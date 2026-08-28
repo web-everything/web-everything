@@ -13,12 +13,13 @@
  * IT DECLARES OVER THE TICK CORE; IT DOES NOT RE-DERIVE IT. The conveyor's dispatch policy — the in-flight
  * build guard, the lane exclusion, the scope-lease arbitration, the TTLs, the union re-dispatch gate — is
  * `we:scripts/conveyor/tick-core.mjs#planTick`, which is pure and tested. This operation CONSUMES that core's
- * three launch lists — `decisions.spawnBuilds`, `decisions.spawnPrepareScope` and
- * `decisions.spawnPrepareDecision` (#3165) — and refuses to invent a launch of its own:
+ * five launch lists — `decisions.spawnBuilds`, `decisions.spawnPrepareScope`, `decisions.spawnPrepareDecision`
+ * (#3165), and `decisions.spawnFixes` / `decisions.spawnCiHeals` (#3383) — and refuses to invent a launch of
+ * its own:
  *
  *   - ONE DISPATCH PER CALL, never a batch. `--num=<N>` resolves THAT item's kind and starts THAT item's
  *     agent. The tick already decides multiplicity; a loop here would be a second scheduler in front of it.
- *   - the KIND is never an input either. It is whichever of the three lists the core put this num in, and
+ *   - the KIND is never an input either. It is whichever of the five lists the core put this num in, and
  *     it selects the brief, the session slug and the lane scope together — see `shapeDispatchRead`.
  *
  *   - the LANE is never an input. A caller cannot ask for a lane; it dispatches the lane the core assigned, or
@@ -88,22 +89,58 @@ export const DISPATCH_EFFECT = 'conveyor.dispatch-delivery-agent';
  */
 export const DEFAULT_EXPECTED_WITHIN_MINUTES = 90;
 
-/** The five `{{PLACEHOLDER}}` tokens `we:skills-src/conveyor/delivery-agent-brief.md` declares. */
+/** The five `{{PLACEHOLDER}}` tokens `we:skills-src/conveyor/delivery-agent-brief.md` declares — build and
+ * both prepare kinds share this set (#3165). */
 export const BRIEF_PLACEHOLDERS = Object.freeze(['ITEM_NUM', 'ITEM_SPEC_PATH', 'LANE', 'SESSION_SLUG', 'SCOPE']);
 
 /**
- * THE THREE AGENT KINDS THIS OPERATION CAN START (#3165), in the order the shell resolves them.
- *
- * `planTick` returns three launch lists — `spawnBuilds`, `spawnPrepareScope`, `spawnPrepareDecision` — and
- * until #3165 the operation launched only the first. The other two were planned, surfaced as the operator's
- * `⚠ N auto-preparing scope: #NNN` note, and then dropped on the floor: `dispatch-lane --num=<one of them>`
- * came back "not in `decisions.spawnBuilds`" forever, so an out-of-session prepare could only be hand-spawned.
- *
- * ONE ITEM IS IN AT MOST ONE LIST — an unscoped held item never reaches `spawnBuilds`, and a decision is never
- * an unshaped build — so the order below is a tie-break that no real tick exercises, not a precedence rule.
- * Stated as data anyway, because two files agreeing on the order by coincidence is how they stop agreeing.
+ * The `{{PLACEHOLDER}}` tokens `we:skills-src/conveyor/fix-agent-brief.md` declares (#3383). No
+ * `ITEM_SPEC_PATH` — a fix agent reconstitutes from the bounced PR's own ref, not the item's spec path — and
+ * `PR_NUM`/`LANE_REF` replace it: which PR, and which ref to reconstitute onto.
  */
-export const LAUNCH_KINDS = Object.freeze(['build', 'prepare', 'prepare-decision']);
+export const FIX_BRIEF_PLACEHOLDERS = Object.freeze(['ITEM_NUM', 'PR_NUM', 'LANE_REF', 'LANE', 'SESSION_SLUG', 'SCOPE']);
+
+/**
+ * The `{{PLACEHOLDER}}` tokens `we:skills-src/conveyor/fix-agent-ci-brief.md` declares (#3383). Same shape as
+ * {@link FIX_BRIEF_PLACEHOLDERS} plus `REASON` (`red-ci` | `behind`, #2666) — the durable CI-heal comment names
+ * why the heal fired, and only the tick core (via `isRedCi`) knows that.
+ */
+export const CI_HEAL_BRIEF_PLACEHOLDERS = Object.freeze([...FIX_BRIEF_PLACEHOLDERS, 'REASON']);
+
+/** Per-{@link LAUNCH_KINDS} placeholder set — which of the above a given kind's brief requires. */
+export const BRIEF_PLACEHOLDERS_BY_KIND = Object.freeze({
+  build: BRIEF_PLACEHOLDERS,
+  prepare: BRIEF_PLACEHOLDERS,
+  'prepare-decision': BRIEF_PLACEHOLDERS,
+  fix: FIX_BRIEF_PLACEHOLDERS,
+  'ci-heal': CI_HEAL_BRIEF_PLACEHOLDERS,
+});
+
+/**
+ * THE FIVE AGENT KINDS THIS OPERATION CAN START (#3165, extended #3383), in the order the shell resolves them.
+ *
+ * `planTick` returns five launch lists — `spawnBuilds`, `spawnPrepareScope`, `spawnPrepareDecision`,
+ * `spawnFixes`, `spawnCiHeals`. Until #3165 the operation launched only the first; until #3383 it launched only
+ * the first three — `spawnFixes`/`spawnCiHeals` were planned, guarded and briefed (`fix-agent-brief.md` /
+ * `fix-agent-ci-brief.md` existed, unwired) but only ever SURFACED for a human/session to hand-execute
+ * (`we:skills-src/conveyor/SKILL.md` §3c's "you EXECUTE `decisions.spawnCiHeals`") — the exact manual step the
+ * background-mechanical-dispatcher epic exists to close.
+ *
+ * ONE ITEM IS IN AT MOST ONE LIST — an unscoped held item never reaches `spawnBuilds`, a decision is never an
+ * unshaped build, and a fix/ci-heal targets an OPEN PR a build/prepare item cannot simultaneously be — so the
+ * order below is a tie-break that no real tick exercises, not a precedence rule. Stated as data anyway, because
+ * two files agreeing on the order by coincidence is how they stop agreeing.
+ */
+export const LAUNCH_KINDS = Object.freeze(['build', 'prepare', 'prepare-decision', 'fix', 'ci-heal']);
+
+/** {@link LAUNCH_KINDS} whose scope is the item's OWN `scope:` frontmatter, same as a build (#3383) — a fix or
+ * CI-heal repairs the item's PR in place, so it needs the same paths the build was allowed to touch, not the
+ * prepare kinds' single-backlog-file scope. */
+export const ITEM_SCOPED_LAUNCH_KINDS = Object.freeze(['build', 'fix', 'ci-heal']);
+
+/** {@link LAUNCH_KINDS} that reconstitute from an existing PR ref rather than starting fresh from `main` — the
+ * ones whose brief needs `PR_NUM`/`LANE_REF` instead of `ITEM_SPEC_PATH` (#3383). */
+export const PR_REPAIR_LAUNCH_KINDS = Object.freeze(['fix', 'ci-heal']);
 
 /**
  * How long an in-flight dispatch record whose agent's LIVENESS CANNOT BE ESTABLISHED keeps holding its item
@@ -186,11 +223,13 @@ export const BRIEF_TOKEN_RE = /\{\{\s*([^{}\n]*?)\s*\}\}/g;
  * separators typos actually produce are the space and the dot as much as the dash.
  *
  * @param {string} name - the token name, without braces.
+ * @param {readonly string[]} [placeholders] - the kind's own required set (#3383) — defaults to
+ *   {@link BRIEF_PLACEHOLDERS} so every pre-#3383 caller is byte-identical.
  * @returns {string|null}
  */
-export function canonicalPlaceholder(name) {
+export function canonicalPlaceholder(name, placeholders = BRIEF_PLACEHOLDERS) {
   const norm = String(name ?? '').trim().replace(/[^A-Za-z0-9]+/g, '_').toUpperCase();
-  return BRIEF_PLACEHOLDERS.includes(norm) ? norm : null;
+  return placeholders.includes(norm) ? norm : null;
 }
 
 /**
@@ -223,15 +262,22 @@ export const BRIEF_VALUE_RE = /^[A-Za-z0-9_.,:/@#-]+$/;
  * inside the pure declaration. The agreement is asserted instead, against the core's OWN function, in
  * `we:scripts/operations/__tests__/dispatch-lane.test.mjs`.
  *
+ * FIX/CI-HEAL SLUGS (#3383) mirror the brief tables' own examples verbatim (`fix-agent-brief.md`: `` `{{SESSION_SLUG}}` | a
+ * stable per-repair session slug, e.g. `fix-{{ITEM_NUM}}` ``) — not `releaseSessionForNum`'s business, since a
+ * fix/ci-heal lease is released by the fix agent itself (`rearm-review.mjs`/`ci-heal-mark.mjs` exit, never a
+ * merge watcher) and carries no risk of arming a watcher for a session nobody created.
+ *
  * @param {string|number} num
- * @param {'build'|'prepare'|'prepare-decision'} [kind] - defaults to `build`, so every pre-#3165 caller is
- *   byte-identical.
+ * @param {'build'|'prepare'|'prepare-decision'|'fix'|'ci-heal'} [kind] - defaults to `build`, so every
+ *   pre-#3165 caller is byte-identical.
  * @returns {string}
  */
 export function sessionSlugFor(num, kind = 'build') {
   const id = String(num).trim();
   if (kind === 'prepare-decision') return `prepare-decision-${id}`;
   if (kind === 'prepare') return `prepare-${id}`;
+  if (kind === 'fix') return `fix-${id}`;
+  if (kind === 'ci-heal') return `ci-heal-${id}`;
   return `conveyor-${id}`;
 }
 
@@ -274,14 +320,16 @@ export function sessionSlugFor(num, kind = 'build') {
  *
  * @param {string} template - the brief's markdown.
  * @param {Record<string, string|number>} values - keyed by placeholder NAME (`ITEM_NUM`, not `{{ITEM_NUM}}`).
+ * @param {readonly string[]} [placeholders] - the kind's own required set (#3383, {@link BRIEF_PLACEHOLDERS_BY_KIND}) —
+ *   defaults to {@link BRIEF_PLACEHOLDERS} so every pre-#3383 caller (build, both prepare kinds) is byte-identical.
  * @returns {{prompt: string, unknownTokens: string[]}}
  */
-export function fillBrief(template, values = {}) {
+export function fillBrief(template, values = {}, placeholders = BRIEF_PLACEHOLDERS) {
   const text = String(template ?? '');
   if (!text.trim()) {
     throw new Error('dispatch-lane: the delivery-agent brief template is empty — refusing to dispatch an agent with no instructions');
   }
-  for (const name of BRIEF_PLACEHOLDERS) {
+  for (const name of placeholders) {
     const value = values[name];
     if (value === undefined || value === null || String(value).trim() === '') {
       throw new Error(`dispatch-lane: no value for the brief placeholder {{${name}}} — refusing to fill it with nothing`);
@@ -299,8 +347,8 @@ export function fillBrief(template, values = {}) {
     // The EXACT shape is the only one that substitutes. `whole` is compared rather than `name` alone because
     // the scan strips the surrounding whitespace into the match but not into the capture, so `{{ ITEM_NUM }}`
     // and `{{ITEM_NUM}}` arrive with the same `name` and must NOT be treated the same.
-    if (whole === `{{${name}}}` && BRIEF_PLACEHOLDERS.includes(name)) return String(values[name]);
-    const canonical = canonicalPlaceholder(name);
+    if (whole === `{{${name}}}` && placeholders.includes(name)) return String(values[name]);
+    const canonical = canonicalPlaceholder(name, placeholders);
     if (canonical) { misspelled.add(`${whole} (meaning {{${canonical}}})`); return whole; }
     unknown.add(whole);
     return whole;
@@ -310,7 +358,7 @@ export function fillBrief(template, values = {}) {
       `dispatch-lane: the brief carries a MISSPELLED placeholder — ${[...misspelled].sort().join(', ')}. No `
       + 'substitution reaches it, so the dispatched agent would run the token verbatim (a lane leased under a '
       + 'literal `{{ SESSION_SLUG }}` is a lease nothing ever releases). Refusing to dispatch. Spell it exactly '
-      + `as one of ${BRIEF_PLACEHOLDERS.map((n) => `{{${n}}}`).join(', ')}.`,
+      + `as one of ${placeholders.map((n) => `{{${n}}}`).join(', ')}.`,
     );
   }
   return { prompt, unknownTokens: [...unknown].sort() };
@@ -585,7 +633,8 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes } = {}) {
       holdReason: suppressed
         ? `suppressed by the in-flight build guard (${suppressed.by === 'lane' ? `lane ${suppressed.lane} is held` : 'an agent is already in flight for this item'})`
         : 'the tick core did not clear this item for dispatch — it is not in `decisions.spawnBuilds`, '
-          + '`decisions.spawnPrepareScope` or `decisions.spawnPrepareDecision`',
+          + '`decisions.spawnPrepareScope`, `decisions.spawnPrepareDecision`, `decisions.spawnFixes` or '
+          + '`decisions.spawnCiHeals`',
     };
   }
 
@@ -600,45 +649,86 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes } = {}) {
   }
   // THE LANE-LEASE SCOPE, and the word `scope` doing two jobs is what made this look like a blocker (#3165).
   //
-  //   - a BUILD's lane scope is the item's own `scope:` FRONTMATTER — the paths it will edit;
+  //   - a BUILD's (and, #3383, a FIX's / CI-HEAL's) lane scope is the item's own `scope:` FRONTMATTER — the
+  //     paths a repair may touch is the same set a build was allowed to touch, since a fix/ci-heal repairs
+  //     that PR in place;
   //   - a PREPARE's lane scope is `we:<specPath>`, the item's own backlog file. It is not a choice made here:
   //     `we:skills-src/conveyor/SKILL.md:272` says a prepare's `--scope` is "a single, distinct backlog file
   //     … disjoint by construction", and both prepare briefs already run exactly that `acquire`.
   //
   // A prepare agent is dispatched PRECISELY BECAUSE the item has no `scope:` — that is the thing it is being
-  // sent to write. So the refusal below is BUILD-ONLY and stays where it is, and the prepare branch routes
-  // past it rather than around it being weakened.
+  // sent to write. So the refusal below is ITEM-SCOPED-KINDS-ONLY and stays where it is, and the prepare
+  // branch routes past it rather than around it being weakened.
   //
   // PINNED RESIDUAL: `prepare-decision-agent-brief.md:68-69`'s own `acquire` declares a WIDER scope than this
   // one file — it appends `we:src/_data/researchTopics.json` and `we:src/_includes/research-descriptions/`,
   // the `/research/` files a decision prepare authors. The brief is the thing that actually takes the lease,
   // so that is the scope the lane ends up holding; this value is what the run record says was declared. The
   // card (#3165) sets one rule for both prepare kinds, so this is recorded rather than silently widened.
-  const scope = launchKind === 'build' ? itemScope : [`we:${specPath}`];
-  if (launchKind === 'build' && !itemScope.length) {
-    // Unreachable through the core (`dispatch-plan` holds an unscoped item `unshaped-no-scope` and auto-prepares
-    // it, so it never reaches `spawnBuilds`) — refused anyway, because an empty `--scope` declares a lane that
-    // owns no paths and the scope-lease collector would let an overlapping sibling launch beside it.
-    throw new Error(`dispatch-lane.read: #${resolvedNum} has no \`scope:\` — the dispatcher never launches an unscoped item to build`);
+  const itemScopedKind = ITEM_SCOPED_LAUNCH_KINDS.includes(launchKind);
+  const scope = itemScopedKind ? itemScope : [`we:${specPath}`];
+  if (itemScopedKind && !itemScope.length) {
+    // Unreachable through the core for a BUILD (`dispatch-plan` holds an unscoped item `unshaped-no-scope` and
+    // auto-prepares it, so it never reaches `spawnBuilds`) — refused anyway for every item-scoped kind, because
+    // an empty `--scope` declares a lane that owns no paths and the scope-lease collector would let an
+    // overlapping sibling launch beside it.
+    throw new Error(`dispatch-lane.read: #${resolvedNum} has no \`scope:\` — the dispatcher never launches an unscoped item to ${launchKind}`);
+  }
+
+  // A FIX/CI-HEAL RECONSTITUTES FROM AN EXISTING PR (#3383), never from `main` — see `fix-agent-brief.md` /
+  // `fix-agent-ci-brief.md`'s own step 1 ("reuse the ref — never rebuild from scratch"). Both facts the brief
+  // needs to do that — WHICH PR, and WHICH REF to reconstitute onto — come off the core's own spawn row and the
+  // io shell's PR-listing read respectively; neither is inventable here, so both are refused when absent rather
+  // than guessed.
+  const prRepairKind = PR_REPAIR_LAUNCH_KINDS.includes(launchKind);
+  let prNum = null;
+  let laneRef = null;
+  let reason = null;
+  if (prRepairKind) {
+    prNum = String(launch.pr ?? '').trim();
+    if (!prNum) {
+      throw new Error(`dispatch-lane.read: the tick core cleared #${resolvedNum} for a ${launchKind} but named no PR — refusing to dispatch without one`);
+    }
+    laneRef = String(raw.prHeadRef ?? '').trim();
+    if (!laneRef) {
+      throw new Error(`dispatch-lane.read: no head ref resolved for PR #${prNum} — the ${launchKind} brief needs it to reconstitute onto`);
+    }
+    if (launchKind === 'ci-heal') {
+      reason = String(launch.reason ?? '').trim();
+      if (!reason) {
+        throw new Error(`dispatch-lane.read: the tick core cleared PR #${prNum} for a ci-heal but named no reason — refusing to dispatch without one`);
+      }
+    }
   }
 
   const sessionSlug = sessionSlugFor(resolvedNum, launchKind);
+  const placeholders = BRIEF_PLACEHOLDERS_BY_KIND[launchKind];
   // FILLED HERE, not in the sink. The prompt is a pure function of the item and the core's assignment, so it
   // belongs on the pure side — and freezing it into the effect payload means the run record says exactly what
   // was dispatched, which is what a restart needs and a sink-side fill would not give.
   const brief = fillBrief(String(raw.briefTemplate ?? ''), {
     ITEM_NUM: resolvedNum,
-    ITEM_SPEC_PATH: specPath,
     LANE: launch.lane,
     SESSION_SLUG: sessionSlug,
     SCOPE: scope.join(','),
-  });
+    // ITEM_SPEC_PATH for build/prepare kinds; PR_NUM + LANE_REF (+ REASON for ci-heal) for a PR-repair kind —
+    // `placeholders` (the kind's own required set) decides which of these `fillBrief` actually looks for, so
+    // handing it a superset it does not need for this kind is inert, not a defect.
+    ITEM_SPEC_PATH: specPath,
+    ...(prRepairKind ? { PR_NUM: prNum, LANE_REF: laneRef } : {}),
+    ...(launchKind === 'ci-heal' ? { REASON: reason } : {}),
+  }, placeholders);
   return {
     ...base,
     dispatching: true,
     lane: launch.lane,
     sessionSlug,
     itemSpecPath: specPath,
+    // null for build/prepare — only a PR-repair kind targets an existing PR. Carried on the verdict (and so
+    // onto the run record) the same way `itemSpecPath` is, for the same reason: a restart needs to see what
+    // was actually dispatched, not re-derive it.
+    pr: prRepairKind ? Number(prNum) : null,
+    prHeadRef: prRepairKind ? laneRef : null,
     scope,
     holdReason: null,
     inFlightRuns: [],

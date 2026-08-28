@@ -31,13 +31,18 @@ import { createRegistry } from '../registry.mjs';
 import { OPERATIONS, resolveOperation } from '../run.mjs';
 import {
   BRIEF_PLACEHOLDERS,
+  BRIEF_PLACEHOLDERS_BY_KIND,
   BRIEF_TOKEN_RE,
+  CI_HEAL_BRIEF_PLACEHOLDERS,
   DEFAULT_EXPECTED_WITHIN_MINUTES,
   DISPATCH_EFFECT,
   DISPATCH_HOLD_GRACE_MINUTES,
   DISPATCH_LANE_OP,
   DISPATCH_LISTING_GRACE_MINUTES,
+  FIX_BRIEF_PLACEHOLDERS,
+  ITEM_SCOPED_LAUNCH_KINDS,
   LAUNCH_KINDS,
+  PR_REPAIR_LAUNCH_KINDS,
   canonicalPlaceholder,
   dispatchLaneOperation,
   DISPATCH_GUARD_LISTING_GRACE_MINUTES,
@@ -1368,10 +1373,10 @@ describe('#3165: the planner\'s prepare lists reach the spawner', () => {
     // …and the pure half refuses a reader that hands it one, rather than shaping a read around it.
     expect(() => shapeDispatchRead(tickRead({ launchKind: 'prepare-scope' }), { num: '3037' }))
       .toThrow(/unknown `launchKind`/);
-    // The three that ARE wired all resolve, and to three DISTINCT files — one map entry pointing at the wrong
+    // The five that ARE wired all resolve, and to five DISTINCT files — one map entry pointing at the wrong
     // brief is the same failure with a quieter face.
     const paths = LAUNCH_KINDS.map((k) => briefPath(REPO_ROOT, k));
-    expect(new Set(paths).size).toBe(3);
+    expect(new Set(paths).size).toBe(5);
     for (const path of paths) expect(readFileSync(path, 'utf8').trim()).not.toBe('');
   });
 
@@ -1419,5 +1424,131 @@ describe('#3165: the planner\'s prepare lists reach the spawner', () => {
     // …and it reports WHICH agent was asked for, so a run record of a declined prepare is not mistakable for a
     // declined build.
     expect(run.verdict.launchKind).toBe('build');
+  });
+});
+
+// ── #3383: fix / ci-heal launch kinds — mechanizing SKILL.md §3c's manual "you EXECUTE" step ──────────────────
+
+const FIX_BRIEF = [
+  '# fix brief for #{{ITEM_NUM}}',
+  'pr: {{PR_NUM}}',
+  'ref: {{LANE_REF}}',
+  'lane: {{LANE}}',
+  'session: {{SESSION_SLUG}}',
+  'scope: {{SCOPE}}',
+].join('\n');
+
+const CI_HEAL_BRIEF = `${FIX_BRIEF}\nreason: {{REASON}}`;
+
+/** A `readTick`-shaped raw read for a `fix`/`ci-heal` launch — mirrors `tickRead()` above, but with a `pr` on
+ * the launch row (never `itemSpecPath`-shaped) and the io-fetched `prHeadRef` alongside it. */
+function tickReadFor(kind, overrides = {}) {
+  const launch = { num: '3037', lane: 8, pr: 701, ...(kind === 'ci-heal' ? { reason: 'red-ci' } : {}), ...overrides.launch };
+  return tickRead({
+    launchKind: kind,
+    launch,
+    briefTemplate: kind === 'ci-heal' ? CI_HEAL_BRIEF : FIX_BRIEF,
+    prHeadRef: 'lane/3037-declare-dispatch',
+    dispatchedGuard: { num: '3037', pr: 701, lane: 8, spawnedTick: 0 },
+    ...overrides,
+    launch,
+  });
+}
+
+describe('#3383 — sessionSlugFor / fillBrief / BRIEF_PLACEHOLDERS_BY_KIND widen for fix/ci-heal', () => {
+  it('sessionSlugFor mints fix-<num> and ci-heal-<num>, distinct from every other kind', () => {
+    expect(sessionSlugFor('701', 'fix')).toBe('fix-701');
+    expect(sessionSlugFor('701', 'ci-heal')).toBe('ci-heal-701');
+    expect(new Set(['build', 'prepare', 'prepare-decision', 'fix', 'ci-heal'].map((k) => sessionSlugFor('701', k))).size).toBe(5);
+  });
+
+  it('BRIEF_PLACEHOLDERS_BY_KIND: fix has no ITEM_SPEC_PATH, gains PR_NUM + LANE_REF; ci-heal adds REASON on top', () => {
+    expect(BRIEF_PLACEHOLDERS_BY_KIND.fix).toEqual(FIX_BRIEF_PLACEHOLDERS);
+    expect(FIX_BRIEF_PLACEHOLDERS).not.toContain('ITEM_SPEC_PATH');
+    expect(FIX_BRIEF_PLACEHOLDERS).toEqual(expect.arrayContaining(['PR_NUM', 'LANE_REF']));
+    expect(BRIEF_PLACEHOLDERS_BY_KIND['ci-heal']).toEqual(CI_HEAL_BRIEF_PLACEHOLDERS);
+    expect(CI_HEAL_BRIEF_PLACEHOLDERS).toEqual([...FIX_BRIEF_PLACEHOLDERS, 'REASON']);
+    expect(BRIEF_PLACEHOLDERS_BY_KIND.build).toBe(BRIEF_PLACEHOLDERS);
+  });
+
+  it('fillBrief with an explicit placeholder list fills a fix-shaped brief and ignores an unsupplied ITEM_SPEC_PATH', () => {
+    const { prompt, unknownTokens } = fillBrief(FIX_BRIEF, {
+      ITEM_NUM: '3037', PR_NUM: '701', LANE_REF: 'lane/3037-x', LANE: '8', SESSION_SLUG: 'fix-3037', SCOPE: 'we:scripts/',
+    }, FIX_BRIEF_PLACEHOLDERS);
+    expect(prompt).toContain('pr: 701');
+    expect(prompt).toContain('ref: lane/3037-x');
+    expect(unknownTokens).toEqual([]);
+  });
+
+  it('fillBrief still refuses a fix fill missing PR_NUM, even though the DEFAULT (build) placeholder list never asked for it', () => {
+    expect(() => fillBrief(FIX_BRIEF, {
+      ITEM_NUM: '3037', LANE_REF: 'lane/3037-x', LANE: '8', SESSION_SLUG: 'fix-3037', SCOPE: 'we:scripts/',
+    }, FIX_BRIEF_PLACEHOLDERS)).toThrow(/no value for the brief placeholder \{\{PR_NUM\}\}/);
+  });
+});
+
+describe('#3383 — shapeDispatchRead dispatches a fix/ci-heal exactly as it dispatches a build', () => {
+  it('a fix launch: PR_NUM/LANE_REF fill from launch.pr/raw.prHeadRef, scope is the ITEM\'s own (build-shaped, not we:<specPath>)', () => {
+    const v = shapeDispatchRead(tickReadFor('fix'), { num: '3037' });
+    expect(v.dispatching).toBe(true);
+    expect(v.launchKind).toBe('fix');
+    expect(v.pr).toBe(701);
+    expect(v.prHeadRef).toBe('lane/3037-declare-dispatch');
+    expect(v.sessionSlug).toBe('fix-3037');
+    expect(v.scope).toEqual(['we:scripts/operations/']); // the ITEM's own scope: frontmatter — see tickRead()
+    expect(v.prompt).toContain('pr: 701');
+    expect(v.prompt).toContain('ref: lane/3037-declare-dispatch');
+    expect(v.prompt).toContain('session: fix-3037');
+  });
+
+  it('a ci-heal launch: REASON fills from launch.reason too, and PR_NUM/LANE_REF work the same as fix', () => {
+    const v = shapeDispatchRead(tickReadFor('ci-heal', { launch: { reason: 'behind' } }), { num: '3037' });
+    expect(v.dispatching).toBe(true);
+    expect(v.launchKind).toBe('ci-heal');
+    expect(v.sessionSlug).toBe('ci-heal-3037');
+    expect(v.prompt).toContain('reason: behind');
+  });
+
+  it('build/prepare kinds are untouched: `pr` and `prHeadRef` are null on their verdict', () => {
+    const v = shapeDispatchRead(tickRead(), { num: '3037' });
+    expect(v.dispatching).toBe(true);
+    expect(v.launchKind).toBe('build');
+    expect(v.pr).toBeNull();
+    expect(v.prHeadRef).toBeNull();
+  });
+
+  it('a fix/ci-heal launch with no `pr` on the row REFUSES rather than dispatching without one', () => {
+    expect(() => shapeDispatchRead(tickReadFor('fix', { launch: { pr: undefined } }), { num: '3037' }))
+      .toThrow(/named no PR/);
+  });
+
+  it('a fix/ci-heal launch with no `raw.prHeadRef` REFUSES — the brief cannot reconstitute onto nothing', () => {
+    expect(() => shapeDispatchRead(tickReadFor('fix', { prHeadRef: null }), { num: '3037' }))
+      .toThrow(/no head ref resolved/);
+  });
+
+  it('a ci-heal launch with no `launch.reason` REFUSES — the durable comment needs to say why it fired', () => {
+    expect(() => shapeDispatchRead(tickReadFor('ci-heal', { launch: { reason: undefined } }), { num: '3037' }))
+      .toThrow(/named no reason/);
+  });
+
+  it('a fix/ci-heal item with no `scope:` REFUSES exactly like an unscoped build does', () => {
+    const raw = tickReadFor('fix', { item: { num: '3037', slug: 'x', specPath: 'backlog/3037-x.md', scope: [] } });
+    expect(() => shapeDispatchRead(raw, { num: '3037' })).toThrow(/no `scope:`/);
+  });
+});
+
+describe('#3383 — ITEM_SCOPED_LAUNCH_KINDS / PR_REPAIR_LAUNCH_KINDS are the exact, disjoint-by-role partitions LAUNCH_KINDS implies', () => {
+  it('every LAUNCH_KIND is scoped by the item OR by its own spec path — never neither, never both', () => {
+    for (const kind of LAUNCH_KINDS) {
+      const itemScoped = ITEM_SCOPED_LAUNCH_KINDS.includes(kind);
+      const specScoped = kind === 'prepare' || kind === 'prepare-decision';
+      expect(itemScoped || specScoped).toBe(true);
+      expect(itemScoped && specScoped).toBe(false);
+    }
+  });
+
+  it('PR_REPAIR_LAUNCH_KINDS is exactly {fix, ci-heal} — the two kinds that reconstitute from an existing PR ref', () => {
+    expect([...PR_REPAIR_LAUNCH_KINDS].sort()).toEqual(['ci-heal', 'fix']);
   });
 });

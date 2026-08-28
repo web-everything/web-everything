@@ -78,6 +78,8 @@ const BRIEF_BY_KIND = Object.freeze({
   build: 'delivery-agent-brief.md',
   prepare: 'prepare-scope-agent-brief.md',
   'prepare-decision': 'prepare-decision-agent-brief.md',
+  fix: 'fix-agent-brief.md',
+  'ci-heal': 'fix-agent-ci-brief.md',
 });
 
 // UNKNOWN KIND THROWS; it does NOT fall back to the delivery brief. Handing a scope-prep agent the delivery
@@ -146,7 +148,11 @@ export const LISTING_GRACE_MS = DISPATCH_LISTING_GRACE_MINUTES * 60 * 1000;
  *   {@link persistLastSeenLive}, which stamps `lastSeenLiveAt` onto every entry this read just confirmed
  *   alive. A seam, not decoration: it is the one WRITE on an otherwise read-only path, and a test that wants
  *   the read without touching a run store overrides it with the identity.
- * @returns {{launch: object|null, launchKind: 'build'|'prepare'|'prepare-decision', suppressed: object|null, resolvedNum: string, item: object|null, briefTemplate: string, nextState: object, statusLine: string, notes: object[], bookkeepingSource: string, observedAt: string}}
+ * @param {() => object[]} [o.listPrs] - injectable `gh pr list` reader (#3383), consulted ONLY for a
+ *   `fix`/`ci-heal` launch — a build/prepare dispatch never pays for this call. Defaults to
+ *   {@link defaultListPrs}, the SAME reader the observer already uses, so a fix/ci-heal's `LANE_REF` comes
+ *   from one already-proven `headRefName` source rather than a second one invented for this path.
+ * @returns {{launch: object|null, launchKind: 'build'|'prepare'|'prepare-decision'|'fix'|'ci-heal', suppressed: object|null, resolvedNum: string, item: object|null, briefTemplate: string, nextState: object, statusLine: string, notes: object[], bookkeepingSource: string, observedAt: string, prHeadRef: string|null}}
  */
 export function readTick({
   num,
@@ -159,6 +165,7 @@ export function readTick({
   listInFlightDispatches = (key) => inFlightDispatchesFor(key),
   listAgents = () => defaultListAgents({ exec }),
   recordLiveness = (stamped) => { persistLastSeenLive(stamped, { now }); return stamped; },
+  listPrs = () => defaultListPrs({ exec }),
   now = () => new Date(),
 } = {}) {
   const key = normNum(num);
@@ -191,22 +198,38 @@ export function readTick({
   const item = findItem(key, loadItems);
   const nextState = tick && typeof tick.nextState === 'object' ? tick.nextState : null;
   // THE SELECTION happens here, with the tick's own normalizer — see the declaration's header for why it is
-  // not in the pure half. THREE LISTS, not one (#3165): `planTick` plans builds AND both prepare kinds, and
-  // launching only the first is why `dispatch-lane --num=<an auto-preparing item>` did nothing at all while
-  // the operator's status line kept promising it would.
+  // not in the pure half. FIVE LISTS, not one (#3165, extended #3383): `planTick` plans builds, both prepare
+  // kinds, fixes and CI-heals, and launching only a subset is why `dispatch-lane --num=<an item held for one
+  // of the others>` did nothing at all while the operator's status line kept promising it would.
   //
   // FIRST MATCH WINS, and no real tick makes that a decision — an item held as unscoped never reaches
-  // `spawnBuilds`, and a decision is never an unshaped build, so the lists are disjoint by construction.
+  // `spawnBuilds`, a decision is never an unshaped build, and a fix/ci-heal targets an OPEN PR a build/prepare
+  // item cannot simultaneously be — so the lists are disjoint by construction.
   const LAUNCH_LISTS = [
     ['build', decisions.spawnBuilds],
     ['prepare', decisions.spawnPrepareScope],
     ['prepare-decision', decisions.spawnPrepareDecision],
+    ['fix', decisions.spawnFixes],
+    ['ci-heal', decisions.spawnCiHeals],
   ];
   let launch = null;
   let launchKind = 'build';
   for (const [kind, rows] of LAUNCH_LISTS) {
     const row = match(rows);
     if (row) { launch = row; launchKind = kind; break; }
+  }
+
+  // THE PR'S HEAD REF (#3383) — a `fix`/`ci-heal` brief's `{{LANE_REF}}`, the ref it reconstitutes onto rather
+  // than starting fresh from `main`. Fetched ONLY for these two kinds: a build/prepare dispatch has no PR yet
+  // and must not pay for a `gh pr list` call it has no use for. Reuses `defaultListPrs`'s OWN listing (the
+  // observer's `headRefName` source, `classifyDispatchPr`) rather than a second `gh pr view` invented for this
+  // one field, per this file's own `PR_LIST_JSON_FIELDS` precedent.
+  let prHeadRef = null;
+  if ((launchKind === 'fix' || launchKind === 'ci-heal') && launch && launch.pr != null) {
+    let prs = [];
+    try { prs = listPrs(); } catch { prs = []; }
+    const row = (Array.isArray(prs) ? prs : []).find((p) => Number(p?.number) === Number(launch.pr));
+    prHeadRef = row?.headRefName ? String(row.headRefName) : null;
   }
 
   return {
@@ -217,11 +240,12 @@ export function readTick({
     launchKind,
     suppressed: match(decisions.suppressedBuilds),
     // THIS launch's guard entry, picked out of the tick's guards with the same normalizer. The core records
-    // one per planned spawn, in `buildGuards` for a build and `prepareGuards` for either prepare kind; only
-    // this one describes work this operation actually starts. The prepare match is keyed on the KIND too,
-    // because `prepareGuards` holds both kinds in one list.
-    dispatchedGuard: launchKind === 'build'
-      ? match(nextState?.buildGuards)
+    // one per planned spawn, in `buildGuards` for a build, `prepareGuards` for either prepare kind, `fixGuards`
+    // for a fix and `ciHealGuards` for a ci-heal; only this one describes work this operation actually starts.
+    // The prepare match is keyed on the KIND too, because `prepareGuards` holds both kinds in one list.
+    dispatchedGuard: launchKind === 'build' ? match(nextState?.buildGuards)
+      : launchKind === 'fix' ? match(nextState?.fixGuards)
+      : launchKind === 'ci-heal' ? match(nextState?.ciHealGuards)
       : (Array.isArray(nextState?.prepareGuards) ? nextState.prepareGuards : [])
         .find((g) => g && normNum(g.num) === key && (g.kind || 'prepare') === launchKind) || null,
     item,
@@ -238,6 +262,7 @@ export function readTick({
     // is pure, so the clock has to arrive as DATA rather than be read there. Omitted or unparseable → nothing
     // ages out and every in-flight record holds, which is the fail-closed direction.
     observedAt: now().toISOString(),
+    prHeadRef,
   };
 }
 
