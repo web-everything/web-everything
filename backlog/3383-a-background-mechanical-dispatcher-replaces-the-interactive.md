@@ -213,11 +213,22 @@ clear, or `provision --count=N` with `N` large enough to grow past the busy rang
 clone + npm install per new lane).
 
 **For the next session, explicitly, so it does not have to be told twice:**
-- **The goal is improving the mechanical-dispatcher prototype and the machinery it depends on
+- **The goal is improving the mechanical-dispatcher prototype and the machinery it depends on — not
+  landing any particular backlog item.** "The prototype" means the WHOLE machinery this epic touches
   (`we:scripts/lane-pool.mjs`, `we:scripts/readiness/conveyor-state.mjs`,
-  `we:scripts/readiness/dispatch-plan.mjs`, etc.) — not landing any particular backlog item.** Discard
-  work on an item freely, without ceremony, whenever it stops being the fastest path to a machinery
-  finding. This is a standing instruction for this whole line of work, not a one-off for today.
+  `we:scripts/readiness/dispatch-plan.mjs`, `we:scripts/operations/dispatch-lane*.mjs`,
+  `we:skills-src/conveyor/*.mjs`, and anything else the runner's tick chain touches) — not one file.
+  Discard work on an item freely, without ceremony, whenever it stops being the fastest path to a
+  machinery finding. This is a standing instruction for this whole line of work, not a one-off for today.
+- **Sweep known bugs across this whole machinery and apply as many fixes as possible to this branch**
+  (not just the two this session happened to trip over live). Check the backlog for open items tagged
+  against `lane-pool`, `conveyor`, `dispatch`, `readiness`, footguns, etc. — e.g. `#2924` (lane-pool
+  acquire's TOCTOU on the destructive reset path, named but not fixed this session) and the
+  `xs6omfp`-born dirty-tree-guard-on-`--lane=N` item are two already-known candidates. Prioritize by
+  what could actually crash or corrupt a live dispatch, same bar as this session's two fixes.
+- **Rebase this branch onto current `origin/main` before continuing** — it forked before today's `main`
+  moved forward (e.g. this session's own work landed nothing to `main`, but other unrelated PRs have).
+  Confirm tests + `check:standards` stay green post-rebase before building further on top.
 - Always set `WE_DISPATCH_AGENT_ARGS` before dispatching anything for real — unset is a guaranteed hang now
   that both known crash-class bugs (this session's fetch race, `#3353`'s permission-mode gap) are fixed;
   the NEXT class of failure a live run finds will be a different one.
