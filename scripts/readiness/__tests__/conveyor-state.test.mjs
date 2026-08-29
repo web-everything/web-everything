@@ -326,8 +326,8 @@ describe('shapePrs — gh pr list → the in-flight PR shape', () => {
 });
 
 // A lane-pool `status --json` row + the scope-lease-collect picture leases share the lane index.
-const poolRow = (lane, { leased = true, session = `sess-${lane}`, predictedScope, exists = true } = {}) => ({
-  lane, path: `/pool/lane-${lane}`, exists, leased,
+const poolRow = (lane, { leased = true, session = `sess-${lane}`, predictedScope, exists = true, clean } = {}) => ({
+  lane, path: `/pool/lane-${lane}`, exists, leased, clean,
   lease: leased ? { session, ...(predictedScope ? { predictedScope } : {}) } : null,
 });
 const picLease = (lane, { predicted = [], breach = [], session = `sess-${lane}` } = {}) => ({ lane, session, predicted, observed: predicted, breach, clean: breach.length === 0 });
@@ -366,12 +366,20 @@ describe('shapeLanes — pool rows × scope picture → the tick lanes shape', (
   });
 });
 
-describe('computeFreeSlots — free (existing, unleased) lanes', () => {
+describe('computeFreeSlots — free (existing, unleased, clean) lanes', () => {
   it('counts unleased existing lanes only', () => {
     const poolStatus = { lanes: [poolRow(1), poolRow(2, { leased: false }), poolRow(3, { leased: false }), { lane: 4, exists: false, leased: false }] };
     expect(computeFreeSlots(poolStatus)).toBe(2);
   });
   it('null pool → 0', () => expect(computeFreeSlots(null)).toBe(0));
+  it('excludes an unleased lane sitting DIRTY (orphaned work from a crashed/killed session)', () => {
+    const poolStatus = { lanes: [poolRow(1, { leased: false, clean: true }), poolRow(2, { leased: false, clean: false })] };
+    expect(computeFreeSlots(poolStatus)).toBe(1);
+  });
+  it('a lane with no `clean` field at all (older pool-status shape) still counts — undefined is not false', () => {
+    const poolStatus = { lanes: [poolRow(1, { leased: false })] };
+    expect(computeFreeSlots(poolStatus)).toBe(1);
+  });
 });
 
 describe('shapeDaemon — plateau daemon status report → the daemon section (or "unavailable")', () => {

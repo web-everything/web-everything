@@ -268,14 +268,25 @@ export function attachLaneInfra(lanes, infraByNum) {
 }
 
 /**
- * Count FREE lanes in the pool — lanes that exist and hold no live lease (the conveyor's launch budget). A lane
- * with `leased === true` is occupied; a missing lane (`exists === false`) is not counted.
+ * Count FREE lanes in the pool — lanes that exist, hold no live lease, and are not DIRTY (the conveyor's launch
+ * budget). A lane with `leased === true` is occupied; a missing lane (`exists === false`) is not counted; a
+ * `clean === false` lane (uncommitted work sitting unleased — orphaned from a crashed/killed session) is
+ * excluded too, using the same `status --json` field the caller already fetched, no extra IO.
+ *
+ * THIS IS STILL AN OPTIMISTIC UPPER BOUND, NOT A GUARANTEE. `lane-pool list --acquirable` (what
+ * `dispatch-plan.mjs` actually dispatches against) also excludes AHEAD lanes — clean, but carrying unpushed
+ * commits — via `isLaneAcquirable`'s `dirtyOrAhead.ahead` check (we:scripts/lib/lane-lease.mjs). That needs a
+ * fetch-and-compare per lane, too costly to run on every tick (the #2920/#2924 fan-out), so it is deliberately
+ * NOT folded in here. A tick can therefore report `freeSlots > 0` while `dispatch-plan.mjs` holds every item
+ * for `"no free lane"` — confirmed live, 2026-08-29 (all 41 lanes on one host: 10 leased, 17 dirty, and the
+ * remaining 14 "clean" ones every one of them AHEAD) — `dispatch-plan.mjs`'s own hold reason is authoritative
+ * for whether a specific dispatch can actually launch; `freeSlots` is a cheap status-line estimate only.
  * @param {{lanes?:object[]}|null|undefined} poolStatus
  * @returns {number}
  */
 export function computeFreeSlots(poolStatus) {
   const laneRows = Array.isArray(poolStatus?.lanes) ? poolStatus.lanes : [];
-  return laneRows.filter((l) => l && typeof l === 'object' && l.exists !== false && l.leased !== true).length;
+  return laneRows.filter((l) => l && typeof l === 'object' && l.exists !== false && l.leased !== true && l.clean !== false).length;
 }
 
 /**
