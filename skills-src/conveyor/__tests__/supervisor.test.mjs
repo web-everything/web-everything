@@ -225,13 +225,13 @@ describe('makeRealSpawnChild — real node child processes, never runner.mjs its
     expect(result).toMatchObject({ code: 0, signal: null });
     expect(result.ranMs).toBeGreaterThanOrEqual(0);
     expect(result.ranMs).toBeLessThan(Date.now() - start + 50); // internally-measured duration is sane
-  });
+  }, 15_000); // a real `node -e` spawn can take multiple seconds under a loaded environment (measured: ~5s here)
 
   it('reports a real non-zero exit code', async () => {
     const spawnChild = makeRealSpawnChild({ runnerPath: '-e', extraArgs: ['process.exit(7)'], onChild: () => {} });
     const result = await spawnChild();
     expect(result).toMatchObject({ code: 7, signal: null });
-  });
+  }, 15_000);
 
   it('a real child killed via the handle reports the SIGNAL, and the process is actually gone — proving no orphan', async () => {
     // A real long-sleeping child (well beyond the test's own patience), so it can ONLY end by being killed —
@@ -266,7 +266,7 @@ describe('makeRealSpawnChild — real node child processes, never runner.mjs its
     expect(result.signal).toBeNull();
     expect(result.code).not.toBe(0);
     expect(Number.isInteger(result.code)).toBe(true);
-  });
+  }, 15_000); // a real node spawn can take multiple seconds under a loaded environment (measured: ~5s here)
 });
 
 describe('makeJsonlLog — real file IO, best-effort (never throws)', () => {

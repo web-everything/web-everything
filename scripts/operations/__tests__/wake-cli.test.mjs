@@ -296,7 +296,7 @@ describe('the waker CLI registers the dispatch observer — the half of the feat
     expect(out).not.toMatch(/no-observer/);
     expect(out).toMatch(/now awaiting-effect/);
     // …and the record is untouched, because a live session resolves nothing.
-    expect(createFileRunStore(dir).read(RUN_ID).effects[0]).toMatchObject({ status: 'in-flight', handle: HANDLE });
+    expect(createFileRunStore(dir).read(RUN_ID).effects[0]).toMatchObject({ status: 'in-flight', handle: SHORT_HANDLE });
   }, CHILD_PROCESS_TIMEOUT_MS);
 
   it('reads the live sessions as `claude agents --json`, and NEVER with `--all`', async () => {
@@ -456,7 +456,7 @@ describe('--resolve refuses a LIVE handle, and a retry never orphans the handle 
     expect(stdout).toMatch(/--force/);
     // THE ENTRY IS UNTOUCHED, which is the half that matters: a refusal that had already written would have
     // handed the run to the retry anyway.
-    expect(createFileRunStore(dir).read(RUN_ID).effects[0]).toMatchObject({ status: 'in-flight', handle: HANDLE });
+    expect(createFileRunStore(dir).read(RUN_ID).effects[0]).toMatchObject({ status: 'in-flight', handle: SHORT_HANDLE });
   }, CHILD_PROCESS_TIMEOUT_MS);
 
   it('G2: `--force` gets through, and says on the line that liveness was not checked', async () => {
@@ -490,11 +490,11 @@ describe('--resolve refuses a LIVE handle, and a retry never orphans the handle 
     const store = createFileRunStore(dir);
     // Close it out under --force, exactly as an operator who was sure would — then let the retry run.
     closeOutEntry({ runId: RUN_ID, key: KEY, status: 'failed', force: true, store });
-    const sinks = createDispatchSinks({ root: PRIMARY, spawnAgent: () => '', mintSessionId: () => 'sess-2' });
+    const sinks = createDispatchSinks({ root: PRIMARY, spawnAgent: () => bgStdout('a2a2a2a2'), mintSessionId: () => 'sess-2' });
     const after = (await applyPendingEffects(store.read(RUN_ID), { sinks, store })).run;
 
     const entry = after.effects[0];
-    expect(entry.handle).toBe('sess-2');
+    expect(entry.handle).toBe('a2a2a2a2');
     expect(entry.status).toBe('in-flight');
     // sess-1 IS STILL FINDABLE — the whole point. The review's reproduction asked exactly this question of the
     // record and got `false`. #3331: the superseded handle is the SHORT id `parkOneDispatch`'s sink actually
