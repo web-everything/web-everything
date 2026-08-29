@@ -1,8 +1,9 @@
 ---
 bornAs: xl1ru2l
 kind: task
-status: open
+status: active
 dateOpened: "2026-08-05"
+dateStarted: "2026-08-29"
 tags: []
 scope: ["we:scripts/lib/invariant-catalogue.json"]
 ---
@@ -30,3 +31,9 @@ The catalogue exists to be the citable record of what the guards actually do —
 - The `guard-lane.denies-primary-tree-edit` entry's `statement` and `howChecked` match [`we:scripts/guard-lane.mjs`](scripts/guard-lane.mjs) — no exemption, and the classification term named is one the code actually has.
 - A check makes this class **script-detectable** rather than relying on a reader noticing: at minimum a test that fails when the catalogue asserts an exemption the guard's own classification does not implement.
 - The rest of the catalogue is swept once for the same staleness class (an entry whose `status: enforced` outlived the code it describes).
+
+## Progress
+
+- **Done:** Rewrote the `guard-lane.denies-primary-tree-edit` `statement`/`howChecked` in `we:scripts/lib/invariant-catalogue.json` to match `we:scripts/guard-lane.mjs`'s actual `laneGuardDecision()` — no exemption, `isMemory` (not the removed `inAgentMemory`) named as the real classification term.
+- **Done:** Added `we:scripts/lib/__tests__/invariant-catalogue-guard-lane-sync.test.mjs` — asserts the guard actually denies a primary agent-memory edit, that the statement never re-claims an "except…exempt" carve-out, and that every classification term `howChecked` names is one `we:scripts/guard-lane.mjs` actually declares. Verified it fails on the original stale wording before confirming it passes on the fix.
+- **Done:** Swept every `howChecked` entry in the catalogue for a referenced file/function that no longer exists in the repo (script-checked, not just read). Found and fixed one more: `guard-bash.denies-direct-main-push`'s `howChecked` pointed at `we:scripts/guard-bash.test.mjs`, which moved to `we:scripts/__tests__/guard-bash.test.mjs`. No other entry's referenced path or named function was missing.

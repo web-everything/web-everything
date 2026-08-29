@@ -170,8 +170,8 @@
       "id": "guard-lane.denies-primary-tree-edit",
       "tier": "A",
       "subject": "scripts/guard-lane.mjs (PreToolUse Edit|Write)",
-      "statement": "an Edit/Write targeting a constellation PRIMARY checkout (webeverything/frontierui/plateau-app, not under .lanes/) is DENIED — every edit-action must run in an isolated lane clone (#2123) — except the agent-memory tree, which is exempt, and unless LANE_GUARD_OFF=1 is explicitly set.",
-      "howChecked": "scripts/guard-lane.mjs realpath classification (inPrimary && !inLane && !inAgentMemory → deny)",
+      "statement": "an Edit/Write targeting a constellation PRIMARY checkout (webeverything/frontierui/plateau-app, not under .lanes/) is DENIED — every edit-action must run in an isolated lane clone (#2123); the agent-memory tree carries NO exemption (removed 2026-07-09 — it is denied like any other tracked file), unless LANE_GUARD_OFF=1 is explicitly set.",
+      "howChecked": "scripts/guard-lane.mjs laneGuardDecision() realpath classification (inPrimary && !inLane → deny, unconditionally; isMemory only selects the denial message's wording, it grants no exemption)",
       "status": "enforced"
     },
     {
@@ -187,7 +187,7 @@
       "tier": "A",
       "subject": "scripts/guard-bash.mjs (PreToolUse Bash)",
       "statement": "a `git push` targeting a constellation `main` branch is denied — every change must reach main through a lane/* ref → PR → CI (#2203); escape only via MAIN_PUSH_OK=1.",
-      "howChecked": "scripts/guard-bash.mjs decide()/reason(); scripts/guard-bash.test.mjs",
+      "howChecked": "scripts/guard-bash.mjs decide()/reason(); scripts/__tests__/guard-bash.test.mjs",
       "status": "enforced"
     },
     {
