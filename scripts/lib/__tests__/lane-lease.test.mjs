@@ -22,6 +22,7 @@ import {
   isForeignOccupancy,
   isContestedLease,
   requiredAssertionSlug,
+  isTransientRefLockError,
 } from '../lane-lease.mjs';
 
 const T0 = Date.parse('2026-07-05T12:00:00.000Z');
@@ -428,5 +429,25 @@ describe('#2997 — leaseOwnedByCaller refuses the ownerSession fallback on a CO
     const reserved = leaseBody({ session: 'memory-lane', acquiredAt: at, ownerSession: 'sess-shared', reserved: true, holder: 'h-res' });
     expect(leaseOwnedByCaller({ lease: reserved, session: 'Mac:1', mySessionId: 'sess-shared', targeted: true, contested: true })).toBe(false);
     expect(leaseOwnedByCaller({ lease: reserved, session: 'Mac:1', mySessionId: 'sess-shared', targeted: true, contested: false })).toBe(false);
+  });
+});
+
+describe('isTransientRefLockError — the shared-object-store fetch race lane-pool.mjs retries', () => {
+  it('matches the real message git prints on a ref-lock race (live-fire dispatch test, 2026-08-29)', () => {
+    const msg = "error: cannot lock ref 'refs/remotes/origin/lane/mechanical-dispatcher-recovered': "
+      + 'is at d0c83a7b0400c28b496f2a940b65b095ad11cfc8 but expected ca540827b3a39ab9345e75385ce3172535584bbb';
+    expect(isTransientRefLockError(msg)).toBe(true);
+  });
+  it('is case-insensitive and matches on a substring (execFileSync errors wrap the git stderr in prose)', () => {
+    expect(isTransientRefLockError('Command failed: git fetch origin\nError: Cannot Lock Ref \'x\': is at a but expected b')).toBe(true);
+  });
+  it('does NOT match an unrelated fetch failure — a real error must still throw unretried', () => {
+    expect(isTransientRefLockError('fatal: unable to access \'https://github.com/x/y.git/\': Could not resolve host')).toBe(false);
+    expect(isTransientRefLockError('fatal: couldn\'t find remote ref main')).toBe(false);
+  });
+  it('null/undefined/non-string input never matches (fail closed to "not retryable")', () => {
+    expect(isTransientRefLockError(null)).toBe(false);
+    expect(isTransientRefLockError(undefined)).toBe(false);
+    expect(isTransientRefLockError('')).toBe(false);
   });
 });

@@ -60,6 +60,19 @@ export function isReservedLease(lease) {
 }
 
 /**
+ * Is a `git fetch` failure the transient shared-object-store ref-lock race, safe to retry — versus a real
+ * failure (network down, bad remote) a caller must not paper over? Live-fire dispatch test, 2026-08-29:
+ * every lane in the #1933 pool clones `--reference` the same object store, so two lanes fetching at once can
+ * both touch the same `refs/remotes/origin/*` and git refuses the loser with `"error: cannot lock ref
+ * '<ref>': is at X but expected Y"`. On a host running several concurrent sessions this is ORDINARY
+ * contention, not a real error — `lane-pool.mjs`'s `fetchOriginPruneWithRetry` uses this predicate to
+ * retry ONLY this exact signature; every other fetch failure still throws unretried, exactly as before.
+ */
+export function isTransientRefLockError(message) {
+  return /cannot lock ref/i.test(String(message ?? ''));
+}
+
+/**
  * Is a lane safe to acquire right now? Exists, holds no other session's uncommitted / unpushed work
  * (`dirtyOrAhead` — the #2267 data-loss guard), and carries no LIVE lease (none, or a stale one to reclaim).
  */
