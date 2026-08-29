@@ -40,6 +40,8 @@ import { createBoardReader, createExclusionReader } from './suggest-next-io.mjs'
 import { gateHealthOperation, GATE_HEALTH_OP, classifyFollowUp } from './gate-health.mjs';
 import { prStatusOperation, PR_STATUS_OP } from './pr-status.mjs';
 import { createPrReader } from './pr-status-io.mjs';
+import { routePrOutcomeOperation, ROUTE_PR_OUTCOME_OP } from './route-pr-outcome.mjs';
+import { createRouteOutcomeReader } from './route-pr-outcome-io.mjs';
 import { createHistoryReader } from './gate-health-io.mjs';
 import { dispatchLaneOperation, DISPATCH_LANE_OP } from './dispatch-lane.mjs';
 import { createTickReader, createDispatchSinks, agentArgsFromEnv } from './dispatch-lane-io.mjs';
@@ -140,6 +142,15 @@ export const OPERATIONS = Object.freeze({
   }),
   [GATE_HEALTH_OP]: () => ({
     declaration: gateHealthOperation({ loadHistory: createHistoryReader({ classify: classifyFollowUp }) }),
+    sinks: {},
+  }),
+  // #xrpo1 — the gap: no operation reached `deriveReviewDisposition` (`we:scripts/lib/review-core.mjs`), so a
+  // caller through the engine had to reach around it into `review-core.mjs`/`review-escalation.mjs` directly.
+  // Read-only, same no-sinks reasoning as `pr-status`/`gate-health`/`suggest-next`: every step is `compute`,
+  // and the disposition call itself lives in `route-pr-outcome-io.mjs` (not this declaration) so the
+  // declaring module stays an import-graph leaf — see that file's header for why.
+  [ROUTE_PR_OUTCOME_OP]: () => ({
+    declaration: routePrOutcomeOperation({ readPrView: createRouteOutcomeReader() }),
     sinks: {},
   }),
   // #3037 — the first operation whose effect STARTS work instead of finishing it. Its one sink launches a

@@ -45,6 +45,7 @@ const SHIM = `#!/usr/bin/env node
 // A stand-in for the \`claude\` CLI. Records every invocation, emulates the two sub-commands the delivery
 // loop actually uses, and exits fast. Written by fake-claude.mjs — see that file for why.
 const { readFileSync, writeFileSync, existsSync } = require('node:fs');
+const { randomUUID } = require('node:crypto');
 const LOG = process.env.FAKE_CLAUDE_LOG;
 const argv = process.argv.slice(2);
 
@@ -91,12 +92,23 @@ if (process.env.FAKE_CLAUDE_FAIL === '1') {
 }
 
 if (bg) {
-  // The real CLI returns IMMEDIATELY and the session may not be listed yet. It is listed here so the round
-  // trip is assertable; the not-yet-listed grace window is the dispatcher's own concern and is unit-tested.
-  const id = sessionId || 'generated-' + state.sessions.length;
-  state.sessions.push({ id: id.slice(0, 8), sessionId: id, name, kind: 'background', state: 'running', cwd: process.cwd() });
+  // THE REAL CLI IGNORES \`--session-id\` on a \`--bg\` spawn and mints its OWN id — confirmed against CLI
+  // 2.1.246, three runs, three mismatches, its own stderr warning (#3331 probe). Honouring the passed-in
+  // \`sessionId\` here was the exact drift that let dispatch-lane-io.mjs's now-corrected assumption go
+  // unnoticed by this suite; the shim must not repeat it, so the real id is always CLI-minted, never the
+  // caller's.
+  const realId = randomUUID();
+  const shortId = realId.slice(0, 8);
+  state.sessions.push({ id: shortId, sessionId: realId, name, kind: 'background', state: 'running', cwd: process.cwd() });
   write(state);
-  process.stdout.write('  claude attach ' + id.slice(0, 8) + '    open in this terminal\\n');
+  process.stderr.write('warning: --bg manages the session id; ignoring --session-id (use --resume <id> to continue an existing session)\\n');
+  // The one line dispatch-lane-io.mjs's \`parseBackgroundedHandle\` reads — shape and separator (U+00B7)
+  // matched against a real 2.1.246 spawn, not invented.
+  process.stdout.write('backgrounded · ' + shortId + ' · ' + name + '\\n');
+  process.stdout.write('  claude agents             list sessions\\n');
+  process.stdout.write('  claude attach ' + shortId + '    open in this terminal\\n');
+  process.stdout.write('  claude logs ' + shortId + '      show recent output\\n');
+  process.stdout.write('  claude stop ' + shortId + '      stop this session\\n');
   process.exit(0);
 }
 

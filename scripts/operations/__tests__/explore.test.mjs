@@ -66,6 +66,7 @@ import {
   createExploreSinks,
   escapeHtml,
   inheritedTopicDates,
+  investigatorSessionName,
   isReportComplete,
   panelistReportPath,
   parseCliRefusal,
@@ -534,9 +535,11 @@ describe('the observer — the report axis first, liveness second, four honest w
   });
 
   it('a half-written report on a LIVE session is `running`, not a resolution', async () => {
+    // #3331: liveness is matched by the deterministic `-n` NAME, never `sessionId` — the CLI ignores
+    // `--session-id`, so a listing keyed on it (the old `sess-1` fixture) can never prove liveness.
     const answer = await observe({
       readReport: () => '# p1\n\nI am still thinking about',
-      listAgents: () => [{ sessionId: 'sess-1' }],
+      listAgents: () => [{ name: investigatorSessionName(ctx.runId, entry().payload.panelist) }],
     })(entry(), ctx);
     expect(answer.status).toBe('running');
   });
@@ -657,6 +660,14 @@ describe('the io shell — refusals that keep a malformed run out of the world',
 
   it('refuses to start an investigator with an empty brief', () => {
     expect(() => composeInvestigationPrompt('', '/tmp/x.md')).toThrow(/empty brief/);
+  });
+
+  it('#3331: investigatorSessionName is exactly the `-n` buildInvestigatorArgv sets — one derivation, not two', () => {
+    const argv = buildInvestigatorArgv({ sessionId: 's', runId: 'run-explore-fixture', payload: { panelist: 'p1' }, prompt: '# go' });
+    expect(argv[argv.indexOf('-n') + 1]).toBe(investigatorSessionName('run-explore-fixture', 'p1'));
+    expect(investigatorSessionName('run-explore-fixture', 'p1')).toBe('explore-fixture-p1');
+    // A run id whose tail cut lands on a separator is trimmed, not doubled (`explore--abc-p2` would misread).
+    expect(investigatorSessionName('-abc', 'p2')).toBe('explore-abc-p2');
   });
 
   it('reads a `--json` refusal off the scaffold CLI, so a proven non-write is retried rather than guessed at', () => {

@@ -29,7 +29,7 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { withFakeClaude } from './helpers/fake-claude.mjs';
-import { buildAgentArgv, defaultSpawnAgent, defaultListAgents } from '../dispatch-lane-io.mjs';
+import { buildAgentArgv, defaultSpawnAgent, defaultListAgents, parseBackgroundedHandle } from '../dispatch-lane-io.mjs';
 
 /**
  * Spawn through the REAL default path, with the fake first on PATH.
@@ -72,12 +72,11 @@ describe('dispatching an agent, against a real process', () => {
     expect(seen[seen.length - 1]).toBe('# Deliver item 4242\n\nDo the thing.');
   });
 
-  it('the spawn-to-observe round trip, through BOTH production seams', () => {
+  it('the spawn-to-observe round trip, through BOTH production seams — #3331: the CLI mints its own id', () => {
     fake = withFakeClaude();
-    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
     const env = { ...process.env, ...fake.env };
-    spawnVia(fake, buildAgentArgv({
-      sessionId,
+    const stdout = spawnVia(fake, buildAgentArgv({
+      sessionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
       payload: { num: '77', sessionSlug: 'conveyor-77', prompt: '# brief' },
     }));
 
@@ -90,10 +89,17 @@ describe('dispatching an agent, against a real process', () => {
     // this change, and this case is what holds it.
     const listing = defaultListAgents({ env });
 
-    // Both ends of the chain were previously modelled. This is the one assertion that ties them: the id the
-    // dispatcher pinned is the id the liveness listing reports back.
-    expect(listing.map((s) => s.sessionId)).toContain(sessionId);
-    expect(listing.find((s) => s.sessionId === sessionId).name).toBe('conveyor-77');
+    // #3331 PROVED the id the dispatcher PINS is never the id the CLI actually uses — the fake now mints
+    // its own, same as the real CLI does, so this suite cannot silently regress back to the disproven
+    // assumption. The tie between the two ends of the chain is `parseBackgroundedHandle(stdout)`: the short
+    // id the CLI's own confirmation carries is a prefix of the real listed `sessionId`, and `name` (the `-n`
+    // slug the dispatcher chose) is what identifies WHICH session it belongs to.
+    const handle = parseBackgroundedHandle(stdout);
+    expect(handle).toMatch(/^[0-9a-f]{8}$/);
+    const listed = listing.find((s) => s.name === 'conveyor-77');
+    expect(listed).toBeDefined();
+    expect(listed.sessionId.startsWith(handle)).toBe(true);
+    expect(listing.map((s) => s.sessionId)).not.toContain('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
   });
 
   it('a leading-dash brief is refused by the dispatcher — and the parser proves the refusal is load-bearing', () => {

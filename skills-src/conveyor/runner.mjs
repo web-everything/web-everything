@@ -27,12 +27,27 @@
  *
  * PURE-CORE / IO-SHELL SPLIT (the hard design constraint, mirrored from tick-core.mjs):
  *   • The PURE core ({@link carryForward}, {@link shouldStop}, {@link tickSurface}, {@link runLoop}) has NO
- *     fs / child_process / clock of its own — every effect (stepping a tick, the mechanical passes, emitting,
- *     heartbeating the lease, sleeping) is INJECTED. `runLoop` is the runner's whole control flow, unit-tested
- *     (skills-src/conveyor/__tests__/runner.test.mjs) with fake effects — no git/network, no real lease.
+ *     fs / child_process / clock of its own — every effect (stepping a tick, dispatching, the mechanical
+ *     passes, emitting, heartbeating the lease, sleeping) is INJECTED. `runLoop` is the runner's whole control
+ *     flow, unit-tested (skills-src/conveyor/__tests__/runner.test.mjs) with fake effects — no git/network, no
+ *     real lease, no `claude` process.
  *   • The IO SHELL (the `main()` CLI + the `cli*` effect builders, gated on the main-module check) shells
- *     `tick-core.mjs` (bookkeeping in on STDIN, `{ decisions, nextState }` out), runs the two deterministic
- *     passes, prints the surface, and heartbeats the real singleton lease.
+ *     `tick-core.mjs` (bookkeeping in on STDIN, `{ decisions, nextState }` out), calls `dispatch-lane` for each
+ *     surfaced decision (#3383), runs the two deterministic passes, prints the surface, and heartbeats the
+ *     real singleton lease.
+ *
+ * #3383 — WHAT CHANGED FROM "THREADS `nextState` FORWARD UNCHANGED". The runner still never re-derives a
+ * guard — that invariant is intact. But it is no longer accurate to say it carries THIS tick's own
+ * `nextState` forward byte-identical: `dispatchPass` (below) calls `dispatch-lane` once per surfaced
+ * decision, and EACH call runs its OWN nested `tick-core` read, which is where a newly-dispatched item's
+ * guard entry actually gets ADDED to `nextState` — a fact the runner's own top-level tick read (made BEFORE
+ * any dispatching happens) cannot know. Carrying that stale copy forward instead of the dispatch pass's own
+ * updated one would make the runner's bookkeeping silently drift from what actually got dispatched: the same
+ * item would re-surface and get RE-INVOKED every tick for its whole build lifetime, forever — not a second
+ * live agent (dispatch-lane's OWN double-dispatch guard still catches that), but a wasted subprocess spawn
+ * every ~120s for as long as anything is building. So `runLoop` now carries forward the DISPATCH PASS's
+ * `nextState` when one ran, not the raw tick read's — still the tick core's own answer, just the latest one,
+ * and still nothing the runner computed itself.
  */
 
 import { dirname, join } from 'node:path';
@@ -96,13 +111,19 @@ export function tickSurface(out) {
 
 /**
  * The runner's WHOLE control flow, as a reducer over injected effects — so it is unit-testable with fakes and
- * carries no IO of its own. Each tick: step the core (`tickOnce`), emit the surface, run the deterministic
- * mechanical passes, check stop, heartbeat the singleton lease, sleep, then carry `nextState` forward. A lost
- * lease (another process reclaimed a stale runner) STOPS the loop — the singleton right to drive is gone.
+ * carries no IO of its own. Each tick: step the core (`tickOnce`), emit the surface, dispatch the surfaced
+ * decisions (`dispatchPass`), run the deterministic mechanical passes, check stop, heartbeat the singleton
+ * lease, sleep, then carry the DISPATCH PASS's `nextState` forward (see the file header, #3383, for why that
+ * is not the same as this tick's own raw read). A lost lease (another process reclaimed a stale runner) STOPS
+ * the loop — the singleton right to drive is gone.
  *
  * @param {object} effects
  * @param {(payload:object)=>Promise<object>|object} effects.tickOnce  step the tick core → `{ decisions, nextState }`
  * @param {(surface:object,ctx:object)=>any} [effects.emit]            surface the tick (status + notes + dispatch)
+ * @param {(ctx:{tick:number,out:object})=>Promise<{nextState:object}>} [effects.dispatchPass]
+ *   call `dispatch-lane` once per surfaced decision (#3383) and return the nextState after all of them —
+ *   defaults to an identity pass-through (`out.nextState`, unchanged) so a caller with nothing to dispatch
+ *   through pays no cost and needs no override.
  * @param {(ctx:object)=>any} [effects.mechanicalPasses]              run the no-LLM passes (§4b infra, §4c reaper)
  * @param {()=>boolean|Promise<boolean>} [effects.heartbeat]           extend the singleton lease; false ⇒ lost
  * @param {(ms:number)=>any} [effects.sleep]                           wait between ticks
@@ -114,6 +135,7 @@ export function tickSurface(out) {
 export async function runLoop({
   tickOnce,
   emit = () => {},
+  dispatchPass = async ({ out } = {}) => ({ nextState: (out && out.nextState) || {} }),
   mechanicalPasses = () => {},
   heartbeat = () => true,
   sleep = () => {},
@@ -132,6 +154,15 @@ export async function runLoop({
     const out = await tickOnce(payload);
     lastOut = out;
     await emit(tickSurface(out), { tick });
+
+    // DISPATCH what this tick decided (#3383), BEFORE the mechanical passes — those are unrelated (infra
+    // recovery, lease reaping) and neither reads nor produces `nextState`. Best-effort, same as
+    // `mechanicalPasses` below: a dispatch failure must not wedge the loop. On a throw, `dispatched` keeps
+    // its default (this tick's own raw `nextState`) — the same degraded-but-safe behaviour the runner had
+    // before this pass existed, never worse.
+    let dispatched = { nextState: (out && out.nextState) || {} };
+    try { dispatched = await dispatchPass({ tick, out }); } catch { /* best-effort */ }
+
     // Best-effort deterministic passes — a throw here must never wedge the loop (mirrors the SKILL's §4b/§4c
     // "best-effort; its exit never gates the tick").
     try { await mechanicalPasses({ tick, out }); } catch { /* best-effort — a pass failure never stalls a tick */ }
@@ -145,11 +176,11 @@ export async function runLoop({
     if (!alive) { stoppedReason = 'lease-lost'; break; }
 
     await sleep(intervalMs);
-    // No `signals` folded in: this runner spawns no LLM agents (it only SURFACES the core's decisions — #2701
-    // clause 3), so it observes no agent RETURN and has no `returnedBuildNums` to inject. Build guards still
-    // retire via the CLAIMED path off each tick's fresh state read. Folding observed returns is #2703's job
-    // (wiring headless agent-spawning), not this slice's.
-    payload = carryForward(out);
+    // No `signals` folded in: `dispatchPass` starts agents but does not WATCH them run to completion, so there
+    // is still no `returnedBuildNums` to inject here — that remains a later slice. `nextState` DOES come from
+    // the dispatch pass now, not the raw tick read — see the file header (#3383) for why carrying the stale
+    // one forward would silently re-surface an already-dispatched item every tick.
+    payload = carryForward({ ...out, nextState: dispatched.nextState }, {});
     tick += 1;
   }
   return { ticks: tick + 1, stoppedReason, lastOut };
@@ -193,6 +224,71 @@ function makeCliMechanicalPasses({ scriptsDir, repo = null }) {
     };
     runQuiet('conveyor/infra-blocked.mjs', ['retry']);
     runQuiet('conveyor/lease-reaper.mjs');
+  };
+}
+
+/**
+ * Build the real `dispatchPass` effect (#3383): call `dispatch-lane` once per item this tick's core surfaced
+ * — builds, then prepareScope, then prepareDecision, then fixes, then ciHeals ({@link tickSurface}'s own
+ * order) — and hand back the bookkeeping after all of them.
+ *
+ * SEQUENTIAL, NEVER PARALLEL. `dispatch-lane` runs its own nested `tick-core` read per call, which is where a
+ * just-dispatched item's guard entry actually gets added to `nextState`. Item 2 must see item 1's guard or the
+ * two could both read "not yet guarded" and both clear a lane the double-dispatch guard exists to serialize —
+ * running them in parallel would reopen exactly the race the guard is for.
+ *
+ * THE BOOKKEEPING FILE IS BARE, not `{ bookkeeping: … }`. `forwardableBookkeeping`
+ * ({@link ../../scripts/operations/dispatch-lane-io.mjs}) accepts either shape, but the wrapped one recognizes
+ * only a `bookkeeping` key and reports every sibling as a DROPPED key — so wrapping `nextState` under a
+ * `signals` or similar key here would make every call log a spurious drop for a key nothing ever meant to send.
+ *
+ * A PER-ITEM FAILURE NEVER STOPS THE TICK (mirrors `makeCliMechanicalPasses`'s "best-effort, never wedge"):
+ * a spawn throw, a non-zero exit, or unparsable stdout is caught, logged to stderr, and the loop keeps the
+ * PRIOR `nextState` for that item and moves on — one bad `dispatch-lane` call must not block the rest of this
+ * tick's dispatches.
+ *
+ * `repo` IS ACCEPTED BUT NOT FORWARDED. Unlike `tick-core.mjs` / the mechanical passes, `dispatch-lane`'s own
+ * declared input has no `repo` field — its repo root is resolved by script location
+ * (`dispatch-lane-io.mjs`'s `REPO_ROOT`), never by a flag or cwd. Passing `--repo=` would be refused as an
+ * unknown flag and fail every dispatch this tick, so the parameter exists only for call-site symmetry with
+ * `makeCliTickOnce` / `makeCliMechanicalPasses`.
+ */
+function makeCliDispatchPass({ scriptsDir, repo = null } = {}) {
+  void repo; // see the doc comment above: dispatch-lane declares no --repo input
+  return async ({ out } = {}) => {
+    let nextState = (out && out.nextState) || {};
+    const d = tickSurface(out).dispatch;
+    const items = [...d.builds, ...d.prepareScope, ...d.prepareDecision, ...d.fixes, ...d.ciHeals];
+    if (!items.length) return { nextState };
+
+    const { execFileSync } = await import('node:child_process');
+    const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const runMjs = join(scriptsDir, 'operations', 'run.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'we-conveyor-dispatch-'));
+    try {
+      for (let i = 0; i < items.length; i += 1) {
+        const item = items[i];
+        try {
+          const file = join(dir, `bk-${i}.json`);
+          writeFileSync(file, JSON.stringify(nextState));
+          const args = [runMjs, 'dispatch-lane', `--num=${item.num}`, `--bookkeepingFile=${file}`, '--json'];
+          const stdout = execFileSync('node', args, {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+            maxBuffer: 32 * 1024 * 1024,
+          });
+          const parsed = JSON.parse(stdout);
+          const updated = parsed && parsed.findings && parsed.findings.read && parsed.findings.read.tickNextState;
+          if (updated && typeof updated === 'object') nextState = updated;
+        } catch (e) {
+          process.stderr.write(`⚠ dispatch-lane --num=${item.num} failed (non-fatal): ${String(e.message || e).split('\n')[0]}\n`);
+        }
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    return { nextState };
   };
 }
 
@@ -276,6 +372,7 @@ async function main(argv) {
   const buildEffects = () => ({
     tickOnce: makeCliTickOnce({ tickCorePath: TICK_CORE, repo }),
     emit: makeCliEmit({ json }),
+    dispatchPass: makeCliDispatchPass({ scriptsDir: SCRIPTS_DIR, repo }),
     mechanicalPasses: makeCliMechanicalPasses({ scriptsDir: SCRIPTS_DIR, repo }),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     intervalMs,

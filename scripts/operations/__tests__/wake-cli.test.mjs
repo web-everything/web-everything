@@ -40,6 +40,13 @@ const WAKE_CLI = resolve(HERE, '..', 'wake.mjs');
 const RUN_ID = 'run-wake-cli';
 const KEY = `${RUN_ID}#2#0`;
 const HANDLE = 'ffffffff-1111-2222-3333-444444444444';
+// #3331: `entry.handle` is now the SHORT id the CLI's own `--bg` confirmation carries, not the minted
+// `sessionId` — a genuine prefix of it. `HANDLE` stays the FULL id used in every `agents` listing fixture
+// below (realistic — that is what `claude agents --json` actually reports), and `SHORT_HANDLE` is what
+// `parkOneDispatch`'s sink now records and every dispatch-side assertion compares against.
+const SHORT_HANDLE = HANDLE.split('-')[0];
+/** A fake `--bg` confirmation carrying `shortId`, shaped exactly like the real CLI's (#3331). */
+const bgStdout = (shortId, name = 'conveyor-3037') => `backgrounded · ${shortId} · ${name}\n`;
 /** A PRIMARY checkout — the sink refuses to dispatch from a lane clone, which is what the default resolves to. */
 const PRIMARY = '/primary/webeverything';
 const BRIEF = 'build #{{ITEM_NUM}} at {{ITEM_SPEC_PATH}} in lane {{LANE}} as {{SESSION_SLUG}} scoped {{SCOPE}}';
@@ -95,7 +102,9 @@ async function parkOneDispatch({ ageMs = 10 * 60 * 1000 } = {}) {
   let run = advanceWhileRunning(startRun({ op: DISPATCH_LANE_OP, id: RUN_ID, input: { num: '3037' }, registry }), { registry });
   expect(runStatus(run, { registry })).toBe('awaiting-effect');
   // `claude --bg` is not run on this side either; the in-flight write, the handle and the deadline are real.
-  const sinks = createDispatchSinks({ root: PRIMARY, spawnAgent: () => '', mintSessionId: () => HANDLE });
+  // #3331: the handle recorded is what the (faked) confirmation carries, not the minted id — `mintSessionId`
+  // only feeds the ignored `--session-id` flag now.
+  const sinks = createDispatchSinks({ root: PRIMARY, spawnAgent: () => bgStdout(SHORT_HANDLE), mintSessionId: () => HANDLE });
   run = (await applyPendingEffects(run, { sinks, store })).run;
   expect(run.effects[0].status).toBe('in-flight');
 
@@ -488,8 +497,9 @@ describe('--resolve refuses a LIVE handle, and a retry never orphans the handle 
     expect(entry.handle).toBe('sess-2');
     expect(entry.status).toBe('in-flight');
     // sess-1 IS STILL FINDABLE — the whole point. The review's reproduction asked exactly this question of the
-    // record and got `false`.
-    expect(entry.supersededHandles.map((h) => h.handle)).toEqual([HANDLE]);
-    expect(JSON.stringify(store.read(RUN_ID))).toContain(HANDLE);
+    // record and got `false`. #3331: the superseded handle is the SHORT id `parkOneDispatch`'s sink actually
+    // recorded, not the full `HANDLE` it minted (which was never what got stored).
+    expect(entry.supersededHandles.map((h) => h.handle)).toEqual([SHORT_HANDLE]);
+    expect(JSON.stringify(store.read(RUN_ID))).toContain(SHORT_HANDLE);
   }, CHILD_PROCESS_TIMEOUT_MS);
 });

@@ -9,10 +9,14 @@
  * {@link ./review-pr-io.mjs} use, and what lets the declaration be unit-tested with a two-line stub spawner.
  *
  * EVERY BINDING HERE SHELLS SOMETHING THAT ALREADY EXISTS, or writes one file:
- *   - the panelist spawn is `claude --bg --session-id <uuid>`, the SAME minted-handle contract
- *     `dispatch-lane`'s sink established (#3037) — the id is chosen before the agent exists, so the handle
- *     cannot be attributed to the wrong session;
- *   - the liveness axis is `claude agents --json`, asked exactly as the dispatch observer asks it;
+ *   - the panelist spawn is `claude --bg --session-id <uuid>` — `--session-id` is PASSED but PROVEN IGNORED by
+ *     the real CLI on a `--bg` spawn (#3331), same as `dispatch-lane`'s sink now documents. The minted id is
+ *     kept for a DIFFERENT reason here: {@link panelistReportPath} uses it (never the CLI's real session id,
+ *     which does not exist until after the agent starts) to keep one attempt's report off a name a sibling
+ *     panelist or a retry could guess. Liveness matching does not use it at all — see
+ *     {@link investigatorSessionName} and the observer below;
+ *   - the liveness axis is `claude agents --json`, asked exactly as the dispatch observer asks it, but matched
+ *     by NAME (the deterministic `-n` this sink sets), not by id — #3331 again;
  *   - filing a story is `we:scripts/backlog.mjs scaffold --json`, the real CLI — so JIT hash numbering (#2288),
  *     the skeleton renderer and the guarded write are ONE implementation, not a second one that drifts.
  *
@@ -70,6 +74,7 @@ import { laneGuardDecision, resolveReal, workspaceRootOf } from '../guard-lane.m
 import { assertPublishableContent } from '../backlog/guarded-write.mjs';
 import { localToday } from '../lib/local-date.mjs';
 import { inFlight, notApplied } from './effect-executor.mjs';
+import { normalizeHandle } from './dispatch-lane-io.mjs';
 import { isValidRunId } from './run-record.mjs';
 import {
   DEFAULT_EXPECTED_WITHIN_MINUTES,
@@ -247,6 +252,25 @@ export function composeInvestigationPrompt(brief, reportPath) {
  * options intermixed with operands, so a leading dash can be read as a flag. Same refusal, same reason, as
  * `dispatch-lane-io.mjs#buildAgentArgv`.
  */
+/**
+ * THE DETERMINISTIC `-n` NAME for one panelist's session — the run and the seat, which together are the only
+ * identity this operation has. Trimmed of leading separators on the id's tail so the name reads
+ * `explore-<tail>-p1` rather than `explore--fixture-p1` when the cut lands on a dash.
+ *
+ * PURE AND SHARED (#3331), deliberately: {@link buildInvestigatorArgv} sets this via `-n` at dispatch time, and
+ * `createExploreObservers`'s liveness axis recomputes the SAME value from `(runId, panelist)` to find the
+ * session in `claude agents --json` by name — the real handle `--bg` reports is unknown to the dispatcher, and
+ * proven unaddressable from `--session-id` (#3331), but the name is CLI-respected and needs no round trip.
+ * One function, not two independent literals that could drift.
+ *
+ * @param {string} runId
+ * @param {string} panelist
+ * @returns {string}
+ */
+export function investigatorSessionName(runId, panelist) {
+  return `explore-${String(runId).slice(-8).replace(/^[^A-Za-z0-9]+/, '')}-${String(panelist ?? 'p')}`;
+}
+
 export function buildInvestigatorArgv({ sessionId, runId, payload, prompt, extraArgs = [] }) {
   const text = String(prompt || '');
   if (!text.trim()) throw notApplied('explore: refusing to start an investigator with an empty prompt');
@@ -256,10 +280,7 @@ export function buildInvestigatorArgv({ sessionId, runId, payload, prompt, extra
   return [
     '--bg',
     '--session-id', String(sessionId),
-    // NAMED so `claude agents` is legible to an operator watching a committee: the run and the seat, which
-    // together are the only identity this operation has. The id's tail is trimmed of leading separators so the
-    // name reads `explore-<tail>-p1` rather than `explore--fixture-p1` when the cut lands on a dash.
-    '-n', `explore-${String(runId).slice(-8).replace(/^[^A-Za-z0-9]+/, '')}-${String(payload?.panelist ?? 'p')}`,
+    '-n', investigatorSessionName(runId, payload?.panelist),
     ...extraArgs.map(String),
     text,
   ];
@@ -819,7 +840,11 @@ export function createExploreObservers({
       if (!Array.isArray(sessions)) {
         throw new TypeError('explore-io: `claude agents --json` did not return an array');
       }
-      if (sessions.some((s) => s && String(s.sessionId) === handle)) return { status: 'running', result: null };
+      // #3331: matched by NAME, not by `handle` — the CLI ignores `--session-id` on a `--bg` spawn, so the
+      // minted id `handle` carries (needed for the report path, above) is never the id the listing reports.
+      // `-n` IS respected, and `investigatorSessionName` recomputes the exact value the sink set it to.
+      const expectedName = normalizeHandle(investigatorSessionName(ctx.runId, panelist));
+      if (sessions.some((s) => s && normalizeHandle(s.name) === expectedName)) return { status: 'running', result: null };
 
       // NOT-YET-LISTED IS NOT GONE. `--bg` returns before the session is necessarily visible.
       const started = entry?.startedAt ? Date.parse(entry.startedAt) : NaN;

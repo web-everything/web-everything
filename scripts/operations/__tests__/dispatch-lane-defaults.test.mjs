@@ -279,12 +279,15 @@ describe('the PRODUCTION callers reach those defaults — a tested default nothi
   });
 
   it('the sink goes through `defaultSpawnAgent`, timeout and all', async () => {
-    const { exec, calls } = spyExec('');
+    // #3331: stdout has to carry a real `backgrounded · <id> · <name>` line — the sink now reads the handle
+    // from it (the CLI ignores `--session-id`), and an empty stdout would make this dispatch indeterminate.
+    const { exec, calls } = spyExec('backgrounded · a9a9a9a9 · conveyor-3037\n');
     const sinks = createDispatchSinks({ root: '/primary/webeverything', exec, mintSessionId: () => 'sess-z9' });
-    await sinks[DISPATCH_EFFECT]({ num: '3037', sessionSlug: 'conveyor-3037', prompt: '# go', expectedWithinMinutes: 90 });
+    const result = await sinks[DISPATCH_EFFECT]({ num: '3037', sessionSlug: 'conveyor-3037', prompt: '# go', expectedWithinMinutes: 90 });
     expect(calls[0].file).toBe('claude');
     expect(calls[0].argv.slice(0, 3)).toEqual(['--bg', '--session-id', 'sess-z9']);
     expect(calls[0].opts).toMatchObject({ timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL' });
+    expect(result.handle).toBe('a9a9a9a9');
   });
 
   it('the observer goes through `defaultListAgents` — same argv, still no `--all`', async () => {
@@ -315,6 +318,69 @@ describe('the PRODUCTION callers reach those defaults — a tested default nothi
     // …and the PR axis running first does not cost the liveness axis: an empty page is no verdict, so the
     // agent listing is still read.
     expect(calls.some((c) => c.file === 'claude')).toBe(true);
+  });
+});
+
+describe('#3383 — readTick resolves LANE_REF for a fix/ci-heal launch, and pays no `gh` call for anything else', () => {
+  const baseIo = {
+    root: '/repo',
+    readText: () => 'brief {{ITEM_NUM}} {{PR_NUM}} {{LANE_REF}} {{LANE}} {{SESSION_SLUG}} {{SCOPE}}',
+    loadItems: () => [{ num: '3037', slug: 'x', specPath: 'backlog/3037-x.md', scope: ['we:scripts/'] }],
+    listInFlightDispatches: () => ({ runs: [], unreadable: 0 }),
+    listAgents: () => [],
+  };
+
+  it('a `fix` launch: prHeadRef comes off listPrs(), matched on launch.pr — never a second gh call per dispatch', () => {
+    let listPrsCalls = 0;
+    const v = readTick({
+      num: '3037',
+      ...baseIo,
+      runNode: () => JSON.stringify({ decisions: { spawnFixes: [{ num: '3037', lane: 8, pr: 701 }] }, nextState: { fixGuards: [{ num: '3037', pr: 701, lane: 8, spawnedTick: 0 }] } }),
+      listPrs: () => { listPrsCalls += 1; return [{ number: 701, headRefName: 'lane/3037-x' }, { number: 999, headRefName: 'lane/other' }]; },
+    });
+    expect(v.launchKind).toBe('fix');
+    expect(v.prHeadRef).toBe('lane/3037-x');
+    expect(listPrsCalls).toBe(1);
+  });
+
+  it('a `build` launch never calls listPrs at all — a build dispatch has no PR yet to look up', () => {
+    let listPrsCalls = 0;
+    const v = readTick({
+      num: '3037',
+      ...baseIo,
+      runNode: () => JSON.stringify({ decisions: { spawnBuilds: [{ num: '3037', lane: 8 }] }, nextState: { buildGuards: [{ num: '3037', lane: 8, spawnedTick: 0 }] } }),
+      listPrs: () => { listPrsCalls += 1; return []; },
+    });
+    expect(v.launchKind).toBe('build');
+    expect(v.prHeadRef).toBeNull();
+    expect(listPrsCalls).toBe(0);
+  });
+
+  it('a `ci-heal` launch resolves against nextState.ciHealGuards, not buildGuards/prepareGuards/fixGuards', () => {
+    const v = readTick({
+      num: '3037',
+      ...baseIo,
+      runNode: () => JSON.stringify({
+        decisions: { spawnCiHeals: [{ num: '3037', lane: 8, pr: 701, reason: 'red-ci' }] },
+        nextState: {
+          buildGuards: [{ num: '3037', lane: 9, spawnedTick: 0 }], // a decoy under the SAME num, wrong list
+          ciHealGuards: [{ num: '3037', pr: 701, lane: 8, spawnedTick: 0 }],
+        },
+      }),
+      listPrs: () => [{ number: 701, headRefName: 'lane/3037-x' }],
+    });
+    expect(v.launchKind).toBe('ci-heal');
+    expect(v.dispatchedGuard).toEqual({ num: '3037', pr: 701, lane: 8, spawnedTick: 0 });
+  });
+
+  it('a listPrs() that throws degrades to a null prHeadRef rather than crashing the read — shapeDispatchRead then refuses the dispatch, loudly, not this reader silently', () => {
+    const v = readTick({
+      num: '3037',
+      ...baseIo,
+      runNode: () => JSON.stringify({ decisions: { spawnFixes: [{ num: '3037', lane: 8, pr: 701 }] }, nextState: { fixGuards: [] } }),
+      listPrs: () => { throw new Error('gh is down'); },
+    });
+    expect(v.prHeadRef).toBeNull();
   });
 });
 

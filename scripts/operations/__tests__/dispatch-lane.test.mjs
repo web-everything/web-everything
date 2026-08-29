@@ -64,7 +64,9 @@ import {
   REPO_ROOT,
   forwardableBookkeeping,
   inFlightDispatchesFor,
+  isHandleListed,
   isPreSpawnRefusal,
+  parseBackgroundedHandle,
   readTick,
   stampLiveness,
 } from '../dispatch-lane-io.mjs';
@@ -76,6 +78,14 @@ const OPS_DIR = resolvePath(dirname(fileURLToPath(import.meta.url)), '..');
  * in one, and the sink refuses to dispatch from a lane.
  */
 const PRIMARY = '/primary/webeverything';
+
+/**
+ * A fake `--bg` confirmation, shaped exactly the way the real CLI's is (#3331): `parseBackgroundedHandle`
+ * reads `shortId` off this, not off the minted `sessionId` a test injects via `mintSessionId` — the mint is
+ * pinned into the argv only, proven ignored by the real CLI. Tests that need a specific `handle` on the
+ * resulting entry pass their own `shortId` here rather than relying on what was minted.
+ */
+const bgStdout = (shortId, name = 'n') => `backgrounded · ${shortId} · ${name}\n`;
 
 /** A brief template with every placeholder the operation fills, and nothing else. */
 const BRIEF = [
@@ -630,14 +640,16 @@ describe('the declared effect is a dispatch', () => {
     const store = createMemoryRunStore();
     const sinks = createDispatchSinks({
       root: PRIMARY,
-      spawnAgent: () => '',
+      spawnAgent: () => bgStdout('a1a1a1a1'),
       mintSessionId: () => '11111111-2222-3333-4444-555555555555',
       now: () => new Date('2026-08-13T10:00:00.000Z'),
     });
     const outcome = await applyPendingEffects(run, { sinks, store });
     const entry = outcome.run.effects[0];
     expect(entry.status).toBe('in-flight');
-    expect(entry.handle).toBe('11111111-2222-3333-4444-555555555555');
+    // #3331: the recorded handle is what the CLI's OWN confirmation carried, never the minted sessionId — the
+    // mint is proven ignored by a real `--bg` spawn.
+    expect(entry.handle).toBe('a1a1a1a1');
     expect(entry.expectedBy).toBe('2026-08-13T11:30:00.000Z'); // 90 minutes, the declared default
     expect(entry.startedAt).toBeTruthy();
     expect(outcome.inFlight).toEqual([entry.key]);
@@ -652,19 +664,21 @@ describe('the declared effect is a dispatch', () => {
     const { run } = runTo();
     const store = createMemoryRunStore();
     let spawns = 0;
-    const sinks = createDispatchSinks({ root: PRIMARY, spawnAgent: () => { spawns += 1; return ''; }, mintSessionId: () => 'sess-a1' });
+    const sinks = createDispatchSinks({
+      root: PRIMARY, spawnAgent: () => { spawns += 1; return bgStdout('a2a2a2a2'); }, mintSessionId: () => 'sess-a1',
+    });
     const first = await applyPendingEffects(run, { sinks, store });
     const second = await applyPendingEffects(first.run, { sinks, store });
     expect(spawns).toBe(1);
     expect(second.inFlight).toEqual([first.run.effects[0].key]);
-    expect(second.run.effects[0].handle).toBe('sess-a1');
+    expect(second.run.effects[0].handle).toBe('a2a2a2a2');
   });
 
   it('honours a caller\'s own expectedWithinMinutes', async () => {
     const { run } = runTo(tickRead(), { num: '3037', expectedWithinMinutes: 15 });
     const store = createMemoryRunStore();
     const sinks = createDispatchSinks({
-      root: PRIMARY, spawnAgent: () => '', mintSessionId: () => 'sess-b2', now: () => new Date('2026-08-13T10:00:00.000Z'),
+      root: PRIMARY, spawnAgent: () => bgStdout('b2b2b2b2'), mintSessionId: () => 'sess-b2', now: () => new Date('2026-08-13T10:00:00.000Z'),
     });
     const outcome = await applyPendingEffects(run, { sinks, store });
     expect(outcome.run.effects[0].expectedBy).toBe('2026-08-13T10:15:00.000Z');
@@ -745,8 +759,17 @@ describe('what the sink actually runs', () => {
   });
 
   it('the sink returns a real in-flight marker, not a look-alike', async () => {
-    const sinks = createDispatchSinks({ root: PRIMARY, spawnAgent: () => '', mintSessionId: () => 'sess-d4' });
+    const sinks = createDispatchSinks({ root: PRIMARY, spawnAgent: () => bgStdout('d4d4d4d4'), mintSessionId: () => 'sess-d4' });
     expect(isInFlightResult(await sinks[DISPATCH_EFFECT]({ prompt: 'p', sessionSlug: 's', num: '1' }))).toBe(true);
+  });
+
+  it('#3331: a spawn that returns 0 but prints no parseable confirmation is INDETERMINATE, same as a thrown spawn', async () => {
+    const { run } = runTo();
+    const store = createMemoryRunStore();
+    const sinks = createDispatchSinks({ root: PRIMARY, spawnAgent: () => 'not the shape we expect\n' });
+    const outcome = await applyPendingEffects(run, { sinks, store });
+    expect(outcome.run.effects[0]).toMatchObject({ status: 'in-flight', handle: null });
+    expect(inFlightEntries(outcome.run).unknown).toHaveLength(1);
   });
 });
 
@@ -1184,6 +1207,17 @@ describe('the tick reader', () => {
     expect(out.livenessSource).toBe('not-needed');
   });
 
+  // ── #3331: the handle is now a SHORT id, and the comparison against a listing has to be a prefix ───────────
+
+  it('#3331: G1 matches a SHORT handle (what a real dispatch now records) against a FULL listed sessionId', () => {
+    const rows = [{ runId: 'a', handle: 'a1a1a1a1' }, { runId: 'b', handle: 'b2b2b2b2' }];
+    const out = stampLiveness(
+      { runs: rows, unreadable: 0 },
+      { listAgents: () => [{ sessionId: 'a1a1a1a1-2222-3333-4444-555555555555' }] },
+    );
+    expect(out.runs.map((r) => r.live)).toEqual([true, false]);
+  });
+
   it('G1: the READ wires the liveness answer onto the rows the declaration ages against', () => {
     // The seam that matters: `dispatchStillHolds` is pure, so a `live` field that never got stamped would
     // silently put every hold back on the clock — the exact defect round 2 found, one level up.
@@ -1550,5 +1584,44 @@ describe('#3383 — ITEM_SCOPED_LAUNCH_KINDS / PR_REPAIR_LAUNCH_KINDS are the ex
 
   it('PR_REPAIR_LAUNCH_KINDS is exactly {fix, ci-heal} — the two kinds that reconstitute from an existing PR ref', () => {
     expect([...PR_REPAIR_LAUNCH_KINDS].sort()).toEqual(['ci-heal', 'fix']);
+  });
+});
+
+describe('#3331 — parseBackgroundedHandle: the CLI ignores --session-id, so this is the ONLY handle source', () => {
+  it('reads the short id off a real `--bg` confirmation line', () => {
+    expect(parseBackgroundedHandle('backgrounded · 1ae0905c · probe-listing-lag-1787948603\n  claude agents             list sessions\n'))
+      .toBe('1ae0905c');
+  });
+
+  it('is case-insensitive on input, normalizes to lower case', () => {
+    expect(parseBackgroundedHandle('backgrounded · 1AE0905C · n\n')).toBe('1ae0905c');
+  });
+
+  it('returns null for stdout that does not carry the shape — never a best-effort guess', () => {
+    expect(parseBackgroundedHandle('')).toBeNull();
+    expect(parseBackgroundedHandle('ok\n')).toBeNull();
+    expect(parseBackgroundedHandle('some unrelated CLI output\n')).toBeNull();
+    expect(parseBackgroundedHandle(undefined)).toBeNull();
+  });
+});
+
+describe('#3331 — isHandleListed: prefix match, because a short handle is never equal to a full sessionId', () => {
+  it('matches a short handle against the full id it is a prefix of', () => {
+    expect(isHandleListed('1ae0905c', [{ sessionId: '1ae0905c-314c-4f73-a7c4-3973a9005e82' }])).toBe(true);
+  });
+
+  it('still matches a full handle against itself — forward-compatible if a future CLI honours --session-id', () => {
+    expect(isHandleListed('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', [{ sessionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }])).toBe(true);
+  });
+
+  it('does not match a handle that is merely a SUBSTRING rather than a PREFIX', () => {
+    expect(isHandleListed('0905c314', [{ sessionId: '1ae0905c-314c-4f73-a7c4-3973a9005e82' }])).toBe(false);
+  });
+
+  it('is case-insensitive and false on empty/missing input', () => {
+    expect(isHandleListed('1AE0905C', [{ sessionId: '1ae0905c-314c-4f73-a7c4-3973a9005e82' }])).toBe(true);
+    expect(isHandleListed('', [{ sessionId: 'anything' }])).toBe(false);
+    expect(isHandleListed(null, [{ sessionId: 'anything' }])).toBe(false);
+    expect(isHandleListed('x', null)).toBe(false);
   });
 });

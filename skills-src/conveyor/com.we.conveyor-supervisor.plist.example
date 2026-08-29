@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  EXAMPLE ONLY — NOT INSTALLED, NOT LOADED, INERT.
+
+  This file is a reference for what a launchd LaunchAgent for skills-src/conveyor/supervisor.mjs would look
+  like, mirrored from the plateau-app drain-daemon's real plist (~/Library/LaunchAgents/com.plateau.drain-
+  daemon.plist). It is deliberately checked in as `.plist.example`, NOT `.plist`, and lives in the repo, NOT
+  in ~/Library/LaunchAgents/ — launchd only discovers files in its LaunchAgents/LaunchDaemons directories, so
+  this file being here has no effect on the machine until a human deliberately copies it there and runs
+  `launchctl load`/`bootstrap`. That is an intentional, separate, human decision — never something this
+  supervisor build should do as a side effect.
+
+  To actually install it (NOT done as part of building the supervisor):
+    1. Copy to ~/Library/LaunchAgents/com.we.conveyor-supervisor.plist
+    2. Fill in the real `node` path (see `which node`) and confirm WorkingDirectory
+    3. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.we.conveyor-supervisor.plist`
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.we.conveyor-supervisor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/Users/YOU/workspace/webeverything/skills-src/conveyor/supervisor.mjs</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/YOU/workspace/webeverything</string>
+  <!-- RunAtLoad + KeepAlive: residency survives crash, logout/login, reboot, and sleep by construction —
+       launchd is the OS-level supervisor of THIS process; this process is in turn the supervisor of
+       runner.mjs. ThrottleInterval guards against launchd itself relaunching faster than the supervisor's own
+       backoff would (a launchd-level floor under the supervisor's in-process exponential backoff). -->
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/YOU/workspace/webeverything/.conveyor-supervisor/supervisor.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOU/workspace/webeverything/.conveyor-supervisor/supervisor.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>

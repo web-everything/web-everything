@@ -31,6 +31,12 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const OBSERVE_SCRIPT = resolve(HERE, '..', '__fixtures__', 'observe-dispatch.mjs');
 const RUN_ID = 'run-dispatch-xproc';
 const HANDLE = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+// #3331: `entry.handle` is the SHORT id the CLI's own `--bg` confirmation carries, a genuine prefix of the
+// full id. `HANDLE` stays the FULL id used in `FIXTURE_AGENTS` (realistic — what `claude agents --json`
+// actually reports); `SHORT_HANDLE` is what the sink now records and what dispatch-side assertions compare.
+const SHORT_HANDLE = HANDLE.split('-')[0];
+/** A fake `--bg` confirmation carrying `shortId`, shaped exactly like the real CLI's (#3331). */
+const bgStdout = (shortId, name = 'conveyor-3037') => `backgrounded · ${shortId} · ${name}\n`;
 
 const BRIEF = 'build #{{ITEM_NUM}} at {{ITEM_SPEC_PATH}} in lane {{LANE}} as {{SESSION_SLUG}} scoped {{SCOPE}}';
 /** A PRIMARY checkout — the sink refuses to dispatch from a lane clone, which is what the default resolves to here. */
@@ -63,7 +69,9 @@ async function dispatchAndPark({ startedAt = '2026-08-13T09:00:00.000Z' } = {}) 
 
   // The one thing stubbed on THIS side: `claude --bg` is not run. Everything else — the in-flight write, the
   // handle, the deadline — is the real executor and the real sink.
-  const sinks = createDispatchSinks({ root: PRIMARY, spawnAgent: () => '', mintSessionId: () => HANDLE, now: () => new Date('2026-08-13T09:00:00.000Z') });
+  const sinks = createDispatchSinks({
+    root: PRIMARY, spawnAgent: () => bgStdout(SHORT_HANDLE), mintSessionId: () => HANDLE, now: () => new Date('2026-08-13T09:00:00.000Z'),
+  });
   const outcome = await applyPendingEffects(run, { sinks, store });
   run = outcome.run;
   expect(run.effects[0].status).toBe('in-flight');
