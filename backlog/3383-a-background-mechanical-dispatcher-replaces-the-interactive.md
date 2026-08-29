@@ -12,6 +12,12 @@ tags: []
 
 # A background mechanical dispatcher replaces the interactive session as delivery supervisor
 
+> **STANDING GOAL FOR THIS EPIC (operator, 2026-08-29): improve the prototype and the machinery it
+> depends on — not deliver any particular backlog item.** Discard work on an item freely, without
+> ceremony, the moment it stops being the fastest path to a machinery finding. Do not treat landing a
+> PR as the point of a session on this card. See the 2026-08-29 session update below for what this
+> looked like in practice.
+
 ## The problem, stated plainly (2026-08-27/28, the operator's own words)
 
 "The big problem at the moment is that much of this is handled by a costly session that is getting
