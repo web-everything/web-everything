@@ -205,12 +205,21 @@ unit tests + the existing 34 lane-pool integration tests green, `check:standards
 commits on `origin/lane/mechanical-dispatcher-recovered` (`d0c83a7b`, `9bbb4ff3`), pushed and durable.
 
 **Delivery itself is still not proven end-to-end — this card's own "Done when" #1 remains open.** No PR
-was opened this session. `lane-40` still holds the first agent's real, correct, uncommitted-to-origin
-`#2936` fix (`b6dad636`) — worth salvaging into a real PR by hand, or discarding and letting the
-lease-reaper reclaim it past TTL; not decided here, per the operator's own "delivery is disposable" framing.
-Getting a genuinely free lane on this host (for a next real attempt) needs either the ambient contention to
-clear, or `provision --count=N` with `N` large enough to grow past the busy range (expensive — a real
-clone + npm install per new lane).
+was opened this session. `lane-40`'s `#2936` fix (`b6dad636`) was salvaged (cherry-picked, see below) rather
+than left orphaned or discarded — small, correct, cheap to keep. Getting a genuinely free lane on this host
+(for a next real attempt) needs either the ambient contention to clear, or `provision --count=N` with `N`
+large enough to grow past the busy range (expensive — a real clone + npm install per new lane).
+
+**Branch renamed — `-recovered` was a one-time incident label, not a name to keep.** `lane-11` never had a
+pushed named branch of its own (it sat on local `main` the whole time, tracked to `origin/main`) — so
+`lane/mechanical-dispatcher-recovered` was never a substitute for some "original" branch; it was the
+FIRST real branch this work ever had, created ad hoc during the lane-11 recovery. Keeping "recovered" as
+its permanent name reads as a standing incident flag long after the incident is over. **Renamed to
+`origin/lane/mechanical-dispatcher`** (same content plus the salvaged `#2936` cherry-pick, `3c3f7c7e`) —
+this is now the epic's branch of record; treat `-recovered` as superseded. `lane-40`'s lease was released
+(`we:scripts/lane-pool.mjs release --lane=40 --force`) now that its work is safely elsewhere. The old
+`-recovered` branch was left in place, not deleted, since deleting a pushed branch is exactly the kind of
+action to confirm with a person rather than do unprompted — safe to delete once nothing else references it.
 
 **For the next session, explicitly, so it does not have to be told twice:**
 - **The goal is improving the mechanical-dispatcher prototype and the machinery it depends on — not
