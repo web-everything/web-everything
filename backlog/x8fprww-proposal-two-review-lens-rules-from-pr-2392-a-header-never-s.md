@@ -37,6 +37,20 @@ FOUND 2026-09-21. The review of PR #2392 found two untested guards by mutation p
 
 **Proposed default: (1)**, correctness lens, folded with #3280 if the operator prefers one edit. Reason: option (2) has no grammar to gate on, and (3) leaves the gap this review found open.
 
+## Further evidence (2026-09-21)
+
+The review of PR #2400 (recorded 2026-09-21, reviewed sha `31a400872ffe0b4e57346c57a4fadf43d7676662`, verdict "prevention outstanding") produced exactly the same class of finding on two cards, this time in backlog cards rather than in a source-file header: a "must use X rather than Y" or "never" sentence in a card's fix section, with no Done-when case that fails under the wrong choice.
+
+- `x9vriie` (`acquire --lane=N --branch=<pr-branch>` refuses a clean lane as "ahead"): the fix section says the check must use the live `ls-remote` snapshot rather than stale local remote-tracking refs, but none of the three Done-when cases would fail if the fix used stale local refs. An implementation on stale refs would pass all three and silently discard a commit pushed to a since-deleted branch. Judged by the security lens, `PLAUSIBLE`, spec-only.
+- `xer3jlp` (lane leases outlive their work): the proposed janitor recycles lanes "dirty only by a one-line claim flip", which is also how a live worker's lane looks early in its work. The only guard, "never removes a lane whose lease is live and not stale", was prose in Done-when item 2 with no test. An implementation that ignores lease liveness would pass every listed test. Judged by the security lens, `CONFIRMED`, spec-only.
+- Both findings were spec-only: the cards' tests are unbuilt, so the reviewer could not run a mutation probe; the gap was found by reading the card. The two cards were amended afterwards with a named case each (a stale-tracking-ref fixture on `x9vriie`, a live-lease fixture on `xer3jlp`).
+
+**The rule this suggests, worded for cards:** every "must not", "must use X rather than Y" and "never" sentence in a card's fix section or Done-when needs a Done-when case, named and with its exact fixture, that fails under Y (the wrong choice the sentence rules out). The card should also say that the case fails under Y, so a reviewer can check the claim by reading. This is the card-side twin of this proposal's first rule (a "never" or "still refused" claim in a file header needs a named test for that exact line), and it belongs in the same review-lens brief, since one juror applies both.
+
+The PR #2400 review itself notes that a deterministic gate is not feasible, because these sentences are prose with no machine-readable form. So this is a review-lens rule, not a `check:standards` check: it strengthens the case for option (1) over option (2) above. It adds no new option, and it does not change the proposed default.
+
+Nothing is built and this card stays uncleared: it still needs the operator's OK.
+
 ## Done when
 
 Written for the proposed default (1). NOT to be built until the operator says so.
