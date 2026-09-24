@@ -194,7 +194,13 @@ describe('dispatch-lane fixture-root harness — REAL argv-building + guard logi
       FAKE_GH_FIXTURE: fakeGh.env.FAKE_GH_FIXTURE,
       FAKE_GH_LOG: fakeGh.env.FAKE_GH_LOG,
     };
-    const fakeExec = (cmd, args, opts = {}) => execFileSync(cmd, args, { ...opts, env: { ...combinedEnv, ...opts.env } });
+    // #x8mpubm follow-up — `defaultSpawnAgent` now ALWAYS supplies its own `env` (GH_TOKEN/GITHUB_TOKEN
+    // stripped; see `gh-app-shim.mjs#sanitizeSpawnEnv`), where before this file it never set one at all. This
+    // fixture's OWN routing keys (`PATH` pointing at the fakes, `FAKE_CLAUDE_LOG`/`FAKE_GH_*`) must win
+    // regardless — that is the entire point of the harness (see `fakeClaude.assertWins`) — so `combinedEnv`
+    // goes LAST. Whatever else the code under test puts in its own `env` (like the token-stripping) still
+    // comes through for every key `combinedEnv` does not itself define.
+    const fakeExec = (cmd, args, opts = {}) => execFileSync(cmd, args, { ...opts, env: { ...opts.env, ...combinedEnv } });
 
     return {
       caseRoot, runsDir, fakeClaude, combinedEnv, fakeExec,

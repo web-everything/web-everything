@@ -105,12 +105,18 @@ if (IS_CLI) {
     // The DURABLE re-arm comment — a readable record that the bounce was repaired and re-armed (not a silent
     // flip), AND the durable tally the matching counter reads back to survive a restart (#2643). Its first line
     // MUST be the matching marker (single-sourced) so posting and counting can never drift.
+    // #x01u7az — the rearmed-state sentence must say what the label swap ACTUALLY did, not assume `review:pending`
+    // always lands: on a `review:human` PR `decideSetLabel` now adds NOTHING (the human hold is already the
+    // pending-review signal; see that function's own comment for the live bug — PR #2549, 2026-09-24 — this
+    // closure's old unconditional "re-armed `review:pending`" text used to describe verbatim). Both branches read
+    // `decision.keepsHuman` once and render one of two true sentences instead of one sentence plus a footnote.
     buildComment: isConflictRound
       ? ({ actor, decision }) => [
           CONFLICT_FIX_COMMENT_MARKER,
           '',
-          `A mechanical conflict-resolution round (no other edits) was applied by ${actor}; the PR is re-armed` +
-            ` \`review:pending\` (an independent re-review is owed).${decision.keepsHuman ? ' `review:human` is kept — a gate-self edit stays human-ceremony-only.' : ''}`,
+          `A mechanical conflict-resolution round (no other edits) was applied by ${actor}; ${decision.keepsHuman
+            ? '`review:human` is KEPT as the sole hold — `review:pending` was not added (an independent review is already owed while the human hold stands; only a human `/review` ceremony clears it).'
+            : 'the PR is re-armed `review:pending` (an independent re-review is owed).'}`,
           '',
           'The fix agent did NOT clear the review — a human `/review` (or the drain AI-review convergence pass) re-verdicts. ' +
             'This round is counted against its OWN, smaller conflict-fix cap (#xkmu3gv), never the ordinary negotiation cap.',
@@ -118,8 +124,9 @@ if (IS_CLI) {
       : ({ actor, decision }) => [
           REARM_COMMENT_MARKER,
           '',
-          `The \`review:changes\` bounce was repaired and re-pushed by ${actor}; the PR is re-armed \`review:pending\`` +
-            ` (an independent re-review is owed).${decision.keepsHuman ? ' `review:human` is kept — a gate-self edit stays human-ceremony-only.' : ''}`,
+          `The \`review:changes\` bounce was repaired and re-pushed by ${actor}; ${decision.keepsHuman
+            ? '`review:human` is KEPT as the sole hold — `review:pending` was not added (an independent review is already owed while the human hold stands; only a human `/review` ceremony clears it).'
+            : 'the PR is re-armed `review:pending` (an independent re-review is owed).'}`,
           '',
           'The fix agent did NOT clear the review — a human `/review` (or the drain AI-review convergence pass) re-verdicts.',
         ].join('\n'),

@@ -4,7 +4,12 @@
 import { readFileSync } from 'node:fs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 
-export const OPEN_PR_LIST_FIELDS = 'number,headRefName,title,body,labels,files,mergeable,mergeStateStatus,headRefOid,statusCheckRollup,comments';
+// #3383 — `baseRefName` joined the union once `reconcile-pass.mjs` and `parked-pr-conflict-watch.mjs` each
+// started reading it (the STACKED-BASE CONFLICT branch needs it to tell a PR stacked on another lane/PR apart
+// from an ordinary conflict against `main`); `open-pr-fetch.test.mjs` pins this as the DEDUPLICATED UNION of
+// every standalone reader's own field list, so a reader that starts reading a new field and forgets to widen
+// this one goes red here, not silently.
+export const OPEN_PR_LIST_FIELDS = 'number,headRefName,title,body,labels,files,mergeable,mergeStateStatus,headRefOid,baseRefName,statusCheckRollup,comments';
 export const PR_LIST_LIMIT = 200;
 
 /** Throws on a failed fetch so the runner can fall back to each pass's standalone discovery. */

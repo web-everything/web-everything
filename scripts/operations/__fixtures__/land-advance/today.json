@@ -1,0 +1,6 @@
+[
+  {"repo":"plateau-app","number":153,"labels":["review:pending"],"headRefName":"lane/3140d-verify-gate-declared-rules","createdAt":"2026-09-08T00:00:00Z","updatedAt":"2026-09-08T12:14:00Z","mergeStateStatus":"CLEAN"},
+  {"repo":"we","number":2072,"labels":["ready-to-merge","review:accepted","review-round:1"],"body":"<!-- lane-manifest:begin -->\n```json\n{\"item\":3140,\"repos\":[{\"repo\":\"plateau-app\",\"ref\":\"lane/3140d-verify-gate-declared-rules\",\"carriesResolve\":false},{\"repo\":\"we\",\"ref\":\"lane/3140d-verify-gate-wiring-resolve\",\"carriesResolve\":true}]}\n```\n<!-- lane-manifest:end -->"},
+  {"repo":"we","number":2220,"labels":["review:accepted"],"baseRefName":"lane/mechanical-dispatcher"},
+  {"repo":"we","number":2108,"labels":["review:changes","review-round:1"],"headRefName":"lane/3140-fix"}
+]

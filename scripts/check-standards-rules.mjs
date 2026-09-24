@@ -450,6 +450,12 @@ export function validateBacklogItem(item, ctx) {
     err(`Backlog item "${item.id}" is a story but has no size — every story must carry Fibonacci points`);
   if (item.kind === 'task' && item.size !== undefined)
     err(`Backlog item "${item.id}" is a task but has a size — tasks are never sized (they roll up under a story/epic)`);
+  // `estimatedLoc` (#3839, Fork 4 field of #3801) is the task-only dispatch estimate — estimated changed
+  // lines, distinct from `size` points, that the burndown never sums (docs/agent/backlog-workflow.md#agile-sizing).
+  if (item.estimatedLoc !== undefined && item.kind !== 'task')
+    err(`Backlog item "${item.id}" declares estimatedLoc but is not a task — estimatedLoc is task-only (a story/epic/decision/feature carries size instead)`);
+  if (item.estimatedLoc !== undefined && !(Number.isInteger(item.estimatedLoc) && item.estimatedLoc > 0))
+    err(`Backlog item "${item.id}" has a non-numeric or non-positive estimatedLoc "${item.estimatedLoc}" (expected a positive integer of estimated changed lines)`);
   if (item.parent !== undefined && !knownNums.has(String(item.parent)))
     err(`Backlog item "${item.id}" parent "#${item.parent}" does not resolve to an existing item`,
       dUnresolvedRef('Backlog', item.id, backlogFile, 'parent', String(item.parent), 'backlog/'));
@@ -1961,6 +1967,33 @@ const PRODUCT_JS_RE = /^[A-Z][a-z]+\.js$/;
 const TYPE_FRAGMENT_RE = /^\.(?:d|test|spec|stories|sw\.spec)\.[a-z]+$/;
 
 /**
+ * PURE CORE, single document. Every unmarked pathlike token in `content`, IN ORDER, WITH duplicates —
+ * exactly what {@link scanRepoLocusPrefixes} has always counted. Extracted (#3383 mechanical-dispatcher
+ * fix, live #3565 trial) so a caller that needs the ACTUAL matched substrings — not just a count + first
+ * sample — reads from this identical scan rather than a second, driftable copy of the same five exemption
+ * checks. See {@link findUnmarkedLocusRefs}, its caller.
+ */
+function scanUnmarkedLocusRefs(content) {
+  const noFenced = String(content ?? '').replace(/```[\s\S]*?```/g, '');
+  const unmarked = [];
+  for (const line of noFenced.split('\n')) {
+    if (EXEMPT_FIELD_RE.test(line)) continue;
+    for (const m of line.matchAll(PATHLIKE_RE)) {
+      const before = line.slice(0, m.index);
+      if (LOCUS_MARKER_RE.test(before)) continue;        // already marked (we:/fui:/… or full name)
+      if (/\]\($/.test(before)) continue;                // markdown link target — text carries the locus
+      if (/@$/.test(before)) continue;                   // @scope/pkg npm specifier (scope sits in the token)
+      if (/https?:\/*$/.test(before)) continue;          // URL (the `//…` is consumed into the token)
+      if (/\*$/.test(before)) continue;                  // glob mask (`*.test.ts`) — a file-type pattern, not a path
+      if (PRODUCT_JS_RE.test(m[0])) continue;            // JS-ecosystem product name (`Node.js`), not a repo file
+      if (TYPE_FRAGMENT_RE.test(m[0])) continue;         // bare type-suffix fragment (`.d.ts`), not a path
+      unmarked.push(m[0]);
+    }
+  }
+  return unmarked;
+}
+
+/**
  * Scan docs (`[{ file, content }]`) for code-path tokens lacking a `<repo>:` locus marker. Returns
  * per-file findings `[{ file, count, sample }]` (pure). Strips fenced code blocks first; applies the
  * #880 carve-outs per token. Inline backtick code is NOT exempt — a path in backticks still needs the
@@ -1969,25 +2002,33 @@ const TYPE_FRAGMENT_RE = /^\.(?:d|test|spec|stories|sw\.spec)\.[a-z]+$/;
 export function scanRepoLocusPrefixes(docs) {
   const findings = [];
   for (const { file, content } of docs) {
-    const noFenced = content.replace(/```[\s\S]*?```/g, '');
-    const unmarked = [];
-    for (const line of noFenced.split('\n')) {
-      if (EXEMPT_FIELD_RE.test(line)) continue;
-      for (const m of line.matchAll(PATHLIKE_RE)) {
-        const before = line.slice(0, m.index);
-        if (LOCUS_MARKER_RE.test(before)) continue;        // already marked (we:/fui:/… or full name)
-        if (/\]\($/.test(before)) continue;                // markdown link target — text carries the locus
-        if (/@$/.test(before)) continue;                   // @scope/pkg npm specifier (scope sits in the token)
-        if (/https?:\/*$/.test(before)) continue;          // URL (the `//…` is consumed into the token)
-        if (/\*$/.test(before)) continue;                  // glob mask (`*.test.ts`) — a file-type pattern, not a path
-        if (PRODUCT_JS_RE.test(m[0])) continue;            // JS-ecosystem product name (`Node.js`), not a repo file
-        if (TYPE_FRAGMENT_RE.test(m[0])) continue;         // bare type-suffix fragment (`.d.ts`), not a path
-        unmarked.push(m[0]);
-      }
-    }
+    const unmarked = scanUnmarkedLocusRefs(content);
     if (unmarked.length) findings.push({ file, count: unmarked.length, sample: unmarked[0] });
   }
   return findings;
+}
+
+/**
+ * #3383 mechanical-dispatcher fix — live #3565 trial (2026-09-13). Every DISTINCT unmarked pathlike token
+ * {@link scanRepoLocusPrefixes} would flag in ONE document's content, deduped — the shape an auto-fixer
+ * needs (which exact substrings to prefix) rather than a count + first sample. Reuses
+ * `scanUnmarkedLocusRefs`'s identical scan (the SAME `PATHLIKE_RE`/`LOCUS_MARKER_RE`/exemption checks the
+ * gate itself runs), so a fixer built on this can never drift from what the gate actually flags.
+ *
+ * WHY THIS EXISTS: `we:scripts/operations/deliver-item-wrapper.mjs#sanitizeOwnLocusMentions` (added by
+ * #3565's wrapper-owned-commit redesign) used to prefix bare mentions of ONLY the delivery's own touched
+ * paths, on the assumption that a delivery agent's backlog prose only ever quotes files IT just touched.
+ * A live #3565 dispatch trial disproved that: the pre-commit `lint:locus` hook still rejected the
+ * wrapper's own commit (`locus-prefix: 2 bare code-path ref(s) ...`) because the agent's own `## Progress`
+ * note also cited an UNTOUCHED existing file bare (`queue-store.mjs`, mentioned for context, never itself
+ * part of the diff) — a token the touched-paths-only fixer had no way to know needed prefixing, since it
+ * was never in that list to begin with. Scanning the file's own FULL content with the real detector,
+ * instead of a caller-supplied guess at which tokens might appear, closes that gap by construction: it
+ * prefixes everything the gate would flag, whether or not it happens to be one of the delivery's own
+ * touched files.
+ */
+export function findUnmarkedLocusRefs(content) {
+  return [...new Set(scanUnmarkedLocusRefs(content))];
 }
 
 /**

@@ -38,3 +38,23 @@ items.
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 2. **Restart-survival preserved for every wired kind** — for each of the five kinds this epic covers, a runner
    restart mid-dispatch must not lose or corrupt the in-flight work; verified per-child, not just asserted here.
+
+## Additions from 2026-09-24 incident review
+
+This epic is the main owner of operator proposal 2 ("turn prose rules in agent briefs into mechanical code").
+Two additions:
+
+- **The wrapper writes the completion record, not the agent.** The recurring root cause on 2026-09-24 was
+  agents forgetting to write their completion record, which leaves finished sessions looking alive and
+  freezes reconcile (the #3721 shape). Each wrapper this epic wires should write `started` before it spawns
+  the agent and `done` or `failed` from the child's exit, on every exit path. The agent may add an outcome
+  note, but the record exists whether or not it remembers. Then #3721's reaper axis reads a fact the agent
+  cannot skip.
+- **Count what is left.** The new brief-rule ledger (4055) lists every imperative in each brief and whether
+  code enforces it. Each child here should end with that count lower for its brief, and say which rules moved
+  into its wrapper.
+- **Proposal 5 ("workers that survive interruptions") depends on this epic plus a live dispatcher.** Daemon
+  fixes can only be "filed as cards and built by the conveyor" once the build dispatcher runs unattended
+  (#3984, active; the runtime-core graduation #3487) and the build kind is wired (#3645), because an in-chat
+  worker dies with its chat. The restart-survival criterion above is the same property, seen from the runner's
+  side.

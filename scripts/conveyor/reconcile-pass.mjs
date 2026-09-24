@@ -69,8 +69,12 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
  *   `body`              — `#xu2krte` Fork 1: `we:scripts/conveyor/reconcile-fix-dispatch.mjs` reads the PR's own
  *                         `authored-by-actor` stamp off it to find a conflict-caused bounce's original builder
  *                         session, for the opt-in resume-preference dispatch. Unused by every other decision.
+ *   `baseRefName`       — #3383: what `reconcile-core.mjs`'s STACKED-BASE CONFLICT branch compares against
+ *                         `defaultBranch` to tell a PR stacked on another lane/PR (the drain will never land it,
+ *                         whatever its labels say) apart from an ordinary conflict against `main`. Dropping it
+ *                         silently sends every `conflicted` PR back through the pre-#3383 `owed-elsewhere` path.
  */
-export const PR_LIST_JSON_FIELDS = 'number,headRefName,headRefOid,labels,statusCheckRollup,mergeStateStatus,comments,body';
+export const PR_LIST_JSON_FIELDS = 'number,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body';
 
 /** How many open PRs one pass reads. The board's own `OPEN_LIMIT` is 30; a reconciler that silently stopped at
  *  the default page would leave the overflow unowned, which is this item's defect wearing a smaller hat. */
@@ -234,18 +238,18 @@ export function formatReport({ dispatch = [], refusals = [], notes = [] } = {}) 
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#runReconcilePass — read, decide, return. Every reader is injectable, so
  * the whole shell is exercisable with no network and no credential.
- * @param {{readPrs?:Function, readAgents?:Function, enrich?:Function, now?:number, repo?:string|null}} [o]
+ * @param {{readPrs?:Function, readAgents?:Function, enrich?:Function, now?:number, repo?:string|null, defaultBranch?:string}} [o]
  * @returns {{dispatch:Array<object>, refusals:Array<object>, notes:Array<object>, prs:number, agents:number}}
  */
 export function runReconcilePass({
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
-  now = Date.now(), repo = null,
+  now = Date.now(), repo = null, defaultBranch = 'main',
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-pass: --repo ${repo} is not a constellation repo`);
   const prs = readPrs({ repo });
   const agents = enrich(readAgents({}));
-  const plan = planReconcile({ repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now });
+  const plan = planReconcile({ repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch });
   return { ...plan, prs: prs.length, agents: agents.length };
 }
 

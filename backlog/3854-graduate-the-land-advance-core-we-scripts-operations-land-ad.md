@@ -3,10 +3,12 @@ bornAs: xxdbkpr
 kind: story
 size: 3
 parent: "3443"
-status: open
+status: resolved
 blockedBy: ["3853"]
-scope: ["we:scripts/operations/land-advance.mjs", "we:scripts/operations/land-advance-repair.mjs", "we:scripts/operations/land-advance-escalations.mjs", "we:scripts/operations/__tests__/land-advance.test.mjs", "we:scripts/operations/__tests__/land-advance-repair.test.mjs", "we:scripts/operations/__fixtures__/land-advance/today.json", "we:scripts/operations/land-advance-items.mjs", "we:scripts/operations/__tests__/land-advance-repair-io.test.mjs"]
+scope: ["we:scripts/operations/land-advance.mjs", "we:scripts/operations/land-advance-repair.mjs", "we:scripts/operations/land-advance-escalations.mjs", "we:scripts/operations/__tests__/land-advance-repair.test.mjs", "we:scripts/operations/__fixtures__/land-advance/today.json", "we:scripts/operations/land-advance-items.mjs", "we:scripts/operations/__tests__/land-advance-repair-io.test.mjs"]
 dateOpened: "2026-09-21"
+dateStarted: "2026-09-24"
+dateResolved: "2026-09-24"
 tags: []
 ---
 
@@ -29,3 +31,7 @@ Graduation slice 5 of 6 for the land-advance operation. Three pure modules missi
 ## Step 0 re-plan (2026-09-22)
 
 Moved `we:scripts/operations/land-advance-items.mjs` (17 lines, pure) into this slice from #3865: `we:scripts/operations/land-advance.mjs` imports it, so without it this slice could not pass the gate on main while #3865 waits.
+
+## Graduation import check
+
+- 2026-09-24: graduation-import-check moved `we:scripts/operations/__tests__/land-advance.test.mjs` to #3865 — it imports a module #3865 owns.

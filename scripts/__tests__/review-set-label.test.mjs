@@ -41,6 +41,7 @@ import {
 } from '../lib/review-escalation.mjs';
 import { parseClearerActorId, parseAuthorActorId, readAuthorActorStamps } from '../lib/review-independence.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../lib/review-escalation.mjs';
+import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
 
 const human = [{ name: REVIEW_LABELS.human }, { name: 'ready-to-merge' }];
 const pending = [{ name: REVIEW_LABELS.pending }, { name: 'ready-to-merge' }];
@@ -226,11 +227,32 @@ describe('decideSetLabel — rearm (#2644, folded in from the conveyor decideRea
   it('NEVER emits review:accepted and NEVER removes review:human (the #2630 invariant)', () => {
     const d = decideSetLabel({ to: 'rearm', currentLabels: humanChanges });
     expect(d.allowed).toBe(true);
-    expect(d.addLabel).toBe(REVIEW_LABELS.pending);
     expect(d.addLabel).not.toBe(REVIEW_LABELS.accepted);
     expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL]);
     expect(d.removeLabels).not.toContain(REVIEW_LABELS.human);
     expect(d.keepsHuman).toBe(true);
+  });
+
+  // #x01u7az — LIVE BUG, PR #2549 (2026-09-24): a `review:human` PR was re-armed after a mechanical
+  // `--round=conflict` fix, and this target added `review:pending` ON TOP of the still-live `review:human` —
+  // two review:* hold labels on one PR at once, neither ever telling a reader the other exists. At most ONE
+  // review:* hold may be live at a time; `review:human` already IS the hold on a gate-self PR, so a rearm there
+  // must add NOTHING.
+  it('does NOT add review:pending on a review:human PR — the human hold IS already the pending-review state', () => {
+    const d = decideSetLabel({ to: 'rearm', currentLabels: humanChanges });
+    expect(d.allowed).toBe(true);
+    expect(d.addLabel).toBe('');
+    expect(d.addLabel).not.toBe(REVIEW_LABELS.pending);
+    // Simulate the swap the way the CLI applies it: never leaves human+pending coexisting.
+    const removals = presentRemoveLabels(d.removeLabels, humanChanges);
+    const after = new Set([...humanChanges.map((l) => l.name).filter((n) => !removals.includes(n)), d.addLabel].filter(Boolean));
+    expect(after.has(REVIEW_LABELS.human)).toBe(true);
+    expect(after.has(REVIEW_LABELS.pending)).toBe(false);
+  });
+
+  it('still adds review:pending on an ordinary (non-gate-self) rearm — only the review:human case changes', () => {
+    const d = decideSetLabel({ to: 'rearm', currentLabels: changes });
+    expect(d.addLabel).toBe(REVIEW_LABELS.pending);
   });
 
   it('refuses (idempotent no-op) when there is no review:changes to re-arm', () => {
@@ -283,6 +305,29 @@ describe('decideSetLabel — clear-human (#2895, the ONE target that drops revie
     const d = decideSetLabel({ to: 'clear-human', currentLabels: [...human, { name: REVIEW_LABELS.redteamAccepted }] });
     expect(d.allowed).toBe(true);
     expect(d.removeLabels).toContain(REVIEW_LABELS.redteamAccepted);
+  });
+
+  // #x01u7az — LIVE BUG, PR #2578 (2026-09-24): advisory:accepted was stamped at 13:29:54Z while the PR was
+  // still review:human, then review:human was cleared at 13:38:11Z via clear-human — but the advisory label was
+  // left behind and rode through three more review rounds with review:human gone, i.e. with no PR left for it
+  // to have meant anything about (`advisory:*` only ever describes a `review:human` PR — see
+  // `we:scripts/lib/advisory-labels.mjs`'s own header). `clear-human` must drop it in the SAME write.
+  it('also drops advisory:accepted when clearing a gate-self PR — an advisory only means something on review:human', () => {
+    const d = decideSetLabel({
+      to: 'clear-human',
+      currentLabels: [...human, { name: ADVISORY_LABELS.ACCEPTED }],
+    });
+    expect(d.allowed).toBe(true);
+    expect(d.removeLabels).toContain(ADVISORY_LABELS.ACCEPTED);
+  });
+
+  it('also drops advisory:changes when clearing a gate-self PR (whichever advisory label is present)', () => {
+    const d = decideSetLabel({
+      to: 'clear-human',
+      currentLabels: [...human, { name: ADVISORY_LABELS.CHANGES }],
+    });
+    expect(d.allowed).toBe(true);
+    expect(d.removeLabels).toContain(ADVISORY_LABELS.CHANGES);
   });
 
 });

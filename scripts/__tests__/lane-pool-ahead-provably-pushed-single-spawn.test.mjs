@@ -89,7 +89,9 @@ describe('aheadIsProvablyPushed containment semantics unchanged (#2920)', () => 
     git(['config', 'user.name', 't'], lane);
     git(['commit', '--quiet', '-m', 'unpushed'], lane);
 
-    const acquire = runPool(['acquire', ...poolArgs(), '--no-install', '--session=picker']);
+    // #3383 — `--hard-max=1` pins acquire's own growth-on-empty ceiling at this pool's real size (1 lane), so
+    // the fix can't mask "genuinely unpushed, must refuse" by just cloning a fresh lane instead.
+    const acquire = runPool(['acquire', ...poolArgs(), '--no-install', '--session=picker', '--hard-max=1']);
     expect(acquire.code).not.toBe(0);
     expect(acquire.err).toMatch(/no free lane/);
   });

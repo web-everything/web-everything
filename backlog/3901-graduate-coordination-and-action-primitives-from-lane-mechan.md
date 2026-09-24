@@ -25,3 +25,7 @@ The first lane found three of this slice's tests import modules owned by later s
 - `we:scripts/operations/__tests__/action-dispatch-paths.test.mjs` imports `we:scripts/operations/land-advance-io.mjs` → #3856
 - `we:scripts/operations/__tests__/action-ground-truth.test.mjs` imports `we:scripts/operations/review-dispatch-wrapper.mjs` → #3908
 - `we:scripts/operations/__tests__/session-role.test.mjs` imports `we:scripts/operations/detached-dispatch.mjs` → #3902
+
+## Graduation import check
+
+- 2026-09-24: graduation-import-check made this a blocker of #3856 — its moved-in `we:scripts/operations/__tests__/action-dispatch-paths.test.mjs` imports a module this card owns.

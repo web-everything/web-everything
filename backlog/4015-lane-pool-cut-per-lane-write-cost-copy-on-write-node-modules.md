@@ -21,3 +21,11 @@ Observed 2026-09-23: 52 WE lanes ran a fresh npm ci in one day with package-lock
 ## Sizing note
 
 Two independent halves (deps template; git hygiene). If either grows past a small change, split the git-hygiene half into its own card — the deps half is the bigger win.
+
+## Additions from 2026-09-24 incident review
+
+Operator proposal 4: "lighter lanes (git worktrees instead of 0.8 GB full clones)". No open card weighs worktrees; this card is the right home. Add it as a design fork before building the git-hygiene half:
+
+- **Option A — keep clones, fix the waste (this card as filed).** Copy-on-write node_modules plus a shared alternates store. Keeps today's isolation: each lane has its own `.git`, its own lease files and its own hooks. Lowest risk.
+- **Option B — git worktrees off one shared repo.** Shares objects and refs natively, so a lane costs only its checked-out files. Costs: one branch can be checked out in only one worktree at a time; `.git` becomes a file, so every tool that reads `<lane>/.git/.lane-lease` or runs `git -C <lane>` with repo-level config must be checked (we:scripts/lane-pool.mjs, we:scripts/lib/lane-lease.mjs, we:scripts/guard-lane.mjs, the stop-hook git checks); a `git gc` or a corrupt index in the shared repo hits every lane at once (the daemon clone refresh failures of #3731 show that risk is real).
+- **Recommendation:** ship Option A first (it removes most of the 463 MB per lane, which is node_modules, not git). Measure per-lane size after it. Only take Option B if git files are still the main cost. Note that #4028 (trim) and #4037 (bounded growth) resolved on 2026-09-24 and already cover part of #4014's cap and prune goals; recheck #4014 before building.

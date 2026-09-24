@@ -258,3 +258,137 @@ How each slice (a child of this item) graduates, per the statute
     - First attempt: an untrusted clone folder made `claude --bg` fail ("Workspace not trusted"). That is the
       #3748 class, not a #3857 defect, and it left one stale in-flight run record, `probe-3857-sonnet`.
     - #3857's own card is claimed by another session, so its status flip is left to that session.
+
+- **2026-09-24 (#3917 built: dispatch gate + tick-core pure core, S2).** Ported
+  `we:scripts/readiness/dispatch-pause.mjs` (+test), `we:scripts/readiness/dispatch-plan.mjs` (+test),
+  `we:scripts/readiness/queue-report.mjs`, `we:scripts/conveyor/tick-core.mjs` (+2 tests) and
+  `we:scripts/check-standards-rules.mjs` (+test) from snapshot `600acc14f`, diff-merged per rule 3. Main had
+  moved further on `we:scripts/readiness/dispatch-plan.mjs`, `we:scripts/readiness/queue-report.mjs` and
+  `we:scripts/conveyor/tick-core.mjs`/its test since #3917's own merge notes were written (2026-09-22) — the
+  card's precomputed catchup-ref resolutions were reused as the BRANCH-side input, then a fresh diff-apply
+  carried each onto main's CURRENT tip:
+  - `we:scripts/readiness/dispatch-plan.mjs` (+test): preserved main's own `driftGraduationItem` (#3836),
+    `findPocBranch`/`readRegistry` imports, and its `runJson` → `await runJson` async change, alongside the
+    branch's `--queue-file` item-pull (#3720), `dispatchPausedKinds` and `sizePolicy`.
+  - `we:scripts/readiness/queue-report.mjs`: unioned main's own `needs-investigation` addition with the
+    branch's `no-size` (#3849) addition to `NOT_READY_REASONS` — same array, non-overlapping additions.
+  - `we:scripts/conveyor/tick-core.mjs` (+test): preserved main's own `resolveChildTimeoutMs` import (#3989
+    bounded-child rollout) and the multi-repo `lanePoolListArgsForRepo` free-lane read (#3960/#3962),
+    alongside the branch's kind-scoped dispatch-pause wiring; the test file unions main's new
+    `lanePoolListArgsForRepo` describe block with the branch's kind-scoped-pause describe block.
+  - `we:scripts/check-standards-rules.mjs` (+test): clean 3-way, 0 conflicts, despite 2 more main commits
+    landing on it since the card's notes.
+  - **Own bug found and fixed** (caught by this slice's own test suite, not by inspection): the
+    `--queue-file` restructuring scoped `selection`/`observeSelection` inside the non-queue-file branch only,
+    but `plan.selection = [...selection.values()]` is read later in `main()` unconditionally — a live
+    `ReferenceError`. Fixed by hoisting `selection` to the outer scope.
+  - Full gate: `npm run test:unit` (574/574 files, 16455 tests, 0 failures), `npm run check:standards
+    --scope=3917-...` (0 errors). Landed as PR #2597, verified green at `e98dda4b6`, labelled
+    `review:pending` for the drain.
+  - **Not yet landed.** PR #2597 sits behind a REPO-WIDE review-dispatch stall — `review-status:review-stalled`
+    on 5+ other open PRs (#2596, #2591, #2590, #2584, plus #2597) at the same time, unrelated to this slice's
+    own diff. Several concurrent sessions already hold leases on exactly this class of fix
+    (`fix-2549`/`fix-2578`/`fix-2580`/`fix-review-labels-3383-daemon` in the lane pool at the time of this
+    note) — per this repo's own doctrine (fix the daemon, never the instance by hand), this session did not
+    hand-dispatch a review to force it through. #3917 stays unresolved until the PR actually merges; the next
+    session/daemon pass should resolve it once `gh pr view 2597 --json mergedAt` is non-null.
+
+- **2026-09-24 (#3895 telemetry core, first wave-A build): PR #2595 open, pending review+drain.** Ported
+  `we:scripts/operations/command-redact.mjs`, `we:scripts/operations/telemetry.mjs`,
+  `we:scripts/operations/telemetry-store.mjs`, `we:scripts/operations/telemetry-cli.mjs` and
+  `we:scripts/operations/__tests__/command-redact.test.mjs` from snapshot `600acc14f`. None of the 4 files
+  exist on `main`, and none have been touched by `main` since the merge base `ca7e68b71` — a clean
+  byte-identical port, no diff-merge needed. `we:scripts/operations/command-redact.mjs` (argv
+  credential/control-char redaction before telemetry is persisted or printed) got the extra scrutiny the
+  card called for as a security-relevant file: confirmed zero independent `main` commits to it, so there was
+  no merge to get wrong and no risk of a redaction pattern being dropped.
+  - **Scope correction found at land time.** `we:scripts/operations/__tests__/telemetry-wiring.test.mjs` and
+    `we:scripts/operations/__tests__/telemetry.test.mjs` were in #3895's original scope but statically import
+    modules that are true downstream leaves — `we:scripts/operations/minimal-context-provider.mjs` (#3902),
+    `we:scripts/operations/host-process-sample.mjs` (#3915), `we:scripts/operations/review-dispatch-wrapper.mjs`
+    and the prepare wrappers (#3908/#3905) — none of which exist yet, and all of which are themselves
+    `blockedBy: 3895`. The original Done-when ("passes on main's tree") was unsatisfiable within this slice
+    alone. Re-homed `we:scripts/operations/__tests__/telemetry.test.mjs` to #3915 (its one dependency is
+    already that card's scope) and `we:scripts/operations/__tests__/telemetry-wiring.test.mjs` to #3908 (the
+    last-landing of its three dependencies per the critical path `#3897 → #3902 → #3906 → #3903 → #3904 →
+    #3908`), with dated notes on all three cards — the same "moved here" pattern #3908 already used for
+    `we:scripts/operations/__tests__/action-ground-truth.test.mjs` from #3901.
+  - **Full gate:** `npm run test:unit` 574/574 files, 16411 tests, 0 failures; `npm run check:standards
+    --scope=3895-...` 0 errors; lane `verify` green at `914bd921e`. PR #2595's own CI `test` and `smoke`
+    checks are both green (local `npm run test:smoke` fails only because it needs a FrontierUI dev server on
+    `:3001` as a sibling checkout, per `we:.github/workflows/ci.yml` — unrelated to these 4 backend files;
+    CI's own sibling checkout confirms the real gate is green).
+  - PR #2595 is labelled `review:pending` (blast-radius/size, 2672 changed lines — mostly
+    `we:scripts/operations/telemetry.mjs` and `we:scripts/operations/telemetry-store.mjs` themselves) and left
+    for the drain to land, per the epic's own established pattern (see the 2026-09-06/07 entry). #3895 is not
+    yet resolved — that happens once the PR actually merges.
+
+- **2026-09-24 (#3891 landed; confirmed on `main`'s tree).** Dispatched to graduate #3891 (priority-order
+  and prototype-tracker-compact libraries) per its own card and this item's slice procedure, but on arrival
+  found it already resolved (`status: resolved`, `dateResolved: 2026-09-24`) — a concurrent wave-A/B session
+  had landed it first, via PR #2572 (`lane/batch-2026-09-24-waveA2-3891`, batched together with #3890, #3893,
+  #3906, #3911 and unrelated work), merged 2026-09-24T13:06:36Z. Verified rather than re-done: all 5 files
+  (`we:scripts/lib/priority-markers.mjs`, `we:scripts/lib/priority-order.mjs`, `we:scripts/lib/tracker-page-hash.mjs`,
+  `we:scripts/lib/prototype-tracker-compact.mjs`, `we:scripts/lib/prototype-tracker-render.mjs`) and their tests
+  are present on `main`; `npx vitest run` on the 3 test files this card names passes — 58 tests, 50 passed,
+  8 intentionally skipped (2 pending #3892's `priority-sync`, 6 pending #3909's
+  `we:scripts/lib/prototype-tracker-compact-io.mjs`), matching the landed commit's own message. No further
+  build needed for #3891; this entry only closes the Progress-log gap the landing PR itself didn't fill.
+
+- **2026-09-24 (#3916 built; the first slice this card's own merge notes were stale for).** Ported #3916
+  (test setup, heavy-admission and file-locks) from snapshot `600acc14f`. Confirmed live what rule 3 warns
+  about: **its own 2026-09-22 merge notes had already gone stale by land time.** `main`'s `d79512e13`
+  (landed 2026-09-23, one day after the notes were written) independently ported the branch's ghost-marker/
+  stale-waiter fix under a different shape (`classifyWaiter`/`reapStaleWaiters`, `staleWaiting` as a count)
+  and its own commit message calls the branch's `partitionWaiting`/`pruneStaleWaiting` "now-superseded" — so
+  #3916 does NOT re-introduce those exports or the array-shaped `staleWaiting` the old notes called for;
+  doing so would have duplicated `main`'s already-chosen design and broken its own live tests. Only the
+  genuinely un-landed piece of the branch's heavy-admission/file-locks work — the #3383 slot-reentrancy-by-
+  real-pid fix (`8983b136a`) — was ported, onto `main`'s current files as a diff. `we:vitest.integration.config.ts`
+  and `we:.gitignore` had also each taken one more independent `main` commit since the notes were written;
+  both merged clean (disjoint insertion points). `we:package-lock.json` needed no `npm install` regen — it was
+  byte-identical to the merge base except the one-line license field the notes already named. Full gate:
+  573 test files / 16377 tests, `check:standards` 0 errors, `verify-lane` green. Pushed
+  `lane/3916-graduate-test-setup-heavy-command-admission-and-file-locks-c`, opened PR #2594 (green,
+  labelled `review:pending`, `careLevel=elevated` per the shape command). Self-clearing the review was
+  correctly refused (#2439: the clearing session is the PR's author) — this session cannot manufacture the
+  independence a different session's `/review` pass (or the drain, once a review daemon is live for this
+  repo) must supply. **#3916 is left `status: active`, NOT resolved** — landing on `main` is this item's own
+  done-when, and the PR has not landed yet.
+
+- **2026-09-24 (#3854 landed — the land-advance core).** Graduation slice 5 of 6 for the land-advance
+  operation, building on #3853 (`we:scripts/operations/land-advance-tools.mjs`, already on `main`). Ported
+  `we:scripts/operations/land-advance.mjs` (the declared operation, `LAND_ADVANCE_OP`/`OWED_ACTIONS`),
+  `we:scripts/operations/land-advance-repair.mjs`, `we:scripts/operations/land-advance-escalations.mjs`,
+  `we:scripts/operations/land-advance-items.mjs` and the fixture byte-identical from the branch tip
+  (confirmed via `git diff origin/lane/mechanical-dispatcher` reporting 0 lines once staged) — none of
+  these five files existed on `main`, so this was a straight new-file port, not a diff-merge. Every named
+  import they take (`registry`, `step-kinds`, `constellation-repos`, `lane-concurrency`, `lane-manifest`,
+  `dispatch-plan`, `hiccup-classify`, plus #3853's own `we:scripts/operations/land-advance-tools.mjs`) was
+  checked name-by-name against `main`'s real exports before porting, matching this card's own claim.
+
+  `we:scripts/operations/__tests__/land-advance.test.mjs` needed a real adaptation, not a straight copy: the
+  branch's current copy has grown two test cases since this card was filed, calling `priorityQueue`/
+  `reconcileHolds` from `we:scripts/operations/land-advance-items-io.mjs` — that module is #3865's scope, and
+  #3865 is `blockedBy` this item, so it cannot land first. #3865's own card already flagged this forward
+  dependency ("Neither #3854 nor #3856 has been re-scoped for this yet"). Deferred rather than dropped: one
+  `it()` (the `priorityQueue` case) and the whole `describe('#3720 owed PR work honours reconcile-pass
+  refusals')` block (its one case calls `reconcileHolds`), each replaced with a comment pointing at #3865 to
+  restore when `we:scripts/operations/land-advance-items-io.mjs` lands. Everything else in the file,
+  including the `dispatchPlan`-based item-pull/budget/mode cases (`dispatchPlan` is already on `main`), is
+  untouched.
+
+  Verification: 51/51 on the two pure test files, 34/34 on `we:scripts/operations/__tests__/http-adapter.test.mjs`
+  (confirming no registration pin is needed yet — the module isn't wired into `we:scripts/operations/run.mjs`,
+  that's slice 6/#3856), full suite 575 files / 16407 tests / 0 failed, `check:standards` 0 errors,
+  `verify-lane` green. Pushed `lane/3854-graduate-land-advance-core`, opened PR #2593 (639 changed lines,
+  green, labelled `review:pending` on the size/blast-radius heuristic as expected). The independent review
+  this session dispatched (`we:scripts/operations/review-dispatch.mjs`) stalled repeatedly with
+  `outcome: blocked-on-infra` over roughly 100 minutes — at the time, EVERY open PR in the repo was stuck in
+  the identical `review-status:reviewing`/`review-stalled` oscillation (confirmed via `gh pr list`), and the
+  machine was running 62 concurrent `claude` processes at load average 13–18. Not a defect in the port; no
+  daemon code was touched — the resident review daemon's own outer retry loop is what eventually cleared it
+  once load eased (down to ~8 by the time it converged). Verdict landed `review:accepted` → `ready-to-merge`
+  → merged `33fdc6cdb` at 2026-09-24T19:55:31Z. Resolved via the drain's own auto-resolve-on-land plus this
+  session's own `we:scripts/operations/run.mjs resolve --ref=3854 --graduatedTo=none` call (idempotent with
+  it): `status: resolved`, `dateResolved: 2026-09-24`.

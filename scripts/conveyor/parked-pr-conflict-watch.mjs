@@ -832,8 +832,11 @@ function classifyStatuteConflict(files, { number, repo, listPrPatches, hasReview
  * @returns {Array<object>}
  */
 export function defaultListParkedPrs({ exec = execFileSyncThrottled, repo = null } = {}) {
+  // `baseRefName` (#3383) — the queued-grace routing below reads it to tell a STACKED PR (base isn't `main`, the
+  // drain will never land it regardless of labels) apart from an ordinary conflict against `main`; costs nothing
+  // extra since it comes off the same `gh pr list` call this pass already makes.
   const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT),
-    '--json', 'number,headRefName,mergeable,mergeStateStatus,labels,files'];
+    '--json', 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files'];
   if (repo) argv.push('--repo', repo);
   // #x5n4zn3 — was bare (no timeout).
   const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
@@ -1017,6 +1020,27 @@ export function watchParkedPrConflicts({
         if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
         const age = labelAgeMs({ pr, repo: resolvedRepo });
         if (age == null || age < QUEUED_CONFLICT_GRACE_MS) continue; // the drain still has its turn
+
+        // #3383 — a STACKED PR (`baseRefName` isn't `main`) is never landed by the drain no matter how long it
+        // waits here (`#poc-branch-declared-delivery-mode` clause 5: "base is not <default>"), so the drain-grace
+        // reasoning this whole branch exists for ("give the drain first try") does not apply to it at all — there
+        // is no drain turn to wait out. Worse, falling through to the generic `postFinding` bounce below would
+        // strip `review:accepted` and force a fresh human review for what is ordinarily a purely mechanical
+        // rebase against the PR's OWN base, never a real reviewer-facing content conflict. Deferred here instead:
+        // `we:scripts/conveyor/reconcile-core.mjs`'s own STACKED-BASE CONFLICT branch dispatches the mechanical
+        // rebase directly from the `conflicted` phase, on the SAME `CONFLICT_FIX_ROUND_CAP`/marker floor, with
+        // review labels left completely untouched. This file posts no comment and touches no label for this
+        // population — it only reports the deferral so a dry-run sweep is never silent about what is actually
+        // happening to it (mirrors this whole branch's own dry-run-visibility discipline just above).
+        //
+        // CONFIRMED LIVE 2026-09-24: `chalbert/web-everything#2578` (base `lane/3681-ratify-daemon-lifecycle`)
+        // is exactly this population — see `reconcile-core.mjs`'s own docblock for the full incident.
+        const baseRefName = pr?.baseRefName ?? null;
+        if (baseRefName && baseRefName !== 'main') {
+          entry.routedTo = 'deferred-to-reconcile (stacked base — see reconcile-core.mjs#3383, review labels untouched)';
+          results.push(entry);
+          continue;
+        }
 
         // Same verified-complete file fetch the fresh-detection path re-fetches on a suspected-truncated `pr.files`
         // — this path never reads `pr.files` at all, so it always pays for the paginated, uncapped read.

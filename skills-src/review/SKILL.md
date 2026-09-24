@@ -274,6 +274,10 @@ looks identical to one nobody reviewed:
 - **It describes the CURRENT head only.** The sink refuses to label a head that moved while the panel ran, and the
   runner's `advisory-label-sweep.mjs` drops both labels on any PR whose head moves past the advisory (next tick).
   A pushed commit therefore means no advisory label until the advisory re-runs.
+- **It describes a `review:human` PR only.** The moment `review:human` comes off (`--to=clear-human`), the label no
+  longer describes anything — `decideSetLabel`'s `clear-human` branch drops it in the same write going forward,
+  and the runner's `review-hold-reconcile.mjs` sweeps the strays that predate that fix (also drops a stray
+  `review:pending` left beside a still-live `review:human` — #x01u7az).
 
 **The operator's rule** (2026-09-19): *do not open a `review:human` PR until it carries `advisory:accepted` and has
 neither `review:changes` nor `review:pending`.* `node scripts/operations/operator-queue.mjs` enforces exactly that as

@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   agentArgsFromEnv, assertNotALaneCheckout, buildAgentArgv, defaultSpawnAgent, isPreSpawnRefusal, parseBackgroundedId,
-  REPO_ROOT,
+  REPO_ROOT, resolveGhShimSettingsEnv,
 } from '../operations/dispatch-lane-io.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
@@ -253,6 +253,9 @@ export function dispatchInspection({
   mintSessionId = () => randomUUID(),
   spawnAgent = defaultSpawnAgent,
   extraArgs = [],
+  // #x8mpubm follow-up — this dispatch never wired the gh-app-shim either, the same gap fixed in
+  // `review-dispatch.mjs#dispatchReview` and `reconcile-fix-dispatch.mjs#dispatchFix`.
+  resolveSettingsEnv = resolveGhShimSettingsEnv,
 } = {}) {
   // Everything before the spawn is pre-spawn: a throw here PROVES no agent exists (see noInspectionStarted).
   const prepare = () => {
@@ -272,6 +275,7 @@ export function dispatchInspection({
       payload: { prompt, sessionSlug: planned.sessionSlug },
       systemPromptFile: INSPECT_DISPATCH_SYSTEM_PROMPT_FILE,
       extraArgs: [...inspectDispatchDisallowedToolsArgs(), ...extraArgs],
+      settingsEnv: resolveSettingsEnv(root),
     });
     return { planned, prompt, unknownTokens, sessionId, argv };
   };

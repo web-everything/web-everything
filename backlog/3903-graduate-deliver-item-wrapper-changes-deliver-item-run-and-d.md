@@ -5,7 +5,7 @@ size: 5
 parent: "3443"
 status: open
 blockedBy: ["3902", "3893", "3906", "3917"]
-scope: ["we:scripts/operations/__tests__/completion-cli.test.mjs", "we:scripts/operations/__tests__/completion-record.test.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs", "we:scripts/operations/completion-cli.mjs", "we:scripts/operations/completion-record.mjs", "we:scripts/operations/deliver-item-run.mjs", "we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/delivery-report-store.mjs", "we:skills-src/conveyor/delivery-agent-brief-v2.md", "we:skills-src/conveyor/delivery-agent-brief.md", "we:scripts/operations/open-pr.mjs", "we:scripts/operations/__tests__/open-pr.test.mjs"]
+scope: ["we:scripts/operations/__tests__/completion-cli.test.mjs", "we:scripts/operations/__tests__/completion-record.test.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs", "we:scripts/operations/completion-cli.mjs", "we:scripts/operations/completion-record.mjs", "we:scripts/operations/deliver-item-run.mjs", "we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/delivery-report-store.mjs", "we:skills-src/conveyor/delivery-agent-brief-v2.md", "we:skills-src/conveyor/delivery-agent-brief.md", "we:scripts/operations/open-pr.mjs", "we:scripts/operations/__tests__/open-pr.test.mjs", "we:scripts/operations/__tests__/dispatch-lane-build-wiring.test.mjs"]
 dateOpened: "2026-09-22"
 tags: []
 ---
@@ -57,3 +57,7 @@ Ports 8 files (we:scripts/operations/deliver-item-wrapper.mjs, we:scripts/operat
 
 - **Order fixed:** the wrapper needs `spawnAgentToCompletion` from #3906's `we:scripts/operations/dispatch-lane-io.mjs`, so this slice now lands after #3906 (not before). `we:scripts/operations/delivery-agent-marker.mjs` moved to #3906 to break the cycle.
 - Also owns `we:scripts/operations/open-pr.mjs` (the wrapper needs `extractSubmitResult`) and waits on 3917 for `findUnmarkedLocusRefs` in `we:scripts/check-standards-rules.mjs`.
+
+## Graduation import check
+
+- 2026-09-24: graduation-import-check moved `we:scripts/operations/__tests__/dispatch-lane-build-wiring.test.mjs` here from #3906 — it imports a module this card owns.

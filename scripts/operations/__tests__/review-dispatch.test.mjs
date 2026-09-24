@@ -148,6 +148,44 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
     expect(result.unknownTokens).toEqual(['{{LIKE_THIS}}']);
   });
 
+  // #x8mpubm follow-up (live-caught 2026-09-24, review-2591/2593/2600/2599/2594/2582) — this dispatch NEVER
+  // wired the gh-app-shim: `resolveSettingsEnv` was called nowhere and `settingsEnv` was never passed to
+  // `buildAgentArgv`, so no review session ever got the App-token shim on PATH by any mechanism at all. This
+  // is the regression test for that fix, mirroring dispatch-lane.test.mjs's own #x8mpubm coverage.
+  it('#x8mpubm follow-up — resolveSettingsEnv is called with root, and its result reaches buildAgentArgv via settingsEnv', () => {
+    const calls = [];
+    const resolveSettingsEnv = vi.fn(() => ({ PATH: '/shim:/usr/bin' }));
+    dispatchReview({
+      pr: 1234,
+      repo: 'chalbert/web-everything',
+      root: '/repo',
+      readBrief: () => REAL_TEMPLATE_STUB,
+      mintSessionId: () => '11111111-1111-4111-8111-111111111111',
+      spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
+      checkStaleness: FRESH,
+      resolveSettingsEnv,
+    });
+    expect(resolveSettingsEnv).toHaveBeenCalledTimes(1);
+    expect(resolveSettingsEnv).toHaveBeenCalledWith('/repo');
+    expect(calls[0].argv).toContain('--settings');
+    expect(calls[0].argv[calls[0].argv.indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { PATH: '/shim:/usr/bin' } }));
+  });
+
+  it('#x8mpubm follow-up — resolveSettingsEnv returning null (the real default, unconfigured host) emits no --settings at all', () => {
+    const calls = [];
+    dispatchReview({
+      pr: 1234,
+      repo: 'chalbert/web-everything',
+      root: '/repo',
+      readBrief: () => REAL_TEMPLATE_STUB,
+      mintSessionId: () => '11111111-1111-4111-8111-111111111111',
+      spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
+      checkStaleness: FRESH,
+      resolveSettingsEnv: () => null,
+    });
+    expect(calls[0].argv).not.toContain('--settings');
+  });
+
   it('refuses to dispatch from inside a lane checkout, same guard dispatch-lane-io.mjs uses', () => {
     expect(() => dispatchReview({
       pr: 1, repo: 'chalbert/web-everything', root: '/some/path/.lanes/web-everything/lane-3',

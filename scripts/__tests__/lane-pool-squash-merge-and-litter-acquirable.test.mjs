@@ -128,7 +128,9 @@ describe('squash/rebase-merged ahead lane is provably pushed (#3383)', () => {
 
     expect(git(['cherry', 'origin/main', 'HEAD'], lane)).toMatch(/^\+/);
     expect(listAcquirable()).toEqual([]);
-    const acquire = runPool(['acquire', ...REPO(), '--session=picker']);
+    // #3383 — `--hard-max=1` pins acquire's own growth-on-empty ceiling at this pool's real size (1 lane), so
+    // this test still proves the genuinely-unpushed patch stays refused, rather than self-healing via growth.
+    const acquire = runPool(['acquire', ...REPO(), '--session=picker', '--hard-max=1']);
     expect(acquire.code).not.toBe(0);
     expect(acquire.err).toMatch(/no free lane/);
   });
@@ -163,7 +165,8 @@ describe('litter-only dirty lane is acquirable (#3383)', () => {
     writeFileSync(join(lane, 'file.txt'), 'v1\nREAL UNCOMMITTED WORK\n'); // real dirt, same tracked file
 
     expect(listAcquirable()).toEqual([]);
-    const acquire = runPool(['acquire', ...REPO(), '--session=picker']);
+    // #3383 — pin the growth ceiling at this pool's real size (see the sibling case above for why).
+    const acquire = runPool(['acquire', ...REPO(), '--session=picker', '--hard-max=1']);
     expect(acquire.code).not.toBe(0);
     expect(acquire.err).toMatch(/no free lane/);
     // Nothing was touched.

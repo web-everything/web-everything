@@ -4,8 +4,8 @@ kind: story
 size: 5
 parent: "3443"
 status: open
-blockedBy: ["3903"]
-scope: ["we:scripts/operations/__tests__/ci-heal-dispatch-wrapper.test.mjs", "we:scripts/operations/__tests__/fix-dispatch-wrapper.test.mjs", "we:scripts/operations/ci-heal-dispatch-wrapper.mjs", "we:scripts/operations/ci-heal-run.mjs", "we:scripts/operations/fix-dispatch-wrapper.mjs", "we:scripts/operations/fix-run.mjs", "we:skills-src/conveyor/ci-heal-agent-brief-v2.md", "we:skills-src/conveyor/fix-agent-brief-v2.md", "we:skills-src/conveyor/fix-agent-brief.md", "we:skills-src/conveyor/fix-agent-ci-brief.md"]
+blockedBy: ["3903", "3905"]
+scope: ["we:scripts/operations/__tests__/ci-heal-dispatch-wrapper.test.mjs", "we:scripts/operations/__tests__/fix-dispatch-wrapper.test.mjs", "we:scripts/operations/ci-heal-dispatch-wrapper.mjs", "we:scripts/operations/ci-heal-run.mjs", "we:scripts/operations/fix-dispatch-wrapper.mjs", "we:scripts/operations/fix-run.mjs", "we:skills-src/conveyor/ci-heal-agent-brief-v2.md", "we:skills-src/conveyor/fix-agent-brief-v2.md", "we:skills-src/conveyor/fix-agent-brief.md", "we:skills-src/conveyor/fix-agent-ci-brief.md", "we:scripts/operations/__tests__/dispatch-kind-axes.test.mjs", "we:scripts/operations/__tests__/dispatch-lane-ci-heal-wiring.test.mjs", "we:scripts/operations/__tests__/dispatch-lane-fix-wiring.test.mjs"]
 dateOpened: "2026-09-22"
 tags: []
 ---
@@ -19,3 +19,10 @@ Ports 8 files (we:scripts/operations/fix-dispatch-wrapper.mjs, we:scripts/operat
 1. **Executable** — `npx vitest run we:scripts/operations/__tests__/ci-heal-dispatch-wrapper.test.mjs we:scripts/operations/__tests__/fix-dispatch-wrapper.test.mjs` passes on main's tree (all of this slice's tests; each fails before the port because its module is missing or differs).
 2. **Executable** — `npm run check:standards` reports 0 errors, and the PR's required `test` and `smoke` checks are green.
 3. **Faithful port** — for each ported file, `git diff 600acc14f -- <file>` (prototype snapshot vs main after the port) shows only main's own later changes kept by the merge notes, never a behaviour change of the branch code; runtime data files (e.g. `we:scripts/conveyor/run-scorecards.json`) are never edited.
+
+## Graduation import check
+
+- 2026-09-24: graduation-import-check moved `we:scripts/operations/__tests__/dispatch-lane-fix-wiring.test.mjs` here from #3906 — it imports a module this card owns.
+- 2026-09-24: graduation-import-check moved `we:scripts/operations/__tests__/dispatch-lane-ci-heal-wiring.test.mjs` here from #3906 — it imports a module this card owns.
+- 2026-09-24: graduation-import-check added blockedBy #3905 — the moved-in `we:scripts/operations/__tests__/dispatch-kind-axes.test.mjs` also imports a module #3905 owns.
+- 2026-09-24: graduation-import-check moved `we:scripts/operations/__tests__/dispatch-kind-axes.test.mjs` here from #3906 — it imports a module this card owns.

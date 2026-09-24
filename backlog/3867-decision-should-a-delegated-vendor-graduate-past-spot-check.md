@@ -3,8 +3,10 @@ bornAs: xohvzus
 kind: decision
 parent: "3383"
 relatedTo: ["3690", "3850", "3313", "3949"]
-status: open
+status: resolved
 dateOpened: "2026-09-22"
+dateResolved: "2026-09-24"
+codifiedIn: "docs/agent/platform-decisions.md#delegation-trial-record-graduation"
 preparedDate: "2026-09-23"
 preparedAgainstSha: "97945ac8c1a274ecd6f0c6da1816a54c00308be0"
 relatedReport: reports/2026-09-23-delegation-below-spot-check-grounding.md
@@ -12,6 +14,14 @@ tags: [delegation, supervision, graduation, validation, decision-prep]
 ---
 
 # Decision: should a delegated vendor graduate past spot-check to a lighter or absent independent review after sustained high confidence — reopens ratified rule 7 of #delegation-trial-record-graduation
+
+**Ruled 2026-09-24 by the operator (Nicolas Gilbert): NO.** No supervision level below `spot-check` —
+`SUPERVISION_LEVELS` stays at `full` + `spot-check`, as recommended. One operator amendment: the
+`spot-check` pass is **asynchronous and non-blocking** — it runs off the landing path (it never holds or
+delays a merge; it may run after land), records its verdict, and a finding files a follow-up item. The
+operator also noted, separately, that Claude's own PRs currently lack this floor because #3330 is still
+open. Codified in
+[we:docs/agent/platform-decisions.md#delegation-trial-record-graduation](/docs/agent/platform-decisions/#delegation-trial-record-graduation).
 
 ## Digest
 

@@ -1,4 +1,5 @@
 ---
+bornAs: x3ecgta
 kind: story
 size: 3
 parent: "3383"

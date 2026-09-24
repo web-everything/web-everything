@@ -27,7 +27,8 @@
  */
 import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 import {
   ADVISORY_LABELS, ADVISORY_OUTCOMES, advisoryCoversHead, latestAdvisory,
@@ -148,6 +149,32 @@ export function standDownRow(repo, pr) {
   };
 }
 
+/**
+ * #3383 — LANE RECLAIM, best-effort. `lane-whois.mjs` (a SEPARATE module — see that file's own header) is
+ * the read-only per-lane report over the WE lane pool; this shells out to its `--json` output rather than
+ * statically importing it, so a host/checkout with no lane pool at all (or a copy of this file staged without
+ * that sibling, as `operator-queue-entry.test.mjs` does) degrades to an EMPTY queue instead of failing this
+ * whole report. Only `finished-needs-review` / `unknown-work` lanes are worth the operator's time — an
+ * `in-use` or `finished-reclaimable` lane needs no decision at all (the latter's dry-run reclaim plan is
+ * `lane-whois.mjs`'s own concern, never actioned here).
+ */
+export function laneReclaimQueue({ exec = execFileSync, scriptDir = dirname(fileURLToPath(import.meta.url)) } = {}) {
+  try {
+    const script = join(scriptDir, '..', 'lane-whois.mjs');
+    // A full-pool scan is genuinely slow — one `git` read (or more) per lane, times every lane in the pool,
+    // plus a `gh pr search` per distinct guessed card — 9+ minutes measured live against the real ~65-lane WE
+    // pool under normal host contention. A short timeout here silently degrades every run to "[]" long before
+    // that, which is worse than just being slow: it reads as "nothing needs a decision" instead of "unknown".
+    const out = exec('node', [script, '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 20 * 60_000 });
+    const report = JSON.parse(out);
+    return (report.lanes || [])
+      .filter((row) => row.exists && (row.verdict === 'finished-needs-review' || row.verdict === 'unknown-work'))
+      .map((row) => ({ lane: row.lane, path: row.path, verdict: row.verdict, reason: row.reason }));
+  } catch {
+    return []; // no pool on this host, no gh/claude available, or the sibling module isn't staged — never fail the PR queue over this
+  }
+}
+
 /** Blocking sleep — `main` is synchronous, and this only runs on the rare UNKNOWN-mergeability path. */
 const blockingSleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
@@ -179,7 +206,13 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
   const unsupported = readUnsupported({ path: unsupportedPath }).filter(
     (row) => !requested.length || requested.some((repo) => repoKeyForSlug(repo) === row.repo),
   );
-  const report = { ready: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported };
+  // #3383 — LANE RECLAIM is opt-in via `--with-lanes` (a real `node`+`lane-whois.mjs` subprocess call, best-
+  // effort): a bare `main()` call must stay side-effect-free over the PR queue's own `execFileSync('gh', …)`
+  // sequence — several existing tests replace the WHOLE `node:child_process` module with one shared mock
+  // queued per expected gh call, and an unconditional extra call here would silently consume one of those
+  // slots and cascade-fail every assertion after it. Real operator usage passes the flag explicitly.
+  const laneDecisions = args.includes('--with-lanes') ? laneReclaimQueue() : [];
+  const report = { ready: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported, laneDecisions };
   for (const repo of requested.length ? requested : Object.values(CONSTELLATION_REPOS).map(({ slug }) => slug)) {
     try {
       const prs = JSON.parse(execFileSync('gh', [
@@ -244,6 +277,8 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
     console.log('STUCK — inspected (epic #3383 dispatched a diagnosis-only agent; read its comment):');
     console.log(report.stuck.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  `
       + `[${pr.episodes} episode${pr.episodes === 1 ? '' : 's'}, last ${pr.lastEpisode}]`).join('\n') || '(none)');
+    console.log('LANE RECLAIM — needs your decision (#3383, see `node scripts/lane-whois.mjs`):');
+    console.log(report.laneDecisions.map((d) => `lane-${d.lane}  [${d.verdict}]  ${d.reason}  ${d.path}`).join('\n') || '(none)');
   }
 }
 

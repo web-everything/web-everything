@@ -7,7 +7,7 @@
  * `we:scripts/operations/__tests__/review-dispatch.test.mjs`'s own style for the sibling operation this file's
  * `dispatchFix` composition was mirrored from.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
   findResumeCandidate, buildResumePrompt, tryResumeFix,
@@ -456,9 +456,9 @@ describe('dispatchFix — the composition: plan → fill → mint → spawn', ()
     expect(result.resumed).toBe(false);
   });
 
-  it('#x8mpubm — resolveSettingsEnv is called once and its result folds into the argv as --settings', () => {
+  it('#x8mpubm — resolveSettingsEnv is called once, WITH root, and its result folds into the argv as --settings', () => {
     const calls = [];
-    const resolveSettingsEnv = () => ({ PATH: '/shim:/usr/bin' });
+    const resolveSettingsEnv = vi.fn(() => ({ PATH: '/shim:/usr/bin' }));
     dispatchFix(
       { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:x'], lane: 9 },
       {
@@ -467,6 +467,10 @@ describe('dispatchFix — the composition: plan → fill → mint → spawn', ()
         resolveSettingsEnv,
       },
     );
+    // #x8mpubm follow-up (live-caught 2026-09-24) — `root` must reach the resolver so the durable
+    // `.claude/settings.local.json` delivery (`gh-app-shim.mjs#ensureSettingsFileEnv`) targets the SAME
+    // checkout this dispatch actually starts in.
+    expect(resolveSettingsEnv).toHaveBeenCalledWith('/repo');
     expect(calls[0]).toContain('--settings');
     expect(calls[0][calls[0].indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { PATH: '/shim:/usr/bin' } }));
   });

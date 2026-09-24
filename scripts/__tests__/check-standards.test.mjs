@@ -168,6 +168,25 @@ describe('validateBacklogItem — sibling reference + sizing rules', () => {
   });
 });
 
+// ── `estimatedLoc` — the task-only dispatch estimate (#3839, Fork 4 field of #3801) ──
+describe('validateBacklogItem — estimatedLoc (task-only dispatch estimate, #3839)', () => {
+  it('errors on a story declaring estimatedLoc', () => {
+    const res = run({ kind: 'story', size: 3, estimatedLoc: 80 });
+    expect(messages(res)).toContainEqual(expect.stringContaining('declares estimatedLoc but is not a task'));
+  });
+  it('errors on a non-numeric estimatedLoc', () => {
+    const res = run({ estimatedLoc: '80' });
+    expect(messages(res)).toContainEqual(expect.stringContaining('non-numeric or non-positive estimatedLoc'));
+  });
+  it('errors on a non-positive or non-integer estimatedLoc', () => {
+    expect(messages(run({ estimatedLoc: 0 }))).toContainEqual(expect.stringContaining('non-numeric or non-positive estimatedLoc'));
+    expect(messages(run({ estimatedLoc: 1.5 }))).toContainEqual(expect.stringContaining('non-numeric or non-positive estimatedLoc'));
+  });
+  it('stays clean for a task carrying a valid estimatedLoc', () => {
+    expect(run({ estimatedLoc: 80 }).errors).toEqual([]);
+  });
+});
+
 // ── Feature-tier invariants (#2691, ratified — docs/agent/backlog-workflow.md#feature-tier; plumbing #2998) ──
 describe('validateBacklogItem — feature-tier invariants (ROOT + FLAT, #2691/#2998)', () => {
   it('errors when a feature carries a parent (ROOT invariant)', () => {

@@ -4,7 +4,7 @@ kind: story
 size: 5
 parent: "3383"
 status: open
-blockedBy: ["xgomze7", "xcw0nxo"]
+blockedBy: ["4044", "4043"]
 relatedTo: ["3681", "3999"]
 scope: ["we:scripts/lib/daemon-self-sync.mjs", "we:scripts/lib/__tests__/daemon-self-sync.test.mjs"]
 dateOpened: "2026-09-23"
@@ -18,10 +18,10 @@ one clone tracking `lane/daemon-poc`). The ruling replaced that approach with **
 ([we:docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle](../docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle)
 clause 5). The POC-mode commit on `origin/lane/daemon-poc` (`69b2ec0cc`) is superseded and does not graduate.
 
-Build the overlay core in `we:scripts/lib/daemon-self-sync.mjs`, on top of the rebuild form (xgomze7):
+Build the overlay core in `we:scripts/lib/daemon-self-sync.mjs`, on top of the rebuild form (4044):
 
 - **Overlay list.** Each daemon clone reads an explicit list of overlay fix branches from a per-clone state
-  file under its pinned state root (xvxs2u3). The file is not checked in. An empty or missing list means plain
+  file under its pinned state root (4052). The file is not checked in. An empty or missing list means plain
   `main`.
 - **Rebuild.** Each tick the tree is rebuilt fresh: `origin/main`, then each overlay merged in, in list order.
 - **Auto-drop once in main.** An overlay drops from the list when `git cherry origin/main origin/<overlay>`
@@ -30,7 +30,7 @@ Build the overlay core in `we:scripts/lib/daemon-self-sync.mjs`, on top of the r
 - **Conflict = drop with an alert.** An overlay that no longer merges cleanly onto `main` (plus the overlays
   before it) is dropped from the list and an alert is raised. It is never frozen at an old head.
 - **Rollback = remove the overlay** from the list; the next rebuild runs without it.
-- The boot-input check (xt8j3yk) counts each overlay head as an input, so adding, moving or dropping an
+- The boot-input check (4050) counts each overlay head as an input, so adding, moving or dropping an
   overlay restarts the daemons in that clone.
 
 Not in this card: the test gate before new overlay code is picked up, the drain / `merge-orphan-sweep`

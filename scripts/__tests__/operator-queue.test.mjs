@@ -207,6 +207,7 @@ describe('main', () => {
       stuck: [],
       errors: ['owner/broken: unavailable'],
       unsupported: [],
+      laneDecisions: [],
     });
     expect(execFileSync).toHaveBeenLastCalledWith('gh', [
       'pr', 'list', '--repo', 'owner/good', '--state', 'open', '--limit', '200', '--json',
@@ -222,7 +223,7 @@ describe('main', () => {
       .mockReturnValueOnce(JSON.stringify({ mergeable: 'MERGEABLE' }));
     main(['--repo=o/n', '--json'], { sleep, unsupportedPath: NO_UNSUPPORTED });
     expect(JSON.parse(log.mock.calls[0][0])).toEqual({
-      ready: [{ repo: 'o/n', number: 43, title: 'Ready for review' }], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [],
+      ready: [{ repo: 'o/n', number: 43, title: 'Ready for review' }], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [], laneDecisions: [],
     });
     expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([1000, 2000]);
   });
@@ -234,7 +235,7 @@ describe('main', () => {
     vi.mocked(execFileSync).mockReturnValue(JSON.stringify({ mergeable: 'UNKNOWN' }));
     main(['--repo=o/n', '--json'], { sleep, unsupportedPath: NO_UNSUPPORTED });
     expect(JSON.parse(log.mock.calls[0][0])).toEqual({
-      ready: [], pending: [{ repo: 'o/n', number: 43, title: 'Ready for review' }], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [],
+      ready: [], pending: [{ repo: 'o/n', number: 43, title: 'Ready for review' }], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [], laneDecisions: [],
     });
     expect(sleep).toHaveBeenCalledTimes(4);
   });
@@ -261,6 +262,7 @@ describe('main', () => {
       'NOT READY — agent work (review:human but gates fail):', '(none)',
       'STOOD DOWN — needs your judgment (a fix agent asked a question; no label changed):', '(none)',
       'STUCK — inspected (epic #3383 dispatched a diagnosis-only agent; read its comment):', '(none)',
+      'LANE RECLAIM — needs your decision (#3383, see `node scripts/lane-whois.mjs`):', '(none)',
     ]);
   });
 
@@ -275,6 +277,7 @@ describe('main', () => {
       'NOT READY — agent work (review:human but gates fail):', '(none)',
       'STOOD DOWN — needs your judgment (a fix agent asked a question; no label changed):', '(none)',
       'STUCK — inspected (epic #3383 dispatched a diagnosis-only agent; read its comment):', '(none)',
+      'LANE RECLAIM — needs your decision (#3383, see `node scripts/lane-whois.mjs`):', '(none)',
     ]);
     expect(vi.mocked(execFileSync).mock.calls.map(([, args]) => args[3])).toEqual([
       'chalbert/web-everything', 'chalbert/frontierui', 'chalbert/plateau-app',

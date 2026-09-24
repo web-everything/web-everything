@@ -1,0 +1,20 @@
+{
+  "id": "delegation-post-miss-root-cause-classification",
+  "title": "Should a tooling-caused delegation miss re-graduate at the normal bar once the fix is proven? Prior art on root-cause classification and reinstatement",
+  "status": "open",
+  "summary": "Grounds decision #4029, which asks how a delegation-trial miss's root cause is classified and what happens next: rule 6 of #delegation-trial-record-graduation's unconditional immediate demotion and rule 5's post-miss bar, replaced by the operator's corrected default (2026-09-24 rework) — automated attribution with no human in the loop, a tooling-caused miss keeps its graduated level once fixed (no demotion), and the automatic step-back to full fires only when a miss is both critical and cannot be improved by tooling. FINDING 1: Google's flaky-test quarantine reinstates a test only once its root cause is fixed and it has held a run of consecutive passes against the triggering case, never on trial volume alone. FINDING 2: SRE blameless-postmortem culture treats 'human/vendor error' as a red flag that stops investigation too soon, and reviews corrective actions by a party other than the one under review. FINDING 3: ISO 9001-lineage CAPA/SCAR practice has the requesting organization, not the supplier, review a submitted root-cause finding, and pushes back on 'operator error' as a terminal answer. FINDING 4: no surveyed discipline lets one unit's proven fix transfer clearance to another unit's record without that unit re-accumulating its own evidence. FINDING 5 (rework): none of the surveyed disciplines require the independent classifying party to be human, only that it not be the party under review — this repo's #agent-convergence-independent-validation already treats an in-process, role-separated, fresh-context subagent as sufficient independence, which #4029 reuses for automated root-cause classification. FINDING 6 (rework): 'critical' is grounded on existing code (deriveRisk === 'high', NEVER_SPOT_CHECK_PATH_PREFIXES's statute/gateSelf/irreversible groups, humanRequired), not an invented scale; #3374's jury severity-scale calibration is still open and cited only as related work.",
+  "dateOpened": "2026-09-24",
+  "lastReviewed": "2026-09-24",
+  "reviewHorizon": "P3M",
+  "tags": [
+    "delegation",
+    "graduation",
+    "supervision",
+    "root-cause",
+    "model-routing",
+    "decision-prep"
+  ],
+  "relatedBlocks": [],
+  "relatedPlugs": [],
+  "relatedProject": "conveyor"
+}

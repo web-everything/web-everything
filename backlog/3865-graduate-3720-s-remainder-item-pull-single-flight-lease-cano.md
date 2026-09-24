@@ -5,7 +5,7 @@ size: 5
 parent: "3443"
 status: open
 blockedBy: ["3854", "3891"]
-scope: ["we:scripts/operations/land-advance-items.mjs", "we:scripts/operations/land-advance-items-io.mjs", "we:scripts/operations/land-advance-gate.mjs", "we:scripts/land-advance-hook.mjs", "we:scripts/operations/__tests__/land-advance-items-io.test.mjs", "we:scripts/operations/__tests__/land-advance-hook.test.mjs"]
+scope: ["we:scripts/operations/land-advance-items.mjs", "we:scripts/operations/land-advance-items-io.mjs", "we:scripts/operations/land-advance-gate.mjs", "we:scripts/land-advance-hook.mjs", "we:scripts/operations/__tests__/land-advance-hook.test.mjs", "we:scripts/operations/__tests__/land-advance.test.mjs"]
 dateOpened: "2026-09-21"
 tags: []
 ---
@@ -31,3 +31,8 @@ Ports the rest of #3720 beyond the six-slice land-advance core (#3853/3854/3855/
 ## Step 0 re-plan (2026-09-22)
 
 Dropped blocker #3864: it was ratified 2026-09-22, and its own Done-when needs this slice's tests on main, so waiting on it was circular. #3864 resolves when this slice and #3856 land. Added blockers #3854 (`we:scripts/operations/land-advance-items.mjs` moved there) and 3891 (`we:scripts/lib/prototype-tracker-compact.mjs`).
+
+## Graduation import check
+
+- 2026-09-24: graduation-import-check moved `we:scripts/operations/__tests__/land-advance-items-io.test.mjs` to #3856 — it imports a module #3856 owns.
+- 2026-09-24: graduation-import-check moved `we:scripts/operations/__tests__/land-advance.test.mjs` here from #3854 — it imports a module this card owns.

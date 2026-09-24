@@ -4961,26 +4961,50 @@ threshold is fixed by any clause below.** Seven rules:
    `backdownThresholds` config default (`DEFAULT_BACKDOWN_THRESHOLDS` in
    `we:scripts/lib/provider-routing.mjs`), proposed and changed by an ordinary batched finding against real
    data, never by a decision ceremony. A confirmed miss resets the triple at once; it is never averaged into
-   a score. A concurrent-baseline comparison (the same task run through Claude and through the delegated
-   provider, judged on the difference) is the preferred evidence shape over raising N.
+   a score — **except when rule 5's tooling-caused-and-fixed path applies to that miss, in which case the
+   reset is superseded and the triple keeps its graduated level.** A concurrent-baseline comparison (the same
+   task run through Claude and through the delegated provider, judged on the difference) is the preferred
+   evidence shape over raising N.
 4. **What makes a trial informative — its own recorded field.** A trial is the positive control only when a
    separate `informative` field on the row says so, meaning *independent review found a real problem on this
    trial that was then fixed*. It is never inferred from `outcome` (which means only "did this trial land")
    or from the free-text `findings`.
-5. **Re-graduation after a miss — a root-cause note first, then a higher bar.** After a miss, post-miss
-   trials count toward restoration only once a root-cause note is on record in its own field, not in a later
-   row's `findings`. The post-miss bar is strictly higher than the cold-start bar (`minCleanStreak + k`,
-   with `k` set by the same batched finding that sets N). This is the same principle as
+5. **Re-graduation after a miss — automated attribution first, then a fix or a bar, never a human gate by
+   default.** After a miss, an automated classification step — run by a model distinct from the delegated
+   triple, never the triple itself, never inferred from free text — records a `rootCauseClass` (`tooling` or
+   `vendor`) alongside the existing root-cause note. **A missing or invalid class fails closed to `vendor`. A
+   `tooling` class must cite a concrete landed fix (`rootCauseFixRef`, a PR or commit reference), never bare
+   prose.** A narrow human override exists, mirroring [#calibration-veto-clearing](#calibration-veto-clearing)'s
+   own override: a human may correct a classification or a recurrence tag only on identity/evidentiary grounds
+   (the cited fix does not actually exist or does not match the miss, the classifier misread the row) — never
+   to re-litigate whether a landed fix is good enough, and never as a routine step. When the class is
+   `tooling` and the fix has landed, **the triple keeps its graduated level — no demotion, no post-miss bar,
+   no reentry streak.** The automatic step-back to `full` fires only when the miss is both **critical** (the
+   existing dispatch-risk / never-spot-check / human-required proxy already computed for the work — never a
+   new bespoke scale) **and cannot be improved by tooling** (no fix nameable, or a fix landed and the same
+   failure class recurred — recurrence detected by the same distinct classifier, never a proactive proof-trial
+   requirement) — **or a named tooling-miss cap (a lifetime count, not a decaying one, tunable only by a
+   future ordinary batched finding, the same mechanism that tunes `minCleanStreak`/`k`) has been reached for
+   the triple, which reclassifies the pattern as vendor-caused regardless of any single incident's own
+   criticality.** A tooling fix proven for one triple never clears or extends to another triple's
+   classification, fix credit, or cap count; the same root-cause finding may be referenced across triples that
+   share the cause, but each accumulates its own evidence. This is the same principle as
    [#calibration-veto-clearing](#calibration-veto-clearing), applied to a delivery trial rather than a
-   reviewer's disposition.
-6. **Who moves a level — the data demotes, the operator promotes.** Demotion is computed from the record and
-   takes effect immediately. Promotion to a lighter level takes an explicit ratified act naming the triples
-   promoted, done in batches against accumulated data, never per dispatch and never per trial. With no such
-   act, a triple stays at `full`. This triple axis composes with the repo axis of
-   [#agent-convergence-independent-validation](#agent-convergence-independent-validation): the repo axis
-   says whether a repo permits staged autonomy at all, the triple axis says how much checking a delegated
-   draft gets inside a repo that permits it, and a repo-level `none` is never overridden by any triple's
-   level.
+   reviewer's disposition, with independence satisfied by a distinct automated validator rather than a
+   required human (per
+   [#agent-convergence-independent-validation](#agent-convergence-independent-validation)).
+6. **Who moves a level — the data demotes when the bar above is met, the operator promotes.** Demotion is
+   computed from the record **exactly as rule 5 above gates it** — never unconditional on a bare confirmed
+   miss — and takes effect immediately once the criticality-and-unfixable test (or the repeated-miss cap) is
+   met. Promotion to a lighter level takes an explicit ratified act naming the triples promoted, done in
+   batches against accumulated data, never per dispatch and never per trial. **This includes restoring a
+   triple that was actually stepped back under rule 5's critical-and-unfixable path**: meeting whatever bar
+   applies is never itself sufficient — the ratified act also confirms the classification and cap state that
+   put it there. With no such act, a stepped-back triple stays at `full`. This triple axis composes with the
+   repo axis of [#agent-convergence-independent-validation](#agent-convergence-independent-validation): the
+   repo axis says whether a repo permits staged autonomy at all, the triple axis says how much checking a
+   delegated draft gets inside a repo that permits it, and a repo-level `none` is never overridden by any
+   triple's level.
 7. **The verification floor — shallower, never absent.** At every level the orchestrator reads the real diff
    and rules on it, and runs the close-out gate itself and reads its output
    ([#model-routing](backlog-workflow.md#model-routing) Inline (2) and (5)); a delegated run's exit code is
@@ -4990,6 +5014,13 @@ threshold is fixed by any clause below.** Seven rules:
    one round, the diff and the item card, capped findings, non-blocking). A finding from that pass files a
    follow-up item, and the floor's cost and yield are measured and reported. Any provider may fill the
    reviewer seat; a different provider from the builder is preferred, never required.
+
+   **A level below `spot-check` — lighter or absent — was proposed and declined (#3867):** `spot-check` is
+   the delegated PR's own review at the
+   [#every-pr-gets-a-look-advisory-floor](#every-pr-gets-a-look-advisory-floor) shape, and a producer's
+   record never exempts a PR from that floor. The spot-check pass runs **asynchronously, off the landing
+   path**: it never holds or delays a merge — it may run after land — and it records its verdict; a finding
+   files a follow-up item (#3867).
 
 **Reach.** Mechanical provider routing binds the mechanical dispatch path only. An interactive orchestrating
 loop keeps its own inline routing verdict under [#model-routing](backlog-workflow.md#model-routing) Inline (3)
@@ -5436,7 +5467,7 @@ reasoning and the rejected options:
 
 ### Every resident daemon updates itself from `main` plus opt-in live overlays — rebuilt fresh each tick, restarted between ticks, never hand-merged {#resident-daemon-reload-lifecycle}
 
-**Ratified 2026-09-23** (`3681`, bornAs `x6einv9`, operator, in session, in order: *"3681 ratified"* ·
+**Ratified 2026-09-23** (`3681`, bornAs `3681`, operator, in session, in order: *"3681 ratified"* ·
 *"seems simpler all on prototype for now, no?"* · *"once we have merge into main, we will still want to be able
 to run fixes of a darmon live and switch back to main once it merges"* · *"yes"* (to the live-overlay design) ·
 *"ratified"*). Forks 2 and 4 as re-prepared; Fork 5 amended by the operator to the live-overlay design below.
@@ -5488,18 +5519,18 @@ clauses:
      runs overlays.
    - (f) **Graduation is unchanged.** Overlay code reaches `main` only through its own normal PR and review.
    - (g) **This supersedes the long-lived POC-branch approach for daemons** (`lane/daemon-poc`, tracking epic
-     xii6vye): a daemon never tracks a POC branch as its steady state. It is the daemon exception written into
+     3999): a daemon never tracks a POC branch as its steady state. It is the daemon exception written into
      [#poc-branch-declared-delivery-mode](#poc-branch-declared-delivery-mode) clause 4(a).
 6. **What runs is visible, and hangs are caught from outside.** Each daemon publishes its boot input heads and
    active overlays in its heartbeat or lease record, read by `runner-activity`. Every child call a tick makes
    has a timeout, and a check outside the daemon alerts when its heartbeat stops moving.
 7. **Left open.** How [#drain-daemon-self-hosting-boundary](#drain-daemon-self-hosting-boundary) clause 3 (a
    daemon never approves its own daemon-code change) applies to a review daemon running an overlay whose
-   graduation PR it would review was not ruled. Clause 3 stands unamended until decision card xcw0nxo rules it.
+   graduation PR it would review was not ruled. Clause 3 stands unamended until decision card 4043 rules it.
 
 **Lineage:** #3681 (ratified 2026-09-23; first prepared the morning of 2026-09-23, re-prepared the same evening
-in PR #2546 against the live self-sync of #3954). Supersedes the POC-branch framing of x923r7y and the
-`lane/daemon-poc` registry entry (to be removed by x8kenvp). Composes with
+in PR #2546 against the live self-sync of #3954). Supersedes the POC-branch framing of 3992 and the
+`lane/daemon-poc` registry entry (to be removed by 4042). Composes with
 [#drain-daemon-self-hosting-boundary](#drain-daemon-self-hosting-boundary) (clause 1's rebuild form kept, clause 2's
 premise corrected, clause 3 unchanged), [#poc-branch-declared-delivery-mode](#poc-branch-declared-delivery-mode)
 (clause 4(a) amended) and [#state-lives-where-its-nature-dictates](#state-lives-where-its-nature-dictates).

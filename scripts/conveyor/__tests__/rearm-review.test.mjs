@@ -29,10 +29,16 @@ describe('decideRearm — the pure re-arm swap (#2630)', () => {
     expect(d.removeLabels).not.toContain(REVIEW_LABELS.accepted);
   });
 
-  it('KEEPS review:human on a gate-self bounce — never self-clears the human gate', () => {
+  // #x01u7az — LIVE BUG, PR #2549 (2026-09-24): this used to assert `addLabel === REVIEW_LABELS.pending` here,
+  // which is exactly the bug — a gate-self rearm added `review:pending` ON TOP of the still-live `review:human`,
+  // leaving BOTH review:* hold labels live at once. `review:human` already IS the hold; a rearm on a gate-self
+  // PR now adds NOTHING (see `we:scripts/review-set-label.mjs#decideSetLabel`'s `rearm` branch for the full
+  // reasoning).
+  it('KEEPS review:human on a gate-self bounce, and adds NOTHING — never self-clears, never double-holds', () => {
     const d = decideRearm({ currentLabels: lbl(REVIEW_LABELS.human, REVIEW_LABELS.changes) });
     expect(d.allowed).toBe(true);
-    expect(d.addLabel).toBe(REVIEW_LABELS.pending);
+    expect(d.addLabel).toBe('');
+    expect(d.addLabel).not.toBe(REVIEW_LABELS.pending);
     expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL]); // review:human is NOT in the removals; #2832 strips ready-to-merge
     expect(d.removeLabels).not.toContain(REVIEW_LABELS.human);
     expect(d.keepsHuman).toBe(true);

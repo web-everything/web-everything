@@ -17,7 +17,7 @@ import { prFileContract } from './pr-file-test-helpers.mjs';
 prFileContract({
   name: 'reconcile-pass', load: () => import('../reconcile-pass.mjs'),
   reader: 'defaultReadPrs', run: 'runReconcilePass',
-  fields: 'number,headRefName,headRefOid,labels,statusCheckRollup,mergeStateStatus,comments,body', reconcile: true,
+  fields: 'number,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body', reconcile: true,
 });
 
 

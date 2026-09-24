@@ -188,12 +188,25 @@ Then report `#{{ITEM_NUM}} → blocked-on-infra (tool/permission denial applying
 #{{PR_NUM}})` and exit — do not retry the same denied action yourself in a loop, and do not fall back to a
 Bash rewrite to work around the denial (that is the exact shape that got denied).
 
+**Resolve against this PR's OWN base branch, never an assumed `main`** (#3383). Most PRs base off `main`, but a
+**stacked** PR (built on another still-open lane/PR — `#poc-branch-declared-delivery-mode` clause 5) does not, and
+merging `main` into a PR based on something else would pull in the wrong history entirely. Confirm the real base
+LIVE, every time — never trust a value you were told earlier in this dispatch, since GitHub RETARGETS a stacked
+PR to `main` automatically the moment its base branch merges and is deleted (the normal, expected path):
+
+```bash
+gh pr view {{PR_NUM}} --json baseRefName --repo {{REPO}} --jq .baseRefName
+```
+
 If `origin/main` advanced under the lane and a **conflict**
 blocks the gate, resolve it the `/finish` way (regenerate derived artifacts, take-main for coordination JSON) —
 or, if it is a genuine same-line code overlap you cannot safely resolve, **record the stand-down on the PR
 first** (`#xu2krte` — this call was missing here until then; only the *manual* `/finish` path posted it, so an
 auto-dispatched escalation was silently re-dispatched at the same unresolved conflict next tick, bounded only
-by the 5-attempt rearm cap instead of this terminal exit), THEN report the completion record and stop:
+by the 5-attempt rearm cap instead of this terminal exit), THEN report the completion record and stop. (This is
+written against `main` because that is the common case — see the STACKED-BASE MODE note below for a PR whose own
+base is something else; the same reproduce/resolve/escalate discipline applies either way, just against a
+different ref.)
 
 ```bash
 node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --reason=conflict \
@@ -217,6 +230,38 @@ Then report `#{{ITEM_NUM}} → fix escalated (conflict with main)`.
 > SAME `review:changes → review:pending` swap, but it posts the mechanical-round marker so this repair counts
 > against its own, smaller `CONFLICT_FIX_ROUND_CAP` (3) instead of the ordinary 5-round negotiation cap; using
 > the plain (no `--round=`) form here would silently spend the wrong budget.
+
+> **STACKED-BASE MODE (#3383) — dispatched from `reconcile-core.mjs`'s STACKED-BASE CONFLICT branch onto a PR
+> whose own base is NOT `main`.** You are in this mode if `gh pr view {{PR_NUM}} --json baseRefName,labels
+> --repo {{REPO}}` shows a `baseRefName` other than `main` AND the PR still carries `review:accepted` (or
+> whatever review label it already had) rather than `review:changes` — this PR was never bounced, unlike the
+> ordinary conflict-fix population just above. It is a **stacked** PR (built on another still-open lane/PR): the
+> drain will never land it regardless of label (`#poc-branch-declared-delivery-mode` clause 5, "base is not
+> `<default>`"), so its conflict against that base — typically caused by a fixer pushing new commits to the base
+> lane out from under it — is a purely mechanical rebase, never a reviewer-facing content conflict.
+>
+> **Resolve it by merging or rebasing onto the PR's OWN base ref** (the `baseRefName` you just read — never
+> `main`, unless GitHub has ALREADY retargeted this PR to `main` because that base branch merged and was deleted
+> in the meantime, the normal path; the live `gh pr view` read above is what tells the two apart, so always read
+> it fresh rather than trusting a base named earlier in this dispatch). Resolve every conflicted hunk by reading
+> BOTH sides' intent (this PR's own and whatever landed on its base since), run the gate green, and push.
+> **Touch no `review:*` label of any kind** — `review:accepted` rides through this repair untouched, exactly as
+> it was before the conflict appeared; there is no bounce to undo and nothing to re-arm. **Post a comment on the
+> PR showing the conflicting hunk BEFORE your resolution and the resolved hunk AFTER**, the same before/after
+> evidence discipline the main-base conflict-fix round above uses.
+>
+> **At hand-back, do NOT run `rearm-review.mjs` at all** (there is no `review:changes` to swap) — instead post
+> the durable marker-only comment, which counts against the SAME `CONFLICT_FIX_ROUND_CAP` the ordinary
+> conflict-fix round uses (they are the identical kind of work, just against a different ref):
+>
+> ```bash
+> node "{{WE_ROOT}}/scripts/conveyor/conflict-fix-mark.mjs" {{PR_NUM}} --repo={{REPO}} --base-ref=<the baseRefName you resolved against> && \
+>   node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=re-armed
+> ```
+>
+> If the overlap is a genuine same-line conflict you cannot safely resolve, the same stand-down escalation above
+> applies unchanged (`stand-down.mjs {{PR_NUM}} --repo={{REPO}} --reason=conflict --detail=...`) — this mode
+> changes only what a *successful* resolution hands back with, never the escalation path.
 
 **Build-brief discipline applies to the repair too** (statute:
 [we:docs/agent/platform-decisions.md#build-brief-discipline](../../../docs/agent/platform-decisions.md#build-brief-discipline),
@@ -355,7 +400,9 @@ Skip only if you genuinely hit no generalizable friction.
 `review:pending` (still parked, exit 2), and surfaces it for `/review`. Return a one-line result:
 `#{{ITEM_NUM}} → PR #{{PR_NUM}} (re-armed review:pending | fix escalated <reason> | fix gate-red)`, or, for the
 tooling-denial exit in step 3, `#{{ITEM_NUM}} → blocked-on-infra (...)`, or, for ADVISORY-FIX MODE (step 7a),
-`#{{ITEM_NUM}} → PR #{{PR_NUM}} (advisory finding addressed — a fresh review is owed next, not by this agent)`.
+`#{{ITEM_NUM}} → PR #{{PR_NUM}} (advisory finding addressed — a fresh review is owed next, not by this agent)`,
+or, for STACKED-BASE MODE, `#{{ITEM_NUM}} → PR #{{PR_NUM}} (stacked-base conflict resolved against <baseRefName> —
+review labels untouched)`.
 A red gate / red CI / a blocked-on-infra exit is NOT watcher-visible — your one-line RETURN is the only signal
 that surfaces it, so always report it.
 
@@ -404,6 +451,12 @@ re-push, re-arm-never-clear shape is identical — which is the point (#2630).
 - **A mechanical conflict-resolution round hands back with `rearm-review.mjs --round=conflict`** (#xkmu3gv), so
   it counts against its own smaller cap — the plain form would silently spend the ordinary negotiation cap
   instead.
+- **Always resolve a conflict against the PR's own `baseRefName`, read LIVE, never an assumed `main`** (#3383) —
+  most PRs base off `main`, but a stacked PR does not, and GitHub retargets a stacked PR to `main` automatically
+  once its base merges and is deleted, so the live value can differ from what this dispatch was planned against.
+- **STACKED-BASE MODE never touches any `review:*` label** (#3383) — its only output is the fix itself and the
+  durable marker via `conflict-fix-mark.mjs` (never `rearm-review.mjs`, there is no `review:changes` to swap);
+  it counts against the SAME `CONFLICT_FIX_ROUND_CAP` the ordinary main-base conflict-fix round uses.
 - **If you stop, say so ON THE PR** — every escalation exit runs `stand-down.mjs` before it returns (#3296). A
   refusal that leaves no durable trace is indistinguishable from a crash, and gets re-dispatched forever. The
   marker changes no label; it is terminal for the auto-fix loop and cleared by a human.

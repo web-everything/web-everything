@@ -521,9 +521,10 @@ export function assessLiveness(bound) {
  *   5. THE CAP, from the PR and only from the PR.
  *
  * @param {object} o
- * @param {Array<object>} [o.prs] - open PRs as `gh pr list --json number,headRefName,headRefOid,labels,
- *   statusCheckRollup,mergeStateStatus,comments` returns them, each optionally carrying `transcriptMtimeMs`
- *   (EVIDENCE ONLY — no decision reads it).
+ * @param {Array<object>} [o.prs] - open PRs as `gh pr list --json number,headRefName,headRefOid,baseRefName,
+ *   labels,statusCheckRollup,mergeStateStatus,comments` returns them, each optionally carrying `transcriptMtimeMs`
+ *   (EVIDENCE ONLY — no decision reads it). `baseRefName` is what the STACKED-BASE CONFLICT branch keys on
+ *   (#3383); its absence just means every `conflicted` PR falls through to the pre-#3383 `owed-elsewhere` path.
  * @param {Array<object>} [o.agents] - `claude agents --json` entries, each optionally carrying the two facts the
  *   listing cannot supply and the IO shell resolves: `laneHeadOid` (the `HEAD` of the lane at `cwd`) and
  *   `pidAlive` (`process.kill(pid, 0)` → `true`/`false`; absent = not probed = UNKNOWN).
@@ -543,11 +544,15 @@ export function assessLiveness(bound) {
  * @param {number} [o.advisoryFixCap] - the advisory-fix attempt cap on a `needs-human` PR (#xkmu3gv); defaults
  *   to {@link ADVISORY_FIX_ROUND_CAP} (3). See that constant's own docblock for why it is separate from
  *   `roundCap`.
+ * @param {string} [o.defaultBranch] - the repo's default branch (#3383); defaults to `'main'`. A `conflicted`
+ *   PR whose `baseRefName` differs from this is STACKED (built on another lane/PR) — see the STACKED-BASE
+ *   CONFLICT branch below for why that population needs its own dispatch rather than the generic
+ *   `owed-elsewhere` refusal.
  * @returns {{dispatch:Array<object>, refusals:Array<object>, notes:Array<object>}}
  */
 export function planReconcile({
   repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap = CI_HEAL_ROUND_CAP,
-  conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP,
+  conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP, defaultBranch = 'main',
 } = {}) {
   const dispatch = [];
   const refusals = [];
@@ -563,6 +568,10 @@ export function planReconcile({
       prNumber,
       headRefName: pr?.headRefName ?? null,
       headRefOid: pr?.headRefOid ?? null,
+      // #3383 — carried on every row (evidence, mirrors `transcriptMtimeMs`/`body` just below): the STACKED-BASE
+      // CONFLICT branch reads it, and a reader auditing any other row can see at a glance whether this PR is
+      // stacked on another lane/PR at all, with no need to go back to the raw listing.
+      baseRefName: pr?.baseRefName ?? null,
       // EVIDENCE ONLY. No decision in this file reads it — see the liveness block in the file docblock.
       transcriptMtimeMs: Number.isFinite(pr?.transcriptMtimeMs) ? pr.transcriptMtimeMs : null,
       // #xu2krte Fork 1 — carried on every row (not just `fix` dispatches) for the same "evidence travels with
@@ -692,6 +701,65 @@ export function planReconcile({
       }
       // else: already fixed for the CURRENT advisory note (advisoryFixes >= advisoryNotes) — fall through to
       // the ordinary `OWED['needs-human'] = 'review'` path below, unchanged.
+    }
+
+    // ── STACKED-BASE CONFLICT (#3383) — its OWN branch, ahead of the generic `OWED`/`OWED_ELSEWHERE` table, for
+    // the ONE `conflicted`-phase population that table's blanket "owed-elsewhere: the branch needs a rebase
+    // before it can merge" answer describes a rebase NOBODY will ever perform. A PR whose `baseRefName` is not
+    // `defaultBranch` is STACKED (built on another lane/PR, per `#poc-branch-declared-delivery-mode` clause 5:
+    // "base is not <default>") — the drain will never land it regardless of label, so `OWED_ELSEWHERE.conflicted`
+    // naming "a rebase… owed to the drain" is simply wrong for this population: nobody is coming.
+    // `we:scripts/conveyor/parked-pr-conflict-watch.mjs`'s own queued-conflict grace path independently defers to
+    // THIS branch for the identical reason (see that file's own `graceDue` block) rather than bouncing it via
+    // `postFinding`, which would strip `review:accepted` and force a fresh human review for what is ordinarily a
+    // purely mechanical rebase against the PR's OWN base — never a real reviewer-facing content conflict.
+    //
+    // CONFIRMED LIVE 2026-09-24: `chalbert/web-everything#2578` (`review:accepted`, base
+    // `lane/3681-ratify-daemon-lifecycle`, stacked on PR #2549) went `owed-elsewhere` here and unreported by
+    // `parked-pr-conflict-watch.mjs sweep --dry-run` alike, after a fixer pushed to its base — a genuine
+    // stacked-PR gap no daemon closed. See `reconcile-core.test.mjs` for the pinned regression.
+    //
+    // BOUND ON THE SAME DURABLE MARKER/CAP `#xkmu3gv` (PR #2579) ADDED FOR THE MECHANICAL MAIN-BASE CONFLICT-FIX
+    // POPULATION ({@link CONFLICT_FIX_ROUND_CAP}, `countConflictFixComments`) — this is the identical KIND of
+    // work (rebase-and-resolve, never a judgment call over a reviewer's finding), just against a different ref,
+    // so it shares that population's floor rather than inventing a third one. `mode: 'stacked-rebase'` and
+    // `baseRefName` ride on the dispatch row so `we:skills-src/conveyor/fix-agent-brief.md`'s own STACKED-BASE
+    // MODE section, and any reader, can see at a glance which ref this repair merges — the brief re-reads it LIVE
+    // off the PR itself before acting, never trusting a stale value here, so a PR GitHub has since retargeted to
+    // `defaultBranch` (its stacked base merged to `main` and was deleted — the ordinary, expected path) is read
+    // correctly at repair time even if this row was planned a tick earlier against the old base.
+    //
+    // The hand-back posts the SAME `CONFLICT_FIX_COMMENT_MARKER` `rearm-review.mjs --round=conflict` posts
+    // (`scripts/conveyor/conflict-fix-mark.mjs`), but touches NO label at all — unlike the ordinary conflict-fix
+    // round, this PR was never bounced to `review:changes` in the first place, so there is nothing to "re-arm";
+    // `review:accepted` (or whatever it already carried) rides through this repair completely untouched.
+    //
+    // NEVER FIRES for `baseRefName === defaultBranch` (including a `null`/unknown base) — that population falls
+    // straight through, unchanged, to the existing `OWED_ELSEWHERE.conflicted` refusal below, exactly as it did
+    // before this branch existed. It also never fires for any OTHER phase — a stacked PR that is `bounced`,
+    // `needs-human`, etc. is handled entirely by that phase's own existing branch, unaffected by this one.
+    if (phase === 'conflicted') {
+      const baseRefName = pr?.baseRefName ?? null;
+      const isStackedBase = Boolean(baseRefName) && baseRefName !== defaultBranch;
+      if (isStackedBase) {
+        const conflictAttempts = countConflictFixComments(pr?.comments);
+        if (conflictAttempts >= conflictFixCap) {
+          refuse('cap-exhausted', {
+            ...withPhase, attempts: conflictAttempts, cap: conflictFixCap, capKind: 'conflict-fix',
+            why: `this PR's own durable conflict-fix count is ${conflictAttempts} against a cap of ${conflictFixCap}` +
+              ` — mechanical rebase against its base \`${baseRefName}\` is exhausted here and a person must take it`,
+          });
+        } else {
+          dispatch.push({
+            ...base, ...withPhase, kind: 'fix', isConflict: true, mode: 'stacked-rebase', baseRefName,
+            attempts: conflictAttempts, cap: conflictFixCap,
+            why: `conflicts with its own base \`${baseRefName}\` (not \`${defaultBranch}\`) — a stacked PR the ` +
+              'drain will never land regardless of labels, so this is a mechanical rebase against its base, ' +
+              `never a rebase owed to the drain; ${conflictAttempts} of ${conflictFixCap} conflict-fix attempts are spent`,
+          });
+        }
+        continue;
+      }
     }
 
     if (!OWED[phase]) {

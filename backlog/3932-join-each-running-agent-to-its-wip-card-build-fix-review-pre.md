@@ -30,3 +30,8 @@ Lifecycle from `claude agents --json --all` (cached 10 s). Output: `runs[] {runI
 
 1. **Executable** — we:scripts/operations/__tests__/agent-activity.test.mjs passes under `npx vitest run` with one fixture per kind: `conveyor-N`, `prepare-N`, `prepare-decision-N`, `review-pa-P`, `fix-P`, `ci-heal-P` (PR→card via the supplied map), a Codex thread record, a subagent inheriting its parent, a lane-lease session, a claim-replay session, a mention-only subagent tagged `mention`, an unmatched background session, and an interactive session with no lane or claim that is NOT listed.
 2. **Live** — on the laptop, the `agent-activity` operation run through we:scripts/operations/run.mjs with `--json` (redirected to a file) lists every session `claude agents --json` reports as working, each either on a card or in `unmatched`.
+
+## Additions from 2026-09-24 incident review
+
+- **Add `transcriptAgeS` to each run.** `lastEventAt` from `claude agents` is not enough: on 2026-09-23 and again on 2026-09-24 a session stayed `blocked` in the listing for hours while its transcript never moved (#3951). The transcript file's mtime age is the cheap truth. The new pr-ownership read (4056) uses the same field to flag a stale binding, so compute it once here.
+- **Share the PR→card map.** The pr-ownership read needs the same PR→card map this card takes as input. Build it once, as a shared helper, so /wip's per-card agent view and its per-PR ownership view never disagree about which card a PR belongs to.

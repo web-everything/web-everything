@@ -11,7 +11,7 @@ vi.mock('../../lib/gh-throttle.mjs', () => ({ runGhSync: vi.fn(), execFileSyncTh
 describe('shared open-PR discovery', () => {
   it('pins the deduplicated union and proves every standalone field is included', () => {
     expect(PR_LIST_LIMIT).toBe(200);
-    expect(OPEN_PR_LIST_FIELDS).toBe('number,headRefName,title,body,labels,files,mergeable,mergeStateStatus,headRefOid,statusCheckRollup,comments');
+    expect(OPEN_PR_LIST_FIELDS).toBe('number,headRefName,title,body,labels,files,mergeable,mergeStateStatus,headRefOid,baseRefName,statusCheckRollup,comments');
     const union = OPEN_PR_LIST_FIELDS.split(',');
     expect(new Set(union).size).toBe(union.length);
     const standalone = new Set();

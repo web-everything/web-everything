@@ -38,3 +38,9 @@ The units budget and the kind weights this card's finding asks `review-dispatch`
 
 1. **Executable** — `npx vitest run we:scripts/operations/__tests__/review-dispatch.test.mjs we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs` carry cases that fail before and pass after: with the ceiling at 3 and 2 live sessions, ten owed reviews dispatch exactly one and report nine deferred; at the ceiling, none dispatch and none error; a smaller caller budget is honoured.
 2. **Probed live** — re-arming several real `review:pending` PRs dispatches no more reviewers in one pass than the ceiling allows.
+
+## Additions from 2026-09-24 incident review
+
+- **The daemons are separate processes now.** Since this card was filed, review and fix dispatch moved out of the runner into their own daemons (#3876, #3870). A ceiling computed inside one process cannot see the others. The live count must come from a shared source every daemon reads (the `claude agents` listing filtered by dispatch slug, or a shared lease directory), so three daemons together still stay under one budget.
+- **Stuck sessions eat the budget.** On 2026-09-23/24 the plateau-app pool sat at 14/14 held, largely by review sessions stuck `blocked` (#3951). A ceiling that counts them as live work starves new dispatch, and a ceiling that ignores them over-admits. Count a session whose transcript has not moved for longer than the stale threshold (the `transcriptAgeS` field added to #3932) separately, report it as `held-by-stale`, and let the reaper (#3721, #3624) free it. Do not silently drop it from the count.
+- **Machine load (operator proposal 7).** The load-aware part is owned by #3807 (tracked budget), #3808 (capacity review) and #3611 (adaptive admission). This card only needs to read the one resolver; no second load rule here.

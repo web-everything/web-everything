@@ -139,12 +139,17 @@ import { mintSessionSlug } from './session-slug.mjs';
 import { normNum } from './queue-store.mjs';
 import { capToConcurrency, resolveMaxConcurrentLanes } from '../lib/lane-concurrency.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
+// The kind-scoped pause's PURE half (epic #3383) — the same predicate `dispatch-plan.mjs` uses for its own
+// `build` gate, so the two cores can never disagree about what a given marker holds. No fs comes in with it.
+import { resolvePausedKinds, isScopedPause } from '../readiness/dispatch-pause.mjs';
 
 /** Held reasons (from {@link ../readiness/dispatch-plan.mjs HELD_REASONS}) that already have their OWN dedicated
  *  note elsewhere in {@link planTick} — `needs-slice` from `state.needsSlice`, `needs-decision` from
- *  `state.decisions`, `unshaped-no-scope` from the prepare-spawn notes (`auto-preparing-scope` / `prepare-no-lane`).
- *  The held-reason note loop below skips these so an item is never double-reported under two note kinds. */
-export const HELD_NOTE_EXCLUDED_REASONS = Object.freeze(['needs-slice', 'needs-decision', 'needs-investigation', 'unshaped-no-scope']);
+ *  `state.decisions`, `unshaped-no-scope` AND `no-size` (#3849) from the SAME prepare-spawn notes
+ *  (`auto-preparing-scope` / `prepare-no-lane` — one prepare-scope agent authors both `scope:` and a missing
+ *  size/estimate, #3842). The held-reason note loop below skips these so an item is never double-reported under
+ *  two note kinds. */
+export const HELD_NOTE_EXCLUDED_REASONS = Object.freeze(['needs-slice', 'needs-decision', 'needs-investigation', 'unshaped-no-scope', 'no-size']);
 
 /**
  * SELF-DIAGNOSED STALL DETECTION (2026-09-14, live incident: #3521 held `overlaps lane-2` for 85+ minutes across
@@ -283,10 +288,39 @@ export const DEFAULT_FIX_TTL_TICKS = 5;
 export const DEFAULT_FIX_RETRY_CAP = 3;
 /** Default TTL (in ticks) for the CI-HEAL guard's died-before-repush backstop (SKILL §3c-ci, #2666). */
 export const DEFAULT_CI_HEAL_TTL_TICKS = 5;
+/**
+ * #3383 — What ONE TTL "tick" is worth in wall-clock time: the resident runner's default interval
+ * (`DEFAULT_TICK_INTERVAL_MS` in `skills-src/conveyor/runner.mjs`, 120 s), which is what the tick-count TTLs
+ * above were calibrated against. Hook-driven `tick-once` ticks arrive at a VARIABLE rate (throttled to >= 60 s,
+ * but seconds apart in a burst of prompts and hours apart when idle), so a bare tick count is no longer a
+ * stable clock: in a burst a guard could expire in half the intended time, and after the last prompt of the day
+ * it would never expire at all.
+ */
+export const TTL_MS_PER_TICK = 120_000;
+/** A guard's spawn is stamped with both the tick counter (legacy) and the wall clock (when the caller has one). */
+const spawnStamp = (tick, now) => (Number.isFinite(now) ? { spawnedTick: tick, spawnedAt: now } : { spawnedTick: tick });
+/**
+ * Has a guard's TTL run out? WALL-CLOCK when the guard carries `spawnedAt` and the caller supplied `now` (and the
+ * clock has not gone backwards past the stamp): `ttlTicks * TTL_MS_PER_TICK` ms. Otherwise the original tick
+ * count — a guard persisted before this change, or a caller with no clock, behaves exactly as it always did.
+ * With the resident runner at its 120 s interval the two are the same TTL.
+ */
+export function guardTtlElapsed(g, { tick = 0, now = null, ttlTicks }) {
+  if (Number.isFinite(g?.spawnedAt) && Number.isFinite(now) && now >= g.spawnedAt) return now - g.spawnedAt >= ttlTicks * TTL_MS_PER_TICK;
+  return tick - (g?.spawnedTick ?? tick) >= ttlTicks;
+}
 /** Default per-PR CI-heal attempt cap before a red/BEHIND PR is surfaced for `/review` (SKILL §3c-ci, #2666). */
 export const DEFAULT_CI_HEAL_RETRY_CAP = 3;
 /** Default idle-stop window: queue-empty + no operator feedback for this long → stop (SKILL §6). */
 export const DEFAULT_IDLE_WINDOW_MS = 15 * 60 * 1000;
+/**
+ * The dispatch kinds THIS core spawns, in tick order — the five of `dispatch-pause.mjs#PAUSABLE_KINDS` that
+ * are planned here. `build` is the sixth and is deliberately absent: builds are gated one step upstream, where
+ * `we:scripts/readiness/dispatch-plan.mjs` empties `plan.launch` to `dispatch-paused` holds, so this core never
+ * decides a build's fate. Used to word the kind-scoped pause note with the kinds THIS tick actually withheld.
+ */
+export const TICK_SPAWN_KINDS = Object.freeze(['prepare', 'prepare-decision', 'investigate', 'fix', 'ci-heal']);
+
 /** The review label that routes a bounced PR to a fix agent (vs. a human-owned review park). */
 export const REVIEW_CHANGES_LABEL = 'review:changes';
 
@@ -398,20 +432,39 @@ const BUILD_SESSION_RE = /^conveyor-(\d+)[a-z]?$/i;
  * restart path. This mirrors the fix/ci-heal retry-cap's OWN restart-surviving floor (`prRearmCounts`/
  * `prCiHealCounts`, #2643/#2666): read a fact from the GROUND TRUTH each tick — here, whether the OS session
  * the dispatch spawned is still alive — rather than trusting only the in-process TTL countdown. Pure: given the
- * live-session NAMES (the IO shell's one `claude agents --json` read, {@link defaultListAgents} in
+ * live-session ROWS (the IO shell's one `claude agents --json` read, {@link defaultListAgents} in
  * `../operations/dispatch-lane-io.mjs`), extract every num with a live BUILD session. A session merely being
- * LISTED counts as durable-live regardless of `pid`/`state` ambiguity (unlike `reconcile-core.mjs`'s liveness
+ * LISTED counts as durable-live regardless of `state` ambiguity (unlike `reconcile-core.mjs`'s liveness
  * refusal, which must tell "alive" apart from "unknown" to avoid a WRONG dispatch): here the failure mode this
  * guards against is a double-dispatch, so erring toward "still guarded" a little longer than strictly necessary
- * is the safe direction — once the OS session actually exits, `claude agents --json` stops listing it and this
- * floor clears on its own, no TTL of its own required.
- * @param {Array<{name?:string}>|Array<string>} sessions - `claude agents --json` rows, or plain name strings.
- * @returns {string[]} normalized nums with a live BUILD session.
+ * is the safe direction.
+ *
+ * #3383 FOLLOW-UP (2026-09-14) — `pidAlive === false` IS THE ONE EXCEPTION, and it is load-bearing, not merely
+ * an optimization. This function's ORIGINAL reasoning ("once the OS session actually exits, `claude agents
+ * --json` stops listing it and this floor clears on its own") was found FALSE the same night a live audit
+ * turned up 26 registry rows — `conveyor-*` among them — still listed 6-13.5 DAYS after their process died,
+ * `state` never advancing. Before this exception, ANY listed `conveyor-<num>` name durable-guarded that num
+ * forever, however long the listing itself was stale — permanently suppressing a REAL re-dispatch of an item
+ * whose only "in-flight" evidence was a phantom registry row, silently (the status line's own display already
+ * ages a never-claimed durable entry out of its COUNT after `buildTtlTicks` — see `countableBuildGuards` at
+ * this function's call site — but that never touched the guard itself, which kept blocking dispatch under the
+ * cover of a status line that had stopped mentioning it at all). A row carrying an explicit `pidAlive === false`
+ * — the SAME two-signal probe `driver-watchdog.mjs#resolvePidAlive`/`scanPsOutput` established and
+ * `lease-reaper.mjs`/`session-reaper.mjs` already reuse (a row's own `pid` when present, else a `ps aux` scan
+ * for its full `sessionId`) — is a CONFIRMED death, not an absence of evidence: nothing double-dispatches
+ * against a session that provably no longer exists, so excluding it here costs none of the protection this
+ * floor exists for. `true` (genuinely alive) and `undefined`/`null` (unknown — no `pidAlive` resolved at all,
+ * the exact shape every pre-#3383 caller/test still passes) both keep the ORIGINAL "list alone is enough"
+ * behavior, byte-identical — this is strictly narrower than before, never wider.
+ * @param {Array<{name?:string, pidAlive?:boolean|null}>|Array<string>} sessions - `claude agents --json` rows
+ *   (optionally carrying a `pidAlive` fact the IO shell already resolved), or plain name strings.
+ * @returns {string[]} normalized nums with a live (not confirmed-dead) BUILD session.
  */
 export function durableBuildNums(sessions) {
   const out = [];
   for (const s of Array.isArray(sessions) ? sessions : []) {
     const name = typeof s === 'string' ? s : s?.name;
+    if (typeof s === 'object' && s !== null && s.pidAlive === false) continue; // confirmed dead — never a floor
     const m = BUILD_SESSION_RE.exec(String(name ?? ''));
     if (m) out.push(normNum(m[1]));
   }
@@ -432,7 +485,7 @@ export function durableBuildNums(sessions) {
  * @param {{ lanes?:object[], queue?:object[], tick:number, ttlTicks?:number, returnedBuildNums?:Array<*> }} ctx
  * @returns {{ live:Array<object>, retired:Array<{num:*, lane:*, reason:string, note?:boolean}> }}
  */
-export function retireBuildGuards(buildGuards, { lanes = [], queue = [], tick = 0, ttlTicks = DEFAULT_BUILD_TTL_TICKS, returnedBuildNums = [] } = {}) {
+export function retireBuildGuards(buildGuards, { lanes = [], queue = [], tick = 0, now = null, ttlTicks = DEFAULT_BUILD_TTL_TICKS, returnedBuildNums = [] } = {}) {
   const leasedLanes = new Set((Array.isArray(lanes) ? lanes : []).map((l) => String(l?.lane)));
   const clearedNums = clearedQueueNums(queue);
   const returned = new Set((Array.isArray(returnedBuildNums) ? returnedBuildNums : []).map(normNum));
@@ -444,7 +497,7 @@ export function retireBuildGuards(buildGuards, { lanes = [], queue = [], tick = 
     const claimed = leasedLanes.has(String(g.lane)) || !clearedNums.has(key);
     if (claimed) { retired.push({ num: g.num, lane: g.lane, reason: 'claimed' }); continue; }
     if (returned.has(key)) { retired.push({ num: g.num, lane: g.lane, reason: 'returned' }); continue; }
-    if (tick - (g.spawnedTick ?? tick) >= ttlTicks) {
+    if (guardTtlElapsed(g, { tick, now, ttlTicks })) {
       retired.push({ num: g.num, lane: g.lane, reason: 'ttl', note: true });
       continue;
     }
@@ -496,7 +549,7 @@ export function filterLaunches(launches, liveBuildGuards) {
  * @param {{ unshaped?:object[], decisions?:object[], investigations?:object[], prs?:object[], tick:number, ttlTicks?:number }} ctx
  * @returns {{ live:Array<object>, retired:Array<{num:*, kind:string, reason:string, note?:boolean}> }}
  */
-export function retirePrepareGuards(prepareGuards, { unshaped = [], decisions = [], investigations = [], prs = [], tick = 0, ttlTicks = DEFAULT_PREPARE_TTL_TICKS } = {}) {
+export function retirePrepareGuards(prepareGuards, { unshaped = [], decisions = [], investigations = [], prs = [], tick = 0, now = null, ttlTicks = DEFAULT_PREPARE_TTL_TICKS } = {}) {
   const unshapedNums = new Set((Array.isArray(unshaped) ? unshaped : []).map((u) => normNum(u.num)));
   const unpreparedNums = new Set(
     (Array.isArray(decisions) ? decisions : []).filter((d) => d?.prepared !== true).map((d) => normNum(d.num)),
@@ -516,7 +569,7 @@ export function retirePrepareGuards(prepareGuards, { unshaped = [], decisions = 
     const sawPr = g.sawPr === true || openPr;
     if (!pendingNums.has(key)) { retired.push({ num: g.num, kind, reason: 'scope-committed' }); continue; }
     if (sawPr && !openPr) { retired.push({ num: g.num, kind, reason: 'pr-terminal' }); continue; }
-    if (!sawPr && tick - (g.spawnedTick ?? tick) >= ttlTicks) {
+    if (!sawPr && guardTtlElapsed(g, { tick, now, ttlTicks })) {
       retired.push({ num: g.num, kind, reason: 'ttl', note: true });
       continue;
     }
@@ -534,10 +587,10 @@ export function retirePrepareGuards(prepareGuards, { unshaped = [], decisions = 
  * item HOLDS (a note, no spawn — atomic `acquire` would fail one race anyway). Pure — mutates nothing; returns
  * the spawns, the new guard entries, the lanes it consumed, and any hold notes.
  *
- * @param {{ unshaped?:object[], decisions?:object[], investigations?:object[], prs?:object[], livePrepareGuards?:object[], availableLanes?:Array<*>, tick:number }} ctx
+ * @param {{ unshaped?:object[], decisions?:object[], investigations?:object[], prs?:object[], livePrepareGuards?:object[], availableLanes?:Array<*>, tick:number, now?:number|null, trace?:boolean, dispatchPaused?:boolean, pausedKinds?:string[]|null }} ctx
  * @returns {{ scopeSpawns:Array<{num:*, lane:*}>, decisionSpawns:Array<{num:*, lane:*}>, investigationSpawns:Array<{num:*, lane:*}>, newGuards:Array<object>, consumedLanes:Array<*>, notes:Array<{kind:string, num:*, text:string}> }}
  */
-export function planPrepareSpawns({ unshaped = [], decisions = [], investigations = [], prs = [], livePrepareGuards = [], availableLanes = [], tick = 0, trace = false, dispatchPaused = false } = {}) {
+export function planPrepareSpawns({ unshaped = [], decisions = [], investigations = [], prs = [], livePrepareGuards = [], availableLanes = [], tick = 0, now = null, trace = false, dispatchPaused = false, pausedKinds = null } = {}) {
   const guardNums = new Set((Array.isArray(livePrepareGuards) ? livePrepareGuards : []).map((g) => normNum(g.num)));
   const lanes = [...(Array.isArray(availableLanes) ? availableLanes : [])];
   const scopeSpawns = [];
@@ -556,7 +609,8 @@ export function planPrepareSpawns({ unshaped = [], decisions = [], investigation
       if (trace) gates.push({ name, pass: !condition, observed });
       return condition;
     };
-    if (blocked('dispatch-paused', dispatchPaused, dispatchPaused)) return;
+    const paused = dispatchPaused === true || (Array.isArray(pausedKinds) && pausedKinds.includes(kind));
+    if (blocked('dispatch-paused', paused, paused)) return;
     if (blocked('prepare-guard', guardNums.has(key), { num: key, guards: [...guardNums] })) return; // live prepare-guard entry → already in flight
     const existingPr = openPrForNum(prs, num);
     if (blocked('existing-PR', !!existingPr, existingPr ?? null)) return; // open PR for an unscoped/un-prepared item → its in-flight prepare
@@ -565,7 +619,7 @@ export function planPrepareSpawns({ unshaped = [], decisions = [], investigation
     consumedLanes.push(lane);
     guardNums.add(key); // a decision and a scope item never share a num, but stay safe against a duplicate row
     sink.push({ num, lane });
-    newGuards.push({ num, kind, lane, spawnedTick: tick, sawPr: false });
+    newGuards.push({ num, kind, lane, ...spawnStamp(tick, now), sawPr: false });
   };
 
   for (const u of Array.isArray(unshaped) ? unshaped : []) if (u?.num != null) plan(u.num, 'prepare', scopeSpawns);
@@ -611,7 +665,7 @@ export function planPrepareSpawns({ unshaped = [], decisions = [], investigation
  * @param {{ prs?:object[], launchedNums?:Array<*>, liveFixGuards?:object[], fixAttempts?:object, prRearmCounts?:object, retryCap?:number, availableLanes?:Array<*>, tick:number }} ctx
  * @returns {{ spawns:Array<{pr:number, num:*, lane:*}>, newGuards:Array<object>, fixAttempts:object, consumedLanes:Array<*>, notes:Array<object> }}
  */
-export function planFixSpawns({ prs = [], launchedNums = [], liveFixGuards = [], fixAttempts = {}, prRearmCounts = {}, retryCap = DEFAULT_FIX_RETRY_CAP, availableLanes = [], tick = 0 } = {}) {
+export function planFixSpawns({ prs = [], launchedNums = [], liveFixGuards = [], fixAttempts = {}, prRearmCounts = {}, retryCap = DEFAULT_FIX_RETRY_CAP, availableLanes = [], tick = 0, now = null } = {}) {
   const launched = new Set((Array.isArray(launchedNums) ? launchedNums : []).map(normNum));
   const guardedPrs = new Set((Array.isArray(liveFixGuards) ? liveFixGuards : []).map((g) => Number(g.pr)));
   const nextAttempts = { ...(fixAttempts && typeof fixAttempts === 'object' ? fixAttempts : {}) };
@@ -644,7 +698,7 @@ export function planFixSpawns({ prs = [], launchedNums = [], liveFixGuards = [],
     // decided downstream by dispatch-lane.mjs, and confirmed back into fixAttempts via retireFixGuards' claim
     // detection next tick. Bumping here counted phantom, guard-refused dispatches as real bounces.
     spawns.push({ pr, num: p.num, lane });
-    newGuards.push({ pr, num: p.num, lane, spawnedTick: tick, claimed: false });
+    newGuards.push({ pr, num: p.num, lane, ...spawnStamp(tick, now), claimed: false });
   }
   return { spawns, newGuards, fixAttempts: nextAttempts, consumedLanes, notes };
 }
@@ -673,7 +727,7 @@ export function planFixSpawns({ prs = [], launchedNums = [], liveFixGuards = [],
  * @param {{ prs?:object[], lanes?:object[], tick:number, ttlTicks?:number }} ctx
  * @returns {{ live:Array<object>, retired:Array<{pr:number, num:*, reason:string, claimed:boolean, note?:boolean}>, newlyClaimed:Array<{pr:number, num:*}> }}
  */
-export function retireFixGuards(fixGuards, { prs = [], lanes = [], tick = 0, ttlTicks = DEFAULT_FIX_TTL_TICKS } = {}) {
+export function retireFixGuards(fixGuards, { prs = [], lanes = [], tick = 0, now = null, ttlTicks = DEFAULT_FIX_TTL_TICKS } = {}) {
   const byPr = new Map();
   for (const p of Array.isArray(prs) ? prs : []) if (p?.prNumber != null) byPr.set(Number(p.prNumber), p);
   const leasedLanes = new Set((Array.isArray(lanes) ? lanes : []).map((l) => String(l?.lane)));
@@ -688,7 +742,7 @@ export function retireFixGuards(fixGuards, { prs = [], lanes = [], tick = 0, ttl
     const prRow = byPr.get(Number(g.pr));
     const stillChanges = prRow && isOpenPr(prRow) && hasReviewChanges(prRow);
     if (!stillChanges) { retired.push({ pr: Number(g.pr), num: g.num, reason: 'resolved', claimed }); continue; }
-    if (tick - (g.spawnedTick ?? tick) >= ttlTicks) {
+    if (guardTtlElapsed(g, { tick, now, ttlTicks })) {
       retired.push({ pr: Number(g.pr), num: g.num, reason: claimed ? 'ttl' : 'ttl-unclaimed', note: true, claimed });
       continue;
     }
@@ -732,7 +786,7 @@ export function clearTerminalFixAttempts(fixAttempts, prs) {
  * @param {{ prs?:object[], launchedNums?:Array<*>, liveCiHealGuards?:object[], ciHealAttempts?:object, prCiHealCounts?:object, retryCap?:number, availableLanes?:Array<*>, tick:number }} ctx
  * @returns {{ spawns:Array<{pr:number, num:*, lane:*, reason:string}>, newGuards:Array<object>, ciHealAttempts:object, consumedLanes:Array<*>, notes:Array<object> }}
  */
-export function planCiHealSpawns({ prs = [], launchedNums = [], liveCiHealGuards = [], ciHealAttempts = {}, prCiHealCounts = {}, retryCap = DEFAULT_CI_HEAL_RETRY_CAP, availableLanes = [], tick = 0 } = {}) {
+export function planCiHealSpawns({ prs = [], launchedNums = [], liveCiHealGuards = [], ciHealAttempts = {}, prCiHealCounts = {}, retryCap = DEFAULT_CI_HEAL_RETRY_CAP, availableLanes = [], tick = 0, now = null } = {}) {
   const launched = new Set((Array.isArray(launchedNums) ? launchedNums : []).map(normNum));
   const guardedPrs = new Set((Array.isArray(liveCiHealGuards) ? liveCiHealGuards : []).map((g) => Number(g.pr)));
   const nextAttempts = { ...(ciHealAttempts && typeof ciHealAttempts === 'object' ? ciHealAttempts : {}) };
@@ -763,7 +817,7 @@ export function planCiHealSpawns({ prs = [], launchedNums = [], liveCiHealGuards
     nextAttempts[pr] = attempts + 1;
     const reason = isRedCi(p) ? 'red-ci' : 'behind';
     spawns.push({ pr, num: p.num, lane, reason });
-    newGuards.push({ pr, num: p.num, lane, spawnedTick: tick });
+    newGuards.push({ pr, num: p.num, lane, ...spawnStamp(tick, now) });
   }
   return { spawns, newGuards, ciHealAttempts: nextAttempts, consumedLanes, notes };
 }
@@ -779,7 +833,7 @@ export function planCiHealSpawns({ prs = [], launchedNums = [], liveCiHealGuards
  * @param {{ prs?:object[], tick:number, ttlTicks?:number }} ctx
  * @returns {{ live:Array<object>, retired:Array<{pr:number, num:*, reason:string, note?:boolean}> }}
  */
-export function retireCiHealGuards(ciHealGuards, { prs = [], tick = 0, ttlTicks = DEFAULT_CI_HEAL_TTL_TICKS } = {}) {
+export function retireCiHealGuards(ciHealGuards, { prs = [], tick = 0, now = null, ttlTicks = DEFAULT_CI_HEAL_TTL_TICKS } = {}) {
   const byPr = new Map();
   for (const p of Array.isArray(prs) ? prs : []) if (p?.prNumber != null) byPr.set(Number(p.prNumber), p);
   const live = [];
@@ -789,7 +843,7 @@ export function retireCiHealGuards(ciHealGuards, { prs = [], tick = 0, ttlTicks 
     const prRow = byPr.get(Number(g.pr));
     const stillTarget = prRow && isCiHealTarget(prRow);
     if (!stillTarget) { retired.push({ pr: Number(g.pr), num: g.num, reason: 'resolved' }); continue; }
-    if (tick - (g.spawnedTick ?? tick) >= ttlTicks) {
+    if (guardTtlElapsed(g, { tick, now, ttlTicks })) {
       retired.push({ pr: Number(g.pr), num: g.num, reason: 'ttl', note: true });
       continue;
     }
@@ -929,6 +983,18 @@ export function routeWatcherExit(code, labels = []) {
  *   • parked — distinct conveyor-launched OPEN PRs carrying any `review:*` label.
  *   • health — `state.health.verdict`; a `warn` appends the flagged lanes.
  *   • infra — `state.infraBlocked` count (only when non-empty).
+ *
+ * `building` HERE IS NOT `dispatch.builds.length` IN `.conveyor/driver-status.json` — an intentional, DIFFERENT
+ * number, not a bug (a live report on 2026-09-14 read the two together as inconsistent — worth naming here so
+ * the next reader doesn't re-diagnose the same non-bug). `building` is this tick's TOTAL currently-in-flight
+ * build count (guards + leased lanes, carried forward across ticks); `surface.dispatch.builds` (`decisionsOut.
+ * spawnBuilds`, `runner.mjs#tickSurface`) is only the builds THIS tick freshly spawned — routinely 0 while
+ * `building` stays > 0, whenever nothing new needed dispatching but earlier builds are still running. What WAS
+ * a real bug, fixed alongside this comment (#3383 follow-up, see `durableBuildNums`): a phantom `claude agents`
+ * registry row (listed, `pid: null`, its real process long dead) used to inflate `building` right along with a
+ * genuinely live one, since the durable-floor read below had no way to tell them apart. It now excludes any row
+ * a real `ps aux`-backed liveness probe confirms dead, so `building` (and this line) reflect only sessions
+ * nothing has disproven — never a stale registry artifact.
  * @returns {string}
  */
 /**
@@ -1000,15 +1066,27 @@ export function buildStatusLine({ queue = [], lanes = [], prs = [], health = {},
  *   now?: number|null, lastOperatorTurn?: number|null,
  *   dispatchPaused?: boolean,          // #3609 — the manual/emergency dispatch-pause lever's current state
  *   dispatchPausedReason?: string|null,// (dispatch-pause.mjs#isDispatchPaused / readPauseState), read by the IO
- *                                      // shell. When true, ALL NEW prepare/fix/ci-heal spawns are held this
- *                                      // tick (build launches are already held upstream — dispatch-plan.mjs
- *                                      // empties `plan.launch` to `dispatch-paused` holds when paused, so
- *                                      // `plan.launch` naturally arrives empty here too); already-running
- *                                      // lanes/guards/watchers are entirely untouched.
+ *                                      // shell. When true, NEW spawns are held this tick (build launches
+ *                                      // are held upstream instead — dispatch-plan.mjs empties `plan.launch`
+ *                                      // to `dispatch-paused` holds, so it arrives empty here too);
+ *                                      // already-running lanes/guards/watchers are entirely untouched.
+ *   dispatchPausedKinds?: string[]|null,// (epic #3383) the pause's optional KIND SCOPE — `dispatch-pause.mjs`'s
+ *                                      // `pausedKinds`. `null`/absent = BLANKET: all six kinds held, which is
+ *                                      // what an old-format marker and every boolean-only caller produce, so
+ *                                      // their behavior is unchanged. A NON-EMPTY scope holds ONLY the kinds it
+ *                                      // names, checked one by one against `TICK_SPAWN_KINDS` — e.g.
+ *                                      // `['build','prepare','prepare-decision','investigate']` stops all NEW
+ *                                      // item dispatch while `fix`/`ci-heal` keep working already-open PRs.
  * }} input
  * @returns {{ decisions:object, nextState:object }}
  */
-export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = {}, signals = {}, prRearmCounts = {}, prCiHealCounts = {}, admission = {}, liveAgentSessions = [], config = {}, now = null, lastOperatorTurn = null, dispatchPaused = false, dispatchPausedReason = null } = {}) {
+export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = {}, signals = {}, prRearmCounts = {}, prCiHealCounts = {}, admission = {}, liveAgentSessions = [], config = {}, now = null, lastOperatorTurn = null, dispatchPaused = false, dispatchPausedKinds = null, dispatchPausedReason = null } = {}) {
+  // THE PAUSE, RESOLVED PER KIND (epic #3383). `pausedKinds` is the concrete list this tick holds: `[]` when
+  // nothing is paused, all six when the marker declares no scope (an old-format `{paused:true}` file, or any
+  // caller that still passes only the boolean — both keep holding everything, unchanged), or exactly the
+  // declared subset. Every spawn gate below asks `kindPaused('<kind>')` instead of the old blanket boolean.
+  const pausedKinds = resolvePausedKinds({ paused: dispatchPaused === true, pausedKinds: dispatchPausedKinds });
+  const kindPaused = (kind) => pausedKinds.includes(kind);
   const cfg = {
     buildTtlTicks: config.buildTtlTicks ?? DEFAULT_BUILD_TTL_TICKS,
     prepareTtlTicks: config.prepareTtlTicks ?? DEFAULT_PREPARE_TTL_TICKS,
@@ -1054,14 +1132,29 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     .filter((h) => h && h.num != null)
     .map((h) => ({ num: h.num }));
 
+  // #3849 — the `no-size` holds, read straight off THIS TICK's dispatch plan, same pattern as
+  // `needs-investigation` just above (#3567): a no-size item has no separate `state` derivation step either.
+  // UNLIKE investigation, it is NOT a distinct spawn kind — it is folded into the SAME `prepare` candidate set
+  // as `unshaped` (not a new sink, no new guard `kind`), because #3842's prepare-scope agent already authors a
+  // missing size/estimate in the same turn it authors a missing `scope:` — one prepare agent serves both holds.
+  // A num held BOTH `unshaped-no-scope` and `no-size` is deduped (dispatch-plan.mjs never emits both for the
+  // same item today — `no-size` is checked strictly after the scope gate — but a single spawn per num either way).
+  const noSizeHeld = (Array.isArray(plan.held) ? plan.held : [])
+    .filter((h) => h && h.reason === 'no-size' && h.num != null)
+    .map((h) => ({ num: h.num }));
+  const scopeOrSizeNeeded = noSizeHeld.length === 0 ? unshaped : [
+    ...(Array.isArray(unshaped) ? unshaped : []),
+    ...noSizeHeld.filter((n) => !(Array.isArray(unshaped) ? unshaped : []).some((u) => normNum(u.num) === normNum(n.num))),
+  ];
+
   // 1. RETIRE stale guards FIRST — a launch is then filtered against only still-live guards.
   const build = retireBuildGuards(bookkeeping.buildGuards, {
-    lanes, queue, tick, ttlTicks: cfg.buildTtlTicks, returnedBuildNums: signals.returnedBuildNums,
+    lanes, queue, tick, now, ttlTicks: cfg.buildTtlTicks, returnedBuildNums: signals.returnedBuildNums,
   });
   const prepare = retirePrepareGuards(bookkeeping.prepareGuards, {
-    unshaped, decisions, investigations: investigationsGuardPending, prs, tick, ttlTicks: cfg.prepareTtlTicks,
+    unshaped: scopeOrSizeNeeded, decisions, investigations: investigationsGuardPending, prs, tick, now, ttlTicks: cfg.prepareTtlTicks,
   });
-  const fix = retireFixGuards(bookkeeping.fixGuards, { prs, lanes, tick, ttlTicks: cfg.fixTtlTicks });
+  const fix = retireFixGuards(bookkeeping.fixGuards, { prs, lanes, tick, now, ttlTicks: cfg.fixTtlTicks });
   // #3454 — bump fixAttempts HERE, once per guard, exactly when retireFixGuards confirms a REAL attempt (its
   // assigned lane was observed leased) — never speculatively at plan time (that was the phantom-attempt bug).
   // Re-primes off the durable re-arm-comment floor on the first post-restart claim, same as the old plan-time
@@ -1073,7 +1166,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     const current = Number(fixAttempts[pr]) || 0;
     fixAttempts = { ...fixAttempts, [pr]: Math.max(current, durableFloor) + 1 };
   }
-  const ciHeal = retireCiHealGuards(bookkeeping.ciHealGuards, { prs, tick, ttlTicks: cfg.ciHealTtlTicks });
+  const ciHeal = retireCiHealGuards(bookkeeping.ciHealGuards, { prs, tick, now, ttlTicks: cfg.ciHealTtlTicks });
   const ciHealAttempts = clearTerminalCiHealAttempts(bookkeeping.ciHealAttempts, prs);
 
   // 1b. #3403 — the DURABLE build-guard floor. `build.live` alone is only the in-session bookkeeping, wiped by
@@ -1096,14 +1189,17 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   const priorDurableSpawnedTick = new Map(
     (Array.isArray(bookkeeping.buildGuards) ? bookkeeping.buildGuards : [])
       .filter((g) => g && g.lane == null && g.num != null)
-      .map((g) => [normNum(g.num), g.spawnedTick]),
+      .map((g) => [normNum(g.num), { spawnedTick: g.spawnedTick, spawnedAt: g.spawnedAt }]),
   );
   const durableOnly = durableBuildNums(liveAgentSessions)
     .filter((num) => !build.live.some((g) => normNum(g.num) === num));
   const durableBuildGuards = durableOnly.map((num) => ({
     num,
     lane: null,
-    spawnedTick: priorDurableSpawnedTick.has(num) ? priorDurableSpawnedTick.get(num) : tick,
+    // Sticky: keep BOTH the prior tick stamp and (#3383) the prior wall-clock stamp; never re-stamp on re-synthesis.
+    ...(priorDurableSpawnedTick.has(num)
+      ? { spawnedTick: priorDurableSpawnedTick.get(num).spawnedTick, ...(Number.isFinite(priorDurableSpawnedTick.get(num).spawnedAt) ? { spawnedAt: priorDurableSpawnedTick.get(num).spawnedAt } : {}) }
+      : spawnStamp(tick, now)),
   }));
   const buildLive = [...build.live, ...durableBuildGuards];
 
@@ -1121,7 +1217,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     spawn: buildBudget.admitted,
     suppressed: [...guardFiltered.suppressed, ...buildBudget.overflow.map((l) => ({ num: l.num, lane: l.lane, by: 'capacity-cap' }))],
   };
-  const newBuildGuards = launched.spawn.map((l) => ({ num: l.num, lane: l.lane, spawnedTick: tick }));
+  const newBuildGuards = launched.spawn.map((l) => ({ num: l.num, lane: l.lane, ...spawnStamp(tick, now) }));
   const liveBuildGuards = [...buildLive, ...newBuildGuards];
 
   // #3403 FOLLOW-UP — the STATUS LINE's "building" tally must not count a durable-floor entry (`lane: null`)
@@ -1135,7 +1231,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // that never gets claimed" shape #3454 already established for the fix guard, applied here to the ONE guard
   // kind (the durable floor) whose synthesis previously had no TTL of its own to inherit.
   const countableBuildGuards = liveBuildGuards.filter(
-    (g) => g.lane != null || tick - (Number.isFinite(g.spawnedTick) ? g.spawnedTick : tick) < cfg.buildTtlTicks,
+    (g) => g.lane != null || !guardTtlElapsed({ ...g, spawnedTick: Number.isFinite(g.spawnedTick) ? g.spawnedTick : tick }, { tick, now, ttlTicks: cfg.buildTtlTicks }),
   );
 
   // 3. The free lanes a prepare/fix may take = free lanes MINUS this tick's build launches MINUS every live
@@ -1168,10 +1264,25 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // 4. PREPARE spawns (scope + decision + investigation) — union re-dispatch gate, lane exclusion; consume
   //    lanes. #3609 — a manual dispatch-pause holds these too, not just `plan.launch` (which dispatch-plan.mjs
   //    already empties to `dispatch-paused` holds when paused): these spawns are computed straight off
-  //    `state.unshaped` / `state.decisions` / `state.investigations` / `state.prs`, never off `plan.launch`, so
+  //    `state.unshaped` (unioned with this tick's own `no-size` holds, #3849) / `state.decisions` /
+  //    `state.investigations` / `state.prs`, never off `plan.launch`, so
   //    this tick's OWN `dispatchPaused` input — not a re-read of `plan.held` — is what gates them. Already-live
   //    guards are untouched either way.
-  const prep = planPrepareSpawns({ unshaped, decisions, investigations, prs, livePrepareGuards: prepare.live, availableLanes, tick, trace: true, dispatchPaused });
+  //    KIND-SCOPED (epic #3383): the three prepare-family kinds are held INDEPENDENTLY. `pausedKinds` is handed
+  //    straight to `planPrepareSpawns`, so a held kind short-circuits at its OWN `dispatch-paused` admission gate
+  //    (traced, #xupukxa) and consumes no lane — an UNHELD sibling kind still gets the lanes it would have had.
+  const prep = planPrepareSpawns({
+    unshaped: scopeOrSizeNeeded,
+    decisions,
+    investigations,
+    prs,
+    livePrepareGuards: prepare.live,
+    availableLanes,
+    tick,
+    now,
+    trace: true,
+    pausedKinds,
+  });
   const consumed = new Set(prep.consumedLanes.map(String));
   availableLanes = availableLanes.filter((l) => !consumed.has(String(l)));
   const livePrepareGuards = [...prepare.live, ...prep.newGuards];
@@ -1188,9 +1299,9 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // 6. FIX spawns — conveyor-launched `review:changes` PRs, gated by in-flight test + retry cap; consume lanes.
   //    #3609 — held by the same manual dispatch-pause as step 4; `fixAttempts` passes through UNCHANGED (no new
   //    attempt is spawned to count) rather than being recomputed by `planFixSpawns`.
-  const fixPlan = dispatchPaused
+  const fixPlan = kindPaused('fix')
     ? { spawns: [], newGuards: [], fixAttempts, consumedLanes: [], notes: [] }
-    : planFixSpawns({ prs, launchedNums, liveFixGuards: fix.live, fixAttempts, prRearmCounts, retryCap: cfg.fixRetryCap, availableLanes, tick });
+    : planFixSpawns({ prs, launchedNums, liveFixGuards: fix.live, fixAttempts, prRearmCounts, retryCap: cfg.fixRetryCap, availableLanes, tick, now });
   const liveFixGuards = [...fix.live, ...fixPlan.newGuards];
   const fixConsumed = new Set(fixPlan.consumedLanes.map(String));
   availableLanes = availableLanes.filter((l) => !fixConsumed.has(String(l)));
@@ -1199,9 +1310,9 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   //     fix loop: same entry + counter + cap shape, CI-regression trigger, and the heal repairs ONLY CI — never the
   //     review label. Uses the lanes the builds/prepares/fixes did not take, gated by in-flight test + retry cap.
   //    #3609 — held by the same manual dispatch-pause as steps 4/6; `ciHealAttempts` passes through UNCHANGED.
-  const ciHealPlan = dispatchPaused
+  const ciHealPlan = kindPaused('ci-heal')
     ? { spawns: [], newGuards: [], ciHealAttempts, consumedLanes: [], notes: [] }
-    : planCiHealSpawns({ prs, launchedNums, liveCiHealGuards: ciHeal.live, ciHealAttempts, prCiHealCounts, retryCap: cfg.ciHealRetryCap, availableLanes, tick });
+    : planCiHealSpawns({ prs, launchedNums, liveCiHealGuards: ciHeal.live, ciHealAttempts, prCiHealCounts, retryCap: cfg.ciHealRetryCap, availableLanes, tick, now });
   const liveCiHealGuards = [...ciHeal.live, ...ciHealPlan.newGuards];
 
   // 7. WATCHERS — one per open conveyor-launched PR; prune to currently-open conveyor PRs. Each armed entry
@@ -1219,8 +1330,22 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // planner would otherwise emit): the individual `plan.held` items already carry their own per-num
   // `dispatch-paused` note below, so this note covers only what those DON'T — the tick's own prepare/fix/
   // ci-heal spawns, which never had a `plan.held` row to begin with (see steps 4/6/6b above).
-  if (dispatchPaused) {
-    notes.push({ kind: 'dispatch-paused', text: `⏸ dispatch paused — no new prepare/fix/ci-heal spawns this tick${dispatchPausedReason ? ` (${dispatchPausedReason})` : ''}` });
+  // KIND-SCOPED (epic #3383): a BLANKET pause keeps the exact wording it has always had; a SCOPED one names
+  // what it actually holds, so the note can never say "no new fix spawns" while fix is demonstrably running.
+  if (pausedKinds.length > 0) {
+    const why = dispatchPausedReason ? ` (${dispatchPausedReason})` : '';
+    const heldHere = TICK_SPAWN_KINDS.filter(kindPaused);
+    let text;
+    if (!isScopedPause({ paused: true, pausedKinds: dispatchPausedKinds })) {
+      text = `⏸ dispatch paused — no new prepare/fix/ci-heal spawns this tick${why}`;
+    } else if (heldHere.length > 0) {
+      text = `⏸ dispatch paused for ${pausedKinds.join(', ')} — no new ${heldHere.join('/')} spawns this tick${why}`;
+    } else {
+      // Only `build` is held, and builds are gated UPSTREAM (dispatch-plan.mjs empties `plan.launch`) — say so
+      // rather than claim this tick withheld spawns it never had a reason to withhold.
+      text = `⏸ dispatch paused for ${pausedKinds.join(', ')} — build launches held upstream; every prepare/fix/ci-heal spawn kind still runs${why}`;
+    }
+    notes.push({ kind: 'dispatch-paused', text });
   }
   // #xupukxa — a build trimmed by the SAME concurrency ceiling (step 2) is surfaced too, not just the
   // available-lane withholding above: an operator watching the status line otherwise sees a ready build
@@ -1356,6 +1481,11 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     // Structured (not re-parsed from a `stalled`-kind note's text) — the SAME "give the supervisor a real
     // field, not text to grep" discipline `counts` already applies (#3398's own comment, just above).
     stalled: heldStall.stalled,
+    // #3567 — investigation spawns get their own dispatch route (`decisions.spawnInvestigations`), read by
+    // `we:scripts/operations/dispatch-lane-io.mjs`'s `['investigate', decisions.spawnInvestigations]` route.
+    // Must stay on `decisionsOut` (not just the pre-refactor inline return object) or investigation dispatch
+    // silently sees `undefined` and launches nothing.
+    spawnInvestigations: prep.investigationSpawns,
   };
   // #3521 decision-trace (v1) — a plain-language "why", built from what's already computed above; never a
   // second source of truth for any of it (see {@link buildDecisionTrace}). `allHeld` is the UNFILTERED
@@ -1519,6 +1649,20 @@ async function main(argv) {
   try {
     const { defaultListAgents } = await import('../operations/dispatch-lane-io.mjs');
     liveAgentSessions = defaultListAgents({});
+    // #3383 FOLLOW-UP — resolve REAL pid liveness for this same listing, feeding `durableBuildNums`'s new
+    // `pidAlive === false` exclusion (see its own doc): a live audit found `conveyor-*` rows still listed 6-13.5
+    // DAYS after their process died, which the durable floor's original "the listing clears itself" assumption
+    // never accounted for. ONE `ps aux` scan for the whole batch (never one subprocess per row) — the SAME
+    // reused probe `driver-watchdog.mjs`/`lease-reaper.mjs`/`session-reaper.mjs` already share. Best-effort: a
+    // scan failure leaves every row's `pidAlive` at `null` (unknown), which `durableBuildNums` already treats
+    // exactly like today's un-annotated row — no behavior change on a probe failure.
+    if (Array.isArray(liveAgentSessions) && liveAgentSessions.length) {
+      const { resolvePidAlive, scanPsOutput, defaultIsPidAlive } = await import('./driver-watchdog.mjs');
+      const psOutput = scanPsOutput({});
+      liveAgentSessions = liveAgentSessions.map((s) => (
+        s && typeof s === 'object' ? { ...s, pidAlive: resolvePidAlive(s, { psOutput, isPidAlive: defaultIsPidAlive }) } : s
+      ));
+    }
   } catch { /* leave the floor unset — the in-session TTL still guards */ }
 
   // DURABLE retry-cap floor (#2643): for each OPEN `review:changes` PR, read its re-arm comments off the PR and
@@ -1575,12 +1719,16 @@ async function main(argv) {
   // dispatch-plan.mjs's own IO shell already reads the SAME marker independently for `plan.launch`, so a
   // failure here only affects THIS tick's own prepare/fix/ci-heal spawns, never silently re-arms builds.
   let dispatchPaused = false;
+  let dispatchPausedKinds = null;
   let dispatchPausedReason = null;
   if (!flags['no-pause-check']) {
     try {
       const { readPauseState } = await import('../readiness/dispatch-pause.mjs');
       const pauseState = readPauseState();
       dispatchPaused = pauseState.paused === true;
+      // epic #3383 — carry the marker's KIND SCOPE through verbatim (`null` = blanket); the pure core resolves
+      // it. Flattening it to the boolean here would silently re-widen a scoped pause back to holding all six.
+      dispatchPausedKinds = pauseState.pausedKinds ?? null;
       dispatchPausedReason = pauseState.reason || null;
     } catch { /* leave unpaused — fail open, same contract as readPauseState's own try/catch */ }
   }
@@ -1597,7 +1745,9 @@ async function main(argv) {
     } catch { config.verbose = false; }
   }
 
-  const out = planTick({ state, plan, freeLanes, bookkeeping, signals, prRearmCounts, prCiHealCounts, admission, liveAgentSessions, config, now: Date.now(), lastOperatorTurn, dispatchPaused, dispatchPausedReason });
+  // epic #3383 — dispatchPausedKinds carries the manual-pause marker's KIND SCOPE through verbatim (`null` =
+  // blanket pause); dropping it here would silently re-widen a scoped pause back to holding all six kinds.
+  const out = planTick({ state, plan, freeLanes, bookkeeping, signals, prRearmCounts, prCiHealCounts, admission, liveAgentSessions, config, now: Date.now(), lastOperatorTurn, dispatchPaused, dispatchPausedKinds, dispatchPausedReason });
   // Verbose-mode timing breakdown (#3521 decision-trace v1 follow-up) — an IO-shell-observed fact, not something
   // the pure core computes; attached only here, after the tick already ran, so a timing read can never affect
   // the decision itself.

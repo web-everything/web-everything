@@ -139,7 +139,13 @@ describe('the self-sync wiring pattern main() uses — proven against the real w
     const onRestart = vi.fn(() => ({ code: null, signal: null, restarted: true }));
     const { tickOnce } = withSelfSync(
       { tickOnce: runPass },
-      { root: '/x', onRestart, sync: () => ({ merged: true, commits: 2, reason: 'merged' }), log: { error: vi.fn() } },
+      {
+        root: '/x', onRestart, sync: () => ({ merged: true, commits: 2, reason: 'merged' }), log: { error: vi.fn() },
+        // #3383 live-smoke gate: this proves the restart-vs-run WIRING, not the gate itself (that's
+        // daemon-live-smoke.test.mjs's job) — inject a passing gate + a fake readOriginRef so it never spawns
+        // a real lane-pool/gh/reconcile-pass child against this mocked root.
+        gate: async () => ({ adopt: true, reason: 'test-gate-pass' }), readOriginRef: () => 'origin-sha',
+      },
     );
     const result = await tickOnce();
     expect(runPass).not.toHaveBeenCalled();

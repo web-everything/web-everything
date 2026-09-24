@@ -83,7 +83,10 @@ describe('lane-pool acquire --wait-ms bounded retry/backoff on a full pool (#x3j
     expect(hold.code).toBe(0);
 
     const t0 = Date.now();
-    const acquire = runPool(['acquire', ...poolArgs(), '--session=picker']);
+    // #3383 — `--hard-max=1` pins acquire's own growth-on-empty ceiling at this pool's real size (1 lane), so
+    // this test's actual subject (the wait/poll/fail timing) isn't masked by the SEPARATE growth-on-empty fix
+    // just cloning a fresh lane instead of failing.
+    const acquire = runPool(['acquire', ...poolArgs(), '--session=picker', '--hard-max=1']);
     const elapsed = Date.now() - t0;
 
     expect(acquire.code).not.toBe(0);
@@ -123,7 +126,9 @@ describe('lane-pool acquire --wait-ms bounded retry/backoff on a full pool (#x3j
 
     const waitMs = POLL_MS * 1.5; // spans one poll boundary without running long
     const t0 = Date.now();
-    const acquire = runPool(['acquire', `--wait-ms=${waitMs}`, ...poolArgs(), '--session=picker']);
+    // #3383 — see the note on the sibling case above: pin the growth ceiling at this pool's real size so this
+    // test still proves a GENUINELY exhausted pool fails, rather than self-healing via growth instead of wait.
+    const acquire = runPool(['acquire', `--wait-ms=${waitMs}`, ...poolArgs(), '--session=picker', '--hard-max=1']);
     const elapsed = Date.now() - t0;
 
     expect(acquire.code).not.toBe(0);

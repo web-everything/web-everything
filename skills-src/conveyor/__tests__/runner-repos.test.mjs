@@ -8,7 +8,7 @@ import { readUnsupported, recordUnsupported } from '../../../scripts/conveyor/un
 
 const dirs = [];
 afterEach(() => { vi.restoreAllMocks(); dirs.splice(0).forEach((dir) => rmSync(dir, { recursive: true, force: true })); });
-const perRepo = ['reconcile-fix-dispatch', 'parked-pr-conflict-watch', 'advisory-label-sweep', 'parked-pr-progress-watch', 'ci-queue-watch', 'reconcile-pass', 'review-dispatch', 'review-round-tag', 'review-status-tag'];
+const perRepo = ['reconcile-fix-dispatch', 'parked-pr-conflict-watch', 'advisory-label-sweep', 'review-hold-reconcile', 'parked-pr-progress-watch', 'ci-queue-watch', 'reconcile-pass', 'review-dispatch', 'review-round-tag', 'review-status-tag'];
 const once = ['infra-blocked', 'lease-reaper', 'session-reaper', 'branch-drift', 'lane-pool-health-watch', 'duplicate-pr-watch'];
 async function sweep(repo = null, fail = null) {
   const dir = mkdtempSync(join(tmpdir(), 'runner-repos-')); dirs.push(dir);

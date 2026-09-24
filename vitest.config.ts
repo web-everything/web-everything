@@ -189,6 +189,13 @@ export default defineConfig({
       // #x5n4zn3 — same tier: real throwaway origin/reference/pool, a PATH git shim (this one deliberately
       // HANGS, ignoring SIGTERM), a real spawned `lane-pool.mjs status` child.
       'scripts/__tests__/lane-pool-hung-git-bounded.test.mjs',
+      // #4025 — same tier: real throwaway origin/reference/pool, real spawned `lane-pool.mjs trim`/`provision`
+      // children.
+      'scripts/__tests__/lane-pool-trim.test.mjs',
+      'scripts/__tests__/lane-pool-acquirable-growth-cap.test.mjs',
+      // #3383 — same tier: real throwaway origin/reference/pool, real spawned `lane-pool.mjs` acquire/provision
+      // children, a PATH git shim for the remote-probe-failure case (mirrors its growth-cap sibling above).
+      'scripts/__tests__/lane-pool-acquire-growth.test.mjs',
       'scripts/operations/__tests__/backlog-ops-integration.test.mjs',
       'scripts/operations/__tests__/dispatch-lane-integration.test.mjs',
       'scripts/operations/__tests__/gate-health-integration.test.mjs',

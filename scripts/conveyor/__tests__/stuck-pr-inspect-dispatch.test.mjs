@@ -185,6 +185,22 @@ describe('dispatchInspection — plan → fill → mint → spawn, every IO poin
     expect(opts).toEqual(expect.objectContaining({ cwd: '/repo' }));
   });
 
+  // #x8mpubm follow-up (live-caught 2026-09-24) — this dispatch never wired the gh-app-shim either, the same
+  // gap fixed in review-dispatch.mjs/reconcile-fix-dispatch.mjs.
+  it('#x8mpubm follow-up — resolveSettingsEnv is called with root, and its result folds into the argv as --settings', () => {
+    const resolveSettingsEnv = vi.fn(() => ({ PATH: '/shim:/usr/bin' }));
+    const spawnAgent = vi.fn(() => 'backgrounded · abcd1234 · inspect-2505\n');
+    dispatchInspection({
+      pr: 2505, repo: 'chalbert/web-everything', stage: 'conflict', minutesSince: 390.2, thresholdMinutes: 45,
+      root: '/repo', readBrief: () => '{{PR}}{{REPO}}{{SESSION_SLUG}}{{STAGE}}{{MINUTES_SINCE}}{{THRESHOLD_MINUTES}}',
+      mintSessionId: () => 'uuid-1', spawnAgent, resolveSettingsEnv,
+    });
+    expect(resolveSettingsEnv).toHaveBeenCalledWith('/repo');
+    const [argv] = spawnAgent.mock.calls[0];
+    expect(argv).toContain('--settings');
+    expect(argv[argv.indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { PATH: '/shim:/usr/bin' } }));
+  });
+
   it('refuses to run from a lane checkout (assertNotALaneCheckout)', () => {
     expect(() => dispatchInspection({
       pr: 1, repo: 'chalbert/web-everything', stage: 'fix', minutesSince: 50, thresholdMinutes: 45,

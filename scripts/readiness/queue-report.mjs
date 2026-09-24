@@ -72,7 +72,10 @@ const QUEUED_WAITING_TURN_EXACT = Object.freeze(['no free lane', 'capacity-cap',
  *  of lane capacity — see {@link ../readiness/dispatch-plan.mjs}'s own `HELD_REASONS` docblock for what each
  *  one means and what unblocks it. */
 export const NOT_READY_REASONS = Object.freeze([
-  'blocked', 'unshaped-no-scope', 'needs-slice', 'needs-decision', 'needs-investigation', 'branch-drift-blocked', 'cleared-but-not-ready',
+  // `no-size` (#3801 Fork 4 (b), #3849 admission) joins `unshaped-no-scope` here — same semantics: an action
+  // (prepare authors the missing size/estimate, the same agent that authors a missing scope, #3842) is needed
+  // before the item can ever be picked up, independent of lane capacity.
+  'blocked', 'unshaped-no-scope', 'no-size', 'needs-slice', 'needs-decision', 'needs-investigation', 'branch-drift-blocked', 'cleared-but-not-ready',
 ]);
 
 /** Held reasons that are not a real held queue member at all — a signal to verify/clear, never to wait on. */

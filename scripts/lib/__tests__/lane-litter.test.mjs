@@ -117,7 +117,28 @@ describe('LANE_RELEASE_LITTER_ALLOWLIST', () => {
       '.commit-msg.txt', '.pr-body.md', '.pr-body.txt', 'review-*-output.json', 'commit-msg-fix-*.txt',
       '.commit-msg-fix-*.txt', '.review-*-output.json',
       '.pr-body-*.md', '.open-pr*.json', '.pr-land-result.json', '.converge-*',
+      '.conveyor/', '.delivery-commit-msg-*.txt',
     ]);
+  });
+
+  // #x01u7az — live-observed 2026-09-24: `.conveyor/` (the session sidecar) was the ONLY dirty entry on
+  // roughly two dozen of the pool's ~90 lanes at once, none leased — none of the file-shaped patterns above
+  // can ever match a directory (their `[^/]*` never crosses the trailing `/`), so `acquire`'s auto-pick read
+  // the whole pool as "held/dirty" and starved `--purpose=review-loop` dispatches (PR #2582, seven straight
+  // `blocked-on-infra` sessions over more than an hour). Confirmed by reintroduction: this fails without the
+  // new entry.
+  it('.conveyor/ (the session sidecar directory) is allowlisted', () => {
+    expect(isAllowlistedLitterPath('.conveyor/')).toBe(true);
+    // A file WITHIN the directory is a different path (one more segment) and must NOT match the directory
+    // entry itself — `git status --porcelain` never reports it separately while the whole tree is untracked,
+    // but the pattern's own no-traversal guard must still hold if it ever is.
+    expect(isAllowlistedLitterPath('.conveyor/queue.json')).toBe(false);
+  });
+
+  // Same incident, a naming-drift sibling of the already-allowlisted `.commit-msg-fix-*.txt` family.
+  it('.delivery-commit-msg-*.txt (the delivery-agent-prefixed commit-msg scratch) is allowlisted', () => {
+    expect(isAllowlistedLitterPath('.delivery-commit-msg-build.txt')).toBe(true);
+    expect(isAllowlistedLitterPath('.delivery-commit-msg-gate-fix.txt')).toBe(true);
   });
 
   // Live-caught 2026-09-22: several lanes' ONLY dirty file was `.review-loop-output.json` (leading dot),

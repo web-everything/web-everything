@@ -112,6 +112,33 @@ describe('durableBuildNums — #3403 the restart-surviving build-guard floor', (
       expect(durableBuildNums([{ name: sessionSlugFor(77, kind) }])).toEqual([]);
     }
   });
+
+  // #3383 FOLLOW-UP (found live 2026-09-14 — a `conveyor-*` row still listed 6-13.5 DAYS after its process died,
+  // `pid: null`, `state: "working"`) — a CONFIRMED-dead row must not durable-guard forever.
+  describe('the pidAlive === false exclusion (#3383)', () => {
+    it('a row explicitly confirmed dead (pidAlive: false) is EXCLUDED from the durable floor', () => {
+      expect(durableBuildNums([{ name: 'conveyor-77', pidAlive: false }])).toEqual([]);
+    });
+    it('a row confirmed ALIVE (pidAlive: true) is still counted — unchanged', () => {
+      expect(durableBuildNums([{ name: 'conveyor-77', pidAlive: true }])).toEqual(['77']);
+    });
+    it('a row with no `pidAlive` field at all (every pre-#3383 caller/test) is still counted — byte-identical to before', () => {
+      expect(durableBuildNums([{ name: 'conveyor-77' }])).toEqual(['77']);
+    });
+    it('a row with `pidAlive: null` (probed, unknown) is still counted — unknown never guesses at death', () => {
+      expect(durableBuildNums([{ name: 'conveyor-77', pidAlive: null }])).toEqual(['77']);
+    });
+    it('a plain name STRING (no object, so no pidAlive is even possible) is still counted — unchanged', () => {
+      expect(durableBuildNums(['conveyor-77'])).toEqual(['77']);
+    });
+    it('one dead row among several live ones excludes only the dead one', () => {
+      expect(durableBuildNums([
+        { name: 'conveyor-10', pidAlive: false },
+        { name: 'conveyor-20', pidAlive: true },
+        { name: 'conveyor-30' },
+      ]).sort()).toEqual(['20', '30']);
+    });
+  });
 });
 
 describe('retireBuildGuards — claim / Agent-return / TTL (SKILL §2, three ways)', () => {
@@ -736,6 +763,90 @@ describe('planTick — a cleared kind:investigation item is spawned via spawnInv
   });
 });
 
+describe('planTick — a held "no-size" item is auto-prepared through the SAME prepare-scope spawn as unshaped-no-scope (#3801 Fork 4 (b), #3849 admission)', () => {
+  it('a held no-size item spawns a prepare-scope agent, same tick it clears (#3842 authors size in the same turn)', () => {
+    const out = planTick({
+      state: { queue: [], unshaped: [], lanes: [], prs: [] },
+      plan: { launch: [], held: [{ num: 9002, reason: 'no-size' }] },
+      freeLanes: [4],
+      bookkeeping: { tick: 0 },
+    });
+    expect(out.decisions.spawnPrepareScope).toEqual([{ num: 9002, lane: 4 }]);
+    expect(out.decisions.spawnBuilds).toEqual([]);
+    expect(out.nextState.launchedNums).toContain('9002');
+  });
+
+  it('a live prepare guard for the num suppresses a re-spawn on the next tick', () => {
+    const out = planTick({
+      state: { queue: [], unshaped: [], lanes: [], prs: [] },
+      plan: { launch: [], held: [{ num: 9002, reason: 'no-size' }] },
+      freeLanes: [4],
+      bookkeeping: { tick: 1, prepareGuards: [{ num: 9002, kind: 'prepare', lane: 4, spawnedTick: 0, sawPr: false }] },
+    });
+    expect(out.decisions.spawnPrepareScope).toEqual([]);
+  });
+
+  it('an unshaped-no-scope item AND a no-size item in the same tick each get their own prepare-scope spawn', () => {
+    const out = planTick({
+      state: { queue: [], unshaped: [{ num: 70 }], lanes: [], prs: [] },
+      plan: { launch: [], held: [{ num: 70, reason: 'unshaped-no-scope' }, { num: 90, reason: 'no-size' }] },
+      freeLanes: [4, 5],
+      bookkeeping: { tick: 0 },
+    });
+    expect(out.decisions.spawnPrepareScope).toEqual(expect.arrayContaining([{ num: 70, lane: 4 }, { num: 90, lane: 5 }]));
+    expect(out.decisions.spawnPrepareScope).toHaveLength(2);
+  });
+
+  it('the SAME num held BOTH unshaped-no-scope (state) and no-size (plan.held) spawns exactly ONE prepare agent, never two', () => {
+    // Cannot happen via dispatch-plan.mjs today (no-size is checked strictly after the scope gate), but the
+    // merge is deduped defensively so a future caller can never double-spawn on one num.
+    const out = planTick({
+      state: { queue: [], unshaped: [{ num: 70 }], lanes: [], prs: [] },
+      plan: { launch: [], held: [{ num: 70, reason: 'no-size' }] },
+      freeLanes: [4, 5],
+      bookkeeping: { tick: 0 },
+    });
+    expect(out.decisions.spawnPrepareScope).toEqual([{ num: 70, lane: 4 }]);
+  });
+
+  it('a KIND-SCOPED dispatch-pause on "prepare" holds the no-size auto-prepare too (epic #3383)', () => {
+    const out = planTick({
+      state: { queue: [], unshaped: [], lanes: [], prs: [] },
+      plan: { launch: [], held: [{ num: 9002, reason: 'no-size' }] },
+      freeLanes: [4],
+      bookkeeping: { tick: 0 },
+      dispatchPaused: true,
+      dispatchPausedKinds: ['prepare'],
+    });
+    expect(out.decisions.spawnPrepareScope).toEqual([]);
+  });
+
+  it('a disjoint story launches normally on the SAME tick a no-size item is held/spawned', () => {
+    const out = planTick({
+      state: { queue: [{ num: 10, buildQueued: true }], unshaped: [], lanes: [], prs: [] },
+      plan: { launch: [{ num: 10, lane: 5 }], held: [{ num: 9002, reason: 'no-size' }] },
+      freeLanes: [4, 5],
+      bookkeeping: { tick: 0 },
+    });
+    expect(out.decisions.spawnBuilds).toEqual([{ num: 10, lane: 5 }]);
+    expect(out.decisions.spawnPrepareScope).toEqual([{ num: 9002, lane: 4 }]);
+  });
+
+  it('a `fix`/`ci-heal` spawn is NEVER held for size — planFixSpawns/planCiHealSpawns never consult plan.held at all', () => {
+    // #3849 Done-when (d): fix and ci-heal take the fixSizeSource chain, never this admission gate. Proven
+    // structurally: a fix spawn fires normally even while an UNRELATED item sits held `no-size` this same tick.
+    const changesPr = { num: 10, prNumber: 30, state: 'OPEN', labels: ['review:changes'] };
+    const out = planTick({
+      state: { queue: [], unshaped: [], lanes: [], prs: [changesPr] },
+      plan: { launch: [{ num: 10, lane: 5 }], held: [{ num: 9002, reason: 'no-size' }] },
+      freeLanes: [4, 5, 6], // 5 → the build launch, 4 → the no-size prepare-scope spawn, 6 left for the fix
+      bookkeeping: { tick: 0, launchedNums: ['10'] },
+    });
+    expect(out.decisions.spawnPrepareScope).toEqual([{ num: 9002, lane: 4 }]);
+    expect(out.decisions.spawnFixes).toEqual([{ pr: 30, num: 10, lane: 6 }]);
+  });
+});
+
 describe('planTick — composes the tick and threads nextState', () => {
   it('filters the plan through guards, records new build guards, and grows launchedNums', () => {
     const out = planTick({
@@ -1075,7 +1186,7 @@ describe('planTick — composes the tick and threads nextState', () => {
       ]));
     });
 
-    it('does NOT double-report needs-slice / needs-decision / needs-investigation / unshaped-no-scope — each already has its own note', () => {
+    it('does NOT double-report needs-slice / needs-decision / needs-investigation / unshaped-no-scope / no-size — each already has its own note', () => {
       const out = planTick({
         state: {
           queue: [], needsSlice: [{ num: 50, epicState: 'unsliced' }], decisions: [{ num: 60, prepared: true }],
@@ -1088,20 +1199,24 @@ describe('planTick — composes the tick and threads nextState', () => {
             { num: 61, reason: 'needs-decision' },
             { num: 70, reason: 'unshaped-no-scope' },
             { num: 80, reason: 'needs-investigation' },
+            { num: 90, reason: 'no-size' },
           ],
         },
-        freeLanes: [9],
+        freeLanes: [8, 9],
         bookkeeping: { tick: 0 },
       });
-      // No 'held' note for any of the four excluded reasons — only their own dedicated note kind appears.
+      // No 'held' note for any of the five excluded reasons — only their own dedicated note kind appears.
       expect(out.decisions.notes.filter((n) => n.kind === 'held')).toHaveLength(0);
       expect(out.decisions.notes).toEqual(expect.arrayContaining([
         expect.objectContaining({ kind: 'needs-slice', num: 50 }),
         expect.objectContaining({ kind: 'decision-ready', num: 60 }),
         expect.objectContaining({ kind: 'auto-investigating', nums: [80] }),
+        // #3849 — `no-size` is folded into the SAME 'auto-preparing-scope' note as `unshaped-no-scope`, since
+        // #3842's prepare-scope agent authors either (or both) in one turn.
+        expect.objectContaining({ kind: 'auto-preparing-scope', nums: [90] }),
       ]));
-      // The exclusion set itself is exactly the four reasons that have their own note elsewhere.
-      expect(HELD_NOTE_EXCLUDED_REASONS).toEqual(['needs-slice', 'needs-decision', 'needs-investigation', 'unshaped-no-scope']);
+      // The exclusion set itself is exactly the five reasons that have their own note elsewhere.
+      expect(HELD_NOTE_EXCLUDED_REASONS).toEqual(['needs-slice', 'needs-decision', 'needs-investigation', 'unshaped-no-scope', 'no-size']);
     });
 
     it('emits NO held notes when the queue is empty (plan.held absent or [])', () => {
@@ -1641,5 +1756,127 @@ describe('lanePoolListArgsForRepo — the free-lane read now honors --repo, exac
   it('a missing/non-function resolver → [] (never guesses)', () => {
     expect(lanePoolListArgsForRepo('plateau-app', undefined)).toEqual([]);
     expect(lanePoolListArgsForRepo('plateau-app', null)).toEqual([]);
+  });
+});
+
+describe('planTick — KIND-SCOPED dispatch-pause (epic #3383): hold NEW-item kinds, let already-open-PR kinds run', () => {
+  const changesPr = (pr, num) => ({ num, prNumber: pr, state: 'OPEN', labels: ['review:changes'] });
+  const redPr = (pr, num) => ({ num, prNumber: pr, state: 'OPEN', ci: 'fail', labels: ['ready-to-merge'] });
+  // One candidate per spawn kind this core plans, all simultaneously ready, with a lane each.
+  const everyKindReady = {
+    state: {
+      queue: [], unshaped: [{ num: 20 }], decisions: [{ num: 30, prepared: false }], lanes: [],
+      prs: [changesPr(99, 40), redPr(98, 41)],
+    },
+    plan: { launch: [], held: [{ num: 50, reason: 'needs-investigation' }] },
+    freeLanes: [4, 5, 6, 7, 8],
+    bookkeeping: { tick: 0, launchedNums: [40, 41] },
+  };
+
+  it('BACKWARD COMPAT: `dispatchPaused: true` with NO kinds holds every kind — old-format marker / boolean-only caller', () => {
+    for (const kinds of [undefined, null, []]) {
+      const out = planTick({ ...everyKindReady, dispatchPaused: true, dispatchPausedKinds: kinds });
+      expect(out.decisions.spawnPrepareScope).toEqual([]);
+      expect(out.decisions.spawnPrepareDecision).toEqual([]);
+      expect(out.decisions.spawnInvestigations).toEqual([]);
+      expect(out.decisions.spawnFixes).toEqual([]);
+      expect(out.decisions.spawnCiHeals).toEqual([]);
+      // …and the note keeps its pre-scope wording verbatim.
+      expect(out.decisions.notes.find((n) => n.kind === 'dispatch-paused').text)
+        .toBe('⏸ dispatch paused — no new prepare/fix/ci-heal spawns this tick');
+    }
+  });
+
+  it('THE OPERATOR CASE — new-item kinds held, fix + ci-heal still spawn for already-open PRs', () => {
+    const out = planTick({
+      ...everyKindReady,
+      dispatchPaused: true,
+      dispatchPausedKinds: ['build', 'prepare', 'prepare-decision', 'investigate'],
+      dispatchPausedReason: 'Conserve Claude usage-limit tokens',
+    });
+    expect(out.decisions.spawnBuilds).toEqual([]);
+    expect(out.decisions.spawnPrepareScope).toEqual([]);
+    expect(out.decisions.spawnPrepareDecision).toEqual([]);
+    expect(out.decisions.spawnInvestigations).toEqual([]);
+    // …while the two "act on an already-open PR" kinds proceed, taking the lanes the held kinds did not.
+    expect(out.decisions.spawnFixes).toEqual([{ pr: 99, num: 40, lane: 4 }]);
+    expect(out.decisions.spawnCiHeals).toEqual([{ pr: 98, num: 41, lane: 5, reason: 'red-ci' }]);
+  });
+
+  it('a held kind consumes NO lane — an unheld sibling gets the lane the held one would have taken', () => {
+    const out = planTick({
+      ...everyKindReady,
+      freeLanes: [4], // exactly one lane for the whole tick
+      dispatchPaused: true,
+      dispatchPausedKinds: ['prepare', 'prepare-decision', 'investigate'],
+    });
+    expect(out.decisions.spawnPrepareScope).toEqual([]);
+    expect(out.decisions.spawnFixes).toEqual([{ pr: 99, num: 40, lane: 4 }]);
+  });
+
+  it('the INVERSE scope — fix/ci-heal held while the prepare family keeps spawning', () => {
+    const out = planTick({ ...everyKindReady, dispatchPaused: true, dispatchPausedKinds: ['fix', 'ci-heal'] });
+    expect(out.decisions.spawnPrepareScope).toEqual([{ num: 20, lane: 4 }]);
+    expect(out.decisions.spawnPrepareDecision).toEqual([{ num: 30, lane: 5 }]);
+    expect(out.decisions.spawnInvestigations).toEqual([{ num: 50, lane: 6 }]);
+    expect(out.decisions.spawnFixes).toEqual([]);
+    expect(out.decisions.spawnCiHeals).toEqual([]);
+  });
+
+  it('each prepare-family kind is held INDEPENDENTLY of its two siblings', () => {
+    const out = planTick({ ...everyKindReady, dispatchPaused: true, dispatchPausedKinds: ['prepare-decision'] });
+    expect(out.decisions.spawnPrepareDecision).toEqual([]);
+    expect(out.decisions.spawnPrepareScope).toEqual([{ num: 20, lane: 4 }]);
+    expect(out.decisions.spawnInvestigations).toEqual([{ num: 50, lane: 5 }]);
+    expect(out.decisions.spawnFixes).toEqual([{ pr: 99, num: 40, lane: 6 }]);
+  });
+
+  it('kinds WITHOUT `dispatchPaused` arm nothing, and no note fires', () => {
+    const out = planTick({ ...everyKindReady, dispatchPaused: false, dispatchPausedKinds: ['fix', 'ci-heal'] });
+    // lanes 4/5/6 go to prepare/prepare-decision/investigate, so an unarmed scope leaves fix on lane 7.
+    expect(out.decisions.spawnFixes).toEqual([{ pr: 99, num: 40, lane: 7 }]);
+    expect(out.decisions.notes.some((n) => n.kind === 'dispatch-paused')).toBe(false);
+  });
+
+  it('the NOTE names the kinds a SCOPED pause actually holds — never a flat "dispatch paused" while fix runs', () => {
+    const out = planTick({
+      ...everyKindReady,
+      dispatchPaused: true,
+      dispatchPausedKinds: ['build', 'prepare', 'prepare-decision', 'investigate'],
+      dispatchPausedReason: 'conserve tokens',
+    });
+    const note = out.decisions.notes.find((n) => n.kind === 'dispatch-paused');
+    expect(note.text).toContain('build, prepare, prepare-decision, investigate');
+    expect(note.text).toContain('prepare/prepare-decision/investigate');
+    expect(note.text).toContain('conserve tokens');
+    expect(note.text).not.toContain('/fix/');
+  });
+
+  it('a BUILD-ONLY pause says builds are held upstream rather than claiming this tick withheld spawns', () => {
+    const out = planTick({ ...everyKindReady, dispatchPaused: true, dispatchPausedKinds: ['build'] });
+    const note = out.decisions.notes.find((n) => n.kind === 'dispatch-paused');
+    expect(note.text).toContain('held upstream');
+    expect(out.decisions.spawnPrepareScope).toEqual([{ num: 20, lane: 4 }]);
+    expect(out.decisions.spawnFixes).toEqual([{ pr: 99, num: 40, lane: 7 }]);
+  });
+
+  it('a scope naming ALL SIX kinds is indistinguishable from a blanket pause', () => {
+    const kinds = ['build', 'prepare', 'prepare-decision', 'investigate', 'fix', 'ci-heal'];
+    const scoped = planTick({ ...everyKindReady, dispatchPaused: true, dispatchPausedKinds: kinds });
+    const blanket = planTick({ ...everyKindReady, dispatchPaused: true });
+    expect(scoped).toEqual(blanket);
+  });
+
+  it('a scoped pause still never touches in-flight work — a live fix guard retires normally while fix is held', () => {
+    const out = planTick({
+      state: { queue: [], unshaped: [], lanes: [], prs: [{ num: 40, prNumber: 99, state: 'OPEN', labels: [] }] },
+      plan: { launch: [] },
+      freeLanes: [],
+      bookkeeping: { tick: 5, fixGuards: [{ pr: 99, num: 40, lane: 3, spawnedTick: 0, claimed: true }] },
+      dispatchPaused: true,
+      dispatchPausedKinds: ['fix'],
+    });
+    expect(out.decisions.retireGuards.fix.some((r) => r.pr === 99)).toBe(true);
+    expect(out.nextState.fixGuards).toEqual([]);
   });
 });

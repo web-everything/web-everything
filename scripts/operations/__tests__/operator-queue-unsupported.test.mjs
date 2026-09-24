@@ -22,7 +22,7 @@ it('reports owed unsupported work in text and JSON and uses the constellation sl
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     main(['--json'], { unsupportedPath });
     expect(execFileSync.mock.calls.map(([, args]) => args[3])).toEqual(Object.values(CONSTELLATION_REPOS).map(({ slug }) => slug));
-    expect(JSON.parse(log.mock.calls[0][0])).toEqual({ ready: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [{ ...row, repo: 'plateau-app', at: expect.any(String) }] });
+    expect(JSON.parse(log.mock.calls[0][0])).toEqual({ ready: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [{ ...row, repo: 'plateau-app', at: expect.any(String) }], laneDecisions: [] });
     log.mockClear();
     main([], { unsupportedPath });
     expect(log.mock.calls.flat()).toContain('UNSUPPORTED REPO — owed work the conveyor cannot dispatch for this repo:');

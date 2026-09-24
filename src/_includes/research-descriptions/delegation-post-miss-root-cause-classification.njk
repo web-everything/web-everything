@@ -1,0 +1,97 @@
+{% raw %}
+<h2>The question</h2>
+
+<p><a href="/backlog/4029-a-tooling-caused-delegation-miss-re-graduates-on-the-normal/">#4029</a> asks
+whether a delegation-trial miss traced to <em>tooling or instructions</em> — not the vendor's own judgment —
+should re-graduate at the ordinary cold-start bar once the fix is proven, instead of always paying the
+higher post-miss bar
+<a href="/docs/agent/platform-decisions/#delegation-trial-record-graduation">#delegation-trial-record-graduation</a>
+rule 5 sets today (<code>minCleanStreak + k</code>, built by #3889). Rule 5 currently applies that higher
+bar to every confirmed miss with no distinction for what caused it. This survey does not repeat the #3690
+survey (<a href="/research/delegation-graduation-and-supervision-tiers/">When has a delegated non-Claude
+agent earned lighter supervision?</a>) or #3673's calibration-veto-clearing grounding; it asks three new
+questions those did not cover. The full working is in
+<a href="/reports/2026-09-24-delegation-post-miss-root-cause-classification.md">the session report</a>.</p>
+
+<h2>Finding 1 — reinstatement pairs a named fix with fresh evidence against the trigger, never volume alone</h2>
+
+<p>Google's flaky-test quarantine removes an unstable test from the blocking lane, but exit requires an
+identified root-cause fix, not just a quiet run: a test returns to the blocking lane once its root cause is
+fixed <em>and</em> it has held a run of consecutive passes (Google Testing Blog, "Flaky Tests at Google and
+How We Mitigate Them", 2016; current practice guides corroborate the same shape). Quarantine is explicitly
+temporary and SLA-bound — a mitigation, never a substitute for the fix. This is the direct analog for #4029
+Forks 3 and 4: the fix and the evidence are both required, and the evidence must be fresh against the
+trigger, not an unrelated clean streak.</p>
+
+<h2>Finding 2 — classification targets systems, and is reviewed by someone other than the party under review</h2>
+
+<p>Google's SRE book and the surrounding blameless-postmortem literature treat "human error" (or, by direct
+analogy, "vendor error") as a red flag that stops root-cause analysis too soon, not a valid terminal answer
+— practice pushes past the first plausible answer (e.g. via "5 Whys") to the systemic condition that allowed
+it, and tracks corrective actions separately by whether they change a system/process or merely "retrain a
+person." The postmortem is reviewed by people other than the party whose action produced it, never
+self-certified by that party.</p>
+
+<h2>Finding 3 — ISO 9001-lineage CAPA / SCAR: root cause is investigated, then reviewed by the requesting org</h2>
+
+<p>A Supplier Corrective Action Request requires the supplier to run a structured root-cause method (5 Whys,
+8D, fishbone) and submit it back to the <em>requesting</em> organization for review. Practitioner guidance is
+explicit that reviewers should push back on "operator error" as a terminal root cause and demand the
+underlying process gap (Wikipedia, "Corrective and preventive action"; SCAR glossaries from ComplianceQuest,
+MasterControl and Arena, 2026). The classifying party is never only the party under review — this directly
+grounds #4029 Fork 2's requirement that a tooling-vs-vendor classification be a human-authored field, never
+inferred from free text and never self-declared by the dispatch automation or the delegated vendor's own
+session.</p>
+
+<h2>Finding 4 — no surveyed discipline transfers one unit's proof to another unit's record</h2>
+
+<p>Flaky-test quarantine, SCAR, and postmortem corrective actions are all scoped to the failing unit (the
+specific test, the specific supplier's line, the specific finding). A shared root cause — the same library
+used by ten suppliers, the same infrastructure flake affecting many tests — still requires each unit's own
+corrective-action record to close, even when the same root-cause finding is cited across all of them. This
+grounds #4029 Fork 5's default: a <code>rootCause</code> note may be cited across every affected triple's
+row (the diagnosis is reusable text), but each triple accumulates its own post-fix trial evidence — matching
+the already-ratified "trust never carries across triples" (top of
+<a href="/docs/agent/platform-decisions/#delegation-trial-record-graduation">#delegation-trial-record-graduation</a>).</p>
+
+<h2>Rework — operator-directed reshape (2026-09-24)</h2>
+
+<p>The operator rejected the first prep of #4029 for two shape errors: an unconditional step-back to
+<code>full</code> on every miss regardless of cause, and a human-authored, human-confirmed
+<code>rootCauseClass</code> field. The corrected shape — automated attribution by default (a model distinct
+from the builder, never the builder itself), a tooling-caused miss keeps its graduated level with no
+demotion, and the step-back fires only when a miss is both critical and cannot be improved by tooling —
+reuses two more findings from the same survey rather than reopening it.</p>
+
+<h3>Finding 5 — "independent" means not-the-party-under-review, not specifically human</h3>
+
+<p>Findings 2–3's SRE and SCAR precedent require the classifying party to be someone other than the party
+under review, never specifically a human. This repo already treats a non-human distinct party as sufficient
+independence:
+<a href="/docs/agent/platform-decisions/#agent-convergence-independent-validation">#agent-convergence-independent-validation</a>
+rests independence "entirely on a distinct fresh validator," explicitly satisfied by an in-process
+role-separated subagent given fresh context. #4029's reworked Fork 1 reuses that pattern: an automated
+classifier distinct from the delegated triple satisfies the same not-self-certified principle, no human in
+the loop by default.</p>
+
+<h3>Finding 6 — "critical" already has a code-grounded proxy; no new scale invented</h3>
+
+<p><code>deriveRisk</code> (<code>we:scripts/lib/dispatch-contracts.mjs:148-152</code>) computes
+<code>'high'</code> for a statute-tier touch or a high-stakes bugfix/conflict-resolution;
+<code>NEVER_SPOT_CHECK_PATH_PREFIXES</code> (<code>we:scripts/lib/dispatch-thresholds.mjs:42-46</code>) names
+<code>statute</code>/<code>gateSelf</code>/<code>irreversible</code>; <code>humanRequired</code> flags the
+declarative-leash/statute layer. No standalone "security" escalation-reason category exists today — it is a
+jury reviewer lens, not a signal.
+<a href="/backlog/3374-calibrate-the-finding-consequence-scale-one-axis-or-two-asse/">#3374</a> (a jury
+severity scale) is still open/unresolved and is cited as related work, not authority.</p>
+
+<h2>What this survey does not settle</h2>
+
+<p>None of the three disciplines surveyed map a numeric bar onto "proven" — they say "the fix, then fresh
+evidence of typical scope," not "N clean trials." This survey therefore supports the ordinary cold-start bar
+as the tooling-proven re-entry default, not a fixed lower number; any lower number is deferred to a future
+ordinary batched finding exactly as rule 3 already requires for <code>minCleanStreak</code>/<code>k</code>
+themselves. The call, the forks, and the ratification live on
+<a href="/backlog/4029-a-tooling-caused-delegation-miss-re-graduates-on-the-normal/">#4029</a> itself, not
+here.</p>
+{% endraw %}

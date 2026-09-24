@@ -22,7 +22,7 @@ will still want to be able to run fixes of a darmon live and switch back to main
 branch as its steady state. Instead a resident daemon clone may run **live overlays**: `main` plus an explicit
 list of fix branches, rebuilt each tick, each dropped automatically once `main` has it. The drain and
 `merge-orphan-sweep` stay `main`-only. The long-lived `lane/daemon-poc` approach is superseded (retired by
-x8kenvp). Codified in
+4042). Codified in
 [#resident-daemon-reload-lifecycle](../docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle) clause 5,
 and written into [#poc-branch-declared-delivery-mode](../docs/agent/platform-decisions.md#poc-branch-declared-delivery-mode)
 clause 4(a).

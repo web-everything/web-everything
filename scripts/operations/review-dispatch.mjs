@@ -122,6 +122,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   agentArgsFromEnv, assertNotALaneCheckout, buildAgentArgv, defaultSpawnAgent, parseBackgroundedId, REPO_ROOT,
+  resolveGhShimSettingsEnv,
 } from './dispatch-lane-io.mjs';
 // #xqa9ttq — the single source of truth for the `claude`/`codex` juror-provider enum, shared with
 // `we:scripts/operations/cli-adapter.mjs`'s own `--provider` flag so this dispatch's `--judge-provider`
@@ -365,6 +366,14 @@ export function dispatchReview({
   checkStaleness,
   judgeProvider = 'claude',
   checkoutExists = existsSync, home = homedir(),
+  // #x8mpubm follow-up (live-caught 2026-09-24, review-2591/2593/2600/2599/2594/2582) — THIS FUNCTION NEVER
+  // WIRED THE GH-APP-SHIM AT ALL. `dispatch-lane-io.mjs#createDispatchSinks` resolves it for the conveyor's
+  // OWN build-dispatch effect, but `dispatchReview` builds its own `buildAgentArgv` call directly and never
+  // referenced `settingsEnv` — so no review session ever got `--settings`, and (after the earlier follow-up)
+  // no review session ever got `<root>/.claude/settings.local.json` either. Every review 401 traced back to
+  // this: the shim was simply never on `PATH`, at all, for any review dispatch, since before this fix
+  // existed. NEVER throws — see `resolveGhShimSettingsEnv`'s own contract.
+  resolveSettingsEnv = resolveGhShimSettingsEnv,
 } = {}) {
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
   assertNotALaneCheckout(root);
@@ -402,6 +411,11 @@ export function dispatchReview({
     payload: { prompt, sessionSlug: planned.sessionSlug },
     systemPromptFile: REVIEW_DISPATCH_SYSTEM_PROMPT_FILE,
     extraArgs: [...reviewDispatchDisallowedToolsArgs(), ...extraArgs],
+    // #x8mpubm follow-up — resolved once, here, for this FRESH dispatch, mirroring
+    // `reconcile-fix-dispatch.mjs`'s own call exactly. `root` is threaded through so the durable
+    // `.claude/settings.local.json` delivery (`gh-app-shim.mjs#ensureSettingsFileEnv`) writes into the SAME
+    // checkout this dispatched review session actually starts in.
+    settingsEnv: resolveSettingsEnv(root),
   });
   // #3331 — THE HANDLE COMES BACK OFF STDOUT, it is not the uuid minted above. `claude --bg` DISCARDS
   // `--session-id` (it says so on stderr; measured 3/3 at CLI 2.1.246 by #3331's probe and 2/2 at 2.1.269 with

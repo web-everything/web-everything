@@ -619,6 +619,7 @@ describe('makeCliMechanicalPasses — invokes the exact set of mechanical passes
       'node /scripts/conveyor/ci-queue-watch.mjs sweep --repo=chalbert/web-everything',
       'node /scripts/conveyor/parked-pr-conflict-watch.mjs sweep --repo=chalbert/web-everything',
       'node /scripts/conveyor/advisory-label-sweep.mjs sweep --repo=chalbert/web-everything',
+      'node /scripts/conveyor/review-hold-reconcile.mjs sweep --repo=chalbert/web-everything',
       'node /scripts/conveyor/reconcile-pass.mjs --json --repo=chalbert/web-everything',
       'node /scripts/conveyor/duplicate-pr-watch.mjs sweep --repo=chalbert/web-everything',
       'node /scripts/conveyor/parked-pr-progress-watch.mjs sweep --repo=chalbert/web-everything',
@@ -639,6 +640,9 @@ import { OPEN_PR_LIST_FIELDS } from '../../../scripts/conveyor/open-pr-fetch.mjs
 const consumers = {
   'parked-pr-conflict-watch.mjs': listConflicts,
   'advisory-label-sweep.mjs': listAdvisory,
+  // #x01u7az — the sibling sweep piggybacks on the SAME shared snapshot AND the same standalone-fallback
+  // reader (it reuses `advisory-label-sweep.mjs#defaultListPrs` directly rather than a second copy).
+  'review-hold-reconcile.mjs': listAdvisory,
   'reconcile-pass.mjs': defaultReadPrs,
   'duplicate-pr-watch.mjs': defaultListOpenPrs,
   'parked-pr-progress-watch.mjs': listProgress,
@@ -687,7 +691,7 @@ describe('one open-PR snapshot per mechanical tick', () => {
     return calls.filter(([cmd, script]) => cmd === 'node' && consumers[script.split('/').pop()]);
   }
 
-  it('fetches exactly once and invokes all five consumers once with the same live file, then deletes it', async () => {
+  it('fetches exactly once and invokes all six consumers once with the same live file, then deletes it', async () => {
     const { calls, files } = await tick();
     const fetches = calls.filter(([cmd, ...args]) => cmd === 'gh' && args[0] === 'pr' && args[1] === 'list');
     expect(fetches).toEqual([['gh', 'pr', 'list', '--state', 'open', '--limit', '200', '--json', OPEN_PR_LIST_FIELDS, '--repo', 'chalbert/web-everything']]);
@@ -696,7 +700,7 @@ describe('one open-PR snapshot per mechanical tick', () => {
       expect(call.some((a) => a.startsWith('--prs-file='))).toBe(false);
     }
     expect(consumed.map((c) => c[1].split('/').pop())).toEqual(Object.keys(consumers));
-    expect(files).toHaveLength(5);
+    expect(files).toHaveLength(6);
     expect(new Set(files).size).toBe(1);
     for (const call of consumed) {
       expect(call).toContain(`--prs-file=${files[0]}`);
@@ -705,21 +709,21 @@ describe('one open-PR snapshot per mechanical tick', () => {
     expect(existsSync(files[0])).toBe(false);
   });
 
-  it('warns once on shared-fetch failure and all five consumers perform their standalone discovery without a flag', async () => {
+  it('warns once on shared-fetch failure and all six consumers perform their standalone discovery without a flag', async () => {
     const { calls, files, warnings } = await tick({ fetchThrows: true });
     const consumed = consumerCalls(calls);
     expect(consumed.map((c) => c[1].split('/').pop())).toEqual(Object.keys(consumers));
     expect(consumed.flat().some((a) => a.startsWith('--prs-file='))).toBe(false);
     expect(files).toEqual([]);
-    expect(calls.filter(([cmd]) => cmd === 'gh')).toHaveLength(6); // failed shared attempt + five fallbacks
+    expect(calls.filter(([cmd]) => cmd === 'gh')).toHaveLength(7); // failed shared attempt + six fallbacks
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain('mechanical pass open-pr-fetch [we] failed (non-fatal): shared discovery failed');
   });
 
   it('cleans up even when consumers fail, still invoking every consumer', async () => {
     const { calls, files } = await tick({ consumerThrows: true });
-    expect(consumerCalls(calls)).toHaveLength(5);
-    expect(files).toHaveLength(5);
+    expect(consumerCalls(calls)).toHaveLength(6);
+    expect(files).toHaveLength(6);
     for (const file of files) expect(existsSync(file)).toBe(false);
   });
 
@@ -884,6 +888,9 @@ describe('wireSelfSyncAndAppAuth — self-sync, then token refresh, then the tic
       selfSync: true,
       onRestart: () => { order.push('restart'); return 'restarted'; },
       sync: () => ({ merged: true, commits: 3, reason: 'merged' }),
+      // #3383 live-smoke gate: this test is about restart PRECEDENCE (restart before token-refresh/tick), not
+      // the gate's own verdict — inject a passing one (real daemon-live-smoke.test.mjs covers the gate itself).
+      gate: async () => ({ adopt: true, reason: 'test-gate-pass' }),
       authOpts: {
         env: { WE_GITHUB_APP_ID: 'a', WE_GITHUB_APP_INSTALLATION_ID: 'b', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/k' },
         setEnv: () => { order.push('token-refresh'); },
@@ -951,6 +958,8 @@ describe('wireSelfSyncAndAppAuth — self-sync is OPT-IN (never mutates an inter
       root: '/irrelevant',
       onRestart: () => { calls.push('restart'); return 'restarted'; },
       sync: syncWouldMerge(calls),
+      // #3383 live-smoke gate: passing, so this test keeps proving selfSync opt-in wiring, not the gate.
+      gate: async () => ({ adopt: true, reason: 'test-gate-pass' }),
       authOpts: { log: { error: () => {} } },
       selfSync: true,
     });

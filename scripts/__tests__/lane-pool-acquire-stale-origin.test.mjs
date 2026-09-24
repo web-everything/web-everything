@@ -157,7 +157,10 @@ describe('lane-pool acquire auto-pick stale-origin-ahead false negative (#2452 G
     git(['push', '--quiet', 'origin', 'HEAD:refs/heads/lane/moved-away'], mover2);
 
     // deliberately NO fetch in `lane` — the new tip object is unknown to this clone
-    const acquire = runPool(['acquire', ...poolArgs(), '--no-install', '--session=picker']);
+    // #3383 — `--hard-max=1` pins acquire's own growth-on-empty ceiling at this pool's actual size (1 lane),
+    // so it can't mask "genuinely unproven, must fail" by just cloning a fresh lane instead: this test's whole
+    // point is the#2267 guard on the ONE existing lane, not whether a pool CAN be grown.
+    const acquire = runPool(['acquire', ...poolArgs(), '--no-install', '--session=picker', '--hard-max=1']);
     expect(acquire.code, 'unproven must stay protected — recycling would destroy work').not.toBe(0);
   });
 
@@ -174,7 +177,8 @@ describe('lane-pool acquire auto-pick stale-origin-ahead false negative (#2452 G
     git(['config', 'user.name', 't'], lane);
     git(['commit', '--quiet', '-m', 'unpushed'], lane);
 
-    const acquire = runPool(['acquire', ...poolArgs(), '--no-install', '--session=picker']);
+    // #3383 — see the note on the sibling case above: pin the growth ceiling at this pool's real size.
+    const acquire = runPool(['acquire', ...poolArgs(), '--no-install', '--session=picker', '--hard-max=1']);
     expect(acquire.code).not.toBe(0);
     expect(acquire.err).toMatch(/no free lane/);
   });
@@ -205,7 +209,8 @@ describe('lane-pool acquire auto-pick stale-origin-ahead false negative (#2452 G
     expect(git(['for-each-ref', '--contains=HEAD', '--format=%(refname)', 'refs/remotes'], lane)).toContain('soon-deleted');
 
     // The guard must hold: HEAD is on no live remote ref, so the lane is NOT recyclable.
-    const acquire = runPool(['acquire', ...poolArgs(), '--no-install', '--session=picker']);
+    // #3383 — see the note above: pin the growth ceiling at this pool's real size.
+    const acquire = runPool(['acquire', ...poolArgs(), '--no-install', '--session=picker', '--hard-max=1']);
     expect(acquire.code).not.toBe(0);
     expect(acquire.err).toMatch(/no free lane/);
   });

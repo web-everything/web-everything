@@ -9,12 +9,16 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
+  queueFileRows,
   dispatchPlan, selectClearedRows, clearedNotReady,
   // #3457/#3460 — the age-gated already-done ground-truth enrichment (Fork 2(b)).
   isStaleEnoughForGroundTruth, ALREADY_DONE_AGE_GATE_MS,
   // #x7xv2xt — the explicit free-lane list that keeps a fixture run off the real lane pool.
   parseFreeLanes,
+  // epic #3383 — the kind-scoped dispatch-pause and its narrowed operator gloss.
+  dispatchPausedHint, DISPATCH_PAUSED_HINT,
 } from '../dispatch-plan.mjs';
+import { PAUSABLE_KINDS } from '../dispatch-pause.mjs';
 import { normNum } from '../../conveyor/queue-store.mjs';
 
 describe('dispatchPlan — happy path: disjoint items fill free lanes in rank order', () => {
@@ -604,6 +608,143 @@ describe('dispatchPlan — the UNSCOPED AUTO-PREPARE hold (#2613, ruled 2026-07-
   });
 });
 
+describe('dispatchPlan — the NO-SIZE admission hold (#3801 Fork 4 (b), #3849 admission)', () => {
+  const BLOCK = { unsizedCardPolicy: 'block', defaultSize: 13 };
+  const DEFAULT_SIZE = { unsizedCardPolicy: 'default-size', defaultSize: 13 };
+
+  it('`sizePolicy` omitted (the default) — an unsized scoped item launches exactly as before #3849', () => {
+    const plan = dispatchPlan({ queue: [{ num: 1, scope: ['src/a/'] }], leases: [], freeLanes: [2] });
+    expect(plan.launch).toEqual([{ num: 1, lane: 2 }]); // no `sized` key — untouched shape
+    expect(plan.held).toEqual([]);
+  });
+
+  it('under `block`, a scoped story with no `size:` is HELD "no-size" and never launches', () => {
+    const plan = dispatchPlan({
+      queue: [{ num: 1, kind: 'story', scope: ['src/a/'] }],
+      leases: [], freeLanes: [2],
+      sizePolicy: BLOCK,
+    });
+    expect(plan.launch).toEqual([]);
+    expect(plan.held).toEqual([{ num: 1, reason: 'no-size' }]);
+  });
+
+  it('under `block`, a scoped task with no `estimatedLoc:` is HELD "no-size" too (its own reason, distinct field)', () => {
+    const plan = dispatchPlan({
+      queue: [{ num: 1, kind: 'task', scope: ['src/a/'] }],
+      leases: [], freeLanes: [2],
+      sizePolicy: BLOCK,
+    });
+    expect(plan.launch).toEqual([]);
+    expect(plan.held).toEqual([{ num: 1, reason: 'no-size' }]);
+  });
+
+  it('under `block`, a task with a non-positive/non-integer `estimatedLoc:` is still HELD "no-size" (invalid reads as absent)', () => {
+    const invalid = [0, -3, 1.5];
+    for (const estimatedLoc of invalid) {
+      const plan = dispatchPlan({
+        queue: [{ num: 1, kind: 'task', scope: ['src/a/'], estimatedLoc }],
+        leases: [], freeLanes: [2],
+        sizePolicy: BLOCK,
+      });
+      expect(plan.held).toEqual([{ num: 1, reason: 'no-size' }]);
+    }
+  });
+
+  it('under `block`, a story with a declared `size:` launches normally, `sized: true` on its launch entry', () => {
+    const plan = dispatchPlan({
+      queue: [{ num: 1, kind: 'story', scope: ['src/a/'], size: 3 }],
+      leases: [], freeLanes: [2],
+      sizePolicy: BLOCK,
+    });
+    expect(plan.launch).toEqual([{ num: 1, lane: 2, sized: true }]);
+    expect(plan.held).toEqual([]);
+  });
+
+  it('under `block`, a task with a valid `estimatedLoc:` launches normally, `sized: true`', () => {
+    const plan = dispatchPlan({
+      queue: [{ num: 1, kind: 'task', scope: ['src/a/'], estimatedLoc: 80 }],
+      leases: [], freeLanes: [2],
+      sizePolicy: BLOCK,
+    });
+    expect(plan.launch).toEqual([{ num: 1, lane: 2, sized: true }]);
+    expect(plan.held).toEqual([]);
+  });
+
+  it('a `deliveryAgent:` marker never bypasses the "no-size" hold (#3801 Fork 5 — admission is decided before routing)', () => {
+    const plan = dispatchPlan({
+      queue: [{ num: 1, kind: 'story', scope: ['src/a/'], deliveryAgent: 'codex', deliveryAgentReason: 'trial' }],
+      leases: [], freeLanes: [2],
+      sizePolicy: BLOCK,
+    });
+    expect(plan.launch).toEqual([]);
+    expect(plan.held).toEqual([{ num: 1, reason: 'no-size' }]);
+  });
+
+  it('under `default-size`, an unsized story is ADMITTED (launched), route records `sized: false`', () => {
+    const plan = dispatchPlan({
+      queue: [{ num: 1, kind: 'story', scope: ['src/a/'] }],
+      leases: [], freeLanes: [2],
+      sizePolicy: DEFAULT_SIZE,
+    });
+    expect(plan.launch).toEqual([{ num: 1, lane: 2, sized: false }]);
+    expect(plan.held).toEqual([]);
+  });
+
+  it('under `default-size`, an unsized task is ADMITTED too, `sized: false`', () => {
+    const plan = dispatchPlan({
+      queue: [{ num: 1, kind: 'task', scope: ['src/a/'] }],
+      leases: [], freeLanes: [2],
+      sizePolicy: DEFAULT_SIZE,
+    });
+    expect(plan.launch).toEqual([{ num: 1, lane: 2, sized: false }]);
+    expect(plan.held).toEqual([]);
+  });
+
+  it('a `fix` dispatch is NEVER held for size, even unsized, under `block` (fix/ci-heal take the fixSizeSource chain instead)', () => {
+    const plan = dispatchPlan({
+      queue: [{ num: 1, kind: 'fix', scope: ['src/a/'] }],
+      leases: [], freeLanes: [2],
+      sizePolicy: BLOCK,
+    });
+    // no `sized` key — exempt, its size comes from `fixSizeSource` in `decideDispatchRoute`, not this gate.
+    expect(plan.launch).toEqual([{ num: 1, lane: 2 }]);
+    expect(plan.held).toEqual([]);
+  });
+
+  it('a `ci-heal` dispatch is NEVER held for size, even unsized, under `block`', () => {
+    const plan = dispatchPlan({
+      queue: [{ num: 1, kind: 'ci-heal', scope: ['src/a/'] }],
+      leases: [], freeLanes: [2],
+      sizePolicy: BLOCK,
+    });
+    expect(plan.launch).toEqual([{ num: 1, lane: 2 }]);
+    expect(plan.held).toEqual([]);
+  });
+
+  it('unscoped keeps "unshaped-no-scope" — the no-size gate never relabels a more specific hold', () => {
+    const plan = dispatchPlan({
+      queue: [{ num: 1, kind: 'story' }], // no scope at all
+      leases: [], freeLanes: [2],
+      sizePolicy: BLOCK,
+    });
+    expect(plan.launch).toEqual([]);
+    expect(plan.held).toEqual([{ num: 1, reason: 'unshaped-no-scope' }]);
+  });
+
+  it('a scoped+sized story and a scoped+unsized story in the same tick: the sized one launches, the unsized one holds', () => {
+    const plan = dispatchPlan({
+      queue: [
+        { num: 1, kind: 'story', scope: ['src/a/'] }, // unsized, higher rank
+        { num: 2, kind: 'story', scope: ['src/b/'], size: 5 },
+      ],
+      leases: [], freeLanes: [3, 4],
+      sizePolicy: BLOCK,
+    });
+    expect(plan.launch).toEqual([{ num: 2, lane: 3, sized: true }]);
+    expect(plan.held).toEqual([{ num: 1, reason: 'no-size' }]);
+  });
+});
+
 describe('dispatchPlan — mixed tick pins the full precedence + ordering', () => {
   it('resolves blocked / unscoped / lease-overlap / rival / launch / no-free-lane together', () => {
     const plan = dispatchPlan({
@@ -868,5 +1009,95 @@ describe('parseFreeLanes — the explicit free-lane list (#x7xv2xt)', () => {
   });
   it('parses ids ascending and drops non-integer tokens', () => {
     expect(parseFreeLanes('7, 3,x,12,-1,')).toEqual([3, 7, 12]);
+  });
+});
+
+describe('dispatchPlan — KIND-SCOPED dispatch-pause (epic #3383): `build` is the only kind this core decides', () => {
+  const oneReadyItem = { queue: [{ num: 1, scope: ['a/'] }], leases: [], freeLanes: [10] };
+
+  it('BACKWARD COMPAT: `dispatchPaused: true` with NO kinds still holds the build (old-format marker / boolean-only caller)', () => {
+    for (const kinds of [undefined, null, []]) {
+      const plan = dispatchPlan({ ...oneReadyItem, dispatchPaused: true, dispatchPausedKinds: kinds });
+      expect(plan.launch).toEqual([]);
+      expect(plan.held).toEqual([{ num: 1, reason: 'dispatch-paused' }]);
+    }
+  });
+
+  it('a scope NAMING build holds it, exactly as a blanket pause would', () => {
+    const plan = dispatchPlan({
+      ...oneReadyItem,
+      dispatchPaused: true,
+      dispatchPausedKinds: ['build', 'prepare', 'prepare-decision', 'investigate'],
+    });
+    expect(plan.launch).toEqual([]);
+    expect(plan.held).toEqual([{ num: 1, reason: 'dispatch-paused' }]);
+  });
+
+  it('a scope that does NOT name build lets the build launch — the whole point: fix/ci-heal held, new items flowing', () => {
+    const plan = dispatchPlan({ ...oneReadyItem, dispatchPaused: true, dispatchPausedKinds: ['fix', 'ci-heal'] });
+    expect(plan.launch).toEqual([{ num: 1, lane: 10 }]);
+    expect(plan.held).toEqual([]);
+  });
+
+  it('a scope of ONLY the prepare-family kinds leaves builds launching (those are tick-core.mjs\'s spawns, not this core\'s)', () => {
+    const plan = dispatchPlan({
+      ...oneReadyItem,
+      dispatchPaused: true,
+      dispatchPausedKinds: ['prepare', 'prepare-decision', 'investigate'],
+    });
+    expect(plan.launch).toEqual([{ num: 1, lane: 10 }]);
+  });
+
+  it('kinds WITHOUT `dispatchPaused` hold nothing — the scope never arms the pause by itself', () => {
+    const plan = dispatchPlan({ ...oneReadyItem, dispatchPaused: false, dispatchPausedKinds: ['build'] });
+    expect(plan.launch).toEqual([{ num: 1, lane: 10 }]);
+  });
+
+  it('a typo\'d kind holds nothing — the marker fails OPEN (the CLI is where a typo is refused)', () => {
+    const plan = dispatchPlan({ ...oneReadyItem, dispatchPaused: true, dispatchPausedKinds: ['buidl'] });
+    expect(plan.launch).toEqual([{ num: 1, lane: 10 }]);
+  });
+
+  it('a build-scoped pause still never relabels an item held for a MORE SPECIFIC reason', () => {
+    const plan = dispatchPlan({
+      queue: [{ num: 1, kind: 'epic' }, { num: 2, scope: ['w/'] }],
+      leases: [],
+      freeLanes: [10],
+      dispatchPaused: true,
+      dispatchPausedKinds: ['build'],
+    });
+    expect(plan.held).toEqual([
+      { num: 1, reason: 'needs-slice' },
+      { num: 2, reason: 'dispatch-paused' },
+    ]);
+  });
+});
+
+describe('dispatchPausedHint — the operator gloss narrows to a scoped pause (epic #3383)', () => {
+  it('a BLANKET pause keeps the exact wording it always had', () => {
+    expect(dispatchPausedHint(null)).toBe(DISPATCH_PAUSED_HINT);
+    expect(dispatchPausedHint()).toBe(DISPATCH_PAUSED_HINT);
+    expect(dispatchPausedHint([])).toBe(DISPATCH_PAUSED_HINT);
+  });
+  it('a scope naming EVERY kind reads as blanket too', () => {
+    expect(dispatchPausedHint([...PAUSABLE_KINDS])).toBe(DISPATCH_PAUSED_HINT);
+  });
+  it('a SCOPED pause names the held kinds instead of claiming dispatch is paused outright', () => {
+    const hint = dispatchPausedHint(['build', 'prepare', 'prepare-decision', 'investigate']);
+    expect(hint).toContain('build, prepare, prepare-decision, investigate');
+    expect(hint).toContain('dispatch-pause.mjs clear');
+    expect(hint).not.toBe(DISPATCH_PAUSED_HINT);
+  });
+});
+
+// #3720 — `--queue-file` (land-advance's item-pull): the caller's list sets membership and order.
+describe('queueFileRows (--queue-file)', () => {
+  const norm = (n) => String(n).replace(/^#/, '');
+  it('keeps the file order, accepts ids as strings, numbers or {num}, and drops repeats and blanks', () => {
+    expect(queueFileRows(JSON.stringify(['3653', 3674, { num: '3486' }, '3653', '', null]), norm)).toEqual([{ num: '3653' }, { num: '3674' }, { num: '3486' }]);
+  });
+  it('refuses anything that is not a JSON array', () => {
+    expect(() => queueFileRows('{"a":1}', norm)).toThrow(/JSON array/);
+    expect(() => queueFileRows('nope', norm)).toThrow();
   });
 });

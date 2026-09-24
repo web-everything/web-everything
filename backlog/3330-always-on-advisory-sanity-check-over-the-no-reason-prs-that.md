@@ -5,6 +5,7 @@ size: 5
 parent: "3318"
 blockedBy: ["3329"]
 status: open
+relatedTo: ["3867"]
 dateOpened: "2026-08-26"
 tags: [review, delivery, jury]
 scope:
@@ -55,6 +56,23 @@ disposition. The pass must be structurally incapable of parking: it writes a led
 
 This is what makes the pass free of the #2606 latency cost that killed the random sampler (#2631): a park
 stops the merge, and a review that cannot park cannot stop it.
+
+## Provider, async footing, and scope (folded in from #4031, 2026-09-24)
+
+- **The floor juror defaults to a non-Claude provider** — Codex is allowed for tool-free judging (rule 7 of
+  `#delegation-trial-record-graduation`), Gemini also possible — so the floor costs ~no Claude usage. A
+  different provider from the PR's builder is preferred, never required (rule 7).
+- **The async/non-blocking footing above is now statute, not just this item's own design**:
+  `we:docs/agent/platform-decisions.md#delegation-trial-record-graduation` (rule 7) carries the same "runs
+  asynchronously, off the landing path — never holds or delays a merge" language, added ratifying #3867
+  (operator, 2026-09-24, PR #2583).
+- **It applies to every PR that lands in the no-reason set** — Claude-built and delegated-provider-built
+  alike. The floor is not special-cased by who built the PR, only by whether the PR reached no reviewer
+  (`escalate: false`). Until this item ships, Claude's own PRs lack this floor the same way a delegated
+  build's do.
+- **Cost-baseline correction:** #3313's "~$12.50 across 29 PRs" figure equals 29 × #3318's ~$0.43/PR
+  full-lens baseline — i.e. it is the **full-lens** cost, not this floor's. The floor's own real cost is
+  still unmeasured; closing that gap is exactly the *Measure it* section above, not a separate task.
 
 ## The teeth
 

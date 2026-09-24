@@ -220,6 +220,37 @@ export function defaultIsLeasedNow(dir) {
 }
 
 /**
+ * #4025 — the live pool-TRIM call, shelling `node lane-pool.mjs trim --json [--repo=] [--max=N] [--dry-run]`,
+ * the SAME command an operator runs by hand (see that file's own `trim` section header). `exec` is injectable
+ * so the argv is assertable with no real subprocess. `provision --acquirable` grows a pool whenever nothing
+ * looks free but nothing ever shrank it back — this is the periodic shrink half, piggybacking on the SAME tick
+ * this file's litter-reap pass already runs on, so a pool trends back toward its cap automatically with no
+ * separate cron/daemon (mirrors this file's own header rationale for the litter-reap pass).
+ *
+ * Best-effort, like every other read in this file's IO shell: any failure (a crashed child, unparsable JSON)
+ * returns `null` rather than throwing, so one bad trim tick degrades to "trim unavailable this tick" instead
+ * of crashing the whole health-watch pass (`reaped`/`plan` above still ran and are still reported).
+ * @param {{exec?:Function, repo?:string|null, root?:string, max?:number|null, dryRun?:boolean}} [o]
+ * @returns {{repo:string, root:string, total:number, max:number, removed:number[], kept:Array<object>,
+ *   remaining:number, overCap:number, dryRun:boolean}|null}
+ */
+export function defaultTrimPool({ exec = execFileSync, repo = null, root = REPO_ROOT, max = null, dryRun = false } = {}) {
+  const argv = [join(root, 'scripts', 'lane-pool.mjs'), 'trim', '--json'];
+  const repoPath = resolveLanePoolRepoPath(repo);
+  if (repoPath) argv.push(`--repo=${repoPath}`);
+  if (Number.isInteger(max) && max >= 0) argv.push(`--max=${max}`);
+  if (dryRun) argv.push('--dry-run');
+  try {
+    // #x5n4zn3-style bound, matching `defaultListLaneStatus` above — a real spawned CLI child, never unbounded.
+    const out = exec('node', argv, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: resolveChildTimeoutMs() * 4, killSignal: 'SIGKILL' });
+    const parsed = JSON.parse(String(out || 'null'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * THE IO SHELL. Reads live pool status, reads each unleased lane's porcelain, plans the reap
  * ({@link planLaneReap}), and — unless `dryRun` — reaps every `action:'reap'` lane via the SAME
  * `we:scripts/lib/lane-litter.mjs#cleanLaneLitter` `cmdRelease` calls at release time, passing
@@ -227,14 +258,19 @@ export function defaultIsLeasedNow(dir) {
  * mutation from inside its own function body, with no separate pre-check here that could reopen the race
  * window (see `cleanLaneLitter`'s own docblock). Never throws on a per-lane reap failure — one bad lane must
  * not stop the sweep from reaping the rest.
+ * #4025 — ALSO runs `trimPool` after the litter-reap above (a litter-only lane is already clean by the time
+ * trim evaluates it, so trim never re-derives that decision): the periodic SHRINK half beside this pass's
+ * existing periodic reap half. `trimMax` forwards to `trim`'s own `--max`; omitted, `trim` falls back to its
+ * own per-repo default cap (see `scripts/lane-pool.mjs`'s `TRIM_DEFAULT_CAP`).
  * @param {{repo?:string|null, root?:string, listStatus?:Function, readPorcelain?:Function, reap?:Function,
- *   isLeasedNow?:Function, dryRun?:boolean}} [o]
+ *   isLeasedNow?:Function, dryRun?:boolean, trimPool?:Function, trimMax?:number|null}} [o]
  * @returns {{health:{total:number,leased:number,acquirable:number,dirtyUnleased:number}, plan:Array<object>,
- *   reaped:number[], dryRun:boolean}}
+ *   reaped:number[], dryRun:boolean, trim:object|null}}
  */
 export function watchLanePoolHealth({
   repo = null, root = REPO_ROOT, listStatus = defaultListLaneStatus, readPorcelain = defaultReadPorcelain,
   reap = cleanLaneLitter, isLeasedNow = defaultIsLeasedNow, dryRun = false,
+  trimPool = defaultTrimPool, trimMax = null,
 } = {}) {
   const status = listStatus({ repo, root });
   const lanes = status.lanes.map((l) => (
@@ -254,7 +290,8 @@ export function watchLanePoolHealth({
       } catch { /* best-effort — one bad reap never stops the rest of the sweep */ }
     }
   }
-  return { health: summarizeHealth(lanes, plan, reaped), plan, reaped, dryRun };
+  const trim = trimPool({ repo, root, max: trimMax, dryRun });
+  return { health: summarizeHealth(lanes, plan, reaped), plan, reaped, dryRun, trim };
 }
 
 /**
@@ -278,12 +315,14 @@ if (IS_CLI) {
   const flag = (name) => (argv.find((a) => a.startsWith(`--${name}=`)) || '').slice(name.length + 3) || undefined;
   const repo = flag('repo') || null;
   const dryRun = argv.includes('--dry-run');
+  const maxFlag = flag('max');
+  const trimMax = maxFlag !== undefined && Number.isInteger(Number(maxFlag)) ? Number(maxFlag) : null;
   try {
-    const result = runLanePoolHealthWatch({ repo, dryRun });
+    const result = runLanePoolHealthWatch({ repo, dryRun, trimMax });
     if (result.disabled) {
       process.stderr.write(`  lane-pool-health-watch: disabled (${DISABLE_ENV_VAR} set)\n`);
     } else {
-      const { health, plan, reaped } = result;
+      const { health, plan, reaped, trim } = result;
       process.stderr.write(
         `  pool health: ${health.acquirable} acquirable · ${health.dirtyUnleased} dirty(unleased) · ` +
           `${health.leased} leased · ${health.total} total\n`,
@@ -295,6 +334,18 @@ if (IS_CLI) {
         } else if (p.action === 'leave-dirty') {
           process.stderr.write(`  lane-${p.lane}: left dirty — non-allowlisted state present\n`);
         }
+      }
+      // #4025 — the trim call already prints its own per-lane detail to stderr (it's a real spawned CLI
+      // child); this is just the tick-level summary line so a health-watch log scan sees it without having
+      // to correlate the child's own separately-captured stderr.
+      if (trim) {
+        process.stderr.write(
+          `  pool trim: ${trim.total} lane(s), cap ${trim.max} → ${dryRun ? 'would remove' : 'removed'} ` +
+            `${trim.removed.length} (${trim.total} → ${trim.remaining})` +
+            `${trim.overCap > 0 ? ` — ⚠ still ${trim.overCap} over cap` : ''}\n`,
+        );
+      } else {
+        process.stderr.write('  pool trim: unavailable this tick (best-effort — see any error above)\n');
       }
     }
     process.stdout.write(`${JSON.stringify({ checked: true, ...result })}\n`);

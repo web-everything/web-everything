@@ -292,6 +292,7 @@ export const MECHANICAL_PASS_NAMES = Object.freeze([
   'ci-queue-watch',
   'parked-pr-conflict-watch',
   'advisory-label-sweep',
+  'review-hold-reconcile',
   'reconcile-pass',
   'duplicate-pr-watch',
   'parked-pr-progress-watch',
@@ -356,6 +357,12 @@ export function makeCliMechanicalPasses({
         // Dispatcher must skip this to avoid double-running it.
         if (!skip('parked-pr-conflict-watch')) run('conveyor/parked-pr-conflict-watch.mjs', ['sweep', ...prsArgs], key, slug);
         if (!skip('advisory-label-sweep')) run('conveyor/advisory-label-sweep.mjs', ['sweep', ...prsArgs], key, slug);
+        // #x01u7az — the one-time-and-ongoing cleanup for the two review-hold/advisory strays
+        // `we:scripts/review-set-label.mjs#decideSetLabel`'s `rearm`/`clear-human` fix stops PRODUCING going
+        // forward (a stray review:pending beside a live review:human; a stray advisory:* once review:human is
+        // gone) — see that module's own header for the live PRs (#2549, #2578) this cleans up. Piggybacks on the
+        // SAME shared open-PR snapshot as its sibling sweep, one line above.
+        if (!skip('review-hold-reconcile')) run('conveyor/review-hold-reconcile.mjs', ['sweep', ...prsArgs], key, slug);
         // GROUP (skipped as ONE unit): reconcile-pass → review-dispatch (per PR) → review-round-tag /
         // review-status-tag — the exact sequence skills-src/conveyor/review-daemon.mjs now runs standalone,
         // per PR (#3876). A resident Dispatcher must skip 'reconcile-pass' whole to avoid duplicating it.
@@ -580,16 +587,19 @@ export function resolveSkipPasses(flagValue, { names = MECHANICAL_PASS_NAMES } =
  * a mid-session `process.exit(0)` is wrong. So unless the caller explicitly asserts "this is the dedicated
  * clone" (the CLI's `--self-sync` flag, which the staged launchd plist passes), only the App-token refresh
  * wraps the tick and no git mutation ever happens.
- * @param {{tickOnce:Function, root:string, onRestart:Function, authOpts?:object, sync?:Function, selfSync?:boolean}} o
+ * @param {{tickOnce:Function, root:string, onRestart:Function, authOpts?:object, sync?:Function, selfSync?:boolean, gate?:Function}} o
  *   `sync` is forwarded to {@link withSelfSync} (defaults to the real `selfSyncCheckout`) — exposed so a test
  *   can simulate "new commits arrived" without a real git checkout. `selfSync` must be exactly `true` to wire
- *   the self-sync wrapper at all.
+ *   the self-sync wrapper at all. `gate` is likewise forwarded (#3383's live-smoke gate — defaults to the
+ *   real `gateMergedCommit`) — exposed for the same reason `sync` is: a test that injects a merge without a
+ *   real lane-pool/gh/reconcile-pass-shaped `root` needs to inject a passing gate too, or the (correct,
+ *   unconditional-by-design) live smoke would reject that synthetic merge as it would any other broken one.
  * @returns {Function} the wrapped `tickOnce` effect, same call signature as the one passed in.
  */
-export function wireSelfSyncAndAppAuth({ tickOnce, root, onRestart, authOpts, sync, selfSync = false }) {
+export function wireSelfSyncAndAppAuth({ tickOnce, root, onRestart, authOpts, sync, selfSync = false, gate }) {
   const authed = withGithubAppAuth({ tickOnce }, authOpts);
   if (selfSync !== true) return authed.tickOnce;
-  const selfSyncOpts = { root, onRestart, ...(sync ? { sync } : {}) };
+  const selfSyncOpts = { root, onRestart, ...(sync ? { sync } : {}), ...(gate ? { gate } : {}) };
   return withSelfSync(authed, selfSyncOpts).tickOnce;
 }
 

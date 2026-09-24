@@ -3,9 +3,11 @@ bornAs: xa9fkfz
 kind: story
 size: 5
 parent: "3443"
-status: open
+status: resolved
 scope: ["we:scripts/readiness/dispatch-pause.mjs", "we:scripts/readiness/__tests__/dispatch-pause.test.mjs", "we:scripts/readiness/dispatch-plan.mjs", "we:scripts/readiness/__tests__/dispatch-plan.test.mjs", "we:scripts/readiness/queue-report.mjs", "we:scripts/conveyor/tick-core.mjs", "we:scripts/conveyor/__tests__/tick-core.test.mjs", "we:scripts/conveyor/__tests__/tick-core-wall-clock-ttl.test.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards.test.mjs"]
 dateOpened: "2026-09-22"
+dateStarted: "2026-09-24"
+dateResolved: "2026-09-24"
 tags: []
 ---
 

@@ -72,31 +72,31 @@ operator's own words, in order:
   - Scope: **all daemons may run overlays, the review daemon included** — the operator's explicit choice over
     the re-prep's "never in a clone that reviews, labels or merges PRs". Carve-out: the drain daemon and the
     `merge-orphan-sweep` pass merge to `main`, so they stay `main`-only.
-  - This supersedes the long-lived POC-branch approach for daemons (`lane/daemon-poc`, epic xii6vye) and
-    amends #poc-branch-declared-delivery-mode clause 4(a); card x923r7y was the vehicle for that amendment and
+  - This supersedes the long-lived POC-branch approach for daemons (`lane/daemon-poc`, epic 3999) and
+    amends #poc-branch-declared-delivery-mode clause 4(a); card 3992 was the vehicle for that amendment and
     resolves with this ruling.
 
 **Left open (filed, not ruled):** the re-prep excluded review clones *because of*
 #drain-daemon-self-hosting-boundary clause 3 (a daemon never approves its own daemon-code change). The operator
 allowed overlays in the review daemon but did not say how clause 3 then applies to an overlay whose graduation
-PR that daemon would review. No default was stated, so it is its own decision card, **xcw0nxo**. Clause 3
+PR that daemon would review. No default was stated, so it is its own decision card, **4043**. Clause 3
 stands unamended until then.
 
 Codified as [#resident-daemon-reload-lifecycle](../docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle),
 which also amends [#poc-branch-declared-delivery-mode](../docs/agent/platform-decisions.md#poc-branch-declared-delivery-mode)
 clause 4(a).
 
-**Follow-on build, as filed (all under #3383):** xlqazzv (primary/designated-clone refusal), xt8j3yk (boot
-input heads + per-tick check + 5-min floor), x3ecgta (per-clone reader/writer lock), xvxs2u3 (pinned state
-root), xgomze7 (rebuild form; blocked by x3ecgta), xlqampw (re-scoped: the live-overlay core; blocked by
-xgomze7), xibzioo (test gate before new overlay code; blocked by xlqampw), xmiknhd (drain and
-`merge-orphan-sweep` stay `main`-only; blocked by xlqampw), xi58xoz (child-call timeouts + outside heartbeat
-check), xlpy3qt (outside rollback removes an overlay; blocked by xlqampw, xi58xoz), x0m1pkt (running revision
-and overlays in the heartbeat; blocked by xt8j3yk), x0o7184 (restart via request file), x8kenvp (retire
-`lane/daemon-poc`; blocked by xdpemd4, xlqampw). Existing cards kept: xdpemd4 (pass-daemon self-sync), #3952
+**Follow-on build, as filed (all under #3383):** 4048 (primary/designated-clone refusal), 4050 (boot
+input heads + per-tick check + 5-min floor), 4041 (per-clone reader/writer lock), 4052 (pinned state
+root), 4044 (rebuild form; blocked by 4041), 4002 (re-scoped: the live-overlay core; blocked by
+4044), 4046 (test gate before new overlay code; blocked by 4002), 4049 (drain and
+`merge-orphan-sweep` stay `main`-only; blocked by 4002), 4045 (child-call timeouts + outside heartbeat
+check), 4047 (outside rollback removes an overlay; blocked by 4002, 4045), 4051 (running revision
+and overlays in the heartbeat; blocked by 4050), 4040 (restart via request file), 4042 (retire
+`lane/daemon-poc`; blocked by 3998, 4002). Existing cards kept: 3998 (pass-daemon self-sync), #3952
 (dead-pid lease reclaim, a prerequisite), and #3467, #3397, #3756, #3984 as the re-prep's "Follow-on build"
 section describes. The re-prep's slice 4 (split `wev-review-daemon` so no PR-acting daemon shares a POC clone) is
-narrowed by the amendment to moving `merge-orphan-sweep` out (xmiknhd).
+narrowed by the amendment to moving `merge-orphan-sweep` out (4049).
 
 ## The ask (operator, epic #3383, 2026-09-14)
 

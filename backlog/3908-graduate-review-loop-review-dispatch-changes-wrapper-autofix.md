@@ -4,8 +4,8 @@ kind: story
 size: 5
 parent: "3443"
 status: open
-blockedBy: ["3906", "3904", "3907"]
-scope: ["we:scripts/conveyor/__tests__/advisory-round-count.test.mjs", "we:scripts/conveyor/__tests__/autofix-review-findings.test.mjs", "we:scripts/conveyor/__tests__/fix-autofix-gate.test.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs", "we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs", "we:scripts/conveyor/advisory-round-count.mjs", "we:scripts/conveyor/autofix-review-findings.mjs", "we:scripts/conveyor/fix-autofix-gate.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/operations/__tests__/review-dispatch-wrapper.test.mjs", "we:scripts/operations/__tests__/review-dispatch.test.mjs", "we:scripts/operations/review-dispatch-wrapper.mjs", "we:scripts/operations/review-dispatch.mjs", "we:scripts/conveyor/__tests__/reconcile-fix-routing.test.mjs", "we:scripts/conveyor/__tests__/parked-pr-conflict-dispatch-integration.test.mjs", "we:scripts/operations/__tests__/action-ground-truth.test.mjs"]
+blockedBy: ["3906", "3904", "3907", "3905"]
+scope: ["we:scripts/conveyor/__tests__/advisory-round-count.test.mjs", "we:scripts/conveyor/__tests__/autofix-review-findings.test.mjs", "we:scripts/conveyor/__tests__/fix-autofix-gate.test.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs", "we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs", "we:scripts/conveyor/advisory-round-count.mjs", "we:scripts/conveyor/autofix-review-findings.mjs", "we:scripts/conveyor/fix-autofix-gate.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/operations/__tests__/review-dispatch-wrapper.test.mjs", "we:scripts/operations/__tests__/review-dispatch.test.mjs", "we:scripts/operations/review-dispatch-wrapper.mjs", "we:scripts/operations/review-dispatch.mjs", "we:scripts/conveyor/__tests__/reconcile-fix-routing.test.mjs", "we:scripts/conveyor/__tests__/parked-pr-conflict-dispatch-integration.test.mjs", "we:scripts/operations/__tests__/action-ground-truth.test.mjs", "we:scripts/operations/__tests__/telemetry-wiring.test.mjs"]
 dateOpened: "2026-09-22"
 tags: []
 ---
@@ -16,7 +16,7 @@ Ports 8 files (we:scripts/operations/review-dispatch.mjs, we:scripts/operations/
 
 ## Done when
 
-1. **Executable** — `npx vitest run we:scripts/conveyor/__tests__/advisory-round-count.test.mjs we:scripts/conveyor/__tests__/autofix-review-findings.test.mjs we:scripts/conveyor/__tests__/fix-autofix-gate.test.mjs we:scripts/conveyor/__tests__/reconcile-core.test.mjs we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs we:scripts/operations/__tests__/review-dispatch-wrapper.test.mjs we:scripts/operations/__tests__/review-dispatch.test.mjs we:scripts/conveyor/__tests__/reconcile-fix-routing.test.mjs we:scripts/conveyor/__tests__/parked-pr-conflict-dispatch-integration.test.mjs we:scripts/operations/__tests__/action-ground-truth.test.mjs` passes on main's tree (all of this slice's tests; each fails before the port because its module is missing or differs).
+1. **Executable** — `npx vitest run we:scripts/conveyor/__tests__/advisory-round-count.test.mjs we:scripts/conveyor/__tests__/autofix-review-findings.test.mjs we:scripts/conveyor/__tests__/fix-autofix-gate.test.mjs we:scripts/conveyor/__tests__/reconcile-core.test.mjs we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs we:scripts/operations/__tests__/review-dispatch-wrapper.test.mjs we:scripts/operations/__tests__/review-dispatch.test.mjs we:scripts/conveyor/__tests__/reconcile-fix-routing.test.mjs we:scripts/conveyor/__tests__/parked-pr-conflict-dispatch-integration.test.mjs we:scripts/operations/__tests__/action-ground-truth.test.mjs we:scripts/operations/__tests__/telemetry-wiring.test.mjs` passes on main's tree (all of this slice's tests; each fails before the port because its module is missing or differs).
 2. **Executable** — `npm run check:standards` reports 0 errors, and the PR's required `test` and `smoke` checks are green.
 3. **Faithful port** — for each ported file, `git diff 600acc14f -- <file>` (prototype snapshot vs main after the port) shows only main's own later changes kept by the merge notes, never a behaviour change of the branch code; runtime data files (e.g. `we:scripts/conveyor/run-scorecards.json`) are never edited.
 
@@ -184,3 +184,9 @@ test fixtures may answer whether `supervision` is meant to reach `reviewSeatRout
     record the answer in this card's Done-when rather than assuming either way.
 
 - Moved here from #3901 (2026-09-24): `we:scripts/operations/__tests__/action-ground-truth.test.mjs`, which imports `we:scripts/operations/review-dispatch-wrapper.mjs`, a module this slice ports.
+- Moved here from #3895 (2026-09-24, at #3895 land time): `we:scripts/operations/__tests__/telemetry-wiring.test.mjs`, which imports `we:scripts/operations/review-dispatch-wrapper.mjs` (this slice's own scope), `we:scripts/operations/minimal-context-provider.mjs` (#3902) and the prepare wrappers (#3905). Per the epic's critical path (`#3897 → #3902 → #3906 → #3903 → #3904 → #3908`) and #3905's own `blockedBy: 3903`, both #3902 and #3905 will already be on `main` by the time this slice lands — this is the correct last-landing home for the test's full dependency set. #3895 itself ported `we:scripts/operations/telemetry-store.mjs`, which this test also exercises.
+
+## Graduation import check
+
+- 2026-09-24: graduation-import-check added blockedBy #3905 — the moved-in `we:scripts/operations/__tests__/telemetry-wiring.test.mjs` also imports a module #3905 owns.
+- 2026-09-24: graduation-import-check moved `we:scripts/operations/__tests__/telemetry-wiring.test.mjs` here from #3895 — it imports a module this card owns.

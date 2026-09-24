@@ -713,8 +713,11 @@ export function dispatchFix(planned, {
     extraArgs,
     // #x8mpubm — see `resolveSettingsEnv`'s own param comment above; resolved once, here, for this FRESH
     // dispatch only (never for `tryResumeFix`'s own `buildAgentArgv` call, which must stay a bare
-    // `--bg --resume` with no other flag — see that function's docblock).
-    settingsEnv: resolveSettingsEnv(),
+    // `--bg --resume` with no other flag — see that function's docblock). #x8mpubm follow-up (live-caught
+    // 2026-09-24) — `root` is now threaded through so the durable `.claude/settings.local.json` delivery
+    // (`gh-app-shim.mjs#ensureSettingsFileEnv`) writes into the SAME checkout this dispatch starts in,
+    // matching `review-dispatch.mjs#dispatchReview`'s own fix for the identical gap.
+    settingsEnv: resolveSettingsEnv(root),
   });
   // #3331 — READ THE REAL ID BACK OFF STDOUT, exactly as the resume branch above already does. `claude --bg`
   // discards `--session-id` and assigns its own, so the minted uuid addresses nothing; `agentId` is what

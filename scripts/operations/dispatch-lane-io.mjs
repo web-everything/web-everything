@@ -60,7 +60,7 @@ import { classifyPr } from '../conveyor/pr-watch.mjs';
 // #3637 — the POC-branch registry, so an item's `deliveryTarget:` resolves against DECLARED branches only.
 import { readRegistry as readPocRegistry, validateDeliveryTarget } from '../lib/poc-branches.mjs';
 import { briefTokensForRepo } from '../lib/repo-profile.mjs';
-import { buildGhShimSettingsEnv } from '../lib/gh-app-shim.mjs';
+import { buildGhShimSettingsEnv, sanitizeSpawnEnv } from '../lib/gh-app-shim.mjs';
 import { inFlight, notApplied } from './effect-executor.mjs';
 import { createFileRunStore } from './run-store.mjs';
 import { DEFAULT_EXPECTED_WITHIN_MINUTES, DISPATCH_EFFECT, DISPATCH_LISTING_GRACE_MINUTES, LAUNCH_KINDS } from './dispatch-lane.mjs';
@@ -1004,7 +1004,7 @@ export function createDispatchSinks({
           num: payload?.num,
           extraArgs,
           systemPromptFile: DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
-          settingsEnv: resolveSettingsEnv(),
+          settingsEnv: resolveSettingsEnv(root),
         });
       } catch (e) {
         // A validation failure `buildAgentArgv` already proved happened before any process existed (e.g. an
@@ -1073,7 +1073,17 @@ export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => de
  */
 export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync } = {}) {
   return exec('claude', argv, {
-    encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts,
+    encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL',
+    // #x8mpubm follow-up (live-caught 2026-09-24) — this call inherits `process.env` unless told otherwise,
+    // and this DAEMON's own process may carry a `GH_TOKEN` `github-app-auth-env.mjs` set for ITS OWN gh/git
+    // calls. Left alone, that snapshot leaks into the spawned `claude` front-end and, transitively, into
+    // anything its background-daemon infra bootstraps from it (a pre-warmed spare pool that then outlives
+    // this one dispatch) — a token that never refreshes and eventually expires, exactly what the shim exists
+    // to prevent. Strip it here so an App-authenticated `gh` call only ever happens behind the shim.
+    // Spread `opts` FIRST and sanitize whatever env it carries — a caller-supplied `opts.env` (e.g.
+    // deliver-item-wrapper's `{...process.env, ...deliveryEnv}`) must never replace the stripped env (PR #2600).
+    ...opts,
+    env: sanitizeSpawnEnv(opts.env || process.env),
   });
 }
 
@@ -1147,10 +1157,17 @@ export const DISPATCHED_AGENT_SYSTEM_PROMPT_FILE = join(dirname(fileURLToPath(im
  * caller omits `--settings` entirely and the dispatch proceeds exactly as it would have before this existed.
  * A thin wrapper, not re-exported logic — `gh-app-shim.mjs` owns every real decision; this only guarantees
  * the "never blocks a dispatch" contract every sink in this file already holds itself to.
+ *
+ * `cwd` (#x8mpubm follow-up, live-caught 2026-09-24) — the checkout the dispatched session actually starts
+ * in (`createDispatchSinks`' own `root`). Forwarded to `buildGhShimSettingsEnv` so it can ALSO write the same
+ * PATH override into `<cwd>/.claude/settings.local.json`, the durable delivery path proven to reach a session
+ * even when the CLI's own background-daemon pool serves the dispatch from an already-running "spare" and
+ * silently drops `--settings`'s env (see `gh-app-shim.mjs`'s module header for the live evidence).
+ * @param {string} [cwd]
  * @returns {Record<string,string>|null}
  */
-export function resolveGhShimSettingsEnv() {
-  try { return buildGhShimSettingsEnv(); } catch { return null; }
+export function resolveGhShimSettingsEnv(cwd) {
+  try { return buildGhShimSettingsEnv({ cwd }); } catch { return null; }
 }
 
 export function buildAgentArgv({ sessionId, payload, extraArgs = [], systemPromptFile = null, resumeSessionId = null, settingsEnv = null }) {

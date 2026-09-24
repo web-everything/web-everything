@@ -40,5 +40,5 @@ a bulk merge of the branch and never a direct push to `main`.
   live overlays
   ([#resident-daemon-reload-lifecycle](../docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle)
   clause 5). Done-when 2 is met by that ruling (clause 4(a) amended, for overlays rather than POC tracking). The
-  wind-down is x8kenvp: the pass-daemon commit graduates via xdpemd4, the POC-mode commit `69b2ec0cc` is dropped
-  as superseded by xlqampw, then the registry entry is removed and this epic resolves.
+  wind-down is 4042: the pass-daemon commit graduates via 3998, the POC-mode commit `69b2ec0cc` is dropped
+  as superseded by 4002, then the registry entry is removed and this epic resolves.

@@ -99,6 +99,12 @@ import { isDelegationTripleGraduated } from './conveyor/delegation-trial-gate.mj
 import { readStore } from './conveyor/run-scorecard-store.mjs';
 import { logDelegationTrial } from './conveyor/log-delegation-trial.mjs';
 import { createGhProvider, writeOrder } from './lib/review-label-provider.mjs';
+// #x01u7az — the advisory:* label pair `clear-human` must strip: an advisory only means something on a
+// `review:human` PR (its own header), so a gate-self clearance that drops `review:human` must drop whichever
+// advisory label is still riding along, or the label reads as if an independent advisory endorsed a head
+// nobody re-ran it against. Also read by `decideSetLabel`'s `rearm` branch to keep the "at most one review:*
+// hold" invariant enforceable from ONE imported constant rather than a re-typed literal.
+import { ADVISORY_LABELS } from './lib/advisory-labels.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 // #3631 slice — the LAST bare `execFileSync` in this file's own gh-adjacent write path. This exec closure is
 // `computeNetDiffText`'s injected exec, and today it is only ever invoked with `cmd==='git'` (a fetch/diff/
@@ -235,7 +241,16 @@ export function decideSetLabel({ to, currentLabels = [], findingCount = null, re
       // the SAME head — `accepted` deliberately does NOT strip it, or the two verdicts could never coexist; see
       // gate-invariants.test.mjs INVARIANT 14/15). `clear-human` instead clears an EXPLICIT hold, like a bounce,
       // so the same "needs fresh eyes" posture applies.
-      removeLabels: [REVIEW_LABELS.human, REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted],
+      // #x01u7az — an `advisory:*` label only ever means "the independent advisory ran on a review:human PR"
+      // (`we:scripts/lib/advisory-labels.mjs`'s own header). The moment `review:human` comes off, that context is
+      // gone, so any advisory label still on the PR is stale by construction — never re-derived from a stale head
+      // comparison, just dropped alongside the gate it was scoped to. Live bug (PR #2578, 2026-09-24): a
+      // `clear-human` at 13:38:11Z left `advisory:accepted` (stamped 13:29:54Z, while still `review:human`) sitting
+      // on the PR through three more review rounds with no `review:human` left to explain it.
+      removeLabels: [
+        REVIEW_LABELS.human, REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted,
+        ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES,
+      ],
       keepsHuman: false,
       reason: 'gate-self CLEARED via --to=clear-human — review:human dropped, review:accepted added; drain may merge',
     };
@@ -258,17 +273,27 @@ export function decideSetLabel({ to, currentLabels = [], findingCount = null, re
     }
     return {
       allowed: true,
-      addLabel: REVIEW_LABELS.pending,
-      // #2832 — re-arm applies a review-hold (review:pending), so it must atomically strip ready-to-merge: a
-      // held PR may never carry the go-ahead. `presentRemoveLabels` narrows this to the labels the PR actually
-      // carries, so naming ready-to-merge here is a no-op when it is absent.
+      // #x01u7az — INVARIANT: at most ONE review:* HOLD label live at a time. `review:human` IS the hold on a
+      // gate-self PR; `review:pending` is the hold on an ordinary one. Before this fix, re-arming a
+      // `review:human` bounce added `review:pending` UNCONDITIONALLY, alongside the human hold that never came
+      // off — the contradictory pair live on PR #2549 (2026-09-24): `review:pending` added 14:05:09Z by this
+      // exact rearm path, on top of a `review:human` set 01:32:17Z and never cleared. A `review:human` PR is
+      // ALREADY held; adding `review:pending` on top asserts a second, redundant hold and reads as "still
+      // pending" to anything that doesn't know to check both. Only add `review:pending` when the PR is NOT
+      // gate-self — the human hold on its own already says "an independent review is owed", so a rearm on a
+      // `review:human` PR adds nothing.
+      addLabel: isHuman ? '' : REVIEW_LABELS.pending,
+      // #2832 — re-arm applies a review-hold (review:pending, or review:human alone), so it must atomically
+      // strip ready-to-merge: a held PR may never carry the go-ahead. `presentRemoveLabels` narrows this to the
+      // labels the PR actually carries, so naming ready-to-merge here is a no-op when it is absent.
       // #2412 review-fix — a re-arm hands a repaired bounce back for a fresh, independent re-review (the #2630
       // invariant this function enforces); same reasoning as the `changes` branch below applies to any stale
       // `redteam:accepted` the PR still carries from before the fix.
       removeLabels: [REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL],
       keepsHuman: isHuman,
       reason: isHuman
-        ? 're-armed — review:changes→review:pending; review:human KEPT (gate-self stays human-ceremony-only)'
+        ? 're-armed — review:human KEPT as the sole hold (gate-self stays human-ceremony-only); review:pending '
+          + 'NOT added — the human hold already says an independent review is owed (#x01u7az)'
         : 're-armed — review:changes→review:pending; drain AI-review (or a human) re-verdicts',
     };
   }

@@ -19,13 +19,14 @@ import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
-  decideSelfSync, selfSyncCheckout, withSelfSync, readHeadSha,
+  decideSelfSync, selfSyncCheckout, withSelfSync, readHeadSha, readOriginRefSha,
   decideTickLockGate, decideMoveLockGate,
   acquireCloneTickLock, releaseCloneTickLock, acquireCloneMoveLock, releaseCloneMoveLock,
   DAEMON_SELF_SYNC_BRANCH_ENV, resolvePocSyncBranch, decidePocSelfSync, selfSyncCheckoutPoc,
   isSafeBranchName,
 } from '../daemon-self-sync.mjs';
 import { assertMainNotStale, isStaleMainRefusalMessage } from '../main-staleness.mjs';
+import { SMOKE_KILL_SWITCH_ENV } from '../daemon-live-smoke.mjs';
 
 /** Trivial always-ok lock fakes for suites that exercise `selfSyncCheckout`/`withSelfSync` behavior UNRELATED
  *  to the new per-clone lock (they never touch the fs for it). */
@@ -161,9 +162,19 @@ describe('selfSyncCheckout — injected git', () => {
 });
 
 describe('withSelfSync — restart INSTEAD of ticking when new code arrived', () => {
+  // The live-smoke gate (#3383) sits between a merge and `onRestart` — these tests are about the
+  // restart-vs-tick DECISION, not the gate itself (that's `withSelfSync — live smoke gate (#3383)` below), so
+  // they inject a passing `gate` + a fake `readOriginRef` (no real git call against a mocked root that isn't a
+  // real repo) to keep exercising exactly what they always did.
+  const passingGate = vi.fn(async () => ({ adopt: true, reason: 'test-gate-pass' }));
+  const fakeReadOriginRef = () => 'origin-sha';
+
   it('merged → onRestart runs, the tick does not', async () => {
     const tick = vi.fn(); const onRestart = vi.fn(() => 'restarted');
-    const w = withSelfSync({ tickOnce: tick }, { root: '/x', onRestart, sync: () => ({ merged: true, commits: 4, reason: 'merged' }), log: { error: vi.fn() } });
+    const w = withSelfSync({ tickOnce: tick }, {
+      root: '/x', onRestart, sync: () => ({ merged: true, commits: 4, reason: 'merged' }), log: { error: vi.fn() },
+      gate: passingGate, readOriginRef: fakeReadOriginRef,
+    });
     await expect(w.tickOnce()).resolves.toBe('restarted');
     expect(tick).not.toHaveBeenCalled();
   });
@@ -237,6 +248,85 @@ describe('withSelfSync — restart INSTEAD of ticking when new code arrived', ()
   });
 });
 
+// #3383 — THE LIVE SMOKE GATE. Sits between a merge landing and `onRestart` on the DEFAULT path only (POC mode
+// is untouched, same scoping rule bugs 1/2 use — see the file header). `gate`/`readOriginRef` are injectable
+// (parallel to `sync`/`readHead`) exactly so these wiring tests never need a real lane-pool/gh/reconcile-pass
+// child process; the real behavior of `we:scripts/lib/daemon-live-smoke.mjs#gateMergedCommit` itself is proven
+// in that file's own test suite, and the LIVE (real child processes, real lane, real gh) proof is a separate,
+// deliberately-run script (see the PR body), not a vitest case.
+describe('withSelfSync — live smoke gate (#3383)', () => {
+  it('gate adopts → onRestart runs, exactly like before this fix', async () => {
+    const onRestart = vi.fn(() => 'restarted');
+    const w = withSelfSync({ tickOnce: vi.fn() }, {
+      root: '/x', onRestart, sync: () => ({ merged: true, commits: 2, reason: 'merged' }),
+      gate: async () => ({ adopt: true, reason: 'smoke-pass' }), readOriginRef: () => 'origin-sha', log: { error: vi.fn() },
+    });
+    await expect(w.tickOnce()).resolves.toBe('restarted');
+    expect(onRestart).toHaveBeenCalledTimes(1);
+  });
+
+  it('gate rejects → onRestart is NOT called; the tick runs instead, as if nothing had merged', async () => {
+    const tick = vi.fn(() => 'ticked');
+    const onRestart = vi.fn();
+    const log = { error: vi.fn() };
+    const w = withSelfSync({ tickOnce: tick }, {
+      root: '/x', onRestart, sync: () => ({ merged: true, commits: 2, reason: 'merged' }),
+      gate: async () => ({ adopt: false, reason: 'smoke-fail' }), readOriginRef: () => 'origin-sha', log, ...NOOP_TICK_LOCK,
+    });
+    await expect(w.tickOnce()).resolves.toBe('ticked');
+    expect(onRestart).not.toHaveBeenCalled();
+    expect(tick).toHaveBeenCalledTimes(1);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('LIVE SMOKE GATE rejected'));
+  });
+
+  it('the gate is called with the pre-merge HEAD (rollback target) and the merged origin sha (reject-cache identity)', async () => {
+    const gate = vi.fn(async () => ({ adopt: true, reason: 'ok' }));
+    const readHead = vi.fn(() => 'pre-sha');
+    const readOriginRef = vi.fn(() => 'origin-sha-123');
+    const w = withSelfSync({ tickOnce: vi.fn() }, {
+      root: '/the/clone', onRestart: vi.fn(), sync: () => ({ merged: true, commits: 1, reason: 'merged' }),
+      gate, readHead, readOriginRef, log: { error: vi.fn() },
+    });
+    await w.tickOnce();
+    expect(gate).toHaveBeenCalledWith(expect.objectContaining({ root: '/the/clone', preMergeSha: 'pre-sha', mergedIdentitySha: 'origin-sha-123' }));
+    expect(readOriginRef).toHaveBeenCalledWith(expect.objectContaining({ root: '/the/clone', ref: 'origin/main' }));
+  });
+
+  it('a not-merged tick never calls the gate at all', async () => {
+    const gate = vi.fn();
+    const w = withSelfSync({ tickOnce: () => 'ticked' }, {
+      root: '/x', onRestart: vi.fn(), sync: () => ({ merged: false, commits: 0, reason: 'up-to-date' }), gate, ...NOOP_TICK_LOCK,
+    });
+    await w.tickOnce();
+    expect(gate).not.toHaveBeenCalled();
+  });
+
+  it('the REAL default gate (kill switch on) wires straight to daemon-live-smoke.mjs, no injection needed', async () => {
+    // The kill switch short-circuits BEFORE any child process ever runs (see gateMergedCommit), so this proves
+    // the default `gate`/`readOriginRef` params really are the real module's exports, with zero flakiness risk
+    // (the one real subprocess this exercises, readOriginRefSha's own `git rev-parse`, fails fast and harmlessly
+    // against the non-existent '/x' — exactly like readHeadSha already does elsewhere in this file).
+    const onRestart = vi.fn(() => 'restarted');
+    const w = withSelfSync({ tickOnce: vi.fn() }, {
+      root: '/x', onRestart, sync: () => ({ merged: true, commits: 1, reason: 'merged' }),
+      env: { [SMOKE_KILL_SWITCH_ENV]: '1' }, log: { error: vi.fn() },
+    });
+    await expect(w.tickOnce()).resolves.toBe('restarted');
+  });
+});
+
+describe('readOriginRefSha — injected git', () => {
+  it('reads a ref sha', () => {
+    const run = vi.fn(() => ({ status: 0, stdout: 'deadbeef\n' }));
+    expect(readOriginRefSha({ root: '/x', ref: 'origin/main', run })).toBe('deadbeef');
+    expect(run).toHaveBeenCalledWith(['rev-parse', 'origin/main'], expect.objectContaining({ cwd: '/x', timeout: 60_000, killSignal: 'SIGKILL' }));
+  });
+  it('a failed/timed-out read is null, never a guess', () => {
+    expect(readOriginRefSha({ root: '/x', ref: 'origin/main', run: () => ({ status: 1, stdout: '' }) })).toBeNull();
+    expect(readOriginRefSha({ root: '/x', ref: 'origin/main', run: () => ({ status: null, stdout: '' }) })).toBeNull();
+  });
+});
+
 // #3383 bug 1 — a tick that ITSELF hit the stale-main refusal (origin/main moved AFTER this tick-start sync,
 // mid-tick, across a multi-repo loop) wasted the affected repo(s) this pass. Re-sync IMMEDIATELY when that
 // happens, rather than let the daemon sleep the full interval and lose the SAME race again next tick.
@@ -283,7 +373,9 @@ describe('withSelfSync — restarts on ANY HEAD drift since boot, not only its o
   it('HEAD moved (a sibling process merged first) → restarts even though THIS process\'s own sync found nothing to merge', async () => {
     const onRestart = vi.fn(() => 'restarted');
     const tick = vi.fn();
-    const readHead = vi.fn().mockReturnValueOnce('sha-boot').mockReturnValueOnce('sha-after-sibling-merge');
+    // Call order: boot read (outside tickOnce) → this tick's preMergeSha read (the live-smoke gate's rollback
+    // target, read before every `sync()` call, whether or not it ends up merging) → the bug-2 headNow read.
+    const readHead = vi.fn().mockReturnValueOnce('sha-boot').mockReturnValueOnce('sha-boot').mockReturnValueOnce('sha-after-sibling-merge');
     const w = withSelfSync({ tickOnce: tick }, {
       root: '/x', onRestart, sync: () => ({ merged: false, commits: 0, reason: 'up-to-date' }),
       readHead, log: { error: vi.fn() },
@@ -316,6 +408,7 @@ describe('withSelfSync — restarts on ANY HEAD drift since boot, not only its o
     const readHead = vi.fn(() => 'irrelevant'); // merged branch returns before HEAD drift is ever checked
     const w = withSelfSync({ tickOnce: vi.fn() }, {
       root: '/x', onRestart, sync: () => ({ merged: true, commits: 3, reason: 'merged' }), readHead,
+      gate: async () => ({ adopt: true, reason: 'test-gate-pass' }), readOriginRef: () => 'origin-sha',
     });
     await expect(w.tickOnce()).resolves.toBe('restarted');
   });
@@ -643,8 +736,18 @@ describe('withSelfSync — REAL git, two processes sharing one clone (#3383 bug 
     const tickFixDaemon = vi.fn(() => 'fix-ticked');
     const onRestartReview = vi.fn(() => 'review-restarted');
     const onRestartFix = vi.fn(() => 'fix-restarted');
-    const reviewDaemon = withSelfSync({ tickOnce: tickReviewDaemon }, { root: shared, onRestart: onRestartReview, log: { error: vi.fn() }, ...realLockOpts(join(dir, '.locks')) });
-    const fixDaemon = withSelfSync({ tickOnce: tickFixDaemon }, { root: shared, onRestart: onRestartFix, log: { error: vi.fn() }, ...realLockOpts(join(dir, '.locks')) });
+    // The live-smoke gate (#3383) would otherwise run REAL child processes (lane-pool, gh, reconcile-pass)
+    // against this bare temp repo, which has none of that tooling — inject a passing gate + a fake
+    // readOriginRef so this test keeps proving the bug-2 restart decision, not the gate itself.
+    const passingGate = async () => ({ adopt: true, reason: 'test-gate-pass' });
+    const reviewDaemon = withSelfSync({ tickOnce: tickReviewDaemon }, {
+      root: shared, onRestart: onRestartReview, log: { error: vi.fn() }, gate: passingGate, readOriginRef: () => 'origin-sha',
+      ...realLockOpts(join(dir, '.locks')),
+    });
+    const fixDaemon = withSelfSync({ tickOnce: tickFixDaemon }, {
+      root: shared, onRestart: onRestartFix, log: { error: vi.fn() }, gate: passingGate, readOriginRef: () => 'origin-sha',
+      ...realLockOpts(join(dir, '.locks')),
+    });
 
     // main moves (a drain lands a PR) — the ordinary trigger for a self-sync.
     commit(up, 'b.txt', 'two\n');

@@ -5,7 +5,7 @@ size: 5
 parent: "3443"
 status: open
 blockedBy: ["3895"]
-scope: ["we:scripts/lib/gh-throttle.mjs", "we:scripts/lib/__tests__/gh-throttle.test.mjs", "we:scripts/lib/forge-land-provider.mjs", "we:scripts/lib/__tests__/forge-land-provider.test.mjs", "we:scripts/pr-land.mjs", "we:scripts/__tests__/pr-land.test.mjs", "we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs", "we:scripts/operations/host-process-sample.mjs", "we:scripts/operations/__tests__/host-process-sample.test.mjs"]
+scope: ["we:scripts/lib/gh-throttle.mjs", "we:scripts/lib/__tests__/gh-throttle.test.mjs", "we:scripts/lib/forge-land-provider.mjs", "we:scripts/lib/__tests__/forge-land-provider.test.mjs", "we:scripts/pr-land.mjs", "we:scripts/__tests__/pr-land.test.mjs", "we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs", "we:scripts/operations/host-process-sample.mjs", "we:scripts/operations/__tests__/host-process-sample.test.mjs", "we:scripts/operations/__tests__/telemetry.test.mjs"]
 dateOpened: "2026-09-22"
 tags: []
 ---
@@ -16,7 +16,7 @@ Ports we:scripts/lib/gh-throttle.mjs, we:scripts/lib/forge-land-provider.mjs, we
 
 ## Done when
 
-1. **Executable** — `npx vitest run we:scripts/lib/__tests__/gh-throttle.test.mjs we:scripts/lib/__tests__/forge-land-provider.test.mjs we:scripts/__tests__/pr-land.test.mjs we:scripts/conveyor/__tests__/lease-reaper.test.mjs we:scripts/operations/__tests__/host-process-sample.test.mjs` passes on main's tree (all of this slice's tests; each fails before the port because its module is missing or differs).
+1. **Executable** — `npx vitest run we:scripts/lib/__tests__/gh-throttle.test.mjs we:scripts/lib/__tests__/forge-land-provider.test.mjs we:scripts/__tests__/pr-land.test.mjs we:scripts/conveyor/__tests__/lease-reaper.test.mjs we:scripts/operations/__tests__/host-process-sample.test.mjs we:scripts/operations/__tests__/telemetry.test.mjs` passes on main's tree (all of this slice's tests; each fails before the port because its module is missing or differs).
 2. **Executable** — `npm run check:standards` reports 0 errors, and the PR's required `test` and `smoke` checks are green.
 3. **Faithful port** — for each ported file, `git diff 600acc14f -- <file>` (prototype snapshot vs main after the port) shows only main's own later changes kept by the merge notes, never a behaviour change of the branch code; runtime data files (e.g. `we:scripts/conveyor/run-scorecards.json`) are never edited.
 
@@ -49,3 +49,9 @@ Ports we:scripts/lib/gh-throttle.mjs, we:scripts/lib/forge-land-provider.mjs, we
 - `we:scripts/pr-land.mjs` — clean direct 3-way (main `d622b4d80` `admittedArgv`, `497de6f49`, `f48582572`).
 - `we:scripts/conveyor/lease-reaper.mjs` + test — clean direct 3-way (main `f211888d0` multi-repo).
 - `we:scripts/lib/forge-land-provider.mjs` (+test), `we:scripts/__tests__/pr-land.test.mjs`, `we:scripts/operations/host-process-sample.mjs` (+test) — main untouched / new; apply as-is.
+
+**Moved here from #3895 (2026-09-24, at #3895 land time):** `we:scripts/operations/__tests__/telemetry.test.mjs` — it statically imports `we:scripts/operations/host-process-sample.mjs`, this card's own scope, so it cannot load until this slice ports that file. #3895 ported `we:scripts/operations/telemetry.mjs` and `we:scripts/operations/telemetry-store.mjs` (which this test also exercises) without it; both were confirmed untouched by main since the merge base and are byte-identical to the branch snapshot.
+
+## Graduation import check
+
+- 2026-09-24: graduation-import-check moved `we:scripts/operations/__tests__/telemetry.test.mjs` here from #3895 — it imports a module this card owns.

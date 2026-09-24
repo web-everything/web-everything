@@ -20,3 +20,8 @@ The operator wants a rolling 24h view of how well the mechanical conveyor fills 
 ## Done when
 
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
+
+## Additions from 2026-09-24 incident review
+
+- **Per-daemon throughput, not only pool totals.** Drain slowness on 2026-09-24 could not be told apart from "nothing ready to land". Add, per daemon over the rolling window: items handled per hour (reviews finished, fixes pushed, PRs landed) and the median wait in its input state (for the drain: time from `ready-to-merge` to merged). A drop in throughput while its input queue grows is the stall signal #4045 alerts on.
+- **Placement has moved.** When this card was filed the answer was a standalone Artifact. Since then the operator's surfaces are plateau /wip and /telemetry (#3943). Put the history in the telemetry store and show the trends on /telemetry, and a one-line "now" figure per daemon on /wip, instead of a third page.

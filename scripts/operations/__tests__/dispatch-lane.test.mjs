@@ -83,6 +83,8 @@ import {
   resumeSucceeded,
   // #3637 — the POC delivery target.
   resolveDeliveryBase,
+  // #x8mpubm follow-up — the spawn-env credential hygiene.
+  defaultSpawnAgent,
 } from '../dispatch-lane-io.mjs';
 // #3960 — the repo-aware brief quintet.
 import { briefTokensForRepo } from '../../lib/repo-profile.mjs';
@@ -708,6 +710,9 @@ describe('the declared effect is a dispatch', () => {
     });
     await applyPendingEffects(run, { sinks, store });
     expect(resolveSettingsEnv).toHaveBeenCalledTimes(1);
+    // #x8mpubm follow-up — called WITH the dispatch's own root, so the durable settings.local.json delivery
+    // path (gh-app-shim.mjs#ensureSettingsFileEnv) knows which checkout to write into.
+    expect(resolveSettingsEnv).toHaveBeenCalledWith(PRIMARY);
     expect(seenArgv).toContain('--settings');
     expect(seenArgv[seenArgv.indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { PATH: '/shim:/usr/bin' } }));
   });
@@ -724,6 +729,39 @@ describe('the declared effect is a dispatch', () => {
     });
     await applyPendingEffects(run, { sinks, store });
     expect(seenArgv).not.toContain('--settings');
+  });
+
+  it('#x8mpubm follow-up — defaultSpawnAgent strips GH_TOKEN/GITHUB_TOKEN from the exec env, never lets them leak into the claude front-end invocation', () => {
+    let seenOpts = null;
+    const exec = (cmd, args, opts) => { seenOpts = opts; return ''; };
+    const priorEnv = process.env;
+    try {
+      process.env = { ...priorEnv, GH_TOKEN: 'ghs_daemon_own_token', GITHUB_TOKEN: 'also_should_go', OTHER_VAR: 'kept' };
+      defaultSpawnAgent(['--bg'], {}, { exec });
+    } finally {
+      process.env = priorEnv;
+    }
+    expect(seenOpts.env).toBeDefined();
+    expect(seenOpts.env.GH_TOKEN).toBeUndefined();
+    expect(seenOpts.env.GITHUB_TOKEN).toBeUndefined();
+    expect(seenOpts.env.OTHER_VAR).toBe('kept'); // everything else still passes through
+  });
+
+  it('PR #2600 review:changes — a caller-supplied opts.env is SANITIZED too, never allowed to replace the stripped env', () => {
+    // The exact shape `deliver-item-wrapper.mjs` passes: `env: { ...process.env, ...deliveryEnv }`.
+    let seenOpts = null;
+    const exec = (cmd, args, opts) => { seenOpts = opts; return ''; };
+    defaultSpawnAgent(['--bg'], { env: { GH_TOKEN: 'ghs_daemon_own_token', GITHUB_TOKEN: 'x', DELIVERY_VAR: 'kept' } }, { exec });
+    expect(seenOpts.env.GH_TOKEN).toBeUndefined();
+    expect(seenOpts.env.GITHUB_TOKEN).toBeUndefined();
+    expect(seenOpts.env.DELIVERY_VAR).toBe('kept'); // the caller's own env is still what the child gets
+  });
+
+  it('#x8mpubm follow-up — an explicit opts.cwd from the caller is preserved alongside the stripped env', () => {
+    let seenOpts = null;
+    const exec = (cmd, args, opts) => { seenOpts = opts; return ''; };
+    defaultSpawnAgent(['--bg'], { cwd: '/some/lane' }, { exec });
+    expect(seenOpts.cwd).toBe('/some/lane');
   });
 });
 

@@ -869,6 +869,102 @@ describe('case 5h — real chalbert/web-everything#2549 shape (measured 2026-09-
   });
 });
 
+describe('case 5i — STACKED-BASE CONFLICT dispatch, a `conflicted` PR whose base is not `main` (#3383)', () => {
+  // `chalbert/web-everything#2578`, shape measured live 2026-09-24: `review:accepted` (no `review:changes`, no
+  // `review:human`), `mergeStateStatus: DIRTY`/`mergeable: CONFLICTING` (`classifyPr` reads `conflicted`), base
+  // `lane/3681-ratify-daemon-lifecycle` — stacked on PR #2549, NOT `main`. BEFORE this branch existed,
+  // `runReconcilePass({repo:'chalbert/web-everything'})` refused this `owed-elsewhere` ("the branch needs a
+  // rebase before it can merge"), a rebase the drain will never perform for a non-default-base PR
+  // (`#poc-branch-declared-delivery-mode` clause 5) — a genuine stacked-PR gap no daemon closed.
+  const prStacked = (over = {}) => pr1563({
+    number: 2578,
+    labels: lbl('review:accepted', 'checking', 'review-round:2', 'merge-status:conflicting', 'advisory:accepted'),
+    mergeStateStatus: 'DIRTY',
+    baseRefName: 'lane/3681-ratify-daemon-lifecycle',
+    comments: [],
+    ...over,
+  });
+
+  it('a stacked, conflicted PR with zero prior conflict-fix rounds is dispatched `fix` (mode stacked-rebase), never `owed-elsewhere`', () => {
+    const plan = planReconcile({ prs: [prStacked()], agents: [], now: NOW });
+    expect(plan.refusals).toEqual([]);
+    expect(plan.dispatch).toEqual([expect.objectContaining({
+      kind: 'fix', prNumber: 2578, isConflict: true, mode: 'stacked-rebase',
+      baseRefName: 'lane/3681-ratify-daemon-lifecycle', attempts: 0, cap: CONFLICT_FIX_ROUND_CAP,
+    })]);
+  });
+
+  it('review:accepted rides through UNCHANGED on the dispatch row — this population is never bounced first', () => {
+    const plan = planReconcile({ prs: [prStacked()], agents: [], now: NOW });
+    expect(plan.dispatch[0].labels).toContain('review:accepted');
+  });
+
+  it('shares the SAME durable conflict-fix cap/marker PR #2579 added — never a fourth counter', () => {
+    const comments = Array.from({ length: CONFLICT_FIX_ROUND_CAP - 1 }, () => ({ body: CONFLICT_FIX_COMMENT_MARKER }));
+    const plan = planReconcile({ prs: [prStacked({ comments })], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'stacked-rebase', attempts: CONFLICT_FIX_ROUND_CAP - 1 })]);
+  });
+
+  it(`AT the cap (${CONFLICT_FIX_ROUND_CAP} durable conflict-fix comments) the PR is refused \`cap-exhausted\`, capKind \`conflict-fix\` — never \`owed-elsewhere\``, () => {
+    const comments = Array.from({ length: CONFLICT_FIX_ROUND_CAP }, () => ({ body: CONFLICT_FIX_COMMENT_MARKER }));
+    const plan = planReconcile({ prs: [prStacked({ comments })], agents: [], now: NOW });
+    expect(plan.dispatch).toHaveLength(0);
+    expect(plan.refusals).toEqual([expect.objectContaining({
+      kind: 'cap-exhausted', prNumber: 2578, attempts: CONFLICT_FIX_ROUND_CAP, cap: CONFLICT_FIX_ROUND_CAP, capKind: 'conflict-fix',
+    })]);
+  });
+
+  it('a caller-supplied `conflictFixCap` overrides the default here too', () => {
+    const plan = planReconcile({ prs: [prStacked({ comments: [{ body: CONFLICT_FIX_COMMENT_MARKER }] })], agents: [], now: NOW, conflictFixCap: 1 });
+    expect(plan.dispatch).toHaveLength(0);
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'cap-exhausted', cap: 1, capKind: 'conflict-fix' })]);
+  });
+
+  it('REGRESSION — a `conflicted` PR whose base IS `main` (or unknown) is UNCHANGED: still `owed-elsewhere`', () => {
+    const planMainBase = planReconcile({ prs: [prStacked({ baseRefName: 'main' })], agents: [], now: NOW });
+    expect(planMainBase.dispatch).toHaveLength(0);
+    expect(planMainBase.refusals).toEqual([expect.objectContaining({ kind: 'owed-elsewhere', prNumber: 2578 })]);
+
+    const planNoBase = planReconcile({ prs: [prStacked({ baseRefName: undefined })], agents: [], now: NOW });
+    expect(planNoBase.dispatch).toHaveLength(0);
+    expect(planNoBase.refusals).toEqual([expect.objectContaining({ kind: 'owed-elsewhere', prNumber: 2578 })]);
+  });
+
+  it('REGRESSION — the normal retarget path (GitHub flips `baseRefName` to `main` once the stacked base merges) falls straight through to the ordinary path, unaffected', () => {
+    // Simulates the PR's base branch merging into `main` and GitHub retargeting the PR — from this pass's own
+    // point of view that is INDISTINGUISHABLE from an ordinary main-base conflict, which is exactly the point:
+    // no special-casing was needed for this transition.
+    const retargeted = prStacked({ baseRefName: 'main' });
+    const plan = planReconcile({ prs: [retargeted], agents: [], now: NOW });
+    expect(plan.dispatch).toHaveLength(0);
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'owed-elsewhere', why: 'the branch needs a rebase before it can merge' })]);
+  });
+
+  it('a caller-supplied `defaultBranch` overrides `main` — a PR based on the repo\'s ACTUAL default is not "stacked"', () => {
+    const plan = planReconcile({ prs: [prStacked({ baseRefName: 'trunk' })], agents: [], now: NOW, defaultBranch: 'trunk' });
+    expect(plan.dispatch).toHaveLength(0);
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'owed-elsewhere', prNumber: 2578 })]);
+  });
+
+  it('never fires for a non-`conflicted` phase — a stacked, BOUNCED PR is handled by the existing conflict-fix branch instead', () => {
+    const bounced = pr1563({
+      number: 2579,
+      labels: lbl('review:changes', 'merge-status:conflicting'),
+      mergeStateStatus: 'DIRTY',
+      baseRefName: 'lane/some-other-base',
+      comments: [finding()],
+    });
+    const plan = planReconcile({ prs: [bounced], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', isConflict: true, prNumber: 2579 })]);
+    expect(plan.dispatch[0].mode).not.toBe('stacked-rebase'); // the ordinary `isConflictBounce` branch owns this row
+  });
+
+  it('every row carries `baseRefName` as evidence, dispatch and refusal alike', () => {
+    const plan = planReconcile({ prs: [prStacked()], agents: [], now: NOW });
+    expect(plan.dispatch[0].baseRefName).toBe('lane/3681-ratify-daemon-lifecycle');
+  });
+});
+
 // ── CASE 6 — THE ARGV, PINNED ─────────────────────────────────────────────────────────────────────────────────
 //
 // The one thing fixtures cannot prove. A wrong discovery query does not throw — it returns nothing, and nothing

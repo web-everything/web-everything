@@ -70,6 +70,28 @@ export const LANE_RELEASE_LITTER_ALLOWLIST = [
   // ONLY dirty content. One prefix pattern (not one entry per extension/round) since the round number and
   // extension both vary and `[^/]*` already matches across dots within a path segment.
   '.converge-*',
+  // #x01u7az — live-observed 2026-09-24 on the web-everything pool: `.conveyor/` (the session sidecar
+  // `we:scripts/conveyor/infra-blocked.mjs`'s own header describes — a per-clone, GITIGNORED directory of
+  // operational state: `queue.json`, `infra-blocked.json`, `run-scorecards.json`, lock files, `.log`s) was the
+  // ONLY dirty entry on roughly two dozen of the ~90-lane pool at once, none of them holding a live lease —
+  // `git status --porcelain` reports a wholly-untracked directory as one `?? .conveyor/` line, which none of
+  // the file-shaped patterns above (`[^/]*` never crosses the trailing `/`) could ever match. That falsely
+  // "dirty" majority is what starved `we:scripts/lane-pool.mjs acquire --purpose=review-loop`: seven straight
+  // `review-2582` dispatches over more than an hour each read "no free lane … (N all held/dirty)" and reported
+  // `blocked-on-infra` with no advisory ever posted, while the pool's real free capacity sat locked behind
+  // nothing but this directory. Safe to allowlist: every concrete path this repo's own `.gitignore` names under
+  // `.conveyor/` is generated, regenerable session state, never product content, and a genuinely-leased lane's
+  // `.conveyor/` is never reachable here at all — `isLeasedNow` (this module's own knob) still refuses to touch
+  // a lane a live occupant is standing in, on this path exactly as on every other. `git clean -f` (no `-d`) on
+  // an explicit directory pathspec DOES remove it when every entry beneath is untracked (verified against this
+  // repo's own git before relying on it) — so `cleanLaneLitter`'s existing removal call needs no change, only
+  // the allowlist did.
+  '.conveyor/',
+  // #x01u7az — same live incident: two lanes' only dirty entries were `.delivery-commit-msg-build.txt` /
+  // `.delivery-commit-msg-gate-fix.txt` — a `.delivery-`-prefixed sibling of the already-allowlisted
+  // `.commit-msg-fix-*.txt` / `commit-msg-fix-*.txt` family above, one more naming drift of the exact scratch
+  // shape #3568 already vetted, not a new kind of file.
+  '.delivery-commit-msg-*.txt',
 ];
 
 /**

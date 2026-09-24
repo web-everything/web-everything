@@ -242,7 +242,7 @@ describe('defaultListParkedPrs — argv shape (exec injected, no real gh call)',
     const exec = (cmd, argv) => { capturedArgv = argv; return '[]'; };
     defaultListParkedPrs({ exec });
     expect(capturedArgv).toEqual(['pr', 'list', '--state', 'open', '--limit', '200',
-      '--json', 'number,headRefName,mergeable,mergeStateStatus,labels,files']);
+      '--json', 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files']);
   });
 
   it('appends --repo when given', () => {
@@ -250,7 +250,7 @@ describe('defaultListParkedPrs — argv shape (exec injected, no real gh call)',
     const exec = (cmd, argv) => { capturedArgv = argv; return '[]'; };
     defaultListParkedPrs({ exec, repo: 'o/n' });
     expect(capturedArgv).toEqual(['pr', 'list', '--state', 'open', '--limit', '200',
-      '--json', 'number,headRefName,mergeable,mergeStateStatus,labels,files', '--repo', 'o/n']);
+      '--json', 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files', '--repo', 'o/n']);
   });
 });
 
@@ -1225,7 +1225,7 @@ import { prFileContract } from './pr-file-test-helpers.mjs';
 prFileContract({
   name: 'parked-pr-conflict-watch', load: () => import('../parked-pr-conflict-watch.mjs'),
   reader: 'defaultListParkedPrs', run: 'watchParkedPrConflicts',
-  fields: 'number,headRefName,mergeable,mergeStateStatus,labels,files',
+  fields: 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files',
 });
 
 
@@ -1286,6 +1286,59 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
     expect(r.routedTo).toBe('reconcile-finding (after drain grace)');
     expect(routed).toEqual([2514]);
     expect(provider.calls).toEqual([]); // no second label write, no second comment
+  });
+
+  // #3383 — a STACKED PR (base isn't `main`) is never landed by the drain, so grace-expiry must NEVER bounce it
+  // through `postFinding` (which strips `review:accepted`) — `reconcile-core.mjs`'s own STACKED-BASE CONFLICT
+  // branch owns the mechanical rebase instead. `chalbert/web-everything#2578`'s real shape.
+  it('already flagged, grace elapsed, but base is NOT main (stacked) → deferred to reconcile-core, no bounce', () => {
+    const provider = fakeProvider(); const routed = [];
+    const listPrs = () => [{
+      number: 2578, mergeable: 'CONFLICTING', baseRefName: 'lane/3681-ratify-daemon-lifecycle',
+      labels: L('review:accepted', CONFLICT_LABEL),
+    }];
+    const [r] = watchParkedPrConflicts({
+      repo: 'o/n', listPrs, provider, postFinding: (o) => routed.push(o.pr.number), postStandDown: () => routed.push('sd'),
+      labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1000, listPrFiles: () => { throw new Error('must not be called for a stacked PR'); },
+    });
+    expect(r.routedTo).toBe('deferred-to-reconcile (stacked base — see reconcile-core.mjs#3383, review labels untouched)');
+    expect(routed).toEqual([]); // never bounced, never stood down
+    expect(provider.calls).toEqual([]); // no label write, no comment
+  });
+
+  it('a stacked base is reported even in dry-run — never silent', () => {
+    const provider = fakeProvider();
+    const listPrs = () => [{
+      number: 2578, mergeable: 'CONFLICTING', baseRefName: 'lane/3681-ratify-daemon-lifecycle',
+      labels: L('review:accepted', CONFLICT_LABEL),
+    }];
+    const [r] = watchParkedPrConflicts({
+      repo: 'o/n', listPrs, provider, dryRun: true,
+      labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1000, listPrFiles: () => { throw new Error('must not be called'); },
+    });
+    expect(r.routedTo).toBe('deferred-to-reconcile (stacked base — see reconcile-core.mjs#3383, review labels untouched)');
+  });
+
+  it('a base of `main` (the ordinary case) is UNCHANGED — still bounces once grace elapses', () => {
+    const routed = [];
+    const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', CONFLICT_LABEL) }];
+    const [r] = watchParkedPrConflicts({
+      repo: 'o/n', listPrs, provider: fakeProvider(), postFinding: (o) => routed.push(o.pr.number), postStandDown: () => {},
+      labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1000, listPrFiles: () => [{ path: 'scripts/x.mjs' }],
+    });
+    expect(r.routedTo).toBe('reconcile-finding (after drain grace)');
+    expect(routed).toEqual([2514]);
+  });
+
+  it('a missing `baseRefName` (unknown) is UNCHANGED — still bounces, the safe pre-#3383 default', () => {
+    const routed = [];
+    const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', labels: L('review:accepted', CONFLICT_LABEL) }];
+    const [r] = watchParkedPrConflicts({
+      repo: 'o/n', listPrs, provider: fakeProvider(), postFinding: (o) => routed.push(o.pr.number), postStandDown: () => {},
+      labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1000, listPrFiles: () => [{ path: 'scripts/x.mjs' }],
+    });
+    expect(r.routedTo).toBe('reconcile-finding (after drain grace)');
+    expect(routed).toEqual([2514]);
   });
 
   // #3383 — dry-run used to bail out of the whole grace branch before computing anything (the SAME line that

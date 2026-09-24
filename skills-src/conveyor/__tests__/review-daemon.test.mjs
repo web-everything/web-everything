@@ -16,9 +16,21 @@ vi.mock('../../../scripts/conveyor/session-reaper.mjs', async (importOriginal) =
   return { ...actual, runSessionReaperPass: (...args) => runSessionReaperPassMock(...args) };
 });
 
+// #x01u7az — same reasoning: `runReviewTick`'s new `holdReconcile` default (`sweepReviewHoldLabels`) shells a
+// real `gh pr list` when not injected. Every `runReviewTick(...)` call below that omits `holdReconcile`
+// exercises this mock (a plain no-op), never a real `gh` call; the sweep's own real behavior is proven by its
+// OWN test file (scripts/conveyor/__tests__/review-hold-reconcile.test.mjs) and this daemon's wiring of it is
+// proven separately below (the dedicated `runReviewTick — the review-hold reconcile sweep` describe block,
+// which injects its own fake to assert the wiring).
+const sweepReviewHoldLabelsMock = vi.fn(() => []);
+vi.mock('../../../scripts/conveyor/review-hold-reconcile.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, sweepReviewHoldLabels: (...args) => sweepReviewHoldLabelsMock(...args) };
+});
+
 import {
   runDaemonLoop, runReviewTick, runReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
-  REVIEW_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS, defaultReapSessions, hasStaleMainRefusal,
+  REVIEW_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS, defaultReapSessions, hasStaleMainRefusal, defaultAcquirableLaneCount,
 } from '../review-daemon.mjs';
 import { planReviewDispatch } from '../../../scripts/operations/review-dispatch.mjs';
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
@@ -100,7 +112,10 @@ describe('runReviewTick — the per-tick sequence', () => {
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(dispatch).toHaveBeenCalledWith({ pr: 10, repo: 'chalbert/web-everything' });
     expect(tagRound).toHaveBeenCalledWith({ pr: 10, repo: expect.any(String), round: 2 }); // attempts+1
-    expect(out).toEqual({ reviewsOwed: 1, dispatched: [{ prNumber: 10, agentId: 'agent-10' }], failed: [], refusals: 0, reconcileError: null });
+    expect(out).toEqual({
+      reviewsOwed: 1, dispatched: [{ prNumber: 10, agentId: 'agent-10' }], failed: [], refusals: 0,
+      reconcileError: null, deferredForLanes: 0, holdReconcile: [], holdReconcileError: null,
+    });
   });
 
   it('a failed dispatch is isolated: no round tag, recorded in failed, does not stop the tick', () => {
@@ -161,6 +176,92 @@ describe('runReviewTick — the per-tick sequence', () => {
   });
 });
 
+describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, never by reviews owed alone', () => {
+  const owedPlan = (entries, refusals = []) => ({ dispatch: entries, refusals });
+  const reviewsPlan = (n) => owedPlan(Array.from({ length: n }, (_, i) => ({ kind: 'review', prNumber: 100 + i, attempts: 0 })));
+
+  it('defaults to unbounded (Infinity) when acquirableLanes is omitted — every pre-existing caller is unaffected', () => {
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const out = runReviewTick({ reconcile: () => reviewsPlan(5), dispatch, tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
+    expect(dispatch).toHaveBeenCalledTimes(5);
+    expect(out.dispatched).toHaveLength(5);
+    expect(out.deferredForLanes).toBe(0);
+  });
+
+  it('live incident shape (2026-09-24): 5 owed reviews, only 2 lanes acquirable → dispatches exactly 2, defers 3', () => {
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const acquirableLanes = vi.fn(() => 2);
+    const out = runReviewTick({
+      reconcile: () => reviewsPlan(5), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes,
+    });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(dispatch).toHaveBeenCalledWith({ pr: 100, repo: expect.any(String) });
+    expect(dispatch).toHaveBeenCalledWith({ pr: 101, repo: expect.any(String) });
+    expect(out.reviewsOwed).toBe(5); // still owed — a deferral is not a loss
+    expect(out.dispatched).toHaveLength(2);
+    expect(out.deferredForLanes).toBe(3);
+    expect(acquirableLanes).toHaveBeenCalledWith({ repo: expect.any(String) });
+  });
+
+  it('zero acquirable lanes → dispatches nothing this tick, defers everything, never throws', () => {
+    const dispatch = vi.fn();
+    const out = runReviewTick({
+      reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 0,
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(out.deferredForLanes).toBe(3);
+    expect(out.reviewsOwed).toBe(3);
+  });
+
+  it('more lanes acquirable than reviews owed → dispatches every owed review, defers none', () => {
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const out = runReviewTick({
+      reconcile: () => reviewsPlan(2), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 10,
+    });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(out.deferredForLanes).toBe(0);
+  });
+
+  it('a negative/garbage acquirableLanes read fails toward "dispatch nothing", never toward "dispatch more"', () => {
+    const dispatch = vi.fn();
+    const out = runReviewTick({
+      reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => -1,
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(out.deferredForLanes).toBe(3);
+  });
+
+  it('deferred reviews still feed statusCandidates (the whole owed list, not just what got dispatched)', () => {
+    const statusCandidates = vi.fn(() => []);
+    runReviewTick({
+      reconcile: () => reviewsPlan(4), dispatch: vi.fn(({ pr }) => ({ agentId: `agent-${pr}` })),
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates, acquirableLanes: () => 1,
+    });
+    expect(statusCandidates).toHaveBeenCalledTimes(1);
+    expect(statusCandidates.mock.calls[0][0]).toHaveLength(4); // all 4 owed reviews, not just the 1 dispatched
+  });
+});
+
+describe('runReviewTickAllRepos — #3383 bug 3: deferredForLanes aggregates across repos', () => {
+  it('sums each repo tick\'s own deferredForLanes into the combined total', () => {
+    const tick = vi.fn()
+      .mockReturnValueOnce({ reviewsOwed: 3, dispatched: [], failed: [], refusals: 0, reconcileError: null, deferredForLanes: 2 })
+      .mockReturnValueOnce({ reviewsOwed: 1, dispatched: [], failed: [], refusals: 0, reconcileError: null, deferredForLanes: 0 });
+    const out = runReviewTickAllRepos({ repos: ['chalbert/web-everything', 'chalbert/frontierui'], tick });
+    expect(out.deferredForLanes).toBe(2);
+  });
+});
+
+describe('defaultAcquirableLaneCount — wiring only (never a real lane-pool/git call in this test)', () => {
+  it('is exported as a function taking {repo}', () => {
+    expect(typeof defaultAcquirableLaneCount).toBe('function');
+  });
+});
+
 describe('runReviewTick — reconcile itself is isolated (regression, #xvzwiew live-caught 2026-09-23)', () => {
   // Live production evidence (`~/workspace/wev-review-daemon/.conveyor/review-daemon.log`):
   //   review-daemon: chalbert/frontierui#? failed (non-fatal): spawnSync claude ENOENT
@@ -181,7 +282,8 @@ describe('runReviewTick — reconcile itself is isolated (regression, #xvzwiew l
       .not.toThrow();
     const out = runReviewTick({ reconcile, dispatch, tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
     expect(out).toEqual({
-      reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, reconcileError: 'spawnSync claude ENOENT',
+      reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, reconcileError: 'spawnSync claude ENOENT', deferredForLanes: 0,
+      holdReconcile: [], holdReconcileError: null,
     });
     expect(dispatch).not.toHaveBeenCalled(); // reconcile crashed before any PR was identified
   });
@@ -219,6 +321,62 @@ describe('runReviewTick — real dispatchReview contract (regression, #3876 live
       dispatch, tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
     });
     expect(() => planReviewDispatch({ pr: 10, repo: capturedRepo })).not.toThrow();
+  });
+});
+
+// #x01u7az — the review-hold reconcile sweep (a stray review:pending beside a live review:human; a stray
+// advisory:* once review:human is cleared) is wired into THIS daemon, not only into we:skills-src/conveyor/
+// runner.mjs's own retired mechanical-pass dispatcher (see review-daemon.mjs's own import comment for why: this
+// daemon is the one that is actually running, with no extra launchd install). These tests prove the wiring — the
+// sweep's OWN decision logic is proven in scripts/conveyor/__tests__/review-hold-reconcile.test.mjs.
+describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
+  const noop = () => ({ dispatch: [], refusals: [] });
+
+  it('runs holdReconcile with THIS tick\'s own repo, independent of reconcile\'s plan', () => {
+    const holdReconcile = vi.fn(() => []);
+    runReviewTick({
+      reconcile: noop, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      holdReconcile, repo: 'chalbert/plateau-app',
+    });
+    expect(holdReconcile).toHaveBeenCalledWith({ repo: 'chalbert/plateau-app' });
+  });
+
+  it('folds a real finding onto the tick result under `holdReconcile`', () => {
+    const holdReconcile = () => [{ num: 2549, remove: ['review:pending'] }];
+    const out = runReviewTick({
+      reconcile: noop, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      holdReconcile,
+    });
+    expect(out.holdReconcile).toEqual([{ num: 2549, remove: ['review:pending'] }]);
+    expect(out.holdReconcileError).toBeNull();
+  });
+
+  it('a holdReconcile throw is isolated — reported via holdReconcileError, never escapes the tick', () => {
+    const holdReconcile = () => { throw new Error('gh: rate limited'); };
+    expect(() => runReviewTick({
+      reconcile: noop, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      holdReconcile,
+    })).not.toThrow();
+    const out = runReviewTick({
+      reconcile: noop, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      holdReconcile,
+    });
+    expect(out.holdReconcile).toEqual([]);
+    expect(out.holdReconcileError).toBe('gh: rate limited');
+    // A holdReconcile failure never blocks the rest of the tick — dispatch/tag still ran.
+    expect(out.reconcileError).toBeNull();
+  });
+
+  it('runs even when reconcile itself throws — a review-hold label stray has nothing to do with discovery', () => {
+    const holdReconcile = vi.fn(() => [{ num: 2578, remove: ['advisory:accepted'] }]);
+    const reconcile = () => { throw new Error('spawnSync claude ENOENT'); };
+    const out = runReviewTick({
+      reconcile, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      holdReconcile,
+    });
+    expect(holdReconcile).toHaveBeenCalledTimes(1);
+    expect(out.holdReconcile).toEqual([{ num: 2578, remove: ['advisory:accepted'] }]);
+    expect(out.reconcileError).toBe('spawnSync claude ENOENT');
   });
 });
 
@@ -284,6 +442,34 @@ describe('runReviewTickAllRepos — one runReviewTick call per watched repo', ()
     expect(out.reconcileFailed).toEqual([{ repo: 'chalbert/frontierui', error: 'spawnSync claude ENOENT' }]);
     expect(out.dispatched).toEqual([{ prNumber: 1, agentId: 'a1', repo: 'chalbert/web-everything' }]);
     expect(out.reviewsOwed).toBe(1); // the healthy repo's own count is untouched by the other repo's reconcile failure
+  });
+
+  // #x01u7az — holdReconcile results/errors are aggregated the SAME way as dispatched/failed: tagged with
+  // their own repo, folded across every watched repo, one bad repo isolated from the rest.
+  it('aggregates holdReconcile findings across repos, each tagged with its own repo', () => {
+    const tick = vi.fn(({ repo }) => (repo === 'repo-a'
+      ? { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, reconcileError: null, holdReconcile: [{ num: 2549, remove: ['review:pending'] }], holdReconcileError: null }
+      : { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, reconcileError: null, holdReconcile: [], holdReconcileError: null }));
+    const out = runReviewTickAllRepos({ repos: ['repo-a', 'repo-b'], tick });
+    expect(out.holdReconcile).toEqual([{ num: 2549, remove: ['review:pending'], repo: 'repo-a' }]);
+    expect(out.holdReconcileFailed).toEqual([]);
+  });
+
+  it('a repo whose holdReconcile failed is folded into holdReconcileFailed even when its reconcile itself failed too', () => {
+    const tick = vi.fn(({ repo }) => (repo === 'repo-a'
+      ? { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, reconcileError: 'spawnSync claude ENOENT', holdReconcile: [], holdReconcileError: 'gh: rate limited' }
+      : { reviewsOwed: 1, dispatched: [], failed: [], refusals: 0, reconcileError: null, holdReconcile: [], holdReconcileError: null }));
+    const out = runReviewTickAllRepos({ repos: ['repo-a', 'repo-b'], tick });
+    expect(out.reconcileFailed).toEqual([{ repo: 'repo-a', error: 'spawnSync claude ENOENT' }]);
+    expect(out.holdReconcileFailed).toEqual([{ repo: 'repo-a', error: 'gh: rate limited' }]);
+    expect(out.reviewsOwed).toBe(1); // repo-b's own count is untouched
+  });
+
+  it('a fake tick that omits holdReconcile entirely (older-shaped mock) never throws — defaults to nothing found', () => {
+    const tick = vi.fn(() => ({ reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }));
+    const out = runReviewTickAllRepos({ repos: ['repo-a'], tick });
+    expect(out.holdReconcile).toEqual([]);
+    expect(out.holdReconcileFailed).toEqual([]);
   });
 
   it('defaults to REVIEW_DAEMON_REPOS and to the real runReviewTick when nothing is injected', () => {
@@ -365,6 +551,35 @@ describe('buildCliDaemonEffects.tickOnce — now also runs a session-reap pass e
     log.error.mockClear();
     effects.onTick({ repos: [], reviewsOwed: 0, dispatched: [], failed: [], sessionReap: null });
     expect(log.error.mock.calls.some((c) => /session-reap —/.test(c[0]))).toBe(false);
+  });
+});
+
+describe('buildCliDaemonEffects.onTick — logs the review-hold reconcile sweep\'s own findings (#x01u7az)', () => {
+  it('logs one line per removal, naming the repo, PR, and labels removed', () => {
+    const log = { error: vi.fn() };
+    const effects = buildCliDaemonEffects({ owner: 'x', log });
+    effects.onTick({
+      repos: [], reviewsOwed: 0, dispatched: [], failed: [],
+      holdReconcile: [{ num: 2549, remove: ['review:pending'], repo: 'chalbert/web-everything' }],
+    });
+    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/chalbert\/web-everything#2549 hold-reconcile removed review:pending/));
+  });
+
+  it('logs a non-fatal holdReconcile failure per repo', () => {
+    const log = { error: vi.fn() };
+    const effects = buildCliDaemonEffects({ owner: 'x', log });
+    effects.onTick({
+      repos: [], reviewsOwed: 0, dispatched: [], failed: [],
+      holdReconcileFailed: [{ repo: 'chalbert/frontierui', error: 'gh: rate limited' }],
+    });
+    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/chalbert\/frontierui hold-reconcile failed \(non-fatal, other repos unaffected\): gh: rate limited/));
+  });
+
+  it('logs nothing extra when both are absent/empty', () => {
+    const log = { error: vi.fn() };
+    const effects = buildCliDaemonEffects({ owner: 'x', log });
+    effects.onTick({ repos: [], reviewsOwed: 0, dispatched: [], failed: [] });
+    expect(log.error.mock.calls.some((c) => /hold-reconcile/.test(c[0]))).toBe(false);
   });
 });
 
