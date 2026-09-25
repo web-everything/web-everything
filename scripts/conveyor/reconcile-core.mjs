@@ -398,8 +398,8 @@ export function assessReviewHeadGuard({ comments, headRefOid, now = 0, cap = REV
         kind: 'review-recently-dispatched',
         why: `a review was already dispatched for this exact head ${ageS}s ago — within the ${Math.round(REVIEW_DISPATCH_GRACE_MS / 1000)}s`
           + ' grace window a freshly-spawned session can take to appear live in `claude agents --json`; refusing'
-          + ' to avoid a second, racing review of the identical commit (chalbert/web-everything#2588\'s own shape:'
-          + ' three review sessions on one unchanged head, 16 minutes, two contradictory verdicts)',
+          + ' to avoid a second, racing review of the identical commit (the #2588 shape: three review sessions on'
+          + ' one unchanged head, 16 minutes, two contradictory verdicts)',
       },
     };
   }

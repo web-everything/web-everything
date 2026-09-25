@@ -351,8 +351,8 @@ export function buildReviewDispatchMarkerComment(headRefOid) {
     '',
     'An independent review session was just dispatched against this exact commit. `reconcile-core.mjs#assessReviewHeadGuard`'
       + ' reads this comment back on every later tick to refuse a second review dispatch against the SAME unchanged'
-      + ' head — closing chalbert/web-everything#2588\'s own shape (three review sessions ~2 minutes apart on one'
-      + ' unchanged head, two contradictory verdicts).',
+      + ' head — closing the #2588 shape (three review sessions ~2 minutes apart on one unchanged head, two'
+      + ' contradictory verdicts).',
   ].join('\n');
 }
 
