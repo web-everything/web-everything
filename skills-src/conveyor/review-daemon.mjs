@@ -222,7 +222,11 @@ export function runReviewTick({
   const failed = [];
   for (const d of dispatchable) {
     try {
-      const result = dispatch({ pr: d.prNumber, repo });
+      // xf44mm3 (#4075/#3383) — thread the head this plan row was computed against straight through, so
+      // `dispatchReview` can post the durable "dispatched for head <sha>" marker `reconcile-core.mjs
+      // #assessReviewHeadGuard` reads back on every later tick (closes bugs (c)/(d)). No extra `gh` read: every
+      // `reconcile-core.mjs` dispatch row already carries its own `headRefOid`.
+      const result = dispatch({ pr: d.prNumber, repo, headRefOid: d.headRefOid });
       dispatched.push({ prNumber: d.prNumber, agentId: result.agentId ?? null });
     } catch (e) {
       failed.push({ prNumber: d.prNumber, error: String((e && e.message) || e).split('\n')[0] });

@@ -184,12 +184,38 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal']);
  *                          current tip and is STILL red, this refusal no longer fires and the PR falls through
  *                          to the ordinary `ci-red` → `ci-heal` path below, unaffected.
  *   `nothing-owed`       — the PR is reviewed and queued, or already landed. Genuinely nothing to do.
+ *   `review-recently-dispatched` — xf44mm3 (#4075/#3383): a review was already dispatched for THIS EXACT head
+ *                          within {@link REVIEW_DISPATCH_GRACE_MS}. Refuses unconditionally, the same as a live
+ *                          process would, closing the `claude agents --json` listing-lag race a freshly
+ *                          `claude --bg`-spawned session cannot itself close (see {@link assessReviewHeadGuard}).
  */
 export const REFUSAL_KINDS = Object.freeze([
   'stood-down', 'no-findings', 'cap-exhausted',
   'live-process', 'awaiting-permission', 'liveness-unknown',
-  'owed-elsewhere', 'owed-ci-rerun', 'nothing-owed',
+  'owed-elsewhere', 'owed-ci-rerun', 'nothing-owed', 'review-recently-dispatched',
 ]);
+
+/**
+ * we:scripts/conveyor/reconcile-core.mjs#REVIEW_DISPATCH_MARKER_PREFIX — xf44mm3 (#4075, epic #3383): the
+ * stable, FIXED-PREFIX first line of the durable "a review was just dispatched for head <sha>" comment
+ * `we:scripts/operations/review-dispatch.mjs#dispatchReview` posts the moment `claude --bg` returns. Single-
+ * sourced here (never re-derived at the posting site) so posting and reading can never drift, exactly like
+ * every other marker in {@link BOOKKEEPING_MARKERS}. Deliberately just the PREFIX (no trailing sha) so it can
+ * live in {@link BOOKKEEPING_MARKERS} and `startsWith` still matches every head-specific instance of it —
+ * {@link countReviewDispatchesForHead} / {@link lastReviewDispatchAtForHead} narrow to one exact head by
+ * matching `PREFIX + headRefOid` instead.
+ *
+ * THE GAP THIS CLOSES (CONFIRMED LIVE, `chalbert/web-everything#2588`, 2026-09-24): "changes requested" at
+ * 23:55Z, "accepted" at 00:00Z, from THREE independent review sessions dispatched roughly two minutes apart
+ * against ONE UNCHANGED head — nothing in this file ever compared the PR's current head SHA against what was
+ * last (or is currently being) reviewed. Root cause: a freshly `claude --bg`-spawned session does not appear in
+ * `claude agents --json` for some interval after it starts (`we:skills-src/conveyor/review-daemon.mjs`'s own
+ * header names this "a real, pre-existing… race window"), so the very next 120s tick's `assessLiveness` check
+ * reads "nothing live" and dispatches a SECOND session against the identical head — repeatable every tick until
+ * one of them finally shows up bound. A GitHub comment has no such lag: it is visible on the very next `gh pr
+ * view` read, closing the window `bindAgents`/`assessLiveness` cannot.
+ */
+export const REVIEW_DISPATCH_MARKER_PREFIX = '🔎 conveyor review — dispatched for head ';
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#BOOKKEEPING_MARKERS — the durable conveyor marker comments, which are
@@ -205,6 +231,9 @@ export const BOOKKEEPING_MARKERS = Object.freeze([
   // #xkmu3gv — the two new completed-round markers. Neither is a reviewer speaking, so neither may ever count as
   // a finding (`countFindings`) or the pass would read its OWN handback comment as fresh work to fix.
   CONFLICT_FIX_COMMENT_MARKER, ADVISORY_FIX_COMMENT_MARKER,
+  // xf44mm3 (#4075/#3383) — the review-dispatch marker is this pass's OWN bookkeeping too, never a reviewer's
+  // finding, for the identical reason as every marker above it.
+  REVIEW_DISPATCH_MARKER_PREFIX,
 ]);
 
 /**
@@ -261,6 +290,131 @@ export const CONFLICT_FIX_ROUND_CAP = 3;
  * closes.
  */
 export const ADVISORY_FIX_ROUND_CAP = 3;
+
+/**
+ * we:scripts/conveyor/reconcile-core.mjs#REVIEW_DISPATCH_GRACE_MS — xf44mm3 (#4075/#3383): how long a
+ * `{@link REVIEW_DISPATCH_MARKER_PREFIX}`-marked comment for the CURRENT head unconditionally refuses a second
+ * review dispatch, closing the `claude agents --json` listing-lag race {@link REVIEW_DISPATCH_MARKER_PREFIX}'s
+ * own doc describes. Generous relative to the review-daemon's own 120s tick cadence — long enough that even a
+ * multi-tick lag before the spawned session shows up bound cannot slip through, short enough that a session
+ * that genuinely crashed immediately after spawning is retried within a few ticks rather than stalling the PR.
+ */
+export const REVIEW_DISPATCH_GRACE_MS = 5 * 60 * 1000;
+
+/**
+ * we:scripts/conveyor/reconcile-core.mjs#REVIEW_DISPATCH_HEAD_CAP — xf44mm3 (#4075/#3383): the durable,
+ * PR-comment-derived attempt cap for review dispatches against ONE UNCHANGED head, once
+ * {@link REVIEW_DISPATCH_GRACE_MS} has fully elapsed and the previously-dispatched session is genuinely gone
+ * (crashed, parked without a comment, or reported `blocked-on-infra` past its own cool-off). THE FIX FOR BUG
+ * (b): before this, the zero-findings review-dispatch branch handed back a hardcoded `attempts: 0` on every
+ * single dispatch, so nothing ever advanced toward any cap at all and a review that kept failing re-dispatched
+ * every tick, forever. Counted the same restart-surviving way every other round in this file is — from the PR's
+ * own comment thread ({@link countReviewDispatchesForHead}), never in-process state. Its OWN, smaller cap, not
+ * `roundCap`: a repeated review-dispatch-on-one-head failure and an ordinary negotiation round are different
+ * populations, mirroring {@link CI_HEAL_ROUND_CAP}'s own reasoning for why each population gets its own floor.
+ * A genuinely NEW head (a fixer's push) resets this counter to zero — this cap only ever bounds re-dispatching
+ * against a head this pass has already tried.
+ */
+export const REVIEW_DISPATCH_HEAD_CAP = 3;
+
+/**
+ * we:scripts/conveyor/reconcile-core.mjs#countReviewDispatchesForHead — the DURABLE, restart-surviving count of
+ * how many times a review has been dispatched against this EXACT `headRefOid`, read back off the PR's own
+ * comment thread ({@link REVIEW_DISPATCH_MARKER_PREFIX} + the sha, posted by
+ * `we:scripts/operations/review-dispatch.mjs#dispatchReview`). Pure. A comment is counted only when the marker
+ * is its leading line, matching every other counter in this file.
+ * @param {Array<{body?:string}|string>|null|undefined} comments
+ * @param {string|null|undefined} headRefOid
+ * @returns {number}
+ */
+export function countReviewDispatchesForHead(comments, headRefOid) {
+  const sha = headRefOid ? String(headRefOid) : '';
+  if (!Array.isArray(comments) || !sha) return 0;
+  const marker = REVIEW_DISPATCH_MARKER_PREFIX + sha;
+  let n = 0;
+  for (const c of comments) {
+    const body = commentBody(c);
+    if (typeof body === 'string' && body.trimStart().startsWith(marker)) n += 1;
+  }
+  return n;
+}
+
+/**
+ * we:scripts/conveyor/reconcile-core.mjs#lastReviewDispatchAtForHead — the epoch-ms `createdAt` of the MOST
+ * RECENT `{@link REVIEW_DISPATCH_MARKER_PREFIX}`-marked comment for this exact `headRefOid`, or `null` when none
+ * exists / no comment carries a parseable `createdAt`. Pure. `comments` is expected in the shape `gh pr view
+ * --json comments` returns (`[{ body, createdAt }]`); a bare-string array (no `createdAt`) is tolerated and
+ * simply never contributes a timestamp, mirroring `stand-down.mjs`'s own tolerance.
+ * @param {Array<{body?:string, createdAt?:string}|string>|null|undefined} comments
+ * @param {string|null|undefined} headRefOid
+ * @returns {number|null}
+ */
+export function lastReviewDispatchAtForHead(comments, headRefOid) {
+  const sha = headRefOid ? String(headRefOid) : '';
+  if (!Array.isArray(comments) || !sha) return null;
+  const marker = REVIEW_DISPATCH_MARKER_PREFIX + sha;
+  let latest = null;
+  for (const c of comments) {
+    const body = commentBody(c);
+    if (typeof body !== 'string' || !body.trimStart().startsWith(marker)) continue;
+    const createdAt = typeof c === 'string' ? null : c?.createdAt;
+    const ms = Date.parse(createdAt ?? '');
+    if (Number.isFinite(ms) && (latest === null || ms > latest)) latest = ms;
+  }
+  return latest;
+}
+
+/**
+ * we:scripts/conveyor/reconcile-core.mjs#assessReviewHeadGuard — xf44mm3 (#4075/#3383): THE GUARD every review
+ * dispatch site in {@link planReconcile} calls immediately before pushing a `kind: 'review'` dispatch. Closes
+ * bugs (b), (c) and (d) from one primitive: at most one review may be in flight (or freshly dispatched) per
+ * UNCHANGED head commit. Pure — reads the comments/headRefOid it is handed and decides nothing about liveness
+ * or phase (those stay {@link assessLiveness}'s and {@link planReconcile}'s own jobs).
+ *
+ * TWO DISTINCT PROTECTIONS, because they answer different failure shapes (see {@link REVIEW_DISPATCH_MARKER_PREFIX}
+ * and {@link REVIEW_DISPATCH_HEAD_CAP}'s own docs for the full reasoning behind each):
+ *   1. THE GRACE WINDOW ({@link REVIEW_DISPATCH_GRACE_MS}) — a marker posted for the CURRENT head within the
+ *      grace window refuses UNCONDITIONALLY (`kind: 'review-recently-dispatched'`), whether or not
+ *      `claude agents --json` has caught up yet. This is what actually closes #2588.
+ *   2. THE PER-HEAD CAP ({@link REVIEW_DISPATCH_HEAD_CAP}) — once the grace window has fully elapsed, a fresh
+ *      dispatch against the SAME unchanged head is still allowed, but only up to this cap — never unconditionally
+ *      forever (bug (b)).
+ *
+ * A PR with no `headRefOid` at all (never observed live, but never assumed impossible) refuses to guard at all
+ * — `attempts: 0`, `refuse: null` — since there is no sha to key on; this is unchanged pre-existing behavior for
+ * that edge case, not a new gap.
+ * @param {{comments?:Array, headRefOid?:string|null, now?:number, cap?:number}} o
+ * @returns {{refuse: null, attempts: number}|{refuse: {kind:string, why:string, attempts?:number, cap?:number, capKind?:string}}}
+ */
+export function assessReviewHeadGuard({ comments, headRefOid, now = 0, cap = REVIEW_DISPATCH_HEAD_CAP } = {}) {
+  const sha = headRefOid ? String(headRefOid) : '';
+  if (!sha) return { refuse: null, attempts: 0 };
+  const attempts = countReviewDispatchesForHead(comments, sha);
+  const lastAt = lastReviewDispatchAtForHead(comments, sha);
+  if (lastAt !== null && now && (now - lastAt) < REVIEW_DISPATCH_GRACE_MS) {
+    const ageS = Math.round((now - lastAt) / 1000);
+    return {
+      refuse: {
+        kind: 'review-recently-dispatched',
+        why: `a review was already dispatched for this exact head ${ageS}s ago — within the ${Math.round(REVIEW_DISPATCH_GRACE_MS / 1000)}s`
+          + ' grace window a freshly-spawned session can take to appear live in `claude agents --json`; refusing'
+          + ' to avoid a second, racing review of the identical commit (chalbert/web-everything#2588\'s own shape:'
+          + ' three review sessions on one unchanged head, 16 minutes, two contradictory verdicts)',
+      },
+    };
+  }
+  if (attempts >= cap) {
+    return {
+      refuse: {
+        kind: 'cap-exhausted',
+        attempts, cap, capKind: 'review-dispatch',
+        why: `this exact head has already been dispatched for review ${attempts} time(s) against a cap of ${cap}`
+          + ' — a person must take it rather than this pass re-reviewing the same unchanged commit again',
+      },
+    };
+  }
+  return { refuse: null, attempts };
+}
 
 /** Narrow a raw `gh` label array (`[{name}]`, or bare strings) to the names it carries. Pure. */
 const labelNames = (labels) => (Array.isArray(labels) ? labels : [])
@@ -881,9 +1035,18 @@ export function planReconcile({
       // cycle through this exemption more than `advisoryFixCap` times before THAT cap (not this one) correctly
       // stops it and hands it to a person. A normal PR that has never addressed its advisory finding (the
       // ordinary `!addressed` branch above) is completely unaffected — it never reaches this line at all.
+      // xf44mm3 (#4075/#3383) — the head-guard runs here too, even though this branch is deliberately EXEMPT
+      // from the shared `roundCap` above: exemption from that cap says nothing about the listing-lag race
+      // `assessReviewHeadGuard` closes, which can double-fire a review dispatch regardless of which cap (or
+      // none) gates it. See {@link assessReviewHeadGuard}'s own doc.
+      const headGuardAddressed = assessReviewHeadGuard({ comments: pr?.comments, headRefOid: base.headRefOid, now });
+      if (headGuardAddressed.refuse) {
+        refuse(headGuardAddressed.refuse.kind, { ...withPhase, ...headGuardAddressed.refuse });
+        continue;
+      }
       const advisoryFindingsHere = countFindings(pr?.comments);
       dispatch.push({
-        ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
+        ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere, attempts: headGuardAddressed.attempts,
         why: 'the admitted advisory:changes finding was already addressed by a fix postdating it (order, not' +
           ' count) — a fresh review is owed at once to judge the repaired head, exempt from the shared' +
           ' negotiation-round cap (that cap\'s own count is fed by past advisory notes — this review\'s own' +
@@ -966,7 +1129,23 @@ export function planReconcile({
         why: 'no reviewer finding on this PR — a fix agent would invent work. A review, not a fix, is what an unreviewed PR is owed.',
       });
       if (OWED[phase] === 'review') {
-        dispatch.push({ ...base, ...withPhase, kind: 'review', findings: 0, attempts: 0, why: 'parked for an independent review and no finding has been raised yet — a review is owed (#3279 runs it)' });
+        // xf44mm3 (#4075/#3383) — BUG (b) fixed here: `attempts` used to be hardcoded `0` on every single
+        // dispatch from this branch, so a review that kept crashing / reporting blocked-on-infra / parking
+        // without ever posting a comment never advanced toward any cap and re-dispatched every tick, forever.
+        // `assessReviewHeadGuard` now supplies a REAL, PR-comment-derived durable count, and also closes bugs
+        // (c)/(d) — a second dispatch against the identical still-zero-findings head within the grace window,
+        // or past the per-head cap, refuses instead of dispatching.
+        const headGuard = assessReviewHeadGuard({ comments: pr?.comments, headRefOid: base.headRefOid, now });
+        if (headGuard.refuse) {
+          refuse(headGuard.refuse.kind, { ...withPhase, findings: 0, ...headGuard.refuse });
+        } else {
+          dispatch.push({
+            ...base, ...withPhase, kind: 'review', findings: 0, attempts: headGuard.attempts,
+            why: `parked for an independent review and no finding has been raised yet — a review is owed` +
+              ` (#3279 runs it); ${headGuard.attempts} of ${REVIEW_DISPATCH_HEAD_CAP} review-dispatch attempts` +
+              ' for this exact head are spent',
+          });
+        }
       }
       continue;
     }
@@ -1033,6 +1212,18 @@ export function planReconcile({
         why: `the PR's own durable attempt count is ${attempts} against a cap of ${roundCap} — auto-repair is exhausted here and a person must take it`,
       });
       continue;
+    }
+
+    // xf44mm3 (#4075/#3383) — the head-guard runs here too, for the SAME reason as the other two review-dispatch
+    // sites (see {@link assessReviewHeadGuard}): passing the shared negotiation-round cap says nothing about
+    // whether a review was already dispatched for this exact head moments ago. Never applied to a `fix` dispatch
+    // — a fix agent making real commits is expected to change the head, so there is nothing to guard there.
+    if (OWED[phase] === 'review') {
+      const headGuard = assessReviewHeadGuard({ comments: pr?.comments, headRefOid: base.headRefOid, now });
+      if (headGuard.refuse) {
+        refuse(headGuard.refuse.kind, { ...withPhase, findings, ...headGuard.refuse });
+        continue;
+      }
     }
 
     dispatch.push({

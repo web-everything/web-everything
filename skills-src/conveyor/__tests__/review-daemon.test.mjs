@@ -118,6 +118,17 @@ describe('runReviewTick — the per-tick sequence', () => {
     });
   });
 
+  // xf44mm3 (#4075/#3383) — closes bugs (c)/(d): `dispatchReview` needs the PR's CURRENT head to post the
+  // durable "dispatched for head <sha>" marker `reconcile-core.mjs#assessReviewHeadGuard` reads back on every
+  // later tick. Every `reconcile-core.mjs` dispatch row already carries its own `headRefOid` — this proves it
+  // is threaded straight through with no extra `gh` read.
+  it('threads the dispatch row\'s own headRefOid through to dispatch(), so dispatchReview can post its head marker', () => {
+    const reconcile = vi.fn(() => owedPlan([{ kind: 'review', prNumber: 10, attempts: 0, headRefOid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }]));
+    const dispatch = vi.fn(() => ({ agentId: 'agent-10' }));
+    runReviewTick({ reconcile, dispatch, tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
+    expect(dispatch).toHaveBeenCalledWith({ pr: 10, repo: 'chalbert/web-everything', headRefOid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' });
+  });
+
   it('a failed dispatch is isolated: no round tag, recorded in failed, does not stop the tick', () => {
     const reconcile = vi.fn(() => owedPlan([{ kind: 'review', prNumber: 10, attempts: 0 }, { kind: 'review', prNumber: 20, attempts: 0 }]));
     const dispatch = vi.fn(({ pr }) => { if (pr === 10) throw new Error('checkout stale'); return { agentId: 'a20' }; });

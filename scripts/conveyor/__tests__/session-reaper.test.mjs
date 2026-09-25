@@ -545,6 +545,37 @@ describe('classifySessionReapWithGroundTruth — the completion-record axis (epi
     expect(classifySessionReapWithGroundTruth(bg({ state: 'blocked', name: 'review-1862' }), groundTruthFor))
       .toEqual(classifySessionReapWithGroundTruth(bg({ state: 'blocked', name: 'review-1862' }), groundTruthFor, {}));
   });
+
+  // xf44mm3 (#4075/#3383) — BUG (a): this axis used to reap a `blocked-on-infra` completion record immediately,
+  // ignoring `reconcile-core.mjs#INFRA_RETRY_COOLOFF_MS` (15 min). That let the reaper `claude stop` a session
+  // ~2 minutes after it reported `blocked-on-infra`, which then made the NEXT reconcile tick read the PR as
+  // unbound and re-dispatch early — instead of after the intended cool-off.
+  describe('the blocked-on-infra cool-off (xf44mm3, #4075/#3383)', () => {
+    it('does NOT reap a `blocked-on-infra` record still within the 15-minute cool-off', () => {
+      const now = Date.parse('2026-09-24T18:50:00.000Z'); // 5 minutes after updatedAt — well under the cool-off
+      const completionFor = () => ({ done: true, outcome: 'blocked-on-infra', updatedAt: '2026-09-24T18:45:00.000Z' });
+      expect(classifySessionReapWithGroundTruth(bg({ state: 'blocked', name: 'review-2588' }), () => ({ resolved: false }), { completionFor, now }))
+        .toEqual({ reap: false, reason: 'not-terminal' });
+    });
+    it('DOES reap a `blocked-on-infra` record once the 15-minute cool-off has elapsed', () => {
+      const now = Date.parse('2026-09-24T19:01:00.000Z'); // 16 minutes after updatedAt
+      const completionFor = () => ({ done: true, outcome: 'blocked-on-infra', updatedAt: '2026-09-24T18:45:00.000Z' });
+      expect(classifySessionReapWithGroundTruth(bg({ state: 'blocked', name: 'review-2588' }), () => ({ resolved: false }), { completionFor, now }))
+        .toEqual({ reap: true, reason: 'completion-record-done' });
+    });
+    it('a NON-infra done outcome is reaped immediately, cool-off never applies to it', () => {
+      const now = Date.parse('2026-09-24T18:45:01.000Z'); // 1 second after updatedAt
+      const completionFor = () => ({ done: true, outcome: 'accepted', updatedAt: '2026-09-24T18:45:00.000Z' });
+      expect(classifySessionReapWithGroundTruth(bg({ state: 'blocked', name: 'review-2588' }), () => ({ resolved: false }), { completionFor, now }))
+        .toEqual({ reap: true, reason: 'completion-record-done' });
+    });
+    it('an unparseable `updatedAt` on a blocked-on-infra record never reaps — safer than guessing elapsed', () => {
+      const now = Date.parse('2026-09-24T20:00:00.000Z');
+      const completionFor = () => ({ done: true, outcome: 'blocked-on-infra', updatedAt: 'not-a-date' });
+      expect(classifySessionReapWithGroundTruth(bg({ state: 'blocked', name: 'review-2588' }), () => ({ resolved: false }), { completionFor, now }))
+        .toEqual({ reap: false, reason: 'not-terminal' });
+    });
+  });
 });
 
 describe('classifySessionReapWithGroundTruth — the idle-timeout backstop, axis 3 (epic #3383)', () => {
@@ -786,5 +817,26 @@ describe('makeCompletionResolver — the IO helper over completion-store.mjs (#3
   it('returns null when no record exists on disk for an otherwise-valid slug', () => {
     const resolver = makeCompletionResolver({ dir: '/tmp/we-session-reaper-completion-resolver-test-nonexistent' });
     expect(resolver('review-999999')).toBeNull();
+  });
+
+  // xf44mm3 (#4075/#3383) — BUG (a)'s other half: the resolver used to drop `outcome`/`updatedAt` entirely
+  // (`{ done }` only), which is exactly what made the blocked-on-infra cool-off unenforceable from this axis —
+  // see the `classifySessionReapWithGroundTruth` describe block above for the decision-side proof.
+  it('surfaces outcome + updatedAt from a real record on disk, not just done', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { writeCompletion, newCompletionRecord, applyCompletionUpdate } = await import('../../operations/completion-store.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'we-session-reaper-completion-resolver-'));
+    try {
+      const now = () => '2026-09-24T18:45:00.000Z';
+      const base = newCompletionRecord({ session: 'review-2588', kind: 'review', pr: '2588', now });
+      const record = applyCompletionUpdate(base, { status: 'done', outcome: 'blocked-on-infra' }, now);
+      writeCompletion(record, dir);
+      const resolver = makeCompletionResolver({ dir });
+      expect(resolver('review-2588')).toEqual({ done: true, outcome: 'blocked-on-infra', updatedAt: '2026-09-24T18:45:00.000Z' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

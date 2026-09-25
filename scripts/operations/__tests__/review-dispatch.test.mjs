@@ -19,8 +19,9 @@ import {
   assertMainNotStale, canonicalReviewPlaceholder, dispatchReview, fillReviewBrief, planReviewDispatch,
   reviewDispatchDisallowedToolsArgs, reviewSessionSlug, REVIEW_BRIEF_PLACEHOLDERS,
   REVIEW_DISPATCH_DISALLOWED_TOOLS, REVIEW_DISPATCH_SYSTEM_PROMPT_FILE,
-  TOOL_FREE_ONLY_JUDGE_PROVIDERS,
+  TOOL_FREE_ONLY_JUDGE_PROVIDERS, buildReviewDispatchMarkerComment,
 } from '../review-dispatch.mjs';
+import { REVIEW_DISPATCH_MARKER_PREFIX } from '../../conveyor/reconcile-core.mjs';
 import { buildReviewJudgeRequest, DEFAULT_LENS } from '../review-pr.mjs';
 
 // #3433 — the two argv elements every dispatched review session carries, ahead of anything else, so the tests
@@ -184,6 +185,66 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
       resolveSettingsEnv: () => null,
     });
     expect(calls[0].argv).not.toContain('--settings');
+  });
+
+  // xf44mm3 (#4075/#3383) — closes bugs (c)/(d): CONFIRMED LIVE on `chalbert/web-everything#2588`, three review
+  // sessions dispatched ~2 minutes apart against one unchanged head, two directly contradictory verdicts five
+  // minutes apart. `reconcile-core.mjs#assessReviewHeadGuard` reads this comment back on every later tick; this
+  // is the posting half.
+  describe('the review-dispatch head marker (xf44mm3, #4075/#3383)', () => {
+    it('posts the durable head marker right after a successful spawn, when headRefOid is supplied', () => {
+      const postComments = [];
+      dispatchReview({
+        pr: 1234,
+        repo: 'chalbert/web-everything',
+        root: '/repo',
+        readBrief: () => REAL_TEMPLATE_STUB,
+        mintSessionId: () => '11111111-1111-4111-8111-111111111111',
+        spawnAgent: () => '',
+        checkStaleness: FRESH,
+        headRefOid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+        postComment: (repo, pr, body) => { postComments.push({ repo, pr, body }); },
+      });
+      expect(postComments).toHaveLength(1);
+      expect(postComments[0].repo).toBe('chalbert/web-everything');
+      expect(postComments[0].pr).toBe(1234);
+      expect(postComments[0].body.startsWith(`${REVIEW_DISPATCH_MARKER_PREFIX}deadbeefdeadbeefdeadbeefdeadbeefdeadbeef`)).toBe(true);
+    });
+
+    it('never posts a comment when headRefOid is omitted — byte-identical to before this fix for any caller that does not opt in', () => {
+      const postComments = [];
+      dispatchReview({
+        pr: 1234,
+        repo: 'chalbert/web-everything',
+        root: '/repo',
+        readBrief: () => REAL_TEMPLATE_STUB,
+        mintSessionId: () => '11111111-1111-4111-8111-111111111111',
+        spawnAgent: () => '',
+        checkStaleness: FRESH,
+        postComment: (repo, pr, body) => { postComments.push({ repo, pr, body }); },
+      });
+      expect(postComments).toHaveLength(0);
+    });
+
+    it('a failed comment post never fails the dispatch itself — best-effort, matching every other marker in this codebase', () => {
+      const result = dispatchReview({
+        pr: 1234,
+        repo: 'chalbert/web-everything',
+        root: '/repo',
+        readBrief: () => REAL_TEMPLATE_STUB,
+        mintSessionId: () => '11111111-1111-4111-8111-111111111111',
+        spawnAgent: () => 'backgrounded · agent-xyz · review-1234',
+        checkStaleness: FRESH,
+        headRefOid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+        postComment: () => { throw new Error('gh is down'); },
+      });
+      expect(result.agentId).toBe('agent-xyz');
+    });
+
+    it('buildReviewDispatchMarkerComment\'s first line is exactly the shared prefix + the sha — never re-derived at the call site', () => {
+      const body = buildReviewDispatchMarkerComment('cafef00dcafef00dcafef00dcafef00dcafef00d');
+      expect(body.split('\n')[0]).toBe(`${REVIEW_DISPATCH_MARKER_PREFIX}cafef00dcafef00dcafef00dcafef00dcafef00d`);
+    });
   });
 
   it('refuses to dispatch from inside a lane checkout, same guard dispatch-lane-io.mjs uses', () => {

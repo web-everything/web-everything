@@ -151,6 +151,13 @@ import { assertMainNotStale } from '../lib/main-staleness.mjs';
 export { assertMainNotStale } from '../lib/main-staleness.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { reviewSessionSlug } from '../conveyor/review-session-slug.mjs';
+// xf44mm3 (#4075/#3383) — the durable "dispatched for head <sha>" marker `reconcile-core.mjs#assessReviewHeadGuard`
+// reads back on every later tick to refuse a second review dispatch against an unchanged head (bugs (c)/(d):
+// CONFIRMED LIVE on `chalbert/web-everything#2588`, three review sessions ~2 minutes apart on one head, two
+// contradictory verdicts). The PREFIX is single-sourced in `reconcile-core.mjs` (never re-derived here) so
+// posting and reading can never drift.
+import { REVIEW_DISPATCH_MARKER_PREFIX } from '../conveyor/reconcile-core.mjs';
+import { createGhProvider } from '../lib/review-label-provider.mjs';
 
 // re-exported so nothing that already imports `reviewSessionSlug` from this file has to change (#3437) — the
 // slug itself now lives in `we:scripts/conveyor/review-session-slug.mjs`, a PURE module both this file and
@@ -331,6 +338,25 @@ export function planReviewDispatch({ pr, repo, checkoutExists = existsSync, home
 }
 
 /**
+ * we:scripts/operations/review-dispatch.mjs#buildReviewDispatchMarkerComment — xf44mm3 (#4075/#3383): the
+ * durable PR comment posted the moment a review dispatch's `claude --bg` spawn returns. Its FIRST line MUST be
+ * `{@link REVIEW_DISPATCH_MARKER_PREFIX}<sha>` (single-sourced from `reconcile-core.mjs`) so posting and
+ * counting/matching can never drift — mirrors `ci-heal-mark.mjs#buildCiHealComment`'s own convention.
+ * @param {string} headRefOid
+ * @returns {string}
+ */
+export function buildReviewDispatchMarkerComment(headRefOid) {
+  return [
+    `${REVIEW_DISPATCH_MARKER_PREFIX}${headRefOid}`,
+    '',
+    'An independent review session was just dispatched against this exact commit. `reconcile-core.mjs#assessReviewHeadGuard`'
+      + ' reads this comment back on every later tick to refuse a second review dispatch against the SAME unchanged'
+      + ' head — closing chalbert/web-everything#2588\'s own shape (three review sessions ~2 minutes apart on one'
+      + ' unchanged head, two contradictory verdicts).',
+  ].join('\n');
+}
+
+/**
  * DISPATCH ONE INDEPENDENT REVIEW SESSION. The composition: plan → fill the brief → mint a fresh session id →
  * spawn. Mirrors `we:scripts/operations/dispatch-lane-io.mjs#createDispatchSinks`'s own composition closely —
  * same `assertNotALaneCheckout` guard (a dispatcher run FROM a lane clone would hand the dispatched agent a
@@ -374,6 +400,12 @@ export function dispatchReview({
   // this: the shim was simply never on `PATH`, at all, for any review dispatch, since before this fix
   // existed. NEVER throws — see `resolveGhShimSettingsEnv`'s own contract.
   resolveSettingsEnv = resolveGhShimSettingsEnv,
+  // xf44mm3 (#4075/#3383) — the current PR head, when the caller has it (every reconcile-core.mjs `dispatch`
+  // row already carries `headRefOid`, so `we:skills-src/conveyor/review-daemon.mjs#runReviewTick` threads it
+  // straight through with no extra `gh` read). `null`/omitted means "caller doesn't know the head" — the marker
+  // is simply not posted, byte-identical to before this fix for any caller that doesn't opt in.
+  headRefOid = null,
+  postComment = (repoSlug, prNum, body) => createGhProvider().postComment(repoSlug, prNum, body),
 } = {}) {
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
   assertNotALaneCheckout(root);
@@ -427,6 +459,16 @@ export function dispatchReview({
   // only so an existing caller reading that field still gets the old, documented shape.
   const stdout = String(spawnAgent(argv, { cwd: root }) ?? '');
   const agentId = parseBackgroundedId(stdout);
+  // xf44mm3 (#4075/#3383) — post the durable head marker right after a successful spawn, closing the
+  // `claude agents --json` listing-lag race `reconcile-core.mjs#assessReviewHeadGuard` reads it back to guard
+  // against (bugs (c)/(d)). Best-effort, matching every other marker-post's convention in this codebase (e.g.
+  // `ci-heal-mark.mjs`): a failed comment post never fails the dispatch itself, since the spawn already
+  // succeeded — it does leave THIS one dispatch's own race window open if `gh` itself is unreachable at the
+  // exact moment of dispatch, the same residual every best-effort marker in this file already accepts.
+  if (headRefOid) {
+    try { postComment(planned.repo, planned.pr, buildReviewDispatchMarkerComment(headRefOid)); }
+    catch { /* best-effort — see comment above */ }
+  }
   return {
     sessionId, agentId, sessionSlug: planned.sessionSlug, pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, prompt,
     unknownTokens, judgeProvider,

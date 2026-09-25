@@ -33,6 +33,8 @@ import {
   planReconcile, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs,
   REFUSAL_KINDS, DISPATCH_KINDS, selectStatusCandidates, markSelfReportedDone, markHungSessions, CI_HEAL_ROUND_CAP,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP,
+  REVIEW_DISPATCH_MARKER_PREFIX, REVIEW_DISPATCH_GRACE_MS, REVIEW_DISPATCH_HEAD_CAP,
+  countReviewDispatchesForHead, lastReviewDispatchAtForHead, assessReviewHeadGuard,
 } from '../reconcile-core.mjs';
 import {
   STAND_DOWN_MARKER, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER, buildStandDownComment,
@@ -1196,6 +1198,207 @@ describe('case 5i — STACKED-BASE CONFLICT dispatch, a `conflicted` PR whose ba
   it('every row carries `baseRefName` as evidence, dispatch and refusal alike', () => {
     const plan = planReconcile({ prs: [prStacked()], agents: [], now: NOW });
     expect(plan.dispatch[0].baseRefName).toBe('lane/3681-ratify-daemon-lifecycle');
+  });
+});
+
+// ── CASE 5j — THE REVIEW-DISPATCH HEAD GUARD (xf44mm3, #4075/#3383) ──────────────────────────────────────────────
+//
+// Closes bugs (b)/(c)/(d) from one primitive: at most one review may be in flight (or freshly dispatched) per
+// UNCHANGED head commit. (b) — the zero-findings review-dispatch branch used to hand back a hardcoded
+// `attempts: 0` on every dispatch, so a review that kept failing never advanced toward any cap. (c)/(d) — nothing
+// compared a PR's current head against what was last/currently reviewed, confirmed live on
+// `chalbert/web-everything#2588`: two directly contradictory verdicts ("changes requested" then "accepted") five
+// minutes apart on one unchanged head.
+describe('case 5j — countReviewDispatchesForHead / lastReviewDispatchAtForHead (xf44mm3)', () => {
+  const SHA = '396c73e49f045f2b17a651340dea1c8f3348ca40'; // chalbert/web-everything#2588's real head, see below
+  const markerAt = (createdAt, sha = SHA) => ({ body: `${REVIEW_DISPATCH_MARKER_PREFIX}${sha}\n\nsome trailing body`, createdAt });
+
+  it('counts zero for a PR with no marker comments at all', () => {
+    expect(countReviewDispatchesForHead([finding()], SHA)).toBe(0);
+    expect(countReviewDispatchesForHead([], SHA)).toBe(0);
+    expect(countReviewDispatchesForHead(null, SHA)).toBe(0);
+  });
+
+  it('counts only markers for the EXACT head — a marker for a different (e.g. earlier) head never counts', () => {
+    const comments = [markerAt('2026-09-24T23:52:00Z', SHA), markerAt('2026-09-20T00:00:00Z', 'deadbeef00000000000000000000000000000000')];
+    expect(countReviewDispatchesForHead(comments, SHA)).toBe(1);
+  });
+
+  it('a human quoting the marker in a reply does not inflate the count — leading-line match only', () => {
+    const comments = [markerAt('2026-09-24T23:52:00Z'), { body: `see also: ${REVIEW_DISPATCH_MARKER_PREFIX}${SHA}`, createdAt: '2026-09-24T23:53:00Z' }];
+    expect(countReviewDispatchesForHead(comments, SHA)).toBe(1);
+  });
+
+  it('lastReviewDispatchAtForHead returns the MOST RECENT marker\'s createdAt as epoch ms, for this head only', () => {
+    const comments = [markerAt('2026-09-24T23:52:00Z'), markerAt('2026-09-24T23:54:00Z')];
+    expect(lastReviewDispatchAtForHead(comments, SHA)).toBe(Date.parse('2026-09-24T23:54:00Z'));
+  });
+
+  it('returns null when no marker exists for this head, or `createdAt` cannot be parsed', () => {
+    expect(lastReviewDispatchAtForHead([finding()], SHA)).toBeNull();
+    expect(lastReviewDispatchAtForHead([{ body: `${REVIEW_DISPATCH_MARKER_PREFIX}${SHA}`, createdAt: 'not-a-date' }], SHA)).toBeNull();
+  });
+});
+
+describe('case 5j — assessReviewHeadGuard: at most one review per unchanged head (xf44mm3)', () => {
+  const SHA = '396c73e49f045f2b17a651340dea1c8f3348ca40';
+  const markerAt = (createdAt, sha = SHA) => ({ body: `${REVIEW_DISPATCH_MARKER_PREFIX}${sha}`, createdAt });
+
+  it('no headRefOid at all — never guards (unchanged pre-existing behavior for that edge case)', () => {
+    expect(assessReviewHeadGuard({ comments: [], headRefOid: null, now: 1_000 })).toEqual({ refuse: null, attempts: 0 });
+  });
+
+  it('no prior dispatch for this head — passes through with attempts: 0', () => {
+    expect(assessReviewHeadGuard({ comments: [finding()], headRefOid: SHA, now: Date.parse('2026-09-24T23:54:00Z') }))
+      .toEqual({ refuse: null, attempts: 0 });
+  });
+
+  it('BUG (c)/(d): a marker for this head posted 2 minutes ago (well within the grace window) refuses unconditionally', () => {
+    const comments = [markerAt('2026-09-24T23:52:00Z')];
+    const result = assessReviewHeadGuard({ comments, headRefOid: SHA, now: Date.parse('2026-09-24T23:54:00Z') });
+    expect(result.refuse).toMatchObject({ kind: 'review-recently-dispatched' });
+  });
+
+  it('once the grace window has fully elapsed, a fresh dispatch against the SAME head is allowed again, with a REAL attempt count', () => {
+    const comments = [markerAt('2026-09-24T23:52:00Z')];
+    const now = Date.parse('2026-09-24T23:52:00Z') + REVIEW_DISPATCH_GRACE_MS + 1000; // 1s past the grace window
+    expect(assessReviewHeadGuard({ comments, headRefOid: SHA, now })).toEqual({ refuse: null, attempts: 1 });
+  });
+
+  it('BUG (b): once the grace window elapses each time, repeated failures still hit a real per-head cap — never forever', () => {
+    // Simulate REVIEW_DISPATCH_HEAD_CAP consecutive dispatches, each safely outside the grace window of the one
+    // before it (a crash / blocked-on-infra / park-without-comment between each) — this is exactly what a
+        // hardcoded `attempts: 0` could never detect.
+    const base = Date.parse('2026-09-24T20:00:00Z');
+    const comments = Array.from({ length: REVIEW_DISPATCH_HEAD_CAP }, (_, i) => markerAt(new Date(base + i * (REVIEW_DISPATCH_GRACE_MS + 60_000)).toISOString()));
+    const now = base + REVIEW_DISPATCH_HEAD_CAP * (REVIEW_DISPATCH_GRACE_MS + 60_000) + REVIEW_DISPATCH_GRACE_MS + 1000;
+    const result = assessReviewHeadGuard({ comments, headRefOid: SHA, now });
+    expect(result.refuse).toMatchObject({ kind: 'cap-exhausted', attempts: REVIEW_DISPATCH_HEAD_CAP, cap: REVIEW_DISPATCH_HEAD_CAP, capKind: 'review-dispatch' });
+  });
+
+  it('a NEW head (a fixer\'s push) resets both the grace window and the cap to zero', () => {
+    const oldSha = SHA;
+    const newSha = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
+    const comments = [markerAt('2026-09-24T23:52:00Z', oldSha), markerAt('2026-09-24T23:54:00Z', oldSha)];
+    // 30s after the NEW head appeared with no marker of its own yet — the old head's markers must not leak in.
+    expect(assessReviewHeadGuard({ comments, headRefOid: newSha, now: Date.parse('2026-09-24T23:54:30Z') }))
+      .toEqual({ refuse: null, attempts: 0 });
+  });
+});
+
+describe('case 5j — planReconcile wires the head guard into EVERY review-dispatch site (xf44mm3)', () => {
+  const SHA = '396c73e49f045f2b17a651340dea1c8f3348ca40';
+  const markerAt = (createdAt, sha = SHA) => ({ body: `${REVIEW_DISPATCH_MARKER_PREFIX}${sha}`, createdAt });
+  const pr1576 = (over = {}) => ({
+    number: 1576, state: 'OPEN',
+    headRefName: 'lane/review-slice-scopes', headRefOid: SHA,
+    labels: lbl('review:pending', 'checking'), mergeStateStatus: 'CLEAN',
+    statusCheckRollup: pendingRollup, comments: [], ...over,
+  });
+
+  it('BUG (b) fixed: the zero-findings branch now derives a REAL attempt count, never a hardcoded 0', () => {
+    const now = Date.parse('2026-09-24T20:10:00Z');
+    const oneOldDispatch = [markerAt('2026-09-24T20:00:00Z')]; // well past the grace window relative to `now`
+    const plan = planReconcile({ prs: [pr1576({ comments: oneOldDispatch })], agents: [], now });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', findings: 0, attempts: 1, prNumber: 1576 })]);
+  });
+
+  it('BUG (b) fixed: the zero-findings branch now REFUSES once the per-head cap is hit, instead of dispatching forever', () => {
+    const base = Date.parse('2026-09-24T20:00:00Z');
+    const spacing = REVIEW_DISPATCH_GRACE_MS + 60_000;
+    const comments = Array.from({ length: REVIEW_DISPATCH_HEAD_CAP }, (_, i) => markerAt(new Date(base + i * spacing).toISOString()));
+    const now = base + REVIEW_DISPATCH_HEAD_CAP * spacing + REVIEW_DISPATCH_GRACE_MS + 1000;
+    const plan = planReconcile({ prs: [pr1576({ comments })], agents: [], now });
+    expect(plan.dispatch).toHaveLength(0);
+    // The zero-findings branch always ALSO refuses `no-findings` (pre-existing, unrelated behavior — a PR with
+    // zero findings gets that refusal regardless of the head guard) — the head guard's OWN refusal rides
+    // alongside it, never in place of it.
+    expect(plan.refusals).toHaveLength(2);
+    expect(plan.refusals).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'no-findings', prNumber: 1576 }),
+      expect.objectContaining({ kind: 'cap-exhausted', capKind: 'review-dispatch', prNumber: 1576 }),
+    ]));
+  });
+
+  it('BUG (c)/(d) fixed: a review dispatched moments ago for this exact head refuses a second one instead of dispatching again', () => {
+    const now = Date.parse('2026-09-24T20:02:00Z'); // 2 minutes after the marker below
+    const comments = [markerAt('2026-09-24T20:00:00Z')];
+    const plan = planReconcile({ prs: [pr1576({ comments })], agents: [], now });
+    expect(plan.dispatch).toHaveLength(0);
+    expect(plan.refusals).toHaveLength(2);
+    expect(plan.refusals).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'no-findings', prNumber: 1576 }),
+      expect.objectContaining({ kind: 'review-recently-dispatched', prNumber: 1576 }),
+    ]));
+  });
+
+  it('the head guard also applies to a `needs-human` PR with real findings (the generic bottom dispatch site)', () => {
+    const now = Date.parse('2026-09-24T20:02:00Z');
+    const humanPr = pr1576({
+      labels: lbl('review:human', 'checking'),
+      comments: [finding(), markerAt('2026-09-24T20:00:00Z')],
+    });
+    const plan = planReconcile({ prs: [humanPr], agents: [], now });
+    expect(plan.dispatch).toHaveLength(0);
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-recently-dispatched', prNumber: 1576 })]);
+  });
+
+  it('the head guard never touches a `fix` dispatch — a bounced PR still dispatches normally with no marker at all', () => {
+    const now = Date.parse('2026-09-24T20:02:00Z');
+    const plan = planReconcile({ prs: [pr1563()], agents: [], now });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', prNumber: 1563 })]);
+  });
+});
+
+// xf44mm3 (#4075/#3383) — LIVE REPLAY of `chalbert/web-everything#2588`'s REAL comment history (fetched
+// 2026-09-25 via `gh pr view 2588 --repo chalbert/web-everything --json headRefOid,comments`; the PR's real,
+// unchanged `headRefOid` and its two REAL, GitHub-confirmed verdict comments/timestamps are reproduced here
+// verbatim). This is the live incident the task itself names: "changes requested" at 23:55:40Z, then "accepted"
+// at 00:00:46Z — five minutes six seconds later, on the SAME head, from what the review-daemon's own
+// listing-lag race allowed to be multiple independently-dispatched review sessions.
+//
+// This repo did not yet post a dispatch-time marker when this incident happened (that mechanism is this fix),
+// so the ONE reconstructed fact here is the marker a first review dispatch would have posted — timed at
+// 23:53:00Z, consistent with the "~2 minutes apart" cadence the adversarial review measured across the incident's
+// three sessions and comfortably before the first REAL verdict comment at 23:55:40Z. Everything else — the PR
+// number, its real head sha, and both verdict comments with their real bodies/timestamps — is the actual GitHub
+// data, not invented.
+describe('LIVE REPLAY — chalbert/web-everything#2588 (xf44mm3, #4075/#3383)', () => {
+  const REAL_HEAD_SHA = '396c73e49f045f2b17a651340dea1c8f3348ca40';
+  const REAL_CHANGES_REQUESTED_AT = '2026-09-24T23:55:40Z';
+  const REAL_ACCEPTED_AT = '2026-09-25T00:00:46Z';
+  const reconstructedFirstDispatchMarker = { body: `${REVIEW_DISPATCH_MARKER_PREFIX}${REAL_HEAD_SHA}`, createdAt: '2026-09-24T23:53:00Z' };
+  const realChangesRequestedComment = {
+    body: '🔁 review — changes requested\n\nRecorded by operator via the declared `review-pr` operation (#3035).',
+    createdAt: REAL_CHANGES_REQUESTED_AT,
+  };
+
+  it('with the fix: a second review dispatch attempted right before the real "accepted" comment lands is REFUSED on the same head', () => {
+    // The real incident's second contradictory verdict landed at 00:00:46Z. Evaluate the guard a couple of
+    // minutes before that — squarely where the review-daemon's own 120s tick cadence would have tried to
+    // dispatch again, exactly as it did live.
+    const now = Date.parse('2026-09-24T23:57:00Z'); // 4 minutes after the reconstructed marker — inside the 5-minute grace window
+    const comments = [reconstructedFirstDispatchMarker, realChangesRequestedComment];
+    const result = assessReviewHeadGuard({ comments, headRefOid: REAL_HEAD_SHA, now });
+    expect(result.refuse).toMatchObject({ kind: 'review-recently-dispatched' });
+  });
+
+  it('without the fix (attempts hardcoded to 0, no head check at all): nothing here would ever have refused — the pre-fix shape', () => {
+    // Documents the counterfactual this replay is proving against: before xf44mm3, `planReconcile`'s
+    // zero-findings/needs-human review-dispatch sites carried NO call to any head guard at all, so the SAME
+    // input that now refuses above would, pre-fix, have gone straight to `dispatch.push(...)` with a hardcoded
+    // `attempts: 0` and no head comparison whatsoever — precisely how three sessions ran on one head in 16
+    // minutes with nothing here ever saying no.
+    const now = Date.parse('2026-09-24T23:57:00Z'); // 4 minutes after the reconstructed marker — inside the 5-minute grace window
+    const humanPr = {
+      number: 2588, state: 'OPEN', headRefName: 'lane/review-2588', headRefOid: REAL_HEAD_SHA,
+      labels: lbl('review:human', 'checking'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
+      comments: [reconstructedFirstDispatchMarker, realChangesRequestedComment],
+    };
+    const plan = planReconcile({ prs: [humanPr], agents: [], now });
+    // WITH the fix, this refuses instead of dispatching — the assertion that matters for this item.
+    expect(plan.dispatch).toHaveLength(0);
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-recently-dispatched', prNumber: 2588 })]);
   });
 });
 

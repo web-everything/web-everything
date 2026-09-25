@@ -115,6 +115,10 @@ import { defaultListAgents, normalizeHandle, prListTimeoutMs } from '../operatio
 import { sleepSyncMs } from '../readiness/drain-lock.mjs';
 import { applyCompletionUpdate, newCompletionRecord, tryReadCompletion, writeCompletion } from '../operations/completion-store.mjs';
 import { readHungInfo, resolveHungThresholdMs } from './hung-session.mjs';
+// xf44mm3 (#4075/#3383) — the SAME blocked-on-infra cool-off `reconcile-core.mjs#markSelfReportedDone` binds
+// on, reused here (never re-declared) so the reaper's own completion-record axis cannot honor a shorter,
+// silently-drifted cool-off of its own. See {@link classifySessionReapWithGroundTruth}'s Axis 1 below for why.
+import { INFRA_RETRY_COOLOFF_MS } from './reconcile-core.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -321,9 +325,29 @@ export function classifySessionReapWithGroundTruth(session, groundTruthFor, opts
   if (neverReapWorking && session?.state === 'working') return base; // strictly-stricter mode — see doc above
 
   // Axis 1 — the session's own completion record (see doc above for why this is tried first).
+  //
+  // xf44mm3 (#4075/#3383) — BUG (a), fixed here: this axis used to reap ANY `status: 'done'` record
+  // immediately, with no regard for `outcome: 'blocked-on-infra'` or the 15-minute cool-off
+  // `reconcile-core.mjs#INFRA_RETRY_COOLOFF_MS` / `markSelfReportedDone` deliberately enforce before treating a
+  // blocked-on-infra session as safe to stop retrying (see that function's own doc: long enough that a
+  // persistent outage is not hammered every tick, short enough that a recovered one is retried within a
+  // coffee). Left unenforced HERE, this reaper `claude stop`s the session almost immediately after it reports
+  // done — which then makes `assessLiveness` read the PR as unbound on the very next reconcile tick, so the PR
+  // gets re-dispatched ~2 minutes later instead of after the intended cool-off. Mirrors `markSelfReportedDone`'s
+  // own "unparseable `updatedAt` never counts as elapsed" caution: never a guess in the reaper's favor either.
   if (typeof completionFor === 'function') {
     const record = completionFor(session?.name);
-    if (record && record.done === true) return { reap: true, reason: 'completion-record-done' };
+    if (record && record.done === true) {
+      if (record.outcome === 'blocked-on-infra') {
+        const updatedMs = Date.parse(record.updatedAt ?? '');
+        const coolOffElapsed = Number.isFinite(updatedMs) && (now - updatedMs) >= INFRA_RETRY_COOLOFF_MS;
+        if (coolOffElapsed) return { reap: true, reason: 'completion-record-done' };
+        // still cooling off (or `updatedAt` could not be read) — fall through to the other axes below, exactly
+        // as if this axis had found nothing, rather than reaping early.
+      } else {
+        return { reap: true, reason: 'completion-record-done' };
+      }
+    }
   }
 
   // Axis 2 — the pre-existing backlog-item / PR-merged ground truth, unchanged.
@@ -497,15 +521,19 @@ export function makeGroundTruthResolver({
  * is an exact match, never a prefix guess). `done: true` iff the record's `status` is `'done'`; a missing
  * record, an invalid slug (`completionPath` refuses one — e.g. an interactive session's free-text name), or
  * any read failure all answer `null` (unknown) — NEVER a guess, matching every other resolver in this file.
+ *
+ * ALSO carries `outcome`/`updatedAt` (xf44mm3, #4075/#3383) — previously dropped, which is exactly what let
+ * {@link classifySessionReapWithGroundTruth}'s Axis 1 reap a `blocked-on-infra` session with no regard for its
+ * own cool-off (bug (a); see that axis's own doc for the full incident this closes).
  * @param {{dir?:string}} [io]
- * @returns {(name:string) => ({done:boolean}|null)}
+ * @returns {(name:string) => ({done:boolean, outcome:string|null, updatedAt:string|null}|null)}
  */
 export function makeCompletionResolver({ dir } = {}) {
   return function completionFor(name) {
     if (typeof name !== 'string' || !name) return null;
     try {
       const record = tryReadCompletion(name, dir);
-      return record ? { done: record.status === 'done' } : null;
+      return record ? { done: record.status === 'done', outcome: record.outcome ?? null, updatedAt: record.updatedAt ?? null } : null;
     } catch {
       return null; // invalid slug / unreadable record — unknown, never reap on an unreadable signal
     }
