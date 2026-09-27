@@ -2,10 +2,11 @@
 kind: story
 size: 3
 parent: "3931"
-status: open
+status: active
 blockedBy: ["xvz55jf"]
 scope: ["plateau-app:src/wip/wip-view.ts", "plateau-app:src/wip/wip-read.ts", "plateau-app:src/wip/wip-live.ts", "plateau-app:src/wip/types.ts"]
 dateOpened: "2026-09-26"
+dateStarted: "2026-09-26"
 tags: []
 ---
 
