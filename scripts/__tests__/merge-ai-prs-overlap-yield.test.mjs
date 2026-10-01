@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { planLabelDrain, isPassIdle, buildOverlapRows } from '../merge-ai-prs.mjs';
-import { overlapRowKey } from '../conveyor/land-overlap-yield.mjs';
+import { overlapRowKey, overlapYieldWaits } from '../conveyor/land-overlap-yield.mjs';
+import { embedManifestInBody, buildManifest } from '../readiness/lane-manifest.mjs';
 
 // #4308 — `planLabelDrain`'s `overlapContext` is a PRECOMPUTED `Map` (built by
 // `we:scripts/conveyor/land-overlap-yield.mjs#computeOverlapContext`, exercised on its own in that module's own
@@ -111,5 +112,39 @@ describe('buildOverlapRows — #4308 row-shape wiring (2026-09-29 review finding
     const verdicts = [{ num: 5, repo: 'we', decision: 'skip', item: null, blockedBy: [], stackParents: [] }];
     const { candidateRows } = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext });
     expect(candidateRows).toEqual([]);
+  });
+});
+
+describe('buildOverlapRows — dependsOn from the PR body manifest (non-candidate Y has no verdict)', () => {
+  const bodyBlockedBy = (item, blockedBy) => embedManifestInBody('PR body', buildManifest({ item, blockedBy, repos: [{ repo: 'we', ref: 'lane/y' }] }));
+  const rawPr = (num, extra = {}) => ({ number: num, baseRefName: 'main', isDraft: false, labels: [], files: [], headRefOid: null, ...extra });
+
+  it('derives dependsOn from a body-only manifest when the PR has no verdict', () => {
+    const openPrContext = { prsByRepo: new Map([['we', [rawPr(20, { body: bodyBlockedBy(200, [100]) })]]]) };
+    const { openPrRows } = buildOverlapRows({ candidates: [], verdicts: [], openPrContext });
+    expect(openPrRows[0].dependsOn.has(100)).toBe(true);
+  });
+
+  it('unions the verdict deps with the body deps and tolerates a missing/garbled manifest', () => {
+    const openPrContext = { prsByRepo: new Map([['we', [rawPr(20, { body: bodyBlockedBy(200, [100]) }), rawPr(21, { body: '<!-- lane-manifest:begin -->nope<!-- lane-manifest:end -->' }), rawPr(22)]]]) };
+    const verdicts = [{ num: 20, repo: 'we', decision: 'skip', item: 200, blockedBy: [7], stackParents: [8], headSha: null }];
+    const { openPrRows } = buildOverlapRows({ candidates: [], verdicts, openPrContext });
+    const byNum = (n) => openPrRows.find((r) => r.number === n);
+    expect([...byNum(20).dependsOn].sort((a, b) => a - b)).toEqual([7, 8, 100]);
+    expect(byNum(21).dependsOn.size).toBe(0);
+    expect(byNum(22).dependsOn.size).toBe(0);
+  });
+
+  it('planLabelDrain does NOT yield X to a non-candidate Y whose body declares blockedBy X (no deadlock)', () => {
+    const big = [{ path: 'shared.mjs', additions: 100, deletions: 0 }];
+    const small = [{ path: 'shared.mjs', additions: 1, deletions: 0 }];
+    const mk = (n, files, extra = {}) => rawPr(n, { files, labels: [{ name: 'review:pending' }], ...extra });
+    const openPrContext = { prsByRepo: new Map([['we', [mk(10, small), mk(20, big, { body: bodyBlockedBy(200, [100]) })]]]) };
+    const x = { num: 10, repo: 'we', decision: 'merge', item: 100, blockedBy: [], stackParents: [], headSha: null };
+    const { candidateRows, openPrRows } = buildOverlapRows({ candidates: [x], verdicts: [x], openPrContext });
+    const waits = overlapYieldWaits({ candidates: candidateRows.map((r) => ({ ...r, readyAtMs: 0, windowMs: 45 * 60_000 })), openPrs: openPrRows, nowMs: 1_000 });
+    const { ready, deferred } = planLabelDrain([x], { overlapContext: waits });
+    expect(deferred).toEqual([]);
+    expect(ready.map((c) => c.num)).toEqual([10]);
   });
 });

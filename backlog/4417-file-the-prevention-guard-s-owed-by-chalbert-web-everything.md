@@ -3,9 +3,10 @@ bornAs: xa2b8x5
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: active
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/conveyor/land-overlap-yield.mjs", "we:scripts/conveyor/__tests__/land-overlap-yield.test.mjs", "we:scripts/__tests__/merge-ai-prs-overlap-yield.test.mjs", "we:scripts/__tests__/backlog-cli-snapshot.test.mjs"]
 dateOpened: "2026-09-28"
+dateStarted: "2026-09-30"
 preparedDate: "2026-09-30"
 preparedAgainstSha: "e20756915ef4a1d7bf0bea1e0926dae2cf2acc99"
 tags: []

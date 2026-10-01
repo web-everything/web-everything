@@ -1787,12 +1787,15 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
         if (mergedPrKeys.has(key)) continue;
         const v = verdictByKey.get(key);
         const files = Array.isArray(p.files) ? p.files : [];
+        // A non-candidate PR has no verdict, so its declared deps come from its own body's lane manifest. Union, never replace.
+        const bodyManifest = extractManifestFromBody(p.body);
+        const bodyDeps = [...(Array.isArray(bodyManifest?.blockedBy) ? bodyManifest.blockedBy : []), ...(Array.isArray(bodyManifest?.stackParents) ? bodyManifest.stackParents : [])].map(asItemId);
         rowsByKey.set(key, {
           number: p.number, repo: normalizedRepo, baseRefName: p.baseRefName ?? null, isDraft: !!p.isDraft,
           labels: Array.isArray(p.labels) ? p.labels : [], files, filesComplete: files.length < OVERLAP_FILES_PAGE_CAP,
           readyAtMs: null, windowMs: null, headSha: v?.headSha ?? p.headRefOid ?? null,
           item: v?.item ?? null, exempt: false,
-          dependsOn: new Set([...(v?.blockedBy || []), ...(v?.stackParents || [])]),
+          dependsOn: new Set([...(v?.blockedBy || []), ...(v?.stackParents || []), ...bodyDeps]),
         });
       }
     }

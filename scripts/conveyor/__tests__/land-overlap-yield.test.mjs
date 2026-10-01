@@ -6,6 +6,7 @@ import {
   overlapYieldWaits, outranksForLand, overlapRowKey, windowMsAtLabelTime, validateOverlapYieldConfig,
   resolveOverlapYieldSettings, parseOverlapYieldOverrides, DEFAULT_OVERLAP_YIELD_CONFIG,
   isExemptItem, computeOverlapContext, writeOverlapYieldConfig,
+  isShallowRepository, gitHistoryConfigAtReader, readyToMergeLabelTimeMs,
 } from '../land-overlap-yield.mjs';
 
 const T0 = Date.parse('2026-09-28T12:00:00Z');
@@ -335,5 +336,110 @@ describe('writeOverlapYieldConfig — degrades to an unlocked write, honestly re
     const result = writeOverlapYieldConfig({ path, patch: { windowMinutes: -5 } });
     expect(result.ok).toBe(false);
     expect(result.errors.length).toBeGreaterThan(0);
+  });
+});
+
+describe('isShallowRepository / gitHistoryConfigAtReader / readyToMergeLabelTimeMs — IO shell fallbacks (#4417)', () => {
+  const T = Date.parse('2026-09-28T12:00:00Z');
+  /** exec fake keyed on the git subcommand; counts every call. */
+  const fakeGit = ({ shallow = 'false\n', revList = 'abc123\n', show = JSON.stringify({ enabled: true, windowMinutes: 30 }) } = {}) => {
+    const calls = [];
+    const exec = (_cmd, args) => {
+      calls.push(args[0]);
+      if (args[0] === 'rev-parse') { if (shallow instanceof Error) throw shallow; return shallow; }
+      if (args[0] === 'rev-list') { if (revList instanceof Error) throw revList; return revList; }
+      if (args[0] === 'show') { if (show instanceof Error) throw show; return show; }
+      throw new Error(`unexpected ${args[0]}`);
+    };
+    return { exec, calls };
+  };
+
+  it('isShallowRepository maps true/false/garbage/throw to true/false/null/null', () => {
+    expect(isShallowRepository({ exec: () => 'true\n' })).toBe(true);
+    expect(isShallowRepository({ exec: () => 'false\n' })).toBe(false);
+    expect(isShallowRepository({ exec: () => 'wat' })).toBe(null);
+    expect(isShallowRepository({ exec: () => { throw new Error('no git'); } })).toBe(null);
+  });
+
+  it('gitHistoryConfigAtReader: each fallback path yields its OWN distinct value', () => {
+    expect(gitHistoryConfigAtReader({ exec: fakeGit({ shallow: 'true\n' }).exec })(T)).toEqual({ trusted: false });
+    expect(gitHistoryConfigAtReader({ exec: fakeGit({ shallow: 'garbage' }).exec })(T)).toEqual({ trusted: false });
+    expect(gitHistoryConfigAtReader({ exec: fakeGit({ revList: '\n' }).exec })(T)).toEqual({ trusted: true, windowMinutes: null });
+    expect(gitHistoryConfigAtReader({ exec: fakeGit().exec })(T)).toEqual({ trusted: true, windowMinutes: 30 });
+    expect(gitHistoryConfigAtReader({ exec: fakeGit({ show: new Error('bad path') }).exec })(T)).toEqual({ trusted: true, windowMinutes: null });
+    expect(gitHistoryConfigAtReader({ exec: fakeGit({ show: 'not json' }).exec })(T)).toEqual({ trusted: true, windowMinutes: null });
+    expect(gitHistoryConfigAtReader({ exec: fakeGit({ revList: new Error('boom') }).exec })(T)).toEqual({ trusted: false });
+  });
+
+  it('gitHistoryConfigAtReader memoizes per exact ms — a repeat call spawns no further git', () => {
+    const { exec, calls } = fakeGit();
+    const configAt = gitHistoryConfigAtReader({ exec });
+    const first = configAt(T);
+    const afterFirst = calls.length; // rev-parse + rev-list + show
+    expect(afterFirst).toBe(3);
+    expect(configAt(T)).toBe(first);
+    expect(calls.length).toBe(afterFirst);
+    configAt(T + 1);
+    expect(calls.length).toBe(afterFirst + 2); // a different ms is a real lookup (rev-list + show)
+  });
+
+  describe('readyToMergeLabelTimeMs', () => {
+    let cdir;
+    beforeEach(() => { cdir = mkdtempSync(join(tmpdir(), 'rtm-label-')); });
+    afterEach(() => { rmSync(cdir, { recursive: true, force: true }); });
+    const events = (list) => JSON.stringify(list);
+    const ev = (name, at, event = 'labeled') => ({ event, label: { name }, created_at: at });
+    const mkExec = (out) => { const f = (...a) => { f.n++; if (out instanceof Error) throw out; return out; }; f.n = 0; return f; };
+
+    it('the LAST ready-to-merge add wins; other labels and unlabel events are ignored', () => {
+      const exec = mkExec(events([
+        ev('ready-to-merge', '2026-09-28T10:00:00Z'),
+        ev('review:pending', '2026-09-28T11:00:00Z'),
+        ev('ready-to-merge', '2026-09-28T09:00:00Z', 'unlabeled'),
+        ev('ready-to-merge', '2026-09-28T12:00:00Z'),
+      ]));
+      expect(readyToMergeLabelTimeMs({ repo: 'o/r', num: 1, sha: 's1', exec, dir: cdir })).toBe(Date.parse('2026-09-28T12:00:00Z'));
+    });
+
+    it('empty / invalid JSON / throw → null; no slug or sha → null with NO exec call', () => {
+      expect(readyToMergeLabelTimeMs({ repo: 'o/r', num: 2, sha: 's', exec: mkExec('[]'), dir: cdir })).toBe(null);
+      expect(readyToMergeLabelTimeMs({ repo: 'o/r', num: 3, sha: 's', exec: mkExec('{{'), dir: cdir })).toBe(null);
+      expect(readyToMergeLabelTimeMs({ repo: 'o/r', num: 4, sha: 's', exec: mkExec(new Error('gh down')), dir: cdir })).toBe(null);
+      const exec = mkExec('[]');
+      expect(readyToMergeLabelTimeMs({ repo: null, num: 5, sha: 's', exec, dir: cdir })).toBe(null);
+      expect(readyToMergeLabelTimeMs({ repo: 'o/r', num: 5, sha: '', exec, dir: cdir })).toBe(null);
+      expect(exec.n).toBe(0);
+    });
+
+    it('a second call with the same head sha is served from the cache (exec once); a new sha re-reads', () => {
+      const exec = mkExec(events([ev('ready-to-merge', '2026-09-28T10:00:00Z')]));
+      const args = { repo: 'o/r', num: 6, sha: 'aaaaaaa', exec, dir: cdir };
+      const t = readyToMergeLabelTimeMs(args);
+      expect(readyToMergeLabelTimeMs(args)).toBe(t);
+      expect(exec.n).toBe(1);
+      readyToMergeLabelTimeMs({ ...args, sha: 'bbbbbbb' });
+      expect(exec.n).toBe(2);
+    });
+  });
+});
+
+describe('isExemptItem — filename matching (#4417)', () => {
+  const dirOf = (files) => ({
+    backlogDir: '/b',
+    readdir: () => Object.keys(files),
+    readFile: (p) => files[p.split('/').pop()],
+  });
+  const high = '---\npriority: high\n---\n';
+
+  it('matches the real `<id>-<slug>.md` convention', () => {
+    expect(isExemptItem(100, dirOf({ '100-fix.md': high }))).toBe(true);
+  });
+
+  it('a hyphen-less `<id>.md` is NOT matched (deliberate: cards are always number-hyphen-slug)', () => {
+    expect(isExemptItem(100, dirOf({ '100.md': high }))).toBe(false);
+  });
+
+  it('id 100 never matches a `1000-` prefixed card', () => {
+    expect(isExemptItem(100, dirOf({ '1000-other.md': high }))).toBe(false);
   });
 });

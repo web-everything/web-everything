@@ -350,6 +350,33 @@ describe('backlog.mjs CLI — overlap-yield-config (#4308)', () => {
     expect(readFileSync(configPath(), 'utf8')).toBe(before);
   });
 
+  it('invalid --set-enabled values and non-finite/negative --set-window are refused — exit 1, file byte-identical (#4417)', () => {
+    const before = readFileSync(configPath(), 'utf8');
+    for (const flag of ['--set-enabled=yes', '--set-enabled=1', '--set-enabled=TRUE', '--set-window=-5', '--set-window=Infinity']) {
+      expect(run(['overlap-yield-config', flag]).code, flag).toBe(1);
+    }
+    expect(readFileSync(configPath(), 'utf8')).toBe(before);
+  });
+
+  it('a mutation from a PRIMARY-checkout path is BLOCKED by the lane guard — exit 1, config untouched (#4417)', () => {
+    // `webeverything` is a PRIMARY_REPOS name (guard-lane.mjs), so a copy of scripts/ under <tmp>/ws/webeverything
+    // resolves as the shared primary checkout, not a lane.
+    const ws = mkdtempSync(join(tmpdir(), 'we-primary-sim-'));
+    try {
+      const primaryScripts = join(ws, 'webeverything', 'scripts');
+      cpSync(WE_SCRIPTS_DIR, primaryScripts, { recursive: true });
+      const cfg = join(primaryScripts, 'drain-overlap-yield-config.json');
+      const before = readFileSync(cfg, 'utf8');
+      let code = 0; let stderr = '';
+      try {
+        execFileSync('node', [join(primaryScripts, 'backlog.mjs'), 'overlap-yield-config', '--set-window=20', '--json'], { cwd: join(ws, 'webeverything'), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: childEnv() });
+      } catch (e) { code = e.status; stderr = `${e.stderr}${e.stdout}`; }
+      expect(code).toBe(1);
+      expect(stderr).toContain('BLOCKED');
+      expect(readFileSync(cfg, 'utf8')).toBe(before);
+    } finally { rmSync(ws, { recursive: true, force: true }); }
+  });
+
 });
 
 // #2747 — the deliverable is that the REAL CLI stamps the OPERATOR's calendar day, not the runtime's UTC
