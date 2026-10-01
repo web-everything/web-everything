@@ -3,9 +3,10 @@ bornAs: xppaab9
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: active
 scope: ["we:backlog/4377-provider-allowance-gate-every-model-spawn-checks-a-live-allo.md"]
 dateOpened: "2026-09-28"
+dateStarted: "2026-09-30"
 preparedDate: "2026-09-30"
 preparedAgainstSha: "577ae7270910faca246326a32db914fb1c6a6dcf"
 tags: []

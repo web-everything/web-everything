@@ -6,6 +6,7 @@
  * derivation, the capability-presence join table, retirement-shape, and dual-mode plug conformance.
  * Pure file-move — same tests, smaller file.
  */
+import { buildBacklogResolvableIds } from '../lib/citation-check.mjs';
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -17,6 +18,7 @@ import {
   findStaleRatifiedClaims,
   findDuplicateKeysPerScope, validateNoDuplicateManifestKeys,
   findBuriedForkSections, findNonBatchableMarkers, findTestPlanGaps, findGuardRelaxationGaps, lintBacklogItemRendering,
+  findMustWithoutDoneWhen, findDanglingBacklogRefs,
   deriveResearchFreshness, addIsoDuration, RESEARCH_REVIEW_HORIZON_DEFAULT,
   validateCapabilityPresence, validateRetirementShape,
   validatePlugDualMode, PLUG_UNPLUGGED_TEST_ENFORCED,
@@ -745,5 +747,53 @@ describe('findGuardRelaxationGaps — #4409 guard-relaxation Must lines', () => 
     const body = 'Relax the refusal only when X.\n';
     expect(lintBacklogItemRendering({ item: { id: '9', kind: 'story', status: 'open' }, body }).warnings.some((w) => /relaxes a refusal/.test(w))).toBe(true);
     expect(lintBacklogItemRendering({ item: { id: '9', kind: 'story', status: 'resolved' }, body }).warnings.some((w) => /relaxes a refusal/.test(w))).toBe(false);
+  });
+});
+
+const card = (musts, done) => `## Explicit MVP cut\n\n**Must (MVP):**\n${musts.map((m, i) => `${i + 1}. ${m}`).join('\n')}\n\n**Out of MVP:**\n1. later\n\n## Done when\n\n${done}\n`;
+
+describe('findMustWithoutDoneWhen — #4438 Must ↔ Done-when citation', () => {
+  it('flags the one Must a Done-when never cites', () => {
+    const gaps = findMustWithoutDoneWhen(card(['a', 'b', 'c'], '1. Must 1 holds.\n2. Must 3 holds.'));
+    expect(gaps.map((g) => g.must)).toEqual([2]);
+  });
+  it('accepts `Must N`, `Musts A, B` and `Musts A-B`; prose alone is not a citation', () => {
+    expect(findMustWithoutDoneWhen(card(['a', 'b'], 'Must 2 and Musts 1, 2'))).toEqual([]);
+    expect(findMustWithoutDoneWhen(card(['a', 'b', 'c', 'd'], 'Musts 1-4 delivered'))).toEqual([]);
+    expect(findMustWithoutDoneWhen(card(['a', 'b'], 'Everything in the MVP is delivered.')).map((g) => g.must)).toEqual([1, 2]);
+  });
+  it('returns [] for cards with no MVP-cut section; Out-of-MVP numbering is not a Must', () => {
+    expect(findMustWithoutDoneWhen('## Done when\n\n1. ok\n')).toEqual([]);
+    expect(findMustWithoutDoneWhen(card(['a'], 'Must 1')).length).toBe(0);
+  });
+});
+
+describe('findDanglingBacklogRefs — #4438 we:backlog/<id> resolution', () => {
+  const known = buildBacklogResolvableIds([{ num: '4380' }, { num: '4500', bornAs: 'xabc123' }, { num: 'xnew123' }]);
+  it('flags an unknown id, passes known, provisional and bornAs ids', () => {
+    expect(findDanglingBacklogRefs('see we:backlog/9999-nope.md', known).map((g) => g.id)).toEqual(['9999']);
+    expect(findDanglingBacklogRefs('see `we:backlog/4380-foo.md` and we:backlog/4380', known)).toEqual([]);
+    expect(findDanglingBacklogRefs('we:backlog/xnew123-x.md we:backlog/xabc123-old.md', known)).toEqual([]);
+  });
+  it('honours the (pending-lane) escape marker', () => {
+    expect(findDanglingBacklogRefs('we:backlog/9999-nope.md (pending-lane)', known)).toEqual([]);
+  });
+});
+
+describe('lintBacklogItemRendering — #4438 guards', () => {
+  const body = card(['a', 'b'], 'Must 1') + 'refs we:backlog/9999-nope.md\n';
+  const known = new Set(['4380']);
+  it('surfaces both as warnings on an open card', () => {
+    const r = lintBacklogItemRendering({ item: { id: '9', kind: 'story', status: 'open' }, body, knownBacklogIds: known });
+    expect(r.warnings.some((w) => /no Done-when clause cites/.test(w))).toBe(true);
+    expect(r.warnings.some((w) => /resolve to no file/.test(w))).toBe(true);
+    expect(r.errors.some((e) => /Done-when|resolve to no file/.test(e))).toBe(false);
+  });
+  it('skips resolved cards; omitting knownBacklogIds skips only guard 2', () => {
+    const w = (o) => lintBacklogItemRendering({ body, ...o }).warnings.join('\n');
+    expect(w({ item: { id: '9', kind: 'story', status: 'resolved' }, knownBacklogIds: known })).not.toMatch(/Done-when|no file/);
+    const noIds = w({ item: { id: '9', kind: 'story', status: 'open' } });
+    expect(noIds).toMatch(/no Done-when clause cites/);
+    expect(noIds).not.toMatch(/resolve to no file/);
   });
 });

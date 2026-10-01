@@ -919,12 +919,13 @@ mark("6d. Backlog (single source of truth for ideas/issues/reviews/decisions)");
 // dropped by the loader, so it isn't in `backlog` at all — it must be caught by scanning files directly).
 // #3637 — read the POC-branch registry ONCE for the whole loop, not per item.
 const pocRegistry = readPocRegistry();
+const knownBacklogIds = buildBacklogResolvableIds(backlog); // #4438 guard 2
 for (const item of backlog) {
   if (!item.id) continue;
   const p = join(ROOT, 'backlog', `${item.id}.md`);
   if (!existsSync(p)) continue;
   const body = readFileSync(p, 'utf8').replace(/^---\n[\s\S]*?\n---\n/, '');
-  const { errors: itemErr, warnings: itemWarn } = lintBacklogItemRendering({ item, body, pocRegistry });
+  const { errors: itemErr, warnings: itemWarn } = lintBacklogItemRendering({ item, body, pocRegistry, knownBacklogIds });
   for (const m of itemErr) err(m);
   for (const m of itemWarn) warn(m);
 }

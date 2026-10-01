@@ -23,6 +23,7 @@ import { createRequire } from 'node:module';
 import {
   lintBacklogItemRendering, findUnquotedColonScalars, DIGEST_MAX_WORDS, scanRepoLocusPrefixes,
 } from './check-standards-rules.mjs';
+import { buildBacklogResolvableIds } from './lib/citation-check.mjs';
 import { TIERS } from './lib/build-queue.mjs';
 // #3637 — the declared POC branches, so this scoped lint validates `deliveryTarget:` with the SAME predicate
 // the whole-repo gate uses (a green scoped run must never disagree with `check:standards`).
@@ -88,7 +89,8 @@ for (const h of findUnquotedColonScalars(content)) {
 }
 
 // Body rendering checks (raw HTML, bad links, buried fork, mis-flagged batchable) — shared with the gate.
-const rendering = lintBacklogItemRendering({ item, body, pocRegistry: readPocRegistry() });
+const rendering = lintBacklogItemRendering({ item, body, pocRegistry: readPocRegistry(),
+  knownBacklogIds: buildBacklogResolvableIds(backlog) });
 errors.push(...rendering.errors);
 warnings.push(...rendering.warnings);
 

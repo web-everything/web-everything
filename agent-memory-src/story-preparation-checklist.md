@@ -105,6 +105,8 @@ and dispatchers can then mechanically check whether any of the card's declared `
 since prep by running `node scripts/readiness/prep-staleness.mjs --item=<NNN>`. Do not stamp a story until
 its preparation has passed independent review (item 9).
 
+**Review-lens line (#4438):** every MVP Must is cited by number (`Must N` / `Musts A-B`) in a `## Done when` clause.
+
 **How to apply (items 1–8, 10):** manual discipline until it becomes the `prepare-story` operation (epic #3099). Its
 first slice — a script flagging importers missing from a `scope:` — was built, reviewed twice and **stood
 down** (#3098): in a repo whose scripts shell each other rather than import, a static ESM import scan reads

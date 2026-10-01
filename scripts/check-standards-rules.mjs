@@ -1031,6 +1031,54 @@ export function findTestPlanGaps(body) {
   return gaps;
 }
 
+// ── Must ↔ Done-when coverage (#4438 guard 1) ───────────────────────────────────
+// Every numbered item under `**Must (MVP):**` in `## Explicit MVP cut` must be cited BY NUMBER in `## Done when`
+// (`Must N`, `Musts A, B`, `Musts A-B`). Prose-only coverage is not a citation. Returns one `{ must, detail }`
+// per uncited Must; [] when the card has no MVP-cut section or no numbered Musts.
+const MUST_CITE_RE = /\bMusts?\s+(\d+(?:\s*[-–]\s*\d+)?(?:\s*(?:,|&|and)\s*\d+(?:\s*[-–]\s*\d+)?)*)/gi;
+
+export function findMustWithoutDoneWhen(body) {
+  const lines = String(body ?? '').split(/\r?\n/);
+  const cut = sectionLines(lines, /^explicit mvp cut\b/i);
+  const musts = [];
+  let inMust = false;
+  for (const line of cut) {
+    if (/^\*\*\s*Must\b[^*]*\*\*/i.test(line)) { inMust = true; continue; }
+    if (/^\*\*[^*]+\*\*/.test(line)) { inMust = false; continue; }
+    const m = inMust && /^(\d+)\.\s+(.*)$/.exec(line);
+    if (m) musts.push({ must: Number(m[1]), detail: m[2].slice(0, 60) });
+  }
+  if (!musts.length) return [];
+  const cited = new Set();
+  for (const m of sectionLines(lines, /^done when\b/i).join('\n').matchAll(MUST_CITE_RE)) {
+    for (const part of m[1].split(/\s*(?:,|&|and)\s*/)) {
+      const r = /^(\d+)(?:\s*[-–]\s*(\d+))?$/.exec(part.trim());
+      if (!r) continue;
+      const lo = Number(r[1]);
+      const hi = r[2] ? Number(r[2]) : lo;
+      for (let n = lo; n <= hi && n - lo < 200; n++) cited.add(n);
+    }
+  }
+  return musts.filter((x) => !cited.has(x.must));
+}
+
+// ── Dangling `we:backlog/<id>` refs (#4438 guard 2) ─────────────────────────────
+// A `we:backlog/<id>[-slug][.md]` ref whose id is in no `knownIds` (landed nums + bornAs hashes, from
+// `buildBacklogResolvableIds`). A ref immediately followed by `(pending-lane)` is exempt (sibling still in flight).
+// Returns `[{ id, ref }]`, one per distinct dangling id.
+const BACKLOG_REF_RE = /\bwe:backlog\/([0-9]{1,5}|x[0-9a-z]{6,7})(?![0-9a-z])((?:-[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.md)?)(\s*\(pending-lane\))?/g;
+
+export function findDanglingBacklogRefs(body, knownIds) {
+  const seen = new Set();
+  const gaps = [];
+  for (const m of String(body ?? '').matchAll(BACKLOG_REF_RE)) {
+    if (m[3] || knownIds.has(m[1]) || seen.has(m[1])) continue;
+    seen.add(m[1]);
+    gaps.push({ id: m[1], ref: `we:backlog/${m[1]}${m[2]}` });
+  }
+  return gaps;
+}
+
 // ── Per-item backlog RENDERING lint (#845) ────────────────────────────────────
 // The structural/rendering checks that operate on ONE backlog item in isolation — no registry/cross-item
 // context needed, so they're cheap enough to run on every edit (a scoped `check:standards --item NNN`
@@ -1044,7 +1092,7 @@ export function findTestPlanGaps(body) {
 // run file-driven (a malformed-YAML item is skipped by the loader, so it isn't in the item array at all),
 // so each caller runs `findUnquotedColonScalars(content)` over the raw file itself. Also excludes the
 // digest-length nudge (validateBacklogItem owns it) and the blockedBy cycle walk (a graph-level check).
-export function lintBacklogItemRendering({ item, body, pocRegistry = null }) {
+export function lintBacklogItemRendering({ item, body, pocRegistry = null, knownBacklogIds = null }) {
   const errors = [];
   const warnings = [];
   const id = item.id;
@@ -1108,6 +1156,23 @@ export function lintBacklogItemRendering({ item, body, pocRegistry = null }) {
           : `case "${g.detail}" is neither a capability (Red today) nor a preservation (GREEN today) case`).join('; ');
       warnings.push(`Backlog item "${id}" has Test-plan gaps — ${detail}. Classify each case as capability (fails on the base) ` +
         `or preservation (passes on both, naming its mutation proof), and give every design condition a case.`);
+    }
+  }
+
+  // Must <-> Done-when coverage + dangling `we:backlog/<id>` refs (#4438) — WARNING only, open/active cards.
+  // The dangling-ref check needs the caller's id set; absent -> skipped.
+  if (item.status !== 'resolved') {
+    const mustGaps = findMustWithoutDoneWhen(body);
+    if (mustGaps.length) {
+      warnings.push(`Backlog item "${id}" has MVP Must(s) no Done-when clause cites by number — ` +
+        `${mustGaps.map((g) => `Must ${g.must} ("${g.detail}")`).join('; ')}. Cite each as \`Must N\` / \`Musts A-B\` in ## Done when.`);
+    }
+    if (knownBacklogIds) {
+      const dangling = findDanglingBacklogRefs(body, knownBacklogIds);
+      if (dangling.length) {
+        warnings.push(`Backlog item "${id}" refs backlog card(s) that resolve to no file — ` +
+          `${dangling.map((g) => g.ref).join(', ')}. Fix the id, or mark a sibling still in flight with \`(pending-lane)\` right after the ref.`);
+      }
     }
   }
 
