@@ -12,7 +12,9 @@
  * teaching `pass-daemon.mjs` a new way to resolve a path. The mechanism is proven here with fixture entries
  * (see the test file), not real ones — a real entry is a one-line addition once its slice lands.
  *
- * @typedef {{ script: string, args?: string[], intervalMs: number }} DaemonManifestEntry
+ * @typedef {{ script: string, args?: string[], intervalMs: number, defaultLaunch?: boolean }} DaemonManifestEntry
+ *   - `defaultLaunch`: `false` keeps the entry out of the supervisor launcher's default launch set (an entry
+ *     that is only safe to start by name, e.g. a resident singleton). Absent/`true` = launched by default.
  *   - `script`: repo-relative path to the pass's own CLI entry point (e.g.
  *     `'scripts/conveyor/branch-drift.mjs'`), resolved against the repo root at spawn time — never absolute,
  *     never containing `..` (validated below).
@@ -127,6 +129,9 @@ const MERGE_ORPHAN_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
 const HEALTH_WATCH_INTERVAL_MS = 5 * 60 * 1000;
 
 export const DAEMON_MANIFEST = {
+  // Resident-only: `tick` throws unless the resident `--daemon` owner injected its lease, so the supervisor
+  // launcher's default launch set must never spawn it bare. Still resolvable by name for the resident start.
+  'health-responder': { script: 'scripts/conveyor/health-responder.mjs', args: ['tick'], intervalMs: 60_000, defaultLaunch: false },
   'orphan-claim-release': { script: 'scripts/conveyor/orphan-claim-release.mjs', args: ['--apply'], intervalMs: ORPHAN_CLAIM_INTERVAL_MS },
   'merge-orphan-sweep': { script: 'scripts/merge-ai-prs.mjs', args: [], intervalMs: MERGE_ORPHAN_SWEEP_INTERVAL_MS },
   'branch-drift': { script: 'scripts/conveyor/branch-drift.mjs', args: ['sweep'], intervalMs: DEFAULT_PASS_INTERVAL_MS },
@@ -193,6 +198,9 @@ export function assertValidManifestEntry(name, entry) {
   }
   if (entry.args !== undefined && (!Array.isArray(entry.args) || !entry.args.every((a) => typeof a === 'string'))) {
     throw new TypeError(`daemon-manifest: entry "${name}"'s args must be an array of strings`);
+  }
+  if (entry.defaultLaunch !== undefined && typeof entry.defaultLaunch !== 'boolean') {
+    throw new TypeError(`daemon-manifest: entry "${name}"'s defaultLaunch must be a boolean`);
   }
   if (!Number.isFinite(entry.intervalMs) || entry.intervalMs <= 0) {
     throw new TypeError(`daemon-manifest: entry "${name}"'s intervalMs must be a positive number (got ${JSON.stringify(entry.intervalMs)})`);

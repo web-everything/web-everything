@@ -10,6 +10,7 @@ import { describe, it, expect } from 'vitest';
 import {
   DAEMON_MANIFEST, isSafeManifestScriptPath, assertValidManifestEntry, resolveManifestEntry,
 } from '../daemon-manifest.mjs';
+import { defaultLaunchNames } from '../supervisor-launcher.mjs';
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -22,7 +23,7 @@ describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
 
   it('has exactly the 7 WE-only entries (incl. #3913 orphan-claim-release, epic #3383 merge-orphan-sweep + lease-reaper, #4077 health-watch) plus 6 passes × 3 repos = 25 total (we:backlog/x5uqim1-*.md added ci-red-recovery-watch)', () => {
     expect(Object.keys(DAEMON_MANIFEST).sort()).toEqual([
-      'branch-drift', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'merge-orphan-sweep', 'lease-reaper', 'health-watch',
+      'branch-drift', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'merge-orphan-sweep', 'lease-reaper', 'health-watch', 'health-responder',
       ...['ci-queue-watch', 'parked-pr-conflict-watch', 'parked-pr-progress-watch', 'lane-pool-health-watch', 'stuck-pr-watch', 'ci-red-recovery-watch']
         .flatMap((p) => REPO_KEYS.map((k) => `${p}-${k}`)),
     ].sort());
@@ -196,4 +197,25 @@ describe('resolveManifestEntry — the closed-allowlist lookup itself', () => {
     expect(resolveManifestEntry('branch-drift')).toEqual(DAEMON_MANIFEST['branch-drift']);
     expect(() => resolveManifestEntry('totally-made-up')).toThrow(/"totally-made-up" is not in the daemon manifest/);
   });
+});
+
+it('health-responder is a host singleton shadow tick at 60 seconds', () => {
+  expect(resolveManifestEntry('health-responder')).toMatchObject({ script: 'scripts/conveyor/health-responder.mjs', args: ['tick'], intervalMs: 60_000 });
+});
+
+it('health-responder is resident-only: it never joins the supervisor launcher default launch set', () => {
+  expect(DAEMON_MANIFEST['health-responder'].defaultLaunch).toBe(false);
+  expect(defaultLaunchNames()).not.toContain('health-responder');
+  expect(defaultLaunchNames()).toContain('health-watch');
+  // Still resolvable by name: the resident `pass-daemon`/launchd path is the one sanctioned start.
+  expect(resolveManifestEntry('health-responder').script).toBe('scripts/conveyor/health-responder.mjs');
+});
+
+it('defaultLaunch must be a boolean when present, and false excludes only from the default set', () => {
+  const ok = { script: 'scripts/x.mjs', intervalMs: 1000 };
+  expect(() => assertValidManifestEntry('x', { ...ok, defaultLaunch: 'no' })).toThrow(/defaultLaunch must be a boolean/);
+  expect(assertValidManifestEntry('x', { ...ok, defaultLaunch: false }).defaultLaunch).toBe(false);
+  const manifest = { a: ok, b: { ...ok, defaultLaunch: false }, c: { ...ok, defaultLaunch: true } };
+  expect(defaultLaunchNames(manifest)).toEqual(['a', 'c']);
+  expect(resolveManifestEntry('b', manifest)).toBe(manifest.b);
 });

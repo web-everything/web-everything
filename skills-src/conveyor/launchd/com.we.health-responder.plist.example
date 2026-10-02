@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <!-- EXAMPLE ONLY. Not installed or started by slice 1. Replace placeholders before deployment.
+       Dedicated registered clone: wev-health-responder. Independent pinned responder config defaults
+       to enabled:false, mode:shadow, smells:{}. No live mode or external adapters exist in this slice.
+       Feed: node we:scripts/operations/run.mjs health-respond --json
+       PASS_DAEMON_SELF_SYNC stays absent: no clone mutations are authorized in shadow slice 1.
+       Existing pass-daemon owns singleton, heartbeat and safe between-tick lifecycle.
+       WE_DISPATCH_PAUSE_FILE must match the existing owners before any later live activation. -->
+  <key>Label</key><string>com.we.health-responder</string>
+  <key>Disabled</key><true/>
+  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>300</integer>
+  <key>ProgramArguments</key><array>
+    <string>/ABSOLUTE/NODE</string>
+    <string>/WORKSPACE/wev-health-responder/scripts/conveyor/health-responder.mjs</string>
+    <string>--daemon</string>
+  </array>
+  <key>WorkingDirectory</key><string>/WORKSPACE/wev-health-responder</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>CONVEYOR_STATE_ROOT</key><string>/PINNED/conveyor-state</string>
+    <key>WE_DISPATCH_PAUSE_FILE</key><string>/PINNED/dispatch-pause.json</string>
+  </dict>
+  <key>StandardOutPath</key><string>/PINNED/health-responder.log</string>
+  <key>StandardErrorPath</key><string>/PINNED/health-responder.log</string>
+</dict></plist>

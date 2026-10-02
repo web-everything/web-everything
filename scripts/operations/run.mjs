@@ -23,6 +23,8 @@
  * derived from the declaration — including which operations have a juror to point at a lane at all.
  */
 
+import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
+import { healthRespondOperation, HEALTH_RESPOND_OP } from './health-respond.mjs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -133,6 +135,7 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  * declaration is what {@link ./http-adapter.mjs} derives a route table from, with no third entry anywhere.
  */
 export const OPERATIONS = Object.freeze({
+  [HEALTH_RESPOND_OP]: () => ({ declaration: healthRespondOperation({ readDecisions: readLatestDecisions }), sinks: {} }),
   // #xqa9ttq — `codexAdvisory` reads `REVIEW_PR_CODEX_ADVISORY=1` off the environment (`codexAdvisoryFromEnv`,
   // `we:scripts/operations/review-pr.mjs`), OFF by default — see that flag's own docs for why it is an env
   // var and not a CLI `--flag` (the step list is fixed here, before any run's argv is parsed) and why
@@ -574,7 +577,7 @@ if (IS_CLI) {
   // Only runner-activity promises bounded CLI persistence, including --resume and call logging.
   // stale-state promises zero filesystem writes, including engine bookkeeping.
   const cliStores = name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
-    : name === STALE_STATE_OP ? { store: createMemoryRunStore(), callLog: undefined }
+    : [STALE_STATE_OP, HEALTH_RESPOND_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
     : { store: createFileRunStore(), callLog: createFileCallLogStore() };
   runOperationCli({
     declaration,

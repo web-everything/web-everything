@@ -169,15 +169,15 @@ export function planLaunchTargets(names, { manifest = DAEMON_MANIFEST, resolveEn
 }
 
 /**
- * The names to launch when the CLI is given none of its own: every name CURRENTLY registered in the manifest,
- * sorted for a deterministic launch order. Today (see this file's own header): none — #3873 and any later
+ * The names to launch when the CLI is given none of its own: every name CURRENTLY registered in the manifest
+ * except entries marked `defaultLaunch: false` (start-by-name only), sorted for a deterministic launch order. Today (see this file's own header): none — #3873 and any later
  * daemon-launcher slice are what populate the real manifest; this same, unchanged function then picks up
  * whatever they register with zero code change here. Pure.
  * @param {Record<string, object>} [manifest]
  * @returns {string[]}
  */
 export function defaultLaunchNames(manifest = DAEMON_MANIFEST) {
-  return Object.keys(manifest).sort();
+  return Object.keys(manifest).filter((name) => manifest[name]?.defaultLaunch !== false).sort();
 }
 
 /** Below this runtime, a `classifyExit`-eligible exit would ordinarily read as `'too-short'` (see

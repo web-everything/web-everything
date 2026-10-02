@@ -58,6 +58,7 @@ export const DAEMON_CLONE_SEED = [
   'wev-review-daemon',
   'wev-merge-daemon',
   'wev-health-watch',
+  'wev-health-responder',
   'wev-host-sampler',
   'plateau-drain-daemon',
   `.lanes${SEP}we-drain-daemon${SEP}lane-1`,

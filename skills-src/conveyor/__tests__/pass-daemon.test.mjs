@@ -1,3 +1,4 @@
+// @vitest-environment node
 /**
  * @file skills-src/conveyor/__tests__/pass-daemon.test.mjs
  * @description Unit proof of #3871's generic single-pass daemon — the pure loop only (no real child process,
@@ -244,4 +245,34 @@ describe('spawnPassOnce — env passthrough to the child process (#gh-write-burs
     expect(opts.env).toBe(env);
     expect(opts.env.GH_CALLER).toBe('parked-pr-conflict-watch-we');
   });
+});
+
+it('health responder uses its own existing lease key and stops after lease loss', async () => {
+  expect(passDaemonLeaseKey('health-responder')).toBe('<conveyor:pass-daemon:health-responder-lease>');
+  const runPass = vi.fn(async () => ({ code: 0 }));
+  const sleep = vi.fn();
+  const result = await runPassDaemonLoop({ runPass, sleep, isAlive: () => false, intervalMs: 60_000 });
+  expect(result.stoppedReason).toBe('lease-lost'); expect(runPass).toHaveBeenCalledTimes(1); expect(sleep).not.toHaveBeenCalled();
+});
+
+it('two real processes contend on the responder runner-lock; losing owner cannot heartbeat or release', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { spawnSync } = await import('node:child_process');
+  const { acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned, makeOwner } = await import('../runner-lock.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'responder-lease-'));
+  const key = passDaemonLeaseKey('health-responder'), owner = makeOwner('test-responder');
+  try {
+    expect(acquireRunnerLease(root, owner, { key }).ok).toBe(true);
+    const url = new URL('../runner-lock.mjs', import.meta.url).href;
+    const source = `import { acquireRunnerLease, makeOwner } from ${JSON.stringify(url)}; console.log(JSON.stringify(acquireRunnerLease(process.argv[1], makeOwner('competitor'), { key: process.argv[2] })));`;
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', source, root, key], { encoding: 'utf8', timeout: 10_000 });
+    expect(child.status).toBe(0); expect(JSON.parse(child.stdout).ok).toBe(false);
+    expect(heartbeatRunnerLease(root, 'wrong-owner', { key })).toBe(false);
+    expect(releaseRunnerLeaseIfOwned(root, 'wrong-owner', { key })).toBe(false);
+    expect(heartbeatRunnerLease(root, owner, { key })).toBe(true);
+    releaseRunnerLeaseIfOwned(root, owner, { key });
+    expect(heartbeatRunnerLease(root, owner, { key })).toBe(false);
+  } finally { releaseRunnerLeaseIfOwned(root, owner, { key }); rmSync(root, { recursive: true, force: true }); }
 });

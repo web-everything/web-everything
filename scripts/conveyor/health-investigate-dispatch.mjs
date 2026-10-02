@@ -58,7 +58,7 @@ import { healthDir } from './health-watch-section.mjs';
 
 /** The declared read operations the agent may run through `run.mjs` (4078: runner-activity, stale-state,
  *  dispatch-eligibility). Every other operation id is denied — see {@link NON_READ_OPERATIONS}. */
-export const HEALTH_INVESTIGATE_READ_OPERATIONS = Object.freeze(['runner-activity', 'stale-state', 'dispatch-eligibility']);
+export const HEALTH_INVESTIGATE_READ_OPERATIONS = Object.freeze(['runner-activity', 'stale-state', 'dispatch-eligibility', 'health-respond']);
 
 /** Every OTHER `run.mjs` operation id, denied by name. A static list (importing `run.mjs` here would pull every
  *  operation's io into the health tick); `health-investigate-dispatch.test.mjs` asserts it covers every id in

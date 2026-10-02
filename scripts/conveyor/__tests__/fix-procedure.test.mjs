@@ -613,6 +613,61 @@ describe('fixBegin / fixEnd — the IO shell', () => {
     expect(labels.log).toContainEqual(['set', { add: 'review-status:draft-withdrawn', remove: [FIXING_LABEL] }]);
   });
 
+  it('reentrant draft-then-plain fix-begin replaces the draft meta (never merged forward): status reads fixing, fix-end drops only the fixing label', async () => {
+    const view = { headRefName: BRANCH, headRefOid: 'a'.repeat(40), isDraft: false, state: 'OPEN', labels: [] };
+    const { gh, calls } = fakeGh(view);
+    const labels = fakeLabels();
+    const who = 'fix-4453a';
+    const sessionId = 'sess-4453a';
+    const first = await fixBegin({ repo: 'we', pr: 4453, who, sessionId, draft: true, reason: 'scope-change', gh, labels, lockRoot: root, nowMs: T0 });
+    expect(first).toMatchObject({ ok: true, draft: true, reason: 'scope-change', reentrant: false });
+    // the PR is now draft and carries the draft label; the same fixer re-begins WITHOUT --draft
+    Object.assign(view, { isDraft: true, labels: [{ name: 'review-status:draft-scope-change' }] });
+    labels.log.length = 0;
+    const second = await fixBegin({ repo: 'we', pr: 4453, who, sessionId, gh, labels, lockRoot: root, nowMs: T0 + MIN });
+    expect(second).toMatchObject({ ok: true, reentrant: true, draft: false, reason: null });
+    expect(labels.log.filter(([k]) => k === 'comment')).toHaveLength(0); // reentrant: no second marker comment
+    expect(labels.log).toContainEqual(['set', { add: FIXING_LABEL, remove: ['review-status:draft-scope-change'] }]);
+
+    const entry = readLiveFixClaim({ repo: 'we', pr: 4453, lockRoot: root, nowMs: T0 + 2 * MIN });
+    expect(entry.meta).toMatchObject({ draft: false, reason: null });
+    expect(deriveReviewStatus({ pr: 4453, fixClaim: entry })).toMatchObject({ role: 'fix', state: 'fixing' });
+
+    labels.log.length = 0;
+    const end = await fixEnd({ repo: 'we', pr: 4453, who, sessionId, gh, labels, lockRoot: root });
+    expect(end).toMatchObject({ ok: true, draft: false, reason: null });
+    expect(labels.log).toContainEqual(['set', { remove: [FIXING_LABEL] }]);
+    expect(calls.filter((a) => a[1] === 'ready')).toHaveLength(1); // only the first begin drafted; nothing un-drafts
+  });
+
+  it('reentrant explicit draft reacquire fix-begin: the newer draft intent wins in meta + status, and fix-end drops the matching label', async () => {
+    const view = { headRefName: BRANCH, headRefOid: 'a'.repeat(40), isDraft: false, state: 'OPEN', labels: [] };
+    const { gh, calls } = fakeGh(view);
+    const labels = fakeLabels();
+    const who = 'fix-4453b';
+    const sessionId = 'sess-4453b';
+    const first = await fixBegin({ repo: 'we', pr: 4454, who, sessionId, gh, labels, lockRoot: root, nowMs: T0 });
+    expect(first).toMatchObject({ ok: true, draft: false, reentrant: false });
+    expect(readLiveFixClaim({ repo: 'we', pr: 4454, lockRoot: root, nowMs: T0 }).meta).toMatchObject({ draft: false, reason: null });
+
+    view.labels = [{ name: FIXING_LABEL }];
+    labels.log.length = 0;
+    const second = await fixBegin({ repo: 'we', pr: 4454, who, sessionId, draft: true, reason: 'withdrawn', gh, labels, lockRoot: root, nowMs: T0 + MIN });
+    expect(second).toMatchObject({ ok: true, reentrant: true, draft: true, reason: 'withdrawn' });
+    expect(labels.log).toContainEqual(['set', { add: 'review-status:draft-withdrawn', remove: [FIXING_LABEL] }]);
+    expect(calls.filter((a) => a[1] === 'ready' && a.includes('--undo'))).toHaveLength(1);
+
+    const entry = readLiveFixClaim({ repo: 'we', pr: 4454, lockRoot: root, nowMs: T0 + 2 * MIN });
+    expect(entry.meta).toMatchObject({ draft: true, reason: 'withdrawn' });
+    expect(deriveReviewStatus({ pr: 4454, fixClaim: entry })).toMatchObject({ role: 'fix', state: 'draft-withdrawn' });
+
+    labels.log.length = 0;
+    const end = await fixEnd({ repo: 'we', pr: 4454, who, sessionId, gh, labels, lockRoot: root });
+    expect(end).toMatchObject({ ok: true, draft: true, reason: 'withdrawn' });
+    expect(labels.log).toContainEqual(['set', { remove: ['review-status:draft-withdrawn'] }]);
+    expect(labels.log).not.toContainEqual(['set', { remove: [FIXING_LABEL] }]);
+  });
+
   it('fix-begin refuses --draft with no valid --reason, and --reason with no --draft — before any IO', async () => {
     const { gh, calls } = fakeGh({ headRefName: BRANCH, isDraft: false, state: 'OPEN' });
     const noReason = await fixBegin({ repo: 'we', pr: 9001, who: 'w', draft: true, gh, labels: fakeLabels(), lockRoot: root, nowMs: T0 });

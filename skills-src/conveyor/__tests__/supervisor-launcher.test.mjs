@@ -131,7 +131,14 @@ describe('defaultLaunchNames — every currently-registered name, sorted', () =>
   // Live-caught in review (PR #2472): same class of fix as planLaunchTargets' own test above — assert
   // against DAEMON_MANIFEST's own current real keys, never a value hardcoded at write time.
   it('defaults to the real DAEMON_MANIFEST when none is supplied', () => {
-    expect(defaultLaunchNames()).toEqual(Object.keys(DAEMON_MANIFEST).sort());
+    expect(defaultLaunchNames()).toEqual(Object.keys(DAEMON_MANIFEST).filter((n) => DAEMON_MANIFEST[n].defaultLaunch !== false).sort());
+  });
+
+  it('leaves out entries marked defaultLaunch: false, which stay launchable by explicit name', () => {
+    const manifest = { ...fixtureManifest, 'resident-only': { script: 'scripts/conveyor/r.mjs', args: ['tick'], intervalMs: 1000, defaultLaunch: false } };
+    expect(defaultLaunchNames(manifest)).toEqual(['branch-drift', 'ci-queue-watch', 'no-args-entry']);
+    const { targets } = planLaunchTargets(['resident-only'], { manifest, resolveEntry: fakeResolveEntry });
+    expect(targets.map((t) => t.name)).toEqual(['resident-only']);
   });
 });
 
