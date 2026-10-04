@@ -29,6 +29,10 @@ describe('#3902 — restore-review-label STUCK variant', () => {
     expect(d).toHaveLength(1);
     expect(d[0]).toMatchObject({ label: 'review:pending', variant: 'stuck' });
   });
+  it('the open-only listing has no `state` field: absent state reads as open', () => {
+    const { state, ...listed } = pr3902();
+    expect(owed(plan(listed))).toHaveLength(1);
+  });
   it('policy green/off: not owed', () => {
     expect(owed(plan(pr3902(), 'green'))).toEqual([]);
     expect(owed(plan(pr3902(), 'off'))).toEqual([]);
