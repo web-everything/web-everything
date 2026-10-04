@@ -69,12 +69,12 @@
 import { withOperatorAnswer } from './stand-down-answer-core.mjs';
 import { fixerRulingBrief, renderRulingNotAddressed } from '../lib/ruling-ledger.mjs';
 import { withSalvageHint } from '../lib/salvage-index.mjs';
-import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
-import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
+import { describeDispatchFailure, describeSpawnFailure } from '../lib/describe-spawn-failure.mjs';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -840,7 +840,8 @@ export function fixerTableFor(ruling) {
 export function postRulingNotice({ repo, pr, ruling, exec = execFileSyncThrottled }) {
   // `noticedRungs` is read off the thread by the planner: one notice per head AND ladder rung.
   if (!ruling?.matches?.length || (ruling.noticedRungs ?? []).includes(ruling.rung?.id ?? '*')) return false;
-  exec('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body', renderRulingNotAddressed(ruling)],
+  const slug = ghRepoSlug(repo);
+  exec('gh', ['pr', 'comment', String(pr), '--repo', slug, '--body', renderRulingNotAddressed(ruling)],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
   return true;
 }
@@ -981,7 +982,14 @@ export function dispatchFix(planned, {
     // The durable notice FIRST: a fixer that reads the thread must find the ruling there. A failed post throws, the
     // claim is released below, and the next tick retries; nothing has been spawned.
     const ladderTable = fixerTableFor(planned.rulingNotAddressed); // may refuse before anything is posted
-    postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
+    try {
+      postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
+    } catch (e) {
+      // PR #3794 — a failed gh notice is an environment fault, before any Claude spawn.
+      let target = repo;
+      try { target = ghRepoSlug(repo); } catch { /* unresolvable: name what we were given */ }
+      throw new Error(`${DISPATCH_ENV_FAULT_PREFIX} ruling notice post failed for PR #${planned.pr} (gh pr comment --repo ${target}): ${describeSpawnFailure(e, { label: 'gh pr comment' })}`);
+    }
     if (planned.rulingNotAddressed?.rung) {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ruling-not-addressed rung ${planned.rulingNotAddressed.rung.at} (${planned.rulingNotAddressed.rung.id}) model=${ladderTable?.model ?? 'default-fix-route'}`);
     }
