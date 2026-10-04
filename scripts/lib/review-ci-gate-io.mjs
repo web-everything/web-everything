@@ -53,3 +53,19 @@ export function readReviewCiGate({ repo, pr, readHead = readReviewHead,
     return { allowed: false, headSha, reason: 'unreadable-ci', error: String(error?.message ?? error) };
   }
 }
+
+/**
+ * The one-line skip reason for a refused gate. `unreadable-ci` alone hid the real failure (live 2026-10-04:
+ * plateauapp/plateau-app#202 skipped every pass while the actual error was a `gh` GraphQL "Could not resolve to
+ * a Repository" from a token minted for another org's installation), so the underlying error rides along —
+ * first non-empty lines only, single-line, bounded, and with any token-shaped string scrubbed.
+ */
+export function formatReviewCiSkip(ci) {
+  const reason = ci?.reason ?? 'unreadable-ci';
+  const raw = typeof ci?.error === 'string' ? ci.error : '';
+  const detail = raw.split('\n').map(s => s.trim()).filter(Boolean).slice(0, 2).join(' | ')
+    .replace(/\b(gh[opsur]_|github_pat_)[A-Za-z0-9_]+/g, '<redacted>')
+    .replace(/(authorization:\s*)(token|bearer)?\s*\S+/gi, '$1<redacted>')
+    .slice(0, 300);
+  return detail ? `review-ci: ${reason} (${detail})` : `review-ci: ${reason}`;
+}

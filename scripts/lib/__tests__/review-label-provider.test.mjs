@@ -14,7 +14,27 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { GH_ARGV, PR_STATE_FIELDS, createGhProvider, writeOrder } from '../review-label-provider.mjs';
+import { GH_ARGV, PR_STATE_FIELDS, createGhProvider, writeOrder, clampLabelDescription, GITHUB_LABEL_DESCRIPTION_MAX } from '../review-label-provider.mjs';
+
+describe('clampLabelDescription', () => {
+  it('exports the GitHub limit and preserves strings up to that limit', () => {
+    expect(GITHUB_LABEL_DESCRIPTION_MAX).toBe(100);
+    for (const value of ['', 'short description ', 'x'.repeat(100)]) {
+      expect(clampLabelDescription(value)).toBe(value);
+    }
+  });
+
+  it('returns an empty string for non-strings', () => {
+    for (const value of [undefined, null, 42, true, {}, []]) {
+      expect(clampLabelDescription(value)).toBe('');
+    }
+  });
+
+  it('trims trailing whitespace from the cut before appending an ellipsis', () => {
+    expect(clampLabelDescription('x'.repeat(97) + ' \tmore')).toBe('x'.repeat(97) + '…');
+    expect(clampLabelDescription('x'.repeat(101))).toBe('x'.repeat(99) + '…');
+  });
+});
 
 describe('GH_ARGV is byte-identical to the pre-port inline calls', () => {
   it('reads PR state in ONE call, with every field the label arc needs', () => {
@@ -66,6 +86,15 @@ describe('GH_ARGV is byte-identical to the pre-port inline calls', () => {
   it('ensureLabel accepts an optional color/description override', () => {
     expect(GH_ARGV.ensureLabel('o/n', 'review-status:reviewing', { color: 'c5def5', description: 'a reviewer is actively working this PR' }))
       .toEqual(['label', 'create', 'review-status:reviewing', '--repo', 'o/n', '--color', 'c5def5', '--description', 'a reviewer is actively working this PR', '--force']);
+  });
+
+  it('clamps the ruling-needed description to GitHub’s limit', () => {
+    const description = 'AI review parked with confirmed findings that need an operator ruling on the current head (auto-managed)';
+    const argv = GH_ARGV.ensureLabel('o/n', 'advisory:ruling-needed', { description });
+    const value = argv[argv.indexOf('--description') + 1];
+    expect(value.length).toBeLessThanOrEqual(100);
+    expect(value.endsWith('…')).toBe(true);
+    expect(value).toBe(description.slice(0, 99) + '…');
   });
 });
 
