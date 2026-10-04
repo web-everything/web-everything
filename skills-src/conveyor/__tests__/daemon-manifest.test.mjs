@@ -21,9 +21,9 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..'
 describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
   const REPO_KEYS = Object.keys(CONSTELLATION_REPOS);
 
-  it('has the host passes (including opt-in heavy-run-sample) plus 6 passes per repo', () => {
+  it('has the host passes plus 6 passes per repo', () => {
     expect(Object.keys(DAEMON_MANIFEST).sort()).toEqual([
-      'branch-drift', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'merge-orphan-sweep', 'lease-reaper', 'health-watch', 'health-responder', 'heavy-run-sample',
+      'branch-drift', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'merge-orphan-sweep', 'lease-reaper', 'health-watch', 'health-responder',
       ...['ci-queue-watch', 'parked-pr-conflict-watch', 'parked-pr-progress-watch', 'lane-pool-health-watch', 'stuck-pr-watch', 'ci-red-recovery-watch']
         .flatMap((p) => REPO_KEYS.map((k) => `${p}-${k}`)),
     ].sort());
@@ -220,7 +220,6 @@ it('defaultLaunch must be a boolean when present, and false excludes only from t
   expect(resolveManifestEntry('b', manifest)).toBe(manifest.b);
 });
 
-it('heavy-run sampler is opt-in at a one-minute cadence', () => {
-  expect(DAEMON_MANIFEST['heavy-run-sample']).toEqual({ script: 'scripts/conveyor/heavy-run-ungated.mjs', args: ['sample'], intervalMs: 60_000, defaultLaunch: false });
-  expect(defaultLaunchNames(DAEMON_MANIFEST)).not.toContain('heavy-run-sample');
+it('does not register the dedicated heavy-run sampler as a pass', () => {
+  expect(DAEMON_MANIFEST).not.toHaveProperty('heavy-run-sample');
 });

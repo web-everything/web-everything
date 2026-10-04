@@ -1,12 +1,12 @@
 /** Process-tree classification and sampler IO regression probes. */
 import { afterEach, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { parsePsOutput } from '../health-watch-core.mjs';
 import { healthDir } from '../health-watch-section.mjs';
-import { findUngatedHeavyRuns, summarizeSample, readRecentSamples } from '../heavy-run-ungated.mjs';
+import { findUngatedHeavyRuns, summarizeSample, readRecentSamples, HEAVY_SAMPLE_INTERVAL_ENV, resolveSampleIntervalS } from '../heavy-run-ungated.mjs';
 const dirs = [];
 const temp = () => { const d = mkdtempSync(join(tmpdir(), 'heavy-sample-')); dirs.push(d); return d; };
 afterEach(() => dirs.splice(0).forEach((d) => rmSync(d, { recursive: true, force: true })));
@@ -62,8 +62,8 @@ it('CLI appends one sample, caps history, and loops for a bounded count', () => 
   writeFileSync(path, (JSON.stringify({ at: 'old' }) + '\n').repeat(1440));
   run('sample');
   expect(readFileSync(path, 'utf8').trim().split('\n')).toHaveLength(1440);
-  expect(run('loop', ['--count=2', '--interval=0.01']).trim().split('\n')).toHaveLength(2);
-});
+  expect(run('loop', ['--count=2', '--interval=10']).trim().split('\n')).toHaveLength(2);
+}, 15_000);
 it('records ps failures without failing the CLI', () => {
   const root = temp();
   const bin = join(root, 'bin'); mkdirSync(bin);
@@ -71,4 +71,41 @@ it('records ps failures without failing the CLI', () => {
   const sample = JSON.parse(execFileSync(process.execPath, ['scripts/conveyor/heavy-run-ungated.mjs', 'sample', `--state-root=${root}`, '--json'], { encoding: 'utf8', env: { ...process.env, PATH: bin } }));
   expect(sample.error).toBeTruthy();
   expect(JSON.parse(readFileSync(join(healthDir(root), 'heavy-run-samples.jsonl'), 'utf8'))).toEqual(sample);
+});
+
+it('exports the dedicated sampler interval environment variable', () => {
+  expect(HEAVY_SAMPLE_INTERVAL_ENV).toBe('WE_HEAVY_SAMPLE_INTERVAL_S');
+});
+it.each([
+  ['30', '60', 30],
+  [undefined, '60', 60],
+  ...[undefined, '', 'abc', '5', 'Infinity', 'NaN'].map((env) => [undefined, env, null]),
+  ...['', 'abc', '5', 'Infinity'].map((flag) => [flag, '60', null]),
+  ['10', undefined, 10],
+])('resolves interval flag %s and env %s to %s', (flag, env, expected) => {
+  expect(resolveSampleIntervalS({ flag, env })).toBe(expected);
+});
+it('CLI loop is disabled without an interval and writes no sample', () => {
+  const root = temp();
+  const env = { ...process.env };
+  delete env.WE_HEAVY_SAMPLE_INTERVAL_S;
+  const result = spawnSync(process.execPath, ['scripts/conveyor/heavy-run-ungated.mjs', 'loop', `--state-root=${root}`], { env, encoding: 'utf8', timeout: 2000 });
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain('disabled');
+  expect(existsSync(join(healthDir(root), 'heavy-run-samples.jsonl'))).toBe(false);
+});
+it('CLI loop uses the environment interval and honors count=1', () => {
+  const root = temp(); const fixture = join(root, 'ps.txt');
+  writeFileSync(fixture, 'PID PPID %CPU ELAPSED COMMAND\n10 1 0 00:01 claude\n11 10 1 00:01 vitest run x\n');
+  const result = spawnSync(process.execPath, ['scripts/conveyor/heavy-run-ungated.mjs', 'loop', '--count=1', `--state-root=${root}`, `--ps-fixture=${fixture}`], { env: { ...process.env, WE_HEAVY_SAMPLE_INTERVAL_S: '10' }, encoding: 'utf8', timeout: 2000 });
+  expect(result.status).toBe(0);
+  const lines = readFileSync(join(healthDir(root), 'heavy-run-samples.jsonl'), 'utf8').trim().split('\n');
+  expect(lines).toHaveLength(1);
+  expect(JSON.parse(lines[0])).toMatchObject({ count: 1 });
+});
+it('ships a disabled dedicated loop plist with an explicit interval', () => {
+  const plist = readFileSync('skills-src/conveyor/launchd/com.we.heavy-run-sample.plist.example', 'utf8');
+  expect(plist).toMatch(/<key>Disabled<\/key>\s*<true\/>/);
+  expect(plist).toContain('WE_HEAVY_SAMPLE_INTERVAL_S');
+  expect(plist).toMatch(/heavy-run-ungated\.mjs<\/string>\s*<string>loop<\/string>/);
 });
