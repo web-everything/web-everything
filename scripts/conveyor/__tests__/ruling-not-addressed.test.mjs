@@ -60,6 +60,15 @@ describe('ruling not addressed — the send-back', () => {
     expect(twice.refusals[0].kind).toBe('ruling-dispute');
     expect(twice.notes.find((n) => n.kind === 'ruling-dispute').text).toMatch(/2 fixer turn\(s\) ended without a new head/);
   });
+  it('a fix-end line from anyone but a trusted author does not count as a miss', () => {
+    const thread = ignoredRulingThread();
+    const notice = trusted(renderRulingNotAddressed({ head: H2, matches: [{ finding: { file: 'policy/pointer.md', line: 12, summary: 's' }, ruling: 'block: x', priorHead: H1, misses: 1 }] }), 21);
+    const stranger = { body: `${FIX_END_MARKER}\n`, createdAt: iso(30), author: { login: 'stranger' } };
+    const out = plan(H2, [...thread, notice, stranger, { ...stranger, createdAt: iso(50) }]);
+    expect(out.dispatch.map((d) => d.rulingNotAddressed.rung.id)).toEqual(['resend']);
+    expect(out.dispatch[0].rulingNotAddressed.returns).toBe(0);
+    expect(out.refusals).toEqual([]);
+  });
   it('is read off the real reconcile pass (enrichment wired in)', () => {
     const pr = basePr(H2, ignoredRulingThread());
     const out = runReconcilePass({ repo, now: Date.parse('2026-10-04T12:00:00Z'), readPrs: () => [pr], readAgents: () => [], enrich: (x) => x,

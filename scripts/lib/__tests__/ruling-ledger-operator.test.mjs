@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { readReferralRecords } from '../jury-core.mjs';
+import { mandatoryReferralReviewer, readReferralRecords, renderReferralRecord } from '../jury-core.mjs';
 import { ignoredRulings, operatorBlockRulings, rulingNeeded, claimSimilarity } from '../ruling-ledger.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'conveyor', '__tests__', 'fixtures', 'pr-3794-ignored-ruling.json'), 'utf8'));
@@ -51,6 +51,18 @@ describe('PR #3794 replay (live thread)', () => {
   it('is quiet once the operator rules again after seeing the head (the 12:11Z ruling)', () => {
     expect(ignoredRulings({ headRefOid: SECOND, comments: upto(52) })).toBeNull();
     expect(rulingNeeded({ headRefOid: SECOND, comments: upto(52) })).toBeNull();
+  });
+  it('a head pushed after the 12:11Z re-ruling is a first miss of that ruling, not a third miss counted from 01:19Z', () => {
+    const next = 'e'.repeat(40);
+    const [prev] = readReferralRecords([upto(51).filter((c) => /mandatory-referrals-v1/.test(c.body)).at(-1)], {}).records;
+    const body = renderReferralRecord({ ...prev, head: next, runId: 'run-after-reruling', reviewer: mandatoryReferralReviewer('run-after-reruling'), rulings: [] });
+    const comments = [...upto(52), { body, createdAt: '2026-10-04T13:00:00Z', author: { login: 'web-everything' } }];
+    const ig = ignoredRulings({ headRefOid: next, comments });
+    const m = ig.matches.find((x) => /xcs4nce/.test(x.finding.file));
+    expect(m.ruledAt).toBe('2026-10-04T12:11:32.000Z');
+    expect(m.misses).toBe(1);
+    expect(ig.misses).toBe(1);
+    expect(ig.escalate).toBe(false);
   });
   it('is quiet on the head the operator ruled about (the finding is still the one being ruled)', () => {
     expect(ignoredRulings({ headRefOid: heads['4c488bb2c'], comments: upto(34) })).toBeNull();
