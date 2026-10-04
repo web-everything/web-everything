@@ -35,7 +35,7 @@ import {
   SMOKE_TRANSIENT_RETRIES_ENV, SMOKE_RETRY_BACKOFF_MS_ENV,
   refreshSmokeGithubEnv, probeGithubAuth, hasGithubAuthSignature,
   isEnvTimeoutRow, isEnvTimeoutFailureSet, widenSmokeBudgetsEnv,
-  DISPATCH_DRY_RUN_SCRIPT, DISPATCH_DRY_RUN_CODE_ENTRIES,
+  DISPATCH_DRY_RUN_SCRIPT, DISPATCH_DRY_RUN_CODE_ENTRIES, busyPoolSkip, hostLooksBusy,
 } from '../daemon-live-smoke.mjs';
 
 /**
@@ -88,8 +88,8 @@ describe('isSmokeGateDisabled / resolveSmokeBudgets — pure, env-driven', () =>
     expect(b.ghApiMs).toBe(30_000);
   });
 
-  it('laneAcquireWaitMs defaults to 180000 and is independently overridable via WE_SMOKE_LANE_ACQUIRE_WAIT_MS', () => {
-    expect(resolveSmokeBudgets({}).laneAcquireWaitMs).toBe(180_000);
+  it('laneAcquireWaitMs defaults to 30000 (was 180000, which let a busy pool hold the smoke for 3 min) and is independently overridable via WE_SMOKE_LANE_ACQUIRE_WAIT_MS', () => {
+    expect(resolveSmokeBudgets({}).laneAcquireWaitMs).toBe(30_000);
     expect(resolveSmokeBudgets({ [SMOKE_BUDGET_ENV.laneAcquireWaitMs]: '5000' }).laneAcquireWaitMs).toBe(5000);
     // overriding the wait budget must never perturb the separate, plain laneAcquireMs budget
     expect(resolveSmokeBudgets({ [SMOKE_BUDGET_ENV.laneAcquireWaitMs]: '5000' }).laneAcquireMs)
@@ -332,7 +332,7 @@ describe('runLiveSmoke — injected runChild', () => {
     expect(acquireArgs).toContain('--wait-ms=9000');
   });
 
-  it('the lane acquire argv uses the 180000ms default --wait-ms with no env override', async () => {
+  it('the lane acquire argv uses the 30000ms default --wait-ms with no env override', async () => {
     const calls = [];
     const runChild = vi.fn(async (cmd, args) => {
       calls.push(args);
@@ -342,7 +342,7 @@ describe('runLiveSmoke — injected runChild', () => {
     });
     await runLiveSmoke({ root: '/x', env: {}, runChild });
     const acquireArgs = calls.find((a) => a[1] === 'acquire');
-    expect(acquireArgs).toContain('--wait-ms=180000');
+    expect(acquireArgs).toContain('--wait-ms=30000');
   });
 
   it('a single failing check fails the WHOLE gate, but every other check still runs (no fail-fast)', async () => {
@@ -1240,10 +1240,21 @@ describe('a check that ran out of TIME under load is environment, never code (li
     expect(isEnvTimeoutFailureSet([row, { name: 'gh-api-repo', ok: true }])).toBe(true);
   });
 
+  it('a cheap probe killed at its OWN short cap under load is an env-timeout row (live 2026-10-03: tree-stays-clean 10s)', () => {
+    const killed = { name: 'tree-stays-clean', ok: false, ms: 10018, mayBeTransient: false, detail: 'git status --porcelain failed: timed out after 10000ms (process group killed)' };
+    expect(isEnvTimeoutRow(killed)).toBe(true);
+    // no laundering: a row that failed FAST with the same words did not spend its cap
+    expect(isEnvTimeoutRow({ ...killed, ms: 300 })).toBe(false);
+    // a starved harness (cap far below any real budget) is not load: it keeps the 30s floor
+    expect(isEnvTimeoutRow({ ...killed, ms: 3, detail: 'git status --porcelain failed: timed out after 1ms (process group killed)' })).toBe(false);
+    // tree-printed text keeps the 30s floor
+    expect(isEnvTimeoutRow({ name: 'lane-pool-list', ok: false, ms: 10018, detail: 'lane-pool list failed: list --acquirable scan exceeded its 120000ms budget at lane-3' })).toBe(false);
+  });
+
   it('REPLAY end-to-end: times out twice (budgets widened on the retry) → verdict env-timeout, never code', async () => {
     const host = overloadedHost({ listMs: [120905, 300900], listFails: [true, true] });
     const r = await runLiveSmokeWithRetry({
-      root: '/x', env: {}, runChild: host.runChild, clock: host.clock, sleep: async () => {}, refreshAuth: noAuth, loadAvg: () => [25.18, 25.76, 26.25],
+      root: '/x', env: { WE_SMOKE_BUSY_LOAD_RATIO: '1e9' }, runChild: host.runChild, clock: host.clock, sleep: async () => {}, refreshAuth: noAuth, loadAvg: () => [25.18, 25.76, 26.25],
     });
     expect(r.verdict).toBe('env-timeout');
     expect(r.attempts).toBe(2);
@@ -1256,7 +1267,7 @@ describe('a check that ran out of TIME under load is environment, never code (li
 
   it('a slow first attempt that fits the widened budget on the retry → pass', async () => {
     const host = overloadedHost({ listMs: [120905, 150000], listFails: [true, false] });
-    const r = await runLiveSmokeWithRetry({ root: '/x', env: {}, runChild: host.runChild, clock: host.clock, sleep: async () => {}, refreshAuth: noAuth });
+    const r = await runLiveSmokeWithRetry({ root: '/x', env: { WE_SMOKE_BUSY_LOAD_RATIO: '1e9' }, runChild: host.runChild, clock: host.clock, sleep: async () => {}, refreshAuth: noAuth });
     expect(r.verdict).toBe('pass');
     expect(r.attempts).toBe(2);
   });
@@ -1300,7 +1311,7 @@ describe('a check that ran out of TIME under load is environment, never code (li
   it('gateMergedCommit: env-timeout rolls back, records NO rejection, reason smoke-env-timeout', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'gate-state-'));
     try {
-      const env = { WE_DAEMON_SMOKE_STATE_DIR: stateDir, [SMOKE_BUDGET_ENV.lanePoolListMs]: '1' };
+      const env = { WE_DAEMON_SMOKE_STATE_DIR: stateDir, [SMOKE_BUDGET_ENV.lanePoolListMs]: '1', WE_SMOKE_BUSY_LOAD_RATIO: '1e9' };
       const resetCalls = [];
       const run = (args) => { if (args[0] === 'reset') resetCalls.push(args); return { status: 0, stdout: '' }; };
       const runChild = withNewCheckDefaults(async (cmd, args) => {
@@ -1316,5 +1327,76 @@ describe('a check that ran out of TIME under load is environment, never code (li
       expect(resetCalls).toContainEqual(['reset', '--hard', 'pre']);
       expect(readRejectedSha('/x', env)).toBeNull();
     } finally { rmSync(stateDir, { recursive: true, force: true }); }
+  });
+});
+
+// ── Busy-pool skip (live 2026-10-03 21:16-21:39 ET): lane-pool list 206s + acquire 181s made a ~1000s smoke ─────
+describe('lane-pool probes under a busy pool are SKIPPED (recorded), never allowed to hold the smoke', () => {
+  const KILLED = (n) => `timed out after ${n}ms (process group killed)`;
+  /** A runChild whose pool probes advance a fake clock by `listMs`/`acquireMs` and then throw `listErr`/`acquireErr`. */
+  function host({ listMs = 0, listErr = null, acquireMs = 0, acquireErr = null } = {}) {
+    let t = 1_000_000;
+    const calls = [];
+    const runChild = withNewCheckDefaults(async (cmd, args, opts) => {
+      calls.push({ cmd, args, opts });
+      if (cmd === 'node' && args[1] === 'list') { t += listMs; if (listErr) throw new Error(listErr); return '[]'; }
+      if (cmd === 'node' && args[1] === 'acquire') { t += acquireMs; if (acquireErr) throw new Error(acquireErr); return JSON.stringify({ lane: 3 }); }
+      return '';
+    });
+    return { runChild, clock: () => t, calls };
+  }
+  const row = (r, name) => r.results.find((x) => x.name === name);
+
+  it('the probes run under a SHORT child cap, not the old 5-minute/20-minute budgets', async () => {
+    const h = host();
+    await runLiveSmoke({ root: '/x', env: {}, runChild: h.runChild, clock: h.clock, hostBusy: () => true });
+    expect(h.calls.find((c) => c.args[1] === 'list').opts.timeoutMs).toBe(60_000);
+    expect(h.calls.find((c) => c.args[1] === 'acquire').opts.timeoutMs).toBeLessThanOrEqual(120_000);
+  });
+
+  it('list killed at its cap while the host is busy: skipped (ok), the smoke still passes, reason recorded', async () => {
+    const h = host({ listMs: 60_000, listErr: KILLED(60000) });
+    const r = await runLiveSmoke({ root: '/x', env: {}, runChild: h.runChild, clock: h.clock, hostBusy: () => true });
+    expect(row(r, 'lane-pool-list')).toMatchObject({ ok: true, skipped: true, skipReason: 'busy-pool' });
+    expect(row(r, 'lane-pool-list').detail).toMatch(/^skipped: busy pool/);
+    expect(r.pass).toBe(true);
+  });
+
+  it('the same time-out on an IDLE host still fails (a hung tree is not a busy pool)', async () => {
+    const h = host({ listMs: 60_000, listErr: KILLED(60000) });
+    const r = await runLiveSmoke({ root: '/x', env: {}, runChild: h.runChild, clock: h.clock, hostBusy: () => false });
+    expect(row(r, 'lane-pool-list')).toMatchObject({ ok: false });
+    expect(r.pass).toBe(false);
+  });
+
+  it('a FAST "no free lane" from the tree is not a skip, even on a busy host (no laundering)', async () => {
+    const h = host({ acquireMs: 200, acquireErr: 'no free lane in pool "we" (12 all held/dirty)' });
+    const r = await runLiveSmoke({ root: '/x', env: {}, runChild: h.runChild, clock: h.clock, hostBusy: () => true });
+    expect(row(r, 'lane-acquire-release')).toMatchObject({ ok: false });
+  });
+
+  it('a code-shaped failure is never a skip, however long it took', async () => {
+    const h = host({ listMs: 60_000, listErr: 'SyntaxError: Unexpected token' });
+    const r = await runLiveSmoke({ root: '/x', env: {}, runChild: h.runChild, clock: h.clock, hostBusy: () => true });
+    expect(row(r, 'lane-pool-list')).toMatchObject({ ok: false });
+  });
+
+  it('acquire that waited out its --wait-ms on a busy pool: skipped, and the smoke session is released best-effort', async () => {
+    const h = host({ acquireMs: 30_000, acquireErr: 'no free lane in pool "we" (50 all held/dirty)' });
+    const r = await runLiveSmoke({ root: '/x', env: {}, runChild: h.runChild, clock: h.clock, hostBusy: () => true });
+    expect(row(r, 'lane-acquire-release')).toMatchObject({ ok: true, skipped: true, skipReason: 'busy-pool' });
+    const rel = h.calls.find((c) => c.args[1] === 'release');
+    expect(rel.args).toContain('--all-pools');
+    expect(rel.args.find((a) => a.startsWith('--session=smoke-'))).toBeTruthy();
+    expect(r.pass).toBe(true);
+  });
+
+  it('busyPoolSkip / hostLooksBusy: pure rules', () => {
+    const ctx = { env: {}, hostBusy: () => true };
+    expect(busyPoolSkip({ what: 'x', detail: `x failed: ${KILLED(5)}`, elapsedMs: 89, capMs: 100, ctx })).toBeNull(); // < 90% of cap
+    expect(busyPoolSkip({ what: 'x', detail: `x failed: ${KILLED(5)}`, elapsedMs: 90, capMs: 100, ctx })).toMatchObject({ skipped: true });
+    expect(hostLooksBusy({}, { load: () => 25, cores: () => 10 })).toBe(true);
+    expect(hostLooksBusy({}, { load: () => 3, cores: () => 10 })).toBe(false);
+    expect(hostLooksBusy({ WE_SMOKE_BUSY_LOAD_RATIO: '4' }, { load: () => 25, cores: () => 10 })).toBe(false);
   });
 });

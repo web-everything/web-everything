@@ -183,6 +183,29 @@ describe('rebuildClone', () => {
     expect(second.mock.calls[0][0].changedFiles).toEqual(['backlog/2.md']);
   });
 
+  // Live 2026-10-03: lane-pool probes are now SKIPPED under a busy pool. A build adopted that way never ran those
+  // checks live, so the NEXT smoke must not treat it as "last live-verified" (null ⇒ every check runs).
+  it('a build adopted with a busy-pool skip is not the baseline for skip-unchanged: the next smoke is full', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    advanceMain(originDir, (dir) => writeFile(dir, 'backlog/1.md', 'one\n'));
+    const skipping = vi.fn(async () => ({
+      verdict: 'pass', attempts: 1,
+      smoke: { pass: true, results: [{ name: 'lane-pool-list', ok: true, skipped: true, skipReason: 'busy-pool', detail: 'skipped: busy pool' }] },
+    }));
+    const r1 = await rebuildClone({ root: cloneDir, env, runSmoke: skipping, prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(r1.adopted).toBe(true);
+    expect(readRebuildState(cloneDir, env).busySkippedTrees).toHaveLength(1);
+    advanceMain(originDir, (dir) => writeFile(dir, 'backlog/2.md', 'two\n'));
+    const second = passSmoke();
+    await rebuildClone({ root: cloneDir, env, runSmoke: second, prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(second.mock.calls[0][0].changedFiles).toBeNull(); // not ['backlog/2.md']
+    // that one ran everything and passed without a skip: the third is a normal diff again
+    advanceMain(originDir, (dir) => writeFile(dir, 'backlog/3.md', 'three\n'));
+    const third = passSmoke();
+    await rebuildClone({ root: cloneDir, env, runSmoke: third, prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(third.mock.calls[0][0].changedFiles).toEqual(['backlog/3.md']);
+  });
+
   // #4044 live (10:28-10:40 ET): the fix daemon's rebuild waited silently ~10 min on the review daemon's long tick.
   it('a live reader holding the clone makes the rebuild wait at most 60s by default, logged, then give up', async () => {
     const { originDir, cloneDir, env, lockDir } = makeFixture();

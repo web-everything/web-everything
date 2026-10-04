@@ -786,6 +786,31 @@ describe('case 5e — ci-heal dispatch, capped by the durable heal-mark count, n
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 2602 })]);
   });
 
+  // LIVE INCIDENT 2026-10-04, PR #3833 (web-everything/web-everything): `review:human` + `ci:failed`, a red required
+  // `test` that was NOT this PR's own code. `classifyPr` ranks `review:human` ('needs-human') ABOVE `ci-red`, so
+  // this branch never ran: the PR logged "owed a ci-heal" for 9 hours and no ci-heal was ever planned. A CI
+  // repair is not a review decision — the human hold must not exclude it.
+  it('a `review:human` PR with a red required check IS dispatched `ci-heal` (a CI repair is not a review decision)', () => {
+    const plan = planReconcile({ prs: [prRed({ labels: lbl('review:human', 'ci:failed') })], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 2602, attempts: 0 })]);
+    expect(plan.refusals.filter((r) => r.kind === 'review-ci')).toEqual([]);
+  });
+
+  it('a `review:human` PR whose red check is ONLY review-gate is still not healed', () => {
+    const plan = planReconcile({
+      prs: [prRed({ labels: lbl('review:human'), statusCheckRollup: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] })],
+      agents: [], now: NOW, requiredChecks: ['review-gate'],
+    });
+    expect(plan.dispatch.filter((d) => d.kind === 'ci-heal')).toEqual([]);
+  });
+
+  it('a `review:human` PR at the heal cap surfaces `ci-heal-exhausted`, never a silent stall', () => {
+    const comments = Array.from({ length: CI_HEAL_ROUND_CAP }, () => ({ body: buildCiHealComment({ reason: 'red-ci' }), author: AUTOMATION }));
+    const plan = planReconcile({ prs: [prRed({ labels: lbl('review:human'), comments })], agents: [], now: NOW });
+    expect(plan.dispatch).toHaveLength(0);
+    expect(plan.notes).toEqual([expect.objectContaining({ kind: 'ci-heal-exhausted', prNumber: 2602 })]);
+  });
+
   it(`the durable heal-mark count is read from the PR's OWN comments — ${CI_HEAL_ROUND_CAP - 1} prior heals still dispatches`, () => {
     const comments = Array.from({ length: CI_HEAL_ROUND_CAP - 1 }, () => ({ body: buildCiHealComment({ reason: 'red-ci' }), author: AUTOMATION }));
     expect(comments[0].body.startsWith(CI_HEAL_COMMENT_MARKER)).toBe(true);
@@ -1822,6 +1847,16 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
     expect(plan.refusals).toHaveLength(0);
   });
 
+  it('xuxcsw6 — a fix-mark after the advisory does NOT re-dispatch a review while the referral hold stands (the live #3771 loop)', () => {
+    const comments = [{ body: `${ADVISORY_NOTE_MARKER}\n\nround 1`, author: AUTOMATION }, { body: buildAdvisoryFixComment({}), viewerDidAuthor: true }];
+    const pr = prNeedsHuman({ comments });
+    for (let tick = 0; tick < 3; tick++) {
+      const plan = planReconcile({ prs: [{ ...pr, referralHold: { head: 'a'.repeat(40), episode: 'e', count: 5, why: 'review paused: 5 referrals need a ruling; it resumes on a new push, a ruling, or a send-back' } }], agents: [], now: NOW });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-referrals-pending', prNumber: 2601 })]);
+    }
+  });
+
   // The EXACT `web-everything/web-everything#2549` shape: 5 pre-existing advisory notes (rounds 1-5, `review-round:5`)
   // AND the one genuine advisory-fix mark addressing the latest. `isLatestAdvisoryFindingAddressed` correctly
   // reads `addressed: true` here too (same fix as the test above) — but the GENERIC, pre-existing shared round
@@ -1988,6 +2023,18 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
       kind: 'review', prNumber: 2601, attempts: ADVISORY_FIX_ROUND_CAP, cap: ADVISORY_FIX_ROUND_CAP,
     })]);
     expect(plan.dispatch[0].mode).toBeUndefined(); // never `mode: 'advisory-fix'` — this is a review, not a fixer.
+  });
+
+  // xuxcsw6 — live 2026-10-04, #3771: both direct review branches (a fix postdates the advisory; the newest
+  // advisory does not cover the head) bypassed the referral hold and re-dispatched a full review each tick.
+  const referralHold = { head: 'a'.repeat(40), episode: 'e', count: 2, why: 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back' };
+  it('xuxcsw6 — a held PR is refused review-referrals-pending on the stale-advisory branch, and not when the hold lifts', () => {
+    const pr = prNeedsHuman({ comments: live2766Comments(), headRefOid: REAL_2766_HEAD });
+    const held = planReconcile({ prs: [{ ...pr, referralHold }], agents: [], now: NOW });
+    expect(held.dispatch).toEqual([]);
+    expect(held.refusals).toEqual([expect.objectContaining({ kind: 'review-referrals-pending', prNumber: 2601 })]);
+    expect(planReconcile({ prs: [{ ...pr, referralHold: null }], agents: [], now: NOW }).dispatch)
+      .toEqual([expect.objectContaining({ kind: 'review' })]);
   });
 
   // The exemption above is narrow to a head an advisory has NEVER covered. A PR at the SAME cap, whose newest
@@ -3397,5 +3444,31 @@ describe('xul2kwr withdrawn green drafts', () => {
       const plan = planReconcile({ prs: [pr1563({ isDraft: true, labels: [label], comments: [], statusCheckRollup: checks })], agents: [], now: NOW });
       expect(plan.dispatch).toEqual([expect.objectContaining({ kind })]);
     }
+  });
+});
+
+describe('xe8y12n orthogonal missing-review diagnostic', () => {
+  const commits = [{ messageHeadline: 'repair', authors: [{ name: 'Claude' }] }];
+  it.each([
+    {}, { isDraft: true }, { labels: lbl('ci:failed'), statusCheckRollup: [{ name: 'gate', conclusion: 'failure', status: 'completed' }] },
+    { mergeStateStatus: 'DIRTY', labels: lbl('merge-status:conflicting') },
+    { labels: lbl('review-status:stood-down') },
+    { fixClaim: { session: 'fixer', headSha: 'a'.repeat(40) } },
+  ])('keeps the exact dispatch/refusal decisions for %j', extra => {
+    const pr = { number: 3239, state: 'OPEN', labels: [], headRefName: 'lane/3239', headRefOid: 'a'.repeat(40), comments: [], statusCheckRollup: greenRollup, ...extra };
+    const without = planReconcile({ prs: [pr] });
+    const withEvidence = planReconcile({ prs: [{ ...pr, commits }] });
+    expect(withEvidence.notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing', prNumber: 3239 }));
+    expect(withEvidence.dispatch).toEqual(without.dispatch);
+    expect(withEvidence.refusals).toEqual(without.refusals);
+  });
+  it('does not suppress live-agent decisions', () => {
+    const pr = { number: 3239, state: 'OPEN', labels: [], headRefName: 'lane/3239', headRefOid: 'a'.repeat(40), comments: [], statusCheckRollup: greenRollup };
+    const agents = [{ name: 'review-3239', state: 'running', pid: 123, pidAlive: true, cwd: '/lane', headSha: pr.headRefOid }];
+    const before = planReconcile({ prs: [pr], agents });
+    const after = planReconcile({ prs: [{ ...pr, commits }], agents });
+    expect(after.notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing' }));
+    expect(after.dispatch).toEqual(before.dispatch);
+    expect(after.refusals).toEqual(before.refusals);
   });
 });

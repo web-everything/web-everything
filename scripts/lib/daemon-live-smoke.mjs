@@ -75,7 +75,7 @@
 
 import { randomUUID, createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir, loadavg } from 'node:os';
+import { cpus, homedir, loadavg } from 'node:os';
 import { join } from 'node:path';
 import { runBounded, resolveChildTimeoutMs, resolveLaneAcquireTimeoutMs } from './bounded-child.mjs';
 import { buildGhShimSettingsEnv, sanitizeSpawnEnv } from './gh-app-shim.mjs';
@@ -114,6 +114,11 @@ export const SMOKE_BUDGET_ENV = Object.freeze({
   treeStaysCleanMs: 'WE_SMOKE_TREE_STAYS_CLEAN_MS',
   // #4468 — {@link checkDaemonEntriesBoot}'s own budget; see `daemon-boot-smoke.mjs`.
   daemonBootMs: 'WE_SMOKE_DAEMON_BOOT_MS',
+  // The two BUSY-POOL caps (see {@link busyPoolSkip}): the most the pool probes may spend before they are SKIPPED
+  // (recorded, ok) instead of holding the whole smoke. A rebuild smoke took ~1000s live (2026-10-03) because
+  // `lane-pool list` ran 206s and `acquire` 181s on a loaded host.
+  lanePoolBusyCapMs: 'WE_SMOKE_LANE_POOL_BUSY_CAP_MS',
+  laneAcquireBusyCapMs: 'WE_SMOKE_LANE_ACQUIRE_BUSY_CAP_MS',
 });
 
 function envMs(env, key, fallback) {
@@ -134,7 +139,9 @@ export function resolveSmokeBudgets(env = process.env) {
   return {
     lanePoolListMs: envMs(env, SMOKE_BUDGET_ENV.lanePoolListMs, resolveChildTimeoutMs(env)),
     laneAcquireMs: envMs(env, SMOKE_BUDGET_ENV.laneAcquireMs, resolveLaneAcquireTimeoutMs(env)),
-    laneAcquireWaitMs: envMs(env, SMOKE_BUDGET_ENV.laneAcquireWaitMs, 180_000),
+    laneAcquireWaitMs: envMs(env, SMOKE_BUDGET_ENV.laneAcquireWaitMs, 30_000),
+    lanePoolBusyCapMs: envMs(env, SMOKE_BUDGET_ENV.lanePoolBusyCapMs, 60_000),
+    laneAcquireBusyCapMs: envMs(env, SMOKE_BUDGET_ENV.laneAcquireBusyCapMs, 120_000),
     laneReleaseMs: envMs(env, SMOKE_BUDGET_ENV.laneReleaseMs, resolveChildTimeoutMs(env)),
     ghApiMs: envMs(env, SMOKE_BUDGET_ENV.ghApiMs, 30_000),
     ghPrListMs: envMs(env, SMOKE_BUDGET_ENV.ghPrListMs, 30_000),
@@ -155,7 +162,58 @@ const failureLine = (e) => {
   return err && err !== lines[0] ? `${lines[0]} — ${err.trim()}` : lines[0];
 };
 
-async function checkLanePoolList({ root, budgets, runChild, env }) {
+// ── BUSY-POOL SKIP (live 2026-10-03 21:16-21:39 ET, `wev-review-daemon`) ─────────────────────────────────────────
+// A rebuild smoke took ~1000s: `lane-pool list` 206s and `lane-acquire-release` 181s. Not a bug in the tree — the
+// host was loaded and the pool busy: `list --acquirable` probes lanes one by one (git per lane, ~2.5s each under
+// load), and `acquire --wait-ms` polls the pool scan, which queues behind other holders' scan lock ("gave up
+// waiting for the shared acquirability-scan lock"). While the smoke ran, main moved every ~2 min, so the clone
+// never caught up and every review dispatch was refused as stale.
+//
+// What the two rows prove is that THE TREE'S lane-pool code still lists, acquires and releases. That question is
+// unanswerable while the pool is saturated by OTHER sessions, so a probe that spends its whole (short) cap with
+// the host provably busy is reported `skipped: busy pool` (ok, recorded) rather than failing — or worse,
+// triggering the widened env-timeout retry that made it longer still. A pool problem that IS the tree's fault
+// still fails: a check that ends fast, fails with anything but a time-out/exhaustion signature, or ends while the
+// host is idle is NOT skipped.
+//
+// NO LAUNDERING (the rule `mayBeTransient:false` exists for): the tree's own text can print "no free lane", and
+// a hung tree can simply sleep. So a skip needs ALL of: (1) a time-out/exhaustion signature, (2) the gate's own
+// clock shows the probe really spent >= 90% of its cap, and (3) evidence from OUTSIDE the tree that the host is
+// busy (1-minute load average >= CPU count, `WE_SMOKE_BUSY_LOAD_RATIO` scales it). The rest of the smoke
+// (reconcile, dispatch dry-run, daemon boot, tree-stays-clean) still gates adoption.
+export const BUSY_POOL_SIGNATURES = Object.freeze([
+  /^[^:]+ failed: timed out after \d+ms \(process group killed\)$/,
+  /scan exceeded its \d+ms budget/,
+  /gave up waiting for the shared acquirability-scan lock/,
+  /no free lane/i,
+]);
+export const SMOKE_BUSY_LOAD_RATIO_ENV = 'WE_SMOKE_BUSY_LOAD_RATIO';
+
+/** Is the host busy, judged from outside the tree under test? Injectable via `ctx.hostBusy`. */
+export function hostLooksBusy(env = process.env, { load = () => loadavg()[0], cores = () => cpus().length } = {}) {
+  try {
+    const ratio = envMs(env, SMOKE_BUSY_LOAD_RATIO_ENV, 1);
+    return load() >= Math.max(1, cores()) * ratio;
+  } catch { return false; }
+}
+
+/** PURE-ish: the `skipped: busy pool` result for a failed probe, or `null` when the failure must stand. */
+export function busyPoolSkip({ what, detail, elapsedMs, capMs, ctx }) {
+  const text = String(detail ?? '');
+  if (!BUSY_POOL_SIGNATURES.some((re) => re.test(text))) return null;
+  if (!(elapsedMs >= capMs * 0.9)) return null;
+  const busy = typeof ctx.hostBusy === 'function' ? ctx.hostBusy() : hostLooksBusy(ctx.env);
+  if (!busy) return null;
+  return {
+    ok: true, skipped: true, skipReason: 'busy-pool',
+    detail: `skipped: busy pool — ${what} used its ${Math.round(capMs / 1000)}s cap (${Math.round(elapsedMs / 1000)}s) with the host busy: ${text.slice(0, 200)}`,
+  };
+}
+
+async function checkLanePoolList(ctx) {
+  const { root, budgets, runChild, env } = ctx;
+  const capMs = Math.min(budgets.lanePoolListMs, budgets.lanePoolBusyCapMs);
+  const t0 = (ctx.clock ?? Date.now)();
   try {
     // #4139 live bug (test litter reaching the real pool, card 4061 row 1 — `lane-999999` a "test-fixture id
     // reaching the real pool"): this call used to omit `env` entirely, so `runBounded`'s underlying `spawn`
@@ -167,39 +225,50 @@ async function checkLanePoolList({ root, budgets, runChild, env }) {
     // already IS the real ambient env), so this only changes behavior for a caller that deliberately passed a
     // different one — exactly the case that was silently being dropped.
     const out = await runChild('node', ['scripts/lane-pool.mjs', 'list', '--acquirable', '--no-cache', '--limit=1', '--json'], {
-      cwd: root, timeoutMs: budgets.lanePoolListMs, env,
+      cwd: root, timeoutMs: capMs, env,
     });
     JSON.parse(out);
     return { ok: true, detail: 'lane-pool list --acquirable --no-cache --limit=1 ok' };
   } catch (e) {
-    return { ok: false, detail: `lane-pool list --acquirable failed: ${firstLine(e)}` };
+    const detail = `lane-pool list --acquirable failed: ${firstLine(e)}`;
+    return busyPoolSkip({ what: 'lane-pool list', detail, elapsedMs: (ctx.clock ?? Date.now)() - t0, capMs, ctx })
+      ?? { ok: false, detail };
   }
 }
 
-async function checkLaneAcquireRelease({ root, budgets, sessionSlug, runChild, env }) {
+async function checkLaneAcquireRelease(ctx) {
+  const { root, budgets, sessionSlug, runChild, env } = ctx;
   let laneNum = null;
+  // The child must outlive its own `--wait-ms` plus the real clone/refresh work, but never past the busy cap.
+  const acquireCapMs = Math.max(budgets.laneAcquireWaitMs + 30_000, Math.min(budgets.laneAcquireBusyCapMs, Math.max(budgets.laneAcquireMs, budgets.laneAcquireWaitMs + 60_000)));
+  const t0 = (ctx.clock ?? Date.now)();
   try {
     // #3383 Module D — `--wait-ms=<laneAcquireWaitMs>` lets a momentarily-exhausted pool (every lane busy for
     // a few seconds under real dispatch load) self-heal instead of failing the gate on the very first read;
     // `lane-pool.mjs`'s own `cmdAcquire` polls internally up to that bound before giving up with its "no free
-    // lane" message (which is exactly what `TRANSIENT_FAILURE_PATTERNS` matches on when it still exhausts the
-    // wait). The CHILD's own hard timeout must cover that whole wait plus the acquire's real clone/refresh
-    // work, or `runBounded` kills the child before `--wait-ms` itself gets to time out — hence the `Math.max`
-    // against the plain `laneAcquireMs` budget, with 60s of headroom on top.
+    // lane" message. The child's hard timeout covers that wait plus the acquire's real work, capped at
+    // `laneAcquireBusyCapMs` (see {@link busyPoolSkip}); a short `--ttl-minutes` means a lease whose acquire was
+    // killed mid-flight expires by itself.
     // #4139 — see {@link checkLanePoolList}'s own comment just above: `env` must reach every lane-pool child
     // this gate spawns, never just some of them, or an isolated caller's pool override is only PARTLY honored.
-    const acquireTimeoutMs = Math.max(budgets.laneAcquireMs, budgets.laneAcquireWaitMs + 60_000);
     const out = await runChild('node', [
       'scripts/lane-pool.mjs', 'acquire', '--purpose=smoke', `--session=${sessionSlug}`,
-      `--wait-ms=${budgets.laneAcquireWaitMs}`, '--json',
+      `--wait-ms=${budgets.laneAcquireWaitMs}`, '--ttl-minutes=10', '--json',
     ], {
-      cwd: root, timeoutMs: acquireTimeoutMs, env,
+      cwd: root, timeoutMs: acquireCapMs, env,
     });
     const parsed = JSON.parse(out);
     laneNum = Number.isInteger(parsed?.lane) ? parsed.lane : null;
     if (laneNum == null) return { ok: false, detail: 'lane-pool acquire returned no lane number' };
   } catch (e) {
-    return { ok: false, detail: `lane-pool acquire --purpose=smoke failed: ${firstLine(e)}` };
+    const detail = `lane-pool acquire --purpose=smoke failed: ${firstLine(e)}`;
+    const skip = busyPoolSkip({ what: 'lane-pool acquire', detail, elapsedMs: (ctx.clock ?? Date.now)() - t0, capMs: budgets.laneAcquireWaitMs, ctx });
+    if (!skip) return { ok: false, detail };
+    // A killed acquire may have written a lease just before it died: release this smoke session's leases (best-effort).
+    try {
+      await runChild('node', ['scripts/lane-pool.mjs', 'release', '--all-pools', `--session=${sessionSlug}`], { cwd: root, timeoutMs: budgets.laneReleaseMs, env });
+    } catch { /* the 10-minute lease TTL covers it */ }
+    return skip;
   }
   try {
     await runChild('node', ['scripts/lane-pool.mjs', 'release', `--lane=${laneNum}`, `--session=${sessionSlug}`], {
@@ -607,7 +676,7 @@ export function decideSmokeVerdict(results) {
 export async function runLiveSmoke({
   root, env = process.env, repos = Object.values(CONSTELLATION_REPOS).map((r) => r.slug),
   runChild = runBounded, now = Date.now(), changedFiles = null, closureOf = collectImportClosure,
-  clock = Date.now,
+  clock = Date.now, hostBusy = undefined,
 } = {}) {
   if (isSmokeGateDisabled(env)) return { pass: true, disabled: true, results: [], sessionSlug: null };
   const budgets = resolveSmokeBudgets(env);
@@ -624,7 +693,7 @@ export async function runLiveSmoke({
   // #4139 — `env` (the caller's OWN, possibly-isolated env) rides alongside `ghChildEnv` (the derived,
   // sanitized-for-gh one) so the lane-pool checks can use the former while the gh checks keep using the
   // latter; see {@link checkLanePoolList}'s comment for why dropping this here silently escaped isolation.
-  const ctx = { root, budgets, repos, sessionSlug, env, ghChildEnv, runChild, beforePorcelain };
+  const ctx = { root, budgets, repos, sessionSlug, env, ghChildEnv, runChild, beforePorcelain, clock, hostBusy };
   const results = [];
   for (const check of SMOKE_CHECKS) {
     const startedAt = clock();
@@ -829,6 +898,8 @@ export const ENV_TIMEOUT_PATTERNS = Object.freeze([
 ]);
 export const SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS_ENV = 'WE_SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS';
 export const DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS = 30_000;
+/** The smallest runBounded cap {@link isEnvTimeoutRow} treats as a real budget when judging a kill against its own cap. */
+export const MIN_OWN_CAP_MS = 1_000;
 /** How much wider every budget is on the one env-timeout retry. */
 export const SMOKE_ENV_TIMEOUT_BUDGET_FACTOR_ENV = 'WE_SMOKE_ENV_TIMEOUT_BUDGET_FACTOR';
 export const DEFAULT_ENV_TIMEOUT_BUDGET_FACTOR = 2.5;
@@ -839,7 +910,16 @@ const LANE_POOL_DEFAULT_SCAN_TIMEOUT_MS = 120_000;
 export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS } = {}) {
   if (!row || row.ok) return false;
   const detail = String(row.detail ?? '');
-  return ENV_TIMEOUT_PATTERNS.some((re) => re.test(detail)) && Number(row.ms) >= minElapsedMs;
+  if (!ENV_TIMEOUT_PATTERNS.some((re) => re.test(detail))) return false;
+  // `runBounded`'s OWN kill ("timed out after Nms (process group killed)") is the gate's clock, not tree text: the
+  // row really spent its whole cap N. A cheap probe has a cap far under the 30s floor (live 2026-10-03 22:01 ET,
+  // load 31 on 12 cores: `tree-stays-clean`'s `git status` hit its 10s cap), and the floor then read that
+  // load-induced kill as a code failure and rejected a good build. Judge such a kill against its own cap — but only
+  // a cap that is a real budget: one under {@link MIN_OWN_CAP_MS} is a starved harness (the soak break
+  // `broken-smoke-harness-holds-last-good` sets 1ms), which load cannot explain, so it keeps the 30s floor.
+  const killed = /timed out after (\d+)ms \(process group killed\)$/.exec(detail);
+  if (killed && Number(killed[1]) >= MIN_OWN_CAP_MS) return Number(row.ms) >= Math.min(minElapsedMs, Number(killed[1]) * 0.9);
+  return Number(row.ms) >= minElapsedMs;
 }
 
 /** PURE: is this a failure set the environment explains — at least one {@link isEnvTimeoutRow}, and every other

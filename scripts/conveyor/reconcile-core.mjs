@@ -100,6 +100,7 @@
  * transcript's mtime) is INJECTED on the input records by `we:scripts/conveyor/reconcile-pass.mjs`, so every
  * branch below is reachable in a test with no network and no credential.
  */
+import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
@@ -1106,6 +1107,20 @@ export function acceptLabelDropped({ labels, comments, headSha, now, graceMs = A
   return Number.isFinite(at) && now - at >= graceMs;
 }
 
+/**
+ * xuxcsw6 — the human-parked referral hold gates EVERY review emission, not only {@link dispatchReviewRow}.
+ * The two advisory-fix branches push `kind: 'review'` directly; a parked review posts no fresh advisory note,
+ * so their "fix postdates the advisory" test stayed true and re-dispatched a full review each tick on an
+ * unchanged head (live 2026-10-04, #3771). Wake-ups (new head, a ruling, a send-back) clear `pr.referralHold`.
+ */
+function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
+  if (!pr?.referralHold) return false;
+  refuse('review-referrals-pending', {
+    ...withPhase, ...extra, referralHold: pr.referralHold, why: pr.referralHold.why,
+  });
+  return true;
+}
+
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
   const ci = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup });
@@ -1124,12 +1139,7 @@ function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }
 function dispatchReviewRow({
   pr, requiredChecks, withPhase, base, attempts, roundCap, refuse, refuseCapExhausted, dispatch, extra = {}, now = 0,
 }) {
-  if (pr.referralHold) {
-    refuse('review-referrals-pending', {
-      ...withPhase, ...extra, referralHold: pr.referralHold, why: pr.referralHold.why,
-    });
-    return;
-  }
+  if (refuseReferralHold({ pr, refuse, withPhase, extra })) return;
   // ── `draft` (draft-first PRs, operator-approved 2026-09-27) — checked FIRST, ahead of every other refusal
   // in this function, including `already-reviewed-head`: a draft PR is never owed a review no matter what its
   // `review:*` label or its comment thread says, because GitHub itself will not surface it for review and
@@ -1351,6 +1361,14 @@ function roundCapExhaustedNoteText(prNumber, attempts, cap, capKind) {
   return `PR #${prNumber}: ${capKind} auto-repair rounds exhausted (${attempts}/${cap}) — a person must take it over`;
 }
 
+/** Tri-state diagnostic: unknown evidence is never an empty review family. */
+export function missingReviewLabel(pr) {
+  if (!pr || pr.state !== 'OPEN' || !Array.isArray(pr.labels)
+    || !pr.labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string' && (typeof l === 'string' ? l : l.name).length > 0)
+    || !Array.isArray(pr.commits)) return null;
+  return isAiGeneratedPr(pr) && !pr.labels.some(l => (typeof l === 'string' ? l : l.name).startsWith('review:'));
+}
+
 export function planReconcile({
   repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap = CI_HEAL_ROUND_CAP,
   conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP, defaultBranch = 'main',
@@ -1382,6 +1400,8 @@ export function planReconcile({
   for (const pr of Array.isArray(prs) ? prs : []) {
     const prNumber = Number(pr?.number);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue; // not a PR record; nothing to key on.
+
+    if (missingReviewLabel(pr) === true) notes.push({ kind: 'review-label-missing', prNumber, repo, text: 'open agent PR has no review:* label' });
 
     // The evidence every row carries, so a reader never has to go back to the listing to audit a verdict.
     const operatorAnswer = latestOperatorAnswer(pr?.comments);
@@ -1663,7 +1683,14 @@ export function planReconcile({
     // fixer, an advisory-fix PR), falls through so its repair ownership is intact; review emission is
     // already gated separately by {@link reviewChecksAllow}.
     const reviewCi = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup });
-    if (phase === 'ci-red' && reviewCi.reason === 'required-review-gate-conflict'
+    // LIVE INCIDENT 2026-10-04, PR #3833: `classifyPr` ranks `review:human` ('needs-human') ABOVE `ci-red`, so a
+    // `review:human` PR with a genuinely red required check never entered the `ci-red` branch below — the
+    // main-red watch logged "owed a ci-heal" and the review row logged `review-ci`, and NOBODY planned the heal
+    // (9 h, zero dispatches). A CI repair is not a review decision: ci-heal never touches a `review:*` label, so
+    // the human hold must not exclude it. Only a COMPLETED red (`check.state === 'red'`) opts a needs-human PR in —
+    // pending/unchecked stay with the review path exactly as before.
+    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red');
+    if (ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
       continue;
@@ -1679,7 +1706,7 @@ export function planReconcile({
     // is owed from the PR alone, and leaves "can this repo's worker actually do it" to the dispatcher that
     // reads this plan (`we:scripts/operations/ci-heal-pr-dispatch.mjs#runReconcileCiHealDispatch`, mirroring
     // `reconcile-fix-dispatch.mjs#runReconcileFixDispatch`'s own capability gate for `fix`).
-    if (phase === 'ci-red') {
+    if (ciRepairOwed) {
       // we:backlog/x9wz0ir-*.md (#4075/#3383) — LIVE INCIDENT 2026-09-25: PRs #2635/#2636 are BOTH `owed-ci-
       // rerun` (their required check failed inside one of `main`'s own red windows) AND `mergeStateStatus:
       // 'DIRTY'` (real conflicts with `main`, confirmed live via `gh pr view --json mergeStateStatus,mergeable`
@@ -1979,6 +2006,7 @@ export function planReconcile({
           const latest = headSha ? latestAdvisory(trustedComments) : undefined;
           const advisoryIsStale = Boolean(latest) && !advisoryCoversHead(latest, headSha);
           if (advisoryIsStale) {
+            if (refuseReferralHold({ pr, refuse, withPhase })) continue;
             if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
             dispatch.push({
               ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
@@ -2035,6 +2063,7 @@ export function planReconcile({
       // stops it and hands it to a person. A normal PR that has never addressed its advisory finding (the
       // ordinary `!addressed` branch above) is completely unaffected — it never reaches this line at all.
       const advisoryFindingsHere = countFindings(pr?.comments);
+      if (refuseReferralHold({ pr, refuse, withPhase })) continue;
       if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
       dispatch.push({
         ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,

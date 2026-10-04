@@ -441,22 +441,21 @@ report it.
 
 The auto path above and a human healing a red/BEHIND conveyor PR by hand are **one procedure**. When a human takes
 over: reconstitute on `{{LANE_REF}}` (don't rebuild), merge the live PR base into the lane, repair only the failing check, get the
-locus gate green, re-push HEAD to the same `lane/*` ref, post the CI-heal comment — and **never touch the review
-label**. The only difference between auto and manual is **who** does the repair; the reuse-the-ref, merge,
-repair-only-CI, re-push, never-touch-the-review shape is identical.
+locus gate green, re-push HEAD to the same `lane/*` ref, invoke the CI-heal completion marker to perform its guarded review handoff. The only difference between auto and manual is **who** does the repair; the reuse-the-ref, merge,
+repair-only-CI, re-push, guarded-completion shape is identical.
 
 ## Guardrails (the non-negotiables)
 
 - **Never edit the primary checkout** — all work is in the acquired lane clone (#104/#2183).
-- **Never land the PR; never touch the review label** — you stop at a re-pushed, CI-repaired PR. `review:human` /
-  `review:pending` / `review:changes` / `ready-to-merge` are ALL left exactly as they were — only CI is repaired.
+- **Never land the PR; use the completion marker for review handoff** — you stop at a re-pushed, CI-repaired PR. `review:human` /
+  `review:pending` / `review:changes` remain protected. The marker carries an existing acceptance only with coverage proof, otherwise re-arms it. With a positively observed empty review family, its shared `--only-if=missing` boundary requires an OPEN PR and the pushed SHA, adds pending, and removes stale landing/red-team acceptance labels. Read, write or verification failures are reported separately from the healed branch; inspect the handoff result.
   The drain daemon is the sole writer to `main`; a human `/review` (or the drain AI-review) still owns any parked
   verdict.
 - **Reuse the ref, never rebuild** — reconstitute from `{{LANE_REF}}`; if the ref is gone, report it, don't redo.
 - **Repair only the CI break** — do not fold unrelated work in; do not weaken or delete a test to go green; if the
   diff itself is genuinely wrong (not a CI/merge break), escalate — don't paper over it.
 - **Work only through the normal verbs** — `acquire --base=<ref>` → merge → repair → `git push … lane/*` →
-  `ci-heal-mark.mjs` → daemon/human. No parallel state store, no review-label swap (#2612 / #2666 rulings).
+  `ci-heal-mark.mjs` → daemon/human. No parallel state store or hand-written review-label swap; the shared guarded completion command owns the handoff.
 - **If you stop, say so IN YOUR COMPLETION RECORD** (#4075/xg7m2wq) — every exit above runs
   `completion-cli.mjs report --status=done` before it returns, starting with `report --status=started` at step
   0. A refusal (or a success) that leaves no completion record is indistinguishable from a still-live session,

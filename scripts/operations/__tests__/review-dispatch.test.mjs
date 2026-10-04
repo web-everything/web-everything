@@ -616,6 +616,7 @@ describe('isReviewCodePath (#4387)', () => {
     const entries = [
       'scripts/operations/review-dispatch.mjs', 'scripts/operations/review-pr.mjs',
       'scripts/operations/cli-adapter.mjs', 'scripts/operations/review-loop-cli.mjs',
+      'scripts/operations/review-job.mjs',
     ];
     const missing = [];
     for (const entry of entries) {
@@ -697,7 +698,7 @@ describe('dispatchReview — managed clone behind origin/main (#4387)', () => {
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       expect(run(root)).toHaveLength(1);
-      expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toMatch(/3 commit\(s\) behind origin\/main .*tolerating the lag/);
+      expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toMatch(/3 commit\(s\) behind origin\/main .*scripts\/backlog\/frontmatter\.mjs.*tolerating the lag/);
     } finally { stderr.mockRestore(); }
     expect(git(root, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('3'); // the clone is never moved
   });

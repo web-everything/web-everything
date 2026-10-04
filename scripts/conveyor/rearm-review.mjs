@@ -126,11 +126,15 @@ export function buildRearmComment({ actor, decision }) {
   return [
     REARM_COMMENT_MARKER,
     '',
-    `${decision.rearmFrom === 'review:accepted'
+    `${decision.rearmFrom === 'missing'
+      ? 'The healed PR had no review label; independent review is being requested'
+      : decision.rearmFrom === 'review:accepted'
       ? 'The previously accepted PR was re-pushed and its acceptance is being re-armed for review'
       : 'The `review:changes` bounce was repaired and re-pushed'} by ${actor}; ${decision.keepsHuman
       ? '`review:human` is KEPT as the sole hold — `review:pending` was not added (an independent review is already owed while the human hold stands; only a human `/review` ceremony clears it).'
-      : 'the PR is re-armed `review:pending` (an independent re-review is owed).'}`,
+      : decision.rearmFrom === 'missing'
+        ? '`review:pending` is requested. This comment records the request; the completion result reports whether the label write was verified.'
+        : 'the PR is re-armed `review:pending` (an independent re-review is owed).'}`,
     '',
     'The fix agent did NOT clear the review — a human `/review` (or the drain AI-review convergence pass) re-verdicts.',
   ].join('\n');
@@ -160,7 +164,7 @@ if (IS_CLI) {
     fixedTo: 'rearm',
     defaultActor: 'conveyor fix agent',
     repoOptional: true, // the fix agent runs inside its WE lane clone, so a missing --repo derives from cwd.
-    usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict] [--main-ref=<name>] [--only-if=accepted]  (pr must be a positive integer)',
+    usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>]  (pr must be a positive integer)',
     // The DURABLE re-arm comment — a readable record that the bounce was repaired and re-armed (not a silent
     // flip), AND the durable tally the matching counter reads back to survive a restart (#2643). Its first line
     // MUST be the matching marker (single-sourced) so posting and counting can never drift.
