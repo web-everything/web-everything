@@ -874,6 +874,28 @@ describe('runReconcileFixDispatch — read reconcile-pass, plan, assign a lane, 
     expect(result.refusals).toEqual([{ pr: 1764, kind: 'dispatch-failed', why: 'lane-9 lost its race to a sibling' }]);
   });
 
+  it('a failed `claude --bg` spawn is logged with its exit code + redacted stderr, never the argv/settings/brief (live #3794)', () => {
+    const entries = [{ kind: 'fix', prNumber: 1764, headRefName: 'lane/3438-wire-reconcile-pass' }];
+    const spawnError = Object.assign(
+      new Error('Command failed: claude --bg -n fix-1764 --settings {"env":{"GH_TOKEN":"ghs_abcdefghijklmnop1234"}} # brief head\nbrief body\nstderr text'),
+      { status: 1, stderr: 'Error: boom ghs_abcdefghijklmnop1234\n' },
+    );
+    const result = runReconcileFixDispatch({
+      root: '/repo',
+      reconcile: reconcileStub(entries),
+      findItemFn: findItemStub,
+      loadItems: () => [],
+      pickFreeLanes: () => [2],
+      dispatch: () => { throw spawnError; },
+      checkStaleness: FRESH,
+      fetchItemlessDiffPaths: () => [],
+    });
+    expect(result.refusals).toHaveLength(1);
+    const why = result.refusals[0].why;
+    expect(why).toMatch(/^claude --bg failed \(exit 1\): Error: boom/);
+    expect(why).not.toMatch(/--settings|brief|ghs_|GH_TOKEN/);
+  });
+
   it('PR #1972 review finding — a THROWING `tryResume` is isolated to a per-entry `dispatch-failed` refusal, and does not abort the rest of the tick', () => {
     const entries = [
       // Entry 1: conflict-caused; its `tryResume` call throws (e.g. a transient `claude agents --json` read).

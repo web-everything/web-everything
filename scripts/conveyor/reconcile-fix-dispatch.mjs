@@ -73,6 +73,7 @@ import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
+import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -1202,7 +1203,7 @@ export function runReconcileFixDispatch({
       try {
         attempt = tryResume(entry, { root, repo: repoKey });
       } catch (e) {
-        refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: String((e && e.message) || e).split('\n')[0] });
+        refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
         continue;
       }
       if (attempt.resumed) {
@@ -1233,7 +1234,7 @@ export function runReconcileFixDispatch({
       }
       dispatched.push(result);
     } catch (e) {
-      refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: String((e && e.message) || e).split('\n')[0] });
+      refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
     }
   }
 

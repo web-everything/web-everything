@@ -68,6 +68,7 @@ import {
 } from '../conveyor/fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from '../conveyor/fix-procedure.mjs';
 import { flushOwedWrites } from '../conveyor/ci-heal-owed.mjs';
+import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
 
 function readHealQuotaScores() {
   try {
@@ -374,7 +375,7 @@ export async function runReconcileCiHealDispatch({
       }
       dispatched.push(result);
     } catch (e) {
-      refusals.push({ pr: entry.prNumber, kind: 'dispatch-failed', why: String((e && e.message) || e).split('\n')[0] });
+      refusals.push({ pr: entry.prNumber, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
     }
   }
 
