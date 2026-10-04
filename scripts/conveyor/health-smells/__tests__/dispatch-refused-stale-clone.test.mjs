@@ -12,12 +12,12 @@ const MINUTE = 60_000;
 const T0 = Date.parse('2026-09-26T23:39:00Z');
 
 const STALE_TICK = [
-  'reconcile-fix-dispatch-daemon: tick (chalbert/web-everything, chalbert/frontierui, chalbert/plateau-app) — dispatched 0, refused 11',
-  'reconcile-fix-dispatch-daemon: chalbert/web-everything tick failed (non-fatal, other repos unaffected): review-dispatch: the dispatching checkout is 2 commit(s) behind origin/main — refusing to dispatch a review that would run STALE code from this checkout\'s own import path (#3439).',
-  'reconcile-fix-dispatch-daemon: chalbert/frontierui tick failed (non-fatal, other repos unaffected): review-dispatch: the dispatching checkout is 2 commit(s) behind origin/main — refusing to dispatch a review that would run STALE code from this checkout\'s own import path (#3439).',
-  'reconcile-fix-dispatch-daemon: refused main-still-red chalbert/web-everything PR #2778 — main\'s own CI is still red right now',
+  'reconcile-fix-dispatch-daemon: tick (web-everything/web-everything, frontier-ui/frontierui, plateauapp/plateau-app) — dispatched 0, refused 11',
+  'reconcile-fix-dispatch-daemon: web-everything/web-everything tick failed (non-fatal, other repos unaffected): review-dispatch: the dispatching checkout is 2 commit(s) behind origin/main — refusing to dispatch a review that would run STALE code from this checkout\'s own import path (#3439).',
+  'reconcile-fix-dispatch-daemon: frontier-ui/frontierui tick failed (non-fatal, other repos unaffected): review-dispatch: the dispatching checkout is 2 commit(s) behind origin/main — refusing to dispatch a review that would run STALE code from this checkout\'s own import path (#3439).',
+  'reconcile-fix-dispatch-daemon: refused main-still-red web-everything/web-everything PR #2778 — main\'s own CI is still red right now',
 ].join('\n');
-const GOOD_TICK = 'reconcile-fix-dispatch-daemon: tick (chalbert/web-everything) — dispatched 1, refused 0';
+const GOOD_TICK = 'reconcile-fix-dispatch-daemon: tick (web-everything/web-everything) — dispatched 1, refused 0';
 
 function feed(chunks) {
   let mem;

@@ -279,7 +279,7 @@ function rawFor({ launchKind = 'build', item, routing = null, briefTemplate = br
     observedAt: NOW,
     // #3960/#4174 — the repo-aware quintet every kind's brief now needs at least `WE_ROOT` from; the two
     // repair kinds need all five (`BRIEF_REQUIRED_BY_KIND.fix`/`.ci-heal`).
-    repoTokens: { WE_ROOT: REPO_ROOT, REPO: 'chalbert/web-everything', LANE_REPO: '.', GATE_COMMAND: 'npm test', ATTRIBUTION: 'WE #9001' },
+    repoTokens: { WE_ROOT: REPO_ROOT, REPO: 'web-everything/web-everything', LANE_REPO: '.', GATE_COMMAND: 'npm test', ATTRIBUTION: 'WE #9001' },
     routing,
   };
 }

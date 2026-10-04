@@ -2,9 +2,10 @@
 bornAs: xv05fkj
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/conveyor/__tests__/review-hold-reconcile.test.mjs", "we:scripts/lib/__tests__/gate-invariants.test.mjs"]
 dateOpened: "2026-10-03"
+dateResolved: "2026-10-03"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "e1f0523e0881357fc863f3e88da72e0164eb7091"
 tags: []
@@ -16,6 +17,11 @@ Follow-up to the operator's approval of #3657 (2026-10-03). #3657 makes a park t
 
 ## Progress
 
+- Implemented and verified (2026-10-03, checkout baseline `22103ded6`). Only the sweep's flag input filters `review:changes` while `review:human` is live. The detector and heal function in `we:scripts/lib/review-escalation.mjs` are unchanged; the removal plan is unchanged.
+- Before proof: added regression cases in `we:scripts/conveyor/__tests__/review-hold-reconcile.test.mjs` and INVARIANT 18 in `we:scripts/lib/__tests__/gate-invariants.test.mjs`, then ran both against the unchanged implementation. Six assertions failed (83 tests passed), including both park powerset invariants and the unwanted sweep entry.
+- CLI replay, without helper files: supplied the Proof plan JSON through Bash process substitution (`--prs-file=<(printf '%s' '<JSON>')`) to `node we:scripts/conveyor/review-hold-reconcile.mjs sweep --dry-run` (drop `we:` to execute). Before: `{"checked":true,"changed":1,"results":[{"num":3657,"flagged":["review:changes","review:human"],"flagReason":"unsupported-pair"}]}`. After, identical fixture: `{"checked":true,"changed":0,"results":[]}`. Adding fixture PR #2767 with accepted+human+changes produced only `{"num":2767,"flagged":["review:accepted","review:human"],"flagReason":"genuine-clearance"}`; #3657 remained silent. These are fixture label replays, not claims about current live PR labels; comment history was read by the real CLI, and dry-run performed no writes.
+- Regression/soak proof: both 16-subset park powersets pass. Additional cases pin pending cleanup and accepted+changes without human. A 100-sweep mixed-PR regression proves #3657 produces no entries or state reads while accepted+human+changes remains flagged on every fetch failure, with zero label writes or comments.
+- Verification: `node we:scripts/verify-lane.mjs` passed all 464 tests across six affected suites, including the final 90 tests in the two scoped suites and the 100-sweep regression. `npm run check:standards` passed with 0 errors (5275 warnings); lane marker recorded green. No helper files or shared agent docs were created/edited.
 - Premise checked against main (`e1f0523e0`). #3657 landed as merge `33cee1525`. `we:scripts/lib/review-escalation.mjs:1989 (decideParkToHuman)` now removes only `review:pending`, `review:redteam-accepted` and (unless `keepHumanClearance`) `review:accepted`. It keeps `review:changes`.
 - The sweep still flags the pair. `we:scripts/conveyor/review-hold-reconcile.mjs:107 (planReviewHoldCleanup)` passes every live label to `we:scripts/lib/review-escalation.mjs:2016 (findContradictoryReviewVerdicts)`. That returns `[changes, human]`. Then `we:scripts/lib/review-escalation.mjs:2056 (decideContradictoryVerdictHeal)` returns `unsupported-pair`, and the sweep reports it at `we:scripts/conveyor/review-hold-reconcile.mjs:182`.
 - Scope correction (narrower). The card says "every label set decideParkToHuman can produce" must be unflagged. That is too wide. With `keepHumanClearance: true` the park keeps `review:accepted` beside `review:human` by design (#3023). The sweep must keep flagging that pair, because the #2766/#2767 heal path depends on it (`we:scripts/conveyor/__tests__/review-hold-reconcile.test.mjs:80`). So the rule is: `review:changes` is never part of a flag when `review:human` is live. The accepted+human flag stays.

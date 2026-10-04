@@ -22,7 +22,7 @@
 |---|---|
 | `{{PR}}` | the PR number to review — e.g. `1234` |
 | `{{LANE_REPO}}` | lane-pool checkout selector: an absolute checkout path always (equal to `{{WE_ROOT}}` for WE, a sibling's own checkout otherwise; landing-freeze fix — was `.` for WE, which broke from this dispatch's own scratch cwd) |
-| `{{REPO}}` | the `owner/repo` the PR lives in — e.g. `chalbert/web-everything` |
+| `{{REPO}}` | the `owner/repo` the PR lives in — e.g. `web-everything/web-everything` |
 | `{{SESSION_SLUG}}` | a per-dispatch lane-lease slug, e.g. `review-1234` |
 | `{{JUDGE_PROVIDER}}` | the run's `JudgeProvider`. Always `claude` in practice — `codex` is refused at the command line, see step 2 (`#xu2pp2m`) |
 | `{{WE_ROOT}}` | **#4174** — the absolute WE checkout you are dispatched FROM. You start in a scratch directory outside it (never inside it — see step 1), so this is the only way step 1's `lane-pool.mjs` is findable before you have a lane of your own. |

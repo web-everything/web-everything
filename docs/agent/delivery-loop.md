@@ -155,7 +155,7 @@ achieves that by baking a hardcoded `--disallowedTools` deny list (`REVIEW_DISPA
 
 ```bash
 WE_DISPATCH_AGENT_ARGS='["--permission-mode","dontAsk"]' \
-  node scripts/operations/review-dispatch.mjs --pr=<n> --repo=chalbert/web-everything
+  node scripts/operations/review-dispatch.mjs --pr=<n> --repo=web-everything/web-everything
 ```
 
 This is strictly safer than the bare pattern below — zero bypass, a harness-enforced deny list the model's own
@@ -267,7 +267,7 @@ silently. So does a bare `return` used as a conditional skip — use `ctx.skip()
 
 ## Explain PR holds before dispatching
 
-Run `node scripts/operations/run.mjs pr-reconcile --repo=chalbert/web-everything --json`
+Run `node scripts/operations/run.mjs pr-reconcile --repo=web-everything/web-everything --json`
 before dispatching a review or asking for a human-approval pass. Read `verdict.prs`: one row per PR,
 sorted by number, across open, merged and closed states. The scope is every PR in the named repo
 (a superset of conveyor work, so missing labels cannot hide a hold); `--pr=N` narrows it.

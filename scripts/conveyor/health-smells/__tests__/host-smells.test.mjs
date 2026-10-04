@@ -99,8 +99,8 @@ describe('inhibition — App-token and high-load episodes hold agent dispatch (4
   // lane-starvation's own diagnosis must have run before it is a candidate.
   const diagnosed = (state) => Object.fromEntries(Object.entries(state.episodes).map(([k, e]) => [k, e.smell === 'lane-starvation' ? { ...e, diagnosis: { code: 0, output: '{}' } } : e]));
   // One real-shaped fix-dispatch-daemon tick that wanted a lane and was refused (the demand lane-starvation reads).
-  const NO_LANE_TICK = 'fix-dispatch-daemon: tick (chalbert/web-everything) — dispatched 0, refused 1\n'
-    + 'fix-dispatch-daemon: refused no-lane chalbert/web-everything PR #2901 — no acquirable lane in the pool\n';
+  const NO_LANE_TICK = 'fix-dispatch-daemon: tick (web-everything/web-everything) — dispatched 0, refused 1\n'
+    + 'fix-dispatch-daemon: refused no-lane web-everything/web-everything PR #2901 — no acquirable lane in the pool\n';
   let size = 0;
   const logSample = () => { size += NO_LANE_TICK.length; return [{ name: 'fix-dispatch-daemon', mtimeMs: NOW, sizeBytes: size, text: NO_LANE_TICK, bootstrap: false }]; };
   const ticks = (smells, extra) => {

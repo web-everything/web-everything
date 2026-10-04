@@ -10,7 +10,7 @@ import { readReviewCiGate } from '../lib/review-ci-gate-io.mjs';
  * still holds for both: the judging happens in the fresh jurors `review-loop-cli.mjs` spawns, and the job mints
  * its own fresh actor id per round where this path relies on the `--bg` session's.
  *
- *   node scripts/operations/review-dispatch.mjs --pr=1234 --repo=chalbert/web-everything
+ *   node scripts/operations/review-dispatch.mjs --pr=1234 --repo=web-everything/web-everything
  *
  * THE GAP THIS CLOSES, PRECISELY. `review-pr` (via `we:scripts/operations/review-loop-cli.mjs`, #3072) already
  * runs a review UNATTENDED end to end — spawn two independent jurors, reduce their verdicts, bounce a `changes`
@@ -444,6 +444,11 @@ const REVIEW_CODE_PATH_FILES = new Set([
   // (the same one review-set-label.mjs's approval-time filing already used) instead of driving `file-item`
   // in-process; a new direct import of the review-loop-cli entry file.
   'scripts/lib/prevention-landing-job.mjs',
+  // review-job.mjs (the default dispatch mode, which the daemon runs) — its own direct imports. review-job is
+  // matched by REVIEW_CODE_PATH_RE; the rest of its imports (dispatch-lane-io, review-dispatch, review-independence,
+  // review-extra-seats, jury-core, write-all-sync) are covered above.
+  'scripts/lib/review-ci-gate-io.mjs', 'scripts/operations/completion-cli.mjs', 'scripts/operations/completion-store.mjs',
+  'scripts/conveyor/run-rating.mjs', 'scripts/operations/telemetry-store.mjs', 'scripts/conveyor/reconcile-core.mjs',
 ]);
 
 /** #4387 (PR #2916 review, round 2) — direct imports are not enough: the credential sandbox lives one level

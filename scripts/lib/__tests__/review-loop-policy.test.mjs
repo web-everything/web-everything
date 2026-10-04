@@ -27,7 +27,7 @@ describe('reviewLoopAutoConfirm — the #3072/#3383/#3434 ruling, in code', () =
   });
 
   it('DECLINES (does not auto-answer accept) for an agent-addressed prevention-outstanding verdict — #3442 '
-    + 'REVERSED live on chalbert/web-everything#2749: the rendered verdict text itself says "file the guard '
+    + 'REVERSED live on web-everything/web-everything#2749: the rendered verdict text itself says "file the guard '
     + 'before accept", and jury-core.mjs\'s own VERDICTS doc says this verdict "never silently lands" — an '
     + 'unattended loop answering `accept` over it contradicts both. The run stays parked, exactly like a '
     + 'human-addressed confirm, until an operator files the guard and resumes with --answer=accept themselves.', () => {
@@ -58,7 +58,7 @@ describe('#x100grep — literal grep proof `value: \'accept\'` appears EXACTLY w
   it('the source returns accept from exactly the one reviewed, ratified branch (VERDICTS.ACCEPT), never from '
     + 'VERDICTS.PREVENTION_OUTSTANDING', async () => {
     // #3434's FIRST ratified item narrowed this canary to exactly one occurrence. #3442 widened it to two
-    // (`prevention-outstanding` also auto-cleared); the #2749 live incident (chalbert/web-everything#2749, a
+    // (`prevention-outstanding` also auto-cleared); the #2749 live incident (web-everything/web-everything#2749, a
     // `prevention-outstanding` verdict — both mandatory lenses CONFIRMED real, unfixed defects — mechanically
     // recorded as `review:accepted` and merged) reversed that second branch. This canary now pins the count
     // back to ONE, and ADDS a permanent negative assertion: a future edit can re-add mechanical accept to some
@@ -80,7 +80,7 @@ describe('#x100grep — literal grep proof `value: \'accept\'` appears EXACTLY w
 });
 
 describe('buildAcceptQueueEntry — the notification filed for a queued accept', () => {
-  const entry = buildAcceptQueueEntry({ repo: 'chalbert/web-everything', pr: 1234, runId: 'r-abc123' });
+  const entry = buildAcceptQueueEntry({ repo: 'web-everything/web-everything', pr: 1234, runId: 'r-abc123' });
 
   it('produces a kind learnings-drop still recognizes', () => {
     expect(KINDS).toContain(entry.kind);
@@ -92,7 +92,7 @@ describe('buildAcceptQueueEntry — the notification filed for a queued accept',
   });
 
   it('names the PR and carries a working resume command in `suggestion`', () => {
-    expect(entry.summary).toContain('chalbert/web-everything#1234');
+    expect(entry.summary).toContain('web-everything/web-everything#1234');
     expect(entry.suggestion).toContain('--resume=r-abc123');
     expect(entry.suggestion).toContain('--answer=accept');
   });
@@ -208,8 +208,8 @@ describe('buildPreventionFilingInput — the file-item card the loop files for i
   ];
 
   it('names the PR and both repos in the title, and files a story sized 3', () => {
-    const input = buildPreventionFilingInput({ repo: 'chalbert/web-everything', pr: 2749, findings });
-    expect(input.title).toContain('chalbert/web-everything#2749');
+    const input = buildPreventionFilingInput({ repo: 'web-everything/web-everything', pr: 2749, findings });
+    expect(input.title).toContain('web-everything/web-everything#2749');
     expect(input.kind).toBe('story');
     expect(input.size).toBe('3');
   });
@@ -527,7 +527,7 @@ describe('cardCoversGuard — does a filed card already carry this guard? (PR #2
 
 describe('buildPreventionQueueEntry — the notification filed per unfiled prevention guard (#3442)', () => {
   const finding = { prevention: 'add a lint rule that catches this class of defect at write-time', preventionCaptured: false };
-  const entry = buildPreventionQueueEntry({ repo: 'chalbert/web-everything', pr: 1234, runId: 'r-abc123', finding });
+  const entry = buildPreventionQueueEntry({ repo: 'web-everything/web-everything', pr: 1234, runId: 'r-abc123', finding });
 
   it('produces a kind learnings-drop still recognizes', () => {
     expect(KINDS).toContain(entry.kind);
@@ -539,7 +539,7 @@ describe('buildPreventionQueueEntry — the notification filed per unfiled preve
   });
 
   it('names the PR in `summary` and carries the guard text in `suggestion`', () => {
-    expect(entry.summary).toContain('chalbert/web-everything#1234');
+    expect(entry.summary).toContain('web-everything/web-everything#1234');
     expect(entry.summary).toContain('PREVENTION-OUTSTANDING');
     expect(entry.suggestion).toContain('r-abc123');
     expect(entry.suggestion).toContain(finding.prevention);

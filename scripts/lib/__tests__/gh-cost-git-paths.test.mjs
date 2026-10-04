@@ -13,7 +13,7 @@ const OID = 'f'.repeat(40);
 function gitFixture(log = merge, files = 'backlog/4386-item.md\0') {
   return vi.fn((_file, args) => {
     if (args[0] === 'rev-parse') return args.includes('--is-shallow-repository') ? 'false\n' : `${OID}\n`;
-    if (args[0] === 'remote') return 'git@github.com:chalbert/web-everything.git\n';
+    if (args[0] === 'remote') return 'git@github.com:web-everything/web-everything.git\n';
     if (args.includes('--grep=JIT-number')) return 'drain: JIT-number xcyvee3→#4586 at land (#2288)\n';
     if (args[0] === 'log') return log;
     if (args[0] === 'diff') return files;
@@ -47,7 +47,7 @@ describe('git paths', () => {
   it('reads commits after fetch and gives the existing classifier equivalent inputs at zero GitHub calls', () => {
     const git = gitFixture('abc\0Nic\0nic@example.com\0Build\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n\0Claude <noreply@anthropic.com>\0');
     const gh = vi.fn(() => { throw new Error('GitHub must not run'); });
-    const commits = fetchPrCommits('chalbert/web-everything', 3084, { headRefName: 'lane/4386-build', headRefOid: OID, baseRefName: 'main', git, exec: gh });
+    const commits = fetchPrCommits('web-everything/web-everything', 3084, { headRefName: 'lane/4386-build', headRefOid: OID, baseRefName: 'main', git, exec: gh });
     expect(commits[0].authors).toContainEqual({ name: 'Claude', email: 'noreply@anthropic.com' });
     expect(countBackpressurePrs([{ number: 3084, commits }])).toHaveLength(1);
     expect(git.mock.calls.findIndex(([, a]) => a[0] === 'fetch')).toBeLessThan(git.mock.calls.findIndex(([, a]) => a[0] === 'log'));
@@ -56,7 +56,7 @@ describe('git paths', () => {
   it('falls back when fetch fails', () => {
     const git = vi.fn(() => { throw new Error('offline'); });
     const gh = vi.fn(() => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: [] } } } } }]));
-    expect(fetchPrCommits('chalbert/web-everything', 3084, { headRefName: 'lane/4386', headRefOid: OID, baseRefName: 'main', git, exec: gh })).toEqual([]);
+    expect(fetchPrCommits('web-everything/web-everything', 3084, { headRefName: 'lane/4386', headRefOid: OID, baseRefName: 'main', git, exec: gh })).toEqual([]);
     expect(gh).toHaveBeenCalledTimes(1);
   });
 });
@@ -66,13 +66,13 @@ describe('metered fallback query shapes', () => {
   it('keeps cost in-band and projects the same consumer JSON', () => {
     const rows = [{ number: 42, title: 'WE #4386: build' }];
     const exec = vi.fn(() => JSON.stringify(rows));
-    expect(meteredAlreadyDone('chalbert/web-everything', '4386', { exec })).toEqual(rows);
+    expect(meteredAlreadyDone('web-everything/web-everything', '4386', { exec })).toEqual(rows);
     const pages = [
       { data: { repository: { pullRequest: { commits: { nodes: [{ commit: { oid: 'a', authors: { nodes: [{ name: 'N', email: 'e' }] } } }] } } } } },
       { data: { repository: { pullRequest: { commits: { nodes: [{ commit: { oid: 'b', authors: { nodes: [] } } }] } } } } },
     ];
     const execPages = vi.fn(() => JSON.stringify(pages));
-    expect(meteredPrCommits('chalbert/web-everything', 42, { exec: execPages })).toEqual([{ oid: 'a', authors: [{ name: 'N', email: 'e' }] }, { oid: 'b', authors: [] }]);
+    expect(meteredPrCommits('web-everything/web-everything', 42, { exec: execPages })).toEqual([{ oid: 'a', authors: [{ name: 'N', email: 'e' }] }, { oid: 'b', authors: [] }]);
     for (const [argv] of [...exec.mock.calls, ...execPages.mock.calls]) expect(argv.find((arg) => arg.startsWith('query='))).toContain('rateLimit { cost }');
     const argv = execPages.mock.calls[0][0];
     expect(argv).toEqual(expect.arrayContaining(['--paginate', '--slurp']));
@@ -91,18 +91,18 @@ describe('readGitPrCommits null-return guards', () => {
     for (const [needle, v] of Object.entries(over)) if (k.includes(needle)) return v;
     if (k.includes('is-shallow')) return 'false\n';
     if (args[0] === 'rev-parse') return OID + '\n';
-    if (args[0] === 'remote') return 'https://github.com/chalbert/web-everything.git\n';
+    if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git\n';
     if (args[0] === 'log') return '';
     return '';
   });
-  const read = (git, o = ok, head = 'lane/x') => readGitPrCommits('chalbert/web-everything', head, { git, ...o });
+  const read = (git, o = ok, head = 'lane/x') => readGitPrCommits('web-everything/web-everything', head, { git, ...o });
   it('reads when every guard passes', () => expect(read(gitFor())).toEqual([]));
   it('falls back without headRefOid', () => expect(read(gitFor(), { baseRefName: 'main' })).toBeNull());
   it('falls back on head oid mismatch', () => expect(read(gitFor({ 'rev-parse origin/': 'a'.repeat(40) + '\n' }))).toBeNull());
   it('falls back for a non-main (stacked) base', () => expect(read(gitFor(), { ...ok, baseRefName: 'lane/other' })).toBeNull());
   it('falls back without a base', () => expect(read(gitFor(), { headRefOid: OID })).toBeNull());
   it('falls back on a foreign remote', () => expect(read(gitFor({ 'remote get-url': 'https://github.com/someone/web-everything.git\n' }))).toBeNull());
-  it('falls back on a non-github host', () => expect(read(gitFor({ 'remote get-url': 'https://evil.example/chalbert/web-everything.git\n' }))).toBeNull());
+  it('falls back on a non-github host', () => expect(read(gitFor({ 'remote get-url': 'https://evil.example/web-everything/web-everything.git\n' }))).toBeNull());
   it('falls back on shallow history', () => expect(read(gitFor({ 'is-shallow': 'true\n' }))).toBeNull());
   it.each(['-x', 'a b', '..', ''])('falls back on invalid head %j', (h) => expect(read(gitFor(), ok, h)).toBeNull());
 });
@@ -164,11 +164,11 @@ describe('review-round hardening (#3103)', () => {
 it('the planner reads PR commit facts locally and does not fetch or fall back to GitHub', () => {
   const git = gitFixture('');
   const exec = vi.fn(() => { throw new Error('network forbidden'); });
-  expect(fetchPrCommits('chalbert/web-everything', 1, { git, exec, localOnly: true,
+  expect(fetchPrCommits('web-everything/web-everything', 1, { git, exec, localOnly: true,
     headRefName: 'lane/x-test', headRefOid: OID, baseRefName: 'main' })).toEqual([]);
   expect(git.mock.calls.some(([, args]) => args[0] === 'fetch')).toBe(false);
   expect(exec).not.toHaveBeenCalled();
-  expect(fetchPrCommits('chalbert/web-everything', 1, { git: () => { throw new Error('missing object'); }, exec,
+  expect(fetchPrCommits('web-everything/web-everything', 1, { git: () => { throw new Error('missing object'); }, exec,
     localOnly: true, headRefName: 'lane/x-test', headRefOid: OID, baseRefName: 'main' })).toBeNull();
   expect(exec).not.toHaveBeenCalled();
 });

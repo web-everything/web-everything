@@ -8,7 +8,7 @@
  *   opportunity to improve our product, never as a problem that needs manual intervention"), the cleanup is a
  *   mechanical pass, not a hand-run `gh pr edit`.
  *
- * TWO INDEPENDENT INVARIANTS, ONE SWEEP (they were both live on chalbert/web-everything on 2026-09-24, and both
+ * TWO INDEPENDENT INVARIANTS, ONE SWEEP (they were both live on web-everything/web-everything on 2026-09-24, and both
  * are "a review:* label describing a state that no longer holds"):
  *
  *   1. AT MOST ONE review:* HOLD LABEL. `review:human` is itself a hold — a gate-self PR needs no `review:pending`
@@ -103,8 +103,12 @@ export function planReviewHoldCleanup({ currentLabels = [] } = {}) {
   // Checked on the label set AFTER point (1)'s own removal (never the raw observed set) — the `human` +
   // `pending` pair point (1) already resolves is NOT this bug (it is the #2549 stray a sanctioned `rearm` could
   // produce), and re-flagging it here would be this same sweep contradicting its own point (1) fix one line up.
+  // #3657 preserves review:changes under a live human hold: exclude that designed send-back from the flag
+  // input only. Accepted+human still needs the same history check; no additional label is removed.
   const afterHoldCleanup = [...names].filter((n) => !remove.includes(n));
-  const flagged = findContradictoryReviewVerdicts(afterHoldCleanup);
+  const flagInput = names.has(REVIEW_LABELS.human)
+    ? afterHoldCleanup.filter((n) => n !== REVIEW_LABELS.changes) : afterHoldCleanup;
+  const flagged = findContradictoryReviewVerdicts(flagInput);
   return flagged.length ? { remove, flagged } : { remove };
 }
 

@@ -596,7 +596,7 @@ describe('genericity — the adapter knows nothing about either operation', () =
     const deps = { ...wiring({ sinks }), store, judge: stubJudge, newRunId: idMinter() };
 
     const started = await handleOperationRequest(
-      { method: 'POST', url: '/operations/review-pr/runs', body: { pr: 1146, repo: 'chalbert/web-everything' } },
+      { method: 'POST', url: '/operations/review-pr/runs', body: { pr: 1146, repo: 'web-everything/web-everything' } },
       deps,
     );
     expect(started.status).toBe(201);
@@ -665,7 +665,7 @@ describe('genericity — the adapter knows nothing about either operation', () =
       newRunId: idMinter(),
     };
     const started = await handleOperationRequest(
-      { method: 'POST', url: '/operations/review-pr/runs', body: { pr: 1153, repo: 'chalbert/web-everything' } },
+      { method: 'POST', url: '/operations/review-pr/runs', body: { pr: 1153, repo: 'web-everything/web-everything' } },
       deps,
     );
     expect(started.body.pending.of).toBe('human');
@@ -689,7 +689,7 @@ describe('genericity — the adapter knows nothing about either operation', () =
     const { declaration, registry, sinks } = resolve(REVIEW_PR_OP);
 
     const cli = await runOperationCli({
-      declaration, argv: ['--pr=1146', '--repo=chalbert/web-everything', '--json'],
+      declaration, argv: ['--pr=1146', '--repo=web-everything/web-everything', '--json'],
       registry, store, sinks, judge: stubJudge, newRunId: () => 'review-pr-crossing',
     });
     expect(cli.stopped).toBe('confirm');
@@ -714,7 +714,7 @@ describe('genericity — the adapter knows nothing about either operation', () =
     const deps = { resolve, names, store, judge: stubJudge, newRunId: () => 'review-pr-reverse' };
 
     const started = await handleOperationRequest(
-      { method: 'POST', url: '/operations/review-pr/runs', body: { pr: 1146, repo: 'chalbert/web-everything' } },
+      { method: 'POST', url: '/operations/review-pr/runs', body: { pr: 1146, repo: 'web-everything/web-everything' } },
       deps,
     );
     expect(started.status).toBe(201);
@@ -741,7 +741,7 @@ describe('genericity — the adapter knows nothing about either operation', () =
     // `review-pr`'s knowledge and the adapter is generic over every declaration. The regex here is
     // byte-identical to `daemonReviewDetailJson`'s in `plateau:tools/dev-panel/vite-plugin.ts`.
     const { readPr } = await import('../review-pr-io.mjs');
-    expect(() => readPr({ pr: 1, repo: 'chalbert/web-everything; rm -rf /' }))
+    expect(() => readPr({ pr: 1, repo: 'web-everything/web-everything; rm -rf /' }))
       .toThrow(/`repo` must be <owner\/name>/);
     // …and the adapter itself adds no repo knowledge: a hostile value is a well-typed `string` to it, so it
     // passes the declaration's validation and is stopped one layer down, where the rule lives.

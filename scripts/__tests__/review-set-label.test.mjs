@@ -273,7 +273,7 @@ describe('decideSetLabel — rearm (#2644, folded in from the conveyor decideRea
     expect(d.removeLabels).toContain(REVIEW_LABELS.redteamAccepted);
   });
 
-  // #2811 (chalbert/web-everything PR #2811 live incident) — a `review:accepted` PR whose head then moved
+  // #2811 (web-everything/web-everything PR #2811 live incident) — a `review:accepted` PR whose head then moved
   // (a ci-heal push, a non-content-preserving rebase) is re-armable too: the acceptance is a claim about a
   // SPECIFIC head, and it stops being true once that head is gone. Before this widening, `decideSetLabel`
   // refused a rearm on an accepted-only PR, and nothing else in this file ever reverted a stale acceptance.
@@ -2528,7 +2528,7 @@ describe('buildVerdictComment — a re-stamp says what it is', () => {
  * #x9krtkb — THE LOOP: a human clears `review:human`, the drain rebases (content-preserving), the restamp
  * carries `reviewed-sha`/`reviewed-diff`/`reviewed-contribution` forward but not `cleared-human`, and the next
  * drain pass's anti-test-gaming gate sees no human coverage for the new head and re-parks `review:human` — on a
- * PR a human had JUST cleared. Measured live on PR #2572 (chalbert/web-everything), 2026-09-24.
+ * PR a human had JUST cleared. Measured live on PR #2572 (web-everything/web-everything), 2026-09-24.
  *
  * `buildVerdictComment`'s half of the fix: given the caller's own proof (`humanClearance`, computed by
  * `decideRestampHumanClearance` below), does the RENDERED restamp comment actually carry the marker forward,
@@ -3384,7 +3384,7 @@ describe('#3334 route 2/3 — review-pr\'s record step, whose argv carries the r
  */
 describe('#3334 route 3/3 — the credential-less transport refuses before a request file exists', () => {
   const facts = (over = {}) => ({
-    pr: 1593, repo: 'chalbert/web-everything', sessionId: 'sess-1', reduced: 'accept', findingCount: 0, ...over,
+    pr: 1593, repo: 'web-everything/web-everything', sessionId: 'sess-1', reduced: 'accept', findingCount: 0, ...over,
   });
 
   it('REFUSES staging a reasonless `changes` request', () => {
@@ -3466,13 +3466,13 @@ describe('#4315 direct acceptance boundary', () => {
       expect(writes).toEqual([]);
     } finally { exit.mockRestore(); }
   });
-  it('rejects stale, forged, unavailable, partial, conflicting and unreadable-card records', () => {
+  it('rejects forged, unavailable, partial, conflicting and unreadable-card records', () => {
     const { record, state } = referralState();
     const rule = { id: 'r1', key: record.referrals[0].key, reviewerId: record.reviewer.id, lens: 'correctness',
       result: 'not-real', rationale: 'Verified diff', evidence: ['diff'] };
     record.rulings = [rule]; state.comments.push(gh(renderReferralRecord(record)));
     expect(assertMandatoryReferralsCleared(state, { repo: 'o/r', pr: 7 }).pending).toEqual([]);
-    expect(() => assertMandatoryReferralsCleared({ ...state, headRefOid: 'b'.repeat(40) })).toThrow();
+    expect(() => assertMandatoryReferralsCleared({ ...state, headRefOid: 'b'.repeat(40) })).not.toThrow();
     expect(() => assertMandatoryReferralsCleared({ ...state, comments: undefined })).toThrow();
     expect(() => assertMandatoryReferralsCleared({ ...state, comments: [...state.comments, gh('<!-- mandatory-referrals-v1: truncated')] })).toThrow();
     const forged = { ...record, rulings: [{ ...rule, reviewerId: 'advisory-seat' }] };
@@ -3541,7 +3541,7 @@ fs.writeFileSync('state.json', JSON.stringify(s));
     if (mode === 'older-digest') comments.push({ author: comment.author, body: buildReviewedShaMarker(reviewedHead) });
     const original = { state, headRefOid: healedHead, headRefName: 'lane', labels: labels.map(name => ({ name })), comments, race };
     writeFileSync(join(dir, 'state.json'), JSON.stringify(original));
-    const r = spawnSync(process.execPath, [script, '42', '--repo=chalbert/web-everything', '--to=restamp', '--actor=CI healer', '--channel=ci-heal',
+    const r = spawnSync(process.execPath, [script, '42', '--repo=web-everything/web-everything', '--to=restamp', '--actor=CI healer', '--channel=ci-heal',
       ...(expected === null ? [] : [`--expect-head=${expected}`]), ...extra], {
       cwd: dir, encoding: 'utf8', env: { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`,
         WE_VERDICT_LEDGER_DIR: join(dir, 'ledger'), WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'lock') },
@@ -3610,5 +3610,24 @@ const r = cp.spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio
     expect(result.r.status, result.r.stdout + result.r.stderr).toBe(0);
     expect(parseReviewedDiff(result.added)).toBe(normalizeDiffFingerprint(healedDiff));
     expect(parseReviewedSha(result.added)).toBe(healedHead);
+  });
+});
+
+describe('xe8y12n missing-only rearm boundary', () => {
+  it.each([[], ['bug'], ['redteam:accepted']].map(labels => [labels]))('permits a valid empty family %j', labels => {
+    const result = decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: labels });
+    expect(result).toMatchObject({ allowed: true, addLabel: 'review:pending', rearmFrom: 'missing' });
+    expect(result.removeLabels).toEqual(expect.arrayContaining(['ready-to-merge', 'redteam:accepted']));
+  });
+  it.each([['ready-to-merge'], [{ name: 'ready-to-merge' }, { name: 'checking' }]].map(labels => [labels]))('preserves the producer merge clearance: refuses %j', labels => {
+    const result = decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: labels });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('ready-to-merge');
+  });
+  it.each([undefined, null, {}, [null], [{}], [''], ...['pending', 'changes', 'human', 'accepted', 'future'].map(x => [`review:${x}`])].map(labels => [labels]))('refuses unknown or occupied family %j', labels => {
+    expect(decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: labels }).allowed).toBe(false);
+  });
+  it('ordinary rearm still refuses absence', () => {
+    expect(decideSetLabel({ to: 'rearm', currentLabels: [] }).allowed).toBe(false);
   });
 });

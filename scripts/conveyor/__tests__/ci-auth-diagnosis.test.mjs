@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { collectCiAuthDiagnosis, diagnoseCiAuth, renderCiAuthDiagnosis } from '../ci-auth-diagnosis.mjs';
 
-const repo = 'chalbert/web-everything';
+const repo = 'web-everything/web-everything';
 const headSha = 'a'.repeat(40);
 const revision = 'b'.repeat(40);
 const input = { repo, headSha, runId: 36632379377, attempt: 1 };
@@ -11,7 +11,7 @@ const workflow = `jobs:
       - name: Checkout FUI (sibling)
         uses: actions/checkout@v4
         with:
-          repository: chalbert/frontierui
+          repository: frontier-ui/frontierui
           token: \${{ secrets.FUI_READ_TOKEN }}
 `;
 function fixture() {
@@ -26,10 +26,10 @@ function fixture() {
 it('incident-shaped regression identifies the consuming repo, never the checkout destination', () => {
   const body = renderCiAuthDiagnosis(diagnoseCiAuth(fixture()));
   expect(body).toContain('Checkout FUI (sibling)');
-  expect(body).toContain('gh secret set FUI_READ_TOKEN --repo chalbert/web-everything');
+  expect(body).toContain('gh secret set FUI_READ_TOKEN --repo web-everything/web-everything');
   expect(body).toContain('2026-09-30T00:00:00Z');
   expect(body).toContain('observed now');
-  expect(body).not.toContain('--repo chalbert/frontierui');
+  expect(body).not.toContain('--repo frontier-ui/frontierui');
   expect(body).not.toContain('expired');
 });
 
@@ -44,7 +44,7 @@ const noRotation = (e, detail) => {
 describe('deterministic attribution', () => {
   it.each(["secrets['FUI_READ_TOKEN']", 'secrets["FUI_READ_TOKEN"]'])('supports literal brackets: %s', (ref) => {
     const e = fixture(); e.workflow = e.workflow.replace('secrets.FUI_READ_TOKEN', ref);
-    expect(rendered(e)).toContain('gh secret set FUI_READ_TOKEN --repo chalbert/web-everything');
+    expect(rendered(e)).toContain('gh secret set FUI_READ_TOKEN --repo web-everything/web-everything');
   });
   it('does not choose the first identically named step in another job', () => {
     const e = fixture();
@@ -68,7 +68,7 @@ describe('deterministic attribution', () => {
   });
   it.each(['repo', 'head', 'attempt', 'job-attempt', 'job-head', 'pr-base'])('refuses mismatched %s', (field) => {
     const e = fixture();
-    if (field === 'repo') e.run.repository.full_name = 'chalbert/frontierui';
+    if (field === 'repo') e.run.repository.full_name = 'frontier-ui/frontierui';
     if (field === 'head') e.headSha = 'c'.repeat(40);
     if (field === 'attempt') e.run.run_attempt = 2;
     if (field === 'job-attempt') e.jobs[0].run_attempt = 2;

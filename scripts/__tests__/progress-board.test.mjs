@@ -53,7 +53,7 @@ let seq = 0;
 
 const SEED = {
   title: 'Test board',
-  repo: 'chalbert/web-everything',
+  repo: 'web-everything/web-everything',
   artifactUrl: null,
   phases: { 1: 'First' },
   items: [
@@ -156,7 +156,7 @@ describe('classifyPr', () => {
   });
 
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — LIVE INCIDENT 2026-09-26: `chalbert/web-
-  // everything#2748`'s real rollup (`gh pr view 2748 --repo chalbert/web-everything --json
+  // everything#2748`'s real rollup (`gh pr view 2748 --repo web-everything/web-everything --json
   // statusCheckRollup`) has every REQUIRED check (`test`/`smoke`/`daemon-soak`) green and ONLY the new
   // advisory `soak-replay-gate` check red — the exclusion-list-only `ciFailed(rollup)` (no second arg,
   // BEFORE `soak-replay-gate` was added to `CI_TRUTH_EXCLUDED_CHECKS`) misread this as `ci-red`. Passing the
@@ -196,10 +196,10 @@ describe('classifyPr', () => {
     expect(classifyPr(pr({ labels: ['review:pending'], statusCheckRollup: rollup }))).toBe('needs-review');
   });
 
-  // we:backlog/fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, chalbert/web-everything) —
-  // the REAL rollup read live off PR #2878 via `gh pr view 2878 --repo chalbert/web-everything --json
+  // we:backlog/fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, web-everything/web-everything) —
+  // the REAL rollup read live off PR #2878 via `gh pr view 2878 --repo web-everything/web-everything --json
   // statusCheckRollup` at the moment of the incident (trimmed to the fields `ciFailed`/`classifyPr` read).
-  // `soak-replay-gate` is a REQUIRED check (`gh api repos/chalbert/web-everything/branches/main/protection
+  // `soak-replay-gate` is a REQUIRED check (`gh api repos/web-everything/web-everything/branches/main/protection
   // --jq .required_status_checks.contexts` confirmed live: `["test","smoke","daemon-soak","soak-replay-gate"]`
   // — added to branch protection after the #2748 fix above landed, when only `test`/`smoke`/`daemon-soak`
   // were required) and, like `review-gate`, it RE-RUNS on more than one event for the SAME head — leaving a
@@ -252,13 +252,13 @@ describe('classifyPr', () => {
     expect(ciFailed([{ conclusion: 'TIMED_OUT' }])).toBe(true);
   });
 
-  // #xznd5za (epic #3383/#4075) — LIVE INCIDENT 2026-09-25: `chalbert/web-everything#2636`'s required check
+  // #xznd5za (epic #3383/#4075) — LIVE INCIDENT 2026-09-25: `web-everything/web-everything#2636`'s required check
   // `test-shard (1)` concluded CANCELLED (the daemon's own hung-ci-recovery cancel, applied only once ITS OWN
   // hung-recovery cap was exhausted — never re-run). `ciFailed` used to hand-roll its own conclusion list
   // (`FAILURE`/`TIMED_OUT`/`ACTION_REQUIRED`/`STARTUP_FAILURE`) that OMITTED `CANCELLED` — so `classifyPr` read
   // this exact rollup as having no failing check and returned `'open'`, never `'ci-red'`, and
   // `reconcile-core.mjs`'s entire ci-heal branch (dispatch AND its cap-exhausted escalation) was skipped. This
-  // is the REAL rollup read live off PR #2636 via `gh pr view 2636 --repo chalbert/web-everything --json
+  // is the REAL rollup read live off PR #2636 via `gh pr view 2636 --repo web-everything/web-everything --json
   // statusCheckRollup` at the moment of the incident (trimmed to the fields `ciFailed`/`classifyPr` read).
   it('reads a CANCELLED required check as ci-red — PR #2636\'s real live rollup, 2026-09-25 (#xznd5za)', () => {
     const pr2636Rollup = [
@@ -275,13 +275,13 @@ describe('classifyPr', () => {
     expect(classifyPr(pr({ labels: ['ci:failed'], mergeStateStatus: 'BLOCKED', statusCheckRollup: pr2636Rollup }))).toBe('ci-red');
   });
 
-  // xx6kg3f (epic #3383/#4075) — LIVE INCIDENT 2026-09-26 13:52 ET, PR #2739 (chalbert/web-everything):
+  // xx6kg3f (epic #3383/#4075) — LIVE INCIDENT 2026-09-26 13:52 ET, PR #2739 (web-everything/web-everything):
   // `review:accepted` + the durable `ci:failed` label, but the reconcile tick that logged
   // `reconcile-refused nothing-owed … phase queued` for it had fetched a rollup that did not (yet, or due to
   // a `gh` hiccup) show the failing `test` check — `ciFailed([])` reads `false`, and with no OTHER signal
   // `classifyPr` fell through to `queued`. The durable `ci:failed` label is exactly the fact this rollup read
   // missed; trusting it as a fallback is what closes the gap. Fixture: PR #2739's REAL labels
-  // (`gh pr view 2739 --repo chalbert/web-everything --json labels`), with the rollup this ONE degraded read
+  // (`gh pr view 2739 --repo web-everything/web-everything --json labels`), with the rollup this ONE degraded read
   // would have returned (empty — the shape a rate-limited/partial `gh` response takes, per this file's own
   // "degradation is a feature" header).
   it('trusts the durable ci:failed label when this read\'s own rollup came back empty — PR #2739, 2026-09-26 (xx6kg3f)', () => {
@@ -289,7 +289,7 @@ describe('classifyPr', () => {
     expect(classifyPr(pr({ labels: pr2739Labels, mergeStateStatus: 'BLOCKED', statusCheckRollup: [] }))).toBe('ci-red');
   });
 
-  // The full real rollup (`gh pr view 2739 --repo chalbert/web-everything --json statusCheckRollup`, at the
+  // The full real rollup (`gh pr view 2739 --repo web-everything/web-everything --json statusCheckRollup`, at the
   // moment its `test` check had already concluded) already classified correctly BEFORE the fix above — pinned
   // here so a future change to `ciFailed`/`FAILING_CONCLUSIONS` cannot quietly regress the non-degraded path.
   it('reads PR #2739\'s real, undegraded rollup as ci-red too (xx6kg3f)', () => {
@@ -976,10 +976,10 @@ describe('CLI verbs for the fields that had none', () => {
     expect(state().title).toBe('The plan');
     expect(page()).toContain('<h1>The plan</h1>');
 
-    expect(cli('--repo=chalbert/frontierui').code).toBe(0);
-    expect(state().repo).toBe('chalbert/frontierui');
+    expect(cli('--repo=frontier-ui/frontierui').code).toBe(0);
+    expect(state().repo).toBe('frontier-ui/frontierui');
     expect(cli('--repo=not a repo').code).toBe(1);
-    expect(state().repo).toBe('chalbert/frontierui'); // the bad value never landed
+    expect(state().repo).toBe('frontier-ui/frontierui'); // the bad value never landed
     expect(cli('--repo=').out).toMatch(/repository cleared/);
     expect(state().repo).toBeNull();
   });
@@ -1994,7 +1994,7 @@ describe('classifyPr — a stale ci:failed label must not outrank a rollup that 
 
   // we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — SUPERSEDES the assertion this case used
   // to make. It used to expect `'ci-red'` here, on the theory that "not proven green" is reason enough to trust
-  // a stale label. LIVE INCIDENT 2026-09-26/27 (chalbert/web-everything) proved that reasoning wrong: `main`
+  // a stale label. LIVE INCIDENT 2026-09-26/27 (web-everything/web-everything) proved that reasoning wrong: `main`
   // went red then green, the mechanical rebase (`ci-red-recovery-watch.mjs`) rebased each stuck PR onto the new
   // tip and re-ran CI, and every one of them still carried this exact shape — a STALE `ci:failed` label beside
   // a required check that had only just RESTARTED and not concluded yet. Trusting the label there dispatched a

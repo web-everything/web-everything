@@ -45,7 +45,7 @@
  *   node scripts/review-runner.mjs                       # discover review:pending PRs and shadow-dispose each
  *   node scripts/review-runner.mjs 974 975 983           # shadow-dispose an explicit set (labels re-read fresh)
  *   node scripts/review-runner.mjs --json                # machine-readable shadow log on stdout
- *   node scripts/review-runner.mjs --repo=chalbert/web-everything   # override the discovery repo (default: WE)
+ *   node scripts/review-runner.mjs --repo=web-everything/web-everything   # override the discovery repo (default: WE)
  *   node scripts/review-runner.mjs --no-lock             # skip the singleton lease (tests / a forced re-run)
  *
  * Exit codes: 0 = a pass ran (or a live runner already held the lease — a benign no-op); 2 = usage error

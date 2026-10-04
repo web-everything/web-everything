@@ -519,8 +519,11 @@ async function fileTimeoutFollowup(path, { root, fileFollowup } = {}) {
   }
 }
 
+export const TIMEOUT_PENDING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
 /** Retried independently of CI colour, head changes, heal capability and lane availability. */
-export async function flushTimeoutFollowups({ root = REPO_ROOT, repo, dir = timeoutStateDir(), fileFollowup, effects = timeoutGithubEffects() } = {}) {
+export async function flushTimeoutFollowups({ root = REPO_ROOT, repo, dir = timeoutStateDir(), fileFollowup, effects = timeoutGithubEffects(),
+  now = Date.now, maxAgeMs = TIMEOUT_PENDING_MAX_AGE_MS } = {}) {
   if (!existsSync(dir)) return [];
   const results = [];
   for (const name of readdirSync(dir).filter((n) => n.endsWith('.json'))) {
@@ -531,21 +534,36 @@ export async function flushTimeoutFollowups({ root = REPO_ROOT, repo, dir = time
       const canonical = join(dir, `${timeoutKey(state.evidence)}.json`);
       if (path !== canonical && existsSync(canonical)) continue;
       const pending = state.requests.find((r) => r.status === 'pending');
-      if (pending) {
-        const observed = await effects.observe(state.evidence, pending.target);
-        if (observed.repo === repo && observed.runHead === state.evidence.head && observed.run === pending.target.run
-            && observed.job === pending.target.job && observed.jobRun === pending.target.run && observed.attempt > pending.target.attempt) {
-          timeoutTransaction(path, null, (current) => {
+      if (pending && !state.retired) {
+        const at = new Date(now()).toISOString();
+        if (!pending.reservedAt) {
+          pending.reservedAt = timeoutTransaction(path, null, (current) => {
             const request = current.requests[pending.id];
-            if (request.status === 'pending') {
-              request.status = 'confirmed'; request.outcome = `observed run attempt ${observed.attempt}; request attribution uncertain`;
-            }
+            request.reservedAt ??= at;
+            return request.reservedAt;
           });
+        }
+        if (Date.parse(at) - Date.parse(pending.reservedAt) > maxAgeMs) {
+          timeoutTransaction(path, null, (current) => { current.retired ??= { reason: 'aged-out', at }; });
+        } else {
+          const observed = await effects.observe(state.evidence, pending.target);
+          if (observed.repo === repo && observed.runHead === state.evidence.head && observed.run === pending.target.run
+              && observed.job === pending.target.job && observed.jobRun === pending.target.run && observed.attempt > pending.target.attempt) {
+            timeoutTransaction(path, null, (current) => {
+              const request = current.requests[pending.id];
+              if (request.status === 'pending') {
+                request.status = 'confirmed'; request.outcome = `observed run attempt ${observed.attempt}; request attribution uncertain`;
+              }
+            });
+          }
+          if (observed.open === false) {
+            timeoutTransaction(path, null, (current) => { current.retired ??= { reason: 'pr-closed', at }; });
+          }
         }
       }
       await fileTimeoutFollowup(path, { root, fileFollowup });
       const after = JSON.parse(readFileSync(path, 'utf8'));
-      results.push({ card: after.card?.payload.num, filed: after.card?.filed, reason: after.card?.error });
+      results.push({ card: after.card?.payload.num, filed: after.card?.filed, reason: after.card?.error, retired: after.retired?.reason });
     } catch (error) { results.push({ reason: error.message }); }
   }
   return results;
@@ -555,7 +573,7 @@ export async function flushTimeoutFollowups({ root = REPO_ROOT, repo, dir = time
  * budget. It reconciles only on an observed newer run attempt for the SAME repository and head.
  */
 export async function dispatchTimeoutRetry(evidence, {
-  root = REPO_ROOT, repo, dir = timeoutStateDir(), effects = timeoutGithubEffects(), fileFollowup,
+  root = REPO_ROOT, repo, dir = timeoutStateDir(), effects = timeoutGithubEffects(), fileFollowup, now = Date.now,
 } = {}) {
   const refuse = (reason, extra = {}) => ({ status: 'refused', reason, ...extra });
   if (!evidence?.eligible || evidence.repo !== repo || !evidence.head || !evidence.signature
@@ -576,7 +594,7 @@ export async function dispatchTimeoutRetry(evidence, {
     const target = evidence.jobs.find((j) => !state.requests.some((r) => r.status === 'confirmed'
       && r.target.run === j.run && r.target.job === j.job && r.target.attempt === j.attempt));
     if (!target) return { waiting: true };
-    reservation = { id: state.requests.length, signature: evidence.signature, target, status: 'pending', outcome: 'reserved; API outcome unknown' };
+    reservation = { id: state.requests.length, signature: evidence.signature, target, status: 'pending', reservedAt: new Date(now()).toISOString(), outcome: 'reserved; API outcome unknown' };
     state.requests.push(reservation);
     return { target };
   });

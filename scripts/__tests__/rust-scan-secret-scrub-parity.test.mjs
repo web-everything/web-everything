@@ -77,7 +77,7 @@ describe.skipIf(!hasCargo)('we-scan secret-scrub — cross-language parity with 
       'backlog/004-labeled-mismatched-quote.md': "password: \"hunter2Trombone'\n",
       'backlog/005-blob.md': 'Payload: Qx7mK2pL9vN4wR8tY3sJ6hG1fD5bC0eA9zX2qW7mN4v\n',
       'backlog/006-personal-email.md': 'Contact nic.g.gilbert@gmail.com for follow-up.\n',
-      'backlog/007-service-email-passes.md': 'origin is git@github.com:chalbert/web-everything.git\n',
+      'backlog/007-service-email-passes.md': 'origin is git@github.com:web-everything/web-everything.git\n',
       'backlog/008-public-ip.md': 'server at 8.8.8.8 handles DNS.\n',
       'backlog/009-private-ip-passes.md': 'bridge at 127.0.0.1:8080 and 192.168.1.1.\n',
       'backlog/010-ipv6.md': 'Address: 2001:0db8:85a3:0000:8a2e\n',

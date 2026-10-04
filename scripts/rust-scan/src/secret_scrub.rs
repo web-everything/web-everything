@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn service_account_email_passes() {
-        assert_eq!(scrub_publish("origin is git@github.com:chalbert/web-everything.git"), Vec::<String>::new());
+        assert_eq!(scrub_publish("origin is git@github.com:web-everything/web-everything.git"), Vec::<String>::new());
     }
 
     #[test]

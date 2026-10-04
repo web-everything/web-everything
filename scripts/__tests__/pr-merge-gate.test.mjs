@@ -17,8 +17,8 @@ describe('pr-merge-gate — buildGateMergeArgs (mirrors the merge-ai-prs inline 
     expect(buildGateMergeArgs({ pr: 12 })).toEqual(['pr', 'merge', '12', '--merge', '--delete-branch']);
   });
   it('threads --repo <slug> when a repo is given (the multi-repo drain)', () => {
-    expect(buildGateMergeArgs({ pr: 7, repo: 'chalbert/frontierui' }))
-      .toEqual(['pr', 'merge', '7', '--repo', 'chalbert/frontierui', '--merge', '--delete-branch']);
+    expect(buildGateMergeArgs({ pr: 7, repo: 'frontier-ui/frontierui' }))
+      .toEqual(['pr', 'merge', '7', '--repo', 'frontier-ui/frontierui', '--merge', '--delete-branch']);
   });
   it('honours the merge method flag and never emits --auto (the drain owns ordering)', () => {
     expect(mergeMethodFlag('squash')).toBe('--squash');
@@ -36,8 +36,8 @@ describe('pr-merge-gate — buildGateMergeArgs (mirrors the merge-ai-prs inline 
       .toEqual(['pr', 'merge', '12', '--merge', '--delete-branch', '--match-head-commit', 'abc1234']);
   });
   it('threads --match-head-commit AFTER --repo when both are given', () => {
-    expect(buildGateMergeArgs({ pr: 7, repo: 'chalbert/frontierui', matchHeadCommit: 'deadbeef' }))
-      .toEqual(['pr', 'merge', '7', '--repo', 'chalbert/frontierui', '--merge', '--delete-branch', '--match-head-commit', 'deadbeef']);
+    expect(buildGateMergeArgs({ pr: 7, repo: 'frontier-ui/frontierui', matchHeadCommit: 'deadbeef' }))
+      .toEqual(['pr', 'merge', '7', '--repo', 'frontier-ui/frontierui', '--merge', '--delete-branch', '--match-head-commit', 'deadbeef']);
   });
   it('omits --match-head-commit when none is given — byte-identical to the pre-fix argv (no regression)', () => {
     expect(buildGateMergeArgs({ pr: 12 })).toEqual(['pr', 'merge', '12', '--merge', '--delete-branch']);
@@ -77,10 +77,10 @@ describe('pr-merge-gate — mergePr caller invariant (#2290)', () => {
   it('WE_MERGE_BREAK_GLASS=1 lets a non-drain caller PROCEED and emits the loud audit line', () => {
     const { exec, calls } = fakeExec();
     const { log, lines } = fakeLog();
-    const r = mergePr({ pr: 42, repo: 'chalbert/plateau-app', caller: 'pr-land', exec, env: { WE_MERGE_BREAK_GLASS: '1' }, log });
+    const r = mergePr({ pr: 42, repo: 'plateauapp/plateau-app', caller: 'pr-land', exec, env: { WE_MERGE_BREAK_GLASS: '1' }, log });
     expect(calls).toHaveLength(1); // the merge WAS shelled under break-glass
     expect(calls[0].args).toContain('--repo');
-    expect(lines.join('')).toMatch(/BREAK-GLASS merge by route=pr-land pr=42 repo=chalbert\/plateau-app — off the normal path/);
+    expect(lines.join('')).toMatch(/BREAK-GLASS merge by route=pr-land pr=42 repo=plateauapp\/plateau-app — off the normal path/);
     expect(r).toEqual({ ok: true });
   });
 });
@@ -347,14 +347,14 @@ describe('pr-merge-gate — retargetStackedPrs (#3383, the #2578 incident)', () 
   it('buildStackedPrListArgs scopes the listing to --base <headRef> — never a full-repo fan-out', () => {
     expect(buildStackedPrListArgs({ headRef: 'lane/3681-ratify-daemon-lifecycle' }))
       .toEqual(['pr', 'list', '--state', 'open', '--base', 'lane/3681-ratify-daemon-lifecycle', '--json', 'number,baseRefName']);
-    expect(buildStackedPrListArgs({ repo: 'chalbert/frontierui', headRef: 'lane/x' }))
-      .toEqual(['pr', 'list', '--state', 'open', '--base', 'lane/x', '--repo', 'chalbert/frontierui', '--json', 'number,baseRefName']);
+    expect(buildStackedPrListArgs({ repo: 'frontier-ui/frontierui', headRef: 'lane/x' }))
+      .toEqual(['pr', 'list', '--state', 'open', '--base', 'lane/x', '--repo', 'frontier-ui/frontierui', '--json', 'number,baseRefName']);
   });
 
   it('buildRetargetArgs builds `pr edit <n> --base <default>`', () => {
     expect(buildRetargetArgs({ pr: 2578, base: 'main' })).toEqual(['pr', 'edit', '2578', '--base', 'main']);
-    expect(buildRetargetArgs({ pr: 9, repo: 'chalbert/plateau-app', base: 'main' }))
-      .toEqual(['pr', 'edit', '9', '--repo', 'chalbert/plateau-app', '--base', 'main']);
+    expect(buildRetargetArgs({ pr: 9, repo: 'plateauapp/plateau-app', base: 'main' }))
+      .toEqual(['pr', 'edit', '9', '--repo', 'plateauapp/plateau-app', '--base', 'main']);
   });
 
   it('retargets every PR the listing names, onto the default branch, BEFORE any merge/delete happens', () => {

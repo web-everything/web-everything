@@ -67,7 +67,7 @@
  * `makeCliMechanicalPasses` also calls it when that runner is up.
  *
  * THE THIRD, PREVIOUSLY-INVISIBLE POPULATION — UNOWNED (#xs81oxb, parent #4075/#3383). Live-caught,
- * `chalbert/web-everything#2709` (`fix(#4138)`, stacked on #2708 which merged at 02:13Z 2026-09-26): a DIRTY PR
+ * `web-everything/web-everything#2709` (`fix(#4138)`, stacked on #2708 which merged at 02:13Z 2026-09-26): a DIRTY PR
  * carrying NO review-workflow label at all — not `review:human`/`pending`/`changes` (the PARKED population above)
  * and not `review:accepted`/`ready-to-merge` (the QUEUED population above) — matched neither. `classifyPr`
  * (`we:progress-board.mjs`) still reads it as `conflicted`, so `we:scripts/conveyor/reconcile-core.mjs` keeps
@@ -160,6 +160,7 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 // `latestConflictAlertCreatedAtMs` / `hasRecentConflictFindingComment` for why these three, uniquely in this
 // file, were missing it.
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { operatorAnswerForStandDown } from './stand-down-answer-core.mjs';
 
 // #xkmu3gv — single-sourced in the new leaf `we:scripts/conveyor/conflict-label.mjs` (a genuine pure leaf, no
 // imports) so `we:scripts/conveyor/reconcile-core.mjs` can read the label with no heavier pull-in than this
@@ -222,7 +223,7 @@ export function isQueuedConflictTarget(pr) {
  * STACKED base is `reconcile-core.mjs#3383`'s STACKED-BASE CONFLICT branch's job, unchanged), and claimed by
  * NEITHER {@link isParkedConflictTarget} (no uncleared `review:human`/`pending`/`changes` hold) NOR
  * {@link isQueuedConflictTarget} (no `review:accepted`/`ready-to-merge` go-ahead either)? PURE. #xs81oxb
- * (parent #4075/#3383) — live-caught on `chalbert/web-everything#2709`: a formerly-stacked PR whose base merged
+ * (parent #4075/#3383) — live-caught on `web-everything/web-everything#2709`: a formerly-stacked PR whose base merged
  * and was retargeted to `main`, left carrying only an unrelated `checking` label. See this file's own header,
  * "THE THIRD, PREVIOUSLY-INVISIBLE POPULATION", for the full incident and why this population gets no grace
  * period (unlike {@link isQueuedConflictTarget}'s own `QUEUED_CONFLICT_GRACE_MS}` wait).
@@ -352,7 +353,7 @@ export function defaultComputeConflictDisposition({ pr, cwd = REPO_ROOT, exec = 
 
 /**
  * we:scripts/conveyor/parked-pr-conflict-watch.mjs#defaultConflictingFilePaths — #xconflres1 (live incident,
- * `chalbert/web-everything#2772` — see {@link isStatuteTierConflict}'s own docblock for the full incident this
+ * `web-everything/web-everything#2772` — see {@link isStatuteTierConflict}'s own docblock for the full incident this
  * closes). The CONTENT-BASED, PRECISE alternative {@link isStatuteTierConflict}'s own docblock already named as
  * future work: rather than reading the PR's WHOLE changed-file set (an over-cautious approximation that routes a
  * PR to a human whenever a leash/statute file merely SITS IN the diff, whether or not it is any part of the
@@ -524,7 +525,7 @@ export function latestConflictAlertCreatedAtMs(comments) {
  * POPULATION regardless of which code path is driving the round — {@link watchParkedPrConflicts}'s own
  * idle-conflict-bounce re-assertion (below) and `reconcile-core.mjs`'s `isConflictBounce` dispatch both bind on
  * this same number, so a PR can never get more mechanical conflict-resolution attempts by however many times its
- * ownership ping-pongs between the two passes (landing-freeze fix, chalbert/web-everything#2793, 2026-09-27).
+ * ownership ping-pongs between the two passes (landing-freeze fix, web-everything/web-everything#2793, 2026-09-27).
  */
 export const CONFLICT_FIX_ROUND_CAP = 3;
 
@@ -939,10 +940,33 @@ export function findWatcherStandDownComment(comments) {
 }
 
 /**
+ * we:scripts/conveyor/parked-pr-conflict-watch.mjs#isWatcherStandDownOperatorAnswered — has the operator
+ * recorded a stand-down ANSWER (`we:scripts/conveyor/stand-down-answer-core.mjs`, marker
+ * `conveyor-stand-down-answer:v1`) for the LATEST watcher stand-down on this thread? PURE. The answer is
+ * authenticated by `parseOperatorAnswer` (operator/automation login + a re-built body that must match exactly)
+ * and must name that stand-down's own comment id, so a stale answer to an older stand-down never lifts a newer
+ * one. A later operator answer lifts the stand-down for that episode: the watch re-derived "still a judgment
+ * call" every sweep and never looked at it (live: web-everything/web-everything#3771, 2026-10-03).
+ * @param {Array<object>|null|undefined} comments
+ * @returns {boolean}
+ */
+export function isWatcherStandDownOperatorAnswered(comments) {
+  if (!Array.isArray(comments)) return false;
+  let last = -1;
+  for (let i = 0; i < comments.length; i += 1) {
+    const c = comments[i];
+    const body = typeof c === 'string' ? c : c?.body;
+    if (typeof body === 'string' && body.trimStart().startsWith(STAND_DOWN_MARKER)
+      && body.includes(WATCHER_STAND_DOWN_ACTOR)) last = i;
+  }
+  return last !== -1 && operatorAnswerForStandDown(comments, last) !== null;
+}
+
+/**
  * we:scripts/conveyor/parked-pr-conflict-watch.mjs#isWatcherMarkerAlreadySuperseded — has a supersede comment
  * ({@link SUPERSEDE_STAND_DOWN_MARKER}) already been posted AFTER the latest watcher stand-down on this thread?
  * PURE. The re-check's idempotency read: without it every sweep re-posted the supersede comment and a fresh
- * `review:changes` finding (live on chalbert/web-everything#2549, 2026-09-24, one pair every ~2 minutes).
+ * `review:changes` finding (live on web-everything/web-everything#2549, 2026-09-24, one pair every ~2 minutes).
  *
  * Body-only on purpose. This read only ever SUPPRESSES a re-dispatch, so a forged supersede comment can do no
  * worse than leave the PR stood down (the safe direction). The dispatch gate that could be unblocked by a forgery
@@ -1184,7 +1208,7 @@ export function defaultListPrPatches({ number, repo, exec = execFileSyncThrottle
  */
 export function defaultListPrComments({ number, repo, exec = execFileSyncThrottled }) {
   const path = repo ? `repos/${repo}/issues/${number}/comments` : `repos/{owner}/{repo}/issues/${number}/comments`;
-  const argv = ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', path, '--jq', '.[] | [.body, .created_at, .user.login] | @tsv'];
+  const argv = ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', path, '--jq', '.[] | [.body, .created_at, .user.login, .node_id] | @tsv'];
   // #x5n4zn3 — was bare (no timeout).
   const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
   return String(out || '').split('\n').filter((l) => l !== '').map((line) => {
@@ -1193,12 +1217,19 @@ export function defaultListPrComments({ number, repo, exec = execFileSyncThrottl
     const rest = line.slice(tab1 + 1);
     const tab2 = rest.indexOf('\t');
     const createdAtRaw = tab2 === -1 ? rest : rest.slice(0, tab2);
-    const loginRaw = tab2 === -1 ? '' : rest.slice(tab2 + 1);
+    const afterCreated = tab2 === -1 ? '' : rest.slice(tab2 + 1);
+    const tab3 = afterCreated.indexOf('\t');
+    const loginRaw = tab3 === -1 ? afterCreated : afterCreated.slice(0, tab3);
+    // The GraphQL node id (`IC_kwDO…`) — the id an operator stand-down answer names in `Supersedes stand-down
+    // comment \`<id>\``. Without it the answer can never be matched to the stand-down it resolves.
+    const idRaw = tab3 === -1 ? '' : afterCreated.slice(tab3 + 1);
     const login = unescapeTsvField(loginRaw) || null;
+    const id = unescapeTsvField(idRaw) || null;
     return {
       body: unescapeTsvField(line.slice(0, tab1)),
       createdAt: unescapeTsvField(createdAtRaw) || null,
       author: login ? { login } : null,
+      ...(id ? { id } : {}),
     };
   });
 }
@@ -1213,7 +1244,7 @@ export function defaultListPrComments({ number, repo, exec = execFileSyncThrottl
  * @param {{num:number|string, headRefName?:string}} pr
  * @returns {string}
  */
-export function buildConflictFindingBody(pr, { appendOnlyStatute = false, reviewHumanFixable = false } = {}) {
+export function buildConflictFindingBody(pr, { appendOnlyStatute = false, reviewHumanFixable = false, resync = false } = {}) {
   const ref = pr?.headRefName ? ` (\`${pr.headRefName}\`)` : '';
   // #3383-append-only-statute — an EXPLICIT, narrower instruction for the one case this file's classifier proves
   // mechanical: both sides only ADDED a new `### ` section at the same spot in a statute doc. Stated as its own
@@ -1243,6 +1274,18 @@ export function buildConflictFindingBody(pr, { appendOnlyStatute = false, review
         'you changed.',
     ]
     : [];
+  if (resync) {
+    return [
+      `PR #${pr?.num ?? pr?.number ?? '?'}${ref} is behind \`main\`: GitHub reports \`mergeable: CONFLICTING\`, ` +
+        'but `git merge-tree` finds NO conflict against current `main`. This is the WHOLE finding.',
+      '',
+      '**Re-sync with `main` — nothing to resolve.** Merge `main` into this branch (no rebase, no force-push), ' +
+        'push it, and let GitHub recompute mergeability and run CI on the new head. If the merge unexpectedly ' +
+        'conflicts, resolve only that conflict. Make no other edits and touch no `review:*` label.',
+      '',
+      '_Auto-detected by the parked-PR conflict watch (`we:scripts/conveyor/parked-pr-conflict-watch.mjs`)._',
+    ].join('\n');
+  }
   return [
     `PR #${pr?.num ?? pr?.number ?? '?'}${ref} has drifted into a real GIT merge conflict against \`main\` — ` +
       "GitHub reports `mergeable: CONFLICTING`. This is the WHOLE finding; there is no separate reviewer comment " +
@@ -1300,7 +1343,7 @@ export function narrowToConflictingFiles(files, conflictingPaths) {
  * #xconflres1 — `conflictingPaths`, when given as a NON-EMPTY array ({@link defaultConflictingFilePaths}'s own
  * output), narrows `files` down to ONLY the paths actually in the same-line git conflict BEFORE ever computing
  * `isStatuteTierConflict` — the precise alternative to reading the PR's whole changed-file set (see that
- * function's own docblock for the live incident, `chalbert/web-everything#2772`, this closes). `null`/`undefined`/
+ * function's own docblock for the live incident, `web-everything/web-everything#2772`, this closes). `null`/`undefined`/
  * an EMPTY array (the probe could not tell, or found no parseable conflict path), or any conflict path that does
  * not match a changed file exactly ({@link narrowToConflictingFiles}), leaves `files` UNNARROWED — today's
  * whole-diff behaviour, the safe/over-cautious fallback direction.
@@ -1379,9 +1422,9 @@ export function defaultListParkedPrs({ exec = execFileSyncThrottled, repo = null
  * path (`we:scripts/review-set-label.mjs#bodyFileRoots`) and removed afterward either way.
  * @param {{pr:object, repo:string|null, exec?:Function}} o
  */
-export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appendOnlyStatute = false, reviewHumanFixable = false }) {
+export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appendOnlyStatute = false, reviewHumanFixable = false, resync = false }) {
   const bodyPath = join(tmpdir(), `reconcile-finding-conflict-${pr?.number}-${randomUUID()}.md`);
-  writeFileSync(bodyPath, buildConflictFindingBody({ num: pr?.number, headRefName: pr?.headRefName }, { appendOnlyStatute, reviewHumanFixable }), 'utf8');
+  writeFileSync(bodyPath, buildConflictFindingBody({ num: pr?.number, headRefName: pr?.headRefName }, { appendOnlyStatute, reviewHumanFixable, resync }), 'utf8');
   try {
     const argv = [
       join(REPO_ROOT, 'scripts', 'conveyor', 'reconcile-finding.mjs'), String(pr?.number),
@@ -1514,7 +1557,7 @@ export function watchParkedPrConflicts({
     // was invisible to every sweep after the first (this file's own "IDEMPOTENCY, NO SEPARATE STORE" header rule
     // — a comment posts only on the absent→present label transition, never again while the label sits on the
     // PR), while `reconcile-core.mjs`'s `OWED_ELSEWHERE.conflicted` refusal assumes THIS file owns re-attempting
-    // it — a ping-pong with no owner. Confirmed live: `chalbert/web-everything#2793` sat exactly here
+    // it — a ping-pong with no owner. Confirmed live: `web-everything/web-everything#2793` sat exactly here
     // (`review:pending` + `review-round:2` + `merge-status:conflicting`, `mergeable: CONFLICTING`, no
     // `review:changes`) — the finding that once bounced it to `review:changes` had already been rearmed
     // (`review:changes → review:pending`) by a completed mechanical conflict-fix round that did not actually
@@ -1601,7 +1644,20 @@ export function watchParkedPrConflicts({
           : classifyStatuteConflict(filesForCheck, {
               number: pr?.number, repo: resolvedRepo, listPrPatches, hasReviewHuman: true, listMainStatutePatches, conflictingPaths,
             });
-        if (isStatuteTier && !appendOnlyStatute && !reviewHumanFixable) {
+        // Two reasons the judgment stand-down must NOT stand even though the whole-diff heuristic still reads
+        // statute-tier (live: web-everything/web-everything#3771, stuck for hours):
+        //  - the operator recorded an answer to THIS stand-down (`isWatcherStandDownOperatorAnswered`);
+        //  - `git merge-tree` finds NO conflict at all while GitHub still says CONFLICTING (a rename/modify main
+        //    resolves cleanly, or GitHub's cached mergeability is stale). There is no hunk to judge, so
+        //    `conflictingPaths` was `[]`, the narrowing fell back to the whole diff, and a statute file merely
+        //    SITTING in the diff stood the PR down. That is a plain re-sync with main, never a judgment call.
+        const operatorAnswered = isWatcherStandDownOperatorAnswered(comments);
+        let gitClean = false;
+        if (isStatuteTier && !appendOnlyStatute && !reviewHumanFixable && !operatorAnswered) {
+          try { gitClean = computeConflictDisposition({ pr, repo: resolvedRepo }) === 'clean'; } catch { gitClean = false; }
+        }
+        const resync = gitClean;
+        if (isStatuteTier && !appendOnlyStatute && !reviewHumanFixable && !operatorAnswered && !gitClean) {
           // Still a genuine judgment call — the earlier stand-down stands; never re-post, never duplicate the marker.
           entry.routedTo = 'stand-down (unchanged)';
           results.push(entry);
@@ -1617,13 +1673,17 @@ export function watchParkedPrConflicts({
           // (`isWatcherMarkerAlreadySuperseded`) and the dispatch gate (`isStandDownSuperseded`) key on, so it must
           // only exist once the finding really went out. If `postFinding` throws, no supersede is posted and the
           // next sweep retries — instead of a "routed to a fix agent" note with no fix request behind it.
-          postFinding({ pr, repo: resolvedRepo, appendOnlyStatute, reviewHumanFixable: isStatuteTier && !appendOnlyStatute });
+          postFinding({ pr, repo: resolvedRepo, appendOnlyStatute, reviewHumanFixable: isStatuteTier && !appendOnlyStatute && !operatorAnswered && !resync, ...(resync ? { resync: true } : {}) });
           // A missing supersede leaves the marker unsuperseded, so this same branch re-runs next sweep (the PR still
           // carries `review:human` + the conflict label) — only report it as superseded once it really posted.
           try { postSupersedeComment({ pr, repo: resolvedRepo, provider }); } catch { superseded = false; }
         }
         if (superseded) entry.supersededStandDown = true;
-        entry.routedTo = !isStatuteTier
+        entry.routedTo = resync
+          ? 'reconcile-finding (git sees no conflict, GitHub does — plain re-sync with main, marker superseded)'
+          : operatorAnswered && isStatuteTier && !appendOnlyStatute && !reviewHumanFixable
+          ? 'reconcile-finding (operator answer lifted the stand-down, marker superseded)'
+          : !isStatuteTier
           ? 'reconcile-finding (no longer statute-tier — #xconflres1, marker superseded)'
           : appendOnlyStatute
           ? 'reconcile-finding (append-only statute, marker superseded)'
@@ -1686,7 +1746,7 @@ export function watchParkedPrConflicts({
         // population — it only reports the deferral so a dry-run sweep is never silent about what is actually
         // happening to it (mirrors this whole branch's own dry-run-visibility discipline just above).
         //
-        // CONFIRMED LIVE 2026-09-24: `chalbert/web-everything#2578` (base `lane/3681-ratify-daemon-lifecycle`)
+        // CONFIRMED LIVE 2026-09-24: `web-everything/web-everything#2578` (base `lane/3681-ratify-daemon-lifecycle`)
         // is exactly this population — see `reconcile-core.mjs`'s own docblock for the full incident.
         const baseRefName = pr?.baseRefName ?? null;
         if (baseRefName && baseRefName !== 'main') {
@@ -1711,7 +1771,7 @@ export function watchParkedPrConflicts({
               number: pr?.number, repo: resolvedRepo, listPrPatches, hasReviewHuman, listMainStatutePatches, conflictingPaths,
             });
 
-        // #xconflres1 (live incident `chalbert/web-everything#2772`) — a QUEUED PR re-evaluated here every sweep
+        // #xconflres1 (live incident `web-everything/web-everything#2772`) — a QUEUED PR re-evaluated here every sweep
         // may already carry a stand-down THIS WATCH posted on an EARLIER sweep, back when it was still `parked`
         // and the whole-diff heuristic over-fired. If the narrower check above now says the conflict is
         // dispatchable, that earlier marker must be explicitly SUPERSEDED (never silently left to contradict a
@@ -1797,7 +1857,7 @@ export function watchParkedPrConflicts({
           // finding after a good supersede leaves the PR queued too, and the next sweep (now reading the marker
           // as superseded) posts just the finding. `supersededStandDown` is only reported once it really posted.
           // #xconflres1 — includes the "no longer statute-tier at all" outcome (the false-positive stand-down this
-          // whole card exists to unblock, e.g. `chalbert/web-everything#2772`).
+          // whole card exists to unblock, e.g. `web-everything/web-everything#2772`).
           // #gh-write-burst — only the finding is skipped when `alreadyBounced`; the supersede needs no guard of its
           // own (`priorWatcherStandDown` already reads false once a supersede is on the thread).
           if (!dryRun) {

@@ -280,7 +280,7 @@ describe('healNnnCollision refuses to push onto a branch a fixer holds the LIVE 
       rm: { status: 0 },
       'write-tree': { status: 0, stdout: 'tree'.padEnd(40, '0') + '\n' },
       'commit-tree': { status: 0, stdout: 'newCommit'.padEnd(40, '0') + '\n' },
-      remote: { status: 0, stdout: 'git@github.com:chalbert/web-everything.git\n' },
+      remote: { status: 0, stdout: 'git@github.com:web-everything/web-everything.git\n' },
       push: { status: 0 },
     });
     const r = healNnnCollision({ laneRef: 'lane/x-2222-claimed', run });

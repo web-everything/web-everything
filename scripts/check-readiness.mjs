@@ -158,7 +158,7 @@ const inReview = [];
 const prScanFile = process.env.WE_OPEN_PRS_FILE;
 if (!process.argv.includes('--no-pr-scan') && (prScanFile || !process.argv.includes('--no-fetch'))) {
   const pr = openPrsByItem(prScanFile
-    ? { run: () => ({ status: 0, stdout: readFileSync(prScanFile, 'utf8'), stderr: '' }), repos: ['chalbert/web-everything'] }
+    ? { run: () => ({ status: 0, stdout: readFileSync(prScanFile, 'utf8'), stderr: '' }), repos: ['web-everything/web-everything'] }
     : undefined);
   const prSet = new Set(pr.nums);
   if (prSet.size) {

@@ -100,7 +100,7 @@ node scripts/progress-board.mjs --rephase=<id> --phase=3   # move an existing ro
 node scripts/progress-board.mjs --remove=<id>              # drop a plan row (a typo'd title, a dropped item)
 node scripts/progress-board.mjs --phase-title=2 --to="Merge-gate correctness"   # empty --to clears it
 node scripts/progress-board.mjs --board-title="Progress board"
-node scripts/progress-board.mjs --repo=chalbert/web-everything   # what `gh pr list --repo` is given
+node scripts/progress-board.mjs --repo=web-everything/web-everything   # what `gh pr list --repo` is given
 node scripts/progress-board.mjs --decision-remove=<id>     # its R-number retires and is never reissued
 node scripts/progress-board.mjs --start=<id> --date=2026-08-01   # correct a date the board stamped for you
 ```

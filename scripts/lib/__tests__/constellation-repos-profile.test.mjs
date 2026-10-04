@@ -19,19 +19,19 @@ describe('repoProfile', () => {
     // its own docblock for why). Left out of this static map (unlike every other field here) because the real
     // value is machine-dependent; asserted separately.
     we: {
-      slug: 'chalbert/web-everything', slugTag: '',
+      slug: 'web-everything/web-everything', slugTag: '',
       scopePrefixes: ['we', 'webeverything'], canonicalPrefix: 'we',
       capabilities: { review: true, fix: true, ciHeal: true, build: 'direct' },
     },
     frontierui: {
-      slug: 'chalbert/frontierui', slugTag: 'fui', lanePoolRepo: `${HOME}/workspace/frontierui`,
+      slug: 'frontier-ui/frontierui', slugTag: 'fui', lanePoolRepo: `${HOME}/workspace/frontierui`,
       scopePrefixes: ['fui', 'frontierui'], canonicalPrefix: 'fui',
       // #x33jgwt multi-repo slice 5 turned `fix` on for the couple-repos; #3967 multi-repo slice 7 turns
       // `ciHeal` on the same way, independently, as its own capability.
       capabilities: { review: true, fix: true, ciHeal: true, build: 'couple' },
     },
     'plateau-app': {
-      slug: 'chalbert/plateau-app', slugTag: 'pa', lanePoolRepo: `${HOME}/workspace/plateau-app`,
+      slug: 'plateauapp/plateau-app', slugTag: 'pa', lanePoolRepo: `${HOME}/workspace/plateau-app`,
       scopePrefixes: ['plateau', 'plateau-app'], canonicalPrefix: 'plateau',
       capabilities: { review: true, fix: true, ciHeal: true, build: 'couple' },
     },
@@ -39,9 +39,9 @@ describe('repoProfile', () => {
 
   // Every input form this function documents itself as accepting, per repo.
   const INPUTS = {
-    we: ['we', 'chalbert/web-everything', 'we:', 'webeverything', 'webeverything:'],
-    frontierui: ['frontierui', 'chalbert/frontierui', 'fui', 'fui:', 'frontierui:'],
-    'plateau-app': ['plateau-app', 'chalbert/plateau-app', 'pa', 'pa:', 'plateau', 'plateau:', 'plateau-app:'],
+    we: ['we', 'web-everything/web-everything', 'we:', 'webeverything', 'webeverything:'],
+    frontierui: ['frontierui', 'frontier-ui/frontierui', 'fui', 'fui:', 'frontierui:'],
+    'plateau-app': ['plateau-app', 'plateauapp/plateau-app', 'pa', 'pa:', 'plateau', 'plateau:', 'plateau-app:'],
   };
 
   for (const [key, inputs] of Object.entries(INPUTS)) {
@@ -126,7 +126,7 @@ describe('gateFor', () => {
 
   it('resolves the same gate from any vocabulary (key, gh slug, scope prefix) and defaults WE root to THIS checkout', () => {
     const byKey = gateFor('frontierui', { home: HOME, checkoutExists: () => true });
-    expect(gateFor('chalbert/frontierui', { home: HOME, checkoutExists: () => true })).toBe(byKey);
+    expect(gateFor('frontier-ui/frontierui', { home: HOME, checkoutExists: () => true })).toBe(byKey);
     expect(gateFor('fui:', { home: HOME, checkoutExists: () => true })).toBe(byKey);
     expect(byKey).toBe(`node ${briefTokensForRepo('we', { checkoutExists: () => true }).WE_ROOT}/scripts/verify-lane.mjs run --repo=.`);
   });
@@ -151,7 +151,7 @@ describe('briefTokensForRepo', () => {
       checkoutExists: () => true, readPackageJson: () => WE_PACKAGE_JSON,
     });
     expect(tokens).toEqual({
-      REPO: 'chalbert/web-everything',
+      REPO: 'web-everything/web-everything',
       LANE_REPO: expect.any(String),
       GATE_COMMAND: expect.stringMatching(/\/scripts\/verify-lane\.mjs run --repo=\.$/),
       WE_ROOT: expect.any(String),
@@ -177,7 +177,7 @@ describe('briefTokensForRepo', () => {
       itemNum: '3960', home: '/home/test',
       checkoutExists: () => true, readPackageJson: () => PLATEAU_PACKAGE_JSON,
     });
-    expect(tokens.REPO).toBe('chalbert/plateau-app');
+    expect(tokens.REPO).toBe('plateauapp/plateau-app');
     expect(tokens.LANE_REPO).toBe('/home/test/workspace/plateau-app');
     expect(tokens.GATE_COMMAND).toBe(`node ${tokens.WE_ROOT}/scripts/verify-lane.mjs run --repo=.`); // verify-lane picks `npm test` itself (#3919)
     expect(tokens.ATTRIBUTION).toBe('PLATEAU #3960');

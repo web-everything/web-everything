@@ -46,7 +46,7 @@ export function prSnapshotDir(env = process.env) {
   return join(home, '.claude', 'conveyor', 'pr-snapshot');
 }
 
-/** `chalbert/web-everything` → `chalbert__web-everything`; null for anything that is not a plain owner/name. */
+/** `web-everything/web-everything` → `web-everything__web-everything`; null for anything that is not a plain owner/name. */
 export function snapshotKey(repo) {
   const m = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(String(repo ?? '').trim());
   return m ? `${m[1].toLowerCase()}__${m[2].toLowerCase()}` : null;

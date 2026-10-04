@@ -118,9 +118,9 @@ describe('buildAdvisoryFixComment — the durable comment body (#xkmu3gv)', () =
   });
 });
 
-describe('#xconv1-evidence (chalbert/web-everything#2766/#2767 misfire) — isLatestAdvisoryFindingAddressed recognizes a CONVERTED note too', () => {
+describe('#xconv1-evidence (web-everything/web-everything#2766/#2767 misfire) — isLatestAdvisoryFindingAddressed recognizes a CONVERTED note too', () => {
   const convertedNote = renderConvertedAdvisoryNote({
-    repo: 'chalbert/web-everything', pr: 2766, headSha: 'deadbeef',
+    repo: 'web-everything/web-everything', pr: 2766, headSha: 'deadbeef',
     acceptComment: { body: 'x' }, escalation: { kind: 'test-gaming', reasonText: 'x' },
     targetedCheckAnswer: { verdict: 'changes', note: 'no diff evidence to confirm the removed tests were legitimate' },
   });
@@ -154,7 +154,7 @@ describe('#xconv1-evidence (chalbert/web-everything#2766/#2767 misfire) — isLa
   });
 });
 
-describe('#xconv1-evidence FOLLOW-UP (chalbert/web-everything#2766/#2767, 2026-09-27) — countCompletedAdvisoryEpisodes', () => {
+describe('#xconv1-evidence FOLLOW-UP (web-everything/web-everything#2766/#2767, 2026-09-27) — countCompletedAdvisoryEpisodes', () => {
   const AUTO = { login: 'web-everything' };
   it('a single note with no fix at all is ZERO completed episodes', () => {
     expect(countCompletedAdvisoryEpisodes([{ body: FRESH_NOTE, author: AUTO }])).toBe(0);
@@ -208,7 +208,7 @@ describe('#xconv1-evidence FOLLOW-UP (chalbert/web-everything#2766/#2767, 2026-0
   // fact `countCompletedAdvisoryEpisodes` reads (leading marker, author, order) is preserved verbatim.
   const pr2766RealThreadShape = [
     { createdAt: '2026-09-26T21:25:28Z', body: '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\nheld — a review hold…', author: AUTO },
-    { createdAt: '2026-09-26T21:47:43Z', body: '✅ review — accepted\n\n## Human review verdict — chalbert/web-everything#2766…', author: AUTO },
+    { createdAt: '2026-09-26T21:47:43Z', body: '✅ review — accepted\n\n## Human review verdict — web-everything/web-everything#2766…', author: AUTO },
     { createdAt: '2026-09-26T21:51:01Z', body: '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\ntest-gaming suspected…', author: AUTO },
     { createdAt: '2026-09-26T21:52:19Z', body: '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\nheld — a review hold…', author: AUTO },
     { createdAt: '2026-09-26T23:15:40Z', body: '**`review:accepted` removed — mutual exclusivity (#2766/#2767).**…', author: AUTO },
@@ -238,7 +238,7 @@ describe('#xconv1-evidence FOLLOW-UP (chalbert/web-everything#2766/#2767, 2026-0
 
 describe('#xconv1-evidence — isAdvisoryMechanismStandDownSuperseded recognizes a CONVERTED note too', () => {
   const convertedNote = renderConvertedAdvisoryNote({
-    repo: 'chalbert/web-everything', pr: 2766, headSha: 'deadbeef',
+    repo: 'web-everything/web-everything', pr: 2766, headSha: 'deadbeef',
     acceptComment: { body: 'x' }, escalation: { kind: 'test-gaming', reasonText: 'x' },
     targetedCheckAnswer: { verdict: 'changes', note: 'no diff evidence available' },
   });

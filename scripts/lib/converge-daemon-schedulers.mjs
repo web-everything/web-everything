@@ -75,7 +75,7 @@ export function renderSystemdUnits(cfg) {
 
   const service = `[Unit]
 Description=Web Everything converge daemon (shadow pass)
-Documentation=https://github.com/chalbert/web-everything/blob/main/scripts/converge-daemon-pass.mjs
+Documentation=https://github.com/web-everything/web-everything/blob/main/scripts/converge-daemon-pass.mjs
 
 [Service]
 Type=oneshot

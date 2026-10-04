@@ -2143,13 +2143,13 @@ describe('lanePoolListArgsForRepo — the free-lane read now honors --repo, exac
   });
   it('--repo resolving to the WE profile itself → no change (lane-pool.mjs already defaults to the WE pool)', () => {
     expect(lanePoolListArgsForRepo('we', repoProfile)).toEqual([]);
-    expect(lanePoolListArgsForRepo('chalbert/web-everything', repoProfile)).toEqual([]);
+    expect(lanePoolListArgsForRepo('web-everything/web-everything', repoProfile)).toEqual([]);
   });
   it('--repo naming a sibling repo → the matching --repo=<lanePoolRepo> argument, scoping capacity to ITS pool', () => {
     expect(lanePoolListArgsForRepo('plateau-app', repoProfile)).toEqual([`--repo=${repoProfile('plateau-app').lanePoolRepo}`]);
     expect(lanePoolListArgsForRepo('frontierui', repoProfile)).toEqual([`--repo=${repoProfile('frontierui').lanePoolRepo}`]);
     // Accepts every vocabulary repoProfile itself accepts (gh slug, slug tag, scope prefix) — not re-derived here.
-    expect(lanePoolListArgsForRepo('chalbert/plateau-app', repoProfile)).toEqual([`--repo=${repoProfile('plateau-app').lanePoolRepo}`]);
+    expect(lanePoolListArgsForRepo('plateauapp/plateau-app', repoProfile)).toEqual([`--repo=${repoProfile('plateau-app').lanePoolRepo}`]);
     expect(lanePoolListArgsForRepo('fui', repoProfile)).toEqual([`--repo=${repoProfile('frontierui').lanePoolRepo}`]);
   });
   it('an unresolvable --repo value → [] (falls back to lane-pool.mjs\'s own WE-cwd default, never throws)', () => {

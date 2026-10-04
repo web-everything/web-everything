@@ -36,7 +36,7 @@ describe('negative controls', () => {
     'execSync(`gh api repos/{owner}/{repo}/pulls`)',
     "execSync('gh pr view 1')",
     'execSync(`gh pr view ${pr}`)',
-    "const slug = 'chalbert/frontierui'",
+    "const slug = 'frontier-ui/frontierui'",
     "execSync('gh pr view 1; gh pr view 2 --repo owner/repo')",
     "// args.push('--repo', repo)\nconst args = ['pr', 'view']; exec('gh', args)",
     "const args = ['pr', 'view']; function run(args) { exec('gh', args); } exec('gh', args)",
@@ -57,8 +57,8 @@ describe('explicit repository and non-executable controls', () => {
     'execSync(`gh api repos/${repo}/pulls`)',
     "execSync('gh pr view 1 --repo=owner/repo')",
     "execSync('gh pr view 1 -R owner/repo')",
-    '// chalbert/frontierui\n/* chalbert/plateau-app gh pr view 1 */',
-    "const url = 'https://example.test'; // chalbert/frontierui",
+    '// frontier-ui/frontierui\n/* plateauapp/plateau-app gh pr view 1 */',
+    "const url = 'https://example.test'; // frontier-ui/frontierui",
     "throw new Error('gh pr view failed')",
     "const args = ['pr', 'view']; args.push('--repo', slug); function run(args) { exec('gh', args); }",
     "const build = (repo) => ['pr', 'merge', '1', ...(repo ? ['--repo', repo] : [])];",
@@ -76,7 +76,7 @@ it('skips tests, fixtures and dependencies at any depth', () => {
 it('rejects invalid, duplicate, placeholder and stale allowlist entries', () => {
   const file = 'scripts/lib/example.mjs';
   const reason = 'The systemd documentation link names the source host for the installed daemon.';
-  const corpus = new Map([[file, "const repo = 'chalbert/frontierui'"]]);
+  const corpus = new Map([[file, "const repo = 'frontier-ui/frontierui'"]]);
   expect(validateAllowlist([{ file, reason }], corpus)).toEqual([]);
   for (const entry of [{ file: '', reason }, { file: 'scripts/outside.mjs', reason }, { file: 'scripts/lib/missing.mjs', reason },
     ...['TODO', 'n/a', 'legacy', 'because', 'scripts lib example mjs '.repeat(4)].map((text) => ({ file, reason: text.repeat(4) }))]) {
@@ -89,7 +89,7 @@ it('rejects invalid, duplicate, placeholder and stale allowlist entries', () => 
 it('does not let comments, unrelated scopes or later shell commands hide a violation', () => {
   expect(scanMultiRepo("execSync('gh pr view 1 --repo x/y && gh pr view 2')")).toHaveLength(1);
   expect(scanMultiRepo("execFileSync('sh', ['-c', 'gh pr view 1'])")).toHaveLength(1);
-  expect(scanMultiRepo('const url = `repos/${repo /* chalbert/frontierui */}/pulls`;')).toEqual([]);
+  expect(scanMultiRepo('const url = `repos/${repo /* frontier-ui/frontierui */}/pulls`;')).toEqual([]);
   expect(scanMultiRepo("runGhSync(['api', `repos/${'{owner}/{repo}'}/pulls`])")).toHaveLength(1);
   // gh-argv-shaped arrays are checked wherever they flow, so an unrecognised helper cannot hide a repo-less call.
   expect(scanMultiRepo("function f() { const args = ['pr', 'view']; } function g(args) { exec('gh', args); }")).toHaveLength(1);

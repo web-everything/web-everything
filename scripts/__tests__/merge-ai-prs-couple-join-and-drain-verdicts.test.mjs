@@ -24,8 +24,8 @@ describe('merge-ai-prs — #xc7p3q9: couple-join decoupled from the ready-to-mer
   // (classifyPr + attach) → buildCarrierHealth → joinImplToCouples → planLabelDrain). No hand-built verdicts, no
   // re-typed composition (B12) — a future edit that drops `truncated`/`contextComplete` from the join breaks here.
   const WE = null;                                   // the local WE clone (repo=null, key 'cwd') — runCli's convention
-  const FUI = 'chalbert/frontierui';
-  const localSlug = 'chalbert/web-everything';
+  const FUI = 'frontier-ui/frontierui';
+  const localSlug = 'web-everything/web-everything';
   const isLocalRepo = (repo) => repo == null || repo === localSlug;
   const claude = { authors: [{ name: 'Claude Opus 4.8', email: 'noreply@anthropic.com' }] };
   const green = [{ name: 'test', conclusion: 'SUCCESS' }];
@@ -375,15 +375,15 @@ describe('merge-ai-prs — #xc7p3q9: couple-join decoupled from the ready-to-mer
     // `--this-repo` (REPOS=[null]) + the constellation self-slug: the local repo must appear ONCE (as null).
     expect(hasBoth(resolveContextRepos([null], localSlug))).toBe(false);
     // the default full constellation (REPOS carries the self slug): once, as the slug.
-    expect(hasBoth(resolveContextRepos([localSlug, FUI, 'chalbert/plateau-app'], localSlug))).toBe(false);
+    expect(hasBoth(resolveContextRepos([localSlug, FUI, 'plateauapp/plateau-app'], localSlug))).toBe(false);
     // `--repos=<implSlug>` (WE narrowed out): the constellation still adds WE once, never doubled.
     expect(hasBoth(resolveContextRepos([FUI], localSlug))).toBe(false);
     // and the widened context DOES still include the frontierui + plateau-app carriers for the blind health read.
-    expect(resolveContextRepos([null], localSlug)).toEqual(expect.arrayContaining([FUI, 'chalbert/plateau-app']));
-    // R10 — a short-name `--repos=frontierui` normalizes to `chalbert/frontierui`, so the context never holds a
+    expect(resolveContextRepos([null], localSlug)).toEqual(expect.arrayContaining([FUI, 'plateauapp/plateau-app']));
+    // R10 — a short-name `--repos=frontierui` normalizes to `frontier-ui/frontierui`, so the context never holds a
     // bogus short-name whose listing throws (which pre-R3 latched contextComplete:false permanently).
     expect(resolveRepos({ repos: 'frontierui', self: localSlug })).toEqual([FUI]);
-    expect(resolveRepos({ repos: 'frontierui,chalbert/plateau-app', self: localSlug })).toEqual([FUI, 'chalbert/plateau-app']);
+    expect(resolveRepos({ repos: 'frontierui,plateauapp/plateau-app', self: localSlug })).toEqual([FUI, 'plateauapp/plateau-app']);
   });
 
   const carrierManifestFull = { item: 'xcarr01', repos: [{ repo: 'we', ref: 'lane/xcarr01-we' }, { repo: 'fui', ref: 'lane/xcarr01-fui' }], blockedBy: [], stackParents: [] };
@@ -515,8 +515,8 @@ describe('merge-ai-prs — #xc7p3q9: couple-join decoupled from the ready-to-mer
 // MERGED-SIBLING no-regression case (which pins the `\ mergedRefs` subtraction).
 describe('merge-ai-prs — #3004 coupleIncomplete: a half-landed couple no longer clears a dependent\'s edge', () => {
   const WE = null;                                    // the local WE clone (repo=null, key 'cwd') — runCli's convention
-  const FUI = 'chalbert/frontierui';
-  const localSlug = 'chalbert/web-everything';
+  const FUI = 'frontier-ui/frontierui';
+  const localSlug = 'web-everything/web-everything';
   const isLocalRepo = (repo) => repo == null || repo === localSlug;
   const green = [{ name: 'test', conclusion: 'SUCCESS' }];
   const ghPr = (number, headRefName, labels = []) =>

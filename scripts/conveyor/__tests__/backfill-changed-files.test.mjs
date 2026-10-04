@@ -85,7 +85,7 @@ describe('planBackfill', () => {
       missRow({ taskDescription: 'Harden codex-direct-task.mjs / gemini-direct-task.mjs — round 1 of 3' }),
       missRow({ taskDescription: 'Harden codex-direct-task.mjs / gemini-direct-task.mjs — round 2 of 3' }),
     ];
-    const { rows, noPr } = planBackfill({ records: rowsFromRealStore }, 'chalbert/web-everything');
+    const { rows, noPr } = planBackfill({ records: rowsFromRealStore }, 'web-everything/web-everything');
     expect(rows).toEqual([]);
     expect(noPr).toHaveLength(2);
     expect(noPr.every((n) => n.model === 'gpt-6-astra' && n.taskType === 'bugfix')).toBe(true);

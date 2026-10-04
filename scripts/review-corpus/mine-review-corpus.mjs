@@ -620,7 +620,7 @@ export function buildCases(pr, verdicts, { cwd = ROOT } = {}) {
 }
 
 function parseArgs(argv) {
-  const o = { repo: 'chalbert/web-everything', limit: 200, out: 'scripts/review-corpus/cases', commentsDir: null };
+  const o = { repo: 'web-everything/web-everything', limit: 200, out: 'scripts/review-corpus/cases', commentsDir: null };
   for (const a of argv) {
     const m = a.match(/^--([\w-]+)(?:=(.*))?$/);
     if (!m) continue;

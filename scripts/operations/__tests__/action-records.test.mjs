@@ -14,9 +14,9 @@ const absent = { listAgents: () => [], findEffect: () => ({ found: false }) };
 beforeEach(() => { clock = 1_000; actions = createActionStore({ now, leaseMs: 10, absenceGraceMs: 100 }); });
 describe('resource actions', () => {
   it('normalizes keys and qualified slugs and refuses unknown repos', () => {
-    expect(actionResource('frontierui', { type: 'item', id: 'x4e6oux' })).toBe('chalbert/frontierui#item:x4e6oux');
+    expect(actionResource('frontierui', { type: 'item', id: 'x4e6oux' })).toBe('frontier-ui/frontierui#item:x4e6oux');
     expect(actionResource('web-everything', { type: 'pr', id: '02345' })).toBe(resource);
-    expect(actionResource('we', { type: 'item', id: '# XABC' })).toBe('chalbert/web-everything#item:xabc');
+    expect(actionResource('we', { type: 'item', id: '# XABC' })).toBe('web-everything/web-everything#item:xabc');
     expect(() => actionResource('unknown', { type: 'pr', id: 1 })).toThrow(/Unknown/);
   });
   it('allows only the lifecycle and valid terminal outcomes', async () => {

@@ -2,9 +2,10 @@
 bornAs: xrt1u72
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/stand-down.mjs", "we:scripts/conveyor/fix-dispatch-claim.mjs", "we:scripts/conveyor/fix-procedure.mjs", "we:scripts/conveyor/__tests__/fix-procedure.test.mjs", "we:scripts/conveyor/__tests__/stand-down.test.mjs", "we:scripts/conveyor/__tests__/fix-dispatch-claim.test.mjs", "we:skills-src/conveyor/fix-agent-brief.md"]
 dateOpened: "2026-10-01"
+dateResolved: "2026-10-03"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "e1f0523e0881357fc863f3e88da72e0164eb7091"
 tags: []
@@ -24,6 +25,19 @@ Premise checked against main `e1f0523e0`. Still true; not delivered (`git log -S
 - The silent refusal: `we:scripts/conveyor/fix-procedure.mjs:684-685` writes the refusal with `out(r, 3)` — JSON on stdout only.
 - Drift 1 — the claim owner. The dispatch claim's owner is the DAEMON's `host:pid` (`we:scripts/conveyor/fix-dispatch-claim.mjs:99 (fixDispatchClaimOwner)`), not the fixer. So the fixer cannot release it with `releaseFixDispatchClaim` as-is. The only link from claim to fixer is the session name (`we:scripts/conveyor/fix-claim-store.mjs:65 (fixDispatchSessionName)`, e.g. `fix-3311`).
 - Drift 2 — the stand-down CLI never learns who is calling. The brief calls it with `--repo` and `--reason` only (`we:skills-src/conveyor/fix-agent-brief.md:165`, `:283`, `:400`, `:438`). Old scope: 3 source files + 1 test. Corrected scope adds the brief (pass `--who={{SESSION_SLUG}}`) and `we:scripts/conveyor/__tests__/stand-down.test.mjs` (pin that the brief passes it).
+
+
+### Implementation and proof — 2026-10-03
+
+- Implemented the session-matched release in `we:scripts/conveyor/fix-dispatch-claim.mjs`, called immediately after a successful terminal/pause comment in `we:scripts/conveyor/stand-down.mjs`, before label IO. Missing caller/repo identity retains claims and warns. The four fixer commands in `we:skills-src/conveyor/fix-agent-brief.md` now pass the session slug; the manual finish command is unchanged.
+- Red/green regression: the three scoped test files first reported **9 failed / 198 passed** (missing helper, missing formatter, and missing brief flags), then **207 passed** after implementation. Added six isolated CLI cases for terminal/pause release, missing who, unknown/missing repo, and failed posting; all **50 stand-down tests passed**. CLI probes stub GitHub writes and use real temporary claim stores; no helper files were created.
+- Proof-plan step 1 used open WE PR **#3808**, a fresh `WE_COORDINATION_ROOT`, owner `daemon:1`, and real read-only CLI PR inspection. Before: exit **3**, stdout `{ok:false,reason:"dispatched-fixer",heldBy:"fix-3808",pr:3808}`, no refusal diagnostic. Stderr did contain an unrelated sandbox `gh-throttle` admission warning (so was not literally empty).
+- After: exit **3**, the same JSON refusal with the specified additive `dispatchKind:"fix"`, plus `✗ fix-begin refused on PR #3808: dispatched-fixer — held by fix-3808 (daemon fix dispatch claim; it frees on that session's stand-down/exit or its 10-minute TTL)` on stderr. The same unrelated admission warning remained. Direct session release returned `released:[{kind:"fix",owner:"daemon:1"}]`; the scratch claim directory then contained **zero entries**, and direct `acquireFixClaim` for `split-3808` returned **ok:true** immediately. No real PR labels/comments or live coordination claims were changed by this replay.
+- The deterministic #3311 replay acquires at T0+2 minutes, inside the 10-minute TTL, and pins mismatched session, other kind, other PR, other repo, and untouched `fixing` claims. Live post-merge observation (proof-plan step 2) remains a follow-up, not claimed as completed here.
+
+- Final scoped run: **214 tests passed** across the three scoped test files, including a **20-tick soak** with the stood-down session still listed as working. Each refresh leaves its dispatch claim absent; each split acquire/release succeeds inside five minutes of T0.
+- `npm run check:standards`: **0 errors**, 5275 warnings. `git diff --check`: clean.
+- Required `node we:scripts/verify-lane.mjs`: **278 files / 13,316 tests passed; 2 files / 6 tests failed**. All failures are real process-table probes in `we:scripts/operations/__tests__/clear-stuck-session-io-real.test.mjs` and `we:scripts/operations/__tests__/restart-runner-io-real.test.mjs`. A direct process-table probe returned **Operation not permitted** from the sandbox. The lane marker remains red; no test/gate was weakened and no out-of-scope file was edited. Re-run lane verification in a process-table-capable environment before landing. The final additional soak passed in the scoped run after this wider run started.
 
 ## Design
 
@@ -90,3 +104,5 @@ Live case: PR #3311 (already past). Proof on the recorded shape, then on the nex
 
 - `fix-end` could also release the session's dispatch claim on the normal success path. Not done here: this card is about stand-down only, and the success path has the re-arm ordering to think through.
 - The daemon sweep could release a claim when the session's completion record says `done` (self-reported), not only when the listing reads terminal.
+
+- Testing lesson: the dispatch import graph can pre-load the pure stand-down exports. CLI ordering probes must execute a fresh CLI module instance, with child-process IO stubbed before invoking it; isolated subprocesses avoid module-cache and native-module mocking ambiguity.

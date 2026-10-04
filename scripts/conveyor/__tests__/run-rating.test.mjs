@@ -506,9 +506,9 @@ describe('toScorecardRow', () => {
 
 describe('rollupKey / phaseForKind', () => {
   it('keys by PR when present, else item, else session name', () => {
-    expect(rollupKey({ pr: 5 })).toBe('chalbert/web-everything#pr5');
-    expect(rollupKey({ item: 9 })).toBe('chalbert/web-everything#item9');
-    expect(rollupKey({ sessionName: 'x' })).toBe('chalbert/web-everything#session:x');
+    expect(rollupKey({ pr: 5 })).toBe('web-everything/web-everything#pr5');
+    expect(rollupKey({ item: 9 })).toBe('web-everything/web-everything#item9');
+    expect(rollupKey({ sessionName: 'x' })).toBe('web-everything/web-everything#session:x');
   });
   it('maps dispatch kinds to build/review/rework, and an unknown kind to other', () => {
     expect(phaseForKind('conveyor')).toBe('build');
@@ -643,7 +643,7 @@ describe('rateReviewJobLog', () => {
     writeFileSync(file, [
       '[2026-09-25T16:26:44.047Z] review-job review-2670: running review-loop-cli in /some/lane',
       '[2026-09-25T16:34:47.303Z] review-job review-2670: loop finished in 483255ms — auto-cleared (verdict accept, loop converged, run review-pr-x)',
-      JSON.stringify({ pr: 2670, repo: 'chalbert/web-everything', sessionSlug: 'review-2670', verdict: 'accept', loopOutcome: 'converged', runId: 'review-pr-x', label: null, outcome: 'auto-cleared', timings: { acquireMs: 115968, loopMs: 483255, totalMs: 599834 } }),
+      JSON.stringify({ pr: 2670, repo: 'web-everything/web-everything', sessionSlug: 'review-2670', verdict: 'accept', loopOutcome: 'converged', runId: 'review-pr-x', label: null, outcome: 'auto-cleared', timings: { acquireMs: 115968, loopMs: 483255, totalMs: 599834 } }),
       '',
     ].join('\n'));
     const result = rateReviewJobLog(file);

@@ -91,7 +91,7 @@
  *   node scripts/merge-ai-prs.mjs --label=ready-to-merge --no-drain-lease  # escape hatch: skip the whole-process lease entirely (tests / break-glass)
  *   node scripts/merge-ai-prs.mjs --label=ready-to-merge # #2257/#2287 — the ONE /drain sweeps ALL 3 constellation repos BY DEFAULT (WE+frontierui+plateau-app), one global blockedBy cascade
  *   node scripts/merge-ai-prs.mjs --label=ready-to-merge --this-repo # #2287 — opt OUT: scope to the cwd repo only (a deliberately single-repo drain)
- *   node scripts/merge-ai-prs.mjs --repos=chalbert/frontierui,chalbert/plateau-app # sweep an explicit repo set (comma-separated owner/name slugs)
+ *   node scripts/merge-ai-prs.mjs --repos=frontier-ui/frontierui,plateauapp/plateau-app # sweep an explicit repo set (comma-separated owner/name slugs)
  *
  * MULTI-REPO (#2257/#2287 — the single /drain lander sweeps all 3 constellation repos BY DEFAULT). Neither
  * `--repos` nor `--this-repo` → the constellation (self's owner × web-everything/frontierui/plateau-app, self
@@ -180,6 +180,7 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey } from './conveyor/land-overlap-yield.mjs'; // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
+import { CONSTELLATION_REPOS, canonicalizeSlug } from './lib/constellation-repos.mjs';
 export { remoteManifestApiArgs };
 
 // #2414 — the local, machine-scoped FIRST-DRAIN-SIGHTING manifest baseline the land-time tamper gate diffs a
@@ -487,7 +488,7 @@ export function isRequiredCheckFailed(pr, requiredCheck = 'test') {
  * running yet is neither, and a caller that folds "not green" into "must still be failed" misreads a check
  * still in flight on the CURRENT head as a concluded failure.
  *
- * LIVE INCIDENT this closes, 2026-09-26/27 (chalbert/web-everything): `main` went red then green, the
+ * LIVE INCIDENT this closes, 2026-09-26/27 (web-everything/web-everything): `main` went red then green, the
  * mechanical rebase (`we:scripts/conveyor/ci-red-recovery-watch.mjs`) rebased each stuck PR onto the new tip
  * and re-triggered CI, and every one of them still carried a STALE `ci:failed` label from before the rebase.
  * `we:scripts/progress-board.mjs#classifyPr`'s own `ci:failed`-label fallback branch read
@@ -1856,6 +1857,12 @@ export function narrowPrsByRepo(listings, { onlyPr = null, onlyRepo = null, repo
  * @param {Array<{repo:(string|null), rows:Array}>} listings
  * @returns {Map<(string|null), Array>}
  */
+/** Split per-repo listing results into the usable ones and the failed ones (`{repo, err}`); pure. */
+export function partitionListings(listings) {
+  const all = Array.isArray(listings) ? listings : [];
+  return { ok: all.filter((l) => !l.err), failed: all.filter((l) => l.err) };
+}
+
 export function buildLiveListingsByRepo(listings) {
   return new Map((Array.isArray(listings) ? listings : []).map((l) => [l.repo, l.rows]));
 }
@@ -2638,7 +2645,7 @@ export function buildMergeTraceReason({ headSha = null, caller = 'drain', sessio
  * #4138 — the `drainReasonMarker` kind for a PR `retargetStackedPrs` (`we:scripts/lib/pr-merge-gate.mjs`,
  * #3383) could NOT retarget before its base branch is deleted by the merge that is about to happen. GitHub's
  * own base-branch-delete cascade closes such a PR moments later with NO comment of its own (confirmed live:
- * chalbert/web-everything#2578, closed 2026-09-24 21:44:43Z by `web-everything[bot]`, zero comment on either
+ * web-everything/web-everything#2578, closed 2026-09-24 21:44:43Z by `web-everything[bot]`, zero comment on either
  * of its two closes) — a silent close is exactly the #4138 gap. `retargetStackedPrs` already retargets the
  * common case before the delete; this covers its residual best-effort failure (the listing/edit itself
  * errored), where the close is about to happen anyway and the PR would otherwise carry no explanation at all.
@@ -2653,7 +2660,7 @@ export const STACKED_BASE_CLOSE_KIND = 'stacked-base-close';
  * @returns {string}
  */
 export function buildStackedBaseCloseReason({ headRef = 'its base branch' } = {}) {
-  return `this PR's base branch (\`${headRef}\`) is about to be deleted by another PR landing, and an attempt to retarget this PR onto the default branch first did NOT succeed. GitHub will likely close this PR automatically as a result — that closure is NOT a merge/content decision about this PR. Once the delete has happened, GitHub permits neither a retarget nor a reopen on it (verified live recovering chalbert/web-everything#2578), so recovery is: re-target this PR's branch onto the default branch on a fresh PR, or ask an operator to run the #3383 recovery path (#3383/#4138).`;
+  return `this PR's base branch (\`${headRef}\`) is about to be deleted by another PR landing, and an attempt to retarget this PR onto the default branch first did NOT succeed. GitHub will likely close this PR automatically as a result — that closure is NOT a merge/content decision about this PR. Once the delete has happened, GitHub permits neither a retarget nor a reopen on it (verified live recovering web-everything/web-everything#2578), so recovery is: re-target this PR's branch onto the default branch on a fresh PR, or ask an operator to run the #3383 recovery path (#3383/#4138).`;
 }
 
 /**
@@ -2845,19 +2852,26 @@ const CONSTELLATION_REPO_NAMES = ['web-everything', 'frontierui', 'plateau-app']
  * @param {{repos?:string|null, singleRepo?:boolean, self?:string|null}} o
  * @returns {Array<string|null>}
  */
-export function resolveRepos({ repos, singleRepo, self } = {}) {
+export function resolveRepos({ repos, singleRepo, self: rawSelf } = {}) {
+  const self = typeof rawSelf === 'string' ? canonicalizeSlug(rawSelf) : rawSelf;
   if (typeof repos === 'string' && repos.trim()) {
     // #xc7p3q9 (R10) — NORMALIZE every `--repos` entry to `owner/name`. A short-name `--repos=frontierui` otherwise
-    // yields a bogus `frontierui` alongside the canonical `chalbert/frontierui`: its listing throws, and (pre-R3)
+    // yields a bogus `frontierui` alongside the canonical `frontier-ui/frontierui`: its listing throws, and (pre-R3)
     // latched `contextComplete:false` permanently. Prefix the local owner when an entry carries no `/`.
     const owner = self && self.includes('/') ? self.split('/')[0] : null;
-    const norm = (s) => (s.includes('/') || !owner) ? s : `${owner}/${s}`;
+    const declaredByDir = (n) => Object.values(CONSTELLATION_REPOS).find((r) => r.dirs.includes(n))?.slug ?? null;
+    const norm = (s) => s.includes('/') ? canonicalizeSlug(s) : (declaredByDir(s) ?? (owner ? `${owner}/${s}` : s));
     const list = [...new Set(repos.split(',').map((s) => s.trim()).filter(Boolean).map(norm))];
     if (list.length) return list;
   }
   // #2287 — the constellation is the DEFAULT (the backlog is WE-global, so cross-repo blockedBy needs one
   // global cascade). Opt OUT with `--this-repo` for a deliberately scoped single-repo drain.
   if (singleRepo) return [null];
+  // The constellation spans ONE ORG PER REPO since the 2026-10-03 move, so when self IS a constellation repo the
+  // default set is the declared slugs themselves — never "self's owner x names", which would invent
+  // `web-everything/frontierui`. A non-constellation self (a fork) keeps the owner-times-names derivation.
+  const declared = Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
+  if (self && declared.includes(self)) return [self, ...declared.filter((s) => s !== self)];
   const owner = self && self.includes('/') ? self.split('/')[0] : null;
   if (!owner) return [null]; // can't derive the constellation without an owner → stay single-repo (safe)
   const slugs = CONSTELLATION_REPO_NAMES.map((n) => `${owner}/${n}`);
@@ -2885,7 +2899,7 @@ export function resolveContextRepos(repos, self) {
 }
 
 /**
- * #2263 — the sibling-clone DIRECTORY NAME for a constellation repo slug (e.g. `chalbert/frontierui` →
+ * #2263 — the sibling-clone DIRECTORY NAME for a constellation repo slug (e.g. `frontier-ui/frontierui` →
  * `frontierui`), so the local-only rebase-drop plumbing (#2198) can be routed through THAT repo's own clone
  * instead of being left as a `skipped-remote` skip. Pure. `null` for a repo outside the known constellation
  * (nothing to route to — unchanged legacy skip). Whether that sibling clone actually EXISTS is a runtime
@@ -3669,7 +3683,7 @@ async function runCli() {
   // operator's personal one. Awaited HERE, before any gh work, so a fresh env var is in place for even the
   // very first discovery call; a `--watch` run re-checks at the top of every pass (see the watch loop). See
   // github-app-auth-env.mjs's own header for why this lives outside gh-throttle.mjs.
-  await ensureFreshGithubAppEnv({ log: console });
+  await ensureFreshGithubAppEnv({ log: console, perOwner: true });
   // #4308 — the drain CLI's one-off overlap-yield overrides (`--overlap-yield`/`--no-overlap-yield`/
   // `--overlap-yield-window=<n>`, env `WE_DRAIN_OVERLAP_YIELD`). A usage error (conflicting flags, a bad env
   // value) throws here and is caught by this file's own top-level `runCli().catch(...)` — an ordinary CLI
@@ -4156,7 +4170,7 @@ async function runCli() {
           }
         }
       } else {
-        // #xg790dh-follow-up (epic #3383/#4075) — LIVE INCIDENT 2026-09-26, PR #2748 (chalbert/web-everything):
+        // #xg790dh-follow-up (epic #3383/#4075) — LIVE INCIDENT 2026-09-26, PR #2748 (web-everything/web-everything):
         // an otherwise fully-AI PR whose long-lived branch had absorbed the drain's OWN bookkeeping commits
         // (`drain: resolve #NNNN on land …` / `drain: JIT-number …` / `drain: rebase … onto …`) reads
         // `ciLifecycleCertified: false` here — `isAiGeneratedPr` does not (yet — see `we:scripts/lib/
@@ -4279,9 +4293,14 @@ async function runCli() {
       if (!AS_JSON) process.stderr.write(`  ⚠ ${repo || 'cwd repo'}: default branch unresolved (${String(e.message || e).split('\n')[0]}) — the non-default-base hold is off for it this pass (#3674)\n`);
     }
   };
-  const [listings] = await __t.timeAsync('listing', () => Promise.all([mapWithConcurrency(REPOS, REPOS.length, listOne), Promise.all(REPOS.map(resolveDefaultBranch))]));
-  const listErr = listings.find((l) => l.err);
-  if (listErr) fail('gh-error', `gh pr list${listErr.repo ? ` --repo ${listErr.repo}` : ''} failed [${listErr.err.kind}]: ${listErr.err.text}${listErr.err.hint ? ` — ${listErr.err.hint}` : ''}`, 4);
+  let [listings] = await __t.timeAsync('listing', () => Promise.all([mapWithConcurrency(REPOS, REPOS.length, listOne), Promise.all(REPOS.map(resolveDefaultBranch))]));
+  // One repo's failed listing no longer kills the pass: it is logged as failed and the other repos proceed
+  // (`partitionListings`). Only when EVERY repo failed is it the old bad-env hard-fail. The failed repo is absent
+  // from the live rows, so the context re-list also fails and the couple gate fails closed for it.
+  const { ok: okListings, failed: failedListings } = partitionListings(listings);
+  if (failedListings.length && !okListings.length) { const listErr = failedListings[0]; fail('gh-error', `gh pr list${listErr.repo ? ` --repo ${listErr.repo}` : ''} failed [${listErr.err.kind}]: ${listErr.err.text}${listErr.err.hint ? ` — ${listErr.err.hint}` : ''}`, 4); }
+  for (const l of failedListings) process.stderr.write(`  ✗ repo ${l.repo || 'cwd'} FAILED to list [${l.err.kind}]: ${l.err.text} — skipped this pass, continuing with the other repos\n`);
+  listings = okListings;
   // #4108 — this pass's already-fetched LIVE rows per repo (see `buildLiveListingsByRepo`'s docblock for why
   // it is `rows`, never `prs`), reused below so `collectContext` need not re-list any repo in `REPOS`. `l.rows`
   // is always an array here (never undefined): the `listErr` check above already `fail()`-exited on any entry
@@ -5442,7 +5461,7 @@ async function runCli() {
           // (`postMergeTrace()`, called only from a success path below): this used to post the comment
           // right here, UNCONDITIONALLY, before the merge write even ran — so a PR whose merge attempt then
           // failed (a real conflict, `gh pr merge` refusing) permanently carried a false "landed head ... —
-          // merged by drain" claim while the PR sat OPEN. Confirmed live on chalbert/web-everything#2596,
+          // merged by drain" claim while the PR sat OPEN. Confirmed live on web-everything/web-everything#2596,
           // 2026-09-24: the trace posted at 23:53Z while the PR stayed OPEN/CONFLICTING. The READ stays eager
           // (it still names the exact commit this pass is about to attempt); only the write moved.
           // xvzc4v4 advisory fix — the SHA is the one revalidation just pinned (fresh `headRefOid` == the head the
@@ -5548,7 +5567,7 @@ async function runCli() {
           // PR never carries a "landed head ... — merged by drain" claim it did not earn. The failure is
           // still fully reported: `failedMerges` below drives both the per-pass stderr line and the sweep's
           // own JSON `failed` array (exit 2 only when nothing landed), which is what a false-positive trace
-          // comment used to silently paper over (confirmed live on chalbert/web-everything#2596, 2026-09-24).
+          // comment used to silently paper over (confirmed live on web-everything/web-everything#2596, 2026-09-24).
           const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; // stays blocking its dependents; not retried this pass
           noteSplit(`merge failed: ${detail}`);
           // #2198 — a PR we JUST rebuilt (rebase-drop) has a new head, so CI (`test`) is re-running; an immediate
@@ -5817,7 +5836,7 @@ async function runCli() {
   // goes to the formatter — it computes+appends the trailing `total=` itself; passing `timings` here would
   // print `total=` twice (once as an ordinary step, once as the formatter's own).
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length})\n`);
-  const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
+  const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
   return { result, merged, failedMerges, pendingRebased: pendingAll, deferred, duplicateIdsOnMain };
   }; // end sweepOnce
 
@@ -5919,7 +5938,7 @@ async function runCli() {
     // #3881 — refresh the App token at the top of EVERY pass (a no-op unless configured, and a plain cache read
     // until the token nears expiry). Never on a timer: this loop sleeps with `sleepSync`, so the event loop is
     // never free for a background refresh to run — the top of a pass is the only point it can.
-    if (pass > 1) await ensureFreshGithubAppEnv({ log: console });
+    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true });
     if (leaseHeld) heartbeatDrainLease(DRAIN_LOCK_ROOT, leaseOwner, { scope: leaseScope, repoKey: localSlug }); // #2395 — keep the whole-process lease alive across a long watch (an `under-lease` child never heartbeats — its parent daemon owns that); #2458 re-supply the scope so it survives the heartbeat rewrite; #3440 repoKey selects the same per-repo lock dir
     // #2681 — RE-CHECK the red-main dispatch-freeze EVERY pass: a post-land red can be raised DURING a running
     // watch (the resident drain daemon is a long-lived `--watch`), and stop-the-line must catch it, not just a

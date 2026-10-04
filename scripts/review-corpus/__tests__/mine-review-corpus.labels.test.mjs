@@ -56,7 +56,7 @@ const verdict = ({
 
 Recorded by operator via the declared \`review-pr\` operation (#3035).
 
-## Human review verdict — chalbert/web-everything#1559
+## Human review verdict — web-everything/web-everything#1559
 
 **Verdict:** ✅ pass — no blocking findings
 

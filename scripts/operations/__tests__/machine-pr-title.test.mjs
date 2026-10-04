@@ -26,7 +26,7 @@ describe('machine PR titles', () => {
   });
   it('summarizes prevention without confusing guarded PRs with backlog ids', () => {
     const title = machinePrTitle({ item: 'xjhjcjn', kind: 'prevention', card: {
-      title: "File the prevention guard(s) owed by chalbert/web-everything#3158's independent review",
+      title: "File the prevention guard(s) owed by web-everything/web-everything#3158's independent review",
       raw: '1. `we:scripts/a.mjs:918` — Reject malformed flags\n2. Another guard',
     } });
     expect(title).toBe('WE #xjhjcjn: prevention — Reject malformed flags (from #3158 review)');
@@ -73,9 +73,9 @@ describe('origin/main card metadata', () => {
 
 describe('publication and prevention filing', () => {
   it('uses the finding before the provenance, reserving space for both', () => {
-    const title = preventionCardTitle({ repo: 'chalbert/web-everything', pr: 2828,
+    const title = preventionCardTitle({ repo: 'web-everything/web-everything', pr: 2828,
       digest: '1. `we:scripts/a.mjs:2` — Reject malformed flags' });
-    expect(title).toBe('Prevention — Reject malformed flags (from chalbert/web-everything#2828 review)');
+    expect(title).toBe('Prevention — Reject malformed flags (from web-everything/web-everything#2828 review)');
     const prTitle = machinePrTitle({ item: 'xjhjcjn', kind: 'prevention', card: { title } });
     expect(prTitle).toBe('WE #xjhjcjn: prevention — Reject malformed flags (from #2828 review)');
     const long = machinePrTitle({ item: 'xjhjcjn', kind: 'prevention', card: {

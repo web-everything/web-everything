@@ -342,12 +342,12 @@ describe('drain lease PER-REPO key (#3440 — one project\'s daemon never blocks
 
   describe('localRepoSlug — the invoking checkout\'s own repo identity, parsed from `git remote get-url origin`', () => {
     it('parses an https origin URL to an org/repo slug', () => {
-      const exec = () => 'https://github.com/chalbert/web-everything.git\n';
-      expect(localRepoSlug({ exec })).toBe('chalbert/web-everything');
+      const exec = () => 'https://github.com/web-everything/web-everything.git\n';
+      expect(localRepoSlug({ exec })).toBe('web-everything/web-everything');
     });
     it('parses an ssh origin URL (no .git suffix) the same way', () => {
-      const exec = () => 'git@github.com:chalbert/plateau-app\n';
-      expect(localRepoSlug({ exec })).toBe('chalbert/plateau-app');
+      const exec = () => 'git@github.com:plateauapp/plateau-app\n';
+      expect(localRepoSlug({ exec })).toBe('plateauapp/plateau-app');
     });
     it('returns null when git/origin is unavailable (no remote, detached, not a repo) — never throws', () => {
       const exec = () => { throw new Error('fatal: not a git repository'); };

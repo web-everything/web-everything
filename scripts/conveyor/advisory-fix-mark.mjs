@@ -29,7 +29,7 @@ import { resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
-// #xconv1-evidence (chalbert/web-everything#2766/#2767 misfire) — a CONVERTED advisory note
+// #xconv1-evidence (web-everything/web-everything#2766/#2767 misfire) — a CONVERTED advisory note
 // (`we:scripts/lib/review-escalation.mjs#renderConvertedAdvisoryNote`, posted by
 // `we:scripts/conveyor/convert-advisory-dispatch.mjs`) carries its OWN leading marker, never
 // `ADVISORY_NOTE_MARKER` (that one is `renderAdvisoryNote`'s, in `we:scripts/operations/review-pr.mjs`). Both
@@ -120,7 +120,7 @@ export function buildAdvisoryFixComment({ actor = 'conveyor fix agent' } = {}) {
 
 /**
  * we:scripts/conveyor/advisory-fix-mark.mjs#countCompletedAdvisoryEpisodes — xconv1-evidence follow-up
- * (chalbert/web-everything#2766/#2767, 2026-09-27): the advisory-fix CAP must count COMPLETED EPISODES (one
+ * (web-everything/web-everything#2766/#2767, 2026-09-27): the advisory-fix CAP must count COMPLETED EPISODES (one
  * advisory note through to the fix that unlocked the NEXT one), never raw fix-mark COMMENTS — a distinction
  * the lifetime `countAdvisoryFixComments` collapses, exactly the kind of count-vs-something-truer gap
  * {@link isLatestAdvisoryFindingAddressed} already closed once for the "addressed" question (xaer296/#2549).
@@ -214,7 +214,7 @@ export function countCompletedAdvisoryEpisodes(comments) {
  * `countAdvisoryFixComments(comments) < countAdvisoryComments(comments)` — a raw COUNT comparison that only
  * holds when the two histories start at parity (0/0) and move in lockstep, one-for-one. That assumption breaks
  * the moment a `review:human` PR already has advisory-note HISTORY from before this marker mechanism existed
- * (any PR with `review-round` > 1 the day #xkmu3gv shipped): CONFIRMED LIVE on `chalbert/web-everything#2549`
+ * (any PR with `review-round` > 1 the day #xkmu3gv shipped): CONFIRMED LIVE on `web-everything/web-everything#2549`
  * — 5 advisory-panel comments already on the thread (review rounds 1-5, all pre-dating #xkmu3gv) and exactly
  * ONE advisory-fix mark ever posted (the round that genuinely fixed the CURRENT, latest finding). `1 < 5` stays
  * true FOREVER under the old test — no number of further genuine fixes ever catches up to a backlog of
@@ -264,7 +264,7 @@ export function isLatestAdvisoryFindingAddressed(comments) {
  * OWN prior stand-down, re-classified by a LATER watch sweep) for a DIFFERENT population: a fixer dispatched
  * into ADVISORY-FIX MODE that could not reproduce the finding — because {@link isLatestAdvisoryFindingAddressed}
  * was ALREADY true when it ran — and (per the pre-fix brief) wrongly stood down instead of posting the hand-back
- * marker (CONFIRMED LIVE, `chalbert/web-everything#2549`, 2026-09-24T14:35:41Z).
+ * marker (CONFIRMED LIVE, `web-everything/web-everything#2549`, 2026-09-24T14:35:41Z).
  *
  * UNLIKE the watcher's own supersede, this needs NO new comment posted to become non-terminal: the proof that
  * the finding was already addressed BEFORE the stand-down already lives on the thread (the fix-mark's own

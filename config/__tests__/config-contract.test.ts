@@ -14,7 +14,7 @@ import {
   isDimensionPointer,
   InvalidConfigEntryError,
 } from '../defineConfig';
-import { PLATFORM_FLAVOR_DEFAULTS } from '../platformDefaults';
+import { PLATFORM_FLAVOR_DEFAULTS, PLATFORM_CROSS_PROVIDER_FALLBACK_WAIT_TIMEOUT_MS } from '../platformDefaults';
 
 describe('defineConfig — validation + identity', () => {
   it('returns the config unchanged (identity) for inference', () => {
@@ -42,6 +42,20 @@ describe('defineConfig — validation + identity', () => {
 
   it('#2523: the windowedCollection platform default is native-first (content-visibility)', () => {
     expect(PLATFORM_FLAVOR_DEFAULTS.windowedCollection).toBe('content-visibility');
+  });
+
+  // xb1e9nj: cross-provider seat fallback is a config dimension, default wait-then-park.
+  it('accepts a crossProviderFallback entry for each of the three policies plus a wait timeout', () => {
+    for (const policy of ['park-now', 'wait-then-park', 'same-provider-other-model'] as const) {
+      expect(() => defineConfig({ crossProviderFallback: { policy, waitTimeoutMs: 1000 } })).not.toThrow();
+    }
+    expect(() => defineConfig({ crossProviderFallback: extendsFlavor('park-now') })).not.toThrow();
+  });
+
+  it('xb1e9nj: the crossProviderFallback platform default is wait-then-park, never same-provider-other-model', () => {
+    expect(PLATFORM_FLAVOR_DEFAULTS.crossProviderFallback).toBe('wait-then-park');
+    expect(PLATFORM_FLAVOR_DEFAULTS.crossProviderFallback).not.toBe('same-provider-other-model');
+    expect(PLATFORM_CROSS_PROVIDER_FALLBACK_WAIT_TIMEOUT_MS).toBeGreaterThan(0);
   });
 
   it('ignores omitted/undefined dimensions', () => {

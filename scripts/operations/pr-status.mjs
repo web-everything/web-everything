@@ -109,7 +109,7 @@ export const NON_BLOCKING_CONCLUSIONS = Object.freeze(['skipped', 'neutral']);
  * PR #2775) joined this list for the SAME underlying reason, discovered the same way: it is NOT a required
  * status check (`gh api repos/<repo>/branches/main/protection --jq .required_status_checks.contexts` lists
  * only `test`/`smoke`/`daemon-soak`), yet a wholesale "any check failed" scan treated its red the same as a
- * real required-check failure. LIVE INCIDENT 2026-09-26, PR #2748 (chalbert/web-everything): every real
+ * real required-check failure. LIVE INCIDENT 2026-09-26, PR #2748 (web-everything/web-everything): every real
  * required check (`test`, `smoke`, `daemon-soak`) was green, `soak-replay-gate` was the ONLY red check (a
  * separate, genuine gap in that PR's own waiver — see that gate's own module for the fix to its parsing), and
  * `classifyPr` still read the PR as `ci-red` off that one advisory check, which kept a `ci-heal-2748` session

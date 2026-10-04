@@ -50,15 +50,15 @@ const REAL_TEMPLATE_STUB = [
 
 describe('planReviewDispatch', () => {
   it('derives a distinct, review-only session slug', () => {
-    expect(planReviewDispatch({ pr: 1234, repo: 'chalbert/web-everything' })).toEqual({
-      pr: 1234, repo: 'chalbert/web-everything', repoKey: 'we', laneRepo: WE_LANE_REPO, sessionSlug: 'review-1234',
+    expect(planReviewDispatch({ pr: 1234, repo: 'web-everything/web-everything' })).toEqual({
+      pr: 1234, repo: 'web-everything/web-everything', repoKey: 'we', laneRepo: WE_LANE_REPO, sessionSlug: 'review-1234',
     });
   });
 
   it('refuses a non-positive-integer PR', () => {
-    expect(() => planReviewDispatch({ pr: 0, repo: 'chalbert/web-everything' })).toThrow(/positive integer/);
-    expect(() => planReviewDispatch({ pr: 'abc', repo: 'chalbert/web-everything' })).toThrow(/positive integer/);
-    expect(() => planReviewDispatch({ pr: -5, repo: 'chalbert/web-everything' })).toThrow(/positive integer/);
+    expect(() => planReviewDispatch({ pr: 0, repo: 'web-everything/web-everything' })).toThrow(/positive integer/);
+    expect(() => planReviewDispatch({ pr: 'abc', repo: 'web-everything/web-everything' })).toThrow(/positive integer/);
+    expect(() => planReviewDispatch({ pr: -5, repo: 'web-everything/web-everything' })).toThrow(/positive integer/);
   });
 
   it('refuses a repo that is not an owner/repo slug', () => {
@@ -80,14 +80,14 @@ describe('reviewSessionSlug', () => {
 describe('fillReviewBrief', () => {
   // #4174 — WE_ROOT joined REVIEW_BRIEF_PLACEHOLDERS; see that export's own comment.
   const values = {
-    PR: 1234, REPO: 'chalbert/web-everything', SESSION_SLUG: 'review-1234', JUDGE_PROVIDER: 'claude', LANE_REPO: '.',
+    PR: 1234, REPO: 'web-everything/web-everything', SESSION_SLUG: 'review-1234', JUDGE_PROVIDER: 'claude', LANE_REPO: '.',
     WE_ROOT: '/repo',
   };
 
   it('substitutes the placeholders the template actually uses, and reports (never refuses) an unrelated '
     + 'bracketed token', () => {
     const { prompt, unknownTokens } = fillReviewBrief(REAL_TEMPLATE_STUB, values);
-    expect(prompt).toContain('# brief for 1234 in chalbert/web-everything');
+    expect(prompt).toContain('# brief for 1234 in web-everything/web-everything');
     expect(prompt).toContain('--session=review-1234');
     expect(unknownTokens).toEqual(['{{LIKE_THIS}}']);
   });
@@ -97,7 +97,7 @@ describe('fillReviewBrief', () => {
   });
 
   it('refuses a missing value', () => {
-    expect(() => fillReviewBrief('{{PR}} {{REPO}} {{SESSION_SLUG}}', { PR: 1, REPO: 'chalbert/web-everything' }))
+    expect(() => fillReviewBrief('{{PR}} {{REPO}} {{SESSION_SLUG}}', { PR: 1, REPO: 'web-everything/web-everything' }))
       .toThrow(/no value for the brief placeholder \{\{SESSION_SLUG\}\}/);
   });
 
@@ -123,7 +123,7 @@ describe('fillReviewBrief', () => {
 
   it('refuses a missing JUDGE_PROVIDER value exactly like any other declared placeholder (#xqa9ttq)', () => {
     expect(() => fillReviewBrief('{{PR}} {{REPO}} {{SESSION_SLUG}} {{JUDGE_PROVIDER}}', {
-      PR: 1, REPO: 'chalbert/web-everything', SESSION_SLUG: 'review-1',
+      PR: 1, REPO: 'web-everything/web-everything', SESSION_SLUG: 'review-1',
     })).toThrow(/no value for the brief placeholder \{\{JUDGE_PROVIDER\}\}/);
   });
 });
@@ -133,7 +133,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
     const calls = [];
     const result = dispatchReview({ ciGate: GREEN_CI,
       pr: 1234,
-      repo: 'chalbert/web-everything',
+      repo: 'web-everything/web-everything',
       root: '/repo',
       readBrief: () => REAL_TEMPLATE_STUB,
       mintSessionId: () => '11111111-1111-4111-8111-111111111111',
@@ -152,7 +152,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
       '--append-system-prompt-file', REVIEW_DISPATCH_SYSTEM_PROMPT_FILE,
       '--effort', 'high', '--model', 'sonnet',
       ...DISALLOWED_TOOLS_ARGV,
-      '# brief for 1234 in chalbert/web-everything\n'
+      '# brief for 1234 in web-everything/web-everything\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --session=review-1234\n'
       + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token',
     ]);
@@ -160,7 +160,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
     expect(result.sessionId).toBe('11111111-1111-4111-8111-111111111111');
     expect(result.sessionSlug).toBe('review-1234');
     expect(result.pr).toBe(1234);
-    expect(result.repo).toBe('chalbert/web-everything');
+    expect(result.repo).toBe('web-everything/web-everything');
     expect(result.unknownTokens).toEqual(['{{LIKE_THIS}}']);
   });
 
@@ -172,7 +172,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
     [{ scopePaths: ['docs/agent/platform-decisions.md'] }, 'opus'],
   ])('passes an explicit review model for %j', (signals, model) => {
     const spawnAgent = vi.fn();
-    dispatchReview({ ciGate: GREEN_CI, pr: 1234, repo: 'chalbert/web-everything', root: '/repo',
+    dispatchReview({ ciGate: GREEN_CI, pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
       readBrief: () => REAL_TEMPLATE_STUB, checkStaleness: FRESH, spawnAgent,
       ensureSessionCwd: d => d, resolveSettingsEnv: () => null,
       isolateSession: () => ({ worktreeSettings: null }), ...signals });
@@ -190,7 +190,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
     const resolveSettingsEnv = vi.fn(() => ({ PATH: '/shim:/usr/bin' }));
     dispatchReview({ ciGate: GREEN_CI,
       pr: 1234,
-      repo: 'chalbert/web-everything',
+      repo: 'web-everything/web-everything',
       root: '/repo',
       readBrief: () => REAL_TEMPLATE_STUB,
       mintSessionId: () => '11111111-1111-4111-8111-111111111111',
@@ -209,7 +209,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
     const calls = [];
     dispatchReview({ ciGate: GREEN_CI,
       pr: 1234,
-      repo: 'chalbert/web-everything',
+      repo: 'web-everything/web-everything',
       root: '/repo',
       readBrief: () => REAL_TEMPLATE_STUB,
       mintSessionId: () => '11111111-1111-4111-8111-111111111111',
@@ -222,7 +222,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
 
   it('refuses to dispatch from inside a lane checkout, same guard dispatch-lane-io.mjs uses', () => {
     expect(() => dispatchReview({ ciGate: GREEN_CI,
-      pr: 1, repo: 'chalbert/web-everything', root: '/some/path/.lanes/web-everything/lane-3',
+      pr: 1, repo: 'web-everything/web-everything', root: '/some/path/.lanes/web-everything/lane-3',
       readBrief: () => REAL_TEMPLATE_STUB,
       spawnAgent: () => { throw new Error('must not be called'); },
       checkStaleness: FRESH,
@@ -232,7 +232,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
   it('never spawns when the plan itself refuses (bad PR/repo caught before any fs/spawn call)', () => {
     let readBriefCalls = 0;
     expect(() => dispatchReview({ ciGate: GREEN_CI,
-      pr: -1, repo: 'chalbert/web-everything', root: '/repo',
+      pr: -1, repo: 'web-everything/web-everything', root: '/repo',
       readBrief: () => { readBriefCalls += 1; return REAL_TEMPLATE_STUB; },
       spawnAgent: () => { throw new Error('must not be called'); },
       checkStaleness: FRESH,
@@ -247,7 +247,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
     const calls = [];
     dispatchReview({ ciGate: GREEN_CI,
       pr: 1234,
-      repo: 'chalbert/web-everything',
+      repo: 'web-everything/web-everything',
       root: '/repo',
       readBrief: () => REAL_TEMPLATE_STUB,
       mintSessionId: () => '11111111-1111-4111-8111-111111111111',
@@ -264,7 +264,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
       '--effort', 'high', '--model', 'sonnet',
       ...DISALLOWED_TOOLS_ARGV,
       '--permission-mode', 'plan',
-      '# brief for 1234 in chalbert/web-everything\n'
+      '# brief for 1234 in web-everything/web-everything\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --session=review-1234\n'
       + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token',
     ]);
@@ -279,7 +279,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
     const calls = [];
     dispatchReview({ ciGate: GREEN_CI,
       pr: 1234,
-      repo: 'chalbert/web-everything',
+      repo: 'web-everything/web-everything',
       root: '/repo',
       readBrief: () => REAL_TEMPLATE_STUB,
       mintSessionId: () => '11111111-1111-4111-8111-111111111111',
@@ -307,7 +307,7 @@ describe('dispatchReview — judgeProvider (#xqa9ttq)', () => {
   it('defaults to claude when omitted — additive, never a default flip', () => {
     const calls = [];
     const result = dispatchReview({ ciGate: GREEN_CI,
-      pr: 1234, repo: 'chalbert/web-everything', root: '/repo',
+      pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
       readBrief: () => JUDGE_PROVIDER_TEMPLATE,
       mintSessionId: () => '11111111-1111-4111-8111-111111111111',
       spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
@@ -320,7 +320,7 @@ describe('dispatchReview — judgeProvider (#xqa9ttq)', () => {
   it('refuses judgeProvider \'codex\' BEFORE reading the brief or spawning - review-pr\'s judge steps are tool-bearing (PR #2115 review)', () => {
     let readBriefCalls = 0;
     expect(() => dispatchReview({ ciGate: GREEN_CI,
-      pr: 1234, repo: 'chalbert/web-everything', root: '/repo',
+      pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
       readBrief: () => { readBriefCalls += 1; return JUDGE_PROVIDER_TEMPLATE; },
       spawnAgent: () => { throw new Error('must not be called'); },
       checkStaleness: FRESH,
@@ -331,7 +331,7 @@ describe('dispatchReview — judgeProvider (#xqa9ttq)', () => {
 
   it('premise pin: review-pr\'s REAL judge request is tool-bearing, which is why codex is refused (fails if review-pr ever grows a tool-free-only roster)', () => {
     const read = {
-      repo: 'chalbert/web-everything', pr: 1, title: 't', body: '', netChangedFiles: ['a.mjs'], diffText: 'diff',
+      repo: 'web-everything/web-everything', pr: 1, title: 't', body: '', netChangedFiles: ['a.mjs'], diffText: 'diff',
     };
     const request = buildReviewJudgeRequest({ read, lens: DEFAULT_LENS });
     expect(Array.isArray(request.allowedTools) && request.allowedTools.length > 0).toBe(true);
@@ -341,7 +341,7 @@ describe('dispatchReview — judgeProvider (#xqa9ttq)', () => {
   it('refuses an unrecognised provider name BEFORE reading the brief or spawning', () => {
     let readBriefCalls = 0;
     expect(() => dispatchReview({ ciGate: GREEN_CI,
-      pr: 1234, repo: 'chalbert/web-everything', root: '/repo',
+      pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
       readBrief: () => { readBriefCalls += 1; return JUDGE_PROVIDER_TEMPLATE; },
       spawnAgent: () => { throw new Error('must not be called'); },
       checkStaleness: FRESH,
@@ -388,7 +388,7 @@ describe('REVIEW_DISPATCH_DISALLOWED_TOOLS (#3433)', () => {
   it('the deny list is baked in even when the caller supplies NO extraArgs at all — not opt-in', () => {
     const calls = [];
     dispatchReview({ ciGate: GREEN_CI,
-      pr: 1234, repo: 'chalbert/web-everything', root: '/repo',
+      pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
       readBrief: () => REAL_TEMPLATE_STUB,
       mintSessionId: () => '11111111-1111-4111-8111-111111111111',
       spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
@@ -399,7 +399,7 @@ describe('REVIEW_DISPATCH_DISALLOWED_TOOLS (#3433)', () => {
 
   it('keeps the deny list before caller-supplied extraArgs', () => {
     const spawnAgent = vi.fn();
-    dispatchReview({ ciGate: GREEN_CI, pr: 1234, repo: 'chalbert/web-everything', root: '/repo',
+    dispatchReview({ ciGate: GREEN_CI, pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
       readBrief: () => REAL_TEMPLATE_STUB, spawnAgent, checkStaleness: FRESH,
       extraArgs: ['--permission-mode', 'plan'] });
     const argv = spawnAgent.mock.calls[0][0];
@@ -411,7 +411,7 @@ describe('REVIEW_DISPATCH_DISALLOWED_TOOLS (#3433)', () => {
   it('refuses an ambient model override rather than bypassing review risk routing', () => {
     const spawnAgent = vi.fn();
     expect(() => dispatchReview({ ciGate: GREEN_CI,
-      pr: 1234, repo: 'chalbert/web-everything', root: '/repo',
+      pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
       readBrief: () => REAL_TEMPLATE_STUB, spawnAgent,
       extraArgs: ['--model', 'opus'], checkStaleness: FRESH,
     })).toThrow(/hand-set --model/);
@@ -571,7 +571,7 @@ describe('dispatchReview — refuses to spawn from a stale checkout (#3439)', ()
   it('refuses before reading the brief or spawning, when behind origin/main', () => {
     let readBriefCalls = 0;
     expect(() => dispatchReview({ ciGate: GREEN_CI,
-      pr: 1234, repo: 'chalbert/web-everything', root: '/repo',
+      pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
       readBrief: () => { readBriefCalls += 1; return REAL_TEMPLATE_STUB; },
       spawnAgent: () => { throw new Error('must not be called'); },
       checkStaleness: () => ({ action: 'warn', behind: 9, ahead: 0, dirty: false, warning: 'stub' }),
@@ -582,7 +582,7 @@ describe('dispatchReview — refuses to spawn from a stale checkout (#3439)', ()
   it('proceeds to spawn when the checkout is fresh', () => {
     const calls = [];
     dispatchReview({ ciGate: GREEN_CI,
-      pr: 1234, repo: 'chalbert/web-everything', root: '/repo',
+      pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
       readBrief: () => REAL_TEMPLATE_STUB,
       mintSessionId: () => '11111111-1111-4111-8111-111111111111',
       spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
@@ -616,6 +616,7 @@ describe('isReviewCodePath (#4387)', () => {
     const entries = [
       'scripts/operations/review-dispatch.mjs', 'scripts/operations/review-pr.mjs',
       'scripts/operations/cli-adapter.mjs', 'scripts/operations/review-loop-cli.mjs',
+      'scripts/operations/review-job.mjs',
     ];
     const missing = [];
     for (const entry of entries) {
@@ -675,7 +676,7 @@ describe('dispatchReview — managed clone behind origin/main (#4387)', () => {
   const run = (root) => {
     const calls = [];
     dispatchReview({ ciGate: GREEN_CI,
-      pr: 1234, repo: 'chalbert/web-everything', root, home: '/home/test', checkoutExists: () => true,
+      pr: 1234, repo: 'web-everything/web-everything', root, home: '/home/test', checkoutExists: () => true,
       readBrief: () => REAL_TEMPLATE_STUB, mintSessionId: () => '11111111-1111-4111-8111-111111111111',
       spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
       resolveSettingsEnv: () => ({}), sessionCwdFor: () => join(dir, 'session'), ensureSessionCwd: () => {},
@@ -697,7 +698,7 @@ describe('dispatchReview — managed clone behind origin/main (#4387)', () => {
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       expect(run(root)).toHaveLength(1);
-      expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toMatch(/3 commit\(s\) behind origin\/main .*tolerating the lag/);
+      expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toMatch(/3 commit\(s\) behind origin\/main .*scripts\/backlog\/frontmatter\.mjs.*tolerating the lag/);
     } finally { stderr.mockRestore(); }
     expect(git(root, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('3'); // the clone is never moved
   });
@@ -734,7 +735,7 @@ describe('#3331 — dispatchReview reports the id `claude --bg` assigned, not th
     // verdict (live: review-2129) read to every operator as a silent failure.
     const result = dispatchReview({ ciGate: GREEN_CI,
       pr: 1234,
-      repo: 'chalbert/web-everything',
+      repo: 'web-everything/web-everything',
       root: '/repo',
       readBrief: () => REAL_TEMPLATE_STUB,
       mintSessionId: () => '11111111-1111-4111-8111-111111111111',
@@ -750,7 +751,7 @@ describe('#3331 — dispatchReview reports the id `claude --bg` assigned, not th
   it('reports `agentId: null` rather than a fabricated one when the banner cannot be read', () => {
     const result = dispatchReview({ ciGate: GREEN_CI,
       pr: 1234,
-      repo: 'chalbert/web-everything',
+      repo: 'web-everything/web-everything',
       root: '/repo',
       readBrief: () => REAL_TEMPLATE_STUB,
       mintSessionId: () => '11111111-1111-4111-8111-111111111111',
@@ -762,7 +763,7 @@ describe('#3331 — dispatchReview reports the id `claude --bg` assigned, not th
 });
 
 it('plans tagged sibling reviews and rejects unknown owner slugs', () => {
-  expect(planReviewDispatch({ pr: 49, repo: 'chalbert/frontierui', home: '/home/test', checkoutExists: () => true })).toEqual({ pr: 49, repo: 'chalbert/frontierui', repoKey: 'frontierui', laneRepo: '/home/test/workspace/frontierui', sessionSlug: 'review-fui-49' });
+  expect(planReviewDispatch({ pr: 49, repo: 'frontier-ui/frontierui', home: '/home/test', checkoutExists: () => true })).toEqual({ pr: 49, repo: 'frontier-ui/frontierui', repoKey: 'frontierui', laneRepo: '/home/test/workspace/frontierui', sessionSlug: 'review-fui-49' });
   expect(() => planReviewDispatch({ pr: 49, repo: 'other/repo' })).toThrow(/not a constellation repo/);
 });
 
@@ -791,7 +792,7 @@ it('refuses a missing foreign checkout before spawning', () => {
   expect(() => dispatchReview({ ciGate: GREEN_CI, ...options, root: '/repo', checkStaleness: FRESH, spawnAgent: (...args) => calls.push(args) })).toThrow(/unsupported-repo/);
   expect(calls).toEqual([]);
   expect(() => fillReviewBrief('{{lane-repo}}', {
-    PR: 49, REPO: 'chalbert/plateau-app', SESSION_SLUG: 'review-pa-49', JUDGE_PROVIDER: 'claude',
+    PR: 49, REPO: 'plateauapp/plateau-app', SESSION_SLUG: 'review-pa-49', JUDGE_PROVIDER: 'claude',
     LANE_REPO: '/home/test/workspace/plateau-app', WE_ROOT: '/repo',
   })).toThrow(/MISSPELLED/);
 });
@@ -813,24 +814,24 @@ describe('x6n7c2p required checks before review — fresh dispatch boundary', ()
           ...(state === 'missing' ? [] : [{ name: 'daemon-soak', status: state === 'pending' ? 'in_progress' : 'completed', conclusion: state === 'red' ? 'failure' : 'success' }])];
       },
     });
-    const out = dispatchReview({ pr: 3432, repo: 'chalbert/web-everything', root: '/repo', ciGate,
+    const out = dispatchReview({ pr: 3432, repo: 'web-everything/web-everything', root: '/repo', ciGate,
       checkStaleness: FRESH, readBrief: () => 'review {{PR}}', mintSessionId: () => 'ci-regression',
       ensureSessionCwd: path => { sessionWrites++; return path; }, resolveSettingsEnv: () => ({}),
       isolateSession: () => ({ worktreeSettings: {} }), spawnAgent: () => { spawns++; return ''; } });
     expect(sessionWrites).toBe(state === 'green' ? 1 : 0);
     expect(spawns).toBe(state === 'green' ? 1 : 0);
     expect(Boolean(out.skipped)).toBe(state !== 'green');
-    expect(reads[0]).toEqual(['head', { repo: 'chalbert/web-everything', pr: 3432 }]);
-    expect(reads[1]).toEqual(['required', { repo: 'chalbert/web-everything', ttlMs: 0 }]);
-    if (!['stale-cache', 'fallback'].includes(state)) expect(reads[2]).toEqual(['checks', { repo: 'chalbert/web-everything', headSha }]);
+    expect(reads[0]).toEqual(['head', { repo: 'web-everything/web-everything', pr: 3432 }]);
+    expect(reads[1]).toEqual(['required', { repo: 'web-everything/web-everything', ttlMs: 0 }]);
+    if (!['stale-cache', 'fallback'].includes(state)) expect(reads[2]).toEqual(['checks', { repo: 'web-everything/web-everything', headSha }]);
     if (state !== 'green') expect(out.headSha).toBe(headSha);
   });
 });
 
 describe('x6n7c2p session-mode CLI report for a skipped dispatch', () => {
   it('reports a CI-refused (skipped) result as not started instead of reading launch fields off it', () => {
-    const skipped = { pr: 3432, repo: 'chalbert/web-everything', headSha: 'a'.repeat(40), skipped: 'review-ci: required-checks-not-successful', ci: { allowed: false } };
-    expect(formatSessionDispatchResult(skipped)).toBe('dispatch-review: chalbert/web-everything#3432 not started — review-ci: required-checks-not-successful\n');
+    const skipped = { pr: 3432, repo: 'web-everything/web-everything', headSha: 'a'.repeat(40), skipped: 'review-ci: required-checks-not-successful', ci: { allowed: false } };
+    expect(formatSessionDispatchResult(skipped)).toBe('dispatch-review: web-everything/web-everything#3432 not started — review-ci: required-checks-not-successful\n');
   });
   it('still reports a launched session with its id and unknown tokens', () => {
     const out = formatSessionDispatchResult({ agentId: 'ag1', sessionSlug: 'review-1', pr: 7, repo: 'o/r', judgeProvider: 'claude', unknownTokens: ['X'] });

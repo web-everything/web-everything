@@ -25,13 +25,13 @@ tests + this runbook; the Worker itself lives at the repo root so `wrangler.toml
 ## Deploy — production path: `.github/workflows/deploy.yml` (corrected 2026-07-03)
 
 **Not** Cloudflare's own Workers Builds git integration — that dashboard "Create application → import
-`chalbert/web-everything`" flow was tried and disconnected: a single-repo Cloudflare checkout can't reach
+`web-everything/web-everything`" flow was tried and disconnected: a single-repo Cloudflare checkout can't reach
 the sibling `../frontierui` repo that `build:docs` needs (see below), so it can never produce a working
 build. The actual deployer is a **cross-repo GitHub Action** (`we:.github/workflows/deploy.yml`), which runs
 on every push to `main`:
 
-1. Checks out `chalbert/web-everything` **and** `chalbert/frontierui` as siblings under `$GITHUB_WORKSPACE`
-   (the FUI checkout needs a `FUI_READ_TOKEN` fine-grained PAT, `Contents:Read` on `chalbert/frontierui`).
+1. Checks out `web-everything/web-everything` **and** `frontier-ui/frontierui` as siblings under `$GITHUB_WORKSPACE`
+   (the FUI checkout needs a `FUI_READ_TOKEN` fine-grained PAT, `Contents:Read` on `frontier-ui/frontierui`).
 2. Builds FUI's tools first (`npm run build:tools`, ratified #1946/#2016 ordering) — produces
    `dist/tools/component-render/cli.mjs`, which WE's Eleventy build shells out to.
 3. Builds the WE site (`npm run build:docs`, **not** `npm run build` — the demo build (`build:demo` →

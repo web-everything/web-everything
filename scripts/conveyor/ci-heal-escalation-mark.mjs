@@ -8,7 +8,7 @@
  * changes it — the same head reaching the SAME dead end on a re-dispatch is pure waste, but a fixed head
  * deserves a fresh look.
  *
- * LIVE INCIDENT this closes, chalbert/web-everything#2783: three separate ci-heal sessions dispatched across
+ * LIVE INCIDENT this closes, web-everything/web-everything#2783: three separate ci-heal sessions dispatched across
  * one evening, each ending "escalated (needs human — not a CI break)" for the identical reason on the
  * identical head — because the brief's escalation exit wrote NOTHING durable (a bare one-line RETURN to the
  * calling session, never a PR comment), so every reconcile tick that followed re-read the PR as plain `ci-red`
@@ -22,7 +22,7 @@
  * reconcile tick plans a heal again — no human intervention required, no stale record to clean up.
  *
  * OUTCOME IS THREE-VALUED (we:backlog/heal-wait-for-rerun, Fork 2; `not-a-ci-break` added we:backlog/
- * fix-review-ciheal-deadlock, LIVE DEADLOCK 2026-09-28/29, PR #2878 chalbert/web-everything):
+ * fix-review-ciheal-deadlock, LIVE DEADLOCK 2026-09-28/29, PR #2878 web-everything/web-everything):
  *   · `needs-human` — a genuine judgment call the agent could not safely make (the diff itself looks wrong, a
  *     real conflict, the lane ref is gone).
  *   · `waiting-on-system-fix` — the red is caused by the TOOLING/GATE ITSELF (an advisory check misbehaving, a

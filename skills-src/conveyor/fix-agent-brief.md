@@ -43,7 +43,7 @@
 | `{{LANE}}` | a FREE lane id the conveyor assigned this repair (a fresh clone; the repair is reconstituted from `{{LANE_REF}}`, not the original lease) |
 | `{{SESSION_SLUG}}` | a stable per-repair session slug, e.g. `fix-{{PR_NUM}}` (ties `acquire`↔`release`) |
 | `{{SCOPE}}` | the item's `scope:` frontmatter, repo-qualified & comma-joined (same as the build's scope) — for an item-less PR, its own already-changed files under its repo's prefix instead |
-| `{{REPO}}` | the target repo's gh slug (e.g. `chalbert/web-everything`) — every `--repo=` flag below |
+| `{{REPO}}` | the target repo's gh slug (e.g. `web-everything/web-everything`) — every `--repo=` flag below |
 | `{{LANE_REPO}}` | what `lane-pool.mjs --repo=` itself expects — an absolute checkout path always (equal to `{{WE_ROOT}}` for WE, a sibling's own checkout otherwise; landing-freeze fix — was `.` for WE, which broke from this dispatch's own scratch cwd) |
 | `{{GATE_COMMAND}}` | informational only — the sibling-repo-aware synchronous `run` form (`gateFor(...)`, `we:scripts/lib/repo-profile.mjs`); a dispatched agent does NOT run it (the guard denies it) and uses `verify-lane.mjs request` / `check` in step 4 |
 | `{{WE_ROOT}}` | the absolute WE checkout that owns every tool this brief runs (`rearm-review.mjs`, `stand-down.mjs`, …) |
@@ -162,7 +162,7 @@ judgment you cannot safely make, do **NOT** guess. **Record the stand-down on th
 `review:changes` (do **not** re-arm) and RETURN `#{{ITEM_NUM}} → fix escalated (finding needs human judgment)`:
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --reason=needs-judgment \
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=needs-judgment \
   --detail="<one line — what you could not decide>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-needs-judgment
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
@@ -196,7 +196,7 @@ not one (its own text says so, twice), so nothing here ever touches `review:huma
 `review:accepted` — this repair's only output is the fix itself plus the durable marker at step 7a.
 
 > **If you genuinely cannot reproduce the finding because it was ALREADY FIXED — this is GOOD NEWS, not a
-> judgment call, and you must NOT stand down** (#xkmu3gv incident, CONFIRMED LIVE on `chalbert/web-everything
+> judgment call, and you must NOT stand down** (#xkmu3gv incident, CONFIRMED LIVE on `web-everything/web-everything
 > #2549`, 2026-09-24: a fixer correctly found nothing to fix, then wrongly stood down anyway, freezing the PR).
 > A `stand-down` is TERMINAL and reserved for a genuine judgment call your read of the finding could not safely
 > make — it is never the right exit for "there was nothing left to do here". Tell the two apart by re-reading
@@ -280,7 +280,7 @@ base is something else; the same reproduce/resolve/escalate discipline applies e
 different ref.)
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --reason=conflict \
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=conflict \
   --detail="<one line — what made the overlap unsafe to resolve automatically>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-conflict
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
@@ -397,7 +397,7 @@ A red gate is a hard stop. Record the stand-down on the PR, leave it `review:cha
 RETURN `#{{ITEM_NUM}} → fix gate-red`. Do not re-push a red diff.
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --reason=gate-red \
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=gate-red \
   --detail="<one line — which check stayed red>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=gate-red
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
@@ -435,7 +435,7 @@ terminal and needs no person), release the claim, and return:
 
 ```bash
 git push origin HEAD:refs/heads/{{LANE_REF}}-fix-{{PR_NUM}}-alt
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --reason=concurrent-author \
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=concurrent-author \
   --head="$(git ls-remote origin refs/heads/{{LANE_REF}} | cut -f1)" --alt={{LANE_REF}}-fix-{{PR_NUM}}-alt \
   --alt-sha="$(git rev-parse HEAD)" --detail="<one line — what the other author changed>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=not-applicable

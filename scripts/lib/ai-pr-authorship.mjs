@@ -73,7 +73,7 @@ function stripGitConflictFooter(body) {
  *   1. `Merge branch 'main' …` / `Merge remote-tracking …` with an EMPTY body (after stripping git's own
  *      `# Conflicts:` footer, see {@link stripGitConflictFooter}) — what `gh pr update-branch` / a local
  *      rebase-on-behind creates, WITH OR WITHOUT a real conflict along the way. Live-caught 2026-09-26 on
- *      `chalbert/web-everything#2741`: `git merge origin/main` hit a conflict, git appended
+ *      `web-everything/web-everything#2741`: `git merge origin/main` hit a conflict, git appended
  *      `# Conflicts:\n#\t<path>\n#\t<path>` to the default commit message, and the commit went through
  *      non-interactively — the body was therefore non-empty, and this shape's original bare `body === ''`
  *      check missed it even though the footer is git's OWN generated boilerplate, never authored prose.
@@ -97,7 +97,7 @@ export function isMechanicalMergeCommit(commit) {
 }
 
 /** we:scripts/lib/ai-pr-authorship.mjs#isDrainBookkeepingCommit — a THIRD shape of mechanical integration
- *  commit, live-caught 2026-09-26 on `chalbert/web-everything#2741`: the DRAIN ITSELF lands a family of
+ *  commit, live-caught 2026-09-26 on `web-everything/web-everything#2741`: the DRAIN ITSELF lands a family of
  *  bookkeeping commits directly onto `main` (never through a `Merge …` headline `isMechanicalMergeCommit`
  *  would catch) — `drain: JIT-number …→#NNNN at land (#2288)` / `drain: resolve #NNNN on land (#2748)`
  *  (`we:scripts/lane-drain.mjs`'s own `committed = quietGit(…, ['commit', '-m', \`drain: …\`, …])` call sites) /
@@ -112,7 +112,7 @@ export function isMechanicalMergeCommit(commit) {
  *  gate) disqualified it from the #2421/#2281 TOTAL ci-lifecycle reconcile entirely: no `checking` / `ci:failed`
  *  / `blocked` / `ready-to-merge` label ever applied, in violation of the #2281-ratified "exactly one
  *  ci-lifecycle label present on every open AI PR, never inferred from absence" statute. CONFIRMED LIVE:
- *  `chalbert/web-everything#2741` carried `review:pending, review-round:1` only — no ci-lifecycle label at all —
+ *  `web-everything/web-everything#2741` carried `review:pending, review-round:1` only — no ci-lifecycle label at all —
  *  while `test`/`daemon-soak` were IN_PROGRESS, entirely because its inherited history carried
  *  `drain: JIT-number …`/`drain: resolve #…` commits from `main` alongside its own genuinely-AI fix commits.
  *  EXACT shapes only (PR #2748 review): the full subject must match one of the drain's own generated templates

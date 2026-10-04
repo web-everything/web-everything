@@ -10,7 +10,7 @@ import {
 } from '../merge-ai-prs.mjs';
 import { aiPr } from './fixtures/merge-ai-prs-fixtures.mjs';
 
-const repo = 'chalbert/web-everything';
+const repo = 'web-everything/web-everything';
 const sha = '07a3f88b3754b6d514d839a671ca102d770b92d0';
 const reviews = (n) => Array.from({ length: n }, () => ({ __typename: 'CheckRun', name: 'review-gate', conclusion: 'SUCCESS' }));
 const pr = (statusCheckRollup = reviews(100)) => aiPr({

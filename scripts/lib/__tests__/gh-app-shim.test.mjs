@@ -30,7 +30,7 @@ import {
 
 const CONFIGURED_ENV = {
   WE_GITHUB_APP_ID: '5037855',
-  WE_GITHUB_APP_INSTALLATION_ID: '163880042',
+  WE_GITHUB_APP_INSTALLATION_ID: '167640002',
   WE_GITHUB_APP_PRIVATE_KEY_PATH: '/Users/x/.secrets/github-apps/web-everything.pem',
 };
 
@@ -262,11 +262,11 @@ describe('renderGhShimScript — pure text, and REALLY RUN against a fake real g
         const goneCli = join(dir, 'lane-that-was-deleted', 'scripts', 'lib', 'gh-throttle.mjs');
         writeFileSync(shimPath, renderGhShimScript({ realGhPath: realGh, cachePath, ghThrottleCliPath: goneCli }), 'utf8');
         chmodSync(shimPath, 0o755);
-        const r = spawnSync(shimPath, ['api', 'repos/x/y'], { encoding: 'utf8' });
+        const r = spawnSync(shimPath, ['api', 'repos/web-everything/y'], { encoding: 'utf8' });
         expect(r.stderr).not.toMatch(/Cannot find module|cjs\/loader/);
         expect(r.status).toBe(0);
         const out = JSON.parse(r.stdout);
-        expect(out.argv).toEqual(['api', 'repos/x/y']);
+        expect(out.argv).toEqual(['api', 'repos/web-everything/y']);
         expect(out.ghToken).toBe('ghs_live_fresh'); // still on the App token — only the pacing hop is skipped
       } finally {
         rmSync(dir, { recursive: true, force: true });
@@ -286,7 +286,7 @@ describe('renderGhShimScript — pure text, and REALLY RUN against a fake real g
         const goneCli = join(dir, 'lane-that-was-deleted', 'scripts', 'lib', 'gh-throttle.mjs');
         writeFileSync(shimPath, renderGhShimScript({ realGhPath: realGh, cachePath, ghThrottleCliPath: goneCli }), 'utf8');
         chmodSync(shimPath, 0o755);
-        const r = spawnSync(shimPath, ['api', 'repos/x/y'], { encoding: 'utf8' });
+        const r = spawnSync(shimPath, ['api', 'repos/web-everything/y'], { encoding: 'utf8' });
         expect(r.status).toBe(0);
         expect(JSON.parse(r.stdout)).toEqual({ ok: true });
         expect(r.stderr).toContain('gh-shim:');
@@ -318,7 +318,7 @@ describe('renderGhShimScript — pure text, and REALLY RUN against a fake real g
         const shimPath = join(dir, 'gh');
         writeFileSync(shimPath, renderGhShimScript({ realGhPath: realGh, cachePath, ghThrottleCliPath: brokenCli }), 'utf8');
         chmodSync(shimPath, 0o755);
-        const r = spawnSync(shimPath, ['api', 'repos/x/y'], { encoding: 'utf8' });
+        const r = spawnSync(shimPath, ['api', 'repos/web-everything/y'], { encoding: 'utf8' });
         expect(r.status).toBe(0);
         expect(JSON.parse(r.stdout)).toEqual({ ok: true, via: 'real-gh' });
         expect(r.stderr).toContain('gh-shim:');
@@ -934,7 +934,7 @@ process.exitCode = ${mode === 'failure' ? 7 : 0};
         WE_GH_THROTTLE_OUTER_INV: mode === 'nested' ? 'outer-probe' : '',
       };
       // A new shell resolves a bare gh through the actual generated PATH, after checkout deletion.
-      const result = spawnSync('/bin/sh', ['-c', 'command -v gh; gh api graphql'], { env, encoding: 'utf8' });
+      const result = spawnSync('/bin/sh', ['-c', 'command -v gh; gh api graphql'], { env, encoding: 'utf8', cwd: dir });
       expect(result.stdout).toBe(`${join(bin, 'gh')}\npayload\u0000bytes\n`);
       expect(result.status).toBe(mode === 'failure' ? 7 : 0);
       expect(readFileSync(count, 'utf8')).toBe('call\n');

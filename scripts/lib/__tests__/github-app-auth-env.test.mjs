@@ -28,7 +28,7 @@ const NOOP_STATUS = { writeStatus: () => {} };
 
 const CONFIGURED_ENV = {
   WE_GITHUB_APP_ID: '5037855',
-  WE_GITHUB_APP_INSTALLATION_ID: '163880042',
+  WE_GITHUB_APP_INSTALLATION_ID: '555000111',
   WE_GITHUB_APP_PRIVATE_KEY_PATH: '/Users/x/.secrets/github-apps/web-everything.pem',
 };
 
@@ -44,7 +44,7 @@ const selectedInfo = vi.fn(async () => ({ permissions: FULL_PERMS, repositorySel
 describe('resolveGithubAppEnvConfig — opt-in, all three or none', () => {
   it('returns the config when all three env vars are set', () => {
     expect(resolveGithubAppEnvConfig(CONFIGURED_ENV)).toEqual({
-      appId: '5037855', installationId: '163880042', privateKeyPath: '/Users/x/.secrets/github-apps/web-everything.pem',
+      appId: '5037855', installationId: '555000111', privateKeyPath: '/Users/x/.secrets/github-apps/web-everything.pem',
     });
   });
 
@@ -141,7 +141,7 @@ describe('ensureFreshGithubAppEnv — the IO shell, every effect injected', () =
     });
     expect(result).toEqual({ applied: true, reason: 'ok' });
     expect(mint).toHaveBeenCalledWith({
-      appId: '5037855', installationId: '163880042',
+      appId: '5037855', installationId: '555000111',
       privateKeyPath: '/Users/x/.secrets/github-apps/web-everything.pem', now: NOW,
     });
     expect(writeCache).toHaveBeenCalledWith(expect.any(String), { v: CACHE_VERSION, appId: CONFIGURED_ENV.WE_GITHUB_APP_ID, installationId: CONFIGURED_ENV.WE_GITHUB_APP_INSTALLATION_ID, token: 'ghs_fresh', expiresAt: '2026-09-23T13:00:00Z' });
@@ -187,7 +187,7 @@ describe('ensureFreshGithubAppEnv — the IO shell, every effect injected', () =
   it('THE LIVE CASE: an installation with NO permissions is refused — personal auth stays, nothing cached', async () => {
     const writeCache = vi.fn();
     const mint = vi.fn().mockResolvedValue({ token: 'ghs_bare', expiresAt: '2026-09-23T13:00:00Z', permissions: {} });
-    const listRepos = vi.fn(async () => ['chalbert/web-everything']);
+    const listRepos = vi.fn(async () => ['web-everything/web-everything']);
     const setEnv = vi.fn();
     const log = { error: vi.fn() };
     const result = await ensureFreshGithubAppEnv({
@@ -196,7 +196,7 @@ describe('ensureFreshGithubAppEnv — the IO shell, every effect injected', () =
     expect(result.applied).toBe(false);
     expect(result.reason).toBe('insufficient-access');
     expect(result.missingPermissions).toContain('pull_requests:write');
-    expect(result.missingRepos).toEqual(REQUIRED_APP_REPOS.filter((r) => r !== 'chalbert/web-everything'));
+    expect(result.missingRepos).toEqual(REQUIRED_APP_REPOS.filter((r) => r !== 'web-everything/web-everything'));
     expect(setEnv).not.toHaveBeenCalled();
     expect(writeCache).not.toHaveBeenCalled(); // an unusable token is never cached, so the next refresh re-checks
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('NOT applying'));
@@ -306,7 +306,7 @@ describe('findInstallationGaps — pure', () => {
   it("repository_selection 'all' reports zero missing repos regardless of what `repos` contains — empty, undefined, or incomplete", () => {
     expect(findInstallationGaps({ permissions: FULL_PERMS, repos: [], repositorySelection: 'all' }).missingRepos).toEqual([]);
     expect(findInstallationGaps({ permissions: FULL_PERMS, repositorySelection: 'all' }).missingRepos).toEqual([]);
-    expect(findInstallationGaps({ permissions: FULL_PERMS, repos: ['chalbert/web-everything'], repositorySelection: 'all' }).missingRepos).toEqual([]);
+    expect(findInstallationGaps({ permissions: FULL_PERMS, repos: ['web-everything/web-everything'], repositorySelection: 'all' }).missingRepos).toEqual([]);
   });
 
   it("repository_selection 'selected' (or absent) still enforces the enumeration check exactly as before", () => {

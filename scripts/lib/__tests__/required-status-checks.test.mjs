@@ -30,10 +30,10 @@ describe('getRequiredStatusChecks', () => {
 
   it('fetches live and writes a cache on success', () => {
     const readChecks = () => ['test', 'smoke', 'daemon-soak'];
-    const result = getRequiredStatusChecks({ repo: 'chalbert/web-everything', cachePath, now: 1000, readChecks });
+    const result = getRequiredStatusChecks({ repo: 'web-everything/web-everything', cachePath, now: 1000, readChecks });
     expect(result).toEqual({ checks: ['test', 'smoke', 'daemon-soak'], source: 'live' });
     const cached = JSON.parse(readFileSync(cachePath, 'utf8'));
-    expect(cached.entries['chalbert/web-everything@main']).toEqual({
+    expect(cached.entries['web-everything/web-everything@main']).toEqual({
       checks: ['test', 'smoke', 'daemon-soak'], source: 'live', fetchedAtMs: 1000,
     });
   });
@@ -41,9 +41,9 @@ describe('getRequiredStatusChecks', () => {
   it('serves the cache within the TTL without calling the reader again', () => {
     let calls = 0;
     const readChecks = () => { calls += 1; return ['test', 'smoke', 'daemon-soak']; };
-    getRequiredStatusChecks({ repo: 'chalbert/web-everything', cachePath, now: 1000, readChecks });
+    getRequiredStatusChecks({ repo: 'web-everything/web-everything', cachePath, now: 1000, readChecks });
     const second = getRequiredStatusChecks({
-      repo: 'chalbert/web-everything', cachePath, now: 1000 + 60_000, ttlMs: 15 * 60_000, readChecks,
+      repo: 'web-everything/web-everything', cachePath, now: 1000 + 60_000, ttlMs: 15 * 60_000, readChecks,
     });
     expect(second).toEqual({ checks: ['test', 'smoke', 'daemon-soak'], source: 'cache' });
     expect(calls).toBe(1);
@@ -52,9 +52,9 @@ describe('getRequiredStatusChecks', () => {
   it('re-fetches once the cache is past its TTL', () => {
     let calls = 0;
     const readChecks = () => { calls += 1; return ['test', 'smoke', 'daemon-soak', 'a-new-required-check']; };
-    getRequiredStatusChecks({ repo: 'chalbert/web-everything', cachePath, now: 1000, ttlMs: 1000, readChecks });
+    getRequiredStatusChecks({ repo: 'web-everything/web-everything', cachePath, now: 1000, ttlMs: 1000, readChecks });
     const third = getRequiredStatusChecks({
-      repo: 'chalbert/web-everything', cachePath, now: 1000 + 2000, ttlMs: 1000, readChecks,
+      repo: 'web-everything/web-everything', cachePath, now: 1000 + 2000, ttlMs: 1000, readChecks,
     });
     expect(third).toEqual({ checks: ['test', 'smoke', 'daemon-soak', 'a-new-required-check'], source: 'live' });
     expect(calls).toBe(2);
@@ -63,10 +63,10 @@ describe('getRequiredStatusChecks', () => {
   it('falls back to a STALE cache when the live fetch fails', () => {
     const flakyRead = () => { throw new Error('gh: rate limited'); };
     writeFileSync(cachePath, JSON.stringify({
-      key: 'chalbert/web-everything@main', checks: ['test', 'smoke', 'daemon-soak'], fetchedAtMs: 0,
+      key: 'web-everything/web-everything@main', checks: ['test', 'smoke', 'daemon-soak'], fetchedAtMs: 0,
     }));
     const result = getRequiredStatusChecks({
-      repo: 'chalbert/web-everything', cachePath, now: 999_999_999, ttlMs: 1000, readChecks: flakyRead,
+      repo: 'web-everything/web-everything', cachePath, now: 999_999_999, ttlMs: 1000, readChecks: flakyRead,
     });
     expect(result).toEqual({ checks: ['test', 'smoke', 'daemon-soak'], source: 'stale-cache', cacheAgeMs: 999_999_999 });
   });
@@ -74,19 +74,19 @@ describe('getRequiredStatusChecks', () => {
   it('falls back to the hardcoded FALLBACK_REQUIRED_STATUS_CHECKS when there is no cache at all and the ' +
     'live fetch fails — gh missing, unauthenticated, offline, or rate-limited', () => {
     const flakyRead = () => { throw new Error('gh: command not found'); };
-    const result = getRequiredStatusChecks({ repo: 'chalbert/web-everything', cachePath, now: 1000, readChecks: flakyRead });
+    const result = getRequiredStatusChecks({ repo: 'web-everything/web-everything', cachePath, now: 1000, readChecks: flakyRead });
     expect(result).toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS], source: 'fallback' });
   });
 
   it('does not use a live result that comes back empty — falls through to cache/fallback instead', () => {
     const readChecks = () => [];
-    const result = getRequiredStatusChecks({ repo: 'chalbert/web-everything', cachePath, now: 1000, readChecks });
+    const result = getRequiredStatusChecks({ repo: 'web-everything/web-everything', cachePath, now: 1000, readChecks });
     expect(result).toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS], source: 'fallback' });
   });
 
   it('keys the cache by repo+branch — a different repo/branch never reads another\'s cached set', () => {
     const readChecks = () => ['test', 'smoke', 'daemon-soak'];
-    getRequiredStatusChecks({ repo: 'chalbert/web-everything', branch: 'main', cachePath, now: 1000, readChecks });
+    getRequiredStatusChecks({ repo: 'web-everything/web-everything', branch: 'main', cachePath, now: 1000, readChecks });
     let otherCalls = 0;
     const otherRead = () => { otherCalls += 1; return ['test']; };
     const result = getRequiredStatusChecks({ repo: 'chalbert/other-repo', branch: 'main', cachePath, now: 1000, readChecks: otherRead });
@@ -99,9 +99,9 @@ describe('getRequiredStatusChecks', () => {
   }); };
 
   it.each([
-    ['chalbert/plateau-app', ['test', 'e2e']],
-    ['chalbert/frontierui', ['test']],
-    ['chalbert/web-everything', ['test', 'smoke', 'daemon-soak']],
+    ['plateauapp/plateau-app', ['test', 'e2e']],
+    ['frontier-ui/frontierui', ['test']],
+    ['web-everything/web-everything', ['test', 'smoke', 'daemon-soak']],
   ])('caches the declared set for %s on a plan-feature 403, then retries after TTL', (repo, checks) => {
     const readChecks = vi.fn(plan403);
     expect(getRequiredStatusChecks({ repo, cachePath, now: 1000, ttlMs: 1000, readChecks }))
@@ -121,9 +121,9 @@ describe('getRequiredStatusChecks', () => {
     'HTTP 403: API rate limit exceeded',
   ])('uses declared policy on protection denial: %s', message => {
     const readChecks = vi.fn(() => { throw Object.assign(new Error('gh api failed'), { stderr: Buffer.from(message) }); });
-    expect(getRequiredStatusChecks({ repo: 'chalbert/plateau-app', cachePath, now: 1000, readChecks }))
+    expect(getRequiredStatusChecks({ repo: 'plateauapp/plateau-app', cachePath, now: 1000, readChecks }))
       .toEqual({ checks: ['test', 'e2e'], source: 'declared' });
-    expect(getRequiredStatusChecks({ repo: 'chalbert/plateau-app', cachePath, now: 1001, readChecks }))
+    expect(getRequiredStatusChecks({ repo: 'plateauapp/plateau-app', cachePath, now: 1001, readChecks }))
       .toEqual({ checks: ['test', 'e2e'], source: 'declared' });
     expect(readChecks).toHaveBeenCalledTimes(1);
   });
@@ -140,11 +140,11 @@ describe('getRequiredStatusChecks', () => {
     const declaredRead = vi.fn(plan403);
     const releaseRead = vi.fn(() => ['release-check']);
     for (const now of [1000, 1500]) {
-      expect(getRequiredStatusChecks({ repo: 'chalbert/web-everything', cachePath, now, readChecks: liveRead }))
+      expect(getRequiredStatusChecks({ repo: 'web-everything/web-everything', cachePath, now, readChecks: liveRead }))
         .toEqual({ checks: ['test', 'smoke', 'daemon-soak', 'new-check'], source: now === 1000 ? 'live' : 'cache' });
-      expect(getRequiredStatusChecks({ repo: 'chalbert/plateau-app', cachePath, now, readChecks: declaredRead }))
+      expect(getRequiredStatusChecks({ repo: 'plateauapp/plateau-app', cachePath, now, readChecks: declaredRead }))
         .toEqual({ checks: ['test', 'e2e'], source: 'declared' });
-      expect(getRequiredStatusChecks({ repo: 'chalbert/web-everything', branch: 'release', cachePath, now, readChecks: releaseRead }))
+      expect(getRequiredStatusChecks({ repo: 'web-everything/web-everything', branch: 'release', cachePath, now, readChecks: releaseRead }))
         .toEqual({ checks: ['release-check'], source: now === 1000 ? 'live' : 'cache' });
     }
     for (const reader of [liveRead, declaredRead, releaseRead]) expect(reader).toHaveBeenCalledTimes(1);
@@ -153,11 +153,11 @@ describe('getRequiredStatusChecks', () => {
 
   it('preserves a legacy entry when another repo writes its first cache entry', () => {
     writeFileSync(cachePath, JSON.stringify({
-      key: 'chalbert/web-everything@main', checks: ['test', 'legacy-required'], fetchedAtMs: 1000,
+      key: 'web-everything/web-everything@main', checks: ['test', 'legacy-required'], fetchedAtMs: 1000,
     }));
-    getRequiredStatusChecks({ repo: 'chalbert/plateau-app', cachePath, now: 1500, readChecks: plan403 });
+    getRequiredStatusChecks({ repo: 'plateauapp/plateau-app', cachePath, now: 1500, readChecks: plan403 });
     const readChecks = vi.fn();
-    expect(getRequiredStatusChecks({ repo: 'chalbert/web-everything', cachePath, now: 1500, readChecks }))
+    expect(getRequiredStatusChecks({ repo: 'web-everything/web-everything', cachePath, now: 1500, readChecks }))
       .toEqual({ checks: ['test', 'legacy-required'], source: 'cache' });
     expect(readChecks).not.toHaveBeenCalled();
   });
@@ -182,25 +182,25 @@ describe('defaultReadRequiredStatusChecks', () => {
       expect(opts.timeout).toBe(15_000);
       return { status: 0, stdout: Buffer.from('["personal-check"]'), stderr: Buffer.alloc(0) };
     });
-    expect(defaultReadRequiredStatusChecks({ repo: 'chalbert/web-everything' })).toEqual(['personal-check']);
+    expect(defaultReadRequiredStatusChecks({ repo: 'web-everything/web-everything' })).toEqual(['personal-check']);
     expect(execFileSync).toHaveBeenCalledWith('gh', ['auth', 'token'], expect.any(Object));
-    expect(spawnSync.mock.calls[0][1]).toEqual(['api', 'repos/chalbert/web-everything/branches/main/protection', '--jq', '.required_status_checks.contexts']);
+    expect(spawnSync.mock.calls[0][1]).toEqual(['api', 'repos/web-everything/web-everything/branches/main/protection', '--jq', '.required_status_checks.contexts']);
     expect(process.env.GH_TOKEN === 'ghs_test_fixture').toBe(true);
   });
 
   it('preserves routed HTTP failures for declared-policy classification', () => {
     vi.stubEnv('WE_GH_THROTTLE_PERSONAL_ROUTE', '1');
     spawnSync.mockReturnValue({ status: 1, stdout: Buffer.alloc(0), stderr: Buffer.from('Resource not accessible by integration (HTTP 403)') });
-    expect(getRequiredStatusChecks({ repo: 'chalbert/plateau-app', cachePath: join(dir, 'cache.json') }))
+    expect(getRequiredStatusChecks({ repo: 'plateauapp/plateau-app', cachePath: join(dir, 'cache.json') }))
       .toEqual({ source: 'declared', checks: ['test', 'e2e'] });
   });
 
   it('shells `gh api repos/<repo>/branches/<branch>/protection --jq .required_status_checks.contexts`', () => {
-    const result = defaultReadRequiredStatusChecks({ repo: 'chalbert/web-everything', branch: 'main' });
+    const result = defaultReadRequiredStatusChecks({ repo: 'web-everything/web-everything', branch: 'main' });
     expect(result).toEqual(['test', 'smoke', 'daemon-soak']);
     expect(execFileSync).toHaveBeenCalledWith(
       'gh',
-      ['api', 'repos/chalbert/web-everything/branches/main/protection', '--jq', '.required_status_checks.contexts'],
+      ['api', 'repos/web-everything/web-everything/branches/main/protection', '--jq', '.required_status_checks.contexts'],
       expect.objectContaining({ encoding: 'utf8' }),
     );
   });

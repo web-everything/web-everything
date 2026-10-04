@@ -323,14 +323,14 @@ describe('defaultListLaneStatus — argv shape (exec injected, no real subproces
   it('resolves a constellation SLUG to its real checkout path before shelling lane-pool.mjs', () => {
     let capturedArgv;
     const exec = (cmd, argv) => { capturedArgv = argv; return '{"lanes":[]}'; };
-    defaultListLaneStatus({ exec, root: '/repo', repo: 'chalbert/plateau-app' });
+    defaultListLaneStatus({ exec, root: '/repo', repo: 'plateauapp/plateau-app' });
     expect(capturedArgv).toEqual(['/repo/scripts/lane-pool.mjs', 'status', '--json', `--repo=${process.env.HOME}/workspace/plateau-app`]);
   });
 
   it('a WE slug appends NO --repo at all — WE has no fixed path, lane-pool.mjs defaults to the cwd toplevel', () => {
     let capturedArgv;
     const exec = (cmd, argv) => { capturedArgv = argv; return '{"lanes":[]}'; };
-    defaultListLaneStatus({ exec, root: '/repo', repo: 'chalbert/web-everything' });
+    defaultListLaneStatus({ exec, root: '/repo', repo: 'web-everything/web-everything' });
     expect(capturedArgv).toEqual(['/repo/scripts/lane-pool.mjs', 'status', '--json']);
   });
 });
@@ -353,7 +353,7 @@ describe('defaultListAcquirable — argv shape (exec injected, no real subproces
   it('resolves a constellation slug the same way defaultListLaneStatus does', () => {
     let capturedArgv;
     const exec = (cmd, argv) => { capturedArgv = argv; return '[]'; };
-    defaultListAcquirable({ exec, root: '/repo', repo: 'chalbert/plateau-app' });
+    defaultListAcquirable({ exec, root: '/repo', repo: 'plateauapp/plateau-app' });
     expect(capturedArgv).toEqual(['/repo/scripts/lane-pool.mjs', 'list', '--acquirable', '--json', `--repo=${process.env.HOME}/workspace/plateau-app`]);
   });
 
@@ -375,11 +375,11 @@ describe('defaultListAcquirable — argv shape (exec injected, no real subproces
 
 describe('resolveLanePoolRepoPath', () => {
   it('a recognized slug resolves to that repo\'s real checkout path, $HOME expanded', () => {
-    expect(resolveLanePoolRepoPath('chalbert/plateau-app', '/Users/x')).toBe('/Users/x/workspace/plateau-app');
-    expect(resolveLanePoolRepoPath('chalbert/frontierui', '/Users/x')).toBe('/Users/x/workspace/frontierui');
+    expect(resolveLanePoolRepoPath('plateauapp/plateau-app', '/Users/x')).toBe('/Users/x/workspace/plateau-app');
+    expect(resolveLanePoolRepoPath('frontier-ui/frontierui', '/Users/x')).toBe('/Users/x/workspace/frontierui');
   });
   it('the WE slug resolves to null (no fixed path — let lane-pool.mjs default to the cwd toplevel)', () => {
-    expect(resolveLanePoolRepoPath('chalbert/web-everything', '/Users/x')).toBeNull();
+    expect(resolveLanePoolRepoPath('web-everything/web-everything', '/Users/x')).toBeNull();
   });
   it('an unrecognized value (already a path) passes through unchanged', () => {
     expect(resolveLanePoolRepoPath('/some/checkout', '/Users/x')).toBe('/some/checkout');
@@ -423,7 +423,7 @@ describe('defaultTrimPool — argv shape (exec injected, no real subprocess)', (
   it('resolves a constellation slug the same way defaultListLaneStatus does', () => {
     let capturedArgv;
     const exec = (cmd, argv) => { capturedArgv = argv; return '{}'; };
-    defaultTrimPool({ exec, root: '/repo', repo: 'chalbert/plateau-app' });
+    defaultTrimPool({ exec, root: '/repo', repo: 'plateauapp/plateau-app' });
     expect(capturedArgv).toEqual(['/repo/scripts/lane-pool.mjs', 'trim', '--json', `--repo=${process.env.HOME}/workspace/plateau-app`]);
   });
 
@@ -478,9 +478,9 @@ describe('watchLanePoolHealth — IO shell over injected fakes', () => {
     const listAcquirable = (o) => { capturedListAcquirableArgs = o; return new Set([1]); }; // lane 3 excluded
     const result = watchLanePoolHealth({
       listStatus, readPorcelain, reap: () => {}, trimPool: () => null, listAcquirable, listWhois: () => null,
-      repo: 'chalbert/plateau-app', root: '/repo',
+      repo: 'plateauapp/plateau-app', root: '/repo',
     });
-    expect(capturedListAcquirableArgs).toEqual({ repo: 'chalbert/plateau-app', root: '/repo' });
+    expect(capturedListAcquirableArgs).toEqual({ repo: 'plateauapp/plateau-app', root: '/repo' });
     expect(result.plan.find((p) => p.lane === 1).action).toBe('already-clean');
     expect(result.plan.find((p) => p.lane === 3).action).toBe('already-clean'); // plan alone still says clean
     expect(result.health).toEqual({ total: 2, leased: 0, acquirable: 1, dirtyUnleased: 1 }); // real answer wins
@@ -556,8 +556,8 @@ describe('watchLanePoolHealth — trim wiring (#4025)', () => {
     const listStatus = () => ({ lanes: [] });
     let captured;
     const trimPool = (o) => { captured = o; return { total: 10, max: 5, removed: [9, 10], kept: [], remaining: 8, overCap: 3, dryRun: false }; };
-    const result = watchLanePoolHealth({ listStatus, readPorcelain: () => '', repo: 'chalbert/plateau-app', root: '/repo', trimMax: 5, trimPool, listAcquirable: () => null, listWhois: () => null });
-    expect(captured).toEqual({ repo: 'chalbert/plateau-app', root: '/repo', max: 5, dryRun: false });
+    const result = watchLanePoolHealth({ listStatus, readPorcelain: () => '', repo: 'plateauapp/plateau-app', root: '/repo', trimMax: 5, trimPool, listAcquirable: () => null, listWhois: () => null });
+    expect(captured).toEqual({ repo: 'plateauapp/plateau-app', root: '/repo', max: 5, dryRun: false });
     expect(result.trim).toEqual({ total: 10, max: 5, removed: [9, 10], kept: [], remaining: 8, overCap: 3, dryRun: false });
   });
 

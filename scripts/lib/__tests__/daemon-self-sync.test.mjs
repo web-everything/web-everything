@@ -330,7 +330,7 @@ describe('withSelfSync — mid-tick stale refusal reacts immediately (#3383 bug 
 
   it('a tick result flagged by hasStaleRefusal triggers an immediate REBUILD + restart when it adopts', async () => {
     const onRestart = vi.fn(() => 'restarted');
-    const tickResult = { refusals: [{ repo: 'chalbert/frontierui', kind: 'tick-failed', why: 'review-dispatch: ... STALE code from this checkout ... (#3439)' }] };
+    const tickResult = { refusals: [{ repo: 'frontier-ui/frontierui', kind: 'tick-failed', why: 'review-dispatch: ... STALE code from this checkout ... (#3439)' }] };
     const rebuild = vi.fn()
       .mockResolvedValueOnce({ moved: false, reason: 'up-to-date' }) // tick-start rebuild: nothing to do yet
       .mockResolvedValueOnce({ moved: true, adopted: true, head: 'newsha' }); // the immediate rebuild after the tick

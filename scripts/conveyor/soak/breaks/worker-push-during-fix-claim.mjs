@@ -2,7 +2,7 @@
  * @file breaks/worker-push-during-fix-claim.mjs — live break, 2026-09-27 (the fix procedure, operator-approved).
  * A second author pushed to a PR's lane while the daemon fixer was mid-repair, and the PR ended up buried.
  *
- * LIVE INCIDENT: chalbert/web-everything PR #2811. The daemon fixer `fix-2811` was repairing the PR; an
+ * LIVE INCIDENT: web-everything/web-everything PR #2811. The daemon fixer `fix-2811` was repairing the PR; an
  * orchestrator worker (not a daemon session) pushed two commits (`efaae6300`, `60f0f3d57`) to the SAME branch
  * `lane/run-rating-slice1-mechanical-grade`. Nothing refused the push. The fixer saved its repair on
  * `lane/run-rating-slice1-fix-2811-alt` and posted a TERMINAL stand-down with no label and the wrong reason, and

@@ -585,3 +585,10 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
   }
   return { ok: true, status: 'untracked', reason: 'untracked', detail: `${why} — this caller opted out of mandatory verification (--no-require-verified / WE_REQUIRE_VERIFIED=0), so the marker is advisory here (the PR's required CI check still gates the merge).` };
 }
+
+
+/** #4161 — a fresh lease is sufficient unless the same-host holder is provably dead. */
+export function verifyServerVerdict({ leaseStatus, pidLiveness }) {
+  if (leaseStatus.held && pidLiveness !== 'dead') return { alive: true, owner: leaseStatus.owner };
+  return { alive: false, reason: leaseStatus.held ? 'holder-dead' : leaseStatus.stale ? 'stale-lease' : 'no-lease' };
+}

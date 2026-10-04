@@ -1,16 +1,21 @@
 /**
  * x55dojc — the git-hook hardening primitives `probation-heal-run.mjs`/`probation-build-run.mjs` share.
- * Real temp dirs throughout (cheap: plain fs + one `git init`), never mocked — the whole point of this module
- * is fs/git-adjacent behavior that a fake would just re-assert.
+ * Real temp repositories exercise hooks and cleanup independently of the scoped version-probe doubles.
  */
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   HOOKS_DISABLED_ENV, hookSurfaceChanged, resetHookSurface, snapshotHookSurface, withHooksDisabled,
 } from '../git-hook-surface.mjs';
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal();
+  const execFileSync = vi.fn(actual.execFileSync);
+  return { ...actual, execFileSync, default: { ...actual.default, execFileSync } };
+});
 
 let dirs = [];
 function makeRepo() {
@@ -24,14 +29,89 @@ function makeRepo() {
   execFileSync('git', ['commit', '--quiet', '-m', 'base'], { cwd: dir });
   return dir;
 }
-afterEach(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); dirs = []; });
+afterEach(async () => {
+  vi.mocked(execFileSync).mockReset().mockImplementation((await vi.importActual('node:child_process')).execFileSync);
+  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  dirs = [];
+});
 
 describe('withHooksDisabled', () => {
-  it('overlays the env-based git-config override without mutating the input', () => {
-    const env = { PATH: '/bin', GIT_CONFIG_COUNT: 'should-be-overwritten' };
-    const out = withHooksDisabled(env);
-    expect(out).toEqual({ PATH: '/bin', ...HOOKS_DISABLED_ENV });
-    expect(env.GIT_CONFIG_COUNT).toBe('should-be-overwritten'); // input untouched
+  it.each([undefined, '', '0', '00'])('appends to an empty count (%s)', (count) => {
+    const env = Object.freeze({ PATH: process.env.PATH, ...(count === undefined ? {} : { GIT_CONFIG_COUNT: count }) });
+    expect(withHooksDisabled(env)).toEqual({ ...env, ...HOOKS_DISABLED_ENV });
+  });
+
+  it('supports the default environment', () => {
+    expect(withHooksDisabled()).toEqual(HOOKS_DISABLED_ENV);
+  });
+
+  it('preserves caller pairs and appends exactly once on repeated application', () => {
+    const env = Object.freeze({ PATH: process.env.PATH, OTHER: 'untouched', GIT_CONFIG_COUNT: '3',
+      GIT_CONFIG_KEY_0: 'probe.preserved', GIT_CONFIG_VALUE_0: '',
+      GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/earlier',
+      GIT_CONFIG_KEY_2: 'core.hooksPath', GIT_CONFIG_VALUE_2: '/later' });
+    let out = env;
+    for (let i = 3; i < 13; i++) {
+      const previous = out;
+      out = withHooksDisabled(previous);
+      expect(out).toEqual({ ...previous, GIT_CONFIG_COUNT: String(i + 1),
+        [`GIT_CONFIG_KEY_${i}`]: 'core.hooksPath', [`GIT_CONFIG_VALUE_${i}`]: '/dev/null' });
+      expect(out).not.toBe(previous);
+    }
+    expect(env.GIT_CONFIG_COUNT).toBe('3');
+  });
+
+  it.each(['-1', '1.5', 'secret-count', '1\n', ' 1', '+1', '1e2', '2147483647', '2147483648', '9007199254740993'])
+  ('refuses malformed or overflowing count (%s) without leaking it', (count) => {
+    expect(() => withHooksDisabled({ GIT_CONFIG_COUNT: count })).toThrow(/GIT_CONFIG_COUNT/);
+    try { withHooksDisabled({ GIT_CONFIG_COUNT: count }); } catch (error) {
+      expect(error.message).not.toContain(count);
+    }
+  });
+
+  it.each(['GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'])('refuses a missing %s without leaking values', (missing) => {
+    const env = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'probe.secret', GIT_CONFIG_VALUE_0: 'secret-value' };
+    delete env[missing];
+    expect(() => withHooksDisabled(env)).toThrow(missing);
+    try { withHooksDisabled(env); } catch (error) {
+      expect(error.message).not.toMatch(/probe.secret|secret-value/);
+    }
+  });
+
+  it.each(['2.31.0', '2.50.1', '3.0.0', '2.39.5 (Apple Git-154)', '2.47.1.windows.2'])
+  ('accepts stable Git %s and probes the supplied environment without a shell', (version) => {
+    vi.mocked(execFileSync).mockReturnValueOnce(`git version ${version}\n`);
+    const env = { PATH: '/chosen/git', OTHER: 'kept' };
+    expect(withHooksDisabled(env)).toEqual({ ...env, ...HOOKS_DISABLED_ENV });
+    const [command, args, options] = vi.mocked(execFileSync).mock.calls.at(-1);
+    expect(command).toBe('git');
+    expect(args).toEqual(['--version']);
+    expect(options.env).toEqual({ ...env, ...HOOKS_DISABLED_ENV });
+    expect(options.shell ?? false).toBe(false);
+    expect(options.timeout).toBeGreaterThan(0);
+    expect(options.timeout).toBeLessThanOrEqual(5000);
+  });
+
+  it.each(['2.30.9', '2.31.0-rc1', '2.31', 'garbage', '2.50.0\n', '2.50.0\ngit version 2.30.0'])
+  ('refuses unsupported or ambiguous Git %s before a protected operation', (version) => {
+    vi.mocked(execFileSync).mockReturnValueOnce(`git version ${version}\n`);
+    const operation = vi.fn();
+    expect(() => operation(withHooksDisabled({ PATH: '/chosen/git' }))).toThrow(/Git.*2\.31/);
+    expect(operation).not.toHaveBeenCalled();
+  });
+
+  it.each(['ENOENT', 'ETIMEDOUT', 'command failed'])('refuses probe failure %s without leaking output', (code) => {
+    vi.mocked(execFileSync).mockImplementationOnce(() => { throw Object.assign(new Error('secret-output'), { code }); });
+    const operation = vi.fn();
+    expect(() => operation(withHooksDisabled())).toThrow('Hook protection initialization refused: Git version probe failed (requires Git >=2.31.0)');
+    expect(operation).not.toHaveBeenCalled();
+  });
+
+  it('does not cache success across PATH changes', () => {
+    vi.mocked(execFileSync).mockReturnValueOnce('git version 2.31.0\n').mockReturnValueOnce('git version 2.30.9\n');
+    withHooksDisabled({ PATH: '/new' });
+    expect(() => withHooksDisabled({ PATH: '/old' })).toThrow(/Git.*2\.31/);
+    expect(vi.mocked(execFileSync).mock.calls.slice(-2).map((call) => call[2].env.PATH)).toEqual(['/new', '/old']);
   });
 });
 
@@ -55,15 +135,21 @@ describe('a real planted pre-commit hook', () => {
 
     // RED (the vulnerability): an ordinary commit, no hooks-disabled override, lets the planted hook run.
     execFileSync('git', ['commit', '-m', 'plain commit'], { cwd: dir, env: cleanEnv });
-    expect(() => execFileSync('cat', [marker])).not.toThrow();
+    expect(existsSync(marker)).toBe(true);
     rmSync(marker);
 
     // GREEN (this fix): the SAME planted hook, the SAME commit machinery, but with HOOKS_DISABLED_ENV in the
     // child's env — git finds no hook under `/dev/null` and skips it silently.
     writeFileSync(join(dir, 'a.txt'), 'v2\n');
-    execFileSync('git', ['add', 'a.txt'], { cwd: dir, env: withHooksDisabled(process.env) });
-    execFileSync('git', ['commit', '-m', 'protected commit'], { cwd: dir, env: withHooksDisabled(process.env) });
-    expect(() => execFileSync('cat', [marker])).toThrow();
+    const protectedEnv = withHooksDisabled({ ...cleanEnv, GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'probe.preserved', GIT_CONFIG_VALUE_0: 'yes',
+      GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: join(dir, '.git', 'hooks') });
+    const query = (key) => execFileSync('git', ['config', '--get', key], { cwd: dir, env: protectedEnv, encoding: 'utf8' }).trim();
+    expect(query('probe.preserved')).toBe('yes');
+    expect(query('core.hooksPath')).toBe('/dev/null');
+    execFileSync('git', ['add', 'a.txt'], { cwd: dir, env: protectedEnv });
+    execFileSync('git', ['commit', '-m', 'protected commit'], { cwd: dir, env: protectedEnv });
+    expect(existsSync(marker)).toBe(false);
   });
 
   it('is inert even if the worker rewrites the lane\'s own .git/config hooksPath back', () => {

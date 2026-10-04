@@ -35,6 +35,7 @@
  * no longer a stand-down at all — see {@link CONCURRENT_AUTHOR_PAUSE_MARKER}.)
  */
 import { resolve } from 'node:path';
+import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -262,7 +263,7 @@ const bodyOf = (c) => (typeof c === 'string' ? c : c?.body);
 
 /**
  * we:scripts/conveyor/stand-down.mjs#AUTOMATION_LOGINS — the GitHub login(s) this repo's own conveyor
- * automation posts durable marker comments under. CONFIRMED LIVE (xaer296 follow-up, `chalbert/web-everything
+ * automation posts durable marker comments under. CONFIRMED LIVE (xaer296 follow-up, `web-everything/web-everything
  * #2549`, 2026-09-24): every durable marker this repo's own tooling posts (`stand-down.mjs`,
  * `advisory-fix-mark.mjs`, `rearm-review.mjs`, `conflict-fix-mark.mjs`, the parked-PR conflict watch, …) is
  * authored by `web-everything` — but GitHub's own `viewerDidAuthor` flag ("did the CURRENT caller write this")
@@ -432,7 +433,7 @@ if (IS_CLI) {
   };
   const pr = Number(positionals[0]);
   if (!Number.isInteger(pr) || pr <= 0) {
-    fail(`usage: stand-down.mjs <pr> [--repo=<owner/name>] [--reason=<${Object.keys(STAND_DOWN_REASONS).join('|')}>] [--actor=<name>] [--detail=<text>] [--head=<sha> --alt=<lane/…-alt> --alt-sha=<sha>]  (pr must be a positive integer)`);
+    fail(`usage: stand-down.mjs <pr> [--repo=<owner/name>] [--reason=<${Object.keys(STAND_DOWN_REASONS).join('|')}>] [--who=<session slug>] [--actor=<name>] [--detail=<text>] [--head=<sha> --alt=<lane/…-alt> --alt-sha=<sha>]  (pr must be a positive integer)`);
   }
   const actor = typeof flags.actor === 'string' ? flags.actor : undefined;
   const detail = typeof flags.detail === 'string' ? flags.detail : undefined;
@@ -456,6 +457,14 @@ if (IS_CLI) {
   } catch (e) {
     fail(`could not post stand-down comment on PR #${pr}: ${String(e.message || e).split('\n')[0]}`);
   }
+  let dispatchClaimReleased = [];
+  const repo = repoKeyForSlug(flags.repo);
+  if (typeof flags.who !== 'string' || !flags.who || !repo) {
+    process.stderr.write('⚠ stand-down: dispatch claim retained; release requires --who and a known --repo\n');
+  } else {
+    const { releaseSessionFixDispatchClaims } = await import('./fix-dispatch-claim.mjs');
+    dispatchClaimReleased = releaseSessionFixDispatchClaims({ repo, pr, who: flags.who }).released;
+  }
   // fix procedure — a TERMINAL stand-down is VISIBLE: `review-status:stood-down` goes on the PR, so a person
   // scanning labels sees it without reading the thread (PR #2811 had no label at all). Best-effort: the comment
   // above is the durable record the planner reads; a failed label write is reported, never fatal.
@@ -469,5 +478,5 @@ if (IS_CLI) {
       process.stderr.write(`⚠ stand-down: comment posted but the ${STAND_DOWN_LABEL} label failed: ${String(e.message || e).split('\n')[0]}\n`);
     }
   }
-  process.stdout.write(JSON.stringify({ ok: true, pr, stoodDown: !concurrent, paused: concurrent, labeled }) + '\n');
+  process.stdout.write(JSON.stringify({ ok: true, pr, stoodDown: !concurrent, paused: concurrent, labeled, dispatchClaimReleased }) + '\n');
 }

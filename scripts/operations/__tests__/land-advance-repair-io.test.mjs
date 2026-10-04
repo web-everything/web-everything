@@ -10,7 +10,7 @@ import { CI_HEAL_COMMENT_MARKER } from '../../conveyor/ci-heal-mark.mjs';
 import { STAND_DOWN_MARKER } from '../../conveyor/stand-down.mjs';
 import { CONFLICT_LABEL } from '../../conveyor/parked-pr-conflict-watch.mjs';
 const now = Date.parse('2026-09-20T20:00:00Z');
-const emptyFs = { ...fs, readdirSync: () => [], readFileSync: (p) => { if (String(p).endsWith('swept-repos.json')) return '["chalbert/web-everything","chalbert/frontierui","chalbert/plateau-app"]'; throw Object.assign(new Error('missing'), { code: 'ENOENT' }); } };
+const emptyFs = { ...fs, readdirSync: () => [], readFileSync: (p) => { if (String(p).endsWith('swept-repos.json')) return '["web-everything/web-everything","frontier-ui/frontierui","plateauapp/plateau-app"]'; throw Object.assign(new Error('missing'), { code: 'ENOENT' }); } };
 const live = { name: 'x', createdAt: '2026-09-20T13:00:00Z', updatedAt: '2026-09-20T15:00:00Z', baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' };
 // Tonight's shapes as `gh pr list` returns them (labels are objects there).
 const gh = [{ ...live, number: 2349, headRefName: 'lane/ci-red-thing', labels: [{ name: 'ci:failed' }], mergeStateStatus: 'UNSTABLE' },
@@ -23,7 +23,7 @@ const gh = [{ ...live, number: 2349, headRefName: 'lane/ci-red-thing', labels: [
 // (still item-carrying-only on main, unlike this module's own branch snapshot).
 const ports = (over = {}) => ({ fs: emptyFs, now: () => now, home: '/nonexistent/home', drainDir: '/nonexistent/drain', jobsDir: '/nonexistent/jobs', trialLog: '/nonexistent/trials.jsonl', readSessions: () => [], store: createMemoryRunStore(), machineLoad: () => 0, findItemFn: () => null, loadItems: () => [],
   fetchItemlessDiffPaths: vi.fn((pr) => [`scripts/x-${pr}.mjs`]), readPrComments: () => [],
-  run: (cmd, args) => cmd === 'gh' ? (args.includes('chalbert/web-everything') ? JSON.stringify(gh) : '[]') : cmd === 'git' ? '0 0' : '/lanes/lane-1\n/lanes/lane-2', ...over });
+  run: (cmd, args) => cmd === 'gh' ? (args.includes('web-everything/web-everything') ? JSON.stringify(gh) : '[]') : cmd === 'git' ? '0 0' : '/lanes/lane-1\n/lanes/lane-2', ...over });
 const label = (labels) => labels.map((l) => l.name ?? l);
 
 describe('reader: repair evidence', () => {
@@ -66,7 +66,7 @@ describe('reader: repair evidence', () => {
     const store = createMemoryRunStore(), t = (kind, target) => ({ session: 's', kind, target, launchedAt: '2026-09-20T19:00:00Z', deadline: '2026-09-20T21:00:00Z', expectedResultPath: `/r/${kind}.md`, permissionsGranted: [] });
     writeFollowUp(t('ci-heal', 'we#2349'), { store }); writeFollowUp(t('conflict-fix', 'we#2344'), { store });
     const fixed = gh.map((p) => ({ ...p, labels: [], mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' }));
-    const inputs = createLandAdvanceReader(ports({ store, run: (cmd, args) => cmd === 'gh' ? (args.includes('chalbert/web-everything') ? JSON.stringify(fixed) : '[]') : cmd === 'git' ? '0 0' : '/lane-1', readSessions: () => [{ id: 's', liveness: 'live-idle' }] }))();
+    const inputs = createLandAdvanceReader(ports({ store, run: (cmd, args) => cmd === 'gh' ? (args.includes('web-everything/web-everything') ? JSON.stringify(fixed) : '[]') : cmd === 'git' ? '0 0' : '/lane-1', readSessions: () => [{ id: 's', liveness: 'live-idle' }] }))();
     expect(inputs.followUps.map((f) => f.evidence.targetMovedOn)).toEqual([true, true]);
   });
 });
@@ -77,7 +77,7 @@ describe('apply: the repair dispatches', () => {
       dispatchReview: vi.fn(), dispatchFix: vi.fn(async () => ({ agentId: 'fix-agent', sessionSlug: 'fix-2344' })), dispatchCiHeal: vi.fn(async () => ({ agentId: 'pid:99', sessionSlug: 'ci-heal-2349' })), run: vi.fn(), ...over };
     return { p, plan: planLandAdvance({ now, freeLanes: 3, cap: 5, ...planInputs }) };
   };
-  const prs = gh.map((x) => ({ ...x, repo: 'we', slug: 'chalbert/web-everything', labels: label(x.labels) }));
+  const prs = gh.map((x) => ({ ...x, repo: 'we', slug: 'web-everything/web-everything', labels: label(x.labels) }));
   const fixPlans = { 'we#2349': { planned: { itemNum: null, attributionKind: 'PR', attributionNum: '2349', pr: 2349, laneRef: 'lane/ci-red-thing', scope: ['we:scripts/a.mjs'] } },
     'we#2344': { planned: { itemNum: null, attributionKind: 'PR', attributionNum: '2344', pr: 2344, laneRef: 'lane/g', scope: ['we:scripts/b.mjs'], isConflict: true } } };
   it('routes ci-heal to the ci-heal dispatch and a conflict to the reconcile fix, each with its own tool grant and ledger kind', async () => {

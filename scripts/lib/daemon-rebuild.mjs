@@ -779,7 +779,7 @@ function alertsFilePath(root, env = process.env) {
 }
 
 const EMPTY_STATE = Object.freeze({
-  adopted: null, rejected: null, inProgress: null, quarantine: null, unverified: null, building: null, held: null,
+  adopted: null, rejected: null, inProgress: null, quarantine: null, unverified: null, building: null, held: null, busySkippedTrees: null,
 });
 
 /**
@@ -801,6 +801,7 @@ export function readRebuildState(root, env = process.env) {
       unverified: parsed?.unverified ?? null,
       building: parsed?.building ?? null,
       held: parsed?.held ?? null,
+      busySkippedTrees: parsed?.busySkippedTrees ?? null,
     };
   } catch {
     return { ...EMPTY_STATE };
@@ -1968,6 +1969,14 @@ async function smokeAndAdopt({
   // SMOKE_CHECKS). Unknown (not the adopted head, a failed diff) ⇒ null ⇒ full smoke.
   const changedSince = (sha) => {
     if (!adoptedHead || adoptedHead !== prevHead) return null;
+    // A build adopted while a lane-pool probe was SKIPPED for a busy pool (`skipped: busy pool`) was never
+    // live-verified on those checks, so "unchanged since the last live-verified build" does not hold for it:
+    // the next smoke runs every check (null = full smoke), or a chain of busy skips would launder the pool code.
+    const busyTrees = readRebuildState(root, stEnv).busySkippedTrees;
+    if (Array.isArray(busyTrees) && busyTrees.length) {
+      const headTree = verifyRev(git, `${prevHead}^{tree}`);
+      if (!headTree || busyTrees.includes(headTree)) return null;
+    }
     const d = git(['diff', '--name-only', prevHead, sha]);
     return d.status === 0 ? String(d.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean) : null;
   };
@@ -2004,7 +2013,14 @@ async function smokeAndAdopt({
   /** Adopt `p`, whose smoke just PASSED. fix-rebuild-finalize: the pass is recorded as the clone's ready candidate
    *  FIRST, so a lock refusal here never throws it away — the next write-lock holder (this process's next tick, or
    *  a sibling at its own tick start) adopts it without re-smoking (see prepareRebuild). */
-  const finalize = async (p, onAdopted, readyMeta = { kind: 'candidate' }) => {
+  const finalize = async (p, onAdopted, readyMeta = { kind: 'candidate' }, smokeResult = null) => {
+    // Record, BEFORE adopting, that this build's tree passed with a busy-pool skip (see `changedSince`).
+    const busySkipped = (smokeResult?.smoke?.results || []).filter((r) => r.skipReason === 'busy-pool').map((r) => r.name);
+    if (busySkipped.length) {
+      const tree = verifyRev(git, `${p.finalSha}^{tree}`);
+      alert('smoke-busy-pool-skipped', { checks: busySkipped, message: 'lane-pool probe(s) skipped under a busy pool; the next smoke re-runs every check' });
+      if (tree) await locked((st) => { st.busySkippedTrees = [tree, ...(st.busySkippedTrees || []).filter((t) => t !== tree)].slice(0, 5); });
+    }
     writeReadyCandidate(root, {
       ...readyMeta,
       prevHead,
@@ -2074,7 +2090,7 @@ async function smokeAndAdopt({
     await hold('smoke-threw', []);
     return { moved: false, reason: 'smoke-threw', plan, alerts: [...prepAlerts, ...alertsList] };
   }
-  if (a.smokeResult.verdict === 'pass') return finalize(plan);
+  if (a.smokeResult.verdict === 'pass') return finalize(plan, undefined, undefined, a.smokeResult);
 
   const failedA = failedRows(a.smokeResult);
   if (a.smokeResult.verdict === 'auth-broken') {
@@ -2172,7 +2188,7 @@ async function smokeAndAdopt({
       }
       const b = await smokeSha(planB.finalSha, changedSince(planB.finalSha), 'plain-main');
       if (!b.worktreeFailed && !b.threw && b.smokeResult?.verdict === 'pass') {
-        const fin = await finalize(planB, dropSuspects, fallbackReady);
+        const fin = await finalize(planB, dropSuspects, fallbackReady, b.smokeResult);
         return { ...fin, reason: 'fallback-plain-main', fallback: { from: plan.finalSha, to: planB.finalSha, dropped: suspectInfo } };
       }
       bFailed = b.smokeResult ? failedRows(b.smokeResult) : null;

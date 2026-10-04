@@ -31,10 +31,10 @@ const sample = (name, text, over = {}) => ({ name, mtimeMs: 0, sizeBytes: text.l
 describe('parseDaemonLog — fix-dispatch style block', () => {
   const text = [
     'reconcile-fix-dispatch-daemon: tick (a, b) — dispatched 0, refused 3',
-    'reconcile-fix-dispatch-daemon: refused dispatch-failed chalbert/web-everything PR #2653 — dispatch-lane: no value for the brief placeholder {{SCOPE}} — refusing to fill it with nothing',
-    'reconcile-fix-dispatch-daemon: reconcile-refused nothing-owed chalbert/web-everything PR #2658 — phase `open` — nothing new to do',
-    'reconcile-fix-dispatch-daemon: chalbert/frontierui tick failed (non-fatal, other repos unaffected): review-dispatch: the dispatching checkout is 4 commit(s) behind origin/main — refusing to dispatch',
-    'reconcile-fix-dispatch-daemon: refused no-lane chalbert/web-everything PR #2661 — no free lane in the pool',
+    'reconcile-fix-dispatch-daemon: refused dispatch-failed web-everything/web-everything PR #2653 — dispatch-lane: no value for the brief placeholder {{SCOPE}} — refusing to fill it with nothing',
+    'reconcile-fix-dispatch-daemon: reconcile-refused nothing-owed web-everything/web-everything PR #2658 — phase `open` — nothing new to do',
+    'reconcile-fix-dispatch-daemon: frontier-ui/frontierui tick failed (non-fatal, other repos unaffected): review-dispatch: the dispatching checkout is 4 commit(s) behind origin/main — refusing to dispatch',
+    'reconcile-fix-dispatch-daemon: refused no-lane web-everything/web-everything PR #2661 — no free lane in the pool',
   ].join('\n');
 
   it('folds the summary + every detail line into ONE tick block', () => {
@@ -60,7 +60,7 @@ describe('parseDaemonLog — fix-dispatch style block', () => {
 
   it('records the no-lane refusal subject and the placeholder text verbatim (for the recommend() regex)', () => {
     const t = parseDaemonLog(text).ticks[0];
-    expect(t.noLane).toEqual([{ repo: 'chalbert/web-everything' }]);
+    expect(t.noLane).toEqual([{ repo: 'web-everything/web-everything' }]);
     expect(t.blocking.find((b) => /dispatch-failed/.test(b))).toContain('{{SCOPE}}');
   });
 
@@ -122,7 +122,7 @@ describe('foldDaemonMemory', () => {
   });
 
   it('tracks an unproductive streak across samples and resets it the moment a tick dispatches something', () => {
-    let mem = foldDaemonMemory(undefined, sample('d', 'd: tick (1) — dispatched 0, refused 1\nd: refused no-lane chalbert/web-everything PR #1 — no free lane', { mtimeMs: 0 }), 0);
+    let mem = foldDaemonMemory(undefined, sample('d', 'd: tick (1) — dispatched 0, refused 1\nd: refused no-lane web-everything/web-everything PR #1 — no free lane', { mtimeMs: 0 }), 0);
     expect(mem.unproductiveSince).toBe(0);
     expect(mem.unproductiveTicks).toBe(1);
     mem = foldDaemonMemory(mem, sample('d', 'd: tick (2) — dispatched 1', { mtimeMs: 1000 }), 1000);
@@ -188,7 +188,7 @@ describe('smell: daemon-silent — alive lease, no tick for >10 min opens; ticks
 describe('smell: daemon-owed-no-dispatch', () => {
   it('streak rule: 30+ min of dispatched-0 + blocking refusal opens; a dispatched>0 tick cleans, 2 cleans close', () => {
     let state = emptyHealthState();
-    const noLaneText = (n, pr) => `fix-dispatch-daemon: tick (${n}) — dispatched 0, refused 1\nfix-dispatch-daemon: refused no-lane chalbert/web-everything PR #${pr} — no free lane in the pool`;
+    const noLaneText = (n, pr) => `fix-dispatch-daemon: tick (${n}) — dispatched 0, refused 1\nfix-dispatch-daemon: refused no-lane web-everything/web-everything PR #${pr} — no free lane in the pool`;
 
     let r = runHealthTick(state, { daemonLogs: [sample('fix-dispatch-daemon', noLaneText(1, 4001), { mtimeMs: 0 })] }, [daemonOwedNoDispatch], 0);
     state = r.state;
@@ -212,11 +212,11 @@ describe('smell: daemon-owed-no-dispatch', () => {
   it('ratio rule: 3 of 5 recent ticks (>=60%) unproductive breaches even with no 30-minute streak', () => {
     const text = [
       'review-daemon: tick (1) — dispatched 0, refused 1',
-      'review-daemon: refused no-lane chalbert/web-everything PR #3001 — no free lane',
+      'review-daemon: refused no-lane web-everything/web-everything PR #3001 — no free lane',
       'review-daemon: tick (2) — dispatched 0, refused 1',
-      'review-daemon: refused no-lane chalbert/web-everything PR #3002 — no free lane',
+      'review-daemon: refused no-lane web-everything/web-everything PR #3002 — no free lane',
       'review-daemon: tick (3) — dispatched 0, refused 1',
-      'review-daemon: refused no-lane chalbert/web-everything PR #3003 — no free lane',
+      'review-daemon: refused no-lane web-everything/web-everything PR #3003 — no free lane',
       'review-daemon: tick (4) — dispatched 1, refused 0',
       'review-daemon: tick (5) — dispatched 1, refused 0',
     ].join('\n');
@@ -308,7 +308,7 @@ describe('parseDaemonLog / foldDaemonMemory — trust refusals', () => {
   });
 
   it('counts the dispatch sink\'s normalized refusal line (lower-case "workspace not trusted")', () => {
-    const line = 'reconcile-fix-dispatch-daemon: refused dispatch-failed chalbert/web-everything PR #2822 — claude could not be started (workspace not trusted for /x/dispatch/a) — no agent exists';
+    const line = 'reconcile-fix-dispatch-daemon: refused dispatch-failed web-everything/web-everything PR #2822 — claude could not be started (workspace not trusted for /x/dispatch/a) — no agent exists';
     expect(parseDaemonLog(line).trustRefusals).toBe(1);
   });
 });
@@ -316,9 +316,9 @@ describe('parseDaemonLog / foldDaemonMemory — trust refusals', () => {
 describe('smell: dispatch-trust-refused', () => {
   it('2 "Workspace not trusted" refusals in 60 min opens; quiet closes after 3 clean samples', () => {
     const text = [
-      'reconcile-fix-dispatch-daemon: tick (chalbert/web-everything) — dispatched 0, refused 1',
+      'reconcile-fix-dispatch-daemon: tick (web-everything/web-everything) — dispatched 0, refused 1',
       'Workspace not trusted. Run `claude` in /x/dispatch/a once and accept the trust prompt, then retry.',
-      'reconcile-fix-dispatch-daemon: refused dispatch-failed chalbert/web-everything PR #2822 — claude could not be started (workspace not trusted for /x/dispatch/a) — no agent exists',
+      'reconcile-fix-dispatch-daemon: refused dispatch-failed web-everything/web-everything PR #2822 — claude could not be started (workspace not trusted for /x/dispatch/a) — no agent exists',
       'Workspace not trusted. Run `claude` in /x/dispatch/b once and accept the trust prompt, then retry.',
     ].join('\n');
     let state = emptyHealthState();
@@ -348,7 +348,7 @@ describe('smell: dispatch-trust-refused', () => {
   });
 
   it('opens on the sink\'s normalized refusal lines alone, with no raw CLI stderr logged (PR #2824 review)', () => {
-    const text = ['a', 'b'].map((s) => `reconcile-fix-dispatch-daemon: refused dispatch-failed chalbert/web-everything PR #2822 — claude could not be started (workspace not trusted for /x/dispatch/${s}) — no agent exists`).join('\n');
+    const text = ['a', 'b'].map((s) => `reconcile-fix-dispatch-daemon: refused dispatch-failed web-everything/web-everything PR #2822 — claude could not be started (workspace not trusted for /x/dispatch/${s}) — no agent exists`).join('\n');
     const r = runHealthTick(emptyHealthState(), { daemonLogs: [sample('fix-dispatch-daemon', text, { mtimeMs: 0 })] }, [dispatchTrustRefused], 0);
     expect(r.transitions.some((t) => t.type === 'opened' && t.key === 'dispatch-trust-refused::dispatch-trust')).toBe(true);
   });
@@ -423,7 +423,7 @@ describe('smell: claude-auth-expired (live incident, night of 2026-09-25/26 ET)'
 describe('smell: lane-starvation', () => {
   it('opens after openAfter=2 samples (not 1); acquirable>demand + no recent no-lane closes after 3', () => {
     let state = emptyHealthState();
-    const noLaneText = (n, pr) => `fix-dispatch-daemon: tick (${n}) — dispatched 0, refused 1\nfix-dispatch-daemon: refused no-lane chalbert/web-everything PR #${pr} — no free lane`;
+    const noLaneText = (n, pr) => `fix-dispatch-daemon: tick (${n}) — dispatched 0, refused 1\nfix-dispatch-daemon: refused no-lane web-everything/web-everything PR #${pr} — no free lane`;
 
     let r = runHealthTick(state, {
       lanePools: [{ repo: 'we', health: { total: 2, leased: 2, acquirable: 0, dirtyUnleased: 0 }, at: 0 }],
@@ -506,24 +506,24 @@ describe('smell: red-pr-unattended', () => {
   it('red for >1h with no fixer opens; a live fix-<N> agent cleans and closes (closeAfter=1)', () => {
     let state = emptyHealthState();
     const prs = [{
-      repo: 'chalbert/web-everything', number: 2636, title: 'fix flaky test', updatedAt: new Date(T0 - 2 * HOUR).toISOString(),
+      repo: 'web-everything/web-everything', number: 2636, title: 'fix flaky test', updatedAt: new Date(T0 - 2 * HOUR).toISOString(),
       labels: [], statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE', completedAt: new Date(T0 - 2 * HOUR).toISOString() }],
     }];
     let r = runHealthTick(state, { prs, agents: [] }, [redPrUnattended], T0);
     state = r.state;
-    expect(r.transitions.some((t) => t.type === 'opened' && t.key === 'red-pr-unattended::chalbert/web-everything#2636')).toBe(true);
+    expect(r.transitions.some((t) => t.type === 'opened' && t.key === 'red-pr-unattended::web-everything/web-everything#2636')).toBe(true);
 
     r = runHealthTick(state, { prs, agents: [{ name: 'fix-2636', state: 'running' }] }, [redPrUnattended], T0 + MINUTE);
-    expect(r.transitions.some((t) => t.type === 'closed' && t.key === 'red-pr-unattended::chalbert/web-everything#2636')).toBe(true);
+    expect(r.transitions.some((t) => t.type === 'closed' && t.key === 'red-pr-unattended::web-everything/web-everything#2636')).toBe(true);
   });
 
   it('a red review-gate check alone (ignored) never breaches — the PR is skipped entirely', () => {
     const prs = [{
-      repo: 'chalbert/web-everything', number: 9999, title: 'x', updatedAt: new Date(T0).toISOString(), labels: [],
+      repo: 'web-everything/web-everything', number: 9999, title: 'x', updatedAt: new Date(T0).toISOString(), labels: [],
       statusCheckRollup: [{ name: 'review-gate', conclusion: 'FAILURE', completedAt: new Date(T0).toISOString() }],
     }];
     const results = redPrUnattended.evaluate({ prs, agents: [] }, { now: T0, daemons: {} });
-    expect(results.find((r) => r.subject === 'chalbert/web-everything#9999')).toBeUndefined();
+    expect(results.find((r) => r.subject === 'web-everything/web-everything#9999')).toBeUndefined();
   });
 });
 
@@ -826,8 +826,8 @@ describe('daemon-silent on a daemon known only through daemon-status', () => {
 describe('incremental reads keep tick details that cross a sample boundary', () => {
   const summary = 'reconcile-fix-dispatch-daemon: tick (a) — dispatched 0, refused 2';
   const details = [
-    'reconcile-fix-dispatch-daemon: refused no-lane chalbert/frontierui PR #7 — no free lane to dispatch a fix agent for PR #7',
-    'reconcile-fix-dispatch-daemon: refused dispatch-failed chalbert/web-everything PR #8 — dispatch-lane: no value for the brief placeholder {{SCOPE}} — refusing',
+    'reconcile-fix-dispatch-daemon: refused no-lane frontier-ui/frontierui PR #7 — no free lane to dispatch a fix agent for PR #7',
+    'reconcile-fix-dispatch-daemon: refused dispatch-failed web-everything/web-everything PR #8 — dispatch-lane: no value for the brief placeholder {{SCOPE}} — refusing',
   ].join('\n');
   const T = Date.parse('2026-09-25T12:00:00.000Z');
   const sample = (text, i) => ({ name: 'fix', mtimeMs: T + i * 60_000, sizeBytes: 100 * (i + 1), text, bootstrap: false });
@@ -840,8 +840,8 @@ describe('incremental reads keep tick details that cross a sample boundary', () 
     expect(split.lastTick.unproductive).toBe(true);
     expect(split.unproductiveTicks).toBe(whole.unproductiveTicks);
     expect(Object.keys(split.unproductiveReasons).sort()).toEqual(Object.keys(whole.unproductiveReasons).sort());
-    expect(split.lastTick.noLane).toEqual(['chalbert/frontierui']);
-    expect(Object.keys(split.prRefusals).sort()).toEqual(['chalbert/frontierui#7', 'chalbert/web-everything#8']);
+    expect(split.lastTick.noLane).toEqual(['frontier-ui/frontierui']);
+    expect(Object.keys(split.prRefusals).sort()).toEqual(['frontier-ui/frontierui#7', 'web-everything/web-everything#8']);
     expect(split.recentTicks.at(-1).u).toBe(1);
   });
 });
@@ -849,7 +849,7 @@ describe('incremental reads keep tick details that cross a sample boundary', () 
 describe('lane-starvation credits demand to the repo each refusal names', () => {
   it('a no-lane refusal on frontierui breaches the frontierui pool, not we', () => {
     const now = Date.parse('2026-09-25T12:00:00.000Z');
-    const daemons = { fix: { lastTick: { noLane: ['chalbert/frontierui', 'chalbert/frontierui'] }, noLaneTimes: [] } };
+    const daemons = { fix: { lastTick: { noLane: ['frontier-ui/frontierui', 'frontier-ui/frontierui'] }, noLaneTimes: [] } };
     const pools = [
       { repo: 'we', health: { total: 10, leased: 9, acquirable: 1, dirtyUnleased: 0 }, at: now },
       { repo: 'frontierui', health: { total: 2, leased: 2, acquirable: 0, dirtyUnleased: 0 }, at: now },
@@ -890,10 +890,10 @@ describe('review-daemon per-PR failures and the dirty-clone hold', () => {
   it('parses `<repo>#N failed (non-fatal)` as a blocking stale-checkout reason tied to the PR', () => {
     const p = parseDaemonLog([
       'review-daemon: tick (a, b) — 9 owed, dispatched 0, failed 9',
-      'review-daemon: chalbert/web-everything#2672 failed (non-fatal): review-dispatch: the dispatching checkout is 10 commit(s) behind origin/main — refusing to dispatch a review',
+      'review-daemon: web-everything/web-everything#2672 failed (non-fatal): review-dispatch: the dispatching checkout is 10 commit(s) behind origin/main — refusing to dispatch a review',
     ].join('\n'));
     expect(p.ticks[0].blocking).toContain('stale-checkout: dispatching clone behind origin/main');
-    expect(p.ticks[0].prs).toEqual([{ pr: 'chalbert/web-everything#2672', reason: 'stale-checkout: dispatching clone behind origin/main' }]);
+    expect(p.ticks[0].prs).toEqual([{ pr: 'web-everything/web-everything#2672', reason: 'stale-checkout: dispatching clone behind origin/main' }]);
   });
   it('a `dirty` rebuild alert holds the clone open until the next adoption', () => {
     const at = Date.parse('2026-09-25T17:35:18.330Z');
@@ -922,8 +922,8 @@ describe('round 2: attribution and benign-only ticks', () => {
     const p = parseDaemonLog([
       'review-daemon: tick (a) — 2 owed, dispatched 0, failed 0',
       'reconcile-fix-dispatch-daemon: tick (a) — dispatched 0, refused 2',
-      'reconcile-fix-dispatch-daemon: reconcile-refused live-process chalbert/web-everything PR #1 — a bound session has a LIVE pid',
-      'reconcile-fix-dispatch-daemon: reconcile-refused cap-exhausted chalbert/web-everything PR #2 — cap',
+      'reconcile-fix-dispatch-daemon: reconcile-refused live-process web-everything/web-everything PR #1 — a bound session has a LIVE pid',
+      'reconcile-fix-dispatch-daemon: reconcile-refused cap-exhausted web-everything/web-everything PR #2 — cap',
     ].join('\n'));
     expect(p.ticks.map(tickIsUnproductive)).toEqual([false, false]);
   });
@@ -991,17 +991,17 @@ describe('report fences around untrusted text (#4437)', () => {
 describe('xyx5mea stuck PR duration', () => {
   const start = 1790882705935;
   const targets = [draftNotPromoted, redPrUnattended, repeatedPrAttempts];
-  const subject = 'chalbert/web-everything#3336';
+  const subject = 'web-everything/web-everything#3336';
   const key = (s) => `${s.id}::${subject}`;
   const reload = (s) => JSON.parse(JSON.stringify(s));
   const notify = (r) => r.plan.filter(p => p.kind === 'notify');
   function probes(now) {
     return {
-      prs: [{ repo: 'chalbert/web-everything', number: 3336, isDraft: true,
+      prs: [{ repo: 'web-everything/web-everything', number: 3336, isDraft: true,
         statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: new Date(start - HOUR).toISOString() }] }],
       agents: [], daemonLogs: [],
       operationRuns: Array.from({ length: 5 }, (_, i) => ({ id: `run-${i}`, op: 'open-pr',
-        input: { repo: 'chalbert/web-everything', pr: 3336 }, effects: [{ key: 'submit', status: 'failed',
+        input: { repo: 'web-everything/web-everything', pr: 3336 }, effects: [{ key: 'submit', status: 'failed',
           lastAttemptAt: new Date(now).toISOString(), error: 'submit failed' }] })),
     };
   }

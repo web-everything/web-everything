@@ -465,7 +465,7 @@ function ghPrList(repo, args) {
  *  all. This is deliberately future-proof in a way the exclusion list structurally cannot be: a brand-new
  *  advisory workflow is, by construction, not yet in branch protection's required set, so it can never cause
  *  a false red here even before anyone thinks to add its name to {@link CI_TRUTH_EXCLUDED_CHECKS} — exactly
- *  the gap the exclusion list left open (LIVE INCIDENT 2026-09-26, PR #2748 (chalbert/web-everything): the new
+ *  the gap the exclusion list left open (LIVE INCIDENT 2026-09-26, PR #2748 (web-everything/web-everything): the new
  *  `soak-replay-gate` advisory check, PR #2775, went red on a PR whose every required check was green, and
  *  every exclusion-list-based reader misread it as a genuine CI failure until `soak-replay-gate` was added to
  *  the list by hand). `requiredChecks` omitted/empty falls back to the exclusion-list behaviour unchanged, so
@@ -476,7 +476,7 @@ function ghPrList(repo, args) {
  *  only) that silently OMITTED `CANCELLED` (and `STALE`), while `FAILING_CONCLUSIONS` and
  *  `we:scripts/merge-ai-prs.mjs#isRequiredCheckFailed` both already treat a cancelled run as failing ("a real
  *  hang/kill leaves no readable verdict, so it must not read as clean" — see that function's own docblock).
- *  LIVE INCIDENT 2026-09-25, PR #2636 (chalbert/web-everything): the daemon's own hung-ci-recovery cancelled the
+ *  LIVE INCIDENT 2026-09-25, PR #2636 (web-everything/web-everything): the daemon's own hung-ci-recovery cancelled the
  *  hung `test-shard (1)` run once its OWN cap was exhausted (`cancelled-no-rerun`, cap-exhausted, never re-run)
  *  — `classifyPr` (which calls this function, and ONLY this function, for CI truth) then read the rollup as
  *  having zero failing checks and returned phase `'open'` instead of `'ci-red'`, so `reconcile-core.mjs`'s
@@ -488,7 +488,7 @@ function ghPrList(repo, args) {
  *  derivation entirely.
  *
  *  COLLAPSED TO THE LATEST RUN PER CHECK NAME FIRST (`collapseRollupToLatestPerName`, #2925/#xkfv491) —
- *  LIVE DEADLOCK 2026-09-28/29, PR #2878 (chalbert/web-everything): `review-gate` re-runs on every `labeled`/
+ *  LIVE DEADLOCK 2026-09-28/29, PR #2878 (web-everything/web-everything): `review-gate` re-runs on every `labeled`/
  *  `unlabeled` event (`.github/workflows/review-gate.yml`), and once a repo's branch protection grows a SECOND
  *  gate-shaped required check that reruns more than once per head (here `soak-replay-gate`, added to
  *  `required_status_checks.contexts` after the earlier `CI_TRUTH_EXCLUDED_CHECKS`-only era — see that
@@ -560,7 +560,7 @@ export function classifyPr(pr, requiredChecks) {
   // `review:accepted` SUPERSEDES `review:human`: the human hold has already been cleared, so the PR is
   // waiting on the merge queue, not on the operator. Without this an accepted PR sits in their section forever.
   if (labels.has('review:human') && !labels.has('review:accepted')) return 'needs-human';
-  // xx6kg3f (epic #3383/#4075) — LIVE INCIDENT 2026-09-26, PR #2739 (chalbert/web-everything): `ciFailed`
+  // xx6kg3f (epic #3383/#4075) — LIVE INCIDENT 2026-09-26, PR #2739 (web-everything/web-everything): `ciFailed`
   // is ONLY as current as the ONE `statusCheckRollup` a caller happened to fetch this tick. This file's own
   // header already treats a degraded `gh` read as a normal, expected mode ("`gh` missing, unauthenticated,
   // offline or rate-limited must not lose the page") — but `classifyPr` itself never carried that principle

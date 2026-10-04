@@ -17,7 +17,7 @@ import { REVIEW_SEAT_DISPATCH_KIND } from '../../lib/provider-routing.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
 import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
 
-const REPO = 'chalbert/web-everything';
+const REPO = 'web-everything/web-everything';
 const NOW = Date.parse('2026-09-26T15:00:00Z');
 const REV = 'a'.repeat(40);
 

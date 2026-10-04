@@ -319,12 +319,12 @@ describe('lane-resume — land is repo-aware (#2383: /finish spans all constella
 
   it('a REMOTE repo → every gh call is `--repo`-scoped and the drain trigger targets that repo via `--repos=`', () => {
     const { run, calls } = scriptedRun({ ...prView() });
-    const v = land({ prNum: 5, run, repo: 'chalbert/plateau-app', prInfo: { headRefName: 'lane/x-2202', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }] } });
+    const v = land({ prNum: 5, run, repo: 'plateauapp/plateau-app', prInfo: { headRefName: 'lane/x-2202', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }] } });
     expect(v.action).toBe('enqueued');
     const edit = labelEdit(calls);
-    expect(edit.args).toEqual(expect.arrayContaining(['--repo', 'chalbert/plateau-app']));
+    expect(edit.args).toEqual(expect.arrayContaining(['--repo', 'plateauapp/plateau-app']));
     const trig = drainTrigger(calls);
-    expect(trig.args).toContain('--repos=chalbert/plateau-app'); // NOT --this-repo — that would sweep the cwd repo
+    expect(trig.args).toContain('--repos=plateauapp/plateau-app'); // NOT --this-repo — that would sweep the cwd repo
     expect(trig.args).not.toContain('--this-repo');
   });
 
@@ -332,10 +332,10 @@ describe('lane-resume — land is repo-aware (#2383: /finish spans all constella
     // No RESOLVE_PLUMBING scripted: a local rebaseDropManifest would call git write-tree/commit-tree/push and
     // fail here — proving the remote path never runs it, just enqueues + lets the (sibling-clone-aware) drain rebuild.
     const { run, calls } = scriptedRun({ ...prView() });
-    const v = land({ prNum: 5, run, repo: 'chalbert/frontierui', prInfo: { headRefName: 'lane/x-2202', mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }] } });
+    const v = land({ prNum: 5, run, repo: 'frontier-ui/frontierui', prInfo: { headRefName: 'lane/x-2202', mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }] } });
     expect(v).toMatchObject({ action: 'enqueued', rebased: false }); // deferred, not 'rebuilt-enqueued'
     expect(calls.some((c) => c.args[0] === 'commit-tree')).toBe(false); // never touched local git
-    expect(drainTrigger(calls).args).toContain('--repos=chalbert/frontierui');
+    expect(drainTrigger(calls).args).toContain('--repos=frontier-ui/frontierui');
   });
 
   it('the LOCAL repo (no `repo`) keeps the established `--this-repo` trigger and un-scoped gh calls', () => {
@@ -346,11 +346,11 @@ describe('lane-resume — land is repo-aware (#2383: /finish spans all constella
   });
 
   it('the remote-manifest `gh api` read forces `--method GET` (else `-f` makes gh POST → 404 → every remote lane silently drops item/blockedBy)', () => {
-    const args = remoteManifestApiArgs('chalbert/plateau-app', 'lane/x-2343');
+    const args = remoteManifestApiArgs('plateauapp/plateau-app', 'lane/x-2343');
     // GET must be explicit and precede the endpoint (a POST to the read-only contents endpoint 404s).
     expect(args).toContain('--method');
     expect(args[args.indexOf('--method') + 1]).toBe('GET');
-    expect(args).toContain('repos/chalbert/plateau-app/contents/.lane-manifest.json');
+    expect(args).toContain('repos/plateauapp/plateau-app/contents/.lane-manifest.json');
     expect(args).toEqual(expect.arrayContaining(['-f', 'ref=lane/x-2343']));
   });
 });
@@ -773,7 +773,7 @@ describe('lane-resume — deriveItemFromRef (#xcf4556)', () => {
 
 describe('lane-resume — classifyPrMissingRef (#xcf4556, the pr-missing discover bucket)', () => {
   const base = (o) => ({
-    ref: 'lane/x', repo: 'chalbert/web-everything', tipSha: 'abc123', committerDate: new Date().toISOString(),
+    ref: 'lane/x', repo: 'web-everything/web-everything', tipSha: 'abc123', committerDate: new Date().toISOString(),
     prStates: [], tipOnMain: false, deliversRealChange: true, item: 3915, now: Date.now(), windowDays: 7, ...o,
   });
 
@@ -811,7 +811,7 @@ describe('lane-resume — classifyPrMissingRef (#xcf4556, the pr-missing discove
 
   it('a fresh, PR-less, off-main, real-delivery ref within the window IS pr-missing, naming its item', () => {
     const v = classifyPrMissingRef(base({}));
-    expect(v).toMatchObject({ ref: 'lane/x', repo: 'chalbert/web-everything', item: 3915, tip: 'abc123', disposition: 'pr-missing' });
+    expect(v).toMatchObject({ ref: 'lane/x', repo: 'web-everything/web-everything', item: 3915, tip: 'abc123', disposition: 'pr-missing' });
     expect(v.reason).toMatch(/#3915/);
   });
 

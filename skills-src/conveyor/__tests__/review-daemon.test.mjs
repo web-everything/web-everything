@@ -52,10 +52,10 @@ describe('hasStaleMainRefusal', () => {
     return message;
   };
   it('true when a per-PR dispatch failed with the real assertMainNotStale refusal message', () => {
-    expect(hasStaleMainRefusal({ failed: [{ prNumber: 42, repo: 'chalbert/web-everything', error: staleMessage() }] })).toBe(true);
+    expect(hasStaleMainRefusal({ failed: [{ prNumber: 42, repo: 'web-everything/web-everything', error: staleMessage() }] })).toBe(true);
   });
   it('true when a WHOLE-REPO tick failed with it (forEachRepo\'s own {repo, error} capture)', () => {
-    expect(hasStaleMainRefusal({ repos: [{ repo: 'chalbert/plateau-app', error: staleMessage() }] })).toBe(true);
+    expect(hasStaleMainRefusal({ repos: [{ repo: 'plateauapp/plateau-app', error: staleMessage() }] })).toBe(true);
   });
   it('false for an ordinary, unrelated failure in either shape', () => {
     expect(hasStaleMainRefusal({ failed: [{ prNumber: 1, error: 'gh: rate limited' }] })).toBe(false);
@@ -113,7 +113,7 @@ describe('runReviewTick — the per-tick sequence', () => {
       reconcile: () => owedPlan([{ kind: 'review', prNumber: 10 }]),
       dispatch, tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [],
     });
-    expect(dispatch).toHaveBeenCalledWith({ pr: 10, repo: 'chalbert/web-everything',
+    expect(dispatch).toHaveBeenCalledWith({ pr: 10, repo: 'web-everything/web-everything',
       escalationReason: ['statute'], scopePaths: ['docs/agent/platform-decisions.md'] });
   });
 
@@ -127,7 +127,7 @@ describe('runReviewTick — the per-tick sequence', () => {
     const tagStatus = vi.fn();
     const out = runReviewTick({ reconcile, dispatch, tagRound, tagStatus, statusCandidates: () => [] });
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledWith({ pr: 10, repo: 'chalbert/web-everything', escalationReason: [], scopePaths: [] });
+    expect(dispatch).toHaveBeenCalledWith({ pr: 10, repo: 'web-everything/web-everything', escalationReason: [], scopePaths: [] });
     expect(tagRound).toHaveBeenCalledWith({ pr: 10, repo: expect.any(String), round: 2 }); // attempts+1
     expect(out).toEqual({
       reviewsOwed: 1, dispatched: [{ prNumber: 10, agentId: 'agent-10' }], failed: [], notStarted: [], refusals: 0,
@@ -227,7 +227,7 @@ describe('runReviewTick — the per-tick sequence', () => {
     expect(tagStatus).toHaveBeenCalledTimes(1);
   });
 
-  // Live-caught 2026-09-26, PR chalbert/web-everything#2711, card x8who76 — END-TO-END with #2711's REAL label
+  // Live-caught 2026-09-26, PR web-everything/web-everything#2711, card x8who76 — END-TO-END with #2711's REAL label
   // sequence and the REAL `selectStatusCandidates`/`tagReviewStatus` (only the `gh` provider is faked): #2711
   // got `review:accepted` + `ready-to-merge` (phase `queued` → `classifyPr`), which `reconcile-pass.mjs`'s real
   // `runReconcilePass` refuses as `nothing-owed` — NOT a review/fix dispatch entry, and (before this fix)
@@ -264,11 +264,11 @@ describe('runReviewTick — the per-tick sequence', () => {
     expect(out.reviewsOwed).toBe(0);
     expect(out.dispatched).toEqual([]);
     expect(setLabelsCalls).toEqual([
-      { repo: 'chalbert/web-everything', pr: 2711, spec: { add: undefined, remove: ['review-status:reviewing'] } },
+      { repo: 'web-everything/web-everything', pr: 2711, spec: { add: undefined, remove: ['review-status:reviewing'] } },
     ]);
   });
 
-  // Live-caught 2026-09-26, PR chalbert/web-everything#2742, card xg790dh — END-TO-END with #2742's REAL label
+  // Live-caught 2026-09-26, PR web-everything/web-everything#2742, card xg790dh — END-TO-END with #2742's REAL label
   // sequence and the REAL `selectStatusCandidates`/`tagReviewStatus` (only the `gh` provider is faked): #2742's
   // `fix-2742` session finished (`state: 'done'`, idle 11+ min) and its re-push then went CI-red (`ci:failed`),
   // so `reconcile-pass.mjs`'s real `runReconcilePass` now dispatches a `kind:'ci-heal'` entry for it — NOT a
@@ -303,7 +303,7 @@ describe('runReviewTick — the per-tick sequence', () => {
     expect(out.reviewsOwed).toBe(0);
     expect(out.dispatched).toEqual([]);
     expect(setLabelsCalls).toEqual([
-      { repo: 'chalbert/web-everything', pr: 2742, spec: { add: undefined, remove: ['review-status:fixing'] } },
+      { repo: 'web-everything/web-everything', pr: 2742, spec: { add: undefined, remove: ['review-status:fixing'] } },
     ]);
   });
 
@@ -331,7 +331,7 @@ describe('runReviewTick — the per-tick sequence', () => {
       tagRound: () => { throw new Error('no round tag on a non-review dispatch'); },
     });
     expect(setLabelsCalls).toEqual([
-      { repo: 'chalbert/web-everything', pr: 2742, spec: { add: 'review-status:healing-ci', remove: ['review-status:fixing'] } },
+      { repo: 'web-everything/web-everything', pr: 2742, spec: { add: 'review-status:healing-ci', remove: ['review-status:fixing'] } },
     ]);
   });
 
@@ -361,7 +361,7 @@ describe('runReviewTick — the per-tick sequence', () => {
     });
     expect(out.dispatched).toEqual([]);
     expect(setLabelsCalls).toEqual([
-      { repo: 'chalbert/web-everything', pr: 3001, spec: { add: 'review-status:awaiting-ci', remove: [] } },
+      { repo: 'web-everything/web-everything', pr: 3001, spec: { add: 'review-status:awaiting-ci', remove: [] } },
     ]);
   });
 });
@@ -531,7 +531,7 @@ describe('buildCliDaemonEffects.onTick — logs the exact pause line when authPa
     const lines = [];
     const fx = buildCliDaemonEffects({ owner: 'o', log: { error: (l) => lines.push(l) }, reapSessions: () => null, runReview: () => ({}) });
     fx.onTick({
-      repos: [{ repo: 'chalbert/web-everything' }], reviewsOwed: 0, dispatched: [], failed: [],
+      repos: [{ repo: 'web-everything/web-everything' }], reviewsOwed: 0, dispatched: [], failed: [],
       authPaused: true, authPauseReason: 'paused: Claude login expired — run /login',
     });
     expect(lines).toContain('review-daemon: paused: Claude login expired — run /login');
@@ -540,7 +540,7 @@ describe('buildCliDaemonEffects.onTick — logs the exact pause line when authPa
   it('logs nothing extra when not paused', () => {
     const lines = [];
     const fx = buildCliDaemonEffects({ owner: 'o', log: { error: (l) => lines.push(l) }, reapSessions: () => null, runReview: () => ({}) });
-    fx.onTick({ repos: [{ repo: 'chalbert/web-everything' }], reviewsOwed: 0, dispatched: [], failed: [], authPaused: false });
+    fx.onTick({ repos: [{ repo: 'web-everything/web-everything' }], reviewsOwed: 0, dispatched: [], failed: [], authPaused: false });
     expect(lines.some((l) => l.includes('paused: Claude login expired'))).toBe(false);
   });
 });
@@ -550,7 +550,7 @@ describe('runReviewTickAllRepos — #3383 bug 3: deferredForLanes aggregates acr
     const tick = vi.fn()
       .mockReturnValueOnce({ reviewsOwed: 3, dispatched: [], failed: [], refusals: 0, reconcileError: null, deferredForLanes: 2 })
       .mockReturnValueOnce({ reviewsOwed: 1, dispatched: [], failed: [], refusals: 0, reconcileError: null, deferredForLanes: 0 });
-    const out = runReviewTickAllRepos({ repos: ['chalbert/web-everything', 'chalbert/frontierui'], tick });
+    const out = runReviewTickAllRepos({ repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], tick });
     expect(out.deferredForLanes).toBe(2);
   });
 });
@@ -563,8 +563,8 @@ describe('defaultAcquirableLaneCount — wiring only (never a real lane-pool/git
 
 describe('runReviewTick — reconcile itself is isolated (regression, #xvzwiew live-caught 2026-09-23)', () => {
   // Live production evidence (`~/workspace/wev-review-daemon/.conveyor/review-daemon.log`):
-  //   review-daemon: chalbert/frontierui#? failed (non-fatal): spawnSync claude ENOENT
-  //   review-daemon: chalbert/frontierui reconcile failed (non-fatal, other repos unaffected): spawnSync claude ENOENT
+  //   review-daemon: frontier-ui/frontierui#? failed (non-fatal): spawnSync claude ENOENT
+  //   review-daemon: frontier-ui/frontierui reconcile failed (non-fatal, other repos unaffected): spawnSync claude ENOENT
   // Both lines were ONE underlying failure — `reconcile-pass.mjs`'s own `claude agents --json` read throwing —
   // reported twice and misleadingly: the first line reads as if a SPECIFIC PR's review dispatch failed, but no
   // PR was ever identified (reconcile crashed before `dispatch` could even be reached).
@@ -600,10 +600,10 @@ describe('runReviewTick — repo reaches reconcile too (regression, #xvyuwtg liv
   // discovered WE's own PRs. Fixed by passing `{repo}` into `reconcile` too.
   it('reconcile is called with the SAME repo this tick was given, not unconditionally omitted', () => {
     const reconcile = vi.fn(() => ({ dispatch: [], refusals: [] }));
-    runReviewTick({ reconcile, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], repo: 'chalbert/plateau-app' });
+    runReviewTick({ reconcile, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], repo: 'plateauapp/plateau-app' });
     // #4133 — also receives `readPrs`/`readAgents` closures now (the tick's own single reads, reused inside
     // reconcile rather than re-fetched); `objectContaining` keeps this assertion about `repo` specifically.
-    expect(reconcile).toHaveBeenCalledWith(expect.objectContaining({ repo: 'chalbert/plateau-app' }));
+    expect(reconcile).toHaveBeenCalledWith(expect.objectContaining({ repo: 'plateauapp/plateau-app' }));
   });
 });
 
@@ -730,9 +730,9 @@ describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
     const holdReconcile = vi.fn(() => []);
     runReviewTick({
       reconcile: noop, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
-      holdReconcile, repo: 'chalbert/plateau-app',
+      holdReconcile, repo: 'plateauapp/plateau-app',
     });
-    expect(holdReconcile).toHaveBeenCalledWith({ repo: 'chalbert/plateau-app' });
+    expect(holdReconcile).toHaveBeenCalledWith({ repo: 'plateauapp/plateau-app' });
   });
 
   it('folds a real finding onto the tick result under `holdReconcile`', () => {
@@ -777,9 +777,9 @@ describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
 describe('REVIEW_DAEMON_REPOS', () => {
   it('is every constellation repo\'s real slug, not just WE (live-caught 2026-09-22, #xvyuwtg: plateau-app PR #167 sat unwatched)', () => {
     expect(REVIEW_DAEMON_REPOS.sort()).toEqual(Object.values(CONSTELLATION_REPOS).map((r) => r.slug).sort());
-    expect(REVIEW_DAEMON_REPOS).toContain('chalbert/plateau-app');
-    expect(REVIEW_DAEMON_REPOS).toContain('chalbert/frontierui');
-    expect(REVIEW_DAEMON_REPOS).toContain('chalbert/web-everything');
+    expect(REVIEW_DAEMON_REPOS).toContain('plateauapp/plateau-app');
+    expect(REVIEW_DAEMON_REPOS).toContain('frontier-ui/frontierui');
+    expect(REVIEW_DAEMON_REPOS).toContain('web-everything/web-everything');
   });
 });
 
@@ -831,13 +831,13 @@ describe('runReviewTickAllRepos — one runReviewTick call per watched repo', ()
   // `reconcileFailed` bucket — never into `failed` (that would resurrect the exact misleading report this
   // whole fix removes).
   it('a repo whose tick reports reconcileError is folded into reconcileFailed, never into failed', () => {
-    const tick = vi.fn(({ repo }) => (repo === 'chalbert/frontierui'
+    const tick = vi.fn(({ repo }) => (repo === 'frontier-ui/frontierui'
       ? { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, reconcileError: 'spawnSync claude ENOENT' }
       : { reviewsOwed: 1, dispatched: [{ prNumber: 1, agentId: 'a1' }], failed: [], refusals: 0, reconcileError: null }));
-    const out = runReviewTickAllRepos({ repos: ['chalbert/web-everything', 'chalbert/frontierui'], tick });
+    const out = runReviewTickAllRepos({ repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], tick });
     expect(out.failed).toEqual([]); // no bogus `prNumber: null` dispatch failure
-    expect(out.reconcileFailed).toEqual([{ repo: 'chalbert/frontierui', error: 'spawnSync claude ENOENT' }]);
-    expect(out.dispatched).toEqual([{ prNumber: 1, agentId: 'a1', repo: 'chalbert/web-everything' }]);
+    expect(out.reconcileFailed).toEqual([{ repo: 'frontier-ui/frontierui', error: 'spawnSync claude ENOENT' }]);
+    expect(out.dispatched).toEqual([{ prNumber: 1, agentId: 'a1', repo: 'web-everything/web-everything' }]);
     expect(out.reviewsOwed).toBe(1); // the healthy repo's own count is untouched by the other repo's reconcile failure
   });
 
@@ -880,7 +880,7 @@ describe('runReviewTickAllRepos — one runReviewTick call per watched repo', ()
   });
 });
 
-// #xconv1 (chalbert/web-everything#2766/#2767 unblock, epic #3383/#4075) — the mechanical, no-session
+// #xconv1 (web-everything/web-everything#2766/#2767 unblock, epic #3383/#4075) — the mechanical, no-session
 // convert-advisory stage: posts the converted advisory note + runs ONE targeted-check judge seat for a
 // `kind:'convert-advisory'` dispatch entry. A SEPARATE, ADDITIVE async pipeline from `runReviewTick` (see that
 // function's own doc above for why) — every test here injects `convertAdvisory`/`tick`, never the real
@@ -1019,11 +1019,11 @@ describe('buildCliDaemonEffects.tickOnce — folds the convert-advisory stage on
       convertAdvisoryEnabled: true,
       reapSessions: () => null,
       runReview: () => { order.push('review'); return fakeReview(); },
-      runConvertAdvisories: async () => { order.push('convert-advisory'); return { convertAdvisoriesOwed: 1, posted: [{ prNumber: 2766, outcome: 'accept', repo: 'chalbert/web-everything' }], skipped: [], failed: [] }; },
+      runConvertAdvisories: async () => { order.push('convert-advisory'); return { convertAdvisoriesOwed: 1, posted: [{ prNumber: 2766, outcome: 'accept', repo: 'web-everything/web-everything' }], skipped: [], failed: [] }; },
     });
     const result = await effects.tickOnce();
     expect(order).toEqual(['review', 'convert-advisory']);
-    expect(result.convertAdvisory).toEqual({ convertAdvisoriesOwed: 1, posted: [{ prNumber: 2766, outcome: 'accept', repo: 'chalbert/web-everything' }], skipped: [], failed: [] });
+    expect(result.convertAdvisory).toEqual({ convertAdvisoriesOwed: 1, posted: [{ prNumber: 2766, outcome: 'accept', repo: 'web-everything/web-everything' }], skipped: [], failed: [] });
     // The review tick's own fields are still present — folding convertAdvisory on never replaces them.
     expect(result).toHaveProperty('repos');
   });
@@ -1046,17 +1046,17 @@ describe('buildCliDaemonEffects.tickOnce — folds the convert-advisory stage on
     effects.onTick({
       repos: [], reviewsOwed: 0, dispatched: [], failed: [],
       convertAdvisory: {
-        posted: [{ prNumber: 2766, outcome: 'accept', repo: 'chalbert/web-everything' }],
-        skipped: [{ prNumber: 2767, reason: 'already-converted', repo: 'chalbert/web-everything' }],
-        failed: [{ prNumber: 9, error: 'boom', repo: 'chalbert/web-everything' }],
-        reconcileFailed: [{ repo: 'chalbert/frontierui', error: 'ENOENT' }],
+        posted: [{ prNumber: 2766, outcome: 'accept', repo: 'web-everything/web-everything' }],
+        skipped: [{ prNumber: 2767, reason: 'already-converted', repo: 'web-everything/web-everything' }],
+        failed: [{ prNumber: 9, error: 'boom', repo: 'web-everything/web-everything' }],
+        reconcileFailed: [{ repo: 'frontier-ui/frontierui', error: 'ENOENT' }],
       },
     });
     expect(log.error.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining([
-      expect.stringMatching(/chalbert\/web-everything#2766 convert-advisory posted \(targeted check: accept\)/),
-      expect.stringMatching(/chalbert\/web-everything#2767 convert-advisory skipped — already-converted/),
-      expect.stringMatching(/chalbert\/web-everything#9 convert-advisory failed \(non-fatal\): boom/),
-      expect.stringMatching(/chalbert\/frontierui convert-advisory reconcile failed \(non-fatal, other repos unaffected\): ENOENT/),
+      expect.stringMatching(/web-everything\/web-everything#2766 convert-advisory posted \(targeted check: accept\)/),
+      expect.stringMatching(/web-everything\/web-everything#2767 convert-advisory skipped — already-converted/),
+      expect.stringMatching(/web-everything\/web-everything#9 convert-advisory failed \(non-fatal\): boom/),
+      expect.stringMatching(/frontier-ui\/frontierui convert-advisory reconcile failed \(non-fatal, other repos unaffected\): ENOENT/),
     ]));
 
     log.error.mockClear();
@@ -1159,12 +1159,12 @@ describe('buildCliDaemonEffects.tickOnce — now also runs a session-reap pass e
 
 describe('priorityNamesForLiveProcessPrs — #3383 follow-up: which session names a budget-bounded reap should clear first', () => {
   it('mints every role\'s session name (review/fix/ci-heal) for each live-process-blocked PR', () => {
-    const names = priorityNamesForLiveProcessPrs([{ repo: 'chalbert/web-everything', prNumber: 2771 }]);
+    const names = priorityNamesForLiveProcessPrs([{ repo: 'web-everything/web-everything', prNumber: 2771 }]);
     expect(names).toEqual(new Set(['review-2771', 'fix-2771', 'ci-heal-2771']));
   });
 
   it('tags a non-WE repo\'s session names correctly (never bare numbers for a sibling repo)', () => {
-    const names = priorityNamesForLiveProcessPrs([{ repo: 'chalbert/plateau-app', prNumber: 55 }]);
+    const names = priorityNamesForLiveProcessPrs([{ repo: 'plateauapp/plateau-app', prNumber: 55 }]);
     expect(names).toEqual(new Set(['review-pa-55', 'fix-pa-55', 'ci-heal-pa-55']));
   });
 
@@ -1200,10 +1200,10 @@ describe('runReviewTickAllRepos — liveProcessPrs (#3383 follow-up): aggregated
   it('tags each entry with the repo it came from', () => {
     const tick = vi.fn(({ repo }) => ({
       reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, reconcileError: null,
-      liveProcessPrs: repo === 'chalbert/web-everything' ? [10] : [],
+      liveProcessPrs: repo === 'web-everything/web-everything' ? [10] : [],
     }));
-    const out = runReviewTickAllRepos({ repos: ['chalbert/web-everything', 'chalbert/plateau-app'], tick });
-    expect(out.liveProcessPrs).toEqual([{ repo: 'chalbert/web-everything', prNumber: 10 }]);
+    const out = runReviewTickAllRepos({ repos: ['web-everything/web-everything', 'plateauapp/plateau-app'], tick });
+    expect(out.liveProcessPrs).toEqual([{ repo: 'web-everything/web-everything', prNumber: 10 }]);
   });
 });
 
@@ -1213,7 +1213,7 @@ describe('buildCliDaemonEffects.tickOnce — carries liveProcessPrs into the NEX
     const runReview = () => {
       call += 1;
       return call === 1
-        ? { repos: [], reviewsOwed: 0, dispatched: [], failed: [], liveProcessPrs: [{ repo: 'chalbert/web-everything', prNumber: 2771 }] }
+        ? { repos: [], reviewsOwed: 0, dispatched: [], failed: [], liveProcessPrs: [{ repo: 'web-everything/web-everything', prNumber: 2771 }] }
         : { repos: [], reviewsOwed: 0, dispatched: [], failed: [], liveProcessPrs: [] };
     };
     const reapSessions = vi.fn(() => ({ scanned: 0, stopped: 0, alreadyGone: 0, failures: 0, anomalies: 0, kept: 0 }));
@@ -1231,9 +1231,9 @@ describe('buildCliDaemonEffects.onTick — logs the review-hold reconcile sweep\
     const effects = buildCliDaemonEffects({ owner: 'x', log });
     effects.onTick({
       repos: [], reviewsOwed: 0, dispatched: [], failed: [],
-      holdReconcile: [{ num: 2549, remove: ['review:pending'], repo: 'chalbert/web-everything' }],
+      holdReconcile: [{ num: 2549, remove: ['review:pending'], repo: 'web-everything/web-everything' }],
     });
-    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/chalbert\/web-everything#2549 hold-reconcile removed review:pending/));
+    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/web-everything\/web-everything#2549 hold-reconcile removed review:pending/));
   });
 
   it('logs a non-fatal holdReconcile failure per repo', () => {
@@ -1241,9 +1241,9 @@ describe('buildCliDaemonEffects.onTick — logs the review-hold reconcile sweep\
     const effects = buildCliDaemonEffects({ owner: 'x', log });
     effects.onTick({
       repos: [], reviewsOwed: 0, dispatched: [], failed: [],
-      holdReconcileFailed: [{ repo: 'chalbert/frontierui', error: 'gh: rate limited' }],
+      holdReconcileFailed: [{ repo: 'frontier-ui/frontierui', error: 'gh: rate limited' }],
     });
-    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/chalbert\/frontierui hold-reconcile failed \(non-fatal, other repos unaffected\): gh: rate limited/));
+    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/frontier-ui\/frontierui hold-reconcile failed \(non-fatal, other repos unaffected\): gh: rate limited/));
   });
 
   it('logs nothing extra when both are absent/empty', () => {
@@ -1263,9 +1263,9 @@ describe('buildCliDaemonEffects.onTick — logs the review-hold reconcile sweep\
     const effects = buildCliDaemonEffects({ owner: 'x', log });
     expect(() => effects.onTick({
       repos: [], reviewsOwed: 0, dispatched: [], failed: [],
-      holdReconcile: [{ num: 2767, flagged: ['review:accepted', 'review:human'], flagReason: 'fetch-unavailable', fetchError: 'gh: rate limited', repo: 'chalbert/web-everything' }],
+      holdReconcile: [{ num: 2767, flagged: ['review:accepted', 'review:human'], flagReason: 'fetch-unavailable', fetchError: 'gh: rate limited', repo: 'web-everything/web-everything' }],
     })).not.toThrow();
-    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/chalbert\/web-everything#2767 hold-reconcile FLAGGED contradictory review:accepted,review:human — not auto-resolved \(fetch-unavailable, fetch error: gh: rate limited\)/));
+    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/web-everything\/web-everything#2767 hold-reconcile FLAGGED contradictory review:accepted,review:human — not auto-resolved \(fetch-unavailable, fetch error: gh: rate limited\)/));
   });
 
   it('does NOT throw on a healed-only entry (no `remove` key), and logs the heal + comment status', () => {
@@ -1273,9 +1273,9 @@ describe('buildCliDaemonEffects.onTick — logs the review-hold reconcile sweep\
     const effects = buildCliDaemonEffects({ owner: 'x', log });
     expect(() => effects.onTick({
       repos: [], reviewsOwed: 0, dispatched: [], failed: [],
-      holdReconcile: [{ num: 2767, healed: ['review:accepted'], commentPosted: true, repo: 'chalbert/web-everything' }],
+      holdReconcile: [{ num: 2767, healed: ['review:accepted'], commentPosted: true, repo: 'web-everything/web-everything' }],
     })).not.toThrow();
-    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/chalbert\/web-everything#2767 hold-reconcile HEALED — removed review:accepted, comment posted/));
+    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/web-everything\/web-everything#2767 hold-reconcile HEALED — removed review:accepted, comment posted/));
   });
 });
 
@@ -1350,9 +1350,9 @@ describe('review:pending PRs the tick did not dispatch — the daemon prints why
     expect(out.pendingNotDispatched).toEqual([{ prNumber: 2746, labels: ['review:pending'], reasons: ['live-process: live pid'] }]);
     const lines = [];
     const fx = buildCliDaemonEffects({ owner: 'o', log: { error: (l) => lines.push(l) } });
-    fx.onTick({ repos: [{ repo: 'chalbert/web-everything' }], reviewsOwed: 1, dispatched: [], failed: [],
-      pendingNotDispatched: out.pendingNotDispatched.map((p) => ({ ...p, repo: 'chalbert/web-everything' })) });
-    expect(lines).toContain('review-daemon: chalbert/web-everything#2746 review:pending, no review dispatched — live-process: live pid');
+    fx.onTick({ repos: [{ repo: 'web-everything/web-everything' }], reviewsOwed: 1, dispatched: [], failed: [],
+      pendingNotDispatched: out.pendingNotDispatched.map((p) => ({ ...p, repo: 'web-everything/web-everything' })) });
+    expect(lines).toContain('review-daemon: web-everything/web-everything#2746 review:pending, no review dispatched — live-process: live pid');
   });
 
   it('runReviewTickAllRepos aggregates pendingNotDispatched with the repo', () => {
@@ -1388,7 +1388,7 @@ it('x6n7c2p required checks before review — synthetic #3432 four-tick soak spe
     ['b', 'in_progress', null], ['b', 'completed', 'success']];
   const dispatched = [];
   for (const [head, status, conclusion] of sequence) {
-    const out = runReviewTick({ repo: 'chalbert/web-everything',
+    const out = runReviewTick({ repo: 'web-everything/web-everything',
       reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 3432, attempts: 2 }], refusals: [] }),
       readPrs: () => [{ number: 3432, labels: [{ name: 'review:pending' }] }], readAgents: () => [],
       acquirableLanes: () => 1, tagRound, tagStatus: () => {}, statusCandidates: () => [], holdReconcile: () => [],
@@ -1428,7 +1428,7 @@ it.each([false, true])('xux0rs9: a referral pause is announced once (parallel CI
   const plan = { dispatch: [], refusals: [parallel ? { kind: 'owed-ci-rerun', prNumber: 3481, reviewRefusal: refusal } : refusal] };
   try {
     for (let tick = 0; tick < 3; tick++) {
-      runReviewTick({ repo: 'chalbert/web-everything', reconcile: () => plan, dispatch,
+      runReviewTick({ repo: 'web-everything/web-everything', reconcile: () => plan, dispatch,
         readPrs: () => [subject], readAgents: () => [], holdReconcile: () => [],
         tagRound: vi.fn(), tagStatus: vi.fn(),
         notifyReferral: args => notifyReferralHold({ ...args, dir, post, log }),
@@ -1443,7 +1443,7 @@ it.each([false, true])('xux0rs9: a referral pause is announced once (parallel CI
 
 it('xux0rs9: an unreadable notice receipt does not prevent another PR from being reviewed', () => {
   const dispatch = vi.fn(() => ({ agentId: 'new-review' }));
-  const result = runReviewTick({ repo: 'chalbert/web-everything',
+  const result = runReviewTick({ repo: 'web-everything/web-everything',
     reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 3508 }], refusals: [
       { kind: 'review-referrals-pending', prNumber: 3481, referralHold: { episode: 'broken-receipt' } },
     ] }), dispatch, holdReconcile: () => [], tagRound: vi.fn(), tagStatus: vi.fn(),

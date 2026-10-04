@@ -1,7 +1,7 @@
 /**
  * @file scripts/lib/required-status-checks.mjs — @module required-status-checks
  *
- * THE PROBLEM THIS CLOSES (LIVE INCIDENT 2026-09-26, PR #2748, chalbert/web-everything): "CI failed" was
+ * THE PROBLEM THIS CLOSES (LIVE INCIDENT 2026-09-26, PR #2748, web-everything/web-everything): "CI failed" was
  * decided by an EXCLUSION list (`we:scripts/operations/pr-status.mjs#CI_TRUTH_EXCLUDED_CHECKS`) — every check
  * counted as CI truth EXCEPT the ones named on that list. A brand-new advisory workflow (the soak-replay gate,
  * PR #2775) went red on a PR whose every REQUIRED check (`test`/`smoke`/`daemon-soak`) was green, and every
@@ -42,7 +42,7 @@ import { resolvePersonalRouteEnabled, runGhCliPassthrough } from './gh-throttle.
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
 /**
- * The required set as confirmed live on 2026-09-26 (`gh api repos/chalbert/web-everything/branches/main/
+ * The required set as confirmed live on 2026-09-26 (`gh api repos/web-everything/web-everything/branches/main/
  * protection --jq .required_status_checks.contexts`). Used as WE's declared policy on protection 403/404,
  * or as an untrusted fallback for other failures when no cache exists. A successful live fetch always wins,
  * so a real branch-protection change is picked up on the next successful read regardless of this constant.

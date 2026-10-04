@@ -1,6 +1,6 @@
 /**
  * @file breaks/ci-heal-loop-stale-label-review-gate.mjs — live break, 2026-09-26 (#4075/#3383, card 4249
- * follow-up). PR #2748 (chalbert/web-everything) got SIX `ci-heal-2748` sessions in ~30 minutes (15:48–16:18 ET).
+ * follow-up). PR #2748 (web-everything/web-everything) got SIX `ci-heal-2748` sessions in ~30 minutes (15:48–16:18 ET).
  * Its required `test` check was GREEN; the only red check was `review-gate`, which is red BY DESIGN while
  * `review:pending` stands (a hold signal, not a code-health signal). Every session correctly found nothing to
  * heal and stood down — and the next fix-dispatch tick sent another one.

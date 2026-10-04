@@ -68,7 +68,7 @@ function registryFor(readerOptions) {
   return { declaration, registry };
 }
 
-const BASE_INPUT = { item: '9999', repo: 'chalbert/web-everything' };
+const BASE_INPUT = { item: '9999', repo: 'web-everything/web-everything' };
 const CLEAN_ANSWER = {
   confidence: 'High',
   risks: [{ risk: 'premise', addressed: true, note: 'verified against we:scripts/foo.mjs line 42' }],

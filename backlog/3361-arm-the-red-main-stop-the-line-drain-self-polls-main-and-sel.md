@@ -3,6 +3,7 @@ bornAs: xu9c4q4
 kind: story
 size: 5
 status: open
+blockedBy: ["5001"]
 scope: ["we:scripts/readiness/red-main-remediation.mjs"]
 dateOpened: "2026-08-26"
 tags: []
@@ -11,6 +12,8 @@ tags: []
 # Arm the red-main stop-the-line — drain self-polls main and self-freezes, revert-to-green stays drain-owned
 
 DEFERRED BY THE OPERATOR 2026-08-26 — recover manually until it hurts. #2681 built the dispatch-freeze and revert-authority remediation, and `we:scripts/merge-ai-prs.mjs` already refuses to land while the freeze marker is present. But nothing ever writes that marker, so the lever is dormant. Arming it means the drain polls main's CI status at the top of its sweep and freezes itself.
+
+**Un-deferred 2026-10-03 (operator).** Approved ~14:45 ET, verbatim *"Ok for all"*, in answer to the orchestrator's recommendation to re-open this card. Revert must only target a culprit that the blame step identified, so this card is `blockedBy` 5001 (main-red blame and bisection, `bornAs` `5001`).
 
 ## Why the design is already constrained
 

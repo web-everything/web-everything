@@ -429,3 +429,20 @@ it('#4439 appends a launch trial once under concurrent file-store writers', asyn
     expect(readStore(io).records.map(r => r.pr)).toEqual([101, 102]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+it('#3996 validates nullable footprint counts and preserves them on each trial', () => {
+  const io = memIo();
+  for (const field of ['newLoc', 'modifiedLoc', 'newFiles', 'modifiedFiles']) {
+    for (const value of [null, 0, 17]) {
+      const row = { ...baseRow(), [field]: value };
+      expect(validateScorecard(row).ok).toBe(true);
+      appendScorecard(row, io);
+      expect(readStore(io).records.at(-1)[field]).toBe(value);
+    }
+    for (const value of [-1, 1.5, '2', true, {}, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(validateScorecard({ ...baseRow(), [field]: value }).ok).toBe(false);
+    }
+    // the stated bound is a SAFE integer: the largest one is accepted, the next is not
+    expect(validateScorecard({ ...baseRow(), [field]: Number.MAX_SAFE_INTEGER }).ok).toBe(true);
+  }
+});

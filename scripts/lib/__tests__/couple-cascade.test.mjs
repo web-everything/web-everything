@@ -14,8 +14,8 @@ import { repoKeyFromSlug } from '../../readiness/lane-manifest.mjs';
 import { planCoupleCascadeStep, carrierPreflight, openSiblingRefSet, candKey, isImplHalf, isCoupleCarrier } from '../couple-cascade.mjs';
 
 const WE = null;                                   // the local WE clone — runCli's convention (repo=null, key 'cwd')
-const PA = 'chalbert/plateau-app';
-const localSlug = 'chalbert/web-everything';
+const PA = 'plateauapp/plateau-app';
+const localSlug = 'web-everything/web-everything';
 const isLocalRepo = (repo) => repo == null || repo === localSlug;
 const repoKeyOfSlug = (slug) => (isLocalRepo(slug) ? 'we' : repoKeyFromSlug(slug));
 const repoKeyOf = (v) => repoKeyOfSlug(v.repo);

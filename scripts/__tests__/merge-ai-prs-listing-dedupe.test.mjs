@@ -113,9 +113,9 @@ describe('buildLiveListingsByRepo — the reused map MUST carry `rows` (RAW), ne
 
   it('a repo with NO candidates at all (`prs: []`) still hands the context every open PR via `rows`', () => {
     const open = { number: 3, baseRefName: 'main', labels: [] };
-    const listings = [{ repo: 'chalbert/web-everything', prs: [], rows: [open] }];
+    const listings = [{ repo: 'web-everything/web-everything', prs: [], rows: [open] }];
     const map = buildLiveListingsByRepo(listings);
-    expect(map.get('chalbert/web-everything')).toEqual([open]);
+    expect(map.get('web-everything/web-everything')).toEqual([open]);
   });
 });
 

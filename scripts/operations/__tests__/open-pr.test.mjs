@@ -377,7 +377,7 @@ describe('classifySubmit — refused and could-not-run are different facts', () 
 
   it('never reports a POST-OPEN refusal as opened, even though it carries a pr number', () => {
     for (const { want, ...payload } of POST_OPEN_REFUSALS) {
-      const r = classifySubmit({ status: 3, stdout: JSON.stringify({ repo: 'chalbert/web-everything', merged: false, ...payload }) });
+      const r = classifySubmit({ status: 3, stdout: JSON.stringify({ repo: 'web-everything/web-everything', merged: false, ...payload }) });
       expect({ reason: payload.reason, outcome: r.outcome }).toEqual({ reason: payload.reason, outcome: want });
       // …and the PR number still reaches the caller, who needs it to go look at what was opened-then-refused.
       expect(r.pr).toBe(1501);

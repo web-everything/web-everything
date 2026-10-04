@@ -368,27 +368,27 @@ describe('openPrItemNums (multi-repo)', () => {
   it('reads every constellation repo with an explicit --repo and unions the item numbers', () => {
     const calls = [];
     const byRepo = {
-      'chalbert/web-everything': [{ headRefName: 'lane/2100-spec', title: '' }],
-      'chalbert/frontierui': [],
-      'chalbert/plateau-app': [{ headRefName: 'lane/2072-impl', title: '' }],
+      'web-everything/web-everything': [{ headRefName: 'lane/2100-spec', title: '' }],
+      'frontier-ui/frontierui': [],
+      'plateauapp/plateau-app': [{ headRefName: 'lane/2072-impl', title: '' }],
     };
     const run = (args) => { calls.push(args); return { status: 0, stdout: JSON.stringify(byRepo[args[args.indexOf('--repo') + 1]]) }; };
     const r = openPrItemNums({ run });
-    expect(calls.map((a) => a[a.indexOf('--repo') + 1])).toEqual(['chalbert/web-everything', 'chalbert/frontierui', 'chalbert/plateau-app']);
+    expect(calls.map((a) => a[a.indexOf('--repo') + 1])).toEqual(['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app']);
     expect(new Set(r.nums)).toEqual(new Set(['2100', '2072']));
     expect(r.partial).toBeUndefined();
   });
   it('a failing SIBLING repo keeps the other numbers and is reported under partial', () => {
-    const run = (args) => (args.includes('chalbert/plateau-app')
+    const run = (args) => (args.includes('plateauapp/plateau-app')
       ? { status: 1, stdout: '', stderr: 'HTTP 404\n' }
       : { status: 0, stdout: JSON.stringify([{ headRefName: 'lane/2100-x', title: '' }]) });
     const r = openPrItemNums({ run });
     expect(r.nums).toEqual(['2100']);
-    expect(r.partial).toEqual([{ repo: 'chalbert/plateau-app', reason: 'HTTP 404' }]);
+    expect(r.partial).toEqual([{ repo: 'plateauapp/plateau-app', reason: 'HTTP 404' }]);
     expect(r.unavailable).toBeUndefined();
   });
   it('the WE read failing is unavailable, as before', () => {
-    const run = (args) => (args.includes('chalbert/web-everything') ? { status: 1, stdout: '', stderr: 'boom' } : { status: 0, stdout: '[]' });
+    const run = (args) => (args.includes('web-everything/web-everything') ? { status: 1, stdout: '', stderr: 'boom' } : { status: 0, stdout: '[]' });
     expect(openPrItemNums({ run })).toEqual({ nums: [], unavailable: true, reason: 'boom' });
   });
 });

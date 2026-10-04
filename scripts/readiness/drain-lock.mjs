@@ -56,6 +56,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 import {
   reserve, readLockEntry, releaseLockDir, heartbeat, isLeaseExpired, DEFAULT_LEASE_MINUTES,
 } from './file-locks.mjs';
@@ -118,7 +119,7 @@ export function localRepoSlug({ cwd = process.cwd(), exec = execFileSync } = {})
   try {
     const url = exec('git', ['remote', 'get-url', 'origin'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     const m = url.match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?$/);
-    return m ? m[1] : null;
+    return m ? canonicalizeSlug(m[1]) : null;
   } catch { return null; }
 }
 

@@ -12,7 +12,7 @@
  *   inflates that PR's round count toward `cap-exhausted`, silently swallowing a real fixer's remaining rounds.
  *
  * THE SIGNAL: `author.login`, NOT a comment-body substring. `gh pr list/view --json comments` (the shape every
- * caller in this repo actually reads — confirmed live, `chalbert/web-everything#2578`/`#2602`/`#2607`,
+ * caller in this repo actually reads — confirmed live, `web-everything/web-everything#2578`/`#2602`/`#2607`,
  * 2026-09-24) returns each comment's poster as `author.login`, a field GitHub itself assigns from the real
  * authenticated identity that posted the comment. A comment BODY can say anything a commenter likes; `author.login`
  * cannot be forged by writing a comment. `viewerDidAuthor` (GitHub's "did the CURRENT read's credential post
@@ -61,7 +61,7 @@
  * automation posts comments under. Overridable via `WE_AUTOMATION_LOGINS` (comma-separated) for a
  * differently-named install; the default covers both shapes actually observed live in this repo — the plain
  * GraphQL-backed `gh pr list/view --json comments` shape (`web-everything`, confirmed on
- * `chalbert/web-everything#2578`/`#2602`/`#2607`) and the REST App-bot shape some `gh` paths/installs surface
+ * `web-everything/web-everything#2578`/`#2602`/`#2607`) and the REST App-bot shape some `gh` paths/installs surface
  * (`web-everything[bot]`) — so a caller reading either shape resolves the same way. Compared case-insensitively.
  * @returns {string[]}
  */

@@ -2,7 +2,7 @@
 /**
  * @file scripts/conveyor/main-red-recovery.mjs
  * @description we:backlog/x5uqim1-*.md (parent #4075, epic #3383) — LIVE INCIDENT 2026-09-25: five
- *   `ready-to-merge` + `review:accepted` PRs (chalbert/web-everything#2596/#2622/#2629/#2631/#2634, plus #2635)
+ *   `ready-to-merge` + `review:accepted` PRs (web-everything/web-everything#2596/#2622/#2629/#2631/#2634, plus #2635)
  *   sat for hours because their required `test` check failed while `origin/main`'s OWN CI was red (`main` was
  *   fixed by PR #2638 at 2026-09-25T02:23:27Z). Nobody refreshed their branches once `main` recovered, and
  *   `we:scripts/conveyor/ci-heal-pr-dispatch.mjs` would have dispatched a CI-heal agent to "repair" code that
@@ -878,7 +878,7 @@ export function planHungCiRecoveries({
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 // MISSING-CI-RUN RECOVERY — we:backlog/xi4od2p-*.md (parent #4075, epic #3383). LIVE INCIDENT 2026-09-26: PR
-// chalbert/web-everything#2729 (#4166) sat `review:accepted` + `MERGEABLE` but `BLOCKED`, labelled `checking`,
+// web-everything/web-everything#2729 (#4166) sat `review:accepted` + `MERGEABLE` but `BLOCKED`, labelled `checking`,
 // because its head 19889a0e never got a `test`/`smoke`/`daemon-soak` run queued AT ALL — not failed, not hung,
 // simply never created (only 3x `review-gate`, unrelated). Confirmed root cause: #2729 was opened stacked on
 // #2722's branch; when #2722 merged (2026-09-26 15:13:48Z), GitHub fired a `base_ref_changed` timeline event on
@@ -939,7 +939,7 @@ export const MISSING_RUN_COMMENT_MARKER = '🚦 conveyor missing-run-recovery';
  * (`workflowName`) — a PR that reported ANY CI-workflow check is never flagged.
  *
  * A REAL MERGE CONFLICT (`mergeable === 'CONFLICTING'`) IS NEVER A CANDIDATE HERE, whatever its rollup shows —
- * live incident, chalbert/web-everything#2793 (landing freeze, 2026-09-27): GitHub creates no merge ref for a
+ * live incident, web-everything/web-everything#2793 (landing freeze, 2026-09-27): GitHub creates no merge ref for a
  * conflicting PR, so a `pull_request`-triggered required check can never start, let alone report — the rollup
  * reads as "missing" FOREVER, not "hasn't happened yet". Before this exclusion, this pass kept re-triggering CI
  * on #2793 every sweep, burning {@link DEFAULT_MAX_MISSING_RUN_RETRIES_PER_SHA} attempts on a check that could

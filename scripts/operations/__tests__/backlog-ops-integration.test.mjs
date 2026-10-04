@@ -175,7 +175,7 @@ describe('resolve — the scope reconciliation\'s git reads, for real (#2803)', 
 
   /**
    * ★ THE SILENT-INERTNESS BUG, as a live check. `observedFilesForResolve` reads the origin URL, strips
-   * `.git`, and turns `chalbert/web-everything` into the repo key `we` — which is what makes the observed
+   * `.git`, and turns `web-everything/web-everything` into the repo key `we` — which is what makes the observed
    * paths comparable to a card's `we:`-qualified `scope:` list.
    *
    * Remove `(?:\.git)?$` from the slug regex and the key becomes `web-everything.git`, every observed path is

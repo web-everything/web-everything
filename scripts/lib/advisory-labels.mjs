@@ -26,7 +26,7 @@ export const ADVISORY_LABELS = Object.freeze({
   CHANGES: 'advisory:changes',
 });
 
-/** `gh label create` metadata — matches the labels created by hand in chalbert/web-everything and chalbert/frontierui. */
+/** `gh label create` metadata — matches the labels created by hand in web-everything/web-everything and frontier-ui/frontierui. */
 export const ADVISORY_LABEL_META = Object.freeze({
   [ADVISORY_LABELS.ACCEPTED]: Object.freeze({
     color: '0e8a16',

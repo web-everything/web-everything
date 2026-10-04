@@ -5960,6 +5960,59 @@ contexts is an operator-run `setup` step, never an agent action. It does not clo
 and `we:reports/2026-09-21-backlog-id-assignment-prior-art.md`. Full reasoning and the rejected options:
 [#3732](/backlog/3732-decision-where-backlog-ids-are-assigned-so-a-temporary-hash/).
 
+### A delivery-strategy decider picks only for fields set to auto; fixed settings and invariants always win; it starts in shadow mode {#delivery-decider-under-fixed-settings}
+
+**Ratified 2026-10-03 by the operator (Nicolas Gilbert), in conversation, Fork 1 (a) at the card's default, with
+the shadow-mode ruling below (`#4998`, `bornAs` `4998`).** The operator's words: *"Ok for all"*, in answer to
+the orchestrator's recommendation. Context: the same day the operator made several delivery strategies
+configurable settings (verify mode, overlap strategy, the main-protection policy keys, backlog ids numbered
+before publish). This rule says how a decider picks between strategies at run time without taking authority from
+those settings.
+
+**The rule:**
+1. **Precedence per strategy field, highest first.**
+   1. **Invariants.** They take no `auto` and nothing below relaxes them: CI parity with main (`prCi.*`), backlog
+      ids numbered before publish, the statute/gate `review:human` class, never merging a red candidate, the sole
+      main writer.
+   2. **Per-item operator override** (a label or card field). It never relaxes an invariant.
+   3. **Fixed value.** Any value other than `auto` is final; the decider is not called.
+   4. **Decider.** Only for a field set to `auto`, inside the sibling bound fields (`stackMaxDepth`,
+      `reservedForRepairs`).
+   5. **Platform default** (`we:config/platformDefaults.ts`) when a signal is unknown.
+2. **Safety-class fields are tighten-only.** `mergeGate.onMainRed` and `mergeGate.recheckWhenMainMoved` take
+   `auto` only so the decider may pick a value at least as strict as the platform default, never looser.
+   `dispatchGate.overlapOverride` takes no `auto`.
+3. **Shadow mode first (the operator's ruling on the fork).** A field set to `auto` starts in shadow: the
+   decider only logs what it would pick, with its reasons, next to the value actually applied (the platform
+   default). It acts only after the operator has reviewed about a week of those logs and explicitly promotes the
+   field. Promotion is itself a configurable setting per field, and its default is shadow. `auto` is never the
+   platform default in v1.
+4. **Supported by default, not forks.**
+   - The decider is a deterministic rule table, not a learned policy
+     ([deterministic-core-thin-judgment](#deterministic-core-thin-judgment) clause 1).
+   - It is a library each daemon calls at action time with a fresh snapshot, not a central daemon publishing
+     stale decisions ([event-driven-land-is-wake-only](#event-driven-land-is-wake-only) clause 1).
+   - v1 covers only decision points with a live mechanism. Speculation depth and batch size ship only with the
+     batched-queue build that `event-driven-land-is-wake-only` clause 3 defers; the decider never starts it early.
+   - An impossible pin is reported as `blocked: fixed-policy-conflict`, never substituted, and journaled.
+   - Every decision is journaled through `recordPolicyEvent` with its point, subject, choice, source
+     (`invariant|override|setting|decider|default`), rule id, signals and alternatives.
+   - Decider-governed values are read only from tracked, committed settings: one home for the delivery policy
+     and the overlap-yield settings.
+
+**Composition.** Setting shape follows [config-extends-platform-default](#config-extends-platform-default) (its
+"most-permissive default" clause is not cited; it runs the wrong way for safety knobs).
+[gate-on-merged-tree-lane-fast-fail](#gate-on-merged-tree-lane-fast-fail) is unchanged and is enforced through the
+merge re-check, not by the decider. The heavy-slot cap stays with
+[heavy-command-admission-queue](#heavy-command-admission-queue); the decider only orders priority.
+
+**What this ruling does not do.** It builds nothing. Build stories: the `auto` value and promotion setting in the
+delivery-policy loader (`5008`) and the decider core with shadow mode (`5009`).
+
+**Lineage:** ratified via `#4998` (prepared 2026-10-03), grounded in `/research/delivery-strategy-decider/` and
+`we:reports/2026-10-03-delivery-strategy-survey-and-decider.md`. Full reasoning and the rejected options:
+[#4998](/backlog/4998-decision-a-delivery-strategy-decider-picks-per-decision-poin/).
+
 ---
 
 ## Standing process & method rules (codified in the topical docs — pointers)
@@ -6001,3 +6054,16 @@ Review sessions always receive an explicit model: Sonnet by default, Opus for hi
 care/escalation or statute-tier paths. The review daemon forwards the PR snapshot's
 escalation reasons and touched paths to the session launcher; CLI defaults never
 choose the session's tier. The existing review care classifier interprets reasons.
+
+### When the cross-provider review seat cannot sit, wait then park; the stand-in is a configurable dimension {#cross-provider-seat-fallback}
+
+Operator ruling, 2026-10-03 (decision 4772): "Ok to wait, make it a configurable dimension". The
+fallback when the Codex cross-provider review seat is unavailable is the `crossProviderFallback`
+[config dimension](#config-extends-platform-default): `park-now` | `wait-then-park` (platform default) |
+`same-provider-other-model`, plus a `waitTimeoutMs` parameter. The default waits for the provider seat for a
+bounded time, then parks the PR for a human. `same-provider-other-model` is an explicit opt-in and is never
+the default. The judge seat follows the same rule (decision xud2hha: Claude-authored PRs get a Codex judge,
+Codex-authored PRs get an Opus judge, same fallback dimension). Declared in `we:config/defineConfig.ts` and
+`we:config/platformDefaults.ts`; the daemon that consumes it is card 4880.
+
+**Lineage:** 4772 (ruled 2026-10-03). Instance of [config-extends-platform-default](#config-extends-platform-default).

@@ -35,7 +35,7 @@ import { preventionCardTitle } from '../operations/machine-pr-title.mjs';
  * human-only ceremony (`--to=clear-human`) is exactly what `#3434` confirmed should stay in place.
  *
  * #3442's SECOND RULING (below) IS NOW REVERSED AND REPLACED (2026-09-26, live incident
- * chalbert/web-everything#2749). That ruling had this policy answer `accept` unattended for a
+ * web-everything/web-everything#2749). That ruling had this policy answer `accept` unattended for a
  * `prevention-outstanding` verdict, on the theory that every actual finding was already resolved and only a
  * documentation debt remained. Live evidence says that reasoning does not hold: PR #2749 (and others merged the
  * same day) reduced to `prevention-outstanding` with BOTH mandatory lenses (correctness, security) reporting
@@ -120,7 +120,7 @@ const UNATTENDED_ANSWER = CONFIRM_OPTIONS.includes('changes') ? 'changes' : (() 
  *      `#1765`) both queued for no reason other than this line.
  *
  *   3. `run.verdict.verdict === VERDICTS.PREVENTION_OUTSTANDING` → DECLINE (`#3442`'s auto-accept REVERSED,
- *      2026-09-26, live incident chalbert/web-everything#2749 — see the file header for the full account). This
+ *      2026-09-26, live incident web-everything/web-everything#2749 — see the file header for the full account). This
  *      function stays PURE, so it cannot itself file the owed guard(s) — that is impure I/O, and filing it is
  *      NOT a decision for a human either (see the file header's 2026-09-26 scope ruling). The DECLINE here is
  *      momentary: `review-loop-cli.mjs` reads it via {@link isPreventionOutstandingParked}, mechanically files

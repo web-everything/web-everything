@@ -22,7 +22,7 @@ describe('GH_ARGV is byte-identical to the pre-port inline calls', () => {
     // `state` (#2953), `createdAt` (#3067), `comments` (#x9krtkb). This assertion is what makes each addition
     // deliberate: it fails on any change, so a field cannot appear here without someone deciding it should.
     expect(GH_ARGV.readPrState('o/n', 7)).toEqual([
-      'pr', 'view', '7', '--repo', 'o/n', '--json', 'labels,headRefOid,headRefName,state,body,createdAt,title,comments',
+      'pr', 'view', '7', '--repo', 'o/n', '--json', 'labels,headRefOid,headRefName,state,body,createdAt,title,comments,isDraft',
     ]);
   });
 
@@ -55,7 +55,7 @@ describe('GH_ARGV is byte-identical to the pre-port inline calls', () => {
   });
 
   it('names the state fields once, so a stub cannot drift from the real read', () => {
-    expect(PR_STATE_FIELDS).toEqual(['labels', 'headRefOid', 'headRefName', 'state', 'body', 'createdAt', 'title', 'comments']);
+    expect(PR_STATE_FIELDS).toEqual(['labels', 'headRefOid', 'headRefName', 'state', 'body', 'createdAt', 'title', 'comments', 'isDraft']);
   });
 
   it('creates a label with --force — create-or-update, never an error on one that already exists', () => {
@@ -108,8 +108,8 @@ describe('the gh adapter', () => {
   });
 
   it('trims the repo slug it derives for a caller that omitted --repo', () => {
-    const p = createGhProvider({ exec: () => 'chalbert/web-everything\n' });
-    expect(p.currentRepo()).toBe('chalbert/web-everything');
+    const p = createGhProvider({ exec: () => 'web-everything/web-everything\n' });
+    expect(p.currentRepo()).toBe('web-everything/web-everything');
   });
 
   it('ensureLabel shells the exact argv GH_ARGV builds', () => {

@@ -249,7 +249,7 @@ describe('planCiLifecycleLabelUpdate (#2421 — the label add/remove plan enforc
 // later merges `origin/main` into itself (a routine rebase-refresh, e.g. "Merge remote-tracking branch
 // 'origin/main' into lane/x") inherits every one of those already-landed merge commits into ITS OWN open
 // PR's `commits` list, because the PR's recorded `baseRefOid` predates them. Confirmed live against PR #2685
-// (chalbert/web-everything): its commit list carries a "Merge pull request #2688 from
+// (web-everything/web-everything): its commit list carries a "Merge pull request #2688 from
 // chalbert/lane/4091-resolve-item" commit whose sole author is `web-everything[bot]` and whose body is the
 // merged PR's own title (never empty) — so it fails BOTH the old mechanical-merge test (headline pattern,
 // AND the empty-body requirement) while being authored by neither a human contributor nor Claude. Before this
@@ -297,7 +297,7 @@ describe('#3729 — a GitHub-native "Merge pull request #NNN from …" commit mu
 // (`certifyLabel || aiGenerated || humanCleared`) so an ALREADY `ready-to-merge`/`review:accepted` PR still
 // certifies despite the false read.
 //
-// SUPERSEDED IN PART (live-caught 2026-09-26, `chalbert/web-everything#2741`, epic #4075/#3383): the OR-path
+// SUPERSEDED IN PART (live-caught 2026-09-26, `web-everything/web-everything#2741`, epic #4075/#3383): the OR-path
 // only ever helps a PR that has ALREADY reached `ready-to-merge` or `review:accepted` — it does nothing for a
 // PR still in EARLY negotiation (`review:pending`/first round, no label yet) that inherits the identical drain
 // bookkeeping shape. Worse, `labelOnGreenVerdict` gates the auto-`ready-to-merge` stamp on the SAME
@@ -385,9 +385,9 @@ describe('spawnReviewSetLabel (#1671 review finding — repoFlag() is the WRONG 
 
   it('emits the SINGLE-token --repo= form review-set-label.mjs actually parses, never repoFlag()\'s two-token gh form', () => {
     const { calls, spawn } = spy();
-    const out = spawnReviewSetLabel({ pr: 1671, repo: 'chalbert/web-everything', to: 'accepted', spawn });
+    const out = spawnReviewSetLabel({ pr: 1671, repo: 'web-everything/web-everything', to: 'accepted', spawn });
     expect(out).toEqual({ ok: true });
-    expect(calls[0].argv).toContain('--repo=chalbert/web-everything');
+    expect(calls[0].argv).toContain('--repo=web-everything/web-everything');
     expect(calls[0].argv).not.toContain('--repo'); // the gh-CLI two-token form — never emitted here
   });
 
@@ -399,30 +399,30 @@ describe('spawnReviewSetLabel (#1671 review finding — repoFlag() is the WRONG 
 
   it('inherits the caller\'s cwd (undefined) for a local-repo PR', () => {
     const { calls, spawn } = spy();
-    spawnReviewSetLabel({ pr: 9, repo: 'chalbert/web-everything', to: 'accepted', spawn });
+    spawnReviewSetLabel({ pr: 9, repo: 'web-everything/web-everything', to: 'accepted', spawn });
     expect(calls[0].opts.cwd).toBeUndefined();
   });
 
   it('a non-zero exit reports ok:false with a reason, never throws — the #1671 bug\'s failure was silent, this one is not', () => {
     const { spawn } = spy(2);
-    expect(() => spawnReviewSetLabel({ pr: 1671, repo: 'chalbert/web-everything', to: 'accepted', spawn })).not.toThrow();
-    const out = spawnReviewSetLabel({ pr: 1671, repo: 'chalbert/web-everything', to: 'accepted', spawn: () => ({ status: 2, stdout: '{"error":"invalid --repo"}', stderr: '' }) });
+    expect(() => spawnReviewSetLabel({ pr: 1671, repo: 'web-everything/web-everything', to: 'accepted', spawn })).not.toThrow();
+    const out = spawnReviewSetLabel({ pr: 1671, repo: 'web-everything/web-everything', to: 'accepted', spawn: () => ({ status: 2, stdout: '{"error":"invalid --repo"}', stderr: '' }) });
     expect(out.ok).toBe(false);
     expect(out.reason).toMatch(/invalid --repo/);
   });
 
   it('a thrown spawn (e.g. ENOENT) is caught, never propagates', () => {
     const spawn = () => { throw new Error('spawn ENOENT'); };
-    expect(() => spawnReviewSetLabel({ pr: 1, repo: 'chalbert/web-everything', to: 'accepted', spawn })).not.toThrow();
-    expect(spawnReviewSetLabel({ pr: 1, repo: 'chalbert/web-everything', to: 'accepted', spawn }).ok).toBe(false);
+    expect(() => spawnReviewSetLabel({ pr: 1, repo: 'web-everything/web-everything', to: 'accepted', spawn })).not.toThrow();
+    expect(spawnReviewSetLabel({ pr: 1, repo: 'web-everything/web-everything', to: 'accepted', spawn }).ok).toBe(false);
   });
 
   it('passes through optional --actor/--channel/--reason only when supplied', () => {
     const { calls, spawn } = spy();
-    spawnReviewSetLabel({ pr: 1, repo: 'chalbert/web-everything', to: 'accepted', spawn });
+    spawnReviewSetLabel({ pr: 1, repo: 'web-everything/web-everything', to: 'accepted', spawn });
     expect(calls[0].argv.some((a) => a.startsWith('--actor='))).toBe(false);
     calls.length = 0;
-    spawnReviewSetLabel({ pr: 1, repo: 'chalbert/web-everything', to: 'clear-human', actor: 'nic', reason: 'operator said so', spawn });
+    spawnReviewSetLabel({ pr: 1, repo: 'web-everything/web-everything', to: 'clear-human', actor: 'nic', reason: 'operator said so', spawn });
     expect(calls[0].argv).toContain('--actor=nic');
     expect(calls[0].argv).toContain('--reason=operator said so');
   });
@@ -582,11 +582,11 @@ describe('#2684 — isStackedWeCoupleHalf (which manifest PRs get the couple re-
 
 describe('resolveRepos (#2257/#2287 — the single /drain lander sweeps all 3 constellation repos BY DEFAULT)', () => {
   it('neither flag (+ self) → the constellation IS the default (#2287), SELF FIRST', () => {
-    expect(resolveRepos({ self: 'chalbert/web-everything' }))
-      .toEqual(['chalbert/web-everything', 'chalbert/frontierui', 'chalbert/plateau-app']);
+    expect(resolveRepos({ self: 'web-everything/web-everything' }))
+      .toEqual(['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app']);
   });
   it('--this-repo → single-repo [null] (deliberately scoped; the cwd repo, no --repo)', () => {
-    expect(resolveRepos({ singleRepo: true, self: 'chalbert/web-everything' })).toEqual([null]);
+    expect(resolveRepos({ singleRepo: true, self: 'web-everything/web-everything' })).toEqual([null]);
   });
   it('default derives the owner from self and dedupes (self is not listed twice)', () => {
     const r = resolveRepos({ self: 'acme/frontierui' });
@@ -600,17 +600,17 @@ describe('resolveRepos (#2257/#2287 — the single /drain lander sweeps all 3 co
     expect(resolveRepos({ self: 'noslug' })).toEqual([null]);
   });
   it('--repos=a,b → exactly those slugs (explicit override, trims + drops blanks)', () => {
-    expect(resolveRepos({ repos: 'chalbert/frontierui, chalbert/plateau-app' }))
-      .toEqual(['chalbert/frontierui', 'chalbert/plateau-app']);
-    expect(resolveRepos({ repos: ' , chalbert/frontierui , ' })).toEqual(['chalbert/frontierui']);
+    expect(resolveRepos({ repos: 'frontier-ui/frontierui, plateauapp/plateau-app' }))
+      .toEqual(['frontier-ui/frontierui', 'plateauapp/plateau-app']);
+    expect(resolveRepos({ repos: ' , frontier-ui/frontierui , ' })).toEqual(['frontier-ui/frontierui']);
   });
   it('--repos wins over the default/--this-repo when given', () => {
     expect(resolveRepos({ repos: 'x/y', self: 'a/web-everything' })).toEqual(['x/y']);
     expect(resolveRepos({ repos: 'x/y', singleRepo: true, self: 'a/web-everything' })).toEqual(['x/y']);
   });
   it('`--all-repos` is a harmless no-op alias of the default (unknown key ignored → still constellation)', () => {
-    expect(resolveRepos({ allRepos: true, self: 'chalbert/web-everything' }))
-      .toEqual(['chalbert/web-everything', 'chalbert/frontierui', 'chalbert/plateau-app']);
+    expect(resolveRepos({ allRepos: true, self: 'web-everything/web-everything' }))
+      .toEqual(['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app']);
   });
   it('an empty/whitespace --repos falls back to the single-repo default', () => {
     expect(resolveRepos({ repos: '' })).toEqual([null]);
@@ -620,9 +620,9 @@ describe('resolveRepos (#2257/#2287 — the single /drain lander sweeps all 3 co
 
 describe('siblingCloneName (#2263 — sibling-clone routing for remote-repo rebase-drop)', () => {
   it('a known constellation repo slug → its short directory name', () => {
-    expect(siblingCloneName('chalbert/frontierui')).toBe('frontierui');
-    expect(siblingCloneName('chalbert/plateau-app')).toBe('plateau-app');
-    expect(siblingCloneName('chalbert/web-everything')).toBe('web-everything');
+    expect(siblingCloneName('frontier-ui/frontierui')).toBe('frontierui');
+    expect(siblingCloneName('plateauapp/plateau-app')).toBe('plateau-app');
+    expect(siblingCloneName('web-everything/web-everything')).toBe('web-everything');
   });
   it('a repo outside the known constellation → null (nothing to route to)', () => {
     expect(siblingCloneName('chalbert/some-other-repo')).toBeNull();
@@ -1223,11 +1223,11 @@ describe('drain reason comment (#2313 — stamp park/skip reasons onto the PR, n
   });
 
   it('#2399 remoteManifestApiArgs — GET is explicit, so an -f/--field param never silently switches gh api to POST', () => {
-    const args = remoteManifestApiArgs('chalbert/plateau-app', 'lane/x-2343');
+    const args = remoteManifestApiArgs('plateauapp/plateau-app', 'lane/x-2343');
     // GET must be explicit and precede the endpoint (a POST to the read-only contents endpoint 404s).
     expect(args).toContain('--method');
     expect(args[args.indexOf('--method') + 1]).toBe('GET');
-    expect(args).toContain('repos/chalbert/plateau-app/contents/.lane-manifest.json');
+    expect(args).toContain('repos/plateauapp/plateau-app/contents/.lane-manifest.json');
     expect(args).toEqual(expect.arrayContaining(['-f', 'ref=lane/x-2343']));
   });
 });
@@ -1287,7 +1287,7 @@ describe('landedIdsForCandidate (#3441 — resolve-on-land for a plain single-lo
     expect(landedIdsForCandidate({ hasManifest: false, item: null, repo: null, headRef: 'lane/3412-resolve-fix', title: '' }, { fetchGuardSignals: noSignals, fetchDiff: () => '' })).toEqual([]);
   });
 
-  // Incident 2026-09-26 03:14Z — PR #2785 (`chalbert/web-everything`, branch `lane/2779-session-token-fresh`,
+  // Incident 2026-09-26 03:14Z — PR #2785 (`web-everything/web-everything`, branch `lane/2779-session-token-fresh`,
   // no manifest, no title marker, no body). At land time PR #2779 (the real, unmerged bg-isolation fix) was
   // still open. RED: with no `openPrNums` (the pre-fix call shape — production never actually wired this
   // through before this fix), the bare branch-name lead segment wrongly credited card #2779. GREEN: the fixed
@@ -1439,7 +1439,7 @@ describe('landedIdsForCandidate (#3441 — resolve-on-land for a plain single-lo
   });
 });
 
-// #xg790dh-follow-up (epic #3383/#4075) — LIVE INCIDENT 2026-09-26, PR #2748 (chalbert/web-everything): the
+// #xg790dh-follow-up (epic #3383/#4075) — LIVE INCIDENT 2026-09-26, PR #2748 (web-everything/web-everything): the
 // #3729-residual escape hatch above (certifyLabel OR aiGenerated OR humanCleared) does not help a PR that is
 // mid-review — it carries neither `ready-to-merge` nor `review:accepted` yet (that is the whole point of
 // `review:pending`) — so an uncertified-but-genuinely-AI PR whose branch absorbed a drain bookkeeping commit

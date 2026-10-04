@@ -41,7 +41,7 @@ import {
 } from './lib/verdict-ledger.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 
-const DEFAULT_REPO = 'chalbert/web-everything';
+const DEFAULT_REPO = 'web-everything/web-everything';
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
 
 /**

@@ -15,7 +15,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..', '..');
-const REPO = ['chalbert', 'web-everything'].join('/'); // built, not a literal — a stub slug, not a hardcoded target repo
+const REPO = ['web-everything', 'web-everything'].join('/'); // built, not a literal — a stub slug, not a hardcoded target repo
 const TICKS = 6;
 const CAP = 2;
 

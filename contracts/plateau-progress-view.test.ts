@@ -69,11 +69,11 @@ describe('Plateau progress-view declarative contract', () => {
   it('accepts an explicitly pending human review with system prerequisites', () => {
     const value = snapshot();
     const action = {
-      id: 'review:chalbert/web-everything#123', kind: 'human-review',
-      ref: 'chalbert/web-everything#123', description: 'Review the contract change.',
+      id: 'review:web-everything/web-everything#123', kind: 'human-review',
+      ref: 'web-everything/web-everything#123', description: 'Review the contract change.',
       operatorReason: 'Explicit human review requested.', ready: false,
       blockingSystemPrerequisites: ['clean CI'],
-      url: 'https://github.com/chalbert/web-everything/pull/123', forkRef: null,
+      url: 'https://github.com/web-everything/web-everything/pull/123', forkRef: null,
     };
     const example = { ...value, actions: [action] };
     example.summary.humanPending.value = 1;

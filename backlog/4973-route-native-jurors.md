@@ -1,12 +1,13 @@
 ---
 bornAs: xzaqgfu
 kind: story
-status: open
+status: resolved
 size: 3
 parent: "4936"
 blockedBy: ["4874"]
 scope: ["we:skills-src/jury/panel-fanout.mjs", "we:skills-src/jury/__tests__/panel-fanout.test.mjs", "we:scripts/lib/judge-panel.mjs", "we:scripts/lib/__tests__/judge-panel.test.mjs"]
 dateOpened: "2026-09-30"
+dateResolved: "2026-10-03"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "4a2606bc2f711efd86849e250db36b1b100a0fa4"
 tags: [routing, dispatch, review]
@@ -17,6 +18,12 @@ tags: [routing, dispatch, review]
 When the `/jury` panel fan-out judges a PR diff, its native Claude jurors default to the review-need tier: Haiku for inert prose, Sonnet by default, Opus for critical changes. Today every juror defaults to Sonnet at medium effort. An explicit `model`/`effort` in the payload still wins. Every seat's output records the provider, model, effort and reason it ran with. The jurors stay native Claude: this card changes size, not provider or authority.
 
 ## Progress
+
+**Implementation preflight (2026-10-03).** Blocked in this checkout at `4b3c1073f`: the declared prerequisite #4874 is still open locally, and `we:scripts/lib/review-need.mjs` is absent. Searching the implementation sources found no `reviewNeedFor` definition. The local remote-tracking ref `origin/lane/card-4874` at `de1ca5bc9` contains that module, but bringing its implementation into this checkout would exceed this card's four-file scope; dependency integration is pending. No routing implementation or resolution is claimed.
+
+Before-change baseline: `npx vitest run we:skills-src/jury/__tests__/panel-fanout.test.mjs we:scripts/lib/__tests__/judge-panel.test.mjs` (remove the `we:` path qualifiers when executing) passed both suites, 98 tests. `node we:scripts/verify-lane.mjs` initially exited 3 with `selection-required` because the checkout had no diff. The required tier regression, mutation and live panel proofs remain pending the prerequisite; there is no after-change routing proof yet.
+
+After recording this blocker, `node we:scripts/verify-lane.mjs` passed its card-only selection (no related tests) and `npm run check:standards`: 0 errors, 5286 warnings. This verifies the progress-note edit only, not completion of the implementation.
 
 **Re-aim (2026-10-03).** Old premise: "Mandatory jurors stay native Claude at high care under #4374". The card was to expose native-only model and effort policy and reject provider edits that change authority. #4374 has been re-aimed (it now routes model size by risk on native Claude), so that premise is stale. The goal stays the same: explicit, recorded model and effort for native jurors, with authority unchanged. It now uses the shared review-need tier from 4874. Re-parented from the launch-routing audit epic 4733, whose audit row still points here, to the review-routing epic 4936.
 

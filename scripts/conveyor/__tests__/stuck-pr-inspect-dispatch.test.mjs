@@ -28,13 +28,13 @@ describe('inspectSessionSlug', () => {
 
 describe('planInspectDispatch', () => {
   it('resolves the gh slug and session slug for a valid PR/repo', () => {
-    expect(planInspectDispatch({ pr: '2505', repo: 'chalbert/web-everything' })).toEqual({
-      pr: 2505, repo: 'chalbert/web-everything', repoKey: 'we', sessionSlug: 'inspect-2505',
+    expect(planInspectDispatch({ pr: '2505', repo: 'web-everything/web-everything' })).toEqual({
+      pr: 2505, repo: 'web-everything/web-everything', repoKey: 'we', sessionSlug: 'inspect-2505',
     });
   });
   it('refuses a non-positive-integer PR', () => {
-    expect(() => planInspectDispatch({ pr: 'abc', repo: 'chalbert/web-everything' })).toThrow(/positive integer/);
-    expect(() => planInspectDispatch({ pr: -1, repo: 'chalbert/web-everything' })).toThrow(/positive integer/);
+    expect(() => planInspectDispatch({ pr: 'abc', repo: 'web-everything/web-everything' })).toThrow(/positive integer/);
+    expect(() => planInspectDispatch({ pr: -1, repo: 'web-everything/web-everything' })).toThrow(/positive integer/);
   });
   it('refuses a non-constellation repo', () => {
     expect(() => planInspectDispatch({ pr: 1, repo: 'someone/else' })).toThrow(/is not a constellation repo/);
@@ -43,11 +43,11 @@ describe('planInspectDispatch', () => {
 
 describe('fillInspectBrief', () => {
   const template = 'PR {{PR}} in {{REPO}} as {{SESSION_SLUG}} — stage {{STAGE}}, {{MINUTES_SINCE}}m over {{THRESHOLD_MINUTES}}m.';
-  const values = { PR: 2505, REPO: 'chalbert/web-everything', SESSION_SLUG: 'inspect-2505', STAGE: 'conflict', MINUTES_SINCE: 390, THRESHOLD_MINUTES: 45 };
+  const values = { PR: 2505, REPO: 'web-everything/web-everything', SESSION_SLUG: 'inspect-2505', STAGE: 'conflict', MINUTES_SINCE: 390, THRESHOLD_MINUTES: 45 };
 
   it('substitutes every declared placeholder', () => {
     const { prompt, unknownTokens } = fillInspectBrief(template, values);
-    expect(prompt).toBe('PR 2505 in chalbert/web-everything as inspect-2505 — stage conflict, 390m over 45m.');
+    expect(prompt).toBe('PR 2505 in web-everything/web-everything as inspect-2505 — stage conflict, 390m over 45m.');
     expect(unknownTokens).toEqual([]);
   });
 
@@ -141,7 +141,7 @@ describe('inspectDispatchDisallowedToolsArgs', () => {
     ]) expect(INSPECT_DISPATCH_DISALLOWED_TOOLS).toContain(must);
   });
   it('keeps the brief\'s own timeline read reachable (only the sweep verb of the watch is denied)', () => {
-    const cmd = 'node scripts/conveyor/stuck-pr-watch.mjs timeline --pr=1 --repo=chalbert/web-everything';
+    const cmd = 'node scripts/conveyor/stuck-pr-watch.mjs timeline --pr=1 --repo=web-everything/web-everything';
     const prefixes = INSPECT_DISPATCH_DISALLOWED_TOOLS.map((p) => p.slice('Bash('.length, -':*)'.length));
     expect(prefixes.filter((d) => cmd.startsWith(d))).toEqual([]);
   });
@@ -168,12 +168,12 @@ describe('dispatchInspection — plan → fill → mint → spawn, every IO poin
     const spawnAgent = vi.fn(() => 'backgrounded · abcd1234 · inspect-2505\n');
     const readBrief = () => 'Inspecting {{PR}} on {{REPO}} as {{SESSION_SLUG}} — {{STAGE}}/{{MINUTES_SINCE}}/{{THRESHOLD_MINUTES}}';
     const result = dispatchInspection({
-      pr: 2505, repo: 'chalbert/web-everything', stage: 'conflict', minutesSince: 390.2, thresholdMinutes: 45,
+      pr: 2505, repo: 'web-everything/web-everything', stage: 'conflict', minutesSince: 390.2, thresholdMinutes: 45,
       root: '/repo', readBrief, mintSessionId: () => 'uuid-1', spawnAgent,
     });
     expect(result.agentId).toBe('abcd1234');
     expect(result.sessionSlug).toBe('inspect-2505');
-    expect(result.repo).toBe('chalbert/web-everything');
+    expect(result.repo).toBe('web-everything/web-everything');
     expect(result.prompt).toContain('inspect-2505');
     expect(result.prompt).toContain('conflict/390/45');
 
@@ -193,7 +193,7 @@ describe('dispatchInspection — plan → fill → mint → spawn, every IO poin
     const resolveSettingsEnv = vi.fn(() => ({ PATH: '/shim:/usr/bin' }));
     const spawnAgent = vi.fn(() => 'backgrounded · abcd1234 · inspect-2505\n');
     dispatchInspection({
-      pr: 2505, repo: 'chalbert/web-everything', stage: 'conflict', minutesSince: 390.2, thresholdMinutes: 45,
+      pr: 2505, repo: 'web-everything/web-everything', stage: 'conflict', minutesSince: 390.2, thresholdMinutes: 45,
       root: '/repo', readBrief: () => '{{PR}}{{REPO}}{{SESSION_SLUG}}{{STAGE}}{{MINUTES_SINCE}}{{THRESHOLD_MINUTES}}',
       mintSessionId: () => 'uuid-1', spawnAgent, resolveSettingsEnv,
     });
@@ -206,7 +206,7 @@ describe('dispatchInspection — plan → fill → mint → spawn, every IO poin
 
   it('refuses to run from a lane checkout (assertNotALaneCheckout)', () => {
     expect(() => dispatchInspection({
-      pr: 1, repo: 'chalbert/web-everything', stage: 'fix', minutesSince: 50, thresholdMinutes: 45,
+      pr: 1, repo: 'web-everything/web-everything', stage: 'fix', minutesSince: 50, thresholdMinutes: 45,
       root: '/some/path/.lanes/web-everything/lane-9',
       readBrief: () => '{{PR}}{{REPO}}{{SESSION_SLUG}}{{STAGE}}{{MINUTES_SINCE}}{{THRESHOLD_MINUTES}}',
       spawnAgent: vi.fn(),
@@ -215,7 +215,7 @@ describe('dispatchInspection — plan → fill → mint → spawn, every IO poin
 
   describe('noInspectionStarted — only a failure that PROVES no agent exists (PR #2553 review)', () => {
     const base = {
-      pr: 1, repo: 'chalbert/web-everything', stage: 'fix', minutesSince: 50, thresholdMinutes: 45, root: '/repo',
+      pr: 1, repo: 'web-everything/web-everything', stage: 'fix', minutesSince: 50, thresholdMinutes: 45, root: '/repo',
       readBrief: () => '{{PR}}{{REPO}}{{SESSION_SLUG}}{{STAGE}}{{MINUTES_SINCE}}{{THRESHOLD_MINUTES}}',
       mintSessionId: () => 'uuid-1',
     };

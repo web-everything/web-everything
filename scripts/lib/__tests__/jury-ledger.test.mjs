@@ -459,7 +459,11 @@ describe('#4315 durable referral replay', () => {
         expect(read().referralState.pending).toEqual([]);
         expect(read().referralState.blocked).toHaveLength(result === 'block' ? 1 : 0);
       }
-      expect(foldJuryLedger(readJuryLog('o/r#7', { root }), { head: 'b'.repeat(40) }).referralState.pending).toHaveLength(1);
+      const nextHead = 'b'.repeat(40);
+      expect(foldJuryLedger(readJuryLog('o/r#7', { root }), { head: nextHead }).referralState.pending).toEqual([]);
+      expect(foldJuryLedger([...readJuryLog('o/r#7', { root }), {
+        type: 'mandatory-referrals', round: 0, record: { ...r, head: nextHead, rulings: [] },
+      }], { head: nextHead }).referralState.pending).toEqual([r.referrals[0].key]);
       appendFileSync(juryLogPath('o/r#7', root), '{"type":"mandatory-referrals","record":');
       expect(read().referralState.pending).toContain('malformed-referral-record');
     } finally { rmSync(root, { recursive: true, force: true }); }

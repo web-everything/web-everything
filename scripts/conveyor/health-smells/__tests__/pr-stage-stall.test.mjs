@@ -13,7 +13,7 @@ import { STAND_DOWN_MARKER } from '../../stand-down.mjs';
 import smell, { workingSession, stuckWatchRecord } from '../pr-stage-stall.mjs';
 
 const NOW = Date.parse('2026-09-29T12:00:00Z');
-const REPO = 'chalbert/web-everything';
+const REPO = 'web-everything/web-everything';
 const ago = (m) => new Date(NOW - m * MINUTE).toISOString();
 
 function pr(number, { labels = ['review:pending'], minutes = 90, mergeable = 'MERGEABLE', comments = [], isDraft = false } = {}) {

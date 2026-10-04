@@ -160,7 +160,7 @@ describe('guard-bash denies a raw PR-body rewrite', () => {
   // dashes rather than whitespace, so a raw-string regex missed both.
   for (const cmd of [
     'gh pr edit 1162 --body-file /tmp/body.md',
-    'gh pr edit 1162 --repo chalbert/web-everything --body-file /tmp/b.md',
+    'gh pr edit 1162 --repo web-everything/web-everything --body-file /tmp/b.md',
     'gh pr edit 1162 --body "text"',
     'gh pr edit 1162 --body="text"',
     'gh pr edit 1162 -F /tmp/body.md',

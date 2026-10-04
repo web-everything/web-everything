@@ -20,7 +20,7 @@ import { PR_VIEW_FIELDS, prViewFileName } from '../operations/review-pr-io.mjs';
 const RESPONSE = {
   number: 1542,
   title: 'a real PR',
-  url: 'https://github.com/chalbert/web-everything/pull/1542',
+  url: 'https://github.com/web-everything/web-everything/pull/1542',
   body: 'the authored PR description',
   labels: [{ name: 'review:human' }],
   comments: [{ author: { login: 'chalbert' }, authorAssociation: 'OWNER', body: 'the drain park notice' }],
@@ -51,17 +51,17 @@ describe('the argv is derived, never typed', () => {
   });
 
   it('runs ONE `gh pr view` with the request\'s own repo and pr', () => {
-    expect(viewArgv({ repo: 'chalbert/web-everything', pr: 1542 }))
-      .toEqual(['pr', 'view', '1542', '--repo', 'chalbert/web-everything', '--json', TRANSPORT_VIEW_FIELDS.join(',')]);
+    expect(viewArgv({ repo: 'web-everything/web-everything', pr: 1542 }))
+      .toEqual(['pr', 'view', '1542', '--repo', 'web-everything/web-everything', '--json', TRANSPORT_VIEW_FIELDS.join(',')]);
   });
 });
 
 describe('it publishes what `gh` returned, and nothing it wrote itself', () => {
   it('returns the response verbatim, under the reader\'s own file name', () => {
     const { exec, seen } = gh();
-    const out = producePrView({ request: { repo: 'chalbert/web-everything', pr: 1542 }, exec });
+    const out = producePrView({ request: { repo: 'web-everything/web-everything', pr: 1542 }, exec });
     expect(seen).toHaveLength(1);
-    expect(out.fileName).toBe(prViewFileName('chalbert/web-everything', 1542));
+    expect(out.fileName).toBe(prViewFileName('web-everything/web-everything', 1542));
     // Every field of the response survives untouched — no summary, no normalisation, no invented key.
     for (const [k, v] of Object.entries(RESPONSE)) expect(out.view[k]).toEqual(v);
   });
@@ -78,8 +78,8 @@ describe('it publishes what `gh` returned, and nothing it wrote itself', () => {
   });
 
   it('carries the repo on the view, so the committed file is self-describing', () => {
-    const out = producePrView({ request: { repo: 'chalbert/web-everything', pr: 1542 }, exec: gh().exec });
-    expect(out.view.repo).toBe('chalbert/web-everything');
+    const out = producePrView({ request: { repo: 'web-everything/web-everything', pr: 1542 }, exec: gh().exec });
+    expect(out.view.repo).toBe('web-everything/web-everything');
   });
 
   /**
@@ -109,19 +109,19 @@ describe('refusals, before anything reaches the branch', () => {
    */
   it('refuses a response about a different PR', () => {
     const { exec } = gh(JSON.stringify({ ...RESPONSE, number: 1541 }));
-    expect(() => producePrView({ request: { repo: 'chalbert/web-everything', pr: 1542 }, exec })).toThrow(/#1541/);
+    expect(() => producePrView({ request: { repo: 'web-everything/web-everything', pr: 1542 }, exec })).toThrow(/#1541/);
   });
 
   it('refuses a response with no `number` at all', () => {
     const { number, ...rest } = RESPONSE;
     const { exec } = gh(JSON.stringify(rest));
-    expect(() => producePrView({ request: { repo: 'chalbert/web-everything', pr: 1542 }, exec }))
+    expect(() => producePrView({ request: { repo: 'web-everything/web-everything', pr: 1542 }, exec }))
       .toThrow(/no `number` field at all/);
   });
 
   it('names bytes that are not JSON rather than publishing them', () => {
     const { exec } = gh('gh: HTTP 403');
-    expect(() => producePrView({ request: { repo: 'chalbert/web-everything', pr: 1542 }, exec }))
+    expect(() => producePrView({ request: { repo: 'web-everything/web-everything', pr: 1542 }, exec }))
       .toThrow(/not JSON/);
   });
 

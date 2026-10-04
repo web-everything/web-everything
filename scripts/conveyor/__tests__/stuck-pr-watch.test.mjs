@@ -27,10 +27,10 @@ function stuckFixPr(overrides = {}) {
 describe('defaultListOpenPrs', () => {
   it('asks for every field the pure core needs, in one call', () => {
     const exec = vi.fn(() => '[]');
-    defaultListOpenPrs({ exec, repo: 'chalbert/web-everything' });
+    defaultListOpenPrs({ exec, repo: 'web-everything/web-everything' });
     expect(exec).toHaveBeenCalledWith('gh', [
       'pr', 'list', '--state', 'open', '--limit', '200', '--json', PR_LIST_JSON_FIELDS,
-      '--repo', 'chalbert/web-everything',
+      '--repo', 'web-everything/web-everything',
     ], expect.any(Object));
   });
   it('omits --repo when none is given', () => {
@@ -47,10 +47,10 @@ describe('defaultListTimelineEvents', () => {
       JSON.stringify({ createdAt: 'T2', event: 'commented', body: 'line one\n\tline two' }),
       '',
     ].join('\n'));
-    const events = defaultListTimelineEvents({ number: 42, repo: 'chalbert/web-everything', exec });
+    const events = defaultListTimelineEvents({ number: 42, repo: 'web-everything/web-everything', exec });
     expect(exec.mock.calls[0][0]).toBe('gh');
     const argv = exec.mock.calls[0][1];
-    expect(argv).toContain('repos/chalbert/web-everything/issues/42/timeline');
+    expect(argv).toContain('repos/web-everything/web-everything/issues/42/timeline');
     expect(argv.join(' ')).toContain('labeled');
     expect(argv.join(' ')).toContain('commented');
     expect(argv.join(' ')).toContain('committed');
@@ -65,17 +65,17 @@ describe('defaultListTimelineEvents', () => {
 describe('defaultReadFullTimeline — the inspection agent\'s GET-only replacement for raw `gh api` (PR #2553 review)', () => {
   it('always issues a fixed -X GET against the PR timeline and parses one JSON object per line', () => {
     const exec = vi.fn(() => `${JSON.stringify({ event: 'labeled', createdAt: 'T1', actor: 'a', label: 'review:changes', body: null })}\n`);
-    const events = defaultReadFullTimeline({ number: '42', repo: 'chalbert/web-everything', exec });
+    const events = defaultReadFullTimeline({ number: '42', repo: 'web-everything/web-everything', exec });
     const argv = exec.mock.calls[0][1];
     expect(argv.slice(0, 7)).toEqual(['api', '--paginate', '-X', 'GET', '-F', 'per_page=100',
-      'repos/chalbert/web-everything/issues/42/timeline']);
+      'repos/web-everything/web-everything/issues/42/timeline']);
     expect(argv).not.toContain('-f');
     expect(argv).not.toContain('--input');
     expect(events).toEqual([{ event: 'labeled', createdAt: 'T1', actor: 'a', label: 'review:changes', body: null }]);
   });
   it('refuses a non-integer PR or a non-constellation repo before ever calling gh', () => {
     const exec = vi.fn();
-    expect(() => defaultReadFullTimeline({ number: '42/../../x', repo: 'chalbert/web-everything', exec })).toThrow(/--pr/);
+    expect(() => defaultReadFullTimeline({ number: '42/../../x', repo: 'web-everything/web-everything', exec })).toThrow(/--pr/);
     expect(() => defaultReadFullTimeline({ number: 42, repo: 'evil/repo', exec })).toThrow(/constellation/);
     expect(exec).not.toHaveBeenCalled();
   });
@@ -95,9 +95,9 @@ describe('watchStuckPrs — the whole sweep, every IO point injected', () => {
 
   it('--dry-run NEVER calls the dispatcher or the comment provider (the PROOF requirement)', () => {
     const dispatch = vi.fn();
-    const provider = { postComment: vi.fn(), currentRepo: vi.fn(() => 'chalbert/web-everything') };
+    const provider = { postComment: vi.fn(), currentRepo: vi.fn(() => 'web-everything/web-everything') };
     const result = watchStuckPrs({
-      repo: 'chalbert/web-everything', dryRun: true, now,
+      repo: 'web-everything/web-everything', dryRun: true, now,
       listPrs: () => [stuckFixPr()],
       listTimelineEvents: oldActivity,
       readAgents: () => [], enrich: (a) => a,
@@ -116,9 +116,9 @@ describe('watchStuckPrs — the whole sweep, every IO point injected', () => {
   it('a real sweep dispatches and posts the marker comment for a genuinely stuck PR', () => {
     const dispatch = vi.fn(() => ({ sessionSlug: 'fix-42-inspect', agentId: 'abc123' })); // return shape only — slug not asserted here
     const postComment = vi.fn();
-    const provider = { postComment, currentRepo: vi.fn(() => 'chalbert/web-everything') };
+    const provider = { postComment, currentRepo: vi.fn(() => 'web-everything/web-everything') };
     const result = watchStuckPrs({
-      repo: 'chalbert/web-everything', dryRun: false, now,
+      repo: 'web-everything/web-everything', dryRun: false, now,
       listPrs: () => [stuckFixPr()],
       listTimelineEvents: oldActivity,
       readAgents: () => [], enrich: (a) => a,
@@ -128,7 +128,7 @@ describe('watchStuckPrs — the whole sweep, every IO point injected', () => {
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(postComment).toHaveBeenCalledTimes(1);
     const [repoArg, prArg, body] = postComment.mock.calls[0];
-    expect(repoArg).toBe('chalbert/web-everything');
+    expect(repoArg).toBe('web-everything/web-everything');
     expect(prArg).toBe(42);
     expect(body.startsWith(STUCK_DISPATCH_MARKER)).toBe(true);
     expect(result.dispatchedCount).toBe(1);
@@ -141,7 +141,7 @@ describe('watchStuckPrs — the whole sweep, every IO point injected', () => {
       comments: [{ body: `${STUCK_DISPATCH_MARKER}\n\nepisode: 2026-09-23T17:00:00Z\n\n…` }],
     });
     const result = watchStuckPrs({
-      repo: 'chalbert/web-everything', dryRun: false, now,
+      repo: 'web-everything/web-everything', dryRun: false, now,
       listPrs: () => [pr], listTimelineEvents: oldActivity,
       readAgents: () => [], enrich: (a) => a, countLiveInspections: () => 0, dispatch, provider,
     });
@@ -151,12 +151,12 @@ describe('watchStuckPrs — the whole sweep, every IO point injected', () => {
 
   it('a NEW episode (fresh activity, then stuck again) dispatches again', () => {
     const dispatch = vi.fn(() => ({ sessionSlug: 'inspect-42', agentId: null }));
-    const provider = { postComment: vi.fn(), currentRepo: vi.fn(() => 'chalbert/web-everything') };
+    const provider = { postComment: vi.fn(), currentRepo: vi.fn(() => 'web-everything/web-everything') };
     const pr = stuckFixPr({
       comments: [{ body: `${STUCK_DISPATCH_MARKER}\n\nepisode: 2026-09-01T00:00:00Z\n\n…` }], // an OLD, different episode
     });
     const result = watchStuckPrs({
-      repo: 'chalbert/web-everything', dryRun: false, now,
+      repo: 'web-everything/web-everything', dryRun: false, now,
       listPrs: () => [pr], listTimelineEvents: oldActivity, // latest activity is 2026-09-23T17:00:00Z — a NEW episode
       readAgents: () => [], enrich: (a) => a, countLiveInspections: () => 0, dispatch, provider,
     });
@@ -167,11 +167,11 @@ describe('watchStuckPrs — the whole sweep, every IO point injected', () => {
   it('ROUND TRIP: the watch\'s own marker + the inspection agent\'s diagnosis never mint a new episode (review finding, PR #2553)', () => {
     // Sweep 1: genuinely stuck since T1 → dispatches and posts its marker.
     const postComment = vi.fn();
-    const provider = { postComment, currentRepo: vi.fn(() => 'chalbert/web-everything') };
+    const provider = { postComment, currentRepo: vi.fn(() => 'web-everything/web-everything') };
     const dispatch = vi.fn(() => ({ sessionSlug: 'inspect-42', agentId: null }));
     const t1 = '2026-09-23T17:00:00Z';
     const sweep = (at, timeline, comments) => watchStuckPrs({
-      repo: 'chalbert/web-everything', dryRun: false, now: new Date(at).getTime(),
+      repo: 'web-everything/web-everything', dryRun: false, now: new Date(at).getTime(),
       listPrs: () => [stuckFixPr({ comments })], listTimelineEvents: () => timeline,
       readAgents: () => [], enrich: (a) => a, countLiveInspections: () => 0, dispatch, provider,
     });
@@ -196,11 +196,11 @@ describe('watchStuckPrs — the whole sweep, every IO point injected', () => {
 
   /** Two sweeps over the same stuck PR, with sweep 1's successfully-posted comments fed back as sweep 2's. */
   function twoSweeps({ dispatch, postComment }) {
-    const provider = { postComment, currentRepo: vi.fn(() => 'chalbert/web-everything') };
+    const provider = { postComment, currentRepo: vi.fn(() => 'web-everything/web-everything') };
     const posted = () => postComment.mock.calls
       .filter((_, i) => postComment.mock.results[i].type === 'return').map((c) => ({ body: c[2] }));
     const sweep = () => watchStuckPrs({
-      repo: 'chalbert/web-everything', dryRun: false, now,
+      repo: 'web-everything/web-everything', dryRun: false, now,
       listPrs: () => [stuckFixPr({ comments: posted() })], listTimelineEvents: oldActivity,
       readAgents: () => [], enrich: (a) => a, countLiveInspections: () => 0, dispatch, provider,
     });
@@ -231,10 +231,10 @@ describe('watchStuckPrs — the whole sweep, every IO point injected', () => {
     const dispatch = vi.fn(() => { order.push('dispatch'); return { sessionSlug: 'inspect-42', agentId: null }; });
     const postComment = vi.fn(() => { order.push('comment'); });
     watchStuckPrs({
-      repo: 'chalbert/web-everything', dryRun: false, now,
+      repo: 'web-everything/web-everything', dryRun: false, now,
       listPrs: () => [stuckFixPr()], listTimelineEvents: oldActivity,
       readAgents: () => [], enrich: (a) => a, countLiveInspections: () => 0,
-      dispatch, provider: { postComment, currentRepo: vi.fn(() => 'chalbert/web-everything') },
+      dispatch, provider: { postComment, currentRepo: vi.fn(() => 'web-everything/web-everything') },
     });
     expect(order).toEqual(['comment', 'dispatch']);
     expect(postComment.mock.calls[0][2]).toContain('`inspect-42`');
@@ -270,11 +270,11 @@ describe('watchStuckPrs — the whole sweep, every IO point injected', () => {
   it('a provable failure that REPEATS every sweep retracts at most once — bounded comments, bounded launches', () => {
     const dispatch = vi.fn(() => { throw markNoInspectionStarted(new Error('refusing to start from a lane checkout')); });
     const postComment = vi.fn();
-    const provider = { postComment, currentRepo: vi.fn(() => 'chalbert/web-everything') };
+    const provider = { postComment, currentRepo: vi.fn(() => 'web-everything/web-everything') };
     const posted = () => postComment.mock.calls.map((c) => ({ body: c[2] }));
     for (let i = 0; i < 5; i += 1) {
       watchStuckPrs({
-        repo: 'chalbert/web-everything', dryRun: false, now,
+        repo: 'web-everything/web-everything', dryRun: false, now,
         listPrs: () => [stuckFixPr({ comments: posted() })], listTimelineEvents: oldActivity,
         readAgents: () => [], enrich: (a) => a, countLiveInspections: () => 0, dispatch, provider,
       });
@@ -287,7 +287,7 @@ describe('watchStuckPrs — the whole sweep, every IO point injected', () => {
     const dispatch = vi.fn();
     const provider = { postComment: vi.fn(), currentRepo: vi.fn() };
     const result = watchStuckPrs({
-      repo: 'chalbert/web-everything', dryRun: false, now,
+      repo: 'web-everything/web-everything', dryRun: false, now,
       listPrs: () => [stuckFixPr()],
       listTimelineEvents: oldActivity,
       readAgents: () => [], enrich: (a) => a,
@@ -301,7 +301,7 @@ describe('watchStuckPrs — the whole sweep, every IO point injected', () => {
   it('excludes review:human, draft, and stood-down PRs before ever fetching a timeline', () => {
     const listTimelineEvents = vi.fn(oldActivity);
     const result = watchStuckPrs({
-      repo: 'chalbert/web-everything', dryRun: true, now,
+      repo: 'web-everything/web-everything', dryRun: true, now,
       listPrs: () => [stuckFixPr({ number: 1, labels: [{ name: 'review:human' }] }), stuckFixPr({ number: 2, isDraft: true })],
       listTimelineEvents,
       readAgents: () => [], enrich: (a) => a, countLiveInspections: () => 0,
@@ -313,7 +313,7 @@ describe('watchStuckPrs — the whole sweep, every IO point injected', () => {
   it('a failed agents read fails CLOSED — the whole sweep skips rather than guessing nothing is live', () => {
     const dispatch = vi.fn();
     const result = watchStuckPrs({
-      repo: 'chalbert/web-everything', dryRun: false, now,
+      repo: 'web-everything/web-everything', dryRun: false, now,
       listPrs: () => [stuckFixPr()],
       listTimelineEvents: oldActivity,
       readAgents: () => { throw new Error('claude agents failed'); },

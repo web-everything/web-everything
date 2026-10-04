@@ -16,7 +16,7 @@ Merged and closed PRs remain visible; do not dispatch work just because a histor
 ## Invocation
 
 ```bash
-node scripts/operations/run.mjs pr-reconcile --repo=chalbert/web-everything --json
+node scripts/operations/run.mjs pr-reconcile --repo=web-everything/web-everything --json
 ```
 
 Use the target repository's owner/name; add `--pr=<number>` to inspect one PR.

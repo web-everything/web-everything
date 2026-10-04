@@ -26,7 +26,7 @@ import { validateRequest, APPLIABLE_TARGETS } from '../../apply-review-request.m
 const run = (over = {}) => ({
   id: 'review-pr-abc',
   op: 'review-pr',
-  input: { pr: 1496, repo: 'chalbert/web-everything', lens: 'correctness', actor: 'operator' },
+  input: { pr: 1496, repo: 'web-everything/web-everything', lens: 'correctness', actor: 'operator' },
   verdict: { verdict: 'accept' },
   telemetry: [{ step: 'judge', sessionId: 'sess-123' }],
   ...over,
@@ -75,7 +75,7 @@ describe('the declaration', () => {
 
 describe('factsFromRun — provenance, or a refusal', () => {
   it('reads the subject and the juror session out of the record', () => {
-    expect(factsFromRun(run())).toMatchObject({ pr: 1496, repo: 'chalbert/web-everything', sessionId: 'sess-123', reduced: 'accept' });
+    expect(factsFromRun(run())).toMatchObject({ pr: 1496, repo: 'web-everything/web-everything', sessionId: 'sess-123', reduced: 'accept' });
   });
 
   /**
@@ -107,11 +107,11 @@ describe('factsFromRun — provenance, or a refusal', () => {
 });
 
 describe('buildRequest — the applier\'s rules, applied here', () => {
-  const facts = { pr: 1496, repo: 'chalbert/web-everything', sessionId: 'sess-123', reduced: 'accept' };
+  const facts = { pr: 1496, repo: 'web-everything/web-everything', sessionId: 'sess-123', reduced: 'accept' };
 
   it('builds a request the applier accepts', () => {
     const out = buildRequest({ facts, to: 'accepted', body: 'the write-up', actor: 'claude-review-pr' }, validateRequest);
-    expect(out.request).toMatchObject({ pr: 1496, repo: 'chalbert/web-everything', to: 'accepted', sessionId: 'sess-123' });
+    expect(out.request).toMatchObject({ pr: 1496, repo: 'web-everything/web-everything', to: 'accepted', sessionId: 'sess-123' });
     expect(out.path).toBe('ops/review-requests/1496-accepted.json');
   });
 
@@ -177,7 +177,7 @@ describe('#3540 describeNoWriteUp — WHY is the write-up missing?', () => {
 describe('the stage effect', () => {
   it('declares one idempotent effect carrying bytes the plan already computed', () => {
     const decl = ops(() => ({ record: run(), body: 'x' }));
-    const effects = step(decl, 'stage').effects({ verdict: { path: 'ops/review-requests/1496-accepted.json', request: { pr: 1496, to: 'accepted', repo: 'chalbert/web-everything' } } });
+    const effects = step(decl, 'stage').effects({ verdict: { path: 'ops/review-requests/1496-accepted.json', request: { pr: 1496, to: 'accepted', repo: 'web-everything/web-everything' } } });
     expect(effects).toHaveLength(1);
     expect(effects[0]).toMatchObject({ type: STAGE_REQUEST_EFFECT, idempotent: true });
     expect(JSON.parse(effects[0].payload.content)).toMatchObject({ pr: 1496 });
@@ -216,9 +216,9 @@ describe('the sink — a worktree, never a branch switch in the caller\'s lane',
   const stub = (calls, over = {}, onRun) => createRecordVerdictSinks({
     root: '/repo',
     // #3261 — the board is chosen by matching the checkout's origin to the request's repo, and a mismatch is
-    // REFUSED rather than defaulted. These stubs push for `chalbert/web-everything`, so the fixture checkout
+    // REFUSED rather than defaulted. These stubs push for `web-everything/web-everything`, so the fixture checkout
     // claims to be that repo. Injected, so no test shells `git remote`.
-    originRepo: () => 'chalbert/web-everything',
+    originRepo: () => 'web-everything/web-everything',
     now: () => 111,
     run: (args, opts) => {
       calls.push({ args, cwd: opts?.cwd });
@@ -240,7 +240,7 @@ describe('the sink — a worktree, never a branch switch in the caller\'s lane',
    */
   it('takes its filesystem calls as injected parameters, so a test never writes for real', async () => {
     const calls = [];
-    await sink(calls, { diff: '' })({ path: 'ops/review-requests/1-accepted.json', content: '{}\n', pr: 1, to: 'accepted', repo: 'chalbert/web-everything' });
+    await sink(calls, { diff: '' })({ path: 'ops/review-requests/1-accepted.json', content: '{}\n', pr: 1, to: 'accepted', repo: 'web-everything/web-everything' });
     const writes = calls.filter((c) => c.fs);
     expect(writes.length).toBeGreaterThan(0);
     // …and every path it touched is under the worktree it created, never the caller's root itself.
@@ -254,7 +254,7 @@ describe('the sink — a worktree, never a branch switch in the caller\'s lane',
    */
   it('never runs a checkout in the caller\'s root — only inside its own worktree', async () => {
     const calls = [];
-    await sink(calls, { diff: 'ops/review-requests/1496-accepted.json' })({ path: 'ops/review-requests/1496-accepted.json', content: '{}\n', pr: 1496, to: 'accepted', repo: 'chalbert/web-everything' })
+    await sink(calls, { diff: 'ops/review-requests/1496-accepted.json' })({ path: 'ops/review-requests/1496-accepted.json', content: '{}\n', pr: 1496, to: 'accepted', repo: 'web-everything/web-everything' })
       .catch(() => {});
     const checkouts = calls.filter((c) => c.args?.[0] === 'checkout');
     expect(checkouts.length).toBeGreaterThan(0);
@@ -267,7 +267,7 @@ describe('the sink — a worktree, never a branch switch in the caller\'s lane',
       if (args[0] === 'push') throw new Error('network');
       return undefined;
     });
-    await expect(sinks[STAGE_REQUEST_EFFECT]({ path: 'ops/review-requests/1496-accepted.json', content: '{}\n', pr: 1496, to: 'accepted', repo: 'chalbert/web-everything' })).rejects.toThrow(/network/);
+    await expect(sinks[STAGE_REQUEST_EFFECT]({ path: 'ops/review-requests/1496-accepted.json', content: '{}\n', pr: 1496, to: 'accepted', repo: 'web-everything/web-everything' })).rejects.toThrow(/network/);
     expect(calls.some((c) => c.args?.[0] === 'worktree' && c.args?.[1] === 'prune')).toBe(true);
     // The DIRECTORY removal too, not just the registration prune — a `finally` that dropped one of the two
     // would still pass a check for the other.
@@ -278,14 +278,14 @@ describe('the sink — a worktree, never a branch switch in the caller\'s lane',
   // being kept rather than an error to report.
   it('treats "nothing to commit" as success, not failure', async () => {
     const calls = [];
-    const out = await sink(calls, { diff: '' })({ path: 'ops/review-requests/1496-accepted.json', content: '{}\n', pr: 1496, to: 'accepted', repo: 'chalbert/web-everything' });
+    const out = await sink(calls, { diff: '' })({ path: 'ops/review-requests/1496-accepted.json', content: '{}\n', pr: 1496, to: 'accepted', repo: 'web-everything/web-everything' });
     expect(out).toMatchObject({ pushed: false });
     expect(calls.some((c) => c.args?.[0] === 'push')).toBe(false);
   });
 
   it('pushes to the branch CI actually watches', async () => {
     const calls = [];
-    await sink(calls, { diff: 'x' })({ path: 'ops/review-requests/1496-accepted.json', content: '{}\n', pr: 1496, to: 'accepted', repo: 'chalbert/web-everything' });
+    await sink(calls, { diff: 'x' })({ path: 'ops/review-requests/1496-accepted.json', content: '{}\n', pr: 1496, to: 'accepted', repo: 'web-everything/web-everything' });
     const push = calls.find((c) => c.args?.[0] === 'push');
     expect(push.args).toContain(`HEAD:${TRANSPORT_BRANCH}`);
   });
@@ -293,7 +293,7 @@ describe('the sink — a worktree, never a branch switch in the caller\'s lane',
 
 describe('the write-up name matches what review-pr stages', () => {
   it('is repo-and-pr keyed, with the slash flattened', () => {
-    expect(writeUpName('chalbert/web-everything', 1496)).toBe('chalbert-web-everything-1496-verdict.md');
+    expect(writeUpName('web-everything/web-everything', 1496)).toBe('web-everything-web-everything-1496-verdict.md');
   });
 });
 
@@ -350,7 +350,7 @@ describe('#3261 — the sink runs its git against the BOARD, not the driver', ()
   const build = (calls, onRun) => createRecordVerdictSinks({
     root: '/driver',
     // The driver is web-everything; the board is the sibling whose origin IS the request's repo.
-    originRepo: (cwd) => (cwd === OTHER ? 'o/other' : 'chalbert/web-everything'),
+    originRepo: (cwd) => (cwd === OTHER ? 'o/other' : 'web-everything/web-everything'),
     now: () => 111,
     run: (args, opts) => {
       calls.push({ args, cwd: opts?.cwd });

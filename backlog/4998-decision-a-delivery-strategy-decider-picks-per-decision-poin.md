@@ -2,8 +2,11 @@
 bornAs: x1hhjnb
 kind: decision
 parent: "3383"
-status: open
+status: resolved
 dateOpened: "2026-10-03"
+dateStarted: "2026-10-03"
+dateResolved: "2026-10-03"
+codifiedIn: "docs/agent/platform-decisions.md#delivery-decider-under-fixed-settings"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "22103ded66ade34e9d6dac68081d1f487fdef7d7"
 relatedTo: ["3361", "2692", "2740", "3611"]
@@ -84,7 +87,8 @@ table and the mapping of every setting ruled today are sections 5.4 and 5.7 of t
   proposed only after 5000 and 5001 land and culprit-finding data shows integration-attributed red windows
   while `recheckWhenMainMoved` is `always`. Until then clause 3 is unchanged.
 - **Shadow mode first.** A field set to `auto` starts in shadow: the decider computes and journals its choice next
-  to the applied value (the platform default) until the operator flips that field live.
+  to the applied value (the platform default) until the operator reviews about a week of logs and flips that field
+  live. Promotion is itself a configurable per-field setting, defaulting to shadow (ruled 2026-10-03).
 - **Platform defaults stay today's ruled values.** `auto` is never the platform default in v1.
 - **An impossible pin is reported, never substituted:** `blocked: fixed-policy-conflict`, journaled.
 - **Decide at action time.** The decider is a library each daemon calls with a fresh snapshot, not a central
@@ -167,6 +171,17 @@ On ratification, file:
 2. The decider core: rule table for D1, D2, D3, D5, D6, D7, D8, D9, hold times, journal, `--explain`, shadow
    mode. Scope `we:scripts/lib/delivery-decider.mjs` and its tests.
 3. Wiring per consumer, inside the stories that own each point (4991, 4992, xi8vgqq, xca0u65, xkpbs7b).
+
+## Ruling — RATIFIED 2026-10-03
+
+Ratified by the operator (Nicolas Gilbert), 2026-10-03 ~14:45 ET, verbatim *"Ok for all"*, in answer to the
+orchestrator's recommendation. Fork 1 (a) at the default. The one open point was shadow mode: **shadow first**.
+With `auto`, the decider only logs what it would pick, with its reasons, and acts only after the operator has
+reviewed about a week of logs and explicitly promotes the field. Promotion is a configurable setting, default
+shadow. Pre-ratify staleness checks (`check:item`, `check:health` flags, statutes ratified since the stamp) found
+no change to any default. Codified at `we:docs/agent/platform-decisions.md#delivery-decider-under-fixed-settings`.
+Build stories filed: `5008` (auto value, tighten-only, promotion setting, one settings home) and `5009`
+(decider core with shadow mode).
 
 ## Done when
 

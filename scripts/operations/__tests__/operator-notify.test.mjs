@@ -8,7 +8,7 @@ import { planNotifications, runOperatorNotify, itemKey } from '../operator-notif
 import { readState, writeState } from '../operator-notify-io.mjs';
 import { evaluatePr } from '../operator-queue.mjs';
 
-const row = { repo: 'chalbert/web-everything', number: 2108, title: 'Review this PR' };
+const row = { repo: 'web-everything/web-everything', number: 2108, title: 'Review this PR' };
 const now = '2026-09-20T12:00:00Z';
 let dir, path, notify;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'notify-')); path = join(dir, 'state.json'); notify = vi.fn(() => ({ ok: true })); });
@@ -18,7 +18,7 @@ const run = (ready = [], errors = []) => runOperatorNotify({ readQueue: () => ({
 describe('notification state', () => {
   it('notifies once, drops departed items, and notifies on return', async () => {
     expect((await run([row])).notified).toEqual([row]);
-    expect(notify).toHaveBeenCalledWith({ title: 'Review needed: chalbert/web-everything#2108', body: row.title });
+    expect(notify).toHaveBeenCalledWith({ title: 'Review needed: web-everything/web-everything#2108', body: row.title });
     expect(readState(path).notified[itemKey(row)]).toEqual({ title: row.title, notifiedAt: now });
     const before = readFileSync(path, 'utf8');
     expect((await run([row])).notified).toEqual([]);

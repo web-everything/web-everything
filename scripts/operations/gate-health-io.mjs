@@ -158,7 +158,7 @@ export function createHistoryReader({ repo = CONSTELLATION_REPOS.we.slug, root =
     throw new TypeError('gate-health-io: `classify` is required — pass `classifyFollowUp` from we:scripts/lib/gate-health.mjs');
   }
   // `repo` comes from the CALL, not from binding time. Bound at construction it silently ignored
-  // `--repo=chalbert/frontierui` and answered with web-everything's history — a wrong answer wearing the
+  // `--repo=frontier-ui/frontierui` and answered with web-everything's history — a wrong answer wearing the
   // right label, which is worse than a refusal. `root` still binds, so a cross-repo request is refused below
   // rather than joined against the wrong commit stream.
   return ({ repo: asked = repo, limit = 300, windowDays = FOLLOW_WINDOW_DAYS } = {}) => {

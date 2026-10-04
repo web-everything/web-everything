@@ -12,7 +12,7 @@
 	     automation executes code from (we:scripts/lib/automation-home.mjs#controlClonePath; the gh shim's throttle
 	     CLI resolves here too). This daemon runs FROM it with --self-sync, so the daemon rebuild machinery keeps it
 	     on origin/main between ticks (same machinery as the review daemon):
-	       git clone https://github.com/chalbert/web-everything /Users/nicolasgilbert/workspace/wev-control
+	       git clone https://github.com/web-everything/web-everything /Users/nicolasgilbert/workspace/wev-control
 	     then `npm ci` in it.
 	  2. Move the cleared queue out of the primary checkout, once (the old file is left untouched):
 	       node scripts/conveyor/queue.mjs migrate --dry-run   # then without --dry-run

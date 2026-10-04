@@ -15,7 +15,7 @@ import {
 } from '../lib/verdict-ledger.mjs';
 import { REVIEW_LABELS } from '../lib/review-escalation.mjs';
 
-const REPO = 'chalbert/web-everything';
+const REPO = 'web-everything/web-everything';
 const AT = '2026-08-10T12:00:00.000Z';
 const rec = (over) => buildVerdictRecord({ repo: REPO, pr: 1, verdict: VERDICTS.ACCEPTED, at: AT, source: 'test', ...over });
 const L = (...names) => names.map((name) => ({ name }));

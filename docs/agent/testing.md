@@ -60,7 +60,7 @@ without changing clearance, outstanding holds, review-round counts, or live labe
 Append failures are reported best-effort on stderr and do not abort the shadow report.
 
 Query the durable evidence offline with
-`node scripts/lib/verdict-ledger.mjs shadow-agreement --repo=chalbert/web-everything --human-actor=nic --json`.
+`node scripts/lib/verdict-ledger.mjs shadow-agreement --repo=web-everything/web-everything --human-actor=nic --json`.
 Use the exact declared human actor stored in your verdict rows. Without `--human-actor`, only the explicit
 `clear-human` ceremony is a human outcome; with it, accepted/changes rows for that actor also qualify.
 Declared attribution is not identity verification. `summarizeShadowAgreement` compares the latest preceding

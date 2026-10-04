@@ -109,7 +109,7 @@ describe('restampAcceptance (#3202 — the re-stamp reads the PR\'s OWN tree)', 
   // NOT acquire a pinned cwd it never needed.
   it('inherits the drain\'s cwd for a local-repo PR', () => {
     const { calls, spawn } = spy();
-    restampAcceptance({ pr: 7, repo: 'chalbert/web-everything', newHead: 'abc1234', spawn });
+    restampAcceptance({ pr: 7, repo: 'web-everything/web-everything', newHead: 'abc1234', spawn });
     expect(calls[0].opts.cwd).toBeUndefined();
   });
 
@@ -392,7 +392,7 @@ describe('#3184 — the drain records a fingerprint READ MISS instead of collaps
 
   it('pins diff reads to the sibling clone', () => {
     const exec = vi.fn((cmd) => cmd === 'gh' ? JSON.stringify(acceptanceView()) : 'git result');
-    readDrainAcceptance({ pr: 3432, repo: 'chalbert/frontierui', cwd: '/ws/frontierui', exec,
+    readDrainAcceptance({ pr: 3432, repo: 'frontier-ui/frontierui', cwd: '/ws/frontierui', exec,
       netDiff: ({ exec: git, rev, fetchExtraRefs }) => {
         expect(rev).toBe('lane/3432');
         expect(fetchExtraRefs).toEqual(['lane/3432']);
@@ -525,7 +525,7 @@ function acceptanceView() {
   }] };
 }
 function acceptanceOptions(view = acceptanceView()) {
-  return { pr: 3432, repo: 'chalbert/web-everything', local: true,
+  return { pr: 3432, repo: 'web-everything/web-everything', local: true,
     exec: () => JSON.stringify(view), netDiff: () => ({ scored: true, text: REVIEWED_DIFF }) };
 }
 
@@ -541,7 +541,7 @@ describe('PR #3432 — drain acceptance verification and pending reconciliation'
     const exec = (cmd, args, opts) => {
       expect(cmd).toBe('gh');
       expect(opts.maxBuffer).toBe(64 * 1024 * 1024);
-      expect(args).toEqual(['pr', 'view', '3432', '--repo', 'chalbert/web-everything', '--json', 'headRefOid,headRefName,comments']);
+      expect(args).toEqual(['pr', 'view', '3432', '--repo', 'web-everything/web-everything', '--json', 'headRefOid,headRefName,comments']);
       // Real pipe buffering, with precisely the options the production reader supplies.
       return execFileSync(process.execPath, ['-e', 'process.stdout.write(require("node:fs").readFileSync(0))'], {
         ...opts, stdio: ['pipe', 'pipe', 'pipe'], input: payload,

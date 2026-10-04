@@ -11,11 +11,11 @@
  * a reviewer's finding — introduced by `origin/lane/xdhidso-review-human-statute-fixer` (PR #2577): a
  * `review:human`, statute-tier merge conflict that does not overlap `main`'s own edits since the merge base is
  * routed to the fixer via `we:scripts/conveyor/reconcile-finding.mjs`, which bounces the PR `review:changes`
- * exactly like an ordinary reviewer finding would. CONFIRMED LIVE, 2026-09-24: `chalbert/web-everything#2549`
+ * exactly like an ordinary reviewer finding would. CONFIRMED LIVE, 2026-09-24: `web-everything/web-everything#2549`
  * had already spent 5 of 5 ordinary rounds (`review-round:5`) by the time #2577's routing rule newly offered it
  * a mechanical conflict fix — `runReconcilePass` refused it `cap-exhausted` before the fixer ever ran, even
  * though ZERO conflict-resolution rounds had ever actually run on this PR (real `runReconcilePass({repo:
- * 'chalbert/web-everything'})`, no writes). Mirrors `we:scripts/conveyor/reconcile-core.mjs#CI_HEAL_ROUND_CAP`'s
+ * 'web-everything/web-everything'})`, no writes). Mirrors `we:scripts/conveyor/reconcile-core.mjs#CI_HEAL_ROUND_CAP`'s
  * own reasoning exactly: a different KIND of round needs its own floor, never a shared one that lets a PR burn
  * through one cap doing the other kind's work.
  *
@@ -37,7 +37,7 @@
  *
  * #2787 LIVE INCIDENT (2026-09-27) ADDS {@link countStaleConflictFixRounds}. `countConflictFixComments` counts
  * every completed round, full stop — it cannot tell "the same conflict, still stuck" apart from "a fresh
- * conflict, because the target moved on and the mechanism keeps working just fine". `chalbert/web-everything`
+ * conflict, because the target moved on and the mechanism keeps working just fine". `web-everything/web-everything`
  * PR #2787 spent all 3 of its rounds on a stacked base that got rebased twice then landed entirely (three
  * genuine SUCCESSES against three different targets), then was refused `cap-exhausted` on the first-ever
  * main-base conflict it hit afterward. See that function's own docblock for the fix. `countConflictFixComments`

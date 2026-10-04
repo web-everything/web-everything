@@ -3,9 +3,11 @@ bornAs: xbdefjb
 kind: story
 size: 2
 parent: "3383"
-status: open
+status: resolved
 scope: ["we:.github/workflows/ci.yml", "we:scripts/conveyor/main-red-recovery.mjs", "we:scripts/conveyor/main-ci-coverage.mjs"]
 dateOpened: "2026-10-03"
+dateStarted: "2026-10-03"
+dateResolved: "2026-10-03"
 tags: []
 ---
 
@@ -15,6 +17,10 @@ Measured 2026-10-03: of the last 100 runs of we:.github/workflows/ci.yml on main
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+1. **Executable** — `npx vitest run we:scripts/__tests__/ci-main-runs-not-cancelled.test.mjs` fails on the old `cancel-in-progress: true` and passes once main runs are never cancelled.
+2. **Executable** — unit tests cover the main-coverage calculation (completed main runs over main pushes, minutes since the last completed run, last green and first red SHA).
+3. **Live** — `gh run list` on main, before and after, shows the cancelled share falling and each started main run completing during a burst of merges.
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+## Progress
+
+- 2026-10-03 (operator-approved fast path, main-red recovery): slice 1 is in its own PR. `we:.github/workflows/ci.yml` now sets `cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}`, guarded by `we:scripts/__tests__/ci-main-runs-not-cancelled.test.mjs` (before: 1 failed, after: 2 passed). Still owed: the main-coverage JSON CLI, the note in `we:scripts/conveyor/main-red-recovery.mjs`, and the live before/after proof.

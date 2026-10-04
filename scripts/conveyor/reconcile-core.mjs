@@ -100,6 +100,7 @@
  * transcript's mtime) is INJECTED on the input records by `we:scripts/conveyor/reconcile-pass.mjs`, so every
  * branch below is reachable in a test with no network and no credential.
  */
+import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
@@ -133,7 +134,7 @@ import {
   isLatestAdvisoryFindingAddressed, isAdvisoryMechanismStandDownSuperseded,
 } from './advisory-fix-mark.mjs';
 import { CONFLICT_LABEL } from './conflict-label.mjs';
-// advisory-after-cap (chalbert/web-everything#2766 live incident, 2026-09-27) — see the ADVISORY-FIX
+// advisory-after-cap (web-everything/web-everything#2766 live incident, 2026-09-27) — see the ADVISORY-FIX
 // cap-exhausted branch below for why the "is a fresh review owed on a stale advisory note" check reuses these
 // two, never a second reimplementation of "does the newest advisory comment name this PR's CURRENT head".
 import { ADVISORY_LABELS, latestAdvisory, advisoryCoversHead } from '../lib/advisory-labels.mjs';
@@ -153,7 +154,7 @@ import {
 import {
   parseReviewedSha, planConvertSupersededVerdict, targetedCheckQuestion, findAcceptVerdictComment, REVIEW_LABELS,
 } from '../lib/review-escalation.mjs';
-// live incident, chalbert/web-everything PR #2752 (#4034/#2748) — a PR whose own content is ALREADY on `main`,
+// live incident, web-everything/web-everything PR #2752 (#4034/#2748) — a PR whose own content is ALREADY on `main`,
 // carried there by a different PR that stacked on its branch and merged first, never owes a fix or a review.
 // The verdict itself (`pr.alreadyLandedInMain`, per-file blob-identity evidence) is computed by the IO shell
 // (`we:scripts/conveyor/reconcile-pass.mjs#enrichPrsWithAlreadyLandedFacts`, `we:scripts/lib/
@@ -178,7 +179,7 @@ import {
  * being re-planned, and the cap is the SAME durable floor (`countCiHealComments`) either path would read off
  * the PR, never two independent counters.
  */
-// #xconv1 (chalbert/web-everything#2766/#2767 unblock) — `convert-advisory` is the FOURTH kind: a `needs-human`
+// #xconv1 (web-everything/web-everything#2766/#2767 unblock) — `convert-advisory` is the FOURTH kind: a `needs-human`
 // PR whose CURRENT head already completed an independent jury review that a LATER escalation superseded (never
 // a fresh push — see the ONE-REVIEW-PER-HEAD block below). It converts that verdict into the standing advisory
 // note plus one targeted check on the escalation's own reason, instead of dispatching a whole second panel run
@@ -240,7 +241,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *                          A review already ran against this exact commit; dispatching another risks a second,
  *                          contradicting verdict landing on a commit nobody has touched since (the live #2588
  *                          incident this refusal closes: 3 review sessions in 16 minutes on one head, "changes"
- *                          then "accepted" 5 minutes apart). #xconv1 (chalbert/web-everything#2766/#2767
+ *                          then "accepted" 5 minutes apart). #xconv1 (web-everything/web-everything#2766/#2767
  *                          unblock) carved out ONE exception: a `needs-human` PR in this exact shape whose
  *                          comments also carry a LATER escalation (test-gaming/manifest-tamper park, or the
  *                          #2773 mutual-exclusivity heal) is not this risk at all — `review:human` already
@@ -249,7 +250,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *                          we:backlog/4352 carved out a SECOND: a `review:pending` head whose accept comment is
  *                          older than {@link ACCEPT_LABEL_GRACE_MS} lost its label write (budget-dropped), so it
  *                          dispatches the ordinary `review` (`relabelOwed: true`) — see {@link acceptLabelDropped}.
- *   `already-landed`    — live incident, chalbert/web-everything PR #2752 (#4034/#2748): every file this PR
+ *   `already-landed`    — live incident, web-everything/web-everything PR #2752 (#4034/#2748): every file this PR
  *                          touches is byte-identical to some commit already on `main` — its own content was
  *                          carried there by a DIFFERENT PR (often one stacked on its branch that merged first)
  *                          while THIS PR's ref was separately rebased and drifted into an apparent conflict.
@@ -372,7 +373,7 @@ export const CI_HEAL_ROUND_CAP = 3;
  * counts only rounds against the CURRENT target, see {@link CONFLICT_FIX_ABSOLUTE_CEILING}'s own docblock for
  * why a plain per-marker count was wrong) — never `roundCap`'s shared rearm/advisory counters, and never
  * reduced by however many ordinary negotiation rounds a
- * PR has already spent (CONFIRMED LIVE: `chalbert/web-everything#2549` was already at 5 of 5 ordinary rounds
+ * PR has already spent (CONFIRMED LIVE: `web-everything/web-everything#2549` was already at 5 of 5 ordinary rounds
  * when PR #2577's routing rule newly offered it a conflict fix, and the shared cap refused it before the fixer
  * ever ran — see that leaf's own header for the full incident). A PR that ALSO exhausts three
  * conflict-resolution rounds still needs a person, exactly as an exhausted `roundCap` does.
@@ -778,7 +779,7 @@ export function markSelfReportedDone(agents, completionFor, nowMs) {
  * assessLiveness}, never a change to that pinned function itself.
  *
  * WHY THIS EXISTS, SEPARATELY FROM `markSelfReportedDone` (epic #3383 continuation, live 2026-09-24,
- * chalbert/web-everything #2599/#2596/#2594/#2588/#2587/#2582): those six PRs' bound review sessions never
+ * web-everything/web-everything #2599/#2596/#2594/#2588/#2587/#2582): those six PRs' bound review sessions never
  * wrote a `status: done` completion record — the review brief's "report done on infra failure" instruction is
  * PROSE, and an agent that crashes/exits under stress can skip it — so `markSelfReportedDone` never fires for
  * them and `assessLiveness` keeps reading them as live, freezing the PR forever. This is a THIRD, MECHANICAL
@@ -960,7 +961,7 @@ export function markIdleFinishedSessions(agents, idleFinishedInfoFor, nowMs, thr
  * stopped promptly) and no self-report, so without this exclusion they read as `live-process` FOREVER, and the
  * fix-dispatch daemon never sent a fresh fixer even after the operator logged back in.
  *
- * `state === 'stopped'` is ALSO finished — live-caught 2026-09-25 (PR #2647/#2625, both `chalbert/web-everything`,
+ * `state === 'stopped'` is ALSO finished — live-caught 2026-09-25 (PR #2647/#2625, both `web-everything/web-everything`,
  * both stuck at an informative `review-status:review-stalled`/`reviewing` label with nothing live and nothing
  * retrying). Root cause, confirmed against a real `claude agents --json --all` listing off the running review
  * daemon's own checkout: `we:scripts/conveyor/session-reaper.mjs` calls `claude stop` on every `done`/`failed`/
@@ -1106,6 +1107,20 @@ export function acceptLabelDropped({ labels, comments, headSha, now, graceMs = A
   return Number.isFinite(at) && now - at >= graceMs;
 }
 
+/**
+ * xuxcsw6 — the human-parked referral hold gates EVERY review emission, not only {@link dispatchReviewRow}.
+ * The two advisory-fix branches push `kind: 'review'` directly; a parked review posts no fresh advisory note,
+ * so their "fix postdates the advisory" test stayed true and re-dispatched a full review each tick on an
+ * unchanged head (live 2026-10-04, #3771). Wake-ups (new head, a ruling, a send-back) clear `pr.referralHold`.
+ */
+function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
+  if (!pr?.referralHold) return false;
+  refuse('review-referrals-pending', {
+    ...withPhase, ...extra, referralHold: pr.referralHold, why: pr.referralHold.why,
+  });
+  return true;
+}
+
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
   const ci = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup });
@@ -1124,12 +1139,7 @@ function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }
 function dispatchReviewRow({
   pr, requiredChecks, withPhase, base, attempts, roundCap, refuse, refuseCapExhausted, dispatch, extra = {}, now = 0,
 }) {
-  if (pr.referralHold) {
-    refuse('review-referrals-pending', {
-      ...withPhase, ...extra, referralHold: pr.referralHold, why: pr.referralHold.why,
-    });
-    return;
-  }
+  if (refuseReferralHold({ pr, refuse, withPhase, extra })) return;
   // ── `draft` (draft-first PRs, operator-approved 2026-09-27) — checked FIRST, ahead of every other refusal
   // in this function, including `already-reviewed-head`: a draft PR is never owed a review no matter what its
   // `review:*` label or its comment thread says, because GitHub itself will not surface it for review and
@@ -1165,7 +1175,7 @@ function dispatchReviewRow({
     && acceptLabelDropped({ labels: withPhase?.labels, comments: pr?.comments, headSha, now });
   if (relabelOwed) extra = { ...extra, relabelOwed: true };
   if (headSha && reviewedSha && reviewedSha === headSha && !relabelOwed) {
-    // #xconv1 (chalbert/web-everything#2766/#2767 unblock, epic #3383/#4075) — a `needs-human` PR in this
+    // #xconv1 (web-everything/web-everything#2766/#2767 unblock, epic #3383/#4075) — a `needs-human` PR in this
     // EXACT shape (accepted, then escalated — never a fresh push, or `reviewedSha` would no longer equal
     // `headSha`) is NOT the #2588 risk this refusal exists for: `review-pr.mjs`'s own `confirm` step
     // already refuses a second ACCEPT on a `review:human` PR (we:skills-src/review/SKILL.md, "A
@@ -1351,6 +1361,14 @@ function roundCapExhaustedNoteText(prNumber, attempts, cap, capKind) {
   return `PR #${prNumber}: ${capKind} auto-repair rounds exhausted (${attempts}/${cap}) — a person must take it over`;
 }
 
+/** Tri-state diagnostic: unknown evidence is never an empty review family. */
+export function missingReviewLabel(pr) {
+  if (!pr || pr.state !== 'OPEN' || !Array.isArray(pr.labels)
+    || !pr.labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string' && (typeof l === 'string' ? l : l.name).length > 0)
+    || !Array.isArray(pr.commits)) return null;
+  return isAiGeneratedPr(pr) && !pr.labels.some(l => (typeof l === 'string' ? l : l.name).startsWith('review:'));
+}
+
 export function planReconcile({
   repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap = CI_HEAL_ROUND_CAP,
   conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP, defaultBranch = 'main',
@@ -1382,6 +1400,8 @@ export function planReconcile({
   for (const pr of Array.isArray(prs) ? prs : []) {
     const prNumber = Number(pr?.number);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue; // not a PR record; nothing to key on.
+
+    if (missingReviewLabel(pr) === true) notes.push({ kind: 'review-label-missing', prNumber, repo, text: 'open agent PR has no review:* label' });
 
     // The evidence every row carries, so a reader never has to go back to the listing to audit a verdict.
     const operatorAnswer = latestOperatorAnswer(pr?.comments);
@@ -1604,7 +1624,7 @@ export function planReconcile({
 
     // ── ALREADY-LANDED — its OWN branch, AHEAD OF EVERY OTHER CHECK IN THIS LOOP (`ci-red`, the advisory-fix
     // branch, STACKED-BASE, the generic `OWED` table — every one of them would otherwise dispatch a fixer or a
-    // reviewer at a PR with nothing left to change). Live incident, chalbert/web-everything PR #2752: bounced
+    // reviewer at a PR with nothing left to change). Live incident, web-everything/web-everything PR #2752: bounced
     // (`review:changes`) AND `merge-status:conflicting`, which — unchecked — hits `isConflictBounce` below and
     // dispatches a mechanical conflict-fix. But every file it touches is already, byte-for-byte, on `main`
     // (carried there by PR #2759, which stacked on #2752's branch and merged first); a fixer would find nothing
@@ -1766,7 +1786,7 @@ export function planReconcile({
       const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
       if (escalation) {
         const isSystemFix = escalation.outcome === 'waiting-on-system-fix';
-        // we:backlog/fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, chalbert/web-everything)
+        // we:backlog/fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, web-everything/web-everything)
         // — the THIRD escalation outcome (`ci-heal-escalation-mark.mjs#CI_HEAL_ESCALATION_OUTCOMES`): ci-heal
         // examined the PR and confirmed the red is the review gate itself (held by the `review:pending`/
         // `review:human` label), not a CI break — a STRUCTURED verdict, never parsed from `reason` prose. Unlike
@@ -1902,7 +1922,7 @@ export function planReconcile({
     // ({@link isLatestAdvisoryFindingAddressed}: does a fix-mark appear AFTER the latest advisory note?), NOT the
     // COUNT comparison (`advisoryFixes < advisoryNotes`) this branch used before. The count comparison only holds
     // when both histories start at 0/0 and move one-for-one; it breaks the moment a `review:human` PR already has
-    // advisory-note history predating this marker mechanism — CONFIRMED LIVE on `chalbert/web-everything#2549`
+    // advisory-note history predating this marker mechanism — CONFIRMED LIVE on `web-everything/web-everything#2549`
     // (5 pre-existing advisory notes, exactly 1 genuine fix, `1 < 5` staying true forever) — the reconcile pass
     // kept re-dispatching a fixer at an ALREADY-fixed PR, which is exactly how a second fixer that (correctly)
     // found nothing to reproduce ended up standing down (see `we:scripts/conveyor/advisory-fix-mark.mjs`'s own
@@ -1911,7 +1931,7 @@ export function planReconcile({
     // `advisoryFixes` (the durable attempt COUNT) is still read below, but ONLY for the CAP — a genuinely
     // unfixable finding must still stop after `advisoryFixCap` real attempts.
     //
-    // xconv1-evidence FOLLOW-UP (chalbert/web-everything#2766/#2767, 2026-09-27) — `advisoryFixes` MUST count
+    // xconv1-evidence FOLLOW-UP (web-everything/web-everything#2766/#2767, 2026-09-27) — `advisoryFixes` MUST count
     // COMPLETED EPISODES, never raw fix-mark COMMENTS: CONFIRMED LIVE, once the #xconv1-evidence fix correctly
     // read a CONVERTED note as addressed, the cap-exempt fresh review it owed ran and posted a BRAND NEW,
     // unrelated advisory finding — but the PR's 3 historical fix-mark comments had ALL landed inside that ONE
@@ -1938,7 +1958,7 @@ export function planReconcile({
           continue;
         }
         if (advisoryFixes >= advisoryFixCap) {
-          // advisory-after-cap (chalbert/web-everything#2766, live-caught 2026-09-27): the cap above is right to
+          // advisory-after-cap (web-everything/web-everything#2766, live-caught 2026-09-27): the cap above is right to
           // stop ANOTHER FIXER — but it must never ALSO block the one fresh review a head that moved AFTER the
           // last advisory note is still owed. Live shape: a fixer (a merge-conflict resolution, `main` merged in
           // to clear a stale `mergeStateStatus`) pushed a new head — posting its OWN, different marker
@@ -1979,6 +1999,7 @@ export function planReconcile({
           const latest = headSha ? latestAdvisory(trustedComments) : undefined;
           const advisoryIsStale = Boolean(latest) && !advisoryCoversHead(latest, headSha);
           if (advisoryIsStale) {
+            if (refuseReferralHold({ pr, refuse, withPhase })) continue;
             if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
             dispatch.push({
               ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
@@ -2011,7 +2032,7 @@ export function planReconcile({
       // FOLLOW-UP 2 (epic #3383) — deliberately EXEMPT from the generic shared `roundCap` that path would
       // otherwise apply.
       //
-      // CONFIRMED LIVE, `chalbert/web-everything#2549`, 2026-09-24: once the count-vs-order bug and the
+      // CONFIRMED LIVE, `web-everything/web-everything#2549`, 2026-09-24: once the count-vs-order bug and the
       // stand-down mechanism-failure gap above were both fixed, the real `runReconcilePass` correctly stopped
       // refusing `stood-down` — and immediately hit a THIRD gap instead: `cap-exhausted` at `5/5` against
       // `NEGOTIATION_ROUND_CAP`. That 5 is `countAdvisoryComments` — the very COUNT OF ADVISORY NOTES, i.e. the
@@ -2035,6 +2056,7 @@ export function planReconcile({
       // stops it and hands it to a person. A normal PR that has never addressed its advisory finding (the
       // ordinary `!addressed` branch above) is completely unaffected — it never reaches this line at all.
       const advisoryFindingsHere = countFindings(pr?.comments);
+      if (refuseReferralHold({ pr, refuse, withPhase })) continue;
       if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
       dispatch.push({
         ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
@@ -2057,7 +2079,7 @@ export function planReconcile({
     // `postFinding`, which would strip `review:accepted` and force a fresh human review for what is ordinarily a
     // purely mechanical rebase against the PR's OWN base — never a real reviewer-facing content conflict.
     //
-    // CONFIRMED LIVE 2026-09-24: `chalbert/web-everything#2578` (`review:accepted`, base
+    // CONFIRMED LIVE 2026-09-24: `web-everything/web-everything#2578` (`review:accepted`, base
     // `lane/3681-ratify-daemon-lifecycle`, stacked on PR #2549) went `owed-elsewhere` here and unreported by
     // `parked-pr-conflict-watch.mjs sweep --dry-run` alike, after a fixer pushed to its base — a genuine
     // stacked-PR gap no daemon closed. See `reconcile-core.test.mjs` for the pinned regression.
@@ -2182,7 +2204,7 @@ export function planReconcile({
     // on its OWN, smaller cap ({@link CONFLICT_FIX_ROUND_CAP}), counted from its OWN marker
     // (`countConflictFixComments`) — NEVER the shared `roundCap`/`countRearmComments`/`countAdvisoryComments`
     // floor below, which a PR can independently have already exhausted on real review negotiation (CONFIRMED
-    // LIVE: `chalbert/web-everything#2549`, `review-round:5` against the shared cap of 5, zero conflict-fix
+    // LIVE: `web-everything/web-everything#2549`, `review-round:5` against the shared cap of 5, zero conflict-fix
     // rounds ever run). See that constant's own docblock for the full incident.
     const isConflictBounce = phase === 'bounced' && withPhase.labels.includes(CONFLICT_LABEL);
     if (isConflictBounce) {

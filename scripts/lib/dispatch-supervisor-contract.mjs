@@ -1,7 +1,9 @@
 /** Supervisor invocation contracts as data only; nothing here launches a process. */
-import { TASK_TYPES, RISKS, VERDICTS, PROVIDERS, VERDICT_MODES, buildDispatchProfile,
+import { RISKS, VERDICTS, PROVIDERS, VERDICT_MODES, buildDispatchProfile,
   validateDispatchProfile, validateTaskShape, validateTaskResult, validatePlan,
   validateSupervisorVerdict, taskSessionName } from './dispatch-contracts.mjs';
+
+import { taskTypeFor } from './dispatch-task-type.mjs';
 
 const object = x => x !== null && typeof x === 'object' && !Array.isArray(x);
 const text = x => typeof x === 'string' && x.trim().length > 0;
@@ -10,7 +12,7 @@ function freeze(x) { if (object(x) || Array.isArray(x)) { Object.values(x).forEa
 const schemaObject = properties => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
 const str = { type: 'string' }, arr = { type: 'array', items: str };
 const taskSchema = schemaObject({ id: str, title: str, dependsOn: arr, profile: schemaObject({
-  taskType: { type: 'string', enum: [...TASK_TYPES] }, estimatedLoc: { type: 'integer', minimum: 1 }, filesTouched: arr,
+  estimatedLoc: { type: 'integer', minimum: 1 }, filesTouched: arr,
   acceptanceTestable: { type: 'boolean' }, risk: { type: 'string', enum: [...RISKS] }, dependsOn: arr,
 }) });
 // @test-only-export-ok: contract for the G2 dispatcher wiring (no runtime caller in slice G1)
@@ -44,7 +46,8 @@ function schemaErrors(value, schema, path = 'output') {
 }
 function buildTasks(tasks, options, errors) {
   return tasks.map((task, i) => {
-    const built = buildDispatchProfile(task.profile, options);
+    const derived = taskTypeFor({ kind: 'build', cause: 'planned', scopePaths: task.profile.filesTouched });
+    const built = buildDispatchProfile({ ...task.profile, taskType: derived.taskType }, options);
     errors.push(...built.errors.map(e => `tasks[${i}]: ${e}`));
     return { id: task.id, title: task.title, dependsOn: [...task.dependsOn], profile: built.profile, agent: null, status: 'planned' };
   });

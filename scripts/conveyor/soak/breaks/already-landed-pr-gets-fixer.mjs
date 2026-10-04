@@ -3,7 +3,7 @@
  * whose own content ALREADY LANDED on `main` through a different PR kept getting a mechanical conflict-fix
  * session dispatched at it by the fix-dispatch daemon.
  *
- * LIVE INCIDENT: chalbert/web-everything PR #2752 (`lane/4034-critical-work-gate`). PR #2759 was stacked on
+ * LIVE INCIDENT: web-everything/web-everything PR #2752 (`lane/4034-critical-work-gate`). PR #2759 was stacked on
  * #2752's branch and merged first, carrying every one of #2752's commits onto `main`; `main` then refined those
  * files further. #2752's own branch was separately rebased afterward, drifted to `mergeable: CONFLICTING`, and
  * was labelled `merge-status:conflicting` (+ `review:changes`, with findings). The reconcile planner

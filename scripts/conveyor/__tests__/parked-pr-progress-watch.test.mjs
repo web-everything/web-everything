@@ -226,7 +226,7 @@ describe('watchNeglectedPrs — the IO shell over injected fakes', () => {
     };
     const posted = [];
     const results = watchNeglectedPrs({
-      repo: 'chalbert/web-everything',
+      repo: 'web-everything/web-everything',
       now: NOW,
       listPrs: () => prs,
       listAgents: () => [{ name: 'conveyor-3151', state: 'done' }],

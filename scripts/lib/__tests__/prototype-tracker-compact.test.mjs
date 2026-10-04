@@ -154,7 +154,7 @@ describe('the whole compact page', () => {
 
   it('says "none" for an empty NEEDS YOU, prints lines verbatim, and says so when the queue could not be read', () => {
     expect(html).toContain('<p class="none">none</p>');
-    const lines = ['PR #2401 (chalbert/web-everything) — review:human, gates pass'];
+    const lines = ['PR #2401 (web-everything/web-everything) — review:human, gates pass'];
     expect(page({ needsYou: lines })).toContain(`<pre class="needs">${lines[0]}</pre>`);
     const unread = page({ needsYou: null, needsYouError: 'operator-queue.mjs is not on any checkout found' });
     expect(unread).toContain('unavailable: operator-queue.mjs is not on any checkout found');

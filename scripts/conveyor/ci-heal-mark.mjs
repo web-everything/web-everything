@@ -8,7 +8,7 @@
  * An existing acceptance is carried only through the shared CLI's head-bound coverage proof.
  * Failed proof/restamp falls back to the existing accepted-only rearm; other live verdicts remain protected.
  * Both operations are best-effort and report their outcomes separately from the durable heal comment.
- * Without a live review or merge-path label, a fresh, head-bound read permits adding review:pending.
+ * Without a live review label, a fresh, head-bound shared re-arm permits adding review:pending and removes stale landing signals.
  * CI lifecycle labels alone are insufficient: the drain removes them when checks turn green.
  * `--restore-routing-only` repairs historical routing loss on the freshly read PR head,
  * posting only a restoration explanation, with no heal marker, restamp, or rearm.
@@ -191,12 +191,13 @@ export function postOrOweCiHealComment({ pr, body, headSha, repo, post = postPrC
  * @param {{pr:number|string, repo?:string, cwd?:string, actor?:string, onlyIfAccepted?:boolean, spawn?:Function}} o
  * @returns {{ok:boolean, reason?:string}}
  */
-export function spawnCiHealRearm({ pr, repo, cwd, actor = 'conveyor CI-heal agent', onlyIfAccepted = true, spawn = spawnSync } = {}) {
+export function spawnCiHealRearm({ pr, repo, cwd, actor = 'conveyor CI-heal agent', onlyIfAccepted = true, onlyIf, headSha, spawn = spawnSync } = {}) {
   const args = [new URL('./rearm-review.mjs', import.meta.url).pathname, String(pr), `--actor=${actor}`];
   if (repo) args.push(`--repo=${repo}`);
   // #4333 — validated at the CHILD's mutation boundary: both callers only ever re-arm a stale acceptance, so a
   // `review:changes` verdict that lands between the caller's read and the child's read is never overwritten.
-  if (onlyIfAccepted) args.push('--only-if=accepted');
+  if (onlyIf === 'missing') args.push('--only-if=missing', `--expect-head=${headSha || ''}`);
+  else if (onlyIfAccepted) args.push('--only-if=accepted');
   try {
     // `spawnSync`-shaped (mirrors `restampAcceptance`'s own seam exactly) — NEVER throws on a non-zero exit, so
     // a refused re-arm (nothing to re-arm — the common case, no `review:accepted` live) is a plain `{ok:false}`
@@ -261,16 +262,18 @@ function restoreHealRouting({ pr, repo, headSha, currentHead = false }) {
 // ── IO SHELL (runs only as a CLI — the pure exports above stay side-effect-free on import) ────────────────────────
 /** Existing successful-heal review hand-back, shared with attempt-accounted probation heals. */
 export function handBackCiHealReview({ pr, repo, headSha, cwd = process.cwd(), actor,
-  exec = execFileSync, restamp = spawnCiHealRestamp, rearm = spawnCiHealRearm, restore = restoreHealRouting } = {}) {
+  exec = execFileSync, restamp = spawnCiHealRestamp, rearm = spawnCiHealRearm } = {}) {
   let rearmed = false;
   let restamped = false;
   let restored;
   let carryReason;
   try {
-    const viewArgs = ['pr', 'view', String(pr), '--json', 'labels'];
+    const viewArgs = ['pr', 'view', String(pr), '--json', 'labels,isDraft'];
     if (repo) viewArgs.push(`--repo=${repo}`);
     const raw = exec('gh', viewArgs, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
-    const labels = JSON.parse(raw || '{}').labels;
+    const observed = JSON.parse(raw || '{}');
+    const labels = observed.labels;
+    if (!Array.isArray(labels) || !labels.every(l => l && typeof l.name === 'string' && l.name.length > 0)) throw new Error('CI-heal review labels are unreadable');
     if (hasReviewLabel(labels, REVIEW_LABELS.accepted)) {
       const handback = {
         pr, repo, cwd, actor,
@@ -279,10 +282,16 @@ export function handBackCiHealReview({ pr, repo, headSha, cwd = process.cwd(), a
       restamped = carry.ok;
       if (!restamped) {
         carryReason = carry.reason;
-        rearmed = rearm(handback).ok;
+        const fallback = rearm(handback);
+        rearmed = fallback.ok;
+        if (!fallback.ok) carryReason = `${carryReason || ''}; re-arm failed: ${fallback.reason || 'unknown failure'}`;
       }
-    } else if (missingHealRouting(labels)) {
-      ({ restored } = restore({ pr, repo, headSha }));
+    } else if (observed.isDraft === false && !labels.some(l => l.name.startsWith('review:') || l.name === 'ready-to-merge')) {
+      // Only a PR KNOWN to be ready (`isDraft === false`) with neither a verdict nor the producer's own merge
+      // clearance is handed back; an unknown draft status or a `ready-to-merge` PR is left exactly as it is.
+      const result = rearm({ pr, repo, cwd, actor, headSha, onlyIf: 'missing' });
+      if (result.ok) restored = REVIEW_LABELS.pending;
+      else carryReason = result.reason || 'missing review handoff refused';
     }
   } catch (e) {
     carryReason = String(e.message || e);

@@ -1025,7 +1025,7 @@ describe('fetchPrStatesForRepo — #xr4ygg7 ONE gh pr list PER REPO, never one s
     expect(calls[0].cmd).toBe('gh');
     // #4415 — REST, not `pr list`: `['api', '-i', 'repos/<slug>/pulls?state=all&per_page=…&page=1']`.
     expect(calls[0].args[0]).toBe('api');
-    expect(calls[0].args).toContain('repos/chalbert/plateau-app/pulls?state=all&per_page=100&page=1');
+    expect(calls[0].args).toContain('repos/plateauapp/plateau-app/pulls?state=all&per_page=100&page=1');
     expect(states.byItem.get('181')).toBe('merged');  // an item-kind (conveyor-181) lookup
     expect(states.byPr.get('900')).toBe('merged');    // a PR_KIND (fix-900) lookup — DIFFERENT key, same fetch
     expect(states.byItem.get('900')).toBeUndefined(); // the PR's own number is NOT in the item-keyed map
@@ -1037,7 +1037,7 @@ describe('fetchPrStatesForRepo — #xr4ygg7 ONE gh pr list PER REPO, never one s
     fetchPrStatesForRepo('we', { 'pr-repo': 'chalbert/some-fork' }, { exec });
     expect(calls[0]).toContain('repos/chalbert/some-fork/pulls?state=all&per_page=100&page=1');
     fetchPrStatesForRepo('frontierui', { 'pr-repo': 'chalbert/some-fork' }, { exec });
-    expect(calls[1]).toContain('repos/chalbert/frontierui/pulls?state=all&per_page=100&page=1');
+    expect(calls[1]).toContain('repos/frontier-ui/frontierui/pulls?state=all&per_page=100&page=1');
   });
   it('--no-check-prs disables the axis with no exec call at all', () => {
     const exec = () => { throw new Error('must not be called'); };

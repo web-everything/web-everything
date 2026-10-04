@@ -22,6 +22,27 @@ function provider({ readPrState } = {}) {
 }
 
 describe('planReviewHoldCleanup', () => {
+  it('does NOT flag review:changes beside review:human — a send-back under a human hold is designed (#3657)', () => {
+    expect(planReviewHoldCleanup({ currentLabels: ['review:human', 'review:changes'] }))
+      .toEqual({ remove: [] });
+    expect(needsReviewHoldCleanup(pr(1, ['review:human', 'review:changes']))).toBe(false);
+  });
+
+  it('still flags accepted+human when review:changes also rides along', () => {
+    expect(planReviewHoldCleanup({ currentLabels: ['review:accepted', 'review:human', 'review:changes'] }))
+      .toEqual({ remove: [], flagged: ['review:accepted', 'review:human'] });
+  });
+
+  it('cleans pending beside human+changes without flagging or removing the send-back', () => {
+    expect(planReviewHoldCleanup({ currentLabels: ['review:human', 'review:changes', 'review:pending'] }))
+      .toEqual({ remove: ['review:pending'] });
+  });
+
+  it('still flags accepted+changes without a human hold', () => {
+    expect(planReviewHoldCleanup({ currentLabels: ['review:accepted', 'review:changes'] }))
+      .toEqual({ remove: [], flagged: ['review:accepted', 'review:changes'] });
+  });
+
   // #x01u7az — LIVE, PR #2549 (2026-09-24): review:pending added by a mechanical rearm on top of a still-live
   // review:human, never cleared. At most one review:* hold at a time.
   it('drops a stray review:pending that coexists with review:human', () => {
@@ -107,6 +128,37 @@ describe('needsReviewHoldCleanup', () => {
 });
 
 describe('sweepReviewHoldLabels', () => {
+  it('skips a PR carrying review:human + review:changes — no entry, no readPrState call', () => {
+    const p = provider();
+    const results = sweepReviewHoldLabels({
+      repo: 'o/n', provider: p,
+      listPrs: () => [pr(3657, ['review:human', 'review:changes'])],
+    });
+    expect(results).toEqual([]);
+    expect(p.calls.readPrState).toEqual([]);
+    expect(p.calls.set).toEqual([]);
+    expect(p.calls.postComment).toEqual([]);
+  });
+
+  it('keeps the send-back quiet over 100 sweeps while accepted+human still fails closed on fetch errors', () => {
+    const p = provider(); // readPrState throws: no flagged label may be removed on this error path
+    for (let tick = 0; tick < 100; tick += 1) {
+      expect(sweepReviewHoldLabels({
+        repo: 'o/n', provider: p,
+        listPrs: () => [
+          pr(3657, ['review:human', 'review:changes']),
+          pr(2767, ['review:accepted', 'review:human', 'review:changes']),
+        ],
+      })).toEqual([{
+        num: 2767, flagged: ['review:accepted', 'review:human'], flagReason: 'fetch-unavailable',
+        fetchError: 'readPrState not stubbed for this test',
+      }]);
+    }
+    expect(p.calls.readPrState).toEqual(Array.from({ length: 100 }, () => ({ repo: 'o/n', number: 2767 })));
+    expect(p.calls.set).toEqual([]);
+    expect(p.calls.postComment).toEqual([]);
+  });
+
   it('drops the stray review:pending from a PR that also carries review:human (PR #2549 shape)', () => {
     const p = provider();
     const results = sweepReviewHoldLabels({
@@ -149,7 +201,7 @@ describe('sweepReviewHoldLabels', () => {
   it('FLAGS (never heals) when the readPrState fetch itself fails — fail closed toward NOT deleting', () => {
     const p = provider(); // no readPrState stub → throws
     const results = sweepReviewHoldLabels({
-      repo: 'chalbert/web-everything', provider: p,
+      repo: 'web-everything/web-everything', provider: p,
       listPrs: () => [pr(2767, LIVE_LABELS)],
     });
     expect(results).toEqual([{
@@ -163,7 +215,7 @@ describe('sweepReviewHoldLabels', () => {
   it('FLAGS (never heals) when the PR\'s own comments prove a GENUINE current human clearance', () => {
     const p = provider({ readPrState: () => ({ headRefOid: 'aaa1111', comments: [{ body: '<!-- reviewed-sha: aaa1111 -->\n<!-- cleared-human: Ada -->', author: bot }] }) });
     const results = sweepReviewHoldLabels({
-      repo: 'chalbert/web-everything', provider: p,
+      repo: 'web-everything/web-everything', provider: p,
       listPrs: () => [pr(2767, LIVE_LABELS)],
     });
     expect(results).toEqual([{ num: 2767, flagged: ['review:accepted', 'review:human'], flagReason: 'genuine-clearance' }]);
@@ -174,11 +226,11 @@ describe('sweepReviewHoldLabels', () => {
   it('HEALS #2767\'s real (pre-fix) label + comment state — removes review:accepted, posts a comment, never touches review:human', () => {
     const p = provider({ readPrState: () => ({ headRefOid: LIVE_2767_HEAD, comments: LIVE_2767_COMMENTS }) });
     const results = sweepReviewHoldLabels({
-      repo: 'chalbert/web-everything', provider: p,
+      repo: 'web-everything/web-everything', provider: p,
       listPrs: () => [pr(2767, LIVE_LABELS)],
     });
     expect(results).toEqual([{ num: 2767, healed: ['review:accepted'], commentPosted: true }]);
-    expect(p.calls.set).toEqual([{ repo: 'chalbert/web-everything', number: 2767, spec: { remove: ['review:accepted'] } }]);
+    expect(p.calls.set).toEqual([{ repo: 'web-everything/web-everything', number: 2767, spec: { remove: ['review:accepted'] } }]);
     expect(p.calls.postComment).toHaveLength(1);
     expect(p.calls.postComment[0].body).toContain('review:accepted` removed');
     expect(p.calls.postComment[0].body).toContain('review:human` remains');
@@ -189,7 +241,7 @@ describe('sweepReviewHoldLabels', () => {
   it('HEALS #2766 too — the identical real shape, a different PR', () => {
     const p = provider({ readPrState: () => ({ headRefOid: 'abbe08beacae462f98d6caf654d3ce7867c92801', comments: LIVE_2767_COMMENTS }) });
     const results = sweepReviewHoldLabels({
-      repo: 'chalbert/web-everything', provider: p,
+      repo: 'web-everything/web-everything', provider: p,
       listPrs: () => [pr(2766, LIVE_LABELS)],
     });
     expect(results).toEqual([{ num: 2766, healed: ['review:accepted'], commentPosted: true }]);
@@ -198,7 +250,7 @@ describe('sweepReviewHoldLabels', () => {
   it('dry-run computes the heal but never posts the comment or calls setLabels', () => {
     const p = provider({ readPrState: () => ({ headRefOid: LIVE_2767_HEAD, comments: LIVE_2767_COMMENTS }) });
     const results = sweepReviewHoldLabels({
-      repo: 'chalbert/web-everything', provider: p, dryRun: true,
+      repo: 'web-everything/web-everything', provider: p, dryRun: true,
       listPrs: () => [pr(2767, LIVE_LABELS)],
     });
     expect(results).toEqual([{ num: 2767, healed: ['review:accepted'] }]); // no commentPosted — nothing was posted
@@ -210,12 +262,12 @@ describe('sweepReviewHoldLabels', () => {
     const p = provider({ readPrState: () => ({ headRefOid: LIVE_2767_HEAD, comments: LIVE_2767_COMMENTS }) });
     p.postComment = () => { throw new Error('gh comment boom'); };
     const results = sweepReviewHoldLabels({
-      repo: 'chalbert/web-everything', provider: p,
+      repo: 'web-everything/web-everything', provider: p,
       listPrs: () => [pr(2767, LIVE_LABELS)],
     });
     expect(results).toEqual([{ num: 2767, healed: ['review:accepted'], error: 'gh comment boom' }]);
     // The removal still happened despite the comment failing — losing the explanation is bad, losing the fix is worse.
-    expect(p.calls.set).toEqual([{ repo: 'chalbert/web-everything', number: 2767, spec: { remove: ['review:accepted'] } }]);
+    expect(p.calls.set).toEqual([{ repo: 'web-everything/web-everything', number: 2767, spec: { remove: ['review:accepted'] } }]);
   });
 
   it('dry-run reports the plan and never calls setLabels', () => {

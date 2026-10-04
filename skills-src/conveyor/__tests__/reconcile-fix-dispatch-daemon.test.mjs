@@ -28,7 +28,7 @@ describe('hasStaleMainRefusal', () => {
     let message = null;
     try { assertMainNotStale('/repo', () => ({ action: 'warn', reason: 'diverged', behind: 1, ahead: 5, dirty: false })); }
     catch (e) { message = e.message; }
-    expect(hasStaleMainRefusal({ refusals: [{ repo: 'chalbert/frontierui', kind: 'tick-failed', why: message }] })).toBe(true);
+    expect(hasStaleMainRefusal({ refusals: [{ repo: 'frontier-ui/frontierui', kind: 'tick-failed', why: message }] })).toBe(true);
   });
   it('false for an ordinary, unrelated tick failure', () => {
     expect(hasStaleMainRefusal({ refusals: [{ repo: 'x', kind: 'tick-failed', why: 'gh: rate limited' }] })).toBe(false);
@@ -92,9 +92,9 @@ describe('runDaemonLoop — the pure control flow', () => {
 describe('FIX_DISPATCH_DAEMON_REPOS', () => {
   it('is every constellation repo\'s real slug, not just WE (#x1rr9rh, multi-repo slice 2)', () => {
     expect(FIX_DISPATCH_DAEMON_REPOS.sort()).toEqual(Object.values(CONSTELLATION_REPOS).map((r) => r.slug).sort());
-    expect(FIX_DISPATCH_DAEMON_REPOS).toContain('chalbert/plateau-app');
-    expect(FIX_DISPATCH_DAEMON_REPOS).toContain('chalbert/frontierui');
-    expect(FIX_DISPATCH_DAEMON_REPOS).toContain('chalbert/web-everything');
+    expect(FIX_DISPATCH_DAEMON_REPOS).toContain('plateauapp/plateau-app');
+    expect(FIX_DISPATCH_DAEMON_REPOS).toContain('frontier-ui/frontierui');
+    expect(FIX_DISPATCH_DAEMON_REPOS).toContain('web-everything/web-everything');
   });
 });
 
@@ -181,15 +181,15 @@ describe('buildCliDaemonEffects — the real-effect factory (heartbeat wiring on
     const log = { error: vi.fn() };
     const effects = buildCliDaemonEffects({ owner: 'x', log });
     effects.onTick({
-      repos: [{ repo: 'chalbert/web-everything', result: {} }, { repo: 'chalbert/plateau-app', error: 'gh: rate limited' }],
-      dispatched: [{ pr: 1, repo: 'chalbert/web-everything' }],
-      refusals: [{ kind: 'unsupported-repo', prNumber: 2, repo: 'chalbert/plateau-app' }],
+      repos: [{ repo: 'web-everything/web-everything', result: {} }, { repo: 'plateauapp/plateau-app', error: 'gh: rate limited' }],
+      dispatched: [{ pr: 1, repo: 'web-everything/web-everything' }],
+      refusals: [{ kind: 'unsupported-repo', prNumber: 2, repo: 'plateauapp/plateau-app' }],
     });
     expect(log.error).toHaveBeenCalledWith(
-      'reconcile-fix-dispatch-daemon: tick (chalbert/web-everything, chalbert/plateau-app) — dispatched 1, refused 1',
+      'reconcile-fix-dispatch-daemon: tick (web-everything/web-everything, plateauapp/plateau-app) — dispatched 1, refused 1',
     );
     expect(log.error).toHaveBeenCalledWith(
-      'reconcile-fix-dispatch-daemon: chalbert/plateau-app tick failed (non-fatal, other repos unaffected): gh: rate limited',
+      'reconcile-fix-dispatch-daemon: plateauapp/plateau-app tick failed (non-fatal, other repos unaffected): gh: rate limited',
     );
   });
 
@@ -201,13 +201,13 @@ describe('buildCliDaemonEffects — the real-effect factory (heartbeat wiring on
     const log = { error: vi.fn() };
     const effects = buildCliDaemonEffects({ owner: 'x', log });
     effects.onTick({
-      repos: [{ repo: 'chalbert/web-everything', result: {} }],
+      repos: [{ repo: 'web-everything/web-everything', result: {} }],
       dispatched: [],
-      refusals: [{ kind: 'no-lane', pr: 2636, repo: 'chalbert/web-everything', why: 'no free lane to dispatch a CI-heal agent for PR #2636' }],
+      refusals: [{ kind: 'no-lane', pr: 2636, repo: 'web-everything/web-everything', why: 'no free lane to dispatch a CI-heal agent for PR #2636' }],
       reconcileRefusals: [],
     });
     expect(log.error).toHaveBeenCalledWith(
-      'reconcile-fix-dispatch-daemon: refused no-lane chalbert/web-everything PR #2636 — no free lane to dispatch a CI-heal agent for PR #2636',
+      'reconcile-fix-dispatch-daemon: refused no-lane web-everything/web-everything PR #2636 — no free lane to dispatch a CI-heal agent for PR #2636',
     );
   });
 
@@ -215,16 +215,16 @@ describe('buildCliDaemonEffects — the real-effect factory (heartbeat wiring on
     const log = { error: vi.fn() };
     const effects = buildCliDaemonEffects({ owner: 'x', log });
     effects.onTick({
-      repos: [{ repo: 'chalbert/web-everything', result: {} }],
+      repos: [{ repo: 'web-everything/web-everything', result: {} }],
       dispatched: [],
       refusals: [],
       reconcileRefusals: [{
-        kind: 'owed-ci-rerun', prNumber: 2635, repo: 'chalbert/web-everything',
+        kind: 'owed-ci-rerun', prNumber: 2635, repo: 'web-everything/web-everything',
         why: "the required check failed at 2026-09-25T01:57:47Z, while main's own CI was red",
       }],
     });
     expect(log.error).toHaveBeenCalledWith(
-      "reconcile-fix-dispatch-daemon: reconcile-refused owed-ci-rerun chalbert/web-everything PR #2635 — the required check failed at 2026-09-25T01:57:47Z, while main's own CI was red",
+      "reconcile-fix-dispatch-daemon: reconcile-refused owed-ci-rerun web-everything/web-everything PR #2635 — the required check failed at 2026-09-25T01:57:47Z, while main's own CI was red",
     );
   });
 
@@ -232,9 +232,9 @@ describe('buildCliDaemonEffects — the real-effect factory (heartbeat wiring on
     const log = { error: vi.fn() };
     const effects = buildCliDaemonEffects({ owner: 'x', log });
     effects.onTick({
-      repos: [{ repo: 'chalbert/frontierui', error: 'gh: rate limited' }],
+      repos: [{ repo: 'frontier-ui/frontierui', error: 'gh: rate limited' }],
       dispatched: [],
-      refusals: [{ repo: 'chalbert/frontierui', prNumber: null, kind: 'tick-failed', why: 'gh: rate limited' }],
+      refusals: [{ repo: 'frontier-ui/frontierui', prNumber: null, kind: 'tick-failed', why: 'gh: rate limited' }],
       reconcileRefusals: [],
     });
     const calls = log.error.mock.calls.map((c) => c[0]);
@@ -430,7 +430,7 @@ describe('runTickAllRepos — the daemon tick now runs BOTH fix and ci-heal disp
     // calls that same guard near its own top, exactly as `runReconcileFixDispatch` already does.
     const ciHealTick = vi.fn(async () => { throw new Error(message); });
     const out = await runTickAllRepos({
-      repos: ['chalbert/web-everything'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
+      repos: ['web-everything/web-everything'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
     // Proves the WIRING: hasStaleMainRefusal reads whatever `runTickAllRepos` puts in `.refusals`, regardless
     // of which half (fix or ci-heal) produced it — a ci-heal-side entry is never dropped or siloed from the
@@ -561,7 +561,7 @@ describe('buildCliDaemonEffects — onTick logs the exact pause line when authPa
     const log = { error: vi.fn() };
     const effects = buildCliDaemonEffects({ owner: 'test-owner', log });
     effects.onTick({
-      repos: [{ repo: 'chalbert/web-everything' }], dispatched: [], refusals: [], reconcileRefusals: [],
+      repos: [{ repo: 'web-everything/web-everything' }], dispatched: [], refusals: [], reconcileRefusals: [],
       authPaused: true, authPauseReason: 'paused: Claude login expired — run /login',
     });
     expect(log.error).toHaveBeenCalledWith('reconcile-fix-dispatch-daemon: paused: Claude login expired — run /login');
@@ -571,7 +571,7 @@ describe('buildCliDaemonEffects — onTick logs the exact pause line when authPa
     const log = { error: vi.fn() };
     const effects = buildCliDaemonEffects({ owner: 'test-owner', log });
     effects.onTick({
-      repos: [{ repo: 'chalbert/web-everything' }], dispatched: [], refusals: [], reconcileRefusals: [], authPaused: false,
+      repos: [{ repo: 'web-everything/web-everything' }], dispatched: [], refusals: [], reconcileRefusals: [], authPaused: false,
     });
     expect(log.error.mock.calls.some((c) => String(c[0]).includes('paused: Claude login expired'))).toBe(false);
   });
@@ -699,7 +699,7 @@ describe('runHungCiRecoveryAllRepos — one sweepHungCiRecovery call per watched
         prNumber: 2636, runId: 36187480460, ok: true, action: 'cancelled-no-rerun', kind: 'repeat-hang', why: 'job hung twice',
       }],
     }));
-    const out = runHungCiRecoveryAllRepos({ repos: ['chalbert/web-everything'], tick });
+    const out = runHungCiRecoveryAllRepos({ repos: ['web-everything/web-everything'], tick });
     expect(out.dispatched).toEqual([expect.objectContaining({ prNumber: 2636, kind: 'repeat-hang', action: 'cancelled-no-rerun' })]);
   });
 
@@ -764,7 +764,7 @@ describe('runTickAllRepos — now runs THREE halves: fix, ci-heal, and hung-ci-r
 describe('formatHungActionLine — one printable line per hung-run action, with its reason (xd1sfms)', () => {
   it('prints a successful action with its reason', () => {
     const line = formatHungActionLine({
-      repo: 'chalbert/web-everything', prNumber: 2636, runId: 36161558017, ok: true, action: 'cancelled-and-rerun', why: 'stuck 3h',
+      repo: 'web-everything/web-everything', prNumber: 2636, runId: 36161558017, ok: true, action: 'cancelled-and-rerun', why: 'stuck 3h',
     });
     expect(line).toContain('PR #2636');
     expect(line).toContain('run 36161558017');
@@ -774,7 +774,7 @@ describe('formatHungActionLine — one printable line per hung-run action, with 
 
   it('prints a FAILED action with its error AND its reason — never silently dropped', () => {
     const line = formatHungActionLine({
-      repo: 'chalbert/web-everything', prNumber: 2636, runId: 1, ok: false, action: 'cancel-failed', error: 'gh: not found', why: 'stuck 3h',
+      repo: 'web-everything/web-everything', prNumber: 2636, runId: 1, ok: false, action: 'cancel-failed', error: 'gh: not found', why: 'stuck 3h',
     });
     expect(line).toContain('FAILED cancel-failed');
     expect(line).toContain('gh: not found');
@@ -875,7 +875,7 @@ describe('runTickAllRepos — now runs FOUR halves: fix, ci-heal, hung-ci-recove
 describe('formatMainRedRebaseActionLine — one printable line per mechanical-rebase action (x5uqim1 follow-up)', () => {
   it('prints a successful action', () => {
     const line = formatMainRedRebaseActionLine({
-      repo: 'chalbert/web-everything', prNumber: 2685, headRefName: 'lane/xgqz204', ok: true, action: 'rebased',
+      repo: 'web-everything/web-everything', prNumber: 2685, headRefName: 'lane/xgqz204', ok: true, action: 'rebased',
     });
     expect(line).toContain('PR #2685');
     expect(line).toContain('lane/xgqz204');
@@ -884,7 +884,7 @@ describe('formatMainRedRebaseActionLine — one printable line per mechanical-re
 
   it('prints a FAILED action with its error', () => {
     const line = formatMainRedRebaseActionLine({
-      repo: 'chalbert/web-everything', prNumber: 2685, headRefName: 'lane/xgqz204', ok: false, action: 'error', error: 'merge conflict',
+      repo: 'web-everything/web-everything', prNumber: 2685, headRefName: 'lane/xgqz204', ok: false, action: 'error', error: 'merge conflict',
     });
     expect(line).toContain('FAILED error');
     expect(line).toContain('merge conflict');
@@ -907,7 +907,7 @@ describe('runTickAllRepos — source contract: really calls runMainRedRebaseAllR
   });
 });
 
-// xi4od2p (#4075/#3383) — the daemon's SIXTH half: missing-run recovery (PR chalbert/web-everything#2729's LIVE
+// xi4od2p (#4075/#3383) — the daemon's SIXTH half: missing-run recovery (PR web-everything/web-everything#2729's LIVE
 // incident — a required check that never even started). Mirrors {@link runMainRedRebaseAllRepos}'s own suite
 // shape exactly: per-repo isolation via injected `tick`, then a `runTickAllRepos` merge proof, then a
 // source-contract proof — same reason this half rides THIS daemon (no launchd job installs `pass-daemon.mjs`
@@ -1021,7 +1021,7 @@ describe('runPromoteDraftDispatchAllRepos (draft-first PRs)', () => {
 // threw the stale-main guard every tick and the daemon logged NOTHING for it — a `tick-failed` refusal from any
 // half but the fix half was skipped as "already printed". Every promote outcome must reach the log.
 describe('onTick — every promote-draft outcome is logged (#3806 incident)', () => {
-  const REPO = 'chalbert/web-everything';
+  const REPO = 'web-everything/web-everything';
   const tickOf = (over) => {
     const log = { error: vi.fn() };
     buildCliDaemonEffects({ owner: 'x', log }).onTick({ repos: [{ repo: REPO, result: {} }], dispatched: [], refusals: [], reconcileRefusals: [], ...over });
@@ -1044,7 +1044,7 @@ describe('onTick — every promote-draft outcome is logged (#3806 incident)', ()
   it('logs one line per promoted draft', () => {
     const lines = tickOf({ promoteDraft: { dispatched: [{ pr: 3806, kind: 'promote-draft', repo: REPO }] }, dispatched: [{ pr: 3806, kind: 'promote-draft', repo: REPO }] });
     expect(lines).toContain(formatPromoteActionLine({ pr: 3806, repo: REPO }));
-    expect(formatPromoteActionLine({ pr: 3806, repo: REPO })).toMatch(/promoted chalbert\/web-everything PR #3806 to ready for review/);
+    expect(formatPromoteActionLine({ pr: 3806, repo: REPO })).toMatch(/promoted web-everything\/web-everything PR #3806 to ready for review/);
   });
 
   it('logs a draft the promote half did not promote, with its reason', () => {
@@ -1102,7 +1102,7 @@ describe('runTickAllRepos — draft-first PRs: the promote-draft half rides THIS
 describe('formatMissingRunActionLine — one printable line per missing-run-trigger action, including the label-clear note (xi4od2p)', () => {
   it('prints a successful action with the label-cleared note', () => {
     const line = formatMissingRunActionLine({
-      repo: 'chalbert/web-everything', prNumber: 2729, headRefName: 'lane/4166-x', ok: true, action: 'update-branch',
+      repo: 'web-everything/web-everything', prNumber: 2729, headRefName: 'lane/4166-x', ok: true, action: 'update-branch',
       labelCleared: true, why: 'no run at all',
     });
     expect(line).toContain('PR #2729');
@@ -1114,7 +1114,7 @@ describe('formatMissingRunActionLine — one printable line per missing-run-trig
 
   it('prints a FAILED action with its error, and no label-cleared note when nothing was cleared', () => {
     const line = formatMissingRunActionLine({
-      repo: 'chalbert/web-everything', prNumber: 2729, headRefName: 'lane/4166-x', ok: false, action: 'workflow-dispatch',
+      repo: 'web-everything/web-everything', prNumber: 2729, headRefName: 'lane/4166-x', ok: false, action: 'workflow-dispatch',
       labelCleared: false, error: 'workflow not found',
     });
     expect(line).toContain('FAILED workflow-dispatch');
@@ -1141,7 +1141,7 @@ describe('runTickAllRepos — source contract: really calls runMissingRunRecover
 
  it('logs computed scope ranks from the real per-repo tick result shape', () => {
   const log = { error: vi.fn() };
-  buildCliDaemonEffects({ owner: 'x', log }).onTick({ repos: [{ repo: 'chalbert/web-everything',
+  buildCliDaemonEffects({ owner: 'x', log }).onTick({ repos: [{ repo: 'web-everything/web-everything',
     result: { scopeRanks: [{ pr: 3311, rank: 1, blocks: 5, ageHours: 2, score: 7, aged: false }] } }] });
-  expect(log.error).toHaveBeenCalledWith('reconcile-fix-dispatch-daemon: scope-rank chalbert/web-everything PR #3311 — rank 1, blocks 5, age 2h, score 7, aged-FIFO false');
+  expect(log.error).toHaveBeenCalledWith('reconcile-fix-dispatch-daemon: scope-rank web-everything/web-everything PR #3311 — rank 1, blocks 5, age 2h, score 7, aged-FIFO false');
 });

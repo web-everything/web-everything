@@ -120,11 +120,11 @@ describe('abandoned builder draft recovery', () => {
       isPidAlive: () => authorLive, listAgents: () => [],
       api: vi.fn(path => path.startsWith('pulls/')
         ? { draft: true, state: 'open', updated_at: new Date().toISOString(),
-          head: { ref: candidate.laneRef, sha: 'abc', repo: { full_name: 'chalbert/web-everything' } } }
+          head: { ref: candidate.laneRef, sha: 'abc', repo: { full_name: 'web-everything/web-everything' } } }
         : path === 'commits/abc' ? { commit: { committer: { date: headCommittedAt } } }
         : { check_runs: [
           { id: 1, name: 'review-gate', conclusion: 'failure' },
-          { id: 2, name: 'test-shard (2)', conclusion: 'failure', details_url: 'https://github.com/chalbert/web-everything/actions/runs/123/job/456' },
+          { id: 2, name: 'test-shard (2)', conclusion: 'failure', details_url: 'https://github.com/web-everything/web-everything/actions/runs/123/job/456' },
         ] }),
       paged: vi.fn(() => []), gh: vi.fn(() => 'setup\n##[error]AssertionError: Done-when 2\nsummary'),
       freeLanes: () => [8], reserve: () => ({ ok: true }), release: vi.fn(),
@@ -147,13 +147,13 @@ describe('abandoned builder draft recovery', () => {
       for (let i = 0; i < MAX_RESUME_ATTEMPTS + 1; i++) await cliRecoverBuilderDrafts(args, io);
       expect(io.dispatch).toHaveBeenCalledTimes(MAX_RESUME_ATTEMPTS);
       expect(io.dispatch).toHaveBeenCalledWith(expect.objectContaining({ pr: 3033, itemNum: '4502', laneRef: candidate.laneRef, lane: 8, reason: 'red-ci' }));
-      expect(io.gh).toHaveBeenCalledWith(['pr', 'edit', '3033', '--repo', 'chalbert/web-everything', '--add-label', 'blocked:needs-human']);
-      expect(io.gh).toHaveBeenCalledWith(['pr', 'comment', '3033', '--repo', 'chalbert/web-everything', '--body', expect.stringContaining('First error: ##[error]AssertionError: Done-when 2')]);
+      expect(io.gh).toHaveBeenCalledWith(['pr', 'edit', '3033', '--repo', 'web-everything/web-everything', '--add-label', 'blocked:needs-human']);
+      expect(io.gh).toHaveBeenCalledWith(['pr', 'comment', '3033', '--repo', 'web-everything/web-everything', '--body', expect.stringContaining('First error: ##[error]AssertionError: Done-when 2')]);
       expect(io.api).toHaveBeenCalledWith('commits/abc');
       // A producer receipt survives a wrapper that never settled its run.
       rmSync(join(dir, 'build-red-draft-resumes'), { recursive: true, force: true });
       const receipt = { runId: 'dispatch-lane-test', entry: structuredClone(row),
-        repo: 'chalbert/web-everything', pr: 3033, ref: candidate.laneRef };
+        repo: 'web-everything/web-everything', pr: 3033, ref: candidate.laneRef };
       row.result = null;
       row.status = 'in-flight';
       io.dispatch.mockClear();

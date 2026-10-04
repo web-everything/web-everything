@@ -521,7 +521,7 @@ describe('makeCliMechanicalPasses — the review-reconcile dispatch block never 
         calls.push([cmd, ...args]);
         const joined = args.join(' ');
         if (joined.includes('reconcile-pass.mjs')) return JSON.stringify(plan);
-        if (cmd === 'gh' && args.includes('repo') && args.includes('view')) return 'chalbert/web-everything';
+        if (cmd === 'gh' && args.includes('repo') && args.includes('view')) return 'web-everything/web-everything';
         if (joined.includes('review-dispatch.mjs')) {
           if (dispatchThrows) throw new Error('review-dispatch.mjs: assertMainNotStale tripped');
           return '';
@@ -539,7 +539,7 @@ describe('makeCliMechanicalPasses — the review-reconcile dispatch block never 
     const cp = await import('node:child_process');
     cp.execFileSync.mockImplementation(execFileSync);
 
-    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'chalbert/web-everything', exec: cp.execFileSync });
+    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', exec: cp.execFileSync });
     await mechanicalPasses({ out: {} });
 
     const dispatchCalls = calls.filter((c) => c.join(' ').includes('review-dispatch.mjs'));
@@ -556,12 +556,12 @@ describe('makeCliMechanicalPasses — the review-reconcile dispatch block never 
     const cp = await import('node:child_process');
     cp.execFileSync.mockImplementation(execFileSync);
 
-    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'chalbert/web-everything', exec: cp.execFileSync });
+    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', exec: cp.execFileSync });
     await mechanicalPasses({ out: {} });
 
     const roundTagCalls = calls.filter((c) => c.join(' ').includes('review-round-tag.mjs'));
     expect(roundTagCalls).toHaveLength(1);
-    expect(roundTagCalls[0]).toEqual(expect.arrayContaining(['99', '--repo=chalbert/web-everything', '--round=3']));
+    expect(roundTagCalls[0]).toEqual(expect.arrayContaining(['99', '--repo=web-everything/web-everything', '--round=3']));
   });
 
   it('still runs the informative review-status-tag.mjs sweep even when the dispatch above it failed', async () => {
@@ -572,7 +572,7 @@ describe('makeCliMechanicalPasses — the review-reconcile dispatch block never 
     const cp = await import('node:child_process');
     cp.execFileSync.mockImplementation(execFileSync);
 
-    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'chalbert/web-everything', exec: cp.execFileSync });
+    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', exec: cp.execFileSync });
     await mechanicalPasses({ out: {} });
 
     const statusTagCalls = calls.filter((c) => c.join(' ').includes('review-status-tag.mjs'));
@@ -601,7 +601,7 @@ describe('makeCliMechanicalPasses — invokes the exact set of mechanical passes
     const cp = await import('node:child_process');
     cp.execFileSync.mockImplementation(execFileSync);
 
-    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'chalbert/web-everything', exec: cp.execFileSync });
+    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', exec: cp.execFileSync });
     await mechanicalPasses({ out: {} });
 
     // The exact relative script path (or literal flag) each call carries, in the order `execFileSync` saw them
@@ -609,22 +609,22 @@ describe('makeCliMechanicalPasses — invokes the exact set of mechanical passes
     // assertion goes red, which is the whole point (a `grep` for the added line, this PR's own backlog card
     // cited as its only prior check, catches none of that).
     expect(calls.filter((c) => c[0] === 'node').map((c) => c.filter((a) => !a.startsWith('--prs-file=')).join(' '))).toEqual([
-      'node /scripts/conveyor/infra-blocked.mjs retry --repo=chalbert/web-everything',
-      'node /scripts/conveyor/lease-reaper.mjs --repo=chalbert/web-everything',
-      'node /scripts/conveyor/session-reaper.mjs --repo=chalbert/web-everything',
-      'node /scripts/conveyor/branch-drift.mjs sweep --repo=chalbert/web-everything',
-      'node /scripts/conveyor/lane-pool-health-watch.mjs --repo=chalbert/web-everything',
-      'node /scripts/operations/operator-notify.mjs --once --repo=chalbert/web-everything',
-      'node /scripts/conveyor/reconcile-fix-dispatch.mjs --repo=chalbert/web-everything',
-      'node /scripts/operations/ci-heal-pr-dispatch.mjs --repo=chalbert/web-everything',
-      'node /scripts/operations/promote-draft-pr-dispatch.mjs --repo=chalbert/web-everything',
-      'node /scripts/conveyor/ci-queue-watch.mjs sweep --repo=chalbert/web-everything',
-      'node /scripts/conveyor/parked-pr-conflict-watch.mjs sweep --repo=chalbert/web-everything',
-      'node /scripts/conveyor/advisory-label-sweep.mjs sweep --repo=chalbert/web-everything',
-      'node /scripts/conveyor/review-hold-reconcile.mjs sweep --repo=chalbert/web-everything',
-      'node /scripts/conveyor/reconcile-pass.mjs --json --repo=chalbert/web-everything',
-      'node /scripts/conveyor/duplicate-pr-watch.mjs sweep --repo=chalbert/web-everything',
-      'node /scripts/conveyor/parked-pr-progress-watch.mjs sweep --repo=chalbert/web-everything',
+      'node /scripts/conveyor/infra-blocked.mjs retry --repo=web-everything/web-everything',
+      'node /scripts/conveyor/lease-reaper.mjs --repo=web-everything/web-everything',
+      'node /scripts/conveyor/session-reaper.mjs --repo=web-everything/web-everything',
+      'node /scripts/conveyor/branch-drift.mjs sweep --repo=web-everything/web-everything',
+      'node /scripts/conveyor/lane-pool-health-watch.mjs --repo=web-everything/web-everything',
+      'node /scripts/operations/operator-notify.mjs --once --repo=web-everything/web-everything',
+      'node /scripts/conveyor/reconcile-fix-dispatch.mjs --repo=web-everything/web-everything',
+      'node /scripts/operations/ci-heal-pr-dispatch.mjs --repo=web-everything/web-everything',
+      'node /scripts/operations/promote-draft-pr-dispatch.mjs --repo=web-everything/web-everything',
+      'node /scripts/conveyor/ci-queue-watch.mjs sweep --repo=web-everything/web-everything',
+      'node /scripts/conveyor/parked-pr-conflict-watch.mjs sweep --repo=web-everything/web-everything',
+      'node /scripts/conveyor/advisory-label-sweep.mjs sweep --repo=web-everything/web-everything',
+      'node /scripts/conveyor/review-hold-reconcile.mjs sweep --repo=web-everything/web-everything',
+      'node /scripts/conveyor/reconcile-pass.mjs --json --repo=web-everything/web-everything',
+      'node /scripts/conveyor/duplicate-pr-watch.mjs sweep --repo=web-everything/web-everything',
+      'node /scripts/conveyor/parked-pr-progress-watch.mjs sweep --repo=web-everything/web-everything',
     ]);
   });
 });
@@ -673,14 +673,14 @@ describe('one open-PR snapshot per mechanical tick', () => {
           // It exists while each consumer runs and contains the full snapshot.
           snapshots.push(JSON.parse(readFileSync(file, 'utf8')));
         } else {
-          consumers[name]({ repo: 'chalbert/web-everything', exec: cp.execFileSync });
+          consumers[name]({ repo: 'web-everything/web-everything', exec: cp.execFileSync });
         }
         if (consumerThrows) throw new Error('consumer failed');
       }
       return name === 'reconcile-pass.mjs' ? JSON.stringify({ dispatch: [], refusals: [] }) : '';
     });
     try {
-      const run = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'chalbert/web-everything', exec: cp.execFileSync });
+      const run = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', exec: cp.execFileSync });
       for (let i = 0; i < ticks; i++) await run({ out: {} });
       for (const snapshot of snapshots) expect(snapshot).toEqual(fixture);
       return { calls, files, warnings: stderr.mock.calls.map(([line]) => line) };
@@ -696,7 +696,7 @@ describe('one open-PR snapshot per mechanical tick', () => {
   it('fetches exactly once and invokes all six consumers once with the same live file, then deletes it', async () => {
     const { calls, files } = await tick();
     const fetches = calls.filter(([cmd, ...args]) => cmd === 'gh' && args[0] === 'pr' && args[1] === 'list');
-    expect(fetches).toEqual([['gh', 'pr', 'list', '--state', 'open', '--limit', '200', '--json', OPEN_PR_LIST_FIELDS, '--repo', 'chalbert/web-everything']]);
+    expect(fetches).toEqual([['gh', 'pr', 'list', '--state', 'open', '--limit', '200', '--json', OPEN_PR_LIST_FIELDS, '--repo', 'web-everything/web-everything']]);
     const consumed = consumerCalls(calls);
     for (const call of calls.filter(([cmd, script]) => cmd === 'node' && !consumers[script.split('/').pop()] && !script.endsWith('/reconcile-fix-dispatch.mjs') && !script.endsWith('/ci-heal-pr-dispatch.mjs') && !script.endsWith('/promote-draft-pr-dispatch.mjs'))) {
       expect(call.some((a) => a.startsWith('--prs-file='))).toBe(false);
@@ -788,7 +788,7 @@ describe('makeCliMechanicalPasses — skipPasses omits exactly the named pass(es
     const cp = await import('node:child_process');
     cp.execFileSync.mockImplementation(execFileSync);
     const mechanicalPasses = makeCliMechanicalPasses({
-      scriptsDir: '/scripts', repo: 'chalbert/web-everything', exec: cp.execFileSync, skipPasses,
+      scriptsDir: '/scripts', repo: 'web-everything/web-everything', exec: cp.execFileSync, skipPasses,
     });
     await mechanicalPasses({ out: {} });
     return calls.filter((c) => c[0] === 'node').map((c) => c[1]);

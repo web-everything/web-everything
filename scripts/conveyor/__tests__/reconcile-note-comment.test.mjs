@@ -149,10 +149,10 @@ describe('postNoteComment — the IO shell', () => {
   it('shells `gh pr comment <pr> --body <body> --repo <repo>` and reports ok', () => {
     const exec = (file, args) => {
       expect(file).toBe('gh');
-      expect(args).toEqual(['pr', 'comment', '10', '--body', 'hello', '--repo', 'chalbert/web-everything']);
+      expect(args).toEqual(['pr', 'comment', '10', '--body', 'hello', '--repo', 'web-everything/web-everything']);
       return '';
     };
-    expect(postNoteComment({ repo: 'chalbert/web-everything', pr: 10, body: 'hello', exec })).toEqual({ ok: true });
+    expect(postNoteComment({ repo: 'web-everything/web-everything', pr: 10, body: 'hello', exec })).toEqual({ ok: true });
   });
 
   it('omits --repo when none is given', () => {

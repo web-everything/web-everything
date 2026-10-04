@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES, fixDispatchClaimRoot, fixDispatchClaimOwner, fixDispatchResource,
-  acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, fixDispatchSessionName,
+  releaseSessionFixDispatchClaims, acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, fixDispatchSessionName,
   isClaimSessionLive, listFixDispatchClaims, refreshLiveFixDispatchClaims, MAX_FIX_DISPATCH_CLAIM_REFRESH_MS,
 } from '../fix-dispatch-claim.mjs';
 import { heartbeat } from '../../readiness/file-locks.mjs';
@@ -536,4 +536,17 @@ describe('overlap claim settlement', () => {
     } });
     expect(readFixDispatchClaim({ repo: 'we', pr: 3103, lockRoot: claimRoot }).meta.claimedAt).toBe(iso(T0 + 500));
   });
+});
+
+
+it('releaseSessionFixDispatchClaims releases only the claim minted for that who', () => {
+  for (const [pr, kind] of [[3311, 'fix'], [3311, 'ci-heal'], [3312, 'fix']]) {
+    acquireFixDispatchClaim({ repo: 'we', pr, kind, owner: 'daemon:1', lockRoot: claimRoot });
+  }
+  expect(releaseSessionFixDispatchClaims({ repo: 'we', pr: 3311, who: 'fix-3311', lockRoot: claimRoot }).released)
+    .toEqual([{ kind: 'fix', owner: 'daemon:1' }]);
+  expect(readFixDispatchClaim({ repo: 'we', pr: 3311, lockRoot: claimRoot })).toBeNull();
+  for (const [pr, kind] of [[3311, 'ci-heal'], [3312, 'fix']]) {
+    expect(readFixDispatchClaim({ repo: 'we', pr, kind, lockRoot: claimRoot })).not.toBeNull();
+  }
 });

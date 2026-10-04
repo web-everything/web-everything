@@ -45,7 +45,7 @@ describe('merge-ai-prs — AI detection', () => {
     expect(isAiGeneratedPr({ commits: [mechMerge] })).toBe(false);
   });
 
-  // Live-caught 2026-09-26 on `chalbert/web-everything#2741` (epic #4075/#3383): the drain lands a family of
+  // Live-caught 2026-09-26 on `web-everything/web-everything#2741` (epic #4075/#3383): the drain lands a family of
   // bookkeeping commits directly onto `main` — `drain: JIT-number …→#NNNN at land (#2288)` / `drain: resolve
   // #NNNN on land (#2748)` — and a long-lived lane that merges a newer `main` into itself inherits them into
   // its OWN PR's `commits` list, alongside a real merge commit whose body is git's own auto-appended
@@ -529,9 +529,9 @@ describe('merge-ai-prs — #2683 matchesOnlyTarget (the --only fast-drain repo-s
     expect(matchesOnlyTarget({ prNumber: 12, onlyPr: '12', repo: null, onlyRepo: null, isLocal: true, repoCount: 1 })).toBe(true);
   });
   it('legacy /finish REMOTE lane: --repos=<remoteslug> (repoCount 1, non-local) STILL matches (regression guard)', () => {
-    // /finish fires `--only=42 --repos=chalbert/frontierui` with NO --only-repo; a local-only default would have
+    // /finish fires `--only=42 --repos=frontier-ui/frontierui` with NO --only-repo; a local-only default would have
     // filtered the remote target out and merged nothing.
-    expect(matchesOnlyTarget({ prNumber: 42, onlyPr: '42', repo: 'chalbert/frontierui', onlyRepo: null, isLocal: false, repoCount: 1 })).toBe(true);
+    expect(matchesOnlyTarget({ prNumber: 42, onlyPr: '42', repo: 'frontier-ui/frontierui', onlyRepo: null, isLocal: false, repoCount: 1 })).toBe(true);
   });
   it('multi-repo default sweep, no --only-repo → disambiguate to the LOCAL repo only', () => {
     expect(matchesOnlyTarget({ prNumber: 12, onlyPr: '12', repo: 'o/web-everything', onlyRepo: null, isLocal: true, repoCount: 3 })).toBe(true);
@@ -817,7 +817,7 @@ describe('merge-ai-prs — #2393 impl-PR→WE-manifest laneRef join (joinImplToC
   // a WE carrier (its own manifest) + its couple's lane refs; and a manifest-less impl PR keyed by headRef.
   const we = (num, item, { blockedBy = [], stackParents = [], refs = [] } = {}) =>
     ({ num, repo: null, headRef: `lane/${item}`, hasManifest: true, manifestRefs: refs, item, blockedBy, stackParents });
-  const impl = (num, headRef) => ({ num, repo: 'chalbert/frontierui', headRef, hasManifest: false, item: null, blockedBy: [], stackParents: [] });
+  const impl = (num, headRef) => ({ num, repo: 'frontier-ui/frontierui', headRef, hasManifest: false, item: null, blockedBy: [], stackParents: [] });
 
   it('a manifest-less impl PR INHERITS its couple item + blockedBy + stackParents (closes the impl-orphan-always-ready hole)', () => {
     const couple = we(10, 'xitem00', { blockedBy: ['xblk000'], stackParents: ['xpar000'], refs: ['lane/xitem00', 'lane/xitem00-fui'] });
@@ -949,8 +949,8 @@ describe('merge-ai-prs — cross-repo lease-key MISMATCH regression (2026-09-01 
     // The daemon's own top-level acquire, exactly as the pre-fix daemon.mjs called it: no repoKey.
     expect(acquireDrainLease(root, OWNER, { nowMs: 0 }).ok).toBe(true);
     // The child resolves ITS OWN repoKey from the clone it runs in (real localRepoSlug, real parse).
-    const childRepoKey = localRepoSlug({ exec: fakeExec('git@github.com:chalbert/web-everything.git') });
-    expect(childRepoKey).toBe('chalbert/web-everything');
+    const childRepoKey = localRepoSlug({ exec: fakeExec('git@github.com:web-everything/web-everything.git') });
+    expect(childRepoKey).toBe('web-everything/web-everything');
     // The child's --under-lease gate reads status at the SCOPED path — but the daemon never wrote a lease
     // there, only at the legacy unscoped one. So it reads as free, not "held by OWNER".
     const status = drainLeaseStatus(root, { nowMs: 60_000, repoKey: childRepoKey });
@@ -963,7 +963,7 @@ describe('merge-ai-prs — cross-repo lease-key MISMATCH regression (2026-09-01 
 
   it('FIXED shape: daemon acquires with the SAME repoKey the child resolves → the child correctly sees under-lease and proceeds', () => {
     const OWNER = 'Mac:73384:drain-daemon';
-    const repoKey = localRepoSlug({ exec: fakeExec('git@github.com:chalbert/web-everything.git') });
+    const repoKey = localRepoSlug({ exec: fakeExec('git@github.com:web-everything/web-everything.git') });
     // The fix: the daemon computes repoKey the same way (from the SAME clone) and threads it through its own
     // acquire — now both sides key off the identical lock dir.
     expect(acquireDrainLease(root, OWNER, { nowMs: 0, repoKey }).ok).toBe(true);

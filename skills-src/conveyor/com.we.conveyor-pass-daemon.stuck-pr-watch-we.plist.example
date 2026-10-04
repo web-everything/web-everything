@@ -8,7 +8,7 @@
   header for the full explanation of why an `.example` file has zero effect on the machine until a human
   deliberately installs it.
 
-  WHAT THIS WATCHER DOES. Runs `node scripts/conveyor/stuck-pr-watch.mjs sweep --repo=chalbert/web-everything`
+  WHAT THIS WATCHER DOES. Runs `node scripts/conveyor/stuck-pr-watch.mjs sweep --repo=web-everything/web-everything`
   on an interval: catches an open WE PR that has had no progress (no new commit, label event, or comment) for
   longer than its review stage's own expected time, with nothing live already working it, and dispatches ONE
   diagnosis-only inspection agent per stuck episode. `skills-src/conveyor/daemon-manifest.mjs` registers THREE

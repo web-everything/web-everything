@@ -26,7 +26,7 @@
  * #xcla4iv — A THIRD population, between "item found on main" and "genuine ghost": the STANDARD file-item-in-
  * PR workflow files a new item's card in the SAME PR that delivers it, so `findItem` (which reads only what is
  * committed to `main`) returns `null` for it until this PR actually lands — indistinguishable, by number
- * alone, from a truly unresolvable/deleted item. Live case: `chalbert/web-everything` PR #2553 (branch
+ * alone, from a truly unresolvable/deleted item. Live case: `web-everything/web-everything` PR #2553 (branch
  * `lane/xzi292i-stuck-pr-watch`) carries `backlog/xzi292i-....md` IN ITS OWN DIFF, with a real `scope:`
  * frontmatter, yet was refused `no-scope` on every reconcile tick because the old code treated any `findItem`
  * miss as a ghost. Fixed here, in the shared resolver (not a second hand-rolled path in `reconcile-fix-
@@ -45,7 +45,7 @@ import { laneRefItemNum } from './lease-reaper.mjs';
 /**
  * we:scripts/conveyor/pr-work-unit.mjs#isSafeFallbackScopeEntry — may this PR-author-controlled string become a
  * scope-fence entry? PURE. MOVED HERE (from `reconcile-fix-dispatch.mjs`, which still re-exports it for
- * backward compatibility) by the chalbert/web-everything#2573 review findings (correctness + security): this
+ * backward compatibility) by the web-everything/web-everything#2573 review findings (correctness + security): this
  * is the ONE shared choke point {@link resolvePrWorkUnit} itself can call it from, for every untrusted-scope
  * branch this resolver produces (PR-diff paths, and #xcla4iv's card-in-diff scope), so every consumer
  * (`reconcile-fix-dispatch.mjs#planFixesFromReconcile` AND `ci-heal-pr-dispatch.mjs`) is protected without
@@ -86,7 +86,7 @@ export function isSafeFallbackScopeEntry(entry) {
  *
  * @param {object} o
  * @param {string} o.repo - any vocabulary {@link repoProfile} accepts (key / gh slug / slug tag / scope
- *   prefix, with or without a trailing `:`) — e.g. `'we'`, `'plateau-app'`, `'plateau'`, `'chalbert/plateau-app'`.
+ *   prefix, with or without a trailing `:`) — e.g. `'we'`, `'plateau-app'`, `'plateau'`, `'plateauapp/plateau-app'`.
  * @param {{number: number|string, headRefName?: string|null, headRefOid?: string|null}} o.pr - the PR's own
  *   number, head ref name, and (#xcla4iv) head ref sha — the three fields `reconcile-pass.mjs`'s dispatch
  *   entries already carry as `prNumber`/`headRefName`/`headRefOid`. `headRefOid` is only needed for the
@@ -145,7 +145,7 @@ export function resolvePrWorkUnit({ repo, pr, findItem, fetchDiffPaths, fetchCar
       }
       cardScope = Array.isArray(cardScope) ? cardScope.map(String).filter(Boolean) : [];
       const diffScope = paths.map((p) => `${profile.canonicalPrefix}:${p}`);
-      // Review findings (correctness + security, chalbert/web-everything#2573) — a card filed IN this PR's own
+      // Review findings (correctness + security, web-everything/web-everything#2573) — a card filed IN this PR's own
       // UNMERGED diff is exactly as PR-author-controlled/unreviewed as the diff paths themselves (neither has
       // landed on `main` yet), unlike a resolved item's declared `scope:` (trusted above, at the `attribution:
       // 'item'` return a few lines up, precisely because THAT card already sits on `main`). So this card's

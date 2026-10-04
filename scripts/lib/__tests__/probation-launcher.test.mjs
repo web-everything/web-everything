@@ -139,12 +139,12 @@ describe('attribution', () => {
 
 describe('launchScorecardRow', () => {
   it('is a valid store row with no outcome and no verifier — a launch is not a judged trial', () => {
-    const r = launchScorecardRow({ worker: agyClaude, pr: 7, repo: 'chalbert/web-everything', handle: 'ci-heal-7', launchOutcome: 'healed' });
+    const r = launchScorecardRow({ worker: agyClaude, pr: 7, repo: 'web-everything/web-everything', handle: 'ci-heal-7', launchOutcome: 'healed' });
     expect(validateScorecard(r)).toEqual({ ok: true, errors: [] });
     expect(r).toMatchObject({ dispatchKind: 'probation-launch', taskType: 'ci-heal', outcome: null, verifiedBy: null, executor: 'antigravity' });
   });
   it('a doc-fix build row is valid too, with no PR at launch time (#4291)', () => {
-    const r = launchScorecardRow({ worker: docFixCodex, pr: null, repo: 'chalbert/web-everything', handle: 'probation-4291', item: '4291', launchOutcome: 'opened-pr' });
+    const r = launchScorecardRow({ worker: docFixCodex, pr: null, repo: 'web-everything/web-everything', handle: 'probation-4291', item: '4291', launchOutcome: 'opened-pr' });
     expect(validateScorecard(r)).toEqual({ ok: true, errors: [] });
     expect(r).toMatchObject({ dispatchKind: 'probation-launch', taskType: 'doc-fix', outcome: null, verifiedBy: null, executor: 'codex', item: '4291' });
   });

@@ -50,8 +50,8 @@ describe('nextLandingStage', () => {
 // shape until then, only a hand-picked flat fixture that happened to match what the code assumed.
 describe('parseOpenPrResult', () => {
   it('extracts pr/url from the REAL nested run-record shape', () => {
-    const out = fakeOpenPrResult(2877, 'https://github.com/chalbert/web-everything/pull/2877');
-    expect(parseOpenPrResult(out)).toEqual({ pr: 2877, url: 'https://github.com/chalbert/web-everything/pull/2877' });
+    const out = fakeOpenPrResult(2877, 'https://github.com/web-everything/web-everything/pull/2877');
+    expect(parseOpenPrResult(out)).toEqual({ pr: 2877, url: 'https://github.com/web-everything/web-everything/pull/2877' });
   });
 
   it('returns null/null for malformed or unexpected output, never throws', () => {

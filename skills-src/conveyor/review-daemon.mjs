@@ -94,7 +94,7 @@ import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
 // exact gap this wiring closes.
 import { sweepReviewHoldLabels } from '../../scripts/conveyor/review-hold-reconcile.mjs';
 import { selectStatusCandidates } from '../../scripts/conveyor/reconcile-core.mjs';
-// #xconv1 (chalbert/web-everything#2766/#2767 unblock) — the mechanical, no-session executor for a
+// #xconv1 (web-everything/web-everything#2766/#2767 unblock) — the mechanical, no-session executor for a
 // `kind:'convert-advisory'` dispatch entry. Wired as its OWN additive pipeline stage below
 // (`runConvertAdvisoryTick`/`runConvertAdvisoryTickAllRepos`), never folded into `runReviewTick`'s existing
 // `reviews`/`fixes` dispatch loop: that loop is gated on `acquirableLanes` (a convert-advisory entry needs no
@@ -513,7 +513,7 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
 }
 
 /**
- * #xconv1 (chalbert/web-everything#2766/#2767 unblock) — ONE repo's worth of `kind:'convert-advisory'`
+ * #xconv1 (web-everything/web-everything#2766/#2767 unblock) — ONE repo's worth of `kind:'convert-advisory'`
  * dispatch entries, posted mechanically. A SEPARATE, ADDITIVE stage from {@link runReviewTick}: a
  * convert-advisory entry needs no lane and no session (see `convert-advisory-dispatch.mjs`'s own header for
  * why the targeted-check judge seat needs neither either), so gating it behind `acquirableLanes` — the cap
@@ -864,7 +864,7 @@ export function buildCliDaemonEffects({
         const sr = result.sessionReap;
         log.error(`review-daemon: session-reap — ${sr.scanned} scanned, ${sr.stopped} stopped${sr.alreadyGone ? `, ${sr.alreadyGone} already gone` : ''}${sr.failures ? `, ${sr.failures} failed` : ''}${sr.anomalies ? `, ${sr.anomalies} anomalies` : ''}${sr.previouslyReaped ? `, ${sr.previouslyReaped} already reaped earlier (skipped)` : ''}, ${sr.kept} kept${sr.deferred ? `, ${sr.deferred} deferred to next tick (reap budget: ${sr.reapBudget?.maxStops} stops / ${sr.reapBudget?.maxDurationMs}ms, #3383)` : ''}`);
       }
-      // #xconv1 (chalbert/web-everything#2766/#2767 unblock) — the mechanical, no-session convert-advisory
+      // #xconv1 (web-everything/web-everything#2766/#2767 unblock) — the mechanical, no-session convert-advisory
       // stage's own report: `posted` names the targeted check's own verdict, `skipped` is the idempotency
       // no-op (a head already carrying the converted note), `failed`/`reconcileFailed` mirror the review
       // stage's own non-fatal reporting one level up.

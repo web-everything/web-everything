@@ -205,7 +205,7 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
     expect(plan.dispatch.map((d) => d.kind)).toEqual(['fix']);
   });
 
-  // #xu2krte Fork 2 (review-human statute amendment) — PR chalbert/web-everything#2549's shape: the parked-PR
+  // #xu2krte Fork 2 (review-human statute amendment) — PR web-everything/web-everything#2549's shape: the parked-PR
   // conflict watch itself stood a PR down at conflict-detection time (`reason=conflict`, its own actor string),
   // which is a ROUTING artifact the SAME watch re-derives every sweep, never a fix agent's own judgment call.
   // That must not block this gate forever the way an actual escalation does.
@@ -264,7 +264,7 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
     expect(plan.dispatch).toHaveLength(0);
   });
 
-  // xaer296 (epic #3383) — CONFIRMED LIVE on `chalbert/web-everything#2549`, 2026-09-24T14:35:41Z: a fixer
+  // xaer296 (epic #3383) — CONFIRMED LIVE on `web-everything/web-everything#2549`, 2026-09-24T14:35:41Z: a fixer
   // dispatched in ADVISORY-FIX MODE correctly found nothing to reproduce (the finding was already fixed by an
   // earlier round) and wrongly stood down anyway. `we:scripts/conveyor/advisory-fix-mark.mjs
   // #isAdvisoryMechanismStandDownSuperseded` recognizes this as a MECHANISM FAILURE the thread already proves,
@@ -317,7 +317,7 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
     expect(plan.refusals.map((r) => r.kind)).toEqual(['stood-down']);
   });
 
-  // xaer296 FOLLOW-UP — CONFIRMED LIVE on `chalbert/web-everything#2549`, 2026-09-24: the coordinator loaded
+  // xaer296 FOLLOW-UP — CONFIRMED LIVE on `web-everything/web-everything#2549`, 2026-09-24: the coordinator loaded
   // `viewerDidAuthor`-only fix into the daemon clone and ran `runReconcilePass` for REAL — it still refused
   // `stood-down` (`standDowns: 2`), because `viewerDidAuthor` reads `false` on every marker comment this repo's
   // automation posts, from BOTH a personal-token read AND the resident daemon's own real production read (its
@@ -825,11 +825,11 @@ describe('case 5e — ci-heal dispatch, capped by the durable heal-mark count, n
 // we:backlog/x5uqim1-*.md (#4075/#3383) — LIVE INCIDENT 2026-09-25: a `ci-red` PR whose required check failed
 // only because `origin/main`'s own CI was red at that moment must refuse `owed-ci-rerun`, never dispatch
 // `ci-heal` — a heal agent would "repair" code that was never broken. Fixture shapes measured live off
-// `chalbert/web-everything`: PR #2635 (33 commits behind main, never refreshed, failed inside main's real
+// `web-everything/web-everything`: PR #2635 (33 commits behind main, never refreshed, failed inside main's real
 // 01:30:55Z–02:31:25Z red window) and PR #2596 (`ahead_by: 0` — the operator's own manual branch refresh, still
 // red) — see `main-red-recovery.test.mjs` for the same real window, and that module's own file header for why a
 // rebase onto main (not a `gh run rerun`) is the real mechanism.
-// #xznd5za (epic #3383/#4075) — LIVE INCIDENT 2026-09-25: `chalbert/web-everything#2636`'s required check
+// #xznd5za (epic #3383/#4075) — LIVE INCIDENT 2026-09-25: `web-everything/web-everything#2636`'s required check
 // `test-shard (1)` concluded CANCELLED (the daemon's own hung-ci-recovery cancel, applied only once its OWN
 // hung-recovery cap was exhausted — never re-run). `we:scripts/progress-board.mjs#ciFailed` used to hand-roll a
 // conclusion list that OMITTED `CANCELLED`, so `classifyPr` (this file's ONLY source of `phase` — see the file
@@ -838,7 +838,7 @@ describe('case 5e — ci-heal dispatch, capped by the durable heal-mark count, n
 // though `we:scripts/conveyor/main-red-recovery.mjs`'s own attribution (fed by the ALREADY-correct
 // `we:scripts/merge-ai-prs.mjs#isRequiredCheckFailed`) independently confirmed "required check failed … owed a
 // ci-heal, not a rebase" on the very same tick. This fixture is the REAL rollup read live off PR #2636 via `gh
-// pr view 2636 --repo chalbert/web-everything --json statusCheckRollup,comments` at the moment of the incident.
+// pr view 2636 --repo web-everything/web-everything --json statusCheckRollup,comments` at the moment of the incident.
 describe('case 5h — a CANCELLED required check reads ci-red and is ci-healed, never nothing-owed (#xznd5za, PR #2636 real shape)', () => {
   const pr2636CancelledRollup = [
     { __typename: 'CheckRun', name: 'test-shard (1)', status: 'COMPLETED', conclusion: 'CANCELLED' },
@@ -888,7 +888,7 @@ describe('case 5h — a CANCELLED required check reads ci-red and is ci-healed, 
 });
 
 // #2748 false-red follow-up (soak-replay-gate, PR #2775) — LIVE INCIDENT 2026-09-26: `chalbert/web-
-// everything#2748`'s real rollup (`gh pr view 2748 --repo chalbert/web-everything --json statusCheckRollup`)
+// everything#2748`'s real rollup (`gh pr view 2748 --repo web-everything/web-everything --json statusCheckRollup`)
 // has every REQUIRED check (`test`/`smoke`/`daemon-soak`) green, and the ONLY red check is the brand-new
 // advisory `soak-replay-gate` (PR #2775) — an advisory check `classifyPr`'s exclusion list did not yet know
 // about. This read `phase: 'ci-red'` and kept a `ci-heal-2748` session dispatched against a PR with nothing a
@@ -954,9 +954,9 @@ describe('case 5j — requiredChecks makes a NEW advisory check\'s red never rea
   });
 });
 
-// we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — LIVE INCIDENT, chalbert/web-everything: of
+// we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — LIVE INCIDENT, web-everything/web-everything: of
 // ~10 ci-heal sessions dispatched inside one hour, 7 (PRs #2782/#2778/#2772/#2779/…) ended "no change needed".
-// Real measured shape (`gh api repos/chalbert/web-everything/branches/main/protection`, `gh run list --branch
+// Real measured shape (`gh api repos/web-everything/web-everything/branches/main/protection`, `gh run list --branch
 // main`, `gh api .../commits/<sha>/check-runs` on each PR's own pre-heal commit): `main`'s own red window ran
 // 2026-09-26T23:03:09Z (first concluded `failure`) to 2026-09-27T00:49:15Z (the run that finally concluded
 // `success`) — the fix (PR #2780/#4247) MERGED at 00:38Z, but CI itself did not CONFIRM green until 00:49:15Z.
@@ -1024,7 +1024,7 @@ describe('case 5k — a stale ci:failed label beside a RESTARTED (not yet conclu
   });
 });
 
-// we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — LIVE INCIDENT, chalbert/web-everything#2783:
+// we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — LIVE INCIDENT, web-everything/web-everything#2783:
 // three ci-heal sessions dispatched across one evening, each ending "escalated (needs human — not a CI break)"
 // for the IDENTICAL reason on the IDENTICAL head — because the brief's escalation exit wrote nothing durable
 // (a bare one-line RETURN), so every reconcile tick that followed re-read the PR as plain `ci-red` with
@@ -1145,7 +1145,7 @@ describe('case 5l — a ci-heal already escalated THIS EXACT head never gets re-
     expect(REFUSAL_KINDS).toContain('waiting-on-system-fix');
   });
 
-  // we:backlog/fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, chalbert/web-everything) —
+  // we:backlog/fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, web-everything/web-everything) —
   // a `not-a-ci-break` escalation is ci-heal's OWN structured confirmation that the PR's true owed action is
   // a review, never another heal. BEFORE this fix, the only bucket available for this exact finding was
   // `needs-human` — which this same describe block's own earlier tests confirm is a hard, review-blocking
@@ -1329,7 +1329,7 @@ describe('case 5g — owed-ci-rerun refuses ci-heal for a ci-red PR attributable
 });
 
 // we:backlog/review-while-main-red (#4075/#3383) — LIVE INCIDENT 2026-09-26: PRs #2769/#2770/#2772/#2778/#2779
-// (chalbert/web-everything) sat `review:pending` + `ci:failed(owed-ci-rerun)` for hours with review capacity
+// (web-everything/web-everything) sat `review:pending` + `ci:failed(owed-ci-rerun)` for hours with review capacity
 // idle (2 review jobs running against 5 held PRs) — the `owed-ci-rerun` refusal above used to be the PR's ONLY
 // row every tick, so a review never even got a look until main recovered AND the mechanical rebase cleared
 // `ci:failed`, serializing two genuinely independent facts (main's own CI state; whether this PR has been
@@ -1570,7 +1570,7 @@ describe('case 5i — landing-freeze fix: owed-ci-rerun via main\'s own latest-r
 });
 
 describe('case 5f — conflict-fix dispatch, capped by its OWN durable marker, not the shared roundCap (#xkmu3gv)', () => {
-  // `chalbert/web-everything#2549`, shape measured live 2026-09-24: `bounced` (review:changes present, wins
+  // `web-everything/web-everything#2549`, shape measured live 2026-09-24: `bounced` (review:changes present, wins
   // `classifyPr`'s precedence over `review:human`), ALSO carrying `merge-status:conflicting` (the mechanical
   // conflict-resolution route PR #2577 introduces) and `advisory:changes`, with 5 prior real negotiation rounds
   // already spent (`review-round:5`, at the shared `NEGOTIATION_ROUND_CAP` of 5).
@@ -1683,7 +1683,7 @@ describe('case 5f — conflict-fix dispatch, capped by its OWN durable marker, n
   });
 });
 
-describe('case 5f-2 — ALREADY-LANDED pre-empts the conflict-fix dispatch (live incident, chalbert/web-everything PR #2752, #4034/#2748)', () => {
+describe('case 5f-2 — ALREADY-LANDED pre-empts the conflict-fix dispatch (live incident, web-everything/web-everything PR #2752, #4034/#2748)', () => {
   // Real shape, measured live 2026-09-26: `review:changes` + `merge-status:conflicting`, `mergeStateStatus:
   // DIRTY` — exactly `case 5f`'s `isConflictBounce` population, which would otherwise dispatch a mechanical
   // conflict-fix here. `we:scripts/conveyor/reconcile-pass.mjs#enrichPrsWithAlreadyLandedFacts` is the IO shell
@@ -1800,7 +1800,7 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
     expect(isLatestAdvisoryFindingAddressed([advisoryNote, { body: forged.body, viewerDidAuthor: true }])).toBe(true);
   });
 
-  // xaer296 (epic #3383) — CONFIRMED LIVE, `chalbert/web-everything#2549`, 2026-09-24: 5 advisory-panel comments
+  // xaer296 (epic #3383) — CONFIRMED LIVE, `web-everything/web-everything#2549`, 2026-09-24: 5 advisory-panel comments
   // already on the thread from ordinary review rounds 1-5 (ALL pre-dating the #xkmu3gv marker mechanism), and
   // exactly ONE genuine advisory-fix round, which DID address the current (latest, 5th) finding. The OLD
   // count-based test (`advisoryFixes < advisoryNotes`, i.e. `1 < 5`) stayed true forever — no number of further
@@ -1822,7 +1822,17 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
     expect(plan.refusals).toHaveLength(0);
   });
 
-  // The EXACT `chalbert/web-everything#2549` shape: 5 pre-existing advisory notes (rounds 1-5, `review-round:5`)
+  it('xuxcsw6 — a fix-mark after the advisory does NOT re-dispatch a review while the referral hold stands (the live #3771 loop)', () => {
+    const comments = [{ body: `${ADVISORY_NOTE_MARKER}\n\nround 1`, author: AUTOMATION }, { body: buildAdvisoryFixComment({}), viewerDidAuthor: true }];
+    const pr = prNeedsHuman({ comments });
+    for (let tick = 0; tick < 3; tick++) {
+      const plan = planReconcile({ prs: [{ ...pr, referralHold: { head: 'a'.repeat(40), episode: 'e', count: 5, why: 'review paused: 5 referrals need a ruling; it resumes on a new push, a ruling, or a send-back' } }], agents: [], now: NOW });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-referrals-pending', prNumber: 2601 })]);
+    }
+  });
+
+  // The EXACT `web-everything/web-everything#2549` shape: 5 pre-existing advisory notes (rounds 1-5, `review-round:5`)
   // AND the one genuine advisory-fix mark addressing the latest. `isLatestAdvisoryFindingAddressed` correctly
   // reads `addressed: true` here too (same fix as the test above) — but the GENERIC, pre-existing shared round
   // cap (`countAdvisoryComments` UNIONED into `roundCap`, #2117/#2298) independently reads 5 notes against a
@@ -1831,7 +1841,7 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
   // — before this fix the PR was invisibly STUCK on a terminal `stood-down` forever (case 2's own new tests);
   // after it, the SAME PR reaches a clean, auditable `cap-exhausted` refusal a human can act on (exactly the
   // task's own "owed an advisory review (or clean hand-back)" framing) instead of a silent dead end.
-  // xaer296 FOLLOW-UP 2 — CONFIRMED LIVE on `chalbert/web-everything#2549`, 2026-09-24: once `addressed` is
+  // xaer296 FOLLOW-UP 2 — CONFIRMED LIVE on `web-everything/web-everything#2549`, 2026-09-24: once `addressed` is
   // correctly `true` (order-based, per the test above), the real reconcile pass hit a THIRD gap — it fell
   // through to the generic `OWED`-table review dispatch, which is subject to the SAME shared `roundCap`
   // (`NEGOTIATION_ROUND_CAP`) fed by `countAdvisoryComments` — i.e. the raw COUNT OF ADVISORY NOTES, which is
@@ -1894,7 +1904,7 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
     })]);
   });
 
-  // xconv1-evidence FOLLOW-UP (chalbert/web-everything#2766/#2767, 2026-09-27), reconstructed from the real
+  // xconv1-evidence FOLLOW-UP (web-everything/web-everything#2766/#2767, 2026-09-27), reconstructed from the real
   // live thread shape (order + marker prefixes + authorship, as `gh pr view 2766 --json comments` returned it):
   // a CONVERTED note, 3 fix-mark comments ALL landing inside that SAME episode (the mechanism bug meant no
   // review ever advanced it before the #xconv1-evidence fix), then a later, independent review's own genuinely
@@ -1915,14 +1925,14 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
     })]);
   });
 
-  // advisory-after-cap (chalbert/web-everything#2766, live-caught 2026-09-27, ~11:20Z), reconstructed from the
-  // real thread shape (`gh pr view 2766 --repo chalbert/web-everything --json labels,comments,commits,headRefOid`):
+  // advisory-after-cap (web-everything/web-everything#2766, live-caught 2026-09-27, ~11:20Z), reconstructed from the
+  // real thread shape (`gh pr view 2766 --repo web-everything/web-everything --json labels,comments,commits,headRefOid`):
   // a converted note + 3 fix-mark comments in ONE episode, then two real advisory notes each followed by one
   // completed fix episode (3 completed episodes total = AT the cap) — and the head then moved a FOURTH time via
   // a MERGE-CONFLICT fix (a different, non-advisory marker), never followed by a fresh advisory. The reconcile
   // pass correctly refuses `cap-exhausted` (no more auto-repair) but, before this item, ALSO refused the one
   // fresh review the operator needs, because nothing here had ever run `advise` against this exact head. Verified
-  // live: `node scripts/conveyor/reconcile-pass.mjs --repo=chalbert/web-everything --json` read this PR as
+  // live: `node scripts/conveyor/reconcile-pass.mjs --repo=web-everything/web-everything --json` read this PR as
   // `cap-exhausted`/`advisory-fix`, `attempts: 3, cap: 3`, with `headRefOid: 'd2453a582…'` — the same head this
   // fixture uses.
   const REAL_2766_HEAD = 'd2453a58216d6cc4b14a4e1f30c673451ca93485'; // measured live head, 2026-09-27T11:17:58Z
@@ -1935,7 +1945,7 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
       `${ADVISORY_NOTE_MARKER} This PR carries \`review:human\`. The independent`,
       'AI review below ran automatically, before the required human review ceremony.',
       '',
-      '## ⚠️ Advisory review (informational only) — chalbert/web-everything#2766',
+      '## ⚠️ Advisory review (informational only) — web-everything/web-everything#2766',
       '',
       '**Verdict:** 🚦 human review required',
       '',
@@ -1973,7 +1983,7 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
       { body: '🔧 **conveyor fix (`fix-2766`) — merge conflict with `main` resolved** (head `d2453a582`)', author: AUTOMATION },
       { body: `${CONFLICT_FIX_COMMENT_MARKER}\n\nA mechanical conflict-fix round merged main and re-armed.`, author: AUTOMATION },
   ];
-  it('THE LIVE chalbert/web-everything#2766 SHAPE (2026-09-27, ~11:20Z): advisory-fix cap genuinely AT 3/3, then the head moved via a merge-conflict fix with no advisory yet — owed a fresh REVIEW, never another fixer, never a silent cap-exhausted dead end', () => {
+  it('THE LIVE web-everything/web-everything#2766 SHAPE (2026-09-27, ~11:20Z): advisory-fix cap genuinely AT 3/3, then the head moved via a merge-conflict fix with no advisory yet — owed a fresh REVIEW, never another fixer, never a silent cap-exhausted dead end', () => {
     const comments = live2766Comments();
     const pr = prNeedsHuman({ comments, headRefOid: REAL_2766_HEAD });
     // Sanity on the fixture itself, so a future edit to it can't silently stop exercising the cap.
@@ -1988,6 +1998,18 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
       kind: 'review', prNumber: 2601, attempts: ADVISORY_FIX_ROUND_CAP, cap: ADVISORY_FIX_ROUND_CAP,
     })]);
     expect(plan.dispatch[0].mode).toBeUndefined(); // never `mode: 'advisory-fix'` — this is a review, not a fixer.
+  });
+
+  // xuxcsw6 — live 2026-10-04, #3771: both direct review branches (a fix postdates the advisory; the newest
+  // advisory does not cover the head) bypassed the referral hold and re-dispatched a full review each tick.
+  const referralHold = { head: 'a'.repeat(40), episode: 'e', count: 2, why: 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back' };
+  it('xuxcsw6 — a held PR is refused review-referrals-pending on the stale-advisory branch, and not when the hold lifts', () => {
+    const pr = prNeedsHuman({ comments: live2766Comments(), headRefOid: REAL_2766_HEAD });
+    const held = planReconcile({ prs: [{ ...pr, referralHold }], agents: [], now: NOW });
+    expect(held.dispatch).toEqual([]);
+    expect(held.refusals).toEqual([expect.objectContaining({ kind: 'review-referrals-pending', prNumber: 2601 })]);
+    expect(planReconcile({ prs: [{ ...pr, referralHold: null }], agents: [], now: NOW }).dispatch)
+      .toEqual([expect.objectContaining({ kind: 'review' })]);
   });
 
   // The exemption above is narrow to a head an advisory has NEVER covered. A PR at the SAME cap, whose newest
@@ -2120,7 +2142,7 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
   });
 });
 
-describe('case 5h — real chalbert/web-everything#2549 shape (measured 2026-09-24, the live case #xkmu3gv closes)', () => {
+describe('case 5h — real web-everything/web-everything#2549 shape (measured 2026-09-24, the live case #xkmu3gv closes)', () => {
   // The actual live labels this PR carried when this item was built (`review:changes`, `review:human`,
   // `merge-status:conflicting`, `advisory:changes`, `review-round:5`) — before this item, `runReconcilePass`
   // against the real repo refused it `cap-exhausted` outright, with no advisory fix ever owed. See the PR body
@@ -2140,10 +2162,10 @@ describe('case 5h — real chalbert/web-everything#2549 shape (measured 2026-09-
 });
 
 describe('case 5i — STACKED-BASE CONFLICT dispatch, a `conflicted` PR whose base is not `main` (#3383)', () => {
-  // `chalbert/web-everything#2578`, shape measured live 2026-09-24: `review:accepted` (no `review:changes`, no
+  // `web-everything/web-everything#2578`, shape measured live 2026-09-24: `review:accepted` (no `review:changes`, no
   // `review:human`), `mergeStateStatus: DIRTY`/`mergeable: CONFLICTING` (`classifyPr` reads `conflicted`), base
   // `lane/3681-ratify-daemon-lifecycle` — stacked on PR #2549, NOT `main`. BEFORE this branch existed,
-  // `runReconcilePass({repo:'chalbert/web-everything'})` refused this `owed-elsewhere` ("the branch needs a
+  // `runReconcilePass({repo:'web-everything/web-everything'})` refused this `owed-elsewhere` ("the branch needs a
   // rebase before it can merge"), a rebase the drain will never perform for a non-default-base PR
   // (`#poc-branch-declared-delivery-mode` clause 5) — a genuine stacked-PR gap no daemon closed.
   const prStacked = (over = {}) => pr1563({
@@ -3010,13 +3032,13 @@ describe('#2588/review-loops — ONE REVIEW PER HEAD COMMIT (epic #3383/#4075)',
   });
 });
 
-describe('#xconv1 (chalbert/web-everything#2766/#2767 unblock) — CONVERT instead of re-review on a superseded verdict', () => {
+describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT instead of re-review on a superseded verdict', () => {
   const HEAD = 'abbe08beacae462f98d6caf654d3ce7867c92801'; // #2766's real live head
   const ACCEPTED_AT = '2026-09-26T21:47:43Z';
   const acceptComment = () => ({
     author: { login: 'web-everything' }, createdAt: ACCEPTED_AT,
     body: `✅ review — accepted\n\nRecorded by agent (unattended review-loop) via the declared \`review-pr\` `
-      + `operation (#3035).\n\n## Human review verdict — chalbert/web-everything#2766\n\n**Verdict:** ✅ pass — `
+      + `operation (#3035).\n\n## Human review verdict — web-everything/web-everything#2766\n\n**Verdict:** ✅ pass — `
       + `no blocking findings\n\n${buildReviewedShaMarker(HEAD)}`,
   });
   const testGamingParkComment = () => ({
@@ -3261,7 +3283,7 @@ describe('xng7q1p mechanical timeout precedence', () => {
   const head = 'a'.repeat(40);
   const pr = (extra = {}) => pr1563({ number: 3415, headRefOid: head, labels: [], comments: [], statusCheckRollup: redRollup,
     timeoutRetryBudget: { confirmed: 0, pending: false },
-    timeoutRetry: { eligible: true, repo: 'chalbert/web-everything', pr: 3415, head, signature: 'timeout', jobs: [{ run: 10, job: 20, attempt: 1 }] }, ...extra });
+    timeoutRetry: { eligible: true, repo: 'web-everything/web-everything', pr: 3415, head, signature: 'timeout', jobs: [{ run: 10, job: 20, attempt: 1 }] }, ...extra });
   it('does not authorize retries without an observed budget', () => {
     const result = planReconcile({ prs: [pr({ timeoutRetryBudget: undefined })], now: NOW });
     expect(result.dispatch.map((row) => row.kind)).toEqual(['ci-heal']);
@@ -3397,5 +3419,31 @@ describe('xul2kwr withdrawn green drafts', () => {
       const plan = planReconcile({ prs: [pr1563({ isDraft: true, labels: [label], comments: [], statusCheckRollup: checks })], agents: [], now: NOW });
       expect(plan.dispatch).toEqual([expect.objectContaining({ kind })]);
     }
+  });
+});
+
+describe('xe8y12n orthogonal missing-review diagnostic', () => {
+  const commits = [{ messageHeadline: 'repair', authors: [{ name: 'Claude' }] }];
+  it.each([
+    {}, { isDraft: true }, { labels: lbl('ci:failed'), statusCheckRollup: [{ name: 'gate', conclusion: 'failure', status: 'completed' }] },
+    { mergeStateStatus: 'DIRTY', labels: lbl('merge-status:conflicting') },
+    { labels: lbl('review-status:stood-down') },
+    { fixClaim: { session: 'fixer', headSha: 'a'.repeat(40) } },
+  ])('keeps the exact dispatch/refusal decisions for %j', extra => {
+    const pr = { number: 3239, state: 'OPEN', labels: [], headRefName: 'lane/3239', headRefOid: 'a'.repeat(40), comments: [], statusCheckRollup: greenRollup, ...extra };
+    const without = planReconcile({ prs: [pr] });
+    const withEvidence = planReconcile({ prs: [{ ...pr, commits }] });
+    expect(withEvidence.notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing', prNumber: 3239 }));
+    expect(withEvidence.dispatch).toEqual(without.dispatch);
+    expect(withEvidence.refusals).toEqual(without.refusals);
+  });
+  it('does not suppress live-agent decisions', () => {
+    const pr = { number: 3239, state: 'OPEN', labels: [], headRefName: 'lane/3239', headRefOid: 'a'.repeat(40), comments: [], statusCheckRollup: greenRollup };
+    const agents = [{ name: 'review-3239', state: 'running', pid: 123, pidAlive: true, cwd: '/lane', headSha: pr.headRefOid }];
+    const before = planReconcile({ prs: [pr], agents });
+    const after = planReconcile({ prs: [{ ...pr, commits }], agents });
+    expect(after.notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing' }));
+    expect(after.dispatch).toEqual(before.dispatch);
+    expect(after.refusals).toEqual(before.refusals);
   });
 });

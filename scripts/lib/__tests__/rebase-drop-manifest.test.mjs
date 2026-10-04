@@ -412,7 +412,7 @@ describe('rebaseDropManifest refuses to push onto a branch a fixer holds the LIV
     if (priorRoot === undefined) delete process.env.WE_COORDINATION_ROOT; else process.env.WE_COORDINATION_ROOT = priorRoot;
   });
 
-  const REMOTE_URL = { status: 0, stdout: 'git@github.com:chalbert/web-everything.git\n' };
+  const REMOTE_URL = { status: 0, stdout: 'git@github.com:web-everything/web-everything.git\n' };
 
   it('a manifest-only conflict on a claimed lane is refused BEFORE the push — the invariant holds even though the PR is not draft', () => {
     acquireFixClaim({ repo: 'we', pr: 4293, who: 'fixer-4293', why: 'repairing a review finding', branch: 'lane/x-claimed', lockRoot: fixDispatchClaimRoot() });
@@ -446,7 +446,7 @@ describe('rebaseDropManifest refuses to push onto a branch a fixer holds the LIV
     acquireFixClaim({ repo: 'we', pr: 4293, who: 'fixer-4293', branch: 'lane/x-shared-name', lockRoot: fixDispatchClaimRoot() });
     const { run, calls } = scriptedRun({
       'merge-tree': { status: 1, stdout: conflictOut([LANE_MANIFEST]) },
-      remote: { status: 0, stdout: 'git@github.com:chalbert/frontierui.git\n' },
+      remote: { status: 0, stdout: 'git@github.com:frontier-ui/frontierui.git\n' },
       ...RESOLVED_PLUMBING,
     });
     const r = rebaseDropManifest({ laneRef: 'lane/x-shared-name', run });

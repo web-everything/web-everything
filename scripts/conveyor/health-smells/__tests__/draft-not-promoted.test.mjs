@@ -19,59 +19,59 @@ const redRollup = (completedAt) => [{ name: 'test', status: 'COMPLETED', conclus
 describe('draft-not-promoted — evaluate', () => {
   it('breaches: a draft PR green for 20 minutes (past the 15-minute bound) with nothing promoting it', () => {
     const pr = {
-      repo: 'chalbert/web-everything', number: 2813, title: 'draft-first PRs', isDraft: true,
+      repo: 'web-everything/web-everything', number: 2813, title: 'draft-first PRs', isDraft: true,
       statusCheckRollup: greenRollup(new Date(NOW - 20 * MINUTE).toISOString()), updatedAt: new Date(NOW - 20 * MINUTE).toISOString(),
     };
     const out = smell.evaluate({ prs: [pr] }, { now: NOW });
-    const r = out.find((x) => x.subject === 'chalbert/web-everything#2813');
+    const r = out.find((x) => x.subject === 'web-everything/web-everything#2813');
     expect(r.breach).toBe(true);
     expect(r.measure.greenForMin).toBe(20);
     expect(r.summary).toMatch(/draft PR/);
     expect(r.recommendation).toMatch(/promote-draft-pr-dispatch/);
-    expect(r.recommendation).toMatch(/gh pr ready 2813 --repo chalbert\/web-everything/);
+    expect(r.recommendation).toMatch(/gh pr ready 2813 --repo web-everything\/web-everything/);
   });
 
   it('does not breach yet: a draft PR green for only 5 minutes', () => {
     const pr = {
-      repo: 'chalbert/web-everything', number: 2814, title: 'x', isDraft: true,
+      repo: 'web-everything/web-everything', number: 2814, title: 'x', isDraft: true,
       statusCheckRollup: greenRollup(new Date(NOW - 5 * MINUTE).toISOString()),
     };
     const out = smell.evaluate({ prs: [pr] }, { now: NOW });
-    expect(out.find((x) => x.subject === 'chalbert/web-everything#2814').breach).toBe(false);
+    expect(out.find((x) => x.subject === 'web-everything/web-everything#2814').breach).toBe(false);
   });
 
   it('a non-draft PR is never a candidate at all, however long it has been green', () => {
     const pr = {
-      repo: 'chalbert/web-everything', number: 2815, title: 'x', isDraft: false,
+      repo: 'web-everything/web-everything', number: 2815, title: 'x', isDraft: false,
       statusCheckRollup: greenRollup(new Date(NOW - 60 * MINUTE).toISOString()),
     };
     const out = smell.evaluate({ prs: [pr] }, { now: NOW });
-    expect(out.find((x) => x.subject === 'chalbert/web-everything#2815')).toBeUndefined();
+    expect(out.find((x) => x.subject === 'web-everything/web-everything#2815')).toBeUndefined();
   });
 
   it('a draft PR whose checks are still pending is never a candidate — only a genuinely green draft can be stuck-unpromoted', () => {
-    const pr = { repo: 'chalbert/web-everything', number: 2816, title: 'x', isDraft: true, statusCheckRollup: pendingRollup };
+    const pr = { repo: 'web-everything/web-everything', number: 2816, title: 'x', isDraft: true, statusCheckRollup: pendingRollup };
     const out = smell.evaluate({ prs: [pr] }, { now: NOW });
-    expect(out.find((x) => x.subject === 'chalbert/web-everything#2816')).toBeUndefined();
+    expect(out.find((x) => x.subject === 'web-everything/web-everything#2816')).toBeUndefined();
   });
 
   it('a draft PR with a red required check is never a candidate — that is ci-heal\'s job, not promotion', () => {
     const pr = {
-      repo: 'chalbert/web-everything', number: 2817, title: 'x', isDraft: true,
+      repo: 'web-everything/web-everything', number: 2817, title: 'x', isDraft: true,
       statusCheckRollup: redRollup(new Date(NOW - 60 * MINUTE).toISOString()),
     };
     const out = smell.evaluate({ prs: [pr] }, { now: NOW });
-    expect(out.find((x) => x.subject === 'chalbert/web-everything#2817')).toBeUndefined();
+    expect(out.find((x) => x.subject === 'web-everything/web-everything#2817')).toBeUndefined();
   });
 
   it('falls back to updatedAt when no check carries a readable completedAt, never fabricating a bound off missing data', () => {
     const pr = {
-      repo: 'chalbert/web-everything', number: 2818, title: 'x', isDraft: true,
+      repo: 'web-everything/web-everything', number: 2818, title: 'x', isDraft: true,
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: null }],
       updatedAt: new Date(NOW - 30 * MINUTE).toISOString(),
     };
     const out = smell.evaluate({ prs: [pr] }, { now: NOW });
-    const r = out.find((x) => x.subject === 'chalbert/web-everything#2818');
+    const r = out.find((x) => x.subject === 'web-everything/web-everything#2818');
     expect(r.breach).toBe(true);
     expect(r.measure.greenForMin).toBe(30);
   });

@@ -11,7 +11,7 @@
  *
  * @module config
  */
-import type { AutoDefineFlavorName } from './defineConfig';
+import type { AutoDefineFlavorName, CrossProviderFallbackPolicy } from './defineConfig';
 
 /**
  * Platform default flavor id for `autoDefine`: **`strict-explicit`** — the native baseline (explicit
@@ -46,4 +46,10 @@ export const PLATFORM_FLAVOR_DEFAULTS = {
    *  selection / count / find / focus behave as if the whole list were present, #2513). The `js-windowing`
    *  strategy is the opt-in for tens-of-thousands lists. */
   windowedCollection: 'content-visibility',
+  /** Cross-provider seat fallback (xb1e9nj): wait for the provider seat for a bounded time, then park for a
+   *  human. `same-provider-other-model` is an explicit opt-in and is never the default. */
+  crossProviderFallback: 'wait-then-park' satisfies CrossProviderFallbackPolicy,
 } as const;
+
+/** Default `waitTimeoutMs` for `wait-then-park` (xb1e9nj): 24 hours, the bound the decision named as the example. */
+export const PLATFORM_CROSS_PROVIDER_FALLBACK_WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1000;

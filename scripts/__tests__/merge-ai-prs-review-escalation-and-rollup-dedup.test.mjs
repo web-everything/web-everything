@@ -743,7 +743,7 @@ describe('#2899 jury J2/J4 — planResolveOnLand is TOTAL: nothing is silently w
     // Both halves carry a manifest for one item. With an item-only last-write-wins key the impl's headRef won,
     // and the gate's `r !== couple.headRef` exemption then SKIPPED the still-open impl ref — the safety check
     // disabling itself. Ordered impl-last on purpose: this is the input that used to pass.
-    const impl = { item: 'xcarr01', repo: 'chalbert/frontierui', isWe: false, headRef: 'lane/xcarr01-fui', manifestRefs: ['lane/xcarr01-fui', 'lane/xcarr01-we'] };
+    const impl = { item: 'xcarr01', repo: 'frontier-ui/frontierui', isWe: false, headRef: 'lane/xcarr01-fui', manifestRefs: ['lane/xcarr01-fui', 'lane/xcarr01-we'] };
     const p = planResolveOnLand({
       landedItems: ['xcarr01'],
       assigned: [],

@@ -10,7 +10,7 @@
  * [#operations-declared-once-callers-generated](../../docs/agent/platform-decisions.md#operations-declared-once-callers-generated)
  * in the smallest form it can take.
  *
- *   node scripts/operations/run.mjs review-pr --pr=1234 --repo=chalbert/web-everything --cwd=<a lane>
+ *   node scripts/operations/run.mjs review-pr --pr=1234 --repo=web-everything/web-everything --cwd=<a lane>
  *   node scripts/operations/run.mjs review-pr --resume=<run-id> --answer=accept
  *   node scripts/operations/run.mjs review-pr --resume=<run-id> --answer=abstain   # writes nothing
  *

@@ -24,6 +24,9 @@ export {
   type RenderStrategyFlavorName,
   type CodegenSoTFlavorName,
   type WindowedCollectionFlavorName,
+  type CrossProviderFallbackPolicy,
+  type CrossProviderFallbackFlavorName,
+  type CrossProviderFallbackValue,
 } from './defineConfig';
 
 export { type DimensionResolver } from './resolverContract';
@@ -31,5 +34,6 @@ export { type DimensionResolver } from './resolverContract';
 export {
   PLATFORM_AUTO_DEFINE_FLAVOR,
   PLATFORM_FLAVOR_DEFAULTS,
+  PLATFORM_CROSS_PROVIDER_FALLBACK_WAIT_TIMEOUT_MS,
   type AutoDefineOverrides,
 } from './platformDefaults';

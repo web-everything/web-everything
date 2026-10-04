@@ -23,9 +23,9 @@ const SOURCE = readFileSync(resolve(HERE, '..', 'mine-review-corpus.mjs'), 'utf8
 const CODE = SOURCE.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
 
 const ALLOWED = [
-  'repos/chalbert/web-everything/issues/1569/comments',
-  'repos/chalbert/web-everything/pulls/1569',
-  'repos/chalbert/web-everything/pulls/1569/files',
+  'repos/web-everything/web-everything/issues/1569/comments',
+  'repos/web-everything/web-everything/pulls/1569',
+  'repos/web-everything/web-everything/pulls/1569/files',
 ];
 
 describe('assertReadOnlyEndpoint — the allowed reads', () => {
@@ -98,16 +98,16 @@ describe('assertReadOnlyEndpoint — refuses a write flag whatever the endpoint'
 describe('assertReadOnlyEndpoint — refuses anything off the allowlist', () => {
   const REFUSED = [
     // The mutating endpoints this corpus must never touch, even as a bare GET-shaped path.
-    'repos/chalbert/web-everything/issues/1569/labels',
-    'repos/chalbert/web-everything/pulls/1569/merge',
-    'repos/chalbert/web-everything/pulls/1569/reviews',
+    'repos/web-everything/web-everything/issues/1569/labels',
+    'repos/web-everything/web-everything/pulls/1569/merge',
+    'repos/web-everything/web-everything/pulls/1569/reviews',
     // Widening by wildcard or prefix — the shape a later "just let it read anything" edit would take.
-    'repos/chalbert/web-everything',
-    'repos/chalbert/web-everything/issues/1569',
+    'repos/web-everything/web-everything',
+    'repos/web-everything/web-everything/issues/1569',
     // Anchoring: a path that merely CONTAINS an allowed shape must not pass at either end.
-    'repos/chalbert/web-everything/pulls/1569/files/extra',
-    'x/repos/chalbert/web-everything/pulls/1569',
-    'repos/chalbert/web-everything/issues/1569/comments/42',
+    'repos/web-everything/web-everything/pulls/1569/files/extra',
+    'x/repos/web-everything/web-everything/pulls/1569',
+    'repos/web-everything/web-everything/issues/1569/comments/42',
   ];
 
   it.each(REFUSED)('throws on %s', (endpoint) => {

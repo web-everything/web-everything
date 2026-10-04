@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/chalbert/web-everything.git",
+    "url": "https://github.com/web-everything/web-everything.git",
     "directory": "contracts"
   },
   "publishConfig": {

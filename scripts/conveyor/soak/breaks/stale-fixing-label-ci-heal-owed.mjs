@@ -2,7 +2,7 @@
  * @file breaks/stale-fixing-label-ci-heal-owed.mjs — live break, 2026-09-26 (card 4249, epic #4075/#3383).
  * A PR that moved from being owed a FIX to being owed a CI-HEAL kept a stale `review-status:fixing` label forever.
  *
- * LIVE INCIDENT: chalbert/web-everything PR #2742. Its `fix-2742` session finished (`state: 'done'`) and the
+ * LIVE INCIDENT: web-everything/web-everything PR #2742. Its `fix-2742` session finished (`state: 'done'`) and the
  * re-push went CI-red (`ci:failed`), so every review-daemon tick's plan carried a `kind:'ci-heal'` dispatch entry
  * for it. `we:skills-src/conveyor/review-daemon.mjs#runReviewTick` only fed `kind:'review'` / `kind:'fix'`
  * entries plus refusals to `we:scripts/conveyor/reconcile-core.mjs#selectStatusCandidates` — a ci-heal entry is

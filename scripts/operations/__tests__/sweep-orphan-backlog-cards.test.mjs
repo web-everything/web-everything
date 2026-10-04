@@ -24,13 +24,13 @@ dateOpened: "2026-09-28"
 tags: []
 ---
 
-# File the prevention guard(s) owed by chalbert/web-everything#${pr}'s independent review
+# File the prevention guard(s) owed by web-everything/web-everything#${pr}'s independent review
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
 1. \`we:scripts/a.mjs\` — ${guard}
 
-Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#${pr}@${sha}
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#${pr}@${sha}
 
 ## Done when
 
@@ -47,9 +47,9 @@ dateOpened: "2026-09-27"
 tags: []
 ---
 
-# File the prevention guard(s) owed by chalbert/web-everything#${pr}'s independent review
+# File the prevention guard(s) owed by web-everything/web-everything#${pr}'s independent review
 
-Filed mechanically by the unattended review loop (#2749) — every finding below reduced chalbert/web-everything#${pr}'s review (reviewed head \`${sha}\`) to prevention-outstanding by naming a guard neither captured nor filed:
+Filed mechanically by the unattended review loop (#2749) — every finding below reduced web-everything/web-everything#${pr}'s review (reviewed head \`${sha}\`) to prevention-outstanding by naming a guard neither captured nor filed:
 
 1. \`we:scripts/b.mjs\` — ${guard}
 
@@ -64,12 +64,12 @@ describe('parseOrphanCard', () => {
     expect(c.hashId).toBe('xab12cd');
     expect(c.status).toBe('open');
     expect(c.kind).toBe('story');
-    expect(c.sourceRef).toBe('chalbert/web-everything#2900');
+    expect(c.sourceRef).toBe('web-everything/web-everything#2900');
   });
 
   it('reads the review-loop shape: no idempotency key, sourceRef falls back to the title', () => {
     const c = parseOrphanCard('backlog/xef34gh-file-the-prevention.md', LOOP_CARD(2821, 'cafef00d'));
-    expect(c.sourceRef).toBe('chalbert/web-everything#2821');
+    expect(c.sourceRef).toBe('web-everything/web-everything#2821');
   });
 
   it('two cards for the SAME PR + SAME guard hash identically; a different guard hashes differently', () => {
@@ -115,7 +115,7 @@ describe('selectOrphanSurvivors', () => {
     const cards = [parseOrphanCard('backlog/xzzzzzz-a.md', APPROVAL_CARD(42, 's1'))];
     const { survivors, dropped } = selectOrphanSurvivors(cards, { mainGuardKeys: new Set([orphanDedupeKey(onMain)]) });
     expect(survivors).toEqual([]);
-    expect(dropped[0].reason).toMatch(/covers chalbert\/web-everything#42/);
+    expect(dropped[0].reason).toMatch(/covers web-everything\/web-everything#42/);
   });
 
   // PR #2901 review: a main card for the same PR with a DIFFERENT guard is different debt — never a drop.
@@ -388,7 +388,7 @@ const CONTENT_CHECK_OK = JSON.stringify({ ok: true, errors: [], warnings: [] });
 const VERIFY_GREEN = JSON.stringify({ verdict: { ok: true, passed: 3, failed: 0, unrun: 0, blocking: [] } });
 const VERIFY_RED = JSON.stringify({ verdict: { ok: false, blocking: ['vitest'] } });
 const OPEN_PR_OPENED = JSON.stringify({
-  findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 7777, url: 'https://github.com/chalbert/web-everything/pull/7777' } }] } },
+  findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 7777, url: 'https://github.com/web-everything/web-everything/pull/7777' } }] } },
 });
 
 const ONE_CARD = () => [{ rel: 'backlog/xab12cd-a.md', content: APPROVAL_CARD(500, 'sha500') }];
@@ -437,7 +437,7 @@ describe('sweepOrphanBacklogCards — the real scan → dedupe → lane → comm
       queueSurvivors: (survivors) => { queuedWith.push(...survivors); return survivors.map((s) => s.hashId); },
       mkTmp: () => '/tmp/sweep-x', rmTmp: () => {}, writeFile: (p, c) => written.push({ p, c }),
     });
-    expect(result).toEqual({ ok: true, step: 'done', reason: null, landed: ['backlog/xab12cd-a.md'], dropped: [], pr: 7777, url: 'https://github.com/chalbert/web-everything/pull/7777' });
+    expect(result).toEqual({ ok: true, step: 'done', reason: null, landed: ['backlog/xab12cd-a.md'], dropped: [], pr: 7777, url: 'https://github.com/web-everything/web-everything/pull/7777' });
 
     // acquire — a real lane.
     expect(calls[0].args[0]).toMatch(/scripts[/\\]lane-pool\.mjs$/);

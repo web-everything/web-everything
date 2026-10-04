@@ -152,7 +152,7 @@ export function scanTestTampering({ diffText = '' } = {}) {
 
 /**
  * Is this PR's test-gaming signal (at least partly) INHERITED from an already-escalated stacked base, rather
- * than genuinely new to this PR? Live shape (chalbert/web-everything#2766/#2767, 2026-09-26): #2767 is opened
+ * than genuinely new to this PR? Live shape (web-everything/web-everything#2766/#2767, 2026-09-26): #2767 is opened
  * on top of #2766's own branch; #2766 rewrites its "property 4" tests (legitimately, per its own PR), and
  * because #2767 is stacked on it, `scanTestTampering` sees that SAME diff as part of #2767's own net diff too
  * and trips the identical `tests-removed` finding — a human reviewing #2767 cold has no way to know the

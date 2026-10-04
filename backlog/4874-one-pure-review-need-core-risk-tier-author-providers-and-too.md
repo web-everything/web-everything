@@ -3,9 +3,10 @@ bornAs: xoopd0u
 kind: story
 size: 3
 parent: "4936"
-status: open
+status: resolved
 scope: ["we:scripts/lib/review-need.mjs", "we:scripts/lib/__tests__/review-need.test.mjs", "we:scripts/review-core-cli.mjs", "we:scripts/__tests__/review-core-cli.test.mjs"]
 dateOpened: "2026-10-03"
+dateResolved: "2026-10-03"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "4a2606bc2f711efd86849e250db36b1b100a0fa4"
 tags: [review, routing]
@@ -24,6 +25,89 @@ Preparation (2026-10-03) verified the inputs this core composes. Nothing is buil
 - Live probe on this checkout (the `shape --files=<f> --json` subcommand of we:scripts/review-core-cli.mjs, and `criticalWorkVerdict`): a backlog card is `none`/`prose`/not critical; `we:docs/agent/testing.md` is `code` and critical (statute); `we:scripts/lib/auto-land-seam.mjs` is `elevated` with gate-derivation and critical (gate-self); `we:scripts/operations/review-seat-caps.mjs` is not critical; `we:.github/workflows/ci.yml` is critical (irreversible).
 - Commit authorship is readable today. Claude: `we:scripts/lib/ai-pr-authorship.mjs#isAiCommit` (line 30). Codex: delivery commits carry `Co-Authored-By: Codex <noreply@openai.com>` from `we:scripts/operations/deliver-item-wrapper.mjs#coAuthorTrailerFor` (line 1993); orchestrated Codex jobs write a `Written by Codex (...)` body line instead (for example commit e1c7feeb9). The last 200 main commits carry 35 Codex trailers, 49 Claude trailers and 4 `Written by Codex` lines. Merge and drain bookkeeping commits are already filtered by `isMechanicalMergeCommit` (line 91) and `isDrainBookkeepingCommit` (line 138).
 - The "protected list" in the operator's target has no single home on main yet. Its parts on main are the critical-work groups above. The judge protected list proposed by xfnv9ay is still in open PR #3771; see Follow-ups.
+
+Implementation proof (2026-10-03):
+
+- Before: the new focused suite failed to resolve the absent module; the existing CLI suite passed all 53 tests. `git cat-file -e origin/main:we:scripts/lib/review-need.mjs` (with the repository alias removed for Git) also confirmed the module is absent on origin/main.
+- After: Vitest on we:scripts/lib/__tests__/review-need.test.mjs and we:scripts/__tests__/review-core-cli.test.mjs passed all 114 tests (47 core, 67 CLI). Regressions cover malformed/missing scope and commits, operative prose, both authorship stamps, bookkeeping filtering, CLI JSON and text output, and the existing empty-input refusal (exit 2).
+- Compatibility: loaded the original HEAD version of we:scripts/review-core-cli.mjs in memory and compared 10 touch-sets across four care overrides; all 40 plans retained byte-identical serialized pre-existing fields after removing the additive `need` field.
+- Mutation proof: temporarily replaced the critical predicate branch in we:scripts/lib/review-need.mjs with `if (false)`. The core suite failed 14 tests, including the CI gate file we:.github/workflows/ci.yml and empty-list cases; restored the original branch before final verification. The we:scripts/lib/auto-land-seam.mjs case correctly remained Opus through its independent gate-derivation trigger.
+- Final gate: `node we:scripts/verify-lane.mjs` (repository alias removed when executing) passed 5,314 tests across 80 files and ran `npm run check:standards`: zero errors, 5,274 warnings. No tests or gates were weakened.
+- Live proof uses `gh pr view <n> --json state,files,commits`, passing its file paths via `--files` and its unchanged JSON via `--commits-file=/dev/stdin` to `we:scripts/review-core-cli.mjs shape --json`; no helper files.
+
+Live merged PR #3810:
+
+```json
+{
+  "tier": "haiku",
+  "tierReasons": [
+    "inert-prose"
+  ],
+  "needsTools": {
+    "correctness": false,
+    "security": false
+  },
+  "authors": [
+    "claude"
+  ],
+  "authorsKnown": true,
+  "crossProvider": {
+    "required": "codex",
+    "satisfiedBy": null,
+    "reason": "Claude or unknown authors: require a Codex seat"
+  }
+}
+```
+
+Live merged PR #3800:
+
+```json
+{
+  "tier": "sonnet",
+  "tierReasons": [
+    "standard-review"
+  ],
+  "needsTools": {
+    "correctness": true,
+    "security": true
+  },
+  "authors": [
+    "codex"
+  ],
+  "authorsKnown": true,
+  "crossProvider": {
+    "required": null,
+    "satisfiedBy": "claude-mandatory-seats",
+    "reason": "Codex-only authors: Claude mandatory seats cross providers"
+  }
+}
+```
+
+Live merged PR #3507:
+
+```json
+{
+  "tier": "opus",
+  "tierReasons": [
+    "critical:never-spot-check: gateSelf"
+  ],
+  "needsTools": {
+    "correctness": true,
+    "security": true
+  },
+  "authors": [
+    "claude",
+    "codex",
+    "unknown"
+  ],
+  "authorsKnown": false,
+  "crossProvider": {
+    "required": "codex",
+    "satisfiedBy": null,
+    "reason": "Claude or unknown authors: require a Codex seat"
+  }
+}
+```
 
 ## Design
 
@@ -101,6 +185,8 @@ Run Vitest on we:scripts/lib/__tests__/review-need.test.mjs and we:scripts/__tes
 3. `npm run check:standards` passes.
 
 ## Follow-ups
+
+- Testing lesson: we:scripts/review-core-cli.mjs emits structured refusal JSON on stdout, including for exit 2. CLI refusal tests must inspect that output. Ordinary inert documentation can qualify for Haiku under the existing subject router; operative documentation remains covered by strict non-Haiku regressions.
 
 - When xfnv9ay (judge protected list, open PR #3771) lands, add its list as one more opus reason. Reuse its export; do not keep a copy.
 - Tier thresholds are policy. Moving them into we:scripts/lib/dispatch-routing-policy.json belongs to the policy-dimensions epic #4376 once that has a home for review rules.

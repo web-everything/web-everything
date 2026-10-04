@@ -54,7 +54,7 @@ it.each([198, 199])('replays Plateau PR #%s with protection unavailable and test
     const readRequired = args => getRequiredStatusChecks({ ...args, cachePath: join(dir, 'cache.json'),
       readChecks: () => { throw new Error('Resource not accessible by integration (HTTP 403)'); } });
     const checks = ['test', 'e2e'].map(name => ({ name, status: 'completed', conclusion: 'success' }));
-    const io = fixture({ repo: 'chalbert/plateau-app', pr, readRequired, readChecks: () => checks });
+    const io = fixture({ repo: 'plateauapp/plateau-app', pr, readRequired, readChecks: () => checks });
     expect(readReviewCiGate(io)).toMatchObject({ allowed: true, source: 'declared', headSha });
     expect(readReviewCiGate({ ...io, readChecks: () => checks.slice(0, 1) })).toMatchObject({ allowed: false, source: 'declared' });
   } finally {
@@ -93,7 +93,7 @@ it.each([
     const checks = [{ name: 'smoke', status: 'completed', conclusion: 'success' },
       { name: 'test', status: at < testDone ? 'in_progress' : 'completed', conclusion: at < testDone ? null : 'success' },
       ...(at < soakStarted ? [] : [{ name: 'daemon-soak', status: 'completed', conclusion: 'failure' }])];
-    const out = readReviewCiGate({ repo: 'chalbert/web-everything', pr: 3432, readHead: () => sha,
+    const out = readReviewCiGate({ repo: 'web-everything/web-everything', pr: 3432, readHead: () => sha,
       readRequired: () => ({ source: 'live', checks: ['test', 'smoke', 'daemon-soak'] }), readChecks: () => checks });
     expect(out.allowed).toBe(false);
     expect(out.affected).toContainEqual({ name: 'daemon-soak', reason: at < soakStarted ? 'missing' : 'failure' });
@@ -109,7 +109,7 @@ it.each([
   const dir = mkdtempSync(join(tmpdir(), 'we-review-ci-cache-'));
   try {
     const cachePath = join(dir, 'cache.json');
-    const repo = 'chalbert/web-everything';
+    const repo = 'web-everything/web-everything';
     const names = ['test', 'smoke', 'daemon-soak'];
     getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => names });
     const io = fixture({ repo,

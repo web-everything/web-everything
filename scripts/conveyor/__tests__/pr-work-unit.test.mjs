@@ -89,7 +89,7 @@ describe('resolvePrWorkUnit (#xdx3ifb)', () => {
 
   // #xcla4iv — the standard file-item-in-PR workflow: the card and the code that delivers it land in the SAME
   // PR, so `findItem` (which reads only `main`) misses it, but the PR's own diff carries the card. Live case:
-  // `chalbert/web-everything` PR #2553 (branch `lane/xzi292i-stuck-pr-watch`) — see the file header.
+  // `web-everything/web-everything` PR #2553 (branch `lane/xzi292i-stuck-pr-watch`) — see the file header.
   describe('#xcla4iv — the item\'s own card is filed IN this PR\'s diff, not yet on `main`', () => {
     it('attributes to the ITEM and reads the card\'s own committed `scope:` at the PR head, when found', () => {
       const calls = [];
@@ -187,7 +187,7 @@ describe('resolvePrWorkUnit (#xdx3ifb)', () => {
       expect(unit.itemNum).toBeNull();
     });
 
-    // Review findings (correctness + security, chalbert/web-everything#2573) — a card filed IN this PR's own
+    // Review findings (correctness + security, web-everything/web-everything#2573) — a card filed IN this PR's own
     // unmerged diff is exactly as PR-author-controlled/unreviewed as the diff paths themselves (neither has
     // landed on `main`), so it must get the SAME two guards the diff-paths fallback already gets: character
     // safety and containment to the PR's own footprint. Before the fix, `cardScope` was returned verbatim.

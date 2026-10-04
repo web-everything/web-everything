@@ -178,11 +178,11 @@ export function orderedRepos(m) {
  * #2390 — the manifest repo KEY (`we`/`frontierui`/`plateau-app`) for a git slug or short name. Pure. The
  * escalation scorers (the drain in `merge-ai-prs.mjs`, the producer in `pr-land.mjs`) hold a repo as an
  * `owner/name` slug or `null` (the cwd repo); the manifest keys it by the SHORT name, with `web-everything`
- * carried as `we` (its `INTEGRATION_ORDER` key). Maps a slug (`chalbert/frontierui` → `frontierui`), a bare
+ * carried as `we` (its `INTEGRATION_ORDER` key). Maps a slug (`frontier-ui/frontierui` → `frontierui`), a bare
  * short name (`web-everything` → `we`), and passes an already-canonical key through. `null`/empty → `null`.
  *
  * A trailing `.git` is stripped BEFORE the short-name comparison — a raw `git remote get-url origin` value
- * (`git@github.com:chalbert/web-everything.git`) is a real live input to this function via
+ * (`git@github.com:web-everything/web-everything.git`) is a real live input to this function via
  * `scope-lease-collect.mjs`'s `repoKeyForLane`, not just a clean `owner/name` slug; without the strip, the
  * comparison never matches `'web-everything'`, and the WHOLE-URL-taken-as-slug case degrades to a raw
  * `web-everything.git` key instead of `we` (live incident, 2026-09-04) — silently mismatching every OTHER

@@ -1,4 +1,4 @@
-/** @file #xconv1 (chalbert/web-everything#2766/#2767 unblock) — the mechanical executor for a
+/** @file #xconv1 (web-everything/web-everything#2766/#2767 unblock) — the mechanical executor for a
  *  `kind:'convert-advisory'` dispatch entry: post the converted advisory note, run ONE tool-free targeted-check
  *  judge seat, apply advisory:accepted|changes, clear review:awaiting-advisory. No `gh`, no real judge spawn,
  *  no real `git` — every effect injected (#xconv1-evidence adds `fetchEvidence` to that list: every test below
@@ -16,7 +16,7 @@ import {
 
 const HEAD = 'abbe08beacae462f98d6caf654d3ce7867c92801';
 const acceptComment = {
-  body: `✅ review — accepted\n\n## Human review verdict — chalbert/web-everything#2766\n\n**Verdict:** ✅ pass\n\n${buildReviewedShaMarker(HEAD)}`,
+  body: `✅ review — accepted\n\n## Human review verdict — web-everything/web-everything#2766\n\n**Verdict:** ✅ pass\n\n${buildReviewedShaMarker(HEAD)}`,
   createdAt: '2026-09-26T21:47:43Z',
 };
 const escalation = {
@@ -152,37 +152,37 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
       + FAKE_DIFF.replace(/^/, 'diff --git a/scripts/operations/__tests__/review-loop-cli.test.mjs b/scripts/operations/__tests__/review-loop-cli.test.mjs\n');
     const exec = (cmd, args) => {
       calls.push(`${cmd} ${args.join(' ')}`);
-      if (cmd === 'git' && args[0] === 'remote') return 'git@github.com:chalbert/web-everything.git\n';
+      if (cmd === 'git' && args[0] === 'remote') return 'git@github.com:web-everything/web-everything.git\n';
       if (cmd === 'gh') return ghDiff;
       throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
     };
     const result = fetchTestGamingDiffEvidence({
-      exec, repo: 'chalbert/frontierui', prNumber: 77, rev: HEAD,
+      exec, repo: 'frontier-ui/frontierui', prNumber: 77, rev: HEAD,
       paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'],
     });
     expect(result.scored).toBe(true);
     expect(result.text).toContain("-it('old case'");
     expect(result.text).not.toContain('src/other.mjs');
-    expect(calls).toContain('gh pr diff 77 --repo chalbert/frontierui');
+    expect(calls).toContain('gh pr diff 77 --repo frontier-ui/frontierui');
     expect(calls.some((c) => c.startsWith('git fetch') || c.startsWith('git diff'))).toBe(false);
   });
   it('fetchTestGamingDiffEvidence: a foreign repo with no PR number is scored:false (never a local-git guess)', () => {
     const exec = (cmd, args) => {
-      if (cmd === 'git' && args[0] === 'remote') return 'https://github.com/chalbert/web-everything.git\n';
+      if (cmd === 'git' && args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git\n';
       throw new Error('must not be reached');
     };
-    expect(fetchTestGamingDiffEvidence({ exec, repo: 'chalbert/frontierui', rev: HEAD, paths: ['a.test.mjs'] }))
+    expect(fetchTestGamingDiffEvidence({ exec, repo: 'frontier-ui/frontierui', rev: HEAD, paths: ['a.test.mjs'] }))
       .toMatchObject({ scored: false, reason: 'repo-not-local' });
   });
   it('fetchTestGamingDiffEvidence: a repo matching this checkout\'s origin keeps the local net-diff path', () => {
     const exec = (cmd, args) => {
-      if (cmd === 'git' && args[0] === 'remote') return 'https://github.com/chalbert/web-everything.git\n';
+      if (cmd === 'git' && args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git\n';
       if (args[0] === 'fetch') return '';
       if (args[0] === 'merge-base') return 'deadbeef';
       if (args[0] === 'diff') return FAKE_DIFF;
       throw new Error(`unexpected ${cmd}`);
     };
-    expect(fetchTestGamingDiffEvidence({ exec, repo: 'chalbert/web-everything', prNumber: 1, rev: HEAD, paths: ['x.test.mjs'] }))
+    expect(fetchTestGamingDiffEvidence({ exec, repo: 'web-everything/web-everything', prNumber: 1, rev: HEAD, paths: ['x.test.mjs'] }))
       .toMatchObject({ scored: true, text: FAKE_DIFF });
   });
   it('resolveTargetedCheckEvidence: heal-mutual-exclusivity REQUIRES the PR comment history and hands it to the judge (PR #2781 review)', async () => {
@@ -287,7 +287,7 @@ describe('runTargetedCheck', () => {
 describe('planConvertAdvisoryEffects (pure)', () => {
   it('an `accept` targeted check plans advisory:accepted, drops any stale advisory:changes and review:awaiting-advisory', () => {
     const plan = planConvertAdvisoryEffects({
-      prNumber: 2766, repo: 'chalbert/web-everything', headSha: HEAD, acceptComment, escalation,
+      prNumber: 2766, repo: 'web-everything/web-everything', headSha: HEAD, acceptComment, escalation,
       targetedCheckAnswer: { verdict: 'accept', note: 'ok' },
       currentLabels: [{ name: 'review:human' }, { name: 'review:awaiting-advisory' }, { name: 'advisory:changes' }],
     });
@@ -297,7 +297,7 @@ describe('planConvertAdvisoryEffects (pure)', () => {
   });
   it('a `changes` targeted check plans advisory:changes', () => {
     const plan = planConvertAdvisoryEffects({
-      prNumber: 2766, repo: 'chalbert/web-everything', headSha: HEAD, acceptComment, escalation,
+      prNumber: 2766, repo: 'web-everything/web-everything', headSha: HEAD, acceptComment, escalation,
       targetedCheckAnswer: { verdict: 'changes', note: 'weakened' },
       currentLabels: [{ name: 'review:human' }],
     });
@@ -306,14 +306,14 @@ describe('planConvertAdvisoryEffects (pure)', () => {
   });
   it('review:awaiting-advisory is left alone when already absent (never a spurious remove call)', () => {
     const plan = planConvertAdvisoryEffects({
-      prNumber: 2766, repo: 'chalbert/web-everything', headSha: HEAD, acceptComment, escalation,
+      prNumber: 2766, repo: 'web-everything/web-everything', headSha: HEAD, acceptComment, escalation,
       targetedCheckAnswer: { verdict: 'accept', note: 'ok' }, currentLabels: [{ name: 'review:human' }],
     });
     expect(plan.removeLabels).toEqual([]);
   });
   it('an `inconclusive` targeted check plans NO advisory label at all (#xconv1-evidence — never a manufactured advisory:changes)', () => {
     const plan = planConvertAdvisoryEffects({
-      prNumber: 2766, repo: 'chalbert/web-everything', headSha: HEAD, acceptComment, escalation,
+      prNumber: 2766, repo: 'web-everything/web-everything', headSha: HEAD, acceptComment, escalation,
       targetedCheckAnswer: { verdict: 'inconclusive', note: 'no diff evidence was available' },
       currentLabels: [{ name: 'review:human' }, { name: 'review:awaiting-advisory' }],
     });
@@ -332,7 +332,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
       return { verdict: 'accept', note: 'legitimate removal' };
     });
     const result = await dispatchConvertAdvisory(d, {
-      repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(),
+      repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(),
     });
     expect(result.posted).toBe(true);
     expect(p.calls.postComment).toHaveLength(1);
@@ -346,7 +346,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
     const p = provider({ readPrState: () => ({ comments: [acceptComment], labels: [{ name: 'review:human' }] }) });
     const fakeJudge = vi.fn();
     const result = await dispatchConvertAdvisory(d, {
-      repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeUnavailableEvidence(),
+      repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeUnavailableEvidence(),
     });
     expect(fakeJudge).not.toHaveBeenCalled();
     expect(result.targetedCheckAnswer.verdict).toBe('inconclusive');
@@ -357,7 +357,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
 
   it('IDEMPOTENT: a head that already carries the converted note is a no-op — no post, no label write, no judge call, no evidence fetch', async () => {
     const already = renderConvertedAdvisoryNote({
-      repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
+      repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
       targetedCheckAnswer: { verdict: 'accept', note: 'ok' },
     });
     expect(hasConvertedAdvisoryNote([{ body: already, author: { login: 'web-everything' } }], HEAD)).toBe(true);
@@ -366,7 +366,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
     const p = provider({ readPrState: () => ({ comments: [{ body: already, author: { login: 'web-everything' } }], labels: [{ name: 'advisory:accepted' }] }) });
     const fakeJudge = vi.fn();
     const fetchEvidence = vi.fn();
-    const result = await dispatchConvertAdvisory(d, { repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence });
+    const result = await dispatchConvertAdvisory(d, { repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence });
     expect(result.skipped).toBe('already-converted');
     expect(p.calls.postComment).toHaveLength(0);
     expect(p.calls.setLabels).toHaveLength(0);
@@ -376,13 +376,13 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
 
   it('`force` bypasses the idempotency check — #xconv1-evidence\'s own "not by hand" repair path for a note that was produced with no evidence', async () => {
     const already = renderConvertedAdvisoryNote({
-      repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
+      repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
       targetedCheckAnswer: { verdict: 'changes', note: 'no diff evidence to confirm the removed tests were legitimate' },
     });
     const p = provider({ readPrState: () => ({ comments: [{ body: already, author: { login: 'web-everything' } }], labels: [{ name: 'advisory:changes' }] }) });
     const fakeJudge = vi.fn(async () => ({ verdict: 'accept', note: 'confirmed legitimate — replaced by equivalent coverage' }));
     const result = await dispatchConvertAdvisory(d, {
-      repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(), force: true,
+      repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(), force: true,
     });
     expect(result.skipped).toBeUndefined();
     expect(result.posted).toBe(true);
@@ -395,7 +395,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
     const fakeJudge = vi.fn(async () => ({ verdict: 'accept', note: 'legitimate removal' }));
     const fetchEvidence = fakeAvailableEvidence();
     const result = await dispatchConvertAdvisory(d, {
-      repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence, dryRun: true,
+      repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence, dryRun: true,
       comments: [acceptComment], labels: [{ name: 'review:human' }, { name: 'review:awaiting-advisory' }],
     });
     expect(fakeJudge).toHaveBeenCalledTimes(1);
@@ -413,7 +413,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
     const p = provider({ readPrState: () => ({ comments: [acceptComment], labels: [{ name: 'review:human' }] }) });
     const fakeJudge = vi.fn(async () => ({ verdict: 'changes', note: 'tests were weakened, not replaced' }));
     const result = await dispatchConvertAdvisory(d, {
-      repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(),
+      repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(),
     });
     expect(p.calls.setLabels[0].spec).toEqual({ add: 'advisory:changes', remove: [] });
     expect(result.body).toContain('tests were weakened, not replaced');
@@ -430,7 +430,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
     };
     const fakeJudge = vi.fn(async () => ({ verdict: 'changes', note: 'tests were weakened' }));
     // Nobody touched a label since the note (the write never landed) — the timeline is empty.
-    const opts = { repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(), readLabelEvents: () => [] };
+    const opts = { repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(), readLabelEvents: () => [] };
     await expect(dispatchConvertAdvisory(d, opts)).rejects.toThrow(/502/);
     expect(posted).toHaveLength(1);
 
@@ -440,7 +440,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
     expect(retry.repairedLabels).toBe(true);
     expect(fakeJudge).toHaveBeenCalledTimes(1); // never re-asked
     expect(posted).toHaveLength(1); // never re-posted
-    expect(p.setLabels).toHaveBeenLastCalledWith('chalbert/web-everything', 2766,
+    expect(p.setLabels).toHaveBeenLastCalledWith('web-everything/web-everything', 2766,
       { add: 'advisory:changes', remove: ['review:awaiting-advisory'] });
   });
 
@@ -470,7 +470,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
         const { posted, p, fakeJudge, allowLabels } = replacementFixture({ prior, verdict });
         // The only advisory event is the PRIOR label, applied BEFORE the note — nobody decided anything since.
         const readLabelEvents = vi.fn(() => [{ event: 'labeled', label: prior, createdAt: '2026-09-26T12:00:00Z' }]);
-        const opts = { repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(), readLabelEvents };
+        const opts = { repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(), readLabelEvents };
         await expect(dispatchConvertAdvisory(d, opts)).rejects.toThrow(/502/);
         expect(posted).toHaveLength(1);
         allowLabels();
@@ -478,14 +478,14 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
         expect(retry.repairedLabels).toBe(true);
         expect(fakeJudge).toHaveBeenCalledTimes(1);
         expect(posted).toHaveLength(1);
-        expect(p.setLabels).toHaveBeenLastCalledWith('chalbert/web-everything', 2766, { add: want, remove: [prior] });
+        expect(p.setLabels).toHaveBeenLastCalledWith('web-everything/web-everything', 2766, { add: want, remove: [prior] });
       });
     }
 
     it('a HALF-applied write (the add landed, the remove failed → both labels) is repaired — this write\'s own add is not an override', async () => {
       const labels = [{ name: 'review:human' }, { name: 'advisory:changes' }, { name: 'advisory:accepted' }];
       const note = renderConvertedAdvisoryNote({
-        repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
+        repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
         targetedCheckAnswer: { verdict: 'accept', note: 'ok' },
       });
       const p = provider({ readPrState: () => ({ comments: [{ body: note, author: { login: 'web-everything' }, createdAt: NOTE_AT }], labels }) });
@@ -493,7 +493,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
         { event: 'labeled', label: 'advisory:changes', createdAt: '2026-09-26T12:00:00Z' },
         { event: 'labeled', label: 'advisory:accepted', createdAt: '2026-09-27T01:00:01Z' },
       ];
-      const r = await dispatchConvertAdvisory(d, { repo: 'chalbert/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn(), readLabelEvents });
+      const r = await dispatchConvertAdvisory(d, { repo: 'web-everything/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn(), readLabelEvents });
       expect(r.repairedLabels).toBe(true);
       // advisory:accepted already landed — only the failed removal is owed.
       expect(p.calls.setLabels[0].spec).toEqual({ add: undefined, remove: ['advisory:changes'] });
@@ -501,13 +501,13 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
 
     it('the label repair revalidates too: a head that moved since the snapshot gets no label', async () => {
       const note = renderConvertedAdvisoryNote({
-        repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
+        repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
         targetedCheckAnswer: { verdict: 'accept', note: 'ok' },
       });
       const comments = [{ body: note, author: { login: 'web-everything' }, createdAt: NOTE_AT }];
       const p = provider({ readPrState: () => ({ headRefOid: 'f'.repeat(40), comments, labels: [] }) });
       const r = await dispatchConvertAdvisory(d, {
-        repo: 'chalbert/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn(), comments, labels: [],
+        repo: 'web-everything/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn(), comments, labels: [],
         readLabelEvents: () => [],
       });
       expect(r.skipped).toBe('head-moved');
@@ -517,7 +517,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
     it('an advisory label event AFTER the note (a human override) → never fought', async () => {
       const { p, fakeJudge, allowLabels } = replacementFixture({ prior: 'advisory:changes', verdict: 'accept' });
       const readLabelEvents = vi.fn(() => [{ event: 'labeled', label: 'advisory:changes', createdAt: '2026-09-27T02:00:00Z' }]);
-      const opts = { repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(), readLabelEvents };
+      const opts = { repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(), readLabelEvents };
       await expect(dispatchConvertAdvisory(d, opts)).rejects.toThrow(/502/);
       allowLabels();
       const r = await dispatchConvertAdvisory(d, opts);
@@ -528,7 +528,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
     it('the label timeline cannot be read → fail closed (no repair), never a guess', async () => {
       const { p, fakeJudge, allowLabels } = replacementFixture({ prior: 'advisory:changes', verdict: 'accept' });
       const readLabelEvents = vi.fn(() => { throw new Error('gh: HTTP 502'); });
-      const opts = { repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(), readLabelEvents };
+      const opts = { repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(), readLabelEvents };
       await expect(dispatchConvertAdvisory(d, opts)).rejects.toThrow(/502/);
       allowLabels();
       const r = await dispatchConvertAdvisory(d, opts);
@@ -544,7 +544,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
       const p = provider({ readPrState: () => ({ headRefOid: head, comments: [acceptComment], labels: [{ name: 'review:human' }] }) });
       const fakeJudge = vi.fn(async () => { head = 'f'.repeat(40); return { verdict: 'accept', note: 'ok' }; });
       const r = await dispatchConvertAdvisory(d, {
-        repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(),
+        repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(),
         comments: [acceptComment], labels: [{ name: 'review:human' }, { name: 'review:awaiting-advisory' }],
       });
       expect(r.skipped).toBe('head-moved');
@@ -558,12 +558,12 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
       const p = provider({ readPrState: () => ({ comments, labels: [{ name: 'review:human' }] }) });
       const fakeJudge = vi.fn(async () => {
         comments = [...comments, {
-          body: renderConvertedAdvisoryNote({ repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation, targetedCheckAnswer: { verdict: 'accept', note: 'ok' } }),
+          body: renderConvertedAdvisoryNote({ repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation, targetedCheckAnswer: { verdict: 'accept', note: 'ok' } }),
           author: { login: 'web-everything' },
         }];
         return { verdict: 'accept', note: 'ok' };
       });
-      const r = await dispatchConvertAdvisory(d, { repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence() });
+      const r = await dispatchConvertAdvisory(d, { repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence() });
       expect(r.skipped).toBe('already-converted');
       expect(p.calls.postComment).toHaveLength(0);
       expect(p.calls.setLabels).toHaveLength(0);
@@ -573,7 +573,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
       let state = 'OPEN';
       const p = provider({ readPrState: () => ({ state, comments: [acceptComment], labels: [{ name: 'review:human' }] }) });
       const fakeJudge = vi.fn(async () => { state = 'MERGED'; return { verdict: 'accept', note: 'ok' }; });
-      const r = await dispatchConvertAdvisory(d, { repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence() });
+      const r = await dispatchConvertAdvisory(d, { repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence() });
       expect(r.skipped).toBe('pr-not-open');
       expect(p.calls.postComment).toHaveLength(0);
     });
@@ -583,7 +583,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
       const p = provider({ readPrState: () => ({ comments: [acceptComment], labels }) });
       const fakeJudge = vi.fn(async () => { labels = [{ name: 'review:human' }]; return { verdict: 'accept', note: 'ok' }; });
       await dispatchConvertAdvisory(d, {
-        repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(),
+        repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(),
         comments: [acceptComment], labels,
       });
       expect(p.calls.setLabels[0].spec).toEqual({ add: 'advisory:accepted', remove: [] });
@@ -592,11 +592,11 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
 
   it('LABEL RETRY is a no-op once the labels already match the recorded outcome', async () => {
     const already = renderConvertedAdvisoryNote({
-      repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
+      repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
       targetedCheckAnswer: { verdict: 'accept', note: 'ok' },
     });
     const p = provider({ readPrState: () => ({ comments: [{ body: already, author: { login: 'web-everything' } }], labels: [{ name: 'advisory:accepted' }] }) });
-    const result = await dispatchConvertAdvisory(d, { repo: 'chalbert/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn() });
+    const result = await dispatchConvertAdvisory(d, { repo: 'web-everything/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn() });
     expect(result.skipped).toBe('already-converted');
     expect(result.repairedLabels).toBeUndefined();
     expect(p.calls.setLabels).toHaveLength(0);
@@ -604,7 +604,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
 
   it('LABEL RETRY never fights a later decision: a human override (or a fresh advisory) at the same head is left alone, every tick (PR #2781 review)', async () => {
     const note = renderConvertedAdvisoryNote({
-      repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
+      repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
       targetedCheckAnswer: { verdict: 'changes', note: 'x' },
     });
     // Recorded `changes`, but a human swapped in advisory:accepted (and review:awaiting-advisory came back).
@@ -618,7 +618,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
       { event: 'labeled', label: 'advisory:accepted', createdAt: '2026-09-27T03:00:00Z' },
     ];
     for (let tick = 0; tick < 3; tick += 1) {
-      const r = await dispatchConvertAdvisory(d, { repo: 'chalbert/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn(), readLabelEvents });
+      const r = await dispatchConvertAdvisory(d, { repo: 'web-everything/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn(), readLabelEvents });
       expect(r).toEqual({ prNumber: 2766, headSha: HEAD, skipped: 'already-converted' });
     }
     expect(p.calls.setLabels).toHaveLength(0);
@@ -626,11 +626,11 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
 
   it('LABEL RETRY never adds an advisory label for a recorded `inconclusive` (it applies none to lose)', async () => {
     const note = renderConvertedAdvisoryNote({
-      repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
+      repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
       targetedCheckAnswer: { verdict: 'inconclusive', note: 'x' },
     });
     const p = provider({ readPrState: () => ({ comments: [{ body: note, author: { login: 'web-everything' } }], labels: [{ name: 'review:human' }] }) });
-    const r = await dispatchConvertAdvisory(d, { repo: 'chalbert/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn(), readLabelEvents: vi.fn(() => []) });
+    const r = await dispatchConvertAdvisory(d, { repo: 'web-everything/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn(), readLabelEvents: vi.fn(() => []) });
     expect(r.repairedLabels).toBeUndefined();
     expect(p.calls.setLabels).toHaveLength(0);
   });
@@ -639,13 +639,13 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
     const NOTE_AT = '2026-09-27T01:00:00Z';
     const noteComment = (verdict) => ({
       body: renderConvertedAdvisoryNote({
-        repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
+        repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
         targetedCheckAnswer: { verdict, note: 'x' },
       }),
       author: { login: 'web-everything' }, createdAt: NOTE_AT,
     });
     const run = (p, readLabelEvents) => dispatchConvertAdvisory(d, {
-      repo: 'chalbert/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn(), readLabelEvents,
+      repo: 'web-everything/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn(), readLabelEvents,
     });
 
     it('LABEL RETRY respects removal of the last advisory label — an operator\'s unlabel after the note is never reversed', async () => {
@@ -703,12 +703,12 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
 
   it('dryRun on a lost label write REPORTS the repair it would make, without writing (PR #2781 review)', async () => {
     const note = renderConvertedAdvisoryNote({
-      repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
+      repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD, acceptComment, escalation,
       targetedCheckAnswer: { verdict: 'changes', note: 'x' },
     });
     const p = provider();
     const r = await dispatchConvertAdvisory(d, {
-      repo: 'chalbert/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn(), dryRun: true,
+      repo: 'web-everything/web-everything', provider: p, runJudge: vi.fn(), fetchEvidence: vi.fn(), dryRun: true,
       comments: [{ body: note, author: { login: 'web-everything' }, createdAt: '2026-09-27T01:00:00Z' }], labels: [{ name: 'review:human' }],
       readLabelEvents: () => [],
     });
@@ -720,7 +720,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
     const heal = { ...d, escalation: { kind: 'heal-mutual-exclusivity', reasonText: 'heal' } };
     const p = provider();
     const fakeJudge = vi.fn();
-    const result = await dispatchConvertAdvisory(heal, { repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, comments: [], labels: [] });
+    const result = await dispatchConvertAdvisory(heal, { repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, comments: [], labels: [] });
     expect(fakeJudge).not.toHaveBeenCalled();
     expect(result.targetedCheckAnswer.verdict).toBe('inconclusive');
   });
@@ -732,24 +732,24 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
       expect(opts.evidence).toContain('operator: --to=clear-human');
       return { verdict: 'changes', note: 'a clearance was missed' };
     });
-    await dispatchConvertAdvisory(heal, { repo: 'chalbert/web-everything', provider: provider(), runJudge: fakeJudge, comments, labels: [] });
+    await dispatchConvertAdvisory(heal, { repo: 'web-everything/web-everything', provider: provider(), runJudge: fakeJudge, comments, labels: [] });
     expect(fakeJudge).toHaveBeenCalledTimes(1);
   });
 
   it('forwards repo + PR number to the evidence fetch so a foreign-repo PR is read from ITS repo (PR #2781 review)', async () => {
     const fetchEvidence = fakeAvailableEvidence();
     await dispatchConvertAdvisory(d, {
-      repo: 'chalbert/frontierui', provider: provider(), runJudge: vi.fn(async () => ({ verdict: 'accept', note: 'ok' })),
+      repo: 'frontier-ui/frontierui', provider: provider(), runJudge: vi.fn(async () => ({ verdict: 'accept', note: 'ok' })),
       fetchEvidence, comments: [acceptComment], labels: [],
     });
-    expect(fetchEvidence).toHaveBeenCalledWith(expect.objectContaining({ repo: 'chalbert/frontierui', prNumber: 2766, rev: HEAD }));
+    expect(fetchEvidence).toHaveBeenCalledWith(expect.objectContaining({ repo: 'frontier-ui/frontierui', prNumber: 2766, rev: HEAD }));
   });
 
   it('with no shared read handed in, fetches fresh PR state once up front, plus the ONE pre-write revalidation read', async () => {
     const p = provider({ readPrState: () => ({ comments: [acceptComment], labels: [] }) });
     const fakeJudge = vi.fn(async () => ({ verdict: 'accept', note: 'ok' }));
     await dispatchConvertAdvisory(d, {
-      repo: 'chalbert/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(),
+      repo: 'web-everything/web-everything', provider: p, runJudge: fakeJudge, fetchEvidence: fakeAvailableEvidence(),
     });
     expect(p.calls.readPrState).toHaveLength(2);
   });
@@ -757,7 +757,7 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
   it('with a shared read handed in, only the pre-write revalidation reads', async () => {
     const p = provider({ readPrState: () => ({ comments: [acceptComment], labels: [] }) });
     await dispatchConvertAdvisory(d, {
-      repo: 'chalbert/web-everything', provider: p, runJudge: vi.fn(async () => ({ verdict: 'accept', note: 'ok' })),
+      repo: 'web-everything/web-everything', provider: p, runJudge: vi.fn(async () => ({ verdict: 'accept', note: 'ok' })),
       fetchEvidence: fakeAvailableEvidence(), comments: [acceptComment], labels: [],
     });
     expect(p.calls.readPrState).toHaveLength(1);
@@ -765,11 +765,11 @@ describe('dispatchConvertAdvisory (IO shell, injected)', () => {
 
   it('readAdvisoryLabelEvents projects only the labels a converted note writes — advisory:*, review:awaiting-advisory, review:pending — off the timeline (fixed GET argv)', () => {
     const exec = vi.fn(() => '{"event":"labeled","label":"advisory:changes","createdAt":"t1"}\n\n');
-    expect(readAdvisoryLabelEvents('chalbert/web-everything', 2766, { exec })).toEqual([
+    expect(readAdvisoryLabelEvents('web-everything/web-everything', 2766, { exec })).toEqual([
       { event: 'labeled', label: 'advisory:changes', createdAt: 't1' },
     ]);
     const argv = exec.mock.calls[0][1];
-    expect(argv.slice(0, 7)).toEqual(['api', '--paginate', '-X', 'GET', '-F', 'per_page=100', 'repos/chalbert/web-everything/issues/2766/timeline']);
+    expect(argv.slice(0, 7)).toEqual(['api', '--paginate', '-X', 'GET', '-F', 'per_page=100', 'repos/web-everything/web-everything/issues/2766/timeline']);
     expect(argv[8]).toMatch(/startswith\("advisory:"\)/);
     expect(argv[8]).toContain('$n == "review:awaiting-advisory" or $n == "review:pending"');
   });

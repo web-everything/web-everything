@@ -35,7 +35,7 @@
  *     `defaultOriginRepo` derives `owner/name` from the origin URL, so a fixture needs a plausible slug. An
  *     earlier attempt at this harness set a real GitHub URL — and the next `git fetch origin` LEFT THE
  *     MACHINE and pulled the real repository. The origin here is instead a bare repo whose DIRECTORY is
- *     named `<tmp>/chalbert/web-everything.git`: `defaultOriginRepo`'s regex reads the identical slug off
+ *     named `<tmp>/web-everything/web-everything.git`: `defaultOriginRepo`'s regex reads the identical slug off
  *     it, and it resolves to a path that exists nowhere but this temp dir.
  *
  * (3) UNIQUE TEMP DIRS AND `finally` CLEANUP. The suite is sharded, so two workers run these concurrently;
@@ -54,7 +54,7 @@ import { dirname, join } from 'node:path';
  * compares the two (`resolveTransportRoot`, #3261) takes its NORMAL path rather than its refusal path —
  * see detail (2) for why this is a directory name and never a URL.
  */
-export const FIXTURE_SLUG = 'chalbert/web-everything';
+export const FIXTURE_SLUG = 'web-everything/web-everything';
 
 /** The default branch of every fixture. Named explicitly so `init.defaultBranch` cannot decide it for us. */
 export const DEFAULT_BRANCH = 'main';
@@ -181,8 +181,8 @@ export async function withRealRepo(fn) {
 async function withClone({ prefix, cloneArgs, narrow }, fn) {
   const tmp = scratch(prefix);
   let seedCounter = 0;
-  // Detail (2): the SLUG comes from the directory name. `<tmp>/chalbert/web-everything.git` reads as
-  // `chalbert/web-everything` through `defaultOriginRepo`'s regex and resolves to nothing off this machine.
+  // Detail (2): the SLUG comes from the directory name. `<tmp>/web-everything/web-everything.git` reads as
+  // `web-everything/web-everything` through `defaultOriginRepo`'s regex and resolves to nothing off this machine.
   const origin = join(tmp, ...FIXTURE_SLUG.split('/'));
   mkdirSync(dirname(origin), { recursive: true });
   git(['init', '--bare', '--quiet', '-b', DEFAULT_BRANCH, `${origin}.git`], { cwd: tmp });

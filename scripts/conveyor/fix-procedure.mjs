@@ -4,7 +4,7 @@
  * @description THE FIX PROCEDURE every fixer follows (operator-approved 2026-09-27): a durable per-PR FIX CLAIM
  *   taken with `fix-begin` and released with `fix-end`, so exactly one author repairs a PR at a time.
  *
- * LIVE INCIDENT (chalbert/web-everything PR #2811). The daemon fixer `fix-2811` was repairing the PR while an
+ * LIVE INCIDENT (web-everything/web-everything PR #2811). The daemon fixer `fix-2811` was repairing the PR while an
  * orchestrator worker (not a daemon session) pushed two commits to the SAME lane ref. Nothing told either author
  * the other existed. The fixer saw a "concurrent author", saved its repair on a side branch, and posted a
  * TERMINAL stand-down ("a human clears the marker") whose reason text even named the wrong cause ("a genuine
@@ -192,7 +192,7 @@ export function acquireFixClaim({
   const resource = fixDispatchResource({ repo: repoKey, pr: prNum, kind: FIXING_KIND });
   const foreign = liveForeignDispatch({ repo: repoKey, pr: prNum, who, lockRoot, nowMs });
   if (foreign) {
-    return { ok: false, reason: 'dispatched-fixer', heldBy: foreign.session, resource };
+    return { ok: false, reason: 'dispatched-fixer', heldBy: foreign.session, dispatchKind: foreign.kind, resource };
   }
   const prior = readLockEntry(lockRoot, resource);
   const own = prior && prior.owner === owner && isLiveFixClaim(prior, nowMs);
@@ -551,6 +551,14 @@ async function labelProviderDefault() {
   return createGhProvider();
 }
 
+/** Human-readable refusal, alongside the CLI JSON result. */
+export function fixBeginRefusalMessage(result) {
+  const message = `✗ fix-begin refused on PR #${result.pr}: ${result.reason} — held by ${result.heldBy ?? 'unknown'}`;
+  return result.reason === 'dispatched-fixer'
+    ? `${message} (daemon ${result.dispatchKind} dispatch claim; it frees on that session's stand-down/exit or its 10-minute TTL)`
+    : message;
+}
+
 /**
  * `fix-begin`: claim → (draft, only for an explicit reason) → label → marker comment. Default (operator ruling
  * 2026-09-27, draft-only-on-withdrawal): NO draft — the PR stays ready, `review-status:fixing` is the visible
@@ -578,7 +586,7 @@ export async function fixBegin({
     repo: repoKey, pr, who, why, sessionId, token, branch: view.headRefName, headSha: view.headRefOid, lockRoot, nowMs, ttlMinutes,
     draft, reason,
   });
-  if (!claim.ok) return { ok: false, reason: claim.reason, heldBy: claim.heldBy, pr: Number(pr) };
+  if (!claim.ok) return { ok: false, reason: claim.reason, heldBy: claim.heldBy, ...(claim.dispatchKind ? { dispatchKind: claim.dispatchKind } : {}), pr: Number(pr) };
   const heldToken = claim.token ?? token;
   const steps = [];
   try {
@@ -682,6 +690,7 @@ if (IS_CLI) {
         const draft = flags.draft === true || flags.draft === 'true';
         const draftReason = typeof flags.reason === 'string' ? flags.reason : null;
         const r = await fixBegin({ repo, pr, who, why: typeof flags.why === 'string' ? flags.why : '', draft, reason: draftReason });
+        if (!r.ok) writeLineSync(2, fixBeginRefusalMessage(r));
         out(r, r.ok ? 0 : 3);
       }
       if (cmd === 'fix-end') { const r = await fixEnd({ repo, pr, who, sessionId: id.sessionId, token: id.token }); out(r, r.ok ? 0 : 3); }

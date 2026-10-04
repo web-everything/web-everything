@@ -113,7 +113,7 @@ describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
   });
 
   it('lane-pool-health-watch is wired for plateau-app specifically (live-caught 2026-09-22: PR #167 had no lane-pool coverage)', () => {
-    expect(DAEMON_MANIFEST['lane-pool-health-watch-plateau-app'].args).toContain('--repo=chalbert/plateau-app');
+    expect(DAEMON_MANIFEST['lane-pool-health-watch-plateau-app'].args).toContain('--repo=plateauapp/plateau-app');
   });
 
   it('epic #3383 stuck-pr-watch runs `sweep` against the real script, per repo, at the shared cadence', () => {

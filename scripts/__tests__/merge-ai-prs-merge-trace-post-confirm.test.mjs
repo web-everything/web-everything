@@ -1,6 +1,6 @@
 /**
  * @file scripts/__tests__/merge-ai-prs-merge-trace-post-confirm.test.mjs
- * @description #xngv3vn (epic #3383/#4075) — LIVE INCIDENT, chalbert/web-everything#2596, 2026-09-24: the drain
+ * @description #xngv3vn (epic #3383/#4075) — LIVE INCIDENT, web-everything/web-everything#2596, 2026-09-24: the drain
  *   posted "📌 Merge trace — landed head `053c499f0…` — merged by drain" at 23:53Z while the PR stayed OPEN and
  *   CONFLICTING. Root cause: the merge-trace comment (`buildMergeTraceReason` — "landed head ... merged by ...",
  *   a PAST-TENSE, confirmed-fact claim) used to be posted UNCONDITIONALLY, right before the merge write even
@@ -134,7 +134,7 @@ describe('merge-ai-prs — #xngv3vn: the merge-trace comment is posted only afte
   });
 });
 
-// #4138 — LIVE INCIDENT, chalbert/web-everything#2578, 2026-09-24: closed TWICE by `web-everything[bot]` with
+// #4138 — LIVE INCIDENT, web-everything/web-everything#2578, 2026-09-24: closed TWICE by `web-everything[bot]` with
 // NO comment on either close. The FIRST close (21:44:43Z) is the #3383 stacked-base cascade this file's
 // `retargetStackedPrs` call site already retargets away from in the common case — but its own best-effort
 // failure path (`onFailed`) used to only log to stderr, so a PR `retargetStackedPrs` could not save still got

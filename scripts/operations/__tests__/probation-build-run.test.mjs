@@ -62,12 +62,12 @@ const codex = { id: 'codex', provider: 'codex', model: 'gpt-6-astra', executor: 
 /** A fake io: a claimed item whose worker diff, gate and PR-open result the test chooses. */
 // The card's own `scope:` (in `raw` AND the parsed `scope`) is what bounds the worker — kept consistent with
 // the happy-path numstat below, never only the dispatch's `--scope` argument (#4291 advisory finding).
-const ITEM_RAW = '---\nstatus: open\nscope: ["we:backlog-docs/probation.md"]\n---\n\n## Done when\n\n1. it works.';
+const ITEM_RAW = '---\nstatus: open\nscope: ["we:docs/probation/probation.md"]\n---\n\n## Done when\n\n1. it works.';
 
 function fakeIo({
-  itemScope = ['we:backlog-docs/probation.md'],
+  itemScope = ['we:docs/probation/probation.md'],
   lane = '/lanes/22', item = { path: 'backlog/4291-probation-launcher.md', slug: 'probation-launcher', title: 'Probation launcher', spec: '## Done when\n\n1. it works.', raw: ITEM_RAW, scope: itemScope },
-  claimOk = true, numstat = '1\t20\tbacklog-docs/probation.md', gate = true, resolveOk = true, openPr: openPrResult = { ok: true, pr: 9001, url: 'https://x/9001' },
+  claimOk = true, numstat = '1\t20\tdocs/probation/probation.md', gate = true, resolveOk = true, openPr: openPrResult = { ok: true, pr: 9001, url: 'https://x/9001' },
   throwOn = null, postWorkerSpec = null, postWorkerRaw = null, claimTamperedRaw = null, runWorkerOk = true, lastMessage = undefined,
   headShaSequence = null, throwOnHeadShaCall = null, hookResetClean = true, hookTampered = false, tamperRestoreClean = true,
 } = {}) {
@@ -117,7 +117,7 @@ function fakeIo({
 // #4291 plan review round 7 — a declared scope is now REQUIRED before any worker runs (see the run script's
 // own "no declared scope" refusal), so every test defaults one matching the happy-path numstat below; a test
 // that needs a DIFFERENT scope (or none) overrides it via `extra.scope` (including `''`, which parses to `[]`).
-const args = (worker = codex, extra = {}) => parseArgs(['--num=4291', '--session=probation-4291', `--worker=${JSON.stringify(worker)}`, '--lane=22', '--scope=we:backlog-docs/probation.md', ...Object.entries(extra).map(([k, v]) => `--${k}=${v}`)]);
+const args = (worker = codex, extra = {}) => parseArgs(['--num=4291', '--session=probation-4291', `--worker=${JSON.stringify(worker)}`, '--lane=22', '--scope=we:docs/probation/probation.md', ...Object.entries(extra).map(([k, v]) => `--${k}=${v}`)]);
 
 describe('parseArgs', () => {
   it('parses the build-specific flags (num, attempt) and the shared ones', () => {
@@ -133,7 +133,7 @@ describe('runProbationBuild — the arc', () => {
     const r = await runProbationBuild(args(), io);
     expect(r).toMatchObject({ outcome: 'opened-pr', executor: 'codex' });
     expect(calls.find((c) => c[0] === 'worker')).toEqual(['worker', expect.stringMatching(/scripts\/codex-direct-task\.mjs$/), '--model=gpt-6-astra']);
-    expect(calls.find((c) => c[0] === 'commit')).toEqual(['commit', ['backlog-docs/probation.md', 'backlog/4291-probation-launcher.md'], expect.stringContaining('WE #4291: doc-fix-build — ')]);
+    expect(calls.find((c) => c[0] === 'commit')).toEqual(['commit', ['docs/probation/probation.md', 'backlog/4291-probation-launcher.md'], expect.stringContaining('WE #4291: doc-fix-build — ')]);
     expect(calls.find((c) => c[0] === 'openPr')).toEqual(['openPr', 'probation-launcher', '']);
     expect(calls.filter((c) => c[0] === 'scorecard')).toEqual([['scorecard', 'opened-pr', 'codex', null, null, '4291', 9001]]);
     expect(calls.some((c) => c[0] === 'discard')).toBe(false);
@@ -145,10 +145,10 @@ describe('runProbationBuild — the arc', () => {
   it('a claim-stamp line in the raw numstat never inflates the worker\'s own diff or duplicates the commit path', async () => {
     // If the item's own file were not excluded, this numstat (as the claim/resolve bookkeeping diff would look)
     // would count as a SECOND changed file, wrongly consuming half the doc-fix envelope's file cap.
-    const { io, calls } = fakeIo({ numstat: '1\t20\tbacklog-docs/probation.md\n2\t1\tbacklog/4291-probation-launcher.md' });
+    const { io, calls } = fakeIo({ numstat: '1\t20\tdocs/probation/probation.md\n2\t1\tbacklog/4291-probation-launcher.md' });
     const r = await runProbationBuild(args(), io);
     expect(r.outcome).toBe('opened-pr');
-    expect(calls.find((c) => c[0] === 'commit')[1]).toEqual(['backlog-docs/probation.md', 'backlog/4291-probation-launcher.md']);
+    expect(calls.find((c) => c[0] === 'commit')[1]).toEqual(['docs/probation/probation.md', 'backlog/4291-probation-launcher.md']);
   });
 
   it('no lane available → not-applicable, before any claim', async () => {
@@ -261,7 +261,7 @@ describe('runProbationBuild — the arc', () => {
   });
 
   it('a build bigger than the doc-fix envelope lands Findings and holds for the builder', async () => {
-    const { io, calls } = fakeIo({ numstat: '60\t50\tbacklog-docs/probation.md' });
+    const { io, calls } = fakeIo({ numstat: '60\t50\tdocs/probation/probation.md' });
     const r = await runProbationBuild(args(), io);
     expect(r.outcome).toBe('opened-pr');
     expect(r.detail).toMatch(/changed 110 lines/);
@@ -286,15 +286,16 @@ describe('runProbationBuild — the arc', () => {
     // Rounds 4-6 tried a DENYLIST of specific dangerous paths against an unscoped item, and it kept being
     // provably incomplete (round 5 named `CLAUDE.md`, round 6 named `GEMINI.md`). Round 7 replaced the whole
     // fallback with a hard refusal on no declared scope (below) plus this allowlist — so EVERY one of these
-    // "dangerous" paths is now caught the SAME way, by not being in `args().scope`, never by name.
+    // paths remains refused. #3996 now rejects non-reader-facing Markdown at the documentation gate first;
+    // reader-facing docs still exercise the item's scope allowlist independently.
     it('a path matching the item\'s own declared scope is built', async () => {
-      const { io } = fakeIo({ numstat: '1\t20\tbacklog-docs/probation.md' });
+      const { io } = fakeIo({ numstat: '1\t20\tdocs/probation/probation.md' });
       const r = await runProbationBuild(args(), io);
       expect(r.outcome).toBe('opened-pr');
     });
     it('a scope entry ending in `/` is a DIRECTORY prefix — every file under it is in scope (#4291 plan review round 9)', async () => {
-      const { io } = fakeIo({ numstat: '1\t20\tbacklog-docs/guides/anything.md', itemScope: ['we:backlog-docs/guides/'] });
-      const r = await runProbationBuild(args(codex, { scope: 'we:backlog-docs/guides/' }), io);
+      const { io } = fakeIo({ numstat: '1\t20\tdocs/probation/guides/anything.md', itemScope: ['we:docs/probation/guides/'] });
+      const r = await runProbationBuild(args(codex, { scope: 'we:docs/probation/guides/' }), io);
       expect(r.outcome).toBe('opened-pr');
     });
     it('a cross-repo scope entry (e.g. `frontierui:docs/a.md`) never allowlists a same-named WE path — this launcher only ever builds in the WE lane (#4291 plan review round 10)', async () => {
@@ -305,17 +306,18 @@ describe('runProbationBuild — the arc', () => {
       expect(calls.some((c) => c[0] === 'worker')).toBe(false);
     });
     it.each([
-      ['a different backlog card', 'backlog/9999-some-other-item.md'],
-      ['the statute layer', 'docs/agent/platform-decisions.md'],
-      ['CLAUDE.md', 'CLAUDE.md'],
-      ['AGENTS.md', 'AGENTS.md'],
-      ['a .claude/ command file', '.claude/commands/x.md'],
-      ['an arbitrary unlisted .md file (GEMINI.md — round 6\'s own example; no denylist entry names it)', 'GEMINI.md'],
-    ])('%s is discarded for being out of scope, even though `.md` alone would pass the doc-only check', async (_label, path) => {
+      ['a different backlog card', 'backlog/9999-some-other-item.md', /non-documentation path/],
+      ['the statute layer', 'docs/agent/platform-decisions.md', /outside the item's own declared scope/],
+      ['an unlisted reader-facing document', 'docs/GEMINI.md', /outside the item's own declared scope/],
+      ['CLAUDE.md', 'CLAUDE.md', /non-documentation path/],
+      ['AGENTS.md', 'AGENTS.md', /non-documentation path/],
+      ['a .claude/ command file', '.claude/commands/x.md', /non-documentation path/],
+      ['an arbitrary unlisted .md file (GEMINI.md — round 6\'s own example; no denylist entry names it)', 'GEMINI.md', /non-documentation path/],
+    ])('%s is discarded by the documentation or scope allowlist', async (_label, path, refusal) => {
       const { io, calls } = fakeIo({ numstat: `2\t1\t${path}` });
       const r = await runProbationBuild(args(), io);
       expect(r.outcome).toBe('gate-red');
-      expect(r.detail).toMatch(/outside the item's own declared scope/);
+      expect(r.detail).toMatch(refusal);
       expect(r.detail).toContain(path);
       expect(calls.some((c) => c[0] === 'discard')).toBe(true);
       expect(calls.some((c) => c[0] === 'resolve')).toBe(false);
@@ -323,20 +325,20 @@ describe('runProbationBuild — the arc', () => {
   });
 
   it('a dispatch --scope broader than the card\'s own declared scope never widens the allowlist — the card governs (#4291 advisory finding)', async () => {
-    // The dispatch argument allows `backlog-docs/probation.md`; the card (read in the lane) declares only `a.md`.
-    const { io, calls } = fakeIo({ itemScope: ['we:backlog-docs/a.md'] });
+    // The dispatch argument allows `docs/probation/probation.md`; the card (read in the lane) declares only `a.md`.
+    const { io, calls } = fakeIo({ itemScope: ['we:docs/probation/a.md'] });
     const r = await runProbationBuild(args(), io);
     expect(r.outcome).toBe('gate-red');
-    expect(r.detail).toMatch(/outside the item's own declared scope.*: backlog-docs\/probation\.md$/);
+    expect(r.detail).toMatch(/outside the item's own declared scope.*: docs\/probation\/probation\.md$/);
     expect(calls.some((c) => c[0] === 'resolve')).toBe(false);
     expect(calls.some((c) => c[0] === 'discard')).toBe(true);
   });
 
   it('a card scope WIDER than the leased dispatch --scope never lets the worker edit an unleased path (#4291 advisory repair review)', async () => {
-    const { io, calls } = fakeIo({ itemScope: ['we:backlog-docs/'], numstat: '1\t2\tbacklog-docs/other.md' });
-    const r = await runProbationBuild(args(), io); // leased only backlog-docs/probation.md
+    const { io, calls } = fakeIo({ itemScope: ['we:docs/probation/'], numstat: '1\t2\tdocs/probation/other.md' });
+    const r = await runProbationBuild(args(), io); // leased only docs/probation/probation.md
     expect(r.outcome).toBe('gate-red');
-    expect(r.detail).toMatch(/outside the item's own declared scope.*: backlog-docs\/other\.md$/);
+    expect(r.detail).toMatch(/outside the item's own declared scope.*: docs\/probation\/other\.md$/);
     expect(calls.some((c) => c[0] === 'resolve')).toBe(false);
   });
 
@@ -345,7 +347,7 @@ describe('runProbationBuild — the arc', () => {
     const r = await runProbationBuild(args(codex, { scope: '' }), io);
     expect(r.outcome).toBe('opened-pr');
     expect(calls.some((c) => c[0] === 'commit')).toBe(true);
-    const { io: io2 } = fakeIo({ numstat: '1\t2\tbacklog-docs/other.md' });
+    const { io: io2 } = fakeIo({ numstat: '1\t2\tdocs/probation/other.md' });
     expect((await runProbationBuild(args(codex, { scope: '' }), io2)).outcome).toBe('gate-red'); // the card still governs
     const { io: io3 } = fakeIo(); // a lease naming only another repo's paths is still a lease — nothing here is leased
     expect((await runProbationBuild(args(codex, { scope: 'frontierui:docs/x.md' }), io3)).outcome).toBe('gate-red');
@@ -398,7 +400,7 @@ describe('runProbationBuild — the arc', () => {
   });
 
   it('a worker forging `graduatedTo:`/`codifiedIn:` directly is caught as tamper too — this launcher never sets those itself, so they are NOT in its own allowlist even though the shared default permits them (#4291 plan review round 8)', async () => {
-    const { io, calls } = fakeIo({ postWorkerRaw: '---\nstatus: open\nscope: ["we:backlog-docs/probation.md"]\ngraduatedTo: "some-standard"\n---\n\n## Done when\n\n1. it works.' });
+    const { io, calls } = fakeIo({ postWorkerRaw: '---\nstatus: open\nscope: ["we:docs/probation/probation.md"]\ngraduatedTo: "some-standard"\n---\n\n## Done when\n\n1. it works.' });
     const r = await runProbationBuild(args(), io);
     expect(r.outcome).toBe('escalated-needs-human');
     expect(r.detail).toMatch(/edited the item's own backlog card/);
@@ -408,8 +410,8 @@ describe('runProbationBuild — the arc', () => {
   // #4291 advisory finding (codex-correctness) — the post-worker card is compared against the POST-CLAIM read,
   // byte for byte: `status`/`dateStarted` are claim-owned, but the worker may not forge them either.
   it.each([
-    ['status', '---\nstatus: resolved\nscope: ["we:backlog-docs/probation.md"]\n---\n\n## Done when\n\n1. it works.'],
-    ['dateStarted', '---\nstatus: open\nscope: ["we:backlog-docs/probation.md"]\ndateStarted: "2020-01-01"\n---\n\n## Done when\n\n1. it works.'],
+    ['status', '---\nstatus: resolved\nscope: ["we:docs/probation/probation.md"]\n---\n\n## Done when\n\n1. it works.'],
+    ['dateStarted', '---\nstatus: open\nscope: ["we:docs/probation/probation.md"]\ndateStarted: "2020-01-01"\n---\n\n## Done when\n\n1. it works.'],
   ])('a worker forging the claim-owned `%s` directly is caught as tamper', async (_key, forged) => {
     const { io, calls } = fakeIo({ postWorkerRaw: forged });
     const r = await runProbationBuild(args(), io);
@@ -603,7 +605,7 @@ describe('standalone task types and workers', () => {
   });
 
   it('the default still refuses 200 documentation LOC', async () => {
-    const { io } = fakeIo({ numstat: '200\t0\tbacklog-docs/probation.md' });
+    const { io } = fakeIo({ numstat: '200\t0\tdocs/probation/probation.md' });
     expect((await runProbationBuild(args(), io)).detail).toContain('route to the builder');
   });
 
@@ -654,7 +656,7 @@ describe('standalone task types and workers', () => {
         const code = `import { appendScorecard } from ${JSON.stringify(storeUrl)};
           import { launchScorecardRow } from ${JSON.stringify(launcherUrl)};
           appendScorecard(launchScorecardRow({ worker: ${JSON.stringify({ ...codex, taskType: 'bugfix' })},
-            pr: null, repo: 'chalbert/web-everything', handle: 'parallel-${item}', item: '${item}', launchOutcome: 'gate-red' }),
+            pr: null, repo: 'web-everything/web-everything', handle: 'parallel-${item}', item: '${item}', launchOutcome: 'gate-red' }),
             { path: ${JSON.stringify(path)}, requireLock: true });`;
         const child = spawn(process.execPath, ['--input-type=module', '-e', code], { env: { ...process.env, LANE_POOL_ROOT: dir } });
         let stderr = '';
@@ -824,7 +826,7 @@ describe('standalone prepare', () => {
     expect(calls.some(c => c[0] === 'gate')).toBe(true);
   });
   it('requires declared test scope before stamping source preparation', async () => {
-    const raw = prepared.replace('we:backlog-docs/probation.md', 'we:scripts/merge-ai-prs.mjs');
+    const raw = prepared.replace('we:docs/probation/probation.md', 'we:scripts/merge-ai-prs.mjs');
     const { io, calls } = prepareIo({ item: { path, raw, spec: raw, scope: ['we:scripts/merge-ai-prs.mjs'] }, postWorkerRaw: raw });
     const tasks = [];
     io.writeTaskFile = (_dir, _name, text) => { tasks.push(text); return '/tmp/task.md'; };
@@ -839,7 +841,7 @@ describe('standalone prepare', () => {
     ['we:scripts/__tests__/unrelated.test.mjs', false],
     ['frontierui:scripts/__tests__/merge-ai-prs.test.mjs', false],
   ])('stamps only when the (possibly corrected) scope lists a matching test: %s', async (testScope, accepted) => {
-    const raw = prepared.replace('we:backlog-docs/probation.md', 'we:scripts/merge-ai-prs.mjs');
+    const raw = prepared.replace('we:docs/probation/probation.md', 'we:scripts/merge-ai-prs.mjs');
     const revised = raw.replace('"we:scripts/merge-ai-prs.mjs"]', `"we:scripts/merge-ai-prs.mjs", "${testScope}"]`);
     const { io, calls } = prepareIo({ item: { path, raw, spec: raw, scope: ['we:scripts/merge-ai-prs.mjs'] }, postWorkerRaw: revised });
     expect((await runProbationBuild(prepareArgs(), io)).outcome).toBe(accepted ? 'opened-pr' : 'escalated-needs-human');
@@ -903,7 +905,7 @@ describe('standalone prepare', () => {
     expect(calls.some(c => c[0] === 'stamp')).toBe(true);
   });
   it('accepts a worker that corrects the card\'s own scope: (#4658) and reaches opened-pr', async () => {
-    const { io, calls } = prepareIo({ postWorkerRaw: prepared.replace('scope: ["we:backlog-docs/probation.md"]', 'scope: ["we:scripts/real-touch-set.mjs", "we:scripts/__tests__/real-touch-set.test.mjs"]') });
+    const { io, calls } = prepareIo({ postWorkerRaw: prepared.replace('scope: ["we:docs/probation/probation.md"]', 'scope: ["we:scripts/real-touch-set.mjs", "we:scripts/__tests__/real-touch-set.test.mjs"]') });
     expect(await runProbationBuild(prepareArgs(), io)).toMatchObject({ outcome: 'opened-pr' });
     expect(calls.some(c => c[0] === 'openPr')).toBe(true);
   });
@@ -984,7 +986,7 @@ describe('Findings publication regressions', () => {
   });
 
   it('refuses to publish Findings if discarding the implementation failed', async () => {
-    const { io, calls } = fakeIo({ numstat: '200\t0\tbacklog-docs/probation.md' });
+    const { io, calls } = fakeIo({ numstat: '200\t0\tdocs/probation/probation.md' });
     io.discardChanges = () => {};
     const result = await runProbationBuild(args(), io);
     expect(result.outcome).toBe('gate-red');

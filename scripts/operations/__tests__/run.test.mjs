@@ -1,6 +1,6 @@
 /**
  * @file run.test.mjs — the REAL `run.mjs dispatch-lane` CLI refuses a stale checkout (#4329, the prevention
- * guard owed by chalbert/web-everything#2815's review).
+ * guard owed by web-everything/web-everything#2815's review).
  *
  * `dispatch-path-isolation-and-executor.test.mjs` proves `cliPreflight` with injected `arm`/`assertFresh`, so
  * deleting the `cliPreflight(name)` call from `run.mjs`'s CLI block broke no test. This runs the actual CLI as a

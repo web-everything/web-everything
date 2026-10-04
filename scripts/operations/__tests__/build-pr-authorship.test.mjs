@@ -19,13 +19,13 @@ it('retains a producer receipt after the wrapper dies without settling; backfill
     const module = pathToFileURL(resolve('scripts/operations/build-pr-authorship.mjs')).href;
     const out = spawnSync(process.execPath, ['--input-type=module', '-e', `
       import { producerBuildContext, checkpointBuildPr } from ${JSON.stringify(module)};
-      checkpointBuildPr(producerBuildContext(), { repo: 'chalbert/web-everything', pr: 3033, ref: 'lane/4502b-example' }, ${JSON.stringify(join(dir, 'receipts'))});
+      checkpointBuildPr(producerBuildContext(), { repo: 'web-everything/web-everything', pr: 3033, ref: 'lane/4502b-example' }, ${JSON.stringify(join(dir, 'receipts'))});
       process.kill(process.pid, 'SIGKILL');
     `], { env, encoding: 'utf8' });
     expect(out.signal, out.stderr).toBe('SIGKILL');
     expect(store.read(record.id).effects[0].result).toBeNull();
     expect(readAuthorship(join(dir, 'receipts'))[0]).toMatchObject({ pr: 3033, entry: { payload: { launchKind: 'build' } } });
-    const args = { runs: [{ id: record.id, record }], prs: [{ number: 3033, headRefName: 'lane/4502b-example' }], repo: 'chalbert/web-everything' };
+    const args = { runs: [{ id: record.id, record }], prs: [{ number: 3033, headRefName: 'lane/4502b-example' }], repo: 'web-everything/web-everything' };
     expect(backfillAuthorship(args)).toEqual([]);
     record.effects[0].status = 'applied';
     record.effects[0].result = { pr: 3033 };

@@ -91,13 +91,13 @@ export function createLandAdvanceReader(ports = {}) {
     trialLog = join(home, 'workspace/.operations/delegation-trials.jsonl'), escalationsDir = join(home, 'workspace/.operations/escalations'),
     sweptReposPath = join(ROOT, 'scripts/lib/swept-repos.json'),
     readSessions = () => readLiveSessions({ run }), findItemFn = findItem, loadItems = () => defaultLoadItems(ROOT),
-    resolveFallbackScope = (pr) => run('gh', ['pr', 'diff', String(pr), '--repo', 'chalbert/web-everything', '--name-only']).trim().split('\n').filter(Boolean).map((p) => `we:${p}`),
+    resolveFallbackScope = (pr) => run('gh', ['pr', 'diff', String(pr), '--repo', 'web-everything/web-everything', '--name-only']).trim().split('\n').filter(Boolean).map((p) => `we:${p}`),
     // #3856 graduation — `planFixesFromReconcile`'s itemless-PR branch moved to the shared `resolvePrWorkUnit`
     // (`we:scripts/conveyor/pr-work-unit.mjs`, landed on `main` after this module's own branch snapshot) between
     // when this file was written and when it graduated here. That resolver's `fetchDiffPaths` contract is
     // UN-prefixed (it adds the repo prefix itself) — unlike `resolveFallbackScope` above, which the item-carrying
     // no-scope fallback still consumes pre-prefixed. Same underlying `gh pr diff --name-only` read, no `we:` map.
-    fetchItemlessDiffPaths = (pr) => run('gh', ['pr', 'diff', String(pr), '--repo', 'chalbert/web-everything', '--name-only']).trim().split('\n').filter(Boolean),
+    fetchItemlessDiffPaths = (pr) => run('gh', ['pr', 'diff', String(pr), '--repo', 'web-everything/web-everything', '--name-only']).trim().split('\n').filter(Boolean),
     followUpEvidence, refreshPrototype = false, readPrototype, isPidAlive = defaultIsPidAlive,
     readPrComments = (pr) => JSON.parse(run('gh', ['pr', 'view', String(pr.number), '--repo', pr.slug, '--json', 'comments'])).comments ?? [],
     sessionEvidence = (followUps) => makeEvidenceResolver({ followUps, jobsDir, home }),
@@ -106,7 +106,7 @@ export function createLandAdvanceReader(ports = {}) {
     // `live-process` binding (cwd + HEAD sha) sees sessions a name match cannot, so it is read once for `we` (the only
     // repo it plans) and attached as refusals. A failed read is a source error, so apply refuses on half a picture.
     canonicalRoot = null, readItems = canonicalRoot ? createItemReader({ root: canonicalRoot }) : null,
-    readReconcile = canonicalRoot ? () => JSON.parse(String(execFileSync('node', ['scripts/conveyor/reconcile-pass.mjs', '--json', '--repo=chalbert/web-everything'],
+    readReconcile = canonicalRoot ? () => JSON.parse(String(execFileSync('node', ['scripts/conveyor/reconcile-pass.mjs', '--json', '--repo=web-everything/web-everything'],
       { cwd: ROOT, encoding: 'utf8', timeout: 180000, maxBuffer: 64 * 1024 * 1024, stdio: 'pipe' }))) : null } = ports;
   return function readInputs() {
     const errors = [], get = (source, fn, fallback) => { try { return fn(); } catch (e) { errors.push({ source, message: String(e.message ?? e) }); return fallback; } };
@@ -228,7 +228,7 @@ export function createLandAdvanceApplier(ports = {}) {
         const launchTime = now();
         // `fix` and `conflict-fix` share the reconcile fix dispatch; `ci-heal` goes through the tick's own sink (ci-heal-pr-dispatch.mjs).
         // #3856 graduation — `repo:` is the internal repo KEY (`row.repo`, e.g. `we`), not the gh slug
-        // (`row.slug`, e.g. `chalbert/web-everything`): `dispatchCiHeal`/`dispatchFix` thread it straight into
+        // (`row.slug`, e.g. `web-everything/web-everything`): `dispatchCiHeal`/`dispatchFix` thread it straight into
         // `sessionSlugFor` → `repoSlugTag`, which (unlike `repoProfile`) accepts only a known internal key, never
         // a gh slug — see `we:scripts/lib/constellation-repos.mjs#repoSlugTag`. This module's own branch snapshot
         // predates that multi-repo tightening, which is why it originally read `row.slug` here.

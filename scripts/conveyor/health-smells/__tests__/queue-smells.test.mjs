@@ -13,8 +13,8 @@ import labelConflict, { labelConflicts } from '../review-label-conflict.mjs';
 import stoodDown, { standDownOf } from '../stood-down-prs.mjs';
 
 const NOW = Date.parse('2026-09-29T12:00:00Z');
-const WE = 'chalbert/web-everything';
-const FUI = 'chalbert/frontierui';
+const WE = 'web-everything/web-everything';
+const FUI = 'frontier-ui/frontierui';
 
 const pr = (repo, number, labels = [], comments = []) => ({ repo, number, labels: labels.map((name) => ({ name })), comments });
 

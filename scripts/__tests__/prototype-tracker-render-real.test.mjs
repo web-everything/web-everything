@@ -22,7 +22,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const TRACKER = resolve(HERE, '..', 'prototype-tracker.mjs');
 const GOLDEN = readFileSync(join(HERE, 'fixtures', 'prototype-tracker-full.golden.html'), 'utf8');
 
-const QUEUE_LINE = 'PR #2401 (chalbert/web-everything) — review:human, gates pass, needs you';
+const QUEUE_LINE = 'PR #2401 (web-everything/web-everything) — review:human, gates pass, needs you';
 const QUEUE_STUB = (needs) => `console.log('NEEDS YOU (review:human + advisory:accepted, all gates pass):');
 console.log(${JSON.stringify(needs)});
 console.log('PENDING — transient, re-run (GitHub is still computing mergeability; no agent work owed):');

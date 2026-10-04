@@ -8,7 +8,7 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3336"
+          "https://github.com/web-everything/web-everything/pull/3336"
         ],
         "observedHead": "4ecb5deb362c81aa28de162db4616bb4c2009347",
         "unknownFields": [
@@ -25,9 +25,9 @@
       },
       "episode": {
         "id": "2026-10-01-draft-not-promoted-chalbert-web-everything-3336-1925",
-        "key": "draft-not-promoted::chalbert/web-everything#3336",
+        "key": "draft-not-promoted::web-everything/web-everything#3336",
         "smell": "draft-not-promoted",
-        "subject": "chalbert/web-everything#3336",
+        "subject": "web-everything/web-everything#3336",
         "status": "open",
         "severity": "high",
         "openedAt": 1790882705935,
@@ -39,11 +39,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3336,
         "head": "4ecb5deb362c81aa28de162db4616bb4c2009347",
         "episodeId": "2026-10-01-draft-not-promoted-chalbert-web-everything-3336-1925",
-        "episodeKey": "draft-not-promoted::chalbert/web-everything#3336",
+        "episodeKey": "draft-not-promoted::web-everything/web-everything#3336",
         "observedAt": 1790938800000,
         "complete": false
       },
@@ -56,8 +56,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3311",
-          "https://github.com/chalbert/web-everything/pull/3311#issuecomment-5940367503"
+          "https://github.com/web-everything/web-everything/pull/3311",
+          "https://github.com/web-everything/web-everything/pull/3311#issuecomment-5940367503"
         ],
         "observedHead": null,
         "unknownFields": [
@@ -66,7 +66,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Ready events Oct 1 14:04:21Z (32258012355) and 21:18:02Z (32289858689); scope-change draft at 20:13:19Z (32285477565), claim release at 20:56:05Z; merged 21:33:54Z. Draft episode opened 20:34:01.992Z and closed 21:11:13.732Z, before the second actual ready event. [comment 5940367503](https://github.com/chalbert/web-everything/pull/3311#issuecomment-5940367503)",
+        "observation": "Ready events Oct 1 14:04:21Z (32258012355) and 21:18:02Z (32289858689); scope-change draft at 20:13:19Z (32285477565), claim release at 20:56:05Z; merged 21:33:54Z. Draft episode opened 20:34:01.992Z and closed 21:11:13.732Z, before the second actual ready event. [comment 5940367503](https://github.com/web-everything/web-everything/pull/3311#issuecomment-5940367503)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock"
@@ -74,9 +74,9 @@
       },
       "episode": {
         "id": "replay-D2-3311",
-        "key": "draft-not-promoted::chalbert/web-everything#3311",
+        "key": "draft-not-promoted::web-everything/web-everything#3311",
         "smell": "draft-not-promoted",
-        "subject": "chalbert/web-everything#3311",
+        "subject": "web-everything/web-everything#3311",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -88,11 +88,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3311,
         "head": null,
         "episodeId": "replay-D2-3311",
-        "episodeKey": "draft-not-promoted::chalbert/web-everything#3311",
+        "episodeKey": "draft-not-promoted::web-everything/web-everything#3311",
         "observedAt": 1790938800000,
         "complete": false
       },
@@ -105,8 +105,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3239",
-          "https://github.com/chalbert/web-everything/pull/3239#issuecomment-5937599395"
+          "https://github.com/web-everything/web-everything/pull/3239",
+          "https://github.com/web-everything/web-everything/pull/3239#issuecomment-5937599395"
         ],
         "observedHead": "67e9ca92c8780b58dce97e8957b2732e762ab480",
         "unknownFields": [
@@ -115,7 +115,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; current head `67e9ca92c8780b58dce97e8957b2732e762ab480`; Oct 1 01:12:17Z escalation reports an unrelated probation test, later head-bound heal at 18:12:43Z and claim release 18:12:48Z. [comment 5937599395](https://github.com/chalbert/web-everything/pull/3239#issuecomment-5937599395)",
+        "observation": "Open, no labels; current head `67e9ca92c8780b58dce97e8957b2732e762ab480`; Oct 1 01:12:17Z escalation reports an unrelated probation test, later head-bound heal at 18:12:43Z and claim release 18:12:48Z. [comment 5937599395](https://github.com/web-everything/web-everything/pull/3239#issuecomment-5937599395)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock"
@@ -123,9 +123,9 @@
       },
       "episode": {
         "id": "replay-L1-3239",
-        "key": "pr-no-owner::chalbert/web-everything#3239",
+        "key": "pr-no-owner::web-everything/web-everything#3239",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3239",
+        "subject": "web-everything/web-everything#3239",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -137,11 +137,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3239,
         "head": "67e9ca92c8780b58dce97e8957b2732e762ab480",
         "episodeId": "replay-L1-3239",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3239",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3239",
         "observedAt": 1790938800000,
         "complete": false
       },
@@ -154,8 +154,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3389",
-          "https://github.com/chalbert/web-everything/pull/3389#issuecomment-5941764044"
+          "https://github.com/web-everything/web-everything/pull/3389",
+          "https://github.com/web-everything/web-everything/pull/3389#issuecomment-5941764044"
         ],
         "observedHead": "667c1a330adea2001a09053f7ef09a43b5a1fe11",
         "unknownFields": [
@@ -164,7 +164,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; heal marker at Oct 1 22:17:17Z names `99d53bf598f9292ea964cad68d985f038e425cdc`, whereas current head/fix-end is `667c1a330adea2001a09053f7ef09a43b5a1fe11`. [comment 5941764044](https://github.com/chalbert/web-everything/pull/3389#issuecomment-5941764044)",
+        "observation": "Open, no labels; heal marker at Oct 1 22:17:17Z names `99d53bf598f9292ea964cad68d985f038e425cdc`, whereas current head/fix-end is `667c1a330adea2001a09053f7ef09a43b5a1fe11`. [comment 5941764044](https://github.com/web-everything/web-everything/pull/3389#issuecomment-5941764044)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock"
@@ -172,9 +172,9 @@
       },
       "episode": {
         "id": "replay-L2-3389",
-        "key": "pr-no-owner::chalbert/web-everything#3389",
+        "key": "pr-no-owner::web-everything/web-everything#3389",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3389",
+        "subject": "web-everything/web-everything#3389",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -186,11 +186,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3389,
         "head": "667c1a330adea2001a09053f7ef09a43b5a1fe11",
         "episodeId": "replay-L2-3389",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3389",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3389",
         "observedAt": 1790938800000,
         "complete": false
       },
@@ -203,8 +203,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3390",
-          "https://github.com/chalbert/web-everything/pull/3390#issuecomment-5941750430"
+          "https://github.com/web-everything/web-everything/pull/3390",
+          "https://github.com/web-everything/web-everything/pull/3390#issuecomment-5941750430"
         ],
         "observedHead": "da71bd5bb092f5cdb20803653ab9bfa004f3c31f",
         "unknownFields": [
@@ -213,7 +213,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; heal at Oct 1 22:16:28Z, head `da71bd5bb092f5cdb20803653ab9bfa004f3c31f`. [comment 5941750430](https://github.com/chalbert/web-everything/pull/3390#issuecomment-5941750430)",
+        "observation": "Open, no labels; heal at Oct 1 22:16:28Z, head `da71bd5bb092f5cdb20803653ab9bfa004f3c31f`. [comment 5941750430](https://github.com/web-everything/web-everything/pull/3390#issuecomment-5941750430)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock"
@@ -221,9 +221,9 @@
       },
       "episode": {
         "id": "replay-L3-3390",
-        "key": "pr-no-owner::chalbert/web-everything#3390",
+        "key": "pr-no-owner::web-everything/web-everything#3390",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3390",
+        "subject": "web-everything/web-everything#3390",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -235,11 +235,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3390,
         "head": "da71bd5bb092f5cdb20803653ab9bfa004f3c31f",
         "episodeId": "replay-L3-3390",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3390",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3390",
         "observedAt": 1790938800000,
         "complete": false
       },
@@ -252,8 +252,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3391",
-          "https://github.com/chalbert/web-everything/pull/3391#issuecomment-5941813804"
+          "https://github.com/web-everything/web-everything/pull/3391",
+          "https://github.com/web-everything/web-everything/pull/3391#issuecomment-5941813804"
         ],
         "observedHead": "d2d4b7566feb2508208dd8f0c0f5b5e4108377e9",
         "unknownFields": [
@@ -262,7 +262,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; heal at Oct 1 22:20:14Z, marker head `d2d4b7566feb2508208dd8f0c0f5b5e4108377e9`. [comment 5941813804](https://github.com/chalbert/web-everything/pull/3391#issuecomment-5941813804)",
+        "observation": "Open, no labels; heal at Oct 1 22:20:14Z, marker head `d2d4b7566feb2508208dd8f0c0f5b5e4108377e9`. [comment 5941813804](https://github.com/web-everything/web-everything/pull/3391#issuecomment-5941813804)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock"
@@ -270,9 +270,9 @@
       },
       "episode": {
         "id": "replay-L4-3391",
-        "key": "pr-no-owner::chalbert/web-everything#3391",
+        "key": "pr-no-owner::web-everything/web-everything#3391",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3391",
+        "subject": "web-everything/web-everything#3391",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -284,11 +284,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3391,
         "head": "d2d4b7566feb2508208dd8f0c0f5b5e4108377e9",
         "episodeId": "replay-L4-3391",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3391",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3391",
         "observedAt": 1790938800000,
         "complete": false
       },
@@ -301,8 +301,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3392",
-          "https://github.com/chalbert/web-everything/pull/3392#issuecomment-5941873536"
+          "https://github.com/web-everything/web-everything/pull/3392",
+          "https://github.com/web-everything/web-everything/pull/3392#issuecomment-5941873536"
         ],
         "observedHead": "3ec895af28dc1265f6f6d15629da05831799b0b9",
         "unknownFields": [
@@ -311,7 +311,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; heal at Oct 1 22:24:05Z, marker head `3ec895af28dc1265f6f6d15629da05831799b0b9`. [comment 5941873536](https://github.com/chalbert/web-everything/pull/3392#issuecomment-5941873536)",
+        "observation": "Open, no labels; heal at Oct 1 22:24:05Z, marker head `3ec895af28dc1265f6f6d15629da05831799b0b9`. [comment 5941873536](https://github.com/web-everything/web-everything/pull/3392#issuecomment-5941873536)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock"
@@ -319,9 +319,9 @@
       },
       "episode": {
         "id": "replay-L5-3392",
-        "key": "pr-no-owner::chalbert/web-everything#3392",
+        "key": "pr-no-owner::web-everything/web-everything#3392",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3392",
+        "subject": "web-everything/web-everything#3392",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -333,11 +333,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3392,
         "head": "3ec895af28dc1265f6f6d15629da05831799b0b9",
         "episodeId": "replay-L5-3392",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3392",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3392",
         "observedAt": 1790938800000,
         "complete": false
       },
@@ -350,8 +350,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3463",
-          "https://github.com/chalbert/web-everything/pull/3463#issuecomment-5945943801"
+          "https://github.com/web-everything/web-everything/pull/3463",
+          "https://github.com/web-everything/web-everything/pull/3463#issuecomment-5945943801"
         ],
         "observedHead": "1807e6dc53937a98d6104df6f1c5fa2d5ff7a670",
         "unknownFields": [
@@ -360,7 +360,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; heal at Oct 2 05:06:38Z, marker head `1807e6dc53937a98d6104df6f1c5fa2d5ff7a670`. [comment 5945943801](https://github.com/chalbert/web-everything/pull/3463#issuecomment-5945943801)",
+        "observation": "Open, no labels; heal at Oct 2 05:06:38Z, marker head `1807e6dc53937a98d6104df6f1c5fa2d5ff7a670`. [comment 5945943801](https://github.com/web-everything/web-everything/pull/3463#issuecomment-5945943801)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock"
@@ -368,9 +368,9 @@
       },
       "episode": {
         "id": "replay-L6-3463",
-        "key": "pr-no-owner::chalbert/web-everything#3463",
+        "key": "pr-no-owner::web-everything/web-everything#3463",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3463",
+        "subject": "web-everything/web-everything#3463",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -382,11 +382,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3463,
         "head": "1807e6dc53937a98d6104df6f1c5fa2d5ff7a670",
         "episodeId": "replay-L6-3463",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3463",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3463",
         "observedAt": 1790938800000,
         "complete": false
       },
@@ -399,8 +399,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3471",
-          "https://github.com/chalbert/web-everything/pull/3471#issuecomment-5947540377"
+          "https://github.com/web-everything/web-everything/pull/3471",
+          "https://github.com/web-everything/web-everything/pull/3471#issuecomment-5947540377"
         ],
         "observedHead": "3cb5d27dd5f33672ebbe8f82d98eff47c771b6db",
         "unknownFields": [
@@ -409,7 +409,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; heal at Oct 2 07:39:21Z, marker head `3cb5d27dd5f33672ebbe8f82d98eff47c771b6db`. [comment 5947540377](https://github.com/chalbert/web-everything/pull/3471#issuecomment-5947540377)",
+        "observation": "Open, no labels; heal at Oct 2 07:39:21Z, marker head `3cb5d27dd5f33672ebbe8f82d98eff47c771b6db`. [comment 5947540377](https://github.com/web-everything/web-everything/pull/3471#issuecomment-5947540377)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock"
@@ -417,9 +417,9 @@
       },
       "episode": {
         "id": "replay-L7-3471",
-        "key": "pr-no-owner::chalbert/web-everything#3471",
+        "key": "pr-no-owner::web-everything/web-everything#3471",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3471",
+        "subject": "web-everything/web-everything#3471",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -431,11 +431,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3471,
         "head": "3cb5d27dd5f33672ebbe8f82d98eff47c771b6db",
         "episodeId": "replay-L7-3471",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3471",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3471",
         "observedAt": 1790938800000,
         "complete": false
       },
@@ -448,8 +448,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3432",
-          "https://github.com/chalbert/web-everything/pull/3432#issuecomment-5950031614"
+          "https://github.com/web-everything/web-everything/pull/3432",
+          "https://github.com/web-everything/web-everything/pull/3432#issuecomment-5950031614"
         ],
         "observedHead": "495e86acb5a3331fea1b014411a9c5d849406262",
         "unknownFields": [
@@ -458,7 +458,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, current head `495e86acb5a3331fea1b014411a9c5d849406262`; current labels include review:human/review-round:3/review-status:reviewing. 51 \u201cMandatory review owner\u201d comments contain 17 distinct owner UUIDs, not 51 runs. Human hold applied Oct 2 02:46:06Z (32305059803). No comment starts with the actual `ADVISORY_NOTE_MARKER` in the fetched thread (we:scripts/conveyor/advisory-round-count.mjs:49). Old post-accept red-team note at 01:47:35Z references `2498e55c6b57f30b629e1477e55366138ef724d6`. [comment 5950031614](https://github.com/chalbert/web-everything/pull/3432#issuecomment-5950031614)",
+        "observation": "Open, current head `495e86acb5a3331fea1b014411a9c5d849406262`; current labels include review:human/review-round:3/review-status:reviewing. 51 \u201cMandatory review owner\u201d comments contain 17 distinct owner UUIDs, not 51 runs. Human hold applied Oct 2 02:46:06Z (32305059803). No comment starts with the actual `ADVISORY_NOTE_MARKER` in the fetched thread (we:scripts/conveyor/advisory-round-count.mjs:49). Old post-accept red-team note at 01:47:35Z references `2498e55c6b57f30b629e1477e55366138ef724d6`. [comment 5950031614](https://github.com/web-everything/web-everything/pull/3432#issuecomment-5950031614)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock"
@@ -466,9 +466,9 @@
       },
       "episode": {
         "id": "replay-R1-3432",
-        "key": "repeated-pr-attempts::chalbert/web-everything#3432",
+        "key": "repeated-pr-attempts::web-everything/web-everything#3432",
         "smell": "repeated-pr-attempts",
-        "subject": "chalbert/web-everything#3432",
+        "subject": "web-everything/web-everything#3432",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -480,11 +480,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3432,
         "head": "495e86acb5a3331fea1b014411a9c5d849406262",
         "episodeId": "replay-R1-3432",
-        "episodeKey": "repeated-pr-attempts::chalbert/web-everything#3432",
+        "episodeKey": "repeated-pr-attempts::web-everything/web-everything#3432",
         "observedAt": 1790938800000,
         "complete": false
       },
@@ -497,9 +497,9 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3373",
-          "https://github.com/chalbert/web-everything/pull/3373#issuecomment-5943319885",
-          "https://github.com/chalbert/web-everything/pull/3373#issuecomment-5944962349"
+          "https://github.com/web-everything/web-everything/pull/3373",
+          "https://github.com/web-everything/web-everything/pull/3373#issuecomment-5943319885",
+          "https://github.com/web-everything/web-everything/pull/3373#issuecomment-5944962349"
         ],
         "observedHead": "b98e62d179c5326e64af41809e8b3c1f5ab6d432",
         "unknownFields": [
@@ -508,7 +508,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open draft, current head `b98e62d179c5326e64af41809e8b3c1f5ab6d432`; missing-run attempts Oct 2 03:15:45Z and 03:18:24Z. Retained repeated-attempt episode at 03:42 reports 14 refusals and an existing two-trigger cap, not 14 successful runs. Red episodes closed without the PR being ready. [comment 5943319885](https://github.com/chalbert/web-everything/pull/3373#issuecomment-5943319885) [comment 5944962349](https://github.com/chalbert/web-everything/pull/3373#issuecomment-5944962349)",
+        "observation": "Open draft, current head `b98e62d179c5326e64af41809e8b3c1f5ab6d432`; missing-run attempts Oct 2 03:15:45Z and 03:18:24Z. Retained repeated-attempt episode at 03:42 reports 14 refusals and an existing two-trigger cap, not 14 successful runs. Red episodes closed without the PR being ready. [comment 5943319885](https://github.com/web-everything/web-everything/pull/3373#issuecomment-5943319885) [comment 5944962349](https://github.com/web-everything/web-everything/pull/3373#issuecomment-5944962349)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock"
@@ -516,9 +516,9 @@
       },
       "episode": {
         "id": "replay-C1-3373",
-        "key": "red-pr-unattended::chalbert/web-everything#3373",
+        "key": "red-pr-unattended::web-everything/web-everything#3373",
         "smell": "red-pr-unattended",
-        "subject": "chalbert/web-everything#3373",
+        "subject": "web-everything/web-everything#3373",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -530,11 +530,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3373,
         "head": "b98e62d179c5326e64af41809e8b3c1f5ab6d432",
         "episodeId": "replay-C1-3373",
-        "episodeKey": "red-pr-unattended::chalbert/web-everything#3373",
+        "episodeKey": "red-pr-unattended::web-everything/web-everything#3373",
         "observedAt": 1790938800000,
         "complete": false
       },
@@ -547,9 +547,9 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3415",
-          "https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943092941",
-          "https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943866044"
+          "https://github.com/web-everything/web-everything/pull/3415",
+          "https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943092941",
+          "https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943866044"
         ],
         "observedHead": null,
         "unknownFields": [
@@ -558,7 +558,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open draft; three completed-heal markers Oct 1 23:31:33Z, 23:46:50Z, Oct 2 00:10:08Z; exhaustion comment Oct 2 01:26:57Z says 3/3. Comments prove spending/exhaustion, not that failures were flaky. [comment 5943092941](https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943092941) [comment 5943866044](https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943866044)",
+        "observation": "Open draft; three completed-heal markers Oct 1 23:31:33Z, 23:46:50Z, Oct 2 00:10:08Z; exhaustion comment Oct 2 01:26:57Z says 3/3. Comments prove spending/exhaustion, not that failures were flaky. [comment 5943092941](https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943092941) [comment 5943866044](https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943866044)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock"
@@ -566,9 +566,9 @@
       },
       "episode": {
         "id": "replay-C2-3415",
-        "key": "red-pr-unattended::chalbert/web-everything#3415",
+        "key": "red-pr-unattended::web-everything/web-everything#3415",
         "smell": "red-pr-unattended",
-        "subject": "chalbert/web-everything#3415",
+        "subject": "web-everything/web-everything#3415",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -580,11 +580,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3415,
         "head": null,
         "episodeId": "replay-C2-3415",
-        "episodeKey": "red-pr-unattended::chalbert/web-everything#3415",
+        "episodeKey": "red-pr-unattended::web-everything/web-everything#3415",
         "observedAt": 1790938800000,
         "complete": false
       },
@@ -597,7 +597,7 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3336"
+          "https://github.com/web-everything/web-everything/pull/3336"
         ],
         "observedHead": "4ecb5deb362c81aa28de162db4616bb4c2009347",
         "unknownFields": [
@@ -615,9 +615,9 @@
       },
       "episode": {
         "id": "2026-10-01-draft-not-promoted-chalbert-web-everything-3336-1925",
-        "key": "draft-not-promoted::chalbert/web-everything#3336",
+        "key": "draft-not-promoted::web-everything/web-everything#3336",
         "smell": "draft-not-promoted",
-        "subject": "chalbert/web-everything#3336",
+        "subject": "web-everything/web-everything#3336",
         "status": "open",
         "severity": "high",
         "openedAt": 1790882705935,
@@ -629,11 +629,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3336,
         "head": "4ecb5deb362c81aa28de162db4616bb4c2009347",
         "episodeId": "2026-10-01-draft-not-promoted-chalbert-web-everything-3336-1925",
-        "episodeKey": "draft-not-promoted::chalbert/web-everything#3336",
+        "episodeKey": "draft-not-promoted::web-everything/web-everything#3336",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -663,7 +663,7 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3336"
+          "https://github.com/web-everything/web-everything/pull/3336"
         ],
         "observedHead": "4ecb5deb362c81aa28de162db4616bb4c2009347",
         "unknownFields": [
@@ -682,9 +682,9 @@
       },
       "episode": {
         "id": "2026-10-01-draft-not-promoted-chalbert-web-everything-3336-1925",
-        "key": "draft-not-promoted::chalbert/web-everything#3336",
+        "key": "draft-not-promoted::web-everything/web-everything#3336",
         "smell": "draft-not-promoted",
-        "subject": "chalbert/web-everything#3336",
+        "subject": "web-everything/web-everything#3336",
         "status": "open",
         "severity": "high",
         "openedAt": 1790882705935,
@@ -696,11 +696,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3336,
         "head": "4ecb5deb362c81aa28de162db4616bb4c2009347",
         "episodeId": "2026-10-01-draft-not-promoted-chalbert-web-everything-3336-1925",
-        "episodeKey": "draft-not-promoted::chalbert/web-everything#3336",
+        "episodeKey": "draft-not-promoted::web-everything/web-everything#3336",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -730,7 +730,7 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3336"
+          "https://github.com/web-everything/web-everything/pull/3336"
         ],
         "observedHead": "4ecb5deb362c81aa28de162db4616bb4c2009347",
         "unknownFields": [
@@ -749,9 +749,9 @@
       },
       "episode": {
         "id": "2026-10-01-draft-not-promoted-chalbert-web-everything-3336-1925",
-        "key": "draft-not-promoted::chalbert/web-everything#3336",
+        "key": "draft-not-promoted::web-everything/web-everything#3336",
         "smell": "draft-not-promoted",
-        "subject": "chalbert/web-everything#3336",
+        "subject": "web-everything/web-everything#3336",
         "status": "open",
         "severity": "high",
         "openedAt": 1790882705935,
@@ -763,11 +763,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3336,
         "head": "4ecb5deb362c81aa28de162db4616bb4c2009347",
         "episodeId": "2026-10-01-draft-not-promoted-chalbert-web-everything-3336-1925",
-        "episodeKey": "draft-not-promoted::chalbert/web-everything#3336",
+        "episodeKey": "draft-not-promoted::web-everything/web-everything#3336",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -797,7 +797,7 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3336"
+          "https://github.com/web-everything/web-everything/pull/3336"
         ],
         "observedHead": "4ecb5deb362c81aa28de162db4616bb4c2009347",
         "unknownFields": [
@@ -816,9 +816,9 @@
       },
       "episode": {
         "id": "2026-10-01-draft-not-promoted-chalbert-web-everything-3336-1925",
-        "key": "draft-not-promoted::chalbert/web-everything#3336",
+        "key": "draft-not-promoted::web-everything/web-everything#3336",
         "smell": "draft-not-promoted",
-        "subject": "chalbert/web-everything#3336",
+        "subject": "web-everything/web-everything#3336",
         "status": "open",
         "severity": "high",
         "openedAt": 1790882705935,
@@ -830,11 +830,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3336,
         "head": "4ecb5deb362c81aa28de162db4616bb4c2009347",
         "episodeId": "2026-10-01-draft-not-promoted-chalbert-web-everything-3336-1925",
-        "episodeKey": "draft-not-promoted::chalbert/web-everything#3336",
+        "episodeKey": "draft-not-promoted::web-everything/web-everything#3336",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -864,8 +864,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3311",
-          "https://github.com/chalbert/web-everything/pull/3311#issuecomment-5940367503"
+          "https://github.com/web-everything/web-everything/pull/3311",
+          "https://github.com/web-everything/web-everything/pull/3311#issuecomment-5940367503"
         ],
         "observedHead": null,
         "unknownFields": [
@@ -874,7 +874,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Ready events Oct 1 14:04:21Z (32258012355) and 21:18:02Z (32289858689); scope-change draft at 20:13:19Z (32285477565), claim release at 20:56:05Z; merged 21:33:54Z. Draft episode opened 20:34:01.992Z and closed 21:11:13.732Z, before the second actual ready event. [comment 5940367503](https://github.com/chalbert/web-everything/pull/3311#issuecomment-5940367503)",
+        "observation": "Ready events Oct 1 14:04:21Z (32258012355) and 21:18:02Z (32289858689); scope-change draft at 20:13:19Z (32285477565), claim release at 20:56:05Z; merged 21:33:54Z. Draft episode opened 20:34:01.992Z and closed 21:11:13.732Z, before the second actual ready event. [comment 5940367503](https://github.com/web-everything/web-everything/pull/3311#issuecomment-5940367503)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -884,9 +884,9 @@
       },
       "episode": {
         "id": "replay-D2-3311",
-        "key": "draft-not-promoted::chalbert/web-everything#3311",
+        "key": "draft-not-promoted::web-everything/web-everything#3311",
         "smell": "draft-not-promoted",
-        "subject": "chalbert/web-everything#3311",
+        "subject": "web-everything/web-everything#3311",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -898,11 +898,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3311,
         "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "episodeId": "replay-D2-3311",
-        "episodeKey": "draft-not-promoted::chalbert/web-everything#3311",
+        "episodeKey": "draft-not-promoted::web-everything/web-everything#3311",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -932,8 +932,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3311",
-          "https://github.com/chalbert/web-everything/pull/3311#issuecomment-5940367503"
+          "https://github.com/web-everything/web-everything/pull/3311",
+          "https://github.com/web-everything/web-everything/pull/3311#issuecomment-5940367503"
         ],
         "observedHead": null,
         "unknownFields": [
@@ -942,7 +942,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Ready events Oct 1 14:04:21Z (32258012355) and 21:18:02Z (32289858689); scope-change draft at 20:13:19Z (32285477565), claim release at 20:56:05Z; merged 21:33:54Z. Draft episode opened 20:34:01.992Z and closed 21:11:13.732Z, before the second actual ready event. [comment 5940367503](https://github.com/chalbert/web-everything/pull/3311#issuecomment-5940367503)",
+        "observation": "Ready events Oct 1 14:04:21Z (32258012355) and 21:18:02Z (32289858689); scope-change draft at 20:13:19Z (32285477565), claim release at 20:56:05Z; merged 21:33:54Z. Draft episode opened 20:34:01.992Z and closed 21:11:13.732Z, before the second actual ready event. [comment 5940367503](https://github.com/web-everything/web-everything/pull/3311#issuecomment-5940367503)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -952,9 +952,9 @@
       },
       "episode": {
         "id": "replay-D2-3311",
-        "key": "draft-not-promoted::chalbert/web-everything#3311",
+        "key": "draft-not-promoted::web-everything/web-everything#3311",
         "smell": "draft-not-promoted",
-        "subject": "chalbert/web-everything#3311",
+        "subject": "web-everything/web-everything#3311",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -966,11 +966,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3311,
         "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "episodeId": "replay-D2-3311",
-        "episodeKey": "draft-not-promoted::chalbert/web-everything#3311",
+        "episodeKey": "draft-not-promoted::web-everything/web-everything#3311",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1000,9 +1000,9 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3415",
-          "https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943092941",
-          "https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943866044"
+          "https://github.com/web-everything/web-everything/pull/3415",
+          "https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943092941",
+          "https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943866044"
         ],
         "observedHead": null,
         "unknownFields": [
@@ -1011,7 +1011,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open draft; three completed-heal markers Oct 1 23:31:33Z, 23:46:50Z, Oct 2 00:10:08Z; exhaustion comment Oct 2 01:26:57Z says 3/3. Comments prove spending/exhaustion, not that failures were flaky. [comment 5943092941](https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943092941) [comment 5943866044](https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943866044)",
+        "observation": "Open draft; three completed-heal markers Oct 1 23:31:33Z, 23:46:50Z, Oct 2 00:10:08Z; exhaustion comment Oct 2 01:26:57Z says 3/3. Comments prove spending/exhaustion, not that failures were flaky. [comment 5943092941](https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943092941) [comment 5943866044](https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943866044)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -1020,9 +1020,9 @@
       },
       "episode": {
         "id": "replay-C2-3415",
-        "key": "red-pr-unattended::chalbert/web-everything#3415",
+        "key": "red-pr-unattended::web-everything/web-everything#3415",
         "smell": "red-pr-unattended",
-        "subject": "chalbert/web-everything#3415",
+        "subject": "web-everything/web-everything#3415",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -1034,11 +1034,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3415,
         "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "episodeId": "replay-C2-3415",
-        "episodeKey": "red-pr-unattended::chalbert/web-everything#3415",
+        "episodeKey": "red-pr-unattended::web-everything/web-everything#3415",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1067,9 +1067,9 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3415",
-          "https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943092941",
-          "https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943866044"
+          "https://github.com/web-everything/web-everything/pull/3415",
+          "https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943092941",
+          "https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943866044"
         ],
         "observedHead": null,
         "unknownFields": [
@@ -1078,7 +1078,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open draft; three completed-heal markers Oct 1 23:31:33Z, 23:46:50Z, Oct 2 00:10:08Z; exhaustion comment Oct 2 01:26:57Z says 3/3. Comments prove spending/exhaustion, not that failures were flaky. [comment 5943092941](https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943092941) [comment 5943866044](https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943866044)",
+        "observation": "Open draft; three completed-heal markers Oct 1 23:31:33Z, 23:46:50Z, Oct 2 00:10:08Z; exhaustion comment Oct 2 01:26:57Z says 3/3. Comments prove spending/exhaustion, not that failures were flaky. [comment 5943092941](https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943092941) [comment 5943866044](https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943866044)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -1088,9 +1088,9 @@
       },
       "episode": {
         "id": "replay-C2-3415",
-        "key": "red-pr-unattended::chalbert/web-everything#3415",
+        "key": "red-pr-unattended::web-everything/web-everything#3415",
         "smell": "red-pr-unattended",
-        "subject": "chalbert/web-everything#3415",
+        "subject": "web-everything/web-everything#3415",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -1102,11 +1102,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3415,
         "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "episodeId": "replay-C2-3415",
-        "episodeKey": "red-pr-unattended::chalbert/web-everything#3415",
+        "episodeKey": "red-pr-unattended::web-everything/web-everything#3415",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1137,9 +1137,9 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3415",
-          "https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943092941",
-          "https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943866044"
+          "https://github.com/web-everything/web-everything/pull/3415",
+          "https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943092941",
+          "https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943866044"
         ],
         "observedHead": null,
         "unknownFields": [
@@ -1148,7 +1148,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open draft; three completed-heal markers Oct 1 23:31:33Z, 23:46:50Z, Oct 2 00:10:08Z; exhaustion comment Oct 2 01:26:57Z says 3/3. Comments prove spending/exhaustion, not that failures were flaky. [comment 5943092941](https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943092941) [comment 5943866044](https://github.com/chalbert/web-everything/pull/3415#issuecomment-5943866044)",
+        "observation": "Open draft; three completed-heal markers Oct 1 23:31:33Z, 23:46:50Z, Oct 2 00:10:08Z; exhaustion comment Oct 2 01:26:57Z says 3/3. Comments prove spending/exhaustion, not that failures were flaky. [comment 5943092941](https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943092941) [comment 5943866044](https://github.com/web-everything/web-everything/pull/3415#issuecomment-5943866044)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -1158,9 +1158,9 @@
       },
       "episode": {
         "id": "replay-C2-3415",
-        "key": "red-pr-unattended::chalbert/web-everything#3415",
+        "key": "red-pr-unattended::web-everything/web-everything#3415",
         "smell": "red-pr-unattended",
-        "subject": "chalbert/web-everything#3415",
+        "subject": "web-everything/web-everything#3415",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -1172,11 +1172,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3415,
         "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "episodeId": "replay-C2-3415",
-        "episodeKey": "red-pr-unattended::chalbert/web-everything#3415",
+        "episodeKey": "red-pr-unattended::web-everything/web-everything#3415",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1207,9 +1207,9 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3373",
-          "https://github.com/chalbert/web-everything/pull/3373#issuecomment-5943319885",
-          "https://github.com/chalbert/web-everything/pull/3373#issuecomment-5944962349"
+          "https://github.com/web-everything/web-everything/pull/3373",
+          "https://github.com/web-everything/web-everything/pull/3373#issuecomment-5943319885",
+          "https://github.com/web-everything/web-everything/pull/3373#issuecomment-5944962349"
         ],
         "observedHead": "b98e62d179c5326e64af41809e8b3c1f5ab6d432",
         "unknownFields": [
@@ -1218,7 +1218,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open draft, current head `b98e62d179c5326e64af41809e8b3c1f5ab6d432`; missing-run attempts Oct 2 03:15:45Z and 03:18:24Z. Retained repeated-attempt episode at 03:42 reports 14 refusals and an existing two-trigger cap, not 14 successful runs. Red episodes closed without the PR being ready. [comment 5943319885](https://github.com/chalbert/web-everything/pull/3373#issuecomment-5943319885) [comment 5944962349](https://github.com/chalbert/web-everything/pull/3373#issuecomment-5944962349)",
+        "observation": "Open draft, current head `b98e62d179c5326e64af41809e8b3c1f5ab6d432`; missing-run attempts Oct 2 03:15:45Z and 03:18:24Z. Retained repeated-attempt episode at 03:42 reports 14 refusals and an existing two-trigger cap, not 14 successful runs. Red episodes closed without the PR being ready. [comment 5943319885](https://github.com/web-everything/web-everything/pull/3373#issuecomment-5943319885) [comment 5944962349](https://github.com/web-everything/web-everything/pull/3373#issuecomment-5944962349)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -1227,9 +1227,9 @@
       },
       "episode": {
         "id": "replay-C1-3373",
-        "key": "red-pr-unattended::chalbert/web-everything#3373",
+        "key": "red-pr-unattended::web-everything/web-everything#3373",
         "smell": "red-pr-unattended",
-        "subject": "chalbert/web-everything#3373",
+        "subject": "web-everything/web-everything#3373",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -1241,11 +1241,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3373,
         "head": "b98e62d179c5326e64af41809e8b3c1f5ab6d432",
         "episodeId": "replay-C1-3373",
-        "episodeKey": "red-pr-unattended::chalbert/web-everything#3373",
+        "episodeKey": "red-pr-unattended::web-everything/web-everything#3373",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1274,8 +1274,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3432",
-          "https://github.com/chalbert/web-everything/pull/3432#issuecomment-5950031614"
+          "https://github.com/web-everything/web-everything/pull/3432",
+          "https://github.com/web-everything/web-everything/pull/3432#issuecomment-5950031614"
         ],
         "observedHead": "495e86acb5a3331fea1b014411a9c5d849406262",
         "unknownFields": [
@@ -1284,7 +1284,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, current head `495e86acb5a3331fea1b014411a9c5d849406262`; current labels include review:human/review-round:3/review-status:reviewing. 51 \u201cMandatory review owner\u201d comments contain 17 distinct owner UUIDs, not 51 runs. Human hold applied Oct 2 02:46:06Z (32305059803). No comment starts with the actual `ADVISORY_NOTE_MARKER` in the fetched thread (we:scripts/conveyor/advisory-round-count.mjs:49). Old post-accept red-team note at 01:47:35Z references `2498e55c6b57f30b629e1477e55366138ef724d6`. [comment 5950031614](https://github.com/chalbert/web-everything/pull/3432#issuecomment-5950031614)",
+        "observation": "Open, current head `495e86acb5a3331fea1b014411a9c5d849406262`; current labels include review:human/review-round:3/review-status:reviewing. 51 \u201cMandatory review owner\u201d comments contain 17 distinct owner UUIDs, not 51 runs. Human hold applied Oct 2 02:46:06Z (32305059803). No comment starts with the actual `ADVISORY_NOTE_MARKER` in the fetched thread (we:scripts/conveyor/advisory-round-count.mjs:49). Old post-accept red-team note at 01:47:35Z references `2498e55c6b57f30b629e1477e55366138ef724d6`. [comment 5950031614](https://github.com/web-everything/web-everything/pull/3432#issuecomment-5950031614)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -1293,9 +1293,9 @@
       },
       "episode": {
         "id": "replay-R1-3432",
-        "key": "repeated-pr-attempts::chalbert/web-everything#3432",
+        "key": "repeated-pr-attempts::web-everything/web-everything#3432",
         "smell": "repeated-pr-attempts",
-        "subject": "chalbert/web-everything#3432",
+        "subject": "web-everything/web-everything#3432",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -1307,11 +1307,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3432,
         "head": "495e86acb5a3331fea1b014411a9c5d849406262",
         "episodeId": "replay-R1-3432",
-        "episodeKey": "repeated-pr-attempts::chalbert/web-everything#3432",
+        "episodeKey": "repeated-pr-attempts::web-everything/web-everything#3432",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1345,8 +1345,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3432",
-          "https://github.com/chalbert/web-everything/pull/3432#issuecomment-5950031614"
+          "https://github.com/web-everything/web-everything/pull/3432",
+          "https://github.com/web-everything/web-everything/pull/3432#issuecomment-5950031614"
         ],
         "observedHead": "495e86acb5a3331fea1b014411a9c5d849406262",
         "unknownFields": [
@@ -1355,7 +1355,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, current head `495e86acb5a3331fea1b014411a9c5d849406262`; current labels include review:human/review-round:3/review-status:reviewing. 51 \u201cMandatory review owner\u201d comments contain 17 distinct owner UUIDs, not 51 runs. Human hold applied Oct 2 02:46:06Z (32305059803). No comment starts with the actual `ADVISORY_NOTE_MARKER` in the fetched thread (we:scripts/conveyor/advisory-round-count.mjs:49). Old post-accept red-team note at 01:47:35Z references `2498e55c6b57f30b629e1477e55366138ef724d6`. [comment 5950031614](https://github.com/chalbert/web-everything/pull/3432#issuecomment-5950031614)",
+        "observation": "Open, current head `495e86acb5a3331fea1b014411a9c5d849406262`; current labels include review:human/review-round:3/review-status:reviewing. 51 \u201cMandatory review owner\u201d comments contain 17 distinct owner UUIDs, not 51 runs. Human hold applied Oct 2 02:46:06Z (32305059803). No comment starts with the actual `ADVISORY_NOTE_MARKER` in the fetched thread (we:scripts/conveyor/advisory-round-count.mjs:49). Old post-accept red-team note at 01:47:35Z references `2498e55c6b57f30b629e1477e55366138ef724d6`. [comment 5950031614](https://github.com/web-everything/web-everything/pull/3432#issuecomment-5950031614)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -1364,9 +1364,9 @@
       },
       "episode": {
         "id": "replay-R1-3432",
-        "key": "repeated-pr-attempts::chalbert/web-everything#3432",
+        "key": "repeated-pr-attempts::web-everything/web-everything#3432",
         "smell": "repeated-pr-attempts",
-        "subject": "chalbert/web-everything#3432",
+        "subject": "web-everything/web-everything#3432",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -1378,11 +1378,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3432,
         "head": "495e86acb5a3331fea1b014411a9c5d849406262",
         "episodeId": "replay-R1-3432",
-        "episodeKey": "repeated-pr-attempts::chalbert/web-everything#3432",
+        "episodeKey": "repeated-pr-attempts::web-everything/web-everything#3432",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1417,8 +1417,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3239",
-          "https://github.com/chalbert/web-everything/pull/3239#issuecomment-5937599395"
+          "https://github.com/web-everything/web-everything/pull/3239",
+          "https://github.com/web-everything/web-everything/pull/3239#issuecomment-5937599395"
         ],
         "observedHead": "67e9ca92c8780b58dce97e8957b2732e762ab480",
         "unknownFields": [
@@ -1427,7 +1427,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; current head `67e9ca92c8780b58dce97e8957b2732e762ab480`; Oct 1 01:12:17Z escalation reports an unrelated probation test, later head-bound heal at 18:12:43Z and claim release 18:12:48Z. [comment 5937599395](https://github.com/chalbert/web-everything/pull/3239#issuecomment-5937599395)",
+        "observation": "Open, no labels; current head `67e9ca92c8780b58dce97e8957b2732e762ab480`; Oct 1 01:12:17Z escalation reports an unrelated probation test, later head-bound heal at 18:12:43Z and claim release 18:12:48Z. [comment 5937599395](https://github.com/web-everything/web-everything/pull/3239#issuecomment-5937599395)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -1436,9 +1436,9 @@
       },
       "episode": {
         "id": "replay-L1-3239",
-        "key": "pr-no-owner::chalbert/web-everything#3239",
+        "key": "pr-no-owner::web-everything/web-everything#3239",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3239",
+        "subject": "web-everything/web-everything#3239",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -1452,11 +1452,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3239,
         "head": "67e9ca92c8780b58dce97e8957b2732e762ab480",
         "episodeId": "replay-L1-3239",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3239",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3239",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1490,8 +1490,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3389",
-          "https://github.com/chalbert/web-everything/pull/3389#issuecomment-5941764044"
+          "https://github.com/web-everything/web-everything/pull/3389",
+          "https://github.com/web-everything/web-everything/pull/3389#issuecomment-5941764044"
         ],
         "observedHead": "667c1a330adea2001a09053f7ef09a43b5a1fe11",
         "unknownFields": [
@@ -1500,7 +1500,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; heal marker at Oct 1 22:17:17Z names `99d53bf598f9292ea964cad68d985f038e425cdc`, whereas current head/fix-end is `667c1a330adea2001a09053f7ef09a43b5a1fe11`. [comment 5941764044](https://github.com/chalbert/web-everything/pull/3389#issuecomment-5941764044)",
+        "observation": "Open, no labels; heal marker at Oct 1 22:17:17Z names `99d53bf598f9292ea964cad68d985f038e425cdc`, whereas current head/fix-end is `667c1a330adea2001a09053f7ef09a43b5a1fe11`. [comment 5941764044](https://github.com/web-everything/web-everything/pull/3389#issuecomment-5941764044)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -1509,9 +1509,9 @@
       },
       "episode": {
         "id": "replay-L2-3389",
-        "key": "pr-no-owner::chalbert/web-everything#3389",
+        "key": "pr-no-owner::web-everything/web-everything#3389",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3389",
+        "subject": "web-everything/web-everything#3389",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -1525,11 +1525,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3389,
         "head": "667c1a330adea2001a09053f7ef09a43b5a1fe11",
         "episodeId": "replay-L2-3389",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3389",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3389",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1563,8 +1563,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3390",
-          "https://github.com/chalbert/web-everything/pull/3390#issuecomment-5941750430"
+          "https://github.com/web-everything/web-everything/pull/3390",
+          "https://github.com/web-everything/web-everything/pull/3390#issuecomment-5941750430"
         ],
         "observedHead": "da71bd5bb092f5cdb20803653ab9bfa004f3c31f",
         "unknownFields": [
@@ -1573,7 +1573,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; heal at Oct 1 22:16:28Z, head `da71bd5bb092f5cdb20803653ab9bfa004f3c31f`. [comment 5941750430](https://github.com/chalbert/web-everything/pull/3390#issuecomment-5941750430)",
+        "observation": "Open, no labels; heal at Oct 1 22:16:28Z, head `da71bd5bb092f5cdb20803653ab9bfa004f3c31f`. [comment 5941750430](https://github.com/web-everything/web-everything/pull/3390#issuecomment-5941750430)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -1582,9 +1582,9 @@
       },
       "episode": {
         "id": "replay-L3-3390",
-        "key": "pr-no-owner::chalbert/web-everything#3390",
+        "key": "pr-no-owner::web-everything/web-everything#3390",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3390",
+        "subject": "web-everything/web-everything#3390",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -1598,11 +1598,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3390,
         "head": "da71bd5bb092f5cdb20803653ab9bfa004f3c31f",
         "episodeId": "replay-L3-3390",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3390",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3390",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1636,8 +1636,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3391",
-          "https://github.com/chalbert/web-everything/pull/3391#issuecomment-5941813804"
+          "https://github.com/web-everything/web-everything/pull/3391",
+          "https://github.com/web-everything/web-everything/pull/3391#issuecomment-5941813804"
         ],
         "observedHead": "d2d4b7566feb2508208dd8f0c0f5b5e4108377e9",
         "unknownFields": [
@@ -1646,7 +1646,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; heal at Oct 1 22:20:14Z, marker head `d2d4b7566feb2508208dd8f0c0f5b5e4108377e9`. [comment 5941813804](https://github.com/chalbert/web-everything/pull/3391#issuecomment-5941813804)",
+        "observation": "Open, no labels; heal at Oct 1 22:20:14Z, marker head `d2d4b7566feb2508208dd8f0c0f5b5e4108377e9`. [comment 5941813804](https://github.com/web-everything/web-everything/pull/3391#issuecomment-5941813804)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -1655,9 +1655,9 @@
       },
       "episode": {
         "id": "replay-L4-3391",
-        "key": "pr-no-owner::chalbert/web-everything#3391",
+        "key": "pr-no-owner::web-everything/web-everything#3391",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3391",
+        "subject": "web-everything/web-everything#3391",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -1671,11 +1671,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3391,
         "head": "d2d4b7566feb2508208dd8f0c0f5b5e4108377e9",
         "episodeId": "replay-L4-3391",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3391",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3391",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1711,8 +1711,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3392",
-          "https://github.com/chalbert/web-everything/pull/3392#issuecomment-5941873536"
+          "https://github.com/web-everything/web-everything/pull/3392",
+          "https://github.com/web-everything/web-everything/pull/3392#issuecomment-5941873536"
         ],
         "observedHead": "3ec895af28dc1265f6f6d15629da05831799b0b9",
         "unknownFields": [
@@ -1721,7 +1721,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; heal at Oct 1 22:24:05Z, marker head `3ec895af28dc1265f6f6d15629da05831799b0b9`. [comment 5941873536](https://github.com/chalbert/web-everything/pull/3392#issuecomment-5941873536)",
+        "observation": "Open, no labels; heal at Oct 1 22:24:05Z, marker head `3ec895af28dc1265f6f6d15629da05831799b0b9`. [comment 5941873536](https://github.com/web-everything/web-everything/pull/3392#issuecomment-5941873536)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -1730,9 +1730,9 @@
       },
       "episode": {
         "id": "replay-L5-3392",
-        "key": "pr-no-owner::chalbert/web-everything#3392",
+        "key": "pr-no-owner::web-everything/web-everything#3392",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3392",
+        "subject": "web-everything/web-everything#3392",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -1746,11 +1746,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3392,
         "head": "3ec895af28dc1265f6f6d15629da05831799b0b9",
         "episodeId": "replay-L5-3392",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3392",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3392",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1784,8 +1784,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3463",
-          "https://github.com/chalbert/web-everything/pull/3463#issuecomment-5945943801"
+          "https://github.com/web-everything/web-everything/pull/3463",
+          "https://github.com/web-everything/web-everything/pull/3463#issuecomment-5945943801"
         ],
         "observedHead": "1807e6dc53937a98d6104df6f1c5fa2d5ff7a670",
         "unknownFields": [
@@ -1794,7 +1794,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; heal at Oct 2 05:06:38Z, marker head `1807e6dc53937a98d6104df6f1c5fa2d5ff7a670`. [comment 5945943801](https://github.com/chalbert/web-everything/pull/3463#issuecomment-5945943801)",
+        "observation": "Open, no labels; heal at Oct 2 05:06:38Z, marker head `1807e6dc53937a98d6104df6f1c5fa2d5ff7a670`. [comment 5945943801](https://github.com/web-everything/web-everything/pull/3463#issuecomment-5945943801)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -1803,9 +1803,9 @@
       },
       "episode": {
         "id": "replay-L6-3463",
-        "key": "pr-no-owner::chalbert/web-everything#3463",
+        "key": "pr-no-owner::web-everything/web-everything#3463",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3463",
+        "subject": "web-everything/web-everything#3463",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -1819,11 +1819,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3463,
         "head": "1807e6dc53937a98d6104df6f1c5fa2d5ff7a670",
         "episodeId": "replay-L6-3463",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3463",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3463",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1857,8 +1857,8 @@
         "captureTime": "unknown (preparation card did not record per-PR retrieval time)",
         "sourceCard": "we:backlog/xdmqryh-health-responder-a-daemon-that-acts-on-health-signals-not-on.md",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3471",
-          "https://github.com/chalbert/web-everything/pull/3471#issuecomment-5947540377"
+          "https://github.com/web-everything/web-everything/pull/3471",
+          "https://github.com/web-everything/web-everything/pull/3471#issuecomment-5947540377"
         ],
         "observedHead": "3cb5d27dd5f33672ebbe8f82d98eff47c771b6db",
         "unknownFields": [
@@ -1867,7 +1867,7 @@
           "complete current diff",
           "same-head completed run provenance"
         ],
-        "observation": "Open, no labels; heal at Oct 2 07:39:21Z, marker head `3cb5d27dd5f33672ebbe8f82d98eff47c771b6db`. [comment 5947540377](https://github.com/chalbert/web-everything/pull/3471#issuecomment-5947540377)",
+        "observation": "Open, no labels; heal at Oct 2 07:39:21Z, marker head `3cb5d27dd5f33672ebbe8f82d98eff47c771b6db`. [comment 5947540377](https://github.com/web-everything/web-everything/pull/3471#issuecomment-5947540377)",
         "synthetic": [
           "episode normalization unless an exact episode id is supplied",
           "replay clock",
@@ -1876,9 +1876,9 @@
       },
       "episode": {
         "id": "replay-L7-3471",
-        "key": "pr-no-owner::chalbert/web-everything#3471",
+        "key": "pr-no-owner::web-everything/web-everything#3471",
         "smell": "pr-no-owner",
-        "subject": "chalbert/web-everything#3471",
+        "subject": "web-everything/web-everything#3471",
         "status": "open",
         "severity": "high",
         "openedAt": 1790935200000,
@@ -1892,11 +1892,11 @@
       },
       "facts": {
         "kind": "pr",
-        "repo": "chalbert/web-everything",
+        "repo": "web-everything/web-everything",
         "pr": 3471,
         "head": "3cb5d27dd5f33672ebbe8f82d98eff47c771b6db",
         "episodeId": "replay-L7-3471",
-        "episodeKey": "pr-no-owner::chalbert/web-everything#3471",
+        "episodeKey": "pr-no-owner::web-everything/web-everything#3471",
         "observedAt": 1790938800000,
         "complete": true,
         "paused": false,
@@ -1928,7 +1928,7 @@
       "provenance": {
         "capturedDate": "2026-10-02",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3311"
+          "https://github.com/web-everything/web-everything/pull/3311"
         ],
         "observedHead": null,
         "unknownFields": [
@@ -1989,7 +1989,7 @@
       "provenance": {
         "capturedDate": "2026-10-02",
         "urls": [
-          "https://github.com/chalbert/web-everything/pull/3311"
+          "https://github.com/web-everything/web-everything/pull/3311"
         ],
         "observedHead": null,
         "unknownFields": [

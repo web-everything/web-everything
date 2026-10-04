@@ -108,7 +108,7 @@ describe('(a) every dispatch path isolates its session through the shared helper
     const isolateSession = vi.fn(isolateDispatchSession);
     let seen = null;
     dispatchReview({
-      pr: 1234, repo: 'chalbert/web-everything', root: '/repo', checkStaleness: FRESH,
+      pr: 1234, repo: 'web-everything/web-everything', root: '/repo', checkStaleness: FRESH,
       ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }),
       readBrief: () => '# review {{PR}} {{REPO}} {{SESSION_SLUG}}',
       mintSessionId: () => 'sid-review',

@@ -86,6 +86,9 @@ import { createHash } from 'node:crypto';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultCachePath, resolveGithubAppEnvConfig } from './github-app-auth-env.mjs';
+import {
+  OWNER_INSTALLATIONS, MOVED_REPO_OWNERS, canonicalOwner, installationMap, installationForOwner, ownerOfSlug, ownerFromRemoteUrl, ownerFromGhArgv, installationCachePath,
+} from './github-app-installations.mjs';
 import { primaryCheckout } from '../bootstrap-session.mjs';
 import { controlClonePath } from './automation-home.mjs';
 import { stripGhDebug, rateLimitRecords, ghAuthIdentity, classifyGhResource } from './gh-throttle.mjs';
@@ -298,6 +301,17 @@ const { pathToFileURL } = require('node:url');
 const REAL_GH = ${JSON.stringify(realGhPath)};
 const CACHE_PATH = ${JSON.stringify(cachePath)};
 const CACHE_VERSION = ${JSON.stringify(SHIM_CACHE_VERSION)};
+// Per-owner App installations (we:scripts/lib/github-app-installations.mjs): the token is chosen by the target
+// repo's OWNER, since one installation covers one account. An unknown owner falls back to personal auth.
+const OWNER_INSTALLATIONS = ${JSON.stringify(OWNER_INSTALLATIONS)};
+const MOVED_REPO_OWNERS = ${JSON.stringify(MOVED_REPO_OWNERS)};
+${canonicalOwner.toString()}
+${installationMap.toString()}
+${installationForOwner.toString()}
+${ownerOfSlug.toString()}
+${ownerFromRemoteUrl.toString()}
+${ownerFromGhArgv.toString()}
+${installationCachePath.toString()}
 const REFRESH_BUFFER_MS = ${JSON.stringify(SHIM_REFRESH_BUFFER_MS)};
 const GH_THROTTLE_CLI = ${JSON.stringify(ghThrottleCliPath)};
 
@@ -440,12 +454,47 @@ function runThrottled(argv, env) {
 }
 
 let cachedInstallationId = null;
-function freshCachedToken() {
+let usedCachePath = CACHE_PATH;
+function readFreshCache(path) {
   let cached;
-  try { cached = JSON.parse(readFileSync(CACHE_PATH, 'utf8')); } catch { return null; }
+  try { cached = JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
   if (!cached || cached.v !== CACHE_VERSION || typeof cached.expiresAt !== 'string' || typeof cached.token !== 'string') return null;
   const expiresAtMs = Date.parse(cached.expiresAt);
   if (!Number.isFinite(expiresAtMs) || (expiresAtMs - REFRESH_BUFFER_MS) <= Date.now()) return null;
+  return cached;
+}
+// The owner this call targets: the argv's own repo, else the current checkout's origin remote, else null.
+function targetOwner(argv, env) {
+  const fromArgv = ownerFromGhArgv(argv);
+  if (fromArgv) return fromArgv;
+  if (env.GH_REPO) { const o = ownerOfSlug(String(env.GH_REPO).split('/').slice(-2).join('/')); if (o) return o; }
+  try {
+    if (!existsSync('/usr/bin/git')) return null;
+    const r = spawnSync('/usr/bin/git', ['remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 });
+    return r.status === 0 ? ownerFromRemoteUrl(String(r.stdout || '').trim()) : null;
+  } catch { return null; }
+}
+function freshCachedToken() {
+  const owner = targetOwner(process.argv.slice(2), process.env);
+  let cached = null;
+  if (owner) {
+    const id = installationForOwner(owner, process.env);
+    if (!id) {
+      process.stderr.write('gh-shim: no GitHub App installation is configured for owner "' + owner + '" - using personal auth for this call\\n');
+      return null;
+    }
+    usedCachePath = installationCachePath(CACHE_PATH, id);
+    cached = readFreshCache(usedCachePath);
+    if (!cached) {
+      // Not minted yet for this owner: the legacy single cache still serves it when it holds THIS installation.
+      const legacy = readFreshCache(CACHE_PATH);
+      if (legacy && (legacy.installationId == null || String(legacy.installationId) === String(id))) { cached = legacy; usedCachePath = CACHE_PATH; }
+    }
+  } else {
+    usedCachePath = CACHE_PATH;
+    cached = readFreshCache(CACHE_PATH);
+  }
+  if (!cached) return null;
   cachedInstallationId = cached.installationId ?? null;
   return cached.token;
 }
@@ -456,7 +505,7 @@ function looksLikeAppTokenAuthFailure(stderrText) {
 }
 
 function invalidateSharedCache() {
-  try { unlinkSync(CACHE_PATH); } catch { /* best-effort — a missing/already-gone cache is fine */ }
+  try { unlinkSync(usedCachePath); } catch { /* best-effort — a missing/already-gone cache is fine */ }
 }
 
 // #x8mpubm follow-up (live-caught 2026-09-24, review-2578/2601 — \`Unterminated string in JSON\`, a >64KB

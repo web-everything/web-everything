@@ -1,7 +1,7 @@
 /**
  * @file scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs
  * @description we:backlog/x5uqim1-*.md (#4075/#3383) — the IO shell over `main-red-recovery.mjs`'s pure planner.
- *   Fixtures are the REAL shapes measured 2026-09-25 off `chalbert/web-everything`: PR #2635 (33 commits behind
+ *   Fixtures are the REAL shapes measured 2026-09-25 off `web-everything/web-everything`: PR #2635 (33 commits behind
  *   main, never refreshed, inside main's real red window) is the one this pass should actually refresh; PR
  *   #2596 (`ahead_by: 0` from the operator's own manual branch refresh, still red) is the one it must report
  *   ALREADY HANDLED. CORRECTED mid-build from an earlier `gh run rerun` design — see `main-red-recovery.mjs`'s
@@ -202,7 +202,7 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     const readComments = () => [];
     const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
     sweepCiRedRecovery({
-      repo: 'chalbert/frontierui', readOpenPrs, readMainRuns, readAheadBy, readComments, refresh,
+      repo: 'frontier-ui/frontierui', readOpenPrs, readMainRuns, readAheadBy, readComments, refresh,
       postComment: vi.fn(), apply: true,
     });
     expect(refresh).toHaveBeenCalledWith('lane/xdzl6mb', expect.objectContaining({
@@ -287,7 +287,7 @@ describe('ci-red-recovery-watch — refreshOntoMain', () => {
   });
 });
 
-// #2811 (chalbert/web-everything PR #2811 live incident) — this watcher's own mechanical rebase moves the head
+// #2811 (web-everything/web-everything PR #2811 live incident) — this watcher's own mechanical rebase moves the head
 // exactly like a ci-heal's re-push does, so a live `review:accepted` it finds is stale for the same reason.
 describe('ci-red-recovery-watch — reconcileAcceptanceAfterRebase (#2811)', () => {
   const readLabels = (labels) => () => labels;
@@ -308,11 +308,11 @@ describe('ci-red-recovery-watch — reconcileAcceptanceAfterRebase (#2811)', () 
     const restamp = vi.fn(() => ({ ok: true }));
     const rearm = vi.fn();
     const out = reconcileAcceptanceAfterRebase({
-      prNumber: 2635, newHead: 'a19e50b56', repo: 'chalbert/web-everything', root: '/repo',
+      prNumber: 2635, newHead: 'a19e50b56', repo: 'web-everything/web-everything', root: '/repo',
       readLabels: readLabels([{ name: REVIEW_LABELS.accepted }]), restamp, rearm,
     });
     expect(out).toEqual({ attempted: true, restamped: true, rearmed: false });
-    expect(restamp).toHaveBeenCalledWith({ pr: 2635, repo: 'chalbert/web-everything', newHead: 'a19e50b56', cwd: '/repo' });
+    expect(restamp).toHaveBeenCalledWith({ pr: 2635, repo: 'web-everything/web-everything', newHead: 'a19e50b56', cwd: '/repo' });
     expect(rearm).not.toHaveBeenCalled(); // THE LOAD-BEARING GUARD: a successful restamp is never followed by a rearm.
   });
 
@@ -320,11 +320,11 @@ describe('ci-red-recovery-watch — reconcileAcceptanceAfterRebase (#2811)', () 
     const restamp = vi.fn(() => ({ ok: false, reason: 'reviewed diff no longer matches' }));
     const rearm = vi.fn(() => ({ ok: true }));
     const out = reconcileAcceptanceAfterRebase({
-      prNumber: 2811, newHead: 'a19e50b56', repo: 'chalbert/web-everything', root: '/repo',
+      prNumber: 2811, newHead: 'a19e50b56', repo: 'web-everything/web-everything', root: '/repo',
       readLabels: readLabels([{ name: REVIEW_LABELS.accepted }]), restamp, rearm,
     });
     expect(out).toEqual({ attempted: true, restamped: false, rearmed: true });
-    expect(rearm).toHaveBeenCalledWith(expect.objectContaining({ pr: 2811, repo: 'chalbert/web-everything', cwd: '/repo' }));
+    expect(rearm).toHaveBeenCalledWith(expect.objectContaining({ pr: 2811, repo: 'web-everything/web-everything', cwd: '/repo' }));
   });
 
   it('reconcileAcceptanceAfterRebase — real restamp/rearm children never receive a literal null repo', () => {
@@ -349,8 +349,8 @@ describe('ci-red-recovery-watch — reconcileAcceptanceAfterRebase (#2811)', () 
   it('defaultReadPrLabels asks gh pr view --json labels for the exact PR, --repo included when given', () => {
     const calls = [];
     const exec = (bin, argv) => { calls.push(argv); return '{"labels":[{"name":"review:accepted"}]}'; };
-    expect(defaultReadPrLabels(2811, { exec, repo: 'chalbert/web-everything' })).toEqual([{ name: 'review:accepted' }]);
-    expect(calls[0]).toEqual(['pr', 'view', '2811', '--json', 'labels', '--repo', 'chalbert/web-everything']);
+    expect(defaultReadPrLabels(2811, { exec, repo: 'web-everything/web-everything' })).toEqual([{ name: 'review:accepted' }]);
+    expect(calls[0]).toEqual(['pr', 'view', '2811', '--json', 'labels', '--repo', 'web-everything/web-everything']);
   });
 
   it('never throws — a label-read failure reports attempted:false rather than sinking the pass', () => {
@@ -416,7 +416,7 @@ describe('ci-red-recovery-watch — formatReport', () => {
 const runningCheck = (name, startedAt, detailsUrl) => ({
   __typename: 'CheckRun', name, workflowName: 'CI', status: 'IN_PROGRESS', conclusion: '', startedAt, detailsUrl,
 });
-const RUN_URL = (job) => `https://github.com/chalbert/web-everything/actions/runs/36161558017/job/${job}`;
+const RUN_URL = (job) => `https://github.com/web-everything/web-everything/actions/runs/36161558017/job/${job}`;
 const PR_2636_HUNG = {
   number: 2636, headRefName: 'lane/batch-...-3915', headRefOid: 'deadbeef2636',
   statusCheckRollup: [runningCheck('test-shard (1)', '2026-09-25T16:34:28Z', RUN_URL('108159093983'))],
@@ -453,10 +453,10 @@ describe('ci-red-recovery-watch — cancelAndRerunHungRun', () => {
     const calls = [];
     const exec = vi.fn((file, args) => { calls.push(args); return ''; });
     const sleepSync = vi.fn();
-    const result = cancelAndRerunHungRun(36161558017, { repo: 'chalbert/web-everything', exec, sleepSync });
+    const result = cancelAndRerunHungRun(36161558017, { repo: 'web-everything/web-everything', exec, sleepSync });
     expect(result).toEqual({ ok: true, action: 'cancelled-and-rerun' });
-    expect(calls[0]).toEqual(['run', 'cancel', '36161558017', '--repo', 'chalbert/web-everything']);
-    expect(calls[1]).toEqual(['run', 'rerun', '36161558017', '--repo', 'chalbert/web-everything']);
+    expect(calls[0]).toEqual(['run', 'cancel', '36161558017', '--repo', 'web-everything/web-everything']);
+    expect(calls[1]).toEqual(['run', 'rerun', '36161558017', '--repo', 'web-everything/web-everything']);
     expect(calls[1]).not.toContain('--failed');
     expect(sleepSync).toHaveBeenCalledTimes(1);
   });
@@ -654,9 +654,9 @@ describe('ci-red-recovery-watch — cancelHungRun', () => {
   it('cancels and NEVER reruns', () => {
     const calls = [];
     const exec = vi.fn((file, args) => { calls.push(args); return ''; });
-    const result = cancelHungRun(36187480460, { repo: 'chalbert/web-everything', exec });
+    const result = cancelHungRun(36187480460, { repo: 'web-everything/web-everything', exec });
     expect(result).toEqual({ ok: true, action: 'cancelled-no-rerun' });
-    expect(calls).toEqual([['run', 'cancel', '36187480460', '--repo', 'chalbert/web-everything']]);
+    expect(calls).toEqual([['run', 'cancel', '36187480460', '--repo', 'web-everything/web-everything']]);
   });
 
   it('reports a failed cancel with the REAL error text', () => {
@@ -672,7 +672,7 @@ describe('ci-red-recovery-watch — describeExecError', () => {
   // 123" — the actual `gh` stderr (a permission error, a "run already completed" race, etc.) was silently
   // dropped. Confirmed live against #2636's own daemon log.
   it('prefers the REAL stderr over the generic "Command failed" exec message', () => {
-    const e = new Error('Command failed: gh run cancel 36187480460 --repo chalbert/web-everything');
+    const e = new Error('Command failed: gh run cancel 36187480460 --repo web-everything/web-everything');
     e.stderr = 'HttpError: Resource not accessible by integration (actions:write required)\n';
     expect(describeExecError(e)).toBe('HttpError: Resource not accessible by integration (actions:write required)');
   });
@@ -742,31 +742,31 @@ describe('ci-red-recovery-watch — formatHungReport', () => {
   });
 });
 
-// ── MISSING-CI-RUN RECOVERY (xi4od2p, #4075/#3383) — fixture is PR chalbert/web-everything#2729's REAL state ──
+// ── MISSING-CI-RUN RECOVERY (xi4od2p, #4075/#3383) — fixture is PR web-everything/web-everything#2729's REAL state ──
 describe('ci-red-recovery-watch — defaultReadRequiredContexts / defaultReadHeadCommittedAt', () => {
   it('reads the live required contexts off branch protection', () => {
     const exec = vi.fn(() => '["test","smoke","daemon-soak"]');
-    const contexts = defaultReadRequiredContexts({ repo: 'chalbert/web-everything', branch: 'main', exec });
+    const contexts = defaultReadRequiredContexts({ repo: 'web-everything/web-everything', branch: 'main', exec });
     expect(contexts).toEqual(['test', 'smoke', 'daemon-soak']);
-    expect(exec).toHaveBeenCalledWith('gh', ['api', 'repos/chalbert/web-everything/branches/main/protection', '--jq', '.required_status_checks.contexts'], expect.anything());
+    expect(exec).toHaveBeenCalledWith('gh', ['api', 'repos/web-everything/web-everything/branches/main/protection', '--jq', '.required_status_checks.contexts'], expect.anything());
   });
 
   it('returns null (unknown) on a read failure — never substitutes an invented default set (PR #2740 review)', () => {
     const exec = vi.fn(() => { throw new Error('403'); });
-    expect(defaultReadRequiredContexts({ repo: 'chalbert/web-everything', exec })).toBeNull();
+    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything', exec })).toBeNull();
   });
 
   it('returns null (unknown) when no repo is given, and preserves an explicitly EMPTY required set as []', () => {
     expect(defaultReadRequiredContexts({ repo: null, exec: vi.fn() })).toBeNull();
-    expect(defaultReadRequiredContexts({ repo: 'chalbert/web-everything', exec: vi.fn(() => '[]') })).toEqual([]);
-    expect(defaultReadRequiredContexts({ repo: 'chalbert/web-everything', exec: vi.fn(() => 'null') })).toEqual([]);
+    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything', exec: vi.fn(() => '[]') })).toEqual([]);
+    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything', exec: vi.fn(() => 'null') })).toEqual([]);
   });
 
   it('reads a head commit\'s own committed date', () => {
     const exec = vi.fn(() => '2026-09-26T14:20:26Z\n');
-    const date = defaultReadHeadCommittedAt('19889a0edecfdf25794d39a868ff48f0860c6d39', { repo: 'chalbert/web-everything', exec });
+    const date = defaultReadHeadCommittedAt('19889a0edecfdf25794d39a868ff48f0860c6d39', { repo: 'web-everything/web-everything', exec });
     expect(date).toBe('2026-09-26T14:20:26Z');
-    expect(exec).toHaveBeenCalledWith('gh', ['api', 'repos/chalbert/web-everything/commits/19889a0edecfdf25794d39a868ff48f0860c6d39', '--jq', '.commit.committer.date'], expect.anything());
+    expect(exec).toHaveBeenCalledWith('gh', ['api', 'repos/web-everything/web-everything/commits/19889a0edecfdf25794d39a868ff48f0860c6d39', '--jq', '.commit.committer.date'], expect.anything());
   });
 
   it('returns null on a missing sha/repo or a read failure, never throws', () => {
@@ -780,7 +780,7 @@ describe('ci-red-recovery-watch — defaultReadRequiredContexts / defaultReadHea
 describe('ci-red-recovery-watch — triggerCiForPr', () => {
   it('refuses incomplete targets without dispatching a workflow', () => {
     const exec = vi.fn();
-    expect(triggerCiForPr({ prNumber: 3209 }, { repo: 'chalbert/web-everything', exec }))
+    expect(triggerCiForPr({ prNumber: 3209 }, { repo: 'web-everything/web-everything', exec }))
       .toMatchObject({ ok: false, deferred: true, action: 'pull-request-push' });
     expect(exec).not.toHaveBeenCalled();
   });
@@ -789,9 +789,9 @@ describe('ci-red-recovery-watch — triggerCiForPr', () => {
 describe('ci-red-recovery-watch — clearStaleCheckingLabel', () => {
   it('removes the checking label when present', () => {
     const exec = vi.fn(() => '');
-    const cleared = clearStaleCheckingLabel(2729, { repo: 'chalbert/web-everything', exec, currentLabels: ['review:accepted', 'checking'] });
+    const cleared = clearStaleCheckingLabel(2729, { repo: 'web-everything/web-everything', exec, currentLabels: ['review:accepted', 'checking'] });
     expect(cleared).toBe(true);
-    expect(exec).toHaveBeenCalledWith('gh', ['pr', 'edit', '2729', '--remove-label', 'checking', '--repo', 'chalbert/web-everything'], expect.anything());
+    expect(exec).toHaveBeenCalledWith('gh', ['pr', 'edit', '2729', '--remove-label', 'checking', '--repo', 'web-everything/web-everything'], expect.anything());
   });
 
   it('is a no-op (never calls gh) when the label is not present', () => {
@@ -952,7 +952,7 @@ describe('ci-red-recovery-watch — sweepMissingRunRecovery (PR #2729 fixture: z
   // Review of PR #3253: a stacked or fork PR was deferred (free) every tick, so no marker ever tripped the cap.
   it('a stacked PR and a fork PR reach a bounded, recorded outcome within the cap across repeated ticks', async () => {
     const { pushMissingRunCommit } = await import('../missing-run-push.mjs');
-    const repo = 'chalbert/web-everything';
+    const repo = 'web-everything/web-everything';
     const mk = (number, sha, base, headRepo) => ({
       pr: { number, headRefName: `lane/p${number}`, baseRefName: base, headRefOid: sha, mergeable: 'MERGEABLE', statusCheckRollup: [], labels: [] },
       live: { state: 'open', mergeable: true, head: { sha, ref: `lane/p${number}`, repo: { full_name: headRepo } }, base: { ref: base } },
@@ -994,7 +994,7 @@ describe('ci-red-recovery-watch — sweepMissingRunRecovery (PR #2729 fixture: z
     expect(result.dispatch).toEqual([]);
   });
 
-  // Live incident, chalbert/web-everything#2793 (landing freeze, 2026-09-27) — real `gh pr view` shape: base
+  // Live incident, web-everything/web-everything#2793 (landing freeze, 2026-09-27) — real `gh pr view` shape: base
   // `main`, `mergeable: CONFLICTING`, `mergeStateStatus: DIRTY`, empty rollup, head sha
   // 8be3bce0e51990837b7f9c016b407ec0f1657a1c already carrying 2 prior missing-run trigger-attempt comments.
   // Before the fix this sweep triggered CI a third time (or, having already spent 2 attempts, refused

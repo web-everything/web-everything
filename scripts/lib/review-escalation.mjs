@@ -1107,7 +1107,7 @@ export function parseReviewedSha(comments) {
 }
 
 /**
- * #xconv1 (chalbert/web-everything#2766/#2767 unblock, epic #3383/#4075) — locate the COMMENT that carries the
+ * #xconv1 (web-everything/web-everything#2766/#2767 unblock, epic #3383/#4075) — locate the COMMENT that carries the
  * LATEST `reviewed-sha` marker matching a given head — the exact comment {@link parseReviewedSha} derived its
  * answer from — so a caller that needs to QUOTE the verdict, not just confirm its sha, has the comment body and
  * timestamp in hand. Mirrors `parseReviewedSha`'s own trusted-author gate (#4140) and "latest wins" rule
@@ -1263,7 +1263,7 @@ export function targetedCheckQuestion(escalation) {
     + 'the clearance.';
 }
 
-// #xconv1-evidence (chalbert/web-everything#2766/#2767 misfire, epic #3383/#4075) — the targeted-check judge
+// #xconv1-evidence (web-everything/web-everything#2766/#2767 misfire, epic #3383/#4075) — the targeted-check judge
 // answered `changes` for both PRs with NO diff evidence in front of it: `buildTargetedCheckInput` (below, in
 // `we:scripts/conveyor/convert-advisory-dispatch.mjs`) used to pass only the escalation REASON TEXT plus the
 // prior verdict, on the theory that "the reason already names the specific evidence". It names the FILE, never
@@ -1946,7 +1946,7 @@ export function shouldReparkForTestTampering({ tampered, netDiffScored, humanCle
 
 /**
  * we:scripts/lib/review-escalation.mjs#decideParkToHuman — THE AUTOMATED-ESCALATION LABEL SWAP (mutual-
- * exclusivity fix; live bug on chalbert/web-everything#2766/#2767, 2026-09-26): when the drain's own re-score
+ * exclusivity fix; live bug on web-everything/web-everything#2766/#2767, 2026-09-26): when the drain's own re-score
  * escalates a PR to `review:human` (test-gaming, manifest-tamper, …), it must not leave a prior `review:*`
  * VERDICT standing next to the new hold. #2767's actual sequence: an unattended review loop recorded
  * `review:accepted` at 21:46Z; three minutes later the anti-test-gaming gate (#2440/#xuboo0q) parked

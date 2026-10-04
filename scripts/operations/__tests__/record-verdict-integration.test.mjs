@@ -34,6 +34,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 import {
   APPLIER_WORKFLOW,
@@ -428,13 +429,24 @@ describe('which board a verdict belongs on, read off a REAL remote (#3261)', () 
    * that decides whether a verdict is refused, so a wrong answer here is a verdict pushed to the wrong
    * repo's board where the right applier will never see it (plateau-app#144's failure).
    *
-   * The fixture origin is a DIRECTORY named `<tmp>/chalbert/web-everything.git` precisely so this can be
+   * The fixture origin is a DIRECTORY named `<tmp>/web-everything/web-everything.git` precisely so this can be
    * exercised without a URL that resolves off the machine — see `helpers/real-repo.mjs`, detail (2).
    */
   it('reads owner/name off a real origin remote', async () => {
     await withBareOrigin(async (ctx) => {
       expect(defaultOriginRepo(ctx.clone)).toBe(FIXTURE_SLUG);
       expect(resolveTransportRoot({ repo: FIXTURE_SLUG, root: ctx.clone })).toBe(ctx.clone);
+    });
+  });
+
+  /** The 2026-10-03 org move left every clone/lane with `chalbert/<repo>` origins; they must read as the CURRENT
+   *  slug or every review refuses before its read step (outage). Real git, URL never fetched. */
+  it('reads a legacy chalbert/ origin as the repo\'s current slug', async () => {
+    await withBareOrigin(async (ctx) => {
+      execFileSync('git', ['remote', 'set-url', 'origin', 'git@github.com:chalbert/web-everything.git'], { cwd: ctx.clone });
+      expect(defaultOriginRepo(ctx.clone)).toBe('web-everything/web-everything');
+      execFileSync('git', ['remote', 'set-url', 'origin', 'https://github.com/chalbert/frontierui.git'], { cwd: ctx.clone });
+      expect(defaultOriginRepo(ctx.clone)).toBe('frontier-ui/frontierui');
     });
   });
 
@@ -458,7 +470,7 @@ describe('which board a verdict belongs on, read off a REAL remote (#3261)', () 
       ctx.seedOriginBranch(TRANSPORT_BRANCH);
       const tipBefore = ctx.git(['rev-parse', TRANSPORT_BRANCH], { cwd: ctx.origin }).trim();
 
-      await expect(stage(ctx, { repo: 'chalbert/plateau-app' })).rejects.toThrow(/refusing to stage a verdict for chalbert\/plateau-app on chalbert\/web-everything's transport branch/);
+      await expect(stage(ctx, { repo: 'plateauapp/plateau-app' })).rejects.toThrow(/refusing to stage a verdict for plateauapp\/plateau-app on web-everything\/web-everything's transport branch/);
 
       expect(ctx.git(['rev-parse', TRANSPORT_BRANCH], { cwd: ctx.origin }).trim()).toBe(tipBefore);
     });

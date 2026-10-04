@@ -1247,7 +1247,7 @@
           "order": 1,
           "pr": {
             "number": 123,
-            "url": "https://github.com/chalbert/web-everything/pull/123",
+            "url": "https://github.com/web-everything/web-everything/pull/123",
             "ci": "passing",
             "review": "pending"
           }
@@ -1477,7 +1477,7 @@
           "order": 1,
           "pr": {
             "number": 123,
-            "url": "https://github.com/chalbert/web-everything/pull/123",
+            "url": "https://github.com/web-everything/web-everything/pull/123",
             "ci": "failing",
             "review": null
           }
@@ -1752,7 +1752,7 @@
           "runId": "runner:job-7",
           "logicalWorkId": "we:4620",
           "parentRunId": null,
-          "repo": "chalbert/web-everything",
+          "repo": "web-everything/web-everything",
           "cardRefs": [
             "we:4620"
           ],
@@ -3381,7 +3381,7 @@
           "runId": "runner:session-0",
           "logicalWorkId": "we:4620",
           "parentRunId": null,
-          "repo": "chalbert/web-everything",
+          "repo": "web-everything/web-everything",
           "cardRefs": [
             "we:4620"
           ],
@@ -3428,7 +3428,7 @@
           "runId": "runner:session-1",
           "logicalWorkId": "plateau-app:sample",
           "parentRunId": null,
-          "repo": "chalbert/plateau-app",
+          "repo": "plateauapp/plateau-app",
           "cardRefs": [
             "plateau-app:sample"
           ],
@@ -3475,7 +3475,7 @@
           "runId": "codex:session-2",
           "logicalWorkId": null,
           "parentRunId": null,
-          "repo": "chalbert/web-everything",
+          "repo": "web-everything/web-everything",
           "cardRefs": [],
           "prRefs": [],
           "description": "Synthetic standalone observation.",
@@ -3549,7 +3549,7 @@
           "runId": "runner:session-4",
           "logicalWorkId": "we:4620",
           "parentRunId": null,
-          "repo": "chalbert/web-everything",
+          "repo": "web-everything/web-everything",
           "cardRefs": [
             "we:4620"
           ],
@@ -3596,7 +3596,7 @@
           "runId": "runner:session-5",
           "logicalWorkId": "plateau-app:sample",
           "parentRunId": null,
-          "repo": "chalbert/plateau-app",
+          "repo": "plateauapp/plateau-app",
           "cardRefs": [
             "plateau-app:sample"
           ],
@@ -3643,7 +3643,7 @@
           "runId": "runner:session-6",
           "logicalWorkId": "we:4620",
           "parentRunId": "runner:session-0",
-          "repo": "chalbert/web-everything",
+          "repo": "web-everything/web-everything",
           "cardRefs": [
             "we:4620"
           ],
@@ -3979,7 +3979,7 @@
           "runId": "runner:session-0",
           "logicalWorkId": "we:4620",
           "parentRunId": null,
-          "repo": "chalbert/web-everything",
+          "repo": "web-everything/web-everything",
           "cardRefs": [
             "we:4620"
           ],

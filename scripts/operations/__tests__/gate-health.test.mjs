@@ -117,11 +117,11 @@ describe('precondition 3 — clustered observations', () => {
 });
 
 describe('the repo input reaches the reader', () => {
-  // It was validated against the enum and then never passed, so `--repo=chalbert/frontierui` was accepted and
+  // It was validated against the enum and then never passed, so `--repo=frontier-ui/frontierui` was accepted and
   // answered with web-everything's history — a wrong answer wearing the right label.
   it('a request for another repo is refused, not silently answered with this one', () => {
-    const reader = createHistoryReader({ repo: 'chalbert/web-everything', classify: classifyFollowUp });
-    expect(() => reader({ repo: 'chalbert/frontierui' })).toThrow(/bound to chalbert\/web-everything/);
+    const reader = createHistoryReader({ repo: 'web-everything/web-everything', classify: classifyFollowUp });
+    expect(() => reader({ repo: 'frontier-ui/frontierui' })).toThrow(/bound to web-everything\/web-everything/);
   });
 
   it('the declaration passes `repo` through', () => {
@@ -131,8 +131,8 @@ describe('the repo input reaches the reader', () => {
     });
     const registry = createRegistry();
     registry.register(declaration);
-    advanceWhileRunning(startRun({ op: GATE_HEALTH_OP, id: 'r-repo', input: { repo: 'chalbert/frontierui' }, registry }), { registry });
-    expect(seen).toBe('chalbert/frontierui');
+    advanceWhileRunning(startRun({ op: GATE_HEALTH_OP, id: 'r-repo', input: { repo: 'frontier-ui/frontierui' }, registry }), { registry });
+    expect(seen).toBe('frontier-ui/frontierui');
   });
 });
 
@@ -700,7 +700,7 @@ describe('joinHistory', () => {
 });
 
 describe('the declaration', () => {
-  const history = { repo: 'chalbert/web-everything', nowSec: NOW, records: [pr(1, 10, true, null, 60)], unmeasurable: 2, hotFiles: ['x'] };
+  const history = { repo: 'web-everything/web-everything', nowSec: NOW, records: [pr(1, 10, true, null, 60)], unmeasurable: 2, hotFiles: ['x'] };
 
   it('is read-only and GET-shaped — both steps are `compute`', () => {
     expect(isReadOnlyDeclaration(runGateHealth({}, history).declaration)).toBe(true);

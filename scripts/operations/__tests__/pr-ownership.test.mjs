@@ -106,7 +106,7 @@ describe('pr-ownership — one fixture per live shape, through the real reconcil
     const r = reader();
     await invoke(r.read);
     expect(r.reconcile).toHaveBeenCalledTimes(1);
-    expect(r.reconcile.mock.calls[0][0]).toMatchObject({ repo: 'chalbert/web-everything', now: NOW });
+    expect(r.reconcile.mock.calls[0][0]).toMatchObject({ repo: 'web-everything/web-everything', now: NOW });
     expect(r.readAgents).toHaveBeenCalledTimes(1);
     expect(r.run.mock.calls[0][1]).toContain('--repo=/fixture');
   });

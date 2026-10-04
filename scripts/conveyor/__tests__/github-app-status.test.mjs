@@ -45,11 +45,11 @@ describe('formatGithubAppStatus — pure, given a status record or null', () => 
       applied: false,
       reason: 'insufficient-access',
       missingPermissions: ['metadata:read', 'pull_requests:write'],
-      missingRepos: ['chalbert/web-everything', 'chalbert/plateau-app'],
+      missingRepos: ['web-everything/web-everything', 'plateauapp/plateau-app'],
       checkedAt: '2026-09-23T13:51:32.000Z',
     });
     expect(out).toContain('grant repository permissions: metadata:read, pull_requests:write');
-    expect(out).toContain('add repositories to the installation: chalbert/web-everything, chalbert/plateau-app');
+    expect(out).toContain('add repositories to the installation: web-everything/web-everything, plateauapp/plateau-app');
   });
 
   it('insufficient-access with only one of the two gaps omits the other line entirely', () => {

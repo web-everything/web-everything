@@ -1,5 +1,5 @@
 {
-  "_note": "#4351 shape-equivalence pair, captured live 2026-09-29 for the SAME three PRs (merged/open/closed): `rest` from `gh api repos/chalbert/web-everything/pulls?state=all` (trimmed to the fields a converted reader uses + a few it ignores), `graphql` from the same pullRequests connection gh pr list --json number,state,title,headRefName,body reads. Bodies cut to 300 chars on BOTH sides.",
+  "_note": "#4351 shape-equivalence pair, captured live 2026-09-29 for the SAME three PRs (merged/open/closed): `rest` from `gh api repos/web-everything/web-everything/pulls?state=all` (trimmed to the fields a converted reader uses + a few it ignores), `graphql` from the same pullRequests connection gh pr list --json number,state,title,headRefName,body reads. Bodies cut to 300 chars on BOTH sides.",
   "rest": [
     {
       "number": 2895,
@@ -21,7 +21,7 @@
       "number": 2894,
       "state": "open",
       "title": "WE #4358: fix the review<->ci-heal deadlock (stale rerun + escalation outcome)",
-      "body": "## Live deadlock this closes\n\nPR #2878 (chalbert/web-everything, WE #4358, `review:pending`, idle since 2026-09-29 00:32Z):\n\n1. Its only red check was `review-gate`, red *because* the PR is `review:pending` (all CI — test, shards,\n   soak, smoke — was green).\n2. The fix/ci-heal daemon nonetheless di",
+      "body": "## Live deadlock this closes\n\nPR #2878 (web-everything/web-everything, WE #4358, `review:pending`, idle since 2026-09-29 00:32Z):\n\n1. Its only red check was `review-gate`, red *because* the PR is `review:pending` (all CI — test, shards,\n   soak, smoke — was green).\n2. The fix/ci-heal daemon nonetheless di",
       "draft": false,
       "merged_at": null,
       "closed_at": null,
@@ -63,7 +63,7 @@
       "state": "OPEN",
       "title": "WE #4358: fix the review<->ci-heal deadlock (stale rerun + escalation outcome)",
       "headRefName": "lane/fix-review-ciheal-deadlock",
-      "body": "## Live deadlock this closes\n\nPR #2878 (chalbert/web-everything, WE #4358, `review:pending`, idle since 2026-09-29 00:32Z):\n\n1. Its only red check was `review-gate`, red *because* the PR is `review:pending` (all CI — test, shards,\n   soak, smoke — was green).\n2. The fix/ci-heal daemon nonetheless di"
+      "body": "## Live deadlock this closes\n\nPR #2878 (web-everything/web-everything, WE #4358, `review:pending`, idle since 2026-09-29 00:32Z):\n\n1. Its only red check was `review-gate`, red *because* the PR is `review:pending` (all CI — test, shards,\n   soak, smoke — was green).\n2. The fix/ci-heal daemon nonetheless di"
     },
     {
       "number": 2889,

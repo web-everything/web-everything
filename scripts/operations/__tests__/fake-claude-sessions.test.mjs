@@ -57,7 +57,7 @@ function ctxFor(instance, completionsDir) {
   return {
     claude: instance,
     gh: null,
-    repoFor: () => ({ slug: 'chalbert/web-everything', originPath: '' }),
+    repoFor: () => ({ slug: 'web-everything/web-everything', originPath: '' }),
     simClone: process.cwd(),
     env: envFor(instance),
     completionsDir,

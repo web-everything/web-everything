@@ -49,12 +49,38 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # #5000: never cancel a run on main. A merge every few minutes cancelled 85 of 100 main runs (2026-10-03),
+  # hiding main's red/green for hours. PR branches still cancel superseded runs.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
 
 jobs:
+  # CARD-ONLY LIGHT PATH (actions-queue-relief, 2026-10-03). A PR that changes only `backlog/**` runs the
+  # `test` job's `check:standards` (the backlog/card guards) but NOT the unit shards, coverage merge,
+  # integration suite, docs build or Playwright lane. Detection is `scripts/ci-card-only.mjs` (tested):
+  # light ONLY for a `pull_request` whose every changed path is under `backlog/`; a push to main, a manual
+  # dispatch, an empty diff, or any other path is the full suite. Fail closed: if this job fails, `light` is
+  # empty (not 'true'), and `test` / `smoke` below fail on `needs.changes.result != 'success'`.
+  #
+  # REQUIRED CHECKS STILL REPORT FROM REAL RUNNING JOBS: `test` and `smoke` keep running as jobs (they do
+  # the light work or a one-line pass) instead of being job-level skipped, because a SKIPPED required check
+  # reads `skipped`, which the drain's `reviewCiGate` (scripts/lib/review-ci-gate.mjs) does NOT treat as
+  # success. `daemon-soak` already finishes in seconds when no daemon code is touched (a card-only PR never is).
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      light: ${{ steps.detect.outputs.light }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Is this a card-only PR?
+        id: detect
+        run: node scripts/ci-card-only.mjs --event='${{ github.event_name }}' --base='${{ github.event.pull_request.base.sha }}' --head=HEAD >> "$GITHUB_OUTPUT"
+
   # Sharded unit suite (#2682). The 2000+ vitest suite runs split across N parallel runners
   # (`vitest run --shard=i/N`) to cut the `test` gate's wall-clock. Each shard runs WITH coverage but
   # with its per-shard thresholds disabled (`test:coverage:shard`) — a single shard exercises only
@@ -63,6 +89,8 @@ jobs:
   # result, so the split changes only WHERE tests run, never WHETHER coverage gates. Sharding is by test
   # FILE, so every file (incl. the poolMatchGlobs singleFork one) lands in exactly one shard.
   test-shard:
+    needs: changes
+    if: ${{ needs.changes.outputs.light != 'true' }}
     runs-on: ubuntu-latest
     # xd1sfms (#4075/#3383) — LIVE 2026-09-25: PR #2636's `test-shard (1)` (run 36161558017) hung
     # `in_progress` 3h+ while its 3 sibling shards finished in ~90-260s; with no `timeout-minutes` set,
@@ -97,11 +125,21 @@ jobs:
         with:
           path: web-everything
           fetch-depth: 0 # tests that shell check-standards need origin/main history for the backlog scope guards
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
       - name: Checkout FUI (sibling)
         uses: actions/checkout@v4
         with:
-          repository: chalbert/frontierui
-          token: ${{ secrets.FUI_READ_TOKEN }}
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
       - uses: actions/setup-node@v4
@@ -149,7 +187,7 @@ jobs:
   # mis-read by branch protection as satisfied, which would let a broken shard merge green. Failing
   # explicitly makes `test` a real red instead.
   test:
-    needs: test-shard
+    needs: [changes, test-shard]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     # xd1sfms (#4075/#3383) — same measurement pass as `test-shard` above: 15 successful runs sampled
@@ -159,6 +197,14 @@ jobs:
     steps:
       - name: Gate on shard results
         run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "changes (card-only detection) did not succeed (result: ${{ needs.changes.result }}) - failing closed."
+            exit 1
+          fi
+          if [ "${{ needs.changes.outputs.light }}" = "true" ]; then
+            echo "Card-only PR: unit shards intentionally not run; running check:standards only."
+            exit 0
+          fi
           if [ "${{ needs.test-shard.result }}" != "success" ]; then
             echo "One or more test shards did not succeed (test-shard result: ${{ needs.test-shard.result }})."
             exit 1
@@ -170,11 +216,21 @@ jobs:
         with:
           path: web-everything
           fetch-depth: 0 # backlog scope guards compare the PR against origin/main
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
       - name: Checkout FUI (sibling)
         uses: actions/checkout@v4
         with:
-          repository: chalbert/frontierui
-          token: ${{ secrets.FUI_READ_TOKEN }}
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
       - uses: actions/setup-node@v4
@@ -198,6 +254,7 @@ jobs:
       # Each shard artifact lands in its own subdir (no merge-multiple), so coverage-final.json names
       # don't collide; the merge script walks the tree recursively.
       - name: Download shard coverage
+        if: ${{ needs.changes.outputs.light != 'true' }}
         uses: actions/download-artifact@v4
         with:
           path: web-everything/coverage-shards
@@ -207,6 +264,7 @@ jobs:
       # --expect=N must equal the matrix shard count above — it fails loud if a shard's report is
       # missing, so a dropped shard can never under-count coverage into a false green.
       - name: Merge coverage + enforce 80% bar (#2082)
+        if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: web-everything
         run: npm run coverage:merge -- coverage-shards --threshold=80 --expect=4
 
@@ -219,6 +277,7 @@ jobs:
       # `npm test`) no longer pays real git/subprocess cost per lane. Runs here so the required `test` gate
       # still verifies these on every push before merge — only the LOCAL per-lane cost dropped.
       - name: Real-git integration suite (lane-pool, operations transport)
+        if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: web-everything
         run: npm run test:integration:vitest
 
@@ -357,27 +416,51 @@ jobs:
   # GitHub jobs don't share a workspace; that duplicated setup runs concurrently with `test`, so it costs
   # runner-minutes, not wall-clock. The `visual` job (below, disabled) already duplicates the same setup.
   smoke:
+    needs: changes
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     # xd1sfms (#4075/#3383) — same measurement pass: 15 successful runs sampled 2026-09-25 gave this job
     # (docs build + Playwright install + the interaction lane) min=129s max=146s p50=135s p95=146s —
     # 3x146s≈7.3min, rounded up to 10min.
     timeout-minutes: 10
     steps:
+      - name: Gate on card-only detection
+        run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "changes (card-only detection) did not succeed (result: ${{ needs.changes.result }}) - failing closed."
+            exit 1
+          fi
+          if [ "${{ needs.changes.outputs.light }}" = "true" ]; then
+            echo "Card-only PR: docs build + interaction lane intentionally not run."
+          fi
       # Same sibling layout as `test` / deploy.yml — WE's `build:docs` shells out to FUI's render CLI.
       #   $GITHUB_WORKSPACE/web-everything  (this repo)
       #   $GITHUB_WORKSPACE/frontierui      (the tool sibling)
       - name: Checkout WE
+        if: ${{ needs.changes.outputs.light != 'true' }}
         uses: actions/checkout@v4
         with:
           path: web-everything
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
       - name: Checkout FUI (sibling)
+        if: ${{ needs.changes.outputs.light != 'true' }}
         uses: actions/checkout@v4
         with:
-          repository: chalbert/frontierui
-          token: ${{ secrets.FUI_READ_TOKEN }}
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
       - uses: actions/setup-node@v4
+        if: ${{ needs.changes.outputs.light != 'true' }}
         with:
           node-version: 22
           cache: npm
@@ -388,12 +471,14 @@ jobs:
       # FUI first (ratified #1946/#2016 ordering): the `@frontierui/*` alias resolves to sibling source and
       # `build:docs` calls the pinned component-render CLI produced by build:tools.
       - name: Install + build FUI tools
+        if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: frontierui
         run: |
           npm ci
           npm run build:tools
 
       - name: Install
+        if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: web-everything
         run: npm ci
 
@@ -401,6 +486,7 @@ jobs:
       # gated CI a broken docs build (e.g. the #2184 transforms.cjs mis-wire) merged green and silently
       # broke the deploy. FUI's render CLI is already built above, so this needs no extra setup; ~25s.
       - name: Build WE docs (deploy smoke)
+        if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: web-everything
         run: npm run build:docs
 
@@ -409,10 +495,12 @@ jobs:
       # (apt system libs) still runs each time — those aren't cacheable across runners — but the browser
       # download, the bulk of the cost, is served from cache on a hit.
       - name: Resolve Playwright version
+        if: ${{ needs.changes.outputs.light != 'true' }}
         id: pw
         working-directory: web-everything
         run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
       - name: Cache Playwright browsers
+        if: ${{ needs.changes.outputs.light != 'true' }}
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
@@ -422,10 +510,12 @@ jobs:
       # over a fixed fixture page served by tests/interaction/serve.mjs. WE_INTERACTION_ONLY skips the app
       # dev-server webServer entry (see playwright.config.ts) so no build/live-data is needed.
       - name: Install Playwright chromium
+        if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: web-everything
         run: npx playwright install --with-deps chromium
 
       - name: Interaction lane
+        if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: web-everything
         run: npm run test:interaction
         env:
@@ -462,11 +552,21 @@ jobs:
         with:
           path: web-everything
           fetch-depth: 0
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
       - name: Checkout FUI (sibling)
         uses: actions/checkout@v4
         with:
-          repository: chalbert/frontierui
-          token: ${{ secrets.FUI_READ_TOKEN }}
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
       - uses: actions/setup-node@v4
@@ -576,11 +676,21 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: web-everything
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
       - name: Checkout FUI (sibling)
         uses: actions/checkout@v4
         with:
-          repository: chalbert/frontierui
-          token: ${{ secrets.FUI_READ_TOKEN }}
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
       - uses: actions/setup-node@v4

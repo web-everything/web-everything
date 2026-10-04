@@ -181,7 +181,7 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
     const result = countOpenPrsForRepo('we', { exec, env: {} });
-    expect(result).toEqual({ repoKey: 'we', slug: 'chalbert/web-everything', count: 1, prNumbers: [1], limit: 15, unavailable: false, unresolved: 0, apiFetches: 2 });
+    expect(result).toEqual({ repoKey: 'we', slug: 'web-everything/web-everything', count: 1, prNumbers: [1], limit: 15, unavailable: false, unresolved: 0, apiFetches: 2 });
     // Exactly one list call + one commits call per NOT-accepted PR (#2 is skipped — already accepted).
     expect(calls.filter((a) => a[1] === 'list')).toHaveLength(1);
     expect(calls.filter((a) => a[0] === 'api' && a[1] === 'graphql')).toHaveLength(2);
@@ -314,7 +314,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     expect(spent).toEqual([3, 3, 1, 0]);
     for (const number of [1, 2, 3]) {
       expect(h.calls.filter((args) => args.includes(`number=${number}`))).toHaveLength(1);
-      expect(createAuthorshipCache({ path }).get(`chalbert/web-everything#${number}@oid${number}`)).toEqual({ failedAt: now });
+      expect(createAuthorshipCache({ path }).get(`web-everything/web-everything#${number}@oid${number}`)).toEqual({ failedAt: now });
     }
   });
 
@@ -328,7 +328,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
       const r = countOpenPrsForDispatch('we', { ...h, authorshipCache, now: now + offset });
       expect(h.graphql()).toBe(expected);
       expect(r).toMatchObject({ count: 0, unresolved: 1, apiFetches: expected });
-      expect(authorshipCache.get('chalbert/web-everything#1@oid1')).toEqual({ failedAt: now + (expected ? offset : 0) });
+      expect(authorshipCache.get('web-everything/web-everything#1@oid1')).toEqual({ failedAt: now + (expected ? offset : 0) });
     }
   });
 
@@ -337,7 +337,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     const authorshipCache = tmpCache();
     const o = { ...h, authorshipCache, now: 1_000_000 };
     expect(countOpenPrsForRepo('we', { ...o, maxApiFetches: 2 })).toMatchObject({ count: 2, unresolved: 4 });
-    for (const number of [3, 4, 5, 6]) expect(authorshipCache.get(`chalbert/web-everything#${number}@oid${number}`)).toBeUndefined();
+    for (const number of [3, 4, 5, 6]) expect(authorshipCache.get(`web-everything/web-everything#${number}@oid${number}`)).toBeUndefined();
     h.calls.length = 0;
     expect(countOpenPrsForRepo('we', { ...o, maxApiFetches: Infinity })).toMatchObject({ count: 6, unresolved: 0 });
     expect(h.graphql()).toBe(4);
@@ -352,8 +352,8 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     h.calls.length = 0;
     countOpenPrsForDispatch('we', { ...h, authorshipCache, now: 1_001_000 });
     expect(h.graphql()).toBe(1);
-    expect(authorshipCache.get('chalbert/web-everything#1@oid1')).toBeUndefined();
-    expect(authorshipCache.get('chalbert/web-everything#1@moved')).toEqual({ failedAt: 1_001_000 });
+    expect(authorshipCache.get('web-everything/web-everything#1@oid1')).toBeUndefined();
+    expect(authorshipCache.get('web-everything/web-everything#1@moved')).toEqual({ failedAt: 1_001_000 });
   });
 
   it('local git can resolve a PR during its failure cooldown', () => {
@@ -364,7 +364,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     open[0].baseRefName = 'main';
     h.calls.length = 0;
     const git = (_command, args) => {
-      if (args[0] === 'remote') return 'https://github.com/chalbert/web-everything.git';
+      if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git';
       if (args[0] === 'check-ref-format') return '';
       if (args[0] === 'rev-parse') return args[1] === '--is-shallow-repository' ? 'false' : 'oid1';
       if (args[0] === 'log') return ['oid1', 'Claude', 'noreply@anthropic.com', 'Implement feature', '', ''].join('\0');
@@ -372,14 +372,14 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     };
     expect(countOpenPrsForDispatch('we', { ...h, git, authorshipCache, now: 1_001_000 })).toMatchObject({ count: 1, unresolved: 0, apiFetches: 0, fallback: false });
     expect(h.graphql()).toBe(0);
-    expect(authorshipCache.get('chalbert/web-everything#1@oid1')).toBe(true);
+    expect(authorshipCache.get('web-everything/web-everything#1@oid1')).toBe(true);
   });
 
   it('local-only unresolved PRs are not negative-cached', () => {
     const h = harness(rows(1));
     const authorshipCache = tmpCache();
     expect(countOpenPrsForRepo('we', { ...h, authorshipCache, localOnly: true, now: 1_000_000 })).toMatchObject({ unresolved: 1, apiFetches: 0 });
-    expect(authorshipCache.get('chalbert/web-everything#1@oid1')).toBeUndefined();
+    expect(authorshipCache.get('web-everything/web-everything#1@oid1')).toBeUndefined();
     expect(h.graphql()).toBe(0);
     expect(countOpenPrsForRepo('we', { ...h, authorshipCache, now: 1_001_000 })).toMatchObject({ count: 1, unresolved: 0, apiFetches: 1 });
   });

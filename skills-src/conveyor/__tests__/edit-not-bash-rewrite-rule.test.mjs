@@ -5,7 +5,7 @@
  *   otherwise-clear repair is denied by a permission/tool-use guard reports `blocked-on-infra` rather than
  *   standing down.
  *
- *   Live incident, 2026-09-23 (PR #2518, `chalbert/web-everything`, fix session `fix-2518`): a `python3`
+ *   Live incident, 2026-09-23 (PR #2518, `web-everything/web-everything`, fix session `fix-2518`): a `python3`
  *   heredoc rewriting `backlog/3945-telemetry-ask-source.md` inside an already-acquired lane clone was denied
  *   — "Permission for this action was denied by the Claude Code auto mode classifier. Reason: [Modify Shared
  *   Resources]." — even though Bash itself was fully permitted in that lane, and even though the reviewer's

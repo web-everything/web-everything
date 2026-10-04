@@ -201,3 +201,23 @@ describe('session names and new provenance fields', () => {
     }
   });
 });
+
+it('#3996 preserves plan size provenance for a planned build', () => {
+  const dispatch = { kind: 'build', cause: 'planned', scopePaths: ['scripts/a.mjs'], sizeSource: 'plan' };
+  expect(c.decideDispatchRoute({ ...dispatch, estimatedLoc: 42 })).toMatchObject({ sizeSource: 'plan', sized: true, estimatedLoc: 42 });
+  expect(c.decideDispatchRoute({ ...dispatch, size: 2 })).toMatchObject({ sizeSource: 'plan', sized: true, estimatedLoc: 80 });
+  for (const extra of [{}, { size: 4 }, { estimatedLoc: 0 }, { estimatedLoc: -1 }, { estimatedLoc: '42' }]) {
+    expect(c.decideDispatchRoute({ ...dispatch, ...extra }).outcome).toBe('refused');
+  }
+});
+
+// The planner only ever emits planned `build` tasks (`dispatch-supervisor-contract.mjs#buildTasks`). A caller-supplied
+// `sizeSource: 'plan'` on a repair kind would otherwise skip `resolveFixSize` and turn a repair that defaults to the
+// largest band into a small, in-envelope one.
+it.each([
+  ['fix', 'planned'], ['ci-heal', 'planned'], ['fix', 'conflict'], ['ci-heal', 'ci-failure'], ['build', 'conflict'], ['build', 'review-finding'],
+])('#3996 refuses a caller-supplied plan size for %s / %s', (kind, cause) => {
+  const routed = c.decideDispatchRoute({ kind, cause, scopePaths: ['scripts/a.mjs'], sizeSource: 'plan', estimatedLoc: 1 });
+  expect(routed).toMatchObject({ outcome: 'refused', sized: null, sizeSource: null });
+  expect(routed.refusal).toMatch(/plan/);
+});

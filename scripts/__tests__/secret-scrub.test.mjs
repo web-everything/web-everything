@@ -86,7 +86,7 @@ describe('scrubPublish — PASSES ordinary, correct backlog/memory prose', () =>
   pass('a screaming-snake identifier', 'The REGISTRY_SCRIPT_TYPE constant and pullRefreshThresholdPx knob.');
   pass('a localhost address', 'the worker forwards frames to 127.0.0.1:<port>/bridge on the host');
   pass('a machine-account email and a test-vector placeholder',
-    'origin is `git@github.com:chalbert/web-everything.git`; the vector sets the email field to a@b.com');
+    'origin is `git@github.com:web-everything/web-everything.git`; the vector sets the email field to a@b.com');
   pass('a plain generalized sentence', 'the lane gate is too coarse for docs-only diffs');
 });
 

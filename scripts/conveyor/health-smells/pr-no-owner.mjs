@@ -1,6 +1,6 @@
 /**
  * @file scripts/conveyor/health-smells/pr-no-owner.mjs
- * @description Landing-freeze fix, chalbert/web-everything#2793 (2026-09-27) — a PR with NO live session, whose
+ * @description Landing-freeze fix, web-everything/web-everything#2793 (2026-09-27) — a PR with NO live session, whose
  * fix-dispatch daemon's OWN planner keeps refusing it with a reason that means "someone else owns this"
  * (`reconcile-refused owed-elsewhere` — `reconcile-core.mjs`'s `OWED_ELSEWHERE.conflicted` — or
  * `refused missing-run-cap-exhausted` — `ci-red-recovery-watch.mjs`'s missing-run pass giving up and handing off

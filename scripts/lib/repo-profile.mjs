@@ -86,7 +86,7 @@ function resolveProfileKey(input) {
 /**
  * The ONE per-repo profile — key, slug, slugTag, the expanded checkout path, what `lane-pool.mjs --repo=`
  * expects, every backlog-scope/locus prefix that means this repo, the dominant one to WRITE, and today's
- * capabilities. Accepts a repo key (`we`/`frontierui`/`plateau-app`), a gh slug (`chalbert/plateau-app`), a
+ * capabilities. Accepts a repo key (`we`/`frontierui`/`plateau-app`), a gh slug (`plateauapp/plateau-app`), a
  * slug tag (`fui`/`pa`), or a scope prefix (`we`/`fui`/`frontierui`/`plateau`/`plateau-app`), with or without a
  * trailing `:`. Returns `null` for anything unrecognized — NEVER throws. Frozen. PURE given `home`.
  *

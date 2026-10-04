@@ -189,7 +189,7 @@ const MIXED_BAR_ANSWER = {
 
 const cannedJudge = (answer) => () => async () => judgeOutcome(answer, {});
 
-const BASE_ARGV = ['--pr=1234', '--repo=chalbert/web-everything'];
+const BASE_ARGV = ['--pr=1234', '--repo=web-everything/web-everything'];
 
 describe('runReviewLoopOnce — the loop field (converged/in-progress/exhausted/escalated) survives --json on EVERY stop', () => {
   it('on a mechanically-accepted stop, --json carries run.verdict.loop unmodified, no queue fields at all — #3434', async () => {
@@ -270,7 +270,7 @@ describe('review-loop-cli.mjs --json stdout purity — the notice effect must no
     const { out, stdoutChunks, stderrChunks, combinedStdout } = await runCapturingStdio(sinksWithRealNotice(true));
     expect(out.code).toBe(0);
     // The notice really did fire — on stderr, never stdout — or this test would prove nothing.
-    expect(stderrChunks.join('')).toMatch(/^PR chalbert\/web-everything#1234 — human review accepted/);
+    expect(stderrChunks.join('')).toMatch(/^PR web-everything\/web-everything#1234 — human review accepted/);
     expect(stdoutChunks).toEqual([]);
     expect(() => JSON.parse(combinedStdout)).not.toThrow();
     expect(JSON.parse(combinedStdout).verdict.loop.outcome).toBe('converged');
@@ -346,7 +346,7 @@ describe('runReviewLoopOnce — property 2: findings BOUNCE unattended, and the 
 describe('runReviewLoopOnce — property 4, MECHANIZED (#2749 fix, 2026-09-26 scope ruling): prevention-outstanding '
   + 'files the owed guard(s) as ONE real backlog card through file-item, then auto-resumes to accept — NEVER '
   + 'surfaced to a human', () => {
-  // #2749 — chalbert/web-everything#2749 reduced to `prevention-outstanding` (both mandatory lenses, correctness
+  // #2749 — web-everything/web-everything#2749 reduced to `prevention-outstanding` (both mandatory lenses, correctness
   // and security, CONFIRMED real unfixed defects: a daemon-clone guard bypassable via LANE_GUARD_OFF=1, a
   // chained `git -C` hole, a non-realpathed symlink write hole) and was mechanically recorded `review:accepted`
   // and merged anyway — directly contradicting the verdict's own rendered text, "🚩 prevention outstanding —
@@ -378,7 +378,7 @@ describe('runReviewLoopOnce — property 4, MECHANIZED (#2749 fix, 2026-09-26 sc
     // The SAME effect application a clean accept gets — a label swap to accepted.
     expect(seen.map((s) => s.type)).toContain(REVIEW_EFFECTS.LABEL);
     expect(fileItemCalls).toHaveLength(1);
-    expect(fileItemCalls[0].title).toContain('chalbert/web-everything#1234');
+    expect(fileItemCalls[0].title).toContain('web-everything/web-everything#1234');
     expect(fileItemCalls[0].scope).toContain(`we:${NET_PATHS[0]}`);
     expect(fileItemCalls[0].queue).toBe('true');
     expect(out.lines.join('\n')).toMatch(/prevention guard\(s\) filed mechanically — backlog\/9001-file-the-guard\.md \(#9001\)/);
@@ -803,7 +803,7 @@ describe('runReviewLoopOnce — a retry after an effect-halted mechanized accept
 
 describe('buildFileItemArgv — the production `file-item` binding\'s argv, pinned against the REAL declaration (PR #2766 advisory)', () => {
   const input = buildPreventionFilingInput({
-    repo: 'chalbert/web-everything', pr: 1234, parent: '4075',
+    repo: 'web-everything/web-everything', pr: 1234, parent: '4075',
     findings: [{ file: NET_PATHS[0], line: 7, prevention: 'add a lint rule', preventionCaptured: false }],
   });
 
@@ -1004,7 +1004,7 @@ describe('fileItemForPrevention — the production `fileItem` binding (#2749)', 
 describe('fileItemForPreventionViaLandingJob — routes through the shared detached landing job (#4493), never '
   + 'file-item in-process', () => {
   const input = {
-    title: 'chalbert/web-everything#1234', kind: 'story', size: '3', digest: 'd', scope: 'we:a.mjs', parent: '',
+    title: 'web-everything/web-everything#1234', kind: 'story', size: '3', digest: 'd', scope: 'we:a.mjs', parent: '',
     queue: 'true',
   };
 

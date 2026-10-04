@@ -255,9 +255,9 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
     });
     const report = JSON.parse(out);
     expect(report.wouldStop).toEqual([{ id: 'review1', sessionId: 'review-1-full-uuid', name: 'review-1862', reason: 'ground-truth-pr:pr#1862:merged' }]);
-    // `gh pr view 1862 --repo chalbert/web-everything --json state,mergedAt` was the ONE real gh call this pass made — the review-1871 shape
+    // `gh pr view 1862 --repo web-everything/web-everything --json state,mergedAt` was the ONE real gh call this pass made — the review-1871 shape
     // (an unrelated open PR) never happens to be in this listing, so there is nothing else to bound here.
-    expect(readFileSync(ghArgvFile, 'utf8').trim()).toBe('pr view 1862 --repo chalbert/web-everything --json state,mergedAt');
+    expect(readFileSync(ghArgvFile, 'utf8').trim()).toBe('pr view 1862 --repo web-everything/web-everything --json state,mergedAt');
   }, EXEC_TIMEOUT_MS);
 
   it('a `working` review-<PR> session whose PR is still open (the review-1871 shape) is kept, not reaped', () => {
@@ -324,9 +324,9 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
     });
     const report = JSON.parse(out);
     expect(report.wouldStop).toEqual([{ id: 'review1', sessionId: 'review-1-full-uuid', name: 'review-1862', reason: 'ground-truth-pr:pr#1862:merged' }]);
-    // `gh pr view 1862 --repo chalbert/web-everything --json state,mergedAt` was the ONE real gh call this pass made — the review-1871 shape
+    // `gh pr view 1862 --repo web-everything/web-everything --json state,mergedAt` was the ONE real gh call this pass made — the review-1871 shape
     // (an unrelated open PR) never happens to be in this listing, so there is nothing else to bound here.
-    expect(readFileSync(ghArgvFile, 'utf8').trim()).toBe('pr view 1862 --repo chalbert/web-everything --json state,mergedAt');
+    expect(readFileSync(ghArgvFile, 'utf8').trim()).toBe('pr view 1862 --repo web-everything/web-everything --json state,mergedAt');
   }, EXEC_TIMEOUT_MS);
 
   it('a `working` review-<PR> session whose PR is still open (the review-1871 shape) is kept, not reaped', () => {

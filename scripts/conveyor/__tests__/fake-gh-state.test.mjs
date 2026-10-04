@@ -59,12 +59,12 @@ function seedBranchAt(originPath, branch, atRef = DEFAULT_BRANCH) {
 function makeGithub(originPath, opts = {}) {
   const root = mkdtempSync(join(tmpdir(), 'fake-gh-store-'));
   cleanups.push(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
-  const gh = createFakeGithub({ root, repos: [{ slug: 'chalbert/web-everything', originPath, defaultBranch: DEFAULT_BRANCH, ...opts }] });
+  const gh = createFakeGithub({ root, repos: [{ slug: 'web-everything/web-everything', originPath, defaultBranch: DEFAULT_BRANCH, ...opts }] });
   cleanups.push(gh.cleanup);
   return gh;
 }
 
-const SLUG = 'chalbert/web-everything';
+const SLUG = 'web-everything/web-everything';
 
 function ghExec(gh, args, cwd) {
   return execFileSync('gh', args, { cwd, encoding: 'utf8', env: { ...process.env, ...gh.env }, stdio: ['ignore', 'pipe', 'pipe'] });

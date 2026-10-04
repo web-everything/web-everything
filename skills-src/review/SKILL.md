@@ -289,7 +289,7 @@ GitHub's transient `mergeable: UNKNOWN` is re-polled and, if it never settles, r
 On a host without `gh`, that automatic post can halt as UNKNOWN. Follow the VM write-path section above to
 verify the outcome and, if missing, publish a labelled verbatim transcription before resuming.
 
-## A superseded verdict is CONVERTED, never re-reviewed (#xconv1, chalbert/web-everything#2766/#2767 unblock)
+## A superseded verdict is CONVERTED, never re-reviewed (#xconv1, web-everything/web-everything#2766/#2767 unblock)
 
 A `review:human` PR whose CURRENT head already completed an independent jury review — then got escalated by a
 LATER event on that SAME head (the drain's test-gaming/manifest-tamper park, or the #2773 mutual-exclusivity

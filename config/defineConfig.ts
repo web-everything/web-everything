@@ -84,6 +84,22 @@ export type CodegenSoTFlavorName = string; // owned by #798 (codegen source-of-t
 export type WindowedCollectionFlavorName = string; // owned by #2523 (list-virtualization strategy axis).
 
 /**
+ * What stands in when the cross-provider review/judge seat cannot sit (decision xb1e9nj, ruled 2026-10-03).
+ * `park-now` parks for a human at once; `wait-then-park` (the platform default) waits for the provider's
+ * hold to lift up to `waitTimeoutMs`, then parks; `same-provider-other-model` lets a different model from the
+ * same provider count as independent (explicit opt-in only, never the default).
+ */
+export type CrossProviderFallbackPolicy = 'park-now' | 'wait-then-park' | 'same-provider-other-model';
+export type CrossProviderFallbackFlavorName = CrossProviderFallbackPolicy;
+
+/** The inline value shape of the `crossProviderFallback` dimension. */
+export interface CrossProviderFallbackValue {
+  policy: CrossProviderFallbackPolicy;
+  /** How long `wait-then-park` waits for the seat before parking for a human, in milliseconds. */
+  waitTimeoutMs: number;
+}
+
+/**
  * The root author surface. One key per dimension; the four known dimensions are typed to their own
  * flavor-id union (the compiler invariant). The index signature keeps the surface **open** — new
  * dimensions are added without a schema change (`config-extends-platform-default` is open-set).
@@ -106,6 +122,12 @@ export interface WebEverythingConfig {
    * (`we:src/_data/intents/windowed-collection.json`). Resolved per project via `config-extends-platform-default`.
    */
   windowedCollection?: DimensionEntry<WindowedCollectionFlavorName>;
+  /**
+   * Cross-provider seat fallback dimension (xb1e9nj) — what stands in when the Codex review seat (and, per
+   * xud2hha, the cross-provider judge) cannot sit. Values `park-now` | `wait-then-park` (default) |
+   * `same-provider-other-model`, plus the `waitTimeoutMs` parameter. Resolved via `config-extends-platform-default`.
+   */
+  crossProviderFallback?: DimensionEntry<CrossProviderFallbackFlavorName, CrossProviderFallbackValue>;
   /** Open-set: any further dimension keyed by name. */
   [dimension: string]: DimensionEntry | undefined;
 }

@@ -99,8 +99,8 @@ describe('the `gh pr view --json` field list', () => {
 
 describe('the request a session pushes', () => {
   it('carries the two identifying fields and nothing that steers what CI fetches', () => {
-    const req = buildViewRequest({ repo: 'chalbert/web-everything', pr: 1542, requestedAt: '2026-08-24T00:00:00Z' });
-    expect(req).toEqual({ repo: 'chalbert/web-everything', pr: 1542, requestedAt: '2026-08-24T00:00:00Z' });
+    const req = buildViewRequest({ repo: 'web-everything/web-everything', pr: 1542, requestedAt: '2026-08-24T00:00:00Z' });
+    expect(req).toEqual({ repo: 'web-everything/web-everything', pr: 1542, requestedAt: '2026-08-24T00:00:00Z' });
   });
 
   /**
@@ -126,7 +126,7 @@ describe('the request a session pushes', () => {
   });
 
   it('accepts a well-formed one', () => {
-    expect(validateViewRequest({ repo: 'chalbert/web-everything', pr: 1542 }))
-      .toEqual({ ok: true, request: { repo: 'chalbert/web-everything', pr: 1542 } });
+    expect(validateViewRequest({ repo: 'web-everything/web-everything', pr: 1542 }))
+      .toEqual({ ok: true, request: { repo: 'web-everything/web-everything', pr: 1542 } });
   });
 });

@@ -30,7 +30,7 @@ describe('session slugs', () => {
     expect(repoKeyForSlugTag()).toBe('we');
     expect(repoKeyForSlugTag('other')).toBeNull();
     expect(repoSlugTag('other')).toBeNull();
-    expect(repoKeyForSlug('chalbert/frontierui')).toBe('frontierui');
+    expect(repoKeyForSlug('frontier-ui/frontierui')).toBe('frontierui');
     expect(repoKeyForSlug('plateau-app')).toBe('plateau-app');
   });
 });

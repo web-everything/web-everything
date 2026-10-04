@@ -255,7 +255,7 @@ function observedFilesForResolve() {
   const git = (args) => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
   try {
     // `repoKeyFromSlug` (lane-manifest.mjs:171) takes an `owner/name` SLUG, not a remote URL: it splits on `/`
-    // and never strips `.git`, so the raw `git@github.com:chalbert/web-everything.git` would key as
+    // and never strips `.git`, so the raw `git@github.com:web-everything/web-everything.git` would key as
     // `web-everything.git` and NOTHING would ever match a `we:`-qualified declared entry — the guard would be
     // silently inert. Normalize the URL to `owner/name` first, with the same pattern pr-land.mjs:830 uses.
     const url = git(['remote', 'get-url', 'origin']).trim();

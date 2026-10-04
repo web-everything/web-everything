@@ -21,7 +21,7 @@ describe('credential metadata collector', () => {
     expect(result.secrets.map((r) => r.repo)).toEqual([...DEFAULT_REPOS].sort());
     expect(result.ciFindings.every((r) => r.badCredentials)).toBe(true);
     expect(JSON.stringify(result)).not.toContain('SECRET_CANARY');
-    expect(calls.filter((a) => a[0] === 'run')[0]).toEqual(['run', 'view', '42', '--repo', 'chalbert/frontierui', '--attempt', '1', '--log-failed']);
+    expect(calls.filter((a) => a[0] === 'run')[0]).toEqual(['run', 'view', '42', '--repo', 'frontier-ui/frontierui', '--attempt', '1', '--log-failed']);
   });
   it('paginates secrets and deduplicates; retains partial rows on a later denial', () => {
     const page = Array.from({ length: 100 }, (_, i) => secret(`S_${i}`));

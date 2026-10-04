@@ -127,7 +127,7 @@ describe('real stores, shared ingestion, and filesystem evidence', () => {
     expect(result.runs).toHaveLength(1);
     expect(exec).toHaveBeenCalledTimes(3);
     expect(exec.mock.calls.map(([, args]) => args[3])).toEqual([
-      'chalbert/web-everything', 'chalbert/frontierui', 'chalbert/plateau-app',
+      'web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app',
     ]);
   });
 

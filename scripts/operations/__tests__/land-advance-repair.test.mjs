@@ -4,7 +4,7 @@ import { queueFirstHold, nyDayKey, isPreToday, followUpKindFor, REPAIR_RETRY_CAP
 import { ALLOWED_TOOLS_BY_KIND, allowedToolsArg } from '../land-advance-tools.mjs';
 // Tonight's live fixtures (2026-09-20): #2349 red with no fixer; #2344 conflicted, bounced, its fixer finished, a stale `fixing` tag.
 const now = Date.parse('2026-09-20T20:00:00Z'); // 16:00 in New York
-const base = { repo: 'we', slug: 'chalbert/web-everything', baseRefName: 'main', createdAt: '2026-09-20T13:00:00Z', updatedAt: '2026-09-20T15:00:00Z', mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' };
+const base = { repo: 'we', slug: 'web-everything/web-everything', baseRefName: 'main', createdAt: '2026-09-20T13:00:00Z', updatedAt: '2026-09-20T15:00:00Z', mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' };
 const p2349 = { ...base, number: 2349, headRefName: 'lane/ci-red-thing', labels: ['ci:failed'], mergeStateStatus: 'UNSTABLE' };
 const p2344 = { ...base, number: 2344, headRefName: 'lane/graduate-3443-fix-dispatch-pr-diff-scope', labels: ['review:changes', 'review-status:fixing'], mergeStateStatus: 'DIRTY', mergeable: 'CONFLICTING', updatedAt: '2026-09-20T12:00:00Z' };
 const planned = (pr, extra = {}) => ({ planned: { itemNum: null, attributionKind: 'PR', attributionNum: String(pr), pr, laneRef: `lane/x-${pr}`, scope: [`we:scripts/x-${pr}.mjs`], scopeSource: 'pr-diff', isConflict: false, ...extra } });
@@ -73,11 +73,11 @@ describe('dispatch-conflict-fix', () => {
       expect(r).toMatchObject({ owedAction: 'escalate', kind: 'conflict-fix-refused', packetId: 'conflict-fix-refused-we-2344' }); expect(r.evidence.join(' ')).toContain(why);
       expect(p.proposed).toHaveLength(0); expect(p.deferred).toHaveLength(0);
     }
-    const other = { ...p2349, repo: 'plateau-app', slug: 'chalbert/plateau-app' };
+    const other = { ...p2349, repo: 'plateau-app', slug: 'plateauapp/plateau-app' };
     expect(row(plan({ prs: [other], fixPlans: { 'plateau-app#2349': { refusal: { kind: 'unsupported-repo', why: 'we only' } } } }), 2349)).toMatchObject({ owedAction: 'escalate', kind: 'ci-heal-refused' });
   });
   it('an ambiguous session identity stays a named deferral (it may clear next pass)', () => {
-    const twin = { ...p2349, repo: 'frontierui', slug: 'chalbert/frontierui' }, p = plan({ prs: [p2349, twin], sessions: [{ id: 'f', name: 'fix-2349', kind: 'background', liveness: 'live-active', verdict: 'progressing' }] });
+    const twin = { ...p2349, repo: 'frontierui', slug: 'frontier-ui/frontierui' }, p = plan({ prs: [p2349, twin], sessions: [{ id: 'f', name: 'fix-2349', kind: 'background', liveness: 'live-active', verdict: 'progressing' }] });
     expect(p.rows.find((r) => r.subject === 'we#2349')).toMatchObject({ owedAction: 'dispatch-ci-heal', dispatchable: false, refusal: { kind: 'ambiguous' } });
     expect(p.proposed).toHaveLength(0); expect(p.deferred.map((r) => r.reason)).toEqual(['ambiguous', 'ambiguous']);
   });

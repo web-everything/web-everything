@@ -121,11 +121,11 @@ describe('lane-manifest-write (#2174 producer stop-at-push)', () => {
 
 describe('#2390 — repoKeyFromSlug (map a git slug/short name → the manifest repo key)', () => {
   it('maps web-everything (slug OR bare name) to the `we` key', () => {
-    expect(repoKeyFromSlug('chalbert/web-everything')).toBe('we');
+    expect(repoKeyFromSlug('web-everything/web-everything')).toBe('we');
     expect(repoKeyFromSlug('web-everything')).toBe('we');
   });
   it('passes the impl-repo short names through (slug or bare)', () => {
-    expect(repoKeyFromSlug('chalbert/frontierui')).toBe('frontierui');
+    expect(repoKeyFromSlug('frontier-ui/frontierui')).toBe('frontierui');
     expect(repoKeyFromSlug('plateau-app')).toBe('plateau-app');
     expect(repoKeyFromSlug('we')).toBe('we'); // already canonical
   });

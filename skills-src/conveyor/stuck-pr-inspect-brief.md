@@ -16,7 +16,7 @@
 | Placeholder | What the dispatcher fills it with |
 |---|---|
 | `{{PR}}` | the stuck PR's number — e.g. `2505` |
-| `{{REPO}}` | the target repo's gh slug — e.g. `chalbert/web-everything` |
+| `{{REPO}}` | the target repo's gh slug — e.g. `web-everything/web-everything` |
 | `{{SESSION_SLUG}}` | this inspection's session slug — `inspect-{{PR}}` for WE, `inspect-pa-{{PR}}` / `inspect-fui-{{PR}}` for the sibling repos |
 | `{{STAGE}}` | which tracked stage the watch caught this PR in — `review` / `fix` / `approved` / `conflict` |
 | `{{MINUTES_SINCE}}` | roughly how many minutes of no progress the watch measured |

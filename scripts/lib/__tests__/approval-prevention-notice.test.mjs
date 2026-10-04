@@ -334,7 +334,7 @@ describe('buildApprovalPreventionFilingInput — the self-contained file-item in
     expect(buildApprovalPreventionFilingInput({ repo: 'o/r', pr: 7, findings }).digest).not.toContain('Idempotency key');
   });
 
-  // chalbert/web-everything#2766's OWN approval (2026-09-27, ~09:00 ET, `--to=clear-human`) FAILED live:
+  // web-everything/web-everything#2766's OWN approval (2026-09-27, ~09:00 ET, `--to=clear-human`) FAILED live:
   // `runApprovalPreventionFiling`'s `file-item` subprocess exited non-zero (`stopped: 'effect-halted'`) because
   // the write-time gate (`we:scripts/backlog/guarded-write.mjs#assertPublishableContent`, the #883 locus-prefix
   // scan) refused the rendered card — reproduced read-only against the PR's real 12:45Z advisory finding text,
@@ -365,10 +365,10 @@ describe('buildApprovalPreventionFilingInput — the self-contained file-item in
       },
     ];
     const key = buildApprovalPreventionKey({
-      repo: 'chalbert/web-everything', pr: 2766, headSha: 'd2453a58216d6cc4b14a4e1f30c673451ca93485',
+      repo: 'web-everything/web-everything', pr: 2766, headSha: 'd2453a58216d6cc4b14a4e1f30c673451ca93485',
     });
     const input = buildApprovalPreventionFilingInput({
-      repo: 'chalbert/web-everything', pr: 2766, findings, parent: '4075', source: 'advisory', key,
+      repo: 'web-everything/web-everything', pr: 2766, findings, parent: '4075', source: 'advisory', key,
     });
     // RED before the fix: the bare full-path mention survived verbatim, no `we:` prefix.
     expect(input.digest).not.toContain('in scripts/lib/__tests__/review-loop-policy.test.mjs that asserts');

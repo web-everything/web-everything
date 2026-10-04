@@ -2,8 +2,11 @@
 bornAs: xb1e9nj
 kind: decision
 parent: "4936"
-status: open
+status: resolved
 dateOpened: "2026-10-03"
+dateStarted: "2026-10-03"
+dateResolved: "2026-10-03"
+codifiedIn: "docs/agent/platform-decisions.md#cross-provider-seat-fallback"
 tags: [review, independence]
 ---
 
@@ -24,3 +27,13 @@ Story 4880 adds a blocking Codex seat to every PR with Claude-authored commits. 
 **Skeptic:** B only helps if outages are short. If Codex holds routinely last more than a day, B becomes A with extra latency. Measure the hold durations from the quota-hold history before ruling.
 
 Not prepared yet: it needs `/prepare` (a research topic on hold durations and prior art for provider diversity in review) before the operator rules it.
+
+## Ruling (operator, 2026-10-03)
+
+Operator: "Ok to wait, make it a configurable dimension".
+
+- **Fork 1 → (B), expressed as a configurable dimension, not a baked mechanic.** The default is to wait for Codex for a bounded time, then park the PR for a human (`review:human`).
+- The policy is the `crossProviderFallback` dimension under [config-extends-platform-default](../docs/agent/platform-decisions.md#config-extends-platform-default), with values `park-now` | `wait-then-park` (default) | `same-provider-other-model`, plus a wait-timeout parameter (`waitTimeoutMs`).
+- `park-now` is option A. `wait-then-park` is option B. `same-provider-other-model` is option C and is an explicit opt-in only; it is never the default.
+- Declared in `we:config/defineConfig.ts` (type + key) and `we:config/platformDefaults.ts` (default value and default timeout). The review daemon consumes it; that impl is card 4880.
+- **Decision xud2hha follows this ruling.** The operator answered "Ok" to "the judge follows the same cross-provider rule": Claude-authored PRs get a Codex judge, Codex-authored PRs get an Opus judge. When the cross-provider judge is unavailable, the same `crossProviderFallback` dimension applies. xud2hha lives only on open PR #3771 and is not edited here.

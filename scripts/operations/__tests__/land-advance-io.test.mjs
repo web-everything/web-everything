@@ -11,16 +11,16 @@ const now = Date.parse('2026-09-20T00:00:00Z');
 const dirs = [];
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'land-advance-')); dirs.push(p); return p; };
 afterEach(() => { dirs.splice(0).forEach((p) => fs.rmSync(p, { recursive: true, force: true })); });
-const prs = [1,2,3].map((number) => ({ number, repo: 'we', slug: 'chalbert/web-everything', labels: ['review:pending'], createdAt: '2026-09-08' }));
-const emptyFs = { ...fs, readdirSync: () => [], readFileSync: (p) => { if (String(p).endsWith('swept-repos.json')) return '["chalbert/web-everything","chalbert/frontierui","chalbert/plateau-app"]'; throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }, statSync: () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); } };
+const prs = [1,2,3].map((number) => ({ number, repo: 'we', slug: 'web-everything/web-everything', labels: ['review:pending'], createdAt: '2026-09-08' }));
+const emptyFs = { ...fs, readdirSync: () => [], readFileSync: (p) => { if (String(p).endsWith('swept-repos.json')) return '["web-everything/web-everything","frontier-ui/frontierui","plateauapp/plateau-app"]'; throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }, statSync: () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); } };
 const readerPorts = (overrides = {}) => ({ fs: emptyFs, now: () => now, readSessions: () => [], store: createMemoryRunStore(), machineLoad: () => 0,
   run: (cmd, args) => cmd === 'gh' ? '[]' : cmd === 'git' ? '321 180' : '/lanes/lane-1\n/lanes/lane-2', ...overrides });
 describe('evidence IO', () => {
   it('records a failed repo without hiding other repos; uses full slugs', () => {
     const run = vi.fn((cmd, args) => {
       if (cmd !== 'gh') return cmd === 'git' ? '321 180' : '/lane-1';
-      const slug = args[args.indexOf('--repo') + 1]; expect(slug).toMatch(/^chalbert\//);
-      if (slug === 'chalbert/frontierui') throw new Error('network unavailable');
+      const slug = args[args.indexOf('--repo') + 1]; expect(slug).toMatch(/^(web-everything|frontier-ui|plateauapp)\//);
+      if (slug === 'frontier-ui/frontierui') throw new Error('network unavailable');
       return JSON.stringify([prs[0]]);
     });
     const inputs = createLandAdvanceReader(readerPorts({ run }))();
@@ -46,7 +46,7 @@ describe('evidence IO', () => {
   it.each(['Provider used: CODEX-direct-task', '## Authorship\nGemini wrote it', '**Provider used:** Codex'])('parses section %s', (text) => expect(resultProvider(text)).toMatch(/Codex|Gemini/));
   it('does not treat an incidental mention as authorship', () => expect(resultProvider('Maybe use codex tomorrow')).toBeNull());
   it('calls the existing fix planner and retains no-scope refusals', () => {
-    const run = (cmd, args) => cmd === 'gh' ? (args.includes('chalbert/web-everything') ? JSON.stringify([
+    const run = (cmd, args) => cmd === 'gh' ? (args.includes('web-everything/web-everything') ? JSON.stringify([
       { number: 2170, labels: ['review:changes'], headRefName: 'lane/stuck-session-op-docs' },
       { number: 2108, labels: ['review:changes'], headRefName: 'lane/3140-fix' },
     ]) : '[]') : cmd === 'git' ? '0 1' : '/lane-1';
@@ -65,7 +65,7 @@ describe('evidence IO', () => {
     const findItemFn = vi.fn(() => { throw new Error('must not look up an item'); });
     const run = (cmd, args) => cmd === 'gh'
       ? (args[0] === 'pr' && args[1] === 'diff' ? 'docs/agent/testing.md\n'
-        : args.includes('chalbert/web-everything') ? JSON.stringify([
+        : args.includes('web-everything/web-everything') ? JSON.stringify([
           { number: 2170, labels: ['review:changes'], headRefName: 'lane/stuck-session-op-docs' },
         ]) : '[]')
       : cmd === 'git' ? '0 0' : '/lane-1';

@@ -47,8 +47,8 @@ describe('#3217 durable shadow observations', () => {
       { pr: 1, repo: 'we', labels: ['review:pending'] },
       { pr: 2, repo: 'we', labels: ['review:pending'] },
     ], CONFIG, (subject) => subject === 'we#1' ? cleanDiverseLedger() : []);
-    appendShadowRecords(records, 'chalbert/web-everything');
-    const rows = readVerdictLedger('chalbert/web-everything');
+    appendShadowRecords(records, 'web-everything/web-everything');
+    const rows = readVerdictLedger('web-everything/web-everything');
     expect(rows.map((r) => r.wouldClear)).toEqual([true, false]);
     for (const r of rows) {
       expect(r).toMatchObject({ verdict: 'observed', mode: 'shadow', applied: false, mutated: false, clears: false });
@@ -64,7 +64,7 @@ describe('#3217 durable shadow observations', () => {
       return { ok: false, errors: ['refused'] };
     }).mockReturnValue({ ok: true });
     vi.spyOn(process.stderr, 'write').mockImplementation(() => { throw new Error('closed'); });
-    expect(() => appendShadowRecords(records, 'chalbert/web-everything', append)).not.toThrow();
+    expect(() => appendShadowRecords(records, 'web-everything/web-everything', append)).not.toThrow();
     expect(append).toHaveBeenCalledTimes(2);
   });
 
@@ -90,7 +90,7 @@ fi
     expect(readFileSync(join(root, 'gh-calls'), 'utf8')).toBe('pr list\n');
     expect(JSON.parse(child.stdout)).toMatchObject({ ranPass: true, mode: 'shadow', mutations: 0 });
     if (fail) expect(child.stderr).toContain('verdict-ledger append failed');
-    else expect(readVerdictLedger('chalbert/web-everything')).toEqual([
+    else expect(readVerdictLedger('web-everything/web-everything')).toEqual([
       expect.objectContaining({ pr: 42, mode: 'shadow', wouldClear: false, applied: false, mutated: false }),
     ]);
   });
@@ -185,7 +185,7 @@ describe('the singleton LEASE protocol — owner-match release (the flagged bran
 
 describe('repoKeyForSlug — the #2830 M3 slug↔key mapper (fail-closed)', () => {
   it('maps the WE slug and key to the we key', () => {
-    expect(repoKeyForSlug('chalbert/web-everything')).toBe('we');
+    expect(repoKeyForSlug('web-everything/web-everything')).toBe('we');
     expect(repoKeyForSlug('we')).toBe('we');
   });
   it('maps the impl repos', () => {
@@ -200,6 +200,6 @@ describe('repoKeyForSlug — the #2830 M3 slug↔key mapper (fail-closed)', () =
 });
 
 it('recognizes owner-qualified sibling slugs', () => {
-  expect(repoKeyForSlug('chalbert/frontierui')).toBe('frontierui');
-  expect(repoKeyForSlug('chalbert/plateau-app')).toBe('plateau-app');
+  expect(repoKeyForSlug('frontier-ui/frontierui')).toBe('frontierui');
+  expect(repoKeyForSlug('plateauapp/plateau-app')).toBe('plateau-app');
 });

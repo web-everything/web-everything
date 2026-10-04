@@ -30,6 +30,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { describe, it, expect } from 'vitest';
+import { planReviewHoldCleanup } from '../../conveyor/review-hold-reconcile.mjs';
 import {
   REVIEW_LABELS,
   isGateSelfPath,
@@ -885,5 +886,30 @@ describe('INVARIANT 17 — park cleanup preserves send-backs and proven human cl
   it('#2766/#2767\'s own real label state is caught by the check (regression pin)', () => {
     const live = [REVIEW_LABELS.accepted, REVIEW_LABELS.human, 'review-status:reviewing', 'review-round:1', REVIEW_LABELS.awaitingAdvisory];
     expect(findContradictoryReviewVerdicts(live).sort()).toEqual([REVIEW_LABELS.accepted, REVIEW_LABELS.human].sort());
+  });
+});
+
+describe('INVARIANT 18 — the review-hold sweep never flags a send-back the park preserved (#3657)', () => {
+  const VERDICT_LABELS = [REVIEW_LABELS.pending, REVIEW_LABELS.accepted, REVIEW_LABELS.changes, REVIEW_LABELS.human];
+
+  it('keepHumanClearance:false — no park outcome is ever flagged', () => {
+    for (const set of powerset(VERDICT_LABELS)) {
+      const decision = decideParkToHuman({ currentLabels: set, keepHumanClearance: false });
+      const removed = new Set(decision.removeLabels);
+      const after = [...new Set([...set.filter((l) => !removed.has(l)), decision.addLabel])];
+      expect(planReviewHoldCleanup({ currentLabels: after }).flagged).toBeUndefined();
+    }
+  });
+
+  it('keepHumanClearance:true — only accepted+human is flagged, never review:changes', () => {
+    for (const set of powerset(VERDICT_LABELS)) {
+      const decision = decideParkToHuman({ currentLabels: set, keepHumanClearance: true });
+      const removed = new Set(decision.removeLabels);
+      const after = [...new Set([...set.filter((l) => !removed.has(l)), decision.addLabel])];
+      const { flagged } = planReviewHoldCleanup({ currentLabels: after });
+      expect(flagged ?? []).not.toContain(REVIEW_LABELS.changes);
+      expect(flagged).toEqual(after.includes(REVIEW_LABELS.accepted)
+        ? [REVIEW_LABELS.accepted, REVIEW_LABELS.human].sort() : undefined);
+    }
   });
 });

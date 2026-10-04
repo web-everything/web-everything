@@ -11,8 +11,8 @@
  * `review-loop-policy.mjs`'s header for the full account of why `#3442`'s old mechanical-accept-without-filing
  * was reversed and replaced rather than merely reverted.
  *
- *   node scripts/operations/review-loop-cli.mjs --pr=1234 --repo=chalbert/web-everything --cwd=<a lane>
- *   node scripts/operations/review-loop-cli.mjs --resume=<run-id> --repo=chalbert/web-everything --pr=1234
+ *   node scripts/operations/review-loop-cli.mjs --pr=1234 --repo=web-everything/web-everything --cwd=<a lane>
+ *   node scripts/operations/review-loop-cli.mjs --resume=<run-id> --repo=web-everything/web-everything --pr=1234
  *
  * WHY THIS IS A SEPARATE ENTRY POINT FROM `run.mjs review-pr`, NOT A FLAG ON IT. `runOperationCli`
  * (`we:scripts/operations/cli-adapter.mjs`) drives every declared operation for a HUMAN at a terminal — it

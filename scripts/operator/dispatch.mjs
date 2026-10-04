@@ -112,7 +112,7 @@ export function unleaseLane({ lane, slug, repo = REPO, exec = spawnSync }) {
  * what was proven live, not something this port gets to improve on rewrite).
  */
 export function buildFixPrompt({ pr, branch, lanePath }) {
-  return `You are a FIX agent for pull request #${pr} in \`chalbert/web-everything\`. You did not review it; your
+  return `You are a FIX agent for pull request #${pr} in \`web-everything/web-everything\`. You did not review it; your
 job is to address the review that bounced it, and nothing else.
 
 ## Your lane
@@ -209,7 +209,7 @@ Report: which findings you addressed, which you did not and why, and the commit 
 
 /** CI_HEAL agent prompt — `converge.py`'s `CI_HEAL` template, ported verbatim. */
 export function buildCiHealPrompt({ pr, branch, lanePath }) {
-  return `You are healing a REAL CI FAILURE on pull request #${pr} in \`chalbert/web-everything\`. Its review
+  return `You are healing a REAL CI FAILURE on pull request #${pr} in \`web-everything/web-everything\`. Its review
 already ACCEPTED this diff's content — do not re-review it, do not second-guess the accepted changes. Your
 job is narrow: make the failing CI check pass, and nothing else.
 
@@ -226,13 +226,13 @@ LANE_SESSION=conv-${pr} git reset --hard FETCH_HEAD
 ## What actually failed
 
 \`\`\`
-gh pr checks ${pr} --repo chalbert/web-everything
+gh pr checks ${pr} --repo web-everything/web-everything
 \`\`\`
 
 For the failing check, read its real log — not a guess:
 
 \`\`\`
-gh run view --job=<the failing job id from the checks output> --repo chalbert/web-everything --log-failed
+gh run view --job=<the failing job id from the checks output> --repo web-everything/web-everything --log-failed
 \`\`\`
 
 ## Fix ONLY what the log says is wrong
@@ -264,13 +264,13 @@ Report the failing check's name, what was actually wrong, and the commit sha.
 
 /** REVIEW agent prompt — `converge.py`'s `REVIEW` template, ported verbatim. */
 export function buildReviewPrompt({ pr, drvPath, jurorPath }) {
-  return `You are an INDEPENDENT reviewer for pull request #${pr} in \`chalbert/web-everything\`. You did not
+  return `You are an INDEPENDENT reviewer for pull request #${pr} in \`web-everything/web-everything\`. You did not
 write it and you did not fix it — those were other sessions.
 
 Run the declared operation, not a procedure of your own. Read \`skills-src/review/SKILL.md\`, then:
 
 \`\`\`
-node scripts/operations/run.mjs review-pr --pr=${pr} --repo=chalbert/web-everything --cwd=${jurorPath} --json
+node scripts/operations/run.mjs review-pr --pr=${pr} --repo=web-everything/web-everything --cwd=${jurorPath} --json
 \`\`\`
 
 \`--cwd\` is the juror's own lane and is REQUIRED. You work in \`${drvPath}\`. The operation has a \`confirm\`
@@ -529,7 +529,7 @@ export function runIdsFromFailingChecks(checkRows) {
  * @returns {Promise<string>} a status string describing what was found and done.
  */
 export async function healCi({ pr, branch, lane, repo = REPO, execFn = spawnSync, runAgentFn = runAgent }) {
-  const checksOut = execFn('gh', ['pr', 'checks', String(pr), '--repo', 'chalbert/web-everything',
+  const checksOut = execFn('gh', ['pr', 'checks', String(pr), '--repo', 'web-everything/web-everything',
     '--json', 'name,state,link'], { cwd: repo, encoding: 'utf8' }).stdout;
   let rows;
   try {
@@ -537,7 +537,7 @@ export async function healCi({ pr, branch, lane, repo = REPO, execFn = spawnSync
   } catch {
     return 'no-op (gh checks output unparseable — leaving as-is)';
   }
-  // #xg790dh-follow-up — LIVE INCIDENT 2026-09-26, PRs #2748/#2749/#2753 (chalbert/web-everything): `review-gate`
+  // #xg790dh-follow-up — LIVE INCIDENT 2026-09-26, PRs #2748/#2749/#2753 (web-everything/web-everything): `review-gate`
   // (`we:.github/workflows/review-gate.yml` + `we:scripts/check-review-gate.mjs`) is BY DESIGN red for as long
   // as `review:pending`/`review:human`/`review:changes` stands — that is its whole job, not a code-health signal
   // — yet a plain `state === 'FAILURE'` scan with no exclusion counted it as a real failure: `failing.length`
@@ -550,7 +550,7 @@ export async function healCi({ pr, branch, lane, repo = REPO, execFn = spawnSync
   if (failing.length === 0) {
     // NOT A NO-OP — a stale label re-observed and left untouched can burn a whole round budget re-diagnosing
     // "stale" without ever clearing it (converge.py:509-515).
-    execFn('gh', ['pr', 'edit', String(pr), '--repo', 'chalbert/web-everything', '--remove-label', 'ci:failed'],
+    execFn('gh', ['pr', 'edit', String(pr), '--repo', 'web-everything/web-everything', '--remove-label', 'ci:failed'],
       { cwd: repo, encoding: 'utf8' });
     return 'cleared stale ci:failed (every check passed)';
   }
@@ -560,7 +560,7 @@ export async function healCi({ pr, branch, lane, repo = REPO, execFn = spawnSync
 
   let transient = true;
   for (const runId of runIds) {
-    const out = execFn('gh', ['run', 'view', runId, '--repo', 'chalbert/web-everything', '--json', 'jobs'],
+    const out = execFn('gh', ['run', 'view', runId, '--repo', 'web-everything/web-everything', '--json', 'jobs'],
       { cwd: repo, encoding: 'utf8' }).stdout;
     let jobRows;
     try {
@@ -574,7 +574,7 @@ export async function healCi({ pr, branch, lane, repo = REPO, execFn = spawnSync
 
   if (transient) {
     for (const runId of runIds) {
-      execFn('gh', ['run', 'rerun', runId, '--repo', 'chalbert/web-everything', '--failed'],
+      execFn('gh', ['run', 'rerun', runId, '--repo', 'web-everything/web-everything', '--failed'],
         { cwd: repo, encoding: 'utf8' });
     }
     return `transient (startup_failure/cancelled/timed_out) — reran ${runIds.length} run(s)`;

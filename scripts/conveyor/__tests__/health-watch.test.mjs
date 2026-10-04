@@ -449,9 +449,9 @@ describe('tick() — forced lane-starvation fixture', () => {
     const fixLog = join(logsDir, 'fix-dispatch-daemon.log');
     writeFileSync(fixLog, [
       'fix-dispatch-daemon: tick (1) — dispatched 0, refused 3',
-      'fix-dispatch-daemon: refused no-lane chalbert/web-everything PR #2661 — no free lane in the pool',
-      'fix-dispatch-daemon: refused no-lane chalbert/web-everything PR #2662 — no free lane in the pool',
-      'fix-dispatch-daemon: refused no-lane chalbert/web-everything PR #2663 — no free lane in the pool',
+      'fix-dispatch-daemon: refused no-lane web-everything/web-everything PR #2661 — no free lane in the pool',
+      'fix-dispatch-daemon: refused no-lane web-everything/web-everything PR #2662 — no free lane in the pool',
+      'fix-dispatch-daemon: refused no-lane web-everything/web-everything PR #2663 — no free lane in the pool',
       '',
     ].join('\n'));
 
@@ -466,9 +466,9 @@ describe('tick() — forced lane-starvation fixture', () => {
     // A second no-lane tick block, appended — the incremental read of just the new lines.
     appendFileSync(fixLog, [
       'fix-dispatch-daemon: tick (2) — dispatched 0, refused 3',
-      'fix-dispatch-daemon: refused no-lane chalbert/web-everything PR #2664 — no free lane in the pool',
-      'fix-dispatch-daemon: refused no-lane chalbert/web-everything PR #2665 — no free lane in the pool',
-      'fix-dispatch-daemon: refused no-lane chalbert/web-everything PR #2666 — no free lane in the pool',
+      'fix-dispatch-daemon: refused no-lane web-everything/web-everything PR #2664 — no free lane in the pool',
+      'fix-dispatch-daemon: refused no-lane web-everything/web-everything PR #2665 — no free lane in the pool',
+      'fix-dispatch-daemon: refused no-lane web-everything/web-everything PR #2666 — no free lane in the pool',
       '',
     ].join('\n'));
 
@@ -496,7 +496,7 @@ describe('tick() — an episode that closes in the same tick its investigation f
     const fixLog = join(logsDir, 'fix-dispatch-daemon.log');
     const noLaneBlock = (n) => [
       `fix-dispatch-daemon: tick (${n}) — dispatched 0, refused 3`,
-      ...[1, 2, 3].map((i) => `fix-dispatch-daemon: refused no-lane chalbert/web-everything PR #${2600 + n * 10 + i} — no free lane in the pool`),
+      ...[1, 2, 3].map((i) => `fix-dispatch-daemon: refused no-lane web-everything/web-everything PR #${2600 + n * 10 + i} — no free lane in the pool`),
       '',
     ].join('\n');
     writeFileSync(poolLog, `${JSON.stringify({ checked: true, health: { total: 2, leased: 2, acquirable: 0, dirtyUnleased: 0 } })}\n`);
@@ -618,7 +618,7 @@ describe('probeMergedPrs', () => {
     const exec = (cmd, args) => { calls.push(args); return JSON.stringify([{ number: 2689, title: 'x0zg44l: soak', headRefName: 'lane/x0zg44l-soak', body: '' }]); };
     const out = probeMergedPrs({ exec });
     // The backlog cards are WE's, so the merged-PR list must be WE's too — never whatever repo the cwd resolves to.
-    expect(calls[0]).toEqual(expect.arrayContaining(['--repo', 'chalbert/web-everything']));
+    expect(calls[0]).toEqual(expect.arrayContaining(['--repo', 'web-everything/web-everything']));
     expect(out.prs).toEqual([{ number: 2689, title: 'x0zg44l: soak', headRefName: 'lane/x0zg44l-soak', body: '' }]);
     // The real repo's backlog/ dir has hundreds of cards — proves this reads the real reader, not a stub.
     expect(out.cards.length).toBeGreaterThan(50);
@@ -638,14 +638,14 @@ describe('persisted state is scrubbed', () => {
     const stateRoot = join(dir, 'state');
     writeFileSync(join(logsDir, 'fix-dispatch-daemon.log'), [
       'reconcile-fix-dispatch-daemon: tick (a) — dispatched 0, refused 1',
-      `reconcile-fix-dispatch-daemon: refused dispatch-failed chalbert/web-everything PR #9 — auth header token ${tok} rejected`,
+      `reconcile-fix-dispatch-daemon: refused dispatch-failed web-everything/web-everything PR #9 — auth header token ${tok} rejected`,
       '',
     ].join('\n'));
     const flags = { 'state-root': stateRoot, 'logs-dir': logsDir, 'lock-root': lockRoot, 'self-sync-dir': syncDir, 'no-gh': true, 'no-diagnose': true };
     await tick(flags);
     const { readFileSync } = await import('node:fs');
     const stateText = readFileSync(join(healthDir(stateRoot), 'state.json'), 'utf8');
-    expect(stateText).toContain('chalbert/web-everything#9');
+    expect(stateText).toContain('web-everything/web-everything#9');
     expect(stateText).not.toContain(tok);
   });
 });
@@ -758,7 +758,7 @@ describe('round 2: tick output, silences, partial lines', () => {
     const tok = `ghp_${'Z'.repeat(36)}`;
     // Bootstrap-read ticks are spread back at the interval, so 16 unproductive ticks span 30 min: the episode
     // opens on the first tick and its summary/recommendation carry the refusal text.
-    const block = `reconcile-fix-dispatch-daemon: tick (a) — dispatched 0, refused 1\nreconcile-fix-dispatch-daemon: refused dispatch-failed chalbert/web-everything PR #9 — auth header token ${tok} rejected\n`;
+    const block = `reconcile-fix-dispatch-daemon: tick (a) — dispatched 0, refused 1\nreconcile-fix-dispatch-daemon: refused dispatch-failed web-everything/web-everything PR #9 — auth header token ${tok} rejected\n`;
     writeFileSync(join(logsDir, 'fix-dispatch-daemon.log'), `reconcile-fix-dispatch-daemon: started on Mac:1, tick every 120000ms.\n${block.repeat(16)}`);
     const summary = await tick(flags);
     expect(summary.transitions.some((t) => t.key === 'daemon-owed-no-dispatch::fix-dispatch-daemon')).toBe(true);
@@ -782,12 +782,12 @@ describe('round 2: tick output, silences, partial lines', () => {
     const f = join(logsDir, 'fix-dispatch-daemon.log');
     writeFileSync(f, 'reconcile-fix-dispatch-daemon: started on Mac:1, tick every 120000ms.\n');
     const a = probeDaemonLogs(logsDir, {});
-    appendFileSync(f, 'reconcile-fix-dispatch-daemon: tick (a) — dispatched 0, refused 1\nreconcile-fix-dispatch-daemon: refused no-lane chalbert/fronti');
+    appendFileSync(f, 'reconcile-fix-dispatch-daemon: tick (a) — dispatched 0, refused 1\nreconcile-fix-dispatch-daemon: refused no-lane frontier-ui/fronti');
     const b = probeDaemonLogs(logsDir, a.cursors);
-    expect(b.samples[0].text).not.toContain('chalbert/fronti');
+    expect(b.samples[0].text).not.toContain('frontier-ui/fronti');
     appendFileSync(f, 'erui PR #7 — no free lane\n');
     const c = probeDaemonLogs(logsDir, b.cursors);
-    expect(c.samples[0].text).toBe('reconcile-fix-dispatch-daemon: refused no-lane chalbert/frontierui PR #7 — no free lane\n');
+    expect(c.samples[0].text).toBe('reconcile-fix-dispatch-daemon: refused no-lane frontier-ui/frontierui PR #7 — no free lane\n');
   });
 });
 
@@ -1021,18 +1021,18 @@ describe('xyx5mea isolated shell replay', () => {
       'no-gh': true, 'no-diagnose': true };
     for (const name of ['logs-dir', 'lock-root', 'self-sync-dir']) mkdirSync(flags[name], { recursive: true });
     const statePath = join(healthDir(flags['state-root']), 'state.json');
-    const key = `${smell}::chalbert/web-everything#${number}`;
+    const key = `${smell}::web-everything/web-everything#${number}`;
     function input(now) {
       return {
         prs: smell === 'repeated-pr-attempts' ? [] : [{
-          repo: 'chalbert/web-everything', number, isDraft: smell === 'draft-not-promoted',
+          repo: 'web-everything/web-everything', number, isDraft: smell === 'draft-not-promoted',
           statusCheckRollup: [{ name: 'test', status: 'COMPLETED',
             conclusion: smell === 'draft-not-promoted' ? 'SUCCESS' : 'FAILURE',
             completedAt: new Date(start - hour).toISOString() }],
         }],
         agents: [], daemonLogs: [],
         operationRuns: smell !== 'repeated-pr-attempts' ? [] : Array.from({ length: 5 }, (_, i) => ({
-          id: `run-${i}`, op: 'open-pr', input: { repo: 'chalbert/web-everything', pr: number },
+          id: `run-${i}`, op: 'open-pr', input: { repo: 'web-everything/web-everything', pr: number },
           effects: [{ key: 'submit', status: 'failed', lastAttemptAt: new Date(now).toISOString(), error: 'submit failed' }],
         })),
       };
@@ -1074,4 +1074,47 @@ describe('xyx5mea isolated shell replay', () => {
     expect(restart.transitions.filter(t => t.type === 'escalated')).toEqual([]);
     expect(episodeReplay.send).toHaveBeenCalledTimes(1);
   });
+});
+
+it('xe8y12n probe preserves fresh raw evidence independently of cached/normalised labels', () => {
+  const commits = [{ authors: [{ name: 'Claude' }] }];
+  const exec = (_bin, args) => JSON.stringify(args[1] === 'list'
+    ? [{ number: 3239, labels: null }]
+    : { state: 'OPEN', labels: [], headRefOid: 'a'.repeat(40) });
+  const rows = probePrs({ exec, readCommits: () => commits, now: 123 });
+  expect(rows[0]).toMatchObject({ labelsValid: false, reviewObservation: { state: 'OPEN', labels: [], commits, observedAt: 123 } });
+  const failed = probePrs({ exec: (_bin, args) => { if (args[1] === 'view') throw new Error('unavailable'); return JSON.stringify([{ number: 3239, labels: [] }]); }, readCommits: () => commits });
+  expect(failed[0].reviewObservation).toBeNull();
+});
+
+it('xe8y12n probe re-observes only PRs whose cached labels could hide a missing review label', async () => {
+  const views = [];
+  const commitReads = [];
+  const listed = [
+    { number: 1, labels: [{ name: 'review:pending' }] },
+    { number: 2, labels: [{ name: 'review:human' }, { name: 'bug' }] },
+    { number: 3, labels: [{ name: 'checking' }] },
+    { number: 4, labels: [] },
+    { number: 5, labels: null },
+    { number: 6, labels: [{ name: 'review:accepted' }], isDraft: true },
+  ];
+  const exec = (_bin, args) => {
+    if (args[1] === 'list') return JSON.stringify(listed);
+    views.push(Number(args[2]));
+    return JSON.stringify({ state: 'OPEN', labels: [], headRefOid: 'a'.repeat(40) });
+  };
+  const rows = probePrs({ exec, now: 5, readCommits: (_slug, number) => { commitReads.push(number); return []; } });
+  const byNumber = new Map(rows.map(row => [row.number, row]));
+  // Each constellation repo lists the same fixture, so only count what happens for one repo's rows.
+  const perRepo = new Set(views);
+  expect([...perRepo].sort()).toEqual([3, 4, 5]);
+  expect(views.length).toBe(perRepo.size * (rows.length / listed.length));
+  expect(new Set(commitReads)).toEqual(perRepo);
+  // A labelled PR costs no call but still reports a clean cached observation, so an open episode can close.
+  for (const number of [1, 2, 6]) expect(byNumber.get(number).reviewObservation).toMatchObject({ state: 'OPEN', cached: true, commits: [] });
+  const { default: smell } = await import('../health-smells/review-label-missing.mjs');
+  const closeResults = smell.evaluate({ prs: [...byNumber.values()].filter(row => [1, 2, 6].includes(row.number)) }, { now: 10, lastTick: { completedAt: 0 } });
+  expect(closeResults).toHaveLength(3);
+  for (const result of closeResults) expect(result.breach).toBe(false);
+  for (const number of [3, 4, 5]) expect(byNumber.get(number).reviewObservation).toMatchObject({ state: 'OPEN' });
 });

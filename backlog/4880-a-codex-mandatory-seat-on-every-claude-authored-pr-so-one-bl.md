@@ -5,7 +5,7 @@ size: 5
 parent: "4936"
 status: open
 blockedBy: ["4874", "4374", "4815"]
-scope: ["we:scripts/operations/review-pr.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs", "we:scripts/lib/pr-view-transport.mjs", "we:scripts/lib/__tests__/pr-view-transport.test.mjs", "we:scripts/lib/review-loop-policy.mjs", "we:scripts/lib/__tests__/review-loop-policy.test.mjs", "we:scripts/lib/model-probation.mjs", "we:scripts/lib/model-probation.json", "we:scripts/lib/__tests__/model-probation.test.mjs"]
+scope: ["we:scripts/operations/review-pr.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs", "we:scripts/lib/pr-view-transport.mjs", "we:scripts/lib/__tests__/pr-view-transport.test.mjs", "we:scripts/lib/review-loop-policy.mjs", "we:scripts/lib/__tests__/review-loop-policy.test.mjs", "we:scripts/lib/model-probation.mjs", "we:scripts/lib/model-probation.json", "we:scripts/lib/__tests__/model-probation.test.mjs", "we:config/defineConfig.ts", "we:config/platformDefaults.ts", "we:config/__tests__/config-contract.test.ts"]
 dateOpened: "2026-10-03"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "4a2606bc2f711efd86849e250db36b1b100a0fa4"
@@ -40,16 +40,17 @@ Preparation (2026-10-03) grounded the seams. Nothing is built yet.
    When `read.need.crossProvider.required` is `null` (Codex-only authors), the step records `skipped: 'author-not-claude'` and spawns nothing. The step's lens is `MANDATORY_LENSES[0]` (correctness). Its admitted findings join the verdict like the other mandatory seats. Extend the registration assertion at the bottom of `reviewPrOperation` to cover the new step.
 3. **No double Codex correctness seat.** When `judgeCrossProvider` runs, the opt-in `judgeCorrectnessAdvisory` seat is suppressed for that run. It would be the same model on the same lens.
 4. **Independence record.** `reduce` adds `verdict.independence = { authors, seatProviders: { correctness: 'claude', security: 'claude', crossProvider: 'codex'|'skipped' }, crossProvider: 'met'|'not-required'|'unmet', cause }`. The value is `unmet` when the seat was required and Codex was skipped, timed out or returned an invalid answer. `renderVerdictWriteUp` (line 1500) prints one line: `Independence: authors <list>; seats <provider per lens>; cross-provider <met|not-required|unmet (cause)>`.
-5. **Unmet blocks unattended accept only.** `reviewLoopAutoConfirm` declines an `accept` when `run.verdict.independence?.crossProvider === 'unmet'`. The run stays parked; the existing queued-accept notice names the cause. A human `/review` can still clear it, because a human is independent. A `changes` verdict from any seat still bounces normally. This is the fail-closed default. Decision 4772 may later choose a softer stand-in.
+5. **Unmet blocks unattended accept only.** `reviewLoopAutoConfirm` declines an `accept` when `run.verdict.independence?.crossProvider === 'unmet'`. The run stays parked; the existing queued-accept notice names the cause. A human `/review` can still clear it, because a human is independent. A `changes` verdict from any seat still bounces normally.
+7. **The stand-in is the `crossProviderFallback` dimension (decision 4772, ruled 2026-10-03).** The `unmet` handling in step 5 is governed by one key in the keyed `webeverything.config.*` file, declared in `we:config/defineConfig.ts` with its platform default in `we:config/platformDefaults.ts` (already landed with the ruling). Values: `park-now` (decline the unattended accept at once, the original step 5); `wait-then-park` (**default**: keep the run `review:pending`, re-dispatch when the quota-hold reset time from `we:scripts/lib/provider-quota-hold.mjs` passes, and park `review:human` once `waitTimeoutMs` has elapsed, default 24 hours); `same-provider-other-model` (opt-in only: a different Claude model, e.g. Opus on a Sonnet-authored PR, counts as the independent seat and the run records `crossProvider: met` with cause `same-provider-other-model`). `review-pr` reads the resolved value; a missing, unparseable or unknown value resolves to the default `wait-then-park`, never to `same-provider-other-model`. The judge seat (decision xud2hha) reads the same key.
 6. **Probation role.** Add `'mandatory-review'` to `PROBATION_ROLES`, and do not add it to `NEVER_BLOCKING_ROLES`. Give the `codex::gpt-6-astra` entry `mandatory-review: probation` with `since: <build date>`, owner `4880`. Its meaning: this seat may block (veto) a PR, but its accept never clears one alone, because the Claude mandatory seats must also accept. This follows the operator's 2026-10-03 direction for a cross-provider mandatory seat. Graduation to `trusted` stays a separate human ruling (`we:docs/agent/platform-decisions.md#model-probation-graduation-criteria`).
 
 ## MVP
 
-Steps 1-6 in one PR. Incremental behind `main`; additive. The new step is the only behaviour change, and it only adds a blocking seat or a park.
+Steps 1-7 in one PR. Incremental behind `main`; additive. The new step is the only behaviour change, and it only adds a blocking seat or a park.
 
 This card must land after 4815 (open PR #3507), which edits `we:scripts/operations/review-pr.mjs`, and after 4374, which edits the same request builders. It needs 4874 for `reviewNeedFor`.
 
-Tasks: (1) add the transport field and test; (2) add the probation role and registry entry, with tests; (3) add the request builder and step, with the registration assertion; (4) add `independence` to `reduce` and the write-up; (5) add the decline rule to the loop policy; (6) run the live proof.
+Tasks: (1) add the transport field and test; (2) add the probation role and registry entry, with tests; (3) add the request builder and step, with the registration assertion; (4) add `independence` to `reduce` and the write-up; (5) add the decline rule to the loop policy; (6) read the `crossProviderFallback` dimension in `review-pr` and the review daemon's re-dispatch (the three values, the timeout, the default); (7) run the live proof.
 
 ## Test plan
 
@@ -64,6 +65,14 @@ Tasks: (1) add the transport field and test; (2) add the probation role and regi
   - `judgeCorrectnessAdvisory` is not spawned when the cross-provider seat runs;
   - the write-up shows the independence line.
 - (RED today) `we:scripts/lib/__tests__/review-loop-policy.test.mjs`: an agent-addressed `accept` with `unmet` returns `null` (decline). `met` and `not-required` answer as before. A `changes` with `unmet` is unaffected.
+- (RED today) `crossProviderFallback` in `review-pr` / `review-loop-policy` tests, one case per value:
+  - `park-now`: Codex skipped gives `unmet` and an immediate decline, with no re-dispatch scheduled;
+  - `wait-then-park`: Codex skipped inside `waitTimeoutMs` keeps the run `review:pending` and schedules a re-dispatch at the hold's reset time;
+  - `wait-then-park` timeout expiry: once `waitTimeoutMs` has elapsed with the seat still unavailable, the run parks `review:human` with the reason;
+  - `same-provider-other-model`: a different Claude model seats as the independent seat and the run records `met` with that cause;
+  - default: with no config key, with an unknown value and with a malformed value, the resolved policy is `wait-then-park`, and `same-provider-other-model` is never selected unless explicitly set;
+  - the default `waitTimeoutMs` equals `PLATFORM_CROSS_PROVIDER_FALLBACK_WAIT_TIMEOUT_MS` and a non-positive or non-numeric timeout falls back to it.
+- The config contract (`we:config/__tests__/config-contract.test.ts`) already asserts the three values are accepted and the default is `wait-then-park`, not `same-provider-other-model`.
 - (RED today) **Must on error:** unknown authorship, a malformed `commits` field, a Codex timeout, malformed JSON or a refusal must all give `unmet` or seat Codex. None may give `not-required` or an unattended accept.
 - (RED today) **Must for non-code:** a docs-only, config-only or data-only Claude-authored PR still seats Codex. The independence rule does not depend on file type. Only a Codex-only authorship skips the seat.
 
@@ -85,6 +94,6 @@ Tasks: (1) add the transport field and test; (2) add the probation role and regi
 
 ## Follow-ups
 
-- Decision 4772: what may stand in when Codex is unavailable. This card ships option A (park for a human) until that is ruled.
+- Decision 4772 is ruled (2026-10-03): the stand-in is the `crossProviderFallback` dimension, default `wait-then-park` (design step 7).
 - When xud2hha is ruled, align the judge seat with this review-seat rule. Both should use the same author-provider reader from 4874.
 - Seat-level trial records for `mandatory-review` (rate the Codex seat's blocking findings against outcomes) belong in the run-rating work. File them when 20 or more real blocking findings exist.

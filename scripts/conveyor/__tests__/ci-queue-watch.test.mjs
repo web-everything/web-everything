@@ -362,9 +362,9 @@ describe('ci-queue-watch.mjs CLI — real subprocess, fake gh, real sidecar file
     const argvFile = join(dir, 'gh-argv-repo.json');
     writeFileSync(ghPath, `#!/usr/bin/env node\nrequire('fs').writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));\nprocess.stdout.write('[]');\n`);
     chmodSync(ghPath, 0o755);
-    runCli(['sweep', '--json', '--repo=chalbert/web-everything']);
+    runCli(['sweep', '--json', '--repo=web-everything/web-everything']);
     const ghArgv = JSON.parse(readFileSync(argvFile, 'utf8'));
-    expect(ghArgv[ghArgv.indexOf('--repo') + 1]).toBe('chalbert/web-everything');
+    expect(ghArgv[ghArgv.indexOf('--repo') + 1]).toBe('web-everything/web-everything');
   });
 
   it('a bare valueless --limit (no "=N") falls back to the default limit, never Number(true) === 1', () => {
@@ -418,7 +418,7 @@ it('keeps separate per-repo histories and preserves the WE filename', async () =
   const previous = process.env.CONVEYOR_CI_QUEUE_FILE;
   try {
     process.env.CONVEYOR_CI_QUEUE_FILE = join(dir, 'history.json');
-    for (const [repo, suffix, count] of [['chalbert/web-everything', '', 1], ['chalbert/frontierui', '-frontierui', 2], ['chalbert/plateau-app', '-plateau-app', 3]]) {
+    for (const [repo, suffix, count] of [['web-everything/web-everything', '', 1], ['frontier-ui/frontierui', '-frontierui', 2], ['plateauapp/plateau-app', '-plateau-app', 3]]) {
       for (let i = 0; i < count; i++) sweepCiQueue({ repo, listRuns: () => [], now: () => repo });
       const path = resolveCiQueueHistoryPath(repo);
       expect(path).toBe(join(dir, `history${suffix}.json`));

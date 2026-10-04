@@ -5,7 +5,7 @@
  * — see that file's own `latestRequiredCheck` header for the full live-incident history: a rollup can carry a
  * STALE, superseded run beside the check's real latest run, and a reader that does not collapse to the latest
  * run per name first misreads the stale one as still current) into its OWN dependency-free module, we:backlog/
- * fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, chalbert/web-everything).
+ * fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, web-everything/web-everything).
  *
  * WHY A SEPARATE FILE, NOT JUST "IMPORT IT FROM merge-ai-prs.mjs" (what every existing caller already does —
  * `we:scripts/fetch-parked.mjs`, `we:scripts/readiness/conveyor-state.mjs`, `we:scripts/conveyor/

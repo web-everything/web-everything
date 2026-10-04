@@ -52,7 +52,7 @@ describe('makeEvidenceResolver', () => {
     const followUps = [{ session: '9eff9f54', kind: 'review', target: 'plateau-app#148' }];
     const evidenceFor = makeEvidenceResolver({ followUps, statFn: statMap({}), readCompletionFn: () => null, prSignalFor });
     expect(evidenceFor(session).prSignal).toEqual({ reviewSignalAtMs: 5, what: 'label review:accepted' });
-    expect(calls).toEqual([['148', 'chalbert/plateau-app']]);
+    expect(calls).toEqual([['148', 'plateauapp/plateau-app']]);
     // no ledger target → repo is ambiguous → never guessed
     expect(evidenceFor({ ...session, id: 'zzzz', sessionId: 'zzzz-1' }).prSignal).toBeUndefined();
     // cheaper proof present → no gh call
@@ -76,7 +76,7 @@ describe('makeEvidenceResolver', () => {
 describe('prSignalFromGh', () => {
   const exec = (labels, comments) => (_p, args) => (args[1].endsWith('/events') ? labels : comments);
   it('takes the newest review:* label or verdict comment', () => {
-    const r = prSignalFromGh('148', 'chalbert/plateau-app', { exec: exec('2026-09-20T12:00:00Z review:pending\n2026-09-20T13:00:00Z review:accepted\n', '2026-09-20T13:30:00Z\n') });
+    const r = prSignalFromGh('148', 'plateauapp/plateau-app', { exec: exec('2026-09-20T12:00:00Z review:pending\n2026-09-20T13:00:00Z review:accepted\n', '2026-09-20T13:30:00Z\n') });
     expect(r).toEqual({ reviewSignalAtMs: Date.parse('2026-09-20T13:30:00Z'), what: 'verdict comment' });
   });
   it('none found → null signal; gh failure → null (unknown)', () => {
@@ -87,8 +87,8 @@ describe('prSignalFromGh', () => {
 
 describe('slugForRepoKey', () => {
   it('maps the constellation keys to owner/repo slugs and refuses unknown ones', () => {
-    expect(slugForRepoKey('we')).toBe('chalbert/web-everything');
-    expect(slugForRepoKey('plateau-app')).toBe('chalbert/plateau-app');
+    expect(slugForRepoKey('we')).toBe('web-everything/web-everything');
+    expect(slugForRepoKey('plateau-app')).toBe('plateauapp/plateau-app');
     expect(slugForRepoKey('nope')).toBeNull();
     expect(slugForRepoKey('__proto__')).toBeNull();
   });

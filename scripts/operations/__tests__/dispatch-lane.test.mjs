@@ -1120,7 +1120,7 @@ describe('what the sink actually runs', () => {
     let message = '';
     try { await sinks[DISPATCH_EFFECT]({ prompt: 'p', sessionSlug: 's', num: '1' }); } catch (e) { message = e.message; }
     expect(message).toMatch(/no agent exists/);
-    const line = `reconcile-fix-dispatch-daemon: refused dispatch-failed chalbert/web-everything PR #1 — ${message}`;
+    const line = `reconcile-fix-dispatch-daemon: refused dispatch-failed web-everything/web-everything PR #1 — ${message}`;
     expect(parseDaemonLog(line).trustRefusals).toBe(1);
   });
 
@@ -2782,7 +2782,7 @@ describe('#3960: the fix/ci-heal briefs fill repo-aware, and reproduce WE\'s pre
     // Landing-freeze fix (lane-leftover-reclaim) — `--repo=` is now `{{LANE_REPO}}`, an absolute path equal to
     // `{{WE_ROOT}}` for `we` (was the literal `.`, broken from a dispatched session's scratch cwd — #4174).
     expect(prompt).toContain(`node "${tokens.WE_ROOT}/scripts/lane-pool.mjs" acquire --repo=${tokens.LANE_REPO} --lane=5`);
-    expect(prompt).toContain('gh pr view 701 --json title,body,comments --repo chalbert/web-everything');
+    expect(prompt).toContain('gh pr view 701 --json title,body,comments --repo web-everything/web-everything');
   });
 
   it('for WE, the ci-heal brief\'s {{ATTRIBUTION}} reproduces the pre-#3960 hardcoded literal exactly', () => {
@@ -2798,7 +2798,7 @@ describe('#3960: the fix/ci-heal briefs fill repo-aware, and reproduce WE\'s pre
     const tokens = briefTokensForRepo('plateau-app', {
       itemNum: '2608', home: '/home/test', checkoutExists: () => true, readPackageJson: () => PLATEAU_PACKAGE_JSON,
     });
-    expect(tokens.REPO).toBe('chalbert/plateau-app');
+    expect(tokens.REPO).toBe('plateauapp/plateau-app');
     expect(tokens.LANE_REPO).toBe('/home/test/workspace/plateau-app');
     expect(tokens.GATE_COMMAND).toBe(`node ${tokens.WE_ROOT}/scripts/verify-lane.mjs run --repo=.`); // verify-lane picks `npm test` itself (#3919)
     const { prompt, unknownTokens } = fillBrief(FIX_BRIEF, { ...BASE_FIX_VALUES, ...tokens }, BRIEF_REQUIRED_BY_KIND.fix, undefined, REPO_AWARE_VALUE_PATTERNS);
@@ -2807,8 +2807,8 @@ describe('#3960: the fix/ci-heal briefs fill repo-aware, and reproduce WE\'s pre
     // Every tool this brief runs is qualified with WE_ROOT — the tools live only there, never in the plateau
     // checkout `{{LANE_REPO}}` names.
     expect(prompt).toContain(`node "${tokens.WE_ROOT}/scripts/lane-pool.mjs" acquire --repo=/home/test/workspace/plateau-app`);
-    expect(prompt).toContain(`node "${tokens.WE_ROOT}/scripts/conveyor/rearm-review.mjs" 701 --repo=chalbert/plateau-app`);
-    expect(prompt).toContain(`node "${tokens.WE_ROOT}/scripts/operations/completion-cli.mjs" report --repo=chalbert/plateau-app`);
+    expect(prompt).toContain(`node "${tokens.WE_ROOT}/scripts/conveyor/rearm-review.mjs" 701 --repo=plateauapp/plateau-app`);
+    expect(prompt).toContain(`node "${tokens.WE_ROOT}/scripts/operations/completion-cli.mjs" report --repo=plateauapp/plateau-app`);
     expect(prompt).not.toContain('node "/home/test/workspace/plateau-app/scripts');
     // The gate runs against the plateau lane (`--repo=.`), with WE's own verify-lane choosing plateau's scripts.
     expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/verify-lane.mjs request --repo=.`);
@@ -2862,7 +2862,7 @@ describe('#4269: the ci-heal brief captures the examined head ONCE and never re-
       { ITEM_NUM: '2638', PR_NUM: 743, LANE_REF: 'lane/2638-x', LANE: 6, SESSION_SLUG: 'ci-heal-743', SCOPE: 'we:scripts/operations/', REASON: 'red-ci', ...tokens },
       BRIEF_REQUIRED_BY_KIND['ci-heal'], undefined, REPO_AWARE_VALUE_PATTERNS,
     );
-    expect(prompt).toContain('EXAMINED_HEAD="$(gh pr view 743 --repo chalbert/web-everything --json headRefOid --jq .headRefOid)"');
+    expect(prompt).toContain('EXAMINED_HEAD="$(gh pr view 743 --repo web-everything/web-everything --json headRefOid --jq .headRefOid)"');
     // lane-ref-gone, conflict, not-a-ci-break, needs-human, waiting-on-system-fix
     expect(prompt.match(/--head="\$EXAMINED_HEAD"/g)).toHaveLength(5);
   });
@@ -3254,7 +3254,7 @@ describe('#3110 — a fresh build dispatch\'s attempt tag rides its session slug
 
 describe('shapeDispatchRead — refuses a dispatch a real merged PR already shows done (#3457/#3460)', () => {
   const alreadyDonePr = (over = {}) => ({
-    number: 1768, url: 'https://github.com/chalbert/web-everything/pull/1768',
+    number: 1768, url: 'https://github.com/web-everything/web-everything/pull/1768',
     title: 'review-loop-policy: mechanical acceptance from a clean independent verdict (#3434)',
     mergedAt: '2026-09-01T16:44:28Z', ...over,
   });
@@ -3286,15 +3286,15 @@ describe('shapeDispatchRead — refuses a dispatch a real merged PR already show
     });
     const v = shapeDispatchRead(read, { num: '3434' });
     expect(v.dispatching).toBe(false);
-    expect(v.holdReason).toContain('https://github.com/chalbert/web-everything/pull/1768');
+    expect(v.holdReason).toContain('https://github.com/web-everything/web-everything/pull/1768');
     expect(v.holdReason).toContain('prepare-decision');
   });
 
   it('reproduces the REAL #3433 shape — a plain `build` launch, refused the same way with its own PR', () => {
-    const pr = { number: 1829, url: 'https://github.com/chalbert/web-everything/pull/1829', title: 'WE #3433: bake a Bash disallowedTools deny list into every dispatched review session', mergedAt: '2026-09-02T16:31:19Z' };
+    const pr = { number: 1829, url: 'https://github.com/web-everything/web-everything/pull/1829', title: 'WE #3433: bake a Bash disallowedTools deny list into every dispatched review session', mergedAt: '2026-09-02T16:31:19Z' };
     const v = shapeDispatchRead(tickRead({ resolvedNum: '3433', alreadyDone: { done: true, pr, checked: true } }), { num: '3433' });
     expect(v.dispatching).toBe(false);
-    expect(v.holdReason).toContain('https://github.com/chalbert/web-everything/pull/1829');
+    expect(v.holdReason).toContain('https://github.com/web-everything/web-everything/pull/1829');
   });
 
   it('an UNCHECKED or nothing-found verdict never blocks a real, legitimately-needed dispatch', () => {

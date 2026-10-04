@@ -15,7 +15,7 @@ const record = { standDownId: 'IC_stopped', reason, actor: 'chalbert', channel: 
 const trusted = (body, id = 'IC_answer') => ({ id, body, author: { login: 'web-everything' }, viewerDidAuthor: false });
 const stop = trusted(buildStandDownComment({ reason: 'needs-judgment', detail: '#4650 conflicts with #4658' }), record.standDownId);
 const answer = trusted(buildOperatorAnswer(record));
-const argv = ['3181', '--repo=chalbert/web-everything', `--reason=${reason}`, '--actor=chalbert', '--channel=Codex chat'];
+const argv = ['3181', '--repo=web-everything/web-everything', `--reason=${reason}`, '--actor=chalbert', '--channel=Codex chat'];
 const pr = (comments) => ({ number: 3181, state: 'OPEN', headRefName: 'lane/answer-test', headRefOid: 'a'.repeat(40),
   labels: [{ name: 'review:changes' }], mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
   comments: [trusted('1. Correct the prepare scope guard.'), ...comments], files: [{ path: 'scripts/prepare.mjs' }] });
@@ -87,7 +87,7 @@ else {
   it('names a failed comments read in one line and performs no write', () => {
     const gh = vi.fn(() => { throw new Error('spawnSync gh ENOBUFS\nlarge subprocess diagnostics'); });
     expect(() => runStandDownAnswer(argv, { gh })).toThrow(
-      /^Could not read comments for chalbert\/web-everything PR #3181: spawnSync gh ENOBUFS$/,
+      /^Could not read comments for web-everything\/web-everything PR #3181: spawnSync gh ENOBUFS$/,
     );
     expect(gh).toHaveBeenCalledTimes(1);
   });

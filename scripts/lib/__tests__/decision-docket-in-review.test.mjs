@@ -24,7 +24,7 @@ import { findRawMarkers } from './fixtures/docket-raw-markers.mjs';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../../..');
 const TEMPLATE = readFileSync(join(ROOT, 'skills-src/decision-docket/template.html'), 'utf8');
 const NOW = new Date('2026-09-21T12:00:00Z');
-const PR_URL = (n) => `https://github.com/chalbert/web-everything/pull/${n}`;
+const PR_URL = (n) => `https://github.com/web-everything/web-everything/pull/${n}`;
 
 describe('classifyPrKind / pickPr', () => {
   it('reads the kind off the title prefix, for THIS item only', () => {
@@ -58,9 +58,9 @@ describe('classifyPrKind / pickPr', () => {
   });
 
   it('buildDecisionRecord carries the PR and its blockers; a plain row has pr: null and no blockers', () => {
-    const entry = { num: '9106', title: 'T', prepared: false, prs: [{ number: 7, title: 'prepare #9106: forks', url: PR_URL(7), repo: 'chalbert/web-everything' }], blockedBy: ['9105'] };
+    const entry = { num: '9106', title: 'T', prepared: false, prs: [{ number: 7, title: 'prepare #9106: forks', url: PR_URL(7), repo: 'web-everything/web-everything' }], blockedBy: ['9105'] };
     const rec = buildDecisionRecord(entry, null, NOW);
-    expect(rec.pr).toEqual({ number: 7, state: 'open', kind: 'preparation', title: 'prepare #9106: forks', url: PR_URL(7), repo: 'chalbert/web-everything' });
+    expect(rec.pr).toEqual({ number: 7, state: 'open', kind: 'preparation', title: 'prepare #9106: forks', url: PR_URL(7), repo: 'web-everything/web-everything' });
     expect(rec.blockedBy).toEqual(['9105']);
     const plain = buildDecisionRecord({ num: '1', title: 'T' }, null, NOW);
     expect(plain.pr).toBeNull();
@@ -75,7 +75,7 @@ function row(num, over = {}) {
     pr: null, blockedBy: [], ...over,
   };
 }
-const prOf = (number, kind, extra = {}) => ({ number, state: 'open', kind, title: `${kind} #x: t`, url: PR_URL(number), repo: 'chalbert/web-everything', ...extra });
+const prOf = (number, kind, extra = {}) => ({ number, state: 'open', kind, title: `${kind} #x: t`, url: PR_URL(number), repo: 'web-everything/web-everything', ...extra });
 
 describe('renderDocketHtml — the In review section', () => {
   const data = {
@@ -84,7 +84,7 @@ describe('renderDocketHtml — the In review section', () => {
       row(1, { title: 'Plain `ranked` decision', leverageScore: 50 }),
       row(2, { title: 'Ratify me **now**', prepared: true, preparedDate: '2026-09-01', leverageScore: 5, pr: prOf(2376, 'ratification') }),
       row(3, { title: 'Prepare me', leverageScore: 90, pr: prOf(2375, 'preparation') }),
-      row(4, { title: 'Blocked and in review', leverageScore: 1, pr: prOf(2399, 'other', { repo: 'chalbert/frontierui' }), blockedBy: ['1770', '1979'] }),
+      row(4, { title: 'Blocked and in review', leverageScore: 1, pr: prOf(2399, 'other', { repo: 'frontier-ui/frontierui' }), blockedBy: ['1770', '1979'] }),
     ],
   };
   const html = renderDocketHtml(data, TEMPLATE, { now: NOW });
@@ -214,7 +214,7 @@ describe('the real generator CLI over a fixture corpus (offline)', () => {
 
   it('lists the open-PR decisions (ready or blocked) with a pr field; leaves the blocked-only one off', () => {
     expect(Object.keys(byNum).sort()).toEqual(['9101', '9102', '9104', '9106']);
-    expect(byNum['9101'].pr).toEqual({ number: 9901, state: 'open', kind: 'ratification', title: 'ratify #9101: rule it', url: PR_URL(9901), repo: 'chalbert/web-everything' });
+    expect(byNum['9101'].pr).toEqual({ number: 9901, state: 'open', kind: 'ratification', title: 'ratify #9101: rule it', url: PR_URL(9901), repo: 'web-everything/web-everything' });
     expect(byNum['9102'].pr).toMatchObject({ number: 9902, kind: 'preparation', url: PR_URL(9902) });
     expect(byNum['9106'].pr).toMatchObject({ number: 9906, kind: 'preparation' });
     expect(byNum['9106'].blockedBy).toEqual(['9105']); // blocked AND in review: listed, and says what blocks it

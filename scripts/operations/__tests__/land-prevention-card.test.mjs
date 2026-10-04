@@ -53,7 +53,7 @@ const FILE_ITEM_OK = JSON.stringify({ verdict: { num: 9001, rel: 'backlog/9001-f
 const VERIFY_GREEN = JSON.stringify({ verdict: { ok: true, passed: 2, failed: 0, unrun: 0, blocking: [] } });
 const OPEN_PR_OPENED = JSON.stringify({
   runId: 'r1', op: 'open-pr', stopped: 'complete', applied: [], inFlight: [], pending: null,
-  findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 5555, url: 'https://github.com/chalbert/web-everything/pull/5555' } }] } },
+  findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 5555, url: 'https://github.com/web-everything/web-everything/pull/5555' } }] } },
 });
 
 describe('landPreventionCard — the real acquire → file-item → commit → verify → open-pr → release sequence', () => {
@@ -88,7 +88,7 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
       exec, write: () => {}, mkTmp: () => '/tmp/land-prevention-card-x', rmTmp: () => {}, writeFile: (p, c) => written.push({ p, c }),
     });
     expect(written.find(({ p }) => p.endsWith('commit-msg.txt')).c.split('\n')[0]).toBe('WE #9001: prevention — Reject malformed flags (from #42 review)');
-    expect(result).toEqual({ ok: true, step: 'done', num: 9001, rel: 'backlog/9001-file-the-prevention.md', pr: 5555, url: 'https://github.com/chalbert/web-everything/pull/5555', reason: null });
+    expect(result).toEqual({ ok: true, step: 'done', num: 9001, rel: 'backlog/9001-file-the-prevention.md', pr: 5555, url: 'https://github.com/web-everything/web-everything/pull/5555', reason: null });
 
     // acquire — a real lane, never the daemon clone that spawned this job.
     expect(calls[0].cmd).toBe('node');
@@ -125,7 +125,7 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
     expect(written.some((w) => w.p.endsWith('pr-body.md') && w.c.includes(INPUT.digest))).toBe(true);
   });
 
-  // chalbert/web-everything#2766's own approval (2026-09-27) FAILED live because the OLD synchronous seam
+  // web-everything/web-everything#2766's own approval (2026-09-27) FAILED live because the OLD synchronous seam
   // (this file's own predecessor, inline in `review-set-label.mjs` before #4317) fell back to `execFileSync`'s
   // thrown `e.message` — Node's "Command failed: <cmd> <args…>" reconstruction — whenever `e.stderr` was empty,
   // which leaked a fragment of THIS CALL'S OWN argv (the multi-line digest running straight into the next

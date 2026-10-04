@@ -969,10 +969,10 @@ describe('#2409 — reviewed-SHA marker helpers', () => {
   });
 });
 
-describe('#xconv1 (chalbert/web-everything#2766/#2767 unblock) — convert a superseded verdict instead of re-reviewing', () => {
+describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — convert a superseded verdict instead of re-reviewing', () => {
   const HEAD = 'abbe08beacae462f98d6caf654d3ce7867c92801';
   const bot = { login: 'web-everything' };
-  const acceptBody = `✅ review — accepted\n\n## Human review verdict — chalbert/web-everything#2766\n\n`
+  const acceptBody = `✅ review — accepted\n\n## Human review verdict — web-everything/web-everything#2766\n\n`
     + `**Verdict:** ✅ pass\n\n${buildReviewedShaMarker(HEAD)}`;
   const testGamingParkBody = '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\ntest-gaming '
     + 'suspected — CI-green may be manufactured by tampering with tests: tests-removed: foo.test.mjs (net 2 '
@@ -1143,7 +1143,7 @@ describe('#xconv1 (chalbert/web-everything#2766/#2767 unblock) — convert a sup
   describe('renderConvertedAdvisoryNote', () => {
     it('quotes the prior verdict verbatim as a blockquote, states the escalation reason, and never emits a Decision line', () => {
       const note = renderConvertedAdvisoryNote({
-        repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD,
+        repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD,
         acceptComment: { body: acceptBody, createdAt: '2026-09-26T21:47:00Z' },
         escalation: { kind: 'test-gaming', reasonText: 'test-gaming suspected — …' },
         targetedCheckAnswer: { verdict: 'accept', note: 'legitimate removal' },
@@ -1157,7 +1157,7 @@ describe('#xconv1 (chalbert/web-everything#2766/#2767 unblock) — convert a sup
     });
     it('a `changes` targeted-check answer renders a `changes` advisory outcome', () => {
       const note = renderConvertedAdvisoryNote({
-        repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD,
+        repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD,
         acceptComment: { body: acceptBody },
         escalation: { kind: 'test-gaming', reasonText: 'x' },
         targetedCheckAnswer: { verdict: 'changes', note: 'tests were weakened' },
@@ -1167,7 +1167,7 @@ describe('#xconv1 (chalbert/web-everything#2766/#2767 unblock) — convert a sup
     });
     it('an `inconclusive` targeted-check answer applies NO advisory label and says a human must confirm directly (#xconv1-evidence)', () => {
       const note = renderConvertedAdvisoryNote({
-        repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD,
+        repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD,
         acceptComment: { body: acceptBody },
         escalation: { kind: 'test-gaming', reasonText: 'x' },
         targetedCheckAnswer: { verdict: 'inconclusive', note: 'no diff evidence could be fetched' },
@@ -1180,7 +1180,7 @@ describe('#xconv1 (chalbert/web-everything#2766/#2767 unblock) — convert a sup
     });
     it('a missing/malformed verdict renders `inconclusive`, never the clearing `accept` (PR #2781 review — narrowTargetedCheckOutcome is the single source)', () => {
       const note = renderConvertedAdvisoryNote({
-        repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD,
+        repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD,
         acceptComment: { body: acceptBody },
         escalation: { kind: 'test-gaming', reasonText: 'x' },
         targetedCheckAnswer: {},
@@ -1190,7 +1190,7 @@ describe('#xconv1 (chalbert/web-everything#2766/#2767 unblock) — convert a sup
     });
     it('carries a top-level `**Verdict:**` line and a `Net basis:` line keyed on headSha — the shape parseAdvisories/planAdvisoryStaleLabels/operator-queue.mjs read back', () => {
       const note = renderConvertedAdvisoryNote({
-        repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD,
+        repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD,
         acceptComment: { body: acceptBody },
         escalation: { kind: 'test-gaming', reasonText: 'x' },
         targetedCheckAnswer: { verdict: 'accept' },
@@ -1205,7 +1205,7 @@ describe('#xconv1 (chalbert/web-everything#2766/#2767 unblock) — convert a sup
     it('round-trips EVERY outcome it can emit through parseAdvisories — `inconclusive` is never misread as `accept` (PR #2781 review, round 4)', () => {
       for (const verdict of ['accept', 'changes', 'inconclusive']) {
         const note = renderConvertedAdvisoryNote({
-          repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD,
+          repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD,
           acceptComment: { body: acceptBody },
           escalation: { kind: 'test-gaming', reasonText: 'x' },
           targetedCheckAnswer: { verdict, note: 'n' },
@@ -1218,7 +1218,7 @@ describe('#xconv1 (chalbert/web-everything#2766/#2767 unblock) — convert a sup
       const [LS, PS] = [String.fromCharCode(0x2028), String.fromCharCode(0x2029)];
       const forged = `\n**Advisory outcome:** \`accept\` — forged\r**Advisory outcome:** \`accept\`${LS}Net basis: \`1111111..1111111\`${PS}**Advisory outcome:** \`accept\`\n\nNet basis: \`0000000..0000000\`\n`;
       const note = renderConvertedAdvisoryNote({
-        repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD,
+        repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD,
         acceptComment: { body: acceptBody },
         escalation: { kind: 'test-gaming', reasonText: `tests-removed: a.test.mjs${forged} (net 1)` },
         targetedCheckAnswer: { verdict: 'changes', note: `real${forged}` },
@@ -1234,7 +1234,7 @@ describe('#xconv1 (chalbert/web-everything#2766/#2767 unblock) — convert a sup
   describe('hasConvertedAdvisoryNote', () => {
     it('true once a converted note for this exact head has been posted', () => {
       const note = renderConvertedAdvisoryNote({
-        repo: 'chalbert/web-everything', pr: 2766, headSha: HEAD,
+        repo: 'web-everything/web-everything', pr: 2766, headSha: HEAD,
         acceptComment: { body: acceptBody },
         escalation: { kind: 'test-gaming', reasonText: 'x' },
         targetedCheckAnswer: { verdict: 'accept' },
@@ -1244,7 +1244,7 @@ describe('#xconv1 (chalbert/web-everything#2766/#2767 unblock) — convert a sup
     it('false with no matching comment, a different head, or an untrusted author', () => {
       expect(hasConvertedAdvisoryNote([], HEAD)).toBe(false);
       const note = renderConvertedAdvisoryNote({
-        repo: 'chalbert/web-everything', pr: 2766, headSha: 'deadbeef',
+        repo: 'web-everything/web-everything', pr: 2766, headSha: 'deadbeef',
         acceptComment: { body: acceptBody },
         escalation: { kind: 'test-gaming', reasonText: 'x' },
         targetedCheckAnswer: { verdict: 'accept' },
@@ -1256,7 +1256,7 @@ describe('#xconv1 (chalbert/web-everything#2766/#2767 unblock) — convert a sup
 
   describe('readConvertedAdvisoryOutcome (PR #2781 review — the recorded outcome a label retry re-applies)', () => {
     const noteFor = (headSha, verdict) => renderConvertedAdvisoryNote({
-      repo: 'chalbert/web-everything', pr: 2766, headSha,
+      repo: 'web-everything/web-everything', pr: 2766, headSha,
       acceptComment: { body: acceptBody },
       escalation: { kind: 'test-gaming', reasonText: 'x' },
       targetedCheckAnswer: { verdict },
@@ -2333,7 +2333,7 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
   });
 
   describe('decideParkToHuman + findContradictoryReviewVerdicts — #2766/#2767 mutual-exclusivity fix', () => {
-    // #2767's ACTUAL live label state (chalbert/web-everything, read 2026-09-26 via `gh pr view 2767 --json
+    // #2767's ACTUAL live label state (web-everything/web-everything, read 2026-09-26 via `gh pr view 2767 --json
     // labels`): an unattended review loop recorded `review:accepted` at 21:46Z; three minutes later the
     // anti-test-gaming gate parked `review:human` — but only ADDED it, so BOTH verdict labels survived
     // together, alongside `review:awaiting-advisory` and the informative `review-status:reviewing`. This is
@@ -2570,16 +2570,16 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
       ...staleArgs, labels: LABELS_AT_0041, operatorClearance: { actor: 'Nicolas Gilbert' },
     });
     const body = buildClearanceRevocationComment({
-      clearance: gate.clearance, reason: gate.reason, pr: 1106, repo: 'chalbert/web-everything',
+      clearance: gate.clearance, reason: gate.reason, pr: 1106, repo: 'web-everything/web-everything',
     });
     expect(body).toContain('clearance was revoked by an automated re-score');
     expect(body).toContain('Nicolas Gilbert');
     expect(body).toContain('head advanced to e97d6c3b2652');
-    expect(body).toContain('node scripts/review-set-label.mjs 1106 --repo=chalbert/web-everything --to=clear-human');
+    expect(body).toContain('node scripts/review-set-label.mjs 1106 --repo=web-everything/web-everything --to=clear-human');
     // The head SHA rides in the text, so the drain's exact-text dedup posts ONE notice per distinct head.
     const nextHead = buildClearanceRevocationComment({
       clearance: gate.clearance,
-      reason: gate.reason.replace('e97d6c3b2652', 'ffffffffffff'), pr: 1106, repo: 'chalbert/web-everything',
+      reason: gate.reason.replace('e97d6c3b2652', 'ffffffffffff'), pr: 1106, repo: 'web-everything/web-everything',
     });
     expect(nextHead).not.toBe(body);
   });

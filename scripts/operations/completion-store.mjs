@@ -205,7 +205,7 @@ export function writeCompletion(record, dir = resolveCompletionsDir(), { expectP
       toWrite = { ...record, infraStreak: prevStreak, infraStreakSince: prev.infraStreakSince ?? prev.updatedAt };
     }
 
-    // #4314 (prevention guard owed by chalbert/web-everything#2831's independent review, finding 4) —
+    // #4314 (prevention guard owed by web-everything/web-everything#2831's independent review, finding 4) —
     // the write is temp-file-then-rename for atomicity, but a failure between the two (a real EISDIR/ENOTDIR
     // from a corrupted or concurrently-modified completions dir, a full disk, a permission error) used to leave
     // the `.tmp` file on disk forever: nothing else in this module, or any reader (`listCompletionSessions`),

@@ -134,7 +134,7 @@ function a2Def() {
         // behind-only clone instead of fast-forwarding it past the smoke gate. A local-only ahead commit is no
         // longer how a daemon clone runs ahead (overlays are); the rebuild refuses such a commit as local work.
         w.gh.raw.fault({
-          verb: 'pr list', kind: 'push-to-main', times: 1, repo: 'chalbert/web-everything',
+          verb: 'pr list', kind: 'push-to-main', times: 1, repo: 'web-everything/web-everything',
           files: touchedImported(w, 'a2'), message: 'sim: a2 mid-tick origin advance (daemon code)',
         });
       },

@@ -56,7 +56,7 @@ describe('the real incident that motivated this pass — the 2026-09-05 quadrupl
   it('a full sweep over the real #3478 quadruple posts exactly four findings, each citing its own siblings', () => {
     const posted = [];
     const postFinding = ({ repo, pr, body }) => posted.push({ repo, pr, body });
-    const results = watchDuplicatePrs({ repo: 'chalbert/web-everything', listPrs: () => QUADRUPLE_3478, postFinding });
+    const results = watchDuplicatePrs({ repo: 'web-everything/web-everything', listPrs: () => QUADRUPLE_3478, postFinding });
     expect(results).toHaveLength(4);
     expect(results.every((r) => r.posted)).toBe(true);
     expect(posted).toHaveLength(4);

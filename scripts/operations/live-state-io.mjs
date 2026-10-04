@@ -44,7 +44,7 @@ import { openHealthEpisodesData } from '../conveyor/health-watch-section.mjs';
 import { readJsonlTail } from './land-advance-io.mjs';
 import { readGithubAppStatus, defaultStatusPath } from '../lib/github-app-auth-env.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
-import { createAgentActivityReader } from './agent-activity-io.mjs';
+import { createAgentActivityReader, leasesFromLanePoolStatus, RECENT_MS } from './agent-activity-io.mjs';
 import { enrichRows } from './live-work-io.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -61,17 +61,25 @@ export function defaultDrainHistoryPath(env = process.env, home = homedir()) {
 }
 
 /**
- * One constellation pool's lane rows, counted into free/leased/dirty — never a re-scan of git; the counting
- * reads ONLY the fields `lane-pool.mjs status --json` already computed per lane (`clean`, `leased`, `exists`).
+ * Read one constellation pool's status once, for both lane counting and the activity lease join.
  * @param {string} repoKey
  * @param {{execFn?:Function, cwd?:string, repoPathArg?:string|null}} o
  */
-export function readOneLanePool(repoKey, { execFn = execFileSync, cwd = ROOT, repoPathArg = null } = {}) {
+export function readLanePoolStatus(repoKey, { execFn = execFileSync, cwd = ROOT, repoPathArg = null } = {}) {
   const args = [join(ROOT, 'scripts', 'lane-pool.mjs'), 'status', '--json'];
   if (repoPathArg) args.push(`--repo=${repoPathArg}`);
   try {
     const out = execFn('node', args, { cwd, encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
-    const parsed = JSON.parse(out);
+    return { parsed: JSON.parse(out) };
+  } catch (e) {
+    return { error: String(e.message ?? e).split('\n')[0] };
+  }
+}
+
+/** Count an already-read status, retaining the same fail-soft error row. */
+export function countLanePool(repoKey, { parsed, error }) {
+  try {
+    if (error !== undefined) throw new Error(error);
     const lanes = Array.isArray(parsed.lanes) ? parsed.lanes : [];
     const existing = lanes.filter((l) => l.exists);
     const free = existing.filter((l) => l.clean && !l.leased);
@@ -83,11 +91,17 @@ export function readOneLanePool(repoKey, { execFn = execFileSync, cwd = ROOT, re
   }
 }
 
+/** Read and count one pool for standalone callers. */
+export function readOneLanePool(repoKey, o) {
+  return countLanePool(repoKey, readLanePoolStatus(repoKey, o));
+}
+
 /** Every constellation pool's lane counts — `we` reads via `cwd` (this checkout IS a `we` clone, so its own
  *  origin resolves the pool with no `--repo` needed); each sibling passes its checkout path explicitly, since
  *  `lane-pool.mjs`'s origin-URL derivation needs a real checkout to read `git remote get-url origin` from. */
-export function readAllLanePools({ execFn = execFileSync, home = homedir() } = {}) {
+export function readAllLanePools({ execFn = execFileSync, home = homedir(), statusFor = {} } = {}) {
   return Object.keys(CONSTELLATION_REPOS).map((repoKey) => {
+    if (statusFor[repoKey] !== undefined) return countLanePool(repoKey, statusFor[repoKey]);
     const meta = CONSTELLATION_REPOS[repoKey];
     return meta.path
       ? readOneLanePool(repoKey, { execFn, cwd: ROOT, repoPathArg: expandHome(meta.path, home) })
@@ -125,6 +139,7 @@ export function readMachineLoad({ readLoadavg = loadavg, readCpus = cpus } = {})
  * source without touching the others.
  * @param {{now?:() => number, collectDaemons?:Function, collectQueue?:Function, readHealth?:Function,
  *   readLanes?:Function, readDrain?:Function, readGithub?:Function, readLoad?:Function,
+ *   readWeLaneStatus?:Function, createActivityReader?:Function,
  *   readActivity?:(input:object) => {rows:object[]}}} [o]
  */
 export function collectLiveState({
@@ -136,8 +151,15 @@ export function collectLiveState({
   readDrain = readDrainLastPass,
   readGithub = readGithubAuth,
   readLoad = readMachineLoad,
-  readActivity = createAgentActivityReader(),
+  readWeLaneStatus = () => readLanePoolStatus('we', { cwd: ROOT }),
+  createActivityReader = createAgentActivityReader,
+  readActivity = undefined,
 } = {}) {
+  const weStatus = readWeLaneStatus();
+  const activityReader = readActivity ?? createActivityReader({
+    readLeases: () => leasesFromLanePoolStatus(weStatus.parsed),
+    subagentRecentMs: RECENT_MS,
+  });
   const daemonStatus = assessDaemonStatus(collectDaemons());
   const heavyQueue = assessHeavyQueue(collectQueue());
   return {
@@ -145,13 +167,13 @@ export function collectLiveState({
     daemonStatus,
     heavyQueue,
     health: readHealth(),
-    lanePools: readLanes(),
+    lanePools: readLanes({ statusFor: { we: weStatus } }),
     drain: readDrain(),
     githubAuth: readGithub(),
     machineLoad: readLoad(),
     // Card x20lkf6's RUNNING section input — raw agent-activity rows, enriched with last-activity/pid-liveness.
     // `./live-state.mjs#assessLiveState` reuses THIS SAME already-assessed `heavyQueue` (above) when it calls
     // `./live-work.mjs#assessLiveWork` over these rows — never a second heavy-admission read.
-    runningRows: enrichRows(readActivity({ all: true }).rows),
+    runningRows: enrichRows(activityReader({ all: true }).rows),
   };
 }

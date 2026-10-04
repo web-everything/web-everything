@@ -4,7 +4,7 @@
  * A parked PR can live in any of the constellation repos. Two vocabularies name a repo and they are NOT the same:
  *   • the internal repo KEY — `we` / `frontierui` / `plateau-app` — used everywhere in-process (the ledger subject
  *     `${key}#${pr}`, the discovered-PR `repo` field, the review reporting).
- *   • the gh SLUG — `chalbert/web-everything` / `chalbert/frontierui` / `chalbert/plateau-app` — passed to `gh --repo`.
+ *   • the gh SLUG — `web-everything/web-everything` / `frontier-ui/frontierui` / `plateauapp/plateau-app` — passed to `gh --repo`.
  * A tool that parses a `--repo=<slug>` flag but hard-codes the key (the #2830 review's M3 defect: `--repo=…frontierui`
  * read FrontierUI but emitted `repo: 'we'`, so the ledger subject pointed at an unrelated WE PR) crosses the two
  * silently. This module is the ONE mapping between them, so no consumer keeps its own key literal.
@@ -30,9 +30,9 @@
  *  caller must never derive a key from a basename by hand. Frozen — the single source both the convergence
  *  workflow and the scheduled runner read (never a second copy). */
 export const CONSTELLATION_REPOS = Object.freeze({
-  we: { slug: 'chalbert/web-everything', slugTag: '', path: '', dirs: ['web-everything', 'webeverything'] },
-  frontierui: { slug: 'chalbert/frontierui', slugTag: 'fui', path: '$HOME/workspace/frontierui', dirs: ['frontierui'] },
-  'plateau-app': { slug: 'chalbert/plateau-app', slugTag: 'pa', path: '$HOME/workspace/plateau-app', dirs: ['plateau-app'] },
+  we: { slug: 'web-everything/web-everything', slugTag: '', path: '', dirs: ['web-everything', 'webeverything'] },
+  frontierui: { slug: 'frontier-ui/frontierui', slugTag: 'fui', path: '$HOME/workspace/frontierui', dirs: ['frontierui'] },
+  'plateau-app': { slug: 'plateauapp/plateau-app', slugTag: 'pa', path: '$HOME/workspace/plateau-app', dirs: ['plateau-app'] },
 });
 
 /**
@@ -80,12 +80,30 @@ export function siblingKeys(selfKey) {
  * @returns {string|null}
  */
 export function repoKeyForSlug(slugOrKey) {
-  const v = String(slugOrKey || '');
+  const v = canonicalizeSlug(String(slugOrKey || ''));
   if (!v) return null;
   for (const [key, meta] of Object.entries(CONSTELLATION_REPOS)) {
     if (key === v || meta.slug === v) return key;
   }
   return null;
+}
+
+/**
+ * Map a LEGACY slug to the repo's current one. The 2026-10-03 org move left old `chalbert/<repo>` names behind in
+ * daemon-clone `origin` URLs and old config; git and REST follow GitHub's redirect for those, but GraphQL does
+ * not, so any slug derived from such a remote must be canonicalized before it reaches `gh --repo`. Anything that
+ * is not a legacy `chalbert/<known repo dir>` is returned unchanged. PURE.
+ * @param {string} slug
+ * @returns {string}
+ */
+export function canonicalizeSlug(slug) {
+  const m = /^chalbert\/([^/]+?)(?:\.git)?$/i.exec(String(slug || '').trim());
+  if (!m) return slug;
+  const name = m[1].toLowerCase();
+  for (const meta of Object.values(CONSTELLATION_REPOS)) {
+    if (meta.dirs.includes(name)) return meta.slug;
+  }
+  return slug;
 }
 
 /** Session tag for a known repo key, or null. */

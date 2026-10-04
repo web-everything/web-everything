@@ -25,7 +25,7 @@
  * yet evidenced it, is the opposite failure: a session whose real-world work is genuinely finished — its own
  * backlog item `status: resolved`, a real PR merged — while `claude agents` itself never advances that
  * session's `state` past `working`/`blocked` at all. Confirmed live: `conveyor-3451`'s target,
- * `we:backlog/3451-*.md`, carries `status: resolved` with a merged PR (`chalbert/web-everything#1862`, "WE
+ * `we:backlog/3451-*.md`, carries `status: resolved` with a merged PR (`web-everything/web-everything#1862`, "WE
  * #3451: resolve — active → resolved"), yet the SAME live `claude agents --json --all` listing that landed
  * that PR still reported `conveyor-3451` as `state: "blocked"` — a session the original state-only axis would
  * never touch. A same-night survey of the other 22 non-`done`/`failed` background rows found 17 in the
@@ -284,7 +284,7 @@ const BACKSTOP_COMPLETION_KINDS = new Set(['review', 'fix', 'inspect', 'ci-heal'
  * `completion-cli.mjs report --status=done` stayed `status: 'started'` in its completion record FOREVER, even
  * after this reaper correctly stopped it. `reconcile-core.mjs#markSelfReportedDone` (and any other future
  * reader of a completion record) then has no way to tell "still genuinely in flight" apart from "finished,
- * just never wrote it down" — the exact gap that froze `chalbert/web-everything#2599` and its five siblings for
+ * just never wrote it down" — the exact gap that froze `web-everything/web-everything#2599` and its five siblings for
  * this incident, and the exact one that would freeze the NEXT crash-before-self-report the same way.
  *
  * This function decides whether a session the reaper is ABOUT TO REAP needs a completion record written on its
@@ -551,7 +551,7 @@ export function resolveLastActivityMs(session, {
  * `we:scripts/conveyor/hung-session.mjs`), independent of anything the listing or the agent chooses to report.
  * Letting `neverReapWorking` veto THIS axis would mean the one daemon mode built to distrust a stale listing
  * is precisely the mode where a session the listing is WRONG about can never be reaped — the exact live
- * failure (chalbert/web-everything `review-2582`, state `working`, dead) this axis exists to close. Injected
+ * failure (web-everything/web-everything `review-2582`, state `working`, dead) this axis exists to close. Injected
  * as `hungFor(session)`, mirroring `completionFor`/`groundTruthFor`'s own try/catch-to-null discipline in the
  * caller — never called for a session missing `cwd`/`sessionId`, and any read failure answers "not hung",
  * never a guess.
@@ -1240,6 +1240,9 @@ export function resolveChatSpawnGuardCeilingMs(env = process.env) {
   return (Number.isFinite(n) && n > 0 ? n : 24) * 60 * 60 * 1000;
 }
 
+/** Same-host clock-skew allowance; later timestamps cannot grant reap immunity (#4184). */
+export const CHAT_SPAWN_LINK_FUTURE_SKEW_MS = 5 * 60 * 1000;
+
 /** Filename-safe session ids only — both stores are keyed by a CLI-minted UUID, never free text. */
 function isSafeSessionId(id) {
   return typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id);
@@ -1337,6 +1340,7 @@ export function isChatEnded(chatSessionId, dir = resolveChatEndedDir(), { readFi
  *   - `link === null` (no stamp at all — daemon-dispatched, or this feature simply hasn't stamped it, e.g. a
  *     session started before this axis shipped) → NOT blocked. This is the "unchanged from today" default.
  *   - `link.ok === true` and `ended === true` → NOT blocked, `chat-ended`.
+ *   - With the clamp enabled, a timestamp beyond the clock-skew allowance is invalid: NOT blocked, `chat-spawn-link-future-dated`.
  *   - Otherwise (an `{ok:false}` ambiguous/corrupt link, OR a real link that is not yet ended) → BLOCKED, UNLESS
  *     `nowMs - link.recordedAtMs >= ceilingMs`, in which case → NOT blocked, `chat-spawn-guard-ceiling` — a
  *     forged, corrupted, or simply never-ended link cannot grant reap immunity FOREVER, mirroring
@@ -1350,7 +1354,7 @@ export function isChatEnded(chatSessionId, dir = resolveChatEndedDir(), { readFi
  *     When blocked and NOT saved by the ceiling: `chat-not-ended` for a real link, `ambiguous-chat-link` for a
  *     corrupt one — the reason always reflects which case it actually was.
  * @param {{link:null|{ok:false, recordedAtMs?:number|null}|{ok:true, spawnedByChatSessionId:string, recordedAtMs?:number|null}, ended?:boolean, nowMs?:number, ceilingMs?:number|null}} o
- * @returns {{blocked:boolean, reason:('no-link'|'ambiguous-chat-link'|'chat-ended'|'chat-not-ended'|'chat-spawn-guard-ceiling')}}
+ * @returns {{blocked:boolean, reason:('no-link'|'ambiguous-chat-link'|'chat-ended'|'chat-not-ended'|'chat-spawn-guard-ceiling'|'chat-spawn-link-future-dated')}}
  */
 export function classifyChatSpawnGuard({ link, ended = false, nowMs = Date.now(), ceilingMs = null } = {}) {
   if (link === null || link === undefined) return { blocked: false, reason: 'no-link' };
@@ -1365,6 +1369,7 @@ export function classifyChatSpawnGuard({ link, ended = false, nowMs = Date.now()
   // clock, or a link whose age is somehow still unknowable even via mtime) disables the clamp for THAT check
   // only — the surrounding block still applies — never silently widening a block into a permanent one.
   if (typeof ceilingMs === 'number' && ceilingMs > 0 && typeof link.recordedAtMs === 'number' && Number.isFinite(link.recordedAtMs)) {
+    if (link.recordedAtMs - nowMs > CHAT_SPAWN_LINK_FUTURE_SKEW_MS) return { blocked: false, reason: 'chat-spawn-link-future-dated' };
     if (nowMs - link.recordedAtMs >= ceilingMs) return { blocked: false, reason: 'chat-spawn-guard-ceiling' };
   }
   return link.ok === true ? { blocked: true, reason: 'chat-not-ended' } : { blocked: true, reason: 'ambiguous-chat-link' };

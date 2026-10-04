@@ -33,7 +33,7 @@ const HEAD_OID = 'f'.repeat(40);
 const view = (over = {}) => ({
   number: 1496,
   title: 'verify: declare over verify-lane',
-  url: 'https://github.com/chalbert/web-everything/pull/1496',
+  url: 'https://github.com/web-everything/web-everything/pull/1496',
   body: 'the PR body',
   labels: [{ name: 'review:human' }],
   comments: [],
@@ -46,12 +46,12 @@ const view = (over = {}) => ({
   headRefOid: HEAD_OID, // #xaoja7a — what makes a staged view falsifiable against the tree that will be judged
   ...over,
 });
-const check = (v, over = {}) => checkStagedView({ view: v, pr: 1496, repo: 'chalbert/web-everything', fields: PR_VIEW_FIELDS, ...over });
+const check = (v, over = {}) => checkStagedView({ view: v, pr: 1496, repo: 'web-everything/web-everything', fields: PR_VIEW_FIELDS, ...over });
 /** The provenance a healthy CI-produced read reports. */
 const fromTransport = (over = {}) => ({
   source: 'transport',
   ref: TRANSPORT_REF,
-  path: viewPath(prViewFileName('chalbert/web-everything', 1496)),
+  path: viewPath(prViewFileName('web-everything/web-everything', 1496)),
   commit: 'c'.repeat(40),
   transportAvailable: true,
   probed: true,
@@ -65,7 +65,7 @@ const ops = (readPayload = () => ({ view: view(), provenance: fromTransport() })
 const step = (decl, name) => decl.steps.find((s) => s.name === name).step;
 /** Drive the `check` step the way the engine does, with the `read` finding already in place. */
 const runCheck = (readFinding, input = {}) => step(ops(), 'check').fn({
-  input: { pr: 1496, repo: 'chalbert/web-everything', dir: '/views', ...input },
+  input: { pr: 1496, repo: 'web-everything/web-everything', dir: '/views', ...input },
   findings: { read: readFinding },
 });
 
@@ -173,7 +173,7 @@ describe('the subject is checked at STAGING, not only at reading (#1466)', () =>
 describe('the path is the reader\'s own name', () => {
   it('stages under `prViewFileName`, so the reader finds it', () => {
     const out = runCheck({ view: view(), provenance: fromTransport() });
-    expect(out.path).toBe(`/views/${prViewFileName('chalbert/web-everything', 1496)}`);
+    expect(out.path).toBe(`/views/${prViewFileName('web-everything/web-everything', 1496)}`);
     // The slash is percent-encoded, NOT flattened to `-`: `foo-bar/baz` and `foo/bar-baz` collided under the
     // old scheme and one repo's view silently answered for the other's.
     expect(out.path).toContain('%2F');
@@ -181,7 +181,7 @@ describe('the path is the reader\'s own name', () => {
 
   it('refuses to stage with no directory rather than guessing one', () => {
     const decl = stagePrViewOperation({ readPayload: () => ({ view: view(), provenance: fromTransport() }) }, { fields: PR_VIEW_FIELDS, viewFileName: prViewFileName });
-    expect(() => step(decl, 'check').fn({ input: { pr: 1496, repo: 'chalbert/web-everything', dir: '' }, findings: { read: { view: view(), provenance: fromTransport() } } }))
+    expect(() => step(decl, 'check').fn({ input: { pr: 1496, repo: 'web-everything/web-everything', dir: '' }, findings: { read: { view: view(), provenance: fromTransport() } } }))
       .toThrow(/no directory to stage into/);
   });
 });
@@ -288,9 +288,9 @@ describe('a hand-supplied view is REFUSED wherever CI can serve — the structur
    */
   it('refuses `--from=` on a repo whose transport branch exists', () => {
     const provenance = { source: 'file', from: '/tmp/v.json', transportAvailable: true, probed: true };
-    expect(() => checkViewProvenance({ provenance, repo: 'chalbert/web-everything', pr: 1496, view: view() }))
+    expect(() => checkViewProvenance({ provenance, repo: 'web-everything/web-everything', pr: 1496, view: view() }))
       .toThrow(/refusing a hand-supplied view/);
-    expect(() => checkViewProvenance({ provenance, repo: 'chalbert/web-everything', pr: 1496, view: view() }))
+    expect(() => checkViewProvenance({ provenance, repo: 'web-everything/web-everything', pr: 1496, view: view() }))
       .toThrow(new RegExp(TRANSPORT_BRANCH));
   });
 
@@ -401,7 +401,7 @@ describe('the check step runs all three refusals, in order', () => {
 });
 
 describe('the transport reader — bytes out of the fetched ref, never off a path', () => {
-  const NAME = prViewFileName('chalbert/web-everything', 1496);
+  const NAME = prViewFileName('web-everything/web-everything', 1496);
   const PATH = viewPath(NAME);
   const BLOB = 'b'.repeat(40);
 
@@ -438,7 +438,7 @@ describe('the transport reader — bytes out of the fetched ref, never off a pat
    */
   const reader = (stub, over = {}) => createTransportReader({
     run: stub.run, sleep: () => {}, now: () => 0, env: {}, cwd: '/repo',
-    viewFileName: prViewFileName, originRepo: () => 'chalbert/web-everything',
+    viewFileName: prViewFileName, originRepo: () => 'web-everything/web-everything',
     mkdir: (p) => stub.calls.push(['fs:mkdir', p]),
     write: (p) => stub.calls.push(['fs:write', p]),
     rm: (p) => stub.calls.push(['fs:rm', p]),
@@ -447,7 +447,7 @@ describe('the transport reader — bytes out of the fetched ref, never off a pat
 
   it('reads the view with ONE `git show` against the remote-tracking ref', () => {
     const stub = gitStub();
-    const out = reader(stub)({ repo: 'chalbert/web-everything', pr: 1496 });
+    const out = reader(stub)({ repo: 'web-everything/web-everything', pr: 1496 });
     expect(out.view.number).toBe(1496);
     const show = stub.calls.find((c) => c[0] === 'show');
     expect(show).toEqual(['show', `${TRANSPORT_REF}:${PATH}`]);
@@ -467,16 +467,16 @@ describe('the transport reader — bytes out of the fetched ref, never off a pat
     const dispatch = createPayloadReader({
       read: () => { reads += 1; return '{}'; },
       run: stub.run, sleep: () => {}, now: () => 0, env: {}, cwd: '/repo',
-      viewFileName: prViewFileName, originRepo: () => 'chalbert/web-everything',
+      viewFileName: prViewFileName, originRepo: () => 'web-everything/web-everything',
     });
-    dispatch({ source: 'transport', repo: 'chalbert/web-everything', pr: 1496 });
+    dispatch({ source: 'transport', repo: 'web-everything/web-everything', pr: 1496 });
     expect(reads).toBe(0);
   });
 
   // The fetch is what overwrites a remote-tracking ref a session may have pointed elsewhere with `update-ref`.
   it('always fetches the ref before reading it', () => {
     const stub = gitStub();
-    reader(stub)({ repo: 'chalbert/web-everything', pr: 1496 });
+    reader(stub)({ repo: 'web-everything/web-everything', pr: 1496 });
     const fetchIdx = stub.calls.findIndex((c) => c[0] === 'fetch' && String(c[3]).includes(TRANSPORT_BRANCH));
     const showIdx = stub.calls.findIndex((c) => c[0] === 'show');
     expect(fetchIdx).toBeGreaterThanOrEqual(0);
@@ -485,7 +485,7 @@ describe('the transport reader — bytes out of the fetched ref, never off a pat
 
   it('pushes no request when the view is already on the branch', () => {
     const stub = gitStub();
-    reader(stub)({ repo: 'chalbert/web-everything', pr: 1496 });
+    reader(stub)({ repo: 'web-everything/web-everything', pr: 1496 });
     expect(stub.calls.some((c) => c[0] === 'push')).toBe(false);
   });
 
@@ -493,7 +493,7 @@ describe('the transport reader — bytes out of the fetched ref, never off a pat
     // The baseline probe consumes the first answer; then absent, absent, published — so it really loops.
     const stub = gitStub({ blobs: ['', '', '', BLOB] });
     const slept = [];
-    const out = reader(stub, { sleep: (ms) => slept.push(ms) })({ repo: 'chalbert/web-everything', pr: 1496 });
+    const out = reader(stub, { sleep: (ms) => slept.push(ms) })({ repo: 'web-everything/web-everything', pr: 1496 });
     expect(out.view.number).toBe(1496);
     expect(stub.calls.some((c) => c[0] === 'push')).toBe(true);
     expect(slept).toEqual([DEFAULT_TRANSPORT_INTERVAL_MS, DEFAULT_TRANSPORT_INTERVAL_MS]);
@@ -506,9 +506,9 @@ describe('the transport reader — bytes out of the fetched ref, never off a pat
    */
   it('gives up with a refusal that names the workflow, and never falls back to a local file', () => {
     const stub = gitStub({ blobs: [''] });
-    expect(() => reader(stub, { env: { WE_PR_VIEW_TRANSPORT_TIMEOUT_MS: '30000', WE_PR_VIEW_TRANSPORT_INTERVAL_MS: '10000' } })({ repo: 'chalbert/web-everything', pr: 1496 }))
+    expect(() => reader(stub, { env: { WE_PR_VIEW_TRANSPORT_TIMEOUT_MS: '30000', WE_PR_VIEW_TRANSPORT_INTERVAL_MS: '10000' } })({ repo: 'web-everything/web-everything', pr: 1496 }))
       .toThrow(/gave up waiting for CI/);
-    expect(() => reader(stub, { env: { WE_PR_VIEW_TRANSPORT_TIMEOUT_MS: '30000', WE_PR_VIEW_TRANSPORT_INTERVAL_MS: '10000' } })({ repo: 'chalbert/web-everything', pr: 1496 }))
+    expect(() => reader(stub, { env: { WE_PR_VIEW_TRANSPORT_TIMEOUT_MS: '30000', WE_PR_VIEW_TRANSPORT_INTERVAL_MS: '10000' } })({ repo: 'web-everything/web-everything', pr: 1496 }))
       .toThrow(/Do NOT fall back to `--from=`/);
   });
 
@@ -518,26 +518,26 @@ describe('the transport reader — bytes out of the fetched ref, never off a pat
    */
   it('terminates on the attempt cap even when the clock never advances', () => {
     const stub = gitStub({ blobs: [''] });
-    expect(() => reader(stub, { now: () => 0 })({ repo: 'chalbert/web-everything', pr: 1496 }))
+    expect(() => reader(stub, { now: () => 0 })({ repo: 'web-everything/web-everything', pr: 1496 }))
       .toThrow(/gave up waiting for CI/);
   });
 
   it('re-asks and waits for DIFFERENT bytes under `--refresh`', () => {
     const stub = gitStub({ blobs: [BLOB, BLOB, 'd'.repeat(40)] });
-    const out = reader(stub)({ repo: 'chalbert/web-everything', pr: 1496, refresh: true });
+    const out = reader(stub)({ repo: 'web-everything/web-everything', pr: 1496, refresh: true });
     expect(stub.calls.some((c) => c[0] === 'push')).toBe(true);
     expect(out.provenance.blob).toBe('d'.repeat(40));
   });
 
   it('refuses a repo that has not onboarded, rather than waiting three minutes for nothing', () => {
     const stub = gitStub({ branch: '' });
-    expect(() => reader(stub)({ repo: 'chalbert/web-everything', pr: 1496 })).toThrow(/no `ops\/pr-views` branch on origin/);
+    expect(() => reader(stub)({ repo: 'web-everything/web-everything', pr: 1496 })).toThrow(/no `ops\/pr-views` branch on origin/);
     expect(stub.calls.some((c) => c[0] === 'push')).toBe(false);
   });
 
   it('names the branch when the bytes on it are not JSON', () => {
     const stub = gitStub({ body: 'not json' });
-    expect(() => reader(stub)({ repo: 'chalbert/web-everything', pr: 1496 })).toThrow(/is not valid JSON/);
+    expect(() => reader(stub)({ repo: 'web-everything/web-everything', pr: 1496 })).toThrow(/is not valid JSON/);
   });
 
   it('refuses a view request for a repo this checkout does not own (#3261, #1548 r3)', () => {
@@ -546,15 +546,15 @@ describe('the transport reader — bytes out of the fetched ref, never off a pat
     // about to push, and phrased as a complaint about staging rather than about the flag that was wrong.
     // The same ownership check the file reader makes now runs first, so nothing touches the branch at all.
     const stub = gitStub({ blobs: [''] });
-    expect(() => reader(stub, { originRepo: () => 'chalbert/plateau-app' })({ repo: 'chalbert/web-everything', pr: 1496 }))
-      .toThrow(/refusing to use .* as chalbert\/web-everything's checkout/);
+    expect(() => reader(stub, { originRepo: () => 'plateauapp/plateau-app' })({ repo: 'web-everything/web-everything', pr: 1496 }))
+      .toThrow(/refusing to use .* as web-everything\/web-everything's checkout/);
   });
 
   it('…and refuses BEFORE fetching, so a wrong `--repoRoot` costs nothing', () => {
     // What moving it earlier actually buys, asserted rather than assumed.
     const calls = [];
     const stub = (args, opts) => { calls.push(args[0]); return ''; };
-    expect(() => reader(stub, { originRepo: () => 'chalbert/plateau-app' })({ repo: 'chalbert/web-everything', pr: 1496 }))
+    expect(() => reader(stub, { originRepo: () => 'plateauapp/plateau-app' })({ repo: 'web-everything/web-everything', pr: 1496 }))
       .toThrow(/refusing to use/);
     expect(calls).toEqual([]);
   });
@@ -639,7 +639,7 @@ describe('the wait budget', () => {
  */
 describe('the transport read against real git', () => {
   const git = (dir, ...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
-  const REPO = 'chalbert/web-everything';
+  const REPO = 'web-everything/web-everything';
   let origin;
   let clone;
   let headOid;

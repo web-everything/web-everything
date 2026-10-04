@@ -30,7 +30,7 @@ explicit instruction (not run during implementation):
 
 ```bash
 answer_cli=we:scripts/conveyor/stand-down-answer.mjs
-node "${answer_cli#we:}" 3181 --repo=chalbert/web-everything --reason="Scope correction is fine but must be careful to going against goal and decision and escalate if needed" --actor=chalbert --channel="Codex chat"
+node "${answer_cli#we:}" 3181 --repo=web-everything/web-everything --reason="Scope correction is fine but must be careful to going against goal and decision and escalate if needed" --actor=chalbert --channel="Codex chat"
 ```
 
 Command entry point: we:scripts/conveyor/stand-down-answer.mjs. Operator answer dated 2026-09-30.

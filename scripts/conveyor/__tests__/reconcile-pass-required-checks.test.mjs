@@ -48,7 +48,7 @@ it.each([false, true])('Plateau #198 green checks promote with repo-local 403 fa
     expect(plan.refusals.filter(row => row.kind === 'check-read-failed')).toEqual([]);
     expect(plan.dispatch).toEqual([expect.objectContaining({ prNumber: 198, kind: 'promote-draft' })]);
     expect(readChecks).toHaveBeenCalledTimes(hydrate ? 1 : 0);
-    if (hydrate) expect(readChecks).toHaveBeenCalledWith({ repo: 'chalbert/plateau-app', sha: XX_HEAD });
+    if (hydrate) expect(readChecks).toHaveBeenCalledWith({ repo: 'plateauapp/plateau-app', sha: XX_HEAD });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -291,7 +291,7 @@ describe('main', () => {
       'LANE RECLAIM — needs your decision (#3383, see `node scripts/lane-whois.mjs`):', '(none)',
     ]);
     expect(vi.mocked(execFileSync).mock.calls.map(([, args]) => args[3])).toEqual([
-      'chalbert/web-everything', 'chalbert/frontierui', 'chalbert/plateau-app',
+      'web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app',
     ]);
   });
 });

@@ -12,7 +12,7 @@ import {
   notifyReferralHold, REFERRAL_RETRY_MS,
 } from '../review-referral-hold.mjs';
 
-const repo = 'chalbert/web-everything';
+const repo = 'web-everything/web-everything';
 const head = 'a'.repeat(40);
 const at = Date.parse('2026-10-03T08:00:00Z');
 const iso = n => new Date(n).toISOString();
@@ -85,7 +85,7 @@ describe('attempted mandatory referrals', () => {
   it('does not hold an unattempted referral, a different subject, or an incomplete review', () => {
     expect(hold(pr(), [evidence({ attempted: false })])).toBeNull();
     expect(hold(pr({ number: 3507 }))).toBeNull();
-    expect(hold(pr(), [{ ...evidence(), repo: 'chalbert/frontierui' }])).toBeNull();
+    expect(hold(pr(), [{ ...evidence(), repo: 'frontier-ui/frontierui' }])).toBeNull();
     const unfinished = run(); unfinished.stepTimings.pop();
     expect(reviewRunEvidence(unfinished)).toBeNull();
   });

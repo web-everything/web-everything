@@ -72,7 +72,7 @@ export const ROLE_DISPATCH_KINDS = Object.freeze(['prepare', 'prepare-decision',
  * distinct from the kind. An UNKNOWN non-empty cause is REFUSED rather than ignored: a caller that had a
  * reason the table does not know about is a caller whose `taskType` this module cannot honestly derive.
  */
-export const DISPATCH_CAUSES = Object.freeze(['conflict', 'review-finding', 'ci-failure']);
+export const DISPATCH_CAUSES = Object.freeze(['planned', 'conflict', 'review-finding', 'ci-failure']);
 
 /** The cause `we:scripts/conveyor/reconcile-fix-dispatch.mjs` reports for a `merge-status:conflicting` bounce. */
 export const CONFLICT_CAUSE = 'conflict';
@@ -90,15 +90,20 @@ export const TASK_TYPES_WITHOUT_PRODUCING_KIND = Object.freeze({
 
 /**
  * WHICH PATHS COUNT AS DOCUMENTATION for the all-docs `build` → `doc-fix` rule. Deliberately tight and
- * auditable rather than clever: a markdown/text file anywhere, or anything under `docs/`. A `build` whose
- * declared `scope:` is entirely these paths writes prose, and `doc-fix` is the envelope the router has trial
- * history for (100 LOC / 2 files) — see `provider-routing.mjs#PROVEN_TASK_ENVELOPES`.
- *
- * Widening this table widens what may be routed as a doc change, so it is a table, not a regex to tweak.
+ * auditable: only reader-facing documentation homes and the root README count, never an arbitrary markdown suffix.
+ * Widening this table widens what may be routed as a doc change.
  */
-export const DOC_PATH_SUFFIXES = Object.freeze(['.md', '.mdx', '.markdown', '.txt']);
-/** Directory prefixes whose every file counts as documentation. */
-export const DOC_PATH_PREFIXES = Object.freeze(['docs/']);
+export const DOC_PATH_PREFIXES = Object.freeze(['docs/', 'src/_data/', 'src/_includes/']);
+
+/**
+ * Homes that mix reader-facing content with EXECUTABLE build-time code (`src/_data/` holds Eleventy loaders such
+ * as `backlog.js` and `rules.js`), so a prefix alone is not enough: only these (non-executable) extensions count.
+ * `docs/` is deliberately absent — it stays prefix-wide, exactly as before.
+ */
+const DOC_HOME_EXTENSIONS =Object.freeze({
+  'src/_data/': Object.freeze(['.json']),
+  'src/_includes/': Object.freeze(['.njk']),
+});
 
 /**
  * Strip the repo qualifier a declared `scope:` path carries (`we:scripts/x.mjs`, `frontierui:src/y.ts`) and
@@ -117,16 +122,21 @@ export function normalizeScopePath(entry) {
 }
 
 /**
- * Is this scope path a documentation path? See {@link DOC_PATH_SUFFIXES} / {@link DOC_PATH_PREFIXES}.
+ * Is this scope path a documentation path? See {@link DOC_PATH_PREFIXES}.
  *
  * @param {string} entry - a raw or repo-qualified scope path.
  * @returns {boolean}
  */
 export function isDocScopePath(entry) {
-  const path = normalizeScopePath(entry).toLowerCase();
-  if (!path) return false;
-  if (DOC_PATH_PREFIXES.some((p) => path === p.replace(/\/$/, '') || path.startsWith(p))) return true;
-  return DOC_PATH_SUFFIXES.some((s) => path.endsWith(s));
+  if (typeof entry !== 'string') return false;
+  const path = normalizeScopePath(entry);
+  if (!path || path.startsWith('/') || path.includes('\\') || path.split('/').includes('..')) return false;
+  if (path === 'README.md') return true;
+  return DOC_PATH_PREFIXES.some((p) => {
+    const extensions = DOC_HOME_EXTENSIONS[p];
+    if (!extensions) return path === p.slice(0, -1) || path.startsWith(p);
+    return path.startsWith(p) && extensions.some((ext) => path.length > p.length + ext.length && path.endsWith(ext));
+  });
 }
 
 /** Shared test-file boundary for classification and the post-worker diff envelope. */
@@ -177,6 +187,12 @@ export function taskTypeFor({ kind, cause, scopePaths, failingFiles } = {}) {
 
   if (k === 'fix' && rawCause === CONFLICT_CAUSE) {
     return derived('conflict-resolution', 'a `fix` dispatched because a bounce was conflict-caused — the CAUSE, not the kind, produces this taskType');
+  }
+  if (rawCause === 'planned' && CODE_CHANGE_DISPATCH_KINDS.includes(k)) {
+    if (!paths.length) return refuse('a planned dispatch needs declared scope paths to derive its taskType');
+    if (paths.every(isTestPath)) return derived('test-fix', 'every planned scope path is a test file');
+    if (paths.every(isDocScopePath)) return derived('doc-fix', 'every planned scope path is documentation');
+    return derived('build-new-feature', 'planned work includes a non-documentation path');
   }
   // agy-launcher-probation (operator, 2026-09-27) — a CI heal is its own taskType, not `bugfix`: it repairs a red
   // or BEHIND PR's CI, not a reviewer's finding, and it is opened on probation while `bugfix` stays closed.

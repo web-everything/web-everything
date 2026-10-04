@@ -6,7 +6,7 @@ import { dispatchPlan } from '../../readiness/dispatch-plan.mjs';
 import { CONSTELLATION_REPOS } from '../../lib/constellation-repos.mjs';
 const today = JSON.parse(readFileSync('scripts/operations/__fixtures__/land-advance/today.json'));
 const now = Date.parse('2026-09-20T00:00:00Z');
-const pr = (number, extra = {}) => ({ repo: 'we', slug: 'chalbert/web-everything', number, labels: ['review:pending'], createdAt: '2026-09-08T00:00:00Z', updatedAt: '2026-09-08T12:14:00Z', baseRefName: 'main', ...extra });
+const pr = (number, extra = {}) => ({ repo: 'we', slug: 'web-everything/web-everything', number, labels: ['review:pending'], createdAt: '2026-09-08T00:00:00Z', updatedAt: '2026-09-08T12:14:00Z', baseRefName: 'main', ...extra });
 const plan = (extra = {}) => planLandAdvance({ now, prs: [], freeLanes: 8, ...extra });
 const history = (n) => Array.from({ length: n }, (_, i) => ({ at: new Date(now - (n - i) * 80000).toISOString(), deferredDetail: [{ num: 2072, waitOn: ['couple-carrier:unknown'] }] }));
 describe('what is owed', () => {
@@ -87,7 +87,7 @@ describe('what is owed', () => {
   });
   it('maps every configured full slug and refuses unknowns', () => {
     const repos = JSON.parse(readFileSync('scripts/lib/swept-repos.json'));
-    expect(repos).toEqual(['chalbert/web-everything','chalbert/frontierui','chalbert/plateau-app']);
+    expect(repos).toEqual(['web-everything/web-everything','frontier-ui/frontierui','plateauapp/plateau-app']);
     for (const slug of repos) expect(CONSTELLATION_REPOS[repoKeyFromSlug(slug)]).toBeDefined();
     expect(() => repoKeyFromSlug('evil/frontierui')).toThrow();
   });

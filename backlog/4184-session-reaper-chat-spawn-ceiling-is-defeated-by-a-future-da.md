@@ -3,9 +3,11 @@ bornAs: xpl4fjv
 kind: story
 size: 2
 parent: "3383"
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/session-reaper.mjs", "we:scripts/conveyor/__tests__/session-reaper.test.mjs"]
 dateOpened: "2026-09-25"
+dateResolved: "2026-10-03"
+graduatedTo: none
 preparedDate: "2026-10-03"
 preparedAgainstSha: "e1f0523e0881357fc863f3e88da72e0164eb7091"
 tags: []
@@ -16,6 +18,16 @@ tags: []
 PR #2678 merged with its review's CONFIRMED security finding unfixed: we:scripts/conveyor/session-reaper.mjs classifyChatSpawnGuard checks nowMs - link.recordedAtMs >= ceilingMs, so a link file whose recordedAt is in the future yields a negative elapsed time that never reaches the ceiling and restores permanent reap-immunity - the exact bug the ceiling exists to close, contradicting its own comment that the ceiling holds regardless of what a link file claims. Fix: treat recordedAtMs greater than nowMs plus a small clock-skew tolerance as invalid (expired, not blocked), in tryReadChatSpawnLink or the guard. Math.max(0, nowMs - recordedAtMs), the review's suggested prevention, does NOT fix it (elapsed stays 0 forever). Add a ceiling test with a future-dated recordedAt. Done when that test fails on main and passes after.
 
 ## Progress
+
+- Final verification: `npx vitest run we:scripts/conveyor/__tests__/session-reaper.test.mjs` (strip the locus prefix for shell execution) passed all 310 tests. `node we:scripts/verify-lane.mjs` passed 1,699 tests across 23 files and `npm run check:standards` completed with 0 errors (5,274 warnings); lane verdict green. `git diff --check` passed. Parent #3383 remains active with other open/active children, so no parent edit is needed.
+
+- Implemented in this checkout on 2026-10-03, baseline HEAD `4f3995a8e7094eedc47ec66752bc6bc022b6b6f3`; the scoped implementation matched local `origin/main` before editing. Added the fixed five-minute constant, future-date rejection inside the existing clamp, and reason documentation in `we:scripts/conveyor/session-reaper.mjs`. Ended-link precedence and disabled-clamp behavior are unchanged.
+- Before proof: ran the new #4184 tests in `we:scripts/conveyor/__tests__/session-reaper.test.mjs` against the unchanged implementation. Required tests 1, 2, and 6 failed with blocked results (`chat-not-ended`, `ambiguous-chat-link`, `chat-not-ended`, respectively). The corrupt-mtime soak also failed; the constant/boundary check failed because the new constant was not yet exported. Seven other selected cases passed.
+- IO replay before/after: an inline Node module imported `makeChatSpawnGuardResolver`, used a disposable directory through `OPERATION_CHAT_SPAWNS_DIR` and `OPERATION_CHAT_ENDED_DIR`, fixed the clock at `2026-10-03T00:00:00Z`, and wrote a child link with a never-ended parent and `recordedAt: "2099-01-01T00:00:00.000Z"`. It then replaced that same file with corrupt JSON and set its mtime to the same 2099 instant using `utimesSync` (equivalent to the planned touch). Identical replay before and after the fix, with temporary fixtures removed after each run:
+  - recordedAt before: `{"blocked":true,"reason":"chat-not-ended"}`; after: `{"blocked":false,"reason":"chat-spawn-link-future-dated"}`.
+  - corrupt JSON / mtime before: `{"blocked":true,"reason":"ambiguous-chat-link"}`; after: `{"blocked":false,"reason":"chat-spawn-link-future-dated"}`.
+- Regression coverage includes both link shapes, exactly five minutes ahead versus one millisecond beyond, ended precedence, omitted/null/non-positive/non-numeric ceilings, the extended ceiling invariant, real recordedAt IO, and 1,000 repeated corrupt-mtime resolver passes with a simulated clock advancing one minute per pass. No helper files or shared agent documentation were added. Proof is recorded here for human review; no PR was requested.
+
 
 - Premise checked against current main. Still true. No drift in scope.
 - The ceiling check is `we:scripts/conveyor/session-reaper.mjs:1367-1368 (classifyChatSpawnGuard)`: `if (nowMs - link.recordedAtMs >= ceilingMs)`. A `recordedAtMs` in the future makes the difference negative, so it never reaches the ceiling. The link stays blocked forever.

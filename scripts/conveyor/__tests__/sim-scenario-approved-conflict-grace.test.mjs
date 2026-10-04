@@ -49,7 +49,7 @@ import { describe, expect, it } from 'vitest';
 import { scenario, runScenario } from './sim/scenario.mjs';
 import { CONFLICT_LABEL, QUEUED_CONFLICT_GRACE_MS } from '../parked-pr-conflict-watch.mjs';
 
-const WE_SLUG = 'chalbert/web-everything';
+const WE_SLUG = 'web-everything/web-everything';
 const BRANCH = 'lane/2501-conflict-fixture';
 const ITEM_NUM = '2501';
 

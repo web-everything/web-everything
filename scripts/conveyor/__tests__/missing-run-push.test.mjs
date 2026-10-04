@@ -9,7 +9,7 @@ import { countMissingRunComments, buildMissingRunComment } from '../main-red-rec
 
 const sha = '1f7481b9bccf75ae1c37ed5705ec2ab57d77a9c7';
 const next = 'a'.repeat(40);
-const repo = 'chalbert/web-everything';
+const repo = 'web-everything/web-everything';
 const d = { prNumber: 3209, headRefName: 'lane/model-routing', headSha: sha };
 const pr = { state: 'open', mergeable: true, head: { sha, ref: d.headRefName, repo: { full_name: repo } }, base: { ref: 'main' } };
 function fixture({ live = pr, fetched = sha, message = 'fix', failPush = false, checkClaim = () => null,

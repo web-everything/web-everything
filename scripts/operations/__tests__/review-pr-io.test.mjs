@@ -550,7 +550,7 @@ describe('the PR-view transport', () => {
   });
 
   it('names a staged view by encoded slug and number', () => {
-    expect(prViewFileName('chalbert/web-everything', 1465)).toBe('chalbert%2Fweb-everything-1465.json');
+    expect(prViewFileName('web-everything/web-everything', 1465)).toBe('web-everything%2Fweb-everything-1465.json');
   });
 
   // The `-` flattening was NOT injective: a repo name may contain `-`, so two different repos landed on one
@@ -619,9 +619,9 @@ describe('readPr refuses a cross-repo target rather than degrading to an empty d
     let gitCalls = 0;
     const countingExec = () => { gitCalls += 1; return ''; };
     expect(() => readPr({
-      pr: 139, repo: 'chalbert/plateau-app', exec: countingExec, cwd: '/somewhere',
+      pr: 139, repo: 'plateauapp/plateau-app', exec: countingExec, cwd: '/somewhere',
       originRepo: () => 'org/web-everything', readView: () => ({ ...VIEW, number: 139 }),
-    })).toThrow(/refusing to review chalbert\/plateau-app#139.*origin is org\/web-everything/s);
+    })).toThrow(/refusing to review plateauapp\/plateau-app#139.*origin is org\/web-everything/s);
     // Refuses BEFORE any net-diff git call — the mismatch never reaches `git`, exactly like the
     // wrong-PR-number refusal a few lines up.
     expect(gitCalls).toBe(0);
@@ -631,7 +631,7 @@ describe('readPr refuses a cross-repo target rather than degrading to an empty d
     let called = 0;
     const readView = () => { called += 1; return VIEW; };
     expect(() => readPr({
-      pr: 139, repo: 'chalbert/plateau-app', exec: () => '', originRepo: () => 'org/web-everything', readView,
+      pr: 139, repo: 'plateauapp/plateau-app', exec: () => '', originRepo: () => 'org/web-everything', readView,
     })).toThrow();
     expect(called).toBe(0);
   });
@@ -826,9 +826,9 @@ describe('readPr wires the injected view transport', () => {
 describe('the subject checkout is DERIVED from the constellation siblings (#xgmzd0y)', () => {
   // Origins keyed by path — the only fact the resolver is allowed to match on.
   const origins = {
-    '/pool/lane-1': 'chalbert/web-everything',
-    '/pool/frontierui': 'chalbert/frontierui',
-    '/pool/plateau-app': 'chalbert/plateau-app',
+    '/pool/lane-1': 'web-everything/web-everything',
+    '/pool/frontierui': 'frontier-ui/frontierui',
+    '/pool/plateau-app': 'plateauapp/plateau-app',
   };
   const originRepo = (cwd) => origins[cwd] ?? '';
   const siblings = () => ([
@@ -837,16 +837,16 @@ describe('the subject checkout is DERIVED from the constellation siblings (#xgmz
   ]);
 
   it('returns the current checkout when it already IS the requested repo', () => {
-    const got = resolveSubjectCheckout({ repo: 'chalbert/web-everything', cwd: '/pool/lane-1', originRepo, siblings });
+    const got = resolveSubjectCheckout({ repo: 'web-everything/web-everything', cwd: '/pool/lane-1', originRepo, siblings });
     expect(got.path).toBe('/pool/lane-1');
     // Resolved on the first probe — no sibling walk when the answer is underfoot.
     expect(got.probed).toEqual(['/pool/lane-1']);
   });
 
   it('finds the sibling clone whose ORIGIN matches, which is the whole point', () => {
-    expect(resolveSubjectCheckout({ repo: 'chalbert/frontierui', cwd: '/pool/lane-1', originRepo, siblings }).path)
+    expect(resolveSubjectCheckout({ repo: 'frontier-ui/frontierui', cwd: '/pool/lane-1', originRepo, siblings }).path)
       .toBe('/pool/frontierui');
-    expect(resolveSubjectCheckout({ repo: 'chalbert/plateau-app', cwd: '/pool/lane-1', originRepo, siblings }).path)
+    expect(resolveSubjectCheckout({ repo: 'plateauapp/plateau-app', cwd: '/pool/lane-1', originRepo, siblings }).path)
       .toBe('/pool/plateau-app');
   });
 
@@ -854,13 +854,13 @@ describe('the subject checkout is DERIVED from the constellation siblings (#xgmz
     // The directory is called `frontierui`, but its origin is somebody else's fork. Name says yes, origin says
     // no, and origin is the fact that decides.
     const forked = (cwd) => (cwd === '/pool/frontierui' ? 'someone-else/frontierui' : origins[cwd] ?? '');
-    expect(resolveSubjectCheckout({ repo: 'chalbert/frontierui', cwd: '/pool/lane-1', originRepo: forked, siblings }).path)
+    expect(resolveSubjectCheckout({ repo: 'frontier-ui/frontierui', cwd: '/pool/lane-1', originRepo: forked, siblings }).path)
       .toBeNull();
   });
 
   it('skips an ABSENT sibling rather than probing a path that is not there', () => {
     const missing = () => ([{ name: 'frontierui', path: '/pool/frontierui', present: false }]);
-    const got = resolveSubjectCheckout({ repo: 'chalbert/frontierui', cwd: '/pool/lane-1', originRepo, siblings: missing });
+    const got = resolveSubjectCheckout({ repo: 'frontier-ui/frontierui', cwd: '/pool/lane-1', originRepo, siblings: missing });
     expect(got.path).toBeNull();
     expect(got.probed).toEqual(['/pool/lane-1']);
   });
@@ -875,14 +875,14 @@ describe('the subject checkout is DERIVED from the constellation siblings (#xgmz
     // What the real table answers from a lane: the PRIMARY checkout, because `siblingsFor` probes the
     // primary's parent first. Both clones exist and both have the right origin — the isolated one must win.
     const bothExist = (cwd) => ({
-      '/pool/lane-1': 'chalbert/web-everything',
-      '/home/user/frontierui': 'chalbert/frontierui',
-      '/pool/frontierui': 'chalbert/frontierui',
+      '/pool/lane-1': 'web-everything/web-everything',
+      '/home/user/frontierui': 'frontier-ui/frontierui',
+      '/pool/frontierui': 'frontier-ui/frontierui',
     })[cwd] ?? '';
     const primaryFirst = () => ([{ name: 'frontierui', path: '/home/user/frontierui', present: true }]);
 
     const got = resolveSubjectCheckout({
-      repo: 'chalbert/frontierui', cwd: '/pool/lane-1', originRepo: bothExist, siblings: primaryFirst,
+      repo: 'frontier-ui/frontierui', cwd: '/pool/lane-1', originRepo: bothExist, siblings: primaryFirst,
     });
     expect(got.path).toBe('/pool/frontierui');
     // And it tried the pool-local path BEFORE the primary, which is the ordering being pinned.
@@ -892,32 +892,32 @@ describe('the subject checkout is DERIVED from the constellation siblings (#xgmz
   });
 
   it('falls back to the table path when no pool-local clone exists', () => {
-    const onlyPrimary = (cwd) => (cwd === '/home/user/plateau-app' ? 'chalbert/plateau-app' : '');
+    const onlyPrimary = (cwd) => (cwd === '/home/user/plateau-app' ? 'plateauapp/plateau-app' : '');
     const table = () => ([{ name: 'plateau-app', path: '/home/user/plateau-app', present: true }]);
     expect(resolveSubjectCheckout({
-      repo: 'chalbert/plateau-app', cwd: '/pool/lane-1', originRepo: onlyPrimary, siblings: table,
+      repo: 'plateauapp/plateau-app', cwd: '/pool/lane-1', originRepo: onlyPrimary, siblings: table,
     }).path).toBe('/home/user/plateau-app');
   });
 
   it('covers EVERY constellation member, not just frontierui', () => {
     const pool = (cwd) => ({
-      '/pool/lane-1': 'chalbert/web-everything',
-      '/pool/frontierui': 'chalbert/frontierui',
-      '/pool/plateau-app': 'chalbert/plateau-app',
+      '/pool/lane-1': 'web-everything/web-everything',
+      '/pool/frontierui': 'frontier-ui/frontierui',
+      '/pool/plateau-app': 'plateauapp/plateau-app',
     })[cwd] ?? '';
     const table = () => ([
       { name: 'frontierui', path: '/pool/frontierui', present: true },
       { name: 'plateau-app', path: '/pool/plateau-app', present: true },
     ]);
     const at = (repo) => resolveSubjectCheckout({ repo, cwd: '/pool/lane-1', originRepo: pool, siblings: table }).path;
-    expect(at('chalbert/web-everything')).toBe('/pool/lane-1');
-    expect(at('chalbert/frontierui')).toBe('/pool/frontierui');
-    expect(at('chalbert/plateau-app')).toBe('/pool/plateau-app');
+    expect(at('web-everything/web-everything')).toBe('/pool/lane-1');
+    expect(at('frontier-ui/frontierui')).toBe('/pool/frontierui');
+    expect(at('plateauapp/plateau-app')).toBe('/pool/plateau-app');
   });
 
   it('survives a throwing sibling table — the GUARD speaks, not a crash', () => {
     const exploding = () => { throw new Error('no constellation table here'); };
-    const got = resolveSubjectCheckout({ repo: 'chalbert/frontierui', cwd: '/pool/lane-1', originRepo, siblings: exploding });
+    const got = resolveSubjectCheckout({ repo: 'frontier-ui/frontierui', cwd: '/pool/lane-1', originRepo, siblings: exploding });
     expect(got.path).toBeNull();
   });
 
@@ -930,7 +930,7 @@ describe('the subject checkout is DERIVED from the constellation siblings (#xgmz
     const reader = createReviewPrReader({ cwd: '/pool/lane-1', originRepo: spyOrigin, siblings });
 
     let err;
-    try { reader({ pr: 43, repo: 'chalbert/frontierui' }); } catch (e) { err = e; }
+    try { reader({ pr: 43, repo: 'frontier-ui/frontierui' }); } catch (e) { err = e; }
 
     // Rooted at the FUI clone, not the WE lane it was driven from.
     expect(checked.at(-1)).toBe('/pool/frontierui');
@@ -1162,8 +1162,13 @@ describe('#4315 durable referral effects', () => {
   it('a drop that cannot be persisted retains the hold', async () => {
     const h = harness({ failure: 'post', env: { REVIEW_PR_ANTIGRAVITY_REVIEW: '0' } });
     seedReferrals(h, ['judgeAntigravityReview']);
-    expect((await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX)).pending).toEqual(['referral-persistence-failed']);
-    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7 })).toThrow(/mandatory referral hold/);
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(result.pending).toEqual(['referral-persistence-failed']);
+    // The operation runner persists this failure evidence; old-head referrals alone are no longer a hold.
+    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7,
+      readRuns: () => [{ repo: 'o/r', pr: 7, head: h.state.headRefOid, completedAt: 1,
+        persistenceFailed: result.pending.includes('referral-persistence-failed') }],
+    })).toThrow(/referral-persistence-failed/);
   });
   it.each(['pending', 'human-and-changes'])('parks with live %s labels without consuming a send-back', async initial => {
     const h = harness({ failure: 'judge' });
@@ -1514,5 +1519,14 @@ describe('#4315 durable referral effects', () => {
     expect(h.trace.at(-1)).toBe('mirror:true');
     await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, { ...CTX, runId: 'another-checkout' });
     expect(h.judge).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('legacy vs current owner slugs compare equal (outage 2026-10-03)', () => {
+  it('resolveSubjectCheckout accepts a chalbert/ origin for the web-everything/ slug and the reverse', () => {
+    const a = resolveSubjectCheckout({ repo: 'web-everything/web-everything', cwd: '/x', originRepo: () => 'chalbert/web-everything', siblings: () => [] });
+    expect(a.path).toBe('/x');
+    const b = resolveSubjectCheckout({ repo: 'chalbert/web-everything', cwd: '/x', originRepo: () => 'web-everything/web-everything', siblings: () => [] });
+    expect(b.path).toBe('/x');
   });
 });

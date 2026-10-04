@@ -112,7 +112,7 @@ beforeAll(() => {
   git(['config', 'user.email', 'test@example.com']);
   git(['config', 'user.name', 'test']);
   // The origin slug is what `repoKeyFromSlug` turns into the `we:` qualifier the declared scope is matched on.
-  git(['remote', 'add', 'origin', 'https://github.com/chalbert/web-everything.git']);
+  git(['remote', 'add', 'origin', 'https://github.com/web-everything/web-everything.git']);
   git(['add', '-A']);
   git(['commit', '-qm', 'base']);
   // The diff base. merge-base(origin/main, HEAD) == HEAD, so the COMMITTED half is empty and the observed set

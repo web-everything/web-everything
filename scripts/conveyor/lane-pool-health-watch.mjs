@@ -190,13 +190,13 @@ export function freeLaneRows(lanes, acquirableLaneNumbers) {
  * Resolve a caller-supplied `--repo` into what `we:scripts/lane-pool.mjs --repo=` actually needs: a
  * filesystem path. Live-caught 2026-09-22, first real (non-dry-run, non-fixture) run under a standalone
  * daemon: every OTHER repo-generic conveyor pass (`we:scripts/conveyor/reconcile-pass.mjs`,
- * `we:scripts/operations/review-dispatch.mjs`, …) accepts a constellation SLUG (`chalbert/plateau-app`) and
+ * `we:scripts/operations/review-dispatch.mjs`, …) accepts a constellation SLUG (`plateauapp/plateau-app`) and
  * resolves it internally; this file forwarded whatever it was given UNCHANGED straight into
  * `lane-pool.mjs status --repo=<value>`, which has ALWAYS been, and stays, path-only (confirmed by direct
  * read of `we:scripts/lane-pool.mjs#resolveRepo` — no slug resolution exists there, and giving it one now
  * would be a much bigger, riskier change than fixing the one caller that got the contract backwards). A
- * daemon wired with `--repo=chalbert/plateau-app` (matching its own manifest entry's sibling convention)
- * crashed every run: `lane-pool.mjs` tried to resolve a literal `./chalbert/plateau-app` directory.
+ * daemon wired with `--repo=plateauapp/plateau-app` (matching its own manifest entry's sibling convention)
+ * crashed every run: `lane-pool.mjs` tried to resolve a literal `./plateauapp/plateau-app` directory.
  *
  * Accepts EITHER form so an existing caller already passing a raw path (this file's own tests, an operator's
  * `--dry-run` from the command line) is unaffected: a recognized slug resolves to that repo's real checkout

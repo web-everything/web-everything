@@ -184,7 +184,7 @@ describe('regex fixtures used by the evaluator stay honest about what they match
     // against that command's REAL output, built from verify-lane.mjs's own `emit()` format + run-mode detail
     // strings (read from the source so a reworded line breaks this test, not a live canary run).
     const src = readFileSync(join(REPO_ROOT, 'scripts', 'verify-lane.mjs'), 'utf8');
-    expect(gateFor('chalbert/web-everything', { weRoot: REPO_ROOT })).not.toMatch(/--json/);
+    expect(gateFor('web-everything/web-everything', { weRoot: REPO_ROOT })).not.toMatch(/--json/);
     expect(src).toContain('`verify-lane [lane @ ${result.sha ? result.sha.slice(0, 8) : \'?\'}] ${result.status}: ${result.detail}\\n`');
     const greenDetail = /detail: exitCode === 0 \? '([^']+)'/.exec(src)?.[1];
     expect(greenDetail).toBeTruthy();

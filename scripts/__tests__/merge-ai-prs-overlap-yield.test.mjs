@@ -85,18 +85,18 @@ describe('buildOverlapRows — #4308 row-shape wiring (2026-09-29 review finding
   it('normalizes a null (local-repo) Map key to `localSlug` — for BOTH the row\'s own `.repo` and the matching keys', () => {
     const openPrContext = { prsByRepo: new Map([[null, [rawPr(10, { files: [{ path: 'a', additions: 5, deletions: 0 }] })]]]) };
     const verdicts = [{ num: 10, repo: null, decision: 'merge', item: null, blockedBy: [], stackParents: [], headSha: 'deadbeef' }];
-    const { candidateRows, openPrRows } = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, localSlug: 'chalbert/web-everything' });
+    const { candidateRows, openPrRows } = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, localSlug: 'web-everything/web-everything' });
     expect(openPrRows).toHaveLength(1);
-    expect(openPrRows[0].repo).toBe('chalbert/web-everything'); // NOT null — a real slug `readyToMergeLabelTimeMs` can call `gh api` against
+    expect(openPrRows[0].repo).toBe('web-everything/web-everything'); // NOT null — a real slug `readyToMergeLabelTimeMs` can call `gh api` against
     expect(candidateRows).toHaveLength(1);
-    expect(candidateRows[0].repo).toBe('chalbert/web-everything');
+    expect(candidateRows[0].repo).toBe('web-everything/web-everything');
     expect(candidateRows[0].headSha).toBe('deadbeef');
   });
 
   it('excludes a PR already merged earlier this same cascade (mergedPrKeys), keyed the SAME normalized way', () => {
     const openPrContext = { prsByRepo: new Map([[null, [rawPr(10), rawPr(11)]]]) };
-    const mergedPrKeys = new Set([overlapRowKey({ repo: 'chalbert/web-everything', number: 10 })]);
-    const { openPrRows } = buildOverlapRows({ candidates: [], verdicts: [], openPrContext, mergedPrKeys, localSlug: 'chalbert/web-everything' });
+    const mergedPrKeys = new Set([overlapRowKey({ repo: 'web-everything/web-everything', number: 10 })]);
+    const { openPrRows } = buildOverlapRows({ candidates: [], verdicts: [], openPrContext, mergedPrKeys, localSlug: 'web-everything/web-everything' });
     expect(openPrRows.map((r) => r.number)).toEqual([11]);
   });
 

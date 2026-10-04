@@ -3,7 +3,7 @@
  * @file scripts/conveyor/already-landed-watch.mjs
  * @description THE ALREADY-LANDED WATCH — the ACT half of the live incident closed by
  *   `we:scripts/lib/already-landed-content.mjs` / `we:scripts/conveyor/reconcile-core.mjs`'s `already-landed`
- *   refusal (chalbert/web-everything PR #2752, #4034/#2748). `reconcile-core.mjs` already stops the planner
+ *   refusal (web-everything/web-everything PR #2752, #4034/#2748). `reconcile-core.mjs` already stops the planner
  *   from dispatching a fix/review/ci-heal at a PR whose content is already, file-by-file, on `main` — this pass
  *   is what actually CLOSES that PR and resolves its backlog card, since a refusal alone leaves the PR sitting
  *   open forever with nothing coming to clear it (mirrors why `we:scripts/conveyor/parked-pr-conflict-watch.mjs`

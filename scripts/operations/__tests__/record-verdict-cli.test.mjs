@@ -38,7 +38,7 @@ process.env.REVIEW_PR_CODEX_CORRECTNESS_ADVISORY = '0';
 // registration (`model-probation.json`'s `antigravity`/`gemini-3.1-pro` entry) defaults it ON too.
 process.env.REVIEW_PR_ANTIGRAVITY_REVIEW = '0';
 
-const BASE_INPUT = { pr: 4242, repo: 'chalbert/web-everything' };
+const BASE_INPUT = { pr: 4242, repo: 'web-everything/web-everything' };
 const CLEAN_ANSWER = { summary: 'nothing blocking', findings: [] };
 
 /** A stub `readPr` — no `gh`, no network. `labels` decides gate-self. */
@@ -418,7 +418,7 @@ describe('#3540 record-verdict-cli — ONE call, no separate --resume of the rev
 // rule the placeholder satisfies but a real write-up would not, this reddens, which is exactly where #3540's
 // own comment says the fix belongs.
 describe('#3540 round 3 — the precheck\'s placeholder body agrees with a realistic one', () => {
-  const facts = { repo: 'chalbert/web-everything', pr: 4242, actor: 'claude-review-pr' };
+  const facts = { repo: 'web-everything/web-everything', pr: 4242, actor: 'claude-review-pr' };
   // A write-up-shaped body: never empty, carries real content — standing in for what
   // `renderVerdictWriteUp` actually produces, without depending on that render pipeline here.
   const REALISTIC_BODY = '**Decision:** `accepted`\n\nRecorded through the declared `review-pr` operation.';

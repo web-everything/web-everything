@@ -3,9 +3,10 @@ bornAs: x3337wu
 kind: story
 size: 3
 parent: "3383"
-status: open
+status: resolved
 scope: ["we:scripts/verify-lane.mjs", "we:scripts/lib/lane-verify.mjs", "we:scripts/__tests__/verify-lane.test.mjs", "we:scripts/__tests__/lane-verify.test.mjs"]
 dateOpened: "2026-09-25"
+dateResolved: "2026-10-03"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "e1f0523e0881357fc863f3e88da72e0164eb7091"
 tags: []
@@ -23,6 +24,20 @@ Premise checked against main at `e1f0523e0`.
 - **So the "resident daemon" option is already delivered.** What is left is the other half: when that daemon is not alive, `request` still stamps `running` and returns 0 (`we:scripts/verify-lane.mjs:356` writeMarker, then `we:scripts/verify-lane.mjs:367` emit `requested`). Nothing then ever picks it up. The two options are not a fork. The refusal guards the daemon path; it does not replace it.
 - **Old premise:** "the runner-activity read". **Corrected:** that read (`we:scripts/operations/runner-activity-io.mjs:54` `KNOWN_DAEMONS`) lists dispatcher, fix-dispatch and review only, not the verify daemon. The right liveness signal is the verify daemon's own lease, read with `runnerLeaseStatus` (`we:skills-src/conveyor/runner-lock.mjs:150`) plus the same-host pid probe `probeRunnerLeaseLiveness` (`we:skills-src/conveyor/runner-lock.mjs:102`).
 - **Scope corrected:** `we:scripts/conveyor/verify-dispatch.mjs` needs no change. Added the pure helper's home (`we:scripts/lib/lane-verify.mjs`) and both test files.
+
+### Implementation and observed proof — 2026-10-03
+
+- Implemented the pure lease/PID verdict in `we:scripts/lib/lane-verify.mjs` and the request-only IO guard in `we:scripts/verify-lane.mjs`, after cache reuse and before the running marker write. Missing, expired, and confirmed-dead holders refuse with exit 3, `status: no-server`, recovery instructions, and no new marker. Updated the usage/exit-code banner.
+- Regression-first: the new verdict cases failed against the unchanged implementation (missing export); all three unavailable-server CLI cases returned exit 0 instead of 3. The cache fixture initially lacked `origin/main`; added that real local branch, matching the existing cache tests so the content hash can resolve. No production cache behavior or test expectation was weakened.
+- **Before, real CLI + 61-second soak:** in a temporary Git repository with one untracked edit and an empty lock root selected through `CONVEYOR_RUNNER_LOCK_ROOT`, `request --gate=true --json` returned exit 0, `{"status":"requested","reason":"requested"}`. After 61 seconds, `check --json` returned exit 2, `{"ok":false,"status":"running","reason":"verify-unfinished"}`. The marker was stranded.
+- **After, real CLI:** the same absent-lease setup returned exit 3 in **160 ms**, `{"status":"no-server","reason":"verify-daemon-not-alive","ok":false}`. The detail named `no-lease`, `<conveyor:verify-daemon-lease>`, `last heartbeat: none`, said `no marker was written`, and included the launchctl and Node recovery steps. An explicit filesystem assertion confirmed marker absence.
+- **Recovery, real daemon/dispatcher path:** acquired the keyed lease for the live proof process in the isolated root. Request returned exit 0 / `requested` in **148 ms**. Ran `runDaemonLoop` → `runVerifyTick` → the real `runVerifyDispatch` against a temporary one-lane pool, using the real bounded child spawn and `--gate=true` for this transport proof. Dispatch reported one lane, zero failures; `check --wait=540000 --json` returned exit 0, `{"ok":true,"status":"green","reason":"verified","settled":true}` in **178 ms**. Released the proof lease and removed temporary fixtures in `finally`; no helper files added.
+- **Host-proof limitation:** the prescribed `launchctl bootout` returned `Boot-out failed: 1: Operation not permitted`. Therefore the launchd stop/bootstrap cycle was not performed; the isolated-root exercise above is the observed substitute, not a claim that the host lifecycle was tested. A subsequent launchctl read confirmed the original service remained `state = running`, PID 33692, so no restart was needed.
+- **Scoped validation:** `npx vitest run verify-lane.test lane-verify.test` passed **171/171 tests**, including absent/stale/dead holders, live and unknown PID verdicts, unchanged cache reuse without a daemon, and live request marker creation. The refusal subprocesses have a two-second timeout.
+
+- **Required wider gate:** `node we:scripts/verify-lane.mjs` ran 107 test files: **6,189 passed, 1 failed**. The failing existing case in `we:scripts/operations/__tests__/heavy-queue-io-real.test.mjs` requires the real process command line. `we:scripts/operations/heavy-queue-io.mjs` calls `ps` and returns null on execution failure; a direct `ps -p $$ -o command=` probe returned exit 126, `/bin/ps: Operation not permitted`. The sandbox blocks the required host capability. No test, gate, or out-of-scope source was changed. The verification marker is red; resolution is intentionally pending an unrestricted verification run and the host lifecycle proof.
+
+- **Standards validation:** `npm run check:standards` passed with **0 errors** (5,292 warnings). `git diff --check` passed. Only the four declared source/test files and this card changed.
 
 ## Design
 
@@ -81,6 +96,9 @@ Live case on this host (launchd runs the verify daemon as `com.we.verify-daemon`
 4. The live before/after proof from `## Proof plan` is recorded in `## Progress`.
 
 ## Follow-ups
+
+- Re-run `node we:scripts/verify-lane.mjs` with process inspection permitted, then resolve through `node we:scripts/operations/run.mjs resolve --ref=4161` once the remaining proof is complete.
+- Repeat the prescribed launchd stop/bootstrap proof from an unrestricted host session; this checkout session could not stop the service. The isolated-root proof above covers request refusal and real dispatch recovery, but not launchd lifecycle control.
 
 - Add the verify daemon to `KNOWN_DAEMONS` in `we:scripts/operations/runner-activity-io.mjs:54`, so `/runner-status` shows its liveness too.
 - Commit a verify-daemon launchd plist example under `we:skills-src/conveyor/launchd/`. The live plist exists on this host, but the repo has no example, so a fresh host gets no resident server.

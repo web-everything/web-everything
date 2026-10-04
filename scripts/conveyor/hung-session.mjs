@@ -1,7 +1,7 @@
 /**
  * hung-session.mjs — shared pure-core/IO-shell "hung session" detection (epic #3383 continuation).
  *
- * WHY THIS EXISTS (root cause, live 2026-09-24, chalbert/web-everything#2599/#2596/#2594/#2588/#2587/#2582).
+ * WHY THIS EXISTS (root cause, live 2026-09-24, web-everything/web-everything#2599/#2596/#2594/#2588/#2587/#2582).
  * `skills-src/review/review-agent-brief.md` tells a review agent, IN PROSE, to self-report
  * `status: done, outcome: blocked-on-infra` via `scripts/operations/completion-cli.mjs` before it exits on an
  * infra failure. Under stress (a crash, an unhandled error) an agent can exit WITHOUT ever running that
@@ -36,7 +36,7 @@
  * (`reconcile-core.mjs`'s own docblock states it verbatim).
  *
  * `lastActivityMs` PREFERS THE TRANSCRIPT'S OWN EMBEDDED ENTRY TIMESTAMPS OVER THE FILE'S mtime, and this is
- * load-bearing, not a style choice — MEASURED LIVE while building this axis (chalbert/web-everything
+ * load-bearing, not a style choice — MEASURED LIVE while building this axis (web-everything/web-everything
  * `review-2599`'s real transcript, 2026-09-24): its last real JSONL line carried `timestamp:
  * "2026-09-24T18:46:09Z"`, while `fs.statSync` on the very same file reported an `mtime` almost THREE HOURS
  * LATER. Something in this environment can bump a transcript file's mtime with no new content (a backup pass,

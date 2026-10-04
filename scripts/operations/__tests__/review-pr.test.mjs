@@ -248,7 +248,7 @@ async function driveToRecordDeclared({
   return current;
 }
 
-const BASE_INPUT = { pr: 1234, repo: 'chalbert/web-everything' };
+const BASE_INPUT = { pr: 1234, repo: 'web-everything/web-everything' };
 
 // ── PROPERTY 1: THE DIFF ARRIVES ON THE NET BASIS ─────────────────────────────────────────────────────────
 describe('the net basis', () => {
@@ -1004,7 +1004,7 @@ describe('#3063 a step refusal renders a stop instead of throwing out of `driveR
 
     const started = await runOperationCli({
       declaration, registry, store, sinks, judge: meteredJudge,
-      argv: ['--pr=1153', '--repo=chalbert/web-everything'], newRunId: () => 'run-refuse',
+      argv: ['--pr=1153', '--repo=web-everything/web-everything'], newRunId: () => 'run-refuse',
     });
     expect(started.stopped).toBe('confirm');
     expect(started.lines.join('\n')).toContain('awaiting a decision from: human');
@@ -1051,7 +1051,7 @@ describe('#3063 a step refusal renders a stop instead of throwing out of `driveR
     const sinks = Object.fromEntries(Object.values(REVIEW_EFFECTS).map((t) => [t, async () => ({ ok: true })]));
     await runOperationCli({
       declaration, registry, store, sinks, judge: meteredJudge,
-      argv: ['--pr=1153', '--repo=chalbert/web-everything'], newRunId: () => 'run-repeat',
+      argv: ['--pr=1153', '--repo=web-everything/web-everything'], newRunId: () => 'run-repeat',
     });
     const first = await runOperationCli({
       declaration, registry, store, sinks, judge: meteredJudge,
@@ -1071,7 +1071,7 @@ describe('#3063 a step refusal renders a stop instead of throwing out of `driveR
     const sinks = Object.fromEntries(Object.values(REVIEW_EFFECTS).map((t) => [t, async () => ({ ok: true })]));
     await runOperationCli({
       declaration, registry, store, sinks, judge: meteredJudge,
-      argv: ['--pr=1153', '--repo=chalbert/web-everything'], newRunId: () => 'run-json',
+      argv: ['--pr=1153', '--repo=web-everything/web-everything'], newRunId: () => 'run-json',
     });
     const refused = await runOperationCli({
       declaration, registry, store, sinks, judge: meteredJudge,
@@ -1308,7 +1308,7 @@ describe('the derived command line', () => {
 
     const first = await runOperationCli({
       declaration, registry, store, sinks, judge,
-      argv: ['--pr=1234', '--repo=chalbert/web-everything'],
+      argv: ['--pr=1234', '--repo=web-everything/web-everything'],
       newRunId: () => 'run-cli',
     });
     expect(first.stopped).toBe('confirm');
@@ -1333,7 +1333,7 @@ describe('the derived command line', () => {
     const sinks = Object.fromEntries(Object.values(REVIEW_EFFECTS).map((t) => [t, async () => ({ ok: true })]));
     await runOperationCli({
       declaration, registry, store, sinks, judge,
-      argv: ['--pr=1234', '--repo=chalbert/web-everything'], newRunId: () => 'run-opt',
+      argv: ['--pr=1234', '--repo=web-everything/web-everything'], newRunId: () => 'run-opt',
     });
     await expect(runOperationCli({
       declaration, registry, store, sinks, judge,
@@ -1359,7 +1359,7 @@ describe('the juror\'s cost survives the run (the adapter used to drop it)', () 
     const sinks = Object.fromEntries(Object.values(REVIEW_EFFECTS).map((t) => [t, async () => ({ ok: true })]));
     const out = await runOperationCli({
       declaration, registry, store, sinks, judge,
-      argv: ['--pr=1234', '--repo=chalbert/web-everything'], newRunId: () => 'run-tel',
+      argv: ['--pr=1234', '--repo=web-everything/web-everything'], newRunId: () => 'run-tel',
     });
     return { out, store, declaration, registry, sinks };
   };
@@ -2594,7 +2594,7 @@ describe('#x6t2z6h — the two seats disagree', () => {
 describe('#3335 the caller declares the shape its touch-set earns', () => {
   /** A `read` view whose NET file list is exactly #1580's — the statute, which scores care `high`. */
   const statuteRead = () => {
-    const raw = stubReader({})({ pr: 1580, repo: 'chalbert/web-everything' });
+    const raw = stubReader({})({ pr: 1580, repo: 'web-everything/web-everything' });
     return { ...raw, net: { ...raw.net, paths: ['docs/agent/platform-decisions.md'] } };
   };
 
@@ -3582,10 +3582,10 @@ describe('#xu2pp2m — a review can no longer clear a PR on material it could no
     // alone, would either miss the measured case or reject a legitimate one.
     const { registry } = registryFor({});
     const reader = stubReader({});
-    const raw = reader({ pr: 1234, repo: 'chalbert/web-everything' });
+    const raw = reader({ pr: 1234, repo: 'web-everything/web-everything' });
     const shaped = shapeReadFinding(
       { ...raw, diff: { text: '', scored: true } },
-      { pr: 1234, repo: 'chalbert/web-everything' },
+      { pr: 1234, repo: 'web-everything/web-everything' },
     );
     expect(shaped.degraded).toBe(false);
     expect(registry).toBeTruthy();
@@ -3645,10 +3645,10 @@ describe('#xu2pp2m — a review can no longer clear a PR on material it could no
 });
 
 // The accepted review comment fetched read-only from the incident URL below.
-const INCIDENT_4315_COMMENT = "\u2705 review \u2014 accepted\n\nRecorded by agent (unattended review-loop) via the declared `review-pr` operation (#3035).\n\n## Human review verdict \u2014 chalbert/web-everything#2835\n\n**Verdict:** \u2705 pass \u2014 no blocking findings\n\n### Panel verdicts\n\n| lens | weight | verdict |\n| --- | --- | --- |\n| correctness | mandatory | accept |\n| security | mandatory | accept |\n| simplicity (codex) | advisory | accept |\n| codex-correctness (codex, advisory) | advisory | changes |\n| antigravity-review (antigravity, advisory) | advisory | accept |\n\n### Findings (4)\n\n**codex-correctness/correctness** (2)\n- `scripts/conveyor/lease-reaper.mjs` \u2014 git cherry can report containment while ignoring unlanded changes introduced by a merge commit. \u2014 On the uncommon path where the lane contains a merge commit with unique conflict-resolution changes, but its non-merge commits are already present or patch-equivalent upstream, merge-base rejects ancestry while git cherry produces empty or all-minus output because it excludes merge commits. The fallback then corroborates the lease and permits reclamation despite unlanded work. Mutation probing was impossible with the read-only shell; a regression named 'retains a lease with unlanded merge-resolution changes' should defend this case. _[CONFIRMED]_ _[impact if unfixed: broken]_\n  - _Prevention (OWED \u2014 file it):_ Add a deterministic real-Git regression with unique merge-resolution content and require the containment check to reject it; conservatively reject unaccounted-for merge commits.\n- `scripts/conveyor/lease-reaper.mjs` \u2014 The squash fallback only handles individually patch-equivalent commits, not a typical squash of multiple commits. \u2014 For a merged PR containing two or more distinct commits squashed into one, git cherry compares each original commit's patch against the combined squash patch and ordinarily emits plus entries. The completed lease consequently remains until the existing TTL backstop. The added SQUASH-merged integration test uses only one feature commit and misses this common squash shape. Mutation probing was impossible with the read-only shell; a test named 'reclaims a multi-commit squash-merged lease' should exercise it. _[CONFIRMED]_ _[impact if unfixed: degraded]_\n  - _Prevention (OWED \u2014 file it):_ Add a deterministic real-Git test that squashes two distinct feature commits into one upstream commit and verifies safe reclamation using aggregate containment evidence.\n\n**antigravity-review/logic error** (1)\n- `scripts/conveyor/lease-reaper.mjs:392` \u2014 The `git cherry` patch-equivalence fallback fails for squash-merged PRs containing more than one commit. \u2014 A PR with multiple commits is squash-merged into the base branch. Because `git cherry` compares patch IDs on a strictly per-commit basis, none of the individual commits in the PR will match the single combined squash commit's patch ID. `git cherry` outputs `+` for all commits, the fallback evaluates to `false`, and the lease incorrectly rides the 4-hour TTL instead of reaping early. I have NO tools to verify this by mutation, but modifying the `a TTL-STALE lease whose PR was SQUASH-merged` integration test to author two distinct commits before squash-merging would prove it reddens. _[PLAUSIBLE]_ _[impact if unfixed: degraded]_\n  - _Prevention (OWED \u2014 file it):_ A `check:standards` rule requiring git-integration tests that verify branch-level equivalence to operate on N>1 commit cardinality, preventing trivial single-commit false proofs.\n\n**antigravity-review/coverage** (1)\n- `scripts/conveyor/lease-reaper.mjs:380` \u2014 The prose guarantees that a `-`-prefixed sha will not be misread as a flag, but no test exercises this malformed input. \u2014 A future refactor removes the `--` separator. If `gh` returns a malformed `-`-prefixed sha, `git merge-base` fails with an unrecognized option error. While safely caught as `null`, the specific prose guarantee (\"never misread as a flag\") is violated with no test to catch the regression. I have NO tools, but adding a test passing a `-malformed` sha to `defaultGitIsAncestor` SHOULD defend this. _[PLAUSIBLE]_ _[impact if unfixed: cosmetic]_\n  - _Prevention (OWED \u2014 file it):_ A review lens or lint ensuring every explicit defensive parsing claim in prose is paired with a negative test case exercising the malformed input.\n\n---\n\n**Decision:** `accept` \u2014 recorded by agent (unattended review-loop).\n**Lenses:** `correctness` + `security` + `simplicity` + `codex-correctness` + `antigravity-review` \u2014 5 juror(s), one per lens, each a separate `judge` step spawned with its own derived session id (#3028) and its own tools (#3319). They ran SEQUENTIALLY and neither saw the other's findings; this is not a `judgePanel` fan-out (#3050). The other 2 panel lens(es) (standards-conformance, claim-accuracy) did NOT run and are not reported as unjudged.\n**Earned vs seated:** this PR's code touch-set scores care `elevated` (blast-radius (scripts/__tests__/lane-pool-reap-branch-fallback.test.mjs, scripts/conveyor/__tests__/lease-reaper.test.mjs, scripts/conveyor/lease-reaper.mjs, \u2026)), for which the care dial asks for 5 lens(es) \u00d7 1 juror(s)/lens \u00d7 2 round(s). This run seated 5 lens(es) (correctness, security, simplicity, codex-correctness, antigravity-review), 1 juror each, in 1 round. SHORTFALL: 2 earned lens(es) (standards-conformance, claim-accuracy) did not sit. The caller declared no `--careLevel`, so nothing checked the shape this run was dialled for against the files it actually judged (#3335). The shortfall is structural \u2014 the step list is fixed at registration (#3319) \u2014 so it is RECORDED here rather than implied away: do not read the seats above as the whole review this PR earned.\nNet basis: `6881b3ae875f8e3f98ead7caaec48bd7c045e1b5..b0da85e383921e3024cb8711605df3a3d4f49535` (rev `origin/lane/xkk4lv7-branch-fallback-reap` at review time) \u2014 9 net changed file(s) vs current main (#2450), not `gh pr diff`'s three-dot list.\n\n_Recorded through the declared `review-pr` operation (#3035)._\n\n<!-- reviewed-sha: b0da85e383921e3024cb8711605df3a3d4f49535 -->\n<!-- reviewed-diff: e05c9357fb9cfdada3119145cf636badff8ea50523c8b93aa9fc7695f5db815b -->\n<!-- reviewed-contribution: f1f45866ebbde80a6981a55030b13e36c3ba1f2ba3f7b2a5da5db0de19fffb1c -->\n<!-- cleared-by-actor: 9c9608ba-e783-48f2-894e-c1d68cd0b77e -->";
+const INCIDENT_4315_COMMENT = "\u2705 review \u2014 accepted\n\nRecorded by agent (unattended review-loop) via the declared `review-pr` operation (#3035).\n\n## Human review verdict \u2014 web-everything/web-everything#2835\n\n**Verdict:** \u2705 pass \u2014 no blocking findings\n\n### Panel verdicts\n\n| lens | weight | verdict |\n| --- | --- | --- |\n| correctness | mandatory | accept |\n| security | mandatory | accept |\n| simplicity (codex) | advisory | accept |\n| codex-correctness (codex, advisory) | advisory | changes |\n| antigravity-review (antigravity, advisory) | advisory | accept |\n\n### Findings (4)\n\n**codex-correctness/correctness** (2)\n- `scripts/conveyor/lease-reaper.mjs` \u2014 git cherry can report containment while ignoring unlanded changes introduced by a merge commit. \u2014 On the uncommon path where the lane contains a merge commit with unique conflict-resolution changes, but its non-merge commits are already present or patch-equivalent upstream, merge-base rejects ancestry while git cherry produces empty or all-minus output because it excludes merge commits. The fallback then corroborates the lease and permits reclamation despite unlanded work. Mutation probing was impossible with the read-only shell; a regression named 'retains a lease with unlanded merge-resolution changes' should defend this case. _[CONFIRMED]_ _[impact if unfixed: broken]_\n  - _Prevention (OWED \u2014 file it):_ Add a deterministic real-Git regression with unique merge-resolution content and require the containment check to reject it; conservatively reject unaccounted-for merge commits.\n- `scripts/conveyor/lease-reaper.mjs` \u2014 The squash fallback only handles individually patch-equivalent commits, not a typical squash of multiple commits. \u2014 For a merged PR containing two or more distinct commits squashed into one, git cherry compares each original commit's patch against the combined squash patch and ordinarily emits plus entries. The completed lease consequently remains until the existing TTL backstop. The added SQUASH-merged integration test uses only one feature commit and misses this common squash shape. Mutation probing was impossible with the read-only shell; a test named 'reclaims a multi-commit squash-merged lease' should exercise it. _[CONFIRMED]_ _[impact if unfixed: degraded]_\n  - _Prevention (OWED \u2014 file it):_ Add a deterministic real-Git test that squashes two distinct feature commits into one upstream commit and verifies safe reclamation using aggregate containment evidence.\n\n**antigravity-review/logic error** (1)\n- `scripts/conveyor/lease-reaper.mjs:392` \u2014 The `git cherry` patch-equivalence fallback fails for squash-merged PRs containing more than one commit. \u2014 A PR with multiple commits is squash-merged into the base branch. Because `git cherry` compares patch IDs on a strictly per-commit basis, none of the individual commits in the PR will match the single combined squash commit's patch ID. `git cherry` outputs `+` for all commits, the fallback evaluates to `false`, and the lease incorrectly rides the 4-hour TTL instead of reaping early. I have NO tools to verify this by mutation, but modifying the `a TTL-STALE lease whose PR was SQUASH-merged` integration test to author two distinct commits before squash-merging would prove it reddens. _[PLAUSIBLE]_ _[impact if unfixed: degraded]_\n  - _Prevention (OWED \u2014 file it):_ A `check:standards` rule requiring git-integration tests that verify branch-level equivalence to operate on N>1 commit cardinality, preventing trivial single-commit false proofs.\n\n**antigravity-review/coverage** (1)\n- `scripts/conveyor/lease-reaper.mjs:380` \u2014 The prose guarantees that a `-`-prefixed sha will not be misread as a flag, but no test exercises this malformed input. \u2014 A future refactor removes the `--` separator. If `gh` returns a malformed `-`-prefixed sha, `git merge-base` fails with an unrecognized option error. While safely caught as `null`, the specific prose guarantee (\"never misread as a flag\") is violated with no test to catch the regression. I have NO tools, but adding a test passing a `-malformed` sha to `defaultGitIsAncestor` SHOULD defend this. _[PLAUSIBLE]_ _[impact if unfixed: cosmetic]_\n  - _Prevention (OWED \u2014 file it):_ A review lens or lint ensuring every explicit defensive parsing claim in prose is paired with a negative test case exercising the malformed input.\n\n---\n\n**Decision:** `accept` \u2014 recorded by agent (unattended review-loop).\n**Lenses:** `correctness` + `security` + `simplicity` + `codex-correctness` + `antigravity-review` \u2014 5 juror(s), one per lens, each a separate `judge` step spawned with its own derived session id (#3028) and its own tools (#3319). They ran SEQUENTIALLY and neither saw the other's findings; this is not a `judgePanel` fan-out (#3050). The other 2 panel lens(es) (standards-conformance, claim-accuracy) did NOT run and are not reported as unjudged.\n**Earned vs seated:** this PR's code touch-set scores care `elevated` (blast-radius (scripts/__tests__/lane-pool-reap-branch-fallback.test.mjs, scripts/conveyor/__tests__/lease-reaper.test.mjs, scripts/conveyor/lease-reaper.mjs, \u2026)), for which the care dial asks for 5 lens(es) \u00d7 1 juror(s)/lens \u00d7 2 round(s). This run seated 5 lens(es) (correctness, security, simplicity, codex-correctness, antigravity-review), 1 juror each, in 1 round. SHORTFALL: 2 earned lens(es) (standards-conformance, claim-accuracy) did not sit. The caller declared no `--careLevel`, so nothing checked the shape this run was dialled for against the files it actually judged (#3335). The shortfall is structural \u2014 the step list is fixed at registration (#3319) \u2014 so it is RECORDED here rather than implied away: do not read the seats above as the whole review this PR earned.\nNet basis: `6881b3ae875f8e3f98ead7caaec48bd7c045e1b5..b0da85e383921e3024cb8711605df3a3d4f49535` (rev `origin/lane/xkk4lv7-branch-fallback-reap` at review time) \u2014 9 net changed file(s) vs current main (#2450), not `gh pr diff`'s three-dot list.\n\n_Recorded through the declared `review-pr` operation (#3035)._\n\n<!-- reviewed-sha: b0da85e383921e3024cb8711605df3a3d4f49535 -->\n<!-- reviewed-diff: e05c9357fb9cfdada3119145cf636badff8ea50523c8b93aa9fc7695f5db815b -->\n<!-- reviewed-contribution: f1f45866ebbde80a6981a55030b13e36c3ba1f2ba3f7b2a5da5db0de19fffb1c -->\n<!-- cleared-by-actor: 9c9608ba-e783-48f2-894e-c1d68cd0b77e -->";
 
 // #4315: reconstructed structured input, NOT a historical-ledger replay.
-// Provenance: https://github.com/chalbert/web-everything/pull/2835#issuecomment-5869333574
+// Provenance: https://github.com/web-everything/web-everything/pull/2835#issuecomment-5869333574
 // Reviewed SHA b0da85e383921e3024cb8711605df3a3d4f49535. Retain the reported
 // CONFIRMED/broken tags and source coordinates; represent the four nonblocking
 // seats from the published headings/tags below. The comment is evidence, not a raw jury ledger.
@@ -3662,7 +3662,7 @@ describe('#4315 incident-shaped mandatory referral', () => {
       impactIfUnfixed: line.match(/impact if unfixed: ([a-z]+)/)[1],
     }));
     expect(recovered).toHaveLength(4);
-    let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: 'run-4315', input: { pr: 2835, repo: 'chalbert/web-everything' }, registry }), { registry });
+    let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: 'run-4315', input: { pr: 2835, repo: 'web-everything/web-everything' }, registry }), { registry });
     while (run.pending?.kind === 'judge') {
       const answer = run.pending.step === 'judgeCorrectnessAdvisory'
         ? { summary: 'Codex correctness findings transcribed from the accepted comment', findings: recovered.slice(0, 2) }
@@ -3692,7 +3692,7 @@ describe('#4315 incident-shaped mandatory referral', () => {
     expect(judge).toHaveBeenCalledTimes(1);
     expect(trace.indexOf('post')).toBeLessThan(trace.indexOf('review:pending'));
     expect(state.labels).toEqual(['review:human']);
-    expect(() => assertMandatoryReferralsCleared(state, { repo: 'chalbert/web-everything', pr: 2835 })).toThrow();
+    expect(() => assertMandatoryReferralsCleared(state, { repo: 'web-everything/web-everything', pr: 2835 })).toThrow();
   });
 });
 

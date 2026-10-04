@@ -126,9 +126,9 @@ export const meta = {
 // (NOT `~`): bash does not tilde-expand `~` mid-argument, so `--repo=~/…` would pass a literal tilde; `$HOME` is
 // a variable expansion bash DOES perform inside an argument, yielding an absolute path.
 const REPOS = {
-  we: { slug: 'chalbert/web-everything', path: '' },
-  frontierui: { slug: 'chalbert/frontierui', path: '$HOME/workspace/frontierui' },
-  'plateau-app': { slug: 'chalbert/plateau-app', path: '$HOME/workspace/plateau-app' },
+  we: { slug: 'web-everything/web-everything', path: '' },
+  frontierui: { slug: 'frontier-ui/frontierui', path: '$HOME/workspace/frontierui' },
+  'plateau-app': { slug: 'plateauapp/plateau-app', path: '$HOME/workspace/plateau-app' },
 };
 const DEFAULT_REPO = 'we';
 
@@ -626,7 +626,7 @@ function labelFetchPrompt(prs) {
     '',
     `PRs to look up (JSON): ${JSON.stringify(prs.map((p) => ({ pr: p.pr, repo: p.repo })))}.`,
     'For each, in the PR\'s repo run `gh pr view <pr> --repo <slug> --json number,labels` (the `we` id → slug',
-    'chalbert/web-everything, run in your cwd; for a non-we id, use its slug or run gh in its checkout path).',
+    'web-everything/web-everything, run in your cwd; for a non-we id, use its slug or run gh in its checkout path).',
     'If a PR genuinely cannot be read, OMIT it (do not invent labels) — the workflow fails closed and skips it.',
     '',
     `Constellation repos (id → gh slug / checkout path): ${JSON.stringify(repoList)}.`,

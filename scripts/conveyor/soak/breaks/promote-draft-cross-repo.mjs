@@ -9,9 +9,9 @@
  * (`we:scripts/lib/for-each-repo.mjs`) — `cwd` never changes between repos, only the `repo` slug threaded
  * through the reconcile plan does. The default provider (`we:scripts/lib/draft-promote-provider.mjs`'s
  * `createDraftPromoteProvider`) called plain `gh pr ready <pr>` with no `--repo`, relying on `gh` inferring the
- * repo from `cwd`'s git remote — always the WE checkout. `chalbert/plateau-app#187` (a green draft) sat refused
+ * repo from `cwd`'s git remote — always the WE checkout. `plateauapp/plateau-app#187` (a green draft) sat refused
  * ("ready-failed … Command failed: gh pr ready 187") until promoted by hand, because `gh` resolved PR 187
- * against `chalbert/web-everything` instead.
+ * against `web-everything/web-everything` instead.
  *
  * FIX: `467349c87` (`we:backlog/4379`) threads `runReconcilePromoteDraftDispatch`'s own already-resolved
  * `repoSlug` through to the provider as an explicit `--repo` — `undefined` (byte-identical) for the WE-default
@@ -31,13 +31,13 @@
  * SCENARIO (no daemon ticking, no `runSoak` world — this is a single dispatch-call reproduction, mirroring
  * `we:scripts/operations/__tests__/promote-draft-pr-dispatch.test.mjs`'s own "real default provider" test but
  * one layer deeper, through a REAL `gh` subprocess):
- *   1. two real bare git origins are built, named by directory exactly like `chalbert/web-everything.git` /
- *      `chalbert/plateau-app.git` (`we:scripts/operations/__tests__/helpers/real-repo.mjs`'s own "detail (2)"
+ *   1. two real bare git origins are built, named by directory exactly like `web-everything/web-everything.git` /
+ *      `plateauapp/plateau-app.git` (`we:scripts/operations/__tests__/helpers/real-repo.mjs`'s own "detail (2)"
  *      convention — the fake `gh`'s cwd-inference regex reads the slug off the directory name);
  *   2. `createFakeGithub` (`we:scripts/conveyor/__tests__/helpers/fake-gh.mjs`) registers BOTH repos in one
  *      store; a draft, green-CI PR is opened on the `plateau-app` side only;
  *   3. the REAL `runReconcilePromoteDraftDispatch` runs with `root` = the WE-side clone (so `gh`'s own cwd
- *      inference would resolve `chalbert/web-everything`), `repo: 'chalbert/plateau-app'`, and NO injected
+ *      inference would resolve `web-everything/web-everything`), `repo: 'plateauapp/plateau-app'`, and NO injected
  *      `provider` — so the REAL default `createDraftPromoteProvider` construction is exercised, shelling the
  *      REAL `gh` (the fake shim) via the REAL `runGhSync` transport, with `reconcile`/`readHeadCheckState`/
  *      `clearAwaitingCi` injected only to skip the (separately-tested, orthogonal) reconcile-plan and stale-CI
@@ -45,7 +45,7 @@
  *
  * RED  = pre-fix: `gh pr ready <pr>` is called with NO `--repo` from the WE-checkout cwd, the plateau-app PR is
  *        never promoted (still draft), and the dispatch reports a `ready-failed` refusal.
- * GREEN = with the fix: `gh pr ready <pr> --repo chalbert/plateau-app` is called explicitly, the PR promotes to
+ * GREEN = with the fix: `gh pr ready <pr> --repo plateauapp/plateau-app` is called explicitly, the PR promotes to
  *         ready, and there is no refusal.
  */
 import { execFileSync } from 'node:child_process';

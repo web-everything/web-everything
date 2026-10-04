@@ -5,7 +5,7 @@ import { readReviewCiGate } from '../lib/review-ci-gate-io.mjs';
  * @description x26lw6u (epic #3383) — RUN THE INDEPENDENT-REVIEW ARC AS A DETERMINISTIC JOB, NOT A CLAUDE
  * WRAPPER SESSION.
  *
- *   node scripts/operations/review-job.mjs run --pr=1234 --repo=chalbert/web-everything   # the arc, foreground
+ *   node scripts/operations/review-job.mjs run --pr=1234 --repo=web-everything/web-everything   # the arc, foreground
  *
  * THE WASTE THIS REMOVES (measured 2026-09-24 → 25, the review daemon's own transcripts). The review daemon
  * (`we:skills-src/conveyor/review-daemon.mjs`) used to start one `claude --bg` session per owed review
@@ -84,7 +84,7 @@ import { assertNotALaneCheckout, REPO_ROOT, resolveGhShimSettingsEnv } from './d
 import {
   decideJobClaim, jobLogPath, pidAlive, readJobRecord, removeJobRecord, reviewJobsDir, writeJobRecord,
 } from './review-job-store.mjs';
-import { assertMainNotStale, dispatchReview, planReviewDispatch } from './review-dispatch.mjs';
+import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
 import { runReport } from './completion-cli.mjs';
 import { tryReadCompletion } from './completion-store.mjs';
 import { rateAndRecordReviewJob } from '../conveyor/run-rating.mjs';
@@ -156,6 +156,18 @@ export function classifyReviewLoopOutcome(parsed) {
   }
   if (stopped === 'confirm') return { outcome: 'parked', ...base };
   return { outcome: BLOCKED_ON_INFRA, ...base };
+}
+
+/**
+ * PURE — the completion label for a loop that PRINTED a payload: null on a clean exit, else `exit N`, plus the
+ * payload's own `stopped` word and `error` text when it carries them (so a refusal is recorded verbatim).
+ * @returns {string|null}
+ */
+export function loopFailureLabel(parsed, status) {
+  const err = typeof parsed?.error === 'string' ? parsed.error.trim() : '';
+  const stopped = typeof parsed?.stopped === 'string' ? parsed.stopped : '';
+  if (status === 0 && !err) return null;
+  return `exit ${status}${err && stopped ? ` (${stopped})` : ''}${err ? `: ${err}` : ''}`.slice(0, 500);
 }
 
 /**
@@ -474,7 +486,10 @@ function runReviewArc({
     } else if (parsed) {
       // #3647 — classify what the loop PRINTED even on a non-zero exit: a finished review whose secondary
       // filing step failed is still that review's real outcome.
-      classified = { ...classifyReviewLoopOutcome(parsed), label: loop.status === 0 ? null : `exit ${loop.status}` };
+      // THE REAL ERROR, NEVER SILENT: a loop that stopped before judging prints `{stopped, error}` (e.g.
+      // `step-refused` + the refusal text). The label used to be only `exit 1`, and the added-seats arc then
+      // reported "printed no diff" — the outage of 2026-10-03 hid its cause for hours.
+      classified = { ...classifyReviewLoopOutcome(parsed), label: loopFailureLabel(parsed, loop.status) };
     } else {
       classified = {
         outcome: BLOCKED_ON_INFRA, verdict: null, loopOutcome: null, runId: null,
@@ -485,6 +500,7 @@ function runReviewArc({
       if (classified.outcome === BLOCKED_ON_INFRA) loopSpan?.fail(new Error(classified.label || 'blocked-on-infra'), { outcome: classified.outcome });
       else loopSpan?.ok({ outcome: classified.outcome, verdict: classified.verdict, loopOutcome: classified.loopOutcome, runId: classified.runId });
     } catch { /* telemetry */ }
+    if (classified.outcome === BLOCKED_ON_INFRA && classified.label) io.log(`review-job ${slug}: loop error — ${classified.label}`);
     io.log(`review-job ${slug}: loop finished in ${timings.loopMs}ms — ${classified.outcome} (verdict ${classified.verdict ?? '-'}, loop ${classified.loopOutcome ?? '-'}, run ${classified.runId ?? '-'})`);
     // #4194 — hand the added seats what they need; they run in `runReviewJob` once this arc has fully finished.
     if (parsed && !loop.timedOut) seatsBox.input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload: parsed, slug };
@@ -533,7 +549,10 @@ export function dispatchReviewJob({
 } = {}) {
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
   assertNotALaneCheckout(root);
-  assertMainNotStale(root, checkStaleness);
+  // The job path is the DEFAULT review dispatch (the daemon calls it), so it must narrow a managed clone's
+  // refusal to the review code path exactly like `dispatchReview` does (#4387). Without this the narrowing
+  // never applied and every landed code file made the clone stale (live 2026-10-03: 21 commits behind).
+  assertMainNotStale(root, checkStaleness, { dispatchPath: isReviewCodePath });
   const slug = planned.sessionSlug;
   const logPath = jobLogPath(slug, dir);
   const base = { mode: 'job', pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, sessionSlug: slug, agentId: null, logPath };

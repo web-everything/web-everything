@@ -9,7 +9,7 @@
 	BEFORE INSTALLING:
 	  1. Make the health watch's OWN dedicated clone (4065 Fork 1: shared with no other daemon, so no other
 	     daemon's overlay or conflicted self-sync can take the watcher down with the watched):
-	       git clone https://github.com/chalbert/web-everything.git ~/workspace/wev-health-watch
+	       git clone https://github.com/web-everything/web-everything.git ~/workspace/wev-health-watch
 	       cd ~/workspace/wev-health-watch && npm ci
 	  2. Replace <app-id>, <installation-id>, <path-to-private-key.pem> with the real GitHub App values (never
 	     commit them). The watch's `gh pr list` then draws on the App's budget, not the operator's.

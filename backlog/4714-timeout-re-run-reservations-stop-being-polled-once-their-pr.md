@@ -2,10 +2,11 @@
 bornAs: x3ugt7s
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/operations/ci-heal-pr-dispatch.mjs", "we:scripts/operations/__tests__/ci-heal-pr-dispatch.test.mjs"]
 scopeRationale: "we:scripts/conveyor/timeout-retry-state.mjs is cited only for its state-dir location and named as an explicit no-change file."
 dateOpened: "2026-10-02"
+dateResolved: "2026-10-03"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "e1f0523e0881357fc863f3e88da72e0164eb7091"
 tags: []
@@ -16,6 +17,14 @@ tags: []
 Follow-up from the #3559 advisory (2026-10-02). we:scripts/operations/ci-heal-pr-dispatch.mjs:490 flushTimeoutFollowups re-observes every unresolved pending reservation (three GitHub reads each) on every reconcile tick, with no PR-open or age bound, spending GitHub budget on dead entries. Retire entries whose PR is closed or merged or whose age passes a cap; test that a closed PR pending state stops polling.
 
 ## Progress
+
+- **Final verification:** we:scripts/verify-lane.mjs completed green (exit 0): **69 test files, 3,321 tests passed**; its standards gate reported **0 errors** (5,278 warnings). The standalone standards gate also passed. Only the two scoped implementation/test files and this card changed; no helper files or shared agent docs were created or edited.
+
+- Implemented 2026-10-03 in the two scoped files: seven-day pending retirement, durable reservation timestamps (including legacy first-sight stamping), closed-PR retirement after the existing confirmation check, and the retirement reason in flush result rows. Retirement preserves request status, retry budget, heal hold, and owed follow-up filing.
+- **Before proof:** clean lane HEAD and local `main` both at `54a42d3e61b3a8876833be2f7831b91bdd5cf796`; no diff in we:scripts/operations/ci-heal-pr-dispatch.mjs. Inline Node replay (no helper file) wrote a temporary version-1 ledger for PR #3559 with one pending request, synthetic head/run/job, and counting `observe` returning `{ open: false }`. Three flushes produced **3 observations**, no retirement. This is a replay, not a live GitHub observation.
+- **Red regression proof:** ran the targeted Vitest suite in we:scripts/operations/__tests__/ci-heal-pr-dispatch.test.mjs against the unchanged implementation with the added tests: **55 passed, 4 failed**. Closed-PR retirement, age retirement, legacy stamping, and the final-confirmation/owed-filing soak failed. The new age constant was absent on that baseline; the age case failed because it still performed a read.
+- **After proof:** repeated the same inline replay against the implementation: three flushes produced **1 observation** and persisted `retired: { reason: 'pr-closed', at: '2026-10-03T17:07:47.944Z' }`. The live directory returned by `timeoutStateDir()` was absent both before and after, so no live reconcile was applicable. Temporary replay ledgers were removed.
+- **Regression/soak proof:** the targeted suite now passes **59/59** tests. Added the five requested cases to the existing `4863 retry reservation and restart soak` block (the current name of the card's cited block), plus a 100-tick soak: the last closed-PR observation confirms the newer attempt, retirement persists, a failed owed-card filing retries successfully, exactly one observation and two filing attempts occur. The young-entry case also pins the exact age-cap boundary as still eligible for polling.
 
 - Old premise: `flushTimeoutFollowups` sits at `we:scripts/operations/ci-heal-pr-dispatch.mjs:490`.
   Corrected: it now sits at `we:scripts/operations/ci-heal-pr-dispatch.mjs:523 (flushTimeoutFollowups)`. Line 490 is inside `fileTimeoutFollowup`.

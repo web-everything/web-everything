@@ -23,7 +23,7 @@
  * inferring the repo from `cwd`'s git remote (the ORIGINAL convention here, copied from `createGhLandProvider`
  * — see that file's own header for why it is safe THERE: `pr-land.mjs`'s `cwd` is always a checkout of the
  * repo it is landing into) silently resolved every non-WE PR number against web-everything instead. Confirmed
- * live: `chalbert/plateau-app#187` sat refused ("ready-failed … Command failed: gh pr ready 187") until
+ * live: `plateauapp/plateau-app#187` sat refused ("ready-failed … Command failed: gh pr ready 187") until
  * promoted by hand. Fix: an explicit `repo` (the gh `owner/name` slug) threaded through construction, appended
  * as `--repo <repo>` — mirrors `we:scripts/lib/review-label-provider.mjs`'s `GH_ARGV`, which never relied on
  * `cwd` inference in the first place. `repo` stays OPTIONAL (undefined omits `--repo`) so the byte-identical

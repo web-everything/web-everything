@@ -484,7 +484,7 @@ describe('rebaseDropContent refuses to push onto a branch a fixer holds the LIVE
     const { run, calls } = scriptedRun({
       'merge-tree': { status: 1, stdout: out },
       'cat-file': (args) => ({ status: 0, stdout: blobs[args[2]] ?? '' }),
-      remote: { status: 0, stdout: 'git@github.com:chalbert/web-everything.git\n' },
+      remote: { status: 0, stdout: 'git@github.com:web-everything/web-everything.git\n' },
       ...honestWriteBack().script,
     });
     const r = rebaseDropContent({ laneRef: 'lane/x-2371-claimed', run });

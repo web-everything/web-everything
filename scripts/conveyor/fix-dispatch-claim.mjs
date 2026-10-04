@@ -137,6 +137,24 @@ export function acquireFixDispatchClaim({
   return { ...result, resource, lockRoot };
 }
 
+/** Release only dispatch claims minted for the session that just posted its stand-down. */
+export function releaseSessionFixDispatchClaims({ repo, pr, who, lockRoot = fixDispatchClaimRoot() } = {}) {
+  const released = [];
+  const skipped = [];
+  for (const kind of ['fix', 'ci-heal']) {
+    const entry = readFixDispatchClaim({ repo, pr, kind, lockRoot });
+    if (!entry) { skipped.push({ kind, reason: 'absent' }); continue; }
+    let name;
+    try { name = fixDispatchSessionName({ repo, pr, kind }); }
+    catch { skipped.push({ kind, reason: 'unknown-session' }); continue; }
+    if (name !== who) { skipped.push({ kind, reason: 'session-mismatch' }); continue; }
+    const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
+    if (result.released) released.push({ kind, owner: entry.owner });
+    else skipped.push({ kind, reason: result.reason });
+  }
+  return { released, skipped };
+}
+
 /**
  * Release a claim this `owner` holds. A no-op (never throws, never touches a lock it does not own) when the
  * claim is already gone or owned by someone else — the caller learns why via `reason`, but nothing is torn

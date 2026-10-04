@@ -93,6 +93,12 @@ export function validateScorecard(row) {
   if (typeof row.criteriaEvaluated !== 'number' || row.criteriaEvaluated < 0) errors.push('`criteriaEvaluated` must be a non-negative number');
   if (row.criteriaEvaluated === 0 && row.score !== null) errors.push('`score` MUST be null when `criteriaEvaluated` is 0 — never 100 on an empty read (Fork 2 amendment)');
   if (row.score !== null && (typeof row.score !== 'number' || row.score < 0 || row.score > 100)) errors.push('`score` must be null or a number in [0, 100]');
+  // Optional for historical rows; null means unmeasured, zero means measured and absent.
+  for (const field of ['newLoc', 'modifiedLoc', 'newFiles', 'modifiedFiles']) {
+    if (row[field] != null && (!Number.isSafeInteger(row[field]) || row[field] < 0)) {
+      errors.push(`${field} must be null or a non-negative safe integer`);
+    }
+  }
   if (!Array.isArray(row.deductions)) errors.push('`deductions` must be an array (possibly empty)');
   else {
     for (const d of row.deductions) {

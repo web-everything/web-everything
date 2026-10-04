@@ -4,7 +4,7 @@
  *   Mirrors `we:scripts/conveyor/rearm-review.mjs#countRearmComments`'s own shape and reason for existing, for
  *   a population that marker cannot see.
  *
- * THE GAP THIS CLOSES — confirmed LIVE on `chalbert/web-everything#2117`: 33 separate advisory-panel comments
+ * THE GAP THIS CLOSES — confirmed LIVE on `web-everything/web-everything#2117`: 33 separate advisory-panel comments
  * posted against the SAME "Findings (7)" content between 2026-09-15T00:24Z and 2026-09-15T19:13Z (roughly every
  * 20-90 minutes, no end condition), and a further burst on `#2298` on 2026-09-18/19. Both PRs carry
  * `review:changes` + `review:human`, so `classifyPr` (`we:scripts/progress-board.mjs`) reads them as `bounced`

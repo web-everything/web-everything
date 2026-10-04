@@ -194,7 +194,7 @@ def run_agent(prompt, lane, tag, timeout=3600, verify=None):
     return "ok"
 
 
-FIX = """You are a FIX agent for pull request #{pr} in `chalbert/web-everything`. You did not review it; your
+FIX = """You are a FIX agent for pull request #{pr} in `web-everything/web-everything`. You did not review it; your
 job is to address the review that bounced it, and nothing else.
 
 ## Your lane
@@ -288,7 +288,7 @@ better than one with none.
 Report: which findings you addressed, which you did not and why, and the commit sha.
 """
 
-CI_HEAL = """You are healing a REAL CI FAILURE on pull request #{pr} in `chalbert/web-everything`. Its review
+CI_HEAL = """You are healing a REAL CI FAILURE on pull request #{pr} in `web-everything/web-everything`. Its review
 already ACCEPTED this diff's content — do not re-review it, do not second-guess the accepted changes. Your
 job is narrow: make the failing CI check pass, and nothing else.
 
@@ -305,13 +305,13 @@ LANE_SESSION=conv-{pr} git reset --hard FETCH_HEAD
 ## What actually failed
 
 ```
-gh pr checks {pr} --repo chalbert/web-everything
+gh pr checks {pr} --repo web-everything/web-everything
 ```
 
 For the failing check, read its real log — not a guess:
 
 ```
-gh run view --job=<the failing job id from the checks output> --repo chalbert/web-everything --log-failed
+gh run view --job=<the failing job id from the checks output> --repo web-everything/web-everything --log-failed
 ```
 
 ## Fix ONLY what the log says is wrong
@@ -340,13 +340,13 @@ git push origin HEAD:{branch}
 Report the failing check's name, what was actually wrong, and the commit sha.
 """
 
-REVIEW = """You are an INDEPENDENT reviewer for pull request #{pr} in `chalbert/web-everything`. You did not
+REVIEW = """You are an INDEPENDENT reviewer for pull request #{pr} in `web-everything/web-everything`. You did not
 write it and you did not fix it — those were other sessions.
 
 Run the declared operation, not a procedure of your own. Read `skills-src/review/SKILL.md`, then:
 
 ```
-node scripts/operations/run.mjs review-pr --pr={pr} --repo=chalbert/web-everything --cwd={juror_path} --json
+node scripts/operations/run.mjs review-pr --pr={pr} --repo=web-everything/web-everything --cwd={juror_path} --json
 ```
 
 `--cwd` is the juror's own lane and is REQUIRED. You work in `{drv_path}`. The operation has a `confirm`
@@ -503,7 +503,7 @@ def heal_ci(pr, branch, lane):
     `conclusion` field, not from log text — the log's wording is not a contract, the conclusion enum is.
     """
     checks = subprocess.run(
-        ["gh", "pr", "checks", str(pr), "--repo", "chalbert/web-everything", "--json", "name,state,link"],
+        ["gh", "pr", "checks", str(pr), "--repo", "web-everything/web-everything", "--json", "name,state,link"],
         capture_output=True, text=True, cwd=REPO).stdout
     try:
         rows = json.loads(checks)
@@ -515,7 +515,7 @@ def heal_ci(pr, branch, lane):
         # PR can burn its whole round cap with `heal_ci` correctly diagnosing "stale" every round but never
         # ACTING on that diagnosis, so nothing ever removes the label. Confirming "stale" and then leaving it
         # is not a safe default here; the label is demonstrably wrong given every check passed.
-        subprocess.run(["gh", "pr", "edit", str(pr), "--repo", "chalbert/web-everything",
+        subprocess.run(["gh", "pr", "edit", str(pr), "--repo", "web-everything/web-everything",
                         "--remove-label", "ci:failed"], capture_output=True, text=True, cwd=REPO)
         return "cleared stale ci:failed (every check passed)"
 
@@ -531,7 +531,7 @@ def heal_ci(pr, branch, lane):
     transient = True
     for run_id in run_ids:
         out = subprocess.run(
-            ["gh", "run", "view", run_id, "--repo", "chalbert/web-everything", "--json", "jobs"],
+            ["gh", "run", "view", run_id, "--repo", "web-everything/web-everything", "--json", "jobs"],
             capture_output=True, text=True, cwd=REPO).stdout
         try:
             job_rows = json.loads(out).get("jobs", [])
@@ -546,7 +546,7 @@ def heal_ci(pr, branch, lane):
 
     if transient:
         for run_id in run_ids:
-            subprocess.run(["gh", "run", "rerun", run_id, "--repo", "chalbert/web-everything", "--failed"],
+            subprocess.run(["gh", "run", "rerun", run_id, "--repo", "web-everything/web-everything", "--failed"],
                            capture_output=True, text=True, cwd=REPO)
         return f"transient (startup_failure/cancelled/timed_out) — reran {len(run_ids)} run(s)"
 
@@ -579,7 +579,7 @@ def converge(pr):
         # resolution for exactly this contradiction — not a label edit invented here.
         if "review:accepted" in state and "review:pending" in state:
             r = subprocess.run(
-                ["node", "scripts/review-set-label.mjs", str(pr), "--repo=chalbert/web-everything",
+                ["node", "scripts/review-set-label.mjs", str(pr), "--repo=web-everything/web-everything",
                  "--to=accepted"],
                 capture_output=True, text=True, cwd=REPO)
             emit(f"#{pr} r{rnd}: cleared stale review:pending alongside an accept — {r.stdout.strip()[:120]}")

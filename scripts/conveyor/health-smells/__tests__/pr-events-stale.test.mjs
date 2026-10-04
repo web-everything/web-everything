@@ -44,9 +44,9 @@ describe('pr-events-stale', () => {
   });
 
   it('a check completed well after the last delivery → breach (deliveries not arriving)', () => {
-    const [r] = run({ prEventsStatus: [status({ lastDeliveryAt: ago(90) })], prs: [pr('chalbert/frontierui', 42, 20)] });
+    const [r] = run({ prEventsStatus: [status({ lastDeliveryAt: ago(90) })], prs: [pr('frontier-ui/frontierui', 42, 20)] });
     expect(r.breach).toBe(true);
-    expect(r.summary).toMatch(/MISSED — chalbert\/frontierui#42/);
+    expect(r.summary).toMatch(/MISSED — frontier-ui\/frontierui#42/);
     expect(r.recommendation).toMatch(/Recent Deliveries/);
   });
 

@@ -162,7 +162,7 @@ describe('#4229 — recordQueueCapRefusal (IO shell over injected fakes — no r
     const atCap = [markerComment(), markerComment(), markerComment()];
     const result = recordQueueCapRefusal({
       pr: 1854,
-      repo: 'chalbert/web-everything',
+      repo: 'web-everything/web-everything',
       why: 'projected heavy-test queue wait 45m would exceed 30m with this dispatch (+8m) — retried next pass',
       readPrComments: () => atCap,
       postComment: (o) => posted.push(o),
@@ -170,7 +170,7 @@ describe('#4229 — recordQueueCapRefusal (IO shell over injected fakes — no r
     });
     expect(result).toEqual({ attempts: 3, capExhausted: true });
     expect(posted).toHaveLength(1);
-    expect(posted[0]).toMatchObject({ repo: 'chalbert/web-everything', pr: 1854 });
+    expect(posted[0]).toMatchObject({ repo: 'web-everything/web-everything', pr: 1854 });
     expect(posted[0].body).toContain(NOTE_COMMENT_MARKER); // the shared reconcile-notes marker, reused verbatim
     expect(posted[0].body).not.toContain(QUEUE_CAP_REFUSAL_MARKER); // the note, never a fresh attempt marker
     expect(notified).toHaveLength(1);
@@ -292,7 +292,7 @@ describe('#4229 — runReconcileFixDispatch: the durable count survives across p
     const { defaultReadPrComments } = await import('../ci-red-recovery-watch.mjs');
     const { postNoteComment } = await import('../reconcile-note-comment.mjs');
     const ALWAYS_REFUSE = { tryAdmit: () => ({ admit: false, projectedMinutes: 45, maxWaitMinutes: 30, demandMinutes: 8 }) };
-    for (const [repo, slug] of [[undefined, 'chalbert/web-everything'], ['we', 'chalbert/web-everything'], ['chalbert/web-everything', 'chalbert/web-everything']]) {
+    for (const [repo, slug] of [[undefined, 'web-everything/web-everything'], ['we', 'web-everything/web-everything'], ['web-everything/web-everything', 'web-everything/web-everything']]) {
       const argvs = [];
       const exec = (_cmd, argv) => { argvs.push(argv); return JSON.stringify({ comments: [] }); };
       runFix([1854], ALWAYS_REFUSE, {
@@ -329,8 +329,8 @@ describe('#4229 — runReconcileFixDispatch: the durable count survives across p
     expect(notified).toHaveLength(2);
   });
 
-  // #4229 — REPLAY PROOF, grounded in real PR chalbert/web-everything#2756's own real identity (`gh pr view 2756
-  // --repo chalbert/web-everything --json number,headRefName,updatedAt`, captured 2026-09-26: open,
+  // #4229 — REPLAY PROOF, grounded in real PR web-everything/web-everything#2756's own real identity (`gh pr view 2756
+  // --repo web-everything/web-everything --json number,headRefName,updatedAt`, captured 2026-09-26: open,
   // `review:changes`, head `lane/xu38vlf-conflict-watch-caps-and-bound` — a genuine bounced PR this repo's own
   // fix-dispatch daemon owes a fix). SYNTHESIZED: neither this repo's fix-dispatch daemon log
   // (`wev-review-daemon/.conveyor/fix-dispatch-daemon.log`) nor the merge/health-watch daemon clones' own logs

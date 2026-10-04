@@ -33,7 +33,7 @@ import {
 } from '../../gemini-direct-task.mjs';
 import { EventEmitter } from 'node:events';
 
-const REPO = 'chalbert/web-everything';
+const REPO = 'web-everything/web-everything';
 const NOW = Date.parse('2026-09-26T15:00:00Z');
 
 const CLAUDE_FINDING = { summary: 'isMechanicalMergeCommit trusts the message headline alone, so a forged merge headline bypasses the gate', file: 'scripts/lib/ai-pr-authorship.mjs', line: 41 };

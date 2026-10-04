@@ -79,7 +79,7 @@ describe('prompt builders (converge.py FIX/CI_HEAL/REVIEW templates, ported verb
   it('buildCiHealPrompt interpolates and stays narrowly scoped to CI, not a re-review', () => {
     const p = buildCiHealPrompt({ pr: 42, branch: 'lane/y', lanePath: '/lanes/lane-7' });
     expect(p).toContain('pull request #42');
-    expect(p).toContain('gh pr checks 42 --repo chalbert/web-everything');
+    expect(p).toContain('gh pr checks 42 --repo web-everything/web-everything');
     expect(p).toContain('Do NOT touch anything the accepted review did not ask you to touch');
   });
 

@@ -32,13 +32,13 @@ describe('isBudgetRefusal', () => {
 
 describe('resolveOwedRepo', () => {
   it('a --repo slug or key resolves to the constellation key + canonical slug', () => {
-    expect(resolveOwedRepo({ repoFlag: 'chalbert/web-everything' })).toEqual({ key: 'we', slug: 'chalbert/web-everything' });
-    expect(resolveOwedRepo({ repoFlag: 'plateau-app' })).toEqual({ key: 'plateau-app', slug: 'chalbert/plateau-app' });
+    expect(resolveOwedRepo({ repoFlag: 'web-everything/web-everything' })).toEqual({ key: 'we', slug: 'web-everything/web-everything' });
+    expect(resolveOwedRepo({ repoFlag: 'plateau-app' })).toEqual({ key: 'plateau-app', slug: 'plateauapp/plateau-app' });
   });
 
   it('without --repo, reads the LOCAL origin remote (ssh or https), never GitHub', () => {
-    expect(resolveOwedRepo({ exec: () => 'git@github.com:chalbert/frontierui.git\n' })).toEqual({ key: 'frontierui', slug: 'chalbert/frontierui' });
-    expect(resolveOwedRepo({ exec: () => 'https://github.com/chalbert/web-everything\n' })).toEqual({ key: 'we', slug: 'chalbert/web-everything' });
+    expect(resolveOwedRepo({ exec: () => 'git@github.com:frontier-ui/frontierui.git\n' })).toEqual({ key: 'frontierui', slug: 'frontier-ui/frontierui' });
+    expect(resolveOwedRepo({ exec: () => 'https://github.com/web-everything/web-everything\n' })).toEqual({ key: 'we', slug: 'web-everything/web-everything' });
   });
 
   it('a repo outside the constellation, or no remote at all, is null', () => {
@@ -48,7 +48,7 @@ describe('resolveOwedRepo', () => {
 });
 
 describe('recordOwedWrite / readOwedWrites / clearOwedWrite', () => {
-  const base = { repo: 'we', slug: 'chalbert/web-everything', pr: 5, kind: 'ci-heal', headSha: HEAD, body: 'b' };
+  const base = { repo: 'we', slug: 'web-everything/web-everything', pr: 5, kind: 'ci-heal', headSha: HEAD, body: 'b' };
 
   it('one file per (repo, pr, kind): a repeat refusal refreshes the same record, a different kind is its own', () => {
     const dir = mkdtempSync(join(tmpdir(), 'owed-'));
@@ -99,7 +99,7 @@ describe('owedWriteAlreadyLive', () => {
 });
 
 describe('readOwedWrites — repo/slug consistency guard', () => {
-  const base = { repo: 'we', slug: 'chalbert/web-everything', pr: 5, kind: 'ci-heal', headSha: HEAD, body: 'b' };
+  const base = { repo: 'we', slug: 'web-everything/web-everything', pr: 5, kind: 'ci-heal', headSha: HEAD, body: 'b' };
   const withTmp = (fn) => {
     const dir = mkdtempSync(join(tmpdir(), 'owed-'));
     try { return fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -114,7 +114,7 @@ describe('readOwedWrites — repo/slug consistency guard', () => {
 
   it.each([
     ['an outside slug', { slug: 'outsider/wrong' }],
-    ['another constellation repo slug', { slug: 'chalbert/frontierui' }],
+    ['another constellation repo slug', { slug: 'frontier-ui/frontierui' }],
     ['a case-variant slug', { slug: 'Chalbert/Web-Everything' }],
     ['a missing slug', { slug: undefined }],
     ['an empty slug', { slug: '' }],
@@ -136,9 +136,9 @@ describe('readOwedWrites — repo/slug consistency guard', () => {
   });
 
   it.each([
-    ['we', 'chalbert/web-everything'],
-    ['frontierui', 'chalbert/frontierui'],
-    ['plateau-app', 'chalbert/plateau-app'],
+    ['we', 'web-everything/web-everything'],
+    ['frontierui', 'frontier-ui/frontierui'],
+    ['plateau-app', 'plateauapp/plateau-app'],
   ])('accepts the canonical %s record for both kinds and keeps the repo filter', (repo, slug) => {
     withTmp((dir) => {
       for (const kind of ['ci-heal', 'ci-heal-escalation']) recordOwedWrite({ ...base, repo, slug, kind }, { dir });
@@ -170,8 +170,8 @@ describe('readOwedWrites — repo/slug consistency guard', () => {
       const res = flushOwedWrites({ repo: 'we', dir, exec });
       expect(res.posted).toHaveLength(1);
       expect(calls).toHaveLength(2);
-      expect(calls[0]).toContain('chalbert/web-everything');
-      expect(calls[1]).toContain('--repo=chalbert/web-everything');
+      expect(calls[0]).toContain('web-everything/web-everything');
+      expect(calls[1]).toContain('--repo=web-everything/web-everything');
       expect(readOwedWrites({ dir })).toEqual([]);
     });
   });
@@ -181,7 +181,7 @@ describe('readOwedWrites — repo/slug consistency guard', () => {
 it('xp0lsdi: distinct attempt writes survive repeated failures and never age out uncounted', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owed-attempts-'));
   try {
-    for (const attemptId of ['one', 'two']) recordOwedWrite({ repo: 'we', slug: 'chalbert/web-everything', pr: 3373, kind: 'ci-heal', headSha: HEAD,
+    for (const attemptId of ['one', 'two']) recordOwedWrite({ repo: 'we', slug: 'web-everything/web-everything', pr: 3373, kind: 'ci-heal', headSha: HEAD,
       attemptId, body: `🩹 conveyor CI-heal — failed attempt\nhead: ${HEAD}\nattempt: ${attemptId}` }, { dir, now: 1 });
     expect(readOwedWrites({ dir })).toHaveLength(2);
     const records = readOwedWrites({ dir });

@@ -140,12 +140,12 @@ describe('fetchOpenPrsRest — build-dispatch daemon field parity (#4351 follow-
       httpOk(JSON.stringify(FIXTURE.restFiles['2901'])),
       httpOk(JSON.stringify(FIXTURE.restFiles['2902'])),
     ]);
-    const rows = fetchOpenPrsRest({ repo: 'chalbert/web-everything', exec, env: { VITEST: '1' } });
+    const rows = fetchOpenPrsRest({ repo: 'web-everything/web-everything', exec, env: { VITEST: '1' } });
     expect(rows).toEqual(FIXTURE.graphql);
     expect(calls).toEqual([
-      ['api', '-i', 'repos/chalbert/web-everything/pulls?state=open&per_page=100&page=1'],
-      ['api', '-i', 'repos/chalbert/web-everything/pulls/2901/files?per_page=100&page=1'],
-      ['api', '-i', 'repos/chalbert/web-everything/pulls/2902/files?per_page=100&page=1'],
+      ['api', '-i', 'repos/web-everything/web-everything/pulls?state=open&per_page=100&page=1'],
+      ['api', '-i', 'repos/web-everything/web-everything/pulls/2901/files?per_page=100&page=1'],
+      ['api', '-i', 'repos/web-everything/web-everything/pulls/2902/files?per_page=100&page=1'],
     ]);
     expect(calls.every((argv) => argv[0] !== 'pr')).toBe(true);
   });

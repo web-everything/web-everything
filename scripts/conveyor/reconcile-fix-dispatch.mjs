@@ -179,7 +179,7 @@ export function defaultConfirmWait(ms) {
  *   own frontmatter scope (`scopeSource` absent/`'card'` — trusted, never filtered). A number with NO matching
  *   card anywhere in the diff falls to the GHOST case just above — as of #x9fbg1x-live-incident (2026-09-27),
  *   THAT case is also no longer an outright `no-scope`: see this docblock's own "no-scope" section above, third
- *   bullet, and the ghost-handling code below (`else if (!item)`) for the fix — `chalbert/web-everything#2779`
+ *   bullet, and the ghost-handling code below (`else if (!item)`) for the fix — `web-everything/web-everything#2779`
  *   is the live PR this closes.
  *
  * #x9fbg1x-live-incident ALSO fixes WHERE the diff itself comes from: every scope-fallback read below now
@@ -223,7 +223,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
     // question, and (2) tell a READ THAT FAILED apart from a diff that is GENUINELY empty, so a transient `gh`
     // failure (rate limit, timeout, `gh` briefly unavailable) is never silently read as "this PR touches
     // nothing" and folded into a permanent `no-scope` refusal — see {@link fetchPrDiffPaths}'s own updated
-    // contract (`null` = failed, `[]` = genuinely empty). LIVE case this closes: `chalbert/web-everything#2779`
+    // contract (`null` = failed, `[]` = genuinely empty). LIVE case this closes: `web-everything/web-everything#2779`
     // (branch `lane/x9fbg1x-bg-isolation-scope`) — a real, 19-file PR — refused `no-scope` on every tick because
     // its own item number never resolved (no backlog card anywhere) and the separate diff-read fallback kept
     // coming back empty.
@@ -299,7 +299,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
     // scope (the PR's real changed files) even when it was non-empty — this file's own top-of-file docblock
     // already named this population as one of the three "same safe fallback" cases (#3634's own "Scope,
     // narrowed" section), but the code never actually wired it, only the item-less (`!itemNum`) and card-in-diff
-    // (#xcla4iv) populations were. LIVE: `chalbert/web-everything#2779` (branch `lane/x9fbg1x-bg-isolation-scope`)
+    // (#xcla4iv) populations were. LIVE: `web-everything/web-everything#2779` (branch `lane/x9fbg1x-bg-isolation-scope`)
     // — item `x9fbg1x` resolves nowhere (no backlog card, ever) and carries no card in its own diff either, yet
     // the PR itself is a real, 19-file change. Converged with the ALREADY-SAFE item-less handling above: a
     // genuine ghost now gets the identical treatment an item-less PR always has — the PR's own diff as fence,
@@ -328,7 +328,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
     // PR-author-controlled fallbacks for a card filed IN this PR's own unmerged diff: `'card'` (the card's own
     // frontmatter, read off the PR's own head — an unmerged PR is exactly as author-controlled/unreviewed as
     // its diff, so it gets the same filter) and `'diff'` (the PR's raw diff paths). Review findings
-    // (correctness + security, chalbert/web-everything#2573) — `resolvePrWorkUnit` itself now ALSO applies
+    // (correctness + security, web-everything/web-everything#2573) — `resolvePrWorkUnit` itself now ALSO applies
     // `isSafeFallbackScopeEntry` (plus containment to the PR's own diff, for `'card'`) at its own shared choke
     // point before returning either of these two `scopeSource`s, so this re-filter here is defense in depth,
     // never a behavior change for a caller: filtering an already-filtered array is idempotent.
@@ -395,7 +395,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
   return { planned, refusals };
 }
 
-// `isSafeFallbackScopeEntry` MOVED to `pr-work-unit.mjs` (chalbert/web-everything#2573 review findings —
+// `isSafeFallbackScopeEntry` MOVED to `pr-work-unit.mjs` (web-everything/web-everything#2573 review findings —
 // `resolvePrWorkUnit` itself now needs to call it, at the one shared choke point every consumer of that
 // resolver goes through; see its own docblock there for the full rationale). Re-exported here so existing
 // importers of this file (this module's own three call sites above, and this file's own tests) see no change.
@@ -442,7 +442,7 @@ export function fetchPrDiffScope(pr, { exec = execFileSyncThrottled, root = REPO
  * @returns {string[]|null} `null` on a failed read — #x9fbg1x-live-incident (2026-09-27): this USED TO degrade
  *   to `[]`, the exact same shape a genuinely empty diff returns, so `planFixesFromReconcile` could not tell
  *   "this PR truly changed nothing" apart from "the read broke" and folded a transient `gh` failure straight
- *   into a durable `no-scope` refusal (LIVE: `chalbert/web-everything#2779`, a real 19-file PR, refused
+ *   into a durable `no-scope` refusal (LIVE: `web-everything/web-everything#2779`, a real 19-file PR, refused
  *   `no-scope` on every tick). Every caller of this function (and of {@link fetchPrDiffScope}) MUST treat `null`
  *   distinctly from `[]` from here on — `resolvePrWorkUnit`'s own `fetchDiffPaths(prNumber) || []` already does
  *   (a `null` degrades to the pre-existing safe `[]` there, UNCHANGED for that shared resolver's own callers);
@@ -478,7 +478,7 @@ export function fetchPrDiffPaths(pr, { exec = execFileSyncThrottled, root = REPO
  * `{owner}`/`{repo}` PLACEHOLDERS, not a literal slug: `gh api` (unlike `gh pr diff`) has no `--repo` flag —
  * these placeholders resolve from the given `repo` (when it names one — `GH_REPO`-style, via the endpoint
  * template itself) or, when `repo` is `null`, from the checkout's own git remote at `cwd: root` (today's only
- * reachable case is WE itself, whose checkout IS `chalbert/web-everything`).
+ * reachable case is WE itself, whose checkout IS `web-everything/web-everything`).
  * @param {string} path - repo-relative, e.g. `backlog/xzi292i-....md`.
  * @param {string} ref - a commit sha (the PR's own `headRefOid`).
  * @param {{exec?:Function, root?:string, repo?:string|null}} [o]
@@ -1132,7 +1132,11 @@ export function runReconcileFixDispatch({
   const actualScopes = new Map((reconciled.openPrFiles ?? []).filter((p) => Array.isArray(p.files))
     .map((p) => [Number(p.pr), p.files.map((path) => `${prefix}:${path}`)]));
   for (const entry of plannedAll) actualScopes.set(entry.pr, entry.overlapScope);
-  const claims = listFixClaims().map((claim) => {
+  // Terminal-until-a-human-answers PRs (unanswered stand-down) hold NO scope slot — nobody is working them.
+  const { claims: heldClaims, released: terminalHoldsReleased } = dropTerminalFixClaims(
+    listFixClaims(), reconciled.refusals, { repoKey, repoOf: repoKeyForSlug },
+  );
+  const claims = heldClaims.map((claim) => {
     if (!plannedAll.length) return claim;
     const claimRepo = claim.meta?.repo;
     if (claimRepo && repoKeyForSlug(claimRepo) !== repoKey) return claim;
@@ -1233,7 +1237,7 @@ export function runReconcileFixDispatch({
     }
   }
 
-  return { dispatched, refusals, scopeRanks: scopeFilter.ranks, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
+  return { dispatched, refusals, scopeRanks: scopeFilter.ranks, ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
 }
 
 /** Card xkyw1x4 — a `queueAdmission` option may be a queue BUDGET already (`createQueueBudget`'s object — the
@@ -1460,11 +1464,41 @@ if (IS_CLI) {
         const itemLabel = d.itemNum ? `item #${d.itemNum}` : 'no backlog item';
         lines.push(`  → fix    PR #${d.pr} (${itemLabel}) — ${who} (${d.sessionSlug}), ${laneInfo}`);
       }
+      for (const h of (result.terminalHoldsReleased ?? [])) lines.push(`  scope-hold released PR #${h.pr} — ${h.why}`);
       for (const rank of (result.scopeRanks ?? [])) lines.push(`  scope-rank PR #${rank.pr} — rank ${rank.rank}, blocks ${rank.blocks}, age ${rank.ageHours}h, score ${rank.score}, aged-FIFO ${rank.aged}`);
       for (const r of result.refusals) lines.push(`  ✗ ${r.kind} PR #${r.prNumber ?? r.pr} — ${r.why}`);
       process.stdout.write(lines.join('\n') + '\n');
     }
   }
+}
+
+/**
+ * Terminal-until-a-human-answers states never hold a scope slot. A PR whose latest state is an UNANSWERED stand-down
+ * (reconcile refuses it `stood-down`, a check that runs BEFORE the live-claim check, so it is exact) has a fix agent
+ * that stopped to ask a question: nobody is working it, and it stays that way until an operator answers. Its lingering
+ * fix claim must not serialize other PRs behind it (live: #3834 held we:AGENTS.md and blocked #3787, #3771, #3767).
+ * Answered and re-dispatched, it gets a new claim and re-enters normally. Pure.
+ * Deliberately NOT treated the same (not provably idle): `cap-exhausted` (the last heal may still be running),
+ * a withdrawn draft or a parked/needs-human PR (a ci-heal or conflict fix can still be live on them),
+ * `ci-heal-escalated` (checked after the live-claim check, so not distinguishable here).
+ * @param {Array<{meta?:{pr?:number, repo?:string}}>} claims
+ * @param {Array<{kind?:string, prNumber?:number}>} reconcileRefusals
+ * @param {{repoKey?:string, repoOf?:(slug:string)=>string|null}} [o]
+ * @returns {{claims:Array<object>, released:Array<{pr:number, why:string}>}}
+ */
+export function dropTerminalFixClaims(claims, reconcileRefusals = [], { repoKey = 'we', repoOf = () => null } = {}) {
+  const terminal = new Set((Array.isArray(reconcileRefusals) ? reconcileRefusals : [])
+    .filter((r) => r?.kind === 'stood-down').map((r) => Number(r.prNumber)));
+  if (!terminal.size) return { claims, released: [] };
+  const released = [];
+  const kept = claims.filter((claim) => {
+    const pr = Number(claim.meta?.pr);
+    const claimRepo = claim.meta?.repo;
+    if (!terminal.has(pr) || (claimRepo && repoOf(claimRepo) !== repoKey)) return true;
+    released.push({ pr, why: 'unanswered stand-down is terminal until a human answers — its claim holds no scope slot' });
+    return false;
+  });
+  return { claims: kept, released };
 }
 
 /**

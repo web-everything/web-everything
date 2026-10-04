@@ -1,6 +1,6 @@
 /**
  * already-landed-content.mjs — the PURE core for "has this open PR's own content already landed on `main`,
- * carried there by a DIFFERENT PR?" (live incident: chalbert/web-everything PR #2752, #4034/#2748).
+ * carried there by a DIFFERENT PR?" (live incident: web-everything/web-everything PR #2752, #4034/#2748).
  *
  * WHY THIS EXISTS. PR #2759 was built ON TOP OF #2752's branch (a stacked lane) and merged to `main` first,
  * carrying every one of #2752's commits with it. #2752's own branch was SEPARATELY rebased afterward (its

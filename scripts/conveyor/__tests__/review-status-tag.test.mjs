@@ -134,7 +134,7 @@ describe('deriveReviewStatus', () => {
     expect(deriveReviewStatus({ pr: 1765, agents })?.role).toBe('fix');
   });
 
-  // The exact conflict-bounce fixture reported live at 14:45 ET on `chalbert/web-everything#2741`
+  // The exact conflict-bounce fixture reported live at 14:45 ET on `web-everything/web-everything#2741`
   // (`review:changes` + `review-round:1` + `merge-status:conflicting`, mechanically bounced by
   // `we:scripts/conveyor/parked-pr-conflict-watch.mjs`) with its real `fix-2741` session, actually `working`.
   // The status sweep's candidate selection (`we:scripts/conveyor/reconcile-core.mjs#selectStatusCandidates`)
@@ -281,50 +281,50 @@ describe('tagReviewStatus — IO shell over injected fakes (no claude/gh process
   it('tags a PR whose review is actively working, ensuring the label exists first', () => {
     const provider = fakeProvider([]);
     const listAgents = () => [{ name: 'review-42', state: 'working' }];
-    const result = tagReviewStatus({ pr: 42, repo: 'chalbert/web-everything', listAgents, provider });
+    const result = tagReviewStatus({ pr: 42, repo: 'web-everything/web-everything', listAgents, provider });
     expect(result).toEqual({ changed: true, label: 'review-status:reviewing', removed: [] });
     expect(provider.calls).toEqual([
-      ['readLabels', 'chalbert/web-everything', 42],
-      ['ensureLabel', 'chalbert/web-everything', 'review-status:reviewing'],
-      ['setLabels', 'chalbert/web-everything', 42, { add: 'review-status:reviewing', remove: [] }],
+      ['readLabels', 'web-everything/web-everything', 42],
+      ['ensureLabel', 'web-everything/web-everything', 'review-status:reviewing'],
+      ['setLabels', 'web-everything/web-everything', 42, { add: 'review-status:reviewing', remove: [] }],
     ]);
   });
 
   it('clears a stale status label once the session is gone, adding nothing back (no ensureLabel call)', () => {
     const provider = fakeProvider([{ name: 'review-status:reviewing' }]);
     const listAgents = () => [];
-    const result = tagReviewStatus({ pr: 42, repo: 'chalbert/web-everything', listAgents, provider });
+    const result = tagReviewStatus({ pr: 42, repo: 'web-everything/web-everything', listAgents, provider });
     expect(result).toEqual({ changed: true, label: null, removed: ['review-status:reviewing'] });
     expect(provider.calls).toEqual([
-      ['readLabels', 'chalbert/web-everything', 42],
-      ['setLabels', 'chalbert/web-everything', 42, { add: undefined, remove: ['review-status:reviewing'] }],
+      ['readLabels', 'web-everything/web-everything', 42],
+      ['setLabels', 'web-everything/web-everything', 42, { add: undefined, remove: ['review-status:reviewing'] }],
     ]);
   });
 
   it('is idempotent — no write call when the label already matches live state', () => {
     const provider = fakeProvider([{ name: 'review-status:fixing' }]);
     const listAgents = () => [{ name: 'fix-42', state: 'working' }];
-    const result = tagReviewStatus({ pr: 42, repo: 'chalbert/web-everything', listAgents, provider });
+    const result = tagReviewStatus({ pr: 42, repo: 'web-everything/web-everything', listAgents, provider });
     expect(result).toEqual({ changed: false, label: 'review-status:fixing', removed: [] });
-    expect(provider.calls).toEqual([['readLabels', 'chalbert/web-everything', 42]]);
+    expect(provider.calls).toEqual([['readLabels', 'web-everything/web-everything', 42]]);
   });
 
   // draft-first PRs (operator-approved 2026-09-27)
   it('tags a draft PR awaiting-ci, even with a stale (done) review row sitting under its name', () => {
     const provider = fakeProvider([]);
     const listAgents = () => [{ name: 'review-42', state: 'done' }];
-    const result = tagReviewStatus({ pr: 42, repo: 'chalbert/web-everything', listAgents, provider, isDraft: true });
+    const result = tagReviewStatus({ pr: 42, repo: 'web-everything/web-everything', listAgents, provider, isDraft: true });
     expect(result).toEqual({ changed: true, label: 'review-status:awaiting-ci', removed: [] });
     expect(provider.calls).toEqual([
-      ['readLabels', 'chalbert/web-everything', 42],
-      ['ensureLabel', 'chalbert/web-everything', 'review-status:awaiting-ci'],
-      ['setLabels', 'chalbert/web-everything', 42, { add: 'review-status:awaiting-ci', remove: [] }],
+      ['readLabels', 'web-everything/web-everything', 42],
+      ['ensureLabel', 'web-everything/web-everything', 'review-status:awaiting-ci'],
+      ['setLabels', 'web-everything/web-everything', 42, { add: 'review-status:awaiting-ci', remove: [] }],
     ]);
   });
 
   it('isDraft defaults to false — an omitted flag is byte-identical to before this option existed', () => {
     const provider = fakeProvider([]);
-    const result = tagReviewStatus({ pr: 42, repo: 'chalbert/web-everything', listAgents: () => [], provider });
+    const result = tagReviewStatus({ pr: 42, repo: 'web-everything/web-everything', listAgents: () => [], provider });
     expect(result).toEqual({ changed: false, label: null, removed: [] });
   });
 
@@ -336,7 +336,7 @@ describe('tagReviewStatus — IO shell over injected fakes (no claude/gh process
       const listAgents = () => { listAgentsCalls++; return []; };
       const provider = fakeProvider([{ name: 'should-never-be-read' }]);
       const result = tagReviewStatus({
-        pr: 42, repo: 'chalbert/web-everything', listAgents, provider,
+        pr: 42, repo: 'web-everything/web-everything', listAgents, provider,
         agents: [{ name: 'review-42', state: 'working' }], currentLabels: [],
       });
       expect(result).toEqual({ changed: true, label: 'review-status:reviewing', removed: [] });
@@ -347,7 +347,7 @@ describe('tagReviewStatus — IO shell over injected fakes (no claude/gh process
     it('is idempotent off the supplied data too — no write when it already matches', () => {
       const provider = fakeProvider([{ name: 'should-never-be-read' }]);
       const result = tagReviewStatus({
-        pr: 42, repo: 'chalbert/web-everything', provider,
+        pr: 42, repo: 'web-everything/web-everything', provider,
         agents: [{ name: 'review-42', state: 'working' }], currentLabels: [{ name: 'review-status:reviewing' }],
       });
       expect(result).toEqual({ changed: false, label: 'review-status:reviewing', removed: [] });
@@ -357,8 +357,8 @@ describe('tagReviewStatus — IO shell over injected fakes (no claude/gh process
     it('omitting both reads fresh — byte-identical to before these options existed', () => {
       const provider = fakeProvider([]);
       const listAgents = () => [{ name: 'review-42', state: 'working' }];
-      tagReviewStatus({ pr: 42, repo: 'chalbert/web-everything', listAgents, provider });
-      expect(provider.calls[0]).toEqual(['readLabels', 'chalbert/web-everything', 42]);
+      tagReviewStatus({ pr: 42, repo: 'web-everything/web-everything', listAgents, provider });
+      expect(provider.calls[0]).toEqual(['readLabels', 'web-everything/web-everything', 42]);
     });
   });
 });
@@ -376,31 +376,31 @@ describe('applyReviewStatus — dispatch-time variant, NO claude agents --json r
 
   it('applies a KNOWN state directly — no listAgents call exists on this function at all', () => {
     const provider = fakeProvider([]);
-    const result = applyReviewStatus({ pr: 2771, repo: 'chalbert/web-everything', state: 'fixing', provider });
+    const result = applyReviewStatus({ pr: 2771, repo: 'web-everything/web-everything', state: 'fixing', provider });
     expect(result).toEqual({ changed: true, label: 'review-status:fixing', removed: [] });
     expect(provider.calls).toEqual([
-      ['readLabels', 'chalbert/web-everything', 2771],
-      ['ensureLabel', 'chalbert/web-everything', 'review-status:fixing'],
-      ['setLabels', 'chalbert/web-everything', 2771, { add: 'review-status:fixing', remove: [] }],
+      ['readLabels', 'web-everything/web-everything', 2771],
+      ['ensureLabel', 'web-everything/web-everything', 'review-status:fixing'],
+      ['setLabels', 'web-everything/web-everything', 2771, { add: 'review-status:fixing', remove: [] }],
     ]);
   });
 
   it('is idempotent — no write call when the label already matches the known state', () => {
     const provider = fakeProvider([{ name: 'review-status:fixing' }]);
-    const result = applyReviewStatus({ pr: 2771, repo: 'chalbert/web-everything', state: 'fixing', provider });
+    const result = applyReviewStatus({ pr: 2771, repo: 'web-everything/web-everything', state: 'fixing', provider });
     expect(result).toEqual({ changed: false, label: 'review-status:fixing', removed: [] });
-    expect(provider.calls).toEqual([['readLabels', 'chalbert/web-everything', 2771]]);
+    expect(provider.calls).toEqual([['readLabels', 'web-everything/web-everything', 2771]]);
   });
 
   it('swaps a stale status for the new known one, same label home as tagReviewStatus', () => {
     const provider = fakeProvider([{ name: 'review-status:reviewing' }]);
-    const result = applyReviewStatus({ pr: 2771, repo: 'chalbert/web-everything', state: 'fixing', provider });
+    const result = applyReviewStatus({ pr: 2771, repo: 'web-everything/web-everything', state: 'fixing', provider });
     expect(result).toEqual({ changed: true, label: 'review-status:fixing', removed: ['review-status:reviewing'] });
   });
 
   it('currentLabels, when supplied, skips provider.readLabels entirely', () => {
     const provider = fakeProvider([{ name: 'should-never-be-read' }]);
-    const result = applyReviewStatus({ pr: 2771, repo: 'chalbert/web-everything', state: 'fixing', provider, currentLabels: [] });
+    const result = applyReviewStatus({ pr: 2771, repo: 'web-everything/web-everything', state: 'fixing', provider, currentLabels: [] });
     expect(result).toEqual({ changed: true, label: 'review-status:fixing', removed: [] });
     expect(provider.calls.map((c) => c[0])).toEqual(['ensureLabel', 'setLabels']); // no 'readLabels' call
   });
@@ -415,7 +415,7 @@ it('tags only the matching repo session', () => {
   expect(deriveReviewStatus({ pr: 49, agents })).toBeNull();
   expect(deriveReviewStatus({ pr: 49, agents, repo: 'frontierui' })).toEqual({ role: 'review', state: 'reviewing' });
   const provider = { readLabels: () => [], ensureLabel: () => {}, setLabels: () => {} };
-  expect(tagReviewStatus({ pr: 49, repo: 'chalbert/frontierui', listAgents: () => agents, provider }).label).toBe('review-status:reviewing');
+  expect(tagReviewStatus({ pr: 49, repo: 'frontier-ui/frontierui', listAgents: () => agents, provider }).label).toBe('review-status:reviewing');
   expect(() => tagReviewStatus({ pr: 49, repo: 'other/repo' })).toThrow(/not a constellation repo/);
 });
 
@@ -424,7 +424,7 @@ it('shows head-scoped needs-human after the worker exits and clears it on a new 
   const comments = [{ author: { login: 'web-everything' }, body: buildCiHealEscalationComment({ headSha: 'abc', outcome: 'needs-human', reason: 'origin ref verified absent' }) }];
   const writes = [];
   const provider = { ensureLabel() {}, setLabels: (_r, _p, delta) => writes.push(delta) };
-  const opts = { pr: 3154, repo: 'chalbert/web-everything', agents: [], provider, readFixClaim: () => null };
+  const opts = { pr: 3154, repo: 'web-everything/web-everything', agents: [], provider, readFixClaim: () => null };
   expect(tagReviewStatus({ ...opts, currentLabels: ['review-status:fixing'], prState: { comments, headRefOid: 'abc' } }).label).toBe('review-status:needs-human');
   expect(tagReviewStatus({ ...opts, currentLabels: ['review-status:needs-human'], prState: { comments, headRefOid: 'def' } }).label).toBeNull();
   expect(writes.at(-1).remove).toContain('review-status:needs-human');
@@ -444,17 +444,17 @@ describe('xul2kwr automatic writers preserve withdrawal until explicit removal',
       setLabels: (_repo, _pr, { add, remove }) => { labels = labels.filter(l => !remove.includes(l)); if (add && !labels.includes(add)) labels.push(add); },
     };
     for (let tick = 0; tick < 5; tick++) {
-      const tagged = tagReviewStatus({ pr: 3432, repo: 'chalbert/web-everything', provider, agents: [], isDraft: true, readFixClaim: () => null });
+      const tagged = tagReviewStatus({ pr: 3432, repo: 'web-everything/web-everything', provider, agents: [], isDraft: true, readFixClaim: () => null });
       expect(tagged.label).toBe('review-status:draft-withdrawn');
       for (const state of ['reviewing', null]) {
-        expect(applyReviewStatus({ pr: 3432, repo: 'chalbert/web-everything', provider, state }).label).toBe('review-status:draft-withdrawn');
+        expect(applyReviewStatus({ pr: 3432, repo: 'web-everything/web-everything', provider, state }).label).toBe('review-status:draft-withdrawn');
         expect(labels).toEqual(['review-status:draft-withdrawn']);
       }
     }
     labels = [];
-    tagReviewStatus({ pr: 3432, repo: 'chalbert/web-everything', provider, agents: [], isDraft: true, readFixClaim: () => null });
+    tagReviewStatus({ pr: 3432, repo: 'web-everything/web-everything', provider, agents: [], isDraft: true, readFixClaim: () => null });
     expect(labels).toEqual(['review-status:awaiting-ci']);
-    applyReviewStatus({ pr: 3432, repo: 'chalbert/web-everything', provider, state: null });
+    applyReviewStatus({ pr: 3432, repo: 'web-everything/web-everything', provider, state: null });
     expect(labels).toEqual([]);
   });
 });

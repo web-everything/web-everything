@@ -38,6 +38,18 @@
 # trusted tree — a PR cannot fake presence-on-main from within its own diff. Once this PR lands, the file
 # exists on `main` permanently (removing it would be its own reviewed diff), so this branch becomes dead
 # code from then on — a permanent defensive no-op, not a standing loophole.
+#
+# QUEUE RELIEF (actions-queue-relief, 2026-10-03): this workflow fired on EVERY label change on every PR and
+# queued 75 runs at once, each with a full checkout + `npm ci`. Two changes, neither touching the verdict:
+#   1. `concurrency` per PR with `cancel-in-progress` — a run only ever reports the PR's label state at its own
+#      event time, so only the LATEST run per PR matters; an older queued/running one is cancelled. The surviving
+#      run is the newest, so the check's latest row per head SHA is always a real verdict.
+#   2. A cheap fast path for a `labeled`/`unlabeled` event whose label does NOT start with `review:`. Such an event
+#      cannot change the verdict, but it still produces the NEWEST run, and the drain (`review-ci-gate.mjs`) reads
+#      the latest row per name and treats a `skipped` conclusion as NOT success. So the job is NOT skipped with a
+#      job-level `if:`: it still runs and still reports the true verdict, computed in shell from the event's own
+#      label list (no checkout, no `npm ci`). The shell hold list below is asserted equal to REVIEW_HOLD_LABELS
+#      by `scripts/__tests__/ci-card-only.test.mjs`. Every other event takes the original path unchanged.
 name: Review gate
 
 on:
@@ -48,22 +60,47 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: review-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   review-gate:
     runs-on: ubuntu-latest
     steps:
+      # Fast path: an unrelated label (not `review:*`) changed. The verdict is still computed and reported,
+      # just without a checkout. Must stay in sync with REVIEW_HOLD_LABELS (asserted by a test).
+      - name: Fast verdict for a non-review label event
+        id: fast
+        if: ${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'review:') }}
+        env:
+          LABELS_JSON: ${{ toJson(github.event.pull_request.labels) }}
+        run: |
+          HOLD_LABELS_LIST='review:pending,review:changes,review:human'
+          echo "done=true" >> "$GITHUB_OUTPUT"
+          held="$(printf '%s' "$LABELS_JSON" | jq -r --arg l "$HOLD_LABELS_LIST" '[.[].name] | map(select(. as $n | ($l | split(",")) | index($n))) | join(", ")')"
+          if [ -n "$held" ]; then
+            echo "check-review-gate held - a review hold stands: $held"
+            exit 1
+          fi
+          echo "check-review-gate ok - no review hold present"
+
       - uses: actions/checkout@v4
+        if: ${{ steps.fast.outputs.done != 'true' }}
         with:
           ref: main
 
       - uses: actions/setup-node@v4
+        if: ${{ steps.fast.outputs.done != 'true' }}
         with:
           node-version: '22'
           cache: npm
 
       - run: npm ci --ignore-scripts
+        if: ${{ steps.fast.outputs.done != 'true' }}
 
       - name: Check for an un-cleared review hold
+        if: ${{ steps.fast.outputs.done != 'true' }}
         env:
           LABELS_JSON: ${{ toJson(github.event.pull_request.labels) }}
         run: |

@@ -128,7 +128,7 @@ process.stdout.write(''); process.exit(0);
 // ── fake git: canned origin slug; `diff` FAILS (forces the gh-files escalation fallback); else no-op ──
 const FAKE_GIT = `#!/usr/bin/env node
 const a = process.argv.slice(2);
-if (a[0] === 'remote' && a[1] === 'get-url') { process.stdout.write('git@github.com:chalbert/web-everything.git\\n'); process.exit(0); }
+if (a[0] === 'remote' && a[1] === 'get-url') { process.stdout.write('git@github.com:web-everything/web-everything.git\\n'); process.exit(0); }
 if (a[0] === 'diff') { process.exit(1); } // force computeNetDiffChangedFiles → gh 'pr view --json files' fallback
 process.exit(0);
 `;

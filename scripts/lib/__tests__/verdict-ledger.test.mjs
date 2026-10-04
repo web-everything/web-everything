@@ -30,7 +30,7 @@ import { lockDirFor, makeLockEntry } from '../../readiness/file-locks.mjs';
 import { buildRows } from '../../review-ledger-check.mjs';
 import { ROUND_VERDICTS, reviewRoundsFromVerdictLedger, owedFromLedgerVerdict } from '../../pr-status.mjs';
 
-const REPO = 'chalbert/web-everything';
+const REPO = 'web-everything/web-everything';
 const AT = '2026-08-10T12:00:00.000Z';
 
 /** #3329 — the BEARING subset, DERIVED from the module's own two exports rather than listed here. A local
@@ -524,7 +524,7 @@ describe('#3007 IO — the machine-global home, the locked append, the tolerant 
   });
 
   it('one file per repo, named reversibly', () => {
-    expect(verdictLedgerPath(REPO)).toBe(join(dir, 'chalbert-web-everything.jsonl'));
+    expect(verdictLedgerPath(REPO)).toBe(join(dir, 'web-everything-web-everything.jsonl'));
   });
 
   it('appends, reads back, and folds', () => {
@@ -536,7 +536,7 @@ describe('#3007 IO — the machine-global home, the locked append, the tolerant 
     expect(folded.get(20).current.verdict).toBe(VERDICTS.ACCEPTED);
     expect(folded.get(20).history).toHaveLength(2);
     expect(folded.get(21).clears).toBe(false);
-    expect(listLedgerRepos()).toEqual(['chalbert-web-everything']);
+    expect(listLedgerRepos()).toEqual(['web-everything-web-everything']);
   });
 
   it('reads persisted shadow/human evidence through the offline agreement CLI', () => {

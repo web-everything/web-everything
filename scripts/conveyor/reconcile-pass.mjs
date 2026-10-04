@@ -48,6 +48,7 @@
  * cannot corrupt anything, and a lease taken inside a one-shot read is a lease nothing releases when the process
  * is killed.
  */
+import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from '../operations/pr-status.mjs';
 import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
@@ -143,16 +144,26 @@ export const PR_LIST_JSON_FIELDS = 'number,headRefName,headRefOid,baseRefName,la
  *  the default page would leave the overflow unowned, which is this item's defect wearing a smaller hat. */
 export const PR_LIST_LIMIT = 200;
 
+/** Attach authorship only where the open-PR listing has no review disposition. */
+export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCommits } = {}) {
+  return prs.map(pr => {
+    if (!Array.isArray(pr.labels) || pr.labels.some(l => (typeof l === 'string' ? l : l?.name)?.startsWith('review:'))) return pr;
+    return { ...pr, state: pr.state ?? 'OPEN',
+      commits: readCommits(repo, pr.number, { headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefName: pr.baseRefName }) };
+  });
+}
+
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#defaultReadPrs — the OPEN-PR discovery query. `exec` is injectable so
  * the argv is assertable with no `gh` on PATH and no credential.
  * @param {{exec?:Function, repo?:string|null}} [o]
  * @returns {Array<object>}
  */
-export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null } = {}) {
+export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo } = {}) {
+  const enrich = rows => enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) });
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
-  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true }); if (shared) return shared; }
+  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
   const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', PR_LIST_JSON_FIELDS];
   if (repo) argv.push('--repo', repo);
   // #x5n4zn3 — was bare (no timeout).
@@ -163,7 +174,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null } = {
   });
   if (isGhDeferred(out)) return JSON.parse(String(out));
   const parsed = JSON.parse(String(out || '[]'));
-  return Array.isArray(parsed) ? parsed : [];
+  return Array.isArray(parsed) ? enrich(parsed) : [];
 }
 
 /**
@@ -540,7 +551,7 @@ export function enrichPrsWithMainRedFacts(prs, {
   return { prs: enriched, mainRedWindows, mainLatestCheckRuns };
 }
 
-// live incident, chalbert/web-everything PR #2752 (#4034/#2748) — see `we:scripts/lib/already-landed-content.mjs`'s
+// live incident, web-everything/web-everything PR #2752 (#4034/#2748) — see `we:scripts/lib/already-landed-content.mjs`'s
 // own header for the incident and why per-file BLOB IDENTITY against `main`'s own history is the signal, not a
 // plain merge-tree/current-content diff.
 import { CONFLICT_LABEL } from './conflict-label.mjs';
@@ -782,7 +793,7 @@ export function defaultReadPullsForCommit(sha, { exec = execFileSyncThrottled, r
 }
 
 /**
- * we:scripts/conveyor/reconcile-pass.mjs#enrichPrsWithAlreadyLandedFacts — live incident, chalbert/web-everything
+ * we:scripts/conveyor/reconcile-pass.mjs#enrichPrsWithAlreadyLandedFacts — live incident, web-everything/web-everything
  * PR #2752 (#4034/#2748): attach `alreadyLandedInMain: {carrierPr}` to any open PR whose own content is already,
  * file-by-file, present on `main` — see `we:scripts/lib/already-landed-content.mjs`'s own header for the full
  * incident and why this needs blob identity rather than a plain diff.
@@ -987,6 +998,17 @@ export function defaultReadChecks({ repo, sha }, { exec = execFileSyncThrottled 
  * Hydrate truncated or incomplete check input from the exact-head REST feed. Unknown evidence is withheld from the
  * CI-consuming branches (heal, promotion) via an `unchecked` verdict, but never removes the PR from planning.
  */
+/**
+ * A PR GitHub reports as conflicting with its base. GitHub runs NO `pull_request` CI on a conflicting head (there is
+ * no merge commit to test), so for such a PR the absence of every required check is the EXPECTED state, never a
+ * failed read. Conflict facts only: the `merge-status:conflicting` label (the conflict watch's own mark), the
+ * `mergeable` field, or `mergeStateStatus: DIRTY` (the same field `classifyPr` reads for the `conflicted` phase).
+ */
+export function isConflictingPr(pr) {
+  const labels = Array.isArray(pr?.labels) ? pr.labels.map(l => (typeof l === 'string' ? l : l?.name)) : [];
+  return labels.includes(CONFLICT_LABEL) || pr?.mergeable === 'CONFLICTING' || pr?.mergeStateStatus === 'DIRTY';
+}
+
 function hydrateChecks(prs, { repo, requiredChecks, readChecks }) {
   const cache = new Map();
   const ready = [], refusals = [];
@@ -994,6 +1016,15 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks }) {
     const runs = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
     const missing = (requiredChecks ?? []).filter(name => !runs.some(run => run?.name === name));
     if (runs.length < 100 && !missing.length) { ready.push(pr); continue; }
+    // Live deadlock shape, PR #3771 (2026-10-03): a conflicting head can never grow its required checks, so reading
+    // the REST feed every tick and refusing `check-read-failed` for "missing required checks" is a read that cannot
+    // succeed and a refusal that names no real fault. The conflict repair that PR is owed (a mechanical re-sync
+    // with main) does not consume CI at all. Nothing observed for ANY required name + not truncated = expected
+    // absence: skip the read (it also costs a GitHub call per tick), refuse nothing, keep the empty rollup so the
+    // verdict stays `unchecked` (never green, never red) for every CI-consuming branch. Observed evidence (a
+    // required check that did run before the conflict) still goes through the read below.
+    const conflicting = isConflictingPr(pr);
+    if (conflicting && runs.length < 100 && missing.length === (requiredChecks ?? []).length) { ready.push(pr); continue; }
     const sha = pr.headRefOid;
     const key = `${repo}/${sha}`;
     if (!cache.has(key)) {
@@ -1024,7 +1055,8 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks }) {
       } catch (error) { cache.set(key, { error: String(error?.message ?? error) }); }
     }
     const result = cache.get(key);
-    const refused = result.error ?? result.incomplete;
+    // A conflicting head's incomplete required set is expected (see above); only a real read error still refuses.
+    const refused = result.error ?? (conflicting ? null : result.incomplete);
     if (refused) {
       refusals.push({ kind: 'check-read-failed', prNumber: pr.number, headRefOid: sha,
         why: `required-check hydration refused for ${repo}@${sha}: ${refused}` });
@@ -1081,7 +1113,7 @@ export function runReconcilePass({
   // `owner/name` slug, never the raw input. `repo == null` stays `null` (gh infers the repo from cwd, same as
   // before) — only a caller-supplied value is normalised.
   const resolvedRepo = repo == null ? null : CONSTELLATION_REPOS[repoKey].slug;
-  const rawPrs = readPrs({ repo: resolvedRepo });
+  const rawPrs = readPrs({ repo: resolvedRepo, ...(readPrs === defaultReadPrs ? { attributionRepo: CONSTELLATION_REPOS[repoKey].slug } : {}) });
   if (isGhDeferred(rawPrs)) return { ...rawPrs, dispatch: [], refusals: [], notes: [rawPrs.message], prs: 0, agents: 0 };
   // #4501 — read the live required-check set (branch protection, cached; degrades to
   // the repo's declared fallback if the live fetch fails) BEFORE enriching main-red facts, so BOTH

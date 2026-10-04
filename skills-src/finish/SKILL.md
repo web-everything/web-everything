@@ -113,7 +113,7 @@ not an unconditional auto-open list.
    - **When the lane already has an OPEN PR, take the fix claim FIRST** (fix procedure, operator-approved
      2026-09-27; draft-only-on-withdrawal, `docs/agent/platform-decisions.md#fix-claim-draft-only-on-withdrawal`):
      `node scripts/conveyor/fix-procedure.mjs fix-begin <pr> --repo=<the PR's repo slug, e.g.
-     chalbert/frontierui> --who=<finisher name> --why="finish: <bucket>"`. `--repo` is required — a PR number is
+     frontier-ui/frontierui> --who=<finisher name> --why="finish: <bucket>"`. `--repo` is required — a PR number is
      only unique within its repo, so a cross-repo couple names each half's own repo. **This is a normal repair
      loop, so it stays READY by default — never draft**; it refuses everyone else's pushes to the branch until
      you run `fix-procedure.mjs fix-end <pr> --repo=<same> --who=<same>` after your push (a claim never drafted

@@ -69,7 +69,7 @@ export function scanMultiRepo(source) {
     if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateExpression(node)) {
       const value = ts.isTemplateExpression(node) ? node.head.text + node.templateSpans.map((span) => '${'
         + printer.printNode(ts.EmitHint.Expression, span.expression, tree) + '}' + span.literal.text).join('') : node.text;
-      const slugs = new RegExp('chalbert/' + '(?:web-everything|frontierui|plateau-app)');
+      const slugs = new RegExp('(?:web-everything/' + 'web-everything|frontier-ui/' + 'frontierui|plateauapp/' + 'plateau-app)');
       if (slugs.test(value)) add(node, 'repo-literal');
       // Only shell command strings, not diagnostic prose quoting CLI names.
       let parent = node.parent;

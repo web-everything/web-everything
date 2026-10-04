@@ -63,6 +63,7 @@ import {
   isChatEnded,
   classifyChatSpawnGuard,
   resolveChatSpawnGuardCeilingMs,
+  CHAT_SPAWN_LINK_FUTURE_SKEW_MS,
   makeChatSpawnGuardResolver,
   runStampChatSpawnHook,
   runMarkChatEndedHook,
@@ -445,13 +446,13 @@ describe('repo-aware ground truth', () => {
     const calls = [];
     const groundTruthFor = makeGroundTruthResolver({ exec: (file, args) => {
       calls.push([file, args]);
-      return JSON.stringify({ state: args.includes('chalbert/frontierui') ? 'OPEN' : 'MERGED' });
+      return JSON.stringify({ state: args.includes('frontier-ui/frontierui') ? 'OPEN' : 'MERGED' });
     } });
     const listing = ['review-49', 'review-fui-49', 'fix-fui-49'].map((name) => bg({ name, sessionId: name, state: 'working' }));
     const { reap, keep } = sessionReapPlan(listing, { groundTruthFor });
     expect(reap.map((r) => r.session.name)).toEqual(['review-49']);
     expect(keep.map((r) => r.session.name)).toEqual(['review-fui-49', 'fix-fui-49']);
-    expect(calls).toEqual(['chalbert/web-everything', 'chalbert/frontierui'].map((repo) => ['gh', ['pr', 'view', '49', '--repo', repo, '--json', 'state,mergedAt']]));
+    expect(calls).toEqual(['web-everything/web-everything', 'frontier-ui/frontierui'].map((repo) => ['gh', ['pr', 'view', '49', '--repo', repo, '--json', 'state,mergedAt']]));
   });
   it('keeps sessions on unknown repo or gh failure', () => {
     const listing = [bg({ name: 'review-fui-49', state: 'working' })];
@@ -2652,6 +2653,38 @@ describe('classifyChatSpawnGuard — PURE, the three-way rule', () => {
   // ceiling bounds the blast radius of any bad/forged write to a finite window instead.
   describe('the ceiling — a link can never block reaping forever (security fix, PR #2678)', () => {
     const T0 = 1_000_000;
+
+    it('a future-dated recordedAtMs is invalid — not blocked, chat-spawn-link-future-dated (#4184)', () => {
+      const link = { ok: true, spawnedByChatSessionId: 'chat-1', recordedAtMs: T0 + 365 * 24 * 60 * 60 * 1000 };
+      expect(classifyChatSpawnGuard({ link, ended: false, nowMs: T0, ceilingMs: 10_000 }))
+        .toEqual({ blocked: false, reason: 'chat-spawn-link-future-dated' });
+    });
+    it('a future-dated ambiguous/corrupt link (mtime fallback) is also not blocked (#4184)', () => {
+      const link = { ok: false, recordedAtMs: T0 + 60 * 60 * 1000 };
+      expect(classifyChatSpawnGuard({ link, nowMs: T0, ceilingMs: 10_000 }))
+        .toEqual({ blocked: false, reason: 'chat-spawn-link-future-dated' });
+    });
+    it('a link within the clock-skew tolerance is still blocked (#4184)', () => {
+      expect(CHAT_SPAWN_LINK_FUTURE_SKEW_MS).toBe(5 * 60 * 1000);
+      const link = { ok: true, spawnedByChatSessionId: 'chat-1', recordedAtMs: T0 + CHAT_SPAWN_LINK_FUTURE_SKEW_MS };
+      expect(classifyChatSpawnGuard({ link, nowMs: T0, ceilingMs: 24 * 60 * 60 * 1000 }))
+        .toEqual({ blocked: true, reason: 'chat-not-ended' });
+      expect(classifyChatSpawnGuard({ link: { ...link, recordedAtMs: link.recordedAtMs + 1 }, nowMs: T0, ceilingMs: 10_000 }))
+        .toEqual({ blocked: false, reason: 'chat-spawn-link-future-dated' });
+    });
+    it('ended still wins over a future-dated link — reason chat-ended (#4184)', () => {
+      const link = { ok: true, spawnedByChatSessionId: 'chat-1', recordedAtMs: T0 + 365 * 24 * 60 * 60 * 1000 };
+      expect(classifyChatSpawnGuard({ link, ended: true, nowMs: T0, ceilingMs: 10_000 }))
+        .toEqual({ blocked: false, reason: 'chat-ended' });
+    });
+    it.each([null, undefined, 0, -1, '10000', NaN])('does not reject future dates with disabled/invalid ceiling %s (#4184)', ceilingMs => {
+      for (const ok of [true, false]) {
+        const link = { ok, spawnedByChatSessionId: 'chat-1', recordedAtMs: T0 + 365 * 24 * 60 * 60 * 1000 };
+        expect(classifyChatSpawnGuard({ link, nowMs: T0, ceilingMs }))
+          .toEqual({ blocked: true, reason: ok ? 'chat-not-ended' : 'ambiguous-chat-link' });
+      }
+    });
+
     it('still blocked before the ceiling elapses', () => {
       const link = { ok: true, spawnedByChatSessionId: 'chat-1', recordedAtMs: T0 };
       expect(classifyChatSpawnGuard({ link, ended: false, nowMs: T0 + 1000, ceilingMs: 10_000 }))
@@ -2704,6 +2737,10 @@ describe('classifyChatSpawnGuard — PURE, the three-way rule', () => {
         const after = classifyChatSpawnGuard({ link, ended: false, nowMs: T0 + 10_000, ceilingMs: 10_000 });
         expect(after).toEqual({ blocked: false, reason: 'chat-spawn-guard-ceiling' });
       }
+      for (const shape of cases) {
+        const link = { ...shape, recordedAtMs: T0 + 10 * CHAT_SPAWN_LINK_FUTURE_SKEW_MS };
+        expect(classifyChatSpawnGuard({ link, ended: false, nowMs: T0, ceilingMs: 10_000 }).blocked).toBe(false);
+      }
     });
   });
 });
@@ -2731,6 +2768,29 @@ describe('makeChatSpawnGuardResolver — routes link → ended lookup', () => {
   afterEach(() => {
     rmSync(spawnsDir, { recursive: true, force: true });
     rmSync(endedDir, { recursive: true, force: true });
+  });
+
+  it('makeChatSpawnGuardResolver does not block a session whose link file claims a future recordedAt (#4184)', () => {
+    const id = 'future-child';
+    writeFileSync(join(spawnsDir, `${id}.json`), JSON.stringify({
+      v: 1, spawnedSessionId: id, spawnedByChatSessionId: 'chat-x', recordedAt: '2099-01-01T00:00:00.000Z',
+    }));
+    const guard = makeChatSpawnGuardResolver({ spawnsDir, endedDir, now: () => Date.parse('2026-10-03T00:00:00Z') });
+    expect(guard({ sessionId: id })).toEqual({ blocked: false, reason: 'chat-spawn-link-future-dated' });
+  });
+
+  it('rejects a corrupt future-mtime link across repeated resolver passes (#4184)', () => {
+    const id = 'future-corrupt-child';
+    const path = join(spawnsDir, `${id}.json`);
+    writeFileSync(path, '{corrupt');
+    const future = new Date('2099-01-01T00:00:00.000Z');
+    utimesSync(path, future, future);
+    let nowMs = Date.parse('2026-10-03T00:00:00Z');
+    const guard = makeChatSpawnGuardResolver({ spawnsDir, endedDir, now: () => nowMs });
+    for (let pass = 0; pass < 1_000; pass++) {
+      expect(guard({ sessionId: id })).toEqual({ blocked: false, reason: 'chat-spawn-link-future-dated' });
+      nowMs += 60_000;
+    }
   });
 
   it('not blocked for a session with no link', () => {

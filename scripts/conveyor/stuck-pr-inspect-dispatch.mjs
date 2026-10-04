@@ -3,7 +3,7 @@
  * @file scripts/conveyor/stuck-pr-inspect-dispatch.mjs
  * @description DISPATCH ONE DIAGNOSIS-ONLY INSPECTION AGENT for one stuck PR (epic #3383's stuck-PR watch).
  *
- *   node scripts/conveyor/stuck-pr-inspect-dispatch.mjs --pr=2505 --repo=chalbert/web-everything \
+ *   node scripts/conveyor/stuck-pr-inspect-dispatch.mjs --pr=2505 --repo=web-everything/web-everything \
  *     --stage=conflict --minutes-since=390 --threshold-minutes=45
  *
  * MIRRORS `we:scripts/operations/review-dispatch.mjs#dispatchReview`'s OWN COMPOSITION (plan → fill the brief →

@@ -155,11 +155,11 @@ describe('buildRunnerArgv', () => {
   });
 
   it('passes an explicit repo through', () => {
-    expect(buildRunnerArgv({ repo: 'chalbert/frontierui' })).toContain('--repo=chalbert/frontierui');
+    expect(buildRunnerArgv({ repo: 'frontier-ui/frontierui' })).toContain('--repo=frontier-ui/frontierui');
   });
 
   it('never constructs a flag that could ACT — no --enforce anywhere in the argv', () => {
-    for (const repo of [null, 'chalbert/web-everything']) {
+    for (const repo of [null, 'web-everything/web-everything']) {
       expect(buildRunnerArgv({ repo }).join(' ')).not.toMatch(/enforce/);
     }
   });
@@ -282,7 +282,7 @@ describe('renderPlist', () => {
 
   it('omits the repo override entirely when none is configured', () => {
     expect(renderPlist(cfg)).not.toContain('CONVERGE_DAEMON_REPO');
-    expect(renderPlist({ ...cfg, repo: 'chalbert/frontierui' })).toContain('<key>CONVERGE_DAEMON_REPO</key><string>chalbert/frontierui</string>');
+    expect(renderPlist({ ...cfg, repo: 'frontier-ui/frontierui' })).toContain('<key>CONVERGE_DAEMON_REPO</key><string>frontier-ui/frontierui</string>');
   });
 });
 

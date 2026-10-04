@@ -1437,7 +1437,7 @@ describe('automatic item preparation', () => {
     const effects = fixture();
     effects.listProbationPrepares = () => ['4322', '4325'].map(item => ({ item,
       scoredAt: item, dispatchKind: 'probation-launch', taskType: 'prepare',
-      repo: 'chalbert/web-everything', launchOutcome: 'gate-red', pr: null }));
+      repo: 'web-everything/web-everything', launchOutcome: 'gate-red', pr: null }));
     const tick = await runBuildDispatchTick({ live: true, effects });
     expect(tick.prepare.route).toBe('probation');
     expect(tick.prepare.policyRoute).toMatchObject({ provider: 'codex', model: 'gpt-6-astra' });
@@ -2029,7 +2029,7 @@ describe('executor prediction and independent caps (#4531)', () => {
 describe('probation prepare route circuit breaker', () => {
   const row = (item, launchOutcome = 'gate-red', pr = null) => ({
     item, scoredAt: `2026-09-30T03:${item}:00Z`, dispatchKind: 'probation-launch',
-    taskType: 'prepare', repo: 'chalbert/web-everything', launchOutcome, pr,
+    taskType: 'prepare', repo: 'web-everything/web-everything', launchOutcome, pr,
   });
   it('requires fix citations to reopen after two failures, even after a later success', () => {
     const failed = [row('22'), row('25', 'escalated-needs-human')];

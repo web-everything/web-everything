@@ -22,9 +22,9 @@ import {
   acquireFixClaim, releaseFixClaim, heartbeatFixClaim, readLiveFixClaim, pushRefusal, isClaimHolder,
   fixBegin, fixEnd, withAltBranchHint, repoKeyFromRemoteUrl, repoKeyForCheckout, DEFAULT_FIX_CLAIM_TTL_MINUTES,
   FIX_BEGIN_MARKER, FIX_END_MARKER, FIXING_LABEL, STOOD_DOWN_LABEL, parseGitPush, resolvePushDestination,
-  refuseHeldPush, parseGitPushes, resolvePushDestinations, pushTargetUnreliable,
+  fixBeginRefusalMessage, refuseHeldPush, parseGitPushes, resolvePushDestinations, pushTargetUnreliable,
 } from '../fix-procedure.mjs';
-import { acquireFixDispatchClaim, refreshLiveFixDispatchClaims } from '../fix-dispatch-claim.mjs';
+import { acquireFixDispatchClaim, refreshLiveFixDispatchClaims, releaseSessionFixDispatchClaims, readFixDispatchClaim } from '../fix-dispatch-claim.mjs';
 import { fixDispatchClaimRoot } from '../fix-claim-store.mjs';
 import {
   STAND_DOWN_MARKER, CONCURRENT_AUTHOR_PAUSE_MARKER, buildConcurrentAuthorPauseComment, concurrentAuthorPauses,
@@ -63,7 +63,7 @@ describe('the fix claim', () => {
   it('a second fixer is refused while the first holds it; the holder re-begins reentrantly', () => {
     const a = acquireFixClaim({ repo: 'we', pr: 2811, who: 'fix-2811', why: 'address review', branch: BRANCH, lockRoot: root, nowMs: T0 });
     expect(a).toMatchObject({ ok: true });
-    const b = acquireFixClaim({ repo: 'chalbert/web-everything', pr: 2811, who: 'rubric-worker', lockRoot: root, nowMs: T0 + MIN });
+    const b = acquireFixClaim({ repo: 'web-everything/web-everything', pr: 2811, who: 'rubric-worker', lockRoot: root, nowMs: T0 + MIN });
     expect(b).toMatchObject({ ok: false, reason: 'held', heldBy: 'fixer:fix-2811' });
     expect(acquireFixClaim({ repo: 'we', pr: 2811, who: 'fix-2811', token: a.token, lockRoot: root, nowMs: T0 + 2 * MIN })).toMatchObject({ ok: true, reason: 'own' });
     // the reentrant re-begin kept the branch it was first given
@@ -203,14 +203,14 @@ describe('pushes while a claim is live', () => {
       throw new Error(`no ${k}`);
     };
     const urls = {
-      'remote get-url origin': 'git@github.com:chalbert/frontierui.git\n',
-      'remote get-url we': 'https://github.com/chalbert/web-everything.git\n',
+      'remote get-url origin': 'git@github.com:frontier-ui/frontierui.git\n',
+      'remote get-url we': 'https://github.com/web-everything/web-everything.git\n',
     };
     // A frontierui checkout pushing an explicit lane ref to its `we` remote is a WE push.
     expect(resolvePushDestination(`git push we HEAD:refs/heads/${BRANCH}`, { cwd: '/lane', exec: git(urls) }))
       .toEqual({ repoKey: 'we', branches: [BRANCH] });
     // A URL remote is read directly.
-    expect(resolvePushDestination(`git push https://github.com/chalbert/web-everything.git HEAD:${BRANCH}`, { cwd: '/lane', exec: git(urls) }))
+    expect(resolvePushDestination(`git push https://github.com/web-everything/web-everything.git HEAD:${BRANCH}`, { cwd: '/lane', exec: git(urls) }))
       .toEqual({ repoKey: 'we', branches: [BRANCH] });
     // A bare push: the branch's push remote and its push/upstream ref are the target (fail-closed: all candidates).
     const bare = git({
@@ -242,7 +242,7 @@ describe('pushes while a claim is live', () => {
 
   // Destination matrix (#4326 item 4): every potentially updated claimed branch must be named.
   describe('resolvePushDestination: push.default / remote.<name>.push', () => {
-    const urls = { 'remote get-url we': 'https://github.com/chalbert/web-everything.git\n' };
+    const urls = { 'remote get-url we': 'https://github.com/web-everything/web-everything.git\n' };
     const repoCfg = (extra) => (cmd, args) => {
       const map = { ...urls, 'symbolic-ref -q --short HEAD': 'lane/mine\n', 'config --get branch.lane/mine.remote': 'we\n', ...extra };
       const k = args.join(' ');
@@ -273,7 +273,7 @@ describe('pushes while a claim is live', () => {
 
   // #4326 items 3 + 5 — the REAL decide()/reason() against real throwaway git repos and a real claim store.
   describe('the hook against real repos (computeFixClaimCtx -> decide)', () => {
-    const WE_URL = 'https://github.com/chalbert/web-everything.git';
+    const WE_URL = 'https://github.com/web-everything/web-everything.git';
     const mkRepo = (url = WE_URL) => {
       const dir = mkdtempSync(join(tmpdir(), 'fix-push-repo-'));
       const g = (...a) => execFileSync('git', a, { cwd: dir, stdio: 'ignore' });
@@ -319,7 +319,7 @@ describe('pushes while a claim is live', () => {
     });
     it('two pushes to different repos, claim only on the second destination -> refused; no claim -> allowed', async () => {
       const a = repo(WE_URL);
-      const b = repo('https://github.com/chalbert/frontierui.git');
+      const b = repo('https://github.com/frontier-ui/frontierui.git');
       const cmd = `git -C ${a} push origin lane/ok && git -C ${b} push origin lane/claimed`;
       expect(await verdict(cmd, a)).toBeNull();
       claim('frontierui', 77, 'lane/claimed');
@@ -597,7 +597,7 @@ describe('fixBegin / fixEnd — the IO shell', () => {
     const labels = fakeLabels();
     const r = await fixBegin({ repo: 'we', pr: 2812, who: 'fix-2812', why: 'scope changed mid-review', sessionId: 'sess-2812', draft: true, reason: 'scope-change', gh, labels, lockRoot: root, nowMs: T0 });
     expect(r).toMatchObject({ ok: true, draft: true, reason: 'scope-change', steps: ['draft', 'label', 'comment'] });
-    expect(calls).toContainEqual(['pr', 'ready', '2812', '--repo', 'chalbert/web-everything', '--undo']);
+    expect(calls).toContainEqual(['pr', 'ready', '2812', '--repo', 'web-everything/web-everything', '--undo']);
     expect(labels.log).toContainEqual(['set', { add: 'review-status:draft-scope-change', remove: [] }]);
 
     const end = await fixEnd({ repo: 'we', pr: 2812, who: 'fix-2812', sessionId: 'sess-2812', gh, labels, lockRoot: root });
@@ -709,14 +709,14 @@ describe('the fix daemon\'s refresh sweep and a `fixing` claim', () => {
 
 describe('repoKeyFromRemoteUrl', () => {
   it('maps ssh and https remotes; unknown repos are null', () => {
-    expect(repoKeyFromRemoteUrl('git@github.com:chalbert/web-everything.git')).toBe('we');
-    expect(repoKeyFromRemoteUrl('https://github.com/chalbert/frontierui')).toBe('frontierui');
+    expect(repoKeyFromRemoteUrl('git@github.com:web-everything/web-everything.git')).toBe('we');
+    expect(repoKeyFromRemoteUrl('https://github.com/frontier-ui/frontierui')).toBe('frontierui');
     expect(repoKeyFromRemoteUrl('git@github.com:someone/else.git')).toBeNull();
   });
 
   it('repoKeyForCheckout reads the URL of the remote it is told to (pr-land passes its --remote), from a checkout PATH', () => {
     const calls = [];
-    const exec = (cmd, args, o) => { calls.push([args.at(-1), o.cwd]); return args.at(-1) === 'upstream' ? 'git@github.com:chalbert/frontierui.git\n' : 'git@github.com:chalbert/web-everything.git\n'; };
+    const exec = (cmd, args, o) => { calls.push([args.at(-1), o.cwd]); return args.at(-1) === 'upstream' ? 'git@github.com:frontier-ui/frontierui.git\n' : 'git@github.com:web-everything/web-everything.git\n'; };
     expect(repoKeyForCheckout('/lanes/x', { exec })).toBe('we');
     expect(repoKeyForCheckout('/lanes/x', { remote: 'upstream', exec })).toBe('frontierui');
     expect(calls).toEqual([['origin', '/lanes/x'], ['upstream', '/lanes/x']]);
@@ -759,7 +759,7 @@ describe('refuseHeldPush — the injected-run push-claim check (#4293)', () => {
   };
 
   it('resolves the repo off the injected run (never a subprocess of its own) and refuses a live claim', () => {
-    const run = scriptedRun({ status: 0, stdout: 'git@github.com:chalbert/web-everything.git\n' });
+    const run = scriptedRun({ status: 0, stdout: 'git@github.com:web-everything/web-everything.git\n' });
     const remoteCalls = [];
     const spied = (cmd, args, opts) => { if (args[0] === 'remote') remoteCalls.push(args); return run(cmd, args, opts); };
     const refusal = refuseHeldPush({ run: spied, remote: 'origin', branch: BRANCH });
@@ -769,7 +769,7 @@ describe('refuseHeldPush — the injected-run push-claim check (#4293)', () => {
   });
 
   it('a repo the run resolves to a DIFFERENT constellation repo is unaffected by this claim', () => {
-    const run = scriptedRun({ status: 0, stdout: 'git@github.com:chalbert/frontierui.git\n' });
+    const run = scriptedRun({ status: 0, stdout: 'git@github.com:frontier-ui/frontierui.git\n' });
     expect(refuseHeldPush({ run, remote: 'origin', branch: BRANCH })).toBeNull();
   });
 
@@ -787,7 +787,7 @@ describe('refuseHeldPush — the injected-run push-claim check (#4293)', () => {
   });
 
   it('no live claim on the branch → null, whether or not the repo resolves', () => {
-    const run = scriptedRun({ status: 0, stdout: 'git@github.com:chalbert/web-everything.git\n' });
+    const run = scriptedRun({ status: 0, stdout: 'git@github.com:web-everything/web-everything.git\n' });
     expect(refuseHeldPush({ run, remote: 'origin', branch: 'lane/no-claim-here' })).toBeNull();
   });
 });
@@ -829,7 +829,7 @@ describe('the CLI and its documented invocations name the repo', () => {
 
 
 it('xul2kwr synthetic #3432 soak: withdrawal survives expiry and stale plans until fix-end', async () => {
-  const repo = 'chalbert/web-everything';
+  const repo = 'web-everything/web-everything';
   const held = 'review-status:draft-withdrawn';
   let nowMs = T0;
   const pr = { number: 3432, state: 'OPEN', isDraft: true, headRefName: BRANCH,
@@ -893,4 +893,56 @@ it('xul2kwr synthetic #3432 soak: withdrawal survives expiry and stale plans unt
   expect(pr.isDraft).toBe(false);
   expect(pr.labels).toEqual([]);
   console.info('xul2kwr synthetic replay', JSON.stringify({ ticks: trace.length, first: trace[0], last: trace.at(-1), effectsAfterRelease: effects }));
+});
+
+
+describe('a stood-down fixer frees its dispatch claim at once (#3311)', () => {
+  const seed = (lockRoot, extra = {}) => acquireFixDispatchClaim({ repo: 'we', pr: 3311, owner: 'daemon:1', nowMs: T0, lockRoot, ...extra });
+  it('replays #3311: daemon claim blocks split; stand-down frees it inside the TTL', () => {
+    seed(root);
+    expect(acquireFixClaim({ repo: 'we', pr: 3311, who: 'split-3311', lockRoot: root, nowMs: T0 + MIN }))
+      .toMatchObject({ ok: false, reason: 'dispatched-fixer', dispatchKind: 'fix' });
+    expect(releaseSessionFixDispatchClaims({ repo: 'we', pr: 3311, who: 'fix-3311', lockRoot: root }).released)
+      .toEqual([{ kind: 'fix', owner: 'daemon:1' }]);
+    expect(acquireFixClaim({ repo: 'we', pr: 3311, who: 'split-3311', lockRoot: root, nowMs: T0 + 2 * MIN }).ok).toBe(true);
+  });
+  it.each(['fix-9999', 'split-3311', undefined])('leaves mismatched who %s alone', (who) => {
+    seed(root);
+    expect(releaseSessionFixDispatchClaims({ repo: 'we', pr: 3311, who, lockRoot: root }).released).toEqual([]);
+    expect(readFixDispatchClaim({ repo: 'we', pr: 3311, lockRoot: root })).not.toBeNull();
+  });
+  it('releases only its own kind and never the fixing claim', () => {
+    seed(root); seed(root, { kind: 'ci-heal' }); seed(root, { kind: 'fixing' });
+    expect(releaseSessionFixDispatchClaims({ repo: 'we', pr: 3311, who: 'ci-heal-3311', lockRoot: root }).released)
+      .toEqual([{ kind: 'ci-heal', owner: 'daemon:1' }]);
+    for (const kind of ['fix', 'fixing']) expect(readFixDispatchClaim({ repo: 'we', pr: 3311, kind, lockRoot: root })).not.toBeNull();
+    seed(root, { kind: 'ci-heal' });
+    releaseSessionFixDispatchClaims({ repo: 'we', pr: 3311, who: 'fix-3311', lockRoot: root });
+    expect(readFixDispatchClaim({ repo: 'we', pr: 3311, kind: 'ci-heal', lockRoot: root })).not.toBeNull();
+  });
+  it('scopes by repo', () => {
+    seed(root, { repo: 'frontierui' });
+    expect(releaseSessionFixDispatchClaims({ repo: 'we', pr: 3311, who: 'fix-3311', lockRoot: root }).released).toEqual([]);
+    expect(readFixDispatchClaim({ repo: 'frontierui', pr: 3311, lockRoot: root })).not.toBeNull();
+  });
+  it('soaks 20 refresh ticks with the stood-down session still listed live', () => {
+    seed(root);
+    releaseSessionFixDispatchClaims({ repo: 'we', pr: 3311, who: 'fix-3311', lockRoot: root });
+    for (let tick = 1; tick <= 20; tick += 1) {
+      const nowMs = T0 + tick * 15_000;
+      const sweep = refreshLiveFixDispatchClaims({ lockRoot: root,
+        listAgentsAll: () => [{ name: 'fix-3311', state: 'working' }], hungInfoFor: () => null,
+        nowIso: () => new Date(nowMs).toISOString() });
+      expect(sweep.refreshed).toEqual([]);
+      expect(readFixDispatchClaim({ repo: 'we', pr: 3311, lockRoot: root })).toBeNull();
+      const next = acquireFixClaim({ repo: 'we', pr: 3311, who: 'split-3311', lockRoot: root, nowMs });
+      expect(next.ok).toBe(true);
+      expect(releaseFixClaim({ repo: 'we', pr: 3311, who: 'split-3311', token: next.token, lockRoot: root }).released).toBe(true);
+    }
+  });
+  it('fixBeginRefusalMessage names the reason and the holder', () => {
+    const message = fixBeginRefusalMessage({ pr: 3311, reason: 'dispatched-fixer', heldBy: 'fix-3311', dispatchKind: 'fix' });
+    for (const part of ['dispatched-fixer', 'fix-3311', 'TTL', 'daemon fix']) expect(message).toContain(part);
+    expect(fixBeginRefusalMessage({ pr: 3311, reason: 'held', heldBy: 'other' })).toContain('held — held by other');
+  });
 });

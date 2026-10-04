@@ -478,7 +478,7 @@ export function runMainRedRebaseAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, ti
 
 /**
  * we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs#runMissingRunRecoveryAllRepos — xi4od2p (epic
- * #4075/#3383), LIVE INCIDENT 2026-09-26: PR chalbert/web-everything#2729 sat `review:accepted` + `MERGEABLE`
+ * #4075/#3383), LIVE INCIDENT 2026-09-26: PR web-everything/web-everything#2729 sat `review:accepted` + `MERGEABLE`
  * but `BLOCKED`, labelled `checking`, because its head never got a required-check run queued AT ALL — a THIRD,
  * disjoint population from the `hungCi`/`mainRedRebase` halves below (see
  * `we:scripts/conveyor/main-red-recovery.mjs`'s own "MISSING-CI-RUN RECOVERY" section for the full incident and
@@ -774,6 +774,9 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
       // required by the card and matched by the soak scenario/live-proof read; never merely implied by an
       // empty `dispatched` count.
       if (authPaused) log.error(`reconcile-fix-dispatch-daemon: ${authPauseReason ?? 'paused: Claude login expired — run /login'}`);
+      for (const r of repos) for (const h of (r.result?.terminalHoldsReleased ?? [])) {
+        log.error(`reconcile-fix-dispatch-daemon: scope-hold released ${r.repo} PR #${h.pr} — ${h.why}`);
+      }
       for (const r of repos) for (const rank of (r.result?.scopeRanks ?? [])) {
         log.error(`reconcile-fix-dispatch-daemon: scope-rank ${r.repo} PR #${rank.pr} — rank ${rank.rank}, blocks ${rank.blocks}, age ${rank.ageHours}h, score ${rank.score}, aged-FIFO ${rank.aged}`);
       }

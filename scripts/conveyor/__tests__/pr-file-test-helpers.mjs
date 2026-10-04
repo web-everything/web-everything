@@ -25,7 +25,7 @@ export function prFileContract({ name, load, reader, run, fields, reconcile = fa
         const mod = await load();
         writeFileSync(path, JSON.stringify(fixture));
         const options = {
-          repo: 'chalbert/web-everything', dryRun: true, now: Date.parse('2026-09-18T12:00:00Z'),
+          repo: 'web-everything/web-everything', dryRun: true, now: Date.parse('2026-09-18T12:00:00Z'),
           listAgents: () => [], readAgents: () => [], enrich: (agents) => agents,
           listLabelEvents: () => [{ createdAt: '2026-09-15T12:00:00Z', labelName: 'review:pending' }],
         };
@@ -71,7 +71,7 @@ export function prFileContract({ name, load, reader, run, fields, reconcile = fa
       const savedExitCode = process.exitCode;
       try {
         process.argv = [process.execPath, resolve(`scripts/conveyor/${name}.mjs`),
-          ...(reconcile ? ['--json'] : ['sweep', '--dry-run']), '--repo=chalbert/web-everything', ...args];
+          ...(reconcile ? ['--json'] : ['sweep', '--dry-run']), '--repo=web-everything/web-everything', ...args];
         await load(); // Executes the actual IS_CLI block, including flag parsing.
         expect(process.exitCode).toBe(savedExitCode);
         const output = reconcile ? stdout.mock.calls.map(([s]) => s).join('')
@@ -103,7 +103,7 @@ export function prFileContract({ name, load, reader, run, fields, reconcile = fa
         }
         expect(standalone.result).toEqual(fromFile.result);
         expect(standalone.throttled).toEqual([['gh',
-          ['pr', 'list', '--state', 'open', '--limit', '200', '--json', fields, '--repo', 'chalbert/web-everything'], expect.any(Object)]]);
+          ['pr', 'list', '--state', 'open', '--limit', '200', '--json', fields, '--repo', 'web-everything/web-everything'], expect.any(Object)]]);
       });
     });
   });

@@ -2677,7 +2677,7 @@ describe('review-parked-prs.mjs — required-check read goes through the shared 
     expect(decl.verdictFrom).toBe('assess');
 
     const finding = shapeReadFinding({
-      repo: 'chalbert/web-everything',
+      repo: 'web-everything/web-everything',
       prs: [{
         number: 1,
         headSha: 'a'.repeat(40),

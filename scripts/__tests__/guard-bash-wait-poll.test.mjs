@@ -14,12 +14,12 @@ const T = '/private/tmp/claude-501/-Users-x-workspace-webeverything/b2b9df0b/tas
 // Real PR/CI polls (lane-worker subagents).
 const PR_POLLS = [
   `for i in $(seq 1 40); do\n  state=$(gh pr view 2583 --json state,mergedAt,mergeCommit -q '.state + "|" + (.mergedAt // "null")' 2>&1)\n  echo "[$i] $state"\n  if echo "$state" | grep -q '^MERGED'; then echo "MERGED"; break; fi\n  sleep 15\ndone`,
-  `for i in $(seq 1 90); do\n  info=$(gh pr view 2593 --repo chalbert/web-everything --json state,labels,mergedAt 2>/dev/null)\n  state=$(echo "$info" | python3 -c "import json,sys; print(json.load(sys.stdin)['state'])")\n  [ "$state" = MERGED ] && break\n  sleep 10\ndone`,
-  `until gh pr checks 2610 --repo chalbert/web-everything | grep -qv pending; do sleep 30; done`,
+  `for i in $(seq 1 90); do\n  info=$(gh pr view 2593 --repo web-everything/web-everything --json state,labels,mergedAt 2>/dev/null)\n  state=$(echo "$info" | python3 -c "import json,sys; print(json.load(sys.stdin)['state'])")\n  [ "$state" = MERGED ] && break\n  sleep 10\ndone`,
+  `until gh pr checks 2610 --repo web-everything/web-everything | grep -qv pending; do sleep 30; done`,
   `while true; do s=$(gh pr view 2641 --json statusCheckRollup -q '.statusCheckRollup[].conclusion'); echo "$s" | grep -q SUCCESS && break; sleep 20; done`,
-  `for i in 1 2 3 4 5; do gh api repos/chalbert/web-everything/commits/b798c7490/check-runs --jq '.check_runs[].status'; sleep 60; done`,
+  `for i in 1 2 3 4 5; do gh api repos/web-everything/web-everything/commits/b798c7490/check-runs --jq '.check_runs[].status'; sleep 60; done`,
   `while gh run list --branch lane/x --json status -q '.[0].status' | grep -q in_progress; do sleep 20; done`,
-  `gh pr checks 2610 --repo chalbert/web-everything --watch 2>&1 | tail -40`,
+  `gh pr checks 2610 --repo web-everything/web-everything --watch 2>&1 | tail -40`,
   `gh run watch 123456`,
 ];
 
@@ -35,7 +35,7 @@ const TASK_POLLS = [
 // Must keep passing in EVERY session kind.
 const ALLOWED = [
   'gh pr view 2583 --json state,labels,mergedAt',
-  'gh pr checks 2610 --repo chalbert/web-everything',
+  'gh pr checks 2610 --repo web-everything/web-everything',
   'gh pr view 12 --json statusCheckRollup',
   `cat ${T}/bnu77l1c4.output`,
   'until curl -sf http://localhost:4000/ >/dev/null; do sleep 1; done',

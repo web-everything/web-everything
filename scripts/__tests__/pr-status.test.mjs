@@ -117,7 +117,7 @@ describe('reviewRoundsFromLedger — rounds are read from the ledger, never coun
 // ── RULE 2 — the OTHER append-only ledger, the one today's open PRs actually live in ─────────────────────────
 
 /** Verdict-ledger rows as `verdict-ledger.mjs` writes them (only the fields this module reads). */
-const row = (pr, verdict) => ({ v: 1, kind: 'we.review-verdict', pr, verdict, repo: 'chalbert/web-everything' });
+const row = (pr, verdict) => ({ v: 1, kind: 'we.review-verdict', pr, verdict, repo: 'web-everything/web-everything' });
 
 describe('reviewRoundsFromVerdictLedger — one qualifying row is one round', () => {
   it('counts only rows for THIS pr', () => {

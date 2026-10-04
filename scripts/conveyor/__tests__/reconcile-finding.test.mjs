@@ -63,7 +63,7 @@ describe('runReconcileFindingCli — the real incident, PR #1920 (2026-09-05)', 
     return {
       calls,
       name: 'stub',
-      currentRepo: () => 'chalbert/web-everything',
+      currentRepo: () => 'web-everything/web-everything',
       readPrState: () => {
         calls.push(['readPrState']);
         return { labels: live.map((name) => ({ name })), headRefOid: 'a'.repeat(40), headRefName: 'lane/2412c-engine-tier-redteam-gate', state: 'OPEN', body: '' };
@@ -103,7 +103,7 @@ describe('runReconcileFindingCli — the real incident, PR #1920 (2026-09-05)', 
   it('posts the finding + applies review:changes on a clean, review:pending PR (the happy path)', () => {
     const provider = stubProvider({ labels: ['review:pending'] });
     const { exitCode, payload } = run({
-      argv: ['1920', '--repo=chalbert/web-everything', '--body-file=/tmp/finding.md', '--agent=the #1920 rebase agent'],
+      argv: ['1920', '--repo=web-everything/web-everything', '--body-file=/tmp/finding.md', '--agent=the #1920 rebase agent'],
       readFile: fakeReadFile(FINDING_TEXT),
       provider,
       locateBodyFile: okLocate,
@@ -126,7 +126,7 @@ describe('runReconcileFindingCli — the real incident, PR #1920 (2026-09-05)', 
   it('NEVER reaches review:accepted or clear-human — fixedTo pins the target regardless of --to on argv', () => {
     const provider = stubProvider({ labels: ['review:pending'] });
     const { payload } = run({
-      argv: ['1920', '--repo=chalbert/web-everything', '--body-file=/tmp/finding.md', '--to=accepted'],
+      argv: ['1920', '--repo=web-everything/web-everything', '--body-file=/tmp/finding.md', '--to=accepted'],
       readFile: fakeReadFile(FINDING_TEXT),
       provider,
       locateBodyFile: okLocate,
@@ -138,7 +138,7 @@ describe('runReconcileFindingCli — the real incident, PR #1920 (2026-09-05)', 
   it('keeps review:human in place — a bounce never clears the gate-self hold', () => {
     const provider = stubProvider({ labels: ['review:human'] });
     const { payload } = run({
-      argv: ['1920', '--repo=chalbert/web-everything', '--body-file=/tmp/finding.md'],
+      argv: ['1920', '--repo=web-everything/web-everything', '--body-file=/tmp/finding.md'],
       readFile: fakeReadFile(FINDING_TEXT),
       provider,
       locateBodyFile: okLocate,
@@ -151,7 +151,7 @@ describe('runReconcileFindingCli — the real incident, PR #1920 (2026-09-05)', 
   it('strips a stale review:accepted / ready-to-merge — a re-raised finding must not look landable', () => {
     const provider = stubProvider({ labels: ['review:accepted', 'ready-to-merge'] });
     const { payload } = run({
-      argv: ['1920', '--repo=chalbert/web-everything', '--body-file=/tmp/finding.md'],
+      argv: ['1920', '--repo=web-everything/web-everything', '--body-file=/tmp/finding.md'],
       readFile: fakeReadFile(FINDING_TEXT),
       provider,
       locateBodyFile: okLocate,
@@ -163,7 +163,7 @@ describe('runReconcileFindingCli — the real incident, PR #1920 (2026-09-05)', 
 
   it('refuses with no --body-file — this is always a bounce, never a silent no-op', () => {
     const { exitCode, payload } = run({
-      argv: ['1920', '--repo=chalbert/web-everything'],
+      argv: ['1920', '--repo=web-everything/web-everything'],
       readFile: fakeReadFile(FINDING_TEXT),
       provider: stubProvider(),
       locateBodyFile: okLocate,
@@ -174,7 +174,7 @@ describe('runReconcileFindingCli — the real incident, PR #1920 (2026-09-05)', 
 
   it('refuses the bare `--body-file <path>` space-separated form', () => {
     const { exitCode, payload } = run({
-      argv: ['1920', '--repo=chalbert/web-everything', '--body-file', '/tmp/finding.md'],
+      argv: ['1920', '--repo=web-everything/web-everything', '--body-file', '/tmp/finding.md'],
       readFile: fakeReadFile(FINDING_TEXT),
       provider: stubProvider(),
       locateBodyFile: okLocate,
@@ -186,7 +186,7 @@ describe('runReconcileFindingCli — the real incident, PR #1920 (2026-09-05)', 
   it('refuses a --body-file outside the allowed roots, before any gh call', () => {
     const provider = stubProvider({ labels: ['review:pending'] });
     const { exitCode, payload } = run({
-      argv: ['1920', '--repo=chalbert/web-everything', '--body-file=/etc/passwd'],
+      argv: ['1920', '--repo=web-everything/web-everything', '--body-file=/etc/passwd'],
       readFile: fakeReadFile(FINDING_TEXT),
       provider,
       locateBodyFile: () => ({ ok: false, roots: ['/repo', '/tmp'] }),
@@ -198,7 +198,7 @@ describe('runReconcileFindingCli — the real incident, PR #1920 (2026-09-05)', 
 
   it('refuses an unreadable --body-file', () => {
     const { exitCode, payload } = run({
-      argv: ['1920', '--repo=chalbert/web-everything', '--body-file=/tmp/missing.md'],
+      argv: ['1920', '--repo=web-everything/web-everything', '--body-file=/tmp/missing.md'],
       readFile: fakeReadFile(undefined),
       provider: stubProvider(),
       locateBodyFile: okLocate,
@@ -209,7 +209,7 @@ describe('runReconcileFindingCli — the real incident, PR #1920 (2026-09-05)', 
 
   it('refuses an empty --body-file — no fabricated finding', () => {
     const { exitCode, payload } = run({
-      argv: ['1920', '--repo=chalbert/web-everything', '--body-file=/tmp/finding.md'],
+      argv: ['1920', '--repo=web-everything/web-everything', '--body-file=/tmp/finding.md'],
       readFile: fakeReadFile('   \n  '),
       provider: stubProvider(),
       locateBodyFile: okLocate,
@@ -224,7 +224,7 @@ describe('runReconcileFindingCli — the real incident, PR #1920 (2026-09-05)', 
     // UNKNOWN finding count, which never refuses — see that function's own doc.
     const provider = stubProvider({ labels: ['review:pending'] });
     const { exitCode, payload } = run({
-      argv: ['1920', '--repo=chalbert/web-everything', '--body-file=/tmp/finding.md'],
+      argv: ['1920', '--repo=web-everything/web-everything', '--body-file=/tmp/finding.md'],
       readFile: fakeReadFile('short but real'),
       provider,
       locateBodyFile: okLocate,
@@ -248,7 +248,7 @@ describe('runReconcileFindingCli — the real incident, PR #1920 (2026-09-05)', 
   it('a --channel override renders in the attribution instead of the default', () => {
     const provider = stubProvider({ labels: ['review:pending'] });
     run({
-      argv: ['1920', '--repo=chalbert/web-everything', '--body-file=/tmp/finding.md', '--channel=the drain rebase pass'],
+      argv: ['1920', '--repo=web-everything/web-everything', '--body-file=/tmp/finding.md', '--channel=the drain rebase pass'],
       readFile: fakeReadFile(FINDING_TEXT),
       provider,
       locateBodyFile: okLocate,

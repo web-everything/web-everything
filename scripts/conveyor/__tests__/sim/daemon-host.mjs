@@ -40,7 +40,7 @@ const IN_PROCESS_DAEMONS = Object.freeze({
  *  `skills-src/conveyor/daemon-manifest.mjs`'s own WE entries (`conflict-watch`/`lane-health`), plus
  *  `merge-orphan-sweep`'s bare invocation and `lease-reaper`'s own (never in the manifest — mirrored here
  *  from `skills-src/conveyor/runner.mjs`'s `makeCliMechanicalPasses`, the one place that runs it today). */
-const WE_SLUG = 'chalbert/web-everything';
+const WE_SLUG = 'web-everything/web-everything';
 const PASS_DAEMONS = Object.freeze({
   'conflict-watch': { script: 'scripts/conveyor/parked-pr-conflict-watch.mjs', args: ['sweep', `--repo=${WE_SLUG}`] },
   'lane-health': { script: 'scripts/conveyor/lane-pool-health-watch.mjs', args: [`--repo=${WE_SLUG}`] },

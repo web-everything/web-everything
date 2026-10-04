@@ -1,4 +1,6 @@
-import { mandatoryReferralState } from './lib/jury-core.mjs';
+import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
+import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
+import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
 /**
  * review-set-label.mjs — swap a PR's review label, INVARIANT-2 guarded (#2470, increment 2 of 2). Also the
  * SINGLE HOME of the shared review-label CLI harness (#2644): a PURE `decideSetLabel` decides the swap for a
@@ -157,7 +159,7 @@ import { spawnPreventionLandingJob } from './lib/prevention-landing-job.mjs';
 // already owns end to end); `buildApprovalPreventionFilingInput` builds the `file-item` input from them — a
 // SELF-CONTAINED builder, deliberately not a shared import of `review-loop-policy.mjs`'s own #2749 one (that
 // file's header explains why: a real import cycle back through `operations/review-pr.mjs`, and — the more
-// pressing reason today — chalbert/web-everything#2766 is an open, active PR reshaping that exact function).
+// pressing reason today — web-everything/web-everything#2766 is an open, active PR reshaping that exact function).
 // See `runApprovalPreventionFiling` below for the wiring and why THIS seam, not the drain's land step.
 import {
   selectApprovalPreventionFindings, hasApprovalPreventionMarkerForHead, buildApprovalPreventionMarker,
@@ -235,16 +237,17 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *     a gate re-derive. REFUSED unless a live `review:accepted` is already on the PR: a re-stamp may only carry
  *     an acceptance ACROSS a head move, never manufacture one.
  * @param {{to:('accepted'|'changes'|'rearm'|'clear-human'), currentLabels?:Array, findingCount?:number|null,
- *   reason?:string, requireLive?:(null|'accepted')}} o - `currentLabels` is the observed label array (string or `{name}` shape, per
+ *   reason?:string, requireLive?:(null|'accepted'|'missing')}} o - `currentLabels` is the observed label array (string or `{name}` shape, per
  *   `hasReviewLabel`). `findingCount` and `reason` are the #3334 decision inputs: how many findings the juror
  *   raised (tri-state — `null` is UNKNOWN and never refuses) and the reason the caller stated, if any. They are
  *   ARGUMENTS, never fetched: this function is pure and stays pure. `requireLive` (#4333, `rearm` only) is the
  *   opt-in live-state precondition: `'accepted'` refuses the re-arm unless `review:accepted` is live in
  *   `currentLabels` (the caller's OWN fresh read), so a `review:changes` verdict that landed after a caller's
- *   earlier read is never swapped to pending.
+ *   earlier read is never swapped to pending. `missing` requires a schema-valid empty review family;
+ *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels = [], findingCount = null, reason = '', requireLive = null } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -322,7 +325,7 @@ export function decideSetLabel({ to, currentLabels = [], findingCount = null, re
   // review:accepted, and NEVER removes review:human — the #2630 invariant, enforced HERE so the CLI cannot
   // route around it.
   //
-  // #2811 (chalbert/web-everything PR #2811) — WHY `review:accepted` IS ALSO RE-ARMABLE NOW. A `review:accepted`
+  // #2811 (web-everything/web-everything PR #2811) — WHY `review:accepted` IS ALSO RE-ARMABLE NOW. A `review:accepted`
   // verdict is a claim about a SPECIFIC head; it stops being true the moment a ci-heal or a mechanical rebase
   // moves the head without anyone re-reviewing it. Before this, nothing ever un-accepted a PR whose head moved
   // that way (`ci-heal-mark.mjs`'s own header used to say, correctly for the OTHER cases: "a CI-heal repairs
@@ -341,6 +344,16 @@ export function decideSetLabel({ to, currentLabels = [], findingCount = null, re
   // gap (a stale-accepted PR was never re-planned for review); it is not what was standing between a stale
   // acceptance and a bad merge — that gate already held.
   if (to === 'rearm') {
+    const missing = requireLive === 'missing';
+    if (missing && (!Array.isArray(currentLabels) || !currentLabels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string' && (typeof l === 'string' ? l : l.name).length > 0)
+      || currentLabels.some(l => (typeof l === 'string' ? l : l.name).startsWith('review:')))) {
+      return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: 'missing-only re-arm requires a valid empty review family' };
+    }
+    // A producer-cleared `ready-to-merge` PR is on the merge path by authority this restore never holds: the
+    // re-arm would strip that clearance and push it into an independent-review cycle it was not meant to take.
+    if (missing && currentLabels.some(l => (typeof l === 'string' ? l : l.name) === READY_TO_MERGE_LABEL)) {
+      return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: 'missing-only re-arm preserves the producer ready-to-merge clearance' };
+    }
     const wasChanges = hasReviewLabel(currentLabels, REVIEW_LABELS.changes);
     const wasAccepted = hasReviewLabel(currentLabels, REVIEW_LABELS.accepted);
     if (requireLive === 'accepted' && !wasAccepted) {
@@ -353,7 +366,7 @@ export function decideSetLabel({ to, currentLabels = [], findingCount = null, re
           + '(#4333); nothing was changed',
       };
     }
-    if (!wasChanges && !wasAccepted) {
+    if (!missing && !wasChanges && !wasAccepted) {
       return {
         allowed: false,
         addLabel: '',
@@ -386,8 +399,8 @@ export function decideSetLabel({ to, currentLabels = [], findingCount = null, re
       // `redteam:accepted` the PR still carries from before the fix.
       removeLabels: [REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL],
       keepsHuman: isHuman,
-      rearmFrom: wasChanges ? REVIEW_LABELS.changes : REVIEW_LABELS.accepted,
-      reason: isHuman
+      rearmFrom: missing ? 'missing' : wasChanges ? REVIEW_LABELS.changes : REVIEW_LABELS.accepted,
+      reason: missing ? 'missing review family restored to review:pending; independent review owed' : isHuman
         ? 're-armed — review:human KEPT as the sole hold (gate-self stays human-ceremony-only); review:pending '
           + 'NOT added — the human hold already says an independent review is owed (#x01u7az)'
         : wasAccepted && !wasChanges
@@ -906,7 +919,7 @@ export function runReviewLabelCli({
   // #xan09na — opt-in head-bound carry. Legacy drain callers remain a separate migration.
   const expectHeadFlag = argv.find((a) => a === '--expect-head' || a.startsWith('--expect-head='));
   const expectedHead = expectHeadFlag?.slice('--expect-head='.length).toLowerCase();
-  const guardedRestamp = expectHeadFlag !== undefined || (to === 'restamp' && channelArg === 'ci-heal');
+  const guardedRestamp = (to === 'restamp' && expectHeadFlag !== undefined) || (to === 'restamp' && channelArg === 'ci-heal');
   if (guardedRestamp && (to !== 'restamp' || !/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) {
     fail('guarded restamp requires --expect-head=<full 40-hex SHA> and cannot use --new-head');
   }
@@ -924,9 +937,11 @@ export function runReviewLabelCli({
   if (repo ? !REPO_RE.test(repo) : !repoOptional) {
     fail('invalid --repo — expected <owner/name>');
   }
-  if (onlyIf !== null && onlyIf !== 'accepted') {
-    fail("invalid --only-if — expected 'accepted'");
+  if (onlyIf !== null && !['accepted', 'missing'].includes(onlyIf)) {
+    fail("invalid --only-if — expected 'accepted' or 'missing'");
   }
+  if (expectHeadFlag !== undefined && !guardedRestamp && onlyIf !== 'missing') fail('--expect-head requires guarded restamp or missing re-arm');
+  if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
   if (onlyIf !== null && to !== 'rearm') {
     fail('--only-if is only valid with the rearm target');
   }
@@ -1025,7 +1040,7 @@ export function runReviewLabelCli({
   try {
     const parsed = provider.readPrState(repo, pr);
     if (['accepted', 'restamp', 'clear-human'].includes(to)) assertMandatoryReferralsCleared(parsed, { repo, pr });
-    currentLabels = Array.isArray(parsed.labels) ? parsed.labels : [];
+    currentLabels = onlyIf === 'missing' ? parsed.labels : Array.isArray(parsed.labels) ? parsed.labels : [];
     headSha = typeof parsed.headRefOid === 'string' ? parsed.headRefOid : '';
     // #2979 — the branch name the NET diff is resolved against (see the fingerprint block below). Same gh call,
     // one more json field, no extra hop.
@@ -1047,7 +1062,7 @@ export function runReviewLabelCli({
     fail(ghErr(e, 'gh pr view failed'), 1);
   }
 
-  if (guardedRestamp && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if ((guardedRestamp || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
 
   // #x9krtkb (bug 2) — THE OVERRIDE. `restamp` alone trusts an explicit `--new-head` over the `headRefOid` this
   // process just re-read, because for `restamp` alone that read can be racing the very push that produced the
@@ -1341,13 +1356,21 @@ export function runReviewLabelCli({
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SWAP: add the verdict label, remove the stale ones
   // (argv array, no shell). Intersect the decision's removals with the labels the PR ACTUALLY carries so
   // `gh pr edit --remove-label` is never handed an absent label (which errors).
-  const removals = presentRemoveLabels(decision.removeLabels, currentLabels);
+  let removals = presentRemoveLabels(decision.removeLabels, currentLabels);
   const applySwap = () => {
     try {
       if (['accepted', 'restamp', 'clear-human'].includes(to)) {
         const fresh = provider.readPrState(repo, pr);
         if (fresh.headRefOid !== headSha && !(to === 'restamp' && newHeadArg && !mandatoryReferralState(fresh.comments).records.length)) throw new Error('head changed before acceptance; hold retained');
         assertMandatoryReferralsCleared(fresh, { repo, pr });
+      }
+      if (onlyIf === 'missing') {
+        const fresh = provider.readPrState(repo, pr);
+        if (fresh.state !== 'OPEN' || fresh.isDraft !== false || fresh.headRefOid !== expectedHead
+          || !decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: fresh.labels }).allowed) {
+          throw new Error('missing review handoff refused: state, draft status, head or review family changed before write');
+        }
+        removals = presentRemoveLabels(decision.removeLabels, fresh.labels);
       }
       provider.setLabels(repo, pr, { add: decision.addLabel, remove: removals });
     } catch (e) {
@@ -1510,7 +1533,16 @@ export function runReviewLabelCli({
   // we:scripts/review-set-label.mjs#runReviewLabelCli — re-read the labels so the printed result reflects the
   // true post-swap state (tolerant: fall back to a locally-derived set if the re-read fails).
   let newLabels;
-  try {
+  if (onlyIf === 'missing') {
+    try {
+      const after = provider.readPrState(repo, pr);
+      if (after.state !== 'OPEN' || after.headRefOid !== expectedHead || !Array.isArray(after.labels)
+        || !after.labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string' && (typeof l === 'string' ? l : l.name).length > 0)) throw new Error('invalid post-write state');
+      newLabels = after.labels.map(l => typeof l === 'string' ? l : l.name);
+      if (!newLabels.includes(REVIEW_LABELS.pending) || newLabels.some(l => l.startsWith('review:') && l !== REVIEW_LABELS.pending)
+        || decision.removeLabels.some(l => newLabels.includes(l))) throw new Error('label transition was not observed');
+    } catch (e) { fail(`missing review handoff could not be verified: ${e.message}`, 1); }
+  } else try {
     newLabels = provider.readLabels(repo, pr).map((l) => (typeof l === 'string' ? l : l && l.name)).filter(Boolean);
   } catch {
     const names = (Array.isArray(currentLabels) ? currentLabels : [])
@@ -1952,9 +1984,41 @@ export function referralCardReadable(ref, root = process.cwd()) {
 }
 
 /** Fail closed at every acceptance entry point using the fresh durable PR record. */
-export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable = referralCardReadable } = {}) {
-  const result = mandatoryReferralState(state.comments, { repo, pr, head: state.headRefOid,
-    body: typeof state.body === 'string' ? state.body : '', createdAt: state.createdAt, cardReadable });
+export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable = referralCardReadable,
+  env = process.env, readRuns = readReviewRunEvidence } = {}) {
+  const context = { repo, pr, head: state.headRefOid, body: typeof state.body === 'string' ? state.body : '',
+    createdAt: state.createdAt, cardReadable, seatDisabled: seat => referralSeatDisabled(seat, env) };
+  const result = mandatoryReferralState(state.comments, context);
+  const head = state.headRefOid;
+  const mine = r => r.repo === repo && r.pr === Number(pr) && r.head === head;
+  const current = repo && pr ? result.records.filter(mine) : [];
+  const last = repo && pr ? readRuns().filter(r => r.repo === repo && r.pr === Number(pr) && r.head === head)
+    .sort((a, b) => b.completedAt - a.completedAt)[0] : undefined;
+  // The newest review of this head failed to persist its referrals: only a record written at or after that
+  // review started can speak for it. An earlier record of the same head (or an undated one) proves nothing
+  // about the referrals that were lost, so it must not clear the hold.
+  if (last?.persistenceFailed) {
+    const writtenByIt = (Array.isArray(state.comments) ? state.comments : []).some(c => {
+      // createdAt only: an edit that appends rulings to an earlier record bumps updatedAt, and must not make
+      // that earlier record look like it was written by the failed review.
+      const at = Date.parse(c?.createdAt);
+      return Number.isFinite(at) && at >= last.startedAt
+        && readReferralRecords([c], { head }).records.some(mine);
+    });
+    if (!writtenByIt) {
+      throw new Error(`mandatory referral hold: referral-persistence-failed; no readable referral record for current head ${head} written by its latest review; persist the mandatory review before acceptance`);
+    }
+  }
+  // Old heads' holds are not carried onto a new head — but only because that head's own review took their place.
+  // With no record for this head, that review must be PROVEN complete and clean by a run record; the absence of a
+  // failure marker is not evidence (the run store is local and can be missing, pruned or on another machine).
+  if (!current.length && !(last && !last.persistenceFailed && !last.parked && !last.pending.length)) {
+    const older = result.records.filter(r => r.head !== head && (!repo || !pr || (r.repo === repo && r.pr === Number(pr))));
+    const held = older.flatMap(r => { const s = referralRecordState(r, { ...context, head: r.head }); return [...s.pending, ...s.blocked]; });
+    if (held.length) {
+      throw new Error(`mandatory referral hold: no-current-head-review-evidence; no readable referral record or completed clean review for current head ${head}, and earlier heads still hold ${[...new Set(held)].join(', ')}; review the current head before acceptance`);
+    }
+  }
   if (result.pending.length || result.blocked.length) {
     throw new Error(`mandatory referral hold: ${[...result.pending, ...result.blocked].join(', ')}; record finding-specific mandatory rulings before acceptance`);
   }

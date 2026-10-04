@@ -457,7 +457,7 @@ describe('computeFreeSlots — free (existing, unleased, clean) lanes', () => {
 
 describe('shapeDaemon — plateau daemon status report → the daemon section (or "unavailable")', () => {
   it('distills resident / lastPass / parked from the real report shape', () => {
-    const report = { launchd: { loaded: true }, lastPass: { at: '2026-07-22T14:56:07.141Z', merged: 0 }, parkedNow: [{ num: 104, repo: 'chalbert/plateau-app' }] };
+    const report = { launchd: { loaded: true }, lastPass: { at: '2026-07-22T14:56:07.141Z', merged: 0 }, parkedNow: [{ num: 104, repo: 'plateauapp/plateau-app' }] };
     expect(shapeDaemon(report)).toEqual({ resident: true, lastPass: report.lastPass, parked: report.parkedNow });
   });
   it('a null/absent report → the "unavailable" sentinel (graceful degrade)', () => {
@@ -608,7 +608,7 @@ describe('assembleConveyorState — the whole tick picture', () => {
     poolStatus: { lanes: [poolRow(1, { predictedScope: ['we:scripts/readiness/conveyor-state.mjs'] }), poolRow(2, { leased: false }), poolRow(3, { leased: false }) ] },
     scopePicture: { leases: [picLease(1, { predicted: ['we:scripts/readiness/conveyor-state.mjs'] })] },
     prList: [{ number: 658, state: 'OPEN', headRefName: 'lane/2611-conveyor-state', statusCheckRollup: [{ conclusion: 'SUCCESS' }], labels: [{ name: 'review:human' }] }],
-    daemonReport: { launchd: { loaded: true }, lastPass: { at: '2026-07-22T15:00:00Z', merged: 0 }, history: [{ at: '2026-07-22T14:00:00Z', merged: 1 }], parkedNow: [{ num: 104, repo: 'chalbert/plateau-app' }] },
+    daemonReport: { launchd: { loaded: true }, lastPass: { at: '2026-07-22T15:00:00Z', merged: 0 }, history: [{ at: '2026-07-22T14:00:00Z', merged: 1 }], parkedNow: [{ num: 104, repo: 'plateauapp/plateau-app' }] },
     queuedState: { queued: [{ num: '2611', at: '2026-07-22T14:30:00Z' }] },
     laneItem: { 1: '2611' },
     now,

@@ -1,7 +1,7 @@
 /**
  * @file scripts/conveyor/__tests__/main-red-recovery.test.mjs
  * @description Pins we:backlog/x5uqim1-*.md's pure core against the REAL shapes measured live 2026-09-25 off
- *   `chalbert/web-everything`: `main`'s own `gh run list --branch main` history (one genuine red window,
+ *   `web-everything/web-everything`: `main`'s own `gh run list --branch main` history (one genuine red window,
  *   01:30:55Z–02:31:25Z, closed by PR #2638) and the six PRs whose `test` run's own `attempts/1` completion
  *   timestamp falls inside it — five already manually refreshed onto main by the operator (`ahead_by: 0`,
  *   still red — a genuine own-failure now) and one never refreshed (PR #2635, `ahead_by: 33`) — plus one PR
@@ -23,7 +23,7 @@ import {
   countMissingRunComments, buildMissingRunComment,
 } from '../main-red-recovery.mjs';
 
-// ── fixtures — measured off chalbert/web-everything, 2026-09-25 ────────────────────────────────────────────────
+// ── fixtures — measured off web-everything/web-everything, 2026-09-25 ────────────────────────────────────────────────
 const run = (createdAt, updatedAt, conclusion, status = 'completed') => ({ createdAt, updatedAt, conclusion, status, workflowName: 'CI' });
 
 /** A slice of `main`'s own real run history: one closed red window (the live incident), bracketed by green. */
@@ -473,7 +473,7 @@ const runningCheck = (name, startedAt, detailsUrl) => ({
 const doneCheck = (name, startedAt, completedAt, detailsUrl) => ({
   __typename: 'CheckRun', name, workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt, completedAt, detailsUrl,
 });
-const RUN_URL = (job) => `https://github.com/chalbert/web-everything/actions/runs/36161558017/job/${job}`;
+const RUN_URL = (job) => `https://github.com/web-everything/web-everything/actions/runs/36161558017/job/${job}`;
 
 const PR_2636_HUNG = {
   number: 2636,
@@ -641,7 +641,7 @@ describe('main-red-recovery — planHungCiRecoveries', () => {
 });
 
 // ── MISSING-CI-RUN RECOVERY (xi4od2p, #4075/#3383) ──────────────────────────────────────────────────────────
-// Fixture is PR chalbert/web-everything#2729's REAL, live-measured state, 2026-09-26: `gh pr view 2729 --json
+// Fixture is PR web-everything/web-everything#2729's REAL, live-measured state, 2026-09-26: `gh pr view 2729 --json
 // statusCheckRollup` carries ONLY three `review-gate` CheckRun entries (all `SUCCESS`) — zero entries for
 // `test`/`smoke`/`daemon-soak`, its repo's real required contexts (`gh api repos/.../branches/main/protection
 // --jq '.required_status_checks.contexts'` → `["test","smoke","daemon-soak"]`). Its head
@@ -701,7 +701,7 @@ describe('main-red-recovery — buildMissingRunCandidates / isMissingRunOverdue 
     expect(buildMissingRunCandidates([PR_2729], { requiredContexts: null })).toEqual([expect.objectContaining({ prNumber: 2729 })]);
   });
 
-  // Live incident, chalbert/web-everything#2793 (landing freeze, 2026-09-27): real `gh pr view` shape —
+  // Live incident, web-everything/web-everything#2793 (landing freeze, 2026-09-27): real `gh pr view` shape —
   // `mergeable: CONFLICTING`, `mergeStateStatus: DIRTY`, empty `statusCheckRollup` (GitHub creates no merge ref
   // for a conflicting PR, so no `pull_request`-triggered check can ever start). Before the fix this read as an
   // ordinary missing-run candidate and got retriggered every sweep until the cap burned — a permanent

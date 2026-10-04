@@ -35,7 +35,7 @@ describe('the fs shell', () => {
     expect(JSON.parse(readFileSync(join(dir, 'review-701.json'), 'utf8'))).toEqual(sample());
   });
 
-  // #4314 (prevention guard owed by chalbert/web-everything#2831's independent review, finding 4: "a lint rule
+  // #4314 (prevention guard owed by web-everything/web-everything#2831's independent review, finding 4: "a lint rule
   // enforcing `finally` cleanup blocks for temp file handles, or a property-based test that asserts directory
   // size remains constant after simulated concurrent accesses"). writeCompletion's temp-file-then-rename write
   // had no cleanup on a failed rename: a real (not mocked) EISDIR — renaming the temp file onto a path that is

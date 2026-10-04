@@ -16,18 +16,36 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { acquireRunnerLease, makeOwner, heartbeatRunnerLease, RUNNER_LEASE_MINUTES } from '../../skills-src/conveyor/runner-lock.mjs';
+import { VERIFY_DAEMON_LEASE_KEY } from '../../skills-src/conveyor/verify-daemon.mjs';
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
 
 const VERIFY_LANE = resolve(process.cwd(), 'scripts/verify-lane.mjs');
 const OTHER_SHA = 'b'.repeat(40); // "Y" — the sha the overlapping run's marker belongs to (never this HEAD)
 
+function seedVerifyServer(root, options = {}) {
+  const result = acquireRunnerLease(root, makeOwner('verify-test'), { key: VERIFY_DAEMON_LEASE_KEY, ...options });
+  expect(result.ok).toBe(true);
+}
+
 let dir;
+let lockRoot;
+let previousLockRoot;
 beforeEach(() => {
+  previousLockRoot = process.env.CONVEYOR_RUNNER_LOCK_ROOT;
+  lockRoot = mkdtempSync(join(tmpdir(), 'verify-server-'));
+  seedVerifyServer(lockRoot);
+  process.env.CONVEYOR_RUNNER_LOCK_ROOT = lockRoot;
   dir = mkdtempSync(join(tmpdir(), 'verify-lane-race-'));
   execFileSync('git', ['init', '-q'], { cwd: dir });
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-qm', 'x'], { cwd: dir });
 });
-afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => {
+  if (previousLockRoot === undefined) delete process.env.CONVEYOR_RUNNER_LOCK_ROOT;
+  else process.env.CONVEYOR_RUNNER_LOCK_ROOT = previousLockRoot;
+  rmSync(lockRoot, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true });
+});
 
 const marker = () => join(dir, '.git', '.lane-verify');
 const headSha = () => execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
@@ -1090,5 +1108,53 @@ process.exit(${standardsExit});
     expect(f.calls()).toHaveLength(count);
     if (count === 1) expect(result.json.retriedTimeouts).toBeUndefined();
     else expect(result.json.retriedTimeouts).toEqual(f.files);
+  });
+});
+
+
+describe('verify-lane request refuses fast when no verify daemon is alive (#4161)', () => {
+  function request() {
+    const result = spawnSync(process.execPath, [VERIFY_LANE, 'request', '--gate=true', '--json'], {
+      cwd: dir, encoding: 'utf8', timeout: 2000,
+    });
+    expect(result.error).toBeUndefined();
+    return { code: result.status, json: JSON.parse(result.stdout.trim()) };
+  }
+  function expectRefusal(reason) {
+    const { code, json } = request();
+    expect(code).toBe(3);
+    expect(json).toMatchObject({ status: 'no-server', reason: 'verify-daemon-not-alive', ok: false, sha: headSha() });
+    expect(json.detail).toContain(reason);
+    expect(json.detail).toContain(VERIFY_DAEMON_LEASE_KEY);
+    expect(json.detail).toContain('launchctl kickstart');
+    expect(json.detail).toContain('no marker was written');
+    expect(existsSync(marker())).toBe(false);
+  }
+  it('request with no verify-daemon lease exits 3 and writes no marker', () => {
+    rmSync(lockRoot, { recursive: true, force: true });
+    expectRefusal('no-lease');
+  });
+  it('request with a stale verify-daemon lease is refused the same way', () => {
+    const nowMs = Date.now() - (RUNNER_LEASE_MINUTES + 1) * 60_000;
+    heartbeatRunnerLease(lockRoot, makeOwner('verify-test'), { key: VERIFY_DAEMON_LEASE_KEY, nowMs });
+    expectRefusal('stale-lease');
+  });
+  it('request with a fresh lease whose same-host holder exited is refused', () => {
+    rmSync(lockRoot, { recursive: true, force: true });
+    const child = spawnSync(process.execPath, ['-e', ''], { encoding: 'utf8' });
+    seedVerifyServer(lockRoot, { pid: child.pid });
+    expectRefusal('holder-dead');
+  });
+  it('request on an unchanged tree with a cached green still returns cached with no daemon alive', () => {
+    execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
+    expect(runVerify('true').json.status).toBe('green');
+    const before = readFileSync(marker(), 'utf8');
+    rmSync(lockRoot, { recursive: true, force: true });
+    expect(request()).toMatchObject({ code: 0, json: { status: 'cached' } });
+    expect(readFileSync(marker(), 'utf8')).toBe(before);
+  });
+  it('request with a live verify-daemon lease still stamps running', () => {
+    expect(request()).toMatchObject({ code: 0, json: { status: 'requested' } });
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).status).toBe('running');
   });
 });

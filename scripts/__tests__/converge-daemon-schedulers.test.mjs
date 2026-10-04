@@ -16,7 +16,7 @@ const cfg = {
   juryDir: '/home/n/workspace/webeverything/.conveyor/jury',
   stdoutPath: '/home/n/.we-converge/daemon.log',
   intervalSec: 900,
-  repo: 'chalbert/web-everything',
+  repo: 'web-everything/web-everything',
 };
 
 describe('systemdUnitNames', () => {

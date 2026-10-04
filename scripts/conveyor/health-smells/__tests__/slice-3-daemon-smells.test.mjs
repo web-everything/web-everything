@@ -94,16 +94,16 @@ describe('self-sync-conflict', () => {
 
 // ── live-process-stale-transcript ─────────────────────────────────────────────────────────────────────────────
 
-const WE = 'chalbert/web-everything';
+const WE = 'web-everything/web-everything';
 const refused = (pr, n = 1, repo = WE) => Array.from({ length: n }, () => `reconcile-fix-dispatch-daemon: reconcile-refused live-process ${repo} PR #${pr} — a bound session has a LIVE pid — something is already working this PR, however stale its transcript looks`);
 const binding = (pr, idleMin, extra = {}) => ({ pr, repo: WE, name: `review-${pr}`, source: 'review-job', pid: 4242, lastActivityAgeMs: idleMin == null ? null : idleMin * MINUTE, reason: null, ...extra });
 
 describe('liveProcessRefusals', () => {
   it('collects distinct repo/PR pairs with their counts, ignoring every other refusal kind', () => {
-    const text = [...refused(2911, 3), ...refused(12, 1, 'chalbert/frontierui'), 'reconcile-fix-dispatch-daemon: reconcile-refused nothing-owed chalbert/web-everything PR #5 — x'].join('\n');
+    const text = [...refused(2911, 3), ...refused(12, 1, 'frontier-ui/frontierui'), 'reconcile-fix-dispatch-daemon: reconcile-refused nothing-owed web-everything/web-everything PR #5 — x'].join('\n');
     expect(liveProcessRefusals([{ name: 'fix-dispatch-daemon', text }])).toEqual([
       { repo: WE, pr: 2911, count: 3 },
-      { repo: 'chalbert/frontierui', pr: 12, count: 1 },
+      { repo: 'frontier-ui/frontierui', pr: 12, count: 1 },
     ]);
   });
 });
@@ -137,7 +137,7 @@ describe('live-process-stale-transcript', () => {
   });
 
   it('a binding from another repo never matches (same PR number, different repo)', () => {
-    const other = binding(2911, 300, { repo: 'chalbert/frontierui' });
+    const other = binding(2911, 300, { repo: 'frontier-ui/frontierui' });
     const r = liveStale.evaluate({ daemonLogs: [log('d', ...refused(2911))], liveBindings: [other] }, { now: NOW });
     expect(r[0].measure.bindings).toBe(0);
   });

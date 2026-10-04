@@ -1,5 +1,5 @@
 /**
- * @file Local simulation: replay a REAL PR's event sequence (chalbert/web-everything#2708, rebuilt from its REST
+ * @file Local simulation: replay a REAL PR's event sequence (web-everything/web-everything#2708, rebuilt from its REST
  * timeline — see the fixture's `source`) through the receiver as signed webhook deliveries, then read it back
  * through the daemon client (`we:scripts/lib/pr-events.mjs`) wired to the same handler. Proves the end-to-end
  * contract: signed → stored in order → cursor-read → the right daemon wakes / the drain is nudged.
@@ -78,7 +78,7 @@ describe('replay of PR #2708 (real event sequence)', () => {
     const h = harness();
     const nudges = [];
     const waker = createEventWaker({
-      role: 'review', repos: ['chalbert/web-everything'], url: 'https://we-pr-events.test', token: ENV.PR_EVENTS_READ_TOKEN,
+      role: 'review', repos: ['web-everything/web-everything'], url: 'https://we-pr-events.test', token: ENV.PR_EVENTS_READ_TOKEN,
       poll: (c, o) => pollEvents(c, { ...o, fetchImpl: h.fetchImpl }), now: h.now, writeStatus: null,
       forward: [{ role: 'drain', send: (evs) => { nudges.push(evs.map((e) => `${e.type}.${e.action}${e.label ? `:${e.label}` : ''}`)); } }],
       rawSleep: async (ms) => { h.setClock(h.now() + ms); }, minWakeGapMs: 0, log: { error: () => {} },
@@ -87,7 +87,7 @@ describe('replay of PR #2708 (real event sequence)', () => {
     await h.deliver(FIX.deliveries[0]); // opened
     const woke = await waker.sleep(120_000);
     expect(woke).toMatchObject({ woke: true });
-    expect(woke.reason).toMatch(/chalbert\/web-everything#2708 pull_request\.opened/);
+    expect(woke.reason).toMatch(/web-everything\/web-everything#2708 pull_request\.opened/);
     for (const d of FIX.deliveries.slice(1)) await h.deliver(d);
     await waker.pollOnce();
     const flat = nudges.flat();

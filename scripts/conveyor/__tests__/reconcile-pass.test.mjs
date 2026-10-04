@@ -32,7 +32,7 @@ it('normalises a bare repo KEY (e.g. --repo=we) to its gh owner/name slug before
     repo: 'we', readPrs, enrichMainRed,
     readAgents: () => [], enrich: (agents) => agents,
   });
-  expect(readPrs).toHaveBeenCalledWith({ repo: 'chalbert/web-everything' });
+  expect(readPrs).toHaveBeenCalledWith({ repo: 'web-everything/web-everything' });
   // #4501 — `enrichMainRed` now also receives the live-fetched `requiredChecks` (here degraded to the
   // FALLBACK_REQUIRED_STATUS_CHECKS default, since `execFileSync` is mocked with no real `gh` behind it) —
   // this test's own concern (repo-key normalisation) is unaffected.
@@ -40,7 +40,7 @@ it('normalises a bare repo KEY (e.g. --repo=we) to its gh owner/name slug before
   // real branch-protection list (e.g. with `soak-replay-gate`) the list is a SUPERSET of the fallback — assert the
   // fallback checks are present rather than pinning the exact host-dependent list.
   expect(enrichMainRed).toHaveBeenCalledWith([], {
-    repo: 'chalbert/web-everything', defaultBranch: 'main',
+    repo: 'web-everything/web-everything', defaultBranch: 'main',
     requiredChecks: expect.arrayContaining(['test', 'smoke', 'daemon-soak']),
   });
 });
@@ -60,14 +60,14 @@ it('fetches the required set once per pass and threads it into planReconcile (ne
   ];
   const readRequiredChecks = vi.fn(() => ({ checks: ['test', 'smoke', 'daemon-soak'], source: 'live' }));
   const plan = runReconcilePass({
-    repo: 'chalbert/web-everything',
+    repo: 'web-everything/web-everything',
     readPrs: () => [{
       number: 2748, headRefName: 'lane/x', labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }],
       mergeStateStatus: 'CLEAN', statusCheckRollup: rollup, comments: [],
     }],
     readAgents: () => [], enrich: (agents) => agents, readRequiredChecks,
   });
-  expect(readRequiredChecks).toHaveBeenCalledWith({ repo: 'chalbert/web-everything', branch: 'main' });
+  expect(readRequiredChecks).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', branch: 'main' });
   expect(plan.dispatch).toEqual([]);
   expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'nothing-owed', phase: 'queued', prNumber: 2748 })]);
 });
@@ -80,7 +80,7 @@ it('maps repo slugs before binding and refuses unknown repos before IO', async (
     readPrs: () => [{ statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 49, headRefName: 'lane/1-x', headRefOid: 'a'.repeat(40), labels: [{ name: 'review:pending' }], comments: [] }],
     readAgents: () => [{ name: 'review-fui-49', pidAlive: true, pid: 1 }], enrich: (agents) => agents,
   };
-  expect(runReconcilePass({ ...options, repo: 'chalbert/frontierui' }).refusals.some((r) => r.kind === 'live-process')).toBe(true);
+  expect(runReconcilePass({ ...options, repo: 'frontier-ui/frontierui' }).refusals.some((r) => r.kind === 'live-process')).toBe(true);
   expect(runReconcilePass(options).dispatch).toHaveLength(1);
   expect(() => runReconcilePass({ repo: 'other/repo', readPrs: () => { throw new Error('must not read'); } })).toThrow(/not a constellation repo/);
 });
@@ -182,7 +182,7 @@ it('enrichPrsWithMainRedFacts reads main\'s run list once, and attaches the gree
 it('enrichPrsWithMainRedFacts also enriches a PR red only on soak-replay-gate, when requiredChecks names it (#4501)', async () => {
   const { enrichPrsWithMainRedFacts } = await import('../reconcile-pass.mjs');
   const readMainRuns = () => [];
-  // Real shape, chalbert/web-everything PR #2939, CI run 36599015675: soak-replay-gate FAILURE while
+  // Real shape, web-everything/web-everything PR #2939, CI run 36599015675: soak-replay-gate FAILURE while
   // test/smoke/daemon-soak were all SUCCESS.
   const soakGateRed = {
     number: 2939, headRefOid: 'deadbeef', statusCheckRollup: [
@@ -247,12 +247,12 @@ it('enrichPrsWithMainRedFacts skips the green-fix read when the check is not gre
 
 it('defaultReadMainGreenFixFacts: contains-green short-circuits; otherwise reads the merge base\'s check-runs; any failure is null', async () => {
   const { defaultReadMainGreenFixFacts } = await import('../reconcile-pass.mjs');
-  const o = { repo: 'chalbert/web-everything', greenSha: 'green-sha', checkName: 'daemon-soak' };
+  const o = { repo: 'web-everything/web-everything', greenSha: 'green-sha', checkName: 'daemon-soak' };
 
   const containsExec = vi.fn(() => JSON.stringify({ behind_by: 0, merge_base: 'green-sha' }));
   expect(defaultReadMainGreenFixFacts('pr-head', { ...o, exec: containsExec })).toEqual({ prContainsMainGreenSha: true, mergeBaseCheckRuns: null, mergeBaseRunConclusion: null });
   expect(containsExec).toHaveBeenCalledTimes(1);
-  expect(containsExec.mock.calls[0][1]).toEqual(expect.arrayContaining(['repos/chalbert/web-everything/compare/green-sha...pr-head']));
+  expect(containsExec.mock.calls[0][1]).toEqual(expect.arrayContaining(['repos/web-everything/web-everything/compare/green-sha...pr-head']));
 
   const baseRuns = [{ name: 'daemon-soak', conclusion: 'success', status: 'completed', completed_at: 'x' }];
   const behindExec = vi.fn()
@@ -262,7 +262,7 @@ it('defaultReadMainGreenFixFacts: contains-green short-circuits; otherwise reads
   expect(defaultReadMainGreenFixFacts('pr-head', { ...o, exec: behindExec })).toEqual({ prContainsMainGreenSha: false, mergeBaseCheckRuns: baseRuns, mergeBaseRunConclusion: null });
   expect(behindExec).toHaveBeenCalledTimes(2);
   expect(behindExec.mock.calls[1][1]).toEqual([
-    'api', 'repos/chalbert/web-everything/commits/base-sha/check-runs?check_name=daemon-soak&per_page=100', '--jq', '.check_runs',
+    'api', 'repos/web-everything/web-everything/commits/base-sha/check-runs?check_name=daemon-soak&per_page=100', '--jq', '.check_runs',
   ]);
 
   // No result at the base (PR #2748's shape) → reads the base's own CI push run; newest COMPLETED `CI` wins.
@@ -276,7 +276,7 @@ it('defaultReadMainGreenFixFacts: contains-green short-circuits; otherwise reads
       { name: 'release-please', status: 'completed', conclusion: 'failure', updated_at: '2026-09-26T04:00:00Z' },
     ]));
   expect(defaultReadMainGreenFixFacts('pr-head', { ...o, exec: skippedExec }).mergeBaseRunConclusion).toBe('success');
-  expect(skippedExec.mock.calls[2][1][3]).toBe('repos/chalbert/web-everything/actions/runs?head_sha=base-sha&event=push&per_page=100');
+  expect(skippedExec.mock.calls[2][1][3]).toBe('repos/web-everything/web-everything/actions/runs?head_sha=base-sha&event=push&per_page=100');
 
   const none = { prContainsMainGreenSha: null, mergeBaseCheckRuns: null, mergeBaseRunConclusion: null };
   const throwingExec = vi.fn(() => { throw new Error('gh: not found'); });
@@ -299,15 +299,15 @@ it('defaultReadMainLatestCheckRuns reads main\'s latest completed run\'s own che
     { status: 'completed', updatedAt: '2026-09-27T04:00:00Z', headSha: 'main-tip-sha', workflowName: 'CI' },
   ]);
   const exec = vi.fn(() => JSON.stringify([{ name: 'daemon-soak', conclusion: 'success', status: 'completed', completed_at: '2026-09-27T03:56:55Z' }]));
-  const out = defaultReadMainLatestCheckRuns({ exec, repo: 'chalbert/web-everything', readMainRuns });
+  const out = defaultReadMainLatestCheckRuns({ exec, repo: 'web-everything/web-everything', readMainRuns });
   expect(out).toEqual([{ name: 'daemon-soak', conclusion: 'success', status: 'completed', completed_at: '2026-09-27T03:56:55Z' }]);
   expect(exec).toHaveBeenCalledWith('gh', [
     // PR #2793 review — `per_page=100`: the default page of 30 can push the failing check off page one.
-    'api', 'repos/chalbert/web-everything/commits/main-tip-sha/check-runs?per_page=100', '--jq', '.check_runs',
+    'api', 'repos/web-everything/web-everything/commits/main-tip-sha/check-runs?per_page=100', '--jq', '.check_runs',
   ], expect.any(Object));
 
   const throwingExec = vi.fn(() => { throw new Error('gh: not found'); });
-  expect(defaultReadMainLatestCheckRuns({ exec: throwingExec, repo: 'chalbert/web-everything', readMainRuns })).toEqual([]);
+  expect(defaultReadMainLatestCheckRuns({ exec: throwingExec, repo: 'web-everything/web-everything', readMainRuns })).toEqual([]);
 });
 
 it('defaultReadMainRuns filters to the CI workflow and passes the exact pinned argv', async () => {
@@ -328,17 +328,17 @@ it('defaultReadAheadBy reads ahead_by off the real compare-endpoint shape, and d
   const { execFileSync } = await import('node:child_process');
   execFileSync.mockReturnValueOnce('33\n');
   const { defaultReadAheadBy } = await import('../reconcile-pass.mjs');
-  expect(defaultReadAheadBy('ab9985630d90019a07b94e946bc75f8de7a6161f', { repo: 'chalbert/web-everything' })).toBe(33);
+  expect(defaultReadAheadBy('ab9985630d90019a07b94e946bc75f8de7a6161f', { repo: 'web-everything/web-everything' })).toBe(33);
   expect(execFileSync).toHaveBeenCalledWith('gh', [
     'api', '--method', 'GET',
-    'repos/chalbert/web-everything/compare/ab9985630d90019a07b94e946bc75f8de7a6161f...main', '--jq', '.ahead_by',
+    'repos/web-everything/web-everything/compare/ab9985630d90019a07b94e946bc75f8de7a6161f...main', '--jq', '.ahead_by',
   ], expect.any(Object));
 
   execFileSync.mockImplementationOnce(() => { throw new Error('gh: not found'); });
   expect(defaultReadAheadBy('deadbeef', {})).toBeNull();
 });
 
-// live incident, chalbert/web-everything PR #2752 (#4034/#2748) — see `we:scripts/lib/already-landed-content.mjs`'s
+// live incident, web-everything/web-everything PR #2752 (#4034/#2748) — see `we:scripts/lib/already-landed-content.mjs`'s
 // own header for the incident. These pin the IO shell that computes `alreadyLandedInMain` off per-file blob
 // identity against `main`'s own history, injected so the whole path is exercisable with no real git/gh.
 const HEAD_2752 = '253d75c2b82988be773903cba4e5ed172be57fb8';
@@ -781,9 +781,9 @@ it('defaultReadPullsForCommit reads the PR numbers GitHub associates with a comm
   const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
   execFileSyncThrottled.mockReturnValueOnce('2759\n');
   const { defaultReadPullsForCommit } = await import('../reconcile-pass.mjs');
-  expect(defaultReadPullsForCommit('22faaaa9', { repo: 'chalbert/web-everything' })).toEqual([2759]);
+  expect(defaultReadPullsForCommit('22faaaa9', { repo: 'web-everything/web-everything' })).toEqual([2759]);
   expect(execFileSyncThrottled).toHaveBeenCalledWith('gh', [
-    'api', 'repos/chalbert/web-everything/commits/22faaaa9/pulls', '--jq', '.[].number',
+    'api', 'repos/web-everything/web-everything/commits/22faaaa9/pulls', '--jq', '.[].number',
   ], expect.any(Object));
 
   execFileSyncThrottled.mockImplementationOnce(() => { throw new Error('404'); });
@@ -802,7 +802,7 @@ it('skips a deferred snapshot without enriching or planning from empty PR eviden
 
 describe('xng7q1p conservative timeout evidence', () => {
   const head = 'a'.repeat(40);
-  const repo = 'chalbert/web-everything';
+  const repo = 'web-everything/web-everything';
   const log = (path = 'unit.test.mjs', name = 'suite > times out') =>
     ` FAIL ${path} > ${name}\nError: Test timed out in 5000ms.\n Test Files 1 failed | 1 passed\n Tests 1 failed | 2 passed\n Duration 10.0s\n`;
   const fixture = () => ({ repo, pr: 3415, head, sourceHead: head, diffComplete: true, checksComplete: true,
@@ -897,7 +897,7 @@ import { classifyTimeoutEvidence, parseTimeoutFailures, enrichPrsWithTimeoutEvid
 import { planReconcile as timeoutPlanReconcile } from '../reconcile-core.mjs';
 
 it('xng7q1p immutable GitHub reads feed enrichment → planner without checkout-derived scope', () => {
-  const head = 'a'.repeat(40), repo = 'chalbert/web-everything';
+  const head = 'a'.repeat(40), repo = 'web-everything/web-everything';
   const prefix = `repos/${repo}`;
   const log = ' FAIL unit.test.mjs > suite > timeout\nError: Test timed out in 5000ms.\n Test Files 1 failed\n Tests 1 failed\n Duration 5.2s\n';
   const sources = { 'vitest.config.ts': 'export default {test:{}};', 'unit.test.mjs': 'import {it} from "vitest";' };
@@ -947,7 +947,7 @@ it('xxh4zw8 hydrates the crowded snapshot before planning same-tick recovery', a
   const plan = runReconcilePass({ ...xxOptions(), readChecks });
   expect(plan.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
   expect(readChecks).toHaveBeenCalledTimes(1);
-  expect(readChecks).toHaveBeenCalledWith({ repo: 'chalbert/web-everything', sha: XX_HEAD });
+  expect(readChecks).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', sha: XX_HEAD });
 });
 
 it('xxh4zw8 hydrates shared-file input and preserves attribution timestamps and numeric rerun IDs', async () => {
@@ -973,7 +973,7 @@ it('xxh4zw8 hydrates shared-file input and preserves attribution timestamps and 
       } });
     expect(plan.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
     expect(exec.mock.calls[0][1]).toContain('--paginate');
-    expect(exec.mock.calls[0][1]).toContain(`repos/chalbert/web-everything/commits/${XX_HEAD}/check-runs`);
+    expect(exec.mock.calls[0][1]).toContain(`repos/web-everything/web-everything/commits/${XX_HEAD}/check-runs`);
     expect(exec.mock.calls[0][1].at(-1)).toContain('completed_at');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -994,7 +994,7 @@ it('xxh4zw8 the 100-row boundary hydrates even with all names present and target
   runReconcilePass({ ...xxOptions(), repo: 'frontierui', readChecks,
     readPrs: () => [pr, { ...pr, number: 3337, headRefOid: 'b'.repeat(40) }] });
   expect(readChecks.mock.calls).toEqual([
-    [{ repo: 'chalbert/frontierui', sha: XX_HEAD }], [{ repo: 'chalbert/frontierui', sha: 'b'.repeat(40) }],
+    [{ repo: 'frontier-ui/frontierui', sha: XX_HEAD }], [{ repo: 'frontier-ui/frontierui', sha: 'b'.repeat(40) }],
   ]);
 });
 
@@ -1080,4 +1080,94 @@ it('xxh4zw8 malformed JSON-lines read is refused and failed identical-head reads
   expect(exec).toHaveBeenCalledTimes(1);
   expect(plan.dispatch).toEqual([]);
   expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toHaveLength(2);
+});
+
+it('xe8y12n real PR read shell enriches the reported missing-family shape from commit evidence', async () => {
+  const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+  const { planReconcile } = await import('../reconcile-core.mjs');
+  const calls = [];
+  const prs = defaultReadPrs({ repo: 'o/r', exec: (_bin, args) => {
+    calls.push(args);
+    return JSON.stringify(args[1] === 'list' ? [{ number: 3239, labels: [], comments: [], statusCheckRollup: [] }]
+      : { data: { repository: { pullRequest: { commits: { nodes: [{ commit: { messageHeadline: 'repair', authors: { nodes: [{ name: 'Claude' }] } } }] } } } } });
+  } });
+  expect(calls.some(args => args.some(arg => arg.includes('commits(first:')))).toBe(true);
+  expect(planReconcile({ prs }).notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing' }));
+});
+
+// ── Live deadlock shape, PR #3771 (2026-10-03): a CONFLICTING head never gets pull_request CI ────────────────────
+// GitHub runs no CI on a conflicting head, so its required checks can never appear. Hydration used to read the REST
+// feed every tick and refuse `check-read-failed: missing required checks`, for a PR whose owed work (a mechanical
+// re-sync with main) does not consume CI at all. Absence there is EXPECTED: no read, no refusal, the conflict-fix
+// still planned. Every other path (a non-conflicting PR, a real read error, observed evidence) still refuses/reads.
+describe('conflicting head: missing required checks are expected (#3771)', () => {
+  const real = async () => (await import('node:fs')).readFileSync(
+    (await import('node:path')).join(process.cwd(), 'scripts/conveyor/__tests__/fixtures/pr-3771-conflicting-no-ci.json'), 'utf8');
+  const livePr = async (patch = {}) => ({ ...JSON.parse(await real()), ...patch });
+  const opts = (pr, readChecks) => ({ ...xxOptions(), readPrs: () => [pr], readChecks,
+    enrichFixClaims: p => p, enrichTimeouts: p => p, enrichReferralHolds: p => p });
+  const dispatchOf = (plan) => plan.dispatch.map(d => [d.prNumber, d.kind, d.isConflict ?? null]);
+
+  it('real #3771 data: the conflict repair is planned, nothing is read, nothing is refused', async () => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const readChecks = vi.fn(() => []);
+    const plan = runReconcilePass(opts(await livePr(), readChecks));
+    expect(dispatchOf(plan)).toEqual([[3771, 'fix', true]]);
+    expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
+    expect(readChecks).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['the conflict label alone', { mergeStateStatus: 'CLEAN' }],
+    ['mergeStateStatus DIRTY alone', { labels: [{ name: 'review:changes' }] }],
+    ['mergeable CONFLICTING alone', { mergeStateStatus: 'CLEAN', mergeable: 'CONFLICTING', labels: [{ name: 'review:changes' }] }],
+  ])('%s is enough to expect missing checks', async (_, patch) => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const readChecks = vi.fn(() => []);
+    const plan = runReconcilePass(opts(await livePr(patch), readChecks));
+    expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
+    expect(readChecks).not.toHaveBeenCalled();
+  });
+
+  it('a PR that is NOT conflicting still refuses on missing required checks, exactly as before', async () => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const readChecks = vi.fn(() => []);
+    const clean = await livePr({ mergeStateStatus: 'CLEAN',
+      labels: [{ name: 'review:changes' }, { name: 'review:human' }] });
+    const plan = runReconcilePass(opts(clean, readChecks));
+    expect(readChecks).toHaveBeenCalledTimes(1);
+    expect(plan.refusals.filter(r => r.kind === 'check-read-failed'))
+      .toEqual([expect.objectContaining({ prNumber: 3771, why: expect.stringContaining('missing required checks') })]);
+  });
+
+  it('a conflicting PR with OBSERVED check evidence still reads, and a real read error still refuses', async () => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const observed = await livePr({ statusCheckRollup: [{ name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' }] });
+    const fail = vi.fn(() => { throw new Error('HTTP 502'); });
+    const plan = runReconcilePass(opts(observed, fail));
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toHaveLength(1);
+    // ...but an incomplete-yet-readable feed on a conflicting head is not a refusal.
+    const readable = vi.fn(() => xxRuns().filter(row => row.name === 'soak-replay-gate'));
+    const ok = runReconcilePass(opts(observed, readable));
+    expect(readable).toHaveBeenCalledTimes(1);
+    expect(ok.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
+  });
+
+  // Rules as they stand (confirmed, unchanged): `review:human` is NOT a hold on a mechanical re-sync with main, so it
+  // never blocks the conflict repair. A recorded stand-down IS terminal until the operator answers it (a fix agent
+  // asked a question), and #3771 carries that answer, so the repair is planned. Without the answer it stays refused.
+  it('review:human does not block the re-sync; an UNANSWERED stand-down still does', async () => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const pr = await livePr();
+    const withoutHuman = { ...pr, labels: pr.labels.filter(l => l.name !== 'review:human') };
+    expect(dispatchOf(runReconcilePass(opts(withoutHuman, () => []))))
+      .toEqual(dispatchOf(runReconcilePass(opts(pr, () => []))));
+    const unanswered = { ...pr, comments: pr.comments.filter(c => !c.body.includes('conveyor-stand-down-answer')
+      && !c.body.startsWith('\u21A9\uFE0F') && !c.body.includes('Recorded by parked-pr-conflict-watch')) };
+    const plan = runReconcilePass(opts(unanswered, () => []));
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals.map(r => r.kind)).toContain('stood-down');
+    expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
+  });
 });

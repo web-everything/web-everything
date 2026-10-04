@@ -31,9 +31,9 @@
  *      that forgets to apply the env, or by a hostile child that unsets its own inherited env and calls
  *      `git -c core.hooksPath=<real path>` explicitly — an explicit `-c` DOES outrank the inherited env).
  *
- * No fs/git call here ever throws past its own contract — every function degrades to a documented, FAIL-CLOSED
- * default (an unreadable snapshot reads as "changed") rather than letting an unexpected error escape into a
- * caller that is very often already inside its own cleanup/refusal path.
+ * withHooksDisabled probes Git synchronously and throws on initialization refusal. Snapshot/reset cleanup
+ * calls retain their no-throw contracts and documented FAIL-CLOSED defaults (an unreadable snapshot reads
+ * as "changed") for callers that are often already inside their own cleanup/refusal path.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -42,7 +42,8 @@ import { lstatSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSy
 import { join } from 'node:path';
 
 /**
- * Env additions that force git hooks off for every process that inherits them. See the file header for why
+ * Zero-entry compatibility template; alone it does not check the Git prerequisite or preserve counted
+ * caller entries. Use withHooksDisabled for initialization. See the file header for why
  * env-based config, not a per-call `-c` flag, is what makes this survive a worker rewriting `.git/config`.
  */
 export const HOOKS_DISABLED_ENV = Object.freeze({
@@ -52,14 +53,49 @@ export const HOOKS_DISABLED_ENV = Object.freeze({
 });
 
 /**
- * `env` with hooks forced off (see {@link HOOKS_DISABLED_ENV}). PURE — returns a new object, never mutates
- * `env`. A caller with its OWN `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` entries already set
- * would have them overwritten here; no run script in this repo sets those today.
+ * Return a fresh environment with core.hooksPath appended after all caller counted entries.
+ * Synchronously probes Git through this appended environment (preserving the supplied PATH), without caching
+ * success. Even the prerequisite probe inherits the traditional-hook override.
  * @param {Record<string,string>} [env]
  * @returns {Record<string,string>}
+ * @throws {Error} Initialization refusal for invalid counted configuration or unprobeable/unsupported Git.
+ *   Diagnostics omit configuration values and subprocess output. Cleanup contracts are unchanged.
  */
 export function withHooksDisabled(env = {}) {
-  return { ...env, ...HOOKS_DISABLED_ENV };
+  const rawCount = env.GIT_CONFIG_COUNT;
+  const count = rawCount === undefined || rawCount === '' ? 0 : Number(rawCount);
+  if ((rawCount !== undefined && rawCount !== '' && (typeof rawCount !== 'string' || /[^0-9]/.test(rawCount)))
+    || !Number.isSafeInteger(count) || count < 0 || count >= 2147483647) {
+    throw new Error('Hook protection initialization refused: invalid GIT_CONFIG_COUNT (must leave room for one signed-int entry)');
+  }
+  for (let i = 0; i < count; i++) {
+    for (const field of ['KEY', 'VALUE']) {
+      const name = `GIT_CONFIG_${field}_${i}`;
+      if (typeof env[name] !== 'string') {
+        throw new Error(`Hook protection initialization refused: missing or invalid ${name}`);
+      }
+    }
+  }
+
+  const protectedEnv = { ...env, GIT_CONFIG_COUNT: String(count + 1),
+    [`GIT_CONFIG_KEY_${count}`]: 'core.hooksPath', [`GIT_CONFIG_VALUE_${count}`]: '/dev/null' };
+  let version;
+  try {
+    version = execFileSync('git', ['--version'], {
+      env: protectedEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 4096, shell: false,
+    });
+  } catch {
+    throw new Error('Hook protection initialization refused: Git version probe failed (requires Git >=2.31.0)');
+  }
+  // Anchor the entire output: prereleases, extra lines and unknown suffixes are ambiguous.
+  const match = /^git version ([0-9]+)\.([0-9]+)\.([0-9]+)(?: \(Apple Git-[0-9]+\)|\.windows\.[0-9]+)?(?:\r?\n)?$/.exec(version);
+  const parts = match?.slice(1, 4).map(Number);
+  if (!parts || match[0].length !== version.length || !parts.every(Number.isSafeInteger)
+    || !(parts[0] > 2 || (parts[0] === 2 && parts[1] >= 31))) {
+    throw new Error('Hook protection initialization refused: requires a stable Git >=2.31.0 version');
+  }
+  return protectedEnv;
 }
 
 /** A stable fingerprint for one `.git/hooks/` entry: type + permission bits + content (files) or link target

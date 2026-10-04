@@ -3,7 +3,7 @@
  * @description we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — pins the durable, HEAD-SCOPED
  *   ci-heal escalation marker: build/parse round-trip, the trusted-author gate (mirrors every sibling marker),
  *   and the head-scoping that makes a new push re-arm auto-heal with no human intervention. Real incident:
- *   chalbert/web-everything#2783 (three ci-heal sessions in one evening, each escalating identically on the
+ *   web-everything/web-everything#2783 (three ci-heal sessions in one evening, each escalating identically on the
  *   same head with nothing durable recorded).
  */
 import { describe, it, expect } from 'vitest';
@@ -179,7 +179,7 @@ describe('fix-agent-ci-brief.md — every escalation marker targets the head thi
 
 // we:backlog/4352 — the escalation-marker sibling of ci-heal-mark's owed-on-budget-refusal case.
 describe('#4352 — postOrOweCiHealEscalation', () => {
-  const REPO = { key: 'we', slug: 'chalbert/web-everything' };
+  const REPO = { key: 'we', slug: 'web-everything/web-everything' };
   const budgetError = () => {
     const stderr = budgetBlockedMessage({ resource: 'graphql', until: 'soon' });
     return Object.assign(new Error(`Command failed\n${stderr}`), { status: 1, stderr });
@@ -192,7 +192,7 @@ describe('#4352 — postOrOweCiHealEscalation', () => {
       pr: 2783, body, headSha: HEAD, repo: REPO, post: () => { throw budgetError(); }, owe: (r) => { owed.push(r); return r; },
     });
     expect(out.commented).toBe(false);
-    expect(owed).toEqual([{ repo: 'we', slug: 'chalbert/web-everything', pr: 2783, kind: 'ci-heal-escalation', headSha: HEAD, body }]);
+    expect(owed).toEqual([{ repo: 'we', slug: 'web-everything/web-everything', pr: 2783, kind: 'ci-heal-escalation', headSha: HEAD, body }]);
   });
 
   it('a successful post owes nothing; a non-budget failure still throws', () => {
@@ -220,20 +220,20 @@ it('re-arms legacy acquire-null escalations without deleting comments or moving 
 
 it('#4545 renders credential evidence after the existing marker fields', () => {
   const body = buildCiHealEscalationComment({ headSha: HEAD, outcome: 'needs-human', reason: 'Bad credentials',
-    authDiagnosis: { status: 'resolved', repo: 'chalbert/web-everything', runId: 36632379377, attempt: 1,
+    authDiagnosis: { status: 'resolved', repo: 'web-everything/web-everything', runId: 36632379377, attempt: 1,
       revision: 'b'.repeat(40), job: 'build', step: 'Checkout FUI (sibling)', secret: 'FUI_READ_TOKEN',
       updatedAt: '2026-09-30T00:00:00Z', observedAt: '2026-10-01T00:00:00Z', repositorySecret: true } });
-  expect(body).toContain('gh secret set FUI_READ_TOKEN --repo chalbert/web-everything');
+  expect(body).toContain('gh secret set FUI_READ_TOKEN --repo web-everything/web-everything');
   expect(latestCiHealEscalationForHead([{ body, author: AUTOMATION }], HEAD)).toMatchObject({ outcome: 'needs-human', reason: 'Bad credentials' });
 });
 
 describe('#4545 real CLI composition and owed-body preservation', () => {
-  const flags = { head: HEAD, outcome: 'needs-human', reason: 'Bad credentials', repo: 'chalbert/web-everything', run: '36632379377', attempt: '1' };
+  const flags = { head: HEAD, outcome: 'needs-human', reason: 'Bad credentials', repo: 'web-everything/web-everything', run: '36632379377', attempt: '1' };
   function collect(input) {
     return collectCiAuthDiagnosis(input, { now: () => '2026-10-01T00:00:00Z', read: (args) => {
       if (args[0] === 'secret') return JSON.stringify([{ name: 'FUI_READ_TOKEN', updatedAt: '2026-09-30T00:00:00Z' }]);
       if (args[0] === 'run') return 'build\tCheckout FUI (sibling)\t##[error]Bad credentials';
-      if (args[1].includes('/contents/')) return JSON.stringify({ encoding: 'base64', content: Buffer.from('jobs:\n  build:\n    steps:\n      - name: Checkout FUI (sibling)\n        uses: actions/checkout@v4\n        with:\n          repository: chalbert/frontierui\n          token: ${{ secrets.FUI_READ_TOKEN }}').toString('base64') });
+      if (args[1].includes('/contents/')) return JSON.stringify({ encoding: 'base64', content: Buffer.from('jobs:\n  build:\n    steps:\n      - name: Checkout FUI (sibling)\n        uses: actions/checkout@v4\n        with:\n          repository: frontier-ui/frontierui\n          token: ${{ secrets.FUI_READ_TOKEN }}').toString('base64') });
       if (args[1].includes('/jobs?')) return JSON.stringify({ total_count: 1, jobs: [{ id: 42, run_id: Number(flags.run), run_attempt: 1, head_sha: HEAD, name: 'build', conclusion: 'failure', steps: [{ number: 2, name: 'Checkout FUI (sibling)', conclusion: 'failure' }] }] });
       return JSON.stringify({ id: Number(flags.run), run_attempt: 1, head_sha: HEAD, repository: { full_name: flags.repo }, path: '.github/workflows/ci.yml', event: 'push' });
     } });
@@ -242,7 +242,7 @@ describe('#4545 real CLI composition and owed-body preservation', () => {
     const body = composeCiHealEscalation(flags, { collect });
     expect(body).toContain('Checkout FUI (sibling)');
     expect(body).toContain('2026-09-30T00:00:00Z');
-    expect(body).toContain('gh secret set FUI_READ_TOKEN --repo chalbert/web-everything');
+    expect(body).toContain('gh secret set FUI_READ_TOKEN --repo web-everything/web-everything');
     let record;
     const out = postOrOweCiHealEscalation({ pr: 2999, body, headSha: HEAD, repo: { key: 'we', slug: flags.repo },
       post: () => { throw new Error(budgetBlockedMessage({ resource: 'graphql', until: 'soon' })); },

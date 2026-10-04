@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * @file scripts/conveyor/convert-advisory-dispatch.mjs
- * @description #xconv1 (chalbert/web-everything#2766/#2767 unblock, epic #3383/#4075) — the IO shell that turns
+ * @description #xconv1 (web-everything/web-everything#2766/#2767 unblock, epic #3383/#4075) — the IO shell that turns
  *   one `we:scripts/conveyor/reconcile-core.mjs#planReconcile` `kind:'convert-advisory'` dispatch entry into its
  *   real effects, MECHANICALLY — no Claude wrapper session, mirroring `we:scripts/operations/review-job.mjs`'s
  *   own "nothing here needs judgment beyond one narrow question, so nothing here spawns a session" reasoning:
@@ -54,11 +54,12 @@ import { resolveNetDiffBasis } from '../merge-ai-prs.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 
+import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 /** The forced JSON shape the targeted-check judge's answer must satisfy (#xconv1). One verdict, one citing
  *  note — never a re-derivation of `review-core.mjs`'s own multi-finding panel shape, because this is
  *  deliberately NOT a panel: one question, one answer.
  *
- *  #xconv1-evidence (chalbert/web-everything#2766/#2767 misfire) — `inconclusive` was added as a THIRD allowed
+ *  #xconv1-evidence (web-everything/web-everything#2766/#2767 misfire) — `inconclusive` was added as a THIRD allowed
  *  verdict alongside `accept`/`changes`: the judge must be able to say "I cannot decide this from what I was
  *  given" without that reading as either a clean clearance or a manufactured finding. See
  *  `we:scripts/lib/review-escalation.mjs#TARGETED_CHECK_OUTCOMES` for why `inconclusive` deliberately maps to
@@ -251,7 +252,7 @@ export function fetchTestGamingDiffEvidence({
 /** `owner/name` from a GitHub remote URL (ssh or https, with or without `.git`), lowercased; `null` otherwise. */
 export function slugFromRemoteUrl(url) {
   const m = /github\.com[:/]+([^/\s]+\/[^/\s]+?)(?:\.git)?\/?\s*$/i.exec(String(url || '').trim());
-  return m ? m[1].toLowerCase() : null;
+  return m ? canonicalizeSlug(m[1].toLowerCase()) : null;
 }
 
 /** IO (injected `exec`): is `repo` this checkout's own `remote`? Unreadable remote → `false` (never assume). */

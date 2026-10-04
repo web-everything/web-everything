@@ -7,7 +7,7 @@ import {
   verifySignature, signBody, parseGithubEvent, createEventLog, createMemoryStorage, handleRequest, timingSafeEqual,
 } from '../core.mjs';
 
-const REPO = { full_name: 'chalbert/web-everything' };
+const REPO = { full_name: 'web-everything/web-everything' };
 
 describe('verifySignature', () => {
   it('matches GitHub\'s documented test vector', async () => {
@@ -47,7 +47,7 @@ describe('parseGithubEvent', () => {
       pull_request: { number: 12, title: 'SECRET TITLE', body: 'SECRET BODY', head: { sha: 'abc' }, user: { login: 'someone' } },
       sender: { login: 'someone' },
     }, { deliveryId: 'd1', receivedAt: at });
-    expect(r).toEqual({ id: 'd1', at: '2026-09-27T12:00:00.000Z', type: 'pull_request', action: 'labeled', repo: 'chalbert/web-everything', prs: [12], sha: 'abc', label: 'review:pending' });
+    expect(r).toEqual({ id: 'd1', at: '2026-09-27T12:00:00.000Z', type: 'pull_request', action: 'labeled', repo: 'web-everything/web-everything', prs: [12], sha: 'abc', label: 'review:pending' });
     expect(JSON.stringify(r)).not.toMatch(/SECRET|someone/);
   });
 

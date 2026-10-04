@@ -1,11 +1,12 @@
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord,
-  activeReferrals, REFERRAL_SEAT_PROVIDERS, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
+  activeReferrals, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
 import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
-import { buildReviewJudgeRequest, antigravityReviewFromEnv } from './review-pr.mjs';
-import { resolveProviderCap, PROVIDER_CAP_ENV } from './review-extra-seats.mjs';
+import { buildReviewJudgeRequest } from './review-pr.mjs';
+import { referralSeatDisabled } from './review-seat-policy.mjs';
+export { referralSeatDisabled } from './review-seat-policy.mjs';
 /**
  * @file scripts/operations/review-pr-io.mjs
  * @description THE IO SHELL of the `review-pr` declaration (#3035, under epic #3029) — the reader its `read`
@@ -61,6 +62,7 @@ import { siblingsFor } from '../bootstrap-session.mjs';
 import { PR_VIEW_FIELDS, prViewFileName } from '../lib/pr-view-transport.mjs';
 import { defaultOriginRepo } from './record-verdict-io.mjs';
 import { REVIEW_EFFECTS } from './review-pr.mjs';
+import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 import { isValidRunId } from './run-record.mjs';
 // mechanical-dispatcher — the `AWAITING_ADVISORY_CLEAR` sink's own label name, imported rather than restated.
 import { REVIEW_LABELS, hasReviewLabel } from '../lib/review-escalation.mjs';
@@ -214,7 +216,7 @@ export function readPr({
   // plateau-app#139). Checked here, ahead of the `gh pr view` call too, so a mismatched target fails fast
   // rather than spending a network round trip it cannot use.
   const haveRepo = originRepo(cwd);
-  if (haveRepo !== repo) {
+  if (canonicalizeSlug(haveRepo) !== canonicalizeSlug(repo)) {
     throw new Error(
       `review-pr-io: refusing to review ${repo}#${pr} — this checkout's origin is ${haveRepo || '(unknown)'}, `
       + `not ${repo}. review-pr's diff comes from LOCAL git rooted at this checkout, so a cross-repo target `
@@ -375,7 +377,7 @@ export function resolveSubjectCheckout({
   repo, cwd = REPO_ROOT, originRepo = defaultOriginRepo, siblings = siblingsFor,
 } = {}) {
   const probed = [cwd];
-  if (originRepo(cwd) === repo) return { path: cwd, probed };
+  if (canonicalizeSlug(originRepo(cwd)) === canonicalizeSlug(repo)) return { path: cwd, probed };
   let candidates = [];
   // A broken/absent sibling table must not turn a refusal into a crash — the guard is the one that speaks.
   try { candidates = siblings(cwd) || []; } catch { candidates = []; }
@@ -397,7 +399,7 @@ export function resolveSubjectCheckout({
       if (candidate === sibling.path && !sibling.present) continue;
       if (probed.includes(candidate)) continue;
       probed.push(candidate);
-      if (originRepo(candidate) === repo) return { path: candidate, probed };
+      if (canonicalizeSlug(originRepo(candidate)) === canonicalizeSlug(repo)) return { path: candidate, probed };
     }
   }
   return { path: null, probed };
@@ -443,22 +445,6 @@ const PRE_WRITE_REFUSALS = Object.freeze([
   // #3334 tests so the two cannot drift into a refusal this list no longer recognises.
   'reasonless bounce:',
 ]);
-
-/**
- * THE one definition of "this optional reviewer seat is disabled", used wherever a referral may be retired.
- * The Antigravity review seat runs on its own gate (`REVIEW_PR_ANTIGRAVITY_REVIEW` / probation), which never
- * reads the Gemini cap, so its default cap of 0 alone must not disable it: only the flag being off, or an
- * operator who EXPLICITLY set the cap to 0, does. The direct `agy-*` finding seats are enforced by their
- * provider cap alone. Mandatory and unknown seats are never disabled. PURE.
- */
-export function referralSeatDisabled(seat, env = process.env) {
-  if (!Object.hasOwn(REFERRAL_SEAT_PROVIDERS, seat)) return false;
-  const provider = REFERRAL_SEAT_PROVIDERS[seat];
-  const capZero = resolveProviderCap(provider, env) === 0;
-  if (seat !== 'judgeAntigravityReview') return capZero;
-  const explicitZero = capZero && Number.isInteger(Number(env?.[PROVIDER_CAP_ENV[provider]])) && env[PROVIDER_CAP_ENV[provider]] !== '';
-  return !antigravityReviewFromEnv(env) || explicitZero;
-}
 
 // Keep v1's identity-bearing fields intact: old readers recompute the key from them.
 // In particular, a huge summary/key cannot be hashed away without breaking those readers.
@@ -557,8 +543,12 @@ export function createReviewPrSinks({
       const persist = (record) => {
         const body = renderReferralRecord(record);
         if (body.length > commentBudget) throw new Error(`mandatory referral record exceeds ${commentBudget} characters`);
-        fresh();
-        labelProvider.postComment(read.repo, read.pr, body);
+        const before = fresh();
+        // xuxcsw6: never repost a record the thread already carries byte-for-byte (trusted-author read).
+        const same = r => JSON.stringify(r) === JSON.stringify(record);
+        if (!readReferralRecords(before.comments, context(before)).records.some(same)) {
+          labelProvider.postComment(read.repo, read.pr, body);
+        }
         const state = fresh();
         const parsed = readReferralRecords(state.comments, context(state));
         if (parsed.malformed || !parsed.records.some(r => JSON.stringify(r) === JSON.stringify(record))) {

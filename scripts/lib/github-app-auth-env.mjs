@@ -36,6 +36,7 @@ import { dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { mintInstallationToken, getInstallationInfo } from './github-app-token.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
+import { installationMap, installationForOwner, ownerOfSlug, remapLegacyInstallationId, installationCachePath } from './github-app-installations.mjs';
 
 /**
  * What the fleet's `gh` calls actually need, as GitHub App permission levels. Live-caught 2026-09-23: the
@@ -141,7 +142,9 @@ export function resolveGithubAppEnvConfig(env = process.env) {
   const installationId = env.WE_GITHUB_APP_INSTALLATION_ID;
   const privateKeyPath = env.WE_GITHUB_APP_PRIVATE_KEY_PATH;
   if (!appId || !installationId || !privateKeyPath) return null;
-  return { appId, installationId, privateKeyPath };
+  // The retired personal-account installation id is remapped to the web-everything org's installation, so a
+  // launchd plist that still carries the old id keeps minting a token that covers the moved repos.
+  return { appId, installationId: remapLegacyInstallationId(installationId, env), privateKeyPath };
 }
 
 /**
@@ -256,6 +259,9 @@ export async function ensureFreshGithubAppEnv({
   log = console,
   statusPath = defaultStatusPath(),
   writeStatus = writeStatusFile,
+  extraInstallations = true,
+  perOwner = false,
+  installShim = defaultInstallOwnerShim,
 } = {}) {
   const record = (result) => {
     // `not-configured` is skipped, deliberately (#x8mpubm follow-up): this shared file reports the FLEET's
@@ -324,7 +330,10 @@ export async function ensureFreshGithubAppEnv({
       return record({ applied: false, reason: 'access-check-failed' });
     }
 
-    const { missingPermissions, missingRepos } = findInstallationGaps({ permissions: minted.permissions, repos, repositorySelection }, required);
+    // An installation covers ONE owner, so it is only required to cover the constellation repos that owner holds.
+    const ownRepos = REQUIRED_APP_REPOS.filter((r) => installationForOwner(ownerOfSlug(r), env) === String(config.installationId));
+    const requiredForThis = required?.repos ? required : { ...(required ?? {}), repos: ownRepos.length ? ownRepos : REQUIRED_APP_REPOS };
+    const { missingPermissions, missingRepos } = findInstallationGaps({ permissions: minted.permissions, repos, repositorySelection }, requiredForThis);
     if (missingPermissions.length || missingRepos.length) {
       log.error?.(
         'github-app-auth-env: App installation is missing access the fleet needs — NOT applying it, staying on personal auth. '
@@ -337,12 +346,54 @@ export async function ensureFreshGithubAppEnv({
     writeCache(cachePath, cached);
   }
 
+  // Per-installation caches: the daemon's own GH_TOKEN covers ONE owner, so also keep a fresh token for EVERY
+  // mapped installation in its own cache file, which the gh shim picks by the target repo's owner.
+  // Best-effort: a failure here never affects the primary token applied below.
+  if (extraInstallations && !perOwner && Object.values(installationMap(env)).includes(String(config.installationId))) {
+    await ensurePerInstallationCaches({ config, primary: cached, env, cachePath, now, readCache, writeCache, mint, log });
+  }
+
+  // MULTI-REPO CALLERS (the drain sweeps web-everything + frontier-ui + plateauapp in one process): one pinned
+  // `GH_TOKEN` belongs to ONE org's installation, so every `--repo` outside that org failed with "Could not
+  // resolve to a Repository" and the whole pass died (live 2026-10-03 23:17Z). With `perOwner`, GH_TOKEN is NOT
+  // set; every owner's token is kept fresh in its own cache (above) and `gh` is routed through the shim, which
+  // picks the token by each call's target repo owner and falls back to personal auth, with a warning, for an
+  // owner that has no installation.
+  if (perOwner) {
+    if (!Object.values(installationMap(env)).includes(String(config.installationId))) {
+      log.error?.('github-app-auth-env: this installation is not in the owner map - per-owner routing needs it; staying on personal auth.');
+      return record({ applied: false, reason: 'owner-map-missing' });
+    }
+    // The per-owner caches must be fresh for EVERY owner even when the primary came from the cache.
+    await ensurePerInstallationCaches({ config, primary: cached, env, cachePath, now, readCache, writeCache, mint, log });
+    let shim;
+    try { shim = await installShim(env, { cachePath }); } catch (e) { shim = { ok: false, reason: String((e && e.message) || e) }; }
+    if (!shim || !shim.ok) {
+      log.error?.(`github-app-auth-env: could not install the per-owner gh shim (${shim && shim.reason}) - staying on personal auth.`);
+      return record({ applied: false, reason: 'shim-failed' });
+    }
+    return record({ applied: true, reason: 'ok', perOwner: true });
+  }
+
   setEnv(cached.token);
   // Bind provenance to the credential actually applied; inherited metadata cannot label a fallback token.
   env.WE_GH_AUTH_SOURCE = source;
   env.WE_GH_AUTH_INSTALLATION = String(cached.installationId);
   env.WE_GH_AUTH_TOKEN_HASH = createHash('sha256').update(cached.token).digest('hex');
   return record({ applied: true, reason: 'ok' });
+}
+
+/**
+ * Default per-owner routing: write this checkout's `gh` shim and prepend its dir to `env.PATH` (idempotent).
+ * Dynamic import: `gh-app-shim.mjs` imports this module.
+ */
+async function defaultInstallOwnerShim(env, { cachePath }) {
+  const { buildGhShimSettingsEnv } = await import('./gh-app-shim.mjs');
+  const settings = buildGhShimSettingsEnv({ env, pathEnv: env.PATH || '', cachePath });
+  if (!settings || !settings.PATH) return { ok: false, reason: 'no-real-gh-or-write-failed' };
+  const dir = settings.PATH.split(':')[0];
+  if (!(env.PATH || '').split(':').includes(dir)) env.PATH = settings.PATH;
+  return { ok: true, dir };
 }
 
 /**
@@ -360,6 +411,32 @@ export async function ensureFreshGithubAppEnv({
  * @param {Parameters<typeof ensureFreshGithubAppEnv>[0]} [opts] - forwarded to every refresh
  * @returns {typeof effects} the same effects, `tickOnce` wrapped
  */
+/**
+ * Keep one fresh token cache per mapped installation (`web-everything.<installationId>.json` beside the legacy
+ * cache). The primary installation's already-fresh token is reused, not re-minted. Never throws.
+ */
+export async function ensurePerInstallationCaches({ config, primary, env, cachePath, now, readCache, writeCache, mint, log }) {
+  const done = {};
+  const entries = Object.entries(installationMap(env));
+  for (const [owner, installationId] of entries) {
+    if (done[installationId]) continue;
+    done[installationId] = true;
+    const path = installationCachePath(cachePath, installationId);
+    try {
+      if (String(installationId) === String(config.installationId) && primary?.token) {
+        writeCache(path, primary);
+        continue;
+      }
+      const have = readCache(path);
+      if (isCacheFresh(have, now) && have.token && String(have.installationId) === String(installationId) && have.appId === config.appId) continue;
+      const minted = await mint({ appId: config.appId, installationId, privateKeyPath: config.privateKeyPath, now });
+      writeCache(path, { v: CACHE_VERSION, appId: config.appId, installationId: String(installationId), token: minted.token, expiresAt: minted.expiresAt });
+    } catch (e) {
+      log.error?.(`github-app-auth-env: could not refresh the token cache for owner ${owner} (installation ${installationId}); that owner falls back to personal auth: ${String((e && e.message) || e)}`);
+    }
+  }
+}
+
 export function withGithubAppAuth(effects, opts = { log: console }) {
   const tick = effects.tickOnce;
   return {

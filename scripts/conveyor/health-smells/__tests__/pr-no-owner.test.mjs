@@ -1,6 +1,6 @@
 /**
  * @file scripts/conveyor/health-smells/__tests__/pr-no-owner.test.mjs
- * @description Landing-freeze fix, chalbert/web-everything#2793 (2026-09-27) — the `pr-no-owner` smell's PURE
+ * @description Landing-freeze fix, web-everything/web-everything#2793 (2026-09-27) — the `pr-no-owner` smell's PURE
  *   `evaluate()`, fed the REAL fix-dispatch-daemon log lines this incident produced (`gh` shape captured live:
  *   `refused missing-run-cap-exhausted … PR #2793 — … head sha 8be3bce0e51990837b7f9c016b407ec0f1657a1c already
  *   had 2 missing-run trigger attempt(s) …` and `reconcile-refused owed-elsewhere … PR #2793 — the branch needs
@@ -15,12 +15,12 @@ const MINUTE = 60_000;
 const T0 = Date.parse('2026-09-27T05:50:00Z');
 
 const PR_2793_TICK = [
-  'reconcile-fix-dispatch-daemon: tick (chalbert/web-everything) — dispatched 0, refused 2',
-  'reconcile-fix-dispatch-daemon: refused missing-run-cap-exhausted chalbert/web-everything PR #2793 — PR #2793\'s head sha 8be3bce0e51990837b7f9c016b407ec0f1657a1c already had 2 missing-run trigger attempt(s) that did not produce a real check run (cap 2) — this needs a human/ci-heal look, not another mechanical trigger',
-  'reconcile-fix-dispatch-daemon: reconcile-refused owed-elsewhere chalbert/web-everything PR #2793 — the branch needs a rebase before it can merge',
+  'reconcile-fix-dispatch-daemon: tick (web-everything/web-everything) — dispatched 0, refused 2',
+  'reconcile-fix-dispatch-daemon: refused missing-run-cap-exhausted web-everything/web-everything PR #2793 — PR #2793\'s head sha 8be3bce0e51990837b7f9c016b407ec0f1657a1c already had 2 missing-run trigger attempt(s) that did not produce a real check run (cap 2) — this needs a human/ci-heal look, not another mechanical trigger',
+  'reconcile-fix-dispatch-daemon: reconcile-refused owed-elsewhere web-everything/web-everything PR #2793 — the branch needs a rebase before it can merge',
 ].join('\n');
 
-const OTHER_PR_HEALTHY_TICK = 'reconcile-fix-dispatch-daemon: tick (chalbert/web-everything) — dispatched 1, refused 0';
+const OTHER_PR_HEALTHY_TICK = 'reconcile-fix-dispatch-daemon: tick (web-everything/web-everything) — dispatched 1, refused 0';
 
 function feed(chunks) {
   let mem;
@@ -32,7 +32,7 @@ function feed(chunks) {
   return mem;
 }
 
-const PR_2793 = { repo: 'chalbert/web-everything', number: 2793, title: 'daemon-soak owed-ci-rerun: excuse via main\'s own latest-run green check', headRefName: 'lane/rerun-after-main-fix' };
+const PR_2793 = { repo: 'web-everything/web-everything', number: 2793, title: 'daemon-soak owed-ci-rerun: excuse via main\'s own latest-run green check', headRefName: 'lane/rerun-after-main-fix' };
 
 describe('ELSEWHERE_REASON_RE', () => {
   it('matches both refusal kinds this smell exists for, and only those', () => {
@@ -72,7 +72,7 @@ describe('pr-no-owner — GREEN: #2793\'s real shape', () => {
     const mem = feed([{ text: PR_2793_TICK, at: T0 }]);
     const [r] = smell.evaluate({ prs: [PR_2793], agents: [] }, { now: T0 + 5 * MINUTE, daemons: { 'fix-dispatch-daemon': mem } });
     expect(r).toBeDefined();
-    expect(r.subject).toBe('chalbert/web-everything#2793');
+    expect(r.subject).toBe('web-everything/web-everything#2793');
     expect(r.breach).toBe(true);
     // The daemon processes the `refused …` line before the `reconcile-refused …` line each tick (this file's own
     // onTick order), so the LATEST recorded reason for this PR is the reconcile-core one — still one of the two
@@ -92,8 +92,8 @@ describe('pr-no-owner — GREEN: #2793\'s real shape', () => {
 
   it('never fires for a PR whose latest refusal is an ordinary, correct no-op (nothing-owed / cap-exhausted)', () => {
     const healthyTick = [
-      'reconcile-fix-dispatch-daemon: tick (chalbert/web-everything) — dispatched 0, refused 1',
-      'reconcile-fix-dispatch-daemon: reconcile-refused nothing-owed chalbert/web-everything PR #2793 — phase `queued` — reviewed and queued, or already landed; this pass has nothing to dispatch',
+      'reconcile-fix-dispatch-daemon: tick (web-everything/web-everything) — dispatched 0, refused 1',
+      'reconcile-fix-dispatch-daemon: reconcile-refused nothing-owed web-everything/web-everything PR #2793 — phase `queued` — reviewed and queued, or already landed; this pass has nothing to dispatch',
     ].join('\n');
     const mem = feed([{ text: healthyTick, at: T0 }]);
     const out = smell.evaluate({ prs: [PR_2793], agents: [] }, { now: T0 + 5 * MINUTE, daemons: { 'fix-dispatch-daemon': mem } });

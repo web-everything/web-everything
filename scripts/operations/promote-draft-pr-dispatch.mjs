@@ -30,7 +30,7 @@
  * precedent exactly. Both callers are safe to keep: `gh pr ready` is idempotent server-side (a PR already
  * non-draft is a silent no-op), so whichever caller's tick reaches a given PR first simply wins.
  *
- * STALE-GREEN RE-VERIFICATION (live incident, chalbert/web-everything PR #2811, 2026-09-27): the `entries` this
+ * STALE-GREEN RE-VERIFICATION (live incident, web-everything/web-everything PR #2811, 2026-09-27): the `entries` this
  * pass promotes come from `runReconcilePass`'s ONE PR snapshot for the whole tick — `entry.check` (folded into
  * `withPhase.check` by `planReconcile`) is whatever `statusCheckRollup` looked like at THAT read, seconds to
  * minutes before this loop actually calls `provider.ready`. #2811 measured the gap directly: the plan read this
@@ -50,8 +50,8 @@
  * remote. `root` is this dispatching checkout's OWN cwd (always the WE checkout the daemon runs from,
  * `we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs#runPromoteDraftDispatchAllRepos` loops every
  * constellation repo via `we:scripts/lib/for-each-repo.mjs` from the SAME process) — so every non-WE PR
- * number silently resolved against `chalbert/web-everything` instead. Confirmed live:
- * `chalbert/plateau-app#187` refused ("Command failed: gh pr ready 187") until promoted by hand. Fixed by
+ * number silently resolved against `web-everything/web-everything` instead. Confirmed live:
+ * `plateauapp/plateau-app#187` refused ("Command failed: gh pr ready 187") until promoted by hand. Fixed by
  * threading this function's own already-resolved `repoSlug` through to the provider as an explicit `--repo`
  * — `undefined` for the WE-default path (byte-identical to before), the real slug otherwise.
  */

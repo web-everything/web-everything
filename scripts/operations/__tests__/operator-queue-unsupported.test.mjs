@@ -29,7 +29,7 @@ it('reports owed unsupported work in text and JSON and uses the constellation sl
     expect(log.mock.calls.flat()).toContain('UNSUPPORTED REPO — owed work the conveyor cannot dispatch for this repo:');
     expect(log.mock.calls.flat()).toContain('plateau-app#49  fix  WE-only worker.');
     log.mockClear();
-    main(['--repo=chalbert/frontierui', '--json'], { unsupportedPath });
+    main(['--repo=frontier-ui/frontierui', '--json'], { unsupportedPath });
     expect(JSON.parse(log.mock.calls[0][0]).unsupported).toEqual([]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

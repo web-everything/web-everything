@@ -14,7 +14,7 @@ it('replays the builder dry-run before/after with identical historical prepare f
     fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [],
     killSwitch: () => ({ engaged: false }), listPrepareInFlight: () => [], listPrepareClaims: () => [],
     readPrepareStatus: () => ({ preparedDate: null }),
-    listProbationPrepares: () => ['old-1', 'old-2'].map((handle, i) => ({ handle, item: `${4300 + i}`, scoredAt: `2026-09-29T0${i}:00:00Z`, dispatchKind: 'probation-launch', taskType: 'prepare', repo: 'chalbert/web-everything', launchOutcome: 'gate-red', pr: null })),
+    listProbationPrepares: () => ['old-1', 'old-2'].map((handle, i) => ({ handle, item: `${4300 + i}`, scoredAt: `2026-09-29T0${i}:00:00Z`, dispatchKind: 'probation-launch', taskType: 'prepare', repo: 'web-everything/web-everything', launchOutcome: 'gate-red', pr: null })),
     dispatch: () => { throw new Error('a dry-run must not dispatch'); },
   };
   const snapshots = [];

@@ -61,11 +61,21 @@ jobs:
           # Need write permission for the branch push in the "Open baseline-refresh PR" step.
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
       - name: Checkout FUI (sibling)
         uses: actions/checkout@v4
         with:
-          repository: chalbert/frontierui
-          token: ${{ secrets.FUI_READ_TOKEN }}
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
       - uses: actions/setup-node@v4

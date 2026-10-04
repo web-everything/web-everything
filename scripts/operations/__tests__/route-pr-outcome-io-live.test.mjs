@@ -79,7 +79,7 @@ describe('createRouteOutcomeReader — against the real `gh` binary', () => {
         // The repo/pr are irrelevant — `gh` refuses on the missing credential before it would ever ask
         // GitHub whether either exists. What matters is that the REAL non-zero exit reaches the reader as a
         // throw, exactly as `execFileSync`'s real contract says it must.
-        expect(() => read({ repo: 'chalbert/web-everything', pr: 1 })).toThrow();
+        expect(() => read({ repo: 'web-everything/web-everything', pr: 1 })).toThrow();
       } finally {
         rmSync(ghConfigDir, { recursive: true, force: true });
       }

@@ -446,7 +446,7 @@ export function defaultReadPrLabels(prNumber, { exec = execFileSyncThrottled, re
 }
 
 /**
- * we:scripts/conveyor/ci-red-recovery-watch.mjs#reconcileAcceptanceAfterRebase — #2811 (chalbert/web-everything
+ * we:scripts/conveyor/ci-red-recovery-watch.mjs#reconcileAcceptanceAfterRebase — #2811 (web-everything/web-everything
  * PR #2811 live incident). This watcher's OWN rebase (`refreshOntoMain`, a MECHANICAL `rebaseDropManifest` —
  * never a code edit) moves the head exactly like a ci-heal's re-push does, and a live `review:accepted` it
  * leaves behind is stale for the same reason (`ci-heal-mark.mjs`'s own header: an acceptance is a claim about a
@@ -689,7 +689,7 @@ export function formatHungReport({ dispatch = [], refusals = [], applied = [] } 
 
 // ── MISSING-CI-RUN RECOVERY (we:backlog/xi4od2p-*.md, parent #4075/#3383) ──────────────────────────────────────
 // See `we:scripts/conveyor/main-red-recovery.mjs`'s own "MISSING-CI-RUN RECOVERY" section header for the full
-// incident (PR chalbert/web-everything#2729) and why this is a THIRD, disjoint population from the main-red and
+// incident (PR web-everything/web-everything#2729) and why this is a THIRD, disjoint population from the main-red and
 // hung-run passes above: a required check that never even started, never CONCLUDED and never went
 // `IN_PROGRESS`/`QUEUED`. This half owns every real IO the missing-run pass needs: reading the LIVE required
 // context names off branch protection, the one extra per-candidate read (`gh api commits/<sha>` for the head

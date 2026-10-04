@@ -173,15 +173,15 @@ describe('lane-whois#fetchAllPrs through the real throttle (PATH-faked gh)', () 
   });
 
   it('returns the old shape, re-reads via a free 304, and spends only the core bucket', () => {
-    const first = fetchAllPrs({ ghRepo: 'chalbert/web-everything' });
-    const second = fetchAllPrs({ ghRepo: 'chalbert/web-everything' });
+    const first = fetchAllPrs({ ghRepo: 'web-everything/web-everything' });
+    const second = fetchAllPrs({ ghRepo: 'web-everything/web-everything' });
     expect(first).toEqual(FIXTURE.graphql);
     expect(second).toEqual(FIXTURE.graphql);
 
     const argv = readFileSync(argvLog, 'utf8').trim().split('\n');
     expect(argv).toEqual([
-      'api -i repos/chalbert/web-everything/pulls?state=all&per_page=100&page=1',
-      'api -i -H If-None-Match: W/"e1" repos/chalbert/web-everything/pulls?state=all&per_page=100&page=1',
+      'api -i repos/web-everything/web-everything/pulls?state=all&per_page=100&page=1',
+      'api -i -H If-None-Match: W/"e1" repos/web-everything/web-everything/pulls?state=all&per_page=100&page=1',
     ]);
     expect(readdirSync(join(dir, 'etag'))).toHaveLength(1);
 

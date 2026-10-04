@@ -15,7 +15,7 @@ import { preventionCardTitle } from '../operations/machine-pr-title.mjs';
  * (OWED — file it):_` line and never file anything:
  *   (a) an ADVISORY note posted on a `review:human` PR (`review-pr.mjs`'s `advise` step) — the advisory outcome
  *       can be `accept` (only the two MANDATORY lenses gate that label) while an ADVISORY lens still named an
- *       owed guard; live example: chalbert/web-everything#2800's advisory at 2026-09-27T11:24:13Z, `advisory:
+ *       owed guard; live example: web-everything/web-everything#2800's advisory at 2026-09-27T11:24:13Z, `advisory:
  *       accepted` label live, one `codex-correctness` finding carrying `_Prevention (OWED — file it):_`.
  *   (b) an ACCEPT verdict (a human's `/review` accept, or the review-loop's own) whose findings list ONE OR
  *       MORE non-blocking owed guards — `hasUncapturedPrevention` is notice-wide (see `jury-core.mjs`'s
@@ -42,7 +42,7 @@ import { preventionCardTitle } from '../operations/machine-pr-title.mjs';
  *      `review-set-label.mjs` would be a genuine cycle. Node tolerates some cycles by evaluation-order luck;
  *      relying on that is exactly the fragility this repo's OWN leaf-module precedents (`reasonless-bounce.mjs`,
  *      `jury-core.mjs`) already refuse.
- *   2. IT IS A MOVING TARGET RIGHT NOW. chalbert/web-everything#2766 (open, mergeable, still under active
+ *   2. IT IS A MOVING TARGET RIGHT NOW. web-everything/web-everything#2766 (open, mergeable, still under active
  *      review as this was written) substantially rewrites `buildPreventionFilingInput` in place (adds a `head`
  *      pin, `cleanFindingFile`, `preventionGuardAnchor`, `cardCoversGuard` for its own by-content dedup). Sharing
  *      that function via a cross-file move (the cycle-avoiding fix for reason 1) would put this PR and #2766 in
@@ -73,7 +73,7 @@ const trustedComments = (comments) => (Array.isArray(comments) ? comments : []).
 // exceptions) — reusing the SAME token `citation-check.mjs` already exports rather than re-typing the literal
 // `'we:'` a second place could drift from.
 import { IN_REPO_LOCUS } from './citation-check.mjs';
-// chalbert/web-everything#2766 approval (2026-09-27) — the REAL detector the write-time gate itself runs,
+// web-everything/web-everything#2766 approval (2026-09-27) — the REAL detector the write-time gate itself runs,
 // reused as the digest safety net's second pass below (mirrors `we:scripts/lib/review-loop-policy.mjs
 // #buildPreventionFilingInput`'s own fix for the identical gap, landed in #2766). A true leaf like
 // `citation-check.mjs` above — no path back to `review-set-label.mjs` or `operations/review-pr.mjs`.
@@ -360,7 +360,7 @@ export function buildApprovalPreventionFilingInput({
     const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     return text.replace(new RegExp(`(?<![\\w./:-])${escaped}(?![\\w-])`, 'g'), `${IN_REPO_LOCUS}${f}`);
   }, digestRaw);
-  // chalbert/web-everything#2766's OWN approval (2026-09-27, ~09:00 ET) proved the pass above insufficient: it
+  // web-everything/web-everything#2766's OWN approval (2026-09-27, ~09:00 ET) proved the pass above insufficient: it
   // deliberately skips a name already part of a longer `dir/basename` path (by design, to avoid corrupting a
   // longer name it should leave alone), so a FULL bare path a juror's `prevention` prose names — here, this
   // card's OWN test-sibling path (`scope` already carries it, `we:`-prefixed, but the finding's free-text prose

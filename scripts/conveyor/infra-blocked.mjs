@@ -56,6 +56,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { HOME_REASONS } from '../operations/pr-land-reasons.mjs';
 
 // ── TUNING (exported so a caller/test can override; the conveyor tick uses the defaults) ──────────────────────
+import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 
 /** Backoff base: the wait after the FIRST failure before the first retry (30s). */
 export const DEFAULT_BASE_MS = 30_000;
@@ -198,7 +199,7 @@ export function parseInfraStore(text) {
       ref: e.ref != null ? String(e.ref) : null,
       sha: e.sha != null ? String(e.sha) : null,
       base: e.base != null ? String(e.base) : 'main',
-      // repo slug (e.g. "chalbert/plateau-app") — which repo the pushed ref lives in. Absent → the WE repo (the
+      // repo slug (e.g. "plateauapp/plateau-app") — which repo the pushed ref lives in. Absent → the WE repo (the
       // single-locus common case). Carried so a cross-locus couple's impl-half block is never resumed against the
       // WRONG repo (the resume guards on it) and the shape is couple-ready (#2659 review, finding 2).
       repo: e.repo != null ? String(e.repo) : null,
@@ -529,7 +530,7 @@ export function originSlugOf(cwd = INFRA_ROOT) {
     // #x5n4zn3 — was bare (no timeout); a local config read, short budget.
     const url = execFileSync('git', ['remote', 'get-url', 'origin'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15_000, killSignal: 'SIGKILL' }).trim();
     const m = url.match(/[:/]([^/]+\/[^/]+?)(?:\.git)?$/);
-    return m ? m[1] : null;
+    return m ? canonicalizeSlug(m[1]) : null;
   } catch {
     return null;
   }

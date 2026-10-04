@@ -33,7 +33,7 @@ import {
   validateRequest,
 } from '../apply-review-request.mjs';
 
-const OK = { repo: 'chalbert/web-everything', pr: 1466, to: 'accepted', actor: 'reviewer', body: '# verdict' };
+const OK = { repo: 'web-everything/web-everything', pr: 1466, to: 'accepted', actor: 'reviewer', body: '# verdict' };
 
 describe('what this applier REFUSES', () => {
   /**
@@ -118,7 +118,7 @@ describe('the argv handed to the SINGLE HOME', () => {
     const argv = buildLabelArgv(request, '/tmp/body.md');
     expect(argv[0]).toBe(join(REPO_ROOT, 'scripts', 'review-set-label.mjs'));
     expect(argv).toContain('1466');
-    expect(argv).toContain('--repo=chalbert/web-everything');
+    expect(argv).toContain('--repo=web-everything/web-everything');
     expect(argv).toContain('--to=accepted');
     expect(argv).toContain('--actor=reviewer');
     expect(argv).toContain('--body-file=/tmp/body.md');
@@ -192,7 +192,7 @@ describe('the session identity handed to the CLI', () => {
  */
 describe('the checkout the child is pinned to', () => {
   const PLATEAU = '/checkouts/plateau-app';
-  const ORIGINS = { [PLATEAU]: 'chalbert/plateau-app', [REPO_ROOT]: 'chalbert/web-everything' };
+  const ORIGINS = { [PLATEAU]: 'plateauapp/plateau-app', [REPO_ROOT]: 'web-everything/web-everything' };
   const originRepo = (dir) => ORIGINS[dir] ?? '';
 
   /** Stage a real request file — `main` reads one from disk, so the applier is exercised end to end. */
@@ -213,7 +213,7 @@ describe('the checkout the child is pinned to', () => {
   it('runs the child from the VERDICTED repo’s checkout, not the applier’s own REPO_ROOT', () => {
     // The plateau-app layout: the applier's own checkout IS web-everything (that is what `REPO_ROOT` names),
     // and the verdict belongs to a repo whose tree is somewhere else entirely.
-    const { path, cleanup } = stage({ ...OK, repo: 'chalbert/plateau-app' });
+    const { path, cleanup } = stage({ ...OK, repo: 'plateauapp/plateau-app' });
     const { calls, spawn } = recordingSpawn();
     try {
       expect(main([path, `${REPO_ROOT_FLAG}${PLATEAU}`], { spawn, originRepo, cwd: REPO_ROOT })).toBe(0);
@@ -225,13 +225,13 @@ describe('the checkout the child is pinned to', () => {
     expect(calls[0].opts.cwd).not.toBe(REPO_ROOT);
     // …while the CODE still comes from THIS checkout. Run our script, from their tree.
     expect(calls[0].argv[0]).toBe(join(REPO_ROOT, 'scripts', 'review-set-label.mjs'));
-    expect(calls[0].argv).toContain('--repo=chalbert/plateau-app');
+    expect(calls[0].argv).toContain('--repo=plateauapp/plateau-app');
   });
 
   it('defaults to the process cwd — the plateau-app workflow’s layout, with no flag passed', () => {
     // That workflow runs from the judged repo's root with web-everything checked out beneath it, so the cwd is
     // already right. It is CHOSEN and CHECKED all the same: `REPO_ROOT` also "happened to be right" once.
-    const { path, cleanup } = stage({ ...OK, repo: 'chalbert/plateau-app', body: '' });
+    const { path, cleanup } = stage({ ...OK, repo: 'plateauapp/plateau-app', body: '' });
     const { calls, spawn } = recordingSpawn();
     try {
       expect(main([path], { spawn, originRepo, cwd: PLATEAU })).toBe(0);
@@ -241,7 +241,7 @@ describe('the checkout the child is pinned to', () => {
   });
 
   it('REFUSES a tree whose origin is not the repo the verdict names, instead of fingerprinting it empty', () => {
-    const { path, cleanup } = stage({ ...OK, repo: 'chalbert/plateau-app' });
+    const { path, cleanup } = stage({ ...OK, repo: 'plateauapp/plateau-app' });
     const { calls, spawn } = recordingSpawn();
     try {
       // Standing in web-everything, holding a plateau-app verdict: the exact situation that used to run.
@@ -252,16 +252,16 @@ describe('the checkout the child is pinned to', () => {
   });
 
   it('names both repos and the flag that fixes it, so the refusal is actionable', () => {
-    const boom = () => resolveVerdictedRoot({ repo: 'chalbert/plateau-app', root: REPO_ROOT, originRepo });
-    expect(boom).toThrow(/chalbert\/plateau-app/);
-    expect(boom).toThrow(/chalbert\/web-everything/);
+    const boom = () => resolveVerdictedRoot({ repo: 'plateauapp/plateau-app', root: REPO_ROOT, originRepo });
+    expect(boom).toThrow(/plateauapp\/plateau-app/);
+    expect(boom).toThrow(/web-everything\/web-everything/);
     expect(boom).toThrow(new RegExp(REPO_ROOT_FLAG));
   });
 
   it('says "(not a checkout)" rather than nothing when the tree cannot be probed at all', () => {
     // `defaultOriginRepo` returns '' for a directory that is not a git repo, and an error reading
     // "…for X from 's tree" would send a reader looking for a repo called nothing.
-    expect(() => resolveVerdictedRoot({ repo: 'chalbert/plateau-app', root: '/nowhere', originRepo }))
+    expect(() => resolveVerdictedRoot({ repo: 'plateauapp/plateau-app', root: '/nowhere', originRepo }))
       .toThrow(/not a checkout/);
   });
 
@@ -269,7 +269,7 @@ describe('the checkout the child is pinned to', () => {
     // The CLI's `--body-file` allowlist is rooted at `process.cwd()` — the trap `restampAcceptance` sidesteps by
     // passing no body at all. A body written under the APPLIER's checkout would be refused by a child standing
     // in the verdicted repo, so the temp path is part of the pinning, not an implementation detail.
-    const { path, cleanup } = stage({ ...OK, repo: 'chalbert/plateau-app', body: '# findings' });
+    const { path, cleanup } = stage({ ...OK, repo: 'plateauapp/plateau-app', body: '# findings' });
     const { calls, spawn } = recordingSpawn();
     try {
       main([path, `${REPO_ROOT_FLAG}${PLATEAU}`], { spawn, originRepo, cwd: REPO_ROOT });
@@ -281,7 +281,7 @@ describe('the checkout the child is pinned to', () => {
   it('leaves `--check` free of the tree probe — it promises to validate and touch nothing', () => {
     // A validate-only run legitimately happens far from the verdicted checkout (linting the staged files on
     // `ops/review-requests`), where the sibling repo's tree need not exist at all.
-    const { path, cleanup } = stage({ ...OK, repo: 'chalbert/plateau-app' });
+    const { path, cleanup } = stage({ ...OK, repo: 'plateauapp/plateau-app' });
     const { calls, spawn } = recordingSpawn();
     const originExplodes = () => { throw new Error('probed the world on --check'); };
     try {

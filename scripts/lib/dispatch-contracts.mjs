@@ -1181,7 +1181,15 @@ function decideDispatchRouteLegacy(dispatch = {}, { scorecards = [], enforceSupe
     // fallback: it walks {@link resolveFixSize}'s `fixSizeSource` chain instead, because `block` alone would
     // silently stop a conflict-caused fix (this card's own reasoning, on the checked-in default policy).
     let estimatedLoc; let sized; let sizeSource;
-    if (REPAIR_KINDS.includes(kind)) {
+    if (dispatch?.sizeSource === 'plan') {
+      // The planner only emits planned `build` tasks. `sizeSource` is caller-supplied, so a repair (or any other
+      // cause) naming it would skip `resolveFixSize` / the card size policy and pick a smaller, more autonomous envelope.
+      if (kind !== 'build' || dispatch.cause !== 'planned') return routeRefused(kind, derivation, 'plan size is only valid for a planned build');
+      const bySize = estimatedLocForSize(dispatch.size);
+      estimatedLoc = dispatch.estimatedLoc ?? (bySize.sized ? bySize.estimatedLoc : null);
+      if (!integer(estimatedLoc)) return routeRefused(kind, derivation, 'plan size requires a positive estimatedLoc or a supported size');
+      sized = true; sizeSource = 'plan';
+    } else if (REPAIR_KINDS.includes(kind)) {
       ({ estimatedLoc, sized, sizeSource } = resolveFixSize(dispatch, sizePolicy));
     } else if (dispatch?.estimatedLoc != null) {
       estimatedLoc = dispatch.estimatedLoc; sized = true; sizeSource = 'card';
@@ -1300,7 +1308,7 @@ function decideDispatchRouteLegacy(dispatch = {}, { scorecards = [], enforceSupe
         audit(
           'estimated-loc', String(estimatedLoc), `size=${JSON.stringify(dispatch?.size ?? null)}`,
           sized
-            ? 'from the card\'s own `size:`'
+            ? (sizeSource === 'plan' ? 'from the planner estimate' : 'from the card\'s own `size:`')
             : sizeSource === 'largest-band'
               ? 'the card declares no `size:` — read as the largest band, which sits outside every proven envelope'
               : `the card declares no \`size:\` — unsizedCardPolicy is \`default-size\`, read as ${sizeSource}`,

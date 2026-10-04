@@ -188,8 +188,8 @@ describe('the publish gate (pure)', () => {
   });
 
   it('reads the GitHub slug from either remote form', () => {
-    expect(githubSlug('https://github.com/chalbert/web-everything.git')).toBe('chalbert/web-everything');
-    expect(githubSlug('git@github.com:chalbert/web-everything.git')).toBe('chalbert/web-everything');
+    expect(githubSlug('https://github.com/web-everything/web-everything.git')).toBe('web-everything/web-everything');
+    expect(githubSlug('git@github.com:web-everything/web-everything.git')).toBe('web-everything/web-everything');
     expect(githubSlug('/tmp/origin.git')).toBeNull();
   });
 });

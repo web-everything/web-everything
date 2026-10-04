@@ -142,7 +142,7 @@ describe('runTickAllRepos — now runs FIVE halves, notes included (#4191)', () 
 
 describe('formatNoteLine — one printable line per surfaced note (#4191)', () => {
   it('includes the kind, repo, PR, and reason', () => {
-    const line = formatNoteLine({ kind: 'ci-heal-exhausted', repo: 'chalbert/web-everything', prNumber: 2636, text: 'ci-heal attempts exhausted (3/3)' });
+    const line = formatNoteLine({ kind: 'ci-heal-exhausted', repo: 'web-everything/web-everything', prNumber: 2636, text: 'ci-heal attempts exhausted (3/3)' });
     expect(line).toContain('note ci-heal-exhausted');
     expect(line).toContain('PR #2636');
     expect(line).toContain('ci-heal attempts exhausted (3/3)');

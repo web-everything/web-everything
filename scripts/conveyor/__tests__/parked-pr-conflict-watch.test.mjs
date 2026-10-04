@@ -51,7 +51,9 @@ import {
   isWatcherMarkerAlreadySuperseded,
   CONFLICT_FIX_ROUND_CAP,
   latestConflictFixMarkerCreatedAtMs,
+  isWatcherStandDownOperatorAnswered,
 } from '../parked-pr-conflict-watch.mjs';
+import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
 import {
   STAND_DOWN_MARKER, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER, buildStandDownComment,
@@ -103,23 +105,23 @@ describe('the real incident that motivated this pass — WE PR #1920, captured l
       setLabels: (repo, pr, spec) => calls.push(['setLabels', repo, pr, spec]),
       postComment: (repo, pr, body) => calls.push(['postComment', repo, pr, body]),
     };
-    const results = watchParkedPrConflicts({ repo: 'chalbert/web-everything', listPrs: () => [REAL_1920_SNAPSHOT], provider, ...noopRouting() });
+    const results = watchParkedPrConflicts({ repo: 'web-everything/web-everything', listPrs: () => [REAL_1920_SNAPSHOT], provider, ...noopRouting() });
     expect(results).toEqual([{ num: 1920, isConflicting: true, add: CONFLICT_LABEL, remove: [], newlyDetected: true, commented: true, routedTo: 'reconcile-finding' }]);
     // #4118 — the label now applies LAST, only once the alert + dispatch are known-good (see this file's own
     // header, "IDEMPOTENCY, NO SEPARATE STORE" section's #4118 update, and `CONFLICT_RETRY_WINDOW_MS`).
     expect(calls[0][0]).toBe('postComment');
     expect(calls[0][3]).toContain('lane/2412c-engine-tier-redteam-gate');
-    expect(calls[1]).toEqual(['ensureLabel', 'chalbert/web-everything', CONFLICT_LABEL]);
-    expect(calls[2]).toEqual(['setLabels', 'chalbert/web-everything', 1920, { add: CONFLICT_LABEL, remove: [] }]);
+    expect(calls[1]).toEqual(['ensureLabel', 'web-everything/web-everything', CONFLICT_LABEL]);
+    expect(calls[2]).toEqual(['setLabels', 'web-everything/web-everything', 1920, { add: CONFLICT_LABEL, remove: [] }]);
   });
 
   it('once the PR is rebased clean (as #1920 actually was, mid-investigation) the label self-clears', () => {
     const healed = { ...REAL_1920_SNAPSHOT, mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [...REAL_1920_SNAPSHOT.labels, { name: CONFLICT_LABEL }] };
     const calls = [];
     const provider = { setLabels: (repo, pr, spec) => calls.push(['setLabels', repo, pr, spec]) };
-    const results = watchParkedPrConflicts({ repo: 'chalbert/web-everything', listPrs: () => [healed], provider });
+    const results = watchParkedPrConflicts({ repo: 'web-everything/web-everything', listPrs: () => [healed], provider });
     expect(results).toEqual([{ num: 1920, isConflicting: false, add: null, remove: [CONFLICT_LABEL], newlyDetected: false, newlyResolved: true, commented: false }]);
-    expect(calls).toEqual([['setLabels', 'chalbert/web-everything', 1920, { add: undefined, remove: [CONFLICT_LABEL] }]]);
+    expect(calls).toEqual([['setLabels', 'web-everything/web-everything', 1920, { add: undefined, remove: [CONFLICT_LABEL] }]]);
   });
 });
 
@@ -536,7 +538,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       const pr = { number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
       const liveFixAgent = { name: mintSessionSlug({ kind: 'fix', id: 1920, repo: 'we' }), state: 'working', pid: 4242, pidAlive: true };
       const results = watchParkedPrConflicts({
-        repo: 'chalbert/web-everything', listPrs: () => [pr], provider,
+        repo: 'web-everything/web-everything', listPrs: () => [pr], provider,
         postRearm: (o) => routed.push(['rearm', o.pr.number]),
         listAgents: () => [liveFixAgent],
         listPrComments: () => [],
@@ -546,7 +548,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       // stop emitting `newlyResolved` next sweep, permanently losing the rearm this fixer is still owed.
       // #xu38vlf — the ONE write on this first-observed sweep is the durable REARM_DEFERRED_MARKER, so a LATER
       // sweep can bound how long this wait has been running.
-      expect(provider.calls).toEqual([['postComment', 'chalbert/web-everything', 1920]]);
+      expect(provider.calls).toEqual([['postComment', 'web-everything/web-everything', 1920]]);
       expect(results[0].routedTo).toBe('rearm-deferred (fix agent still live)');
       expect(results[0].rearmDeferredSince).toBeTypeOf('number');
     });
@@ -557,7 +559,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       const pr = { number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
       const stuckFixAgent = { name: mintSessionSlug({ kind: 'fix', id: 1920, repo: 'we' }), state: 'blocked', pid: 4242, pidAlive: true };
       const results = watchParkedPrConflicts({
-        repo: 'chalbert/web-everything', listPrs: () => [pr], provider,
+        repo: 'web-everything/web-everything', listPrs: () => [pr], provider,
         postRearm: (o) => routed.push(['rearm', o.pr.number]),
         listAgents: () => [stuckFixAgent],
       });
@@ -570,12 +572,12 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       const routed = [];
       const pr = { number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
       const results = watchParkedPrConflicts({
-        repo: 'chalbert/web-everything', listPrs: () => [pr], provider,
+        repo: 'web-everything/web-everything', listPrs: () => [pr], provider,
         postRearm: (o) => routed.push(['rearm', o.pr.number]),
         listAgents: () => [], // no live agents at all
       });
       expect(routed).toEqual([['rearm', 1920]]);
-      expect(provider.calls).toEqual([['setLabels', 'chalbert/web-everything', 1920, { add: undefined, remove: [CONFLICT_LABEL] }]]);
+      expect(provider.calls).toEqual([['setLabels', 'web-everything/web-everything', 1920, { add: undefined, remove: [CONFLICT_LABEL] }]]);
       expect(results[0].routedTo).toBe('rearm-review');
     });
 
@@ -585,7 +587,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       const pr = { number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
       const doneFixAgent = { name: mintSessionSlug({ kind: 'fix', id: 1920, repo: 'we' }), state: 'done', pid: 4242, pidAlive: true };
       const results = watchParkedPrConflicts({
-        repo: 'chalbert/web-everything', listPrs: () => [pr], provider,
+        repo: 'web-everything/web-everything', listPrs: () => [pr], provider,
         postRearm: (o) => routed.push(['rearm', o.pr.number]),
         listAgents: () => [doneFixAgent],
       });
@@ -599,7 +601,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       const pr = { number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
       const otherPrFixAgent = { name: mintSessionSlug({ kind: 'fix', id: 4242, repo: 'we' }), state: 'working', pidAlive: true };
       const results = watchParkedPrConflicts({
-        repo: 'chalbert/web-everything', listPrs: () => [pr], provider,
+        repo: 'web-everything/web-everything', listPrs: () => [pr], provider,
         postRearm: (o) => routed.push(['rearm', o.pr.number]),
         listAgents: () => [otherPrFixAgent],
       });
@@ -611,7 +613,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
       const routed = [];
       const pr = { number: 1920, mergeable: 'MERGEABLE', labels: [{ name: CONFLICT_LABEL }, { name: 'review:changes' }] };
       const results = watchParkedPrConflicts({
-        repo: 'chalbert/web-everything', listPrs: () => [pr], provider,
+        repo: 'web-everything/web-everything', listPrs: () => [pr], provider,
         postRearm: (o) => routed.push(['rearm', o.pr.number]),
         listAgents: () => { throw new Error('claude agents --json failed'); },
       });
@@ -726,7 +728,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
         expect(notifyDesktopChecked).not.toHaveBeenCalled();
       });
 
-      // #xu38vlf — REPLAY PROOF, grounded in real PR chalbert/web-everything#2741's own real head ref and real
+      // #xu38vlf — REPLAY PROOF, grounded in real PR web-everything/web-everything#2741's own real head ref and real
       // comment timestamps (`gh pr view 2741 --json headRefName,comments`, captured 2026-09-26): the conflict
       // alert landed at 18:36:30Z, and this PR's REAL mechanical fix resolved + re-armed for real at 18:47:45Z
       // (11m15s later — nowhere near any bound, so the real PR never hit this gap). SYNTHESIZED: at that same
@@ -745,7 +747,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
         const REAL_RESOLVED_AT = Date.parse('2026-09-26T18:47:45Z'); // real: GitHub's own MERGEABLE-again read
         let rearmed = false;
         const sweep = (now, comments) => watchParkedPrConflicts({
-          repo: 'chalbert/web-everything', listPrs: () => [pr2741], provider,
+          repo: 'web-everything/web-everything', listPrs: () => [pr2741], provider,
           postRearm: () => { rearmed = true; }, listAgents: () => [staleFixAgent], listPrComments: () => comments, now,
         });
 
@@ -767,7 +769,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
         expect(results[0].routedTo).toBe('rearm-deferred (fix agent still live)');
         expect(rearmed).toBe(false);
         expect(postNoteComment).toHaveBeenCalledTimes(1);
-        expect(postNoteComment.mock.calls[0][0]).toMatchObject({ repo: 'chalbert/web-everything', pr: 2741 });
+        expect(postNoteComment.mock.calls[0][0]).toMatchObject({ repo: 'web-everything/web-everything', pr: 2741 });
         expect(notifyDesktopChecked).toHaveBeenCalledTimes(1);
       });
     });
@@ -794,7 +796,7 @@ describe('watchParkedPrConflicts — IO shell over injected fakes (no gh process
   });
 
   // #xs81oxb (parent #4075/#3383) — RENAMED, 2026-09-26: a CONFLICTING PR with no park label used to be silently
-  // ignored here ("not this pass's scope"), which is exactly the gap live-caught on `chalbert/web-everything#2709`
+  // ignored here ("not this pass's scope"), which is exactly the gap live-caught on `web-everything/web-everything#2709`
   // (`we:scripts/conveyor/reconcile-core.mjs` refusing it `owed-elsewhere` forever, nothing ever attempting the
   // rebase it named). This population is no longer ignored — see the dedicated
   // "unowned PRs that conflict with no review-workflow label at all (#xs81oxb)" describe block below for full
@@ -1426,7 +1428,7 @@ describe('defaultListPrComments — argv shape + @tsv round-trip incl. author.lo
     let capturedArgv;
     defaultListPrComments({ number: 42, repo: 'o/n', exec: (cmd, argv) => { capturedArgv = argv; return ''; } });
     expect(capturedArgv).toEqual(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/issues/42/comments',
-      '--jq', '.[] | [.body, .created_at, .user.login] | @tsv']);
+      '--jq', '.[] | [.body, .created_at, .user.login, .node_id] | @tsv']);
   });
 
   it("falls back to gh's own {owner}/{repo} template when repo is omitted", () => {
@@ -1504,7 +1506,7 @@ describe('defaultPostConflictFinding / defaultPostConflictStandDown / defaultPos
 });
 
 // ── #xu2krte Fork 2 — the review-human statute-amendment exception ─────────────────────────────────────────────
-// PR chalbert/web-everything#2549: `review:human` + `merge-status:conflicting`, amends clause 4(a) of the
+// PR web-everything/web-everything#2549: `review:human` + `merge-status:conflicting`, amends clause 4(a) of the
 // delivery-mode statute (removes existing text — NOT append-only), so the append-only exception (#2531) cannot
 // apply. Before this fork, ANY non-append-only statute-tier conflict stood down forever, human or not. This fork
 // asks one more question first: did `main` independently touch the SAME hunk since the merge base? If not, a
@@ -1782,7 +1784,7 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
     expect(provider.calls).toEqual([['postComment', 'o/n', 2549, expect.stringMatching(/superseded/i)]]);
   });
 
-  // Live on chalbert/web-everything#2549 (2026-09-24): with no durable "already superseded" read, every sweep
+  // Live on web-everything/web-everything#2549 (2026-09-24): with no durable "already superseded" read, every sweep
   // (~2 min) re-posted the supersede comment AND a fresh review:changes finding. The supersede comment IS the
   // durable record, so once one follows the watcher's marker the recheck is done.
   it('a watcher marker ALREADY followed by a supersede comment is not re-superseded or re-dispatched', () => {
@@ -1850,12 +1852,114 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood
       listPrFiles: () => ['docs/agent/platform-decisions.md'],
       listPrPatches: () => ({ 'docs/agent/platform-decisions.md': PR_HUNK_10_13 }),
       listMainStatutePatches: () => ({ 'docs/agent/platform-decisions.md': MAIN_HUNK_OVERLAPPING }),
+      computeConflictDisposition: () => 'real',
       postFinding: (o) => routed.push(['finding', o]),
       postStandDown: (o) => routed.push(['stand-down', o]),
     });
     expect(results[0].routedTo).toBe('stand-down (unchanged)');
     expect(routed).toEqual([]);
     expect(provider.calls).toEqual([]);
+  });
+
+  // ── #3771 (live 2026-10-03): the recheck kept `stand-down (unchanged)` forever ─────────────────────────────
+  // Cause 1: `git merge-tree` is CLEAN (main's rename/modify resolves) while GitHub says CONFLICTING, so the
+  // conflict-path list is `[]`, narrowing falls back to the whole diff, and a statute file merely sitting in the
+  // diff read as a judgment call. Cause 2: the operator's stand-down answer was never read by the recheck.
+  describe('#3771 — GitHub-only conflict and operator answer lift the watcher stand-down', () => {
+    const STAND_DOWN_ID = 'IC_kwDORBt1-c8AAAABY-kEBg';
+    const stoodDown = { ...watcherMarkerComment, id: STAND_DOWN_ID };
+    const answerBody = buildOperatorAnswer({ standDownId: STAND_DOWN_ID, reason: 'Resume and re-sync with main', actor: 'chalbert', channel: 'claude-code-chat' });
+    const operatorAnswer = (over = {}) => ({ body: answerBody, author: { login: 'chalbert' }, ...over });
+    // whole-diff statute-tier + a hunk overlap that, alone, keeps the stand-down (the pre-fix behaviour)
+    const stuckInputs = (over = {}) => ({
+      repo: 'o/n', listPrs: () => [alreadyLabelledPr({ number: 3771 })],
+      listPrFiles: () => ['docs/agent/platform-decisions.md', 'backlog/xne1udi-decision.md'],
+      listPrPatches: () => ({ 'docs/agent/platform-decisions.md': PR_HUNK_10_13 }),
+      listMainStatutePatches: () => ({ 'docs/agent/platform-decisions.md': MAIN_HUNK_OVERLAPPING }),
+      computeConflictingPaths: () => [], // git sees no conflict path
+      ...over,
+    });
+
+    it('BEFORE: git-clean + GitHub-conflicting with no answer and a real-looking diff but a conflicting probe still stands down', () => {
+      const routed = [];
+      const results = watchParkedPrConflicts(stuckInputs({
+        provider: fakeProvider(), listPrComments: () => [stoodDown], computeConflictDisposition: () => 'real',
+        postFinding: (o) => routed.push(['finding', o]), postStandDown: (o) => routed.push(['stand-down', o]),
+      }));
+      expect(results[0].routedTo).toBe('stand-down (unchanged)');
+      expect(routed).toEqual([]);
+    });
+
+    it('git merge-tree clean while GitHub says CONFLICTING: dispatches a plain re-sync finding and supersedes the marker', () => {
+      const routed = [];
+      const provider = fakeProvider();
+      const results = watchParkedPrConflicts(stuckInputs({
+        provider, listPrComments: () => [stoodDown], computeConflictDisposition: () => 'clean',
+        postFinding: (o) => routed.push(['finding', o]), postStandDown: (o) => routed.push(['stand-down', o]),
+      }));
+      expect(results[0].routedTo).toMatch(/plain re-sync with main/);
+      expect(results[0].supersededStandDown).toBe(true);
+      expect(routed.map(([k]) => k)).toEqual(['finding']);
+      expect(routed[0][1]).toMatchObject({ resync: true, reviewHumanFixable: false, appendOnlyStatute: false });
+      expect(provider.calls.length).toBe(1); // the supersede comment
+    });
+
+    it('a failed disposition probe fails closed: the stand-down stays', () => {
+      const routed = [];
+      const results = watchParkedPrConflicts(stuckInputs({
+        provider: fakeProvider(), listPrComments: () => [stoodDown],
+        computeConflictDisposition: () => { throw new Error('git blew up'); },
+        postFinding: (o) => routed.push(o),
+      }));
+      expect(results[0].routedTo).toBe('stand-down (unchanged)');
+      expect(routed).toEqual([]);
+    });
+
+    it('a later operator answer naming the stand-down lifts it for that episode, even on a real conflict', () => {
+      const routed = [];
+      const provider = fakeProvider();
+      const results = watchParkedPrConflicts(stuckInputs({
+        provider, listPrComments: () => [stoodDown, operatorAnswer()], computeConflictDisposition: () => 'real',
+        postFinding: (o) => routed.push(['finding', o]), postStandDown: (o) => routed.push(['stand-down', o]),
+      }));
+      expect(results[0].routedTo).toMatch(/operator answer lifted the stand-down/);
+      expect(results[0].supersededStandDown).toBe(true);
+      expect(routed.map(([k]) => k)).toEqual(['finding']);
+      expect(routed[0][1].reviewHumanFixable).toBe(false);
+    });
+
+    it('an answer naming a DIFFERENT comment id, or from a stranger, does not lift it', () => {
+      const other = buildOperatorAnswer({ standDownId: 'IC_other', reason: 'go', actor: 'chalbert', channel: 'chat' });
+      for (const answer of [{ body: other, author: { login: 'chalbert' } }, operatorAnswer({ author: { login: 'mallory' } })]) {
+        const routed = [];
+        const results = watchParkedPrConflicts(stuckInputs({
+          provider: fakeProvider(), listPrComments: () => [stoodDown, answer], computeConflictDisposition: () => 'real',
+          postFinding: (o) => routed.push(o),
+        }));
+        expect(results[0].routedTo).toBe('stand-down (unchanged)');
+        expect(routed).toEqual([]);
+      }
+    });
+
+    it('isWatcherStandDownOperatorAnswered: only the LATEST watcher stand-down counts, and an answer must come after it', () => {
+      expect(isWatcherStandDownOperatorAnswered([stoodDown, operatorAnswer()])).toBe(true);
+      expect(isWatcherStandDownOperatorAnswered([operatorAnswer(), stoodDown])).toBe(false);
+      expect(isWatcherStandDownOperatorAnswered([stoodDown, operatorAnswer(), { ...watcherMarkerComment, id: 'IC_newer' }])).toBe(false);
+      expect(isWatcherStandDownOperatorAnswered([stoodDown])).toBe(false);
+      expect(isWatcherStandDownOperatorAnswered(null)).toBe(false);
+    });
+
+    it('buildConflictFindingBody({resync}) asks for a plain merge of main, not conflict resolution', () => {
+      const body = buildConflictFindingBody({ number: 3771, headRefName: 'lane/x' }, { resync: true });
+      expect(body).toMatch(/Re-sync with `main` — nothing to resolve/);
+      expect(body).toMatch(/no rebase, no force-push/);
+    });
+
+    it('defaultListPrComments projects the comment node id so an answer can be matched', () => {
+      const line = ['body', '2026-10-03T16:40:37Z', 'web-everything', STAND_DOWN_ID].join('\t');
+      const out = defaultListPrComments({ number: 3771, repo: 'o/n', exec: () => `${line}\n` });
+      expect(out[0]).toMatchObject({ createdAt: '2026-10-03T16:40:37Z', author: { login: 'web-everything' }, id: STAND_DOWN_ID });
+    });
   });
 
   it('an already-labelled PR with NO watcher marker (e.g. already dispatched, or a fix agent\'s OWN stand-down) is left alone', () => {
@@ -1987,7 +2091,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   // sits past the drain's grace window, so `postFinding` (→ a fresh `gh pr comment` + a fresh `review:changes`
   // `gh pr edit`) fired again on EVERY tick, for every PR stuck in this state, in every repo the pass watches —
   // confirmed against `calls.jsonl`: ~300 `pr edit`/`pr comment`/`api --method` mutations in ten minutes, which
-  // tripped GitHub's secondary rate limit and froze landing for chalbert/web-everything 04:04-04:33Z. This test
+  // tripped GitHub's secondary rate limit and froze landing for web-everything/web-everything 04:04-04:33Z. This test
   // runs the SAME PR through two consecutive sweeps (exactly what the mechanical pass does every intervalMs) and
   // proves the second sweep does not re-post: before the fix, `routed` would contain `[2514, 2514]`.
   it('#gh-write-burst — a second sweep tick on the SAME stuck-past-grace PR does not re-post the finding', () => {
@@ -2024,7 +2128,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   // is ALSO stacked and freshly drifts into conflict hits this path's PLAIN, non-statute `else` branch
   // (`postFinding` unconditionally, first tick, no grace to wait out) — which had NO `baseRefName` awareness at
   // all, so it would bounce an ordinary main-conflict onto a PR whose real conflict is against its own base,
-  // reproducing the identical `chalbert/web-everything#2578` failure shape for a population `graceDue`'s own fix
+  // reproducing the identical `web-everything/web-everything#2578` failure shape for a population `graceDue`'s own fix
   // never covered.
   it('xaer296 — FIRST sighting of a PARKED (non-queued) stacked-base PR is ALSO deferred to reconcile-core, never bounced as an ordinary main conflict', () => {
     const provider = fakeProvider(); const routed = [];
@@ -2061,7 +2165,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
 
   // #3383 — a STACKED PR (base isn't `main`) is never landed by the drain, so grace-expiry must NEVER bounce it
   // through `postFinding` (which strips `review:accepted`) — `reconcile-core.mjs`'s own STACKED-BASE CONFLICT
-  // branch owns the mechanical rebase instead. `chalbert/web-everything#2578`'s real shape.
+  // branch owns the mechanical rebase instead. `web-everything/web-everything#2578`'s real shape.
   it('already flagged, grace elapsed, but base is NOT main (stacked) → deferred to reconcile-core, no bounce', () => {
     const provider = fakeProvider(); const routed = [];
     const listPrs = () => [{
@@ -2319,7 +2423,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
     });
   });
 
-  // #xngv3vn (epic #3383/#4075) — LIVE INCIDENT, chalbert/web-everything#2596, 2026-09-24: an approved/queued
+  // #xngv3vn (epic #3383/#4075) — LIVE INCIDENT, web-everything/web-everything#2596, 2026-09-24: an approved/queued
   // PR drifted into a REAL content conflict (not the shared manifest) and the queued-conflict watch deferred it
   // the full 30-minute `QUEUED_CONFLICT_GRACE_MS` to "give the drain first try" — but the drain's ONLY
   // self-heal path is `we:scripts/lib/rebase-drop-manifest.mjs`'s manifest-only rebase-drop, which cannot touch
@@ -2426,7 +2530,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
 
 // #xs81oxb (parent #4075/#3383) — THE THIRD, PREVIOUSLY-INVISIBLE POPULATION: a DIRTY/CONFLICTING PR carrying NO
 // review-workflow label at all — neither the PARKED population (an uncleared review:human/pending/changes hold)
-// nor the QUEUED population (review:accepted/ready-to-merge). Live-caught on `chalbert/web-everything#2709`
+// nor the QUEUED population (review:accepted/ready-to-merge). Live-caught on `web-everything/web-everything#2709`
 // (`fix(#4138)`, stacked on #2708 which merged and had its base retargeted to `main`): `mergeStateStatus: DIRTY`,
 // labels `[checking]`, no `review:*` label at all — before this fix, `watchParkedPrConflicts` silently skipped
 // it (see the RENAMED test just below, which used to assert exactly that as "not this pass's scope") and
@@ -2755,7 +2859,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       expect(notifyDesktopChecked).not.toHaveBeenCalled();
     });
 
-    // #xu38vlf — REPLAY PROOF, grounded in real PR chalbert/web-everything#2709's own real head ref (`gh pr view
+    // #xu38vlf — REPLAY PROOF, grounded in real PR web-everything/web-everything#2709's own real head ref (`gh pr view
     // 2709 --json headRefName,baseRefName`, captured 2026-09-26: `lane/4138-pr-closed-reason-comment` off
     // `main`) — the SAME PR this file's own header names as the original UNOWNED-population incident. This PR's
     // REAL mechanical rebase-drop succeeded on its first attempt (a single real 🔧 conveyor-fix comment,
@@ -2780,7 +2884,7 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       for (let sweep = 1; sweep <= 4; sweep += 1) {
         const attemptsBeforeThisSweep = countUnownedRebaseAttempts(thread);
         const results = watchParkedPrConflicts({
-          repo: 'chalbert/web-everything', listPrs: () => [pr2709], provider,
+          repo: 'web-everything/web-everything', listPrs: () => [pr2709], provider,
           postFinding: (o) => routed.push(o.pr.number),
           computeConflictDisposition: () => 'manifest-only', // real shape: the shared .lane-manifest.json collision
           attemptMechanicalRebase: () => { throw new Error('fatal: Unable to create \'.git/index.lock\': File exists.'); },
@@ -2801,13 +2905,13 @@ describe('unowned PRs that conflict with no review-workflow label at all (#xs81o
       expect(outcomes[3]).toMatchObject({ attemptsBeforeThisSweep: UNOWNED_REBASE_ATTEMPT_CAP, capExhausted: true, routedTo: 'reconcile-finding' });
       expect(routed).toEqual([2709, 2709, 2709, 2709]); // every sweep still bounces — the PR is never silently dropped
       expect(postNoteComment).toHaveBeenCalledTimes(1); // surfaced EXACTLY ONCE across all 4 sweeps, not every sweep
-      expect(postNoteComment.mock.calls[0][0]).toMatchObject({ repo: 'chalbert/web-everything', pr: 2709 });
+      expect(postNoteComment.mock.calls[0][0]).toMatchObject({ repo: 'web-everything/web-everything', pr: 2709 });
       expect(notifyDesktopChecked).toHaveBeenCalledTimes(1);
     });
   });
 });
 
-// Landing-freeze fix, chalbert/web-everything#2793, 2026-09-27 — a ping-pong-with-no-owner: this file's own
+// Landing-freeze fix, web-everything/web-everything#2793, 2026-09-27 — a ping-pong-with-no-owner: this file's own
 // "IDEMPOTENCY, NO SEPARATE STORE" header rule (a comment posts only on the absent→present label transition,
 // never again while the label already sits on the PR) left a PARKED-but-not-`review:human` PR that drifted back
 // into conflict after a rearm invisible to every later sweep, while `reconcile-core.mjs`'s own
@@ -2823,7 +2927,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
       ensureLabel: (repo, name) => { calls.push(['ensureLabel', repo, name]); },
       setLabels: (repo, pr, spec) => { calls.push(['setLabels', repo, pr, spec]); },
       postComment: (repo, pr, body) => { calls.push(['postComment', repo, pr]); },
-      currentRepo: () => 'chalbert/web-everything',
+      currentRepo: () => 'web-everything/web-everything',
     };
   };
   // The exact real shape (see the describe-level comment above), already carrying `merge-status:conflicting`
@@ -2841,7 +2945,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
     // whenever there is no watcher stand-down marker to re-examine (`findWatcherStandDownComment` finds none).
     const provider = fakeProvider();
     const results = watchParkedPrConflicts({
-      repo: 'chalbert/web-everything', listPrs: () => [{ ...PR_2793, labels: L('review:human', 'merge-status:conflicting') }],
+      repo: 'web-everything/web-everything', listPrs: () => [{ ...PR_2793, labels: L('review:human', 'merge-status:conflicting') }],
       provider, listPrComments: () => [], postFinding: () => {},
     });
     expect(results).toEqual([]); // `recheckCandidate` finds no watcher marker and bails — nothing this pass does
@@ -2851,7 +2955,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
     const provider = fakeProvider();
     const routed = [];
     const results = watchParkedPrConflicts({
-      repo: 'chalbert/web-everything', listPrs: () => [PR_2793], provider,
+      repo: 'web-everything/web-everything', listPrs: () => [PR_2793], provider,
       postFinding: (o) => routed.push(o.pr.number), listPrComments: () => [],
     });
     expect(results).toEqual([expect.objectContaining({
@@ -2867,7 +2971,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
     const provider = fakeProvider();
     const postFinding = vi.fn();
     const results = watchParkedPrConflicts({
-      repo: 'chalbert/web-everything',
+      repo: 'web-everything/web-everything',
       listPrs: () => [{ ...PR_2793, labels: L('review:changes', 'merge-status:conflicting') }],
       provider, postFinding, listPrComments: () => [],
     });
@@ -2883,7 +2987,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
       createdAt: '2026-09-27T05:00:00Z', author: { login: 'web-everything' },
     }];
     const results = watchParkedPrConflicts({
-      repo: 'chalbert/web-everything', listPrs: () => [PR_2793], provider, postFinding,
+      repo: 'web-everything/web-everything', listPrs: () => [PR_2793], provider, postFinding,
       listPrComments: () => alreadyReasserted, now: Date.parse('2026-09-27T05:10:00Z'),
     });
     expect(results).toEqual([expect.objectContaining({ routedTo: 'reconcile-finding (idle conflict-bounce, already re-asserted this round)' })]);
@@ -2898,7 +3002,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
       { body: `${CONFLICT_FIX_COMMENT_MARKER}\n\nround 2`, createdAt: '2026-09-27T04:00:00Z', author: { login: 'web-everything' } },
     ];
     const results = watchParkedPrConflicts({
-      repo: 'chalbert/web-everything', listPrs: () => [PR_2793], provider, postFinding,
+      repo: 'web-everything/web-everything', listPrs: () => [PR_2793], provider, postFinding,
       listPrComments: () => thread, now: Date.parse('2026-09-27T05:50:00Z'),
     });
     expect(results).toEqual([expect.objectContaining({
@@ -2916,7 +3020,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
       body: `${CONFLICT_FIX_COMMENT_MARKER}\n\nround ${i + 1}`, createdAt: `2026-09-27T0${i + 1}:00:00Z`, author: { login: 'web-everything' },
     }));
     const results = watchParkedPrConflicts({
-      repo: 'chalbert/web-everything', listPrs: () => [PR_2793], provider, postFinding,
+      repo: 'web-everything/web-everything', listPrs: () => [PR_2793], provider, postFinding,
       listPrComments: () => atCap, now: Date.parse('2026-09-27T05:50:00Z'),
     });
     expect(results).toEqual([expect.objectContaining({
@@ -2924,7 +3028,7 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
     })]);
     expect(postFinding).not.toHaveBeenCalled();
     expect(postNoteComment).toHaveBeenCalledTimes(1);
-    expect(postNoteComment.mock.calls[0][0]).toMatchObject({ repo: 'chalbert/web-everything', pr: 2793 });
+    expect(postNoteComment.mock.calls[0][0]).toMatchObject({ repo: 'web-everything/web-everything', pr: 2793 });
     expect(postNoteComment.mock.calls[0][0].body).toContain(`mechanical conflict-fix rounds exhausted (${CONFLICT_FIX_ROUND_CAP}/${CONFLICT_FIX_ROUND_CAP})`);
     expect(notifyDesktopChecked).toHaveBeenCalledTimes(1);
   });
@@ -3074,7 +3178,7 @@ describe('watchParkedPrConflicts — the append-only statute exception (#3383)',
     expect(comment).not.toMatch(/drain gets the first try|still conflicting in \d+ minutes/);
   });
 
-  // #3383 — the live bug (PR #2505, chalbert/web-everything): a queued/approved PR that was NOT statute-tier
+  // #3383 — the live bug (PR #2505, web-everything/web-everything): a queued/approved PR that was NOT statute-tier
   // at detection (so it was correctly deferred to the drain, `routedTo: 'deferred-to-drain'`, never handed to a
   // human) is later re-checked, past the drain's grace window, and turns out to touch a statute-tier file whose
   // only change is an append-only new `### ` section. The grace path used to short-circuit on
@@ -3114,7 +3218,7 @@ describe('watchParkedPrConflicts — the append-only statute exception (#3383)',
   });
 });
 
-// #xconflres1 — LIVE INCIDENT, chalbert/web-everything#2772, 2026-09-27: the whole-diff `isStatuteTierConflict`
+// #xconflres1 — LIVE INCIDENT, web-everything/web-everything#2772, 2026-09-27: the whole-diff `isStatuteTierConflict`
 // heuristic stood a QUEUED, `ready-to-merge`/`review:accepted` PR down as a "genuine same-line conflict, human
 // judgment needed" solely because its diff ALSO touched `scripts/lib/__tests__/gate-invariants.test.mjs` (a
 // POLICY_SPEC/declarative-leash basename) — a file with NO conflict at all. A real, read-only

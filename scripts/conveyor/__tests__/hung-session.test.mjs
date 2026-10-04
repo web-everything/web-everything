@@ -9,7 +9,7 @@
  *   axis both import — see either file's docblock for why a shared module matters here.
  *
  *   `readHungInfo`'s tests drive staleness through the TRANSCRIPT'S OWN embedded entry `timestamp`, not
- *   `utimesSync` on the file's mtime — measured live (chalbert/web-everything `review-2599`, 2026-09-24) that
+ *   `utimesSync` on the file's mtime — measured live (web-everything/web-everything `review-2599`, 2026-09-24) that
  *   this environment can bump a transcript's mtime with no new content, so mtime-only staleness would have
  *   been the wrong signal to pin here. One dedicated case proves the mtime FALLBACK path directly.
  */

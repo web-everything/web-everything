@@ -22,7 +22,7 @@ describe('draft-promote-provider (draft-first PRs)', () => {
   // we:backlog/x4ua3v8 — the cwd-inferred-repo fix: a caller that KNOWS the PR's repo (the multi-repo daemon
   // path) must be able to pin it explicitly rather than let `gh` infer it from `cwd`'s git remote.
   it('buildReadyArgs appends --repo <repo> when a repo is given, byte-identical when omitted', () => {
-    expect(buildReadyArgs(42, 'chalbert/plateau-app')).toEqual(['pr', 'ready', '42', '--repo', 'chalbert/plateau-app']);
+    expect(buildReadyArgs(42, 'plateauapp/plateau-app')).toEqual(['pr', 'ready', '42', '--repo', 'plateauapp/plateau-app']);
     expect(buildReadyArgs(42, undefined)).toEqual(['pr', 'ready', '42']);
     expect(buildReadyArgs(42, null)).toEqual(['pr', 'ready', '42']);
   });
@@ -30,9 +30,9 @@ describe('draft-promote-provider (draft-first PRs)', () => {
   it('the adapter threads its bound repo through to every ready() call', () => {
     const seen = [];
     const provider = createDraftPromoteProvider({
-      cwd: '/repo', repo: 'chalbert/frontierui', exec: (args) => { seen.push(args); return 'ok'; },
+      cwd: '/repo', repo: 'frontier-ui/frontierui', exec: (args) => { seen.push(args); return 'ok'; },
     });
     expect(provider.ready(7)).toBe('ok');
-    expect(seen).toEqual([['pr', 'ready', '7', '--repo', 'chalbert/frontierui']]);
+    expect(seen).toEqual([['pr', 'ready', '7', '--repo', 'frontier-ui/frontierui']]);
   });
 });

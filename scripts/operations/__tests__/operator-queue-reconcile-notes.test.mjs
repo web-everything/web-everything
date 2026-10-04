@@ -19,14 +19,14 @@ describe('reconcileNotesFor', () => {
     const exec = (file, args) => {
       expect(file).toBe('node');
       expect(args[0]).toMatch(/reconcile-pass\.mjs$/);
-      expect(args[1]).toBe('--repo=chalbert/web-everything');
+      expect(args[1]).toBe('--repo=web-everything/web-everything');
       expect(args[2]).toBe('--json');
       return JSON.stringify(fakeResult);
     };
-    expect(reconcileNotesFor(['chalbert/web-everything'], { exec })).toEqual([
+    expect(reconcileNotesFor(['web-everything/web-everything'], { exec })).toEqual([
       {
         kind: 'ci-heal-exhausted', prNumber: 2636, attempts: 2, cap: 3, lastFailureReason: 'test check failing',
-        text: 'PR #2636: ci-heal attempts exhausted (2/3)', repo: 'chalbert/web-everything',
+        text: 'PR #2636: ci-heal attempts exhausted (2/3)', repo: 'web-everything/web-everything',
       },
     ]);
   });

@@ -99,7 +99,7 @@ describe('reduceCheckState — the empty list is the whole point', () => {
     expect(reduceCheckState([done('success', 'test'), done('failure', 'soak-replay-gate')], []).state).toBe('green');
   });
 
-  // we:backlog/fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, chalbert/web-everything) —
+  // we:backlog/fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, web-everything/web-everything) —
   // a required check that RE-RUNS more than once on one head (a `-gate`-shaped check retriggered by a
   // `labeled`/`unlabeled`/`edited` event: `review-gate.yml`, `soak-replay-gate.yml`) can leave a STALE
   // `FAILURE` run beside a later `SUCCESS` rerun of the SAME name in one `statusCheckRollup` fetch. Before the

@@ -3,7 +3,7 @@ import * as s from '../dispatch-supervisor-contract.mjs';
 import * as c from '../dispatch-contracts.mjs';
 
 const supervisor = { provider: 'claude', model: 'claude-opus-5', sessionId: null };
-const raw = (extra = {}) => ({ taskType: 'doc-fix', estimatedLoc: 30, filesTouched: ['docs/a.md'], acceptanceTestable: true, risk: 'low', dependsOn: [], ...extra });
+const raw = (extra = {}) => ({ estimatedLoc: 30, filesTouched: ['docs/a.md'], acceptanceTestable: true, risk: 'low', dependsOn: [], ...extra });
 const task = (id = 'a', deps = [], extra = {}) => ({ id, title: `Task ${id}`, dependsOn: deps, profile: raw({ dependsOn: deps }), ...extra });
 const output = (tasks = [task()]) => ({ storyRef: '3383', round: 1, tasks });
 const identity = (extra = {}) => ({ taskId: 'a', storyRef: '3383', round: 1, attempt: 1, mode: 'acting', supervisor, verifiedBy: 'other', storyTaskType: 'doc-fix', ...extra });
@@ -26,7 +26,7 @@ describe('strict supervisor output schemas', () => {
     expect(s.PLAN_OUTPUT_SCHEMA.properties.tasks.items.properties.profile.properties).not.toHaveProperty('complexity');
     expect(s.VERDICT_OUTPUT_SCHEMA.properties.newTasks.type).toEqual(['array', 'null']);
     expect(s.VERDICT_OUTPUT_SCHEMA.properties.complete.type).toEqual(['boolean', 'null']);
-    expect(s.PLAN_OUTPUT_SCHEMA.properties.tasks.items.properties.profile.properties.taskType.enum).toEqual(c.TASK_TYPES);
+    expect(JSON.stringify(s.PLAN_OUTPUT_SCHEMA)).not.toContain('taskType');
   });
   it('derives profiles, preserves a supervisor and initializes tasks', () => {
     const input = output([task('a', [], { profile: raw({ filesTouched: ['docs/agent/a.md'], estimatedLoc: 900, risk: 'low' }) })]);
@@ -103,4 +103,18 @@ describe('context packets and invocation evidence', () => {
     expect(s.planFromSupervisorOutput(output(), null).ok).toBe(false);
     expect(s.verdictFromSupervisorOutput(verdictOutput(), null).ok).toBe(false);
   });
+});
+
+it('#3996 validates and routes planner JSON without a declared task type', () => {
+  for (const [file, taskType] of [['docs/a.md', 'doc-fix'], ['scripts/a.mjs', 'build-new-feature'], ['scripts/a.test.mjs', 'test-fix']]) {
+    const input = output([task('a', [], { profile: raw({ filesTouched: [file], risk: 'high' }) })]);
+    const parsed = s.planFromSupervisorOutput(input, { supervisor });
+    expect(parsed.ok).toBe(true);
+    const profile = parsed.plan.tasks[0].profile;
+    expect(profile).toMatchObject({ taskType, risk: 'high' });
+    const routed = c.decideDispatchRoute({ kind: 'build', cause: 'planned', scopePaths: profile.filesTouched,
+      estimatedLoc: profile.estimatedLoc, sizeSource: 'plan', risk: profile.risk });
+    expect(routed).toMatchObject({ taskType, sizeSource: 'plan', sized: true });
+    expect(s.planFromSupervisorOutput(output([task('a', [], { profile: raw({ taskType }) })]), { supervisor }).ok).toBe(false);
+  }
 });

@@ -57,8 +57,8 @@ describe('fetchOpenPrsRest — real throttle + ETag 304 path (PATH-faked gh, no 
   });
 
   it('a repeat tick reads the list AND every PR\'s files as free 304s, and spends only the core bucket', () => {
-    const first = fetchOpenPrsRest({ repo: 'chalbert/web-everything' });
-    const second = fetchOpenPrsRest({ repo: 'chalbert/web-everything' });
+    const first = fetchOpenPrsRest({ repo: 'web-everything/web-everything' });
+    const second = fetchOpenPrsRest({ repo: 'web-everything/web-everything' });
     expect(first).toEqual(FIXTURE.graphql);
     expect(second).toEqual(FIXTURE.graphql); // served from the ETag cache, same answer
 

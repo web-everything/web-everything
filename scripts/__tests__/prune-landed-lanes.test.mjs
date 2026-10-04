@@ -53,7 +53,7 @@ describe('prune-landed-lanes — classifyLaneBranch (safety property: never dele
     expect(v.verdict).toBe('keep');
   });
 
-  // #4138 — live: chalbert/web-everything#2578 closed a SECOND time after being retargeted to `main` (so the
+  // #4138 — live: web-everything/web-everything#2578 closed a SECOND time after being retargeted to `main` (so the
   // #3383 stacked-base-on-a-DRAIN-MERGE cascade could not explain it); prune-landed-lanes never checked
   // whether some OTHER open PR is based on a `lane/*` branch it is about to delete — the identical hazard,
   // just on THIS script's own ref deletes instead of the drain's merge-and-delete.

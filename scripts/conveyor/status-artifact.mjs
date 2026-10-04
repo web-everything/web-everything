@@ -23,7 +23,7 @@ import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import { localToday } from '../lib/local-date.mjs';
 
-const REPO = 'chalbert/web-everything';
+const REPO = 'web-everything/web-everything';
 const sh = (c) => { try { return execSync(c, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); } catch { return ''; } };
 const j = (c) => { const o = sh(c); try { return JSON.parse(o); } catch { return null; } };
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');

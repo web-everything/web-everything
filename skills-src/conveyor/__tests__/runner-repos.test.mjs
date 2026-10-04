@@ -38,7 +38,7 @@ it('sweeps all three repo slugs with separate snapshots and runs WE passes once'
   for (const pass of once) expect(exec.mock.calls.filter(([, args]) => basename(args[0]) === `${pass}.mjs`)).toHaveLength(1);
 });
 it('isolates child failures and records unsupported review work', async () => {
-  const { exec, stderr, unsupportedPath } = await sweep(null, (args) => args[0].endsWith('review-dispatch.mjs') && args.includes('--repo=chalbert/frontierui'));
+  const { exec, stderr, unsupportedPath } = await sweep(null, (args) => args[0].endsWith('review-dispatch.mjs') && args.includes('--repo=frontier-ui/frontierui'));
   expect(exec.mock.calls.filter(([, args]) => args[0].endsWith('review-dispatch.mjs'))).toHaveLength(3);
   expect(stderr.mock.calls.flat().join('')).toContain('operations/review-dispatch.mjs [frontierui] failed (non-fatal)');
   expect(readUnsupported({ path: unsupportedPath })).toEqual([expect.objectContaining({ repo: 'frontierui', prNumber: 7, action: 'review' })]);
@@ -47,8 +47,8 @@ it('isolates child failures and records unsupported review work', async () => {
   expect(readUnsupported({ path: unsupportedPath })).toEqual([expect.objectContaining({ action: 'fix', prNumber: 8 })]);
 });
 it('limits an explicit repo and refuses unknown explicit repos', async () => {
-  const { exec, fetchOpenPrs } = await sweep('chalbert/frontierui');
-  expect(fetchOpenPrs.mock.calls).toEqual([[{ repo: 'chalbert/frontierui' }]]);
+  const { exec, fetchOpenPrs } = await sweep('frontier-ui/frontierui');
+  expect(fetchOpenPrs.mock.calls).toEqual([[{ repo: 'frontier-ui/frontierui' }]]);
   for (const pass of perRepo) expect(exec.mock.calls.filter(([, args]) => basename(args[0]) === `${pass}.mjs`)).toHaveLength(1);
   const unknown = await sweep('other/repo');
   expect(unknown.fetchOpenPrs).not.toHaveBeenCalled();
