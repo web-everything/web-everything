@@ -2107,6 +2107,60 @@ export function dispatchLaneGrant(payload, { root = REPO_ROOT, exists = existsSy
   return { additionalDirectories: dirs, allow: rules };
 }
 
+/**
+ * #3850 (live-caught 2026-10-04, 151 "Workspace not trusted" refusals in the fix-dispatch log) — the policy
+ * switch for TRUSTING THE SCRATCH ROOT. Default ON: a dispatch into `<root>/<uuid>` trusts `<root>` once, and
+ * every later session dir under it is trusted by inheritance (the CLI walks a non-git cwd's ancestors for a
+ * trusted entry — proven live, see the PR). `off`/`0`/`false`/`no` restores the old per-session-dir grant.
+ */
+export const DISPATCH_TRUST_ROOT_ENV = 'WE_DISPATCH_TRUST_ROOT';
+
+/**
+ * #3850 — the lock {@link grantDispatchTrust}/{@link revokeDispatchTrust} serialize on. ROOT CAUSE of the live
+ * refusals: these two used `<trustPath>.lock`, which for `~/.claude.json` is the SAME path Claude Code's own
+ * config lock uses — and Claude's is a DIRECTORY (mkdir-style lock). While any `claude` process held it, our
+ * `open(…, 'wx')` hit EEXIST, waited out its 5s timeout, and the grant was silently swallowed, so the spawn ran
+ * untrusted (and the one retry re-granted into the same wall). When the dir aged past 30s we "stole" it instead —
+ * renaming a live CLI process's lock away (360 `~/.claude.json.lock.stolen.*` dirs on the host). Our own lock
+ * now has its own name, so it never collides with, nor steals, the CLI's.
+ * @param {string} trustPath
+ */
+export function dispatchTrustLockPath(trustPath) {
+  return `${trustPath}.we-dispatch-trust.lock`;
+}
+
+/**
+ * True when `dir` or any ancestor carries `hasTrustDialogAccepted: true` in `config.projects` — the same walk
+ * the CLI does for a cwd outside a git repo (a dispatch scratch dir is never a repo). PURE.
+ * @param {object|null} config
+ * @param {string} dir
+ */
+export function isTrustedIn(config, dir) {
+  const projects = config?.projects ?? {};
+  let cur = resolve(String(dir));
+  for (;;) {
+    if (projects[cur]?.hasTrustDialogAccepted === true) return true;
+    const up = dirname(cur);
+    if (up === cur) return false;
+    cur = up;
+  }
+}
+
+/**
+ * #3850 — WHICH directory to trust for a dispatch cwd. A cwd under the dispatch scratch root resolves to the ROOT
+ * (trusted once, inherited by every session dir after it); anything else (a lane, a test path) to itself, exactly
+ * as before. {@link DISPATCH_TRUST_ROOT_ENV}=off restores the per-dir grant. PURE apart from the env read.
+ * @param {string} dir
+ * @param {{env?: Record<string, string|undefined>, scratchRoot?: string}} [o]
+ * @returns {string[]}
+ */
+export function dispatchTrustTargets(dir, { env = process.env, scratchRoot = dispatchScratchRoot({ env }) } = {}) {
+  const d = resolve(String(dir));
+  if (/^(0|off|false|no)$/i.test(String(env?.[DISPATCH_TRUST_ROOT_ENV] ?? '').trim())) return [d];
+  const r = resolve(String(scratchRoot));
+  return d === r || d.startsWith(`${r}/`) ? [r] : [d];
+}
+
 /** Test/override hook for {@link grantDispatchTrust}'s trust file — mirrors {@link DISPATCH_CWD_ENV}. A
  *  soak/sim world points this at a throwaway file under its own root, so the REAL production mechanism runs
  *  unstubbed without ever touching the operator's actual `~/.claude.json`. */
@@ -2151,14 +2205,18 @@ function resolveDispatchTrustPath(env = process.env) {
  * @param {{trustPath?: string}} [o] - injectable ONLY so a test can point it at a throwaway file instead of
  *   overriding process.env — the same seam `exec`/`spawnAgent` already are on this sink.
  */
-export function grantDispatchTrust(dir, { trustPath = resolveDispatchTrustPath() } = {}) {
+export function grantDispatchTrust(dir, { trustPath = resolveDispatchTrustPath(), env = process.env, scratchRoot } = {}) {
   try {
-    withFileLock(`${trustPath}.lock`, () => {
+    const targets = dispatchTrustTargets(dir, { env, ...(scratchRoot ? { scratchRoot } : {}) });
+    withFileLock(dispatchTrustLockPath(trustPath), () => {
       const before = readJsonConfig(trustPath);
       // `null` = present but unparseable (bootstrap-session.mjs's own `readJsonConfig` contract) — write
       // nothing, exactly as bootstrap-session.mjs's own trust step refuses to in that case.
       if (before === null) return;
-      const next = withTrustedDirs(before, [dir]);
+      // #3850 — already trusted (the dir itself or the scratch ROOT above it): write NOTHING. Once the root is
+      // trusted this is every dispatch, so the operator-wide file is no longer rewritten per spawn at all.
+      if (targets.every((t) => isTrustedIn(before, t))) return;
+      const next = withTrustedDirs(before, targets);
       // Backup-first, exactly matching bootstrap-session.mjs's own `writeTrust` discipline for this same file —
       // it holds the operator's whole per-project CLI state, not just this one directory's trust flag.
       if (existsSync(trustPath)) copyFileSync(trustPath, `${trustPath}.bak`);
@@ -2203,7 +2261,7 @@ export function revokeDispatchTrust(dirs, { trustPath = resolveDispatchTrustPath
   // side effect a cleanup pass should never have.
   if (!existsSync(trustPath)) return { revoked: [] };
   try {
-    return withFileLock(`${trustPath}.lock`, () => {
+    return withFileLock(dispatchTrustLockPath(trustPath), () => {
       const before = readJsonConfig(trustPath);
       // `null` = present but unparseable — write nothing, same refusal `grantDispatchTrust` makes.
       if (before === null) return { revoked: [] };

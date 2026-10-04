@@ -89,6 +89,8 @@ import {
   // this file is a SEPARATE fresh-dispatch call site (see `dispatchFix`'s own docblock), so it needs the same
   // two seams wired in here rather than inheriting them for free.
   dispatchSessionCwd, ensureDispatchSessionCwd,
+  // #3850 — a "Workspace not trusted" spawn refusal is an ENVIRONMENT fault the dispatcher heals itself.
+  isTrustRefusal, grantDispatchTrust,
 } from '../operations/dispatch-lane-io.mjs';
 import { stopSession } from '../operations/dispatch-abort.mjs';
 import { assertMainNotStale } from '../operations/review-dispatch.mjs';
@@ -884,6 +886,8 @@ export function dispatchFix(planned, {
   // and returns the `--settings` worktree patch). Before this, only dispatch-lane's sink applied it, so this
   // path's sessions hit Claude Code's "Call EnterWorktree first" guard on their first Edit.
   isolateSession = isolateDispatchSession,
+  // #3850 — re-grant trust after a trust refusal (the scratch ROOT, via `grantDispatchTrust`); a test stubs it.
+  healTrust = (d) => grantDispatchTrust(d),
   // fix procedure — injectable live fix-claim read (`fix-procedure.mjs#readLiveFixClaim`); a test stubs it.
   readFixClaim = ({ repo: r, pr }) => readLiveFixClaim({ repo: r, pr, ...(claimRoot ? { lockRoot: claimRoot } : {}) }),
 } = {}) {
@@ -971,8 +975,29 @@ export function dispatchFix(planned, {
     // #x0jphk5 — nothing was actually spawned: release so a legitimate retry for this same PR is never blocked
     // by our own failed attempt.
     releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
+    // #3850 — the CLI's own stderr proves no agent started AND names a fault the dispatcher can heal (trust
+    // the scratch root). Re-grant now and surface it as a transient environment fault, never a dispatch failure.
+    if (isTrustRefusal(e)) {
+      try { healTrust(sessionCwdFor('_')); } catch { /* grantDispatchTrust never throws; belt-and-suspenders */ }
+      throw new Error(`${DISPATCH_ENV_FAULT_PREFIX} workspace not trusted (claude --bg refused the scratch cwd) — `
+        + 'the dispatch scratch root was re-granted; no agent started, retrying next pass');
+    }
     throw e;
   }
+}
+
+/** #3850 — the `why` prefix that marks a refusal as an environment fault the dispatcher already healed. */
+export const DISPATCH_ENV_FAULT_PREFIX = 'dispatch-env-fault:';
+
+/**
+ * #3850 — re-kind a `dispatch-failed` refusal whose cause is a healed environment fault (see
+ * {@link DISPATCH_ENV_FAULT_PREFIX}) as `dispatch-env-fault`: transient, retried next pass, and NOT one of
+ * health-watch's blocking refusal kinds. Pure; every other refusal passes through untouched.
+ * @param {Array<{kind:string, why?:string}>} refusals
+ */
+export function classifyEnvFaultRefusals(refusals) {
+  return refusals.map((r) => (r?.kind === 'dispatch-failed' && String(r.why ?? '').startsWith(DISPATCH_ENV_FAULT_PREFIX)
+    ? { ...r, kind: 'dispatch-env-fault' } : r));
 }
 
 /**
@@ -1238,7 +1263,7 @@ export function runReconcileFixDispatch({
     }
   }
 
-  return { dispatched, refusals, scopeRanks: scopeFilter.ranks, ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
+  return { dispatched, refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
 }
 
 /** Card xkyw1x4 — a `queueAdmission` option may be a queue BUDGET already (`createQueueBudget`'s object — the
