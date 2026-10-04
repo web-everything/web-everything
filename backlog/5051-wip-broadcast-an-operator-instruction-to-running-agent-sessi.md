@@ -2,9 +2,10 @@
 bornAs: x4lad92
 kind: story
 size: 8
-status: open
+status: resolved
 scope: ["plateau:wip-relay.js", "plateau:scripts/wip-publish.ts", "plateau:src/wip/glance/glance-view.ts"]
 dateOpened: "2026-10-03"
+dateResolved: "2026-10-04"
 tags: []
 ---
 
