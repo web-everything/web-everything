@@ -918,6 +918,8 @@ export function dispatchFix(planned, {
       pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane,
     };
   }
+  // #3850 — the cwd this dispatch actually spawned into, so a trust heal grants THAT dir (never a placeholder).
+  let spawnCwd = null;
   try {
     const sessionSlug = sessionSlugFor(planned.itemNum, 'fix', planned.pr, '', repo);
     // #3960 — the repo-aware quintet, computed once from `repo`'s own profile (never re-derived here). The
@@ -943,6 +945,7 @@ export function dispatchFix(planned, {
     // #4174 — THE FIX: this session's cwd is a scratch directory outside `root`, never `root` itself (see
     // `dispatchSessionCwd`'s own header at the io shell for why — the identical bug `createDispatchSinks` had).
     const sessionCwd = ensureSessionCwd(sessionCwdFor(sessionId));
+    spawnCwd = sessionCwd;
     const argv = buildAgentArgv({
       sessionId,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
@@ -977,10 +980,13 @@ export function dispatchFix(planned, {
     releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
     // #3850 — the CLI's own stderr proves no agent started AND names a fault the dispatcher can heal (trust
     // the scratch root). Re-grant now and surface it as a transient environment fault, never a dispatch failure.
-    if (isTrustRefusal(e)) {
-      try { healTrust(sessionCwdFor('_')); } catch { /* grantDispatchTrust never throws; belt-and-suspenders */ }
+    // Grants the REAL session dir (`grantDispatchTrust` collapses it to the scratch root under the default policy,
+    // and trusts exactly that dir under `WE_DISPATCH_TRUST_ROOT=off`). With no cwd (the refusal came before one was
+    // made) nothing was healed, so it is NOT relabelled transient — the raw error surfaces as before.
+    if (spawnCwd && isTrustRefusal(e)) {
+      try { healTrust(spawnCwd); } catch { /* grantDispatchTrust never throws; belt-and-suspenders */ }
       throw new Error(`${DISPATCH_ENV_FAULT_PREFIX} workspace not trusted (claude --bg refused the scratch cwd) — `
-        + 'the dispatch scratch root was re-granted; no agent started, retrying next pass');
+        + 'the dispatch scratch cwd was re-granted; no agent started, retrying next pass');
     }
     throw e;
   }

@@ -10,10 +10,12 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  answerDisposition, buildOperatorAnswer, parseOperatorAnswer, withOperatorAnswer, DISPOSITIONS,
+  answerDisposition, buildOperatorAnswer, parseOperatorAnswer, withOperatorAnswer, DISPOSITIONS, isCloseSupersededExecuted,
 } from '../stand-down-answer-core.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
-import { runReconcilePromoteDraftDispatch, closeSupersededComment, CLOSE_SUPERSEDED_MARKER } from '../../operations/promote-draft-pr-dispatch.mjs';
+import {
+  runReconcilePromoteDraftDispatch, closeSupersededComment, CLOSE_SUPERSEDED_MARKER, defaultReadCardsOnMain, PR_FILES_JSON_CAP,
+} from '../../operations/promote-draft-pr-dispatch.mjs';
 
 const comments3850 = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', '3850-stand-down-answer.json'), 'utf8'));
 const pr3850 = {
@@ -28,6 +30,19 @@ describe('#3850 — structured dispositions', () => {
     expect(answerDisposition({ reason: 'Scope correction is fine but must be careful' })).toBeNull();
     expect(answerDisposition({ reason: 'Fix the test; the old card was superseded by #12' })).toBeNull();
     expect(answerDisposition(null)).toBeNull();
+  });
+
+  it('a DESTRUCTIVE disposition is never inferred from prose naming another object or asking for more work', () => {
+    for (const reason of [
+      'Supersedes the earlier ruling — keep the PR, just fix the failing test',
+      'Supersede the old implementation with the reviewed replacement',
+      'Superseded by #12, carry on',
+      'Close issue #123 as superseded; continue this repair',
+      'Close the old card as superseded and fix this PR',
+      'Close as superseded but keep the card',
+    ]) expect(answerDisposition({ reason }), reason).toBeNull();
+    expect(answerDisposition({ reason: 'Close this PR as superseded.' })).toBe('close-superseded');
+    expect(answerDisposition({ reason: 'close as superseded' })).toBe('close-superseded');
   });
 
   it('an explicit disposition round-trips through the record, and an unknown one is refused', () => {
@@ -57,6 +72,19 @@ describe('#3850 — structured dispositions', () => {
     expect(plan.dispatch.filter((d) => d.prNumber === 3850).map((d) => d.kind)).toEqual(['close-superseded']);
     expect(planReconcile({ prs: [{ ...pr3850, state: 'CLOSED' }], agents: [], durableCounts: {}, now: 0 }).dispatch
       .filter((d) => d.kind === 'close-superseded')).toEqual([]);
+  });
+
+  it('idempotent: once the conveyor\'s close comment postdates the answer, a REOPENED PR is not re-closed', () => {
+    const closed = { author: { login: 'web-everything' }, body: closeSupersededComment({ reason: 'Close as superseded: x', actor: 'chalbert', channel: 'chat' }) };
+    const reopened = { ...pr3850, comments: [...comments3850, closed] };
+    const plan = planReconcile({ prs: [reopened], agents: [], durableCounts: {}, now: Date.parse('2026-10-04T17:40:00Z') });
+    expect(plan.dispatch.filter((d) => d.prNumber === 3850)).toEqual([]);
+    expect(isCloseSupersededExecuted(reopened.comments)).toBe(true);
+    // a marker an UNTRUSTED account posted counts for nothing; a fresh answer AFTER the marker plans again
+    const forged = { ...pr3850, comments: [...comments3850, { author: { login: 'random-user' }, body: closed.body }] };
+    expect(isCloseSupersededExecuted(forged.comments)).toBe(false);
+    const reanswered = [...comments3850, closed, comments3850.find((c) => c.body.startsWith('<!-- conveyor-stand-down-answer:v1 -->'))];
+    expect(isCloseSupersededExecuted(reanswered)).toBe(false);
   });
 
   it('a live fix claim still wins: nothing is closed under a running fixer', () => {
@@ -95,6 +123,13 @@ describe('#3850 — the promote-draft pass executes the disposition', () => {
     expect(onMain.refusals).toEqual([expect.objectContaining({ pr: 3850, kind: 'close-card-on-main' })]);
     const unreadable = runReconcilePromoteDraftDispatch({ ...base, reconcile: () => plan, readCardsOnMain: () => { throw new Error('gh down'); }, closePr: never });
     expect(unreadable.refusals).toEqual([expect.objectContaining({ pr: 3850, kind: 'close-unreadable' })]);
+  });
+
+  it('defaultReadCardsOnMain fails closed when gh truncated the files list at its 100-entry cap', () => {
+    const files = (n) => JSON.stringify({ files: Array.from({ length: n }, (_, i) => ({ path: `src/f${i}.js` })) });
+    const runGh = (n) => (args) => { if (args[0] === 'pr') return files(n); throw new Error('no contents call expected'); };
+    expect(() => defaultReadCardsOnMain({ repoSlug: 'o/r', prNumber: 1, runGh: runGh(PR_FILES_JSON_CAP) })).toThrow(/cap/);
+    expect(defaultReadCardsOnMain({ repoSlug: 'o/r', prNumber: 1, runGh: runGh(PR_FILES_JSON_CAP - 1) })).toEqual([]);
   });
 
   it('the comment escapes HTML-comment openers in the quoted ruling', () => {

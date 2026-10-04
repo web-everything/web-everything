@@ -61,10 +61,10 @@ import { execFileSync } from 'node:child_process';
 // these ran SIMULTANEOUSLY in a single `ps aux` snapshot, none logged anywhere, spending the shared `graphql`
 // bucket (8943 points/hour that hour, 6365.2 UNATTRIBUTED — `gh-spend.mjs report --hours=1 --by=caller`).
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { normNum } from '../conveyor/queue-store.mjs';
@@ -2150,6 +2150,9 @@ export function isTrustedIn(config, dir) {
  * #3850 — WHICH directory to trust for a dispatch cwd. A cwd under the dispatch scratch root resolves to the ROOT
  * (trusted once, inherited by every session dir after it); anything else (a lane, a test path) to itself, exactly
  * as before. {@link DISPATCH_TRUST_ROOT_ENV}=off restores the per-dir grant. PURE apart from the env read.
+ * The root is collapsed to ONLY when it is the dispatcher-owned `…/.operations/dispatch` directory. A broader
+ * `WE_DISPATCH_CWD` override (e.g. `$HOME/work`) would make the persistent trust cover every repo ever cloned under
+ * it (hooks, MCP servers, project settings) and nothing revokes a root entry — those fall back to the per-dir grant.
  * @param {string} dir
  * @param {{env?: Record<string, string|undefined>, scratchRoot?: string}} [o]
  * @returns {string[]}
@@ -2158,8 +2161,12 @@ export function dispatchTrustTargets(dir, { env = process.env, scratchRoot = dis
   const d = resolve(String(dir));
   if (/^(0|off|false|no)$/i.test(String(env?.[DISPATCH_TRUST_ROOT_ENV] ?? '').trim())) return [d];
   const r = resolve(String(scratchRoot));
+  if (!r.endsWith(`${sep}.operations${sep}dispatch`)) return [d];
   return d === r || d.startsWith(`${r}/`) ? [r] : [d];
 }
+
+/** How many times {@link grantDispatchTrust} re-reads and re-applies a grant a concurrent writer clobbered. */
+export const DISPATCH_TRUST_GRANT_ATTEMPTS = 3;
 
 /** Test/override hook for {@link grantDispatchTrust}'s trust file — mirrors {@link DISPATCH_CWD_ENV}. A
  *  soak/sim world points this at a throwaway file under its own root, so the REAL production mechanism runs
@@ -2205,23 +2212,36 @@ function resolveDispatchTrustPath(env = process.env) {
  * @param {{trustPath?: string}} [o] - injectable ONLY so a test can point it at a throwaway file instead of
  *   overriding process.env — the same seam `exec`/`spawnAgent` already are on this sink.
  */
-export function grantDispatchTrust(dir, { trustPath = resolveDispatchTrustPath(), env = process.env, scratchRoot } = {}) {
+export function grantDispatchTrust(dir, { trustPath = resolveDispatchTrustPath(), env = process.env, scratchRoot, afterWrite } = {}) {
   try {
     const targets = dispatchTrustTargets(dir, { env, ...(scratchRoot ? { scratchRoot } : {}) });
-    withFileLock(dispatchTrustLockPath(trustPath), () => {
-      const before = readJsonConfig(trustPath);
-      // `null` = present but unparseable (bootstrap-session.mjs's own `readJsonConfig` contract) — write
-      // nothing, exactly as bootstrap-session.mjs's own trust step refuses to in that case.
-      if (before === null) return;
-      // #3850 — already trusted (the dir itself or the scratch ROOT above it): write NOTHING. Once the root is
-      // trusted this is every dispatch, so the operator-wide file is no longer rewritten per spawn at all.
-      if (targets.every((t) => isTrustedIn(before, t))) return;
-      const next = withTrustedDirs(before, targets);
-      // Backup-first, exactly matching bootstrap-session.mjs's own `writeTrust` discipline for this same file —
-      // it holds the operator's whole per-project CLI state, not just this one directory's trust flag.
-      if (existsSync(trustPath)) copyFileSync(trustPath, `${trustPath}.bak`);
-      writeFileSync(trustPath, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
-    });
+    // #3850 — the CLI's own `~/.claude.json` writes do NOT take our lock (they use `<trust>.lock`, which we must
+    // never contend for or steal), so a CLI write can land between our read and our rename and drop the grant.
+    // Atomic rename + a re-read that re-applies a lost grant (bounded) is what we can do without owning its lock.
+    for (let attempt = 0; attempt <= DISPATCH_TRUST_GRANT_ATTEMPTS; attempt += 1) {
+      const done = withFileLock(dispatchTrustLockPath(trustPath), () => {
+        const before = readJsonConfig(trustPath);
+        // `null` = present but unparseable (bootstrap-session.mjs's own `readJsonConfig` contract) — write
+        // nothing, exactly as bootstrap-session.mjs's own trust step refuses to in that case.
+        if (before === null) return true;
+        // #3850 — already trusted: write NOTHING. A scratch ROOT target is trusted by the CLI's ancestor walk
+        // (a dispatch scratch dir is never a git repo); any other target (a lane — a git worktree) needs its OWN
+        // entry, since the CLI does not necessarily inherit an ancestor's trust there.
+        const alreadyTrusted = (t) => (t !== resolve(String(dir))
+          ? isTrustedIn(before, t) : before?.projects?.[t]?.hasTrustDialogAccepted === true);
+        if (targets.every(alreadyTrusted)) return true;
+        if (attempt === DISPATCH_TRUST_GRANT_ATTEMPTS) return true; // out of retries — never loop forever
+        const next = withTrustedDirs(before, targets);
+        // Backup-first, exactly matching bootstrap-session.mjs's own `writeTrust` discipline for this same file —
+        // it holds the operator's whole per-project CLI state, not just this one directory's trust flag.
+        const exists = existsSync(trustPath);
+        if (exists) copyFileSync(trustPath, `${trustPath}.bak`);
+        writeJsonAtomic(trustPath, next, exists ? { mode: statSync(trustPath).mode & 0o777 } : {});
+        return false; // written — loop once more to confirm it survived
+      });
+      if (done) break;
+      if (typeof afterWrite === 'function') afterWrite(attempt);
+    }
   } catch { /* see docblock — never blocks a dispatch */ }
 }
 

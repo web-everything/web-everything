@@ -46,7 +46,7 @@ describe('#3850 — trust the dispatch scratch ROOT, once', () => {
 
   it('grants the root (not the session dir), and a second dispatch writes nothing at all', () => {
     const trustFile = join(dir, 'trust-root.json');
-    const root = join(dir, 'dispatch');
+    const root = join(dir, '.operations', 'dispatch');
     writeFileSync(trustFile, JSON.stringify({ projects: { '/other': { hasTrustDialogAccepted: true } } }));
     grantDispatchTrust(join(root, 'sess-1'), { trustPath: trustFile, env: {}, scratchRoot: root });
     const after1 = readFileSync(trustFile, 'utf8');
@@ -64,10 +64,55 @@ describe('#3850 — trust the dispatch scratch ROOT, once', () => {
     const trustFile = join(dir, 'trust-cli-lock.json');
     writeFileSync(trustFile, JSON.stringify({ projects: {} }));
     mkdirSync(`${trustFile}.lock`); // what the CLI holds while it writes ~/.claude.json
-    grantDispatchTrust(join(dir, 'd2', 'sess'), { trustPath: trustFile, env: {}, scratchRoot: join(dir, 'd2') });
-    expect(JSON.parse(readFileSync(trustFile, 'utf8')).projects[join(dir, 'd2')]).toEqual({ hasTrustDialogAccepted: true });
+    const d2 = join(dir, 'd2', '.operations', 'dispatch');
+    grantDispatchTrust(join(d2, 'sess'), { trustPath: trustFile, env: {}, scratchRoot: d2 });
+    expect(JSON.parse(readFileSync(trustFile, 'utf8')).projects[d2]).toEqual({ hasTrustDialogAccepted: true });
     expect(existsSync(`${trustFile}.lock`)).toBe(true); // the CLI's lock is never stolen
     expect(dispatchTrustLockPath(trustFile)).not.toBe(`${trustFile}.lock`);
+  });
+});
+
+describe('#3850 review round 1 — trust grant scope and lost-update hardening', () => {
+  it('a lane (git worktree) cwd under a trusted ANCESTOR still gets its own entry — the ancestor walk is scratch-only', () => {
+    const trustFile = join(dir, 'trust-lane.json');
+    const lane = '/ws/.lanes/we/lane-3';
+    writeFileSync(trustFile, JSON.stringify({ projects: { '/ws': { hasTrustDialogAccepted: true } } }));
+    grantDispatchTrust(lane, { trustPath: trustFile, env: {}, scratchRoot: '/ws/.operations/dispatch' });
+    expect(JSON.parse(readFileSync(trustFile, 'utf8')).projects[lane]).toEqual({ hasTrustDialogAccepted: true });
+  });
+
+  it('a broad WE_DISPATCH_CWD override is NOT collapsed to its root — per-dir grant instead', () => {
+    expect(dispatchTrustTargets('/home/u/work/sess', { env: {}, scratchRoot: '/home/u/work' })).toEqual(['/home/u/work/sess']);
+    expect(dispatchTrustTargets('/ws/.operations/dispatch/s', { env: {}, scratchRoot: '/ws/.operations/dispatch' })).toEqual(['/ws/.operations/dispatch']);
+  });
+
+  it('a grant a concurrent CLI write clobbers is re-applied, and the CLI\'s own update survives (two-writer interleave)', () => {
+    const trustFile = join(dir, 'trust-interleave.json');
+    const root = join(dir, 'il', '.operations', 'dispatch');
+    writeFileSync(trustFile, JSON.stringify({ projects: {} }));
+    let clobbered = false;
+    grantDispatchTrust(join(root, 's'), {
+      trustPath: trustFile, env: {}, scratchRoot: root,
+      // the CLI rewrites the file from ITS stale snapshot right after our write: our grant is gone, its update is new
+      afterWrite: () => { if (!clobbered) { clobbered = true; writeFileSync(trustFile, JSON.stringify({ projects: {}, cliOnlyKey: 'kept' })); } },
+    });
+    const j = JSON.parse(readFileSync(trustFile, 'utf8'));
+    expect(j.projects[root]).toEqual({ hasTrustDialogAccepted: true });
+    expect(j.cliOnlyKey).toBe('kept');
+  });
+
+  it('with WE_DISPATCH_TRUST_ROOT=off a heal grants the real session dir, not a placeholder', () => {
+    const trustFile = join(dir, 'trust-off.json');
+    const root = join(dir, 'off', '.operations', 'dispatch');
+    writeFileSync(trustFile, JSON.stringify({ projects: {} }));
+    const refusal = Object.assign(new Error('Command failed'), { status: 1, stderr: 'Workspace not trusted. Run `claude` once' });
+    expect(() => dispatchFix({ itemNum: null, pr: 1, laneRef: 'lane/x', scope: ['we:x'], lane: 1 }, {
+      root: '/repo', readBrief: () => '# {{PR_NUM}} {{ITEM_NUM}} {{LANE}} {{SESSION_SLUG}} {{SCOPE}} {{LANE_REF}}', mintSessionId: () => 'sid9', readFixClaim: () => null,
+      ensureSessionCwd: (d) => d, sessionCwdFor: (s) => join(root, s),
+      spawnAgent: () => { throw refusal; },
+      healTrust: (d) => grantDispatchTrust(d, { trustPath: trustFile, env: { [DISPATCH_TRUST_ROOT_ENV]: 'off' }, scratchRoot: root }),
+    })).toThrow(/dispatch-env-fault/);
+    expect(JSON.parse(readFileSync(trustFile, 'utf8')).projects[join(root, 'sid9')]).toEqual({ hasTrustDialogAccepted: true });
   });
 });
 
@@ -96,7 +141,7 @@ describe('#3850 — a trust refusal is a healed environment fault, not a dispatc
     expect(thrown.message.startsWith(DISPATCH_ENV_FAULT_PREFIX)).toBe(true);
     expect(thrown.message).toMatch(/workspace not trusted/i); // the health smell still counts it
     expect(thrown.stderr).toBeUndefined();
-    expect(healed).toEqual(['/ws/.operations/dispatch/_']);
+    expect(healed).toEqual(['/ws/.operations/dispatch/sid']); // the REAL session dir, never a placeholder
   });
 
   it('any other spawn failure is rethrown untouched, with no heal', () => {

@@ -17,7 +17,7 @@ export default {
     const violations = [];
     try {
       const trustFile = join(dir, 'claude.json');
-      const scratchRoot = join(dir, 'dispatch');
+      const scratchRoot = join(dir, '.operations', 'dispatch');
       writeFileSync(trustFile, JSON.stringify({ projects: {} }));
       mkdirSync(`${trustFile}.lock`); // the CLI's own config lock, held
       grantDispatchTrust(join(scratchRoot, '3e7c5b54'), { trustPath: trustFile, env: {}, scratchRoot });

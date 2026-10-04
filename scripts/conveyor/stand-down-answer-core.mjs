@@ -16,8 +16,11 @@ export const DISPOSITIONS = Object.freeze(['close-superseded']);
 
 /**
  * The disposition an answer carries: the explicit record field, or — for an answer recorded before the field
- * existed — a reason that OPENS with "close … as superseded" / "supersede(d) …" (deterministic, anchored; prose
- * that merely mentions superseding later on never matches).
+ * existed — a reason that OPENS with exactly "close as superseded" / "close this PR as superseded" and then ends
+ * the clause (`:` `.` `—` `;` `,` or the end of the text). A DESTRUCTIVE action is never read out of looser prose:
+ * "Supersedes the earlier ruling — keep the PR", "Supersede the old implementation with …" and "Close issue #123
+ * as superseded; continue this repair" all name some OTHER object or ask for continued work, so they infer
+ * nothing (an operator who means it uses `--disposition=close-superseded`).
  * @param {{disposition?: string, reason?: string}|null} answer
  * @returns {string|null}
  */
@@ -25,7 +28,8 @@ export function answerDisposition(answer) {
   if (!answer) return null;
   if (DISPOSITIONS.includes(answer.disposition)) return answer.disposition;
   const head = String(answer.reason ?? '').trim().toLowerCase();
-  return /^(close\b[^.\n:]{0,40}\bas superseded|supersede[ds]?\b)/.test(head) ? 'close-superseded' : null;
+  return /^close(?: (?:this|the) (?:pr|pull request))? as superseded\s*(?:[:.,;—–-]|$)/.test(head)
+    && !/\b(?:continue|keep|retain|but|however|instead)\b/.test(head) ? 'close-superseded' : null;
 }
 
 export function buildOperatorAnswer({ standDownId, reason, actor, channel, disposition }) {
@@ -106,4 +110,26 @@ export function withOperatorAnswer(prompt, answer) {
     return `# Operator ruling — DISPOSITION \`${answerDisposition(answer)}\` (conveyor-executed)\n\nThe operator ruled this PR should not land (verbatim: ${answer.reason}). The conveyor closes it mechanically. Do NOT delete, revert or edit files to implement this; stop and report.\n\n${prompt}`;
   }
   return `# Operator ruling — implement this answer to the stand-down\n\nRelayed on @${answer.actor}'s explicit instruction via ${answer.channel}.\nThe operator's answer, verbatim:\n\n${answer.reason}\n\nApply this ruling to the escalated question. Review gates remain in force. Escalate any remaining conflict with the goal or ratified decisions; do not infer permission to change lifecycle fields.\n\n${prompt}`;
+}
+
+/** #3850 — the marker on the conveyor's own superseded-close comment (posted by the promote-draft pass). */
+export const CLOSE_SUPERSEDED_MARKER = '<!-- conveyor-close-superseded:v1 -->';
+
+/**
+ * #3850 — has the latest operator answer's `close-superseded` ALREADY been executed? True when a trusted
+ * {@link CLOSE_SUPERSEDED_MARKER} comment postdates the latest answer comment. Without it a PR a human reopens
+ * (to rescue its card, say) is re-planned `close-superseded` — and re-closed with another comment — every tick
+ * until someone deletes the answer. A NEW answer posted after the marker is a fresh ruling and plans again.
+ * @param {Array<object>|null|undefined} comments - oldest first, as `gh pr view --json comments` returns them.
+ * @returns {boolean}
+ */
+export function isCloseSupersededExecuted(comments) {
+  if (!Array.isArray(comments)) return false;
+  let answerAt = -1;
+  for (let i = comments.length - 1; i >= 0; i -= 1) {
+    if (parseOperatorAnswer(comments[i])) { answerAt = i; break; }
+  }
+  if (answerAt < 0) return false;
+  return comments.slice(answerAt + 1).some((c) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'
+    && c.body.trimStart().startsWith(CLOSE_SUPERSEDED_MARKER));
 }

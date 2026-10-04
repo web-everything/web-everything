@@ -120,7 +120,7 @@ import {
 } from './stand-down.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 // #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
-import { answerDisposition } from './stand-down-answer-core.mjs';
+import { answerDisposition, isCloseSupersededExecuted } from './stand-down-answer-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { reviewSessionSlug } from './review-session-slug.mjs';
 // Both dispatcher wrappers delegate to the pure session-slug module.
@@ -1557,7 +1557,10 @@ export function planReconcile({
     // close a PR under a running fixer) and before every repair branch.
     // `state` is ABSENT on the open-only `gh pr list` listing (`OPEN_PR_LIST_FIELDS`) — absent means open (live:
     // the first edge tick dispatched a fixer at #3850 because this read `state === 'OPEN'`).
+    // Idempotent: once the conveyor's own close comment postdates the answer the disposition is DONE — a PR a
+    // human then reopens is never re-closed every tick (it also never reaches a fixer: the answer stays on it).
     if ((pr?.state ?? 'OPEN') === 'OPEN' && answerDisposition(operatorAnswer) === 'close-superseded') {
+      if (isCloseSupersededExecuted(pr?.comments)) continue;
       dispatch.push({
         ...base, kind: 'close-superseded',
         why: `the operator ruled this PR superseded (@${operatorAnswer.actor} via ${operatorAnswer.channel}) — close it, no fix agent`,

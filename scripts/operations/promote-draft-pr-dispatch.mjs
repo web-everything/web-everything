@@ -68,6 +68,7 @@ import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
 import { reduceCheckState } from './pr-status.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
+import { CLOSE_SUPERSEDED_MARKER } from '../conveyor/stand-down-answer-core.mjs';
 
 const THIS_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 let promoteClosureMemo;
@@ -133,14 +134,17 @@ export function defaultAddLabel({ repoSlug, prNumber, label, runGh = runGhSync }
   });
 }
 
-/** #3850 — the marker on the conveyor's own superseded-close comment. */
-export const CLOSE_SUPERSEDED_MARKER = '<!-- conveyor-close-superseded:v1 -->';
+/** #3850 — the marker on the conveyor's own superseded-close comment (defined with the answer reader that checks it). */
+export { CLOSE_SUPERSEDED_MARKER };
 
 /** #3850 — the comment the close carries: who ruled it, verbatim. Pure. */
 export function closeSupersededComment(answer = {}) {
   const quote = String(answer.reason ?? '').replace(/<!--/g, '&lt;!--').split('\n').map((l) => `> ${l}`).join('\n');
   return `${CLOSE_SUPERSEDED_MARKER}\n## Closed as superseded — operator disposition\n\nRuled by @${answer.actor ?? 'operator'} via ${answer.channel ?? 'unknown'} (\`close-superseded\`), executed mechanically by the conveyor. No files were changed and no fix agent was dispatched.\n\n${quote}`;
 }
+
+/** `gh pr view --json files` returns at most this many entries, silently. */
+export const PR_FILES_JSON_CAP = 100;
 
 /** #3850 — close a PR with the superseded comment (one `gh pr close --comment` write). */
 export function defaultClosePr({ repoSlug, prNumber, comment, runGh = runGhSync } = {}) {
@@ -159,6 +163,11 @@ export function defaultReadCardsOnMain({ repoSlug, prNumber, base = 'main', runG
   const view = JSON.parse(runGh(['pr', 'view', String(prNumber), '--repo', repoSlug, '--json', 'files'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-files', repo: repoSlug },
   }));
+  // `--json files` is capped at 100 entries and does not error when it truncates: a list at the cap may be missing
+  // the very card that is already on main, so it is unreadable, not "no card" (fail closed → the caller refuses).
+  if ((view?.files ?? []).length >= PR_FILES_JSON_CAP) {
+    throw new Error(`pr files list is at the ${PR_FILES_JSON_CAP}-entry gh cap — cannot prove no card is already on ${base}`);
+  }
   const cards = (view?.files ?? []).map((f) => f?.path).filter((p) => /^backlog\/[^/]+\.md$/.test(String(p)));
   const onMain = [];
   for (const path of cards) {
