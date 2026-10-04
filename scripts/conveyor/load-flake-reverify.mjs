@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { runBounded } from '../lib/bounded-child.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
-import { loadFlakeHoldState, loadFlakeResults, buildLoadFlakeResolvedComment } from './stand-down.mjs';
+import { loadFlakeResults, buildLoadFlakeResolvedComment } from './stand-down.mjs';
+import { loadFlakeHoldState } from './load-flake-hold.mjs';
 
 export function reverifyConfig(env = process.env, maxLoadPerCore) {
   const positive = (value, fallback) => {
@@ -65,7 +66,11 @@ export async function runLoadFlakeReverify({ repo = 'we', dryRun = false, config
   if (attempts >= config.maxAttempts) { await post('exhausted'); return { result: 'exhausted' }; }
   // Legacy holds have no recorded head: the fresh discovery head is still required as an ancestor.
   await io.prepare(slug, hold.alt.branch, pr.headRefName);
-  if (!await io.isAncestor(pr.headRefOid, hold.alt.sha)) return { deferred: 'non-ancestor' };
+  if (!await io.isAncestor(pr.headRefOid, hold.alt.sha)) {
+    // The PR moved past the saved repair: end the hold so reconcile hands the PR back and this pass stops re-picking it.
+    await post('head-moved', 'The saved alt commit is not a descendant of the PR head, so it can no longer be pushed.');
+    return { deferred: 'non-ancestor' };
+  }
   // Lease at the saved alt BRANCH (lane-pool resolves origin/<ref>); the head check below pins the exact sha.
   const lane = await io.acquire(hold.alt.branch, pr.number, key);
   try {

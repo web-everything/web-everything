@@ -1,6 +1,6 @@
 /** Operator ceremony record for we:scripts/conveyor/stand-down-answer.mjs. Pure readers. */
-import { AUTOMATION_LOGINS, OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
-import { standDownComments, isStandDownSuperseded } from './stand-down.mjs';
+import { AUTOMATION_LOGINS, OPERATOR_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { standDownComments, isStandDownSuperseded, isLoadFlakeStandDown } from './stand-down.mjs';
 import { isAdvisoryMechanismStandDownSuperseded } from './advisory-fix-mark.mjs';
 
 export const OPERATOR_ANSWER_MARKER = '<!-- conveyor-stand-down-answer:v1 -->';
@@ -34,7 +34,8 @@ export function parseOperatorAnswer(comment) {
 }
 
 function isTerminal(comment) {
-  return standDownComments([comment]).length > 0;
+  // A legacy load-flake hold is no longer a terminal stand-down, but an operator can still answer (end) it by id.
+  return standDownComments([comment]).length > 0 || (isTrustedMarkerAuthor(comment) && isLoadFlakeStandDown(comment));
 }
 
 export function operatorAnswerForStandDown(comments, index) {
