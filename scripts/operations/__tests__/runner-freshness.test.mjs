@@ -85,6 +85,7 @@ describe('runner freshness policy', () => {
         "pr-reconcile",
         "pr-status",
         "priority-sync",
+        "record-referral-ruling",
         "record-verdict",
         "resolve",
         "restart-runner",
