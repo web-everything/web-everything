@@ -67,7 +67,7 @@ export default {
   id: 'ruling-needed-pr-waits-silently',
   title: 'a PR parked on unanswered mandatory referrals waits for hours with no label, needs-you row, push or health alert',
   card: 'operator order 2026-10-04 ~08:15 ET; live incident PR #3794 04:32Z-12:15Z (also #3771, #3833)',
-  fixedBy: { sha: '3aeccaa0bf05f4ae5d2c565866f46b587787da8a', where: 'lane/fix-ruling-needed-surface' },
+  fixedBy: { sha: '4a33d462c910fbbd29444b1600ff5b1d717570d7,3aeccaa0bf05f4ae5d2c565866f46b587787da8a', where: 'lane/fix-ruling-needed-surface' },
   fixPresent(root) { return existsSync(join(root, 'scripts/lib/ruling-ledger.mjs')); },
   async run({ log, sourceRoot = REPO_ROOT } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-ruling-needed-'));

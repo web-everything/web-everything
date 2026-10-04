@@ -43,7 +43,7 @@ describe('needs-you row and push', () => {
   it('the queue row names every finding with its file, the head, and when it began', () => {
     const row = rulingNeededRow(repo, parked());
     expect(row).toMatchObject({ repo, number: 3794, head: H1 });
-    expect(row.findings).toEqual([{ file: 'policy/pointer.md', line: 12, summary: SUMMARY }]);
+    expect(row.findings).toEqual([{ file: 'policy/pointer.md', line: 12, summary: SUMMARY, reason: 'pending' }]);
     expect(row.since).toBe(new Date(Date.parse('2026-10-03T08:05:00Z')).toISOString());
   });
   it('no row once ruled', () => {

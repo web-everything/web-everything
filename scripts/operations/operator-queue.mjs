@@ -61,7 +61,7 @@ export function rulingNeededRow(repo, pr) {
   return {
     repo, number: pr.number, title: pr.title, head: need.head,
     since: need.since === null ? null : new Date(need.since).toISOString(),
-    findings: need.findings.map((f) => ({ file: f.file, line: f.line, summary: f.summary })),
+    findings: need.findings.map((f) => ({ file: f.file, line: f.line, summary: f.summary, reason: f.reason })),
   };
 }
 
@@ -396,7 +396,7 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
     console.log(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`).join('\n') || '(none)');
     console.log('RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:');
     console.log(report.rulingNeeded.map((r) => `${r.repo}#${r.number}  ${r.title}  [waiting since ${r.since || 'time unknown'}, head ${r.head.slice(0, 9)}]\n`
-      + r.findings.map((f) => `    - ${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}  ${f.summary}`).join('\n')).join('\n') || '(none)');
+      + r.findings.map((f) => `    - ${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}  ${f.summary}${f.reason === 'dispute' ? '  [came back after your block ruling; the fixer and reviewer disagree]' : ''}`).join('\n')).join('\n') || '(none)');
     console.log('PENDING — transient, re-run (GitHub is still computing mergeability; no agent work owed):');
     console.log(report.pending.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`).join('\n') || '(none)');
     console.log('UNSUPPORTED REPO — owed work the conveyor cannot dispatch for this repo:');

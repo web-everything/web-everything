@@ -50,12 +50,27 @@ const plan = (headIdx, comments, minutes) => {
   pr = { ...pr, referralHold: hold.decideReferralHold(pr, [evidence(H[headIdx], minutes)], { repo, now: at + (minutes + 10) * 60000 }) };
   return core.planReconcile({ prs: [pr], agents: [], now: at + (minutes + 10) * 60000, requiredChecks: ['gate'] });
 };
+import { readFileSync } from 'node:fs';
+const fx = JSON.parse(readFileSync(join(src, 'scripts/conveyor/soak/fixtures/pr-3794-live-thread.json'), 'utf8'));
+const liveHeads = {};
+for (const cm of fx.comments) for (const r of jury.readReferralRecords([cm], {}).records) liveHeads[r.head.slice(0, 9)] = r.head;
+const livePlan = (head, upto) => { let pr = { number: 3794, state: 'OPEN', headRefName: 'lane/prepare-main-protection', headRefOid: head,
+    labels: [{ name: 'review:human' }, { name: 'advisory:changes' }], mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }], comments: fx.comments.filter((cm) => cm._liveIndex <= upto) };
+  if (pass.enrichPrsWithIgnoredRulings) [pr] = pass.enrichPrsWithIgnoredRulings([pr]);
+  return core.planReconcile({ prs: [pr], agents: [], now: Date.parse('2026-10-04T06:00:00Z'), requiredChecks: ['gate'] }); };
+const l1 = livePlan(liveHeads.dd32bfb5c, 43);
+const l2 = livePlan(liveHeads['13f5a7354'], 51);
+const l3 = livePlan(liveHeads['13f5a7354'], 52);
 const p2 = plan(1, thread(2), 20);
 const p3 = plan(2, thread(3), 40);
 const out = {
   h2: p2.dispatch.map((d) => [d.kind, d.mode ?? null]), h2Refusals: p2.refusals.map((r) => r.kind),
   h2Ruling: p2.dispatch[0]?.rulingNotAddressed?.matches?.[0]?.ruling ?? null,
   h3: p3.dispatch.map((d) => [d.kind, d.mode ?? null]), h3Refusals: p3.refusals.map((r) => r.kind), h3Notes: p3.notes.map((n) => n.kind),
+  live1: l1.dispatch.map((d) => [d.kind, d.mode ?? null]), live1Ruling: l1.dispatch[0]?.rulingNotAddressed?.matches?.[0]?.ruling ?? null,
+  live2: l2.dispatch.map((d) => [d.kind, d.mode ?? null]), live2Notes: l2.notes.map((n) => n.kind),
+  live3: l3.dispatch.map((d) => [d.kind, d.mode ?? null]), live3Notes: l3.notes.map((n) => n.kind),
 };
 process.stdout.write(JSON.stringify(out));
 `;
@@ -64,7 +79,7 @@ export default {
   id: 'ignored-ruling-parks-again',
   title: 'a finding the operator already ruled block comes back on a new head and the review just parks again instead of going back to the fixer',
   card: 'operator order 2026-10-04 ~08:15 ET; live incident PR #3794 (card xcs4nce, policy pointer files; also #3833, #3771)',
-  fixedBy: { sha: '3aeccaa0bf05f4ae5d2c565866f46b587787da8a', where: 'lane/fix-ruling-needed-surface' },
+  fixedBy: { sha: '4a33d462c910fbbd29444b1600ff5b1d717570d7,3aeccaa0bf05f4ae5d2c565866f46b587787da8a', where: 'lane/fix-ruling-needed-surface' },
   fixPresent(root) { return existsSync(join(root, 'scripts/lib/ruling-ledger.mjs')); },
   async run({ log, sourceRoot = REPO_ROOT } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-ignored-ruling-'));
@@ -85,6 +100,15 @@ export default {
       if (sentBack && !/pointer files must be listed/.test(out.h2Ruling ?? '')) violations.push({ invariant: 'ruling-attached', detail: 'the original ruling text is not attached to the send-back' });
       if (out.h3.length !== 0 || !out.h3Refusals.includes('ruling-dispute') || !out.h3Notes.includes('ruling-dispute')) {
         violations.push({ invariant: 'escalates-after-two-misses', detail: `miss 2 must escalate (no third fixer round, a ruling-dispute note); got dispatch=${JSON.stringify(out.h3)} refusals=${out.h3Refusals.join(',') || 'none'} notes=${out.h3Notes.join(',') || 'none'}` });
+      }
+      // The live thread itself (PR #3794): the operator's own "ruling: block" comment, replayed head by head.
+      const liveFirst = out.live1.length === 1 && out.live1[0][0] === 'fix' && out.live1[0][1] === 'ruling-not-addressed' && /ruling: block/.test(out.live1Ruling ?? '');
+      if (!liveFirst) violations.push({ invariant: 'live-first-miss-sent-back', detail: `PR #3794's first head after the operator's 01:19Z block ruling must go back to a fixer with that ruling; got dispatch=${JSON.stringify(out.live1)}` });
+      if (out.live2.some((d) => d[1] === 'ruling-not-addressed') || !out.live2Notes.includes('ruling-dispute')) {
+        violations.push({ invariant: 'live-second-miss-escalates', detail: `PR #3794's second head must escalate (ruling-dispute note, no third send-back); got dispatch=${JSON.stringify(out.live2)} notes=${out.live2Notes.join(',') || 'none'}` });
+      }
+      if (out.live3.some((d) => d[1] === 'ruling-not-addressed') || out.live3Notes.includes('ruling-dispute')) {
+        violations.push({ invariant: 'live-fresh-ruling-clears', detail: `after the operator's 12:11Z re-ruling nothing may be sent back or escalated; got dispatch=${JSON.stringify(out.live3)} notes=${out.live3Notes.join(',') || 'none'}` });
       }
       return { violations };
     } finally {
