@@ -2,9 +2,10 @@
 bornAs: xuxcsw6
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/conveyor/__tests__/review-referral-hold.test.mjs"]
 dateOpened: "2026-10-04"
+dateResolved: "2026-10-04"
 tags: []
 ---
 
