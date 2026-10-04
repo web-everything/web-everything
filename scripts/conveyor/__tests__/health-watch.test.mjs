@@ -1087,7 +1087,7 @@ it('xe8y12n probe preserves fresh raw evidence independently of cached/normalise
   expect(failed[0].reviewObservation).toBeNull();
 });
 
-it('xe8y12n probe re-observes only PRs whose cached labels could hide a missing review label', () => {
+it('xe8y12n probe re-observes only PRs whose cached labels could hide a missing review label', async () => {
   const views = [];
   const commitReads = [];
   const listed = [
@@ -1103,13 +1103,18 @@ it('xe8y12n probe re-observes only PRs whose cached labels could hide a missing 
     views.push(Number(args[2]));
     return JSON.stringify({ state: 'OPEN', labels: [], headRefOid: 'a'.repeat(40) });
   };
-  const rows = probePrs({ exec, readCommits: (_slug, number) => { commitReads.push(number); return []; } });
+  const rows = probePrs({ exec, now: 5, readCommits: (_slug, number) => { commitReads.push(number); return []; } });
   const byNumber = new Map(rows.map(row => [row.number, row]));
   // Each constellation repo lists the same fixture, so only count what happens for one repo's rows.
   const perRepo = new Set(views);
   expect([...perRepo].sort()).toEqual([3, 4, 5]);
   expect(views.length).toBe(perRepo.size * (rows.length / listed.length));
   expect(new Set(commitReads)).toEqual(perRepo);
-  for (const number of [1, 2, 6]) expect(byNumber.get(number).reviewObservation).toBeNull();
+  // A labelled PR costs no call but still reports a clean cached observation, so an open episode can close.
+  for (const number of [1, 2, 6]) expect(byNumber.get(number).reviewObservation).toMatchObject({ state: 'OPEN', cached: true, commits: [] });
+  const { default: smell } = await import('../health-smells/review-label-missing.mjs');
+  const closeResults = smell.evaluate({ prs: [...byNumber.values()].filter(row => [1, 2, 6].includes(row.number)) }, { now: 10, lastTick: { completedAt: 0 } });
+  expect(closeResults).toHaveLength(3);
+  for (const result of closeResults) expect(result.breach).toBe(false);
   for (const number of [3, 4, 5]) expect(byNumber.get(number).reviewObservation).toMatchObject({ state: 'OPEN' });
 });

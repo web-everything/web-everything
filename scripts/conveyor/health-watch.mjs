@@ -523,10 +523,14 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
     for (const pr of rows) {
       // Snapshot rows may be cached. Only a successful fresh provider read counts for this smell — and only a PR
       // whose cached labels hold no `review:*` label can be in breach, so a labelled PR costs no per-PR call
-      // (the shared snapshot stays the budgeted path for the common case).
+      // (the shared snapshot stays the budgeted path for the common case). The labelled row still reports a clean
+      // observation from those cached labels, so an open `review-label-missing` episode CLOSES once the label is
+      // restored (the smell ignores absent subjects); a stale cache can only delay detecting a NEW breach by one
+      // snapshot refresh, never report a false one.
       let reviewObservation = null;
       const cachedReviewLabelled = Array.isArray(pr.labels) && pr.labels.some(l => typeof l?.name === 'string' && l.name.startsWith('review:'));
-      if (!cachedReviewLabelled) try {
+      if (cachedReviewLabelled) reviewObservation = { state: 'OPEN', labels: pr.labels.map(l => ({ name: l?.name })), commits: [], observedAt: now, cached: true };
+      else try {
         const live = JSON.parse(exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'state,labels,headRefOid,headRefName,baseRefName']));
         if (live && !Array.isArray(live)) reviewObservation = { ...live, observedAt: now,
           commits: readCommits(slug, pr.number, { headRefName: live.headRefName, headRefOid: live.headRefOid, baseRefName: live.baseRefName,
