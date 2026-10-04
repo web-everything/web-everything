@@ -1979,8 +1979,20 @@ function ghErr(e, fallback) {
 /** A deferral is discharged only by an existing readable backlog card, never an intention to file. */
 export function referralCardReadable(ref, root = process.cwd()) {
   if (!/^we:backlog\/[^/]+\.md$/.test(ref ?? '')) return false;
-  try { return /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(readFileSync(`${root}/${ref.slice(3)}`, 'utf8')); }
-  catch { return false; }
+  const card = text => /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(text);
+  try { return card(readFileSync(`${root}/${ref.slice(3)}`, 'utf8')); }
+  catch {
+    // #4979 — a provisional card (`x…`) is renumbered when it lands (#2288 JIT numbering); a ruling that cited
+    // it by its birth name still names that card through the landed file's `bornAs:`.
+    const born = /^we:backlog\/(x[a-z0-9]{6})-/.exec(ref)?.[1];
+    if (!born) return false;
+    try {
+      return readdirSync(`${root}/backlog`).some(name => name.endsWith('.md') && /^\d+-/.test(name) && (() => {
+        const text = readFileSync(`${root}/backlog/${name}`, 'utf8');
+        return card(text) && new RegExp(`^bornAs:[ \\t]*["']?${born}["']?[ \\t]*$`, 'm').test(text.split(/\r?\n---\r?\n/)[0]);
+      })());
+    } catch { return false; }
+  }
 }
 
 /** Fail closed at every acceptance entry point using the fresh durable PR record. */
@@ -2014,7 +2026,7 @@ export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable 
   // failure marker is not evidence (the run store is local and can be missing, pruned or on another machine).
   if (!current.length && !(last && !last.persistenceFailed && !last.parked && !last.pending.length)) {
     const older = result.records.filter(r => r.head !== head && (!repo || !pr || (r.repo === repo && r.pr === Number(pr))));
-    const held = older.flatMap(r => { const s = referralRecordState(r, { ...context, head: r.head }); return [...s.pending, ...s.blocked]; });
+    const held = older.flatMap(r => { const s = referralRecordState(r, { ...context, head: r.head, operatorRulings: result.operatorRulings }); return [...s.pending, ...s.blocked]; });
     if (held.length) {
       throw new Error(`mandatory referral hold: no-current-head-review-evidence; no readable referral record or completed clean review for current head ${head}, and earlier heads still hold ${[...new Set(held)].join(', ')}; review the current head before acceptance`);
     }

@@ -678,6 +678,9 @@ export function formatRefusalLine(label, r) {
 /** ONE printable line per draft the promote half un-drafted (`gh pr ready`), the success half of "log every
  *  promote outcome" (live incident 2026-10-03, PR #3806). Mirrors {@link formatRefusalLine}'s shape. */
 export function formatPromoteActionLine(d) {
+  if (d?.kind === 'restore-review-label') {
+    return `reconcile-fix-dispatch-daemon: labelled ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} ${d?.label ?? 'review:pending'} — open lane PR, all required checks green, no review:* label (restore-review-label)`;
+  }
   return `reconcile-fix-dispatch-daemon: promoted ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} to ready for review — every required check is green (promote-draft)`;
 }
 

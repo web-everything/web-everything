@@ -893,7 +893,7 @@ describe('xng7q1p conservative timeout evidence', () => {
   });
 });
 import timeoutTs from 'typescript';
-import { classifyTimeoutEvidence, parseTimeoutFailures, enrichPrsWithTimeoutEvidence, readTimeoutEvidence } from '../reconcile-pass.mjs';
+import { classifyTimeoutEvidence, parseTimeoutFailures, enrichPrsWithTimeoutEvidence, readTimeoutEvidence, timeoutImpact, isDerivedTimeoutCheck } from '../reconcile-pass.mjs';
 import { planReconcile as timeoutPlanReconcile } from '../reconcile-core.mjs';
 
 it('xng7q1p immutable GitHub reads feed enrichment → planner without checkout-derived scope', () => {
@@ -1169,5 +1169,32 @@ describe('conflicting head: missing required checks are expected (#3771)', () =>
     expect(plan.dispatch).toEqual([]);
     expect(plan.refusals.map(r => r.kind)).toContain('stood-down');
     expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
+  });
+});
+
+// LIVE INCIDENT 2026-10-04, PR #3826: card-only PR, an UNTOUCHED test hit the 5000 ms default, 3/3 heals burned.
+describe('timeout re-run eligibility — card-only diff + derived red checks (PR #3826)', () => {
+  const sources = { 'a.test.mjs': 'import "./b.mjs"; process.env.X;', 'b.mjs': 'export const b = 1;', 'vite.config.mts': 'export default {};' };
+  const base = { head: 'h', sourceHead: 'h', sources, roots: ['vite.config.mts', 'a.test.mjs'] };
+  it('RED before the fix: a backlog-card-only diff was "changed-input-impact-unknown"; now it is eligible', () => {
+    expect(timeoutImpact({ ...base, changed: [{ filename: 'backlog/xw4yqe9-card.md' }] }, timeoutTs)).toBeNull();
+  });
+  it('a card plus any non-card (or source) change keeps refusing', () => {
+    expect(timeoutImpact({ ...base, changed: [{ filename: 'backlog/x.md' }, { filename: 'README.md' }] }, timeoutTs)).toBe('changed-input-impact-unknown');
+    expect(timeoutImpact({ ...base, sources: { ...sources, 'a.test.mjs': 'import "./b.mjs";' }, changed: [{ filename: 'b.mjs' }] }, timeoutTs)).toBe('changed-dependency:b.mjs');
+  });
+  it('card-only still refuses an unresolvable relative import of the failing test', () => {
+    expect(timeoutImpact({ ...base, sources: { 'a.test.mjs': 'import "./gone.mjs";' }, changed: [{ filename: 'backlog/x.md' }] }, timeoutTs)).toMatch(/^unresolved-dependency:/);
+  });
+  it('review-gate and the shard-derived aggregate `test` are not primary failure evidence', () => {
+    const checks = [{ name: 'review-gate', conclusion: 'failure' }, { name: 'test-shard (2)', conclusion: 'failure' }, { name: 'test', conclusion: 'failure' }];
+    expect(checks.filter((c) => !isDerivedTimeoutCheck(c, checks)).map((c) => c.name)).toEqual(['test-shard (2)']);
+    expect(isDerivedTimeoutCheck({ name: 'test', conclusion: 'failure' }, [{ name: 'test-shard (1)', conclusion: 'success' }])).toBe(false);
+  });
+  it('the re-run is on by default and WE_CI_TIMEOUT_RERUN_ENABLED=0 is only a kill switch', () => {
+    const pr = { number: 1, headRefOid: 'h', statusCheckRollup: [{ name: 'test-shard (2)', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/2' }] };
+    const read = () => ({ eligible: true });
+    expect(enrichPrsWithTimeoutEvidence([pr], { repo: 'o/r', read, readBudget: () => ({ confirmed: 0 }) })[0].timeoutRetry).toEqual({ eligible: true });
+    expect(enrichPrsWithTimeoutEvidence([pr], { repo: 'o/r', read, enabled: false })[0]).toBe(pr);
   });
 });

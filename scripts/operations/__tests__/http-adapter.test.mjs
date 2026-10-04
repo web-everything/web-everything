@@ -57,6 +57,7 @@ import { PRIORITY_SYNC_OP } from '../priority-sync.mjs';
 import { EXPLORE_OP } from '../explore.mjs';
 import { OPEN_PR_OP } from '../open-pr.mjs';
 import { RECORD_VERDICT_OP } from '../record-verdict.mjs';
+import { RECORD_REFERRAL_RULING_OP } from '../record-referral-ruling.mjs';
 import { VERIFY_OP } from '../verify.mjs';
 import { MUTATION_CHECK_OP } from '../mutation-check.mjs';
 import { PR_STATUS_OP } from '../pr-status.mjs';
@@ -335,6 +336,9 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // (the reader and the git sinks live in `record-verdict-io.mjs`), but that is a discipline its own suite
     // pins, not a claim this pinned list makes.
     [RECORD_VERDICT_OP]: 'record-verdict.mjs',
+    // #4979 — `record-referral-ruling`'s `write` step posts a PR comment, so it is NOT read-only; listed here for
+    // map coverage. The gh reads and the post live in `record-referral-ruling-io.mjs`.
+    [RECORD_REFERRAL_RULING_OP]: 'record-referral-ruling.mjs',
     // #xp240uk — `verify` is two `compute` steps with no sink, so it IS read-only and appears in the pinned
     // list below. Its io (the spawn of the single home) lives entirely in `verify-io.mjs` and arrives only
     // through the `runChecks` its builder is handed in `../run.mjs`, which is what keeps this module pure.

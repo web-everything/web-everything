@@ -2,9 +2,11 @@
 bornAs: x5w7u24
 kind: story
 size: 8
-status: open
+status: resolved
 scope: ["we:scripts/lib/jury-core.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/lib/__tests__/jury-core.test.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
 dateOpened: "2026-10-02"
+dateStarted: "2026-10-04"
+dateResolved: "2026-10-04"
 tags: []
 ---
 
@@ -37,3 +39,15 @@ Source reviews: https://github.com/chalbert/web-everything/pull/3507#issuecommen
 3. Exercise transient tamper-and-restore and delayed background writers, including thrown judge errors and timeouts. Prove process cleanup and continuous protection, not merely matching snapshots after return.
 4. Exercise mixed plain/confirmation records (one durable attempt), same-head legacy clearance, old-head replay, stronger new claims and unavailable verification across restarts. Verify source, documentation, configuration and data findings; block and missing evidence retain their holds, card requires a readable durable reference, and not-real requires the appropriate evidence provenance.
 5. Demonstrate regressions failing before implementation, then pass `we:scripts/lib/__tests__/jury-core.test.mjs`, `we:scripts/operations/__tests__/review-pr-io.test.mjs`, `we:scripts/operations/__tests__/review-pr.test.mjs` and `we:scripts/__tests__/review-set-label.test.mjs`. Exercise the real sandbox/provisioning/cleanup path end to end before declaring completion. Stale heads, unreadable evidence, tampering and incomplete publication must preserve the mandatory hold for every input kind.
+
+## Progress — operator ruling path (2026-10-04)
+
+This part was delivered first because PR #3771 was stuck on it. The operator said on 2026-10-04 ~10:35 ET: "make sure all PRs move". An operator can now rule block, card or not-real on a mandatory referral through one sanctioned writer: the `record-referral-ruling` operation (we:scripts/operations/record-referral-ruling.mjs). The gate, `we:scripts/lib/jury-core.mjs#mandatoryReferralState`, reads these rulings alongside reviewer rulings. A ruling counts only if all of these hold:
+
+- A trusted principal posted the exact rendered record.
+- Its actor is an `OPERATOR_LOGINS` login.
+- It names the PR, head, referral run and finding it rules on.
+
+The latest operator ruling on that exact finding supersedes the reviewer's. A new head drops it. `card` needs a readable we:backlog card.
+
+The actor, channel and operator words are a recorded assertion, as with `clear-human` (the #2895 honesty tax). They are not out-of-band authentication. That stronger boundary stays with the confirmation turn. The tool-bearing confirmation turn above is still open.

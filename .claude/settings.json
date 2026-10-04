@@ -150,6 +150,24 @@
             "command": "node scripts/backlog-guard.mjs"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node scripts/broadcast-inject.mjs"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node scripts/broadcast-inject.mjs"
+          }
+        ]
       }
     ]
   }

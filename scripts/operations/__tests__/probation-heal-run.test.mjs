@@ -485,7 +485,7 @@ describe('xp0lsdi durable crash recovery and restart soak', () => {
     expect(readOwedWrites({ dir: h.owed })).toEqual([]);
     const pr = { ...captured3373, comments: h.comments };
     // The default classifier excludes this check, but captured branch protection explicitly requires it.
-    expect(planReconcile({ prs: [pr], agents: [], now: Date.parse('2026-10-02T12:00:00Z') }).dispatch).toEqual([]);
+    expect(planReconcile({ prs: [pr], agents: [], now: Date.parse('2026-10-02T12:00:00Z') }).dispatch.filter((d) => d.kind !== 'restore-review-label')).toEqual([]);
     // Captured from the live main required_status_checks endpoint on 2026-10-02.
     const plan = planReconcile({ requiredChecks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'], prs: [pr], agents: [], now: Date.parse('2026-10-02T12:00:00Z') });
     expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal', prNumber: 3373, attempts: 2 }));

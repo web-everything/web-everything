@@ -1254,8 +1254,16 @@ export function parseTimeoutFailures(log) {
 export function timeoutImpact({ changed, sources, roots, head, sourceHead }, ts) {
   if (head !== sourceHead || !Array.isArray(roots) || !roots.length) return 'unbound-impact-evidence';
   const paths = changed.flatMap((f) => [f.filename, f.previous_filename].filter(Boolean));
-  if (paths.some((p) => !/\.[cm]?[jt]sx?$/.test(p)
-      || /(^|\/)(?:[^/]*config[^/]*|[^/]*setup[^/]*|fixtures?|data|__fixtures__)(\/|\.)/i.test(p))) {
+  // A backlog card (`backlog/<id>.md`) is documentation: never imported, never a test fixture or setup file
+  // (PR #3826 was card-only; the blanket "non-source ⇒ unknown" rule made every card PR ineligible forever).
+  const isBacklogCard = (p) => /^backlog\/[^/]+\.md$/.test(p);
+  // CARD-ONLY diffs cannot be reached by an import edge, and the failure being retried is a TIMEOUT (never an
+  // assertion on content), so the walk is narrowed to the FAILING TESTS' own relative closure (it still refuses
+  // an unresolvable relative import). Ambient `process`/external-package edges — which every test and the
+  // shared vite config have — no longer defeat it; they cannot carry a card.
+  const cardOnly = paths.length > 0 && paths.every(isBacklogCard);
+  if (paths.some((p) => !isBacklogCard(p) && (!/\.[cm]?[jt]sx?$/.test(p)
+      || /(^|\/)(?:[^/]*config[^/]*|[^/]*setup[^/]*|fixtures?|data|__fixtures__)(\/|\.)/i.test(p)))) {
     return 'changed-input-impact-unknown';
   }
   const seen = new Set();
@@ -1291,14 +1299,14 @@ export function timeoutImpact({ changed, sources, roots, head, sourceHead }, ts)
       ts.forEachChild(node, scan);
     };
     scan(parsed);
-    if (unknown) return `unknown-dependency-edge:${path}`;
+    if (unknown && !cardOnly) return `unknown-dependency-edge:${path}`;
     // Include setup/globalSetup literal entries even though these are not import declarations.
     for (const m of source.matchAll(/\b(?:setupFiles|globalSetup)\s*:\s*(\[[^\]]*\]|['"][^'"]+['"])/g)) {
       for (const s of m[1].matchAll(/['"]([^'"]+)['"]/g)) imports.push(s[1]);
     }
     for (const spec of imports) {
       if (spec === 'vitest' || spec === 'vitest/config') continue;
-      if (!spec.startsWith('.')) return `unknown-external-dependency:${spec}`;
+      if (!spec.startsWith('.')) { if (cardOnly) continue; return `unknown-external-dependency:${spec}`; }
       const base = posix.normalize(posix.join(posix.dirname(path), spec));
       const candidates = [base, ...['.ts', '.mjs', '.js', '.tsx', '/index.ts', '/index.js'].map((ext) => base + ext)];
       const resolved = candidates.find((p) => Object.hasOwn(sources, p));
@@ -1308,7 +1316,9 @@ export function timeoutImpact({ changed, sources, roots, head, sourceHead }, ts)
     }
     return null;
   };
-  for (const root of roots) { const reason = visit(root); if (reason) return reason; }
+  const walkRoots = cardOnly ? roots.filter((r) => /\.test\.[cm]?[jt]sx?$/.test(r)) : roots;
+  if (cardOnly && !walkRoots.length) return 'unbound-impact-evidence';
+  for (const root of walkRoots) { const reason = visit(root); if (reason) return reason; }
   return null;
 }
 
@@ -1335,6 +1345,14 @@ export function classifyTimeoutEvidence(evidence, { repo, pr, head, ts }) {
   if (reason) return no(reason);
   const signature = createHash('sha256').update(JSON.stringify(failures.map((f) => [f.path, f.name, f.kind]).sort())).digest('hex');
   return { eligible: true, repo, pr, head, signature, failures, jobs: evidence.jobs.map(({ log, ...job }) => job) };
+}
+
+/** A failed check that is not primary evidence: `review-gate` (red by design under a review hold) and the
+ *  aggregate `test` job when at least one `test-shard (N)` job also failed (it only mirrors its shards). */
+export function isDerivedTimeoutCheck(check, checks = []) {
+  if (check?.name === 'review-gate') return true;
+  return check?.name === 'test'
+    && checks.some((c) => /^test-shard \(\d+\)$/.test(c?.name ?? '') && !['success', 'skipped', 'neutral'].includes(c.conclusion));
 }
 
 /** Repository-explicit, bounded, read-only collector. Any pagination/truncation/head race refuses.
@@ -1372,7 +1390,13 @@ export function readTimeoutEvidence(pr, { repo, exec = execFileSyncThrottled, ts
     const statuses = api(`repos/${repo}/commits/${head}/status`);
     if (statuses.total_count !== 0) throw new Error('unaccounted-commit-status');
     if (checks.some((c) => c.status !== 'completed')) throw new Error('checks-pending');
-    const failed = checks.filter((c) => !['success', 'skipped', 'neutral'].includes(c.conclusion));
+    // LIVE INCIDENT 2026-10-04, PR #3826 (card-only, test-shard (2) hit the 5000 ms default on an UNTOUCHED test):
+    // the inventory counted ten `review-gate` runs (red BY DESIGN while a review label is held — never CI
+    // evidence) and the derived aggregate `test` job (red only because its shard needed-failed, no vitest summary
+    // of its own), so the log reads blew the 15 s evidence deadline / the aggregate read as an "incomplete
+    // inventory" and the PR could never be classified eligible for the re-run that does not spend heal budget.
+    const failed = checks.filter((c) => !['success', 'skipped', 'neutral'].includes(c.conclusion))
+      .filter((c) => !isDerivedTimeoutCheck(c, checks));
     const jobs = failed.map((c) => {
       const match = c.details_url?.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)\/job\/(\d+)$/);
       if (!match || match[1] !== repo) throw new Error('unknown-check-origin');
@@ -1417,12 +1441,14 @@ export function readTimeoutEvidence(pr, { repo, exec = execFileSyncThrottled, ts
 }
 
 export function enrichPrsWithTimeoutEvidence(prs, {
-  repo, read = readTimeoutEvidence, readBudget = readTimeoutBudget, enabled = process.env.WE_CI_TIMEOUT_RERUN_ENABLED === '1',
+  repo, read = readTimeoutEvidence, readBudget = readTimeoutBudget, enabled = process.env.WE_CI_TIMEOUT_RERUN_ENABLED !== '0',
 } = {}) {
-  // New mechanical infrastructure stays opt-in until the card's controlled live proof passes.
+  // GRADUATED 2026-10-04 (PR #3826): the opt-in flag was never set on the edge, so the re-run that does not spend
+  // heal budget was dead code and a flaky-timeout PR burned 3/3 heals. On by default now; `=0` is the kill switch.
   if (!enabled) return prs;
   return prs.map((pr) => {
-    if (!(pr.statusCheckRollup ?? []).some((c) => ['failure', 'timed_out'].includes(String(c.conclusion).toLowerCase()))) return pr;
+    if (!(pr.statusCheckRollup ?? []).some((c) => c.name !== 'review-gate'
+      && ['failure', 'timed_out'].includes(String(c.conclusion).toLowerCase()))) return pr;
     const timeoutRetryBudget = readBudget({ repo, pr: pr.number, head: pr.headRefOid });
     if (!(pr.statusCheckRollup ?? []).some((c) => c.detailsUrl?.startsWith(`https://github.com/${repo}/actions/runs/`))) {
       return { ...pr, timeoutRetryBudget, timeoutRetry: { eligible: false, reason: 'missing-check-origin' } };

@@ -7,7 +7,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, resolveDraft } from '../pr-land.mjs';
+import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, resolveDraft, unlabelledHandOffLabel } from '../pr-land.mjs';
 import { REVIEW_LABELS, REVIEW_LABEL_META, READY_TO_MERGE_LABEL, scoreEscalation } from '../lib/review-escalation.mjs';
 import { buildAuthorActorMarker, parseAuthorActorId } from '../lib/review-independence.mjs';
 import { PANEL_LENSES } from '../lib/review-core.mjs';
@@ -837,5 +837,21 @@ describe('#4386 push rejection guidance', () => {
   it('preserves unrelated failure detail', () => {
     expect(pushFailedDetail('Command failed: git push origin HEAD\nPermission denied', refs))
       .toBe('git push origin HEAD:refs/heads/lane/proof-4386 failed (Command failed: git push origin HEAD)');
+  });
+});
+
+// LIVE INCIDENT 2026-10-03/04, PR #3830: a `--label-on-green` run that ended red left the PR with no label at all.
+describe('unlabelledHandOffLabel — label-on-green exits must not strand the PR label-less (PR #3830)', () => {
+  it('hands a red / timed-out / behind label-on-green exit off with review:pending', () => {
+    for (const reason of ['check-red', 'check-timeout', 'behind']) {
+      expect(unlabelledHandOffLabel({ mode: 'label-on-green', reason, labelApplied: false, prNum: 3830 })).toBe('review:pending');
+    }
+  });
+  it('never when a label was applied, no PR exists, another mode, a conflict, or a success reason', () => {
+    expect(unlabelledHandOffLabel({ mode: 'label-on-green', reason: 'check-red', labelApplied: true, prNum: 1 })).toBeNull();
+    expect(unlabelledHandOffLabel({ mode: 'label-on-green', reason: 'check-red', prNum: null })).toBeNull();
+    expect(unlabelledHandOffLabel({ mode: 'land', reason: 'check-red', prNum: 1 })).toBeNull();
+    expect(unlabelledHandOffLabel({ mode: 'label-on-green', reason: 'conflict', prNum: 1 })).toBeNull();
+    expect(unlabelledHandOffLabel({ mode: 'label-on-green', reason: 'labelled-on-green', prNum: 1 })).toBeNull();
   });
 });
