@@ -86,11 +86,14 @@ export function rulingNeeded(pr) {
   if (!SHA.test(head)) return null;
   const snaps = recordSnapshots(pr?.comments, head);
   let since = null;
+  let firstIndex = Infinity;
   for (const s of snaps) {
     if (s.record.head !== head || !s.record.attempted) continue;
+    firstIndex = Math.min(firstIndex, s.index);
     const at = sinceOf(s.comment);
     if (at !== null && (since === null || at < since)) since = at;
   }
+  if (operatorVerdictAfter(pr?.comments, firstIndex)) return null;
   const live = new Map();
   for (const { record } of currentRecords(snaps, head)) {
     const pending = pendingKeys(record, head);
@@ -150,6 +153,10 @@ export function operatorBlockRulings(comments) {
   });
   return out;
 }
+/** Did the operator send the PR back (a verdict comment of their own) after thread position `index`? That IS a ruling on
+ *  everything open at that point, so nothing is "waiting" or "ignored" for a head whose records came before it. */
+const operatorVerdictAfter = (comments, index) => (Array.isArray(comments) ? comments : []).some((c, i) => i > index
+  && typeof c !== 'string' && isOperatorAuthored(c) && String(c?.body ?? '').trimStart().startsWith(OPERATOR_VERDICT));
 const hintMatchesFile = (hints, file) => !!file && hints.some((h) => String(file).toLowerCase().includes(h));
 
 /**
@@ -165,6 +172,7 @@ export function ignoredRulings(pr) {
   const cur = currentRecords(snaps, head);
   if (!cur.length) return null;
   const firstIndex = Math.min(...snaps.filter((s) => s.record.head === head).map((s) => s.index));
+  if (operatorVerdictAfter(pr?.comments, firstIndex)) return null;
   const operator = operatorBlockRulings(pr?.comments);
 
   // Every block ruling: (a) inside an earlier head's record, (b) the operator's own verdict comments.

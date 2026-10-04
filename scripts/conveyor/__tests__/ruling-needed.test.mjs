@@ -18,6 +18,16 @@ describe('advisory:ruling-needed label', () => {
     expect(planRulingNeededLabel(ruled).action).toBe('remove');
     expect(planRulingNeededLabel({ ...labelled, headRefOid: H2 }).action).toBe('remove');
   });
+  it('the operator sending the PR back after the record is a ruling: the label comes off, no row (live #3771, #3881, #3833)', () => {
+    const sendBack = { body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\n## Operator ruling: send back to fix (block)',
+      createdAt: '2026-10-03T09:00:00Z', author: { login: 'chalbert' } };
+    const labelled = parked({ labels: [{ name: 'review:human' }, { name: RULING_NEEDED_LABEL }], comments: [...parked().comments, sendBack] });
+    expect(planRulingNeededLabel(labelled).action).toBe('remove');
+    expect(rulingNeededRow(repo, labelled)).toBeNull();
+    // control: the same comment from someone else clears nothing
+    const forged = { ...labelled, comments: [...parked().comments, { ...sendBack, author: { login: 'stranger' } }] };
+    expect(rulingNeededRow(repo, forged)).not.toBeNull();
+  });
   it('a PR that never parked is left alone', () => {
     expect(planRulingNeededLabel({ number: 1, headRefOid: H1, labels: [], comments: [] }).action).toBe('none');
   });
