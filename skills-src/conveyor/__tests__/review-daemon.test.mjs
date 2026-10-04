@@ -611,7 +611,7 @@ describe('runReviewTick — repo reaches reconcile too (regression, #xvyuwtg liv
 // `gh pr list` / `claude agents --json` per tick, reused by reconcile AND the tag helpers, never re-fetched
 // once per PR.
 describe('runReviewTick — #4133 shared reads (opt-in via readPrs/readAgents)', () => {
-  it('omitting readPrs/readAgents (the default) is byte-identical to before — reconcile gets no extra keys, tags get no currentLabels/agents', () => {
+  it('omitting readPrs/readAgents (the default) passes the default branch without extra reads — tags get no currentLabels/agents', () => {
     const reconcile = vi.fn(() => ({ dispatch: [{ kind: 'review', prNumber: 10, attempts: 0 }], refusals: [] }));
     const tagRound = vi.fn();
     const tagStatus = vi.fn();
@@ -619,7 +619,7 @@ describe('runReviewTick — #4133 shared reads (opt-in via readPrs/readAgents)',
       reconcile, dispatch: () => ({ agentId: 'a' }), tagRound, tagStatus,
       statusCandidates: () => [{ prNumber: 10 }],
     });
-    expect(reconcile).toHaveBeenCalledWith({ repo: expect.any(String) });
+    expect(reconcile).toHaveBeenCalledWith({ repo: expect.any(String), defaultBranch: 'main' });
     expect(tagRound).toHaveBeenCalledWith(expect.objectContaining({ currentLabels: undefined }));
     expect(tagStatus).toHaveBeenCalledWith(expect.objectContaining({ agents: undefined, currentLabels: undefined }));
   });
@@ -1468,4 +1468,15 @@ describe('#4154 shared scan lane assignments', () => {
       ...(Array.isArray(lanes) ? { preferLane: lanes[i] } : {}),
     })));
   });
+});
+
+it('tags a waiting stack surfaced only as a note using the same base/default branch snapshot', () => {
+  const pr = { number: 3915, isDraft: true, baseRefName: 'lane/base', labels: [] };
+  const reconcile = vi.fn(() => ({ dispatch: [], refusals: [], notes: [{ kind: 'stacked-awaiting-base', prNumber: 3915 }] }));
+  const tagStatus = vi.fn();
+  runReviewTick({ reconcile, readPrs: () => [pr], readAgents: () => [], defaultBranch: 'release',
+    tagStatus, tagRound: () => {}, dispatch: vi.fn(), holdReconcile: () => [] });
+  expect(reconcile).toHaveBeenCalledWith(expect.objectContaining({ defaultBranch: 'release' }));
+  expect(tagStatus).toHaveBeenCalledOnce();
+  expect(tagStatus).toHaveBeenCalledWith(expect.objectContaining({ pr: 3915, isDraft: true, prState: pr, defaultBranch: 'release' }));
 });
