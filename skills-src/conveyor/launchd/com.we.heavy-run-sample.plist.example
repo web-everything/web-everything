@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	STAGED, NOT INSTALLED. Optional ~60s process sampling for heavy-run-ungated.
+	Uses the same wev-health-watch clone as com.we.health-watch; install dependencies there first.
+	Pin CONVEYOR_STATE_ROOT to the same root as the health watch. No GitHub calls or credentials.
+	INSTALL: copy to ~/Library/LaunchAgents/com.we.heavy-run-sample.plist, then load it with launchctl.
+	-->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>CONVEYOR_STATE_ROOT</key>
+		<string>/Users/nicolasgilbert/workspace/webeverything</string>
+		<key>PASS_DAEMON_SELF_SYNC</key>
+		<string>1</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.we.heavy-run-sample</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin/node</string>
+		<string>/Users/nicolasgilbert/workspace/wev-health-watch/skills-src/conveyor/pass-daemon.mjs</string>
+		<string>--pass=heavy-run-sample</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/nicolasgilbert/workspace/wev-health-watch/.conveyor/heavy-run-sample.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/nicolasgilbert/workspace/wev-health-watch/.conveyor/heavy-run-sample.log</string>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/nicolasgilbert/workspace/wev-health-watch</string>
+</dict>
+</plist>
