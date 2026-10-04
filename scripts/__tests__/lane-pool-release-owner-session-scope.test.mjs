@@ -11,7 +11,8 @@
  *   lease is only released if its OWN `ownerSession` (the durable `CLAUDE_CODE_SESSION_ID` stamped at acquire,
  *   #2367) also matches. Omitted, behaviour is unchanged (name alone, as every other existing caller expects).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { readFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -38,11 +39,13 @@ function runPool(args, extraEnv = {}) {
 const REPO = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=ownerscope', '--branch=main', '--no-install'];
 const laneDir = (n) => join(poolRoot, 'ownerscope', `lane-${n}`);
 
-beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'lane-pool-owner-scope-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
-  poolRoot = join(base, 'pool');
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-owner-scope-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
 
   git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
   git(['clone', '--quiet', originDir, referenceDir]);
@@ -50,12 +53,21 @@ beforeEach(() => {
   git(['add', 'file.txt'], referenceDir);
   git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', 'origin', 'main'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
+beforeEach(() => {
+  base = mkdtempSync(join(tmpdir(), 'lane-pool-owner-scope-'));
+  poolRoot = join(base, 'pool');
 
   expect(runPool(['provision', '--count=2', ...REPO()]).code).toBe(0);
 });
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 describe('#x2psfwz — release --all-pools --session=<reused-name> --owner-session=<id> never drops a different round\'s lease', () => {

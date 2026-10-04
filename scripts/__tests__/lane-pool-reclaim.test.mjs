@@ -7,7 +7,8 @@
  *   origin + reference checkout, private `LANE_POOL_ROOT` — same fixture shape as `lane-whois.test.mjs` and
  *   `lane-pool-trim.test.mjs`.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, mkdirSync, chmodSync, utimesSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -38,10 +39,27 @@ const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, 
 const lanePath = (n) => join(poolRoot, 'reclaimpool', `lane-${n}`);
 const leaseMarker = (n) => join(lanePath(n), '.git', '.lane-lease');
 
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-reclaim-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
+
+  git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
+  git(['clone', '--quiet', originDir, referenceDir]);
+  writeFileSync(join(referenceDir, 'file.txt'), 'v1\n');
+  git(['add', 'file.txt'], referenceDir);
+  git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], referenceDir);
+  git(['push', '--quiet', 'origin', 'main'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
 beforeEach(() => {
   base = mkdtempSync(join(tmpdir(), 'lane-pool-reclaim-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
   poolRoot = join(base, 'pool');
   binDir = join(base, 'bin');
   mkdirSync(binDir);
@@ -66,18 +84,12 @@ beforeEach(() => {
     WE_LANE_SALVAGE_QUIET_MIN: '0',
   };
 
-  git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
-  git(['clone', '--quiet', originDir, referenceDir]);
-  writeFileSync(join(referenceDir, 'file.txt'), 'v1\n');
-  git(['add', 'file.txt'], referenceDir);
-  git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], referenceDir);
-  git(['push', '--quiet', 'origin', 'main'], referenceDir);
-
   expect(runPool(['provision', '--count=3', ...poolArgs()]).code).toBe(0);
 });
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 describe('lane-pool reclaim — BEFORE (the gap)', () => {
