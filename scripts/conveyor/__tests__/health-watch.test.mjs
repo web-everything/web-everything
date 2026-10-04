@@ -1118,3 +1118,37 @@ it('xe8y12n probe re-observes only PRs whose cached labels could hide a missing 
   for (const result of closeResults) expect(result.breach).toBe(false);
   for (const number of [3, 4, 5]) expect(byNumber.get(number).reviewObservation).toMatchObject({ state: 'OPEN' });
 });
+
+it('heavy-run history fixture reaches the detector without appending fixture observations', async () => {
+  const flags = {
+    'state-root': dir, 'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'),
+    'self-sync-dir': join(dir, 'sync'), 'no-gh': true, 'no-diagnose': true,
+    'ps-fixture': join(dir, 'ps.txt'), 'heavy-run-samples-file': join(dir, 'samples.jsonl'),
+    now: '2026-10-04T00:10:00Z',
+  };
+  for (const key of ['logs-dir', 'lock-root', 'self-sync-dir']) mkdirSync(flags[key]);
+  writeFileSync(flags['ps-fixture'], '10 1 0 00:01 claude\n11 10 0 00:01 vitest run x\n');
+  const history = JSON.stringify({ at: '2026-10-04T00:09:00Z', count: 1, runs: [{ pid: 11, programName: 'claude', command: 'vitest run x' }] }) + '\n';
+  writeFileSync(flags['heavy-run-samples-file'], history);
+  const result = await tick(flags);
+  expect(result.transitions.some((t) => t.type === 'opened' && t.key === 'heavy-run-ungated::host')).toBe(true);
+  expect(readFileSync(flags['heavy-run-samples-file'], 'utf8')).toBe(history);
+  expect(existsSync(join(healthDir(dir), 'heavy-run-samples.jsonl'))).toBe(false);
+});
+
+it('a process-probe tick appends its own observation after evaluation', async () => {
+  const flags = {
+    'state-root': dir, 'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'),
+    'self-sync-dir': join(dir, 'sync'), 'no-gh': true, 'no-diagnose': true,
+  };
+  for (const key of ['logs-dir', 'lock-root', 'self-sync-dir']) mkdirSync(flags[key]);
+  // Exercise the actual child-process transport without relying on sandbox permission to read host ps.
+  const bin = join(dir, 'bin'); mkdirSync(bin);
+  writeFileSync(join(bin, 'ps'), '#!/bin/sh\nprintf "10 1 0 00:01 claude\\n11 10 0 00:01 vitest run x\\n"\n', { mode: 0o755 });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
+  try { await tick(flags); } finally { process.env.PATH = oldPath; }
+  const lines = readFileSync(join(healthDir(dir), 'heavy-run-samples.jsonl'), 'utf8').trim().split('\n');
+  expect(lines).toHaveLength(1);
+  expect(JSON.parse(lines[0])).toMatchObject({ at: expect.any(String), count: 1, runs: [{ pid: 11, programName: 'claude', command: 'vitest run x' }] });
+});
