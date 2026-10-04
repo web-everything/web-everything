@@ -33,10 +33,11 @@ import { join } from 'node:path';
 const src = process.env.SOAK_SOURCE_ROOT;
 const job = await import(pathToFileURL(join(src, 'scripts/operations/review-job.mjs')).href);
 const smoke = await import(pathToFileURL(join(src, 'scripts/lib/daemon-live-smoke.mjs')).href);
+const { CONSTELLATION_REPOS } = await import(pathToFileURL(join(src, 'scripts/lib/constellation-repos.mjs')).href);
 const out = { spawned: null, threw: null, smoke: null };
 try {
   const r = job.dispatchReviewJob({
-    ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 3771, repo: 'web-everything/web-everything',
+    ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 3771, repo: CONSTELLATION_REPOS.we.slug,
     root: process.env.SOAK_CLONE, dir: process.env.SOAK_JOBS, readCompletion: () => null,
     resolveSettingsEnv: () => null, spawnJob: () => 4242,
   });

@@ -898,6 +898,8 @@ export const ENV_TIMEOUT_PATTERNS = Object.freeze([
 ]);
 export const SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS_ENV = 'WE_SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS';
 export const DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS = 30_000;
+/** The smallest runBounded cap {@link isEnvTimeoutRow} treats as a real budget when judging a kill against its own cap. */
+export const MIN_OWN_CAP_MS = 1_000;
 /** How much wider every budget is on the one env-timeout retry. */
 export const SMOKE_ENV_TIMEOUT_BUDGET_FACTOR_ENV = 'WE_SMOKE_ENV_TIMEOUT_BUDGET_FACTOR';
 export const DEFAULT_ENV_TIMEOUT_BUDGET_FACTOR = 2.5;
@@ -912,9 +914,11 @@ export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_EL
   // `runBounded`'s OWN kill ("timed out after Nms (process group killed)") is the gate's clock, not tree text: the
   // row really spent its whole cap N. A cheap probe has a cap far under the 30s floor (live 2026-10-03 22:01 ET,
   // load 31 on 12 cores: `tree-stays-clean`'s `git status` hit its 10s cap), and the floor then read that
-  // load-induced kill as a code failure and rejected a good build. Judge such a kill against its own cap.
+  // load-induced kill as a code failure and rejected a good build. Judge such a kill against its own cap — but only
+  // a cap that is a real budget: one under {@link MIN_OWN_CAP_MS} is a starved harness (the soak break
+  // `broken-smoke-harness-holds-last-good` sets 1ms), which load cannot explain, so it keeps the 30s floor.
   const killed = /timed out after (\d+)ms \(process group killed\)$/.exec(detail);
-  if (killed) return Number(row.ms) >= Math.min(minElapsedMs, Number(killed[1]) * 0.9);
+  if (killed && Number(killed[1]) >= MIN_OWN_CAP_MS) return Number(row.ms) >= Math.min(minElapsedMs, Number(killed[1]) * 0.9);
   return Number(row.ms) >= minElapsedMs;
 }
 

@@ -1245,6 +1245,8 @@ describe('a check that ran out of TIME under load is environment, never code (li
     expect(isEnvTimeoutRow(killed)).toBe(true);
     // no laundering: a row that failed FAST with the same words did not spend its cap
     expect(isEnvTimeoutRow({ ...killed, ms: 300 })).toBe(false);
+    // a starved harness (cap far below any real budget) is not load: it keeps the 30s floor
+    expect(isEnvTimeoutRow({ ...killed, ms: 3, detail: 'git status --porcelain failed: timed out after 1ms (process group killed)' })).toBe(false);
     // tree-printed text keeps the 30s floor
     expect(isEnvTimeoutRow({ name: 'lane-pool-list', ok: false, ms: 10018, detail: 'lane-pool list failed: list --acquirable scan exceeded its 120000ms budget at lane-3' })).toBe(false);
   });
