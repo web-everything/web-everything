@@ -817,13 +817,14 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.processes = attempt('processes', () => (flags['ps-fixture']
     ? parsePsOutput(readFileSync(flags['ps-fixture'], 'utf8'))
     : probeProcesses()));
+  probes.machineLoad = attempt('machineLoad', () => (flags['machine-load-fixture']
+    ? JSON.parse(readFileSync(flags['machine-load-fixture'], 'utf8'))
+    : probeMachineLoad()));
+  // heavy-enforce — the `heavy-run-ungated` smell's sample history (the ~60s sampler plus each tick's own append).
   const heavyRunSamplesPath = flags['heavy-run-samples-file'] || join(dir, 'heavy-run-samples.jsonl');
   probes.heavyRunSamples = attempt('heavyRunSamples', () => readRecentSamples(heavyRunSamplesPath, {
     now, windowMs: config.heavyRunUngatedWindowMs ?? 10 * MINUTE,
   }));
-  probes.machineLoad = attempt('machineLoad', () => (flags['machine-load-fixture']
-    ? JSON.parse(readFileSync(flags['machine-load-fixture'], 'utf8'))
-    : probeMachineLoad()));
   // `gh-call-failures` — fs-only, every tick: the gh-throttle call log's tail (`--gh-calls-log=FILE` in tests).
   probes.ghCalls = attempt('ghCalls', () => probeGhCalls(flags['gh-calls-log'] ? { logPath: flags['gh-calls-log'] } : {}));
   // #4309 — alongside (never replacing) the 2 MB tail above: persist every fully closed hour of GitHub spend once,
