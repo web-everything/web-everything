@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import {
-  dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
+  dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
   findResumeCandidate, buildResumePrompt, tryResumeFix, filterFixesByInFlightScope, dropTerminalFixClaims,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
@@ -386,6 +386,57 @@ describe('fetchPrDiffPaths — the un-prefixed read `resolvePrWorkUnit`\'s own `
   it('fails soft to `null` on any `gh` failure (#x9fbg1x-live-incident — see fetchPrDiffScope\'s own updated test)', () => {
     const exec = () => { throw new Error('gh: PR not found'); };
     expect(fetchPrDiffPaths(404, { exec, root: '/repo' })).toBeNull();
+  });
+});
+
+// PR #3794 live incident — `gh pr diff` answers HTTP 406 `PullRequest.diff too_large` past 300 files.
+describe('fetchPrDiffPaths — 406 too_large falls back to the paginated file-list API (PR #3794)', () => {
+  const tooLarge = () => Object.assign(new Error('gh failed'), { stderr: 'could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of files (300).\nPullRequest.diff too_large' });
+  const execFor = (handlers) => (cmd, argv) => {
+    const key = argv.slice(0, 2).join(' ');
+    const h = handlers[key];
+    if (!h) throw new Error(`unexpected ${key}`);
+    return typeof h === 'function' ? h(argv) : h;
+  };
+
+  it('classifies the 406 text', () => {
+    expect(isDiffTooLargeError(tooLarge())).toBe(true);
+    expect(isDiffTooLargeError(new Error('gh: PR not found'))).toBe(false);
+  });
+
+  it('reads compare/<base>...<head> (live base) when the diff is too large', () => {
+    const seen = [];
+    const exec = execFor({
+      'pr diff': () => { throw tooLarge(); },
+      'pr view': 'main abc123\n',
+      'api --paginate': (argv) => { seen.push(argv.find((a) => a.startsWith('repos/'))); return 'a.md\nb.md\na.md\n'; },
+    });
+    expect(fetchPrDiffPaths(3794, { exec, root: '/repo' })).toEqual(['a.md', 'b.md']);
+    expect(seen).toEqual(['repos/{owner}/{repo}/compare/main...abc123']);
+  });
+
+  it('falls back to pulls/<n>/files when compare is unavailable', () => {
+    const exec = execFor({
+      'pr diff': () => { throw tooLarge(); },
+      'pr view': () => { throw new Error('boom'); },
+      'api --paginate': (argv) => { expect(argv.find((a) => a.startsWith('repos/'))).toMatch(/pulls\/3794\/files/); return 'x.ts\n'; },
+    });
+    expect(fetchPrDiffPaths(3794, { exec, root: '/repo' })).toEqual(['x.ts']);
+  });
+
+  it('throws a PERMANENT error (never plain null/transient) when every endpoint fails', () => {
+    const exec = () => { throw tooLarge(); };
+    let err;
+    try { fetchPrDiffPaths(3794, { exec, root: '/repo' }); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(PermanentScopeReadError);
+    expect(err.permanent).toBe(true);
+  });
+
+  it('planFixesFromReconcile refuses a permanent read `scope-too-large`, not `scope-read-failed`', () => {
+    const entry = { kind: 'fix', prNumber: 3794, headRefName: 'lane/prepare-main-protection', labels: [] };
+    const { planned, refusals } = planFixesFromReconcile([entry], () => null, () => [], () => [], 'we', () => { throw new PermanentScopeReadError('too big'); });
+    expect(planned).toEqual([]);
+    expect(refusals).toEqual([{ pr: 3794, kind: 'scope-too-large', why: expect.stringContaining('not retried as transient') }]);
   });
 });
 

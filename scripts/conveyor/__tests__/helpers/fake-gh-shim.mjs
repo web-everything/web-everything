@@ -87,6 +87,7 @@ try {
 const HTTP_401 = "HTTP 401: Bad credentials (https://api.github.com/graphql)\n";
 const HTTP_RATE_LIMIT = 'API rate limit exceeded for user ID 1\n';
 const HTTP_5XX = 'HTTP 502: Bad Gateway\n';
+const HTTP_406_TOO_LARGE = 'could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of files (300). Consider using \'List pull requests files\' API or locally cloning the repository instead.\nPullRequest.diff too_large\n';
 // #4075 soak harness gap (break `sticky-smoke-rejection`): `gh` is a Go binary — a real network failure prints
 // Go's net/http error text, never one of the HTTP_* fixtures above. Live 2026-09-25 08:14 ET both gh smoke checks
 // failed together with exactly this shape (`daemon-live-smoke.mjs#TRANSIENT_FAILURE_PATTERNS` added
@@ -421,13 +422,15 @@ function handleApi(store, rest) {
   return guarded(() => {
     const method = flagValue(rest, '--method') || flagValue(rest, '-X') || 'GET';
     const jq = flagValue(rest, '--jq');
-    const path = rest.find((a, i) => {
+    let path = rest.find((a, i) => {
       if (a.startsWith('-')) return false;
       const prev = rest[i - 1];
       // skip values that belong to a preceding flag (-F k=v, --method/-X M, --jq Q)
       if (prev === '-F' || prev === '--method' || prev === '-X' || prev === '--jq') return false;
       return true;
     });
+    // Real `gh api` expands `{owner}/{repo}` from the cwd's remote; mirror that (PR #3794 fallback reads use it).
+    if (path && path.includes('{owner}/{repo}')) path = path.replace('{owner}/{repo}', resolveRepoSlug(store, null));
     if (method !== 'GET') return { stderr: `fake-gh: unsupported api --method ${method}\n`, exitCode: 1 };
     if (!path) return { stderr: 'fake-gh: api: no path given\n', exitCode: 1 };
 
@@ -613,6 +616,8 @@ const result = withStore(STORE_PATH, (store) => {
     if (f.timesLeft <= 0) bucket.shift();
     if (f.kind === 'rate-limit') return { stderr: HTTP_RATE_LIMIT, exitCode: 1 };
     if (f.kind === '5xx') return { stderr: HTTP_5XX, exitCode: 1 };
+    // PR #3794 — GitHub's answer to `gh pr diff` on a PR over 300 files; permanent for that endpoint.
+    if (f.kind === 'too-large') return { stderr: HTTP_406_TOO_LARGE, exitCode: 1 };
     if (f.kind === '401') return { stderr: HTTP_401, exitCode: 1 };
     if (f.kind === 'timeout') return { sleepMs: 120_000 };
     // #4075 soak harness gap — see GO_NETWORK_ERROR's own comment above.

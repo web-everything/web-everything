@@ -75,6 +75,25 @@ export function manifestConflictDisposition(parsed, manifest = LANE_MANIFEST) {
   return 'real';
 }
 
+/** Guard thresholds (PR #3794). A rebuilt tip may grow a PR's changed-file count by at most this absolute slack... */
+export const SCOPE_JUMP_SLACK = 25;
+/** ...and may not multiply it by more than this factor. BOTH must be exceeded to refuse (small PRs may legitimately grow). */
+export const SCOPE_JUMP_FACTOR = 3;
+
+/**
+ * PR #3794 — decide whether a rebuilt tip's changed-file count jumped implausibly far past the PR's previous
+ * count (the signature of main's own commits being carried into the PR instead of just its own). Pure.
+ * `prev`/`post` are file COUNTS; either being null/0 (unreadable / no baseline) means "cannot judge" -> ok.
+ * @returns {{ok:boolean, prev:number|null, post:number|null, reason?:string}}
+ */
+export function scopeJumpVerdict(prev, post) {
+  if (!Number.isFinite(prev) || !Number.isFinite(post) || prev <= 0) return { ok: true, prev, post };
+  if (post > prev + SCOPE_JUMP_SLACK && post > prev * SCOPE_JUMP_FACTOR) {
+    return { ok: false, prev, post, reason: `the rebuilt tip would change ${post} files against base, but the PR changed ${prev} before the rebase (more than +${SCOPE_JUMP_SLACK} and x${SCOPE_JUMP_FACTOR}) — main's own commits are probably being carried into the PR` };
+  }
+  return { ok: true, prev, post };
+}
+
 /** The default real git runner. #2923 — this used to be a LOCAL `(cmd, args, { env, cwd })` literal that named
  *  neither `input` nor `encoding`, so destructuring silently dropped them. `merge-ai-prs.mjs` imports THIS
  *  symbol and injects it into `rebaseDropContent` / `applyCollisionHealToIndex`, whose write-back passes
@@ -216,6 +235,19 @@ export function rebaseDropManifest({
     if (curCommit) {
       return { action: 'current', reason: 'tip already up-to-date on base and manifest-free — no rebuild needed', base, laneRef, newCommit: curCommit };
     }
+  }
+
+  // PR #3794 — SCOPE-JUMP GUARD: refuse to push a rebuilt tip whose changed-file count (vs `base`) exploded past the
+  // PR's count before the rebase, and report it. Counts are read with `git diff --name-only`: BEFORE = the PR's own
+  // contribution (`base...mergeRef`, merge-base form); AFTER = `base` vs the resolved tree (what the PR will show once
+  // GitHub measures it against `base`). A read that fails or returns nothing means "cannot judge" and never blocks.
+  const countFiles = (args) => {
+    const r = run('git', ['diff', '--name-only', ...args], { cwd });
+    return r.status === 0 ? String(r.stdout || '').split('\n').filter(Boolean).length : null;
+  };
+  const jump = scopeJumpVerdict(countFiles([`${base}...${mergeRef}`]), countFiles([base, resolvedTree]));
+  if (!jump.ok) {
+    return { action: 'error', guard: 'scope-jump', prevFiles: jump.prev, postFiles: jump.post, reason: `refusing to push ${laneRef}: ${jump.reason}` };
   }
 
   const healTag = healed.length ? `, renumber ${healed.map((r) => `#${r.oldNum}→#${r.newNum}`).join('/')}` : '';

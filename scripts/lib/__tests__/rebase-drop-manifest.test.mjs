@@ -14,6 +14,7 @@ import {
   parseMergeTree,
   manifestConflictDisposition,
   rebaseDropManifest,
+  scopeJumpVerdict,
 } from '../rebase-drop-manifest.mjs';
 import { acquireFixClaim } from '../../conveyor/fix-procedure.mjs';
 import { fixDispatchClaimRoot } from '../../conveyor/fix-claim-store.mjs';
@@ -452,5 +453,38 @@ describe('rebaseDropManifest refuses to push onto a branch a fixer holds the LIV
     const r = rebaseDropManifest({ laneRef: 'lane/x-shared-name', run });
     expect(r.action).toBe('rebased');
     expect(calls.some((c) => c.args[0] === 'push')).toBe(true);
+  });
+});
+
+describe('rebaseDropManifest scope-jump guard (PR #3794)', () => {
+  const names = (n) => Array.from({ length: n }, (_, i) => `src/f${i}.ts`).join('\n') + '\n';
+  // `git diff --name-only <base>...<ref>` (before) vs `git diff --name-only <base> <tree>` (after).
+  const diffScript = (before, after) => ({
+    diff: (args) => ({ status: 0, stdout: names(args[2].includes('...') ? before : after) }),
+  });
+
+  it('scopeJumpVerdict: a small PR growing a little is fine; a jump past +25 AND x3 is refused; unreadable never blocks', () => {
+    expect(scopeJumpVerdict(8, 12).ok).toBe(true);
+    expect(scopeJumpVerdict(200, 300).ok).toBe(true); // big PR, modest growth
+    expect(scopeJumpVerdict(8, 309).ok).toBe(false);
+    expect(scopeJumpVerdict(8, 309).reason).toMatch(/309 files.*8 before/);
+    expect(scopeJumpVerdict(0, 309).ok).toBe(true); // no baseline
+    expect(scopeJumpVerdict(null, 309).ok).toBe(true);
+  });
+
+  it('refuses to commit/push a rebuilt tip whose file count exploded, and reports prev/post', () => {
+    const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING, ...diffScript(8, 309) });
+    const r = rebaseDropManifest({ laneRef: 'lane/prepare-main-protection', run });
+    expect(r.action).toBe('error');
+    expect(r.guard).toBe('scope-jump');
+    expect(r.prevFiles).toBe(8);
+    expect(r.postFiles).toBe(309);
+    expect(calls.some((c) => c.args[0] === 'commit-tree')).toBe(false);
+    expect(calls.some((c) => c.args[0] === 'push')).toBe(false);
+  });
+
+  it('a normal rebuild (count steady) still pushes', () => {
+    const { run } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING, ...diffScript(8, 8) });
+    expect(rebaseDropManifest({ laneRef: 'lane/ok', run }).action).toBe('rebased');
   });
 });

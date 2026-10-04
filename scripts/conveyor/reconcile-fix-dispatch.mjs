@@ -228,13 +228,15 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
     // its own item number never resolved (no backlog card anywhere) and the separate diff-read fallback kept
     // coming back empty.
     let diffReadFailed = false;
+    let diffReadPermanent = false; // PR #3794 — a 406 too_large read that no fallback could answer: never retried.
+    const noteReadFailure = (e) => { diffReadFailed = true; if (e?.permanent) diffReadPermanent = true; };
     let cachedDiffPaths;
     const entryFiles = Array.isArray(entry.files) && entry.files.length < 100 ? entry.files.filter((p) => typeof p === 'string' && p) : null;
     const fetchDiffPathsForEntry = (prNum) => {
       if (cachedDiffPaths !== undefined) return cachedDiffPaths;
       if (entryFiles) return entryFiles; // trusted — already fetched, possibly genuinely empty.
       let out;
-      try { out = fetchItemlessDiffPaths(prNum); } catch { diffReadFailed = true; return []; }
+      try { out = fetchItemlessDiffPaths(prNum); } catch (e) { noteReadFailure(e); return []; }
       if (out === null) { diffReadFailed = true; return []; }
       cachedDiffPaths = Array.isArray(out) ? out : [];
       return cachedDiffPaths;
@@ -243,7 +245,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
     const resolveFallbackScopeForEntry = (prNum, itemKey) => {
       if (entryFiles) return entryFiles.map((p) => `${prefix}:${p}`);
       let out;
-      try { out = resolveFallbackScope(prNum, itemKey); } catch { diffReadFailed = true; return []; }
+      try { out = resolveFallbackScope(prNum, itemKey); } catch (e) { noteReadFailure(e); return []; }
       if (out === null) { diffReadFailed = true; return []; }
       return Array.isArray(out) ? out : [];
     };
@@ -266,7 +268,9 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
         // #x9fbg1x-live-incident — a read that FAILED must retry later, never be read as a durable "no files".
         // This tick still can't dispatch (no fence either way), but it is reported distinctly so a reader (and
         // the next tick's fresh read) can tell the two apart.
-        refusals.push(diffReadFailed
+        refusals.push(diffReadPermanent
+          ? { pr, kind: 'scope-too-large', why: `PR #${pr} changes too many files for \`gh pr diff\` (HTTP 406) and the paginated file-list fallbacks failed too — a permanent condition, not retried as transient` }
+          : diffReadFailed
           ? { pr, kind: 'scope-read-failed', why: `PR #${pr} names no backlog item, and the changed-file diff read failed (transient \`gh\` error) — retrying next pass rather than treating this as no files` }
           : { pr, kind: 'no-scope', why: `PR #${pr} names no backlog item, and its own changed-file diff found nothing to fence with either — refusing to dispatch a fix agent with no fence` });
         continue;
@@ -363,7 +367,9 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
     }
     if (!scope.length) {
       // #x9fbg1x-live-incident — a read that FAILED must retry later, never be read as a durable "no files".
-      refusals.push(diffReadFailed
+      refusals.push(diffReadPermanent
+        ? { pr, kind: 'scope-too-large', why: `PR #${pr} changes too many files for \`gh pr diff\` (HTTP 406) and the paginated file-list fallbacks failed too — a permanent condition, not retried as transient` }
+        : diffReadFailed
         ? { pr, kind: 'scope-read-failed', why: `item #${itemNum} (PR #${pr}) has no declared scope, and the changed-file fallback read failed (transient \`gh\` error) — retrying next pass rather than treating this as no files` }
         : { pr, kind: 'no-scope', why: `item #${itemNum} (PR #${pr}) has no declared scope, and the PR's own changed-file fallback found nothing to fence with either — refusing to dispatch a fix agent with no fence` });
       continue;
@@ -375,7 +381,9 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
     // as it always has.
     const changedPaths = fetchDiffPathsForEntry(pr);
     if (diffReadFailed) {
-      refusals.push({ pr, kind: 'scope-read-failed', why: `PR #${pr} changed-file read failed — retrying next pass` });
+      refusals.push(diffReadPermanent
+        ? { pr, kind: 'scope-too-large', why: `PR #${pr} changes too many files for \`gh pr diff\` (HTTP 406) and the paginated file-list fallbacks failed too — a permanent condition, not retried as transient` }
+        : { pr, kind: 'scope-read-failed', why: `PR #${pr} changed-file read failed — retrying next pass` });
       continue;
     }
     const isConflict = Array.isArray(entry.labels) && entry.labels.includes(CONFLICT_LABEL);
@@ -450,15 +458,69 @@ export function fetchPrDiffScope(pr, { exec = execFileSyncThrottled, root = REPO
  *   kind (`scope-read-failed` vs `no-scope`) instead of merely swallowing it one level deeper.
  */
 export function fetchPrDiffPaths(pr, { exec = execFileSyncThrottled, root = REPO_ROOT, repo = null } = {}) {
+  const opts = (maxBuffer) => ({
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, cwd: root,
+    timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  });
   try {
     const argv = ['pr', 'diff', String(pr), '--name-only'];
     if (repo) argv.push('--repo', repo);
     // #x5n4zn3 — was bare (no timeout).
-    const out = exec('gh', argv, {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024, cwd: root,
-      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
-    });
+    const out = exec('gh', argv, opts(4 * 1024 * 1024));
     return String(out || '').split('\n').map((s) => s.trim()).filter(Boolean);
+  } catch (err) {
+    // PR #3794 live incident — GitHub answers `gh pr diff` with HTTP 406 / `PullRequest.diff too_large` once a PR
+    // changes more than 300 files. That answer is PERMANENT for that diff endpoint: retrying the same call can
+    // never succeed, yet it used to degrade to `null` (= "transient, retry next pass") forever. Read the same
+    // file list through the paginated REST endpoints instead; only if those fail too is the refusal permanent.
+    if (!isDiffTooLargeError(err)) return null;
+    const paged = fetchPrFilesPaginated(pr, { exec, root, repo, opts });
+    if (paged) return paged;
+    throw new PermanentScopeReadError(`PR #${pr}: \`gh pr diff\` is too large (HTTP 406, over 300 files) and the paginated file-list fallbacks failed too`);
+  }
+}
+
+/** Thrown by {@link fetchPrDiffPaths} when the changed-file list can NEVER be read through any endpoint (the diff
+ *  endpoint answered 406 too_large AND the paginated fallbacks failed). `permanent` tells a caller to refuse with
+ *  a non-retried kind (`scope-too-large`) instead of `scope-read-failed`. */
+export class PermanentScopeReadError extends Error {
+  constructor(message) { super(message); this.name = 'PermanentScopeReadError'; this.permanent = true; }
+}
+
+/** Is this `gh pr diff` failure GitHub's "diff too large" (HTTP 406, `PullRequest.diff too_large`, >300 files)? Pure. */
+export function isDiffTooLargeError(err) {
+  const text = `${err?.stderr ?? ''}\n${err?.stdout ?? ''}\n${err?.message ?? ''}`;
+  return /HTTP 406|too_large|exceeded the maximum number of files/i.test(text);
+}
+
+/** GitHub caps both file-list endpoints at 3000 files. */
+export const MAX_PAGINATED_FILES = 3000;
+
+/**
+ * The paginated fallback for a too-large PR diff. Prefers `compare/<base>...<headSha>` (diffed against the LIVE base
+ * branch — the PR's real contribution), then `pulls/<n>/files` (diffed against the PR's recorded base sha, which can
+ * lag main and overstate the list; PR #3794 showed 309 files there vs 8 against live main). Returns the de-duplicated
+ * path list (capped at {@link MAX_PAGINATED_FILES}), or `null` when neither endpoint answered.
+ */
+export function fetchPrFilesPaginated(pr, { exec = execFileSyncThrottled, root = REPO_ROOT, repo = null, opts } = {}) {
+  const o = opts || (() => ({
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, cwd: root,
+    timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  }));
+  const slug = repo || '{owner}/{repo}';
+  const lines = (out) => [...new Set(String(out || '').split('\n').map((s) => s.trim()).filter(Boolean))].slice(0, MAX_PAGINATED_FILES);
+  try {
+    const viewArgv = ['pr', 'view', String(pr), '--json', 'baseRefName,headRefOid', '--jq', '.baseRefName + " " + .headRefOid'];
+    if (repo) viewArgv.push('--repo', repo);
+    const [base, head] = String(exec('gh', viewArgv, o(1024 * 1024)) || '').trim().split(' ');
+    if (base && head) {
+      const out = exec('gh', ['api', '--paginate', '--method', 'GET', `repos/${slug}/compare/${base}...${head}`, '-F', 'per_page=100', '--jq', '.files[]?.filename'], o(8 * 1024 * 1024));
+      return lines(out);
+    }
+  } catch { /* fall through to the pulls/files endpoint */ }
+  try {
+    const out = exec('gh', ['api', '--paginate', '--method', 'GET', `repos/${slug}/pulls/${pr}/files`, '-F', 'per_page=100', '--jq', '.[].filename'], o(8 * 1024 * 1024));
+    return lines(out);
   } catch {
     return null;
   }
