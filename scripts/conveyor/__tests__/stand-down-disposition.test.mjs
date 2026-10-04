@@ -85,6 +85,9 @@ describe('#3850 — structured dispositions', () => {
     expect(isCloseSupersededExecuted(forged.comments)).toBe(false);
     const reanswered = [...comments3850, closed, comments3850.find((c) => c.body.startsWith('<!-- conveyor-stand-down-answer:v1 -->'))];
     expect(isCloseSupersededExecuted(reanswered)).toBe(false);
+    // a stray well-formed answer naming NO stand-down after the marker does not move the boundary
+    const stray = { author: { login: 'chalbert' }, body: buildOperatorAnswer({ standDownId: 'IC_nothing', reason: 'x', actor: 'chalbert', channel: 'chat' }) };
+    expect(isCloseSupersededExecuted([...reopened.comments, stray])).toBe(true);
   });
 
   it('a live fix claim still wins: nothing is closed under a running fixer', () => {

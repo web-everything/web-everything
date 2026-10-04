@@ -125,9 +125,12 @@ export const CLOSE_SUPERSEDED_MARKER = '<!-- conveyor-close-superseded:v1 -->';
  */
 export function isCloseSupersededExecuted(comments) {
   if (!Array.isArray(comments)) return false;
+  // The SAME "latest answer" the planner acts on (`latestOperatorAnswer`: it must answer a stand-down that
+  // precedes it) — a stray well-formed answer naming no stand-down must not move the boundary.
   let answerAt = -1;
   for (let i = comments.length - 1; i >= 0; i -= 1) {
-    if (parseOperatorAnswer(comments[i])) { answerAt = i; break; }
+    const answer = parseOperatorAnswer(comments[i]);
+    if (answer && comments.slice(0, i).some((c) => isTerminal(c) && c.id != null && String(c.id) === answer.standDownId)) { answerAt = i; break; }
   }
   if (answerAt < 0) return false;
   return comments.slice(answerAt + 1).some((c) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'
