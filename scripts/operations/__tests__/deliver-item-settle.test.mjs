@@ -92,6 +92,7 @@ describe('settleDispatchEffect', () => {
   // thrown error, a wrong write) fails THIS test, not just the kill one. The kill test itself now also imports
   // the real module before hanging, so a genuinely broken import throws at startup and the child never even
   // reaches "seeded" — turning a silent false-pass into a visible failure.
+  const CHILD_PROCESS_TEST_TIMEOUT_MS = 60_000;
   const runStoreModule = pathToFileURL(join(REPO_ROOT, 'scripts', 'operations', 'run-store.mjs')).href;
   const settleModule = pathToFileURL(join(REPO_ROOT, 'scripts', 'operations', 'deliver-item-settle.mjs')).href;
 
@@ -127,7 +128,7 @@ describe('settleDispatchEffect', () => {
 
     rmSync(runsDir, { recursive: true, force: true });
     rmSync(scriptDir, { recursive: true, force: true });
-  });
+  }, CHILD_PROCESS_TEST_TIMEOUT_MS);
 
   // Done-when 2 — a wrapper KILLED before it ever reaches a settle call must leave the effect untouched
   // (fail-closed for a genuinely unknown outcome, per #3073). The child imports the REAL `settleDispatchEffect`
@@ -166,6 +167,9 @@ describe('settleDispatchEffect', () => {
         if (buf.includes('seeded')) resolvePromise();
       });
       child.on('error', rejectPromise);
+      // A child that dies before "seeded" (broken import) must fail HERE with its exit code, not sit until the
+      // test-level timeout reports a bare "timed out".
+      child.on('exit', (code) => rejectPromise(new Error(`kill-test child exited ${code} before printing "seeded"`)));
     });
     await seeded;
     const rawBeforeKill = readFileSync(join(runsDir, 'dispatch-lane-killed.json'), 'utf8');
@@ -179,5 +183,8 @@ describe('settleDispatchEffect', () => {
 
     rmSync(runsDir, { recursive: true, force: true });
     rmSync(scriptDir, { recursive: true, force: true });
-  });
+    // Flake fix (PR #3833's required `test` timed out here at the 5000ms default, twice, on a loaded CI runner):
+    // the 5 s budget covers a COLD child `node` startup + importing run-store/deliver-item-settle, which is
+    // load-dependent. The assertions are unchanged; only the wait for the child to be ready is made generous.
+  }, CHILD_PROCESS_TEST_TIMEOUT_MS);
 });
