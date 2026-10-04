@@ -36,6 +36,12 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     ['npx vitest related scripts/a.mjs --run', queue + 'npx vitest related scripts/a.mjs --run'],
     ['npm test', 'npm run test:unit -- <test-file>'],
     ['npm test -- a.test.mjs', 'npm run test:unit -- a.test.mjs'],
+    // a forwarded vitest subcommand has no test:unit equivalent (it would become a filename filter after `vitest run`)
+    ['npm test -- related scripts/a.mjs --run --passWithNoTests', queue + 'npx vitest related scripts/a.mjs --run --passWithNoTests'],
+    ['npm test related scripts/a.mjs', queue + 'npx vitest related scripts/a.mjs'],
+    ['FOO=1 npm test -- related scripts/a.mjs', 'FOO=1 ' + queue + 'npx vitest related scripts/a.mjs'],
+    ['npm test -- list', queue + 'npx vitest list'],
+    ['npm test -- watch a.test.mjs', 'npm run test:unit -- a.test.mjs'],
     ['node scripts/check-standards.mjs --local --files=a.mjs', 'npm run check:standards -- --local --files=a.mjs'],
     ['FOO=1 npx vitest run a.test.mjs', 'FOO=1 ' + queue + 'npx vitest run a.test.mjs'],
     ['FOO="a b" WE_FULL_SUITE_OK=1 npx vitest run "a file.test.mjs"', 'FOO="a b" WE_FULL_SUITE_OK=1 ' + queue + 'npx vitest run "a file.test.mjs"'],
@@ -61,6 +67,12 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     'node --check scripts/check-standards.mjs', 'node -c scripts/check-standards.mjs',
     ...['--version', '-v', '--help', '-h', 'list', 'init', 'bench'].map((arg) => `npx vitest ${arg}`),
   ])('allows %s', (cmd) => expect(decide(cmd, {})).toBeNull());
+
+  it('the queued replacement for `npm test -- related …` is itself allowed (no deny loop)', () => {
+    const suggested = decide('npm test -- related scripts/a.mjs --run --passWithNoTests', {}).match(/Use: `([^`]+)`/)[1];
+    expect(suggested).toBe(queue + 'npx vitest related scripts/a.mjs --run --passWithNoTests');
+    expect(decide(suggested, {})).toBeNull();
+  });
 
   it('keeps full-suite precedence and queues its targeted advice', () => {
     const result = decide('npx vitest run', {});

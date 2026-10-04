@@ -2495,8 +2495,12 @@ function ungatedHeavyHead(head, depth = 0) {
     ? w[1] : inv?.names?.length === 1 ? inv.names[0] : null;
   if (!['test', 't', 'tst'].includes(name)) return null;
   const i = w.indexOf(name, 1);
+  const forwarded = head.slice(words[i].end).trim().replace(/^--(?:\s+|$)/, '');
+  // A forwarded vitest subcommand (`related`, `list`, `bench`, ...) has no `test:unit` equivalent: after
+  // `vitest run` it would degrade to a filename filter (`related a.mjs --passWithNoTests` silently runs nothing).
+  if (VITEST_NON_RUN_SUBCOMMANDS.has(forwarded.split(/\s+/)[0])) return { kind: 'test', subcommand: true, tail: forwarded };
   // `npm test -- run <f>` forwards vitest's own mode word; `test:unit` already runs `vitest run`, so drop it.
-  return { kind: 'test', tail: head.slice(words[i].end).trim().replace(/^--(?:\s+|$)/, '').replace(/^(?:run|watch|dev)(?:\s+|$)/, '') };
+  return { kind: 'test', tail: forwarded.replace(/^(?:run|watch|dev)(?:\s+|$)/, '') };
 }
 
 /** Deny any unqueued test/standards execution, with a runnable replacement. Pure; no escape. */
@@ -2516,7 +2520,9 @@ export function ungatedHeavyRunReason(segment) {
   const env = prefix.length ? prefix.join(' ') + ' ' : '';
   const command = i ? s.slice(words[i]?.start ?? s.length) : s;
   const replacement = run.kind === 'test'
-    ? 'npm run test:unit -- ' + (run.tail || '<test-file>')
+    ? run.subcommand
+      ? 'node scripts/readiness/heavy-admission.mjs run -- npx vitest ' + run.tail
+      : 'npm run test:unit -- ' + (run.tail || '<test-file>')
     : run.kind === 'standards'
       ? 'npm run check:standards' + (run.tail ? ' -- ' + run.tail : '')
       : 'node scripts/readiness/heavy-admission.mjs run -- ' + command;
