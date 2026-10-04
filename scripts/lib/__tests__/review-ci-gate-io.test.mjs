@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getRequiredStatusChecks } from '../required-status-checks.mjs';
-import { readReviewCiGate, readReviewHead, readReviewChecks } from '../review-ci-gate-io.mjs';
+import { readReviewCiGate, readReviewHead, readReviewChecks, formatReviewCiSkip } from '../review-ci-gate-io.mjs';
 const headSha = 'a'.repeat(40);
 function fixture(over = {}) {
   return { repo: 'other/product', pr: 3432, readHead: vi.fn(() => headSha),
@@ -122,4 +122,24 @@ it.each([
       expect(readReviewCiGate({ ...io, readChecks: () => [] }).allowed).toBe(false);
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+describe('formatReviewCiSkip — the real error behind unreadable-ci is logged (plateau #202, 2026-10-04)', () => {
+  const realError = "Command failed: gh pr view 202 --repo plateauapp/plateau-app --json headRefOid\nGraphQL: Could not resolve to a Repository with the name 'plateauapp/plateau-app'. (repository)\n";
+  it('carries the underlying gh error on one line', () => {
+    const io = fixture({ repo: 'plateauapp/plateau-app', pr: 202, readHead: () => { throw new Error(realError); } });
+    const line = formatReviewCiSkip(readReviewCiGate(io));
+    expect(line).toMatch(/^review-ci: unreadable-ci \(/);
+    expect(line).toContain("Could not resolve to a Repository with the name 'plateauapp/plateau-app'");
+    expect(line).not.toContain('\n');
+  });
+  it('scrubs token-shaped strings and bounds the length', () => {
+    const line = formatReviewCiSkip({ reason: 'unreadable-ci', error: `boom ghs_${'A'.repeat(36)} Authorization: token abc123 ${'x'.repeat(900)}` });
+    expect(line).not.toMatch(/ghs_A|abc123/);
+    expect(line.length).toBeLessThan(340);
+  });
+  it('keeps the plain reason when there is no error', () => {
+    expect(formatReviewCiSkip({ allowed: false, reason: 'required-checks-not-successful' })).toBe('review-ci: required-checks-not-successful');
+    expect(formatReviewCiSkip(undefined)).toBe('review-ci: unreadable-ci');
+  });
 });
