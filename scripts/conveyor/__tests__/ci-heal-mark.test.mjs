@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
   countCiHealComments, buildCiHealComment, CI_HEAL_COMMENT_MARKER, spawnCiHealRearm, sanitizeForPublicComment, redactSecrets, spawnCiHealRestamp, postOrOweCiHealComment, resolveHealHead,
@@ -321,9 +321,25 @@ describe('CI-heal carry child arguments', () => {
 describe('CI-heal missing routing label incident replay', () => {
   const head = '1807e6dc53937a98d6104df6f1c5fa2d5ff7a670';
   const scenarios = [
+    ...['source.js', 'README.md', 'config.toml', 'data.json'].map(file => ({ name: `xe8y12n #3239 ${file}`, pr: 3239, labels: [], file, expected: ['review:pending'] })),
+    { name: 'xe8y12n withheld write #3239', labels: [], writeIgnored: true, expected: [], healthProof: true },
+    ...['source.js', 'README.md', 'config.toml', 'data.json'].flatMap(file => [
+      { name: `${file} malformed child labels`, labels: [], race: { labels: null }, expected: [] },
+      { name: `${file} missing child state`, labels: [], race: { state: null }, expected: [] },
+      { name: `${file} missing child head`, labels: [], race: { headRefOid: null }, expected: [] },
+      { name: `${file} concurrent verdict`, labels: [], race: { labels: [{ name: 'review:human' }] }, expected: ['review:human'] },
+      { name: `${file} child read fails`, labels: [], childReadFails: true, expected: [] },
+      { name: `${file} verification read fails`, labels: [], refetchFails: true, expected: ['review:pending'] },
+    ].map(scenario => ({ ...scenario, file, guardCase: true }))),
     { name: '#3463 prepare (2026-10-02 05:06:38Z)', pr: 3463, labels: ['ci:failed', 'review-status:fixing'], expected: ['review:pending'] },
     { name: '#3389 prevention (2026-10-01 22:17:17Z)', pr: 3389, head: '99d53bf598f9292ea964cad68d985f038e425cdc', labels: ['checking', 'review-status:fixing'], expected: ['review:pending'] },
     { name: 'existing prevention merge path', labels: ['ready-to-merge', 'checking'], expected: ['ready-to-merge'] },
+    // The final pre-write read is the child's THIRD view (parent observation, child initial read, pre-write read).
+    { name: 'verdict arrives at the pre-write read', file: 'source.js', guardCase: true, labels: [], raceAt: 3, race: { labels: [{ name: 'review:human' }] }, expected: ['review:human'] },
+    { name: 'ready-to-merge arrives at the pre-write read', file: 'source.js', guardCase: true, labels: [], raceAt: 3, race: { labels: [{ name: 'ready-to-merge' }] }, expected: ['ready-to-merge'] },
+    { name: 'draft arrives at the pre-write read', file: 'source.js', guardCase: true, labels: [], raceAt: 3, race: { isDraft: true }, expected: [] },
+    { name: 'draft status unknown at the pre-write read', file: 'source.js', guardCase: true, labels: [], raceAt: 3, race: { isDraft: null }, expected: [] },
+    { name: 'draft status unknown at the hand-back read', file: 'source.js', guardCase: true, labels: [], isDraftUnknown: true, expected: [] },
     ...['review:human', 'review:changes', 'review:pending', 'review:unknown'].map(label => ({ name: label, labels: [label], expected: [label] })),
     ...['review:human', 'review:changes', 'review:accepted', 'review:unknown'].map(label => ({ name: `concurrent ${label}`, labels: [], race: { labels: [{ name: label }] }, expected: [label] })),
     { name: 'concurrent head move', labels: [], race: { headRefOid: 'f'.repeat(40) }, expected: [] },
@@ -334,20 +350,33 @@ describe('CI-heal missing routing label incident replay', () => {
     { name: 'read fails', labels: [], readFails: true, expected: [] },
     { name: 'write fails', labels: [], writeFails: true, expected: [] },
     { name: 'write is not observed', labels: [], writeIgnored: true, expected: [] },
+    { name: 'post-write stale landing signal appears', labels: [], afterWrite: { labels: [{ name: 'review:pending' }, { name: 'ready-to-merge' }, { name: 'redteam:accepted' }] }, expected: ['review:pending', 'ready-to-merge', 'redteam:accepted'] },
     { name: 'post-write head changes', labels: [], afterWrite: { headRefOid: 'f'.repeat(40) }, expected: ['review:pending'] },
   ];
   const restoreOnlyScenarios = [
     { name: 'unlabelled open PR', pr: 42, labels: [], expected: ['review:pending'] },
     { name: 'accepted', labels: ['review:accepted'], expected: ['review:accepted'] },
     { name: 'merged', labels: [], state: 'MERGED', expected: [] },
-    ...scenarios,
+    ...scenarios.filter(scenario => !scenario.file && !scenario.healthProof),
   ].map(scenario => ({ ...scenario, name: `restore-only: ${scenario.name}`, restoreOnly: true }));
   it.each([...scenarios, ...restoreOnlyScenarios])('$name', async (scenario) => {
-    const healHead = scenario.head || head;
+    let healHead = scenario.head || head;
     const dir = mkdtempSync(join(tmpdir(), 'ci-heal-routing-'));
     try {
+      if ((scenario.file && !scenario.guardCase) || scenario.healthProof) {
+        const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+        git('init', '-b', 'lane');
+        git('config', 'user.name', 'Synthetic heal'); git('config', 'user.email', 'heal@example.test');
+        writeFileSync(join(dir, scenario.file || 'source.js'), 'synthetic healed content\n');
+        git('add', scenario.file || 'source.js'); git('commit', '-m', 'synthetic CI heal');
+        git('init', '--bare', 'remote.git');
+        git('remote', 'add', 'origin', join(dir, 'remote.git'));
+        git('push', 'origin', 'HEAD:refs/heads/lane');
+        healHead = git('rev-parse', 'HEAD');
+        expect(git('--git-dir=remote.git', 'rev-parse', 'refs/heads/lane')).toBe(healHead);
+      }
       const labels = scenario.labels?.map(name => name === null ? null : ({ name }));
-      const state = { state: scenario.state || 'OPEN', isDraft: scenario.isDraft || false, headRefOid: healHead, labels, comments: [] };
+      const state = { state: scenario.state || 'OPEN', isDraft: scenario.isDraftUnknown ? undefined : scenario.isDraft || false, headRefOid: healHead, labels, comments: [], files: scenario.file ? [{ path: scenario.file }] : [] };
       writeFileSync(join(dir, 'state.json'), JSON.stringify(state));
       mkdirSync(join(dir, 'bin'));
       writeFileSync(join(dir, 'bin', 'gh'), `#!${process.execPath}
@@ -356,16 +385,17 @@ const a = process.argv.slice(2), scenario = ${JSON.stringify(scenario)};
 const s = JSON.parse(fs.readFileSync('state.json', 'utf8'));
 fs.appendFileSync('calls.jsonl', JSON.stringify(a) + '\\n');
 if (a[0] === 'pr' && a[1] === 'view') {
- if (scenario.readFails) process.exit(1);
+ if (scenario.readFails || (scenario.childReadFails && s.reads >= 1) || (scenario.refetchFails && s.written)) process.exit(1);
  s.reads = (s.reads || 0) + 1;
- if (s.reads === 2 && scenario.race) Object.assign(s, scenario.race);
- if (s.reads === 3 && scenario.afterWrite) Object.assign(s, scenario.afterWrite);
+ if (s.reads === (scenario.raceAt || 2) && scenario.race) Object.assign(s, scenario.race);
+ if (s.written && scenario.afterWrite) Object.assign(s, scenario.afterWrite);
  console.log(JSON.stringify(s));
 } else if (a[0] === 'pr' && a[1] === 'comment') {
  s.comments.push({body: a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--body-file') + 1], 'utf8') : a[a.indexOf('--body') + 1]});
 } else if (a[0] === 'pr' && a[1] === 'edit') {
  if (scenario.writeFails) process.exit(1);
  if (scenario.writeIgnored) process.exit(0);
+ s.written = true;
  for (let i = 0; i < a.length; i++) {
   if (a[i] === '--add-label' && !s.labels.some(l => l.name === a[i + 1])) s.labels.push({name: a[i + 1]});
   if (a[i] === '--remove-label') s.labels = s.labels.filter(l => l.name !== a[i + 1]);
@@ -374,13 +404,20 @@ if (a[0] === 'pr' && a[1] === 'view') {
 fs.writeFileSync('state.json', JSON.stringify(s));
 `);
       chmodSync(join(dir, 'bin', 'gh'), 0o755);
-      const result = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), '..', 'ci-heal-mark.mjs'),
+      const entry = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '..', 'ci-heal-mark.mjs'));
+      // Opt-in historical execution uses the preparation SHA's actual CLI, with imports anchored to
+      // its original location. No alternate production entrypoint or helper file is created.
+      const historical = process.env.XE8Y12N_PREPARATION === '1'
+        ? execFileSync('git', ['show', '026425e9e4a9c067851692c796ec0620879dabcb:scripts/conveyor/ci-heal-mark.mjs'], { encoding: 'utf8' })
+          .replace(/from (['"])(\.[^'"]+)\1/g, (_m, quote, path) => `from ${quote}${new URL(path, entry).href}${quote}`)
+          .replaceAll('import.meta.url', JSON.stringify(entry.href)) : null;
+      const result = spawnSync(process.execPath, [...(historical ? ['--input-type=module', '--eval', historical, '--'] : []), fileURLToPath(entry),
         String(scenario.pr || 42), '--repo=web-everything/web-everything',
         // Restore-only must use the remote head, ignoring even a conflicting explicit heal head.
         `--head=${scenario.restoreOnly ? 'b'.repeat(40) : healHead}`,
         ...(scenario.restoreOnly ? ['--restore-routing-only'] : [])],
       { cwd: dir, encoding: 'utf8', env: { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'lock') } });
-      const failed = scenario.readFails || scenario.writeFails || scenario.writeIgnored || scenario.afterWrite;
+      const failed = scenario.readFails || scenario.writeFails || scenario.writeIgnored || scenario.afterWrite || scenario.refetchFails;
       expect(result.status, result.stderr).toBe(scenario.restoreOnly && failed ? 1 : 0);
       const final = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'));
       const { planCiLifecycleLabelUpdate } = await import('../../merge-ai-prs.mjs');
@@ -388,7 +425,7 @@ fs.writeFileSync('state.json', JSON.stringify(s));
       const cleanup = planCiLifecycleLabelUpdate({ currentLabels: validLabels, desired: 'ready-to-merge', owned: ['checking', 'ci:failed', 'blocked'] });
       // fix-end removes its activity badge; drain removes stale CI labels on green.
       const afterGreen = validLabels.map(l => l.name).filter(l => l !== 'review-status:fixing' && !cleanup.toRemove.includes(l));
-      expect(afterGreen, result.stdout).toEqual(scenario.expected);
+      expect(afterGreen, JSON.stringify({ pushedSha: healHead, result: result.stdout, calls: readFileSync(join(dir, 'calls.jsonl'), 'utf8'), labels: final.labels })).toEqual(scenario.expected);
       const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
       expect(calls.every(c => c.includes('web-everything/web-everything') || c.includes('--repo=web-everything/web-everything'))).toBe(true);
       const edits = calls.filter(c => c[1] === 'edit');
@@ -408,13 +445,47 @@ fs.writeFileSync('state.json', JSON.stringify(s));
         return;
       }
       const outcome = JSON.parse(result.stdout.trim().split('\n').pop());
+      if (scenario.healthProof) {
+        const { default: smell } = await import('../health-smells/review-label-missing.mjs');
+        const { emptyHealthState, stepEpisodes } = await import('../health-watch-core.mjs');
+        let memory = emptyHealthState();
+        const transitions = [], samples = [];
+        for (let n = 0; n < 10; n++) {
+          const time = Date.parse('2026-10-03T12:00:00Z') + n * 900000;
+          const results = smell.evaluate({ prs: [{ repo: 'web-everything/web-everything', number: 3239,
+            reviewObservation: { ...final, commits: [{ authors: [{ name: 'Claude' }] }], observedAt: time } }] },
+            { now: time, lastTick: memory.lastTick });
+          const next = stepEpisodes(memory, [{ smell, results }], time);
+          transitions.push(...next.transitions.map(t => t.type));
+          samples.push({ observedAt: time, transitions: next.transitions.map(t => t.type) });
+          memory = JSON.parse(JSON.stringify({ ...next.state, lastTick: { completedAt: time } }));
+        }
+        expect(transitions).toEqual(['opened']);
+        expect(Object.keys(memory.episodes)).toHaveLength(1);
+        console.info('xe8y12n withheld-write completion soak', JSON.stringify({ pushedSha: healHead, result: outcome, calls, labels: final.labels, samples }));
+      }
+      if (scenario.file && !scenario.guardCase) {
+        const { planReconcile } = await import('../reconcile-core.mjs');
+        const commits = [{ messageHeadline: 'heal', authors: [{ name: 'Claude' }] }];
+        const plan = planReconcile({ requiredChecks: ['gate'], prs: [{ ...final, number: 3239, commits,
+          statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }] }] });
+        expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'review' }));
+        console.info('xe8y12n synthetic completion proof', JSON.stringify({ pushedSha: healHead, content: scenario.file,
+          result: outcome, calls, labels: final.labels, plan }));
+        const repeated = spawnSync(process.execPath, [fileURLToPath(entry), '3239', '--repo=web-everything/web-everything', `--head=${healHead}`],
+          { cwd: dir, encoding: 'utf8', env: { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'lock') } });
+        expect(repeated.status, repeated.stderr).toBe(0);
+        expect(JSON.parse(repeated.stdout.trim().split('\n').pop()).restored).toBeUndefined();
+        expect(readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse).filter(c => c[1] === 'edit')).toHaveLength(1);
+
+      }
       if (scenario.pr) {
         expect(edits).toHaveLength(1);
         expect(edits[0]).not.toContain('--remove-label');
         expect(outcome).toMatchObject({ restored: 'review:pending' });
       } else {
         expect(outcome.restored).toBeUndefined();
-        if (scenario.writeFails || scenario.writeIgnored || scenario.afterWrite) {
+        if (scenario.writeFails || scenario.writeIgnored || scenario.afterWrite || scenario.refetchFails) {
           expect(edits).toHaveLength(1);
           expect(outcome.carryReason).toEqual(expect.any(String));
         } else expect(edits).toHaveLength(0);
@@ -447,7 +518,7 @@ it('xp0lsdi: attempt-accounted success retains the guarded review hand-back with
   });
   expect(result).toMatchObject({ restamped: false, rearmed: true });
   expect(calls).toHaveLength(2);
-  expect(calls[0]).toEqual(['pr', 'view', '3373', '--json', 'labels', '--repo=web-everything/web-everything']);
+  expect(calls[0]).toEqual(['pr', 'view', '3373', '--json', 'labels,isDraft', '--repo=web-everything/web-everything']);
   expect(calls[1]).toMatchObject({ pr: 3373, repo: 'web-everything/web-everything' });
 });
 

@@ -48,6 +48,7 @@
  * cannot corrupt anything, and a lease taken inside a one-shot read is a lease nothing releases when the process
  * is killed.
  */
+import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from '../operations/pr-status.mjs';
 import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
@@ -143,16 +144,26 @@ export const PR_LIST_JSON_FIELDS = 'number,headRefName,headRefOid,baseRefName,la
  *  the default page would leave the overflow unowned, which is this item's defect wearing a smaller hat. */
 export const PR_LIST_LIMIT = 200;
 
+/** Attach authorship only where the open-PR listing has no review disposition. */
+export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCommits } = {}) {
+  return prs.map(pr => {
+    if (!Array.isArray(pr.labels) || pr.labels.some(l => (typeof l === 'string' ? l : l?.name)?.startsWith('review:'))) return pr;
+    return { ...pr, state: pr.state ?? 'OPEN',
+      commits: readCommits(repo, pr.number, { headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefName: pr.baseRefName }) };
+  });
+}
+
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#defaultReadPrs — the OPEN-PR discovery query. `exec` is injectable so
  * the argv is assertable with no `gh` on PATH and no credential.
  * @param {{exec?:Function, repo?:string|null}} [o]
  * @returns {Array<object>}
  */
-export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null } = {}) {
+export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo } = {}) {
+  const enrich = rows => enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) });
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
-  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true }); if (shared) return shared; }
+  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
   const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', PR_LIST_JSON_FIELDS];
   if (repo) argv.push('--repo', repo);
   // #x5n4zn3 — was bare (no timeout).
@@ -163,7 +174,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null } = {
   });
   if (isGhDeferred(out)) return JSON.parse(String(out));
   const parsed = JSON.parse(String(out || '[]'));
-  return Array.isArray(parsed) ? parsed : [];
+  return Array.isArray(parsed) ? enrich(parsed) : [];
 }
 
 /**
@@ -1102,7 +1113,7 @@ export function runReconcilePass({
   // `owner/name` slug, never the raw input. `repo == null` stays `null` (gh infers the repo from cwd, same as
   // before) — only a caller-supplied value is normalised.
   const resolvedRepo = repo == null ? null : CONSTELLATION_REPOS[repoKey].slug;
-  const rawPrs = readPrs({ repo: resolvedRepo });
+  const rawPrs = readPrs({ repo: resolvedRepo, ...(readPrs === defaultReadPrs ? { attributionRepo: CONSTELLATION_REPOS[repoKey].slug } : {}) });
   if (isGhDeferred(rawPrs)) return { ...rawPrs, dispatch: [], refusals: [], notes: [rawPrs.message], prs: 0, agents: 0 };
   // #4501 — read the live required-check set (branch protection, cached; degrades to
   // the repo's declared fallback if the live fetch fails) BEFORE enriching main-red facts, so BOTH

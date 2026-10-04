@@ -47,7 +47,8 @@ export const OBSERVATION_ONLY = Object.freeze({
   "open-prs-over-limit": "Preserve existing backpressure; never raise/disable the PR limit.",
   "pr-events-stale": "Existing polling fallback owns availability; no webhook/token/deployment edits.",
   "pr-stage-stall": "Cluster is not a per-PR action authorization; reuse inspections and specific episodes.",
-  "review-seat-cap-near-limit": "Low severity; report only, no provider/cap changes and no operator ping.",
+  "review-label-missing": "A missing label is reported only; restoring review goes through the guarded re-arm command, never a responder label write.",
+  "review-seat-cap-near-limit":"Low severity; report only, no provider/cap changes and no operator ping.",
   "self-sync-conflict": "Never force or hand-merge a clone/overlay from the responder.",
   "stood-down-prs": "Terminal questions need explicit operator answers; never auto-call stand-down-answer.",
   "untracked-backlog-card": "Do not adopt/commit unknown daemon-clone files; normal owner/file-item delivery is owed."

@@ -1075,3 +1075,46 @@ describe('xyx5mea isolated shell replay', () => {
     expect(episodeReplay.send).toHaveBeenCalledTimes(1);
   });
 });
+
+it('xe8y12n probe preserves fresh raw evidence independently of cached/normalised labels', () => {
+  const commits = [{ authors: [{ name: 'Claude' }] }];
+  const exec = (_bin, args) => JSON.stringify(args[1] === 'list'
+    ? [{ number: 3239, labels: null }]
+    : { state: 'OPEN', labels: [], headRefOid: 'a'.repeat(40) });
+  const rows = probePrs({ exec, readCommits: () => commits, now: 123 });
+  expect(rows[0]).toMatchObject({ labelsValid: false, reviewObservation: { state: 'OPEN', labels: [], commits, observedAt: 123 } });
+  const failed = probePrs({ exec: (_bin, args) => { if (args[1] === 'view') throw new Error('unavailable'); return JSON.stringify([{ number: 3239, labels: [] }]); }, readCommits: () => commits });
+  expect(failed[0].reviewObservation).toBeNull();
+});
+
+it('xe8y12n probe re-observes only PRs whose cached labels could hide a missing review label', async () => {
+  const views = [];
+  const commitReads = [];
+  const listed = [
+    { number: 1, labels: [{ name: 'review:pending' }] },
+    { number: 2, labels: [{ name: 'review:human' }, { name: 'bug' }] },
+    { number: 3, labels: [{ name: 'checking' }] },
+    { number: 4, labels: [] },
+    { number: 5, labels: null },
+    { number: 6, labels: [{ name: 'review:accepted' }], isDraft: true },
+  ];
+  const exec = (_bin, args) => {
+    if (args[1] === 'list') return JSON.stringify(listed);
+    views.push(Number(args[2]));
+    return JSON.stringify({ state: 'OPEN', labels: [], headRefOid: 'a'.repeat(40) });
+  };
+  const rows = probePrs({ exec, now: 5, readCommits: (_slug, number) => { commitReads.push(number); return []; } });
+  const byNumber = new Map(rows.map(row => [row.number, row]));
+  // Each constellation repo lists the same fixture, so only count what happens for one repo's rows.
+  const perRepo = new Set(views);
+  expect([...perRepo].sort()).toEqual([3, 4, 5]);
+  expect(views.length).toBe(perRepo.size * (rows.length / listed.length));
+  expect(new Set(commitReads)).toEqual(perRepo);
+  // A labelled PR costs no call but still reports a clean cached observation, so an open episode can close.
+  for (const number of [1, 2, 6]) expect(byNumber.get(number).reviewObservation).toMatchObject({ state: 'OPEN', cached: true, commits: [] });
+  const { default: smell } = await import('../health-smells/review-label-missing.mjs');
+  const closeResults = smell.evaluate({ prs: [...byNumber.values()].filter(row => [1, 2, 6].includes(row.number)) }, { now: 10, lastTick: { completedAt: 0 } });
+  expect(closeResults).toHaveLength(3);
+  for (const result of closeResults) expect(result.breach).toBe(false);
+  for (const number of [3, 4, 5]) expect(byNumber.get(number).reviewObservation).toMatchObject({ state: 'OPEN' });
+});

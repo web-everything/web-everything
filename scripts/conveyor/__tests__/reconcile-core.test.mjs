@@ -3399,3 +3399,29 @@ describe('xul2kwr withdrawn green drafts', () => {
     }
   });
 });
+
+describe('xe8y12n orthogonal missing-review diagnostic', () => {
+  const commits = [{ messageHeadline: 'repair', authors: [{ name: 'Claude' }] }];
+  it.each([
+    {}, { isDraft: true }, { labels: lbl('ci:failed'), statusCheckRollup: [{ name: 'gate', conclusion: 'failure', status: 'completed' }] },
+    { mergeStateStatus: 'DIRTY', labels: lbl('merge-status:conflicting') },
+    { labels: lbl('review-status:stood-down') },
+    { fixClaim: { session: 'fixer', headSha: 'a'.repeat(40) } },
+  ])('keeps the exact dispatch/refusal decisions for %j', extra => {
+    const pr = { number: 3239, state: 'OPEN', labels: [], headRefName: 'lane/3239', headRefOid: 'a'.repeat(40), comments: [], statusCheckRollup: greenRollup, ...extra };
+    const without = planReconcile({ prs: [pr] });
+    const withEvidence = planReconcile({ prs: [{ ...pr, commits }] });
+    expect(withEvidence.notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing', prNumber: 3239 }));
+    expect(withEvidence.dispatch).toEqual(without.dispatch);
+    expect(withEvidence.refusals).toEqual(without.refusals);
+  });
+  it('does not suppress live-agent decisions', () => {
+    const pr = { number: 3239, state: 'OPEN', labels: [], headRefName: 'lane/3239', headRefOid: 'a'.repeat(40), comments: [], statusCheckRollup: greenRollup };
+    const agents = [{ name: 'review-3239', state: 'running', pid: 123, pidAlive: true, cwd: '/lane', headSha: pr.headRefOid }];
+    const before = planReconcile({ prs: [pr], agents });
+    const after = planReconcile({ prs: [{ ...pr, commits }], agents });
+    expect(after.notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing' }));
+    expect(after.dispatch).toEqual(before.dispatch);
+    expect(after.refusals).toEqual(before.refusals);
+  });
+});
