@@ -2,10 +2,11 @@
 kind: story
 size: 5
 parent: "3383"
-status: active
+status: resolved
 scaffoldedBy: "session-watchdog-lane-7"
 dateScaffolded: "2026-10-04"
 dateOpened: "2026-10-04"
+dateResolved: "2026-10-04"
 tags: []
 ---
 
