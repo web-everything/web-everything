@@ -1198,3 +1198,51 @@ describe('timeout re-run eligibility — card-only diff + derived red checks (PR
     expect(enrichPrsWithTimeoutEvidence([pr], { repo: 'o/r', read, enabled: false })[0]).toBe(pr);
   });
 });
+
+describe('stacked PR required-check absence (#3915)', () => {
+  const stacked = () => ({ ...xxPr(), number: 3915, baseRefName: 'lane/base', statusCheckRollup: [] });
+  const base = () => ({ ...xxPr(), number: 3889, headRefName: 'lane/base', baseRefName: 'main',
+    statusCheckRollup: XX_REQUIRED.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })) });
+  const run = async (prs, extra = {}) => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const readChecks = vi.fn(() => []);
+    const plan = runReconcilePass({ ...xxOptions(), readPrs: () => prs, readChecks,
+      enrichTimeouts: p => p, enrichReferralHolds: p => p, ...extra });
+    return { plan, readChecks };
+  };
+  it('waits on the open base PR without reading or promoting', async () => {
+    const { plan, readChecks } = await run([stacked(), base()]);
+    expect(readChecks).not.toHaveBeenCalled();
+    expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
+    expect(plan.notes).toContainEqual(expect.objectContaining({ kind: 'stacked-awaiting-base', prNumber: 3915,
+      baseRefName: 'lane/base', basePrNumber: 3889, why: expect.stringContaining('PR #3889') }));
+    expect(plan.dispatch.filter(r => r.prNumber === 3915)).toEqual([]);
+    const { formatReport } = await import('../reconcile-pass.mjs');
+    expect(formatReport(plan)).toContain('stacked on lane/base (PR #3889)');
+  });
+  it('surfaces an orphaned base', async () => {
+    const { plan, readChecks } = await run([stacked()]);
+    expect(readChecks).not.toHaveBeenCalled();
+    expect(plan.notes).toContainEqual(expect.objectContaining({ kind: 'stacked-base-orphaned', basePrNumber: null }));
+  });
+  it.each(['main', 'strict', 'partial', 'truncated'])('keeps hydration for %s', async shape => {
+    const pr = stacked();
+    if (shape === 'main') pr.baseRefName = 'main';
+    if (shape === 'partial') pr.statusCheckRollup = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }];
+    if (shape === 'truncated') pr.statusCheckRollup = Array.from({ length: 100 }, () => ({ name: 'other' }));
+    if (shape === 'strict') vi.stubEnv('WE_STACKED_PR_CHECK_POLICY', 'strict');
+    try {
+      const { plan, readChecks } = await run([pr]);
+      expect(readChecks).toHaveBeenCalledOnce();
+      expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toHaveLength(1);
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('classifies against the configured default and reads the policy', async () => {
+    const { isStackedPr, readStackedPrCheckPolicy } = await import('../reconcile-pass.mjs');
+    expect(isStackedPr({ baseRefName: 'release' }, 'release')).toBe(false);
+    expect(isStackedPr({}, 'main')).toBe(false);
+    expect(isStackedPr({ baseRefName: 'main' }, 'release')).toBe(true);
+    expect(readStackedPrCheckPolicy({})).toBe('await-base');
+    expect(readStackedPrCheckPolicy({ WE_STACKED_PR_CHECK_POLICY: 'strict' })).toBe('strict');
+  });
+});

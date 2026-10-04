@@ -42,7 +42,7 @@ describe('GH_ARGV is byte-identical to the pre-port inline calls', () => {
     // `state` (#2953), `createdAt` (#3067), `comments` (#x9krtkb). This assertion is what makes each addition
     // deliberate: it fails on any change, so a field cannot appear here without someone deciding it should.
     expect(GH_ARGV.readPrState('o/n', 7)).toEqual([
-      'pr', 'view', '7', '--repo', 'o/n', '--json', 'labels,headRefOid,headRefName,state,body,createdAt,title,comments,isDraft',
+      'pr', 'view', '7', '--repo', 'o/n', '--json', 'labels,headRefOid,headRefName,baseRefName,state,body,createdAt,title,comments,isDraft',
     ]);
   });
 
@@ -75,7 +75,7 @@ describe('GH_ARGV is byte-identical to the pre-port inline calls', () => {
   });
 
   it('names the state fields once, so a stub cannot drift from the real read', () => {
-    expect(PR_STATE_FIELDS).toEqual(['labels', 'headRefOid', 'headRefName', 'state', 'body', 'createdAt', 'title', 'comments', 'isDraft']);
+    expect(PR_STATE_FIELDS).toEqual(['labels', 'headRefOid', 'headRefName', 'baseRefName', 'state', 'body', 'createdAt', 'title', 'comments', 'isDraft']);
   });
 
   it('creates a label with --force — create-or-update, never an error on one that already exists', () => {

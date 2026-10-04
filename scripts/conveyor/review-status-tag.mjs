@@ -36,6 +36,8 @@ import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 
 /** Matches this module's own label shape, and only this shape.
  *
+ *  `awaiting-base` — a draft stacked on a non-default branch waits for its base PR to land.
+ *
  *  `awaiting-ci` (draft-first PRs, operator-approved 2026-09-27) — added alongside the five LIVE-agent states
  *  below, though it is not one: it names a draft PR (`scripts/pr-land.mjs --park`'s new draft-by-default
  *  open) that no agent is, or should be, working — no review is dispatched for it until `scripts/conveyor/
@@ -59,7 +61,7 @@ import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
  *  `fix-begin` time (mutually exclusive with `fixing`/each other and with `awaiting-ci` — see
  *  {@link deriveReviewStatus}'s own `fixClaim` branch for how a LIVE claim's recorded reason is read back so
  *  this reconciler's own periodic pass never fights `fix-begin`'s freshly-applied label). */
-export const STATUS_LABEL_RE = /^review-status:(reviewing|review-stalled|fixing|fix-stalled|fixing-conflict|fixing-conflict-stalled|healing-ci|ci-heal-stalled|awaiting-ci|draft-scope-change|draft-withdrawn|needs-human)$/;
+export const STATUS_LABEL_RE = /^review-status:(reviewing|review-stalled|fixing|fix-stalled|fixing-conflict|fixing-conflict-stalled|healing-ci|ci-heal-stalled|awaiting-ci|awaiting-base|draft-scope-change|draft-withdrawn|needs-human)$/;
 
 /**
  * `claude agents --json` states this module treats as LIVE — something is currently actioned, or stuck trying
@@ -86,10 +88,10 @@ const LIVE_STATES = Object.freeze({ working: 'reviewing', blocked: 'stalled' });
  * (`we:scripts/conveyor/reconcile-core.mjs#classifyPr`'s `ci-red` phase is its own branch ahead of the
  * `OWED`/`OWED_ELSEWHERE` table), so the ordering is precedence-in-name-only — it never actually shadows a
  * real ci-heal for a PR that also has a stale review/fix session row sitting in `claude agents --json`.
- * @param {{pr:number|string, agents?:Array<{name?:string, state?:string}>, isDraft?:boolean, mergeConflicted?:boolean, fixClaim?:object|null, escalation?:object|null}} o
- * @returns {{role:'review'|'fix'|'ci-heal'|'draft', state:'reviewing'|'review-stalled'|'fixing'|'fix-stalled'|'fixing-conflict'|'fixing-conflict-stalled'|'healing-ci'|'ci-heal-stalled'|'awaiting-ci'|'draft-scope-change'|'draft-withdrawn'|'needs-human'}|null}
+ * @param {{pr:number|string, agents?:Array<{name?:string, state?:string}>, isDraft?:boolean, baseRefName?:string, defaultBranch?:string, mergeConflicted?:boolean, fixClaim?:object|null, escalation?:object|null}} o
+ * @returns {{role:'review'|'fix'|'ci-heal'|'draft', state:'reviewing'|'review-stalled'|'fixing'|'fix-stalled'|'fixing-conflict'|'fixing-conflict-stalled'|'healing-ci'|'ci-heal-stalled'|'awaiting-ci'|'awaiting-base'|'draft-scope-change'|'draft-withdrawn'|'needs-human'}|null}
  */
-export function deriveReviewStatus({ pr, agents = [], repo = 'we', isDraft = false, mergeConflicted = false, fixClaim = null, escalation = null } = {}) {
+export function deriveReviewStatus({ pr, agents = [], repo = 'we', isDraft = false, baseRefName, defaultBranch = 'main', mergeConflicted = false, fixClaim = null, escalation = null } = {}) {
   const reviewName = mintSessionSlug({ kind: 'review', id: pr, repo });
   const fixName = mintSessionSlug({ kind: 'fix', id: pr, repo });
   const ciHealName = mintSessionSlug({ kind: 'ci-heal', id: pr, repo });
@@ -150,7 +152,7 @@ export function deriveReviewStatus({ pr, agents = [], repo = 'we', isDraft = fal
   // own state at all: "awaiting-ci" — deterministic off the PR record (`pr.isDraft`), never a fabricated idle
   // guess, and the operator-visible answer to "why hasn't this been reviewed yet" (no `review:*` label match
   // needed: the label lander already knows this is a draft the moment `isDraft` is true).
-  if (isDraft) return { role: 'draft', state: 'awaiting-ci' };
+  if (isDraft) return { role: 'draft', state: baseRefName && baseRefName !== defaultBranch ? 'awaiting-base' : 'awaiting-ci' };
   return null;
 }
 
@@ -182,7 +184,7 @@ export function planStatusLabelChange({ status, currentLabels = [] } = {}) {
  * (`we:skills-src/conveyor/review-daemon.mjs#runReviewTick`, wired to reuse it) passes it straight through.
  * Omitting either (the default, and every pre-existing caller/test) reads fresh, byte-identical to before
  * these options existed.
- * @param {{pr:number|string, repo:string, listAgents?:Function, provider?:object, agents?:Array<object>, currentLabels?:Array<{name?:string}|string>, isDraft?:boolean, mergeConflicted?:boolean, readFixClaim?:Function}} o
+ * @param {{pr:number|string, repo:string, listAgents?:Function, provider?:object, agents?:Array<object>, currentLabels?:Array<{name?:string}|string>, isDraft?:boolean, baseRefName?:string, defaultBranch?:string, mergeConflicted?:boolean, readFixClaim?:Function}} o
  * @returns {{changed:boolean, label:string|null, removed:string[]}}
  */
 // x26lw6u — the default listing includes live review JOBS (`we:scripts/operations/review-job.mjs`): a review no
@@ -191,9 +193,8 @@ export function planStatusLabelChange({ status, currentLabels = [] } = {}) {
 export function tagReviewStatus({
   pr, repo, listAgents = () => listAgentsWithReviewJobs(), provider = createGhProvider(),
   agents: suppliedAgents, currentLabels: suppliedLabels, prState,
-  // draft-first PRs (operator-approved 2026-09-27) — threaded straight to `deriveReviewStatus`; `false` by
-  // default so every pre-existing caller/test of this function (none of which pass it) is unaffected.
-  isDraft = false,
+  // Reuse explicit facts or the PR snapshot; standalone calls read that snapshot from the provider.
+  isDraft, baseRefName, defaultBranch = 'main',
   // `fixing-conflict` (draft reason at a glance, operator ask 2026-09-27, #2826) — same "false by default, no
   // existing caller affected" convention as `isDraft` above.
   mergeConflicted = false,
@@ -209,7 +210,8 @@ export function tagReviewStatus({
   // A failed read throws before any label write, preserving an existing human signal.
   const subject = prState ?? provider.readPrState?.(repo, pr);
   const escalation = latestCiHealEscalationForHead(subject?.comments, subject?.headRefOid);
-  const status = deriveReviewStatus({ pr, agents, repo: repoKey, isDraft, mergeConflicted, fixClaim, escalation });
+  const status = deriveReviewStatus({ pr, agents, repo: repoKey, isDraft: isDraft ?? subject?.isDraft ?? false,
+    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation });
   const currentLabels = suppliedLabels ?? provider.readLabels(repo, pr);
   const plan = planStatusLabelChange({ status, currentLabels });
   if (!plan.add && plan.remove.length === 0) {
@@ -218,7 +220,9 @@ export function tagReviewStatus({
   }
   // `review-status:*` is a small fixed enum, but a repo that has never carried one yet still needs it created
   // before `gh pr edit --add-label` will accept it — same reasoning as `review-round-tag.mjs`'s own ensure.
-  if (plan.add) provider.ensureLabel(repo, plan.add, { color: 'c5def5', description: 'informative: a reviewer/fixer is currently working this PR, or stuck (auto-managed)' });
+  if (plan.add) provider.ensureLabel(repo, plan.add, { color: 'c5def5', description: plan.add === 'review-status:awaiting-base'
+    ? 'Waiting for the base PR to land and this PR to retarget before required CI runs'
+    : 'informative: a reviewer/fixer is currently working this PR, or stuck (auto-managed)' });
   // `add` is optional on the shared port (#2026-09-01 extension) precisely for this remove-only case: nothing
   // is live, so there is no replacement label — only the stale one comes off.
   provider.setLabels(repo, pr, { add: plan.add ?? undefined, remove: plan.remove });
@@ -258,7 +262,9 @@ export function applyReviewStatus({ pr, repo, state, provider = createGhProvider
     return { changed: false, label: currentLabels.some(l => (typeof l === 'string' ? l : l?.name) === 'review-status:draft-withdrawn')
       ? 'review-status:draft-withdrawn' : state ? `review-status:${state}` : null, removed: [] };
   }
-  if (plan.add) provider.ensureLabel(repo, plan.add, { color: 'c5def5', description: 'informative: a reviewer/fixer is currently working this PR, or stuck (auto-managed)' });
+  if (plan.add) provider.ensureLabel(repo, plan.add, { color: 'c5def5', description: plan.add === 'review-status:awaiting-base'
+    ? 'Waiting for the base PR to land and this PR to retarget before required CI runs'
+    : 'informative: a reviewer/fixer is currently working this PR, or stuck (auto-managed)' });
   provider.setLabels(repo, pr, { add: plan.add ?? undefined, remove: plan.remove });
   return { changed: true, label: plan.add, removed: plan.remove };
 }
