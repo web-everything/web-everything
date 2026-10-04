@@ -62,6 +62,10 @@ run.
    not refuse at all and the merged run does, every merged refusal is caused. A refusal is **also** caused
    when its `file` is among the PR's changed files (`git diff --name-only <baseRef>...HEAD`) or its `hash`
    names a pending card the PR adds or edits: a PR that touches a refusing file owns it.
+   - **The rule, in one line (operator ruling on this card):** a refusal that is **new against current main**
+     is **caused**, whichever file it names and whether or not that file is in the PR's diff. It is never
+     downgraded to a warning. "Current main" is the freshly fetched `baseRef`; a refusal counts as already on
+     main only when the base run proves it (below).
    - **Inherited needs positive proof; caused is the default.** A refusal is **inherited** only when all of
      these hold: the base run **completed without throwing** and returned a structured `refusals` list (empty
      or not, even when it also carries an `error` string), that list contains
@@ -175,3 +179,7 @@ Steps 1 to 4.
 1. **Executable:** the replay case in `we:scripts/__tests__/check-standards-main-state-parity.test.mjs` fails
    before this lands and passes after.
 2. Proof steps 1 and 2 are pasted in the PR.
+3. **Executable (the operator's indirect-cause ruling):** the "Caused indirectly, by changing the sweep" and
+   "New against current main is caused, wherever the file is" cases in
+   `we:scripts/__tests__/check-standards-main-state-parity.test.mjs` fail before this lands (they assert an
+   error where today's relaxed rule gives none) and pass after.

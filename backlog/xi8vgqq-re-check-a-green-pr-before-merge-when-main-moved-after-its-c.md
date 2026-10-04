@@ -42,6 +42,17 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
      drain therefore **derives the tested main SHA itself** from data the PR cannot write. **Default: the
      exact one**, the first parent of the merge commit GitHub built for the event (`refs/pull/<n>/merge` as
      of the run's trigger), read through the API by the drain.
+   - **The rule, in one line (operator ruling on this card):** the tested main commit is either established
+     **exactly** or it is `unknown`, and `unknown` **refuses**: this gate re-checks, and #xca0u65 grants no
+     exemption. Nothing estimates it. The helper may never return a commit it only believes was tested.
+   - **A pinned source must be proved to exist before it is relied on.** A probe on 2026-10-04 of a real
+     merged PR's `CI` run (`gh api repos/<repo>/actions/runs?head_sha=<head>`) showed `pull_requests` empty and
+     no base SHA on the run object, so that field is **not** a usable source. The builder's first step is a
+     feasibility proof: find a source, tied to one run and not writable by the PR, that yields the exact
+     merge commit, and record a real-run fixture of it (Proof plan step 0). **If no such source passes,
+     the story still ships:** `readTestedMainSha` returns `unknown` for every run, so every run past the age
+     cap is re-checked (bounded by step 3) and #xca0u65 never grants an exemption. That is the intended
+     refuse-by-default state, never a reason to add a guess.
    - **No exact value means unknown, and unknown is never guessed.** There is **no timestamp fallback**. A
      commit date is not a push time, so "main's tip as of `created_at`" can name a commit the run never
      tested (a main commit pushed after the run was created can carry an older commit date, whatever
@@ -162,6 +173,13 @@ Steps 1 to 5.
     is reached, a PR with an `unknown` tested commit proceeds as `off` would; that is intended and bounded,
     not a hole. The module exports no
     fallback margin constant (a test asserts `TESTED_SHA_FALLBACK_MARGIN_MIN` is not exported).
+  - **Refuse when not exact (RED today):** a test over a table of inputs (every shape the API can give:
+    missing field, malformed SHA, an extra parent, a second parent that is not the run's `head_sha`, a
+    first parent that is not on main's first-parent line, a call error, a timeout) asserts the **only** two
+    outcomes are `{ state: 'exact', sha }` where `sha` was read from a pinned source, and `{ state:
+    'unknown' }`. A property-style assertion walks the helper's source and fixtures to check no code path
+    reads a commit date or run timestamp to choose a SHA. With the pinned source stubbed out entirely, every
+    input is `unknown` and the drain re-checks (the always-refuse state).
   - **Forged tested-SHA hint:** a run whose job published main's current tip as its tested SHA, while the
     exact derived value is older, is re-checked. A hint older than the derived value makes the effective SHA
     the older one. A hint that is not on main's first-parent line is ignored. **A hint with an `unknown`
@@ -203,6 +221,12 @@ Steps 1 to 5.
 
 ## Proof plan
 
+0. **Feasibility, before any other step.** Against one real merged PR's `CI` run, call `readTestedMainSha`
+   un-injected and paste its result. Either it returns `{ state: 'exact', sha }` and the sha equals the first
+   parent of the merge commit that run checked out (shown by the run's own checkout log line), or it returns
+   `{ state: 'unknown' }` and the PR says plainly that no pinned source was found, so the shipped behaviour is
+   always-refuse. A fixture of the real response is committed beside `we:scripts/lib/__tests__/tested-main-base.test.mjs`. A story whose
+   only evidence is injected readers has not proved the exact path is reachable.
 1. Before/after on the live queue: run the drain in dry-run JSON mode on current open PRs, with at least two
    ready PRs. **Before:** both shown as `merge`. **After:** the second shown as `would re-check`, naming
    main's tip and the run's age anchor (the older of `created_at` and `run_started_at`).
@@ -219,4 +243,7 @@ Steps 1 to 5.
 ## Done when
 
 1. **Executable:** the replay case fails before this lands (B merges) and passes after (B is re-checked).
-2. Proof step 1 is pasted in the PR.
+2. Proof steps 0 and 1 are pasted in the PR.
+3. **Executable (the operator's no-guess ruling):** the "Unknown tested commit is never guessed" and "Refuse
+   when not exact" cases in `we:scripts/lib/__tests__/tested-main-base.test.mjs` fail before this lands and
+   pass after.

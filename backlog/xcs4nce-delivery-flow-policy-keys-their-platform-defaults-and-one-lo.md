@@ -83,6 +83,13 @@ dispatched, not when a PR merges (`we:scripts/conveyor/build-dispatch-policy.mjs
     agent-clearable), because it decides whether the merge protections fire. Register the loader
     `we:scripts/lib/delivery-policy.mjs` at the **engine tier**, like `we:scripts/merge-ai-prs.mjs`. An `off`/`free`/weaker value in a
     PR is then reviewed by a person, never cleared by an agent verdict.
+  - **The rule, in one line (operator ruling on this card, twice):** a JSON file may supply a policy value
+    **only if a PR cannot edit it without `review:human`.** Pointers are therefore restricted to
+    already-protected paths; no pointer-reachable file sits outside the human-gated roster. The loader and the
+    review gate ask the **same predicate**, `isPolicySpecPath`, which is **basename-matched** like the rest of
+    the trust chain. So "the loader honours this file" and "an edit to this file forces `review:human`" are
+    one fact read twice: a file the loader honours is, by construction, one the gate protects, in whichever
+    directory it sits.
   - **A pointer target is policy-tier too, or it is refused.** A string pointer hands part of the policy to
     another file, so editing only that file would otherwise skip `review:human` (the root file is untouched)
     and weaken a protection after landing. The loader therefore accepts a pointer **only if its resolved
@@ -215,8 +222,12 @@ In the build lane, paste three CLI runs into the PR (plus the trust run, step 4 
 
 1. No config file: every field shows its default.
 2. `WE_POLICY_CONFIG` pointing at a temp file that sets `mergeGate.onMainRed` to `warn`: that field shows
-   `warn` from `config`, and every other field shows its default.
-3. A temp file with `onMainRed` set to `explode`: the field shows `halt`, with one warning.
+   `warn` from `config`, and every other field shows its default. **The temp file lives inside the daemon's
+   state dir** (point the state dir at a temp directory for the proof), because the confinement rules ignore a
+   `WE_POLICY_CONFIG` file anywhere else, and a file inside `root` is honoured only if it is registered.
+   Outside the state dir the run would show the default plus a warning, which is the correct refusal, not
+   this step's result.
+3. A temp file (same place) with `onMainRed` set to `explode`: the field shows `halt`, with one warning.
 
 Also show one `recordPolicyEvent` line written to a temp `WE_POLICY_EVENTS_FILE`, and one with a control
 character and a 5 000-character reason, showing it stripped and cut.
@@ -242,3 +253,8 @@ character and a 5 000-character reason, showing it stripped and cut.
    `dimension.field` paths (the five policy objects, not `sources`, `warnings` or `filesRead`) equal those of
    `PLATFORM_DELIVERY_POLICY_DEFAULTS`, so a key added to the table without a default, or a default missing
    from the output, fails the test instead of passing a hand count.
+3. **Executable (pointed-to file, the repeated operator ruling):** a case in
+   `we:scripts/lib/__tests__/gate-config.test.mjs` shows a pointer-target JSON file, edited **alone** (the root
+   file untouched), forces `review:human`; and a case in `we:scripts/lib/__tests__/delivery-policy.test.mjs`
+   shows a pointer to an **unregistered** JSON file yields the default plus a warning naming the path. Both fail
+   before this lands.
