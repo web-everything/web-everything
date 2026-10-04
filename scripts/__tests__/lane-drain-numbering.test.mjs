@@ -181,6 +181,45 @@ describe('numberPendingHashes — drain JIT numbering wire (#2288)', () => {
     expect(git('status', '--porcelain').trim()).toBe('');
   });
 
+  it.each([
+    [undefined, undefined, 'fixture-slug', false],
+    [undefined, undefined, 'real-slug', true],
+    ['hash', undefined, 'fixture-slug', true],
+    [undefined, 'pass', 'fixture-slug', false],
+    [undefined, 'pass', 'real-slug', true],
+    ['hash', 'pass', 'fixture-slug', true],
+  ])('matches citations with match=%s policy=%s slug=%s (held=%s)', (match, policy, slug, held) => {
+    vi.stubEnv('WE_JIT_UNSWEPT_CITE_MATCH', match);
+    vi.stubEnv('WE_JIT_UNSWEPT_CITE_POLICY', policy);
+    try {
+      write('backlog/2200-legacy.md', '---\nkind: story\n---\n');
+      write('backlog/xhash01-real-slug.md', '---\nkind: story\n---\n');
+      write('scripts/other.mjs', `// backlog/xhash01-${slug}.md\n`);
+      write(QUEUED_REL, JSON.stringify({ queued: [] }));
+      git('add', '.'); git('commit', '-qm', 'seed citation match');
+      const result = numberPendingHashes(repo);
+      expect(result.committed).toBe(!held);
+      expect(result.assigned).toEqual(held ? [] : [{ hash: 'xhash01', nnn: '2201' }]);
+      expect(backlogNames()).toContain(held ? 'xhash01-real-slug.md' : '2201-real-slug.md');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('numbers when soak metadata is repaired and only a different slug remains', () => {
+    write('backlog/2200-legacy.md', '---\nkind: story\n---\n');
+    write('backlog/xhash01-real-slug.md', '---\nkind: story\n---\n');
+    const definition = 'scripts/conveyor/soak/breaks/regression.mjs';
+    write(definition, "export default { card: 'we:backlog/xhash01-real-slug.md', run() { return 'backlog/xhash01-fixture-slug.md'; } };\n");
+    write(QUEUED_REL, JSON.stringify({ queued: [] }));
+    git('add', '.'); git('commit', '-qm', 'seed partial sweep');
+    const result = numberPendingHashes(repo);
+    expect(result.assigned).toEqual([{ hash: 'xhash01', nnn: '2201' }]);
+    expect(result.committed).toBe(true);
+    expect(readFileSync(join(repo, definition), 'utf8')).toContain('we:backlog/2201-real-slug.md');
+    expect(readFileSync(join(repo, definition), 'utf8')).toContain('backlog/xhash01-fixture-slug.md');
+  });
+
   it('assigns max+1, renames the hash file, rewrites a referrer, and commits', () => {
     write('backlog/2200-legacy.md', '---\nkind: story\nstatus: resolved\n---\n# Legacy\n');
     write('backlog/xhash01-alpha.md', '---\nkind: story\nstatus: resolved\n---\n# Alpha\n\nBody mentions xhash01.\n');
