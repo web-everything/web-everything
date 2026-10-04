@@ -65,15 +65,34 @@ export function defaultDrainHistoryPath(env = process.env, home = homedir()) {
  * @param {string} repoKey
  * @param {{execFn?:Function, cwd?:string, repoPathArg?:string|null}} o
  */
-export function readLanePoolStatus(repoKey, { execFn = execFileSync, cwd = ROOT, repoPathArg = null } = {}) {
+export function readLanePoolStatus(repoKey, { execFn = execFileSync, cwd = ROOT, repoPathArg = null, env = process.env } = {}) {
   const args = [join(ROOT, 'scripts', 'lane-pool.mjs'), 'status', '--json'];
   if (repoPathArg) args.push(`--repo=${repoPathArg}`);
+  const maxAgeMs = resolveLiveStateLaneStatusMaxAgeMs(env);
+  if (maxAgeMs > 0) args.push(`--max-age-ms=${maxAgeMs}`);
   try {
     const out = execFn('node', args, { cwd, encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
     return { parsed: JSON.parse(out) };
   } catch (e) {
     return { error: String(e.message ?? e).split('\n')[0] };
   }
+}
+
+/**
+ * Host churn cut (2026-10-04) — how old a signature-matched cached lane probe `live-state` will accept (see
+ * `../lib/lane-status-cache.mjs`). live-state only COUNTS free/leased/dirty lanes for a dashboard (both wip
+ * publishers read it every 120 s, once per constellation pool — ~28 s of `git status` over 90 lanes each time);
+ * it never acts on a lane. Any git-level change (commit/checkout/reset/fetch/add) still invalidates a row
+ * immediately; only an un-staged working-tree edit can lag in the dirty COUNT, by at most this window. Default
+ * 180 s = the publishers' 120 s read cadence plus one ~30-60 s scan, so each read can reuse the previous one's
+ * rows (the cache is shared only among opted-in callers). `0` restores the always-fresh probe.
+ */
+export const LIVE_STATE_LANE_STATUS_MAX_AGE_ENV = 'WE_LIVE_STATE_LANE_STATUS_MAX_AGE_MS';
+export const DEFAULT_LIVE_STATE_LANE_STATUS_MAX_AGE_MS = 180_000;
+export function resolveLiveStateLaneStatusMaxAgeMs(env = process.env) {
+  const raw = env[LIVE_STATE_LANE_STATUS_MAX_AGE_ENV];
+  const n = raw === undefined || raw === '' ? NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_LIVE_STATE_LANE_STATUS_MAX_AGE_MS;
 }
 
 /** Count an already-read status, retaining the same fail-soft error row. */
