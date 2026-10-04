@@ -43,7 +43,30 @@ import { readUnsupported } from '../conveyor/unsupported-repo.mjs';
 import { stuckDispatchEpisodes } from '../conveyor/stuck-pr-dispatch-marker.mjs';
 import { countStandDownComments, standDownComments, standDownReason } from '../conveyor/stand-down.mjs';
 import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
+// Loaded lazily and fail-soft, like `laneReclaimQueue`: the ledger pulls in `jury-core.mjs`'s whole graph, which this
+// file's header deliberately keeps out of its own (a copy staged without it must still run and print the queue).
+let rulingLedger = null;
+let rulingLedgerError = null;
+try { rulingLedger = await import('../lib/ruling-ledger.mjs'); } catch (e) { rulingLedgerError = String(e?.message ?? e).split('\n')[0]; }
+// The effective ladder says where a twice-ignored finding becomes the operator's; absent, the platform default stands.
+let rulingHumanAt;
+try { rulingHumanAt = (await import('../conveyor/fixer-ladder.mjs')).loadFixerLadder().humanAt; } catch { /* default */ }
 const hasLabel = (pr, name) => (pr.labels ?? []).some((label) => label.name === name);
+
+/**
+ * RULING NEEDED row (live 2026-10-04, PR #3794: parked about 8 h with confirmed findings awaiting a ruling and no
+ * alert anywhere). Derived from the PR thread alone, for ANY open PR (the park is the signal, whatever the labels
+ * say), so it shows until a ruling or a new head clears it. `findings` is one line each plus the file.
+ */
+export function rulingNeededRow(repo, pr) {
+  const need = rulingLedger?.rulingNeeded(pr, rulingHumanAt === undefined ? {} : { humanAt: rulingHumanAt });
+  if (!need) return null;
+  return {
+    repo, number: pr.number, title: pr.title, head: need.head,
+    since: need.since === null ? null : new Date(need.since).toISOString(),
+    findings: need.findings.map((f) => ({ file: f.file, line: f.line, summary: f.summary, reason: f.reason })),
+  };
+}
 
 /** How many times an UNKNOWN mergeability is re-polled, and the first backoff (doubling each attempt). */
 export const MERGEABLE_POLL_ATTEMPTS = 4;
@@ -315,8 +338,9 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
   const repoSlugs = requested.length ? requested : Object.values(CONSTELLATION_REPOS).map(({ slug }) => slug);
   const reconcileNotes = args.includes('--with-reconcile-notes') ? reconcileNotesFor(repoSlugs) : [];
   const report = {
-    ready: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported, laneDecisions, backpressure, reconcileNotes, ...(health ? { health } : {}),
+    ready: [], rulingNeeded: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported, laneDecisions, backpressure, reconcileNotes, ...(health ? { health } : {}),
   };
+  if (rulingLedgerError) report.errors.push(`ruling-needed section unavailable: ${rulingLedgerError}`);
   for (const repo of repoSlugs) {
     try {
       const prs = JSON.parse(execFileSync('gh', [
@@ -341,6 +365,10 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
           readyNumbersThisRepo.add(pr.number);
         } else if (result.transient) report.pending.push(row);
         else report.notReady.push({ ...row, reasons: result.reasons });
+      }
+      for (const pr of prs) {
+        const row = rulingNeededRow(repo, pr);
+        if (row) report.rulingNeeded.push(row);
       }
       // STOOD DOWN — every OPEN PR (any labels) carrying a stand-down comment, minus anything already in NEEDS
       // YOU above. `countStandDownComments` is the reused, single-sourced gate for "does this PR qualify at all".
@@ -369,6 +397,9 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
     if (health) console.log(health.join('\n'));
     console.log('NEEDS YOU (review:human + advisory:accepted, all gates pass):');
     console.log(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`).join('\n') || '(none)');
+    console.log('RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:');
+    console.log(report.rulingNeeded.map((r) => `${r.repo}#${r.number}  ${r.title}  [waiting since ${r.since || 'time unknown'}, head ${r.head.slice(0, 9)}]\n`
+      + r.findings.map((f) => `    - ${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}  ${f.summary}${f.reason === 'dispute' ? '  [came back after your block ruling; the fixer and reviewer disagree]' : ''}`).join('\n')).join('\n') || '(none)');
     console.log('PENDING — transient, re-run (GitHub is still computing mergeability; no agent work owed):');
     console.log(report.pending.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`).join('\n') || '(none)');
     console.log('UNSUPPORTED REPO — owed work the conveyor cannot dispatch for this repo:');

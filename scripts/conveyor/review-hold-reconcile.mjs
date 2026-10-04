@@ -62,6 +62,7 @@ import {
 import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { defaultListPrs } from './advisory-label-sweep.mjs';
+import { sweepRulingNeededLabels } from './ruling-needed-sweep.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 
 /** Plain label names off a `gh --json labels` array (`[{name}]`) or a bare-string array. Pure. */
@@ -190,6 +191,16 @@ export function sweepReviewHoldLabels({
     }
     results.push(entry);
   }
+  // `advisory:ruling-needed` — a derived label (a parked review whose confirmed findings await the operator's
+  // ruling on the current head), added and removed from the SAME listing this sweep already read. Its own entry
+  // shape (`ruling`), so the three existing fields above keep their meaning. A failure here never costs the sweep.
+  try {
+    for (const r of sweepRulingNeededLabels({ repo, listPrs: () => prs, provider, dryRun })) {
+      results.push({ num: r.num, ruling: r.action, ...(r.error ? { error: r.error } : {}) });
+    }
+  } catch (e) {
+    results.push({ num: 0, ruling: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] });
+  }
   return results;
 }
 
@@ -218,6 +229,7 @@ if (IS_CLI) {
           const did = dryRun ? 'would heal' : 'healed';
           writeLineSync(2, `  🩹 PR #${r.num}: ${did} — removed ${r.healed.join(',')} (no genuine human clearance found for the live head)${r.commentPosted ? ', comment posted' : ''}${r.error ? ` (${r.error})` : ''}`);
         }
+        if (r.ruling) writeLineSync(2, `  PR #${r.num}: ${dryRun ? 'would ' : ''}${r.ruling} advisory:ruling-needed${r.error ? ` (FAILED: ${r.error})` : ''}`);
         if (r.flagged?.length) {
           writeLineSync(2, `  🚩 PR #${r.num}: carries contradictory review:* verdict labels (${r.flagged.join(',')}) — #2766/#2767 shape; not auto-resolved (${r.flagReason || 'unresolved'}${r.fetchError ? `, fetch error: ${r.fetchError}` : ''}). Resolve via review-set-label.mjs --to=clear-human or --to=changes.`);
         }
