@@ -168,7 +168,7 @@ const hintMatchesFile = (hints, file) => !!file && hints.some((h) => String(file
  * A ruling the operator wrote AFTER this head's record is a fresh ruling on it, not an ignored one.
  * @returns {null|{head:string, misses:number, escalate:boolean, sentBack:boolean, sentBackAt:?number, matches:Array<object>}}
  */
-export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT } = {}) {
+export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStalls = false } = {}) {
   const head = String(pr?.headRefOid ?? '').toLowerCase();
   if (!SHA.test(head)) return null;
   const snaps = recordSnapshots(pr?.comments, head);
@@ -227,18 +227,29 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT } = {}) {
   if (!matches.length) return null;
   const sent = sentBackAt(pr?.comments, head);
   // A fixer that was sent back, ended, and left this head unchanged missed once more: the ladder counts it.
-  const returns = fixerReturnsAfter(pr?.comments, sent);
+  const returns = fixerReturnsAfter(pr?.comments, sent, { countInfraStalls });
   const effective = worst + returns;
   return { head, misses: worst, returns, effectiveMisses: effective, escalate: effective >= humanAt, sentBack: sent !== null, sentBackAt: sent, noticedRungs: noticedRungs(pr?.comments, head), matches };
 }
 
 /** Leading text of the fix-end marker (`we:scripts/conveyor/fix-procedure.mjs#FIX_END_MARKER`; a test pins them equal). */
 export const FIX_END_PREFIX = '🔓 conveyor fix-end';
-/** Turns a fixer ended after this head was sent back: each one that left the head unchanged is one more miss. */
-export function fixerReturnsAfter(comments, at) {
+/** Leading text of the infra-stall mark a fix-end carries when its turn ended `blocked-on-infra`
+ *  (`we:scripts/conveyor/fix-procedure.mjs#FIX_END_INFRA_STALL_MARK`; a test pins them equal). */
+export const FIX_END_INFRA_STALL_PREFIX = '<!-- fix-end-outcome: blocked-on-infra';
+/** Env knob: `WE_FIXER_LADDER_COUNT_INFRA_STALLS=1` makes an infra-stalled fixer turn count as a miss again
+ *  (default off: an outage — verify never ran, GitHub down — says nothing about the fixer). */
+export const COUNT_INFRA_STALLS_ENV = 'WE_FIXER_LADDER_COUNT_INFRA_STALLS';
+export function resolveCountInfraStalls(env = process.env) {
+  return /^(1|true|yes|on)$/i.test(String(env?.[COUNT_INFRA_STALLS_ENV] ?? '').trim());
+}
+/** Turns a fixer ended after this head was sent back: each one that left the head unchanged is one more miss —
+ *  except a turn that ended blocked on infrastructure (live 2026-10-04, PR #3890), unless `countInfraStalls`. */
+export function fixerReturnsAfter(comments, at, { countInfraStalls = false } = {}) {
   if (at == null) return 0;
   return (Array.isArray(comments) ? comments : []).filter((c) => isTrustedMarkerAuthor(c)
-    && String(c?.body ?? '').trimStart().startsWith(FIX_END_PREFIX) && (sinceOf(c) ?? 0) > at).length;
+    && String(c?.body ?? '').trimStart().startsWith(FIX_END_PREFIX) && (sinceOf(c) ?? 0) > at
+    && (countInfraStalls || !String(c.body).includes(FIX_END_INFRA_STALL_PREFIX))).length;
 }
 
 const sentBackLine = (head, rungId = null) => `<!-- ruling-not-addressed: ${head}${rungId ? ` rung=${rungId}` : ''} -->`;

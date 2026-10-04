@@ -90,6 +90,13 @@ export const FIX_DRAFT_LABEL = Object.freeze({
 /** Stable first lines of the two marker comments. Treat as fixed once shipped. */
 export const FIX_BEGIN_MARKER = '🔒 conveyor fix-begin — fix claim held';
 export const FIX_END_MARKER = '🔓 conveyor fix-end — fix claim released';
+/**
+ * Durable mark on a fix-end comment whose turn ended `blocked-on-infra` (its own completion record says so). The
+ * fixer-escalation ladder (`we:scripts/lib/ruling-ledger.mjs#fixerReturnsAfter`) counts fix-ends on a sent-back
+ * head as misses; an outage is not a miss (live 2026-10-04, PR #3890: verify never ran, ENOTDIR, fixed by #3902).
+ * The count is read off the PR thread, so the mark has to live there too. Pinned equal to the ledger's prefix.
+ */
+export const FIX_END_INFRA_STALL_MARK = '<!-- fix-end-outcome: blocked-on-infra -->';
 
 /** Normalize a repo slug or key to the claim store's repo KEY (`we`, `frontierui`, …). Throws on an unknown one. */
 export function repoKeyOf(repo) {
@@ -508,7 +515,7 @@ export function buildFixBeginComment({
   ].filter((l) => l !== null).join('\n');
 }
 
-export function buildFixEndComment({ who, headSha = null, draft = false }) {
+export function buildFixEndComment({ who, headSha = null, draft = false, infraStall = false }) {
   const tail = draft
     ? 'The PR stays a draft; the fix daemon marks it ready once required CI is green, and review re-runs from there.'
     : 'The PR was never drafted for this claim — it stays ready; nothing further is owed here, and dispatch '
@@ -517,8 +524,36 @@ export function buildFixEndComment({ who, headSha = null, draft = false }) {
     FIX_END_MARKER,
     '',
     `\`${who}\` released the fix claim${headSha ? ` at \`${String(headSha).slice(0, 9)}\`` : ''}. ${tail}`,
+    ...(infraStall ? [
+      '',
+      'This turn ended **blocked on infrastructure** (its completion record says `blocked-on-infra`), not on the '
+        + 'fix itself: it is retried after the infra cool-off and is **not** counted as a fixer miss on the '
+        + 'escalation ladder.',
+      FIX_END_INFRA_STALL_MARK,
+    ] : []),
   ].join('\n');
 }
+
+/**
+ * Did THIS fix turn end `blocked-on-infra`? Read off the session's own completion record (written by the fixer
+ * right before `fix-end`, per `fix-agent-brief.md`). Only a `done` record of THIS session counts: a record from
+ * another session id, or (with no session id to compare) one older than this claim, is a different turn. Pure.
+ * @param {object|null} record  the completion record for `who`
+ * @param {{sessionId?:string|null, claimedAt?:string|null}} o
+ */
+export function isInfraStallCompletion(record, { sessionId = null, claimedAt = null } = {}) {
+  if (!record || record.status !== 'done' || record.outcome !== 'blocked-on-infra') return false;
+  if (record.sessionId && sessionId) return record.sessionId === sessionId;
+  if (record.sessionId && !sessionId) return false;
+  const updated = Date.parse(record.updatedAt ?? '');
+  const claimed = Date.parse(claimedAt ?? '');
+  return Number.isFinite(updated) && (!Number.isFinite(claimed) || updated >= claimed);
+}
+
+const readCompletionDefault = async (who) => {
+  const { tryReadCompletion } = await import('../operations/completion-store.mjs');
+  return tryReadCompletion(String(who));
+};
 
 /**
  * The recovery hint appended to a fixer's prompt when a previous fixer saved its work on a side branch
@@ -632,6 +667,7 @@ export async function fixBegin({
  */
 export async function fixEnd({
   repo, pr, who, sessionId = callerIdentity().sessionId, token = callerIdentity().token, gh = ghDefault, labels = null, lockRoot = fixDispatchClaimRoot(),
+  readCompletion = readCompletionDefault,
 } = {}) {
   const repoKey = repoKeyOf(repo);
   const slug = CONSTELLATION_REPOS[repoKey].slug;
@@ -643,10 +679,14 @@ export async function fixEnd({
   const steps = [];
   let headSha = null;
   try { headSha = JSON.parse(String(await gh(['pr', 'view', String(pr), '--repo', slug, '--json', 'headRefOid']))).headRefOid ?? null; } catch { headSha = null; }
+  let infraStall = false;
+  try {
+    infraStall = isInfraStallCompletion(await readCompletion(who), { sessionId, claimedAt: rel.entry?.meta?.claimedAt ?? null });
+  } catch { infraStall = false; }
   const provider = labels ?? await labelProviderDefault();
   try { provider.setLabels(slug, Number(pr), { remove: [heldLabel] }); steps.push('unlabel'); } catch (e) { steps.push(`unlabel-failed: ${String(e?.message ?? e).split('\n')[0]}`); }
-  try { provider.postComment(slug, Number(pr), buildFixEndComment({ who, headSha, draft: wasDraft })); steps.push('comment'); } catch (e) { steps.push(`comment-failed: ${String(e?.message ?? e).split('\n')[0]}`); }
-  return { ok: true, pr: Number(pr), repo: repoKey, who, headSha, draft: wasDraft, reason: draftReason, steps };
+  try { provider.postComment(slug, Number(pr), buildFixEndComment({ who, headSha, draft: wasDraft, infraStall })); steps.push('comment'); } catch (e) { steps.push(`comment-failed: ${String(e?.message ?? e).split('\n')[0]}`); }
+  return { ok: true, pr: Number(pr), repo: repoKey, who, headSha, draft: wasDraft, reason: draftReason, infraStall, steps };
 }
 
 // ── CLI ───────────────────────────────────────────────────────────────────────────────────────────────────────

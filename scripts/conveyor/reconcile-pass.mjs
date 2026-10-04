@@ -72,7 +72,7 @@ import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { countRearmComments } from './rearm-review.mjs';
-import { planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls } from './reconcile-core.mjs';
+import { planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls } from './reconcile-core.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // we:backlog/x5uqim1-*.md (#4075/#3383) — the two extra facts `reconcile-core.mjs#isPrCiFailureOwedRerun` needs
@@ -98,14 +98,14 @@ import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 import { latestCiHealEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { readLiveFixClaim } from './fix-procedure.mjs';
 import { enrichPrsWithReferralHolds } from './review-referral-hold.mjs';
-import { ignoredRulings } from '../lib/ruling-ledger.mjs';
+import { ignoredRulings, resolveCountInfraStalls } from '../lib/ruling-ledger.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
 
 /** A confirmed finding the operator already ruled `block` on an earlier head that came back on this one (read off
  *  the PR thread alone, so a daemon restart loses nothing). Never throws: an unreadable thread means no claim. */
-export function enrichPrsWithIgnoredRulings(prs, { humanAt } = {}) {
+export function enrichPrsWithIgnoredRulings(prs, { humanAt, countInfraStalls = resolveCountInfraStalls() } = {}) {
   return prs.map((pr) => {
-    try { return { ...pr, ignoredRulings: ignoredRulings(pr, humanAt === undefined ? {} : { humanAt }) }; } catch { return { ...pr, ignoredRulings: null }; }
+    try { return { ...pr, ignoredRulings: ignoredRulings(pr, { ...(humanAt === undefined ? {} : { humanAt }), countInfraStalls }) }; } catch { return { ...pr, ignoredRulings: null }; }
   });
 }
 // #4263 — the SAME terminal-state classifier `pr-watch.mjs`'s own drain-lane watcher uses (merged/closed/
@@ -229,7 +229,7 @@ export function defaultReadAgents({
   // pid, so a PR with a review job in flight is refused `live-process` exactly as a live review session was.
   const listed = listAgentsWithReviewJobs({ listAgents: () => defaultListAgents({ exec, env }), listJobs });
   // xpb0zyq — a session that already wrote its own completion record is finished, whatever the listing says.
-  const selfReported = markSelfReportedDone(Array.isArray(listed) ? listed : [], completionFor, now);
+  const selfReported = markSelfReportedDone(Array.isArray(listed) ? listed : [], completionFor, now, { infraCooloffMs: resolveInfraRetryCooloffMs(env) });
   // #3383 continuation — a session whose OWN transcript has gone stale is finished too, self-report or not.
   const hungMarked = markHungSessions(selfReported, hungInfoFor, now, hungThresholdMs);
   // Live incident fix, night of 2026-09-25/26 ET — a session whose OWN transcript shows the Claude CLI's own
