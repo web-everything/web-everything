@@ -437,6 +437,15 @@ export async function ensurePerInstallationCaches({ config, primary, env, cacheP
   }
 }
 
+/**
+ * The App-auth options for every FLEET daemon. Each daemon touches more than one org (web-everything,
+ * frontier-ui, plateauapp), and each org has its own installation, so the token is chosen per call by the target
+ * repo's owner (see `perOwner` in {@link ensureFreshGithubAppEnv}). Pinning one org's token as GH_TOKEN made
+ * every call to another org fail with "Could not resolve to a Repository" (drain 2026-10-03; review daemon and
+ * fix-dispatch daemon on plateauapp/plateau-app 2026-10-04). Daemons import this; none spell their own.
+ */
+export const FLEET_APP_AUTH_OPTS = Object.freeze({ log: console, perOwner: true });
+
 export function withGithubAppAuth(effects, opts = { log: console }) {
   const tick = effects.tickOnce;
   return {

@@ -215,9 +215,14 @@ const POOL_ROOT = expandHome(process.env.LANE_POOL_ROOT) || join(homedir(), 'wor
 const log = (m) => process.stderr.write(m + '\n');
 
 /** Lane indices under a pool dir (`lane-N` children), sorted — mirrors lane-pool's own `laneIndicesIn`. */
-function laneIndicesIn(poolDir) {
+export function laneIndicesIn(poolDir) {
   if (!existsSync(poolDir)) return [];
-  return readdirSync(poolDir)
+  // A plain FILE beside the pools (macOS's `.metadata_never_index` Spotlight marker, a stray `.DS_Store`) is
+  // not a pool: `readdirSync` on it throws ENOTDIR, and that one throw used to fail the WHOLE tick, every
+  // tick — no gate ran host-wide for hours (2026-10-04 incident). A non-directory holds no lanes; skip it.
+  let names;
+  try { names = readdirSync(poolDir); } catch (e) { if (e?.code === 'ENOTDIR') return []; throw e; }
+  return names
     .filter((d) => /^lane-\d+$/.test(d))
     .map((d) => Number(d.slice(5)))
     .sort((a, b) => a - b);

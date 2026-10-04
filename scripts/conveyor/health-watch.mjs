@@ -27,6 +27,7 @@
  * Usage:
  *   node scripts/conveyor/health-watch.mjs tick    [--json] [--force-gh] [--no-gh] [--dry-run] [--state-root=DIR]
  *                                                  [--logs-dir=DIR] [--lock-root=DIR] [--self-sync-dir=DIR]
+ *                                                  [--heavy-run-samples-file=FILE]  # ungated heavy-run history fixture
  *                                                  [--ps-fixture=FILE] [--machine-load-fixture=FILE]  # machine-overload's inputs, real by default
  *                                                  [--no-investigate]  # skip the #4078 investigation pass entirely
  *                                                  [--no-file]  # skip the #4079 filing-request planning pass entirely
@@ -48,6 +49,7 @@ import {
 } from './health-watch-core.mjs';
 import { daemonJobsRoot } from '../operations/run-store.mjs';
 import { SMELLS } from './health-smells/index.mjs';
+import { readRecentSamples, appendSample, summarizeSample, findUngatedHeavyRuns } from './heavy-run-ungated.mjs';
 import { healthDir, healthSectionLines } from './health-watch-section.mjs';
 import { runInvestigations } from './health-investigate-dispatch.mjs';
 import {
@@ -664,8 +666,11 @@ export function probeLiveBindings(agents, {
  * platform default) and caches the result in `<healthDir>/session-watchdog.json`, so a tick between passes still
  * hands the smells the last result (their episodes neither close nor re-open on an off-tick). The pass reads its
  * own `claude agents --json` listing (local, no API) every pass — not the gh-cadence `agents` probe, which runs
- * only every 15 minutes. Fixture flags (`--watchdog-agents-fixture`, `--watchdog-claims-fixture`,
- * `--watchdog-heads-fixture`) replay a recorded host; a fixture run or `--dry-run` never acts.
+ * only every 15 minutes. Any watchdog fixture flag (`--watchdog-agents-fixture`, `--watchdog-claims-fixture`,
+ * `--watchdog-heads-fixture`) replays a recorded host, and a fixture-scoped tick (`--state-root`, `--logs-dir` or
+ * `--lock-root`, the same `fixtureTick` rule the other probes use) reads no host state at all — no real
+ * `claude agents`, claim listing, PR-head cache, heavy-admission read or coordination-root event log. Either one,
+ * or `--dry-run`, never acts.
  * @returns {object} the pass result plus `{cached:boolean, configError:string|null}`
  */
 export function probeSessionWatchdog({
@@ -674,7 +679,10 @@ export function probeSessionWatchdog({
   const { config: cfg, error: configError } = resolveSessionWatchdogConfig(config.sessionWatchdog);
   const cachePath = join(dir, 'session-watchdog.json');
   const fixture = flags['watchdog-agents-fixture'];
-  const prev = fixture ? null : readJson(cachePath, null);
+  const anyFixture = !!(fixture || flags['watchdog-claims-fixture'] || flags['watchdog-heads-fixture']);
+  const scoped = !!(flags['logs-dir'] || flags['lock-root'] || flags['state-root']);
+  const isolated = anyFixture || scoped;
+  const prev = anyFixture ? null : readJson(cachePath, null);
   const prevAt = Date.parse(prev?.at ?? '');
   // 30 s of slack so a 5-minute tick that lands a few seconds early still runs a 5-minute pass.
   if (prev && Number.isFinite(prevAt) && now - prevAt < cfg.intervalMinutes * MINUTE - 30_000) {
@@ -684,14 +692,14 @@ export function probeSessionWatchdog({
   const heads = flags['watchdog-heads-fixture'] ? readFix('watchdog-heads-fixture') : null;
   const result = runPass({
     nowMs: now, config: cfg,
-    act: cfg.act && !fixture && !flags['dry-run'] && !flags['no-watchdog-act'],
-    ...(fixture ? { agents: readFix('watchdog-agents-fixture') } : {}),
+    act: cfg.act && !isolated && !flags['dry-run'] && !flags['no-watchdog-act'],
+    ...(fixture ? { agents: readFix('watchdog-agents-fixture') } : scoped ? { agents: [] } : {}),
     ...(processes !== undefined ? { processes } : {}),
-    ...(flags['watchdog-claims-fixture'] ? { listClaims: () => readFix('watchdog-claims-fixture') } : {}),
-    ...(heads ? { prHeadFor: (repo, pr) => heads[`${repo}#${pr}`] ?? null } : {}),
-    ...(fixture ? { eventDir: join(dir, 'session-watchdog-events'), readHeavy: () => null } : {}),
+    ...(flags['watchdog-claims-fixture'] ? { listClaims: () => readFix('watchdog-claims-fixture') } : scoped ? { listClaims: () => [] } : {}),
+    ...(heads ? { prHeadFor: (repo, pr) => heads[`${repo}#${pr}`] ?? null } : scoped ? { prHeadFor: () => null } : {}),
+    ...(isolated ? { eventDir: join(dir, 'session-watchdog-events'), readHeavy: () => null } : {}),
   });
-  if (!fixture && !flags['dry-run']) writeJsonAtomic(cachePath, result);
+  if (!anyFixture && !flags['dry-run']) writeJsonAtomic(cachePath, result);
   return { ...result, cached: false, configError };
 }
 
@@ -859,6 +867,11 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.machineLoad = attempt('machineLoad', () => (flags['machine-load-fixture']
     ? JSON.parse(readFileSync(flags['machine-load-fixture'], 'utf8'))
     : probeMachineLoad()));
+  // heavy-enforce — the `heavy-run-ungated` smell's sample history (the ~60s sampler plus each tick's own append).
+  const heavyRunSamplesPath = flags['heavy-run-samples-file'] || join(dir, 'heavy-run-samples.jsonl');
+  probes.heavyRunSamples = attempt('heavyRunSamples', () => readRecentSamples(heavyRunSamplesPath, {
+    now, windowMs: config.heavyRunUngatedWindowMs ?? 10 * MINUTE,
+  }));
   // `gh-call-failures` — fs-only, every tick: the gh-throttle call log's tail (`--gh-calls-log=FILE` in tests).
   probes.ghCalls = attempt('ghCalls', () => probeGhCalls(flags['gh-calls-log'] ? { logPath: flags['gh-calls-log'] } : {}));
   // #4309 — alongside (never replacing) the 2 MB tail above: persist every fully closed hour of GitHub spend once,
@@ -955,6 +968,10 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // A silence whose tracking card is still `active` never expires (4065 Fork 3): read those cards' status.
   const activeCards = readActiveCards(silences.map((x) => x.card).filter(Boolean), flags['backlog-dir'] || join(REPO_ROOT, 'backlog'));
   const result = runHealthTick({ ...prev, silences, lastTick: lastTickForSmells }, probes, SMELLS, now, { config, probeErrors, activeCards });
+  // Read history before evaluation, then persist this tick once. Synthetic process fixtures never persist.
+  if (!flags['ps-fixture']) attempt('heavyRunSampleAppend', () => appendSample(heavyRunSamplesPath,
+    probes.processes ? summarizeSample(findUngatedHeavyRuns(probes.processes), new Date(now).toISOString())
+      : { at: new Date(now).toISOString(), error: probeErrors.processes || 'process snapshot unavailable' }));
   // Scrubbed ONCE, right here: everything below — the printed section, the returned summary, every file — sees
   // only the redacted state.
   const state = scrubDeep(result.state);

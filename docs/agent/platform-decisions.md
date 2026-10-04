@@ -4197,7 +4197,7 @@ this rule leans on rests on a distinct fresh validator, unchanged by this ruling
 `review:human`; this rule never touches that boundary, it only removes the human step from the tier that was
 never `review:human` to begin with).
 
-**Superseded in part 2026-10-03 (xne1udi, operator).** "`review:human` stays human-only" now holds for the
+**Superseded in part 2026-10-03 (4862, operator).** "`review:human` stays human-only" now holds for the
 protected list only; outside it an independent judge may clear the label —
 [#independent-judge-clears-review-human-outside-protected-list](#independent-judge-clears-review-human-outside-protected-list).
 The `review:pending` rule above is unchanged.
@@ -4320,12 +4320,12 @@ only on `SELF_CLEAR`, never on independent review). Full reasoning and the rejec
 
 ### An independent judge may clear `review:human` once the reviewers accept — except on a protected list that always stays human {#independent-judge-clears-review-human-outside-protected-list}
 
-**Ratified 2026-10-03 by the operator (Nicolas Gilbert) (xne1udi), option B.** Operator, verbatim: "I'd be
+**Ratified 2026-10-03 by the operator (Nicolas Gilbert) (4862), option B.** Operator, verbatim: "I'd be
 happy to be more lenient on some human acceptance and replace and external judge for now". Of three options
 (A: the judge clears by category; B: the judge replaces the human sign-off except on a protected list; C: the
 judge clears only after an N-hour wait), B was chosen now: "Waiting is a nice option, but I would not use it
 just right now I think, my judgement will become more important once it's closer to a release but we are a
-while back". The protected list and using the same judge as xne1udi's arbiter: "Ok".
+while back". The protected list and using the same judge as 4862's arbiter: "Ok".
 
 **The rule.**
 
@@ -4375,7 +4375,7 @@ non-author invariant ([#agent-convergence-independent-validation](#agent-converg
 is the reason rule 2 exists. It does not touch the scheduled runner's `landMode`
 ([#enforce-flip-triple-gated](#enforce-flip-triple-gated)).
 
-**Lineage:** ratified by xne1udi (operator, 2026-10-03), which began as the fixer/reviewer arbiter proposal
+**Lineage:** ratified by 4862 (operator, 2026-10-03), which began as the fixer/reviewer arbiter proposal
 of 2026-10-02 and was widened in the same discussion to the human sign-off. Build status lives on the
 decision item and its build epic, not here
 ([#statute-anchor-states-rule-not-status](#statute-anchor-states-rule-not-status)).
@@ -6131,7 +6131,7 @@ fallback when the Codex cross-provider review seat is unavailable is the `crossP
 [config dimension](#config-extends-platform-default): `park-now` | `wait-then-park` (platform default) |
 `same-provider-other-model`, plus a `waitTimeoutMs` parameter. The default waits for the provider seat for a
 bounded time, then parks the PR for a human. `same-provider-other-model` is an explicit opt-in and is never
-the default. The judge seat follows the same rule (decision xud2hha: Claude-authored PRs get a Codex judge,
+the default. The judge seat follows the same rule (decision 5079: Claude-authored PRs get a Codex judge,
 Codex-authored PRs get an Opus judge, same fallback dimension). Declared in `we:config/defineConfig.ts` and
 `we:config/platformDefaults.ts`; the daemon that consumes it is card 4880.
 

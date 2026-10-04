@@ -225,6 +225,34 @@ describe('planWatchdog — findings, actions, events', () => {
     const unknown = planWatchdog({ rows: [{ ...ghost, pidAlive: null }], claims: [], standardFor, nowMs: NOW });
     expect(unknown.actions.find((a) => a.type === 'clear-ghost').safe).toBe(false);
   });
+  const ghostRow = { name: 'fix-2115', id: '3e63a0f4', sessionId: 'sid-g', listingKind: 'background', kind: 'fix', prBound: true, repo: 'we', target: '2115', class: CLASSES.GHOST, pidAlive: false };
+  const liveRow = { ...ghostRow, id: 'a1b2c3d4', sessionId: 'sid-live', class: CLASSES.ACTIVE, pidAlive: true, reason: 'distinct-tool-calls', evidence: {} };
+  const releases = (p) => p.actions.filter((a) => a.type !== 'clear-ghost');
+  it('a same-name ghost listed BEFORE a live session never releases the live session\'s claims', () => {
+    const liveClaim = claim({ pr: 2115, who: 'fix-2115', sessionId: 'sid-live' });
+    for (const rows of [[ghostRow, liveRow], [liveRow, ghostRow]]) {
+      const p = planWatchdog({ rows, claims: [liveClaim], standardFor, nowMs: NOW });
+      expect(releases(p)).toEqual([]);
+      expect(p.findings.find((f) => f.type === 'fixer-stuck')).toBeUndefined();
+    }
+  });
+  it('a claim with a sessionId is held by that session only; the name is the fallback for a claim without one', () => {
+    const p = planWatchdog({ rows: [ghostRow, liveRow], claims: [claim({ pr: 2115, who: 'fix-2115', sessionId: 'sid-g' })], standardFor, nowMs: NOW });
+    // the ghost's OWN claim is releasable by sessionId, but its dispatch-claim release is withheld: a live row shares its name
+    expect(releases(p)).toEqual([expect.objectContaining({ type: 'release-fix-claim', sessionId: 'sid-g' })]);
+    const noSid = planWatchdog({ rows: [ghostRow], claims: [claim({ pr: 2115, who: 'fix-2115', sessionId: undefined })], standardFor, nowMs: NOW });
+    expect(releases(noSid).map((a) => a.type).sort()).toEqual(['release-dispatch-claims', 'release-fix-claim']);
+    const sharedNoSid = planWatchdog({ rows: [ghostRow, liveRow], claims: [claim({ pr: 2115, who: 'fix-2115', sessionId: undefined })], standardFor, nowMs: NOW });
+    expect(releases(sharedNoSid)).toEqual([]);
+  });
+  it('liveness matrix: only a CONFIRMED-dead ghost releases claims or is cleared safely', () => {
+    const c = claim({ pr: 2115, who: 'fix-2115', sessionId: 'sid-g' });
+    for (const [pidAlive, expected] of [[false, true], [null, false], [true, false]]) {
+      const p = planWatchdog({ rows: [{ ...ghostRow, pidAlive }], claims: [c], standardFor, nowMs: NOW });
+      expect(releases(p).length > 0, `pidAlive=${pidAlive}`).toBe(expected);
+      expect(p.actions.find((a) => a.type === 'clear-ghost').safe).toBe(expected);
+    }
+  });
 });
 
 describe('runSessionWatchdogPass — the IO shell with fakes', () => {
@@ -369,6 +397,47 @@ describe('probeSessionWatchdog — interval cache in the health dir', () => {
     probeSessionWatchdog({ dir, now: T0 + 120 * MIN, runPass, config: { sessionWatchdog: { intervalMinutes: 60 } }, flags: { 'dry-run': true } });
     expect(runs.at(-1).act).toBe(false);
   });
+  it('every fixture flag and every fixture-scoped tick flag disables acting on its own, and a scoped tick reads no host state', () => {
+    const empty = (o) => ({ at: new Date(o.nowMs).toISOString(), rows: [], findings: [], actions: [], events: [], acked: [] });
+    const fx = join(mkdtempSync(join(tmpdir(), 'watchdog-fx-')), 'f.json');
+    writeFileSync(fx, '[]');
+    const cases = [
+      { 'watchdog-agents-fixture': fx }, { 'watchdog-claims-fixture': fx }, { 'watchdog-heads-fixture': fx },
+      { 'state-root': '/x' }, { 'logs-dir': '/x' }, { 'lock-root': '/x' },
+      { 'watchdog-claims-fixture': fx, 'watchdog-heads-fixture': fx },
+    ];
+    for (const flags of cases) {
+      const dir = mkdtempSync(join(tmpdir(), 'watchdog-health-'));
+      const runs = [];
+      probeSessionWatchdog({ dir, now: T0, flags, runPass: (o) => { runs.push(o); return empty(o); } });
+      expect(runs[0].act, JSON.stringify(Object.keys(flags))).toBe(false);
+      const isScoped = !!(flags['state-root'] || flags['logs-dir'] || flags['lock-root']);
+      // a fixture replay never writes the cache the live host reads back
+      if (!isScoped) expect(() => readFileSync(join(dir, 'session-watchdog.json'))).toThrow(/ENOENT/);
+      if (isScoped) {
+        // no real `claude agents`, claims, PR heads, heavy-admission read or coordination-root event log
+        expect(runs[0].agents).toEqual([]);
+        expect(runs[0].listClaims()).toEqual([]);
+        expect(runs[0].prHeadFor('we', 1)).toBeNull();
+        expect(runs[0].readHeavy()).toBeNull();
+        expect(runs[0].eventDir.startsWith(dir)).toBe(true);
+      }
+    }
+  });
+  it('tick() under --state-root never executes `claude` or acts on the host', async () => {
+    const { tick } = await import('../health-watch.mjs');
+    const bin = mkdtempSync(join(tmpdir(), 'watchdog-bin-'));
+    const sentinel = join(bin, 'claude-ran');
+    writeFileSync(join(bin, 'claude'), `#!/bin/sh\necho ran >> "${sentinel}"\necho '[]'\n`, { mode: 0o755 });
+    const root = mkdtempSync(join(tmpdir(), 'watchdog-tick-'));
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${bin}:${prevPath}`;
+    try {
+      const out = await tick({ 'state-root': root, 'logs-dir': root, 'lock-root': root, 'no-gh': true });
+      expect(JSON.stringify(out).includes('sessionWatchdogConfig')).toBe(false);
+    } finally { process.env.PATH = prevPath; }
+    expect(() => readFileSync(sentinel)).toThrow(/ENOENT/);
+  }, 60_000);
   it('an invalid sessionWatchdog config is reported, and the default stands', () => {
     const dir = mkdtempSync(join(tmpdir(), 'watchdog-health-'));
     const r = probeSessionWatchdog({ dir, now: T0, runPass: (o) => ({ at: new Date(o.nowMs).toISOString(), cfg: o.config }), config: { sessionWatchdog: { intervalMinutes: -1 } } });

@@ -339,7 +339,19 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor
   const findings = [];
   const actions = [];
   const events = [];
-  const holderOf = (c) => rows.find((r) => (c.meta?.sessionId && r.sessionId === c.meta.sessionId) || r.name === c.meta?.who) ?? null;
+  // A claim that records its holder's sessionId is held by THAT session only: names are `fix-<pr>`, so a September
+  // ghost and a fresh live dispatch for the same PR share one, and a name match would pick whichever is listed first.
+  // The name is only the fallback for a claim with no sessionId.
+  const holderOf = (c) => {
+    const sid = c.meta?.sessionId;
+    if (sid) return rows.find((r) => r.sessionId === sid) ?? null;
+    return rows.find((r) => r.name === c.meta?.who) ?? null;
+  };
+  // Releasing a claim on a ghost's behalf is only safe once the process is CONFIRMED dead (`pidAlive === false`, the
+  // same predicate `clear-ghost` uses; unknown liveness is not death) and no other listed session shares the ghost's
+  // name unless that one is itself a confirmed-dead ghost.
+  const confirmedDead = (r) => r.class === CLASSES.GHOST && r.pidAlive === false;
+  const nameShared = (r) => rows.some((o) => o !== r && o.name === r.name && !confirmedDead(o));
   const claimedBy = new Set();
   for (const c of claims || []) {
     const m = c.meta || {};
@@ -367,7 +379,7 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor
     if (claimAgeMs != null && claimAgeMs >= standard.ms && head && m.headSha && head === m.headSha) {
       findings.push({ type: 'fix-claim-held-no-progress', ...base, prHead: head, holderClass: holder?.class ?? 'not-listed' });
     }
-    if (holder?.class === CLASSES.GHOST) {
+    if (holder && confirmedDead(holder) && (m.sessionId || !nameShared(holder))) {
       actions.push({ type: 'release-fix-claim', repo: m.repo, pr: m.pr, who: m.who, sessionId: m.sessionId ?? null, session: holder.name });
     }
   }
@@ -378,7 +390,7 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor
     if (r.class === CLASSES.GHOST) {
       if (r.listingKind === 'background') {
         actions.push({ type: 'clear-ghost', handle: r.id ?? null, session: r.name, safe: r.pidAlive === false && !!r.id });
-        if (r.prBound && r.repo && r.target) actions.push({ type: 'release-dispatch-claims', repo: r.repo, pr: Number(r.target), session: r.name });
+        if (r.prBound && r.repo && r.target && confirmedDead(r) && !nameShared(r)) actions.push({ type: 'release-dispatch-claims', repo: r.repo, pr: Number(r.target), session: r.name });
       }
     }
   }

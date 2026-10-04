@@ -21,7 +21,7 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..'
 describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
   const REPO_KEYS = Object.keys(CONSTELLATION_REPOS);
 
-  it('has exactly the 7 WE-only entries (incl. #3913 orphan-claim-release, epic #3383 merge-orphan-sweep + lease-reaper, #4077 health-watch) plus 6 passes × 3 repos = 25 total (we:backlog/x5uqim1-*.md added ci-red-recovery-watch)', () => {
+  it('has the host passes plus 6 passes per repo', () => {
     expect(Object.keys(DAEMON_MANIFEST).sort()).toEqual([
       'branch-drift', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'merge-orphan-sweep', 'lease-reaper', 'health-watch', 'health-responder',
       ...['ci-queue-watch', 'parked-pr-conflict-watch', 'parked-pr-progress-watch', 'lane-pool-health-watch', 'stuck-pr-watch', 'ci-red-recovery-watch']
@@ -218,4 +218,8 @@ it('defaultLaunch must be a boolean when present, and false excludes only from t
   const manifest = { a: ok, b: { ...ok, defaultLaunch: false }, c: { ...ok, defaultLaunch: true } };
   expect(defaultLaunchNames(manifest)).toEqual(['a', 'c']);
   expect(resolveManifestEntry('b', manifest)).toBe(manifest.b);
+});
+
+it('does not register the dedicated heavy-run sampler as a pass', () => {
+  expect(DAEMON_MANIFEST).not.toHaveProperty('heavy-run-sample');
 });
