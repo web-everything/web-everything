@@ -1736,7 +1736,7 @@ export function planReconcile({
     // PR is owed the same neutral `review:pending` (the promote-draft half strips the contradictory
     // `ready-to-merge` when it writes). Policy `reviewLabelHeal` (env `WE_REVIEW_LABEL_HEAL`): `stuck` (default)
     // adds this variant; `green` keeps only the branch above; `off` disables both.
-    if (reviewLabelHeal === 'stuck' && !pr?.isDraft && pr?.state === 'OPEN' && withPhase.check === 'red'
+    if (reviewLabelHeal === 'stuck' && !pr?.isDraft && (pr?.state ?? 'OPEN') === 'OPEN' && withPhase.check === 'red'
         && String(pr?.headRefName ?? '').startsWith('lane/')
         && withPhase.labels.includes('ready-to-merge')
         && !withPhase.labels.some((l) => l.startsWith('review:'))

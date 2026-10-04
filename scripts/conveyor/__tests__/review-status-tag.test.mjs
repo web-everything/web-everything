@@ -458,3 +458,27 @@ describe('xul2kwr automatic writers preserve withdrawal until explicit removal',
     expect(labels).toEqual([]);
   });
 });
+
+it('draft stacks await their base; default-branch drafts await CI', () => {
+  expect(deriveReviewStatus({ pr: 3915, isDraft: true, baseRefName: 'lane/base', defaultBranch: 'main' }))
+    .toEqual({ role: 'draft', state: 'awaiting-base' });
+  expect(deriveReviewStatus({ pr: 3915, isDraft: true, baseRefName: 'release', defaultBranch: 'release' }))
+    .toEqual({ role: 'draft', state: 'awaiting-ci' });
+  expect(STATUS_LABEL_RE.test('review-status:awaiting-base')).toBe(true);
+  expect(planStatusLabelChange({ status: null, currentLabels: ['review-status:awaiting-base'] }).remove)
+    .toEqual(['review-status:awaiting-base']);
+});
+
+it('uses the PR snapshot to tag awaiting-base and clears it on promotion', () => {
+  const writes = [];
+  const provider = {
+    ensureLabel: (_repo, label, meta) => { expect(meta.description.length).toBeLessThanOrEqual(100); },
+    setLabels: (_repo, _pr, change) => writes.push(change),
+  };
+  const result = tagReviewStatus({ pr: 3915, repo: 'we', agents: [], currentLabels: ['review-status:awaiting-ci'],
+    prState: { isDraft: true, baseRefName: 'lane/base' }, defaultBranch: 'release', readFixClaim: () => null, provider });
+  expect(result.label).toBe('review-status:awaiting-base');
+  expect(writes[0]).toEqual({ add: 'review-status:awaiting-base', remove: ['review-status:awaiting-ci'] });
+  applyReviewStatus({ pr: 3915, repo: 'we', state: null, currentLabels: [result.label], provider });
+  expect(writes[1]).toEqual({ add: undefined, remove: ['review-status:awaiting-base'] });
+});

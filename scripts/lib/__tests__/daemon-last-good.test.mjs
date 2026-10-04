@@ -18,6 +18,8 @@ import { spawnSync } from 'node:child_process';
 import {
   cloneKeyOf, decideLastGood, lastGoodMaxAgeMs, LAST_GOOD_MAX_AGE_ENV, DEFAULT_LAST_GOOD_MAX_AGE_MS,
   daemonConveyorStateRoot, daemonStateDir, CONVEYOR_STATE_ROOT_ENV,
+  decideRebuildGrace, rebuildGraceForClone, staleGuardRebuildGraceMs, STALE_GUARD_REBUILD_GRACE_ENV,
+  DEFAULT_STALE_GUARD_REBUILD_GRACE_MS,
 } from '../daemon-last-good.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
 import { assertMainNotStale, STALE_MAIN_REFUSAL_MARKER } from '../main-staleness.mjs';
@@ -317,5 +319,37 @@ describe('assertMainNotStale — the x5wbsbc last-good fallback (managed clone)'
 
     expect(result.fresh).toBe(true);
     expect(called).toBe(false);
+  });
+});
+
+describe('decideRebuildGrace — bounded grace while a rebuild of the clone is running (PRs #3923/#3924)', () => {
+  const now = Date.parse('2026-10-04T19:00:00Z');
+  const state = (o = {}) => ({
+    adopted: { head: 'h', at: '2026-10-04T18:25:00Z' },
+    building: { pid: 1, host: 'x', startedAt: '2026-10-04T18:50:00Z', target: 't' }, ...o,
+  });
+  const base = { nowMs: now, graceMs: 60 * 60_000, leaseStaleMs: 20 * 60_000, ownerAlive: () => true };
+  it('grants the grace for a live build within the window since the last adoption', () => {
+    expect(decideRebuildGrace({ ...base, state: state() })).toMatchObject({ grace: true, target: 't', sinceAdoptMs: 35 * 60_000 });
+  });
+  it('refuses (fails closed) for every unknown or out-of-bounds case', () => {
+    expect(decideRebuildGrace({ ...base, state: null }).grace).toBe(false);
+    expect(decideRebuildGrace({ ...base, state: state({ building: null }) }).reason).toBe('no-build-running');
+    expect(decideRebuildGrace({ ...base, state: state(), graceMs: 0 }).reason).toBe('grace-off');
+    expect(decideRebuildGrace({ ...base, state: state(), ownerAlive: () => false }).reason).toBe('build-owner-gone');
+    expect(decideRebuildGrace({ ...base, state: state({ adopted: { head: 'h' } }) }).reason).toBe('no-adoption-time');
+    expect(decideRebuildGrace({ ...base, state: state(), graceMs: 30 * 60_000 }).reason).toBe('grace-expired');
+    expect(decideRebuildGrace({ ...base, state: state({ building: { pid: 1, startedAt: '2026-10-04T18:30:00Z' } }) }).reason)
+      .toBe('build-lease-stale');
+  });
+  it('the grace window is a WE_* knob (0 = off, junk = default)', () => {
+    expect(staleGuardRebuildGraceMs({})).toBe(DEFAULT_STALE_GUARD_REBUILD_GRACE_MS);
+    expect(staleGuardRebuildGraceMs({ [STALE_GUARD_REBUILD_GRACE_ENV]: '0' })).toBe(0);
+    expect(staleGuardRebuildGraceMs({ [STALE_GUARD_REBUILD_GRACE_ENV]: '5000' })).toBe(5000);
+    expect(staleGuardRebuildGraceMs({ [STALE_GUARD_REBUILD_GRACE_ENV]: 'nope' })).toBe(DEFAULT_STALE_GUARD_REBUILD_GRACE_MS);
+  });
+  it('rebuildGraceForClone reads the clone\'s rebuild state and never throws', () => {
+    expect(rebuildGraceForClone({ root: '/x', env: {}, now, readState: () => state(), ownerAlive: () => true }).grace).toBe(true);
+    expect(rebuildGraceForClone({ root: '/x', env: {}, now, readState: () => { throw new Error('boom'); } }).grace).toBe(false);
   });
 });

@@ -21,6 +21,9 @@ export default defineConfig({
     // `action-cli.test.mjs`/`action-records.test.mjs` rely on: their `createActionStore()` calls take no
     // explicit root, so without it they would write real attempts to `~/workspace/.operations/coordination`.
     setupFiles: ['./vitest.setup.ts'],
+    // tmp-leak fix: one private temp root per run, leak count reported + root removed at teardown
+    // (scripts/lib/test-tmp-root.mjs; WE_TMP_LEAK_MODE / WE_TMP_LEAK_MAX).
+    globalSetup: ['./vitest.globalSetup.mjs'],
     // Minimal git template for every throwaway `git init`/`clone` (no inert sample-hook copies) — cuts file-event
     // churn from the real-git lane-pool tests in this tier; see vitest.shared.ts#minimalGitTemplateEnv.
     env: minimalGitTemplateEnv(),

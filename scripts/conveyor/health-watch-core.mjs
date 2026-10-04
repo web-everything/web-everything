@@ -50,6 +50,10 @@ export const DEFAULT_HEALTH_CONFIG = Object.freeze({
   // A parked review waiting on the operator's ruling alerts after this long (`ruling-needed-waiting`).
   rulingNeededAfterMs: 2 * HOUR,
   historyKeep: 100,
+  // Sustained ungated heavy runs: minimum runs per sample, samples per window, and window length.
+  heavyRunUngatedMinRuns: 1,
+  heavyRunUngatedMinSamples: 2,
+  heavyRunUngatedWindowMs: 10 * MINUTE,
   // #4078 — the diagnose-only investigation agent (slice 2). OFF until the operator turns it on (4065 clause 6:
   // agent dispatch is its own settings change, independent of `mode`). The budget is 4078's own numbers.
   investigateDispatch: false,
