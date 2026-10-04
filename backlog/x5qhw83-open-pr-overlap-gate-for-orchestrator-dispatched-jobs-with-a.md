@@ -34,9 +34,23 @@ same gate (follow-up).
 
 1. **Pure gate** in `we:scripts/readiness/overlap-chain.mjs`:
    `openPrOverlapGate({ scope, openPrs, selfPr, policy, overrideReason })` returns
-   `{ allowed, hits: [{ file, pr }], mode, record, reason }`, where `reason` is `null` or a short code
-   (`overlap`, `override-reason-required`, `open-prs-unreadable`) the caller prints and the tests assert on.
-   - It ignores `selfPr`, the PR this job repairs: a repair must touch its own PR's files.
+   `{ allowed, hits: [{ file, pr }], mode, record, reason, selfPrExempt }`, where `reason` is `null` or a short
+   code (`overlap`, `override-reason-required`, `open-prs-unreadable`) the caller prints and the tests assert on,
+   and `selfPrExempt` is `null` or `{ pr, files }` (the hits `selfPr` suppressed, below).
+   - It ignores `selfPr`, the PR this job repairs, **only when `selfPr` is validated**: a repair must touch its
+     own PR's files, but `--pr` is typed by the dispatcher, so the gate does not take it on trust.
+     - **`selfPr` must be an open PR present in `openPrs`.** A number that is not in the list (closed, merged,
+       mistyped, made up) is ignored as if `--pr` were absent: every hit counts, and the gate returns the code
+       `self-pr-not-open` in `reason` when that is what caused a refusal, so the dispatcher sees why. (This also
+       means `selfPr` cannot name a PR the gate has not read.)
+     - **The exemption is never silent.** When a valid `selfPr` suppresses at least one hit, `selfPrExempt` is
+       set and the wiring records one `overlap-self-pr` event (step 3) in every mode, so naming the overlapped
+       PR as the one being repaired leaves the same kind of trail as an override.
+     - **What this does not do.** It cannot tell a real repair of #3507 from a job that only claims to be one:
+       both have a scope inside #3507's files, so a "scope must be a subset of `selfPr`'s files" rule would
+       not separate them (and would wrongly refuse a repair that adds a new test file). What is enforceable
+       here is validity plus visibility, and the card claims no more: a dispatcher that lies about `--pr`
+       is visible on the WIP page, not prevented.
    - **An unreadable open-PR list fails closed.** The caller passes `openPrs: null` when the fetch threw or
      hit its page limit (a truncated list is not a complete one), distinct from `[]` (no open PRs). With
      `null`, the gate returns `allowed: false`, no hits, and a reason `open-prs-unreadable`, under `off` and
@@ -53,7 +67,16 @@ same gate (follow-up).
    `--overlap-override-reason=<text>`. Before any model is spawned, they fetch open PRs with files, run the
    gate, and exit non-zero on a refusal. A refused run costs nothing.
 3. **Record.** When `record` is true, call `recordPolicyEvent`: key `dispatchGate.overlapOverride`, event
-   `overlap-override`, subject `<repo>#<pr>`, the reason, and detail `{ files, dispatcher, mode }`.
+   `overlap-override`, the reason, and detail `{ files, dispatcher, mode, repairing }`.
+   - **One event per overlapped PR, keyed on that PR.** The subject is `<repo>#<hit.pr>`, the PR whose files
+     were overlapped (from `hits[].pr`), **not** the PR being repaired. A job overlapping two open PRs writes two
+     events, each with only that PR's files in `detail.files`. `repairing` is `selfPr` or `null` and is only
+     context: `--pr` is optional, so no subject ever depends on it (a missing `--pr` must never produce
+     `<repo>#undefined`, and a hit-bearing event is never written under a bare `<repo>`; the one bare-`<repo>`
+     subject is the hit-less `overlapCheck: 'unreadable'` event in step 1, which has no PR to name). The smell (step 4) keys on this subject, so the writer and the
+     reader agree by construction.
+   - When `selfPrExempt` is set, also write one event `overlap-self-pr`, subject `<repo>#<selfPr>`, detail
+     `{ files: selfPrExempt.files, dispatcher, mode }`, no reason (none is asked for), in every mode.
    - **Untrusted text.** The reason is free text typed by a dispatching agent, and file names come from
      other PRs. `recordPolicyEvent` truncates and strips them on write (story #xcs4nce), and the smell and the
      WIP page treat them as plain text. The gate also rejects, before the length check, a reason containing a
@@ -67,10 +90,18 @@ same gate (follow-up).
      medium health episode that quotes the reason for 24 hours), not from the length check. The card does not
      claim more.
 4. **WIP.** Add `we:scripts/conveyor/health-smells/overlap-override-used.mjs` on the `policyEvents` probe from
-   story #xq4p21a: severity `medium`, action `alert`, one row per overlapped PR. It breaches when an override
-   for that PR was recorded in the last 24 hours, and the summary quotes the reason. It also gets one row
+   story #xq4p21a: severity `medium`, action `alert`, one row per overlapped PR. A row's key is the subject
+   `<repo>#<pr>` of the `overlap-override` events (step 3: the overlapped PR, written once per PR), so it
+   breaches when an override that overlapped that PR was recorded in the last 24 hours, and the summary quotes
+   the reason. It also gets one row
    per repo that has an `overlapCheck: 'unreadable'` event in the last 24 hours ("overlap check was blind"),
-   so a `free`-mode blind spot is visible too. A medium episode turns the
+   so a `free`-mode blind spot is visible too. `overlap-self-pr` events get their own rows, one per `selfPr`
+   and event type (the row key is `<event>:<subject>`, so an `overlap-self-pr` row and an `overlap-override`
+   row for the same `<repo>#3507` never merge), at severity `low`, action `note`: a repair of one's own PR
+   stays visible in the episode list without turning the health section yellow. The builder confirms in
+   `we:scripts/conveyor/health-smells/` that a `low` episode is accepted and listed; if the framework has no
+   such tier, the row goes in the smell's summary text instead and the card's claim narrows to that.
+   (Only the `medium` listing is evidenced today by `we:../plateau-app/src/wip/progress-health.ts:65-75`.) A medium episode turns the
    live-state health section yellow and lists on the WIP page (`we:../plateau-app/src/wip/progress-health.ts:65-75`).
 
 ## MVP
@@ -93,7 +124,19 @@ Steps 1 to 4 for the two direct-job entry points.
   - **Unreadable open-PR list:** `openPrs: null` is refused with `open-prs-unreadable` under `off` and
     `logged` (even with a real reason); under `free` it is allowed with `record` true and
     `overlapCheck: 'unreadable'`. `[]` is allowed (nothing to overlap).
-  - `selfPr` 3507: allowed under every mode, with no record.
+  - `selfPr` 3507 (open, in `openPrs`), scope inside #3507's files: allowed under every mode, with no
+    `overlap-override` record but `selfPrExempt` set (and the wiring writes one `overlap-self-pr` event).
+  - **`selfPr` that is not validated:** `selfPr` 9999 (not in `openPrs`) with the same scope under `off`: refused
+    with `self-pr-not-open`, naming #3507, even though `--pr` was given (`self-pr-not-open` takes precedence over
+    `overlap` as the `reason` whenever the refusal came from an ignored `selfPr`). Under `logged` without a reason: refused;
+    with a real reason: allowed with `record`. `selfPr` omitted: same as an unknown number (every hit counts).
+  - **Two overlapped PRs, one job, no `--pr`:** a scope touching one file of #3507 and one of another open PR
+    produces two `overlap-override` events, subjects `<repo>#3507` and `<repo>#<other>`, each carrying only
+    its own PR's files; no subject contains `undefined`.
+  - **Producer/consumer fixture:** feed the events the wiring actually writes (the case above) to the
+    `overlap-override-used` smell: it yields exactly one `overlap-override` row per overlapped PR (#3507 and
+    the other), and a job that repaired a third PR is not given an `overlap-override` row of its own for
+    `--pr` (the third PR gets a row only from an `overlap-self-pr` event, below).
   - A disjoint scope: allowed, no record.
   - Default (no config): behaves as `off`.
   - **Replay of #3507:** five sequential fix jobs on #3507's files. Before this story: all five dispatch.
@@ -104,8 +147,9 @@ Steps 1 to 4 for the two direct-job entry points.
   limit reached), each exit non-zero before the spawn function is called.
 - **Capability (RED today, fails before this lands):** `we:scripts/conveyor/health-smells/__tests__/overlap-override-used.test.mjs`: the shape is valid; an event in
   the last 24 hours breaches; an older one does not; an `overlapCheck: 'unreadable'` event yields a
-  "blind" row for its repo. A journaled reason carrying markup stays inert in the
-  summary (plain text), and the summary stays within a fixed length.
+  "blind" row for its repo. An `overlap-self-pr` event yields one row at severity `low`, keyed separately from
+  an `overlap-override` row for the same `<repo>#<pr>` (both events present: two rows). A journaled reason
+  carrying markup stays inert in the summary (plain text), and the summary stays within a fixed length.
 
 ## Proof plan
 

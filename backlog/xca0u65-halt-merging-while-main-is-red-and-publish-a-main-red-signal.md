@@ -3,7 +3,7 @@ kind: story
 size: 5
 parent: "x0hvbwx"
 status: open
-blockedBy: ["xcs4nce", "xi8vgqq"]
+blockedBy: ["xcs4nce", "xi8vgqq", "xq4p21a"]
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/merge-ai-prs-main-red-halt.test.mjs", "we:scripts/operations/live-state.mjs", "we:scripts/operations/live-state-io.mjs", "we:scripts/operations/__tests__/live-state-io.test.mjs", "we:scripts/operations/__tests__/live-state.test.mjs"]
 dateOpened: "2026-10-03"
 preparedDate: "2026-10-03"

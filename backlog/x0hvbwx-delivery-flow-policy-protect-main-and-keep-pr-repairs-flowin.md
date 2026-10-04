@@ -53,13 +53,17 @@ Also: #xca0u65 for `mergeGate.onMainRed` (`halt`); #x5qhw83 for `dispatchGate.ov
 4. #xi8vgqq: re-check before merge when main moved. It also adds the tested-main-SHA helper and the one-line
    CI step that records it.
 5. #xca0u65: halt on red main, and the `mainState` snapshot section. Blocked by #xi8vgqq too, because its
-   exemption uses that helper (a run's tested main SHA, not its start time).
+   exemption uses that helper (a run's tested main SHA, not its start time), and by #xq4p21a, because its
+   `main-state-read` alert calls the refusal-alert helper that story builds.
 6. #x5qhw83: the open-PR overlap gate with a logged override. Also blocked by #xq4p21a, for the probe.
 7. #xkpbs7b: repairs-first heavy queue.
 
 Stories 2, 4 and 5 (#xq4p21a, #xi8vgqq, #xca0u65) all edit `we:scripts/merge-ai-prs.mjs`. The conveyor's `scope-vs-open-prs` hold
-(`we:scripts/conveyor/build-dispatch-policy.mjs:271-274`) runs them one at a time automatically, so they carry
-no artificial blocker edges.
+(`we:scripts/conveyor/build-dispatch-policy.mjs:271-274`) runs them one at a time automatically, but that only
+prevents two of them running at once, not the order. So #xi8vgqq and #xca0u65 each carry an explicit
+`blockedBy` edge to #xq4p21a, because both call the refusal-alert helper (`drain.onStepRefusal`,
+`drain-step-refused` / `drain-step-ok`) it builds: whichever dispatched first would otherwise fail its own alert
+tests or build a second, divergent helper. The order edge #xi8vgqq → #xca0u65 is explicit for the same reason.
 
 **For the WIP page's high-alert band:** read `machineHealth.sections.mainState` (from `sections.mainState` in
 `we:scripts/operations/run.mjs live-state --json`), added by #xca0u65. The band itself is a plateau-app follow-up.

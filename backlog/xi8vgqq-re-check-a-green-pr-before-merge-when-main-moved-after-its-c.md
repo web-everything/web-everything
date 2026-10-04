@@ -3,7 +3,7 @@ kind: story
 size: 5
 parent: "x0hvbwx"
 status: open
-blockedBy: ["xcs4nce"]
+blockedBy: ["xcs4nce", "xq4p21a"]
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/merge-ai-prs-recheck-main-moved.test.mjs", "we:scripts/lib/tested-main-base.mjs", "we:scripts/lib/__tests__/tested-main-base.test.mjs", "we:.github/workflows/ci.yml"]
 dateOpened: "2026-10-03"
 preparedDate: "2026-10-03"
@@ -13,7 +13,8 @@ tags: [policy, drain, merge, freshness]
 
 # Re-check a green PR before merge when main moved after its checks ran
 
-Before merging, the drain checks whether main moved after the PR's green `test` run started. If it did, the
+Before merging, the drain checks whether main moved past the main commit the PR's green `test` run actually
+tested (by commit identity, not by when the run started). If it did, the
 drain rebuilds the PR onto current main so CI runs again, and merges on a later pass. Governed by
 `mergeGate.recheckWhenMainMoved` (default `if-older-than-N-min`, operator ruling 2026-10-03) and
 `mergeGate.recheckMaxAgeMin` (default 30).
@@ -86,11 +87,18 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
    a commit whose file list cannot be read in full (the compare API truncates its commit and file lists,
    around 250 commits and 300 files) counts as a real move, never as bookkeeping. Without this exclusion, merge A's own bookkeeping commit lands during B's rebuilt CI run, B
    reads as stale again, and the queue stalls.
-3. **Pure predicate** `needsMainMovedRecheck({ policy, moved, testedUnknown, runStartedAt, recheckCount, now })`:
-   - `if-older-than-N-min` (default): re-check only when main moved **and** the PR's last green run started
-     more than `recheckMaxAgeMin` (30) minutes ago. **Exception:** when the tested main commit is `unknown`
-     (step 1), the run's age is not consulted and the PR is re-checked: the age gate exists to trust a fresh
-     run whose tested commit is known, and an unknown tested commit gives nothing to trust.
+3. **Pure predicate** `needsMainMovedRecheck({ policy, moved, testedUnknown, runAgeAnchor, recheckCount, now })`:
+   - `if-older-than-N-min` (default): re-check only when main moved **and** the PR's last green run is older
+     than `recheckMaxAgeMin` (30) minutes, measured from `runAgeAnchor`. **The anchor is not the run's start
+     time.** A rerun resets `run_started_at` but reuses the run's original merge commit, so a clock read from
+     it would call a rerun of an old run "fresh" while it still tested the old main (the same rerun trap step 1
+     names for the tested commit). `runAgeAnchor` is the **older** (earlier) of the run's `created_at` (set once,
+     when the run was first created) and its `run_started_at`, so neither field's rerun behaviour can make a
+     run look younger than it is. If either field is missing, unparseable or in the future, the anchor is
+     treated as "older than any limit" and the PR is re-checked (the safe direction).
+     **Exception:** when the tested main commit is `unknown` (step 1), the run's age is not consulted and the
+     PR is re-checked: the age gate exists to trust a fresh run whose tested commit is known, and an unknown
+     tested commit gives nothing to trust.
    - `always`: re-check whenever main moved (per step 2).
    - `off`: never re-check (today's behaviour).
    - **Bounded.** A PR already re-checked `RECHECK_MAX_PER_PR` times (module constant, 2) in the last 6 hours
@@ -159,8 +167,22 @@ Steps 1 to 5.
     the older one. A hint that is not on main's first-parent line is ignored. **A hint with an `unknown`
     derived value is ignored:** the result stays `unknown` and the PR is re-checked, even when the hint
     names main's current tip.
-  - **Commit identity, not clock:** a run rerun after main moved (new `startedAt`, old tested SHA) is
-    re-checked. A run queued and started late, but whose tested SHA equals main's tip, is not.
+  - **Commit identity, not clock:** a run rerun after main moved (new `run_started_at`, old tested SHA) is
+    re-checked. A run queued and started late, but whose tested SHA equals main's tip, is not. **This case is
+    tested once per policy value, including the default** (the rule above is only as good as its test under
+    each value), because the default is the one that reads a clock:
+    - `always`: the rerun is re-checked (main moved).
+    - **`if-older-than-N-min` (the default), the rerun case:** tested M0, `created_at` 3 hours ago,
+      `run_started_at` reset to 5 minutes ago by a rerun, main now at M1. The PR **is** re-checked, because the
+      age anchor is the older `created_at`, not the reset start time. With a predicate that read
+      `run_started_at` this case merges B untested against M1, so it fails against that implementation.
+    - Default, a genuinely fresh run: `created_at` and `run_started_at` both 10 minutes ago, tested M0, main at
+      M1 by a commit that is not bookkeeping: not re-checked (fresh CI is trusted, as the replay below says).
+    - Default, a bad anchor input, one case each: `created_at` missing; `run_started_at` missing; either one
+      unparseable; either one in the future: each is re-checked (the anchor reads as "older than any limit").
+    - `off`: the rerun is not re-checked (today's behaviour).
+    - **Wiring:** the caller (the drain) passes the anchor computed from both fields, and a test asserts the
+      predicate is never handed `run_started_at` alone.
   - **Bounded:** a PR already re-checked twice in the window is not re-checked a third time; one
     `recheck-cap-reached` event is recorded. After the window the count resets.
   - **Bounded with a broken journal:** with the journal path unwritable (every `recordPolicyEvent` a no-op),
@@ -172,8 +194,8 @@ Steps 1 to 5.
     threshold, because without a tested commit the run's age proves nothing).
   - Default (no config): behaves as `if-older-than-N-min` with 30.
   - A bad `recheckMaxAgeMin` falls back to 30, through the loader.
-  - **Replay of failure mode (2):** PRs A and B are both green against main M0, B's green run started more
-    than 30 minutes ago. The pass merges A (main moves to M1). Before this story: B merges untested against
+  - **Replay of failure mode (2):** PRs A and B are both green against main M0, B's green run is older
+    than 30 minutes by its age anchor (even if a rerun reset its start time). The pass merges A (main moves to M1). Before this story: B merges untested against
     M1. After it, under the default: B is skipped with `recheck-main-moved`, and `rebaseDropManifest` is
     called with B's head ref. With B's run only 10 minutes old, the default merges B (fresh CI is trusted).
     Under `always`, B is re-checked either way. Under `off`: B merges (the old behaviour is still selectable).
@@ -183,7 +205,7 @@ Steps 1 to 5.
 
 1. Before/after on the live queue: run the drain in dry-run JSON mode on current open PRs, with at least two
    ready PRs. **Before:** both shown as `merge`. **After:** the second shown as `would re-check`, naming
-   main's tip and the run's `startedAt`.
+   main's tip and the run's age anchor (the older of `created_at` and `run_started_at`).
 2. On the next real drain pass with two or more ready PRs: show the second PR's rebuilt head, its new CI run,
    and its later merge (PR numbers and run ids in the PR description or a follow-up comment).
 
