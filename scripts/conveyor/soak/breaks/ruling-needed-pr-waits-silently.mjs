@@ -30,7 +30,7 @@ const queue = await imp('scripts/operations/operator-queue.mjs');
 const notify = await imp('scripts/operations/operator-notify.mjs');
 const smell = (await imp('scripts/conveyor/health-smells/ruling-needed-waiting.mjs'))?.default;
 const core = await imp('scripts/conveyor/health-watch-core.mjs');
-const repo = 'web-everything/web-everything';
+const repo = 'owner/name';
 const H1 = 'a'.repeat(40), H2 = 'b'.repeat(40);
 const T0 = Date.parse('2026-10-04T04:32:00Z');
 const original = { summary: 'policy pointer files are not listed', file: 'policy/pointer.md', line: 3, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };

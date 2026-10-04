@@ -30,7 +30,7 @@ const jury = await imp('scripts/lib/jury-core.mjs');
 const core = await imp('scripts/conveyor/reconcile-core.mjs');
 const pass = await imp('scripts/conveyor/reconcile-pass.mjs');
 const hold = await imp('scripts/conveyor/review-referral-hold.mjs');
-const repo = 'web-everything/web-everything';
+const repo = 'owner/name';
 const H = ['a', 'b', 'c'].map((c) => c.repeat(40));
 const at = Date.parse('2026-10-04T03:50:00Z');
 const original = { summary: 'policy pointer files are missing from the standards manifest so the gate cannot see them', file: 'policy/pointer.md', line: 12, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };

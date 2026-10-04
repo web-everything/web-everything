@@ -29,7 +29,7 @@ const core = await imp('scripts/conveyor/reconcile-core.mjs');
 const pass = await imp('scripts/conveyor/reconcile-pass.mjs');
 const ledger = await imp('scripts/lib/ruling-ledger.mjs');
 const ladderMod = await imp('scripts/conveyor/fixer-ladder.mjs');
-const repo = 'web-everything/web-everything';
+const repo = 'owner/name';
 const H = ['a', 'b', 'c', 'd'].map((c) => c.repeat(40));
 const T0 = Date.parse('2026-10-04T03:00:00Z');
 const original = { summary: 'human-review protection omits JSON files that supply policy values through pointers', file: 'backlog/xcs4nce-policy.md', line: 3, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
