@@ -1555,7 +1555,9 @@ export function planReconcile({
     // conveyor, never handed to a fixer: fix-3850 read "close as superseded" as "delete the card's files", was
     // denied, and ended blocked-on-infra with the PR still open. Checked after the live-claim refusal (never
     // close a PR under a running fixer) and before every repair branch.
-    if (pr?.state === 'OPEN' && answerDisposition(operatorAnswer) === 'close-superseded') {
+    // `state` is ABSENT on the open-only `gh pr list` listing (`OPEN_PR_LIST_FIELDS`) — absent means open (live:
+    // the first edge tick dispatched a fixer at #3850 because this read `state === 'OPEN'`).
+    if ((pr?.state ?? 'OPEN') === 'OPEN' && answerDisposition(operatorAnswer) === 'close-superseded') {
       dispatch.push({
         ...base, kind: 'close-superseded',
         why: `the operator ruled this PR superseded (@${operatorAnswer.actor} via ${operatorAnswer.channel}) — close it, no fix agent`,

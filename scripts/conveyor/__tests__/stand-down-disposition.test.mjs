@@ -51,6 +51,14 @@ describe('#3850 — structured dispositions', () => {
     expect(mine.map((d) => d.kind)).toEqual(['close-superseded']);
   });
 
+  it('the open-only listing carries no `state` field — absent state is open (live edge regression)', () => {
+    const { state, ...listed } = pr3850;
+    const plan = planReconcile({ prs: [listed], agents: [], durableCounts: {}, now: Date.parse('2026-10-04T17:40:00Z') });
+    expect(plan.dispatch.filter((d) => d.prNumber === 3850).map((d) => d.kind)).toEqual(['close-superseded']);
+    expect(planReconcile({ prs: [{ ...pr3850, state: 'CLOSED' }], agents: [], durableCounts: {}, now: 0 }).dispatch
+      .filter((d) => d.kind === 'close-superseded')).toEqual([]);
+  });
+
   it('a live fix claim still wins: nothing is closed under a running fixer', () => {
     const plan = planReconcile({ prs: [{ ...pr3850, fixClaim: { who: 'fix-3850' } }], agents: [], durableCounts: {}, now: 0 });
     expect(plan.dispatch.filter((d) => d.prNumber === 3850)).toEqual([]);
