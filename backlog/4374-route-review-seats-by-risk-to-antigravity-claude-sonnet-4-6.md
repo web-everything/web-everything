@@ -3,10 +3,11 @@ bornAs: xh701hj
 kind: story
 size: 3
 parent: "4936"
-status: open
+status: resolved
 blockedBy: ["4874", "4815"]
 scope: ["we:scripts/operations/review-pr.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs"]
 dateOpened: "2026-09-28"
+dateResolved: "2026-10-03"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "4a2606bc2f711efd86849e250db36b1b100a0fa4"
 tags: [review, routing]
@@ -17,6 +18,27 @@ tags: [review, routing]
 The two mandatory review seats take their Claude model from the review-need tier: Haiku for inert prose (card-only, notes), Sonnet by default, Opus for gate, statute, security, irreversible or human-required changes. A seat gets tools only when its lens must run code. The tier comes from the verified net diff, never from caller input. Every seat records the model, tools and reason it ran with. Re-aimed 2026-10-03 from the Antigravity-Sonnet route, because Antigravity review seats are now off.
 
 ## Progress
+
+**Implementation preflight (2026-10-03).** Blocked in checkout HEAD
+`79afdb836d2709c3ddd0210f2e927e66d7ea1084`: reading
+`we:scripts/lib/review-need.mjs` returned `No such file or directory`, and
+`git ls-tree HEAD` queried for that path returned no entry. Dependency
+#4874 remains open and its Progress says “Nothing is built yet”; #4815 also
+remains open. The scoped implementation cannot import the required
+`reviewNeedFor` until #4874 is present, and the MVP explicitly requires landing
+after #4815. Before/after: mandatory routing remains the existing literal
+Sonnet configuration; no implementation or tests changed. No mutation or live
+tier proof is claimed, and this card remains unresolved. Implementing the
+missing module would exceed this card's declared scope and the instruction to
+create no helper files.
+
+Required verification was invoked with `node we:scripts/verify-lane.mjs`.
+It selected the card-only related-test check plus `npm run check:standards`,
+then acquired admission capacity after 134171ms. The card-only Vitest selection
+found no test files and exited 0. Standards passed with 0 errors and 5295
+warnings; the verifier exited 0 and recorded green. This validates the
+card-only change, not the unimplemented routing feature. The resolve operation
+was not run because the Done-when requirements are unmet.
 
 **Re-aim (2026-10-03).** Old premise: route `none`/`low` mandatory seats to Antigravity-Claude Sonnet 4.6, with a 1-in-5 native comparison and a new `mandatory-review` probation role (prepared 2026-09-30 against b1e5ed4e). Corrected premise: the operator has disabled the Antigravity and Gemini seats. The review daemon plist sets `WE_REVIEW_SEAT_CAP_AGY_CLAUDE=0` and `WE_REVIEW_SEAT_CAP_AGY_GEMINI=0`, and `we:scripts/operations/review-extra-seats.mjs:97` defaults `agy-gemini` to 0 ("Gemini too weak for review until Gemini 4"). Codex is set to 5000, which is effectively uncapped. The operator's target (2026-10-03) is model size by risk on native Claude, plus a cross-provider seat on Codex.
 

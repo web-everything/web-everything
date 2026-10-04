@@ -9,11 +9,12 @@
 import { mkdirSync, writeFileSync, utimesSync, openSync, writeSync, closeSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { it, expect } from 'vitest';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import {
   readLaneLeases, indexLeasesBySession, codexThreadRows, subagentRowsFor, claimedNumsFromTranscript,
-  firstMessageText, interactiveRows, projectSlugFor, createAgentActivityReader,
+  RECENT_MS, leasesFromLanePoolStatus, firstMessageText, interactiveRows, projectSlugFor, createAgentActivityReader,
 } from '../agent-activity-io.mjs';
 import { resolveAgentActivity } from '../agent-activity.mjs';
 
@@ -267,4 +268,64 @@ it('reader ages out a 17-day-old no-pid background session and its children, kee
       expect(rows.find(r => r.name === 'fresh').lastActivityMs).toBe(now);
     }
   });
+});
+
+it('filters stale plain and workflow transcripts before opening their heads; default keeps both', async () => {
+  await withRealRepo(async ({ root }) => {
+    const projects = join(root, 'projects');
+    const cwd = '/fixture';
+    const base = join(projects, projectSlugFor(cwd), 'parent', 'subagents');
+    // Whole seconds survive filesystem timestamp precision at the exact six-hour boundary.
+    const now = Math.floor(Date.now() / 1000) * 1000;
+    for (const dir of [base, join(base, 'workflows', 'run')]) {
+      mkdirSync(dir, { recursive: true });
+      for (const [name, age] of [['stale', 7 * 3600000], ['fresh', 0], ['boundary', RECENT_MS]]) {
+        const path = join(dir, `agent-${name}.jsonl`);
+        writeFileSync(path, userLine(name));
+        const time = new Date(now - age);
+        utimesSync(path, time, time);
+      }
+    }
+    // A real Node child instruments the native ESM binding before importing the reader.
+    const proof = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const opened = [], original = fs.openSync;
+      fs.openSync = (path, ...args) => { opened.push(path); return original(path, ...args); };
+      syncBuiltinESMExports();
+      const { subagentRowsFor } = await import(${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/operations/agent-activity-io.mjs')).href)});
+      // The loader may open its own module files through the patched binding (Node-version dependent), so
+      // drop everything recorded during import and keep only transcript heads opened by the reader call.
+      opened.length = 0;
+      const rows = subagentRowsFor('parent', ${JSON.stringify(cwd)}, ${JSON.stringify(projects)}, { recentMs: ${RECENT_MS}, now: ${now} });
+      const heads = opened.filter((path) => /agent-[^/]*\\.jsonl$/.test(String(path)));
+      opened.length = 0;
+      const unreadable = subagentRowsFor('parent', ${JSON.stringify(cwd)}, ${JSON.stringify(projects)}, {
+        recentMs: ${RECENT_MS}, now: ${now}, stat: () => { throw new Error('gone'); },
+      });
+      console.log(JSON.stringify({ rows, heads, unreadable, unreadableHeads: opened }));
+    `], { encoding: 'utf8', timeout: 15000 }));
+    expect(proof.rows.map(r => r.firstMessageText).sort()).toEqual(['boundary', 'boundary', 'fresh', 'fresh']);
+    expect(proof.heads).toHaveLength(4);
+    expect(proof.heads.every(path => !path.includes('stale'))).toBe(true);
+    expect(proof.unreadable).toEqual([]);
+    expect(proof.unreadableHeads).toEqual([]);
+    expect(subagentRowsFor('parent', cwd, projects)).toHaveLength(6);
+    const lease = { purpose: 'build-1', ownerSession: 'parent' };
+    const reader = createAgentActivityReader({
+      root, projectsDir: projects, codexHome: join(root, 'codex'), listJobs: () => [],
+      listAgents: () => [{ sessionId: 'parent', cwd, state: 'working' }],
+      run: () => { throw new Error('unexpected lane-pool spawn'); },
+      readLeases: () => [lease], subagentRecentMs: RECENT_MS, now: () => now,
+    });
+    const result = reader({});
+    expect(result.rows.find(row => row.sessionId === 'parent').lease).toEqual(lease);
+    expect(result.rows.filter(row => row.kind === 'subagent')).toHaveLength(4);
+  });
+});
+
+it('leasesFromLanePoolStatus tolerates missing and malformed status', () => {
+  for (const parsed of [undefined, null, {}, { lanes: 'x' }, { lanes: [null, {}] }]) {
+    expect(leasesFromLanePoolStatus(parsed)).toEqual([]);
+  }
 });

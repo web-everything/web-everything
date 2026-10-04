@@ -3466,13 +3466,13 @@ describe('#4315 direct acceptance boundary', () => {
       expect(writes).toEqual([]);
     } finally { exit.mockRestore(); }
   });
-  it('rejects stale, forged, unavailable, partial, conflicting and unreadable-card records', () => {
+  it('rejects forged, unavailable, partial, conflicting and unreadable-card records', () => {
     const { record, state } = referralState();
     const rule = { id: 'r1', key: record.referrals[0].key, reviewerId: record.reviewer.id, lens: 'correctness',
       result: 'not-real', rationale: 'Verified diff', evidence: ['diff'] };
     record.rulings = [rule]; state.comments.push(gh(renderReferralRecord(record)));
     expect(assertMandatoryReferralsCleared(state, { repo: 'o/r', pr: 7 }).pending).toEqual([]);
-    expect(() => assertMandatoryReferralsCleared({ ...state, headRefOid: 'b'.repeat(40) })).toThrow();
+    expect(() => assertMandatoryReferralsCleared({ ...state, headRefOid: 'b'.repeat(40) })).not.toThrow();
     expect(() => assertMandatoryReferralsCleared({ ...state, comments: undefined })).toThrow();
     expect(() => assertMandatoryReferralsCleared({ ...state, comments: [...state.comments, gh('<!-- mandatory-referrals-v1: truncated')] })).toThrow();
     const forged = { ...record, rulings: [{ ...rule, reviewerId: 'advisory-seat' }] };

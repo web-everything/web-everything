@@ -138,8 +138,13 @@ export function readLaneLeases({ run = execFileSync, root = REPO_ROOT } = {}) {
       env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
     });
     const parsed = JSON.parse(out);
-    return Array.isArray(parsed.lanes) ? parsed.lanes.map((l) => l.lease).filter(Boolean) : [];
+    return leasesFromLanePoolStatus(parsed);
   } catch { return []; }
+}
+
+/** Shared pure lease projection; malformed status is the same fail-soft empty join. */
+export function leasesFromLanePoolStatus(parsed) {
+  return Array.isArray(parsed?.lanes) ? parsed.lanes.map((l) => l?.lease).filter(Boolean) : [];
 }
 
 /** `Map<sessionId, lease>`, keyed by BOTH `ownerSession` and `workerSession` — either can name the row
@@ -155,8 +160,12 @@ export function indexLeasesBySession(leases) {
 
 /** Every direct subagent (plain + workflow-lane) of ONE session, found by ITS OWN `cwd` — never a blind
  *  scan. Missing dir (no subagents, or an unreadable one) → `[]`, not an error: most sessions have none. */
-export function subagentRowsFor(parentSessionId, cwd, projectsDir = claudeProjectsDir()) {
+export function subagentRowsFor(parentSessionId, cwd, projectsDir = claudeProjectsDir(), { recentMs = null, now = Date.now(), stat = statSync } = {}) {
   if (!parentSessionId || !cwd) return [];
+  const isRecent = (path) => {
+    if (typeof recentMs !== 'number') return true;
+    try { return now - stat(path).mtimeMs <= recentMs; } catch { return false; }
+  };
   const dir = join(projectsDir, projectSlugFor(cwd), parentSessionId, 'subagents');
   if (!existsSync(dir)) return [];
   let entries;
@@ -172,6 +181,7 @@ export function subagentRowsFor(parentSessionId, cwd, projectsDir = claudeProjec
         let files;
         try { files = readdirSync(runDir).filter((f) => /^agent-.*\.jsonl$/.test(f)); } catch { continue; }
         for (const f of files) {
+          if (!isRecent(join(runDir, f))) continue;
           rows.push({
             id: `${parentSessionId}:wf:${runId}:${f}`, sessionId: null, runtime: 'claude', kind: 'subagent',
             cwd, parentSessionId, workflowLane: true, firstMessageText: firstMessageText(join(runDir, f)),
@@ -182,6 +192,7 @@ export function subagentRowsFor(parentSessionId, cwd, projectsDir = claudeProjec
       continue;
     }
     if (/^agent-.*\.jsonl$/.test(entry)) {
+      if (!isRecent(join(dir, entry))) continue;
       rows.push({
         id: `${parentSessionId}:${entry}`, sessionId: null, runtime: 'claude', kind: 'subagent',
         cwd, parentSessionId, workflowLane: false, firstMessageText: firstMessageText(join(dir, entry)),
@@ -241,7 +252,7 @@ export function codexThreadRows(root = REPO_ROOT, { codexHome = resolveCodexHome
   return rows;
 }
 
-const RECENT_MS = STALE_ROW_MS; // matches active-progress-watch.mjs's own staleness cutoff
+export const RECENT_MS = STALE_ROW_MS; // matches active-progress-watch.mjs's own staleness cutoff
 
 /** Top-level session transcripts NOT already accounted for by `claude agents` — the operator's own
  *  interactive chats, or an agent whose harness process has already exited. Recency-bounded (6h) so a full
@@ -290,11 +301,13 @@ export function createAgentActivityReader({
   completionsDir = resolveCompletionsDir(),
   codexHome = resolveCodexHome(),
   run = execFileSync,
+  readLeases = () => readLaneLeases({ run, root }),
+  subagentRecentMs = null,
   now = Date.now,
 } = {}) {
   return (input = {}) => {
     const base = listAgentsWithReviewJobs({ listAgents, ...(listJobs ? { listJobs } : {}) });
-    const leaseIndex = indexLeasesBySession(readLaneLeases({ run, root }));
+    const leaseIndex = indexLeasesBySession(readLeases());
     const known = new Set();
     const rows = [];
     for (const a of base) {
@@ -325,7 +338,7 @@ export function createAgentActivityReader({
       if (isAgedOut(row, { now: now() })) continue;
       row.claimedNums = transcriptPath ? claimedNumsFromTranscript(transcriptPath) : [];
       rows.push(row);
-      if (sessionId && a.cwd) rows.push(...subagentRowsFor(sessionId, a.cwd, projectsDir));
+      if (sessionId && a.cwd) rows.push(...subagentRowsFor(sessionId, a.cwd, projectsDir, { recentMs: subagentRecentMs, now: now() }));
     }
     for (const row of codexThreadRows(root, { codexHome })) {
       let completion = null;

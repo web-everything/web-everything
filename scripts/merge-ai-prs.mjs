@@ -1857,6 +1857,12 @@ export function narrowPrsByRepo(listings, { onlyPr = null, onlyRepo = null, repo
  * @param {Array<{repo:(string|null), rows:Array}>} listings
  * @returns {Map<(string|null), Array>}
  */
+/** Split per-repo listing results into the usable ones and the failed ones (`{repo, err}`); pure. */
+export function partitionListings(listings) {
+  const all = Array.isArray(listings) ? listings : [];
+  return { ok: all.filter((l) => !l.err), failed: all.filter((l) => l.err) };
+}
+
 export function buildLiveListingsByRepo(listings) {
   return new Map((Array.isArray(listings) ? listings : []).map((l) => [l.repo, l.rows]));
 }
@@ -3677,7 +3683,7 @@ async function runCli() {
   // operator's personal one. Awaited HERE, before any gh work, so a fresh env var is in place for even the
   // very first discovery call; a `--watch` run re-checks at the top of every pass (see the watch loop). See
   // github-app-auth-env.mjs's own header for why this lives outside gh-throttle.mjs.
-  await ensureFreshGithubAppEnv({ log: console });
+  await ensureFreshGithubAppEnv({ log: console, perOwner: true });
   // #4308 — the drain CLI's one-off overlap-yield overrides (`--overlap-yield`/`--no-overlap-yield`/
   // `--overlap-yield-window=<n>`, env `WE_DRAIN_OVERLAP_YIELD`). A usage error (conflicting flags, a bad env
   // value) throws here and is caught by this file's own top-level `runCli().catch(...)` — an ordinary CLI
@@ -4287,9 +4293,14 @@ async function runCli() {
       if (!AS_JSON) process.stderr.write(`  ⚠ ${repo || 'cwd repo'}: default branch unresolved (${String(e.message || e).split('\n')[0]}) — the non-default-base hold is off for it this pass (#3674)\n`);
     }
   };
-  const [listings] = await __t.timeAsync('listing', () => Promise.all([mapWithConcurrency(REPOS, REPOS.length, listOne), Promise.all(REPOS.map(resolveDefaultBranch))]));
-  const listErr = listings.find((l) => l.err);
-  if (listErr) fail('gh-error', `gh pr list${listErr.repo ? ` --repo ${listErr.repo}` : ''} failed [${listErr.err.kind}]: ${listErr.err.text}${listErr.err.hint ? ` — ${listErr.err.hint}` : ''}`, 4);
+  let [listings] = await __t.timeAsync('listing', () => Promise.all([mapWithConcurrency(REPOS, REPOS.length, listOne), Promise.all(REPOS.map(resolveDefaultBranch))]));
+  // One repo's failed listing no longer kills the pass: it is logged as failed and the other repos proceed
+  // (`partitionListings`). Only when EVERY repo failed is it the old bad-env hard-fail. The failed repo is absent
+  // from the live rows, so the context re-list also fails and the couple gate fails closed for it.
+  const { ok: okListings, failed: failedListings } = partitionListings(listings);
+  if (failedListings.length && !okListings.length) { const listErr = failedListings[0]; fail('gh-error', `gh pr list${listErr.repo ? ` --repo ${listErr.repo}` : ''} failed [${listErr.err.kind}]: ${listErr.err.text}${listErr.err.hint ? ` — ${listErr.err.hint}` : ''}`, 4); }
+  for (const l of failedListings) process.stderr.write(`  ✗ repo ${l.repo || 'cwd'} FAILED to list [${l.err.kind}]: ${l.err.text} — skipped this pass, continuing with the other repos\n`);
+  listings = okListings;
   // #4108 — this pass's already-fetched LIVE rows per repo (see `buildLiveListingsByRepo`'s docblock for why
   // it is `rows`, never `prs`), reused below so `collectContext` need not re-list any repo in `REPOS`. `l.rows`
   // is always an array here (never undefined): the `listErr` check above already `fail()`-exited on any entry
@@ -5825,7 +5836,7 @@ async function runCli() {
   // goes to the formatter — it computes+appends the trailing `total=` itself; passing `timings` here would
   // print `total=` twice (once as an ordinary step, once as the formatter's own).
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length})\n`);
-  const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
+  const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
   return { result, merged, failedMerges, pendingRebased: pendingAll, deferred, duplicateIdsOnMain };
   }; // end sweepOnce
 
@@ -5927,7 +5938,7 @@ async function runCli() {
     // #3881 — refresh the App token at the top of EVERY pass (a no-op unless configured, and a plain cache read
     // until the token nears expiry). Never on a timer: this loop sleeps with `sleepSync`, so the event loop is
     // never free for a background refresh to run — the top of a pass is the only point it can.
-    if (pass > 1) await ensureFreshGithubAppEnv({ log: console });
+    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true });
     if (leaseHeld) heartbeatDrainLease(DRAIN_LOCK_ROOT, leaseOwner, { scope: leaseScope, repoKey: localSlug }); // #2395 — keep the whole-process lease alive across a long watch (an `under-lease` child never heartbeats — its parent daemon owns that); #2458 re-supply the scope so it survives the heartbeat rewrite; #3440 repoKey selects the same per-repo lock dir
     // #2681 — RE-CHECK the red-main dispatch-freeze EVERY pass: a post-land red can be raised DURING a running
     // watch (the resident drain daemon is a long-lived `--watch`), and stop-the-line must catch it, not just a

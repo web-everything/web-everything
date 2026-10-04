@@ -1162,8 +1162,13 @@ describe('#4315 durable referral effects', () => {
   it('a drop that cannot be persisted retains the hold', async () => {
     const h = harness({ failure: 'post', env: { REVIEW_PR_ANTIGRAVITY_REVIEW: '0' } });
     seedReferrals(h, ['judgeAntigravityReview']);
-    expect((await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX)).pending).toEqual(['referral-persistence-failed']);
-    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7 })).toThrow(/mandatory referral hold/);
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(result.pending).toEqual(['referral-persistence-failed']);
+    // The operation runner persists this failure evidence; old-head referrals alone are no longer a hold.
+    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7,
+      readRuns: () => [{ repo: 'o/r', pr: 7, head: h.state.headRefOid, completedAt: 1,
+        persistenceFailed: result.pending.includes('referral-persistence-failed') }],
+    })).toThrow(/referral-persistence-failed/);
   });
   it.each(['pending', 'human-and-changes'])('parks with live %s labels without consuming a send-back', async initial => {
     const h = harness({ failure: 'judge' });

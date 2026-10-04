@@ -47,8 +47,9 @@
  *     loop.
  *   node scripts/verify-lane.mjs reset                # clear a stale marker so `verify` can start (x4jcqm4) — refuses if a FOREIGN lease is live (own live lease is OK, #3378)
  *   node scripts/verify-lane.mjs request              # #3105 — stamp the `running` marker and return immediately; does NOT run the gate.
+ *     Refuses with exit 3 and no marker written when no verify daemon is alive.
  *     The sanctioned call for an interactive agent session: the actual suite run is picked up and executed by
- *     `scripts/conveyor/verify-dispatch.mjs` (a mechanical runner pass, unbound by the agent tool's foreground
+ *     `scripts/conveyor/verify-dispatch.mjs` (via the verify daemon, unbound by the agent tool's foreground
  *     window) on its next tick, which runs the SAME `verify` mode below to completion. An agent that called
  *     `request` then polls `check` across its own turns — each `check` call is a fast marker read, never a
  *     suite run, so no single call can ever exceed the foreground window, no matter how long the gate itself
@@ -57,8 +58,11 @@
  *
  * Exit codes: 0 = green (marker recorded green) / `check` verdict ok / `reset` cleared or was a no-op / `request`
  * accepted; 2 = red (suites failed — marker recorded red) / `check` verdict not-ok; 3 = usage / git error (no
- * marker written) / `reset` refused because a FOREIGN lease is live (own live lease no longer refuses, #3378).
+ * marker written) / `request` refused because no verify daemon is alive / `reset` refused because a FOREIGN lease is live (own live lease no longer refuses, #3378).
  */
+import { RUNNER_LOCK_ROOT, runnerLeaseStatus, probeRunnerLeaseLiveness } from '../skills-src/conveyor/runner-lock.mjs';
+import { VERIFY_DAEMON_LEASE_KEY } from '../skills-src/conveyor/verify-daemon.mjs';
+import { readLockEntry } from './readiness/file-locks.mjs';
 import { spawn } from 'node:child_process';
 import { createFailureCollector } from './lib/verify-failures.mjs';
 import { timeoutRetryFiles, describeTimeoutRetry, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
@@ -66,7 +70,7 @@ import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlin
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs } from './lib/lane-verify.mjs';
+import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs } from './lib/lane-verify.mjs';
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
@@ -353,11 +357,25 @@ if (cacheHit) {
   emit({ sha: headSha, status: 'green', reason: 'cached', exitCode: preStart.exitCode ?? null, ...cachedRetry, detail: cachedDetail }, 0);
 }
 
+// #4161 — cached results need no server; only new requests require the daemon's live lease.
+if (MODE === 'request') {
+  const lockRoot = process.env.CONVEYOR_RUNNER_LOCK_ROOT || RUNNER_LOCK_ROOT;
+  const leaseStatus = runnerLeaseStatus(lockRoot, { key: VERIFY_DAEMON_LEASE_KEY });
+  const pidLiveness = probeRunnerLeaseLiveness(readLockEntry(lockRoot, VERIFY_DAEMON_LEASE_KEY));
+  const verdict = verifyServerVerdict({ leaseStatus, pidLiveness });
+  if (!verdict.alive) {
+    emit({
+      sha: headSha, status: 'no-server', reason: 'verify-daemon-not-alive', ok: false,
+      detail: `No verify daemon is alive (${verdict.reason}; lease ${VERIFY_DAEMON_LEASE_KEY}; last heartbeat: ${leaseStatus.heartbeatAt || 'none'}); no marker was written. Start it with launchctl kickstart -k gui/$(id -u)/com.we.verify-daemon, or run node skills-src/conveyor/verify-daemon.mjs (we:skills-src/conveyor/verify-daemon.mjs), then re-run request.`,
+    }, 3);
+  }
+}
+
 if (MODE !== 'run') writeMarker(verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: currentTreeHash, runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined }));
 
 // #3105 — `request` stops HERE: the marker is stamped, nothing has run yet, and this call already returns
 // (`emit` calls `process.exit`). The actual suite run is picked up by `scripts/conveyor/verify-dispatch.mjs`
-// (a mechanical runner pass) on its next tick, which re-invokes THIS file's default `verify` mode — the exact
+// (via the verify daemon) on its next tick, which re-invokes THIS file's default `verify` mode — the exact
 // code below, unchanged — to completion. This is the only way an interactive agent session may ever bring this
 // gate's `running` marker into being: no new marker status, no new gate-decision branch — a `request`-stamped
 // marker is indistinguishable from (and handled identically to) an ordinary in-flight `running` one by every

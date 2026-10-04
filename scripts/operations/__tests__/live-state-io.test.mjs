@@ -8,8 +8,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   expandHome, defaultDrainHistoryPath, readOneLanePool, readAllLanePools, readDrainLastPass, readMachineLoad,
-  collectLiveState,
+  collectLiveState, countLanePool,
 } from '../live-state-io.mjs';
+import { RECENT_MS } from '../agent-activity-io.mjs';
 
 describe('expandHome', () => {
   it('expands a leading $HOME to the real home dir', () => expect(expandHome('$HOME/workspace/frontierui', '/Users/x')).toBe('/Users/x/workspace/frontierui'));
@@ -128,6 +129,7 @@ describe('collectLiveState — joins every sub-read into one snapshot, each seam
   it('calls every collector exactly once and stamps observedAt from the injected clock', () => {
     const calls = [];
     const out = collectLiveState({
+      readWeLaneStatus: () => ({ parsed: { lanes: [] } }),
       now: () => Date.parse('2026-09-26T12:00:00.000Z'),
       collectDaemons: () => { calls.push('daemons'); return { daemons: [] }; },
       collectQueue: () => { calls.push('queue'); return { held: [], waiting: [] }; },
@@ -148,4 +150,54 @@ describe('collectLiveState — joins every sub-read into one snapshot, each seam
     // the injected `readActivity` returns no rows).
     expect(out.runningRows).toEqual([]);
   });
+});
+
+// #4956: one shared status must supply both consumers, including failures.
+it('counts a pre-read status and reuses it without spawning WE', () => {
+  const parsed = { lanes: [
+    { exists: true, clean: true, leased: false },
+    { exists: true, clean: false, leased: false },
+    { exists: true, clean: true, leased: true },
+    { exists: false },
+  ] };
+  const expected = { repoKey: 'we', total: 3, free: 1, leased: 1, dirty: 1 };
+  expect(countLanePool('we', { parsed })).toEqual(expected);
+  expect(readOneLanePool('we', { execFn: () => JSON.stringify(parsed) })).toEqual(expected);
+  expect(countLanePool('we', { error: 'boom' })).toEqual({ repoKey: 'we', total: 0, free: 0, leased: 0, dirty: 0, error: 'boom' });
+  for (const status of [{ parsed }, { error: 'boom' }]) {
+    const calls = [];
+    const rows = readAllLanePools({ statusFor: { we: status }, execFn: (cmd, args) => {
+      calls.push(args); return '{"lanes":[]}';
+    } });
+    expect(calls).toHaveLength(2);
+    expect(calls.every(args => args.some(arg => arg.startsWith('--repo=')))).toBe(true);
+    expect(rows[0]).toEqual(countLanePool('we', status));
+  }
+});
+
+it('shares exactly one WE status with lane counts and activity leases across repeated reads', () => {
+  for (const status of [
+    { parsed: { lanes: [{ exists: true, clean: true, leased: true, lease: { purpose: 'build-1', ownerSession: 's1' } }] } },
+    { error: 'timed out' },
+  ]) {
+    let reads = 0;
+    let readers = 0;
+    for (let i = 0; i < 20; i++) {
+      collectLiveState({
+        readWeLaneStatus: () => { reads++; return status; },
+        collectDaemons: () => ({ daemons: [] }), collectQueue: () => ({ held: [], waiting: [] }),
+        readHealth: () => ({}), readDrain: () => ({}), readGithub: () => null,
+        readLoad: () => ({ loadavg: [0], cores: 1 }),
+        readLanes: options => { expect(options).toEqual({ statusFor: { we: status } }); return []; },
+        createActivityReader: options => {
+          readers++;
+          expect(options.subagentRecentMs).toBe(RECENT_MS);
+          expect(options.readLeases()).toEqual(status.parsed ? [{ purpose: 'build-1', ownerSession: 's1' }] : []);
+          return () => ({ rows: [] });
+        },
+      });
+    }
+    expect(reads).toBe(20);
+    expect(readers).toBe(20);
+  }
 });
