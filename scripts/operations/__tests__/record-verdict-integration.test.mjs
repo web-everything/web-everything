@@ -34,6 +34,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 import {
   APPLIER_WORKFLOW,
@@ -435,6 +436,17 @@ describe('which board a verdict belongs on, read off a REAL remote (#3261)', () 
     await withBareOrigin(async (ctx) => {
       expect(defaultOriginRepo(ctx.clone)).toBe(FIXTURE_SLUG);
       expect(resolveTransportRoot({ repo: FIXTURE_SLUG, root: ctx.clone })).toBe(ctx.clone);
+    });
+  });
+
+  /** The 2026-10-03 org move left every clone/lane with `chalbert/<repo>` origins; they must read as the CURRENT
+   *  slug or every review refuses before its read step (outage). Real git, URL never fetched. */
+  it('reads a legacy chalbert/ origin as the repo\'s current slug', async () => {
+    await withBareOrigin(async (ctx) => {
+      execFileSync('git', ['remote', 'set-url', 'origin', 'git@github.com:chalbert/web-everything.git'], { cwd: ctx.clone });
+      expect(defaultOriginRepo(ctx.clone)).toBe('web-everything/web-everything');
+      execFileSync('git', ['remote', 'set-url', 'origin', 'https://github.com/chalbert/frontierui.git'], { cwd: ctx.clone });
+      expect(defaultOriginRepo(ctx.clone)).toBe('frontier-ui/frontierui');
     });
   });
 

@@ -431,3 +431,76 @@ describe('buildComment / `comment` — the graduatedTo resolution basis (#2447)'
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+// #4874: exercise the real I/O boundary without creating fixture/helper files.
+describe('#4874 shape need', () => {
+  const cli = resolve('scripts/review-core-cli.mjs');
+  const cardFiles = ['backlog/4874-example.md'];
+  it('adds need while preserving every existing card-plan field', () => {
+    const { need, ...plan } = buildShapePlan({ changedFiles: cardFiles });
+    expect(plan).toEqual({
+      careLevel: 'none', reasons: [], humanRequired: false, earnedLenses: [],
+      mandatoryFloor: ['root-cause', 'completeness'], subject: 'prose', rounds: 0,
+      jurorsPerLens: 0, seatLens: 'root-cause', seatLensReachable: false,
+      escalated: false, changedFiles: cardFiles,
+      trail: [
+        'all 1 touched file(s) are inert prose and nothing escalated on path kind → PROSE.',
+        'prose subject → the #2657 decision-prose lenses (root-cause + completeness); rigor unchanged at care=none (0 round(s), 0 juror(s)/lens).',
+      ],
+    });
+    expect(need).toMatchObject({ tier: 'haiku', authorsKnown: false, crossProvider: { required: 'codex' } });
+  });
+  it.each([
+    { commits: [{ messageBody: 'Co-Authored-By: Codex <noreply@openai.com>' }] },
+    [{ messageBody: 'Written by Codex (codex-direct-task)' }],
+  ])('reads --commits-file in gh and array form: %j', (input) => {
+    const plan = JSON.parse(execFileSync(process.execPath, [cli, 'shape', `--files=${cardFiles[0]}`, '--commits-file=/dev/stdin', '--json'], { input: JSON.stringify(input), encoding: 'utf8' }));
+    expect(plan.need).toMatchObject({ authors: ['codex'], authorsKnown: true, crossProvider: { required: null } });
+  });
+  it.each(['{', '{"commits":{}}', 'null', '[]'])('fails closed on bad or empty commits: %s', (input) => {
+    const plan = JSON.parse(execFileSync(process.execPath, [cli, 'shape', `--files=${cardFiles[0]}`, '--commits-file=/dev/stdin', '--json'], { input, encoding: 'utf8' }));
+    expect(plan.need.crossProvider.required).toBe('codex');
+    expect(plan.need.authorsKnown).toBe(false);
+  });
+  it('fails closed when commits-file cannot be read', () => {
+    const plan = JSON.parse(execFileSync(process.execPath, [cli, 'shape', `--files=${cardFiles[0]}`, '--commits-file=/dev/null/nonexistent', '--json'], { encoding: 'utf8' }));
+    expect(plan.need.crossProvider.required).toBe('codex');
+  });
+  it('does not certify a partially malformed gh file list', () => {
+    const plan = JSON.parse(execFileSync(process.execPath, [cli, 'shape', '--json'], {
+      input: JSON.stringify({ files: [{ path: cardFiles[0] }, {}] }), encoding: 'utf8',
+    }));
+    expect(plan.need.tier).toBe('opus');
+    expect(plan.need.crossProvider.required).toBe('codex');
+  });
+  it.each(['{', '[]', '{}', 'null'])('preserves the stricter CLI refusal for unreadable/empty scope: %s', (input) => {
+    try {
+      execFileSync(process.execPath, [cli, 'shape', '--json'], { input, stdio: ['pipe', 'pipe', 'pipe'] });
+      expect.fail('must refuse');
+    } catch (error) {
+      expect(error.status).toBe(2);
+      expect(JSON.parse(String(error.stdout)).error).toContain('no changed files');
+    }
+  });
+  it.each([
+    '{"files":[{}]}',
+    '{"files":[{"path":""}]}',
+    '{"files":[null]}',
+    '{"files":[""]}',
+    '[{"path":""}]',
+    '[null]',
+    '[""]',
+  ])('refuses a wholly unreadable non-empty file list with exit 2: %s', (input) => {
+    try {
+      execFileSync(process.execPath, [cli, 'shape', '--json'], { input, stdio: ['pipe', 'pipe', 'pipe'] });
+      expect.fail('must refuse');
+    } catch (error) {
+      expect(error.status).toBe(2);
+      expect(JSON.parse(String(error.stdout)).error).toContain('no changed files');
+    }
+  });
+  it('prints the human-readable routing line', () => {
+    const output = execFileSync(process.execPath, [cli, 'shape', `--files=${cardFiles[0]}`], { encoding: 'utf8' });
+    expect(output).toContain('tier: haiku (inert-prose)  tools: correctness=false,security=false  cross-provider seat: codex');
+  });
+});

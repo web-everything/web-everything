@@ -12,7 +12,7 @@ import { join } from 'node:path';
 
 import {
   BLOCKED_ON_INFRA, DEFERRED_NO_LANE, MAX_LANE_DEFERRALS, REVIEW_JOB_KIND, REVIEW_JOB_LANE_WAIT_MS,
-  classifyReviewLoopOutcome, crashLabelFromLoop, decideJobClaim, dispatchReviewByMode, dispatchReviewJob,
+  classifyReviewLoopOutcome, crashLabelFromLoop, loopFailureLabel, decideJobClaim, dispatchReviewByMode, dispatchReviewJob,
   jobRecordToAgentRow, laneCooloffActive, listAgentsWithReviewJobs, listReviewJobAgents, nextLaneDeferral,
   parseReviewLoopStdout, readJobRecord, resolveReviewDispatchMode, runReviewJob, writeJobRecord,
 } from '../review-job.mjs';
@@ -470,4 +470,15 @@ it('#4154 soak: 100 seven-review ticks reuse distinct assignments without auto-p
     expect(acquired.size).toBe(7);
   }
   expect(loops).toBe(700);
+});
+
+describe('loopFailureLabel — the loop\'s own error is recorded, never swallowed (outage 2026-10-03)', () => {
+  it('carries the refusal text and stop word of a loop that stopped before judging', () => {
+    const parsed = { stopped: 'step-refused', verdict: null, error: 'review-pr-io: refusing to review x/y#1 — origin is a/b' };
+    expect(loopFailureLabel(parsed, 1)).toBe('exit 1 (step-refused): review-pr-io: refusing to review x/y#1 — origin is a/b');
+  });
+  it('is null on a clean exit and a bare exit code when the payload has no error', () => {
+    expect(loopFailureLabel({ stopped: 'complete' }, 0)).toBeNull();
+    expect(loopFailureLabel({ stopped: 'confirm' }, 2)).toBe('exit 2');
+  });
 });
