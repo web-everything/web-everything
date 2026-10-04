@@ -84,7 +84,7 @@ import { assertNotALaneCheckout, REPO_ROOT, resolveGhShimSettingsEnv } from './d
 import {
   decideJobClaim, jobLogPath, pidAlive, readJobRecord, removeJobRecord, reviewJobsDir, writeJobRecord,
 } from './review-job-store.mjs';
-import { assertMainNotStale, dispatchReview, planReviewDispatch } from './review-dispatch.mjs';
+import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
 import { runReport } from './completion-cli.mjs';
 import { tryReadCompletion } from './completion-store.mjs';
 import { rateAndRecordReviewJob } from '../conveyor/run-rating.mjs';
@@ -533,7 +533,10 @@ export function dispatchReviewJob({
 } = {}) {
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
   assertNotALaneCheckout(root);
-  assertMainNotStale(root, checkStaleness);
+  // The job path is the DEFAULT review dispatch (the daemon calls it), so it must narrow a managed clone's
+  // refusal to the review code path exactly like `dispatchReview` does (#4387). Without this the narrowing
+  // never applied and every landed code file made the clone stale (live 2026-10-03: 21 commits behind).
+  assertMainNotStale(root, checkStaleness, { dispatchPath: isReviewCodePath });
   const slug = planned.sessionSlug;
   const logPath = jobLogPath(slug, dir);
   const base = { mode: 'job', pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, sessionSlug: slug, agentId: null, logPath };

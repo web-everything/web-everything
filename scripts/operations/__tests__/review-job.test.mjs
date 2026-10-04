@@ -6,7 +6,9 @@ import { readReviewCiGate } from '../../lib/review-ci-gate-io.mjs';
  * store (we:scripts/operations/review-job-store.mjs). Every effect is faked: no lane pool, no `claude`, no `gh`.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -285,6 +287,50 @@ describe('dispatchReviewJob — what the daemon calls', () => {
     dispatchReviewJob({ ...base, dir, resolveSettingsEnv: () => null, spawnJob: () => 1 });
     expect(readdirSync(dir).filter((n) => !n.endsWith('.log'))).toEqual(['review-10.json']);
     expect(existsSync(join(dir, 'review-10.json'))).toBe(true);
+  });
+});
+
+describe('dispatchReviewJob — a managed clone behind origin/main (the default dispatch path)', () => {
+  // Live 2026-10-03: the review daemon refused every dispatch ("21 commit(s) behind") because this job path called
+  // `assertMainNotStale` without the review code path, so the #4387 narrowing only ever covered `--mode=session`.
+  let root;
+  let prevEnv;
+  const git = (cwd, ...a) => execFileSync('git', a, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const commit = (cwd, file) => {
+    mkdirSync(dirname(join(cwd, file)), { recursive: true });
+    writeFileSync(join(cwd, file), 'x\n' + Math.random());
+    git(cwd, 'add', file);
+    git(cwd, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', `edit ${file}`);
+  };
+  function behind(...files) {
+    git(dir, 'init', '-q', '--bare', '-b', 'main', 'origin.git');
+    git(dir, 'clone', '-q', 'origin.git', 'up');
+    const up = join(dir, 'up');
+    commit(up, 'a.txt'); git(up, 'push', '-q', 'origin', 'main');
+    git(dir, 'clone', '-q', '-b', 'main', 'origin.git', 'clone');
+    for (const f of files) commit(up, f);
+    git(up, 'push', '-q', 'origin', 'main');
+    root = join(dir, 'clone');
+    prevEnv = process.env.WE_DAEMON_MANAGED_CLONE; process.env.WE_DAEMON_MANAGED_CLONE = '1';
+  }
+  afterEach(() => { if (prevEnv === undefined) delete process.env.WE_DAEMON_MANAGED_CLONE; else process.env.WE_DAEMON_MANAGED_CLONE = prevEnv; prevEnv = undefined; });
+  const go = () => dispatchReviewJob({
+    ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 10, repo: REPO, root, dir: join(dir, 'jobs'),
+    readCompletion: () => null, resolveSettingsEnv: () => null, spawnJob: () => 77,
+  });
+
+  it('behind only in code OFF the review path: dispatches and logs the tolerated files', () => {
+    behind('scripts/lane-pool.mjs', 'scripts/backlog/frontmatter.mjs');
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      expect(go()).toMatchObject({ jobPid: 77 });
+      expect(err.mock.calls.map((c) => String(c[0])).join('')).toMatch(/2 commit\(s\) behind.*scripts\/lane-pool\.mjs.*tolerating the lag/);
+    } finally { err.mockRestore(); }
+  });
+
+  it('behind in a file the review runs (review-loop-cli, or review-job\'s own imports): still refuses', () => {
+    behind('scripts/lane-pool.mjs', 'scripts/operations/review-loop-cli.mjs');
+    expect(() => go()).toThrow(/2 commit\(s\) behind origin\/main.*STALE code/s);
   });
 });
 
