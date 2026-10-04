@@ -68,8 +68,9 @@ const out = {
   h2: p2.dispatch.map((d) => [d.kind, d.mode ?? null]), h2Refusals: p2.refusals.map((r) => r.kind),
   h2Ruling: p2.dispatch[0]?.rulingNotAddressed?.matches?.[0]?.ruling ?? null,
   h3: p3.dispatch.map((d) => [d.kind, d.mode ?? null]), h3Refusals: p3.refusals.map((r) => r.kind), h3Notes: p3.notes.map((n) => n.kind),
+  h3Rung: p3.dispatch[0]?.rulingNotAddressed?.rung?.id ?? null,
   live1: l1.dispatch.map((d) => [d.kind, d.mode ?? null]), live1Ruling: l1.dispatch[0]?.rulingNotAddressed?.matches?.[0]?.ruling ?? null,
-  live2: l2.dispatch.map((d) => [d.kind, d.mode ?? null]), live2Notes: l2.notes.map((n) => n.kind),
+  live2: l2.dispatch.map((d) => [d.kind, d.mode ?? null]), live2Notes: l2.notes.map((n) => n.kind), live2Rung: l2.dispatch[0]?.rulingNotAddressed?.rung?.id ?? null,
   live3: l3.dispatch.map((d) => [d.kind, d.mode ?? null]), live3Notes: l3.notes.map((n) => n.kind),
 };
 process.stdout.write(JSON.stringify(out));
@@ -79,7 +80,8 @@ export default {
   id: 'ignored-ruling-parks-again',
   title: 'a finding the operator already ruled block comes back on a new head and the review just parks again instead of going back to the fixer',
   card: 'operator order 2026-10-04 ~08:15 ET; live incident PR #3794 (card xcs4nce, policy pointer files; also #3833, #3771)',
-  fixedBy: { sha: '9262954bee52086a168380dd4445d3170d1d7e7b,c144900a6da7ebb005f1e5d83adb73f84e16aa27,4a33d462c910fbbd29444b1600ff5b1d717570d7,3aeccaa0bf05f4ae5d2c565866f46b587787da8a', where: 'lane/fix-ruling-needed-surface', paths: [
+  fixedBy: { sha: 'b01658095e2513f2b0ca7f5923b08ce0723f851c,9262954bee52086a168380dd4445d3170d1d7e7b,c144900a6da7ebb005f1e5d83adb73f84e16aa27,4a33d462c910fbbd29444b1600ff5b1d717570d7,3aeccaa0bf05f4ae5d2c565866f46b587787da8a', where: 'lane/fix-ruling-needed-surface', paths: [
+    'scripts/conveyor/fixer-ladder.mjs',
     'scripts/conveyor/health-responder-core.mjs',
     'scripts/conveyor/health-smells-notify-list.mjs',
     'scripts/conveyor/health-smells/ruling-needed-waiting.mjs',
@@ -92,6 +94,8 @@ export default {
     'scripts/conveyor/review-hold-reconcile.mjs',
     'scripts/conveyor/review-referral-hold.mjs',
     'scripts/conveyor/ruling-needed-sweep.mjs',
+    'scripts/lib/dispatch-routing-policy.json',
+    'scripts/lib/fixer-escalation-policy.mjs',
     'scripts/lib/ruling-ledger.mjs',
     'scripts/operations/operator-notify.mjs',
     'scripts/operations/operator-queue.mjs',
@@ -115,14 +119,16 @@ export default {
       const sentBack = out.h2.length === 1 && out.h2[0][0] === 'fix' && out.h2[0][1] === 'ruling-not-addressed';
       if (!sentBack) violations.push({ invariant: 'sent-straight-back', detail: `miss 1 must dispatch one fix (ruling-not-addressed); got dispatch=${JSON.stringify(out.h2)} refusals=${out.h2Refusals.join(',') || 'none'} (parked again = the live defect)` });
       if (sentBack && !/pointer files must be listed/.test(out.h2Ruling ?? '')) violations.push({ invariant: 'ruling-attached', detail: 'the original ruling text is not attached to the send-back' });
-      if (out.h3.length !== 0 || !out.h3Refusals.includes('ruling-dispute') || !out.h3Notes.includes('ruling-dispute')) {
-        violations.push({ invariant: 'escalates-after-two-misses', detail: `miss 2 must escalate (no third fixer round, a ruling-dispute note); got dispatch=${JSON.stringify(out.h3)} refusals=${out.h3Refusals.join(',') || 'none'} notes=${out.h3Notes.join(',') || 'none'}` });
+      // Miss 2 is the NEXT rung of the fixer-escalation ladder (a stronger model), never a plain park and never the same
+      // fixer for a third time. (The ladder's later rungs have their own break: fixer-ladder-skips-stronger-model.)
+      if (out.h3.length !== 1 || out.h3[0][1] !== 'ruling-not-addressed' || out.h3Rung !== 'stronger-model') {
+        violations.push({ invariant: 'second-miss-escalates', detail: `miss 2 must go to the stronger-model rung; got dispatch=${JSON.stringify(out.h3)} rung=${out.h3Rung} refusals=${out.h3Refusals.join(',') || 'none'} notes=${out.h3Notes.join(',') || 'none'}` });
       }
       // The live thread itself (PR #3794): the operator's own "ruling: block" comment, replayed head by head.
       const liveFirst = out.live1.length === 1 && out.live1[0][0] === 'fix' && out.live1[0][1] === 'ruling-not-addressed' && /ruling: block/.test(out.live1Ruling ?? '');
       if (!liveFirst) violations.push({ invariant: 'live-first-miss-sent-back', detail: `PR #3794's first head after the operator's 01:19Z block ruling must go back to a fixer with that ruling; got dispatch=${JSON.stringify(out.live1)}` });
-      if (out.live2.some((d) => d[1] === 'ruling-not-addressed') || !out.live2Notes.includes('ruling-dispute')) {
-        violations.push({ invariant: 'live-second-miss-escalates', detail: `PR #3794's second head must escalate (ruling-dispute note, no third send-back); got dispatch=${JSON.stringify(out.live2)} notes=${out.live2Notes.join(',') || 'none'}` });
+      if (out.live2.length !== 1 || out.live2Rung !== 'stronger-model') {
+        violations.push({ invariant: 'live-second-miss-escalates', detail: `PR #3794's second head must go to the stronger-model rung; got dispatch=${JSON.stringify(out.live2)} rung=${out.live2Rung} notes=${out.live2Notes.join(',') || 'none'}` });
       }
       if (out.live3.some((d) => d[1] === 'ruling-not-addressed') || out.live3Notes.includes('ruling-dispute')) {
         violations.push({ invariant: 'live-fresh-ruling-clears', detail: `after the operator's 12:11Z re-ruling nothing may be sent back or escalated; got dispatch=${JSON.stringify(out.live3)} notes=${out.live3Notes.join(',') || 'none'}` });

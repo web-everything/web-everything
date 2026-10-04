@@ -67,7 +67,8 @@ export default {
   id: 'ruling-needed-pr-waits-silently',
   title: 'a PR parked on unanswered mandatory referrals waits for hours with no label, needs-you row, push or health alert',
   card: 'operator order 2026-10-04 ~08:15 ET; live incident PR #3794 04:32Z-12:15Z (also #3771, #3833)',
-  fixedBy: { sha: '9262954bee52086a168380dd4445d3170d1d7e7b,c144900a6da7ebb005f1e5d83adb73f84e16aa27,4a33d462c910fbbd29444b1600ff5b1d717570d7,3aeccaa0bf05f4ae5d2c565866f46b587787da8a', where: 'lane/fix-ruling-needed-surface', paths: [
+  fixedBy: { sha: 'b01658095e2513f2b0ca7f5923b08ce0723f851c,9262954bee52086a168380dd4445d3170d1d7e7b,c144900a6da7ebb005f1e5d83adb73f84e16aa27,4a33d462c910fbbd29444b1600ff5b1d717570d7,3aeccaa0bf05f4ae5d2c565866f46b587787da8a', where: 'lane/fix-ruling-needed-surface', paths: [
+    'scripts/conveyor/fixer-ladder.mjs',
     'scripts/conveyor/health-responder-core.mjs',
     'scripts/conveyor/health-smells-notify-list.mjs',
     'scripts/conveyor/health-smells/ruling-needed-waiting.mjs',
@@ -80,6 +81,8 @@ export default {
     'scripts/conveyor/review-hold-reconcile.mjs',
     'scripts/conveyor/review-referral-hold.mjs',
     'scripts/conveyor/ruling-needed-sweep.mjs',
+    'scripts/lib/dispatch-routing-policy.json',
+    'scripts/lib/fixer-escalation-policy.mjs',
     'scripts/lib/ruling-ledger.mjs',
     'scripts/operations/operator-notify.mjs',
     'scripts/operations/operator-queue.mjs',
