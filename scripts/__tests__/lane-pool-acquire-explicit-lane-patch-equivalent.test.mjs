@@ -15,7 +15,8 @@
  *   `acquire --lane=N` on a lane with a genuinely unique unpushed commit is UNCHANGED — still refused without
  *   `--force` (the fix must never widen the hole `#2267`/`#3390` exist to close).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -36,11 +37,13 @@ function runPool(args) {
 
 let base, originDir, referenceDir, poolRoot;
 
-beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'lane-pool-explicit-patch-eq-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
-  poolRoot = join(base, 'pool');
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-explicit-patch-eq-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
 
   git(['init', '--quiet', '--bare', '--initial-branch=trunk', originDir]);
   git(['clone', '--quiet', originDir, referenceDir]);
@@ -50,10 +53,19 @@ beforeEach(() => {
   git(['add', 'file.txt'], referenceDir);
   git(['commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', originDir, 'HEAD:refs/heads/trunk'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
+beforeEach(() => {
+  base = mkdtempSync(join(tmpdir(), 'lane-pool-explicit-patch-eq-'));
+  poolRoot = join(base, 'pool');
 });
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=explicitpatcheq', '--branch=trunk', '--no-install'];

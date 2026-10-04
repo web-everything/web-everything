@@ -27,7 +27,8 @@
  *   unrecognized flag (exit non-zero, no JSON on stdout) — this test fails at the very first assertion on the
  *   leased-only call's exit code until the flag exists.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync, readFileSync, realpathSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -55,18 +56,13 @@ let base, originDir, referenceDir, poolRoot;
 const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=leasedonly', '--branch=trunk', '--no-install'];
 const laneDirOf = (n) => join(poolRoot, 'leasedonly', `lane-${n}`);
 
-beforeEach(() => {
-  // realpathSync: on macOS `os.tmpdir()` resolves under `/var/...`, a symlink to the canonical `/private/var/...`
-  // — a spawned shell's own `$PWD` (what the git-spawn PATH shim below logs) reports the CANONICAL path, so an
-  // un-resolved `base` made every `spawnLines.some(l => l.startsWith(laneDirOf(n) + '|'))` compare a `/var/...`
-  // prefix against logged `/private/var/...` lines: always false, which read as "zero spawns" for EVERY lane —
-  // vacuously true for the "no spawn in an unleased lane" assertions and silently wrong for the "the leased lane
-  // DID spawn ≥4 times" one (#4345 round-2 self-review: caught because that assertion expects a positive count,
-  // where the same bug in the negative assertions could not have been noticed by the assertion failing).
-  base = realpathSync(mkdtempSync(join(tmpdir(), 'lane-pool-leased-only-')));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
-  poolRoot = join(base, 'pool');
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = realpathSync(mkdtempSync(join(tmpdir(), 'lane-pool-leased-only-fixture-')));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
 
   git(['init', '--quiet', '--bare', '--initial-branch=trunk', originDir]);
   git(['clone', '--quiet', originDir, referenceDir]);
@@ -76,6 +72,21 @@ beforeEach(() => {
   git(['add', 'file.txt'], referenceDir);
   git(['commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', originDir, 'HEAD:refs/heads/trunk'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
+beforeEach(() => {
+  // realpathSync: on macOS `os.tmpdir()` resolves under `/var/...`, a symlink to the canonical `/private/var/...`
+  // — a spawned shell's own `$PWD` (what the git-spawn PATH shim below logs) reports the CANONICAL path, so an
+  // un-resolved `base` made every `spawnLines.some(l => l.startsWith(laneDirOf(n) + '|'))` compare a `/var/...`
+  // prefix against logged `/private/var/...` lines: always false, which read as "zero spawns" for EVERY lane —
+  // vacuously true for the "no spawn in an unleased lane" assertions and silently wrong for the "the leased lane
+  // DID spawn ≥4 times" one (#4345 round-2 self-review: caught because that assertion expects a positive count,
+  // where the same bug in the negative assertions could not have been noticed by the assertion failing).
+  base = realpathSync(mkdtempSync(join(tmpdir(), 'lane-pool-leased-only-')));
+  poolRoot = join(base, 'pool');
 
   const provision = runPool(['provision', `--count=${N}`, ...poolArgs()]);
   expect(provision.code).toBe(0);
@@ -85,6 +96,7 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 describe('status --leased-only (#4345)', () => {

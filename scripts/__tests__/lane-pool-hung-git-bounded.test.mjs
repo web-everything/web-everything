@@ -28,7 +28,8 @@
  * bare origin + reference checkout, no shared pool root), reused so provisioning the lane under test still uses
  * a REAL, unshimmed `git` — only the ONE probe command under test runs with the hung shim on `PATH`.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -62,12 +63,13 @@ function isAlive(pid) {
 
 let base, originDir, referenceDir, poolRoot, shimDir;
 
-beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'lane-pool-hung-git-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
-  poolRoot = join(base, 'pool');
-  shimDir = join(base, 'shimbin');
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-hung-git-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
 
   git(['init', '--quiet', '--bare', '--initial-branch=trunk', originDir]);
   git(['clone', '--quiet', originDir, referenceDir]);
@@ -77,6 +79,15 @@ beforeEach(() => {
   git(['add', 'file.txt'], referenceDir);
   git(['commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', originDir, 'HEAD:refs/heads/trunk'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
+beforeEach(() => {
+  base = mkdtempSync(join(tmpdir(), 'lane-pool-hung-git-'));
+  poolRoot = join(base, 'pool');
+  shimDir = join(base, 'shimbin');
 });
 
 afterEach(() => {
@@ -85,6 +96,7 @@ afterEach(() => {
   // life. SIGKILL is always effective (untrappable), so this can never itself hang.
   try { execFileSync('pkill', ['-KILL', '-f', join(shimDir, 'git')]); } catch { /* nothing to reap — the common case */ }
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=hunggit', '--branch=trunk', '--no-install'];

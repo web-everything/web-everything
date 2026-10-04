@@ -9,7 +9,8 @@
  *   smell. Real throwaway origin + reference checkout, private `LANE_POOL_ROOT`, fake `claude`/`lsof` on PATH
  *   (same fixture shape as `lane-pool-reclaim.test.mjs`).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -47,10 +48,27 @@ const watchReclaim = (lane) => defaultReclaimLane({
   exec: (cmd, argv, opts) => execFileSync(cmd, [...argv, ...poolArgs()], { ...opts, cwd: referenceDir, env: { ...opts.env, ...env } }),
 });
 
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-journal-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
+
+  git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
+  git(['clone', '--quiet', originDir, referenceDir]);
+  writeFileSync(join(referenceDir, 'file.txt'), 'v1\n');
+  git(['add', 'file.txt'], referenceDir);
+  commit(referenceDir, 'v1');
+  git(['push', '--quiet', 'origin', 'main'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
 beforeEach(() => {
   base = mkdtempSync(join(tmpdir(), 'lane-pool-journal-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
   poolRoot = join(base, 'pool');
   binDir = join(base, 'bin');
   mkdirSync(binDir);
@@ -61,17 +79,12 @@ beforeEach(() => {
   env = { ...process.env, LANE_POOL_ROOT: poolRoot, HOME: base, PATH: `${binDir}:${process.env.PATH}`, WE_LANE_SALVAGE_QUIET_MIN: '0' };
   delete env.LANE_JOURNAL_ACTOR;
 
-  git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
-  git(['clone', '--quiet', originDir, referenceDir]);
-  writeFileSync(join(referenceDir, 'file.txt'), 'v1\n');
-  git(['add', 'file.txt'], referenceDir);
-  commit(referenceDir, 'v1');
-  git(['push', '--quiet', 'origin', 'main'], referenceDir);
   expect(runPool(['provision', '--count=2', ...poolArgs()]).code).toBe(0);
 });
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 describe('lane lifecycle journal — acquire → reaper release → health-watch reclaim', () => {
