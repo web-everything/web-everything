@@ -103,6 +103,14 @@
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
+import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
+import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
+
+/** The ladder `planReconcile` uses when its caller supplies none: the platform default, Claude rungs only, no route
+ *  override (the IO shell, `reconcile-pass.mjs`, passes the loaded ladder with its routing-policy models). */
+const DEFAULT_FIXER_LADDER = Object.freeze({
+  policy: DEFAULT_FIXER_ESCALATION, routes: Object.freeze({}), available: (rung) => rung.provider !== 'codex',
+});
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
 import { reduceCheckState } from '../operations/pr-status.mjs';
@@ -1392,6 +1400,7 @@ export function missingReviewLabel(pr) {
 export function planReconcile({
   repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap = CI_HEAL_ROUND_CAP,
   conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP, defaultBranch = 'main',
+  fixerLadder = DEFAULT_FIXER_LADDER,
   mainRedWindows = [], mainLatestCheckRuns = [],
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — the repo's REQUIRED status-check names (branch
   // protection, `we:scripts/lib/required-status-checks.mjs`), threaded straight through to `classifyPr` so
@@ -1976,6 +1985,42 @@ export function planReconcile({
           why: `a required check is failing, nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`,
         });
       }
+      continue;
+    }
+
+    // ── RULING NOT ADDRESSED — ahead of the advisory-fix branch and of every review emission. A confirmed finding
+    // the operator already ruled `block` on an EARLIER head has come back on this one: the fixer's push did not
+    // satisfy the ruling (live 2026-10-04, PR #3794: card xcs4nce, policy pointer files). Parking it again only
+    // waits for the same human to repeat themselves, so it goes straight back to a fixer with the original ruling
+    // attached. How far up the fixer-escalation ladder it goes (resend, stronger model with a failing test first,
+    // cross-provider when available, then the operator as a needs-you note, an arbiter later) is the configured
+    // ladder's call, counted in heads it came back on plus fixer turns that ended without a new head.
+    if (phase === 'needs-human' && pr?.ignoredRulings?.matches?.length) {
+      const ig = pr.ignoredRulings;
+      const files = ig.matches.map((m) => m.finding.file ?? '(no file)');
+      // WHICH RUNG: the configured ladder (`we:scripts/lib/fixer-escalation-policy.mjs`) decides from how many heads the
+      // finding has come back on. Resend, then a stronger model with a failing test first, then cross-provider when
+      // that is available, then the operator. A send-back that came back with no new head is the operator's call too.
+      // `effectiveMisses` = heads it came back on + turns a fixer ended on this head without changing it.
+      const rung = pickRung(fixerLadder.policy, ig.effectiveMisses ?? ig.misses, { available: fixerLadder.available });
+      if (!rung || rung.action === 'needs-you') {
+        const trail = fixerLadder.policy.rungs.filter((r) => r.action === 'dispatch' && r.at < (ig.effectiveMisses ?? ig.misses)).map((r) => r.id).join(' > ');
+        refuse('ruling-dispute', {
+          ...withPhase, rulingNotAddressed: ig,
+          why: `${ig.matches.length} confirmed finding(s) the operator ruled block came back after ${ig.misses} miss(es)`
+            + `${ig.returns ? ` and ${ig.returns} fixer turn(s) ended without a new head` : ''} — fixer versus reviewer disagreement, needs the operator`,
+        });
+        notes.push({ kind: 'ruling-dispute', prNumber, head: ig.head, misses: ig.misses, rung: 'human', files,
+          text: rulingDisputeText(prNumber, { ...ig, escalate: true }, trail) });
+        continue;
+      }
+      const route = fixerLadder.routes?.[rung.id] ?? null;
+      dispatch.push({
+        ...base, ...withPhase, kind: 'fix', mode: 'ruling-not-addressed', findings: ig.matches.length,
+        rulingNotAddressed: { ...ig, rung: { id: rung.id, at: rung.at, label: rung.label, instruction: rung.instruction, taskType: rung.taskType, model: route?.model ?? null }, route },
+        why: `${ig.matches.length} confirmed finding(s) the operator already ruled block came back on a new head`
+          + ` (${files.join(', ')}) — the last fix did not satisfy the ruling; escalation rung ${rung.at} (${rung.id}): ${rung.label}`,
+      });
       continue;
     }
 

@@ -3,7 +3,11 @@
  * operator-queue owns readiness. Failure is never swallowed: swallowed stderr once
  * hid the drain daemon's fetch failure for 10 hours. All effects and time are injected.
  */
-export const itemKey = (row) => `${row.repo}#${row.number}`;
+// A parked review that needs a ruling is notified once per PR AND head: a new head is a new ask.
+export const itemKey = (row) => row.rulingHead
+  ? `${row.repo}#${row.number}@${String(row.rulingHead).slice(0, 9)}:ruling` : `${row.repo}#${row.number}`;
+export const rulingRows = (queue) => (Array.isArray(queue?.rulingNeeded) ? queue.rulingNeeded : [])
+  .map((r) => ({ ...r, rulingHead: r.head, title: String(r.title ?? '') }));
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const normalizedState = (state) => ({ notified: Object.fromEntries(
   object(state?.notified) ? Object.entries(state.notified).filter(([, entry]) => object(entry) && typeof entry.title === 'string') : [],
@@ -27,14 +31,17 @@ export function planNotifications({ ready, state, now }) {
   return { toNotify, nextState: { notified } };
 }
 
-export const notificationFor = (row) => ({ title: `Review needed: ${itemKey(row)}`, body: row.title });
+export const notificationFor = (row) => row.rulingHead
+  ? { title: `Ruling needed: ${row.repo}#${row.number}`,
+    body: `${row.findings.length} confirmed finding(s) wait on you: ${row.findings.map((f) => f.file ?? 'no file').join(', ')} — ${row.title}` }
+  : { title: `Review needed: ${itemKey(row)}`, body: row.title };
 
 export async function runOperatorNotify({ readQueue, readState, writeState, notify, now }) {
   let queue;
   try { queue = await readQueue(); }
   catch (error) { return { notified: [], failed: [], queueErrors: [errorText(error)], exitCode: 2 }; }
   const state = normalizedState(await readState());
-  const { toNotify, nextState } = planNotifications({ ready: queue.ready, state, now });
+  const { toNotify, nextState } = planNotifications({ ready: [...queue.ready, ...rulingRows(queue)], state, now });
   const queueErrors = queue.errors ?? [];
   if (queueErrors.length) nextState.notified = { ...state.notified, ...nextState.notified };
   const notified = [];
