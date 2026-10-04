@@ -103,7 +103,7 @@
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
-import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
+import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer, answerDisposition } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
 import { reduceCheckState } from '../operations/pr-status.mjs';
 import { isForeignCompletionSessionId } from '../operations/completion-record.mjs';
@@ -192,7 +192,7 @@ import {
 // gate below), so the review this pass would otherwise dispatch the moment CI finishes is instead HELD until
 // this fires and un-drafts it — closing the "6 of 26 PRs got reviewed before their own first CI run even
 // finished" measurement (operator, 2026-09-27) that motivated this whole feature.
-export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label']);
+export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label', 'close-superseded']);
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#REFUSAL_KINDS — every reason this pass declines to dispatch. Frozen and
@@ -1545,6 +1545,18 @@ export function planReconcile({
       refuse('fix-claimed', {
         who: pr.fixClaim.who, since: pr.fixClaim.claimedAt ?? null,
         why: `${pr.fixClaim.who} holds the fix claim${pr.fixClaim.why ? ` (${pr.fixClaim.why})` : ''} — nothing is dispatched until its fix-end`,
+      });
+      continue;
+    }
+
+    // ── #3850 — an operator DISPOSITION (stand-down-answer-core.mjs#answerDisposition) is executed by the
+    // conveyor, never handed to a fixer: fix-3850 read "close as superseded" as "delete the card's files", was
+    // denied, and ended blocked-on-infra with the PR still open. Checked after the live-claim refusal (never
+    // close a PR under a running fixer) and before every repair branch.
+    if (pr?.state === 'OPEN' && answerDisposition(operatorAnswer) === 'close-superseded') {
+      dispatch.push({
+        ...base, kind: 'close-superseded',
+        why: `the operator ruled this PR superseded (@${operatorAnswer.actor} via ${operatorAnswer.channel}) — close it, no fix agent`,
       });
       continue;
     }
