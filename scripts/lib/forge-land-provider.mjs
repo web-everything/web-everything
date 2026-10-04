@@ -50,6 +50,7 @@ import { assertMachineTitle } from '../operations/machine-pr-title.mjs';
  */
 
 import { runGhSync } from './gh-throttle.mjs';
+import { clampLabelDescription } from './review-label-provider.mjs';
 
 /** The `gh pr merge` method flag for a merge method (default merge = --no-ff history the drain wants). */
 export function mergeMethodFlag(method) {
@@ -126,7 +127,7 @@ export const GH_ARGV = Object.freeze({
    *  small, long-lived set (`ready-to-merge`, the review-escalation labels, a caller's `--park` label), created
    *  once and re-created best-effort (wrapped in a try/catch at every call site) rather than force-updated on
    *  every land. Byte-identical to the inline calls this replaces — adding `--force` would NOT be. */
-  labelCreate: (name, { color, description }) => ['label', 'create', name, '--color', color, '--description', description],
+  labelCreate: (name, { color, description }) => ['label', 'create', name, '--color', color, '--description', clampLabelDescription(description)],
   requiredChecks: (pr) => ['pr', 'checks', String(pr), '--required', '--json', 'state,bucket'],
 });
 

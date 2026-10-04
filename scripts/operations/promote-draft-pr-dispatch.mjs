@@ -172,7 +172,7 @@ export function runReconcilePromoteDraftDispatch({
   readPrLabels = defaultReadPrLabels,
   // #3902 — strips `ready-to-merge` when the STUCK restore variant applies its review hold.
   removeLabel = defaultRemoveLabel,
-  // #2811/#2821 follow-up — clear the now-stale `review-status:awaiting-ci` label the INSTANT a draft promotes,
+  // #2811/#2821 follow-up — clear the now-stale `review-status:awaiting-ci` / `review-status:awaiting-base` label the INSTANT a draft promotes,
   // never waiting on a different daemon's tick to notice `isDraft` flipped (mirrors `applyReviewStatus`'s own
   // "the daemon that changes the state applies its own tag right at the moment" convention, `review-status-
   // tag.mjs`'s own docblock). Best-effort: a failed clear never fails the promotion itself, and the periodic

@@ -3,19 +3,25 @@
 <plist version="1.0">
 <dict>
 	<!--
-	STAGED, NOT INSTALLED. Optional ~60s process sampling for heavy-run-ungated.
+	OFF by default: the health-watch tick samples every 5 min.
 	Uses the same wev-health-watch clone as com.we.health-watch; install dependencies there first.
 	Pin CONVEYOR_STATE_ROOT to the same root as the health watch. No GitHub calls or credentials.
-	INSTALL: copy to ~/Library/LaunchAgents/com.we.heavy-run-sample.plist, then load it with launchctl.
+	To enable: copy to ~/Library/LaunchAgents/com.we.heavy-run-sample.plist,
+	remove the Disabled key (or launchctl enable gui/$(id -u)/com.we.heavy-run-sample),
+	set WE_HEAVY_SAMPLE_INTERVAL_S to the desired interval in seconds (>= 10), then run:
+	launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.we.heavy-run-sample.plist
+	To disable: launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.we.heavy-run-sample.plist
 	-->
+	<key>Disabled</key>
+	<true/>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
 		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 		<key>CONVEYOR_STATE_ROOT</key>
 		<string>/Users/nicolasgilbert/workspace/webeverything</string>
-		<key>PASS_DAEMON_SELF_SYNC</key>
-		<string>1</string>
+		<key>WE_HEAVY_SAMPLE_INTERVAL_S</key>
+		<string>60</string>
 	</dict>
 	<key>KeepAlive</key>
 	<true/>
@@ -24,8 +30,8 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin/node</string>
-		<string>/Users/nicolasgilbert/workspace/wev-health-watch/skills-src/conveyor/pass-daemon.mjs</string>
-		<string>--pass=heavy-run-sample</string>
+		<string>/Users/nicolasgilbert/workspace/wev-health-watch/scripts/conveyor/heavy-run-ungated.mjs</string>
+		<string>loop</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

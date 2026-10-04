@@ -40,6 +40,15 @@ describe('GH_ARGV is byte-identical to the pre-port inline calls', () => {
     expect(GH_ARGV.requiredChecks(7)).toEqual(['pr', 'checks', '7', '--required', '--json', 'state,bucket']);
   });
 
+  it('clamps the ruling-needed description to GitHub’s limit', () => {
+    const description = 'AI review parked with confirmed findings that need an operator ruling on the current head (auto-managed)';
+    const argv = GH_ARGV.labelCreate('advisory:ruling-needed', { color: 'ededed', description });
+    const value = argv[argv.indexOf('--description') + 1];
+    expect(value.length).toBeLessThanOrEqual(100);
+    expect(value.endsWith('…')).toBe(true);
+    expect(value).toBe(description.slice(0, 99) + '…');
+  });
+
   it('re-exports the pre-existing pure builders unchanged', () => {
     expect(mergeMethodFlag('squash')).toBe('--squash');
     expect(buildCreateArgs({ base: 'main', head: 'lane/2153-x' })).toEqual(['pr', 'create', '--base', 'main', '--head', 'lane/2153-x', '--fill']);
