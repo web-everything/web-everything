@@ -908,7 +908,14 @@ const LANE_POOL_DEFAULT_SCAN_TIMEOUT_MS = 120_000;
 export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS } = {}) {
   if (!row || row.ok) return false;
   const detail = String(row.detail ?? '');
-  return ENV_TIMEOUT_PATTERNS.some((re) => re.test(detail)) && Number(row.ms) >= minElapsedMs;
+  if (!ENV_TIMEOUT_PATTERNS.some((re) => re.test(detail))) return false;
+  // `runBounded`'s OWN kill ("timed out after Nms (process group killed)") is the gate's clock, not tree text: the
+  // row really spent its whole cap N. A cheap probe has a cap far under the 30s floor (live 2026-10-03 22:01 ET,
+  // load 31 on 12 cores: `tree-stays-clean`'s `git status` hit its 10s cap), and the floor then read that
+  // load-induced kill as a code failure and rejected a good build. Judge such a kill against its own cap.
+  const killed = /timed out after (\d+)ms \(process group killed\)$/.exec(detail);
+  if (killed) return Number(row.ms) >= Math.min(minElapsedMs, Number(killed[1]) * 0.9);
+  return Number(row.ms) >= minElapsedMs;
 }
 
 /** PURE: is this a failure set the environment explains — at least one {@link isEnvTimeoutRow}, and every other

@@ -1240,6 +1240,15 @@ describe('a check that ran out of TIME under load is environment, never code (li
     expect(isEnvTimeoutFailureSet([row, { name: 'gh-api-repo', ok: true }])).toBe(true);
   });
 
+  it('a cheap probe killed at its OWN short cap under load is an env-timeout row (live 2026-10-03: tree-stays-clean 10s)', () => {
+    const killed = { name: 'tree-stays-clean', ok: false, ms: 10018, mayBeTransient: false, detail: 'git status --porcelain failed: timed out after 10000ms (process group killed)' };
+    expect(isEnvTimeoutRow(killed)).toBe(true);
+    // no laundering: a row that failed FAST with the same words did not spend its cap
+    expect(isEnvTimeoutRow({ ...killed, ms: 300 })).toBe(false);
+    // tree-printed text keeps the 30s floor
+    expect(isEnvTimeoutRow({ name: 'lane-pool-list', ok: false, ms: 10018, detail: 'lane-pool list failed: list --acquirable scan exceeded its 120000ms budget at lane-3' })).toBe(false);
+  });
+
   it('REPLAY end-to-end: times out twice (budgets widened on the retry) → verdict env-timeout, never code', async () => {
     const host = overloadedHost({ listMs: [120905, 300900], listFails: [true, true] });
     const r = await runLiveSmokeWithRetry({
