@@ -7,12 +7,13 @@
  */
 import { describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  DEFERRED_SCAN_TESTS, REPO_SCAN_TESTS, SCAN_FILES_ENV, SCAN_TEST_TAG,
-  scanCommands, scanScope, scopedScanFiles, selectScanTests,
+  DEFERRED_SCAN_TESTS, REPO_SCAN_TESTS, SCAN_FILES_ENV, SCAN_ROOT_ENV, SCAN_TEST_TAG,
+  scanCommands, scanRoot, scanScope, scopedScanFiles, selectScanTests,
 } from '../lib/repo-scan-tests.mjs';
 import { resolveDefaultGate } from '../lib/verify-lane-gate.mjs';
 
@@ -137,20 +138,39 @@ describe('guard: every repo-scanning test is marked or deferred with a reason', 
 // ── The #3887 regression, through the real scanning test ──────────────────────────────────────────────────
 describe('#3887 regression: a NEW file with a repo literal is caught by the verify scan', () => {
   const rel = 'scripts/lib/__verify-scan-regression-3887.mjs';
-  const run = (env) => spawnSync('npx', ['vitest', 'run', MULTI, '-t', 'keeps every scanned source', '--reporter=dot'], { cwd: root, encoding: 'utf8', env: { ...process.env, ...env } });
+  // The violating file lives ONLY in a throwaway tree (VERIFY_SCAN_ROOT): written into the live scripts/lib it would be
+  // visible, for the whole child vitest run, to any other worker scanning the real tree in parallel (PR #3890 review).
+  const run = (scanDir) => spawnSync('npx', ['vitest', 'run', MULTI, '-t', 'keeps every scanned source', '--reporter=dot'], {
+    cwd: root, encoding: 'utf8',
+    env: { ...process.env, [SCAN_FILES_ENV]: JSON.stringify([rel]), [SCAN_ROOT_ENV]: scanDir },
+  });
+
+  it('the scan root override is how a fixture stays out of the live tree', () => {
+    expect(scanRoot('/live', {})).toBe('/live');
+    expect(scanRoot('/live', { [SCAN_ROOT_ENV]: '' })).toBe('/live');
+    expect(scanRoot('/live', { [SCAN_ROOT_ENV]: '/tmp/fixture' })).toBe('/tmp/fixture');
+  });
 
   it('the gate selects the scan for the new file, and the scoped real test fails on it', () => {
-    const abs = join(root, rel);
+    const fixture = mkdtempSync(join(tmpdir(), 'verify-scan-3887-'));
     try {
-      writeFileSync(abs, "export const slug = 'frontier-ui/frontierui';\n");
-      const cmds = scanCommands({ changedFiles: [rel] });
-      expect(cmds[0]).toContain(JSON.stringify([rel]));
-      const scoped = run({ [SCAN_FILES_ENV]: JSON.stringify([rel]) });
+      // isolation: the fixture is outside the checkout, and the file never exists in the live tree
+      expect(relative(root, fixture).startsWith('..')).toBe(true);
+      mkdirSync(join(fixture, 'scripts/lib'), { recursive: true });
+      writeFileSync(join(fixture, 'scripts/lib/we-only-checks.json'), '[]\n');
+      writeFileSync(join(fixture, rel), "export const slug = 'frontier-ui/frontierui';\n");
+      expect(existsSync(join(root, rel))).toBe(false);
+
+      expect(scanCommands({ changedFiles: [rel] })[0]).toContain(JSON.stringify([rel]));
+      const scoped = run(fixture);
       expect(scoped.status, scoped.stdout + scoped.stderr).not.toBe(0);
       expect(scoped.stdout + scoped.stderr).toContain(rel);
-    } finally { rmSync(abs, { force: true }); }
-    // and with the offending file gone the same scoped scan is green (the failure was the file, not the scoping)
-    const clean = run({ [SCAN_FILES_ENV]: JSON.stringify([rel]) });
-    expect(clean.status, clean.stdout + clean.stderr).toBe(0);
+      expect(existsSync(join(root, rel))).toBe(false);
+
+      // and with the offending file gone the same scoped scan is green (the failure was the file, not the scoping)
+      rmSync(join(fixture, rel));
+      const clean = run(fixture);
+      expect(clean.status, clean.stdout + clean.stderr).toBe(0);
+    } finally { rmSync(fixture, { recursive: true, force: true }); }
   }, 60_000);
 });

@@ -7,18 +7,22 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isScannedFile, SCAN_ROOTS, scanMultiRepo, validateAllowlist } from '../lib/multi-repo-scan.mjs';
-import { scanScope } from '../lib/repo-scan-tests.mjs';
+import { scanRoot, scanScope } from '../lib/repo-scan-tests.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const read = (file) => readFileSync(resolve(root, file), 'utf8');
 // Scoped (verify): scan only the changed files that still exist; a deleted file's allowlist entry is still judged
 // (it is in the scope but not in `sources`, so validateAllowlist reports it missing). Unscoped: the whole tree.
+// The sources come from `scanDir` (the live checkout unless VERIFY_SCAN_ROOT names a throwaway tree — the #3887
+// regression test uses one so its violating file is never visible to a concurrent worker scanning the real tree).
 const scope = scanScope();
+const scanDir = scanRoot(root);
+const readScanned = (file) => readFileSync(resolve(scanDir, file), 'utf8');
 const sources = new Map((scope
-  ? [...scope].filter((file) => isScannedFile(file) && existsSync(resolve(root, file)))
-  : SCAN_ROOTS.flatMap((dir) => readdirSync(resolve(root, dir), { recursive: true }).map((name) => `${dir}/${name}`).filter(isScannedFile))
-).map((file) => [file, read(file)]));
-const allowlist = JSON.parse(read('scripts/lib/we-only-checks.json')).filter(({ file }) => !scope || scope.has(file));
+  ? [...scope].filter((file) => isScannedFile(file) && existsSync(resolve(scanDir, file)))
+  : SCAN_ROOTS.flatMap((dir) => readdirSync(resolve(scanDir, dir), { recursive: true }).map((name) => `${dir}/${name}`).filter(isScannedFile))
+).map((file) => [file, readScanned(file)]));
+const allowlist = JSON.parse(readScanned('scripts/lib/we-only-checks.json')).filter(({ file }) => !scope || scope.has(file));
 
 it('keeps every scanned source repo-explicit or specifically allowlisted', () => {
   expect(validateAllowlist(allowlist, sources)).toEqual([]);

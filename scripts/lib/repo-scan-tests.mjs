@@ -23,7 +23,14 @@
 /** Env var carrying the changed-file list (JSON array of repo-relative paths) a `scope: 'files'` scanner honours. */
 export const SCAN_FILES_ENV = 'VERIFY_SCAN_FILES';
 
-const SOURCE_EXT = /\.(mjs|cjs|js|ts|mts|cts)$/;
+/**
+ * Env var naming the directory a `scope: 'files'` scanner reads its sources from, instead of the live checkout. A test
+ * that needs to prove the scanner catches a violating file points it at a throwaway tree, so the violation never
+ * exists in the real tree where a concurrently running scanner (another vitest worker) could read it.
+ */
+export const SCAN_ROOT_ENV = 'VERIFY_SCAN_ROOT';
+
+const SOURCE_EXT =/\.(mjs|cjs|js|ts|mts|cts)$/;
 const inTree = (file, roots) => roots.some((r) => file.startsWith(`${r}/`));
 const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|$)/.test(file);
 
@@ -124,6 +131,12 @@ export function scanScope(env = process.env) {
   const parsed = JSON.parse(raw);
   if (!Array.isArray(parsed) || parsed.some((p) => typeof p !== 'string')) throw new Error(`${SCAN_FILES_ENV} must be a JSON array of paths`);
   return new Set(parsed);
+}
+
+/** The directory a scanner reads sources from: {@link SCAN_ROOT_ENV} when set, else `defaultRoot` (the live checkout). */
+export function scanRoot(defaultRoot, env = process.env) {
+  const raw = env?.[SCAN_ROOT_ENV];
+  return raw === undefined || raw === '' ? defaultRoot : raw;
 }
 
 /** Narrow `files` (repo-relative) to the scan scope; unchanged when the scope is `null` (full scan). */
