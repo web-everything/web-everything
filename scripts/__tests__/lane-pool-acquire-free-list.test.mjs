@@ -17,7 +17,8 @@
  *   - a MISSING list is a pure no-op — acquire falls back to the scan exactly like before this feature existed;
  *   - `--no-free-list` opts out even when a fresh, valid list is sitting right there.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, mkdirSync, existsSync, readFileSync, chmodSync, realpathSync } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
@@ -68,10 +69,27 @@ function writeFreeList({ lanes, writtenAt = Date.now() }) {
   writeFreeLaneListAtomic(resolveFreeLaneListPath({ repoName: NAME, poolDir }), list);
 }
 
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-acquire-free-list-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
+
+  git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
+  git(['clone', '--quiet', originDir, referenceDir]);
+  writeFileSync(join(referenceDir, 'file.txt'), 'v1\n');
+  git(['add', 'file.txt'], referenceDir);
+  git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], referenceDir);
+  git(['push', '--quiet', 'origin', 'main'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
 beforeEach(() => {
   base = mkdtempSync(join(tmpdir(), 'lane-pool-acquire-free-list-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
   poolRoot = join(base, 'pool');
   shimDir = join(base, 'shim');
   traceLog = join(base, 'git-trace.log');
@@ -83,17 +101,11 @@ beforeEach(() => {
     `#!/bin/sh\nprintf '%s\\t%s\\t%s\\n' "$(pwd -P)" "\${GIT_OPTIONAL_LOCKS:-}" "$*" >> "$GIT_TRACE_LOG"\nexec "${REAL_GIT}" "$@"\n`,
   );
   chmodSync(join(shimDir, 'git'), 0o755);
-
-  git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
-  git(['clone', '--quiet', originDir, referenceDir]);
-  writeFileSync(join(referenceDir, 'file.txt'), 'v1\n');
-  git(['add', 'file.txt'], referenceDir);
-  git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], referenceDir);
-  git(['push', '--quiet', 'origin', 'main'], referenceDir);
 });
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 describe('#4122 acquire consumes the free-lane list', () => {
