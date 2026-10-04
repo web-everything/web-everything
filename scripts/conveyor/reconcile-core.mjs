@@ -1683,7 +1683,14 @@ export function planReconcile({
     // fixer, an advisory-fix PR), falls through so its repair ownership is intact; review emission is
     // already gated separately by {@link reviewChecksAllow}.
     const reviewCi = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup });
-    if (phase === 'ci-red' && reviewCi.reason === 'required-review-gate-conflict'
+    // LIVE INCIDENT 2026-10-04, PR #3833: `classifyPr` ranks `review:human` ('needs-human') ABOVE `ci-red`, so a
+    // `review:human` PR with a genuinely red required check never entered the `ci-red` branch below — the
+    // main-red watch logged "owed a ci-heal" and the review row logged `review-ci`, and NOBODY planned the heal
+    // (9 h, zero dispatches). A CI repair is not a review decision: ci-heal never touches a `review:*` label, so
+    // the human hold must not exclude it. Only a COMPLETED red (`check.state === 'red'`) opts a needs-human PR in —
+    // pending/unchecked stay with the review path exactly as before.
+    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red');
+    if (ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
       continue;
@@ -1699,7 +1706,7 @@ export function planReconcile({
     // is owed from the PR alone, and leaves "can this repo's worker actually do it" to the dispatcher that
     // reads this plan (`we:scripts/operations/ci-heal-pr-dispatch.mjs#runReconcileCiHealDispatch`, mirroring
     // `reconcile-fix-dispatch.mjs#runReconcileFixDispatch`'s own capability gate for `fix`).
-    if (phase === 'ci-red') {
+    if (ciRepairOwed) {
       // we:backlog/x9wz0ir-*.md (#4075/#3383) — LIVE INCIDENT 2026-09-25: PRs #2635/#2636 are BOTH `owed-ci-
       // rerun` (their required check failed inside one of `main`'s own red windows) AND `mergeStateStatus:
       // 'DIRTY'` (real conflicts with `main`, confirmed live via `gh pr view --json mergeStateStatus,mergeable`

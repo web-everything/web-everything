@@ -786,6 +786,31 @@ describe('case 5e — ci-heal dispatch, capped by the durable heal-mark count, n
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 2602 })]);
   });
 
+  // LIVE INCIDENT 2026-10-04, PR #3833 (web-everything/web-everything): `review:human` + `ci:failed`, a red required
+  // `test` that was NOT this PR's own code. `classifyPr` ranks `review:human` ('needs-human') ABOVE `ci-red`, so
+  // this branch never ran: the PR logged "owed a ci-heal" for 9 hours and no ci-heal was ever planned. A CI
+  // repair is not a review decision — the human hold must not exclude it.
+  it('a `review:human` PR with a red required check IS dispatched `ci-heal` (a CI repair is not a review decision)', () => {
+    const plan = planReconcile({ prs: [prRed({ labels: lbl('review:human', 'ci:failed') })], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 2602, attempts: 0 })]);
+    expect(plan.refusals.filter((r) => r.kind === 'review-ci')).toEqual([]);
+  });
+
+  it('a `review:human` PR whose red check is ONLY review-gate is still not healed', () => {
+    const plan = planReconcile({
+      prs: [prRed({ labels: lbl('review:human'), statusCheckRollup: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] })],
+      agents: [], now: NOW, requiredChecks: ['review-gate'],
+    });
+    expect(plan.dispatch.filter((d) => d.kind === 'ci-heal')).toEqual([]);
+  });
+
+  it('a `review:human` PR at the heal cap surfaces `ci-heal-exhausted`, never a silent stall', () => {
+    const comments = Array.from({ length: CI_HEAL_ROUND_CAP }, () => ({ body: buildCiHealComment({ reason: 'red-ci' }), author: AUTOMATION }));
+    const plan = planReconcile({ prs: [prRed({ labels: lbl('review:human'), comments })], agents: [], now: NOW });
+    expect(plan.dispatch).toHaveLength(0);
+    expect(plan.notes).toEqual([expect.objectContaining({ kind: 'ci-heal-exhausted', prNumber: 2602 })]);
+  });
+
   it(`the durable heal-mark count is read from the PR's OWN comments — ${CI_HEAL_ROUND_CAP - 1} prior heals still dispatches`, () => {
     const comments = Array.from({ length: CI_HEAL_ROUND_CAP - 1 }, () => ({ body: buildCiHealComment({ reason: 'red-ci' }), author: AUTOMATION }));
     expect(comments[0].body.startsWith(CI_HEAL_COMMENT_MARKER)).toBe(true);
