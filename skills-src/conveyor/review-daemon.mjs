@@ -431,6 +431,15 @@ export function runReviewTick({
 export const REVIEW_DAEMON_REPOS = Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
 
 /**
+ * App auth for this daemon is PER-OWNER: it sweeps every constellation repo in one process, and each org has its
+ * own App installation. Pinning ONE installation's token in GH_TOKEN (the old default) made every call to a repo
+ * outside that org fail with GraphQL "Could not resolve to a Repository" — live 2026-10-04, plateauapp/plateau-app
+ * #202 skipped every pass as `review-ci: unreadable-ci` while its CI was green. Per-owner leaves GH_TOKEN unset and
+ * routes `gh` through the shim, which picks each call's token by the target repo's owner (as the drain does).
+ */
+export const REVIEW_DAEMON_APP_AUTH_OPTS = Object.freeze({ log: console, perOwner: true });
+
+/**
  * Run {@link runReviewTick} once per watched repo, isolating one repo's failure from the rest — a plateau-app
  * `gh` outage (or a rate limit, or a repo with zero open PRs) must never stop WE's own reviews from being
  * dispatched, the same "one bad entry never aborts the rest" discipline `runReviewTick` already applies
@@ -912,7 +921,7 @@ async function main() {
   // early; the interval stays as the safety net. This daemon also forwards drain-relevant events to the drain
   // daemon's localhost POST /nudge — one forwarder, so the drain wakes on events without its own feed client.
   const { stoppedReason } = await runDaemonLoop(
-    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner })), {
+    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner }), REVIEW_DAEMON_APP_AUTH_OPTS), {
       root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
     }), { role: 'review', repos: REVIEW_DAEMON_REPOS, forward: [makeDrainNudgeForward()] }),
   );
