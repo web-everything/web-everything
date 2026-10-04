@@ -2601,9 +2601,11 @@ function printStatus(repo) {
   // Host churn cut (2026-10-04): `--max-age-ms=N` / env WE_LANE_STATUS_MAX_AGE_MS (default 0 = always probe
   // fresh, today's behaviour) lets a display-only reader reuse a recent, signature-matched probe.
   const maxAgeMs = resolveStatusMaxAgeMs(flags['max-age-ms']);
-  const statusCache = { maxAgeMs, cache: maxAgeMs > 0 ? readStatusCache(repo.poolDir) : { lanes: {} }, updates: {} };
+  // Only an opted-in call reads OR writes the cache: a default `status` stays strictly read-only (stale-state and
+  // other readers pin "writes no state"), so the cache is shared among the opted-in display readers only.
+  const statusCache = maxAgeMs > 0 ? { maxAgeMs, cache: readStatusCache(repo.poolDir), updates: {} } : null;
   const rows = existingLanes(repo).map((n) => laneStatus(repo, n, { leasedOnly, statusCache }));
-  writeStatusCache(repo.poolDir, statusCache.updates);
+  if (statusCache) writeStatusCache(repo.poolDir, statusCache.updates);
   if (flags.json) {
     process.stdout.write(JSON.stringify({ repo: repo.name, root: repo.poolDir, leasedOnly, lanes: rows }, null, 2) + '\n');
     return;

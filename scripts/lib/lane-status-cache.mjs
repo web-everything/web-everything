@@ -7,8 +7,9 @@
  *   constellation pool, every read), the three pool health-watches, conveyor-state, the dispatch daemons. That
  *   made it the single largest `git` caller on the host (`fs_usage`: git 560k fs events / 10 s).
  *
- *   Every full probe now RECORDS its per-lane answer here, and a caller that opts in (`--max-age-ms=N`, or env
- *   `WE_LANE_STATUS_MAX_AGE_MS`) may REUSE a row instead of re-probing, but only when BOTH hold:
+ *   A caller that opts in (`--max-age-ms=N`, or env `WE_LANE_STATUS_MAX_AGE_MS`) RECORDS its per-lane probes here
+ *   and may REUSE a row instead of re-probing, but only when BOTH hold (a default call neither reads nor writes
+ *   the file — plain `status` stays strictly read-only):
  *     1. the row is younger than the caller's max age, and
  *     2. the lane's cheap git SIGNATURE is unchanged — `.git/HEAD`'s content plus the stat (mtime/size/inode)
  *        of `.git/index`, the checked-out branch ref, `refs/remotes/origin/<branch>`, and `packed-refs`. Any

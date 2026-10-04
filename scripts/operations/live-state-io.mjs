@@ -84,10 +84,11 @@ export function readLanePoolStatus(repoKey, { execFn = execFileSync, cwd = ROOT,
  * publishers read it every 120 s, once per constellation pool — ~28 s of `git status` over 90 lanes each time);
  * it never acts on a lane. Any git-level change (commit/checkout/reset/fetch/add) still invalidates a row
  * immediately; only an un-staged working-tree edit can lag in the dirty COUNT, by at most this window. Default
- * 120 s = the publishers' own read cadence. `0` restores the always-fresh probe.
+ * 180 s = the publishers' 120 s read cadence plus one ~30-60 s scan, so each read can reuse the previous one's
+ * rows (the cache is shared only among opted-in callers). `0` restores the always-fresh probe.
  */
 export const LIVE_STATE_LANE_STATUS_MAX_AGE_ENV = 'WE_LIVE_STATE_LANE_STATUS_MAX_AGE_MS';
-export const DEFAULT_LIVE_STATE_LANE_STATUS_MAX_AGE_MS = 120_000;
+export const DEFAULT_LIVE_STATE_LANE_STATUS_MAX_AGE_MS = 180_000;
 export function resolveLiveStateLaneStatusMaxAgeMs(env = process.env) {
   const raw = env[LIVE_STATE_LANE_STATUS_MAX_AGE_ENV];
   const n = raw === undefined || raw === '' ? NaN : Number(raw);

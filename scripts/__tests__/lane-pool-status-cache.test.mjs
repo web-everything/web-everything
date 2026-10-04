@@ -59,7 +59,7 @@ afterEach(() => { rmSync(base, { recursive: true, force: true }); });
 
 describe('status --max-age-ms (host churn cut)', () => {
   it('reuses a signature-matched probe inside the window: zero git spawns in any lane', () => {
-    const first = runPool(['status', ...poolArgs(), '--json']);
+    const first = runPool(['status', ...poolArgs(), '--json', '--max-age-ms=600000']);
     expect(first.code).toBe(0);
     resetLog();
     const second = runPool(['status', ...poolArgs(), '--json', '--max-age-ms=600000']);
@@ -69,15 +69,19 @@ describe('status --max-age-ms (host churn cut)', () => {
     expect(strip(second.out)).toEqual(strip(first.out));
   });
 
-  it('default (no flag, no env) still probes every lane fresh — today\'s behaviour', () => {
+  it('default (no flag, no env) still probes every lane fresh and writes nothing — today\'s behaviour', () => {
+    expect(runPool(['status', ...poolArgs(), '--json', '--max-age-ms=600000']).code).toBe(0);
+    rmSync(join(poolRoot, 'stcache', '.lane-status-cache.json'));
     expect(runPool(['status', ...poolArgs(), '--json']).code).toBe(0);
+    expect(existsSync(join(poolRoot, 'stcache', '.lane-status-cache.json'))).toBe(false);
+    expect(runPool(['status', ...poolArgs(), '--json', '--max-age-ms=600000']).code).toBe(0);
     resetLog();
     expect(runPool(['status', ...poolArgs(), '--json']).code).toBe(0);
     for (let n = 1; n <= N; n++) expect(spawnsIn(n).some((l) => l.includes('status --porcelain'))).toBe(true);
   });
 
   it('a commit in a lane invalidates its row at once, even inside the window', () => {
-    expect(runPool(['status', ...poolArgs(), '--json']).code).toBe(0);
+    expect(runPool(['status', ...poolArgs(), '--json', '--max-age-ms=600000']).code).toBe(0);
     const d = laneDirOf(2);
     git(['config', 'user.email', 't@t.com'], d);
     git(['config', 'user.name', 't'], d);
@@ -93,7 +97,7 @@ describe('status --max-age-ms (host churn cut)', () => {
   });
 
   it('env WE_LANE_STATUS_MAX_AGE_MS is the same knob as the flag', () => {
-    expect(runPool(['status', ...poolArgs(), '--json']).code).toBe(0);
+    expect(runPool(['status', ...poolArgs(), '--json'], { WE_LANE_STATUS_MAX_AGE_MS: '600000' }).code).toBe(0);
     resetLog();
     expect(runPool(['status', ...poolArgs(), '--json'], { WE_LANE_STATUS_MAX_AGE_MS: '600000' }).code).toBe(0);
     for (let n = 1; n <= N; n++) expect(spawnsIn(n)).toEqual([]);
