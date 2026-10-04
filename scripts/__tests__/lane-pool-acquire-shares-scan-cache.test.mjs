@@ -18,7 +18,8 @@
  *     --scan-timeout-ms=<S>` return within `W + S` plus slack, never anywhere near the unbounded cost a full
  *     rescan-per-tick would take — the exact "the 30s wait doesn't bound the scan" failure mode this closes.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, spawn, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, mkdirSync, existsSync, readFileSync, chmodSync, realpathSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -66,10 +67,27 @@ const resetTrace = () => rmSync(traceLog, { force: true });
 const laneGitCalls = () => trace().filter((t) => t.cwd.startsWith(realpathSync(pool()) + '/lane-'));
 const dirty = (n) => writeFileSync(join(lanePath(n), 'file.txt'), 'v1\nUNCOMMITTED\n');
 
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-acquire-cache-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
+
+  git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
+  git(['clone', '--quiet', originDir, referenceDir]);
+  writeFileSync(join(referenceDir, 'file.txt'), 'v1\n');
+  git(['add', 'file.txt'], referenceDir);
+  git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], referenceDir);
+  git(['push', '--quiet', 'origin', 'main'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
 beforeEach(() => {
   base = mkdtempSync(join(tmpdir(), 'lane-pool-acquire-cache-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
   poolRoot = join(base, 'pool');
   shimDir = join(base, 'shim');
   traceLog = join(base, 'git-trace.log');
@@ -82,17 +100,11 @@ beforeEach(() => {
       `if [ -n "$GIT_SHIM_SLEEP" ]; then sleep "$GIT_SHIM_SLEEP"; fi\nexec "${REAL_GIT}" "$@"\n`,
   );
   chmodSync(join(shimDir, 'git'), 0o755);
-
-  git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
-  git(['clone', '--quiet', originDir, referenceDir]);
-  writeFileSync(join(referenceDir, 'file.txt'), 'v1\n');
-  git(['add', 'file.txt'], referenceDir);
-  git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], referenceDir);
-  git(['push', '--quiet', 'origin', 'main'], referenceDir);
 });
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 describe('#3383 acquire auto-pick shares the single-flight scan under concurrency', () => {

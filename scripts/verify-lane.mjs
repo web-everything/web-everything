@@ -264,7 +264,7 @@ if (typeof flags.gate === 'string') {
     // Only a KNOWN diff whose selection is blocked counts; an unresolvable diff (no `origin/main`) is unchanged.
     let defaultBlocked = false;
     try {
-      const { decision } = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts() });
+      const { decision } = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)) });
       defaultBlocked = decision.mode === 'blocked' && Array.isArray(decision.changedFiles) && decision.changedFiles.length > 0;
     } catch { /* cannot tell ⇒ unchanged behaviour */ }
     const refusal = defaultBlocked ? explicitGateRefusal(GATE) : null;
@@ -279,7 +279,7 @@ if (typeof flags.gate === 'string') {
     }
   }
 } else {
-  const resolved = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts() });
+  const resolved = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)) });
   if (resolved.decision.mode === 'blocked') emit({ sha: headSha, status: 'selection-required', reason: 'local-selection-bound', ok: false, detail: describeGate(resolved) }, 3);
   GATE = resolved.command;
   resolvedGate = resolved;
@@ -292,7 +292,7 @@ if (typeof flags.gate === 'string') {
 // without interpreting arbitrary shell overrides or accidentally skipping their remaining steps.
 if (!resolvedGate && typeof flags.gate === 'string') {
   try {
-    const resolved = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts() });
+    const resolved = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)) });
     if (resolved.command === GATE) resolvedGate = resolved;
   } catch { /* Unknown selection cannot authorize a retry. */ }
 }
@@ -466,6 +466,15 @@ try {
       // Exact file filters, one worker, no related traversal, no passWithNoTests, and no second attempt.
       result = await runGate('npx', ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism',
         ...retriedTimeouts.map(file => `./${file}`)]);
+    }
+  }
+  // #3887 — the repo-scanning tests `vitest related` cannot select, scoped to the changed files (each command carries
+  // its own VERIFY_SCAN_FILES). Before check:standards, so a scanner failure is reported with the tests.
+  if (retryableGate && result.exitCode === 0) {
+    for (const scanCommand of resolvedGate.scanCommands ?? []) {
+      process.stderr.write(`⏱ repo-scanning tests (scoped to changed files): ${scanCommand.replace(/^VERIFY_SCAN_FILES='[^']*'/, 'VERIFY_SCAN_FILES=<changed files>')}\n`);
+      result = await runGate(scanCommand);
+      if (result.exitCode !== 0) break;
     }
   }
   if (retryableGate && result.exitCode === 0 && resolvedGate.standardsCommand) {

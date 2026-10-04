@@ -14,9 +14,11 @@
  *   the before/after run). The allowlist below is deliberately narrow and named per file, so it cannot
  *   silently swallow a new, unrelated offender.
  */
+/** @repo-scanning-test scope=files — see scripts/lib/repo-scan-tests.mjs (verify scopes it via VERIFY_SCAN_FILES, #3887). */
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { scanScope } from '../repo-scan-tests.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findSearchBackedGhListCalls, filterOpenPrsByLabel, OPEN_PR_LIST_LIMIT } from '../no-search-backed-pr-list.mjs';
@@ -43,8 +45,12 @@ const ALLOWLIST = {
 };
 
 function trackedSourceFiles() {
+  const keep = (f) => /\.(mjs|js)$/.test(f) && !/\/__tests__\/|\/__fixtures__\//.test(f);
+  // Scoped (verify, #3887): the changed files themselves — `git ls-files` cannot see a brand-new untracked file.
+  const scope = scanScope();
+  if (scope) return [...scope].filter((f) => /^(scripts|skills-src)\//.test(f) && keep(f) && existsSync(join(ROOT, f)));
   const out = execFileSync('git', ['ls-files', 'scripts', 'skills-src'], { cwd: ROOT, encoding: 'utf8' });
-  return out.split('\n').filter((f) => /\.(mjs|js)$/.test(f) && !/\/__tests__\/|\/__fixtures__\//.test(f));
+  return out.split('\n').filter(keep);
 }
 
 describe('no-search-backed-pr-list (#no-label-search)', () => {

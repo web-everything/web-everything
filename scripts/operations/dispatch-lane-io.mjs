@@ -138,6 +138,7 @@ import {
 // rather than from `claude agents --json`, which never heard of it; `deliveryDispatchLogPath` names where its
 // narration went for the observer's `unresolved` message. See {@link isDispatchHandleLive}.
 import { DETACHED_HANDLE_PREFIX, defaultIsPidAlive, deliveryDispatchLogPath, detachedHandlePid } from './detached-dispatch.mjs';
+import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
 
 /**
  * The three native Claude model ids {@link ../lib/dispatch-contracts.mjs#CLAUDE_NATIVE_MODEL_BY_TIER} maps to
@@ -1552,7 +1553,7 @@ export function createDispatchSinks({
         // observed. The replay guard refuses it and `inFlightEntries` reports it under `unknown`, which is
         // exactly right — a person finds out what happened and closes it out.
         throw new Error(
-          `claude --bg failed and whether an agent started is UNKNOWN: ${String((e && e.message) || e).split('\n')[0]}`,
+          `claude --bg failed and whether an agent started is UNKNOWN: ${describeDispatchFailure(e)}`,
         );
       }
       const minutes = Number(payload.expectedWithinMinutes) > 0
