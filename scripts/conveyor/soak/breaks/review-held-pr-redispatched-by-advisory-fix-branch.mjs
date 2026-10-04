@@ -56,7 +56,7 @@ process.stdout.write(JSON.stringify(out));
 export default {
   id: 'review-held-pr-redispatched-by-advisory-fix-branch',
   title: 'a PR held for unanswered mandatory referrals is re-reviewed every tick on an unchanged head through the advisory-fix review branches',
-  card: 'card xuxcsw6; live incident PR #3771, 2026-10-04 03:50-04:05Z (follow-up to #4918)',
+  card: 'card 5049; live incident PR #3771, 2026-10-04 03:50-04:05Z (follow-up to #4918)',
   fixedBy: { sha: '0dd46f7b3', where: 'lane/xuxcsw6-referral-hold-all-review-branches', paths: ['scripts/conveyor/reconcile-core.mjs'] },
   fixPresent(root) {
     const p = join(root, 'scripts/conveyor/reconcile-core.mjs');
