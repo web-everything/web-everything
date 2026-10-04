@@ -133,7 +133,10 @@ export function claimedNumsFromTranscript(path) {
  *  means resolver 4 simply finds nothing, never that the whole read fails. */
 export function readLaneLeases({ run = execFileSync, root = REPO_ROOT } = {}) {
   try {
-    const out = run(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'status', '--json'], {
+    // Host churn cut (2026-10-04): `--leased-only` (#4345) — this reader only projects each row's raw `lease`,
+    // which `--leased-only` reports identically for EVERY row (leased or not); it just skips the full git probe
+    // (`git status` over ~10k files) for the ~75 of 90 lanes with no live lease. Runs on every wip-publisher read.
+    const out = run(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'status', '--json', '--leased-only'], {
       cwd: root, encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024,
       env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
     });
