@@ -45,6 +45,12 @@ story does not edit that file, but its replay test reuses the refusal fixture sh
    was a refusal, record `drain-step-ok` for it. This lets the smell close.
 4. **Cover the other silent step.** Do the same for resolve-on-land failures (`resolveOnLandReport.failed`,
    declared at `we:scripts/merge-ai-prs.mjs:5650`), with subject `resolve-on-land`.
+   - **Subjects are an open set, with the same recovery rule.** Other drain stories raise this alert for a
+     step they cannot run safely, each under its own subject: `main-state-read` (story #xca0u65, the main-run
+     read failed) and `recheck-state` (story #xi8vgqq, the re-check counter could not be read or written).
+     Each uses the same event pair: `drain-step-refused` when the step refuses, and `drain-step-ok` the next
+     time that subject's step runs cleanly after a refusal, so its episode closes like the other two. The
+     helper that records the pair takes the subject as an argument and holds no fixed list.
 5. **Probe and smell.** Add one probe line, `probes.policyEvents = readPolicyEvents({ sinceMs: 24h })`, beside
    the existing probes (`we:scripts/conveyor/health-watch.mjs:735-812`). Other policy smells reuse it. Add
    `we:scripts/conveyor/health-smells/drain-step-refused.mjs`:
@@ -72,6 +78,8 @@ tick, and the smell names the cause.
   - Default (no config): behaves as `alert`.
   - After a refusal, a clean run records `drain-step-ok` once. A second clean run records nothing.
   - A resolve-on-land failure records an event with subject `resolve-on-land`.
+  - An arbitrary subject (`main-state-read`) records `drain-step-refused`, then `drain-step-ok` after a clean
+    run, and the smell's episode for it closes. The smell lists a subject it has never heard of.
   - **Replay of 2026-10-03:** in a temp git repo, commit a pending card `xhash01-alpha` and a script outside the rewrite
     scope that cites that card by its hash-named backlog path (the refusal fixture from
     `we:scripts/__tests__/lane-drain-numbering.test.mjs`). Run the step. Before this story: the result has

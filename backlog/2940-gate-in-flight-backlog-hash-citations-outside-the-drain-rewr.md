@@ -54,16 +54,30 @@ run.
 2. **Caused vs inherited: only a refusal this PR causes is an error.** The strand rule was deliberately
    relaxed in PR CI and in lanes because erroring on a condition already on main wedged `verify-lane` for
    every lane and turned each pre-existing strand into a red test for an unrelated PR (see the comment at
-   `we:scripts/check-standards-rules.mjs:2860-2868`). This rule keeps that lesson. Each refusal `{ file, hash }`
-   is **caused** by the PR when `file` is among the PR's changed files (`git diff --name-only <baseRef>...HEAD`)
-   or `hash` names a pending card the PR adds or edits. Otherwise it is **inherited**.
+   `we:scripts/check-standards-rules.mjs:2860-2868`). This rule keeps that lesson, and decides "caused" **by
+   difference, not by which files the PR touched**. The rule runs the dry run twice: once on the **base tree**
+   (`baseRef`, checked out read-only into a temp worktree, running the base's own `we:scripts/lane-drain.mjs`)
+   and once on the merged tree it is judging (running the PR's `we:scripts/lane-drain.mjs`). A refusal
+   `{ file, hash }` in the merged result is **caused** when it is not in the base result. If the base run did
+   not refuse at all and the merged run does, every merged refusal is caused. A refusal is **also** caused
+   when its `file` is among the PR's changed files (`git diff --name-only <baseRef>...HEAD`) or its `hash`
+   names a pending card the PR adds or edits: a PR that touches a refusing file owns it. Otherwise it is
+   **inherited**. The file-in-the-diff test alone is not enough, because a PR can cause a refusal **without touching the
+   refusing file**: it narrows the drain's rewrite scope, edits the refusal logic in
+   `we:scripts/lane-drain.mjs`, or moves or renames the scope constant, and citations already on main start
+   refusing though neither they nor their cards are in `git diff --name-only`. The differential catches all of
+   these, because it compares what the drain would do on each tree.
    - Caused, under `on`, in PR CI or a lane: a hard error: "after this lands, the drain's JIT numbering will
-     refuse: <detail>. Cite the durable thing, or widen the sweep."
+     refuse: <detail>. Cite the durable thing, or widen the sweep." The message says whether the PR touches
+     the refusing file or only changed the sweep, so the author can see why.
    - Inherited, in PR CI or a lane: a **warning** naming the refusal and saying it comes from main, never an
      error. An unrelated PR stays green on a main that already holds a refusing citation, and a CI heal is not
      asked to fix what it cannot.
    - No `baseRef` available (a bare lane with no origin ref): everything is inherited, so a warning only. The
-     rule fails open to today's relaxed behaviour rather than wedging a lane.
+     rule fails open to today's relaxed behaviour rather than wedging a lane. **In PR CI a `baseRef` always
+     exists**, so there the base run is never skipped: if the base run itself cannot be executed (the
+     worktree or the dry run throws), the rule does not guess "inherited"; it treats every merged-tree
+     refusal as caused and says in the error that the base comparison failed. Only a bare lane may fail open.
    - On main (push-to-main CI): any refusal is an error, because a strand is about to happen or has.
    - In PR CI, the checkout is the PR merged with current main (`we:.github/workflows/ci.yml:168-172`,
      check-standards at `:215`), and `baseRef` is the PR's base (`origin/<base>`).
@@ -98,8 +112,19 @@ Steps 1 to 4.
     #3176 citation (the 2026-10-03 state). A PR that changes only an unrelated file gets a **warning** naming
     the inherited refusal and **no error**, in PR CI and in a lane. The same tree on push-to-main is an error.
   - **Caused:** a PR that adds a new out-of-scope citation of a pending hash, and a PR that adds a pending
-    card whose hash main already cites out of scope, each get an error. A PR that touches the file that
-    already holds the citation (without introducing it) is judged by `file` in the diff: error.
+    card whose hash main already cites out of scope, each get an error (the refusal is in the merged run and
+    not in the base run, or names a pending card the PR adds). A PR that touches the file that already holds
+    the citation (without introducing it) is also an error: the file is in the diff.
+  - **Caused indirectly, by changing the sweep (RED today):** the base tree has a citation in a file that is
+    inside the rewrite scope, so the base dry run does not refuse. The PR changes only
+    `we:scripts/lane-drain.mjs` (narrows the scope constant, or moves or renames it) so that file is now
+    outside the scope. Neither that file nor its card appears in `git diff --name-only`. Expect **an error**,
+    not a warning. A second case changes the refusal logic itself so a previously accepted citation now
+    refuses: also an error.
+  - **Inherited stays inherited under the differential:** a refusal present in both the base run and the
+    merged run, from a PR that touches neither the sweep, the file nor the card, is still a warning.
+  - **Base comparison failure in PR CI:** with the base dry run injected to throw, every merged refusal is an
+    error and the message says the base comparison failed. In a bare lane with no `baseRef`, a warning only.
   - No `baseRef`: the refusal is a warning only.
   - The policy file is read from the base: a PR whose head sets `prCi.mainStateParity` to `off` is still
     judged under the base's `on`.
@@ -113,6 +138,9 @@ Steps 1 to 4.
    stranded-hash warning path. **After:** fails with the dry-run error naming the soak citation.
 2. Run the same on current origin/main (which already holds the inherited refusal) with an unrelated one-file
    PR on top. It must show a warning and **no error**, so the rule adds no false red.
+2a. In a scratch clone of current origin/main, make a one-file change that narrows the drain's rewrite scope
+   (touching only `we:scripts/lane-drain.mjs`). **Before:** the PR-side check shows no error. **After:** it
+   shows the error for the citation that now refuses, though that citation's file is not in the diff.
 3. Paste both outputs in the PR.
 
 ## Follow-ups

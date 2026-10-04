@@ -34,8 +34,16 @@ same gate (follow-up).
 
 1. **Pure gate** in `we:scripts/readiness/overlap-chain.mjs`:
    `openPrOverlapGate({ scope, openPrs, selfPr, policy, overrideReason })` returns
-   `{ allowed, hits: [{ file, pr }], mode, record }`.
+   `{ allowed, hits: [{ file, pr }], mode, record, reason }`, where `reason` is `null` or a short code
+   (`overlap`, `override-reason-required`, `open-prs-unreadable`) the caller prints and the tests assert on.
    - It ignores `selfPr`, the PR this job repairs: a repair must touch its own PR's files.
+   - **An unreadable open-PR list fails closed.** The caller passes `openPrs: null` when the fetch threw or
+     hit its page limit (a truncated list is not a complete one), distinct from `[]` (no open PRs). With
+     `null`, the gate returns `allowed: false`, no hits, and a reason `open-prs-unreadable`, under `off` and
+     `logged` alike (a reason cannot override a check that did not run). Under `free` it allows and sets
+     `record` true, with `detail.overlapCheck: 'unreadable'` and subject `<repo>` (no PR is known), so the
+     WIP page still shows that the check was blind (the smell in step 4 also rows these events). A refused
+     run costs nothing and a retry re-reads.
    - `off` (default): any hit refuses. The message names each file and PR. A reason does not help.
    - `logged`: a hit refuses unless `overrideReason` is a real reason (non-empty after trimming, at least 15
      characters). When allowed, it returns `record` set to true.
@@ -49,15 +57,20 @@ same gate (follow-up).
    - **Untrusted text.** The reason is free text typed by a dispatching agent, and file names come from
      other PRs. `recordPolicyEvent` truncates and strips them on write (story #xcs4nce), and the smell and the
      WIP page treat them as plain text. The gate also rejects, before the length check, a reason containing a
-     control character, and caps it at 500 characters (a longer one is refused, not truncated, so the
-     recorded reason is the one the dispatcher meant).
+     control character, and refuses a reason longer than `POLICY_EVENT_REASON_MAX` (a longer one is refused,
+     not truncated, so the recorded reason is the one the dispatcher meant). That constant is **exported by
+     `we:scripts/lib/delivery-policy.mjs` (story #xcs4nce, value 200) and imported by the gate**: the gate's
+     cap and the journal's truncation are one number by construction, never two numbers kept in step by hand.
+     A reason the gate accepts therefore always reads back from the journal intact.
    - **What the 15-character floor is, and is not.** It stops an empty or one-word reason by accident. It
      does not make a reason *good*: any filler passes. The audit value comes from the visible record (the
      medium health episode that quotes the reason for 24 hours), not from the length check. The card does not
      claim more.
 4. **WIP.** Add `we:scripts/conveyor/health-smells/overlap-override-used.mjs` on the `policyEvents` probe from
    story #xq4p21a: severity `medium`, action `alert`, one row per overlapped PR. It breaches when an override
-   for that PR was recorded in the last 24 hours, and the summary quotes the reason. A medium episode turns the
+   for that PR was recorded in the last 24 hours, and the summary quotes the reason. It also gets one row
+   per repo that has an `overlapCheck: 'unreadable'` event in the last 24 hours ("overlap check was blind"),
+   so a `free`-mode blind spot is visible too. A medium episode turns the
    live-state health section yellow and lists on the WIP page (`we:../plateau-app/src/wip/progress-health.ts:65-75`).
 
 ## MVP
@@ -72,7 +85,14 @@ Steps 1 to 4 for the two direct-job entry points.
   - `off`: a scope with `we:scripts/lib/jury-core.mjs` is refused and names #3507, even with a reason.
   - `logged`: no reason is refused; a too-short reason is refused; a real reason is allowed with `record`.
   - `free`: allowed with `record`.
-  - `logged`: a 501-character reason and a reason containing a control character are each refused.
+  - `logged`: a reason one character over `POLICY_EVENT_REASON_MAX` and a reason containing a control
+    character are each refused.
+  - `logged`: a reason of exactly `POLICY_EVENT_REASON_MAX` characters is allowed, and after `record` then
+    `readPolicyEvents` it reads back **intact** (no `…`). The gate imports the constant, so this fails if
+    anyone gives the gate its own number.
+  - **Unreadable open-PR list:** `openPrs: null` is refused with `open-prs-unreadable` under `off` and
+    `logged` (even with a real reason); under `free` it is allowed with `record` true and
+    `overlapCheck: 'unreadable'`. `[]` is allowed (nothing to overlap).
   - `selfPr` 3507: allowed under every mode, with no record.
   - A disjoint scope: allowed, no record.
   - Default (no config): behaves as `off`.
@@ -80,9 +100,11 @@ Steps 1 to 4 for the two direct-job entry points.
     After it, under the default: all five are refused before spawning, so #3507 needs no extra rounds.
 - **Capability (RED today, fails before this lands):** `we:scripts/__tests__/direct-task-overlap-gate.test.mjs`: a missing `--scope` exits with a usage error; a
   refusal exits non-zero before the spawn function is called (spawn injected and asserted unused); an allowed
-  override writes one journal line.
+  override writes one journal line; an open-PR fetch that throws, and one that returns a full page (the page
+  limit reached), each exit non-zero before the spawn function is called.
 - **Capability (RED today, fails before this lands):** `we:scripts/conveyor/health-smells/__tests__/overlap-override-used.test.mjs`: the shape is valid; an event in
-  the last 24 hours breaches; an older one does not. A journaled reason carrying markup stays inert in the
+  the last 24 hours breaches; an older one does not; an `overlapCheck: 'unreadable'` event yields a
+  "blind" row for its repo. A journaled reason carrying markup stays inert in the
   summary (plain text), and the summary stays within a fixed length.
 
 ## Proof plan

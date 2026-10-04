@@ -41,9 +41,18 @@ Prepared 2026-10-03 against `838e849ab`.
    - **Commit identity, not start time.** A run's start time does not prove which main it tested: an old
      green run rerun after main turned red gets a new start time but still tests the old merge commit, and a
      queued run can start after the main it merged against went stale. So the exemption uses the run's tested
-     main SHA (`readTestedMainSha`, `we:scripts/lib/tested-main-base.mjs`, built by story #xi8vgqq, which also
-     records it in `we:.github/workflows/ci.yml`): the PR is exempt only when `redSha` is an ancestor of, or
-     equal to, that tested SHA. A run with no recorded tested SHA is not exempt.
+     main SHA (`readTestedMainSha`, `we:scripts/lib/tested-main-base.mjs`, built by story #xi8vgqq): the PR is
+     exempt only when `redSha` is an ancestor of, or equal to, that tested SHA. A run with no tested SHA is
+     not exempt. That SHA is **derived by the drain, never taken from a value the PR's own job publishes**
+     (see the provenance rule in #xi8vgqq step 1): a PR that could set it could exempt itself from the halt.
+   - **Unreadable main state fails closed.** `defaultReadMainRuns` can throw, hit a rate limit, or return no
+     runs at all. The read returns `{ state: 'unknown' }`, distinct from `red` and `green`, and the gate treats
+     `unknown` like `red` under `halt`: every PR is skipped with reason `main-state-unreadable` (no exemption
+     is possible, because `redSha` is not known), and the drain raises the refusal alert through
+     `drain.onStepRefusal` (story #xq4p21a) under the subject `main-state-read`. The next pass reads again; a
+     clean read records `drain-step-ok` for that subject, so this clears by itself when the read recovers. Under `warn` it lands and records the signal; under `off` it is ignored. The break-glass
+     bypass (step 3) still applies. A halt that lasts only while the read is down is the safe direction; the
+     unsafe one is landing on a red main because the read failed.
    - `warn`: land as today, but record the signal.
    - `off`: today's behaviour.
 3. **Bypass kept.** `--no-red-main-freeze` and `WE_MERGE_BREAK_GLASS` (`we:scripts/merge-ai-prs.mjs:5868`)
@@ -52,8 +61,12 @@ Prepared 2026-10-03 against `838e849ab`.
    `mergeGate.onMainRed`, event `main-red`, subject is the red SHA, detail is `{ redSince, halted }`.
 5. **Snapshot field.** In `we:scripts/operations/live-state-io.mjs`, collect `read.mainState` with the same
    main-run read. In `assessLiveState`, add a section:
-   `mainState: { status, reason, redSince, redSha, policy, halted }`.
-   - `status` is `red` while main is red, under any policy. It reports a fact, not a policy.
+   `mainState: { status, state, reason, redSince, redSha, policy, halted }`.
+   - `status` is `red` while main is red, under any policy. It reports a fact, not a policy. When the
+     main-run read failed, `status` is `yellow` (a member of `STATUS_ORDER` in
+     `we:scripts/operations/live-state.mjs`, so `worstStatus` really lifts `overall`; an unlisted value
+     would rank below green) and a separate field `state: 'unknown'` carries the fact, with `reason` naming
+     the failure. `state` is `red`, `green` or `unknown`; `status` is derived from it.
    - `halted` is true only under `halt`.
    - `overall` picks it up through `worstStatus`.
 
@@ -82,13 +95,21 @@ Steps 1 to 5 in WE. The band itself is a plateau-app follow-up.
   - `off`: both land; no event.
   - Default (no config): behaves as `halt`.
   - Main green: every policy lands both PRs; no event.
+  - **Unreadable main state (RED today):** with `defaultReadMainRuns` injected to throw, then to return an
+    empty list, under `halt` every PR is skipped with `main-state-unreadable` and the refusal alert is called
+    once; under `warn` both land; under `off` both land; with break-glass set, both land. On the next pass
+    with a working read, the PRs are judged normally.
+  - **Forged tested SHA:** a PR whose job published `redSha`'s descendant as its tested SHA, while the
+    drain-derived value predates `redSha`, is still skipped (the exemption reads the derived value).
   - Break-glass set: lands under `halt`.
   - One event per red window, not one per pass.
   - **Replay of 2026-10-03:** a main-run fixture with the red window open, plus three ready PRs tested before
     it and one tested after it (the PR #3788 shape). Before this story: all four land. After it: only the
     fourth lands.
 - **Capability (RED today, fails before this lands):** `we:scripts/operations/__tests__/live-state.test.mjs`: `mainState` is `red` with `halted` true under
-  `halt`; `red` with `halted` false under `warn`; `green` when main is green; `overall` becomes `red`.
+  `halt`; `red` with `halted` false under `warn`; `green` when main is green; `overall` becomes `red`; a
+  failed main-run read gives `state: 'unknown'`, `status: 'yellow'` and the failure in `reason`, and
+  `overall` is at least `yellow`, never `green`.
 
 ## Proof plan
 

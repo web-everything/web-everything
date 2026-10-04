@@ -69,5 +69,6 @@ No story touches open PR #3507's files.
 ## Done when
 
 1. Every story is resolved.
-2. `node we:scripts/lib/delivery-policy.mjs --json` shows all eight fields.
+2. `node we:scripts/lib/delivery-policy.mjs --json` shows every key of the keys table in story #xcs4nce (nine
+   today), checked by a test that compares the output's flattened `dimension.field` paths to the defaults constant's.
 3. Each story's replay of its 2026-10-03 failure passes on main.

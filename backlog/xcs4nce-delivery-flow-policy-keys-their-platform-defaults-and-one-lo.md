@@ -110,9 +110,12 @@ dispatched, not when a PR merges (`we:scripts/conveyor/build-dispatch-policy.mjs
   - **Journal text is untrusted.** `reason` and `detail` carry text derived from agent flags and repository
     content (override reasons, file names in a refusal). On write, `recordPolicyEvent` strips every control
     character (C0 and C1, including newlines inside a value, so one event stays one line), truncates `reason`
-    to 200 characters and each string in `detail` to 500, keeps at most 20 entries of any array in `detail`,
+    to `POLICY_EVENT_REASON_MAX` (200) characters and each string in `detail` to 500, keeps at most 20 entries
+    of any array in `detail`,
     and caps the whole line at 4 KB (dropping `detail` fields last-first, never the key, event or subject).
     A truncated value ends in `…`. Readers still treat the text as plain text, never markup.
+    `we:scripts/lib/delivery-policy.mjs` **exports `POLICY_EVENT_REASON_MAX`** so any gate that refuses an
+    over-long reason (story #x5qhw83) imports the one number instead of keeping its own.
 - CLI: `node we:scripts/lib/delivery-policy.mjs [--json] [--ref=<git-ref>]` prints the resolved policy, the
   source of each field and any warnings.
 
@@ -134,8 +137,12 @@ Types, defaults, the loader, the journal and the CLI. No consumer changes: each 
   - A changed mtime triggers a re-read; an unchanged mtime is served from cache.
   - `recordPolicyEvent` then `readPolicyEvents` round-trips. A write to an unwritable path returns without
     throwing.
+  - **CLI keys:** the flattened `dimension.field` paths of the five policy objects in the
+    `we:scripts/lib/delivery-policy.mjs --json` output (not `sources` or `warnings`) equal the flattened paths of
+    `PLATFORM_DELIVERY_POLICY_DEFAULTS` and the nine rows of the Keys table, no more and no fewer.
   - **Sanitising:** a reason with a newline and an ESC byte comes back without them, as one journal line; a
-    5 000-character reason is cut to 200 with `…`; a detail with 100 file names keeps 20; one huge `detail`
+    5 000-character reason is cut to `POLICY_EVENT_REASON_MAX` (200) with `…`; a reason of exactly that length
+    comes back intact; a detail with 100 file names keeps 20; one huge `detail`
     leaves a line of at most 4 KB with key, event and subject intact.
   - **Trust (base copy):** with a `ref`, a temp git repo whose base commit has `mergeGate.onMainRed: halt`
     and whose PR head commit sets it to `off` loads `halt`, even though the working tree says `off`. Without
@@ -188,4 +195,8 @@ character and a 5 000-character reason, showing it stripped and cut.
 1. **Executable:** `npx vitest run we:config/__tests__/config-contract.test.ts we:scripts/lib/__tests__/delivery-policy.test.mjs`
    (paths without the `we:` prefix when run) fails before this lands, because there are no keys and no
    loader, and passes after.
-2. `node we:scripts/lib/delivery-policy.mjs --json` prints all eight fields with their defaults.
+2. `node we:scripts/lib/delivery-policy.mjs --json` prints every key in the Keys table (nine today) with its
+   default. **Executable:** a `we:scripts/lib/__tests__/delivery-policy.test.mjs` case asserts the CLI output's flattened
+   `dimension.field` paths (the five policy objects, not `sources` or `warnings`) equal those of
+   `PLATFORM_DELIVERY_POLICY_DEFAULTS`, so a key added to the table without a default, or a default missing
+   from the output, fails the test instead of passing a hand count.
