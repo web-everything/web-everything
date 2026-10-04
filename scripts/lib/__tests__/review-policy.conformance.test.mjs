@@ -26,6 +26,7 @@
  * cannot quietly relax the bridge to make an impl diff pass. Do not do that; if the contract is genuinely wrong,
  * change the CONTRACT (a deliberate, human-reviewed spec edit), not this suite.
  */
+/** @repo-scanning-test scope=full — whole-repo sweep, cannot be scoped; see scripts/lib/repo-scan-tests.mjs (#3887). */
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, relative, sep } from 'node:path';

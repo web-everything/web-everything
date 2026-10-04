@@ -18,6 +18,7 @@
  * same `fixerRegistry` — see the engine header.
  */
 import { execFileSync } from 'node:child_process';
+import { admittedArgv } from './readiness/heavy-admission.mjs';
 import { readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -56,7 +57,10 @@ if (process.env.ANTHROPIC_API_KEY) {
 function runSuite() {
   let out;
   try {
-    out = execFileSync('node', [CHECK, '--json'], { encoding: 'utf8' });
+    // heavy-enforce: each re-run of the suite queues on the host heavy-admission pool (pass-through when the
+    // caller already holds a slot). The wrapper inherits stdio, so the JSON report still arrives on stdout.
+    const admitted = admittedArgv('node', [CHECK, '--json']);
+    out = execFileSync(admitted.file, admitted.args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   } catch (e) {
     out = e.stdout; // non-zero exit (errors present) still emits the JSON report on stdout
   }

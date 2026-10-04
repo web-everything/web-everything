@@ -68,6 +68,7 @@ import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
 import { reduceCheckState } from './pr-status.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
+import { CLOSE_SUPERSEDED_MARKER } from '../conveyor/stand-down-answer-core.mjs';
 
 const THIS_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 let promoteClosureMemo;
@@ -126,11 +127,67 @@ export function defaultReadPrLabels({ repoSlug, prNumber, runGh = runGhSync } = 
   return validatePrLabels(envelope?.labels);
 }
 
+/** #3902 — strip `ready-to-merge` when the STUCK restore variant applies a review hold. */
+export function defaultRemoveLabel({ repoSlug, prNumber, label, runGh = runGhSync } = {}) {
+  runGh(['pr', 'edit', String(prNumber), '--repo', repoSlug, '--remove-label', label], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-label-remove', repo: repoSlug },
+  });
+}
+
 /** The one label write of the restore-review-label half. */
 export function defaultAddLabel({ repoSlug, prNumber, label, runGh = runGhSync } = {}) {
   runGh(['pr', 'edit', String(prNumber), '--repo', repoSlug, '--add-label', label], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-label-add', repo: repoSlug },
   });
+}
+
+/** #3850 — the marker on the conveyor's own superseded-close comment (defined with the answer reader that checks it). */
+export { CLOSE_SUPERSEDED_MARKER };
+
+/** #3850 — the comment the close carries: who ruled it, verbatim. Pure. */
+export function closeSupersededComment(answer = {}) {
+  const quote = String(answer.reason ?? '').replace(/<!--/g, '&lt;!--').split('\n').map((l) => `> ${l}`).join('\n');
+  return `${CLOSE_SUPERSEDED_MARKER}\n## Closed as superseded — operator disposition\n\nRuled by @${answer.actor ?? 'operator'} via ${answer.channel ?? 'unknown'} (\`close-superseded\`), executed mechanically by the conveyor. No files were changed and no fix agent was dispatched.\n\n${quote}`;
+}
+
+/** `gh pr view --json files` returns at most this many entries, silently. */
+export const PR_FILES_JSON_CAP = 100;
+
+/** #3850 — close a PR with the superseded comment (one `gh pr close --comment` write). */
+export function defaultClosePr({ repoSlug, prNumber, comment, runGh = runGhSync } = {}) {
+  runGh(['pr', 'close', String(prNumber), '--repo', repoSlug, '--comment', comment], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-close', repo: repoSlug },
+  });
+}
+
+/**
+ * #3850 — the PR's backlog cards that ALREADY exist on the default branch. Closing the PR discards a card the PR
+ * itself introduced; a card that is on main would stay open and needs a backlog edit (there is no sanctioned
+ * "superseded" status in `backlog.mjs`), so the executor refuses rather than closing half the ruling. Fails
+ * closed: any read error throws and the caller refuses.
+ */
+export function defaultReadCardsOnMain({ repoSlug, prNumber, base = 'main', runGh = runGhSync } = {}) {
+  const view = JSON.parse(runGh(['pr', 'view', String(prNumber), '--repo', repoSlug, '--json', 'files'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-files', repo: repoSlug },
+  }));
+  // `--json files` is capped at 100 entries and does not error when it truncates: a list at the cap may be missing
+  // the very card that is already on main, so it is unreadable, not "no card" (fail closed → the caller refuses).
+  if ((view?.files ?? []).length >= PR_FILES_JSON_CAP) {
+    throw new Error(`pr files list is at the ${PR_FILES_JSON_CAP}-entry gh cap — cannot prove no card is already on ${base}`);
+  }
+  const cards = (view?.files ?? []).map((f) => f?.path).filter((p) => /^backlog\/[^/]+\.md$/.test(String(p)));
+  const onMain = [];
+  for (const path of cards) {
+    try {
+      runGh(['api', `repos/${repoSlug}/contents/${path}?ref=${base}`, '--silent'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'contents', repo: repoSlug },
+      });
+      onMain.push(path);
+    } catch (e) {
+      if (!/404|Not Found/i.test(String(e?.stderr ?? e?.message ?? e))) throw e;
+    }
+  }
+  return onMain;
 }
 
 /**
@@ -163,7 +220,9 @@ export function runReconcilePromoteDraftDispatch({
   // read says red/pending) with no `gh` on PATH. Defaults to the real `gh api commits/<sha>/check-runs` read.
   readHeadCheckState = defaultReadHeadCheckState,
   readPrLabels = defaultReadPrLabels,
-  // #2811/#2821 follow-up — clear the now-stale `review-status:awaiting-ci` label the INSTANT a draft promotes,
+  // #3902 — strips `ready-to-merge` when the STUCK restore variant applies its review hold.
+  removeLabel = defaultRemoveLabel,
+  // #2811/#2821 follow-up — clear the now-stale `review-status:awaiting-ci` / `review-status:awaiting-base` label the INSTANT a draft promotes,
   // never waiting on a different daemon's tick to notice `isDraft` flipped (mirrors `applyReviewStatus`'s own
   // "the daemon that changes the state applies its own tag right at the moment" convention, `review-status-
   // tag.mjs`'s own docblock). Best-effort: a failed clear never fails the promotion itself, and the periodic
@@ -172,6 +231,9 @@ export function runReconcilePromoteDraftDispatch({
   // `restore-review-label` (PR #3830 incident): the one write for an open, green, label-less lane PR.
   // Idempotent (`gh pr edit --add-label`); re-reads labels first so a label another actor just set wins.
   addLabel = defaultAddLabel,
+  // #3850 — the close-superseded disposition's two IO seams (a test injects both).
+  closePr = defaultClosePr,
+  readCardsOnMain = defaultReadCardsOnMain,
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`promote-draft-pr-dispatch: --repo ${repo} is not a constellation repo`);
@@ -271,15 +333,40 @@ export function runReconcilePromoteDraftDispatch({
       refusals.push({ pr: entry.prNumber, kind: 'label-state-unreadable', why: String(e?.message ?? e).split('\n')[0] });
       continue;
     }
-    if (labels.some(l => l.startsWith('review:') || l === 'ready-to-merge')) {
+    // #3902 — the STUCK variant is planned FOR a `ready-to-merge` PR, so only a review label stops it there.
+    const stuck = entry.variant === 'stuck';
+    if (labels.some(l => l.startsWith('review:') || (!stuck && l === 'ready-to-merge'))) {
       refusals.push({ pr: entry.prNumber, kind: 'label-already-set', why: 'a review/landing label appeared since the plan was read' });
       continue;
     }
     try {
       addLabel({ repoSlug, prNumber: entry.prNumber, label: entry.label ?? 'review:pending' });
+      // A review hold and the `ready-to-merge` go-ahead are contradictory (#2832): strip it, best-effort — the
+      // drain's merge gate re-checks the hold either way.
+      if (stuck && labels.includes('ready-to-merge')) {
+        try { removeLabel({ repoSlug, prNumber: entry.prNumber, label: 'ready-to-merge' }); } catch { /* best-effort */ }
+      }
       dispatched.push({ pr: entry.prNumber, kind: 'restore-review-label', label: entry.label ?? 'review:pending' });
     } catch (e) {
       refusals.push({ pr: entry.prNumber, kind: 'label-failed', why: String((e && e.message) || e).split('\n')[0] });
+    }
+  }
+  // ── close-superseded half (#3850): an operator disposition, executed mechanically — never a fixer.
+  for (const entry of (reconciled.dispatch ?? []).filter((e) => e.kind === 'close-superseded')) {
+    let onMain;
+    try { onMain = readCardsOnMain({ repoSlug, prNumber: entry.prNumber }); } catch (e) {
+      refusals.push({ pr: entry.prNumber, kind: 'close-unreadable', why: String(e?.message ?? e).split('\n')[0] });
+      continue;
+    }
+    if (onMain.length) {
+      refusals.push({ pr: entry.prNumber, kind: 'close-card-on-main', why: `card(s) already on main (${onMain.join(', ')}) need a backlog edit before the PR closes` });
+      continue;
+    }
+    try {
+      closePr({ repoSlug, prNumber: entry.prNumber, comment: closeSupersededComment(entry.operatorAnswer) });
+      dispatched.push({ pr: entry.prNumber, kind: 'close-superseded' });
+    } catch (e) {
+      refusals.push({ pr: entry.prNumber, kind: 'close-failed', why: String((e && e.message) || e).split('\n')[0] });
     }
   }
   return { dispatched, refusals, reconcileRefusals: reconciled.refusals?.length ?? 0, reconcileRefusalDetails: reconciled.refusals };

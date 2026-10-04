@@ -29,6 +29,7 @@
  * Usage:
  *   node scripts/conveyor/health-watch.mjs tick    [--json] [--force-gh] [--no-gh] [--dry-run] [--state-root=DIR]
  *                                                  [--logs-dir=DIR] [--lock-root=DIR] [--self-sync-dir=DIR]
+ *                                                  [--heavy-run-samples-file=FILE]  # ungated heavy-run history fixture
  *                                                  [--ps-fixture=FILE] [--machine-load-fixture=FILE]  # machine-overload's inputs, real by default
  *                                                  [--no-investigate]  # skip the #4078 investigation pass entirely
  *                                                  [--no-file]  # skip the #4079 filing-request planning pass entirely
@@ -52,6 +53,7 @@ import {
 } from './health-watch-core.mjs';
 import { daemonJobsRoot } from '../operations/run-store.mjs';
 import { SMELLS } from './health-smells/index.mjs';
+import { readRecentSamples, appendSample, summarizeSample, findUngatedHeavyRuns } from './heavy-run-ungated.mjs';
 import { healthDir, healthSectionLines } from './health-watch-section.mjs';
 import { runInvestigations } from './health-investigate-dispatch.mjs';
 import {
@@ -62,6 +64,8 @@ export { healthDir, healthSectionLines };
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { laneJournalPath, readLaneJournalTail, reconcileLaneJournalEntry } from '../lib/lane-history.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
+import { laneIndicesIn, poolsWithLanes } from '../lib/lane-pool-scan.mjs';
+import { readVerifyMarker } from '../lib/lane-verify.mjs';
 // #4317 — the same "which paths are DAEMON clones" registry `guard-lane.mjs`/`guard-bash.mjs` already use, so
 // this probe's notion of "a daemon clone" can never drift from the guards'.
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
@@ -403,6 +407,29 @@ export function probeLanePools(logsDir) {
 }
 
 /**
+ * The `fixer-verify-never-settles` smell's input (live 2026-10-04): every lane whose verify marker is `running`,
+ * with the lane's own HEAD, so the smell can tell a request nothing ever picked up (or a dispatched run that
+ * outlived every ceiling) from a normal in-flight gate. Only `running` markers pay for the `git rev-parse`;
+ * every other lane is one small file read. Never throws on a non-directory pool-root entry (shared walk).
+ * @returns {Array<{pool:string, lane:number, sha:string|null, head:string|null, startedAt:string|null, runId:string|null, suites:string|null}>}
+ */
+export function probeLaneVerifyMarkers({ poolRoot, readHead } = {}) {
+  if (!poolRoot) return [];
+  const head = readHead || ((dir) => { try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } });
+  const out = [];
+  for (const pool of poolsWithLanes(poolRoot)) {
+    for (const lane of laneIndicesIn(join(poolRoot, pool))) {
+      const dir = join(poolRoot, pool, `lane-${lane}`);
+      let marker;
+      try { marker = readVerifyMarker(join(dir, '.git')); } catch { continue; }
+      if (!marker || marker.corrupt || marker.status !== 'running') continue;
+      out.push({ pool, lane, sha: marker.sha ?? null, head: head(dir), startedAt: marker.startedAt ?? null, runId: marker.runId ?? null, suites: marker.suites ?? null });
+    }
+  }
+  return out;
+}
+
+/**
  * #4370 — the `lane-destructive-unpushed` smell's input: the recent tail of every pool's lane lifecycle journal
  * (`<poolRoot>/<pool>/.lane-journal.jsonl`), entries newer than `windowMs` only. Rechecks candidate commits against local remote refs. `[]` when no
  * pool has a journal yet.
@@ -520,7 +547,7 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
     // #4066 — `mergeable` + `comments` for the queue smells: `pr-stage-stall` classifies stages the stuck-PR
     // watch's own way (needs `mergeable`) and reads its markers off the thread; `stood-down-prs` counts the
     // stand-down markers. Both are already in the shared snapshot's field set, so the snapshot path costs nothing extra.
-    const fields = 'number,title,headRefName,labels,statusCheckRollup,updatedAt,isDraft,mergeable,comments';
+    const fields = 'number,title,headRefName,headRefOid,labels,statusCheckRollup,updatedAt,isDraft,mergeable,comments';
     const shared = exec === run ? readSharedOpenPrs({ repo: slug, fields }) : null;
     const listed = shared || JSON.parse(exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '100', '--json', fields]));
     const rows = Array.isArray(listed) ? listed : []; // a throttle deferral object = skip this repo's PR smells this pass
@@ -542,7 +569,7 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
       } catch { /* Unknown, not a clean observation. */ }
       out.push({
         reviewObservation,
-        repo: slug, number: pr.number, title: pr.title, headRefName: pr.headRefName, updatedAt: pr.updatedAt,
+        repo: slug, number: pr.number, title: pr.title, headRefName: pr.headRefName, headRefOid: pr.headRefOid ?? null, updatedAt: pr.updatedAt,
         isDraft: !!pr.isDraft,
         mergeable: pr.mergeable ?? null,
         // Only what the marker readers need (leading line, time, trusted author) — never the whole comment record.
@@ -787,6 +814,10 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.laneJournal = attempt('laneJournal', () => probeLaneJournal({
     poolRoot: flags['lane-pool-root'] || (fixtureTick ? null : defaultPoolRoot(REPO_ROOT)), now,
   }));
+  // `fixer-verify-never-settles` — fs + one `git rev-parse` per RUNNING marker only. Same fixture rule as above.
+  probes.laneVerifyMarkers = attempt('laneVerifyMarkers', () => probeLaneVerifyMarkers({
+    poolRoot: flags['lane-pool-root'] || (fixtureTick ? null : defaultPoolRoot(REPO_ROOT)),
+  }));
   // #4200-ish — cheap, fs-only, every tick: catches a shim baked with a lane-clone path BEFORE that lane resets.
   probes.ghShimLanes = attempt('ghShimLanes', () => probeGhShimLanes());
   // #4317 — cheap, every tick: an aged untracked backlog card sitting inside a daemon clone (the exact class of
@@ -806,6 +837,11 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.machineLoad = attempt('machineLoad', () => (flags['machine-load-fixture']
     ? JSON.parse(readFileSync(flags['machine-load-fixture'], 'utf8'))
     : probeMachineLoad()));
+  // heavy-enforce — the `heavy-run-ungated` smell's sample history (the ~60s sampler plus each tick's own append).
+  const heavyRunSamplesPath = flags['heavy-run-samples-file'] || join(dir, 'heavy-run-samples.jsonl');
+  probes.heavyRunSamples = attempt('heavyRunSamples', () => readRecentSamples(heavyRunSamplesPath, {
+    now, windowMs: config.heavyRunUngatedWindowMs ?? 10 * MINUTE,
+  }));
   // `gh-call-failures` — fs-only, every tick: the gh-throttle call log's tail (`--gh-calls-log=FILE` in tests).
   probes.ghCalls = attempt('ghCalls', () => probeGhCalls(flags['gh-calls-log'] ? { logPath: flags['gh-calls-log'] } : {}));
   // #4309 — alongside (never replacing) the 2 MB tail above: persist every fully closed hour of GitHub spend once,
@@ -902,6 +938,10 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // A silence whose tracking card is still `active` never expires (4065 Fork 3): read those cards' status.
   const activeCards = readActiveCards(silences.map((x) => x.card).filter(Boolean), flags['backlog-dir'] || join(REPO_ROOT, 'backlog'));
   const result = runHealthTick({ ...prev, silences, lastTick: lastTickForSmells }, probes, SMELLS, now, { config, probeErrors, activeCards });
+  // Read history before evaluation, then persist this tick once. Synthetic process fixtures never persist.
+  if (!flags['ps-fixture']) attempt('heavyRunSampleAppend', () => appendSample(heavyRunSamplesPath,
+    probes.processes ? summarizeSample(findUngatedHeavyRuns(probes.processes), new Date(now).toISOString())
+      : { at: new Date(now).toISOString(), error: probeErrors.processes || 'process snapshot unavailable' }));
   // Scrubbed ONCE, right here: everything below — the printed section, the returned summary, every file — sees
   // only the redacted state.
   const state = scrubDeep(result.state);

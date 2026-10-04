@@ -1142,8 +1142,15 @@ function runCli() {
   // its absence still means "not queued"; the label lander won't collect a red PR either way. A producer that
   // wants the drain to land it must use `--label-on-green` (wait → label when green → hand off).
   if (PLAN.mode === 'open-only') {
+    // #3902 (live 2026-10-04) — open-only used to skip the #2307 review-escalation score entirely, so a
+    // `--no-wait` PR opened with NO review label and depended on the drain's land-time pass to score it — which
+    // only sees fully-green merge candidates. PR #3902 went red before that and was never reviewed. The score
+    // needs no green (net diff + manifest), so apply it AT OPEN, like every other producer mode. Best-effort.
+    let openVerdict = null;
+    try { openVerdict = applyReviewEscalationLabel(); } catch { /* a scoring miss never blocks the open */ }
+    if (openVerdict?.label && !AS_JSON) process.stderr.write(`pr-land [${REPO}] · #${prNum} review-escalation at open → ${openVerdict.label}\n`);
     if (!AS_JSON && LABEL) process.stderr.write(`pr-land [${REPO}] · #${prNum} opened UNLABELLED (--no-wait): use --label-on-green so the ${LABEL} label is applied only when required checks pass; the drain's ci-lifecycle reconcile labels its checking/ci:failed/blocked state on its next sweep (#2421)\n`);
-    emit({ repo: REPO, merged: false, reason: 'opened', pr: Number(prNum), ref: REF, label: null, labelApplied: false, detail: `opened self-approved PR #${prNum} for ${REF} (--no-wait, no ready-to-merge label yet — CI not confirmed green; the drain's ci-lifecycle reconcile covers its checking/ci:failed/blocked state, #2421)` }, 0);
+    emit({ repo: REPO, merged: false, reason: 'opened', pr: Number(prNum), ref: REF, label: null, labelApplied: false, ...(openVerdict?.label ? { reviewLabel: openVerdict.label, reviewLabelApplied: openVerdict.apply } : {}), detail: `opened self-approved PR #${prNum} for ${REF} (--no-wait, no ready-to-merge label yet — CI not confirmed green; the drain's ci-lifecycle reconcile covers its checking/ci:failed/blocked state, #2421)` }, 0);
   }
 
   // #2622 — PARK mode (`--park=review:human|review:pending`): the PR is open (through the SAME producer create

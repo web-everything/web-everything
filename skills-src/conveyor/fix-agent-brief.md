@@ -387,6 +387,7 @@ at run time leaves a red marker).
 It never expands a default local selection into the full suite. **Never run the full suite yourself**
 (`npm run test:unit`, `npm test`, a bare `vitest run`): the verify runner runs the same gate for you, CI runs it
 anyway, and the Bash guard denies it.
+For any test run of your own (e.g. re-running one test file), use the queued form only — `node {{WE_ROOT}}/scripts/readiness/heavy-admission.mjs run -- npx vitest run <test-file>` or `npm run test:unit -- <test-file>`; a direct `npx vitest`, `npm test` or bare `check-standards.mjs` run skips the host's heavy-run queue and the Bash guard denies it.
 
 A green gate proves the **checks** pass; it does not, by itself, prove the reviewer's finding is actually fixed.
 Re-run the SAME test from step 2 — it must now be green — and, where the finding had a real-surface probe,

@@ -66,7 +66,10 @@ const DAEMON_REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..
 import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
 import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
-import { withGithubAppAuth } from '../../scripts/lib/github-app-auth-env.mjs';
+import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
+/** Per-owner App auth: this daemon fixes PRs in every org (live 2026-10-04: plateau-app calls failed with the
+ *  web-everything token pinned). */
+export const FIX_DISPATCH_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
 import { withSelfSync } from '../../scripts/lib/daemon-self-sync.mjs';
 import { withPrEvents } from '../../scripts/lib/pr-events.mjs';
 import { isStaleMainRefusalMessage } from '../../scripts/lib/main-staleness.mjs';
@@ -615,7 +618,8 @@ export async function runTickAllRepos({
   const statusTags = [];
   if (typeof tagDispatchStatus === 'function') {
     for (const d of [...fix.dispatched, ...ciHeal.dispatched]) {
-      if (d?.pr == null) continue;
+      // A salvage push spawned no session — nothing for a session-status label to describe.
+      if (d?.pr == null || d.kind === 'ci-heal-salvage') continue;
       try {
         const result = tagDispatchStatus({ pr: d.pr, repo: d.repo });
         statusTags.push({ pr: d.pr, repo: d.repo, ...result });
@@ -678,6 +682,9 @@ export function formatRefusalLine(label, r) {
 /** ONE printable line per draft the promote half un-drafted (`gh pr ready`), the success half of "log every
  *  promote outcome" (live incident 2026-10-03, PR #3806). Mirrors {@link formatRefusalLine}'s shape. */
 export function formatPromoteActionLine(d) {
+  if (d?.kind === 'close-superseded') {
+    return `reconcile-fix-dispatch-daemon: closed ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} as superseded — operator disposition (close-superseded), no fix agent`;
+  }
   if (d?.kind === 'restore-review-label') {
     return `reconcile-fix-dispatch-daemon: labelled ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} ${d?.label ?? 'review:pending'} — open lane PR, all required checks green, no review:* label (restore-review-label)`;
   }
@@ -781,7 +788,7 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
         log.error(`reconcile-fix-dispatch-daemon: scope-hold released ${r.repo} PR #${h.pr} — ${h.why}`);
       }
       for (const r of repos) for (const rank of (r.result?.scopeRanks ?? [])) {
-        log.error(`reconcile-fix-dispatch-daemon: scope-rank ${r.repo} PR #${rank.pr} — rank ${rank.rank}, blocks ${rank.blocks}, age ${rank.ageHours}h, score ${rank.score}, aged-FIFO ${rank.aged}`);
+        log.error(`reconcile-fix-dispatch-daemon: scope-rank ${r.repo} PR #${rank.pr} — rank ${rank.rank}, blocks ${rank.blocks}, age ${rank.ageHours}h, score ${rank.score}, aged-FIFO ${rank.aged}${rank.agedAdmit ? ` — aged-admit after ${rank.agedAdmit.waitedMinutes}m (bound ${rank.agedAdmit.maxWaitMinutes}m) past ${rank.agedAdmit.bypassed.join(', ')}` : ''}`);
       }
       for (const r of repos) if (r.error) log.error(`reconcile-fix-dispatch-daemon: ${r.repo} tick failed (non-fatal, other repos unaffected): ${r.error}`);
       // #x0mn6x0 — ONE LINE PER REFUSAL, never just the count above. `refusals` = a PR the plan offered to
@@ -908,7 +915,7 @@ async function main() {
   };
   // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged) — see we:scripts/lib/pr-events.mjs.
   const { stoppedReason } = await runDaemonLoop(
-    withPrEvents(withSelfSync(withGithubAppAuth(withFixDispatchClaimRefresh(buildCliDaemonEffects({ owner }))), {
+    withPrEvents(withSelfSync(withGithubAppAuth(withFixDispatchClaimRefresh(buildCliDaemonEffects({ owner })), FIX_DISPATCH_APP_AUTH_OPTS), {
       root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
     }), { role: 'fix', repos: FIX_DISPATCH_DAEMON_REPOS }),
   );

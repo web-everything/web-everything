@@ -23,7 +23,8 @@
  *   Same throwaway origin+pool harness shape as the sibling `lane-pool-acquire-scan-wait-decouple.
  *   test.mjs` this file is modeled on.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, spawn, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, mkdirSync, chmodSync, readFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -59,15 +60,13 @@ function provision(count) {
   expect(runPool(['provision', `--count=${count}`, ...REPO()]).code).toBe(0);
 }
 
-beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'lane-pool-lockwait-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
-  poolRoot = join(base, 'pool');
-  shimDir = join(base, 'shim');
-  mkdirSync(shimDir);
-  writeFileSync(join(shimDir, 'git'), `#!/bin/sh\nexec "${REAL_GIT}" "$@"\n`);
-  chmodSync(join(shimDir, 'git'), 0o755);
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-lockwait-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
 
   git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
   git(['clone', '--quiet', originDir, referenceDir]);
@@ -75,10 +74,23 @@ beforeEach(() => {
   git(['add', 'file.txt'], referenceDir);
   git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', 'origin', 'main'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
+beforeEach(() => {
+  base = mkdtempSync(join(tmpdir(), 'lane-pool-lockwait-'));
+  poolRoot = join(base, 'pool');
+  shimDir = join(base, 'shim');
+  mkdirSync(shimDir);
+  writeFileSync(join(shimDir, 'git'), `#!/bin/sh\nexec "${REAL_GIT}" "$@"\n`);
+  chmodSync(join(shimDir, 'git'), 0o755);
 });
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 describe('lane-pool acquire (xj2k2pp) — the shared-scan LOCK WAIT is bounded by the caller\'s own --wait-ms', () => {

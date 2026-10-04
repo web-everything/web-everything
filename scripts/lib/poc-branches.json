@@ -3,23 +3,45 @@
   "branches": [
     {
       "branch": "lane/mechanical-dispatcher",
-      "purpose": "Epic #3383's own prototype branch — the background mechanical dispatcher (conveyor runner, dispatch brief, tick loop) built and iterated ahead of main.",
+      "purpose": "Epic #3383's own prototype branch \u2014 the background mechanical dispatcher (conveyor runner, dispatch brief, tick loop) built and iterated ahead of main.",
       "owner": "3383",
       "dateOpened": "2026-08-28",
       "target": "main",
-      "scope": ["we:scripts/conveyor/", "we:skills-src/conveyor/"],
+      "scope": [
+        "we:scripts/conveyor/",
+        "we:skills-src/conveyor/"
+      ],
       "graduationItem": "3443",
       "autoSync": true
     },
     {
       "branch": "lane/daemon-poc",
-      "purpose": "Epic #3383's daemon prototype branch — conveyor daemons (review/merge/drain) run FROM this branch so daemon fixes land fast, with no per-landing review tax; each fix also graduates to main through its own normal PR. Operator ruling 2026-09-23 (in conversation, verbatim): \"I'd thought we would first fix the deamon in protoytpe to go quick and then graduat to main once perfect.\"",
+      "purpose": "Epic #3383's daemon prototype branch \u2014 conveyor daemons (review/merge/drain) run FROM this branch so daemon fixes land fast, with no per-landing review tax; each fix also graduates to main through its own normal PR. Operator ruling 2026-09-23 (in conversation, verbatim): \"I'd thought we would first fix the deamon in protoytpe to go quick and then graduat to main once perfect.\"",
       "owner": "3383",
       "dateOpened": "2026-09-23",
       "target": "main",
-      "scope": ["we:scripts/conveyor/", "we:skills-src/conveyor/", "we:scripts/lib/", "we:scripts/lane-pool.mjs", "we:scripts/merge-ai-prs.mjs"],
+      "scope": [
+        "we:scripts/conveyor/",
+        "we:skills-src/conveyor/",
+        "we:scripts/lib/",
+        "we:scripts/lane-pool.mjs",
+        "we:scripts/merge-ai-prs.mjs"
+      ],
       "graduationItem": "xii6vye",
       "autoSync": true
+    },
+    {
+      "branch": "lane/wip-quickview",
+      "repo": "plateauapp/plateau-app",
+      "purpose": "plateau-app's /wip ALPHA publisher branch: the alpha relay page and its laptop publisher (com.plateau.wip-publisher-alpha runs this branch's code) iterate here ahead of main. Fixes land fast through poc-land from a plateau-app lane; each graduates to plateau-app main through its own normal PR. Operator ruling 2026-10-04 (relayed by the coordinator): register it for poc-land rather than widen the drain's base rule (#3805).",
+      "owner": "3383",
+      "dateOpened": "2026-10-03",
+      "target": "main",
+      "scope": [
+        "plateau:src/wip/",
+        "plateau:scripts/wip-publish.ts"
+      ],
+      "autoSync": false
     }
   ]
 }

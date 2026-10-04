@@ -32,6 +32,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "drain-merge-rate-drop": "Throughput is aggregate, not authority to bypass a merge gate.",
   "drain-pass-over-budget": "Do not kill or lengthen a running drain budget; report the slow step.",
   "duplicate-live-sessions": "Do not stop either live worker; the dispatcher owns the duplicate claim.",
+  "fixer-verify-never-settles": "Never reset/re-request a marker or kill a waiter; fix the verify-daemon pass that is not dispatching.",
   "gh-call-failures": "Inhibit responder GitHub actions, honor existing throttle; do not amplify failed writes.",
   "gh-graphql-budget": "Inhibit GitHub actions until the existing budget read permits them; no new poll/retry loop.",
   "gh-shim-lane-path": "Repair the shim producer via normal delivery, never patch a generated shim in place.",
@@ -39,6 +40,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "github-app-token": "Inhibit GitHub actions; existing auth refresh/operator owns recovery, no credential mutation.",
   "health-tick-overrun": "Hold actions if watch freshness is inadequate; watchdog/owner diagnoses the probe.",
   "heavy-queue-wait": "Honor heavy admission; do not raise the cap or kill a holder.",
+  "heavy-run-ungated": "Route the named program's runs through heavy admission; never kill the run or raise the cap.",
   "lane-destructive-unpushed": "Possible loss needs recovery judgment; preserve reflogs and do not clean anything.",
   "lane-pool-growth": "Dirty/unleased is not proof of abandoned work; no trim/reset/provision.",
   "lane-worker-without-lease": "A live worker needs ownership investigation, never release or fabricated adoption.",
@@ -49,6 +51,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "pr-stage-stall": "Cluster is not a per-PR action authorization; reuse inspections and specific episodes.",
   "review-label-missing": "A missing label is reported only; restoring review goes through the guarded re-arm command, never a responder label write.",
   "review-seat-cap-near-limit":"Low severity; report only, no provider/cap changes and no operator ping.",
+  "ruling-needed-waiting": "A ruling is the operator's judgment; never record, infer or auto-answer one.",
   "self-sync-conflict": "Never force or hand-merge a clone/overlay from the responder.",
   "stood-down-prs": "Terminal questions need explicit operator answers; never auto-call stand-down-answer.",
   "untracked-backlog-card": "Do not adopt/commit unknown daemon-clone files; normal owner/file-item delivery is owed."

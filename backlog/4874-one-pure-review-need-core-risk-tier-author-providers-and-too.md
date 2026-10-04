@@ -24,7 +24,7 @@ Preparation (2026-10-03) verified the inputs this core composes. Nothing is buil
 - The critical predicate already exists: `we:scripts/lib/critical-work.mjs#criticalWorkVerdict` (line 135) flags gate-self, statute, irreversible (CI, deploy), security paths, human-required, `risk: high` and the `security` tag. An empty file list is critical (`unknown-scope`).
 - Live probe on this checkout (the `shape --files=<f> --json` subcommand of we:scripts/review-core-cli.mjs, and `criticalWorkVerdict`): a backlog card is `none`/`prose`/not critical; `we:docs/agent/testing.md` is `code` and critical (statute); `we:scripts/lib/auto-land-seam.mjs` is `elevated` with gate-derivation and critical (gate-self); `we:scripts/operations/review-seat-caps.mjs` is not critical; `we:.github/workflows/ci.yml` is critical (irreversible).
 - Commit authorship is readable today. Claude: `we:scripts/lib/ai-pr-authorship.mjs#isAiCommit` (line 30). Codex: delivery commits carry `Co-Authored-By: Codex <noreply@openai.com>` from `we:scripts/operations/deliver-item-wrapper.mjs#coAuthorTrailerFor` (line 1993); orchestrated Codex jobs write a `Written by Codex (...)` body line instead (for example commit e1c7feeb9). The last 200 main commits carry 35 Codex trailers, 49 Claude trailers and 4 `Written by Codex` lines. Merge and drain bookkeeping commits are already filtered by `isMechanicalMergeCommit` (line 91) and `isDrainBookkeepingCommit` (line 138).
-- The "protected list" in the operator's target has no single home on main yet. Its parts on main are the critical-work groups above. The judge protected list proposed by xfnv9ay is still in open PR #3771; see Follow-ups.
+- The "protected list" in the operator's target has no single home on main yet. Its parts on main are the critical-work groups above. The judge protected list proposed by 5062 is still in open PR #3771; see Follow-ups.
 
 Implementation proof (2026-10-03):
 
@@ -188,5 +188,5 @@ Run Vitest on we:scripts/lib/__tests__/review-need.test.mjs and we:scripts/__tes
 
 - Testing lesson: we:scripts/review-core-cli.mjs emits structured refusal JSON on stdout, including for exit 2. CLI refusal tests must inspect that output. Ordinary inert documentation can qualify for Haiku under the existing subject router; operative documentation remains covered by strict non-Haiku regressions.
 
-- When xfnv9ay (judge protected list, open PR #3771) lands, add its list as one more opus reason. Reuse its export; do not keep a copy.
+- When 5062 (judge protected list, open PR #3771) lands, add its list as one more opus reason. Reuse its export; do not keep a copy.
 - Tier thresholds are policy. Moving them into we:scripts/lib/dispatch-routing-policy.json belongs to the policy-dimensions epic #4376 once that has a home for review rules.

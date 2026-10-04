@@ -893,3 +893,38 @@ describe('missing-run — stalled PARTIAL rollup (PR #3850)', () => {
     expect(buildMissingRunCandidates([{ ...PR_3850, mergeable: 'CONFLICTING' }], { requiredContexts: REQ })).toEqual([]);
   });
 });
+
+// LIVE 2026-10-04, PR #3903: red only on the PR-scoped `soak-replay-gate` inside a main-red window was refused as
+// `owed-ci-rerun` (rebase once main recovers) every tick and never ci-healed. The soak break
+// `pr-scoped-gate-red-never-healed` replays it through planReconcile.
+describe('PR-scoped required checks are never main-attributable (configurable)', async () => {
+  const { failingRequiredCheckForAttribution, resolvePrScopedChecks, DEFAULT_PR_SCOPED_CHECKS } = await import('../main-red-recovery.mjs');
+  const WINDOWS = [{ start: '2026-10-04T16:00:00Z', end: '2026-10-04T16:50:00Z' }];
+  const row = (name, conclusion, completedAt) => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion, completedAt });
+  const REQ = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
+
+  it('defaults to soak-replay-gate; WE_PR_SCOPED_CHECKS replaces it, "" means none', () => {
+    expect(DEFAULT_PR_SCOPED_CHECKS).toEqual(['soak-replay-gate']);
+    expect(resolvePrScopedChecks({})).toEqual(['soak-replay-gate']);
+    expect(resolvePrScopedChecks({ WE_PR_SCOPED_CHECKS: 'soak-replay-gate, lint-gate' })).toEqual(['soak-replay-gate', 'lint-gate']);
+    expect(resolvePrScopedChecks({ WE_PR_SCOPED_CHECKS: '' })).toEqual([]);
+  });
+
+  it('a failing PR-scoped check wins the attribution pick even inside a main-red window', () => {
+    const pr = { statusCheckRollup: [row('daemon-soak', 'FAILURE', '2026-10-04T16:30:00Z'), row('soak-replay-gate', 'FAILURE', '2026-10-04T16:24:27Z')] };
+    expect(failingRequiredCheckForAttribution(pr, { requiredChecks: REQ, mainRedWindows: WINDOWS })).toEqual({ name: 'soak-replay-gate', completedAt: '2026-10-04T16:24:27Z' });
+    expect(failingRequiredCheckForAttribution(pr, { requiredChecks: REQ, mainRedWindows: WINDOWS, prScopedChecks: [] }).name).toBe('daemon-soak');
+  });
+
+  it('isPrCiFailureOwedRerun never excuses a PR-scoped check; an empty list restores the old attribution', () => {
+    const facts = { requiredCheckCompletedAt: '2026-10-04T16:24:27Z', aheadBy: 12, mainRedWindows: WINDOWS, failingCheckName: 'soak-replay-gate' };
+    expect(isPrCiFailureOwedRerun(facts)).toBe(false);
+    expect(isPrCiFailureOwedRerun({ ...facts, prScopedChecks: [] })).toBe(true);
+  });
+
+  it('planMainRedRebases refuses own-failure for a PR-scoped check instead of rebasing it', () => {
+    const out = planMainRedRebases({ candidates: [{ prNumber: 3903, aheadBy: 12, failureCompletedAt: '2026-10-04T16:24:27Z', failingCheckName: 'soak-replay-gate' }], mainRedWindows: WINDOWS });
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals[0]).toMatchObject({ prNumber: 3903, kind: 'own-failure' });
+  });
+});

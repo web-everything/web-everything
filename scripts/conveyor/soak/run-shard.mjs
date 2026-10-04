@@ -15,6 +15,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { shardFiles, parseShardArg, REPO_ROOT } from './shard-files.mjs';
+import { admittedArgv } from '../../readiness/heavy-admission.mjs';
 
 function main(argv) {
   const { shard, total } = parseShardArg(argv, 'usage: run-shard.mjs --shard=<i>/<N>');
@@ -26,7 +27,10 @@ function main(argv) {
   }
 
   process.stdout.write(`soak shard ${shard}/${total}: running ${files.length} file(s):\n${files.map((f) => `  ${f}`).join('\n')}\n`);
-  const result = spawnSync('vitest', ['run', '--config', 'vitest.soak.config.ts', ...files], {
+  // heavy-enforce: takes a heavy-admission slot itself, so a direct `node run-shard.mjs` is queued too; under
+  // `npm run test:soak:shard` (already admitted) the wrapper sees WE_HEAVY_ADMISSION_HELD and passes through.
+  const admitted = admittedArgv('npx', ['vitest', 'run', '--config', 'vitest.soak.config.ts', ...files]);
+  const result = spawnSync(admitted.file, admitted.args, {
     stdio: 'inherit',
     cwd: REPO_ROOT,
   });
