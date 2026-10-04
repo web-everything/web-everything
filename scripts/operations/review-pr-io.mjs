@@ -62,6 +62,7 @@ import { siblingsFor } from '../bootstrap-session.mjs';
 import { PR_VIEW_FIELDS, prViewFileName } from '../lib/pr-view-transport.mjs';
 import { defaultOriginRepo } from './record-verdict-io.mjs';
 import { REVIEW_EFFECTS } from './review-pr.mjs';
+import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 import { isValidRunId } from './run-record.mjs';
 // mechanical-dispatcher — the `AWAITING_ADVISORY_CLEAR` sink's own label name, imported rather than restated.
 import { REVIEW_LABELS, hasReviewLabel } from '../lib/review-escalation.mjs';
@@ -215,7 +216,7 @@ export function readPr({
   // plateau-app#139). Checked here, ahead of the `gh pr view` call too, so a mismatched target fails fast
   // rather than spending a network round trip it cannot use.
   const haveRepo = originRepo(cwd);
-  if (haveRepo !== repo) {
+  if (canonicalizeSlug(haveRepo) !== canonicalizeSlug(repo)) {
     throw new Error(
       `review-pr-io: refusing to review ${repo}#${pr} — this checkout's origin is ${haveRepo || '(unknown)'}, `
       + `not ${repo}. review-pr's diff comes from LOCAL git rooted at this checkout, so a cross-repo target `
@@ -376,7 +377,7 @@ export function resolveSubjectCheckout({
   repo, cwd = REPO_ROOT, originRepo = defaultOriginRepo, siblings = siblingsFor,
 } = {}) {
   const probed = [cwd];
-  if (originRepo(cwd) === repo) return { path: cwd, probed };
+  if (canonicalizeSlug(originRepo(cwd)) === canonicalizeSlug(repo)) return { path: cwd, probed };
   let candidates = [];
   // A broken/absent sibling table must not turn a refusal into a crash — the guard is the one that speaks.
   try { candidates = siblings(cwd) || []; } catch { candidates = []; }
@@ -398,7 +399,7 @@ export function resolveSubjectCheckout({
       if (candidate === sibling.path && !sibling.present) continue;
       if (probed.includes(candidate)) continue;
       probed.push(candidate);
-      if (originRepo(candidate) === repo) return { path: candidate, probed };
+      if (canonicalizeSlug(originRepo(candidate)) === canonicalizeSlug(repo)) return { path: candidate, probed };
     }
   }
   return { path: null, probed };

@@ -159,6 +159,18 @@ export function classifyReviewLoopOutcome(parsed) {
 }
 
 /**
+ * PURE — the completion label for a loop that PRINTED a payload: null on a clean exit, else `exit N`, plus the
+ * payload's own `stopped` word and `error` text when it carries them (so a refusal is recorded verbatim).
+ * @returns {string|null}
+ */
+export function loopFailureLabel(parsed, status) {
+  const err = typeof parsed?.error === 'string' ? parsed.error.trim() : '';
+  const stopped = typeof parsed?.stopped === 'string' ? parsed.stopped : '';
+  if (status === 0 && !err) return null;
+  return `exit ${status}${err && stopped ? ` (${stopped})` : ''}${err ? `: ${err}` : ''}`.slice(0, 500);
+}
+
+/**
  * PURE — pull the JSON payload out of the loop's stdout. `--json` prints ONE pretty-printed object, but a
  * stray leading line must not lose a finished review (#3647's lesson), so fall back to the first line that
  * opens an object and parse from there.
@@ -474,7 +486,10 @@ function runReviewArc({
     } else if (parsed) {
       // #3647 — classify what the loop PRINTED even on a non-zero exit: a finished review whose secondary
       // filing step failed is still that review's real outcome.
-      classified = { ...classifyReviewLoopOutcome(parsed), label: loop.status === 0 ? null : `exit ${loop.status}` };
+      // THE REAL ERROR, NEVER SILENT: a loop that stopped before judging prints `{stopped, error}` (e.g.
+      // `step-refused` + the refusal text). The label used to be only `exit 1`, and the added-seats arc then
+      // reported "printed no diff" — the outage of 2026-10-03 hid its cause for hours.
+      classified = { ...classifyReviewLoopOutcome(parsed), label: loopFailureLabel(parsed, loop.status) };
     } else {
       classified = {
         outcome: BLOCKED_ON_INFRA, verdict: null, loopOutcome: null, runId: null,
@@ -485,6 +500,7 @@ function runReviewArc({
       if (classified.outcome === BLOCKED_ON_INFRA) loopSpan?.fail(new Error(classified.label || 'blocked-on-infra'), { outcome: classified.outcome });
       else loopSpan?.ok({ outcome: classified.outcome, verdict: classified.verdict, loopOutcome: classified.loopOutcome, runId: classified.runId });
     } catch { /* telemetry */ }
+    if (classified.outcome === BLOCKED_ON_INFRA && classified.label) io.log(`review-job ${slug}: loop error — ${classified.label}`);
     io.log(`review-job ${slug}: loop finished in ${timings.loopMs}ms — ${classified.outcome} (verdict ${classified.verdict ?? '-'}, loop ${classified.loopOutcome ?? '-'}, run ${classified.runId ?? '-'})`);
     // #4194 — hand the added seats what they need; they run in `runReviewJob` once this arc has fully finished.
     if (parsed && !loop.timedOut) seatsBox.input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload: parsed, slug };
