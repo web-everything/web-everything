@@ -3,7 +3,8 @@ kind: story
 size: 3
 parent: "xaojq81"
 status: open
-scope: ["we:scripts/lib/judge-clearance.mjs", "we:scripts/lib/gate-config.mjs", "we:scripts/guard-bash.mjs", "we:scripts/guard-lane.mjs", "we:scripts/lib/judge-trusted-paths.mjs", "we:scripts/operations/dispatch-lane.mjs", "we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/lib/__tests__/judge-clearance.test.mjs", "we:scripts/lib/__tests__/gate-invariants.test.mjs", "we:scripts/lib/__tests__/gate-config.test.mjs", "we:scripts/__tests__/guard-bash.test.mjs", "we:scripts/__tests__/guard-lane.test.mjs", "we:scripts/operations/__tests__/dispatch-lane.test.mjs"]
+scope: ["we:scripts/lib/judge-clearance.mjs", "we:scripts/lib/gate-config.mjs", "we:scripts/guard-bash.mjs", "we:scripts/guard-lane.mjs", "we:scripts/lib/judge-trusted-paths.mjs", "we:scripts/operations/dispatch-lane.mjs", "we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs", "we:scripts/lib/__tests__/judge-clearance.test.mjs", "we:scripts/lib/__tests__/gate-invariants.test.mjs", "we:scripts/lib/__tests__/gate-config.test.mjs", "we:scripts/__tests__/guard-bash.test.mjs", "we:scripts/__tests__/guard-lane.test.mjs", "we:scripts/operations/__tests__/dispatch-lane.test.mjs"]
+scopeRationale: "The judge-verdict-record and judge-facts modules are named in the Musts and the leash test only as protected paths: they are built by the sibling story xq3kn88 (its scope), and this story's protected-list pattern and leash test cover them by name before they exist."
 dateOpened: "2026-10-03"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "e1f0523e0881357fc863f3e88da72e0164eb7091"
