@@ -62,6 +62,31 @@ describe('temp sweep', () => {
     expect(readBusyTopLevel(root, { run: () => { throw Object.assign(Error('partial'), { stdout: `p1\nn${root}/gh-t-AbC123\n` }); } })).toEqual(new Set(['gh-t-AbC123']));
     for (const stdout of ['', 'p123\n', 'garbage']) expect(() => readBusyTopLevel(root, { run: () => { throw Object.assign(Error('failed'), { stdout }); } })).toThrow();
   });
+  it('treats a truncated lsof scan (timeout, kill, buffer overflow) as unknown busy state, never partial', () => {
+    const stdout = `p1\nn${root}/gh-t-AbC123\n`;
+    const truncations = [
+      { code: 'ETIMEDOUT', killed: true, signal: 'SIGTERM', status: null },
+      { killed: true, signal: 'SIGTERM', status: null },
+      { signal: 'SIGKILL', status: null },
+      { code: 'ENOBUFS' },
+    ];
+    for (const shape of truncations) {
+      expect(() => readBusyTopLevel(root, { run: () => { throw Object.assign(Error('truncated'), { ...shape, stdout }); } })).toThrow();
+    }
+    // a routine non-zero exit (permission gaps) keeps its partial output
+    expect(readBusyTopLevel(root, { run: () => { throw Object.assign(Error('exit 1'), { status: 1, signal: null, stdout }); } })).toEqual(new Set(['gh-t-AbC123']));
+  });
+  it('fails closed on non-numeric or NaN sweep knobs (young entries are never swept)', async () => {
+    const path = entry('gh-t-AbC123');
+    for (const olderThanMs of ['24h', NaN, undefined, null]) {
+      const result = await sweep({ olderThanMs, now: Date.now() });
+      expect(result).toMatchObject({ deleted: 0, young: 1 });
+      expect(fs.existsSync(path)).toBe(true);
+    }
+    for (const knob of [{ batchSize: 'x' }, { batchSize: NaN }, { maxDeletes: 'x' }, { timeBudgetMs: 'x' }, { pauseMs: NaN }]) {
+      expect(await sweep({ olderThanMs: 0, busy: new Set(), dryRun: true, ...knob })).toMatchObject({ deleted: 1, complete: true });
+    }
+  });
 });
 
 

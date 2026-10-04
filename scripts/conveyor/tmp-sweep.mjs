@@ -15,6 +15,9 @@ export function readBusyTopLevel(tmpRoot, { run = execFileSync } = {}) {
   try {
     output = run('lsof', ['-n', '-d', 'cwd', '-Fpn'], { encoding: 'utf8', timeout: 30000, maxBuffer: 64 * 1024 * 1024 });
   } catch (error) {
+    // lsof exits non-zero on routine permission gaps, and its partial stdout is still a full scan. A timeout kill,
+    // a signal or a spawn/buffer error (ETIMEDOUT, ENOBUFS, ...) truncates stdout: that is unknown busy state.
+    if (error.killed || error.signal || error.code) throw error;
     output = error.stdout;
   }
   const paths = String(output ?? '').split('\n').filter((line) => line.startsWith('n/')).map((line) => line.slice(1));
@@ -32,12 +35,20 @@ export function readBusyTopLevel(tmpRoot, { run = execFileSync } = {}) {
   return busy;
 }
 
+// Config knobs come from an operator-edited config.json: a string or NaN must never reach a comparison (every
+// `age < NaN` is false, which would read as "old enough"), so anything not a finite number >= min takes the default.
+const knob = (value, fallback, min = 0) => (typeof value === 'number' && Number.isFinite(value) && value >= min ? value : fallback);
+
 export async function sweepOurTmp({
-  tmpRoot, prefixes, olderThanMs = TMP_SWEEP_DEFAULTS.tmpSweepOlderThanMs, now = Date.now(),
-  batchSize = TMP_SWEEP_DEFAULTS.tmpSweepBatchSize, pauseMs = TMP_SWEEP_DEFAULTS.tmpSweepPauseMs,
-  maxDeletes = TMP_SWEEP_DEFAULTS.tmpSweepMaxDeletesPerRun, timeBudgetMs = TMP_SWEEP_DEFAULTS.tmpSweepTimeBudgetMs,
+  tmpRoot, prefixes, olderThanMs: olderThanOpt, now = Date.now(),
+  batchSize: batchSizeOpt, pauseMs: pauseMsOpt, maxDeletes: maxDeletesOpt, timeBudgetMs: timeBudgetOpt,
   busy = readBusyTopLevel(tmpRoot), dryRun = false, fs = nodeFs, sleep = setTimeout, log = () => {},
 }) {
+  const olderThanMs = knob(olderThanOpt, TMP_SWEEP_DEFAULTS.tmpSweepOlderThanMs);
+  const batchSize = knob(batchSizeOpt, TMP_SWEEP_DEFAULTS.tmpSweepBatchSize, 1);
+  const pauseMs = knob(pauseMsOpt, TMP_SWEEP_DEFAULTS.tmpSweepPauseMs);
+  const maxDeletes = knob(maxDeletesOpt, TMP_SWEEP_DEFAULTS.tmpSweepMaxDeletesPerRun);
+  const timeBudgetMs = knob(timeBudgetOpt, TMP_SWEEP_DEFAULTS.tmpSweepTimeBudgetMs);
   const started = Date.now();
   const names = fs.readdirSync(tmpRoot);
   const pattern = ourTmpEntryPattern(prefixes);
@@ -49,7 +60,7 @@ export async function sweepOurTmp({
     if (busy.has(name)) { result.busy++; continue; }
     try {
       const path = join(tmpRoot, name);
-      if (now - fs.lstatSync(path).mtimeMs < olderThanMs) { result.young++; continue; }
+      if (!(now - fs.lstatSync(path).mtimeMs >= olderThanMs)) { result.young++; continue; } // fails closed on NaN
       result.eligible++;
       if (inBatch >= batchSize) {
         await sleep(pauseMs);
