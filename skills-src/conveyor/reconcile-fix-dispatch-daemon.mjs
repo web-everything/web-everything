@@ -615,7 +615,8 @@ export async function runTickAllRepos({
   const statusTags = [];
   if (typeof tagDispatchStatus === 'function') {
     for (const d of [...fix.dispatched, ...ciHeal.dispatched]) {
-      if (d?.pr == null) continue;
+      // A salvage push spawned no session — nothing for a session-status label to describe.
+      if (d?.pr == null || d.kind === 'ci-heal-salvage') continue;
       try {
         const result = tagDispatchStatus({ pr: d.pr, repo: d.repo });
         statusTags.push({ pr: d.pr, repo: d.repo, ...result });
