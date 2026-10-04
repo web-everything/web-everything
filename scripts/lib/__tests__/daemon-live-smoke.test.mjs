@@ -36,6 +36,7 @@ import {
   refreshSmokeGithubEnv, probeGithubAuth, hasGithubAuthSignature,
   isEnvTimeoutRow, isEnvTimeoutFailureSet, widenSmokeBudgetsEnv,
   DISPATCH_DRY_RUN_SCRIPT, DISPATCH_DRY_RUN_CODE_ENTRIES, busyPoolSkip, hostLooksBusy,
+  smokeLoadFactor, SMOKE_LOAD_SCALE_ENV, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX,
 } from '../daemon-live-smoke.mjs';
 
 /**
@@ -74,26 +75,104 @@ describe('isSmokeGateDisabled / resolveSmokeBudgets — pure, env-driven', () =>
   it.each(['0', 'false', 'no', ''])('%j → not disabled', (v) => expect(isSmokeGateDisabled({ [SMOKE_KILL_SWITCH_ENV]: v })).toBe(false));
 
   it('every budget has a sane positive default with no env set', () => {
-    const b = resolveSmokeBudgets({});
+    const b = resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0' });
     for (const v of Object.values(b)) expect(v).toBeGreaterThan(0);
   });
   it('each budget is independently overridable via its own env var', () => {
     for (const [key, envVar] of Object.entries(SMOKE_BUDGET_ENV)) {
-      const b = resolveSmokeBudgets({ [envVar]: '12345' });
+      const b = resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0', [envVar]: '12345' });
       expect(b[key]).toBe(12345);
     }
   });
   it('a non-numeric override falls back to the default rather than NaN/0', () => {
-    const b = resolveSmokeBudgets({ [SMOKE_BUDGET_ENV.ghApiMs]: 'not-a-number' });
+    const b = resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0', [SMOKE_BUDGET_ENV.ghApiMs]: 'not-a-number' });
     expect(b.ghApiMs).toBe(30_000);
   });
 
   it('laneAcquireWaitMs defaults to 30000 (was 180000, which let a busy pool hold the smoke for 3 min) and is independently overridable via WE_SMOKE_LANE_ACQUIRE_WAIT_MS', () => {
-    expect(resolveSmokeBudgets({}).laneAcquireWaitMs).toBe(30_000);
-    expect(resolveSmokeBudgets({ [SMOKE_BUDGET_ENV.laneAcquireWaitMs]: '5000' }).laneAcquireWaitMs).toBe(5000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0' }).laneAcquireWaitMs).toBe(30_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0', [SMOKE_BUDGET_ENV.laneAcquireWaitMs]: '5000' }).laneAcquireWaitMs).toBe(5000);
     // overriding the wait budget must never perturb the separate, plain laneAcquireMs budget
-    expect(resolveSmokeBudgets({ [SMOKE_BUDGET_ENV.laneAcquireWaitMs]: '5000' }).laneAcquireMs)
-      .toBe(resolveSmokeBudgets({}).laneAcquireMs);
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0', [SMOKE_BUDGET_ENV.laneAcquireWaitMs]: '5000' }).laneAcquireMs)
+      .toBe(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0' }).laneAcquireMs);
+  });
+});
+
+describe('load-aware smoke budgets', () => {
+  const host = (load = 48, cores = 12) => ({ load: () => load, cores: () => cores });
+  const defaults = () => resolveSmokeBudgets({}, host(0));
+
+  it.each([0, 6, 12])('idle host (load %s) preserves every default', (load) => {
+    expect(resolveSmokeBudgets({}, host(load))).toEqual(defaults());
+    expect(resolveSmokeBudgets({}, host(load))).toEqual({
+      lanePoolListMs: 300_000, laneAcquireMs: 2_400_000, laneReleaseMs: 300_000,
+      laneAcquireWaitMs: 30_000, lanePoolBusyCapMs: 60_000, laneAcquireBusyCapMs: 120_000,
+      ghApiMs: 30_000, ghPrListMs: 30_000, reconcileMs: 60_000,
+      dispatchDryRunMs: 45_000, treeStaysCleanMs: 10_000, daemonBootMs: 45_000,
+    });
+  });
+
+  it('load 48 on 12 cores scales dispatch and reconcile by four', () => {
+    expect(resolveSmokeBudgets({}, host())).toMatchObject({ dispatchDryRunMs: 180_000, reconcileMs: 240_000 });
+  });
+
+  it('load 100 on 12 cores is capped at four times the defaults', () => {
+    expect(resolveSmokeBudgets({}, host(100))).toEqual(resolveSmokeBudgets({}, host()));
+    expect(resolveSmokeBudgets({}, host(100)).dispatchDryRunMs).toBe(180_000);
+  });
+
+  it('an explicit operator budget stays absolute under load', () => {
+    expect(resolveSmokeBudgets({ WE_SMOKE_DISPATCH_DRY_RUN_MS: '50000' }, host()).dispatchDryRunMs).toBe(50_000);
+  });
+
+  it('busy caps and the lane acquire wait never scale', () => {
+    expect(resolveSmokeBudgets({}, host())).toMatchObject({
+      lanePoolBusyCapMs: 60_000, laneAcquireBusyCapMs: 120_000, laneAcquireWaitMs: 30_000,
+    });
+  });
+
+  it('WE_SMOKE_LOAD_SCALE=0 disables scaling under load', () => {
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0' }, host())).toEqual(defaults());
+  });
+
+  it('WE_SMOKE_LOAD_SCALE_MAX=2 caps scaling at twice the defaults', () => {
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host())).toMatchObject({
+      dispatchDryRunMs: 90_000, reconcileMs: 120_000,
+    });
+  });
+
+  it.each(['load', 'cores'])('a throwing %s probe preserves defaults', (probe) => {
+    expect(resolveSmokeBudgets({}, { ...host(), [probe]: () => { throw new Error('unavailable'); } })).toEqual(defaults());
+  });
+
+  it.each(['0', '-1', 'invalid', 'Infinity'])('invalid budget override %s still scales the default', (value) => {
+    expect(resolveSmokeBudgets({ WE_SMOKE_DISPATCH_DRY_RUN_MS: value }, host()).dispatchDryRunMs).toBe(180_000);
+  });
+
+  it('exports the knobs and a pure factor with a one-core floor', () => {
+    expect(SMOKE_LOAD_SCALE_ENV).toBe('WE_SMOKE_LOAD_SCALE');
+    expect(SMOKE_LOAD_SCALE_MAX_ENV).toBe('WE_SMOKE_LOAD_SCALE_MAX');
+    expect(DEFAULT_SMOKE_LOAD_SCALE_MAX).toBe(4);
+    expect(smokeLoadFactor({}, host(2, 0))).toBe(2);
+  });
+
+  it('rounds every scaled default and preserves every explicit budget, including fractions', () => {
+    const scaled = resolveSmokeBudgets({}, host(17, 13));
+    const excluded = ['lanePoolBusyCapMs', 'laneAcquireBusyCapMs', 'laneAcquireWaitMs'];
+    for (const [key, value] of Object.entries(defaults())) {
+      expect(scaled[key]).toBe(excluded.includes(key) ? value : Math.round(value * 17 / 13));
+      expect(resolveSmokeBudgets({ [SMOKE_BUDGET_ENV[key]]: '50000.5' }, host())[key]).toBe(50_000.5);
+    }
+  });
+
+  it('retry widening writes absolute budgets that cannot scale twice', () => {
+    const scaled = resolveSmokeBudgets({}, host());
+    const env = Object.fromEntries(Object.entries(scaled).map(([key, value]) => [SMOKE_BUDGET_ENV[key], String(value)]));
+    const widened = widenSmokeBudgetsEnv({ ...env, WE_SMOKE_LOAD_SCALE: '0' });
+    delete widened.WE_SMOKE_LOAD_SCALE;
+    const retry = resolveSmokeBudgets(widened, host());
+    expect(retry.dispatchDryRunMs).toBe(450_000);
+    expect(retry.reconcileMs).toBe(600_000);
   });
 });
 
@@ -1301,8 +1380,8 @@ describe('a check that ran out of TIME under load is environment, never code (li
   });
 
   it('widenSmokeBudgetsEnv: every budget ×factor, and the list child outlives the scan by 30s', () => {
-    const w = widenSmokeBudgetsEnv({ LANE_POOL_LIST_SCAN_TIMEOUT_MS: '200000' }, 2);
-    const b = resolveSmokeBudgets({});
+    const w = widenSmokeBudgetsEnv({ WE_SMOKE_LOAD_SCALE: '0', LANE_POOL_LIST_SCAN_TIMEOUT_MS: '200000' }, 2);
+    const b = resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0' });
     expect(Number(w.WE_SMOKE_GH_API_MS)).toBe(b.ghApiMs * 2);
     expect(Number(w.LANE_POOL_LIST_SCAN_TIMEOUT_MS)).toBe(400000);
     expect(Number(w.WE_SMOKE_LANE_POOL_LIST_MS)).toBeGreaterThanOrEqual(430000);

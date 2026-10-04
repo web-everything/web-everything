@@ -126,6 +126,23 @@ function envMs(env, key, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+export const SMOKE_LOAD_SCALE_ENV = 'WE_SMOKE_LOAD_SCALE';
+export const SMOKE_LOAD_SCALE_MAX_ENV = 'WE_SMOKE_LOAD_SCALE_MAX';
+export const DEFAULT_SMOKE_LOAD_SCALE_MAX = 4;
+
+// Live 2026-10-04: load ~48 made dispatch-dry-run take 80–115s; smoke-env-timeout
+// held PRs #3903/#3916/#3917 off wev-control and wev-review-daemon. Scale default
+// check budgets with host load, keeping operator overrides absolute and busy-pool caps short.
+/** Pure load factor with injected host probes; unavailable probes leave budgets unchanged. */
+export function smokeLoadFactor(env, { load, cores }) {
+  if (env?.[SMOKE_LOAD_SCALE_ENV] === '0') return 1;
+  try {
+    const maxFactor = envMs(env, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX);
+    const ratio = load() / Math.max(1, cores());
+    return Number.isNaN(ratio) ? 1 : Math.max(1, Math.min(ratio, maxFactor));
+  } catch { return 1; }
+}
+
 /** Non-negative integer env override (unlike {@link envMs}, `0` is a valid, meaningful value — e.g. "no
  *  retries"). Falls back on anything else (missing, negative, non-numeric). */
 function envNonNegInt(env, key, fallback) {
@@ -135,8 +152,9 @@ function envNonNegInt(env, key, fallback) {
 
 /** Resolve every check's budget from env, falling back to a sane default (or to `bounded-child.mjs`'s own
  *  budgets, the single source for the generic/acquire timeouts). @returns {Record<string, number>} */
-export function resolveSmokeBudgets(env = process.env) {
-  return {
+export function resolveSmokeBudgets(env = process.env, { load = () => loadavg()[0], cores = () => cpus().length } = {}) {
+  const factor = smokeLoadFactor(env, { load, cores });
+  const budgets = {
     lanePoolListMs: envMs(env, SMOKE_BUDGET_ENV.lanePoolListMs, resolveChildTimeoutMs(env)),
     laneAcquireMs: envMs(env, SMOKE_BUDGET_ENV.laneAcquireMs, resolveLaneAcquireTimeoutMs(env)),
     laneAcquireWaitMs: envMs(env, SMOKE_BUDGET_ENV.laneAcquireWaitMs, 30_000),
@@ -150,6 +168,11 @@ export function resolveSmokeBudgets(env = process.env) {
     treeStaysCleanMs: envMs(env, SMOKE_BUDGET_ENV.treeStaysCleanMs, 10_000),
     daemonBootMs: envMs(env, SMOKE_BUDGET_ENV.daemonBootMs, DEFAULT_DAEMON_BOOT_MS),
   };
+  for (const key of Object.keys(budgets)) {
+    if (key === 'lanePoolBusyCapMs' || key === 'laneAcquireBusyCapMs' || key === 'laneAcquireWaitMs') continue;
+    if (envMs(env, SMOKE_BUDGET_ENV[key], null) === null) budgets[key] = Math.round(budgets[key] * factor);
+  }
+  return budgets;
 }
 
 const firstLine = (e) => String((e && e.message) || e).split('\n')[0];
