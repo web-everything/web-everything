@@ -135,6 +135,7 @@ export const DAEMON_MANIFEST = {
   'orphan-claim-release': { script: 'scripts/conveyor/orphan-claim-release.mjs', args: ['--apply'], intervalMs: ORPHAN_CLAIM_INTERVAL_MS },
   'merge-orphan-sweep': { script: 'scripts/merge-ai-prs.mjs', args: [], intervalMs: MERGE_ORPHAN_SWEEP_INTERVAL_MS },
   'branch-drift': { script: 'scripts/conveyor/branch-drift.mjs', args: ['sweep'], intervalMs: DEFAULT_PASS_INTERVAL_MS },
+  'load-flake-reverify': { script: 'scripts/conveyor/load-flake-reverify.mjs', args: ['sweep'], intervalMs: DEFAULT_PASS_INTERVAL_MS },
   'infra-blocked': { script: 'scripts/conveyor/infra-blocked.mjs', args: ['retry'], intervalMs: DEFAULT_PASS_INTERVAL_MS },
   'duplicate-pr-watch': { script: 'scripts/conveyor/duplicate-pr-watch.mjs', args: ['sweep'], intervalMs: DEFAULT_PASS_INTERVAL_MS },
   // #3383 — live-caught 2026-09-24: `scripts/conveyor/lease-reaper.mjs` (reclaims a lane lease whose owning

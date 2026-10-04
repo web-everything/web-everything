@@ -1,6 +1,6 @@
 /** Operator ceremony record for we:scripts/conveyor/stand-down-answer.mjs. Pure readers. */
-import { AUTOMATION_LOGINS, OPERATOR_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { STAND_DOWN_MARKER, isConcurrentAuthorStandDown, isStandDownSuperseded } from './stand-down.mjs';
+import { AUTOMATION_LOGINS, OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
+import { standDownComments, isStandDownSuperseded } from './stand-down.mjs';
 import { isAdvisoryMechanismStandDownSuperseded } from './advisory-fix-mark.mjs';
 
 export const OPERATOR_ANSWER_MARKER = '<!-- conveyor-stand-down-answer:v1 -->';
@@ -34,8 +34,7 @@ export function parseOperatorAnswer(comment) {
 }
 
 function isTerminal(comment) {
-  return isTrustedMarkerAuthor(comment) && typeof comment?.body === 'string'
-    && comment.body.trimStart().startsWith(STAND_DOWN_MARKER) && !isConcurrentAuthorStandDown(comment);
+  return standDownComments([comment]).length > 0;
 }
 
 export function operatorAnswerForStandDown(comments, index) {

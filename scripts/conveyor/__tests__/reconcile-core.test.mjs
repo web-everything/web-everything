@@ -3497,3 +3497,30 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
     }
   });
 });
+
+import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
+import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
+it('legacy #3881 waits on host load, not a human', () => {
+  const comment = { body: loadFlakeLegacyBody, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION };
+  expect(countUnresolvedStandDowns([comment])).toBe(0);
+  const plan = planReconcile({ prs: [pr1563({ comments: [finding(), comment] })], agents: [], durableCounts: {}, now: NOW });
+  expect(plan.refusals[0].kind).toBe('load-flake-hold');
+});
+
+import { buildLoadFlakeHoldComment as loadHoldBody, buildLoadFlakeResolvedComment as loadResultBody } from '../stand-down.mjs';
+it('load-hold reconcile routing respects cutoff, head changes, and terminal exhaustion', () => {
+  const c = (body, createdAt = '2026-10-04T18:51:50Z') => ({ body, createdAt, author: AUTOMATION });
+  const hold = c(loadHoldBody({ head: 'head-at-hold', alt: 'lane/fix-alt', altSha: '9202eee8a' }));
+  for (const [comments, headRefOid, expected] of [
+    [[c(loadFlakeLegacyBody, '2026-10-05T00:00:00Z')], 'head-at-hold', 'stood-down'],
+    [[hold], 'head-at-hold', 'load-flake-hold'],
+    [[hold], 'new-head', null],
+    [[hold, c(loadResultBody({ altSha: '9202eee8a', result: 'pushed' }), '2026-10-04T20:00:00Z')], 'head-at-hold', null],
+    [[hold, c(loadResultBody({ altSha: '9202eee8a', result: 'exhausted' }), '2026-10-04T20:00:00Z')], 'head-at-hold', 'stood-down'],
+  ]) {
+    const plan = planReconcile({ prs: [pr1563({ comments: [finding(), ...comments], headRefOid })], agents: [], durableCounts: {}, now: NOW });
+    const kinds = plan.refusals.map((r) => r.kind);
+    if (expected) expect(kinds).toContain(expected);
+    else { expect(kinds).not.toContain('stood-down'); expect(kinds).not.toContain('load-flake-hold'); }
+  }
+});

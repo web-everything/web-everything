@@ -394,6 +394,16 @@ re-run that SAME probe and confirm it now shows the fixed behavior. Keep the tri
 before-output from step 2; step 6 posts both as the evidence.
 
 A red gate is a hard stop. Record the stand-down on the PR, leave it `review:changes` (do **not** re-arm), and
+When verify is red ONLY on timeouts that pass alone under high host load, save and push the fix to
+`lane/<head>-fix-<N>-alt`, then use the load-flake exit instead of the terminal gate-red exit:
+
+```bash
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=load-flake --head=<pr-head-sha> --alt=<saved-alt-branch> --alt-sha=<saved-sha>
+node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=blocked-on-load-flake
+```
+
+Report `blocked-on-load-flake` and exit; the quiet-host reverify pass retries the saved fix automatically.
+
 RETURN `#{{ITEM_NUM}} → fix gate-red`. Do not re-push a red diff.
 
 ```bash

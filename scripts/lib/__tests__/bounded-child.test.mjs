@@ -135,3 +135,8 @@ it('preserves multiline stderr and exit status for the tick/daemon logger', asyn
   await expect(runBounded(NODE, ['-e', 'console.error("heading\\nactual root cause"); process.exit(3)']))
     .rejects.toMatchObject({ stderr: 'heading\nactual root cause\n', status: 3 });
 });
+
+it('preserves failing stdout for load-flake reverify summaries', async () => {
+  await expect(runBounded(NODE, ['-e', 'console.log("failing test detail"); console.error("gate red"); process.exitCode = 1'], { timeoutMs: 5000 }))
+    .rejects.toMatchObject({ stdout: 'failing test detail\n', stderr: 'gate red\n', status: 1 });
+});

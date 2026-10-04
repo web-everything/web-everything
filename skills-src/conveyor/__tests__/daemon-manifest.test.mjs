@@ -23,7 +23,7 @@ describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
 
   it('has exactly the 7 WE-only entries (incl. #3913 orphan-claim-release, epic #3383 merge-orphan-sweep + lease-reaper, #4077 health-watch) plus 6 passes × 3 repos = 25 total (we:backlog/x5uqim1-*.md added ci-red-recovery-watch)', () => {
     expect(Object.keys(DAEMON_MANIFEST).sort()).toEqual([
-      'branch-drift', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'merge-orphan-sweep', 'lease-reaper', 'health-watch', 'health-responder',
+      'branch-drift', 'load-flake-reverify', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'merge-orphan-sweep', 'lease-reaper', 'health-watch', 'health-responder',
       ...['ci-queue-watch', 'parked-pr-conflict-watch', 'parked-pr-progress-watch', 'lane-pool-health-watch', 'stuck-pr-watch', 'ci-red-recovery-watch']
         .flatMap((p) => REPO_KEYS.map((k) => `${p}-${k}`)),
     ].sort());
@@ -89,7 +89,7 @@ describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
   });
 
   it('the WE-only passes carry no --repo flag at all — genuinely single-repo, not merely unbuilt cross-repo', () => {
-    for (const name of ['branch-drift', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'lease-reaper']) {
+    for (const name of ['branch-drift', 'load-flake-reverify', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'lease-reaper']) {
       expect(DAEMON_MANIFEST[name].args.some((a) => a.startsWith('--repo='))).toBe(false);
     }
   });

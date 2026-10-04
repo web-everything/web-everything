@@ -357,7 +357,7 @@ describe('countStandDownComments — a forged marker from a random commenter mus
 it('every fixer stand-down call in the brief passes --who={{SESSION_SLUG}}', () => {
   const calls = readFileSync(BRIEF, 'utf8').replace(/\\\n\s*/g, ' ').split('\n')
     .filter((line) => line.startsWith('node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs"'));
-  expect(calls).toHaveLength(4);
+  expect(calls).toHaveLength(5);
   for (const call of calls) expect(call).toContain('--who={{SESSION_SLUG}}');
 });
 
@@ -408,5 +408,32 @@ describe('stand-down CLI releases only after a successful comment (#4897)', () =
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+// #3881: legacy local verify flakes must not request human judgment.
+import { loadFlakeHolds, loadFlakeHoldState, parseAltBranch, buildLoadFlakeHoldComment, buildLoadFlakeResolvedComment } from '../stand-down.mjs';
+import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
+const loadComment = (body, createdAt = '2026-10-04T18:51:50Z') => ({ body, createdAt, author: AUTOMATION });
+describe('load-flake holds', () => {
+  it('parses the real alt SHA and reclassifies only trusted pre-cutoff load flakes', () => {
+    const c = loadComment(loadFlakeLegacyBody);
+    expect(parseAltBranch(c.body)).toEqual({ branch: 'lane/fix-polluted-branch-scope-read-fix-3881-alt', sha: '9202eee8a' });
+    expect(countTerminalStandDowns([c])).toBe(0);
+    expect(loadFlakeHolds([c])[0]).toMatchObject({ head: null, legacy: true });
+    expect(countTerminalStandDowns([{ ...c, createdAt: '2026-10-05T00:00:00Z' }])).toBe(1);
+    expect(countTerminalStandDowns([loadComment(c.body.replace('load flakiness', 'test failure'))])).toBe(1);
+    expect(loadFlakeHolds([{ ...c, author: { login: 'stranger' } }])).toEqual([]);
+  });
+  it('holds until pushed or moved; red-again stays live; exhausted is terminal', () => {
+    const c = loadComment(buildLoadFlakeHoldComment({ head: 'old', alt: 'lane/fix-alt', altSha: '9202eee8a' }));
+    expect(loadFlakeHoldState({ comments: [c], headRefOid: 'old' }).live).toBe(true);
+    expect(loadFlakeHoldState({ comments: [c], headRefOid: 'new' }).live).toBe(false);
+    for (const result of ['pushed', 'red-again', 'exhausted']) {
+      const comments = [c, loadComment(buildLoadFlakeResolvedComment({ altSha: '9202eee8a', result }), '2026-10-04T20:00:00Z')];
+      expect(loadFlakeHoldState({ comments, headRefOid: 'old' }).live).toBe(result === 'red-again');
+      expect(countTerminalStandDowns(comments)).toBe(result === 'exhausted' ? 1 : 0);
+    }
+    expect(buildLoadFlakeHoldComment({ head: 'old' })).toContain('stand-down reason=gate-red');
   });
 });

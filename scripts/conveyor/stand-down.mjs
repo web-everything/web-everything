@@ -66,6 +66,7 @@ export const STAND_DOWN_LABEL = 'review-status:stood-down';
  */
 export const STAND_DOWN_REASONS = Object.freeze({
   'needs-judgment': 'the reviewer\'s finding needs a judgment the fix agent could not safely make, so it did NOT guess',
+  'load-flake': 'verify is red only on host-load timeouts; the saved fix awaits a quiet host',
   'gate-red': 'the gate stayed RED after the repair, and a red diff must never be re-pushed',
   'conflict': 'a genuine same-line conflict with `main` blocked the repair',
   'lane-ref-gone': 'the PR\'s lane ref no longer resolves, so the ~done work could not be reconstituted',
@@ -181,6 +182,64 @@ export function buildConcurrentAuthorPauseComment({ actor = 'conveyor fix agent'
   ].join('\n');
 }
 
+/** Local verify recovery; #4999 covers the complementary CI flake quarantine. */
+export const LOAD_FLAKE_HOLD_MARKER = '⏳ conveyor fix — fix ready, verify red only on host-load timeouts; re-verifies when the host is quiet';
+export const LOAD_FLAKE_RESOLVED_MARKER = '↩ conveyor fix — load-flake reverify result';
+export const LEGACY_LOAD_FLAKE_CUTOFF = '2026-10-05T00:00:00Z';
+
+export function isLoadFlakeStandDown(c) {
+  const body = c?.body ?? '';
+  const at = Date.parse(c?.createdAt ?? '');
+  return body.trimStart().startsWith(STAND_DOWN_MARKER)
+    && STAND_DOWN_TRAILER_RE.exec(body)?.[1] === 'gate-red'
+    && at < Date.parse(LEGACY_LOAD_FLAKE_CUTOFF)
+    && /load[\s-]+flak/i.test(body) && !!parseAltBranch(body)?.sha;
+}
+
+function loadTrailer(body, name) {
+  const match = new RegExp(`<!-- ${name} ([^>]+)-->\\s*$`).exec(body);
+  return Object.fromEntries([...(match?.[1] ?? '').matchAll(/([a-z-]+)=(\S+)/g)].map((m) => [m[1], m[2]]));
+}
+
+export function loadFlakeHolds(comments) {
+  return (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor).flatMap((c) => {
+    const body = c?.body ?? '';
+    const createdAt = c.createdAt ?? null;
+    if (isLoadFlakeStandDown(c)) return [{ createdAt, head: null, alt: parseAltBranch(body), legacy: true }];
+    if (!body.trimStart().startsWith(LOAD_FLAKE_HOLD_MARKER)) return [];
+    const t = loadTrailer(body, 'load-flake-hold');
+    return t.alt && t['alt-sha'] && t.outcome === 'blocked-on-load-flake'
+      ? [{ createdAt, head: t.head ?? null, alt: { branch: t.alt, sha: t['alt-sha'] }, legacy: false }] : [];
+  }).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+}
+
+export function loadFlakeResults(comments) {
+  return (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor).flatMap((c) => {
+    if (!c?.body?.trimStart().startsWith(LOAD_FLAKE_RESOLVED_MARKER)) return [];
+    const t = loadTrailer(c.body, 'load-flake-resolved');
+    return t['alt-sha'] && ['pushed', 'red-again', 'head-moved', 'exhausted'].includes(t.result)
+      ? [{ createdAt: c.createdAt ?? null, sha: t['alt-sha'], result: t.result }] : [];
+  }).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+}
+
+export function loadFlakeHoldState({ comments, headRefOid = null, now = 0 }) {
+  const hold = loadFlakeHolds(comments).at(-1);
+  if (!hold) return { live: false, hold: null };
+  const results = loadFlakeResults(comments).filter((r) => r.sha === hold.alt.sha
+    && Date.parse(r.createdAt) >= Date.parse(hold.createdAt));
+  const resolution = results.filter((r) => r.result !== 'red-again').at(-1);
+  return { hold, results, resolution, live: !resolution && !(hold.head && headRefOid && hold.head !== headRefOid) };
+}
+
+export function buildLoadFlakeHoldComment({ head, alt, altSha, detail = '' }) {
+  if (!alt || !altSha) return buildStandDownComment({ reason: 'gate-red', detail });
+  return `${LOAD_FLAKE_HOLD_MARKER}\n\n${detail}\n<!-- load-flake-hold${head ? ` head=${head}` : ''} alt=${alt} alt-sha=${altSha} outcome=blocked-on-load-flake -->`;
+}
+
+export function buildLoadFlakeResolvedComment({ altSha, result, detail = '' }) {
+  return `${LOAD_FLAKE_RESOLVED_MARKER}\n\n${result === 'exhausted' ? 'Retry cap reached; a human is the next step.\n\n' : ''}${detail.slice(-1500)}\n<!-- load-flake-resolved alt-sha=${altSha} result=${result} -->`;
+}
+
 /**
  * DELIBERATELY NOT A REASON HERE: a permission / tool-use denial while applying an otherwise-clear fix (live
  * 2026-09-23, PR #2518 — a `python3` heredoc rewriting `backlog/3945-*.md` was denied by Claude Code's own
@@ -220,7 +279,8 @@ export function standDownComments(comments) {
     const body = typeof c === 'string' ? c : c?.body;
     // fix procedure — a concurrent-author stand-down is a re-armable pause, never a terminal stand-down.
     if (typeof body === 'string' && body.trimStart().startsWith(STAND_DOWN_MARKER) && isTrustedMarkerAuthor(c)
-      && !isConcurrentAuthorStandDown(c)) {
+      && !isConcurrentAuthorStandDown(c) && !isLoadFlakeStandDown(c)
+      || loadFlakeResults([c]).some((r) => r.result === 'exhausted')) {
       out.push({ body, createdAt: (typeof c === 'string' ? null : c?.createdAt) ?? null });
     }
   }
@@ -358,8 +418,7 @@ export function countTerminalStandDowns(comments) {
   let n = 0;
   for (let i = 0; i < comments.length; i += 1) {
     const c = comments[i];
-    const body = bodyOf(c);
-    if (typeof body !== 'string' || !body.trimStart().startsWith(STAND_DOWN_MARKER)) continue;
+    if (!standDownComments([c]).length) continue;
     if (!isTrustedMarkerAuthor(c)) continue; // #3383 — a forged stand-down from an untrusted login is never terminal.
     if (isConcurrentAuthorStandDown(c)) continue; // fix procedure — reclassified as a re-armable pause.
     if (!isStandDownSuperseded(comments, i)) n += 1;
@@ -441,14 +500,15 @@ if (IS_CLI) {
   // one: free `--detail` prose is never sniffed (PR #2821 review — an unrelated stand-down that merely mentioned
   // a "concurrent author" was re-armed). A legacy conflict-shaped post is still reclassified when READ.
   const concurrent = flags.reason === 'concurrent-author';
-  const body = concurrent
+  const loadHold = flags.reason === 'load-flake' && !!flags.alt && !!flags['alt-sha'];
+  const body = loadHold ? buildLoadFlakeHoldComment({ head: flags.head, alt: flags.alt, altSha: flags['alt-sha'], detail }) : concurrent
     ? buildConcurrentAuthorPauseComment({
       actor, detail,
       head: typeof flags.head === 'string' ? flags.head : null,
       alt: typeof flags.alt === 'string' ? flags.alt : (parseAltBranch(detail)?.branch ?? null),
       altSha: typeof flags['alt-sha'] === 'string' ? flags['alt-sha'] : (parseAltBranch(detail)?.sha ?? null),
     })
-    : buildStandDownComment({ actor, reason: typeof flags.reason === 'string' ? flags.reason : undefined, detail });
+    : buildStandDownComment({ actor, reason: flags.reason === 'load-flake' ? 'gate-red' : typeof flags.reason === 'string' ? flags.reason : undefined, detail });
   const repoArgs = typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : []; // a missing --repo derives from cwd.
   const gh = (args) => execFileSync('gh', args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
   try {
@@ -469,7 +529,7 @@ if (IS_CLI) {
   // scanning labels sees it without reading the thread (PR #2811 had no label at all). Best-effort: the comment
   // above is the durable record the planner reads; a failed label write is reported, never fatal.
   let labeled = false;
-  if (!concurrent) {
+  if (!concurrent && !loadHold) {
     try {
       gh(['label', 'create', STAND_DOWN_LABEL, ...repoArgs, '--color', 'b60205', '--description', 'a fixer stood down; a person is the next step (auto-managed)', '--force']);
       gh(['pr', 'edit', String(pr), ...repoArgs, '--add-label', STAND_DOWN_LABEL]);
@@ -478,5 +538,5 @@ if (IS_CLI) {
       process.stderr.write(`⚠ stand-down: comment posted but the ${STAND_DOWN_LABEL} label failed: ${String(e.message || e).split('\n')[0]}\n`);
     }
   }
-  process.stdout.write(JSON.stringify({ ok: true, pr, stoodDown: !concurrent, paused: concurrent, labeled, dispatchClaimReleased }) + '\n');
+  process.stdout.write(JSON.stringify({ ok: true, pr, stoodDown: !concurrent && !loadHold, paused: concurrent, loadFlakeHold: loadHold, labeled, dispatchClaimReleased }) + '\n');
 }
