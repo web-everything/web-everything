@@ -476,7 +476,7 @@ export function fetchPrDiffPaths(pr, { exec = execFileSyncThrottled, root = REPO
     if (!isDiffTooLargeError(err)) return null;
     const paged = fetchPrFilesPaginated(pr, { exec, root, repo, opts });
     if (paged) return paged;
-    throw new PermanentScopeReadError(`PR #${pr}: \`gh pr diff\` is too large (HTTP 406, over 300 files) and the paginated file-list fallbacks failed too`);
+    throw new PermanentScopeReadError(`PR #${pr}: \`gh pr diff\` is too large (HTTP 406, over 300 files) and the paginated file-list fallbacks failed or were capped (possibly truncated) too`);
   }
 }
 
@@ -493,14 +493,20 @@ export function isDiffTooLargeError(err) {
   return /HTTP 406|too_large|exceeded the maximum number of files/i.test(text);
 }
 
-/** GitHub caps both file-list endpoints at 3000 files. */
+/** GitHub's `pulls/<n>/files` lists at most 3000 files; a list that reaches this size may be truncated. */
 export const MAX_PAGINATED_FILES = 3000;
+
+/** GitHub's `compare/<base>...<head>` lists at most 300 changed files (it paginates commits, not files) — a list that
+ *  reaches this size may be truncated, so it is never trusted as the complete PR scope (PR #3881 review). */
+export const MAX_COMPARE_FILES = 300;
 
 /**
  * The paginated fallback for a too-large PR diff. Prefers `compare/<base>...<headSha>` (diffed against the LIVE base
  * branch — the PR's real contribution), then `pulls/<n>/files` (diffed against the PR's recorded base sha, which can
  * lag main and overstate the list; PR #3794 showed 309 files there vs 8 against live main). Returns the de-duplicated
- * path list (capped at {@link MAX_PAGINATED_FILES}), or `null` when neither endpoint answered.
+ * path list, or `null` when no endpoint gave a COMPLETE answer: a compare list that reaches
+ * {@link MAX_COMPARE_FILES} falls through to `pulls/<n>/files`, and a `pulls/<n>/files` list that reaches
+ * {@link MAX_PAGINATED_FILES} is refused rather than returned as a partial scope.
  */
 export function fetchPrFilesPaginated(pr, { exec = execFileSyncThrottled, root = REPO_ROOT, repo = null, opts } = {}) {
   const o = opts || (() => ({
@@ -508,19 +514,23 @@ export function fetchPrFilesPaginated(pr, { exec = execFileSyncThrottled, root =
     timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
   }));
   const slug = repo || '{owner}/{repo}';
-  const lines = (out) => [...new Set(String(out || '').split('\n').map((s) => s.trim()).filter(Boolean))].slice(0, MAX_PAGINATED_FILES);
+  const lines = (out) => [...new Set(String(out || '').split('\n').map((s) => s.trim()).filter(Boolean))];
   try {
     const viewArgv = ['pr', 'view', String(pr), '--json', 'baseRefName,headRefOid', '--jq', '.baseRefName + " " + .headRefOid'];
     if (repo) viewArgv.push('--repo', repo);
     const [base, head] = String(exec('gh', viewArgv, o(1024 * 1024)) || '').trim().split(' ');
     if (base && head) {
       const out = exec('gh', ['api', '--paginate', '--method', 'GET', `repos/${slug}/compare/${base}...${head}`, '-F', 'per_page=100', '--jq', '.files[]?.filename'], o(8 * 1024 * 1024));
-      return lines(out);
+      const files = lines(out);
+      if (files.length < MAX_COMPARE_FILES) return files;
+      // At the compare cap the list may be truncated — fall through to pulls/<n>/files rather than trust it.
     }
   } catch { /* fall through to the pulls/files endpoint */ }
   try {
     const out = exec('gh', ['api', '--paginate', '--method', 'GET', `repos/${slug}/pulls/${pr}/files`, '-F', 'per_page=100', '--jq', '.[].filename'], o(8 * 1024 * 1024));
-    return lines(out);
+    const files = lines(out);
+    // At the pulls/files cap the list may be truncated too — refuse (null → permanent scope-too-large), never partial.
+    return files.length < MAX_PAGINATED_FILES ? files : null;
   } catch {
     return null;
   }

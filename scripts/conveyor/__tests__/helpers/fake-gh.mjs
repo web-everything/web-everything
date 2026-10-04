@@ -586,19 +586,23 @@ export function listChangedFilesNative(originPath, base, head) {
   });
 }
 
-/** REST shape: `{filename, status, patch}` — used by `pulls/{n}/files` and `compare/{a}...{b}`. */
-export function listChangedFilesRest(originPath, base, head) {
+/** REST shape: `{filename, status, patch}` — used by `pulls/{n}/files` and `compare/{a}...{b}`.
+ *  `maxPatched` bounds how many entries carry a `patch` (one `git diff` each — 300+ file PRs would otherwise run
+ *  past a daemon tick); the rest get `''`, as GitHub itself omits patches for very large diffs (PR #3881). */
+export function listChangedFilesRest(originPath, base, head, { maxPatched = Infinity } = {}) {
   const mb = mergeBaseOf(originPath, base, head);
   const lines = runGit(['diff', '--name-status', mb, head], originPath).split('\n').filter(Boolean);
-  return lines.map((line) => {
+  return lines.map((line, idx) => {
     const [code, path] = line.split('\t');
     const status = code.startsWith('A') ? 'added' : code.startsWith('D') ? 'removed' : code.startsWith('R') ? 'renamed' : 'modified';
     let patch = '';
-    try {
-      const raw = runGit(['diff', '--unified=3', mb, head, '--', path], originPath);
-      const at = raw.indexOf('\n@@');
-      patch = at === -1 ? '' : raw.slice(at + 1);
-    } catch { patch = ''; }
+    if (idx < maxPatched) {
+      try {
+        const raw = runGit(['diff', '--unified=3', mb, head, '--', path], originPath);
+        const at = raw.indexOf('\n@@');
+        patch = at === -1 ? '' : raw.slice(at + 1);
+      } catch { patch = ''; }
+    }
     return { filename: path, status, patch };
   });
 }

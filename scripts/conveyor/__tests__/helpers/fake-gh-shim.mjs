@@ -103,6 +103,21 @@ function callVerb() {
   return argv[0];
 }
 
+/** The fault buckets a call matches, most specific first. A `pulls/<n>/files` read ALSO matches the path-scoped
+ *  verb `'api pulls/files'`, so a scenario can fail that one endpoint without failing every `gh api` call (PR #3881). */
+function callFaultVerbs() {
+  const verb = callVerb();
+  if (verb === 'api' && argv.some((a) => /^repos\/[^/]+\/[^/]+\/pulls\/\d+\/files$/.test(a))) return ['api pulls/files', verb];
+  return [verb];
+}
+
+/** GitHub's real list caps: `compare/<a>...<b>` lists at most 300 changed files (it paginates commits, not files);
+ *  `pulls/<n>/files` at most 3000. Modelled faithfully so a truncated answer is reproducible (PR #3881). */
+const COMPARE_FILES_CAP = 300;
+const PULLS_FILES_CAP = 3000;
+/** Only this many entries of a file list carry a `patch` (one `git diff` each; GitHub omits patches on huge diffs too). */
+const LARGE_DIFF_PATCHES = 100;
+
 // -------------------------------------------------------------------------------------------------------
 // Tiny argv helpers — hand-rolled per subcommand rather than one generic parser, so each handler's flag set
 // stays obviously readable against the header's own list above.
@@ -447,8 +462,8 @@ function handleApi(store, rest) {
       const slug = `${m[1]}/${m[2]}`; const num = Number(m[3]);
       const repoState = requireRepo(store, slug); const pr = requirePr(repoState, num);
       const oids = resolveDiffOids(repoState, pr);
-      const filesRest = oids.headOid && oids.baseOid ? listChangedFilesRest(repoState.originPath, oids.baseOid, oids.headOid) : [];
-      return jsonResult(filesRest, jq);
+      const filesRest = oids.headOid && oids.baseOid ? listChangedFilesRest(repoState.originPath, oids.baseOid, oids.headOid, { maxPatched: LARGE_DIFF_PATCHES }) : [];
+      return jsonResult(filesRest.slice(0, PULLS_FILES_CAP), jq);
     }
     if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)$/))) {
       const slug = `${m[1]}/${m[2]}`; const num = Number(m[3]);
@@ -555,7 +570,7 @@ function handleApi(store, rest) {
       };
       return jsonResult({
         merge_base_commit: { sha: mergeBase }, ahead_by: count(`${a}..${b}`), behind_by: count(`${b}..${a}`),
-        files: listChangedFilesRest(repoState.originPath, a, b),
+        files: listChangedFilesRest(repoState.originPath, a, b, { maxPatched: LARGE_DIFF_PATCHES }).slice(0, COMPARE_FILES_CAP),
       }, jq);
     }
     if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/contents\/(.+)$/))) {
@@ -608,8 +623,7 @@ const result = withStore(STORE_PATH, (store) => {
     return { stderr: HTTP_401, exitCode: 1 };
   }
 
-  const verb = callVerb();
-  const bucket = store.faults[verb];
+  const bucket = callFaultVerbs().map((v) => store.faults[v]).find((b) => b && b.length);
   if (bucket && bucket.length) {
     const f = bucket[0];
     f.timesLeft -= 1;

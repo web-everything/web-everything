@@ -424,6 +424,77 @@ describe('fetchPrDiffPaths — 406 too_large falls back to the paginated file-li
     expect(fetchPrDiffPaths(3794, { exec, root: '/repo' })).toEqual(['x.ts']);
   });
 
+  // PR #3881 review (CONFIRMED correctness, block): GitHub's compare endpoint lists at most 300 changed files, so a
+  // 300-path compare answer may be a silently truncated scope. It must fall through to pulls/<n>/files (cap 3000).
+  describe('compare file cap (300) and pulls/files cap (3000) — never return a truncated scope', () => {
+    const paths = (n, prefix = 'f') => Array.from({ length: n }, (_, i) => `${prefix}${i}.md`).join('\n') + '\n';
+    const run = ({ compare, pulls }) => {
+      const seen = [];
+      const exec = execFor({
+        'pr diff': () => { throw tooLarge(); },
+        'pr view': 'main abc123\n',
+        'api --paginate': (argv) => {
+          const ep = argv.find((a) => a.startsWith('repos/'));
+          seen.push(ep.includes('/compare/') ? 'compare' : 'pulls');
+          const h = ep.includes('/compare/') ? compare : pulls;
+          if (h instanceof Error) throw h;
+          return h;
+        },
+      });
+      let result; let err;
+      try { result = fetchPrDiffPaths(3881, { exec, root: '/repo' }); } catch (e) { err = e; }
+      return { result, err, seen };
+    };
+
+    it('trusts a compare answer just under the cap (299 files) without calling pulls/files', () => {
+      const { result, seen } = run({ compare: paths(299) });
+      expect(result).toHaveLength(299);
+      expect(seen).toEqual(['compare']);
+    });
+
+    it('treats exactly 300 compare files as possibly truncated and reads pulls/files instead', () => {
+      const { result, seen } = run({ compare: paths(300), pulls: paths(450, 'p') });
+      expect(seen).toEqual(['compare', 'pulls']);
+      expect(result).toHaveLength(450);
+      expect(result[0]).toBe('p0.md');
+    });
+
+    it('treats more than 300 compare files as possibly truncated and reads pulls/files instead', () => {
+      const { result, seen } = run({ compare: paths(305), pulls: paths(320, 'p') });
+      expect(seen).toEqual(['compare', 'pulls']);
+      expect(result).toHaveLength(320);
+    });
+
+    it('refuses permanently (never a partial 300-file scope) when compare is capped and pulls/files fails', () => {
+      const { result, err, seen } = run({ compare: paths(300), pulls: new Error('boom') });
+      expect(seen).toEqual(['compare', 'pulls']);
+      expect(result).toBeUndefined();
+      expect(err).toBeInstanceOf(PermanentScopeReadError);
+    });
+
+    it('accepts pulls/files just under its 3000 cap (2999 files)', () => {
+      const { result } = run({ compare: paths(300), pulls: paths(2999, 'p') });
+      expect(result).toHaveLength(2999);
+    });
+
+    it('refuses permanently when pulls/files itself reaches the 3000 cap (possibly truncated)', () => {
+      const { result, err } = run({ compare: paths(300), pulls: paths(3000, 'p') });
+      expect(result).toBeUndefined();
+      expect(err).toBeInstanceOf(PermanentScopeReadError);
+    });
+
+    it('refuses permanently when pulls/files returns more than the cap', () => {
+      const { err } = run({ compare: paths(300), pulls: paths(3200, 'p') });
+      expect(err).toBeInstanceOf(PermanentScopeReadError);
+    });
+
+    it('refuses permanently when compare is unavailable and pulls/files is capped', () => {
+      const { err, seen } = run({ compare: new Error('404'), pulls: paths(3000, 'p') });
+      expect(seen).toEqual(['compare', 'pulls']);
+      expect(err).toBeInstanceOf(PermanentScopeReadError);
+    });
+  });
+
   it('throws a PERMANENT error (never plain null/transient) when every endpoint fails', () => {
     const exec = () => { throw tooLarge(); };
     let err;
