@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
 const done = (name, conclusion = 'SUCCESS') => ({ __typename: 'CheckRun', workflowName: 'CI', name, status: 'COMPLETED', conclusion });
 
@@ -19,7 +20,7 @@ export default {
       statusCheckRollup: [done('smoke'), done('daemon-soak'), done('soak-replay-gate'), done('test-shard (1)'), done('test-shard (2)', 'CANCELLED')] };
     const violations = [];
     // The App token cannot read branch protection (null) — the live condition.
-    const plan = sweepMissingRunRecovery({ repo: 'web-everything/web-everything', readOpenPrs: () => [pr], readRequiredContexts: () => null,
+    const plan = sweepMissingRunRecovery({ repo: CONSTELLATION_REPOS.we.slug, readOpenPrs: () => [pr], readRequiredContexts: () => null,
       readHeadCommittedAt: () => '2026-10-03T20:50:00Z', readComments: () => [], now: Date.parse('2026-10-04T11:50:00Z') });
     if (!plan.dispatch.some((d) => d.prNumber === 3850 && d.kind === 'trigger-ci')) violations.push('PR #3850 (required `test` absent, every other check completed) was not owed a CI trigger');
     return { violations };
