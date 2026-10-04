@@ -742,19 +742,3 @@ describe('runVerifyDispatch — run identity wiring (a fake spawnGate, a real ma
     expect(after.runId).toBeUndefined();
   });
 });
-
-// Live incident 2026-10-04 13:36Z: a plain FILE at the pool root (`.metadata_never_index`, the macOS Spotlight
-// sentinel) made the pool walk `readdirSync` it, throw ENOTDIR, and fail EVERY tick — no request was dispatched
-// for 2h and five sessions polled `check --wait` on markers nothing would settle (PR #3890's fixer, 9 timeouts).
-describe('runVerifyDispatch — a non-directory entry at the pool root never fails the sweep', () => {
-  it('dispatches a pending lane even when the pool root holds a plain file (the .metadata_never_index shape)', async () => {
-    writeFileSync(join(poolRoot, '.metadata_never_index'), '');
-    writeFileSync(join(poolDir, '.DS_Store'), '');
-    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
-    const calls = [];
-    const result = await runVerifyDispatch({ poolRoot, spawnGate: (args) => { calls.push(args[1]); return Promise.resolve({ pid: 1 }); } });
-    expect(calls).toEqual([`--repo=${laneDir}`]);
-    expect(result.dispatched).toHaveLength(1);
-    expect(result.dispatched[0]).toMatchObject({ pool: 'flagtest', lane: 1 });
-  });
-});

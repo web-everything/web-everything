@@ -79,8 +79,7 @@
  */
 
 import { parseSessionSlug } from './session-slug.mjs';
-import { existsSync, readFileSync } from 'node:fs';
-import { laneIndicesIn, poolsWithLanes } from '../lib/lane-pool-scan.mjs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -1131,12 +1130,22 @@ function readLease(dir) {
   }
 }
 
+/** Lane indices under a pool dir (`lane-N` children), sorted — mirrors lane-pool's own `laneIndicesIn`. */
+function laneIndicesIn(poolDir) {
+  if (!existsSync(poolDir)) return [];
+  return readdirSync(poolDir)
+    .filter((d) => /^lane-\d+$/.test(d))
+    .map((d) => Number(d.slice(5)))
+    .sort((a, b) => a - b);
+}
 
 /** Pool names under POOL_ROOT that hold lanes (skip scratch clones / render siblings) — one or the selected. */
 function poolsToScan(flags) {
   if (typeof flags.pool === 'string' && flags.pool) return [flags.pool];
-  // 2026-10-04 — shared walk: a non-directory root entry is skipped, never an ENOTDIR that fails the pass.
-  return poolsWithLanes(POOL_ROOT);
+  if (!existsSync(POOL_ROOT)) return [];
+  return readdirSync(POOL_ROOT)
+    .filter((name) => laneIndicesIn(join(POOL_ROOT, name)).length > 0)
+    .sort();
 }
 
 /**

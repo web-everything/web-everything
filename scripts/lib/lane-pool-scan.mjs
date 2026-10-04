@@ -1,6 +1,7 @@
 /**
- * lane-pool-scan.mjs — the ONE host-wide lane-pool walk shared by the resident daemons that sweep every pool
- * (`verify-dispatch.mjs`, `lease-reaper.mjs`).
+ * lane-pool-scan.mjs — a never-throwing host-wide lane-pool walk, used by the health watch's `laneVerifyMarkers`
+ * probe. (`verify-dispatch.mjs` and `lease-reaper.mjs` still carry their own copy, fixed for the same incident
+ * by PR #3902; folding them onto this helper is a follow-up, not done here to avoid conflicting with it.)
  *
  * WHY THIS EXISTS (live incident 2026-10-04 13:36Z). A plain FILE appeared at the pool root —
  * `~/workspace/.lanes/.metadata_never_index`, the macOS "never index this tree" sentinel dropped to cool a hot

@@ -114,8 +114,7 @@
  * lets #3878's standalone `we:skills-src/conveyor/verify-daemon.mjs` tick it directly. `main()` below is now a
  * thin CLI shell over it.
  */
-import { readFileSync, writeFileSync, renameSync } from 'node:fs';
-import { laneIndicesIn, poolsWithLanes } from '../lib/lane-pool-scan.mjs';
+import { existsSync, readFileSync, readdirSync, writeFileSync, renameSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -215,15 +214,24 @@ const POOL_ROOT = expandHome(process.env.LANE_POOL_ROOT) || join(homedir(), 'wor
 
 const log = (m) => process.stderr.write(m + '\n');
 
+/** Lane indices under a pool dir (`lane-N` children), sorted — mirrors lane-pool's own `laneIndicesIn`. */
+function laneIndicesIn(poolDir) {
+  if (!existsSync(poolDir)) return [];
+  return readdirSync(poolDir)
+    .filter((d) => /^lane-\d+$/.test(d))
+    .map((d) => Number(d.slice(5)))
+    .sort((a, b) => a - b);
+}
 
 /** Pool names under `poolRoot` that hold lanes — mirrors lease-reaper.mjs's `poolsToScan` (no `--pool` filter
  *  here: unlike the reaper, a delivery agent may request verification from any pool this runner drives).
  *  Defaults to the module-level {@link POOL_ROOT}; a caller only ever overrides it in a test (#4360), never in
  *  production. */
 function poolsToScan(poolRoot = POOL_ROOT) {
-  // 2026-10-04 — the shared walk skips a non-directory root entry (`.metadata_never_index`) instead of throwing
-  // ENOTDIR and failing the whole sweep every tick (see lib/lane-pool-scan.mjs).
-  return poolsWithLanes(poolRoot);
+  if (!existsSync(poolRoot)) return [];
+  return readdirSync(poolRoot)
+    .filter((name) => laneIndicesIn(join(poolRoot, name)).length > 0)
+    .sort();
 }
 
 function tryGit(args, cwd) {
