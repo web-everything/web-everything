@@ -92,3 +92,4 @@ Agent Meta · Memory · Model Routing cluster — open a leaf with `node scripts
 - [Night mode: quiet orchestration](night-mode-quiet-orchestration.md) — 10 PM ET (or "off for the night") until the operator pings back: no per-merge turns, 30-min check-ins, emergency stops always noted
 - [Redirect daemon sessions in emergencies](redirect-daemon-sessions-in-emergencies.md) — the orchestrator may message a live daemon session to stop or reorient it (relaying the operator); never to grant approval
 - [No Gemini reviews until v4](no-gemini-reviews-until-v4.md) — Gemini (also via Antigravity) takes no review seat until Gemini 4; false CONFIRMED findings looped #3432
+- [No long foreground commands](feedback-no-long-foreground-commands.md) — orchestrator foreground = quick reads only; verify, open-pr, card filing and fixes go to a background subagent (which runs verify in its own foreground); waits via background jobs or Monitor
