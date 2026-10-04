@@ -1478,4 +1478,19 @@ describe('lane-pool probes under a busy pool are SKIPPED (recorded), never allow
     expect(hostLooksBusy({}, { load: () => 3, cores: () => 10 })).toBe(false);
     expect(hostLooksBusy({ WE_SMOKE_BUSY_LOAD_RATIO: '4' }, { load: () => 25, cores: () => 10 })).toBe(false);
   });
+
+  it('busyPoolSkip: lane-pool lock contention is busy-pool, never blamed on an overlay (live 2026-10-04, #3902)', () => {
+    // The exact refusal that dropped the verify-dispatch ENOTDIR fix overlay twice: a DIFFERENT acquire held the
+    // shared scan lock. It names someone else's work, so it skips even when the load average looks idle.
+    const detail = 'lane-pool acquire --purpose=smoke failed: exited 1: ✗ no lane within 30000ms in pool "web-everything" — '
+      + "a different acquire's shared acquirability scan was still running when this call's --wait-ms elapsed (lock contention); "
+      + 'this is NOT necessarily because all 9 lane(s) are held/dirty — retry, or raise --wait-ms';
+    const idle = { env: {}, hostBusy: () => false };
+    expect(busyPoolSkip({ what: 'lane-pool acquire', detail, elapsedMs: 30_404, capMs: 30_000, ctx: idle }))
+      .toMatchObject({ ok: true, skipped: true, skipReason: 'busy-pool' });
+    // Still bounded: an early contention failure (well before the wait elapsed) is not excused.
+    expect(busyPoolSkip({ what: 'lane-pool acquire', detail, elapsedMs: 1_000, capMs: 30_000, ctx: idle })).toBeNull();
+    // A genuine all-held pool on an idle host still fails the smoke.
+    expect(busyPoolSkip({ what: 'lane-pool acquire', detail: 'x failed: no free lane in pool "w" (9 all held/dirty)', elapsedMs: 30_404, capMs: 30_000, ctx: idle })).toBeNull();
+  });
 });

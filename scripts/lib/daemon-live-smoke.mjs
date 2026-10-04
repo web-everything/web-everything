@@ -207,11 +207,17 @@ const failureLine = (e) => {
 // clock shows the probe really spent >= 90% of its cap, and (3) evidence from OUTSIDE the tree that the host is
 // busy (1-minute load average >= CPU count, `WE_SMOKE_BUSY_LOAD_RATIO` scales it). The rest of the smoke
 // (reconcile, dispatch dry-run, daemon boot, tree-stays-clean) still gates adoption.
+/** lane-pool's own "another acquire still held the shared scan lock" refusal (#xj2k2pp). It names a DIFFERENT
+ *  caller's work, never the tree under test, so it is busy-pool on its own — no host-load check needed. Live
+ *  2026-10-04: this text matched no signature, so the smoke blamed the only overlay (PR #3902/#3903, the
+ *  verify-dispatch ENOTDIR fix) and dropped it twice while no gate ran host-wide. */
+export const LOCK_CONTENTION_SIGNATURE = /scan was still running when this call's --wait-ms elapsed \(lock contention\)|gave up waiting for the shared acquirability-scan lock/;
 export const BUSY_POOL_SIGNATURES = Object.freeze([
   /^[^:]+ failed: timed out after \d+ms \(process group killed\)$/,
   /scan exceeded its \d+ms budget/,
   /gave up waiting for the shared acquirability-scan lock/,
   /no free lane/i,
+  LOCK_CONTENTION_SIGNATURE,
 ]);
 export const SMOKE_BUSY_LOAD_RATIO_ENV = 'WE_SMOKE_BUSY_LOAD_RATIO';
 
@@ -228,7 +234,8 @@ export function busyPoolSkip({ what, detail, elapsedMs, capMs, ctx }) {
   const text = String(detail ?? '');
   if (!BUSY_POOL_SIGNATURES.some((re) => re.test(text))) return null;
   if (!(elapsedMs >= capMs * 0.9)) return null;
-  const busy = typeof ctx.hostBusy === 'function' ? ctx.hostBusy() : hostLooksBusy(ctx.env);
+  const busy = LOCK_CONTENTION_SIGNATURE.test(text)
+    || (typeof ctx.hostBusy === 'function' ? ctx.hostBusy() : hostLooksBusy(ctx.env));
   if (!busy) return null;
   return {
     ok: true, skipped: true, skipReason: 'busy-pool',
