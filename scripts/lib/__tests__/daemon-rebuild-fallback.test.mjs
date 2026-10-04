@@ -500,3 +500,134 @@ describe('failsSameChecks', () => {
     expect(failsSameChecks([{ name: 'a' }], undefined)).toBe(false);
   });
 });
+
+// ── h. a LOAD-shaped smoke failure blames an overlay only through a same-run differential (live 2026-10-04) ──
+// Live 16:02Z / 16:26Z, wev-control: A (main + PR #3903) failed `lane-acquire-release` (lane-pool's own "lock
+// contention" refusal) and `dispatch-dry-run` ("timed out after 45000ms"). Plain main smoked minutes later, once
+// the contention cleared, and passed — so the healthy overlay was dropped, twice. Plain main fails the same two
+// checks under the same load.
+
+const CONTENTION = 'lane-pool acquire --purpose=smoke failed: exited 1: ✗ no lane within 30000ms in pool "web-everything" — a different acquire\'s shared acquirability scan was still running when this call\'s --wait-ms elapsed (lock contention); this is NOT necessarily because all 90 lane(s) are held/dirty — retry, or raise --wait-ms';
+const DISPATCH_TIMEOUT = 'dispatch dry-run child failed: timed out after 45000ms (process group killed)';
+const loadFail = () => ({
+  verdict: 'code',
+  attempts: 1,
+  smoke: {
+    results: [
+      { ok: false, name: 'lane-acquire-release', ms: 31_000, mayBeTransient: false, detail: CONTENTION },
+      { ok: false, name: 'dispatch-dry-run', ms: 45_100, mayBeTransient: false, detail: DISPATCH_TIMEOUT },
+    ],
+  },
+});
+const PASS = () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } });
+
+async function loadFixture(ref = 'lane/verify-pool-scan-non-dir', pr = 3903) {
+  const fx = makeFixture();
+  // Main moves past the clone, so plain main is a real (newer) build, as live.
+  const mainSha = advanceMain(fx.originDir, (dir) => writeFile(dir, 'main-moved.txt', 'y\n'));
+  pushBranch(fx.originDir, ref, (dir) => writeFile(dir, 'overlay.txt', 'x\n'));
+  addOverlay(fx.cloneDir, { ref, pr }, { env: fx.env });
+  return { ...fx, mainSha, ref };
+}
+
+describe('load-shaped smoke failure: an overlay is blamed only by a same-run differential', () => {
+  it('A fails under load, plain main passes, A re-smoked passes: adopts A and KEEPS the overlay', async () => {
+    const { cloneDir, env, ref } = await loadFixture();
+    let aCalls = 0;
+    const runSmoke = vi.fn(async ({ root }) => {
+      if (!existsSync(join(root, 'overlay.txt'))) return PASS();
+      aCalls += 1;
+      return aCalls === 1 ? loadFail() : PASS();
+    });
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+
+    expect(result.adopted).toBe(true);
+    expect(existsSync(join(cloneDir, 'overlay.txt'))).toBe(true);
+    expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual([ref]);
+    const kinds = result.alerts.map((a) => a.kind);
+    expect(kinds).not.toContain('overlay-dropped-smoke-failed');
+    expect(kinds).toContain('smoke-load-confirm-passed');
+    expect(runSmoke).toHaveBeenCalledTimes(3); // A, B (plain main), A again
+  });
+
+  it('A fails under load twice while plain main passes: environment — adopts plain main, keeps the overlay, backs off A', async () => {
+    const { cloneDir, env, ref, mainSha } = await loadFixture();
+    const t = 5_000_000;
+    const runSmoke = vi.fn(async ({ root }) => (existsSync(join(root, 'overlay.txt')) ? loadFail() : PASS()));
+    const result = await rebuildClone({
+      root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, now: () => t,
+    });
+
+    expect(result.reason).toBe('smoke-env-load');
+    expect(result.adopted).toBe(true);
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(mainSha); // clone is current on main
+    expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual([ref]);
+    expect(result.alerts.map((a) => a.kind)).not.toContain('overlay-dropped-smoke-failed');
+    const st = readRebuildState(cloneDir, env);
+    expect(st.rejected).toMatchObject({ envLoad: true, attempts: 1 });
+    expect(Date.parse(st.rejected.retryAt)).toBe(t + 5 * 60_000);
+
+    // Inside the backoff the same inputs are not re-smoked.
+    const again = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, now: () => t + 1000 });
+    expect(again.reason).toBe('still-rejected');
+    expect(runSmoke).toHaveBeenCalledTimes(3);
+  });
+
+  it('A and plain main both fail under load: environment hold with backoff — no last-good control, no harness-broken, overlay kept', async () => {
+    const { cloneDir, env, ref } = await loadFixture();
+    const runSmoke = vi.fn(async () => loadFail());
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+
+    expect(result.reason).toBe('smoke-env-load');
+    expect(result.moved).toBe(false);
+    expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual([ref]);
+    const st = readRebuildState(cloneDir, env);
+    expect(st.held?.reason).toBe('smoke-env-load');
+    expect(st.rejected).toMatchObject({ envLoad: true });
+    expect(st.rejected.harnessBroken).toBeUndefined();
+    expect(runSmoke).toHaveBeenCalledTimes(2); // A + B only
+  });
+
+  it('a load-shaped A failure never takes the "plain main is already running" no-smoke shortcut', async () => {
+    const fx = makeFixture();
+    expect((await rebuildClone({ root: fx.cloneDir, env: fx.env, runSmoke: passSmoke(), prState: async () => null, lockOpts: LOCK_OPTS })).reason).toBe('up-to-date');
+    pushBranch(fx.originDir, 'lane/x', (dir) => writeFile(dir, 'overlay.txt', 'x\n'));
+    addOverlay(fx.cloneDir, { ref: 'lane/x', pr: 1 }, { env: fx.env });
+    let aCalls = 0;
+    const runSmoke = vi.fn(async ({ root }) => {
+      if (!existsSync(join(root, 'overlay.txt'))) return PASS();
+      aCalls += 1;
+      return aCalls === 1 ? loadFail() : PASS();
+    });
+    const result = await rebuildClone({ root: fx.cloneDir, env: fx.env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(result.adopted).toBe(true);
+    expect(readOverlays(fx.cloneDir, { env: fx.env }).map((o) => o.ref)).toEqual(['lane/x']);
+    expect(runSmoke).toHaveBeenCalledTimes(3);
+  });
+
+  it('A re-smoke reproduces a CODE-shaped failure on the same check while plain main passed: the overlay is dropped', async () => {
+    const { cloneDir, env } = await loadFixture();
+    let aCalls = 0;
+    const runSmoke = vi.fn(async ({ root }) => {
+      if (!existsSync(join(root, 'overlay.txt'))) return PASS();
+      aCalls += 1;
+      return aCalls === 1 ? loadFail() : {
+        verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'dispatch-dry-run', ms: 900, mayBeTransient: false, detail: 'dispatch dry-run failed (1/3): review: Cannot find module x' }] },
+      };
+    });
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(result.reason).toBe('fallback-plain-main');
+    expect(readOverlays(cloneDir, { env })).toEqual([]);
+    expect(result.alerts.map((a) => a.kind)).toContain('overlay-dropped-smoke-failed');
+  });
+
+  it('knob WE_DAEMON_SMOKE_LOAD_DIFFERENTIAL=0 restores the single plain-main comparison', async () => {
+    const { cloneDir, env } = await loadFixture();
+    const runSmoke = vi.fn(async ({ root }) => (existsSync(join(root, 'overlay.txt')) ? loadFail() : PASS()));
+    const result = await rebuildClone({
+      root: cloneDir, env: { ...env, WE_DAEMON_SMOKE_LOAD_DIFFERENTIAL: '0' }, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+    expect(result.reason).toBe('fallback-plain-main');
+    expect(runSmoke).toHaveBeenCalledTimes(2);
+  });
+});
