@@ -1,5 +1,5 @@
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
-  readReferralRecords, mandatoryReferralState, renderReferralRecord,
+  readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
   activeReferrals, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
@@ -656,7 +656,9 @@ export function createReviewPrSinks({
         // Persist the attempt before dispatch. A crash or timeout spends this set's single automated attempt.
         for (const initial of existing) {
           if (initial.attempted || !activeReferrals(initial).length || !referralRecordState(initial, { ...context(state),
-            records: readReferralRecords(state.comments, context(state)).records }).pending.length) continue;
+            records: readReferralRecords(state.comments, context(state)).records,
+            // #4979 — an operator ruling already settled these findings; never spend the automated attempt on them.
+            operatorRulings: readOperatorRulings(state.comments, context(state)).rulings }).pending.length) continue;
           let record = { ...initial, attempted: true };
           state = persist(record);
           // Hold before dispatch too: an exhausted or interrupted worker must leave a visible owner.
