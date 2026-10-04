@@ -30,7 +30,7 @@ export default {
   id: 'capped-compare-scope-never-trusted',
   title: 'fix-dispatch accepts a 300-file compare answer (GitHub\'s cap) as the complete scope of a too-large PR and dispatches a fixer on it',
   card: 'PR #3881 review (block) — compare fallback accepts a truncated 300-file response',
-  fixedBy: { sha: '0c8dbfea8', where: 'lane/fix-polluted-branch-scope-read', paths: ['scripts/conveyor/reconcile-fix-dispatch.mjs'] },
+  fixedBy: { sha: '56c0967da', where: 'lane/fix-polluted-branch-scope-read', paths: ['scripts/conveyor/reconcile-fix-dispatch.mjs'] },
   fixPresent(root) {
     try {
       return /MAX_COMPARE_FILES/.test(readFileSync(join(root, 'scripts/conveyor/reconcile-fix-dispatch.mjs'), 'utf8'));
