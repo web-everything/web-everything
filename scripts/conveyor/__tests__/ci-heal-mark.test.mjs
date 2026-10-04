@@ -334,6 +334,12 @@ describe('CI-heal missing routing label incident replay', () => {
     { name: '#3463 prepare (2026-10-02 05:06:38Z)', pr: 3463, labels: ['ci:failed', 'review-status:fixing'], expected: ['review:pending'] },
     { name: '#3389 prevention (2026-10-01 22:17:17Z)', pr: 3389, head: '99d53bf598f9292ea964cad68d985f038e425cdc', labels: ['checking', 'review-status:fixing'], expected: ['review:pending'] },
     { name: 'existing prevention merge path', labels: ['ready-to-merge', 'checking'], expected: ['ready-to-merge'] },
+    // The final pre-write read is the child's THIRD view (parent observation, child initial read, pre-write read).
+    { name: 'verdict arrives at the pre-write read', file: 'source.js', guardCase: true, labels: [], raceAt: 3, race: { labels: [{ name: 'review:human' }] }, expected: ['review:human'] },
+    { name: 'ready-to-merge arrives at the pre-write read', file: 'source.js', guardCase: true, labels: [], raceAt: 3, race: { labels: [{ name: 'ready-to-merge' }] }, expected: ['ready-to-merge'] },
+    { name: 'draft arrives at the pre-write read', file: 'source.js', guardCase: true, labels: [], raceAt: 3, race: { isDraft: true }, expected: [] },
+    { name: 'draft status unknown at the pre-write read', file: 'source.js', guardCase: true, labels: [], raceAt: 3, race: { isDraft: null }, expected: [] },
+    { name: 'draft status unknown at the hand-back read', file: 'source.js', guardCase: true, labels: [], isDraftUnknown: true, expected: [] },
     ...['review:human', 'review:changes', 'review:pending', 'review:unknown'].map(label => ({ name: label, labels: [label], expected: [label] })),
     ...['review:human', 'review:changes', 'review:accepted', 'review:unknown'].map(label => ({ name: `concurrent ${label}`, labels: [], race: { labels: [{ name: label }] }, expected: [label] })),
     { name: 'concurrent head move', labels: [], race: { headRefOid: 'f'.repeat(40) }, expected: [] },
@@ -370,7 +376,7 @@ describe('CI-heal missing routing label incident replay', () => {
         expect(git('--git-dir=remote.git', 'rev-parse', 'refs/heads/lane')).toBe(healHead);
       }
       const labels = scenario.labels?.map(name => name === null ? null : ({ name }));
-      const state = { state: scenario.state || 'OPEN', isDraft: scenario.isDraft || false, headRefOid: healHead, labels, comments: [], files: scenario.file ? [{ path: scenario.file }] : [] };
+      const state = { state: scenario.state || 'OPEN', isDraft: scenario.isDraftUnknown ? undefined : scenario.isDraft || false, headRefOid: healHead, labels, comments: [], files: scenario.file ? [{ path: scenario.file }] : [] };
       writeFileSync(join(dir, 'state.json'), JSON.stringify(state));
       mkdirSync(join(dir, 'bin'));
       writeFileSync(join(dir, 'bin', 'gh'), `#!${process.execPath}
@@ -381,7 +387,7 @@ fs.appendFileSync('calls.jsonl', JSON.stringify(a) + '\\n');
 if (a[0] === 'pr' && a[1] === 'view') {
  if (scenario.readFails || (scenario.childReadFails && s.reads >= 1) || (scenario.refetchFails && s.written)) process.exit(1);
  s.reads = (s.reads || 0) + 1;
- if (s.reads === 2 && scenario.race) Object.assign(s, scenario.race);
+ if (s.reads === (scenario.raceAt || 2) && scenario.race) Object.assign(s, scenario.race);
  if (s.written && scenario.afterWrite) Object.assign(s, scenario.afterWrite);
  console.log(JSON.stringify(s));
 } else if (a[0] === 'pr' && a[1] === 'comment') {
@@ -419,7 +425,7 @@ fs.writeFileSync('state.json', JSON.stringify(s));
       const cleanup = planCiLifecycleLabelUpdate({ currentLabels: validLabels, desired: 'ready-to-merge', owned: ['checking', 'ci:failed', 'blocked'] });
       // fix-end removes its activity badge; drain removes stale CI labels on green.
       const afterGreen = validLabels.map(l => l.name).filter(l => l !== 'review-status:fixing' && !cleanup.toRemove.includes(l));
-      expect(afterGreen, JSON.stringify({ pushedSha: healHead, result: result.stdout, calls: readFileSync(join(dir, 'calls.jsonl'), 'utf8'), labels: final.labels })).toEqual(scenario.name === 'existing prevention merge path' ? ['review:pending'] : scenario.expected);
+      expect(afterGreen, JSON.stringify({ pushedSha: healHead, result: result.stdout, calls: readFileSync(join(dir, 'calls.jsonl'), 'utf8'), labels: final.labels })).toEqual(scenario.expected);
       const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
       expect(calls.every(c => c.includes('web-everything/web-everything') || c.includes('--repo=web-everything/web-everything'))).toBe(true);
       const edits = calls.filter(c => c[1] === 'edit');
@@ -473,10 +479,9 @@ fs.writeFileSync('state.json', JSON.stringify(s));
         expect(readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse).filter(c => c[1] === 'edit')).toHaveLength(1);
 
       }
-      if (scenario.pr || scenario.name === 'existing prevention merge path') {
+      if (scenario.pr) {
         expect(edits).toHaveLength(1);
-        if (scenario.name === 'existing prevention merge path') expect(edits[0]).toEqual(expect.arrayContaining(['--remove-label', 'ready-to-merge']));
-        else expect(edits[0]).not.toContain('--remove-label');
+        expect(edits[0]).not.toContain('--remove-label');
         expect(outcome).toMatchObject({ restored: 'review:pending' });
       } else {
         expect(outcome.restored).toBeUndefined();

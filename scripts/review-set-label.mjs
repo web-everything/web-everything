@@ -349,6 +349,11 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       || currentLabels.some(l => (typeof l === 'string' ? l : l.name).startsWith('review:')))) {
       return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: 'missing-only re-arm requires a valid empty review family' };
     }
+    // A producer-cleared `ready-to-merge` PR is on the merge path by authority this restore never holds: the
+    // re-arm would strip that clearance and push it into an independent-review cycle it was not meant to take.
+    if (missing && currentLabels.some(l => (typeof l === 'string' ? l : l.name) === READY_TO_MERGE_LABEL)) {
+      return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: 'missing-only re-arm preserves the producer ready-to-merge clearance' };
+    }
     const wasChanges = hasReviewLabel(currentLabels, REVIEW_LABELS.changes);
     const wasAccepted = hasReviewLabel(currentLabels, REVIEW_LABELS.accepted);
     if (requireLive === 'accepted' && !wasAccepted) {
@@ -1361,9 +1366,9 @@ export function runReviewLabelCli({
       }
       if (onlyIf === 'missing') {
         const fresh = provider.readPrState(repo, pr);
-        if (fresh.state !== 'OPEN' || fresh.headRefOid !== expectedHead
+        if (fresh.state !== 'OPEN' || fresh.isDraft !== false || fresh.headRefOid !== expectedHead
           || !decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: fresh.labels }).allowed) {
-          throw new Error('missing review handoff refused: state, head or review family changed before write');
+          throw new Error('missing review handoff refused: state, draft status, head or review family changed before write');
         }
         removals = presentRemoveLabels(decision.removeLabels, fresh.labels);
       }

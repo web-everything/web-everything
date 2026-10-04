@@ -521,9 +521,12 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
     const listed = shared || JSON.parse(exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '100', '--json', fields]));
     const rows = Array.isArray(listed) ? listed : []; // a throttle deferral object = skip this repo's PR smells this pass
     for (const pr of rows) {
-      // Snapshot rows may be cached. Only a successful fresh provider read counts for this smell.
+      // Snapshot rows may be cached. Only a successful fresh provider read counts for this smell — and only a PR
+      // whose cached labels hold no `review:*` label can be in breach, so a labelled PR costs no per-PR call
+      // (the shared snapshot stays the budgeted path for the common case).
       let reviewObservation = null;
-      try {
+      const cachedReviewLabelled = Array.isArray(pr.labels) && pr.labels.some(l => typeof l?.name === 'string' && l.name.startsWith('review:'));
+      if (!cachedReviewLabelled) try {
         const live = JSON.parse(exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'state,labels,headRefOid,headRefName,baseRefName']));
         if (live && !Array.isArray(live)) reviewObservation = { ...live, observedAt: now,
           commits: readCommits(slug, pr.number, { headRefName: live.headRefName, headRefOid: live.headRefOid, baseRefName: live.baseRefName,

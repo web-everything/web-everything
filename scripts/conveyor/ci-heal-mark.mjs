@@ -286,7 +286,9 @@ export function handBackCiHealReview({ pr, repo, headSha, cwd = process.cwd(), a
         rearmed = fallback.ok;
         if (!fallback.ok) carryReason = `${carryReason || ''}; re-arm failed: ${fallback.reason || 'unknown failure'}`;
       }
-    } else if (observed.isDraft !== true && Array.isArray(labels) && labels.every(l => l && typeof l.name === 'string' && l.name.length > 0) && !labels.some(l => l.name.startsWith('review:'))) {
+    } else if (observed.isDraft === false && !labels.some(l => l.name.startsWith('review:') || l.name === 'ready-to-merge')) {
+      // Only a PR KNOWN to be ready (`isDraft === false`) with neither a verdict nor the producer's own merge
+      // clearance is handed back; an unknown draft status or a `ready-to-merge` PR is left exactly as it is.
       const result = rearm({ pr, repo, cwd, actor, headSha, onlyIf: 'missing' });
       if (result.ok) restored = REVIEW_LABELS.pending;
       else carryReason = result.reason || 'missing review handoff refused';
