@@ -1,9 +1,10 @@
 ---
+bornAs: xa86gy7
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xun4mun-high-alert-when-agent-jobs-fail-fast-most-review-fix-or-buil.md"]
+scope: ["we:backlog/5034-high-alert-when-agent-jobs-fail-fast-most-review-fix-or-buil.md"]
 dateOpened: "2026-10-03"
 tags: []
 ---
@@ -12,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xun4mun-high-alert-when-agent-jobs-fail-fast-most-review-fix-or-buil.md:17` — A check:standards rule that refuses to land, or warns on, a backlog card whose Done-when still contains the scaffold TODO line.
+1. `we:backlog/5034-high-alert-when-agent-jobs-fail-fast-most-review-fix-or-buil.md:17` — A check:standards rule that refuses to land, or warns on, a backlog card whose Done-when still contains the scaffold TODO line.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#3861@15b6aea0e434bb9cd44a2a842821a40e04bc99b2
 
