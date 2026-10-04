@@ -40,7 +40,7 @@
 import { deriveSessionId, sessionSeed } from './judge-spawn.mjs';
 import { decideClearerIndependence, parseAuthorActorId } from './review-independence.mjs';
 import { CARE_LEVELS } from './review-escalation.mjs';
-import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { AUTOMATION_LOGINS, OPERATOR_LOGINS, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 // #2438's labelled data fence (#2967 moved it to a leaf so this module can reach it — `review-core.mjs`,
 // where it used to live, imports THIS module, so importing back would be a cycle).
 import { FENCED_DATA_RULE, fenceUntrusted } from './mandate-fence.mjs';
@@ -2332,13 +2332,23 @@ export function validateReferralRecord(r) {
  * Run-derived identities on other records confer no authority over this obligation.
  */
 export function referralRecordState(record, { head = record?.head, body = record?.authorBody ?? '', createdAt = '',
-  cardReadable = () => false, seatDisabled = () => false } = {}) {
+  cardReadable = () => false, seatDisabled = () => false, operatorRulings = [] } = {}) {
   if (!validateReferralRecord(record)) return { pending: ['malformed-referral-record'], blocked: [], rulings: [] };
   const pending = [], blocked = [], rulings = [];
   const independent = decideClearerIndependence({ authorId: parseAuthorActorId(body),
     clearerId: record.reviewer.id, prCreatedAt: createdAt }).independent === true;
   for (const f of activeReferrals(record)) {
     const recorded = record.rulings.filter(r => r.key === f.key);
+    // #4979 — the operator's ruling on THIS exact (repo, PR, head, run, finding) is the explicit, authorized
+    // supersession: the latest one decides, over the reviewer's. It is pinned to the record's head, so a new
+    // head (or an unreadable card) leaves the finding pending exactly like a reviewer ruling would.
+    const operator = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => o.repo === record.repo
+      && o.pr === record.pr && o.head === record.head && o.runId === record.runId && o.key === f.key).at(-1);
+    if (operator) {
+      if (head !== record.head || (operator.result === 'card' && !cardReadable(operator.card))) pending.push(f.key);
+      else { rulings.push(operator); if (operator.result === 'block') blocked.push(f.key); }
+      continue;
+    }
     // Match audited drops: disabling an optional seat cannot erase an existing ruling (especially a block),
     // even one not yet counted because its clearer is not independent.
     if (!recorded.length && seatDisabled(f.seat)) continue;
@@ -2427,10 +2437,114 @@ export function readReferralRecords(comments, { head } = {}) {
   return { records: [...records.values()], malformed };
 }
 
+/**
+ * #4979 — THE OPERATOR RULING PATH. The operator rules block / card / not-real on a mandatory referral; the
+ * sanctioned writer (`we:scripts/operations/record-referral-ruling.mjs`) posts it as ONE machine-marked PR
+ * comment. It never edits a referral record (those stay append-only and reviewer-scoped): the gate reads both.
+ *
+ * What makes a ruling count (every other shape is a hold, never a clearance):
+ *  - posted by a trusted principal: `author.login` is an automation or operator login. `viewerDidAuthor` alone
+ *    is not enough (same rule as the stand-down answer, we:scripts/conveyor/stand-down-answer-core.mjs);
+ *  - the body is EXACTLY what {@link buildOperatorRulingComment} renders from its own trailer, so prose,
+ *    quotes or a hand-edit cannot inject or alter a ruling;
+ *  - `actor` is a registered operator login (OPERATOR_LOGINS), with a one-line channel, the operator's words
+ *    verbatim, a timestamp and the recording session's id (audit; like `clear-human`, the actor is a recorded
+ *    assertion — #2895's honesty tax — not a signature);
+ *  - each ruling names the repo, PR, head SHA, referral run and finding key it rules on. The gate applies it only
+ *    to that exact record, only while that head is the PR's head; `card` needs a readable we:backlog card.
+ */
+export const OPERATOR_RULING_MARKER = 'mandatory-referral-operator-ruling-v1';
+export const OPERATOR_RULING_RESULTS = Object.freeze(['block', 'card', 'not-real']);
+const OPERATOR_RULING_OPENER = /^[ \t]*<!-- mandatory-referral-operator-ruling-v1:/m;
+const inertProse = s => String(s).replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;');
+
+/** Strict shape of one operator ruling record. Pure; never throws. */
+export function validateOperatorRuling(r) {
+  try {
+    if (!r || r.version !== 1 || !/^[^/\s]+\/[^/\s]+$/.test(r.repo) || !Number.isInteger(r.pr) || r.pr < 1
+      || !/^[a-f0-9]{40}$/.test(r.head)) return false;
+    if (typeof r.actor !== 'string' || !/^[\w-]+$/.test(r.actor) || !OPERATOR_LOGINS.includes(r.actor.toLowerCase())) return false;
+    if (typeof r.channel !== 'string' || !r.channel.trim() || /[\r\n]/.test(r.channel) || r.channel.length > 200) return false;
+    if (typeof r.reason !== 'string' || !r.reason.trim() || r.reason.length > 4000) return false;
+    if (typeof r.at !== 'string' || !Number.isFinite(Date.parse(r.at))) return false;
+    if (typeof r.clearerId !== 'string') return false;
+    if (!Array.isArray(r.rulings) || !r.rulings.length) return false;
+    const seen = new Set();
+    for (const x of r.rulings) {
+      if (!x || typeof x.runId !== 'string' || !x.runId.trim() || typeof x.key !== 'string' || !x.key.trim()
+        || !OPERATOR_RULING_RESULTS.includes(x.result)) return false;
+      if (x.result === 'card' ? !/^we:backlog\/[^/]+\.md$/.test(x.card ?? '') : x.card !== undefined) return false;
+      const id = JSON.stringify([x.runId, x.key]);
+      if (seen.has(id)) return false;
+      seen.add(id);
+    }
+    return true;
+  } catch { return false; }
+}
+
+/** Render the one sanctioned comment. The trailer is the only structured data; the visible text is inert. */
+export function buildOperatorRulingComment(r) {
+  if (!validateOperatorRuling(r)) throw new TypeError('invalid operator referral ruling');
+  const quote = inertProse(r.reason).split('\n').map(line => `> ${line}`).join('\n');
+  const lines = r.rulings.map((x, i) => {
+    let summary = '';
+    try { summary = String(JSON.parse(x.key).at(-1) ?? ''); } catch { /* opaque key */ }
+    return `${i + 1}. **${x.result}**${x.card ? ` → \`${inertProse(x.card)}\`` : ''} — ${inertProse(summary.replace(/\s+/g, ' ').slice(0, 300))} (run \`${inertProse(x.runId)}\`)`;
+  });
+  return `## Operator ruling on mandatory referrals\n\n`
+    + `Recorded on the operator's explicit instruction: @${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`.\n`
+    + `This rules only on the findings listed; it applies to this head only and does not change review labels.\n\n`
+    + `${quote}\n\n${lines.join('\n')}\n\n`
+    + `<!-- ${OPERATOR_RULING_MARKER}: ${Buffer.from(JSON.stringify(r)).toString('base64')} -->`;
+}
+
+/**
+ * Read one comment: `null` when it is not an operator-ruling comment, `{record}` when it is a valid one from a
+ * trusted principal, `{malformed: true, head?}` otherwise (an outsider's copy, a hand-edit, a truncated write).
+ */
+export function parseOperatorRulingComment(comment) {
+  const body = typeof comment === 'string' ? comment : comment?.body ?? '';
+  if (typeof body !== 'string' || !OPERATOR_RULING_OPENER.test(body)) return null;
+  const login = typeof comment === 'object' && comment ? String(comment.author?.login ?? '').toLowerCase() : '';
+  const trusted = login && [...AUTOMATION_LOGINS, ...OPERATOR_LOGINS].includes(login);
+  const normalized = body.replace(/\r\n/g, '\n').trimEnd();
+  const match = new RegExp(`\\n<!-- ${OPERATOR_RULING_MARKER}: ([A-Za-z0-9+/=]+) -->$`).exec(normalized);
+  let record = null;
+  try { record = match ? JSON.parse(Buffer.from(match[1], 'base64').toString('utf8')) : null; } catch { record = null; }
+  const head = typeof record?.head === 'string' && /^[a-f0-9]{40}$/.test(record.head) ? record.head : undefined;
+  if (!trusted || !record || !validateOperatorRuling(record)) return { malformed: true, head };
+  try { if (buildOperatorRulingComment(record) !== normalized) return { malformed: true, head }; }
+  catch { return { malformed: true, head }; }
+  return { record };
+}
+
+/** Every valid operator ruling in thread order, flattened to one entry per (run, finding). */
+export function readOperatorRulings(comments, { head } = {}) {
+  const rulings = [];
+  let malformed = false;
+  const current = /^[a-f0-9]{40}$/.test(head ?? '') ? head : null;
+  for (const comment of Array.isArray(comments) ? comments : []) {
+    const parsed = parseOperatorRulingComment(comment);
+    if (!parsed) continue;
+    // A broken ruling that provably belongs to another head cannot hold this one; anything else holds.
+    if (parsed.malformed) { malformed ||= !(current && parsed.head && parsed.head !== current); continue; }
+    const r = parsed.record;
+    for (const x of r.rulings) {
+      rulings.push(Object.freeze({ operator: true, repo: r.repo, pr: r.pr, head: r.head, runId: x.runId, key: x.key,
+        result: x.result, ...(x.card ? { card: x.card } : {}), actor: r.actor, channel: r.channel, reason: r.reason,
+        at: r.at, clearerId: r.clearerId }));
+    }
+  }
+  return { rulings, malformed };
+}
+
 /** Shared fresh-read acceptance boundary and replay state. */
 export function mandatoryReferralState(comments, context = {}) {
   const { records, malformed } = readReferralRecords(comments, context);
+  const operator = readOperatorRulings(comments, context);
+  context = { ...context, operatorRulings: operator.rulings };
   const pending = malformed ? ['malformed-referral-record'] : [];
+  if (operator.malformed) pending.push('malformed-operator-ruling');
   if (records.length && Object.hasOwn(context, 'head') && !/^[a-f0-9]{40}$/.test(context.head ?? '')) {
     pending.push('unavailable-reviewed-head');
   }
@@ -2444,5 +2558,5 @@ export function mandatoryReferralState(comments, context = {}) {
     pending.push(...state.pending);
     blocked.push(...state.blocked);
   }
-  return { records, pending: [...new Set(pending)], blocked: [...new Set(blocked)], malformed };
+  return { records, operatorRulings: operator.rulings, pending: [...new Set(pending)], blocked: [...new Set(blocked)], malformed };
 }

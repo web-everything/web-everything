@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
-import { readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
+import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -71,6 +71,12 @@ function wakeTime(pr, run) {
       const { records } = readReferralRecords([c], { head: pr.headRefOid });
       return records.some(r => r.repo === run.repo && r.pr === run.pr && r.head === run.head
         && r.rulings.some(ruling => !knownRulings.has(JSON.stringify(ruling)))) ? [at] : [];
+    }
+    // #4979 — an operator's block/card/not-real ruling on this run's head is a ruling like a reviewer's: it wakes.
+    const operatorRuling = parseOperatorRulingComment(c);
+    if (operatorRuling) {
+      const r = operatorRuling.record;
+      return r && r.repo === run.repo && r.pr === run.pr && r.head === run.head ? [at] : [];
     }
     if (body.startsWith(REARM_COMMENT_MARKER) || body.startsWith('🔁 review — changes requested')) return [at];
     // An operator reply is a request to reconsider, never authority to clear the human gate.
