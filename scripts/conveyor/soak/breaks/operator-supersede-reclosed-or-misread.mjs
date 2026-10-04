@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+// red-green: run with `--at-parent` — a later commit also edits stand-down-answer-core.mjs, so reverse-applying the fix hunks no longer applies cleanly.
 export default {
   id: 'operator-supersede-reclosed-or-misread',
   title: 'PR #3918: a reopened PR with a standing "Close as superseded" answer was re-planned for close every tick, and prose like "Supersedes the earlier ruling - keep the PR" was inferred as a close ruling',
