@@ -797,25 +797,15 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     ordered.push(stem); done.add(idFromName(stem));
   }
 
-  // Assign contiguous max+1 in that order; record in the LOCAL ledger.
-  let maxNum = stems.map(idFromName).filter(isNum).reduce((m, n) => Math.max(m, Number(n)), 0);
   const ledgerAbs = join(CWD, LEDGER_REL);
   let ledger = {};
   try { ledger = JSON.parse(readFileSync(ledgerAbs, 'utf8')) || {}; } catch { ledger = {}; }
-  const assigned = [];
-  for (const stem of ordered) {
-    const hash = idFromName(stem);
-    maxNum += 1;
-    const nnn = String(maxNum).padStart(3, '0');
-    ledger[hash] = nnn;
-    assigned.push({ hash, nnn });
-  }
 
   nextPhase('precheck');
-  // Fail fast before reference walks: only newly ledgered hashes can block this drain pass.
+  // Check all pending hashes before assigning numbers or walking references.
   const remainingBreakCites = new Map();
   for (const { name, content } of breakFiles) {
-    const rewritten = rewriteSoakCardCitation(content, (hash) => ledger[hash] ?? hash);
+    const rewritten = rewriteSoakCardCitation(content, (hash) => pendingHashes.has(hash) ? '0000' : (ledger[hash] ?? hash));
     remainingBreakCites.set(name, new Set(findHashPathCiteOutsideBacklog(rewritten, name).map((c) => c.hash)));
   }
 
@@ -830,17 +820,10 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   // own gate uses (scripts/lib/citation-check.mjs — one source of truth, never two independently-drifting
   // copies); repo-wide is still cheap (`--threads=1`, the #4166-measured win: a few tens of ms here).
   //
-  // A hit outside this pass's own swept files means some file the sweep doesn't know how to fix would be
-  // left pointing at a path that is about to stop existing — so this pass REFUSES to number ANY of its
-  // pending hashes (fail closed, whole-pass, not a partial per-hash carve-out: committing SOME renames while
-  // leaving others' cross-refs half-rewritten risks a new, harder-to-see inconsistency, and the existing
-  // numbering-mutex-contention path above already defers the WHOLE pass on a lesser obstacle). The hash(es)
-  // stay pending and are retried on the very next land — same shape as that mutex deferral.
-  // Gate on THIS pass's own renames only — never the whole append-only ledger: a hash numbered in some past
-  // pass stays in the ledger forever, and a stale historical mention of its path must not block every later
-  // numbering (PR #2757 review).
+  // Hold only the cited cards: keeping their paths and hash references preserves their pending state.
+  // WE_JIT_UNSWEPT_CITE_POLICY=pass retains the legacy whole-pass refusal; other values use card policy.
+  // Historical ledger hashes are irrelevant here: only pending cards could be renamed by this pass.
   const sweptRelPaths = new Set(files.map((f) => pathFor(f.name).relPath));
-  const renamingNow = new Set(assigned.map((a) => a.hash));
   let unsweptHashPathCites = [];
   try {
     const hits = execFileSync(
@@ -850,17 +833,50 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     unsweptHashPathCites = findHashPathCitesInGrepLines(hits)
       // Soak modules are only partially swept: a repaired card field cannot hide a remaining
       // hash-path citation in code/comments (even the same hash on the same line).
-      .filter((c) => renamingNow.has(c.hash) && (remainingBreakCites.has(c.file)
+      .filter((c) => pendingHashes.has(c.hash) && (remainingBreakCites.has(c.file)
         ? remainingBreakCites.get(c.file).has(c.hash)
         : !sweptRelPaths.has(c.file)))
       .map((c) => ({ path: c.file, hash: c.hash }));
   } catch { /* git grep exits 1 on no match, or git unavailable — no findings either way, never abort on that alone */ }
+  const held = [];
+  const heldHashes = new Set();
   if (unsweptHashPathCites.length) {
     const detail = unsweptHashPathCites.map((f) => `${f.path} cites ${f.hash}`).join('; ');
-    console.warn(`[numberPendingHashes] refusing this pass — a citation outside the rewrite scope would ` +
-      `dangle post-rename: ${detail}. Widen the sweep scope (scripts/lane-drain.mjs#numberPendingHashes) or ` +
-      `fix the citation, then this hash numbers on the next pass.`);
-    return finish({ assigned: [], committed: false, error: `hash-path citation outside the rewrite scope: ${detail}` });
+    if (process.env.WE_JIT_UNSWEPT_CITE_POLICY === 'pass') {
+      console.warn(`[numberPendingHashes] refusing this pass — a citation outside the rewrite scope would ` +
+        `dangle post-rename: ${detail}. Widen the sweep scope (scripts/lane-drain.mjs#numberPendingHashes) or ` +
+        `fix the citation, then this hash numbers on the next pass.`);
+      return finish({ assigned: [], committed: false, error: `hash-path citation outside the rewrite scope: ${detail}` });
+    }
+    for (const { hash, path } of unsweptHashPathCites) {
+      if (!heldHashes.has(hash)) {
+        heldHashes.add(hash);
+        held.push({ hash, citedBy: [] });
+      }
+      const entry = held.find((item) => item.hash === hash);
+      if (!entry.citedBy.includes(path)) entry.citedBy.push(path);
+    }
+    for (const { hash, citedBy } of held) {
+      console.warn(`[numberPendingHashes] holding ${hash} — cited by path outside the rewrite scope: ${citedBy.join(', ')}; ` +
+        `it stays pending (other cards number normally). Cite it as #${hash} instead.`);
+    }
+    if (heldHashes.size === pendingHashes.size) {
+      return finish({ assigned: [], committed: false, held, error: `hash-path citation outside the rewrite scope: ${detail}` });
+    }
+  }
+
+  // A held card must not be renamed by a STALE ledger entry either (the ledger is append-only and applyLedger
+  // swaps the whole of it), so drop any old mapping for it before anything reads the ledger.
+  for (const hash of heldHashes) delete ledger[hash];
+  // Assign contiguous max+1 only to eligible cards, retaining their topological order.
+  let maxNum = stems.map(idFromName).filter(isNum).reduce((m, n) => Math.max(m, Number(n)), 0);
+  const assigned = [];
+  for (const stem of ordered.filter((name) => !heldHashes.has(idFromName(name)))) {
+    const hash = idFromName(stem);
+    maxNum += 1;
+    const nnn = String(maxNum).padStart(3, '0');
+    ledger[hash] = nnn;
+    assigned.push({ hash, nnn });
   }
 
   nextPhase('resolve');
@@ -1022,7 +1038,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     inRepo(from) && inRepo(to) && existsSync(join(CWD, from)));
   // #2319 — `number-stranded --dry-run`: report the planned mapping + renames without touching the tree/index.
   if (dryRun) return finish({
-    assigned, committed: false, dryRun: true, unresolvedReferences,
+    assigned, held, committed: false, dryRun: true, unresolvedReferences,
     renamed: renames.map((r) => r.to),
     wouldRename: [...renames, ...livePathRenames].map((r) => ({ from: r.from, to: r.to })),
   });
@@ -1046,7 +1062,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     const content = rewriteByName.has(from) ? rewriteByName.get(from) : readFileSync(join(BL, `${from}.md`), 'utf8');
     writeFileSync(join(BL, `${to}.md`), content);
     if (quietGit(CWD, ['rm', '--quiet', `backlog/${from}.md`]) == null)
-      return finish({ assigned, committed: false, error: `git rm ${from} failed` });
+      return finish({ assigned, held, committed: false, error: `git rm ${from} failed` });
     toAdd.push(`backlog/${to}.md`);
     commitPaths.push(`backlog/${from}.md`, `backlog/${to}.md`);
   }
@@ -1059,7 +1075,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     const content = swapHashes(readFileSync(join(CWD, from), 'utf8'), ledgerEntries);
     writeFileSync(join(CWD, to), content);
     if (quietGit(CWD, ['rm', '--quiet', from]) == null)
-      return finish({ assigned, committed: false, error: `git rm ${from} failed` });
+      return finish({ assigned, held, committed: false, error: `git rm ${from} failed` });
     toAdd.push(to);
     commitPaths.push(from, to);
   }
@@ -1091,7 +1107,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   const paths = [...new Set(commitPaths)];
   const summary = assigned.map((a) => `${a.hash}→#${a.nnn}`).join(', ');
   const committed = quietGit(CWD, ['commit', '-m', assertNoClosingKeywordRef(`drain: JIT-number ${summary} at land (#2288)`, 'JIT-number commit message'), '--', ...paths]) != null;
-  return finish({ assigned, committed, unresolvedReferences, renamed: [...renames, ...livePathRenames].map((r) => r.to), changedPaths: paths });
+  return finish({ assigned, held, committed, unresolvedReferences, renamed: [...renames, ...livePathRenames].map((r) => r.to), changedPaths: paths });
 }
 
 /**

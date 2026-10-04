@@ -306,11 +306,58 @@ describe('numberPendingHashes — drain JIT numbering wire (#2288)', () => {
     expect(readFileSync(join(repo, 'backlog/2201-dependent.md'), 'utf8')).toContain('  - xdead00');
   });
 
+  it.each([undefined, 'card', 'unknown'])('holds only the cited card with policy %s', (policy) => {
+    const previous = process.env.WE_JIT_UNSWEPT_CITE_POLICY;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      if (policy === undefined) delete process.env.WE_JIT_UNSWEPT_CITE_POLICY;
+      else process.env.WE_JIT_UNSWEPT_CITE_POLICY = policy;
+      const alpha = '---\nkind: story\nstatus: open\n---\n# Alpha\n';
+      const citation = "export const fixture = { filename: 'backlog/xhash01-alpha.md' };\n// backlog/xhash01-alpha.md\n";
+      write('backlog/2200-legacy.md', '---\nblockedBy: [xhash01]\n---\n');
+      write('backlog/xhash01-alpha.md', alpha);
+      write('backlog/xhash02-beta.md', '---\nblockedBy: [xhash01]\n---\n# Beta cites #xhash01\n');
+      write('scripts/other.mjs', citation);
+      write(QUEUED_REL, JSON.stringify({ queued: [] }));
+      git('add', '.'); git('commit', '-qm', 'seed per-card hold');
+      const head = git('rev-parse', 'HEAD');
+      const held = [{ hash: 'xhash01', citedBy: ['scripts/other.mjs'] }];
+      const preview = numberPendingHashes(repo, { dryRun: true });
+      expect(preview).toMatchObject({ assigned: [{ hash: 'xhash02', nnn: '2201' }], held, committed: false, dryRun: true });
+      expect(git('status', '--porcelain').trim()).toBe('');
+      expect(existsSync(join(repo, LEDGER_REL))).toBe(false);
+      warn.mockClear();
+
+      const result = numberPendingHashes(repo);
+      expect(result).toMatchObject({ assigned: [{ hash: 'xhash02', nnn: '2201' }], committed: true, held });
+      expect(result.unresolvedReferences).toContainEqual({ hash: 'xhash01', name: 'xhash02-beta', status: 'in-flight' });
+      expect(backlogNames()).toEqual(['2200-legacy.md', '2201-beta.md', 'xhash01-alpha.md']);
+      expect(readFileSync(join(repo, 'backlog/xhash01-alpha.md'), 'utf8')).toBe(alpha);
+      expect(readFileSync(join(repo, 'scripts/other.mjs'), 'utf8')).toBe(citation);
+      expect(readFileSync(join(repo, 'backlog/2200-legacy.md'), 'utf8')).toContain('blockedBy: [xhash01]');
+      expect(readFileSync(join(repo, 'backlog/2201-beta.md'), 'utf8')).toContain('blockedBy: [xhash01]');
+      expect(JSON.parse(readFileSync(join(repo, LEDGER_REL), 'utf8'))).toEqual({ xhash02: '2201' });
+      expect(git('rev-parse', 'HEAD')).not.toBe(head);
+      expect(git('status', '--porcelain').trim()).toBe('');
+      expect(warn.mock.calls.filter(([line]) => line.startsWith('[numberPendingHashes] holding'))).toEqual([
+        ['[numberPendingHashes] holding xhash01 — cited by path outside the rewrite scope: scripts/other.mjs; it stays pending (other cards number normally). Cite it as #xhash01 instead.'],
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env.WE_JIT_UNSWEPT_CITE_POLICY;
+      else process.env.WE_JIT_UNSWEPT_CITE_POLICY = previous;
+      warn.mockRestore();
+    }
+  });
+
   it('refuses unswept citations before any reference-resolution subprocesses', () => {
     pendingReferences();
     write('scripts/other.mjs', '// backlog/xhash01-alpha.md\n');
     git('add', '.'); git('commit', '-qm', 'unswept citation');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const previous = process.env.WE_JIT_UNSWEPT_CITE_POLICY;
+    process.env.WE_JIT_UNSWEPT_CITE_POLICY = 'pass';
+    write('backlog/xhash02-beta.md', '---\nkind: story\n---\n');
+    git('add', '.'); git('commit', '-qm', 'another pending card');
     try {
       withGitLog((calls) => {
         const { phaseMs, ...result } = numberPendingHashes(repo, { dryRun: true });
@@ -324,7 +371,11 @@ describe('numberPendingHashes — drain JIT numbering wire (#2288)', () => {
           'fix the citation, then this hash numbers on the next pass.');
         expect(warn.mock.calls.filter(([line]) => line.startsWith('[numberPendingHashes] phaseMs'))).toHaveLength(1);
       });
-    } finally { warn.mockRestore(); }
+    } finally {
+      if (previous === undefined) delete process.env.WE_JIT_UNSWEPT_CITE_POLICY;
+      else process.env.WE_JIT_UNSWEPT_CITE_POLICY = previous;
+      warn.mockRestore();
+    }
   });
 
   it('batches distinct bornAs lookups and preserves the first landed number', () => {
@@ -773,6 +824,8 @@ describe('numberPendingHashes — drain JIT numbering wire (#2288)', () => {
     expect(res.committed).toBe(false);
     expect(res.error).toMatch(/hash-path citation outside the rewrite scope/);
     expect(res.error).toContain(citationPath);
+    expect(res.held).toEqual([{ hash: 'xhash01', citedBy: [citationPath] }]);
+    expect(existsSync(join(repo, LEDGER_REL))).toBe(false);
     // The tree is untouched — no partial rename, no rewrite, nothing staged.
     expect(git('status', '--porcelain').trim()).toBe('');
     expect(backlogNames()).toContain('xhash01-alpha.md');
