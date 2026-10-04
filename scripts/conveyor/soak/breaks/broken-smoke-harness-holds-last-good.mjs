@@ -77,6 +77,9 @@ export default {
         // control (last-good) smoke inherit the SAME broken budget — the whole point of "the harness is broken,
         // not the code".
         w.env.WE_SMOKE_TREE_STAYS_CLEAN_MS = '1';
+        // A broken harness now adopts the candidate as no worse by default; this scenario pins the opt-out
+        // hold-on-last-good path (WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE=0).
+        w.env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '0';
         return {};
       },
       async perRound(w, round, ctx, api) {

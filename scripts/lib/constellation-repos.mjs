@@ -88,6 +88,17 @@ export function repoKeyForSlug(slugOrKey) {
   return null;
 }
 
+/** Resolve a key or canonicalized OWNER/REPO slug at the gh boundary (PR #3794 received `--repo we`). */
+export function ghRepoSlug(keyOrSlug) {
+  if (typeof keyOrSlug === 'string') {
+    const key = repoKeyForSlug(keyOrSlug);
+    if (key) return CONSTELLATION_REPOS[key].slug;
+    const slug = canonicalizeSlug(keyOrSlug);
+    if (/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(slug)) return slug;
+  }
+  throw new Error('ghRepoSlug: expected a known repo key or an OWNER/REPO slug');
+}
+
 /**
  * Map a LEGACY slug to the repo's current one. The 2026-10-03 org move left old `chalbert/<repo>` names behind in
  * daemon-clone `origin` URLs and old config; git and REST follow GitHub's redirect for those, but GraphQL does

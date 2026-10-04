@@ -47,6 +47,8 @@ export const DEFAULT_HEALTH_CONFIG = Object.freeze({
   reminderAfterMs: 4 * HOUR,
   silenceDefaultMs: 72 * HOUR,
   healthStaleAfterMs: 15 * MINUTE,
+  // A parked review waiting on the operator's ruling alerts after this long (`ruling-needed-waiting`).
+  rulingNeededAfterMs: 2 * HOUR,
   historyKeep: 100,
   // Sustained ungated heavy runs: minimum runs per sample, samples per window, and window length.
   heavyRunUngatedMinRuns: 1,

@@ -239,7 +239,11 @@ export function buildCodexPrompt(task, { review = false } = {}) {
     `${task.trim()}\n\n---\n\n`
     + 'Make the change directly by editing files in this working directory. When you are done, STOP — do '
     + 'not run `git commit`, do not run `git push`, and do not open a pull request. A human will review the '
-    + 'diff and decide what to do with it.'
+    + 'diff and decide what to do with it.\n\n'
+    // heavy-enforce: Codex's own shell calls are not under the Claude Bash guard, so say it in the prompt too.
+    + 'Run tests ONLY through the host heavy-run queue: `node scripts/readiness/heavy-admission.mjs run -- npx '
+    + 'vitest run <test-file>` (or `npm run test:unit -- <test-file>`, `npm run check:standards`). Never run a '
+    + 'bare `npx vitest`, `npm test`, or `node scripts/check-standards.mjs` — they skip the queue and overload the host.'
   );
 }
 

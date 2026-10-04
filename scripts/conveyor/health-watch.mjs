@@ -544,7 +544,7 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
     // #4066 — `mergeable` + `comments` for the queue smells: `pr-stage-stall` classifies stages the stuck-PR
     // watch's own way (needs `mergeable`) and reads its markers off the thread; `stood-down-prs` counts the
     // stand-down markers. Both are already in the shared snapshot's field set, so the snapshot path costs nothing extra.
-    const fields = 'number,title,headRefName,labels,statusCheckRollup,updatedAt,isDraft,mergeable,comments';
+    const fields = 'number,title,headRefName,headRefOid,labels,statusCheckRollup,updatedAt,isDraft,mergeable,comments';
     const shared = exec === run ? readSharedOpenPrs({ repo: slug, fields }) : null;
     const listed = shared || JSON.parse(exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '100', '--json', fields]));
     const rows = Array.isArray(listed) ? listed : []; // a throttle deferral object = skip this repo's PR smells this pass
@@ -566,7 +566,7 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
       } catch { /* Unknown, not a clean observation. */ }
       out.push({
         reviewObservation,
-        repo: slug, number: pr.number, title: pr.title, headRefName: pr.headRefName, updatedAt: pr.updatedAt,
+        repo: slug, number: pr.number, title: pr.title, headRefName: pr.headRefName, headRefOid: pr.headRefOid ?? null, updatedAt: pr.updatedAt,
         isDraft: !!pr.isDraft,
         mergeable: pr.mergeable ?? null,
         // Only what the marker readers need (leading line, time, trusted author) — never the whole comment record.

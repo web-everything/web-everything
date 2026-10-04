@@ -10,6 +10,7 @@ import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const REFERRAL_RETRY_MS = [15, 30, 60].map(n => n * 60_000);
@@ -134,7 +135,15 @@ export function notifyReferralHold({ repo, prNumber, hold, comments = [],
   const detail = !hold.persistenceFailed ? '' : hold.retryAt
     ? `\n\nReferral persistence failed; the next bounded retry is at ${new Date(hold.retryAt).toISOString()}.`
     : '\n\nReferral persistence retries are exhausted; waiting for a new event.';
-  try { post(`${hold.why}${detail}\n\n${marker}`); }
+  // One line per waiting finding with its file, so the thread itself says what is owed (live 2026-10-04, PR #3794:
+  // "N referrals need a ruling" named nothing). A read failure just leaves the old, shorter notice.
+  let findings = '';
+  try {
+    const need = rulingNeeded({ headRefOid: hold.head, comments });
+    if (need) findings = `\n\nWaiting on your ruling (block, card or not-real):\n${need.findings
+      .map(f => `- \`${f.file ?? 'no file'}${f.line ? `:${f.line}` : ''}\` — ${f.summary}`).join('\n')}`;
+  } catch { /* the short notice still posts */ }
+  try { post(`${hold.why}${findings}${detail}\n\n${marker}`); }
   catch (e) {
     const error = String(e.message ?? e);
     const retryAt = error.includes('call not sent') && attempt <= REFERRAL_RETRY_MS.length
