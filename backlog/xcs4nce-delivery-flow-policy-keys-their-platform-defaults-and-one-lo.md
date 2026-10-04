@@ -83,9 +83,18 @@ dispatched, not when a PR merges (`we:scripts/conveyor/build-dispatch-policy.mjs
     agent-clearable), because it decides whether the merge protections fire. Register the loader
     `we:scripts/lib/delivery-policy.mjs` at the **engine tier**, like `we:scripts/merge-ai-prs.mjs`. An `off`/`free`/weaker value in a
     PR is then reviewed by a person, never cleared by an agent verdict.
+  - **A pointer target is policy-tier too, or it is refused.** A string pointer hands part of the policy to
+    another file, so editing only that file would otherwise skip `review:human` (the root file is untouched)
+    and weaken a protection after landing. The loader therefore accepts a pointer **only if its resolved
+    path is already a registered policy-tier, `leash: 'spec'` member** (`isPolicySpecPath` in
+    `we:scripts/lib/gate-config.mjs`, the one registry; the loader asks it, nothing else lists targets). Any
+    other pointer falls back to the default for that field with a warning naming the path. This holds with
+    or without a `ref`, and for a pointer found inside a pointed-to file. The MVP registers **no** pointer
+    target, so the pointer form is effectively off until a later story registers a target file in
+    `we:scripts/lib/gate-config.mjs`; that registration is itself a human-reviewed edit of the roster.
   - **Confinement.** A pointer path must resolve **inside `root`** (after `realpath`, so a symlink out of the
     tree is refused); an absolute path, a `..` escape, or a symlink out falls back to the default for that
-    field with a warning. `WE_POLICY_CONFIG` is honoured only for a local daemon process (never when
+    field with a warning. This is checked in addition to the registered-target rule above, never instead of it. `WE_POLICY_CONFIG` is honoured only for a local daemon process (never when
     `GITHUB_ACTIONS` is set, so a workflow cannot be redirected to a file the PR controls) and must resolve
     inside `root` or inside the daemon's own state dir; otherwise it is ignored with a warning.
 - Fields merge one by one over the default. A missing field keeps its default.
@@ -134,9 +143,19 @@ Types, defaults, the loader, the journal and the CLI. No consumer changes: each 
   - **Confinement:** a pointer that climbs out of `root` with `..`, an absolute path, and a symlink pointing
     out of `root` each give the default plus one warning. `WE_POLICY_CONFIG` is ignored under `GITHUB_ACTIONS=true` and
     when it points outside `root` and the state dir.
+  - **Pointer target (registered-only):** a pointer to an in-`root` JSON file that is **not** a registered
+    policy-tier member gives the default plus one warning that names the path, even though the file is valid
+    and holds a legal value (e.g. `onMainRed: off`). With a `ref`, the same pointer is refused when read from
+    git. A pointer inside a pointed-to file is refused the same way. With a temp registry that registers the
+    target, the pointer is honoured (source `config`), proving the check reads the registry rather than a
+    hardcoded list.
 - **Capability (RED today, fails before this lands):** `we:scripts/lib/__tests__/gate-config.test.mjs`:
   `we:webeverything.config.json` is a registered policy-tier, `leash: 'spec'` member (so a PR touching it
   forces `review:human`), and `we:scripts/lib/delivery-policy.mjs` is a registered engine-tier member.
+  **Pointer files:** a test that a pointer-target file (a temp JSON file the loader is pointed at) forces
+  `review:human` **when it is edited alone**, with `we:webeverything.config.json` untouched, once it is
+  registered. Together with the loader's registered-only pointer test above, no policy value can reach a
+  daemon from a file outside the human-gated roster.
 - **Capability (RED today, fails before this lands):** Replay of the failure this prevents: the defaults are the safe ones. With no config file, a test asserts
   `mergeGate.onMainRed` is `halt`, `drain.onStepRefusal` is `alert` and `dispatchGate.overlapOverride` is
   `off`. These are the settings whose absence let 2026-10-03 happen with no stop and no alert.
@@ -155,6 +174,9 @@ character and a 5 000-character reason, showing it stripped and cut.
 
 4. Trust: in a temp git repo, a base commit with `mergeGate.onMainRed` at `halt` and a PR commit that sets it
    to `off`. **Before** (reading the working tree): `off`. **After** (`--ref=<base>`): `halt`.
+5. Pointer target: a temp config whose `mergeGate` entry is a string pointer to a second temp JSON file (valid,
+   setting `onMainRed: off`) that is not registered. **Before** (no registered-target rule): `off` from
+   `config`. **After:** `halt` from `default`, with one warning naming that file.
 
 ## Follow-ups
 
