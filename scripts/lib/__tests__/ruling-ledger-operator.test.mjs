@@ -36,12 +36,13 @@ describe('PR #3794 replay (live thread)', () => {
     expect(m.ruling).toMatch(/string pointer to another JSON file/);
     expect(m.ruledAt).toBe('2026-10-04T01:19:33.000Z');
   });
-  it('the second head it came back on escalates, and shows up as a ruling the operator must give', () => {
+  it('the second head it came back on is a second miss; with the ladder set to ask the operator at 2 it shows as a ruling the operator must give', () => {
     const ig = ignoredRulings({ headRefOid: SECOND, comments: upto(51) });
     expect(ig.misses).toBe(2);
-    expect(ig.escalate).toBe(true);
-    const need = rulingNeeded({ headRefOid: SECOND, comments: upto(51) });
-    expect(need.findings.map((f) => [f.reason, f.file.slice(0, 15)])).toEqual([['dispute', 'backlog/xcs4nce']]);
+    expect(ig.escalate).toBe(false); // the platform default ladder tries a stronger model first
+    expect(rulingNeeded({ headRefOid: SECOND, comments: upto(51) })).toBeNull();
+    const asked = rulingNeeded({ headRefOid: SECOND, comments: upto(51) }, { humanAt: 2 });
+    expect(asked.findings.map((f) => [f.reason, f.file.slice(0, 15)])).toEqual([['dispute', 'backlog/xcs4nce']]);
   });
   it('the other findings on that head (never ruled block) are not flagged', () => {
     const ig = ignoredRulings({ headRefOid: SECOND, comments: upto(51) });

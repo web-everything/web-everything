@@ -818,10 +818,25 @@ export function withRulingNotAddressed(prompt, ruling) {
   return ruling?.matches?.length ? `${fixerRulingBrief(ruling)}${prompt}` : prompt;
 }
 
+/**
+ * The model override for a fixer-escalation rung, as the routing-policy `table` `buildAgentArgv` already takes (the
+ * same seam every dispatch uses, so claims, the fix claim and the re-arm are untouched). `null` = the ordinary
+ * `fix` route (the resend rung). The model was chosen by the routing policy for the rung's task type, never by hand.
+ * A route to a provider this path cannot launch is refused here rather than silently run on Claude.
+ */
+export function fixerTableFor(ruling) {
+  const route = ruling?.route ?? null;
+  if (!route) return null;
+  if (route.provider !== 'claude') {
+    throw new Error(`fixer-escalation: rung ${ruling.rung?.id} routes to ${route.provider}, which the fix dispatch cannot launch (only claude --bg is wired)`);
+  }
+  return { model: route.model, effort: route.effort, reason: `fixer-escalation rung ${ruling.rung?.id ?? '?'}` };
+}
+
 /** Post the send-back notice once per head (the durable record, and what the fixer reads on the thread). */
 export function postRulingNotice({ repo, pr, ruling, exec = execFileSyncThrottled }) {
-  // `ruling.sentBack` is read off the thread by the planner: a notice for this head already exists.
-  if (!ruling?.matches?.length || ruling.sentBack) return false;
+  // `noticedRungs` is read off the thread by the planner: one notice per head AND ladder rung.
+  if (!ruling?.matches?.length || (ruling.noticedRungs ?? []).includes(ruling.rung?.id ?? '*')) return false;
   exec('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body', renderRulingNotAddressed(ruling)],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
   return true;
@@ -958,7 +973,11 @@ export function dispatchFix(planned, {
     }, BRIEF_REQUIRED_BY_KIND.fix, optionalNames, REPO_AWARE_VALUE_PATTERNS);
     // The durable notice FIRST: a fixer that reads the thread must find the ruling there. A failed post throws, the
     // claim is released below, and the next tick retries; nothing has been spawned.
+    const ladderTable = fixerTableFor(planned.rulingNotAddressed); // may refuse before anything is posted
     postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
+    if (planned.rulingNotAddressed?.rung) {
+      console.error(`reconcile-fix-dispatch: PR #${planned.pr} ruling-not-addressed rung ${planned.rulingNotAddressed.rung.at} (${planned.rulingNotAddressed.rung.id}) model=${ladderTable?.model ?? 'default-fix-route'}`);
+    }
     const sessionId = String(mintSessionId());
     // #4174 — THE FIX: this session's cwd is a scratch directory outside `root`, never `root` itself (see
     // `dispatchSessionCwd`'s own header at the io shell for why — the identical bug `createDispatchSinks` had).
@@ -966,6 +985,7 @@ export function dispatchFix(planned, {
     const argv = buildAgentArgv({
       sessionId,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
+      ...(ladderTable ? { table: ladderTable } : {}),
       payload: { prompt: withAltBranchHint(withSalvageHint(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), sessionSlug, launchKind: 'fix' },
       // #3606 — see this function's own docblock: without this the fix agent reads a correctly-filled brief as an
       // unfilled template and self-aborts (3/3 live).

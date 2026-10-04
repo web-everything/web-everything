@@ -23,6 +23,7 @@
  */
 import { readReferralRecords, referralRecordState } from './jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { DEFAULT_FIXER_ESCALATION, TEST_FIRST_INSTRUCTION, humanAtMisses } from './fixer-escalation-policy.mjs';
 
 export const RULING_NEEDED_LABEL = 'advisory:ruling-needed';
 export const RULING_NEEDED_LABEL_META = Object.freeze({
@@ -32,7 +33,9 @@ export const RULING_NEEDED_LABEL_META = Object.freeze({
 
 /** Leading line of the send-back comment; its hidden second marker carries the head it answered. */
 export const RULING_NOT_ADDRESSED_MARKER = '⛔ conveyor — ruling not addressed';
-export const RULING_NOT_ADDRESSED_MISSES_TO_ESCALATE = 2;
+/** Misses at which the PLATFORM-DEFAULT ladder asks a person, with only Claude rungs available (the cross-provider rung
+ *  is dormant until a launcher is wired). Callers that loaded the effective ladder pass its own `humanAt`. */
+export const DEFAULT_HUMAN_AT = humanAtMisses(DEFAULT_FIXER_ESCALATION, { available: (r) => r.provider !== 'codex' });
 const SIMILARITY_FLOOR = 0.5;
 
 const SHA = /^[a-f0-9]{40}$/;
@@ -81,7 +84,7 @@ function currentRecords(snaps, head) {
  * @param {{comments?: Array, headRefOid?: string}} pr
  * @returns {null|{head:string, since:number|null, findings:Array<{key:string,seat:string,file:?string,line:?number,summary:string,reason:string}>}}
  */
-export function rulingNeeded(pr) {
+export function rulingNeeded(pr, { humanAt = DEFAULT_HUMAN_AT } = {}) {
   const head = String(pr?.headRefOid ?? '').toLowerCase();
   if (!SHA.test(head)) return null;
   const snaps = recordSnapshots(pr?.comments, head);
@@ -99,7 +102,7 @@ export function rulingNeeded(pr) {
     const pending = pendingKeys(record, head);
     for (const f of record.referrals) if (pending.includes(f.key) && !live.has(f.key)) live.set(f.key, { ...findingView(f), reason: 'pending' });
   }
-  const ig = ignoredRulings(pr);
+  const ig = ignoredRulings(pr, { humanAt });
   if (ig?.escalate) for (const m of ig.matches) if (!live.has(m.finding.key)) live.set(m.finding.key, { ...m.finding, reason: 'dispute' });
   return live.size ? { head, since, findings: [...live.values()] } : null;
 }
@@ -165,7 +168,7 @@ const hintMatchesFile = (hints, file) => !!file && hints.some((h) => String(file
  * A ruling the operator wrote AFTER this head's record is a fresh ruling on it, not an ignored one.
  * @returns {null|{head:string, misses:number, escalate:boolean, sentBack:boolean, sentBackAt:?number, matches:Array<object>}}
  */
-export function ignoredRulings(pr) {
+export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT } = {}) {
   const head = String(pr?.headRefOid ?? '').toLowerCase();
   if (!SHA.test(head)) return null;
   const snaps = recordSnapshots(pr?.comments, head);
@@ -223,42 +226,65 @@ export function ignoredRulings(pr) {
   }
   if (!matches.length) return null;
   const sent = sentBackAt(pr?.comments, head);
-  return { head, misses: worst, escalate: worst >= RULING_NOT_ADDRESSED_MISSES_TO_ESCALATE, sentBack: sent !== null, sentBackAt: sent, matches };
+  // A fixer that was sent back, ended, and left this head unchanged missed once more: the ladder counts it.
+  const returns = fixerReturnsAfter(pr?.comments, sent);
+  const effective = worst + returns;
+  return { head, misses: worst, returns, effectiveMisses: effective, escalate: effective >= humanAt, sentBack: sent !== null, sentBackAt: sent, noticedRungs: noticedRungs(pr?.comments, head), matches };
 }
 
-const sentBackLine = (head) => `<!-- ruling-not-addressed: ${head} -->`;
+/** Leading text of the fix-end marker (`we:scripts/conveyor/fix-procedure.mjs#FIX_END_MARKER`; a test pins them equal). */
+export const FIX_END_PREFIX = '🔓 conveyor fix-end';
+/** Turns a fixer ended after this head was sent back: each one that left the head unchanged is one more miss. */
+export function fixerReturnsAfter(comments, at) {
+  if (at == null) return 0;
+  return (Array.isArray(comments) ? comments : []).filter((c) => isTrustedMarkerAuthor(c)
+    && String(c?.body ?? '').trimStart().startsWith(FIX_END_PREFIX) && (sinceOf(c) ?? 0) > at).length;
+}
+
+const sentBackLine = (head, rungId = null) => `<!-- ruling-not-addressed: ${head}${rungId ? ` rung=${rungId}` : ''} -->`;
+const sentBackComments = (comments, head) => (Array.isArray(comments) ? comments : []).filter((c) => isTrustedMarkerAuthor(c)
+  && String(c?.body ?? '').trimStart().startsWith(RULING_NOT_ADDRESSED_MARKER)
+  && new RegExp(`<!-- ruling-not-addressed: ${head}(?: rung=[\\w-]+)? -->`).test(String(c.body)));
+/** The ladder rungs this head has already been announced on (one notice per head and rung). */
+export function noticedRungs(comments, head) {
+  return sentBackComments(comments, head).map((c) => /rung=([\w-]+)/.exec(c.body)?.[1] ?? '*');
+}
 /** When a trusted author sent this head back (ms), or null. Also the once-per-head guard for the post. */
 export function sentBackAt(comments, head) {
-  const times = (Array.isArray(comments) ? comments : []).filter((c) => isTrustedMarkerAuthor(c)
-    && String(c?.body ?? '').trimStart().startsWith(RULING_NOT_ADDRESSED_MARKER)
-    && String(c.body).includes(sentBackLine(head))).map((c) => sinceOf(c) ?? 0);
+  const times = sentBackComments(comments, head).map((c) => sinceOf(c) ?? 0);
   return times.length ? Math.min(...times) : null;
 }
 export const hasSentBack = (comments, head) => sentBackAt(comments, head) !== null;
 
 const where = (f) => `${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}`;
 /** The PR comment that goes with the send-back: the durable record AND what the fixer reads. */
-export function renderRulingNotAddressed({ head, matches }) {
+export function renderRulingNotAddressed({ head, matches, rung = null }) {
   return `${RULING_NOT_ADDRESSED_MARKER}\n\nThe last fix did not satisfy a ruling the operator already gave. `
-    + 'A review on the new head reports the same confirmed finding again, so this goes straight back to the fixer.\n\n'
+    + 'A review on the new head reports the same confirmed finding again, so this goes straight back to a fixer.\n\n'
+    + (rung ? `**Escalation rung ${rung.at} (${rung.id}):** ${rung.label}${rung.model ? ` — model ${rung.model}` : ''}.\n\n` : '')
     + matches.map((m) => `- \`${where(m.finding)}\` — ${m.finding.summary}\n`
       + `  - earlier ruling (${m.priorHead ? `head \`${m.priorHead.slice(0, 9)}\`` : `operator, ${m.ruledAt ?? 'earlier'}`}): ${m.ruling}\n`
       + `  - times it came back after the ruling: ${m.misses}`).join('\n')
-    + `\n\n${sentBackLine(head)}`;
+    + `\n\n${sentBackLine(head, rung?.id)}`;
 }
 
 /** The text put in front of the fixer's brief. */
-export function fixerRulingBrief({ matches }) {
+export function fixerRulingBrief({ matches, rung = null }) {
   return '# Ruling not addressed — read this first\n\n'
     + 'The operator already ruled on the finding(s) below, and your predecessor\'s last push did not satisfy the ruling. '
     + 'This is the whole ask: change the code so each finding is actually fixed as ruled. '
     + 'Treat the "⛔ conveyor — ruling not addressed" comment on the PR as the authoritative finding '
     + '(advisory-fix style: repair only this, no verdict, never touch review:human).\n\n'
     + matches.map((m) => `- ${where(m.finding)} — ${m.finding.summary}\n  Operator ruling, verbatim: ${m.ruling}\n  Note: the last fix did not satisfy this.`).join('\n')
+    + (rung?.instruction === TEST_FIRST_INSTRUCTION
+      ? '\n\nThis is escalation rung ' + rung.at + ' (' + rung.id + '): the same finding has now come back ' + rung.at + ' time(s). '
+        + 'Before changing any code, write a failing test for EACH finding above that fails on the current head for the reason the ruling gives, '
+        + 'show it red, then make the fix that turns it green. A fix without such a test will be judged as not addressing the ruling.'
+      : '')
     + '\n\n';
 }
 
-export const rulingDisputeText = (prNumber, ig) => `PR #${prNumber}: ${ig.matches.length} confirmed finding(s) the operator ruled "block" came back on the new head `
-  + (ig.sentBack && !ig.escalate ? '(the fixer was sent back and returned without a new head)' : `(${ig.misses} misses after the ruling)`)
-  + ' — fixer and reviewer disagree; a person (or an arbiter) must decide. '
+export const rulingDisputeText = (prNumber, ig, trail = '') => `PR #${prNumber}: ${ig.matches.length} confirmed finding(s) the operator ruled "block" came back on the new head `
+  + (ig.returns ? `(${ig.misses} miss(es) after the ruling, and ${ig.returns} fixer turn(s) ended without a new head)` : `(${ig.misses} misses after the ruling)`)
+  + ' — fixer and reviewer disagree; a person (or an arbiter) must decide.' + (trail ? ` Ladder so far: ${trail}.` : '') + ' '
   + ig.matches.map((m) => `${where(m.finding)}`).join(', ');

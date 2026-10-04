@@ -21,13 +21,14 @@ import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { labelNames } from '../lib/advisory-labels.mjs';
 import { RULING_NEEDED_LABEL, RULING_NEEDED_LABEL_META, rulingNeeded } from '../lib/ruling-ledger.mjs';
+import { loadFixerLadder } from './fixer-ladder.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 
 /** PURE: what to do about the label on one PR. */
-export function planRulingNeededLabel(pr) {
+export function planRulingNeededLabel(pr, opts = {}) {
   const has = labelNames(pr?.labels).includes(RULING_NEEDED_LABEL);
-  const need = rulingNeeded(pr);
+  const need = rulingNeeded(pr, opts);
   if (need && !has) return { action: 'add', need };
   if (!need && has) return { action: 'remove', need: null };
   return { action: 'none', need };
@@ -50,8 +51,11 @@ export function sweepRulingNeededLabels({ repo = null, listPrs = defaultListPrs,
   const prs = listPrs({ repo });
   const results = [];
   let resolvedRepo = repo;
+  // Where the effective fixer-escalation ladder hands a twice-ignored finding to the operator.
+  let humanAt;
+  try { humanAt = loadFixerLadder().humanAt; } catch { /* the platform default stands */ }
   for (const pr of Array.isArray(prs) ? prs : []) {
-    const plan = planRulingNeededLabel(pr);
+    const plan = planRulingNeededLabel(pr, humanAt === undefined ? {} : { humanAt });
     if (plan.action === 'none') continue;
     const entry = { num: pr.number, action: plan.action };
     if (!dryRun) {

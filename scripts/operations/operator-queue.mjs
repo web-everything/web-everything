@@ -48,6 +48,9 @@ import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
 let rulingLedger = null;
 let rulingLedgerError = null;
 try { rulingLedger = await import('../lib/ruling-ledger.mjs'); } catch (e) { rulingLedgerError = String(e?.message ?? e).split('\n')[0]; }
+// The effective ladder says where a twice-ignored finding becomes the operator's; absent, the platform default stands.
+let rulingHumanAt;
+try { rulingHumanAt = (await import('../conveyor/fixer-ladder.mjs')).loadFixerLadder().humanAt; } catch { /* default */ }
 const hasLabel = (pr, name) => (pr.labels ?? []).some((label) => label.name === name);
 
 /**
@@ -56,7 +59,7 @@ const hasLabel = (pr, name) => (pr.labels ?? []).some((label) => label.name === 
  * say), so it shows until a ruling or a new head clears it. `findings` is one line each plus the file.
  */
 export function rulingNeededRow(repo, pr) {
-  const need = rulingLedger?.rulingNeeded(pr);
+  const need = rulingLedger?.rulingNeeded(pr, rulingHumanAt === undefined ? {} : { humanAt: rulingHumanAt });
   if (!need) return null;
   return {
     repo, number: pr.number, title: pr.title, head: need.head,

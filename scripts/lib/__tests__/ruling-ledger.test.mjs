@@ -84,11 +84,12 @@ describe('ignoredRulings', () => {
       comment(record({ head: H2, runId: 'run-2', rulings: [block] }), 22)];
     expect(ignoredRulings({ headRefOid: H2, comments })).toBeNull();
   });
-  it('escalates on the second miss', () => {
+  it('counts the second miss, and asks the operator at the ladder\'s own threshold (default 3: resend, stronger model, then a person)', () => {
     const comments = [...history, comment(record({ head: H2, runId: 'run-2' }), 20), comment(record({ head: H3, runId: 'run-3' }), 40)];
     const ig = ignoredRulings({ headRefOid: H3, comments });
     expect(ig.misses).toBe(2);
-    expect(ig.escalate).toBe(true);
+    expect(ig.escalate).toBe(false);
+    expect(ignoredRulings({ headRefOid: H3, comments }, { humanAt: 2 }).escalate).toBe(true);
   });
   it('knows when the head was already sent back', () => {
     const comments = [...history, comment(record({ head: H2, runId: 'run-2' }), 20)];

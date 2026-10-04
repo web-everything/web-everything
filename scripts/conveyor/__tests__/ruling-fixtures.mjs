@@ -5,6 +5,7 @@ export const repo = 'web-everything/web-everything';
 export const H1 = 'a'.repeat(40);
 export const H2 = 'b'.repeat(40);
 export const H3 = 'c'.repeat(40);
+export const H4 = 'd'.repeat(40);
 export const SUMMARY = 'policy pointer files are missing from the standards manifest so the gate cannot see them';
 export const T0 = Date.parse('2026-10-03T08:00:00Z');
 export const iso = (min) => new Date(T0 + min * 60_000).toISOString();
