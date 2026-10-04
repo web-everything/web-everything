@@ -15,7 +15,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -58,19 +58,24 @@ function countGitSpawnsDuring(fn) {
   return { result, spawnCount };
 }
 
-// Inflate origin with N unrelated filler branches, each one commit, from a throwaway clone.
+// Inflate origin with N unrelated filler branches, each one commit off origin's current `main`. Written straight
+// into the bare origin with ONE `git fast-import` (one pack, one process) rather than N × (write + add + commit +
+// push + reset) in a throwaway clone — the same N real remote heads the lane fetches, at a small fraction of the
+// file-system churn (this helper alone was ~15k file events per run of this file).
 function addFillerHeads(n) {
-  const filler = join(base, 'filler');
-  if (!existsSync(filler)) {
-    git(['clone', '--quiet', originDir, filler]);
-  }
+  const mainSha = git(['rev-parse', 'refs/heads/main'], originDir);
+  const data = (s) => `data ${Buffer.byteLength(s)}\n${s}\n`;
+  let stream = '';
   for (let i = 0; i < n; i++) {
-    writeFileSync(join(filler, `filler-${Date.now()}-${i}.txt`), `filler-${i}\n`);
-    git(['add', '.'], filler);
-    gitc(['commit', '--quiet', '-m', `filler ${i}`], filler);
-    git(['push', '--quiet', 'origin', `HEAD:refs/heads/lane/filler-${i}`], filler);
-    git(['reset', '--quiet', '--hard', 'origin/main'], filler); // each filler branches fresh off main
+    stream += `commit refs/heads/lane/filler-${i}\n`
+      + 'committer t <t@t.com> 1700000000 +0000\n'
+      + data(`filler ${i}`)
+      + `from ${mainSha}\n`
+      + `M 100644 inline filler-${i}.txt\n`
+      + data(`filler-${i}`)
+      + '\n';
   }
+  execFileSync('git', ['fast-import', '--quiet'], { cwd: originDir, input: stream });
 }
 
 beforeEach(() => {

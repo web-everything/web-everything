@@ -1,5 +1,7 @@
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
 // #449 (per #606): WE consumes the plug platform layer as the `@frontierui/plugs` package — dev-time
 // resolved to the sibling Frontier UI source (mirrors vite.config.mts). Shared by vitest.config.ts and
@@ -35,3 +37,22 @@ export const weAlias = {
 // already pinned to exactly one worker for a CORRECTNESS reason (flaky under contention), not a speed one;
 // this constant governs the OTHER files' worker ceiling, never overrides an existing serialization need.
 export const maxTestWorkers = 4;
+
+// File-event churn fix: every `git init`/`git clone` a test (or a CLI it spawns, e.g. `lane-pool.mjs provision`)
+// runs copies git's default template — 14 `hooks/*.sample` files, `description`, `info/exclude` and their dirs —
+// into the new repo. The real-git lane-pool suite clones ~1,200 throwaway repos per run, so those inert copies
+// alone were ~20% of its ~230k file events (measured with a recursive FSEvents watch), and fseventsd pays for
+// every one. Point `GIT_TEMPLATE_DIR` at a minimal template instead: an EMPTY `hooks/` (git's sample hooks are
+// inert, never executed) and the stock `info/exclude`, so code and tests that write `.git/hooks/<name>` or
+// append to `.git/info/exclude` without a `mkdir` keep working exactly as on a stock clone. Created once per
+// host under the OS temp dir (idempotent), never inside the checkout. Inherited by every spawned `git`.
+export function minimalGitTemplateEnv(): { GIT_TEMPLATE_DIR: string } {
+  const dir = join(tmpdir(), 'we-test-git-template');
+  mkdirSync(join(dir, 'hooks'), { recursive: true });
+  mkdirSync(join(dir, 'info'), { recursive: true });
+  const exclude = join(dir, 'info', 'exclude');
+  if (!existsSync(exclude)) {
+    writeFileSync(exclude, "# git ls-files --others --exclude-from=.git/info/exclude\n# Lines that start with '#' are comments.\n");
+  }
+  return { GIT_TEMPLATE_DIR: dir };
+}
