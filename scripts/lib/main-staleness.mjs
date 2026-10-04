@@ -20,7 +20,7 @@ import { spawnSync } from 'node:child_process';
 import { realpathSync, writeSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { lastGoodForClone } from './daemon-last-good.mjs';
+import { lastGoodForClone, rebuildGraceForClone } from './daemon-last-good.mjs';
 
 /** Default git runner — spawnSync (returns non-zero without throwing). */
 export function gitRun(args, opts = {}) {
@@ -159,12 +159,26 @@ export function isCodePath(path) {
   return /\.(mjs|cjs|js|ts|json)$/.test(p) && !/(^|\/)__tests__\//.test(p) && !/\.test\.[mc]?[jt]s$/.test(p);
 }
 
-/** Files changed on `origin/<base>` since this checkout's merge-base with it (`git diff --name-only
- *  HEAD...origin/<base>`), or `null` on any git failure. */
-export function behindFiles(root, base = 'main', run = gitRun) {
-  const r = run(['diff', '--name-only', `HEAD...origin/${base}`], { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
+/** Env knob: `0` reverts {@link behindFiles} to the old merge-base diff (`git diff HEAD...origin/<base>`). */
+export const STALE_GUARD_MISSING_COMMITS_ENV = 'WE_STALE_GUARD_MISSING_COMMITS';
+
+/** Files touched by the commits this checkout is MISSING from `origin/<base>` (`HEAD..origin/<base>`), or
+ *  `null` on any git failure (callers fail closed).
+ *
+ *  Live 2026-10-04 (`wev-review-daemon`, PRs #3923/#3924): a daemon clone is `origin/main` plus overlay MERGE
+ *  commits, so it has several merge bases with `origin/main`, and `git diff HEAD...origin/main` silently picks
+ *  ONE (the plain-main base). Every file an overlay already brought in and that later landed on main
+ *  (`reconcile-core.mjs` via an overlay PR) then counted as "behind" — and as on the review path — so the guard
+ *  refused for code the clone already runs. Listing the missing commits instead is exact: commits reachable from
+ *  HEAD (the overlay branches' own commits) are excluded. `--cc` keeps a clean merge commit out (its changes are
+ *  its own commits, listed separately) but still names any file a merge RESOLVED differently from its parents. */
+export function behindFiles(root, base = 'main', run = gitRun, env = process.env) {
+  const opts = { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' };
+  const r = env?.[STALE_GUARD_MISSING_COMMITS_ENV] === '0'
+    ? run(['diff', '--name-only', `HEAD...origin/${base}`], opts)
+    : run(['log', '--cc', '--name-only', '--format=', `HEAD..origin/${base}`], opts);
   if (r.status !== 0) return null;
-  return String(r.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean);
+  return [...new Set(String(r.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean))];
 }
 
 /**
@@ -193,6 +207,8 @@ export function assertMainNotStale(root, checkStaleness, {
   reexec = reexecSelf, changedFiles = (r, from, to) => changedFilesBetween(r, from, to),
   // x5wbsbc — the last-known-good read (see `daemon-last-good.mjs`); injectable for tests.
   lastGood = (r, dirty) => lastGoodForClone({ root: r, headSha: readHeadSha(r), dirty }),
+  // The bounded rebuild-in-progress grace (see `daemon-last-good.mjs#decideRebuildGrace`); injectable for tests.
+  rebuildGrace = (r) => rebuildGraceForClone({ root: r }),
   write = (s) => process.stderr.write(s),
 } = {}) {
   // #4044 Module E — a MANAGED clone (`process.env.WE_DAEMON_MANAGED_CLONE === '1'`, set by
@@ -206,13 +222,15 @@ export function assertMainNotStale(root, checkStaleness, {
     base, autoFf: !managedClone, cleanOnly: true, run: (args) => gitRun(args, { cwd: r }),
   }));
   let st = check(root);
+  let behindMemo;
+  const behindList = () => (behindMemo === undefined ? (behindMemo = listBehindFiles(root)) : behindMemo);
   // #4044 (live 2026-09-25): the drain lands a commit every few minutes, most touching only `backlog/*.md`, and
   // the fix daemon refused WHOLE repos whenever its managed clone was a few such commits behind. This guard
   // exists so a dispatch never runs STALE CODE from this checkout's import path — commits that change no code
   // file cannot make it stale. So a managed clone behind ONLY in non-code files is fresh enough to dispatch;
   // the next tick-start rebuild still brings it current. Unknown diff ⇒ the refusal stands (fail closed).
   if (st && st.action === 'warn' && managedClone) {
-    const files = listBehindFiles(root);
+    const files = behindList();
     if (Array.isArray(files) && files.length > 0 && !files.some(isCodePath)) {
       process.stderr.write(`${label}: the managed clone is ${st.behind} commit(s) behind origin/${base} in non-code files only (${files.length} file(s)) — not stale for dispatch (#4044).\n`);
       st = { fresh: true, behind: st.behind, behindNonCodeOnly: true, files: files.length };
@@ -251,6 +269,24 @@ export function assertMainNotStale(root, checkStaleness, {
         fresh: true, behind: st.behind, onLastGood: true, lastGood: lg.lastGood, heldSince: lg.heldSince,
         heldReason: lg.held?.reason ?? null, overAge: lg.overAge,
       };
+    }
+  }
+  // Live 2026-10-04 (PRs #3923/#3924): a managed clone behind ON its dispatch path while its own rebuild is
+  // running (a smoke that takes many minutes on a loaded host) refused every review until the build landed. A
+  // BOUNDED grace covers that window: a live build lease, and a last adoption no older than
+  // `WE_STALE_GUARD_REBUILD_GRACE_MS` (default 60 min, 0 = off). Only for a caller that names its dispatch path
+  // and only with a KNOWN behind-file list — an unknown diff still refuses.
+  if (st && st.action === 'warn' && managedClone && typeof dispatchPath === 'function') {
+    const files = behindList();
+    let g = null;
+    if (Array.isArray(files) && files.length > 0) { try { g = rebuildGrace(root); } catch { g = null; } }
+    if (g && g.grace) {
+      const onPath = files.filter((f) => isCodePath(f) && dispatchPath(f));
+      const named = onPath.slice(0, 5).join(', ') + (onPath.length > 5 ? `, +${onPath.length - 5} more` : '');
+      write(`${label}: the managed clone is ${st.behind} commit(s) behind origin/${base} ON this dispatch's code path `
+        + `(${named}), but its rebuild${g.target ? ` to ${String(g.target).slice(0, 12)}` : ''} is in progress `
+        + `(${Math.round((g.sinceAdoptMs ?? 0) / 60_000)} min since the last adoption, within the grace) — dispatching.\n`);
+      st = { fresh: true, behind: st.behind, rebuildGrace: true, onPathFiles: onPath, buildTarget: g.target ?? null };
     }
   }
   if (st && st.synced) {
