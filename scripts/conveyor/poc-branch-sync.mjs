@@ -81,7 +81,7 @@ import {
   DEFAULT_RENAG_MS, DEFAULT_BASE_MS, DEFAULT_FACTOR, DEFAULT_CAP_MS, DEFAULT_MAX_ATTEMPTS,
   runDriftSweepBestEffort,
 } from './branch-sync.mjs';
-import { readRegistry, findPocBranch, resolveAutoSyncEnabled } from '../lib/poc-branches.mjs';
+import { readRegistry, findPocBranch, resolveAutoSyncEnabled, branchesForRepo } from '../lib/poc-branches.mjs';
 import { withPocLandLock, localRepoSlug } from '../readiness/drain-lock.mjs';
 import { isNonFastForwardRejection } from '../operations/poc-land.mjs';
 
@@ -307,7 +307,9 @@ export function syncOnePocBranchOnce({
 export function runPocBranchSync({ cwd = process.cwd(), env = process.env, registry = null, now = Date.now(), sync = syncOnePocBranchOnce } = {}) {
   const reg = registry ?? readRegistry();
   const results = [];
-  for (const entry of reg?.branches ?? []) {
+  // Only Web Everything's own branches: this pass runs in a WE checkout and merges WE's `main` (a sibling
+  // repo's registered POC branch — `repo` field — is landed by `poc-land` from its own lane, never synced here).
+  for (const entry of branchesForRepo(reg)) {
     if (!resolveAutoSyncEnabled(entry, env)) {
       results.push({ branch: entry.branch, status: 'disabled' });
       continue;

@@ -58,7 +58,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { gitRun } from '../lib/git-run.mjs';
-import { readRegistry, findPocBranch, normalizeBranchRef } from '../lib/poc-branches.mjs';
+import { readRegistry, findPocBranch, normalizeBranchRef, branchesForRepo, DEFAULT_POC_REPO } from '../lib/poc-branches.mjs';
 import { withPocLandLock, localRepoSlug } from '../readiness/drain-lock.mjs';
 import { createChecksRunner } from './verify-io.mjs';
 import { LEASE_FILENAME, renewedLease } from '../lib/lane-lease.mjs';
@@ -288,10 +288,13 @@ export function landOnPocBranch({
 
   // 0. Rule 10(c) — only a DECLARED branch is landable. Fail closed: an unreadable registry means "no POC
   //    branch is declared" and every target is refused, rather than a push to an unvetted ref.
+  // The lane's own repo picks which registry entries apply (`repo` field; no origin ⇒ Web Everything, the
+  // pre-`repo` behaviour), so a sibling repo's registered POC branch is landable from that repo's lane only.
+  const key = repoKey === undefined ? localRepoSlug({ cwd }) : repoKey;
   const reg = registry ?? readRegistry();
-  const entry = findPocBranch(reg, name);
+  const entry = findPocBranch(reg, name, key || DEFAULT_POC_REPO);
   if (!entry) {
-    const known = (reg?.branches ?? []).map((b) => b.branch);
+    const known = branchesForRepo(reg, key || DEFAULT_POC_REPO).map((b) => b.branch);
     return {
       status: 'not-registered',
       branch: name,
@@ -299,7 +302,7 @@ export function landOnPocBranch({
       verified: false,
       rebased: false,
       error: `"${name}" is not a registered POC branch (known: ${known.length ? known.join(', ') : 'none'}). `
-        + 'Doctrine rule 10(c): a POC branch must NAME what it is for and who graduates it — register it in '
+        + `${key && key !== DEFAULT_POC_REPO ? `(repo ${key}) ` : ''}Doctrine rule 10(c): a POC branch must NAME what it is for and who graduates it — register it in `
         + 'we:scripts/lib/poc-branches.json before landing on it.',
     };
   }
@@ -316,7 +319,6 @@ export function landOnPocBranch({
     if (!v?.ok) return { status: 'verify-failed', branch: name, attempts: 0, verified: false, rebased: false, error: v?.detail ?? 'verify reported no verdict' };
   }
 
-  const key = repoKey === undefined ? localRepoSlug({ cwd }) : repoKey;
   let rebased = false;
 
   const locked = withLock(() => {
