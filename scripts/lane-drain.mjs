@@ -67,7 +67,7 @@
  * failed (couple stopped, main left as far as it got); 3 = bad input (no manifest, invalid, not queued).
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, readdirSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, mkdtempSync, rmSync, existsSync, renameSync } from 'node:fs';
 import { resolve, join, isAbsolute, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
@@ -678,6 +678,21 @@ function rewriteSoakCardCitation(content, visit) {
  * failure is reported, the land stands.
  */
 export function numberPendingHashes(CWD, { dryRun = false } = {}) {
+  // Phase costs expose where the drain pass budget goes, including refused passes.
+  const phaseMs = { read: 0, precheck: 0, resolve: 0, apply: 0, write: 0 };
+  let phase = 'read';
+  let phaseStart = performance.now();
+  const nextPhase = (next) => {
+    const now = performance.now();
+    phaseMs[phase] += now - phaseStart;
+    phaseStart = now;
+    phase = next;
+  };
+  const finish = (result) => {
+    nextPhase(phase);
+    console.warn(`[numberPendingHashes] phaseMs ${Object.entries(phaseMs).map(([key, ms]) => `${key}=${ms.toFixed(2)}ms`).join(' ')}`);
+    return { ...result, phaseMs };
+  };
   const BL = join(CWD, 'backlog');
   const DOCS = join(CWD, 'docs', 'agent');
   const MEMORY = join(CWD, 'agent-memory-src');
@@ -796,96 +811,11 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     assigned.push({ hash, nnn });
   }
 
-  // Local bookkeeping cannot answer for another clone. Resolve explicit references through the
-  // durable origin/main bornAs record before applying this clone's ledger (#2903).
-  const unresolvedReferences = [];
-  const resolutions = new Map();
-  // #3383 perf — this used to answer "is `hash` visible on ANY ref" by building `visibleHashItems`
-  // (a Set of every backlog file name on every ref) with ONE `git ls-tree -r -- backlog/` SUBPROCESS
-  // PER visible ref (refs/heads/ + refs/remotes/), each one returning EVERY backlog filename at that
-  // ref (thousands of lines). Fine on a fresh clone (a handful of refs); on a mature constellation clone
-  // with 2000+ accumulated lane refs it is an O(refs) subprocess fan-out returning O(refs × backlog-size)
-  // lines of text into Node — measured live (#3383) at 10-14 minutes wall-clock for a SINGLE numbering
-  // pass that needed even one fallback resolve, vs the ~40-60s baseline for a pass that didn't (the
-  // resident drain-daemon's own numbering-critical-section lock caught red-handed: held 4+ minutes,
-  // CPU-bound, no visible child process — i.e. burning time re-parsing giant per-ref listings in JS, not
-  // waiting on git itself).
-  //
-  // Replaced with ONE `git rev-list --objects <refs…> -- backlog/` walk. `rev-list` shares the graph
-  // traversal across every ref given in a single argv (all these refs fork from the same overwhelmingly-
-  // shared history), so the cost tracks the repo's total backlog/ history ONCE, not per ref — measured on
-  // the live 2200+-ref clone: 4.9s total vs the prior O(refs) approach's 10+ minutes, and the output is
-  // ~15k lines (the whole history) instead of ~9M (every ref's full current listing). Slightly more
-  // inclusive than the old CURRENT-TREE-only check: a hash whose backlog file was later removed from
-  // every ref's TIP but still sits somewhere in a ref's REACHABLE HISTORY now reads 'in-flight' where it
-  // would have read 'unresolvable' before. That is the SAFE direction per this function's own contract two
-  // lines up ("Absence is NOT proof of death") — erring toward "still might be alive" only ever DEFERS a
-  // numbering decision, it never wrongly assigns one.
-  const localHashStems = new Set(stems.map(idFromName).filter(isHash)); // this clone's own tree — free, no git call
-  let refsCache = null;
-  const listVisibleRefs = () => {
-    if (!refsCache) refsCache = (quietGit(CWD, ['for-each-ref', '--format=%(refname)', 'refs/heads/', 'refs/remotes/']) || '').split('\n').filter(Boolean);
-    return refsCache;
-  };
-  let remoteHashSetCache = null; // built lazily ONCE per numberPendingHashes call, only if a fallback is ever needed
-  const remoteVisibleHashes = () => {
-    if (remoteHashSetCache) return remoteHashSetCache;
-    remoteHashSetCache = new Set();
-    const refs = listVisibleRefs();
-    if (!refs.length) return remoteHashSetCache;
-    let out = '';
-    try {
-      out = execFileSync('git', ['rev-list', '--objects', ...refs, '--', 'backlog/'],
-        { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
-    } catch { /* best-effort — an exec miss leaves the set empty; every fallback reads 'unresolvable' */ }
-    for (const line of out.split('\n')) {
-      const sp = line.indexOf(' '); // bare `<sha>` (no space) = a commit/tree object, not a backlog file
-      if (sp < 0) continue;
-      const path = line.slice(sp + 1);
-      if (!path.startsWith('backlog/')) continue;
-      const id = idFromName(path.slice('backlog/'.length).replace(/\.md$/, ''));
-      if (isHash(id)) remoteHashSetCache.add(id);
-    }
-    return remoteHashSetCache;
-  };
-  const resolveReference = (hash, name) => {
-    if (ledger[hash] !== undefined) return hash; // the existing ledger pass owns this rewrite
-    if (!resolutions.has(hash)) resolutions.set(hash, landedNumberFor(hash, CWD));
-    const landed = resolutions.get(hash);
-    if (landed !== null) return landed;
-    // A visible provisional item is positive evidence of in-flight work. Absence is NOT proof
-    // of death: another clone may have an unfetched/private branch. Surface that uncertainty.
-    const visible = localHashStems.has(hash) || remoteVisibleHashes().has(hash);
-    const status = visible ? 'in-flight' : 'unresolvable';
-    if (!unresolvedReferences.some((r) => r.hash === hash && r.name === name)) {
-      unresolvedReferences.push({ hash, name, status });
-      console.warn(`[numberPendingHashes] ${name}: ${hash} ${status}` +
-        (status === 'unresolvable' ? ' (no ledger, bornAs, or visible provisional item; potentially dead)' : ' (visible provisional item; left pending)'));
-    }
-    return hash;
-  };
-  const resolvedFiles = files.map(({ name, content }) => ({ name,
-    content: mapHashReferences(content, (hash) => resolveReference(hash, name)),
-  }));
-  // Only newly assigned items are stamped; fallback mappings never alter birth records or numbering.
-  const { renames, rewrites, pathRenames } = applyLedger(resolvedFiles, ledger);
-  // applyLedger compares against resolvedFiles, so retain fallback-only edits as well.
-  const rewrittenNames = new Set(rewrites.map((r) => r.name));
-  for (const file of resolvedFiles) {
-    if (!rewrittenNames.has(file.name) && file.content !== contentByName.get(file.name)) rewrites.push(file);
-  }
-  // #4247 — repair a bare-digit `ack` value the swap above just produced (see normalizeFlowAckCardRefs'
-  // own docblock) in every flow file THIS pass rewrote; never a repo-wide sweep for pre-existing staleness.
-  for (const r of rewrites) {
-    if (r.name.endsWith('.flow.json')) r.content = normalizeFlowAckCardRefs(r.content);
-  }
-  // Keep soak modules out of BOTH generic passes (fallback reference resolution and applyLedger,
-  // including its path-renaming side effects). Old ledger entries are just as dangerous as new IDs:
-  // 952011907 replaced the queue soak's historical HASH with its LANDED_NUM via an old ledger mapping.
+  nextPhase('precheck');
+  // Fail fast before reference walks: only newly ledgered hashes can block this drain pass.
   const remainingBreakCites = new Map();
   for (const { name, content } of breakFiles) {
-    const rewritten = rewriteSoakCardCitation(content, (hash) => ledger[hash] ?? resolveReference(hash, name));
-    if (rewritten !== content) rewrites.push({ name, content: rewritten });
+    const rewritten = rewriteSoakCardCitation(content, (hash) => ledger[hash] ?? hash);
     remainingBreakCites.set(name, new Set(findHashPathCiteOutsideBacklog(rewritten, name).map((c) => c.hash)));
   }
 
@@ -930,9 +860,155 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     console.warn(`[numberPendingHashes] refusing this pass — a citation outside the rewrite scope would ` +
       `dangle post-rename: ${detail}. Widen the sweep scope (scripts/lane-drain.mjs#numberPendingHashes) or ` +
       `fix the citation, then this hash numbers on the next pass.`);
-    return { assigned: [], committed: false, error: `hash-path citation outside the rewrite scope: ${detail}` };
+    return finish({ assigned: [], committed: false, error: `hash-path citation outside the rewrite scope: ${detail}` });
   }
 
+  nextPhase('resolve');
+  // Local bookkeeping cannot answer for another clone. Resolve explicit references through the
+  // durable origin/main bornAs record before applying this clone's ledger (#2903).
+  const unresolvedReferences = [];
+  // One lazy bornAs scan replaces per-hash git startups within the drain pass budget.
+  let bornAsNumbers = null;
+  const landedNumbers = () => {
+    if (bornAsNumbers) return bornAsNumbers;
+    bornAsNumbers = new Map();
+    try {
+      const out = execFileSync('git', ['grep', '-E', '^bornAs: x[0-9a-z]{6}$', 'origin/main', '--', 'backlog/'],
+        { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 });
+      const seen = new Set();
+      for (const line of out.split('\n')) {
+        const match = line.match(/^origin\/main:(backlog\/.*):bornAs: (x[0-9a-z]{6})$/);
+        if (!match || seen.has(match[2])) continue;
+        seen.add(match[2]); // First path wins, even when its non-numeric stem yields no number.
+        const number = match[1].match(/backlog\/(\d{1,5})-.*\.md$/);
+        if (number) bornAsNumbers.set(match[2], number[1]);
+      }
+    } catch { /* best-effort — no origin/main or git failure means no landed mappings */ }
+    return bornAsNumbers;
+  };
+  // #3383 perf — this used to answer "is `hash` visible on ANY ref" by building `visibleHashItems`
+  // (a Set of every backlog file name on every ref) with ONE `git ls-tree -r -- backlog/` SUBPROCESS
+  // PER visible ref (refs/heads/ + refs/remotes/), each one returning EVERY backlog filename at that
+  // ref (thousands of lines). Fine on a fresh clone (a handful of refs); on a mature constellation clone
+  // with 2000+ accumulated lane refs it is an O(refs) subprocess fan-out returning O(refs × backlog-size)
+  // lines of text into Node — measured live (#3383) at 10-14 minutes wall-clock for a SINGLE numbering
+  // pass that needed even one fallback resolve, vs the ~40-60s baseline for a pass that didn't (the
+  // resident drain-daemon's own numbering-critical-section lock caught red-handed: held 4+ minutes,
+  // CPU-bound, no visible child process — i.e. burning time re-parsing giant per-ref listings in JS, not
+  // waiting on git itself).
+  //
+  // Replaced with ONE `git rev-list --objects <refs…> -- backlog/` walk. `rev-list` shares the graph
+  // traversal across every ref given in a single argv (all these refs fork from the same overwhelmingly-
+  // shared history), so the cost tracks the repo's total backlog/ history ONCE, not per ref — measured on
+  // the live 2200+-ref clone: 4.9s total vs the prior O(refs) approach's 10+ minutes, and the output is
+  // ~15k lines (the whole history) instead of ~9M (every ref's full current listing). Slightly more
+  // inclusive than the old CURRENT-TREE-only check: a hash whose backlog file was later removed from
+  // every ref's TIP but still sits somewhere in a ref's REACHABLE HISTORY now reads 'in-flight' where it
+  // would have read 'unresolvable' before. That is the SAFE direction per this function's own contract two
+  // lines up ("Absence is NOT proof of death") — erring toward "still might be alive" only ever DEFERS a
+  // numbering decision, it never wrongly assigns one.
+  const localHashStems = new Set(stems.map(idFromName).filter(isHash)); // this clone's own tree — free, no git call
+  let refsCache = null;
+  const listVisibleRefs = () => {
+    if (!refsCache) refsCache = [...new Set((quietGit(CWD, ['for-each-ref', '--format=%(objectname)', 'refs/heads/', 'refs/remotes/']) || '').split('\n').filter(Boolean))];
+    return refsCache;
+  };
+  let remoteHashSetCache = null; // built lazily ONCE per numberPendingHashes call, only if a fallback is ever needed
+  const remoteVisibleHashes = () => {
+    if (remoteHashSetCache) return remoteHashSetCache;
+    remoteHashSetCache = new Set();
+    const tips = listVisibleRefs();
+    // Cache history across passes: deleted refs may retain diagnostic visibility (the safe direction).
+    const enabled = process.env.WE_JIT_VISIBLE_HASH_CACHE !== '0';
+    let cachePath = null;
+    let cached = null;
+    if (enabled) {
+      try {
+        cachePath = resolve(CWD, execFileSync('git', ['rev-parse', '--git-path', 'we-jit-visible-hashes.json'],
+          { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim());
+        const value = JSON.parse(readFileSync(cachePath, 'utf8'));
+        if (value.version === 1 && Array.isArray(value.tips) && Array.isArray(value.hashes) &&
+          value.tips.every((tip) => typeof tip === 'string' && /^[0-9a-f]{40,64}$/.test(tip)) &&
+          value.hashes.every((hash) => typeof hash === 'string' && isHash(hash))) cached = value;
+      } catch { /* missing/corrupt cache falls back to the full walk */ }
+    }
+    const cachedTips = new Set(cached?.tips ?? []);
+    const newTips = tips.filter((tip) => !cachedTips.has(tip));
+    if (cached) {
+      remoteHashSetCache = new Set(cached.hashes);
+      if (!newTips.length) return remoteHashSetCache;
+    }
+    const walk = (args) => execFileSync('git', ['rev-list', '--objects', ...args, '--', 'backlog/'],
+      { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
+    let out = '';
+    try {
+      if (tips.length) {
+        if (cached) {
+          try { out = walk([...newTips, '--not', ...cached.tips]); }
+          catch { out = walk(tips); } // A cached tip may have been garbage-collected.
+        } else out = walk(tips);
+      }
+    } catch { return remoteHashSetCache; } // Do not persist an incomplete walk.
+    for (const line of out.split('\n')) {
+      const sp = line.indexOf(' '); // bare `<sha>` (no space) = a commit/tree object, not a backlog file
+      if (sp < 0) continue;
+      const path = line.slice(sp + 1);
+      if (!path.startsWith('backlog/')) continue;
+      const id = idFromName(path.slice('backlog/'.length).replace(/\.md$/, ''));
+      if (isHash(id)) remoteHashSetCache.add(id);
+    }
+    if (cachePath) {
+      // Atomic replacement keeps interrupted drain passes from leaving a partial cache.
+      const tmp = `${cachePath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+      try {
+        writeFileSync(tmp, JSON.stringify({ version: 1, tips, hashes: [...remoteHashSetCache] }) + '\n');
+        renameSync(tmp, cachePath);
+      } catch { /* cache writes are best-effort */ }
+      finally { try { rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ } }
+    }
+    return remoteHashSetCache;
+  };
+  const resolveReference = (hash, name) => {
+    if (ledger[hash] !== undefined) return hash; // the existing ledger pass owns this rewrite
+    const landed = landedNumbers().get(hash) ?? null;
+    if (landed !== null) return landed;
+    // A visible provisional item is positive evidence of in-flight work. Absence is NOT proof
+    // of death: another clone may have an unfetched/private branch. Surface that uncertainty.
+    const visible = localHashStems.has(hash) || remoteVisibleHashes().has(hash);
+    const status = visible ? 'in-flight' : 'unresolvable';
+    if (!unresolvedReferences.some((r) => r.hash === hash && r.name === name)) {
+      unresolvedReferences.push({ hash, name, status });
+      console.warn(`[numberPendingHashes] ${name}: ${hash} ${status}` +
+        (status === 'unresolvable' ? ' (no ledger, bornAs, or visible provisional item; potentially dead)' : ' (visible provisional item; left pending)'));
+    }
+    return hash;
+  };
+  const resolvedFiles = files.map(({ name, content }) => ({ name,
+    content: mapHashReferences(content, (hash) => resolveReference(hash, name)),
+  }));
+  nextPhase('apply');
+  // Only newly assigned items are stamped; fallback mappings never alter birth records or numbering.
+  const { renames, rewrites, pathRenames } = applyLedger(resolvedFiles, ledger);
+  // applyLedger compares against resolvedFiles, so retain fallback-only edits as well.
+  const rewrittenNames = new Set(rewrites.map((r) => r.name));
+  for (const file of resolvedFiles) {
+    if (!rewrittenNames.has(file.name) && file.content !== contentByName.get(file.name)) rewrites.push(file);
+  }
+  // #4247 — repair a bare-digit `ack` value the swap above just produced (see normalizeFlowAckCardRefs'
+  // own docblock) in every flow file THIS pass rewrote; never a repo-wide sweep for pre-existing staleness.
+  for (const r of rewrites) {
+    if (r.name.endsWith('.flow.json')) r.content = normalizeFlowAckCardRefs(r.content);
+  }
+  // Keep soak modules out of BOTH generic passes (fallback reference resolution and applyLedger,
+  // including its path-renaming side effects). Old ledger entries are just as dangerous as new IDs:
+  // 952011907 replaced the queue soak's historical HASH with its LANDED_NUM via an old ledger mapping.
+  nextPhase('resolve');
+  for (const { name, content } of breakFiles) {
+    const rewritten = rewriteSoakCardCitation(content, (hash) => ledger[hash] ?? resolveReference(hash, name));
+    if (rewritten !== content) rewrites.push({ name, content: rewritten });
+  }
+
+  nextPhase('apply');
   // #2400 — path-value refs are derived from UNTRUSTED backlog content, so CONFINE them to inside the repo
   // before acting: a crafted `relatedReport`/body token like `../../../outside/notes-<hash>.md` would
   // otherwise make `writeFileSync(join(CWD, to))` + `git rm from` write outside the tree and delete an
@@ -945,11 +1021,12 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   const livePathRenames = pathRenames.filter(({ from, to }) =>
     inRepo(from) && inRepo(to) && existsSync(join(CWD, from)));
   // #2319 — `number-stranded --dry-run`: report the planned mapping + renames without touching the tree/index.
-  if (dryRun) return {
+  if (dryRun) return finish({
     assigned, committed: false, dryRun: true, unresolvedReferences,
     renamed: renames.map((r) => r.to),
     wouldRename: [...renames, ...livePathRenames].map((r) => ({ from: r.from, to: r.to })),
-  };
+  });
+  nextPhase('write');
   const rewriteByName = new Map(rewrites.map((r) => [r.name, r.content]));
   const renameFroms = new Set(renames.map((r) => r.from));
   // A rename is `git rm OLD` + write-to-NEW (NOT `git mv`): a scoped `git commit -- <paths>` is pathspec
@@ -969,7 +1046,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     const content = rewriteByName.has(from) ? rewriteByName.get(from) : readFileSync(join(BL, `${from}.md`), 'utf8');
     writeFileSync(join(BL, `${to}.md`), content);
     if (quietGit(CWD, ['rm', '--quiet', `backlog/${from}.md`]) == null)
-      return { assigned, committed: false, error: `git rm ${from} failed` };
+      return finish({ assigned, committed: false, error: `git rm ${from} failed` });
     toAdd.push(`backlog/${to}.md`);
     commitPaths.push(`backlog/${from}.md`, `backlog/${to}.md`);
   }
@@ -982,7 +1059,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     const content = swapHashes(readFileSync(join(CWD, from), 'utf8'), ledgerEntries);
     writeFileSync(join(CWD, to), content);
     if (quietGit(CWD, ['rm', '--quiet', from]) == null)
-      return { assigned, committed: false, error: `git rm ${from} failed` };
+      return finish({ assigned, committed: false, error: `git rm ${from} failed` });
     toAdd.push(to);
     commitPaths.push(from, to);
   }
@@ -1014,7 +1091,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   const paths = [...new Set(commitPaths)];
   const summary = assigned.map((a) => `${a.hash}→#${a.nnn}`).join(', ');
   const committed = quietGit(CWD, ['commit', '-m', assertNoClosingKeywordRef(`drain: JIT-number ${summary} at land (#2288)`, 'JIT-number commit message'), '--', ...paths]) != null;
-  return { assigned, committed, unresolvedReferences, renamed: [...renames, ...livePathRenames].map((r) => r.to), changedPaths: paths };
+  return finish({ assigned, committed, unresolvedReferences, renamed: [...renames, ...livePathRenames].map((r) => r.to), changedPaths: paths });
 }
 
 /**

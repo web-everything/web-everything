@@ -9,7 +9,7 @@
  * compiled agent-memory bundle every future session loads into context). The pure decider (`applyLedger`)
  * is unit-tested in scripts/backlog/__tests__/id.test.mjs; this proves the FS/git boundary.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -40,6 +40,31 @@ beforeEach(() => {
   write('.gitignore', '.claude/skills/batch-backlog-items/id-ledger.json\n');
 });
 afterEach(() => { try { rmSync(repo, { recursive: true, force: true }); } catch { /* best-effort */ } });
+
+// Observe real git subprocesses to guard the drain pass budget, as in #3383.
+function withGitLog(run) {
+  const dir = mkdtempSync(join(tmpdir(), 'git-shim-'));
+  const log = join(dir, 'calls.log');
+  const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+  writeFileSync(join(dir, 'git'), `#!/bin/sh\necho "$@" >> "${log}"\nexec "${real}" "$@"\n`);
+  execFileSync('chmod', ['+x', join(dir, 'git')]);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${dir}:${oldPath}`;
+  try {
+    run(() => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : [],
+      () => writeFileSync(log, ''));
+  } finally {
+    process.env.PATH = oldPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function pendingReferences() {
+  write(QUEUED_REL, JSON.stringify({ queued: [] }));
+  write('backlog/xhash01-alpha.md', '---\nblockedBy: [xdead00, xdead01, xflight]\n---\n');
+  git('add', '.'); git('commit', '-qm', 'pending references');
+  git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+}
 
 describe('numberPendingHashes — drain JIT numbering wire (#2288)', () => {
   it('numbers pending cards on main with soak-definition citations and repairs those citations atomically', () => {
@@ -279,6 +304,113 @@ describe('numberPendingHashes — drain JIT numbering wire (#2288)', () => {
     expect(numberPendingHashes(repo, { dryRun: true }).unresolvedReferences).toEqual(expected);
     expect(numberPendingHashes(repo).unresolvedReferences).toEqual(expected);
     expect(readFileSync(join(repo, 'backlog/2201-dependent.md'), 'utf8')).toContain('  - xdead00');
+  });
+
+  it('refuses unswept citations before any reference-resolution subprocesses', () => {
+    pendingReferences();
+    write('scripts/other.mjs', '// backlog/xhash01-alpha.md\n');
+    git('add', '.'); git('commit', '-qm', 'unswept citation');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      withGitLog((calls) => {
+        const { phaseMs, ...result } = numberPendingHashes(repo, { dryRun: true });
+        expect(result).toEqual({ assigned: [], committed: false,
+          error: 'hash-path citation outside the rewrite scope: scripts/other.mjs cites xhash01' });
+        expect(calls().filter((c) => c.startsWith('rev-list') ||
+          (c.startsWith('grep') && (c.includes('-l') || c.includes('bornAs'))))).toEqual([]);
+        expect(phaseMs).toEqual({ read: expect.any(Number), precheck: expect.any(Number), resolve: 0, apply: 0, write: 0 });
+        expect(warn).toHaveBeenCalledWith('[numberPendingHashes] refusing this pass — a citation outside the rewrite scope would ' +
+          'dangle post-rename: scripts/other.mjs cites xhash01. Widen the sweep scope (scripts/lane-drain.mjs#numberPendingHashes) or ' +
+          'fix the citation, then this hash numbers on the next pass.');
+        expect(warn.mock.calls.filter(([line]) => line.startsWith('[numberPendingHashes] phaseMs'))).toHaveLength(1);
+      });
+    } finally { warn.mockRestore(); }
+  });
+
+  it('batches distinct bornAs lookups and preserves the first landed number', () => {
+    write('backlog/012-first.md', '---\nbornAs: xdead00\n---\n');
+    write('backlog/013-second.md', '---\nbornAs: xdead00\n---\n');
+    pendingReferences();
+    withGitLog((calls) => {
+      const result = numberPendingHashes(repo);
+      expect(result.committed).toBe(true);
+      expect(calls().filter((c) => c.startsWith('grep') && c.includes('bornAs'))).toHaveLength(1);
+      expect(readFileSync(join(repo, 'backlog/014-alpha.md'), 'utf8')).toContain('blockedBy: [012, xdead01, xflight]');
+      expect(Object.keys(result.phaseMs)).toEqual(['read', 'precheck', 'resolve', 'apply', 'write']);
+    });
+  });
+
+  it('reuses visibility across passes and incrementally walks new tips', () => {
+    pendingReferences();
+    withGitLog((calls, clear) => {
+      const first = numberPendingHashes(repo, { dryRun: true });
+      expect(calls().filter((c) => c.startsWith('rev-list'))).toHaveLength(1);
+      clear();
+      expect(numberPendingHashes(repo, { dryRun: true }).unresolvedReferences).toEqual(first.unresolvedReferences);
+      expect(calls().filter((c) => c.startsWith('rev-list'))).toHaveLength(0);
+      const head = git('rev-parse', 'HEAD').trim();
+      git('checkout', '-qb', 'lane/flight');
+      write('backlog/xflight-flight.md', '---\nstatus: open\n---\n');
+      git('add', '.'); git('commit', '-qm', 'flight');
+      git('checkout', '--detach', head);
+      clear();
+      const third = numberPendingHashes(repo, { dryRun: true });
+      const walks = calls().filter((c) => c.startsWith('rev-list'));
+      expect(walks).toHaveLength(1);
+      expect(walks[0]).toContain('--not');
+      expect(third.unresolvedReferences).toContainEqual({ hash: 'xflight', name: 'xhash01-alpha', status: 'in-flight' });
+      git('branch', '-D', 'lane/flight');
+      clear();
+      expect(numberPendingHashes(repo, { dryRun: true }).unresolvedReferences).toEqual(third.unresolvedReferences);
+      expect(calls().filter((c) => c.startsWith('rev-list'))).toHaveLength(0);
+    });
+  });
+
+  it.each(['corrupt', 'version', 'missing-tip', 'unwritable'])('survives a %s visibility cache', (kind) => {
+    pendingReferences();
+    const cachePath = join(repo, '.git/we-jit-visible-hashes.json');
+    if (kind === 'unwritable') mkdirSync(cachePath);
+    else writeFileSync(cachePath, kind === 'corrupt' ? '{' : JSON.stringify({
+      version: kind === 'version' ? 2 : 1, tips: ['f'.repeat(40)], hashes: [],
+    }));
+    withGitLog((calls) => {
+      const result = numberPendingHashes(repo, { dryRun: true });
+      expect(result.unresolvedReferences.map((r) => r.status)).toEqual(['unresolvable', 'unresolvable', 'unresolvable']);
+      const walks = calls().filter((c) => c.startsWith('rev-list'));
+      expect(walks).toHaveLength(kind === 'missing-tip' ? 2 : 1);
+      expect(walks.at(-1)).not.toContain('--not');
+      expect(readdirSync(join(repo, '.git')).filter((name) => name.endsWith('.tmp'))).toEqual([]);
+      if (kind !== 'unwritable') expect(JSON.parse(readFileSync(cachePath, 'utf8')).version).toBe(1);
+    });
+  });
+
+  it('does not print timings or resolve references when no hashes are pending', () => {
+    write('backlog/001-numbered.md', '---\nstatus: open\n---\n');
+    git('add', '.'); git('commit', '-qm', 'numbered');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(numberPendingHashes(repo)).toEqual({ assigned: [], committed: false });
+      expect(warn).not.toHaveBeenCalled();
+    } finally { warn.mockRestore(); }
+  });
+
+  it('disables cache reads and writes with WE_JIT_VISIBLE_HASH_CACHE=0', () => {
+    pendingReferences();
+    const old = process.env.WE_JIT_VISIBLE_HASH_CACHE;
+    process.env.WE_JIT_VISIBLE_HASH_CACHE = '0';
+    try {
+      withGitLog((calls) => {
+        const first = numberPendingHashes(repo, { dryRun: true });
+        expect(numberPendingHashes(repo, { dryRun: true }).unresolvedReferences).toEqual(first.unresolvedReferences);
+        const walks = calls().filter((c) => c.startsWith('rev-list'));
+        expect(walks).toHaveLength(2);
+        expect(walks.every((c) => !c.includes('--not'))).toBe(true);
+        expect(existsSync(join(repo, '.git/we-jit-visible-hashes.json'))).toBe(false);
+      });
+    } finally {
+      if (old === undefined) delete process.env.WE_JIT_VISIBLE_HASH_CACHE;
+      else process.env.WE_JIT_VISIBLE_HASH_CACHE = old;
+    }
   });
 
   it('#3383 — the unresolved-reference fallback stays O(1) git subprocesses as the ref count grows, never O(refs)', () => {
