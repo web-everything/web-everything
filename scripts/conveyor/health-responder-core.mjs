@@ -40,6 +40,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "github-app-token": "Inhibit GitHub actions; existing auth refresh/operator owns recovery, no credential mutation.",
   "health-tick-overrun": "Hold actions if watch freshness is inadequate; watchdog/owner diagnoses the probe.",
   "heavy-queue-wait": "Honor heavy admission; do not raise the cap or kill a holder.",
+  "heavy-run-ungated": "Route the named program's runs through heavy admission; never kill the run or raise the cap.",
   "lane-destructive-unpushed": "Possible loss needs recovery judgment; preserve reflogs and do not clean anything.",
   "lane-pool-growth": "Dirty/unleased is not proof of abandoned work; no trim/reset/provision.",
   "lane-worker-without-lease": "A live worker needs ownership investigation, never release or fabricated adoption.",

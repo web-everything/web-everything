@@ -172,6 +172,9 @@ export const DAEMON_MANIFEST = {
   // own expected time and dispatches ONE diagnosis-only inspection agent per stuck episode
   // (`we:scripts/conveyor/stuck-pr-watch.mjs`, `we:scripts/conveyor/stuck-pr-watch-core.mjs`).
   ...perRepoEntries('stuck-pr-watch', 'scripts/conveyor/stuck-pr-watch.mjs', ['sweep']),
+  // The ~60s process sampler behind the heavy-run-ungated smell.
+  // Runs under pass-daemon.mjs --pass=heavy-run-sample (opt-in).
+  'heavy-run-sample': { script: 'scripts/conveyor/heavy-run-ungated.mjs', args: ['sample'], intervalMs: 60_000, defaultLaunch: false },
   // #4077 (ruling #4065) — the HEALTH WATCH: one host-wide entry (not per-repo — its host smells read every
   // daemon's log/lease on this machine, and its one `gh pr list` sweep already covers the constellation). A
   // 5-minute tick; the script's own watchdog caps a tick at 3x its 60 s budget and writes its own

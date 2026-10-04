@@ -13,7 +13,7 @@ import { spawnSync, spawn as spawnProcess, execFileSync } from 'node:child_proce
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { laneNeedsVerifyDispatch, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER } from '../verify-dispatch.mjs';
+import { laneNeedsVerifyDispatch, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../../../skills-src/conveyor/verify-daemon.mjs';
@@ -84,6 +84,20 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+});
+
+describe('verify-dispatch — a plain FILE in the pool root never fails the tick (2026-10-04 ENOTDIR outage)', () => {
+  it('skips a non-directory entry beside the pools and still dispatches the real lane', () => {
+    // macOS drops `.metadata_never_index` (a 0-byte FILE) into `~/workspace/.lanes`; readdirSync on it threw
+    // ENOTDIR and the whole tick failed, every tick, so no requested gate ever ran.
+    writeFileSync(join(poolRoot, '.metadata_never_index'), '');
+    expect(laneIndicesIn(join(poolRoot, '.metadata_never_index'))).toEqual([]);
+    runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir);
+    const r = runDispatch(['--json'], { LANE_POOL_ROOT: poolRoot });
+    expect(r.err).not.toMatch(/ENOTDIR/);
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.out).dispatched).toHaveLength(1);
+  });
 });
 
 describe('verify-dispatch CLI — the request → dispatch → green round trip (#3105)', () => {
