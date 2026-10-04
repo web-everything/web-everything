@@ -2026,7 +2026,7 @@ export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable 
   // failure marker is not evidence (the run store is local and can be missing, pruned or on another machine).
   if (!current.length && !(last && !last.persistenceFailed && !last.parked && !last.pending.length)) {
     const older = result.records.filter(r => r.head !== head && (!repo || !pr || (r.repo === repo && r.pr === Number(pr))));
-    const held = older.flatMap(r => { const s = referralRecordState(r, { ...context, head: r.head, operatorRulings: result.operatorRulings }); return [...s.pending, ...s.blocked]; });
+    const held = older.flatMap(r => { const s = referralRecordState(r, { ...context, head: r.head, records: result.records, operatorRulings: result.operatorRulings }); return [...s.pending, ...s.blocked]; });
     if (held.length) {
       throw new Error(`mandatory referral hold: no-current-head-review-evidence; no readable referral record or completed clean review for current head ${head}, and earlier heads still hold ${[...new Set(held)].join(', ')}; review the current head before acceptance`);
     }

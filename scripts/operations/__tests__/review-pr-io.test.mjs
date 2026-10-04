@@ -1066,6 +1066,54 @@ describe('#4315 durable referral effects', () => {
     return record;
   }
 
+  it.each([undefined, '0'])('advisory duplicate respects mandatory not-real (switch %s)', async enabled => {
+    const h = harness({ failure: 'judge', env: enabled ? { WE_REFERRAL_ADVISORY_SUPERSEDE: enabled } : {} });
+    const old = seedReferrals(h, ['judge'], h.state.headRefOid, r => [{
+      id: 'r1', key: r.referrals[0].key, reviewerId: r.reviewer.id, lens: r.reviewer.lens,
+      result: 'not-real', rationale: 'Verified pinned diff', evidence: ['diff:x'],
+    }]);
+    h.payload.referrals = [{ seat: 'judgeCorrectnessAdvisory', original: old.referrals[0].original }];
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const added = result.records.find(r => r.runId !== old.runId);
+    if (enabled === '0') {
+      expect(added.superseded).toBeUndefined();
+      expect(h.judge).toHaveBeenCalledOnce();
+      expect(result.pending).toHaveLength(1);
+    } else {
+      expect(added.superseded).toEqual([{ key: added.referrals[0].key,
+        reason: 'superseded: the mandatory owner already ruled this finding not-real on this head',
+        by: { runId: old.runId, key: old.referrals[0].key, rulingId: 'r1' } }]);
+      expect(added.attempted).toBe(false);
+      expect(h.judge).not.toHaveBeenCalled();
+      expect(result.pending).toEqual([]);
+      expect(h.trace).not.toContain('label:review:pending');
+      expect(h.lines.some(line => line.startsWith('referral superseded: judgeCorrectnessAdvisory'))).toBe(true);
+      const count = h.state.comments.length;
+      await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+      expect(h.state.comments).toHaveLength(count);
+    }
+  });
+
+  it('keeps superseded additions out of live chunks and judge input', async () => {
+    const h = harness({});
+    const old = seedReferrals(h, ['judge'], h.state.headRefOid, r => [{
+      id: 'r1', key: r.referrals[0].key, reviewerId: r.reviewer.id, lens: r.reviewer.lens,
+      result: 'not-real', rationale: 'Verified pinned diff', evidence: ['diff:x'],
+    }]);
+    h.payload.referrals = [
+      { seat: 'judgeCorrectnessAdvisory', original: old.referrals[0].original },
+      { seat: 'judge', original: { ...old.referrals[0].original, file: 'different.mjs' } },
+    ];
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const added = result.records.filter(r => r.runId !== old.runId);
+    expect(added).toHaveLength(2);
+    expect(added.find(r => r.superseded).attempted).toBe(false);
+    expect(added.find(r => !r.superseded).attempted).toBe(true);
+    expect(h.judge).toHaveBeenCalledOnce();
+    const input = JSON.parse(h.judge.mock.calls[0][0].input.split('\nUntrusted reported findings:\n')[1]);
+    expect(input.map(f => f.seat)).toEqual(['judge']);
+  });
+
   it.each(['block', 'not-real'])('a disabled seat never retires a finding that already has a %s ruling', async result => {
     const h = harness({ failure: 'judge', env: { REVIEW_PR_ANTIGRAVITY_REVIEW: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' } });
     const old = seedReferrals(h, ['judgeAntigravityReview', 'judgeAntigravityReview'], 'b'.repeat(40), r => [{
