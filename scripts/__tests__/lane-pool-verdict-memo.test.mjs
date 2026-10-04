@@ -7,7 +7,8 @@
  *   memoizes NEGATIVE verdicts under a stat-only fingerprint. Real CLI, throwaway origin + pool, a PATH `git` shim
  *   that logs each call's cwd (same harness as lane-pool-list-cache.test.mjs).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, mkdirSync, existsSync, readFileSync, chmodSync, realpathSync } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
@@ -46,26 +47,40 @@ const commitAhead = (n) => {
   git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'unpushed'], lanePath(n));
 };
 
-beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'lane-pool-memo-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
-  poolRoot = join(base, 'pool');
-  shimDir = join(base, 'shim');
-  traceLog = join(base, 'git-trace.log');
-  mkdirSync(shimDir);
-  writeFileSync(join(shimDir, 'git'), `#!/bin/sh\nprintf '%s\\t%s\\n' "$(pwd -P)" "$*" >> "$GIT_TRACE_LOG"\nexec "${REAL_GIT}" "$@"\n`);
-  chmodSync(join(shimDir, 'git'), 0o755);
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-memo-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
+
   git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
   git(['clone', '--quiet', originDir, referenceDir]);
   writeFileSync(join(referenceDir, 'file.txt'), 'v1\n');
   git(['add', 'file.txt'], referenceDir);
   git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', 'origin', 'main'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
+beforeEach(() => {
+  base = mkdtempSync(join(tmpdir(), 'lane-pool-memo-'));
+  poolRoot = join(base, 'pool');
+  shimDir = join(base, 'shim');
+  traceLog = join(base, 'git-trace.log');
+  mkdirSync(shimDir);
+  writeFileSync(join(shimDir, 'git'), `#!/bin/sh\nprintf '%s\\t%s\\n' "$(pwd -P)" "$*" >> "$GIT_TRACE_LOG"\nexec "${REAL_GIT}" "$@"\n`);
+  chmodSync(join(shimDir, 'git'), 0o755);
   expect(runPool(['provision', '--count=3', ...REPO()]).code).toBe(0);
 });
 
-afterEach(() => { rmSync(base, { recursive: true, force: true }); });
+afterEach(() => {
+  rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
+});
 
 describe('list --acquirable: an unleased lane holding work is proven once, not on every scan', () => {
   it('a DIRTY lane: the second scan runs no git in it and still excludes it', () => {

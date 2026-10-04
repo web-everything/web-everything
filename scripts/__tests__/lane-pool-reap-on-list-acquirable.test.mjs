@@ -9,7 +9,8 @@
  *   geometry as `lane-pool-reap-on-acquire.test.mjs` (real child process, throwaway bare origin + reference,
  *   private `LANE_POOL_ROOT`, no network).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -59,11 +60,13 @@ function acquire(lane, session, extra = []) {
   return lanePath(lane);
 }
 
-beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'lane-pool-list-reap-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
-  poolRoot = join(base, 'pool');
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-list-reap-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
 
   git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
   git(['clone', '--quiet', originDir, referenceDir]);
@@ -71,12 +74,21 @@ beforeEach(() => {
   git(['add', 'file.txt'], referenceDir);
   git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', 'origin', 'main'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
+beforeEach(() => {
+  base = mkdtempSync(join(tmpdir(), 'lane-pool-list-reap-'));
+  poolRoot = join(base, 'pool');
 
   expect(runPool(['provision', '--count=2', ...poolArgs()]).code).toBe(0);
 });
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 describe('lane-pool #3449 — `list --acquirable` reaps a provably-dead ghost with NO acquire call', () => {

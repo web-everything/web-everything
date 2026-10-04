@@ -18,7 +18,8 @@
  *        own existing timing guarantee survived the fix, not that the fix reaches the resident pass too, which
  *        the sibling `lease-reaper.mjs` unit suite already covers directly).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -81,11 +82,13 @@ function fakeGhOnPath(headRefName, mergedAtIso, mergeCommitSha) {
 const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, `--name=branchfallbackpool`, '--branch=main', '--no-install'];
 const lanePath = (n) => join(poolRoot, 'branchfallbackpool', `lane-${n}`);
 
-beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'lane-pool-branch-fallback-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
-  poolRoot = join(base, 'pool');
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-branch-fallback-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
 
   git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
   git(['clone', '--quiet', originDir, referenceDir]);
@@ -93,12 +96,21 @@ beforeEach(() => {
   git(['add', 'file.txt'], referenceDir);
   git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', 'origin', 'main'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
+beforeEach(() => {
+  base = mkdtempSync(join(tmpdir(), 'lane-pool-branch-fallback-'));
+  poolRoot = join(base, 'pool');
 
   expect(runPool(['provision', '--count=2', ...poolArgs()]).code).toBe(0);
 });
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 // Acquires under a NON-DISPATCHER session (the `Mac:<ppid>`-shaped `defaultSession()` fallback every bare

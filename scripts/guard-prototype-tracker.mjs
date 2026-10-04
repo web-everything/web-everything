@@ -45,7 +45,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readRegistry, normalizeBranchRef } from './lib/poc-branches.mjs';
+import { readRegistry, normalizeBranchRef, branchesForRepo } from './lib/poc-branches.mjs';
 import { findTrackerPath, parseTracker } from './lib/prototype-tracker-data.mjs';
 import { localToday } from './lib/local-date.mjs';
 
@@ -66,7 +66,7 @@ export const FRESH_DAYS = 1;
  * @returns {string[]}
  */
 export function protectedBranchNames(registry, epicNum = '3383') {
-  return (registry?.branches ?? []).filter((b) => b.owner === epicNum).map((b) => b.branch);
+  return branchesForRepo(registry).filter((b) => b.owner === epicNum).map((b) => b.branch);
 }
 
 /**

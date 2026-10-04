@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { watchLanePoolHealth } from '../conveyor/lane-pool-health-watch.mjs';
 import { refreshSalvageIndex, readSalvageIndex, landedCheckKey, branchShaReader } from '../lib/salvage-index.mjs';
+import { readLaneLeases } from '../operations/agent-activity-io.mjs';
 
 describe('health-watch: no porcelain re-read for a lane status just reported clean', () => {
   const lanes = [
@@ -88,5 +89,14 @@ describe('salvage index: landed verdict memoised per branch tip', () => {
     rmSync(join(laneDir(), '.git', 'refs'), { recursive: true });
     writeFileSync(join(laneDir(), '.git', 'packed-refs'), `# pack-refs\n${'d'.repeat(40)} refs/remotes/origin/main\n`);
     expect(branchShaReader('origin/main')(laneDir())).toBe('d'.repeat(40));
+  });
+});
+
+describe('agent-activity lease read skips the git probe for unleased lanes', () => {
+  it('asks lane-pool status for --leased-only (lease fields are identical; only git fields drop)', () => {
+    let argv = null;
+    const run = (_bin, args) => { argv = args; return JSON.stringify({ lanes: [{ lane: 1, lease: { session: 's' } }, { lane: 2, lease: null }] }); };
+    expect(readLaneLeases({ run, root: '/r' })).toEqual([{ session: 's' }]);
+    expect(argv).toEqual(['/r/scripts/lane-pool.mjs', 'status', '--json', '--leased-only']);
   });
 });
