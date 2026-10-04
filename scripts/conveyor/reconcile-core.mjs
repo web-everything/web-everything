@@ -1411,9 +1411,9 @@ export function planReconcile({
   // `null` (the default, and what every existing test/caller gets unless it opts in) degrades the staleness
   // comparison below to ref-name-only — see {@link countStaleConflictFixRounds}'s own docblock.
   mainSha = null,
-  // #3902 — the review-label healer policy, see the `restore-review-label` STUCK variant below. Pure input;
-  // the IO caller resolves it from env via {@link resolveReviewLabelHealMode}.
-  reviewLabelHeal = 'stuck',
+  // #3902 — the review-label healer policy, see the `restore-review-label` STUCK variant below. A caller may pass
+  // it; omitted, it is the one env read in this file (`WE_REVIEW_LABEL_HEAL`, via {@link resolveReviewLabelHealMode}).
+  reviewLabelHeal = resolveReviewLabelHealMode(globalThis.process?.env ?? {}),
 } = {}) {
   const dispatch = [];
   const refusals = [];

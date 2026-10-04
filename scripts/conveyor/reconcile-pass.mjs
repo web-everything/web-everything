@@ -72,7 +72,7 @@ import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { countRearmComments } from './rearm-review.mjs';
-import { planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, resolveReviewLabelHealMode } from './reconcile-core.mjs';
+import { planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls } from './reconcile-core.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // we:backlog/x5uqim1-*.md (#4075/#3383) — the two extra facts `reconcile-core.mjs#isPrCiFailureOwedRerun` needs
@@ -1147,8 +1147,6 @@ export function runReconcilePass({
   const plan = planReconcile({
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha,
-    // #3902 — review-label healer policy (`WE_REVIEW_LABEL_HEAL`: stuck | green | off).
-    reviewLabelHeal: resolveReviewLabelHealMode(process.env),
   });
   return { ...plan, refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
