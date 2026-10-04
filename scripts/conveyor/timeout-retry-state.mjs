@@ -19,8 +19,9 @@ export function readTimeoutStates(evidence, dir = timeoutStateDir()) {
   });
 }
 
-export function readTimeoutBudget({ dir = timeoutStateDir(), ...evidence }) {
+export function readTimeoutBudget({ dir, ...evidence }) {
   try {
+    dir ??= timeoutStateDir(); // resolved inside the guard: an unreadable lock root is "unreadable state", never a throw
     const requests = readTimeoutStates(evidence, dir).flatMap((state) => state.requests);
     return { confirmed: requests.filter((r) => r.status === 'confirmed').length,
       pending: requests.some((r) => r.status === 'pending') };

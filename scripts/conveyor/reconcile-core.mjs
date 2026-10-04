@@ -192,7 +192,7 @@ import {
 // gate below), so the review this pass would otherwise dispatch the moment CI finishes is instead HELD until
 // this fires and un-drafts it — closing the "6 of 26 PRs got reviewed before their own first CI run even
 // finished" measurement (operator, 2026-09-27) that motivated this whole feature.
-export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft']);
+export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label']);
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#REFUSAL_KINDS — every reason this pass declines to dispatch. Frozen and
@@ -1361,6 +1361,18 @@ function roundCapExhaustedNoteText(prNumber, attempts, cap, capKind) {
   return `PR #${prNumber}: ${capKind} auto-repair rounds exhausted (${attempts}/${cap}) — a person must take it over`;
 }
 
+/** How long a PR must have been green and still label-less before `restore-review-label` fires: a producer
+ *  (`pr-land --label-on-green`) labels `ready-to-merge` within seconds of green, and must not race a daemon-added
+ *  `review:pending` that would hold an auto-landing PR for a review it does not need. */
+export const RESTORE_REVIEW_LABEL_GRACE_MS = 10 * 60_000;
+
+/** True when the newest completed check finished at least the grace ago (or no timestamp is readable). */
+export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS) {
+  const times = (Array.isArray(rollup) ? rollup : []).map((c) => Date.parse(c?.completedAt)).filter(Number.isFinite);
+  if (!times.length || !Number.isFinite(now) || !now) return true;
+  return now - Math.max(...times) >= graceMs;
+}
+
 /** Tri-state diagnostic: unknown evidence is never an empty review family. */
 export function missingReviewLabel(pr) {
   if (!pr || pr.state !== 'OPEN' || !Array.isArray(pr.labels)
@@ -1672,6 +1684,27 @@ export function planReconcile({
         ...base, ...withPhase, kind: 'promote-draft',
         why: 'draft PR — every required check is green; promote it to ready for review (draft-first PRs, '
           + 'operator-approved 2026-09-27) — nothing else is owed this PR until that happens',
+      });
+      continue;
+    }
+
+    // ── `restore-review-label` (LIVE INCIDENT 2026-10-03/04, PR #3830 — an approval-time prevention-card PR) —
+    // an OPEN, GREEN, non-draft `lane/*` PR carrying NO `review:*` label (and no `ready-to-merge` landing-gate
+    // label either) is in limbo forever: `classifyPr` reads phase `open` ("no hold recorded"), the generic table
+    // answers `nothing-owed`, and no daemon ever owns it. The producer (`pr-land --label-on-green`) exits
+    // WITHOUT any label when its green-wait ends red/timeout/behind, and the fix daemon later heals the red —
+    // leaving a green PR nobody labelled. Owed here: the neutral hand-off label `review:pending`, applied by the
+    // promote-draft pass's sibling half (`promote-draft-pr-dispatch.mjs`), so the ordinary review path owns it.
+    // Deliberately NOT gated on AI authorship (the commit list of a drain-rebased lane carries merge commits
+    // from other authors, which made `missingReviewLabel` read false on #3830 itself).
+    if (phase === 'open' && !pr?.isDraft && withPhase.check === 'green'
+        && String(pr?.headRefName ?? '').startsWith('lane/')
+        && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
+        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+      dispatch.push({
+        ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending',
+        why: 'open lane PR, every required check is green, and it carries no review:* (or ready-to-merge) label — '
+          + 'nothing would ever own it; apply review:pending so the ordinary review path picks it up',
       });
       continue;
     }

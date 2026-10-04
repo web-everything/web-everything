@@ -126,6 +126,13 @@ export function defaultReadPrLabels({ repoSlug, prNumber, runGh = runGhSync } = 
   return validatePrLabels(envelope?.labels);
 }
 
+/** The one label write of the restore-review-label half. */
+export function defaultAddLabel({ repoSlug, prNumber, label, runGh = runGhSync } = {}) {
+  runGh(['pr', 'edit', String(prNumber), '--repo', repoSlug, '--add-label', label], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-label-add', repo: repoSlug },
+  });
+}
+
 /**
  * Run ONE pass: reconcile, filter `kind:'promote-draft'`, call `gh pr ready` on each. Repo-agnostic, same
  * `--repo`/`--prs-file` contract as `ci-heal-pr-dispatch.mjs`'s own `runReconcileCiHealDispatch`.
@@ -162,6 +169,9 @@ export function runReconcilePromoteDraftDispatch({
   // tag.mjs`'s own docblock). Best-effort: a failed clear never fails the promotion itself, and the periodic
   // `tagReviewStatus` sweep still corrects it on its own next pass either way.
   clearAwaitingCi = applyReviewStatus,
+  // `restore-review-label` (PR #3830 incident): the one write for an open, green, label-less lane PR.
+  // Idempotent (`gh pr edit --add-label`); re-reads labels first so a label another actor just set wins.
+  addLabel = defaultAddLabel,
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`promote-draft-pr-dispatch: --repo ${repo} is not a constellation repo`);
@@ -249,6 +259,27 @@ export function runReconcilePromoteDraftDispatch({
       // a `gh` hiccup here never throws the whole pass — the PR stays draft and this same plan entry recurs
       // next tick, so a transient failure self-heals within one tick interval rather than needing a retry loop.
       refusals.push({ pr: entry.prNumber, kind: 'ready-failed', why: String((e && e.message) || e).split('\n')[0] });
+    }
+  }
+  // ── restore-review-label half: green, open, label-less lane PRs get `review:pending` (see reconcile-core).
+  for (const entry of (reconciled.dispatch ?? []).filter((e) => e.kind === 'restore-review-label')) {
+    let labels;
+    try {
+      labels = validatePrLabels(readPrLabels({ repoSlug, prNumber: entry.prNumber }))
+        .map(l => (typeof l === 'string' ? l : l.name));
+    } catch (e) {
+      refusals.push({ pr: entry.prNumber, kind: 'label-state-unreadable', why: String(e?.message ?? e).split('\n')[0] });
+      continue;
+    }
+    if (labels.some(l => l.startsWith('review:') || l === 'ready-to-merge')) {
+      refusals.push({ pr: entry.prNumber, kind: 'label-already-set', why: 'a review/landing label appeared since the plan was read' });
+      continue;
+    }
+    try {
+      addLabel({ repoSlug, prNumber: entry.prNumber, label: entry.label ?? 'review:pending' });
+      dispatched.push({ pr: entry.prNumber, kind: 'restore-review-label', label: entry.label ?? 'review:pending' });
+    } catch (e) {
+      refusals.push({ pr: entry.prNumber, kind: 'label-failed', why: String((e && e.message) || e).split('\n')[0] });
     }
   }
   return { dispatched, refusals, reconcileRefusals: reconciled.refusals?.length ?? 0, reconcileRefusalDetails: reconciled.refusals };

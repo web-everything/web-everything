@@ -58,6 +58,7 @@
  */
 import { resolve } from 'node:path';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
+import { DECLARED_REQUIRED_STATUS_CHECKS } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
@@ -723,6 +724,12 @@ export function defaultReadRequiredContexts({ repo = null, branch = 'main', exec
   }
 }
 
+/** The repo's declared (policy) required set — never a network read; `null` for an undeclared repo. */
+export function defaultReadDeclaredContexts({ repo = null } = {}) {
+  const declared = repo ? DECLARED_REQUIRED_STATUS_CHECKS[repo] : null;
+  return Array.isArray(declared) ? [...declared] : null;
+}
+
 /**
  * we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultReadHeadCommittedAt — the one extra per-candidate read
  * this pass needs (`gh pr list` never returns a head commit's own timestamp): the head sha's own commit date,
@@ -809,7 +816,7 @@ export function clearStaleCheckingLabel(prNumber, { repo = null, exec = execFile
 export function sweepMissingRunRecovery({
   repo = null, apply = false, defaultBranch = 'main',
   readOpenPrs = defaultReadOpenPrs, readRequiredContexts = defaultReadRequiredContexts,
-  readHeadCommittedAt = defaultReadHeadCommittedAt,
+  readHeadCommittedAt = defaultReadHeadCommittedAt, readDeclaredContexts = defaultReadDeclaredContexts,
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
   clearLabel = clearStaleCheckingLabel, thresholdMs = DEFAULT_MISSING_RUN_THRESHOLD_MS,
   maxRetriesPerSha = DEFAULT_MAX_MISSING_RUN_RETRIES_PER_SHA, now = Date.now(),
@@ -821,7 +828,11 @@ export function sweepMissingRunRecovery({
   // {@link buildMissingRunCandidates} then uses its narrower "no CI-workflow check at all" test rather than a
   // guessed name set (PR #2740 review).
   const requiredContexts = readRequiredContexts({ repo, branch: defaultBranch });
-  const rawCandidates = buildMissingRunCandidates(prs, { requiredContexts: requiredContexts ?? null });
+  // The daemon's App token cannot read protection (403 → null), which would blind the partial-rollup check
+  // (draft #3850: `test` never reported beside green siblings). Fall back to the repo's DECLARED required set —
+  // used ONLY for that check, never to widen the all-absent test (PR #2740 review).
+  const stalledPartialContexts = requiredContexts ?? readDeclaredContexts({ repo });
+  const rawCandidates = buildMissingRunCandidates(prs, { requiredContexts: requiredContexts ?? null, stalledPartialContexts });
   const prByNumber = new Map((Array.isArray(prs) ? prs : []).map((pr) => [Number(pr?.number), pr]));
   // Every per-candidate extra read below only runs for a PR {@link buildMissingRunCandidates} already narrowed
   // to (zero required-check rollup entries at all) — mirrors {@link sweepCiRedRecovery}/{@link sweepHungCiRecovery}'s
