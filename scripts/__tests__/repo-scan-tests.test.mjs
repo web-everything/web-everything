@@ -137,7 +137,7 @@ describe('guard: every repo-scanning test is marked or deferred with a reason', 
 // ── The #3887 regression, through the real scanning test ──────────────────────────────────────────────────
 describe('#3887 regression: a NEW file with a repo literal is caught by the verify scan', () => {
   const rel = 'scripts/lib/__verify-scan-regression-3887.mjs';
-  const run = (env) => spawnSync('npx', ['vitest', 'run', MULTI, '--reporter=dot'], { cwd: root, encoding: 'utf8', env: { ...process.env, ...env } });
+  const run = (env) => spawnSync('npx', ['vitest', 'run', MULTI, '-t', 'keeps every scanned source', '--reporter=dot'], { cwd: root, encoding: 'utf8', env: { ...process.env, ...env } });
 
   it('the gate selects the scan for the new file, and the scoped real test fails on it', () => {
     const abs = join(root, rel);

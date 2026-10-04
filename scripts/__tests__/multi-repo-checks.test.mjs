@@ -113,4 +113,4 @@ it('the timeout reservation soak uses a repository-neutral fixture and still exe
   expect(scanMultiRepo(read(file))).toEqual([]);
   const { default: scenario } = await import('../conveyor/soak/breaks/timeout-retry-reservation-wedged-on-failed-observation.mjs');
   expect(scenario.judge(await scenario.run())).toEqual([]);
-});
+}, 30_000); // imports + runs a soak scenario: over the 5s default under CI coverage load (seen red on PR #3890)
