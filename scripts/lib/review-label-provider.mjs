@@ -44,7 +44,7 @@ import { runGhSync } from './gh-throttle.mjs';
 
 /** The `--json` fields the label arc reads about a PR. Named once so a second adapter supplies the same shape
  *  rather than guessing at it, and so a stub in a test cannot drift from what the real one returns. */
-export const PR_STATE_FIELDS = Object.freeze(['labels', 'headRefOid', 'headRefName', 'state', 'body', 'createdAt', 'title', 'comments', 'isDraft']);
+export const PR_STATE_FIELDS = Object.freeze(['labels', 'headRefOid', 'headRefName', 'baseRefName', 'state', 'body', 'createdAt', 'title', 'comments', 'isDraft']);
 // `isDraft` (#xe8y12n) rides the SAME call: the missing-only re-arm re-reads it at the pre-write boundary so a
 // PR converted to draft after the caller's observation never receives `review:pending`.
 // `title` supplies delegation trial descriptions on this same call, with no extra hop.

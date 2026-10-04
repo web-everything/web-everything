@@ -216,6 +216,7 @@ export function explainPendingNotDispatched({ prs, plan, dispatchable = [], defe
  * @returns {{reviewsOwed:number, dispatched:Array<{prNumber:number, agentId:string|null}>, failed:Array<{prNumber:number, error:string}>, refusals:number, reconcileError:string|null, deferredForLanes:number, holdReconcile:Array<object>, holdReconcileError:string|null}}
  */
 export function runReviewTick({
+  defaultBranch = 'main',
   reconcile = runReconcilePass,
   dispatch = dispatchReviewByMode,
   tagRound = tagReviewRound,
@@ -293,9 +294,9 @@ export function runReviewTick({
     if (sharedReads) {
       rawPrs = readPrs({ repo });
       rawAgents = readAgents({});
-      plan = reconcile({ repo, readPrs: () => rawPrs, readAgents: () => rawAgents });
+      plan = reconcile({ repo, defaultBranch, readPrs: () => rawPrs, readAgents: () => rawAgents });
     } else {
-      plan = reconcile({ repo });
+      plan = reconcile({ repo, defaultBranch });
     }
   } catch (e) {
     return {
@@ -394,11 +395,14 @@ export function runReviewTick({
   // already exists (`dispatchReviewJob` writes it before returning) — reusing the snapshot would tag it "nothing
   // live" and strip its `review-status:reviewing` until the next tick. Those PRs read fresh (`undefined`).
   const dispatchedThisTick = new Set(dispatched.map((d) => Number(d.prNumber)));
-  for (const c of statusCandidates(reviews, plan.refusals ?? [], fixes, ciHeals)) {
+  // Waiting stacks can have only a surfaced note; they still need their draft status label.
+  const candidates = [...statusCandidates(reviews, plan.refusals ?? [], fixes, ciHeals),
+    ...(plan.notes ?? []).filter(n => ['stacked-awaiting-base', 'stacked-base-orphaned'].includes(n.kind))];
+  for (const c of new Map(candidates.map(c => [Number(c.prNumber), c])).values()) {
     const agents = dispatchedThisTick.has(Number(c.prNumber)) ? undefined : (rawAgents ?? undefined);
     try {
       tagStatus({
-        pr: c.prNumber, repo, agents, prState: (rawPrs ?? []).find(p => Number(p.number) === Number(c.prNumber)), currentLabels: labelsByPr.get(Number(c.prNumber)),
+        pr: c.prNumber, repo, agents, defaultBranch, prState: (rawPrs ?? []).find(p => Number(p.number) === Number(c.prNumber)), currentLabels: labelsByPr.get(Number(c.prNumber)),
         isDraft: isDraftByPr.get(Number(c.prNumber)), mergeConflicted: mergeConflictedByPr.get(Number(c.prNumber)),
       });
     }
