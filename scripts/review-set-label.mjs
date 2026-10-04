@@ -1,4 +1,6 @@
-import { mandatoryReferralState } from './lib/jury-core.mjs';
+import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
+import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
+import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
 /**
  * review-set-label.mjs — swap a PR's review label, INVARIANT-2 guarded (#2470, increment 2 of 2). Also the
  * SINGLE HOME of the shared review-label CLI harness (#2644): a PURE `decideSetLabel` decides the swap for a
@@ -1952,9 +1954,41 @@ export function referralCardReadable(ref, root = process.cwd()) {
 }
 
 /** Fail closed at every acceptance entry point using the fresh durable PR record. */
-export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable = referralCardReadable } = {}) {
-  const result = mandatoryReferralState(state.comments, { repo, pr, head: state.headRefOid,
-    body: typeof state.body === 'string' ? state.body : '', createdAt: state.createdAt, cardReadable });
+export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable = referralCardReadable,
+  env = process.env, readRuns = readReviewRunEvidence } = {}) {
+  const context = { repo, pr, head: state.headRefOid, body: typeof state.body === 'string' ? state.body : '',
+    createdAt: state.createdAt, cardReadable, seatDisabled: seat => referralSeatDisabled(seat, env) };
+  const result = mandatoryReferralState(state.comments, context);
+  const head = state.headRefOid;
+  const mine = r => r.repo === repo && r.pr === Number(pr) && r.head === head;
+  const current = repo && pr ? result.records.filter(mine) : [];
+  const last = repo && pr ? readRuns().filter(r => r.repo === repo && r.pr === Number(pr) && r.head === head)
+    .sort((a, b) => b.completedAt - a.completedAt)[0] : undefined;
+  // The newest review of this head failed to persist its referrals: only a record written at or after that
+  // review started can speak for it. An earlier record of the same head (or an undated one) proves nothing
+  // about the referrals that were lost, so it must not clear the hold.
+  if (last?.persistenceFailed) {
+    const writtenByIt = (Array.isArray(state.comments) ? state.comments : []).some(c => {
+      // createdAt only: an edit that appends rulings to an earlier record bumps updatedAt, and must not make
+      // that earlier record look like it was written by the failed review.
+      const at = Date.parse(c?.createdAt);
+      return Number.isFinite(at) && at >= last.startedAt
+        && readReferralRecords([c], { head }).records.some(mine);
+    });
+    if (!writtenByIt) {
+      throw new Error(`mandatory referral hold: referral-persistence-failed; no readable referral record for current head ${head} written by its latest review; persist the mandatory review before acceptance`);
+    }
+  }
+  // Old heads' holds are not carried onto a new head — but only because that head's own review took their place.
+  // With no record for this head, that review must be PROVEN complete and clean by a run record; the absence of a
+  // failure marker is not evidence (the run store is local and can be missing, pruned or on another machine).
+  if (!current.length && !(last && !last.persistenceFailed && !last.parked && !last.pending.length)) {
+    const older = result.records.filter(r => r.head !== head && (!repo || !pr || (r.repo === repo && r.pr === Number(pr))));
+    const held = older.flatMap(r => { const s = referralRecordState(r, { ...context, head: r.head }); return [...s.pending, ...s.blocked]; });
+    if (held.length) {
+      throw new Error(`mandatory referral hold: no-current-head-review-evidence; no readable referral record or completed clean review for current head ${head}, and earlier heads still hold ${[...new Set(held)].join(', ')}; review the current head before acceptance`);
+    }
+  }
   if (result.pending.length || result.blocked.length) {
     throw new Error(`mandatory referral hold: ${[...result.pending, ...result.blocked].join(', ')}; record finding-specific mandatory rulings before acceptance`);
   }

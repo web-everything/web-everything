@@ -1856,7 +1856,10 @@ describe('#4315 mandatory referral protocol', () => {
     expect(mandatoryReferralState(comments, { head: r.head }).pending).toContain('malformed-referral-record');
     const next = mandatoryReferralState(comments, { head: 'b'.repeat(40) });
     expect(next.malformed).toBe(false);
-    expect(next.pending).toEqual([r.referrals[0].key]);
+    expect(next.pending).toEqual([]);
+    const current = { ...r, head: 'b'.repeat(40), rulings: [] };
+    expect(mandatoryReferralState([...comments, post(renderReferralRecord(current))], { head: current.head }).pending)
+      .toEqual([r.referrals[0].key]);
     expect(readReferralRecords(comments).malformed).toBe(true);
   });
   it('preserves conflicts until explicit supersession, and fails closed on omissions/corruption', () => {

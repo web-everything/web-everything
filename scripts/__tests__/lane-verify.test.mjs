@@ -12,6 +12,7 @@ import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import {
+  verifyServerVerdict,
   VERIFY_FILENAME,
   DEFAULT_VERIFY_TTL_MINUTES,
   verifyStartBody,
@@ -1184,4 +1185,20 @@ it('timeout retry audit is bound to the finishing run and visible on red/green r
     expect(verdict.detail).toContain('untouched.test.mjs');
     expect(verifyFinishBody(record, { exitCode }).retriedTimeouts).toBeUndefined();
   }
+});
+
+
+describe('verifyServerVerdict (#4161)', () => {
+  const owner = 'host:123:verify-daemon';
+  it.each(['alive', 'unknown'])('held lease + %s pid is alive', (pidLiveness) => {
+    expect(verifyServerVerdict({ leaseStatus: { held: true, stale: false, owner }, pidLiveness }))
+      .toEqual({ alive: true, owner });
+  });
+  it.each([
+    [{ held: true, stale: false, owner }, 'dead', 'holder-dead'],
+    [{ held: false, stale: true, owner }, 'alive', 'stale-lease'],
+    [{ held: false, stale: false, owner: null }, 'unknown', 'no-lease'],
+  ])('refuses unavailable server %#', (leaseStatus, pidLiveness, reason) => {
+    expect(verifyServerVerdict({ leaseStatus, pidLiveness })).toEqual({ alive: false, reason });
+  });
 });

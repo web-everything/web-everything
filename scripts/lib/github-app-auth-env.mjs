@@ -260,6 +260,8 @@ export async function ensureFreshGithubAppEnv({
   statusPath = defaultStatusPath(),
   writeStatus = writeStatusFile,
   extraInstallations = true,
+  perOwner = false,
+  installShim = defaultInstallOwnerShim,
 } = {}) {
   const record = (result) => {
     // `not-configured` is skipped, deliberately (#x8mpubm follow-up): this shared file reports the FLEET's
@@ -347,8 +349,30 @@ export async function ensureFreshGithubAppEnv({
   // Per-installation caches: the daemon's own GH_TOKEN covers ONE owner, so also keep a fresh token for EVERY
   // mapped installation in its own cache file, which the gh shim picks by the target repo's owner.
   // Best-effort: a failure here never affects the primary token applied below.
-  if (extraInstallations && Object.values(installationMap(env)).includes(String(config.installationId))) {
+  if (extraInstallations && !perOwner && Object.values(installationMap(env)).includes(String(config.installationId))) {
     await ensurePerInstallationCaches({ config, primary: cached, env, cachePath, now, readCache, writeCache, mint, log });
+  }
+
+  // MULTI-REPO CALLERS (the drain sweeps web-everything + frontier-ui + plateauapp in one process): one pinned
+  // `GH_TOKEN` belongs to ONE org's installation, so every `--repo` outside that org failed with "Could not
+  // resolve to a Repository" and the whole pass died (live 2026-10-03 23:17Z). With `perOwner`, GH_TOKEN is NOT
+  // set; every owner's token is kept fresh in its own cache (above) and `gh` is routed through the shim, which
+  // picks the token by each call's target repo owner and falls back to personal auth, with a warning, for an
+  // owner that has no installation.
+  if (perOwner) {
+    if (!Object.values(installationMap(env)).includes(String(config.installationId))) {
+      log.error?.('github-app-auth-env: this installation is not in the owner map - per-owner routing needs it; staying on personal auth.');
+      return record({ applied: false, reason: 'owner-map-missing' });
+    }
+    // The per-owner caches must be fresh for EVERY owner even when the primary came from the cache.
+    await ensurePerInstallationCaches({ config, primary: cached, env, cachePath, now, readCache, writeCache, mint, log });
+    let shim;
+    try { shim = await installShim(env, { cachePath }); } catch (e) { shim = { ok: false, reason: String((e && e.message) || e) }; }
+    if (!shim || !shim.ok) {
+      log.error?.(`github-app-auth-env: could not install the per-owner gh shim (${shim && shim.reason}) - staying on personal auth.`);
+      return record({ applied: false, reason: 'shim-failed' });
+    }
+    return record({ applied: true, reason: 'ok', perOwner: true });
   }
 
   setEnv(cached.token);
@@ -357,6 +381,19 @@ export async function ensureFreshGithubAppEnv({
   env.WE_GH_AUTH_INSTALLATION = String(cached.installationId);
   env.WE_GH_AUTH_TOKEN_HASH = createHash('sha256').update(cached.token).digest('hex');
   return record({ applied: true, reason: 'ok' });
+}
+
+/**
+ * Default per-owner routing: write this checkout's `gh` shim and prepend its dir to `env.PATH` (idempotent).
+ * Dynamic import: `gh-app-shim.mjs` imports this module.
+ */
+async function defaultInstallOwnerShim(env, { cachePath }) {
+  const { buildGhShimSettingsEnv } = await import('./gh-app-shim.mjs');
+  const settings = buildGhShimSettingsEnv({ env, pathEnv: env.PATH || '', cachePath });
+  if (!settings || !settings.PATH) return { ok: false, reason: 'no-real-gh-or-write-failed' };
+  const dir = settings.PATH.split(':')[0];
+  if (!(env.PATH || '').split(':').includes(dir)) env.PATH = settings.PATH;
+  return { ok: true, dir };
 }
 
 /**

@@ -1081,3 +1081,80 @@ it('xxh4zw8 malformed JSON-lines read is refused and failed identical-head reads
   expect(plan.dispatch).toEqual([]);
   expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toHaveLength(2);
 });
+
+// ── Live deadlock shape, PR #3771 (2026-10-03): a CONFLICTING head never gets pull_request CI ────────────────────
+// GitHub runs no CI on a conflicting head, so its required checks can never appear. Hydration used to read the REST
+// feed every tick and refuse `check-read-failed: missing required checks`, for a PR whose owed work (a mechanical
+// re-sync with main) does not consume CI at all. Absence there is EXPECTED: no read, no refusal, the conflict-fix
+// still planned. Every other path (a non-conflicting PR, a real read error, observed evidence) still refuses/reads.
+describe('conflicting head: missing required checks are expected (#3771)', () => {
+  const real = async () => (await import('node:fs')).readFileSync(
+    (await import('node:path')).join(process.cwd(), 'scripts/conveyor/__tests__/fixtures/pr-3771-conflicting-no-ci.json'), 'utf8');
+  const livePr = async (patch = {}) => ({ ...JSON.parse(await real()), ...patch });
+  const opts = (pr, readChecks) => ({ ...xxOptions(), readPrs: () => [pr], readChecks,
+    enrichFixClaims: p => p, enrichTimeouts: p => p, enrichReferralHolds: p => p });
+  const dispatchOf = (plan) => plan.dispatch.map(d => [d.prNumber, d.kind, d.isConflict ?? null]);
+
+  it('real #3771 data: the conflict repair is planned, nothing is read, nothing is refused', async () => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const readChecks = vi.fn(() => []);
+    const plan = runReconcilePass(opts(await livePr(), readChecks));
+    expect(dispatchOf(plan)).toEqual([[3771, 'fix', true]]);
+    expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
+    expect(readChecks).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['the conflict label alone', { mergeStateStatus: 'CLEAN' }],
+    ['mergeStateStatus DIRTY alone', { labels: [{ name: 'review:changes' }] }],
+    ['mergeable CONFLICTING alone', { mergeStateStatus: 'CLEAN', mergeable: 'CONFLICTING', labels: [{ name: 'review:changes' }] }],
+  ])('%s is enough to expect missing checks', async (_, patch) => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const readChecks = vi.fn(() => []);
+    const plan = runReconcilePass(opts(await livePr(patch), readChecks));
+    expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
+    expect(readChecks).not.toHaveBeenCalled();
+  });
+
+  it('a PR that is NOT conflicting still refuses on missing required checks, exactly as before', async () => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const readChecks = vi.fn(() => []);
+    const clean = await livePr({ mergeStateStatus: 'CLEAN',
+      labels: [{ name: 'review:changes' }, { name: 'review:human' }] });
+    const plan = runReconcilePass(opts(clean, readChecks));
+    expect(readChecks).toHaveBeenCalledTimes(1);
+    expect(plan.refusals.filter(r => r.kind === 'check-read-failed'))
+      .toEqual([expect.objectContaining({ prNumber: 3771, why: expect.stringContaining('missing required checks') })]);
+  });
+
+  it('a conflicting PR with OBSERVED check evidence still reads, and a real read error still refuses', async () => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const observed = await livePr({ statusCheckRollup: [{ name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' }] });
+    const fail = vi.fn(() => { throw new Error('HTTP 502'); });
+    const plan = runReconcilePass(opts(observed, fail));
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toHaveLength(1);
+    // ...but an incomplete-yet-readable feed on a conflicting head is not a refusal.
+    const readable = vi.fn(() => xxRuns().filter(row => row.name === 'soak-replay-gate'));
+    const ok = runReconcilePass(opts(observed, readable));
+    expect(readable).toHaveBeenCalledTimes(1);
+    expect(ok.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
+  });
+
+  // Rules as they stand (confirmed, unchanged): `review:human` is NOT a hold on a mechanical re-sync with main, so it
+  // never blocks the conflict repair. A recorded stand-down IS terminal until the operator answers it (a fix agent
+  // asked a question), and #3771 carries that answer, so the repair is planned. Without the answer it stays refused.
+  it('review:human does not block the re-sync; an UNANSWERED stand-down still does', async () => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const pr = await livePr();
+    const withoutHuman = { ...pr, labels: pr.labels.filter(l => l.name !== 'review:human') };
+    expect(dispatchOf(runReconcilePass(opts(withoutHuman, () => []))))
+      .toEqual(dispatchOf(runReconcilePass(opts(pr, () => []))));
+    const unanswered = { ...pr, comments: pr.comments.filter(c => !c.body.includes('conveyor-stand-down-answer')
+      && !c.body.startsWith('\u21A9\uFE0F') && !c.body.includes('Recorded by parked-pr-conflict-watch')) };
+    const plan = runReconcilePass(opts(unanswered, () => []));
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals.map(r => r.kind)).toContain('stood-down');
+    expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
+  });
+});

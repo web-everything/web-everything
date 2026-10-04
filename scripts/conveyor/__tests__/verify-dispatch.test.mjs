@@ -15,6 +15,8 @@ import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { laneNeedsVerifyDispatch, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
+import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
+import { VERIFY_DAEMON_LEASE_KEY } from '../../../skills-src/conveyor/verify-daemon.mjs';
 
 describe('laneNeedsVerifyDispatch — the pure dispatch decision', () => {
   it('dispatches a running marker for the lane\'s own current HEAD', () => {
@@ -53,7 +55,7 @@ function runDispatch(args, extraEnv = {}) {
 }
 
 function runVerifyLane(args, cwd) {
-  const r = spawnSync('node', [VERIFY_LANE, ...args], { encoding: 'utf8', cwd });
+  const r = spawnSync('node', [VERIFY_LANE, ...args], { encoding: 'utf8', cwd, env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: verifyLockRoot } });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 
@@ -68,10 +70,13 @@ function makeLane(dir) {
   return dir;
 }
 
-let base, poolRoot, poolDir, laneDir;
+let base, poolRoot, poolDir, laneDir, verifyLockRoot;
 
 beforeEach(() => {
   base = mkdtempSync(join(tmpdir(), 'verify-dispatch-'));
+  // #4161 — `verify-lane request` refuses (exit 3) unless a verify daemon holds a live lease; seed one.
+  verifyLockRoot = join(base, 'runner-locks');
+  acquireRunnerLease(verifyLockRoot, makeOwner('verify-dispatch-test'), { key: VERIFY_DAEMON_LEASE_KEY });
   poolRoot = join(base, 'pool');
   poolDir = join(poolRoot, 'flagtest');
   laneDir = makeLane(join(poolDir, 'lane-1'));

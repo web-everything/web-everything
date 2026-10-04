@@ -774,6 +774,9 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
       // required by the card and matched by the soak scenario/live-proof read; never merely implied by an
       // empty `dispatched` count.
       if (authPaused) log.error(`reconcile-fix-dispatch-daemon: ${authPauseReason ?? 'paused: Claude login expired — run /login'}`);
+      for (const r of repos) for (const h of (r.result?.terminalHoldsReleased ?? [])) {
+        log.error(`reconcile-fix-dispatch-daemon: scope-hold released ${r.repo} PR #${h.pr} — ${h.why}`);
+      }
       for (const r of repos) for (const rank of (r.result?.scopeRanks ?? [])) {
         log.error(`reconcile-fix-dispatch-daemon: scope-rank ${r.repo} PR #${rank.pr} — rank ${rank.rank}, blocks ${rank.blocks}, age ${rank.ageHours}h, score ${rank.score}, aged-FIFO ${rank.aged}`);
       }

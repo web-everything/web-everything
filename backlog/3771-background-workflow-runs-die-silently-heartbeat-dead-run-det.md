@@ -3,9 +3,10 @@ bornAs: x0y6xk4
 kind: story
 size: 5
 parent: "3383"
-status: open
+status: resolved
 scope: ["we:scripts/operations/dispatch-lane-io.mjs", "we:scripts/operations/review-dispatch.mjs"]
 dateOpened: "2026-09-20"
+dateResolved: "2026-10-03"
 tags: []
 ---
 

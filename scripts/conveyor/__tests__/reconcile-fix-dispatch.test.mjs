@@ -10,7 +10,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
-  findResumeCandidate, buildResumePrompt, tryResumeFix, filterFixesByInFlightScope,
+  findResumeCandidate, buildResumePrompt, tryResumeFix, filterFixesByInFlightScope, dropTerminalFixClaims,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
 import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../operations/dispatch-lane-io.mjs';
@@ -1445,6 +1445,49 @@ describe('actual PR ownership and unblock ranking (2026-10-01)', () => {
     expect(out.dispatched).toEqual([{ pr: 3311 }]);
     expect(reads).toEqual(snapshot ? [] : [3336]);
     expect(out.scopeRanks).toEqual([{ pr: 3311, rank: 1, blocks: 0, ageHours: 0, score: 0, aged: false }]);
+  });
+
+  describe('stood-down PRs release their scope hold (live #3834 blocking #3787)', () => {
+    const agents = 'AGENTS.md';
+    const standDown = { kind: 'stood-down', prNumber: 3834 };
+    const claim3834 = { meta: { repo: 'web-everything/web-everything', pr: 3834, scope: [`we:${agents}`] } };
+    const e3787 = { kind: 'fix', prNumber: 3787, headRefName: 'lane/3787-x', files: [agents, 'docs/agent/platform-decisions.md'] };
+    const run = (refusals, claims) => runReconcileFixDispatch({
+      root: '/repo', repo: 'we', checkStaleness: FRESH,
+      reconcile: () => ({ dispatch: [e3787], refusals, openPrFiles: [{ pr: 3834, files: [agents] }, { pr: 3787, files: e3787.files }] }),
+      findItemFn: () => null, loadItems: () => [], pickFreeLanes: () => [1],
+      listBuildClaims: () => [], listFixClaims: () => claims,
+      fetchItemlessDiffPaths: () => e3787.files,
+      dispatch: (entry) => ({ pr: entry.pr }), tryResume: () => ({ resumed: false }),
+    });
+
+    it('BEFORE the stand-down is answered: #3834 holds no slot, so #3787 is dispatched, not refused scope-overlap', () => {
+      const out = run([standDown], [claim3834]);
+      expect(out.refusals.filter((r) => r.kind === 'scope-overlap')).toEqual([]);
+      expect(out.dispatched).toEqual([{ pr: 3787 }]);
+      expect(out.terminalHoldsReleased).toEqual([expect.objectContaining({ pr: 3834 })]);
+    });
+
+    it('control: the same live claim WITHOUT a stand-down still serializes #3787 behind #3834', () => {
+      const out = run([], [claim3834]);
+      expect(out.dispatched).toEqual([]);
+      expect(out.refusals[0]).toMatchObject({ pr: 3787, kind: 'scope-overlap' });
+      expect(out.refusals[0].why).toContain('behind #3834');
+    });
+
+    it('once answered (no stood-down refusal any more) the PR re-enters and holds its slot normally', () => {
+      expect(run([], [claim3834]).terminalHoldsReleased).toBeUndefined();
+    });
+
+    it('dropTerminalFixClaims only drops stood-down PRs of the same repo, never other refusals', () => {
+      const other = { meta: { repo: 'web-everything/web-everything', pr: 3849 } };
+      const foreign = { meta: { repo: 'plateauapp/plateau-app', pr: 3834 } };
+      const repoOf = (slug) => (slug.startsWith('plateau') ? 'plateau-app' : 'we');
+      const out = dropTerminalFixClaims([claim3834, other, foreign],
+        [standDown, { kind: 'cap-exhausted', prNumber: 3849 }, { kind: 'draft', prNumber: 3849 }], { repoKey: 'we', repoOf });
+      expect(out.claims).toEqual([other, foreign]);
+      expect(out.released.map((r) => r.pr)).toEqual([3834]);
+    });
   });
 
   it('refuses a planned fix if its actual diff cannot be observed', () => {

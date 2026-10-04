@@ -49,7 +49,8 @@
 # check out BOTH repos as siblings and build FUI's tools first. Single-repo CI cannot build this site.
 #
 # Secrets (repo → Settings → Secrets and variables → Actions):
-#   FUI_READ_TOKEN        — fine-grained PAT, Contents:Read on frontier-ui/frontierui (checkout the sibling)
+#   WE_APP_PRIVATE_KEY    — GitHub App private key (var WE_APP_ID = app id); app installed on frontier-ui/frontierui, Contents:Read; preferred
+#   FUI_READ_TOKEN        — fallback fine-grained PAT, Contents:Read on frontier-ui/frontierui (used only if WE_APP_ID unset)
 #   CLOUDFLARE_API_TOKEN  — scoped token, Workers Scripts · Edit (deploy)
 #   CLOUDFLARE_ACCOUNT_ID — the account id
 name: Deploy WE site (Cloudflare Worker)
@@ -157,11 +158,21 @@ jobs:
           path: web-everything
           # THE POINT OF THIS CHANGE: build the commit CI verified, not the branch tip.
           ref: ${{ env.DEPLOY_SHA }}
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
       - name: Checkout FUI (sibling)
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
-          token: ${{ secrets.FUI_READ_TOKEN }}
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
       - uses: actions/setup-node@v4

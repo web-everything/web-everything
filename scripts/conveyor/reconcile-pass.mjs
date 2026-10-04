@@ -987,6 +987,17 @@ export function defaultReadChecks({ repo, sha }, { exec = execFileSyncThrottled 
  * Hydrate truncated or incomplete check input from the exact-head REST feed. Unknown evidence is withheld from the
  * CI-consuming branches (heal, promotion) via an `unchecked` verdict, but never removes the PR from planning.
  */
+/**
+ * A PR GitHub reports as conflicting with its base. GitHub runs NO `pull_request` CI on a conflicting head (there is
+ * no merge commit to test), so for such a PR the absence of every required check is the EXPECTED state, never a
+ * failed read. Conflict facts only: the `merge-status:conflicting` label (the conflict watch's own mark), the
+ * `mergeable` field, or `mergeStateStatus: DIRTY` (the same field `classifyPr` reads for the `conflicted` phase).
+ */
+export function isConflictingPr(pr) {
+  const labels = Array.isArray(pr?.labels) ? pr.labels.map(l => (typeof l === 'string' ? l : l?.name)) : [];
+  return labels.includes(CONFLICT_LABEL) || pr?.mergeable === 'CONFLICTING' || pr?.mergeStateStatus === 'DIRTY';
+}
+
 function hydrateChecks(prs, { repo, requiredChecks, readChecks }) {
   const cache = new Map();
   const ready = [], refusals = [];
@@ -994,6 +1005,15 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks }) {
     const runs = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
     const missing = (requiredChecks ?? []).filter(name => !runs.some(run => run?.name === name));
     if (runs.length < 100 && !missing.length) { ready.push(pr); continue; }
+    // Live deadlock shape, PR #3771 (2026-10-03): a conflicting head can never grow its required checks, so reading
+    // the REST feed every tick and refusing `check-read-failed` for "missing required checks" is a read that cannot
+    // succeed and a refusal that names no real fault. The conflict repair that PR is owed (a mechanical re-sync
+    // with main) does not consume CI at all. Nothing observed for ANY required name + not truncated = expected
+    // absence: skip the read (it also costs a GitHub call per tick), refuse nothing, keep the empty rollup so the
+    // verdict stays `unchecked` (never green, never red) for every CI-consuming branch. Observed evidence (a
+    // required check that did run before the conflict) still goes through the read below.
+    const conflicting = isConflictingPr(pr);
+    if (conflicting && runs.length < 100 && missing.length === (requiredChecks ?? []).length) { ready.push(pr); continue; }
     const sha = pr.headRefOid;
     const key = `${repo}/${sha}`;
     if (!cache.has(key)) {
@@ -1024,7 +1044,8 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks }) {
       } catch (error) { cache.set(key, { error: String(error?.message ?? error) }); }
     }
     const result = cache.get(key);
-    const refused = result.error ?? result.incomplete;
+    // A conflicting head's incomplete required set is expected (see above); only a real read error still refuses.
+    const refused = result.error ?? (conflicting ? null : result.incomplete);
     if (refused) {
       refusals.push({ kind: 'check-read-failed', prNumber: pr.number, headRefOid: sha,
         why: `required-check hydration refused for ${repo}@${sha}: ${refused}` });
