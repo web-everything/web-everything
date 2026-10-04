@@ -711,3 +711,12 @@ calls; shallow history exercises the metered GraphQL fallback. Preserve exact st
 and cache replay assertions on that fallback. Keep the fake host's throttle store private so another
 suite cannot consume its budget. Numbering fixtures likewise pass a private `lockRoot` to the real
 mutex instead of acquiring the developer's shared drain lock.
+
+### Direct heavy-run hook probes
+
+The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
+and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
+or the admitted `npm run test:unit -- <file>` / `npm run check:standards` scripts.
+`WE_FULL_SUITE_OK` bypasses only full-suite selection, never admission. Guard tests should
+assert the suggested command verbatim and probe stdin-to-stdout hook wiring; unrelated
+allow-case fixtures must use admitted commands.
