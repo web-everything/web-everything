@@ -32,6 +32,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "drain-merge-rate-drop": "Throughput is aggregate, not authority to bypass a merge gate.",
   "drain-pass-over-budget": "Do not kill or lengthen a running drain budget; report the slow step.",
   "duplicate-live-sessions": "Do not stop either live worker; the dispatcher owns the duplicate claim.",
+  "fixer-verify-never-settles": "Never reset/re-request a marker or kill a waiter; fix the verify-daemon pass that is not dispatching.",
   "gh-call-failures": "Inhibit responder GitHub actions, honor existing throttle; do not amplify failed writes.",
   "gh-graphql-budget": "Inhibit GitHub actions until the existing budget read permits them; no new poll/retry loop.",
   "gh-shim-lane-path": "Repair the shim producer via normal delivery, never patch a generated shim in place.",
