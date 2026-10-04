@@ -25,8 +25,13 @@
  *   - a malformed referral thread (the gate already holds it; a ruling cannot repair a broken record).
  *
  * `--finding` selects from the OPEN findings on the live head (pending or blocked), numbered from 1 in thread
- * order: `all-open`, a comma list of numbers (`1,3`), or one exact finding key. `--preview` plans and prints
- * without posting.
+ * order: `all-open`, a comma list of numbers (`1,3`), `<file>:<line>`, `<file>` (no line), or one exact finding key.
+ * `--preview` plans and prints without posting.
+ *
+ * FOLLOW-UP (plateau-app #202, 2026-10-04). Once this ruling leaves no pending finding on the head: any `block`
+ * sends the PR back through review-set-label's own `--to=changes` path (listing each blocked finding and its
+ * rationale); otherwise the posted ruling wakes the paused review. Both clear `advisory:ruling-needed`.
+ * Set `--sendBack=false` or `WE_REFERRAL_RULING_FOLLOW_UP=0` to disable this follow-up (enabled by default).
  *
  * PURE. The reader and the sink live in `./record-referral-ruling-io.mjs`.
  */
@@ -41,6 +46,9 @@ import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 
 export const RECORD_REFERRAL_RULING_OP = 'record-referral-ruling';
 export const OPERATOR_RULING_POST_EFFECT = 'github.operator-referral-ruling';
+export const OPERATOR_RULING_FOLLOW_UP_EFFECT = 'github.operator-referral-ruling-follow-up';
+/** Mirrors the derived label of PR #3889's ruling-needed sweep. */
+export const RULING_NEEDED_LABEL = 'advisory:ruling-needed';
 
 /**
  * The findings still open on `head`: every active referral of a current-head record that the gate leaves
@@ -52,12 +60,16 @@ export function openReferralFindings({ comments, repo, pr, head, body = '', crea
   const open = [];
   for (const record of state.records) {
     if (record.head !== head || record.repo !== repo || record.pr !== Number(pr)) continue;
-    const s = referralRecordState(record, { ...context, operatorRulings: state.operatorRulings });
+    const s = referralRecordState(record, { ...context, records: state.records, operatorRulings: state.operatorRulings });
     const held = new Set([...s.pending, ...s.blocked]);
     for (const f of activeReferrals(record)) {
       if (held.has(f.key)) {
+        const blocked = s.blocked.includes(f.key);
+        const effective = s.rulings.filter((r) => r.key === f.key).at(-1);
         open.push({ index: open.length + 1, runId: record.runId, key: f.key, seat: f.seat,
-          summary: f.finding?.summary ?? '', state: s.blocked.includes(f.key) ? 'blocked' : 'pending' });
+          file: f.finding?.file ?? '', line: Number.isInteger(f.finding?.line) ? f.finding.line : null,
+          summary: f.finding?.summary ?? '', state: blocked ? 'blocked' : 'pending',
+          rationale: blocked ? (effective?.rationale ?? effective?.reason ?? '') : '' });
       }
     }
   }
@@ -67,7 +79,7 @@ export function openReferralFindings({ comments, repo, pr, head, body = '', crea
 /** Pick the selected open findings. PURE; throws on a selection that names nothing or something not open. */
 export function selectFindings(open, finding) {
   const sel = String(finding ?? '').trim();
-  if (!sel) throw new Error('--finding is required: all-open, a comma list of open-finding numbers, or one exact key');
+  if (!sel) throw new Error('--finding is required: all-open, a comma list of open-finding numbers, <file>:<line>, <file>, or one exact key');
   if (sel === 'all-open') {
     if (!open.length) throw new Error('no open mandatory-referral findings on the live head — nothing to rule on');
     return open;
@@ -81,8 +93,35 @@ export function selectFindings(open, finding) {
     return picked;
   }
   const hits = open.filter((o) => o.key === sel);
-  if (!hits.length) throw new Error('--finding names no open finding key on the live head');
-  return hits;
+  if (hits.length) return hits;
+  const location = /^(.+):(\d+)$/.exec(sel);
+  const matches = open.filter((o) => location
+    ? o.file === location[1] && o.line === Number(location[2])
+    : o.file === sel && o.line == null);
+  if (matches.length === 1) return matches;
+  const list = (entries) => entries.map((o) => `  ${o.index}. ${o.seat} ${findingLocation(o)} — ${o.summary}`).join('\n');
+  if (matches.length > 1) throw new Error(`--finding=${sel} is ambiguous:\n${list(matches)}\nPick by number.`);
+  throw new Error(`--finding=${sel} matches no open finding on the live head. Open:\n${list(open)}`);
+}
+
+/** Render a finding's location. PURE. */
+const findingLocation = ({ file, line }) => `${file ?? ''}${line == null ? '' : `:${line}`}`;
+
+/** Decide the handoff after the last pending ruling, preserving blocks from other findings. PURE. */
+export function planRulingFollowUp({ open, selected, ruling, reason, enabled, head }) {
+  if (!enabled) return null;
+  const isSelected = (o) => selected.some((s) => s.runId === o.runId && s.key === o.key);
+  if (open.some((o) => o.state === 'pending' && !isSelected(o))) return null;
+  const blocked = open.filter((o) => isSelected(o) ? ruling === 'block' : o.state === 'blocked')
+    .map((o) => ({ seat: o.seat, file: o.file, line: o.line, summary: o.summary,
+      rationale: isSelected(o) ? reason : o.rationale }));
+  if (!blocked.length) return { action: 'resume' };
+  const prose = (s) => String(s ?? '').replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').replace(/\s+/g, ' ').trim();
+  const body = '### Blocked referral findings (operator ruling)\n\n'
+    + `The operator ruled these mandatory-referral findings \`block\` on head \`${head}\`. Fix each one, then push.\n\n`
+    + blocked.map((o, i) => `${i + 1}. \`${findingLocation(o)}\` (${o.seat}) — ${prose(o.summary)}`
+      + (prose(o.rationale) ? `\n   Rationale: ${prose(o.rationale)}` : '')).join('\n');
+  return { action: 'send-back', blocked, body };
 }
 
 /** THE VERDICT. Build and validate the record; refuse anything the gate would not honour. PURE. */
@@ -106,7 +145,9 @@ export function planOperatorRuling(read, input) {
     clearerId: read.clearerId,
   };
   if (!validateOperatorRuling(record)) throw new Error('the operator ruling record failed validation; nothing posted');
-  return { record, body: buildOperatorRulingComment(record), selected, open: read.open };
+  const followUp = planRulingFollowUp({ open: read.open, selected, ruling, reason, head: read.head,
+    enabled: input.sendBack !== false && read.followUpEnabled !== false });
+  return { record, body: buildOperatorRulingComment(record), selected, open: read.open, followUp };
 }
 
 export function recordReferralRulingOperation({ readRulingContext } = {}) {
@@ -124,6 +165,7 @@ export function recordReferralRulingOperation({ readRulingContext } = {}) {
       actor: 'string',
       channel: 'string',
       reason: 'string',
+      sendBack: { type: 'boolean', required: false, default: true },
       preview: { type: 'boolean', required: false, default: false },
     },
     verdictFrom: 'plan',
@@ -133,7 +175,7 @@ export function recordReferralRulingOperation({ readRulingContext } = {}) {
     }),
     plan: compute({
       reads: ['input.repo', 'input.pr', 'input.finding', 'input.ruling', 'input.actor', 'input.channel',
-        'input.reason', 'findings.read'],
+        'input.reason', 'input.sendBack', 'findings.read'],
       fn: (view) => planOperatorRuling(view.findings.read, view.input),
     }),
     write: effectStep({
@@ -143,7 +185,12 @@ export function recordReferralRulingOperation({ readRulingContext } = {}) {
       effects: (view) => (view.input.preview ? [] : [{
         type: OPERATOR_RULING_POST_EFFECT, idempotent: false,
         payload: { repo: view.verdict.record.repo, pr: view.verdict.record.pr, head: view.verdict.record.head, body: view.verdict.body },
-      }]),
+      }, ...(view.verdict.followUp ? [{
+        type: OPERATOR_RULING_FOLLOW_UP_EFFECT, idempotent: true,
+        payload: { repo: view.verdict.record.repo, pr: view.verdict.record.pr, head: view.verdict.record.head,
+          action: view.verdict.followUp.action, body: view.verdict.followUp.body,
+          actor: view.verdict.record.actor, channel: view.verdict.record.channel },
+      }] : [])]),
     }),
   });
 }
