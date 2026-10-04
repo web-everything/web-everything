@@ -221,10 +221,13 @@ export function assertMainNotStale(root, checkStaleness, {
       // #4387 (live 2026-09-28): the drain lands about a PR a minute and a rebuild takes minutes, so the review
       // daemon sat 4-18 commits behind and logged 970 refusals in one evening — for commits that never touched
       // the code a review dispatch runs. Only a behind file on the caller's own dispatch path can make it stale.
-      const code = files.filter(isCodePath).length;
+      const codeFiles = files.filter(isCodePath);
+      const code = codeFiles.length;
+      // Name what was tolerated (first 5), so the log shows exactly which lag a dispatch ran through.
+      const named = codeFiles.slice(0, 5).join(', ') + (code > 5 ? `, +${code - 5} more` : '');
       write(`${label}: the managed clone is ${st.behind} commit(s) behind origin/${base} (${code} code file(s), none on `
-        + `this dispatch's code path) — tolerating the lag and dispatching (#4387).\n`);
-      st = { fresh: true, behind: st.behind, behindOffDispatchPath: true, files: files.length, codeFiles: code };
+        + `this dispatch's code path: ${named || 'none'}) — tolerating the lag and dispatching (#4387).\n`);
+      st = { fresh: true, behind: st.behind, behindOffDispatchPath: true, files: files.length, codeFiles: code, toleratedFiles: codeFiles };
     }
   }
   // x5wbsbc (epic #4075) — FALLBACK TO THE LAST WORKING BUILD, NEVER BLOCK DELIVERY (operator ruling 2026-09-26).
