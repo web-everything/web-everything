@@ -21,8 +21,8 @@ Builds rule 4 of `we:docs/agent/platform-decisions.md#independent-judge-clears-r
 
 **Reuse the existing verdict ledger — do not add a second one.** `we:scripts/lib/verdict-ledger.mjs` is already the single owner of an append-only JSONL record of every review verdict, and `we:scripts/review-set-label.mjs` already appends to it on every label swap (`buildVerdictRecord` / `appendVerdict`). So:
 
-- Extend `buildVerdictRecord` with an optional `judge` block: `{ provider, model, actorId, authorProvider, verdict, protectedConcern, reasoning, refusal }`. Absent for every non-judge verdict, so existing records and readers are unchanged. The ledger version stays 1 because the field is optional and additive; a reader that does not know `judge` ignores it.
-- `we:scripts/operations/judge-clear.mjs` passes the `judge` block through on a clear. It also appends a record for a judge **refusal after spawn** (the judge answered `keep-human`), with verdict `observed` (a non-bearing verdict, `NON_BEARING`), so the digest can show what the judge declined. Refusals before spawn (protected list, kill switch, independence) are not ledgered — nothing judged them.
+- **The clear path is owned by `xq3kn88`, which this story builds on:** the `clear-human-judge` → `clear-human` mapping in `verdictForLabelTarget`, the optional `judge` block on `buildVerdictRecord` (`{ provider, model, actorId, authorProvider, verdict, protectedConcern, reasoning, refusal }`, absent for every non-judge verdict, ledger version stays 1), and the row appended at the label home in `we:scripts/review-set-label.mjs` before the swap (fail closed). That is where the append actually happens, so the clear row cannot live in this story's scope. This story adds a small reader, `judgeRecordsSince(records, since)`, in `we:scripts/lib/verdict-ledger.mjs` that returns the records carrying a `judge` block.
+- `we:scripts/operations/judge-clear.mjs` appends a record for a judge **refusal after spawn** (the judge answered `keep-human`), with verdict `observed` (a non-bearing verdict, `NON_BEARING`), so the digest can show what the judge declined. Refusals before spawn (protected list, kill switch, independence) are not ledgered — nothing judged them.
 
 **Digest** `we:scripts/conveyor/judge-digest.mjs [--since=<ISO>] [--dry-run]`:
 
@@ -33,7 +33,7 @@ Builds rule 4 of `we:docs/agent/platform-decisions.md#independent-judge-clears-r
 
 ## MVP
 
-1. Must append one durable ledger record with a `judge` block for every judge clear and every post-spawn judge decline.
+1. Must have one durable ledger record with a `judge` block for every judge clear (appended at the label home, built in `xq3kn88`) and every post-spawn judge decline (appended by the runner, here).
 2. Must leave every existing ledger record shape and reader unchanged.
 3. Must send at most one digest per local day, listing every judge clear in the window with its reasoning.
 4. Must send a "none today" digest when the window is empty.
@@ -49,7 +49,7 @@ Builds rule 4 of `we:docs/agent/platform-decisions.md#independent-judge-clears-r
 
 Extend `we:scripts/lib/__tests__/verdict-ledger.test.mjs` (matching source: `we:scripts/lib/verdict-ledger.mjs`):
 
-- A record built with a `judge` block round-trips; one built without it is byte-identical to today's. Red today: `buildVerdictRecord` has no `judge` block.
+- `judgeRecordsSince` returns only the records with a `judge` block inside the window and skips a record without one. Red today: `judgeRecordsSince` does not exist. (The `judge` block round trip and the mapping are tested in `xq3kn88`'s extension of this same file.)
 - A judge decline records verdict `observed` and is not counted as clearing by `verdictClears`. Red today: no judge record is written.
 
 New `we:scripts/conveyor/__tests__/judge-digest.test.mjs` (matching source: `we:scripts/conveyor/judge-digest.mjs`):
@@ -62,7 +62,7 @@ New `we:scripts/conveyor/__tests__/judge-digest.test.mjs` (matching source: `we:
 - The kill switch was turned off during the window → the digest says so. Red today: the digest does not exist.
 - The judge is OFF now (store reads `judgeEnabled: false`), with two clears recorded earlier in the window → the digest still lists both and leads with the "judge OFF since" line; an unreadable store → the line names the parse error. Red today: the digest does not exist.
 
-`we:scripts/operations/judge-clear.mjs` gains one assertion in its existing test file (`we:scripts/operations/__tests__/judge-clear.test.mjs`, from `xq3kn88`) that the `judge` block reaches the ledger writer.
+`we:scripts/operations/judge-clear.mjs` gains one assertion in its existing test file (`we:scripts/operations/__tests__/judge-clear.test.mjs`, from `xq3kn88`) that a post-spawn `keep-human` answer appends one `observed` row carrying the `judge` block. The clear row itself is asserted end to end through `runReviewLabelCli` in `xq3kn88`; the digest test here reads a row produced that way (a fixture built by the real `buildVerdictRecord` with a `judge` block, never a hand-typed JSON line).
 
 ## Proof plan
 

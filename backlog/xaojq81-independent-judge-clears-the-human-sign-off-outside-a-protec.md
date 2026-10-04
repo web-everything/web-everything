@@ -13,11 +13,11 @@ The rule: `we:docs/agent/platform-decisions.md#independent-judge-clears-review-h
 
 ## Slices (build order)
 
-1. `xfnv9ay` — decision core: protected list (in the leash, including the judge's own inputs and control modules) and the provider/actor independence check, with the author provider read from the trusted dispatch run record, never PR text. Pure.
+1. `xfnv9ay` — decision core: protected list (in the leash: merge/approval logic including the merge gate's workflows and label appliers, credentials, security checks, the ratification surfaces as class (d) — ruled by the operator 2026-10-04 — and the judge's own inputs and control modules, the last defined by a `judge-*` pattern so a later module is covered the day it lands) and the provider/actor independence check, with the author provider read from the trusted dispatch run record bound to the run window that created the PR, never PR text. Pure; exports the one protected-list check the arbiter also uses.
 2. `x6e8z3o` — kill switch and default-off wait switch. Fails closed: an absent or unreadable store reads as judge OFF, at one fixed path; the operator turns the judge on with one `on` command. (Parallel with 1.)
-3. `xq3kn88` — judge seat runner and the `clear-human-judge` target at the label home. One PR at a time, by hand. Blocked by 1 and 2.
-4. `xfbj1fa` — judge records in the existing verdict ledger, and the daily digest. Blocked by 3.
-5. `x6prrg3` — the arbiter for fixer/reviewer disagreements, same judge seat. Blocked by 3.
+3. `xq3kn88` — judge seat runner and the `clear-human-judge` target at the label home, including the target's ledger mapping and the `judge` block row appended there. One PR at a time, by hand. Blocked by 1 and 2.
+4. `xfbj1fa` — the post-spawn decline rows and the daily digest, reading the judge rows slice 3 writes. Blocked by 3.
+5. `x6prrg3` — the arbiter for fixer/reviewer disagreements, same judge seat, bounded by the same protected-list check. Blocked by 1 and 3.
 6. `xfetp9j` — the conveyor pass that runs 3 and 5 each tick and the digest daily. Blocked by 3, 4 and 5, so nothing clears unattended before records and arbiter limits exist.
 
 ## Done when
