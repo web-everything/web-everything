@@ -108,7 +108,7 @@ import { freeLaneNumbers } from '../../scripts/conveyor/reconcile-fix-dispatch.m
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
 import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
-import { withGithubAppAuth } from '../../scripts/lib/github-app-auth-env.mjs';
+import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 import { withSelfSync } from '../../scripts/lib/daemon-self-sync.mjs';
 import { withPrEvents, makeDrainNudgeForward } from '../../scripts/lib/pr-events.mjs';
 import { makePoolExhaustionLogger } from '../../scripts/conveyor/pool-exhaustion.mjs';
@@ -437,7 +437,7 @@ export const REVIEW_DAEMON_REPOS = Object.values(CONSTELLATION_REPOS).map((r) =>
  * #202 skipped every pass as `review-ci: unreadable-ci` while its CI was green. Per-owner leaves GH_TOKEN unset and
  * routes `gh` through the shim, which picks each call's token by the target repo's owner (as the drain does).
  */
-export const REVIEW_DAEMON_APP_AUTH_OPTS = Object.freeze({ log: console, perOwner: true });
+export const REVIEW_DAEMON_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
 
 /**
  * Run {@link runReviewTick} once per watched repo, isolating one repo's failure from the rest — a plateau-app
