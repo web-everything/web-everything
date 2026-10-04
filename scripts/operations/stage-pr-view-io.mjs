@@ -51,6 +51,7 @@ import {
   viewPath,
 } from '../lib/pr-view-transport.mjs';
 import { defaultOriginRepo, resolveTransportRoot } from './record-verdict-io.mjs';
+import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 import { WRITE_VIEW_EFFECT } from './stage-pr-view.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -141,7 +142,7 @@ export function ownsRepo({ cwd, repo, originRepo = defaultOriginRepo }) {
   if (!at) return false;
   const want = String(repo ?? '').trim();
   if (!want) return false;
-  try { return originRepo(at) === want; } catch { return false; }
+  try { return canonicalizeSlug(originRepo(at)) === canonicalizeSlug(want); } catch { return false; }
 }
 
 export function probeTransportBranch({ run = defaultGit, cwd = REPO_ROOT } = {}) {

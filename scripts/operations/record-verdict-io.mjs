@@ -28,6 +28,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 
 import { stageOnTransportBranch, trackingRefspec } from '../lib/git-transport-branch.mjs';
 
@@ -114,7 +115,7 @@ export function resolveTransportRoot({
   if (!want) throw new Error(`${who}: no \`repo\` on the request — cannot decide which board it belongs on`);
   const candidate = String(repoRoot ?? '').trim() || root;
   const have = originRepo(candidate);
-  if (have === want) return candidate;
+  if (canonicalizeSlug(have) === canonicalizeSlug(want)) return candidate;
   throw new Error(
     `${who}: refusing to stage ${what} for ${want} on ${have || '(unknown)'}'s transport branch (#3261). `
     + `Each repo owns its own notes: the request must be pushed to that repo's own \`${branch}\`, where `
@@ -124,12 +125,17 @@ export function resolveTransportRoot({
   );
 }
 
-/** `owner/name` of a checkout's `origin`, or '' when it cannot be read. Probing must never throw. */
+/**
+ * `owner/name` of a checkout's `origin`, or '' when it cannot be read. Probing must never throw.
+ * A LEGACY `chalbert/<repo>` origin (every clone and lane minted before the 2026-10-03 org move) is returned as
+ * the repo's CURRENT slug (`canonicalizeSlug`) — otherwise every caller that compares it to a `--repo=` slug
+ * refuses, which blocked ALL reviews before their read step (outage 2026-10-03).
+ */
 export function defaultOriginRepo(cwd) {
   try {
     const url = String(execFileSync('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8', cwd })).trim();
     const m = url.match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?$/);
-    return m ? m[1] : '';
+    return m ? canonicalizeSlug(m[1]) : '';
   } catch { return ''; }
 }
 

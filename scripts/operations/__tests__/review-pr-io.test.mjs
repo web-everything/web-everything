@@ -1521,3 +1521,12 @@ describe('#4315 durable referral effects', () => {
     expect(h.judge).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('legacy vs current owner slugs compare equal (outage 2026-10-03)', () => {
+  it('resolveSubjectCheckout accepts a chalbert/ origin for the web-everything/ slug and the reverse', () => {
+    const a = resolveSubjectCheckout({ repo: 'web-everything/web-everything', cwd: '/x', originRepo: () => 'chalbert/web-everything', siblings: () => [] });
+    expect(a.path).toBe('/x');
+    const b = resolveSubjectCheckout({ repo: 'chalbert/web-everything', cwd: '/x', originRepo: () => 'web-everything/web-everything', siblings: () => [] });
+    expect(b.path).toBe('/x');
+  });
+});

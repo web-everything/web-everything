@@ -94,6 +94,7 @@ import { renderPanelComment, deriveResolutionBasis } from './lib/review-render.m
 // here — see `buildShapePlan`'s docblock for the scope carve between #3309 and this item.
 import { CARE_LEVELS, scoreEscalation } from './lib/review-escalation.mjs';
 import { routeReviewShape } from './lib/decision-routing.mjs';
+import { reviewNeedFor } from './lib/review-need.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 
 // ── tiny flags parser (matches push-if-green.mjs) ─────────────────────────────────────────────────────
@@ -516,7 +517,7 @@ function runRigor(flags, asJson) {
  *   mandatoryFloor: string[], subject: string, rounds: number, jurorsPerLens: number, seatLens: string,
  *   escalated: boolean, changedFiles: string[], trail: string[]}}
  */
-export function buildShapePlan({ changedFiles = [], careLevel } = {}) {
+export function buildShapePlan({ changedFiles = [], careLevel, commits = null } = {}) {
   const files = (Array.isArray(changedFiles) ? changedFiles : [])
     .filter((f) => typeof f === 'string' && f.trim().length > 0)
     .map((f) => f.trim());
@@ -542,6 +543,7 @@ export function buildShapePlan({ changedFiles = [], careLevel } = {}) {
     escalated: plan.careLevel !== CARE_LEVELS.NONE,
     changedFiles: files,
     trail: [...plan.trail],
+    need: reviewNeedFor({ changedFiles, careLevel, commits }),
   };
 }
 
@@ -551,6 +553,7 @@ export function buildShapePlan({ changedFiles = [], careLevel } = {}) {
  * operation as `--careLevel=`, where `read` re-scores the NET file list and refuses a declaration the PR
  * contradicts. Input is `--files=a,b,c`, or a JSON array / `{changedFiles}` / `{files}` on --file/stdin, so
  * `gh pr view <pr> --json files --jq '[.files[].path]'` pipes in unmodified.
+ * Optional `--commits-file` reads a JSON array or `gh pr view --json commits` output for author routing.
  */
 function runShape(flags, asJson) {
   let files = [];
@@ -563,10 +566,13 @@ function runShape(flags, asJson) {
     else if (json && Array.isArray(json.files)) {
       // `gh pr view --json files` UNJQ'd: `{files:[{path,…}]}`. Accepted so a caller that forgot the `--jq` gets
       // the right answer rather than an empty touch-set — which would silently read as care `none`.
-      files = json.files.map((f) => (typeof f === 'string' ? f : f && f.path)).filter(Boolean);
+      files = json.files.map((f) => (typeof f === 'string' ? f : f && f.path));
     }
   }
-  if (!files.length) {
+  // The refusal tests for at least one READABLE path, but the list handed on stays unfiltered: an entry that
+  // yielded no path is kept as-is so `buildShapePlan` sees the touch-set was partly unreadable (fail-closed `need`),
+  // while a list with NO readable entry (`{files:[{}]}`, `[null]`, `['']`) is still refused rather than scored `none`.
+  if (!files.some((f) => typeof f === 'string' && f.trim().length > 0)) {
     return fail(
       'shape: no changed files — pass --files=a,b,c, or pipe `gh pr view <pr> --json files --jq \'[.files[].path]\'` '
       + 'on stdin. An EMPTY touch-set is refused rather than scored, because it scores `none` (no panel at all) and '
@@ -575,9 +581,18 @@ function runShape(flags, asJson) {
     );
   }
 
+  let commits = null;
+  if (typeof flags['commits-file'] === 'string') {
+    try {
+      // fd 0 rather than the `/dev/stdin` path: on Linux a piped stdin is a socket, and opening it by path fails (ENXIO).
+      const source = flags['commits-file'] === '/dev/stdin' ? 0 : flags['commits-file'];
+      const input = JSON.parse(readFileSync(source, 'utf8'));
+      commits = Array.isArray(input) ? input : input?.commits;
+    } catch { commits = null; }
+  }
   let plan;
   try {
-    plan = buildShapePlan({ changedFiles: files, careLevel: typeof flags.careLevel === 'string' ? flags.careLevel : undefined });
+    plan = buildShapePlan({ changedFiles: files, commits, careLevel: typeof flags.careLevel === 'string' ? flags.careLevel : undefined });
   } catch (e) {
     return fail(String(e && e.message || e), 1);
   }
@@ -590,6 +605,7 @@ function runShape(flags, asJson) {
     `care-level: ${plan.careLevel}   humanRequired: ${plan.humanRequired}   subject: ${plan.subject}\n`
     + `earned: ${plan.earnedLenses.length} lens(es) (${plan.earnedLenses.join(', ') || '(none)'}) `
     + `× ${plan.jurorsPerLens} juror(s)/lens × ${plan.rounds} round(s)\n`
+    + `tier: ${plan.need.tier} (${plan.need.tierReasons.join('; ')})  tools: ${Object.entries(plan.need.needsTools).map(([lens, tools]) => `${lens}=${tools}`).join(',')}  cross-provider seat: ${plan.need.crossProvider.required ?? 'none'}\n`
     + `mandatory floor: ${plan.mandatoryFloor.join(', ') || '(none)'}\n`
     + `reasons: ${plan.reasons.join('; ') || '(none)'}\n`
     + (plan.seatLensReachable
