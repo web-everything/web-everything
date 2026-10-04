@@ -163,8 +163,11 @@ export function resolveSmokeBudgets(env = process.env, { load = () => loadavg()[
     laneReleaseMs: envMs(env, SMOKE_BUDGET_ENV.laneReleaseMs, resolveChildTimeoutMs(env)),
     ghApiMs: envMs(env, SMOKE_BUDGET_ENV.ghApiMs, 30_000),
     ghPrListMs: envMs(env, SMOKE_BUDGET_ENV.ghPrListMs, 30_000),
-    reconcileMs: envMs(env, SMOKE_BUDGET_ENV.reconcileMs, 60_000),
-    dispatchDryRunMs: envMs(env, SMOKE_BUDGET_ENV.dispatchDryRunMs, 45_000),
+    // Live 2026-10-04: the dispatch dry-run's three LIVE passes took ~90s on a quiet host (load ~10), all of it
+    // waiting on gh/git children — the cost grows with the open-PR count, not with load. 45s/60s held every
+    // daemon clone off main (`smoke-env-timeout`). Generous defaults, still load-scaled below.
+    reconcileMs: envMs(env, SMOKE_BUDGET_ENV.reconcileMs, 120_000),
+    dispatchDryRunMs: envMs(env, SMOKE_BUDGET_ENV.dispatchDryRunMs, 180_000),
     treeStaysCleanMs: envMs(env, SMOKE_BUDGET_ENV.treeStaysCleanMs, 10_000),
     daemonBootMs: envMs(env, SMOKE_BUDGET_ENV.daemonBootMs, DEFAULT_DAEMON_BOOT_MS),
   };

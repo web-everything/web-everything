@@ -107,18 +107,18 @@ describe('load-aware smoke budgets', () => {
     expect(resolveSmokeBudgets({}, host(load))).toEqual({
       lanePoolListMs: 300_000, laneAcquireMs: 2_400_000, laneReleaseMs: 300_000,
       laneAcquireWaitMs: 30_000, lanePoolBusyCapMs: 60_000, laneAcquireBusyCapMs: 120_000,
-      ghApiMs: 30_000, ghPrListMs: 30_000, reconcileMs: 60_000,
-      dispatchDryRunMs: 45_000, treeStaysCleanMs: 10_000, daemonBootMs: 45_000,
+      ghApiMs: 30_000, ghPrListMs: 30_000, reconcileMs: 120_000,
+      dispatchDryRunMs: 180_000, treeStaysCleanMs: 10_000, daemonBootMs: 45_000,
     });
   });
 
   it('load 48 on 12 cores scales dispatch and reconcile by four', () => {
-    expect(resolveSmokeBudgets({}, host())).toMatchObject({ dispatchDryRunMs: 180_000, reconcileMs: 240_000 });
+    expect(resolveSmokeBudgets({}, host())).toMatchObject({ dispatchDryRunMs: 720_000, reconcileMs: 480_000 });
   });
 
   it('load 100 on 12 cores is capped at four times the defaults', () => {
     expect(resolveSmokeBudgets({}, host(100))).toEqual(resolveSmokeBudgets({}, host()));
-    expect(resolveSmokeBudgets({}, host(100)).dispatchDryRunMs).toBe(180_000);
+    expect(resolveSmokeBudgets({}, host(100)).dispatchDryRunMs).toBe(720_000);
   });
 
   it('an explicit operator budget stays absolute under load', () => {
@@ -137,7 +137,7 @@ describe('load-aware smoke budgets', () => {
 
   it('WE_SMOKE_LOAD_SCALE_MAX=2 caps scaling at twice the defaults', () => {
     expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host())).toMatchObject({
-      dispatchDryRunMs: 90_000, reconcileMs: 120_000,
+      dispatchDryRunMs: 360_000, reconcileMs: 240_000,
     });
   });
 
@@ -146,7 +146,7 @@ describe('load-aware smoke budgets', () => {
   });
 
   it.each(['0', '-1', 'invalid', 'Infinity'])('invalid budget override %s still scales the default', (value) => {
-    expect(resolveSmokeBudgets({ WE_SMOKE_DISPATCH_DRY_RUN_MS: value }, host()).dispatchDryRunMs).toBe(180_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_DISPATCH_DRY_RUN_MS: value }, host()).dispatchDryRunMs).toBe(720_000);
   });
 
   it('exports the knobs and a pure factor with a one-core floor', () => {
@@ -171,8 +171,8 @@ describe('load-aware smoke budgets', () => {
     const widened = widenSmokeBudgetsEnv({ ...env, WE_SMOKE_LOAD_SCALE: '0' });
     delete widened.WE_SMOKE_LOAD_SCALE;
     const retry = resolveSmokeBudgets(widened, host());
-    expect(retry.dispatchDryRunMs).toBe(450_000);
-    expect(retry.reconcileMs).toBe(600_000);
+    expect(retry.dispatchDryRunMs).toBe(1_800_000);
+    expect(retry.reconcileMs).toBe(1_200_000);
   });
 });
 
