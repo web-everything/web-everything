@@ -126,6 +126,13 @@ export function defaultReadPrLabels({ repoSlug, prNumber, runGh = runGhSync } = 
   return validatePrLabels(envelope?.labels);
 }
 
+/** #3902 — strip `ready-to-merge` when the STUCK restore variant applies a review hold. */
+export function defaultRemoveLabel({ repoSlug, prNumber, label, runGh = runGhSync } = {}) {
+  runGh(['pr', 'edit', String(prNumber), '--repo', repoSlug, '--remove-label', label], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-label-remove', repo: repoSlug },
+  });
+}
+
 /** The one label write of the restore-review-label half. */
 export function defaultAddLabel({ repoSlug, prNumber, label, runGh = runGhSync } = {}) {
   runGh(['pr', 'edit', String(prNumber), '--repo', repoSlug, '--add-label', label], {
@@ -163,6 +170,8 @@ export function runReconcilePromoteDraftDispatch({
   // read says red/pending) with no `gh` on PATH. Defaults to the real `gh api commits/<sha>/check-runs` read.
   readHeadCheckState = defaultReadHeadCheckState,
   readPrLabels = defaultReadPrLabels,
+  // #3902 — strips `ready-to-merge` when the STUCK restore variant applies its review hold.
+  removeLabel = defaultRemoveLabel,
   // #2811/#2821 follow-up — clear the now-stale `review-status:awaiting-ci` label the INSTANT a draft promotes,
   // never waiting on a different daemon's tick to notice `isDraft` flipped (mirrors `applyReviewStatus`'s own
   // "the daemon that changes the state applies its own tag right at the moment" convention, `review-status-
@@ -271,12 +280,19 @@ export function runReconcilePromoteDraftDispatch({
       refusals.push({ pr: entry.prNumber, kind: 'label-state-unreadable', why: String(e?.message ?? e).split('\n')[0] });
       continue;
     }
-    if (labels.some(l => l.startsWith('review:') || l === 'ready-to-merge')) {
+    // #3902 — the STUCK variant is planned FOR a `ready-to-merge` PR, so only a review label stops it there.
+    const stuck = entry.variant === 'stuck';
+    if (labels.some(l => l.startsWith('review:') || (!stuck && l === 'ready-to-merge'))) {
       refusals.push({ pr: entry.prNumber, kind: 'label-already-set', why: 'a review/landing label appeared since the plan was read' });
       continue;
     }
     try {
       addLabel({ repoSlug, prNumber: entry.prNumber, label: entry.label ?? 'review:pending' });
+      // A review hold and the `ready-to-merge` go-ahead are contradictory (#2832): strip it, best-effort — the
+      // drain's merge gate re-checks the hold either way.
+      if (stuck && labels.includes('ready-to-merge')) {
+        try { removeLabel({ repoSlug, prNumber: entry.prNumber, label: 'ready-to-merge' }); } catch { /* best-effort */ }
+      }
       dispatched.push({ pr: entry.prNumber, kind: 'restore-review-label', label: entry.label ?? 'review:pending' });
     } catch (e) {
       refusals.push({ pr: entry.prNumber, kind: 'label-failed', why: String((e && e.message) || e).split('\n')[0] });
