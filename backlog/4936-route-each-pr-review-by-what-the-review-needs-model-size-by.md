@@ -32,7 +32,7 @@ Operator 2026-10-03: more review routing based on what the review needs. Lenses 
 
 ## Open decision
 
-- 4772: what stands in when the Codex seat is unavailable. 4880 ships the strict answer, parking for a human. The decision may soften it. Rule it together with xud2hha (judge seat, open PR #3771).
+- 4772: what stands in when the Codex seat is unavailable. 4880 ships the strict answer, parking for a human. The decision may soften it. Rule it together with 5079 (judge seat, open PR #3771).
 
 ## Related, not in this epic
 
