@@ -127,6 +127,8 @@ import {
   CONCURRENT_AUTHOR_PAUSE_MARKER, concurrentAuthorPauses, isConcurrentAuthorStandDown,
 } from './stand-down.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
+// #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
+import { answerDisposition, isCloseSupersededExecuted } from './stand-down-answer-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { reviewSessionSlug } from './review-session-slug.mjs';
 // Both dispatcher wrappers delegate to the pure session-slug module.
@@ -200,7 +202,7 @@ import {
 // gate below), so the review this pass would otherwise dispatch the moment CI finishes is instead HELD until
 // this fires and un-drafts it — closing the "6 of 26 PRs got reviewed before their own first CI run even
 // finished" measurement (operator, 2026-09-27) that motivated this whole feature.
-export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label']);
+export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label', 'close-superseded']);
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#REFUSAL_KINDS — every reason this pass declines to dispatch. Frozen and
@@ -1565,6 +1567,23 @@ export function planReconcile({
       refuse('fix-claimed', {
         who: pr.fixClaim.who, since: pr.fixClaim.claimedAt ?? null,
         why: `${pr.fixClaim.who} holds the fix claim${pr.fixClaim.why ? ` (${pr.fixClaim.why})` : ''} — nothing is dispatched until its fix-end`,
+      });
+      continue;
+    }
+
+    // ── #3850 — an operator DISPOSITION (stand-down-answer-core.mjs#answerDisposition) is executed by the
+    // conveyor, never handed to a fixer: fix-3850 read "close as superseded" as "delete the card's files", was
+    // denied, and ended blocked-on-infra with the PR still open. Checked after the live-claim refusal (never
+    // close a PR under a running fixer) and before every repair branch.
+    // `state` is ABSENT on the open-only `gh pr list` listing (`OPEN_PR_LIST_FIELDS`) — absent means open (live:
+    // the first edge tick dispatched a fixer at #3850 because this read `state === 'OPEN'`).
+    // Idempotent: once the conveyor's own close comment postdates the answer the disposition is DONE — a PR a
+    // human then reopens is never re-closed every tick (it also never reaches a fixer: the answer stays on it).
+    if ((pr?.state ?? 'OPEN') === 'OPEN' && answerDisposition(operatorAnswer) === 'close-superseded') {
+      if (isCloseSupersededExecuted(pr?.comments)) continue;
+      dispatch.push({
+        ...base, kind: 'close-superseded',
+        why: `the operator ruled this PR superseded (@${operatorAnswer.actor} via ${operatorAnswer.channel}) — close it, no fix agent`,
       });
       continue;
     }
