@@ -18,7 +18,8 @@ function record({ head, runId, summary = SUMMARY, file, rulings = [] }) {
   return { version: 1, repo, pr: 3794, head, runId, reviewer, authorBody: '<!-- authored-by-actor: author -->',
     attempted: true, referrals: [{ key, seat: 'judge', original, finding: normalizeFinding(original) }],
     rulings: rulings.map((r, i) => ({ id: `r${i}`, key, reviewerId: reviewer.id, lens: reviewer.lens,
-      result: r.result, rationale: r.rationale ?? 'no', evidence: ['e'], ...(r.card ? { card: r.card } : {}) })) };
+      result: r.result, rationale: r.rationale ?? 'no', evidence: ['e'], ...(r.card ? { card: r.card } : {}),
+      ...(r.supersedes ? { supersedes: r.supersedes } : {}) })) };
 }
 const comment = (rec, n, login = 'web-everything') => ({ body: renderReferralRecord(rec), createdAt: t(n), author: { login } });
 const block = { result: 'block', rationale: 'pointer files must be listed; do not ship without them' };
@@ -78,6 +79,33 @@ describe('ignoredRulings', () => {
       comment(record({ head: H1, runId: 'run-1', rulings: [{ result: 'not-real' }] }), 3),
       comment(record({ head: H2, runId: 'run-2' }), 20)];
     expect(ignoredRulings({ headRefOid: H2, comments: rulingCard })).toBeNull();
+  });
+  it('does not resurrect a block superseded in a later snapshot', () => {
+    const withdrawn = [comment(record({ head: H1, runId: 'run-1' }), 1),
+      comment(record({ head: H1, runId: 'run-1', rulings: [block] }), 3),
+      comment(record({ head: H1, runId: 'run-1', rulings: [block, { result: 'not-real', supersedes: 'r0' }] }), 5)];
+    const comments = [...withdrawn, comment(record({ head: H2, runId: 'run-2' }), 20)];
+    expect(ignoredRulings({ headRefOid: H2, comments })).toBeNull();
+    // control: the same thread without the superseding snapshot still flags the miss
+    expect(ignoredRulings({ headRefOid: H2, comments: [...history, comment(record({ head: H2, runId: 'run-2' }), 20)] })?.misses).toBe(1);
+  });
+  it('keeps the blocks of two runs on one head that reuse the same ruling id', () => {
+    const other = 'the widget focus ring is dropped when the host page sets a custom outline colour';
+    const comments = [...history,
+      comment(record({ head: H1, runId: 'run-1b', summary: other, file: 'widget/focus.md' }), 2),
+      comment(record({ head: H1, runId: 'run-1b', summary: other, file: 'widget/focus.md', rulings: [block] }), 4),
+      comment(record({ head: H2, runId: 'run-2' }), 20),
+      comment(record({ head: H2, runId: 'run-2b', summary: other, file: 'widget/focus.md' }), 21)];
+    expect(ignoredRulings({ headRefOid: H2, comments }).matches.map((m) => m.finding.file).sort()).toEqual(['policy/pointer.md', 'widget/focus.md']);
+  });
+  it('a fresh re-ruling restarts the miss count: it is measured from the latest block, not the first', () => {
+    const comments = [...history,
+      comment(record({ head: H2, runId: 'run-2' }), 20),
+      comment(record({ head: H2, runId: 'run-2', rulings: [block] }), 22),
+      comment(record({ head: H3, runId: 'run-3' }), 40)];
+    const ig = ignoredRulings({ headRefOid: H3, comments });
+    expect(ig.misses).toBe(1);
+    expect(ig.escalate).toBe(false);
   });
   it('is quiet once the new head already has its own ruling', () => {
     const comments = [...history, comment(record({ head: H2, runId: 'run-2' }), 20),

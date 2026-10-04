@@ -10,7 +10,8 @@
  *   heads present, total git process count for one acquire pass must stay small and NOT scale with the
  *   remote-head count (which is exactly the O(ahead-lanes × remote-heads) blowup this item exists to kill).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -31,11 +32,13 @@ function runPool(args, extraEnv = {}) {
 
 let base, originDir, referenceDir, poolRoot;
 
-beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'lane-pool-single-spawn-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
-  poolRoot = join(base, 'pool');
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-single-spawn-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
 
   git(['init', '--quiet', '--bare', '--initial-branch=trunk', originDir]);
   git(['clone', '--quiet', originDir, referenceDir]);
@@ -46,10 +49,19 @@ beforeEach(() => {
   git(['commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', originDir, 'HEAD:refs/heads/lane/seed'], referenceDir);
   git(['update-ref', 'refs/heads/trunk', 'refs/heads/lane/seed'], originDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
+beforeEach(() => {
+  base = mkdtempSync(join(tmpdir(), 'lane-pool-single-spawn-'));
+  poolRoot = join(base, 'pool');
 });
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=singlespawn', '--branch=trunk', '--no-install'];
@@ -114,18 +126,19 @@ describe('aheadIsProvablyPushed spawn cost does not scale with remote-head count
     git(['commit', '--quiet', '-m', 'landed'], lane);
     git(['push', '--quiet', 'origin', 'HEAD:refs/heads/lane/landed'], lane);
 
-    // Inflate the remote to N_HEADS unrelated branches, from a separate throwaway clone, so `ls-remote` (and,
-    // under the OLD code, the per-head merge-base fan-out) has plenty of heads to churn through.
-    const filler = join(base, 'filler');
-    git(['clone', '--quiet', originDir, filler]);
-    git(['config', 'user.email', 't@t.com'], filler);
-    git(['config', 'user.name', 't'], filler);
+    // Inflate the remote to N_HEADS unrelated branches so `ls-remote` (and, under the OLD code, the per-head
+    // merge-base fan-out) has plenty of heads to churn through: a chain of N_HEADS commits off the default
+    // branch, head i at commit i. Written straight into the bare origin with ONE `git fast-import` rather than
+    // N × (commit + push) from a throwaway clone — same remote heads, a fraction of the file-system churn.
+    const data = (s) => `data ${Buffer.byteLength(s)}\n${s}\n`;
+    let stream = '';
+    let parent = git(['rev-parse', 'HEAD'], originDir); // the default branch a fresh clone would check out
     for (let i = 0; i < N_HEADS; i++) {
-      writeFileSync(join(filler, 'file.txt'), `filler-${i}\n`);
-      git(['add', 'file.txt'], filler);
-      git(['commit', '--quiet', '-m', `filler ${i}`], filler);
-      git(['push', '--quiet', 'origin', `HEAD:refs/heads/lane/filler-${i}`], filler);
+      stream += `commit refs/heads/lane/filler-${i}\nmark :${i + 1}\ncommitter t <t@t.com> 1700000000 +0000\n`
+        + data(`filler ${i}`) + `from ${parent}\nM 100644 inline file.txt\n` + data(`filler-${i}`) + '\n';
+      parent = `:${i + 1}`;
     }
+    execFileSync('git', ['fast-import', '--quiet'], { cwd: originDir, input: stream });
     expect(git(['ls-remote', '--heads', 'origin'], lane).split('\n').filter(Boolean).length).toBeGreaterThanOrEqual(N_HEADS);
 
     // Count every `git` process spawned during the acquire call via a PATH-shimmed counting wrapper.

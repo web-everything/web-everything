@@ -838,3 +838,59 @@ it('xxh4zw8 replay soak reaches one exact-head heal sink, holds subsequent ticks
     expect(readyCalls).toEqual([]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+describe('CI-heal salvage before agent dispatch', () => {
+  const entry = { kind: 'ci-heal', prNumber: 3895, headRefName: 'lane/session-watchdog', headRefOid: 'a'.repeat(40) };
+  async function exercise(salvage, overrides = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-heal-salvage-dispatch-'));
+    const dispatch = vi.fn(() => ({ agentId: 'test' }));
+    try {
+      const result = await runReconcileCiHealDispatch({ root: '/repo',
+        reconcile: () => ({ dispatch: [entry], refusals: [] }), checkStaleness: FRESH,
+        flushOwed: () => ({}), pollAttempts: () => [], flushTimeouts: async () => [], timeoutHold: () => null,
+        resolveProfile: () => ({ capabilities: { ciHeal: true }, lanePoolRepo: 'x' }),
+        pickFreeLanes: () => [1], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
+        unsupportedPath: join(dir, 'unsupported.json'), queueAdmission: null, dispatch, salvage, ...overrides });
+      return { result, dispatch };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+  it('returns a salvage dispatch without spawning an agent', async () => {
+    const { result, dispatch } = await exercise(() => ({ pushed: true, sha: 's', laneDir: '/saved' }));
+    expect(result.dispatched).toEqual([{ kind: 'ci-heal-salvage', pr: 3895, sha: 's', laneDir: '/saved', headRefName: entry.headRefName }]);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+  it('leaves the lane available for the next PR', async () => {
+    const { dispatch } = await exercise(({ entry: e }) => e.prNumber === 3895 ? { pushed: true, sha: 's' } : null,
+      { reconcile: () => ({ dispatch: [entry, { ...entry, prNumber: 3896 }], refusals: [] }) });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch.mock.calls[0][0]).toMatchObject({ pr: 3896, lane: 1 });
+  });
+  it.each(['null', 'throw', 'failed'])('falls through on %s salvage', async mode => {
+    const { result, dispatch } = await exercise(() => {
+      if (mode === 'throw') throw Error('offline');
+      return mode === 'failed' ? { pushed: false, sha: 's', reason: 'rejected' } : null;
+    });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    if (mode === 'failed') expect(result.refusals).toContainEqual({ pr: 3895, kind: 'ci-heal-salvage-failed', why: 'rejected' });
+  });
+  it('honors the disable switch', async () => {
+    const previous = process.env.WE_CIHEAL_SALVAGE;
+    process.env.WE_CIHEAL_SALVAGE = '0';
+    try {
+      const salvage = vi.fn(); const { dispatch } = await exercise(salvage);
+      expect(salvage).not.toHaveBeenCalled(); expect(dispatch).toHaveBeenCalledTimes(1);
+    } finally {
+      if (previous === undefined) delete process.env.WE_CIHEAL_SALVAGE;
+      else process.env.WE_CIHEAL_SALVAGE = previous;
+    }
+  });
+  it.each(['unsettled', 'owed', 'timeout'])('respects the %s hold before salvage', async hold => {
+    const salvage = vi.fn();
+    const { dispatch } = await exercise(salvage, {
+      pollAttempts: () => hold === 'unsettled' ? [{ pr: 3895, status: 'running' }] : [],
+      flushOwed: () => hold === 'owed' ? { kept: [{ pr: 3895 }] } : {},
+      timeoutHold: () => hold === 'timeout' ? { reason: 'pending' } : null,
+    });
+    expect(salvage).not.toHaveBeenCalled(); expect(dispatch).not.toHaveBeenCalled();
+  });
+});

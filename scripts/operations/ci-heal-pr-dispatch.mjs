@@ -68,6 +68,19 @@ import {
 } from '../conveyor/fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from '../conveyor/fix-procedure.mjs';
 import { flushOwedWrites } from '../conveyor/ci-heal-owed.mjs';
+import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
+import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
+import { salvageEnabled, laneDirsForRepo, findSalvageCommit, pushSalvage } from '../conveyor/ci-heal-salvage.mjs';
+
+function defaultSalvage({ entry, root, repoKey }) {
+  if (process.env.VITEST && !process.env.LANE_POOL_ROOT) return null;
+  const laneDirs = laneDirsForRepo({ poolRoot: defaultPoolRoot(root),
+    poolName: CONSTELLATION_REPOS[repoKey].slug.split('/')[1] });
+  const candidate = findSalvageCommit({ pr: entry.prNumber, headRefOid: entry.headRefOid, laneDirs });
+  if (!candidate) return null;
+  const result = pushSalvage({ ...candidate, headRefName: entry.headRefName });
+  return result.ok ? { pushed: true, ...candidate } : { pushed: false, ...candidate, reason: result.detail };
+}
 
 function readHealQuotaScores() {
   try {
@@ -276,6 +289,7 @@ export async function runReconcileCiHealDispatch({
   retryTimeout = dispatchTimeoutRetry,
   flushTimeouts = flushTimeoutFollowups,
   timeoutHold = readTimeoutHold,
+  salvage = defaultSalvage,
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`ci-heal-pr-dispatch: --repo ${repo} is not a constellation repo`);
@@ -330,6 +344,18 @@ export async function runReconcileCiHealDispatch({
     if ((owedFlush.kept ?? []).some(row => row.pr === entry.prNumber)) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-accounting-owed', why: 'durable heal accounting is not confirmed' }); continue; }
     const hold = timeoutHold({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber, head: entry.headRefOid });
     if (hold) { refusals.push({ pr: entry.prNumber, kind: 'ci-timeout-rerun', ...hold }); continue; }
+    if (salvageEnabled()) {
+      let recovered = null;
+      try { recovered = await salvage({ entry, root, repoKey, profile }); } catch { /* Fall through to dispatch. */ }
+      if (recovered?.pushed === true) {
+        dispatched.push({ kind: 'ci-heal-salvage', pr: entry.prNumber, sha: recovered.sha,
+          laneDir: recovered.laneDir, headRefName: entry.headRefName });
+        continue;
+      }
+      if (recovered?.pushed === false && recovered.sha) {
+        refusals.push({ pr: entry.prNumber, kind: 'ci-heal-salvage-failed', why: recovered.reason });
+      }
+    }
     const q = queueBudget.tryAdmit('ci-heal', { id: entry.prNumber });
     if (!q.admit) {
       refusals.push({ pr: entry.prNumber, kind: 'queue-cap', why: queueCapWhy(q) });
@@ -374,7 +400,7 @@ export async function runReconcileCiHealDispatch({
       }
       dispatched.push(result);
     } catch (e) {
-      refusals.push({ pr: entry.prNumber, kind: 'dispatch-failed', why: String((e && e.message) || e).split('\n')[0] });
+      refusals.push({ pr: entry.prNumber, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
     }
   }
 

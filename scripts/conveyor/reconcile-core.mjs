@@ -127,6 +127,8 @@ import {
   CONCURRENT_AUTHOR_PAUSE_MARKER, concurrentAuthorPauses, isConcurrentAuthorStandDown,
 } from './stand-down.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
+// #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
+import { answerDisposition, isCloseSupersededExecuted } from './stand-down-answer-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { reviewSessionSlug } from './review-session-slug.mjs';
 // Both dispatcher wrappers delegate to the pure session-slug module.
@@ -200,7 +202,7 @@ import {
 // gate below), so the review this pass would otherwise dispatch the moment CI finishes is instead HELD until
 // this fires and un-drafts it — closing the "6 of 26 PRs got reviewed before their own first CI run even
 // finished" measurement (operator, 2026-09-27) that motivated this whole feature.
-export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label']);
+export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label', 'close-superseded']);
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#REFUSAL_KINDS — every reason this pass declines to dispatch. Frozen and
@@ -1391,6 +1393,14 @@ export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIE
   return now - Math.max(...times) >= graceMs;
 }
 
+/** #3902 — env switch for the review-label healer: `stuck` (default) | `green` | `off`. */
+export const REVIEW_LABEL_HEAL_ENV = 'WE_REVIEW_LABEL_HEAL';
+/** Resolve the healer policy; any unknown value falls back to the default. PURE over the env object it is given. */
+export function resolveReviewLabelHealMode(env = {}) {
+  const v = String(env?.[REVIEW_LABEL_HEAL_ENV] ?? '').trim().toLowerCase();
+  return ['stuck', 'green', 'off'].includes(v) ? v : 'stuck';
+}
+
 /** Tri-state diagnostic: unknown evidence is never an empty review family. */
 export function missingReviewLabel(pr) {
   if (!pr || pr.state !== 'OPEN' || !Array.isArray(pr.labels)
@@ -1422,6 +1432,9 @@ export function planReconcile({
   // `null` (the default, and what every existing test/caller gets unless it opts in) degrades the staleness
   // comparison below to ref-name-only — see {@link countStaleConflictFixRounds}'s own docblock.
   mainSha = null,
+  // #3902 — the review-label healer policy, see the `restore-review-label` STUCK variant below. A caller may pass
+  // it; omitted, it is the one env read in this file (`WE_REVIEW_LABEL_HEAL`, via {@link resolveReviewLabelHealMode}).
+  reviewLabelHeal = resolveReviewLabelHealMode(globalThis.process?.env ?? {}),
 } = {}) {
   const dispatch = [];
   const refusals = [];
@@ -1564,6 +1577,23 @@ export function planReconcile({
       refuse('fix-claimed', {
         who: pr.fixClaim.who, since: pr.fixClaim.claimedAt ?? null,
         why: `${pr.fixClaim.who} holds the fix claim${pr.fixClaim.why ? ` (${pr.fixClaim.why})` : ''} — nothing is dispatched until its fix-end`,
+      });
+      continue;
+    }
+
+    // ── #3850 — an operator DISPOSITION (stand-down-answer-core.mjs#answerDisposition) is executed by the
+    // conveyor, never handed to a fixer: fix-3850 read "close as superseded" as "delete the card's files", was
+    // denied, and ended blocked-on-infra with the PR still open. Checked after the live-claim refusal (never
+    // close a PR under a running fixer) and before every repair branch.
+    // `state` is ABSENT on the open-only `gh pr list` listing (`OPEN_PR_LIST_FIELDS`) — absent means open (live:
+    // the first edge tick dispatched a fixer at #3850 because this read `state === 'OPEN'`).
+    // Idempotent: once the conveyor's own close comment postdates the answer the disposition is DONE — a PR a
+    // human then reopens is never re-closed every tick (it also never reaches a fixer: the answer stays on it).
+    if ((pr?.state ?? 'OPEN') === 'OPEN' && answerDisposition(operatorAnswer) === 'close-superseded') {
+      if (isCloseSupersededExecuted(pr?.comments)) continue;
+      dispatch.push({
+        ...base, kind: 'close-superseded',
+        why: `the operator ruled this PR superseded (@${operatorAnswer.actor} via ${operatorAnswer.channel}) — close it, no fix agent`,
       });
       continue;
     }
@@ -1716,7 +1746,7 @@ export function planReconcile({
     // promote-draft pass's sibling half (`promote-draft-pr-dispatch.mjs`), so the ordinary review path owns it.
     // Deliberately NOT gated on AI authorship (the commit list of a drain-rebased lane carries merge commits
     // from other authors, which made `missingReviewLabel` read false on #3830 itself).
-    if (phase === 'open' && !pr?.isDraft && withPhase.check === 'green'
+    if (reviewLabelHeal !== 'off' && phase === 'open' && !pr?.isDraft && withPhase.check === 'green'
         && String(pr?.headRefName ?? '').startsWith('lane/')
         && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
         && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
@@ -1724,6 +1754,27 @@ export function planReconcile({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending',
         why: 'open lane PR, every required check is green, and it carries no review:* (or ready-to-merge) label — '
           + 'nothing would ever own it; apply review:pending so the ordinary review path picks it up',
+      });
+      continue;
+    }
+    // ── `restore-review-label`, STUCK variant (LIVE 2026-10-04, PR #3902). A `ready-to-merge` lane PR with NO
+    // review:* label skipped review only because the drain's escalation pass would score it at land time — but
+    // that pass scores MERGE CANDIDATES (every required check green). #3902 got `ready-to-merge` from the drain's
+    // green-`test` stamp, then a second push turned `soak-replay-gate` red: never a candidate, so never scored,
+    // so never reviewed, and the fix daemon only re-posted a `review-label-missing` note. Past the grace, such a
+    // PR is owed the same neutral `review:pending` (the promote-draft half strips the contradictory
+    // `ready-to-merge` when it writes). Policy `reviewLabelHeal` (env `WE_REVIEW_LABEL_HEAL`): `stuck` (default)
+    // adds this variant; `green` keeps only the branch above; `off` disables both.
+    if (reviewLabelHeal === 'stuck' && !pr?.isDraft && (pr?.state ?? 'OPEN') === 'OPEN' && withPhase.check === 'red'
+        && String(pr?.headRefName ?? '').startsWith('lane/')
+        && withPhase.labels.includes('ready-to-merge')
+        && !withPhase.labels.some((l) => l.startsWith('review:'))
+        && isAiGeneratedPr(pr)
+        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+      dispatch.push({
+        ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending', variant: 'stuck',
+        why: 'ready-to-merge lane PR with a red required check and no review:* label — the drain only scores '
+          + 'review escalation for merge candidates, so nothing would ever review it; apply review:pending',
       });
       continue;
     }

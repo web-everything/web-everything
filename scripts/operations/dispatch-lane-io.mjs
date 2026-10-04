@@ -61,10 +61,10 @@ import { execFileSync } from 'node:child_process';
 // these ran SIMULTANEOUSLY in a single `ps aux` snapshot, none logged anywhere, spending the shared `graphql`
 // bucket (8943 points/hour that hour, 6365.2 UNATTRIBUTED — `gh-spend.mjs report --hours=1 --by=caller`).
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { normNum } from '../conveyor/queue-store.mjs';
@@ -138,6 +138,7 @@ import {
 // rather than from `claude agents --json`, which never heard of it; `deliveryDispatchLogPath` names where its
 // narration went for the observer's `unresolved` message. See {@link isDispatchHandleLive}.
 import { DETACHED_HANDLE_PREFIX, defaultIsPidAlive, deliveryDispatchLogPath, detachedHandlePid } from './detached-dispatch.mjs';
+import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
 
 /**
  * The three native Claude model ids {@link ../lib/dispatch-contracts.mjs#CLAUDE_NATIVE_MODEL_BY_TIER} maps to
@@ -1552,7 +1553,7 @@ export function createDispatchSinks({
         // observed. The replay guard refuses it and `inFlightEntries` reports it under `unknown`, which is
         // exactly right — a person finds out what happened and closes it out.
         throw new Error(
-          `claude --bg failed and whether an agent started is UNKNOWN: ${String((e && e.message) || e).split('\n')[0]}`,
+          `claude --bg failed and whether an agent started is UNKNOWN: ${describeDispatchFailure(e)}`,
         );
       }
       const minutes = Number(payload.expectedWithinMinutes) > 0
@@ -2106,6 +2107,67 @@ export function dispatchLaneGrant(payload, { root = REPO_ROOT, exists = existsSy
   return { additionalDirectories: dirs, allow: rules };
 }
 
+/**
+ * #3850 (live-caught 2026-10-04, 151 "Workspace not trusted" refusals in the fix-dispatch log) — the policy
+ * switch for TRUSTING THE SCRATCH ROOT. Default ON: a dispatch into `<root>/<uuid>` trusts `<root>` once, and
+ * every later session dir under it is trusted by inheritance (the CLI walks a non-git cwd's ancestors for a
+ * trusted entry — proven live, see the PR). `off`/`0`/`false`/`no` restores the old per-session-dir grant.
+ */
+export const DISPATCH_TRUST_ROOT_ENV = 'WE_DISPATCH_TRUST_ROOT';
+
+/**
+ * #3850 — the lock {@link grantDispatchTrust}/{@link revokeDispatchTrust} serialize on. ROOT CAUSE of the live
+ * refusals: these two used `<trustPath>.lock`, which for `~/.claude.json` is the SAME path Claude Code's own
+ * config lock uses — and Claude's is a DIRECTORY (mkdir-style lock). While any `claude` process held it, our
+ * `open(…, 'wx')` hit EEXIST, waited out its 5s timeout, and the grant was silently swallowed, so the spawn ran
+ * untrusted (and the one retry re-granted into the same wall). When the dir aged past 30s we "stole" it instead —
+ * renaming a live CLI process's lock away (360 `~/.claude.json.lock.stolen.*` dirs on the host). Our own lock
+ * now has its own name, so it never collides with, nor steals, the CLI's.
+ * @param {string} trustPath
+ */
+export function dispatchTrustLockPath(trustPath) {
+  return `${trustPath}.we-dispatch-trust.lock`;
+}
+
+/**
+ * True when `dir` or any ancestor carries `hasTrustDialogAccepted: true` in `config.projects` — the same walk
+ * the CLI does for a cwd outside a git repo (a dispatch scratch dir is never a repo). PURE.
+ * @param {object|null} config
+ * @param {string} dir
+ */
+export function isTrustedIn(config, dir) {
+  const projects = config?.projects ?? {};
+  let cur = resolve(String(dir));
+  for (;;) {
+    if (projects[cur]?.hasTrustDialogAccepted === true) return true;
+    const up = dirname(cur);
+    if (up === cur) return false;
+    cur = up;
+  }
+}
+
+/**
+ * #3850 — WHICH directory to trust for a dispatch cwd. A cwd under the dispatch scratch root resolves to the ROOT
+ * (trusted once, inherited by every session dir after it); anything else (a lane, a test path) to itself, exactly
+ * as before. {@link DISPATCH_TRUST_ROOT_ENV}=off restores the per-dir grant. PURE apart from the env read.
+ * The root is collapsed to ONLY when it is the dispatcher-owned `…/.operations/dispatch` directory. A broader
+ * `WE_DISPATCH_CWD` override (e.g. `$HOME/work`) would make the persistent trust cover every repo ever cloned under
+ * it (hooks, MCP servers, project settings) and nothing revokes a root entry — those fall back to the per-dir grant.
+ * @param {string} dir
+ * @param {{env?: Record<string, string|undefined>, scratchRoot?: string}} [o]
+ * @returns {string[]}
+ */
+export function dispatchTrustTargets(dir, { env = process.env, scratchRoot = dispatchScratchRoot({ env }) } = {}) {
+  const d = resolve(String(dir));
+  if (/^(0|off|false|no)$/i.test(String(env?.[DISPATCH_TRUST_ROOT_ENV] ?? '').trim())) return [d];
+  const r = resolve(String(scratchRoot));
+  if (!r.endsWith(`${sep}.operations${sep}dispatch`)) return [d];
+  return d === r || d.startsWith(`${r}/`) ? [r] : [d];
+}
+
+/** How many times {@link grantDispatchTrust} re-reads and re-applies a grant a concurrent writer clobbered. */
+export const DISPATCH_TRUST_GRANT_ATTEMPTS = 3;
+
 /** Test/override hook for {@link grantDispatchTrust}'s trust file — mirrors {@link DISPATCH_CWD_ENV}. A
  *  soak/sim world points this at a throwaway file under its own root, so the REAL production mechanism runs
  *  unstubbed without ever touching the operator's actual `~/.claude.json`. */
@@ -2150,19 +2212,36 @@ function resolveDispatchTrustPath(env = process.env) {
  * @param {{trustPath?: string}} [o] - injectable ONLY so a test can point it at a throwaway file instead of
  *   overriding process.env — the same seam `exec`/`spawnAgent` already are on this sink.
  */
-export function grantDispatchTrust(dir, { trustPath = resolveDispatchTrustPath() } = {}) {
+export function grantDispatchTrust(dir, { trustPath = resolveDispatchTrustPath(), env = process.env, scratchRoot, afterWrite } = {}) {
   try {
-    withFileLock(`${trustPath}.lock`, () => {
-      const before = readJsonConfig(trustPath);
-      // `null` = present but unparseable (bootstrap-session.mjs's own `readJsonConfig` contract) — write
-      // nothing, exactly as bootstrap-session.mjs's own trust step refuses to in that case.
-      if (before === null) return;
-      const next = withTrustedDirs(before, [dir]);
-      // Backup-first, exactly matching bootstrap-session.mjs's own `writeTrust` discipline for this same file —
-      // it holds the operator's whole per-project CLI state, not just this one directory's trust flag.
-      if (existsSync(trustPath)) copyFileSync(trustPath, `${trustPath}.bak`);
-      writeFileSync(trustPath, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
-    });
+    const targets = dispatchTrustTargets(dir, { env, ...(scratchRoot ? { scratchRoot } : {}) });
+    // #3850 — the CLI's own `~/.claude.json` writes do NOT take our lock (they use `<trust>.lock`, which we must
+    // never contend for or steal), so a CLI write can land between our read and our rename and drop the grant.
+    // Atomic rename + a re-read that re-applies a lost grant (bounded) is what we can do without owning its lock.
+    for (let attempt = 0; attempt <= DISPATCH_TRUST_GRANT_ATTEMPTS; attempt += 1) {
+      const done = withFileLock(dispatchTrustLockPath(trustPath), () => {
+        const before = readJsonConfig(trustPath);
+        // `null` = present but unparseable (bootstrap-session.mjs's own `readJsonConfig` contract) — write
+        // nothing, exactly as bootstrap-session.mjs's own trust step refuses to in that case.
+        if (before === null) return true;
+        // #3850 — already trusted: write NOTHING. A scratch ROOT target is trusted by the CLI's ancestor walk
+        // (a dispatch scratch dir is never a git repo); any other target (a lane — a git worktree) needs its OWN
+        // entry, since the CLI does not necessarily inherit an ancestor's trust there.
+        const alreadyTrusted = (t) => (t !== resolve(String(dir))
+          ? isTrustedIn(before, t) : before?.projects?.[t]?.hasTrustDialogAccepted === true);
+        if (targets.every(alreadyTrusted)) return true;
+        if (attempt === DISPATCH_TRUST_GRANT_ATTEMPTS) return true; // out of retries — never loop forever
+        const next = withTrustedDirs(before, targets);
+        // Backup-first, exactly matching bootstrap-session.mjs's own `writeTrust` discipline for this same file —
+        // it holds the operator's whole per-project CLI state, not just this one directory's trust flag.
+        const exists = existsSync(trustPath);
+        if (exists) copyFileSync(trustPath, `${trustPath}.bak`);
+        writeJsonAtomic(trustPath, next, exists ? { mode: statSync(trustPath).mode & 0o777 } : {});
+        return false; // written — loop once more to confirm it survived
+      });
+      if (done) break;
+      if (typeof afterWrite === 'function') afterWrite(attempt);
+    }
   } catch { /* see docblock — never blocks a dispatch */ }
 }
 
@@ -2202,7 +2281,7 @@ export function revokeDispatchTrust(dirs, { trustPath = resolveDispatchTrustPath
   // side effect a cleanup pass should never have.
   if (!existsSync(trustPath)) return { revoked: [] };
   try {
-    return withFileLock(`${trustPath}.lock`, () => {
+    return withFileLock(dispatchTrustLockPath(trustPath), () => {
       const before = readJsonConfig(trustPath);
       // `null` = present but unparseable — write nothing, same refusal `grantDispatchTrust` makes.
       if (before === null) return { revoked: [] };

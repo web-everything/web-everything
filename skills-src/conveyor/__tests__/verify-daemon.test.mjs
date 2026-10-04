@@ -15,7 +15,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  runDaemonLoop, runVerifyTick, buildCliDaemonEffects, realSleep,
+  runDaemonLoop, runVerifyTick, buildCliDaemonEffects, realSleep, cloneHeadChanged,
   startIndependentHeartbeat, DEFAULT_HEARTBEAT_INTERVAL_MS,
   VERIFY_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS,
 } from '../verify-daemon.mjs';
@@ -377,5 +377,25 @@ describe('builder start-to-start cadence', () => {
     await runDaemonLoop({ fixedCadence: true, tickOnce, isAlive: () => alive,
       sleep: async () => { alive = false; } });
     expect(tickOnce).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Live 2026-10-04: the verify daemon ran 25 h on one in-memory tree; the ENOTDIR fix overlaid onto its clone
+// never reached the running sweep. The loop now exits between ticks once the clone HEAD moves, so launchd
+// (KeepAlive) relaunches it on the new code.
+describe('code-change restart', () => {
+  it('cloneHeadChanged: true only for a readable, different HEAD', () => {
+    expect(cloneHeadChanged({ bootHead: 'a', readHead: () => 'a' })).toBe(false);
+    expect(cloneHeadChanged({ bootHead: 'a', readHead: () => 'b' })).toBe(true);
+    expect(cloneHeadChanged({ bootHead: 'a', readHead: () => null })).toBe(false);
+    expect(cloneHeadChanged({ bootHead: null, readHead: () => 'b' })).toBe(false);
+  });
+
+  it('runDaemonLoop stops with code-changed after the tick in which the clone moved, never mid-tick', async () => {
+    let head = 'a';
+    let ticks = 0;
+    const tickOnce = async () => { ticks += 1; if (ticks === 2) head = 'b'; return {}; };
+    const out = await runDaemonLoop({ tickOnce, sleep: async () => {}, codeChanged: () => cloneHeadChanged({ bootHead: 'a', readHead: () => head }), maxTicks: 10 });
+    expect(out).toEqual({ ticks: 2, stoppedReason: 'code-changed' });
   });
 });

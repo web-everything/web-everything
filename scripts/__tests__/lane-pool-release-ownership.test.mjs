@@ -9,7 +9,8 @@
  *   shared `--session`/`LANE_SESSION`) but the SAME `CLAUDE_CODE_SESSION_ID` env var, matching the real scenario:
  *   one interactive session, driving `acquire` then `release` through separate Bash-tool invocations.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -39,11 +40,13 @@ function runPool(args, ownerSessionId) {
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 
-beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'lane-pool-release-owner-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
-  poolRoot = join(base, 'pool');
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-release-owner-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
 
   git(['init', '--quiet', '--bare', '--initial-branch=trunk', originDir]);
   git(['clone', '--quiet', originDir, referenceDir]);
@@ -54,10 +57,19 @@ beforeEach(() => {
   git(['commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', originDir, 'HEAD:refs/heads/lane/seed'], referenceDir);
   git(['update-ref', 'refs/heads/trunk', 'refs/heads/lane/seed'], originDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
+beforeEach(() => {
+  base = mkdtempSync(join(tmpdir(), 'lane-pool-release-owner-'));
+  poolRoot = join(base, 'pool');
 });
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=releaseowner', '--branch=trunk', '--no-install'];

@@ -52,7 +52,7 @@ import { readUnsupported, recordUnsupported } from '../../scripts/conveyor/unsup
 import { selectStatusCandidates } from '../../scripts/conveyor/reconcile-core.mjs';
 import { localDateString } from '../../scripts/lib/local-date.mjs';
 import { withSelfSync } from '../../scripts/lib/daemon-self-sync.mjs';
-import { withGithubAppAuth } from '../../scripts/lib/github-app-auth-env.mjs';
+import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 
 /** The runner's tick interval — matches the SKILL's chained-sleep heartbeat (§2.5): ~120 s, just under the
  *  5-min prompt-cache window so a main-session loop's ticks stay cheap. The headless runner spends no model
@@ -615,7 +615,7 @@ export function resolveSkipPasses(flagValue, { names = MECHANICAL_PASS_NAMES } =
  * @returns {Function} the wrapped `tickOnce` effect, same call signature as the one passed in.
  */
 export function wireSelfSyncAndAppAuth({
-  tickOnce, root, onRestart, authOpts, sync, selfSync = false, gate,
+  tickOnce, root, onRestart, authOpts = FLEET_APP_AUTH_OPTS, sync, selfSync = false, gate,
   rebuild, mainOnly, acquireRead, releaseRead, readState,
 }) {
   const authed = withGithubAppAuth({ tickOnce }, authOpts);

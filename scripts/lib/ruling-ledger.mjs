@@ -179,14 +179,18 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
   const operator = operatorBlockRulings(pr?.comments);
 
   // Every block ruling: (a) inside an earlier head's record, (b) the operator's own verdict comments.
+  // Read each earlier record from its LATEST snapshot only: supersession is resolved inside one snapshot, so an older
+  // snapshot would keep planting a block that a later one withdrew. The ruling's thread position is where it first appeared.
   const blocks = new Map();
-  for (const { record, index } of snaps) {
-    if (record.head === head) continue;
+  const latestOfRun = new Map();
+  for (const s of snaps) if (s.record.head !== head) latestOfRun.set(`${s.record.head}:${s.record.runId}`, s);
+  for (const { record, index: latestIndex } of latestOfRun.values()) {
     for (const f of record.referrals) {
       for (const r of activeRulings(record, f.key)) {
         if (r.result !== 'block') continue;
-        const id = `${record.head}:${r.id}`;
-        if (!blocks.has(id)) blocks.set(id, { source: 'record', finding: findingView(f), ruling: rulingText(r), priorHead: record.head, index });
+        const firstSeen = snaps.find((s) => s.record.head === record.head && s.record.runId === record.runId
+          && s.record.rulings.some((x) => x.key === f.key && x.id === r.id));
+        blocks.set(`${record.head}:${record.runId}:${r.id}`, { source: 'record', finding: findingView(f), ruling: rulingText(r), priorHead: record.head, index: firstSeen?.index ?? latestIndex });
       }
     }
   }
@@ -206,22 +210,26 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       const g = findingView(f);
       if (matches.some((m) => m.finding.key === g.key)) continue;
       if (rulingsHere(f.key).some((r) => r.result === 'block')) continue;
-      for (const b of blocks.values()) {
-        if (b.index > firstIndex) continue; // written after this head's record: a fresh ruling on it
-        if (!matchesBlock(g, b)) continue;
-        if (b.source === 'record' && rulingsHere(f.key).length) continue;
-        // The operator re-ruled on this very head after seeing it: handled, not ignored.
-        if (operator.some((o) => o.index > firstIndex && hintMatchesFile(o.hints, g.file) && claimSimilarity(g.summary, o.text) >= SIMILARITY_FLOOR)) continue;
-        const heads = new Set([head]);
-        for (const s of snaps) {
-          if (s.index <= b.index || s.record.head === b.priorHead) continue;
-          if (s.record.referrals.some((x) => matchesBlock(findingView(x), b))) heads.add(s.record.head);
-        }
-        worst = Math.max(worst, heads.size);
-        matches.push({ finding: g, ruledFinding: b.source === 'record' ? b.finding : null, ruling: b.ruling, priorHead: b.priorHead,
-          ruledAt: b.at ? new Date(b.at).toISOString() : null, source: b.source, misses: heads.size });
-        break;
+      // The standing ruling is the LATEST matching block: a fresh re-ruling restarts the count, so the ladder gives
+      // the fixer the rungs that re-ruling bought instead of counting heads from the first ruling.
+      let b = null;
+      for (const c of blocks.values()) {
+        if (c.index > firstIndex) continue; // written after this head's record: a fresh ruling on it
+        if (!matchesBlock(g, c)) continue;
+        if (c.source === 'record' && rulingsHere(f.key).length) continue;
+        if (!b || c.index > b.index) b = c;
       }
+      if (!b) continue;
+      // The operator re-ruled on this very head after seeing it: handled, not ignored.
+      if (operator.some((o) => o.index > firstIndex && hintMatchesFile(o.hints, g.file) && claimSimilarity(g.summary, o.text) >= SIMILARITY_FLOOR)) continue;
+      const heads = new Set([head]);
+      for (const s of snaps) {
+        if (s.index <= b.index || s.record.head === b.priorHead) continue;
+        if (s.record.referrals.some((x) => matchesBlock(findingView(x), b))) heads.add(s.record.head);
+      }
+      worst = Math.max(worst, heads.size);
+      matches.push({ finding: g, ruledFinding: b.source === 'record' ? b.finding : null, ruling: b.ruling, priorHead: b.priorHead,
+        ruledAt: b.at ? new Date(b.at).toISOString() : null, source: b.source, misses: heads.size });
     }
   }
   if (!matches.length) return null;

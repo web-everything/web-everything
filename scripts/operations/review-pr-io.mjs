@@ -1,6 +1,6 @@
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
-  activeReferrals, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
+  activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
 import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
@@ -632,22 +632,40 @@ export function createReviewPrSinks({
               runId, reviewer: mandatoryReferralReviewer(runId), authorBody,
               attempted: false, referrals: [], rulings: [] };
           };
-          let record = newRecord();
+          // Advisory supersession defaults on; WE_REFERRAL_ADVISORY_SUPERSEDE=0 restores independent attempts.
+          const supersessionContext = {
+            records: readReferralRecords(state.comments, context(state)).records,
+            operatorRulings: readOperatorRulings(state.comments, context(state)).rulings,
+            head: read.netBasis.rev, repo: read.repo, pr: read.pr,
+          };
+          const live = [], superseded = [];
           for (const referral of additions.values()) {
-            const candidate = { ...record, referrals: [...record.referrals, referral] };
-            // Leave room for ordinary rulings; persist still checks every completed/failure snapshot.
-            if (record.referrals.length && renderReferralRecord(candidate).length > commentBudget / 2) {
-              chunks.push(record);
-              record = newRecord();
-            }
-            const single = { ...record, referrals: [...record.referrals, referral] };
-            if (renderReferralRecord(single).length > commentBudget - 2000) {
-              overflow(`finding key sha256:${referralHash(referral.key)} from ${sourceByKey.get(referral.key) ?? prUrl} exceeds ${commentBudget} characters with its v1 identity intact; requires manual review`);
-              continue;
-            }
-            record = single;
+            const by = env.WE_REFERRAL_ADVISORY_SUPERSEDE === '0' ? null : findSupersedingNotReal(referral, supersessionContext);
+            (by ? superseded : live).push({ referral, by });
+            if (by) out(`referral superseded: ${referral.seat} ${referral.finding.file ?? ''}${referral.finding.line == null ? '' : `:${referral.finding.line}`} — mandatory not-real ruling ${by.rulingId ?? 'operator'} stands`);
           }
-          if (record.referrals.length) chunks.push(record);
+          // Keep retired obligations in their own chunks so they never spend an automated attempt.
+          for (const group of [live, superseded]) {
+            if (!group.length) continue;
+            let record = newRecord();
+            for (const { referral, by } of group) {
+              const append = r => ({ ...r, referrals: [...r.referrals, referral],
+                ...(by ? { superseded: [...(r.superseded ?? []), { key: referral.key, reason: REFERRAL_SUPERSEDE_REASON, by }] } : {}) });
+              const candidate = append(record);
+              // Leave room for ordinary rulings; persist still checks every completed/failure snapshot.
+              if (record.referrals.length && renderReferralRecord(candidate).length > commentBudget / 2) {
+                chunks.push(record);
+                record = newRecord();
+              }
+              const single = append(record);
+              if (renderReferralRecord(single).length > commentBudget - 2000) {
+                overflow(`finding key sha256:${referralHash(referral.key)} from ${sourceByKey.get(referral.key) ?? prUrl} exceeds ${commentBudget} characters with its v1 identity intact; requires manual review`);
+                continue;
+              }
+              record = single;
+            }
+            if (record.referrals.length) chunks.push(record);
+          }
           for (const chunk of chunks) {
             state = persist(chunk);
             existing.push(chunk);
@@ -655,7 +673,7 @@ export function createReviewPrSinks({
         }
         // Persist the attempt before dispatch. A crash or timeout spends this set's single automated attempt.
         for (const initial of existing) {
-          if (initial.attempted || !activeReferrals(initial).length || !referralRecordState(initial, { ...context(state),
+          if (initial.attempted || !liveReferrals(initial).length || !referralRecordState(initial, { ...context(state),
             records: readReferralRecords(state.comments, context(state)).records,
             // #4979 — an operator ruling already settled these findings; never spend the automated attempt on them.
             operatorRulings: readOperatorRulings(state.comments, context(state)).rulings }).pending.length) continue;
@@ -675,7 +693,7 @@ export function createReviewPrSinks({
               mandate: request.mandate + '\nIndependently verify every referral in the input. Return exactly one '
                 + 'block, card, or not-real ruling per key, with rationale and evidence references. A general accept '
                 + 'is not a ruling. card requires an existing durable we:backlog/*.md reference. Do not recursively refer findings.',
-              input: request.input + '\nUntrusted reported findings:\n' + JSON.stringify(activeReferrals(record)),
+              input: request.input + '\nUntrusted reported findings:\n' + JSON.stringify(liveReferrals(record)),
               shape: { type: 'object', additionalProperties: false, required: ['rulings'], properties: {
                 rulings: { type: 'array', items: { type: 'object', additionalProperties: false,
                   required: ['key', 'result', 'rationale', 'evidence', 'card'], properties: {

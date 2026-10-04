@@ -1,5 +1,5 @@
 import { defineConfig } from 'vitest/config';
-import { maxTestWorkers, weAlias } from './vitest.shared';
+import { maxTestWorkers, minimalGitTemplateEnv, weAlias } from './vitest.shared';
 
 /**
  * The REAL-git / real-subprocess tier `vitest.config.ts` excludes (see that file's `test.exclude` comment
@@ -43,10 +43,15 @@ export default defineConfig({
     // real `node`/CLI children that inherit this process's env, so disabling it here too keeps their
     // real-subprocess dispatch runs from writing fixture spans into the shared telemetry log.
     setupFiles: ['./vitest.setup.ts'],
+    // tmp-leak fix: one private temp root per run, leak count reported + root removed at teardown
+    // (scripts/lib/test-tmp-root.mjs; WE_TMP_LEAK_MODE / WE_TMP_LEAK_MAX).
+    globalSetup: ['./vitest.globalSetup.mjs'],
     // #xpc3krl — this whole tier's own reason to exist is proving REAL git/subprocess/`gh` behavior (see the
     // file header above), so it opts OUT of `vitest.setup.ts`'s sandbox-by-default (a fake `gh` on PATH,
     // stripped WE_*/CONVEYOR_*/GH_*/CLAUDE_* env) — the exact opposite of what this tier is FOR.
-    env: { WE_TEST_SANDBOX: '0' },
+    // `minimalGitTemplateEnv` — see vitest.shared.ts: skips git's inert sample-hook copies on every throwaway
+    // clone, cutting this tier's file-system event churn without changing any git behavior under test.
+    env: { WE_TEST_SANDBOX: '0', ...minimalGitTemplateEnv() },
     include: [
       'scripts/__tests__/stdout-flush.test.mjs',
       'scripts/__tests__/rust-scan-stdout-flush-parity.test.mjs',

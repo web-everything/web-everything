@@ -3,10 +3,13 @@
  * @description The io binding of `record-referral-ruling` (#4979): reads the PR thread through `gh`, resolves the
  *   `--card` reference in THIS checkout's backlog, and posts the one operator-ruling comment. The post re-reads the
  *   thread before and after: it never double-posts a byte-identical ruling, refuses when the head moved since the
- *   plan, and fails unless the gate's own reader sees the ruling it just wrote.
+ *   plan. Follow-up re-checks the head, delegates send-back to review-set-label, and clears the ruling-needed label.
+ *   The post fails unless the gate's own reader sees the ruling it just wrote.
  */
 
-import { readdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -15,7 +18,7 @@ import { readOperatorRulings } from '../lib/jury-core.mjs';
 import { currentActorId } from '../lib/review-independence.mjs';
 import { referralCardReadable } from '../review-set-label.mjs';
 import { idFromName, normalizeId } from '../backlog/id.mjs';
-import { openReferralFindings, OPERATOR_RULING_POST_EFFECT } from './record-referral-ruling.mjs';
+import { openReferralFindings, OPERATOR_RULING_POST_EFFECT, OPERATOR_RULING_FOLLOW_UP_EFFECT, RULING_NEEDED_LABEL } from './record-referral-ruling.mjs';
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -72,15 +75,50 @@ export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = 
     return {
       head: thread.headRefOid, open: open.open, malformed: open.malformed,
       card: resolveCardRef(card, { root, readable }),
+      followUpEnabled: env.WE_REFERRAL_RULING_FOLLOW_UP !== '0',
       now: now(), clearerId: currentActorId(env),
     };
   };
 }
 
-export function createRecordReferralRulingSinks({ readJson = ghJson, post = (repo, pr, body) => execFileSyncThrottled('gh',
+export function createRecordReferralRulingSinks({ readJson = ghJson,
+  readPr = (repo, pr) => readJson(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,labels']),
+  runSetLabel = execFileSync,
+  setLabels = (...args) => execFileSyncThrottled('gh', args,
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }),
+  post = (repo, pr, body) => execFileSyncThrottled('gh',
   ['pr', 'comment', String(pr), '--repo', repo, '--body', body], { encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }) } = {}) {
   return {
+    [OPERATOR_RULING_FOLLOW_UP_EFFECT]: async ({ repo, pr, head, action, body, actor, channel }) => {
+      const before = await readPr(repo, pr);
+      if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing changed — re-run against the new head`);
+      const labels = before.labels.map((l) => typeof l === 'string' ? l : l.name);
+      let sentBack = false;
+      if (action === 'send-back' && !labels.includes('review:changes')) {
+        const dir = mkdtempSync(join(tmpdir(), 'operator-referral-ruling-'));
+        try {
+          const path = join(dir, 'body.md');
+          writeFileSync(path, body, 'utf8');
+          let stdout;
+          try {
+            stdout = await runSetLabel(process.execPath, [join(REPO_ROOT, 'scripts/review-set-label.mjs'), String(pr),
+              `--repo=${repo}`, '--to=changes', `--body-file=${path}`, `--actor=${actor}`, `--channel=${channel}`],
+            { encoding: 'utf8', timeout: 120_000 });
+          } catch (error) {
+            let message;
+            try { message = JSON.parse(String(error.stdout)).error; } catch { /* Keep the process error when stdout is not JSON. */ }
+            throw new Error(message || error.message);
+          }
+          const result = JSON.parse(String(stdout).trim().split('\n').filter(Boolean).at(-1) ?? '{}');
+          if (result.error || result.ok !== true) throw new Error(result.error || 'review-set-label did not confirm send-back');
+          sentBack = true;
+        } finally { rmSync(dir, { recursive: true, force: true }); }
+      }
+      const labelCleared = labels.includes(RULING_NEEDED_LABEL);
+      if (labelCleared) await setLabels('pr', 'edit', String(pr), '--repo', repo, '--remove-label', RULING_NEEDED_LABEL);
+      return { action, sentBack, labelCleared };
+    },
     [OPERATOR_RULING_POST_EFFECT]: async ({ repo, pr, head, body }) => {
       const before = readPrThread(repo, pr, { readJson });
       if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing posted — re-run against the new head`);

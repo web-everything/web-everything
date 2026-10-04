@@ -169,6 +169,26 @@ export function classifyCiFailureAttribution({ failureCompletedAt, mainRedWindow
 export const DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS = FALLBACK_REQUIRED_STATUS_CHECKS;
 
 /**
+ * PR-SCOPED REQUIRED CHECKS — live 2026-10-04, PR #3903. Some required checks judge only the PR's OWN content
+ * (`soak-replay-gate`: "a daemon-scope bug fix must add a soak break"). A red `main` can never explain them: the
+ * same PR fails the same way on any base. But `failingRequiredCheckForAttribution` attributed #3903's red
+ * `soak-replay-gate` (16:24Z) to a main-red window, so the planner refused `owed-ci-rerun` ("owed a mechanical
+ * rebase once main recovers") and no ci-heal ever ran; the review daemon sat at `awaiting-ci`.
+ *
+ * A failing check named here is never main-attributable: it wins the attribution pick and is never excused as
+ * `owed-ci-rerun`, so the ordinary `ci-heal` path owns it. CONFIGURABLE: `WE_PR_SCOPED_CHECKS` is a
+ * comma-separated list that REPLACES the default (`""` = none, restoring the old behaviour).
+ */
+export const DEFAULT_PR_SCOPED_CHECKS = Object.freeze(['soak-replay-gate']);
+
+/** The PR-scoped required checks in force. PURE over `env`. */
+export function resolvePrScopedChecks(env = process.env) {
+  const raw = env?.WE_PR_SCOPED_CHECKS;
+  if (typeof raw !== 'string') return DEFAULT_PR_SCOPED_CHECKS;
+  return raw.split(',').map((x) => x.trim()).filter(Boolean);
+}
+
+/**
  * we:scripts/conveyor/main-red-recovery.mjs#failingRequiredCheckForAttribution — soak-main-red: across EVERY
  * required check (not just `test`), the ONE failing check a red-`main` attribution must be judged on. PURE.
  * `null` when none of `requiredChecks` is failing. With several failing, a check whose completion falls OUTSIDE
@@ -179,7 +199,7 @@ export const DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS = FALLBACK_REQUIRED_STATUS_CHECK
  * @param {{requiredChecks?:string[], mainRedWindows?:Array<object>}} [o]
  * @returns {{name:string, completedAt:(string|null)}|null}
  */
-export function failingRequiredCheckForAttribution(pr, { requiredChecks = DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS, mainRedWindows = [] } = {}) {
+export function failingRequiredCheckForAttribution(pr, { requiredChecks = DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS, mainRedWindows = [], prScopedChecks = resolvePrScopedChecks() } = {}) {
   const names = Array.isArray(requiredChecks) ? requiredChecks : DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS; // [] = none required
   const failing = [];
   for (const name of new Set(names)) {
@@ -187,6 +207,9 @@ export function failingRequiredCheckForAttribution(pr, { requiredChecks = DEFAUL
     failing.push({ name, completedAt: latestRequiredCheck(pr, name)?.completedAt ?? null });
   }
   if (!failing.length) return null;
+  // A failing PR-scoped check (see DEFAULT_PR_SCOPED_CHECKS) is the PR's own, whatever main was doing.
+  const scoped = failing.find((f) => prScopedChecks.includes(f.name));
+  if (scoped) return scoped;
   const unexplained = failing.find((f) => classifyCiFailureAttribution({ failureCompletedAt: f.completedAt, mainRedWindows }) !== 'main-red');
   if (unexplained) return unexplained;
   return failing.reduce((a, b) => (Date.parse(b.completedAt) > Date.parse(a.completedAt) ? b : a));
@@ -398,8 +421,10 @@ export const MERGE_BASE_FINISHED_RUN_CONCLUSIONS = Object.freeze(['success', 'fa
 export function isPrCiFailureOwedRerun({
   requiredCheckCompletedAt, aheadBy, mainRedWindows, failingCheckName = null, mainLatestCheckRuns = null,
   prContainsMainGreenSha = null, mergeBaseCheckRuns = null, mergeBaseRunConclusion = null,
-  comments = [], headSha = null,
+  comments = [], headSha = null, prScopedChecks = resolvePrScopedChecks(),
 } = {}) {
+  // A PR-scoped check (DEFAULT_PR_SCOPED_CHECKS) fails on the PR's own content — a rebase never clears it.
+  if (failingCheckName && prScopedChecks.includes(failingCheckName)) return false;
   const behind = Number.isFinite(aheadBy) ? aheadBy : null;
   if (behind === 0) return false; // already current — neither path below can still owe a rerun (point 2).
   const attribution = classifyCiFailureAttribution({ failureCompletedAt: requiredCheckCompletedAt, mainRedWindows });
@@ -449,6 +474,7 @@ export function isPrCiFailureOwedRerun({
  */
 export function planMainRedRebases({
   candidates = [], mainRedWindows = [], mainLatestCheckRuns = [], maxRebaseRetriesPerSha = DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
+  prScopedChecks = resolvePrScopedChecks(),
 } = {}) {
   const dispatch = [];
   const refusals = [];
@@ -465,6 +491,10 @@ export function planMainRedRebases({
       failureCompletedAt: c?.failureCompletedAt ?? null,
       failingCheckName: c?.failingCheckName ?? null,
     };
+    if (base.failingCheckName && prScopedChecks.includes(base.failingCheckName)) {
+      refusals.push({ ...base, kind: 'own-failure', why: `PR #${prNumber}'s failing check \`${base.failingCheckName}\` is PR-scoped (judges the PR's own content) — a rebase onto main never clears it; owed a ci-heal` });
+      continue;
+    }
     const attribution = classifyCiFailureAttribution({ failureCompletedAt: base.failureCompletedAt, mainRedWindows });
     // landing-freeze fix — see this function's own docblock and `isMainGreenFixOwed`'s (PR #2793 review: main
     // green alone is not proof; the candidate must carry the per-PR merge-base / containment evidence too).

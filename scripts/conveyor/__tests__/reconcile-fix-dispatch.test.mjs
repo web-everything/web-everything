@@ -874,6 +874,28 @@ describe('runReconcileFixDispatch — read reconcile-pass, plan, assign a lane, 
     expect(result.refusals).toEqual([{ pr: 1764, kind: 'dispatch-failed', why: 'lane-9 lost its race to a sibling' }]);
   });
 
+  it('a failed `claude --bg` spawn is logged with its exit code + redacted stderr, never the argv/settings/brief (live #3794)', () => {
+    const entries = [{ kind: 'fix', prNumber: 1764, headRefName: 'lane/3438-wire-reconcile-pass' }];
+    const spawnError = Object.assign(
+      new Error('Command failed: claude --bg -n fix-1764 --settings {"env":{"GH_TOKEN":"ghs_abcdefghijklmnop1234"}} # brief head\nbrief body\nstderr text'),
+      { status: 1, stderr: 'Error: boom ghs_abcdefghijklmnop1234\n' },
+    );
+    const result = runReconcileFixDispatch({
+      root: '/repo',
+      reconcile: reconcileStub(entries),
+      findItemFn: findItemStub,
+      loadItems: () => [],
+      pickFreeLanes: () => [2],
+      dispatch: () => { throw spawnError; },
+      checkStaleness: FRESH,
+      fetchItemlessDiffPaths: () => [],
+    });
+    expect(result.refusals).toHaveLength(1);
+    const why = result.refusals[0].why;
+    expect(why).toMatch(/^claude --bg failed \(exit 1\): Error: boom/);
+    expect(why).not.toMatch(/--settings|brief|ghs_|GH_TOKEN/);
+  });
+
   it('PR #1972 review finding — a THROWING `tryResume` is isolated to a per-entry `dispatch-failed` refusal, and does not abort the rest of the tick', () => {
     const entries = [
       // Entry 1: conflict-caused; its `tryResume` call throws (e.g. a transient `claude agents --json` read).
@@ -1392,7 +1414,8 @@ describe('fair overlap queue', () => {
   });
   it('reports positions including older blocked waiters and deduplicates two claims for one PR', () => {
     const claims = [{ meta: { pr: 3103, scope } }, { meta: { pr: 3103, scope } }];
-    const { refusals } = filterFixesByInFlightScope([fx(3090, '13'), fx(3033, '12')], [], claims);
+    // #3881 — these pin queue ORDER under the bound; the aging override has its own file (scope-overlap-aging).
+    const { refusals } = filterFixesByInFlightScope([fx(3090, '13'), fx(3033, '12')], [], claims, { maxWaitMinutes: null });
     expect(refusals[0].why).toContain('waiting 2nd behind #3103 on we:scripts/pr-land.mjs');
     expect(refusals[1]).toMatchObject({ pr: 3090, queuePosition: 3 });
     expect(refusals[1].why).toContain('waiting 3rd behind #3103, #3033');
@@ -1400,7 +1423,7 @@ describe('fair overlap queue', () => {
   it('does not bypass a blocked older waiter through another file', () => {
     const older = { ...fx(1, '12'), scope: ['we:a', 'we:b'] };
     expect(filterFixesByInFlightScope([older, { ...fx(2, '13'), scope: ['we:b'] }], [],
-      [{ meta: { pr: 3, scope: ['we:a'] } }]).planned).toEqual([]);
+      [{ meta: { pr: 3, scope: ['we:a'] } }], { maxWaitMinutes: null }).planned).toEqual([]);
   });
   it('carries waiting age and human priority through scope planning', () => {
     const { planned } = planFixesFromReconcile([{ kind: 'fix', prNumber: 3033, headRefName: 'feature',

@@ -23,7 +23,7 @@
  * Usage:
  *   node scripts/lane-pool.mjs provision --count=N [--acquirable] [--no-install] [--force]   # ensure N lanes exist (clone missing) + refresh all + ensure deps + ensure the WE pool's FUI render-sibling (#2166); --acquirable grows PAST foreign-leased lanes so N ACQUIRABLE ones result (#2426)
  *   node scripts/lane-pool.mjs refresh           [--no-install] [--force]     # fetch + hard-reset existing lanes to origin/main (no creation)
- *   node scripts/lane-pool.mjs status  [--json] [--leased-only]     # per-lane: path / head / clean / behind origin/main / deps / lease. #4345: --leased-only reads only the lease marker (no git) for a lane with no LIVE lease, and runs the full git probe only for lanes that ARE leased — for a reader that only ever consumes leased rows (conveyor-state.mjs / scope-lease-collect.mjs); an unleased row's git-derived fields (head/branch/clean/behind) are simply absent. Keep plain `status` for operator use and for anything needing dirty-unleased info (lane-pool-health-watch.mjs's trim).
+ *   node scripts/lane-pool.mjs status  [--json] [--leased-only] [--max-age-ms=N]     # per-lane: path / head / clean / behind origin/main / deps / lease. #4345: --leased-only reads only the lease marker (no git) for a lane with no LIVE lease, and runs the full git probe only for lanes that ARE leased — for a reader that only ever consumes leased rows (conveyor-state.mjs / scope-lease-collect.mjs); an unleased row's git-derived fields (head/branch/clean/behind) are simply absent. Keep plain `status` for operator use and for anything needing dirty-unleased info (lane-pool-health-watch.mjs's trim).
  *   node scripts/lane-pool.mjs list    [--json] [--acquirable [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N]]  # existing lane paths (for the orchestrator to dispatch into); --acquirable filters out foreign-leased / busy lanes (#2426); #xn432dz: lease-first (no git in a live-leased lane), SINGLE-FLIGHT + cached for --cache-ttl-ms (env LANE_POOL_LIST_CACHE_TTL_MS, default 30000; 0 disables) so concurrent callers share one scan, --no-cache forces a fresh one, --limit=N stops at N (never cached), and the scan fails cleanly past --scan-timeout-ms (env LANE_POOL_LIST_SCAN_TIMEOUT_MS, default 120000)
  *   node scripts/lane-pool.mjs path    --lane=N                     # print one lane's absolute path
  *   node scripts/lane-pool.mjs acquire [--purpose=<slug>] [--session=<slug>] [--lane=N] [--item=NNN[,NNN…]] [--ttl-minutes=N] [--no-reset] [--no-reap] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--wait-ms=N] [--no-free-list] [--free-list-max-age-ms=N] [--json]  # #2275 lease a free lane (exclusive) + reset to origin/main (or, with #2386 --base=<ref>, to a predecessor lane's pushed tip); stdout = its path. #4122: auto-pick tries `we:scripts/conveyor/lane-pool-health-watch.mjs`'s pre-computed free-lane list FIRST (near-zero git) when it exists and is fresh (< --free-list-max-age-ms / LANE_POOL_FREE_LIST_MAX_AGE_MS, default 10min) — every candidate is still atomically claimed + re-verified fresh before it's ever handed out, so a stale entry costs at most a lost race, never a clobbered lane; --no-free-list opts out. Falls back to today's shared, single-flight, cached full-pool scan (#xn432dz/#3383) unchanged, only when the list is missing, stale or exhausted. #x3jmao3: auto-pick (no --lane) OPT-IN bounded retry — --wait-ms=<total> polls (ACQUIRE_POLL_MS spacing, no busy-wait) for up to that many ms before the "no free lane" failure, instead of failing on the very first full-pool reading (omitted ⇒ today's instant-fail, unchanged); a genuinely-exhausted pool still fails with the identical message once the bound elapses. #2748: BEFORE selecting, a reaper backstop reclaims any PROVABLY-DEAD ghost lease in the pool (item resolved on main, or PR merged/closed) so a finished-but-unreleased lane never blocks a fresh dispatch — the pool ACTS on the ghost the board only flags; --no-reap opts out. #2413: --purpose=workflow-lane MARKS the lease (workflowLane:true) → the guard requires a sibling to assert its minted slug before a destructive op. #2560: --scope=<repo:path,...> declares this lane's ADVISORY predicted file-scope — persisted into the marker (the live scope-lease collector reads it) + warns on overlap, but NEVER gates the acquire (the whole-clone lease is the real lock). #2616: --item=NNN records this lane's item → lane in the lane-ports registry (same as `map`) so conveyor-state's health-stall scan can flag a genuinely stalled lane — the self-serve population a conveyor delivery agent needs (nothing else calls `map` for it). #2350: --reserve (requires --lane=N) mints a PERMANENT reserved lane — no TTL, never stale, off-limits to acquire/refresh/provision (even --force); dropped only by `release --release-reserved`. #2997: EVERY acquire now mints a per-holder `holder` slug into the lease and prints it (stderr + --json `holder`) — the one signal that separates this holder from a SIBLING agent of the same session, which `ownerSession` cannot; assert it as `--session=<slug>` (release) or `LANE_SESSION=<slug>` (a destructive git op) whenever a sibling of your session also holds a live lane. #2997 r2: --adopt also stamps YOU as the lane's OCCUPANT (`workerSession`) — pass it when the process running this acquire is the one that will work in the lane, omit it when you are leasing on someone else's behalf (they run `adopt` instead).
@@ -114,6 +114,7 @@ import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeL
 // #2560 — lane-pool may freely import readiness (confirmed no circular import): the advisory scope-lease check
 // at acquire. normScope normalizes the declared `--scope`; candidateLaunch is the pure overlap-at-launch query.
 import { normScope } from './readiness/scope-lease.mjs';
+import { laneGitSignature, readStatusCache, cachedGitFields, writeStatusCache, resolveStatusMaxAgeMs } from './lib/lane-status-cache.mjs';
 import { isCherryOutputAllPatchEquivalent } from './lib/git-patch-equivalence.mjs';
 import { candidateLaunch } from './readiness/scope-lease-live.mjs';
 // #x3jmao3 — the SAME non-busy-wait spin-poll primitive `withNumberingLock` already uses to space its own
@@ -1156,7 +1157,7 @@ function refreshLane(repo, n, { force = false } = {}) {
  * @param {number} n
  * @param {{leasedOnly?: boolean}} [opts]
  */
-function laneStatus(repo, n, { leasedOnly = false } = {}) {
+function laneStatus(repo, n, { leasedOnly = false, statusCache = null } = {}) {
   const dir = laneDir(repo, n);
   if (!existsSync(dir)) return { lane: n, path: dir, exists: false };
   let readError;
@@ -1175,18 +1176,33 @@ function laneStatus(repo, n, { leasedOnly = false } = {}) {
       leased: false,
     };
   }
-  const head = tryGit(['rev-parse', '--short', 'HEAD'], dir);
-  const branch = tryGit(['rev-parse', '--abbrev-ref', 'HEAD'], dir);
-  const porcelain = tryGit(['status', '--porcelain'], dir);
-  const behind = tryGit(['rev-list', '--count', `HEAD..origin/${repo.branch}`], dir);
+  // Host churn cut (2026-10-04) — reuse a recent probe of this lane when the caller opted in AND its git
+  // signature is unchanged (see `we:scripts/lib/lane-status-cache.mjs`); otherwise probe fresh and record it.
+  const sig = statusCache ? laneGitSignature(dir, repo.branch) : null;
+  const hit = statusCache ? cachedGitFields(statusCache.cache, n, sig, Date.now(), statusCache.maxAgeMs) : null;
+  let probe;
+  if (hit) {
+    probe = hit;
+  } else {
+    const head = tryGit(['rev-parse', '--short', 'HEAD'], dir);
+    const branch = tryGit(['rev-parse', '--abbrev-ref', 'HEAD'], dir);
+    const porcelain = tryGit(['status', '--porcelain'], dir);
+    const behind = tryGit(['rev-list', '--count', `HEAD..origin/${repo.branch}`], dir);
+    probe = { head, branch, clean: porcelain === '', behind: behind === null ? '?' : Number(behind) };
+    // Only a COMPLETE probe is recorded, and only against the signature read BEFORE it (a change racing the
+    // probe then simply mismatches next time — never a stale row stamped with a newer signature).
+    if (statusCache && sig && head !== null && branch !== null && porcelain !== null && behind !== null) {
+      statusCache.updates[String(n)] = { sig, ...probe };
+    }
+  }
   return {
     lane: n,
     path: dir,
     exists: true,
-    head,
-    branch,
-    clean: porcelain === '',
-    behind: behind === null ? '?' : Number(behind),
+    head: probe.head,
+    branch: probe.branch,
+    clean: probe.clean,
+    behind: probe.behind,
     deps: depsReady(dir),
     lease: lease || null,
     ...(readError ? { readError } : {}),
@@ -2582,7 +2598,14 @@ function printStatus(repo) {
   // consumes leased rows, e.g. conveyor-state.mjs / scope-lease-collect.mjs). A leased lane's row is byte-for-
   // byte identical to a full `status` call; an unleased lane's row just omits the git-derived fields.
   const leasedOnly = !!flags['leased-only'];
-  const rows = existingLanes(repo).map((n) => laneStatus(repo, n, { leasedOnly }));
+  // Host churn cut (2026-10-04): `--max-age-ms=N` / env WE_LANE_STATUS_MAX_AGE_MS (default 0 = always probe
+  // fresh, today's behaviour) lets a display-only reader reuse a recent, signature-matched probe.
+  const maxAgeMs = resolveStatusMaxAgeMs(flags['max-age-ms']);
+  // Only an opted-in call reads OR writes the cache: a default `status` stays strictly read-only (stale-state and
+  // other readers pin "writes no state"), so the cache is shared among the opted-in display readers only.
+  const statusCache = maxAgeMs > 0 ? { maxAgeMs, cache: readStatusCache(repo.poolDir), updates: {} } : null;
+  const rows = existingLanes(repo).map((n) => laneStatus(repo, n, { leasedOnly, statusCache }));
+  if (statusCache) writeStatusCache(repo.poolDir, statusCache.updates);
   if (flags.json) {
     process.stdout.write(JSON.stringify({ repo: repo.name, root: repo.poolDir, leasedOnly, lanes: rows }, null, 2) + '\n');
     return;
@@ -3980,6 +4003,8 @@ const KNOWN_FLAGS = new Set([
   // #4345 — status --leased-only: skip the 4 git calls per UNLEASED lane (rev-parse ×2, status --porcelain,
   // rev-list) for a reader that only consumes leased rows (conveyor-state.mjs / scope-lease-collect.mjs).
   'leased-only',
+  // Host churn cut (2026-10-04) — status's opt-in reuse window for a signature-matched cached probe.
+  'max-age-ms',
 ]);
 
 // ── dispatch ──────────────────────────────────────────────────────────────────────────────────────

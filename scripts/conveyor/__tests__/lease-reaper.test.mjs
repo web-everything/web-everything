@@ -48,6 +48,7 @@ import {
   defaultGitIsAncestor,
   fetchSessionSignals,
   buildLeaseSignalsFor,
+  laneIndicesIn,
 } from '../lease-reaper.mjs';
 import { DEFAULT_LEASE_TTL_MINUTES } from '../../lib/lane-lease.mjs';
 import { DISPATCH_GUARD_LISTING_GRACE_MINUTES } from '../../operations/dispatch-lane.mjs';
@@ -1722,5 +1723,17 @@ describe('resolveLeaseItemNum / buildLeaseSignalsFor — #4332 ownerAlive veto',
       const sig = build([{ kind: 'interactive', sessionId: 'live-owner', cwd: dir }])({ ...cand(), lease: sessionLease });
       expect(sig.prState).toBe('merged');
     });
+  });
+});
+
+describe('laneIndicesIn — a plain FILE in the pool root is not a pool (2026-10-04 ENOTDIR outage)', () => {
+  it('returns [] for a non-directory entry instead of throwing ENOTDIR', () => {
+    const root = mkdtempSync(join(tmpdir(), 'reaper-pool-file-'));
+    try {
+      writeFileSync(join(root, '.metadata_never_index'), '');
+      mkdirSync(join(root, 'web-everything', 'lane-2'), { recursive: true });
+      expect(laneIndicesIn(join(root, '.metadata_never_index'))).toEqual([]);
+      expect(laneIndicesIn(join(root, 'web-everything'))).toEqual([2]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

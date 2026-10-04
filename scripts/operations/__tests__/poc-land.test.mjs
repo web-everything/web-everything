@@ -107,6 +107,24 @@ describe('1. fast-forward success', () => {
   });
 });
 
+describe('a sibling-repo POC branch (`repo` field)', () => {
+  const SIB = normalizeRegistry({ branches: [{ branch: 'lane/wip-quickview', repo: 'plateauapp/plateau-app', purpose: 'alpha', owner: '3383', dateOpened: '2026-10-03', target: 'main', scope: [] }] });
+  it('lands from a lane of THAT repo', () => {
+    const g = scriptGit({ fetch: OK(), 'rev-parse': [OK('laneHEAD'), OK('base0')], 'merge-base': OK('base0'), push: OK() });
+    const r = landOnPocBranch({ branch: 'lane/wip-quickview', cwd: '/lane', registry: SIB, run: g.run, verify: passing, withLock: grantingLock, repoKey: 'plateauapp/plateau-app' });
+    expect(r.status).toBe('landed');
+    expect(g.argvFor('push')).toEqual([['push', 'origin', 'HEAD:refs/heads/lane/wip-quickview']]);
+  });
+  it('is refused from a Web Everything lane (or a lane with no origin), before touching git', () => {
+    for (const repoKey of ['web-everything/web-everything', null]) {
+      const g = scriptGit({});
+      const r = landOnPocBranch({ branch: 'lane/wip-quickview', cwd: '/lane', registry: SIB, run: g.run, verify: passing, withLock: grantingLock, repoKey });
+      expect(r.status).toBe('not-registered');
+      expect(g.calls).toEqual([]);
+    }
+  });
+});
+
 describe('2. rebase-and-retry — the loser of a race does not fail', () => {
   it('rebases onto the fresh tip, RE-RUNS the gate, then lands on the next attempt', () => {
     const g = scriptGit({
@@ -234,7 +252,8 @@ describe('4. lock serialization — two landers, one branch, a REAL lock dir', (
     tryAcquireNumberingLock(lockRoot, makeOwner('someone-else'), { lockPath: pocLandLockPathFor(BRANCH, 'org/repo') });
     const g = scriptGit({ fetch: OK(), 'rev-parse': OK('x'), 'merge-base': OK('x'), push: OK() });
     const r = landOnPocBranch({
-      branch: BRANCH, cwd: '/lane', registry: REGISTRY, run: g.run, verify: passing, repoKey: 'org/repo',
+      // The repo key is both the lock key and the registry identity (`repo` field), so the entry names it.
+      branch: BRANCH, cwd: '/lane', registry: normalizeRegistry({ branches: [{ ...REGISTRY.branches[0], repo: 'org/repo' }] }), run: g.run, verify: passing, repoKey: 'org/repo',
       withLock: (fn, o) => withPocLandLock(fn, { ...o, lockRoot, waitMs: 0, sleep: () => {} }),
     });
     expect(r.status).toBe('locked');
