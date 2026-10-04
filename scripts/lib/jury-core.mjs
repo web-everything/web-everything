@@ -2286,10 +2286,45 @@ const supersededRulings = (ruling) => ruling.supersedes == null ? []
 export const REFERRAL_SEAT_PROVIDERS = Object.freeze({
   judgeAntigravityReview: 'agy-gemini', 'agy-gemini': 'agy-gemini', 'agy-claude': 'agy-claude',
 });
+export const ADVISORY_REFERRAL_SEATS = Object.freeze(['judgeAdvisory', 'judgeCorrectnessAdvisory', 'judgeAntigravityReview']);
+export const REFERRAL_SUPERSEDE_REASON = 'superseded: the mandatory owner already ruled this finding not-real on this head';
 export const REFERRAL_DROP_REASON = 'dropped: seat disabled by operator config';
 // A drop only retires a finding nobody has ruled on: a finding with a ruling (a `block` above all) keeps counting.
 export const activeReferrals = (record) => record.referrals.filter(f => !(record.dropped ?? []).some(d => d.key === f.key)
   || record.rulings.some(r => r.key === f.key));
+
+export const liveReferrals = (record) => activeReferrals(record).filter(f => !(record.superseded ?? []).some(s => s.key === f.key)
+  || record.rulings.some(r => r.key === f.key));
+
+/** Same-head owner decisions may retire advisory duplicates; never infer clearance from prose alone. */
+export function findSupersedingNotReal(referral, { records = [], operatorRulings = [], head, repo, pr }) {
+  if (!ADVISORY_REFERRAL_SEATS.includes(referral.seat)) return null;
+  const matches = (record, key) => {
+    if (key === referral.key) return false;
+    const finding = record.referrals.find(f => f.key === key)?.finding;
+    const target = referral.finding;
+    const file = corroborationPath(finding?.file);
+    if (!file || file !== corroborationPath(target.file)) return false;
+    if (!(finding.line == null && target.line == null)
+      && !(finding.line != null && target.line != null
+        && Math.abs(finding.line - target.line) <= CORROBORATION_LINE_WINDOW)) return false;
+    const summary = s => String(s ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+    return summary(finding.summary) === summary(target.summary) || wordOverlap(finding.summary, target.summary) >= 0.5;
+  };
+  for (const record of records) {
+    if (record.head !== head || record.repo !== repo || record.pr !== pr) continue;
+    for (const ruling of record.rulings) {
+      if (ruling.result === 'not-real' && !record.rulings.some(next => supersededRulings(next).includes(ruling.id))
+        && matches(record, ruling.key)) return { runId: record.runId, key: ruling.key, rulingId: ruling.id };
+    }
+  }
+  for (const ruling of operatorRulings) {
+    if (ruling.result !== 'not-real' || ruling.head !== head || ruling.repo !== repo || ruling.pr !== pr) continue;
+    const record = records.find(r => r.runId === ruling.runId && r.head === head && r.repo === repo && r.pr === pr);
+    if (record && matches(record, ruling.key)) return { runId: ruling.runId, key: ruling.key, operator: true };
+  }
+  return null;
+}
 
 /** Versioned snapshot of the append-only referral history, mirrored into the jury ledger. */
 export function validateReferralRecord(r) {
@@ -2311,6 +2346,14 @@ export function validateReferralRecord(r) {
       || new Set(r.dropped.map(d => d.key)).size !== r.dropped.length
       || r.dropped.some(d => d.reason !== REFERRAL_DROP_REASON
         || !Object.hasOwn(REFERRAL_SEAT_PROVIDERS, r.referrals.find(f => f.key === d.key)?.seat)))) return false;
+    if (r.superseded !== undefined && (!Array.isArray(r.superseded)
+      || new Set(r.superseded.map(s => s.key)).size !== r.superseded.length
+      || r.superseded.some(s => s.reason !== REFERRAL_SUPERSEDE_REASON
+        || !ADVISORY_REFERRAL_SEATS.includes(r.referrals.find(f => f.key === s.key)?.seat)
+        || !s.by || typeof s.by.runId !== 'string' || !s.by.runId.trim()
+        || typeof s.by.key !== 'string' || !s.by.key.trim() || s.by.key === s.key
+        || !(s.by.operator === true && s.by.rulingId === undefined
+          || s.by.operator === undefined && typeof s.by.rulingId === 'string' && s.by.rulingId.trim())))) return false;
     const ids = new Set();
     for (const rli of r.rulings) {
       if (!rli || typeof rli.id !== 'string' || !rli.id || ids.has(rli.id)
@@ -2328,11 +2371,11 @@ export function validateReferralRecord(r) {
   } catch { return false; }
 }
 
-/** Resolve only the exact record's rulings, from its independent assigned reviewer.
- * Run-derived identities on other records confer no authority over this obligation.
+/** Resolve own rulings from the assigned reviewer or operator. An unruled advisory duplicate
+ * may also clear through its explicit same-subject, same-head not-real supersession reference.
  */
 export function referralRecordState(record, { head = record?.head, body = record?.authorBody ?? '', createdAt = '',
-  cardReadable = () => false, seatDisabled = () => false, operatorRulings = [] } = {}) {
+  cardReadable = () => false, seatDisabled = () => false, operatorRulings = [], records = [] } = {}) {
   if (!validateReferralRecord(record)) return { pending: ['malformed-referral-record'], blocked: [], rulings: [] };
   const pending = [], blocked = [], rulings = [];
   const independent = decideClearerIndependence({ authorId: parseAuthorActorId(body),
@@ -2347,6 +2390,16 @@ export function referralRecordState(record, { head = record?.head, body = record
     if (operator) {
       if (head !== record.head || (operator.result === 'card' && !cardReadable(operator.card))) pending.push(f.key);
       else { rulings.push(operator); if (operator.result === 'block') blocked.push(f.key); }
+      continue;
+    }
+    const superseded = (record.superseded ?? []).find(s => s.key === f.key);
+    if (!recorded.length && superseded) {
+      const { by } = superseded;
+      const sameSubject = r => r.runId === by.runId && r.repo === record.repo && r.pr === record.pr && r.head === record.head;
+      const backed = by.operator
+        ? operatorRulings.some(r => sameSubject(r) && r.key === by.key && r.result === 'not-real')
+        : records.some(r => sameSubject(r) && r.rulings.some(x => x.id === by.rulingId && x.key === by.key && x.result === 'not-real'));
+      if (head !== record.head || !backed) pending.push(f.key);
       continue;
     }
     // Match audited drops: disabling an optional seat cannot erase an existing ruling (especially a block),
@@ -2370,6 +2423,7 @@ export function renderReferralRecord(record) {
   return `Mandatory review owner: ${record.reviewer.id} (${record.reviewer.lens}).\n`
     + `CONFIRMED broken/unrecoverable findings require a finding-specific block/card/not-real ruling.\n`
     + record.referrals.map(f => `- ${f.key}: ${f.finding.summary}`).join('\n')
+    + (record.superseded ?? []).map(s => `\n- ${s.key}: ${s.reason} (by run ${s.by.runId})`).join('')
     + (record.dropped ?? []).map(d => `\n- ${d.key}: ${d.reason}`).join('')
     + `\nAttempt recorded: ${record.attempted}. Reason: ${record.failure ?? (referralRecordState(record).pending.length ? 'mandatory finding-specific review required' : 'finding-specific rulings recorded')}. Rulings: ${JSON.stringify(record.rulings)}\n`
     + `Record any missing finding-specific rulings with the mandatory reviewer identified above, retaining prior rulings and explicit supersedes IDs. Then start a fresh review-pr --pr=${record.pr} --repo=${record.repo}; it reuses this PR record without another automated attempt. card requires a readable backlog reference.\n`
@@ -2427,6 +2481,7 @@ export function readReferralRecords(comments, { head } = {}) {
         if (previous && (previous.authorBody !== r.authorBody || JSON.stringify(previous.referrals) !== JSON.stringify(r.referrals)
           || (previous.attempted && !r.attempted)
           || JSON.stringify((r.dropped ?? []).slice(0, (previous.dropped ?? []).length)) !== JSON.stringify(previous.dropped ?? [])
+          || JSON.stringify((r.superseded ?? []).slice(0, (previous.superseded ?? []).length)) !== JSON.stringify(previous.superseded ?? [])
           || JSON.stringify(r.rulings.slice(0, previous.rulings.length)) !== JSON.stringify(previous.rulings))) {
           malformed ||= holdsHead(r); continue;
         }
