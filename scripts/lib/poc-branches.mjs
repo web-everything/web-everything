@@ -35,7 +35,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { canonicalizeSlug } from './constellation-repos.mjs';
+import { canonicalizeSlug, CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -54,7 +54,7 @@ export const DEFAULT_GRADUATION_TARGET = 'main';
  *  `repo` is exactly what it always was. A sibling-repo branch (e.g. plateau-app's alpha branch) sets `repo`
  *  so `poc-land` can land on it from that repo's own lane, while every WE-only consumer (the drift sweep, the
  *  mechanical sync, `deliveryTarget:`, the prototype-tracker guard) keeps seeing only WE branches. */
-export const DEFAULT_POC_REPO = 'web-everything/web-everything';
+export const DEFAULT_POC_REPO = CONSTELLATION_REPOS.we.slug;
 
 const SLUG_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 
@@ -114,7 +114,7 @@ export function validatePocBranch(entry) {
   else if (normalizeBranchRef(target) === normalizeBranchRef(entry.branch)) errors.push('`target` must differ from `branch` — a branch cannot graduate into itself');
   if (entry.scope != null && (!Array.isArray(entry.scope) || !entry.scope.every(isNonEmptyString))) errors.push('`scope` must be an array of repo-qualified `<repo>:<path>` strings');
   if (entry.graduationItem != null && !isNonEmptyString(entry.graduationItem)) errors.push('`graduationItem` must be an item id string (e.g. "3443")');
-  if (entry.repo != null && !(typeof entry.repo === 'string' && SLUG_RE.test(entry.repo.trim()))) errors.push('`repo` must be an `owner/name` GitHub slug when present (default: web-everything/web-everything)');
+  if (entry.repo != null && !(typeof entry.repo === 'string' && SLUG_RE.test(entry.repo.trim()))) errors.push(`\`repo\` must be an \`owner/name\` GitHub slug when present (default: ${DEFAULT_POC_REPO})`);
   if (entry.autoSync != null && typeof entry.autoSync !== 'boolean') errors.push('`autoSync` must be a boolean when present (opts this branch in/out of #3383\'s mechanical target-into-branch sync)');
   return { ok: errors.length === 0, errors };
 }

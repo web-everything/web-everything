@@ -2338,6 +2338,7 @@ describe('the write arc and its #2964 ordering', () => {
           'scripts/guard-git-push.mjs',
           'scripts/guard-prototype-tracker.mjs',
           'scripts/lib/poc-branches.mjs',
+          'scripts/lib/constellation-repos.mjs',
           'scripts/lib/prototype-tracker-data.mjs',
           'scripts/lib/local-date.mjs',
         ];
