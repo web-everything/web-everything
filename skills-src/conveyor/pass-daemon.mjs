@@ -54,7 +54,7 @@ import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
-import { ensureFreshGithubAppEnv } from '../../scripts/lib/github-app-auth-env.mjs';
+import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 import { withSelfSync, resolvePocSyncBranch, DAEMON_SELF_SYNC_BRANCH_ENV } from '../../scripts/lib/daemon-self-sync.mjs';
 
 /** How often the INDEPENDENT heartbeat timer fires, regardless of whether a pass is mid-run. Deliberately
@@ -271,7 +271,7 @@ async function main(argv) {
     sleep: realSleep,
     isAlive: () => alive,
     intervalMs,
-    refreshAuth: () => ensureFreshGithubAppEnv({ log: console }),
+    refreshAuth: () => ensureFreshGithubAppEnv(FLEET_APP_AUTH_OPTS),
     onRunError: (e) => console.error(`pass-daemon: "${passName}" run failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`),
     onRefreshError: (e) => console.error(`pass-daemon: "${passName}" GitHub App token refresh failed (non-fatal, falling back to personal auth): ${String((e && e.message) || e).split('\n')[0]}`),
   });

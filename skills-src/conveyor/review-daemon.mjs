@@ -108,7 +108,7 @@ import { freeLaneNumbers } from '../../scripts/conveyor/reconcile-fix-dispatch.m
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
 import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
-import { withGithubAppAuth } from '../../scripts/lib/github-app-auth-env.mjs';
+import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 import { withSelfSync } from '../../scripts/lib/daemon-self-sync.mjs';
 import { withPrEvents, makeDrainNudgeForward } from '../../scripts/lib/pr-events.mjs';
 import { makePoolExhaustionLogger } from '../../scripts/conveyor/pool-exhaustion.mjs';
@@ -216,6 +216,7 @@ export function explainPendingNotDispatched({ prs, plan, dispatchable = [], defe
  * @returns {{reviewsOwed:number, dispatched:Array<{prNumber:number, agentId:string|null}>, failed:Array<{prNumber:number, error:string}>, refusals:number, reconcileError:string|null, deferredForLanes:number, holdReconcile:Array<object>, holdReconcileError:string|null}}
  */
 export function runReviewTick({
+  defaultBranch = 'main',
   reconcile = runReconcilePass,
   dispatch = dispatchReviewByMode,
   tagRound = tagReviewRound,
@@ -293,9 +294,9 @@ export function runReviewTick({
     if (sharedReads) {
       rawPrs = readPrs({ repo });
       rawAgents = readAgents({});
-      plan = reconcile({ repo, readPrs: () => rawPrs, readAgents: () => rawAgents });
+      plan = reconcile({ repo, defaultBranch, readPrs: () => rawPrs, readAgents: () => rawAgents });
     } else {
-      plan = reconcile({ repo });
+      plan = reconcile({ repo, defaultBranch });
     }
   } catch (e) {
     return {
@@ -394,11 +395,14 @@ export function runReviewTick({
   // already exists (`dispatchReviewJob` writes it before returning) — reusing the snapshot would tag it "nothing
   // live" and strip its `review-status:reviewing` until the next tick. Those PRs read fresh (`undefined`).
   const dispatchedThisTick = new Set(dispatched.map((d) => Number(d.prNumber)));
-  for (const c of statusCandidates(reviews, plan.refusals ?? [], fixes, ciHeals)) {
+  // Waiting stacks can have only a surfaced note; they still need their draft status label.
+  const candidates = [...statusCandidates(reviews, plan.refusals ?? [], fixes, ciHeals),
+    ...(plan.notes ?? []).filter(n => ['stacked-awaiting-base', 'stacked-base-orphaned'].includes(n.kind))];
+  for (const c of new Map(candidates.map(c => [Number(c.prNumber), c])).values()) {
     const agents = dispatchedThisTick.has(Number(c.prNumber)) ? undefined : (rawAgents ?? undefined);
     try {
       tagStatus({
-        pr: c.prNumber, repo, agents, prState: (rawPrs ?? []).find(p => Number(p.number) === Number(c.prNumber)), currentLabels: labelsByPr.get(Number(c.prNumber)),
+        pr: c.prNumber, repo, agents, defaultBranch, prState: (rawPrs ?? []).find(p => Number(p.number) === Number(c.prNumber)), currentLabels: labelsByPr.get(Number(c.prNumber)),
         isDraft: isDraftByPr.get(Number(c.prNumber)), mergeConflicted: mergeConflictedByPr.get(Number(c.prNumber)),
       });
     }
@@ -429,6 +433,15 @@ export function runReviewTick({
  *  below, so a future per-user configurable repo list (plateau as a product letting an operator choose which
  *  repos to integrate) is a source swap here, not a redesign of {@link runReviewTickAllRepos}. */
 export const REVIEW_DAEMON_REPOS = Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
+
+/**
+ * App auth for this daemon is PER-OWNER: it sweeps every constellation repo in one process, and each org has its
+ * own App installation. Pinning ONE installation's token in GH_TOKEN (the old default) made every call to a repo
+ * outside that org fail with GraphQL "Could not resolve to a Repository" — live 2026-10-04, plateauapp/plateau-app
+ * #202 skipped every pass as `review-ci: unreadable-ci` while its CI was green. Per-owner leaves GH_TOKEN unset and
+ * routes `gh` through the shim, which picks each call's token by the target repo's owner (as the drain does).
+ */
+export const REVIEW_DAEMON_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
 
 /**
  * Run {@link runReviewTick} once per watched repo, isolating one repo's failure from the rest — a plateau-app
@@ -857,6 +870,7 @@ export function buildCliDaemonEffects({
       for (const h of (result.holdReconcile ?? [])) {
         if (h.remove?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile removed ${h.remove.join(',')}${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.healed?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile HEALED — removed ${h.healed.join(',')}${h.commentPosted ? ', comment posted' : ''}${h.error ? ` (FAILED: ${h.error})` : ''}`);
+        if (h.ruling) log.error(`review-daemon: ${h.repo}#${h.num} ruling-needed label ${h.ruling}${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.flagged?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile FLAGGED contradictory ${h.flagged.join(',')} — not auto-resolved (${h.flagReason || 'unresolved'}${h.fetchError ? `, fetch error: ${h.fetchError}` : ''})`);
       }
       for (const hf of (result.holdReconcileFailed ?? [])) log.error(`review-daemon: ${hf.repo} hold-reconcile failed (non-fatal, other repos unaffected): ${hf.error}`);
@@ -912,7 +926,7 @@ async function main() {
   // early; the interval stays as the safety net. This daemon also forwards drain-relevant events to the drain
   // daemon's localhost POST /nudge — one forwarder, so the drain wakes on events without its own feed client.
   const { stoppedReason } = await runDaemonLoop(
-    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner })), {
+    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner }), REVIEW_DAEMON_APP_AUTH_OPTS), {
       root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
     }), { role: 'review', repos: REVIEW_DAEMON_REPOS, forward: [makeDrainNudgeForward()] }),
   );

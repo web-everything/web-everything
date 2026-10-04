@@ -1,7 +1,8 @@
 /**
  * @file scripts/conveyor/health-smells/heavy-run-ungated.mjs
  * @description Sustained heavy runs outside admission. Combines the current process snapshot with the
- * ~60s sampler's history; attribution names the program that should route runs through admission.
+ * sample history; attribution names the program that should route runs through admission.
+ * Samples come from the health-watch tick by default (5 min) and from the optional dedicated sampler when WE_HEAVY_SAMPLE_INTERVAL_S is set.
  * Counts are run observations across samples, not distinct invocations. Shadow by default.
  */
 import { MINUTE } from '../health-watch-core.mjs';

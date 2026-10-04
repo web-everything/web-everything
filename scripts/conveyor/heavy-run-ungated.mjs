@@ -3,7 +3,9 @@
  * @file scripts/conveyor/heavy-run-ungated.mjs
  * @description Pure heavy-process attribution plus the health watch's cheap process sampler IO shell.
  * `sample [--json] [--state-root=DIR] [--ps-fixture=FILE]` records one snapshot;
- * `loop [--interval=60] [--count=N]` repeats it. No GitHub calls or process mutations.
+ * `loop [--interval=N] [--count=N]` repeats only when the flag or WE_HEAVY_SAMPLE_INTERVAL_S
+ * supplies a finite interval >= 10 seconds. Otherwise the health-watch tick samples every 5 min.
+ * No GitHub calls or process mutations.
  */
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -11,6 +13,14 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parsePsOutput } from './health-watch-core.mjs';
 import { healthDir } from './health-watch-section.mjs';
+
+export const HEAVY_SAMPLE_INTERVAL_ENV = 'WE_HEAVY_SAMPLE_INTERVAL_S';
+
+/** PURE. An explicit flag wins over the environment value, including when invalid. */
+export function resolveSampleIntervalS({ flag, env }) {
+  const interval = Number(flag === undefined ? env : flag);
+  return Number.isFinite(interval) && interval >= 10 ? interval : null;
+}
 
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'fish', 'ksh']);
 const RUNNERS = new Set(['npm', 'npx', 'pnpm', 'yarn']);
@@ -127,9 +137,14 @@ function sample(flags) {
 }
 async function main(args) {
   const [command, ...options] = args;
-  if (!['sample', 'loop'].includes(command)) throw new Error('Usage: heavy-run-ungated.mjs sample|loop [--json] [--state-root=DIR] [--ps-fixture=FILE] [--interval=60] [--count=N]');
+  if (!['sample', 'loop'].includes(command)) throw new Error('Usage: heavy-run-ungated.mjs sample|loop [--json] [--state-root=DIR] [--ps-fixture=FILE] [--interval=N] [--count=N]');
   const flags = Object.fromEntries(options.map((arg) => { const i = arg.indexOf('='); return i < 0 ? [arg.replace(/^--/, ''), true] : [arg.slice(2, i), arg.slice(i + 1)]; }));
-  const interval = Number(flags.interval ?? 60);
+  const interval = command === 'sample' ? Number(flags.interval ?? 60)
+    : resolveSampleIntervalS({ flag: flags.interval, env: process.env[HEAVY_SAMPLE_INTERVAL_ENV] });
+  if (command === 'loop' && interval === null) {
+    console.log('heavy-run sampler: dedicated sampler disabled — the health-watch tick samples every 5 min; set WE_HEAVY_SAMPLE_INTERVAL_S=<seconds> (>= 10) to enable');
+    return;
+  }
   const count = command === 'sample' ? 1 : flags.count === undefined ? Infinity : Number(flags.count);
   if (!(interval > 0 && Number.isFinite(interval)) || !(count === Infinity || (Number.isInteger(count) && count > 0))) throw new Error('interval and count must be positive');
   for (let n = 0; n < count; n++) {

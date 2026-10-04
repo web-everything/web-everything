@@ -107,6 +107,11 @@ const HASH_SLUG = 'x[0-9a-z]{6}';
 export const HASH_PATH_CITE_SOURCE = 'backlog/(x[0-9a-z]{6,7})-[A-Za-z0-9-]+\\.md';
 const HASH_PATH_CITE_RE = new RegExp(`\\b${HASH_PATH_CITE_SOURCE}\\b`, 'g');
 
+/** Classify a cited path using exact-path existence supplied by the caller. */
+export function classifyHashPathCite({ cited, exists }) {
+  return exists(cited) ? 'resolving' : 'dangling';
+}
+
 export function findHashPathCiteOutsideBacklog(text, relPath) {
   const findings = [];
   if (typeof text !== 'string' || text === '' || typeof relPath !== 'string') return findings;

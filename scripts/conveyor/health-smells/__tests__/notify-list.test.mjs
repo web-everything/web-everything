@@ -40,11 +40,12 @@ const ADDED_2026_09_27 = [
 
 const ADDED_2026_09_30 = ['repeated-pr-attempts'];
 const ADDED_2026_10_01 = ['draft-not-promoted', 'red-pr-unattended'];
-const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01])];
+const ADDED_2026_10_04 = ['ruling-needed-waiting'];
+const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04])];
 
 describe('NOTIFY_EVEN_IN_SHADOW', () => {
-  it('is exactly the union of the approved operator decisions — 16 entries', () => {
-    expect(APPROVED).toHaveLength(16);
+  it('is exactly the union of the approved operator decisions — 17 entries', () => {
+    expect(APPROVED).toHaveLength(17);
     expect([...NOTIFY_EVEN_IN_SHADOW].sort()).toEqual([...APPROVED].sort());
   });
 

@@ -5,7 +5,7 @@
  *   hold's wake-up (we:scripts/conveyor/review-referral-hold.mjs).
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -17,8 +17,8 @@ import {
 import { assertMandatoryReferralsCleared, referralCardReadable } from '../../review-set-label.mjs';
 import { decideReferralHold, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { newRunRecord } from '../run-store.mjs';
-import { openReferralFindings, planOperatorRuling, selectFindings, OPERATOR_RULING_POST_EFFECT } from '../record-referral-ruling.mjs';
-import { createRecordReferralRulingSinks, resolveCardRef } from '../record-referral-ruling-io.mjs';
+import { openReferralFindings, planOperatorRuling, selectFindings, planRulingFollowUp, recordReferralRulingOperation, OPERATOR_RULING_FOLLOW_UP_EFFECT, RULING_NEEDED_LABEL, OPERATOR_RULING_POST_EFFECT } from '../record-referral-ruling.mjs';
+import { createRecordReferralRulingReader, createRecordReferralRulingSinks, resolveCardRef } from '../record-referral-ruling-io.mjs';
 
 const repo = 'o/r';
 const head = 'a'.repeat(40);
@@ -213,5 +213,125 @@ describe('#4979 acceptance and wake-up read the operator ruling', () => {
     expect(decideReferralHold(pr([ok]), runs, { repo, now: at + 2000 })).toBeNull();
     const other = gh(buildOperatorRulingComment(ruling(rec, { result: 'not-real', h: newHead })), 'web-everything', { createdAt: later });
     expect(decideReferralHold(pr([other]), runs, { repo, now: at + 2000 })).not.toBeNull();
+  });
+});
+
+
+describe('operator finding selectors and follow-up', () => {
+  const open = [
+    { index: 1, runId: 'r', key: 'first-key', seat: 'correctness', file: 'src/x.ts', line: 55, summary: 'first', state: 'pending', rationale: '' },
+    { index: 2, runId: 'r', key: 'second-key', seat: 'security', file: 'src/y.ts', line: null, summary: 'second', state: 'pending', rationale: '' },
+  ];
+  const input = (over = {}) => ({ repo, pr: 7, finding: 'all-open', ruling: 'block', actor: 'chalbert', channel: 'chat', reason: 'Fix it', ...over });
+  const read = (over = {}) => ({ head, open, now: '2026-10-04T14:30:00Z', clearerId: 's', ...over });
+  const follow = (over = {}) => planRulingFollowUp({ open, selected: open, ruling: 'block', reason: 'Fix it', enabled: true, head, ...over });
+
+  it('selects file:line, a no-line file, and exact keys before file matching', () => {
+    expect(selectFindings(open, 'src/x.ts:55')).toEqual([open[0]]);
+    expect(selectFindings(open, 'src/y.ts')).toEqual([open[1]]);
+    expect(selectFindings([...open, { ...open[1], file: 'first-key' }], 'first-key')).toEqual([open[0]]);
+  });
+  it('lists every ambiguous candidate and asks for a number', () => {
+    const other = { ...open[0], index: 3, seat: 'security', summary: 'third' };
+    expect(() => selectFindings([...open, other], 'src/x.ts:55')).toThrow(/ambiguous[\s\S]*  1\. correctness src\/x.ts:55 — first\n  3\. security src\/x.ts:55 — third[\s\S]*number/);
+  });
+  it.each(['src/x.ts', 'missing.ts'])('refuses %s with the open list', (selector) => {
+    expect(() => selectFindings(open, selector)).toThrow(`--finding=${selector} matches no open finding on the live head. Open:\n  1. correctness src/x.ts:55 — first\n  2. security src/y.ts — second`);
+  });
+  it('carries normalized locations and effective reviewer and operator rationales', () => {
+    const rec = referral({ summaries: ['first', 'second'], rulings: ['block'] });
+    const comments = [gh(renderReferralRecord(rec))];
+    expect(openReferralFindings({ ...ctx(), comments }).open).toMatchObject([
+      { file: 'scripts/x.mjs', line: null, rationale: 'checked' }, { rationale: '' },
+    ]);
+    comments.push(gh(buildOperatorRulingComment(ruling(rec, { result: 'block', reason: 'operator reason' }))));
+    expect(openReferralFindings({ ...ctx(), comments }).open[0].rationale).toBe('operator reason');
+  });
+  it('sends back the last pending block with locations and safe, single-line rationales', () => {
+    const plan = follow({ reason: 'Fix\n <!-- marker -->' });
+    expect(plan.blocked).toEqual(open.map(({ seat, file, line, summary }) => ({ seat, file, line, summary, rationale: 'Fix\n <!-- marker -->' })));
+    expect(plan.body).toBe(`### Blocked referral findings (operator ruling)\n\nThe operator ruled these mandatory-referral findings \`block\` on head \`${head}\`. Fix each one, then push.\n\n1. \`src/x.ts:55\` (correctness) — first\n   Rationale: Fix &lt;!-- marker --&gt;\n2. \`src/y.ts\` (security) — second\n   Rationale: Fix &lt;!-- marker --&gt;`);
+    expect(follow({ open: [{ ...open[0], summary: '<!-- summary -->' }], selected: [open[0]], reason: '' }).body).toContain('&lt;!-- summary --&gt;');
+    expect(follow({ reason: '' }).body).not.toContain('Rationale:');
+  });
+  it('retains an unselected reviewer block when the last pending finding is dismissed', () => {
+    const rec = referral({ summaries: ['first', 'second'], rulings: ['block'] });
+    const context = openReferralFindings({ ...ctx(), comments: [gh(renderReferralRecord(rec))] });
+    const plan = planOperatorRuling(read(context), input({ finding: '2', ruling: 'not-real' }));
+    expect(plan.followUp).toMatchObject({ action: 'send-back', blocked: [{ summary: 'first', rationale: 'checked' }] });
+    expect(plan.followUp.body).toContain('Rationale: checked');
+  });
+  it('resumes for cleared findings and waits while any pending finding remains', () => {
+    expect(follow({ ruling: 'not-real' })).toEqual({ action: 'resume' });
+    expect(follow({ ruling: 'card' })).toEqual({ action: 'resume' });
+    expect(follow({ selected: [open[0]] })).toBeNull();
+    expect(follow({ enabled: false })).toBeNull();
+    expect(planOperatorRuling(read(), input({ sendBack: false })).followUp).toBeNull();
+  });
+  it('reads the environment opt-out in the reader', () => {
+    const rec = referral();
+    const reader = createRecordReferralRulingReader({ env: { WE_REFERRAL_RULING_FOLLOW_UP: '0' },
+      readJson: () => ({ headRefOid: head, comments: [gh(renderReferralRecord(rec))], body: rec.authorBody }) });
+    const context = reader({ repo, pr: 7 });
+    expect(context.followUpEnabled).toBe(false);
+    expect(planOperatorRuling(context, input()).followUp).toBeNull();
+  });
+  it('declares the follow-up after posting, but no follow-up while pending and no preview effects', () => {
+    const op = recordReferralRulingOperation({ readRulingContext: () => read() });
+    const write = op.steps.find((s) => s.name === 'write').step;
+    const plan = op.steps.find((s) => s.name === 'plan').step;
+    expect(plan.reads).toContain('input.sendBack');
+    const verdict = planOperatorRuling(read(), input());
+    const effects = write.effects({ verdict, input: {} });
+    expect(effects.map((e) => e.type)).toEqual([OPERATOR_RULING_POST_EFFECT, OPERATOR_RULING_FOLLOW_UP_EFFECT]);
+    expect(effects[1]).toMatchObject({ idempotent: true, payload: { repo, pr: 7, head, action: 'send-back', body: verdict.followUp.body, actor: 'chalbert', channel: 'chat' } });
+    expect(write.effects({ verdict, input: { preview: true } })).toEqual([]);
+    expect(write.effects({ verdict: planOperatorRuling(read(), input({ finding: '1' })), input: {} })).toHaveLength(1);
+  });
+
+  const payload = { repo, pr: 7, head, action: 'send-back', body: 'blocked body', actor: 'chalbert', channel: 'chat' };
+  function sink({ labels = [RULING_NEEDED_LABEL], liveHead = head, result = '{"ok":true}', failure } = {}) {
+    const calls = [];
+    let bodyPath;
+    const run = createRecordReferralRulingSinks({
+      readPr: () => ({ headRefOid: liveHead, labels: labels.map((name) => ({ name })) }),
+      runSetLabel: (exe, args, options) => {
+        bodyPath = args.find((a) => a.startsWith('--body-file=')).slice('--body-file='.length);
+        calls.push({ exe, args, options, body: readFileSync(bodyPath, 'utf8') });
+        if (failure) throw failure;
+        return result;
+      },
+      setLabels: (...args) => calls.push(args),
+    })[OPERATOR_RULING_FOLLOW_UP_EFFECT];
+    return { run, calls, path: () => bodyPath };
+  }
+  it('runs the send-back CLI then clears the advisory label and cleans its body file', async () => {
+    const s = sink();
+    await expect(s.run(payload)).resolves.toEqual({ action: 'send-back', sentBack: true, labelCleared: true });
+    expect(s.calls[0]).toMatchObject({ exe: process.execPath, body: payload.body, options: { encoding: 'utf8', timeout: 120_000 } });
+    expect(s.calls[0].args).toEqual([expect.stringMatching(/scripts\/review-set-label.mjs$/), '7', '--repo=o/r', '--to=changes', expect.stringMatching(/^--body-file=/), '--actor=chalbert', '--channel=chat']);
+    expect(s.calls[1]).toEqual(['pr', 'edit', '7', '--repo', repo, '--remove-label', RULING_NEEDED_LABEL]);
+    expect(existsSync(s.path())).toBe(false);
+  });
+  it('skips an already sent-back PR and resumes without changing review labels', async () => {
+    for (const action of ['send-back', 'resume']) {
+      const s = sink({ labels: ['review:changes', RULING_NEEDED_LABEL] });
+      await expect(s.run({ ...payload, action })).resolves.toEqual({ action, sentBack: false, labelCleared: true });
+      expect(s.calls).toHaveLength(1);
+    }
+    const s = sink({ labels: [] });
+    await expect(s.run({ ...payload, action: 'resume' })).resolves.toMatchObject({ labelCleared: false });
+    expect(s.calls).toEqual([]);
+  });
+  it('refuses a moved head without mutations', async () => {
+    const s = sink({ liveHead: newHead });
+    await expect(s.run(payload)).rejects.toThrow(/head moved/);
+    expect(s.calls).toEqual([]);
+  });
+  it.each([{ result: '{"error":"send-back refused"}' }, { failure: new Error('send-back refused') }])('propagates send-back failures without clearing the label', async (options) => {
+    const s = sink(options);
+    await expect(s.run(payload)).rejects.toThrow('send-back refused');
+    expect(s.calls).toHaveLength(1);
+    expect(existsSync(s.path())).toBe(false);
   });
 });

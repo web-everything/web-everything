@@ -11,7 +11,7 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
   if (!/^[1-9]\d*$/.test(pr ?? '')) throw new Error('PR must be a positive integer');
   const flags = {};
   for (const arg of args) {
-    const m = arg.match(/^--(repo|reason|actor|channel)=([\s\S]*)$/);
+    const m = arg.match(/^--(repo|reason|actor|channel|disposition)=([\s\S]*)$/);
     if (!m || Object.hasOwn(flags, m[1])) throw new Error(`unknown or duplicate argument: ${arg}`);
     flags[m[1]] = m[2];
   }

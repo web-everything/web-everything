@@ -18,7 +18,7 @@ export default {
     const violations = [];
     const sources = { 'vite.config.mts': 'export default {};', 'scripts/a.test.mjs': 'import {it} from "vitest"; process.env.X;' };
     const impact = pass.timeoutImpact({ head: 'h', sourceHead: 'h', sources, roots: ['vite.config.mts', 'scripts/a.test.mjs'],
-      changed: [{ filename: 'backlog/xw4yqe9-prevention-card.md' }] }, ts);
+      changed: [{ filename: 'backlog/4999-prevention-card.md' }] }, ts);
     if (impact) violations.push(`card-only diff judged impactful: ${impact}`);
     const head = 'b02fe5a3dc2c936f2ba28cc23d41785cf0144015';
     const rollup = [{ name: 'test-shard (2)', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/2' }];
