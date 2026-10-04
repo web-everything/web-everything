@@ -413,7 +413,7 @@ describe('stand-down CLI releases only after a successful comment (#4897)', () =
 
 // #3881: legacy local verify flakes must not request human judgment.
 import { loadFlakeHolds, loadFlakeHoldState, parseAltBranch, buildLoadFlakeHoldComment, buildLoadFlakeResolvedComment } from '../stand-down.mjs';
-import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
+import { loadFlakeLegacyBody, loadTimeoutLegacyBody } from './load-flake-fixture.mjs';
 const loadComment = (body, createdAt = '2026-10-04T18:51:50Z') => ({ body, createdAt, author: AUTOMATION });
 describe('load-flake holds', () => {
   it('parses the real alt SHA and reclassifies only trusted pre-cutoff load flakes', () => {
@@ -422,8 +422,13 @@ describe('load-flake holds', () => {
     expect(countTerminalStandDowns([c])).toBe(0);
     expect(loadFlakeHolds([c])[0]).toMatchObject({ head: null, legacy: true });
     expect(countTerminalStandDowns([{ ...c, createdAt: '2026-10-05T00:00:00Z' }])).toBe(1);
-    expect(countTerminalStandDowns([loadComment(c.body.replace('load flakiness', 'test failure'))])).toBe(1);
+    expect(countTerminalStandDowns([loadComment(c.body.replace('load flakiness', 'test failure').replace('load timeouts', 'test failures'))])).toBe(1);
     expect(loadFlakeHolds([{ ...c, author: { login: 'stranger' } }])).toEqual([]);
+  });
+  it('reclassifies #3932\'s "load timeouts" wording too (17:06 ET stand-down)', () => {
+    const c = loadComment(loadTimeoutLegacyBody, '2026-10-04T21:06:04Z');
+    expect(countTerminalStandDowns([c])).toBe(0);
+    expect(loadFlakeHolds([c])[0]).toMatchObject({ legacy: true, alt: { branch: 'lane/heavy-enforce-guard-fix-3932-alt', sha: 'ea104d91e' } });
   });
   it('holds until pushed or moved; red-again stays live; exhausted is terminal', () => {
     const c = loadComment(buildLoadFlakeHoldComment({ head: 'old', alt: 'lane/fix-alt', altSha: '9202eee8a' }));

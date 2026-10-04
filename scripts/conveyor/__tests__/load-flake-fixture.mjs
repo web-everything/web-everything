@@ -7,3 +7,11 @@ The PR was left EXACTLY as the reviewer left it — no label was changed, the re
 
 **A human is the intended next step.** The automatic fix loop will NOT try this PR again while this comment stands — re-running it would only re-ask the same question. Take it over with \`/finish\`, or delete this comment once the blocker is resolved to hand the PR back to the loop.
 <!-- stand-down reason=gate-red -->`;
+
+/** PR #3932's real stand-down (2026-10-04T21:06:04Z): "load timeouts", no "flakiness". */
+export const loadTimeoutLegacyBody = `${STAND_DOWN_MARKER}
+
+conveyor fix agent stopped rather than guessing: the gate stayed RED after the repair, and a red diff must never be re-pushed. Fix for the npm-test-related finding is done and saved at lane/heavy-enforce-guard-fix-3932-alt (ea104d91e; decide() probe red->green: 'npm test -- related f' now suggests the heavy-admission npx vitest related form, which is itself allowed; 5 new test rows). Diff-selected gate stayed red twice on tests that do not touch guard-bash: output-mix live-repo date test (both runs) plus load timeouts in session-reaper/stand-down/docket-refresh/duplicate-live-sessions. All guard-bash tests passed.
+
+**A human is the intended next step.**
+<!-- stand-down reason=gate-red -->`;

@@ -193,7 +193,9 @@ export function isLoadFlakeStandDown(c) {
   return body.trimStart().startsWith(STAND_DOWN_MARKER)
     && STAND_DOWN_TRAILER_RE.exec(body)?.[1] === 'gate-red'
     && at < Date.parse(LEGACY_LOAD_FLAKE_CUTOFF)
-    && /load[\s-]+flak/i.test(body) && !!parseAltBranch(body)?.sha;
+    // #3881 says "load flakiness", #3932 (17:06 ET) says "load timeouts"; both name a saved alt sha. Bounded by
+    // the cutoff, and the re-verify pass still needs a GREEN verify before any push.
+    && /load[\s-]+(?:flak|timeouts?\b)/i.test(body) && !!parseAltBranch(body)?.sha;
 }
 
 function loadTrailer(body, name) {
