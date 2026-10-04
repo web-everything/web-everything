@@ -292,10 +292,15 @@ export function defaultWriteFreeLaneList({
  * @param {Function} [exec]
  * @returns {string|null}
  */
+/** Env knob: `1` makes every pass re-read porcelain even for a lane `status` just reported clean (pre-2026-10-04). */
+export const REREAD_CLEAN_PORCELAIN_ENV = 'WE_HEALTH_WATCH_REREAD_CLEAN_PORCELAIN';
+
 export function defaultReadPorcelain(dir, exec = execFileSync) {
   try {
     // #x5n4zn3 — was bare (no timeout); called per-lane, so a single stuck lane must not stall the whole sweep.
-    return exec('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+    // GIT_OPTIONAL_LOCKS=0 (#xn432dz, as lane-pool.mjs's own read-only git): a read must never rewrite
+    // `.git/index` — that write per lane per pass also invalidated lane-status-cache's index signature.
+    return exec('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } });
   } catch {
     return null;
   }
@@ -603,10 +608,18 @@ export function watchLanePoolHealth({
   listWhois = defaultListWhois, reclaimLane = defaultReclaimLane, reclaimEnabled = true,
   writeFreeLaneList = defaultWriteFreeLaneList, salvageEnabled = false, salvageMax = DEFAULT_SALVAGE_MAX_PER_TICK,
   lowWater = DEFAULT_LOW_WATER, retention = null, snapshotLane = laneStateSnapshot, journalLitter = defaultJournalLitter,
+  rereadClean = process.env[REREAD_CLEAN_PORCELAIN_ENV] === '1',
 } = {}) {
   const status = listStatus({ repo, root });
+  // Host churn cut (2026-10-04): `status` JUST ran `git status --porcelain` on every lane, so a row it reported
+  // `clean: true` has porcelain '' — re-running it here was a second full-tree stat walk per clean lane per pass
+  // (~60-80 per pool per pass). A clean row plans `already-clean` (no action), so skipping the re-read can only
+  // ever DEFER a reap to the next pass, never cause one. Dirty/unknown rows are still re-read fresh.
+  // `rereadClean` (env WE_HEALTH_WATCH_REREAD_CLEAN_PORCELAIN=1) restores the old always-re-read behaviour.
   const lanes = status.lanes.map((l) => (
-    l && l.exists !== false && !l.leased ? { ...l, porcelain: readPorcelain(l.path) } : l
+    l && l.exists !== false && !l.leased
+      ? { ...l, porcelain: l.clean === true && !rereadClean ? '' : readPorcelain(l.path) }
+      : l
   ));
   const plan = planLaneReap(lanes);
   const reaped = [];

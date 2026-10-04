@@ -114,6 +114,46 @@ export function isSalvageLanded(entry, { repoDir, branchRef = 'origin/main' }) {
   return covered.size > 0 ? true : null;
 }
 
+/**
+ * Host churn cut (2026-10-04) — `isSalvageLanded` is a function of the entry's snapshot tips and the branch
+ * tip it is compared against, so a "not landed" verdict stays true until that lane's `origin/main` moves. Every
+ * health-watch pass (×3 pools, sharing ONE salvage index) used to re-run cat-file + merge-base + 2× diff for
+ * every one of ~300 unlanded entries — ~1,400 `git` children per pass, all under the index lock. Now each entry
+ * records the branch tip it was last judged against (`landedCheck`) and is re-judged only when that tip moves
+ * (or its snapshots change). The memo can only DELAY a "landed" mark, never invent one: a cached verdict is
+ * never `true` (a landed entry is marked and leaves this path). Env `WE_SALVAGE_LANDED_MEMO=0` disables it.
+ */
+export const SALVAGE_LANDED_MEMO_ENV = 'WE_SALVAGE_LANDED_MEMO';
+export function resolveLandedMemoEnabled(env = process.env) { return env[SALVAGE_LANDED_MEMO_ENV] !== '0'; }
+
+/** PURE: the memo key — branch tip + the exact tips judged, so a changed snapshot list is never a stale hit. */
+export function landedCheckKey(entry, branchSha) {
+  const tips = (entry.snapshots || []).map((s) => s.wipSha || s.headSha).filter(Boolean);
+  return `${branchSha}:${tips.join(',')}`;
+}
+
+/** The branch tip SHA in `dir` — plain fs read of the ref (loose, then packed-refs); `git rev-parse` fallback. */
+export function branchShaReader(branchRef) {
+  const m = /^origin\/(.+)$/.exec(branchRef);
+  const refName = m ? `refs/remotes/origin/${m[1]}` : null;
+  return (dir) => {
+    if (refName) {
+      try {
+        const v = readFileSync(join(dir, '.git', refName), 'utf8').trim();
+        if (/^[0-9a-f]{40,64}$/.test(v)) return v;
+      } catch { /* not loose — try packed-refs */ }
+      try {
+        for (const line of readFileSync(join(dir, '.git', 'packed-refs'), 'utf8').split('\n')) {
+          const [sha, name] = line.trim().split(' ');
+          if (name === refName && /^[0-9a-f]{40,64}$/.test(sha)) return sha;
+        }
+      } catch { /* no packed-refs */ }
+    }
+    const out = tryGit(dir, ['rev-parse', '--verify', '--quiet', `${branchRef}^{commit}`]);
+    return out ? out.trim() : null;
+  };
+}
+
 /** PURE: parse a salvage stamp (`20260926-2136` or `20260927-015411`) as UTC ms; `null` if unparsable. */
 export function parseSalvageStamp(stamp) {
   const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})?$/.exec(String(stamp || ''));
@@ -126,8 +166,13 @@ export function parseSalvageStamp(stamp) {
  * the lane still exists), its now-empty stamp dir, and the index row. `dryRun` reports without changing anything.
  * @returns {{landed:object[], expired:object[], bytesFreed:number, kept:number}}
  */
-export function refreshSalvageIndex({ root = resolveSalvageRoot(), branchRef = 'origin/main', nowMs = Date.now(), retentionDays = SALVAGE_RETENTION_DAYS, dryRun = false, repoDirFor = (e) => e.dir } = {}) {
+export function refreshSalvageIndex({ root = resolveSalvageRoot(), branchRef = 'origin/main', nowMs = Date.now(), retentionDays = SALVAGE_RETENTION_DAYS, dryRun = false, repoDirFor = (e) => e.dir, memo = resolveLandedMemoEnabled(), branchShaFor = branchShaReader(branchRef), isLanded = isSalvageLanded } = {}) {
   const landed = []; const expired = []; let bytesFreed = 0;
+  const shaByDir = new Map(); // one branch-tip read per lane dir per refresh, however many entries share it
+  const tipFor = (dir) => {
+    if (!shaByDir.has(dir)) { let sha = null; try { sha = branchShaFor(dir); } catch { sha = null; } shaByDir.set(dir, sha); }
+    return shaByDir.get(dir);
+  };
   const cutoff = nowMs - retentionDays * DAY_MS;
   const decide = (entries) => {
     const keep = [];
@@ -145,8 +190,14 @@ export function refreshSalvageIndex({ root = resolveSalvageRoot(), branchRef = '
         continue;
       }
       if (!e.landed) {
-        const ok = isSalvageLanded(e, { repoDir: repoDirFor(e), branchRef });
-        if (ok === true) { landed.push(e); e.landed = true; e.landedAt = new Date(nowMs).toISOString(); }
+        const repoDir = repoDirFor(e);
+        const branchSha = memo && repoDir && existsSync(repoDir) ? tipFor(repoDir) : null;
+        const key = branchSha ? landedCheckKey(e, branchSha) : null;
+        if (!(key && e.landedCheck === key)) {
+          const ok = isLanded(e, { repoDir, branchRef });
+          if (ok === true) { landed.push(e); e.landed = true; e.landedAt = new Date(nowMs).toISOString(); delete e.landedCheck; }
+          else if (key) e.landedCheck = key; // "not provably landed against THIS branch tip" — re-checked once it moves
+        }
       }
       keep.push(e);
     }
