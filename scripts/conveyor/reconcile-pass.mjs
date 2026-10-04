@@ -98,6 +98,15 @@ import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 import { latestCiHealEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { readLiveFixClaim } from './fix-procedure.mjs';
 import { enrichPrsWithReferralHolds } from './review-referral-hold.mjs';
+import { ignoredRulings } from '../lib/ruling-ledger.mjs';
+
+/** A confirmed finding the operator already ruled `block` on an earlier head that came back on this one (read off
+ *  the PR thread alone, so a daemon restart loses nothing). Never throws: an unreadable thread means no claim. */
+export function enrichPrsWithIgnoredRulings(prs) {
+  return prs.map((pr) => {
+    try { return { ...pr, ignoredRulings: ignoredRulings(pr) }; } catch { return { ...pr, ignoredRulings: null }; }
+  });
+}
 // #4263 — the SAME terminal-state classifier `pr-watch.mjs`'s own drain-lane watcher uses (merged/closed/
 // parked/pending), reused rather than re-invented so "has this PR landed" can never drift between the two
 // call sites. Aliased: this file never reconciles a PR's PHASE (that word means something else here — see
@@ -1095,6 +1104,7 @@ export function runReconcilePass({
   enrichFixClaims = enrichPrsWithFixClaims,
   enrichTimeouts = enrichPrsWithTimeoutEvidence,
   enrichReferralHolds = enrichPrsWithReferralHolds,
+  enrichRulings = enrichPrsWithIgnoredRulings,
   now = Date.now(), repo = null, defaultBranch = 'main',
   // #2748 false-red follow-up — injectable so a test can supply a fixture with no network, matching every
   // other reader in this file. Defaults to the live, cached branch-protection read.
@@ -1140,8 +1150,8 @@ export function runReconcilePass({
   // #4265 — attach each stacked PR's own base ref's current tip, purely locally, no `gh` cost.
   const baseRefPrs = enrichBaseRef(alreadyLandedPrs, { defaultBranch });
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
-  const prs = enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
-    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now });
+  const prs = enrichRulings(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
+    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }));
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
   const plan = planReconcile({

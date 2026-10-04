@@ -67,6 +67,7 @@
  * the tick.
  */
 import { withOperatorAnswer } from './stand-down-answer-core.mjs';
+import { fixerRulingBrief, renderRulingNotAddressed } from '../lib/ruling-ledger.mjs';
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
@@ -279,6 +280,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
         itemNum: null, pr, laneRef: headRefName, scope: itemlessScope, scopeSource: 'pr-diff',
         isConflict: isConflictItemless, body: entry.body ?? null, headRefOid: entry.headRefOid ?? null,
         ...(entry.operatorAnswer ? { operatorAnswer: entry.operatorAnswer } : {}),
+        ...(entry.rulingNotAddressed ? { rulingNotAddressed: entry.rulingNotAddressed } : {}),
         ...(entry.altBranch ? { altBranch: entry.altBranch } : {}), // fix procedure — a saved repair to recover first.
       });
       continue;
@@ -389,6 +391,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
       headRefOid: entry.headRefOid ?? null,
       // fix procedure — the saved alt branch of a concurrent-author pause this PR re-armed from, if any.
       ...(entry.operatorAnswer ? { operatorAnswer: entry.operatorAnswer } : {}),
+      ...(entry.rulingNotAddressed ? { rulingNotAddressed: entry.rulingNotAddressed } : {}),
       ...(entry.altBranch ? { altBranch: entry.altBranch } : {}),
     });
   }
@@ -808,6 +811,23 @@ export function tryResumeFix(planned, {
 }
 
 /**
+ * Put the ruling-not-addressed brief in front of the fixer's prompt (the send-back's whole ask), or leave the prompt
+ * alone. The same text is the durable PR comment {@link postRulingNotice} writes.
+ */
+export function withRulingNotAddressed(prompt, ruling) {
+  return ruling?.matches?.length ? `${fixerRulingBrief(ruling)}${prompt}` : prompt;
+}
+
+/** Post the send-back notice once per head (the durable record, and what the fixer reads on the thread). */
+export function postRulingNotice({ repo, pr, ruling, exec = execFileSyncThrottled }) {
+  // `ruling.sentBack` is read off the thread by the planner: a notice for this head already exists.
+  if (!ruling?.matches?.length || ruling.sentBack) return false;
+  exec('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body', renderRulingNotAddressed(ruling)],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
+  return true;
+}
+
+/**
  * we:scripts/conveyor/reconcile-fix-dispatch.mjs#dispatchFix — DISPATCH ONE FRESH FIX AGENT for one planned
  * entry that either isn't a conflict-caused resume candidate, or whose {@link tryResumeFix} attempt did not
  * resume. Mirrors `we:scripts/operations/review-dispatch.mjs#dispatchReview`'s own composition (plan → fill →
@@ -885,6 +905,8 @@ export function dispatchFix(planned, {
   isolateSession = isolateDispatchSession,
   // fix procedure — injectable live fix-claim read (`fix-procedure.mjs#readLiveFixClaim`); a test stubs it.
   readFixClaim = ({ repo: r, pr }) => readLiveFixClaim({ repo: r, pr, ...(claimRoot ? { lockRoot: claimRoot } : {}) }),
+  // The ruling-not-addressed send-back's durable notice (once per head). Injectable so a test posts nothing.
+  postNotice = postRulingNotice,
 } = {}) {
   // #x33jgwt multi-repo slice 5 — no repo gate HERE any more (see {@link tryResumeFix}'s own docblock for why):
   // `runReconcileFixDispatch` already refused a repo whose profile lacks the `fix` capability before this ever
@@ -934,6 +956,9 @@ export function dispatchFix(planned, {
       SCOPE: planned.scope.join(','),
       ...tokens,
     }, BRIEF_REQUIRED_BY_KIND.fix, optionalNames, REPO_AWARE_VALUE_PATTERNS);
+    // The durable notice FIRST: a fixer that reads the thread must find the ruling there. A failed post throws, the
+    // claim is released below, and the next tick retries; nothing has been spawned.
+    postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
     const sessionId = String(mintSessionId());
     // #4174 — THE FIX: this session's cwd is a scratch directory outside `root`, never `root` itself (see
     // `dispatchSessionCwd`'s own header at the io shell for why — the identical bug `createDispatchSinks` had).
@@ -941,7 +966,7 @@ export function dispatchFix(planned, {
     const argv = buildAgentArgv({
       sessionId,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
-      payload: { prompt: withAltBranchHint(withSalvageHint(withOperatorAnswer(prompt, planned.operatorAnswer), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), sessionSlug, launchKind: 'fix' },
+      payload: { prompt: withAltBranchHint(withSalvageHint(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), sessionSlug, launchKind: 'fix' },
       // #3606 — see this function's own docblock: without this the fix agent reads a correctly-filled brief as an
       // unfilled template and self-aborts (3/3 live).
       systemPromptFile: DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,

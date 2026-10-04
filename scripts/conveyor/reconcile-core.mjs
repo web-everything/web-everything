@@ -103,6 +103,7 @@
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
+import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
 import { reduceCheckState } from '../operations/pr-status.mjs';
@@ -1911,6 +1912,39 @@ export function planReconcile({
           why: `a required check is failing, nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`,
         });
       }
+      continue;
+    }
+
+    // ── RULING NOT ADDRESSED — ahead of the advisory-fix branch and of every review emission. A confirmed finding
+    // the operator already ruled `block` on an EARLIER head has come back on this one: the fixer's push did not
+    // satisfy the ruling (live 2026-10-04, PR #3794: card xcs4nce, policy pointer files). Parking it again only
+    // waits for the same human to repeat themselves, so it goes straight back to a fixer with the original ruling
+    // attached. Once per head: a head that was already sent back and is still here (the fixer returned without a
+    // new head), or a SECOND miss after the ruling, is a fixer-versus-reviewer disagreement and goes to the
+    // operator as a needs-you note (an arbiter comes later) instead of a third round.
+    if (phase === 'needs-human' && pr?.ignoredRulings?.matches?.length) {
+      const ig = pr.ignoredRulings;
+      const files = ig.matches.map((m) => m.finding.file ?? '(no file)');
+      // "Sent back" only counts once a fixer actually ran after the notice (its end marker or advisory-fix mark
+      // postdates it); a spawn that failed before starting leaves a notice but no fixer, and is simply retried.
+      const fixerReturned = ig.sentBackAt != null && (Array.isArray(pr?.comments) ? pr.comments : []).some((c) => isTrustedMarkerAuthor(c)
+        && [FIX_END_MARKER, ADVISORY_FIX_COMMENT_MARKER].some((m) => String(c?.body ?? '').trimStart().startsWith(m))
+        && (Date.parse(c?.createdAt) || 0) > ig.sentBackAt);
+      if (ig.escalate || fixerReturned) {
+        refuse('ruling-dispute', {
+          ...withPhase, rulingNotAddressed: ig,
+          why: `${ig.matches.length} confirmed finding(s) the operator ruled block came back after ${ig.misses} miss(es)`
+            + `${fixerReturned && !ig.escalate ? ' and the send-back produced no new head' : ''} — fixer versus reviewer disagreement, needs the operator`,
+        });
+        notes.push({ kind: 'ruling-dispute', prNumber, head: ig.head, misses: ig.misses, files, text: rulingDisputeText(prNumber, { ...ig, sentBack: fixerReturned }) });
+        continue;
+      }
+      dispatch.push({
+        ...base, ...withPhase, kind: 'fix', mode: 'ruling-not-addressed', findings: ig.matches.length,
+        rulingNotAddressed: ig,
+        why: `${ig.matches.length} confirmed finding(s) the operator already ruled block came back on a new head`
+          + ` (${files.join(', ')}) — the last fix did not satisfy the ruling; sent straight back to the fixer with it attached`,
+      });
       continue;
     }
 

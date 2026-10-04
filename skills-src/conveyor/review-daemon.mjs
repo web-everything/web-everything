@@ -857,6 +857,7 @@ export function buildCliDaemonEffects({
       for (const h of (result.holdReconcile ?? [])) {
         if (h.remove?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile removed ${h.remove.join(',')}${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.healed?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile HEALED — removed ${h.healed.join(',')}${h.commentPosted ? ', comment posted' : ''}${h.error ? ` (FAILED: ${h.error})` : ''}`);
+        if (h.ruling) log.error(`review-daemon: ${h.repo}#${h.num} ruling-needed label ${h.ruling}${h.error ? ` (FAILED: ${h.error})` : ''}`);
         if (h.flagged?.length) log.error(`review-daemon: ${h.repo}#${h.num} hold-reconcile FLAGGED contradictory ${h.flagged.join(',')} — not auto-resolved (${h.flagReason || 'unresolved'}${h.fetchError ? `, fetch error: ${h.fetchError}` : ''})`);
       }
       for (const hf of (result.holdReconcileFailed ?? [])) log.error(`review-daemon: ${hf.repo} hold-reconcile failed (non-fatal, other repos unaffected): ${hf.error}`);
