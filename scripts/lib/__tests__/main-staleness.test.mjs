@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
   classifyStaleness, checkMainStaleness, assertMainNotStale, staleRemedy, isCodePath,
-  isStaleMainRefusalMessage, STALE_MAIN_REFUSAL_MARKER,
+  isStaleMainRefusalMessage, STALE_MAIN_REFUSAL_MARKER, behindFiles, codeDirty,
 } from '../main-staleness.mjs';
 
 describe('classifyStaleness', () => {
@@ -287,6 +287,91 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
       expect(() => assertMainNotStale('/repo', warn, { dispatchPath: () => false, listBehindFiles: () => ['x.mjs'] }))
         .toThrow(/DIVERGED/);
     });
+  });
+  // Live 2026-10-04 (PRs #3923/#3924): a daemon clone is main + overlay MERGES, so it has several merge bases
+  // with origin/main and `git diff HEAD...origin/main` picked the plain-main one — counting a file an overlay
+  // already brought in (and that later landed on main) as behind, and refusing for code the clone already runs.
+  function makeOverlayClone() {
+    dir = mkdtempSync(join(tmpdir(), 'main-staleness-overlay-'));
+    git(dir, 'init', '-q', '--bare', '-b', 'main', 'origin.git');
+    git(dir, 'clone', '-q', 'origin.git', 'upstream');
+    const up = join(dir, 'upstream');
+    commit(up, 'a.txt', 'one\n');
+    git(up, 'push', '-q', 'origin', 'main');
+    git(up, 'checkout', '-q', '-b', 'lane/overlay');
+    commit(up, 'review.mjs', 'overlay\n');
+    git(up, 'push', '-q', 'origin', 'lane/overlay');
+    git(up, 'checkout', '-q', 'main');
+    commit(up, 'base.txt', 'two\n');
+    git(up, 'push', '-q', 'origin', 'main');
+    const clonePath = join(dir, 'clone');
+    git(dir, 'clone', '-q', '-b', 'main', 'origin.git', 'clone');
+    git(clonePath, 'fetch', '-q', 'origin', 'lane/overlay');
+    git(clonePath, '-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '-q', '--no-ff', '-m', 'overlay', 'origin/lane/overlay');
+    // main moves on: the overlay lands (a merge), then an unrelated code commit
+    git(up, '-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '-q', '--no-ff', '-m', 'land overlay', 'lane/overlay');
+    commit(up, 'unrelated.mjs', 'x\n');
+    git(up, 'push', '-q', 'origin', 'main');
+    git(clonePath, 'fetch', '-q', 'origin');
+    return clonePath;
+  }
+  it('behindFiles lists only the MISSING commits\' files — never an overlay file the clone already has', () => {
+    const clonePath = makeOverlayClone();
+    expect(behindFiles(clonePath, 'main', undefined, {}).sort()).toEqual(['unrelated.mjs']);
+    // the knob restores the old merge-base diff (which over-reports the overlay's review.mjs)
+    expect(behindFiles(clonePath, 'main', undefined, { WE_STALE_GUARD_MISSING_COMMITS: '0' })).toContain('review.mjs');
+  });
+  it('managed clone behind only in files an overlay already brought in (plus off-path code) dispatches', () => {
+    const clonePath = makeOverlayClone();
+    const logs = [];
+    const st = withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, {
+      label: 'test', dispatchPath: (p) => p === 'review.mjs', write: (s) => logs.push(s),
+      lastGood: () => null, rebuildGrace: () => ({ grace: false }),
+    }));
+    expect(st).toMatchObject({ fresh: true, behindOffDispatchPath: true, toleratedFiles: ['unrelated.mjs'] });
+  });
+  // The bounded rebuild-in-progress grace: on-path lag while the clone's own rebuild runs still dispatches.
+  it('rebuild grace: on-path lag dispatches only while a rebuild is in progress; unknown diff still refuses', () => {
+    const warn = () => ({ action: 'warn', reason: 'not-auto-syncing', behind: 9, ahead: 0, dirty: false });
+    const logs = [];
+    const opts = {
+      label: 'test', dispatchPath: (p) => p === 'review.mjs', write: (s) => logs.push(s), lastGood: () => null,
+      listBehindFiles: () => ['review.mjs', 'backlog/x.md'],
+    };
+    withManagedCloneEnv('1', () => {
+      const building = () => ({ grace: true, reason: 'rebuild-in-progress', target: 'a'.repeat(40), sinceAdoptMs: 600_000 });
+      expect(assertMainNotStale('/repo', warn, { ...opts, rebuildGrace: building }))
+        .toMatchObject({ fresh: true, rebuildGrace: true, onPathFiles: ['review.mjs'] });
+      expect(logs.join('')).toMatch(/ON this dispatch's code path \(review\.mjs\).*rebuild to aaaaaaaaaaaa is in progress/);
+      expect(() => assertMainNotStale('/repo', warn, { ...opts, rebuildGrace: () => ({ grace: false, reason: 'grace-expired' }) }))
+        .toThrow(/STALE/);
+      expect(() => assertMainNotStale('/repo', warn, { ...opts, rebuildGrace: () => { throw new Error('x'); } })).toThrow(/STALE/);
+      expect(() => assertMainNotStale('/repo', warn, { ...opts, listBehindFiles: () => null, rebuildGrace: building })).toThrow(/STALE/);
+      // a caller with no dispatch path never gets the grace
+      expect(() => assertMainNotStale('/repo', warn, { ...opts, dispatchPath: null, rebuildGrace: building })).toThrow(/STALE/);
+    });
+  });
+  it('codeDirty: untracked non-code files do not count; a tracked change or untracked code does', () => {
+    const run = (out, status = 0) => () => ({ status, stdout: out });
+    expect(codeDirty('/r', run('?? backlog/x1.md\n?? backlog/x2.md\n'))).toBe(false);
+    expect(codeDirty('/r', run('?? backlog/x1.md\n?? scripts/new.mjs\n'))).toBe(true);
+    expect(codeDirty('/r', run(' M backlog/x1.md\n'))).toBe(true);
+    expect(codeDirty('/r', run('', 128))).toBe(true);
+  });
+  it('last-good fallback ignores untracked non-code files (live 2026-10-04: review cards left in the clone)', () => {
+    const warn = () => ({ action: 'warn', reason: 'not-auto-syncing', behind: 9, ahead: 0, dirty: true });
+    const seen = [];
+    const opts = {
+      label: 'test', write: () => {}, listBehindFiles: () => ['review.mjs'], dispatchPath: (p) => p === 'review.mjs',
+      rebuildGrace: () => ({ grace: false }),
+      lastGood: (_r, dirty) => { seen.push(dirty); return dirty ? { onLastGood: false } : { onLastGood: true, lastGood: 'a'.repeat(40) }; },
+    };
+    withManagedCloneEnv('1', () => {
+      expect(assertMainNotStale('/repo', warn, { ...opts, treeDirtyForCode: () => false })).toMatchObject({ fresh: true, onLastGood: true });
+      expect(() => assertMainNotStale('/repo', warn, { ...opts, treeDirtyForCode: () => true })).toThrow(/STALE/);
+      expect(() => assertMainNotStale('/repo', warn, { ...opts, treeDirtyForCode: () => { throw new Error('x'); } })).toThrow(/STALE/);
+    });
+    expect(seen).toEqual([false, true, true]);
   });
   it('isCodePath: modules and JSON are code; markdown and tests are not', () => {
     expect(['a.mjs', 'x/y.js', 'c.cjs', 'd.ts', 'src/_data/x.json', 'package-lock.json'].every(isCodePath)).toBe(true);
