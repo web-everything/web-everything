@@ -4343,8 +4343,9 @@ while back". The protected list and using the same judge as xne1udi's arbiter: "
    trust-chain roster in `we:scripts/lib/gate-config.mjs` is the floor of this class); **(b)** credentials
    and secrets; **(c)** anything that weakens a security check; **(d)** the rules layer and every other
    ratification surface — this statute and its future per-ruling files, and any file that records a ruling
-   (added by the operator's ruling of 2026-10-04, relayed via claude-code-chat: "send back to fix (block)":
-   "add a protected class for the rules layer and other ratification surfaces … A PR touching them is never
+   (added by the operator's ruling of 2026-10-04, relayed via claude-code-chat, verbatim: "add a protected
+   class for the rules layer and other ratification surfaces, such as `docs/agent/platform-decisions.md` (and
+   its future per-ruling files) and any file that records a ruling. A PR touching them is never
    judge-clearable and always needs the human ceremony"). The list is checked deterministically
    where a path or pattern decides it, and the judge itself must refuse when its own reading finds (c).
    Any doubt resolves to "protected". Widening the judge's reach into the list is a new ruling, not an

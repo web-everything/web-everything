@@ -4,7 +4,7 @@ size: 3
 parent: "xaojq81"
 status: open
 blockedBy: ["xq3kn88"]
-scope: ["we:scripts/lib/verdict-ledger.mjs", "we:scripts/conveyor/judge-digest.mjs", "we:scripts/operations/judge-clear.mjs", "we:scripts/lib/__tests__/verdict-ledger.test.mjs", "we:scripts/conveyor/__tests__/judge-digest.test.mjs"]
+scope: ["we:scripts/lib/verdict-ledger.mjs", "we:scripts/conveyor/judge-digest.mjs", "we:scripts/operations/judge-clear.mjs", "we:scripts/operations/__tests__/judge-clear.test.mjs", "we:scripts/lib/__tests__/verdict-ledger.test.mjs", "we:scripts/conveyor/__tests__/judge-digest.test.mjs"]
 dateOpened: "2026-10-03"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "e1f0523e0881357fc863f3e88da72e0164eb7091"
@@ -27,6 +27,7 @@ Builds rule 4 of `we:docs/agent/platform-decisions.md#independent-judge-clears-r
 **Digest** `we:scripts/conveyor/judge-digest.mjs [--since=<ISO>] [--dry-run]`:
 
 - Reads the ledger (`verdictLedgerPath(repo)`) for records with a `judge` block in the last 24 hours (America/New_York day boundary by default, the operator's timezone).
+- **A clear whose swap failed is not counted.** `xq3kn88` appends an `observed` row with reason `swap-failed` for the same PR and head when the label swap failed after the clear row was written; the digest nets those out (a clear row with a later `swap-failed` row for the same PR and head is listed as "cleared but the label swap failed", not as a clear). 
 - Renders one short message: count of clears and declines; one line per PR (number, title, author provider, judge model, one-sentence reasoning, link); and a line if the kill switch was off or a wait was set during the window (read from the switch store's `at`). The digest must work while the judge is switched off (the conveyor pass sends it on those days too, see `xfetp9j`): it reads the switch state itself, and when the judge is OFF it puts "judge OFF since <time> (<reason>)" first, or "judge OFF: switch store unreadable (<parse error>)" when the store failed to parse. It reads only the ledger and the switch store, never the judge or a PR, so an off judge cannot stop it.
 - Delivers through the existing operator notification path (`notifyDesktopChecked` in `we:scripts/operations/operator-notify-io.mjs`, the same channel the NEEDS-YOU pass in `we:scripts/operations/operator-notify-cli.mjs` uses), as one notification whose body points at the full digest text written beside the ledger; a delivery failure is printed, never swallowed. `--dry-run` prints only. Idempotent per day: a marker records the last digest day, so a second run on the same day sends nothing.
 - Zero judge records in the window → still one line ("no judge clearances today"), so silence never looks like breakage.
@@ -55,6 +56,7 @@ Extend `we:scripts/lib/__tests__/verdict-ledger.test.mjs` (matching source: `we:
 New `we:scripts/conveyor/__tests__/judge-digest.test.mjs` (matching source: `we:scripts/conveyor/judge-digest.mjs`):
 
 - Three judge clears and one decline in the window, one clear outside it → the digest lists exactly the four in-window records. Red today: the digest does not exist.
+- A clear row followed by a `swap-failed` row for the same PR and head → listed as "cleared but the label swap failed", not counted as a clear. Red today: the digest does not exist.
 - A second run on the same day sends nothing; the next day sends again. Red today: the digest does not exist.
 - Empty window → the "none today" line. Red today: the digest does not exist.
 - A malformed JSONL line is skipped and reported as "1 unreadable record". Red today: the digest does not exist.
