@@ -122,7 +122,10 @@ import { withWriteLock } from './daemon-clone-lock.mjs';
 import {
   cloneKey, overlayFilePath, readOverlayState, removeOverlay, appendOverlayEvent,
 } from './daemon-overlays.mjs';
-import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
+import {
+  runLiveSmokeWithRetry, isEnvTimeoutRow, TRANSIENT_FAILURE_PATTERNS,
+  SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS_ENV, DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS,
+} from './daemon-live-smoke.mjs';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { daemonStateDir, daemonConveyorStateRoot } from './daemon-last-good.mjs';
@@ -1053,6 +1056,52 @@ export function rejectRetryDelayMs(env, attempts) {
   return Math.min(base * 2 ** Math.max(0, attempts - 1), max);
 }
 
+// ── LOAD-shaped smoke failures: blamed on an overlay only through a same-run differential (live 2026-10-04) ──
+// wev-control, 16:02Z and 16:26Z: candidate A (main + PR #3903) failed `lane-acquire-release` with lane-pool's own
+// "(lock contention)" refusal and `dispatch-dry-run` with "timed out after 45000ms". Plain main, smoked minutes
+// later once the contention had cleared, passed — so the healthy overlay was dropped, twice. Plain main fails the
+// same checks under the same load. A failure whose every row is load-shaped (ran out of time on the gate's own
+// clock, another caller's lock, or external transient noise) is therefore NOT evidence against an overlay by
+// itself: after plain main passes, A is smoked AGAIN in the same run. A passes ⇒ adopt A (overlay kept). A
+// reproduces a CODE-shaped failure on a check it failed before ⇒ genuine, drop as before. Anything else ⇒
+// environment (`smoke-env-load`): never drop, retry A with backoff. No laundering: an env-load verdict never
+// ADOPTS A — only a clean A pass does.
+
+/** Knob: `0` turns the load differential off (back to one plain-main comparison). Default on. */
+export const SMOKE_LOAD_DIFFERENTIAL_ENV = 'WE_DAEMON_SMOKE_LOAD_DIFFERENTIAL';
+/** Knobs: backoff before an env-load-held candidate is re-smoked — base * 2^(attempts-1), capped. */
+export const ENV_LOAD_RETRY_BASE_ENV = 'WE_DAEMON_ENV_LOAD_RETRY_BASE_MS';
+export const ENV_LOAD_RETRY_MAX_ENV = 'WE_DAEMON_ENV_LOAD_RETRY_MAX_MS';
+export const DEFAULT_ENV_LOAD_RETRY_BASE_MS = 5 * 60_000;
+export const DEFAULT_ENV_LOAD_RETRY_MAX_MS = 60 * 60_000;
+/** Another caller's lane-pool lock, never the tree under test. */
+export const LOAD_CONTENTION_SIGNATURES = Object.freeze([
+  /\(lock contention\)/,
+  /gave up waiting for the shared acquirability-scan lock/,
+]);
+
+export function loadDifferentialEnabled(env) {
+  return String(env?.[SMOKE_LOAD_DIFFERENTIAL_ENV] ?? '').trim() !== '0';
+}
+
+export function envLoadRetryDelayMs(env, attempts) {
+  const base = Number(env?.[ENV_LOAD_RETRY_BASE_ENV]) > 0 ? Number(env[ENV_LOAD_RETRY_BASE_ENV]) : DEFAULT_ENV_LOAD_RETRY_BASE_MS;
+  const max = Number(env?.[ENV_LOAD_RETRY_MAX_ENV]) > 0 ? Number(env[ENV_LOAD_RETRY_MAX_ENV]) : DEFAULT_ENV_LOAD_RETRY_MAX_MS;
+  return Math.min(base * 2 ** Math.max(0, attempts - 1), max);
+}
+
+/** PURE: is this failed smoke row explained by host load (time-out on the gate's clock, lock contention, or
+ *  external transient noise from a check allowed to be transient)? */
+export function isLoadShapedRow(row, env = {}) {
+  if (!row || row.ok) return false;
+  const minElapsedMs = Number(env?.[SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS_ENV]) > 0
+    ? Number(env[SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS_ENV]) : DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS;
+  if (isEnvTimeoutRow(row, { minElapsedMs })) return true;
+  const detail = String(row.detail ?? '');
+  if (LOAD_CONTENTION_SIGNATURES.some((re) => re.test(detail))) return true;
+  return row.mayBeTransient !== false && TRANSIENT_FAILURE_PATTERNS.some((re) => re.test(detail));
+}
+
 /** A failed check's detail, safe for the alerts log: tokens redacted, one bounded line. */
 function redactDetail(detail) {
   return String(detail ?? '').replace(/\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g, '$1<redacted>').slice(0, 500);
@@ -1921,6 +1970,9 @@ export function failsSameChecks(candidateFailed, controlFailed) {
  *   (a) PLAIN MAIN: when A carries any NON-pinned overlay, build B = main + pinned overlays only and smoke it. B
  *       passes ⇒ adopt B and DROP A's non-pinned overlays from the list (they are what broke it — every one is
  *       reported, `overlay-dropped-smoke-failed`; with several, all are dropped as suspects, never bisected).
+ *       When EVERY A failure is load-shaped ({@link isLoadShapedRow}), B is a full smoke and a B pass re-smokes A
+ *       in the same run: A passes ⇒ adopt A; A reproduces a code-shaped failure ⇒ drop as above; otherwise
+ *       `smoke-env-load` — adopt B (or hold when B failed too), keep every overlay, retry A with backoff.
  *   (b) otherwise the clone STAYS on its last-good build (`prevHead`, never touched) and `state.held` records
  *       why; `main-staleness.mjs#assertMainNotStale` keeps dispatching from that build (max-age alert, never a
  *       refusal), and the health watch's `daemon-held-on-last-good` sign notifies after 15 min.
@@ -2160,6 +2212,29 @@ async function smokeAndAdopt({
   }));
   const suspects = withPin.filter((ap) => !ap.pinned);
   let bFailed = null;
+  // See LOAD_CONTENTION_SIGNATURES' header: every A row load-shaped ⇒ the same-run differential decides.
+  const loadOnly = loadDifferentialEnabled(env) && failedA.length > 0 && failedA.every((r) => isLoadShapedRow(r, env));
+  const envLoadRecord = (st) => {
+    const prev = st.rejected?.envLoad && st.rejected?.inputsKey === plan.inputsKey ? st.rejected
+      : (priorRejected?.envLoad && priorRejected?.inputsKey === plan.inputsKey ? priorRejected : null);
+    const attempts = (prev?.attempts || 0) + 1;
+    st.rejected = {
+      inputsKey: plan.inputsKey,
+      reason: failedA.map((r) => r.name).join(','),
+      at: nowIso(),
+      envLoad: true,
+      attempts,
+      retryAt: new Date(now() + envLoadRetryDelayMs(env, attempts)).toISOString(),
+    };
+    return st.rejected;
+  };
+  const envLoadAlert = (extra) => alert('smoke-env-load', {
+    failed: failedA.map((r) => r.name).join(','),
+    details: failedA.map((r) => ({ name: r.name, ms: r.ms, detail: redactDetail(r.detail) })),
+    suspects: suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr })),
+    ...extra,
+    message: 'every failed check is load-shaped (timeout / lock contention) and no same-run differential pinned it on an overlay — environment, not the candidate; overlays kept, retrying with backoff',
+  });
   if (!mainOnly && suspects.length > 0) {
     const pinnedOverlays = withPin.filter((ap) => ap.pinned).map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr }));
     const planB = await planRebuild({
@@ -2182,12 +2257,41 @@ async function smokeAndAdopt({
       };
       // Plain main IS the build already running (an overlay was just added onto an otherwise-current clone) and
       // that build is the smoke-verified one: nothing to smoke, just drop the suspect(s).
-      if (planB.finalSha === prevHead && adoptedHead === prevHead) {
+      // A load-shaped failure never takes this shortcut: an earlier pass is not a SAME-RUN differential.
+      if (!loadOnly && planB.finalSha === prevHead && adoptedHead === prevHead) {
         const fin = await finalize(planB, dropSuspects, fallbackReady);
         return { ...fin, reason: 'fallback-plain-main', fallback: { from: plan.finalSha, to: planB.finalSha, dropped: suspectInfo } };
       }
-      const b = await smokeSha(planB.finalSha, changedSince(planB.finalSha), 'plain-main');
-      if (!b.worktreeFailed && !b.threw && b.smokeResult?.verdict === 'pass') {
+      const b = await smokeSha(planB.finalSha, loadOnly ? null : changedSince(planB.finalSha), 'plain-main');
+      const bPassed = !b.worktreeFailed && !b.threw && b.smokeResult?.verdict === 'pass';
+      if (bPassed && loadOnly) {
+        // Same-run differential, second half: re-smoke A now that plain main passed.
+        const a2 = await smokeSha(plan.finalSha, null, 'confirm');
+        if (!a2.worktreeFailed && !a2.threw && a2.smokeResult?.verdict === 'pass') {
+          alert('smoke-load-confirm-passed', {
+            failed: failedNames, suspects: suspectInfo,
+            message: 'A failed under load, plain main passed, A re-smoked passed — load, not the overlay; adopting A with every overlay kept',
+          });
+          const fin = await finalize(plan, undefined, undefined, a2.smokeResult);
+          return { ...fin, reason: fin.adopted ? 'smoke-load-confirm-passed' : fin.reason };
+        }
+        const failedA2 = a2.smokeResult ? failedRows(a2.smokeResult) : [];
+        const failedNamesA = new Set(failedA.map((r) => r.name));
+        const reproduced = failedA2.some((r) => failedNamesA.has(r.name) && !isLoadShapedRow(r, env));
+        if (!reproduced) {
+          envLoadAlert({ plainMain: 'passed', confirm: failedA2.map((r) => r.name).join(',') || (a2.worktreeFailed ? `worktree: ${a2.worktreeFailed}` : 'threw') });
+          // Plain main passed: adopt it so the clone stays current, keep every overlay, back A off.
+          const recordBackoff = () => {
+            const st = readRebuildState(root, stEnv);
+            envLoadRecord(st);
+            writeRebuildState(root, st, stEnv);
+          };
+          const fin = await finalize(planB, recordBackoff, { kind: 'candidate' }, b.smokeResult);
+          return { ...fin, reason: fin.adopted ? 'smoke-env-load' : fin.reason };
+        }
+        // A reproduced a code-shaped failure on a check it already failed, while plain main passed: genuine.
+      }
+      if (bPassed) {
         const fin = await finalize(planB, dropSuspects, fallbackReady, b.smokeResult);
         return { ...fin, reason: 'fallback-plain-main', fallback: { from: plan.finalSha, to: planB.finalSha, dropped: suspectInfo } };
       }
@@ -2195,6 +2299,13 @@ async function smokeAndAdopt({
       alert('fallback-plain-main-failed', {
         failed: (bFailed || []).map((r) => r.name).join(',') || (b.worktreeFailed ? `worktree: ${b.worktreeFailed}` : 'threw'),
       });
+      if (loadOnly) {
+        // Plain main failed too, under the same load: environment. No last-good control (it would fail the same
+        // way and read as a broken harness), no drop — hold and retry A with backoff.
+        envLoadAlert({ plainMain: (bFailed || []).map((r) => r.name).join(',') || 'unavailable' });
+        await hold('smoke-env-load', failedA, {}, (st) => { envLoadRecord(st); });
+        return { moved: false, reason: 'smoke-env-load', plan, alerts: [...prepAlerts, ...alertsList] };
+      }
     } else {
       alert('fallback-plain-main-unplannable', { reason: planB.reason });
     }
