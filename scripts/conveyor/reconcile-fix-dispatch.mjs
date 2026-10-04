@@ -269,7 +269,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
         // This tick still can't dispatch (no fence either way), but it is reported distinctly so a reader (and
         // the next tick's fresh read) can tell the two apart.
         refusals.push(diffReadPermanent
-          ? { pr, kind: 'scope-too-large', why: `PR #${pr} changes too many files for \`gh pr diff\` (HTTP 406) and the paginated file-list fallbacks failed too — a permanent condition, not retried as transient` }
+          ? { pr, kind: 'scope-too-large', why: `PR #${pr} changes too many files for the PR diff read (HTTP 406) and the paginated file-list fallbacks failed too — a permanent condition, not retried as transient` }
           : diffReadFailed
           ? { pr, kind: 'scope-read-failed', why: `PR #${pr} names no backlog item, and the changed-file diff read failed (transient \`gh\` error) — retrying next pass rather than treating this as no files` }
           : { pr, kind: 'no-scope', why: `PR #${pr} names no backlog item, and its own changed-file diff found nothing to fence with either — refusing to dispatch a fix agent with no fence` });
@@ -368,7 +368,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
     if (!scope.length) {
       // #x9fbg1x-live-incident — a read that FAILED must retry later, never be read as a durable "no files".
       refusals.push(diffReadPermanent
-        ? { pr, kind: 'scope-too-large', why: `PR #${pr} changes too many files for \`gh pr diff\` (HTTP 406) and the paginated file-list fallbacks failed too — a permanent condition, not retried as transient` }
+        ? { pr, kind: 'scope-too-large', why: `PR #${pr} changes too many files for the PR diff read (HTTP 406) and the paginated file-list fallbacks failed too — a permanent condition, not retried as transient` }
         : diffReadFailed
         ? { pr, kind: 'scope-read-failed', why: `item #${itemNum} (PR #${pr}) has no declared scope, and the changed-file fallback read failed (transient \`gh\` error) — retrying next pass rather than treating this as no files` }
         : { pr, kind: 'no-scope', why: `item #${itemNum} (PR #${pr}) has no declared scope, and the PR's own changed-file fallback found nothing to fence with either — refusing to dispatch a fix agent with no fence` });
@@ -382,7 +382,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
     const changedPaths = fetchDiffPathsForEntry(pr);
     if (diffReadFailed) {
       refusals.push(diffReadPermanent
-        ? { pr, kind: 'scope-too-large', why: `PR #${pr} changes too many files for \`gh pr diff\` (HTTP 406) and the paginated file-list fallbacks failed too — a permanent condition, not retried as transient` }
+        ? { pr, kind: 'scope-too-large', why: `PR #${pr} changes too many files for the PR diff read (HTTP 406) and the paginated file-list fallbacks failed too — a permanent condition, not retried as transient` }
         : { pr, kind: 'scope-read-failed', why: `PR #${pr} changed-file read failed — retrying next pass` });
       continue;
     }
