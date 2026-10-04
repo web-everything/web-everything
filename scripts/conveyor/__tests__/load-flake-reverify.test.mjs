@@ -83,3 +83,24 @@ describe('quiet-host reverify', () => {
     expect(run.mock.calls[1][1]).toContain('--session=owner');
   });
 });
+
+import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
+import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
+describe('superseded legacy holds and moved heads (PR #3945 review)', () => {
+  const legacy = { ...comment(loadFlakeLegacyBody), id: 'IC_legacy_hold' };
+  const answer = { id: 'IC_answer', author: { login: 'web-everything' }, createdAt: '2026-10-04T21:00:00Z',
+    body: buildOperatorAnswer({ standDownId: 'IC_legacy_hold', reason: 'handled by hand', actor: 'chalbert', channel: 'test' }) };
+  it('an answered legacy hold on an advanced head is never a candidate', () => {
+    const pr = { number: 3881, headRefOid: 'advanced', comments: [legacy, answer] };
+    expect(planLoadFlakeReverify({ prs: [pr], load: [1, 1], cores: 12, now })).toEqual({ deferred: 'no-candidate' });
+    expect(planLoadFlakeReverify({ prs: [{ ...pr, comments: [legacy] }], load: [1, 1], cores: 12, now }).candidate).toBeTruthy();
+  });
+  it('a hold whose saved alt is no longer a descendant is ended, not retried forever', async () => {
+    const { io, pr } = fixture(); io.isAncestor.mockReturnValue(false);
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'non-ancestor' });
+    expect(io.comment.mock.calls[0][2]).toContain('result=head-moved');
+    const ended = { ...pr, comments: [...pr.comments, comment(io.comment.mock.calls[0][2], '2026-10-04T22:00:01Z')] };
+    expect(planLoadFlakeReverify({ prs: [ended], load: [1, 1], cores: 12, now })).toEqual({ deferred: 'no-candidate' });
+    expect(io.acquire).not.toHaveBeenCalled();
+  });
+});

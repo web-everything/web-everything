@@ -203,11 +203,21 @@ function loadTrailer(body, name) {
   return Object.fromEntries([...(match?.[1] ?? '').matchAll(/([a-z-]+)=(\S+)/g)].map((m) => [m[1], m[2]]));
 }
 
-export function loadFlakeHolds(comments) {
-  return (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor).flatMap((c) => {
+/**
+ * A legacy hold was a terminal stand-down before it was reclassified, so it must also end the way a stand-down ends
+ * (PR #3945 review). `isSuperseded(comments, index)` decides that; the default knows only the watcher's own
+ * supersede, because this file must stay import-light (the operator queue stages it alone). Production callers use
+ * `load-flake-hold.mjs`, which adds the advisory and operator-answer rules.
+ */
+export function loadFlakeHolds(comments, isSuperseded = isStandDownSuperseded) {
+  const all = Array.isArray(comments) ? comments : [];
+  return all.flatMap((c, i) => {
+    if (!isTrustedMarkerAuthor(c)) return [];
     const body = c?.body ?? '';
     const createdAt = c.createdAt ?? null;
-    if (isLoadFlakeStandDown(c)) return [{ createdAt, head: null, alt: parseAltBranch(body), legacy: true }];
+    if (isLoadFlakeStandDown(c)) {
+      return isSuperseded(all, i) ? [] : [{ createdAt, head: null, alt: parseAltBranch(body), legacy: true }];
+    }
     if (!body.trimStart().startsWith(LOAD_FLAKE_HOLD_MARKER)) return [];
     const t = loadTrailer(body, 'load-flake-hold');
     return t.alt && t['alt-sha'] && t.outcome === 'blocked-on-load-flake'
@@ -224,8 +234,8 @@ export function loadFlakeResults(comments) {
   }).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
 }
 
-export function loadFlakeHoldState({ comments, headRefOid = null, now = 0 }) {
-  const hold = loadFlakeHolds(comments).at(-1);
+export function loadFlakeHoldState({ comments, headRefOid = null, now = 0, isSuperseded }) {
+  const hold = loadFlakeHolds(comments, isSuperseded).at(-1);
   if (!hold) return { live: false, hold: null };
   const results = loadFlakeResults(comments).filter((r) => r.sha === hold.alt.sha
     && Date.parse(r.createdAt) >= Date.parse(hold.createdAt));

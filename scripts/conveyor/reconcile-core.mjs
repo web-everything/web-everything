@@ -125,8 +125,9 @@ import { latestCiHealEscalationForHead, CI_HEAL_ESCALATION_MARKER } from './ci-h
 import {
   isStandDownSuperseded, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER,
   CONCURRENT_AUTHOR_PAUSE_MARKER, concurrentAuthorPauses, isConcurrentAuthorStandDown,
-  standDownComments, loadFlakeHoldState,
+  standDownComments,
 } from './stand-down.mjs';
+import { loadFlakeHoldState } from './load-flake-hold.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 // #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
 import { answerDisposition, isCloseSupersededExecuted } from './stand-down-answer-core.mjs';

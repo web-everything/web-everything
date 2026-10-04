@@ -3524,3 +3524,14 @@ it('load-hold reconcile routing respects cutoff, head changes, and terminal exha
     else { expect(kinds).not.toContain('stood-down'); expect(kinds).not.toContain('load-flake-hold'); }
   }
 });
+
+import { buildOperatorAnswer as buildLegacyHoldAnswer } from '../stand-down-answer-core.mjs';
+it('a legacy load-flake hold the thread superseded no longer refuses the PR (PR #3945 review)', () => {
+  const legacy = { id: 'IC_legacy_hold', body: loadFlakeLegacyBody, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION };
+  const answer = { id: 'IC_answer', createdAt: '2026-10-04T20:00:00Z', author: AUTOMATION,
+    body: buildLegacyHoldAnswer({ standDownId: 'IC_legacy_hold', reason: 'handled by hand', actor: 'chalbert', channel: 'test' }) };
+  const kinds = (comments) => planReconcile({ prs: [pr1563({ comments: [finding(), ...comments], headRefOid: 'advanced-past-alt' })], agents: [], durableCounts: {}, now: NOW }).refusals.map((r) => r.kind);
+  expect(kinds([legacy])).toContain('load-flake-hold');
+  expect(kinds([legacy, answer])).not.toContain('load-flake-hold');
+  expect(kinds([legacy, answer])).not.toContain('stood-down');
+});

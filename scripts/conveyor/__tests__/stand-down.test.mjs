@@ -442,3 +442,36 @@ describe('load-flake holds', () => {
     expect(buildLoadFlakeHoldComment({ head: 'old' })).toContain('stand-down reason=gate-red');
   });
 });
+
+// PR #3945 review: a legacy gate-red load-flake stand-down that the thread has since superseded must stay inactive.
+import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
+import { loadFlakeHolds as loadFlakeHoldsFull, loadFlakeHoldState as loadFlakeHoldStateFull } from '../load-flake-hold.mjs';
+import { ADVISORY_FIX_COMMENT_MARKER } from '../advisory-fix-mark.mjs';
+import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
+describe('superseded legacy load-flake holds', () => {
+  const legacy = { ...loadComment(loadFlakeLegacyBody), id: 'IC_legacy_hold' };
+  const answer = {
+    id: 'IC_answer', author: AUTOMATION, createdAt: '2026-10-04T22:00:00Z',
+    body: buildOperatorAnswer({ standDownId: 'IC_legacy_hold', reason: 'ship the alt branch by hand', actor: 'chalbert', channel: 'test' }),
+  };
+  const note = { body: `${ADVISORY_NOTE_MARKER}\n\nadvisory note`, author: AUTOMATION, createdAt: '2026-10-04T18:00:00Z' };
+  const fixMark = { body: `${ADVISORY_FIX_COMMENT_MARKER}\n\nfixed`, author: AUTOMATION, createdAt: '2026-10-04T18:30:00Z' };
+  it('an operator answer naming the legacy hold ends it', () => {
+    expect(loadFlakeHoldsFull([legacy])).toHaveLength(1);
+    expect(loadFlakeHoldsFull([legacy, answer])).toEqual([]);
+    expect(loadFlakeHoldStateFull({ comments: [legacy], headRefOid: 'advanced-past-alt' }).live).toBe(true);
+    expect(loadFlakeHoldStateFull({ comments: [legacy, answer], headRefOid: 'advanced-past-alt' }).live).toBe(false);
+  });
+  it('an answer naming a different comment does not end it', () => {
+    const other = { ...answer, body: buildOperatorAnswer({ standDownId: 'IC_other', reason: 'x', actor: 'chalbert', channel: 'test' }) };
+    expect(loadFlakeHoldsFull([legacy, other])).toHaveLength(1);
+  });
+  it('an advisory finding already addressed before the hold ends it', () => {
+    expect(loadFlakeHoldsFull([note, fixMark, legacy])).toEqual([]);
+    expect(loadFlakeHoldsFull([note, legacy])).toHaveLength(1);
+  });
+  it('stand-down.mjs stays import-light: the operator queue stages it alone', () => {
+    const src = readFileSync(resolve(HERE, '..', 'stand-down.mjs'), 'utf8');
+    expect(src).not.toMatch(/from '\.\/(advisory-fix-mark|stand-down-answer-core)\.mjs'/);
+  });
+});
