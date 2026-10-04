@@ -342,6 +342,7 @@ describe('pinned overlay stays held on smoke-rejected when the last-good control
 describe('smoke-harness-broken (x5wbsbc)', () => {
   it('rejects as smoke-harness-broken when the last-good control fails the same check, backs off, then retries', async () => {
     const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '0';
     pushBranch(originDir, 'lane/harness', (dir) => writeFile(dir, 'harness.txt', 'x\n'));
     addOverlay(cloneDir, { ref: 'lane/harness', pinned: true }, { env }); // pinned: skip the plain-main fallback
 
@@ -367,6 +368,13 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
       root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, now: () => t,
     });
     expect(second.reason).toBe('smoke-harness-broken-backoff');
+    const state2 = readRebuildState(cloneDir, env);
+    expect(second.plan.inputsKey).not.toBe(state2.rejected.inputsKey);
+    const stale = second.alerts.find((a) => a.kind === 'clone-held-stale').detail;
+    expect(stale.retryAt).not.toBeNull();
+    expect(stale.retryAt).toBe(state2.rejected.retryAt);
+    expect(stale.attempts).toBe(state2.rejected.attempts);
+    expect(stale.broken).toEqual({ failed: 'harness-check', detail: 'boom' });
     expect(runSmoke.mock.calls.length).toBe(callsAfterFirst); // not called again
 
     t += 24 * 60 * 60_000; // comfortably past the default retry backoff (minutes, not hours)
@@ -380,6 +388,59 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
     expect(state3.rejected.attempts).toBe(2);
     expect(Date.parse(state3.rejected.retryAt)).toBe(t + 2 * 5 * 60_000);
   });
+
+  it('adopts a pinned candidate by default when the last-good control fails the same cross-org check', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE;
+    pushBranch(originDir, 'lane/harness-fix', (dir) => writeFile(dir, 'harness-fix.txt', 'fix\n'));
+    addOverlay(cloneDir, { ref: 'lane/harness-fix', pinned: true }, { env });
+    const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    const runSmoke = vi.fn(async () => ({
+      verdict: 'code', attempts: 1,
+      smoke: { results: [{ ok: false, name: 'reconcile-dry-run', detail: 'gh pr list --repo frontier-ui/frontierui: Command failed (cross-org auth)' }] },
+    }));
+
+    const result = await rebuildClone({
+      root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+
+    expect(result.adopted).toBe(true);
+    expect(result.reason).toBe('harness-broken-adopted-not-worse');
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(result.plan.finalSha);
+    expect(result.plan.finalSha).not.toBe(prevHead);
+    expect(result.alerts.find((a) => a.kind === 'smoke-harness-broken-adopted-not-worse')?.detail).toMatchObject({
+      failed: 'reconcile-dry-run', alsoFailedOn: ['last-good'], message: expect.any(String),
+    });
+    expect(readRebuildState(cloneDir, env).held).toBeNull();
+    expect(runSmoke).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a candidate failing x and y when the last-good control fails only x', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE;
+    pushBranch(originDir, 'lane/worse', (dir) => writeFile(dir, 'worse.txt', 'bad\n'));
+    addOverlay(cloneDir, { ref: 'lane/worse', pinned: true }, { env });
+    const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    const runSmoke = vi.fn(async ({ root }) => ({
+      verdict: 'code', attempts: 1,
+      smoke: { results: [
+        { ok: false, name: 'x', detail: 'shared failure' },
+        { ok: !existsSync(join(root, 'worse.txt')), name: 'y', detail: 'candidate regression' },
+      ] },
+    }));
+
+    const result = await rebuildClone({
+      root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+
+    expect(result.adopted).not.toBe(true);
+    expect(result.reason).toBe('smoke-rejected');
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(prevHead);
+    expect(result.alerts.some((a) => a.kind === 'smoke-harness-broken-adopted-not-worse')).toBe(false);
+    expect(readRebuildState(cloneDir, env).held?.reason).toBe('smoke-rejected');
+    expect(runSmoke).toHaveBeenCalledTimes(2);
+  });
+
 });
 
 // ── f. single flight — #2731's build lease covers the WHOLE fallback (A, B, C), not just the first smoke ──────

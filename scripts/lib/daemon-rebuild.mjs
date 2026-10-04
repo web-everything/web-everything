@@ -1067,6 +1067,11 @@ export function rejectRetryDelayMs(env, attempts) {
 // environment (`smoke-env-load`): never drop, retry A with backoff. No laundering: an env-load verdict never
 // ADOPTS A — only a clean A pass does.
 
+/** Default ON: when last-good fails every check the candidate failed, adopt the candidate as no worse.
+ *  A harness fix that lives in the candidate can only ever arrive this way when the running harness also
+ *  fails last-good. Set to '0' to retain the hold-on-last-good and retry-backoff behavior. */
+export const HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV = 'WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE';
+
 /** Knob: `0` turns the load differential off (back to one plain-main comparison). Default on. */
 export const SMOKE_LOAD_DIFFERENTIAL_ENV = 'WE_DAEMON_SMOKE_LOAD_DIFFERENTIAL';
 /** Knobs: backoff before an env-load-held candidate is re-smoked — base * 2^(attempts-1), capped. */
@@ -1342,7 +1347,13 @@ function staleAlertDetail(result, state) {
     reason: result.reason,
     mainSha: result.plan.mainSha,
     target: result.plan.finalSha,
-    retryAt: state.rejected?.inputsKey === result.plan.inputsKey ? (state.rejected.retryAt ?? null) : null,
+    retryAt: result.reason === 'smoke-harness-broken-backoff' || result.reason === 'smoke-harness-broken'
+      || state.rejected?.inputsKey === result.plan.inputsKey ? (state.rejected?.retryAt ?? null) : null,
+    attempts: state.rejected?.attempts ?? null,
+    ...(state.held ? { broken: {
+      failed: state.held.failed,
+      detail: (state.held.details?.[0]?.detail ?? '').slice(0, 300),
+    } } : {}),
     // x5wbsbc: a held clone keeps dispatching from its last-good build (`main-staleness.mjs#assertMainNotStale`).
     message: 'the rebuild is holding this clone off origin/main — it keeps dispatching from its last-good build (x5wbsbc) until this clears',
   };
@@ -1978,8 +1989,9 @@ export function failsSameChecks(candidateFailed, controlFailed) {
  *       refusal), and the health watch's `daemon-held-on-last-good` sign notifies after 15 min.
  *   (c) to tell (b) apart from a broken HARNESS, the last-good build itself (C = `prevHead`, full smoke, no
  *       skip-unchanged) is smoked as a control: C failing every check A failed means the failure is the smoke's
- *       environment, not the candidate — `smoke-harness-broken`, recorded with a retry backoff (never sticky),
- *       and not re-smoked on every main move until that backoff expires (see `prepareRebuild`). Never blocks.
+ *       environment: adopt A as no worse by default so candidate harness fixes can arrive. With
+ *       {@link HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV} set to '0', hold as `smoke-harness-broken` with a retry
+ *       backoff (never sticky), including across main moves (see `prepareRebuild`). Never blocks.
  * `'transient'` (env noise that survived its retries) keeps today's rule — no reject record — and also holds.
  */
 async function smokeAndAdopt({
@@ -2316,6 +2328,15 @@ async function smokeAndAdopt({
   const cFailed = c.smokeResult ? failedRows(c.smokeResult) : null;
   const harnessBroken = !!(cFailed && failsSameChecks(failedA, cFailed));
   if (harnessBroken) {
+    if (env[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV] !== '0') {
+      alert('smoke-harness-broken-adopted-not-worse', {
+        failed: failedA.map((r) => r.name).join(','),
+        alsoFailedOn: bFailed ? ['plain-main', 'last-good'] : ['last-good'],
+        message: 'last-good failed every check the candidate failed — adopting the candidate as no worse so a candidate harness fix can arrive',
+      });
+      const fin = await finalize(plan, undefined, undefined, a.smokeResult);
+      return { ...fin, reason: fin.adopted ? 'harness-broken-adopted-not-worse' : fin.reason };
+    }
     const prevAttempts = priorRejected?.harnessBroken ? (priorRejected.attempts || 1) : 0;
     const attempts = prevAttempts + 1;
     const retryAt = new Date(now() + rejectRetryDelayMs(env, attempts)).toISOString();
