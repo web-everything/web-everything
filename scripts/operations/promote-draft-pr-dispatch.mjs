@@ -126,17 +126,17 @@ export function defaultReadPrLabels({ repoSlug, prNumber, runGh = runGhSync } = 
   return validatePrLabels(envelope?.labels);
 }
 
-/** The one label write of the restore-review-label half. */
-export function defaultAddLabel({ repoSlug, prNumber, label, runGh = runGhSync } = {}) {
-  runGh(['pr', 'edit', String(prNumber), '--repo', repoSlug, '--add-label', label], {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-label-add', repo: repoSlug },
-  });
-}
-
 /** #3902 — strip `ready-to-merge` when the STUCK restore variant applies a review hold. */
 export function defaultRemoveLabel({ repoSlug, prNumber, label, runGh = runGhSync } = {}) {
   runGh(['pr', 'edit', String(prNumber), '--repo', repoSlug, '--remove-label', label], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-label-remove', repo: repoSlug },
+  });
+}
+
+/** The one label write of the restore-review-label half. */
+export function defaultAddLabel({ repoSlug, prNumber, label, runGh = runGhSync } = {}) {
+  runGh(['pr', 'edit', String(prNumber), '--repo', repoSlug, '--add-label', label], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-label-add', repo: repoSlug },
   });
 }
 
@@ -170,6 +170,8 @@ export function runReconcilePromoteDraftDispatch({
   // read says red/pending) with no `gh` on PATH. Defaults to the real `gh api commits/<sha>/check-runs` read.
   readHeadCheckState = defaultReadHeadCheckState,
   readPrLabels = defaultReadPrLabels,
+  // #3902 — strips `ready-to-merge` when the STUCK restore variant applies its review hold.
+  removeLabel = defaultRemoveLabel,
   // #2811/#2821 follow-up — clear the now-stale `review-status:awaiting-ci` label the INSTANT a draft promotes,
   // never waiting on a different daemon's tick to notice `isDraft` flipped (mirrors `applyReviewStatus`'s own
   // "the daemon that changes the state applies its own tag right at the moment" convention, `review-status-
@@ -179,7 +181,6 @@ export function runReconcilePromoteDraftDispatch({
   // `restore-review-label` (PR #3830 incident): the one write for an open, green, label-less lane PR.
   // Idempotent (`gh pr edit --add-label`); re-reads labels first so a label another actor just set wins.
   addLabel = defaultAddLabel,
-  removeLabel = defaultRemoveLabel,
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`promote-draft-pr-dispatch: --repo ${repo} is not a constellation repo`);
