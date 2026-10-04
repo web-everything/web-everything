@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import { maxTestWorkers } from './vitest.shared';
 
 /**
  * #4075 DAEMON SOAK HARNESS (card x0zg44l) — `npm run test:soak`. The real review + fix daemons, the real
@@ -24,6 +25,14 @@ export default defineConfig({
     env: { WE_TEST_SANDBOX: '0' },
     include: ['scripts/conveyor/soak/**/*.soak.test.mjs'],
     pool: 'forks',
+    // heavy-enforce: the same per-run worker ceiling every other vitest config reads (vitest.shared.ts#maxTestWorkers,
+    // `WE_VITEST_MAX_WORKERS`) — each soak world forks daemon hosts, so an uncapped forks pool is the costliest of all.
+    poolOptions: {
+      forks: {
+        maxForks: maxTestWorkers,
+        minForks: 1,
+      },
+    },
     testTimeout: 15 * 60_000,
     hookTimeout: 5 * 60_000,
   },
