@@ -90,6 +90,8 @@ export function noteEpisodeKey(note) {
   if (note?.kind === 'liveness-wait-exhausted') {
     return `liveness-wait-exhausted:${pr}:${note.since ?? 'unknown-since'}`;
   }
+  // One dispute per head: the same head can keep waiting for days without minting a second comment.
+  if (note?.kind === 'ruling-dispute') return `ruling-dispute:${pr}:${note.head ?? 'unknown-head'}`;
   return `${note?.kind ?? 'note'}:${pr}:${note?.text ?? ''}`;
 }
 
@@ -107,6 +109,7 @@ export function noteHeadline(note) {
   if (note?.kind === 'infra-retry-exhausted') return 'needs your decision: blocked-on-infra retry streak capped';
   if (note?.kind === 'session-overrun') return 'needs your decision: a session has run past its bound';
   if (note?.kind === 'liveness-wait-exhausted') return 'needs your decision: a liveness wait ran past its bound';
+  if (note?.kind === 'ruling-dispute') return 'needs your decision: the fixer and the reviewer disagree about a ruling';
   return `needs your decision: ${note?.kind ?? 'an unrecognised escalation'}`;
 }
 
