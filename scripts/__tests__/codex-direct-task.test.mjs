@@ -227,6 +227,12 @@ describe('buildCodexPrompt — folds in the do-not-commit instruction', () => {
     expect(p).toMatch(/do not run `git push`/);
   });
 
+  it('tells Codex to run tests only through the heavy-admission queue (heavy-enforce)', () => {
+    const p = buildCodexPrompt('Add a comment to notes.txt');
+    expect(p).toContain('node scripts/readiness/heavy-admission.mjs run -- npx vitest run <test-file>');
+    expect(p).toMatch(/Never run a bare `npx vitest`, `npm test`, or `node scripts\/check-standards\.mjs`/);
+  });
+
   it('rejects an empty task', () => {
     expect(() => buildCodexPrompt('')).toThrow();
     expect(() => buildCodexPrompt('   ')).toThrow();
