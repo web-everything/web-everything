@@ -144,3 +144,12 @@ describe('re-arm comments name the observed verdict (#3253)', () => {
     if (currentLabels.includes('review:accepted')) expect(body).not.toContain('bounce was repaired');
   });
 });
+
+it('xe8y12n missing-family comment records intent without claiming an unverified write', async () => {
+  const { buildRearmComment } = await import('../rearm-review.mjs');
+  const body = buildRearmComment({ actor: 'CI healer', decision: { rearmFrom: 'missing', keepsHuman: false } });
+  expect(body).toContain('no review label');
+  expect(body).toContain('completion result reports whether the label write was verified');
+  expect(body).not.toContain('bounce was repaired');
+  expect(body).not.toContain('the PR is re-armed `review:pending`');
+});

@@ -3612,3 +3612,22 @@ const r = cp.spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio
     expect(parseReviewedSha(result.added)).toBe(healedHead);
   });
 });
+
+describe('xe8y12n missing-only rearm boundary', () => {
+  it.each([[], ['bug'], ['redteam:accepted']].map(labels => [labels]))('permits a valid empty family %j', labels => {
+    const result = decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: labels });
+    expect(result).toMatchObject({ allowed: true, addLabel: 'review:pending', rearmFrom: 'missing' });
+    expect(result.removeLabels).toEqual(expect.arrayContaining(['ready-to-merge', 'redteam:accepted']));
+  });
+  it.each([['ready-to-merge'], [{ name: 'ready-to-merge' }, { name: 'checking' }]].map(labels => [labels]))('preserves the producer merge clearance: refuses %j', labels => {
+    const result = decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: labels });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('ready-to-merge');
+  });
+  it.each([undefined, null, {}, [null], [{}], [''], ...['pending', 'changes', 'human', 'accepted', 'future'].map(x => [`review:${x}`])].map(labels => [labels]))('refuses unknown or occupied family %j', labels => {
+    expect(decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: labels }).allowed).toBe(false);
+  });
+  it('ordinary rearm still refuses absence', () => {
+    expect(decideSetLabel({ to: 'rearm', currentLabels: [] }).allowed).toBe(false);
+  });
+});

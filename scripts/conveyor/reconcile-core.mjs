@@ -100,6 +100,7 @@
  * transcript's mtime) is INJECTED on the input records by `we:scripts/conveyor/reconcile-pass.mjs`, so every
  * branch below is reachable in a test with no network and no credential.
  */
+import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
@@ -1360,6 +1361,14 @@ function roundCapExhaustedNoteText(prNumber, attempts, cap, capKind) {
   return `PR #${prNumber}: ${capKind} auto-repair rounds exhausted (${attempts}/${cap}) — a person must take it over`;
 }
 
+/** Tri-state diagnostic: unknown evidence is never an empty review family. */
+export function missingReviewLabel(pr) {
+  if (!pr || pr.state !== 'OPEN' || !Array.isArray(pr.labels)
+    || !pr.labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string' && (typeof l === 'string' ? l : l.name).length > 0)
+    || !Array.isArray(pr.commits)) return null;
+  return isAiGeneratedPr(pr) && !pr.labels.some(l => (typeof l === 'string' ? l : l.name).startsWith('review:'));
+}
+
 export function planReconcile({
   repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap = CI_HEAL_ROUND_CAP,
   conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP, defaultBranch = 'main',
@@ -1391,6 +1400,8 @@ export function planReconcile({
   for (const pr of Array.isArray(prs) ? prs : []) {
     const prNumber = Number(pr?.number);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue; // not a PR record; nothing to key on.
+
+    if (missingReviewLabel(pr) === true) notes.push({ kind: 'review-label-missing', prNumber, repo, text: 'open agent PR has no review:* label' });
 
     // The evidence every row carries, so a reader never has to go back to the listing to audit a verdict.
     const operatorAnswer = latestOperatorAnswer(pr?.comments);

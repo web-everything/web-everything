@@ -34,6 +34,7 @@
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
+import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { execFileSync, spawn } from 'node:child_process';
 import {
   existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, openSync, readSync, closeSync, unlinkSync,
@@ -506,7 +507,7 @@ export function probeRestBudget({ exec = run } = {}) {
   return { limit: j?.limit ?? null, used: j?.used ?? null, remaining: j?.remaining ?? null, reset: j?.reset ?? null };
 }
 
-export function probePrs({ exec = run } = {}) {
+export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.now() } = {}) {
   const out = [];
   for (const { slug } of Object.values(CONSTELLATION_REPOS)) {
     // #gh-graphql-budget — the host-shared open-PR snapshot when this is the real `run` (never a test's fake exec).
@@ -520,7 +521,23 @@ export function probePrs({ exec = run } = {}) {
     const listed = shared || JSON.parse(exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '100', '--json', fields]));
     const rows = Array.isArray(listed) ? listed : []; // a throttle deferral object = skip this repo's PR smells this pass
     for (const pr of rows) {
+      // Snapshot rows may be cached. Only a successful fresh provider read counts for this smell — and only a PR
+      // whose cached labels hold no `review:*` label can be in breach, so a labelled PR costs no per-PR call
+      // (the shared snapshot stays the budgeted path for the common case). The labelled row still reports a clean
+      // observation from those cached labels, so an open `review-label-missing` episode CLOSES once the label is
+      // restored (the smell ignores absent subjects); a stale cache can only delay detecting a NEW breach by one
+      // snapshot refresh, never report a false one.
+      let reviewObservation = null;
+      const cachedReviewLabelled = Array.isArray(pr.labels) && pr.labels.some(l => typeof l?.name === 'string' && l.name.startsWith('review:'));
+      if (cachedReviewLabelled) reviewObservation = { state: 'OPEN', labels: pr.labels.map(l => ({ name: l?.name })), commits: [], observedAt: now, cached: true };
+      else try {
+        const live = JSON.parse(exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'state,labels,headRefOid,headRefName,baseRefName']));
+        if (live && !Array.isArray(live)) reviewObservation = { ...live, observedAt: now,
+          commits: readCommits(slug, pr.number, { headRefName: live.headRefName, headRefOid: live.headRefOid, baseRefName: live.baseRefName,
+            ...(exec !== run ? { exec: args => exec('gh', args) } : {}) }) };
+      } catch { /* Unknown, not a clean observation. */ }
       out.push({
+        reviewObservation,
         repo: slug, number: pr.number, title: pr.title, headRefName: pr.headRefName, updatedAt: pr.updatedAt,
         isDraft: !!pr.isDraft,
         mergeable: pr.mergeable ?? null,
@@ -528,7 +545,8 @@ export function probePrs({ exec = run } = {}) {
         comments: (pr.comments || []).map((c) => ({
           body: c.body, createdAt: c.createdAt, author: { login: c.author?.login ?? null }, viewerDidAuthor: c.viewerDidAuthor,
         })),
-        labels: (pr.labels || []).map((l) => ({ name: l.name })),
+        labels: Array.isArray(pr.labels) ? pr.labels.map(l => ({ name: l?.name })) : [],
+        labelsValid: Array.isArray(pr.labels) && pr.labels.every(l => l && typeof l.name === 'string' && l.name.length > 0),
         // `status` (draft-first PRs, operator-approved 2026-09-27) — carried alongside `state`/`conclusion` so
         // `we:scripts/operations/pr-status.mjs#reduceCheckState` (the `draft-not-promoted` smell's own green
         // check) reads the SAME completion signal every other CI-truth consumer in this repo does off a raw
@@ -826,7 +844,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     } catch { probeErrors.credentialInventory = 'unavailable'; }
   }
   if (ghDue) {
-    const prs = attempt('prs', () => probePrs());
+    const prs = attempt('prs', () => probePrs({ now }));
     const agents = attempt('agents', () => probeAgents());
     // Each probe is set independently of the other succeeding: red-pr-unattended still only evaluates once BOTH
     // are present (its own `probes: ['prs', 'agents']` declaration already gates that), but stale-claim needs
