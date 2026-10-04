@@ -181,6 +181,18 @@ export function behindFiles(root, base = 'main', run = gitRun, env = process.env
   return [...new Set(String(r.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean))];
 }
 
+/** Does the working tree differ from HEAD in a way that changes what runs — any TRACKED change, or an untracked
+ *  code file (see {@link isCodePath})? Untracked non-code files (a `backlog/*.md` card a job wrote) do not.
+ *  `true` on any git failure (fail closed). */
+export function codeDirty(root, run = gitRun) {
+  const r = run(['status', '--porcelain', '--untracked-files=all'], { cwd: root });
+  if (r.status !== 0) return true;
+  return String(r.stdout ?? '').split('\n').filter(Boolean).some((line) => {
+    if (!line.startsWith('?? ')) return true;
+    return isCodePath(line.slice(3).trim().replace(/^"|"$/g, ''));
+  });
+}
+
 /**
  * ASSERT the calling checkout is not behind `origin/<base>` — refuse LOUDLY rather than silently act on stale
  * code from this checkout's own import path (#3439). A checkout that is merely BEHIND (no local commits ahead)
@@ -209,6 +221,7 @@ export function assertMainNotStale(root, checkStaleness, {
   lastGood = (r, dirty) => lastGoodForClone({ root: r, headSha: readHeadSha(r), dirty }),
   // The bounded rebuild-in-progress grace (see `daemon-last-good.mjs#decideRebuildGrace`); injectable for tests.
   rebuildGrace = (r) => rebuildGraceForClone({ root: r }),
+  treeDirtyForCode = (r) => codeDirty(r),
   write = (s) => process.stderr.write(s),
 } = {}) {
   // #4044 Module E — a MANAGED clone (`process.env.WE_DAEMON_MANAGED_CLONE === '1'`, set by
@@ -256,7 +269,12 @@ export function assertMainNotStale(root, checkStaleness, {
   // still dispatches; the health watch's `daemon-held-on-last-good` sign notifies the operator after 15 min.
   if (st && st.action === 'warn' && managedClone) {
     let lg = null;
-    try { lg = lastGood(root, !!st.dirty); } catch { lg = null; }
+    // Live 2026-10-04: untracked backlog/*.md cards a review job left in the clone made `st.dirty` true, so the
+    // last-good fallback never applied while the rebuild was held. Only a TRACKED change or an untracked CODE
+    // file makes the tree differ from the verified build; an unreadable status stays dirty (fail closed).
+    let dirty = !!st.dirty;
+    if (dirty) { try { dirty = treeDirtyForCode(root); } catch { dirty = true; } }
+    try { lg = lastGood(root, dirty); } catch { lg = null; }
     if (lg && lg.onLastGood) {
       const heldWhy = lg.held ? ` held since ${lg.heldSince} (${lg.held.reason ?? '?'}${lg.held.failed ? `: ${lg.held.failed}` : ''})` : '';
       write(`${label}: the managed clone is ${st.behind} commit(s) behind origin/${base} but runs its LAST-KNOWN-GOOD `

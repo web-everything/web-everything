@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
   classifyStaleness, checkMainStaleness, assertMainNotStale, staleRemedy, isCodePath,
-  isStaleMainRefusalMessage, STALE_MAIN_REFUSAL_MARKER, behindFiles,
+  isStaleMainRefusalMessage, STALE_MAIN_REFUSAL_MARKER, behindFiles, codeDirty,
 } from '../main-staleness.mjs';
 
 describe('classifyStaleness', () => {
@@ -350,6 +350,28 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
       // a caller with no dispatch path never gets the grace
       expect(() => assertMainNotStale('/repo', warn, { ...opts, dispatchPath: null, rebuildGrace: building })).toThrow(/STALE/);
     });
+  });
+  it('codeDirty: untracked non-code files do not count; a tracked change or untracked code does', () => {
+    const run = (out, status = 0) => () => ({ status, stdout: out });
+    expect(codeDirty('/r', run('?? backlog/x1.md\n?? backlog/x2.md\n'))).toBe(false);
+    expect(codeDirty('/r', run('?? backlog/x1.md\n?? scripts/new.mjs\n'))).toBe(true);
+    expect(codeDirty('/r', run(' M backlog/x1.md\n'))).toBe(true);
+    expect(codeDirty('/r', run('', 128))).toBe(true);
+  });
+  it('last-good fallback ignores untracked non-code files (live 2026-10-04: review cards left in the clone)', () => {
+    const warn = () => ({ action: 'warn', reason: 'not-auto-syncing', behind: 9, ahead: 0, dirty: true });
+    const seen = [];
+    const opts = {
+      label: 'test', write: () => {}, listBehindFiles: () => ['review.mjs'], dispatchPath: (p) => p === 'review.mjs',
+      rebuildGrace: () => ({ grace: false }),
+      lastGood: (_r, dirty) => { seen.push(dirty); return dirty ? { onLastGood: false } : { onLastGood: true, lastGood: 'a'.repeat(40) }; },
+    };
+    withManagedCloneEnv('1', () => {
+      expect(assertMainNotStale('/repo', warn, { ...opts, treeDirtyForCode: () => false })).toMatchObject({ fresh: true, onLastGood: true });
+      expect(() => assertMainNotStale('/repo', warn, { ...opts, treeDirtyForCode: () => true })).toThrow(/STALE/);
+      expect(() => assertMainNotStale('/repo', warn, { ...opts, treeDirtyForCode: () => { throw new Error('x'); } })).toThrow(/STALE/);
+    });
+    expect(seen).toEqual([false, true, true]);
   });
   it('isCodePath: modules and JSON are code; markdown and tests are not', () => {
     expect(['a.mjs', 'x/y.js', 'c.cjs', 'd.ts', 'src/_data/x.json', 'package-lock.json'].every(isCodePath)).toBe(true);
