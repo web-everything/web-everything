@@ -18,32 +18,14 @@ export const weAlias = {
   '@frontierui/webtheme': fuiWebthemeRoot,
 };
 
-// #x1jcikc: a single `vitest` invocation left NO pool/thread cap at all, so it defaults (via tinypool) to one
-// worker PER AVAILABLE CPU CORE. `heavy-admission.mjs` (#3461) already caps concurrent HEAVY COMMANDS
-// (`test:unit`, `check:standards`, the Playwright capture) at `DEFAULT_ADMISSION_CAP` (2) host-wide — but that
-// cap bounds how many `vitest` PROCESSES may run at once, never how many WORKER THREADS each one spawns. Two
-// admitted `vitest` runs on a real 12-core host therefore each grab up to 12 threads — 24 fighting over 12
-// cores — before the admission cap does any good at all, which is exactly the near-total-CPU symptom this
-// fixes. Sized for the admission cap's OWN documented worst case, not just its happy path: the cap's blocking
-// wait (`acquireSlotBlocking`) FAILS OPEN on a 20-minute timeout by design (a queuing timeout must never
-// strand a lane's whole delivery arc) — so a THIRD `vitest` can and does run concurrently with the two
-// slotted ones under real burst load, not just hypothetically. 4 threads/forks per invocation keeps even that
-// 3-way burst at 3×4=12 — fully subscribed but never oversubscribed — while the designed 2-at-a-time case
-// (2×4=8) still leaves 4 cores of headroom for the OS, git, and everything else running alongside a lane's
-// gate. Applied to `pool: 'threads'` (`vitest.config.ts`, `vitest.maas-conformance.config.ts`) AND to the
-// `forks` pool's `maxForks` (`vitest.integration.config.ts`'s few explicitly-`forks`-scoped files, via
-// `poolMatchGlobs`) so neither pool can locally re-open the same oversubscription this constant exists to
-// close. Deliberately NOT applied to `singleFork: true` files (`vitest.integration.config.ts`) — those are
-// already pinned to exactly one worker for a CORRECTNESS reason (flaky under contention), not a speed one;
-// this constant governs the OTHER files' worker ceiling, never overrides an existing serialization need.
-//
-// heavy-enforce (2026-10-04, operator-approved): the ceiling is no longer a hard-coded 4. It is ONE setting every
-// vitest config reads — `WE_VITEST_MAX_WORKERS` — defaulting to floor(cpu count / heavy-admission cap), never
-// below 1. On the 12-core host with the default cap of 2 that is 6 per run, so the two admitted runs together
-// fill the cores without oversubscribing them. Set `WE_VITEST_MAX_WORKERS=4` to restore the previous fixed
-// ceiling (which also covered the admission wait's fail-open third run). The cap is parsed exactly like
-// `heavy-admission.mjs#resolveCap` (pinned by scripts/__tests__/vitest-worker-cap.test.mjs) rather than imported,
-// so loading a vitest config never pulls in the admission module's whole import graph.
+// Each Vitest invocation defaults to max(1, min(4, floor(cpuCount / heavyCap))) workers.
+// The ceiling of 4 keeps the admission wait's fail-open third run at 3×4=12 cores on
+// the 12-core host; cpuCount / heavyCap only lowers that ceiling on small hosts.
+// WE_VITEST_MAX_WORKERS overrides the default with any valid value >= 1 (rounded down).
+// Heavy-cap parsing matches heavy-admission.mjs#resolveCap (default 2), without importing
+// the admission module's whole import graph when loading a Vitest config.
+// Shared by the threads and forks pools; existing singleFork correctness pins stay serial.
+export const DEFAULT_VITEST_MAX_WORKERS = 4;
 export const VITEST_MAX_WORKERS_ENV = 'WE_VITEST_MAX_WORKERS';
 const HEAVY_ADMISSION_DEFAULT_CAP = 2; // == heavy-admission.mjs#DEFAULT_ADMISSION_CAP (parity-tested)
 
@@ -56,7 +38,7 @@ export function resolveMaxTestWorkers(env: Record<string, string | undefined> = 
   if (env[VITEST_MAX_WORKERS_ENV] !== '' && Number.isFinite(explicit) && explicit >= 1) return Math.floor(explicit);
   const capRaw = Number(env.WE_HEAVY_ADMISSION_CAP);
   const cap = Number.isFinite(capRaw) && capRaw >= 1 ? Math.floor(capRaw) : HEAVY_ADMISSION_DEFAULT_CAP;
-  return Math.max(1, Math.floor((Number(cpuCount) || 0) / cap));
+  return Math.max(1, Math.min(DEFAULT_VITEST_MAX_WORKERS, Math.floor((Number(cpuCount) || 0) / cap)));
 }
 
 export const maxTestWorkers = resolveMaxTestWorkers();
