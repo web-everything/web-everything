@@ -375,6 +375,10 @@ export function stepEpisodes(state, evaluations, now, { config = DEFAULT_HEALTH_
         if (ep.cleanStreak > 0 && ep.severity === 'medium' && smell.escalateAfterMs !== undefined) ep.firstBreachAt = now;
         ep.breachStreak += 1; ep.cleanStreak = 0; ep.lastBreachAt = now; ep.samples += 1;
         ep.measure = r.measure ?? {}; ep.summary = r.summary ?? ''; ep.recommendation = r.recommendation ?? smell.recommendationHint ?? '';
+        // xegykal — a smell may name a human-only escalation (`{humanOnly, actionRef, description, status, reason}`);
+        // the Plateau WIP page lists every open episode carrying `humanOnly: true` as one that needs a person.
+        if (r.escalation && typeof r.escalation === 'object') ep.escalation = r.escalation;
+        else delete ep.escalation;
         if (ep.status === 'pending' && ep.breachStreak >= openAfter) {
           const opens = next.opens[key] || [];
           opens.push(now);
