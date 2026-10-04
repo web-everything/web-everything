@@ -1,7 +1,26 @@
-import { beforeEach, afterEach } from 'vitest';
+import { beforeEach, afterEach, afterAll } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// tmp-leak fix (2026-10-04): this file runs once per test FILE, and every `mkdtempSync` below used to be
+// left behind — ~1.15M dirs in the operator's `$TMPDIR` (2m39s to list). Each dir this file creates is
+// recorded here and removed in `afterAll`, with the env var it backed reset so a later file in the same
+// worker makes its own fresh one instead of reusing a deleted path. `vitest.globalSetup.mjs` is the
+// run-wide backstop for leaks in test files themselves.
+const ownedTmpDirs: Array<{ dir: string; envKey?: string }> = [];
+function ownedTmpDir(prefix: string, envKey?: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  ownedTmpDirs.push({ dir, envKey });
+  return dir;
+}
+afterAll(() => {
+  for (const { dir, envKey } of ownedTmpDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+    if (envKey && process.env[envKey] === dir) delete process.env[envKey];
+    if (process.env.PATH?.startsWith(`${dir}:`)) process.env.PATH = process.env.PATH.slice(dir.length + 1);
+  }
+});
 
 // #xpc3krl (ci-heal-2684, 2026-09-25; extended by operator-approved follow-up the same day) — SANDBOX BY
 // DEFAULT, FIRST, before anything below reads `process.env`. Live-caught on this Mac: 6 tests across
@@ -54,7 +73,7 @@ import { join } from 'node:path';
 // own test body — that always wins over this file, since it runs after.
 if (process.env.WE_TEST_SANDBOX !== '0') {
   try {
-    const fakeGhDir = mkdtempSync(join(tmpdir(), 'we-fake-gh-'));
+    const fakeGhDir = ownedTmpDir('we-fake-gh-');
     const fakeGhPath = join(fakeGhDir, 'gh');
     writeFileSync(
       fakeGhPath,
@@ -83,7 +102,7 @@ if (process.env.WE_TEST_SANDBOX !== '0') {
 // #3383: isolate tests from home AND from each other's durable action holds.
 const ownsCoordinationRoot = process.env.WE_COORDINATION_ROOT === undefined;
 let testCoordinationRoot: string | undefined;
-if (ownsCoordinationRoot) process.env.WE_COORDINATION_ROOT = mkdtempSync(join(tmpdir(), 'we-coord-test-'));
+if (ownsCoordinationRoot) process.env.WE_COORDINATION_ROOT = ownedTmpDir('we-coord-test-', 'WE_COORDINATION_ROOT');
 beforeEach(() => {
   if (ownsCoordinationRoot) {
     testCoordinationRoot = mkdtempSync(join(tmpdir(), 'we-coord-test-'));
@@ -102,7 +121,7 @@ afterEach(() => {
 // (outside the sandbox block): the integration tier proves real `gh`, never the host's real throttle state.
 // Tests of the resolution itself pass an explicit `env`, so this default never reaches them.
 if (process.env.WE_GH_THROTTLE_LOCK_ROOT === undefined) {
-  process.env.WE_GH_THROTTLE_LOCK_ROOT = mkdtempSync(join(tmpdir(), 'we-gh-throttle-test-'));
+  process.env.WE_GH_THROTTLE_LOCK_ROOT = ownedTmpDir('we-gh-throttle-test-', 'WE_GH_THROTTLE_LOCK_ROOT');
 }
 
 // decouple-primary-checkout (epic #4075): the conveyor build queue's DEFAULT path is now the machine-wide
@@ -111,7 +130,7 @@ if (process.env.WE_GH_THROTTLE_LOCK_ROOT === undefined) {
 // host's REAL queue (the one the live build-dispatch daemon reads). Same both-tiers default as the throttle root
 // above; tests of the resolution itself pass an explicit `env`, so this never reaches them.
 if (process.env.WE_DAEMON_STATE_DIR === undefined) {
-  process.env.WE_DAEMON_STATE_DIR = mkdtempSync(join(tmpdir(), 'we-daemon-state-test-'));
+  process.env.WE_DAEMON_STATE_DIR = ownedTmpDir('we-daemon-state-test-', 'WE_DAEMON_STATE_DIR');
 }
 // ...and its one-release fallback read of the OLD in-checkout queue (which, on the operator's laptop, is the
 // primary checkout's real `.conveyor/queue.json`) is switched off for the same reason.

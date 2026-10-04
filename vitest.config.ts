@@ -21,6 +21,9 @@ export default defineConfig({
     // `action-cli.test.mjs`/`action-records.test.mjs` rely on: their `createActionStore()` calls take no
     // explicit root, so without it they would write real attempts to `~/workspace/.operations/coordination`.
     setupFiles: ['./vitest.setup.ts'],
+    // tmp-leak fix: one private temp root per run, leak count reported + root removed at teardown
+    // (scripts/lib/test-tmp-root.mjs; WE_TMP_LEAK_MODE / WE_TMP_LEAK_MAX).
+    globalSetup: ['./vitest.globalSetup.mjs'],
     // #x1jcikc: cap this invocation's own worker count (see vitest.shared.ts#maxTestWorkers for the sizing
     // rationale) — otherwise the ~2000-file suite defaults to one thread per CPU core, which is how two
     // concurrently-admitted `test:unit` runs oversubscribe a 12-core host.
