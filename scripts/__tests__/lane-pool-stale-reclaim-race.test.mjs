@@ -13,7 +13,8 @@
  *   decision on a stale lease, a second real concurrent `acquire --lane=N` runs to completion and reclaims the
  *   SAME lane first, then the paused acquire is let through.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -35,11 +36,13 @@ function runPool(args, extraEnv = {}) {
 const REPO = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=stalereclaim', '--branch=trunk', '--no-install'];
 const leaseMarker = (n) => join(poolRoot, 'stalereclaim', `lane-${n}`, '.git', '.lane-lease');
 
-beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'lane-pool-stale-reclaim-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
-  poolRoot = join(base, 'pool');
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-stale-reclaim-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
 
   git(['init', '--quiet', '--bare', '--initial-branch=trunk', originDir]);
   git(['clone', '--quiet', originDir, referenceDir]);
@@ -49,6 +52,14 @@ beforeEach(() => {
   git(['add', 'file.txt'], referenceDir);
   git(['commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', 'origin', 'HEAD:refs/heads/trunk'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
+beforeEach(() => {
+  base = mkdtempSync(join(tmpdir(), 'lane-pool-stale-reclaim-'));
+  poolRoot = join(base, 'pool');
 
   const provision = runPool(['provision', '--count=1', ...REPO()]);
   expect(provision.code).toBe(0);
@@ -59,6 +70,7 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 describe('#x96v5hl — two concurrent stale-lease reclaimers never both "win"', () => {

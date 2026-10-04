@@ -104,6 +104,9 @@ import { createExploreSinks, agentArgsFromEnv as exploreAgentArgsFromEnv } from 
 import { gapSweepStatusOperation, GAP_SWEEP_STATUS_OP } from './gap-sweep-status.mjs';
 import { createGapSweepSinks } from './gap-sweep-status-io.mjs';
 import { clearStuckSessionOperation, CLEAR_STUCK_SESSION_OP } from './clear-stuck-session.mjs';
+// #4979 — the sanctioned writer of an OPERATOR's block/card/not-real ruling on a PR's mandatory referrals.
+import { recordReferralRulingOperation, RECORD_REFERRAL_RULING_OP } from './record-referral-ruling.mjs';
+import { createRecordReferralRulingReader, createRecordReferralRulingSinks } from './record-referral-ruling-io.mjs';
 import { createClearStuckSessionReader, createClearStuckSessionSinks } from './clear-stuck-session-io.mjs';
 import { docketRefreshOperation, DOCKET_REFRESH_OP, finishDocketOutcome } from './docket-refresh.mjs';
 import { createDocketRefreshReader, createDocketRefreshSinks } from './docket-refresh-io.mjs';
@@ -205,6 +208,11 @@ export const OPERATIONS = Object.freeze({
   // rule `reconcile-core.mjs#assessLiveness` already uses (imported, never re-derived); `authorize` is a real
   // human `confirm` because the effect touches `~/.claude`, not this repo's own tree; `move` quarantines the
   // job directory (never deletes it) and is a no-op unless BOTH the verdict and the human agree.
+  // #4979 — read → plan → write: the operator's referral ruling, pinned to the live head, read back through the gate.
+  [RECORD_REFERRAL_RULING_OP]: () => ({
+    declaration: recordReferralRulingOperation({ readRulingContext: createRecordReferralRulingReader() }),
+    sinks: createRecordReferralRulingSinks(),
+  }),
   [CLEAR_STUCK_SESSION_OP]: () => ({
     declaration: clearStuckSessionOperation({ readStuckFacts: createClearStuckSessionReader() }),
     sinks: createClearStuckSessionSinks(),

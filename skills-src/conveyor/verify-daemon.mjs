@@ -48,7 +48,8 @@
  */
 
 import { hostname } from 'node:os';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   RUNNER_LOCK_ROOT, makeOwner,
@@ -97,13 +98,14 @@ export const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
  *   maxTicks?: number,
  *   fixedCadence?: boolean, // builder opt-in; subtract elapsed work from the interval
  *   now?: () => number, // monotonic milliseconds
+ *   codeChanged?: () => boolean, // 2026-10-04 — true once this daemon's own clone moved under it
  * }} o
  * @returns {Promise<{ticks:number, stoppedReason:string}>}
  */
 export async function runDaemonLoop({
   tickOnce, sleep, isAlive = () => true, onTick = () => {}, onTickError = () => {},
   intervalMs = DEFAULT_INTERVAL_MS, maxTicks = Infinity,
-  fixedCadence = false, now = () => performance.now(),
+  fixedCadence = false, now = () => performance.now(), codeChanged = () => false,
 }) {
   if (typeof tickOnce !== 'function') throw new TypeError('runDaemonLoop requires a tickOnce effect');
   let tick = 0;
@@ -116,6 +118,10 @@ export async function runDaemonLoop({
       onTickError(error, tick, { elapsedMs: Math.round(now() - started), intervalMs });
     }
     if (!isAlive()) return { ticks: tick + 1, stoppedReason: 'lease-lost' };
+    // 2026-10-04 — exit between ticks once the clone's code moved, so the supervisor (launchd KeepAlive) relaunches
+    // on the new tree. Without this a fix overlaid onto this clone never reached the running process: the ENOTDIR
+    // fix sat on disk while the in-memory sweep kept failing every tick (see `cloneHeadChanged`).
+    if (codeChanged()) return { ticks: tick + 1, stoppedReason: 'code-changed' };
     if (tick + 1 >= maxTicks) return { ticks: tick + 1, stoppedReason: 'max-ticks' };
     // Start-to-start cadence: long rounds consume their interval. Never overlap or replay missed ticks.
     await sleep(fixedCadence ? Math.max(0, intervalMs - (now() - started)) : intervalMs);
@@ -136,6 +142,21 @@ export async function runDaemonLoop({
  */
 export async function runVerifyTick({ runVerify = runVerifyDispatch } = {}) {
   return runVerify({});
+}
+
+/**
+ * Did this daemon's own clone move to a different commit since boot? Pure over an injected `readHead`.
+ * Live 2026-10-04: the verify daemon ran 25 h on one in-memory tree (no self-sync, unlike build-dispatch). A
+ * daemon-rebuild of its clone (`wev-control`) updated the files on disk but never the running sweep, so the
+ * ENOTDIR fix could not take effect without a hand restart. A head we cannot read (null) is never "changed" —
+ * a transient git failure must not bounce the daemon.
+ * @param {{bootHead: string|null, readHead: () => string|null}} o
+ * @returns {boolean}
+ */
+export function cloneHeadChanged({ bootHead, readHead }) {
+  if (!bootHead) return false;
+  const now = readHead();
+  return !!now && now !== bootHead;
 }
 
 // ── IO SHELL (runs only as a CLI — owns the real lease + the real dispatch pass) ─────────────────────────────
@@ -255,7 +276,11 @@ async function main() {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
   console.error(`verify-daemon: started on ${hostname()}:${process.pid}, tick every ${DEFAULT_INTERVAL_MS}ms, heartbeat every ${DEFAULT_HEARTBEAT_INTERVAL_MS}ms.`);
-  const { stoppedReason } = await runDaemonLoop(buildCliDaemonEffects({ isAlive }));
+  const cloneRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+  const readHead = () => { try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: cloneRoot, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } };
+  const bootHead = readHead();
+  const codeChanged = () => cloneHeadChanged({ bootHead, readHead });
+  const { stoppedReason } = await runDaemonLoop({ ...buildCliDaemonEffects({ isAlive }), codeChanged });
   if (!stopping) {
     console.error(`verify-daemon: loop stopped (${stoppedReason}) — releasing the lease and exiting.`);
     stopHeartbeat();

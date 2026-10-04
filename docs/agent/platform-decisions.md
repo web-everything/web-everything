@@ -4197,6 +4197,11 @@ this rule leans on rests on a distinct fresh validator, unchanged by this ruling
 `review:human`; this rule never touches that boundary, it only removes the human step from the tier that was
 never `review:human` to begin with).
 
+**Superseded in part 2026-10-03 (xne1udi, operator).** "`review:human` stays human-only" now holds for the
+protected list only; outside it an independent judge may clear the label —
+[#independent-judge-clears-review-human-outside-protected-list](#independent-judge-clears-review-human-outside-protected-list).
+The `review:pending` rule above is unchanged.
+
 ---
 
 ### `clear-human` refuses unless an independent advisory review has already posted for the PR's current head {#clear-human-requires-current-head-advisory-review}
@@ -4310,6 +4315,70 @@ the trigger set (b) would have widened) and
 sibling mechanical-accept path for a genuinely independent verdict — orthogonal, since this rule's gate fires
 only on `SELF_CLEAR`, never on independent review). Full reasoning and the rejected option:
 [#3048](/backlog/3048-an-operator-approval-has-no-recording-route-on-a-self-author.md).
+
+---
+
+### An independent judge may clear `review:human` once the reviewers accept — except on a protected list that always stays human {#independent-judge-clears-review-human-outside-protected-list}
+
+**Ratified 2026-10-03 by the operator (Nicolas Gilbert) (xne1udi), option B.** Operator, verbatim: "I'd be
+happy to be more lenient on some human acceptance and replace and external judge for now". Of three options
+(A: the judge clears by category; B: the judge replaces the human sign-off except on a protected list; C: the
+judge clears only after an N-hour wait), B was chosen now: "Waiting is a nice option, but I would not use it
+just right now I think, my judgement will become more important once it's closer to a release but we are a
+while back". The protected list and using the same judge as xne1udi's arbiter: "Ok".
+
+**The rule.**
+
+1. **When the judge may act.** Only on a PR that carries `review:human`, whose independent reviewers have
+   accepted for the **current** head, and where the human gate is the only thing left between the PR and
+   the drain. The judge clears through the one sanctioned `clear-human` ceremony, so every precondition that
+   ceremony already carries keeps holding — including
+   [#clear-human-requires-current-head-advisory-review](#clear-human-requires-current-head-advisory-review).
+2. **Who the judge is.** A strong model (Opus) seated from a **different provider and a different actor**
+   than the PR's author. It is never the PR's author and never one of that PR's reviewers. When independence
+   cannot be established — the author's provider or actor is unknown, or equals the judge's — the judge does
+   not clear, and the PR waits for the human. Unknown is refused, never assumed.
+3. **The protected list always stays human.** The judge never clears a PR that touches: **(a)** merge or
+   approval logic — the review gate, drain/merge authority, and the review-label clear paths (the
+   trust-chain roster in `we:scripts/lib/gate-config.mjs` is the floor of this class); **(b)** credentials
+   and secrets; **(c)** anything that weakens a security check; **(d)** the rules layer and every other
+   ratification surface — this statute and its future per-ruling files, and any file that records a ruling
+   (added by the operator's ruling of 2026-10-04, relayed via claude-code-chat, verbatim: "add a protected
+   class for the rules layer and other ratification surfaces, such as `docs/agent/platform-decisions.md` (and
+   its future per-ruling files) and any file that records a ruling. A PR touching them is never
+   judge-clearable and always needs the human ceremony"). The list is checked deterministically
+   where a path or pattern decides it, and the judge itself must refuse when its own reading finds (c).
+   Any doubt resolves to "protected". Widening the judge's reach into the list is a new ruling, not an
+   edit.
+4. **Every clearance leaves a durable record.** The clearance comment on the PR names the judge, its
+   provider and model, and quotes its reasoning; a durable record of each clearance is kept beside it. The
+   operator receives one daily digest of the judge's clearances.
+5. **The operator can turn the judge off without a PR.** A kill switch, held outside the repo, stops every
+   judge clearance at once. An unreadable switch reads as "off" (fail closed).
+6. **An optional wait, default off.** A switch can require the PR to have waited N hours on `review:human`
+   before the judge may clear. It defaults **off**, so a judge clearance is immediate; it exists for the
+   period close to a release, when the operator's own judgment matters more.
+7. **The same judge arbitrates fixer/reviewer disagreements.** When a fixer stands down or objects to a
+   review finding, or the same finding bounces twice, the same independent judge rules: fixer right
+   (record a finding ruling, the PR proceeds), reviewer right (restate the demand precisely), or real
+   conflict (file a decision card and escalate with a recommendation). As arbiter it never overrides a
+   security finding or a mandatory reviewer block alone; there it recommends only.
+
+**What this supersedes, with lineage.** It narrows "review:human stays human-only" — stated in
+[#review-pending-clean-verdict-mechanical-accept](#review-pending-clean-verdict-mechanical-accept) (#3434) and
+in the no-agent-clears-a-human-label invariant (#2416) — to the protected list above. Outside that list, an
+independent judge meeting rules 1–2 may now clear the label. It does **not** change what parks a PR on
+`review:human` ([#review-human-declarative-leash-only](#review-human-declarative-leash-only),
+[#human-is-principle-surface-not-path](#human-is-principle-surface-not-path)); it changes only who may lift
+that park. It does not let an author, a reviewer, or the conveyor's own review sessions clear the label: the
+non-author invariant ([#agent-convergence-independent-validation](#agent-convergence-independent-validation))
+is the reason rule 2 exists. It does not touch the scheduled runner's `landMode`
+([#enforce-flip-triple-gated](#enforce-flip-triple-gated)).
+
+**Lineage:** ratified by xne1udi (operator, 2026-10-03), which began as the fixer/reviewer arbiter proposal
+of 2026-10-02 and was widened in the same discussion to the human sign-off. Build status lives on the
+decision item and its build epic, not here
+([#statute-anchor-states-rule-not-status](#statute-anchor-states-rule-not-status)).
 
 ---
 

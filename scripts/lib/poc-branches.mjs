@@ -35,6 +35,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { canonicalizeSlug, CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -47,6 +48,21 @@ export const POC_REGISTRY_VERSION = 1;
 /** The default graduation target when an entry names none — every POC branch graduates into `main` unless it
  *  says otherwise (a branch stacked on another POC branch is the case this leaves room for). */
 export const DEFAULT_GRADUATION_TARGET = 'main';
+
+/** The repo an entry belongs to when it names none (`owner/name` slug). Every entry registered before the
+ *  `repo` field existed is a Web Everything branch, so the registry stays byte-compatible: an entry with no
+ *  `repo` is exactly what it always was. A sibling-repo branch (e.g. plateau-app's alpha branch) sets `repo`
+ *  so `poc-land` can land on it from that repo's own lane, while every WE-only consumer (the drift sweep, the
+ *  mechanical sync, `deliveryTarget:`, the prototype-tracker guard) keeps seeing only WE branches. */
+export const DEFAULT_POC_REPO = CONSTELLATION_REPOS.we.slug;
+
+const SLUG_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
+/** Canonical `owner/name` for a repo value (legacy `chalbert/<dir>` slugs map to their current org). PURE. */
+export function normalizeRepoSlug(repo) {
+  const v = String(repo ?? '').trim().replace(/\.git$/i, '');
+  return v ? canonicalizeSlug(v) : DEFAULT_POC_REPO;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 // PURE CORE — no fs, no clock
@@ -98,6 +114,7 @@ export function validatePocBranch(entry) {
   else if (normalizeBranchRef(target) === normalizeBranchRef(entry.branch)) errors.push('`target` must differ from `branch` — a branch cannot graduate into itself');
   if (entry.scope != null && (!Array.isArray(entry.scope) || !entry.scope.every(isNonEmptyString))) errors.push('`scope` must be an array of repo-qualified `<repo>:<path>` strings');
   if (entry.graduationItem != null && !isNonEmptyString(entry.graduationItem)) errors.push('`graduationItem` must be an item id string (e.g. "3443")');
+  if (entry.repo != null && !(typeof entry.repo === 'string' && SLUG_RE.test(entry.repo.trim()))) errors.push(`\`repo\` must be an \`owner/name\` GitHub slug when present (default: ${DEFAULT_POC_REPO})`);
   if (entry.autoSync != null && typeof entry.autoSync !== 'boolean') errors.push('`autoSync` must be a boolean when present (opts this branch in/out of #3383\'s mechanical target-into-branch sync)');
   return { ok: errors.length === 0, errors };
 }
@@ -120,10 +137,14 @@ export function normalizeRegistry(parsed) {
     const verdict = validatePocBranch(e);
     const name = normalizeBranchRef(e?.branch);
     if (!verdict.ok) { dropped.push({ branch: name || String(e?.branch ?? ''), errors: verdict.errors }); continue; }
-    if (seen.has(name)) { dropped.push({ branch: name, errors: ['duplicate `branch` — the first entry wins'] }); continue; }
-    seen.add(name);
+    const repo = normalizeRepoSlug(e.repo);
+    const key = `${repo}#${name}`;
+    if (seen.has(key)) { dropped.push({ branch: name, errors: ['duplicate `branch` in the same `repo` — the first entry wins'] }); continue; }
+    seen.add(key);
     branches.push(Object.freeze({
       branch: name,
+      // `undefined` for a WE entry that never named one, so `writeRegistry` round-trips the file unchanged.
+      ...(e.repo != null ? { repo } : {}),
       purpose: String(e.purpose).trim(),
       owner: String(e.owner).trim(),
       dateOpened: String(e.dateOpened).trim(),
@@ -149,10 +170,20 @@ export function normalizeRegistry(parsed) {
  * @param {string} branch
  * @returns {object|null}
  */
-export function findPocBranch(registry, branch) {
+export function findPocBranch(registry, branch, repo = DEFAULT_POC_REPO) {
   const want = normalizeBranchRef(branch);
   if (!want) return null;
-  return (registry?.branches ?? []).find((b) => b.branch === want) ?? null;
+  const wantRepo = normalizeRepoSlug(repo);
+  return (registry?.branches ?? []).find((b) => b.branch === want && entryRepo(b) === wantRepo) ?? null;
+}
+
+/** The repo an (already-normalized or raw) entry belongs to. PURE. */
+export function entryRepo(entry) { return normalizeRepoSlug(entry?.repo); }
+
+/** Only the entries of one repo (default: Web Everything) — what every WE-only consumer iterates. PURE. */
+export function branchesForRepo(registry, repo = DEFAULT_POC_REPO) {
+  const want = normalizeRepoSlug(repo);
+  return (registry?.branches ?? []).filter((b) => entryRepo(b) === want);
 }
 
 /**
@@ -162,7 +193,7 @@ export function findPocBranch(registry, branch) {
  * @param {string} branch
  * @returns {boolean}
  */
-export function isPocBranch(registry, branch) { return findPocBranch(registry, branch) !== null; }
+export function isPocBranch(registry, branch, repo = DEFAULT_POC_REPO) { return findPocBranch(registry, branch, repo) !== null; }
 
 /** The env var {@link resolveAutoSyncEnabled} reads for its global default/kill-switch — mirrors
  *  `we:scripts/lib/lane-concurrency.mjs`'s `WE_MAX_CONCURRENT_LANES` and
@@ -214,7 +245,8 @@ export function upsertPocBranch(registry, entry) {
   const verdict = validatePocBranch(entry);
   if (!verdict.ok) throw new TypeError(`poc-branches: invalid entry — ${verdict.errors.join('; ')}`);
   const name = normalizeBranchRef(entry.branch);
-  const kept = (registry?.branches ?? []).filter((b) => b.branch !== name);
+  const repo = normalizeRepoSlug(entry.repo);
+  const kept = (registry?.branches ?? []).filter((b) => !(b.branch === name && entryRepo(b) === repo));
   const next = normalizeRegistry({ version: registry?.version ?? POC_REGISTRY_VERSION, branches: [...kept, entry] });
   return next;
 }
@@ -226,9 +258,10 @@ export function upsertPocBranch(registry, entry) {
  * @param {string} branch
  * @returns {{version: number, branches: object[]}}
  */
-export function removePocBranch(registry, branch) {
+export function removePocBranch(registry, branch, repo = DEFAULT_POC_REPO) {
   const name = normalizeBranchRef(branch);
-  return normalizeRegistry({ version: registry?.version ?? POC_REGISTRY_VERSION, branches: (registry?.branches ?? []).filter((b) => b.branch !== name) });
+  const want = normalizeRepoSlug(repo);
+  return normalizeRegistry({ version: registry?.version ?? POC_REGISTRY_VERSION, branches: (registry?.branches ?? []).filter((b) => !(b.branch === name && entryRepo(b) === want)) });
 }
 
 /**
@@ -248,7 +281,7 @@ export function validateDeliveryTarget(registry, value) {
   const target = normalizeBranchRef(raw);
   if (target === DEFAULT_GRADUATION_TARGET) return { ok: true, target, isPoc: false, error: null };
   if (findPocBranch(registry, target)) return { ok: true, target, isPoc: true, error: null };
-  const known = (registry?.branches ?? []).map((b) => b.branch);
+  const known = branchesForRepo(registry).map((b) => b.branch);
   return {
     ok: false,
     target,
@@ -298,7 +331,7 @@ export function writeRegistry({ registry, path = POC_REGISTRY_PATH, write = (p, 
  */
 export function primaryPocBranch(o = {}) {
   const reg = readRegistry(o);
-  return reg.branches[0] ?? null;
+  return branchesForRepo(reg)[0] ?? null;
 }
 
 /**

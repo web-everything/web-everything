@@ -13,9 +13,10 @@
  *   with MANY unrelated filler heads present, WITHOUT the spawn count scaling with the filler-head count; (c)
  *   a genuinely unrelated/unpushed lane still correctly stays protected.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -58,26 +59,33 @@ function countGitSpawnsDuring(fn) {
   return { result, spawnCount };
 }
 
-// Inflate origin with N unrelated filler branches, each one commit, from a throwaway clone.
+// Inflate origin with N unrelated filler branches, each one commit off origin's current `main`. Written straight
+// into the bare origin with ONE `git fast-import` (one pack, one process) rather than N × (write + add + commit +
+// push + reset) in a throwaway clone — the same N real remote heads the lane fetches, at a small fraction of the
+// file-system churn (this helper alone was ~15k file events per run of this file).
 function addFillerHeads(n) {
-  const filler = join(base, 'filler');
-  if (!existsSync(filler)) {
-    git(['clone', '--quiet', originDir, filler]);
-  }
+  const mainSha = git(['rev-parse', 'refs/heads/main'], originDir);
+  const data = (s) => `data ${Buffer.byteLength(s)}\n${s}\n`;
+  let stream = '';
   for (let i = 0; i < n; i++) {
-    writeFileSync(join(filler, `filler-${Date.now()}-${i}.txt`), `filler-${i}\n`);
-    git(['add', '.'], filler);
-    gitc(['commit', '--quiet', '-m', `filler ${i}`], filler);
-    git(['push', '--quiet', 'origin', `HEAD:refs/heads/lane/filler-${i}`], filler);
-    git(['reset', '--quiet', '--hard', 'origin/main'], filler); // each filler branches fresh off main
+    stream += `commit refs/heads/lane/filler-${i}\n`
+      + 'committer t <t@t.com> 1700000000 +0000\n'
+      + data(`filler ${i}`)
+      + `from ${mainSha}\n`
+      + `M 100644 inline filler-${i}.txt\n`
+      + data(`filler-${i}`)
+      + '\n';
   }
+  execFileSync('git', ['fast-import', '--quiet'], { cwd: originDir, input: stream });
 }
 
-beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'lane-pool-bound-spawn-'));
-  originDir = join(base, 'origin.git');
-  referenceDir = join(base, 'reference');
-  poolRoot = join(base, 'pool');
+// One origin + reference per FILE (built once, restored after every test) instead of one per test — see
+// fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+let fixtureRoot, sharedFixture;
+beforeAll(() => {
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-bound-spawn-fixture-'));
+  originDir = join(fixtureRoot, 'origin.git');
+  referenceDir = join(fixtureRoot, 'reference');
 
   git(['init', '--quiet', '--bare', '--initial-branch=main', originDir]);
   git(['clone', '--quiet', originDir, referenceDir]);
@@ -85,10 +93,19 @@ beforeEach(() => {
   git(['add', 'file.txt'], referenceDir);
   gitc(['commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', 'origin', 'main'], referenceDir);
+  sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
+});
+
+afterAll(() => sharedFixture?.dispose());
+
+beforeEach(() => {
+  base = mkdtempSync(join(tmpdir(), 'lane-pool-bound-spawn-'));
+  poolRoot = join(base, 'pool');
 });
 
 afterEach(() => {
   rmSync(base, { recursive: true, force: true });
+  sharedFixture.restore();
 });
 
 const N_FILLER = 60;

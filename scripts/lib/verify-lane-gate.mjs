@@ -60,6 +60,7 @@ import { createHash } from 'node:crypto';
 import { SELECTION_FLAG, pinnedMergeBase, decideLocalSelection, referencedTestNeedles, LOCAL_FULL_SUITE_TRIGGERS } from '../readiness/test-selection.mjs';
 import { isPolicyCorePath } from './gate-config.mjs';
 import { isAllowlistedLitterPath } from './lane-litter.mjs';
+import { scanCommands } from './repo-scan-tests.mjs';
 
 /** The pathspecs `testsNaming` greps — every vitest test-file suffix (PR #2680 review: one list, pinned by a test). */
 export const VITEST_TEST_PATHSPECS = Object.freeze(['*.test.ts', '*.test.tsx', '*.test.js', '*.test.jsx', '*.test.mjs', '*.test.cjs', '*.test.mts', '*.test.cts']);
@@ -79,7 +80,7 @@ const WE_SCRIPTS = Object.freeze(['test:unit', 'check:standards']);
  * @param {{vitestCmd: string, checkStandardsCmd: string, scripts?: Iterable<string>|null}} args
  * @returns {{command: string, gateReasons: string[]}}
  */
-export function composeGate({ vitestCmd, checkStandardsCmd, scripts }) {
+export function composeGate({ vitestCmd, checkStandardsCmd, scripts, scanCmds = [] }) {
   const have = new Set(scripts == null ? WE_SCRIPTS : scripts);
   const gateReasons = [];
   let testHalf = null;
@@ -91,11 +92,13 @@ export function composeGate({ vitestCmd, checkStandardsCmd, scripts }) {
   let standardsHalf = null;
   if (have.has('check:standards')) standardsHalf = checkStandardsCmd;
   else gateReasons.push('no `check:standards` script in this checkout — health-gate half skipped');
-  const halves = [testHalf, standardsHalf].filter(Boolean);
+  // #3887 — repo-scanning tests `vitest related` can never select; run after the related half, only where a test half exists.
+  const scanHalves = testHalf && have.has('test:unit') ? scanCmds : [];
+  const halves = [testHalf, ...scanHalves, standardsHalf].filter(Boolean);
   if (halves.length === 0) {
     return { command: `echo ${shellQuote('verify-lane: no test:unit/test/check:standards npm script in this checkout — nothing to run')}`, gateReasons };
   }
-  return { command: halves.join(' && '), gateReasons, testCommand: testHalf, standardsCommand: standardsHalf };
+  return { command: halves.join(' && '), gateReasons, testCommand: testHalf, standardsCommand: standardsHalf, scanCommands: scanHalves };
 }
 
 /** Single-quote a string for safe inclusion in a shell command (handles an embedded `'`). */
@@ -131,10 +134,10 @@ export function canScopeCheckStandards(changedFiles) {
  *     separately-safe, already-ratified mechanism, not gated behind the vitest shrink's not-yet-defaulted flag.
  * Selection is mandatory for the default local gate; opt-out requests require an explicit gate.
  * `scripts` (#3919): the target checkout's npm script names; omitted ⇒ WE-shaped (unchanged). See {@link composeGate}.
- * @param {{base?: string, runGit: (args:string[]) => string, env?: Record<string,string|undefined>, scripts?: Iterable<string>|null}} args
+ * @param {{base?: string, runGit: (args:string[]) => string, env?: Record<string,string|undefined>, scripts?: Iterable<string>|null, fileExists?: (repoRelativePath: string) => boolean}} args
  * @returns {{ command: string, gateReasons: string[], decision: import('../readiness/test-selection.mjs').SelectionDecision & {changedFiles: string[]|null} }}
  */
-export function resolveDefaultGate({ base = 'origin/main', runGit, env = process.env, scripts } = {}) {
+export function resolveDefaultGate({ base = 'origin/main', runGit, env = process.env, scripts, fileExists } = {}) {
   // xpnhz4o — the changed set is the WORKING TREE against the pinned merge-base (tracked edits, staged or not,
   // plus untracked files), not HEAD's committed diff. The gate runs against the working tree, so that is the set
   // it must key on — and a fixer runs the gate BEFORE committing, which under the old "dirty ⇒ full" rule (#3389)
@@ -193,7 +196,14 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
     const vitestCmd = targets.length
       ? `npx vitest related ${targets.map(shellQuote).join(' ')} --run --passWithNoTests`
       : `echo ${shellQuote('verify-lane: no remaining changed file for vitest to relate — vitest half skipped (deletions or excluded untracked scratch)')}`;
-    return { ...composeGate({ vitestCmd, checkStandardsCmd, scripts }), decision };
+    // #3887 — `vitest related` selects tests that IMPORT a changed file; a repo-SCANNING test reads files from disk and
+    // imports nothing, so it was never selected. Run the marked scanners scoped to the changed files (cost ~ the number
+    // of changed files, never the whole repo); see scripts/lib/repo-scan-tests.mjs. Scanner reach is the full changed
+    // set (including scratch-excluded untracked files — a new file with a violation is exactly the case to catch).
+    // `fileExists` is injected by the IO shell (this checkout's own files); omitted ⇒ no scan half, so a fixture or a
+    // sibling checkout without these tests never gets a command naming a test it does not have.
+    const scanCmds = typeof fileExists === 'function' ? scanCommands({ changedFiles, fileExists }) : [];
+    return { ...composeGate({ vitestCmd, checkStandardsCmd, scripts, scanCmds }), decision };
   }
   throw new Error(`unexpected local selection mode: ${local.mode}`);
 }
@@ -461,7 +471,7 @@ export function explicitGateRefusal(gate) {
  * @param {{command: string, decision: object}} gate - `resolveDefaultGate`'s return value
  * @returns {string}
  */
-export function describeGate({ command, decision }) {
+export function describeGate({ command, decision, scanCommands = [] }) {
   if (decision.mode === 'blocked') return `verify-lane gate: BLOCKED selection — ${decision.reasons.join('; ')}`;
   const out = [];
   if (decision.mode === 'shrink') {
@@ -470,6 +480,7 @@ export function describeGate({ command, decision }) {
     out.push('verify-lane gate: FULL SUITE (fallback) — the diff could not be safely scoped:');
   }
   for (const r of decision.reasons || []) out.push(`  - ${r}`);
+  if (scanCommands.length) out.push(`  repo-scanning tests (#3887, not reachable by \`vitest related\`): ${scanCommands.length} command(s), scoped to the changed files where the test supports it`);
   out.push(`  command: ${command}`);
   return out.join('\n');
 }

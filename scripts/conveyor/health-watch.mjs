@@ -58,6 +58,8 @@ export { healthDir, healthSectionLines };
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { laneJournalPath, readLaneJournalTail, reconcileLaneJournalEntry } from '../lib/lane-history.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
+import { laneIndicesIn, poolsWithLanes } from '../lib/lane-pool-scan.mjs';
+import { readVerifyMarker } from '../lib/lane-verify.mjs';
 // #4317 — the same "which paths are DAEMON clones" registry `guard-lane.mjs`/`guard-bash.mjs` already use, so
 // this probe's notion of "a daemon clone" can never drift from the guards'.
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
@@ -395,6 +397,29 @@ export function probeLanePools(logsDir) {
       if (last[2] && last[2] !== 'null') reading.workerWithoutLease = JSON.parse(last[2]);
       out.push(reading);
     } catch { /* skip */ }
+  }
+  return out;
+}
+
+/**
+ * The `fixer-verify-never-settles` smell's input (live 2026-10-04): every lane whose verify marker is `running`,
+ * with the lane's own HEAD, so the smell can tell a request nothing ever picked up (or a dispatched run that
+ * outlived every ceiling) from a normal in-flight gate. Only `running` markers pay for the `git rev-parse`;
+ * every other lane is one small file read. Never throws on a non-directory pool-root entry (shared walk).
+ * @returns {Array<{pool:string, lane:number, sha:string|null, head:string|null, startedAt:string|null, runId:string|null, suites:string|null}>}
+ */
+export function probeLaneVerifyMarkers({ poolRoot, readHead } = {}) {
+  if (!poolRoot) return [];
+  const head = readHead || ((dir) => { try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } });
+  const out = [];
+  for (const pool of poolsWithLanes(poolRoot)) {
+    for (const lane of laneIndicesIn(join(poolRoot, pool))) {
+      const dir = join(poolRoot, pool, `lane-${lane}`);
+      let marker;
+      try { marker = readVerifyMarker(join(dir, '.git')); } catch { continue; }
+      if (!marker || marker.corrupt || marker.status !== 'running') continue;
+      out.push({ pool, lane, sha: marker.sha ?? null, head: head(dir), startedAt: marker.startedAt ?? null, runId: marker.runId ?? null, suites: marker.suites ?? null });
+    }
   }
   return out;
 }
@@ -807,6 +832,10 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.operationRuns = attempt('operationRuns', () => probeOperationRuns(fixtureTick ? { roots: [flags['state-root'] || logsDir], jobsRoot: null } : {}));
   probes.laneJournal = attempt('laneJournal', () => probeLaneJournal({
     poolRoot: flags['lane-pool-root'] || (fixtureTick ? null : defaultPoolRoot(REPO_ROOT)), now,
+  }));
+  // `fixer-verify-never-settles` — fs + one `git rev-parse` per RUNNING marker only. Same fixture rule as above.
+  probes.laneVerifyMarkers = attempt('laneVerifyMarkers', () => probeLaneVerifyMarkers({
+    poolRoot: flags['lane-pool-root'] || (fixtureTick ? null : defaultPoolRoot(REPO_ROOT)),
   }));
   // #4200-ish — cheap, fs-only, every tick: catches a shim baked with a lane-clone path BEFORE that lane resets.
   probes.ghShimLanes = attempt('ghShimLanes', () => probeGhShimLanes());
