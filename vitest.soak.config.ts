@@ -18,6 +18,9 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     setupFiles: ['./vitest.setup.ts'],
+    // tmp-leak fix: one private temp root per run, leak count reported + root removed at teardown
+    // (scripts/lib/test-tmp-root.mjs; WE_TMP_LEAK_MODE / WE_TMP_LEAK_MAX).
+    globalSetup: ['./vitest.globalSetup.mjs'],
     // #xpc3krl — the real review + fix daemons, real rebuild/self-sync, a real bare remote (see the file
     // header above) need the real PATH/env this tier is built to exercise, so it opts OUT of
     // `vitest.setup.ts`'s sandbox-by-default (a fake `gh` on PATH, stripped WE_*/CONVEYOR_*/GH_*/CLAUDE_*

@@ -126,6 +126,23 @@ function envMs(env, key, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+export const SMOKE_LOAD_SCALE_ENV = 'WE_SMOKE_LOAD_SCALE';
+export const SMOKE_LOAD_SCALE_MAX_ENV = 'WE_SMOKE_LOAD_SCALE_MAX';
+export const DEFAULT_SMOKE_LOAD_SCALE_MAX = 4;
+
+// Live 2026-10-04: load ~48 made dispatch-dry-run take 80–115s; smoke-env-timeout
+// held PRs #3903/#3916/#3917 off wev-control and wev-review-daemon. Scale default
+// check budgets with host load, keeping operator overrides absolute and busy-pool caps short.
+/** Pure load factor with injected host probes; unavailable probes leave budgets unchanged. */
+export function smokeLoadFactor(env, { load, cores }) {
+  if (env?.[SMOKE_LOAD_SCALE_ENV] === '0') return 1;
+  try {
+    const maxFactor = envMs(env, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX);
+    const ratio = load() / Math.max(1, cores());
+    return Number.isNaN(ratio) ? 1 : Math.max(1, Math.min(ratio, maxFactor));
+  } catch { return 1; }
+}
+
 /** Non-negative integer env override (unlike {@link envMs}, `0` is a valid, meaningful value — e.g. "no
  *  retries"). Falls back on anything else (missing, negative, non-numeric). */
 function envNonNegInt(env, key, fallback) {
@@ -135,8 +152,9 @@ function envNonNegInt(env, key, fallback) {
 
 /** Resolve every check's budget from env, falling back to a sane default (or to `bounded-child.mjs`'s own
  *  budgets, the single source for the generic/acquire timeouts). @returns {Record<string, number>} */
-export function resolveSmokeBudgets(env = process.env) {
-  return {
+export function resolveSmokeBudgets(env = process.env, { load = () => loadavg()[0], cores = () => cpus().length } = {}) {
+  const factor = smokeLoadFactor(env, { load, cores });
+  const budgets = {
     lanePoolListMs: envMs(env, SMOKE_BUDGET_ENV.lanePoolListMs, resolveChildTimeoutMs(env)),
     laneAcquireMs: envMs(env, SMOKE_BUDGET_ENV.laneAcquireMs, resolveLaneAcquireTimeoutMs(env)),
     laneAcquireWaitMs: envMs(env, SMOKE_BUDGET_ENV.laneAcquireWaitMs, 30_000),
@@ -145,11 +163,19 @@ export function resolveSmokeBudgets(env = process.env) {
     laneReleaseMs: envMs(env, SMOKE_BUDGET_ENV.laneReleaseMs, resolveChildTimeoutMs(env)),
     ghApiMs: envMs(env, SMOKE_BUDGET_ENV.ghApiMs, 30_000),
     ghPrListMs: envMs(env, SMOKE_BUDGET_ENV.ghPrListMs, 30_000),
-    reconcileMs: envMs(env, SMOKE_BUDGET_ENV.reconcileMs, 60_000),
-    dispatchDryRunMs: envMs(env, SMOKE_BUDGET_ENV.dispatchDryRunMs, 45_000),
+    // Live 2026-10-04: the dispatch dry-run's three LIVE passes took ~90s on a quiet host (load ~10), all of it
+    // waiting on gh/git children — the cost grows with the open-PR count, not with load. 45s/60s held every
+    // daemon clone off main (`smoke-env-timeout`). Generous defaults, still load-scaled below.
+    reconcileMs: envMs(env, SMOKE_BUDGET_ENV.reconcileMs, 120_000),
+    dispatchDryRunMs: envMs(env, SMOKE_BUDGET_ENV.dispatchDryRunMs, 180_000),
     treeStaysCleanMs: envMs(env, SMOKE_BUDGET_ENV.treeStaysCleanMs, 10_000),
     daemonBootMs: envMs(env, SMOKE_BUDGET_ENV.daemonBootMs, DEFAULT_DAEMON_BOOT_MS),
   };
+  for (const key of Object.keys(budgets)) {
+    if (key === 'lanePoolBusyCapMs' || key === 'laneAcquireBusyCapMs' || key === 'laneAcquireWaitMs') continue;
+    if (envMs(env, SMOKE_BUDGET_ENV[key], null) === null) budgets[key] = Math.round(budgets[key] * factor);
+  }
+  return budgets;
 }
 
 const firstLine = (e) => String((e && e.message) || e).split('\n')[0];
@@ -181,11 +207,17 @@ const failureLine = (e) => {
 // clock shows the probe really spent >= 90% of its cap, and (3) evidence from OUTSIDE the tree that the host is
 // busy (1-minute load average >= CPU count, `WE_SMOKE_BUSY_LOAD_RATIO` scales it). The rest of the smoke
 // (reconcile, dispatch dry-run, daemon boot, tree-stays-clean) still gates adoption.
+/** lane-pool's own "another acquire still held the shared scan lock" refusal (#xj2k2pp). It names a DIFFERENT
+ *  caller's work, never the tree under test, so it is busy-pool on its own — no host-load check needed. Live
+ *  2026-10-04: this text matched no signature, so the smoke blamed the only overlay (PR #3902/#3903, the
+ *  verify-dispatch ENOTDIR fix) and dropped it twice while no gate ran host-wide. */
+export const LOCK_CONTENTION_SIGNATURE = /scan was still running when this call's --wait-ms elapsed \(lock contention\)|gave up waiting for the shared acquirability-scan lock/;
 export const BUSY_POOL_SIGNATURES = Object.freeze([
   /^[^:]+ failed: timed out after \d+ms \(process group killed\)$/,
   /scan exceeded its \d+ms budget/,
   /gave up waiting for the shared acquirability-scan lock/,
   /no free lane/i,
+  LOCK_CONTENTION_SIGNATURE,
 ]);
 export const SMOKE_BUSY_LOAD_RATIO_ENV = 'WE_SMOKE_BUSY_LOAD_RATIO';
 
@@ -202,7 +234,8 @@ export function busyPoolSkip({ what, detail, elapsedMs, capMs, ctx }) {
   const text = String(detail ?? '');
   if (!BUSY_POOL_SIGNATURES.some((re) => re.test(text))) return null;
   if (!(elapsedMs >= capMs * 0.9)) return null;
-  const busy = typeof ctx.hostBusy === 'function' ? ctx.hostBusy() : hostLooksBusy(ctx.env);
+  const busy = LOCK_CONTENTION_SIGNATURE.test(text)
+    || (typeof ctx.hostBusy === 'function' ? ctx.hostBusy() : hostLooksBusy(ctx.env));
   if (!busy) return null;
   return {
     ok: true, skipped: true, skipReason: 'busy-pool',

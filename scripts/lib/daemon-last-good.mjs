@@ -25,7 +25,7 @@
  */
 
 import { readFileSync, realpathSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import { createHash } from 'node:crypto';
 
@@ -138,4 +138,68 @@ export function lastGoodForClone({
     headSha, state: readState(root, env), dirty, nowMs: now, maxAgeMs: lastGoodMaxAgeMs(env),
     leaseStaleMs: Number(env?.[REBUILD_LEASE_STALE_ENV]) > 0 ? Number(env[REBUILD_LEASE_STALE_ENV]) : REBUILD_LEASE_STALE_MS_DEFAULT,
   });
+}
+
+/** Env knob: how long a managed clone may keep dispatching through review-path lag WHILE its rebuild is running
+ *  (measured from its last adoption, `state.adopted.at`). `0` turns the grace off. */
+export const STALE_GUARD_REBUILD_GRACE_ENV = 'WE_STALE_GUARD_REBUILD_GRACE_MS';
+export const DEFAULT_STALE_GUARD_REBUILD_GRACE_MS = 60 * 60_000;
+
+/** @returns {number} the grace in ms (0 = off). */
+export function staleGuardRebuildGraceMs(env = process.env) {
+  const raw = env?.[STALE_GUARD_REBUILD_GRACE_ENV];
+  if (raw === undefined || raw === null || String(raw).trim() === '') return DEFAULT_STALE_GUARD_REBUILD_GRACE_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_STALE_GUARD_REBUILD_GRACE_MS;
+}
+
+/**
+ * PURE: may a managed clone that is behind on its dispatch path still dispatch because a rebuild of it is
+ * running right now? Live 2026-10-04 (`wev-review-daemon`, PRs #3923/#3924): the rebuild smoke ran for many
+ * minutes under host load while main moved, and every review refused in the meantime. The grace is BOUNDED:
+ * it needs a live build lease (`state.building`, younger than the lease-stale window, owner pid alive) AND a
+ * last adoption (`state.adopted.at`) no older than `graceMs` — so a rebuild that keeps failing cannot hold the
+ * guard open forever. Anything unknown (no lease, no adoption time, grace 0) ⇒ no grace (the guard refuses).
+ * @param {{state:object|null, nowMs:number, graceMs:number, leaseStaleMs?:number,
+ *   ownerAlive?:(building:object)=>boolean}} o
+ * @returns {{grace:boolean, reason:string, target?:string|null, buildAgeMs?:number, sinceAdoptMs?:number}}
+ */
+export function decideRebuildGrace({
+  state, nowMs, graceMs, leaseStaleMs = REBUILD_LEASE_STALE_MS_DEFAULT, ownerAlive = () => true,
+}) {
+  if (!(graceMs > 0)) return { grace: false, reason: 'grace-off' };
+  const b = state?.building;
+  const startedMs = Date.parse(b?.startedAt || '');
+  if (!b || !Number.isFinite(startedMs)) return { grace: false, reason: 'no-build-running' };
+  const buildAgeMs = Math.max(0, nowMs - startedMs);
+  if (buildAgeMs > leaseStaleMs) return { grace: false, reason: 'build-lease-stale', buildAgeMs };
+  let alive = false;
+  try { alive = !!ownerAlive(b); } catch { alive = false; }
+  if (!alive) return { grace: false, reason: 'build-owner-gone', buildAgeMs };
+  const adoptedMs = Date.parse(state?.adopted?.at || '');
+  if (!Number.isFinite(adoptedMs)) return { grace: false, reason: 'no-adoption-time', buildAgeMs };
+  const sinceAdoptMs = Math.max(0, nowMs - adoptedMs);
+  if (sinceAdoptMs > graceMs) return { grace: false, reason: 'grace-expired', buildAgeMs, sinceAdoptMs };
+  return { grace: true, reason: 'rebuild-in-progress', target: b.target ?? null, buildAgeMs, sinceAdoptMs };
+}
+
+/** Same-host lease owner liveness (`daemon-rebuild.mjs#buildLeaseIsLive`'s rule, re-stated — import cycle). */
+function leaseOwnerAlive(building) {
+  if (building.host && building.host !== hostname()) return true;
+  if (!Number.isInteger(building.pid)) return false;
+  try { process.kill(building.pid, 0); return true; } catch (e) { return !(e && e.code === 'ESRCH'); }
+}
+
+/** IO shell over {@link decideRebuildGrace} for one clone. Never throws (an error ⇒ no grace). */
+export function rebuildGraceForClone({
+  root, env = process.env, now = Date.now(), readState = readRebuildStateFile, ownerAlive = leaseOwnerAlive,
+}) {
+  try {
+    return decideRebuildGrace({
+      state: readState(root, env), nowMs: now, graceMs: staleGuardRebuildGraceMs(env), ownerAlive,
+      leaseStaleMs: Number(env?.[REBUILD_LEASE_STALE_ENV]) > 0 ? Number(env[REBUILD_LEASE_STALE_ENV]) : REBUILD_LEASE_STALE_MS_DEFAULT,
+    });
+  } catch {
+    return { grace: false, reason: 'unreadable' };
+  }
 }

@@ -24,7 +24,7 @@ Operator, 2026-10-03 (settled in chat), verbatim:
 
 - "I'd be happy to be more lenient on some human acceptance and replace and external judge for now"
 - On the three options offered — A: judge clears by category; B: the judge replaces the human sign-off except on a protected list; C: the judge clears only after an N-hour wait — the operator chose **B now**: "Waiting is a nice option, but I would not use it just right now I think, my judgement will become more important once it's closer to a release but we are a while back"
-- On the protected list, and on using the same judge for this decision (xne1udi): "Ok"
+- On the protected list, and on using the same judge for this decision (4862): "Ok"
 
 Settled design:
 
@@ -38,4 +38,4 @@ Settled design:
 
 What this changes from the proposal above: the proposal said the arbiter "never clears review:human". The ruling reverses that for PRs outside the protected list — the same judge may now clear it, under rules 1–6.
 
-Codified in the statute layer at `we:docs/agent/platform-decisions.md#independent-judge-clears-review-human-outside-protected-list`. Build: epic `xaojq81` and its stories `xfnv9ay` (decision core), `x6e8z3o` (switches), `xq3kn88` (judge seat runner), `xfbj1fa` (ledger and digest), `x6prrg3` (arbiter), `xfetp9j` (conveyor pass).
+Codified in the statute layer at `we:docs/agent/platform-decisions.md#independent-judge-clears-review-human-outside-protected-list`. Build: epic `5060` and its stories `5062` (decision core), `5063` (switches), `5072` (judge seat runner), `5074` (ledger and digest), `5073` (arbiter), `5075` (conveyor pass).

@@ -711,3 +711,13 @@ calls; shallow history exercises the metered GraphQL fallback. Preserve exact st
 and cache replay assertions on that fallback. Keep the fake host's throttle store private so another
 suite cannot consume its budget. Numbering fixtures likewise pass a private `lockRoot` to the real
 mutex instead of acquiring the developer's shared drain lock.
+
+### Ungated heavy-run observations
+
+`we:scripts/conveyor/heavy-run-ungated.mjs` classifies executable/argv positions and walks
+parent PIDs; shell command text alone is not proof that a heavy child started. Its sample
+counts are observations across time, not distinct invocations. Exercise the sampler with
+`--ps-fixture` and a private `--state-root`; health-watch fixture ticks never append their
+synthetic process observations. For the tick's append path, supply a fake `ps` executable
+through a temporary `PATH`: sandboxed hosts can deny real `ps` with “Operation not permitted”.
+The CLI records that failure as an error sample, which does not count toward a breach.
