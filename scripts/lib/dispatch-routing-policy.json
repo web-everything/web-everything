@@ -73,6 +73,8 @@
     "*": {"inherit": true,"effort": {"claude": "medium","codex": "medium","antigravity": "medium","agy-claude": "medium","agy-gemini": "medium"}},
     "build": {"provider": "codex","model": "astra","effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},
     "fix": {"inherit": true,"effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"}},
+    "fix:ruling-escalation-stronger": {"provider": "claude","model": "opus","effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"},"fallback": []},
+    "fix:ruling-escalation-cross-provider": {"provider": "codex","model": "astra","effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"},"fallback": [{"provider": "claude","model": "opus","effort": "high"}]},
     "ci-heal": {"inherit": true,"effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"}},
     "prepare": {"provider": "codex","model": "astra","effort": {"claude": "low","codex": "low","antigravity": "low","agy-claude": "low","agy-gemini": "low"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]},
     "prepare-decision": {"provider": "codex","model": "astra","effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},

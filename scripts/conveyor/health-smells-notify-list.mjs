@@ -44,4 +44,5 @@ export const NOTIFY_EVEN_IN_SHADOW = new Set([
   'repeated-pr-attempts', // Operator rule, 2026-09-30: surface repeated trials per PR.
   'pr-no-owner',
   'daemon-silent',
+  'ruling-needed-waiting', // Operator order, 2026-10-04 ~08:15 ET: a parked review waited ~8 h on a ruling with no alert (PR #3794).
 ]);
