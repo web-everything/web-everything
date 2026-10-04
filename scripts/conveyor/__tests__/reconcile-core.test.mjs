@@ -1822,6 +1822,16 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
     expect(plan.refusals).toHaveLength(0);
   });
 
+  it('xuxcsw6 — a fix-mark after the advisory does NOT re-dispatch a review while the referral hold stands (the live #3771 loop)', () => {
+    const comments = [{ body: `${ADVISORY_NOTE_MARKER}\n\nround 1`, author: AUTOMATION }, { body: buildAdvisoryFixComment({}), viewerDidAuthor: true }];
+    const pr = prNeedsHuman({ comments });
+    for (let tick = 0; tick < 3; tick++) {
+      const plan = planReconcile({ prs: [{ ...pr, referralHold: { head: 'a'.repeat(40), episode: 'e', count: 5, why: 'review paused: 5 referrals need a ruling; it resumes on a new push, a ruling, or a send-back' } }], agents: [], now: NOW });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-referrals-pending', prNumber: 2601 })]);
+    }
+  });
+
   // The EXACT `web-everything/web-everything#2549` shape: 5 pre-existing advisory notes (rounds 1-5, `review-round:5`)
   // AND the one genuine advisory-fix mark addressing the latest. `isLatestAdvisoryFindingAddressed` correctly
   // reads `addressed: true` here too (same fix as the test above) — but the GENERIC, pre-existing shared round
@@ -1988,6 +1998,18 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
       kind: 'review', prNumber: 2601, attempts: ADVISORY_FIX_ROUND_CAP, cap: ADVISORY_FIX_ROUND_CAP,
     })]);
     expect(plan.dispatch[0].mode).toBeUndefined(); // never `mode: 'advisory-fix'` — this is a review, not a fixer.
+  });
+
+  // xuxcsw6 — live 2026-10-04, #3771: both direct review branches (a fix postdates the advisory; the newest
+  // advisory does not cover the head) bypassed the referral hold and re-dispatched a full review each tick.
+  const referralHold = { head: 'a'.repeat(40), episode: 'e', count: 2, why: 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back' };
+  it('xuxcsw6 — a held PR is refused review-referrals-pending on the stale-advisory branch, and not when the hold lifts', () => {
+    const pr = prNeedsHuman({ comments: live2766Comments(), headRefOid: REAL_2766_HEAD });
+    const held = planReconcile({ prs: [{ ...pr, referralHold }], agents: [], now: NOW });
+    expect(held.dispatch).toEqual([]);
+    expect(held.refusals).toEqual([expect.objectContaining({ kind: 'review-referrals-pending', prNumber: 2601 })]);
+    expect(planReconcile({ prs: [{ ...pr, referralHold: null }], agents: [], now: NOW }).dispatch)
+      .toEqual([expect.objectContaining({ kind: 'review' })]);
   });
 
   // The exemption above is narrow to a head an advisory has NEVER covered. A PR at the SAME cap, whose newest

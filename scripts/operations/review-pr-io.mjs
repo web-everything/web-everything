@@ -543,8 +543,12 @@ export function createReviewPrSinks({
       const persist = (record) => {
         const body = renderReferralRecord(record);
         if (body.length > commentBudget) throw new Error(`mandatory referral record exceeds ${commentBudget} characters`);
-        fresh();
-        labelProvider.postComment(read.repo, read.pr, body);
+        const before = fresh();
+        // xuxcsw6: never repost a record the thread already carries byte-for-byte (trusted-author read).
+        const same = r => JSON.stringify(r) === JSON.stringify(record);
+        if (!readReferralRecords(before.comments, context(before)).records.some(same)) {
+          labelProvider.postComment(read.repo, read.pr, body);
+        }
         const state = fresh();
         const parsed = readReferralRecords(state.comments, context(state));
         if (parsed.malformed || !parsed.records.some(r => JSON.stringify(r) === JSON.stringify(record))) {

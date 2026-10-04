@@ -1107,6 +1107,20 @@ export function acceptLabelDropped({ labels, comments, headSha, now, graceMs = A
   return Number.isFinite(at) && now - at >= graceMs;
 }
 
+/**
+ * xuxcsw6 — the human-parked referral hold gates EVERY review emission, not only {@link dispatchReviewRow}.
+ * The two advisory-fix branches push `kind: 'review'` directly; a parked review posts no fresh advisory note,
+ * so their "fix postdates the advisory" test stayed true and re-dispatched a full review each tick on an
+ * unchanged head (live 2026-10-04, #3771). Wake-ups (new head, a ruling, a send-back) clear `pr.referralHold`.
+ */
+function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
+  if (!pr?.referralHold) return false;
+  refuse('review-referrals-pending', {
+    ...withPhase, ...extra, referralHold: pr.referralHold, why: pr.referralHold.why,
+  });
+  return true;
+}
+
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
   const ci = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup });
@@ -1125,12 +1139,7 @@ function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }
 function dispatchReviewRow({
   pr, requiredChecks, withPhase, base, attempts, roundCap, refuse, refuseCapExhausted, dispatch, extra = {}, now = 0,
 }) {
-  if (pr.referralHold) {
-    refuse('review-referrals-pending', {
-      ...withPhase, ...extra, referralHold: pr.referralHold, why: pr.referralHold.why,
-    });
-    return;
-  }
+  if (refuseReferralHold({ pr, refuse, withPhase, extra })) return;
   // ── `draft` (draft-first PRs, operator-approved 2026-09-27) — checked FIRST, ahead of every other refusal
   // in this function, including `already-reviewed-head`: a draft PR is never owed a review no matter what its
   // `review:*` label or its comment thread says, because GitHub itself will not surface it for review and
@@ -1990,6 +1999,7 @@ export function planReconcile({
           const latest = headSha ? latestAdvisory(trustedComments) : undefined;
           const advisoryIsStale = Boolean(latest) && !advisoryCoversHead(latest, headSha);
           if (advisoryIsStale) {
+            if (refuseReferralHold({ pr, refuse, withPhase })) continue;
             if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
             dispatch.push({
               ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
@@ -2046,6 +2056,7 @@ export function planReconcile({
       // stops it and hands it to a person. A normal PR that has never addressed its advisory finding (the
       // ordinary `!addressed` branch above) is completely unaffected — it never reaches this line at all.
       const advisoryFindingsHere = countFindings(pr?.comments);
+      if (refuseReferralHold({ pr, refuse, withPhase })) continue;
       if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
       dispatch.push({
         ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
