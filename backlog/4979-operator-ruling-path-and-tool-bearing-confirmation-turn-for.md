@@ -2,10 +2,11 @@
 bornAs: x5w7u24
 kind: story
 size: 8
-status: active
+status: resolved
 scope: ["we:scripts/lib/jury-core.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/lib/__tests__/jury-core.test.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
 dateOpened: "2026-10-02"
 dateStarted: "2026-10-04"
+dateResolved: "2026-10-04"
 tags: []
 ---
 
