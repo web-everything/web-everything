@@ -40,21 +40,34 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
      comes from the PR's own merge commit, so a value the job publishes is the PR's claim, not a fact. The
      drain therefore **derives the tested main SHA itself** from data the PR cannot write. **Default: the
      exact one**, the first parent of the merge commit GitHub built for the event (`refs/pull/<n>/merge` as
-     of the run's trigger), read through the API by the drain. **Fallback, only when the API gives no exact
-     value:** main's first-parent tip as of the run's original `created_at` (never `run_started_at`, which a
-     rerun resets) **minus a safety margin** (module constant `TESTED_SHA_FALLBACK_MARGIN_MIN`, 10). The
-     margin exists because the merge commit is built before the run is created and commit dates are not push
-     times; the fallback therefore errs **older**, which can only cause an extra re-check, never skip one.
-   - **A claim can only add re-checks, never remove them.** Add a one-line step to `we:.github/workflows/ci.yml`,
-     right after checkout, that records `git rev-parse HEAD^1` as a check-run annotation or job output. The
-     drain reads it only as a *hint*: the effective tested SHA is the **older** (more ancestral on main's
-     first-parent line) of the derived value and the claimed one. A forged "current tip" therefore changes
-     nothing; a forged old value only causes extra re-checks, which the per-PR cap in step 3 already bounds.
-     A hint that is not a commit on main's first-parent line is ignored.
+     of the run's trigger), read through the API by the drain.
+   - **No exact value means unknown, and unknown is never guessed.** There is **no timestamp fallback**. A
+     commit date is not a push time, so "main's tip as of `created_at`" can name a commit the run never
+     tested (a main commit pushed after the run was created can carry an older commit date, whatever
+     safety margin is subtracted), and a guess that is wrong in that direction reads an untested main as
+     tested. **"Exact" means pinned to the run, not read from the live merge ref**: the drain accepts a
+     merge commit only when its second parent equals the run's `head_sha` (the PR head the run built) and it
+     comes from a source tied to the run (the run's checkout record), never from `refs/pull/<n>/merge` as it
+     stands now, which GitHub rebuilds when main moves and whose first parent would then be a newer,
+     untested main. When no such pinned merge commit is available (the merge ref was deleted or rebuilt, the
+     second parent does not match, the call fails, or the field is absent), `readTestedMainSha` returns `{ state: 'unknown' }`. The two
+     callers then fail closed: this story's gate treats `unknown` as **moved** (re-check), and the main-red
+     gate (#xca0u65) grants **no exemption**. A re-check costs one CI cycle, bounded by the per-PR cap in
+     step 3; a wrong "tested" costs an untested merge.
+   - **A claim can only add re-checks, never remove them, and never stands in for the derived value.** Add a
+     one-line step to `we:.github/workflows/ci.yml`, right after checkout, that records `git rev-parse HEAD^1`
+     as a check-run annotation or job output. The drain reads it only as a *hint*: when the derived value is
+     exact, the effective tested SHA is the **older** (more ancestral on main's first-parent line) of the
+     derived value and the claimed one. A forged "current tip" therefore changes nothing; a forged old value
+     only causes extra re-checks, which the per-PR cap in step 3 already bounds. A hint that is not a commit
+     on main's first-parent line is ignored. **When the derived value is `unknown`, the hint is not used at
+     all** (the PR's own job wrote it, so it cannot establish a tested commit by itself): the result stays
+     `unknown`.
    Shared helpers live in `we:scripts/lib/tested-main-base.mjs`, which the main-red story (#xca0u65) also
-   uses: `readTestedMainSha(run)` (derive, then apply the hint rule) and `mainMovedSince(testedMainSha, mainTip)`.
-   A run for which neither a derived nor a claimed SHA is available (an older run) counts as "moved", the
-   safe direction.
+   uses: `readTestedMainSha(run)` (derive exactly, then apply the hint rule; returns `{ state: 'exact', sha }`
+   or `{ state: 'unknown', reason }`) and `mainMovedSince(tested, mainTip)`, which returns "moved" for an
+   `unknown` input. A run for which no exact SHA can be derived (an older run, a deleted merge ref) counts
+   as "moved", the safe direction.
 2. **What counts as "main moved".** `mainMovedSince` walks main's first-parent commits in
    `testedMainSha..mainTip`. Main moved when **any** of them is not a drain bookkeeping commit. Drain
    bookkeeping commits (the JIT-numbering commit and the resolve-on-land commit, which land minutes after each
@@ -73,9 +86,11 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
    a commit whose file list cannot be read in full (the compare API truncates its commit and file lists,
    around 250 commits and 300 files) counts as a real move, never as bookkeeping. Without this exclusion, merge A's own bookkeeping commit lands during B's rebuilt CI run, B
    reads as stale again, and the queue stalls.
-3. **Pure predicate** `needsMainMovedRecheck({ policy, moved, runStartedAt, recheckCount, now })`:
+3. **Pure predicate** `needsMainMovedRecheck({ policy, moved, testedUnknown, runStartedAt, recheckCount, now })`:
    - `if-older-than-N-min` (default): re-check only when main moved **and** the PR's last green run started
-     more than `recheckMaxAgeMin` (30) minutes ago.
+     more than `recheckMaxAgeMin` (30) minutes ago. **Exception:** when the tested main commit is `unknown`
+     (step 1), the run's age is not consulted and the PR is re-checked: the age gate exists to trust a fresh
+     run whose tested commit is known, and an unknown tested commit gives nothing to trust.
    - `always`: re-check whenever main moved (per step 2).
    - `off`: never re-check (today's behaviour).
    - **Bounded.** A PR already re-checked `RECHECK_MAX_PER_PR` times (module constant, 2) in the last 6 hours
@@ -124,12 +139,26 @@ Steps 1 to 5.
     touches `we:scripts/` (or `we:.github/`) counts as a real move: re-check. The same subject over a diff that
     stays inside the drain's rewrite paths is bookkeeping.
   - **Truncated or unreadable file list:** a main commit with the drain's subject whose file list is
-    truncated, or cannot be read, counts as a real move. With no exact tested SHA available, the fallback
-    returns main's tip as of `created_at` minus `TESTED_SHA_FALLBACK_MARGIN_MIN`, so a main commit landing
-    inside the margin counts as moved.
+    truncated, or cannot be read, counts as a real move.
+  - **Unknown tested commit is never guessed (RED today):**
+    `we:scripts/lib/__tests__/tested-main-base.test.mjs` pins that there is no timestamp path. Fixture: main
+    has commits M0 (tested), then a commit M1 whose **commit date is older than the run's `created_at` minus
+    10 minutes** but which arrived on main **after** the run (a backdated or cherry-picked commit; commit
+    dates and arrival order disagree). With the API giving no exact merge-commit parent, `readTestedMainSha`
+    returns `{ state: 'unknown' }` (not M1, not M0), `mainMovedSince` returns moved, and the PR is
+    re-checked. The same fixture under #xca0u65's exemption is **not exempt**. Also: the merge-commit
+    field absent, the call throwing, and a deleted merge ref each give `unknown`. So does a **rebuilt merge
+    ref**: the live merge commit's first parent is a newer main than the run tested, or its second parent
+    differs from the run's `head_sha`; it is never read as the tested commit. (The 10 minutes in this
+    fixture is a fixture value only; no such margin exists in the module.) After the per-PR re-check cap
+    is reached, a PR with an `unknown` tested commit proceeds as `off` would; that is intended and bounded,
+    not a hole. The module exports no
+    fallback margin constant (a test asserts `TESTED_SHA_FALLBACK_MARGIN_MIN` is not exported).
   - **Forged tested-SHA hint:** a run whose job published main's current tip as its tested SHA, while the
-    derived value (from the run's `created_at`) is older, is re-checked. A hint older than the derived value
-    makes the effective SHA the older one. A hint that is not on main's first-parent line is ignored.
+    exact derived value is older, is re-checked. A hint older than the derived value makes the effective SHA
+    the older one. A hint that is not on main's first-parent line is ignored. **A hint with an `unknown`
+    derived value is ignored:** the result stays `unknown` and the PR is re-checked, even when the hint
+    names main's current tip.
   - **Commit identity, not clock:** a run rerun after main moved (new `startedAt`, old tested SHA) is
     re-checked. A run queued and started late, but whose tested SHA equals main's tip, is not.
   - **Bounded:** a PR already re-checked twice in the window is not re-checked a third time; one
@@ -138,7 +167,9 @@ Steps 1 to 5.
     three passes over the same PR still re-check it at most twice, because the count is read from the
     drain's state, not the journal. With the drain's state store unreadable or unwritable, the PR is **not**
     re-checked and the refusal alert path is called once.
-  - A run with no recorded tested SHA counts as moved.
+  - A run with no derivable tested SHA counts as moved, under every policy value that re-checks (`always`
+    and the default `if-older-than-N-min` alike: an `unknown` tested commit is not subject to the age
+    threshold, because without a tested commit the run's age proves nothing).
   - Default (no config): behaves as `if-older-than-N-min` with 30.
   - A bad `recheckMaxAgeMin` falls back to 30, through the loader.
   - **Replay of failure mode (2):** PRs A and B are both green against main M0, B's green run started more

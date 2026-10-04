@@ -61,8 +61,18 @@ run.
    `{ file, hash }` in the merged result is **caused** when it is not in the base result. If the base run did
    not refuse at all and the merged run does, every merged refusal is caused. A refusal is **also** caused
    when its `file` is among the PR's changed files (`git diff --name-only <baseRef>...HEAD`) or its `hash`
-   names a pending card the PR adds or edits: a PR that touches a refusing file owns it. Otherwise it is
-   **inherited**. The file-in-the-diff test alone is not enough, because a PR can cause a refusal **without touching the
+   names a pending card the PR adds or edits: a PR that touches a refusing file owns it.
+   - **Inherited needs positive proof; caused is the default.** A refusal is **inherited** only when all of
+     these hold: the base run **completed without throwing** and returned a structured `refusals` list (empty
+     or not, even when it also carries an `error` string), that list contains
+     the same `{ file, hash }`, and neither the file nor the hash is touched by the PR. A refusal that is
+     **new against current main** is caused, even when its file is not in the PR's diff. Anything short of
+     that proof is caused, never downgraded (the one exception is a bare lane with no `baseRef`, below, and
+     PR CI judges the same tree again): the base run threw or returned no structured list; the merged
+     run refuses with an `error` string but no parsable `refusals` list (so the keys cannot be compared);
+     `baseRef` is stale (the rule re-fetches `baseRef` first, and if the fetch fails in PR CI the base
+     comparison counts as failed, below). The warning is reserved for a refusal main **already holds**.
+   - **Why the file-in-the-diff test alone is not enough.** A PR can cause a refusal **without touching the
    refusing file**: it narrows the drain's rewrite scope, edits the refusal logic in
    `we:scripts/lane-drain.mjs`, or moves or renames the scope constant, and citations already on main start
    refusing though neither they nor their cards are in `git diff --name-only`. The differential catches all of
@@ -121,6 +131,17 @@ Steps 1 to 4.
     outside the scope. Neither that file nor its card appears in `git diff --name-only`. Expect **an error**,
     not a warning. A second case changes the refusal logic itself so a previously accepted citation now
     refuses: also an error.
+  - **New against current main is caused, wherever the file is (RED today):** a PR whose diff touches only
+    an unrelated file, merged onto a main tip that has moved since the PR branched, where the merged tree
+    refuses `{ file: F, hash: H }` and the **successful** base run's `refusals` list does not contain it,
+    and neither `F` nor the card for `H` is in `git diff --name-only`: an **error**, not a warning. The same
+    PR with `{ F, H }` present in the base list: a warning.
+  - **No proof, no downgrade (RED today):** each of these gives an **error**, never a warning, in PR CI:
+    the base run returns an `error` string with no `refusals` list, so a merged refusal whose file is not in
+    the diff is not proven inherited; the base run returns `refusals: undefined`; the merged run returns
+    an `error` with no parsable `refusals` list (any refusal is an error, since no file is known to
+    compare); the `baseRef` fetch fails. The error names which proof was missing. A base run that
+    returns `refusals` **and** an `error` string still proves inherited for the keys it lists.
   - **Inherited stays inherited under the differential:** a refusal present in both the base run and the
     merged run, from a PR that touches neither the sweep, the file nor the card, is still a warning.
   - **Base comparison failure in PR CI:** with the base dry run injected to throw, every merged refusal is an

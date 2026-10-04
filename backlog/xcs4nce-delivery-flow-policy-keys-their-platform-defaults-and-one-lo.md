@@ -63,7 +63,7 @@ dispatched, not when a PR merges (`we:scripts/conveyor/build-dispatch-policy.mjs
 
 **Loader** (`we:scripts/lib/delivery-policy.mjs`):
 
-- `loadDeliveryPolicy({ root, env })` returns `{ prCi, mergeGate, dispatchGate, heavyQueue, drain, sources, warnings }`.
+- `loadDeliveryPolicy({ root, env, ref })` returns `{ prCi, mergeGate, dispatchGate, heavyQueue, drain, sources, warnings, filesRead }`.
   For each field, `sources` says `default` or `config`.
 - The defaults come from `we:config/platformDefaults.ts`, transpiled once per process.
 - The project file is `we:webeverything.config.json` (at `root`), or the path in `WE_POLICY_CONFIG`. A dimension
@@ -89,9 +89,35 @@ dispatched, not when a PR merges (`we:scripts/conveyor/build-dispatch-policy.mjs
     path is already a registered policy-tier, `leash: 'spec'` member** (`isPolicySpecPath` in
     `we:scripts/lib/gate-config.mjs`, the one registry; the loader asks it, nothing else lists targets). Any
     other pointer falls back to the default for that field with a warning naming the path. This holds with
-    or without a `ref`, and for a pointer found inside a pointed-to file. The MVP registers **no** pointer
+    or without a `ref`, for a pointer found inside a pointed-to file, and for a pointer found inside a
+    `WE_POLICY_CONFIG` file. The MVP registers **no** pointer
     target, so the pointer form is effectively off until a later story registers a target file in
     `we:scripts/lib/gate-config.mjs`; that registration is itself a human-reviewed edit of the roster.
+    The registry check has four edge rules, so no JSON file can be pointer-reachable without being gated:
+    - **The registry is the base's, with a `ref`.** The registered set is read from `we:scripts/lib/gate-config.mjs`
+      at the same `ref` as the policy file, so a PR cannot register its own target in the same change that
+      points at it and have the loader honour it before a human has reviewed the roster edit. The loader
+      gets the base's registry through `readPolicySpecRegistryAt(ref)`, a new export of
+      `we:scripts/lib/gate-config.mjs` that reads the base's copy of that file with `git show` into a
+      temp directory and loads **that** copy; it never executes the PR's copy. With no `ref`, the live
+      `isPolicySpecPath(path)` is used. If the base registry cannot be loaded, every pointer is refused.
+    - **The check runs on the resolved real path, and a registered path that is a symlink is refused.**
+      With no `ref`: `realpath` on the working tree, and a registered path whose `lstat` is a symlink is
+      refused. With a `ref`: the file is read from git, so the check uses the **git tree entry**
+      (`git ls-tree <ref> -- <path>`): mode `120000` (a symlink) is refused, and a path that is not a
+      regular blob (mode `100644`/`100755`) at that ref is refused. Either way editing a symlink's
+      unregistered target cannot change a gated file's content.
+      Matching is on the normalized repo-relative path (no `./`, no `..` segments, case as stored in git).
+    - **JSON targets only.** A pointer target must end in `.json`; any other extension is refused even if
+      registered.
+    - **The reach set is auditable.** `loadDeliveryPolicy` returns `filesRead`, the list of every **policy-value
+      source** it opened: the root file and each honoured pointer target (never the platform defaults file,
+      which is code, not a project value). Every entry must be the root file `we:webeverything.config.json`
+      or pass the registry check above; a `WE_POLICY_CONFIG` file counts as a root file only when it is
+      inside the daemon's own state dir (operator-owned, not in the repo), and one inside `root` must itself
+      be registered or it is ignored with a warning. The loader asserts this before returning and drops
+      (with a warning) any value that came from a file that fails, so "every file the loader can reach is human-gated" is
+      checked on each run, not only argued.
   - **Confinement.** A pointer path must resolve **inside `root`** (after `realpath`, so a symlink out of the
     tree is refused); an absolute path, a `..` escape, or a symlink out falls back to the default for that
     field with a warning. This is checked in addition to the registered-target rule above, never instead of it. `WE_POLICY_CONFIG` is honoured only for a local daemon process (never when
@@ -138,7 +164,7 @@ Types, defaults, the loader, the journal and the CLI. No consumer changes: each 
   - `recordPolicyEvent` then `readPolicyEvents` round-trips. A write to an unwritable path returns without
     throwing.
   - **CLI keys:** the flattened `dimension.field` paths of the five policy objects in the
-    `we:scripts/lib/delivery-policy.mjs --json` output (not `sources` or `warnings`) equal the flattened paths of
+    `we:scripts/lib/delivery-policy.mjs --json` output (not `sources`, `warnings` or `filesRead`) equal the flattened paths of
     `PLATFORM_DELIVERY_POLICY_DEFAULTS` and the nine rows of the Keys table, no more and no fewer.
   - **Sanitising:** a reason with a newline and an ESC byte comes back without them, as one journal line; a
     5 000-character reason is cut to `POLICY_EVENT_REASON_MAX` (200) with `…`; a reason of exactly that length
@@ -156,13 +182,29 @@ Types, defaults, the loader, the journal and the CLI. No consumer changes: each 
     git. A pointer inside a pointed-to file is refused the same way. With a temp registry that registers the
     target, the pointer is honoured (source `config`), proving the check reads the registry rather than a
     hardcoded list.
+  - **Pointed-to file edge cases (RED today):**
+    - With a `ref`, a PR head that both registers a new target in `we:scripts/lib/gate-config.mjs` and
+      points at it is **refused**: the registry is read at the base ref, where the target is not registered.
+    - A registered path that is a symlink to an unregistered in-`root` file is refused, even though the
+      symlink's own path is on the roster. The same, with a `ref`: a symlink committed at the base ref (git
+      mode `120000`) is refused, using the tree entry, not the working tree. A registry reader test: the
+      base registry is loaded from a temp copy, never by executing the PR's own copy of that file (a PR copy
+      with a side effect on load leaves it unrun). A pointer written with a leading dot-slash and a parent-directory hop that resolves to a target is judged on its
+      normalized path, so it cannot dodge or borrow a registration.
+    - A registered target that does not end in `.json` is refused.
+    - A pointer inside a `WE_POLICY_CONFIG` file to an unregistered file is refused the same way.
+    - **Reach set:** for each of the cases above and for a clean honoured pointer, every entry of
+      `filesRead` is the root file or passes `isPolicySpecPath`. A test double that makes the loader open
+      an unregistered file (forcing the internal check to be bypassed) still returns no value from that
+      file: the loader's own post-check drops it with a warning.
 - **Capability (RED today, fails before this lands):** `we:scripts/lib/__tests__/gate-config.test.mjs`:
   `we:webeverything.config.json` is a registered policy-tier, `leash: 'spec'` member (so a PR touching it
   forces `review:human`), and `we:scripts/lib/delivery-policy.mjs` is a registered engine-tier member.
   **Pointer files:** a test that a pointer-target file (a temp JSON file the loader is pointed at) forces
   `review:human` **when it is edited alone**, with `we:webeverything.config.json` untouched, once it is
-  registered. Together with the loader's registered-only pointer test above, no policy value can reach a
-  daemon from a file outside the human-gated roster.
+  registered. Together with the loader's registered-only pointer test above (including its symlink and
+  base-registry cases) and its `filesRead` reach-set assertion, no policy value can reach a daemon from a file outside the human-gated
+  roster.
 - **Capability (RED today, fails before this lands):** Replay of the failure this prevents: the defaults are the safe ones. With no config file, a test asserts
   `mergeGate.onMainRed` is `halt`, `drain.onStepRefusal` is `alert` and `dispatchGate.overlapOverride` is
   `off`. These are the settings whose absence let 2026-10-03 happen with no stop and no alert.
@@ -197,6 +239,6 @@ character and a 5 000-character reason, showing it stripped and cut.
    loader, and passes after.
 2. `node we:scripts/lib/delivery-policy.mjs --json` prints every key in the Keys table (nine today) with its
    default. **Executable:** a `we:scripts/lib/__tests__/delivery-policy.test.mjs` case asserts the CLI output's flattened
-   `dimension.field` paths (the five policy objects, not `sources` or `warnings`) equal those of
+   `dimension.field` paths (the five policy objects, not `sources`, `warnings` or `filesRead`) equal those of
    `PLATFORM_DELIVERY_POLICY_DEFAULTS`, so a key added to the table without a default, or a default missing
    from the output, fails the test instead of passing a hand count.

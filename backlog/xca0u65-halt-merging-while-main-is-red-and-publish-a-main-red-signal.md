@@ -42,8 +42,8 @@ Prepared 2026-10-03 against `838e849ab`.
      green run rerun after main turned red gets a new start time but still tests the old merge commit, and a
      queued run can start after the main it merged against went stale. So the exemption uses the run's tested
      main SHA (`readTestedMainSha`, `we:scripts/lib/tested-main-base.mjs`, built by story #xi8vgqq): the PR is
-     exempt only when `redSha` is an ancestor of, or equal to, that tested SHA. A run with no tested SHA is
-     not exempt. That SHA is **derived by the drain, never taken from a value the PR's own job publishes**
+     exempt only when `redSha` is an ancestor of, or equal to, that tested SHA. A run whose tested SHA is
+     `unknown` (no exact value can be derived; #xi8vgqq step 1 has no timestamp fallback) is not exempt. That SHA is **derived by the drain, never taken from a value the PR's own job publishes**
      (see the provenance rule in #xi8vgqq step 1): a PR that could set it could exempt itself from the halt.
    - **Unreadable main state fails closed.** `defaultReadMainRuns` can throw, hit a rate limit, or return no
      runs at all. The read returns `{ state: 'unknown' }`, distinct from `red` and `green`, and the gate treats
@@ -101,6 +101,12 @@ Steps 1 to 5 in WE. The band itself is a plateau-app follow-up.
     with a working read, the PRs are judged normally.
   - **Forged tested SHA:** a PR whose job published `redSha`'s descendant as its tested SHA, while the
     drain-derived value predates `redSha`, is still skipped (the exemption reads the derived value).
+  - **Unknown tested commit is not exempt (RED today):** a PR whose run has no exact derivable tested main
+    SHA (`readTestedMainSha` returns `{ state: 'unknown' }`: merge ref gone, field absent, call failed) is
+    skipped under `halt`, even when the PR's own job published a hint naming main's current tip, and even
+    when the run's `created_at` falls after `redSha`. The exemption never rests on a timestamp or on a
+    value the PR wrote (the backdated-commit fixture in `we:scripts/lib/__tests__/tested-main-base.test.mjs`, story #xi8vgqq, is
+    also run through this gate: not exempt).
   - Break-glass set: lands under `halt`.
   - One event per red window, not one per pass.
   - **Replay of 2026-10-03:** a main-run fixture with the red window open, plus three ready PRs tested before
