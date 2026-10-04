@@ -62,7 +62,7 @@ describe('ruling notice gh boundary', () => {
     expect(releaseClaim).toHaveBeenCalledWith({ repo: 'we', pr: 3794, kind: 'fix', owner: 'test-dispatcher', lockRoot: undefined });
     expect(spawnAgent).not.toHaveBeenCalled();
     expect(err).toBeInstanceOf(Error);
-    expect(err.message).toBe('dispatch-env-fault: ruling notice post failed for PR #3794 (gh pr comment --repo web-everything/web-everything): gh pr comment failed (exit 1): expected the "[HOST/]OWNER/REPO" format, got "we"');
+    expect(err.message).toBe('dispatch-env-fault: ruling notice post failed for PR #3794 (gh pr comment --repo web-everything/web-everything): gh comment failed (exit 1): expected the "[HOST/]OWNER/REPO" format, got "we"');
     expect(err).not.toHaveProperty('status');
     expect(err).not.toHaveProperty('stderr');
     const why = describeDispatchFailure(err);

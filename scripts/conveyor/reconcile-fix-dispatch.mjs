@@ -988,7 +988,7 @@ export function dispatchFix(planned, {
       // PR #3794 — a failed gh notice is an environment fault, before any Claude spawn.
       let target = repo;
       try { target = ghRepoSlug(repo); } catch { /* unresolvable: name what we were given */ }
-      throw new Error(`${DISPATCH_ENV_FAULT_PREFIX} ruling notice post failed for PR #${planned.pr} (gh pr comment --repo ${target}): ${describeSpawnFailure(e, { label: 'gh pr comment' })}`);
+      throw new Error(`${DISPATCH_ENV_FAULT_PREFIX} ruling notice post failed for PR #${planned.pr} (gh pr comment --repo ${target}): ${describeSpawnFailure(e, { label: 'gh comment' })}`);
     }
     if (planned.rulingNotAddressed?.rung) {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ruling-not-addressed rung ${planned.rulingNotAddressed.rung.at} (${planned.rulingNotAddressed.rung.id}) model=${ladderTable?.model ?? 'default-fix-route'}`);
