@@ -1,14 +1,24 @@
+/**
+ * @repo-scanning-test scope=files — verify (#3887) runs this with VERIFY_SCAN_FILES=<changed files> so only those
+ * files are scanned; with the variable unset it scans every file (CI / `vitest run`). See scripts/lib/repo-scan-tests.mjs.
+ */
 import { describe, expect, it } from 'vitest';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isScannedFile, SCAN_ROOTS, scanMultiRepo, validateAllowlist } from '../lib/multi-repo-scan.mjs';
+import { scanScope } from '../lib/repo-scan-tests.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const read = (file) => readFileSync(resolve(root, file), 'utf8');
-const sources = new Map(SCAN_ROOTS.flatMap((dir) => readdirSync(resolve(root, dir), { recursive: true })
-  .map((name) => `${dir}/${name}`).filter(isScannedFile).map((file) => [file, read(file)])));
-const allowlist = JSON.parse(read('scripts/lib/we-only-checks.json'));
+// Scoped (verify): scan only the changed files that still exist; a deleted file's allowlist entry is still judged
+// (it is in the scope but not in `sources`, so validateAllowlist reports it missing). Unscoped: the whole tree.
+const scope = scanScope();
+const sources = new Map((scope
+  ? [...scope].filter((file) => isScannedFile(file) && existsSync(resolve(root, file)))
+  : SCAN_ROOTS.flatMap((dir) => readdirSync(resolve(root, dir), { recursive: true }).map((name) => `${dir}/${name}`).filter(isScannedFile))
+).map((file) => [file, read(file)]));
+const allowlist = JSON.parse(read('scripts/lib/we-only-checks.json')).filter(({ file }) => !scope || scope.has(file));
 
 it('keeps every scanned source repo-explicit or specifically allowlisted', () => {
   expect(validateAllowlist(allowlist, sources)).toEqual([]);
