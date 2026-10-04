@@ -5,16 +5,9 @@ import * as nodeFs from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import { ourTmpEntryPattern } from '../lib/our-tmp-prefixes.mjs';
+import { TMP_SWEEP_DEFAULTS } from './tmp-sweep-config.mjs';
 
-export const TMP_SWEEP_DEFAULTS = Object.freeze({
-  tmpSweepEnabled: true,
-  tmpSweepEveryMs: 24 * 60 * 60 * 1000,
-  tmpSweepOlderThanMs: 24 * 60 * 60 * 1000,
-  tmpSweepBatchSize: 200,
-  tmpSweepPauseMs: 50,
-  tmpSweepMaxDeletesPerRun: 20000,
-  tmpSweepTimeBudgetMs: 15000, // keeps the sweep well inside the 60s tick budget; a capped run resumes next tick
-});
+export { TMP_SWEEP_DEFAULTS };
 
 export function readBusyTopLevel(tmpRoot, { run = execFileSync } = {}) {
   const roots = new Set([resolve(tmpRoot), nodeFs.realpathSync(tmpRoot)]);

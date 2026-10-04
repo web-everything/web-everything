@@ -30,7 +30,7 @@
  *      health watch's own last-tick-completed age.
  */
 
-import { TMP_SWEEP_DEFAULTS } from './tmp-sweep.mjs';
+import { TMP_SWEEP_DEFAULTS } from './tmp-sweep-config.mjs';
 import { foldPrAttempts } from './health-pr-attempts.mjs';
 import { isHighEntropyToken } from '../lib/secret-scrub.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from './health-smells-notify-list.mjs';
