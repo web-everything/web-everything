@@ -1466,7 +1466,7 @@ if (IS_CLI) {
         lines.push(`  → fix    PR #${d.pr} (${itemLabel}) — ${who} (${d.sessionSlug}), ${laneInfo}`);
       }
       for (const h of (result.terminalHoldsReleased ?? [])) lines.push(`  scope-hold released PR #${h.pr} — ${h.why}`);
-      for (const rank of (result.scopeRanks ?? [])) lines.push(`  scope-rank PR #${rank.pr} — rank ${rank.rank}, blocks ${rank.blocks}, age ${rank.ageHours}h, score ${rank.score}, aged-FIFO ${rank.aged}`);
+      for (const rank of (result.scopeRanks ?? [])) lines.push(`  scope-rank PR #${rank.pr} — rank ${rank.rank}, blocks ${rank.blocks}, age ${rank.ageHours}h, score ${rank.score}, aged-FIFO ${rank.aged}${rank.agedAdmit ? `, aged-admit past ${rank.agedAdmit.bypassed.join(', ')}` : ''}`);
       for (const r of result.refusals) lines.push(`  ✗ ${r.kind} PR #${r.prNumber ?? r.pr} — ${r.why}`);
       process.stdout.write(lines.join('\n') + '\n');
     }
@@ -1516,10 +1516,38 @@ export function dropTerminalFixClaims(claims, reconcileRefusals = [], { repoKey 
  * @param {Array<{meta?:{pr?:number, scope?:string[]}}>} fixClaims
  * @returns {{planned:Array<object>, refusals:Array<{pr:number, kind:'scope-overlap', why:string}>}}
  */
-export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims = [], { now = Date.now() } = {}) {
+/**
+ * #3881 (live-caught 2026-10-04) — the AGING OVERRIDE for {@link filterFixesByInFlightScope}. "In flight" stays what
+ * #4295 defined: a LIVE claim (a build, or a fix/ci-heal whose session `refreshLiveFixDispatchClaims` still sees
+ * running) or a higher-ranked waiter in this pass. That is right for one fixer, but nothing bounded the WAIT: PR
+ * #3881 sat 3h+ "waiting 3rd behind #3896, #3889" while those PRs cycled through repeated ci-heal sessions (each a
+ * fresh live claim on the same test file, several sitting in `verify-lane --wait` for 60–110 min). A waiter whose
+ * episode is older than this many minutes is ADMITTED past live claims and past waiters that were themselves
+ * refused this pass — never past a fix ACCEPTED earlier in the same pass (two spawns on one file in one tick).
+ * Overlap after admission is ordinary merge friction the conflict-fix path already owns; starvation is not.
+ * Env `WE_SCOPE_OVERLAP_MAX_WAIT_MINUTES`: a positive number of minutes (default 60); `0`/`off` disables.
+ * @param {Record<string, string|undefined>} [env]
+ * @returns {number|null} minutes, or null when the override is off.
+ */
+export const SCOPE_OVERLAP_MAX_WAIT_ENV = 'WE_SCOPE_OVERLAP_MAX_WAIT_MINUTES';
+export const DEFAULT_SCOPE_OVERLAP_MAX_WAIT_MINUTES = 60;
+export function resolveScopeOverlapMaxWaitMinutes(env = process.env) {
+  const raw = String(env?.[SCOPE_OVERLAP_MAX_WAIT_ENV] ?? '').trim();
+  if (raw === '') return DEFAULT_SCOPE_OVERLAP_MAX_WAIT_MINUTES;
+  if (/^(off|false|no)$/i.test(raw)) return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_SCOPE_OVERLAP_MAX_WAIT_MINUTES;
+  return n === 0 ? null : n;
+}
+
+export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims = [], {
+  now = Date.now(), maxWaitMinutes = resolveScopeOverlapMaxWaitMinutes(),
+} = {}) {
   const accepted = [];
   const refusals = [];
   const picked = [];
+  const acceptedIds = new Set();
+  const agedAdmits = [];
   const waitingTime = (entry) => {
     const ms = Date.parse(entry.waitingSince);
     return Number.isFinite(ms) ? ms : Number.MAX_SAFE_INTEGER;
@@ -1551,7 +1579,12 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
         .map((c) => ({ id: `fix PR #${c.meta?.pr}`, scope: c.meta?.scope })),
       ...picked,
     ];
-    const blockers = inFlight.filter((c) => overlapsInFlight(scopeFor(entry), [c]));
+    let blockers = inFlight.filter((c) => overlapsInFlight(scopeFor(entry), [c]));
+    // #3881 — aging override: past the bound, only a fix ACCEPTED earlier in this same pass still blocks.
+    const waitedMinutes = Math.floor((now - waitingTime(entry)) / 60_000);
+    const agedOut = maxWaitMinutes != null && blockers.length > 0 && waitedMinutes >= maxWaitMinutes;
+    const bypassed = agedOut ? blockers.filter((c) => !acceptedIds.has(c.id)).map((c) => c.id) : [];
+    if (agedOut) blockers = blockers.filter((c) => acceptedIds.has(c.id));
     const hit = overlapsInFlight(scopeFor(entry), blockers);
     // Even a blocked waiter retains its place: a lower-ranked PR must not bypass it
     // through a second file in its scope. Deduplicate claims for the same fixer.
@@ -1565,7 +1598,16 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
       });
       continue;
     }
+    acceptedIds.add(`fix PR #${entry.pr}`);
+    if (bypassed.length) {
+      const admit = { waitedMinutes, maxWaitMinutes, bypassed: [...new Set(bypassed)] };
+      agedAdmits.push({ pr: entry.pr, ...admit });
+      const rank = orderedRanks.find((r) => r.pr === entry.pr);
+      if (rank) rank.agedAdmit = admit; // rides `scopeRanks` into the daemon's own scope-rank log line
+      accepted.push({ ...entry, agedAdmit: admit });
+      continue;
+    }
     accepted.push(entry);
   }
-  return { planned: accepted, refusals, ranks: orderedRanks };
+  return { planned: accepted, refusals, ranks: orderedRanks, ...(agedAdmits.length ? { agedAdmits } : {}) };
 }
