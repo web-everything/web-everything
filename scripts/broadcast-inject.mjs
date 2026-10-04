@@ -13,9 +13,10 @@
  * GUARD: a broadcast can never grant approval or clear a gate. Approval wording is refused when it is recorded and AGAIN here (a refusal is
  * acked as "refused", nothing is injected), and every message is wrapped so the agent reads it as information that approves nothing.
  */
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { existsSync, linkSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Same patterns as plateau-app src/wip/agent-broadcast.ts (APPROVAL). Keep them in step.
@@ -82,8 +83,23 @@ export function deliver(event, { dir = storeDir(), now = Date.now(), readJsonImp
   return { context: messages.join('\n\n'), acks };
 }
 
-/** Exclusive create: the one process that creates the ack file owns the delivery; EEXIST means a concurrent hook already claimed it. */
-const claimAck = (path, body) => writeFileSync(path, JSON.stringify(body), { flag: 'wx' });
+/**
+ * Claim an ack atomically: write the body to a private temp file, then publish it with `link` (which fails with EEXIST if the ack
+ * already exists). The one process whose link succeeds owns the delivery; EEXIST means a concurrent hook already claimed it. The ack
+ * path therefore only ever holds a COMPLETE ack, and any failure (a full disk, an I/O error) rolls the temp file back and throws, so a
+ * broadcast that was not delivered is never mistaken for one that was.
+ */
+export function claimAck(path, body, fs = {}) {
+  const write = fs.writeFileSync ?? writeFileSync;
+  const link = fs.linkSync ?? linkSync;
+  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
+  try {
+    write(tmp, JSON.stringify(body), { flag: 'wx' });
+    link(tmp, path);
+  } finally {
+    try { (fs.unlinkSync ?? unlinkSync)(tmp); } catch { /* nothing to roll back */ }
+  }
+}
 
 /**
  * Claim each ack in order and return the context for exactly the broadcasts whose ack this process created. A broadcast is only

@@ -1,11 +1,11 @@
 /** UserPromptSubmit/PostToolUse broadcast delivery: pure decisions and the real stdin boundary. */
 import { describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { appliesTo, commitAcks, deliver, hasApprovalWording, wrap } from '../broadcast-inject.mjs';
+import { appliesTo, claimAck, commitAcks, deliver, hasApprovalWording, wrap } from '../broadcast-inject.mjs';
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'broadcast-inject.mjs');
 const NOW = Date.parse('2026-10-03T18:30:00Z');
@@ -85,6 +85,38 @@ describe('commitAcks', () => {
     const context = commitAcks(two(), { writeAck });
     expect(context).not.toContain('first');
     expect(context).toContain('second');
+  });
+});
+
+describe('claimAck', () => {
+  const acksDir = () => { const dir = join(mkdtempSync(join(tmpdir(), 'bi-')), 'acks'); mkdirSync(dir); return dir; };
+  it('a write that creates the file and then throws leaves no ack behind, so the broadcast is delivered on the next step', () => {
+    const dir = acksDir();
+    const path = join(dir, 'b1.sess-aaaa1111.json');
+    // Models ENOSPC / EIO mid-write: the file exists (partial) by the time the error is thrown.
+    const partialWrite = (p) => { writeFileSync(p, '{"at":'); throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' }); };
+    const out = () => deliver(ev(), { ...mem({ 'broadcasts.json': { items: [rec()] } }), dir: join(dir, '..'), ackExists: existsSync });
+    expect(commitAcks(out(), { writeAck: (p, b) => claimAck(p, b, { writeFileSync: partialWrite }) })).toBe('');
+    expect(existsSync(path)).toBe(false);
+    expect(readdirSync(dir)).toEqual([]); // the temp file is rolled back too
+    const retry = out();
+    expect(retry.context).toContain('Pause pushes to main.'); // not suppressed as "already delivered"
+    expect(commitAcks(retry)).toContain('Pause pushes to main.');
+    expect(JSON.parse(readFileSync(path, 'utf8')).event).toBe('PostToolUse');
+  });
+  it('a failure at the publish step also leaves nothing behind and does not count as a concurrent claim', () => {
+    const dir = acksDir();
+    const path = join(dir, 'b1.sess-aaaa1111.json');
+    expect(() => claimAck(path, { at: 'x' }, { linkSync: () => { throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); } })).toThrow('EPERM');
+    expect(readdirSync(dir)).toEqual([]);
+  });
+  it('an ack that already exists is never overwritten (EEXIST), and no temp file is left', () => {
+    const dir = acksDir();
+    const path = join(dir, 'b1.sess-aaaa1111.json');
+    writeFileSync(path, '{"first":true}');
+    expect(() => claimAck(path, { second: true })).toThrow(expect.objectContaining({ code: 'EEXIST' }));
+    expect(readFileSync(path, 'utf8')).toBe('{"first":true}');
+    expect(readdirSync(dir)).toEqual(['b1.sess-aaaa1111.json']);
   });
 });
 
