@@ -42,9 +42,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGhSync } from './gh-throttle.mjs';
 
+// GitHub rejects longer label descriptions with HTTP 422:
+// "description is too long (maximum is 100 characters)".
+export const GITHUB_LABEL_DESCRIPTION_MAX = 100;
+
+export function clampLabelDescription(s) {
+  if (typeof s !== 'string') return '';
+  if (s.length <= GITHUB_LABEL_DESCRIPTION_MAX) return s;
+  return s.slice(0, GITHUB_LABEL_DESCRIPTION_MAX - 1).trimEnd() + '…';
+}
+
 /** The `--json` fields the label arc reads about a PR. Named once so a second adapter supplies the same shape
  *  rather than guessing at it, and so a stub in a test cannot drift from what the real one returns. */
-export const PR_STATE_FIELDS = Object.freeze(['labels', 'headRefOid', 'headRefName', 'state', 'body', 'createdAt', 'title', 'comments', 'isDraft']);
+export const PR_STATE_FIELDS = Object.freeze(['labels', 'headRefOid', 'headRefName', 'baseRefName', 'state', 'body', 'createdAt', 'title', 'comments', 'isDraft']);
 // `isDraft` (#xe8y12n) rides the SAME call: the missing-only re-arm re-reads it at the pre-write boundary so a
 // PR converted to draft after the caller's observation never receives `review:pending`.
 // `title` supplies delegation trial descriptions on this same call, with no extra hop.
@@ -93,7 +103,7 @@ export const GH_ARGV = Object.freeze({
   // `we:scripts/conveyor/review-round-tag.mjs`'s `review-round:<N>` mints a brand new name on its very first
   // use at every N, so ensuring existence has to be part of applying it, not a one-time setup step.
   ensureLabel: (repo, name, { color = 'ededed', description = '' } = {}) =>
-    ['label', 'create', name, '--repo', repo, '--color', color, '--description', description, '--force'],
+    ['label', 'create', name, '--repo', repo, '--color', color, '--description', clampLabelDescription(description), '--force'],
   // The PR's changed files, NET versus its base (#4034 follow-up, card 4034b) — read-only, used ONLY to stamp
   // `changedFiles` on a delegation-trial row before it is written; never to gate or edit anything about the PR
   // itself. `--method GET` IS LOAD-BEARING, not decoration: `gh api` silently switches to `POST` once an `-f`/

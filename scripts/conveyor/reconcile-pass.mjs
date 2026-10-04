@@ -1009,13 +1009,35 @@ export function isConflictingPr(pr) {
   return labels.includes(CONFLICT_LABEL) || pr?.mergeable === 'CONFLICTING' || pr?.mergeStateStatus === 'DIRTY';
 }
 
-function hydrateChecks(prs, { repo, requiredChecks, readChecks }) {
+/** A non-default base is a stack; its CI starts after the drain retargets it. */
+export function isStackedPr(pr, defaultBranch) {
+  return Boolean(pr?.baseRefName && pr.baseRefName !== defaultBranch);
+}
+
+/** Emergency opt-out preserves the existing required-check hydration behavior. */
+export function readStackedPrCheckPolicy(env = process.env) {
+  return env.WE_STACKED_PR_CHECK_POLICY === 'strict' ? 'strict' : 'await-base';
+}
+
+function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch }) {
   const cache = new Map();
-  const ready = [], refusals = [];
+  const ready = [], refusals = [], notes = [];
+  const stackedPolicy = readStackedPrCheckPolicy();
   for (const pr of prs) {
     const runs = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
     const missing = (requiredChecks ?? []).filter(name => !runs.some(run => run?.name === name));
     if (runs.length < 100 && !missing.length) { ready.push(pr); continue; }
+    if (stackedPolicy === 'await-base' && isStackedPr(pr, defaultBranch)
+      && runs.length < 100 && missing.length === (requiredChecks ?? []).length) {
+      const basePrNumber = prs.find(candidate => candidate.headRefName === pr.baseRefName)?.number ?? null;
+      const why = basePrNumber !== null
+        ? `stacked on ${pr.baseRefName} (PR #${basePrNumber}) — required checks run once PR #${basePrNumber} lands and the drain retargets this PR to ${defaultBranch}`
+        : `stacked on ${pr.baseRefName} — no open PR owns this base branch; retarget to ${defaultBranch} or restore the base PR`;
+      notes.push({ kind: basePrNumber !== null ? 'stacked-awaiting-base' : 'stacked-base-orphaned',
+        prNumber: pr.number, baseRefName: pr.baseRefName, basePrNumber, why, text: `PR #${pr.number}: ${why}` });
+      ready.push(pr);
+      continue;
+    }
     // Live deadlock shape, PR #3771 (2026-10-03): a conflicting head can never grow its required checks, so reading
     // the REST feed every tick and refusing `check-read-failed` for "missing required checks" is a read that cannot
     // succeed and a refusal that names no real fault. The conflict repair that PR is owed (a mechanical re-sync
@@ -1071,7 +1093,7 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks }) {
     const known = runs.length && ['red', 'pending'].includes(reduceCheckState(runs, requiredChecks).state) ? runs : null;
     ready.push({ ...pr, statusCheckRollup: refused && known ? known : result.error ? [] : result.rows });
   }
-  return { prs: ready, refusals };
+  return { prs: ready, refusals, notes };
 }
 
 /**
@@ -1130,7 +1152,7 @@ export function runReconcilePass({
   // #4501 — `requiredChecks` now threaded through so this enrichment judges the SAME live-required set
   // `planReconcile` uses below, instead of silently falling back to `DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS`.
   const hydrated = hydrateChecks(rawPrs, {
-    repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks,
+    repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, defaultBranch,
   });
   const { prs: redPrs, mainRedWindows, mainLatestCheckRuns } = enrichMainRed(hydrated.prs, { repo: resolvedRepo, defaultBranch, requiredChecks });
   // live incident, PR #2752 (#4034/#2748) — attach `alreadyLandedInMain` to any PR carrying
@@ -1148,7 +1170,7 @@ export function runReconcilePass({
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha,
   });
-  return { ...plan, refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
+  return { ...plan, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
       ? pr.files.map((file) => typeof file === 'string' ? file : file.path) : null })),
   };
