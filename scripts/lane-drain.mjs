@@ -803,10 +803,13 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
 
   nextPhase('precheck');
   // Check all pending hashes before assigning numbers or walking references.
+  const matchByHash = process.env.WE_JIT_UNSWEPT_CITE_MATCH === 'hash';
+  const pendingPaths = new Set(pending.map((stem) => `backlog/${stem}.md`));
+  const citeKey = (cite) => matchByHash ? cite.hash : cite.path;
   const remainingBreakCites = new Map();
   for (const { name, content } of breakFiles) {
     const rewritten = rewriteSoakCardCitation(content, (hash) => pendingHashes.has(hash) ? '0000' : (ledger[hash] ?? hash));
-    remainingBreakCites.set(name, new Set(findHashPathCiteOutsideBacklog(rewritten, name).map((c) => c.hash)));
+    remainingBreakCites.set(name, new Set(findHashPathCiteOutsideBacklog(rewritten, name).map(citeKey)));
   }
 
   // #4075 follow-up (xmd4pfa, hardening after the build-dispatch.flow.json incident) — NEVER COMMIT A
@@ -820,7 +823,8 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   // own gate uses (scripts/lib/citation-check.mjs — one source of truth, never two independently-drifting
   // copies); repo-wide is still cheap (`--threads=1`, the #4166-measured win: a few tens of ms here).
   //
-  // Hold only the cited cards: keeping their paths and hash references preserves their pending state.
+  // Hold exact tracked card paths by default; fixtures/stale slugs cannot be broken by this rename.
+  // WE_JIT_UNSWEPT_CITE_MATCH=hash restores the legacy any-path-with-that-hash hold.
   // WE_JIT_UNSWEPT_CITE_POLICY=pass retains the legacy whole-pass refusal; other values use card policy.
   // Historical ledger hashes are irrelevant here: only pending cards could be renamed by this pass.
   const sweptRelPaths = new Set(files.map((f) => pathFor(f.name).relPath));
@@ -833,8 +837,8 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     unsweptHashPathCites = findHashPathCitesInGrepLines(hits)
       // Soak modules are only partially swept: a repaired card field cannot hide a remaining
       // hash-path citation in code/comments (even the same hash on the same line).
-      .filter((c) => pendingHashes.has(c.hash) && (remainingBreakCites.has(c.file)
-        ? remainingBreakCites.get(c.file).has(c.hash)
+      .filter((c) => (matchByHash ? pendingHashes.has(c.hash) : pendingPaths.has(c.path)) && (remainingBreakCites.has(c.file)
+        ? remainingBreakCites.get(c.file).has(citeKey(c))
         : !sweptRelPaths.has(c.file)))
       .map((c) => ({ path: c.file, hash: c.hash }));
   } catch { /* git grep exits 1 on no match, or git unavailable — no findings either way, never abort on that alone */ }

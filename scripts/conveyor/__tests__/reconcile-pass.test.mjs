@@ -1177,7 +1177,7 @@ describe('timeout re-run eligibility — card-only diff + derived red checks (PR
   const sources = { 'a.test.mjs': 'import "./b.mjs"; process.env.X;', 'b.mjs': 'export const b = 1;', 'vite.config.mts': 'export default {};' };
   const base = { head: 'h', sourceHead: 'h', sources, roots: ['vite.config.mts', 'a.test.mjs'] };
   it('RED before the fix: a backlog-card-only diff was "changed-input-impact-unknown"; now it is eligible', () => {
-    expect(timeoutImpact({ ...base, changed: [{ filename: 'backlog/xw4yqe9-card.md' }] }, timeoutTs)).toBeNull();
+    expect(timeoutImpact({ ...base, changed: [{ filename: 'backlog/4999-card.md' }] }, timeoutTs)).toBeNull();
   });
   it('a card plus any non-card (or source) change keeps refusing', () => {
     expect(timeoutImpact({ ...base, changed: [{ filename: 'backlog/x.md' }, { filename: 'README.md' }] }, timeoutTs)).toBe('changed-input-impact-unknown');

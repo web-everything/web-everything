@@ -46,6 +46,7 @@ import {
   PROVENANCE_ESCAPE_MARKERS,
   findHashPathCiteOutsideBacklog,
   findHashPathCitesInGrepLines,
+  classifyHashPathCite,
   HASH_PATH_CITE_SOURCE,
   findDanglingBacklogGlobCite,
   BACKLOG_GLOB_CITE_SOURCE,
@@ -1207,5 +1208,19 @@ describe('findBlankLineLoci — gate 6f-ii-e (cited start line is blank)', () =>
   it('does not read the trailing terminator as a blank line; far past EOF also yields nothing', () => {
     expect(run('we:scripts/b.mjs:3')).toHaveLength(0);
     expect(run('we:scripts/b.mjs:999')).toHaveLength(0);
+  });
+});
+
+describe('classifyHashPathCite', () => {
+  const real = 'backlog/xhash01-real-slug.md';
+  const exists = (path) => path === real;
+  it('classifies an exact existing path as resolving', () => {
+    expect(classifyHashPathCite({ cited: real, exists })).toBe('resolving');
+  });
+  it('classifies a different slug with the same hash as dangling', () => {
+    expect(classifyHashPathCite({ cited: 'backlog/xhash01-fixture-slug.md', exists })).toBe('dangling');
+  });
+  it('classifies a missing card as dangling', () => {
+    expect(classifyHashPathCite({ cited: real, exists: () => false })).toBe('dangling');
   });
 });
