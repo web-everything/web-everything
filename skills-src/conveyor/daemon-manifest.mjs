@@ -30,6 +30,13 @@ import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
  *  often they run. */
 const DEFAULT_PASS_INTERVAL_MS = 120_000;
 
+/** PR #3881/#3932 — the load-flake re-verify pass. Each run is a cheap loadavg read unless the host is quiet,
+ *  so 5 minutes is plenty; `WE_LOAD_FLAKE_REVERIFY_INTERVAL_MS` overrides it (read once, at manifest load). */
+export function loadFlakeReverifyIntervalMs(env = process.env) {
+  const n = Number(env.WE_LOAD_FLAKE_REVERIFY_INTERVAL_MS);
+  return Number.isFinite(n) && n > 0 ? n : 5 * 60_000;
+}
+
 /**
  * #3873 — one manifest entry per (repo-generic pass × constellation repo), matching exactly what
  * `runner.mjs`'s own per-repo loop already does today (`run(path, args, key, slug)` appends `--repo=${slug}`
@@ -135,7 +142,7 @@ export const DAEMON_MANIFEST = {
   'orphan-claim-release': { script: 'scripts/conveyor/orphan-claim-release.mjs', args: ['--apply'], intervalMs: ORPHAN_CLAIM_INTERVAL_MS },
   'merge-orphan-sweep': { script: 'scripts/merge-ai-prs.mjs', args: [], intervalMs: MERGE_ORPHAN_SWEEP_INTERVAL_MS },
   'branch-drift': { script: 'scripts/conveyor/branch-drift.mjs', args: ['sweep'], intervalMs: DEFAULT_PASS_INTERVAL_MS },
-  'load-flake-reverify': { script: 'scripts/conveyor/load-flake-reverify.mjs', args: ['sweep'], intervalMs: DEFAULT_PASS_INTERVAL_MS },
+  'load-flake-reverify': { script: 'scripts/conveyor/load-flake-reverify.mjs', args: ['sweep'], intervalMs: loadFlakeReverifyIntervalMs() },
   'infra-blocked': { script: 'scripts/conveyor/infra-blocked.mjs', args: ['retry'], intervalMs: DEFAULT_PASS_INTERVAL_MS },
   'duplicate-pr-watch': { script: 'scripts/conveyor/duplicate-pr-watch.mjs', args: ['sweep'], intervalMs: DEFAULT_PASS_INTERVAL_MS },
   // #3383 — live-caught 2026-09-24: `scripts/conveyor/lease-reaper.mjs` (reclaims a lane lease whose owning

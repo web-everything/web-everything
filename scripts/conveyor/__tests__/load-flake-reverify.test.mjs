@@ -17,10 +17,12 @@ function fixture(reds = []) {
 }
 const red = (at) => comment(buildLoadFlakeResolvedComment({ altSha: 'bbb2222', result: 'red-again' }), at);
 describe('quiet-host reverify', () => {
-  it.each([[20, 1], [1, 20]])('defers on either load average without discovery or writes: %j', async (a, b) => {
+  it.each([[20, 1], [1, 20]])('defers on either load average without writes, naming the holds: %j', async (a, b) => {
     const { io } = fixture(); io.loadavg = () => [a, b];
-    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'host-load' });
-    expect(io.listPrs).not.toHaveBeenCalled(); expect(io.acquire).not.toHaveBeenCalled();
+    const out = await runLoadFlakeReverify({}, io);
+    expect(out).toMatchObject({ deferred: 'host-load', load: [a, b] });
+    expect(out.holds.length).toBeGreaterThan(0); // names the held PRs it evaluated (read-only discovery)
+    expect(io.acquire).not.toHaveBeenCalled(); expect(io.comment).not.toHaveBeenCalled(); expect(io.push).not.toHaveBeenCalled();
   });
   it('verifies then pushes the saved SHA and records success, releasing its lane', async () => {
     const { io } = fixture();

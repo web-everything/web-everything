@@ -41,12 +41,20 @@ export async function runLoadFlakeReverify({ repo = 'we', dryRun = false, config
   const now = io.now();
   const load = io.loadavg();
   const cores = io.cpuCount();
-  const early = planLoadFlakeReverify({ load, cores, now, config });
-  if (early.deferred === 'host-load') return early;
   const key = repoKeyForSlug(repo);
   if (!key) throw new Error(`unknown repo: ${repo}`);
   const slug = CONSTELLATION_REPOS[key].slug;
-  const plan = planLoadFlakeReverify({ prs: await io.listPrs(slug), load, cores, now, config });
+  const prs = await io.listPrs(slug);
+  const plan = planLoadFlakeReverify({ prs, load, cores, now, config });
+  // Holding is the common case: name every PR it holds and the load it saw, so the log proves the pass is
+  // evaluating them (a bare "host-load" line cannot be told apart from a pass that sees no holds). Read-only.
+  if (plan.deferred === 'host-load') {
+    return { ...plan, load: load.slice(0, 2).map((n) => Math.round(n * 100) / 100), cores, maxLoadPerCore: config.maxLoadPerCore,
+      holds: prs.flatMap((pr) => {
+        const state = loadFlakeHoldState({ comments: pr.comments, headRefOid: pr.headRefOid, now });
+        return state.live ? [{ pr: pr.number, alt: state.hold.alt.branch, altSha: state.hold.alt.sha }] : [];
+      }) };
+  }
   if (!plan.candidate || dryRun) return { ...plan, dryRun };
   const { pr, hold, attempts } = plan.candidate;
   const post = (result, detail = '') => io.comment(slug, pr.number, buildLoadFlakeResolvedComment({ altSha: hold.alt.sha, result, detail }));

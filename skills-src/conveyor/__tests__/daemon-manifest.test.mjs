@@ -94,6 +94,14 @@ describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
     }
   });
 
+  it('load-flake-reverify runs every 5 minutes by default, overridable by env', async () => {
+    const { loadFlakeReverifyIntervalMs } = await import('../daemon-manifest.mjs');
+    expect(DAEMON_MANIFEST['load-flake-reverify'].intervalMs).toBe(loadFlakeReverifyIntervalMs());
+    expect(loadFlakeReverifyIntervalMs({})).toBe(300_000);
+    expect(loadFlakeReverifyIntervalMs({ WE_LOAD_FLAKE_REVERIFY_INTERVAL_MS: '60000' })).toBe(60_000);
+    expect(loadFlakeReverifyIntervalMs({ WE_LOAD_FLAKE_REVERIFY_INTERVAL_MS: 'junk' })).toBe(300_000);
+  });
+
   it('merge-orphan-sweep carries no --repo/--repos/--this-repo flag — bare already defaults to the full constellation', () => {
     expect(DAEMON_MANIFEST['merge-orphan-sweep'].args.some((a) => a.startsWith('--repo'))).toBe(false);
   });
