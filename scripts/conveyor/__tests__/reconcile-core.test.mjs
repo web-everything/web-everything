@@ -3472,3 +3472,28 @@ describe('xe8y12n orthogonal missing-review diagnostic', () => {
     expect(after.refusals).toEqual(before.refusals);
   });
 });
+
+// LIVE INCIDENT 2026-10-03/04, PR #3830: an open, green lane PR with NO review:* label sat in limbo forever.
+describe('restore-review-label — open green PR with no review label (PR #3830)', () => {
+  it('is on the frozen DISPATCH_KINDS list', () => { expect(DISPATCH_KINDS).toContain('restore-review-label'); });
+  const open = (over = {}) => pr1563({ isDraft: false, labels: [], statusCheckRollup: greenRollup, comments: [], headRefName: 'lane/xw4yqe9-prevention-card', ...over });
+  it('RED before the fix: such a PR was refused `nothing-owed`; now it is owed `review:pending`', () => {
+    const plan = planReconcile({ prs: [open()], agents: [], durableCounts: {}, now: NOW });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', prNumber: 1563, label: 'review:pending' })]);
+  });
+  it('waits out the grace so a label-on-green producer can label ready-to-merge first', () => {
+    const fresh = open({ statusCheckRollup: greenRollup.map((c) => ({ ...c, completedAt: new Date(NOW - 60_000).toISOString() })) });
+    expect(planReconcile({ prs: [fresh], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
+    const settled = open({ statusCheckRollup: greenRollup.map((c) => ({ ...c, completedAt: new Date(NOW - 30 * 60_000).toISOString() })) });
+    expect(planReconcile({ prs: [settled], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(true);
+  });
+  it('never for a labelled, draft, red/pending, ready-to-merge or non-lane PR', () => {
+    for (const p of [
+      open({ labels: lbl('review:accepted') }), open({ labels: lbl('review:pending') }), open({ labels: lbl('ready-to-merge') }),
+      open({ isDraft: true }), open({ statusCheckRollup: pendingRollup }), open({ statusCheckRollup: redRollup }),
+      open({ headRefName: 'feature/human' }),
+    ]) {
+      expect(planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
+    }
+  });
+});

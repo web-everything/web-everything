@@ -358,6 +358,18 @@ export function resolveParkLabel(park) {
 }
 
 /**
+ * A `--label-on-green` producer that exits WITHOUT labelling (green-wait ended red / timed out / behind) must not
+ * strand the PR label-less: nothing owns a green PR with no `review:*` or `ready-to-merge` label (PR #3830).
+ * Returns the neutral hand-off label to apply, or null. Pure. A conflict is left to the conflict-repair path.
+ * @param {{mode?:string, reason?:string, labelApplied?:boolean, prNum?:(number|string|null)}} o
+ * @returns {string|null}
+ */
+export function unlabelledHandOffLabel({ mode, reason, labelApplied = false, prNum = null } = {}) {
+  if (mode !== 'label-on-green' || labelApplied || prNum == null) return null;
+  return ['check-red', 'check-timeout', 'behind'].includes(reason) ? 'review:pending' : null;
+}
+
+/**
  * #2284 — the producer's per-poll verdict on an open PR's merge state. Pure (unit-tested transition table).
  * pr-land NO LONGER merges (the drain is the sole writer and rebases a behind PR before merging), so a
  * BEHIND-but-green PR is landable: the producer LABELS it and hands off rather than aborting — behind-ness is
@@ -684,6 +696,15 @@ function runCli() {
   };
 
   function emit(result, exitCode) {
+    // LIVE INCIDENT 2026-10-03/04, PR #3830: a `--label-on-green` run that ends red/timeout/behind left the PR with
+    // NO label of any kind; once the fix daemon healed the red the PR sat green and label-less forever.
+    let handOff = null;
+    try { handOff = unlabelledHandOffLabel({ mode: PLAN.mode, reason: result?.reason, labelApplied, prNum }); } catch { /* emitted before the PR/plan existed (TDZ) — nothing to hand off */ }
+    if (handOff) {
+      try { forge.ensureLabel(handOff, { color: 'FBCA04', description: 'Review pending — an independent review is owed once required checks are green' }); } catch { /* already exists — fine */ }
+      try { forge.addLabel(prNum, handOff); result = { ...result, handOffLabel: handOff }; }
+      catch (e) { if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not hand #${prNum} off with "${handOff}" (${String(e.message || e).split('\n')[0]})\n`); }
+    }
     if (AS_JSON) writeAllSync(1, JSON.stringify(result) + '\n');
     else {
       const tag = result.merged ? '✓ merged' : result.reason === 'dry-run' ? '· dry-run' : result.reason === 'opened' ? '· opened (no-wait)'

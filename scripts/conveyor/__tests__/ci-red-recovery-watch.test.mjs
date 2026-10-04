@@ -1048,3 +1048,26 @@ describe('ci-red-recovery-watch — formatMissingRunReport', () => {
     expect(report).toContain('applied: update-branch PR #2729 (cleared stale checking label) — no run at all');
   });
 });
+
+describe('ci-red-recovery-watch — sweepMissingRunRecovery, partial rollup with unreadable protection (draft PR #3850)', () => {
+  const done = (name, conclusion = 'SUCCESS') => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion });
+  const PR_3850 = {
+    number: 3850, headRefName: 'lane/prepare-org-move-xvgqv8h', headRefOid: '967fee6791e10673214fa811ecac29837db15950', mergeable: 'MERGEABLE', isDraft: true,
+    statusCheckRollup: [done('smoke'), done('daemon-soak'), done('test-shard (1)'), done('test-shard (2)', 'CANCELLED')], labels: [{ name: 'review:pending' }],
+  };
+  const NOW = Date.parse('2026-10-04T11:50:00Z');
+  it('plans trigger-ci via the declared required set when the App token cannot read protection (null)', () => {
+    const result = sweepMissingRunRecovery({
+      repo: 'web-everything/web-everything', readOpenPrs: () => [PR_3850], readRequiredContexts: () => null,
+      readHeadCommittedAt: () => '2026-10-03T20:50:00Z', readComments: () => [], now: NOW,
+    });
+    expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 3850, kind: 'trigger-ci' })]);
+  });
+  it('an undeclared repo with unreadable protection still plans nothing (never a guessed set)', () => {
+    const result = sweepMissingRunRecovery({
+      repo: 'someone/else', readOpenPrs: () => [{ ...PR_3850, statusCheckRollup: PR_3850.statusCheckRollup.map((c) => ({ ...c, workflowName: 'CI' })) }], readRequiredContexts: () => null,
+      readHeadCommittedAt: () => '2026-10-03T20:50:00Z', readComments: () => [], now: NOW,
+    });
+    expect(result.dispatch).toEqual([]);
+  });
+});

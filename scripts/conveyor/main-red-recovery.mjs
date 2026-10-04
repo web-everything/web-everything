@@ -922,6 +922,27 @@ export const DEFAULT_MAX_MISSING_RUN_RETRIES_PER_SHA = 2;
 export const MISSING_RUN_COMMENT_MARKER = '🚦 conveyor missing-run-recovery';
 
 /**
+ * we:scripts/conveyor/main-red-recovery.mjs#isStalledPartialRollup — the "partial rollup" missing-run
+ * population (LIVE INCIDENT 2026-10-03/04, draft PR #3850): `smoke`, `daemon-soak` and `soak-replay-gate` were
+ * green, one `test-shard` was CANCELLED, so the aggregate `test` job never started — a required context with NO
+ * rollup entry while EVERY entry that exists is already COMPLETED. Nothing is running that could still produce
+ * it, so it is not "hasn't started yet" but a permanent gap: before this, `buildMissingRunCandidates` required
+ * EVERY required context absent, so the PR sat `awaiting-ci` (a draft: never promoted) for ~14 h with no pass
+ * owning it. Anything still queued/in-progress/pending means CI is alive: never stalled. PURE.
+ * @param {Array<object>} roll
+ * @param {string[]|null} names - the required contexts (null/empty → never stalled)
+ * @returns {boolean}
+ */
+export function isStalledPartialRollup(roll, names) {
+  if (!Array.isArray(names) || !names.length || !Array.isArray(roll) || !roll.length) return false;
+  const reported = new Set(roll.map((c) => c?.name || c?.context).filter(Boolean));
+  if (names.every((n) => reported.has(n))) return false;
+  return roll.every((c) => (c?.__typename === 'StatusContext' || (c?.state && !c?.status))
+    ? !['PENDING', 'EXPECTED'].includes(String(c?.state).toUpperCase())
+    : String(c?.status ?? '').toUpperCase() === 'COMPLETED');
+}
+
+/**
  * we:scripts/conveyor/main-red-recovery.mjs#buildMissingRunCandidates — narrow an open-PR listing to one row
  * per PR whose rollup has NO entry at all — not `QUEUED`, not `IN_PROGRESS`, not `COMPLETED`, nothing — for ANY
  * of `requiredContexts`. PURE. Deliberately independent of `buildHungCandidates`'s own `workflowName` filter: a
@@ -954,7 +975,9 @@ export const MISSING_RUN_COMMENT_MARKER = '🚦 conveyor missing-run-recovery';
  * @param {{requiredContexts?:(string[]|null), workflowName?:string}} [o]
  * @returns {Array<{prNumber:number, headRefName:(string|null), headSha:(string|null), baseRefName:(string|null)}>}
  */
-export function buildMissingRunCandidates(prs, { requiredContexts = DEFAULT_REQUIRED_CONTEXTS, workflowName = DEFAULT_MAIN_WORKFLOW_NAME } = {}) {
+export function buildMissingRunCandidates(prs, {
+  requiredContexts = DEFAULT_REQUIRED_CONTEXTS, workflowName = DEFAULT_MAIN_WORKFLOW_NAME, stalledPartialContexts = null,
+} = {}) {
   const unknown = requiredContexts === null;
   // An explicitly EMPTY required set means nothing is required, so nothing can be missing — never substitute
   // the default for it (PR #2740 review). Only `undefined`/a non-array non-null (no caller value) gets the default.
@@ -974,7 +997,9 @@ export function buildMissingRunCandidates(prs, { requiredContexts = DEFAULT_REQU
         const reported = new Set(roll.map((c) => c?.name || c?.context).filter(Boolean));
         return names.every((n) => !reported.has(n));
       })();
-    if (!allMissing) continue; // at least one required context has SOME entry — not this pass's population.
+    if (!allMissing && !isStalledPartialRollup(roll, stalledPartialContexts ?? (unknown ? null : names))) {
+      continue; // at least one required context has SOME entry — not this pass's population.
+    }
     out.push({ prNumber, headRefName: pr?.headRefName ?? null, headSha: pr?.headRefOid ?? null, baseRefName: pr?.baseRefName ?? null });
   }
   return out;

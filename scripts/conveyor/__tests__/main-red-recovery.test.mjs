@@ -19,7 +19,7 @@ import {
   DEFAULT_MAX_REBASE_RETRIES_PER_SHA, REBASE_ONTO_MAIN_COMMENT_MARKER,
   countRebaseOntoMainComments, buildRebaseOntoMainComment,
   DEFAULT_MISSING_RUN_THRESHOLD_MS, DEFAULT_MAX_MISSING_RUN_RETRIES_PER_SHA, MISSING_RUN_COMMENT_MARKER,
-  buildMissingRunCandidates, isMissingRunOverdue, planMissingRunRecoveries,
+  buildMissingRunCandidates, isMissingRunOverdue, planMissingRunRecoveries, isStalledPartialRollup,
   countMissingRunComments, buildMissingRunComment,
 } from '../main-red-recovery.mjs';
 
@@ -861,5 +861,35 @@ describe('failingRequiredCheckForAttribution — every required check, not test 
     const p = pr(row('daemon-soak', 'FAILURE', '2026-09-27T02:11:30Z'));
     expect(isAnyRequiredCheckFailed(p, [])).toBe(false);
     expect(failingRequiredCheckForAttribution(p, { requiredChecks: [], mainRedWindows: WINDOWS })).toBeNull();
+  });
+});
+
+// LIVE INCIDENT 2026-10-03/04, draft PR #3850: smoke/daemon-soak/soak-replay-gate green, one test-shard CANCELLED,
+// the aggregate `test` never ran -> a PARTIAL rollup that every missing-run pass skipped (it wanted ALL absent).
+describe('missing-run — stalled PARTIAL rollup (PR #3850)', () => {
+  const done = (name, conclusion = 'SUCCESS') => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion });
+  const REQ = ['test', 'smoke', 'daemon-soak'];
+  const PR_3850 = {
+    number: 3850, headRefName: 'lane/prepare-org-move-xvgqv8h', headRefOid: '967fee6791e10673214fa811ecac29837db15950', mergeable: 'MERGEABLE',
+    statusCheckRollup: [done('smoke'), done('daemon-soak'), done('test-shard (1)'), done('test-shard (2)', 'CANCELLED'), done('review-gate', 'FAILURE')],
+  };
+  it('RED before the fix: with only requiredContexts the partial rollup is not a candidate', () => {
+    expect(buildMissingRunCandidates([PR_3850], { requiredContexts: REQ })).toEqual([expect.objectContaining({ prNumber: 3850 })]);
+  });
+  it('a stalled partial rollup (a required context absent, everything else COMPLETED) is a candidate, also when protection is unreadable', () => {
+    expect(isStalledPartialRollup(PR_3850.statusCheckRollup, REQ)).toBe(true);
+    expect(buildMissingRunCandidates([PR_3850], { requiredContexts: null, stalledPartialContexts: REQ })).toEqual([expect.objectContaining({ prNumber: 3850 })]);
+  });
+  it('still-running work means CI is alive: never stalled', () => {
+    const live = [...PR_3850.statusCheckRollup, { __typename: 'CheckRun', name: 'test-shard (3)', status: 'IN_PROGRESS' }];
+    expect(isStalledPartialRollup(live, REQ)).toBe(false);
+    expect(buildMissingRunCandidates([{ ...PR_3850, statusCheckRollup: live }], { requiredContexts: REQ })).toEqual([]);
+  });
+  it('every required context reported (even red) is not a missing run, and unknown contexts never guess', () => {
+    expect(isStalledPartialRollup([done('test'), done('smoke'), done('daemon-soak', 'FAILURE')], REQ)).toBe(false);
+    expect(isStalledPartialRollup(PR_3850.statusCheckRollup, null)).toBe(false);
+  });
+  it('a conflicting PR is still excluded', () => {
+    expect(buildMissingRunCandidates([{ ...PR_3850, mergeable: 'CONFLICTING' }], { requiredContexts: REQ })).toEqual([]);
   });
 });

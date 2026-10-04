@@ -417,3 +417,23 @@ describe('runReconcilePromoteDraftDispatch — a draft that is not promoted says
     expect(result.refusals[1].why).toMatch(/unchecked/);
   });
 });
+
+describe('runReconcilePromoteDraftDispatch — restore-review-label half (PR #3830)', () => {
+  const base = { root: '/repo', checkStaleness: FRESH, clearAwaitingCi: NOOP_STATUS, readHeadCheckState: ALWAYS_GREEN, provider: { ready: () => { throw new Error('no'); } } };
+  const plan = { dispatch: [{ kind: 'restore-review-label', prNumber: 3830, label: 'review:pending' }], refusals: [] };
+  it('adds review:pending to a still-label-less PR and reports it', () => {
+    const calls = [];
+    const r = runReconcilePromoteDraftDispatch({ ...base, reconcile: () => plan, readPrLabels: () => [], addLabel: (a) => calls.push(a) });
+    expect(calls).toEqual([expect.objectContaining({ prNumber: 3830, label: 'review:pending' })]);
+    expect(r.dispatched).toEqual([{ pr: 3830, kind: 'restore-review-label', label: 'review:pending' }]);
+  });
+  it('re-reads labels and refuses when a review/landing label appeared since the plan', () => {
+    const r = runReconcilePromoteDraftDispatch({ ...base, reconcile: () => plan, readPrLabels: () => [{ name: 'ready-to-merge' }], addLabel: () => { throw new Error('must not write'); } });
+    expect(r.dispatched).toEqual([]);
+    expect(r.refusals).toEqual([expect.objectContaining({ pr: 3830, kind: 'label-already-set' })]);
+  });
+  it('a failed write is a refusal, never a throw', () => {
+    const r = runReconcilePromoteDraftDispatch({ ...base, reconcile: () => plan, readPrLabels: () => [], addLabel: () => { throw new Error('boom'); } });
+    expect(r.refusals).toEqual([expect.objectContaining({ kind: 'label-failed' })]);
+  });
+});
