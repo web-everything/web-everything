@@ -51,6 +51,19 @@ function configureRepo(dir) {
   git(dir, ['config', 'user.email', 'sim@example.com']);
   git(dir, ['config', 'user.name', 'Sim World']);
   git(dir, ['config', 'commit.gpgsign', 'false']);
+  // No background auto-gc: the template holds thousands of loose objects (scripts/ is large), so the first
+  // `git commit` spawned a DETACHED `gc --auto` that packed and deleted loose objects while the next step was
+  // `git clone` of that very repo — "failed to copy file ... No such file" / "unable to read tree", a crash in
+  // EVERY soak scenario (PR #3794 red-green run). Deterministic scenario repos never need gc.
+  noAutoGc(dir);
+}
+
+/** Also applied to every BARE origin: a `git push` into a bare repo runs `receive-pack`'s own `gc --auto`
+ *  (`receive.autogc`, default on), the detached gc that pruned objects under the next scratch clone. */
+function noAutoGc(dir) {
+  git(dir, ['config', 'gc.auto', '0']);
+  git(dir, ['config', 'maintenance.auto', 'false']);
+  git(dir, ['config', 'receive.autogc', 'false']);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -169,6 +182,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     const originPath = join(root, 'github', `${slug}.git`);
     mkdirSync(dirname(originPath), { recursive: true });
     git(root, ['clone', '--quiet', '--bare', tpl[key], originPath]);
+    noAutoGc(originPath);
     repoEntries[key] = { key, slug, originPath, defaultBranch: 'main' };
   }
 
