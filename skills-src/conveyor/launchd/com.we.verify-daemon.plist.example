@@ -16,6 +16,9 @@
 	-->
 	<key>Label</key>
 	<string>com.we.verify-daemon</string>
+	<!-- Without this, launchd's default throttles the gates' CPU and IO. -->
+	<key>ProcessType</key>
+	<string>Standard</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin/node</string>
@@ -39,6 +42,9 @@
 		<!-- Triple local Vitest test and hook timeouts; CI is unaffected. -->
 		<key>WE_VERIFY_TEST_TIMEOUT_FACTOR</key>
 		<string>3</string>
+		<!-- Run check:standards locally only when the diff touches standards-relevant paths; CI always runs it. -->
+		<key>WE_VERIFY_STANDARDS</key>
+		<string>auto</string>
 		<key>WE_GITHUB_APP_ID</key>
 		<string>&lt;app-id&gt;</string>
 		<key>WE_GITHUB_APP_INSTALLATION_ID</key>
