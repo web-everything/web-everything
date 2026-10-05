@@ -1,6 +1,6 @@
 {
   "name": "@webeverything/contracts",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Web Everything contract distribution package (#872/#874) — the type-only single source of truth (zero runtime emit) that supersedes byte-replication. Per-protocol subpath exports re-export each WE protocol's pure-contract module: the #873 WE-owned planes (guard, validity-merge, validator-resolution), the provider seams (analytics, positioning) and the #879 block-family halves (audit, lifecycle, master-detail, selection, stepper, tree-select), so consumers import only what they use. Package name == contract specifier (#239); FUI (and any impl) depends on it (the FUI→WE arrow). Resolved by sibling consumers via tsconfig paths + vite alias on the scoped specifier (#804 2a); publish is a later, separately-prioritized build (#804 2b).",
   "type": "module",
   "license": "MIT",

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/web-everything/web-everything/compare/contracts-v0.1.0...contracts-v0.1.1) (2026-10-05)
+
+
+### Bug Fixes
+
+* org-move slugs in live code, per-installation App tokens, drain… ([bdff790](https://github.com/web-everything/web-everything/commit/bdff790aa11756226885f6039364e58ede0ee0ac))
+
 ## 0.1.0 (2026-07-02)
 
 
