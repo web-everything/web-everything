@@ -69,6 +69,7 @@ describe('runner freshness policy', () => {
         "dispatch-lane",
         "docket-refresh",
         "explore",
+        "extend-rounds",
         "file-item",
         "gap-sweep-status",
         "gate-health",
