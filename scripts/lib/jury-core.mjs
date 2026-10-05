@@ -1224,6 +1224,105 @@ export const MANDATE_LENSES = Object.freeze({
  *  hardcoded per caller) — see the module doc above for why correctness/security are the mandatory pair. */
 export const MANDATORY_LENSES = Object.freeze([MANDATE_LENSES.CORRECTNESS, MANDATE_LENSES.SECURITY]);
 
+export const LATER_ROUND_ADVISORY_SCOPES = Object.freeze({ CHANGED_ONLY: 'changed-only', ALL: 'all' });
+export const LATER_ROUND_ADVISORY_SCOPE_ENV = 'WE_REVIEW_LATER_ROUND_ADVISORY_SCOPE';
+export const LATER_ROUND_CHANGE_WINDOW = 3;
+export const DEFERRED_ADVISORY_REASON = 'later-round-advisory-untouched';
+
+export function laterRoundAdvisoryScopeFromEnv(env = process.env) {
+  const value = env?.[LATER_ROUND_ADVISORY_SCOPE_ENV];
+  if (value == null || value === '') return { scope: 'changed-only', fellBack: null };
+  if (value === 'changed-only' || value === 'all') return { scope: value, fellBack: null };
+  return { scope: 'all', fellBack: 'unknown-scope-value' };
+}
+
+const SOURCE_EXTENSIONS = new Set('js mjs cjs ts mts cts tsx jsx css scss html py sh rb go rs java kt swift c h cc cpp vue svelte'.split(' '));
+
+export function isSourcePath(file) {
+  if (typeof file !== 'string') return false;
+  const name = file.split('/').at(-1);
+  if (!name || name.startsWith('.')) return false;
+  const dot = name.lastIndexOf('.');
+  return dot > 0 && SOURCE_EXTENSIONS.has(name.slice(dot + 1).toLowerCase());
+}
+
+export function classifyLaterRoundAdvisory(findings, options = {}) {
+  const { lens, mandatoryLenses = MANDATORY_LENSES, scope, latestFix } = options ?? {};
+  const list = Array.isArray(findings) ? findings : [];
+  const keepAll = (fellBack = null) => ({ kept: list, deferred: [], scope: fellBack ? 'all' : scope, fellBack });
+  if (latestFix == null || latestFix.priorHead === null) return keepAll();
+  // `all` was asked for: nothing is scoped, so an unreadable range is not a fallback and must not be reported as one.
+  if (scope !== 'changed-only') return keepAll();
+  if (latestFix.error) return keepAll(`changed-range-unreadable: ${latestFix.error}`);
+  const files = latestFix.files;
+  if (typeof latestFix.priorHead !== 'string' || !latestFix.priorHead
+    || typeof latestFix.head !== 'string' || !latestFix.head
+    || !files || typeof files !== 'object' || Array.isArray(files)
+    || ![null, Object.prototype].includes(Object.getPrototypeOf(files))
+    || Object.values(files).some(lines => lines !== null && (!Array.isArray(lines)
+      || lines.some(n => !Number.isSafeInteger(n) || n < 0)))) {
+    return keepAll('changed-range-unreadable: malformed-latest-fix');
+  }
+  if ((Array.isArray(mandatoryLenses) ? mandatoryLenses : MANDATORY_LENSES).includes(lens) || scope !== 'changed-only') return keepAll();
+  const kept = [];
+  const deferred = [];
+  for (const finding of list) {
+    const cited = typeof finding?.file === 'string' ? exactCitedPath(finding.file) : '';
+    // Resolve through the SAME lenient matcher the admission step used (basename, absolute path, repo prefix), so a
+    // touched file cited in an alias form is never mistaken for an untouched one and deferred.
+    const path = cited && (Object.hasOwn(files, cited) ? cited : matchCitedPath(finding.file, Object.keys(files))) || cited;
+    const line = Number.isInteger(finding?.line) && finding.line > 0 ? finding.line : null;
+    const touched = Object.hasOwn(files, path);
+    if (!path || (touched && (files[path] === null || !isSourcePath(path) || line === null
+      || files[path].some(n => Math.abs(n - line) <= LATER_ROUND_CHANGE_WINDOW)))) {
+      kept.push(finding);
+    } else {
+      deferred.push({ ...finding, deferred: DEFERRED_ADVISORY_REASON });
+    }
+  }
+  return { kept, deferred, scope, fellBack: null };
+}
+
+/**
+ * Juror text is untrusted (a PR author can plant it in the diff). Fold every line terminator JS's multiline `^`
+ * recognises (and the other vertical-space characters) and drop backticks, so an interpolated value can never open
+ * a new line — e.g. a forged `**Advisory outcome:**` that `parseAdvisories` would read ahead of the real one — or
+ * break out of a code span. ONE helper for every renderer that interpolates juror text. PURE.
+ */
+export function foldUntrusted(text) {
+  return String(text ?? '').replace(/[\r\n\u{2028}\u{2029}\u{85}\v\f]+/gu, ' ').replace(/`/g, "'");
+}
+
+const outcomeCitation = f => foldUntrusted(f?.file
+  ? `${f.file}${Number.isInteger(f.line) && f.line > 0 ? `:${f.line}` : ''}`
+  : String(f?.summary ?? '').slice(0, 60));
+
+export function explainPanelOutcome({ outcome, lensVerdicts = {}, findings = [], mandatoryLenses = MANDATORY_LENSES,
+  blockedReferrals, pendingReferrals, deferredCount = 0, scopeFellBack = null } = {}) {
+  const cited = f => outcomeCitation(f) ? ` (finding \`${outcomeCitation(f)}\`)` : '';
+  const prevention = (lens, f) => `Changes: ${lens}${mandatoryLenses.includes(lens) ? '' : ' advisory'} owes a prevention card${cited(f)}`;
+  let reason;
+  if (blockedReferrals?.length) reason = `Changes: a mandatory referral was ruled block${cited(blockedReferrals[0]?.finding)}`;
+  else if (pendingReferrals?.length) reason = `Pending: ${pendingReferrals.length} mandatory referral(s) await a ruling`;
+  else if (outcome === 'accept') reason = 'Accept: no blocking findings on this head';
+  else if (outcome == null) reason = 'No outcome: the reviewed head is not pinned, so no advisory label is applied';
+  else {
+    const blockingLens = mandatoryLenses.find(lens => ['needs-human', 'changes'].includes(lensVerdicts[lens]));
+    const owed = normalizeFindings(findings).find(f => !isFindingOutstanding(f) && blocksAcceptance(f));
+    const owedLens = Object.keys(lensVerdicts).find(lens => lensVerdicts[lens] === 'prevention-outstanding');
+    if (blockingLens) {
+      const finding = findings.find(f => f && isFindingOutstanding(f)
+        && (f.category === blockingLens || f.category?.startsWith(`${blockingLens}/`)));
+      reason = `Changes: ${blockingLens} found a blocking defect${cited(finding)}`;
+    } else if (owed) reason = prevention((owed.category ?? '').split('/')[0], owed);
+    else if (owedLens) reason = prevention(owedLens);
+    else reason = 'Changes: the panel did not accept this head';
+  }
+  if (deferredCount > 0) reason += ` · ${deferredCount} later-round advisory finding(s) moved to card suggestions`;
+  if (scopeFellBack) reason += ` · advisory scope fell back to \`all\` (${foldUntrusted(scopeFellBack)})`;
+  return reason.replace(/[\r\n\u{2028}\u{2029}\u{85}\v\f]+/gu, ' ');
+}
+
 /** Lenses that are ALWAYS surfaced but never block the unanimous-accept land path (#2310) — see the module doc
  *  above for why standards-conformance/simplicity are advisory. */
 export const ADVISORY_LENSES = Object.freeze([

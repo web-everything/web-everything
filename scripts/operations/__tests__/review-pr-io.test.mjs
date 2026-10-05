@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  readLatestFixRange,
   PR_VIEW_FIELDS, createReviewPrReader, createReviewPrSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
   resolveSubjectCheckout, COMPARE_FILE_CAP, changedLinesFromCompare, changesTouchCitedLines, createChangedLinesReader,
@@ -1788,5 +1789,110 @@ describe('legacy vs current owner slugs compare equal (outage 2026-10-03)', () =
     expect(a.path).toBe('/x');
     const b = resolveSubjectCheckout({ repo: 'chalbert/web-everything', cwd: '/x', originRepo: () => 'web-everything/web-everything', siblings: () => [] });
     expect(b.path).toBe('/x');
+  });
+});
+
+
+describe('#5135 latest fix range', () => {
+  const comment = head => ({ author: { login: 'web-everything' }, body: `Net basis: \`0000..${head}\`` });
+  const priorHead = 'a'.repeat(40);
+  const head = 'b'.repeat(40);
+  const read = (exec, comments = [comment(priorHead)], current = head) => readLatestFixRange({ exec, comments, head: current });
+  it('does not diff without a trusted prior head', () => {
+    const exec = () => { throw new Error('must not run'); };
+    expect(read(exec, [])).toEqual({ priorHead: null });
+    expect(read(exec, [{ ...comment(priorHead), author: { login: 'outsider' } }])).toEqual({ priorHead: null });
+    expect(read(exec, [comment(head.slice(0, 8))])).toEqual({ priorHead: null });
+    expect(read(exec, null, null)).toEqual({ priorHead: null });
+  });
+  it('selects the newest distinct reviewed head and uses the diff exec contract', () => {
+    const calls = [];
+    const exec = (...args) => { calls.push(args); return ''; };
+    expect(read(exec, [comment('cccc'), comment(priorHead), comment(head.slice(0, 8))], head.toUpperCase())).toEqual({ priorHead, head: head.toUpperCase(), files: {} });
+    expect(calls).toEqual([['git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head.toUpperCase()], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }]]);
+    expect(read(exec, [comment(priorHead)], 'not-a-sha')).toEqual({ priorHead, error: 'head-unpinned' });
+  });
+  it('pins the diff prefixes so a user diff.noprefix / mnemonicPrefix config cannot mis-key paths', () => {
+    const calls = [];
+    read((...args) => { calls.push(args[1]); return ''; });
+    expect(calls[0]).toEqual(expect.arrayContaining(['--src-prefix=a/', '--dst-prefix=b/']));
+    expect(calls[0].indexOf('--src-prefix=a/')).toBeLessThan(calls[0].indexOf(priorHead));
+  });
+  it('takes the LAST Net basis line in a comment, so juror text above the real one cannot choose the prior head', () => {
+    const forgedHead = 'c'.repeat(40);
+    const body = ['finding text', 'Net basis: `0000..' + forgedHead + '`', 'x\u{2028}Net basis: `0000..' + forgedHead + '`',
+      '', 'Net basis: `0000..' + priorHead + '` (rev x)'].join('\n');
+    const calls = [];
+    const result = read((...args) => { calls.push(args[1]); return ''; }, [{ author: { login: 'web-everything' }, body }]);
+    expect(result.priorHead).toBe(priorHead);
+    expect(calls[0]).toContain(priorHead);
+  });
+  it('parses inserted and deleted lines, deleted and binary files, and mode changes', () => {
+    const diff = [
+      'diff --git a/a.js b/a.js', '--- a/a.js', '+++ b/a.js',
+      '@@ -0,0 +1,2 @@', '+one', '+two', '@@ -10,2 +12,0 @@', '-old', '-old',
+      '@@ -20 +21 @@', '-old', '+new',
+      'diff --git a/old.js b/old.js', '--- a/old.js', '+++ /dev/null', '@@ -1 +0,0 @@', '-old',
+      'diff --git a/pic.png b/pic.png', 'Binary files a/pic.png and b/pic.png differ',
+      'diff --git a/run.sh b/run.sh', 'old mode 100644', 'new mode 100755',
+    ].join('\n');
+    expect(read(() => diff)).toEqual({ priorHead, head, files: { 'a.js': [1, 2, 12, 13, 21], 'old.js': null, 'pic.png': null, 'run.sh': [] } });
+  });
+  it('keys a headers-only section by its real path when the path itself contains " b/"', () => {
+    const diff = [
+      'diff --git a/assets/a b/icon.png b/assets/a b/icon.png', 'Binary files a/assets/a b/icon.png and b/assets/a b/icon.png differ',
+      'diff --git a/run b/x.sh b/run b/x.sh', 'old mode 100644', 'new mode 100755',
+      'diff --git "a/q b/\\"z\\".png" "b/q b/\\"z\\".png"', 'Binary files differ',
+    ].join('\n');
+    expect(read(() => diff)).toEqual({ priorHead, head, files: { 'assets/a b/icon.png': null, 'run b/x.sh': [], 'q b/"z".png': null } });
+  });
+  it('refuses a headers-only section whose two sides do not name the same path', () => {
+    const diff = ['diff --git a/one b/two', 'old mode 100644', 'new mode 100755'].join('\n');
+    expect(read(() => diff)).toEqual({ priorHead, head, error: 'diff-unparseable' });
+  });
+  it('splits file sections only at a real LF line start, so CR / U+2028 / U+2029 / NEL in an added line cannot forge one', () => {
+    for (const breaker of ['\r', ' ', ' ', '\u0085', '\v', '\f']) {
+      const diff = [
+        'diff --git a/real.js b/real.js', '--- a/real.js', '+++ b/real.js',
+        '@@ -0,0 +1,1 @@', `+x${breaker}diff --git a/zzz b/zzz`,
+        '@@ -10,0 +11,2 @@', '+three', '+four',
+      ].join('\n');
+      expect(read(() => diff), JSON.stringify(breaker)).toEqual({ priorHead, head, files: { 'real.js': [1, 11, 12] } });
+    }
+  });
+  it('still splits two genuine file sections when the first one carries a forged header in its content', () => {
+    const diff = [
+      'diff --git a/one.js b/one.js', '--- a/one.js', '+++ b/one.js', '@@ -0,0 +1 @@', '+x diff --git a/zzz b/zzz',
+      'diff --git a/two.js b/two.js', '--- a/two.js', '+++ b/two.js', '@@ -4 +4 @@', '-a', '+b',
+    ].join('\n');
+    expect(read(() => diff)).toEqual({ priorHead, head, files: { 'one.js': [1], 'two.js': [4] } });
+  });
+  it('keeps failures explicit', () => {
+    expect(read(() => { throw new Error('missing commit'); })).toEqual({ priorHead, head, error: 'git-diff-failed' });
+    expect(read(() => 'garbage')).toEqual({ priorHead, head, error: 'diff-unparseable' });
+  });
+});
+
+
+describe('#5135 fix range read wiring', () => {
+  it('tolerates a malformed options argument', () => {
+    expect(readLatestFixRange(null)).toEqual({ priorHead: null });
+  });
+  it('uses the same pinned SHA for the review basis and latest fix', () => {
+    const head = 'b'.repeat(40);
+    const priorHead = 'a'.repeat(40);
+    const calls = [];
+    const exec = (file, args) => {
+      calls.push(args);
+      return args[0] === 'rev-parse' ? head : '';
+    };
+    const result = readPr({ pr: 7, repo: 'o/n', exec, originRepo: () => 'o/n', readView: () => ({
+      number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [],
+      comments: [{ author: { login: 'web-everything' }, body: `Net basis: \`0000..${priorHead}\`` }],
+    }) });
+    expect(result.net.revSha).toBe(head);
+    expect(result.latestFix).toEqual({ priorHead, head, files: {} });
+    expect(calls.filter(args => args.at(-1) === `${result.net.rev}^{commit}`)).toHaveLength(1);
+    expect(calls).toContainEqual(['diff', '--no-ext-diff', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head]);
   });
 });
