@@ -34,6 +34,9 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     'timeout 300 npx vitest run a.test.mjs', 'timeout -s KILL 300 npx vitest run a.test.mjs',
     'nice -n 5 npx vitest run a.test.mjs', 'nice -5 npx vitest run a.test.mjs',
     'node node_modules/vitest/vitest.mjs run a.test.mjs',
+    // other direct entry points of the same vitest install (advisory finding on #3932, round 2)
+    'node ./node_modules/vitest/dist/cli.js run a.test.mjs', 'node node_modules/vitest/dist/cli.js a.test.mjs',
+    'node node_modules/.bin/vitest run a.test.mjs', 'node ../node_modules/.bin/vitest run a.test.mjs',
     'node --title standards scripts/check-standards.mjs --local',
     'node --max-old-space-size 4096 scripts/check-standards.mjs',
     'node --env-file .env scripts/check-standards.mjs',
@@ -54,6 +57,39 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     // a watch/dev process would hold an admission slot until killed: queue a one-shot `run` instead
     ['vitest watch a.test.mjs', queue + 'vitest run a.test.mjs'],
     ['npx vitest dev a.test.mjs', queue + 'npx vitest run a.test.mjs'],
+    // watch spelled as a FLAG (`--watch` / `-w` / `--watch=true`) is the same long-lived process: drop it and queue a one-shot run
+    ['npx vitest --watch a.test.mjs', queue + 'npx vitest run a.test.mjs'],
+    ['vitest -w a.test.mjs', queue + 'vitest run a.test.mjs'],
+    ['npx vitest run --watch a.test.mjs', queue + 'npx vitest run a.test.mjs'],
+    ['npx vitest --watch=true a.test.mjs', queue + 'npx vitest run a.test.mjs'],
+    ['npx vitest related a.mjs --watch', queue + 'npx vitest related a.mjs --run'],
+    ['npm test -- --watch a.test.mjs', 'npm run test:unit -- a.test.mjs'],
+    ['npm test -- -w a.test.mjs', 'npm run test:unit -- a.test.mjs'],
+    ['npm test -- a.test.mjs --watch', 'npm run test:unit -- a.test.mjs'],
+    // vitest's other direct entry points keep their own spelling inside the queue
+    ['node ./node_modules/vitest/dist/cli.js run a.test.mjs', queue + 'node ./node_modules/vitest/dist/cli.js run a.test.mjs'],
+    ['node node_modules/.bin/vitest run a.test.mjs', queue + 'node node_modules/.bin/vitest run a.test.mjs'],
+    // npm workspace / prefix selection must survive into the replacement (it picks WHICH package's tests run)
+    ['npm -w x test -- a.test.mjs', 'npm -w x run test:unit -- a.test.mjs'],
+    ['npm --workspace=x test -- a.test.mjs', 'npm --workspace=x run test:unit -- a.test.mjs'],
+    ['npm --prefix x test -- a.test.mjs', 'npm --prefix x run test:unit -- a.test.mjs'],
+    ['npm -C x -s test -- a.test.mjs', 'npm -C x run test:unit -- a.test.mjs'],
+    ['npm --workspaces test -- a.test.mjs', 'npm --workspaces run test:unit -- a.test.mjs'],
+    ['npm test -w x -- a.test.mjs', 'npm -w x run test:unit -- a.test.mjs'],
+    ['npm -w x test -- related a.mjs --run', queue + 'npm -w x exec -- vitest related a.mjs --run'],
+    // …also when there is no `--` (npm still parses every option), so the package name never becomes a file filter
+    ['npm test -w x a.test.mjs', 'npm -w x run test:unit -- a.test.mjs'],
+    ['npm test --workspace=x a.test.mjs', 'npm --workspace=x run test:unit -- a.test.mjs'],
+    ['npm test --prefix x a.test.mjs', 'npm --prefix x run test:unit -- a.test.mjs'],
+    ['npm test -ws a.test.mjs', 'npm -ws run test:unit -- a.test.mjs'],
+    ['npm test -w x related a.mjs', queue + 'npm -w x exec -- vitest related a.mjs'],
+    // other spellings of the watch flag, and a stray `true`/`false` value must not become a file filter
+    ['npx vitest --watch=1 a.test.mjs', queue + 'npx vitest run a.test.mjs'],
+    ['npx vitest --watch=TRUE a.test.mjs', queue + 'npx vitest run a.test.mjs'],
+    ['npx vitest --watch true a.test.mjs', queue + 'npx vitest run a.test.mjs'],
+    ['npx vitest --watch false a.test.mjs', queue + 'npx vitest run a.test.mjs'],
+    // a value flag's own value is a pattern even when it reads like a watch flag
+    ['npx vitest run -t -w a.test.mjs', queue + 'npx vitest run -t -w a.test.mjs'],
     // a forwarded vitest subcommand has no test:unit equivalent (it would become a filename filter after `vitest run`)
     ['npm test -- related scripts/a.mjs --run --passWithNoTests', queue + 'npx vitest related scripts/a.mjs --run --passWithNoTests'],
     ['npm test related scripts/a.mjs', queue + 'npx vitest related scripts/a.mjs'],
@@ -102,6 +138,17 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     // whole-suite `npm test` spellings the full-suite arm does not parse: its message, never `npm run test:unit`
     'npm -s test', 'npm -s t', 'timeout 5 npm test', 'npm --prefix x --silent test', 'npm -w x test',
     'npm --workspace=x test', 'npm -C x test',
+    // flag-only tails select the WHOLE suite whichever way the flag is spelled (boolean, `=`, separate value)
+    'npm -s test -- --coverage', 'npm -s test -- --reporter=dot', 'npm -s test -- --reporter dot',
+    'npm -s test -- --bail 1', 'timeout 5 npm test -- --coverage', 'npm -w x test -- --coverage',
+    // watch spelled as a flag, scope flags kept, and the other direct vitest entry points
+    'npx vitest --watch a.test.mjs', 'vitest -w a.test.mjs', 'npx vitest run --watch a.test.mjs',
+    'npx vitest related a.mjs --watch', 'npm test -- --watch a.test.mjs', 'npm test -- -w a.test.mjs',
+    'npm -w x test -- a.test.mjs', 'npm --prefix x test -- a.test.mjs', 'npm -C x test -- a.test.mjs',
+    'npm test -w x -- a.test.mjs', 'npm -w x test -- related a.mjs --run',
+    'node ./node_modules/vitest/dist/cli.js run a.test.mjs', 'node node_modules/.bin/vitest run a.test.mjs',
+    'npm test -w x a.test.mjs', 'npm test --prefix x a.test.mjs', 'npm test -w x related a.mjs',
+    'npx vitest --watch=1 a.test.mjs', 'npx vitest --watch true a.test.mjs',
   ])('the suggestion for the denied `%s` is itself allowed (no deny loop)', (cmd) => {
     const reason = decide(cmd, {});
     expect(reason).not.toBeNull();
@@ -109,6 +156,41 @@ describe('heavy-enforce — every direct test run requires admission', () => {
       expect(suggested, suggested).not.toMatch(/<[^>]+>/); // a literal placeholder cannot be pasted
       expect(decide(suggested, {}), suggested).toBeNull();
     }
+  });
+
+  // No suggestion may itself be a long-lived watch process holding one of the 2 admission slots.
+  it.each([
+    'vitest watch a.test.mjs', 'npx vitest dev a.test.mjs', 'npx vitest --watch a.test.mjs', 'vitest -w a.test.mjs',
+    'npx vitest run --watch a.test.mjs', 'npx vitest --watch=true a.test.mjs', 'npx vitest related a.mjs --watch',
+    'npm test -- --watch a.test.mjs', 'npm test -- -w a.test.mjs', 'npm test -- a.test.mjs --watch',
+    'npm test -- watch a.test.mjs', 'npm -w x test -- --watch a.test.mjs',
+  ])('the suggestion for `%s` contains no watch-mode token', (cmd) => {
+    const reason = decide(cmd, {});
+    expect(reason).not.toBeNull();
+    const suggested = [...reason.matchAll(/Use: `([^`]+)`/g)].map((m) => m[1]);
+    expect(suggested.length).toBeGreaterThan(0);
+    for (const s of suggested) {
+      // `-w` is npm's own workspace flag in an `npm …` suggestion, vitest's watch flag everywhere else
+      const watchToken = s.startsWith('npm ') ? /^(?:watch|dev|--watch(?:=true)?)$/ : /^(?:watch|dev|--watch(?:=true)?|-w)$/;
+      for (const tok of s.split(/\s+/)) expect(tok, s).not.toMatch(watchToken);
+    }
+  });
+
+  // vitest's entry scripts behind `node` are the same bare whole-suite run: the full-suite message, not a queued full run
+  it.each([
+    'node node_modules/vitest/dist/cli.js', 'node node_modules/vitest/dist/cli.js run', 'node node_modules/vitest/vitest.mjs run --coverage',
+    'node node_modules/.bin/vitest --coverage', 'node node_modules/.bin/vitest run --coverage',
+  ])('denies the bare whole-suite `%s` with the full-suite message', (cmd) => {
+    expect(decide(cmd, {})).toContain('bare FULL-SUITE');
+  });
+
+  it.each(['node node_modules/vitest/package.json', 'node node_modules/vitest/dist/chunks/foo.js'])(
+    'does not treat `%s` (not a vitest entry script) as a test run', (cmd) => expect(decide(cmd, {})).toBeNull());
+
+  it('a flag-only npm test run gets the full-suite message, not a replacement that is itself denied', () => {
+    const result = decide('npm -s test -- --coverage', {});
+    expect(result).toContain('bare FULL-SUITE');
+    expect(result).not.toContain('heavy-enforce:');
   });
 
   it('keeps full-suite precedence and queues its targeted advice', () => {

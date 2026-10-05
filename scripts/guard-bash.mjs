@@ -2467,6 +2467,13 @@ export function rawHeavyCommandReason(segment, { primaryCwd = false } = {}) {
 }
 
 const VITEST_WORD = /^vitest(?:@\S*)?$/;
+/** vitest's own entry scripts when run through `node` (`vitest/vitest.mjs`, `vitest/dist/cli.js`, `.bin/vitest`). */
+const VITEST_NODE_ENTRY = /(?:^|\/)node_modules\/(?:vitest\/(?:vitest\.mjs|dist\/cli\.js)|\.bin\/vitest)$/;
+/** vitest's watch mode spelled as a flag (`-w` is its short form); `--watch=false`/`=0` is NOT watch. */
+const VITEST_WATCH_FLAG = /^(?:--watch|-w)(?:=(?:true|1|yes|on))?$/i;
+/** npm options that choose WHICH package's `test` script runs; a replacement that drops them tests another package. */
+const NPM_SCOPE_VALUE_FLAGS = new Set(['-w', '--workspace', '--prefix', '-C']);
+const NPM_SCOPE_BARE_FLAG = /^(?:-ws|--workspaces|--include-workspace-root|-iwr)$/;
 const NODE_SCRIPT_WORD = /\.(?:[cm]?js|ts)$/;
 const NODE_SCRIPT_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loader', '--experimental-loader']);
 
@@ -2484,6 +2491,60 @@ function execWrapperWords(w) {
   return 0;
 }
 
+/** The raw source text of the given `headWords` entries, space-joined (quoting survives; only the gaps are normalised). */
+function rawWords(src, words) {
+  return words.map((word) => src.slice(word.start, word.end)).join(' ');
+}
+
+/** Is this word an npm scope option, and if so how many words does it span (the flag plus a separate value)? */
+function npmScopeSpan(words, j) {
+  const text = words[j]?.text || '';
+  const name = text.split('=')[0];
+  if (NPM_SCOPE_BARE_FLAG.test(name)) return 1;
+  if (!NPM_SCOPE_VALUE_FLAGS.has(name) && !/^--(?:workspaces?|include-workspace-root)$/.test(name)) return 0;
+  return text.includes('=') || !words[j + 1] ? 1 : 2;
+}
+
+/** Drop watch-mode flags (and a separate `true`/`false` value) from vitest argument words. A value flag's own
+ *  separate value (`-t -w`) is a pattern, not a flag, so the pair is kept whole. */
+function dropWatchFlags(words) {
+  const out = [];
+  for (let k = 0; k < words.length; k += 1) {
+    const text = words[k].text;
+    if (VITEST_VALUE_FLAGS.has(text) && words[k + 1]) { out.push(words[k], words[k + 1]); k += 1; continue; }
+    if (VITEST_WATCH_FLAG.test(text)) { if (/^(?:true|false)$/i.test(words[k + 1]?.text || '')) k += 1; continue; }
+    out.push(words[k]);
+  }
+  return out;
+}
+
+/** Drop every watch-mode flag from a forwarded vitest argument string (unchanged when it has none). */
+function withoutWatchFlags(args) {
+  const words = headWords(args);
+  const kept = dropWatchFlags(words);
+  return kept.length === words.length ? args : rawWords(args, kept);
+}
+
+/**
+ * Turn a vitest command line (any head: `npx vitest`, `pnpm vitest`, `node …/vitest.mjs`) into a one-shot run:
+ * watch flags are dropped, a `watch`/`dev` subcommand becomes `run`, and `run` is added when nothing names a mode
+ * (a bare `vitest <file>` would start watch mode in a TTY). `related` has no `run`; it takes `--run` instead.
+ */
+function oneShotVitest(command) {
+  const words = headWords(command);
+  const at = words.findIndex((word) => VITEST_WORD.test(word.text) || VITEST_NODE_ENTRY.test(word.text));
+  if (at < 0) return command;
+  const head = words.slice(0, at + 1);
+  const rest = dropWatchFlags(words.slice(at + 1));
+  let out = rawWords(command, head);
+  const sub = rest[0]?.text;
+  if (sub === 'watch' || sub === 'dev') out += ' run' + (rest.length > 1 ? ' ' + rawWords(command, rest.slice(1)) : '');
+  else if (sub === 'related') out += ' ' + rawWords(command, rest) + (rest.some((word) => word.text === '--run') ? '' : ' --run');
+  else if (sub === 'run' || VITEST_NON_RUN_SUBCOMMANDS.has(sub)) out += ' ' + rawWords(command, rest);
+  else out += ' run' + (rest.length ? ' ' + rawWords(command, rest) : '');
+  return out;
+}
+
 /** Classify only the executable head, never a tool name mentioned in an argument. */
 function ungatedHeavyHead(head, depth = 0) {
   if (depth > 8) return null;
@@ -2495,7 +2556,7 @@ function ungatedHeavyHead(head, depth = 0) {
     // `related` selects tests, but still starts workers; --changed does too.
     if (VITEST_NON_RUN_SUBCOMMANDS.has(w[1]) && w[1] !== 'related') return null;
     if (w.slice(1).some((arg) => /^(?:--version|-v|--help|-h)$/.test(arg))) return null;
-    return { kind: 'vitest', watch: w[1] === 'watch' || w[1] === 'dev' };
+    return { kind: 'vitest', watch: w[1] === 'watch' || w[1] === 'dev' || w.slice(1).some((arg) => VITEST_WATCH_FLAG.test(arg)) };
   }
   if (w[0] === 'node') {
     // Only the script position is executable. --check/-c and eval arguments are not scripts.
@@ -2512,7 +2573,7 @@ function ungatedHeavyHead(head, depth = 0) {
     if (/(?:^|\/)check-standards\.mjs$/.test(w[i] || '')) {
       return { kind: 'standards', tail: head.slice(words[i].end).trim() };
     }
-    if (/(?:^|\/)node_modules\/vitest\/vitest\.mjs$/.test(w[i] || '')) {
+    if (VITEST_NODE_ENTRY.test(w[i] || '')) {
       return ungatedHeavyHead('vitest' + head.slice(words[i].end), depth + 1);
     }
     return null; // Includes heavy-admission: its child is an argument, not the executable.
@@ -2524,20 +2585,37 @@ function ungatedHeavyHead(head, depth = 0) {
     return ungatedHeavyHead('vitest' + head.slice(words[w.indexOf(inv.names[0], 1)].end), depth + 1);
   }
   let at = -1;
+  const scope = []; // npm's package-selecting options (`-w x`, `--prefix x`, …), kept in the replacement
   if (w[0] === 'npm') { // runner flags may precede the subcommand: `npm -s test`, `npm --prefix . test`
     let j = 1;
-    while (w[j]?.startsWith('-')) j += !w[j].includes('=') && RUNNER_VALUE_FLAGS.has(w[j]) ? 2 : 1;
+    while (w[j]?.startsWith('-')) {
+      const span = npmScopeSpan(words, j);
+      if (span) scope.push(rawWords(head, words.slice(j, j + span)));
+      j += span || (!w[j].includes('=') && RUNNER_VALUE_FLAGS.has(w[j]) ? 2 : 1);
+    }
     if (['test', 't', 'tst'].includes(w[j])) at = j;
   }
   if (at < 0 && inv?.names?.length === 1) at = w.indexOf(inv.names[0], 1);
   if (at < 0 || !['test', 't', 'tst'].includes(w[at])) return null;
   const i = at;
-  const forwarded = head.slice(words[i].end).trim().replace(/^--(?:\s+|$)/, '');
+  // Options between the script name and `--` still belong to npm (`npm test -w x -- a.test.mjs`): keep its scope
+  // flags and any positional filter, drop the rest; only what follows `--` is forwarded to vitest verbatim.
+  const after = words.slice(i + 1);
+  const dd = after.findIndex((word) => word.text === '--');
+  // With no `--`, npm still parses every option, so scope flags anywhere after the script name are npm's.
+  const kept = [];
+  for (let k = 0; k < (dd < 0 ? after.length : dd); k += 1) {
+    const span = npmScopeSpan(after, k);
+    if (span) { scope.push(rawWords(head, after.slice(k, k + span))); k += span - 1; }
+    else if (dd < 0 || !after[k].text.startsWith('-')) kept.push(after[k]);
+  }
+  let forwarded = [rawWords(head, kept), dd < 0 ? '' : head.slice(after[dd].end).trim()].filter(Boolean).join(' ');
+  forwarded = withoutWatchFlags(forwarded.replace(/^--(?:\s+|$)/, ''));
   // A forwarded vitest subcommand (`related`, `list`, `bench`, ...) has no `test:unit` equivalent: after
   // `vitest run` it would degrade to a filename filter (`related a.mjs --passWithNoTests` silently runs nothing).
-  if (VITEST_NON_RUN_SUBCOMMANDS.has(forwarded.split(/\s+/)[0])) return { kind: 'test', subcommand: true, tail: forwarded };
+  if (VITEST_NON_RUN_SUBCOMMANDS.has(forwarded.split(/\s+/)[0])) return { kind: 'test', subcommand: true, tail: forwarded, scope };
   // `npm test -- run <f>` forwards vitest's own mode word; `test:unit` already runs `vitest run`, so drop it.
-  return { kind: 'test', tail: forwarded.replace(/^(?:run|watch|dev)(?:\s+|$)/, '') };
+  return { kind: 'test', tail: forwarded.replace(/^(?:run|watch|dev)(?:\s+|$)/, ''), scope };
 }
 
 /** Deny any unqueued test/standards execution, with a runnable replacement. Pure; no escape. */
@@ -2545,11 +2623,6 @@ export function ungatedHeavyRunReason(segment) {
   const s = String(segment || '').trim();
   const run = ungatedHeavyHead(canonicalCommand(s));
   if (!run) return null;
-  // A whole-suite `npm test` spelling the full-suite arm does not recognise (`npm -s test`, `timeout 5 npm test`):
-  // its only queued form is `npm run test:unit`, which that arm denies. Give its message, not a deny loop.
-  if (run.kind === 'test' && !run.subcommand && !run.tail && !hasLeadingEnvEscape(s, FULL_SUITE_ESCAPE_ENV)) {
-    return FULL_SUITE_DENY_MESSAGE;
-  }
   // Keep assignment spelling/quoting intact, placing it before node so it remains shell syntax. A leading
   // `WE_FULL_SUITE_OK=1` is kept too: the queued full-suite form still needs it to pass the xpnhz4o arm.
   const words = headWords(s);
@@ -2561,15 +2634,23 @@ export function ungatedHeavyRunReason(segment) {
   }
   const env = prefix.length ? prefix.join(' ') + ' ' : '';
   const command = i ? s.slice(words[i]?.start ?? s.length) : s;
+  const queued = 'node scripts/readiness/heavy-admission.mjs run -- ';
+  const scope = run.scope?.length ? run.scope.join(' ') + ' ' : '';
   const replacement = run.kind === 'test'
     ? run.subcommand
-      ? 'node scripts/readiness/heavy-admission.mjs run -- npx vitest ' + run.tail
-      : 'npm run test:unit' + (run.tail ? ' -- ' + run.tail : '')
+      ? queued + (scope ? 'npm ' + scope + 'exec -- vitest ' : 'npx vitest ') + run.tail
+      : 'npm ' + scope + 'run test:unit' + (run.tail ? ' -- ' + run.tail : '')
     : run.kind === 'standards'
       ? 'npm run check:standards' + (run.tail ? ' -- ' + run.tail : '')
       // a watch/dev process would hold one of the host's 2 admission slots until killed, so queue `run` instead
-      : 'node scripts/readiness/heavy-admission.mjs run -- '
-        + (run.watch ? command.replace(/(\bvitest\S*\s+)(?:watch|dev)\b/, '$1run') : command);
+      : queued + (run.watch ? oneShotVitest(command) : command);
+  // A replacement the full-suite arm would itself deny (a whole-suite `npm -s test`, `timeout 5 npm test`, or a
+  // flag-only tail like `-- --coverage`, which still selects every file) is a deny loop: give that arm's message,
+  // which already names the runnable alternatives. Its escape, when present, is kept in `env` above. (A bare
+  // vitest run never reaches here from `decide`: the full-suite arm runs first and denies it with that message.)
+  if (run.kind === 'test' && !hasLeadingEnvEscape(s, FULL_SUITE_ESCAPE_ENV) && fullSuiteRunReason(replacement)) {
+    return FULL_SUITE_DENY_MESSAGE;
+  }
   return `heavy-enforce: each direct run spawns ~6–11 workers outside the host cap of 2 queued heavy runs; load hit 25–48 on a 12-core host. There is no admission override. Use: \`${env}${replacement}\`.`;
 }
 
@@ -2619,6 +2700,8 @@ export function isFullSuiteHead(head, depth = 0) {
     const inv = runnerInvocation(h);
     return !!(inv && Array.isArray(inv.names) && inv.names.some((n) => FULL_SUITE_SCRIPTS.has(n)));
   }
+  // vitest's own entry scripts behind `node` (`node node_modules/vitest/dist/cli.js`) are the same bare run.
+  if (w[0] === 'node' && VITEST_NODE_ENTRY.test(w[1] || '')) return isFullSuiteHead('vitest' + h.slice(words[1].end), depth + 1);
   if (RUNNER_NAMES.has(w[0])) {
     let idx = -1;
     if (w[0] === 'npm' && ['test', 't', 'tst'].includes(w[1])) { idx = 1; w[1] = 'test'; }
