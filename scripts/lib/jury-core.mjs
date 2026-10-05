@@ -2371,14 +2371,17 @@ export function validateReferralRecord(r) {
   } catch { return false; }
 }
 
-/** Missing-author-stamp policy env: `run-identity` (default) trusts the run-derived referral reviewer;
- * exactly `refuse` keeps the hold and names `author-stamp-missing` in pending reasons.
+/** Missing-author-stamp policy env: `refuse` (default, fail-closed) keeps the hold and names
+ * `author-stamp-missing` in pending reasons; exactly `run-identity` is the explicit operator opt-in that
+ * trusts the run-derived referral reviewer when the stamp is missing. Relaxing a security control must be
+ * a positive act — a stripped stamp (`stamp-lost`) is indistinguishable from a raw-created PR by date alone.
  */
 export const REFERRAL_STAMP_POLICY_ENV = 'WE_REFERRAL_MISSING_STAMP';
 
-/** Resolve `run-identity` by default; only the exact env value `refuse` selects strict stamp refusal. */
+/** Resolve `refuse` by default; only the exact env value `run-identity` relaxes it (any other value, a
+ * mis-cased or unknown one included, stays strict). */
 export function resolveReferralStampPolicy(env = process.env) {
-  return env[REFERRAL_STAMP_POLICY_ENV] === 'refuse' ? 'refuse' : 'run-identity';
+  return env[REFERRAL_STAMP_POLICY_ENV] === 'run-identity' ? 'run-identity' : 'refuse';
 }
 
 /** Resolve own rulings from the assigned reviewer or operator. An unruled advisory duplicate
@@ -2392,10 +2395,11 @@ export function referralRecordState(record, { head = record?.head, body = record
   const pending = [], blocked = [], rulings = [];
   const decision = decideClearerIndependence({ authorId: parseAuthorActorId(body),
     clearerId: record.reviewer.id, prCreatedAt: createdAt });
+  // `validateReferralRecord` already pinned reviewer.id to the run-derived seat, so no separate id check here.
   const missingStamp = decision.independent !== true
-    && [INDEPENDENCE.STAMP_LOST, INDEPENDENCE.UNKNOWN_AUTHOR].includes(decision.status)
-    && record.reviewer.id === mandatoryReferralReviewer(record.runId).id;
-  // This seat is derived from the review run, not any author's real session identity.
+    && [INDEPENDENCE.STAMP_LOST, INDEPENDENCE.UNKNOWN_AUTHOR].includes(decision.status);
+  // Only on the explicit `run-identity` opt-in: this seat is derived from the review run, not any author's
+  // real session identity, so it proves nothing about independence on its own.
   const fallback = missingStamp && stampPolicy === 'run-identity';
   const independent = decision.independent === true || fallback;
   for (const f of activeReferrals(record)) {
