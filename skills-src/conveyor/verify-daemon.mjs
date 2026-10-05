@@ -5,6 +5,10 @@
  *   {@link ../../scripts/conveyor/verify-dispatch.mjs}'s `runVerifyDispatch` on its own interval, standalone,
  *   instead of relying on whatever else might invoke that script.
  *
+ * 2026-10-05 hung-gate incident: ticks launch gates without awaiting settlement, using one in-flight
+ * registry for the process lifetime. A code-change restart waits (still ticking) until it is empty; shutdown
+ * kills its process groups.
+ *
  * THE GAP THIS CLOSES (confirmed by direct read — the one real gap named in the whole daemon-split epic).
  * `we:scripts/conveyor/verify-dispatch.mjs`'s own header justified its blocking safety entirely on "the runner
  * is a SINGLETON... so there is no risk of two dispatches racing the same lane's marker" — a property that
@@ -137,11 +141,11 @@ export async function runDaemonLoop({
  * wrapper exists so the dispatch call itself is a named, injectable effect (unit-tested with a fake `runVerify`
  * — no real subprocess/gh/git in unit tests), the same discipline `sleep`/`heartbeat` already get one level up
  * in {@link runDaemonLoop}.
- * @param {{runVerify?: (o:object) => Promise<{dryRun:boolean, dispatched:Array<object>, failures:Array<object>}>}} [o]
+ * @param {{inFlight?:Map<string, object>, awaitSettle?:boolean, runVerify?: (o:object) => Promise<{dryRun:boolean, dispatched:Array<object>, failures:Array<object>}>}} [o]
  * @returns {Promise<{dryRun:boolean, dispatched:Array<object>, failures:Array<object>}>}
  */
-export async function runVerifyTick({ runVerify = runVerifyDispatch } = {}) {
-  return runVerify({});
+export async function runVerifyTick({ runVerify = runVerifyDispatch, ...options } = {}) {
+  return runVerify(options);
 }
 
 /**
@@ -230,15 +234,17 @@ export function startIndependentHeartbeat({
  *  {@link startIndependentHeartbeat} timer (#4130 — no longer built in here, since the heartbeat must run on
  *  its own clock, independent of this factory's caller). Kept as its own factory (mirroring
  *  `buildCliDaemonEffects` in the sibling daemons) so `main()` stays a thin wire-up. */
-export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAlive = () => true, log = console } = {}) {
+export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAlive = () => true, log = console, runVerify = runVerifyDispatch } = {}) {
+  const inFlight = new Map();
   return {
+    inFlight,
     intervalMs,
-    tickOnce: () => runVerifyTick({}),
+    tickOnce: () => runVerifyTick({ runVerify, inFlight, awaitSettle: false }),
     sleep: realSleep,
     isAlive,
     onTick: (result) => {
-      const { dispatched = [], failures = [] } = result || {};
-      log.error(`verify-daemon: tick — dispatched ${dispatched.length}, failed ${failures.length}`);
+      const { dispatched = [], failures = [], deferred = [] } = result || {};
+      log.error(`verify-daemon: tick — dispatched ${dispatched.length}, in flight ${inFlight.size}, deferred ${deferred.length}, failed ${failures.length}`);
       for (const f of failures) {
         log.error(`verify-daemon: ${f.pool}/lane-${f.lane} failed (non-fatal)${f.timedOut ? ` [timed out: ${f.timedOutPhase}]` : ''}`);
       }
@@ -264,11 +270,15 @@ async function main() {
     owner,
     onLost: () => console.error(`verify-daemon: lease lost mid-run — will stop after the current tick.`),
   });
+  const effects = buildCliDaemonEffects({ isAlive });
   let stopping = false;
   const shutdown = (signal) => {
     if (stopping) return;
     stopping = true;
     console.error(`verify-daemon: ${signal} — releasing the lease and exiting.`);
+    for (const { pid } of effects.inFlight.values()) {
+      try { if (pid > 0) process.kill(-pid, 'SIGKILL'); } catch {}
+    }
     stopHeartbeat();
     releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: VERIFY_DAEMON_LEASE_KEY });
     process.exit(0);
@@ -279,8 +289,10 @@ async function main() {
   const cloneRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
   const readHead = () => { try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: cloneRoot, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } };
   const bootHead = readHead();
-  const codeChanged = () => cloneHeadChanged({ bootHead, readHead });
-  const { stoppedReason } = await runDaemonLoop({ ...buildCliDaemonEffects({ isAlive }), codeChanged });
+  // A code-change restart waits for an empty in-flight registry, but KEEPS TICKING meanwhile: exiting with gates
+  // still running would orphan them, and pausing dispatch until they drain would re-create the starvation.
+  const codeChanged = () => effects.inFlight.size === 0 && cloneHeadChanged({ bootHead, readHead });
+  const { stoppedReason } = await runDaemonLoop({ ...effects, codeChanged });
   if (!stopping) {
     console.error(`verify-daemon: loop stopped (${stoppedReason}) — releasing the lease and exiting.`);
     stopHeartbeat();

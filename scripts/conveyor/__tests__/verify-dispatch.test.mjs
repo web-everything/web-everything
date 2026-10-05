@@ -8,12 +8,12 @@
  *   spawns the real `verify-lane.mjs`/`verify-dispatch.mjs` against a throwaway git fixture, no network, and
  *   asserts the full request → dispatch → green round trip a delivery agent would actually rely on.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync, spawn as spawnProcess, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { laneNeedsVerifyDispatch, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER } from '../verify-dispatch.mjs';
+import { laneNeedsVerifyDispatch, inFlightSuperseded, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../../../skills-src/conveyor/verify-daemon.mjs';
@@ -755,4 +755,115 @@ describe('runVerifyDispatch — run identity wiring (a fake spawnGate, a real ma
     expect(after).toMatchObject({ status: 'running', startedAt: 't-newer' });
     expect(after.runId).toBeUndefined();
   });
+});
+
+
+describe('2026-10-05 hung gate starvation', () => {
+  it('detects the marker before truncating a single large stderr write', async () => {
+    const script = join(base, 'chatty-gate.mjs');
+    writeFileSync(script, `process.stderr.write(${JSON.stringify(GATE_STARTED_MARKER)} + 'x'.repeat(9000)); setTimeout(() => {}, 30000);`);
+    let started = 0;
+    const pids = [];
+    await expect(spawnGateBounded([script], {
+      queueCeilingMs: 2000, gateCeilingMs: 100,
+      onGateStarted: () => { started += 1; }, onSpawn: pid => pids.push(pid),
+    })).rejects.toMatchObject({ timedOutPhase: 'gate' });
+    expect(started).toBe(1);
+    expect(pids).toHaveLength(1);
+    expect(pids[0]).toBeGreaterThan(0);
+  });
+
+  it('returns without settlement, remembers the pid, and never dispatches the same lane twice', async () => {
+    runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir);
+    const inFlight = new Map();
+    let calls = 0;
+    const spawnGate = (_args, { onSpawn }) => {
+      calls += 1;
+      onSpawn?.(12345);
+      return new Promise(() => {});
+    };
+    const opts = { poolRoot, spawnGate, inFlight, awaitSettle: false };
+    const result = await runVerifyDispatch(opts);
+    expect(result.dispatched).toMatchObject([{ lane: 1, launched: true }]);
+    expect(inFlight.get(laneDir)).toMatchObject({ lane: 1, pid: 12345 });
+    expect((await runVerifyDispatch(opts)).dispatched).toEqual([]);
+    expect(calls).toBe(1);
+  }, 2000);
+
+  it('leaves excess requests untouched for a later tick', async () => {
+    const lane2 = makeLane(join(poolDir, 'lane-2'));
+    for (const dir of [laneDir, lane2]) runVerifyLane(['request', `--repo=${dir}`, '--gate=true'], dir);
+    const before = readFileSync(join(lane2, '.git', '.lane-verify'), 'utf8');
+    const result = await runVerifyDispatch({ poolRoot, inFlight: new Map(), awaitSettle: false,
+      maxInFlight: 1, spawnGate: () => new Promise(() => {}) });
+    expect(result.dispatched).toMatchObject([{ lane: 1, launched: true }]);
+    expect(result.deferred).toMatchObject([{ pool: 'flagtest', lane: 2, reason: 'max-in-flight' }]);
+    expect(readFileSync(join(lane2, '.git', '.lane-verify'), 'utf8')).toBe(before);
+  }, 2000);
+
+  it('recognizes only a different run and request that still needs dispatch', () => {
+    const entry = { runId: 'old', requestStartedAt: 'before' };
+    const marker = { status: 'running', sha: 'head', runId: 'new', startedAt: 'after' };
+    expect(inFlightSuperseded(entry, marker, 'head')).toBe(true);
+    expect(inFlightSuperseded(entry, { ...marker, runId: 'old' }, 'head')).toBe(false);
+    expect(inFlightSuperseded(entry, { ...marker, startedAt: 'before' }, 'head')).toBe(false);
+    expect(inFlightSuperseded(entry, marker, 'other')).toBe(false);
+  });
+
+  it('resolves a positive integer concurrency limit, otherwise eight', () => {
+    for (const value of [undefined, '0', '-1', '1.5', 'nope']) {
+      expect(resolveMaxInFlight({ VERIFY_DISPATCH_MAX_IN_FLIGHT: value })).toBe(8);
+    }
+    expect(resolveMaxInFlight({ VERIFY_DISPATCH_MAX_IN_FLIGHT: '3' })).toBe(3);
+  });
+});
+
+
+it('settles a superseded run in the background without overwriting the newer request', async () => {
+  runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true'], laneDir);
+  const inFlight = new Map();
+  let rejectGate;
+  const spawnGate = vi.fn((_args, { onSpawn }) => {
+    onSpawn(12345);
+    return new Promise((_resolve, reject) => { rejectGate = reject; });
+  });
+  const opts = { poolRoot, inFlight, spawnGate, awaitSettle: false };
+  await runVerifyDispatch(opts);
+  const old = inFlight.get(laneDir);
+  const path = join(laneDir, '.git', '.lane-verify');
+  const newer = { ...JSON.parse(readFileSync(path, 'utf8')), runId: 'new-request', startedAt: '2099-01-01T00:00:00.000Z' };
+  writeFileSync(path, JSON.stringify(newer));
+  const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+  try {
+    vi.stubEnv('VERIFY_DISPATCH_KILL_SUPERSEDED', '0');
+    expect((await runVerifyDispatch(opts)).superseded).toEqual([]);
+    expect(kill).not.toHaveBeenCalled();
+    vi.stubEnv('VERIFY_DISPATCH_KILL_SUPERSEDED', '1');
+    const result = await runVerifyDispatch(opts);
+    expect(result.superseded).toEqual([{ pool: 'flagtest', lane: 1, runId: old.runId }]);
+    expect(kill).toHaveBeenCalledWith(-12345, 'SIGKILL');
+    expect(spawnGate).toHaveBeenCalledTimes(1);
+    expect(inFlight.size).toBe(1);
+    rejectGate(Object.assign(new Error('killed'), { signal: 'SIGKILL', status: null }));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(inFlight.size).toBe(0);
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(newer);
+    await runVerifyDispatch({ ...opts, spawnGate: async () => ({ pid: 42 }) });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(inFlight.size).toBe(0);
+  } finally {
+    kill.mockRestore();
+    vi.unstubAllEnvs();
+  }
+});
+
+
+it('detects a gate marker split across stderr chunks', async () => {
+  const script = join(base, 'split-marker.mjs');
+  writeFileSync(script, `process.stderr.write('gate execution '); setTimeout(() => process.stderr.write('starting' + 'x'.repeat(9000)), 100); setTimeout(() => {}, 30000);`);
+  let started = 0;
+  await expect(spawnGateBounded([script], { queueCeilingMs: 2000, gateCeilingMs: 100,
+    onGateStarted: () => { started += 1; },
+  })).rejects.toMatchObject({ timedOutPhase: 'gate' });
+  expect(started).toBe(1);
 });

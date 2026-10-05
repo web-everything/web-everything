@@ -320,7 +320,7 @@ describe('buildCliDaemonEffects — the real-effect factory (isAlive wiring only
       dispatched: [{ pool: 'we', lane: 1 }],
       failures: [{ pool: 'we', lane: 2, timedOut: true, timedOutPhase: 'gate' }],
     });
-    expect(log.error).toHaveBeenCalledWith('verify-daemon: tick — dispatched 1, failed 1');
+    expect(log.error).toHaveBeenCalledWith('verify-daemon: tick — dispatched 1, in flight 0, deferred 0, failed 1');
     expect(log.error).toHaveBeenCalledWith('verify-daemon: we/lane-2 failed (non-fatal) [timed out: gate]');
   });
 
@@ -398,4 +398,18 @@ describe('code-change restart', () => {
     const out = await runDaemonLoop({ tickOnce, sleep: async () => {}, codeChanged: () => cloneHeadChanged({ bootHead: 'a', readHead: () => head }), maxTicks: 10 });
     expect(out).toEqual({ ticks: 2, stoppedReason: 'code-changed' });
   });
+});
+
+
+it('forwards the process-lifetime in-flight registry and non-blocking mode', async () => {
+  const runVerify = vi.fn(async () => ({}));
+  const effects = buildCliDaemonEffects({ runVerify });
+  expect(effects.inFlight).toBeInstanceOf(Map);
+  await effects.tickOnce();
+  await effects.tickOnce();
+  expect(runVerify).toHaveBeenCalledTimes(2);
+  expect(runVerify).toHaveBeenCalledWith({ inFlight: effects.inFlight, awaitSettle: false });
+  runVerify.mockClear();
+  await runVerifyTick({ runVerify, inFlight: effects.inFlight, awaitSettle: false });
+  expect(runVerify).toHaveBeenCalledWith({ inFlight: effects.inFlight, awaitSettle: false });
 });
