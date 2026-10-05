@@ -55,13 +55,13 @@ describe('xpnhz4o — a bare full-suite run is denied, naming the selected gate'
   it.each([
     'node scripts/verify-lane.mjs run',
     'node scripts/verify-lane.mjs',
-    'npx vitest related scripts/a.mjs --run --passWithNoTests',
-    'npx vitest run scripts/__tests__/a.test.mjs',
+    'node scripts/readiness/heavy-admission.mjs run -- npx vitest related scripts/a.mjs --run --passWithNoTests',
+    'node scripts/readiness/heavy-admission.mjs run -- npx vitest run scripts/__tests__/a.test.mjs',
     'npm run test:unit -- scripts/__tests__/a.test.mjs',
     'node scripts/readiness/heavy-admission.mjs run -- npx vitest run a.test.mjs b.test.mjs c.test.mjs',
     'npx vitest --version',
-    'npx vitest run guard-bash',
-    'npx vitest run --maxConcurrency 5 scripts/__tests__/a.test.mjs',
+    'node scripts/readiness/heavy-admission.mjs run -- npx vitest run guard-bash',
+    'node scripts/readiness/heavy-admission.mjs run -- npx vitest run --maxConcurrency 5 scripts/__tests__/a.test.mjs',
     'run-s lint build:check',
     'npm run test:integration',
     'npm run check:standards',
@@ -85,7 +85,7 @@ describe('xpnhz4o — a bare full-suite run is denied, naming the selected gate'
 
   it('the >2-file raw vitest message no longer steers to the (now denied) `npm run test:unit`', () => {
     const r = decide('npx vitest run a.test.mjs b.test.mjs c.test.mjs', {});
-    expect(r).toContain('node scripts/verify-lane.mjs run');
+    expect(r).toContain('node scripts/readiness/heavy-admission.mjs run -- npx vitest run a.test.mjs b.test.mjs c.test.mjs');
     expect(r).not.toMatch(/instead: `npm run test:unit`/);
   });
 });

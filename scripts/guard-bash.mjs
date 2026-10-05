@@ -4,6 +4,7 @@
  *
  * Moves mechanical footguns that previously relied on the model remembering a MEMORY.md line into
  * deterministic write-time enforcement. Denials (each a recurring real incident):
+ *   • heavy-enforce — every direct vitest/test or check-standards execution must use host-wide heavy admission.
  *   • `build:plugs` / `tsc -p tsconfig.plugs.json` (no --noEmit) — emits shadow .js/.d.ts, breaks
  *     vitest, fakes a red gate. Typecheck plugs with `tsc --noEmit`.
  *   • `pkill`/`killall` of vite|node — never tear down the user's running dev server.
@@ -2364,7 +2365,7 @@ export function gitAddEnumerationReason(command) {
 }
 
 // ── xxna58l (#3383) — a session's direct raw invocation of a heavy command that SKIPS the #3461 admission
-// queue entirely: the eleventy site build, a playwright run, or a raw `vitest run` of the whole suite. Each
+// queue entirely: the eleventy site build, a playwright run, any vitest test run, or a direct standards check. Each
 // has a wrapped npm script that already routes through `heavy-admission.mjs run` (`build`, `test:unit`,
 // `test:integration`/`test:e2e`/`test:smoke`/`test:a11y`/`test:interaction`) — this arm's job is to steer a
 // session toward that wrapped script, not to reimplement the queue itself. Anchored on the ACTUAL RUNNER at
@@ -2372,29 +2373,12 @@ export function gitAddEnumerationReason(command) {
 // substring test, or the wrapped script's own `-- vitest run …` tail (which legitimately contains this text
 // as an ARGUMENT, not a command) would be denied too.
 //
-// THE TARGETED-VITEST EXCEPTION AND ITS THRESHOLD (xxna58l's own ask: "decide the threshold from measured
-// timings and record it"). Measured locally while building this arm: a single-file `vitest run` against
-// `scripts/readiness/__tests__/heavy-admission.test.mjs` (54-63 unit tests, no real I/O) completed in
-// ~1.6s wall-clock end-to-end (`Duration 1.62s` — transform/collect/environment/test all included). A
-// one-or-two-file targeted run stays in that same sub-few-second band; the queue exists for the WHOLE suite
-// (observed 25-40 minutes under load, #3383's own finding) and for playwright/eleventy, neither of which has
-// a comparably cheap targeted mode. Gating a quick fix-and-recheck loop behind the same queue as a 40-minute
-// full run would only add latency with no contention benefit, so `RAW_VITEST_TARGETED_FILE_LIMIT` (2) is the
-// line: at or under it, run directly; over it (or the whole suite, i.e. zero named files), route through
-// `npm run test:unit`.
-const VITEST_RUN_HEAD = /^vitest\s+run\b(.*)$/s;
+// heavy-enforce (2026-10-04): even one test file spawns workers outside the host cap.
 const PLAYWRIGHT_TEST_HEAD = /^playwright\s+test\b/;
 const ELEVENTY_HEAD = /^(?:@11ty\/)?eleventy\b/;
 
-/** The most explicit test-file targets a direct `vitest run …` may name and still skip the queue — see the
- *  measured-timing rationale in the comment above. */
-export const RAW_VITEST_TARGETED_FILE_LIMIT = 2;
-
-/** How many explicit (non-flag) file targets a `vitest run` invocation's tail names. Pure, deliberately
- *  approximate: a flag's separately-worded VALUE is not distinguished from a file target (no vitest flag in
- *  ordinary use here takes one), so the one possible skew UNDER-counts flags as targets, which only ever
- *  WIDENS what counts as "too many" — it can deny a borderline case, never let a real whole-suite run through
- *  by miscounting down to the allowed range. */
+/** Count positional test filters for full-suite detection. Known flag values, redirects, numbers,
+ *  booleans and match-all filters do not select files; unknown options are handled conservatively. */
 export function vitestRunFileTargetCount(tail) {
   const toks = shellTokens(String(tail || ''));
   let n = 0;
@@ -2433,12 +2417,11 @@ const VITEST_VALUE_FLAGS = new Set(['--root', '-r', '--dir', '--config', '-c', '
 /**
  * Does a direct (unqueued) invocation of vitest/playwright/eleventy skip the #3461 admission queue? Pure,
  * unit-tested. Returns a reason naming the wrapped npm script to use instead, or null when the segment is not
- * one of these three runners, or (vitest only) is a targeted run at or under
- * {@link RAW_VITEST_TARGETED_FILE_LIMIT}. `eleventy --version`/`--help`/`--dryrun` (no write at all — reuses
+ * one of these runners. All direct vitest test runs require admission.
+ * `eleventy --version`/`--help`/`--dryrun` (no write at all — reuses
  * the SAME `ELEVENTY_NO_WRITE_FLAG` the tree-write arm already defines, one source of truth) and
  * `--serve`/`--watch` (a long-running dev server with no wrapped equivalent — wrapping it would hold an
- * admission slot for the whole dev session, the same reason `test`'s vitest watch mode is left unwrapped in
- * package.json) are both exempt.
+ * admission slot for the whole dev session) are both exempt.
  *
  * THE ELEVENTY CHECK IS SKIPPED AT PRIMARY CWD (`primaryCwd: true`) — deliberately, not an oversight. A raw
  * `eleventy` invocation at primary cwd is ALREADY denied by the older, more specific #2749/#2788 tree-write
@@ -2453,6 +2436,8 @@ const VITEST_VALUE_FLAGS = new Set(['--root', '-r', '--dir', '--config', '-c', '
  * concern is identical at primary and in a lane for those.
  */
 export function rawHeavyCommandReason(segment, { primaryCwd = false } = {}) {
+  const ungated = ungatedHeavyRunReason(segment);
+  if (ungated) return ungated;
   const s = String(segment || '').trim();
   if (!s) return null;
   const cmd = s.replace(/^(?:\w+=\S+\s+)*(?:sudo\s+)?/, '');
@@ -2460,12 +2445,6 @@ export function rawHeavyCommandReason(segment, { primaryCwd = false } = {}) {
   const heads = canon && canon !== cmd ? [cmd, canon] : [cmd];
 
   for (const h of heads) {
-    const vitestMatch = h.match(VITEST_RUN_HEAD);
-    if (vitestMatch) {
-      const targets = vitestRunFileTargetCount(vitestMatch[1]);
-      if (targets > 0 && targets <= RAW_VITEST_TARGETED_FILE_LIMIT) return null; // targeted — allowed directly
-      return `a direct \`vitest run\` of ${targets === 0 ? 'the WHOLE suite' : `${targets} files (over the ${RAW_VITEST_TARGETED_FILE_LIMIT}-file targeted limit)`} skips the #3461 heavy-command admission queue (xxna58l, #3383) — with several lanes contending for one host, an unqueued full run is exactly the load spike the queue exists to cap. Use the diff-selected gate instead: \`node scripts/verify-lane.mjs run\` (runs only the tests your diff reaches, inside the admission queue — xpnhz4o), or queue your explicit list: \`node scripts/readiness/heavy-admission.mjs run -- npx vitest run <files>\`. A targeted run of ${RAW_VITEST_TARGETED_FILE_LIMIT} or fewer explicit test files stays allowed directly, e.g. \`npx vitest run path/to/one.test.mjs\`.`;
-    }
     if (PLAYWRIGHT_TEST_HEAD.test(h)) {
       return 'a direct `playwright test` run skips the #3461 heavy-command admission queue (xxna58l, #3383). Use the wrapped script instead — `npm run test:integration` / `test:e2e` / `test:smoke` / `test:a11y` / `test:interaction`, whichever matches what you need (each already routes through `node scripts/readiness/heavy-admission.mjs run`). No targeted-run exception here: playwright has no fast single-spec mode cheap enough to justify skipping the queue.';
     }
@@ -2485,6 +2464,194 @@ export function rawHeavyCommandReason(segment, { primaryCwd = false } = {}) {
     }
   }
   return null;
+}
+
+const VITEST_WORD = /^vitest(?:@\S*)?$/;
+/** vitest's own entry scripts when run through `node` (`vitest/vitest.mjs`, `vitest/dist/cli.js`, `.bin/vitest`). */
+const VITEST_NODE_ENTRY = /(?:^|\/)node_modules\/(?:vitest\/(?:vitest\.mjs|dist\/cli\.js)|\.bin\/vitest)$/;
+/** vitest's watch mode spelled as a flag (`-w` is its short form); `--watch=false`/`=0` is NOT watch. */
+const VITEST_WATCH_FLAG = /^(?:--watch|-w)(?:=(?:true|1|yes|on))?$/i;
+/** npm options that choose WHICH package's `test` script runs; a replacement that drops them tests another package. */
+const NPM_SCOPE_VALUE_FLAGS = new Set(['-w', '--workspace', '--prefix', '-C']);
+const NPM_SCOPE_BARE_FLAG = /^(?:-ws|--workspaces|--include-workspace-root|-iwr)$/;
+const NODE_SCRIPT_WORD = /\.(?:[cm]?js|ts)$/;
+const NODE_SCRIPT_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loader', '--experimental-loader']);
+
+/** How many leading words of a canonical head are exec wrappers `canonicalCommand` does not peel
+ *  (`timeout [opts] <duration>`, and the `-n <N>` it leaves behind after peeling `nice`)? `nohup` is left
+ *  alone on purpose: the background-run guard owns it, and a queued replacement keeping it would be denied there. */
+function execWrapperWords(w) {
+  if (w[0] === 'timeout') {
+    let i = 1;
+    while (w[i]?.startsWith('-')) i += /^(?:-s|-k|--signal|--kill-after)$/.test(w[i]) ? 2 : 1;
+    return i + 1; // the duration
+  }
+  if (w[0] === '-n' && /^-?\d+$/.test(w[1] || '')) return 2;
+  if (/^(?:-\d+|--adjustment=-?\d+)$/.test(w[0] || '')) return 1;
+  return 0;
+}
+
+/** The raw source text of the given `headWords` entries, space-joined (quoting survives; only the gaps are normalised). */
+function rawWords(src, words) {
+  return words.map((word) => src.slice(word.start, word.end)).join(' ');
+}
+
+/** Is this word an npm scope option, and if so how many words does it span (the flag plus a separate value)? */
+function npmScopeSpan(words, j) {
+  const text = words[j]?.text || '';
+  const name = text.split('=')[0];
+  if (NPM_SCOPE_BARE_FLAG.test(name)) return 1;
+  if (!NPM_SCOPE_VALUE_FLAGS.has(name) && !/^--(?:workspaces?|include-workspace-root)$/.test(name)) return 0;
+  return text.includes('=') || !words[j + 1] ? 1 : 2;
+}
+
+/** Drop watch-mode flags (and a separate `true`/`false` value) from vitest argument words. A value flag's own
+ *  separate value (`-t -w`) is a pattern, not a flag, so the pair is kept whole. */
+function dropWatchFlags(words) {
+  const out = [];
+  for (let k = 0; k < words.length; k += 1) {
+    const text = words[k].text;
+    if (VITEST_VALUE_FLAGS.has(text) && words[k + 1]) { out.push(words[k], words[k + 1]); k += 1; continue; }
+    if (VITEST_WATCH_FLAG.test(text)) { if (/^(?:true|false)$/i.test(words[k + 1]?.text || '')) k += 1; continue; }
+    out.push(words[k]);
+  }
+  return out;
+}
+
+/** Drop every watch-mode flag from a forwarded vitest argument string (unchanged when it has none). */
+function withoutWatchFlags(args) {
+  const words = headWords(args);
+  const kept = dropWatchFlags(words);
+  return kept.length === words.length ? args : rawWords(args, kept);
+}
+
+/**
+ * Turn a vitest command line (any head: `npx vitest`, `pnpm vitest`, `node …/vitest.mjs`) into a one-shot run:
+ * watch flags are dropped, a `watch`/`dev` subcommand becomes `run`, and `run` is added when nothing names a mode
+ * (a bare `vitest <file>` would start watch mode in a TTY). `related` has no `run`; it takes `--run` instead.
+ */
+function oneShotVitest(command) {
+  const words = headWords(command);
+  const at = words.findIndex((word) => VITEST_WORD.test(word.text) || VITEST_NODE_ENTRY.test(word.text));
+  if (at < 0) return command;
+  const head = words.slice(0, at + 1);
+  const rest = dropWatchFlags(words.slice(at + 1));
+  let out = rawWords(command, head);
+  const sub = rest[0]?.text;
+  if (sub === 'watch' || sub === 'dev') out += ' run' + (rest.length > 1 ? ' ' + rawWords(command, rest.slice(1)) : '');
+  else if (sub === 'related') out += ' ' + rawWords(command, rest) + (rest.some((word) => word.text === '--run') ? '' : ' --run');
+  else if (sub === 'run' || VITEST_NON_RUN_SUBCOMMANDS.has(sub)) out += ' ' + rawWords(command, rest);
+  else out += ' run' + (rest.length ? ' ' + rawWords(command, rest) : '');
+  return out;
+}
+
+/** Classify only the executable head, never a tool name mentioned in an argument. */
+function ungatedHeavyHead(head, depth = 0) {
+  if (depth > 8) return null;
+  const words = headWords(head);
+  const w = words.map((word) => word.text);
+  const wrapped = execWrapperWords(w);
+  if (wrapped && words[wrapped]) return ungatedHeavyHead(canonicalCommand(head.slice(words[wrapped].start)), depth + 1);
+  if (VITEST_WORD.test(w[0] || '')) {
+    // `related` selects tests, but still starts workers; --changed does too.
+    if (VITEST_NON_RUN_SUBCOMMANDS.has(w[1]) && w[1] !== 'related') return null;
+    if (w.slice(1).some((arg) => /^(?:--version|-v|--help|-h)$/.test(arg))) return null;
+    return { kind: 'vitest', watch: w[1] === 'watch' || w[1] === 'dev' || w.slice(1).some((arg) => VITEST_WATCH_FLAG.test(arg)) };
+  }
+  if (w[0] === 'node') {
+    // Only the script position is executable. --check/-c and eval arguments are not scripts.
+    let i = 1;
+    while (w[i]?.startsWith('-') && w[i] !== '--') {
+      if (/^(?:--check|-c|--eval|-e|--print|-p)(?:=|$)/.test(w[i])) return null;
+      const flag = w[i];
+      i += 1;
+      if (NODE_SCRIPT_VALUE_FLAGS.has(flag)) i += 1;
+      // a separate option value (`--title standards`, `--env-file .env`, `--max-old-space-size 4096`) is not the script
+      else if (!flag.includes('=') && w[i] && !w[i].startsWith('-') && !NODE_SCRIPT_WORD.test(w[i])) i += 1;
+    }
+    if (w[i] === '--') i += 1;
+    if (/(?:^|\/)check-standards\.mjs$/.test(w[i] || '')) {
+      return { kind: 'standards', tail: head.slice(words[i].end).trim() };
+    }
+    if (VITEST_NODE_ENTRY.test(w[i] || '')) {
+      return ungatedHeavyHead('vitest' + head.slice(words[i].end), depth + 1);
+    }
+    return null; // Includes heavy-admission: its child is an argument, not the executable.
+  }
+  const inv = runnerInvocation(head);
+  if (inv?.exec) return ungatedHeavyHead(canonicalCommand(inv.exec), depth + 1);
+  // pnpm/yarn/bun resolve a bare `vitest` script name to the vitest bin (npm does not).
+  if (w[0] !== 'npm' && inv?.names?.length === 1 && VITEST_WORD.test(inv.names[0])) {
+    return ungatedHeavyHead('vitest' + head.slice(words[w.indexOf(inv.names[0], 1)].end), depth + 1);
+  }
+  let at = -1;
+  const scope = []; // npm's package-selecting options (`-w x`, `--prefix x`, …), kept in the replacement
+  if (w[0] === 'npm') { // runner flags may precede the subcommand: `npm -s test`, `npm --prefix . test`
+    let j = 1;
+    while (w[j]?.startsWith('-')) {
+      const span = npmScopeSpan(words, j);
+      if (span) scope.push(rawWords(head, words.slice(j, j + span)));
+      j += span || (!w[j].includes('=') && RUNNER_VALUE_FLAGS.has(w[j]) ? 2 : 1);
+    }
+    if (['test', 't', 'tst'].includes(w[j])) at = j;
+  }
+  if (at < 0 && inv?.names?.length === 1) at = w.indexOf(inv.names[0], 1);
+  if (at < 0 || !['test', 't', 'tst'].includes(w[at])) return null;
+  const i = at;
+  // Options between the script name and `--` still belong to npm (`npm test -w x -- a.test.mjs`): keep its scope
+  // flags and any positional filter, drop the rest; only what follows `--` is forwarded to vitest verbatim.
+  const after = words.slice(i + 1);
+  const dd = after.findIndex((word) => word.text === '--');
+  // With no `--`, npm still parses every option, so scope flags anywhere after the script name are npm's.
+  const kept = [];
+  for (let k = 0; k < (dd < 0 ? after.length : dd); k += 1) {
+    const span = npmScopeSpan(after, k);
+    if (span) { scope.push(rawWords(head, after.slice(k, k + span))); k += span - 1; }
+    else if (dd < 0 || !after[k].text.startsWith('-')) kept.push(after[k]);
+  }
+  let forwarded = [rawWords(head, kept), dd < 0 ? '' : head.slice(after[dd].end).trim()].filter(Boolean).join(' ');
+  forwarded = withoutWatchFlags(forwarded.replace(/^--(?:\s+|$)/, ''));
+  // A forwarded vitest subcommand (`related`, `list`, `bench`, ...) has no `test:unit` equivalent: after
+  // `vitest run` it would degrade to a filename filter (`related a.mjs --passWithNoTests` silently runs nothing).
+  if (VITEST_NON_RUN_SUBCOMMANDS.has(forwarded.split(/\s+/)[0])) return { kind: 'test', subcommand: true, tail: forwarded, scope };
+  // `npm test -- run <f>` forwards vitest's own mode word; `test:unit` already runs `vitest run`, so drop it.
+  return { kind: 'test', tail: forwarded.replace(/^(?:run|watch|dev)(?:\s+|$)/, ''), scope };
+}
+
+/** Deny any unqueued test/standards execution, with a runnable replacement. Pure; no escape. */
+export function ungatedHeavyRunReason(segment) {
+  const s = String(segment || '').trim();
+  const run = ungatedHeavyHead(canonicalCommand(s));
+  if (!run) return null;
+  // Keep assignment spelling/quoting intact, placing it before node so it remains shell syntax. A leading
+  // `WE_FULL_SUITE_OK=1` is kept too: the queued full-suite form still needs it to pass the xpnhz4o arm.
+  const words = headWords(s);
+  let i = words[0]?.text === 'env' ? 1 : 0;
+  const prefix = i ? ['env'] : [];
+  while (/^[A-Za-z_]\w*=/.test(words[i]?.text || '')) {
+    prefix.push(s.slice(words[i].start, words[i].end));
+    i += 1;
+  }
+  const env = prefix.length ? prefix.join(' ') + ' ' : '';
+  const command = i ? s.slice(words[i]?.start ?? s.length) : s;
+  const queued = 'node scripts/readiness/heavy-admission.mjs run -- ';
+  const scope = run.scope?.length ? run.scope.join(' ') + ' ' : '';
+  const replacement = run.kind === 'test'
+    ? run.subcommand
+      ? queued + (scope ? 'npm ' + scope + 'exec -- vitest ' : 'npx vitest ') + run.tail
+      : 'npm ' + scope + 'run test:unit' + (run.tail ? ' -- ' + run.tail : '')
+    : run.kind === 'standards'
+      ? 'npm run check:standards' + (run.tail ? ' -- ' + run.tail : '')
+      // a watch/dev process would hold one of the host's 2 admission slots until killed, so queue `run` instead
+      : queued + (run.watch ? oneShotVitest(command) : command);
+  // A replacement the full-suite arm would itself deny (a whole-suite `npm -s test`, `timeout 5 npm test`, or a
+  // flag-only tail like `-- --coverage`, which still selects every file) is a deny loop: give that arm's message,
+  // which already names the runnable alternatives. Its escape, when present, is kept in `env` above. (A bare
+  // vitest run never reaches here from `decide`: the full-suite arm runs first and denies it with that message.)
+  if (run.kind === 'test' && !hasLeadingEnvEscape(s, FULL_SUITE_ESCAPE_ENV) && fullSuiteRunReason(replacement)) {
+    return FULL_SUITE_DENY_MESSAGE;
+  }
+  return `heavy-enforce: each direct run spawns ~6–11 workers outside the host cap of 2 queued heavy runs; load hit 25–48 on a 12-core host. There is no admission override. Use: \`${env}${replacement}\`.`;
 }
 
 // ── xpnhz4o — a BARE FULL-SUITE run from an agent session ─────────────────────────────────────────────────
@@ -2533,6 +2700,8 @@ export function isFullSuiteHead(head, depth = 0) {
     const inv = runnerInvocation(h);
     return !!(inv && Array.isArray(inv.names) && inv.names.some((n) => FULL_SUITE_SCRIPTS.has(n)));
   }
+  // vitest's own entry scripts behind `node` (`node node_modules/vitest/dist/cli.js`) are the same bare run.
+  if (w[0] === 'node' && VITEST_NODE_ENTRY.test(w[1] || '')) return isFullSuiteHead('vitest' + h.slice(words[1].end), depth + 1);
   if (RUNNER_NAMES.has(w[0])) {
     let idx = -1;
     if (w[0] === 'npm' && ['test', 't', 'tst'].includes(w[1])) { idx = 1; w[1] = 'test'; }
@@ -2569,8 +2738,12 @@ export function fullSuiteRunReason(segment) {
   const stripped = s.replace(/^(?:\w+=\S*\s+)*/, '');
   const canon = canonicalCommand(s);
   if (!isFullSuiteHead(stripped) && !isFullSuiteHead(canon)) return null;
-  return 'a bare FULL-SUITE unit run (`npm run test:unit` / `npm test` / `vitest` or `vitest run` with no file target, raw or through heavy-admission.mjs) is not allowed from an agent session (xpnhz4o). It takes 10+ minutes; several at once starved the host on 2026-09-25; CI already runs the full suite on every PR as the backstop. Run the diff-selected gate instead: `node scripts/verify-lane.mjs run` — only the tests your diff reaches, plus a scoped check:standards; it falls back to the full suite BY ITSELF, and says so, when a config / setup / dependency / shared-test-helper file changed (use plain `node scripts/verify-lane.mjs` to also record the landing marker). For one or two files: `npx vitest run <file>`. Escape, only when you truly need the whole suite here (logged): prefix the command with `WE_FULL_SUITE_OK=1`.';
+  // No heavy-enforce replacement is appended: for a bare (no file target) run it would be this arm's own deny
+  // again, or a literal `<test-file>` placeholder. The message already names the runnable alternatives.
+  return FULL_SUITE_DENY_MESSAGE;
 }
+
+const FULL_SUITE_DENY_MESSAGE = 'a bare FULL-SUITE unit run (`npm run test:unit` / `npm test` / `vitest` or `vitest run` with no file target, raw or through heavy-admission.mjs) is not allowed from an agent session (xpnhz4o). It takes 10+ minutes; several at once starved the host on 2026-09-25; CI already runs the full suite on every PR as the backstop. Run the diff-selected gate instead: `node scripts/verify-lane.mjs run` — only the tests your diff reaches, plus a scoped check:standards; it falls back to the full suite BY ITSELF, and says so, when a config / setup / dependency / shared-test-helper file changed (use plain `node scripts/verify-lane.mjs` to also record the landing marker). For one or two files: `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`. Escape, only when you truly need the whole suite here (logged): prefix the command with `WE_FULL_SUITE_OK=1`.';
 
 /** The leading-assignment escape for {@link fullSuiteRunReason}. */
 export const FULL_SUITE_ESCAPE_ENV = 'WE_FULL_SUITE_OK';
