@@ -73,6 +73,9 @@ export const VERIFY_DAEMON_LEASE_KEY = '<conveyor:verify-daemon-lease>';
  *  marker. Remove the file to resume dispatch. */
 export const VERIFY_DAEMON_DRAIN_FILE = process.env.WE_VERIFY_DAEMON_DRAIN_FILE || join(RUNNER_LOCK_ROOT, 'verify-daemon.drain');
 
+/** The real drain probe. Under vitest it is off, so a live marker on the host can never change a unit test's dispatch. */
+function defaultIsDraining() { return !process.env.VITEST && existsSync(VERIFY_DAEMON_DRAIN_FILE); }
+
 /** Matches runner.mjs's own tick cadence (DEFAULT_TICK_INTERVAL_MS) and every sibling daemon in this epic —
  *  standing alone, there is no reason to run this pass faster or slower. */
 export const DEFAULT_INTERVAL_MS = 120_000;
@@ -241,7 +244,7 @@ export function startIndependentHeartbeat({
  *  {@link startIndependentHeartbeat} timer (#4130 — no longer built in here, since the heartbeat must run on
  *  its own clock, independent of this factory's caller). Kept as its own factory (mirroring
  *  `buildCliDaemonEffects` in the sibling daemons) so `main()` stays a thin wire-up. */
-export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAlive = () => true, log = console, runVerify = runVerifyDispatch, isDraining = () => existsSync(VERIFY_DAEMON_DRAIN_FILE) } = {}) {
+export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAlive = () => true, log = console, runVerify = runVerifyDispatch, isDraining = defaultIsDraining } = {}) {
   const inFlight = new Map();
   // `awaitSettle:false` returns before any gate settles, so `result.failures` is always empty here: failures
   // arrive later through `onSettled`, are logged as they land, and the next tick summary counts them.
