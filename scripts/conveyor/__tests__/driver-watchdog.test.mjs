@@ -1193,7 +1193,8 @@ describe('the watchdog shares NONE of the driver\'s own decision logic', () => {
       'automation-home.mjs',        // decouple-primary-checkout — queue-store's state-home path (leaf: builtins only)
       'bounded-child.mjs',          // #x5n4zn3 — branch-sync.mjs's gitRun budget (resolveChildTimeoutMs) only
       'branch-sync.mjs',            // gitRun / notifyDesktop / decideEscalation / defaultAppendLog (#3472)
-      'constellation-repos.mjs',    // decouple-primary-checkout — the primary's dir names, for the legacy queue read
+      'claude-agents-cache.mjs',    // hot-cache — short-TTL file cache for `claude agents --json` (leaf: builtins only)
+      'constellation-repos.mjs',   // decouple-primary-checkout — the primary's dir names, for the legacy queue read
       'daemon-last-good.mjs',       // decouple-primary-checkout — daemonConveyorStateRoot (the state home)
       'driver-mode.mjs',            // the launch-posture sidecar's GRAMMAR — bounded vs resident, path+parse only
       'driver-watchdog.mjs',

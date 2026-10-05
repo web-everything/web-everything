@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 
 export function claudeAgentsCacheTtlMs(env = process.env) {
   const value = env.WE_CLAUDE_AGENTS_CACHE_TTL_MS;
@@ -14,7 +15,11 @@ export function cachedClaudeAgents({ all = false, fetch, env = process.env, now 
   const ttl = claudeAgentsCacheTtlMs(env);
   if (!ttl) return String(fetch());
   dir ??= join(tmpdir(), `we-claude-agents-cache-${process.getuid?.() ?? 'unknown'}`);
-  const file = join(dir, all ? 'agents-all.json' : 'agents.json');
+  // Scope the file to the environment that resolves `claude` (PATH/HOME/CLAUDE_CONFIG_DIR): a test pointing
+  // PATH at a fake `claude` must never read, or poison, the live daemons' cache.
+  const scope = createHash('sha1').update(JSON.stringify([env.PATH ?? '', env.HOME ?? '', env.CLAUDE_CONFIG_DIR ?? '']))
+    .digest('hex').slice(0, 12);
+  const file = join(dir, `${all ? 'agents-all' : 'agents'}-${scope}.json`);
   try {
     const cached = JSON.parse(readFileSync(file, 'utf8'));
     const time = now();

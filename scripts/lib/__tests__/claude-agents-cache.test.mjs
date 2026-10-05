@@ -57,5 +57,17 @@ it('separates all sessions and leaves no temporary files after atomic writes', (
   cachedClaudeAgents(o);
   cachedClaudeAgents({ ...o, all: true });
   expect(o.fetch).toHaveBeenCalledTimes(2);
-  expect(readdirSync(o.dir).sort()).toEqual(['agents-all.json', 'agents.json']);
+  const files = readdirSync(o.dir).sort();
+  expect(files).toHaveLength(2);
+  expect(files[0]).toMatch(/^agents-all-[0-9a-f]{12}\.json$/);
+  expect(files[1]).toMatch(/^agents-[0-9a-f]{12}\.json$/);
+});
+
+it('scopes the cache file to PATH/HOME/CLAUDE_CONFIG_DIR so a faked `claude` never shares the live cache', () => {
+  const o = setup();
+  o.fetch.mockReturnValue('[1]');
+  cachedClaudeAgents({ ...o, env: { ...o.env, PATH: '/real/bin' } });
+  const fake = vi.fn(() => '[2]');
+  expect(cachedClaudeAgents({ ...o, fetch: fake, env: { ...o.env, PATH: '/fake/bin' } })).toBe('[2]');
+  expect(fake).toHaveBeenCalledTimes(1);
 });
