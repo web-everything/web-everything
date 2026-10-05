@@ -5,7 +5,7 @@
  *   `tick()` also reads the real GitHub App status file from the home dir — read-only, harmless, left alone.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, readFileSync, existsSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -1117,4 +1117,55 @@ it('xe8y12n probe re-observes only PRs whose cached labels could hide a missing 
   expect(closeResults).toHaveLength(3);
   for (const result of closeResults) expect(result.breach).toBe(false);
   for (const number of [3, 4, 5]) expect(byNumber.get(number).reviewObservation).toMatchObject({ state: 'OPEN' });
+});
+
+
+describe('tmp sweep tick integration', () => {
+  it('sweeps an explicit fixture once, persists cadence, and skips state-root-only ticks', async () => {
+    const root = join(dir, 'tmp'); mkdirSync(root);
+    const oldEntry = (path) => { mkdirSync(path); utimesSync(path, new Date(0), new Date(0)); };
+    const stateRoot = join(dir, 'sweep-state'); const hd = healthDir(stateRoot); mkdirSync(hd, { recursive: true });
+    writeFileSync(join(hd, 'config.json'), JSON.stringify({ tmpSweepOlderThanMs: 0 }));
+    const flags = { 'state-root': stateRoot, 'tmp-sweep-root': root,
+      'lock-root': join(dir, 'locks'), 'self-sync-dir': join(dir, 'sync'), 'logs-dir': join(dir, 'logs'),
+      'no-gh': true, 'no-diagnose': true, 'no-notify': true };
+    const tmpSweepRun = vi.fn(() => 'p1\nn/unrelated\n');
+    const path = join(root, 'gh-t-AbC123'); oldEntry(path);
+    const first = await tick(flags, { tmpSweepRun });
+    expect(first.tmpSweep).toMatchObject({ deleted: 1, complete: true });
+    expect(existsSync(path)).toBe(false);
+    const stamp = JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).tmpSweep;
+    expect(stamp).toMatchObject({ deleted: 1, complete: true, at: expect.any(Number), completedAt: expect.any(Number) });
+    oldEntry(path);
+    expect((await tick(flags, { tmpSweepRun })).tmpSweep).toBeNull();
+    expect(existsSync(path)).toBe(true);
+    expect(JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).tmpSweep).toEqual(stamp);
+    delete flags['tmp-sweep-root'];
+    flags['state-root'] = join(dir, 'fresh-state');
+    expect((await tick(flags, { tmpSweepRun })).tmpSweep).toBeNull();
+    expect(tmpSweepRun).toHaveBeenCalledTimes(1);
+    flags['tmp-sweep-root'] = root;
+    flags['state-root'] = stateRoot;
+    writeFileSync(join(hd, 'config.json'), JSON.stringify({ tmpSweepOlderThanMs: 0, tmpSweepEveryMs: 0, tmpSweepMaxDeletesPerRun: 1 }));
+    oldEntry(join(root, 'gh-t-AbC124'));
+    const capped = await tick(flags, { tmpSweepRun });
+    expect(capped.tmpSweep).toMatchObject({ deleted: 1, complete: false });
+    expect(JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).tmpSweep.completedAt).toBeUndefined();
+    writeFileSync(join(hd, 'config.json'), JSON.stringify({ tmpSweepOlderThanMs: 0 }));
+    expect((await tick(flags, { tmpSweepRun })).tmpSweep).toMatchObject({ deleted: 1, complete: true });
+    flags['state-root'] = join(dir, 'dry-state');
+    oldEntry(path);
+    const dryHd = healthDir(flags['state-root']); mkdirSync(dryHd, { recursive: true });
+    writeFileSync(join(dryHd, 'config.json'), JSON.stringify({ tmpSweepOlderThanMs: 0 }));
+    expect((await tick({ ...flags, 'dry-run': true }, { tmpSweepRun })).tmpSweep.deleted).toBe(1);
+    expect(existsSync(path)).toBe(true);
+    expect(existsSync(join(dryHd, 'state.json'))).toBe(false);
+    const failed = await tick(flags, { tmpSweepRun: () => { throw Error('lsof unavailable'); } });
+    expect(failed.probeErrors.tmpSweep).toBeTruthy();
+    expect(failed.tmpSweep).toBeNull();
+    expect(existsSync(path)).toBe(true);
+    flags['tmp-sweep-root'] = join(root, 'file');
+    writeFileSync(flags['tmp-sweep-root'], 'not a directory');
+    expect((await tick(flags, { tmpSweepRun })).probeErrors.tmpSweep).toBeTruthy();
+  }, 30000);
 });
