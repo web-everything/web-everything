@@ -35,6 +35,20 @@ describe('referenceArgs — a shallow reference is FATAL, not a lost optimisatio
 });
 
 describe('workspaceFor — where the siblings and the pool actually sit', () => {
+  it.each([
+    [['ws', '.operations', 'dispatch', 'abc-123'], ['ws']],
+    [['ws', '.operations'], ['ws']],
+    [['ws', '.lanes', 'web-everything', 'lane-5'], ['ws']],
+    [['ws', 'webeverything'], ['ws']],
+    [['opt', 'somewhere', 'project'], ['opt', 'somewhere']],
+    [['ws', 'my.operations-x', 'repo'], ['ws', 'my.operations-x']],
+    [['ws', '.operations', 'dispatch', '.lanes', 'we', 'lane-5'], ['ws']],
+    [['ws', '.lanes', 'we', 'lane-5', '.operations', 'dispatch'], ['ws']],
+    [['ws', '.operations', 'dispatch', '.operations'], ['ws']],
+  ])('uses the outermost marker for %j (coroner #32)', (input, expected) => {
+    expect(workspaceFor(join(sep, ...input))).toBe(join(sep, ...expected));
+  });
+
   it('is the parent of a primary checkout', () => {
     expect(workspaceFor('/home/user/web-everything')).toBe('/home/user');
     expect(workspaceFor('/Users/nic/workspace/webeverything')).toBe('/Users/nic/workspace');
@@ -55,6 +69,14 @@ describe('workspaceFor — where the siblings and the pool actually sit', () => 
 });
 
 describe('defaultPoolRoot — derived from the checkout, never from $HOME', () => {
+  it('resolves dispatch cwd beside the workspace and preserves the override (coroner #32)', () => {
+    const cwd = join(sep, 'ws', '.operations', 'dispatch', 'abc-123');
+    const env = { HOME: join(sep, 'home', 'x') };
+    expect(defaultPoolRoot(cwd, env)).toBe(join(sep, 'ws', '.lanes'));
+    expect(defaultPoolRoot(cwd, { ...env, LANE_POOL_ROOT: join(sep, 'custom', '.lanes') }))
+      .toBe(join(sep, 'custom', '.lanes'));
+  });
+
   it('puts the pool beside the checkout when $HOME disagrees (the cloud VM)', () => {
     // $HOME=/root, checkouts under /home/user — the exact split that resolved to a phantom
     // /root/workspace/.lanes and made provisioning impossible.
