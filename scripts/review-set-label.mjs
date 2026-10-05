@@ -1,7 +1,7 @@
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
 import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
-import { referralCardReadable, referralLiveContext } from './lib/referral-live-context.mjs';
+import { referralLiveContext } from './lib/referral-live-context.mjs';
 /**
  * review-set-label.mjs — swap a PR's review label, INVARIANT-2 guarded (#2470, increment 2 of 2). Also the
  * SINGLE HOME of the shared review-label CLI harness (#2644): a PURE `decideSetLabel` decides the swap for a
@@ -93,6 +93,7 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
+import { referralCardReadable } from './lib/referral-card-readable.mjs';
 // #2844 — WHO cleared this verdict, and the refusal when that is the PR's own author. See that module's header
 // for what the id rests on (the harness session identity, NOT the free-text `--actor`) and for the residual.
 import {
@@ -1977,7 +1978,7 @@ function ghErr(e, fallback) {
 }
 
 
-// Defined once in the shared live-state module so the review hold reads the gate's exact card rule.
+// Moved to `we:scripts/lib/referral-card-readable.mjs` so the review hold can share it without an import cycle.
 export { referralCardReadable };
 
 /** Fail closed at every acceptance entry point using the fresh durable PR record. */

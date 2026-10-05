@@ -480,7 +480,7 @@ export function comparedFiles(compare) {
 export const CARRY_LINE_MARGIN = 3;
 
 /**
- * Does a change in `changed` (new-side lines) touch the region a carried ruling spoke for? The finding matcher
+ * Does a change in `changed` (old-side and new-side lines) touch the region a carried ruling spoke for? The finding matcher
  * tolerates a `CORROBORATION_LINE_WINDOW` offset between the old finding (the one the operator ruled on) and the
  * new one, so the region is the whole span from the earlier cited line to the later one, plus the margin —
  * checking only the new finding's line would let a rewrite of the old region slip through. PURE.
@@ -511,12 +511,12 @@ export function canonicalRepoPath(raw) {
 }
 
 /** Is `file` a plain file at `ref`? A missing path, a non-canonical path, a directory or any lookup failure is `false` (fail-closed). */
-export function fileExistsAtRef(repo, ref, file) {
+export function fileExistsAtRef(repo, ref, file, ghJson = args => JSON.parse(execFileSyncThrottled('gh', args,
+  { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }))) {
   try {
     if (canonicalRepoPath(file) !== file) return false;
     const path = file.split('/').map(encodeURIComponent).join('/');
-    const got = JSON.parse(execFileSyncThrottled('gh', ['api', `repos/${repo}/contents/${path}?ref=${ref}`],
-      { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }));
+    const got = ghJson(['api', `repos/${repo}/contents/${path}?ref=${ref}`]);
     return !Array.isArray(got) && got?.type === 'file';
   } catch { return false; }
 }
@@ -536,7 +536,7 @@ export function changedLinesFromCompare(files, file, { isRepoFile } = {}) {
   if (!Array.isArray(files) || canonicalRepoPath(file) !== file) return null;
   const entry = files.find(f => f.filename === file || f.previous_filename === file);
   if (!entry) {
-    if (files.length >= 300 || typeof isRepoFile !== 'function') return null;
+    if (files.length >= COMPARE_FILE_CAP || typeof isRepoFile !== 'function') return null;
     let real = false;
     try { real = isRepoFile() === true; } catch { real = false; }
     return real ? { old: new Set(), new: new Set() } : null;
@@ -550,10 +550,10 @@ export function changedLinesFromCompare(files, file, { isRepoFile } = {}) {
     const oldStart = Number(match[1]), oldCount = Number(match[2] ?? 1);
     const start = Number(match[3]), count = Number(match[4] ?? 1);
     // A pure-deletion hunk (`+N,0`) has no new-side lines but still changed the region around `N`; a
-    // pure-insertion hunk (`-N,0`) likewise marks the old-side gap after `N`.
-    if (count === 0) newLines.add(start);
+    // pure-insertion hunk (`-N,0`) likewise marks the old-side gap. Mark both neighbours N and N+1.
+    if (count === 0) { newLines.add(start); newLines.add(start + 1); }
     for (let n = start; n < start + count; n++) newLines.add(n);
-    if (oldCount === 0) oldLines.add(oldStart);
+    if (oldCount === 0) { oldLines.add(oldStart); oldLines.add(oldStart + 1); }
     for (let n = oldStart; n < oldStart + oldCount; n++) oldLines.add(n);
   }
   return hunks ? { old: oldLines, new: newLines } : null;
@@ -563,6 +563,27 @@ export function changedLinesFromCompare(files, file, { isRepoFile } = {}) {
 export function isPreWriteRefusal(text) {
   const s = String(text || '');
   return PRE_WRITE_REFUSALS.some((p) => s.includes(p));
+}
+
+/** The compare API lists at most this many files; a full list may be truncated. */
+export const COMPARE_FILE_CAP = 300;
+
+/**
+ * The default `(repo, base, head, file) => { old, new }|null` reader behind the operator-ruling carry: one compare per
+ * (repo, base, head) cached for the reader's life — failures included — and a contents probe for the
+ * absent-from-compare case. `ghJson(args)` is the injectable `gh api` runner (parsed JSON; throws on failure).
+ */
+export function createChangedLinesReader(ghJson, { readCompare = (repo, base, head) =>
+  ghJson(['api', `repos/${repo}/compare/${base}...${head}`]), fileExists } = {}) {
+  const comparisons = new Map();
+  const exists = fileExists ?? ((repo, ref, file) => fileExistsAtRef(repo, ref, file, ghJson));
+  return (repo, base, head, file) => {
+    const key = JSON.stringify([repo, base, head]);
+    if (!comparisons.has(key)) {
+      try { comparisons.set(key, comparedFiles(readCompare(repo, base, head))); } catch { comparisons.set(key, null); }
+    }
+    return changedLinesFromCompare(comparisons.get(key), file, { isRepoFile: () => exists(repo, base, file) && exists(repo, head, file) });
+  };
 }
 
 /**
@@ -588,7 +609,7 @@ export function createReviewPrSinks({
   referralJudge = judgeSpawn,
   readChangedLines,
   fileExists = fileExistsAtRef,
-  readCompare =(repo, base, head) => JSON.parse(execFileSyncThrottled('gh',
+  readCompare = (repo, base, head) => JSON.parse(execFileSyncThrottled('gh',
     ['api', `repos/${repo}/compare/${base}...${head}`],
     { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })),
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
@@ -626,17 +647,7 @@ export function createReviewPrSinks({
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {
       const { read } = payload;
       // Cache comparisons only for this invocation, including failures. Missing patches cannot prove clearance.
-      const comparisons = new Map();
-      const changedLines = readChangedLines ?? ((repo, base, head, file) => {
-        const key = JSON.stringify([repo, base, head]);
-        if (!comparisons.has(key)) {
-          try { comparisons.set(key, comparedFiles(readCompare(repo, base, head))); }
-          catch { comparisons.set(key, null); }
-        }
-        // Absent-from-compare means "unchanged" only for a path that is a real file at BOTH heads.
-        return changedLinesFromCompare(comparisons.get(key), file,
-          { isRepoFile: () => fileExists(repo, base, file) && fileExists(repo, head, file) });
-      });
+      const changedLines = readChangedLines ?? createChangedLinesReader(undefined, { readCompare, fileExists });
       const commentBudget = 60_000;
       const fresh = () => {
         const state = labelProvider.readPrState(read.repo, read.pr);
@@ -790,18 +801,26 @@ export function createReviewPrSinks({
           const operatorRulings = readOperatorRulings(state.comments, context(state)).rulings;
           for (let i = 0; i < existing.length; i++) {
             const record = existing[i], carried = [];
+            // Findings a reviewer's ruling on THIS head already settles (counted: independent clearer, readable card).
+            // A carry must not replace a counted current-head ruling. An uncounted ruling settles nothing.
+            const stillPending = record.rulings.length
+              ? new Set(referralRecordState(record, { ...context(state), head: record.head, records, operatorRulings }).pending) : null;
             for (const f of activeReferrals(record)) {
               if ((record.carried ?? []).some(c => c.key === f.key)
-                || record.rulings.some(r => r.key === f.key)
+                || (stillPending && record.rulings.some(r => r.key === f.key) && !stillPending.has(f.key))
                 || operatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
                   && o.head === record.head && o.runId === record.runId && o.key === f.key)) continue;
               const match = findCarriedOperatorRuling(f, { records, operatorRulings,
                 head: record.head, repo: record.repo, pr: record.pr });
               if (!match) continue;
+              // `referralRecordState` keeps a carried `card` pending while its card is unreadable, yet `liveReferrals`
+              // drops a carried finding from dispatch: that pairing would hold the gate with no reviewer to clear it.
+              if (match.result === 'card' && !cardReadable(match.card)) continue;
               let changed;
               try {
                 const file = canonicalRepoPath(f.finding.file);
-                changed = file ? await changedLines(record.repo, match.from.head, record.head, file) : null;
+                changed = file && canonicalRepoPath(match.finding.file) === file
+                  ? await changedLines(record.repo, match.from.head, record.head, file) : null;
               } catch { changed = null; }
               // Both sides are required: a bare Set cannot say which coordinate space it is in, so it is unknown.
               if (!(changed?.old instanceof Set && changed?.new instanceof Set)) continue;
