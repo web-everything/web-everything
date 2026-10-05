@@ -104,6 +104,9 @@ import { createExploreSinks, agentArgsFromEnv as exploreAgentArgsFromEnv } from 
 import { gapSweepStatusOperation, GAP_SWEEP_STATUS_OP } from './gap-sweep-status.mjs';
 import { createGapSweepSinks } from './gap-sweep-status-io.mjs';
 import { clearStuckSessionOperation, CLEAR_STUCK_SESSION_OP } from './clear-stuck-session.mjs';
+// The operator's audited auto-repair round extension (cap + granted rounds, read by reconcile-core).
+import { extendRoundsOperation, EXTEND_ROUNDS_OP } from './extend-rounds.mjs';
+import { createExtendRoundsReader, createExtendRoundsSinks } from './extend-rounds-io.mjs';
 // #4979 — the sanctioned writer of an OPERATOR's block/card/not-real ruling on a PR's mandatory referrals.
 import { recordReferralRulingOperation, RECORD_REFERRAL_RULING_OP } from './record-referral-ruling.mjs';
 import { createRecordReferralRulingReader, createRecordReferralRulingSinks } from './record-referral-ruling-io.mjs';
@@ -208,6 +211,11 @@ export const OPERATIONS = Object.freeze({
   // rule `reconcile-core.mjs#assessLiveness` already uses (imported, never re-derived); `authorize` is a real
   // human `confirm` because the effect touches `~/.claude`, not this repo's own tree; `move` quarantines the
   // job directory (never deletes it) and is a no-op unless BOTH the verdict and the human agree.
+  // read → plan → write: the operator's audited round extension, read back through the cap's own counter.
+  [EXTEND_ROUNDS_OP]: () => ({
+    declaration: extendRoundsOperation({ readExtensionContext: createExtendRoundsReader() }),
+    sinks: createExtendRoundsSinks(),
+  }),
   // #4979 — read → plan → write: the operator's referral ruling, pinned to the live head, read back through the gate.
   [RECORD_REFERRAL_RULING_OP]: () => ({
     declaration: recordReferralRulingOperation({ readRulingContext: createRecordReferralRulingReader() }),

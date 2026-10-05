@@ -739,3 +739,13 @@ counts are observations across time, not distinct invocations. Exercise the samp
 synthetic process observations. For the tick's append path, supply a fake `ps` executable
 through a temporary `PATH`: sandboxed hosts can deny real `ps` with “Operation not permitted”.
 The CLI records that failure as an error sample, which does not count toward a breach.
+
+## Auto-repair round boundary
+
+Reconcile permits the final review at the effective round cap; another fixer is refused at that cap.
+Only generic fix exhaustion parks to `review:human`, independently of note-comment dedup.
+`WE_REVIEW_ROUND_CAP` sets the positive integer base cap (default 5).
+An operator can grant 1–5 extra rounds with
+`node scripts/operations/run.mjs extend-rounds --pr=123 --repo=web-everything/web-everything --by=2 --actor=chalbert --channel=console --reason="Try two more rounds" --preview`.
+Omit `--preview` to post the audited grant and verify its trusted count in the PR thread.
+The extension counts only a trusted comment author plus a registered operator actor; repo keys and slugs are equivalent.
