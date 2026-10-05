@@ -1599,6 +1599,25 @@ describe('#4315 mandatory referral protocol', () => {
     }
   });
 
+  // Precedence matrix: a carried operator ruling must never override a ruling the reviewer already recorded
+  // on this head, whatever either one says. The reviewer's own ruling decides; carry only fills the gap.
+  it.each([
+    ['block', 'not-real', true],
+    ['block', 'block', true],
+    ['not-real', 'block', false],
+    ['card', 'not-real', false],
+  ])('a carried operator ruling never overrides the reviewer\'s own: reviewer %s × carried %s', (reviewerResult, carriedResult, blocked) => {
+    const r = record(), key = r.referrals[0].key;
+    const from = { head: 'b'.repeat(40), runId: 'old', key };
+    r.rulings = [rule(r, reviewerResult)];
+    r.carried = [{ key, from, result: carriedResult,
+      reason: 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged' }];
+    const operatorRulings = [{ ...from, repo: r.repo, pr: r.pr, result: carriedResult }];
+    const state = referralRecordState(r, { operatorRulings, cardReadable: () => true, stampPolicy: 'run-identity' });
+    expect(state.blocked).toEqual(blocked ? [key] : []);
+    expect(state.rulings.map(x => x.result)).toEqual([reviewerResult]);
+  });
+
   function supersession() {
     const a = record();
     a.referrals[0].seat = 'judge';

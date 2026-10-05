@@ -2443,7 +2443,9 @@ export function referralRecordState(record, { head = record?.head, body = record
       continue;
     }
     const carried = (record.carried ?? []).find(c => c.key === f.key);
-    if (carried) {
+    // Like `superseded` below, a carried earlier-head ruling never overrides a ruling the reviewer already
+    // recorded on THIS head: that ruling (a `block` above all) decides through the ordinary path.
+    if (carried && !recorded.length) {
       const backing = operatorRulings.filter(o => o.repo === record.repo && o.pr === record.pr
         && o.head === carried.from.head && o.runId === carried.from.runId && o.key === carried.from.key).at(-1);
       if (head !== record.head || !backing || backing.result !== carried.result || backing.card !== carried.card

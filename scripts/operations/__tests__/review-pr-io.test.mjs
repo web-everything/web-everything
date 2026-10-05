@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  PR_VIEW_FIELDS, createReviewPrReader, createReviewPrSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
+  PR_VIEW_FIELDS, changedLinesFromCompare, createReviewPrReader, createReviewPrSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
   resolveSubjectCheckout,
 } from '../review-pr-io.mjs';
@@ -1016,6 +1016,30 @@ describe('#xu2pp2m — `--cwd` decides which checkout the DIFF is read from', ()
   });
 });
 
+describe('changedLinesFromCompare (the compare payload → changed new-side lines)', () => {
+  const patch = '@@ -1,2 +1,3 @@\n a\n+b\n c\n@@ -10 +20,2 @@\n-x\n+y\n+z\n';
+  const file = (extra) => ({ filename: 'x.mjs', status: 'modified', patch, ...extra });
+  it.each([
+    ['no compare (failed gh call)', null, null],
+    ['compare without a files array', undefined, null],
+    ['hunks → the new-side lines of every hunk', [file()], [1, 2, 3, 20, 21]],
+    ['single-line hunk counts one line', [file({ patch: '@@ -5 +7 @@\n-a\n+b\n' })], [7]],
+    ['file untouched by the compare → provably unchanged', [{ filename: 'other.mjs', patch }], []],
+    ['300-file truncation → unknown', Array.from({ length: 300 }, (_, i) => ({ filename: `f${i}.mjs`, patch })), null],
+    ['rename → unknown', [file({ status: 'renamed', previous_filename: 'old.mjs', filename: 'x.mjs' })], null],
+    ['previous_filename match that is a rename → unknown', [file({ status: 'renamed', filename: 'y.mjs', previous_filename: 'x.mjs' })], null],
+    ['missing patch (binary / too large) → unknown', [file({ patch: undefined })], null],
+    ['empty patch → unknown', [file({ patch: '' })], null],
+    ['patch with no hunk header → unknown', [file({ patch: 'garbage' })], null],
+    ['deleted file → unknown, never "unchanged"', [file({ status: 'removed', patch: '@@ -1,20 +0,0 @@\n-a\n' })], null],
+    ['deleted file even with an ordinary-looking patch → unknown', [file({ status: 'removed' })], null],
+    ['pure-deletion hunk still marks the region changed', [file({ patch: '@@ -5,3 +4,0 @@\n-a\n-b\n-c\n' })], [4]],
+  ])('%s', (_name, files, expected) => {
+    const got = changedLinesFromCompare(files, 'x.mjs');
+    expect(got === null ? null : [...got].sort((a, b) => a - b)).toEqual(expected);
+  });
+});
+
 describe('#4315 durable referral effects', () => {
   function harness({ result = 'not-real', failure, env = {}, readChangedLines = () => new Set() } = {}) {
     const head = 'a'.repeat(40), trace = [], lines = [];
@@ -1076,6 +1100,25 @@ describe('#4315 durable referral effects', () => {
       expect(h.judge).toHaveBeenCalledOnce();
       expect(result.pending).toContain(current.referrals[0].key);
     }
+  });
+
+  it('never carries an operator ruling onto a finding the reviewer already ruled on this head', async () => {
+    const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    h.payload.referrals[0].original.line = 12;
+    const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
+    const current = { ...old, head: h.state.headRefOid, runId: 'current',
+      reviewer: mandatoryReferralReviewer('current'), attempted: true };
+    current.rulings = [{ id: 'current:0', key: current.referrals[0].key, reviewerId: current.reviewer.id,
+      lens: current.reviewer.lens, result: 'block', rationale: 'Checked diff', evidence: ['diff:x'] }];
+    h.state.comments.push({ body: renderReferralRecord(current), author: { login: 'web-everything' } });
+    h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+      version: 1, repo: old.repo, pr: old.pr, head: old.head, actor: 'chalbert', channel: 'test',
+      reason: 'not a defect', at: '2026-10-04T12:00:00Z', clearerId: '',
+      rulings: [{ runId: old.runId, key: old.referrals[0].key, result: 'not-real' }],
+    }) });
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const latest = readReferralRecords(h.state.comments).records.find(r => r.runId === 'current');
+    expect(latest.carried).toBeUndefined();
   });
 
   function seedReferrals(h, seats, head = 'b'.repeat(40), rule = () => []) {

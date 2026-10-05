@@ -463,6 +463,30 @@ function boundedReferral(original, source) {
   return bounded;
 }
 
+/**
+ * The new-side line numbers a GitHub compare (`files` array) changed in one file, or `null` when the compare
+ * cannot PROVE which lines changed (missing/failed compare, a 300-file truncation, a rename, a missing or
+ * hunk-less patch, a deleted file). `null` never clears anything: the caller treats it as "do not carry".
+ * PURE — the `gh` call stays in the caller, so this parser is directly table-testable (#4315 review).
+ */
+export function changedLinesFromCompare(files, file) {
+  if (!Array.isArray(files)) return null;
+  const entry = files.find(f => f.filename === file || f.previous_filename === file);
+  if (!entry) return files.length >= 300 ? null : new Set();
+  // A deleted file has no new-side lines at all: an empty Set would read as "cited lines unchanged".
+  if (entry.status === 'removed' || entry.status === 'renamed' || typeof entry.patch !== 'string' || !entry.patch) return null;
+  const lines = new Set();
+  let hunks = 0;
+  for (const match of entry.patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
+    hunks++;
+    const start = Number(match[1]), count = Number(match[2] ?? 1);
+    // A pure-deletion hunk (`+N,0`) has no new-side lines but still changed the region around `N`.
+    if (count === 0) lines.add(start);
+    for (let n = start; n < start + count; n++) lines.add(n);
+  }
+  return hunks ? lines : null;
+}
+
 /** Is this CLI error text one we can PROVE happened before any write? */
 export function isPreWriteRefusal(text) {
   const s = String(text || '');
@@ -537,19 +561,7 @@ export function createReviewPrSinks({
             comparisons.set(key, Array.isArray(value.files) ? value.files : null);
           } catch { comparisons.set(key, null); }
         }
-        const files = comparisons.get(key);
-        if (!files) return null;
-        const entry = files.find(f => f.filename === file || f.previous_filename === file);
-        if (!entry) return files.length >= 300 ? null : new Set();
-        if (entry.status === 'renamed' || typeof entry.patch !== 'string' || !entry.patch) return null;
-        const lines = new Set();
-        let hunks = 0;
-        for (const match of entry.patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
-          hunks++;
-          const start = Number(match[1]), count = Number(match[2] ?? 1);
-          for (let n = start; n < start + count; n++) lines.add(n);
-        }
-        return hunks ? lines : null;
+        return changedLinesFromCompare(comparisons.get(key), file);
       });
       const commentBudget = 60_000;
       const fresh = () => {
@@ -706,6 +718,7 @@ export function createReviewPrSinks({
             const record = existing[i], carried = [];
             for (const f of activeReferrals(record)) {
               if ((record.carried ?? []).some(c => c.key === f.key)
+                || record.rulings.some(r => r.key === f.key)
                 || operatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
                   && o.head === record.head && o.runId === record.runId && o.key === f.key)) continue;
               const match = findCarriedOperatorRuling(f, { records, operatorRulings,
