@@ -13,6 +13,8 @@
  * `investigateDispatch: true` it dispatches a diagnose-only investigation agent per episode and stops it at its
  * wall clock — see we:scripts/conveyor/health-investigate-dispatch.mjs.
  *
+ * Also runs the daily temp sweep (we:scripts/conveyor/tmp-sweep.mjs): deletes our own proven-prefix temp entries
+ * older than `tmpSweepOlderThanMs`, skipping any a process has as its cwd. All knobs are `tmpSweep*` config keys.
  * State lives under the pinned daemon state root (#4052, `health-watch-section.mjs#healthDir`, the ONE shared
  *   resolver every reader goes through — see that file's own header): `.conveyor/health/`
  *   state.json          episodes, per-daemon memory, log cursors, gh cache (written only by the tick)
@@ -31,16 +33,18 @@
  *                                                  [--ps-fixture=FILE] [--machine-load-fixture=FILE]  # machine-overload's inputs, real by default
  *                                                  [--no-investigate]  # skip the #4078 investigation pass entirely
  *                                                  [--no-file]  # skip the #4079 filing-request planning pass entirely
+ *   node scripts/conveyor/health-watch.mjs tmp-sweep [--dry-run] [--json] [--tmp-sweep-root=DIR]
  *   node scripts/conveyor/health-watch.mjs section [--state-root=DIR]      # the HEALTH section (operator queue)
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
+import { sweepOurTmp, readBusyTopLevel, formatTmpSweepLine } from './tmp-sweep.mjs';
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { execFileSync, spawn } from 'node:child_process';
 import {
   existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, openSync, readSync, closeSync, unlinkSync,
 } from 'node:fs';
-import { homedir, loadavg, cpus } from 'node:os';
+import { homedir, loadavg, cpus, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -808,11 +812,15 @@ function acquireTickLock(dir) {
   } catch { return null; }
 }
 
-/**
- * One tick: probe → pure core → diagnoses → write state, reports, stamp.
- * @returns {Promise<object>} a summary (also what `--json` prints)
- */
-export async function tick(flags = {}, { collectInventory = collectCredentialInventory } = {}) {
+function sweepOptions(config, tmpRoot, dryRun, now, run) {
+  return { tmpRoot, dryRun, now, busy: readBusyTopLevel(tmpRoot, { run }),
+    olderThanMs: config.tmpSweepOlderThanMs, batchSize: config.tmpSweepBatchSize,
+    pauseMs: config.tmpSweepPauseMs, maxDeletes: config.tmpSweepMaxDeletesPerRun,
+    timeBudgetMs: config.tmpSweepTimeBudgetMs };
+}
+
+/** One tick: probe, evaluate, diagnose, and persist. Returns the CLI summary. */
+export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun } = {}) {
   const started = Date.now();
   const now = flags.now ? Date.parse(flags.now) : started;
   const dir = healthDir(flags['state-root']);
@@ -823,7 +831,16 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const probeErrors = {};
   const probes = {};
   // A probe's error text is scrubbed at capture: an auth failure can echo a token in its message.
-  const attempt = (name, fn) => { try { return fn(); } catch (e) { probeErrors[name] = scrubText(String(e?.message || e).split('\n')[0]); return undefined; } };
+  const attempt = (name, fn) => {
+    const failed = (e) => { probeErrors[name] = scrubText(String(e?.message || e).split('\n')[0]); return undefined; };
+    try { const value = fn(); return value?.then ? value.catch(failed) : value; } catch (e) { return failed(e); }
+  };
+  const sweepAllowed = flags['tmp-sweep-root'] || (!flags['state-root'] && !flags['dry-run']);
+  const sweepDue = config.tmpSweepEnabled && (!prev.tmpSweep?.completedAt
+    || now - prev.tmpSweep.completedAt >= config.tmpSweepEveryMs || prev.tmpSweep.complete === false);
+  const tmpSweep = sweepAllowed && sweepDue
+    ? await attempt('tmpSweep', () => sweepOurTmp(sweepOptions(config, flags['tmp-sweep-root'] || tmpdir(), !!flags['dry-run'], now, tmpSweepRun)))
+    : null;
 
   const logs = attempt('daemonLogs', () => probeDaemonLogs(logsDir, prev.cursors || {}));
   if (logs) probes.daemonLogs = logs.samples;
@@ -975,6 +992,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // Scrubbed ONCE, right here: everything below — the printed section, the returned summary, every file — sees
   // only the redacted state.
   const state = scrubDeep(result.state);
+  if (tmpSweep) state.tmpSweep = { at: now, ...(tmpSweep.complete ? { completedAt: now } : {}), ...tmpSweep };
+  else if (prev.tmpSweep) state.tmpSweep = prev.tmpSweep;
   state.notifiedSilences = (result.state.silences || []).filter((x) => x.expiredNotified).map(silenceSig);
   delete state.silences;
   state.cursors = logs ? { ...(prev.cursors || {}), ...logs.cursors } : prev.cursors;
@@ -1090,7 +1109,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // The whole summary goes through the scrub too (the last choke point before stdout).
   return scrubDeep({
     now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs,
-    ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
+    tmpSweep: tmpSweep ?? null, ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
     plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, reports: written,
     section: renderHealthSection(state, { now, reportDir }),
     skipped: result.evaluations.filter((e) => !e.results).map((e) => ({ smell: e.smell.id, missing: e.skipped, error: e.error })),
@@ -1112,6 +1131,12 @@ async function main(argv) {
   const { flags, pos } = parseFlags(argv);
   const cmd = pos[0] || 'tick';
   const dir = healthDir(flags['state-root']);
+  if (cmd === 'tmp-sweep') {
+    const config = { ...DEFAULT_HEALTH_CONFIG, ...readJson(join(dir, 'config.json'), {}) };
+    const result = await sweepOurTmp(sweepOptions(config, flags['tmp-sweep-root'] || tmpdir(), !!flags['dry-run'], Date.now()));
+    console.log(flags.json ? JSON.stringify(result, null, 2) : formatTmpSweepLine(result));
+    return 0;
+  }
   if (cmd === 'section') { console.log(healthSectionLines({ stateRoot: flags['state-root'] }).join('\n')); return 0; }
   if (cmd === 'silence' || cmd === 'unsilence') {
     if (!flags.smell) { console.error('health-watch: --smell=<id> is required'); return 1; }
@@ -1128,7 +1153,7 @@ async function main(argv) {
     console.log(`health-watch: ${cmd}d ${flags.smell}${subject ? ` / ${subject}` : ''}`);
     return 0;
   }
-  if (cmd !== 'tick') { console.error(`health-watch: unknown command "${cmd}" (tick | section | silence | unsilence)`); return 1; }
+  if (cmd !== 'tick') { console.error(`health-watch: unknown command "${cmd}" (tick | tmp-sweep | section | silence | unsilence)`); return 1; }
 
   // `--in-process` is the watchdog's worker child: its parent already holds the tick lock.
   const release = flags['dry-run'] || flags['in-process'] ? () => {} : acquireTickLock(dir);
@@ -1142,6 +1167,7 @@ async function main(argv) {
       if (flags.json) console.log(JSON.stringify(summary, null, 2));
       else {
         console.log(`health-watch: tick ${summary.now} in ${summary.durationMs}ms (${summary.mode}); transitions: ${summary.transitions.map((t) => `${t.type} ${t.key}`).join(', ') || 'none'}`);
+        if (summary.tmpSweep) console.log(formatTmpSweepLine(summary.tmpSweep));
         console.log(summary.section.join('\n'));
       }
       return 0;
