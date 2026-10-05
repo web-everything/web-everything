@@ -2338,6 +2338,21 @@ export function findSupersedingNotReal(referral, { records = [], operatorRulings
   return null;
 }
 
+/** The finding fields an operator ruling is scoped to: a carry requires every one to be equal. */
+export const CARRY_SEVERITY_FIELDS = Object.freeze(['verdict', 'impactIfUnfixed']);
+
+/**
+ * The operator ruling that still backs a `carried` entry, or null. The LATEST ruling on the carried-from
+ * (head, run, finding) decides, and it must still say what was carried (same result, same card): an operator who
+ * later re-rules that finding withdraws the backing. ONE definition for the gate (`referralRecordState`) and the
+ * ignored-ruling ledger (`ruling-ledger.mjs#ignoredRulings`), so they cannot disagree on whether a carry stands.
+ */
+export function carriedBackingHolds(carried, { repo, pr, operatorRulings = [] }) {
+  const backing = operatorRulings.filter(o => o.repo === repo && o.pr === pr
+    && o.head === carried.from.head && o.runId === carried.from.runId && o.key === carried.from.key).at(-1);
+  return backing && backing.result === carried.result && backing.card === carried.card ? backing : null;
+}
+
 /** Latest matching operator decision on an earlier head; the IO caller must prove unchanged cited lines. */
 export function findCarriedOperatorRuling(referral, { records = [], operatorRulings = [], head, repo, pr }) {
   const target = referral.finding;
@@ -2354,6 +2369,9 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
     // Clearing a mandatory referral is stricter than merging duplicates: symmetric (Jaccard) overlap, so a short
     // earlier ruling cannot clear a longer, different claim that merely contains its words.
     if (summary(finding.summary) !== summary(target.summary) && wordJaccard(finding.summary, target.summary) < CARRY_SUMMARY_JACCARD_FLOOR) continue;
+    // A ruling is scoped to the severity the operator saw: the same words re-reported as a different verdict or a
+    // higher impact (broken -> unrecoverable) is a new claim for the mandatory reviewer, never a carry.
+    if (CARRY_SEVERITY_FIELDS.some(k => finding[k] !== target[k])) continue;
     return { from: { head: o.head, runId: o.runId, key: o.key }, result: o.result, card: o.card, finding };
   }
   return null;
@@ -2455,11 +2473,22 @@ export function referralRecordState(record, { head = record?.head, body = record
       else { rulings.push(operator); if (operator.result === 'block') blocked.push(f.key); }
       continue;
     }
-    const carried = (record.carried ?? []).find(c => c.key === f.key);
+    // The reviewer's own COUNTED ruling on this head (independent clearer, one outcome, readable card) — the same
+    // test the carry sink applies before it carries, so the two cannot disagree about what a carry may replace.
+    const history = independent ? recorded : [];
+    const active = history.filter(r => !history.some(next => supersededRulings(next).includes(r.id)));
+    const outcomes = new Set(active.map(r => JSON.stringify([r.result, r.result === 'card' ? r.card : null])));
+    const cardUnreadable = active.some(r => r.result === 'card' && !cardReadable(r.card));
+    // A carry only stands in for a ruling nobody has counted on THIS head: a counted reviewer ruling for the same
+    // finding (appended after the carry) wins over it, so a current-head `block` can never be masked by an earlier
+    // head's operator not-real. A reviewer `block` that contradicts another ruling on the finding still yields: the
+    // ordinary path below holds it pending. Any other uncounted ruling (non-independent clearer, unreadable card)
+    // settles nothing, so the carry still applies.
+    const counted = active.length > 0 && ((outcomes.size === 1 && !cardUnreadable) || active.some(r => r.result === 'block'));
+    const carried = counted ? undefined : (record.carried ?? []).find(c => c.key === f.key);
     if (carried) {
-      const backing = operatorRulings.filter(o => o.repo === record.repo && o.pr === record.pr
-        && o.head === carried.from.head && o.runId === carried.from.runId && o.key === carried.from.key).at(-1);
-      if (head !== record.head || !backing || backing.result !== carried.result || backing.card !== carried.card
+      const backing = carriedBackingHolds(carried, { repo: record.repo, pr: record.pr, operatorRulings });
+      if (head !== record.head || !backing
         || (carried.result === 'card' && !cardReadable(carried.card))) pending.push(f.key);
       else { rulings.push(backing); if (carried.result === 'block') blocked.push(f.key); }
       continue;
@@ -2477,11 +2506,7 @@ export function referralRecordState(record, { head = record?.head, body = record
     // Match audited drops: disabling an optional seat cannot erase an existing ruling (especially a block),
     // even one not yet counted because its clearer is not independent.
     if (!recorded.length && seatDisabled(f.seat)) continue;
-    const history = independent ? recorded : [];
-    const active = history.filter(r => !history.some(next => supersededRulings(next).includes(r.id)));
-    const outcomes = new Set(active.map(r => JSON.stringify([r.result, r.result === 'card' ? r.card : null])));
-    if (head !== record.head || outcomes.size !== 1
-      || active.some(r => r.result === 'card' && !cardReadable(r.card))) pending.push(f.key);
+    if (head !== record.head || outcomes.size !== 1 || cardUnreadable) pending.push(f.key);
     else { rulings.push(...active); if (active[0].result === 'block') blocked.push(f.key); }
   }
   // Named only when a finding actually stays held, so a fully operator-ruled record never shows it.

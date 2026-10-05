@@ -164,6 +164,25 @@ describe('ignoredRulings', () => {
       const r2 = carriedOn(record({ head: H2, runId: 'run-2' }));
       expect(ignoredRulings({ headRefOid: H2, comments: [...history, comment(r2, 10)] })?.matches).toHaveLength(1);
     });
+    // The gate (`referralRecordState`) reads the LATEST ruling on the carried-from finding and needs it to still say
+    // what was carried; the ledger must agree, or a re-ruled backing leaves the reviewer block unflagged.
+    // Only a re-ruling to `block` leaves the reviewer's earlier block standing: a later not-real/card ruling
+    // overrules it on its own, which the ledger already honours.
+    it.each([
+      ['not-real', undefined, 'block', undefined],
+      ['card', 'we:backlog/1234-x.md', 'block', undefined],
+    ])('is flagged when the operator re-ruled a carried %s (%s) as %s (%s) after the carry', (was, wasCard, now, nowCard) => {
+      const key = record({ head: H2, runId: 'run-2' }).referrals[0].key;
+      const r2 = { ...record({ head: H2, runId: 'run-2' }), carried: [{ key, reason: REFERRAL_CARRY_REASON,
+        from: { head: H1, runId: 'run-1', key }, result: was, ...(wasCard ? { card: wasCard } : {}) }] };
+      const op = (result, card, n) => ({ author: { login: 'chalbert' }, createdAt: t(n),
+        body: buildOperatorRulingComment({ version: 1, repo, pr: r1().pr, head: H1, actor: 'chalbert', channel: 'test',
+          reason: 'settled', at: t(n), clearerId: '', rulings: [{ runId: 'run-1', key, result, ...(card ? { card } : {}) }] }) });
+      const [first, blockRecord] = history;
+      const comments = (...ops) => [first, op(was, wasCard, 2), blockRecord, ...ops, comment(r2, 10)];
+      expect(ignoredRulings({ headRefOid: H2, comments: comments() })).toBeNull(); // control: backing intact
+      expect(ignoredRulings({ headRefOid: H2, comments: comments(op(now, nowCard, 4)) })?.matches).toHaveLength(1);
+    });
   });
   it('is quiet when the earlier ruling was not block (card / not-real)', () => {
     const rulingCard = [comment(record({ head: H1, runId: 'run-1' }), 1),

@@ -21,7 +21,7 @@
  * PURE. A record is only read from a trusted author (`readReferralRecords` enforces that), and a comment that
  * cannot be read as a record contributes nothing here (the hold itself already fails closed on malformed ones).
  */
-import { readReferralRecords, mandatoryReferralState, parseOperatorRulingComment, readOperatorRulings } from './jury-core.mjs';
+import { readReferralRecords, mandatoryReferralState, parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds } from './jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { DEFAULT_FIXER_ESCALATION, TEST_FIRST_INSTRUCTION, humanAtMisses } from './fixer-escalation-policy.mjs';
 
@@ -240,7 +240,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       // the thread. A carried `block` settles nothing: the cited lines are unchanged, which is exactly an ignored ruling.
       if (operatorRulings.some((o) => o.head === head && o.runId === record.runId && o.key === f.key)
         || (record.carried ?? []).some((c) => c.key === f.key && c.result !== 'block'
-          && operatorRulings.some((o) => o.head === c.from.head && o.runId === c.from.runId && o.key === c.from.key))) continue;
+          && carriedBackingHolds(c, { repo: record.repo, pr: record.pr, operatorRulings }))) continue;
       // The standing ruling is the LATEST matching block: a fresh re-ruling restarts the count, so the ladder gives
       // the fixer the rungs that re-ruling bought instead of counting heads from the first ruling.
       let b = null;

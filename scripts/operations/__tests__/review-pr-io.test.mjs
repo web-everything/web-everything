@@ -1159,10 +1159,10 @@ describe('#4315 durable referral effects', () => {
   });
 
   // An earlier-head operator not-real on `oldLine`, and the SAME finding on the current head at `curLine`.
-  function seedCarry(h, { oldLine = 12, curLine = 12, attempted = false, rule = () => [], operatorRuling = { result: 'not-real' } } = {}) {
+  function seedCarry(h, { oldLine = 12, curLine = 12, attempted = false, rule = () => [], operatorRuling = { result: 'not-real' }, curPatch = {} } = {}) {
     h.payload.referrals[0].original.line = oldLine;
     const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
-    const original = { ...old.referrals[0].original, line: curLine };
+    const original = { ...old.referrals[0].original, line: curLine, ...curPatch };
     const current = { ...old, head: h.state.headRefOid, runId: 'current',
       referrals: [{ ...old.referrals[0], original, finding: normalizeFinding(original),
         key: referralFindingKey('judgeCorrectnessAdvisory', original) }],
@@ -1212,6 +1212,18 @@ describe('#4315 durable referral effects', () => {
       .some(f => f.key === key))).toBe(true);
     // The reviewer (harness default: not-real) adjudicated it, so the gate is not left holding an unattended finding.
     expect(state.pending).not.toContain(key);
+  });
+
+  // An operator ruling is scoped to the severity they saw: the same finding re-reported at a higher impact goes to the
+  // mandatory reviewer instead of inheriting the earlier not-real.
+  it('does not carry an operator ruling onto the same finding re-reported at a higher impact', async () => {
+    const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    const { old, current } = seedCarry(h, { curPatch: { impactIfUnfixed: 'unrecoverable' } });
+    expect(current.referrals[0].original.impactIfUnfixed).not.toBe(old.referrals[0].original.impactIfUnfixed);
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
+    expect(h.judge.mock.calls.some(([req]) => JSON.parse(req.input.split('\nUntrusted reported findings:\n')[1])
+      .some(f => f.key === current.referrals[0].key))).toBe(true);
   });
 
   it('still carries an earlier operator card ruling when the card is readable', async () => {
