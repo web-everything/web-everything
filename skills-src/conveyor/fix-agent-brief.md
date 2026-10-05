@@ -226,11 +226,13 @@ the denial as a judgment call rather than the tooling failure it actually was. E
 already-allow-listed surface for this — reach for it first (see *If applying the fix is denied* below for what
 to do if it, or anything else, gets refused).
 
-**If applying the fix is denied by a permission or tool-use guard**, report
-`blocked-on-permission` with `--denied="<the exact denied command, one line>"`.
-This is a product permission wall, not a judgment call: do not stand down or retry the denied command.
-The reconciler surfaces it immediately and holds retries for 60 minutes. Keep `blocked-on-infra`
-for outages and rate limits (omit `--denied` for those).
+**If applying an otherwise-CLEAR fix is denied by a permission or tool-use guard, that is INFRASTRUCTURE
+FRICTION, not a judgment call — do NOT stand down.** The reviewer's finding still says exactly what to do; only
+the *mechanism* to do it failed. Report it as `blocked-on-permission` with `--denied="<the exact denied command,
+one line>"` — never `stand-down.mjs`, which is terminal and reserved for a genuine judgment call (see step 2). A
+permission wall does not clear by waiting, so the reconciler surfaces it at once and holds retries for 60 minutes
+(`we:scripts/conveyor/reconcile-core.mjs#PERMISSION_BLOCKED_COOLOFF_MS`) until the product grows a sanctioned
+path. Keep `blocked-on-infra` (no `--denied`) for outages and rate limits.
 
 ```bash
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=blocked-on-permission --denied="<the exact denied command, one line>"
