@@ -1159,7 +1159,7 @@ describe('#4315 durable referral effects', () => {
   });
 
   // An earlier-head operator not-real on `oldLine`, and the SAME finding on the current head at `curLine`.
-  function seedCarry(h, { oldLine = 12, curLine = 12, attempted = false, rule = () => [] } = {}) {
+  function seedCarry(h, { oldLine = 12, curLine = 12, attempted = false, rule = () => [], operatorRuling = { result: 'not-real' } } = {}) {
     h.payload.referrals[0].original.line = oldLine;
     const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
     const original = { ...old.referrals[0].original, line: curLine };
@@ -1172,7 +1172,7 @@ describe('#4315 durable referral effects', () => {
     h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
       version: 1, repo: old.repo, pr: old.pr, head: old.head, actor: 'chalbert', channel: 'test',
       reason: 'not a defect', at: '2026-10-04T12:00:00Z', clearerId: '',
-      rulings: [{ runId: old.runId, key: old.referrals[0].key, result: 'not-real' }] }) });
+      rulings: [{ runId: old.runId, key: old.referrals[0].key, ...operatorRuling }] }) });
     return { old, current };
   }
   const realReader = patch => () => changedLinesFromCompare({ status: 'ahead', files: [{ filename: 'x.mjs', status: 'modified', patch }] }, 'x.mjs');
@@ -1198,6 +1198,29 @@ describe('#4315 durable referral effects', () => {
     const key = current.referrals[0].key;
     expect(mandatoryReferralState(h.state.comments, { head: h.state.headRefOid }).blocked).toEqual(result === 'block' ? [key] : []);
     expect(state.pending).not.toContain(key);
+  });
+
+  // The carry persists a `carried` entry that `liveReferrals` excludes from dispatch, while `referralRecordState` keeps
+  // the finding pending for an unreadable card: carrying it would strand the finding with no reviewer and a held gate.
+  it('does not suppress mandatory review when an earlier operator card is unreadable', async () => {
+    const h = harness({ failure: 'card', readChangedLines: () => new Set() });
+    const { current } = seedCarry(h, { operatorRuling: { result: 'card', card: 'we:backlog/7-filed.md' } });
+    const state = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const key = current.referrals[0].key;
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
+    expect(h.judge.mock.calls.some(([req]) => JSON.parse(req.input.split('\nUntrusted reported findings:\n')[1])
+      .some(f => f.key === key))).toBe(true);
+    // The reviewer (harness default: not-real) adjudicated it, so the gate is not left holding an unattended finding.
+    expect(state.pending).not.toContain(key);
+  });
+
+  it('still carries an earlier operator card ruling when the card is readable', async () => {
+    const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    const { current } = seedCarry(h, { operatorRuling: { result: 'card', card: 'we:backlog/7-filed.md' } });
+    const state = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toHaveLength(1);
+    expect(h.judge).not.toHaveBeenCalled();
+    expect(state.pending).not.toContain(current.referrals[0].key);
   });
 
   it('still carries when the current-head reviewer ruling does not count (card naming an unreadable card)', async () => {

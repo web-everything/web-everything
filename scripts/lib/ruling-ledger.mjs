@@ -236,9 +236,10 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       if (matches.some((m) => m.finding.key === g.key)) continue;
       if (rulingsHere(f.key).some((r) => r.result === 'block')) continue;
       // Already settled on this head by the operator: any structured ruling of theirs here (block included — they
-      // looked at it), or one carried forward from an earlier head whose operator backing is still in the thread.
+      // looked at it), or a not-real/card one carried forward from an earlier head whose operator backing is still in
+      // the thread. A carried `block` settles nothing: the cited lines are unchanged, which is exactly an ignored ruling.
       if (operatorRulings.some((o) => o.head === head && o.runId === record.runId && o.key === f.key)
-        || (record.carried ?? []).some((c) => c.key === f.key
+        || (record.carried ?? []).some((c) => c.key === f.key && c.result !== 'block'
           && operatorRulings.some((o) => o.head === c.from.head && o.runId === c.from.runId && o.key === c.from.key))) continue;
       // The standing ruling is the LATEST matching block: a fresh re-ruling restarts the count, so the ladder gives
       // the fixer the rungs that re-ruling bought instead of counting heads from the first ruling.

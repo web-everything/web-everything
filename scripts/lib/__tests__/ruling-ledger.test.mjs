@@ -141,6 +141,25 @@ describe('ignoredRulings', () => {
       const [first, blockRecord] = history;
       expect(ignoredRulings({ headRefOid: H2, comments: [first, opComment(r1(), H1, 'not-real', 2), blockRecord, comment(r2, 10)] })).toBeNull();
     });
+    // {carried result} x {reviewer block earlier}: only a carried `block` leaves the finding an ignored ruling — the
+    // fixer left the cited lines unchanged, which is exactly what the operator's block told it not to do.
+    describe.each([
+      ['not-real', false], ['card', false], ['block', true],
+    ])('a finding carried forward from an operator %s', (result, flagged) => {
+      it(flagged ? 'is still an ignored ruling (the fixer left the blocked lines unchanged)' : 'is settled, not ignored', () => {
+        const key = record({ head: H2, runId: 'run-2' }).referrals[0].key;
+        const r2 = { ...record({ head: H2, runId: 'run-2' }), carried: [{ key, reason: REFERRAL_CARRY_REASON,
+          from: { head: H1, runId: 'run-1', key }, result, ...(result === 'card' ? { card: 'we:backlog/1234-x.md' } : {}) }] };
+        const op = { author: { login: 'chalbert' }, createdAt: t(2),
+          body: buildOperatorRulingComment({ version: 1, repo, pr: r1().pr, head: H1, actor: 'chalbert', channel: 'test',
+            reason: 'settled', at: t(2), clearerId: '',
+            rulings: [{ runId: 'run-1', key, result, ...(result === 'card' ? { card: 'we:backlog/1234-x.md' } : {}) }] }) };
+        const [first, blockRecord] = history;
+        const ig = ignoredRulings({ headRefOid: H2, comments: [first, op, blockRecord, comment(r2, 10)] });
+        if (flagged) expect(ig?.matches).toHaveLength(1);
+        else expect(ig).toBeNull();
+      });
+    });
     it('is flagged when the carried finding\'s operator backing is gone', () => {
       const r2 = carriedOn(record({ head: H2, runId: 'run-2' }));
       expect(ignoredRulings({ headRefOid: H2, comments: [...history, comment(r2, 10)] })?.matches).toHaveLength(1);

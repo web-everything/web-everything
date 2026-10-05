@@ -761,6 +761,9 @@ export function createReviewPrSinks({
               const match = findCarriedOperatorRuling(f, { records, operatorRulings,
                 head: record.head, repo: record.repo, pr: record.pr });
               if (!match) continue;
+              // `referralRecordState` keeps a carried `card` pending while its card is unreadable, yet `liveReferrals`
+              // drops a carried finding from dispatch: that pairing would hold the gate with no reviewer to clear it.
+              if (match.result === 'card' && !cardReadable(match.card)) continue;
               let changed;
               try {
                 const file = String(f.finding.file ?? '').trim().replace(/^(?:\.\/|[ab]\/)/, '').replace(/:\d+(?::\d+)?$/, '');
