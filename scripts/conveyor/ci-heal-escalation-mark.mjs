@@ -52,7 +52,6 @@ import { resolve } from 'node:path';
 import { collectCiAuthDiagnosis, renderCiAuthDiagnosis } from './ci-auth-diagnosis.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
-import { applyReviewStatus } from './review-status-tag.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
 
 /**
@@ -264,6 +263,8 @@ if (IS_CLI) {
   // fixed" for however long that tick is away. See the file header's "clear/replace the fixing label as soon as
   // the session reports any terminal outcome" requirement.
   try {
+    // Dynamic import breaks the review-status-tag → reconcile-core cycle (coroner #36).
+    const { applyReviewStatus } = await import('./review-status-tag.mjs');
     const provider = createGhProvider();
     // No `--repo` given (a repo-less invocation, `gh` inferring from cwd elsewhere in this script) — resolve
     // the SAME way, via `gh repo view`, never a hardcoded constellation repo (this file, like every other

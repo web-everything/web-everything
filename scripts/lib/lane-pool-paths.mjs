@@ -28,9 +28,11 @@ const expandHome = (p, home) => (p && p.startsWith('~') ? join(home, p.slice(1))
  *
  * From a lane clone (`<workspace>/.lanes/<pool>/lane-N`) that is the segment BEFORE `.lanes`, never the lane's
  * own parent: a caller standing in a lane must resolve the SAME pool as one standing in the primary, or a lane
- * would provision its own nested pool. From a primary checkout it is simply the parent.
+ * would provision its own nested pool. Dispatch cwd under `<workspace>/.operations/...` (or ending in
+ * `.operations`) likewise resolves above `.operations` (coroner #32). From a primary checkout it is simply
+ * the parent.
  *
- * The `.lanes` match is NON-GREEDY so it takes the OUTERMOST pool — the same reason
+ * The `.lanes` and `.operations` matches take the FIRST (OUTERMOST) marker — the same reason
  * `judge-spawn.mjs#laneRootOf` is non-greedy: a path that happens to contain a nested `.lanes` must not
  * re-root the answer.
  *
@@ -39,7 +41,13 @@ const expandHome = (p, home) => (p && p.startsWith('~') ? join(home, p.slice(1))
  */
 export function workspaceFor(path) {
   const s = String(path || '');
-  const i = s.indexOf(`${sep}.lanes${sep}`);
+  const laneIndex = s.indexOf(`${sep}.lanes${sep}`);
+  const operationsMarker = `${sep}.operations`;
+  const operationsIndex = s.indexOf(`${operationsMarker}${sep}`);
+  const operationsStart = operationsIndex >= 0 ? operationsIndex
+    : s.endsWith(operationsMarker) ? s.length - operationsMarker.length : -1;
+  const i = laneIndex < 0 ? operationsStart
+    : operationsStart < 0 ? laneIndex : Math.min(laneIndex, operationsStart);
   return i >= 0 ? s.slice(0, i) : dirname(s);
 }
 
@@ -56,7 +64,7 @@ export function workspaceFor(path) {
  * workspace and put the pool at `<checkout>/.lanes` — inside the repo the pool is meant to sit beside. The
  * pre-#3265 `homedir()` default was wrong about the host but at least cwd-INDEPENDENT; deriving without
  * normalising first trades one bug for another (#1539 reviewer, round 2). A lane path needs no normalising —
- * `workspaceFor` strips at `.lanes` from any depth — but the root is still the honest input.
+ * `workspaceFor` strips at the outermost `.lanes` or `.operations` from any depth (coroner #32).
  *
  * @param {string} checkoutRoot - the checkout (or lane) ROOT the caller is in.
  * @param {object} env - environment bag; reads `LANE_POOL_ROOT` and `HOME`.
