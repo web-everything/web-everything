@@ -13,7 +13,7 @@ import { spawnSync, spawn as spawnProcess, execFileSync } from 'node:child_proce
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { laneNeedsVerifyDispatch, inFlightSuperseded, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER } from '../verify-dispatch.mjs';
+import { laneNeedsVerifyDispatch, inFlightSuperseded, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../../../skills-src/conveyor/verify-daemon.mjs';
@@ -293,6 +293,83 @@ describe('spawnGateBounded — gate-only timing (Skeptic-review fix, epic #3383)
   it('kills a run that never reaches the gate at all — a hang BEFORE the marker ever appears', async () => {
     const script = writeFixtureGate(base, { queueDelayMs: 5000, gateDurationMs: 100 });
     await expect(spawnGateBounded([script], { queueCeilingMs: 300, gateCeilingMs: 5000 })).rejects.toMatchObject({ timedOutPhase: 'queue' });
+  });
+});
+
+// #verify-phase-admission — a child that re-queues for a later phase's slot AFTER the one-shot started marker.
+// The wait is queue time, not gate time: it must not eat the gate ceiling, and the gate budget it paused must
+// still bound the real gate work on either side of the wait.
+function writeRequeueGate(dir, { firstGateMs, requeueWaitMs, secondGateMs, resume = true }) {
+  const p = join(dir, `fixture-requeue-${Math.random().toString(36).slice(2)}.mjs`);
+  writeFileSync(
+    p,
+    [
+      `const say = (line) => process.stderr.write(line + '\\n');`,
+      `say('⏱ ' + ${JSON.stringify(GATE_STARTED_MARKER)} + ' (suites: fixture)');`,
+      `setTimeout(() => {`,
+      `  say('⏳ ' + ${JSON.stringify(GATE_QUEUED_MARKER)} + ' (phase: standards)');`,
+      `  setTimeout(() => {`,
+      `    ${resume ? `say('⏱ ' + ${JSON.stringify(GATE_STARTED_MARKER)} + ' (phase: standards)');` : ''}`,
+      `    setTimeout(() => process.exit(0), ${secondGateMs});`,
+      `  }, ${requeueWaitMs});`,
+      `}, ${firstGateMs});`,
+    ].join('\n'),
+    'utf8',
+  );
+  return p;
+}
+
+describe('spawnGateBounded — later-phase admission waits are queue time (#verify-phase-admission)', () => {
+  it('does NOT kill a run that re-queues after the started marker for longer than the gate ceiling', async () => {
+    // Gate work totals 200ms (inside the 500ms ceiling) but the re-queue wait alone is 900ms.
+    const script = writeRequeueGate(base, { firstGateMs: 100, requeueWaitMs: 900, secondGateMs: 100 });
+    await expect(spawnGateBounded([script], { queueCeilingMs: 5000, gateCeilingMs: 500 })).resolves.toBeTruthy();
+  });
+
+  it('still bounds real gate time across the wait: the paused budget resumes, it does not reset', async () => {
+    // 300ms + 300ms of real gate work against a 500ms ceiling — a fresh budget after the wait would let this pass.
+    const script = writeRequeueGate(base, { firstGateMs: 300, requeueWaitMs: 200, secondGateMs: 2000 });
+    await expect(spawnGateBounded([script], { queueCeilingMs: 5000, gateCeilingMs: 500 })).rejects.toMatchObject({ timedOutPhase: 'gate' });
+  });
+
+  it('still bounds the re-queue wait itself by the queue ceiling', async () => {
+    const script = writeRequeueGate(base, { firstGateMs: 50, requeueWaitMs: 5000, secondGateMs: 50, resume: false });
+    await expect(spawnGateBounded([script], { queueCeilingMs: 300, gateCeilingMs: 5000 })).rejects.toMatchObject({ timedOutPhase: 'queue' });
+  });
+
+  it('fires onGateStarted once even when the child re-queues and resumes', async () => {
+    const script = writeRequeueGate(base, { firstGateMs: 50, requeueWaitMs: 100, secondGateMs: 50 });
+    let calls = 0;
+    await spawnGateBounded([script], { queueCeilingMs: 5000, gateCeilingMs: 5000, onGateStarted: () => { calls += 1; } });
+    expect(calls).toBe(1);
+  });
+
+  it('recognises a queued marker whose multi-byte emoji is split across stderr reads', async () => {
+    const p = join(base, `fixture-split-${Math.random().toString(36).slice(2)}.mjs`);
+    writeFileSync(p, [
+      `process.stderr.write('⏱ ' + ${JSON.stringify(GATE_STARTED_MARKER)} + '\\n');`,
+      `const queued = Buffer.from('⏳ ' + ${JSON.stringify(GATE_QUEUED_MARKER)} + ' (phase: standards)\\n');`,
+      `setTimeout(() => {`,
+      `  process.stderr.write(queued.subarray(0, 1));`,
+      `  setTimeout(() => {`,
+      `    process.stderr.write(queued.subarray(1));`,
+      `    setTimeout(() => process.exit(0), 900);`,
+      `  }, 50);`,
+      `}, 50);`,
+    ].join('\n'), 'utf8');
+    // 900ms of queue-time silence against a 300ms gate ceiling: only a recognised marker can save it.
+    await expect(spawnGateBounded([p], { queueCeilingMs: 5000, gateCeilingMs: 300 })).resolves.toBeTruthy();
+  });
+
+  it('ignores marker text that is not a line-anchored marker (gate output cannot move a timer)', async () => {
+    const p = join(base, `fixture-noise-${Math.random().toString(36).slice(2)}.mjs`);
+    writeFileSync(p, [
+      `process.stderr.write('⏱ ' + ${JSON.stringify(GATE_STARTED_MARKER)} + '\\n');`,
+      `process.stderr.write('log: ⏳ ' + ${JSON.stringify(GATE_QUEUED_MARKER)} + ' (quoted in test output)\\n');`,
+      `setTimeout(() => process.exit(0), 900);`,
+    ].join('\n'), 'utf8');
+    // If the quoted text paused the gate budget, the 300ms gate ceiling would never fire (queue ceiling is 5s).
+    await expect(spawnGateBounded([p], { queueCeilingMs: 5000, gateCeilingMs: 300 })).rejects.toMatchObject({ timedOutPhase: 'gate' });
   });
 });
 

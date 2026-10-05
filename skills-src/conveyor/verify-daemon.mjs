@@ -60,7 +60,6 @@ import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
-import { readVerifyMarker } from '../../scripts/lib/lane-verify.mjs';
 import { runVerifyDispatch } from '../../scripts/conveyor/verify-dispatch.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel and from the Fix-dispatch
@@ -246,26 +245,18 @@ export function pidAlive(pid) {
   catch (error) { return error.code !== 'ESRCH'; }
 }
 
-// #verify-inflight-reconcile — resolve worktree git dirs just as verify-dispatch does.
-function requeueOrphan(dir, entry) {
-  let gitDir;
-  try {
-    gitDir = execFileSync('git', ['rev-parse', '--absolute-git-dir'], {
-      cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000,
-      killSignal: 'SIGKILL',
-    }).trim();
-  } catch { gitDir = join(dir, '.git'); }
-  const marker = readVerifyMarker(gitDir);
-  if (marker?.status !== 'running' || (marker.runId && marker.runId !== entry.runId)) return;
-  // #verify-inflight-reconcile — laneNeedsVerifyDispatch accepts fresh running markers;
-  // deleting the Map entry requeues this request without changing its identity or SHA.
+// #verify-inflight-reconcile — does any member of the process group led by `pid` remain? Only ESRCH says no.
+export function processGroupAlive(pid) {
+  try { process.kill(-pid, 0); return true; }
+  catch (error) { return error.code !== 'ESRCH'; }
 }
 
-// #verify-inflight-reconcile — child exit can precede stdio close indefinitely.
+// #verify-inflight-reconcile — child exit can precede stdio close indefinitely. Dropping the entry is the whole
+// requeue: laneNeedsVerifyDispatch accepts a fresh `running` marker, so the next tick re-selects this request
+// with its identity and SHA unchanged, and a settled marker is never re-selected.
 export function reconcileInFlight(inFlight, {
-  isAlive = pidAlive, nowMs = Date.now(), spawnGraceMs = 120_000,
-  killGroup = (group) => process.kill(group, 'SIGKILL'),
-  requeue = requeueOrphan, log = console.error,
+  isAlive = pidAlive, groupAlive = processGroupAlive, nowMs = Date.now(), spawnGraceMs = 120_000,
+  killGroup = (group) => process.kill(group, 'SIGKILL'), log = console.error,
 } = {}) {
   const orphaned = [];
   for (const [dir, entry] of inFlight) {
@@ -274,10 +265,12 @@ export function reconcileInFlight(inFlight, {
       ? (!isAlive(pid) ? 'pid-gone' : null)
       : ((pid == null || pid === 0) && nowMs - startedMs > spawnGraceMs ? 'never-spawned' : null);
     if (!reason) continue;
-    try { if (pid > 0) killGroup(-pid); } catch {}
+    // The leader is gone. A pid is not reused while a process group still carries it, so a group that still has
+    // members is ours (the stuck stdio holders). An empty one means the pid may already belong to an unrelated
+    // process that became its own group leader, so kill nothing. (Narrows the window; a group that empties and a
+    // pid recycled between two ticks is not detectable here.)
+    try { if (pid > 0 && groupAlive(pid)) killGroup(-pid); } catch {}
     inFlight.delete(dir);
-    try { requeue(dir, entry); }
-    catch (error) { log(`verify-daemon: ${pool}/lane-${lane} orphan requeue failed (non-fatal): ${String(error?.message || error).split('\n')[0]}`); }
     log(`verify-daemon: ${pool}/lane-${lane} in-flight run ${String(runId).slice(0, 8)} orphaned (pid ${pid} gone) — dropped and re-queued`);
     orphaned.push({ pool, lane, runId, pid, reason });
   }
@@ -290,7 +283,7 @@ export function reconcileInFlight(inFlight, {
  *  its own clock, independent of this factory's caller). Kept as its own factory (mirroring
  *  `buildCliDaemonEffects` in the sibling daemons) so `main()` stays a thin wire-up. */
 export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAlive = () => true, log = console, runVerify = runVerifyDispatch, isDraining = defaultIsDraining,
-  processIsAlive = pidAlive, killGroup, requeue, now = Date.now, spawnGraceMs = 120_000,
+  processIsAlive = pidAlive, groupAlive, killGroup, now = Date.now, spawnGraceMs = 120_000,
 } = {}) {
   const inFlight = new Map();
   // `awaitSettle:false` returns before any gate settles, so `result.failures` is always empty here: failures
@@ -306,7 +299,7 @@ export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAliv
     tickOnce: async () => {
       // #verify-inflight-reconcile — drain and restart must also release orphaned runs.
       const { orphaned } = reconcileInFlight(inFlight, {
-        isAlive: processIsAlive, nowMs: now(), spawnGraceMs, killGroup, requeue,
+        isAlive: processIsAlive, groupAlive, nowMs: now(), spawnGraceMs, killGroup,
         log: (message) => log.error(message),
       });
       const result = isDraining()

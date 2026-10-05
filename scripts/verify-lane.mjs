@@ -74,7 +74,7 @@ import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyS
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
-import { phaseAdmissionKind, verifyPhaseAdmissionEnabled, buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { VERIFY_STANDARDS_POLICIES, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
@@ -299,8 +299,19 @@ if (typeof flags.gate === 'string') {
 // without interpreting arbitrary shell overrides or accidentally skipping their remaining steps.
 if (!resolvedGate && typeof flags.gate === 'string') {
   try {
-    const resolved = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)) });
+    const resolveUnder = (env) => resolveDefaultGate({ runGit: git, env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)) });
+    const resolved = resolveUnder(process.env);
     if (resolved.command === GATE) resolvedGate = resolved;
+    // The standards policy belongs to the dispatching daemon's environment, which the requesting agent's
+    // usually lacks, so the stamped command can differ from this child's only by that policy. If it is exactly
+    // what some policy resolves to for this diff it is still the default gate: apply OUR policy, and keep
+    // `GATE` (the marker's `suites`) as requested so the request/check/cache key still matches.
+    // Each resolution reads git afresh, so the matching variant must also have seen the diff `resolved` saw.
+    else if (MODE === 'verify' && typeof flags['run-id'] === 'string'
+        && VERIFY_STANDARDS_POLICIES.some((policy) => {
+          const variant = resolveUnder({ ...process.env, WE_VERIFY_STANDARDS: policy });
+          return variant.command === GATE && JSON.stringify(variant.decision.changedFiles) === JSON.stringify(resolved.decision.changedFiles);
+        })) resolvedGate = resolved;
   } catch { /* Unknown selection cannot authorize a retry. */ }
 }
 
@@ -480,7 +491,17 @@ const phaseMs = { vitestMs: null, scanMs: null, standardsMs: null };
 const outcomes = {};
 async function timedRunGate(phase, command, args) {
   const kind = phase?.replace(/Ms$/, '');
-  const acquired = phaseAdmission ? firstPhaseAdmission ?? await acquireAdmission(kind) : null;
+  let acquired = null;
+  if (phaseAdmission && firstPhaseAdmission) acquired = firstPhaseAdmission;
+  else if (phaseAdmission) {
+    // Dispatch already saw the one-shot started marker, so a later phase's wait would count as hung gate time.
+    // Tell it we are queueing again, and that real gate work resumes once the slot is held. Keep both lines in
+    // step with `GATE_QUEUED_MARKER` / `GATE_STARTED_MARKER` in `verify-dispatch.mjs`.
+    // The leading newline keeps the marker at a line start even when the previous phase's output stopped mid-line.
+    process.stderr.write(`\n⏳ gate queueing for admission (phase: ${kind})\n`);
+    acquired = await acquireAdmission(kind);
+    process.stderr.write(`⏱ gate execution starting (phase: ${kind})\n`);
+  }
   firstPhaseAdmission = null;
   const started = performance.now();
   try {

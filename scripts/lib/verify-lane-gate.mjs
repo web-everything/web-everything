@@ -153,7 +153,9 @@ export function verifyStandardsPolicy(env) {
   return ['auto', 'ci-only'].includes(env?.WE_VERIFY_STANDARDS) ? env.WE_VERIFY_STANDARDS : 'always';
 }
 
-export const STANDARDS_AUTO_PREFIXES = Object.freeze([
+export const VERIFY_STANDARDS_POLICIES = Object.freeze(['always', 'auto', 'ci-only']);
+
+export const STANDARDS_AUTO_PREFIXES =Object.freeze([
   'backlog/', 'docs/', 'config/', 'agent-memory-src/', 'skills-src/', '.claude/',
   '.github/', 'src/', 'blocks/', 'research/', 'site/',
 ]);

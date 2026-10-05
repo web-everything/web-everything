@@ -111,6 +111,12 @@
  * and starts a fresh gate timer — it does not extend or add to the queue one. On EITHER timeout the whole
  * process-group kill above still applies unchanged.
  *
+ * LATER-PHASE WAITS (#verify-phase-admission). Per-phase admission makes the child queue AGAIN after the first
+ * marker (scan / standards / retry slots). It brackets each such wait with a `⏳ {@link GATE_QUEUED_MARKER}` line
+ * and a repeat of the `⏱ {@link GATE_STARTED_MARKER}` line: the first pauses the gate budget (what is left of it
+ * is kept) and runs the queue ceiling, the second resumes the gate timer with that remainder. A healthy wait is
+ * never charged as hung gate time, a hung wait is still bounded, and total real gate time is still capped.
+ *
  * PURE-CORE / IO-SHELL SPLIT (mirrors lease-reaper.mjs): {@link laneNeedsVerifyDispatch} is pure (no fs/git);
  * the IO shell owns the POOL_ROOT walk, marker reads, the `git rev-parse HEAD` per lane, and the actual
  * `verify-lane.mjs` spawn. {@link runVerifyDispatch} is that whole IO-shell sweep, exported and exit-free (it
@@ -145,6 +151,13 @@ const VERIFY_DISPATCH_TIMEOUT_MS =
  *  command (see that file's call site) — the ONE signal this file needs to tell "still queuing" from "gate
  *  work has actually started," without inventing a second, parallel marker vocabulary. */
 export const GATE_STARTED_MARKER = 'gate execution starting';
+
+/** Per-phase admission (#verify-phase-admission) makes the child queue AGAIN after {@link GATE_STARTED_MARKER}
+ *  (scan / standards / retry phases). It writes this line before each such wait and re-writes the started line
+ *  once the slot is held, so the dispatcher can pause the gate budget while the child is merely queued instead of
+ *  counting the wait as hung gate time. Only line-anchored occurrences count after the first started marker, so
+ *  gate output that merely mentions the text can never move a timer. */
+export const GATE_QUEUED_MARKER = 'gate queueing for admission';
 
 /** The PRE-marker (queuing) ceiling — a safety net, not the primary defense against a stuck queue wait. The
  *  real ceiling on legitimate queuing is `heavy-admission.mjs`'s own hard give-up ceiling (xhlriy2, #3383:
@@ -367,9 +380,48 @@ export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateSt
       }
     };
     let timer = setTimeout(onTimeout('queue'), queueCeilingMs);
+    // Decode across read boundaries: the marker lines carry a multi-byte emoji a raw chunk could split.
+    child.stderr.setEncoding('utf8');
+    // After the first marker: the gate budget left while the child re-queues for a later phase's slot, and the
+    // partial trailing line carried between chunks (only complete lines can be a line-anchored marker).
+    let gateBudgetMs = gateCeilingMs;
+    let gateResumedAt = 0;
+    let requeueing = false;
+    let lineCarry = '';
+
+    const armGate = () => {
+      clearTimeout(timer);
+      gateResumedAt = Date.now();
+      timer = setTimeout(onTimeout('gate'), gateBudgetMs);
+    };
+    // A later-phase wait is queue time: pause the gate budget (keeping what is left of it) and run the queue
+    // ceiling instead, so a healthy wait is never killed as a hung gate and a hung one is still bounded.
+    const onRequeue = () => {
+      if (requeueing) return;
+      requeueing = true;
+      gateBudgetMs = Math.max(0, gateBudgetMs - (Date.now() - gateResumedAt));
+      clearTimeout(timer);
+      timer = setTimeout(onTimeout('queue'), queueCeilingMs);
+    };
+    const onResume = () => {
+      if (!requeueing) return;
+      requeueing = false;
+      armGate();
+    };
+    const scanLaterMarkers = (text) => {
+      const lines = (lineCarry + text).split('\n');
+      lineCarry = lines.pop().slice(-4096);
+      for (const line of lines) {
+        if (line.startsWith(`⏳ ${GATE_QUEUED_MARKER}`)) onRequeue();
+        else if (line.startsWith(`⏱ ${GATE_STARTED_MARKER}`)) onResume();
+      }
+    };
 
     child.stderr.on('data', (chunk) => {
-      if (markerSeen) return;
+      if (markerSeen) {
+        scanLaterMarkers(chunk.toString('utf8'));
+        return;
+      }
       // Bounded tail — this only ever needs to catch ONE short literal line near the start of the stream;
       // keeping the last ~4KB is generous headroom without letting a chatty gate grow this buffer forever.
       const output = stderrTail + chunk.toString('utf8');
@@ -377,8 +429,9 @@ export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateSt
       stderrTail = output.slice(-4096);
       if (hasMarker) {
         markerSeen = true;
-        clearTimeout(timer);
-        timer = setTimeout(onTimeout('gate'), gateCeilingMs);
+        armGate();
+        // Whatever follows the first marker in this same chunk may already be a re-queue line.
+        scanLaterMarkers(output.slice(output.indexOf(GATE_STARTED_MARKER) + GATE_STARTED_MARKER.length));
         if (typeof onGateStarted === 'function') {
           try {
             onGateStarted();
