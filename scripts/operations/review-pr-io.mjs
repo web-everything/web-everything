@@ -496,9 +496,24 @@ export function carryTouchesChange(changed, oldLine, newLine) {
   return hit(changed.old) || hit(changed.new);
 }
 
-/** Is `file` a plain file at `ref`? A missing path, a directory or any lookup failure is `false` (fail-closed). */
+/**
+ * The repo-relative path a finding's free-text `file` cites, exactly as written — or `null` when it is not a canonical
+ * repo path. A trailing `:line[:col]` is dropped; nothing else is rewritten. In particular a leading `a/` or `b/` is
+ * NOT a diff prefix here (`a/parser.mjs` can be a real directory, distinct from `parser.mjs`, so stripping it could
+ * check a different file than the one cited), and `.`/`..`/empty segments, a leading `/` or a backslash are refused
+ * outright — the contents API may normalize them onto a file the compare DID list, so an alias could read as
+ * "absent from the compare, therefore unchanged". `null` never carries: it only costs a fresh ruling. PURE.
+ */
+export function canonicalRepoPath(raw) {
+  const path = String(raw ?? '').trim().replace(/:\d+(?::\d+)?$/, '');
+  if (!path || path.includes('\\')) return null;
+  return path.split('/').every(seg => seg !== '' && seg !== '.' && seg !== '..') ? path : null;
+}
+
+/** Is `file` a plain file at `ref`? A missing path, a non-canonical path, a directory or any lookup failure is `false` (fail-closed). */
 export function fileExistsAtRef(repo, ref, file) {
   try {
+    if (canonicalRepoPath(file) !== file) return false;
     const path = file.split('/').map(encodeURIComponent).join('/');
     const got = JSON.parse(execFileSyncThrottled('gh', ['api', `repos/${repo}/contents/${path}?ref=${ref}`],
       { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }));
@@ -518,7 +533,7 @@ export function fileExistsAtRef(repo, ref, file) {
  * PURE — the `gh` calls stay in the caller, so this parser is directly table-testable (#4315 review).
  */
 export function changedLinesFromCompare(files, file, { isRepoFile } = {}) {
-  if (!Array.isArray(files)) return null;
+  if (!Array.isArray(files) || canonicalRepoPath(file) !== file) return null;
   const entry = files.find(f => f.filename === file || f.previous_filename === file);
   if (!entry) {
     if (files.length >= 300 || typeof isRepoFile !== 'function') return null;
@@ -785,8 +800,8 @@ export function createReviewPrSinks({
               if (!match) continue;
               let changed;
               try {
-                const file = String(f.finding.file ?? '').trim().replace(/^(?:\.\/|[ab]\/)/, '').replace(/:\d+(?::\d+)?$/, '');
-                changed = await changedLines(record.repo, match.from.head, record.head, file);
+                const file = canonicalRepoPath(f.finding.file);
+                changed = file ? await changedLines(record.repo, match.from.head, record.head, file) : null;
               } catch { changed = null; }
               // Both sides are required: a bare Set cannot say which coordinate space it is in, so it is unknown.
               if (!(changed?.old instanceof Set && changed?.new instanceof Set)) continue;

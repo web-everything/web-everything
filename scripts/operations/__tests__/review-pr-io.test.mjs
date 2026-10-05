@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  PR_VIEW_FIELDS, carryTouchesChange, changedLinesFromCompare, comparedFiles, createReviewPrReader, createReviewPrSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
+  PR_VIEW_FIELDS, canonicalRepoPath, carryTouchesChange, changedLinesFromCompare, comparedFiles, createReviewPrReader, createReviewPrSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
   resolveSubjectCheckout,
 } from '../review-pr-io.mjs';
@@ -1069,6 +1069,39 @@ describe('changedLinesFromCompare (the compare payload → changed old-side and 
   });
 });
 
+describe('canonicalRepoPath (a finding\'s free-text file → the exact repo path it cites, or null)', () => {
+  it.each([
+    ['a plain path', 'src/x.mjs', 'src/x.mjs'],
+    ['a trailing :line', 'src/x.mjs:12', 'src/x.mjs'],
+    ['a trailing :line:col', 'src/x.mjs:12:3', 'src/x.mjs'],
+    ['surrounding whitespace', '  x.mjs ', 'x.mjs'],
+    ['a leading a/ is a real path segment, never stripped', 'a/parser.mjs', 'a/parser.mjs'],
+    ['a leading b/ is a real path segment, never stripped', 'b/parser.mjs', 'b/parser.mjs'],
+    ['a dot-segment in the middle', 'src/../x.mjs', null],
+    ['a leading ..', '../x.mjs', null],
+    ['a leading ./', './x.mjs', null],
+    ['a trailing /.', 'x.mjs/.', null],
+    ['a bare dot', '.', null],
+    ['an empty segment', 'src//x.mjs', null],
+    ['a leading slash', '/x.mjs', null],
+    ['a trailing slash', 'src/', null],
+    ['a backslash', 'src\\..\\x.mjs', null],
+    ['empty', '', null],
+    ['whitespace only', '   ', null],
+    ['undefined', undefined, null],
+    ['a non-string', 42, '42'],
+  ])('%s', (_name, raw, expected) => {
+    expect(canonicalRepoPath(raw)).toBe(expected);
+  });
+});
+
+describe('changedLinesFromCompare refuses a non-canonical cited path', () => {
+  const files = [{ filename: 'x.mjs', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b\n' }];
+  it.each(['src/../x.mjs', './x.mjs', 'a//x.mjs', '/x.mjs'])('%s is unknown even when it resolves', (cited) => {
+    expect(changedLinesFromCompare(files, cited, { isRepoFile: () => true })).toBeNull();
+  });
+});
+
 describe('comparedFiles (a compare speaks for old→new only when old is an ancestor of new)', () => {
   const files = [{ filename: 'x.mjs', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b\n' }];
   it.each([
@@ -1252,6 +1285,51 @@ describe('#4315 durable referral effects', () => {
     const latest = await carryScenario(h, { oldLine: 12, newLine: 12 });
     if (carries) { expect(latest.carried).toHaveLength(1); expect(h.judge).not.toHaveBeenCalled(); }
     else { expect(latest.carried).toBeUndefined(); expect(h.judge).toHaveBeenCalledOnce(); }
+  });
+
+  // The cited path is checked EXACTLY as written. A dot-segment alias of a changed file (`src/../x.mjs`) is absent from
+  // the compare, which lists `x.mjs`, so it must not read as "unchanged" even if the contents API would resolve it.
+  it.each([
+    ['a dot-segment alias of a changed file', 'src/../x.mjs'],
+    ['a leading ./ alias of a changed file', './x.mjs'],
+    ['a trailing-dot alias of a changed file', 'x.mjs/.'],
+    ['an empty-segment alias of a changed file', 'src//x.mjs'],
+  ])('does not carry after checking a non-canonical path: %s', async (_name, cited) => {
+    const readCompare = () => ({ status: 'ahead', files: [{ filename: 'x.mjs', status: 'modified', patch: '@@ -10,3 +10,3 @@\n-a\n+b\n' }] });
+    const h = harness({ failure: 'omitted', readCompare, fileExists: () => true });
+    h.payload.referrals[0].original.file = cited;
+    const latest = await carryScenario(h, { oldLine: 12, newLine: 12 });
+    expect(latest.carried).toBeUndefined();
+    expect(h.judge).toHaveBeenCalledOnce();
+  });
+
+  // `a/parser.mjs` can be a real directory distinct from `parser.mjs`; stripping the prefix checked the wrong file.
+  it('does not carry after checking a different file with a diff-prefix-shaped path', async () => {
+    const readCompare = () => ({ status: 'ahead', files: [{ filename: 'a/parser.mjs', status: 'modified', patch: '@@ -10,3 +10,3 @@\n-a\n+b\n' }] });
+    const seen = [];
+    const h = harness({ failure: 'omitted', readCompare, fileExists: (_repo, _ref, path) => { seen.push(path); return path === 'a/parser.mjs' || path === 'parser.mjs'; } });
+    h.payload.referrals[0].original.file = 'a/parser.mjs';
+    const latest = await carryScenario(h, { oldLine: 12, newLine: 12 });
+    expect(latest.carried).toBeUndefined();
+    expect(h.judge).toHaveBeenCalledOnce();
+    expect(seen).not.toContain('parser.mjs');
+  });
+
+  it('a diff-prefix-shaped path that is not itself a repo file never resolves to the stripped name', async () => {
+    const readCompare = () => ({ status: 'ahead', files: [{ filename: 'parser.mjs', status: 'modified', patch: '@@ -10,3 +10,3 @@\n-a\n+b\n' }] });
+    const h = harness({ failure: 'omitted', readCompare, fileExists: (_repo, _ref, path) => path === 'parser.mjs' });
+    h.payload.referrals[0].original.file = 'b/parser.mjs';
+    const latest = await carryScenario(h, { oldLine: 12, newLine: 12 });
+    expect(latest.carried).toBeUndefined();
+    expect(h.judge).toHaveBeenCalledOnce();
+  });
+
+  it('still carries a canonical path with a :line suffix that no compare entry touched', async () => {
+    const readCompare = () => ({ status: 'ahead', files: [{ filename: 'y.mjs', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b\n' }] });
+    const h = harness({ failure: 'omitted', readCompare, fileExists: () => true });
+    h.payload.referrals[0].original.file = 'src/x.mjs:12';
+    const latest = await carryScenario(h, { oldLine: 12, newLine: 12 });
+    expect(latest.carried).toHaveLength(1);
   });
 
   it('a path that exists at only one head is never proven unchanged', async () => {
