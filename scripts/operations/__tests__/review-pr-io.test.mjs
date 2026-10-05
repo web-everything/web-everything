@@ -1221,7 +1221,7 @@ describe('#4315 durable referral effects', () => {
   // The carry's changed-lines seam answers `{ old, new }` line sets (or null for unknown) — a bare Set is unknown.
   const lineSets = ({ old = [], new: added = [] } = {}) => ({ old: new Set(old), new: new Set(added) });
   function harness({ result = 'not-real', failure, env = {}, readCompare, fileExists = () => true,
-    readChangedLines = readCompare ? undefined : () => lineSets() } = {}) {
+    readChangedLines = readCompare ? undefined : () => lineSets(), cardOk } = {}) {
     const head = 'a'.repeat(40), trace = [], lines = [];
     let posts = 0;
     const state = { headRefOid: head, body: '<!-- authored-by-actor: author -->', comments: [], labels: ['review:pending'] };
@@ -1252,7 +1252,7 @@ describe('#4315 durable referral effects', () => {
         })) } };
     });
     const make = () => createReviewPrSinks({ root, env, readChangedLines, readCompare, fileExists, labelProvider: provider, referralJudge: judge,
-      mirrorReferral: record => trace.push(`mirror:${record.attempted}`), out: line => lines.push(line), cardReadable: () => failure !== 'card' });
+      mirrorReferral: record => trace.push(`mirror:${record.attempted}`), out: line => lines.push(line), cardReadable: () => cardOk ?? failure !== 'card' });
     return { state, trace, lines, payload, judge, make, provider };
   }
 
@@ -1563,6 +1563,30 @@ describe('#4315 durable referral effects', () => {
     const state = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
     expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toHaveLength(1);
     expect(state.pending).not.toContain(current.referrals[0].key);
+  });
+
+  // An operator `card` ruling discharges a finding only while its card is readable. Carrying one whose card is gone
+  // would persist a `carried` entry the gate keeps pending, while `liveReferrals` drops the finding from the judge:
+  // a parked review nobody (including the automated attempt) is positioned to move.
+  it.each([
+    ['a readable card carries', true, true],
+    ['an unreadable card is never carried; the current finding is judged', false, false],
+  ])('an earlier operator card ruling: %s', async (_name, cardOk, carries) => {
+    const h = harness({ failure: 'omitted', cardOk, readChangedLines: () => lineSets() });
+    h.payload.referrals[0].original.line = 12;
+    const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
+    const current = { ...old, head: h.state.headRefOid, runId: 'current',
+      reviewer: mandatoryReferralReviewer('current'), attempted: false };
+    h.state.comments.push({ body: renderReferralRecord(current), author: { login: 'web-everything' } });
+    h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+      version: 1, repo: old.repo, pr: old.pr, head: old.head, actor: 'chalbert', channel: 'test',
+      reason: 'filed as a card', at: '2026-10-04T12:00:00Z', clearerId: '',
+      rulings: [{ runId: old.runId, key: old.referrals[0].key, result: 'card', card: 'we:backlog/7-filed.md' }],
+    }) });
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const latest = readReferralRecords(h.state.comments).records.find(r => r.runId === 'current');
+    if (carries) { expect(latest.carried).toHaveLength(1); expect(h.judge).not.toHaveBeenCalled(); }
+    else { expect(latest.carried).toBeUndefined(); expect(h.judge).toHaveBeenCalledOnce(); }
   });
 
   function seedReferrals(h, seats, head = 'b'.repeat(40), rule = () => []) {

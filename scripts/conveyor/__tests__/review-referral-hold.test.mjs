@@ -181,6 +181,27 @@ describe('live release (parity with the gate)', () => {
       expect(hold(p) === null).toBe(gate.pending.length === 0);
     }
   });
+
+  // The hold omits the gate's `seatDisabled` (the header of referral-live-context.mjs says that only ever errs toward
+  // holding). Pin it: a seat-disabled retirement the gate honours never lets the hold release what the gate holds.
+  it('never releases what the gate holds, even when only the gate retires a disabled seat', () => {
+    const p = withRecord(record());
+    const gate = seatDisabled => mandatoryReferralState(p.comments, { repo, pr: 3481, head, body: p.body,
+      createdAt: p.createdAt, cardReadable: referralCardReadable, ...(seatDisabled ? { seatDisabled } : {}) });
+    expect(gate().pending).toEqual([key]);
+    expect(hold(p)).not.toBeNull();
+    // The gate alone retires the unruled finding; the hold keeps it pending (the documented over-hold, never an under-hold).
+    expect(gate(seat => seat === 'judge').pending).toEqual([]);
+    expect(hold(p)).not.toBeNull();
+  });
+
+  // Each conjunct of the live-release condition has a negative twin: a cleared gate alone does not release a hold
+  // that is inside its persistence-failure retry budget.
+  it('keeps the 15/30/60-minute retry budget when the run failed to persist, even with a cleared live gate', () => {
+    const cleared = withRecord(ruled('block'));
+    expect(hold(cleared)).toBeNull();
+    expect(hold(cleared, [evidence({ failure: true })])).toMatchObject({ persistenceFailed: true, retryAt: at + REFERRAL_RETRY_MS[0] });
+  });
 });
 
 describe('persistence failure retry budget', () => {
