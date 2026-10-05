@@ -3528,4 +3528,3 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
     }
   });
 });
-
