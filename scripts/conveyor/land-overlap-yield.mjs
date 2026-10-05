@@ -24,6 +24,7 @@
  *      fixed from the settings value in effect AT `readyAt(X)` (derived from the tracked config's git history,
  *      never live-recomputed), so neither a drain restart nor an operator widening the window mid-trial can
  *      resurrect an already-expired X ({@link windowMsAtLabelTime}).
+ *   7. A Y whose required check concluded red is skipped (env-only opt-out).
  *
  * PURITY SPLIT (mirrors `we:scripts/readiness/file-locks.mjs` / `we:scripts/lib/target-registry.mjs`): the
  * DECISION logic ({@link overlapYieldWaits}, {@link windowMsAtLabelTime}, {@link validateOverlapYieldConfig},
@@ -90,22 +91,22 @@ export function validateOverlapYieldConfig(raw) {
 /**
  * Full-replace resolution of a one-off CLI/env override against the settings file (#4308 Override precedence
  * — "fully REPLACE ... not merged field-by-field"). Pure.
- * @param {{fileConfig:{enabled:boolean, windowMinutes:number}, overrides?:{enable:(boolean|null), windowMinutes:(number|null)}}} o
+ * @param {{fileConfig:{enabled:boolean, windowMinutes:number}, overrides?:{enable:(boolean|null), windowMinutes:(number|null), skipRed?:(boolean|null)}}} o
  */
 export function resolveOverlapYieldSettings({ fileConfig, overrides = {} } = {}) {
   const base = fileConfig || DEFAULT_OVERLAP_YIELD_CONFIG;
   const enabled = overrides.enable != null ? !!overrides.enable : base.enabled;
   const windowMinutes = overrides.windowMinutes != null ? overrides.windowMinutes : base.windowMinutes;
-  return { enabled, windowMinutes };
+  return { enabled, windowMinutes, skipRed: overrides.skipRed ?? true };
 }
 
 /**
  * Parse the drain CLI's one-off overrides: `--overlap-yield` / `--no-overlap-yield` (force enable/disable),
- * `--overlap-yield-window=<minutes>`, env `WE_DRAIN_OVERLAP_YIELD=0|1`. A flag beats the env var; passing both
- * enable+disable flags, or an env value other than `0`/`1`, is a usage error (throws) — #4308 Override
+ * `--overlap-yield-window=<minutes>`, env `WE_DRAIN_OVERLAP_YIELD=0|1` and `WE_DRAIN_YIELD_SKIP_RED=0|1`.
+ * A flag beats the enable env var; passing both enable+disable flags, or an env value other than `0`/`1`, is a usage error (throws) — #4308 Override
  * precedence. Pure.
  * @param {{argv?:string[], env?:object}} o
- * @returns {{enable:(boolean|null), windowMinutes:(number|null)}}
+ * @returns {{enable:(boolean|null), windowMinutes:(number|null), skipRed:(boolean|null)}}
  */
 export function parseOverlapYieldOverrides({ argv = [], env = {} } = {}) {
   const hasEnable = argv.includes('--overlap-yield');
@@ -126,7 +127,14 @@ export function parseOverlapYieldOverrides({ argv = [], env = {} } = {}) {
     if (!Number.isFinite(n) || n <= 0) throw new Error(`usage: --overlap-yield-window expects a positive number of minutes, got ${JSON.stringify(raw)}`);
     windowMinutes = n;
   }
-  return { enable, windowMinutes };
+  let skipRed = null;
+  if (env.WE_DRAIN_YIELD_SKIP_RED !== undefined) {
+    const raw = String(env.WE_DRAIN_YIELD_SKIP_RED);
+    if (raw === '1') skipRed = true;
+    else if (raw === '0') skipRed = false;
+    else throw new Error(`usage: WE_DRAIN_YIELD_SKIP_RED must be "0" or "1", got ${JSON.stringify(raw)}`);
+  }
+  return { enable, windowMinutes, skipRed };
 }
 
 // ───────────────────────── pure: the rule itself ─────────────────────────
@@ -187,32 +195,30 @@ function dependsOnCandidate(y, x) {
 }
 
 /**
- * THE pure rule (#4308 rules 1-6). No fs, no network, no clock — every timestamp is an argument.
+ * THE pure rule (#4308 rules 1-7). No fs, no network, no clock — every timestamp is an argument.
  *
  * `candidates` are this pass's READY PRs (the X side, i.e. this pass's `ready` set before the overlap check).
  * `openPrs` is the universe of open PRs that might be a yield TARGET (the Y side; `candidates` may also appear
  * in it — a candidate is itself an open PR). Both use the same snapshot-row shape: `{number, repo,
  * baseRefName, isDraft, labels, files:[{path,additions,deletions}], filesComplete, readyAtMs, windowMs, item,
- * exempt, dependsOn:Set}`. `readyAtMs`/`windowMs` are PRECOMPUTED by the caller's IO layer (see
+ * exempt, dependsOn:Set, requiredCheckRed:boolean}`. `readyAtMs`/`windowMs` are PRECOMPUTED by the caller's IO layer (see
  * {@link computeOverlapContext}) — this function only ever compares them; it never fetches them.
  *
- * `ignoreBudget` runs rules 1-5 only (skips rule 6) — the cheap TRIAL pass {@link computeOverlapContext} uses
+ * `ignoreBudget` runs rules 1-5 and 7 only (skips rule 6) — the cheap TRIAL pass {@link computeOverlapContext} uses
  * to discover which candidates need a real (IO-backed) `readyAtMs`/`windowMs` at all, so the label-time read
  * happens only "per yielding candidate" (#4308 Data), never for every ready PR.
  *
- * @param {{candidates:object[], openPrs:object[], nowMs:number, ignoreBudget?:boolean}} o
+ * @param {{candidates:object[], openPrs:object[], nowMs:number, ignoreBudget?:boolean, skipRed?:boolean, skips?:(Map|null)}} o
  * @returns {Map<string, {yieldTo:number, repo:(string|null), files:string[], untilMs:number, windowMinutes:(number|null)}>}
  *   keyed by {@link overlapRowKey}.
  */
-export function overlapYieldWaits({ candidates, openPrs, nowMs, ignoreBudget = false } = {}) {
+export function overlapYieldWaits({ candidates, openPrs, nowMs, ignoreBudget = false, skipRed = true, skips = null } = {}) {
   const out = new Map();
   const xs = Array.isArray(candidates) ? candidates : [];
   const ys = Array.isArray(openPrs) ? openPrs : [];
   for (const x of xs) {
     if (!x || x.exempt === true) continue; // rule 5
     if (x.filesComplete === false) continue; // rule 2 — an unknown file list never yields
-    if (!ignoreBudget && Number.isFinite(x.readyAtMs) && Number.isFinite(x.windowMs) && Number.isFinite(nowMs)
-      && nowMs >= x.readyAtMs + x.windowMs) continue; // rule 6 — past its own budget
     let best = null;
     for (const y of ys) {
       if (!y) continue;
@@ -227,8 +233,21 @@ export function overlapYieldWaits({ candidates, openPrs, nowMs, ignoreBudget = f
       if (!overlappingFiles(x, y).length) continue; // rule 2 — must share a changed file
       if (!outranksForLand(y, x)) continue; // rule 3
       if (dependsOnCandidate(y, x)) continue; // rule 4
+      if (skipRed && y.requiredCheckRed === true) { // rule 7 — informational, independent of rule 6
+        if (skips instanceof Map) {
+          const key = overlapRowKey(x);
+          const entries = skips.get(key) || [];
+          if (!entries.some((entry) => entry.pr === Number(y.number))) {
+            entries.push({ pr: Number(y.number), repo: x.repo ?? null, reason: 'red-ci', token: `overlap-yield-skipped:#${y.number}(red-ci)` });
+          }
+          skips.set(key, entries);
+        }
+        continue;
+      }
       if (!best || outranksForLand(y, best)) best = y;
     }
+    if (!ignoreBudget && Number.isFinite(x.readyAtMs) && Number.isFinite(x.windowMs) && Number.isFinite(nowMs)
+      && nowMs >= x.readyAtMs + x.windowMs) continue; // rule 6 — past its own budget
     if (best) {
       out.set(overlapRowKey(x), {
         yieldTo: Number(best.number),
@@ -464,13 +483,13 @@ export function readyToMergeLabelTimeMs({ repo, num, sha, exec = execFileSyncThr
  * `replan`, not hoist it out of the cascade.
  *
  * Two passes over the pure {@link overlapYieldWaits}: a cheap TRIAL (`ignoreBudget: true`) finds which
- * candidates would yield at all under rules 1-5 (no IO needed for those); only for THOSE candidates does it do
+ * candidates would yield at all under rules 1-5 and 7 (no IO needed for those); only for THOSE candidates does it do
  * the real IO — the label-time read (cached by head sha) and the git-history-backed window — before the REAL
  * pass that also enforces rule 6. A candidate whose label time cannot be read is marked `exempt` for the real
  * pass (never lets a data gap yield forever — the safe direction is "cannot compute a budget ⇒ don't yield").
  * @param {{candidateRows:object[], openPrRows:object[], nowMs?:number, exec?:Function, ghExec?:Function,
- *   cwd?:string, overrides?:{enable:(boolean|null), windowMinutes:(number|null)}}} o
- * @returns {{waits:Map, settings:{enabled:boolean, windowMinutes:number}}}
+ *   cwd?:string, overrides?:{enable:(boolean|null), windowMinutes:(number|null), skipRed?:(boolean|null)}}} o
+ * @returns {{waits:Map, skips:Map, settings:{enabled:boolean, windowMinutes:number, skipRed:boolean}}}
  */
 export function computeOverlapContext({
   candidateRows, openPrRows, nowMs = Date.now(), exec = execFileSync, ghExec = execFileSyncThrottled,
@@ -478,11 +497,12 @@ export function computeOverlapContext({
 } = {}) {
   const fileConfig = loadOverlapYieldConfig({});
   const settings = resolveOverlapYieldSettings({ fileConfig, overrides });
-  if (!settings.enabled) return { waits: new Map(), settings };
+  if (!settings.enabled) return { waits: new Map(), skips: new Map(), settings };
   const xs = Array.isArray(candidateRows) ? candidateRows : [];
   const ys = Array.isArray(openPrRows) ? openPrRows : [];
-  const trial = overlapYieldWaits({ candidates: xs, openPrs: ys, nowMs, ignoreBudget: true });
-  if (!trial.size) return { waits: new Map(), settings };
+  const trialSkips = new Map();
+  const trial = overlapYieldWaits({ candidates: xs, openPrs: ys, nowMs, ignoreBudget: true, skipRed: settings.skipRed, skips: trialSkips });
+  if (!trial.size) return { waits: new Map(), skips: trialSkips, settings };
   const configAt = gitHistoryConfigAtReader({ exec, cwd });
   const enriched = xs.map((x) => {
     if (!trial.has(overlapRowKey(x))) return x;
@@ -501,6 +521,7 @@ export function computeOverlapContext({
       });
     return { ...x, readyAtMs, windowMs };
   });
-  const waits = overlapYieldWaits({ candidates: enriched, openPrs: ys, nowMs });
-  return { waits, settings };
+  const skips = new Map();
+  const waits = overlapYieldWaits({ candidates: enriched, openPrs: ys, nowMs, skipRed: settings.skipRed, skips });
+  return { waits, skips, settings };
 }

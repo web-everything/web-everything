@@ -71,7 +71,9 @@
  *   node scripts/merge-ai-prs.mjs --label=ready-to-merge --no-overlap-yield         # force-disable for this run
  *   node scripts/merge-ai-prs.mjs --label=ready-to-merge --overlap-yield-window=20  # override the window (minutes)
  * (also `WE_DRAIN_OVERLAP_YIELD=1|0`; a CLI flag beats the env var; `--overlap-yield`+`--no-overlap-yield`
- * together, or a non-`0`/`1` env value, is a usage error.) See `we:scripts/conveyor/land-overlap-yield.mjs`.
+ * together, or a non-`0`/`1` env value, is a usage error.)
+ * `WE_DRAIN_YIELD_SKIP_RED=1|0` defaults to 1; 0 restores the old always-yield behaviour.
+ * See `we:scripts/conveyor/land-overlap-yield.mjs`.
  *
  * Usage:
  *   node scripts/merge-ai-prs.mjs --dry-run            # list every open PR + the merge/skip verdict, merge NOTHING
@@ -1890,7 +1892,7 @@ const OVERLAP_FILES_PAGE_CAP = 100;
  * {@link overlapRowKey} on an ALREADY-normalized row — never re-inline the `${repo||''}#${num}` template.
  * @returns {{candidateRows:object[], openPrRows:object[]}}
  */
-export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPrKeys = new Set(), localSlug = null } = {}) {
+export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPrKeys = new Set(), localSlug = null, requiredCheck = 'test' } = {}) {
   const verdictByKey = new Map();
   for (const v of (Array.isArray(verdicts) ? verdicts : [])) verdictByKey.set(overlapRowKey({ repo: v.repo || localSlug, number: v.num }), v);
   const rowsByKey = new Map();
@@ -1910,7 +1912,7 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
           number: p.number, repo: normalizedRepo, baseRefName: p.baseRefName ?? null, isDraft: !!p.isDraft,
           labels: Array.isArray(p.labels) ? p.labels : [], files, filesComplete: files.length < OVERLAP_FILES_PAGE_CAP,
           readyAtMs: null, windowMs: null, headSha: v?.headSha ?? p.headRefOid ?? null,
-          item: v?.item ?? null, exempt: false,
+          item: v?.item ?? null, exempt: false, requiredCheckRed: isRequiredCheckFailed(p, requiredCheck),
           dependsOn: new Set([...(v?.blockedBy || []), ...(v?.stackParents || []), ...bodyDeps]),
         });
       }
@@ -1952,7 +1954,7 @@ export function prepareDrainVerdicts({ listings, repos = [], onlyPr = null, only
  * Pure.
  * @returns {{prsByRepo:Map, verdicts:Array, carrierHealth:Map, plan:{ready:Array, deferred:Array, staleLandedOpenItems:Array}}}
  */
-export function planDrainPass({ verdicts = null, listings = null, openPrContext = {}, repos = [], onlyPr = null, onlyRepo = null, readOf, requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null, candidateHeldByKey = null, landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), overlapContext = null } = {}) {
+export function planDrainPass({ verdicts = null, listings = null, openPrContext = {}, repos = [], onlyPr = null, onlyRepo = null, readOf, requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null, candidateHeldByKey = null, landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), overlapContext = null, overlapSkips = null } = {}) {
   let prsByRepo = null;
   let vs = verdicts;
   if (!Array.isArray(vs)) {
@@ -1974,7 +1976,7 @@ export function planDrainPass({ verdicts = null, listings = null, openPrContext 
   // `landedThisPass` by construction and can never change an answer: the tests would pass (they hand-seed the set)
   // while production behaviour stayed byte-identical. The live derivation belongs in the CASCADE, against refs
   // that ACTUALLY merged — see `deriveCoupleIncomplete`. The disjointness/reachability test pins this.
-  const plan = planLabelDrain(vs, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: ctx.openItems, contextComplete: !!ctx.contextComplete, isWeRepo: isLocalRepo, overlapContext, overlapLocalSlug: localSlug });
+  const plan = planLabelDrain(vs, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: ctx.openItems, contextComplete: !!ctx.contextComplete, isWeRepo: isLocalRepo, overlapContext, overlapSkips, overlapLocalSlug: localSlug });
   return { prsByRepo, verdicts: vs, carrierHealth, plan };
 }
 
@@ -2061,10 +2063,10 @@ export function isConfirmSweepSettled({ merged = 0, pendingRebased = 0, consider
  * orphan the per-carrier gate structurally misses (an unreadable/unlisted carrier has no `manifestRefs` to key a
  * join on). #xc7p3q9 (R2) — a verdict's `waitOn` is NEVER allowed to name its OWN item (a self-referential wait is
  * structurally unsatisfiable — the livelock); such an edge is stripped.
- * @param {{landedThisPass?:Set, provenOnMain?:Set, coupleIncomplete?:Set, extraOpenItems?:Iterable<number|string>, contextComplete?:boolean, isWeRepo?:function, overlapContext?:(Map|null), overlapLocalSlug?:(string|null)}} [proof]  the proof bag: positive proof-of-land sets plus (#3004) the NEGATIVE `coupleIncomplete` counter-evidence set (all `asItemId`-keyed). `overlapContext` (#4308) is `null` (every caller/test before #4308, unchanged behaviour) or a PRECOMPUTED `Map<string,{yieldTo,repo,files,untilMs,windowMinutes}>` keyed by `we:scripts/conveyor/land-overlap-yield.mjs#overlapRowKey` (`` `${repo||''}#${num}` `` — never a bare PR number, which collides across repos) — the caller's IO layer (`computeOverlapContext`) builds it fresh every planning pass (#4308 Window "read fresh at the start of every planning pass"); this function only ever CONSUMES it, never fetches it. `overlapLocalSlug` MUST be the same `localSlug` the caller's `buildOverlapRows` normalized every row's `repo` with (2026-09-29 review finding) — a candidate's own `c.repo` can be `null` for the local repo while the Map's keys were built against the normalized slug; omitting this reintroduces the exact key mismatch that silently disabled the feature for every local-repo candidate.
+ * @param {{landedThisPass?:Set, provenOnMain?:Set, coupleIncomplete?:Set, extraOpenItems?:Iterable<number|string>, contextComplete?:boolean, isWeRepo?:function, overlapContext?:(Map|null), overlapSkips?:(Map|null), overlapLocalSlug?:(string|null)}} [proof]  the proof bag: positive proof-of-land sets plus (#3004) the NEGATIVE `coupleIncomplete` counter-evidence set (all `asItemId`-keyed). `overlapContext` (#4308) is `null` (every caller/test before #4308, unchanged behaviour) or a PRECOMPUTED `Map<string,{yieldTo,repo,files,untilMs,windowMinutes}>` keyed by `we:scripts/conveyor/land-overlap-yield.mjs#overlapRowKey` (`` `${repo||''}#${num}` `` — never a bare PR number, which collides across repos) — the caller's IO layer (`computeOverlapContext`) builds it fresh every planning pass (#4308 Window "read fresh at the start of every planning pass"); this function only ever CONSUMES it, never fetches it. `overlapLocalSlug` MUST be the same `localSlug` the caller's `buildOverlapRows` normalized every row's `repo` with (2026-09-29 review finding) — a candidate's own `c.repo` can be `null` for the local repo while the Map's keys were built against the normalized slug; omitting this reintroduces the exact key mismatch that silently disabled the feature for every local-repo candidate.
  * @returns {{ready:Array, deferred:Array<{num,item,waitOn:Array<number|string>}>, staleLandedOpenItems:Array<number|string>}}  ready is ordered (item asc, then PR#); staleLandedOpenItems = items proven landed yet still named by an open PR (#999/xq985wu F2 stale-PR diagnostic).
  */
-export function planLabelDrain(candidates, { landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), extraOpenItems = null, contextComplete = true, isWeRepo = () => false, overlapContext = null, overlapLocalSlug = null } = {}) {
+export function planLabelDrain(candidates, { landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), extraOpenItems = null, contextComplete = true, isWeRepo = () => false, overlapContext = null, overlapSkips = null, overlapLocalSlug = null } = {}) {
   const list = Array.isArray(candidates) ? candidates : [];
   // Every candidate still in play keeps its item "open" — a red/skip blocker must still defer its dependents,
   // so the open set is ALL candidate items, not just the mergeable ones. (A merged item is removed by the
@@ -2129,9 +2131,11 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
   // one place with both sets in scope) and returned for the caller to name the holding PR.
   const staleLandedOpenItems = [...openItems].filter((id) => provenLanded(id));
   for (const c of list) {
+    const skipEntries = overlapSkips instanceof Map ? overlapSkips.get(overlapRowKey({ repo: c.repo || overlapLocalSlug, number: c.num })) : null;
+    const skipInfo = skipEntries?.length ? { overlapYieldSkipped: skipEntries.map((entry) => entry.token) } : {};
     if (c.requiredCheckReadError) {
       deferred.push({ num: c.num, repo: c.repo, item: c.item, headSha: c.headSha ?? null,
-        waitOn: ['required-check-read'], reason: c.requiredCheckReadError });
+        waitOn: ['required-check-read'], reason: c.requiredCheckReadError, ...skipInfo });
       continue;
     }
     if (c.decision !== 'merge') continue; // @merge-gate-exempt builds the merge-ORDERING lists (ready/deferred); a held PR is `skip` and correctly not ordered for landing — it must not join the merge cascade
@@ -2162,7 +2166,7 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
     // #xc7p3q9 (R2) — a verdict may NEVER waitOn its OWN item (a self-referential wait is structurally
     // unsatisfiable — the livelock). Strip any edge naming this verdict's own item.
     const waitOn = [...new Set([...blockWait, ...stackWait, ...coupleWait, ...blindWait, ...overlapWait])].filter((w) => c.item == null || String(w) !== String(c.item));
-    if (waitOn.length === 0) ready.push(c);
+    if (waitOn.length === 0) ready.push(skipEntries?.length ? { ...c, ...skipInfo } : c);
     else {
       // #xc7p3q9 (Fix 3) — a defer whose ONLY cause is a review-HELD carrier is flagged `heldCoupleOnly`
       // so idle accounting can treat such a pass as idle (a human hold will not clear by polling). A defer that
@@ -2177,7 +2181,7 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
       // "held ONLY by the couple", not merely "held by the couple among other things".
       const heldCoupleOnly = blockWait.length === 0 && stackWait.length === 0 && blindWait.length === 0 && overlapWait.length === 0 && coupleDeferred && (c.coupleDeferReason === 'held' || c.coupleHumanTerminal === true);
       deferred.push({
-        num: c.num, item: c.item, waitOn, ...(heldCoupleOnly ? { heldCoupleOnly: true } : {}),
+        num: c.num, item: c.item, waitOn, ...skipInfo, ...(heldCoupleOnly ? { heldCoupleOnly: true } : {}),
         ...(overlapEntry ? { overlapYield: { pr: overlapEntry.yieldTo, repo: c.repo ?? null, files: overlapEntry.files, untilMs: overlapEntry.untilMs, windowMinutes: overlapEntry.windowMinutes } } : {}),
         headSha: c.headSha ?? null,
       });
@@ -5140,13 +5144,25 @@ async function runCli() {
   // "read fresh at the start of every planning pass" (the Window section's own words) means the SETTINGS FILE,
   // not just this one pass's start — a long `--watch` must see a live disable/window edit on its very next
   // `replan`, not only the pass this closure was built in. `mergedPrKeys` starts empty (nothing has merged yet).
+  const overlapYieldSkips = [];
+  const overlapYieldSkipKeys = new Set();
   const logOverlapYields = (octx) => {
+    for (const [key, entries] of octx.skips) {
+      for (const entry of entries) {
+        const dedupeKey = `${key}#${entry.pr}`;
+        if (!overlapYieldSkipKeys.has(dedupeKey)) {
+          overlapYieldSkipKeys.add(dedupeKey);
+          overlapYieldSkips.push({ num: Number(key.slice(key.lastIndexOf('#') + 1)), repo: entry.repo, reason: entry.token, yieldTo: entry.pr });
+          if (!AS_JSON) process.stderr.write(`  ⏭ overlap-yield-skipped: ${key} did not yield to #${entry.pr} (red-ci) — required check failed\n`);
+        }
+      }
+    }
     if (AS_JSON) return;
     for (const [key, w] of octx.waits) {
       process.stderr.write(`  ⏳ overlap-yield: ${key} yields to #${w.yieldTo} (files: ${w.files.join(', ') || '(unknown)'}; window ${w.windowMinutes != null ? `${w.windowMinutes}m` : '?'}; until ${new Date(w.untilMs).toISOString()})\n`);
     }
   };
-  const overlapRows0 = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, mergedPrKeys: new Set(), localSlug });
+  const overlapRows0 = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, mergedPrKeys: new Set(), localSlug, requiredCheck: REQUIRED });
   const overlapCtx0 = computeOverlapContext({ candidateRows: overlapRows0.candidateRows, openPrRows: overlapRows0.openPrRows, overrides: overlapYieldOverrides });
   logOverlapYields(overlapCtx0);
   const preparedPass = planDrainPass({
@@ -5160,6 +5176,7 @@ async function runCli() {
     landedThisPass,
     provenOnMain,
     overlapContext: overlapCtx0.waits,
+    overlapSkips: overlapCtx0.skips,
   });
   // #xc7p3q9 — the ONE re-plan wiring (shared by the dry-run report and the live cascade): re-orders the joined+
   // stamped `verdicts` across merges, threading the SAME extraOpenItems + contextComplete + WE-repo predicate the
@@ -5173,10 +5190,10 @@ async function runCli() {
     // (openPrContext.prsByRepo is a pass-START snapshot and would otherwise still show a landed PR as open —
     // the same staleness #3004 documents elsewhere in this cascade).
     const mergedPrKeys = new Set(merged.map((m) => overlapRowKey({ repo: m.repo || localSlug, number: m.num })));
-    const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, localSlug });
+    const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, localSlug, requiredCheck: REQUIRED });
     const octx = computeOverlapContext({ candidateRows: rows.candidateRows, openPrRows: rows.openPrRows, overrides: overlapYieldOverrides });
     logOverlapYields(octx);
-    return planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, contextComplete: !!openPrContext.contextComplete, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapLocalSlug: localSlug });
+    return planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, contextComplete: !!openPrContext.contextComplete, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug });
   };
   const toMerge = verdicts.filter((v) => v.decision === 'merge'); // @merge-gate-exempt the FINAL set actually merged; a held PR is `decision:'skip'` and MUST be excluded here — this is the hard AND that never lands a held PR
   const skipped = verdicts.filter((v) => v.decision === 'skip' && !v.requiredCheckReadError);
@@ -5836,7 +5853,7 @@ async function runCli() {
   // goes to the formatter — it computes+appends the trailing `total=` itself; passing `timings` here would
   // print `total=` twice (once as an ordinary step, once as the formatter's own).
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length})\n`);
-  const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
+  const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
   return { result, merged, failedMerges, pendingRebased: pendingAll, deferred, duplicateIdsOnMain };
   }; // end sweepOnce
 
