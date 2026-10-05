@@ -361,6 +361,13 @@ it('every fixer stand-down call in the brief passes --who={{SESSION_SLUG}}', () 
   for (const call of calls) expect(call).toContain('--who={{SESSION_SLUG}}');
 });
 
+it('every fenced stand-down exit block in the brief also releases the fix claim with fix-end (PR #3945 review)', () => {
+  const blocks = [...readFileSync(BRIEF, 'utf8').matchAll(/```bash\n([\s\S]*?)```/g)].map((m) => m[1])
+    .filter((block) => block.includes('conveyor/stand-down.mjs'));
+  expect(blocks.length).toBeGreaterThanOrEqual(5);
+  for (const block of blocks) expect(block, block).toContain('conveyor/fix-procedure.mjs" fix-end');
+});
+
 
 describe('stand-down CLI releases only after a successful comment (#4897)', () => {
   it.each([
@@ -431,12 +438,12 @@ describe('load-flake holds', () => {
     expect(loadFlakeHolds([c])[0]).toMatchObject({ legacy: true, alt: { branch: 'lane/heavy-enforce-guard-fix-3932-alt', sha: 'ea104d91e' } });
   });
   it('holds until pushed or moved; red-again stays live; exhausted is terminal', () => {
-    const c = loadComment(buildLoadFlakeHoldComment({ head: 'old', alt: 'lane/fix-alt', altSha: '9202eee8a' }));
-    expect(loadFlakeHoldState({ comments: [c], headRefOid: 'old' }).live).toBe(true);
-    expect(loadFlakeHoldState({ comments: [c], headRefOid: 'new' }).live).toBe(false);
+    const c = loadComment(buildLoadFlakeHoldComment({ head: 'abc0001', alt: 'lane/fix-alt', altSha: '9202eee8a' }));
+    expect(loadFlakeHoldState({ comments: [c], headRefOid: 'abc0001' }).live).toBe(true);
+    expect(loadFlakeHoldState({ comments: [c], headRefOid: 'def0002' }).live).toBe(false);
     for (const result of ['pushed', 'red-again', 'exhausted']) {
       const comments = [c, loadComment(buildLoadFlakeResolvedComment({ altSha: '9202eee8a', result }), '2026-10-04T20:00:00Z')];
-      expect(loadFlakeHoldState({ comments, headRefOid: 'old' }).live).toBe(result === 'red-again');
+      expect(loadFlakeHoldState({ comments, headRefOid: 'abc0001' }).live).toBe(result === 'red-again');
       expect(countTerminalStandDowns(comments)).toBe(result === 'exhausted' ? 1 : 0);
     }
     expect(buildLoadFlakeHoldComment({ head: 'old' })).toContain('stand-down reason=gate-red');

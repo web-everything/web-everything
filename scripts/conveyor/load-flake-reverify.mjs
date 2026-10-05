@@ -10,6 +10,7 @@ import { runBounded } from '../lib/bounded-child.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
 import { loadFlakeResults, buildLoadFlakeResolvedComment } from './stand-down.mjs';
 import { loadFlakeHoldState } from './load-flake-hold.mjs';
+import { redactSecrets } from './ci-heal-mark.mjs';
 
 export function reverifyConfig(env = process.env, maxLoadPerCore) {
   const positive = (value, fallback) => {
@@ -35,7 +36,7 @@ export function planLoadFlakeReverify({ prs = [], load, cores, now, config = rev
     if (reds.length && now - Date.parse(reds.at(-1).createdAt) < config.cooloffMs) return [];
     return [{ pr, ...state, attempts: reds.length }];
   }).sort((a, b) => Date.parse(a.hold.createdAt) - Date.parse(b.hold.createdAt));
-  return candidates.length ? { candidate: candidates[0] } : { deferred: 'no-candidate' };
+  return candidates.length ? { candidate: candidates[0], candidates } : { deferred: 'no-candidate' };
 }
 
 export async function runLoadFlakeReverify({ repo = 'we', dryRun = false, config = reverifyConfig() } = {}, io = defaultReverifyIo()) {
@@ -57,8 +58,30 @@ export async function runLoadFlakeReverify({ repo = 'we', dryRun = false, config
       }) };
   }
   if (!plan.candidate || dryRun) return { ...plan, dryRun };
-  const { pr, hold, attempts } = plan.candidate;
-  const post = (result, detail = '') => io.comment(slug, pr.number, buildLoadFlakeResolvedComment({ altSha: hold.alt.sha, result, detail }));
+  // Take candidates oldest-first until one makes progress. A hold that cannot be worked right now (fix claim
+  // live, transient fetch failure) must never starve the younger holds behind it; a hold that can NEVER be worked
+  // is ended on the PR instead, so it stops being picked at all.
+  let firstError = null;
+  let lastDeferral = null;
+  for (const candidate of plan.candidates) {
+    try {
+      const out = await reverifyCandidate({ candidate, key, slug, config }, io);
+      if (!NON_PROGRESS.has(out.deferred)) return out;
+      lastDeferral = out;
+    } catch (e) {
+      firstError ??= e;
+    }
+  }
+  if (lastDeferral) return lastDeferral;
+  throw firstError;
+}
+
+/** Deferrals that leave the hold live and unchanged: the next candidate is tried instead of stopping here. */
+const NON_PROGRESS = new Set(['fix-claimed', 'hold-ended']);
+
+async function reverifyCandidate({ candidate, key, slug, config }, io) {
+  const { pr, hold, attempts } = candidate;
+  const post =(result, detail = '') => io.comment(slug, pr.number, buildLoadFlakeResolvedComment({ altSha: hold.alt.sha, result, detail }));
   const check = async () => {
     const live = await io.readPr(slug, pr.number);
     if (live.state !== 'OPEN' || live.headRefName !== pr.headRefName || live.headRefOid !== pr.headRefOid) {
@@ -73,7 +96,14 @@ export async function runLoadFlakeReverify({ repo = 'we', dryRun = false, config
   if (refusal) return refusal;
   if (attempts >= config.maxAttempts) { await post('exhausted'); return { result: 'exhausted' }; }
   // Legacy holds have no recorded head: the fresh discovery head is still required as an ancestor.
-  await io.prepare(slug, hold.alt.branch, pr.headRefName);
+  try {
+    await io.prepare(slug, hold.alt.branch, pr.headRefName);
+  } catch (e) {
+    // A deleted alt (or head) branch can never be pushed: end the hold. Any other fetch failure is transient and rethrown.
+    if (!/couldn't find remote ref/i.test(`${e?.stderr ?? ''}\n${e?.message ?? ''}`)) throw e;
+    await post('head-moved', 'The saved alt branch no longer exists on the remote, so it can no longer be pushed.');
+    return { deferred: 'alt-gone' };
+  }
   if (!await io.isAncestor(pr.headRefOid, hold.alt.sha)) {
     // The PR moved past the saved repair: end the hold so reconcile hands the PR back and this pass stops re-picking it.
     await post('head-moved', 'The saved alt commit is not a descendant of the PR head, so it can no longer be pushed.');
@@ -83,11 +113,17 @@ export async function runLoadFlakeReverify({ repo = 'we', dryRun = false, config
   const lane = await io.acquire(hold.alt.branch, pr.number, key);
   try {
     // Acquire must actually have checked out the saved commit, not a newer branch tip.
-    if (await io.head(lane.path) !== await io.resolveSha(hold.alt.sha, lane.path)) return { deferred: 'lane-head-mismatch' };
+    if (await io.head(lane.path) !== await io.resolveSha(hold.alt.sha, lane.path)) {
+      // The alt branch moved past the recorded sha (a re-push posts its own new hold): this hold can never be
+      // verified as recorded, so end it instead of re-picking it every sweep.
+      await post('head-moved', 'The saved alt branch moved past the recorded commit, so the recorded repair can no longer be verified.');
+      return { deferred: 'lane-head-mismatch' };
+    }
     const verification = await io.verify(lane.path);
     if (!verification.ok) {
       const result = attempts + 1 >= config.maxAttempts ? 'exhausted' : 'red-again';
-      await post(result, String(verification.summary ?? '').slice(-1500));
+      // Verify output is branch-authored text headed for a public comment: redact it, then cut.
+      await post(result, redactSecrets(verification.summary ?? '').slice(-1500));
       return { result };
     }
     refusal = await check();
@@ -98,6 +134,11 @@ export async function runLoadFlakeReverify({ repo = 'we', dryRun = false, config
   } finally {
     await io.release(lane, key);
   }
+}
+
+/** The branch under verify is fixer-authored code: run it without the daemon's GitHub App credentials or any token. */
+export function scrubVerifyEnv(env = process.env) {
+  return Object.fromEntries(Object.entries(env).filter(([k]) => !/^WE_GITHUB_APP_|TOKEN|SECRET|PASSWORD|PRIVATE_KEY|CREDENTIAL/i.test(k)));
 }
 
 export function defaultReverifyIo({ run = execFileSync, runVerification = runBounded, root = resolve(dirname(fileURLToPath(import.meta.url)), '../..') } = {}) {
@@ -121,7 +162,7 @@ export function defaultReverifyIo({ run = execFileSync, runVerification = runBou
     resolveSha: (sha, cwd) => command('git', ['rev-parse', `${sha}^{commit}`], { cwd }).trim(),
     verify: async (cwd) => {
       // Kill the entire verification process group on timeout before releasing its lane.
-      try { await runVerification(process.execPath, [resolve(root, 'scripts/verify-lane.mjs')], { cwd, timeoutMs: 40 * 60_000, maxBytes: 16 * 1024 * 1024 }); return { ok: true }; }
+      try { await runVerification(process.execPath, [resolve(root, 'scripts/verify-lane.mjs')], { cwd, env: scrubVerifyEnv(), timeoutMs: 40 * 60_000, maxBytes: 16 * 1024 * 1024 }); return { ok: true }; }
       catch (e) { return { ok: false, summary: `${e.stdout ?? ''}\n${e.stderr ?? ''}\n${e.message ?? ''}`.slice(-1500) }; }
     },
     push: (cwd, sha, branch) => command('git', ['push', 'origin', `${sha}:refs/heads/${branch}`], { cwd }),

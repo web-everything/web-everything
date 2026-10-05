@@ -104,3 +104,74 @@ describe('superseded legacy holds and moved heads (PR #3945 review)', () => {
     expect(io.acquire).not.toHaveBeenCalled();
   });
 });
+
+import { scrubVerifyEnv } from '../load-flake-reverify.mjs';
+import { loadFlakeHolds } from '../stand-down.mjs';
+describe('starvation, deleted alts and credentials (PR #3945 advisory)', () => {
+  // Two PRs; the oldest hold is #3881 (fixture default), the younger one is #3882 on its own alt.
+  function twoHolds() {
+    const { io, pr } = fixture();
+    const youngerHold = comment(buildLoadFlakeHoldComment({ head: 'ccc3333', alt: 'lane/other-alt', altSha: 'ddd4444' }), '2026-10-04T20:00:00Z');
+    const younger = { number: 3882, state: 'OPEN', headRefName: 'lane/other', headRefOid: 'ccc3333', comments: [youngerHold] };
+    io.listPrs.mockResolvedValue([pr, younger]);
+    io.readPr.mockImplementation(async (_slug, n) => (n === 3882 ? younger : pr));
+    return { io, pr, younger };
+  }
+  it('a moved alt branch ends its hold and the younger hold is not starved', async () => {
+    const { io } = twoHolds();
+    io.head.mockImplementation((path) => 'moved-tip'); // lane checked out a newer tip than the recorded sha
+    io.resolveSha.mockImplementation((sha) => sha);
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'lane-head-mismatch' });
+    expect(io.comment.mock.calls[0][0]).toBe('web-everything/web-everything');
+    expect(io.comment.mock.calls[0][1]).toBe(3881);
+    expect(io.comment.mock.calls[0][2]).toContain('result=head-moved');
+    // The ended hold no longer leads the plan: the next sweep picks the younger hold.
+    const { pr, younger } = twoHolds();
+    const ended = { ...pr, comments: [...pr.comments, comment(io.comment.mock.calls[0][2], '2026-10-04T22:00:01Z')] };
+    expect(planLoadFlakeReverify({ prs: [ended, younger], load: [1, 1], cores: 12, now }).candidate.pr.number).toBe(3882);
+  });
+  it('a live fix claim or a transient fetch failure on the oldest hold falls through to the younger one', async () => {
+    for (const trouble of ['claim', 'fetch']) {
+      const { io } = twoHolds();
+      if (trouble === 'claim') io.pushRefusal.mockImplementation(({ branch }) => (branch === 'lane/fix' ? { refused: true } : null));
+      else io.prepare.mockImplementation((_s, alt) => { if (alt === 'lane/fix-alt') throw new Error('Could not resolve host'); });
+      io.head.mockReturnValue('ddd4444'); io.resolveSha.mockReturnValue('ddd4444');
+      expect(await runLoadFlakeReverify({}, io)).toEqual({ result: 'pushed', pr: 3882 });
+      expect(io.push).toHaveBeenCalledWith('/lane', 'ddd4444', 'lane/other');
+    }
+  });
+  it('a transient failure on the only hold is still thrown, and posts nothing', async () => {
+    const { io } = fixture(); io.prepare.mockImplementation(() => { throw new Error('Could not resolve host: github.com'); });
+    await expect(runLoadFlakeReverify({}, io)).rejects.toThrow('Could not resolve host');
+    expect(io.comment).not.toHaveBeenCalled();
+  });
+  it('a hold whose saved alt branch was deleted is ended; a transient fetch failure is not', async () => {
+    const { io, pr } = fixture();
+    io.prepare.mockImplementation(() => { throw Object.assign(new Error('git fetch failed'), { stderr: "fatal: couldn't find remote ref refs/heads/alt" }); });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'alt-gone' });
+    expect(io.comment.mock.calls[0][2]).toContain('result=head-moved');
+    const ended = { ...pr, comments: [...pr.comments, comment(io.comment.mock.calls[0][2], '2026-10-04T22:00:01Z')] };
+    expect(planLoadFlakeReverify({ prs: [ended], load: [1, 1], cores: 12, now })).toEqual({ deferred: 'no-candidate' });
+  });
+  it('verification runs without App credentials and a red summary is redacted before it is posted', async () => {
+    const env = scrubVerifyEnv({ PATH: '/bin', HOME: '/h', WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/k.pem', GH_TOKEN: 'x', NPM_TOKEN: 'y' });
+    expect(env).toEqual({ PATH: '/bin', HOME: '/h' });
+    const runVerification = vi.fn(async () => ''); const io = defaultReverifyIo({ run: vi.fn(), runVerification, root: '/repo' });
+    await io.verify('/lane');
+    expect(runVerification.mock.calls[0][2].env).not.toHaveProperty('WE_GITHUB_APP_PRIVATE_KEY_PATH');
+    const { io: io2 } = fixture();
+    io2.verify.mockReturnValue({ ok: false, summary: 'assertion: ghp_abcdefghijklmnopqrstuvwxyz0123456789 leaked' });
+    await runLoadFlakeReverify({}, io2);
+    expect(io2.comment.mock.calls[0][2]).not.toContain('ghp_abcdefghijklmnop');
+  });
+  it('holds with an unsafe alt branch or sha are never read', () => {
+    const mk = (alt, sha, head = 'aaa1111') => comment(`${buildLoadFlakeHoldComment({ head, alt, altSha: sha })}`);
+    for (const [alt, sha] of [['x:refs/heads/main', 'bbb2222'], ['lane/fix-alt', '--exec=x'], ['-oops', 'bbb2222'], ['lane/../main', 'bbb2222'], ['lane/fix-alt', 'main']]) {
+      expect(loadFlakeHolds([mk(alt, sha)])).toEqual([]);
+    }
+    expect(loadFlakeHolds([mk('lane/fix-alt', 'bbb2222', '--bad')])).toEqual([]);
+    expect(loadFlakeHolds([mk('lane/fix-alt', 'bbb2222')])).toHaveLength(1);
+    const forged = { ...mk('lane/fix-alt', 'bbb2222'), author: { login: 'stranger' } };
+    expect(loadFlakeHolds([forged])).toEqual([]);
+  });
+});

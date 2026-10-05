@@ -185,6 +185,12 @@ export function buildConcurrentAuthorPauseComment({ actor = 'conveyor fix agent'
 /** Local verify recovery; #4999 covers the complementary CI flake quarantine. */
 export const LOAD_FLAKE_HOLD_MARKER = '⏳ conveyor fix — fix ready, verify red only on host-load timeouts; re-verifies when the host is quiet';
 export const LOAD_FLAKE_RESOLVED_MARKER = '↩ conveyor fix — load-flake reverify result';
+
+/** Hold and result trailers are comment text that later reaches git argv and refspecs, so only plain hex shas and
+ *  ordinary branch names (no `:`, `..`, leading `-`, `//`, `.lock`, whitespace or control characters) are read. */
+export const isSafeGitSha = (v) => typeof v === 'string' && /^[0-9a-f]{7,40}$/.test(v);
+export const isSafeGitBranch = (v) => typeof v === 'string' && v.length <= 200
+  && /^[A-Za-z0-9._][A-Za-z0-9._/-]*$/.test(v) && !/\.\.|\/\/|\.lock(\/|$)|\/$|\.$|^\./.test(v);
 export const LEGACY_LOAD_FLAKE_CUTOFF = '2026-10-05T00:00:00Z';
 
 export function isLoadFlakeStandDown(c) {
@@ -216,11 +222,14 @@ export function loadFlakeHolds(comments, isSuperseded = isStandDownSuperseded) {
     const body = c?.body ?? '';
     const createdAt = c.createdAt ?? null;
     if (isLoadFlakeStandDown(c)) {
-      return isSuperseded(all, i) ? [] : [{ createdAt, head: null, alt: parseAltBranch(body), legacy: true }];
+      const alt = parseAltBranch(body);
+      return isSuperseded(all, i) || !isSafeGitBranch(alt?.branch) || !isSafeGitSha(alt?.sha) ? []
+        : [{ createdAt, head: null, alt, legacy: true }];
     }
     if (!body.trimStart().startsWith(LOAD_FLAKE_HOLD_MARKER)) return [];
     const t = loadTrailer(body, 'load-flake-hold');
-    return t.alt && t['alt-sha'] && t.outcome === 'blocked-on-load-flake'
+    return isSafeGitBranch(t.alt) && isSafeGitSha(t['alt-sha']) && (t.head === undefined || isSafeGitSha(t.head))
+      && t.outcome === 'blocked-on-load-flake'
       ? [{ createdAt, head: t.head ?? null, alt: { branch: t.alt, sha: t['alt-sha'] }, legacy: false }] : [];
   }).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
 }
@@ -229,7 +238,7 @@ export function loadFlakeResults(comments) {
   return (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor).flatMap((c) => {
     if (!c?.body?.trimStart().startsWith(LOAD_FLAKE_RESOLVED_MARKER)) return [];
     const t = loadTrailer(c.body, 'load-flake-resolved');
-    return t['alt-sha'] && ['pushed', 'red-again', 'head-moved', 'exhausted'].includes(t.result)
+    return isSafeGitSha(t['alt-sha']) && ['pushed', 'red-again', 'head-moved', 'exhausted'].includes(t.result)
       ? [{ createdAt: c.createdAt ?? null, sha: t['alt-sha'], result: t.result }] : [];
   }).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
 }

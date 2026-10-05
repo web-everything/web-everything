@@ -3510,13 +3510,13 @@ it('legacy #3881 waits on host load, not a human', () => {
 import { buildLoadFlakeHoldComment as loadHoldBody, buildLoadFlakeResolvedComment as loadResultBody } from '../stand-down.mjs';
 it('load-hold reconcile routing respects cutoff, head changes, and terminal exhaustion', () => {
   const c = (body, createdAt = '2026-10-04T18:51:50Z') => ({ body, createdAt, author: AUTOMATION });
-  const hold = c(loadHoldBody({ head: 'head-at-hold', alt: 'lane/fix-alt', altSha: '9202eee8a' }));
+  const hold = c(loadHoldBody({ head: 'abc1234', alt: 'lane/fix-alt', altSha: '9202eee8a' }));
   for (const [comments, headRefOid, expected] of [
-    [[c(loadFlakeLegacyBody, '2026-10-05T00:00:00Z')], 'head-at-hold', 'stood-down'],
-    [[hold], 'head-at-hold', 'load-flake-hold'],
-    [[hold], 'new-head', null],
-    [[hold, c(loadResultBody({ altSha: '9202eee8a', result: 'pushed' }), '2026-10-04T20:00:00Z')], 'head-at-hold', null],
-    [[hold, c(loadResultBody({ altSha: '9202eee8a', result: 'exhausted' }), '2026-10-04T20:00:00Z')], 'head-at-hold', 'stood-down'],
+    [[c(loadFlakeLegacyBody, '2026-10-05T00:00:00Z')], 'abc1234', 'stood-down'],
+    [[hold], 'abc1234', 'load-flake-hold'],
+    [[hold], 'def5678', null],
+    [[hold, c(loadResultBody({ altSha: '9202eee8a', result: 'pushed' }), '2026-10-04T20:00:00Z')], 'abc1234', null],
+    [[hold, c(loadResultBody({ altSha: '9202eee8a', result: 'exhausted' }), '2026-10-04T20:00:00Z')], 'abc1234', 'stood-down'],
   ]) {
     const plan = planReconcile({ prs: [pr1563({ comments: [finding(), ...comments], headRefOid })], agents: [], durableCounts: {}, now: NOW });
     const kinds = plan.refusals.map((r) => r.kind);
