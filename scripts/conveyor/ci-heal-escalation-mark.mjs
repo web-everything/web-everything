@@ -217,7 +217,10 @@ export function composeCiHealEscalation(flags, { collect = collectCiAuthDiagnosi
 
 // ── IO SHELL (runs only as a CLI — the pure exports above stay side-effect-free on import) ────────────────────────
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
-if (IS_CLI) {
+// The shell is an async `main()` that is deliberately NOT awaited at module top level: review-status-tag.mjs
+// statically imports this module back, so a top-level `await import('./review-status-tag.mjs')` here would wait on
+// a module that is itself waiting for this one to finish evaluating (Node: "unsettled top-level await", exit 13).
+async function main() {
   const argv = process.argv.slice(2);
   const flags = {};
   const positionals = [];
@@ -278,4 +281,10 @@ if (IS_CLI) {
     // self-corrects it once this process is gone.
   }
   process.stdout.write(JSON.stringify({ ok: true, pr, escalated: true, ...(posted.owed ? { owed: true } : {}), outcome: flags.outcome }) + '\n');
+}
+if (IS_CLI) {
+  main().catch((e) => {
+    process.stderr.write(`✗ ${String(e?.message || e)}\n`);
+    process.exit(1);
+  });
 }
