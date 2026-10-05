@@ -1,9 +1,10 @@
 ---
 bornAs: x26el1a
 kind: task
-status: open
+status: resolved
 scope: ["we:scripts/"]
 dateOpened: "2026-10-05"
+dateResolved: "2026-10-05"
 tags: []
 ---
 
