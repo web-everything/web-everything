@@ -6,13 +6,55 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import {
   runPassDaemonLoop, passDaemonLeaseKey, realSleep, DEFAULT_HEARTBEAT_INTERVAL_MS,
   PASS_DAEMON_SELF_SYNC_ENV, passDaemonSelfSyncEnabled, MAIN_ONLY_PASSES, spawnPassOnce,
+  waitForManifestEntry,
 } from '../pass-daemon.mjs';
 import { DAEMON_MANIFEST } from '../daemon-manifest.mjs';
 import { withSelfSync, DAEMON_SELF_SYNC_BRANCH_ENV } from '../../../scripts/lib/daemon-self-sync.mjs';
+
+describe('waitForManifestEntry — missing clone entry (#5129)', () => {
+  it('keeps the actual CLI alive when its manifest entry is absent', () => {
+    const child = spawnSync(process.execPath, [
+      fileURLToPath(new URL('../pass-daemon.mjs', import.meta.url)), '--pass=missing-entry-5129',
+    ], { encoding: 'utf8', timeout: 2000 });
+    expect(child.stderr).toMatch(/missing-entry-5129.*idle.*manifest-entry-missing/);
+    expect(child.error?.code).toBe('ETIMEDOUT');
+    expect(child.signal).toBe('SIGTERM');
+  });
+
+  it('idles with a named reason and a paced sleep until the entry is available', async () => {
+    const manifest = {};
+    const entry = { script: 'scripts/pass.mjs', intervalMs: 1000 };
+    const log = { error: vi.fn() };
+    const sleep = vi.fn(async () => {
+      if (sleep.mock.calls.length === 2) manifest['load-flake-reverify'] = entry;
+    });
+    await expect(waitForManifestEntry('load-flake-reverify', { manifest, sleep, log })).resolves.toBe(entry);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledWith(60_000);
+    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/load-flake-reverify.*idle.*manifest-entry-missing/));
+  });
+
+  it('returns a valid registered entry without idling', async () => {
+    const entry = { script: 'scripts/pass.mjs', intervalMs: 1000 };
+    const sleep = vi.fn();
+    await expect(waitForManifestEntry('pass', { manifest: { pass: entry }, sleep })).resolves.toBe(entry);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it.each([null, { script: '../escape.mjs', intervalMs: 1000 }, { script: 'scripts/pass.mjs', intervalMs: 0 }])(
+    'still refuses a malformed registered entry: %j', async (entry) => {
+      const sleep = vi.fn();
+      await expect(waitForManifestEntry('pass', { manifest: { pass: entry }, sleep })).rejects.toThrow();
+      expect(sleep).not.toHaveBeenCalled();
+    },
+  );
+});
 
 describe('runPassDaemonLoop — the pure run/sleep control flow', () => {
   it('requires a runPass effect and a positive intervalMs', async () => {
