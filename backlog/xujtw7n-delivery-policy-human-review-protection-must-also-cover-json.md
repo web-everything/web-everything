@@ -2,7 +2,6 @@
 kind: story
 size: 3
 status: open
-blockedBy: ["xcs4nce"]
 scope: ["we:scripts/lib/gate-config.mjs", "we:scripts/lib/delivery-policy.mjs"]
 dateOpened: "2026-10-05"
 tags: []

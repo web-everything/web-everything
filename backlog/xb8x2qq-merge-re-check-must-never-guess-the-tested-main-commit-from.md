@@ -2,7 +2,6 @@
 kind: story
 size: 3
 status: open
-blockedBy: ["xi8vgqq"]
 scope: ["we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-10-05"
 tags: []
