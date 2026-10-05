@@ -72,6 +72,7 @@
  * Exit codes: 0 = merged (or opened --no-wait / opened --park / labelled-on-green / dry-run OK); 2 = required check RED (nothing merged);
  * 3 = unmergeable / gh error / push failed / EMPTY DESCRIPTION (#2324 — nothing merged; recoverable — rebase the
  * ref and re-run, or pass --fallback-git; an empty-body refusal is fixed by editing the PR body and re-running);
+ * 3 also covers soak-declaration: add a break scenario or body waiver before publishing a new PR.
  * 4 = BLOCKED-ON-INFRA (#2659) — the lane ref was PUSHED but `gh pr create` failed on an OUTSIDE dependency (a
  * GitHub outage / network fault). NOT a hard fail: the pushed handle is recorded in the conveyor infra-blocked
  * state, which auto-retries with backoff and resume-opens the PR once infra recovers (nothing is stranded; the
@@ -85,6 +86,8 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { assertMayMerge, hasNonEmptyBody } from './lib/pr-merge-gate.mjs';
+import { soakPrecheckAtOpen, soakPrecheckEnabled } from './lib/soak-precheck-at-open.mjs';
+import { parseNameStatus } from './soak-replay-gate-cli.mjs';
 import { createGhLandProvider, buildCreateArgs } from './lib/forge-land-provider.mjs'; // #3585 — the forge-land port
 export { mergeMethodFlag, buildCreateArgs, buildMergeArgs, buildAddLabelArgs } from './lib/forge-land-provider.mjs'; // re-exported for backward compat — callers/tests still import these off pr-land.mjs
 import { numberPendingHashes, isPostLandTreeDirty } from './lane-drain.mjs'; // JIT numbering + dirty-probe, shared single source (#2288/#xzxc92d/#2348)
@@ -801,12 +804,26 @@ function runCli() {
       card: titleItem ? readMainCard(titleItem, gitC) : null }); },
   };
 
+  function soakCreatePrecheck() {
+    if (!soakPrecheckEnabled()) return { ok: true, skipped: 'disabled' };
+    let files;
+    try {
+      files = parseNameStatus(gitC(['diff', '--name-status', '-M', `${REMOTE}/${BASE}...${refSha}`]));
+    } catch (e) {
+      process.stderr.write(`pr-land [${REPO}] · soak precheck: diff unavailable (${String(e.message || e).split('\n')[0]}); CI still enforces it\n`);
+      return { ok: true, skipped: 'diff unavailable; CI still enforces it' };
+    }
+    return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files });
+  }
+
   if (DRY_RUN) {
     const createArgs = buildCreateArgs(createParams);
+    const soak = soakCreatePrecheck();
     emit({
       repo: REPO, merged: false, reason: 'dry-run', ref: REF, base: BASE, method: METHOD,
       plan: [
         `node scripts/lint-locus-prefix.mjs ${buildLocusLintArgs({ root: REPO, range: `${REMOTE}/${BASE}..${refSha}` }).join(' ')}   # #2331 producer locus-prefix re-check (fail fast on the #2170 review-append leak) — swept in --root, the clone holding the commits (#3342)`,
+        `soak precheck (if no PR exists yet): ${soak.ok ? soak.skipped || soak.reason : `REFUSE: ${soak.message}`}`,
         `git push ${REMOTE} ${SRC}:refs/heads/${REF}   # publish the lane clone's ${SRC} (${refSha.slice(0, 8)}) to the lane ref`,
         prCreateBodyGuard(BODY).ok ? `gh ${createArgs.join(' ')}` : `REFUSE (if no PR exists yet): ${prCreateBodyGuard(BODY).reason}  # #2332 fail-fast — an existing PR for this head is exempt`,
         PLAN.waitForChecks ? 'poll: gh pr view <pr> mergeStateStatus + gh pr checks <pr> --required  (wait until green; abort on red)'
@@ -907,6 +924,17 @@ function runCli() {
     // `REPO` is the resolved checkout PATH (never a slug); read the URL of the remote this run actually pushes to.
     const refusal = pushRefusal({ repo: repoKeyForCheckout(REPO, { remote: REMOTE }), branch: REF, ...callerIdentity() });
     if (refusal) emit({ repo: REPO, merged: false, reason: 'fix-claimed', ref: REF, pr: refusal.pr, holder: refusal.holder, detail: refusal.message }, 3);
+  }
+
+  // Create only: existing PRs use their live body; lookup failure falls toward checking.
+  let existingSoakPr = null;
+  try { existingSoakPr = forge.listOpenByHead(REF)?.[0] ?? null; } catch { /* check locally */ }
+  if (!existingSoakPr) {
+    const soak = soakCreatePrecheck();
+    if (!soak.ok) emit({ repo: REPO, merged: false, reason: 'soak-declaration', ref: REF, detail: soak.message }, 3);
+    if (!AS_JSON && !soak.skipped?.startsWith('diff unavailable')) {
+      process.stderr.write(`pr-land [${REPO}] · soak precheck: ${soak.skipped || soak.reason}\n`);
+    }
   }
 
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.

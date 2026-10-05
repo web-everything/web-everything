@@ -129,6 +129,7 @@ import {
 import { isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { daemonStateDir, daemonConveyorStateRoot } from './daemon-last-good.mjs';
+import { readOverlayConflictWakes, markOverlayConflictWake, clearOverlayConflictWake } from './overlay-conflict-wake.mjs';
 import { defaultPoolRoot, workspaceFor } from './lane-pool-paths.mjs';
 
 // ── Fixed rebuild identity (see file header — DETERMINISM) ─────────────────────────────────────────────────
@@ -141,6 +142,88 @@ export const REBUILD_IDENTITY_ENV = Object.freeze({
   GIT_COMMITTER_NAME: 'daemon-rebuild',
   GIT_COMMITTER_EMAIL: 'daemon-rebuild@localhost',
 });
+
+export const OVERLAY_EDGE_RESOLVE_ENV = 'WE_DAEMON_OVERLAY_EDGE_RESOLVE';
+
+function rebuildCommitEnv(git, a, b) {
+  const committerDate = (sha) => {
+    const r = git(['log', '-1', '--format=%ct', sha]);
+    const n = Number(String(r.stdout ?? '').trim());
+    return r.status === 0 && Number.isFinite(n) ? n : 0;
+  };
+  const date = `@${Math.max(committerDate(a), committerDate(b))} +0000`;
+  return { ...REBUILD_IDENTITY_ENV, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date };
+}
+
+const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+
+/** The edge-resolution sha an operator recorded on an overlay entry (`edgeResolution: {sha, by, at}`, written by
+ *  `daemon-overlays.mjs#recordEdgeResolution`), or `null`. Only a full lowercase 40-hex sha counts — a short,
+ *  upper-case, empty or non-string value is read as "nothing recorded", never matched loosely. */
+export function recordedEdgeSha(entry) {
+  const sha = entry?.edgeResolution?.sha;
+  return typeof sha === 'string' && FULL_SHA_RE.test(sha) ? sha : null;
+}
+
+/** Resolve only in the object DB; a failed strategy leaves the next one available.
+ *  `approvedEdgeSha` is the sha an operator recorded for this overlay's `origin/edge/<ref>` (see
+ *  {@link recordedEdgeSha}): an edge branch is adopted ONLY when its tip equals it. A branch that merely exists
+ *  and contains the PR head — anyone with push access can create one — is never trusted. */
+export function resolveOverlayConflict({ git, cur, ovSha, ref, approvedEdgeSha = null }) {
+  const tried = [];
+  try {
+    if (approvedEdgeSha && FULL_SHA_RE.test(approvedEdgeSha)) {
+      const edgeSha = verifyRev(git, `refs/remotes/origin/edge/${ref}^{commit}`);
+      if (edgeSha === approvedEdgeSha) {
+        tried.push('edge-ref');
+        if (git(['merge-base', '--is-ancestor', ovSha, edgeSha]).status === 0) {
+          const mt = git(['merge-tree', '--write-tree', '--no-messages', cur, edgeSha]);
+          const tree = String(mt.stdout ?? '').split('\n')[0].trim();
+          if (mt.status === 0 && tree) return { ok: true, via: 'edge-ref', tree, edgeSha };
+        }
+      } else if (edgeSha) {
+        tried.push('edge-ref-unrecorded-tip');
+      }
+    }
+  } catch { /* try replay */ }
+  tried.push('replay');
+  try {
+    // A merge commit can carry changes no other commit has (a conflict resolution, an adaptation). Replay
+    // walks only non-merge commits, so it would adopt a tree missing that work while the build records the
+    // whole PR head as incorporated. Refuse (fail closed → unresolved) rather than adopt a partial tree.
+    // An unreadable merge probe also refuses: a wrong refusal only keeps the visible drop.
+    const merges = git(['rev-list', '--merges', '--max-count=1', ovSha, '--not', cur]);
+    const hasMerges = merges.status !== 0 || String(merges.stdout ?? '').trim() !== '';
+    const revs = hasMerges ? null : git(['rev-list', '--reverse', '--no-merges', ovSha, '--not', cur]);
+    const commits = String(revs?.stdout ?? '').trim().split(/\s+/).filter(Boolean);
+    if (revs && revs.status === 0 && commits.length > 0) {
+      let tip = cur;
+      let tree;
+      for (const c of commits) {
+        const mt = git(['merge-tree', '--write-tree', '--no-messages', `--merge-base=${c}^`, tip, c]);
+        tree = String(mt.stdout ?? '').split('\n')[0].trim();
+        if (mt.status !== 0 || !tree) { tree = null; break; }
+        const ct = git(['commit-tree', tree, '-p', tip, '-m', `daemon-rebuild: replay ${c}`], {
+          env: rebuildCommitEnv(git, tip, c),
+        });
+        tip = String(ct.stdout ?? '').trim();
+        if (ct.status !== 0 || !tip) { tree = null; break; }
+      }
+      if (tree) return { ok: true, via: 'replay', tree };
+    }
+  } catch { /* report the original conflict */ }
+  const files = [];
+  try {
+    const mt = git(['merge-tree', '--write-tree', '--name-only', cur, ovSha]);
+    if (mt.status === 1) {
+      for (const line of String(mt.stdout ?? '').split('\n').slice(1)) {
+        if (!line) break;
+        files.push(line);
+      }
+    }
+  } catch { /* best-effort paths */ }
+  return { ok: false, files, tried };
+}
 
 /** One git-runner factory shared by every call site in this file — always carries the fixed rebuild identity
  *  (harmless for anything but `commit-tree`), a `timeout` + `killSignal:'SIGKILL'` (house style: a hung git
@@ -248,14 +331,14 @@ function pinnedConflictSkippable(git, mainSha, ovSha, pinnedBy) {
  * from the returned `decisions`.
  * @param {{git:(args:string[], opts?:{env?:object})=>{status:number,stdout:string,stderr:string},
  *   headSha:string, mainRef:string, overlays?:Array<{ref:string, pr?:number|null}>,
- *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean}} o
+ *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean, edgeResolve?:boolean}} o
  * @returns {Promise<{ok:false, reason:'main-unresolved'}|{ok:true, mainSha:string, finalSha:string,
  *   applied:Array<{ref:string,pr:number|null,sha:string}>,
  *   decisions:Array<{ref:string,pr:number|null,action:'remove'|'drop'|'skip'|'apply',reason:string,sha:string|null}>,
  *   alerts:Array<object>, inputsKey:string, upToDate:boolean}>}
  */
 export async function planRebuild({
-  git, headSha, mainRef, overlays = [], prState, mainOnly = false,
+  git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -283,6 +366,7 @@ export async function planRebuild({
       detail: {
         ref, pr, sha, dropReason, pinnedBy: why, message: conflict ? PINNED_OVERLAY_MESSAGE : PINNED_OVERLAY_GONE_MESSAGE,
       },
+      ...(alerts.length ? { alerts } : {}),
     };
   };
 
@@ -305,7 +389,7 @@ export async function planRebuild({
       decisions.push({ ref, pr, action: 'remove', reason: 'ref-gone', sha: null });
       continue;
     }
-    const dropOrRefuse = (reason) => {
+    const dropOrRefuse = (reason, extra = {}) => {
       const p = pinnedStatus(git, raw, mainSha, ovSha);
       if (p.pinned) {
         // xpinskip — one conflicting pinned overlay must never freeze the fleet: when main already runs the
@@ -326,7 +410,7 @@ export async function planRebuild({
         if (s.why) refused.detail.skipRefusedBecause = s.paths ? `${s.why}: ${s.paths.join(',')}` : s.why;
         return refused;
       }
-      decisions.push({ ref, pr, action: 'drop', reason, sha: ovSha });
+      decisions.push({ ref, pr, action: 'drop', reason, sha: ovSha, ...extra });
       return null;
     };
 
@@ -343,17 +427,26 @@ export async function planRebuild({
 
     // 4. merge-tree in the object DB — no working tree, no index.
     const mt = git(['merge-tree', '--write-tree', '--no-messages', cur, ovSha]);
+    let resolution;
+    let tree = String(mt.stdout ?? '').split('\n')[0].trim();
     if (mt.status === 1) {
-      const refused = dropOrRefuse('conflict');
-      if (refused) return refused;
-      continue;
+      if (edgeResolve) resolution = resolveOverlayConflict({ git, cur, ovSha, ref, approvedEdgeSha: recordedEdgeSha(raw) });
+      if (resolution?.ok) tree = resolution.tree;
+      else {
+        if (resolution) alerts.push({
+          kind: 'overlay-conflict-unresolved',
+          detail: { ref, pr, sha: ovSha, files: resolution.files, tried: resolution.tried },
+        });
+        const refused = dropOrRefuse('conflict', resolution ? { files: resolution.files } : {});
+        if (refused) return refused;
+        continue;
+      }
     }
-    if (mt.status !== 0) {
+    if (mt.status !== 0 && !resolution?.ok) {
       const refused = dropOrRefuse('merge-tree-failed');
       if (refused) return refused;
       continue;
     }
-    const tree = String(mt.stdout ?? '').split('\n')[0].trim();
 
     // 5. content already there (e.g. squash-merged) — cherry's patch-id compare can miss this; a direct tree
     //    compare against `cur` catches it regardless of history shape.
@@ -365,16 +458,10 @@ export async function planRebuild({
 
     // 6. mint the merge commit — fixed identity, date = the later of the two parents' committer dates, so the
     //    same (cur, ovSha) pair always mints the identical sha (see file header — DETERMINISM).
-    const committerDate = (sha) => {
-      const r = git(['log', '-1', '--format=%ct', sha]);
-      const n = Number(String(r.stdout ?? '').trim());
-      return r.status === 0 && Number.isFinite(n) ? n : 0;
-    };
-    const dateUnix = Math.max(committerDate(cur), committerDate(ovSha));
-    const dateStr = `@${dateUnix} +0000`;
-    const message = `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur}`;
+    const message = `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur}`
+      + (resolution?.ok ? ` (resolved via ${resolution.via})` : '');
     const ct = git(['commit-tree', tree, '-p', cur, '-p', ovSha, '-m', message], {
-      env: { GIT_AUTHOR_DATE: dateStr, GIT_COMMITTER_DATE: dateStr },
+      env: rebuildCommitEnv(git, cur, ovSha),
     });
     const newSha = String(ct.stdout ?? '').trim();
     if (ct.status !== 0 || !newSha) {
@@ -383,12 +470,15 @@ export async function planRebuild({
       continue;
     }
     cur = newSha;
-    applied.push({ ref, pr, sha: ovSha });
-    decisions.push({ ref, pr, action: 'apply', reason: 'applied', sha: ovSha });
+    const edge = resolution?.edgeSha ? { edgeSha: resolution.edgeSha } : {};
+    applied.push({ ref, pr, sha: ovSha, ...(resolution?.ok ? { resolvedVia: resolution.via, ...edge } : {}) });
+    decisions.push({ ref, pr, action: 'apply', reason: resolution?.ok ? `applied-${resolution.via}` : 'applied', sha: ovSha });
+    if (resolution?.ok) alerts.push({ kind: 'overlay-conflict-resolved', detail: { ref, pr, via: resolution.via, ...edge } });
   }
 
   const inputsKey = createHash('sha256')
-    .update(JSON.stringify({ main: mainSha, overlays: applied.map((a) => [a.ref, a.sha]) }))
+    .update(JSON.stringify({ main: mainSha, overlays: applied.map((a) => a.resolvedVia
+      ? [a.ref, a.sha, a.resolvedVia, a.edgeSha ?? null] : [a.ref, a.sha]) }))
     .digest('hex')
     .slice(0, 16);
 
@@ -734,14 +824,60 @@ export function migrateDaemonStateFiles({ git, root, dirty, env = process.env, f
  *  is unreachable). Otherwise each overlay ref is fetched individually and a failure there is `ref-gone` (its
  *  stale remote-tracking ref is deleted so a later `--not --remotes=origin`/`refs/remotes/origin/<ref>` read
  *  never sees stale data for it). */
-function fetchMainAndOverlays({ git, overlays }) {
+function fetchMainAndOverlays({ git, overlays, edgeResolve = true }) {
   const safeOverlays = overlays.filter((o) => isSafeBranchName(o?.ref));
   const refspecs = [
     '+refs/heads/main:refs/remotes/origin/main',
     ...safeOverlays.map((o) => `+refs/heads/${o.ref}:refs/remotes/origin/${o.ref}`),
   ];
   const batch = git(['fetch', '--quiet', '--prune', 'origin', ...refspecs]);
-  if (batch.status === 0) return { ok: true, goneRefs: [] };
+  // FAIL CLOSED. An edge ref is usable only if THIS run re-confirmed it: every cached `origin/edge/<ref>` is
+  // deleted first, so a failed `ls-remote`/`fetch`, a deleted remote branch, or a thrown git call leaves it
+  // unavailable (the conflict then drops visibly) instead of resolving against a stale branch from an earlier
+  // run. Only an overlay with a recorded resolution (`recordedEdgeSha`) is a candidate at all, and its edge is
+  // fetched only while the remote still advertises exactly the recorded sha — an arbitrary pushed `edge/*`
+  // branch is never even fetched.
+  const fetchEdges = () => {
+    if (!edgeResolve) return;
+    const edgeRef = (ref) => `refs/remotes/origin/edge/${ref}`;
+    // An overlay may itself be named `edge/<x>`: its OWN tracking ref is the same path as overlay `<x>`'s edge
+    // ref, and must never be deleted or re-fetched here.
+    const overlayTracking = new Set(safeOverlays.map((o) => `refs/remotes/origin/${o.ref}`));
+    const edgeCandidates = safeOverlays.filter((o) => !overlayTracking.has(edgeRef(o.ref)));
+    // A delete that fails (lock, I/O) ends edge discovery for the run. The surviving ref is still adopted only
+    // while its tip equals the operator-recorded sha (see `resolveOverlayConflict`) — provenance holds, but it is
+    // not re-confirmed against the remote on that run.
+    const dropCached = () => {
+      let ok = true;
+      for (const { ref } of edgeCandidates) {
+        try { if (git(['update-ref', '-d', edgeRef(ref)]).status !== 0) ok = false; } catch { ok = false; }
+      }
+      return ok;
+    };
+    if (!dropCached()) return;
+    try {
+      const approved = new Map(edgeCandidates.map((o) => [o.ref, recordedEdgeSha(o)]).filter(([, sha]) => sha));
+      if (approved.size === 0) return;
+      const listed = git(['ls-remote', '--heads', 'origin', 'refs/heads/edge/*']);
+      if (listed.status !== 0) return;
+      const advertised = new Map(String(listed.stdout ?? '').trim().split('\n')
+        .map((line) => line.trim().split(/\s+/)).filter((p) => p.length >= 2).map(([sha, name]) => [name, sha]));
+      const edges = [];
+      for (const [ref, sha] of approved) {
+        if (advertised.get(`refs/heads/edge/${ref}`) === sha) edges.push(`+refs/heads/edge/${ref}:${edgeRef(ref)}`);
+      }
+      if (edges.length === 0) return;
+      if (git(['fetch', '--quiet', 'origin', ...edges]).status !== 0) { dropCached(); return; }
+      // The branch may have moved between `ls-remote` and `fetch`: keep only a ref whose tip is the recorded sha.
+      for (const [ref, sha] of approved) {
+        if (verifyRev(git, `${edgeRef(ref)}^{commit}`) !== sha) git(['update-ref', '-d', edgeRef(ref)]);
+      }
+    } catch { dropCached(); /* edge discovery must never block a rebuild */ }
+  };
+  if (batch.status === 0) {
+    fetchEdges();
+    return { ok: true, goneRefs: [] };
+  }
 
   const mainOnlyFetch = git(['fetch', '--quiet', '--prune', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
   if (mainOnlyFetch.status !== 0) return { ok: false, reason: 'fetch-failed' };
@@ -754,6 +890,7 @@ function fetchMainAndOverlays({ git, overlays }) {
       goneRefs.push(o.ref);
     }
   }
+  fetchEdges();
   return { ok: true, goneRefs };
 }
 
@@ -980,7 +1117,7 @@ export function matchReadyCandidate({
  * @param {{git:(args:string[])=>{status:number|null, stdout?:string}, adopt:object, mainTip:string}} o
  */
 export function readyBuildVerified({
-  git, adopt, mainTip, prevHead,
+  git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null,
 }) {
   const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0;
   if (!adopt?.finalSha || !adopt.mainSha || !mainTip || !isAncestor(adopt.mainSha, mainTip)) return false;
@@ -1000,8 +1137,18 @@ export function readyBuildVerified({
     const tip = verifyRev(git, `refs/remotes/origin/${a.ref}^{commit}`);
     if (tip ? !isAncestor(a.sha, tip) : !isAncestor(a.sha, mainTip)) return false;
     // The merge's tree is exactly what planRebuild mints for (prev, overlay) — never an arbitrary tree.
-    const mt = git(['merge-tree', '--write-tree', '--no-messages', prev, a.sha]);
-    const minted = mt.status === 0 ? String(mt.stdout ?? '').split('\n')[0].trim() : '';
+    let minted;
+    if (a.resolvedVia) {
+      // An edge-resolved build is only as trusted as the operator's CURRENT recorded approval: the record's own
+      // `edgeSha` must still equal it, and the tree is re-derived through that same approved edge.
+      const approvedEdgeSha = approvedEdgeShaFor(a.ref);
+      if (a.resolvedVia === 'edge-ref' && (!approvedEdgeSha || a.edgeSha !== approvedEdgeSha)) return false;
+      const resolved = resolveOverlayConflict({ git, cur: prev, ovSha: a.sha, ref: a.ref, approvedEdgeSha });
+      minted = resolved.ok ? resolved.tree : '';
+    } else {
+      const mt = git(['merge-tree', '--write-tree', '--no-messages', prev, a.sha]);
+      minted = mt.status === 0 ? String(mt.stdout ?? '').split('\n')[0].trim() : '';
+    }
     if (!minted || minted !== verifyRev(git, `${cur}^{tree}`)) return false;
     cur = prev;
   }
@@ -1593,7 +1740,8 @@ async function prepareRebuild({
     if (!mainOnly) return terminal({ moved: false, reason: 'overlay-state-corrupt' });
   }
   const overlaysBefore = overlayState.overlays;
-  const fetchResult = fetchMainAndOverlays({ git, overlays: overlaysBefore });
+  const edgeResolve = env[OVERLAY_EDGE_RESOLVE_ENV] !== '0';
+  const fetchResult = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
   if (!fetchResult.ok) {
     if (unsafe.untracked.length > 0) alert('untracked-kept', { paths: unsafe.untracked });
     alert('fetch-failed');
@@ -1613,8 +1761,20 @@ async function prepareRebuild({
 
   // ── Step 3: plan + apply list edits ─────────────────────────────────────────────────────────────────
   const plan = await planRebuild({
-    git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly,
+    git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
   });
+  for (const event of plan.alerts || []) {
+    alert(event.kind, event.detail);
+    if (event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
+      const { pr, ref, files } = event.detail;
+      markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
+    }
+  }
+  for (const [pr, wake] of readOverlayConflictWakes(env, { maxAgeMs: Infinity })) {
+    if (wake.clone === root && !overlaysBefore.some((o) => o.pr === pr && o.ref === wake.ref)) {
+      clearOverlayConflictWake(env, pr);
+    }
+  }
   if (!plan.ok) {
     // A pinned refusal keeps the current tree AND the overlay list untouched (no decisions were applied).
     alert(plan.reason, plan.detail);
@@ -1639,6 +1799,7 @@ async function prepareRebuild({
     return terminal({ moved: false, reason: plan.reason, ...(plan.detail ? { detail: plan.detail } : {}) });
   }
   for (const d of plan.decisions) {
+    if (d.pr != null && (d.action === 'apply' || d.action === 'remove')) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
       removeOverlay(root, d.ref, { env, why: d.reason });
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason }, { env });
@@ -1647,7 +1808,6 @@ async function prepareRebuild({
       alert('overlay-conflict-dropped', { ref: d.ref, reason: d.reason });
     }
   }
-  for (const kind of plan.alerts) alert(kind.kind, kind.detail);
 
   // ── Step 4: up-to-date / still-rejected short-circuits ──────────────────────────────────────────────
   if (plan.upToDate) {
@@ -1686,6 +1846,7 @@ async function prepareRebuild({
         stillWanted: (ref) => wantedRefs.has(ref),
         verifyBuilt: (adopt) => readyBuildVerified({
           git, adopt, mainTip: plan.mainSha, prevHead,
+          approvedEdgeShaFor: (ref) => recordedEdgeSha((overlaysBefore || []).find((o) => o?.ref === ref)),
         }),
         overlayTip: (ref) => verifyRev(git, `refs/remotes/origin/${ref}^{commit}`),
         registered: (ref) => registeredRefs.has(ref),
@@ -2296,6 +2457,7 @@ async function smokeAndAdopt({
     const pinnedOverlays = withPin.filter((ap) => ap.pinned).map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr }));
     const planB = await planRebuild({
       git, headSha: prevHead, mainRef: 'origin/main', overlays: pinnedOverlays,
+      edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
     });
     if (planB.ok) {
       const suspectInfo = suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr }));
@@ -2471,7 +2633,7 @@ export async function dryRunRebuild({
 
           const scratchGit = makeGit({ run, cwd: scratchDir, env });
           scratchGit(['remote', 'add', 'origin', url]);
-          fetchMainAndOverlays({ git: scratchGit, overlays });
+          fetchMainAndOverlays({ git: scratchGit, overlays, edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0' });
 
           plan = await planRebuild({
             git: scratchGit,
@@ -2480,6 +2642,7 @@ export async function dryRunRebuild({
             overlays,
             prState: prState || ((pr) => defaultPrState({ pr, root })),
             mainOnly: false,
+            edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
           });
 
           // Same untracked-collision check `doRebuild` runs before its real `reset --hard` (see
@@ -2600,7 +2763,7 @@ export async function previewOverlayConflict({
     const scratchGit = makeGit({ run, cwd: scratchDir, env });
     scratchGit(['remote', 'add', 'origin', url]);
     const allRefs = existingOverlays.concat([{ ref, pr }]);
-    const fetched = fetchMainAndOverlays({ git: scratchGit, overlays: allRefs });
+    const fetched = fetchMainAndOverlays({ git: scratchGit, overlays: allRefs, edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0' });
     if (!fetched.ok) return { ok: false, reason: 'fetch-failed' };
 
     const mainSha = verifyRev(scratchGit, 'origin/main^{commit}');
@@ -2620,6 +2783,7 @@ export async function previewOverlayConflict({
       planExisting = await planRebuild({
         git: scratchGit, headSha: mainSha, mainRef: 'origin/main', overlays: folding,
         prState: (p) => defaultPrState({ pr: p, root }),
+        edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
       });
       const stuckRef = !planExisting.ok && /^pinned-overlay-/.test(planExisting.reason) ? planExisting.detail?.ref : null;
       if (!stuckRef || !folding.some((o) => o.ref === stuckRef)) break;
@@ -2639,6 +2803,10 @@ export async function previewOverlayConflict({
     // names its file(s) for the refusal/`--allow-conflict` print.
     const mt = scratchGit(['merge-tree', '--write-tree', cur, candSha]);
     if (mt.status === 0) return { ok: true, clean: true, mainSha, cur, candSha, setAside };
+    if (mt.status === 1 && env[OVERLAY_EDGE_RESOLVE_ENV] !== '0'
+      && resolveOverlayConflict({ git: scratchGit, cur, ovSha: candSha, ref }).ok) {
+      return { ok: true, clean: true, mainSha, cur, candSha, setAside };
+    }
 
     // Only status 1 is merge-tree's documented "merge had conflicts". Anything else (unrelated histories, a
     // missing object, a crash) proves nothing about mergeability — it must fail closed as `ok:false`, never read

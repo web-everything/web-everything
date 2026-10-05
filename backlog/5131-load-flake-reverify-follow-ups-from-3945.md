@@ -2,9 +2,10 @@
 bornAs: x6rj2sa
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/"]
 dateOpened: "2026-10-05"
+dateResolved: "2026-10-05"
 tags: []
 ---
 

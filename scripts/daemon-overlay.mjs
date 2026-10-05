@@ -46,6 +46,12 @@
  *                                          [--check] [--allow-conflict --reason=..]
  *   node scripts/daemon-overlay.mjs remove --clone=<path> --ref=<branch> [--reason=..] [--by=..] [--json]
  *   node scripts/daemon-overlay.mjs list   --clone=<path> [--json]
+ *   node scripts/daemon-overlay.mjs approve-edge --clone=<path> --ref=<branch> --sha=<40-hex> [--by=..] [--reason=..] [--json]
+ *
+ * `approve-edge` records, on an already-registered overlay, the exact tip of its `origin/edge/<ref>` branch as
+ * the approved conflict resolution. A rebuild resolves an overlay conflict through an edge branch ONLY when its
+ * tip equals that recorded sha (`daemon-rebuild.mjs#resolveOverlayConflict`) — an arbitrary pushed `edge/*`
+ * branch is never fetched or adopted.
  *
  * `--by` defaults to `$USER`. Every command prints the resulting list (remove also reports whether the ref was
  * actually present). `--no-lock` is still accepted (a no-op) so any older caller/script that still passes it
@@ -78,7 +84,7 @@ import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, statSync, rmSync, renameSync } from 'node:fs';
 import {
-  addOverlay, removeOverlay, readOverlayState, appendOverlayEvent, overlayFilePath,
+  addOverlay, removeOverlay, readOverlayState, appendOverlayEvent, overlayFilePath, recordEdgeResolution,
 } from './lib/daemon-overlays.mjs';
 import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
 import { edgeEnabled, registerPr } from './lib/daemon-edge.mjs';
@@ -246,8 +252,8 @@ export async function withAddGuardLock(root, env, fn, hooks = {}) {
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
-  if (cmd !== 'add' && cmd !== 'remove' && cmd !== 'list') {
-    fail(`expected add|remove|list, got ${JSON.stringify(cmd ?? null)}`);
+  if (cmd !== 'add' && cmd !== 'remove' && cmd !== 'list' && cmd !== 'approve-edge') {
+    fail(`expected add|remove|list|approve-edge, got ${JSON.stringify(cmd ?? null)}`);
     return;
   }
 
@@ -256,8 +262,11 @@ async function main() {
   if (!clone) return fail('--clone=<path> is required');
   const root = resolve(clone);
 
-  if ((cmd === 'add' || cmd === 'remove') && typeof flags.ref !== 'string') {
+  if ((cmd === 'add' || cmd === 'remove' || cmd === 'approve-edge') && typeof flags.ref !== 'string') {
     return fail(`--ref=<branch> is required for ${cmd}`);
+  }
+  if (cmd === 'approve-edge' && typeof flags.sha !== 'string') {
+    return fail('--sha=<full 40-hex tip of origin/edge/<ref>> is required for approve-edge');
   }
 
   let pr = null;
@@ -381,14 +390,25 @@ async function main() {
         ? registerPr({ pr, ref: flags.ref, remoteUrl: String(url.stdout).trim(), env, by, reason })
         : { ok: false, reason: 'no-origin-url' };
     }
-  } else {
+  } else if (cmd === 'remove') {
     const { removed, list } = removeOverlay(root, flags.ref, { env, why: reason || 'operator' });
     if (removed) appendOverlayEvent(root, { kind: 'removed', ref: flags.ref, by, reason }, { env });
     output = { removed, list };
+  } else if (cmd === 'approve-edge') {
+    // The ONLY way an `origin/edge/<ref>` branch becomes adoptable by a rebuild: record actor + exact tip sha on
+    // the registered overlay. A malformed sha, a missing actor or an unregistered ref is a usage error (exit 2).
+    if (!by) return fail('--by=<actor> is required for approve-edge (or set $USER)');
+    try {
+      output = { list: recordEdgeResolution(root, flags.ref, { sha: flags.sha, by, reason }, { env }) };
+    } catch (e) {
+      return fail(String((e && e.message) || e));
+    }
   }
 
   if (asJson) {
     process.stdout.write(`${JSON.stringify(output)}\n`);
+  } else if (cmd === 'approve-edge') {
+    process.stdout.write(`daemon-overlay: approved edge/${flags.ref} @ ${flags.sha} by ${by} list=${JSON.stringify(output.list)}\n`);
   } else if (cmd === 'remove') {
     process.stdout.write(`daemon-overlay: removed=${output.removed} list=${JSON.stringify(output.list)}\n`);
   } else {

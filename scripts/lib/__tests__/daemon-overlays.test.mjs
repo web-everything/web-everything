@@ -22,6 +22,7 @@ import {
   addOverlay,
   removeOverlay,
   appendOverlayEvent,
+  recordEdgeResolution,
 } from '../daemon-overlays.mjs';
 
 const CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'daemon-overlay.mjs');
@@ -187,6 +188,37 @@ describe('removeOverlay', () => {
   });
 });
 
+describe('recordEdgeResolution', () => {
+  const SHA = 'a'.repeat(40);
+
+  it('records actor + sha on a registered overlay, keeps it across a re-add, and leaves an audit event', () => {
+    addOverlay(cloneRoot, { ref: 'lane/a' }, { env: env() });
+    const list = recordEdgeResolution(cloneRoot, 'lane/a', { sha: SHA, by: ' operator ', reason: 'reviewed', now: '2026-10-05T00:00:00Z' }, { env: env() });
+    expect(list[0].edgeResolution).toEqual({ sha: SHA, by: 'operator', at: '2026-10-05T00:00:00Z', reason: 'reviewed' });
+    addOverlay(cloneRoot, { ref: 'lane/a', pr: 9 }, { env: env() });
+    expect(readOverlays(cloneRoot, { env: env() })[0].edgeResolution.sha).toBe(SHA);
+    const events = readFileSync(join(overlayDir, `${cloneKey(cloneRoot)}.events.jsonl`), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    expect(events.at(-1)).toMatchObject({ kind: 'edge-resolution-recorded', ref: 'lane/a', sha: SHA, by: 'operator' });
+  });
+
+  it('refuses a malformed sha, a missing actor and an unregistered overlay without writing anything', () => {
+    addOverlay(cloneRoot, { ref: 'lane/a' }, { env: env() });
+    for (const bad of [{ sha: 'abc123', by: 'op' }, { sha: SHA.toUpperCase(), by: 'op' }, { sha: SHA, by: '' }, { sha: SHA }]) {
+      expect(() => recordEdgeResolution(cloneRoot, 'lane/a', bad, { env: env() })).toThrow(TypeError);
+    }
+    expect(() => recordEdgeResolution(cloneRoot, 'lane/nope', { sha: SHA, by: 'op' }, { env: env() })).toThrow(/not registered/);
+    expect(readOverlays(cloneRoot, { env: env() })[0].edgeResolution).toBeUndefined();
+  });
+
+  it('is dropped together with the overlay entry', () => {
+    addOverlay(cloneRoot, { ref: 'lane/a' }, { env: env() });
+    recordEdgeResolution(cloneRoot, 'lane/a', { sha: SHA, by: 'op' }, { env: env() });
+    removeOverlay(cloneRoot, 'lane/a', { env: env() });
+    addOverlay(cloneRoot, { ref: 'lane/a' }, { env: env() });
+    expect(readOverlays(cloneRoot, { env: env() })[0].edgeResolution).toBeUndefined();
+  });
+});
+
 describe('appendOverlayEvent', () => {
   it('appends one JSON line with an `at` stamp per call', () => {
     appendOverlayEvent(cloneRoot, { kind: 'added', ref: 'lane/a' }, { env: env() });
@@ -241,6 +273,24 @@ describe('CLI (spawnSync, --no-lock — never imports daemon-clone-lock.mjs)', (
     expect(out).toEqual({ removed: true, list: [] });
     const events = readFileSync(join(overlayDir, `${cloneKey(cloneDir)}.events.jsonl`), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     expect(events.map((e) => e.kind)).toEqual(['added', 'removed']);
+  });
+
+  it('approve-edge records the approval for a registered overlay and rejects bad input with exit 2', () => {
+    const { originDir, cloneDir } = makeGitClone();
+    pushRef(originDir, 'lane/cli-test');
+    run(['add', `--clone=${cloneDir}`, '--ref=lane/cli-test', '--no-lock']);
+    const sha = 'b'.repeat(40);
+    const ok = run(['approve-edge', `--clone=${cloneDir}`, '--ref=lane/cli-test', `--sha=${sha}`, '--by=tester', '--reason=reviewed', '--json']);
+    expect(ok.status, ok.stderr).toBe(0);
+    expect(JSON.parse(ok.stdout).list[0].edgeResolution).toMatchObject({ sha, by: 'tester', reason: 'reviewed' });
+    for (const args of [
+      ['--ref=lane/cli-test', '--sha=abc', '--by=tester'],
+      ['--ref=lane/never-added', `--sha=${sha}`, '--by=tester'],
+      ['--ref=lane/cli-test', '--by=tester'],
+    ]) {
+      const bad = run(['approve-edge', `--clone=${cloneDir}`, ...args]);
+      expect(bad.status).toBe(2);
+    }
   });
 
   // Advisory 2026-09-25 (PR #2625): a corrupt file read as an empty list everywhere, silently.

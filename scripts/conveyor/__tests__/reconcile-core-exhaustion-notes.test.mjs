@@ -22,10 +22,12 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 
 import {
-  planReconcile, markSelfReportedDone, assessLiveness,
+  resolveRoundCap, planReconcile, markSelfReportedDone, assessLiveness,
   INFRA_RETRY_CAP, INFRA_RETRY_COOLOFF_MS, INFRA_RETRY_CAPPED_COOLOFF_MS, LIVE_SESSION_OVERRUN_MS,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CI_HEAL_ROUND_CAP,
 } from '../reconcile-core.mjs';
+import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
+import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 import { noteEpisodeKey } from '../reconcile-note-comment.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../../lib/jury-core.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
@@ -120,8 +122,8 @@ describe('xilx617 — round-cap-exhausted notes, one per non-ci-heal `cap-exhaus
     expect(plan.notes[0].text).toBe(`PR #3001: fix auto-repair rounds exhausted (${NEGOTIATION_ROUND_CAP}/${NEGOTIATION_ROUND_CAP}) — a person must take it over`);
   });
 
-  it('the zero-findings review branch pushes a note with capKind "review"', () => {
-    const plan = planReconcile({ prs: [prZeroFindingsReview()], agents: [], durableCounts: { 3002: NEGOTIATION_ROUND_CAP }, now: NOW });
+  it('the zero-findings review branch above the cap pushes a note with capKind "review"', () => {
+    const plan = planReconcile({ prs: [prZeroFindingsReview()], agents: [], durableCounts: { 3002: NEGOTIATION_ROUND_CAP + 1 }, now: NOW });
     // This branch ALSO always pushes the ordinary `no-findings` refusal first (a review population with
     // nothing to fix is still refused as no-findings — see `reconcile-core.mjs`'s own REFUSAL 2 note); the
     // `cap-exhausted` one rides alongside it, never replacing it.
@@ -337,5 +339,78 @@ describe('xilx617 — a long-running LIVE session is bounded by a session-overru
     const notePidOnly2 = { ...notePidOnly1 };
     expect(noteEpisodeKey(notePidOnly1)).toBe(noteEpisodeKey(notePidOnly2));
     expect(noteEpisodeKey(notePidOnly1)).not.toBe(noteEpisodeKey(note1));
+  });
+});
+
+describe('last allowed fix review and round configuration', () => {
+  it.each([[[]], [[finding()]]])('allows the final review, with or without findings', (comments) => {
+    const plan = planReconcile({ prs: [prZeroFindingsReview({ comments })], durableCounts: { 3002: 5 }, requiredChecks: ['gate'] });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', finalReview: true })]);
+    expect(plan.notes).toHaveLength(0);
+  });
+  it('refuses review above the cap', () => {
+    const plan = planReconcile({ prs: [prZeroFindingsReview({ comments: [finding()] })], durableCounts: { 3002: 6 } });
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+    expect(plan.notes).toContainEqual(expect.objectContaining({ capKind: 'review' }));
+  });
+  it('parks an exhausted fixer', () => {
+    const plan = planReconcile({ prs: [prBounced()], durableCounts: { 3001: 5 } });
+    expect(plan.notes).toContainEqual(expect.objectContaining({ capKind: 'fix', parkToHuman: true }));
+  });
+  it('resolves a positive integer config, otherwise the default', () => {
+    for (const value of [undefined, '', ' ', '0', '-1', '2.5', 'no', 'Infinity', '9007199254740992']) {
+      expect(resolveRoundCap({ WE_REVIEW_ROUND_CAP: value })).toBe(5);
+    }
+    expect(resolveRoundCap({ WE_REVIEW_ROUND_CAP: '7' })).toBe(7);
+  });
+});
+
+
+describe('only the generic fix exhaustion parks to review:human', () => {
+  const exhausted = {
+    fix: () => planReconcile({ prs: [prBounced()], durableCounts: { 3001: NEGOTIATION_ROUND_CAP } }),
+    review: () => planReconcile({ prs: [prZeroFindingsReview({ comments: [finding()] })], durableCounts: { 3002: NEGOTIATION_ROUND_CAP + 1 } }),
+    'advisory-fix': () => {
+      const comments = [];
+      for (let i = 0; i < ADVISORY_FIX_ROUND_CAP; i += 1) {
+        comments.push({ body: `${ADVISORY_NOTE_MARKER}\n\nround ${i}`, author: AUTOMATION });
+        comments.push({ body: buildAdvisoryFixComment({}), author: AUTOMATION });
+      }
+      comments.push({ body: `${ADVISORY_NOTE_MARKER}\n\none more, still broken`, author: AUTOMATION });
+      return planReconcile({ prs: [prAdvisoryFix({ comments })] });
+    },
+    'conflict-fix': () => planReconcile({ prs: [prConflictFix({
+      comments: [finding(), ...Array.from({ length: CONFLICT_FIX_ROUND_CAP }, () => ({ body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION }))],
+    })] }),
+    'stacked-rebase': () => planReconcile({ prs: [prStackedRebase({
+      comments: Array.from({ length: CONFLICT_FIX_ROUND_CAP }, () => ({ body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION })),
+    })] }),
+  };
+  it.each(Object.keys(exhausted))('capKind %s carries parkToHuman only when it is "fix"', (capKind) => {
+    const notes = exhausted[capKind]().notes.filter((n) => n.kind === 'round-cap-exhausted');
+    expect(notes).toEqual([expect.objectContaining({ capKind })]);
+    if (capKind === 'fix') expect(notes[0].parkToHuman).toBe(true);
+    else expect(notes[0]).not.toHaveProperty('parkToHuman');
+  });
+});
+
+describe('audited extension lifts the generic fixer cap', () => {
+  it.each([
+    [OPERATOR_LOGINS[0], OPERATOR_LOGINS[0], true],
+    ['web-everything', OPERATOR_LOGINS[0], false], // automation credential claiming an operator actor
+    ['outsider', OPERATOR_LOGINS[0], false],
+    [OPERATOR_LOGINS[0], 'outsider', false],
+  ])('author %s, actor %s', (author, actor, allowed) => {
+    const body = buildRoundExtensionComment({ repo: 'web-everything/web-everything', pr: 3001, by: 2,
+      actor, channel: 'console', reason: 'Try two more rounds', at: '2026-10-05T12:00:00Z' });
+    const pr = prBounced({ comments: [finding(), { body, author: { login: author } }] });
+    const plan = planReconcile({ prs: [pr], durableCounts: { 3001: 5 } });
+    if (allowed) {
+      expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', roundExtensions: 2 })]);
+      expect(plan.notes).toHaveLength(0);
+    } else {
+      expect(plan.dispatch).toHaveLength(0);
+      expect(plan.notes).toContainEqual(expect.objectContaining({ capKind: 'fix', parkToHuman: true }));
+    }
   });
 });

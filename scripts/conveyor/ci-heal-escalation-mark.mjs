@@ -52,7 +52,6 @@ import { resolve } from 'node:path';
 import { collectCiAuthDiagnosis, renderCiAuthDiagnosis } from './ci-auth-diagnosis.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
-import { applyReviewStatus } from './review-status-tag.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
 
 /**
@@ -218,7 +217,10 @@ export function composeCiHealEscalation(flags, { collect = collectCiAuthDiagnosi
 
 // ── IO SHELL (runs only as a CLI — the pure exports above stay side-effect-free on import) ────────────────────────
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
-if (IS_CLI) {
+// The shell is an async `main()` that is deliberately NOT awaited at module top level: review-status-tag.mjs
+// statically imports this module back, so a top-level `await import('./review-status-tag.mjs')` here would wait on
+// a module that is itself waiting for this one to finish evaluating (Node: "unsettled top-level await", exit 13).
+async function main() {
   const argv = process.argv.slice(2);
   const flags = {};
   const positionals = [];
@@ -264,6 +266,8 @@ if (IS_CLI) {
   // fixed" for however long that tick is away. See the file header's "clear/replace the fixing label as soon as
   // the session reports any terminal outcome" requirement.
   try {
+    // Dynamic import breaks the review-status-tag → reconcile-core cycle (coroner #36).
+    const { applyReviewStatus } = await import('./review-status-tag.mjs');
     const provider = createGhProvider();
     // No `--repo` given (a repo-less invocation, `gh` inferring from cwd elsewhere in this script) — resolve
     // the SAME way, via `gh repo view`, never a hardcoded constellation repo (this file, like every other
@@ -277,4 +281,10 @@ if (IS_CLI) {
     // self-corrects it once this process is gone.
   }
   process.stdout.write(JSON.stringify({ ok: true, pr, escalated: true, ...(posted.owed ? { owed: true } : {}), outcome: flags.outcome }) + '\n');
+}
+if (IS_CLI) {
+  main().catch((e) => {
+    process.stderr.write(`✗ ${String(e?.message || e)}\n`);
+    process.exit(1);
+  });
 }

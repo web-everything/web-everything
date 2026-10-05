@@ -2,8 +2,9 @@
  * Pure planning plus injectable IO. A quiet host retries one saved fix, never force-pushing.
  */
 import os from 'node:os';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { runBounded } from '../lib/bounded-child.mjs';
@@ -11,22 +12,51 @@ import { pushRefusal } from './fix-procedure.mjs';
 import { loadFlakeResults, buildLoadFlakeResolvedComment } from './stand-down.mjs';
 import { loadFlakeHoldState } from './load-flake-hold.mjs';
 import { redactSecrets } from './ci-heal-mark.mjs';
+import { RUNNER_LOCK_ROOT } from '../../skills-src/conveyor/runner-lock.mjs';
+
+export const VERIFY_ENV_ALLOWLIST = Object.freeze([
+  'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'CI', 'NODE_ENV', 'NODE_OPTIONS', 'FORCE_COLOR', 'NO_COLOR',
+  'LANE_POOL_ROOT', 'CONVEYOR_RUNNER_LOCK_ROOT', 'PLAYWRIGHT_BROWSERS_PATH', 'WE_VITEST_MAX_WORKERS',
+  'SHELL', 'USER', 'LOGNAME', 'WE_HEAVY_*', 'npm_config_*',
+]);
+const VERIFY_SECRET = /TOKEN|SECRET|PASSWORD|PRIVATE_KEY|CREDENTIAL|API_KEY|ACCESS_KEY|AUTH|SSH_AUTH_SOCK|^WE_GITHUB_APP_/i;
+// npm reads these names in ANY case (npm_config_*, NPM_CONFIG_*, mixed), so the match is case-insensitive.
+// Beyond auth/key/cert material this also covers proxy and registry knobs (their URLs can embed `user:pass@`),
+// one-time passwords, passphrases and CA bundles (`ca`, `cafile`).
+const NPM_CREDENTIAL_CONFIG = /^npm_config_(?:.*(?:token|auth|password|key|secret|cert|userconfig|globalconfig|proxy|registry|otp|passphrase).*|cafile|ca)$/i;
+// A URL carrying `user:pass@` credentials in ANY allowed value is dropped, whatever the variable is called.
+const URL_CREDENTIALS = /:\/\/[^/\s:@]*:[^/\s@]*@/;
+// Path-valued knobs: a literal leading `~` must resolve against the REAL home, not the scratch HOME the child gets.
+const VERIFY_PATH_VARS = new Set(['LANE_POOL_ROOT', 'CONVEYOR_RUNNER_LOCK_ROOT', 'PLAYWRIGHT_BROWSERS_PATH']);
+const expandTilde = (value, home) => (home && (value === '~' || value.startsWith('~/')) ? join(home, value.slice(1)) : value);
 
 export function reverifyConfig(env = process.env, maxLoadPerCore) {
+  const verifyEnvAllow = (env.WE_LOAD_FLAKE_VERIFY_ENV_ALLOW ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (verifyEnvAllow.some((name) => VERIFY_SECRET.test(name))) throw new Error('secret name in WE_LOAD_FLAKE_VERIFY_ENV_ALLOW');
+  if (verifyEnvAllow.some((name) => NPM_CREDENTIAL_CONFIG.test(name))) throw new Error('npm credential-config name in WE_LOAD_FLAKE_VERIFY_ENV_ALLOW');
   const positive = (value, fallback) => {
     const n = Number(value ?? fallback);
     if (!Number.isFinite(n) || n <= 0) throw new Error(`invalid reverify limit: ${value}`);
     return n;
   };
   return {
+    verifyEnvAllow,
     maxLoadPerCore: positive(maxLoadPerCore ?? env.WE_LOAD_FLAKE_REVERIFY_MAX_LOAD_PER_CORE, 0.75),
     maxAttempts: Math.max(1, Math.floor(positive(env.WE_LOAD_FLAKE_REVERIFY_MAX_ATTEMPTS, 3))),
     cooloffMs: positive(env.WE_LOAD_FLAKE_REVERIFY_COOLOFF_MIN, 30) * 60_000,
+    mode: reverifyMode(env),
   };
 }
 
+/** `local` (default) re-verifies the held fix on this host; `ci` pushes it unverified so the PR's CI judges it. */
+function reverifyMode(env) {
+  const mode = env.WE_LOAD_FLAKE_REVERIFY_MODE ?? 'local';
+  if (!['local', 'ci'].includes(mode)) throw new Error('invalid reverify mode');
+  return mode;
+}
+
 export function planLoadFlakeReverify({ prs = [], load, cores, now, config = reverifyConfig({}) }) {
-  if (!(cores > 0) || load.length < 2 || load.slice(0, 2).some((n) => !Number.isFinite(n) || n / cores > config.maxLoadPerCore)) {
+  if (config.mode !== 'ci' && (!(cores > 0) || load.length < 2 || load.slice(0, 2).some((n) => !Number.isFinite(n) || n / cores > config.maxLoadPerCore))) {
     return { deferred: 'host-load' };
   }
   const candidates = prs.flatMap((pr) => {
@@ -42,7 +72,7 @@ export function planLoadFlakeReverify({ prs = [], load, cores, now, config = rev
 /** The one repository the registered pass sweeps (the manifest entry has no --repo flag); see `LOAD_FLAKE_REVERIFY_REPOS`. */
 export const REVERIFY_DEFAULT_REPO = 'we';
 
-export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRun = false, config = reverifyConfig() } = {}, io = defaultReverifyIo()) {
+export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRun = false, config = reverifyConfig() } = {}, io = defaultReverifyIo(config)) {
   const now = io.now();
   const load = io.loadavg();
   const cores = io.cpuCount();
@@ -80,7 +110,7 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
 }
 
 /** Deferrals that leave the hold live and unchanged: the next candidate is tried instead of stopping here. */
-const NON_PROGRESS = new Set(['fix-claimed', 'hold-ended']);
+const NON_PROGRESS = new Set(['fix-claimed', 'hold-ended', 'hold-changed']);
 
 async function reverifyCandidate({ candidate, key, slug, config }, io) {
   const { pr, hold, attempts } = candidate;
@@ -91,7 +121,9 @@ async function reverifyCandidate({ candidate, key, slug, config }, io) {
       await post('head-moved');
       return { deferred: 'head-moved' };
     }
-    if (!loadFlakeHoldState({ comments: live.comments, headRefOid: live.headRefOid }).live) return { deferred: 'hold-ended' };
+    const state = loadFlakeHoldState({ comments: live.comments, headRefOid: live.headRefOid });
+    if (!state.live) return { deferred: 'hold-ended' };
+    if (state.hold.alt.branch !== hold.alt.branch || state.hold.alt.sha !== hold.alt.sha || state.hold.createdAt !== hold.createdAt) return { deferred: 'hold-changed' };
     if (await io.pushRefusal({ repo: key, branch: live.headRefName })) return { deferred: 'fix-claimed' };
     return null;
   };
@@ -122,34 +154,47 @@ async function reverifyCandidate({ candidate, key, slug, config }, io) {
       await post('head-moved', 'The saved alt branch moved past the recorded commit, so the recorded repair can no longer be verified.');
       return { deferred: 'lane-head-mismatch' };
     }
-    const verification = await io.verify(lane.path);
-    if (!verification.ok) {
-      // Verify can run 40 minutes: a red result for a PR that moved, or whose hold ended, meanwhile is stale and must
-      // never post a terminal `exhausted` (or burn an attempt) against the current head.
-      refusal = await check();
-      if (refusal) return refusal;
-      const result = attempts + 1 >= config.maxAttempts ? 'exhausted' : 'red-again';
-      // Verify output is branch-authored text headed for a public comment: redact it, then cut.
-      await post(result, redactSecrets(verification.summary ?? '').slice(-1500));
-      return { result };
+    if (config.mode !== 'ci') {
+      const verification = await io.verify(lane.path);
+      if (!verification.ok) {
+        // Verify can run 40 minutes: a red result for a PR that moved, or whose hold ended, meanwhile is stale and must
+        // never post a terminal `exhausted` (or burn an attempt) against the current head.
+        refusal = await check();
+        if (refusal) return refusal;
+        const result = attempts + 1 >= config.maxAttempts ? 'exhausted' : 'red-again';
+        // Verify output is branch-authored text headed for a public comment: redact it, then cut.
+        await post(result, redactSecrets(verification.summary ?? '').slice(-1500));
+        return { result };
+      }
     }
     refusal = await check();
     if (refusal) return refusal;
     await io.push(lane.path, hold.alt.sha, pr.headRefName);
-    await post('pushed');
+    await post('pushed', config.mode === 'ci'
+      ? "Pushed without a local re-verify (WE_LOAD_FLAKE_REVERIFY_MODE=ci); the PR's CI judges it." : '');
     return { result: 'pushed', pr: pr.number };
   } finally {
     await io.release(lane, key);
   }
 }
 
-/** The branch under verify is fixer-authored code: run it without the daemon's GitHub App credentials or any token.
- *  HOME is kept (npm and git need it), so credentials already stored under it are NOT hidden from the verify child. */
-export function scrubVerifyEnv(env = process.env) {
-  return Object.fromEntries(Object.entries(env).filter(([k]) => !/^WE_GITHUB_APP_|TOKEN|SECRET|PASSWORD|PRIVATE_KEY|CREDENTIAL/i.test(k)));
+/** Fixer-authored verification gets only required knobs and explicit non-secret extensions.
+ *  HOME and temp paths point into disposable scratch directories, and npm's user/global config paths are dropped so
+ *  the child's npm never loads the daemon's ~/.npmrc auth. This is ENV HYGIENE, not a sandbox: the child still runs
+ *  as the daemon's OS user and can read credential files by absolute path or reach keychain-backed helpers.
+ *  Isolating it from those needs a separate OS user or a sandbox profile. Pure. */
+export function scrubVerifyEnv(env = process.env, { allow = [], scratchDir, home = env.HOME || os.homedir() } = {}) {
+  const clean = Object.fromEntries(Object.entries(env).filter(([k, v]) => !VERIFY_SECRET.test(k)
+    && !/^(HOME|TMPDIR|TMP|TEMP|GIT_ASKPASS)$|^(GITHUB_|GH_|SSH_)/.test(k)
+    && !NPM_CREDENTIAL_CONFIG.test(k)
+    && !(typeof v === 'string' && URL_CREDENTIALS.test(v))
+    && (allow.includes(k) || VERIFY_ENV_ALLOWLIST.some((name) => name.endsWith('*') ? k.startsWith(name.slice(0, -1)) : k === name)))
+    .map(([k, v]) => [k, VERIFY_PATH_VARS.has(k) && typeof v === 'string' ? expandTilde(v, home) : v]));
+  if (scratchDir) Object.assign(clean, { HOME: join(scratchDir, 'home'), TMPDIR: join(scratchDir, 'tmp'), TMP: join(scratchDir, 'tmp'), TEMP: join(scratchDir, 'tmp') });
+  return clean;
 }
 
-export function defaultReverifyIo({ run = execFileSync, runVerification = runBounded, root = resolve(dirname(fileURLToPath(import.meta.url)), '../..') } = {}) {
+export function defaultReverifyIo({ run = execFileSync, runVerification = runBounded, verifyEnvAllow = [], root = resolve(dirname(fileURLToPath(import.meta.url)), '../..') } = {}) {
   const command = (bin, args, opts = {}) => run(bin, args, { cwd: root, encoding: 'utf8', timeout: 120_000, maxBuffer: 16 * 1024 * 1024, ...opts });
   const gh = (args) => JSON.parse(command('gh', args));
   const lanePool = (...args) => command(process.execPath, [resolve(root, 'scripts/lane-pool.mjs'), ...args]);
@@ -170,8 +215,22 @@ export function defaultReverifyIo({ run = execFileSync, runVerification = runBou
     resolveSha: (sha, cwd) => command('git', ['rev-parse', `${sha}^{commit}`], { cwd }).trim(),
     verify: async (cwd) => {
       // Kill the entire verification process group on timeout before releasing its lane.
-      try { await runVerification(process.execPath, [resolve(root, 'scripts/verify-lane.mjs')], { cwd, env: scrubVerifyEnv(), timeoutMs: 40 * 60_000, maxBytes: 16 * 1024 * 1024 }); return { ok: true }; }
+      const scratchDir = mkdtempSync(join(os.tmpdir(), 'we-reverify-'));
+      try {
+        mkdirSync(join(scratchDir, 'home')); mkdirSync(join(scratchDir, 'tmp'));
+        const env = scrubVerifyEnv(process.env, { allow: verifyEnvAllow, scratchDir });
+        env.CONVEYOR_RUNNER_LOCK_ROOT ??= RUNNER_LOCK_ROOT;
+        env.PLAYWRIGHT_BROWSERS_PATH ??= join(os.homedir(), process.platform === 'darwin' ? 'Library/Caches' : '.cache', 'ms-playwright');
+        await runVerification(process.execPath, [resolve(root, 'scripts/verify-lane.mjs')], { cwd, env, timeoutMs: 40 * 60_000, maxBytes: 16 * 1024 * 1024 });
+        return { ok: true };
+      }
       catch (e) { return { ok: false, summary: `${e.stdout ?? ''}\n${e.stderr ?? ''}\n${e.message ?? ''}`.slice(-1500) }; }
+      finally {
+        // Branch-authored code wrote into this directory: an unremovable entry must never replace the verify result
+        // (a throw in `finally` would turn a green or red outcome into a pass-level error and re-pick the candidate).
+        try { rmSync(scratchDir, { recursive: true, force: true }); }
+        catch (e) { console.warn(`load-flake reverify: could not remove scratch dir ${scratchDir}: ${e.message}`); }
+      }
     },
     // Pushed from the daemon's own checkout, never the lane: the lane just ran fixer-authored code that could have
     // planted hooks or git config there. `prepare` already fetched the saved commit into this checkout. Hooks are
@@ -185,6 +244,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const [action, ...args] = process.argv.slice(2);
   if (action !== 'sweep') throw new Error('usage: load-flake-reverify.mjs sweep [--repo=we] [--dry-run] [--max-load-per-core=N] [--json]');
   const flags = Object.fromEntries(args.map((a) => { const [k, ...v] = a.replace(/^--/, '').split('='); return [k, v.length ? v.join('=') : true]; }));
-  const result = await runLoadFlakeReverify({ repo: flags.repo ?? REVERIFY_DEFAULT_REPO, dryRun: !!flags['dry-run'], config: reverifyConfig(process.env, flags['max-load-per-core']) });
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  const config = reverifyConfig(process.env, flags['max-load-per-core']);
+  const result = await runLoadFlakeReverify({ repo: flags.repo ?? REVERIFY_DEFAULT_REPO, dryRun: !!flags['dry-run'], config });
+  process.stdout.write(`${JSON.stringify({ mode: config.mode, ...result })}\n`);
 }

@@ -30,6 +30,7 @@
  *      health watch's own last-tick-completed age.
  */
 
+import { CLAUDE_JOBS_ARCHIVE_DEFAULTS } from './claude-jobs-archive-config.mjs';
 import { TMP_SWEEP_DEFAULTS } from './tmp-sweep-config.mjs';
 import { foldPrAttempts } from './health-pr-attempts.mjs';
 import { isHighEntropyToken } from '../lib/secret-scrub.mjs';
@@ -41,6 +42,7 @@ export const HOUR = 60 * MINUTE;
 /** Defaults — every number is config (`<stateRoot>/.conveyor/health/config.json` overrides any of them). */
 export const DEFAULT_HEALTH_CONFIG = Object.freeze({
   ...TMP_SWEEP_DEFAULTS,
+  ...CLAUDE_JOBS_ARCHIVE_DEFAULTS,
   mode: 'shadow',
   tickBudgetMs: 60_000,
   flapMax: 3,

@@ -124,6 +124,23 @@ export const REVIEW_DAEMON_LEASE_KEY = '<conveyor:review-daemon-lease>';
 
 /** Matches runner.mjs's own tick cadence — this sequence ran at that rate as one of its mechanical passes. */
 export const DEFAULT_INTERVAL_MS = 120_000;
+export const MIN_INTERVAL_MS = 10_000;
+/** Node's setTimeout treats any delay above 2**31-1 ms (~24.8 days) as 1 ms, which would turn a "tick rarely"
+ *  setting into back-to-back passes — so valid intervals are clamped to this ceiling. */
+export const MAX_INTERVAL_MS = 2 ** 31 - 1;
+
+/** #5136 — `--interval-ms` overrides `WE_REVIEW_DAEMON_INTERVAL_MS`, then the default cadence.
+ *  Invalid values fall through to the next source; valid intervals are clamped to [10 s, 2**31-1 ms]. */
+export function resolveReviewIntervalMs({ env = process.env, argv = process.argv.slice(2) } = {}) {
+  const flagIndex = argv.findIndex((arg) => arg === '--interval-ms' || arg.startsWith('--interval-ms='));
+  const flagValue = flagIndex < 0 ? undefined : argv[flagIndex] === '--interval-ms'
+    ? argv[flagIndex + 1] : argv[flagIndex].slice('--interval-ms='.length);
+  for (const value of [flagValue, env.WE_REVIEW_DAEMON_INTERVAL_MS]) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return Math.min(MAX_INTERVAL_MS, Math.max(MIN_INTERVAL_MS, n));
+  }
+  return DEFAULT_INTERVAL_MS;
+}
 
 const WE_SLUG = CONSTELLATION_REPOS.we.slug;
 
@@ -897,6 +914,7 @@ export function buildCliDaemonEffects({
 }
 
 async function main() {
+  const intervalMs = resolveReviewIntervalMs();
   const owner = makeOwner('review-daemon');
   const acquired = acquireRunnerLease(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY });
   if (!acquired.ok) {
@@ -913,7 +931,7 @@ async function main() {
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
-  console.error(`review-daemon: started on ${hostname()}:${process.pid}, tick every ${DEFAULT_INTERVAL_MS}ms.`);
+  console.error(`review-daemon: started on ${hostname()}:${process.pid}, tick every ${intervalMs}ms.`);
   // xv6fciw — keep this daemon's dedicated clone on origin/main, and restart onto new code BETWEEN ticks
   // (launchd KeepAlive brings it back), instead of refusing every dispatch until someone re-syncs by hand.
   const selfRoot = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
@@ -926,7 +944,7 @@ async function main() {
   // early; the interval stays as the safety net. This daemon also forwards drain-relevant events to the drain
   // daemon's localhost POST /nudge — one forwarder, so the drain wakes on events without its own feed client.
   const { stoppedReason } = await runDaemonLoop(
-    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner }), REVIEW_DAEMON_APP_AUTH_OPTS), {
+    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs }), REVIEW_DAEMON_APP_AUTH_OPTS), {
       root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
     }), { role: 'review', repos: REVIEW_DAEMON_REPOS, forward: [makeDrainNudgeForward()] }),
   );

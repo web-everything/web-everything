@@ -6,7 +6,7 @@
  *   lexical scope. Everything here READS.
  */
 import { execFileSync } from 'node:child_process';
-import { countStandDownComments } from '../conveyor/stand-down.mjs';
+import { standDownComments } from '../conveyor/stand-down.mjs';
 
 /** How long a `gh` call may take before it is abandoned. A kill lands as a throw, never as an empty list. */
 export const GH_TIMEOUT_MS = 60 * 1000;
@@ -123,7 +123,7 @@ export function createPrReader({ run = execFileSync, reconcile = false } = {}) {
         if (!Array.isArray(parsed.comments)) throw new Error('pr-reconcile: unreadable comments');
         const comments = parsed.comments.map((c) => {
           if (typeof c?.body !== 'string') throw new Error('pr-reconcile: unreadable comment body');
-          // #3383 — `author`/`viewerDidAuthor` MUST survive this normalization: `countStandDownComments` (and
+          // #3383 — `author`/`viewerDidAuthor` MUST survive this normalization: `standDownComments` (and
           // every other durable marker counter) now requires a trusted author
           // (`we:scripts/lib/marker-authorship.mjs`) before a marker counts at all. Dropping these fields here
           // would silently blind `standDownEvidence` to every REAL stand-down (a false negative — the escalation
@@ -137,7 +137,7 @@ export function createPrReader({ run = execFileSync, reconcile = false } = {}) {
         detail = {
           state: String(r.state ?? '').toLowerCase(),
           comments,
-          standDownEvidence: comments.filter((c) => countStandDownComments([c]) > 0),
+          standDownEvidence: comments.filter((c) => standDownComments([c]).length > 0),
         };
       }
       return {

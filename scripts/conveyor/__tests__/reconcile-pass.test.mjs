@@ -1328,3 +1328,22 @@ describe('main-fixed signature facts reader', () => {
     expect(readMainFixedSignatureFacts).not.toHaveBeenCalled();
   });
 });
+
+it('threads the injected round-cap environment into the fixer decision', async () => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const { REARM_COMMENT_MARKER } = await import('../rearm-review.mjs');
+  const options = {
+    repo: 'we', readRequiredChecks: () => ({ checks: ['test'], source: 'live' }),
+    readPrs: () => [{
+      number: 12, state: 'OPEN', headRefName: 'lane/round-cap', headRefOid: 'a'.repeat(40),
+      labels: [{ name: 'review:changes' }], mergeStateStatus: 'CLEAN',
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+      comments: [{ body: '🔁 human review — changes requested\n\nFix the bug.' },
+        ...Array.from({ length: 5 }, () => ({ body: REARM_COMMENT_MARKER, author: { login: 'web-everything' } }))],
+    }],
+    readAgents: () => [], enrich: (agents) => agents,
+  };
+  expect(runReconcilePass({ ...options, env: {} }).refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+  expect(runReconcilePass({ ...options, env: { WE_REVIEW_ROUND_CAP: '7' } }).dispatch)
+    .toContainEqual(expect.objectContaining({ kind: 'fix' }));
+});

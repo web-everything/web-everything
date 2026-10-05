@@ -13,6 +13,7 @@
  * `investigateDispatch: true` it dispatches a diagnose-only investigation agent per episode and stops it at its
  * wall clock — see we:scripts/conveyor/health-investigate-dispatch.mjs.
  *
+ * Also archives old finished Claude job folders daily (claudeJobsArchive* config); archives have no retention limit.
  * Also runs the daily temp sweep (we:scripts/conveyor/tmp-sweep.mjs): deletes our own proven-prefix temp entries
  * older than `tmpSweepOlderThanMs`, skipping any a process has as its cwd. All knobs are `tmpSweep*` config keys.
  * State lives under the pinned daemon state root (#4052, `health-watch-section.mjs#healthDir`, the ONE shared
@@ -33,12 +34,14 @@
  *                                                  [--ps-fixture=FILE] [--machine-load-fixture=FILE]  # machine-overload's inputs, real by default
  *                                                  [--no-investigate]  # skip the #4078 investigation pass entirely
  *                                                  [--no-file]  # skip the #4079 filing-request planning pass entirely
+ *   node scripts/conveyor/health-watch.mjs claude-jobs-archive [--dry-run] [--json] [--claude-jobs-root=DIR] [--claude-jobs-archive-root=DIR]
  *   node scripts/conveyor/health-watch.mjs tmp-sweep [--dry-run] [--json] [--tmp-sweep-root=DIR]
  *   node scripts/conveyor/health-watch.mjs section [--state-root=DIR]      # the HEALTH section (operator queue)
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
+import { archiveClaudeJobs, formatClaudeJobsArchiveLine } from './claude-jobs-archive.mjs';
 import { sweepOurTmp, readBusyTopLevel, formatTmpSweepLine } from './tmp-sweep.mjs';
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { execFileSync, spawn } from 'node:child_process';
@@ -820,6 +823,12 @@ function sweepOptions(config, tmpRoot, dryRun, now, run) {
     timeBudgetMs: config.tmpSweepTimeBudgetMs };
 }
 
+function archiveOptions(config, flags, now) {
+  return { jobsRoot: flags['claude-jobs-root'], archiveRoot: flags['claude-jobs-archive-root'],
+    dryRun: !!flags['dry-run'], now, olderThanMs: config.claudeJobsArchiveOlderThanMs,
+    maxMoves: config.claudeJobsArchiveMaxMovesPerRun, timeBudgetMs: config.claudeJobsArchiveTimeBudgetMs };
+}
+
 /** One tick: probe, evaluate, diagnose, and persist. Returns the CLI summary. */
 export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun } = {}) {
   const started = Date.now();
@@ -841,6 +850,13 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     || now - prev.tmpSweep.completedAt >= config.tmpSweepEveryMs || prev.tmpSweep.complete === false);
   const tmpSweep = sweepAllowed && sweepDue
     ? await attempt('tmpSweep', () => sweepOurTmp(sweepOptions(config, flags['tmp-sweep-root'] || tmpdir(), !!flags['dry-run'], now, tmpSweepRun)))
+    : null;
+
+  const archiveAllowed = flags['claude-jobs-root'] || (!flags['state-root'] && !flags['dry-run']);
+  const archiveDue = config.claudeJobsArchiveEnabled && (!prev.claudeJobsArchive?.completedAt
+    || now - prev.claudeJobsArchive.completedAt >= config.claudeJobsArchiveEveryMs || prev.claudeJobsArchive.complete === false);
+  const claudeJobsArchive = archiveAllowed && archiveDue
+    ? await attempt('claudeJobsArchive', () => archiveClaudeJobs(archiveOptions(config, flags, now)))
     : null;
 
   const logs = attempt('daemonLogs', () => probeDaemonLogs(logsDir, prev.cursors || {}));
@@ -993,6 +1009,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // Scrubbed ONCE, right here: everything below — the printed section, the returned summary, every file — sees
   // only the redacted state.
   const state = scrubDeep(result.state);
+  if (claudeJobsArchive) state.claudeJobsArchive = { at: now, ...(claudeJobsArchive.complete ? { completedAt: now } : {}), ...claudeJobsArchive };
+  else if (prev.claudeJobsArchive) state.claudeJobsArchive = prev.claudeJobsArchive;
   if (tmpSweep) state.tmpSweep = { at: now, ...(tmpSweep.complete ? { completedAt: now } : {}), ...tmpSweep };
   else if (prev.tmpSweep) state.tmpSweep = prev.tmpSweep;
   state.notifiedSilences = (result.state.silences || []).filter((x) => x.expiredNotified).map(silenceSig);
@@ -1110,7 +1128,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // The whole summary goes through the scrub too (the last choke point before stdout).
   return scrubDeep({
     now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs,
-    tmpSweep: tmpSweep ?? null, ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
+    claudeJobsArchive: claudeJobsArchive ?? null, tmpSweep: tmpSweep ?? null, ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
     plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, reports: written,
     section: renderHealthSection(state, { now, reportDir }),
     skipped: result.evaluations.filter((e) => !e.results).map((e) => ({ smell: e.smell.id, missing: e.skipped, error: e.error })),
@@ -1132,6 +1150,12 @@ async function main(argv) {
   const { flags, pos } = parseFlags(argv);
   const cmd = pos[0] || 'tick';
   const dir = healthDir(flags['state-root']);
+  if (cmd === 'claude-jobs-archive') {
+    const config = { ...DEFAULT_HEALTH_CONFIG, ...readJson(join(dir, 'config.json'), {}) };
+    const result = archiveClaudeJobs(archiveOptions(config, flags, Date.now()));
+    console.log(flags.json ? JSON.stringify(result, null, 2) : formatClaudeJobsArchiveLine(result));
+    return 0;
+  }
   if (cmd === 'tmp-sweep') {
     const config = { ...DEFAULT_HEALTH_CONFIG, ...readJson(join(dir, 'config.json'), {}) };
     const result = await sweepOurTmp(sweepOptions(config, flags['tmp-sweep-root'] || tmpdir(), !!flags['dry-run'], Date.now()));
@@ -1154,7 +1178,7 @@ async function main(argv) {
     console.log(`health-watch: ${cmd}d ${flags.smell}${subject ? ` / ${subject}` : ''}`);
     return 0;
   }
-  if (cmd !== 'tick') { console.error(`health-watch: unknown command "${cmd}" (tick | tmp-sweep | section | silence | unsilence)`); return 1; }
+  if (cmd !== 'tick') { console.error(`health-watch: unknown command "${cmd}" (tick | tmp-sweep | claude-jobs-archive | section | silence | unsilence)`); return 1; }
 
   // `--in-process` is the watchdog's worker child: its parent already holds the tick lock.
   const release = flags['dry-run'] || flags['in-process'] ? () => {} : acquireTickLock(dir);
@@ -1168,6 +1192,7 @@ async function main(argv) {
       if (flags.json) console.log(JSON.stringify(summary, null, 2));
       else {
         console.log(`health-watch: tick ${summary.now} in ${summary.durationMs}ms (${summary.mode}); transitions: ${summary.transitions.map((t) => `${t.type} ${t.key}`).join(', ') || 'none'}`);
+        if (summary.claudeJobsArchive) console.log(formatClaudeJobsArchiveLine(summary.claudeJobsArchive));
         if (summary.tmpSweep) console.log(formatTmpSweepLine(summary.tmpSweep));
         console.log(summary.section.join('\n'));
       }
