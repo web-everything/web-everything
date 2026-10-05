@@ -1,3 +1,4 @@
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
@@ -266,6 +267,7 @@ export function readPr({
   const netPaths = computeNetDiffPaths({ exec: gitExec, rev: headRefName, fetchExtraRefs: [] });
 
   const priorRounds = priorRoundsFor(repo, pr);
+  const revSha = revParseCommit(gitExec, netPaths.rev);
 
   return {
     priorRounds,
@@ -294,9 +296,77 @@ export function readPr({
     // `headRefOid` is GitHub's view of the head, which can differ from the ref this clone actually diffed, and
     // recording it would pin the basis to a tree that was never read.
     comments: view.comments,
-    net: { ...netPaths, revSha: revParseCommit(gitExec, netPaths.rev) },
+    net: { ...netPaths, revSha },
+    latestFix: readLatestFixRange({ exec: gitExec, comments: view.comments, head: revSha }),
     diff: netText,
   };
+}
+
+/** #5135 — output cap for the latest-fix `git diff`; past it the read fails and the scope falls back to `all`. */
+export const LATEST_FIX_DIFF_MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
+ * #5135 — the changed new-side lines of the latest fix range (`<prior reviewed head>..<head>`). Never throws:
+ * `{priorHead: null}` on round 1, `{priorHead, head, error}` when the range cannot be read, else
+ * `{priorHead, head, files: {path: number[] | null}}` (`null` = changed, lines unknown).
+ */
+export function readLatestFixRange(options = {}) {
+  const { exec, comments, head } = options ?? {};
+  let priorHead = null;
+  try {
+    const current = typeof head === 'string' && /^[0-9a-f]+$/i.test(head) ? head.toLowerCase() : null;
+    for (const comment of (Array.isArray(comments) ? comments : []).slice().reverse()) {
+      if (!isTrustedMarkerAuthor(comment) || typeof comment.body !== 'string') continue;
+      const reviewed = comment.body.match(/^Net basis: `([0-9a-f]+)\.\.([0-9a-f]+)`/im)?.[2]?.toLowerCase();
+      if (reviewed && (!current || (!reviewed.startsWith(current) && !current.startsWith(reviewed)))) {
+        priorHead = reviewed;
+        break;
+      }
+    }
+    if (!priorHead) return { priorHead: null };
+    if (!current) return { priorHead, error: 'head-unpinned' };
+    let diff;
+    try {
+      diff = String(exec('git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', '--unified=0', priorHead, head], {
+        // A rebase between rounds can make this diff several MB; the 1 MB default would throw and fall back to `all`.
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER,
+      }) ?? '');
+    } catch {
+      return { priorHead, head, error: 'git-diff-failed' };
+    }
+    const files = {};
+    if (!diff.trim()) return { priorHead, head, files };
+    const sections = diff.split(/^diff --git /m).slice(1);
+    if (!sections.length) return { priorHead, head, error: 'diff-unparseable' };
+    const decodePath = value => value.startsWith('"') ? JSON.parse(value) : value;
+    for (const section of sections) {
+      const lines = section.split('\n');
+      const newPath = lines.find(line => line.startsWith('+++ '))?.slice(4);
+      const oldPath = lines.find(line => line.startsWith('--- '))?.slice(4);
+      const deleted = newPath === '/dev/null';
+      const headerPath = lines[0].match(/^(?:"a\/.*"|a\/.*?) ("b\/.*"|b\/.*)$/)?.[1];
+      const rawPath = deleted ? oldPath : newPath ?? headerPath;
+      const path = rawPath && decodePath(rawPath).replace(/^[ab]\//, '').replace(/\t$/, '');
+      if (!path) return { priorHead, head, error: 'diff-unparseable' };
+      const unknown = deleted || lines.some(line => line.startsWith('Binary files ') || line === 'GIT binary patch'
+        || line.startsWith('rename from ') || line.startsWith('rename to '));
+      const changed = new Set();
+      if (!unknown) for (const line of lines) {
+        if (!line.startsWith('@@')) continue;
+        const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
+        if (!hunk) return { priorHead, head, error: 'diff-unparseable' };
+        const start = Number(hunk[1]);
+        const count = hunk[2] === undefined ? 1 : Number(hunk[2]);
+        if (!Number.isSafeInteger(start) || !Number.isSafeInteger(start + count)) return { priorHead, head, error: 'diff-unparseable' };
+        if (count === 0) { changed.add(start); changed.add(start + 1); }
+        else for (let n = start; n < start + count; n++) changed.add(n);
+      }
+      Object.defineProperty(files, path, { value: unknown ? null : [...changed].sort((a, b) => a - b), enumerable: true, configurable: true });
+    }
+    return { priorHead, head, files };
+  } catch {
+    return { priorHead, head, error: 'diff-unparseable' };
+  }
 }
 
 /**

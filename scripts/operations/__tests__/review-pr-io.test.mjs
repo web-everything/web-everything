@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  readLatestFixRange,
   PR_VIEW_FIELDS, createReviewPrReader, createReviewPrSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
   resolveSubjectCheckout, COMPARE_FILE_CAP, changedLinesFromCompare, changesTouchCitedLines, createChangedLinesReader,
@@ -1788,5 +1789,66 @@ describe('legacy vs current owner slugs compare equal (outage 2026-10-03)', () =
     expect(a.path).toBe('/x');
     const b = resolveSubjectCheckout({ repo: 'chalbert/web-everything', cwd: '/x', originRepo: () => 'web-everything/web-everything', siblings: () => [] });
     expect(b.path).toBe('/x');
+  });
+});
+
+
+describe('#5135 latest fix range', () => {
+  const comment = head => ({ author: { login: 'web-everything' }, body: `Net basis: \`0000..${head}\`` });
+  const priorHead = 'a'.repeat(40);
+  const head = 'b'.repeat(40);
+  const read = (exec, comments = [comment(priorHead)], current = head) => readLatestFixRange({ exec, comments, head: current });
+  it('does not diff without a trusted prior head', () => {
+    const exec = () => { throw new Error('must not run'); };
+    expect(read(exec, [])).toEqual({ priorHead: null });
+    expect(read(exec, [{ ...comment(priorHead), author: { login: 'outsider' } }])).toEqual({ priorHead: null });
+    expect(read(exec, [comment(head.slice(0, 8))])).toEqual({ priorHead: null });
+    expect(read(exec, null, null)).toEqual({ priorHead: null });
+  });
+  it('selects the newest distinct reviewed head and uses the diff exec contract', () => {
+    const calls = [];
+    const exec = (...args) => { calls.push(args); return ''; };
+    expect(read(exec, [comment('cccc'), comment(priorHead), comment(head.slice(0, 8))], head.toUpperCase())).toEqual({ priorHead, head: head.toUpperCase(), files: {} });
+    expect(calls).toEqual([['git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', '--unified=0', priorHead, head.toUpperCase()], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }]]);
+    expect(read(exec, [comment(priorHead)], 'not-a-sha')).toEqual({ priorHead, error: 'head-unpinned' });
+  });
+  it('parses inserted and deleted lines, deleted and binary files, and mode changes', () => {
+    const diff = [
+      'diff --git a/a.js b/a.js', '--- a/a.js', '+++ b/a.js',
+      '@@ -0,0 +1,2 @@', '+one', '+two', '@@ -10,2 +12,0 @@', '-old', '-old',
+      '@@ -20 +21 @@', '-old', '+new',
+      'diff --git a/old.js b/old.js', '--- a/old.js', '+++ /dev/null', '@@ -1 +0,0 @@', '-old',
+      'diff --git a/pic.png b/pic.png', 'Binary files a/pic.png and b/pic.png differ',
+      'diff --git a/run.sh b/run.sh', 'old mode 100644', 'new mode 100755',
+    ].join('\n');
+    expect(read(() => diff)).toEqual({ priorHead, head, files: { 'a.js': [1, 2, 12, 13, 21], 'old.js': null, 'pic.png': null, 'run.sh': [] } });
+  });
+  it('keeps failures explicit', () => {
+    expect(read(() => { throw new Error('missing commit'); })).toEqual({ priorHead, head, error: 'git-diff-failed' });
+    expect(read(() => 'garbage')).toEqual({ priorHead, head, error: 'diff-unparseable' });
+  });
+});
+
+
+describe('#5135 fix range read wiring', () => {
+  it('tolerates a malformed options argument', () => {
+    expect(readLatestFixRange(null)).toEqual({ priorHead: null });
+  });
+  it('uses the same pinned SHA for the review basis and latest fix', () => {
+    const head = 'b'.repeat(40);
+    const priorHead = 'a'.repeat(40);
+    const calls = [];
+    const exec = (file, args) => {
+      calls.push(args);
+      return args[0] === 'rev-parse' ? head : '';
+    };
+    const result = readPr({ pr: 7, repo: 'o/n', exec, originRepo: () => 'o/n', readView: () => ({
+      number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [],
+      comments: [{ author: { login: 'web-everything' }, body: `Net basis: \`0000..${priorHead}\`` }],
+    }) });
+    expect(result.net.revSha).toBe(head);
+    expect(result.latestFix).toEqual({ priorHead, head, files: {} });
+    expect(calls.filter(args => args.at(-1) === `${result.net.rev}^{commit}`)).toHaveLength(1);
+    expect(calls).toContainEqual(['diff', '--no-ext-diff', '--no-color', '--no-renames', '--unified=0', priorHead, head]);
   });
 });

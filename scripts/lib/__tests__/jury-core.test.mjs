@@ -16,6 +16,8 @@ import { fileURLToPath } from 'node:url';
 // pins a wrap point or a blockquote indent. See the module header for the autopsy.
 import { proseContains, blockquoteBlockAt, functionNamesInCodeSpans, normalizeProse } from './doc-prose.mjs';
 import {
+  laterRoundAdvisoryScopeFromEnv, isSourcePath, classifyLaterRoundAdvisory, explainPanelOutcome,
+  LATER_ROUND_ADVISORY_SCOPES, LATER_ROUND_ADVISORY_SCOPE_ENV, LATER_ROUND_CHANGE_WINDOW, DEFERRED_ADVISORY_REASON,
   JURY_EVENT_TYPES,
   JURY_EVENT_TYPE_LIST,
   JUROR_STATUSES,
@@ -2185,5 +2187,110 @@ describe('#4315 mandatory referral protocol', () => {
       expect(read.malformed || read.records.length === 1).toBe(true);
       expect(mandatoryReferralState([post(pending + tail)], { head: r.head }).pending.length).toBeGreaterThan(0);
     }
+  });
+});
+
+
+describe('#5135 later-round advisory scope', () => {
+  const finding = { file: 'src/a.mjs', line: 20, summary: 'guard missing', extra: 'retain me' };
+  const latestFix = { priorHead: 'aaaa', head: 'bbbb', files: { 'src/a.mjs': [100] } };
+  const classify = (items = [finding], options = {}) => classifyLaterRoundAdvisory(items, {
+    lens: 'simplicity', scope: 'changed-only', latestFix, ...options,
+  });
+
+  it('reads the scope and refuses unknown values', () => {
+    expect(Object.isFrozen(LATER_ROUND_ADVISORY_SCOPES)).toBe(true);
+    expect(LATER_ROUND_CHANGE_WINDOW).toBe(3);
+    expect(DEFERRED_ADVISORY_REASON).toBe('later-round-advisory-untouched');
+    for (const value of [undefined, '', 'changed-only', 'all', 'junk']) {
+      expect(laterRoundAdvisoryScopeFromEnv({ [LATER_ROUND_ADVISORY_SCOPE_ENV]: value })).toEqual({
+        scope: value === 'all' || value === 'junk' ? 'all' : 'changed-only',
+        fellBack: value === 'junk' ? 'unknown-scope-value' : null,
+      });
+    }
+  });
+
+  it('uses only source extensions', () => {
+    for (const ext of 'js mjs cjs ts mts cts tsx jsx css scss html py sh rb go rs java kt swift c h cc cpp vue svelte'.split(' ')) {
+      expect(isSourcePath(`src/a.${ext}`)).toBe(true);
+    }
+    for (const file of ['a.md', 'a.json', 'a.yml', 'a.yaml', 'a.toml', 'a.csv', 'a.txt', 'Makefile', '.js', '.env', null]) {
+      expect(isSourcePath(file)).toBe(false);
+    }
+  });
+
+  it.each([undefined, null, { priorHead: null }])('keeps round one (%j)', latestFix => {
+    expect(classify([finding], { latestFix })).toEqual({ kept: [finding], deferred: [], scope: 'changed-only', fellBack: null });
+  });
+
+  it('keeps original objects within three lines and defers farther citations', () => {
+    const near = { ...finding, file: './src/a.mjs:103', line: 103 };
+    const far = { ...finding, line: 104 };
+    const result = classify([finding, near, far]);
+    expect(result.kept).toEqual([near]);
+    expect(result.kept[0]).toBe(near);
+    expect(result.deferred).toEqual([finding, far].map(f => ({ ...f, deferred: DEFERRED_ADVISORY_REASON })));
+    expect(finding).not.toHaveProperty('deferred');
+  });
+
+  it.each(['correctness', 'security'])('never scopes %s', lens => {
+    expect(classify([finding], { lens }).kept).toEqual([finding]);
+  });
+  it('supports custom mandatory lenses and all scope', () => {
+    expect(classify([finding], { mandatoryLenses: ['simplicity'] }).kept).toEqual([finding]);
+    expect(classify([finding], { scope: 'all' }).kept).toEqual([finding]);
+  });
+  it.each([
+    [{ priorHead: 'aaaa', head: 'bbbb', error: 'git-diff-failed' }, 'git-diff-failed'],
+    [{ priorHead: 'aaaa', files: null }, 'malformed-latest-fix'],
+    [{ priorHead: 'aaaa', files: [] }, 'malformed-latest-fix'],
+    [{ priorHead: 'aaaa', files: { 'src/a.mjs': 'unknown' } }, 'malformed-latest-fix'],
+    ['bad', 'malformed-latest-fix'],
+    [{ priorHead: 'aaaa', head: 'bbbb', files: new Date() }, 'malformed-latest-fix'],
+    [{ priorHead: 'aaaa', files: {} }, 'malformed-latest-fix'],
+  ])('keeps all on unreadable ranges (%j)', (latestFix, reason) => {
+    expect(classify([finding], { latestFix })).toEqual({ kept: [finding], deferred: [], scope: 'all', fellBack: `changed-range-unreadable: ${reason}` });
+  });
+  it('keeps unknown changes, missing coordinates, and any touched non-source file', () => {
+    for (const file of ['a.md', 'a.json', 'src/a.mjs']) {
+      const f = { ...finding, file };
+      expect(classify([f], { latestFix: { ...latestFix, files: { [file]: null } } }).kept).toEqual([f]);
+      expect(classify([f], { latestFix: { ...latestFix, files: {} } }).deferred).toHaveLength(1);
+      if (file !== 'src/a.mjs') expect(classify([f], { latestFix: { ...latestFix, files: { [file]: [100] } } }).kept).toEqual([f]);
+    }
+    for (const f of [{ ...finding, line: undefined }, { ...finding, line: -1 }, { summary: 'whole PR' }, null]) {
+      expect(classify([f]).kept[0]).toBe(f);
+    }
+    expect(classify(null).kept).toEqual([]);
+  });
+});
+
+describe('#5135 one-line panel reason', () => {
+  const f = { category: 'security/guard', file: 'src/a.mjs', line: 20, summary: 'guard missing', outcome: 'fixed', prevention: 'add a test', preventionCaptured: false };
+  const explain = options => explainPanelOutcome({ outcome: 'changes', findings: [], lensVerdicts: {}, ...options });
+  it.each(['security', 'codex-correctness'])('names %s prevention debt and its citation', lens => {
+    const name = lens === 'security' ? lens : `${lens} advisory`;
+    expect(explain({ findings: [{ ...f, category: `${lens}/guard` }] })).toBe(`Changes: ${name} owes a prevention card (finding \`src/a.mjs:20\`)`);
+    expect(explain({ lensVerdicts: { [lens]: 'prevention-outstanding' } })).toBe(`Changes: ${name} owes a prevention card`);
+  });
+  it.each(['changes', 'needs-human'])('explains mandatory %s before prevention', verdict => {
+    expect(explain({ lensVerdicts: { security: verdict }, findings: [f, { ...f, outcome: undefined }] })).toBe('Changes: security found a blocking defect (finding `src/a.mjs:20`)');
+  });
+  it('explains accept, null, pending, blocked, and fallback in order', () => {
+    expect(explain({ outcome: 'accept' })).toBe('Accept: no blocking findings on this head');
+    expect(explain({ outcome: null })).toBe('No outcome: the reviewed head is not pinned, so no advisory label is applied');
+    expect(explain({ outcome: 'accept', pendingReferrals: [{}] })).toBe('Pending: 1 mandatory referral(s) await a ruling');
+    expect(explain({ blockedReferrals: [{ finding: f }], pendingReferrals: [{}] })).toBe('Changes: a mandatory referral was ruled block (finding `src/a.mjs:20`)');
+    expect(explain({ blockedReferrals: [{}] })).toBe('Changes: a mandatory referral was ruled block');
+    expect(explain({})).toBe('Changes: the panel did not accept this head');
+  });
+  it('uses file or short summary citations and stays on one line', () => {
+    expect(explain({ findings: [{ ...f, line: undefined }] })).toContain('(finding `src/a.mjs`)');
+    const summary = 'x'.repeat(65);
+    expect(explain({ findings: [{ ...f, file: undefined, summary }] })).toContain(`(finding \`${summary.slice(0, 60)}\`)`);
+    expect(explain({ findings: [{ ...f, file: undefined, summary: 'first\nsecond' }] })).not.toContain('\n');
+  });
+  it('appends deferral and fallback explanations', () => {
+    expect(explain({ outcome: 'accept', deferredCount: 2, scopeFellBack: 'unknown-scope-value' })).toBe('Accept: no blocking findings on this head · 2 later-round advisory finding(s) moved to card suggestions · advisory scope fell back to `all` (unknown-scope-value)');
   });
 });

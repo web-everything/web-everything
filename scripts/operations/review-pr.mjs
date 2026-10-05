@@ -1,4 +1,4 @@
-import { requiresMandatoryReferral } from '../lib/jury-core.mjs';
+import { requiresMandatoryReferral, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome } from '../lib/jury-core.mjs';
 /**
  * @file scripts/operations/review-pr.mjs
  * @description THE `review-pr` DECLARATION — the first real operation on the engine (#3035, under epic #3029).
@@ -1062,6 +1062,7 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
   return {
     hasReferralRecord: JSON.stringify(raw.comments ?? []).includes('mandatory-referrals-v1'),
     priorRounds: Number(raw?.priorRounds) || 0,
+    latestFix: raw?.latestFix && typeof raw.latestFix === 'object' ? raw.latestFix : undefined,
     pr: Number(detail.pr) || Number(pr) || 0,
     repo: String(detail.repo || repo || ''),
     title: String(detail.title || ''),
@@ -1808,6 +1809,12 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
   const lensVerdicts = v.lensVerdicts && typeof v.lensVerdicts === 'object' ? v.lensVerdicts : {};
   const lensProviders = v.lensProviders && typeof v.lensProviders === 'object' ? v.lensProviders : {};
   const lenses = Array.isArray(v.lenses) && v.lenses.length ? v.lenses : Object.keys(lensVerdicts);
+  const reasonLine = explainPanelOutcome({
+    outcome, lensVerdicts, findings: v.admittedFindings ?? v.findings ?? [],
+    mandatoryLenses: MANDATORY_LENSES.filter(l => lenses.includes(l)),
+    blockedReferrals: v.blockedReferrals, pendingReferrals: v.pendingReferrals,
+    deferredCount: v.deferredAdvisory?.length ?? 0, scopeFellBack: v.advisoryScope?.fellBack ?? null,
+  });
   const body = renderPanelComment({
     findings: v.findings,
     verdict: v.verdict,
@@ -1824,11 +1831,22 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
     : `Net basis: \`${read.netBasis.base ?? '?'}..${read.netBasis.rev ?? '?'}\`${renderRevProvenance(read.netBasis)} — `
       + `${read.netChangedFiles.length} net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`;
   return [
-    `${ADVISORY_NOTE_MARKER} This PR carries \`review:human\`. The independent`,
+    `${ADVISORY_NOTE_MARKER} ${reasonLine}`,
+    'This PR carries `review:human`. The independent',
     'AI review below ran automatically, before the required human review ceremony — it has neither accepted nor',
     'bounced this PR. No `review:*` label was changed and no decision was recorded.',
     '',
     body,
+    ...(v.deferredAdvisory?.length ? [
+      '',
+      `### Card suggestions (filed later) (${v.deferredAdvisory.length})`,
+      `Later-round advisory findings on code the latest fix (\`${read.latestFix?.priorHead?.slice(0, 8)}..${read.latestFix?.head?.slice(0, 8)}\`) did not touch. They do not count toward \`changes\`; file them as cards instead of fixing them in this PR (#5135).`,
+      ...v.deferredAdvisory.map(f => {
+        const lens = f.category?.split('/')[0] ?? '';
+        const cite = f.file ? `${f.file}${f.line ? `:${f.line}` : ''}` : String(f.summary ?? '').slice(0, 60);
+        return `- \`${lens}\` \`${cite}\` — ${f.summary}`;
+      }),
+    ] : []),
     // THE MACHINE-READABLE OUTCOME, the line `we:scripts/lib/advisory-labels.mjs#parseAdvisories` reads back.
     // The `**Verdict:**` line above cannot carry it: on a `review:human` PR it is always "human review required".
     ...(outcome
@@ -2269,6 +2287,9 @@ export function reviewPrOperation({
       ],
       fn: (view) => {
         const read = view.findings.read;
+        const advisoryScope = laterRoundAdvisoryScopeFromEnv(process.env);
+        let advisoryScopeFellBack = advisoryScope.fellBack;
+        const deferredAdvisory = [];
         // The seats, in declared order. `step` is carried so the refusal below can NAME which juror was
         // silent: with two (or, opted in, three) of them, "the juror returned no summary" is not enough to
         // act on.
@@ -2362,6 +2383,16 @@ export function reviewPrOperation({
           }
           const scoped = scopeFindingsToCitedFiles(answer.findings, { scope: citationScope });
           const raw = scoped.findings;
+          const classified = classifyLaterRoundAdvisory(scoped.admitted, {
+            lens: seat.lens, scope: advisoryScope.scope, latestFix: read.latestFix,
+          });
+          advisoryScopeFellBack ??= classified.fellBack;
+          const kept = new Set(classified.kept);
+          const deferredOriginals = new Set(scoped.admitted.filter(f => !kept.has(f)));
+          const published = raw.filter(f => !deferredOriginals.has(f));
+          deferredAdvisory.push(...classified.deferred.map(f => ({
+            ...f, category: f.category ? `${seat.lens}/${f.category}` : seat.lens,
+          })));
           citationScopeEnforced = citationScopeEnforced || scoped.enforced;
           unverifiableCitations.push(...scoped.unverifiable);
           // #x0p5k2q — REFUSE A SILENT JUROR, here as well as in the shape. `required` in JSON Schema only
@@ -2382,9 +2413,9 @@ export function reviewPrOperation({
             );
           }
           if (!lenses.includes(seat.lens)) lenses.push(seat.lens);
-          lensFindings[seat.lens] = [...(lensFindings[seat.lens] ?? []), ...raw];
-          lensAdmitted[seat.lens] = [...(lensAdmitted[seat.lens] ?? []), ...scoped.admitted];
-          if (!ADVISORY_SEAT_STEPS.includes(seat.step)) verdictAdmitted[seat.lens] = [...(verdictAdmitted[seat.lens] ?? []), ...scoped.admitted];
+          lensFindings[seat.lens] = [...(lensFindings[seat.lens] ?? []), ...published];
+          lensAdmitted[seat.lens] = [...(lensAdmitted[seat.lens] ?? []), ...classified.kept];
+          if (!ADVISORY_SEAT_STEPS.includes(seat.step)) verdictAdmitted[seat.lens] = [...(verdictAdmitted[seat.lens] ?? []), ...classified.kept];
           summaries.push(`${seat.lens}: ${seatSummary}`);
           // #4446 — a gracefully skipped advisory seat is surfaced, never silently an `accept` row.
           if (answer.skipped) skippedSeats.push({ lens: seat.lens, reason: String(answer.skipped.reason ?? seatSummary) });
@@ -2435,6 +2466,8 @@ export function reviewPrOperation({
         return {
           verdict,
           referrals,
+          deferredAdvisory,
+          advisoryScope: { scope: advisoryScopeFellBack ? 'all' : advisoryScope.scope, fellBack: advisoryScopeFellBack },
           // WHERE THE LOOP STANDS, distinct from what this round decided. "converged" and "exhausted" both end
           // the loop and mean opposite things, so a caller must never have to infer one from the other. The
           // round comes from the durable ledger, so it needs no new state and survives a dead session.
