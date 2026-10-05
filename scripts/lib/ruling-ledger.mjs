@@ -21,7 +21,7 @@
  * PURE. A record is only read from a trusted author (`readReferralRecords` enforces that), and a comment that
  * cannot be read as a record contributes nothing here (the hold itself already fails closed on malformed ones).
  */
-import { readReferralRecords, mandatoryReferralState, parseOperatorRulingComment } from './jury-core.mjs';
+import { readReferralRecords, mandatoryReferralState, parseOperatorRulingComment, readOperatorRulings } from './jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { DEFAULT_FIXER_ESCALATION, TEST_FIRST_INSTRUCTION, humanAtMisses } from './fixer-escalation-policy.mjs';
 
@@ -194,6 +194,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
   // that a LATER one of these overruled on a matching finding is no longer a standing ruling (plateau-app #202, 2026-10-04:
   // a reviewer block on the first head, then the operator's not-real on the next head, raised a false "dispute").
   const allRecords = snaps.map((s) => s.record);
+  const operatorRulings = readOperatorRulings(pr?.comments).rulings;
   const overrules = [];
   (Array.isArray(pr?.comments) ? pr.comments : []).forEach((c, index) => {
     const parsed = parseOperatorRulingComment(c);
@@ -219,9 +220,11 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       const g = findingView(f);
       if (matches.some((m) => m.finding.key === g.key)) continue;
       if (rulingsHere(f.key).some((r) => r.result === 'block')) continue;
-      // Already settled on this head by the operator: their own ruling here, or one carried forward from an earlier head.
-      if ((record.carried ?? []).some((c) => c.key === f.key)
-        || overrules.some((o) => o.head === head && o.runId === record.runId && o.key === f.key)) continue;
+      // Already settled on this head by the operator: any structured ruling of theirs here (block included — they
+      // looked at it), or one carried forward from an earlier head whose operator backing is still in the thread.
+      if (operatorRulings.some((o) => o.head === head && o.runId === record.runId && o.key === f.key)
+        || (record.carried ?? []).some((c) => c.key === f.key
+          && operatorRulings.some((o) => o.head === c.from.head && o.runId === c.from.runId && o.key === c.from.key))) continue;
       // The standing ruling is the LATEST matching block: a fresh re-ruling restarts the count, so the ladder gives
       // the fixer the rungs that re-ruling bought instead of counting heads from the first ruling.
       let b = null;

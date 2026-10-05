@@ -1,4 +1,4 @@
-import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, liveReferrals } from '../jury-core.mjs';
+import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, findCarriedOperatorRuling, liveReferrals } from '../jury-core.mjs';
 import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER, REFERRAL_STAMP_POLICY_ENV, resolveReferralStampPolicy } from '../jury-core.mjs';
 /**
  * @file jury-core.test.mjs — proof of the #2654 (S2 of epic #2649) append-only JURY-LEDGER EVENT VOCABULARY:
@@ -1597,6 +1597,34 @@ describe('#4315 mandatory referral protocol', () => {
       expect(state.blocked).toEqual(result === 'block' ? [key] : []);
       expect(liveReferrals(r)).toEqual([]);
     }
+  });
+
+  describe('findCarriedOperatorRuling matches strictly (clearing a mandatory referral)', () => {
+    const file = 'scripts/api/handler.mjs';
+    const ruled = (summary, line = 40) => {
+      const r = record(), f = { ...finding, file, line, summary };
+      r.head = 'b'.repeat(40);
+      r.referrals = [{ key: referralFindingKey('judgeCorrectnessAdvisory', f), seat: 'judgeCorrectnessAdvisory', original: f, finding: normalizeFinding(f) }];
+      return { r, ops: [{ repo: r.repo, pr: r.pr, head: r.head, runId: r.runId, key: r.referrals[0].key, result: 'not-real' }] };
+    };
+    const target = (summary, line) => ({ finding: normalizeFinding({ ...finding, file, line, summary }) });
+    const carry = (summary, line, ruledSummary = 'Missing validation of the request payload') => {
+      const { r, ops } = ruled(ruledSummary);
+      return findCarriedOperatorRuling(target(summary, line), { records: [r], operatorRulings: ops, head: 'a'.repeat(40), repo: r.repo, pr: r.pr });
+    };
+    it('carries the identical and a lightly reworded finding', () => {
+      expect(carry('Missing validation of the request payload', 46)?.result).toBe('not-real');
+      expect(carry('Request payload validation is missing', 41)?.result).toBe('not-real');
+    });
+    it.each([
+      ['a different claim that merely contains the ruled words', 'Missing validation of the request payload leaves the authorization check bypassed in the handler, so any caller escalates', 46],
+      ['the same claim beyond the line window', 'Missing validation of the request payload', 49],
+    ])('does not carry %s', (_, summary, line) => {
+      expect(carry(summary, line)).toBeNull();
+    });
+    it('does not let a short earlier ruling clear a longer different finding (subset overlap)', () => {
+      expect(carry('Missing authorization check, validation absent in handler', 46, 'Missing validation')).toBeNull();
+    });
   });
 
   function supersession() {

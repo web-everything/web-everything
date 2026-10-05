@@ -24,7 +24,7 @@ import { join } from 'node:path';
 import {
   PR_VIEW_FIELDS, createReviewPrReader, createReviewPrSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
-  resolveSubjectCheckout,
+  resolveSubjectCheckout, COMPARE_FILE_CAP, changedLinesFromCompare, changesTouchCitedLines, createChangedLinesReader,
 } from '../review-pr-io.mjs';
 import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation } from '../review-pr.mjs';
 import { createRegistry } from '../registry.mjs';
@@ -1016,6 +1016,62 @@ describe('#xu2pp2m — `--cwd` decides which checkout the DIFF is read from', ()
   });
 });
 
+describe('operator-ruling carry: default changed-lines reader', () => {
+  const patch = '@@ -1,2 +1,3 @@\n a\n+b\n c\n@@ -20 +21,2 @@\n x\n+y';
+  const compare = (files, status = 'ahead') => ({ status, files });
+  it('parses hunk ranges from a compare payload (new side)', () => {
+    expect([...changedLinesFromCompare(compare([{ filename: 'a.mjs', status: 'modified', patch }]), 'a.mjs')]).toEqual([1, 2, 3, 21, 22]);
+  });
+  it.each([
+    ['a diverged compare (three-dot diffs from the merge base, not the ruled head)', compare([], 'diverged')],
+    ['a behind compare', compare([], 'behind')],
+    ['a missing file list', { status: 'ahead' }],
+    ['a rename', compare([{ filename: 'a.mjs', previous_filename: 'old.mjs', status: 'renamed', patch }])],
+    ['a removed file', compare([{ filename: 'a.mjs', status: 'removed', patch: '@@ -1,2 +0,0 @@\n-a\n-b' }])],
+    ['a missing patch', compare([{ filename: 'a.mjs', status: 'modified' }])],
+    ['a payload without hunks', compare([{ filename: 'a.mjs', status: 'modified', patch: 'Binary files differ' }])],
+    ['a truncated file list that omits the file', compare(Array.from({ length: COMPARE_FILE_CAP }, (_, i) => ({ filename: `f${i}`, status: 'modified', patch })))],
+    ['null', null],
+  ])('fails closed (null) on %s', (_, payload) => {
+    expect(changedLinesFromCompare(payload, 'a.mjs', () => true)).toBeNull();
+  });
+  it('treats a file absent from a complete list as unchanged only when it exists at both ends', () => {
+    expect(changedLinesFromCompare(compare([]), 'a.mjs', () => true)).toEqual(new Set());
+    expect(changedLinesFromCompare(compare([]), 'A.MJS', () => false)).toBeNull();
+    expect(changedLinesFromCompare(compare([], 'identical'), 'a.mjs', () => true)).toEqual(new Set());
+  });
+  it('stubbed gh: one compare per (repo, base, head), existence probed at both refs, failures fail closed', () => {
+    const calls = [];
+    const reader = createChangedLinesReader(args => {
+      calls.push(args[1]);
+      if (args[1].includes('/compare/')) return compare([{ filename: 'a.mjs', status: 'modified', patch }]);
+      if (args[1].includes('gone.mjs')) throw new Error('404');
+      if (args[1].includes('contents/src/dir')) return [{ type: 'file', name: 'x.mjs' }];
+      if (args[1].includes('contents/sub.mjs')) return { type: 'submodule' };
+      return { type: 'file' };
+    });
+    expect(reader('o/r', 'b'.repeat(40), 'h'.repeat(40), 'a.mjs')).toEqual(new Set([1, 2, 3, 21, 22]));
+    expect(reader('o/r', 'b'.repeat(40), 'h'.repeat(40), 'other.mjs')).toEqual(new Set());
+    expect(reader('o/r', 'b'.repeat(40), 'h'.repeat(40), 'gone.mjs')).toBeNull();
+    expect(reader('o/r', 'b'.repeat(40), 'h'.repeat(40), 'src/dir')).toBeNull(); // a directory is not a file
+    expect(reader('o/r', 'b'.repeat(40), 'h'.repeat(40), 'sub.mjs')).toBeNull(); // nor a submodule
+    expect(calls.filter(c => c.includes('/compare/'))).toHaveLength(1);
+    expect(calls.some(c => c.includes(`contents/other.mjs?ref=${'b'.repeat(40)}`))).toBe(true);
+    expect(calls.some(c => c.includes(`contents/other.mjs?ref=${'h'.repeat(40)}`))).toBe(true);
+    const failing = createChangedLinesReader(() => { throw new Error('boom'); });
+    expect(failing('o/r', 'b', 'h', 'a.mjs')).toBeNull();
+  });
+  it('window boundary: a change within ±3 of either cited line blocks the carry, ±4 does not', () => {
+    expect(changesTouchCitedLines(new Set([15]), [12, 40])).toBe(true);
+    expect(changesTouchCitedLines(new Set([16]), [12, 40])).toBe(false);
+    expect(changesTouchCitedLines(new Set([9]), [12, 40])).toBe(true);
+    expect(changesTouchCitedLines(new Set([8]), [12, 40])).toBe(false);
+    expect(changesTouchCitedLines(new Set([37]), [12, 40])).toBe(true);
+    expect(changesTouchCitedLines(new Set([100]), [12, null])).toBe(true);
+    expect(changesTouchCitedLines(new Set(), [12, null])).toBe(false);
+  });
+});
+
 describe('#4315 durable referral effects', () => {
   function harness({ result = 'not-real', failure, env = {}, readChangedLines = () => new Set() } = {}) {
     const head = 'a'.repeat(40), trace = [], lines = [];
@@ -1052,12 +1108,16 @@ describe('#4315 durable referral effects', () => {
     return { state, trace, lines, payload, judge, make, provider };
   }
 
-  it.each(['unchanged', 'changed', 'unknown', 'disabled'])('carries an earlier operator ruling only with unchanged lines: %s', async mode => {
+  it.each(['unchanged', 'changed', 'old-line-changed', 'unknown', 'disabled'])('carries an earlier operator ruling only with unchanged lines: %s', async mode => {
     const h = harness({ failure: 'omitted', env: mode === 'disabled' ? { WE_REFERRAL_CARRY_OPERATOR_RULINGS: '0' } : {},
-      readChangedLines: () => mode === 'unknown' ? null : new Set(mode === 'changed' ? [12] : []) });
-    h.payload.referrals[0].original.line = 12;
+      readChangedLines: () => mode === 'unknown' ? null : new Set(mode === 'changed' ? [12] : mode === 'old-line-changed' ? [18] : []) });
+    // The earlier ruled finding cited line 15, this one cites 12: line 18 is within ±3 of the OLD line only.
+    h.payload.referrals[0].original.line = mode === 'old-line-changed' ? 15 : 12;
     const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
+    const original = { ...old.referrals[0].original, line: 12 };
     const current = { ...old, head: h.state.headRefOid, runId: 'current',
+      referrals: [{ ...old.referrals[0], original, finding: normalizeFinding(original),
+        key: referralFindingKey('judgeCorrectnessAdvisory', original) }],
       reviewer: mandatoryReferralReviewer('current'), attempted: false };
     h.state.comments.push({ body: renderReferralRecord(current), author: { login: 'web-everything' } });
     h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
@@ -1073,7 +1133,9 @@ describe('#4315 durable referral effects', () => {
       expect(result.pending).toEqual([]);
     } else {
       expect(latest.carried).toBeUndefined();
-      expect(h.judge).toHaveBeenCalledOnce();
+      // (the old-line mode seeds a second, differently keyed record, so the judge may sit twice; the current finding is always sent)
+      expect(h.judge.mock.calls.some(([req]) => JSON.parse(req.input.split('\nUntrusted reported findings:\n')[1])
+        .some(f => f.key === current.referrals[0].key))).toBe(true);
       expect(result.pending).toContain(current.referrals[0].key);
     }
   });

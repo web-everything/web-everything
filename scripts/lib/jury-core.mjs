@@ -482,6 +482,17 @@ function wordOverlap(a, b) {
   return hit / Math.min(A.size, B.size);
 }
 
+/** Symmetric word overlap (|A∩B| / |A∪B|); unlike {@link wordOverlap} a subset of a longer text does not score 1. */
+function wordJaccard(a, b) {
+  const A = corroborationWords(a);
+  const B = corroborationWords(b);
+  if (!A.size || !B.size) return 0;
+  let hit = 0;
+  for (const w of A) if (B.has(w)) hit += 1;
+  return hit / (A.size + B.size - hit);
+}
+export const CARRY_SUMMARY_JACCARD_FLOOR = 0.6;
+
 /**
  * #4194 — DID ANOTHER SEAT RAISE THE SAME PROBLEM? PURE, deterministic. Used to stamp an ADDED (non-Claude)
  * review seat's finding with whether one of Claude's own seats confirmed it. Two findings corroborate when they
@@ -2340,7 +2351,9 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
     if (!(finding.line == null && target.line == null)
       && !(Number.isInteger(finding.line) && Number.isInteger(target.line)
         && Math.abs(finding.line - target.line) <= CORROBORATION_LINE_WINDOW)) continue;
-    if (summary(finding.summary) !== summary(target.summary) && wordOverlap(finding.summary, target.summary) < 0.5) continue;
+    // Clearing a mandatory referral is stricter than merging duplicates: symmetric (Jaccard) overlap, so a short
+    // earlier ruling cannot clear a longer, different claim that merely contains its words.
+    if (summary(finding.summary) !== summary(target.summary) && wordJaccard(finding.summary, target.summary) < CARRY_SUMMARY_JACCARD_FLOOR) continue;
     return { from: { head: o.head, runId: o.runId, key: o.key }, result: o.result, card: o.card, finding };
   }
   return null;

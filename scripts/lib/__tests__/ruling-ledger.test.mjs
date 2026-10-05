@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
+import { REFERRAL_CARRY_REASON, buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
 import {
   rulingNeeded, ignoredRulings, claimSimilarity, sameFinding, hasSentBack, renderRulingNotAddressed,
   fixerRulingBrief, RULING_NOT_ADDRESSED_MARKER,
@@ -92,6 +92,34 @@ describe('ignoredRulings', () => {
     const comments = [...history, comment(r2, 10), { body: overrule, author: { login: 'chalbert' }, createdAt: t(12) },
       comment(record({ head: H3, runId: 'run-3' }), 20)];
     expect(ignoredRulings({ headRefOid: H3, comments })).toBeNull();
+  });
+  // {reviewer block on an earlier head} x {what settles the finding on THIS head}.
+  describe('a finding the operator settled on this head is never an ignored ruling', () => {
+    const opComment = (rec, head, result, n) => ({ author: { login: 'chalbert' }, createdAt: t(n),
+      body: buildOperatorRulingComment({ version: 1, repo, pr: rec.pr, head, actor: 'chalbert', channel: 'test',
+        reason: 'settled', at: t(n), clearerId: '', rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result }] }) });
+    const r1 = () => record({ head: H1, runId: 'run-1' });
+    const carriedOn = (rec) => ({ ...rec, carried: [{ key: rec.referrals[0].key, reason: REFERRAL_CARRY_REASON,
+      from: { head: H1, runId: 'run-1', key: rec.referrals[0].key }, result: 'not-real' }] });
+    it('is flagged when nothing settled it (control)', () => {
+      const r2 = record({ head: H2, runId: 'run-2' });
+      expect(ignoredRulings({ headRefOid: H2, comments: [...history, comment(r2, 10)] })?.matches).toHaveLength(1);
+    });
+    it.each(['not-real', 'block'])('is quiet after the operator ruled %s on this head', (result) => {
+      const r2 = record({ head: H2, runId: 'run-2' });
+      expect(ignoredRulings({ headRefOid: H2, comments: [...history, comment(r2, 10), opComment(r2, H2, result, 11)] })).toBeNull();
+    });
+    it('is quiet for a finding carried forward from an operator ruling still in the thread', () => {
+      const r2 = carriedOn(record({ head: H2, runId: 'run-2' }));
+      // The operator's backing ruling sits BEFORE the reviewer block in the thread, so it does not overrule that
+      // block: only the carried skip can settle the finding here.
+      const [first, blockRecord] = history;
+      expect(ignoredRulings({ headRefOid: H2, comments: [first, opComment(r1(), H1, 'not-real', 2), blockRecord, comment(r2, 10)] })).toBeNull();
+    });
+    it('is flagged when the carried finding\'s operator backing is gone', () => {
+      const r2 = carriedOn(record({ head: H2, runId: 'run-2' }));
+      expect(ignoredRulings({ headRefOid: H2, comments: [...history, comment(r2, 10)] })?.matches).toHaveLength(1);
+    });
   });
   it('is quiet when the earlier ruling was not block (card / not-real)', () => {
     const rulingCard = [comment(record({ head: H1, runId: 'run-1' }), 1),
