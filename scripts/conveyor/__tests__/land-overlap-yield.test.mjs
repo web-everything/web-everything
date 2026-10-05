@@ -192,11 +192,11 @@ describe('validateOverlapYieldConfig — strict, never silently coerced', () => 
 describe('resolveOverlapYieldSettings — full replace, never merged field-by-field', () => {
   it('an override REPLACES the whole value, not just the touched field', () => {
     const fileConfig = { enabled: false, windowMinutes: 45 };
-    expect(resolveOverlapYieldSettings({ fileConfig, overrides: { enable: true, windowMinutes: null } })).toEqual({ enabled: true, windowMinutes: 45 });
-    expect(resolveOverlapYieldSettings({ fileConfig, overrides: { enable: null, windowMinutes: 5 } })).toEqual({ enabled: false, windowMinutes: 5 });
+    expect(resolveOverlapYieldSettings({ fileConfig, overrides: { enable: true, windowMinutes: null } })).toEqual({ enabled: true, windowMinutes: 45, skipRed: true });
+    expect(resolveOverlapYieldSettings({ fileConfig, overrides: { enable: null, windowMinutes: 5 } })).toEqual({ enabled: false, windowMinutes: 5, skipRed: true });
   });
-  it('no override ⇒ the file config, byte-identical', () => {
-    expect(resolveOverlapYieldSettings({ fileConfig: DEFAULT_OVERLAP_YIELD_CONFIG })).toEqual(DEFAULT_OVERLAP_YIELD_CONFIG);
+  it('no override ⇒ the file config plus skipRed:true', () => {
+    expect(resolveOverlapYieldSettings({ fileConfig: DEFAULT_OVERLAP_YIELD_CONFIG })).toEqual({ ...DEFAULT_OVERLAP_YIELD_CONFIG, skipRed: true });
   });
 });
 
@@ -287,6 +287,17 @@ describe('computeOverlapContext — the drain\'s IO orchestration (2026-09-29 re
     });
     const w = waits.get('we#2');
     expect(w.windowMinutes).toBe(5); // the override — NOT 999 (history) and NOT 45 (code default)
+  });
+
+  it('reports final skips once alongside a green wait', () => {
+    const red = row(1, { requiredCheckRed: true, files: [{ path: 'shared.md', additions: 500 }] });
+    const green = row(3, { files: [{ path: 'shared.md', additions: 100 }] });
+    const { waits, skips } = computeOverlapContext({
+      candidateRows: [xRow(2)], openPrRows: [red, green], nowMs: T0,
+      exec: trustedExec, ghExec: readyGhExec, overrides: { windowMinutes: 5 },
+    });
+    expect(waits.get('we#2').yieldTo).toBe(3);
+    expect(skips.get('we#2')).toEqual([{ pr: 1, repo: 'we', reason: 'red-ci', token: 'overlap-yield-skipped:#1(red-ci)' }]);
   });
 
   it('with NO override, a trusted history value is used', () => {
@@ -439,5 +450,60 @@ describe('readyToMergeLabelTimeMs — event parsing and the by-sha cache', () =>
     expect(readyToMergeLabelTimeMs({ repo: null, num: 1, sha: 'a1a1a1a1', exec: g.exec, dir })).toBeNull();
     expect(readyToMergeLabelTimeMs({ repo: 'o/r', num: 1, sha: '', exec: g.exec, dir })).toBeNull();
     expect(g.count()).toBe(0);
+  });
+});
+
+describe('overlap-yield red CI skips', () => {
+  const x = row({ number: 10, files: [{ path: 'shared.mjs', additions: 5 }], readyAtMs: T0, windowMs: 45 * MIN });
+  const y = { ...row({ number: 20, labels: ['review:pending'], files: [{ path: 'shared.mjs', additions: 200 }] }), requiredCheckRed: true };
+  const skipped = { pr: 20, repo: 'we', reason: 'red-ci', token: 'overlap-yield-skipped:#20(red-ci)' };
+
+  it('skips a red target once, including after the yield budget expires', () => {
+    for (const nowMs of [T0, T0 + 46 * MIN]) {
+      const skips = new Map();
+      expect(overlapYieldWaits({ candidates: [x], openPrs: [y, y], nowMs, skips }).size).toBe(0);
+      expect(skips.get(overlapRowKey(x))).toEqual([skipped]);
+    }
+  });
+
+  it('pending targets and skipRed:false retain the existing yield', () => {
+    for (const options of [{ openPrs: [{ ...y, requiredCheckRed: false }] }, { openPrs: [y], skipRed: false }]) {
+      const skips = new Map();
+      expect(overlapYieldWaits({ candidates: [x], nowMs: T0, skips, ...options }).get(overlapRowKey(x)).yieldTo).toBe(20);
+      expect(skips.size).toBe(0);
+    }
+  });
+
+  it('yields to a smaller green target that still outranks X and records the red target', () => {
+    const green = { ...y, number: 30, requiredCheckRed: false, files: [{ path: 'shared.mjs', additions: 100 }] };
+    const skips = new Map();
+    expect(overlapYieldWaits({ candidates: [x], openPrs: [y, green], nowMs: T0, skips }).get(overlapRowKey(x)).yieldTo).toBe(30);
+    expect(skips.get(overlapRowKey(x))).toEqual([skipped]);
+  });
+
+  it('does not report red targets that fail an earlier rule', () => {
+    const skips = new Map();
+    overlapYieldWaits({ openPrs: [{ ...y, isDraft: true }, { ...y, dependsOn: new Set([100]) }],
+      nowMs: T0, skips, candidates: [{ ...x, item: 100 }] });
+    expect(skips.size).toBe(0);
+  });
+
+  it.each([['0', false], ['1', true], [undefined, null]])('parses skip-red env %s and resolves its default', (raw, expected) => {
+    const overrides = parseOverlapYieldOverrides({ env: { WE_DRAIN_YIELD_SKIP_RED: raw } });
+    expect(overrides.skipRed).toBe(expected);
+    expect(resolveOverlapYieldSettings({ overrides }).skipRed).toBe(expected ?? true);
+  });
+
+  it('rejects an invalid skip-red env value', () => {
+    expect(() => parseOverlapYieldOverrides({ env: { WE_DRAIN_YIELD_SKIP_RED: 'true' } })).toThrow(/usage: WE_DRAIN_YIELD_SKIP_RED must be "0" or "1"/);
+  });
+
+  it('returns all-red trial skips without fetching label times or history', () => {
+    const calls = [];
+    const exec = (...args) => { calls.push(args); throw new Error('unexpected IO'); };
+    const result = computeOverlapContext({ candidateRows: [x], openPrRows: [y], nowMs: T0, exec, ghExec: exec });
+    expect(result.waits.size).toBe(0);
+    expect(result.skips.get(overlapRowKey(x))).toEqual([skipped]);
+    expect(calls).toEqual([]);
   });
 });

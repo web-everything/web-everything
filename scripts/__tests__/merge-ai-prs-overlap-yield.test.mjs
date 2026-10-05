@@ -159,3 +159,44 @@ describe('buildOverlapRows — #4308 row-shape wiring (2026-09-29 review finding
     expect(ctlWaits.get(overlapRowKey({ repo: 'we', number: 1 }))?.yieldTo).toBe(2);
   });
 });
+
+describe('overlap-yield required CI wiring', () => {
+  it.each([
+    [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }, true],
+    [{ context: 'test', state: 'PENDING' }, false],
+    [{ name: 'test', status: 'IN_PROGRESS', conclusion: null }, false],
+    [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, false],
+  ])('classifies required checks: %j', (check, red) => {
+    const { openPrRows } = buildOverlapRows({ openPrContext: { prsByRepo: new Map([['we', [{ number: 1, statusCheckRollup: [check] }]]]) } });
+    expect(openPrRows[0].requiredCheckRed).toBe(red);
+  });
+
+  it('attaches skip tokens to ready and deferred entries without changing waits or idle accounting', () => {
+    const overlapSkips = new Map([['we#10', [{ token: 'overlap-yield-skipped:#20(red-ci)' }]]]);
+    const x = cand(10, 100, [], 'merge', 'we');
+    const ready = planLabelDrain([x], { overlapSkips }).ready[0];
+    expect(ready.overlapYieldSkipped).toEqual(['overlap-yield-skipped:#20(red-ci)']);
+    expect(ready.waitOn).toBeUndefined();
+    const held = { ...x, coupleDefer: true, coupleCarrier: { num: 11 }, coupleDeferReason: 'held' };
+    const { deferred } = planLabelDrain([held], { overlapSkips });
+    expect(deferred[0].overlapYieldSkipped).toEqual(ready.overlapYieldSkipped);
+    expect(deferred[0].waitOn).toEqual(['couple-carrier:11']);
+    expect(isPassIdle({ merged: 0, pendingRebased: 0, deferred })).toBe(true);
+  });
+
+  it('replays #3983 held behind red #3990 on stand-down.test.mjs', () => {
+    const path = 'scripts/conveyor/__tests__/stand-down.test.mjs';
+    const prs = [
+      { number: 3983, baseRefName: 'main', files: [{ path, additions: 289 }] },
+      { number: 3990, baseRefName: 'main', files: [{ path, additions: 1110 }], labels: ['review:pending'],
+        statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] },
+    ];
+    const x = cand(3983, null, [], 'merge', 'we');
+    const { candidateRows, openPrRows } = buildOverlapRows({ candidates: [x], verdicts: [x], openPrContext: { prsByRepo: new Map([['we', prs]]) } });
+    const skips = new Map();
+    const waits = overlapYieldWaits({ candidates: candidateRows, openPrs: openPrRows, nowMs: 0, skips });
+    expect(waits.size).toBe(0);
+    expect(skips.get('we#3983')).toEqual([{ pr: 3990, repo: 'we', reason: 'red-ci', token: 'overlap-yield-skipped:#3990(red-ci)' }]);
+    expect(planLabelDrain([x], { overlapContext: waits, overlapSkips: skips }).ready[0].overlapYieldSkipped).toEqual(['overlap-yield-skipped:#3990(red-ci)']);
+  });
+});
