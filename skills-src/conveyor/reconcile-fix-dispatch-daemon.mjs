@@ -702,13 +702,14 @@ export function defaultTagDispatchStatus({ pr, repo }) {
  * `reconcile-core.mjs#planReconcile` refused OUTRIGHT and never even offered) — the exact distinction PRs
  * #2635/#2636/#2653 made invisible on 2026-09-25 (see this file's own imports' docblocks for the incident).
  * @param {string} label - `'refused'` or `'reconcile-refused'`.
- * @param {{repo?:string, kind?:string, prNumber?:(number|null), pr?:(number|null), why?:string}} r
+ * @param {{repo?:string, kind?:string, prNumber?:(number|null), pr?:(number|null), why?:string, name?:(string|null), pid?:(number|null), cwd?:(string|null)}} r
  * @returns {string}
  */
 export function formatRefusalLine(label, r) {
   const prNum = r?.prNumber ?? r?.pr ?? null;
   const prLabel = prNum == null ? '(no PR)' : `PR #${prNum}`;
-  return `reconcile-fix-dispatch-daemon: ${label} ${r?.kind ?? 'unknown'} ${r?.repo ?? '?'} ${prLabel} — ${r?.why ?? '(no reason given)'}`;
+  const holder = r?.kind === 'live-process' ? ` [name=${r.name ?? '?'} pid=${r.pid ?? 'absent'} cwd=${r.cwd ?? '?'}]` : '';
+  return `reconcile-fix-dispatch-daemon: ${label} ${r?.kind ?? 'unknown'} ${r?.repo ?? '?'} ${prLabel} — ${r?.why ?? '(no reason given)'}${holder}`;
 }
 
 /** ONE printable line per draft the promote half un-drafted (`gh pr ready`), the success half of "log every
