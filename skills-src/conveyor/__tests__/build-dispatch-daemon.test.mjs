@@ -2054,3 +2054,85 @@ describe('probation prepare route circuit breaker', () => {
     }
   });
 });
+
+
+describe('gatePausedTicks', () => {
+  const loadGate = () => import('../build-dispatch-daemon.mjs');
+
+  it('checks the kill switch first and skips the tick with its reason', async () => {
+    const { gatePausedTicks } = await loadGate();
+    const tickOnce = vi.fn();
+    const killSwitch = vi.fn(() => ({ engaged: true, reason: 'operator pause' }));
+    const tick = gatePausedTicks({ tickOnce, killSwitch, env: {} });
+    expect(await tick()).toEqual({ skipped: true, reason: 'paused (operator pause)' });
+    expect(killSwitch).toHaveBeenCalledTimes(1);
+    expect(tickOnce).not.toHaveBeenCalled();
+  });
+
+  it('preserves full paused preparation when opted in', async () => {
+    const { gatePausedTicks, PAUSED_PREP_ENV } = await loadGate();
+    const tickOnce = vi.fn(async () => ({ plan: {} }));
+    const tick = gatePausedTicks({ tickOnce, killSwitch: () => ({ engaged: true }), env: { [PAUSED_PREP_ENV]: '1' } });
+    expect(await tick()).toEqual({ plan: {} });
+    expect(tickOnce).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs an unpaused tick through the sync wrapper after checking the switch', async () => {
+    const { gatePausedTicks } = await loadGate();
+    const calls = [];
+    const tickOnce = vi.fn(async () => { calls.push('tick'); return { plan: {} }; });
+    const tick = gatePausedTicks({ tickOnce, env: {},
+      killSwitch: () => { calls.push('kill'); return { engaged: false }; },
+      wrapSync: (inner) => async () => { calls.push('sync'); return inner(); },
+    });
+    expect(await tick()).toEqual({ plan: {} });
+    expect(calls).toEqual(['kill', 'sync', 'tick']);
+  });
+
+  it.each([undefined, '120000', 'invalid', '0', '-1', 'Infinity'])('throttles sync-only ticks with cadence %s', async (cadence) => {
+    const { gatePausedTicks, PAUSED_SYNC_MS_ENV, DEFAULT_PAUSED_SYNC_MS } = await loadGate();
+    expect(DEFAULT_PAUSED_SYNC_MS).toBe(30 * 60 * 1000);
+    let time = 0;
+    const tickOnce = vi.fn();
+    const sync = vi.fn((inner) => inner());
+    const tick = gatePausedTicks({ tickOnce, killSwitch: () => ({ engaged: true, reason: 'file' }),
+      wrapSync: (inner) => () => sync(inner), now: () => time, env: { [PAUSED_SYNC_MS_ENV]: cadence },
+    });
+    expect(await tick()).toEqual({ skipped: true, reason: 'paused (file); clone self-synced' });
+    time = 60_000;
+    expect(await tick()).toEqual({ skipped: true, reason: 'paused (file)' });
+    expect(sync).toHaveBeenCalledTimes(1);
+    time = cadence === '120000' ? 120_000 : 31 * 60_000;
+    await tick();
+    expect(sync).toHaveBeenCalledTimes(2);
+    expect(tickOnce).not.toHaveBeenCalled();
+  });
+
+  it.each(['', '0', 'FALSE', 'Off'])('keeps paused preparation off for %s', async (value) => {
+    const { gatePausedTicks, PAUSED_PREP_ENV } = await loadGate();
+    const tickOnce = vi.fn();
+    await gatePausedTicks({ tickOnce, killSwitch: () => ({ engaged: true }), env: { [PAUSED_PREP_ENV]: value } })();
+    expect(tickOnce).not.toHaveBeenCalled();
+  });
+
+  it.each(['success', 'skip', 'throw'])('resets the short circuit after sync %s', async (outcome) => {
+    const { gatePausedTicks } = await loadGate();
+    let engaged = true;
+    const tickOnce = vi.fn(async () => ({ plan: {} }));
+    const skipped = { skipped: true, reason: 'sync busy' };
+    const tick = gatePausedTicks({ tickOnce, env: {}, killSwitch: () => ({ engaged, reason: 'file' }),
+      wrapSync: (inner) => async () => {
+        if (engaged && outcome === 'throw') throw new Error('sync failed');
+        if (engaged && outcome === 'skip') return skipped;
+        return inner();
+      },
+    });
+    if (outcome === 'throw') await expect(tick()).rejects.toThrow('sync failed');
+    else if (outcome === 'skip') expect(await tick()).toBe(skipped);
+    else await tick();
+    expect(tickOnce).not.toHaveBeenCalled();
+    engaged = false;
+    expect(await tick()).toEqual({ plan: {} });
+    expect(tickOnce).toHaveBeenCalledTimes(1);
+  });
+});

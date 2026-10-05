@@ -21,7 +21,9 @@
  *     observed progress (a PR delivers the item, or the item left the cleared queue). A restarted daemon has a
  *     new pid, so it cannot take an old claim, and the claim's stored scope keeps the hot-file rule honest.
  *   - KILL SWITCH: `WE_BUILD_DAEMON_KILL=1`, or the file `<coordination root>/build-dispatch-daemon.kill`,
- *     freezes every new dispatch on the next tick (the daemon keeps planning and logging).
+ *     skips live tick preparation and dispatch, logging one paused line per tick. With --self-sync, the
+ *     shared clone still syncs every 30 minutes (WE_BUILD_DAEMON_PAUSED_SYNC_MS overrides the interval).
+ *     WE_BUILD_DAEMON_PAUSED_PREP=1 restores full paused ticks; dry-run always reports the full plan.
  *   - LIVE IS OPT-IN: without `--live` the daemon refuses to dispatch. `--dry-run` prints what it WOULD
  *     dispatch now and exits, touching nothing (no lease, no claim, no dispatch).
  *
@@ -89,6 +91,9 @@ export const PREPARE_SESSION_DEAD_GRACE_MS = 20 * 60_000;
 export const INFRA_RETRY_TIMEOUT_MS = 60_000;
 export const KILL_SWITCH_ENV = 'WE_BUILD_DAEMON_KILL';
 export const KILL_SWITCH_FILENAME = 'build-dispatch-daemon.kill';
+export const PAUSED_PREP_ENV = 'WE_BUILD_DAEMON_PAUSED_PREP';
+export const PAUSED_SYNC_MS_ENV = 'WE_BUILD_DAEMON_PAUSED_SYNC_MS';
+export const DEFAULT_PAUSED_SYNC_MS = 30 * 60 * 1000;
 
 // ── PURE CORE ────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -98,6 +103,34 @@ export function readKillSwitch({ env = {}, killFileExists = false, killFilePath 
   if (v && v !== '0' && v !== 'false' && v !== 'off') return { engaged: true, reason: `${KILL_SWITCH_ENV}=${env[KILL_SWITCH_ENV]}` };
   if (killFileExists) return { engaged: true, reason: `kill file ${killFilePath}` };
   return { engaged: false };
+}
+
+/** Gate serial live ticks before preparation, retaining a slow sync for the shared verify clone. */
+export function gatePausedTicks({ tickOnce, wrapSync = null, killSwitch, env = process.env, now = Date.now, log = () => {} }) {
+  let pausedResult = null;
+  let lastPausedSync = null;
+  const inner = async () => pausedResult ?? tickOnce();
+  const synced = wrapSync ? wrapSync(inner) : inner;
+  return async function tick() {
+    const kill = killSwitch();
+    const prep = String(env[PAUSED_PREP_ENV] ?? '').trim().toLowerCase();
+    if (!kill.engaged || (prep && !['0', 'false', 'off'].includes(prep))) return synced();
+    const paused = { skipped: true, reason: `paused (${kill.reason})` };
+    if (!wrapSync) return paused;
+    const configuredMs = Number(env[PAUSED_SYNC_MS_ENV]);
+    const intervalMs = Number.isFinite(configuredMs) && configuredMs > 0 ? configuredMs : DEFAULT_PAUSED_SYNC_MS;
+    const time = now();
+    if (lastPausedSync !== null && time - lastPausedSync < intervalMs) return paused;
+    lastPausedSync = time;
+    pausedResult = paused;
+    try {
+      const result = await synced();
+      if (result !== paused && result?.skipped) return result;
+      return { ...paused, reason: `${paused.reason}; clone self-synced` };
+    } finally {
+      pausedResult = null;
+    }
+  };
 }
 
 const GUARD_LISTS = ['buildGuards', 'prepareGuards', 'fixGuards', 'ciHealGuards'];
@@ -1463,7 +1496,7 @@ async function live(flags) {
   const effects = cliEffects();
   const prepareEnabled = !flags['no-prepare'];
   let bookkeeping = {};
-  let tickOnce = async () => {
+  const rawTickOnce = async () => {
     const timer = createPhaseTimer();
     const rows = await timer.measure('readBuildRuns', () => cliListRunStoreInFlight());
     effects.listRunStoreInFlight = () => rows;
@@ -1475,10 +1508,14 @@ async function live(flags) {
     bookkeeping = r.nextBookkeeping;
     return r;
   };
-  if (flags['self-sync'] === true) {
-    const { wireSelfSyncAndAppAuth } = await import('./runner.mjs');
-    tickOnce = wireSelfSyncAndAppAuth({ tickOnce, root: REPO_ROOT, selfSync: true, onRestart: () => { release(); process.exit(0); } });
-  }
+  const { wireSelfSyncAndAppAuth } = flags['self-sync'] === true ? await import('./runner.mjs') : {};
+  const tickOnce = gatePausedTicks({
+    tickOnce: rawTickOnce,
+    wrapSync: flags['self-sync'] === true
+      ? (t) => wireSelfSyncAndAppAuth({ tickOnce: t, root: REPO_ROOT, selfSync: true, onRestart: () => { release(); process.exit(0); } })
+      : null,
+    killSwitch: cliKillSwitch,
+  });
   const intervalMs = Number(flags['interval-ms']) > 0 ? Number(flags['interval-ms']) : DEFAULT_INTERVAL_MS;
   console.error(`build-dispatch-daemon: live on ${hostname()}:${process.pid}, caps Claude ${policy.maxConcurrentBuilds} / external ${policy.maxConcurrentExternalBuilds}, tick every ${intervalMs}ms${flags['self-sync'] ? ', self-sync ON' : ''}.`);
   const { stoppedReason } = await runDaemonLoop({
@@ -1510,6 +1547,7 @@ async function main(argv) {
     + '       build-dispatch-daemon.mjs --live [--once] [--self-sync] [--no-prepare] [--max-concurrent=1] [--max-concurrent-external=4] [--max-open-prs=12] [--max-open-items=7] [--interval-ms=120000]\n'
     + 'red draft age env: WE_BUILD_DAEMON_RED_DRAFT_MINUTES (default 60)\n'
     + 'caps env: WE_BUILD_DAEMON_MAX_CONCURRENT (Claude), WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL (Codex/agy); flags win\n'
+    + `paused ticks: ${PAUSED_PREP_ENV}=1 restores full preparation; ${PAUSED_SYNC_MS_ENV} sets clone sync interval (default ${DEFAULT_PAUSED_SYNC_MS}ms)\n`
     + `kill switch: ${KILL_SWITCH_ENV}=1 or touch <coordination root>/${KILL_SWITCH_FILENAME}`);
   process.exit(2);
 }
