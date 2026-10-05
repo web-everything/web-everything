@@ -125,16 +125,19 @@ export const REVIEW_DAEMON_LEASE_KEY = '<conveyor:review-daemon-lease>';
 /** Matches runner.mjs's own tick cadence — this sequence ran at that rate as one of its mechanical passes. */
 export const DEFAULT_INTERVAL_MS = 120_000;
 export const MIN_INTERVAL_MS = 10_000;
+/** Node's setTimeout treats any delay above 2**31-1 ms (~24.8 days) as 1 ms, which would turn a "tick rarely"
+ *  setting into back-to-back passes — so valid intervals are clamped to this ceiling. */
+export const MAX_INTERVAL_MS = 2 ** 31 - 1;
 
 /** #5136 — `--interval-ms` overrides `WE_REVIEW_DAEMON_INTERVAL_MS`, then the default cadence.
- *  Invalid values fall through to the next source; valid intervals have a 10-second minimum. */
+ *  Invalid values fall through to the next source; valid intervals are clamped to [10 s, 2**31-1 ms]. */
 export function resolveReviewIntervalMs({ env = process.env, argv = process.argv.slice(2) } = {}) {
   const flagIndex = argv.findIndex((arg) => arg === '--interval-ms' || arg.startsWith('--interval-ms='));
   const flagValue = flagIndex < 0 ? undefined : argv[flagIndex] === '--interval-ms'
     ? argv[flagIndex + 1] : argv[flagIndex].slice('--interval-ms='.length);
   for (const value of [flagValue, env.WE_REVIEW_DAEMON_INTERVAL_MS]) {
     const n = Number(value);
-    if (Number.isFinite(n) && n > 0) return Math.max(MIN_INTERVAL_MS, n);
+    if (Number.isFinite(n) && n > 0) return Math.min(MAX_INTERVAL_MS, Math.max(MIN_INTERVAL_MS, n));
   }
   return DEFAULT_INTERVAL_MS;
 }

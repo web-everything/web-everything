@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  DEFAULT_INTERVAL_MS, MIN_INTERVAL_MS, resolveReviewIntervalMs, buildCliDaemonEffects,
+  DEFAULT_INTERVAL_MS, MIN_INTERVAL_MS, MAX_INTERVAL_MS, resolveReviewIntervalMs, buildCliDaemonEffects,
 } from '../review-daemon.mjs';
 
 describe('resolveReviewIntervalMs', () => {
@@ -53,6 +53,26 @@ describe('resolveReviewIntervalMs', () => {
     expect(resolveReviewIntervalMs({
       env: { WE_REVIEW_DAEMON_INTERVAL_MS: '45000' }, argv: ['--interval-ms=1'],
     })).toBe(MIN_INTERVAL_MS);
+  });
+
+  it('clamps large values to the setTimeout ceiling (2**31-1), never wrapping to 1ms', () => {
+    expect(MAX_INTERVAL_MS).toBe(2 ** 31 - 1);
+    for (const value of ['3000000000', '1e10', '2147483648', '1e300']) {
+      expect(resolveReviewIntervalMs({ env: { WE_REVIEW_DAEMON_INTERVAL_MS: value }, argv: [] }))
+        .toBe(MAX_INTERVAL_MS);
+      expect(resolveReviewIntervalMs({ env: {}, argv: [`--interval-ms=${value}`] }))
+        .toBe(MAX_INTERVAL_MS);
+      expect(resolveReviewIntervalMs({ env: {}, argv: ['--interval-ms', value] }))
+        .toBe(MAX_INTERVAL_MS);
+    }
+    expect(resolveReviewIntervalMs({ env: { WE_REVIEW_DAEMON_INTERVAL_MS: String(MAX_INTERVAL_MS) }, argv: [] }))
+      .toBe(MAX_INTERVAL_MS);
+  });
+
+  it('a clamped value is a delay setTimeout honours (not coerced to 1ms)', () => {
+    const ms = resolveReviewIntervalMs({ env: { WE_REVIEW_DAEMON_INTERVAL_MS: '3000000000' }, argv: [] });
+    expect(ms).toBeLessThanOrEqual(2 ** 31 - 1);
+    expect(ms).toBeGreaterThanOrEqual(MIN_INTERVAL_MS);
   });
 });
 
