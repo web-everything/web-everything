@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { DEFAULT_REPOS } from './operations/free-scope.mjs';
 import { appendHeldCard, parseHeldCards, planFiling, quietVerdict, markFiled } from './held-cards.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -83,7 +84,7 @@ export async function main(argv, deps = {}) {
   const command = (bin, args, cwd = root) => exec(bin, args, { cwd, encoding: 'utf8' });
   const verdict = () => {
     const previous = JSON.parse(read(state, 'null'));
-    const openPrs = ['web-everything/web-everything', 'plateauapp/plateau-app'].reduce((count, repo) => {
+    const openPrs = DEFAULT_REPOS.reduce((count, repo) => {
       const prs = JSON.parse(command(env.WE_HELD_CARDS_GH_BIN || 'gh',
         ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '300', '--json', 'number']));
       if (!Array.isArray(prs)) throw new Error('gh returned an invalid PR list');

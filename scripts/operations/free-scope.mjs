@@ -13,13 +13,15 @@
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
 import { scopeEntriesOverlap } from '../readiness/scope-lease.mjs';
+import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 
 export const FREE_SCOPE_OP = 'free-scope';
-export const DEFAULT_REPOS = ['web-everything/web-everything', 'plateauapp/plateau-app'];
+/** The repos whose open PRs count — WE and plateau-app, read from the one constellation table. */
+export const DEFAULT_REPOS = Object.freeze(['we', 'plateau-app'].map((key) => CONSTELLATION_REPOS[key].slug));
 export const DEFAULT_TTL_HOURS = 4;
 const alias = (key) => ({ webeverything: 'we', 'web-everything': 'we', plateau: 'plateau-app' })[key] || key;
 export function repoKeyFor(slug) {
-  return slug === DEFAULT_REPOS[0] ? 'we' : slug.split('/').at(-1);
+  return repoKeyForSlug(slug) ?? slug.split('/').at(-1);
 }
 export function qualifyFile(f, defaultRepo = 'we') {
   const value = f.trim().replace(/^\.\//, '');
