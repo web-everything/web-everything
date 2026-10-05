@@ -26,7 +26,8 @@
  * NEVER STUCK, whatever its labels or activity age: `review:human` (a human-only gate — the watch never
  * second-guesses a PR already parked for a person), a draft (`isDraft` — not yet offered for review), or a PR
  * carrying the durable stand-down marker (`we:scripts/conveyor/stand-down.mjs#STAND_DOWN_MARKER` — a fixer
- * already stopped to ask a human; re-flagging it as "stuck" would just re-ask the same question a second way).
+ * already stopped to ask a human; re-flagging it as "stuck" would just re-ask the same question a second way),
+ * or a live load-flake hold awaiting a quiet host. Moved heads and resolved/superseded holds do not exclude it.
  *
  * IDEMPOTENCY, NO SEPARATE STORE (#2612). Exactly one inspection agent is launched per PR per STUCK EPISODE —
  * an episode is keyed by the PR's own last-activity timestamp at detection time
@@ -45,6 +46,7 @@
  */
 import { REVIEW_LABELS, hasReviewLabel, READY_TO_MERGE_LABEL } from '../lib/review-escalation.mjs';
 import { countStandDownComments } from './stand-down.mjs';
+import { isLegacyLoadFlakeHoldSuperseded } from './load-flake-hold.mjs';
 import { assessLiveness, bindAgents } from './reconcile-core.mjs';
 // The dispatch-marker builder/reader lives in its OWN lightweight file — see that file's own header for why:
 // `we:scripts/operations/operator-queue.mjs` needs it too, and must NOT pull in this file's much heavier
@@ -123,7 +125,7 @@ export function isDraftPr(pr) {
 export function isNeverStuckPr(pr) {
   if (hasReviewLabel(pr?.labels, REVIEW_LABELS.human)) return true;
   if (isDraftPr(pr)) return true;
-  if (countStandDownComments(pr?.comments) > 0) return true;
+  if (countStandDownComments(pr?.comments, { headRefOid: pr?.headRefOid, isSuperseded: isLegacyLoadFlakeHoldSuperseded }) > 0) return true;
   return false;
 }
 

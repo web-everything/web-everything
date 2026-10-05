@@ -42,10 +42,10 @@ import { homedir } from 'node:os';
 import { readQueueFile, resolveQueuePath, normNum, bornAsIndexFromItems, resolveBornAsRefs } from '../conveyor/queue-store.mjs';
 import { collapseRollupToLatestPerName } from '../merge-ai-prs.mjs';
 import { CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
-// #3296 — `countStandDownComments` recovers "has a fixer already stood down here" from the PR's own comments
+// #3296 — `standDownComments` recovers "has a fixer already stood down here" from the PR's own comments
 // (the same durable marker `reconcile-core.mjs`'s `planReconcile` already reads). Shaping it into the PR row
 // here — rather than re-deriving it in the board — keeps the marker single-sourced at its one definition.
-import { countStandDownComments } from '../conveyor/stand-down.mjs';
+import { standDownComments } from '../conveyor/stand-down.mjs';
 // #2659 — the infra-blocked state: a delivery/prepare agent that PUSHED its lane ref but failed PR-open on an
 // outside dependency lands here (not a stall / gate-red). `deriveInfraByNum` is PURE (no fs/clock — it takes the
 // raw store + injected `now`), safe for the pure core; the IO shell reads the sidecar via `readInfraStore`.
@@ -232,7 +232,7 @@ export function ciRollup(statusCheckRollup) {
  * `mergeStateStatus` is carried through raw (e.g. `BEHIND`) so the tick's CI-heal loop can spot a
  * not-landable BEHIND+parked PR (`tick-core.mjs` isBehind/isCiHealTarget, #2666/#2738).
  *
- * `stoodDown` (#3296) is derived here, once, from the PR's own comments via {@link countStandDownComments} —
+ * `stoodDown` (#3296) is derived here, once, from the PR's own comments via {@link standDownComments} —
  * the SAME durable signal `reconcile-core.mjs`'s `planReconcile` reads to refuse re-dispatching a fixer. A
  * stand-down makes **no label change** (`stand-down.mjs`'s own contract: "the PR was left EXACTLY as the
  * reviewer left it"), so a stood-down PR still carries whatever `review:*` label it had — without this flag
@@ -255,7 +255,7 @@ export function shapePrs(prList) {
       : [],
     // Raw gh mergeable-state (e.g. `BEHIND`) — the CI-heal loop's BEHIND branch reads this (#2666/#2738).
     mergeStateStatus: String(p?.mergeStateStatus || ''),
-    stoodDown: countStandDownComments(p?.comments) > 0,
+    stoodDown: standDownComments(p?.comments).length > 0,
   }));
 }
 
