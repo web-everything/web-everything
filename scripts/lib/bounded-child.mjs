@@ -132,7 +132,7 @@ export function runBounded(cmd, args, { timeoutMs = DEFAULT_CHILD_TIMEOUT_MS, en
     child.on('error', (e) => { done(); reject(e); });
     child.on('close', (code, signal) => {
       done();
-      const failure = message => Object.assign(new Error(message), { stderr: err, status: code, signal });
+      const failure = message => Object.assign(new Error(message), { stdout: Buffer.concat(chunks).toString('utf8'), stderr: err, status: code, signal });
       if (overBudget) reject(failure(`output exceeded ${maxBytes} bytes (process group killed)`));
       else if (timedOut) reject(failure(`timed out after ${timeoutMs}ms (process group killed)`));
       else if (code !== 0) reject(failure(`exited ${code ?? signal}: ${err.trim().split('\n')[0] || '(no stderr)'}`));

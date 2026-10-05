@@ -260,7 +260,7 @@ export async function dispatchCiHeal(planned, {
  *   (`we:scripts/conveyor/reconcile-core.mjs#planReconcile` already computes a `{prNumber, kind, why, ...}`
  *   per entry — see that file's own `refuse()` closure), now handed up instead of collapsed to nothing. A PR
  *   `reconcile-core.mjs` refuses OUTRIGHT (never becoming a `kind:'ci-heal'` dispatch entry at all — e.g.
- *   `owed-ci-rerun`, `no-findings`, `live-process`, `cap-exhausted`, `stood-down`, `owed-elsewhere`,
+ *   `owed-ci-rerun`, `no-findings`, `live-process`, `cap-exhausted`, `stood-down`, `load-flake-hold`, `owed-elsewhere`,
  *   `nothing-owed`) left NO trace anywhere in the daemon's own tick log before this: it was neither a
  *   `dispatched` entry nor a `refusals` entry (that array only ever held THIS file's OWN per-entry refusals —
  *   `no-lane`/`held`/`dispatch-failed`/`unsupported-repo` — for PRs reconcile DID plan), so a PR silently

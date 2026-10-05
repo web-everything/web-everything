@@ -394,8 +394,22 @@ Re-run the SAME test from step 2 — it must now be green — and, where the fin
 re-run that SAME probe and confirm it now shows the fixed behavior. Keep the trimmed after-output next to the
 before-output from step 2; step 6 posts both as the evidence.
 
-A red gate is a hard stop. Record the stand-down on the PR, leave it `review:changes` (do **not** re-arm), and
-RETURN `#{{ITEM_NUM}} → fix gate-red`. Do not re-push a red diff.
+**Load-flake exception.** When verify is red ONLY on timeouts that pass alone under high host load, save and push
+the fix to `lane/<head>-fix-<N>-alt`, then use the load-flake exit instead of the terminal gate-red exit below. It
+releases the fix claim like every other exit. Pass the PR's FULL 40-character head sha (`git rev-parse origin/<head ref>`).
+Only `web-everything/web-everything` has a reverify worker; for any other repo the script records the terminal
+gate-red stand-down instead (a hold nothing would ever retry), so use the gate-red exit below there:
+
+```bash
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=load-flake --head=<pr-head-sha> --alt=<saved-alt-branch> --alt-sha=<saved-sha>
+node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=blocked-on-load-flake
+node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
+```
+
+Report `blocked-on-load-flake` and exit; the quiet-host reverify pass retries the saved fix automatically.
+
+**Otherwise a red gate is a hard stop.** Record the stand-down on the PR, leave it `review:changes` (do **not**
+re-arm), and RETURN `#{{ITEM_NUM}} → fix gate-red`. Do not re-push a red diff.
 
 ```bash
 node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=gate-red \

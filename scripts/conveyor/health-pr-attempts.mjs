@@ -4,7 +4,7 @@
  */
 export const ATTEMPT_WINDOW_MS = 60 * 60_000;
 export const MIN_PR_ATTEMPTS = 5;
-const BENIGN = /^(?:live-process|nothing-owed|no-findings|stood-down|owed-elsewhere|held|main-still-red)$/;
+const BENIGN = /^(?:live-process|nothing-owed|no-findings|stood-down|load-flake-hold|owed-elsewhere|held|main-still-red)$/;
 
 /** Recorded no-op decisions, not a blanket exemption for a PR's labels. A human
  * gate can still owe an advisory review/fix on a newer head. Keep failures of that

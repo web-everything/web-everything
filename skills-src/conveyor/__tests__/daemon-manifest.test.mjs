@@ -23,7 +23,7 @@ describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
 
   it('has the host passes plus 6 passes per repo', () => {
     expect(Object.keys(DAEMON_MANIFEST).sort()).toEqual([
-      'branch-drift', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'merge-orphan-sweep', 'lease-reaper', 'health-watch', 'health-responder',
+      'branch-drift', 'load-flake-reverify', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'merge-orphan-sweep', 'lease-reaper', 'health-watch', 'health-responder',
       ...['ci-queue-watch', 'parked-pr-conflict-watch', 'parked-pr-progress-watch', 'lane-pool-health-watch', 'stuck-pr-watch', 'ci-red-recovery-watch']
         .flatMap((p) => REPO_KEYS.map((k) => `${p}-${k}`)),
     ].sort());
@@ -89,9 +89,17 @@ describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
   });
 
   it('the WE-only passes carry no --repo flag at all — genuinely single-repo, not merely unbuilt cross-repo', () => {
-    for (const name of ['branch-drift', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'lease-reaper']) {
+    for (const name of ['branch-drift', 'load-flake-reverify', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'lease-reaper']) {
       expect(DAEMON_MANIFEST[name].args.some((a) => a.startsWith('--repo='))).toBe(false);
     }
+  });
+
+  it('load-flake-reverify runs every 5 minutes by default, overridable by env', async () => {
+    const { loadFlakeReverifyIntervalMs } = await import('../daemon-manifest.mjs');
+    expect(DAEMON_MANIFEST['load-flake-reverify'].intervalMs).toBe(loadFlakeReverifyIntervalMs());
+    expect(loadFlakeReverifyIntervalMs({})).toBe(300_000);
+    expect(loadFlakeReverifyIntervalMs({ WE_LOAD_FLAKE_REVERIFY_INTERVAL_MS: '60000' })).toBe(60_000);
+    expect(loadFlakeReverifyIntervalMs({ WE_LOAD_FLAKE_REVERIFY_INTERVAL_MS: 'junk' })).toBe(300_000);
   });
 
   it('merge-orphan-sweep carries no --repo/--repos/--this-repo flag — bare already defaults to the full constellation', () => {
@@ -222,4 +230,16 @@ it('defaultLaunch must be a boolean when present, and false excludes only from t
 
 it('does not register the dedicated heavy-run sampler as a pass', () => {
   expect(DAEMON_MANIFEST).not.toHaveProperty('heavy-run-sample');
+});
+
+describe('load-flake hold repositories have a reverify worker (PR #3945 advisory, round 3)', () => {
+  it('every repository allowed to record a load-flake hold is served by the registered reverify pass', async () => {
+    const { LOAD_FLAKE_REVERIFY_REPOS } = await import('../../../scripts/conveyor/stand-down.mjs');
+    const { REVERIFY_DEFAULT_REPO } = await import('../../../scripts/conveyor/load-flake-reverify.mjs');
+    const pass = DAEMON_MANIFEST['load-flake-reverify'];
+    expect(pass).toBeTruthy();
+    // The pass carries no --repo flag, so it sweeps the default repository only: that is the whole supported set.
+    expect(pass.args.some((a) => a.startsWith('--repo'))).toBe(false);
+    expect(LOAD_FLAKE_REVERIFY_REPOS).toEqual([REVERIFY_DEFAULT_REPO]);
+  });
 });

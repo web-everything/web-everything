@@ -3528,3 +3528,50 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
     }
   });
 });
+
+import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
+import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
+it('legacy #3881 waits on host load, not a human', () => {
+  const comment = { body: loadFlakeLegacyBody, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION };
+  expect(countUnresolvedStandDowns([comment])).toBe(0);
+  const plan = planReconcile({ prs: [pr1563({ comments: [finding(), comment] })], agents: [], durableCounts: {}, now: NOW });
+  expect(plan.refusals[0].kind).toBe('load-flake-hold');
+});
+
+import { buildLoadFlakeHoldComment as loadHoldBody, buildLoadFlakeResolvedComment as loadResultBody } from '../stand-down.mjs';
+it('load-hold reconcile routing respects cutoff, head changes, and terminal exhaustion', () => {
+  const c = (body, createdAt = '2026-10-04T18:51:50Z') => ({ body, createdAt, author: AUTOMATION });
+  const hold = c(loadHoldBody({ head: 'abc1234', alt: 'lane/fix-alt', altSha: '9202eee8a' }));
+  for (const [comments, headRefOid, expected] of [
+    [[c(loadFlakeLegacyBody, '2026-10-05T00:00:00Z')], 'abc1234', 'stood-down'],
+    [[hold], 'abc1234', 'load-flake-hold'],
+    [[hold], 'def5678', null],
+    [[hold, c(loadResultBody({ altSha: '9202eee8a', result: 'pushed' }), '2026-10-04T20:00:00Z')], 'abc1234', null],
+    [[hold, c(loadResultBody({ altSha: '9202eee8a', result: 'exhausted' }), '2026-10-04T20:00:00Z')], 'abc1234', 'stood-down'],
+  ]) {
+    const plan = planReconcile({ prs: [pr1563({ comments: [finding(), ...comments], headRefOid })], agents: [], durableCounts: {}, now: NOW });
+    const kinds = plan.refusals.map((r) => r.kind);
+    if (expected) expect(kinds).toContain(expected);
+    else { expect(kinds).not.toContain('stood-down'); expect(kinds).not.toContain('load-flake-hold'); }
+  }
+});
+
+import { buildOperatorAnswer as buildLegacyHoldAnswer } from '../stand-down-answer-core.mjs';
+it('a legacy load-flake hold the thread superseded no longer refuses the PR (PR #3945 review)', () => {
+  const legacy = { id: 'IC_legacy_hold', body: loadFlakeLegacyBody, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION };
+  const answer = { id: 'IC_answer', createdAt: '2026-10-04T20:00:00Z', author: AUTOMATION,
+    body: buildLegacyHoldAnswer({ standDownId: 'IC_legacy_hold', reason: 'handled by hand', actor: 'chalbert', channel: 'test' }) };
+  const kinds = (comments) => planReconcile({ prs: [pr1563({ comments: [finding(), ...comments], headRefOid: 'advanced-past-alt' })], agents: [], durableCounts: {}, now: NOW }).refusals.map((r) => r.kind);
+  expect(kinds([legacy])).toContain('load-flake-hold');
+  expect(kinds([legacy, answer])).not.toContain('load-flake-hold');
+  expect(kinds([legacy, answer])).not.toContain('stood-down');
+});
+
+it('a legacy load-flake stand-down on a repo the reverify pass never sweeps stays terminal (PR #3945 review)', () => {
+  const legacy = (slug) => ({ id: 'IC_legacy_hold', body: loadFlakeLegacyBody, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION,
+    url: `https://github.com/${slug}/pull/12#issuecomment-1` });
+  const kinds = (slug) => planReconcile({ prs: [pr1563({ comments: [finding(), legacy(slug)] })], agents: [], durableCounts: {}, now: NOW }).refusals.map((r) => r.kind);
+  expect(kinds('frontier-ui/frontierui')).toContain('stood-down');
+  expect(kinds('frontier-ui/frontierui')).not.toContain('load-flake-hold');
+  expect(kinds('web-everything/web-everything')).toContain('load-flake-hold');
+});

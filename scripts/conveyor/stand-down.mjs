@@ -66,6 +66,7 @@ export const STAND_DOWN_LABEL = 'review-status:stood-down';
  */
 export const STAND_DOWN_REASONS = Object.freeze({
   'needs-judgment': 'the reviewer\'s finding needs a judgment the fix agent could not safely make, so it did NOT guess',
+  'load-flake': 'verify is red only on host-load timeouts; the saved fix awaits a quiet host',
   'gate-red': 'the gate stayed RED after the repair, and a red diff must never be re-pushed',
   'conflict': 'a genuine same-line conflict with `main` blocked the repair',
   'lane-ref-gone': 'the PR\'s lane ref no longer resolves, so the ~done work could not be reconstituted',
@@ -181,6 +182,112 @@ export function buildConcurrentAuthorPauseComment({ actor = 'conveyor fix agent'
   ].join('\n');
 }
 
+/** Local verify recovery; #4999 covers the complementary CI flake quarantine. */
+export const LOAD_FLAKE_HOLD_MARKER = '⏳ conveyor fix — fix ready, verify red only on host-load timeouts; re-verifies when the host is quiet';
+export const LOAD_FLAKE_RESOLVED_MARKER = '↩ conveyor fix — load-flake reverify result';
+
+/** Hold and result trailers are comment text that later reaches git argv and refspecs, so only plain hex shas and
+ *  ordinary branch names (no `:`, `..`, leading `-`, `//`, `.lock`, whitespace or control characters) are read. */
+export const isSafeGitSha = (v) => typeof v === 'string' && /^[0-9a-f]{7,40}$/.test(v);
+export const isSafeGitBranch = (v) => typeof v === 'string' && v.length <= 200
+  && /^[A-Za-z0-9._][A-Za-z0-9._/-]*$/.test(v) && !/\.\.|\/\/|\.lock(\/|$)|\/$|\.$|^\./.test(v);
+export const LEGACY_LOAD_FLAKE_CUTOFF = '2026-10-05T00:00:00Z';
+
+/** The repo key a `gh` comment URL (`https://github.com/<owner>/<repo>/pull/N#issuecomment-…`) names, or `null` when the
+ *  comment carries no URL or one for an unknown repo. */
+const commentRepoKey = (c) => {
+  const m = /^https:\/\/github\.com\/([^/]+\/[^/]+)\//.exec(typeof c?.url === 'string' ? c.url : '');
+  return m ? repoKeyForSlug(m[1]) : null;
+};
+
+/**
+ * A pre-cutoff gate-red stand-down that names load flakiness and a saved alt sha reads as a load-flake hold, but only
+ * where the reverify pass actually works (`LOAD_FLAKE_REVERIFY_REPOS`). A comment whose URL names any other repo
+ * stays a terminal stand-down: nothing would ever reverify it, so reclassifying it would park the PR silently
+ * (PR #3945 advisory review). A comment with no URL (a fixture, a bare-string reader) cannot be placed in another
+ * repo, so it keeps the reclassification. `standDownComments`, `loadFlakeHolds` and the answer reader all
+ * share this one predicate, so a legacy comment is never both terminal and a hold, nor neither.
+ */
+export function isLoadFlakeStandDown(c) {
+  const body = c?.body ?? '';
+  const at = Date.parse(c?.createdAt ?? '');
+  const repoKey = commentRepoKey(c);
+  return (repoKey === null || LOAD_FLAKE_REVERIFY_REPOS.includes(repoKey))
+    && body.trimStart().startsWith(STAND_DOWN_MARKER)
+    && STAND_DOWN_TRAILER_RE.exec(body)?.[1] === 'gate-red'
+    && at < Date.parse(LEGACY_LOAD_FLAKE_CUTOFF)
+    // #3881 says "load flakiness", #3932 (17:06 ET) says "load timeouts"; both name a saved alt sha. Bounded by
+    // the cutoff, and the re-verify pass still needs a GREEN verify before any push.
+    && /load[\s-]+(?:flak|timeouts?\b)/i.test(body) && !!parseAltBranch(body)?.sha;
+}
+
+function loadTrailer(body, name) {
+  const match = new RegExp(`<!-- ${name} ([^>]+)-->\\s*$`).exec(body);
+  return Object.fromEntries([...(match?.[1] ?? '').matchAll(/([a-z-]+)=(\S+)/g)].map((m) => [m[1], m[2]]));
+}
+
+/**
+ * A legacy hold was a terminal stand-down before it was reclassified, so it must also end the way a stand-down ends
+ * (PR #3945 review). `isSuperseded(comments, index)` decides that; the default knows only the watcher's own
+ * supersede, because this file must stay import-light (the operator queue stages it alone). Production callers use
+ * `load-flake-hold.mjs`, which adds the advisory and operator-answer rules.
+ */
+export function loadFlakeHolds(comments, isSuperseded = isStandDownSuperseded) {
+  const all = Array.isArray(comments) ? comments : [];
+  return all.flatMap((c, i) => {
+    if (!isTrustedMarkerAuthor(c)) return [];
+    const body = c?.body ?? '';
+    const createdAt = c.createdAt ?? null;
+    if (isLoadFlakeStandDown(c)) {
+      const alt = parseAltBranch(body);
+      return isSuperseded(all, i) || !isSafeGitBranch(alt?.branch) || !isSafeGitSha(alt?.sha) ? []
+        : [{ createdAt, head: null, alt, legacy: true }];
+    }
+    if (!body.trimStart().startsWith(LOAD_FLAKE_HOLD_MARKER)) return [];
+    const t = loadTrailer(body, 'load-flake-hold');
+    return isSafeGitBranch(t.alt) && isSafeGitSha(t['alt-sha']) && (t.head === undefined || isSafeGitSha(t.head))
+      && t.outcome === 'blocked-on-load-flake'
+      ? [{ createdAt, head: t.head ?? null, alt: { branch: t.alt, sha: t['alt-sha'] }, legacy: false }] : [];
+  }).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+}
+
+export function loadFlakeResults(comments) {
+  return (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor).flatMap((c) => {
+    if (!c?.body?.trimStart().startsWith(LOAD_FLAKE_RESOLVED_MARKER)) return [];
+    const t = loadTrailer(c.body, 'load-flake-resolved');
+    return isSafeGitSha(t['alt-sha']) && ['pushed', 'red-again', 'head-moved', 'exhausted'].includes(t.result)
+      ? [{ createdAt: c.createdAt ?? null, sha: t['alt-sha'], result: t.result }] : [];
+  }).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+}
+
+export function loadFlakeHoldState({ comments, headRefOid = null, now = 0, isSuperseded }) {
+  const hold = loadFlakeHolds(comments, isSuperseded).at(-1);
+  if (!hold) return { live: false, hold: null };
+  const results = loadFlakeResults(comments).filter((r) => r.sha === hold.alt.sha
+    && Date.parse(r.createdAt) >= Date.parse(hold.createdAt));
+  const resolution = results.filter((r) => r.result !== 'red-again').at(-1);
+  return { hold, results, resolution, live: !resolution && !(hold.head && headRefOid && !sameCommit(hold.head, headRefOid)) };
+}
+
+/** A recorded sha may be abbreviated (7–40 hex) while GitHub reports the full oid: equal when one prefixes the other. */
+const sameCommit = (a, b) => a.startsWith(b) || b.startsWith(a);
+
+/** Repositories whose load-flake holds a registered reverify pass actually works (the manifest's pass has no --repo flag). */
+export const LOAD_FLAKE_REVERIFY_REPOS = ['we'];
+
+/** Whether a `--reason=load-flake` stand-down may record a hold; anywhere nothing would ever reverify it, it stays terminal. */
+export const loadFlakeHoldRequest = ({ reason, alt, altSha, repoKey }) =>
+  reason === 'load-flake' && !!alt && !!altSha && LOAD_FLAKE_REVERIFY_REPOS.includes(repoKey);
+
+export function buildLoadFlakeHoldComment({ head, alt, altSha, detail = '' }) {
+  if (!alt || !altSha) return buildStandDownComment({ reason: 'gate-red', detail });
+  return `${LOAD_FLAKE_HOLD_MARKER}\n\n${detail}\n<!-- load-flake-hold${head ? ` head=${head}` : ''} alt=${alt} alt-sha=${altSha} outcome=blocked-on-load-flake -->`;
+}
+
+export function buildLoadFlakeResolvedComment({ altSha, result, detail = '' }) {
+  return `${LOAD_FLAKE_RESOLVED_MARKER}\n\n${result === 'exhausted' ? 'Retry cap reached; a human is the next step.\n\n' : ''}${detail.slice(-1500)}\n<!-- load-flake-resolved alt-sha=${altSha} result=${result} -->`;
+}
+
 /**
  * DELIBERATELY NOT A REASON HERE: a permission / tool-use denial while applying an otherwise-clear fix (live
  * 2026-09-23, PR #2518 — a `python3` heredoc rewriting `backlog/3945-*.md` was denied by Claude Code's own
@@ -220,7 +327,8 @@ export function standDownComments(comments) {
     const body = typeof c === 'string' ? c : c?.body;
     // fix procedure — a concurrent-author stand-down is a re-armable pause, never a terminal stand-down.
     if (typeof body === 'string' && body.trimStart().startsWith(STAND_DOWN_MARKER) && isTrustedMarkerAuthor(c)
-      && !isConcurrentAuthorStandDown(c)) {
+      && !isConcurrentAuthorStandDown(c) && !isLoadFlakeStandDown(c)
+      || loadFlakeResults([c]).some((r) => r.result === 'exhausted')) {
       out.push({ body, createdAt: (typeof c === 'string' ? null : c?.createdAt) ?? null });
     }
   }
@@ -358,8 +466,7 @@ export function countTerminalStandDowns(comments) {
   let n = 0;
   for (let i = 0; i < comments.length; i += 1) {
     const c = comments[i];
-    const body = bodyOf(c);
-    if (typeof body !== 'string' || !body.trimStart().startsWith(STAND_DOWN_MARKER)) continue;
+    if (!standDownComments([c]).length) continue;
     if (!isTrustedMarkerAuthor(c)) continue; // #3383 — a forged stand-down from an untrusted login is never terminal.
     if (isConcurrentAuthorStandDown(c)) continue; // fix procedure — reclassified as a re-armable pause.
     if (!isStandDownSuperseded(comments, i)) n += 1;
@@ -441,14 +548,18 @@ if (IS_CLI) {
   // one: free `--detail` prose is never sniffed (PR #2821 review — an unrelated stand-down that merely mentioned
   // a "concurrent author" was re-armed). A legacy conflict-shaped post is still reclassified when READ.
   const concurrent = flags.reason === 'concurrent-author';
-  const body = concurrent
+  const loadHold = loadFlakeHoldRequest({ reason: flags.reason, alt: flags.alt, altSha: flags['alt-sha'], repoKey: repoKeyForSlug(flags.repo) });
+  if (flags.reason === 'load-flake' && !loadHold) {
+    process.stderr.write('⚠ stand-down: no load-flake reverify worker serves this repo (or --alt/--alt-sha is missing); recording a terminal gate-red stand-down instead\n');
+  }
+  const body = loadHold ? buildLoadFlakeHoldComment({ head: flags.head, alt: flags.alt, altSha: flags['alt-sha'], detail }) : concurrent
     ? buildConcurrentAuthorPauseComment({
       actor, detail,
       head: typeof flags.head === 'string' ? flags.head : null,
       alt: typeof flags.alt === 'string' ? flags.alt : (parseAltBranch(detail)?.branch ?? null),
       altSha: typeof flags['alt-sha'] === 'string' ? flags['alt-sha'] : (parseAltBranch(detail)?.sha ?? null),
     })
-    : buildStandDownComment({ actor, reason: typeof flags.reason === 'string' ? flags.reason : undefined, detail });
+    : buildStandDownComment({ actor, reason: flags.reason === 'load-flake' ? 'gate-red' : typeof flags.reason === 'string' ? flags.reason : undefined, detail });
   const repoArgs = typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : []; // a missing --repo derives from cwd.
   const gh = (args) => execFileSync('gh', args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
   try {
@@ -469,7 +580,7 @@ if (IS_CLI) {
   // scanning labels sees it without reading the thread (PR #2811 had no label at all). Best-effort: the comment
   // above is the durable record the planner reads; a failed label write is reported, never fatal.
   let labeled = false;
-  if (!concurrent) {
+  if (!concurrent && !loadHold) {
     try {
       gh(['label', 'create', STAND_DOWN_LABEL, ...repoArgs, '--color', 'b60205', '--description', 'a fixer stood down; a person is the next step (auto-managed)', '--force']);
       gh(['pr', 'edit', String(pr), ...repoArgs, '--add-label', STAND_DOWN_LABEL]);
@@ -478,5 +589,5 @@ if (IS_CLI) {
       process.stderr.write(`⚠ stand-down: comment posted but the ${STAND_DOWN_LABEL} label failed: ${String(e.message || e).split('\n')[0]}\n`);
     }
   }
-  process.stdout.write(JSON.stringify({ ok: true, pr, stoodDown: !concurrent, paused: concurrent, labeled, dispatchClaimReleased }) + '\n');
+  process.stdout.write(JSON.stringify({ ok: true, pr, stoodDown: !concurrent && !loadHold, paused: concurrent, loadFlakeHold: loadHold, labeled, dispatchClaimReleased }) + '\n');
 }
