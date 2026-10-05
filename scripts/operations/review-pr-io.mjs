@@ -798,6 +798,9 @@ export function createReviewPrSinks({
               const match = findCarriedOperatorRuling(f, { records, operatorRulings,
                 head: record.head, repo: record.repo, pr: record.pr });
               if (!match) continue;
+              // A card ruling discharges a finding only while its card is readable. Carrying an unreadable one would
+              // keep the finding pending in the gate yet drop it from the judge (`liveReferrals`): a stuck park.
+              if (match.result === 'card' && !cardReadable(match.card)) continue;
               let changed;
               try {
                 const file = canonicalRepoPath(f.finding.file);
