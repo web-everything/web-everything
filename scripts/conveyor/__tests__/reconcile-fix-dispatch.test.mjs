@@ -465,6 +465,15 @@ describe('fetchPrDiffPaths — 406 too_large falls back to the paginated file-li
       expect(result).toHaveLength(320);
     });
 
+    // The operator ruling's own regression shape (PR #3881): a 301-file PR whose compare answer is GitHub's 300-path
+    // cap and whose pulls/files answer is complete — the scope must be all 301 paths, never the capped 300.
+    it('falls back when compare reaches its 300-file cap (301-file PR → all 301 paths)', () => {
+      const all = Array.from({ length: 301 }, (_, i) => `f${i}.md`);
+      const { result, seen } = run({ compare: `${all.slice(0, 300).join('\n')}\n`, pulls: `${all.join('\n')}\n` });
+      expect(seen).toEqual(['compare', 'pulls']);
+      expect(result).toEqual(all);
+    });
+
     it('refuses permanently (never a partial 300-file scope) when compare is capped and pulls/files fails', () => {
       const { result, err, seen } = run({ compare: paths(300), pulls: new Error('boom') });
       expect(seen).toEqual(['compare', 'pulls']);
