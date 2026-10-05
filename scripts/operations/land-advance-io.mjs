@@ -9,6 +9,7 @@
  * Follow-ups use the existing run-store's in-flight DISPATCH_EFFECT + plain dispatch
  * metadata, one run per launch, with no changes to dispatch-lane semantics.
  */
+import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir, loadavg, cpus } from 'node:os';
@@ -67,7 +68,7 @@ export function writeFollowUp(entry, { store = createFileRunStore(), mintId = ne
     status: 'in-flight', handle: effect.handle, expectedBy: effect.expectedBy, startedAt: entry.launchedAt, dispatch: effect.dispatch });
   store.write(run);
 }
-export function readLiveSessions({ run = runDefault, listAgents = () => run('claude', ['agents', '--json']),
+export function readLiveSessions({ run = runDefault, listAgents = () => cachedClaudeAgents({ fetch: () => run('claude', ['agents', '--json']) }),
   ps = () => scanPsOutput({ exec: (program, args) => run(program, args) }), isPidAlive = defaultIsPidAlive } = {}) {
   const raw = listAgents(), agents = Array.isArray(raw) ? raw : JSON.parse(raw);
   if (!Array.isArray(agents)) throw new Error('claude agents: expected array');

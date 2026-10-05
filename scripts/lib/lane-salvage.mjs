@@ -40,6 +40,7 @@
  * PURE CORE / IO SHELL: {@link salvageStamp}, {@link salvageRefNames}, {@link salvageEligibility},
  * {@link parseLsofCwds} and {@link isWorktreeLitterPath} are pure. Everything else shells git/lsof/fs.
  */
+import { cachedClaudeAgents } from './claude-agents-cache.mjs';
 import { execFileSync } from 'node:child_process';
 import {
   mkdtempSync, rmSync, mkdirSync, writeFileSync, appendFileSync, statSync, existsSync, realpathSync,
@@ -126,7 +127,7 @@ export function liveAgentInLane(agents, dir, sessionIds = []) {
 /** `claude agents --json`, FAIL-CLOSED: `null` when it cannot be read (callers then refuse to salvage). */
 export function readAgentsStrict({ exec = execFileSync } = {}) {
   try {
-    const parsed = JSON.parse(exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000 }));
+    const parsed = JSON.parse(cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000 }) }));
     return Array.isArray(parsed) ? parsed : null;
   } catch { return null; }
 }

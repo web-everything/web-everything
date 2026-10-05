@@ -61,6 +61,7 @@
  * so the whole decision table is unit-tested without a repo, a queue, a `claude` binary or a live driver.
  */
 
+import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -482,9 +483,9 @@ function saveJson(path, obj) {
  * a watchdog must not be able to reach. Shelling one command is a syscall, not duplicated judgment.
  */
 export function defaultListAgents({ exec = execFileSync } = {}) {
-  const out = exec('claude', ['agents', '--json'], {
+  const out = cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL',
-  });
+  }) });
   return JSON.parse(String(out || '[]'));
 }
 

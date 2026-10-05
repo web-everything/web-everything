@@ -50,6 +50,7 @@
  *                                                 # makes cards older than its oldest PR skip (merged-window-uncovered)
  */
 
+import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { machinePrTitle } from '../operations/machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -298,9 +299,9 @@ function ghPrs(state, limit, fields) {
 
 function listSessions() {
   try {
-    const rows = JSON.parse(execFileSync('claude', ['agents', '--json', '--all'], {
+    const rows = JSON.parse(cachedClaudeAgents({ all: true, fetch: () => execFileSync('claude', ['agents', '--json', '--all'], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL',
-    }) || '[]');
+    }) }) || '[]');
     // An empty listing is indistinguishable from a bad read (lease-reaper's sessionStatesForReap reasoning).
     if (!Array.isArray(rows) || rows.length === 0) { log('  ⚠ `claude agents --json --all` listed nothing — every card skipped'); return null; }
     return rows;

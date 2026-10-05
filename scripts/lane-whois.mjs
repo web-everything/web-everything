@@ -39,6 +39,7 @@
  * all). This file is the IO shell that gathers the facts a real lane's git state, ledger, transcripts, and
  * `gh` provide, then hands them to that pure core.
  */
+import { cachedClaudeAgents } from './lib/claude-agents-cache.mjs';
 import { execFileSync } from 'node:child_process';
 import {
   existsSync, readFileSync, readdirSync, realpathSync, mkdirSync, writeFileSync as fsWriteFileSync,
@@ -263,7 +264,7 @@ export function lanePreservedFileChecker(dir, branchRef, dirtyPaths, { maxFallba
 /** `claude agents --json` - the LIVE session listing (background agents, this host). Best-effort. */
 export function liveAgentSessions({ exec = execFileSync } = {}) {
   try {
-    const out = exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const out = cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) });
     const parsed = JSON.parse(out);
     return Array.isArray(parsed) ? parsed : [];
   } catch {

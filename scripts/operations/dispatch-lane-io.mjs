@@ -52,6 +52,7 @@ import { readGitAlreadyDone } from '../lib/git-already-done.mjs';
 
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { execFileSync } from 'node:child_process';
+import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 // #4415 (round 2) — live incident 2026-09-29: `defaultCheckAlreadyDone`/`defaultCheckAlreadyDoneAsync`/
 // `defaultListPrs` below all defaulted to a bare, unattributed `execFileSync`/`execFile` — never
 // `execFileSyncThrottled` — exactly the same defect this card's first round fixed in `lease-reaper.mjs` and
@@ -3251,7 +3252,7 @@ export function defaultLaneRefForPr(pr, { exec = execFileSyncThrottled, env = pr
  *   unchanged; pass `all: true` ONLY from a caller whose job requires seeing completed sessions too.
  */
 export function defaultListAgents({ exec = execFileSync, env = process.env, all = false } = {}) {
-  const out = exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
+  const out = cachedClaudeAgents({ all, env, fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 8 * 1024 * 1024,
@@ -3262,6 +3263,6 @@ export function defaultListAgents({ exec = execFileSync, env = process.env, all 
     // pointed `PATH` at a fake got a real spawn and a REAL listing back. The default is `process.env`, so
     // every existing caller — all of which pass `{ exec }` alone — is byte-identical.
     env,
-  });
+  }) });
   return JSON.parse(String(out || '[]'));
 }
