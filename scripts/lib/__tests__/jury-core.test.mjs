@@ -1,5 +1,5 @@
 import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, liveReferrals } from '../jury-core.mjs';
-import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER } from '../jury-core.mjs';
+import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER, REFERRAL_STAMP_POLICY_ENV, resolveReferralStampPolicy } from '../jury-core.mjs';
 /**
  * @file jury-core.test.mjs — proof of the #2654 (S2 of epic #2649) append-only JURY-LEDGER EVENT VOCABULARY:
  *   the `JURY_EVENT_TYPES` / `JUROR_STATUSES` enums and the pure `validateJuryEvent` / `normalizeJuryEvent`
@@ -8,7 +8,7 @@ import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, 
  *   directly (these symbols are NOT re-exported through the PR-diff-specific review-core), so this file imports
  *   from '../jury-core.mjs' directly.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1744,27 +1744,42 @@ describe('#4315 mandatory referral protocol', () => {
       expect(validateReferralRecord({ ...r, rulings: [{ ...r.rulings[0], ...patch }] })).toBe(false);
     }
     expect(referralRecordState(r, { body: `<!-- authored-by-actor: ${r.reviewer.id} -->` }).pending).toHaveLength(1);
-    expect(referralRecordState(r, { body: '' }).pending).toEqual([]);
+    expect(referralRecordState(r, { body: '' }).pending).toEqual([r.referrals[0].key, 'author-stamp-missing']);
   });
-  it('counts a run-derived reviewer ruling when the author stamp is missing', () => {
+  it('resolves the missing-stamp policy strictly: only the exact value `run-identity` relaxes it', () => {
+    expect(resolveReferralStampPolicy({})).toBe('refuse');
+    expect(resolveReferralStampPolicy({ [REFERRAL_STAMP_POLICY_ENV]: 'refuse' })).toBe('refuse');
+    expect(resolveReferralStampPolicy({ [REFERRAL_STAMP_POLICY_ENV]: 'run-identity' })).toBe('run-identity');
+    for (const v of ['Run-Identity', ' run-identity', 'RUN-IDENTITY', 'strict', 'true', '1', '']) {
+      expect(resolveReferralStampPolicy({ [REFERRAL_STAMP_POLICY_ENV]: v })).toBe('refuse');
+    }
+  });
+  it('holds an unstamped PR by default for both missing-stamp statuses, through the gate', () => {
+    const r = record(); r.authorBody = ''; r.rulings = [rule(r)];
+    const pending = [r.referrals[0].key, 'author-stamp-missing'];
+    const comments = [post(renderReferralRecord(r))];
+    // post-regime → stamp-lost; pre-regime → unknown-author; neither relaxes without the explicit opt-in.
+    for (const [createdAt, status] of [['2026-10-04T17:17:58Z', 'stamp-lost'], ['2026-01-01T00:00:00Z', 'unknown-author']]) {
+      expect(referralRecordState(r, { createdAt })).toMatchObject({ pending, independence: { status, fallback: false } });
+      expect(mandatoryReferralState(comments, { createdAt }).pending).toEqual(pending);
+    }
+  });
+  it('counts a run-derived reviewer ruling when the author stamp is missing only on the explicit opt-in', () => {
     const r = record(); r.authorBody = ''; r.rulings = [rule(r)];
     expect(validateReferralRecord(r)).toBe(true);
-    expect(referralRecordState(r, { createdAt: '2026-10-04T17:17:58Z' })).toMatchObject({
+    const createdAt = '2026-10-04T17:17:58Z';
+    expect(referralRecordState(r, { createdAt, stampPolicy: 'run-identity' })).toMatchObject({
       pending: [], independence: { status: 'stamp-lost', fallback: true },
     });
+    // The same opt-in read from the real env var through the gate's default resolver.
+    const comments = [post(renderReferralRecord(r))];
+    vi.stubEnv(REFERRAL_STAMP_POLICY_ENV, 'run-identity');
+    try { expect(mandatoryReferralState(comments, { createdAt }).pending).toEqual([]); } finally { vi.unstubAllEnvs(); }
+    expect(mandatoryReferralState(comments, { createdAt }).pending).toEqual([r.referrals[0].key, 'author-stamp-missing']);
   });
-  it('names the missing stamp when policy refuses the fallback, including through the gate', () => {
-    const r = record(); r.authorBody = ''; r.rulings = [rule(r)];
-    const context = { createdAt: '2026-10-04T17:17:58Z', stampPolicy: 'refuse' };
-    const pending = [r.referrals[0].key, 'author-stamp-missing'];
-    expect(referralRecordState(r, context)).toMatchObject({
-      pending, independence: { status: 'stamp-lost', fallback: false },
-    });
-    expect(mandatoryReferralState([post(renderReferralRecord(r))], context).pending).toEqual(pending);
-  });
-  it('never applies the missing-stamp fallback to self-clear', () => {
+  it('never applies the missing-stamp fallback to self-clear, even on the opt-in', () => {
     const r = record(); r.rulings = [rule(r)];
-    expect(referralRecordState(r, { body: `<!-- authored-by-actor: ${r.reviewer.id} -->` })).toMatchObject({
+    expect(referralRecordState(r, { body: `<!-- authored-by-actor: ${r.reviewer.id} -->`, stampPolicy: 'run-identity' })).toMatchObject({
       pending: [r.referrals[0].key], independence: { status: 'self-clear', fallback: false },
     });
   });
