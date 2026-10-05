@@ -54,6 +54,7 @@ import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from 
 import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readTimeoutBudget } from './timeout-retry-state.mjs';
+import { isInfraCancelledOnlyRun, isInfraCancelledJob, classifyInfraCancelled, resolveInfraCancelledMode, DEFAULT_INFRA_CANCELLED_MAX_RERUNS } from './infra-cancelled.mjs';
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
 import { createRequire } from 'node:module';
@@ -358,7 +359,22 @@ export function defaultReadMainRuns({
   });
   if (isGhDeferred(out)) return JSON.parse(String(out));
   const parsed = JSON.parse(String(out || '[]'));
-  return (Array.isArray(parsed) ? parsed : []).filter((r) => r?.workflowName === workflowName);
+  const runs = (Array.isArray(parsed) ? parsed : []).filter((r) => r?.workflowName === workflowName);
+  // Outage fix: a `failure` run whose only red jobs were cancelled / had no runner is NOT "main is red". Annotate it
+  // (bounded: only recent completed `failure` runs, read failures leave the run counted red, the safe direction).
+  let reads = 0;
+  return runs.map((r) => {
+    if (String(r?.conclusion).toLowerCase() !== 'failure' || !r.databaseId || reads >= 10) return r;
+    reads++;
+    try {
+      const slug = repo ?? '{owner}/{repo}';
+      const jobs = JSON.parse(String(exec('gh', ['api', `repos/${slug}/actions/runs/${r.databaseId}/jobs?per_page=100`], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024,
+        timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+      }))).jobs;
+      return Array.isArray(jobs) && isInfraCancelledOnlyRun(jobs) ? { ...r, infraCancelledOnly: true } : r;
+    } catch { return r; }
+  });
 }
 
 /**
@@ -1490,10 +1506,22 @@ export function readTimeoutEvidence(pr, { repo, exec = execFileSyncThrottled, ts
       const run = api(`repos/${repo}/actions/runs/${match[2]}`);
       if (job.id !== Number(match[3]) || job.run_id !== run.id || run.head_sha !== head || job.head_sha !== head
           || run.repository.full_name !== repo || job.run_attempt !== run.run_attempt) throw new Error('wrong-run-head-attempt');
-      return { repo, head, run: run.id, job: job.id, attempt: job.run_attempt, workflow: run.path,
+      // Outage fix: a cancelled / startup_failure / no-runner job has NO log, so the read below 404'd and the PR
+      // was refused forever. Classify first; never read a log that cannot exist.
+      const infra = isInfraCancelledJob(job);
+      return { repo, head, run: run.id, job: job.id, name: job.name, attempt: job.run_attempt, workflow: run.path,
         status: job.status, conclusion: job.conclusion, logJob: job.id, logAttempt: job.run_attempt,
-        url: job.html_url, log: api(`repos/${repo}/actions/jobs/${job.id}/logs`, true) };
+        url: job.html_url, infra, log: infra ? '' : api(`repos/${repo}/actions/jobs/${job.id}/logs`, true) };
     });
+    const infraClass = classifyInfraCancelled(jobs);
+    if (infraClass.kind === 'infra-only') {
+      const after = api(`repos/${repo}/pulls/${pr.number}`);
+      if (after.head.sha !== head) throw new Error('stale-head');
+      const signature = createHash('sha256').update(JSON.stringify(['infra-cancelled', head, infraClass.runs.map((r) => r.run).sort()])).digest('hex');
+      return { eligible: true, infraCancelled: true, repo, pr: pr.number, head, signature,
+        jobs: infraClass.runs.map((r) => ({ repo, head, run: r.run, job: r.job, attempt: r.attempt })) };
+    }
+    if (infraClass.kind === 'mixed') return { eligible: false, reason: 'mixed-infra-cancelled-and-real-failure' };
     // Refuse incomplete/mixed inventories before the more expensive immutable source reads.
     if (!jobs.length || jobs.some((j) => !parseTimeoutFailures(j.log).complete)) throw new Error('incomplete-failure-inventory');
     const tree = api(`repos/${repo}/git/trees/${head}?recursive=1`);
@@ -1528,18 +1556,23 @@ export function readTimeoutEvidence(pr, { repo, exec = execFileSyncThrottled, ts
 
 export function enrichPrsWithTimeoutEvidence(prs, {
   repo, read = readTimeoutEvidence, readBudget = readTimeoutBudget, enabled = process.env.WE_CI_TIMEOUT_RERUN_ENABLED !== '0',
+  infraMode = resolveInfraCancelledMode(repoKeyForSlug(repo)), infraMaxReruns = DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
 } = {}) {
   // GRADUATED 2026-10-04 (PR #3826): the opt-in flag was never set on the edge, so the re-run that does not spend
   // heal budget was dead code and a flaky-timeout PR burned 3/3 heals. On by default now; `=0` is the kill switch.
   if (!enabled) return prs;
   return prs.map((pr) => {
     if (!(pr.statusCheckRollup ?? []).some((c) => c.name !== 'review-gate'
-      && ['failure', 'timed_out'].includes(String(c.conclusion).toLowerCase()))) return pr;
+      && ['failure', 'timed_out', 'cancelled', 'startup_failure'].includes(String(c.conclusion).toLowerCase()))) return pr;
     const timeoutRetryBudget = readBudget({ repo, pr: pr.number, head: pr.headRefOid });
     if (!(pr.statusCheckRollup ?? []).some((c) => c.detailsUrl?.startsWith(`https://github.com/${repo}/actions/runs/`))) {
       return { ...pr, timeoutRetryBudget, timeoutRetry: { eligible: false, reason: 'missing-check-origin' } };
     }
-    return { ...pr, timeoutRetry: read(pr, { repo }),
-      timeoutRetryBudget };
+    let timeoutRetry = read(pr, { repo });
+    if (timeoutRetry?.infraCancelled) {
+      timeoutRetry = infraMode === 'rerun' ? { ...timeoutRetry, cap: infraMaxReruns }
+        : { eligible: false, reason: 'infra-cancelled-heal-mode' };
+    }
+    return { ...pr, timeoutRetry, timeoutRetryBudget };
   });
 }

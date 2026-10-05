@@ -2006,9 +2006,11 @@ export function planReconcile({
       }
       // xng7q1p: same-head mechanical retries never consume or rewrite heal markers.
       // All main-red, escalation and live-owner guards above retain precedence.
-      if (retryBudget?.confirmed < 2 && pr.timeoutRetry?.eligible && pr.timeoutRetry.head === pr.headRefOid && pr.timeoutRetry.pr === prNumber) {
+      if (retryBudget?.confirmed < (pr.timeoutRetry?.infraCancelled ? (pr.timeoutRetry.cap ?? 6) : 2) && pr.timeoutRetry?.eligible && pr.timeoutRetry.head === pr.headRefOid && pr.timeoutRetry.pr === prNumber) {
         dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', timeoutRetry: pr.timeoutRetry,
-          why: 'complete timeout inventory and unchanged dependency closure; independent retry budget' });
+          why: pr.timeoutRetry.infraCancelled
+            ? 'every red required check is infra-cancelled (cancelled / startup_failure / no runner) — mechanical re-run, no heal budget'
+            : 'complete timeout inventory and unchanged dependency closure; independent retry budget' });
         continue;
       }
       if (pr.timeoutRetry && !pr.timeoutRetry.eligible) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,

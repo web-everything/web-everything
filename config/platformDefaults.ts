@@ -51,5 +51,18 @@ export const PLATFORM_FLAVOR_DEFAULTS = {
   crossProviderFallback: 'wait-then-park' satisfies CrossProviderFallbackPolicy,
 } as const;
 
+/**
+ * CI-heal defaults for the conveyor (per-repo overridable via `WE_CI_HEAL_INFRA_CANCELLED[_<REPOKEY>]`).
+ * `infraCancelled`: a required check red ONLY because its job was cancelled / never started / had no runner
+ * (a GitHub Actions outage) carries no evidence about the PR's code. `rerun` (default) re-triggers the
+ * cancelled runs mechanically, capped at `infraCancelledMaxReruns` confirmed requests per head, then falls
+ * back to ci-heal; `heal` skips the mechanical re-run. Real failures always go to ci-heal. This never changes
+ * what counts as green. Mirrored in `scripts/conveyor/infra-cancelled.mjs`.
+ */
+export const PLATFORM_CI_HEAL_DEFAULTS = {
+  infraCancelled: 'rerun' as 'rerun' | 'heal',
+  infraCancelledMaxReruns: 6,
+} as const;
+
 /** Default `waitTimeoutMs` for `wait-then-park` (xb1e9nj): 24 hours, the bound the decision named as the example. */
 export const PLATFORM_CROSS_PROVIDER_FALLBACK_WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1000;

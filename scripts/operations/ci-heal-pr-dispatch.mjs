@@ -304,8 +304,14 @@ export async function runReconcileCiHealDispatch({
   const timeoutResults = [];
   for (const entry of (reconciled.dispatch ?? []).filter((row) => row.kind === 'ci-timeout-rerun')) {
     try {
-      timeoutResults.push({ ...await retryTimeout(entry.timeoutRetry, { root, repo: CONSTELLATION_REPOS[repoKey].slug }),
-        kind: 'ci-timeout-rerun', pr: entry.prNumber });
+      // Infra-cancelled evidence names one target per cancelled run; request them all this tick (the per-head cap
+      // still bounds the total). A timeout retry stays one job per tick.
+      const rounds = entry.timeoutRetry?.infraCancelled ? Math.max(1, entry.timeoutRetry.jobs?.length ?? 1) : 1;
+      for (let i = 0; i < rounds; i++) {
+        const result = await retryTimeout(entry.timeoutRetry, { root, repo: CONSTELLATION_REPOS[repoKey].slug });
+        timeoutResults.push({ ...result, kind: 'ci-timeout-rerun', pr: entry.prNumber });
+        if (result.status !== 'requested') break;
+      }
     } catch (error) {
       timeoutResults.push({ kind: 'ci-timeout-rerun', pr: entry.prNumber, status: 'refused', reason: error.message });
     }
@@ -481,8 +487,10 @@ export function timeoutGithubEffects({ exec = execFileSyncThrottled } = {}) {
     },
     request(evidence, target) {
       try {
+        // Infra-cancelled: re-run the whole run's cancelled/failed jobs (a cancelled job has no log to re-run from).
+        const endpoint = evidence.infraCancelled ? `actions/runs/${target.run}/rerun-failed-jobs` : `actions/jobs/${target.job}/rerun`;
         const response = String(exec('gh', ['api', '--include', '--method', 'POST',
-          `repos/${evidence.repo}/actions/jobs/${target.job}/rerun`],
+          `repos/${evidence.repo}/${endpoint}`],
         { encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] }));
         return /^HTTP\/\S+ 201\b/m.test(response) ? { status: 'confirmed' } : { status: 'ambiguous' };
       } catch (error) {
@@ -509,7 +517,7 @@ export function readTimeoutHold({ repo, pr, head, dir = timeoutStateDir() }) {
 async function fileTimeoutFollowup(path, { root, fileFollowup } = {}) {
   let payload;
   timeoutTransaction(path, null, (state) => {
-    if (confirmedTimeouts(state) < 2 || state.card?.filed) return;
+    if (state.evidence.infraCancelled || confirmedTimeouts(state) < 2 || state.card?.filed) return;
     if (state.card?.filingPid) {
       try { process.kill(state.card.filingPid, 0); return; }
       catch (error) { if (error.code !== 'ESRCH') return; }
@@ -614,7 +622,7 @@ export async function dispatchTimeoutRetry(evidence, {
   };
   let reservation;
   const selected = timeoutTransaction(path, initial, (state) => {
-    if (confirmedTimeouts(state) >= 2) return { exhausted: true, card: state.card?.payload.num };
+    if (confirmedTimeouts(state) >= (evidence.infraCancelled ? (evidence.cap ?? 6) : 2)) return { exhausted: true, card: state.card?.payload.num };
     const pending = state.requests.find((r) => r.status === 'pending');
     if (pending) return { pending: structuredClone(pending) };
     const target = evidence.jobs.find((j) => !state.requests.some((r) => r.status === 'confirmed'
@@ -657,7 +665,8 @@ export async function dispatchTimeoutRetry(evidence, {
     return refuse('retry-reconciled-wait-for-evidence');
   }
   if (observed.attempt !== target.attempt || observed.jobAttempt !== target.attempt
-      || observed.status !== 'completed' || observed.conclusion !== 'failure') {
+      || observed.status !== 'completed'
+      || (evidence.infraCancelled ? ['success', 'skipped', 'neutral'].includes(observed.conclusion) : observed.conclusion !== 'failure')) {
     timeoutTransaction(path, initial, (state) => { state.requests[reservation.id].status = 'rejected'; });
     return refuse('job-no-longer-failed-at-evidenced-attempt');
   }
