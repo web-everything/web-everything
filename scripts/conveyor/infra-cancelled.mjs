@@ -34,15 +34,34 @@ export function isInfraCancelledJob(job) {
   return noRunner && Array.isArray(job.steps) && job.steps.length === 0;
 }
 
+/** The first step of the CI `test` aggregate job (`.github/workflows/ci.yml`): it fails closed when a `needs` dep did not succeed. */
+export const AGGREGATE_GATE_STEP = 'Gate on shard results';
+
+const PASSING = Object.freeze(['success', 'skipped', 'neutral']);
+
+/**
+ * Is this failed job the DERIVED aggregate `test` gate — red only because a `needs` dep (a cancelled shard) did not
+ * succeed — rather than a real failure that merely carries the name `test`? PURE. Decided STRUCTURALLY, never by name
+ * alone (a job name is workflow-author controlled): the job is `test` AND the only step that did not pass is the
+ * gate step itself. A `test` job whose gate step passed and a LATER step (check:standards, merge coverage…) failed,
+ * or that failed any step besides the gate, is real evidence.
+ * @param {{name?:string, steps?:Array<{name?:string, conclusion?:string}>}} job a `GET /actions/jobs/<id>` record
+ */
+export function isAggregateGateFailure(job) {
+  if (job?.name !== 'test' || !Array.isArray(job.steps) || !job.steps.length) return false;
+  const notPassing = job.steps.filter((s) => !PASSING.includes(String(s?.conclusion ?? '').toLowerCase()));
+  return notPassing.length === 1 && notPassing[0]?.name === AGGREGATE_GATE_STEP;
+}
+
 /**
  * Classify the failed required jobs of one head. PURE.
- * @param {Array<{run:number, job:number, attempt:number, infra:boolean}>} jobs
+ * @param {Array<{run:number, job:number, attempt:number, infra:boolean, aggregateGate?:boolean}>} jobs
  * @returns {{kind:'none'|'infra-only'|'mixed'|'real', runs:Array<{run:number, job:number, attempt:number}>}}
  */
 export function classifyInfraCancelled(jobs) {
   const all = Array.isArray(jobs) ? jobs : [];
-  // The aggregate `test` job only mirrors its (cancelled) `needs`: it is not independent real evidence.
-  const list = all.some((j) => j.infra) ? all.filter((j) => j.infra || j.name !== 'test') : all;
+  // Only the DERIVED aggregate gate failure mirrors its (cancelled) `needs` and is not independent real evidence.
+  const list = all.some((j) => j.infra) ? all.filter((j) => j.infra || !j.aggregateGate) : all;
   if (!list.length) return { kind: 'none', runs: [] };
   const infra = list.filter((j) => j.infra);
   if (infra.length === 0) return { kind: 'real', runs: [] };
@@ -53,15 +72,16 @@ export function classifyInfraCancelled(jobs) {
 
 /**
  * Is a whole workflow run red ONLY because of infra? PURE. True when at least one job is infra-cancelled and every
- * other non-success job is the derived aggregate (`test`, which only mirrors its cancelled `needs`). Used so an
- * outage-cancelled `main` run is never counted as "main is red".
+ * other non-success job is the derived aggregate gate failure ({@link isAggregateGateFailure}, which only mirrors its
+ * cancelled `needs`). Used so an outage-cancelled `main` run is never counted as "main is red". A real failure in a
+ * job merely NAMED `test` keeps the run red.
  * @param {Array<{name?:string, status?:string, conclusion?:string, runner_name?:string, runner_id?:number, steps?:Array}>} jobs
  */
 export function isInfraCancelledOnlyRun(jobs) {
-  const bad = (Array.isArray(jobs) ? jobs : []).filter((j) => !['success', 'skipped', 'neutral'].includes(String(j?.conclusion ?? '').toLowerCase()));
+  const bad = (Array.isArray(jobs) ? jobs : []).filter((j) => !PASSING.includes(String(j?.conclusion ?? '').toLowerCase()));
   const infra = bad.filter((j) => isInfraCancelledJob(j));
   if (!infra.length) return false;
-  return bad.every((j) => isInfraCancelledJob(j) || j?.name === 'test');
+  return bad.every((j) => isInfraCancelledJob(j) || isAggregateGateFailure(j));
 }
 
 /** Resolve the `ciHeal.infraCancelled` mode for a repo key. Env: `WE_CI_HEAL_INFRA_CANCELLED[_<REPOKEY>]`. PURE. */

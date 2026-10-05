@@ -9,7 +9,9 @@
 	daemon-manifest.mjs declared this watcher but NO launchd template existed, so nothing ever installed it and those
 	PRs sat refused forever (live: PRs 3990/4019/4021 after the 2026-10-05 Actions outage). Shaped like
 	com.we.conveyor-pass-daemon.ci-red-recovery-watch-we, run from the wev-review-daemon clone (self-synced, so overlays
-	reach this pass too). Sibling repos: copy with `--pass=ci-red-recovery-watch-frontierui` / `-plateau-app`.
+	reach this pass too). Sibling repos: copy this file and change the pass name (the ProgramArguments entry after the
+	pass flag) to ci-red-recovery-watch-frontierui or ci-red-recovery-watch-plateau-app. (No double hyphen may appear
+	inside an XML comment, so the flag itself is not spelled out here.)
 	INSTALL (the operator, or a session the operator has said yes to):
 	  1. Replace <app-id>, <installation-id>, <path-to-private-key.pem> with the same GitHub App values the
 	     merge-orphan-sweep plist uses (never commit them):

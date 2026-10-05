@@ -37,6 +37,14 @@ export default {
     if (!plan.dispatch.some((d) => d.prNumber === 5 && d.kind === 'ci-timeout-rerun')) {
       violations.push(`no mechanical re-run planned; refusals: ${plan.refusals.map((r) => `${r.kind}:${r.why}`).join(' | ').slice(0, 200)}`);
     }
+    // Review follow-up (PR #4024): a re-run GitHub keeps rejecting must spend the cap too, then reach ci-heal — the
+    // same refused-forever failure class, one step later.
+    const rejectedForever = pass.enrichPrsWithTimeoutEvidence([pr], { repo, enabled: true, readBudget: () => ({ confirmed: 0, rejected: 6, pending: false }),
+      read: (p, o) => pass.readTimeoutEvidence(p, { ...o, exec }) });
+    const afterRejects = planReconcile({ prs: rejectedForever, agents: [], durableCounts: {}, now: Date.parse('2026-10-05T22:00:00Z'), requiredChecks: ['test'] });
+    if (afterRejects.dispatch.some((d) => d.prNumber === 5 && d.kind === 'ci-timeout-rerun')) {
+      violations.push('a re-run rejected 6 times is still re-planned as a mechanical re-run instead of falling through to ci-heal');
+    }
     return { violations };
   },
   judge(report) { return report.violations; },

@@ -54,7 +54,7 @@ import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from 
 import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readTimeoutBudget } from './timeout-retry-state.mjs';
-import { isInfraCancelledOnlyRun, isInfraCancelledJob, classifyInfraCancelled, resolveInfraCancelledMode, DEFAULT_INFRA_CANCELLED_MAX_RERUNS } from './infra-cancelled.mjs';
+import { isInfraCancelledOnlyRun, isInfraCancelledJob, isAggregateGateFailure, classifyInfraCancelled, resolveInfraCancelledMode, DEFAULT_INFRA_CANCELLED_MAX_RERUNS } from './infra-cancelled.mjs';
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
 import { createRequire } from 'node:module';
@@ -368,11 +368,15 @@ export function defaultReadMainRuns({
     reads++;
     try {
       const slug = repo ?? '{owner}/{repo}';
-      const jobs = JSON.parse(String(exec('gh', ['api', `repos/${slug}/actions/runs/${r.databaseId}/jobs?per_page=100`], {
+      const page = JSON.parse(String(exec('gh', ['api', `repos/${slug}/actions/runs/${r.databaseId}/jobs?per_page=100`], {
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024,
         timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
-      }))).jobs;
-      return Array.isArray(jobs) && isInfraCancelledOnlyRun(jobs) ? { ...r, infraCancelledOnly: true } : r;
+      })));
+      const jobs = page?.jobs;
+      // Only the first page is read, so the inventory must be provably COMPLETE: a real failure on a later page would
+      // otherwise be invisible and the run wrongly judged infra-only. An unverifiable or truncated inventory stays red.
+      const complete = Array.isArray(jobs) && Number.isInteger(page.total_count) && page.total_count === jobs.length;
+      return complete && isInfraCancelledOnlyRun(jobs) ? { ...r, infraCancelledOnly: true } : r;
     } catch { return r; }
   });
 }
@@ -1510,7 +1514,7 @@ export function readTimeoutEvidence(pr, { repo, exec = execFileSyncThrottled, ts
       // was refused forever. Classify first; never read a log that cannot exist.
       const infra = isInfraCancelledJob(job);
       return { repo, head, run: run.id, job: job.id, name: job.name, attempt: job.run_attempt, workflow: run.path,
-        status: job.status, conclusion: job.conclusion, logJob: job.id, logAttempt: job.run_attempt,
+        aggregateGate: isAggregateGateFailure(job), status: job.status, conclusion: job.conclusion, logJob: job.id, logAttempt: job.run_attempt,
         url: job.html_url, infra, log: infra ? '' : api(`repos/${repo}/actions/jobs/${job.id}/logs`, true) };
     });
     const infraClass = classifyInfraCancelled(jobs);

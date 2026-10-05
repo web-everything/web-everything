@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
-  isInfraCancelledJob, classifyInfraCancelled, isInfraCancelledOnlyRun, resolveInfraCancelledMode,
+  isInfraCancelledJob, isAggregateGateFailure, classifyInfraCancelled, isInfraCancelledOnlyRun, resolveInfraCancelledMode,
   DEFAULT_INFRA_CANCELLED_MODE, DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
 } from '../infra-cancelled.mjs';
 import { computeMainRedWindows } from '../main-red-recovery.mjs';
@@ -21,21 +21,53 @@ describe('infra-cancelled classifier', () => {
     expect(isInfraCancelledJob({ status: 'in_progress', conclusion: null })).toBe(false);
   });
 
-  it('infra-only dedupes by run; a real failure makes it mixed; the aggregate test job is ignored', () => {
-    const j = (run, job, infra, name = 'x') => ({ run, job, attempt: 1, infra, name });
+  it('infra-only dedupes by run; a real failure makes it mixed; only the aggregate gate failure is ignored', () => {
+    const j = (run, job, infra, name = 'x', aggregateGate = false) => ({ run, job, attempt: 1, infra, name, aggregateGate });
     expect(classifyInfraCancelled([j(1, 10, true), j(1, 11, true), j(2, 20, true)])).toEqual({
       kind: 'infra-only', runs: [{ run: 1, job: 10, attempt: 1 }, { run: 2, job: 20, attempt: 1 }] });
     expect(classifyInfraCancelled([j(1, 10, true), j(1, 11, false)]).kind).toBe('mixed');
-    expect(classifyInfraCancelled([j(1, 10, true), j(1, 12, false, 'test')]).kind).toBe('infra-only');
+    expect(classifyInfraCancelled([j(1, 10, true), j(1, 12, false, 'test', true)]).kind).toBe('infra-only');
+    // A job merely NAMED `test` that is a real failure (not the aggregate gate step) is real evidence.
+    expect(classifyInfraCancelled([j(1, 10, true), j(1, 12, false, 'test', false)]).kind).toBe('mixed');
     expect(classifyInfraCancelled([j(1, 11, false)]).kind).toBe('real');
     expect(classifyInfraCancelled([]).kind).toBe('none');
   });
 
-  it('a main run red only through cancelled shards + the aggregate test job is infra-only', () => {
-    const agg = { name: 'test', status: 'completed', conclusion: 'failure', runner_name: 'r', steps: [{}] };
+  it('the aggregate gate failure is recognised structurally (its only failed step is the gate step), never by name alone', () => {
+    const step = (name, conclusion) => ({ name, status: 'completed', conclusion });
+    const gateOnly = { name: 'test', status: 'completed', conclusion: 'failure', runner_name: 'r',
+      steps: [step('Set up job', 'success'), step('Gate on shard results', 'failure'), step('Run check:standards', 'skipped')] };
+    const realLaterStep = { ...gateOnly, steps: [step('Set up job', 'success'), step('Gate on shard results', 'success'), step('Run check:standards', 'failure')] };
+    const gateAndLater = { ...gateOnly, steps: [step('Gate on shard results', 'failure'), step('Run check:standards', 'failure')] };
+    expect(isAggregateGateFailure(gateOnly)).toBe(true);
+    expect(isAggregateGateFailure(realLaterStep)).toBe(false);
+    expect(isAggregateGateFailure(gateAndLater)).toBe(false);
+    expect(isAggregateGateFailure({ ...gateOnly, name: 'build' })).toBe(false);
+    expect(isAggregateGateFailure({ ...gateOnly, steps: [] })).toBe(false);
+    expect(isAggregateGateFailure(undefined)).toBe(false);
+  });
+
+  it('a main run red only through cancelled shards + the aggregate gate failure is infra-only; a real `test` failure is not', () => {
+    const step = (name, conclusion) => ({ name, status: 'completed', conclusion });
+    const agg = { name: 'test', status: 'completed', conclusion: 'failure', runner_name: 'r', steps: [step('Gate on shard results', 'failure')] };
+    const realTest = { name: 'test', status: 'completed', conclusion: 'failure', runner_name: 'r',
+      steps: [step('Gate on shard results', 'success'), step('Run check:standards', 'failure')] };
     expect(isInfraCancelledOnlyRun([cancelledJob, agg])).toBe(true);
+    expect(isInfraCancelledOnlyRun([cancelledJob, realTest])).toBe(false);
     expect(isInfraCancelledOnlyRun([cancelledJob, realFail])).toBe(false);
     expect(isInfraCancelledOnlyRun([agg])).toBe(false);
+  });
+
+  // Scoped to this PR's own new template: XML forbids `--` inside a comment, so a plist carrying one is rejected by
+  // plutil/launchctl and the watcher it installs never loads. (Older templates carry the same pattern; that is a
+  // separate, pre-existing cleanup this repair deliberately does not fold in.)
+  it('the ci-red-recovery-watch launchd template is XML-comment-safe: no `--` inside a comment', () => {
+    const file = resolve(process.cwd(), 'skills-src/conveyor/launchd/com.we.conveyor-pass-daemon.ci-red-recovery-watch-we.plist.example');
+    const text = readFileSync(file, 'utf8');
+    const comments = [...text.matchAll(/<!--([\s\S]*?)-->/g)].map((m) => m[1]);
+    expect(comments.length).toBeGreaterThan(0);
+    for (const body of comments) expect({ bad: body.includes('--') || body.endsWith('-') }).toEqual({ bad: false });
+    expect(text.replace(/<!--[\s\S]*?-->/g, '').includes('<!--')).toBe(false);
   });
 
   it('mode defaults to rerun, honours env and a per-repo override, ignores junk', () => {
@@ -64,11 +96,26 @@ describe('main-red judgement', () => {
 
   it('defaultReadMainRuns annotates a failure run whose jobs are infra-only; a failed read leaves it red', () => {
     const list = JSON.stringify([{ databaseId: 7, conclusion: 'failure', status: 'completed', workflowName: 'CI', updatedAt: 'x' }]);
-    const jobs = JSON.stringify({ jobs: [cancelledJob, { name: 'test', status: 'completed', conclusion: 'failure', runner_name: 'r', steps: [{}] }] });
+    const agg = { name: 'test', status: 'completed', conclusion: 'failure', runner_name: 'r', steps: [{ name: 'Gate on shard results', status: 'completed', conclusion: 'failure' }] };
+    const jobs = JSON.stringify({ total_count: 2, jobs: [cancelledJob, agg] });
     const ok = defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? jobs : list) });
     expect(ok[0].infraCancelledOnly).toBe(true);
     const bad = defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => { if (argv[0] === 'api') throw new Error('x'); return list; } });
     expect(bad[0].infraCancelledOnly).toBeUndefined();
+  });
+
+  it('an incomplete job inventory (more jobs than the first page) keeps the run red — a real failure may sit on a later page', () => {
+    const list = JSON.stringify([{ databaseId: 7, conclusion: 'failure', status: 'completed', workflowName: 'CI', updatedAt: 'x' }]);
+    const page1 = Array.from({ length: 100 }, (_, i) => (i === 0 ? cancelledJob : { name: `ok-${i}`, status: 'completed', conclusion: 'success' }));
+    const paged = JSON.stringify({ total_count: 150, jobs: page1 });
+    const out = defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? paged : list) });
+    expect(out[0].infraCancelledOnly).toBeUndefined();
+    // No total_count at all is an unverifiable inventory: also left red (the safe direction).
+    const noTotal = JSON.stringify({ jobs: [cancelledJob] });
+    expect(defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? noTotal : list) })[0].infraCancelledOnly).toBeUndefined();
+    // A complete inventory of exactly the page size is still trusted.
+    const full = JSON.stringify({ total_count: 100, jobs: page1 });
+    expect(defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? full : list) })[0].infraCancelledOnly).toBe(true);
   });
 });
 
@@ -96,6 +143,30 @@ describe('infra-cancelled evidence + planning', () => {
     const e = readTimeoutEvidence(pr, { repo, exec: mkExec() });
     expect(e).toMatchObject({ eligible: true, infraCancelled: true, repo, pr: 5, head });
     expect(e.jobs).toEqual([{ repo, head, run: 100, job: 1, attempt: 1 }]);
+  });
+
+  // `test` is a real runner job here (cancelled `daemon-soak` sits beside it, so `test` is NOT dropped as a derived
+  // aggregate of a failed test-shard). Whether it counts as the aggregate gate is decided by its failed step.
+  const withTestJob = (steps) => {
+    const base = mkExec();
+    return (c, args) => {
+      const path = args[1];
+      if (/actions\/jobs\/1$/.test(path)) return JSON.stringify({ id: 1, run_id: 100, head_sha: head, run_attempt: 1, name: 'test', status: 'completed', conclusion: 'failure', runner_name: 'GitHub Actions 1', steps });
+      if (/actions\/jobs\/1\/logs$/.test(path)) return 'FAIL scripts/x.test.mjs > a real failure\n';
+      return base(c, args);
+    };
+  };
+  const step = (name, conclusion) => ({ name, status: 'completed', conclusion });
+
+  it('a real failure in a job merely named `test` beside a cancelled job is NOT classed infra-only (no free mechanical re-runs)', () => {
+    const e = readTimeoutEvidence(pr, { repo, exec: withTestJob([step('Gate on shard results', 'success'), step('Run check:standards', 'failure')]) });
+    expect(e.infraCancelled).not.toBe(true);
+    expect(e).not.toMatchObject({ eligible: true, infraCancelled: true });
+  });
+
+  it('the genuine aggregate gate failure beside a cancelled job is still infra-only', () => {
+    const e = readTimeoutEvidence(pr, { repo, exec: withTestJob([step('Gate on shard results', 'failure'), step('Run check:standards', 'skipped')]) });
+    expect(e).toMatchObject({ eligible: true, infraCancelled: true });
   });
 
   it('enrichment: rerun mode carries the cap, heal mode falls back to ci-heal', () => {
