@@ -16,6 +16,8 @@
 	<true/>
 	<key>EnvironmentVariables</key>
 	<dict>
+		<key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key>
+		<string>120000</string>
 		<key>PATH</key>
 		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 		<key>CONVEYOR_STATE_ROOT</key>

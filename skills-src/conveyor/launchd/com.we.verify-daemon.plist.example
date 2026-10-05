@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	Example launchd plist for the standalone VERIFY daemon
+	(we:skills-src/conveyor/verify-daemon.mjs), running from the automation's control clone.
+	INSTALL (the operator):
+	  1. Create /Users/nicolasgilbert/workspace/wev-control and run `npm ci` in it.
+	  2. Create /Users/nicolasgilbert/workspace/.operations/coordination for the log below.
+	  3. Fill the GitHub App placeholders (never commit real values).
+	  4. cp this file to ~/Library/LaunchAgents/com.we.verify-daemon.plist (drop `.example`).
+	  5. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.we.verify-daemon.plist
+	CHECK: tail /Users/nicolasgilbert/workspace/.operations/coordination/verify-daemon.log
+	STOP:  launchctl bootout gui/$(id -u)/com.we.verify-daemon
+	-->
+	<key>Label</key>
+	<string>com.we.verify-daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin/node</string>
+		<string>/Users/nicolasgilbert/workspace/wev-control/skills-src/conveyor/verify-daemon.mjs</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>CONVEYOR_STATE_ROOT</key>
+		<string>/Users/nicolasgilbert/.claude/daemon-self-sync-state/conveyor-state</string>
+		<key>WE_GH_THROTTLE_PERSONAL_ROUTE</key>
+		<string>1</string>
+		<key>WE_HEAVY_ADMISSION_CAP</key>
+		<string>3</string>
+		<key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key>
+		<string>120000</string>
+		<!-- Select related tests by imports; skip literal-reference discovery. -->
+		<key>WE_VERIFY_RELATED</key>
+		<string>import-only</string>
+		<!-- Triple local Vitest test and hook timeouts; CI is unaffected. -->
+		<key>WE_VERIFY_TEST_TIMEOUT_FACTOR</key>
+		<string>3</string>
+		<key>WE_GITHUB_APP_ID</key>
+		<string>&lt;app-id&gt;</string>
+		<key>WE_GITHUB_APP_INSTALLATION_ID</key>
+		<string>&lt;installation-id&gt;</string>
+		<key>WE_GITHUB_APP_PRIVATE_KEY_PATH</key>
+		<string>&lt;path-to-private-key.pem&gt;</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/Users/nicolasgilbert/workspace/wev-control</string>
+	<key>StandardOutPath</key>
+	<string>/Users/nicolasgilbert/workspace/.operations/coordination/verify-daemon.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/nicolasgilbert/workspace/.operations/coordination/verify-daemon.log</string>
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+</dict>
+</plist>
