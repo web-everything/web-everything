@@ -23,6 +23,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runSoak } from '../soak.mjs';
+import { rebuildMechanismSource } from '../rebuild-mechanism-source.mjs';
 import { cloneFacts } from '../invariants.mjs';
 
 const OVERLAY_REF = 'lane/xpinskip-pinned-overlay-fixture';
@@ -42,7 +43,7 @@ export default {
   },
   fixPresent(root) {
     try {
-      return /pinnedConflictSkippable/.test(readFileSync(join(root, 'scripts/lib/daemon-rebuild.mjs'), 'utf8'));
+      return /pinnedConflictSkippable/.test(rebuildMechanismSource(root));
     } catch { return false; }
   },
   async run({ log } = {}) {

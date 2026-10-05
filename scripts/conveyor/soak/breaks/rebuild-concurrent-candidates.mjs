@@ -21,10 +21,11 @@
  * sees its marker gone and a spurious rejection is recorded.
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runSoak } from '../soak.mjs';
+import { rebuildMechanismSource } from '../rebuild-mechanism-source.mjs';
 
 const SMOKE_MS = 2_500;
 
@@ -39,7 +40,7 @@ export default {
   },
   fixPresent(root) {
     try {
-      return /rebuild-in-progress/.test(readFileSync(join(root, 'scripts/lib/daemon-rebuild.mjs'), 'utf8'));
+      return /rebuild-in-progress/.test(rebuildMechanismSource(root));
     } catch {
       return false;
     }
