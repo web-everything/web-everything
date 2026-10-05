@@ -1002,7 +1002,7 @@ it('an unscopable default request refuses before stamping a runnable marker', ()
 });
 
 describe('local timeout-only retry under admission', () => {
-  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false } = {}) {
+  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission } = {}) {
     const files = truncated ? Array.from({ length: 21 }, (_, i) => `untouched-${i}.test.mjs`) : ['untouched-a.test.mjs', 'untouched-b.test.mjs'];
     const stderr = files.map((f, i) => ` FAIL  ${f} > case ${i}\n${mixed && i === 1 ? 'AssertionError: wrong value' : 'Error: Test timed out in 5000ms.'}\n`).join('');
     const stdout = ` Test Files  ${files.length} failed\n Tests  ${files.length} failed\n Duration  5.1s\n`;
@@ -1051,13 +1051,38 @@ process.exit(${standardsExit});
     execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'baseline'], { cwd: dir });
     execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
     writeFileSync(join(dir, edited ? files[0] : 'source.mjs'), '// changed\n');
-    const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_HEAVY_ADMISSION_CAP: '1' };
+    const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission };
     function invoke(args = []) {
       const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env, encoding: 'utf8' });
       return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout, stderr: result.stderr };
     }
     return { files, invoke, calls: () => readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };
   }
+
+  // #verify-phase-admission — real slots across the related run, retry, and standards.
+  it.each([undefined, '0'])('records phase admission or the opt-out (%s)', phaseAdmission => {
+    const f = fixture({ phaseAdmission });
+    const result = f.invoke();
+    expect(result.code).toBe(0);
+    const phases = JSON.parse(readFileSync(marker(), 'utf8')).phases;
+    expect(phases.admissionMode).toBe(phaseAdmission === '0' ? 'gate' : 'phase');
+    const calls = f.calls();
+    expect(calls).toHaveLength(3);
+    for (const call of calls) {
+      expect(call.held).toHaveLength(1);
+      expect(call.inherited).toBe('1');
+    }
+    if (phaseAdmission === '0') {
+      expect(phases.admissionPhases).toBeNull();
+      expect(calls.map(call => call.held[0])).toEqual(Array(3).fill(calls[0].held[0]));
+    } else {
+      expect(phases.admissionPhases).toMatchObject({
+        vitest: { kind: 'files', lane: 'fast', waitedMs: expect.any(Number), timedOut: false },
+        standards: { kind: 'standards', lane: 'fast', waitedMs: expect.any(Number), timedOut: false },
+      });
+      expect(phases.admissionWaitMs).toBe(phases.admissionPhases.vitest.waitedMs + phases.admissionPhases.standards.waitedMs);
+    }
+  });
 
   it('retries only failed files once with one worker, then runs standards and records why', () => {
     const f = fixture();
@@ -1172,7 +1197,7 @@ describe('verify phase telemetry (#5141)', () => {
   });
   const explicitPhases = { admissionWaitMs: expect.any(Number), gateMs: expect.any(Number),
     vitestMs: null, scanMs: null, standardsMs: null, targetFileCount: null, changedFileCount: null,
-    importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null,
+    importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, admissionMode: 'gate', admissionPhases: null,
     outcomes: { vitest: { result: 'skipped' }, scan: { result: 'skipped' }, standards: { result: 'skipped' } } };
   function invoke(args) {
     const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, encoding: 'utf8' });
