@@ -1,0 +1,106 @@
+/**
+ * @file scripts/operations/free-scope.mjs
+ * @description PURE scope assessment over supplied PR and agent snapshots. Reuses the lease matcher so
+ * file/subtree conflicts have the same meaning for operators and workers; partial reads never claim free.
+ * No filesystem, clock, process or network access. The declared reader is injected by the IO boundary.
+ *
+ * WHY (operator handoff rules 21 and 26, 2026-10-05): "free scope" means no overlap with (a) the files of any
+ * open PR in web-everything/web-everything or plateauapp/plateau-app AND (b) the declared target files of every
+ * agent still running without a PR. Agents declare (b) in the shared registry
+ * `~/workspace/.operations/coordination/agent-scopes.json` via `we:scripts/operations/free-scope-cli.mjs register`;
+ * an entry past its TTL is ignored and reported, never silently trusted. Skill: `we:skills-src/free-scope/SKILL.md`.
+ */
+import { op } from './registry.mjs';
+import { compute } from './step-kinds.mjs';
+import { scopeEntriesOverlap } from '../readiness/scope-lease.mjs';
+
+export const FREE_SCOPE_OP = 'free-scope';
+export const DEFAULT_REPOS = ['web-everything/web-everything', 'plateauapp/plateau-app'];
+export const DEFAULT_TTL_HOURS = 4;
+const alias = (key) => ({ webeverything: 'we', 'web-everything': 'we', plateau: 'plateau-app' })[key] || key;
+export function repoKeyFor(slug) {
+  return slug === DEFAULT_REPOS[0] ? 'we' : slug.split('/').at(-1);
+}
+export function qualifyFile(f, defaultRepo = 'we') {
+  const value = f.trim().replace(/^\.\//, '');
+  if (!value) return '';
+  const colon = value.indexOf(':');
+  return colon < 0 ? `${alias(defaultRepo)}:${value}`
+    : `${alias(value.slice(0, colon))}:${value.slice(colon + 1).replace(/^\.\//, '')}`;
+}
+const qualified = (files) => [...new Set(files.map((f) => qualifyFile(f)).filter(Boolean))];
+const expiry = (entry) => Date.parse(entry.startedAt) + (entry.ttlHours ?? DEFAULT_TTL_HOURS) * 3600e3;
+export function partitionRegistry(entries, nowMs) {
+  const live = [], stale = [];
+  for (const entry of entries) (Number.isFinite(expiry(entry)) && expiry(entry) > nowMs ? live : stale).push(entry);
+  return { live, stale };
+}
+export function registerScope(entries, { agent, purpose, files, ttlHours = DEFAULT_TTL_HOURS }, nowIso) {
+  if (typeof agent !== 'string' || !agent.trim()) throw new TypeError('free-scope: give --agent=<name>');
+  const scope = qualified(files || []);
+  if (!scope.length) throw new TypeError('free-scope: give --files=a,b or --card=<id>');
+  if (!Number.isFinite(ttlHours) || ttlHours <= 0) throw new TypeError('free-scope: ttlHours must be positive');
+  return [...entries.filter((e) => e.agent !== agent), { agent, purpose, files: scope, startedAt: nowIso, ttlHours }];
+}
+export function releaseScope(entries, agent) {
+  const remaining = entries.filter((e) => e.agent !== agent);
+  return { entries: remaining, released: entries.length - remaining.length };
+}
+const holderName = (h) => h.type === 'pr' ? `PR #${h.number} (${h.repo})` : `agent ${h.agent}`;
+export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAgent = '', excludePr = 0, unreadable = [] }) {
+  const scope = qualified(files || []);
+  if (!scope.length) throw new TypeError('free-scope: give --files=a,b or --card=<id>');
+  const { live, stale } = partitionRegistry(agents.filter((e) => e.agent !== excludeAgent), nowMs);
+  const candidates = [];
+  for (const pr of prs) {
+    if (excludePr > 0 && pr.number === excludePr) continue;
+    for (const path of pr.files) candidates.push({ type: 'pr', repo: pr.repo, number: pr.number,
+      title: pr.title, url: pr.url, file: qualifyFile(path, repoKeyFor(pr.repo)) });
+  }
+  for (const entry of live) for (const file of qualified(entry.files || [])) candidates.push({ type: 'agent',
+    agent: entry.agent, purpose: entry.purpose, startedAt: entry.startedAt,
+    expiresAt: new Date(expiry(entry)).toISOString(), file });
+  const rows = scope.map((file) => {
+    const holders = candidates.filter((h) => scopeEntriesOverlap(file, h.file));
+    return { file, free: holders.length === 0, holders };
+  });
+  const freeFiles = rows.filter((r) => r.free).map((r) => r.file);
+  const occupiedFiles = rows.filter((r) => !r.free).map((r) => r.file);
+  const status = occupiedFiles.length ? 'occupied' : unreadable.length ? 'unknown' : 'free';
+  let headline = status === 'occupied'
+    ? `${freeFiles.length} of ${rows.length} files free — ${rows.filter((r) => !r.free).map((r) => `${r.file} held by ${r.holders.map(holderName).join(', ')}`).join('; ')}`
+    : status === 'unknown' ? `UNKNOWN — could not read open PRs for ${unreadable.map((r) => r.repo).join(', ')}`
+      : `all ${rows.length} files free`;
+  if (status === 'occupied' && unreadable.length) headline += ` — could not read open PRs for ${unreadable.map((r) => r.repo).join(', ')}`;
+  if (stale.length) headline += ` — ${stale.length} stale registry entr${stale.length === 1 ? 'y' : 'ies'} ignored`;
+  return { observedAt: new Date(nowMs).toISOString(), status, files: rows, freeFiles, occupiedFiles,
+    staleAgents: stale.map(({ agent, purpose, startedAt, ttlHours = DEFAULT_TTL_HOURS }) => ({ agent, purpose, startedAt, ttlHours })),
+    unreadable, headline };
+}
+/** Render an ISO timestamp in the operator's timezone (America/New_York), e.g. `2026-10-05 14:31 ET`. */
+export function etTime(iso) {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return String(iso);
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric',
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date(ms)).map((p) => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute} ET`;
+}
+export function formatFreeScope(verdict) {
+  const lines = [verdict.headline];
+  for (const row of verdict.files) lines.push(`${row.free ? 'FREE      ' : 'OCCUPIED  '}${row.file}${row.holders.map((h) =>
+    h.type === 'pr' ? `  ← PR #${h.number} "${h.title}" (${h.repo})`
+      : `  ← agent ${h.agent} (${h.purpose}, since ${etTime(h.startedAt)})`).join('')}`);
+  if (verdict.staleAgents.length) lines.push('stale (ignored):', ...verdict.staleAgents.map((e) => `  ${e.agent} (${e.purpose}, since ${etTime(e.startedAt)}, ttl ${e.ttlHours}h)`));
+  return lines.join('\n');
+}
+export function freeScopeOperation({ collect } = {}) {
+  if (typeof collect !== 'function') throw new TypeError('free-scope needs a collect reader');
+  return op(FREE_SCOPE_OP, {
+    input: { files: { type: 'string', required: false, default: '' }, card: { type: 'string', required: false, default: '' },
+      excludeAgent: { type: 'string', required: false, default: '' }, excludePr: { type: 'number', required: false, default: 0 } },
+    verdictFrom: 'assess',
+    read: compute({ reads: ['input.files', 'input.card'], fn: ({ input }) => collect({ files: input.files, card: input.card }) }),
+    assess: compute({ reads: ['findings.read', 'input.excludeAgent', 'input.excludePr'],
+      fn: ({ findings, input }) => assessFreeScope({ ...findings.read, excludeAgent: input.excludeAgent, excludePr: input.excludePr }) }),
+  });
+}
