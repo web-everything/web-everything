@@ -1133,6 +1133,7 @@ describe('tmp sweep tick integration', () => {
     const path = join(root, 'gh-t-AbC123'); oldEntry(path);
     const first = await tick(flags, { tmpSweepRun });
     expect(first.tmpSweep).toMatchObject({ deleted: 1, complete: true });
+    expect(first.claudeJobsArchive).toBeNull();
     expect(existsSync(path)).toBe(false);
     const stamp = JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).tmpSweep;
     expect(stamp).toMatchObject({ deleted: 1, complete: true, at: expect.any(Number), completedAt: expect.any(Number) });
@@ -1167,5 +1168,40 @@ describe('tmp sweep tick integration', () => {
     flags['tmp-sweep-root'] = join(root, 'file');
     writeFileSync(flags['tmp-sweep-root'], 'not a directory');
     expect((await tick(flags, { tmpSweepRun })).probeErrors.tmpSweep).toBeTruthy();
+  }, 30000);
+});
+
+describe('Claude jobs archive tick integration', () => {
+  it('persists cadence, retries incomplete runs, and requires explicit roots in fixture/dry ticks', async () => {
+    const jobs = join(dir, 'jobs'); mkdirSync(jobs);
+    const archive = join(dir, 'archive');
+    const stateRoot = join(dir, 'archive-state'); const hd = healthDir(stateRoot); mkdirSync(hd, { recursive: true });
+    const config = (extra = {}) => writeFileSync(join(hd, 'config.json'), JSON.stringify({ claudeJobsArchiveOlderThanMs: 0, ...extra }));
+    const job = (id) => { mkdirSync(join(jobs, id)); writeFileSync(join(jobs, id, 'state.json'), '{"state":"done"}'); utimesSync(join(jobs, id, 'state.json'), new Date(0), new Date(0)); };
+    const flags = { 'state-root': stateRoot, 'claude-jobs-root': jobs, 'claude-jobs-archive-root': archive,
+      'lock-root': join(dir, 'locks'), 'self-sync-dir': join(dir, 'sync'), 'logs-dir': join(dir, 'logs'),
+      'no-gh': true, 'no-diagnose': true, 'no-notify': true };
+    config(); job('a');
+    const first = await tick(flags);
+    expect(first.claudeJobsArchive).toMatchObject({ moved: 1, complete: true });
+    expect(first.tmpSweep).toBeNull();
+    expect(existsSync(join(jobs, 'a'))).toBe(false);
+    const stamp = JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).claudeJobsArchive;
+    expect(stamp.completedAt).toEqual(expect.any(Number));
+    job('b');
+    expect((await tick(flags)).claudeJobsArchive).toBeNull();
+    expect(JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).claudeJobsArchive).toEqual(stamp);
+    config({ claudeJobsArchiveEveryMs: 0, claudeJobsArchiveMaxMovesPerRun: 1 }); job('c');
+    expect((await tick(flags)).claudeJobsArchive).toMatchObject({ moved: 1, complete: false });
+    expect(JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).claudeJobsArchive.completedAt).toBeUndefined();
+    config();
+    expect((await tick(flags)).claudeJobsArchive).toMatchObject({ moved: 1, complete: true });
+    flags['state-root'] = join(dir, 'dry-archive-state'); job('d');
+    expect((await tick({ ...flags, 'dry-run': true })).claudeJobsArchive.moved).toBe(1);
+    expect(existsSync(join(jobs, 'd'))).toBe(true);
+    expect(existsSync(join(healthDir(flags['state-root']), 'state.json'))).toBe(false);
+    delete flags['claude-jobs-root'];
+    expect((await tick(flags)).claudeJobsArchive).toBeNull();
+    expect((await tick({ ...flags, 'dry-run': true })).claudeJobsArchive).toBeNull();
   }, 30000);
 });
