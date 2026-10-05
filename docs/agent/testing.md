@@ -748,4 +748,7 @@ Only generic fix exhaustion parks to `review:human`, independently of note-comme
 An operator can grant 1–5 extra rounds with
 `node scripts/operations/run.mjs extend-rounds --pr=123 --repo=web-everything/web-everything --by=2 --actor=chalbert --channel=console --reason="Try two more rounds" --preview`.
 Omit `--preview` to post the audited grant and verify its trusted count in the PR thread.
-The extension counts only a trusted comment author plus a registered operator actor; repo keys and slugs are equivalent.
+The grant must be posted under the operator's own GitHub credential: the operation refuses to post under any other
+login, and a grant counts only when the comment's GitHub author is an operator and names a registered operator actor
+(an automation-authored comment never counts, whatever its body says). Repo keys and slugs are equivalent.
+Grants on one PR together add at most 10 rounds; a further grant is refused and the count is clamped.

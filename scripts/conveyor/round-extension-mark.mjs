@@ -1,8 +1,15 @@
-/** Audited operator grants. Pure; the GitHub author and the recorded operator must both be trusted. */
-import { isTrustedMarkerAuthor, OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
+/**
+ * Audited operator grants. Pure. A grant is authenticated by GitHub's own record of who posted it: the comment's
+ * `author.login` must be an operator, exactly like `operatorFixBudget`. The automation account is NOT enough — any
+ * automation-credentialed process could otherwise post a body naming an operator and lift the cap itself.
+ */
+import { isOperatorAuthored, OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 
 export const ROUND_EXTENSION_MARKER = '➕ conveyor — review round extension granted';
+
+/** The most extra rounds all grants together may add to one PR; repeated grants clamp here, never grow past it. */
+export const MAX_TOTAL_ROUND_EXTENSIONS = 10;
 
 export function buildRoundExtensionComment({ repo, pr, by, actor, channel, reason, at }) {
   const record = { version: 1, repo, pr, by, actor, channel, reason, at };
@@ -19,8 +26,8 @@ export function buildRoundExtensionComment({ repo, pr, by, actor, channel, reaso
 /** Repo keys and their canonical slugs name the same grant; unknown repos match exactly. */
 export function countGrantedRoundExtensions(comments, { repo, pr }) {
   const slug = (value) => CONSTELLATION_REPOS[value]?.slug ?? value;
-  return (Array.isArray(comments) ? comments : []).reduce((sum, comment) => {
-    if (!isTrustedMarkerAuthor(comment) || typeof comment?.body !== 'string'
+  const total = (Array.isArray(comments) ? comments : []).reduce((sum, comment) => {
+    if (!isOperatorAuthored(comment) || typeof comment?.body !== 'string'
       || !comment.body.startsWith(ROUND_EXTENSION_MARKER + '\n')) return sum;
     const matches = [...comment.body.matchAll(/^<!-- round-extension: (.+) -->$/gm)];
     if (matches.length !== 1) return sum;
@@ -35,4 +42,5 @@ export function countGrantedRoundExtensions(comments, { repo, pr }) {
       return sum + r.by;
     } catch { return sum; }
   }, 0);
+  return Math.min(total, MAX_TOTAL_ROUND_EXTENSIONS);
 }

@@ -2,7 +2,9 @@
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
-import { buildRoundExtensionComment } from '../conveyor/round-extension-mark.mjs';
+import {
+  buildRoundExtensionComment, countGrantedRoundExtensions, MAX_TOTAL_ROUND_EXTENSIONS,
+} from '../conveyor/round-extension-mark.mjs';
 
 export const EXTEND_ROUNDS_OP = 'extend-rounds';
 export const ROUND_EXTENSION_POST_EFFECT = 'github.round-extension';
@@ -19,6 +21,10 @@ export function planRoundExtension(read, input) {
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo ?? '')) throw new Error('--repo must be <owner/repo>');
   if (!Number.isSafeInteger(pr) || pr <= 0) throw new Error('--pr must be a positive integer');
   if (read.state !== 'OPEN') throw new Error('the PR must be open to extend its rounds');
+  const granted = countGrantedRoundExtensions(read.comments, { repo, pr });
+  if (granted + by > MAX_TOTAL_ROUND_EXTENSIONS) {
+    throw new Error(`this PR already has ${granted} extra round(s); +${by} would pass the ${MAX_TOTAL_ROUND_EXTENSIONS}-round ceiling`);
+  }
   const record = { version: 1, repo, pr, by, actor: String(actor).toLowerCase(),
     channel: String(channel).trim(), reason: String(reason), at: read.now };
   return { record, body: buildRoundExtensionComment(record) };

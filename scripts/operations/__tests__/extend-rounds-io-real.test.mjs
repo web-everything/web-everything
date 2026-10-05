@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { createExtendRoundsReader } from '../extend-rounds-io.mjs';
-import { AUTOMATION_LOGINS, OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
+import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 
 it('reads, posts verbatim words through gh argv, and verifies the persisted thread', async () => {
   expect(typeof createExtendRoundsReader).toBe('function');
@@ -17,12 +17,13 @@ it('reads, posts verbatim words through gh argv, and verifies the persisted thre
     writeFileSync(fakeGh, `#!${process.execPath}
 const fs = require('node:fs');
 const args = process.argv.slice(2);
+if (args[0] === 'api' && args[1] === 'user') { process.stdout.write(${JSON.stringify(OPERATOR_LOGINS[0] + '\n')}); process.exit(0); }
 if (args[0] !== 'pr' || args[2] !== '12' || args[args.indexOf('--repo') + 1] !== 'web-everything/web-everything') process.exit(2);
 const path = ${JSON.stringify(thread)};
 const data = JSON.parse(fs.readFileSync(path, 'utf8'));
 if (args[1] === 'view') process.stdout.write(JSON.stringify(data));
 else if (args[1] === 'comment') {
-  data.comments.push({ body: args[args.indexOf('--body') + 1], author: { login: ${JSON.stringify(AUTOMATION_LOGINS[0])} } });
+  data.comments.push({ body: args[args.indexOf('--body') + 1], author: { login: ${JSON.stringify(OPERATOR_LOGINS[0])} } });
   fs.writeFileSync(path, JSON.stringify(data));
 } else process.exit(3);
 `);

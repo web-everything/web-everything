@@ -366,11 +366,40 @@ describe('last allowed fix review and round configuration', () => {
 });
 
 
+describe('only the generic fix exhaustion parks to review:human', () => {
+  const exhausted = {
+    fix: () => planReconcile({ prs: [prBounced()], durableCounts: { 3001: NEGOTIATION_ROUND_CAP } }),
+    review: () => planReconcile({ prs: [prZeroFindingsReview({ comments: [finding()] })], durableCounts: { 3002: NEGOTIATION_ROUND_CAP + 1 } }),
+    'advisory-fix': () => {
+      const comments = [];
+      for (let i = 0; i < ADVISORY_FIX_ROUND_CAP; i += 1) {
+        comments.push({ body: `${ADVISORY_NOTE_MARKER}\n\nround ${i}`, author: AUTOMATION });
+        comments.push({ body: buildAdvisoryFixComment({}), author: AUTOMATION });
+      }
+      comments.push({ body: `${ADVISORY_NOTE_MARKER}\n\none more, still broken`, author: AUTOMATION });
+      return planReconcile({ prs: [prAdvisoryFix({ comments })] });
+    },
+    'conflict-fix': () => planReconcile({ prs: [prConflictFix({
+      comments: [finding(), ...Array.from({ length: CONFLICT_FIX_ROUND_CAP }, () => ({ body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION }))],
+    })] }),
+    'stacked-rebase': () => planReconcile({ prs: [prStackedRebase({
+      comments: Array.from({ length: CONFLICT_FIX_ROUND_CAP }, () => ({ body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION })),
+    })] }),
+  };
+  it.each(Object.keys(exhausted))('capKind %s carries parkToHuman only when it is "fix"', (capKind) => {
+    const notes = exhausted[capKind]().notes.filter((n) => n.kind === 'round-cap-exhausted');
+    expect(notes).toEqual([expect.objectContaining({ capKind })]);
+    if (capKind === 'fix') expect(notes[0].parkToHuman).toBe(true);
+    else expect(notes[0]).not.toHaveProperty('parkToHuman');
+  });
+});
+
 describe('audited extension lifts the generic fixer cap', () => {
   it.each([
-    ['web-everything', OPERATOR_LOGINS[0], true],
+    [OPERATOR_LOGINS[0], OPERATOR_LOGINS[0], true],
+    ['web-everything', OPERATOR_LOGINS[0], false], // automation credential claiming an operator actor
     ['outsider', OPERATOR_LOGINS[0], false],
-    ['web-everything', 'outsider', false],
+    [OPERATOR_LOGINS[0], 'outsider', false],
   ])('author %s, actor %s', (author, actor, allowed) => {
     const body = buildRoundExtensionComment({ repo: 'web-everything/web-everything', pr: 3001, by: 2,
       actor, channel: 'console', reason: 'Try two more rounds', at: '2026-10-05T12:00:00Z' });
