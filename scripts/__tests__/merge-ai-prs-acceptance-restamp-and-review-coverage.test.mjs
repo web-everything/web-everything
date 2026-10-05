@@ -9,7 +9,8 @@
  *   `scripts/lib/review-escalation.mjs`).
  */
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -538,29 +539,36 @@ describe('PR #3432 — drain acceptance verification and pending reconciliation'
     const payload = JSON.stringify(view);
     expect(Buffer.byteLength(payload)).toBeGreaterThan(1024 * 1024);
     expect(view.comments).toHaveLength(164);
-    const exec = (cmd, args, opts) => {
-      expect(cmd).toBe('gh');
-      expect(opts.maxBuffer).toBe(64 * 1024 * 1024);
-      expect(args).toEqual(['pr', 'view', '3432', '--repo', 'web-everything/web-everything', '--json', 'headRefOid,headRefName,comments']);
-      // Real pipe buffering, with precisely the options the production reader supplies.
-      return execFileSync(process.execPath, ['-e', 'process.stdout.write(require("node:fs").readFileSync(0))'], {
-        ...opts, stdio: ['pipe', 'pipe', 'pipe'], input: payload,
-      });
-    };
-    const options = { ...acceptanceOptions(view), exec };
-    const evidence = readDrainAcceptance(options);
-    expect(evidence.acceptedSha).toBe(REVIEWED);
-    expect(evidence.headSha).toBe(REBASED);
-    expect(normalizeDiffFingerprint(evidence.headDiff)).toBe(evidence.acceptedDiff);
-    expect(normalizeContributionFingerprint(evidence.headContribution)).toBe(evidence.acceptedContribution);
-    const gate = decideDrainReviewGate({ labels, escalate: true }, options);
-    expect(gate.action).toBe('merge');
-    expect(gate.applyLabel).toBeUndefined();
-    const spawn = vi.fn(() => ({ ok: true }));
-    expect(reconcileDrainReviewPending({ currentLabels: labels, ...options }, { spawn }).ok).toBe(true);
-    expect(spawn).toHaveBeenCalledOnce();
-    expect(spawn.mock.calls[0][0].to).toBe('accepted');
-    expect(decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true }, options).action).toBe('merge');
+    const dir = mkdtempSync(join(tmpdir(), 'we-drain-acceptance-'));
+    try {
+      const payloadFile = join(dir, 'response.json');
+      writeFileSync(payloadFile, payload);
+      const exec = (cmd, args, opts) => {
+        expect(cmd).toBe('gh');
+        expect(opts.maxBuffer).toBe(64 * 1024 * 1024);
+        expect(args).toEqual(['pr', 'view', '3432', '--repo', 'web-everything/web-everything', '--json', 'headRefOid,headRefName,comments']);
+        // Keep real stdout pipe buffering and the production maxBuffer, without waiting for stdin EOF.
+        return execFileSync(process.execPath, ['-e', 'process.stdout.write(require("node:fs").readFileSync(process.argv[1]))', payloadFile], {
+          ...opts, stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
+        });
+      };
+      const options = { ...acceptanceOptions(view), exec };
+      const evidence = readDrainAcceptance(options);
+      expect(evidence.acceptedSha).toBe(REVIEWED);
+      expect(evidence.headSha).toBe(REBASED);
+      expect(normalizeDiffFingerprint(evidence.headDiff)).toBe(evidence.acceptedDiff);
+      expect(normalizeContributionFingerprint(evidence.headContribution)).toBe(evidence.acceptedContribution);
+      const gate = decideDrainReviewGate({ labels, escalate: true }, options);
+      expect(gate.action).toBe('merge');
+      expect(gate.applyLabel).toBeUndefined();
+      const spawn = vi.fn(() => ({ ok: true }));
+      expect(reconcileDrainReviewPending({ currentLabels: labels, ...options }, { spawn }).ok).toBe(true);
+      expect(spawn).toHaveBeenCalledOnce();
+      expect(spawn.mock.calls[0][0].to).toBe('accepted');
+      expect(decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true }, options).action).toBe('merge');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it.each(['ENOBUFS', 'network unavailable', 'invalid JSON', 'missing head', 'missing comments'])('defers an unreadable view without a label write: %s', (failure) => {
