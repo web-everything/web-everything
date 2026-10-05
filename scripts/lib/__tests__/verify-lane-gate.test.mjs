@@ -15,7 +15,7 @@ import { execSync } from 'node:child_process';
 import { LANE_RELEASE_LITTER_ALLOWLIST } from '../lane-litter.mjs';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { explicitGateRefusal, resolveDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
+import { buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -708,4 +708,37 @@ it('exposes the gate halves without splitting shell-quoted changed paths', () =>
   expect(gate.testCommand).toContain("'scripts/a && b.mjs'");
   expect(gate.standardsCommand).toMatch(/^npm run check:standards/);
   expect(gate.command).toBe(`${gate.testCommand} && ${gate.standardsCommand}`);
+});
+
+
+describe('verify phase telemetry (#5141)', () => {
+  it('rounds timings and derives counts from decision arrays', () => {
+    expect(buildVerifyPhases({ admissionWaitMs: 12.4, vitestMs: 3400.6, scanMs: 800.2,
+      standardsMs: 5200.5, gateMs: 9400.4, decision: { targets: ['a', 'b'], changedFiles: ['a'] } })).toEqual({
+      admissionWaitMs: 12, vitestMs: 3401, scanMs: 800, standardsMs: 5201, gateMs: 9400,
+      targetFileCount: 2, changedFileCount: 1,
+    });
+  });
+  it('uses null for missing or non-finite timings and absent decisions', () => {
+    expect(buildVerifyPhases({ admissionWaitMs: Infinity, vitestMs: NaN, scanMs: -Infinity,
+      standardsMs: undefined })).toEqual({ admissionWaitMs: null, vitestMs: null, scanMs: null,
+      standardsMs: null, gateMs: null, targetFileCount: null, changedFileCount: null });
+    expect(buildVerifyPhases({})).toEqual(buildVerifyPhases({ admissionWaitMs: NaN }));
+  });
+  it('guards counts with Array.isArray and preserves empty counts and zero timings', () => {
+    expect(buildVerifyPhases({ admissionWaitMs: 0, gateMs: 0,
+      decision: { targets: { length: 4 }, changedFiles: 'abc' } })).toMatchObject({
+      admissionWaitMs: 0, gateMs: 0, targetFileCount: null, changedFileCount: null,
+    });
+    expect(buildVerifyPhases({ decision: { targets: [], changedFiles: [] } })).toMatchObject({
+      targetFileCount: 0, changedFileCount: 0,
+    });
+  });
+  it('formats a single line and omits null values', () => {
+    expect(formatVerifyPhases(buildVerifyPhases({ admissionWaitMs: 12, vitestMs: 3400, scanMs: 800,
+      standardsMs: 5200, gateMs: 9400, decision: { targets: Array(7), changedFiles: Array(3) } })))
+      .toBe('phaseMs admission=12 vitest=3400 scan=800 standards=5200 gate=9400 targets=7 changed=3');
+    expect(formatVerifyPhases(buildVerifyPhases({ admissionWaitMs: 0, gateMs: 4 })))
+      .toBe('phaseMs admission=0 gate=4');
+  });
 });

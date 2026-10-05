@@ -1158,3 +1158,55 @@ describe('verify-lane request refuses fast when no verify daemon is alive (#4161
     expect(JSON.parse(readFileSync(marker(), 'utf8')).status).toBe('running');
   });
 });
+
+
+describe('verify phase telemetry (#5141)', () => {
+  let previousPoolRoot;
+  beforeEach(() => {
+    previousPoolRoot = process.env.LANE_POOL_ROOT;
+    process.env.LANE_POOL_ROOT = join(dir, '.git', 'pool');
+  });
+  afterEach(() => {
+    if (previousPoolRoot === undefined) delete process.env.LANE_POOL_ROOT;
+    else process.env.LANE_POOL_ROOT = previousPoolRoot;
+  });
+  const explicitPhases = { admissionWaitMs: expect.any(Number), gateMs: expect.any(Number),
+    vitestMs: null, scanMs: null, standardsMs: null, targetFileCount: null, changedFileCount: null };
+  function invoke(args) {
+    const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, encoding: 'utf8' });
+    return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stderr: result.stderr };
+  }
+  it.each([['true', 0], ['false', 2], ['exit 137', 3]])('records and emits phases for %s', (gate, code) => {
+    const result = runVerify(gate);
+    expect(result.code).toBe(code);
+    const record = JSON.parse(readFileSync(marker(), 'utf8'));
+    expect(record.phases).toEqual(explicitPhases);
+    expect(result.json.phases).toEqual(record.phases);
+    for (const args of [['check'], ['check', '--wait=100']]) {
+      expect(invoke(args).json.phases).toEqual(record.phases);
+    }
+  });
+  it('preserves phases on cached verify and request results', () => {
+    execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
+    const first = runVerify('true');
+    expect(first.json.phases).toEqual(explicitPhases);
+    for (const args of [['--gate=true'], ['request', '--gate=true']]) {
+      expect(invoke(args).json).toMatchObject({ reason: 'cached', phases: first.json.phases });
+    }
+  });
+  it.each([['true', 0], ['false', 2], ['exit 137', 3]])('emits run phases and one timing line for %s without a marker', (gate, code) => {
+    const result = invoke(['run', `--gate=${gate}`]);
+    expect(result.code).toBe(code);
+    expect(result.json.phases).toEqual(explicitPhases);
+    expect(result.stderr.match(/⏱ phaseMs /g)).toHaveLength(1);
+    expect(result.stderr).toContain('⏱ gate execution starting');
+    expect(existsSync(marker())).toBe(false);
+  });
+  it.each([null, { corrupt: true, phases: {} }, { phases: null }, { phases: [] }, { phases: 4 }])(
+    'omits phases from check for absent, corrupt, or invalid telemetry: %j', (record) => {
+      if (record) writeFileSync(marker(), JSON.stringify(record));
+      for (const args of [['check'], ['check', '--wait=100']]) {
+        expect(invoke(args).json).not.toHaveProperty('phases');
+      }
+    });
+});

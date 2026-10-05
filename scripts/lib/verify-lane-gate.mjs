@@ -484,3 +484,26 @@ export function describeGate({ command, decision, scanCommands = [] }) {
   out.push(`  command: ${command}`);
   return out.join('\n');
 }
+
+
+/** Build normalized, non-gating phase telemetry for verify markers and CLI results (#5141). */
+export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standardsMs, gateMs, decision }) {
+  const ms = value => Number.isFinite(value) ? Math.round(value) : null;
+  return {
+    admissionWaitMs: ms(admissionWaitMs),
+    vitestMs: ms(vitestMs),
+    scanMs: ms(scanMs),
+    standardsMs: ms(standardsMs),
+    gateMs: ms(gateMs),
+    targetFileCount: Array.isArray(decision?.targets) ? decision.targets.length : null,
+    changedFileCount: Array.isArray(decision?.changedFiles) ? decision.changedFiles.length : null,
+  };
+}
+
+/** Format the available phase telemetry as one short stderr line (#5141). */
+export function formatVerifyPhases(phases) {
+  const fields = { admission: phases.admissionWaitMs, vitest: phases.vitestMs, scan: phases.scanMs,
+    standards: phases.standardsMs, gate: phases.gateMs, targets: phases.targetFileCount, changed: phases.changedFileCount };
+  return ['phaseMs', ...Object.entries(fields).filter(([, value]) => value != null)
+    .map(([name, value]) => `${name}=${value}`)].join(' ');
+}
