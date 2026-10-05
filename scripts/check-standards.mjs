@@ -1757,10 +1757,14 @@ mark("6f-ii-b. REFERENCE-RESOLUTION gates (5b/5c/5d — 2026-09-06 staleness aud
 // 6f-ii-b): a brand-new gate the port doesn't know about must never silently not-run just because the port
 // happens to be built.
 //
-// Resolving paths are errors: they hold numbering and would strand the card on main.
-// Non-resolving historical/fixture paths retain the gate family's warning policy.
+// Resolving paths in the checkout's net diff are errors: they hold numbering and would strand the card.
+// Unowned or non-resolving paths retain the gate family's warning policy.
 try {
   const emit3 = CITATION_GATES_ENFORCED ? err : warn;
+  const citationChanges = localChangedSet({ runGit: (args) => execFileSync('git', args, {
+    cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+  }) });
+  const changedFiles = citationChanges ? new Set(citationChanges.changedFiles) : null;
   let hits = [];
   try {
     hits = execFileSync(
@@ -1773,7 +1777,7 @@ try {
     const key = `${rel}\u0000${cited}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    if (classifyHashPathCite({ cited, exists: (path) => existsSync(join(ROOT, path)) }) === 'resolving') {
+    if (classifyHashPathCite({ cited, exists: (path) => existsSync(join(ROOT, path)), citingFile: rel, changedFiles }) === 'resolving') {
       err(`${rel}: cites a card by its hash-named FILE PATH (\`${cited}\`) — the drain will hold this card from numbering ` +
         `(it would strand on main), cite it as \`#${hash}\` instead.`,
         { kind: 'citation-hash-path-outside-backlog', file: rel });

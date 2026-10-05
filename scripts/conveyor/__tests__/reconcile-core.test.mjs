@@ -3350,7 +3350,9 @@ describe('xng7q1p mechanical timeout precedence', () => {
   it('ineligible evidence retains normal healing with a visible reason', () => {
     const result = planReconcile({ prs: [pr({ timeoutRetry: { eligible: false, reason: 'changed-dependency:leaf.mjs' } })], now: NOW });
     expect(result.dispatch[0].kind).toBe('ci-heal');
-    expect(result.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-ineligible' }));
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-ineligible',
+      why: 'PR #3415: changed-dependency:leaf.mjs' }));
+    expect(result.notes).not.toContainEqual(expect.objectContaining({ kind: 'timeout-retry-ineligible' }));
   });
 });
 
