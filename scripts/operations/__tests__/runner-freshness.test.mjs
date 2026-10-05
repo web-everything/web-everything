@@ -71,6 +71,7 @@ describe('runner freshness policy', () => {
         "explore",
         "extend-rounds",
         "file-item",
+        "free-scope",
         "gap-sweep-status",
         "gate-health",
         "graduation-progress-report",
