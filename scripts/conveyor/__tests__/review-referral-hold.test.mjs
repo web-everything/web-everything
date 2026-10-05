@@ -10,6 +10,7 @@ import { countFindings } from '../reconcile-core.mjs';
 import {
   reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
+  GH_LIST_COMMENT_CAP,
 } from '../review-referral-hold.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -159,6 +160,59 @@ describe('persistence failure retry budget', () => {
     expect(hold(answered, runs, time + 1)).toBeNull();
     runs.push(evidence({ id: 'review-pr-reset', failure: true, time: time + 120_000 }));
     expect(hold(answered, runs, time + 120_001)).toMatchObject({ retryAt: time + 120_000 + REFERRAL_RETRY_MS[0] });
+  });
+});
+
+describe('full comment thread enrichment', () => {
+  const comments = () => Array.from({ length: 100 }, () => comment('Bookkeeping', at - 120_000));
+
+  it.each([true, false])('releases a capped thread after an operator reply (parked: %s)', parked => {
+    const p = pr({ comments: comments() });
+    const readRuns = () => [{ ...evidence(), parked }];
+    expect(enrichPrsWithReferralHolds([p], { repo, readRuns,
+      readComments: () => p.comments })[0].referralHold).not.toBeNull();
+    const full = [...p.comments, comment('Please reconsider.', at + 1, 'chalbert')];
+    const readComments = vi.fn(() => full);
+    const [enriched] = enrichPrsWithReferralHolds([p], { repo, readRuns, readComments });
+    expect(enriched.referralHold).toBeNull();
+    expect(enriched.comments).toBe(full);
+    expect(readComments).toHaveBeenCalledOnce();
+    expect(readComments).toHaveBeenCalledWith({ repo, number: p.number });
+    expect(GH_LIST_COMMENT_CAP).toBe(100);
+  });
+
+  it('does not fetch threads below the list cap', () => {
+    const readComments = vi.fn();
+    enrichPrsWithReferralHolds([pr({ comments: comments().slice(1) })], {
+      repo, readRuns: () => [evidence()], readComments,
+    });
+    expect(readComments).not.toHaveBeenCalled();
+  });
+
+  it.each(['no runs', 'different head', 'different repo', 'different PR'])
+    ('does not fetch a capped thread with %s', mismatch => {
+      const rows = {
+        'no runs': [],
+        'different head': [{ ...evidence(), head: 'b'.repeat(40) }],
+        'different repo': [{ ...evidence(), repo: 'other/repo' }],
+        'different PR': [{ ...evidence(), pr: 99 }],
+      };
+      const readComments = vi.fn();
+      enrichPrsWithReferralHolds([pr({ comments: comments() })], {
+        repo, readRuns: () => rows[mismatch], readComments,
+      });
+      expect(readComments).not.toHaveBeenCalled();
+    });
+
+  it('keeps the truncated thread and hold when the full read throws', () => {
+    const p = pr({ comments: comments() });
+    const readComments = vi.fn(() => { throw new Error('read failed'); });
+    const [enriched] = enrichPrsWithReferralHolds([p], {
+      repo, readRuns: () => [evidence()], readComments,
+    });
+    expect(readComments).toHaveBeenCalledOnce();
+    expect(enriched.comments).toBe(p.comments);
+    expect(enriched.referralHold).not.toBeNull();
   });
 });
 

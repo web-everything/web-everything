@@ -15,6 +15,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
+export const GH_LIST_COMMENT_CAP = 100;
 export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing']));
 export const REFERRAL_RETRY_MS = [15, 30, 60].map(n => n * 60_000);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
@@ -145,10 +146,27 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env } = {}) {
     why, retryAt: null, persistenceFailed: false, exhausted: false };
 }
 
-export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRuns = readReviewRunEvidence } = {}) {
+function defaultReadComments({ repo, number }) {
+  return JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(number), ...(repo ? ['--repo', repo] : []), '--json', 'comments'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })).comments;
+}
+
+export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRuns = readReviewRunEvidence,
+  readComments = defaultReadComments } = {}) {
   const runs = readRuns();
-  return prs.map(pr => ({ ...pr, referralHold: decideReferralHold(pr, runs, { repo, now })
-    ?? decideSameHeadHold(pr, runs, { repo }) }));
+  return prs.map(pr => {
+    // List reads cap comments at 100; later operator events must reach both hold decisions.
+    if (Array.isArray(pr.comments) && pr.comments.length >= GH_LIST_COMMENT_CAP
+      && runs.some(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)) {
+      try {
+        const full = readComments({ repo, number: pr.number });
+        if (Array.isArray(full)) pr = { ...pr, comments: full };
+      }
+      catch { /* Keep the list snapshot when the full thread is unavailable. */ }
+    }
+    return { ...pr, referralHold: decideReferralHold(pr, runs, { repo, now })
+      ?? decideSameHeadHold(pr, runs, { repo }) };
+  });
 }
 
 /** Reserve before sending: an ambiguous transport failure must not create duplicate comments on every tick.
