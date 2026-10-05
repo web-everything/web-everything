@@ -1,9 +1,10 @@
 ---
 bornAs: xx6rdcl
 kind: task
-status: open
+status: resolved
 scope: ["we:skills-src/conveyor/"]
 dateOpened: "2026-10-05"
+dateResolved: "2026-10-05"
 tags: []
 ---
 
