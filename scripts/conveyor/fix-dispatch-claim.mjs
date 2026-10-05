@@ -267,9 +267,12 @@ export function refreshLiveFixDispatchClaims({
       // A terminal row must belong to THIS dispatch, not an older round with the
       // same reusable name. Missing/failed listings and the spawn-listing lag
       // never release a claim. A live sibling above always wins over old rows.
+      // #3964 (2026-10-05): a fixer's own session starts before its fixing claim;
+      // an exact sessionId match settles that claim regardless of start time.
       const settled = agentsAll.some((a) =>
         ['done', 'stopped', 'failed'].includes(a.state)
-        && Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs);
+        && ((entry.meta.sessionId && a.sessionId === entry.meta.sessionId)
+          || (Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs)));
       if (settled) {
         const current = readLockEntry(lockRoot, fixDispatchResource({ repo, pr, kind }));
         if (current?.owner === entry.owner && current.meta?.claimedAt === claimedAt) {

@@ -26,6 +26,7 @@ import {
   isClaimSessionLive, listFixDispatchClaims, refreshLiveFixDispatchClaims, MAX_FIX_DISPATCH_CLAIM_REFRESH_MS,
 } from '../fix-dispatch-claim.mjs';
 import { heartbeat } from '../../readiness/file-locks.mjs';
+import { acquireFixClaim } from '../fix-procedure.mjs';
 import { dispatchFix, tryResumeFix, filterFixesByInFlightScope } from '../reconcile-fix-dispatch.mjs';
 import { dispatchCiHeal } from '../../operations/ci-heal-pr-dispatch.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
@@ -535,6 +536,28 @@ describe('overlap claim settlement', () => {
       return [{ name: 'fix-3103', state: 'done', startedAt: T0 + 1 }];
     } });
     expect(readFixDispatchClaim({ repo: 'we', pr: 3103, lockRoot: claimRoot }).meta.claimedAt).toBe(iso(T0 + 500));
+  });
+});
+
+describe('fixing claim session settlement', () => {
+  it.each([
+    { sessionId: 'S1', state: 'stopped', released: true, refreshed: false },
+    { sessionId: 'OLD', state: 'stopped', released: false, refreshed: false },
+    { sessionId: 'S1', state: 'working', released: false, refreshed: true },
+  ])('$sessionId $state: released=$released, refreshed=$refreshed', ({ sessionId, state, released, refreshed }) => {
+    const key = { repo: 'we', pr: 3964, kind: 'fixing', lockRoot: claimRoot };
+    expect(acquireFixClaim({ ...key, who: 'fix-3964', sessionId: 'S1', nowMs: T0 }).ok).toBe(true);
+    const entry = readFixDispatchClaim(key);
+    expect(entry.meta.claimedAt).toBe(iso(T0));
+    const result = refreshLiveFixDispatchClaims({
+      lockRoot: claimRoot, nowMs: T0 + 1000, nowIso: () => iso(T0 + 1000), hungInfoFor: () => null,
+      listAgentsAll: () => [{ name: entry.meta.who, sessionId, state, startedAt: T0 - 10_000 }],
+    });
+    const expected = { repo: 'we', pr: 3964, kind: 'fixing', owner: entry.owner };
+    expect(result.released ?? []).toEqual(released ? [expected] : []);
+    expect(result.refreshed).toEqual(refreshed ? [{ ...expected, headSha: null }] : []);
+    if (released) expect(readFixDispatchClaim(key)).toBeNull();
+    else expect(readFixDispatchClaim(key)).not.toBeNull();
   });
 });
 
