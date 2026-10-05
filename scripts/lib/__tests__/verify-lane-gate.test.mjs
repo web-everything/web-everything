@@ -15,7 +15,7 @@ import { execSync } from 'node:child_process';
 import { LANE_RELEASE_LITTER_ALLOWLIST } from '../lane-litter.mjs';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { explicitGateRefusal, resolveDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
+import { buildPhaseOutcome, firstStandardsErrorId, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -708,4 +708,84 @@ it('exposes the gate halves without splitting shell-quoted changed paths', () =>
   expect(gate.testCommand).toContain("'scripts/a && b.mjs'");
   expect(gate.standardsCommand).toMatch(/^npm run check:standards/);
   expect(gate.command).toBe(`${gate.testCommand} && ${gate.standardsCommand}`);
+});
+
+
+describe('verify phase telemetry (#5141)', () => {
+  const skipped = { vitest: { result: 'skipped' }, scan: { result: 'skipped' }, standards: { result: 'skipped' } };
+  it('derives outcomes, file reasons, exit and signal fallbacks', () => {
+    expect(buildPhaseOutcome({ kind: 'vitest' })).toEqual({ result: 'skipped' });
+    expect(buildPhaseOutcome({ kind: 'vitest', exitCode: 0, failureDetails: { tests: [{ file: 'old-failure' }] } }))
+      .toEqual({ result: 'pass' });
+    expect(buildPhaseOutcome({ kind: 'scan', exitCode: 1, failureDetails: { tests: [{ file: 'scan.test.mjs' }] } }))
+      .toEqual({ result: 'fail', reason: 'scan.test.mjs' });
+    expect(buildPhaseOutcome({ kind: 'vitest', exitCode: 3 }))
+      .toEqual({ result: 'fail', reason: 'exit 3', source: 'import-graph' });
+    expect(buildPhaseOutcome({ kind: 'scan', exitCode: 0, signal: 'SIGTERM' }))
+      .toEqual({ result: 'fail', reason: 'signal SIGTERM' });
+    expect(buildPhaseOutcome({ kind: 'scan', exitCode: 1, failureDetails: { tests: [{ file: 'x'.repeat(250) }] } }).reason).toHaveLength(200);
+  });
+  it('attributes only literal-only failing files to literal discovery', () => {
+    const decision = { relatedFiles: ['both.test.mjs'], referencedTests: ['literal.test.mjs', 'both.test.mjs'] };
+    for (const [file, source] of [['literal.test.mjs', 'literal-reference'], ['both.test.mjs', 'import-graph'], ['other.test.mjs', 'import-graph']]) {
+      expect(buildPhaseOutcome({ kind: 'vitest', exitCode: 1, decision, failureDetails: { tests: [{ file }, { file: 'ignored' }] } }))
+        .toEqual({ result: 'fail', reason: file, source });
+    }
+  });
+  it('extracts the first standards error, stripping ANSI and retaining a rule id when present', () => {
+    expect(firstStandardsErrorId(' warning ignore\n\x1b[31m error\x1b[0m rule-42: broken\n error second: later')).toBe('rule-42');
+    expect(firstStandardsErrorId(' error A message without a rule')).toBe('A message without a rule');
+    expect(firstStandardsErrorId(' error ' + 'x'.repeat(250))).toHaveLength(200);
+    expect(firstStandardsErrorId('0 error(s), 1 warning(s)')).toBeNull();
+    for (const output of [null, { stdout: 'no errors', stderr: '' }]) {
+      expect(buildPhaseOutcome({ kind: 'standards', exitCode: 2, output })).toEqual({ result: 'fail', reason: 'exit 2' });
+    }
+    expect(buildPhaseOutcome({ kind: 'standards', exitCode: 1, output: { stdout: '', stderr: ' error check-rule: broken' } }))
+      .toEqual({ result: 'fail', reason: 'check-rule' });
+    // Output over the capture cap is null: fall back to the collector's bounded tail.
+    expect(buildPhaseOutcome({ kind: 'standards', exitCode: 1, output: null, failureDetails: { tests: [], summary: 'warn x\n error tail-rule: broken\n1 error(s)' } }))
+      .toEqual({ result: 'fail', reason: 'tail-rule' });
+  });
+  it('counts discovery targets without counting graph overlap as literal', () => {
+    expect(buildVerifyPhases({ decision: { relatedFiles: ['a', 'b'], referencedTests: ['b', 'c'] } }))
+      .toMatchObject({ importGraphTargetCount: 2, literalReferenceTargetCount: 1 });
+    expect(buildVerifyPhases({ decision: { relatedFiles: [], referencedTests: [] } }))
+      .toMatchObject({ importGraphTargetCount: 0, literalReferenceTargetCount: 0 });
+  });
+  it('appends outcomes and discovery counts on one line', () => {
+    const outcomes = { vitest: { result: 'fail', reason: 'scripts/__tests__/x.test.mjs', source: 'literal-reference' }, scan: { result: 'pass' }, standards: { result: 'skipped' } };
+    const phases = buildVerifyPhases({ outcomes, decision: { relatedFiles: ['a'], referencedTests: ['b'] } });
+    expect(phases.outcomes).toEqual(outcomes);
+    expect(formatVerifyPhases(phases)).toBe('phaseMs vitest=fail(scripts/__tests__/x.test.mjs) scan=pass standards=skipped graph=1 literal=1');
+  });
+  it('rounds timings and derives counts from decision arrays', () => {
+    expect(buildVerifyPhases({ admissionWaitMs: 12.4, vitestMs: 3400.6, scanMs: 800.2,
+      standardsMs: 5200.5, gateMs: 9400.4, decision: { targets: ['a', 'b'], changedFiles: ['a'] } })).toEqual({
+      admissionWaitMs: 12, vitestMs: 3401, scanMs: 800, standardsMs: 5201, gateMs: 9400,
+      targetFileCount: 2, changedFileCount: 1, importGraphTargetCount: null, literalReferenceTargetCount: null, outcomes: skipped,
+    });
+  });
+  it('uses null for missing or non-finite timings and absent decisions', () => {
+    expect(buildVerifyPhases({ admissionWaitMs: Infinity, vitestMs: NaN, scanMs: -Infinity,
+      standardsMs: undefined })).toEqual({ admissionWaitMs: null, vitestMs: null, scanMs: null,
+      standardsMs: null, gateMs: null, targetFileCount: null, changedFileCount: null,
+      importGraphTargetCount: null, literalReferenceTargetCount: null, outcomes: skipped });
+    expect(buildVerifyPhases({})).toEqual(buildVerifyPhases({ admissionWaitMs: NaN }));
+  });
+  it('guards counts with Array.isArray and preserves empty counts and zero timings', () => {
+    expect(buildVerifyPhases({ admissionWaitMs: 0, gateMs: 0,
+      decision: { targets: { length: 4 }, changedFiles: 'abc' } })).toMatchObject({
+      admissionWaitMs: 0, gateMs: 0, targetFileCount: null, changedFileCount: null,
+    });
+    expect(buildVerifyPhases({ decision: { targets: [], changedFiles: [] } })).toMatchObject({
+      targetFileCount: 0, changedFileCount: 0,
+    });
+  });
+  it('formats a single line and omits null values', () => {
+    expect(formatVerifyPhases(buildVerifyPhases({ admissionWaitMs: 12, vitestMs: 3400, scanMs: 800,
+      standardsMs: 5200, gateMs: 9400, decision: { targets: Array(7), changedFiles: Array(3) } })))
+      .toBe('phaseMs admission=12 vitest=3400 scan=800 standards=5200 gate=9400 targets=7 changed=3 vitest=skipped scan=skipped standards=skipped');
+    expect(formatVerifyPhases(buildVerifyPhases({ admissionWaitMs: 0, gateMs: 4 })))
+      .toBe('phaseMs admission=0 gate=4 vitest=skipped scan=skipped standards=skipped');
+  });
 });
