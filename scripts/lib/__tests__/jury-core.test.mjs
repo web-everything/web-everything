@@ -1,4 +1,4 @@
-import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, liveReferrals } from '../jury-core.mjs';
+import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, findCarriedOperatorRuling, liveReferrals, carriedBackingHolds } from '../jury-core.mjs';
 import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER, REFERRAL_STAMP_POLICY_ENV, resolveReferralStampPolicy } from '../jury-core.mjs';
 /**
  * @file jury-core.test.mjs — proof of the #2654 (S2 of epic #2649) append-only JURY-LEDGER EVENT VOCABULARY:
@@ -1582,6 +1582,166 @@ describe('#4315 mandatory referral protocol', () => {
   const rule = (r, result = 'not-real') => ({ id: 'r1', key: r.referrals[0].key, reviewerId: r.reviewer.id,
     lens: 'correctness', result, rationale: 'Verified against the pinned diff', evidence: ['diff:lease-reaper'],
     ...(result === 'card' ? { card: 'we:backlog/4315-example.md' } : {}) });
+
+  it('validates and requires operator backing for carried rulings', () => {
+    const r = record(), key = r.referrals[0].key;
+    const from = { head: 'b'.repeat(40), runId: 'old', key };
+    const reason = 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged';
+    for (const result of ['block', 'not-real']) {
+      r.carried = [{ key, from, reason, result }];
+      expect(validateReferralRecord(r)).toBe(true);
+      expect(validateReferralRecord({ ...r, carried: [{ ...r.carried[0], reason: 'wrong' }] })).toBe(false);
+      expect(referralRecordState(r).pending).toEqual([key]);
+      const state = referralRecordState(r, { operatorRulings: [{ ...from, repo: r.repo, pr: r.pr, result }] });
+      expect(state.pending).toEqual([]);
+      expect(state.blocked).toEqual(result === 'block' ? [key] : []);
+      expect(liveReferrals(r)).toEqual([]);
+    }
+  });
+
+  describe('findCarriedOperatorRuling matches strictly (clearing a mandatory referral)', () => {
+    const file = 'scripts/api/handler.mjs';
+    const ruled = (summary, line = 40) => {
+      const r = record(), f = { ...finding, file, line, summary };
+      r.head = 'b'.repeat(40);
+      r.referrals = [{ key: referralFindingKey('judgeCorrectnessAdvisory', f), seat: 'judgeCorrectnessAdvisory', original: f, finding: normalizeFinding(f) }];
+      return { r, ops: [{ repo: r.repo, pr: r.pr, head: r.head, runId: r.runId, key: r.referrals[0].key, result: 'not-real' }] };
+    };
+    const target = (summary, line) => ({ finding: normalizeFinding({ ...finding, file, line, summary }) });
+    const carry = (summary, line, ruledSummary = 'Missing validation of the request payload') => {
+      const { r, ops } = ruled(ruledSummary);
+      return findCarriedOperatorRuling(target(summary, line), { records: [r], operatorRulings: ops, head: 'a'.repeat(40), repo: r.repo, pr: r.pr });
+    };
+    it('carries the identical and a lightly reworded finding', () => {
+      expect(carry('Missing validation of the request payload', 46)?.result).toBe('not-real');
+      expect(carry('Request payload validation is missing', 41)?.result).toBe('not-real');
+    });
+    it.each([
+      ['a different claim that merely contains the ruled words', 'Missing validation of the request payload leaves the authorization check bypassed in the handler, so any caller escalates', 46],
+      ['the same claim beyond the line window', 'Missing validation of the request payload', 49],
+    ])('does not carry %s', (_, summary, line) => {
+      expect(carry(summary, line)).toBeNull();
+    });
+    it('does not let a short earlier ruling clear a longer different finding (subset overlap)', () => {
+      expect(carry('Missing authorization check, validation absent in handler', 46, 'Missing validation')).toBeNull();
+    });
+    it.each([
+      ['a diff-prefixed alias of the ruled path', 'a/scripts/api/handler.mjs'],
+      ['a b/-prefixed alias of the ruled path', 'b/scripts/api/handler.mjs'],
+    ])('does not carry across %s (a real a/ or b/ directory is a different file)', (_, alias) => {
+      const { r, ops } = ruled('Missing validation of the request payload');
+      const ctx = { records: [r], operatorRulings: ops, head: 'a'.repeat(40), repo: r.repo, pr: r.pr };
+      const same = { ...finding, file, line: 41, summary: 'Missing validation of the request payload' };
+      expect(findCarriedOperatorRuling({ finding: normalizeFinding(same) }, ctx)?.result).toBe('not-real'); // control
+      expect(findCarriedOperatorRuling({ finding: normalizeFinding({ ...same, file: alias }) }, ctx)).toBeNull();
+    });
+    it('still tolerates a ./ prefix and a :line suffix on the cited path', () => {
+      const { r, ops } = ruled('Missing validation of the request payload');
+      const ctx = { records: [r], operatorRulings: ops, head: 'a'.repeat(40), repo: r.repo, pr: r.pr };
+      const same = { ...finding, line: 41, summary: 'Missing validation of the request payload' };
+      expect(findCarriedOperatorRuling({ finding: normalizeFinding({ ...same, file: `./${file}` }) }, ctx)?.result).toBe('not-real');
+      expect(findCarriedOperatorRuling({ finding: normalizeFinding({ ...same, file: `${file}:41` }) }, ctx)?.result).toBe('not-real');
+    });
+    it.each([
+      ['a higher impact', { impactIfUnfixed: 'unrecoverable' }],
+      ['a different verdict', { verdict: 'PLAUSIBLE' }],
+      ['no declared impact', { impactIfUnfixed: undefined }],
+    ])('does not carry the same finding re-reported with %s', (_, patch) => {
+      const { r, ops } = ruled('Missing validation of the request payload');
+      const same = { ...finding, file, line: 41, summary: 'Missing validation of the request payload' };
+      const ctx = { records: [r], operatorRulings: ops, head: 'a'.repeat(40), repo: r.repo, pr: r.pr };
+      expect(findCarriedOperatorRuling({ finding: normalizeFinding(same) }, ctx)?.result).toBe('not-real'); // control
+      expect(findCarriedOperatorRuling({ finding: normalizeFinding({ ...same, ...patch }) }, ctx)).toBeNull();
+    });
+  });
+
+  describe('a carried entry vs the reviewer ruling and the operator backing', () => {
+    const reason = 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged';
+    const carriedRecord = (result = 'not-real', card) => {
+      const r = record(), key = r.referrals[0].key;
+      const from = { head: 'b'.repeat(40), runId: 'old', key };
+      r.carried = [{ key, from, reason, result, ...(card ? { card } : {}) }];
+      return { r, key, from, ops: (...rs) => rs.map(x => ({ repo: r.repo, pr: r.pr, ...from, ...x })) };
+    };
+    it.each(['block', 'not-real', 'card'])('a current-head reviewer %s ruling on a carried finding wins over the carry', result => {
+      const { r, key, ops } = carriedRecord();
+      r.rulings = [rule(r, result)];
+      const state = referralRecordState(r, { operatorRulings: ops({ result: 'not-real' }), cardReadable: () => true });
+      expect(state.blocked).toEqual(result === 'block' ? [key] : []);
+      expect(state.rulings.map(x => x.result)).toEqual([result]);
+      expect(state.rulings.some(x => x.operator)).toBe(false); // the reviewer's ruling decided, not the carry's backing
+      expect(liveReferrals(r)).toHaveLength(1);
+    });
+    it('a reviewer block that contradicts another reviewer ruling is not cleared by the carry', () => {
+      const { r, key, ops } = carriedRecord();
+      r.rulings = [rule(r, 'block'), { ...rule(r, 'not-real'), id: 'r2' }];
+      const state = referralRecordState(r, { operatorRulings: ops({ result: 'not-real' }) });
+      expect(state.pending).toEqual([key]);
+      expect(state.blocked).toEqual([]);
+    });
+    it('an UNcounted reviewer ruling (a card nobody can read) leaves the carry standing', () => {
+      const { r, ops } = carriedRecord();
+      r.rulings = [rule(r, 'card')];
+      const state = referralRecordState(r, { operatorRulings: ops({ result: 'not-real' }), cardReadable: () => false });
+      expect(state.pending).toEqual([]);
+      expect(state.blocked).toEqual([]);
+    });
+    // ONE backing predicate for the gate and the ledger: every {result, card, head, run, key} variant of the operator
+    // ruling must give the same answer in `carriedBackingHolds` and in the gate's pending list.
+    it.each([
+      ['identical', {}, true],
+      ['a different result', { result: 'block' }, false],
+      ['a different head', { head: 'c'.repeat(40) }, false],
+      ['a different run', { runId: 'other' }, false],
+      ['a different finding key', { key: 'other' }, false],
+    ])('backing %s: %s', (_, patch, holds) => {
+      const { r, key, ops } = carriedRecord();
+      const operatorRulings = ops({ result: 'not-real', ...patch });
+      expect(!!carriedBackingHolds(r.carried[0], { repo: r.repo, pr: r.pr, operatorRulings })).toBe(holds);
+      expect(referralRecordState(r, { operatorRulings }).pending).toEqual(holds ? [] : [key]);
+    });
+    it.each([
+      ['a different card', { result: 'card', card: 'we:backlog/9999-y.md' }, false],
+      ['the same card', { result: 'card', card: 'we:backlog/1234-x.md' }, true],
+    ])('a carried card ruling with backing on %s', (_, backing, holds) => {
+      const { r, key, ops } = carriedRecord('card', 'we:backlog/1234-x.md');
+      const operatorRulings = ops(backing);
+      expect(!!carriedBackingHolds(r.carried[0], { repo: r.repo, pr: r.pr, operatorRulings })).toBe(holds);
+      expect(referralRecordState(r, { operatorRulings, cardReadable: () => true }).pending).toEqual(holds ? [] : [key]);
+    });
+    it('the LATEST operator ruling on the carried-from finding decides the backing', () => {
+      const { r, ops } = carriedRecord();
+      const ctx = { repo: r.repo, pr: r.pr };
+      expect(carriedBackingHolds(r.carried[0], { ...ctx, operatorRulings: ops({ result: 'not-real' }, { result: 'block' }) })).toBeNull();
+      expect(carriedBackingHolds(r.carried[0], { ...ctx, operatorRulings: ops({ result: 'block' }, { result: 'not-real' }) })).not.toBeNull();
+    });
+    // Append-only: a later snapshot of one run can neither drop nor rewrite what an earlier one recorded.
+    it.each([
+      ['drops carried', n => { n.carried = []; }],
+      ['rewrites a carried result', n => { n.carried[0].result = 'block'; }],
+      ['rewrites a carried from-head', n => { n.carried[0].from.head = 'd'.repeat(40); }],
+      ['rewrites a carried from-run', n => { n.carried[0].from.runId = 'else'; }],
+      ['rewrites a ruling', n => { n.rulings[0].result = 'block'; }],
+      ['drops a ruling', n => { n.rulings = []; }],
+    ])('a later snapshot that %s is malformed', (_, mutate) => {
+      const { r } = carriedRecord('not-real');
+      const first = structuredClone(r);
+      first.rulings = [{ ...rule(r), key: r.referrals[0].key }];
+      const next = structuredClone(first);
+      mutate(next);
+      expect(validateReferralRecord(next)).toBe(true); // the snapshot is valid alone: only the history check can refuse it
+      const read = snapshots => readReferralRecords(snapshots.map(s => post(renderReferralRecord(s))));
+      expect(read([first, next]).malformed).toBe(true);
+      expect(read([first, structuredClone(first)]).malformed).toBe(false); // control: an identical re-post is fine
+    });
+    it('a later snapshot may APPEND a carried entry', () => {
+      const first = record();
+      const { r } = carriedRecord('not-real');
+      const read = snapshots => readReferralRecords(snapshots.map(s => post(renderReferralRecord(s))));
+      expect(read([first, r]).malformed).toBe(false);
+      expect(read([first, r]).records).toHaveLength(1);
+    });
+  });
 
   function supersession() {
     const a = record();

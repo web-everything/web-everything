@@ -1,6 +1,7 @@
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
-  activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
+  findCarriedOperatorRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
 import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
@@ -468,6 +469,73 @@ export function isPreWriteRefusal(text) {
   return PRE_WRITE_REFUSALS.some((p) => s.includes(p));
 }
 
+/** Lines around a cited line that count as "the cited code changed" when carrying an operator ruling forward. */
+export const CARRY_CHANGE_WINDOW = 3;
+/** The compare API lists at most this many files; a full list may be truncated. */
+export const COMPARE_FILE_CAP = 300;
+
+/**
+ * The changed new-side lines of `file` in a compare payload (the returned Set's `.old` holds the changed OLD-side lines,
+ * so each citation can be checked in its own revision's coordinates), or `null` when that cannot be PROVEN (fail closed).
+ * A pure deletion or insertion (zero-count range) marks the two lines it sits between.
+ * `null`: the base is not an ancestor of the head (`status` other than `ahead`/`identical` — a three-dot compare of
+ * diverged heads diffs from the merge base, not from the ruled head), a missing/truncated file list, a rename, a
+ * removed file, or a missing patch. A file absent from a complete list is unchanged only when `fileExists()` shows
+ * the path is a real file at both ends; a path that matches nothing is unknown, not unchanged.
+ * @returns {Set<number>|null}
+ */
+export function changedLinesFromCompare(compare, file, fileExists = () => false) {
+  if (!compare || !['ahead', 'identical'].includes(compare.status) || !Array.isArray(compare.files)) return null;
+  const files = compare.files;
+  const entry = files.find(f => f.filename === file || f.previous_filename === file);
+  if (!entry) return files.length >= COMPARE_FILE_CAP || !fileExists() ? null : new Set();
+  if (entry.status === 'removed' || entry.status === 'renamed' || typeof entry.patch !== 'string' || !entry.patch) return null;
+  const lines = new Set();
+  lines.old = new Set();
+  let hunks = 0;
+  // A zero-count range (`+N,0` after a pure deletion, `-N,0` before a pure insertion) names the line AFTER which the
+  // change sits, so the change is adjacent to both N and N+1: record both, or a deletion would read as "no change".
+  const mark = (set, start, count) => {
+    if (count === 0) { set.add(start); set.add(start + 1); return; }
+    for (let n = start; n < start + count; n++) set.add(n);
+  };
+  for (const match of entry.patch.matchAll(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm)) {
+    hunks++;
+    mark(lines.old, Number(match[1]), Number(match[2] ?? 1));
+    mark(lines, Number(match[3]), Number(match[4] ?? 1));
+  }
+  return hunks ? lines : null;
+}
+
+/** True when any changed line falls within the window of a cited line; a missing cited line means any change blocks. */
+export function changesTouchCitedLines(changed, citedLines) {
+  if (citedLines.some(l => !Number.isInteger(l))) return changed.size > 0;
+  return [...changed].some(n => citedLines.some(l => Math.abs(n - l) <= CARRY_CHANGE_WINDOW));
+}
+
+/**
+ * The default `(repo, base, head, file) => Set|null` reader behind the operator-ruling carry: one compare per
+ * (repo, base, head) cached for the reader's life — failures included — and a contents probe for the
+ * absent-from-compare case. `ghJson(args)` is the injectable `gh api` runner (parsed JSON; throws on failure).
+ */
+export function createChangedLinesReader(ghJson) {
+  const comparisons = new Map();
+  const exists = (repo, ref, file) => {
+    try {
+      // A directory answers with an array; a submodule or symlink with another `type`. Only a real file can be "unchanged".
+      const entry = ghJson(['api', `repos/${repo}/contents/${file.split('/').map(encodeURIComponent).join('/')}?ref=${ref}`]);
+      return !Array.isArray(entry) && entry?.type === 'file';
+    } catch { return false; }
+  };
+  return (repo, base, head, file) => {
+    const key = JSON.stringify([repo, base, head]);
+    if (!comparisons.has(key)) {
+      try { comparisons.set(key, ghJson(['api', `repos/${repo}/compare/${base}...${head}`])); } catch { comparisons.set(key, null); }
+    }
+    return changedLinesFromCompare(comparisons.get(key), file, () => exists(repo, base, file) && exists(repo, head, file));
+  };
+}
+
 /**
  * THE SINKS, bound to a repo root and an output channel.
  *
@@ -489,6 +557,7 @@ export function createReviewPrSinks({
   root = REPO_ROOT,
   env = process.env,
   referralJudge = judgeSpawn,
+  readChangedLines,
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
   cardReadable = (ref) => referralCardReadable(ref, root),
   // #xstdout-json — A `--json` CALLER WANTS STDOUT TO BE ONE PARSEABLE DOCUMENT, END TO END. The `NOTICE`
@@ -523,6 +592,9 @@ export function createReviewPrSinks({
   return {
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {
       const { read } = payload;
+      // Cache comparisons only for this invocation, including failures. Missing patches cannot prove clearance.
+      const changedLines = readChangedLines ?? createChangedLinesReader(args => JSON.parse(execFileSyncThrottled('gh', args,
+        { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })));
       const commentBudget = 60_000;
       const fresh = () => {
         const state = labelProvider.readPrState(read.repo, read.pr);
@@ -669,6 +741,55 @@ export function createReviewPrSinks({
           for (const chunk of chunks) {
             state = persist(chunk);
             existing.push(chunk);
+          }
+        }
+        if (env.WE_REFERRAL_CARRY_OPERATOR_RULINGS !== '0') {
+          const records = readReferralRecords(state.comments, context(state)).records;
+          const operatorRulings = readOperatorRulings(state.comments, context(state)).rulings;
+          for (let i = 0; i < existing.length; i++) {
+            const record = existing[i], carried = [];
+            // Findings a reviewer's ruling on THIS head already settles (counted: independent clearer, readable card).
+            // `referralRecordState` reads `carried` before rulings, so a carry here would silently replace a
+            // current-head block with an earlier head's operator ruling. An UNcounted ruling settles nothing.
+            const stillPending = record.rulings.length
+              ? new Set(referralRecordState(record, { ...context(state), head: record.head, records, operatorRulings }).pending) : null;
+            for (const f of activeReferrals(record)) {
+              if ((record.carried ?? []).some(c => c.key === f.key)
+                || (stillPending && record.rulings.some(r => r.key === f.key) && !stillPending.has(f.key))
+                || operatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
+                  && o.head === record.head && o.runId === record.runId && o.key === f.key)) continue;
+              const match = findCarriedOperatorRuling(f, { records, operatorRulings,
+                head: record.head, repo: record.repo, pr: record.pr });
+              if (!match) continue;
+              // `referralRecordState` keeps a carried `card` pending while its card is unreadable, yet `liveReferrals`
+              // drops a carried finding from dispatch: that pairing would hold the gate with no reviewer to clear it.
+              if (match.result === 'card' && !cardReadable(match.card)) continue;
+              let changed;
+              try {
+                // The exact cited path: an `a/` or `b/` prefix may be a real directory, so it is never stripped for a lookup.
+                const file = exactCitedPath(f.finding.file);
+                changed = await changedLines(record.repo, match.from.head, record.head, file);
+              } catch { changed = null; }
+              if (!(changed instanceof Set)) continue;
+              // Each citation is checked in its own revision's coordinates: this finding's line against the new side,
+              // the earlier ruled finding's line against the old side (a plain injected Set serves for both).
+              if (changesTouchCitedLines(changed, [f.finding.line])
+                || changesTouchCitedLines(changed.old ?? changed, [match.finding.line])) continue;
+              carried.push({ key: f.key, reason: REFERRAL_CARRY_REASON, from: match.from,
+                result: match.result, ...(match.card ? { card: match.card } : {}) });
+            }
+            if (!carried.length) continue;
+            const updated = { ...record, carried: [...(record.carried ?? []), ...carried] };
+            if (renderReferralRecord(updated).length > commentBudget) {
+              overflow(`historical run ${record.runId} carry exceeds ${commentBudget} characters; original record retained`);
+              continue;
+            }
+            state = persist(updated);
+            existing[i] = updated;
+            for (const c of carried) {
+              const f = record.referrals.find(f => f.key === c.key).finding;
+              out(`referral carried: ${f.file ?? ''}${f.line == null ? '' : `:${f.line}`} — operator ${c.result} from ${c.from.head.slice(0, 8)} stands (cited lines unchanged)`);
+            }
           }
         }
         // Persist the attempt before dispatch. A crash or timeout spends this set's single automated attempt.

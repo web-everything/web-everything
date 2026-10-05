@@ -92,6 +92,7 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
+import { referralCardReadable } from './lib/referral-card-readable.mjs';
 // #2844 — WHO cleared this verdict, and the refusal when that is the PR's own author. See that module's header
 // for what the id rests on (the harness session identity, NOT the free-text `--actor`) and for the residual.
 import {
@@ -1976,24 +1977,8 @@ function ghErr(e, fallback) {
 }
 
 
-/** A deferral is discharged only by an existing readable backlog card, never an intention to file. */
-export function referralCardReadable(ref, root = process.cwd()) {
-  if (!/^we:backlog\/[^/]+\.md$/.test(ref ?? '')) return false;
-  const card = text => /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(text);
-  try { return card(readFileSync(`${root}/${ref.slice(3)}`, 'utf8')); }
-  catch {
-    // #4979 — a provisional card (`x…`) is renumbered when it lands (#2288 JIT numbering); a ruling that cited
-    // it by its birth name still names that card through the landed file's `bornAs:`.
-    const born = /^we:backlog\/(x[a-z0-9]{6})-/.exec(ref)?.[1];
-    if (!born) return false;
-    try {
-      return readdirSync(`${root}/backlog`).some(name => name.endsWith('.md') && /^\d+-/.test(name) && (() => {
-        const text = readFileSync(`${root}/backlog/${name}`, 'utf8');
-        return card(text) && new RegExp(`^bornAs:[ \\t]*["']?${born}["']?[ \\t]*$`, 'm').test(text.split(/\r?\n---\r?\n/)[0]);
-      })());
-    } catch { return false; }
-  }
-}
+// Moved to `we:scripts/lib/referral-card-readable.mjs` so the review hold can share it without an import cycle.
+export { referralCardReadable };
 
 /** Fail closed at every acceptance entry point using the fresh durable PR record. */
 export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable = referralCardReadable,
