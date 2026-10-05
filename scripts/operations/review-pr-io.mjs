@@ -338,7 +338,10 @@ export function readLatestFixRange(options = {}) {
     }
     const files = {};
     if (!diff.trim()) return { priorHead, head, files };
-    const sections = diff.split(/^diff --git /m).slice(1);
+    // Split only at a real LF line start: no `m` flag, because `^` under `/m` also matches after CR, U+2028,
+    // U+2029, NEL, VT and FF, so an added line like `x<U+2028>diff --git a/zzz b/zzz` would forge a section and
+    // misattribute the real file's hunks. (A genuine header always starts a line; content lines start with `+`/`-`/` `.)
+    const sections = diff.split(/(?:^|\n)diff --git /).slice(1);
     if (!sections.length) return { priorHead, head, error: 'diff-unparseable' };
     const decodePath = value => value.startsWith('"') ? JSON.parse(value) : value;
     for (const section of sections) {

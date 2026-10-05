@@ -1838,6 +1838,23 @@ describe('#5135 latest fix range', () => {
     ].join('\n');
     expect(read(() => diff)).toEqual({ priorHead, head, files: { 'a.js': [1, 2, 12, 13, 21], 'old.js': null, 'pic.png': null, 'run.sh': [] } });
   });
+  it('splits file sections only at a real LF line start, so CR / U+2028 / U+2029 / NEL in an added line cannot forge one', () => {
+    for (const breaker of ['\r', ' ', ' ', '\u0085', '\v', '\f']) {
+      const diff = [
+        'diff --git a/real.js b/real.js', '--- a/real.js', '+++ b/real.js',
+        '@@ -0,0 +1,1 @@', `+x${breaker}diff --git a/zzz b/zzz`,
+        '@@ -10,0 +11,2 @@', '+three', '+four',
+      ].join('\n');
+      expect(read(() => diff), JSON.stringify(breaker)).toEqual({ priorHead, head, files: { 'real.js': [1, 11, 12] } });
+    }
+  });
+  it('still splits two genuine file sections when the first one carries a forged header in its content', () => {
+    const diff = [
+      'diff --git a/one.js b/one.js', '--- a/one.js', '+++ b/one.js', '@@ -0,0 +1 @@', '+x diff --git a/zzz b/zzz',
+      'diff --git a/two.js b/two.js', '--- a/two.js', '+++ b/two.js', '@@ -4 +4 @@', '-a', '+b',
+    ].join('\n');
+    expect(read(() => diff)).toEqual({ priorHead, head, files: { 'one.js': [1], 'two.js': [4] } });
+  });
   it('keeps failures explicit', () => {
     expect(read(() => { throw new Error('missing commit'); })).toEqual({ priorHead, head, error: 'git-diff-failed' });
     expect(read(() => 'garbage')).toEqual({ priorHead, head, error: 'diff-unparseable' });
