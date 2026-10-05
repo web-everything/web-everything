@@ -482,6 +482,43 @@ function wordOverlap(a, b) {
   return hit / Math.min(A.size, B.size);
 }
 
+/** Symmetric word overlap (|A∩B| / |A∪B|); unlike {@link wordOverlap} a subset of a longer text does not score 1. */
+function wordJaccard(a, b) {
+  const A = corroborationWords(a);
+  const B = corroborationWords(b);
+  if (!A.size || !B.size) return 0;
+  let hit = 0;
+  for (const w of A) if (B.has(w)) hit += 1;
+  return hit / (A.size + B.size - hit);
+}
+export const CARRY_SUMMARY_JACCARD_FLOOR = 0.6;
+
+/**
+ * The cited path AS WRITTEN, for every lookup against a real repository: only a `./` prefix and a `:line` suffix are
+ * dropped. A leading `a/` or `b/` is a real top-level directory as often as it is a diff prefix, so it is NEVER
+ * stripped here — an alias that names a different (root) file would be compared against the wrong file. The
+ * prefix-stripping `corroborationPath` stays for fuzzy label matching only.
+ */
+export const exactCitedPath = (file) => String(file ?? '').trim().replace(/^\.\//, '').replace(/:\d+(?::\d+)?$/, '');
+
+/**
+ * ONE definition of "the same finding" for CLEARING a standing obligation (carrying an operator ruling onto a new
+ * head, `findCarriedOperatorRuling`; overruling an earlier block, `ruling-ledger.mjs#ignoredRulings`): the same exact
+ * path, the same spot (both lines absent, or both within {@link CORROBORATION_LINE_WINDOW}), the same claim
+ * (identical, or symmetric word overlap of at least {@link CARRY_SUMMARY_JACCARD_FLOOR}), and the same severity
+ * ({@link CARRY_SEVERITY_FIELDS}). A ruling is scoped to the instance the operator saw. `a` and `b` are findings
+ * (`{ file, line, summary, verdict, impactIfUnfixed }`).
+ */
+export function sameFindingForClearing(a, b) {
+  const path = exactCitedPath(a?.file);
+  if (!path || path !== exactCitedPath(b?.file)) return false;
+  if (!(a.line == null && b.line == null)
+    && !(Number.isInteger(a.line) && Number.isInteger(b.line) && Math.abs(a.line - b.line) <= CORROBORATION_LINE_WINDOW)) return false;
+  const summary = (s) => String(s ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+  if (summary(a.summary) !== summary(b.summary) && wordJaccard(a.summary, b.summary) < CARRY_SUMMARY_JACCARD_FLOOR) return false;
+  return CARRY_SEVERITY_FIELDS.every((k) => a[k] === b[k]);
+}
+
 /**
  * #4194 — DID ANOTHER SEAT RAISE THE SAME PROBLEM? PURE, deterministic. Used to stamp an ADDED (non-Claude)
  * review seat's finding with whether one of Claude's own seats confirmed it. Two findings corroborate when they
@@ -2288,12 +2325,13 @@ export const REFERRAL_SEAT_PROVIDERS = Object.freeze({
 });
 export const ADVISORY_REFERRAL_SEATS = Object.freeze(['judgeAdvisory', 'judgeCorrectnessAdvisory', 'judgeAntigravityReview']);
 export const REFERRAL_SUPERSEDE_REASON = 'superseded: the mandatory owner already ruled this finding not-real on this head';
+export const REFERRAL_CARRY_REASON = 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged';
 export const REFERRAL_DROP_REASON = 'dropped: seat disabled by operator config';
 // A drop only retires a finding nobody has ruled on: a finding with a ruling (a `block` above all) keeps counting.
 export const activeReferrals = (record) => record.referrals.filter(f => !(record.dropped ?? []).some(d => d.key === f.key)
   || record.rulings.some(r => r.key === f.key));
 
-export const liveReferrals = (record) => activeReferrals(record).filter(f => !(record.superseded ?? []).some(s => s.key === f.key)
+export const liveReferrals = (record) => activeReferrals(record).filter(f => ![...(record.superseded ?? []), ...(record.carried ?? [])].some(s => s.key === f.key)
   || record.rulings.some(r => r.key === f.key));
 
 /** Same-head owner decisions may retire advisory duplicates; never infer clearance from prose alone. */
@@ -2326,6 +2364,36 @@ export function findSupersedingNotReal(referral, { records = [], operatorRulings
   return null;
 }
 
+/** The finding fields an operator ruling is scoped to: a carry requires every one to be equal. */
+export const CARRY_SEVERITY_FIELDS = Object.freeze(['verdict', 'impactIfUnfixed']);
+
+/**
+ * The operator ruling that still backs a `carried` entry, or null. The LATEST ruling on the carried-from
+ * (head, run, finding) decides, and it must still say what was carried (same result, same card): an operator who
+ * later re-rules that finding withdraws the backing. ONE definition for the gate (`referralRecordState`) and the
+ * ignored-ruling ledger (`ruling-ledger.mjs#ignoredRulings`), so they cannot disagree on whether a carry stands.
+ */
+export function carriedBackingHolds(carried, { repo, pr, operatorRulings = [] }) {
+  const backing = operatorRulings.filter(o => o.repo === repo && o.pr === pr
+    && o.head === carried.from.head && o.runId === carried.from.runId && o.key === carried.from.key).at(-1);
+  return backing && backing.result === carried.result && backing.card === carried.card ? backing : null;
+}
+
+/** Latest matching operator decision on an earlier head; the IO caller must prove unchanged cited lines. */
+export function findCarriedOperatorRuling(referral, { records = [], operatorRulings = [], head, repo, pr }) {
+  const target = referral.finding;
+  for (const o of [...operatorRulings].reverse()) {
+    if (o.head === head || o.repo !== repo || o.pr !== pr) continue;
+    const record = records.find(r => r.runId === o.runId && r.head === o.head && r.repo === repo && r.pr === pr);
+    const finding = record?.referrals.find(f => f.key === o.key)?.finding;
+    // Clearing a mandatory referral is stricter than merging duplicates (exact path, line window, symmetric word
+    // overlap, same severity): see `sameFindingForClearing`, the one definition the ledger's overrule shares.
+    if (!finding || !sameFindingForClearing(finding, target)) continue;
+    return { from: { head: o.head, runId: o.runId, key: o.key }, result: o.result, card: o.card, finding };
+  }
+  return null;
+}
+
 /** Versioned snapshot of the append-only referral history, mirrored into the jury ledger. */
 export function validateReferralRecord(r) {
   try {
@@ -2354,6 +2422,14 @@ export function validateReferralRecord(r) {
         || typeof s.by.key !== 'string' || !s.by.key.trim() || s.by.key === s.key
         || !(s.by.operator === true && s.by.rulingId === undefined
           || s.by.operator === undefined && typeof s.by.rulingId === 'string' && s.by.rulingId.trim())))) return false;
+    if (r.carried !== undefined && (!Array.isArray(r.carried)
+      || new Set(r.carried.map(c => c.key)).size !== r.carried.length
+      || r.carried.some(c => !keys.has(c.key) || c.reason !== REFERRAL_CARRY_REASON
+        || !c.from || !/^[a-f0-9]{40}$/.test(c.from.head) || c.from.head === r.head
+        || typeof c.from.runId !== 'string' || !c.from.runId.trim()
+        || typeof c.from.key !== 'string' || !c.from.key.trim()
+        || !['block', 'card', 'not-real'].includes(c.result)
+        || (c.result === 'card' ? !/^we:backlog\/[^/]+\.md$/.test(c.card ?? '') : c.card !== undefined)))) return false;
     const ids = new Set();
     for (const rli of r.rulings) {
       if (!rli || typeof rli.id !== 'string' || !rli.id || ids.has(rli.id)
@@ -2414,6 +2490,26 @@ export function referralRecordState(record, { head = record?.head, body = record
       else { rulings.push(operator); if (operator.result === 'block') blocked.push(f.key); }
       continue;
     }
+    // The reviewer's own COUNTED ruling on this head (independent clearer, one outcome, readable card) — the same
+    // test the carry sink applies before it carries, so the two cannot disagree about what a carry may replace.
+    const history = independent ? recorded : [];
+    const active = history.filter(r => !history.some(next => supersededRulings(next).includes(r.id)));
+    const outcomes = new Set(active.map(r => JSON.stringify([r.result, r.result === 'card' ? r.card : null])));
+    const cardUnreadable = active.some(r => r.result === 'card' && !cardReadable(r.card));
+    // A carry only stands in for a ruling nobody has counted on THIS head: a counted reviewer ruling for the same
+    // finding (appended after the carry) wins over it, so a current-head `block` can never be masked by an earlier
+    // head's operator not-real. A reviewer `block` that contradicts another ruling on the finding still yields: the
+    // ordinary path below holds it pending. Any other uncounted ruling (non-independent clearer, unreadable card)
+    // settles nothing, so the carry still applies.
+    const counted = active.length > 0 && ((outcomes.size === 1 && !cardUnreadable) || active.some(r => r.result === 'block'));
+    const carried = counted ? undefined : (record.carried ?? []).find(c => c.key === f.key);
+    if (carried) {
+      const backing = carriedBackingHolds(carried, { repo: record.repo, pr: record.pr, operatorRulings });
+      if (head !== record.head || !backing
+        || (carried.result === 'card' && !cardReadable(carried.card))) pending.push(f.key);
+      else { rulings.push(backing); if (carried.result === 'block') blocked.push(f.key); }
+      continue;
+    }
     const superseded = (record.superseded ?? []).find(s => s.key === f.key);
     if (!recorded.length && superseded) {
       const { by } = superseded;
@@ -2427,11 +2523,7 @@ export function referralRecordState(record, { head = record?.head, body = record
     // Match audited drops: disabling an optional seat cannot erase an existing ruling (especially a block),
     // even one not yet counted because its clearer is not independent.
     if (!recorded.length && seatDisabled(f.seat)) continue;
-    const history = independent ? recorded : [];
-    const active = history.filter(r => !history.some(next => supersededRulings(next).includes(r.id)));
-    const outcomes = new Set(active.map(r => JSON.stringify([r.result, r.result === 'card' ? r.card : null])));
-    if (head !== record.head || outcomes.size !== 1
-      || active.some(r => r.result === 'card' && !cardReadable(r.card))) pending.push(f.key);
+    if (head !== record.head || outcomes.size !== 1 || cardUnreadable) pending.push(f.key);
     else { rulings.push(...active); if (active[0].result === 'block') blocked.push(f.key); }
   }
   // Named only when a finding actually stays held, so a fully operator-ruled record never shows it.
@@ -2448,6 +2540,7 @@ export function renderReferralRecord(record) {
     + `CONFIRMED broken/unrecoverable findings require a finding-specific block/card/not-real ruling.\n`
     + record.referrals.map(f => `- ${f.key}: ${f.finding.summary}`).join('\n')
     + (record.superseded ?? []).map(s => `\n- ${s.key}: ${s.reason} (by run ${s.by.runId})`).join('')
+    + (record.carried ?? []).map(c => `\n- ${c.key}: ${c.reason} (operator ${c.result}, from ${c.from.head}, run ${c.from.runId})`).join('')
     + (record.dropped ?? []).map(d => `\n- ${d.key}: ${d.reason}`).join('')
     + `\nAttempt recorded: ${record.attempted}. Reason: ${record.failure ?? (referralRecordState(record).pending.length ? 'mandatory finding-specific review required' : 'finding-specific rulings recorded')}. Rulings: ${JSON.stringify(record.rulings)}\n`
     + `Record any missing finding-specific rulings with the mandatory reviewer identified above, retaining prior rulings and explicit supersedes IDs. Then start a fresh review-pr --pr=${record.pr} --repo=${record.repo}; it reuses this PR record without another automated attempt. card requires a readable backlog reference.\n`
@@ -2505,6 +2598,7 @@ export function readReferralRecords(comments, { head } = {}) {
         if (previous && (previous.authorBody !== r.authorBody || JSON.stringify(previous.referrals) !== JSON.stringify(r.referrals)
           || (previous.attempted && !r.attempted)
           || JSON.stringify((r.dropped ?? []).slice(0, (previous.dropped ?? []).length)) !== JSON.stringify(previous.dropped ?? [])
+          || JSON.stringify((r.carried ?? []).slice(0, (previous.carried ?? []).length)) !== JSON.stringify(previous.carried ?? [])
           || JSON.stringify((r.superseded ?? []).slice(0, (previous.superseded ?? []).length)) !== JSON.stringify(previous.superseded ?? [])
           || JSON.stringify(r.rulings.slice(0, previous.rulings.length)) !== JSON.stringify(previous.rulings))) {
           malformed ||= holdsHead(r); continue;
@@ -2629,7 +2723,7 @@ export function mandatoryReferralState(comments, context = {}) {
   }
   const blocked = [];
   // The review carries source findings into the new head's own records. Neither old holds nor old
-  // clearance carry forward here; a finding repeated on the current head still needs its own ruling.
+  // clearance carry forward implicitly; explicit carried entries require operator backing.
   for (const r of records) {
     if (/^[a-f0-9]{40}$/.test(context.head ?? '') && r.head !== context.head) continue;
     if (context.repo && (r.repo !== context.repo || r.pr !== Number(context.pr))) { pending.push('wrong-subject'); continue; }

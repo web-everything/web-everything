@@ -1,4 +1,4 @@
-import { referralFindingKey, mandatoryReferralReviewer, normalizeFinding, renderReferralRecord,
+import { buildOperatorRulingComment, referralFindingKey, mandatoryReferralReviewer, normalizeFinding, renderReferralRecord,
   readReferralRecords, validateReferralRecord, mandatoryReferralState, activeReferrals } from '../../lib/jury-core.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
 /**
@@ -24,7 +24,7 @@ import { join } from 'node:path';
 import {
   PR_VIEW_FIELDS, createReviewPrReader, createReviewPrSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
-  resolveSubjectCheckout,
+  resolveSubjectCheckout, COMPARE_FILE_CAP, changedLinesFromCompare, changesTouchCitedLines, createChangedLinesReader,
 } from '../review-pr-io.mjs';
 import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation } from '../review-pr.mjs';
 import { createRegistry } from '../registry.mjs';
@@ -1016,8 +1016,82 @@ describe('#xu2pp2m — `--cwd` decides which checkout the DIFF is read from', ()
   });
 });
 
+describe('operator-ruling carry: default changed-lines reader', () => {
+  const patch = '@@ -1,2 +1,3 @@\n a\n+b\n c\n@@ -20 +21,2 @@\n x\n+y';
+  const compare = (files, status = 'ahead') => ({ status, files });
+  it('parses hunk ranges from a compare payload (new side)', () => {
+    expect([...changedLinesFromCompare(compare([{ filename: 'a.mjs', status: 'modified', patch }]), 'a.mjs')]).toEqual([1, 2, 3, 21, 22]);
+  });
+  it.each([
+    ['a diverged compare (three-dot diffs from the merge base, not the ruled head)', compare([], 'diverged')],
+    ['a behind compare', compare([], 'behind')],
+    ['a missing file list', { status: 'ahead' }],
+    ['a rename', compare([{ filename: 'a.mjs', previous_filename: 'old.mjs', status: 'renamed', patch }])],
+    ['a removed file', compare([{ filename: 'a.mjs', status: 'removed', patch: '@@ -1,2 +0,0 @@\n-a\n-b' }])],
+    ['a missing patch', compare([{ filename: 'a.mjs', status: 'modified' }])],
+    ['a payload without hunks', compare([{ filename: 'a.mjs', status: 'modified', patch: 'Binary files differ' }])],
+    ['a truncated file list that omits the file', compare(Array.from({ length: COMPARE_FILE_CAP }, (_, i) => ({ filename: `f${i}`, status: 'modified', patch })))],
+    ['null', null],
+  ])('fails closed (null) on %s', (_, payload) => {
+    expect(changedLinesFromCompare(payload, 'a.mjs', () => true)).toBeNull();
+  });
+  it('treats a file absent from a complete list as unchanged only when it exists at both ends', () => {
+    expect(changedLinesFromCompare(compare([]), 'a.mjs', () => true)).toEqual(new Set());
+    expect(changedLinesFromCompare(compare([]), 'A.MJS', () => false)).toBeNull();
+    expect(changedLinesFromCompare(compare([], 'identical'), 'a.mjs', () => true)).toEqual(new Set());
+  });
+  it('stubbed gh: one compare per (repo, base, head), existence probed at both refs, failures fail closed', () => {
+    const calls = [];
+    const reader = createChangedLinesReader(args => {
+      calls.push(args[1]);
+      if (args[1].includes('/compare/')) return compare([{ filename: 'a.mjs', status: 'modified', patch }]);
+      if (args[1].includes('gone.mjs')) throw new Error('404');
+      if (args[1].includes('contents/src/dir')) return [{ type: 'file', name: 'x.mjs' }];
+      if (args[1].includes('contents/sub.mjs')) return { type: 'submodule' };
+      return { type: 'file' };
+    });
+    expect(reader('o/r', 'b'.repeat(40), 'h'.repeat(40), 'a.mjs')).toEqual(new Set([1, 2, 3, 21, 22]));
+    expect(reader('o/r', 'b'.repeat(40), 'h'.repeat(40), 'other.mjs')).toEqual(new Set());
+    expect(reader('o/r', 'b'.repeat(40), 'h'.repeat(40), 'gone.mjs')).toBeNull();
+    expect(reader('o/r', 'b'.repeat(40), 'h'.repeat(40), 'src/dir')).toBeNull(); // a directory is not a file
+    expect(reader('o/r', 'b'.repeat(40), 'h'.repeat(40), 'sub.mjs')).toBeNull(); // nor a submodule
+    expect(calls.filter(c => c.includes('/compare/'))).toHaveLength(1);
+    expect(calls.some(c => c.includes(`contents/other.mjs?ref=${'b'.repeat(40)}`))).toBe(true);
+    expect(calls.some(c => c.includes(`contents/other.mjs?ref=${'h'.repeat(40)}`))).toBe(true);
+    const failing = createChangedLinesReader(() => { throw new Error('boom'); });
+    expect(failing('o/r', 'b', 'h', 'a.mjs')).toBeNull();
+  });
+  // Every way a diff can change code without ADDING a line: a pure deletion (`+N,0`), a pure insertion's old side
+  // (`-N,0`), and deleted old lines whose surviving new-side range sits somewhere else entirely.
+  it.each([
+    ['a pure deletion (+N,0) marks the neighbouring new lines', '@@ -10,3 +9,0 @@\n-a\n-b\n-c', [9, 10], [10, 11, 12]],
+    ['a deletion at the top of the file (+0,0)', '@@ -1,2 +0,0 @@\n-a\n-b', [0, 1], [1, 2]],
+    ['a pure insertion marks the neighbouring old lines (-N,0)', '@@ -5,0 +6,2 @@\n+a\n+b', [6, 7], [5, 6]],
+    ['a single-line hunk without counts', '@@ -4 +4 @@\n-a\n+b', [4], [4]],
+  ])('%s', (_, hunkPatch, expectedNew, expectedOld) => {
+    const changed = changedLinesFromCompare(compare([{ filename: 'a.mjs', status: 'modified', patch: hunkPatch }]), 'a.mjs');
+    expect([...changed].sort((a, b) => a - b)).toEqual(expectedNew);
+    expect([...changed.old].sort((a, b) => a - b)).toEqual(expectedOld);
+  });
+  it('a deletion next to a cited line blocks the carry (the empty-set bug)', () => {
+    const changed = changedLinesFromCompare(compare([{ filename: 'a.mjs', status: 'modified', patch: '@@ -13,2 +12,0 @@\n-a\n-b' }]), 'a.mjs');
+    expect(changed.size).toBeGreaterThan(0);
+    expect(changesTouchCitedLines(changed, [12, 12])).toBe(true);
+    expect(changesTouchCitedLines(changed, [null, null])).toBe(true);
+  });
+  it('window boundary: a change within ±3 of either cited line blocks the carry, ±4 does not', () => {
+    expect(changesTouchCitedLines(new Set([15]), [12, 40])).toBe(true);
+    expect(changesTouchCitedLines(new Set([16]), [12, 40])).toBe(false);
+    expect(changesTouchCitedLines(new Set([9]), [12, 40])).toBe(true);
+    expect(changesTouchCitedLines(new Set([8]), [12, 40])).toBe(false);
+    expect(changesTouchCitedLines(new Set([37]), [12, 40])).toBe(true);
+    expect(changesTouchCitedLines(new Set([100]), [12, null])).toBe(true);
+    expect(changesTouchCitedLines(new Set(), [12, null])).toBe(false);
+  });
+});
+
 describe('#4315 durable referral effects', () => {
-  function harness({ result = 'not-real', failure, env = {} } = {}) {
+  function harness({ result = 'not-real', failure, env = {}, readChangedLines = () => new Set() } = {}) {
     const head = 'a'.repeat(40), trace = [], lines = [];
     let posts = 0;
     const state = { headRefOid: head, body: '<!-- authored-by-actor: author -->', comments: [], labels: ['review:pending'] };
@@ -1047,10 +1121,148 @@ describe('#4315 durable referral effects', () => {
           card: result === 'card' ? 'we:backlog/7-filed.md' : '',
         })) } };
     });
-    const make = () => createReviewPrSinks({ root, env, labelProvider: provider, referralJudge: judge,
+    const make = () => createReviewPrSinks({ root, env, readChangedLines, labelProvider: provider, referralJudge: judge,
       mirrorReferral: record => trace.push(`mirror:${record.attempted}`), out: line => lines.push(line), cardReadable: () => failure !== 'card' });
     return { state, trace, lines, payload, judge, make, provider };
   }
+
+  it.each(['unchanged', 'changed', 'old-line-changed', 'unknown', 'disabled'])('carries an earlier operator ruling only with unchanged lines: %s', async mode => {
+    const h = harness({ failure: 'omitted', env: mode === 'disabled' ? { WE_REFERRAL_CARRY_OPERATOR_RULINGS: '0' } : {},
+      readChangedLines: () => mode === 'unknown' ? null : new Set(mode === 'changed' ? [12] : mode === 'old-line-changed' ? [18] : []) });
+    // The earlier ruled finding cited line 15, this one cites 12: line 18 is within ±3 of the OLD line only.
+    h.payload.referrals[0].original.line = mode === 'old-line-changed' ? 15 : 12;
+    const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
+    const original = { ...old.referrals[0].original, line: 12 };
+    const current = { ...old, head: h.state.headRefOid, runId: 'current',
+      referrals: [{ ...old.referrals[0], original, finding: normalizeFinding(original),
+        key: referralFindingKey('judgeCorrectnessAdvisory', original) }],
+      reviewer: mandatoryReferralReviewer('current'), attempted: false };
+    h.state.comments.push({ body: renderReferralRecord(current), author: { login: 'web-everything' } });
+    h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+      version: 1, repo: old.repo, pr: old.pr, head: old.head, actor: 'chalbert', channel: 'test',
+      reason: 'not a defect', at: '2026-10-04T12:00:00Z', clearerId: '',
+      rulings: [{ runId: old.runId, key: old.referrals[0].key, result: 'not-real' }],
+    }) });
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const latest = readReferralRecords(h.state.comments).records.find(r => r.runId === 'current');
+    if (mode === 'unchanged') {
+      expect(latest.carried).toHaveLength(1);
+      expect(h.judge).not.toHaveBeenCalled();
+      expect(result.pending).toEqual([]);
+    } else {
+      expect(latest.carried).toBeUndefined();
+      // (the old-line mode seeds a second, differently keyed record, so the judge may sit twice; the current finding is always sent)
+      expect(h.judge.mock.calls.some(([req]) => JSON.parse(req.input.split('\nUntrusted reported findings:\n')[1])
+        .some(f => f.key === current.referrals[0].key))).toBe(true);
+      expect(result.pending).toContain(current.referrals[0].key);
+    }
+  });
+
+  // An earlier-head operator not-real on `oldLine`, and the SAME finding on the current head at `curLine`.
+  function seedCarry(h, { oldLine = 12, curLine = 12, attempted = false, rule = () => [], operatorRuling = { result: 'not-real' }, curPatch = {} } = {}) {
+    h.payload.referrals[0].original.line = oldLine;
+    const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
+    const original = { ...old.referrals[0].original, line: curLine, ...curPatch };
+    const current = { ...old, head: h.state.headRefOid, runId: 'current',
+      referrals: [{ ...old.referrals[0], original, finding: normalizeFinding(original),
+        key: referralFindingKey('judgeCorrectnessAdvisory', original) }],
+      reviewer: mandatoryReferralReviewer('current'), attempted, rulings: [] };
+    current.rulings = rule(current);
+    h.state.comments.push({ body: renderReferralRecord(current), author: { login: 'web-everything' } });
+    h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+      version: 1, repo: old.repo, pr: old.pr, head: old.head, actor: 'chalbert', channel: 'test',
+      reason: 'not a defect', at: '2026-10-04T12:00:00Z', clearerId: '',
+      rulings: [{ runId: old.runId, key: old.referrals[0].key, ...operatorRuling }] }) });
+    return { old, current };
+  }
+  const realReader = patch => () => changedLinesFromCompare({ status: 'ahead', files: [{ filename: 'x.mjs', status: 'modified', patch }] }, 'x.mjs');
+
+  it.each([
+    ['a pure deletion next to the cited line', { oldLine: 12, curLine: 12 }, '@@ -13,2 +12,0 @@\n-a\n-b'],
+    ['a deletion of the OLD cited line whose surviving new-side range lies elsewhere', { oldLine: 15, curLine: 12 }, '@@ -15,1 +40,0 @@\n-a'],
+  ])('does not carry an operator ruling across %s', async (_, lines, patch) => {
+    const h = harness({ failure: 'omitted', readChangedLines: realReader(patch) });
+    const { current } = seedCarry(h, lines);
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
+    expect(result.pending).toContain(current.referrals[0].key);
+  });
+
+  // A real top-level `a/` directory is a real path: the compare lookup must use the cited path as written, never
+  // a diff-prefix-stripped alias that may name a different (root) file.
+  it('looks a carried finding up by its exact cited path, and never carries across a diff-prefix alias', async () => {
+    const asked = [];
+    const h = harness({ failure: 'omitted', readChangedLines: (_repo, _base, _head, file) => { asked.push(file); return new Set(); } });
+    h.payload.referrals[0].original.file = 'a/x.mjs';
+    seedCarry(h, { curPatch: { file: 'a/x.mjs' } });
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toHaveLength(1);
+    expect(asked).toEqual(['a/x.mjs']);
+  });
+  it('does not carry a ruling on root x.mjs onto a finding cited at the different file a/x.mjs', async () => {
+    const asked = [];
+    const h = harness({ failure: 'omitted', readChangedLines: (_repo, _base, _head, file) => { asked.push(file); return new Set(); } });
+    const { current } = seedCarry(h, { curPatch: { file: 'a/x.mjs' } });
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
+    expect(result.pending).toContain(current.referrals[0].key);
+  });
+
+  it.each([['block'], ['not-real']])('never replaces a current-head reviewer %s ruling with an earlier-head operator ruling', async result => {
+    const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    const { current } = seedCarry(h, { attempted: true, rule: r => [{ id: 'r1', key: r.referrals[0].key, reviewerId: r.reviewer.id,
+      lens: r.reviewer.lens, result, rationale: 'Checked diff', evidence: ['diff:x'] }] });
+    const state = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const latest = readReferralRecords(h.state.comments).records.find(r => r.runId === 'current');
+    expect(latest.carried).toBeUndefined();
+    const key = current.referrals[0].key;
+    expect(mandatoryReferralState(h.state.comments, { head: h.state.headRefOid }).blocked).toEqual(result === 'block' ? [key] : []);
+    expect(state.pending).not.toContain(key);
+  });
+
+  // The carry persists a `carried` entry that `liveReferrals` excludes from dispatch, while `referralRecordState` keeps
+  // the finding pending for an unreadable card: carrying it would strand the finding with no reviewer and a held gate.
+  it('does not suppress mandatory review when an earlier operator card is unreadable', async () => {
+    const h = harness({ failure: 'card', readChangedLines: () => new Set() });
+    const { current } = seedCarry(h, { operatorRuling: { result: 'card', card: 'we:backlog/7-filed.md' } });
+    const state = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const key = current.referrals[0].key;
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
+    expect(h.judge.mock.calls.some(([req]) => JSON.parse(req.input.split('\nUntrusted reported findings:\n')[1])
+      .some(f => f.key === key))).toBe(true);
+    // The reviewer (harness default: not-real) adjudicated it, so the gate is not left holding an unattended finding.
+    expect(state.pending).not.toContain(key);
+  });
+
+  // An operator ruling is scoped to the severity they saw: the same finding re-reported at a higher impact goes to the
+  // mandatory reviewer instead of inheriting the earlier not-real.
+  it('does not carry an operator ruling onto the same finding re-reported at a higher impact', async () => {
+    const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    const { old, current } = seedCarry(h, { curPatch: { impactIfUnfixed: 'unrecoverable' } });
+    expect(current.referrals[0].original.impactIfUnfixed).not.toBe(old.referrals[0].original.impactIfUnfixed);
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
+    expect(h.judge.mock.calls.some(([req]) => JSON.parse(req.input.split('\nUntrusted reported findings:\n')[1])
+      .some(f => f.key === current.referrals[0].key))).toBe(true);
+  });
+
+  it('still carries an earlier operator card ruling when the card is readable', async () => {
+    const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    const { current } = seedCarry(h, { operatorRuling: { result: 'card', card: 'we:backlog/7-filed.md' } });
+    const state = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toHaveLength(1);
+    expect(h.judge).not.toHaveBeenCalled();
+    expect(state.pending).not.toContain(current.referrals[0].key);
+  });
+
+  it('still carries when the current-head reviewer ruling does not count (card naming an unreadable card)', async () => {
+    const h = harness({ failure: 'card', readChangedLines: () => new Set() });
+    const { current } = seedCarry(h, { attempted: true, rule: r => [{ id: 'r1', key: r.referrals[0].key, reviewerId: r.reviewer.id,
+      lens: r.reviewer.lens, result: 'card', card: 'we:backlog/7-filed.md', rationale: 'Checked diff', evidence: ['diff:x'] }] });
+    const state = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toHaveLength(1);
+    expect(state.pending).not.toContain(current.referrals[0].key);
+  });
 
   function seedReferrals(h, seats, head = 'b'.repeat(40), rule = () => []) {
     const referrals = seats.map((seat, i) => {

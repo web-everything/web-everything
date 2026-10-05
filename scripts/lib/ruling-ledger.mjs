@@ -21,7 +21,7 @@
  * PURE. A record is only read from a trusted author (`readReferralRecords` enforces that), and a comment that
  * cannot be read as a record contributes nothing here (the hold itself already fails closed on malformed ones).
  */
-import { readReferralRecords, referralRecordState } from './jury-core.mjs';
+import { readReferralRecords, mandatoryReferralState, parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds, sameFindingForClearing } from './jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { DEFAULT_FIXER_ESCALATION, TEST_FIRST_INSTRUCTION, humanAtMisses } from './fixer-escalation-policy.mjs';
 
@@ -64,12 +64,6 @@ const activeRulings = (record, key) => {
   return mine.filter((r) => !superseded.has(r.id));
 };
 
-/** Referral keys on `record` that still need a ruling at `head` (card rulings are trusted: no fs read here). */
-function pendingKeys(record, head) {
-  const state = referralRecordState(record, { head, cardReadable: () => true });
-  return state.pending.filter((k) => record.referrals.some((f) => f.key === k));
-}
-
 /** Latest snapshot of each record on `head` (a later snapshot may have ruled what an earlier one left open). */
 function currentRecords(snaps, head) {
   const latest = new Map();
@@ -97,9 +91,9 @@ export function rulingNeeded(pr, { humanAt = DEFAULT_HUMAN_AT } = {}) {
     if (at !== null && (since === null || at < since)) since = at;
   }
   if (operatorVerdictAfter(pr?.comments, firstIndex)) return null;
+  const pending = mandatoryReferralState(pr.comments, { head, cardReadable: () => true }).pending;
   const live = new Map();
   for (const { record } of currentRecords(snaps, head)) {
-    const pending = pendingKeys(record, head);
     for (const f of record.referrals) if (pending.includes(f.key) && !live.has(f.key)) live.set(f.key, { ...findingView(f), reason: 'pending' });
   }
   const ig = ignoredRulings(pr, { humanAt });
@@ -125,6 +119,10 @@ export function sameFinding(a, b) {
   if (!a.file || !b.file || normPath(a.file) !== normPath(b.file)) return false;
   return claimSimilarity(a.summary, b.summary) >= SIMILARITY_FLOOR;
 }
+
+/** What `sameFindingForClearing` (jury-core) compares: the exact path, the spot, the claim and the severity of a finding. */
+const clearingView = (f) => ({ file: f.finding?.file, line: f.finding?.line, summary: f.finding?.summary,
+  verdict: f.finding?.verdict, impactIfUnfixed: f.finding?.impactIfUnfixed });
 
 /** The operator's own words for a ruling, one block of text for the fixer. */
 export function rulingText(ruling) {
@@ -190,11 +188,33 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
         if (r.result !== 'block') continue;
         const firstSeen = snaps.find((s) => s.record.head === record.head && s.record.runId === record.runId
           && s.record.rulings.some((x) => x.key === f.key && x.id === r.id));
-        blocks.set(`${record.head}:${record.runId}:${r.id}`, { source: 'record', finding: findingView(f), ruling: rulingText(r), priorHead: record.head, index: firstSeen?.index ?? latestIndex });
+        blocks.set(`${record.head}:${record.runId}:${r.id}`, { source: 'record', finding: findingView(f), clearing: clearingView(f), ruling: rulingText(r), priorHead: record.head, index: firstSeen?.index ?? latestIndex });
       }
     }
   }
   operator.forEach((o, n) => blocks.set(`operator:${n}`, { source: 'operator', hints: o.hints, text: o.text, ruling: o.text, priorHead: null, index: o.index, at: o.at }));
+
+  // The operator's structured (#4979) rulings, with thread position and the finding each one ruled. A block that a
+  // LATER non-block one overruled on the same finding is no longer a standing ruling (plateau-app #202, 2026-10-04:
+  // a reviewer block on the first head, then the operator's not-real on the next head, raised a false "dispute").
+  // The LATEST operator ruling on that finding decides: a later operator `block` withdraws an intervening not-real/card,
+  // so the original block stands again. "Same finding" is `sameFindingForClearing` (exact path, line window, claim and
+  // severity), the one definition the carry uses: a ruling on one instance never overrules a block on another.
+  const allRecords = snaps.map((s) => s.record);
+  const operatorRulings = readOperatorRulings(pr?.comments).rulings;
+  const structured = [];
+  (Array.isArray(pr?.comments) ? pr.comments : []).forEach((c, index) => {
+    const parsed = parseOperatorRulingComment(c);
+    for (const x of parsed?.record?.rulings ?? []) {
+      const ruled = allRecords.find((r) => r.runId === x.runId && r.head === parsed.record.head)?.referrals.find((f) => f.key === x.key);
+      if (ruled) structured.push({ index, result: x.result, clearing: clearingView(ruled) });
+    }
+  });
+  const overruled = (b) => {
+    if (b.source !== 'record') return false;
+    const latest = structured.filter((o) => o.index > b.index && sameFindingForClearing(o.clearing, b.clearing)).at(-1);
+    return !!latest && latest.result !== 'block';
+  };
 
   const matchesBlock = (view, b) => b.source === 'record'
     ? sameFinding(view, b.finding)
@@ -210,6 +230,12 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       const g = findingView(f);
       if (matches.some((m) => m.finding.key === g.key)) continue;
       if (rulingsHere(f.key).some((r) => r.result === 'block')) continue;
+      // Already settled on this head by the operator: any structured ruling of theirs here (block included — they
+      // looked at it), or a not-real/card one carried forward from an earlier head whose operator backing is still in
+      // the thread. A carried `block` settles nothing: the cited lines are unchanged, which is exactly an ignored ruling.
+      if (operatorRulings.some((o) => o.head === head && o.runId === record.runId && o.key === f.key)
+        || (record.carried ?? []).some((c) => c.key === f.key && c.result !== 'block'
+          && carriedBackingHolds(c, { repo: record.repo, pr: record.pr, operatorRulings }))) continue;
       // The standing ruling is the LATEST matching block: a fresh re-ruling restarts the count, so the ladder gives
       // the fixer the rungs that re-ruling bought instead of counting heads from the first ruling.
       let b = null;
@@ -217,6 +243,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
         if (c.index > firstIndex) continue; // written after this head's record: a fresh ruling on it
         if (!matchesBlock(g, c)) continue;
         if (c.source === 'record' && rulingsHere(f.key).length) continue;
+        if (overruled(c)) continue;
         if (!b || c.index > b.index) b = c;
       }
       if (!b) continue;
