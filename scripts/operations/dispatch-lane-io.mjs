@@ -1,4 +1,3 @@
-import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { observeHealAttempt } from './probation-heal-run.mjs';
 import { dispatchProviderAvailable } from '../lib/dispatch-provider-availability.mjs';
 import { claudeSpawnAlias, resolvePolicyEffort } from '../lib/dispatch-routing-policy.mjs';
@@ -53,6 +52,7 @@ import { readGitAlreadyDone } from '../lib/git-already-done.mjs';
 
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { execFileSync } from 'node:child_process';
+import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 // #4415 (round 2) — live incident 2026-09-29: `defaultCheckAlreadyDone`/`defaultCheckAlreadyDoneAsync`/
 // `defaultListPrs` below all defaulted to a bare, unattributed `execFileSync`/`execFile` — never
 // `execFileSyncThrottled` — exactly the same defect this card's first round fixed in `lease-reaper.mjs` and
