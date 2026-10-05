@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
-import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
+import { mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
+import { referralCardReadable } from '../../lib/referral-card-readable.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { runReconcilePass } from '../reconcile-pass.mjs';
 import { countFindings } from '../reconcile-core.mjs';
@@ -45,7 +46,9 @@ function run({ id = 'review-pr-parked', time = at, failure = false, attempted = 
   r.pending = { kind: 'confirm', step: 'confirm', stepIndex: 9, of: 'human', asks: 'Ruling?', options: ['abstain'] };
   return r;
 }
+// `body` / `createdAt` are what `gh pr list` returns; the live release reads them exactly as the gate does.
 const pr = (overrides = {}) => ({ number: 3481, headRefOid: head, headRefName: 'lane/referrals',
+  body: '<!-- authored-by-actor: author -->', createdAt: iso(at - 3_600_000),
   labels: [{ name: 'review:human' }], comments: [], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...overrides });
 const evidence = opts => reviewRunEvidence(run(opts));
@@ -138,6 +141,66 @@ describe('attempted mandatory referrals', () => {
   it('an edited operator answer and an answer during the panel both wake it', () => {
     expect(hold(pr({ comments: [{ ...comment('answer', at - 120_000, 'chalbert'), updatedAt: iso(at + 1) }] }))).toBeNull();
     expect(hold(pr({ comments: [comment('answer', at - 30_000, 'chalbert')] }))).toBeNull();
+  });
+});
+
+// The live release must agree with the gate that would re-park the PR: every branch of "released" has a negative twin.
+describe('live release (parity with the gate)', () => {
+  const card = readdirSync('backlog').find(n => /^\d+-.+\.md$/.test(n));
+  const ruled = (result, extra = {}, base = record()) => ({ ...base, rulings: [{ id: 'r1', key, reviewerId: base.reviewer.id,
+    lens: base.reviewer.lens, result, rationale: 'confirmed', evidence: ['diff'], ...extra }] });
+  const withRecord = (r, overrides = {}) => pr({ comments: [comment(renderReferralRecord(r), at - 120_000)], ...overrides });
+
+  it.each([
+    ['a reviewer block ruling on the current head', ruled('block')],
+    ['a card ruling citing a readable backlog card', ruled('card', { card: `we:backlog/${card}` })],
+  ])('releases on %s', (_name, r) => {
+    expect(hold(withRecord(r))).toBeNull();
+  });
+
+  it.each([
+    ['no record on the current head', () => pr()],
+    ['a record only on another head', () => withRecord(ruled('block', {}, { ...record(), head: 'b'.repeat(40) }))],
+    ['a record for another PR', () => withRecord(ruled('block', {}, { ...record(), pr: 9999 }))],
+    ['a card ruling citing an unreadable card (the gate re-parks it)', () => withRecord(ruled('card', { card: 'we:backlog/no-such-card.md' }))],
+    ['a missing author stamp under the default refuse policy', () => withRecord(ruled('block'), { body: '', createdAt: iso(at) })],
+  ])('keeps holding on %s', (_name, build) => {
+    expect(hold(build())).not.toBeNull();
+  });
+
+  it('keeps holding on a missing author stamp under WE_REFERRAL_MISSING_STAMP=refuse', () => {
+    vi.stubEnv('WE_REFERRAL_MISSING_STAMP', 'refuse');
+    expect(hold(withRecord(ruled('block'), { body: '', createdAt: iso(at) }))).not.toBeNull();
+  });
+
+  it('agrees with the gate on the very same comments', () => {
+    for (const r of [ruled('block'), ruled('card', { card: 'we:backlog/no-such-card.md' }), ruled('card', { card: `we:backlog/${card}` })]) {
+      const p = withRecord(r);
+      const gate = mandatoryReferralState(p.comments, { repo, pr: 3481, head, body: p.body, createdAt: p.createdAt,
+        cardReadable: referralCardReadable });
+      expect(hold(p) === null).toBe(gate.pending.length === 0);
+    }
+  });
+
+  // The hold omits the gate's `seatDisabled` (the header of referral-live-context.mjs says that only ever errs toward
+  // holding). Pin it: a seat-disabled retirement the gate honours never lets the hold release what the gate holds.
+  it('never releases what the gate holds, even when only the gate retires a disabled seat', () => {
+    const p = withRecord(record());
+    const gate = seatDisabled => mandatoryReferralState(p.comments, { repo, pr: 3481, head, body: p.body,
+      createdAt: p.createdAt, cardReadable: referralCardReadable, ...(seatDisabled ? { seatDisabled } : {}) });
+    expect(gate().pending).toEqual([key]);
+    expect(hold(p)).not.toBeNull();
+    // The gate alone retires the unruled finding; the hold keeps it pending (the documented over-hold, never an under-hold).
+    expect(gate(seat => seat === 'judge').pending).toEqual([]);
+    expect(hold(p)).not.toBeNull();
+  });
+
+  // Each conjunct of the live-release condition has a negative twin: a cleared gate alone does not release a hold
+  // that is inside its persistence-failure retry budget.
+  it('keeps the 15/30/60-minute retry budget when the run failed to persist, even with a cleared live gate', () => {
+    const cleared = withRecord(ruled('block'));
+    expect(hold(cleared)).toBeNull();
+    expect(hold(cleared, [evidence({ failure: true })])).toMatchObject({ persistenceFailed: true, retryAt: at + REFERRAL_RETRY_MS[0] });
   });
 });
 
