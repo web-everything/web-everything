@@ -60,6 +60,7 @@ import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
+import { readVerifyMarker } from '../../scripts/lib/lane-verify.mjs';
 import { runVerifyDispatch } from '../../scripts/conveyor/verify-dispatch.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel and from the Fix-dispatch
@@ -239,12 +240,58 @@ export function startIndependentHeartbeat({
   };
 }
 
+// #verify-inflight-reconcile — only ESRCH proves the process is gone.
+export function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error.code !== 'ESRCH'; }
+}
+
+// #verify-inflight-reconcile — resolve worktree git dirs just as verify-dispatch does.
+function requeueOrphan(dir, entry) {
+  let gitDir;
+  try {
+    gitDir = execFileSync('git', ['rev-parse', '--absolute-git-dir'], {
+      cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000,
+      killSignal: 'SIGKILL',
+    }).trim();
+  } catch { gitDir = join(dir, '.git'); }
+  const marker = readVerifyMarker(gitDir);
+  if (marker?.status !== 'running' || (marker.runId && marker.runId !== entry.runId)) return;
+  // #verify-inflight-reconcile — laneNeedsVerifyDispatch accepts fresh running markers;
+  // deleting the Map entry requeues this request without changing its identity or SHA.
+}
+
+// #verify-inflight-reconcile — child exit can precede stdio close indefinitely.
+export function reconcileInFlight(inFlight, {
+  isAlive = pidAlive, nowMs = Date.now(), spawnGraceMs = 120_000,
+  killGroup = (group) => process.kill(group, 'SIGKILL'),
+  requeue = requeueOrphan, log = console.error,
+} = {}) {
+  const orphaned = [];
+  for (const [dir, entry] of inFlight) {
+    const { pool, lane, runId, pid, startedMs } = entry;
+    const reason = pid > 0
+      ? (!isAlive(pid) ? 'pid-gone' : null)
+      : ((pid == null || pid === 0) && nowMs - startedMs > spawnGraceMs ? 'never-spawned' : null);
+    if (!reason) continue;
+    try { if (pid > 0) killGroup(-pid); } catch {}
+    inFlight.delete(dir);
+    try { requeue(dir, entry); }
+    catch (error) { log(`verify-daemon: ${pool}/lane-${lane} orphan requeue failed (non-fatal): ${String(error?.message || error).split('\n')[0]}`); }
+    log(`verify-daemon: ${pool}/lane-${lane} in-flight run ${String(runId).slice(0, 8)} orphaned (pid ${pid} gone) — dropped and re-queued`);
+    orphaned.push({ pool, lane, runId, pid, reason });
+  }
+  return { orphaned };
+}
+
 /** Build the real effects for {@link runDaemonLoop}: a real tick of {@link runVerifyTick} (which itself calls
  *  the real `runVerifyDispatch`), a real interval sleep, and the `isAlive` sampler backed by `main()`'s own
  *  {@link startIndependentHeartbeat} timer (#4130 — no longer built in here, since the heartbeat must run on
  *  its own clock, independent of this factory's caller). Kept as its own factory (mirroring
  *  `buildCliDaemonEffects` in the sibling daemons) so `main()` stays a thin wire-up. */
-export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAlive = () => true, log = console, runVerify = runVerifyDispatch, isDraining = defaultIsDraining } = {}) {
+export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAlive = () => true, log = console, runVerify = runVerifyDispatch, isDraining = defaultIsDraining,
+  processIsAlive = pidAlive, killGroup, requeue, now = Date.now, spawnGraceMs = 120_000,
+} = {}) {
   const inFlight = new Map();
   // `awaitSettle:false` returns before any gate settles, so `result.failures` is always empty here: failures
   // arrive later through `onSettled`, are logged as they land, and the next tick summary counts them.
@@ -256,14 +303,22 @@ export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAliv
   return {
     inFlight,
     intervalMs,
-    tickOnce: () => (isDraining()
-      ? { dispatched: [], deferred: [], failures: [], draining: true }
-      : runVerifyTick({ runVerify, inFlight, awaitSettle: false, onSettled })),
+    tickOnce: async () => {
+      // #verify-inflight-reconcile — drain and restart must also release orphaned runs.
+      const { orphaned } = reconcileInFlight(inFlight, {
+        isAlive: processIsAlive, nowMs: now(), spawnGraceMs, killGroup, requeue,
+        log: (message) => log.error(message),
+      });
+      const result = isDraining()
+        ? { dispatched: [], deferred: [], failures: [], draining: true }
+        : await runVerifyTick({ runVerify, inFlight, awaitSettle: false, onSettled });
+      return { ...result, orphaned };
+    },
     sleep: realSleep,
     isAlive,
     onTick: (result) => {
-      const { dispatched = [], deferred = [], draining = false } = result || {};
-      log.error(`verify-daemon: tick — dispatched ${dispatched.length}, in flight ${inFlight.size}${draining ? ' (draining)' : ''}, deferred ${deferred.length}, failed ${settledFailures}`);
+      const { dispatched = [], deferred = [], draining = false, orphaned = [] } = result || {};
+      log.error(`verify-daemon: tick — dispatched ${dispatched.length}, in flight ${inFlight.size}${draining ? ' (draining)' : ''}, deferred ${deferred.length}, failed ${settledFailures}${orphaned.length ? `, orphaned ${orphaned.length}` : ''}`);
       settledFailures = 0;
     },
     onTickError: (error) => {
