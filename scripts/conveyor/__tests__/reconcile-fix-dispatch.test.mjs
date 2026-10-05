@@ -1372,6 +1372,14 @@ describe('runReconcileFixDispatch — item-less PRs (#xmtbdgs multi-repo slice 6
 
 describe('filterFixesByInFlightScope (#4295)', () => {
   const fx = (pr, scope, itemNum = null) => ({ pr, itemNum, scope });
+  it('ranks urgent PRs first and admits them past live scope claims', () => {
+    const queue = [fx(1, ['we:a/x']), fx(2, ['we:b/y']), fx(3, ['we:a/x'])];
+    const claims = [{ meta: { pr: 9, scope: ['we:a/'] } }];
+    const result = filterFixesByInFlightScope(queue, [], claims, { urgentPrs: new Set([3]) });
+    expect(result.planned.map((p) => p.pr)).toEqual([3, 2]);
+    expect(result.refusals).toEqual([expect.objectContaining({ pr: 1, kind: 'scope-overlap' })]);
+    expect(result.ranks[0]).toMatchObject({ pr: 3, rank: 1, urgent: true });
+  });
   it('refuses a fix overlapping a live build claim as scope-overlap', () => {
     const r = filterFixesByInFlightScope([fx(1, ['we:scripts/conveyor/x.mjs'])], [{ meta: { num: '9', scope: ['we:scripts/conveyor/'] } }], []);
     expect(r.planned).toEqual([]);

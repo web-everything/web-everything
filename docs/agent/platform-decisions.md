@@ -5700,7 +5700,11 @@ clauses:
      before the live clone moves.
    - (b) **An overlay drops automatically once `main` has it**: `git cherry` against `origin/main` shows only
      `-` lines, or the overlay's PR is merged or closed. With no overlays left, the daemon is plain `main`.
-   - (c) **An overlay that no longer merges cleanly is dropped with an alert**, never frozen at an old head.
+   - (c) **An overlay that no longer merges cleanly first tries a current reviewed edge ref, then mechanical
+     replay in the object database** (operator amendment, 2026-10-05). The merge keeps the PR head as its
+     second parent and still passes the live smoke before adoption. Unresolved conflicts retain the pinned
+     refusal/skip rules and otherwise drop for the pass with an alert; a six-hour wake prioritizes the PR's
+     fixer past scope overlap. `WE_DAEMON_OVERLAY_EDGE_RESOLVE=0` restores plain merge/drop behavior.
    - (d) **Rollback = remove the overlay.** The trigger lives outside the daemon (new code may crash at
      import): a crash loop or a stalled heartbeat after an overlay change removes that overlay and alerts.
    - (e) **Scope: every daemon may run overlays, the review daemon included** — the operator's explicit choice

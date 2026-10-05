@@ -23,10 +23,12 @@ import {
   isClaimStampOnlyEdit, restoreStrayClaimStamps,
   planRebuild, findUnsafeLocalState, rebuildClone, dryRunRebuild, readRebuildState, rebuildStatePath,
   isDaemonManagedClone, daemonConveyorStateRoot, materializeCandidate, removeCandidate, previewOverlayConflict,
+  readyBuildVerified, resolveOverlayConflict, OVERLAY_EDGE_RESOLVE_ENV,
 } from '../daemon-rebuild.mjs';
-import { addOverlay, readOverlays, overlayFilePath } from '../daemon-overlays.mjs';
+import { addOverlay, removeOverlay, readOverlays, overlayFilePath } from '../daemon-overlays.mjs';
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { gitRun } from '../main-staleness.mjs';
+import { readOverlayConflictWakes, markOverlayConflictWake } from '../overlay-conflict-wake.mjs';
 
 const tempDirs = [];
 
@@ -119,6 +121,133 @@ function makeFixture() {
 function passSmoke() {
   return vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
 }
+
+function conflictFixture({ replay = false } = {}) {
+  const f = makeFixture();
+  const a = pushBranch(f.originDir, 'lane/a', (dir) => writeFile(dir, 'README.md', 'A\n'));
+  let b = pushBranch(f.originDir, 'lane/b', (dir) => writeFile(dir, 'README.md', replay ? 'A\n' : 'B\n'));
+  if (replay) b = pushBranch(f.originDir, 'lane/b', (dir) => {
+    writeFile(dir, 'README.md', 'B\n');
+    writeFile(dir, 'extra.txt', 'extra\n');
+  }, { base: 'origin/lane/b' });
+  gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
+  const runGit = (args, opts = {}) => gitRun(args, { cwd: f.cloneDir, env: { ...f.env, ...opts.env } });
+  const main = gitOk(f.cloneDir, ['rev-parse', 'origin/main']).trim();
+  const overlays = [{ ref: 'lane/a', pr: 1 }, { ref: 'lane/b', pr: 2 }];
+  return { ...f, a, b, runGit, main, overlays };
+}
+
+describe('overlay conflict resolution', () => {
+  const plan = (f, options = {}) => planRebuild({
+    git: f.runGit, headSha: f.main, mainRef: 'origin/main', overlays: f.overlays, ...options,
+  });
+
+  it('replays a conflicting overlay deterministically and verifies the ready build', async () => {
+    const f = conflictFixture({ replay: true });
+    const result = await plan(f);
+    expect(result.decisions[1]).toMatchObject({ action: 'apply', reason: 'applied-replay', sha: f.b });
+    expect(result.applied[1]).toMatchObject({ sha: f.b, resolvedVia: 'replay' });
+    expect(result.alerts).toContainEqual({ kind: 'overlay-conflict-resolved', detail: { ref: 'lane/b', pr: 2, via: 'replay' } });
+    expect(gitOk(f.cloneDir, ['show', `${result.finalSha}:README.md`])).toBe('B\n');
+    expect(gitOk(f.cloneDir, ['show', `${result.finalSha}:extra.txt`])).toBe('extra\n');
+    expect(gitOk(f.cloneDir, ['log', '-1', '--format=%B', result.finalSha])).toContain('(resolved via replay)');
+    expect((await plan(f)).finalSha).toBe(result.finalSha);
+    expect(readyBuildVerified({ git: f.runGit, adopt: result, mainTip: f.main, prevHead: f.main })).toBe(true);
+    const plain = { ...result, applied: result.applied.map(({ resolvedVia, ...a }) => a) };
+    expect(readyBuildVerified({ git: f.runGit, adopt: plain, mainTip: f.main, prevHead: f.main })).toBe(false);
+  });
+
+  it('uses a reviewed edge containing the current head and keeps the PR parent', async () => {
+    const f = conflictFixture();
+    const edgeSha = pushBranch(f.originDir, 'edge/lane/b', (dir) => {
+      writeFile(dir, 'README.md', 'A\n');
+      writeFile(dir, 'reviewed.txt', 'resolution\n');
+    }, { base: 'origin/lane/b' });
+    gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
+    const result = await plan(f);
+    expect(result.decisions[1]).toMatchObject({ action: 'apply', reason: 'applied-edge-ref', sha: f.b });
+    expect(result.applied[1]).toMatchObject({ resolvedVia: 'edge-ref', edgeSha });
+    expect(gitOk(f.cloneDir, ['rev-parse', `${result.finalSha}^2`]).trim()).toBe(f.b);
+    expect(result.alerts).toContainEqual({ kind: 'overlay-conflict-resolved', detail: { ref: 'lane/b', pr: 2, via: 'edge-ref', edgeSha } });
+  });
+
+  it('ignores an edge for an older head and reports the unresolved files', async () => {
+    const f = conflictFixture();
+    gitOk(f.cloneDir, ['update-ref', 'refs/remotes/origin/edge/lane/b', f.main]);
+    const result = await plan(f);
+    expect(result.decisions[1]).toMatchObject({ action: 'drop', reason: 'conflict', files: ['README.md'] });
+    expect(result.alerts).toContainEqual({
+      kind: 'overlay-conflict-unresolved',
+      detail: { ref: 'lane/b', pr: 2, sha: f.b, files: ['README.md'], tried: ['edge-ref', 'replay'] },
+    });
+  });
+
+  it('preserves the old conflict behavior when resolution is disabled', async () => {
+    const f = conflictFixture({ replay: true });
+    const result = await plan(f, { edgeResolve: false });
+    expect(result.decisions[1]).toEqual({ ref: 'lane/b', pr: 2, action: 'drop', reason: 'conflict', sha: f.b });
+    expect(result.alerts).toEqual([]);
+  });
+
+  it('falls through git exceptions and reports failures without throwing', () => {
+    const f = conflictFixture({ replay: true });
+    const cur = f.a;
+    const brokenEdge = (args, opts) => {
+      if (args.some((arg) => arg.includes('origin/edge/'))) throw new Error('edge unavailable');
+      return f.runGit(args, opts);
+    };
+    expect(resolveOverlayConflict({ git: brokenEdge, cur, ovSha: f.b, ref: 'lane/b' })).toMatchObject({ ok: true, via: 'replay' });
+    const brokenCommit = (args, opts) => args[0] === 'commit-tree' ? { status: 128 } : brokenEdge(args, opts);
+    expect(resolveOverlayConflict({ git: brokenCommit, cur, ovSha: f.b, ref: 'lane/b' })).toEqual({ ok: false, files: ['README.md'], tried: ['replay'] });
+    expect(resolveOverlayConflict({ git: () => { throw new Error('git failed'); }, cur, ovSha: f.b, ref: 'lane/b' }))
+      .toEqual({ ok: false, files: [], tried: ['replay'] });
+  });
+
+  it('fetches edges once, removes stale edges and wakes then clears the conflicting PR', async () => {
+    const f = conflictFixture();
+    for (const o of f.overlays) addOverlay(f.cloneDir, o, { env: f.env });
+    gitOk(f.cloneDir, ['update-ref', 'refs/remotes/origin/edge/lane/b', f.a]);
+    const run = vi.fn(gitRun);
+    const runSmoke = passSmoke();
+    const rebuild = () => rebuildClone({ root: f.cloneDir, env: f.env, run, runSmoke, prState: () => null, lockOpts: LOCK_OPTS });
+    const first = await rebuild();
+    expect(first.plan.decisions[1].reason).toBe('conflict');
+    expect(git(f.cloneDir, ['rev-parse', '--verify', 'refs/remotes/origin/edge/lane/b']).status).not.toBe(0);
+    expect(run.mock.calls.filter(([args]) => args[0] === 'ls-remote')).toHaveLength(1);
+    expect(readOverlayConflictWakes(f.env).get(2)).toMatchObject({ pr: 2, ref: 'lane/b', files: ['README.md'], clone: f.cloneDir });
+    const edgeSha = pushBranch(f.originDir, 'edge/lane/b', (dir) => {
+      writeFile(dir, 'README.md', 'A\n');
+      writeFile(dir, 'reviewed.txt', 'resolution\n');
+    }, { base: 'origin/lane/b' });
+    run.mockClear();
+    const second = await rebuild();
+    expect(second.adopted).toBe(true);
+    expect(second.plan.applied[1]).toMatchObject({ resolvedVia: 'edge-ref', edgeSha });
+    expect(runSmoke).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls.filter(([args]) => args[0] === 'ls-remote')).toHaveLength(1);
+    expect(run.mock.calls.filter(([args]) => args[0] === 'fetch' && args.some((a) => a.startsWith('+refs/heads/edge/')))).toHaveLength(1);
+    expect(readOverlayConflictWakes(f.env).has(2)).toBe(false);
+    markOverlayConflictWake(f.env, { pr: 2, ref: 'lane/b', files: ['README.md'], clone: f.cloneDir,
+      at: new Date(Date.now() - 7 * 3600_000).toISOString() });
+    removeOverlay(f.cloneDir, 'lane/b', { env: f.env });
+    await rebuild();
+    expect(readOverlayConflictWakes(f.env, { maxAgeMs: Infinity }).has(2)).toBe(false);
+  });
+
+  it('honors the disable env in rebuilds and previews without fetching edges', async () => {
+    const f = conflictFixture({ replay: true });
+    f.env[OVERLAY_EDGE_RESOLVE_ENV] = '0';
+    for (const o of f.overlays) addOverlay(f.cloneDir, o, { env: f.env });
+    const run = vi.fn(gitRun);
+    const preview = await dryRunRebuild({ root: f.cloneDir, env: f.env, run, prState: () => null });
+    expect(preview.plan.decisions[1].reason).toBe('conflict');
+    const result = await rebuildClone({ root: f.cloneDir, env: f.env, run, runSmoke: passSmoke(), prState: () => null, lockOpts: LOCK_OPTS });
+    expect(result.plan.decisions[1].reason).toBe('conflict');
+    expect(result.plan.alerts).toEqual([]);
+    expect(run.mock.calls.some(([args]) => args[0] === 'ls-remote')).toBe(false);
+    expect(readOverlayConflictWakes(f.env).size).toBe(0);
+  });
+});
 
 // x5wbsbc — a smoke that fails ONLY the candidate carrying `file` (the bad change) and passes every other tree,
 // in particular the last-good control the rebuild now smokes before calling a failure a code regression (a stub

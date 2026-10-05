@@ -124,6 +124,7 @@ import {
 } from './queue-cap-refusal-count.mjs';
 // build-path-codex-isolation — the ONE shared bg-isolation helper every dispatch path calls.
 import { isolateDispatchSession } from '../lib/dispatch-bg-isolation.mjs';
+import { readOverlayConflictWakes } from '../lib/overlay-conflict-wake.mjs';
 
 /** The template `we:skills-src/conveyor/fix-agent-brief.md` — the SAME brief `dispatch-lane.mjs`'s own
  *  tick-core-driven fix dispatch fills, read fresh per dispatch so an edit takes effect with no restart. */
@@ -1237,8 +1238,10 @@ export function runReconcileFixDispatch({
     return scope ? { ...claim, meta: { ...claim.meta, scope } } : claim;
   });
   // Serialize against live claims and higher-ranked waiters, including blocked ones.
+  let urgentPrs = new Set();
+  try { urgentPrs = new Set(readOverlayConflictWakes(process.env).keys()); } catch { /* best-effort wake */ }
   const scopeFilter = filterFixesByInFlightScope(
-    plannedAll, listBuildClaims(), claims,
+    plannedAll, listBuildClaims(), claims, { urgentPrs },
   );
   const planned = scopeFilter.planned;
   const refusals = [...ciHealRefusals, ...planRefusals, ...scopeFilter.refusals];
@@ -1625,7 +1628,7 @@ export function resolveScopeOverlapMaxWaitMinutes(env = process.env) {
 }
 
 export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims = [], {
-  now = Date.now(), maxWaitMinutes = resolveScopeOverlapMaxWaitMinutes(),
+  now = Date.now(), maxWaitMinutes = resolveScopeOverlapMaxWaitMinutes(), urgentPrs = new Set(),
 } = {}) {
   const accepted = [];
   const refusals = [];
@@ -1641,12 +1644,14 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     const blocks = new Set(planned.filter((other) => other.pr !== entry.pr
       && overlapsInFlight(scopeFor(other), [{ scope: scopeFor(entry) }])).map((other) => other.pr)).size;
     const ageHours = Math.max(0, Math.floor((now - waitingTime(entry)) / 3_600_000));
-    return { pr: entry.pr, blocks, ageHours, score: blocks + ageHours, aged: ageHours >= 24 };
+    return { pr: entry.pr, blocks, ageHours, score: blocks + ageHours, aged: ageHours >= 24,
+      ...(urgentPrs.has(entry.pr) ? { urgent: true } : {}) };
   });
   const rankByPr = new Map(ranks.map((rank) => [rank.pr, rank]));
   const queue = [...planned].sort((a, b) => {
     const ar = rankByPr.get(a.pr), br = rankByPr.get(b.pr);
-    return Number(br.aged) - Number(ar.aged)
+    return Number(Boolean(br.urgent)) - Number(Boolean(ar.urgent))
+      || Number(br.aged) - Number(ar.aged)
       || (!ar.aged ? br.score - ar.score : 0)
       || waitingTime(a) - waitingTime(b)
       || Number(Boolean(b.reviewHuman)) - Number(Boolean(a.reviewHuman)) || a.pr - b.pr;
@@ -1663,7 +1668,7 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
         .map((c) => ({ id: `fix PR #${c.meta?.pr}`, scope: c.meta?.scope })),
       ...picked,
     ];
-    let blockers = inFlight.filter((c) => overlapsInFlight(scopeFor(entry), [c]));
+    let blockers = urgentPrs.has(entry.pr) ? [] : inFlight.filter((c) => overlapsInFlight(scopeFor(entry), [c]));
     // #3881 — aging override: past the bound, only a fix ACCEPTED earlier in this same pass still blocks.
     const waitedMinutes = Math.floor((now - waitingTime(entry)) / 60_000);
     const agedOut = maxWaitMinutes != null && blockers.length > 0 && waitedMinutes >= maxWaitMinutes;
