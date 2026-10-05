@@ -2466,37 +2466,72 @@ export function rawHeavyCommandReason(segment, { primaryCwd = false } = {}) {
   return null;
 }
 
+const VITEST_WORD = /^vitest(?:@\S*)?$/;
+const NODE_SCRIPT_WORD = /\.(?:[cm]?js|ts)$/;
+const NODE_SCRIPT_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loader', '--experimental-loader']);
+
+/** How many leading words of a canonical head are exec wrappers `canonicalCommand` does not peel
+ *  (`timeout [opts] <duration>`, and the `-n <N>` it leaves behind after peeling `nice`)? `nohup` is left
+ *  alone on purpose: the background-run guard owns it, and a queued replacement keeping it would be denied there. */
+function execWrapperWords(w) {
+  if (w[0] === 'timeout') {
+    let i = 1;
+    while (w[i]?.startsWith('-')) i += /^(?:-s|-k|--signal|--kill-after)$/.test(w[i]) ? 2 : 1;
+    return i + 1; // the duration
+  }
+  if (w[0] === '-n' && /^-?\d+$/.test(w[1] || '')) return 2;
+  if (/^(?:-\d+|--adjustment=-?\d+)$/.test(w[0] || '')) return 1;
+  return 0;
+}
+
 /** Classify only the executable head, never a tool name mentioned in an argument. */
 function ungatedHeavyHead(head, depth = 0) {
   if (depth > 8) return null;
   const words = headWords(head);
   const w = words.map((word) => word.text);
-  if (w[0] === 'vitest') {
+  const wrapped = execWrapperWords(w);
+  if (wrapped && words[wrapped]) return ungatedHeavyHead(canonicalCommand(head.slice(words[wrapped].start)), depth + 1);
+  if (VITEST_WORD.test(w[0] || '')) {
     // `related` selects tests, but still starts workers; --changed does too.
     if (VITEST_NON_RUN_SUBCOMMANDS.has(w[1]) && w[1] !== 'related') return null;
     if (w.slice(1).some((arg) => /^(?:--version|-v|--help|-h)$/.test(arg))) return null;
-    return { kind: 'vitest' };
+    return { kind: 'vitest', watch: w[1] === 'watch' || w[1] === 'dev' };
   }
   if (w[0] === 'node') {
     // Only the script position is executable. --check/-c and eval arguments are not scripts.
     let i = 1;
     while (w[i]?.startsWith('-') && w[i] !== '--') {
       if (/^(?:--check|-c|--eval|-e|--print|-p)(?:=|$)/.test(w[i])) return null;
-      if (['--require', '-r', '--import', '--loader', '--experimental-loader'].includes(w[i])) i += 1;
+      const flag = w[i];
       i += 1;
+      if (NODE_SCRIPT_VALUE_FLAGS.has(flag)) i += 1;
+      // a separate option value (`--title standards`, `--env-file .env`, `--max-old-space-size 4096`) is not the script
+      else if (!flag.includes('=') && w[i] && !w[i].startsWith('-') && !NODE_SCRIPT_WORD.test(w[i])) i += 1;
     }
     if (w[i] === '--') i += 1;
     if (/(?:^|\/)check-standards\.mjs$/.test(w[i] || '')) {
       return { kind: 'standards', tail: head.slice(words[i].end).trim() };
     }
+    if (/(?:^|\/)node_modules\/vitest\/vitest\.mjs$/.test(w[i] || '')) {
+      return ungatedHeavyHead('vitest' + head.slice(words[i].end), depth + 1);
+    }
     return null; // Includes heavy-admission: its child is an argument, not the executable.
   }
   const inv = runnerInvocation(head);
   if (inv?.exec) return ungatedHeavyHead(canonicalCommand(inv.exec), depth + 1);
-  const name = w[0] === 'npm' && ['test', 't', 'tst'].includes(w[1])
-    ? w[1] : inv?.names?.length === 1 ? inv.names[0] : null;
-  if (!['test', 't', 'tst'].includes(name)) return null;
-  const i = w.indexOf(name, 1);
+  // pnpm/yarn/bun resolve a bare `vitest` script name to the vitest bin (npm does not).
+  if (w[0] !== 'npm' && inv?.names?.length === 1 && VITEST_WORD.test(inv.names[0])) {
+    return ungatedHeavyHead('vitest' + head.slice(words[w.indexOf(inv.names[0], 1)].end), depth + 1);
+  }
+  let at = -1;
+  if (w[0] === 'npm') { // runner flags may precede the subcommand: `npm -s test`, `npm --prefix . test`
+    let j = 1;
+    while (w[j]?.startsWith('-')) j += !w[j].includes('=') && RUNNER_VALUE_FLAGS.has(w[j]) ? 2 : 1;
+    if (['test', 't', 'tst'].includes(w[j])) at = j;
+  }
+  if (at < 0 && inv?.names?.length === 1) at = w.indexOf(inv.names[0], 1);
+  if (at < 0 || !['test', 't', 'tst'].includes(w[at])) return null;
+  const i = at;
   const forwarded = head.slice(words[i].end).trim().replace(/^--(?:\s+|$)/, '');
   // A forwarded vitest subcommand (`related`, `list`, `bench`, ...) has no `test:unit` equivalent: after
   // `vitest run` it would degrade to a filename filter (`related a.mjs --passWithNoTests` silently runs nothing).
@@ -2510,6 +2545,11 @@ export function ungatedHeavyRunReason(segment) {
   const s = String(segment || '').trim();
   const run = ungatedHeavyHead(canonicalCommand(s));
   if (!run) return null;
+  // A whole-suite `npm test` spelling the full-suite arm does not recognise (`npm -s test`, `timeout 5 npm test`):
+  // its only queued form is `npm run test:unit`, which that arm denies. Give its message, not a deny loop.
+  if (run.kind === 'test' && !run.subcommand && !run.tail && !hasLeadingEnvEscape(s, FULL_SUITE_ESCAPE_ENV)) {
+    return FULL_SUITE_DENY_MESSAGE;
+  }
   // Keep assignment spelling/quoting intact, placing it before node so it remains shell syntax. A leading
   // `WE_FULL_SUITE_OK=1` is kept too: the queued full-suite form still needs it to pass the xpnhz4o arm.
   const words = headWords(s);
@@ -2524,10 +2564,12 @@ export function ungatedHeavyRunReason(segment) {
   const replacement = run.kind === 'test'
     ? run.subcommand
       ? 'node scripts/readiness/heavy-admission.mjs run -- npx vitest ' + run.tail
-      : 'npm run test:unit -- ' + (run.tail || '<test-file>')
+      : 'npm run test:unit' + (run.tail ? ' -- ' + run.tail : '')
     : run.kind === 'standards'
       ? 'npm run check:standards' + (run.tail ? ' -- ' + run.tail : '')
-      : 'node scripts/readiness/heavy-admission.mjs run -- ' + command;
+      // a watch/dev process would hold one of the host's 2 admission slots until killed, so queue `run` instead
+      : 'node scripts/readiness/heavy-admission.mjs run -- '
+        + (run.watch ? command.replace(/(\bvitest\S*\s+)(?:watch|dev)\b/, '$1run') : command);
   return `heavy-enforce: each direct run spawns ~6–11 workers outside the host cap of 2 queued heavy runs; load hit 25–48 on a 12-core host. There is no admission override. Use: \`${env}${replacement}\`.`;
 }
 
@@ -2613,9 +2655,12 @@ export function fullSuiteRunReason(segment) {
   const stripped = s.replace(/^(?:\w+=\S*\s+)*/, '');
   const canon = canonicalCommand(s);
   if (!isFullSuiteHead(stripped) && !isFullSuiteHead(canon)) return null;
-  const admission = ungatedHeavyRunReason(s);
-  return 'a bare FULL-SUITE unit run (`npm run test:unit` / `npm test` / `vitest` or `vitest run` with no file target, raw or through heavy-admission.mjs) is not allowed from an agent session (xpnhz4o). It takes 10+ minutes; several at once starved the host on 2026-09-25; CI already runs the full suite on every PR as the backstop. Run the diff-selected gate instead: `node scripts/verify-lane.mjs run` — only the tests your diff reaches, plus a scoped check:standards; it falls back to the full suite BY ITSELF, and says so, when a config / setup / dependency / shared-test-helper file changed (use plain `node scripts/verify-lane.mjs` to also record the landing marker). For one or two files: `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`. Escape, only when you truly need the whole suite here (logged): prefix the command with `WE_FULL_SUITE_OK=1`.' + (admission ? ' ' + admission : '');
+  // No heavy-enforce replacement is appended: for a bare (no file target) run it would be this arm's own deny
+  // again, or a literal `<test-file>` placeholder. The message already names the runnable alternatives.
+  return FULL_SUITE_DENY_MESSAGE;
 }
+
+const FULL_SUITE_DENY_MESSAGE = 'a bare FULL-SUITE unit run (`npm run test:unit` / `npm test` / `vitest` or `vitest run` with no file target, raw or through heavy-admission.mjs) is not allowed from an agent session (xpnhz4o). It takes 10+ minutes; several at once starved the host on 2026-09-25; CI already runs the full suite on every PR as the backstop. Run the diff-selected gate instead: `node scripts/verify-lane.mjs run` — only the tests your diff reaches, plus a scoped check:standards; it falls back to the full suite BY ITSELF, and says so, when a config / setup / dependency / shared-test-helper file changed (use plain `node scripts/verify-lane.mjs` to also record the landing marker). For one or two files: `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`. Escape, only when you truly need the whole suite here (logged): prefix the command with `WE_FULL_SUITE_OK=1`.';
 
 /** The leading-assignment escape for {@link fullSuiteRunReason}. */
 export const FULL_SUITE_ESCAPE_ENV = 'WE_FULL_SUITE_OK';

@@ -26,6 +26,18 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     'node scripts/check-standards.mjs', 'node ../check-standards.mjs --local',
     'node /tmp/lane/scripts/check-standards.mjs --local --files=a.mjs',
     'WE_FULL_SUITE_OK=1 npm test -- a.test.mjs',
+    // alternate spellings of the same runs (advisory finding on #3932): runner flags before the subcommand,
+    // a pinned vitest version, exec wrappers, vitest's own entry script, separate-valued node options
+    'pnpm vitest run a.test.mjs', 'yarn vitest run a.test.mjs', 'bun vitest run a.test.mjs',
+    'npm -s test', 'npm --silent test -- a.test.mjs', 'npm --prefix . test', 'npm -w x test -- a.test.mjs',
+    'npx vitest@latest run a.test.mjs', 'npx -y vitest@2 run a.test.mjs',
+    'timeout 300 npx vitest run a.test.mjs', 'timeout -s KILL 300 npx vitest run a.test.mjs',
+    'nice -n 5 npx vitest run a.test.mjs', 'nice -5 npx vitest run a.test.mjs',
+    'node node_modules/vitest/vitest.mjs run a.test.mjs',
+    'node --title standards scripts/check-standards.mjs --local',
+    'node --max-old-space-size 4096 scripts/check-standards.mjs',
+    'node --env-file .env scripts/check-standards.mjs',
+    'node --require ./setup.js scripts/check-standards.mjs',
   ])('denies %s in an ordinary session', (cmd) => {
     expect(decide(cmd, {})).not.toBeNull();
   });
@@ -34,8 +46,14 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     ['npx vitest run scripts/__tests__/a.test.mjs', queue + 'npx vitest run scripts/__tests__/a.test.mjs'],
     ['cd /tmp/lane && npx vitest run a.test.mjs', queue + 'npx vitest run a.test.mjs'],
     ['npx vitest related scripts/a.mjs --run', queue + 'npx vitest related scripts/a.mjs --run'],
-    ['npm test', 'npm run test:unit -- <test-file>'],
+    // the escape-carrying whole-suite run names a pasteable command (no `<test-file>` placeholder)
+    ['WE_FULL_SUITE_OK=1 npm test', 'WE_FULL_SUITE_OK=1 npm run test:unit'],
     ['npm test -- a.test.mjs', 'npm run test:unit -- a.test.mjs'],
+    ['npm -s test -- a.test.mjs', 'npm run test:unit -- a.test.mjs'],
+    ['pnpm vitest run a.test.mjs', queue + 'pnpm vitest run a.test.mjs'],
+    // a watch/dev process would hold an admission slot until killed: queue a one-shot `run` instead
+    ['vitest watch a.test.mjs', queue + 'vitest run a.test.mjs'],
+    ['npx vitest dev a.test.mjs', queue + 'npx vitest run a.test.mjs'],
     // a forwarded vitest subcommand has no test:unit equivalent (it would become a filename filter after `vitest run`)
     ['npm test -- related scripts/a.mjs --run --passWithNoTests', queue + 'npx vitest related scripts/a.mjs --run --passWithNoTests'],
     ['npm test related scripts/a.mjs', queue + 'npx vitest related scripts/a.mjs'],
@@ -74,10 +92,35 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     expect(decide(suggested, {})).toBeNull();
   });
 
+  // Every deny message's `Use: \`…\`` suggestion must itself be allowed — the whole deny-loop class, not one row.
+  it.each([
+    'npx vitest run a.test.mjs', 'vitest watch a.test.mjs', 'npx vitest dev a.test.mjs',
+    'pnpm vitest run a.test.mjs', 'timeout 300 npx vitest run a.test.mjs', 'nice -n 5 npx vitest run a.test.mjs',
+    'node node_modules/vitest/vitest.mjs run a.test.mjs', 'npm -s test -- a.test.mjs', 'npm test',
+    'npm --prefix . test -- a.test.mjs', 'WE_FULL_SUITE_OK=1 npm test', 'WE_FULL_SUITE_OK=1 npx vitest run',
+    'FOO=1 npx vitest@2 run a.test.mjs', 'node --title x scripts/check-standards.mjs --local',
+    // whole-suite `npm test` spellings the full-suite arm does not parse: its message, never `npm run test:unit`
+    'npm -s test', 'npm -s t', 'timeout 5 npm test', 'npm --prefix x --silent test', 'npm -w x test',
+    'npm --workspace=x test', 'npm -C x test',
+  ])('the suggestion for the denied `%s` is itself allowed (no deny loop)', (cmd) => {
+    const reason = decide(cmd, {});
+    expect(reason).not.toBeNull();
+    for (const [, suggested] of reason.matchAll(/Use: `([^`]+)`/g)) {
+      expect(suggested, suggested).not.toMatch(/<[^>]+>/); // a literal placeholder cannot be pasted
+      expect(decide(suggested, {}), suggested).toBeNull();
+    }
+  });
+
   it('keeps full-suite precedence and queues its targeted advice', () => {
     const result = decide('npx vitest run', {});
     expect(result).toContain('bare FULL-SUITE');
     expect(result).toContain('For one or two files: `' + queue + 'npx vitest run <file>`');
+  });
+
+  it('a bare full-suite deny appends no second, self-denying replacement', () => {
+    for (const cmd of ['npx vitest run', 'npm test', 'npm run test:unit', 'vitest', 'npm -s test', 'timeout 5 npm test']) {
+      expect(decide(cmd, {}), cmd).not.toContain('heavy-enforce:');
+    }
   });
 
   it('the actual PreToolUse hook denies a direct targeted run with its replacement', () => {
