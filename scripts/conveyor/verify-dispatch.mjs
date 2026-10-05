@@ -428,15 +428,18 @@ export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateSt
  * Gates launch concurrently; admission remains the sole execution semaphore. With `inFlight`, outstanding
  * runs are capped and same-lane dispatch is suppressed across sweeps. `awaitSettle: false` returns launches
  * immediately; the same settlement handler records failures and removes each registry entry in the background.
+ * With `awaitSettle:false` the returned `failures` is empty at return time, so a caller that must SEE a late
+ * failure passes `onSettled(failure)`, called once per failure as it settles (a throwing observer is isolated).
  * @param {{dryRun?:boolean, spawnGate?:typeof spawnGateBounded, poolRoot?:string,
- *   inFlight?:Map<string, object>|null, awaitSettle?:boolean, maxInFlight?:number}} [o] `spawnGate` and
+ *   inFlight?:Map<string, object>|null, awaitSettle?:boolean, maxInFlight?:number,
+ *   onSettled?:((failure:object) => void)|null}} [o] `spawnGate` and
  *   `poolRoot` (#4360) default to the real {@link spawnGateBounded} and the module-level {@link POOL_ROOT} — the
  *   ONLY reason either is ever overridden is a test that needs a controllable fake and an isolated fixture pool
  *   to prove lanes are dispatched concurrently, never a production caller.
  * @returns {Promise<{dryRun:boolean, dispatched:Array<object>, failures:Array<object>, skippedOutOfScope:Array<object>, deferred:Array<object>, superseded:Array<object>}>}
  */
 export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateBounded, poolRoot = POOL_ROOT,
-  inFlight = null, awaitSettle = true, maxInFlight = resolveMaxInFlight(process.env),
+  inFlight = null, awaitSettle = true, maxInFlight = resolveMaxInFlight(process.env), onSettled = null,
 } = {}) {
   const deferred = [];
   const superseded = [];
@@ -569,13 +572,18 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
       const phase = e.timedOutPhase || 'gate';
       const ceilingMs = phase === 'queue' ? QUEUE_PHASE_CEILING_MS : VERIFY_DISPATCH_TIMEOUT_MS;
       log(`  ⚠ ${pool}/lane-${lane}: verify-lane exceeded the ${ceilingMs}ms ${phase}-phase ceiling — killed (tree included). Recorded infrastructure failure for the still-owned request; inspect the cause before an explicit retry.`);
-      failures.push({ pool, lane, sha: headSha, timedOut: true, timedOutPhase: phase, infrastructure: markerFor(dir)?.infrastructure });
+      recordFailure({ pool, lane, sha: headSha, timedOut: true, timedOutPhase: phase, infrastructure: markerFor(dir)?.infrastructure });
     } else if (status === 2) {
       if (awaitSettle) dispatched.push({ pool, lane, sha: headSha, red: true });
     } else {
       log(`  ⚠ ${pool}/lane-${lane}: verify-lane dispatch failed (non-fatal): ${String(e?.message || e).split('\n')[0]}`);
-      failures.push({ pool, lane, sha: headSha, infrastructure: markerFor(dir)?.infrastructure });
+      recordFailure({ pool, lane, sha: headSha, infrastructure: markerFor(dir)?.infrastructure });
     }
+  }
+
+  function recordFailure(failure) {
+    failures.push(failure);
+    onSettled?.(failure); // a throw is contained by the settlement chain's `.catch`; `.finally` still releases the lane
   }
 
   if (awaitSettle) await Promise.allSettled(settlements);

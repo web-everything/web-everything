@@ -236,23 +236,73 @@ export function startIndependentHeartbeat({
  *  `buildCliDaemonEffects` in the sibling daemons) so `main()` stays a thin wire-up. */
 export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAlive = () => true, log = console, runVerify = runVerifyDispatch } = {}) {
   const inFlight = new Map();
+  // `awaitSettle:false` returns before any gate settles, so `result.failures` is always empty here: failures
+  // arrive later through `onSettled`, are logged as they land, and the next tick summary counts them.
+  let settledFailures = 0;
+  const onSettled = (f) => {
+    settledFailures += 1;
+    log.error(`verify-daemon: ${f.pool}/lane-${f.lane} failed (non-fatal)${f.timedOut ? ` [timed out: ${f.timedOutPhase}]` : ''}`);
+  };
   return {
     inFlight,
     intervalMs,
-    tickOnce: () => runVerifyTick({ runVerify, inFlight, awaitSettle: false }),
+    tickOnce: () => runVerifyTick({ runVerify, inFlight, awaitSettle: false, onSettled }),
     sleep: realSleep,
     isAlive,
     onTick: (result) => {
-      const { dispatched = [], failures = [], deferred = [] } = result || {};
-      log.error(`verify-daemon: tick — dispatched ${dispatched.length}, in flight ${inFlight.size}, deferred ${deferred.length}, failed ${failures.length}`);
-      for (const f of failures) {
-        log.error(`verify-daemon: ${f.pool}/lane-${f.lane} failed (non-fatal)${f.timedOut ? ` [timed out: ${f.timedOutPhase}]` : ''}`);
-      }
+      const { dispatched = [], deferred = [] } = result || {};
+      log.error(`verify-daemon: tick — dispatched ${dispatched.length}, in flight ${inFlight.size}, deferred ${deferred.length}, failed ${settledFailures}`);
+      settledFailures = 0;
     },
     onTickError: (error) => {
       log.error(`verify-daemon: tick failed (non-fatal): ${String((error && error.message) || error).split('\n')[0]}`);
     },
   };
+}
+
+/** SIGKILL the detached process group of every in-flight gate that has spawned. Shared by the signal handler
+ *  and every loop exit, so no path can leave a gate running under a daemon that no longer holds the lease
+ *  (a successor would then double-dispatch the same lane). An entry without a pid has not spawned yet; a pid
+ *  that already exited throws and is skipped. `kill` is injectable for tests. */
+export function killInFlight(inFlight, kill = process.kill.bind(process)) {
+  for (const { pid } of inFlight.values()) {
+    try { if (pid > 0) kill(-pid, 'SIGKILL'); } catch {}
+  }
+}
+
+/** The loop's `codeChanged` predicate: a code-change restart waits for an empty in-flight registry, but the
+ *  loop KEEPS TICKING meanwhile — exiting with gates running would orphan them, and pausing dispatch until
+ *  they drain would re-create the starvation. */
+export function makeCodeChangedGuard({ inFlight, bootHead, readHead }) {
+  return () => inFlight.size === 0 && cloneHeadChanged({ bootHead, readHead });
+}
+
+/** The ONE teardown every exit path shares (SIGTERM/SIGINT and every loop exit): kill in-flight gates, stop
+ *  the heartbeat, release the lease, then exit at once. Idempotent. The immediate exit matters: it stops the
+ *  killed gates' settle chain from running, so their markers stay `running` and a successor re-dispatches the
+ *  lane — letting that chain run would stamp a daemon-initiated kill as an `infrastructure-failure` the
+ *  successor then skips. Everything effectful is injected so the lifecycle is unit-tested with fakes. */
+export function createCleanup({ inFlight, stopHeartbeat, release, kill, exit = (code) => process.exit(code), log = console }) {
+  let stopping = false;
+  return {
+    isStopping: () => stopping,
+    stopAndExit(why) {
+      if (stopping) return;
+      stopping = true;
+      log.error(`verify-daemon: ${why} — releasing the lease and exiting.`);
+      killInFlight(inFlight, kill);
+      stopHeartbeat();
+      release();
+      exit(0);
+    },
+  };
+}
+
+/** Run the loop; whichever way it stops, tear down through `cleanup` (a no-op if a signal already did). */
+export async function runDaemon({ effects, codeChanged, cleanup }) {
+  const out = await runDaemonLoop({ ...effects, codeChanged });
+  cleanup.stopAndExit(`loop stopped (${out.stoppedReason})`);
+  return out;
 }
 
 async function main() {
@@ -271,33 +321,23 @@ async function main() {
     onLost: () => console.error(`verify-daemon: lease lost mid-run — will stop after the current tick.`),
   });
   const effects = buildCliDaemonEffects({ isAlive });
-  let stopping = false;
-  const shutdown = (signal) => {
-    if (stopping) return;
-    stopping = true;
-    console.error(`verify-daemon: ${signal} — releasing the lease and exiting.`);
-    for (const { pid } of effects.inFlight.values()) {
-      try { if (pid > 0) process.kill(-pid, 'SIGKILL'); } catch {}
-    }
-    stopHeartbeat();
-    releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: VERIFY_DAEMON_LEASE_KEY });
-    process.exit(0);
-  };
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  const cleanup = createCleanup({
+    inFlight: effects.inFlight,
+    kill: process.kill.bind(process),
+    stopHeartbeat,
+    release: () => releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: VERIFY_DAEMON_LEASE_KEY }),
+  });
+  process.on('SIGTERM', () => cleanup.stopAndExit('SIGTERM'));
+  process.on('SIGINT', () => cleanup.stopAndExit('SIGINT'));
   console.error(`verify-daemon: started on ${hostname()}:${process.pid}, tick every ${DEFAULT_INTERVAL_MS}ms, heartbeat every ${DEFAULT_HEARTBEAT_INTERVAL_MS}ms.`);
   const cloneRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
   const readHead = () => { try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: cloneRoot, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } };
   const bootHead = readHead();
-  // A code-change restart waits for an empty in-flight registry, but KEEPS TICKING meanwhile: exiting with gates
-  // still running would orphan them, and pausing dispatch until they drain would re-create the starvation.
-  const codeChanged = () => effects.inFlight.size === 0 && cloneHeadChanged({ bootHead, readHead });
-  const { stoppedReason } = await runDaemonLoop({ ...effects, codeChanged });
-  if (!stopping) {
-    console.error(`verify-daemon: loop stopped (${stoppedReason}) — releasing the lease and exiting.`);
-    stopHeartbeat();
-    releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: VERIFY_DAEMON_LEASE_KEY });
-  }
+  await runDaemon({
+    effects,
+    codeChanged: makeCodeChangedGuard({ inFlight: effects.inFlight, bootHead, readHead }),
+    cleanup,
+  });
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));

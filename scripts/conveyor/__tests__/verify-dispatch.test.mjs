@@ -867,3 +867,30 @@ it('detects a gate marker split across stderr chunks', async () => {
   })).rejects.toMatchObject({ timedOutPhase: 'gate' });
   expect(started).toBe(1);
 });
+
+describe('onSettled — background failures reach the caller when awaitSettle is false (PR #3972 review)', () => {
+  it('reports a timed-out gate and a non-red dispatch failure after the sweep has already returned', async () => {
+    runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true'], laneDir);
+    const onSettled = vi.fn();
+    let rejectGate;
+    const spawnGate = () => new Promise((_resolve, reject) => { rejectGate = reject; });
+    const result = await runVerifyDispatch({ poolRoot, inFlight: new Map(), awaitSettle: false, spawnGate, onSettled });
+    expect(result.failures).toEqual([]);
+    expect(onSettled).not.toHaveBeenCalled();
+    rejectGate(Object.assign(new Error('ceiling'), { status: null, signal: 'SIGKILL', timedOutPhase: 'gate' }));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(onSettled).toHaveBeenCalledTimes(1);
+    expect(onSettled).toHaveBeenCalledWith(expect.objectContaining({ pool: 'flagtest', lane: 1, timedOut: true, timedOutPhase: 'gate' }));
+  }, 2000);
+
+  it('a throwing onSettled is contained by the settlement chain: no unhandled rejection, and the lane is still released', async () => {
+    runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true'], laneDir);
+    const inFlight = new Map();
+    const onSettled = vi.fn(() => { throw new Error('observer blew up'); });
+    const spawnGate = () => Promise.reject(Object.assign(new Error('boom'), { status: 1 }));
+    await runVerifyDispatch({ poolRoot, inFlight, awaitSettle: false, spawnGate, onSettled });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(onSettled).toHaveBeenCalledTimes(1);
+    expect(inFlight.size).toBe(0);
+  }, 2000);
+});
