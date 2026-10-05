@@ -1493,6 +1493,39 @@ export function buildReviewAntigravityJudgeRequest({ read, aim = '' }) {
 }
 
 /**
+ * Juror text is untrusted (a PR author can plant it in the diff). Fold every line terminator and drop backticks so
+ * an interpolated value can never open a new line — e.g. a forged `**Advisory outcome:**` that `parseAdvisories`
+ * would read ahead of the real one — or dress itself as a code span. PURE.
+ */
+export function foldUntrusted(text) {
+  return String(text ?? '').replace(/[\r\n\u2028\u2029\u0085\v\f]+/g, ' ').replace(/`/g, "'");
+}
+
+/**
+ * The "Card suggestions (filed later)" section for later-round advisory findings that were diverted out of
+ * `verdict.findings` (#5135). ONE renderer shared by `renderAdvisoryNote` and `renderVerdictWriteUp`, so a
+ * verdict that diverts findings can never be shown by one comment and silently dropped by the other. PURE.
+ *
+ * @param {{read: object, verdict: object}} o
+ * @returns {string[]} lines (empty when nothing was deferred).
+ */
+export function renderDeferredAdvisorySection({ read, verdict } = {}) {
+  const deferred = Array.isArray(verdict?.deferredAdvisory) ? verdict.deferredAdvisory : [];
+  if (!deferred.length) return [];
+  const fix = read?.latestFix;
+  return [
+    '',
+    `### Card suggestions (filed later) (${deferred.length})`,
+    `Later-round advisory findings on code the latest fix (\`${foldUntrusted(fix?.priorHead?.slice(0, 8))}..${foldUntrusted(fix?.head?.slice(0, 8))}\`) did not touch. They do not count toward \`changes\`; file them as cards instead of fixing them in this PR (#5135).`,
+    ...deferred.map(f => {
+      const lens = foldUntrusted(String(f.category ?? '').split('/')[0]);
+      const cite = foldUntrusted(f.file ? `${f.file}${f.line ? `:${f.line}` : ''}` : String(f.summary ?? '').slice(0, 60));
+      return `- \`${lens}\` \`${cite}\` — ${foldUntrusted(f.summary)}`;
+    }),
+  ];
+}
+
+/**
  * The durable verdict write-up posted as the PR comment. EXTENDS `renderPanelComment`
  * (`we:scripts/lib/review-render.mjs`, #2432) rather than hand-rolling markdown — the operation adds only the
  * three lines that are ITS business: who decided, on what basis, and whether that basis was degraded.
@@ -1534,6 +1567,7 @@ export function renderVerdictWriteUp({ read, verdict, answer, actor, reason = ''
       + `${read.netChangedFiles.length} net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`;
   return [
     body,
+    ...renderDeferredAdvisorySection({ read, verdict }),
     '',
     '---',
     '',
@@ -1837,16 +1871,7 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
     'bounced this PR. No `review:*` label was changed and no decision was recorded.',
     '',
     body,
-    ...(v.deferredAdvisory?.length ? [
-      '',
-      `### Card suggestions (filed later) (${v.deferredAdvisory.length})`,
-      `Later-round advisory findings on code the latest fix (\`${read.latestFix?.priorHead?.slice(0, 8)}..${read.latestFix?.head?.slice(0, 8)}\`) did not touch. They do not count toward \`changes\`; file them as cards instead of fixing them in this PR (#5135).`,
-      ...v.deferredAdvisory.map(f => {
-        const lens = f.category?.split('/')[0] ?? '';
-        const cite = f.file ? `${f.file}${f.line ? `:${f.line}` : ''}` : String(f.summary ?? '').slice(0, 60);
-        return `- \`${lens}\` \`${cite}\` — ${f.summary}`;
-      }),
-    ] : []),
+    ...renderDeferredAdvisorySection({ read, verdict: v }),
     // THE MACHINE-READABLE OUTCOME, the line `we:scripts/lib/advisory-labels.mjs#parseAdvisories` reads back.
     // The `**Verdict:**` line above cannot carry it: on a `review:human` PR it is always "human review required".
     ...(outcome
