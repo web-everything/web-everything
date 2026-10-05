@@ -15,10 +15,13 @@ export function salvageEnabled(env = process.env) {
 export function parseReflogSalvageCandidates(text, pr) {
   if (!/^\d+$/.test(String(pr))) return [];
   const messagePattern = new RegExp(`^commit(?: \\(amend\\))?: PR #${pr}: ci-heal\\b`);
+  const briefPattern = new RegExp(`^commit(?: \\(amend\\))?: .+: ci-heal — .*\\(PR #?${pr}\\)$`);
   const candidates = new Set();
   for (const line of text.split('\n').reverse()) {
     const tab = line.indexOf('\t');
-    if (tab < 0 || !messagePattern.test(line.slice(tab + 1))) continue;
+    if (tab < 0) continue;
+    const message = line.slice(tab + 1);
+    if (!messagePattern.test(message) && !briefPattern.test(message)) continue;
     const sha = line.slice(0, tab).split(/\s+/)[1];
     if (/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha ?? '')) candidates.add(sha);
   }

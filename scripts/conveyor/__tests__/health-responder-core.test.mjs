@@ -24,9 +24,17 @@ describe('health responder closed decision table', () => {
     expect(new Set(SMELLS.map((s) => s.id)).size).toBe(SMELLS.length);
     expect(SMELLS.length).toBe(discoverModuleFiles(new URL('../health-smells/', import.meta.url)).length);
     for (const s of SMELLS) {
-      expect(Object.hasOwn(CATALOGUE, s.id), s.id).toBe(true);
       const i = input(); i.episodes[0].smell = s.id; i.episodes[0].key = `${s.id}::${i.episodes[0].subject}`;
       i.config.smells = { [s.id]: true }; i.subjectFacts = {};
+      if (s.id === 'fix-loop-no-push') {
+        // Alert-only; this smell grants the responder no action authority.
+        expect(s.action).toBe('alert');
+        expect(Object.hasOwn(CATALOGUE, s.id)).toBe(false);
+        i.config.smells = {};
+        expect(decide(i)[0]).toMatchObject({ decision: 'hold', rule: 'unknown-smell' });
+        continue;
+      }
+      expect(Object.hasOwn(CATALOGUE, s.id), s.id).toBe(true);
       expect(decide(i)[0].decision).not.toBe('act-would-have');
     }
   });

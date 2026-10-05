@@ -72,6 +72,15 @@ import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { salvageEnabled, laneDirsForRepo, findSalvageCommit, pushSalvage } from '../conveyor/ci-heal-salvage.mjs';
 
+import { readFixLoopRows, appendFixLoopRow, fixLoopConfig, fixLoopState, fixDispatchKilled,
+  fixDispatchKillFile, hasFixHoldLabel } from '../conveyor/fix-loop-ledger.mjs';
+
+const defaultFixLoop = {
+  readRows: () => process.env.VITEST && !process.env.WE_FIX_LOOP_LEDGER ? [] : readFixLoopRows(),
+  append: row => { if (!process.env.VITEST || process.env.WE_FIX_LOOP_LEDGER) appendFixLoopRow(row); },
+  killed: () => process.env.VITEST && !process.env.WE_FIX_DISPATCH_KILL_FILE ? false : fixDispatchKilled(),
+};
+
 function defaultSalvage({ entry, root, repoKey }) {
   if (process.env.VITEST && !process.env.LANE_POOL_ROOT) return null;
   const laneDirs = laneDirsForRepo({ poolRoot: defaultPoolRoot(root),
@@ -290,6 +299,9 @@ export async function runReconcileCiHealDispatch({
   flushTimeouts = flushTimeoutFollowups,
   timeoutHold = readTimeoutHold,
   salvage = defaultSalvage,
+  fixLoop = defaultFixLoop,
+  fixConfig = fixLoopConfig(),
+  now = Date.now(),
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`ci-heal-pr-dispatch: --repo ${repo} is not a constellation repo`);
@@ -339,6 +351,15 @@ export async function runReconcileCiHealDispatch({
   const dispatched = [];
   const refusals = [];
   for (const entry of ciHealEntries) {
+    if (fixLoop.killed()) {
+      refusals.push({ pr: entry.prNumber, kind: 'fix-dispatch-killed', why: `kill file ${fixDispatchKillFile()} present` });
+      continue;
+    }
+    // TODO: expose PR labels in reconcile entries; the current plan only returns a PR count.
+    if (hasFixHoldLabel(entry.labels)) {
+      refusals.push({ pr: entry.prNumber, kind: 'fix-hold-label' });
+      continue;
+    }
     const unsettled =healObservations.find(row => row.pr === entry.prNumber && row.status !== 'resolved');
     if (unsettled) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-unsettled', why: unsettled.error ?? 'owned wrapper still running' }); continue; }
     if ((owedFlush.kept ?? []).some(row => row.pr === entry.prNumber)) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-accounting-owed', why: 'durable heal accounting is not confirmed' }); continue; }
@@ -355,6 +376,15 @@ export async function runReconcileCiHealDispatch({
       if (recovered?.pushed === false && recovered.sha) {
         refusals.push({ pr: entry.prNumber, kind: 'ci-heal-salvage-failed', why: recovered.reason });
       }
+    }
+    let loopRows = [];
+    try { loopRows = fixLoop.readRows(); } catch { /* An unreadable ledger never blocks dispatch. */ }
+    const loop = fixLoopState({ rows: loopRows, repo: repoKey, pr: entry.prNumber,
+      head: entry.headRefOid, now, config: fixConfig });
+    if (loop.held) {
+      refusals.push({ pr: entry.prNumber, kind: 'fix-loop-hold',
+        why: `${loop.count} ci-heal/fix sessions on head ${String(entry.headRefOid ?? '').slice(0, 7)} in ${fixConfig.windowHours}h with nothing pushed; auto-held until the head moves (WE_FIX_LOOP_HOLD=0 disables)` });
+      continue;
     }
     const q = queueBudget.tryAdmit('ci-heal', { id: entry.prNumber });
     if (!q.admit) {
@@ -399,6 +429,10 @@ export async function runReconcileCiHealDispatch({
         continue;
       }
       dispatched.push(result);
+      try {
+        await fixLoop.append({ repo: repoKey, pr: entry.prNumber, kind: 'ci-heal', head: entry.headRefOid,
+          session: result?.session ?? result?.sessionSlug ?? `ci-heal-${entry.prNumber}` });
+      } catch { /* Dispatch succeeded; ledger writes are best effort. */ }
     } catch (e) {
       refusals.push({ pr: entry.prNumber, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
     }
