@@ -49,7 +49,7 @@
 import { spawn } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveManifestEntry } from './daemon-manifest.mjs';
+import { DAEMON_MANIFEST, resolveManifestEntry } from './daemon-manifest.mjs';
 import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
@@ -165,6 +165,17 @@ export async function runPassDaemonLoop({
 // timer already guarantees survival once fixed.)
 export function realSleep(ms) { return new Promise((resolve) => { setTimeout(resolve, ms); }); }
 
+/** #5129 — an older clone may not yet register a launchd job's pass. Stay resident before acquiring a
+ *  lease or spawning anything; exiting would make KeepAlive crash-loop. The imported manifest is static:
+ *  update the clone and restart to pick up a newly registered entry. Malformed entries still fail closed. */
+export async function waitForManifestEntry(passName, { manifest = DAEMON_MANIFEST, sleep = realSleep, log = console } = {}) {
+  while (!Object.hasOwn(manifest, passName)) {
+    log.error(`pass-daemon: "${passName}" idle (manifest-entry-missing) — update this clone and restart; no pass will run.`);
+    await sleep(60_000);
+  }
+  return resolveManifestEntry(passName, manifest);
+}
+
 /** Spawn one real run of the manifest-resolved script to completion, async (never blocking the event loop
  *  the independent heartbeat relies on — mirrors why `runner.mjs`'s own `runQuietHeartbeating` uses `spawn`,
  *  never `execFileSync`, for anything that can outlast a beat).
@@ -197,7 +208,7 @@ async function main(argv) {
   if (!passName) { console.error('pass-daemon: --pass=<name> is required (see skills-src/conveyor/daemon-manifest.mjs for known entries).'); process.exit(1); }
 
   let entry;
-  try { entry = resolveManifestEntry(passName); }
+  try { entry = await waitForManifestEntry(passName); }
   catch (e) { console.error(String((e && e.message) || e)); process.exit(1); return; }
 
   const intervalMs = flags.interval ? Number(flags.interval) : entry.intervalMs;
