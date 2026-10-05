@@ -177,6 +177,13 @@ git merge --no-edit "$BASE_SHA" || exit 1
 git merge-base --is-ancestor "$BASE_SHA" HEAD || exit 1
 ```
 
+To take one side of a conflicted file, or union both, use ONLY
+`node {{WE_ROOT}}/scripts/conveyor/resolve-conflict.mjs --dir=<your lane path> --file=<path> --take=ours|theirs|union`
+(unquoted script path, exactly this shape; pre-allowed in this session's settings).
+NEVER use `git checkout --ours/--theirs`, `git checkout -- <file>`, `git restore`, or `git reset` on a file:
+the auto-mode classifier denies those as "[Irreversible Local Destruction]" (live: fix-3964, PR #3964).
+Hand-merged hunks still use the Edit tool, then `git add`.
+
 Resolve any conflict the `/finish` way: **regenerate derived / generated artifacts** rather than hand-merging them,
 and **take-main for coordination JSON** (`claims.json`, registries). If it is a genuine same-line CODE overlap you
 cannot safely resolve, `git merge --abort` (leave the PR as it is — do NOT force-push a bad merge), report the
@@ -283,17 +290,18 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
     ```
     Then report `#{{ITEM_NUM}} → ci-heal waiting on system fix #<n> (PR #{{PR_NUM}} did nothing wrong)`.
 
-**If applying an otherwise-CLEAR repair is denied by a permission or tool-use guard, that is INFRASTRUCTURE
-FRICTION, not a judgment call.** The failing check still says exactly what to fix; only the *mechanism* to fix it
-failed. Report it as `blocked-on-infra` instead, so the reconciler retries this PR once the friction has had time
-to clear (`we:scripts/conveyor/reconcile-core.mjs#INFRA_RETRY_COOLOFF_MS`):
+**If applying the fix is denied by a permission or tool-use guard**, report
+`blocked-on-permission` with `--denied="<the exact denied command, one line>"`.
+This is a product permission wall, not a judgment call: do not stand down or retry the denied command.
+The reconciler surfaces it immediately and holds retries for 60 minutes. Keep `blocked-on-infra`
+for outages and rate limits (omit `--denied` for those).
 
 ```bash
-node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=blocked-on-infra
+node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=blocked-on-permission --denied="<the exact denied command, one line>"
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
 ```
 
-Then report `#{{ITEM_NUM}} → blocked-on-infra (tool/permission denial applying an otherwise-clear CI heal on PR
+Then report `#{{ITEM_NUM}} → blocked-on-permission (tool/permission denial applying an otherwise-clear CI heal on PR
 #{{PR_NUM}})` and exit — do not retry the same denied action yourself in a loop.
 
 **If a genuine code repair is needed, build-brief discipline still applies** (statute:
@@ -422,6 +430,9 @@ node "{{WE_ROOT}}/scripts/conveyor/learnings-drop.mjs" \
 Skip only if you genuinely hit no generalizable friction.
 
 ### 9. EXIT — do not merge, do not touch the review label, do not release
+
+For a permission-denial exit, RETURN `#{{ITEM_NUM}} → blocked-on-permission (<exact denied command>)`.
+Use `blocked-on-infra` for outages/rate limits.
 
 **Stop here.** Do NOT run `gh pr merge`. Do NOT run a drain. Do NOT `release` the lane. Do NOT change ANY review
 label. Your process EXIT is the signal you are done — but it is NOT the only signal: your **completion record**

@@ -704,6 +704,10 @@ export const INFRA_RETRY_CAP = 4;
  *  outright (a persistent-but-eventually-recovering outage is real), only slowed and surfaced to a person. */
 export const INFRA_RETRY_CAPPED_COOLOFF_MS = 60 * 60 * 1000;
 
+/** A permission wall does not clear by waiting 15 minutes: it clears when the product
+ * changes (an allow rule / sanctioned helper lands). Retry slowly and SURFACE it immediately. */
+export const PERMISSION_BLOCKED_COOLOFF_MS = INFRA_RETRY_CAPPED_COOLOFF_MS;
+
 /**
  * we:scripts/conveyor/reconcile-core.mjs#LIVE_SESSION_OVERRUN_MS — xilx617 (epic #4075/#3383): the default bound
  * past which a `live-process` refusal (a bound session with a probed-live pid — see {@link assessLiveness}) also
@@ -768,6 +772,13 @@ export function markSelfReportedDone(agents, completionFor, nowMs, { infraCoolof
     const updatedMs = Date.parse(rec.updatedAt ?? '');
     const startedMs = startedAtMs(a?.startedAt);
     if (!Number.isFinite(updatedMs) || !Number.isFinite(startedMs) || updatedMs < startedMs) return a;
+    if (rec.outcome === 'blocked-on-permission') {
+      const evidence = { permissionBlocked: true, deniedCommand: rec.denied ?? null, permissionBlockedSince: rec.updatedAt };
+      if (!(nowMs - updatedMs >= PERMISSION_BLOCKED_COOLOFF_MS)) {
+        return { ...a, ...evidence, awaitingInfraCooloff: true };
+      }
+      return { ...a, ...evidence, awaitingInfraCooloff: false, selfReportedDone: true, selfReportedOutcome: rec.outcome };
+    }
     if (rec.outcome === 'blocked-on-infra') {
       // xilx617 (epic #4075/#3383) — the durable per-session streak the completion STORE's own write path
       // maintains (`we:scripts/operations/completion-store.mjs#writeCompletion`); read back here, never
@@ -1631,6 +1642,15 @@ export function planReconcile({
     // internally, for exactly that reason. Episode key is `kind + prNumber + since` (see
     // `reconcile-note-comment.mjs#noteEpisodeKey`) — deliberately NOT `streak`, so a streak that keeps growing
     // past the cap (infra never recovers) still posts as ONE episode, not a fresh comment every tick.
+    const permissionBlocked = bound.find((b) => b.agent?.permissionBlocked === true);
+    if (permissionBlocked) {
+      const deniedCommand = permissionBlocked.agent.deniedCommand ?? null;
+      const since = permissionBlocked.agent.permissionBlockedSince ?? null;
+      notes.push({
+        kind: 'permission-blocked', prNumber, deniedCommand, since,
+        text: `PR #${prNumber}: fixer stopped by a permission denial (${deniedCommand ?? 'denied command not recorded'}) — retrying blindly will hit the same wall; the product needs a sanctioned path or allow rule`,
+      });
+    }
     const infraCapped = bound.find((b) => b.agent?.infraStreakCapped === true);
     if (infraCapped) {
       const streak = Number.isInteger(infraCapped.agent.infraStreak) ? infraCapped.agent.infraStreak : INFRA_RETRY_CAP;

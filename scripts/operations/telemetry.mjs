@@ -333,7 +333,7 @@ export const METRIC_UNITS = Object.freeze(['count', 'ms', 'ratio', 'bytes', 'per
  * Used by {@link classifyOutcomeStatus}; a word not listed anywhere defaults to `unset` rather than guessing.
  */
 export const ERROR_OUTCOMES = Object.freeze([
-  'blocked-on-infra', 'gate-red', 'gate-blocked', 'blocked-mid-build',
+  'blocked-on-permission', 'blocked-on-infra', 'gate-red', 'gate-blocked', 'blocked-mid-build',
   'escalated-conflict', 'escalated-needs-judgment', 'agent-spawn-failed', 'wrapper-threw',
   'no-free-lane', 'acquire-threw', 'could-not-predict', 'could-not-prepare',
   // #4348-open-pr-retry — a build that finished cleanly (gate green) but whose PR-open step hit an outside

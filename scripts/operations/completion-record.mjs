@@ -101,13 +101,13 @@ export function newCompletionRecord({
  * PURE merge of a `patch` onto an existing record — bumps `updatedAt`, never touches `session`/`kind`/`pr`/
  * `item`/`startedAt`/`v`. Used by the io shell's "report done" path so a caller need only name what changed.
  * @param {object} record
- * @param {{status?:string, outcome?:string|null, verdict?:string|null, label?:string|null, runId?:string|null, sessionId?:string|null}} patch
+ * @param {{status?:string, outcome?:string|null, verdict?:string|null, label?:string|null, runId?:string|null, sessionId?:string|null, denied?:string|null}} patch
  * @param {() => string} [now]
  * @returns {object}
  */
 export function applyCompletionUpdate(record, patch = {}, now = () => new Date().toISOString()) {
   const next = { ...record, updatedAt: now() };
-  for (const key of ['status', 'outcome', 'verdict', 'label', 'runId', 'sessionId']) {
+  for (const key of ['status', 'outcome', 'verdict', 'label', 'runId', 'sessionId', 'denied']) {
     if (Object.hasOwn(patch, key)) next[key] = patch[key];
   }
   return next;
@@ -128,7 +128,7 @@ export function validateCompletionRecord(record) {
   if (!isOptionalString(record.pr)) errors.push('`pr` must be a string or null');
   if (!isOptionalString(record.item)) errors.push('`item` must be a string or null');
   if (!COMPLETION_STATUSES.includes(record.status)) errors.push(`\`status\` must be one of ${COMPLETION_STATUSES.join('/')}`);
-  for (const key of ['outcome', 'verdict', 'label', 'runId', 'sessionId']) {
+  for (const key of ['outcome', 'verdict', 'label', 'runId', 'sessionId', 'denied']) {
     if (!isOptionalString(record[key])) errors.push(`\`${key}\` must be a string or null`);
   }
   if (typeof record.startedAt !== 'string' || Number.isNaN(Date.parse(record.startedAt))) errors.push('missing or unparseable `startedAt`');

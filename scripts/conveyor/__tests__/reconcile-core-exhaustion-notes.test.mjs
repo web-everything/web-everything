@@ -339,3 +339,20 @@ describe('xilx617 — a long-running LIVE session is bounded by a session-overru
     expect(noteEpisodeKey(notePidOnly1)).not.toBe(noteEpisodeKey(note1));
   });
 });
+
+it('holds a permission denial for 60 minutes and surfaces its command immediately', () => {
+  const pr = prBounced({ number: 3964, headRefOid: 'b'.repeat(40) });
+  const listed = { name: 'fix-3964', state: 'stopped', startedAt: NOW - 120_000, laneHeadOid: pr.headRefOid };
+  const rec = { status: 'done', outcome: 'blocked-on-permission', updatedAt: new Date(NOW).toISOString(), denied: 'git checkout --theirs file', infraStreak: 9 };
+  for (const elapsed of [15 * 60_000, 60 * 60_000 - 1]) {
+    const agents = markSelfReportedDone([listed], () => rec, NOW + elapsed);
+    expect(agents[0]).toMatchObject({ awaitingInfraCooloff: true, permissionBlocked: true, deniedCommand: rec.denied });
+    expect(agents[0].infraStreak).toBeUndefined();
+    const plan = planReconcile({ prs: [pr], agents, now: NOW + elapsed });
+    expect(plan.dispatch).toHaveLength(0);
+    const note = plan.notes.find((n) => n.kind === 'permission-blocked');
+    expect(note).toMatchObject({ prNumber: 3964, deniedCommand: rec.denied, since: rec.updatedAt });
+    expect(noteEpisodeKey(note)).toBe(`permission-blocked:3964:${rec.updatedAt}`);
+  }
+  expect(markSelfReportedDone([listed], () => rec, NOW + 60 * 60_000)[0]).toMatchObject({ selfReportedDone: true, permissionBlocked: true, deniedCommand: rec.denied });
+});

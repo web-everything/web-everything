@@ -81,6 +81,7 @@ export function noteEpisodeKey(note) {
   if (note?.kind === 'round-cap-exhausted') {
     return `round-cap-exhausted:${pr}:${note.capKind ?? 'unknown-population'}:${note.attempts}/${note.cap}`;
   }
+  if (note?.kind === 'permission-blocked') return `permission-blocked:${pr}:${note.since ?? 'unknown-since'}`;
   if (note?.kind === 'infra-retry-exhausted') {
     return `infra-retry-exhausted:${pr}:${note.since ?? 'unknown-since'}`;
   }
@@ -106,6 +107,7 @@ export function noteHeadline(note) {
   if (note?.kind === 'ci-heal-exhausted') return 'needs your decision: fix attempts exhausted';
   if (note?.kind === 'awaiting-permission') return 'needs your decision: a session is blocked on a permission prompt';
   if (note?.kind === 'round-cap-exhausted') return 'needs your decision: auto-repair rounds exhausted';
+  if (note?.kind === 'permission-blocked') return 'needs your decision: fixer blocked by a permission denial';
   if (note?.kind === 'infra-retry-exhausted') return 'needs your decision: blocked-on-infra retry streak capped';
   if (note?.kind === 'session-overrun') return 'needs your decision: a session has run past its bound';
   if (note?.kind === 'liveness-wait-exhausted') return 'needs your decision: a liveness wait ran past its bound';

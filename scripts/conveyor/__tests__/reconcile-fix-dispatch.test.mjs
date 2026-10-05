@@ -655,16 +655,19 @@ describe('freeLaneNumbers', () => {
 describe('dispatchFix — the composition: plan → fill → mint → spawn', () => {
   it('spawns exactly once, with a freshly minted session id, the assigned lane, and the filled brief as the prompt', () => {
     const calls = [];
+    const grantConflictHelper = vi.fn();
     const result = dispatchFix(
       { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:scripts/conveyor/reconcile-fix-dispatch.mjs'], lane: 9 },
       {
         root: '/repo',
+        grantConflictHelper,
         readBrief: () => REAL_TEMPLATE_STUB,
         mintSessionId: () => '11111111-1111-4111-8111-111111111111',
         spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
       },
     );
 
+    expect(grantConflictHelper).toHaveBeenCalledWith(calls[0].opts.cwd);
     expect(calls).toHaveLength(1);
     // #4174 — cwd is a scratch directory outside `root`, never `root` itself.
     expect(calls[0].opts).toEqual({ cwd: dispatchSessionCwd('11111111-1111-4111-8111-111111111111', { root: '/repo' }) });

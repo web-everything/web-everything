@@ -28,7 +28,7 @@
 export const KNOWN_RETURN_PATTERNS = [
   /→\s*PR\s*#\d+/i,
   /→\s*not-ready\b/i,
-  /→\s*blocked-on-infra\b/i,
+  /→\s*blocked-on-(?:infra|permission)\b/i,
   /→\s*escalated\b/i,
   /→\s*gate-red\b/i,
 ];

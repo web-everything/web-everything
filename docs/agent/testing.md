@@ -739,3 +739,12 @@ counts are observations across time, not distinct invocations. Exercise the samp
 synthetic process observations. For the tick's append path, supply a fake `ps` executable
 through a temporary `PATH`: sandboxed hosts can deny real `ps` with “Operation not permitted”.
 The CLI records that failure as an error sample, which does not count toward a breach.
+
+### Dispatched conflict resolution
+
+`we:scripts/conveyor/resolve-conflict.mjs` uses index stages only inside a lane clone with
+an active merge. Probe with real conflicting repositories under `.lanes/<repo>/lane-<n>`;
+assert stage 0 content and no unmerged entries (taking ours can leave no cached diff).
+Redirect `WE_RESOLVE_CONFLICT_LOG` to temporary storage. Permission-denial completions carry
+`denied`, hold for 60 minutes, and surface a `permission-blocked` note immediately; they are
+separate from transient infrastructure failures and their retry streak.

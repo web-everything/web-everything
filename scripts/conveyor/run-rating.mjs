@@ -113,6 +113,7 @@ export const OUTCOME_MAP = Object.freeze({
   'not-applicable': 'nothing-to-fix',
   blocked: 'escalated',
   'blocked-on-infra': 'escalated',
+  'blocked-on-permission': 'escalated',
   'escalated-needs-human': 'escalated',
   'escalated-needs-judgment': 'escalated',
   'escalated-conflict': 'escalated',

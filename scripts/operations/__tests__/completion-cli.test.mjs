@@ -243,3 +243,9 @@ it('reports and shows repo-specific records independently', () => {
   expect(runShow({ kind: 'review', pr: '49', repo: 'frontierui' }).found).toBe(true);
   expect(runShow({ kind: 'review', pr: '49' }).found).toBe(false);
 });
+
+it('persists --denied from an actual CLI permission-denial report', () => {
+  const denied = 'git checkout --theirs file';
+  execFileSync(process.execPath, [CLI_PATH, 'report', '--session=fix-3964', '--kind=fix', '--status=done', '--outcome=blocked-on-permission', `--denied=${denied}`], { env: { ...process.env, OPERATION_COMPLETIONS_DIR: dir } });
+  expect(tryReadCompletion('fix-3964')).toMatchObject({ outcome: 'blocked-on-permission', denied });
+});

@@ -158,3 +158,16 @@ describe('createDispatchSinks — grants the lane BEFORE spawning the agent', ()
     expect(calls).toEqual(['spawn']);
   });
 });
+
+it('grants only the sanctioned helper for fix and ci-heal, preserving build grants', async () => {
+  const { conflictHelperAllowRules } = await import('../../lib/conflict-helper-allow.mjs');
+  const root = '/repo'; const options = { root, exists: () => false };
+  const rules = conflictHelperAllowRules(root);
+  expect(rules).toEqual(['Bash(node /repo/scripts/conveyor/resolve-conflict.mjs:*)', 'Bash(node "/repo/scripts/conveyor/resolve-conflict.mjs":*)']);
+  expect(conflictHelperAllowRules(null)).toEqual([]);
+  const baseline = dispatchLaneGrant({ lane: 1 }, options);
+  expect(dispatchLaneGrant({ lane: 1, launchKind: 'build' }, options)).toEqual(baseline);
+  for (const launchKind of ['fix', 'ci-heal']) {
+    expect(dispatchLaneGrant({ lane: 1, launchKind }, options)).toEqual({ ...baseline, allow: [...baseline.allow, ...rules] });
+  }
+});
