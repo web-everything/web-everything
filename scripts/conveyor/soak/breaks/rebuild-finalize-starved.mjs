@@ -18,10 +18,11 @@
  * smoke-verified build. PRE-fix: every round smokes a new sha, every finalize is starved, nothing is ever adopted.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runSoak } from '../soak.mjs';
+import { rebuildMechanismSource } from '../rebuild-mechanism-source.mjs';
 
 const ROUNDS = 3;
 
@@ -36,7 +37,7 @@ export default {
   },
   fixPresent(root) {
     try {
-      return /readReadyCandidate/.test(readFileSync(join(root, 'scripts/lib/daemon-rebuild.mjs'), 'utf8'));
+      return /readReadyCandidate/.test(rebuildMechanismSource(root));
     } catch {
       return false;
     }
