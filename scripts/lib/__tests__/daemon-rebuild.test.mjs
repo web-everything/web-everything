@@ -157,6 +157,38 @@ describe('overlay conflict resolution', () => {
     expect(readyBuildVerified({ git: f.runGit, adopt: plain, mainTip: f.main, prevHead: f.main })).toBe(false);
   });
 
+  it('refuses to replay an overlay whose branch has merge-only changes instead of adopting a partial tree', async () => {
+    const f = makeFixture();
+    const a = pushBranch(f.originDir, 'lane/a', (dir) => writeFile(dir, 'README.md', 'A\n'));
+    pushBranch(f.originDir, 'lane/b', (dir) => writeFile(dir, 'README.md', 'A\n'));
+    // whole-branch merge against `a` conflicts on README, but commit-by-commit replay would apply cleanly
+    pushBranch(f.originDir, 'lane/b', (dir) => writeFile(dir, 'README.md', 'B\n'), { base: 'origin/lane/b' });
+    pushBranch(f.originDir, 'side', (dir) => writeFile(dir, 'side.txt', 'side\n'));
+    // lane/b = merge of `side` into lane/b whose resolution adds a file that exists in NO non-merge commit.
+    const author = makeAuthorClone(f.originDir);
+    gitOk(author, ['fetch', '-q', 'origin']);
+    gitOk(author, ['checkout', '-q', '-B', 'lane/b', 'origin/lane/b']);
+    gitOk(author, ['merge', '-q', '--no-ff', '--no-commit', 'origin/side']);
+    writeFile(author, 'merge-only.txt', 'only in the merge resolution\n');
+    gitOk(author, ['add', '-A']);
+    gitOk(author, ['commit', '-q', '-m', 'merge side with adaptation']);
+    gitOk(author, ['push', '-q', 'origin', 'HEAD:refs/heads/lane/b']);
+    const b = gitOk(author, ['rev-parse', 'HEAD']).trim();
+    gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
+    const runGit = (args, opts = {}) => gitRun(args, { cwd: f.cloneDir, env: { ...f.env, ...opts.env } });
+    const main = gitOk(f.cloneDir, ['rev-parse', 'origin/main']).trim();
+
+    expect(resolveOverlayConflict({ git: runGit, cur: a, ovSha: b, ref: 'lane/b' }))
+      .toMatchObject({ ok: false, tried: ['replay'] });
+
+    const result = await planRebuild({
+      git: runGit, headSha: main, mainRef: 'origin/main', overlays: [{ ref: 'lane/a', pr: 1 }, { ref: 'lane/b', pr: 2 }],
+    });
+    expect(result.decisions[1]).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(result.alerts.map((x) => x.kind)).not.toContain('overlay-conflict-resolved');
+    expect(gitOk(f.cloneDir, ['ls-tree', '-r', '--name-only', result.finalSha])).not.toContain('side.txt');
+  });
+
   it('uses a reviewed edge containing the current head and keeps the PR parent', async () => {
     const f = conflictFixture();
     const edgeSha = pushBranch(f.originDir, 'edge/lane/b', (dir) => {

@@ -171,9 +171,15 @@ export function resolveOverlayConflict({ git, cur, ovSha, ref }) {
   } catch { /* try replay */ }
   tried.push('replay');
   try {
-    const revs = git(['rev-list', '--reverse', '--no-merges', ovSha, '--not', cur]);
-    const commits = String(revs.stdout ?? '').trim().split(/\s+/).filter(Boolean);
-    if (revs.status === 0 && commits.length > 0) {
+    // A merge commit can carry changes no other commit has (a conflict resolution, an adaptation). Replay
+    // walks only non-merge commits, so it would adopt a tree missing that work while the build records the
+    // whole PR head as incorporated. Refuse (fail closed → unresolved) rather than adopt a partial tree.
+    // An unreadable merge probe also refuses: a wrong refusal only keeps the visible drop.
+    const merges = git(['rev-list', '--merges', '--max-count=1', ovSha, '--not', cur]);
+    const hasMerges = merges.status !== 0 || String(merges.stdout ?? '').trim() !== '';
+    const revs = hasMerges ? null : git(['rev-list', '--reverse', '--no-merges', ovSha, '--not', cur]);
+    const commits = String(revs?.stdout ?? '').trim().split(/\s+/).filter(Boolean);
+    if (revs && revs.status === 0 && commits.length > 0) {
       let tip = cur;
       let tree;
       for (const c of commits) {
