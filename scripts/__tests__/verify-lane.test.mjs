@@ -1171,7 +1171,9 @@ describe('verify phase telemetry (#5141)', () => {
     else process.env.LANE_POOL_ROOT = previousPoolRoot;
   });
   const explicitPhases = { admissionWaitMs: expect.any(Number), gateMs: expect.any(Number),
-    vitestMs: null, scanMs: null, standardsMs: null, targetFileCount: null, changedFileCount: null };
+    vitestMs: null, scanMs: null, standardsMs: null, targetFileCount: null, changedFileCount: null,
+    importGraphTargetCount: null, literalReferenceTargetCount: null,
+    outcomes: { vitest: { result: 'skipped' }, scan: { result: 'skipped' }, standards: { result: 'skipped' } } };
   function invoke(args) {
     const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, encoding: 'utf8' });
     return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stderr: result.stderr };

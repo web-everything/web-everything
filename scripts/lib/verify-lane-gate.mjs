@@ -57,6 +57,7 @@
  * has both `test:unit` and `check:standards`, so it too gets today's gate unchanged.
  */
 import { createHash } from 'node:crypto';
+import { stripVTControlCharacters } from 'node:util';
 import { SELECTION_FLAG, pinnedMergeBase, decideLocalSelection, referencedTestNeedles, LOCAL_FULL_SUITE_TRIGGERS } from '../readiness/test-selection.mjs';
 import { isPolicyCorePath } from './gate-config.mjs';
 import { isAllowlistedLitterPath } from './lane-litter.mjs';
@@ -486,8 +487,30 @@ export function describeGate({ command, decision, scanCommands = [] }) {
 }
 
 
+/** Extract the first text-mode standards error's rule id or bounded message (#5141). */
+export function firstStandardsErrorId(text) {
+  const message = stripVTControlCharacters(text).match(/^[\t ]*error[\t ]+([^\r\n]+)/m)?.[1].trim();
+  return message ? (message.match(/^([a-z0-9][a-z0-9-]*):/i)?.[1] ?? message).slice(0, 200) : null;
+}
+
+/** Derive non-gating telemetry from one phase's final command result (#5141). */
+export function buildPhaseOutcome({ kind, exitCode, signal, failureDetails, output, decision }) {
+  if (exitCode == null && !signal) return { result: 'skipped' };
+  if (exitCode === 0 && !signal) return { result: 'pass' };
+  const file = failureDetails?.tests?.[0]?.file;
+  const fallback = signal ? `signal ${signal}` : `exit ${exitCode}`;
+  const reason = kind === 'standards'
+    // Output over the capture cap is null; the collector's bounded tail still holds the last error lines.
+    ? firstStandardsErrorId(output ? `${output.stdout ?? ''}\n${output.stderr ?? ''}` : failureDetails?.summary ?? '') ?? fallback
+    : file || fallback;
+  return { result: 'fail', reason: reason.slice(0, 200), ...(kind === 'vitest' ? {
+    source: file && decision?.referencedTests?.includes(file) && !decision?.relatedFiles?.includes(file)
+      ? 'literal-reference' : 'import-graph',
+  } : {}) };
+}
+
 /** Build normalized, non-gating phase telemetry for verify markers and CLI results (#5141). */
-export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standardsMs, gateMs, decision }) {
+export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standardsMs, gateMs, decision, outcomes = {} }) {
   const ms = value => Number.isFinite(value) ? Math.round(value) : null;
   return {
     admissionWaitMs: ms(admissionWaitMs),
@@ -497,6 +520,10 @@ export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standards
     gateMs: ms(gateMs),
     targetFileCount: Array.isArray(decision?.targets) ? decision.targets.length : null,
     changedFileCount: Array.isArray(decision?.changedFiles) ? decision.changedFiles.length : null,
+    importGraphTargetCount: Array.isArray(decision?.relatedFiles) ? decision.relatedFiles.length : null,
+    literalReferenceTargetCount: Array.isArray(decision?.referencedTests) && Array.isArray(decision?.relatedFiles)
+      ? decision.referencedTests.filter(file => !decision.relatedFiles.includes(file)).length : null,
+    outcomes: Object.fromEntries(['vitest', 'scan', 'standards'].map(kind => [kind, outcomes[kind] ?? { result: 'skipped' }])),
   };
 }
 
@@ -504,6 +531,10 @@ export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standards
 export function formatVerifyPhases(phases) {
   const fields = { admission: phases.admissionWaitMs, vitest: phases.vitestMs, scan: phases.scanMs,
     standards: phases.standardsMs, gate: phases.gateMs, targets: phases.targetFileCount, changed: phases.changedFileCount };
+  const counts = { graph: phases.importGraphTargetCount, literal: phases.literalReferenceTargetCount };
   return ['phaseMs', ...Object.entries(fields).filter(([, value]) => value != null)
-    .map(([name, value]) => `${name}=${value}`)].join(' ');
+    .map(([name, value]) => `${name}=${value}`),
+  ...Object.entries(phases.outcomes ?? {}).map(([name, outcome]) =>
+    `${name}=${outcome.result}${outcome.reason ? `(${outcome.reason.replace(/[\r\n\u2028\u2029]/g, ' ')})` : ''}`),
+  ...Object.entries(counts).filter(([, value]) => value != null).map(([name, value]) => `${name}=${value}`)].join(' ');
 }

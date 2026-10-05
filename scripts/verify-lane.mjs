@@ -74,7 +74,7 @@ import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyS
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
-import { buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
@@ -463,10 +463,18 @@ async function runGate(command, args) {
 }
 // #5141 — retain null for phases never run; retries and multiple scans accumulate wall time.
 const phaseMs = { vitestMs: null, scanMs: null, standardsMs: null };
+const outcomes = {};
 async function timedRunGate(phase, command, args) {
   const started = performance.now();
+  const kind = phase?.replace(/Ms$/, '');
   try {
-    return await runGate(command, args);
+    const result = await runGate(command, args);
+    if (kind) outcomes[kind] = buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision });
+    return result;
+  } catch (error) {
+    if (kind) outcomes[kind] = buildPhaseOutcome({ kind, signal: error?.signal,
+      exitCode: Number.isFinite(error?.status) ? error.status : 2, decision: resolvedGate?.decision });
+    throw error;
   } finally {
     if (phase) phaseMs[phase] = (phaseMs[phase] ?? 0) + performance.now() - started;
   }
@@ -509,7 +517,7 @@ try {
   if (admission.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
 }
 
-const phases = buildVerifyPhases({ admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision });
+const phases = buildVerifyPhases({ admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes });
 
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }),
   ...(retriedTimeouts.length ? { retriedTimeouts } : {}) };
