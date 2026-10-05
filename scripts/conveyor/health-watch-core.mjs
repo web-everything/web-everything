@@ -30,6 +30,7 @@
  *      health watch's own last-tick-completed age.
  */
 
+import { TMP_SWEEP_DEFAULTS } from './tmp-sweep-config.mjs';
 import { foldPrAttempts } from './health-pr-attempts.mjs';
 import { isHighEntropyToken } from '../lib/secret-scrub.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from './health-smells-notify-list.mjs';
@@ -39,6 +40,7 @@ export const HOUR = 60 * MINUTE;
 
 /** Defaults — every number is config (`<stateRoot>/.conveyor/health/config.json` overrides any of them). */
 export const DEFAULT_HEALTH_CONFIG = Object.freeze({
+  ...TMP_SWEEP_DEFAULTS,
   mode: 'shadow',
   tickBudgetMs: 60_000,
   flapMax: 3,
@@ -47,7 +49,13 @@ export const DEFAULT_HEALTH_CONFIG = Object.freeze({
   reminderAfterMs: 4 * HOUR,
   silenceDefaultMs: 72 * HOUR,
   healthStaleAfterMs: 15 * MINUTE,
+  // A parked review waiting on the operator's ruling alerts after this long (`ruling-needed-waiting`).
+  rulingNeededAfterMs: 2 * HOUR,
   historyKeep: 100,
+  // Sustained ungated heavy runs: minimum runs per sample, samples per window, and window length.
+  heavyRunUngatedMinRuns: 1,
+  heavyRunUngatedMinSamples: 2,
+  heavyRunUngatedWindowMs: 10 * MINUTE,
   // #4078 — the diagnose-only investigation agent (slice 2). OFF until the operator turns it on (4065 clause 6:
   // agent dispatch is its own settings change, independent of `mode`). The budget is 4078's own numbers.
   investigateDispatch: false,
@@ -375,6 +383,10 @@ export function stepEpisodes(state, evaluations, now, { config = DEFAULT_HEALTH_
         if (ep.cleanStreak > 0 && ep.severity === 'medium' && smell.escalateAfterMs !== undefined) ep.firstBreachAt = now;
         ep.breachStreak += 1; ep.cleanStreak = 0; ep.lastBreachAt = now; ep.samples += 1;
         ep.measure = r.measure ?? {}; ep.summary = r.summary ?? ''; ep.recommendation = r.recommendation ?? smell.recommendationHint ?? '';
+        // xegykal — a smell may name a human-only escalation (`{humanOnly, actionRef, description, status, reason}`);
+        // the Plateau WIP page lists every open episode carrying `humanOnly: true` as one that needs a person.
+        if (r.escalation && typeof r.escalation === 'object') ep.escalation = r.escalation;
+        else delete ep.escalation;
         if (ep.status === 'pending' && ep.breachStreak >= openAfter) {
           const opens = next.opens[key] || [];
           opens.push(now);

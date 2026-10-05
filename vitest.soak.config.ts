@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import { maxTestWorkers } from './vitest.shared';
 
 /**
  * #4075 DAEMON SOAK HARNESS (card x0zg44l) — `npm run test:soak`. The real review + fix daemons, the real
@@ -17,6 +18,9 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     setupFiles: ['./vitest.setup.ts'],
+    // tmp-leak fix: one private temp root per run, leak count reported + root removed at teardown
+    // (scripts/lib/test-tmp-root.mjs; WE_TMP_LEAK_MODE / WE_TMP_LEAK_MAX).
+    globalSetup: ['./vitest.globalSetup.mjs'],
     // #xpc3krl — the real review + fix daemons, real rebuild/self-sync, a real bare remote (see the file
     // header above) need the real PATH/env this tier is built to exercise, so it opts OUT of
     // `vitest.setup.ts`'s sandbox-by-default (a fake `gh` on PATH, stripped WE_*/CONVEYOR_*/GH_*/CLAUDE_*
@@ -24,6 +28,14 @@ export default defineConfig({
     env: { WE_TEST_SANDBOX: '0' },
     include: ['scripts/conveyor/soak/**/*.soak.test.mjs'],
     pool: 'forks',
+    // heavy-enforce: the same per-run worker ceiling every other vitest config reads (vitest.shared.ts#maxTestWorkers,
+    // `WE_VITEST_MAX_WORKERS`) — each soak world forks daemon hosts, so an uncapped forks pool is the costliest of all.
+    poolOptions: {
+      forks: {
+        maxForks: maxTestWorkers,
+        minForks: 1,
+      },
+    },
     testTimeout: 15 * 60_000,
     hookTimeout: 5 * 60_000,
   },

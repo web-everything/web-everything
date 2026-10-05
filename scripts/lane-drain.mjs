@@ -67,7 +67,7 @@
  * failed (couple stopped, main left as far as it got); 3 = bad input (no manifest, invalid, not queued).
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, readdirSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, mkdtempSync, rmSync, existsSync, renameSync } from 'node:fs';
 import { resolve, join, isAbsolute, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
@@ -678,6 +678,21 @@ function rewriteSoakCardCitation(content, visit) {
  * failure is reported, the land stands.
  */
 export function numberPendingHashes(CWD, { dryRun = false } = {}) {
+  // Phase costs expose where the drain pass budget goes, including refused passes.
+  const phaseMs = { read: 0, precheck: 0, resolve: 0, apply: 0, write: 0 };
+  let phase = 'read';
+  let phaseStart = performance.now();
+  const nextPhase = (next) => {
+    const now = performance.now();
+    phaseMs[phase] += now - phaseStart;
+    phaseStart = now;
+    phase = next;
+  };
+  const finish = (result) => {
+    nextPhase(phase);
+    console.warn(`[numberPendingHashes] phaseMs ${Object.entries(phaseMs).map(([key, ms]) => `${key}=${ms.toFixed(2)}ms`).join(' ')}`);
+    return { ...result, phaseMs };
+  };
   const BL = join(CWD, 'backlog');
   const DOCS = join(CWD, 'docs', 'agent');
   const MEMORY = join(CWD, 'agent-memory-src');
@@ -782,13 +797,85 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     ordered.push(stem); done.add(idFromName(stem));
   }
 
-  // Assign contiguous max+1 in that order; record in the LOCAL ledger.
-  let maxNum = stems.map(idFromName).filter(isNum).reduce((m, n) => Math.max(m, Number(n)), 0);
   const ledgerAbs = join(CWD, LEDGER_REL);
   let ledger = {};
   try { ledger = JSON.parse(readFileSync(ledgerAbs, 'utf8')) || {}; } catch { ledger = {}; }
+
+  nextPhase('precheck');
+  // Check all pending hashes before assigning numbers or walking references.
+  const matchByHash = process.env.WE_JIT_UNSWEPT_CITE_MATCH === 'hash';
+  const pendingPaths = new Set(pending.map((stem) => `backlog/${stem}.md`));
+  const citeKey = (cite) => matchByHash ? cite.hash : cite.path;
+  const remainingBreakCites = new Map();
+  for (const { name, content } of breakFiles) {
+    const rewritten = rewriteSoakCardCitation(content, (hash) => pendingHashes.has(hash) ? '0000' : (ledger[hash] ?? hash));
+    remainingBreakCites.set(name, new Set(findHashPathCiteOutsideBacklog(rewritten, name).map(citeKey)));
+  }
+
+  // #4075 follow-up (xmd4pfa, hardening after the build-dispatch.flow.json incident) — NEVER COMMIT A
+  // RENAME THIS PASS CAN PROVE LEAVES A DANGLING CITATION. The dirs swept above (backlog/, docs/agent/,
+  // agent-memory-src/, scripts/conveyor/flows/, scripts/conveyor/soak/breaks/) are a maintained list that can lag
+  // a new citing file TYPE, exactly how `scripts/conveyor/flows/` itself lagged before this same incident
+  // added it (a flow file cited `backlog/xr05jjl-….md`; the card landed as #4220; every PR's CI went red on
+  // the 404'd path). Before writing or committing anything, re-check the REAL, WHOLE tracked tree — not just
+  // the dirs this pass already knows to fix — for a file this pass CANNOT fix still citing one of THIS
+  // pass's hashes by its file path. One `git grep` over the same HASH_PATH_CITE_SOURCE pattern check:standards'
+  // own gate uses (scripts/lib/citation-check.mjs — one source of truth, never two independently-drifting
+  // copies); repo-wide is still cheap (`--threads=1`, the #4166-measured win: a few tens of ms here).
+  //
+  // Hold exact tracked card paths by default; fixtures/stale slugs cannot be broken by this rename.
+  // WE_JIT_UNSWEPT_CITE_MATCH=hash restores the legacy any-path-with-that-hash hold.
+  // WE_JIT_UNSWEPT_CITE_POLICY=pass retains the legacy whole-pass refusal; other values use card policy.
+  // Historical ledger hashes are irrelevant here: only pending cards could be renamed by this pass.
+  const sweptRelPaths = new Set(files.map((f) => pathFor(f.name).relPath));
+  let unsweptHashPathCites = [];
+  try {
+    const hits = execFileSync(
+      'git', ['grep', '--threads=1', '-nE', HASH_PATH_CITE_SOURCE, '--', '.', ':!node_modules', ':!backlog'],
+      { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 },
+    ).split('\n').filter(Boolean);
+    unsweptHashPathCites = findHashPathCitesInGrepLines(hits)
+      // Soak modules are only partially swept: a repaired card field cannot hide a remaining
+      // hash-path citation in code/comments (even the same hash on the same line).
+      .filter((c) => (matchByHash ? pendingHashes.has(c.hash) : pendingPaths.has(c.path)) && (remainingBreakCites.has(c.file)
+        ? remainingBreakCites.get(c.file).has(citeKey(c))
+        : !sweptRelPaths.has(c.file)))
+      .map((c) => ({ path: c.file, hash: c.hash }));
+  } catch { /* git grep exits 1 on no match, or git unavailable — no findings either way, never abort on that alone */ }
+  const held = [];
+  const heldHashes = new Set();
+  if (unsweptHashPathCites.length) {
+    const detail = unsweptHashPathCites.map((f) => `${f.path} cites ${f.hash}`).join('; ');
+    if (process.env.WE_JIT_UNSWEPT_CITE_POLICY === 'pass') {
+      console.warn(`[numberPendingHashes] refusing this pass — a citation outside the rewrite scope would ` +
+        `dangle post-rename: ${detail}. Widen the sweep scope (scripts/lane-drain.mjs#numberPendingHashes) or ` +
+        `fix the citation, then this hash numbers on the next pass.`);
+      return finish({ assigned: [], committed: false, error: `hash-path citation outside the rewrite scope: ${detail}` });
+    }
+    for (const { hash, path } of unsweptHashPathCites) {
+      if (!heldHashes.has(hash)) {
+        heldHashes.add(hash);
+        held.push({ hash, citedBy: [] });
+      }
+      const entry = held.find((item) => item.hash === hash);
+      if (!entry.citedBy.includes(path)) entry.citedBy.push(path);
+    }
+    for (const { hash, citedBy } of held) {
+      console.warn(`[numberPendingHashes] holding ${hash} — cited by path outside the rewrite scope: ${citedBy.join(', ')}; ` +
+        `it stays pending (other cards number normally). Cite it as #${hash} instead.`);
+    }
+    if (heldHashes.size === pendingHashes.size) {
+      return finish({ assigned: [], committed: false, held, error: `hash-path citation outside the rewrite scope: ${detail}` });
+    }
+  }
+
+  // A held card must not be renamed by a STALE ledger entry either (the ledger is append-only and applyLedger
+  // swaps the whole of it), so drop any old mapping for it before anything reads the ledger.
+  for (const hash of heldHashes) delete ledger[hash];
+  // Assign contiguous max+1 only to eligible cards, retaining their topological order.
+  let maxNum = stems.map(idFromName).filter(isNum).reduce((m, n) => Math.max(m, Number(n)), 0);
   const assigned = [];
-  for (const stem of ordered) {
+  for (const stem of ordered.filter((name) => !heldHashes.has(idFromName(name)))) {
     const hash = idFromName(stem);
     maxNum += 1;
     const nnn = String(maxNum).padStart(3, '0');
@@ -796,10 +883,29 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     assigned.push({ hash, nnn });
   }
 
+  nextPhase('resolve');
   // Local bookkeeping cannot answer for another clone. Resolve explicit references through the
   // durable origin/main bornAs record before applying this clone's ledger (#2903).
   const unresolvedReferences = [];
-  const resolutions = new Map();
+  // One lazy bornAs scan replaces per-hash git startups within the drain pass budget.
+  let bornAsNumbers = null;
+  const landedNumbers = () => {
+    if (bornAsNumbers) return bornAsNumbers;
+    bornAsNumbers = new Map();
+    try {
+      const out = execFileSync('git', ['grep', '-E', '^bornAs: x[0-9a-z]{6}$', 'origin/main', '--', 'backlog/'],
+        { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 });
+      const seen = new Set();
+      for (const line of out.split('\n')) {
+        const match = line.match(/^origin\/main:(backlog\/.*):bornAs: (x[0-9a-z]{6})$/);
+        if (!match || seen.has(match[2])) continue;
+        seen.add(match[2]); // First path wins, even when its non-numeric stem yields no number.
+        const number = match[1].match(/backlog\/(\d{1,5})-.*\.md$/);
+        if (number) bornAsNumbers.set(match[2], number[1]);
+      }
+    } catch { /* best-effort — no origin/main or git failure means no landed mappings */ }
+    return bornAsNumbers;
+  };
   // #3383 perf — this used to answer "is `hash` visible on ANY ref" by building `visibleHashItems`
   // (a Set of every backlog file name on every ref) with ONE `git ls-tree -r -- backlog/` SUBPROCESS
   // PER visible ref (refs/heads/ + refs/remotes/), each one returning EVERY backlog filename at that
@@ -824,20 +930,45 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   const localHashStems = new Set(stems.map(idFromName).filter(isHash)); // this clone's own tree — free, no git call
   let refsCache = null;
   const listVisibleRefs = () => {
-    if (!refsCache) refsCache = (quietGit(CWD, ['for-each-ref', '--format=%(refname)', 'refs/heads/', 'refs/remotes/']) || '').split('\n').filter(Boolean);
+    if (!refsCache) refsCache = [...new Set((quietGit(CWD, ['for-each-ref', '--format=%(objectname)', 'refs/heads/', 'refs/remotes/']) || '').split('\n').filter(Boolean))];
     return refsCache;
   };
   let remoteHashSetCache = null; // built lazily ONCE per numberPendingHashes call, only if a fallback is ever needed
   const remoteVisibleHashes = () => {
     if (remoteHashSetCache) return remoteHashSetCache;
     remoteHashSetCache = new Set();
-    const refs = listVisibleRefs();
-    if (!refs.length) return remoteHashSetCache;
+    const tips = listVisibleRefs();
+    // Cache history across passes: deleted refs may retain diagnostic visibility (the safe direction).
+    const enabled = process.env.WE_JIT_VISIBLE_HASH_CACHE !== '0';
+    let cachePath = null;
+    let cached = null;
+    if (enabled) {
+      try {
+        cachePath = resolve(CWD, execFileSync('git', ['rev-parse', '--git-path', 'we-jit-visible-hashes.json'],
+          { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim());
+        const value = JSON.parse(readFileSync(cachePath, 'utf8'));
+        if (value.version === 1 && Array.isArray(value.tips) && Array.isArray(value.hashes) &&
+          value.tips.every((tip) => typeof tip === 'string' && /^[0-9a-f]{40,64}$/.test(tip)) &&
+          value.hashes.every((hash) => typeof hash === 'string' && isHash(hash))) cached = value;
+      } catch { /* missing/corrupt cache falls back to the full walk */ }
+    }
+    const cachedTips = new Set(cached?.tips ?? []);
+    const newTips = tips.filter((tip) => !cachedTips.has(tip));
+    if (cached) {
+      remoteHashSetCache = new Set(cached.hashes);
+      if (!newTips.length) return remoteHashSetCache;
+    }
+    const walk = (args) => execFileSync('git', ['rev-list', '--objects', ...args, '--', 'backlog/'],
+      { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
     let out = '';
     try {
-      out = execFileSync('git', ['rev-list', '--objects', ...refs, '--', 'backlog/'],
-        { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
-    } catch { /* best-effort — an exec miss leaves the set empty; every fallback reads 'unresolvable' */ }
+      if (tips.length) {
+        if (cached) {
+          try { out = walk([...newTips, '--not', ...cached.tips]); }
+          catch { out = walk(tips); } // A cached tip may have been garbage-collected.
+        } else out = walk(tips);
+      }
+    } catch { return remoteHashSetCache; } // Do not persist an incomplete walk.
     for (const line of out.split('\n')) {
       const sp = line.indexOf(' '); // bare `<sha>` (no space) = a commit/tree object, not a backlog file
       if (sp < 0) continue;
@@ -846,12 +977,20 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
       const id = idFromName(path.slice('backlog/'.length).replace(/\.md$/, ''));
       if (isHash(id)) remoteHashSetCache.add(id);
     }
+    if (cachePath) {
+      // Atomic replacement keeps interrupted drain passes from leaving a partial cache.
+      const tmp = `${cachePath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+      try {
+        writeFileSync(tmp, JSON.stringify({ version: 1, tips, hashes: [...remoteHashSetCache] }) + '\n');
+        renameSync(tmp, cachePath);
+      } catch { /* cache writes are best-effort */ }
+      finally { try { rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ } }
+    }
     return remoteHashSetCache;
   };
   const resolveReference = (hash, name) => {
     if (ledger[hash] !== undefined) return hash; // the existing ledger pass owns this rewrite
-    if (!resolutions.has(hash)) resolutions.set(hash, landedNumberFor(hash, CWD));
-    const landed = resolutions.get(hash);
+    const landed = landedNumbers().get(hash) ?? null;
     if (landed !== null) return landed;
     // A visible provisional item is positive evidence of in-flight work. Absence is NOT proof
     // of death: another clone may have an unfetched/private branch. Surface that uncertainty.
@@ -867,6 +1006,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   const resolvedFiles = files.map(({ name, content }) => ({ name,
     content: mapHashReferences(content, (hash) => resolveReference(hash, name)),
   }));
+  nextPhase('apply');
   // Only newly assigned items are stamped; fallback mappings never alter birth records or numbering.
   const { renames, rewrites, pathRenames } = applyLedger(resolvedFiles, ledger);
   // applyLedger compares against resolvedFiles, so retain fallback-only edits as well.
@@ -882,57 +1022,13 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   // Keep soak modules out of BOTH generic passes (fallback reference resolution and applyLedger,
   // including its path-renaming side effects). Old ledger entries are just as dangerous as new IDs:
   // 952011907 replaced the queue soak's historical HASH with its LANDED_NUM via an old ledger mapping.
-  const remainingBreakCites = new Map();
+  nextPhase('resolve');
   for (const { name, content } of breakFiles) {
     const rewritten = rewriteSoakCardCitation(content, (hash) => ledger[hash] ?? resolveReference(hash, name));
     if (rewritten !== content) rewrites.push({ name, content: rewritten });
-    remainingBreakCites.set(name, new Set(findHashPathCiteOutsideBacklog(rewritten, name).map((c) => c.hash)));
   }
 
-  // #4075 follow-up (xmd4pfa, hardening after the build-dispatch.flow.json incident) — NEVER COMMIT A
-  // RENAME THIS PASS CAN PROVE LEAVES A DANGLING CITATION. The dirs swept above (backlog/, docs/agent/,
-  // agent-memory-src/, scripts/conveyor/flows/, scripts/conveyor/soak/breaks/) are a maintained list that can lag
-  // a new citing file TYPE, exactly how `scripts/conveyor/flows/` itself lagged before this same incident
-  // added it (a flow file cited `backlog/xr05jjl-….md`; the card landed as #4220; every PR's CI went red on
-  // the 404'd path). Before writing or committing anything, re-check the REAL, WHOLE tracked tree — not just
-  // the dirs this pass already knows to fix — for a file this pass CANNOT fix still citing one of THIS
-  // pass's hashes by its file path. One `git grep` over the same HASH_PATH_CITE_SOURCE pattern check:standards'
-  // own gate uses (scripts/lib/citation-check.mjs — one source of truth, never two independently-drifting
-  // copies); repo-wide is still cheap (`--threads=1`, the #4166-measured win: a few tens of ms here).
-  //
-  // A hit outside this pass's own swept files means some file the sweep doesn't know how to fix would be
-  // left pointing at a path that is about to stop existing — so this pass REFUSES to number ANY of its
-  // pending hashes (fail closed, whole-pass, not a partial per-hash carve-out: committing SOME renames while
-  // leaving others' cross-refs half-rewritten risks a new, harder-to-see inconsistency, and the existing
-  // numbering-mutex-contention path above already defers the WHOLE pass on a lesser obstacle). The hash(es)
-  // stay pending and are retried on the very next land — same shape as that mutex deferral.
-  // Gate on THIS pass's own renames only — never the whole append-only ledger: a hash numbered in some past
-  // pass stays in the ledger forever, and a stale historical mention of its path must not block every later
-  // numbering (PR #2757 review).
-  const sweptRelPaths = new Set(files.map((f) => pathFor(f.name).relPath));
-  const renamingNow = new Set(assigned.map((a) => a.hash));
-  let unsweptHashPathCites = [];
-  try {
-    const hits = execFileSync(
-      'git', ['grep', '--threads=1', '-nE', HASH_PATH_CITE_SOURCE, '--', '.', ':!node_modules', ':!backlog'],
-      { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 },
-    ).split('\n').filter(Boolean);
-    unsweptHashPathCites = findHashPathCitesInGrepLines(hits)
-      // Soak modules are only partially swept: a repaired card field cannot hide a remaining
-      // hash-path citation in code/comments (even the same hash on the same line).
-      .filter((c) => renamingNow.has(c.hash) && (remainingBreakCites.has(c.file)
-        ? remainingBreakCites.get(c.file).has(c.hash)
-        : !sweptRelPaths.has(c.file)))
-      .map((c) => ({ path: c.file, hash: c.hash }));
-  } catch { /* git grep exits 1 on no match, or git unavailable — no findings either way, never abort on that alone */ }
-  if (unsweptHashPathCites.length) {
-    const detail = unsweptHashPathCites.map((f) => `${f.path} cites ${f.hash}`).join('; ');
-    console.warn(`[numberPendingHashes] refusing this pass — a citation outside the rewrite scope would ` +
-      `dangle post-rename: ${detail}. Widen the sweep scope (scripts/lane-drain.mjs#numberPendingHashes) or ` +
-      `fix the citation, then this hash numbers on the next pass.`);
-    return { assigned: [], committed: false, error: `hash-path citation outside the rewrite scope: ${detail}` };
-  }
-
+  nextPhase('apply');
   // #2400 — path-value refs are derived from UNTRUSTED backlog content, so CONFINE them to inside the repo
   // before acting: a crafted `relatedReport`/body token like `../../../outside/notes-<hash>.md` would
   // otherwise make `writeFileSync(join(CWD, to))` + `git rm from` write outside the tree and delete an
@@ -945,11 +1041,12 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   const livePathRenames = pathRenames.filter(({ from, to }) =>
     inRepo(from) && inRepo(to) && existsSync(join(CWD, from)));
   // #2319 — `number-stranded --dry-run`: report the planned mapping + renames without touching the tree/index.
-  if (dryRun) return {
-    assigned, committed: false, dryRun: true, unresolvedReferences,
+  if (dryRun) return finish({
+    assigned, held, committed: false, dryRun: true, unresolvedReferences,
     renamed: renames.map((r) => r.to),
     wouldRename: [...renames, ...livePathRenames].map((r) => ({ from: r.from, to: r.to })),
-  };
+  });
+  nextPhase('write');
   const rewriteByName = new Map(rewrites.map((r) => [r.name, r.content]));
   const renameFroms = new Set(renames.map((r) => r.from));
   // A rename is `git rm OLD` + write-to-NEW (NOT `git mv`): a scoped `git commit -- <paths>` is pathspec
@@ -969,7 +1066,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     const content = rewriteByName.has(from) ? rewriteByName.get(from) : readFileSync(join(BL, `${from}.md`), 'utf8');
     writeFileSync(join(BL, `${to}.md`), content);
     if (quietGit(CWD, ['rm', '--quiet', `backlog/${from}.md`]) == null)
-      return { assigned, committed: false, error: `git rm ${from} failed` };
+      return finish({ assigned, held, committed: false, error: `git rm ${from} failed` });
     toAdd.push(`backlog/${to}.md`);
     commitPaths.push(`backlog/${from}.md`, `backlog/${to}.md`);
   }
@@ -982,7 +1079,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     const content = swapHashes(readFileSync(join(CWD, from), 'utf8'), ledgerEntries);
     writeFileSync(join(CWD, to), content);
     if (quietGit(CWD, ['rm', '--quiet', from]) == null)
-      return { assigned, committed: false, error: `git rm ${from} failed` };
+      return finish({ assigned, held, committed: false, error: `git rm ${from} failed` });
     toAdd.push(to);
     commitPaths.push(from, to);
   }
@@ -1014,7 +1111,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   const paths = [...new Set(commitPaths)];
   const summary = assigned.map((a) => `${a.hash}→#${a.nnn}`).join(', ');
   const committed = quietGit(CWD, ['commit', '-m', assertNoClosingKeywordRef(`drain: JIT-number ${summary} at land (#2288)`, 'JIT-number commit message'), '--', ...paths]) != null;
-  return { assigned, committed, unresolvedReferences, renamed: [...renames, ...livePathRenames].map((r) => r.to), changedPaths: paths };
+  return finish({ assigned, held, committed, unresolvedReferences, renamed: [...renames, ...livePathRenames].map((r) => r.to), changedPaths: paths });
 }
 
 /**

@@ -46,6 +46,7 @@ import {
   PROVENANCE_ESCAPE_MARKERS,
   findHashPathCiteOutsideBacklog,
   findHashPathCitesInGrepLines,
+  classifyHashPathCite,
   HASH_PATH_CITE_SOURCE,
   findDanglingBacklogGlobCite,
   BACKLOG_GLOB_CITE_SOURCE,
@@ -354,6 +355,14 @@ describe('findHashPathCiteOutsideBacklog — #4075 follow-up (xmd4pfa): a hash-n
 
   it('PASSES (empty) for the SAME hash-named path cited from INSIDE backlog/ itself — the ledger\'s own target, always exempt', () => {
     expect(findHashPathCiteOutsideBacklog('see backlog/xr05jjl-describe-every-conveyor-flow.md', 'backlog/2200-other.md')).toHaveLength(0);
+  });
+
+  it('exempts captured thread data in both the direct and shared grep scanners', () => {
+    const file = 'scripts/conveyor/soak/fixtures/pr-3794-live-thread.json';
+    const text = 'backlog/xcs4nce-card.md and backlog/xi8vgqq-card.md';
+    expect(findHashPathCiteOutsideBacklog(text, file)).toEqual([]);
+    expect(findHashPathCitesInGrepLines([`${file}:1:${text}`])).toEqual([]);
+    expect(findHashPathCiteOutsideBacklog(text, 'scripts/conveyor/soak/other.json')).toHaveLength(2);
   });
 
   it('PASSES (empty) for a numeric backlog path — JIT numbering never renames an already-landed #NNN', () => {
@@ -1207,5 +1216,23 @@ describe('findBlankLineLoci — gate 6f-ii-e (cited start line is blank)', () =>
   it('does not read the trailing terminator as a blank line; far past EOF also yields nothing', () => {
     expect(run('we:scripts/b.mjs:3')).toHaveLength(0);
     expect(run('we:scripts/b.mjs:999')).toHaveLength(0);
+  });
+});
+
+describe('classifyHashPathCite', () => {
+  const real = 'backlog/xhash01-real-slug.md';
+  const exists = (path) => path === real;
+  const citingFile = 'docs/agent/rule.md';
+  it.each([[new Set([citingFile])], [[citingFile]]])('classifies an owned exact existing path as resolving (%s)', (changedFiles) => {
+    expect(classifyHashPathCite({ cited: real, exists, citingFile, changedFiles })).toBe('resolving');
+  });
+  it.each([[new Set(['other.md'])], [['other.md']], [null], [undefined]])('keeps unowned or unknown changes non-resolving (%s)', (changedFiles) => {
+    expect(classifyHashPathCite({ cited: real, exists, citingFile, changedFiles })).toBe('unowned');
+  });
+  it('classifies a different slug with the same hash as dangling', () => {
+    expect(classifyHashPathCite({ cited: 'backlog/xhash01-fixture-slug.md', exists, citingFile, changedFiles: [citingFile] })).toBe('dangling');
+  });
+  it('classifies a missing card as dangling', () => {
+    expect(classifyHashPathCite({ cited: real, exists: () => false, citingFile, changedFiles: [citingFile] })).toBe('dangling');
   });
 });

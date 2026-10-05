@@ -869,7 +869,7 @@ export function clearTerminalFixAttempts(fixAttempts, prs) {
  * @param {{ prs?:object[], launchedNums?:Array<*>, liveCiHealGuards?:object[], ciHealAttempts?:object, prCiHealCounts?:object, retryCap?:number, availableLanes?:Array<*>, tick:number }} ctx
  * @returns {{ spawns:Array<{pr:number, num:*, lane:*, reason:string}>, newGuards:Array<object>, ciHealAttempts:object, consumedLanes:Array<*>, notes:Array<object> }}
  */
-export function planCiHealSpawns({ prs = [], launchedNums = [], liveCiHealGuards = [], ciHealAttempts = {}, prCiHealCounts = {}, retryCap = DEFAULT_CI_HEAL_RETRY_CAP, availableLanes = [], tick = 0, now = null } = {}) {
+export function planCiHealSpawns({ prs = [], launchedNums = [], liveCiHealGuards = [], ciHealAttempts = {}, prCiHealCounts = {}, prCiHealRefunds = {}, retryCap = DEFAULT_CI_HEAL_RETRY_CAP, availableLanes = [], tick = 0, now = null } = {}) {
   const launched = new Set((Array.isArray(launchedNums) ? launchedNums : []).map(normNum));
   const guardedPrs = new Set((Array.isArray(liveCiHealGuards) ? liveCiHealGuards : []).map((g) => Number(g.pr)));
   const nextAttempts = { ...(ciHealAttempts && typeof ciHealAttempts === 'object' ? ciHealAttempts : {}) };
@@ -888,18 +888,21 @@ export function planCiHealSpawns({ prs = [], launchedNums = [], liveCiHealGuards
     if (guardedPrs.has(pr)) continue; // a CI-heal agent for this PR is already live
     // DURABLE re-heal-comment count is the restart-surviving floor; the in-session tally the within-session overlay
     // (it alone catches a heal that died before posting its comment). The cap binds on whichever is higher (#2643).
-    const attempts = Math.max(Number(nextAttempts[pr]) || 0, Number(durable[pr]) || 0);
+    const refunded = Number(prCiHealRefunds[pr]) || 0;
+    const refund = refunded > 0 ? { refunded } : {};
+    const attempts = Math.max(0, (Number(nextAttempts[pr]) || 0) - refunded, Number(durable[pr]) || 0);
     if (attempts >= retryCap) {
-      notes.push({ kind: 'ci-heal-exhausted', num: p.num, pr, attempts, text: `PR #${pr} (#${p.num}) went red/BEHIND ${attempts}× — auto CI-heal exhausted, run /review ${pr}` });
+      notes.push({ kind: 'ci-heal-exhausted', num: p.num, pr, attempts, ...refund, text: `PR #${pr} (#${p.num}) went red/BEHIND ${attempts}× — auto CI-heal exhausted, run /review ${pr}` });
       continue;
     }
     if (lanes.length === 0) { notes.push({ kind: 'ci-heal-no-lane', num: p.num, pr, text: `no free lane to CI-heal PR #${pr}` }); continue; }
     const lane = lanes.shift();
     consumedLanes.push(lane);
     guardedPrs.add(pr);
-    nextAttempts[pr] = attempts + 1;
+    // Keep the stored tally gross so the same window cannot refund it twice (#3794 live case, 2026-10-04).
+    nextAttempts[pr] = attempts + refunded + 1;
     const reason = isRedCi(p) ? 'red-ci' : 'behind';
-    spawns.push({ pr, num: p.num, lane, reason });
+    spawns.push({ pr, num: p.num, lane, reason, ...refund });
     newGuards.push({ pr, num: p.num, lane, ...spawnStamp(tick, now) });
   }
   return { spawns, newGuards, ciHealAttempts: nextAttempts, consumedLanes, notes };
@@ -1186,7 +1189,7 @@ export function buildStatusLine({ queue = [], lanes = [], prs = [], health = {},
  * }} input
  * @returns {{ decisions:object, nextState:object }}
  */
-export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = {}, signals = {}, prRearmCounts = {}, prCiHealCounts = {}, admission = {}, liveAgentSessions = [], config = {}, now = null, lastOperatorTurn = null, dispatchPaused = false, dispatchPausedKinds = null, dispatchPausedReason = null, loadAdmission = {}, queueAdmission = null, itemSizes = {} } = {}) {
+export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = {}, signals = {}, prRearmCounts = {}, prCiHealCounts = {}, prCiHealRefunds = {}, admission = {}, liveAgentSessions = [], config = {}, now = null, lastOperatorTurn = null, dispatchPaused = false, dispatchPausedKinds = null, dispatchPausedReason = null, loadAdmission = {}, queueAdmission = null, itemSizes = {} } = {}) {
   // THE PAUSE, RESOLVED PER KIND (epic #3383). `pausedKinds` is the concrete list this tick holds: `[]` when
   // nothing is paused, all six when the marker declares no scope (an old-format `{paused:true}` file, or any
   // caller that still passes only the boolean — both keep holding everything, unchanged), or exactly the
@@ -1511,7 +1514,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   //    #3609 — held by the same manual dispatch-pause as steps 4/6; `ciHealAttempts` passes through UNCHANGED.
   const ciHealPlanRaw = kindPaused('ci-heal')
     ? { spawns: [], newGuards: [], ciHealAttempts, consumedLanes: [], notes: [] }
-    : planCiHealSpawns({ prs, launchedNums, liveCiHealGuards: ciHeal.live, ciHealAttempts, prCiHealCounts, retryCap: cfg.ciHealRetryCap, availableLanes, tick, now });
+    : planCiHealSpawns({ prs, launchedNums, liveCiHealGuards: ciHeal.live, ciHealAttempts, prCiHealCounts, prCiHealRefunds, retryCap: cfg.ciHealRetryCap, availableLanes, tick, now });
   // Card xkyw1x4 — queue-cap on CI-heal spawns. planCiHealSpawns bumps the attempt count at plan time, so a held
   // heal also gets its PR's prior count back (a held heal is not an attempt).
   const ciHealQueue = applyQueueCapToSpawns(ciHealPlanRaw, 'ci-heal', queueBudget);
@@ -1967,9 +1970,10 @@ async function main(argv) {
   // never bind on a fresh conveyor. Only `review:changes` PRs are read (rare), so it adds no per-tick gh cost in
   // the common case; a comment read that fails is best-effort (floor 0 — the in-session tally still guards).
   const { countRearmComments } = await import('./rearm-review.mjs');
-  const { countCiHealComments } = await import('./ci-heal-mark.mjs');
+  const { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore } = await import('./ci-heal-mark.mjs');
   const prRearmCounts = {};
   const prCiHealCounts = {};
+  const prCiHealRefunds = {};
   // ONE `gh pr view … --json comments` per PR that is EITHER a `review:changes` bounce (fix-loop floor, #2643) OR a
   // CI-heal target (CI-heal floor, #2666). Both durable floors read the SAME comment thread, so a single read serves
   // both counters — a red/BEHIND PR that is also `review:changes` is owned by the fix loop, but reading its comments
@@ -1994,7 +1998,10 @@ async function main(argv) {
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' }));
       const comments = JSON.parse(raw)?.comments;
       if (wantsRearm) prRearmCounts[p.prNumber] = countRearmComments(comments);
-      if (wantsCiHeal) prCiHealCounts[p.prNumber] = countCiHealComments(comments);
+      if (wantsCiHeal) {
+        prCiHealCounts[p.prNumber] = countChargeableCiHealComments(comments, { restore: resolveCiHealBudgetRestore(process.env) });
+        prCiHealRefunds[p.prNumber] = countCiHealComments(comments) - prCiHealCounts[p.prNumber];
+      }
     } catch { /* leave the floor unset — the in-session tally still guards the cap */ }
   }
 
@@ -2088,7 +2095,7 @@ async function main(argv) {
 
   // epic #3383 — dispatchPausedKinds carries the manual-pause marker's KIND SCOPE through verbatim (`null` =
   // blanket pause); dropping it here would silently re-widen a scoped pause back to holding all six kinds.
-  const out = planTick({ state, plan, freeLanes, bookkeeping, signals, prRearmCounts, prCiHealCounts, admission, liveAgentSessions, config, now: Date.now(), lastOperatorTurn, dispatchPaused, dispatchPausedKinds, dispatchPausedReason, loadAdmission, queueAdmission, itemSizes });
+  const out = planTick({ state, plan, freeLanes, bookkeeping, signals, prRearmCounts, prCiHealCounts, prCiHealRefunds, admission, liveAgentSessions, config, now: Date.now(), lastOperatorTurn, dispatchPaused, dispatchPausedKinds, dispatchPausedReason, loadAdmission, queueAdmission, itemSizes });
   // Always expose the observed phase costs, including in the builder log; the pure decision is unchanged.
   out.decisions.timings = timings;
   writeAllSync(1, JSON.stringify(out, null, 2) + '\n');

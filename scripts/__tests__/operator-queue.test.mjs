@@ -207,6 +207,7 @@ describe('main', () => {
     main(['--repo=owner/broken', '--repo=owner/good', '--json'], { unsupportedPath: NO_UNSUPPORTED });
     expect(JSON.parse(log.mock.calls[0][0])).toEqual({
       ready: [{ repo: 'owner/good', number: 42, title: 'Ready for review' }],
+      rulingNeeded: [],
       pending: [],
       notReady: [{
         repo: 'owner/good', number: 43, title: 'Ready for review',
@@ -234,7 +235,7 @@ describe('main', () => {
       .mockReturnValueOnce(JSON.stringify({ mergeable: 'MERGEABLE' }));
     main(['--repo=o/n', '--json'], { sleep, unsupportedPath: NO_UNSUPPORTED });
     expect(JSON.parse(log.mock.calls[0][0])).toEqual({
-      ready: [{ repo: 'o/n', number: 43, title: 'Ready for review' }], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [], laneDecisions: [], backpressure: [], reconcileNotes: [],
+      ready: [{ repo: 'o/n', number: 43, title: 'Ready for review' }], rulingNeeded: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [], laneDecisions: [], backpressure: [], reconcileNotes: [],
     });
     expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([1000, 2000]);
   });
@@ -246,7 +247,7 @@ describe('main', () => {
     vi.mocked(execFileSync).mockReturnValue(JSON.stringify({ mergeable: 'UNKNOWN' }));
     main(['--repo=o/n', '--json'], { sleep, unsupportedPath: NO_UNSUPPORTED });
     expect(JSON.parse(log.mock.calls[0][0])).toEqual({
-      ready: [], pending: [{ repo: 'o/n', number: 43, title: 'Ready for review' }], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [], laneDecisions: [], backpressure: [], reconcileNotes: [],
+      ready: [], rulingNeeded: [], pending: [{ repo: 'o/n', number: 43, title: 'Ready for review' }], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [], laneDecisions: [], backpressure: [], reconcileNotes: [],
     });
     expect(sleep).toHaveBeenCalledTimes(4);
   });
@@ -268,6 +269,7 @@ describe('main', () => {
     main(['--repo=o/n'], { sleep: vi.fn(), unsupportedPath: NO_UNSUPPORTED });
     expect(log.mock.calls.map(([line]) => line)).toEqual([
       'NEEDS YOU (review:human + advisory:accepted, all gates pass):', '(none)',
+      'RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:', '(none)',
       'PENDING — transient, re-run (GitHub is still computing mergeability; no agent work owed):', 'o/n#43  Ready for review',
       'UNSUPPORTED REPO — owed work the conveyor cannot dispatch for this repo:', '(none)',
       'NOT READY — agent work (review:human but gates fail):', '(none)',
@@ -283,6 +285,7 @@ describe('main', () => {
     main([], { unsupportedPath: NO_UNSUPPORTED });
     expect(log.mock.calls.map(([line]) => line)).toEqual([
       'NEEDS YOU (review:human + advisory:accepted, all gates pass):', '(none)',
+      'RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:', '(none)',
       'PENDING — transient, re-run (GitHub is still computing mergeability; no agent work owed):', '(none)',
       'UNSUPPORTED REPO — owed work the conveyor cannot dispatch for this repo:', '(none)',
       'NOT READY — agent work (review:human but gates fail):', '(none)',

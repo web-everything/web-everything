@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	OFF by default: the health-watch tick samples every 5 min.
+	Uses the same wev-health-watch clone as com.we.health-watch; install dependencies there first.
+	Pin CONVEYOR_STATE_ROOT to the same root as the health watch. No GitHub calls or credentials.
+	To enable: copy to ~/Library/LaunchAgents/com.we.heavy-run-sample.plist,
+	remove the Disabled key (or launchctl enable gui/$(id -u)/com.we.heavy-run-sample),
+	set WE_HEAVY_SAMPLE_INTERVAL_S to the desired interval in seconds (>= 10), then run:
+	launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.we.heavy-run-sample.plist
+	To disable: launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.we.heavy-run-sample.plist
+	-->
+	<key>Disabled</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>CONVEYOR_STATE_ROOT</key>
+		<string>/Users/nicolasgilbert/workspace/webeverything</string>
+		<key>WE_HEAVY_SAMPLE_INTERVAL_S</key>
+		<string>60</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.we.heavy-run-sample</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin/node</string>
+		<string>/Users/nicolasgilbert/workspace/wev-health-watch/scripts/conveyor/heavy-run-ungated.mjs</string>
+		<string>loop</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/nicolasgilbert/workspace/wev-health-watch/.conveyor/heavy-run-sample.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/nicolasgilbert/workspace/wev-health-watch/.conveyor/heavy-run-sample.log</string>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/nicolasgilbert/workspace/wev-health-watch</string>
+</dict>
+</plist>

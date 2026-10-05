@@ -1,4 +1,5 @@
-import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER } from '../jury-core.mjs';
+import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, liveReferrals } from '../jury-core.mjs';
+import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER, REFERRAL_STAMP_POLICY_ENV, resolveReferralStampPolicy } from '../jury-core.mjs';
 /**
  * @file jury-core.test.mjs — proof of the #2654 (S2 of epic #2649) append-only JURY-LEDGER EVENT VOCABULARY:
  *   the `JURY_EVENT_TYPES` / `JUROR_STATUSES` enums and the pure `validateJuryEvent` / `normalizeJuryEvent`
@@ -7,7 +8,7 @@ import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, 
  *   directly (these symbols are NOT re-exported through the PR-diff-specific review-core), so this file imports
  *   from '../jury-core.mjs' directly.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1582,6 +1583,104 @@ describe('#4315 mandatory referral protocol', () => {
     lens: 'correctness', result, rationale: 'Verified against the pinned diff', evidence: ['diff:lease-reaper'],
     ...(result === 'card' ? { card: 'we:backlog/4315-example.md' } : {}) });
 
+  function supersession() {
+    const a = record();
+    a.referrals[0].seat = 'judge';
+    a.referrals[0].key = referralFindingKey('judge', finding);
+    a.rulings = [rule(a)];
+    const b = record();
+    b.runId = 'advisory-run'; b.reviewer = mandatoryReferralReviewer(b.runId); b.attempted = false;
+    const by = { runId: a.runId, key: a.referrals[0].key, rulingId: 'r1' };
+    b.superseded = [{ key: b.referrals[0].key, reason: REFERRAL_SUPERSEDE_REASON, by }];
+    return { a, b, by, context: { records: [a], head: a.head, repo: a.repo, pr: a.pr } };
+  }
+
+  it('validates and visibly renders advisory supersession', () => {
+    const { b } = supersession();
+    expect(Object.isFrozen(ADVISORY_REFERRAL_SEATS)).toBe(true);
+    expect(validateReferralRecord(b)).toBe(true);
+    expect(renderReferralRecord(b)).toContain(REFERRAL_SUPERSEDE_REASON + ' (by run run-referral)');
+    expect(liveReferrals(b)).toEqual([]);
+    expect(activeReferrals(b)).toHaveLength(1);
+  });
+
+  it.each(['seat', 'key', 'reason', 'both', 'neither', 'self', 'array', 'duplicate'])('rejects invalid supersession: %s', kind => {
+    const { b } = supersession(), entry = b.superseded[0];
+    if (kind === 'seat') { b.referrals[0].seat = 'judge'; b.referrals[0].key = referralFindingKey('judge', finding); entry.key = b.referrals[0].key; entry.by.key = 'other'; }
+    if (kind === 'key') entry.key = 'unknown';
+    if (kind === 'reason') entry.reason = 'wrong';
+    if (kind === 'both') entry.by.operator = true;
+    if (kind === 'neither') delete entry.by.rulingId;
+    if (kind === 'self') entry.by.key = entry.key;
+    if (kind === 'array') b.superseded = {};
+    if (kind === 'duplicate') b.superseded.push(structuredClone(entry));
+    expect(validateReferralRecord(b)).toBe(false);
+  });
+
+  it('rejects rewritten supersession snapshots', () => {
+    const { b } = supersession(), next = structuredClone(b);
+    next.superseded[0].by.rulingId = 'replacement';
+    expect(readReferralRecords([b, next].map(r => post(renderReferralRecord(r)))).malformed).toBe(true);
+  });
+
+  it.each(['exact', 'near', 'file', 'far', 'mandatory', 'block', 'head', 'replaced', 'no-file', 'one-null', 'repo', 'pr', 'self'])
+  ('matches only applicable active not-real rulings: %s', kind => {
+    const { a, b, by, context } = supersession();
+    const f = b.referrals[0];
+    if (kind === 'near') { a.referrals[0].finding.line = 10; f.finding.line = 18; f.finding.file = './' + f.finding.file; f.finding.summary = 'merge resolution unexpectedly lost'; }
+    if (kind === 'file') f.finding.file = 'other.mjs';
+    if (kind === 'far') { a.referrals[0].finding.line = 10; f.finding.line = 19; }
+    if (kind === 'mandatory') f.seat = 'judge';
+    if (kind === 'block') a.rulings[0].result = 'block';
+    if (kind === 'head') a.head = 'b'.repeat(40);
+    if (kind === 'repo') a.repo = 'other/repo';
+    if (kind === 'pr') a.pr++;
+    if (kind === 'replaced') a.rulings.push({ ...rule(a, 'block'), id: 'r2', supersedes: 'r1' });
+    if (kind === 'no-file') { f.finding.file = null; a.referrals[0].finding.file = null; }
+    if (kind === 'one-null') f.finding.line = 1;
+    if (kind === 'self') f.key = by.key;
+    expect(findSupersedingNotReal(f, context)).toEqual(['exact', 'near'].includes(kind) ? by : null);
+  });
+
+  it('matches operator not-real rulings and resolves their backing', () => {
+    const { a, b, context, by } = supersession();
+    a.rulings = [];
+    const operator = { repo: a.repo, pr: a.pr, head: a.head, runId: a.runId, key: by.key, result: 'not-real', operator: true };
+    const expected = { runId: a.runId, key: by.key, operator: true };
+    context.operatorRulings = [operator];
+    expect(findSupersedingNotReal(b.referrals[0], context)).toEqual(expected);
+    b.superseded[0].by = expected;
+    expect(referralRecordState(b, context).pending).toEqual([]);
+    expect(referralRecordState(b).pending).toHaveLength(1);
+  });
+
+  it.each(['runId', 'repo', 'pr', 'head', 'id', 'key', 'result'])('keeps a mismatched backing %s pending', field => {
+    const { a, b, context } = supersession();
+    if (['id', 'key', 'result'].includes(field)) a.rulings[0][field] = 'wrong';
+    else a[field] = field === 'pr' ? 8 : 'wrong';
+    expect(referralRecordState(b, context).pending).toEqual([b.referrals[0].key]);
+  });
+
+  it('prefers the first matching record and respects an own operator block', () => {
+    const { a, b, by, context } = supersession();
+    const later = { ...a, runId: 'later' };
+    expect(findSupersedingNotReal(b.referrals[0], { ...context, records: [a, later] })).toEqual(by);
+    context.operatorRulings = [{ repo: b.repo, pr: b.pr, head: b.head, runId: b.runId,
+      key: b.referrals[0].key, result: 'block', operator: true }];
+    expect(referralRecordState(b, context).blocked).toEqual([b.referrals[0].key]);
+  });
+
+  it('clears only backed supersession, preserves own rulings, and folds the thread', () => {
+    const { a, b, context } = supersession();
+    expect(referralRecordState(b, context).pending).toEqual([]);
+    expect(referralRecordState(b).pending).toHaveLength(1);
+    expect(referralRecordState(b, { records: [] }).pending).toHaveLength(1);
+    expect(mandatoryReferralState([a, b].map(r => post(renderReferralRecord(r))), context).pending).toEqual([]);
+    b.rulings = [rule(b, 'block')];
+    expect(liveReferrals(b)).toHaveLength(1);
+    expect(referralRecordState(b, context).blocked).toEqual([b.referrals[0].key]);
+  });
+
   it('audited optional-seat drops are append-only and cannot clear mandatory or unknown sources', () => {
     for (const seat of ['judgeAntigravityReview', 'agy-gemini', 'agy-claude', 'judge', 'judgeSecurity', 'unknown']) {
       const r = record();
@@ -1629,7 +1728,44 @@ describe('#4315 mandatory referral protocol', () => {
       expect(validateReferralRecord({ ...r, rulings: [{ ...r.rulings[0], ...patch }] })).toBe(false);
     }
     expect(referralRecordState(r, { body: `<!-- authored-by-actor: ${r.reviewer.id} -->` }).pending).toHaveLength(1);
-    expect(referralRecordState(r, { body: '' }).pending).toHaveLength(1);
+    expect(referralRecordState(r, { body: '' }).pending).toEqual([r.referrals[0].key, 'author-stamp-missing']);
+  });
+  it('resolves the missing-stamp policy strictly: only the exact value `run-identity` relaxes it', () => {
+    expect(resolveReferralStampPolicy({})).toBe('refuse');
+    expect(resolveReferralStampPolicy({ [REFERRAL_STAMP_POLICY_ENV]: 'refuse' })).toBe('refuse');
+    expect(resolveReferralStampPolicy({ [REFERRAL_STAMP_POLICY_ENV]: 'run-identity' })).toBe('run-identity');
+    for (const v of ['Run-Identity', ' run-identity', 'RUN-IDENTITY', 'strict', 'true', '1', '']) {
+      expect(resolveReferralStampPolicy({ [REFERRAL_STAMP_POLICY_ENV]: v })).toBe('refuse');
+    }
+  });
+  it('holds an unstamped PR by default for both missing-stamp statuses, through the gate', () => {
+    const r = record(); r.authorBody = ''; r.rulings = [rule(r)];
+    const pending = [r.referrals[0].key, 'author-stamp-missing'];
+    const comments = [post(renderReferralRecord(r))];
+    // post-regime → stamp-lost; pre-regime → unknown-author; neither relaxes without the explicit opt-in.
+    for (const [createdAt, status] of [['2026-10-04T17:17:58Z', 'stamp-lost'], ['2026-01-01T00:00:00Z', 'unknown-author']]) {
+      expect(referralRecordState(r, { createdAt })).toMatchObject({ pending, independence: { status, fallback: false } });
+      expect(mandatoryReferralState(comments, { createdAt }).pending).toEqual(pending);
+    }
+  });
+  it('counts a run-derived reviewer ruling when the author stamp is missing only on the explicit opt-in', () => {
+    const r = record(); r.authorBody = ''; r.rulings = [rule(r)];
+    expect(validateReferralRecord(r)).toBe(true);
+    const createdAt = '2026-10-04T17:17:58Z';
+    expect(referralRecordState(r, { createdAt, stampPolicy: 'run-identity' })).toMatchObject({
+      pending: [], independence: { status: 'stamp-lost', fallback: true },
+    });
+    // The same opt-in read from the real env var through the gate's default resolver.
+    const comments = [post(renderReferralRecord(r))];
+    vi.stubEnv(REFERRAL_STAMP_POLICY_ENV, 'run-identity');
+    try { expect(mandatoryReferralState(comments, { createdAt }).pending).toEqual([]); } finally { vi.unstubAllEnvs(); }
+    expect(mandatoryReferralState(comments, { createdAt }).pending).toEqual([r.referrals[0].key, 'author-stamp-missing']);
+  });
+  it('never applies the missing-stamp fallback to self-clear, even on the opt-in', () => {
+    const r = record(); r.rulings = [rule(r)];
+    expect(referralRecordState(r, { body: `<!-- authored-by-actor: ${r.reviewer.id} -->`, stampPolicy: 'run-identity' })).toMatchObject({
+      pending: [r.referrals[0].key], independence: { status: 'self-clear', fallback: false },
+    });
   });
   it('requires a current head and readable card; block never grants acceptance', () => {
     for (const result of ['block', 'card', 'not-real']) {

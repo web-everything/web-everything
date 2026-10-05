@@ -372,6 +372,34 @@ export const MERGE_BASE_RED_CONCLUSIONS = Object.freeze(['failure', 'timed_out']
 /** `CI` push-run conclusions that mean main's CI really FINISHED at a commit (never `cancelled`). */
 export const MERGE_BASE_FINISHED_RUN_CONCLUSIONS = Object.freeze(['success', 'failure']);
 
+/** Check-standards messages only; #3794 live case, 2026-10-04. */
+export function extractCiErrorSignatures(logText) {
+  if (typeof logText !== 'string') return [];
+  return [...new Set(logText.split('\n').flatMap((line) => {
+    const clean = line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+      .replace(/^[^\t]*\t[^\t]*\t/, '')
+      .replace(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\s*/, '');
+    const message = /^\s*error\s+(.+)$/.exec(clean)?.[1]?.trim();
+    return message ? [message] : [];
+  }))];
+}
+
+/** Stable literal emitter text; #3794 live case, 2026-10-04. */
+export function signatureFragments(message) {
+  if (typeof message !== 'string') return [];
+  return [...new Set(message.replace(/^\S+:\s+/, '')
+    .split(/`[^`]*`|#[\w-]+|\S*\/\S*|\b\d+(?:\.\d+)*\b| — |[()]/)
+    .map((part) => part.trim())
+    .filter((part) => part.length >= 15 && part.split(/\s+/).length >= 3))];
+}
+
+/** Every error needs an emitter and later main commit; #3794 live case, 2026-10-04. */
+export function isMainFixedSignatureOwed(facts) {
+  return Array.isArray(facts?.signatures) && facts.signatures.length > 0
+    && facts.signatures.every((s) => Array.isArray(s?.emitterFiles) && s.emitterFiles.length > 0
+      && Array.isArray(s?.fixCommits) && s.fixCommits.length > 0);
+}
+
 /**
  * we:scripts/conveyor/main-red-recovery.mjs#isPrCiFailureOwedRerun — THE gate `reconcile-core.mjs` consults to
  * decide `owed-ci-rerun` (never a `ci-heal`) for a `ci-red` PR. PURE.
@@ -421,7 +449,7 @@ export const MERGE_BASE_FINISHED_RUN_CONCLUSIONS = Object.freeze(['success', 'fa
 export function isPrCiFailureOwedRerun({
   requiredCheckCompletedAt, aheadBy, mainRedWindows, failingCheckName = null, mainLatestCheckRuns = null,
   prContainsMainGreenSha = null, mergeBaseCheckRuns = null, mergeBaseRunConclusion = null,
-  comments = [], headSha = null, prScopedChecks = resolvePrScopedChecks(),
+  comments = [], headSha = null, prScopedChecks = resolvePrScopedChecks(), mainFixedSignature = null,
 } = {}) {
   // A PR-scoped check (DEFAULT_PR_SCOPED_CHECKS) fails on the PR's own content — a rebase never clears it.
   if (failingCheckName && prScopedChecks.includes(failingCheckName)) return false;
@@ -432,7 +460,7 @@ export function isPrCiFailureOwedRerun({
   return isMainGreenFixOwed({
     failingCheckName, mainLatestCheckRuns, prContainsMainGreenSha, mergeBaseCheckRuns, mergeBaseRunConclusion,
     comments, headSha,
-  });
+  }) || isMainFixedSignatureOwed(mainFixedSignature);
 }
 
 /**
@@ -504,7 +532,8 @@ export function planMainRedRebases({
       mergeBaseRunConclusion: c?.mergeBaseRunConclusion ?? null,
     });
 
-    if (attribution !== 'main-red' && !mainGreenForCheck) {
+    const mainFixed = attribution !== 'main-red' && !mainGreenForCheck && isMainFixedSignatureOwed(c.mainFixedSignature);
+    if (attribution !== 'main-red' && !mainGreenForCheck && !mainFixed) {
       refusals.push({
         ...base, kind: attribution === 'unknown' ? 'unknown-attribution' : 'own-failure',
         why: attribution === 'unknown'
@@ -547,7 +576,12 @@ export function planMainRedRebases({
     }
     dispatch.push({
       ...base, attempts: rebaseAttempts, kind: 'rebase-onto-main',
-      why: mainGreenForCheck
+      ...(mainFixed ? { attribution: 'main-fixed-signature', attributedWindow: {
+        from: c.mainFixedSignature.bugIntroducedAt, to: c.mainFixedSignature.fixedAt,
+      } } : {}),
+      why: mainFixed
+        ? `PR #${prNumber}'s error signatures were fixed on main by ${[...new Set(c.mainFixedSignature.signatures.flatMap((s) => s.fixCommits))].map((sha) => sha.slice(0, 9)).join(', ')} — refreshing onto main`
+        : mainGreenForCheck
         ? `PR #${prNumber}'s \`${base.failingCheckName}\` check failed at ${base.failureCompletedAt}, but is passing on main's own latest completed run and this head is ${base.aheadBy} commit(s) behind it — main has since fixed this, refreshing onto it`
         : `PR #${prNumber}'s required check failed at ${base.failureCompletedAt}, inside a window where main's own CI was red; main has recovered and this head is ${base.aheadBy} commit(s) behind it — refreshing onto main`,
     });
@@ -624,6 +658,7 @@ export function countRebaseOntoMainComments(comments, headSha = null) {
  */
 export function buildRebaseOntoMainComment({
   headRefName = null, headSha = null, ok = true, action = 'rebased', error = null,
+  attribution = null, attributedWindow = null,
 } = {}) {
   const outcome = ok
     ? (action === 'current'
@@ -635,6 +670,10 @@ export function buildRebaseOntoMainComment({
     '',
     `branch: ${headRefName ?? '(unknown)'}`,
     `sha: ${headSha ?? '(unknown)'}`,
+    ...(attribution === 'main-fixed-signature' && attributedWindow ? [
+      'attribution: main-fixed-signature',
+      `attributed-window: ${attributedWindow.from} ${attributedWindow.to}`,
+    ] : []),
     `conveyor rebase-onto-main ${outcome}`,
   ].join('\n');
 }

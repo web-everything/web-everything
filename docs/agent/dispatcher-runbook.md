@@ -93,6 +93,45 @@ This is about a **delivery agent** the runner spawned (`claude --bg`), not the r
    acquired — that's a separate judgment call (was the tree actually clean?). Release it by hand once you've
    checked: `node scripts/lane-pool.mjs release --lane=<n> --force`.
 
+## The session watchdog — reading what a long session is doing (5105)
+
+The health watch runs `we:scripts/conveyor/session-watchdog.mjs` every `intervalMinutes` (default 5). For each live
+conveyor session (`fix-`, `ci-heal-`, `review-`, `conveyor-`/`build-`, `prepare-`) past its kind's **standard
+duration**, it reads a bounded tail of that session's own transcript and classifies it: `active-progress`,
+`waiting-loop` (the same long command repeated with no edit since — fix-3771's eleven `verify-lane --wait` calls),
+`stalled`, `finished-but-listed`, or `ghost` (listed working, transcript older than `ghostHours`, no process).
+
+- **Standard duration** = the kind's heavy demand from heavy-admission's rolling medians × `standardFactor`
+  (default 2), never below `floorMinutes[kind]`; `fallbackMinutes[kind]` with fewer than `minSamples` samples or
+  for a kind with no heavy demand (review, prepare).
+- **Settings** live under `sessionWatchdog` in the health dir's `config.json` (the health watch's own config,
+  merged over the platform default in `DEFAULT_SESSION_WATCHDOG`; an invalid value is reported as the
+  `sessionWatchdogConfig` probe error and ignored). Every threshold, the interval, and `act` are settings.
+- **What it raises:** `fixer-stuck` (a fix-claim holder in a waiting-loop or stalled), `fix-claim-held-no-progress`
+  (a claim held past standard with the PR head unchanged), `session-stuck` (the same, with no claim) and
+  `ghost-session-listed` (a ghost it could not clear). Episodes that need a person carry `escalation.humanOnly`,
+  which the Plateau WIP page lists.
+- **What it does:** clears a ghost with `claude rm <id>` and re-lists once to confirm (`claude rm` can no-op —
+  Claude Code issue #77683; a row still listed goes to `rm-ineffective.json` and is not retried for `ghostHours`),
+  and releases any live claim the ghost held. It never stops or kills a live session.
+- **One pass by hand:** `node scripts/conveyor/session-watchdog.mjs` (report only) or `--apply`.
+
+**Escalation hand-off contract (v1)** — for the fixer-escalation ladder. Each new stuck-fixer case appends one line
+to `<coordination root>/session-watchdog/fixer-escalations.jsonl`:
+
+```json
+{ "type": "session-watchdog.fixer-stuck", "v": 1, "key": "we#3771|<sessionId>|waiting-loop|<head>",
+  "at": "<iso>", "repo": "we", "pr": 3771, "claimKind": "fixing",
+  "session": { "name": "fix-3771", "id": "f29aeb29", "sessionId": "<uuid>" },
+  "classification": "waiting-loop", "reason": "same-command-repeated", "headSha": "<claimed head>",
+  "evidence": { "repeats": 3, "repeatMinutes": 21, "signature": "node verify-lane.mjs check --wait=540000 --json --repo=.",
+                "idleMinutes": 3, "pendingTool": "Bash", "claimAgeMinutes": 87, "standardMinutes": 20 },
+  "ask": "escalate-fixer" }
+```
+
+A key is written once. The consumer acknowledges by appending `{"key": "<key>", "by": "<who>", "at": "<iso>"}` to
+`fixer-escalations.ack.jsonl` in the same directory; the `fixer-stuck` episode then stops being human-only.
+
 ## Env vars a real dispatch needs
 
 - **`WE_DISPATCH_AGENT_ARGS`** — a JSON array of extra `claude` flags passed to every dispatched agent (e.g.

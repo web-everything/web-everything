@@ -103,6 +103,14 @@
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
+import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
+import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
+
+/** The ladder `planReconcile` uses when its caller supplies none: the platform default, Claude rungs only, no route
+ *  override (the IO shell, `reconcile-pass.mjs`, passes the loaded ladder with its routing-policy models). */
+const DEFAULT_FIXER_LADDER = Object.freeze({
+  policy: DEFAULT_FIXER_ESCALATION, routes: Object.freeze({}), available: (rung) => rung.provider !== 'codex',
+});
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
 import { reduceCheckState } from '../operations/pr-status.mjs';
@@ -112,13 +120,15 @@ import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
-import { countCiHealComments, CI_HEAL_COMMENT_MARKER } from './ci-heal-mark.mjs';
+import { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore, CI_HEAL_COMMENT_MARKER } from './ci-heal-mark.mjs';
 import { latestCiHealEscalationForHead, CI_HEAL_ESCALATION_MARKER } from './ci-heal-escalation-mark.mjs';
 import {
   isStandDownSuperseded, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER,
   CONCURRENT_AUTHOR_PAUSE_MARKER, concurrentAuthorPauses, isConcurrentAuthorStandDown,
 } from './stand-down.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
+// #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
+import { answerDisposition, isCloseSupersededExecuted } from './stand-down-answer-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { reviewSessionSlug } from './review-session-slug.mjs';
 // Both dispatcher wrappers delegate to the pure session-slug module.
@@ -143,7 +153,7 @@ import { ADVISORY_LABELS, latestAdvisory, advisoryCoversHead } from '../lib/advi
 // which would "repair" code that was never broken. `isPrCiFailureOwedRerun` is the PURE leaf that decides this
 // (see its own docblock for the full incident and the two facts it needs); this file only calls it.
 import {
-  isPrCiFailureOwedRerun, countRebaseOntoMainComments, DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
+  isPrCiFailureOwedRerun, isMainFixedSignatureOwed, isMainGreenFixOwed, countRebaseOntoMainComments, DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
   // landing-freeze fix (2026-09-27) — used only to word the `owed-ci-rerun` refusal's `why` accurately when
   // THIS path (not the red-window one) is what actually granted it; see that function's own docblock.
   classifyCiFailureAttribution,
@@ -192,7 +202,7 @@ import {
 // gate below), so the review this pass would otherwise dispatch the moment CI finishes is instead HELD until
 // this fires and un-drafts it — closing the "6 of 26 PRs got reviewed before their own first CI run even
 // finished" measurement (operator, 2026-09-27) that motivated this whole feature.
-export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label']);
+export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label', 'close-superseded']);
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#REFUSAL_KINDS — every reason this pass declines to dispatch. Frozen and
@@ -664,6 +674,16 @@ export function countUnresolvedStandDowns(comments) {
  *  agent every two-minute tick; short enough that a recovered outage is retried within one coffee. */
 export const INFRA_RETRY_COOLOFF_MS = 15 * 60 * 1000;
 
+/** Env knob for {@link INFRA_RETRY_COOLOFF_MS}: `WE_INFRA_RETRY_COOLOFF_MINUTES` (a positive number of minutes).
+ *  Unset, empty, non-numeric or non-positive keeps the default. Pure — the IO shell passes its own `env`. */
+export const INFRA_RETRY_COOLOFF_ENV = 'WE_INFRA_RETRY_COOLOFF_MINUTES';
+export function resolveInfraRetryCooloffMs(env = {}) {
+  const raw = env?.[INFRA_RETRY_COOLOFF_ENV];
+  const n = Number(raw);
+  if (raw === undefined || raw === '' || !Number.isFinite(n) || n <= 0) return INFRA_RETRY_COOLOFF_MS;
+  return n * 60 * 1000;
+}
+
 /**
  * we:scripts/conveyor/reconcile-core.mjs#INFRA_RETRY_CAP — xilx617 (epic #4075/#3383): the durable per-SESSION
  * `blocked-on-infra` STREAK cap. Today a session that self-reports `blocked-on-infra` cools off
@@ -731,7 +751,7 @@ export const LIVE_SESSION_OVERRUN_MS = 90 * 60 * 1000;
  * @returns {Array<object>} the same rows; finished ones gain `selfReportedDone: true` and `selfReportedOutcome`;
  *   a row still inside its own `blocked-on-infra` cool-off gains `awaitingInfraCooloff: true` instead
  */
-export function markSelfReportedDone(agents, completionFor, nowMs) {
+export function markSelfReportedDone(agents, completionFor, nowMs, { infraCooloffMs = INFRA_RETRY_COOLOFF_MS } = {}) {
   return (Array.isArray(agents) ? agents : []).map((a) => {
     const name = a?.name;
     if (!name || String(a?.state ?? '').toLowerCase() === 'done') return a;
@@ -756,7 +776,7 @@ export function markSelfReportedDone(agents, completionFor, nowMs) {
       const infraStreak = Number.isInteger(rec.infraStreak) && rec.infraStreak > 0 ? rec.infraStreak : 1;
       const infraStreakSince = rec.infraStreakSince ?? rec.updatedAt ?? null;
       const infraStreakCapped = infraStreak >= INFRA_RETRY_CAP;
-      const cooloffMs = infraStreakCapped ? INFRA_RETRY_CAPPED_COOLOFF_MS : INFRA_RETRY_COOLOFF_MS;
+      const cooloffMs = infraStreakCapped ? Math.max(INFRA_RETRY_CAPPED_COOLOFF_MS, infraCooloffMs) : infraCooloffMs;
       if (!(nowMs - updatedMs >= cooloffMs)) {
         // #4149 — the process may already be `stopped` (or on its way there) this very tick; the cool-off must
         // outrank that, since it is keyed off the RECORD, never off whether a process happens to still be listed.
@@ -1391,7 +1411,9 @@ export function missingReviewLabel(pr) {
 
 export function planReconcile({
   repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap = CI_HEAL_ROUND_CAP,
+  ciHealBudgetRestore = resolveCiHealBudgetRestore(process.env),
   conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP, defaultBranch = 'main',
+  fixerLadder = DEFAULT_FIXER_LADDER,
   mainRedWindows = [], mainLatestCheckRuns = [],
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — the repo's REQUIRED status-check names (branch
   // protection, `we:scripts/lib/required-status-checks.mjs`), threaded straight through to `classifyPr` so
@@ -1476,6 +1498,7 @@ export function planReconcile({
       // at this PR's merge base with it. EVIDENCE ONLY, injected by the IO shell; absent reads never excuse.
       prContainsMainGreenSha: typeof pr?.prContainsMainGreenSha === 'boolean' ? pr.prContainsMainGreenSha : null,
       mergeBaseCheckRuns: Array.isArray(pr?.mergeBaseCheckRuns) ? pr.mergeBaseCheckRuns : null,
+      mainFixedSignature: pr?.mainFixedSignature ?? null,
       mergeBaseRunConclusion: typeof pr?.mergeBaseRunConclusion === 'string' ? pr.mergeBaseRunConclusion : null,
       // #x9fbg1x-live-incident (2026-09-27) — the PR's OWN already-changed files, when the IO shell's `gh pr
       // list` read carried them (`reconcile-pass.mjs#PR_LIST_JSON_FIELDS` now asks for `files`, served for free
@@ -1556,6 +1579,23 @@ export function planReconcile({
       refuse('fix-claimed', {
         who: pr.fixClaim.who, since: pr.fixClaim.claimedAt ?? null,
         why: `${pr.fixClaim.who} holds the fix claim${pr.fixClaim.why ? ` (${pr.fixClaim.why})` : ''} — nothing is dispatched until its fix-end`,
+      });
+      continue;
+    }
+
+    // ── #3850 — an operator DISPOSITION (stand-down-answer-core.mjs#answerDisposition) is executed by the
+    // conveyor, never handed to a fixer: fix-3850 read "close as superseded" as "delete the card's files", was
+    // denied, and ended blocked-on-infra with the PR still open. Checked after the live-claim refusal (never
+    // close a PR under a running fixer) and before every repair branch.
+    // `state` is ABSENT on the open-only `gh pr list` listing (`OPEN_PR_LIST_FIELDS`) — absent means open (live:
+    // the first edge tick dispatched a fixer at #3850 because this read `state === 'OPEN'`).
+    // Idempotent: once the conveyor's own close comment postdates the answer the disposition is DONE — a PR a
+    // human then reopens is never re-closed every tick (it also never reaches a fixer: the answer stays on it).
+    if ((pr?.state ?? 'OPEN') === 'OPEN' && answerDisposition(operatorAnswer) === 'close-superseded') {
+      if (isCloseSupersededExecuted(pr?.comments)) continue;
+      dispatch.push({
+        ...base, kind: 'close-superseded',
+        why: `the operator ruled this PR superseded (@${operatorAnswer.actor} via ${operatorAnswer.channel}) — close it, no fix agent`,
       });
       continue;
     }
@@ -1727,7 +1767,7 @@ export function planReconcile({
     // PR is owed the same neutral `review:pending` (the promote-draft half strips the contradictory
     // `ready-to-merge` when it writes). Policy `reviewLabelHeal` (env `WE_REVIEW_LABEL_HEAL`): `stuck` (default)
     // adds this variant; `green` keeps only the branch above; `off` disables both.
-    if (reviewLabelHeal === 'stuck' && !pr?.isDraft && pr?.state === 'OPEN' && withPhase.check === 'red'
+    if (reviewLabelHeal === 'stuck' && !pr?.isDraft && (pr?.state ?? 'OPEN') === 'OPEN' && withPhase.check === 'red'
         && String(pr?.headRefName ?? '').startsWith('lane/')
         && withPhase.labels.includes('ready-to-merge')
         && !withPhase.labels.some((l) => l.startsWith('review:'))
@@ -1822,13 +1862,19 @@ export function planReconcile({
         prContainsMainGreenSha: base.prContainsMainGreenSha,
         mergeBaseCheckRuns: base.mergeBaseCheckRuns,
         mergeBaseRunConclusion: base.mergeBaseRunConclusion,
+        mainFixedSignature: base.mainFixedSignature,
       })) {
         const viaMainGreen = classifyCiFailureAttribution({
           failureCompletedAt: base.requiredCheckCompletedAt, mainRedWindows,
         }) !== 'main-red';
+        const viaSignature = viaMainGreen && isMainFixedSignatureOwed(base.mainFixedSignature)
+          && !isMainGreenFixOwed({ ...base, failingCheckName: base.requiredCheckName, mainLatestCheckRuns,
+            comments: pr?.comments, headSha: pr?.headRefOid });
         refuse('owed-ci-rerun', {
           ...withPhase,
-          why: viaMainGreen
+          why: viaSignature
+            ? `the required check's error signatures were fixed on main by ${[...new Set(base.mainFixedSignature.signatures.flatMap((s) => s.fixCommits))].map((sha) => sha.slice(0, 9)).join(', ')} — owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs)`
+            : viaMainGreen
             ? `the required check \`${base.requiredCheckName}\` failed at ${base.requiredCheckCompletedAt}, but is passing on main's own latest completed run — main has since fixed this, this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs), never a ci-heal, which would misdiagnose main's own (now-fixed) breakage as a defect here`
             : `the required check failed at ${base.requiredCheckCompletedAt}, while main's own CI was red — this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs) once main has recovered, never a ci-heal, which would misdiagnose main's own breakage as a defect here`,
         });
@@ -1942,12 +1988,14 @@ export function planReconcile({
           why: 'complete timeout inventory and unchanged dependency closure; independent retry budget' });
         continue;
       }
-      if (pr.timeoutRetry && !pr.timeoutRetry.eligible) notes.push({ kind: 'timeout-retry-ineligible', prNumber,
-        text: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });
-      const ciHealAttempts = countCiHealComments(pr?.comments);
+      if (pr.timeoutRetry && !pr.timeoutRetry.eligible) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,
+        why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });
+      const ciHealAttempts = countChargeableCiHealComments(pr?.comments, { restore: ciHealBudgetRestore });
+      const refunded = countCiHealComments(pr?.comments) - ciHealAttempts;
+      const refund = refunded > 0 ? { refunded } : {};
       if (ciHealAttempts >= ciHealCap) {
         refuse('cap-exhausted', {
-          ...withPhase, attempts: ciHealAttempts, cap: ciHealCap,
+          ...withPhase, ...refund, attempts: ciHealAttempts, cap: ciHealCap,
           why: `the PR's own durable CI-heal count is ${ciHealAttempts} against a cap of ${ciHealCap} — auto-heal is exhausted here and a person must take it`,
         });
         // #xznd5za (epic #3383/#4075) — a capped `ci-red` PR must never be MERELY refused. `cap-exhausted` was
@@ -1972,10 +2020,46 @@ export function planReconcile({
         });
       } else {
         dispatch.push({
-          ...base, ...withPhase, kind: 'ci-heal', attempts: ciHealAttempts,
+          ...base, ...withPhase, ...refund, kind: 'ci-heal', attempts: ciHealAttempts,
           why: `a required check is failing, nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`,
         });
       }
+      continue;
+    }
+
+    // ── RULING NOT ADDRESSED — ahead of the advisory-fix branch and of every review emission. A confirmed finding
+    // the operator already ruled `block` on an EARLIER head has come back on this one: the fixer's push did not
+    // satisfy the ruling (live 2026-10-04, PR #3794: card xcs4nce, policy pointer files). Parking it again only
+    // waits for the same human to repeat themselves, so it goes straight back to a fixer with the original ruling
+    // attached. How far up the fixer-escalation ladder it goes (resend, stronger model with a failing test first,
+    // cross-provider when available, then the operator as a needs-you note, an arbiter later) is the configured
+    // ladder's call, counted in heads it came back on plus fixer turns that ended without a new head.
+    if (phase === 'needs-human' && pr?.ignoredRulings?.matches?.length) {
+      const ig = pr.ignoredRulings;
+      const files = ig.matches.map((m) => m.finding.file ?? '(no file)');
+      // WHICH RUNG: the configured ladder (`we:scripts/lib/fixer-escalation-policy.mjs`) decides from how many heads the
+      // finding has come back on. Resend, then a stronger model with a failing test first, then cross-provider when
+      // that is available, then the operator. A send-back that came back with no new head is the operator's call too.
+      // `effectiveMisses` = heads it came back on + turns a fixer ended on this head without changing it.
+      const rung = pickRung(fixerLadder.policy, ig.effectiveMisses ?? ig.misses, { available: fixerLadder.available });
+      if (!rung || rung.action === 'needs-you') {
+        const trail = fixerLadder.policy.rungs.filter((r) => r.action === 'dispatch' && r.at < (ig.effectiveMisses ?? ig.misses)).map((r) => r.id).join(' > ');
+        refuse('ruling-dispute', {
+          ...withPhase, rulingNotAddressed: ig,
+          why: `${ig.matches.length} confirmed finding(s) the operator ruled block came back after ${ig.misses} miss(es)`
+            + `${ig.returns ? ` and ${ig.returns} fixer turn(s) ended without a new head` : ''} — fixer versus reviewer disagreement, needs the operator`,
+        });
+        notes.push({ kind: 'ruling-dispute', prNumber, head: ig.head, misses: ig.misses, rung: 'human', files,
+          text: rulingDisputeText(prNumber, { ...ig, escalate: true }, trail) });
+        continue;
+      }
+      const route = fixerLadder.routes?.[rung.id] ?? null;
+      dispatch.push({
+        ...base, ...withPhase, kind: 'fix', mode: 'ruling-not-addressed', findings: ig.matches.length,
+        rulingNotAddressed: { ...ig, rung: { id: rung.id, at: rung.at, label: rung.label, instruction: rung.instruction, taskType: rung.taskType, model: route?.model ?? null }, route },
+        why: `${ig.matches.length} confirmed finding(s) the operator already ruled block came back on a new head`
+          + ` (${files.join(', ')}) — the last fix did not satisfy the ruling; escalation rung ${rung.at} (${rung.id}): ${rung.label}`,
+      });
       continue;
     }
 

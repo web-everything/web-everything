@@ -105,6 +105,7 @@ export function planLandAdvance(inputs) {
         // A hard refusal (no scope, unsupported repo, no plan) will not clear by waiting: hand it to triage as a packet.
         if (extra.refusal && extra.refusal.kind !== 'ambiguous') { evidence.push(extra.refusal.why); action = 'escalate'; extra = { kind: `${repair.kind}-refused`, verdict: 'repair dispatch refused', refusal: undefined }; }
       }
+      if (repair.refunded > 0) extra.refunded = repair.refunded;
     } else if (wait) {
       since = wait.since; action = Number(now) - Date.parse(since) >= (inputs.drainThresholdMs ?? 7200000) && wait.count >= (inputs.drainThresholdPasses ?? 90) ? 'escalate' : 'wait-on-drain';
       evidence = [...wait.reasons, `${wait.passes} consecutive passes since ${since}`];

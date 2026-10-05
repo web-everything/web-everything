@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { resolvePidAlive, scanPsOutput, defaultIsPidAlive } from '../conveyor/driver-watchdog.mjs';
 import { planFixesFromReconcile, dispatchFix as realDispatchFix } from '../conveyor/reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../conveyor/parked-pr-conflict-watch.mjs';
-import { countCiHealComments } from '../conveyor/ci-heal-mark.mjs';
+import { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore } from '../conveyor/ci-heal-mark.mjs';
 import { countStandDownComments } from '../conveyor/stand-down.mjs';
 import { dispatchCiHeal as realDispatchCiHeal } from './ci-heal-pr-dispatch.mjs';
 import { isConflicting, followUpKindFor } from './land-advance-repair.mjs';
@@ -147,7 +147,12 @@ export function createLandAdvanceReader(ports = {}) {
     const repairEvidence = {};
     for (const p of prs.filter((p) => p.repo === 'we' && (isConflicting(p) || p.labels.some((l) => (l.name ?? l) === 'ci:failed')))) {
       repairEvidence[`${p.repo}#${p.number}`] = get(`repair-evidence:${p.repo}#${p.number}`, () => {
-        const comments = readPrComments(p); return { ciHealComments: countCiHealComments(comments), standDownComments: countStandDownComments(comments) };
+        const comments = readPrComments(p);
+        const ciHealComments = countChargeableCiHealComments(comments, {
+          restore: ports.ciHealBudgetRestore ?? resolveCiHealBudgetRestore(process.env),
+        });
+        const refunded = countCiHealComments(comments) - ciHealComments;
+        return { ciHealComments, standDownComments: countStandDownComments(comments), ...(refunded > 0 ? { refunded } : {}) };
       }, {});
     }
     const ledger = get('follow-ups', () => readFollowUps({ store }), []);

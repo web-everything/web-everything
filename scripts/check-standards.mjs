@@ -106,7 +106,7 @@ import {
   makeMemoizedLineCounter, CITATION_GATES_ENFORCED,
   findUnresolvedIdentifiers, buildIdentifierIndex, isIndexableSourcePath, PROVENANCE_ESCAPE_MARKERS,
   makeRepoResolver, findDanglingSymbolAnchors, findDanglingMarkdownLinks, findDanglingGraduatedTargets,
-  HASH_PATH_CITE_SOURCE, findHashPathCitesInGrepLines,
+  HASH_PATH_CITE_SOURCE, findHashPathCitesInGrepLines, classifyHashPathCite,
   BACKLOG_GLOB_CITE_SOURCE, buildBacklogResolvableIds,
   findDanglingBacklogGlobCitesInGrepLines,
   findBlankLineLoci, makeMemoizedLineReader,
@@ -1757,11 +1757,14 @@ mark("6f-ii-b. REFERENCE-RESOLUTION gates (5b/5c/5d — 2026-09-06 staleness aud
 // 6f-ii-b): a brand-new gate the port doesn't know about must never silently not-run just because the port
 // happens to be built.
 //
-// WARN-level, matching the rest of this gate family (CITATION_GATES_ENFORCED) — a handful of historical
-// `reports/`/`audits/` write-ups already name a card by its birth-hash path in prose, predating this rule,
-// and are not being re-litigated; a NEW instance (the thing this rule exists to catch) is what gets surfaced.
+// Resolving paths in the checkout's net diff are errors: they hold numbering and would strand the card.
+// Unowned or non-resolving paths retain the gate family's warning policy.
 try {
   const emit3 = CITATION_GATES_ENFORCED ? err : warn;
+  const citationChanges = localChangedSet({ runGit: (args) => execFileSync('git', args, {
+    cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+  }) });
+  const changedFiles = citationChanges ? new Set(citationChanges.changedFiles) : null;
   let hits = [];
   try {
     hits = execFileSync(
@@ -1774,6 +1777,12 @@ try {
     const key = `${rel}\u0000${cited}`;
     if (seen.has(key)) continue;
     seen.add(key);
+    if (classifyHashPathCite({ cited, exists: (path) => existsSync(join(ROOT, path)), citingFile: rel, changedFiles }) === 'resolving') {
+      err(`${rel}: cites a card by its hash-named FILE PATH (\`${cited}\`) — the drain will hold this card from numbering ` +
+        `(it would strand on main), cite it as \`#${hash}\` instead.`,
+        { kind: 'citation-hash-path-outside-backlog', file: rel });
+      continue;
+    }
     emit3(`${rel}: cites a card by its hash-named FILE PATH (\`${cited}\`) — the drain's JIT numbering ` +
       `(#2288) renames that exact path away the moment the card lands, so this citation dangles the instant ` +
       `it does (#4075, the build-dispatch.flow.json incident). Cite the card by its stable id instead ` +

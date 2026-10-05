@@ -209,10 +209,12 @@ describe('guard-bash denies a raw PR-body rewrite', () => {
     expect(reason('gh pr edit 1162 --remove-label review:pending')).toBeFalsy();
   });
 
-  // `pr-land` opens PRs with `gh pr create --body`, which is where the stamp is WRITTEN. Denying create would
-  // block the only path that stamps anything.
-  it('does not touch `gh pr create --body`, which is what writes the stamp', () => {
-    expect(reason('gh pr create --title x --body-file /tmp/b.md')).toBeFalsy();
+  // `pr-land` opens PRs with `gh pr create --body` through its own execFileSync, which never passes this
+  // Bash-tool hook, so it still writes the stamp. A RAW `gh pr create` typed by an agent is denied instead:
+  // it opens an unstamped PR (plateau-app #204), which voids the referral reviewer's rulings.
+  it('denies a raw `gh pr create` (pr-land\'s own create never passes this hook); the escape still allows it', () => {
+    expect(reason('gh pr create --title x --body-file /tmp/b.md')).toMatch(/authored-by-actor/);
+    expect(reason('RAW_PR_CREATE_OK=1 gh pr create --title x --body-file /tmp/b.md')).toBeFalsy();
   });
 
   it('does not deny a read of a PR body', () => {

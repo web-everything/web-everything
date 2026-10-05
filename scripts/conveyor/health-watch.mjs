@@ -13,6 +13,8 @@
  * `investigateDispatch: true` it dispatches a diagnose-only investigation agent per episode and stops it at its
  * wall clock — see we:scripts/conveyor/health-investigate-dispatch.mjs.
  *
+ * Also runs the daily temp sweep (we:scripts/conveyor/tmp-sweep.mjs): deletes our own proven-prefix temp entries
+ * older than `tmpSweepOlderThanMs`, skipping any a process has as its cwd. All knobs are `tmpSweep*` config keys.
  * State lives under the pinned daemon state root (#4052, `health-watch-section.mjs#healthDir`, the ONE shared
  *   resolver every reader goes through — see that file's own header): `.conveyor/health/`
  *   state.json          episodes, per-daemon memory, log cursors, gh cache (written only by the tick)
@@ -27,19 +29,22 @@
  * Usage:
  *   node scripts/conveyor/health-watch.mjs tick    [--json] [--force-gh] [--no-gh] [--dry-run] [--state-root=DIR]
  *                                                  [--logs-dir=DIR] [--lock-root=DIR] [--self-sync-dir=DIR]
+ *                                                  [--heavy-run-samples-file=FILE]  # ungated heavy-run history fixture
  *                                                  [--ps-fixture=FILE] [--machine-load-fixture=FILE]  # machine-overload's inputs, real by default
  *                                                  [--no-investigate]  # skip the #4078 investigation pass entirely
  *                                                  [--no-file]  # skip the #4079 filing-request planning pass entirely
+ *   node scripts/conveyor/health-watch.mjs tmp-sweep [--dry-run] [--json] [--tmp-sweep-root=DIR]
  *   node scripts/conveyor/health-watch.mjs section [--state-root=DIR]      # the HEALTH section (operator queue)
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
+import { sweepOurTmp, readBusyTopLevel, formatTmpSweepLine } from './tmp-sweep.mjs';
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { execFileSync, spawn } from 'node:child_process';
 import {
   existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, openSync, readSync, closeSync, unlinkSync,
 } from 'node:fs';
-import { homedir, loadavg, cpus } from 'node:os';
+import { homedir, loadavg, cpus, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -48,6 +53,7 @@ import {
 } from './health-watch-core.mjs';
 import { daemonJobsRoot } from '../operations/run-store.mjs';
 import { SMELLS } from './health-smells/index.mjs';
+import { readRecentSamples, appendSample, summarizeSample, findUngatedHeavyRuns } from './heavy-run-ungated.mjs';
 import { healthDir, healthSectionLines } from './health-watch-section.mjs';
 import { runInvestigations } from './health-investigate-dispatch.mjs';
 import {
@@ -83,6 +89,7 @@ import { assessDaemonStatus } from '../operations/daemon-status.mjs';
 import { readBacklogCards } from '../backlog-stranded-sweep.mjs';
 import { readPrEventsStatuses } from '../lib/pr-events.mjs';
 import { readSeatCapUsage } from '../operations/review-extra-seats.mjs';
+import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-watchdog.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
@@ -541,7 +548,7 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
     // #4066 — `mergeable` + `comments` for the queue smells: `pr-stage-stall` classifies stages the stuck-PR
     // watch's own way (needs `mergeable`) and reads its markers off the thread; `stood-down-prs` counts the
     // stand-down markers. Both are already in the shared snapshot's field set, so the snapshot path costs nothing extra.
-    const fields = 'number,title,headRefName,labels,statusCheckRollup,updatedAt,isDraft,mergeable,comments';
+    const fields = 'number,title,headRefName,headRefOid,labels,statusCheckRollup,updatedAt,isDraft,mergeable,comments';
     const shared = exec === run ? readSharedOpenPrs({ repo: slug, fields }) : null;
     const listed = shared || JSON.parse(exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '100', '--json', fields]));
     const rows = Array.isArray(listed) ? listed : []; // a throttle deferral object = skip this repo's PR smells this pass
@@ -563,7 +570,7 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
       } catch { /* Unknown, not a clean observation. */ }
       out.push({
         reviewObservation,
-        repo: slug, number: pr.number, title: pr.title, headRefName: pr.headRefName, updatedAt: pr.updatedAt,
+        repo: slug, number: pr.number, title: pr.title, headRefName: pr.headRefName, headRefOid: pr.headRefOid ?? null, updatedAt: pr.updatedAt,
         isDraft: !!pr.isDraft,
         mergeable: pr.mergeable ?? null,
         // Only what the marker readers need (leading line, time, trusted author) — never the whole comment record.
@@ -655,6 +662,49 @@ export function probeLiveBindings(agents, {
     out.push({ pr, repo: null, name: a.name, source: 'session', pid: Number.isInteger(a.pid) ? a.pid : null, lastActivityAgeMs: Number.isFinite(info?.ageMs) ? info.ageMs : null, reason: info?.reason ?? null });
   }
   return out;
+}
+
+/**
+ * xegykal — THE SESSION WATCHDOG probe (`we:scripts/conveyor/session-watchdog.mjs`). Runs one watchdog pass at most
+ * every `sessionWatchdog.intervalMinutes` (a config dimension in this health dir's `config.json`, merged over the
+ * platform default) and caches the result in `<healthDir>/session-watchdog.json`, so a tick between passes still
+ * hands the smells the last result (their episodes neither close nor re-open on an off-tick). The pass reads its
+ * own `claude agents --json` listing (local, no API) every pass — not the gh-cadence `agents` probe, which runs
+ * only every 15 minutes. Any watchdog fixture flag (`--watchdog-agents-fixture`, `--watchdog-claims-fixture`,
+ * `--watchdog-heads-fixture`) replays a recorded host, and a fixture-scoped tick (`--state-root`, `--logs-dir` or
+ * `--lock-root`, the same `fixtureTick` rule the other probes use) reads no host state at all — no real
+ * `claude agents`, claim listing, PR-head cache, heavy-admission read or coordination-root event log. Either one,
+ * or `--dry-run`, never acts.
+ * @returns {object} the pass result plus `{cached:boolean, configError:string|null}`
+ */
+export function probeSessionWatchdog({
+  dir, now = Date.now(), config = {}, processes = undefined, flags = {}, runPass = runSessionWatchdogPass,
+} = {}) {
+  const { config: cfg, error: configError } = resolveSessionWatchdogConfig(config.sessionWatchdog);
+  const cachePath = join(dir, 'session-watchdog.json');
+  const fixture = flags['watchdog-agents-fixture'];
+  const anyFixture = !!(fixture || flags['watchdog-claims-fixture'] || flags['watchdog-heads-fixture']);
+  const scoped = !!(flags['logs-dir'] || flags['lock-root'] || flags['state-root']);
+  const isolated = anyFixture || scoped;
+  const prev = anyFixture ? null : readJson(cachePath, null);
+  const prevAt = Date.parse(prev?.at ?? '');
+  // 30 s of slack so a 5-minute tick that lands a few seconds early still runs a 5-minute pass.
+  if (prev && Number.isFinite(prevAt) && now - prevAt < cfg.intervalMinutes * MINUTE - 30_000) {
+    return { ...prev, cached: true, configError };
+  }
+  const readFix = (k) => JSON.parse(readFileSync(flags[k], 'utf8'));
+  const heads = flags['watchdog-heads-fixture'] ? readFix('watchdog-heads-fixture') : null;
+  const result = runPass({
+    nowMs: now, config: cfg,
+    act: cfg.act && !isolated && !flags['dry-run'] && !flags['no-watchdog-act'],
+    ...(fixture ? { agents: readFix('watchdog-agents-fixture') } : scoped ? { agents: [] } : {}),
+    ...(processes !== undefined ? { processes } : {}),
+    ...(flags['watchdog-claims-fixture'] ? { listClaims: () => readFix('watchdog-claims-fixture') } : scoped ? { listClaims: () => [] } : {}),
+    ...(heads ? { prHeadFor: (repo, pr) => heads[`${repo}#${pr}`] ?? null } : scoped ? { prHeadFor: () => null } : {}),
+    ...(isolated ? { eventDir: join(dir, 'session-watchdog-events'), readHeavy: () => null } : {}),
+  });
+  if (!anyFixture && !flags['dry-run']) writeJsonAtomic(cachePath, result);
+  return { ...result, cached: false, configError };
 }
 
 /**
@@ -762,11 +812,15 @@ function acquireTickLock(dir) {
   } catch { return null; }
 }
 
-/**
- * One tick: probe → pure core → diagnoses → write state, reports, stamp.
- * @returns {Promise<object>} a summary (also what `--json` prints)
- */
-export async function tick(flags = {}, { collectInventory = collectCredentialInventory } = {}) {
+function sweepOptions(config, tmpRoot, dryRun, now, run) {
+  return { tmpRoot, dryRun, now, busy: readBusyTopLevel(tmpRoot, { run }),
+    olderThanMs: config.tmpSweepOlderThanMs, batchSize: config.tmpSweepBatchSize,
+    pauseMs: config.tmpSweepPauseMs, maxDeletes: config.tmpSweepMaxDeletesPerRun,
+    timeBudgetMs: config.tmpSweepTimeBudgetMs };
+}
+
+/** One tick: probe, evaluate, diagnose, and persist. Returns the CLI summary. */
+export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun } = {}) {
   const started = Date.now();
   const now = flags.now ? Date.parse(flags.now) : started;
   const dir = healthDir(flags['state-root']);
@@ -777,7 +831,16 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const probeErrors = {};
   const probes = {};
   // A probe's error text is scrubbed at capture: an auth failure can echo a token in its message.
-  const attempt = (name, fn) => { try { return fn(); } catch (e) { probeErrors[name] = scrubText(String(e?.message || e).split('\n')[0]); return undefined; } };
+  const attempt = (name, fn) => {
+    const failed = (e) => { probeErrors[name] = scrubText(String(e?.message || e).split('\n')[0]); return undefined; };
+    try { const value = fn(); return value?.then ? value.catch(failed) : value; } catch (e) { return failed(e); }
+  };
+  const sweepAllowed = flags['tmp-sweep-root'] || (!flags['state-root'] && !flags['dry-run']);
+  const sweepDue = config.tmpSweepEnabled && (!prev.tmpSweep?.completedAt
+    || now - prev.tmpSweep.completedAt >= config.tmpSweepEveryMs || prev.tmpSweep.complete === false);
+  const tmpSweep = sweepAllowed && sweepDue
+    ? await attempt('tmpSweep', () => sweepOurTmp(sweepOptions(config, flags['tmp-sweep-root'] || tmpdir(), !!flags['dry-run'], now, tmpSweepRun)))
+    : null;
 
   const logs = attempt('daemonLogs', () => probeDaemonLogs(logsDir, prev.cursors || {}));
   if (logs) probes.daemonLogs = logs.samples;
@@ -815,9 +878,17 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.processes = attempt('processes', () => (flags['ps-fixture']
     ? parsePsOutput(readFileSync(flags['ps-fixture'], 'utf8'))
     : probeProcesses()));
+  // xegykal — the session watchdog (its own interval, every-tick probe; see probeSessionWatchdog).
+  probes.sessionWatchdog = attempt('sessionWatchdog', () => probeSessionWatchdog({ dir, now, config, processes: probes.processes, flags }));
+  if (probes.sessionWatchdog?.configError) probeErrors.sessionWatchdogConfig = probes.sessionWatchdog.configError;
   probes.machineLoad = attempt('machineLoad', () => (flags['machine-load-fixture']
     ? JSON.parse(readFileSync(flags['machine-load-fixture'], 'utf8'))
     : probeMachineLoad()));
+  // heavy-enforce — the `heavy-run-ungated` smell's sample history (the ~60s sampler plus each tick's own append).
+  const heavyRunSamplesPath = flags['heavy-run-samples-file'] || join(dir, 'heavy-run-samples.jsonl');
+  probes.heavyRunSamples = attempt('heavyRunSamples', () => readRecentSamples(heavyRunSamplesPath, {
+    now, windowMs: config.heavyRunUngatedWindowMs ?? 10 * MINUTE,
+  }));
   // `gh-call-failures` — fs-only, every tick: the gh-throttle call log's tail (`--gh-calls-log=FILE` in tests).
   probes.ghCalls = attempt('ghCalls', () => probeGhCalls(flags['gh-calls-log'] ? { logPath: flags['gh-calls-log'] } : {}));
   // #4309 — alongside (never replacing) the 2 MB tail above: persist every fully closed hour of GitHub spend once,
@@ -914,9 +985,15 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // A silence whose tracking card is still `active` never expires (4065 Fork 3): read those cards' status.
   const activeCards = readActiveCards(silences.map((x) => x.card).filter(Boolean), flags['backlog-dir'] || join(REPO_ROOT, 'backlog'));
   const result = runHealthTick({ ...prev, silences, lastTick: lastTickForSmells }, probes, SMELLS, now, { config, probeErrors, activeCards });
+  // Read history before evaluation, then persist this tick once. Synthetic process fixtures never persist.
+  if (!flags['ps-fixture']) attempt('heavyRunSampleAppend', () => appendSample(heavyRunSamplesPath,
+    probes.processes ? summarizeSample(findUngatedHeavyRuns(probes.processes), new Date(now).toISOString())
+      : { at: new Date(now).toISOString(), error: probeErrors.processes || 'process snapshot unavailable' }));
   // Scrubbed ONCE, right here: everything below — the printed section, the returned summary, every file — sees
   // only the redacted state.
   const state = scrubDeep(result.state);
+  if (tmpSweep) state.tmpSweep = { at: now, ...(tmpSweep.complete ? { completedAt: now } : {}), ...tmpSweep };
+  else if (prev.tmpSweep) state.tmpSweep = prev.tmpSweep;
   state.notifiedSilences = (result.state.silences || []).filter((x) => x.expiredNotified).map(silenceSig);
   delete state.silences;
   state.cursors = logs ? { ...(prev.cursors || {}), ...logs.cursors } : prev.cursors;
@@ -1032,7 +1109,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // The whole summary goes through the scrub too (the last choke point before stdout).
   return scrubDeep({
     now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs,
-    ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
+    tmpSweep: tmpSweep ?? null, ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
     plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, reports: written,
     section: renderHealthSection(state, { now, reportDir }),
     skipped: result.evaluations.filter((e) => !e.results).map((e) => ({ smell: e.smell.id, missing: e.skipped, error: e.error })),
@@ -1054,6 +1131,12 @@ async function main(argv) {
   const { flags, pos } = parseFlags(argv);
   const cmd = pos[0] || 'tick';
   const dir = healthDir(flags['state-root']);
+  if (cmd === 'tmp-sweep') {
+    const config = { ...DEFAULT_HEALTH_CONFIG, ...readJson(join(dir, 'config.json'), {}) };
+    const result = await sweepOurTmp(sweepOptions(config, flags['tmp-sweep-root'] || tmpdir(), !!flags['dry-run'], Date.now()));
+    console.log(flags.json ? JSON.stringify(result, null, 2) : formatTmpSweepLine(result));
+    return 0;
+  }
   if (cmd === 'section') { console.log(healthSectionLines({ stateRoot: flags['state-root'] }).join('\n')); return 0; }
   if (cmd === 'silence' || cmd === 'unsilence') {
     if (!flags.smell) { console.error('health-watch: --smell=<id> is required'); return 1; }
@@ -1070,7 +1153,7 @@ async function main(argv) {
     console.log(`health-watch: ${cmd}d ${flags.smell}${subject ? ` / ${subject}` : ''}`);
     return 0;
   }
-  if (cmd !== 'tick') { console.error(`health-watch: unknown command "${cmd}" (tick | section | silence | unsilence)`); return 1; }
+  if (cmd !== 'tick') { console.error(`health-watch: unknown command "${cmd}" (tick | tmp-sweep | section | silence | unsilence)`); return 1; }
 
   // `--in-process` is the watchdog's worker child: its parent already holds the tick lock.
   const release = flags['dry-run'] || flags['in-process'] ? () => {} : acquireTickLock(dir);
@@ -1084,6 +1167,7 @@ async function main(argv) {
       if (flags.json) console.log(JSON.stringify(summary, null, 2));
       else {
         console.log(`health-watch: tick ${summary.now} in ${summary.durationMs}ms (${summary.mode}); transitions: ${summary.transitions.map((t) => `${t.type} ${t.key}`).join(', ') || 'none'}`);
+        if (summary.tmpSweep) console.log(formatTmpSweepLine(summary.tmpSweep));
         console.log(summary.section.join('\n'));
       }
       return 0;

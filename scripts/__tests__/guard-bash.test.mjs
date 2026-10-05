@@ -1161,6 +1161,21 @@ describe('guard-bash — differential write-shape table (#2108 review r5)', () =
   });
 });
 
+describe('guard-bash — raw PR creation loses the author stamp', () => {
+  it('denies raw creation across repositories and command prefixes', () => {
+    for (const command of ['gh pr create -R plateauapp/plateau-app --title t --body-file f',
+      'cd /x && gh pr create --fill', 'env FOO=1 /usr/bin/gh pr create --fill']) {
+      expect(decide(command), command).toMatch(/authored-by-actor/);
+    }
+  });
+  it('allows the explicit escape, reads and quoted mentions', () => {
+    for (const command of ['RAW_PR_CREATE_OK=1 gh pr create --fill',
+      'gh pr view 204 -R plateauapp/plateau-app', 'git commit -m "mention gh pr create here"']) {
+      expect(decide(command), command).toBeNull();
+    }
+  });
+});
+
 describe('guard-bash — raw gh-merge bypass block (#2290 assertMayMerge)', () => {
   const blockedMerge = (c) => expect(decide(c), c).toMatch(/assertMayMerge/);
   const allowed = (c) => expect(decide(c), c).toBeNull();

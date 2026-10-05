@@ -725,6 +725,9 @@ describe('rebuildClone', () => {
   ])('%s at HEAD is never promoted unsmoked — a failing smoke leaves the clone back on prevHead', async (_label, asUnverified) => {
     const { cloneDir, env } = makeFixture();
     const { target, prevHead } = crashAfterLegacyReset(cloneDir, env, { asUnverified });
+    // The control fails the same check as the candidate, which now adopts as no worse by default; opt out so the
+    // failing smoke still holds the clone on prevHead (the behavior this case pins).
+    env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '0';
     const runSmoke = vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', detail: 'broken' }] } }));
     const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
     // x5wbsbc: the candidate, then the last-good (prevHead) control smoke — never an unsmoked promotion.

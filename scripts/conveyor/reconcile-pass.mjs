@@ -69,10 +69,11 @@ import { resolve } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
-import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
+import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
+import { REPO_ROOT, defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { countRearmComments } from './rearm-review.mjs';
-import { planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls } from './reconcile-core.mjs';
+import { planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls } from './reconcile-core.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // we:backlog/x5uqim1-*.md (#4075/#3383) — the two extra facts `reconcile-core.mjs#isPrCiFailureOwedRerun` needs
@@ -83,6 +84,7 @@ import { latestRequiredCheck, isRequiredCheckFailed } from '../merge-ai-prs.mjs'
 import {
   computeMainRedWindows, DEFAULT_MAIN_WORKFLOW_NAME, DEFAULT_REQUIRED_CHECK, DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS,
   failingRequiredCheckForAttribution, isAnyRequiredCheckFailed,
+  extractCiErrorSignatures, signatureFragments, isPrCiFailureOwedRerun,
   // landing-freeze fix (2026-09-27) — the one extra read `isPrCiFailureOwedRerun`'s new green-check path needs:
   // `main`'s own latest completed run's headSha, so the IO shell can fetch THAT commit's own per-check
   // conclusions. See `main-red-recovery.mjs`'s own "LANDING-FREEZE FIX" section header for the incident.
@@ -98,6 +100,16 @@ import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 import { latestCiHealEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { readLiveFixClaim } from './fix-procedure.mjs';
 import { enrichPrsWithReferralHolds } from './review-referral-hold.mjs';
+import { ignoredRulings, resolveCountInfraStalls } from '../lib/ruling-ledger.mjs';
+import { loadFixerLadder } from './fixer-ladder.mjs';
+
+/** A confirmed finding the operator already ruled `block` on an earlier head that came back on this one (read off
+ *  the PR thread alone, so a daemon restart loses nothing). Never throws: an unreadable thread means no claim. */
+export function enrichPrsWithIgnoredRulings(prs, { humanAt, countInfraStalls = resolveCountInfraStalls() } = {}) {
+  return prs.map((pr) => {
+    try { return { ...pr, ignoredRulings: ignoredRulings(pr, { ...(humanAt === undefined ? {} : { humanAt }), countInfraStalls }) }; } catch { return { ...pr, ignoredRulings: null }; }
+  });
+}
 // #4263 — the SAME terminal-state classifier `pr-watch.mjs`'s own drain-lane watcher uses (merged/closed/
 // parked/pending), reused rather than re-invented so "has this PR landed" can never drift between the two
 // call sites. Aliased: this file never reconciles a PR's PHASE (that word means something else here — see
@@ -219,7 +231,7 @@ export function defaultReadAgents({
   // pid, so a PR with a review job in flight is refused `live-process` exactly as a live review session was.
   const listed = listAgentsWithReviewJobs({ listAgents: () => defaultListAgents({ exec, env }), listJobs });
   // xpb0zyq — a session that already wrote its own completion record is finished, whatever the listing says.
-  const selfReported = markSelfReportedDone(Array.isArray(listed) ? listed : [], completionFor, now);
+  const selfReported = markSelfReportedDone(Array.isArray(listed) ? listed : [], completionFor, now, { infraCooloffMs: resolveInfraRetryCooloffMs(env) });
   // #3383 continuation — a session whose OWN transcript has gone stale is finished too, self-report or not.
   const hungMarked = markHungSessions(selfReported, hungInfoFor, now, hungThresholdMs);
   // Live incident fix, night of 2026-09-25/26 ET — a session whose OWN transcript shows the Claude CLI's own
@@ -491,6 +503,60 @@ export function defaultReadAheadBy(headSha, { exec = execFileSyncThrottled, repo
   }
 }
 
+/** Best-effort emitter history for #3794 live case, 2026-10-04. */
+export function defaultReadMainFixedSignatureFacts({
+  repo, detailsUrl, failureCompletedAt, root, defaultBranch = 'main', exec = execFileSyncThrottled,
+} = {}) {
+  try {
+    const jobId = /\/job\/(\d+)/.exec(detailsUrl ?? '')?.[1];
+    const mainRef = mainRefFor(defaultBranch);
+    if (!jobId || !mainRef || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')
+        || !Number.isFinite(Date.parse(failureCompletedAt))) return null;
+    root ??= resolveLanePoolRepoPath(repo) ?? REPO_ROOT;
+    const options = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
+    const log = exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], options);
+    const messages = extractCiErrorSignatures(log);
+    if (!messages.length) return { signatures: [] };
+    const git = (args) => exec('git', ['-C', root, ...args], options).trim();
+    const fixes = new Map();
+    const signatures = messages.map((message) => {
+      const fragments = signatureFragments(message);
+      const files = new Set();
+      for (const fragment of fragments) {
+        let matches;
+        try {
+          matches = git(['grep', '-l', '-F', '-e', fragment, mainRef, '--', '.',
+            ':(exclude)**/__tests__/**', ':(exclude)**/fixtures/**', ':(exclude)backlog/**']);
+        } catch (error) {
+          if (error.status === 1) continue;
+          throw error;
+        }
+        for (const match of matches.split('\n').filter(Boolean)) {
+          if (!match.startsWith(`${mainRef}:`)) throw new Error('invalid emitter path');
+          files.add(match.slice(mainRef.length + 1));
+        }
+      }
+      const emitterFiles = [...files];
+      const rows = emitterFiles.length ? git(['--literal-pathspecs', 'log', '--first-parent', '--format=%H%x09%cI',
+        `--since=${failureCompletedAt}`, '--end-of-options', mainRef, '--', ...emitterFiles]) : '';
+      const fixCommits = rows.split('\n').filter(Boolean).map((row) => {
+        const [sha, at] = row.split('\t');
+        if (!isSha(sha) || !Number.isFinite(Date.parse(at))) throw new Error('invalid fix commit');
+        fixes.set(sha, at);
+        return sha;
+      });
+      return { message, fragments, emitterFiles, fixCommits };
+    });
+    const allFiles = [...new Set(signatures.flatMap((s) => s.emitterFiles))];
+    const bugIntroducedAt = allFiles.length ? git(['--literal-pathspecs', 'log', '--first-parent', '-1', '--format=%cI',
+      `--until=${failureCompletedAt}`, '--end-of-options', mainRef, '--', ...allFiles]) : null;
+    if (bugIntroducedAt && !Number.isFinite(Date.parse(bugIntroducedAt))) return null;
+    const fixedAt = [...fixes.values()].sort((a, b) => Date.parse(a) - Date.parse(b))[0] ?? null;
+    return { signatures, fixCommits: [...fixes.keys()], bugIntroducedAt, fixedAt };
+  } catch { return null; }
+}
+
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#enrichPrsWithMainRedFacts — we:backlog/x5uqim1-*.md (#4075/#3383):
  * attach `requiredCheckCompletedAt` / `aheadByOnMain` to every PR whose required check is currently FAILING, and
@@ -523,6 +589,7 @@ export function defaultReadAheadBy(headSha, { exec = execFileSyncThrottled, repo
 export function enrichPrsWithMainRedFacts(prs, {
   readMainRuns = defaultReadMainRuns, readAheadBy = defaultReadAheadBy,
   readMainLatestCheckRuns = defaultReadMainLatestCheckRuns, readMainGreenFixFacts = defaultReadMainGreenFixFacts,
+  readMainFixedSignatureFacts = defaultReadMainFixedSignatureFacts,
   requiredCheck = null, requiredChecks = DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS, defaultBranch = 'main', repo = null,
 } = {}) {
   const checks = requiredCheck ? [requiredCheck] : requiredChecks;
@@ -542,8 +609,13 @@ export function enrichPrsWithMainRedFacts(prs, {
     const greenFix = greenSha && aheadBy !== 0
       ? readMainGreenFixFacts(pr.headRefOid, { repo, greenSha, checkName: check.name })
       : null;
+    const mainFixedSignature = aheadBy > 0 && !isPrCiFailureOwedRerun({
+      requiredCheckCompletedAt: check?.completedAt, failingCheckName: check?.name, aheadBy,
+      mainRedWindows, mainLatestCheckRuns, ...greenFix, comments: pr.comments, headSha: pr.headRefOid,
+    }) ? readMainFixedSignatureFacts({ repo, detailsUrl: latestRequiredCheck(pr, check?.name)?.detailsUrl,
+      failureCompletedAt: check?.completedAt, defaultBranch }) : null;
     return {
-      ...pr, requiredCheckCompletedAt: check?.completedAt ?? null, requiredCheckName: check?.name ?? null, aheadByOnMain: aheadBy,
+      ...pr, mainFixedSignature, requiredCheckCompletedAt: check?.completedAt ?? null, requiredCheckName: check?.name ?? null, aheadByOnMain: aheadBy,
       prContainsMainGreenSha: greenFix?.prContainsMainGreenSha ?? null, mergeBaseCheckRuns: greenFix?.mergeBaseCheckRuns ?? null,
       mergeBaseRunConclusion: greenFix?.mergeBaseRunConclusion ?? null,
     };
@@ -1009,13 +1081,35 @@ export function isConflictingPr(pr) {
   return labels.includes(CONFLICT_LABEL) || pr?.mergeable === 'CONFLICTING' || pr?.mergeStateStatus === 'DIRTY';
 }
 
-function hydrateChecks(prs, { repo, requiredChecks, readChecks }) {
+/** A non-default base is a stack; its CI starts after the drain retargets it. */
+export function isStackedPr(pr, defaultBranch) {
+  return Boolean(pr?.baseRefName && pr.baseRefName !== defaultBranch);
+}
+
+/** Emergency opt-out preserves the existing required-check hydration behavior. */
+export function readStackedPrCheckPolicy(env = process.env) {
+  return env.WE_STACKED_PR_CHECK_POLICY === 'strict' ? 'strict' : 'await-base';
+}
+
+function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch }) {
   const cache = new Map();
-  const ready = [], refusals = [];
+  const ready = [], refusals = [], notes = [];
+  const stackedPolicy = readStackedPrCheckPolicy();
   for (const pr of prs) {
     const runs = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
     const missing = (requiredChecks ?? []).filter(name => !runs.some(run => run?.name === name));
     if (runs.length < 100 && !missing.length) { ready.push(pr); continue; }
+    if (stackedPolicy === 'await-base' && isStackedPr(pr, defaultBranch)
+      && runs.length < 100 && missing.length === (requiredChecks ?? []).length) {
+      const basePrNumber = prs.find(candidate => candidate.headRefName === pr.baseRefName)?.number ?? null;
+      const why = basePrNumber !== null
+        ? `stacked on ${pr.baseRefName} (PR #${basePrNumber}) — required checks run once PR #${basePrNumber} lands and the drain retargets this PR to ${defaultBranch}`
+        : `stacked on ${pr.baseRefName} — no open PR owns this base branch; retarget to ${defaultBranch} or restore the base PR`;
+      notes.push({ kind: basePrNumber !== null ? 'stacked-awaiting-base' : 'stacked-base-orphaned',
+        prNumber: pr.number, baseRefName: pr.baseRefName, basePrNumber, why, text: `PR #${pr.number}: ${why}` });
+      ready.push(pr);
+      continue;
+    }
     // Live deadlock shape, PR #3771 (2026-10-03): a conflicting head can never grow its required checks, so reading
     // the REST feed every tick and refusing `check-read-failed` for "missing required checks" is a read that cannot
     // succeed and a refusal that names no real fault. The conflict repair that PR is owed (a mechanical re-sync
@@ -1050,6 +1144,7 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks }) {
         const observed = collapseRollupToLatestPerName(rows).some(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
           && (row.status.toLowerCase() !== 'completed' || FAILING_CONCLUSIONS.includes(row.conclusion?.toLowerCase())));
         cache.set(key, { rows: rows.map(row => ({ ...row, status: row.status.toUpperCase(),
+          detailsUrl: row.detailsUrl ?? row.details_url ?? row.html_url ?? null,
           conclusion: row.conclusion?.toUpperCase() ?? null, completedAt: row.completed_at ?? null })),
         ...(absent.length && !observed ? { incomplete: `missing required checks: ${absent.join(', ')}` } : {}) });
       } catch (error) { cache.set(key, { error: String(error?.message ?? error) }); }
@@ -1071,7 +1166,7 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks }) {
     const known = runs.length && ['red', 'pending'].includes(reduceCheckState(runs, requiredChecks).state) ? runs : null;
     ready.push({ ...pr, statusCheckRollup: refused && known ? known : result.error ? [] : result.rows });
   }
-  return { prs: ready, refusals };
+  return { prs: ready, refusals, notes };
 }
 
 /**
@@ -1095,6 +1190,9 @@ export function runReconcilePass({
   enrichFixClaims = enrichPrsWithFixClaims,
   enrichTimeouts = enrichPrsWithTimeoutEvidence,
   enrichReferralHolds = enrichPrsWithReferralHolds,
+  enrichRulings = enrichPrsWithIgnoredRulings,
+  // The fixer-escalation ladder (default + local override, models from the routing policy). Injectable for tests.
+  loadLadder = loadFixerLadder,
   now = Date.now(), repo = null, defaultBranch = 'main',
   // #2748 false-red follow-up — injectable so a test can supply a fixture with no network, matching every
   // other reader in this file. Defaults to the live, cached branch-protection read.
@@ -1130,7 +1228,7 @@ export function runReconcilePass({
   // #4501 — `requiredChecks` now threaded through so this enrichment judges the SAME live-required set
   // `planReconcile` uses below, instead of silently falling back to `DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS`.
   const hydrated = hydrateChecks(rawPrs, {
-    repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks,
+    repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, defaultBranch,
   });
   const { prs: redPrs, mainRedWindows, mainLatestCheckRuns } = enrichMainRed(hydrated.prs, { repo: resolvedRepo, defaultBranch, requiredChecks });
   // live incident, PR #2752 (#4034/#2748) — attach `alreadyLandedInMain` to any PR carrying
@@ -1140,15 +1238,17 @@ export function runReconcilePass({
   // #4265 — attach each stacked PR's own base ref's current tip, purely locally, no `gh` cost.
   const baseRefPrs = enrichBaseRef(alreadyLandedPrs, { defaultBranch });
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
-  const prs = enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
-    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now });
+  const fixerLadder = loadLadder();
+  if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
+  const prs = enrichRulings(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
+    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { humanAt: fixerLadder.humanAt });
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
   const plan = planReconcile({
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
-    mainLatestCheckRuns, requiredChecks, mainSha,
+    mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
   });
-  return { ...plan, refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
+  return { ...plan, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
       ? pr.files.map((file) => typeof file === 'string' ? file : file.path) : null })),
   };
