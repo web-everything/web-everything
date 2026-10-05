@@ -125,8 +125,8 @@ export function sanitizeDeniedCommand(value) {
     .replace(/(--?[\w-]*(?:token|secret|password|passwd|api[-_]?key|authorization)[\w-]*[= ])[^\s"']+/gi, '$1[redacted]')
     .replace(/\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY)[A-Za-z0-9_]*=)[^\s"']+/gi, '$1[redacted]');
   // Replace (never delete) the delimiters: deleting can splice a NEW `<!--` together (`<!<!----` → `<!--`).
-  s = s.replace(/<!--|-->|`/g, ' ').replace(/@(?=[\w-])/g, '@​').replace(/\s+/g, ' ').trim();
-  if (/<!--|-->/.test(s)) s = s.replace(/[<>]/g, ' ').replace(/\s+/g, ' ').trim();
+  s = s.replace(/<!--|--!?>|`/g, ' ').replace(/@(?=[\w-])/g, '@\u200b').replace(/\s+/g, ' ').trim();
+  if (/<!--|--!?>/.test(s)) s = s.replace(/[<>]/g, ' ').replace(/\s+/g, ' ').trim();
   if (s.length > DENIED_MAX_LENGTH) s = `${s.slice(0, DENIED_MAX_LENGTH - 1)}…`;
   return s;
 }
