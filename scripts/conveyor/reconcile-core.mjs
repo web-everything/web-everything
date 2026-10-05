@@ -1980,8 +1980,8 @@ export function planReconcile({
           why: 'complete timeout inventory and unchanged dependency closure; independent retry budget' });
         continue;
       }
-      if (pr.timeoutRetry && !pr.timeoutRetry.eligible) notes.push({ kind: 'timeout-retry-ineligible', prNumber,
-        text: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });
+      if (pr.timeoutRetry && !pr.timeoutRetry.eligible) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,
+        why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });
       const ciHealAttempts = countCiHealComments(pr?.comments);
       if (ciHealAttempts >= ciHealCap) {
         refuse('cap-exhausted', {

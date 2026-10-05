@@ -107,9 +107,17 @@ const HASH_SLUG = 'x[0-9a-z]{6}';
 export const HASH_PATH_CITE_SOURCE = 'backlog/(x[0-9a-z]{6,7})-[A-Za-z0-9-]+\\.md';
 const HASH_PATH_CITE_RE = new RegExp(`\\b${HASH_PATH_CITE_SOURCE}\\b`, 'g');
 
-/** Classify a cited path using exact-path existence supplied by the caller. */
-export function classifyHashPathCite({ cited, exists }) {
-  return exists(cited) ? 'resolving' : 'dangling';
+export const CAPTURED_DATA_PREFIXES = ['scripts/conveyor/soak/fixtures/'];
+export function isCapturedDataPath(relPath) {
+  return typeof relPath === 'string' && CAPTURED_DATA_PREFIXES.some(prefix => relPath.startsWith(prefix));
+}
+
+/** Only exact existing citations owned by the checkout's net diff are errors. */
+export function classifyHashPathCite({ cited, exists, citingFile, changedFiles }) {
+  if (!exists(cited)) return 'dangling';
+  const owned = changedFiles instanceof Set ? changedFiles.has(citingFile)
+    : Array.isArray(changedFiles) && changedFiles.includes(citingFile);
+  return owned ? 'resolving' : 'unowned';
 }
 
 export function findHashPathCiteOutsideBacklog(text, relPath) {
@@ -120,6 +128,8 @@ export function findHashPathCiteOutsideBacklog(text, relPath) {
   // same reasoning as isIndexableSourcePath's own test-file exclusion. Without this the gate mostly reports
   // its OWN suite's fixtures back to it, which is exactly the wolf-cry failure mode a noisy gate produces.
   if (PROVENANCE_TEST_FILE_RE.test(relPath)) return findings;
+  // Captured threads record card paths as data, not citations; neither gate nor drain should act on them.
+  if (isCapturedDataPath(relPath)) return findings;
   const seen = new Set();
   for (const m of text.matchAll(HASH_PATH_CITE_RE)) {
     if (seen.has(m[0])) continue;
