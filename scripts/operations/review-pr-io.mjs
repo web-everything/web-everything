@@ -1,6 +1,7 @@
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
-  activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
+  findCarriedOperatorRuling, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
 import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
@@ -489,6 +490,7 @@ export function createReviewPrSinks({
   root = REPO_ROOT,
   env = process.env,
   referralJudge = judgeSpawn,
+  readChangedLines,
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
   cardReadable = (ref) => referralCardReadable(ref, root),
   // #xstdout-json — A `--json` CALLER WANTS STDOUT TO BE ONE PARSEABLE DOCUMENT, END TO END. The `NOTICE`
@@ -523,6 +525,32 @@ export function createReviewPrSinks({
   return {
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {
       const { read } = payload;
+      // Cache comparisons only for this invocation, including failures. Missing patches cannot prove clearance.
+      const comparisons = new Map();
+      const changedLines = readChangedLines ?? ((repo, base, head, file) => {
+        const key = JSON.stringify([repo, base, head]);
+        if (!comparisons.has(key)) {
+          try {
+            const value = JSON.parse(execFileSyncThrottled('gh',
+              ['api', `repos/${repo}/compare/${base}...${head}`],
+              { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024 }));
+            comparisons.set(key, Array.isArray(value.files) ? value.files : null);
+          } catch { comparisons.set(key, null); }
+        }
+        const files = comparisons.get(key);
+        if (!files) return null;
+        const entry = files.find(f => f.filename === file || f.previous_filename === file);
+        if (!entry) return files.length >= 300 ? null : new Set();
+        if (entry.status === 'renamed' || typeof entry.patch !== 'string' || !entry.patch) return null;
+        const lines = new Set();
+        let hunks = 0;
+        for (const match of entry.patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
+          hunks++;
+          const start = Number(match[1]), count = Number(match[2] ?? 1);
+          for (let n = start; n < start + count; n++) lines.add(n);
+        }
+        return hunks ? lines : null;
+      });
       const commentBudget = 60_000;
       const fresh = () => {
         const state = labelProvider.readPrState(read.repo, read.pr);
@@ -669,6 +697,43 @@ export function createReviewPrSinks({
           for (const chunk of chunks) {
             state = persist(chunk);
             existing.push(chunk);
+          }
+        }
+        if (env.WE_REFERRAL_CARRY_OPERATOR_RULINGS !== '0') {
+          const records = readReferralRecords(state.comments, context(state)).records;
+          const operatorRulings = readOperatorRulings(state.comments, context(state)).rulings;
+          for (let i = 0; i < existing.length; i++) {
+            const record = existing[i], carried = [];
+            for (const f of activeReferrals(record)) {
+              if ((record.carried ?? []).some(c => c.key === f.key)
+                || operatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
+                  && o.head === record.head && o.runId === record.runId && o.key === f.key)) continue;
+              const match = findCarriedOperatorRuling(f, { records, operatorRulings,
+                head: record.head, repo: record.repo, pr: record.pr });
+              if (!match) continue;
+              let changed;
+              try {
+                const file = String(f.finding.file ?? '').trim().replace(/^(?:\.\/|[ab]\/)/, '').replace(/:\d+(?::\d+)?$/, '');
+                changed = await changedLines(record.repo, match.from.head, record.head, file);
+              } catch { changed = null; }
+              if (!(changed instanceof Set)) continue;
+              const line = f.finding.line;
+              if (line == null ? changed.size > 0 : [...changed].some(n => n >= line - 3 && n <= line + 3)) continue;
+              carried.push({ key: f.key, reason: REFERRAL_CARRY_REASON, from: match.from,
+                result: match.result, ...(match.card ? { card: match.card } : {}) });
+            }
+            if (!carried.length) continue;
+            const updated = { ...record, carried: [...(record.carried ?? []), ...carried] };
+            if (renderReferralRecord(updated).length > commentBudget) {
+              overflow(`historical run ${record.runId} carry exceeds ${commentBudget} characters; original record retained`);
+              continue;
+            }
+            state = persist(updated);
+            existing[i] = updated;
+            for (const c of carried) {
+              const f = record.referrals.find(f => f.key === c.key).finding;
+              out(`referral carried: ${f.file ?? ''}${f.line == null ? '' : `:${f.line}`} — operator ${c.result} from ${c.from.head.slice(0, 8)} stands (cited lines unchanged)`);
+            }
           }
         }
         // Persist the attempt before dispatch. A crash or timeout spends this set's single automated attempt.

@@ -1583,6 +1583,22 @@ describe('#4315 mandatory referral protocol', () => {
     lens: 'correctness', result, rationale: 'Verified against the pinned diff', evidence: ['diff:lease-reaper'],
     ...(result === 'card' ? { card: 'we:backlog/4315-example.md' } : {}) });
 
+  it('validates and requires operator backing for carried rulings', () => {
+    const r = record(), key = r.referrals[0].key;
+    const from = { head: 'b'.repeat(40), runId: 'old', key };
+    const reason = 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged';
+    for (const result of ['block', 'not-real']) {
+      r.carried = [{ key, from, reason, result }];
+      expect(validateReferralRecord(r)).toBe(true);
+      expect(validateReferralRecord({ ...r, carried: [{ ...r.carried[0], reason: 'wrong' }] })).toBe(false);
+      expect(referralRecordState(r).pending).toEqual([key]);
+      const state = referralRecordState(r, { operatorRulings: [{ ...from, repo: r.repo, pr: r.pr, result }] });
+      expect(state.pending).toEqual([]);
+      expect(state.blocked).toEqual(result === 'block' ? [key] : []);
+      expect(liveReferrals(r)).toEqual([]);
+    }
+  });
+
   function supersession() {
     const a = record();
     a.referrals[0].seat = 'judge';

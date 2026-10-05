@@ -1,4 +1,4 @@
-import { referralFindingKey, mandatoryReferralReviewer, normalizeFinding, renderReferralRecord,
+import { buildOperatorRulingComment, referralFindingKey, mandatoryReferralReviewer, normalizeFinding, renderReferralRecord,
   readReferralRecords, validateReferralRecord, mandatoryReferralState, activeReferrals } from '../../lib/jury-core.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
 /**
@@ -1017,7 +1017,7 @@ describe('#xu2pp2m — `--cwd` decides which checkout the DIFF is read from', ()
 });
 
 describe('#4315 durable referral effects', () => {
-  function harness({ result = 'not-real', failure, env = {} } = {}) {
+  function harness({ result = 'not-real', failure, env = {}, readChangedLines = () => new Set() } = {}) {
     const head = 'a'.repeat(40), trace = [], lines = [];
     let posts = 0;
     const state = { headRefOid: head, body: '<!-- authored-by-actor: author -->', comments: [], labels: ['review:pending'] };
@@ -1047,10 +1047,36 @@ describe('#4315 durable referral effects', () => {
           card: result === 'card' ? 'we:backlog/7-filed.md' : '',
         })) } };
     });
-    const make = () => createReviewPrSinks({ root, env, labelProvider: provider, referralJudge: judge,
+    const make = () => createReviewPrSinks({ root, env, readChangedLines, labelProvider: provider, referralJudge: judge,
       mirrorReferral: record => trace.push(`mirror:${record.attempted}`), out: line => lines.push(line), cardReadable: () => failure !== 'card' });
     return { state, trace, lines, payload, judge, make, provider };
   }
+
+  it.each(['unchanged', 'changed', 'unknown', 'disabled'])('carries an earlier operator ruling only with unchanged lines: %s', async mode => {
+    const h = harness({ failure: 'omitted', env: mode === 'disabled' ? { WE_REFERRAL_CARRY_OPERATOR_RULINGS: '0' } : {},
+      readChangedLines: () => mode === 'unknown' ? null : new Set(mode === 'changed' ? [12] : []) });
+    h.payload.referrals[0].original.line = 12;
+    const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
+    const current = { ...old, head: h.state.headRefOid, runId: 'current',
+      reviewer: mandatoryReferralReviewer('current'), attempted: false };
+    h.state.comments.push({ body: renderReferralRecord(current), author: { login: 'web-everything' } });
+    h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+      version: 1, repo: old.repo, pr: old.pr, head: old.head, actor: 'chalbert', channel: 'test',
+      reason: 'not a defect', at: '2026-10-04T12:00:00Z', clearerId: '',
+      rulings: [{ runId: old.runId, key: old.referrals[0].key, result: 'not-real' }],
+    }) });
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const latest = readReferralRecords(h.state.comments).records.find(r => r.runId === 'current');
+    if (mode === 'unchanged') {
+      expect(latest.carried).toHaveLength(1);
+      expect(h.judge).not.toHaveBeenCalled();
+      expect(result.pending).toEqual([]);
+    } else {
+      expect(latest.carried).toBeUndefined();
+      expect(h.judge).toHaveBeenCalledOnce();
+      expect(result.pending).toContain(current.referrals[0].key);
+    }
+  });
 
   function seedReferrals(h, seats, head = 'b'.repeat(40), rule = () => []) {
     const referrals = seats.map((seat, i) => {

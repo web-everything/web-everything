@@ -60,6 +60,17 @@ function reconcile(p) {
 }
 
 describe('attempted mandatory referrals', () => {
+  it('releases stale run evidence only when the live gate has cleared', () => {
+    const r = record();
+    const p = pr({ comments: [comment(renderReferralRecord(r), at - 120_000)] });
+    expect(hold(p)).not.toBeNull();
+    r.rulings = [{ id: 'r1', key, reviewerId: r.reviewer.id, lens: r.reviewer.lens,
+      result: 'block', rationale: 'confirmed', evidence: ['diff'] }];
+    p.comments = [comment(renderReferralRecord(r), at - 120_000)];
+    expect(hold(p)).toBeNull();
+    expect(decideReferralHold(p, [evidence()], { repo, now: at + 1,
+      env: { WE_REFERRAL_HOLD_LIVE_RELEASE: '0' } })).not.toBeNull();
+  });
   it('reads real run-store shape and withholds an unchanged head in the shared planner, across repeated passes', () => {
     const dir = temp(); vi.stubEnv('OPERATION_RUNS_DIR', dir); writeRun(run(), dir);
     for (let tick = 0; tick < 3; tick++) {

@@ -21,7 +21,7 @@
  * PURE. A record is only read from a trusted author (`readReferralRecords` enforces that), and a comment that
  * cannot be read as a record contributes nothing here (the hold itself already fails closed on malformed ones).
  */
-import { readReferralRecords, referralRecordState } from './jury-core.mjs';
+import { readReferralRecords, mandatoryReferralState } from './jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { DEFAULT_FIXER_ESCALATION, TEST_FIRST_INSTRUCTION, humanAtMisses } from './fixer-escalation-policy.mjs';
 
@@ -64,12 +64,6 @@ const activeRulings = (record, key) => {
   return mine.filter((r) => !superseded.has(r.id));
 };
 
-/** Referral keys on `record` that still need a ruling at `head` (card rulings are trusted: no fs read here). */
-function pendingKeys(record, head) {
-  const state = referralRecordState(record, { head, cardReadable: () => true });
-  return state.pending.filter((k) => record.referrals.some((f) => f.key === k));
-}
-
 /** Latest snapshot of each record on `head` (a later snapshot may have ruled what an earlier one left open). */
 function currentRecords(snaps, head) {
   const latest = new Map();
@@ -97,9 +91,9 @@ export function rulingNeeded(pr, { humanAt = DEFAULT_HUMAN_AT } = {}) {
     if (at !== null && (since === null || at < since)) since = at;
   }
   if (operatorVerdictAfter(pr?.comments, firstIndex)) return null;
+  const pending = mandatoryReferralState(pr.comments, { head, cardReadable: () => true }).pending;
   const live = new Map();
   for (const { record } of currentRecords(snaps, head)) {
-    const pending = pendingKeys(record, head);
     for (const f of record.referrals) if (pending.includes(f.key) && !live.has(f.key)) live.set(f.key, { ...findingView(f), reason: 'pending' });
   }
   const ig = ignoredRulings(pr, { humanAt });

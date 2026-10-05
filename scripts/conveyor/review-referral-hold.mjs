@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
-import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
+import { parseOperatorRulingComment, mandatoryReferralState, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -85,7 +85,7 @@ function wakeTime(pr, run) {
   }));
 }
 
-export function decideReferralHold(pr, runs, { repo, now = Date.now() } = {}) {
+export function decideReferralHold(pr, runs, { repo, now = Date.now(), env = process.env } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number))
     .sort((a, b) => b.completedAt - a.completedAt);
   const last = history[0];
@@ -100,6 +100,13 @@ export function decideReferralHold(pr, runs, { repo, now = Date.now() } = {}) {
   const retryAt = last.persistenceFailed && streak <= REFERRAL_RETRY_MS.length
     ? last.completedAt + REFERRAL_RETRY_MS[streak - 1] : null;
   if (retryAt !== null && now >= retryAt) return null;
+  if (!last.persistenceFailed && env.WE_REFERRAL_HOLD_LIVE_RELEASE !== '0') {
+    const live = mandatoryReferralState(pr.comments, {
+      repo, pr: Number(pr.number), head: pr.headRefOid, cardReadable: () => true,
+    });
+    if (!live.pending.length && live.records.some(r => r.head === pr.headRefOid
+      && r.repo === repo && r.pr === Number(pr.number))) return null;
+  }
   const why = `review paused: ${last.count} referrals need a ruling; it resumes on a new push, a ruling, or a send-back`;
   // Same episode across retries and daemon restarts. A new operator event gets a new notice only if it parks again.
   return { head: last.head, episode: hash([repo, pr.number, last.head, wake]), count: last.count,
