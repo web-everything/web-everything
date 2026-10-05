@@ -2,7 +2,7 @@
 bornAs: xj1zosg
 kind: task
 status: open
-scope: ["we:scripts/review-daemon.mjs"]
+scope: ["we:skills-src/conveyor/review-daemon.mjs", "we:skills-src/conveyor/__tests__/review-daemon-interval.test.mjs", "we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs", "we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs"]
 dateOpened: "2026-10-05"
 tags: []
 ---
@@ -13,6 +13,9 @@ The review and fix-dispatch intervals (120 s) are hardcoded: we:scripts/review-d
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+Delivered half (2026-10-05):
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+1. **Executable** — `npm run test:unit` on we:skills-src/conveyor/__tests__/review-daemon-interval.test.mjs passes: the review daemon's interval reads `--interval-ms`, then `WE_REVIEW_DAEMON_INTERVAL_MS`, then the unchanged 120000 default, floored at 10000 (fails on the pre-change source, 20/21 red).
+2. **Already landed** — `load-flake-reverify` has a `we:skills-src/conveyor/daemon-manifest.mjs` entry whose interval reads `WE_LOAD_FLAKE_REVERIFY_INTERVAL_MS` (default 300000), covered by `we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs`. Nothing left to do here.
+
+Deferred: the fix-dispatch interval knob in `we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs` waits until #3982 lands (that file is in flight there). Keep this card open until then.
