@@ -1,6 +1,7 @@
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
-  activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
+  findCarriedOperatorRuling, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
 import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
@@ -462,6 +463,102 @@ function boundedReferral(original, source) {
   return bounded;
 }
 
+/**
+ * The `files` of a GitHub compare, or `null` when the compare cannot speak for "old head → new head". `base...head`
+ * is a THREE-dot compare: it diffs the merge base against `head`, so it equals the old→new diff only when `base`
+ * is an ancestor of `head` (`status` `ahead`, or `identical`). After a force-push/rebase the heads are `diverged`
+ * (or `behind`), and a file the old head changed but the new head reverted is absent from `files` — which would
+ * read as "provably unchanged". Anything else, including a missing `status`, is unknown and never clears.
+ * PURE — table-testable apart from the `gh` call.
+ */
+export function comparedFiles(compare) {
+  if (!compare || !Array.isArray(compare.files)) return null;
+  return compare.status === 'ahead' || compare.status === 'identical' ? compare.files : null;
+}
+
+/** How far around a cited line a change still counts as touching it (the carry's "cited lines" margin). */
+export const CARRY_LINE_MARGIN = 3;
+
+/**
+ * Does a change in `changed` (new-side lines) touch the region a carried ruling spoke for? The finding matcher
+ * tolerates a `CORROBORATION_LINE_WINDOW` offset between the old finding (the one the operator ruled on) and the
+ * new one, so the region is the whole span from the earlier cited line to the later one, plus the margin —
+ * checking only the new finding's line would let a rewrite of the old region slip through. PURE.
+ */
+export function carryTouchesChange(changed, oldLine, newLine) {
+  const cited = [oldLine, newLine].filter(Number.isInteger);
+  if (!cited.length) return changed.old.size > 0 || changed.new.size > 0;
+  const lo = Math.min(...cited) - CARRY_LINE_MARGIN, hi = Math.max(...cited) + CARRY_LINE_MARGIN;
+  // The two sides are different coordinate spaces (a deletion above shifts every later line), so each side's changed
+  // lines are checked on their own: old-side lines prove the old cited region survived, new-side lines the new one.
+  // The span is checked on both sides — over-rejecting only costs a fresh ruling, never a silent clearance.
+  const hit = (set) => [...set].some(n => n >= lo && n <= hi);
+  return hit(changed.old) || hit(changed.new);
+}
+
+/**
+ * The repo-relative path a finding's free-text `file` cites, exactly as written — or `null` when it is not a canonical
+ * repo path. A trailing `:line[:col]` is dropped; nothing else is rewritten. In particular a leading `a/` or `b/` is
+ * NOT a diff prefix here (`a/parser.mjs` can be a real directory, distinct from `parser.mjs`, so stripping it could
+ * check a different file than the one cited), and `.`/`..`/empty segments, a leading `/` or a backslash are refused
+ * outright — the contents API may normalize them onto a file the compare DID list, so an alias could read as
+ * "absent from the compare, therefore unchanged". `null` never carries: it only costs a fresh ruling. PURE.
+ */
+export function canonicalRepoPath(raw) {
+  const path = String(raw ?? '').trim().replace(/:\d+(?::\d+)?$/, '');
+  if (!path || path.includes('\\')) return null;
+  return path.split('/').every(seg => seg !== '' && seg !== '.' && seg !== '..') ? path : null;
+}
+
+/** Is `file` a plain file at `ref`? A missing path, a non-canonical path, a directory or any lookup failure is `false` (fail-closed). */
+export function fileExistsAtRef(repo, ref, file) {
+  try {
+    if (canonicalRepoPath(file) !== file) return false;
+    const path = file.split('/').map(encodeURIComponent).join('/');
+    const got = JSON.parse(execFileSyncThrottled('gh', ['api', `repos/${repo}/contents/${path}?ref=${ref}`],
+      { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }));
+    return !Array.isArray(got) && got?.type === 'file';
+  } catch { return false; }
+}
+
+/**
+ * The lines a GitHub compare (`files` array) changed in one file, as `{ old, new }` — the old-side and new-side line
+ * numbers of every hunk — or `null` when the compare cannot PROVE which lines changed (missing/failed compare, a
+ * 300-file truncation, a rename, a missing or hunk-less patch, a deleted file). `null` never clears anything: the
+ * caller treats it as "do not carry".
+ *
+ * A file ABSENT from the compare reads as "unchanged" only when `isRepoFile()` proves the cited string is a real
+ * file in the repo; the finding's `file` is free reviewer text (a basename, a `we:` path, a hallucinated name), and
+ * an unresolvable string must never match "nothing changed". With no `isRepoFile` the absent case is unknown.
+ * PURE — the `gh` calls stay in the caller, so this parser is directly table-testable (#4315 review).
+ */
+export function changedLinesFromCompare(files, file, { isRepoFile } = {}) {
+  if (!Array.isArray(files) || canonicalRepoPath(file) !== file) return null;
+  const entry = files.find(f => f.filename === file || f.previous_filename === file);
+  if (!entry) {
+    if (files.length >= 300 || typeof isRepoFile !== 'function') return null;
+    let real = false;
+    try { real = isRepoFile() === true; } catch { real = false; }
+    return real ? { old: new Set(), new: new Set() } : null;
+  }
+  // A deleted file has no new-side lines at all: an empty Set would read as "cited lines unchanged".
+  if (entry.status === 'removed' || entry.status === 'renamed' || typeof entry.patch !== 'string' || !entry.patch) return null;
+  const oldLines = new Set(), newLines = new Set();
+  let hunks = 0;
+  for (const match of entry.patch.matchAll(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm)) {
+    hunks++;
+    const oldStart = Number(match[1]), oldCount = Number(match[2] ?? 1);
+    const start = Number(match[3]), count = Number(match[4] ?? 1);
+    // A pure-deletion hunk (`+N,0`) has no new-side lines but still changed the region around `N`; a
+    // pure-insertion hunk (`-N,0`) likewise marks the old-side gap after `N`.
+    if (count === 0) newLines.add(start);
+    for (let n = start; n < start + count; n++) newLines.add(n);
+    if (oldCount === 0) oldLines.add(oldStart);
+    for (let n = oldStart; n < oldStart + oldCount; n++) oldLines.add(n);
+  }
+  return hunks ? { old: oldLines, new: newLines } : null;
+}
+
 /** Is this CLI error text one we can PROVE happened before any write? */
 export function isPreWriteRefusal(text) {
   const s = String(text || '');
@@ -489,6 +586,11 @@ export function createReviewPrSinks({
   root = REPO_ROOT,
   env = process.env,
   referralJudge = judgeSpawn,
+  readChangedLines,
+  fileExists = fileExistsAtRef,
+  readCompare =(repo, base, head) => JSON.parse(execFileSyncThrottled('gh',
+    ['api', `repos/${repo}/compare/${base}...${head}`],
+    { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })),
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
   cardReadable = (ref) => referralCardReadable(ref, root),
   // #xstdout-json — A `--json` CALLER WANTS STDOUT TO BE ONE PARSEABLE DOCUMENT, END TO END. The `NOTICE`
@@ -523,6 +625,18 @@ export function createReviewPrSinks({
   return {
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {
       const { read } = payload;
+      // Cache comparisons only for this invocation, including failures. Missing patches cannot prove clearance.
+      const comparisons = new Map();
+      const changedLines = readChangedLines ?? ((repo, base, head, file) => {
+        const key = JSON.stringify([repo, base, head]);
+        if (!comparisons.has(key)) {
+          try { comparisons.set(key, comparedFiles(readCompare(repo, base, head))); }
+          catch { comparisons.set(key, null); }
+        }
+        // Absent-from-compare means "unchanged" only for a path that is a real file at BOTH heads.
+        return changedLinesFromCompare(comparisons.get(key), file,
+          { isRepoFile: () => fileExists(repo, base, file) && fileExists(repo, head, file) });
+      });
       const commentBudget = 60_000;
       const fresh = () => {
         const state = labelProvider.readPrState(read.repo, read.pr);
@@ -669,6 +783,44 @@ export function createReviewPrSinks({
           for (const chunk of chunks) {
             state = persist(chunk);
             existing.push(chunk);
+          }
+        }
+        if (env.WE_REFERRAL_CARRY_OPERATOR_RULINGS !== '0') {
+          const records = readReferralRecords(state.comments, context(state)).records;
+          const operatorRulings = readOperatorRulings(state.comments, context(state)).rulings;
+          for (let i = 0; i < existing.length; i++) {
+            const record = existing[i], carried = [];
+            for (const f of activeReferrals(record)) {
+              if ((record.carried ?? []).some(c => c.key === f.key)
+                || record.rulings.some(r => r.key === f.key)
+                || operatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
+                  && o.head === record.head && o.runId === record.runId && o.key === f.key)) continue;
+              const match = findCarriedOperatorRuling(f, { records, operatorRulings,
+                head: record.head, repo: record.repo, pr: record.pr });
+              if (!match) continue;
+              let changed;
+              try {
+                const file = canonicalRepoPath(f.finding.file);
+                changed = file ? await changedLines(record.repo, match.from.head, record.head, file) : null;
+              } catch { changed = null; }
+              // Both sides are required: a bare Set cannot say which coordinate space it is in, so it is unknown.
+              if (!(changed?.old instanceof Set && changed?.new instanceof Set)) continue;
+              if (carryTouchesChange(changed, match.finding.line, f.finding.line)) continue;
+              carried.push({ key: f.key, reason: REFERRAL_CARRY_REASON, from: match.from,
+                result: match.result, ...(match.card ? { card: match.card } : {}) });
+            }
+            if (!carried.length) continue;
+            const updated = { ...record, carried: [...(record.carried ?? []), ...carried] };
+            if (renderReferralRecord(updated).length > commentBudget) {
+              overflow(`historical run ${record.runId} carry exceeds ${commentBudget} characters; original record retained`);
+              continue;
+            }
+            state = persist(updated);
+            existing[i] = updated;
+            for (const c of carried) {
+              const f = record.referrals.find(f => f.key === c.key).finding;
+              out(`referral carried: ${f.file ?? ''}${f.line == null ? '' : `:${f.line}`} — operator ${c.result} from ${c.from.head.slice(0, 8)} stands (cited lines unchanged)`);
+            }
           }
         }
         // Persist the attempt before dispatch. A crash or timeout spends this set's single automated attempt.

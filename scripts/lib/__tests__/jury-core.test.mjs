@@ -1,4 +1,4 @@
-import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, liveReferrals } from '../jury-core.mjs';
+import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, carrySummaryMatches, findCarriedOperatorRuling, findSupersedingNotReal, liveReferrals } from '../jury-core.mjs';
 import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER, REFERRAL_STAMP_POLICY_ENV, resolveReferralStampPolicy } from '../jury-core.mjs';
 /**
  * @file jury-core.test.mjs — proof of the #2654 (S2 of epic #2649) append-only JURY-LEDGER EVENT VOCABULARY:
@@ -1582,6 +1582,79 @@ describe('#4315 mandatory referral protocol', () => {
   const rule = (r, result = 'not-real') => ({ id: 'r1', key: r.referrals[0].key, reviewerId: r.reviewer.id,
     lens: 'correctness', result, rationale: 'Verified against the pinned diff', evidence: ['diff:lease-reaper'],
     ...(result === 'card' ? { card: 'we:backlog/4315-example.md' } : {}) });
+
+  it('validates and requires operator backing for carried rulings', () => {
+    const r = record(), key = r.referrals[0].key;
+    const from = { head: 'b'.repeat(40), runId: 'old', key };
+    const reason = 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged';
+    for (const result of ['block', 'not-real']) {
+      r.carried = [{ key, from, reason, result }];
+      expect(validateReferralRecord(r)).toBe(true);
+      expect(validateReferralRecord({ ...r, carried: [{ ...r.carried[0], reason: 'wrong' }] })).toBe(false);
+      expect(referralRecordState(r).pending).toEqual([key]);
+      const state = referralRecordState(r, { operatorRulings: [{ ...from, repo: r.repo, pr: r.pr, result }] });
+      expect(state.pending).toEqual([]);
+      expect(state.blocked).toEqual(result === 'block' ? [key] : []);
+      expect(liveReferrals(r)).toEqual([]);
+    }
+  });
+
+  // Append-only prefix tamper: a later snapshot of the same record can neither drop nor rewrite a carry an earlier
+  // snapshot made (a stripped carry would silently re-open, or a rewritten one silently re-decide, the finding).
+  it.each(['dropped', 'result rewritten', 'origin rewritten'])('a later snapshot with the carry %s is malformed', kind => {
+    const first = record(), key = first.referrals[0].key;
+    first.carried = [{ key, result: 'not-real', from: { head: 'b'.repeat(40), runId: 'old', key },
+      reason: 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged' }];
+    const next = structuredClone(first);
+    if (kind === 'dropped') delete next.carried;
+    if (kind === 'result rewritten') next.carried[0].result = 'block';
+    if (kind === 'origin rewritten') next.carried[0].from.runId = 'other';
+    expect(validateReferralRecord(next)).toBe(true);
+    expect(readReferralRecords([first].map(r => post(renderReferralRecord(r))), { head: first.head }).malformed).toBe(false);
+    expect(readReferralRecords([first, next].map(r => post(renderReferralRecord(r))), { head: first.head }).malformed).toBe(true);
+  });
+
+  // Precedence matrix: a carried operator ruling must never override a ruling the reviewer already recorded
+  // on this head, whatever either one says. The reviewer's own ruling decides; carry only fills the gap.
+  it.each([
+    ['block', 'not-real', true],
+    ['block', 'block', true],
+    ['not-real', 'block', false],
+    ['card', 'not-real', false],
+  ])('a carried operator ruling never overrides the reviewer\'s own: reviewer %s × carried %s', (reviewerResult, carriedResult, blocked) => {
+    const r = record(), key = r.referrals[0].key;
+    const from = { head: 'b'.repeat(40), runId: 'old', key };
+    r.rulings = [rule(r, reviewerResult)];
+    r.carried = [{ key, from, result: carriedResult,
+      reason: 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged' }];
+    const operatorRulings = [{ ...from, repo: r.repo, pr: r.pr, result: carriedResult }];
+    const state = referralRecordState(r, { operatorRulings, cardReadable: () => true, stampPolicy: 'run-identity' });
+    expect(state.blocked).toEqual(blocked ? [key] : []);
+    expect(state.rulings.map(x => x.result)).toEqual([reviewerResult]);
+  });
+
+  // A carry lets an operator ruling clear the gate alone, so its summary match is stricter than the advisory
+  // supersede's (0.5 over the smaller word set): a different defect with a short, generic summary must not inherit it.
+  it.each([
+    ['exact normalized equality', 'Missing   NULL check on the parser', 'missing null check on the parser', true],
+    ['short generic summary, 1 of 2 words shared', 'missing check', 'missing guard', false],
+    ['half the words shared', 'parser drops trailing newline silently', 'parser rejects leading whitespace quietly', false],
+    ['high overlap over enough words', 'parser drops trailing newline silently here', 'parser drops trailing newline silently there', true],
+    ['too few words even at full overlap of the smaller set', 'drops newline', 'drops newline silently when parsing', false],
+    ['a short summary that is a subset of a long one', 'missing null check parser',
+      'missing null check parser when reading configuration files from remote storage during startup', false],
+    ['no words at all', '', 'anything', false],
+  ])('carry summary match — %s', (_name, a, b, matches) => {
+    expect(carrySummaryMatches(a, b)).toBe(matches);
+    // The carry lookup applies the same rule end to end.
+    const r = record(), key = r.referrals[0].key;
+    const old = { ...r, head: 'b'.repeat(40), runId: 'old', referrals: [{ ...r.referrals[0], finding: { ...r.referrals[0].finding, summary: a } }] };
+    old.referrals[0].key = key;
+    const operatorRulings = [{ head: old.head, repo: old.repo, pr: old.pr, runId: old.runId, key, result: 'not-real' }];
+    const referral = { finding: { ...old.referrals[0].finding, summary: b } };
+    const got = findCarriedOperatorRuling(referral, { records: [old], operatorRulings, head: r.head, repo: r.repo, pr: r.pr });
+    expect(got !== null).toBe(matches);
+  });
 
   function supersession() {
     const a = record();

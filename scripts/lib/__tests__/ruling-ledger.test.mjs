@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
+import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
 import {
   rulingNeeded, ignoredRulings, claimSimilarity, sameFinding, hasSentBack, renderRulingNotAddressed,
   fixerRulingBrief, RULING_NOT_ADDRESSED_MARKER,
@@ -25,6 +25,14 @@ const comment = (rec, n, login = 'web-everything') => ({ body: renderReferralRec
 const block = { result: 'block', rationale: 'pointer files must be listed; do not ship without them' };
 
 describe('rulingNeeded', () => {
+  it('uses the live operator ruling for attempted findings', () => {
+    const r = record({ head: H1, runId: 'run-operator' });
+    const body = buildOperatorRulingComment({ version: 1, repo, pr: r.pr, head: H1,
+      actor: 'chalbert', channel: 'test', reason: 'not a defect', at: t(6), clearerId: '',
+      rulings: [{ runId: r.runId, key: r.referrals[0].key, result: 'not-real' }] });
+    expect(rulingNeeded({ headRefOid: H1, comments: [comment(r, 5),
+      { body, author: { login: 'chalbert' } }] })).toBeNull();
+  });
   it('lists pending findings of the current head with file and summary, and when it began', () => {
     const need = rulingNeeded({ headRefOid: H1, comments: [comment(record({ head: H1, runId: 'run-1' }), 5)] });
     expect(need.head).toBe(H1);
