@@ -38,7 +38,7 @@
  * Pure, unit-tested through `review-core.mjs`'s re-exports in `we:scripts/lib/__tests__/review-core.test.mjs`.
  */
 import { deriveSessionId, sessionSeed } from './judge-spawn.mjs';
-import { decideClearerIndependence, parseAuthorActorId } from './review-independence.mjs';
+import { decideClearerIndependence, INDEPENDENCE, parseAuthorActorId } from './review-independence.mjs';
 import { CARE_LEVELS } from './review-escalation.mjs';
 import { AUTOMATION_LOGINS, OPERATOR_LOGINS, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 // #2438's labelled data fence (#2967 moved it to a leaf so this module can reach it — `review-core.mjs`,
@@ -2371,15 +2371,37 @@ export function validateReferralRecord(r) {
   } catch { return false; }
 }
 
+/** Missing-author-stamp policy env: `refuse` (default, fail-closed) keeps the hold and names
+ * `author-stamp-missing` in pending reasons; exactly `run-identity` is the explicit operator opt-in that
+ * trusts the run-derived referral reviewer when the stamp is missing. Relaxing a security control must be
+ * a positive act — a stripped stamp (`stamp-lost`) is indistinguishable from a raw-created PR by date alone.
+ */
+export const REFERRAL_STAMP_POLICY_ENV = 'WE_REFERRAL_MISSING_STAMP';
+
+/** Resolve `refuse` by default; only the exact env value `run-identity` relaxes it (any other value, a
+ * mis-cased or unknown one included, stays strict). */
+export function resolveReferralStampPolicy(env = process.env) {
+  return env[REFERRAL_STAMP_POLICY_ENV] === 'run-identity' ? 'run-identity' : 'refuse';
+}
+
 /** Resolve own rulings from the assigned reviewer or operator. An unruled advisory duplicate
  * may also clear through its explicit same-subject, same-head not-real supersession reference.
+ * Run-derived identities on other records confer no authority over this obligation.
  */
 export function referralRecordState(record, { head = record?.head, body = record?.authorBody ?? '', createdAt = '',
-  cardReadable = () => false, seatDisabled = () => false, operatorRulings = [], records = [] } = {}) {
+  cardReadable = () => false, seatDisabled = () => false, operatorRulings = [], records = [],
+  stampPolicy = resolveReferralStampPolicy() } = {}) {
   if (!validateReferralRecord(record)) return { pending: ['malformed-referral-record'], blocked: [], rulings: [] };
   const pending = [], blocked = [], rulings = [];
-  const independent = decideClearerIndependence({ authorId: parseAuthorActorId(body),
-    clearerId: record.reviewer.id, prCreatedAt: createdAt }).independent === true;
+  const decision = decideClearerIndependence({ authorId: parseAuthorActorId(body),
+    clearerId: record.reviewer.id, prCreatedAt: createdAt });
+  // `validateReferralRecord` already pinned reviewer.id to the run-derived seat, so no separate id check here.
+  const missingStamp = decision.independent !== true
+    && [INDEPENDENCE.STAMP_LOST, INDEPENDENCE.UNKNOWN_AUTHOR].includes(decision.status);
+  // Only on the explicit `run-identity` opt-in: this seat is derived from the review run, not any author's
+  // real session identity, so it proves nothing about independence on its own.
+  const fallback = missingStamp && stampPolicy === 'run-identity';
+  const independent = decision.independent === true || fallback;
   for (const f of activeReferrals(record)) {
     const recorded = record.rulings.filter(r => r.key === f.key);
     // #4979 — the operator's ruling on THIS exact (repo, PR, head, run, finding) is the explicit, authorized
@@ -2412,7 +2434,9 @@ export function referralRecordState(record, { head = record?.head, body = record
       || active.some(r => r.result === 'card' && !cardReadable(r.card))) pending.push(f.key);
     else { rulings.push(...active); if (active[0].result === 'block') blocked.push(f.key); }
   }
-  return { pending, blocked, rulings };
+  // Named only when a finding actually stays held, so a fully operator-ruled record never shows it.
+  if (missingStamp && stampPolicy === 'refuse' && pending.length) pending.push('author-stamp-missing');
+  return { pending, blocked, rulings, independence: { status: decision.status, fallback } };
 }
 
 export const REFERRAL_RECORD_MARKER = 'mandatory-referrals-v1';
