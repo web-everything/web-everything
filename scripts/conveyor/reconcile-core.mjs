@@ -674,6 +674,16 @@ export function countUnresolvedStandDowns(comments) {
  *  agent every two-minute tick; short enough that a recovered outage is retried within one coffee. */
 export const INFRA_RETRY_COOLOFF_MS = 15 * 60 * 1000;
 
+/** Env knob for {@link INFRA_RETRY_COOLOFF_MS}: `WE_INFRA_RETRY_COOLOFF_MINUTES` (a positive number of minutes).
+ *  Unset, empty, non-numeric or non-positive keeps the default. Pure — the IO shell passes its own `env`. */
+export const INFRA_RETRY_COOLOFF_ENV = 'WE_INFRA_RETRY_COOLOFF_MINUTES';
+export function resolveInfraRetryCooloffMs(env = {}) {
+  const raw = env?.[INFRA_RETRY_COOLOFF_ENV];
+  const n = Number(raw);
+  if (raw === undefined || raw === '' || !Number.isFinite(n) || n <= 0) return INFRA_RETRY_COOLOFF_MS;
+  return n * 60 * 1000;
+}
+
 /**
  * we:scripts/conveyor/reconcile-core.mjs#INFRA_RETRY_CAP — xilx617 (epic #4075/#3383): the durable per-SESSION
  * `blocked-on-infra` STREAK cap. Today a session that self-reports `blocked-on-infra` cools off
@@ -741,7 +751,7 @@ export const LIVE_SESSION_OVERRUN_MS = 90 * 60 * 1000;
  * @returns {Array<object>} the same rows; finished ones gain `selfReportedDone: true` and `selfReportedOutcome`;
  *   a row still inside its own `blocked-on-infra` cool-off gains `awaitingInfraCooloff: true` instead
  */
-export function markSelfReportedDone(agents, completionFor, nowMs) {
+export function markSelfReportedDone(agents, completionFor, nowMs, { infraCooloffMs = INFRA_RETRY_COOLOFF_MS } = {}) {
   return (Array.isArray(agents) ? agents : []).map((a) => {
     const name = a?.name;
     if (!name || String(a?.state ?? '').toLowerCase() === 'done') return a;
@@ -766,7 +776,7 @@ export function markSelfReportedDone(agents, completionFor, nowMs) {
       const infraStreak = Number.isInteger(rec.infraStreak) && rec.infraStreak > 0 ? rec.infraStreak : 1;
       const infraStreakSince = rec.infraStreakSince ?? rec.updatedAt ?? null;
       const infraStreakCapped = infraStreak >= INFRA_RETRY_CAP;
-      const cooloffMs = infraStreakCapped ? INFRA_RETRY_CAPPED_COOLOFF_MS : INFRA_RETRY_COOLOFF_MS;
+      const cooloffMs = infraStreakCapped ? Math.max(INFRA_RETRY_CAPPED_COOLOFF_MS, infraCooloffMs) : infraCooloffMs;
       if (!(nowMs - updatedMs >= cooloffMs)) {
         // #4149 — the process may already be `stopped` (or on its way there) this very tick; the cool-off must
         // outrank that, since it is keyed off the RECORD, never off whether a process happens to still be listed.
