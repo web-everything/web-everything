@@ -25,7 +25,9 @@ import {
   isDaemonManagedClone, daemonConveyorStateRoot, materializeCandidate, removeCandidate, previewOverlayConflict,
   readyBuildVerified, resolveOverlayConflict, OVERLAY_EDGE_RESOLVE_ENV,
 } from '../daemon-rebuild.mjs';
-import { addOverlay, removeOverlay, readOverlays, overlayFilePath } from '../daemon-overlays.mjs';
+import {
+  addOverlay, removeOverlay, readOverlays, overlayFilePath, writeOverlays, recordEdgeResolution,
+} from '../daemon-overlays.mjs';
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { readOverlayConflictWakes, markOverlayConflictWake } from '../overlay-conflict-wake.mjs';
@@ -196,6 +198,7 @@ describe('overlay conflict resolution', () => {
       writeFile(dir, 'reviewed.txt', 'resolution\n');
     }, { base: 'origin/lane/b' });
     gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
+    f.overlays[1] = { ...f.overlays[1], edgeResolution: { sha: edgeSha, by: 'operator', at: '2026-10-05T00:00:00Z' } };
     const result = await plan(f);
     expect(result.decisions[1]).toMatchObject({ action: 'apply', reason: 'applied-edge-ref', sha: f.b });
     expect(result.applied[1]).toMatchObject({ resolvedVia: 'edge-ref', edgeSha });
@@ -206,11 +209,171 @@ describe('overlay conflict resolution', () => {
   it('ignores an edge for an older head and reports the unresolved files', async () => {
     const f = conflictFixture();
     gitOk(f.cloneDir, ['update-ref', 'refs/remotes/origin/edge/lane/b', f.main]);
+    f.overlays[1] = { ...f.overlays[1], edgeResolution: { sha: f.main, by: 'operator', at: '2026-10-05T00:00:00Z' } };
     const result = await plan(f);
     expect(result.decisions[1]).toMatchObject({ action: 'drop', reason: 'conflict', files: ['README.md'] });
     expect(result.alerts).toContainEqual({
       kind: 'overlay-conflict-unresolved',
       detail: { ref: 'lane/b', pr: 2, sha: f.b, files: ['README.md'], tried: ['edge-ref', 'replay'] },
+    });
+  });
+
+  // Review round 1, finding 2 (trust): an `origin/edge/<ref>` branch is adopted only because it EXISTS and contains
+  // the PR head — anyone with push access could plant one and the daemon would run its tree. Adoption now needs a
+  // recorded resolution (actor + sha) on the overlay entry, and the fetched tip must equal that sha.
+  describe('edge provenance', () => {
+    const pushEdge = (f) => {
+      const edgeSha = pushBranch(f.originDir, 'edge/lane/b', (dir) => {
+        writeFile(dir, 'README.md', 'A\n');
+        writeFile(dir, 'reviewed.txt', 'resolution\n');
+      }, { base: 'origin/lane/b' });
+      gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
+      return edgeSha;
+    };
+
+    it('never adopts an arbitrary pushed edge branch that has no recorded resolution', async () => {
+      const f = conflictFixture();
+      pushEdge(f);
+      const result = await plan(f);
+      expect(result.decisions[1]).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(gitOk(f.cloneDir, ['ls-tree', '-r', '--name-only', result.finalSha])).not.toContain('reviewed.txt');
+      expect(result.alerts).toContainEqual({
+        kind: 'overlay-conflict-unresolved',
+        detail: { ref: 'lane/b', pr: 2, sha: f.b, files: ['README.md'], tried: ['replay'] },
+      });
+    });
+
+    it('never adopts an edge whose tip differs from the recorded resolution sha', async () => {
+      const f = conflictFixture();
+      pushEdge(f);
+      f.overlays[1] = { ...f.overlays[1], edgeResolution: { sha: f.a, by: 'operator', at: '2026-10-05T00:00:00Z' } };
+      const result = await plan(f);
+      expect(result.decisions[1]).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(result.applied.map((a) => a.resolvedVia)).not.toContain('edge-ref');
+    });
+
+    it('adopts the edge when its tip equals the recorded resolution sha', async () => {
+      const f = conflictFixture();
+      const edgeSha = pushEdge(f);
+      f.overlays[1] = { ...f.overlays[1], edgeResolution: { sha: edgeSha, by: 'operator', at: '2026-10-05T00:00:00Z' } };
+      const result = await plan(f);
+      expect(result.applied[1]).toMatchObject({ resolvedVia: 'edge-ref', edgeSha });
+    });
+
+    it('verifies a ready edge-resolved build only against the current recorded approval', async () => {
+      const f = conflictFixture();
+      const edgeSha = pushEdge(f);
+      f.overlays[1] = { ...f.overlays[1], edgeResolution: { sha: edgeSha, by: 'operator' } };
+      const result = await plan(f);
+      expect(result.applied[1]).toMatchObject({ resolvedVia: 'edge-ref', edgeSha });
+      const verify = (approvedEdgeShaFor) => readyBuildVerified({
+        git: f.runGit, adopt: result, mainTip: f.main, prevHead: f.main, approvedEdgeShaFor,
+      });
+      expect(verify(() => edgeSha)).toBe(true);
+      expect(verify(() => null)).toBe(false); // approval withdrawn / never recorded
+      expect(verify(() => f.a)).toBe(false); // approval now names a different tip
+    });
+
+    it('refuses a malformed recorded sha instead of matching it loosely', async () => {
+      const f = conflictFixture();
+      const edgeSha = pushEdge(f);
+      for (const sha of [edgeSha.slice(0, 12), edgeSha.toUpperCase(), '', null, 7]) {
+        const overlays = [f.overlays[0], { ...f.overlays[1], edgeResolution: { sha, by: 'operator' } }];
+        const result = await plan(f, { overlays });
+        expect(result.decisions[1]).toMatchObject({ action: 'drop', reason: 'conflict' });
+      }
+    });
+  });
+
+  // Review round 1, finding 1 (fail closed): a failed `ls-remote` / edge `fetch` left a previously fetched
+  // `origin/edge/<ref>` in place, so a branch whose remote was deleted (or just not re-confirmed this run) stayed
+  // eligible for conflict resolution. Any edge not re-confirmed on THIS run must be unavailable.
+  describe('edge discovery fails closed', () => {
+    const seeded = (f) => {
+      const edgeSha = pushBranch(f.originDir, 'edge/lane/b', (dir) => {
+        writeFile(dir, 'README.md', 'A\n');
+        writeFile(dir, 'reviewed.txt', 'resolution\n');
+      }, { base: 'origin/lane/b' });
+      gitOk(f.cloneDir, ['fetch', '-q', 'origin']); // the "previous run" left a cached edge ref behind
+      const list = f.overlays.map((o) => (o.ref === 'lane/b'
+        ? { ...o, edgeResolution: { sha: edgeSha, by: 'operator', at: '2026-10-05T00:00:00Z' } } : o));
+      writeOverlays(f.cloneDir, list, { env: f.env });
+      return edgeSha;
+    };
+    const failing = (match) => vi.fn((args, opts) => (match(args)
+      ? { status: 128, stdout: '', stderr: 'simulated failure' } : gitRun(args, opts)));
+    const cachedEdge = (f) => git(f.cloneDir, ['rev-parse', '--verify', 'refs/remotes/origin/edge/lane/b']).status === 0;
+
+    it.each([
+      ['ls-remote fails', (args) => args[0] === 'ls-remote'],
+      ['the edge fetch fails', (args) => args[0] === 'fetch' && args.some((a) => a.startsWith('+refs/heads/edge/'))],
+    ])('does not reuse a cached edge when %s (rebuild)', async (_name, match) => {
+      const f = conflictFixture();
+      seeded(f);
+      const result = await rebuildClone({
+        root: f.cloneDir, env: f.env, run: failing(match), runSmoke: passSmoke(), prState: () => null, lockOpts: LOCK_OPTS,
+      });
+      expect(result.plan.decisions[1]).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(result.plan.applied.map((a) => a.resolvedVia)).not.toContain('edge-ref');
+      expect(cachedEdge(f)).toBe(false);
+    });
+
+    it('does not fetch an edge the remote advertises at a different tip than the recorded sha', async () => {
+      const f = conflictFixture();
+      seeded(f);
+      const other = 'c'.repeat(40);
+      writeOverlays(f.cloneDir, f.overlays.map((o) => (o.ref === 'lane/b'
+        ? { ...o, edgeResolution: { sha: other, by: 'operator' } } : o)), { env: f.env });
+      const run = vi.fn(gitRun);
+      const result = await rebuildClone({
+        root: f.cloneDir, env: f.env, run, runSmoke: passSmoke(), prState: () => null, lockOpts: LOCK_OPTS,
+      });
+      expect(result.plan.decisions[1]).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(run.mock.calls.some(([args]) => args[0] === 'fetch' && args.some((a) => a.startsWith('+refs/heads/edge/')))).toBe(false);
+      expect(cachedEdge(f)).toBe(false);
+    });
+
+    it('stops edge discovery for the run when a cached edge cannot be deleted', async () => {
+      const f = conflictFixture();
+      seeded(f);
+      const run = failing((args) => args[0] === 'update-ref' && args[1] === '-d' && args[2].includes('/edge/'));
+      await rebuildClone({
+        root: f.cloneDir, env: f.env, run, runSmoke: passSmoke(), prState: () => null, lockOpts: LOCK_OPTS,
+      });
+      // no ls-remote/fetch is attempted on top of a ref we could not clear. (Residual, by design: a ref that
+      // survives a failed delete is still adopted only while its tip equals the operator-recorded sha.)
+      expect(run.mock.calls.some(([args]) => args[0] === 'ls-remote' || args[0] === 'fetch' && args.some((a) => a.startsWith('+refs/heads/edge/')))).toBe(false);
+    });
+
+    it('never deletes the tracking ref of an overlay that is itself named edge/<x>', async () => {
+      const f = conflictFixture();
+      pushBranch(f.originDir, 'edge/lane/b', (dir) => writeFile(dir, 'edge-only.txt', 'x\n'));
+      gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
+      writeOverlays(f.cloneDir, [{ ref: 'lane/b', pr: 2 }, { ref: 'edge/lane/b', pr: 3 }], { env: f.env });
+      const result = await rebuildClone({
+        root: f.cloneDir, env: f.env, run: vi.fn(gitRun), runSmoke: passSmoke(), prState: () => null, lockOpts: LOCK_OPTS,
+      });
+      expect(result.plan.decisions.find((d) => d.ref === 'edge/lane/b')?.reason).not.toBe('ref-gone');
+    });
+
+    it('does not reuse a cached edge whose remote branch is gone', async () => {
+      const f = conflictFixture();
+      seeded(f);
+      gitOk(f.cloneDir, ['push', '-q', 'origin', '--delete', 'edge/lane/b']);
+      const result = await rebuildClone({
+        root: f.cloneDir, env: f.env, run: vi.fn(gitRun), runSmoke: passSmoke(), prState: () => null, lockOpts: LOCK_OPTS,
+      });
+      expect(result.plan.decisions[1]).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(cachedEdge(f)).toBe(false);
+    });
+
+    it('does not reuse a cached edge in a dry-run preview when ls-remote fails', async () => {
+      const f = conflictFixture();
+      seeded(f);
+      const preview = await dryRunRebuild({
+        root: f.cloneDir, env: f.env, run: failing((args) => args[0] === 'ls-remote'), prState: () => null,
+      });
+      expect(preview.plan.decisions[1]).toMatchObject({ action: 'drop', reason: 'conflict' });
     });
   });
 
@@ -228,10 +391,11 @@ describe('overlay conflict resolution', () => {
       if (args.some((arg) => arg.includes('origin/edge/'))) throw new Error('edge unavailable');
       return f.runGit(args, opts);
     };
-    expect(resolveOverlayConflict({ git: brokenEdge, cur, ovSha: f.b, ref: 'lane/b' })).toMatchObject({ ok: true, via: 'replay' });
+    const approvedEdgeSha = f.a; // a recorded resolution, so the edge path is actually attempted
+    expect(resolveOverlayConflict({ git: brokenEdge, cur, ovSha: f.b, ref: 'lane/b', approvedEdgeSha })).toMatchObject({ ok: true, via: 'replay' });
     const brokenCommit = (args, opts) => args[0] === 'commit-tree' ? { status: 128 } : brokenEdge(args, opts);
-    expect(resolveOverlayConflict({ git: brokenCommit, cur, ovSha: f.b, ref: 'lane/b' })).toEqual({ ok: false, files: ['README.md'], tried: ['replay'] });
-    expect(resolveOverlayConflict({ git: () => { throw new Error('git failed'); }, cur, ovSha: f.b, ref: 'lane/b' }))
+    expect(resolveOverlayConflict({ git: brokenCommit, cur, ovSha: f.b, ref: 'lane/b', approvedEdgeSha })).toEqual({ ok: false, files: ['README.md'], tried: ['replay'] });
+    expect(resolveOverlayConflict({ git: () => { throw new Error('git failed'); }, cur, ovSha: f.b, ref: 'lane/b', approvedEdgeSha }))
       .toEqual({ ok: false, files: [], tried: ['replay'] });
   });
 
@@ -245,12 +409,19 @@ describe('overlay conflict resolution', () => {
     const first = await rebuild();
     expect(first.plan.decisions[1].reason).toBe('conflict');
     expect(git(f.cloneDir, ['rev-parse', '--verify', 'refs/remotes/origin/edge/lane/b']).status).not.toBe(0);
-    expect(run.mock.calls.filter(([args]) => args[0] === 'ls-remote')).toHaveLength(1);
+    // nothing recorded → no overlay is an edge candidate, so the remote is never even asked about edge branches
+    expect(run.mock.calls.filter(([args]) => args[0] === 'ls-remote')).toHaveLength(0);
     expect(readOverlayConflictWakes(f.env).get(2)).toMatchObject({ pr: 2, ref: 'lane/b', files: ['README.md'], clone: f.cloneDir });
     const edgeSha = pushBranch(f.originDir, 'edge/lane/b', (dir) => {
       writeFile(dir, 'README.md', 'A\n');
       writeFile(dir, 'reviewed.txt', 'resolution\n');
     }, { base: 'origin/lane/b' });
+    // pushed but not yet approved: still never adopted
+    const unapproved = await rebuild();
+    expect(unapproved.plan.decisions[1].reason).toBe('conflict');
+    expect(git(f.cloneDir, ['rev-parse', '--verify', 'refs/remotes/origin/edge/lane/b']).status).not.toBe(0);
+    recordEdgeResolution(f.cloneDir, 'lane/b', { sha: edgeSha, by: 'operator', reason: 'reviewed' }, { env: f.env });
+    expect(readOverlays(f.cloneDir, { env: f.env })[1].edgeResolution).toMatchObject({ sha: edgeSha, by: 'operator', reason: 'reviewed' });
     run.mockClear();
     const second = await rebuild();
     expect(second.adopted).toBe(true);

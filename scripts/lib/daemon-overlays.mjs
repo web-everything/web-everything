@@ -234,6 +234,43 @@ export function addOverlay(root, {
 }
 
 /**
+ * Record WHO approved WHICH `origin/edge/<ref>` tip as the conflict resolution for a registered overlay
+ * (`edgeResolution: {sha, by, at, reason?}` on its entry). The rebuild adopts an edge branch only when its tip
+ * equals this sha (`daemon-rebuild.mjs#recordedEdgeSha`), so a branch anyone pushed under `edge/` is never run.
+ * `sha` must be a full lowercase 40-hex sha and `by` a non-empty actor; the overlay must already be registered
+ * (an approval for an unregistered ref would sit unused and misleading). Re-recording replaces the previous
+ * approval; removing the overlay drops it with the entry. Leaves an audit event.
+ * @param {string} root
+ * @param {string} ref
+ * @param {{sha:string, by:string, reason?:string|null, now?:string}} approval
+ * @param {{env?:NodeJS.ProcessEnv}} [o]
+ * @returns {Array<object>} the new list
+ */
+export function recordEdgeResolution(root, ref, {
+  sha, by, reason = null, now,
+} = {}, { env = process.env } = {}) {
+  if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/.test(sha)) {
+    throw new TypeError(`daemon-overlays: edge resolution sha ${JSON.stringify(sha)} must be a full 40-hex sha`);
+  }
+  if (typeof by !== 'string' || by.trim() === '') {
+    throw new TypeError('daemon-overlays: an edge resolution needs a non-empty actor (by)');
+  }
+  const list = withListLock(root, env, (pause) => {
+    const current = readOverlaysForWrite(root, env).slice();
+    pause();
+    const idx = current.findIndex((o) => o && o.ref === ref);
+    if (idx === -1) throw new Error(`daemon-overlays: overlay ${JSON.stringify(ref)} is not registered — cannot record an edge resolution for it`);
+    current[idx] = {
+      ...current[idx],
+      edgeResolution: { sha, by: by.trim(), at: now || new Date().toISOString(), ...(reason ? { reason } : {}) },
+    };
+    return writeOverlays(root, current, { env });
+  });
+  appendOverlayEvent(root, { kind: 'edge-resolution-recorded', ref, sha, by: by.trim(), reason }, { env });
+  return list;
+}
+
+/**
  * Remove one overlay entry by ref, if present. Idempotent — removing an absent ref is not an error, just
  * `removed:false`. `why` is accepted for the caller's own bookkeeping (e.g. the CLI's audit event / a
  * rebuild's `remove` reason) but is not itself written by this function — pair it with

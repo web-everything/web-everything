@@ -5700,8 +5700,12 @@ clauses:
      before the live clone moves.
    - (b) **An overlay drops automatically once `main` has it**: `git cherry` against `origin/main` shows only
      `-` lines, or the overlay's PR is merged or closed. With no overlays left, the daemon is plain `main`.
-   - (c) **An overlay that no longer merges cleanly first tries a current reviewed edge ref, then mechanical
-     replay in the object database** (operator amendment, 2026-10-05). The merge keeps the PR head as its
+   - (c) **An overlay that no longer merges cleanly first tries its approved edge ref, then mechanical
+     replay in the object database** (operator amendment, 2026-10-05). An edge ref is *approved* only when an
+     operator recorded its exact tip sha on the overlay entry (`daemon-overlay.mjs approve-edge`, actor and sha
+     kept in the overlay store); a branch merely pushed under `edge/` is never fetched or adopted, and an edge not
+     re-confirmed on the current run (failed `ls-remote` or fetch, deleted remote branch) is unavailable — it
+     fails closed to the drop below. The merge keeps the PR head as its
      second parent and still passes the live smoke before adoption. Unresolved conflicts retain the pinned
      refusal/skip rules and otherwise drop for the pass with an alert; a six-hour wake prioritizes the PR's
      fixer past scope overlap. `WE_DAEMON_OVERLAY_EDGE_RESOLVE=0` restores plain merge/drop behavior.

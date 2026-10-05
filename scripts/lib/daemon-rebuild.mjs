@@ -155,17 +155,34 @@ function rebuildCommitEnv(git, a, b) {
   return { ...REBUILD_IDENTITY_ENV, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date };
 }
 
-/** Resolve only in the object DB; a failed strategy leaves the next one available. */
-export function resolveOverlayConflict({ git, cur, ovSha, ref }) {
+const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+
+/** The edge-resolution sha an operator recorded on an overlay entry (`edgeResolution: {sha, by, at}`, written by
+ *  `daemon-overlays.mjs#recordEdgeResolution`), or `null`. Only a full lowercase 40-hex sha counts — a short,
+ *  upper-case, empty or non-string value is read as "nothing recorded", never matched loosely. */
+export function recordedEdgeSha(entry) {
+  const sha = entry?.edgeResolution?.sha;
+  return typeof sha === 'string' && FULL_SHA_RE.test(sha) ? sha : null;
+}
+
+/** Resolve only in the object DB; a failed strategy leaves the next one available.
+ *  `approvedEdgeSha` is the sha an operator recorded for this overlay's `origin/edge/<ref>` (see
+ *  {@link recordedEdgeSha}): an edge branch is adopted ONLY when its tip equals it. A branch that merely exists
+ *  and contains the PR head — anyone with push access can create one — is never trusted. */
+export function resolveOverlayConflict({ git, cur, ovSha, ref, approvedEdgeSha = null }) {
   const tried = [];
   try {
-    const edgeSha = verifyRev(git, `refs/remotes/origin/edge/${ref}^{commit}`);
-    if (edgeSha) {
-      tried.push('edge-ref');
-      if (git(['merge-base', '--is-ancestor', ovSha, edgeSha]).status === 0) {
-        const mt = git(['merge-tree', '--write-tree', '--no-messages', cur, edgeSha]);
-        const tree = String(mt.stdout ?? '').split('\n')[0].trim();
-        if (mt.status === 0 && tree) return { ok: true, via: 'edge-ref', tree, edgeSha };
+    if (approvedEdgeSha && FULL_SHA_RE.test(approvedEdgeSha)) {
+      const edgeSha = verifyRev(git, `refs/remotes/origin/edge/${ref}^{commit}`);
+      if (edgeSha === approvedEdgeSha) {
+        tried.push('edge-ref');
+        if (git(['merge-base', '--is-ancestor', ovSha, edgeSha]).status === 0) {
+          const mt = git(['merge-tree', '--write-tree', '--no-messages', cur, edgeSha]);
+          const tree = String(mt.stdout ?? '').split('\n')[0].trim();
+          if (mt.status === 0 && tree) return { ok: true, via: 'edge-ref', tree, edgeSha };
+        }
+      } else if (edgeSha) {
+        tried.push('edge-ref-unrecorded-tip');
       }
     }
   } catch { /* try replay */ }
@@ -413,7 +430,7 @@ export async function planRebuild({
     let resolution;
     let tree = String(mt.stdout ?? '').split('\n')[0].trim();
     if (mt.status === 1) {
-      if (edgeResolve) resolution = resolveOverlayConflict({ git, cur, ovSha, ref });
+      if (edgeResolve) resolution = resolveOverlayConflict({ git, cur, ovSha, ref, approvedEdgeSha: recordedEdgeSha(raw) });
       if (resolution?.ok) tree = resolution.tree;
       else {
         if (resolution) alerts.push({
@@ -814,19 +831,48 @@ function fetchMainAndOverlays({ git, overlays, edgeResolve = true }) {
     ...safeOverlays.map((o) => `+refs/heads/${o.ref}:refs/remotes/origin/${o.ref}`),
   ];
   const batch = git(['fetch', '--quiet', '--prune', 'origin', ...refspecs]);
+  // FAIL CLOSED. An edge ref is usable only if THIS run re-confirmed it: every cached `origin/edge/<ref>` is
+  // deleted first, so a failed `ls-remote`/`fetch`, a deleted remote branch, or a thrown git call leaves it
+  // unavailable (the conflict then drops visibly) instead of resolving against a stale branch from an earlier
+  // run. Only an overlay with a recorded resolution (`recordedEdgeSha`) is a candidate at all, and its edge is
+  // fetched only while the remote still advertises exactly the recorded sha — an arbitrary pushed `edge/*`
+  // branch is never even fetched.
   const fetchEdges = () => {
     if (!edgeResolve) return;
+    const edgeRef = (ref) => `refs/remotes/origin/edge/${ref}`;
+    // An overlay may itself be named `edge/<x>`: its OWN tracking ref is the same path as overlay `<x>`'s edge
+    // ref, and must never be deleted or re-fetched here.
+    const overlayTracking = new Set(safeOverlays.map((o) => `refs/remotes/origin/${o.ref}`));
+    const edgeCandidates = safeOverlays.filter((o) => !overlayTracking.has(edgeRef(o.ref)));
+    // A delete that fails (lock, I/O) ends edge discovery for the run. The surviving ref is still adopted only
+    // while its tip equals the operator-recorded sha (see `resolveOverlayConflict`) — provenance holds, but it is
+    // not re-confirmed against the remote on that run.
+    const dropCached = () => {
+      let ok = true;
+      for (const { ref } of edgeCandidates) {
+        try { if (git(['update-ref', '-d', edgeRef(ref)]).status !== 0) ok = false; } catch { ok = false; }
+      }
+      return ok;
+    };
+    if (!dropCached()) return;
     try {
+      const approved = new Map(edgeCandidates.map((o) => [o.ref, recordedEdgeSha(o)]).filter(([, sha]) => sha));
+      if (approved.size === 0) return;
       const listed = git(['ls-remote', '--heads', 'origin', 'refs/heads/edge/*']);
       if (listed.status !== 0) return;
-      const heads = new Set(String(listed.stdout ?? '').trim().split('\n').map((line) => line.split(/\s+/)[1]));
+      const advertised = new Map(String(listed.stdout ?? '').trim().split('\n')
+        .map((line) => line.trim().split(/\s+/)).filter((p) => p.length >= 2).map(([sha, name]) => [name, sha]));
       const edges = [];
-      for (const { ref } of safeOverlays) {
-        if (heads.has(`refs/heads/edge/${ref}`)) edges.push(`+refs/heads/edge/${ref}:refs/remotes/origin/edge/${ref}`);
-        else git(['update-ref', '-d', `refs/remotes/origin/edge/${ref}`]);
+      for (const [ref, sha] of approved) {
+        if (advertised.get(`refs/heads/edge/${ref}`) === sha) edges.push(`+refs/heads/edge/${ref}:${edgeRef(ref)}`);
       }
-      if (edges.length) git(['fetch', '--quiet', 'origin', ...edges]);
-    } catch { /* edge discovery must never block a rebuild */ }
+      if (edges.length === 0) return;
+      if (git(['fetch', '--quiet', 'origin', ...edges]).status !== 0) { dropCached(); return; }
+      // The branch may have moved between `ls-remote` and `fetch`: keep only a ref whose tip is the recorded sha.
+      for (const [ref, sha] of approved) {
+        if (verifyRev(git, `${edgeRef(ref)}^{commit}`) !== sha) git(['update-ref', '-d', edgeRef(ref)]);
+      }
+    } catch { dropCached(); /* edge discovery must never block a rebuild */ }
   };
   if (batch.status === 0) {
     fetchEdges();
@@ -1032,7 +1078,7 @@ export function matchReadyCandidate({
  * @param {{git:(args:string[])=>{status:number|null, stdout?:string}, adopt:object, mainTip:string}} o
  */
 export function readyBuildVerified({
-  git, adopt, mainTip, prevHead,
+  git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null,
 }) {
   const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0;
   if (!adopt?.finalSha || !adopt.mainSha || !mainTip || !isAncestor(adopt.mainSha, mainTip)) return false;
@@ -1054,7 +1100,11 @@ export function readyBuildVerified({
     // The merge's tree is exactly what planRebuild mints for (prev, overlay) — never an arbitrary tree.
     let minted;
     if (a.resolvedVia) {
-      const resolved = resolveOverlayConflict({ git, cur: prev, ovSha: a.sha, ref: a.ref });
+      // An edge-resolved build is only as trusted as the operator's CURRENT recorded approval: the record's own
+      // `edgeSha` must still equal it, and the tree is re-derived through that same approved edge.
+      const approvedEdgeSha = approvedEdgeShaFor(a.ref);
+      if (a.resolvedVia === 'edge-ref' && (!approvedEdgeSha || a.edgeSha !== approvedEdgeSha)) return false;
+      const resolved = resolveOverlayConflict({ git, cur: prev, ovSha: a.sha, ref: a.ref, approvedEdgeSha });
       minted = resolved.ok ? resolved.tree : '';
     } else {
       const mt = git(['merge-tree', '--write-tree', '--no-messages', prev, a.sha]);
@@ -1757,6 +1807,7 @@ async function prepareRebuild({
         stillWanted: (ref) => wantedRefs.has(ref),
         verifyBuilt: (adopt) => readyBuildVerified({
           git, adopt, mainTip: plan.mainSha, prevHead,
+          approvedEdgeShaFor: (ref) => recordedEdgeSha((overlaysBefore || []).find((o) => o?.ref === ref)),
         }),
         overlayTip: (ref) => verifyRev(git, `refs/remotes/origin/${ref}^{commit}`),
         registered: (ref) => registeredRefs.has(ref),
