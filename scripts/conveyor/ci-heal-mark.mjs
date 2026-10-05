@@ -74,6 +74,37 @@ export function countCiHealComments(comments) {
   return n;
 }
 
+// Duplicated to avoid the main-red-recovery → reconcile-core import cycle; #3794 live case, 2026-10-04.
+const REBASE_ONTO_MAIN_COMMENT_MARKER = '🔀 conveyor rebase-onto-main';
+
+/** Restore defaults on; #3794 live case, 2026-10-04. */
+export function resolveCiHealBudgetRestore(env = {}) {
+  return !['0', 'false'].includes(String(env.WE_CI_HEAL_BUDGET_RESTORE ?? '').trim().toLowerCase());
+}
+
+/** Trusted durable refund windows; #3794 live case, 2026-10-04. */
+export function readAttributedWindows(comments) {
+  return (Array.isArray(comments) ? comments : []).flatMap((c) => {
+    if (!isTrustedMarkerAuthor(c) || typeof c?.body !== 'string'
+        || !c.body.trimStart().split('\n')[0].startsWith(REBASE_ONTO_MAIN_COMMENT_MARKER)) return [];
+    const match = /^attributed-window: (\S+) (\S+)\s*$/m.exec(c.body);
+    if (!match) return [];
+    const [, from, to] = match;
+    return Number.isFinite(Date.parse(from)) && Number.isFinite(Date.parse(to)) && Date.parse(from) <= Date.parse(to)
+      ? [{ from, to }] : [];
+  });
+}
+
+/** Refund heals spent during attributed main bugs; #3794 live case, 2026-10-04. */
+export function countChargeableCiHealComments(comments, { restore = true } = {}) {
+  if (!restore) return countCiHealComments(comments);
+  const windows = readAttributedWindows(comments);
+  return countCiHealComments((Array.isArray(comments) ? comments : []).filter((c) => {
+    const at = Date.parse(c?.createdAt);
+    return !windows.some(({ from, to }) => Date.parse(from) <= at && at <= Date.parse(to));
+  }));
+}
+
 /** Built from code points, not literals, so no invisible character lives in this source (#2866). */
 const ZERO_WIDTH_SPACE = String.fromCharCode(0x200b);
 const CONTROL_AND_LINE_SEPARATORS = new RegExp(`[\\r\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f${String.fromCharCode(0x85, 0x2028, 0x2029)}]`, 'g');

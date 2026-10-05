@@ -35,7 +35,9 @@ export function queueFirstHold(prs, now) {
 export function repairAttempts(subject, kind, { followUps = [], repairEvidence = {} } = {}) {
   const ev = repairEvidence[subject] ?? {};
   const ledger = followUps.filter((e) => e.target === subject && e.kind === kind).length;
-  return { attempts: Math.max(ledger, kind === 'ci-heal' ? Number(ev.ciHealComments) || 0 : 0), stoodDown: Number(ev.standDownComments) > 0 };
+  const refunded = kind === 'ci-heal' ? Number(ev.refunded) || 0 : 0;
+  return { attempts: Math.max(ledger - refunded, kind === 'ci-heal' ? Number(ev.ciHealComments) || 0 : 0),
+    stoodDown: Number(ev.standDownComments) > 0, ...(refunded > 0 ? { refunded } : {}) };
 }
 /**
  * The owed repair for one PR, or null. `liveWorker` is true when a slot-holding `fix-<pr>` / `ci-heal-<pr>` session (or a
@@ -48,9 +50,10 @@ export function repairOwed(p, labels, { liveWorker, subject, followUps = [], rep
   const conflict = isConflicting(p), owedAction = conflict ? 'dispatch-conflict-fix' : labels.includes('ci:failed') ? 'dispatch-ci-heal' : null;
   if (!owedAction) return null;
   const kind = REPAIR_KINDS[owedAction], spent = repairAttempts(subject, kind, { followUps, repairEvidence });
-  if (spent.stoodDown) return { owedAction, kind, exhausted: { why: 'a fix agent already stood down here and asked for human judgment', attempts: spent.attempts } };
-  if (spent.attempts >= retryCap) return { owedAction, kind, exhausted: { why: `${spent.attempts} attempts spent (cap ${retryCap})`, attempts: spent.attempts } };
-  return { owedAction, kind };
+  const refund = spent.refunded > 0 ? { refunded: spent.refunded } : {};
+  if (spent.stoodDown) return { owedAction, kind, ...refund, exhausted: { why: 'a fix agent already stood down here and asked for human judgment', attempts: spent.attempts } };
+  if (spent.attempts >= retryCap) return { owedAction, kind, ...refund, exhausted: { why: `${spent.attempts} attempts spent (cap ${retryCap})`, attempts: spent.attempts } };
+  return { owedAction, kind, ...refund };
 }
 /** Why a dispatch row that could not launch is deferred: hold-aware, so a wait behind older PRs is named. */
 export function deferralReason(row, { hold, proposed, now, prsByKey }) {

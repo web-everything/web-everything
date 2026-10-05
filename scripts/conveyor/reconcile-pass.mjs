@@ -69,7 +69,8 @@ import { resolve } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
-import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
+import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
+import { REPO_ROOT, defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { countRearmComments } from './rearm-review.mjs';
 import { planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls } from './reconcile-core.mjs';
@@ -83,6 +84,7 @@ import { latestRequiredCheck, isRequiredCheckFailed } from '../merge-ai-prs.mjs'
 import {
   computeMainRedWindows, DEFAULT_MAIN_WORKFLOW_NAME, DEFAULT_REQUIRED_CHECK, DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS,
   failingRequiredCheckForAttribution, isAnyRequiredCheckFailed,
+  extractCiErrorSignatures, signatureFragments, isPrCiFailureOwedRerun,
   // landing-freeze fix (2026-09-27) — the one extra read `isPrCiFailureOwedRerun`'s new green-check path needs:
   // `main`'s own latest completed run's headSha, so the IO shell can fetch THAT commit's own per-check
   // conclusions. See `main-red-recovery.mjs`'s own "LANDING-FREEZE FIX" section header for the incident.
@@ -501,6 +503,60 @@ export function defaultReadAheadBy(headSha, { exec = execFileSyncThrottled, repo
   }
 }
 
+/** Best-effort emitter history for #3794 live case, 2026-10-04. */
+export function defaultReadMainFixedSignatureFacts({
+  repo, detailsUrl, failureCompletedAt, root, defaultBranch = 'main', exec = execFileSyncThrottled,
+} = {}) {
+  try {
+    const jobId = /\/job\/(\d+)/.exec(detailsUrl ?? '')?.[1];
+    const mainRef = mainRefFor(defaultBranch);
+    if (!jobId || !mainRef || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')
+        || !Number.isFinite(Date.parse(failureCompletedAt))) return null;
+    root ??= resolveLanePoolRepoPath(repo) ?? REPO_ROOT;
+    const options = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
+    const log = exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], options);
+    const messages = extractCiErrorSignatures(log);
+    if (!messages.length) return { signatures: [] };
+    const git = (args) => exec('git', ['-C', root, ...args], options).trim();
+    const fixes = new Map();
+    const signatures = messages.map((message) => {
+      const fragments = signatureFragments(message);
+      const files = new Set();
+      for (const fragment of fragments) {
+        let matches;
+        try {
+          matches = git(['grep', '-l', '-F', '-e', fragment, mainRef, '--', '.',
+            ':(exclude)**/__tests__/**', ':(exclude)**/fixtures/**', ':(exclude)backlog/**']);
+        } catch (error) {
+          if (error.status === 1) continue;
+          throw error;
+        }
+        for (const match of matches.split('\n').filter(Boolean)) {
+          if (!match.startsWith(`${mainRef}:`)) throw new Error('invalid emitter path');
+          files.add(match.slice(mainRef.length + 1));
+        }
+      }
+      const emitterFiles = [...files];
+      const rows = emitterFiles.length ? git(['--literal-pathspecs', 'log', '--first-parent', '--format=%H%x09%cI',
+        `--since=${failureCompletedAt}`, '--end-of-options', mainRef, '--', ...emitterFiles]) : '';
+      const fixCommits = rows.split('\n').filter(Boolean).map((row) => {
+        const [sha, at] = row.split('\t');
+        if (!isSha(sha) || !Number.isFinite(Date.parse(at))) throw new Error('invalid fix commit');
+        fixes.set(sha, at);
+        return sha;
+      });
+      return { message, fragments, emitterFiles, fixCommits };
+    });
+    const allFiles = [...new Set(signatures.flatMap((s) => s.emitterFiles))];
+    const bugIntroducedAt = allFiles.length ? git(['--literal-pathspecs', 'log', '--first-parent', '-1', '--format=%cI',
+      `--until=${failureCompletedAt}`, '--end-of-options', mainRef, '--', ...allFiles]) : null;
+    if (bugIntroducedAt && !Number.isFinite(Date.parse(bugIntroducedAt))) return null;
+    const fixedAt = [...fixes.values()].sort((a, b) => Date.parse(a) - Date.parse(b))[0] ?? null;
+    return { signatures, fixCommits: [...fixes.keys()], bugIntroducedAt, fixedAt };
+  } catch { return null; }
+}
+
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#enrichPrsWithMainRedFacts — we:backlog/x5uqim1-*.md (#4075/#3383):
  * attach `requiredCheckCompletedAt` / `aheadByOnMain` to every PR whose required check is currently FAILING, and
@@ -533,6 +589,7 @@ export function defaultReadAheadBy(headSha, { exec = execFileSyncThrottled, repo
 export function enrichPrsWithMainRedFacts(prs, {
   readMainRuns = defaultReadMainRuns, readAheadBy = defaultReadAheadBy,
   readMainLatestCheckRuns = defaultReadMainLatestCheckRuns, readMainGreenFixFacts = defaultReadMainGreenFixFacts,
+  readMainFixedSignatureFacts = defaultReadMainFixedSignatureFacts,
   requiredCheck = null, requiredChecks = DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS, defaultBranch = 'main', repo = null,
 } = {}) {
   const checks = requiredCheck ? [requiredCheck] : requiredChecks;
@@ -552,8 +609,13 @@ export function enrichPrsWithMainRedFacts(prs, {
     const greenFix = greenSha && aheadBy !== 0
       ? readMainGreenFixFacts(pr.headRefOid, { repo, greenSha, checkName: check.name })
       : null;
+    const mainFixedSignature = aheadBy > 0 && !isPrCiFailureOwedRerun({
+      requiredCheckCompletedAt: check?.completedAt, failingCheckName: check?.name, aheadBy,
+      mainRedWindows, mainLatestCheckRuns, ...greenFix, comments: pr.comments, headSha: pr.headRefOid,
+    }) ? readMainFixedSignatureFacts({ repo, detailsUrl: latestRequiredCheck(pr, check?.name)?.detailsUrl,
+      failureCompletedAt: check?.completedAt, defaultBranch }) : null;
     return {
-      ...pr, requiredCheckCompletedAt: check?.completedAt ?? null, requiredCheckName: check?.name ?? null, aheadByOnMain: aheadBy,
+      ...pr, mainFixedSignature, requiredCheckCompletedAt: check?.completedAt ?? null, requiredCheckName: check?.name ?? null, aheadByOnMain: aheadBy,
       prContainsMainGreenSha: greenFix?.prContainsMainGreenSha ?? null, mergeBaseCheckRuns: greenFix?.mergeBaseCheckRuns ?? null,
       mergeBaseRunConclusion: greenFix?.mergeBaseRunConclusion ?? null,
     };
