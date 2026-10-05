@@ -28,7 +28,7 @@ const RUNNER = fileURLToPath(new URL('./fixtures/fixer-wait-loop-undetected.mjs'
 export default {
   id: 'fixer-wait-loop-undetected',
   title: 'a fixer looping on verify-lane waits held its PR fix claim 1h27 with no push, and no detector read its transcript',
-  card: 'we:backlog/xegykal (epic #3383)',
+  card: 'we:backlog/5105 (epic #3383)',
   fixedBy: {
     sha: '1cf1409bc', where: 'lane/session-watchdog',
     paths: [

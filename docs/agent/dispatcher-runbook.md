@@ -93,7 +93,7 @@ This is about a **delivery agent** the runner spawned (`claude --bg`), not the r
    acquired — that's a separate judgment call (was the tree actually clean?). Release it by hand once you've
    checked: `node scripts/lane-pool.mjs release --lane=<n> --force`.
 
-## The session watchdog — reading what a long session is doing (xegykal)
+## The session watchdog — reading what a long session is doing (5105)
 
 The health watch runs `we:scripts/conveyor/session-watchdog.mjs` every `intervalMinutes` (default 5). For each live
 conveyor session (`fix-`, `ci-heal-`, `review-`, `conveyor-`/`build-`, `prepare-`) past its kind's **standard
