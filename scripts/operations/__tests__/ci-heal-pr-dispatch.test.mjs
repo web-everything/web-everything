@@ -854,6 +854,55 @@ describe('CI-heal salvage before agent dispatch', () => {
       return { result, dispatch };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
+  const loop = (overrides = {}) => ({ killed: () => false, readRows: () => [], append: vi.fn(), ...overrides });
+  const rows = () => Array.from({ length: 3 }, () => ({ v: 1, at: new Date().toISOString(), repo: 'we',
+    pr: entry.prNumber, head: entry.headRefOid, kind: 'ci-heal' }));
+  it('kill file refuses before salvage or dispatch', async () => {
+    const salvage = vi.fn();
+    const { result, dispatch } = await exercise(salvage, { fixLoop: loop({ killed: () => true }) });
+    expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 3895, kind: 'fix-dispatch-killed' }));
+    expect(salvage).not.toHaveBeenCalled(); expect(dispatch).not.toHaveBeenCalled();
+  });
+  it('hold label refuses before salvage when provided', async () => {
+    const salvage = vi.fn();
+    const { result, dispatch } = await exercise(salvage, {
+      reconcile: () => ({ dispatch: [{ ...entry, labels: ['hold:fix'] }], refusals: [] }),
+    });
+    expect(result.refusals).toContainEqual({ pr: 3895, kind: 'fix-hold-label' });
+    expect(salvage).not.toHaveBeenCalled(); expect(dispatch).not.toHaveBeenCalled();
+  });
+  it('loop hold refuses dispatch after trying salvage', async () => {
+    const salvage = vi.fn(() => null), evidence = rows(), ledger = loop({ readRows: () => evidence });
+    const { result, dispatch } = await exercise(salvage, { fixLoop: ledger });
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-loop-hold' }));
+    expect(salvage).toHaveBeenCalledTimes(1); expect(dispatch).not.toHaveBeenCalled();
+    expect(ledger.append).not.toHaveBeenCalled();
+  });
+  it('salvage can push despite the loop threshold', async () => {
+    const evidence = rows(), ledger = loop({ readRows: () => evidence });
+    const { result, dispatch } = await exercise(() => ({ pushed: true, sha: 'saved' }), { fixLoop: ledger });
+    expect(result.dispatched[0].kind).toBe('ci-heal-salvage');
+    expect(dispatch).not.toHaveBeenCalled(); expect(ledger.append).not.toHaveBeenCalled();
+  });
+  it('successful dispatch appends exactly one ledger row', async () => {
+    const ledger = loop();
+    await exercise(() => null, { fixLoop: ledger });
+    expect(ledger.append).toHaveBeenCalledTimes(1);
+    expect(ledger.append).toHaveBeenCalledWith({ repo: 'we', pr: 3895, kind: 'ci-heal',
+      head: entry.headRefOid, session: 'ci-heal-3895' });
+  });
+  it('append failure does not undo a successful dispatch', async () => {
+    const { result } = await exercise(() => null, { fixLoop: loop({ append: () => { throw Error('disk'); } }) });
+    expect(result.dispatched).toHaveLength(1); expect(result.refusals).toEqual([]);
+  });
+  it.each(['held', 'failed'])('does not append for a %s dispatch', async mode => {
+    const ledger = loop();
+    await exercise(() => null, { fixLoop: ledger, dispatch: () => {
+      if (mode === 'failed') throw Error('failed');
+      return { held: true };
+    } });
+    expect(ledger.append).not.toHaveBeenCalled();
+  });
   it('returns a salvage dispatch without spawning an agent', async () => {
     const { result, dispatch } = await exercise(() => ({ pushed: true, sha: 's', laneDir: '/saved' }));
     expect(result.dispatched).toEqual([{ kind: 'ci-heal-salvage', pr: 3895, sha: 's', laneDir: '/saved', headRefName: entry.headRefName }]);
