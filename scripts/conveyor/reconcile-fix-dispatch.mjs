@@ -501,11 +501,24 @@ export const MAX_PAGINATED_FILES = 3000;
 export const MAX_COMPARE_FILES = 300;
 
 /**
+ * The compare answer's file list, or `null` when it is not PROVABLY the complete scope (PR #3881 operator ruling): the
+ * `files` field is missing or not an array, an entry has no filename, or the RAW entry count reached
+ * {@link MAX_COMPARE_FILES} (checked before de-duplication, so a capped list can never slip under the cap). Pure.
+ * @param {unknown} names - the projected `[.files[] | .filename]` array, or `null` for an answer with no `files` array.
+ * @returns {string[]|null}
+ */
+export function completeCompareFiles(names) {
+  if (!Array.isArray(names) || names.length >= MAX_COMPARE_FILES) return null;
+  if (!names.every((n) => typeof n === 'string' && n.trim())) return null;
+  return [...new Set(names.map((n) => n.trim()))];
+}
+
+/**
  * The paginated fallback for a too-large PR diff. Prefers `compare/<base>...<headSha>` (diffed against the LIVE base
  * branch — the PR's real contribution), then `pulls/<n>/files` (diffed against the PR's recorded base sha, which can
  * lag main and overstate the list; PR #3794 showed 309 files there vs 8 against live main). Returns the de-duplicated
- * path list, or `null` when no endpoint gave a COMPLETE answer: a compare list that reaches
- * {@link MAX_COMPARE_FILES} falls through to `pulls/<n>/files`, and a `pulls/<n>/files` list that reaches
+ * path list, or `null` when no endpoint gave a COMPLETE answer: a compare answer that is not provably complete
+ * ({@link completeCompareFiles}) falls through to `pulls/<n>/files`, and a `pulls/<n>/files` list that reaches
  * {@link MAX_PAGINATED_FILES} is refused rather than returned as a partial scope.
  */
 export function fetchPrFilesPaginated(pr, { exec = execFileSyncThrottled, root = REPO_ROOT, repo = null, opts } = {}) {
@@ -520,10 +533,14 @@ export function fetchPrFilesPaginated(pr, { exec = execFileSyncThrottled, root =
     if (repo) viewArgv.push('--repo', repo);
     const [base, head] = String(exec('gh', viewArgv, o(1024 * 1024)) || '').trim().split(' ');
     if (base && head) {
-      const out = exec('gh', ['api', '--paginate', '--method', 'GET', `repos/${slug}/compare/${base}...${head}`, '-F', 'per_page=100', '--jq', '.files[]?.filename'], o(8 * 1024 * 1024));
-      const files = lines(out);
-      if (files.length < MAX_COMPARE_FILES) return files;
-      // At the compare cap the list may be truncated — fall through to pulls/<n>/files rather than trust it.
+      // ONE page, never `--paginate`: compare paginates commits and lists the changed files on the first page only.
+      // The projection keeps a missing/null `files` field (`null`) and a nameless entry (`null` in the array) visible,
+      // where `.files[]?.filename` had turned both into "no files" — an empty list accepted as the complete scope.
+      const out = exec('gh', ['api', '--method', 'GET', `repos/${slug}/compare/${base}...${head}`, '-F', 'per_page=1',
+        '--jq', 'if (.files | type) == "array" then [.files[] | .filename] else null end'], o(8 * 1024 * 1024));
+      const files = completeCompareFiles(JSON.parse(String(out || '').trim() || 'null'));
+      if (files) return files;
+      // Not provably complete (capped, absent or malformed) — fall through to pulls/<n>/files rather than trust it.
     }
   } catch { /* fall through to the pulls/files endpoint */ }
   try {

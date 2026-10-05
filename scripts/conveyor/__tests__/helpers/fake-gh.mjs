@@ -856,6 +856,8 @@ export function createFakeGithub({ root, repos, actor = 'we-daemon-bot' }) {
      *  net/http stderr text (`error connecting to api.github.com` / `dial tcp ...: i/o timeout`) — what a REAL
      *  `gh` (a Go binary) prints on a genuine network fault, distinct from the HTTP_* fixtures the other kinds
      *  use — see `fake-gh-shim.mjs`'s own `GO_NETWORK_ERROR` comment.
+     *  `kind: 'no-files'` (verb `'api compare'`, PR #3881) is not a failure either: the compare call answers, but
+     *  its body carries no `files` array.
      *  `kind: 'push-to-main'` (#3383, scenario A2 — origin advancing MID-TICK, deterministically, from INSIDE
      *  the daemon's own tick) is not a failure at all: the matching call still answers normally, but the shim
      *  first runs a real `git` push of `files`/`message` onto `branch` (default `main`) of `repo`'s own origin

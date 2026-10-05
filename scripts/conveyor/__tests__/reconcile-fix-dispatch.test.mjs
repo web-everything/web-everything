@@ -8,6 +8,7 @@
  * `dispatchFix` composition was mirrored from.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import {
   dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
   findResumeCandidate, buildResumePrompt, tryResumeFix, filterFixesByInFlightScope, dropTerminalFixClaims,
@@ -398,6 +399,35 @@ describe('fetchPrDiffPaths — 406 too_large falls back to the paginated file-li
     if (!h) throw new Error(`unexpected ${key}`);
     return typeof h === 'function' ? h(argv) : h;
   };
+  // Endpoint-faithful gh: answers with GitHub's real JSON body and applies the caller's own `--jq` through real jq,
+  // so a test judges what the endpoint answered, not the argv shape the caller happened to use.
+  const jqOut = (body, argv) => {
+    const i = argv.indexOf('--jq');
+    if (i < 0) return `${JSON.stringify(body)}\n`;
+    const r = spawnSync('jq', ['-r', argv[i + 1]], { input: JSON.stringify(body), encoding: 'utf8' });
+    if (r.status !== 0) throw Object.assign(new Error('gh: jq failed'), { stderr: r.stderr });
+    return r.stdout;
+  };
+  const entries = (names) => names.map((filename) => ({ filename, status: 'modified' }));
+  /** `compare`/`pulls`: an Error (thrown), a filename array (wrapped as GitHub's body), or a raw body (object/array). */
+  const runApi = ({ compare, pulls }) => {
+    const seen = [];
+    const exec = (cmd, argv) => {
+      if (argv[0] === 'pr' && argv[1] === 'diff') throw tooLarge();
+      if (argv[0] === 'pr' && argv[1] === 'view') return jqOut({ baseRefName: 'main', headRefOid: 'abc123' }, argv);
+      const ep = argv.find((a) => a.startsWith('repos/'));
+      const isCompare = ep.includes('/compare/');
+      seen.push(isCompare ? 'compare' : 'pulls');
+      const h = isCompare ? compare : pulls;
+      if (h instanceof Error || h === undefined) throw h ?? new Error(`unexpected ${ep}`);
+      const names = Array.isArray(h) && h.every((s) => typeof s === 'string');
+      const body = names ? (isCompare ? { files: entries(h) } : entries(h)) : h;
+      return jqOut(body, argv);
+    };
+    let result; let err;
+    try { result = fetchPrDiffPaths(3881, { exec, root: '/repo' }); } catch (e) { err = e; }
+    return { result, err, seen };
+  };
 
   it('classifies the 406 text', () => {
     expect(isDiffTooLargeError(tooLarge())).toBe(true);
@@ -406,11 +436,12 @@ describe('fetchPrDiffPaths — 406 too_large falls back to the paginated file-li
 
   it('reads compare/<base>...<head> (live base) when the diff is too large', () => {
     const seen = [];
-    const exec = execFor({
-      'pr diff': () => { throw tooLarge(); },
-      'pr view': 'main abc123\n',
-      'api --paginate': (argv) => { seen.push(argv.find((a) => a.startsWith('repos/'))); return 'a.md\nb.md\na.md\n'; },
-    });
+    const exec = (cmd, argv) => {
+      if (argv[1] === 'diff') throw tooLarge();
+      if (argv[1] === 'view') return jqOut({ baseRefName: 'main', headRefOid: 'abc123' }, argv);
+      seen.push(argv.find((a) => a.startsWith('repos/')));
+      return jqOut({ files: entries(['a.md', 'b.md', 'a.md']) }, argv);
+    };
     expect(fetchPrDiffPaths(3794, { exec, root: '/repo' })).toEqual(['a.md', 'b.md']);
     expect(seen).toEqual(['repos/{owner}/{repo}/compare/main...abc123']);
   });
@@ -427,24 +458,8 @@ describe('fetchPrDiffPaths — 406 too_large falls back to the paginated file-li
   // PR #3881 review (CONFIRMED correctness, block): GitHub's compare endpoint lists at most 300 changed files, so a
   // 300-path compare answer may be a silently truncated scope. It must fall through to pulls/<n>/files (cap 3000).
   describe('compare file cap (300) and pulls/files cap (3000) — never return a truncated scope', () => {
-    const paths = (n, prefix = 'f') => Array.from({ length: n }, (_, i) => `${prefix}${i}.md`).join('\n') + '\n';
-    const run = ({ compare, pulls }) => {
-      const seen = [];
-      const exec = execFor({
-        'pr diff': () => { throw tooLarge(); },
-        'pr view': 'main abc123\n',
-        'api --paginate': (argv) => {
-          const ep = argv.find((a) => a.startsWith('repos/'));
-          seen.push(ep.includes('/compare/') ? 'compare' : 'pulls');
-          const h = ep.includes('/compare/') ? compare : pulls;
-          if (h instanceof Error) throw h;
-          return h;
-        },
-      });
-      let result; let err;
-      try { result = fetchPrDiffPaths(3881, { exec, root: '/repo' }); } catch (e) { err = e; }
-      return { result, err, seen };
-    };
+    const paths = (n, prefix = 'f') => Array.from({ length: n }, (_, i) => `${prefix}${i}.md`);
+    const run = runApi;
 
     it('trusts a compare answer just under the cap (299 files) without calling pulls/files', () => {
       const { result, seen } = run({ compare: paths(299) });
@@ -469,7 +484,7 @@ describe('fetchPrDiffPaths — 406 too_large falls back to the paginated file-li
     // cap and whose pulls/files answer is complete — the scope must be all 301 paths, never the capped 300.
     it('falls back when compare reaches its 300-file cap (301-file PR → all 301 paths)', () => {
       const all = Array.from({ length: 301 }, (_, i) => `f${i}.md`);
-      const { result, seen } = run({ compare: `${all.slice(0, 300).join('\n')}\n`, pulls: `${all.join('\n')}\n` });
+      const { result, seen } = run({ compare: all.slice(0, 300), pulls: all });
       expect(seen).toEqual(['compare', 'pulls']);
       expect(result).toEqual(all);
     });
@@ -500,6 +515,51 @@ describe('fetchPrDiffPaths — 406 too_large falls back to the paginated file-li
     it('refuses permanently when compare is unavailable and pulls/files is capped', () => {
       const { err, seen } = run({ compare: new Error('404'), pulls: paths(3000, 'p') });
       expect(seen).toEqual(['compare', 'pulls']);
+      expect(err).toBeInstanceOf(PermanentScopeReadError);
+    });
+  });
+
+  // PR #3881 operator ruling (block, rung 2): the compare branch returned before pulls/files on ANY answer under 300
+  // paths — including one that is not a complete file list at all (no `files` array, a nameless entry, or a capped
+  // list that de-duplicated under 300). Only a provably complete compare answer may return before pulls/files.
+  describe('compare answer completeness — only a provably complete compare list returns before pulls/files', () => {
+    const run = runApi;
+
+    it('returns a complete compare list (under the cap) without calling pulls/files', () => {
+      const { result, seen } = run({ compare: { ahead_by: 2, files: entries(['a.md', 'b.md']) } });
+      expect(result).toEqual(['a.md', 'b.md']);
+      expect(seen).toEqual(['compare']);
+    });
+
+    it('falls through to pulls/files when the compare answer carries no `files` array (never an empty "complete" scope)', () => {
+      const { result, seen } = run({ compare: { ahead_by: 400, behind_by: 0 }, pulls: entries(['a.md', 'b.md']) });
+      expect(seen).toEqual(['compare', 'pulls']);
+      expect(result).toEqual(['a.md', 'b.md']);
+    });
+
+    it('falls through to pulls/files when the compare `files` field is null', () => {
+      const { result, seen } = run({ compare: { ahead_by: 400, files: null }, pulls: entries(['a.md']) });
+      expect(seen).toEqual(['compare', 'pulls']);
+      expect(result).toEqual(['a.md']);
+    });
+
+    it('falls through to pulls/files when a compare entry has no filename (a malformed list is not a complete one)', () => {
+      const { result, seen } = run({ compare: { files: [{ filename: 'a.md' }, { status: 'modified' }] }, pulls: entries(['a.md', 'b.md']) });
+      expect(seen).toEqual(['compare', 'pulls']);
+      expect(result).toEqual(['a.md', 'b.md']);
+    });
+
+    it('judges the 300 cap on the RAW entry count, not on the de-duplicated path count', () => {
+      const raw = [...Array.from({ length: 299 }, (_, i) => `f${i}.md`), 'f0.md'];
+      const all = Array.from({ length: 320 }, (_, i) => `f${i}.md`);
+      const { result, seen } = run({ compare: { files: entries(raw) }, pulls: entries(all) });
+      expect(seen).toEqual(['compare', 'pulls']);
+      expect(result).toEqual(all);
+    });
+
+    it('refuses permanently when the compare answer has no `files` array and pulls/files fails', () => {
+      const { result, err } = run({ compare: { ahead_by: 400 }, pulls: new Error('gh: HTTP 502') });
+      expect(result).toBeUndefined();
       expect(err).toBeInstanceOf(PermanentScopeReadError);
     });
   });

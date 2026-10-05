@@ -108,8 +108,13 @@ function callVerb() {
 function callFaultVerbs() {
   const verb = callVerb();
   if (verb === 'api' && argv.some((a) => /^repos\/[^/]+\/[^/]+\/pulls\/\d+\/files$/.test(a))) return ['api pulls/files', verb];
+  if (verb === 'api' && argv.some((a) => /^repos\/[^/]+\/[^/]+\/compare\/.+\.\.\..+$/.test(a))) return ['api compare', verb];
   return [verb];
 }
+
+/** Set by the `no-files` fault (verb `'api compare'`): this call's compare answer carries no `files` array — an
+ *  answer that is not a file list at all, which must never read as "no files changed" (PR #3881 operator ruling). */
+let omitCompareFiles = false;
 
 /** GitHub's real list caps: `compare/<a>...<b>` lists at most 300 changed files (it paginates commits, not files);
  *  `pulls/<n>/files` at most 3000. Modelled faithfully so a truncated answer is reproducible (PR #3881). */
@@ -570,7 +575,7 @@ function handleApi(store, rest) {
       };
       return jsonResult({
         merge_base_commit: { sha: mergeBase }, ahead_by: count(`${a}..${b}`), behind_by: count(`${b}..${a}`),
-        files: listChangedFilesRest(repoState.originPath, a, b, { maxPatched: LARGE_DIFF_PATCHES }).slice(0, COMPARE_FILES_CAP),
+        ...(omitCompareFiles ? {} : { files: listChangedFilesRest(repoState.originPath, a, b, { maxPatched: LARGE_DIFF_PATCHES }).slice(0, COMPARE_FILES_CAP) }),
       }, jq);
     }
     if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/contents\/(.+)$/))) {
@@ -636,6 +641,8 @@ const result = withStore(STORE_PATH, (store) => {
     if (f.kind === 'timeout') return { sleepMs: 120_000 };
     // #4075 soak harness gap — see GO_NETWORK_ERROR's own comment above.
     if (f.kind === 'network') return { stderr: GO_NETWORK_ERROR, exitCode: 1 };
+    // PR #3881 — NOT a failure: the call answers, but its compare body has no `files` array (falls through below).
+    if (f.kind === 'no-files') omitCompareFiles = true;
     // #3383 scenario A2 — NOT a failure: a real side-effecting push, mid-call, then fall through to the
     // ordinary verb handler below so THIS call still answers normally. See `fake-gh.mjs#pushCommitToRef`'s own
     // docblock for why this must live here (inside the shim's own dispatch) rather than a scenario play step.
