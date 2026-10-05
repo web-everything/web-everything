@@ -85,6 +85,7 @@ import { assessDaemonStatus } from '../operations/daemon-status.mjs';
 import { readBacklogCards } from '../backlog-stranded-sweep.mjs';
 import { readPrEventsStatuses } from '../lib/pr-events.mjs';
 import { readSeatCapUsage } from '../operations/review-extra-seats.mjs';
+import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-watchdog.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
@@ -660,6 +661,49 @@ export function probeLiveBindings(agents, {
 }
 
 /**
+ * xegykal — THE SESSION WATCHDOG probe (`we:scripts/conveyor/session-watchdog.mjs`). Runs one watchdog pass at most
+ * every `sessionWatchdog.intervalMinutes` (a config dimension in this health dir's `config.json`, merged over the
+ * platform default) and caches the result in `<healthDir>/session-watchdog.json`, so a tick between passes still
+ * hands the smells the last result (their episodes neither close nor re-open on an off-tick). The pass reads its
+ * own `claude agents --json` listing (local, no API) every pass — not the gh-cadence `agents` probe, which runs
+ * only every 15 minutes. Any watchdog fixture flag (`--watchdog-agents-fixture`, `--watchdog-claims-fixture`,
+ * `--watchdog-heads-fixture`) replays a recorded host, and a fixture-scoped tick (`--state-root`, `--logs-dir` or
+ * `--lock-root`, the same `fixtureTick` rule the other probes use) reads no host state at all — no real
+ * `claude agents`, claim listing, PR-head cache, heavy-admission read or coordination-root event log. Either one,
+ * or `--dry-run`, never acts.
+ * @returns {object} the pass result plus `{cached:boolean, configError:string|null}`
+ */
+export function probeSessionWatchdog({
+  dir, now = Date.now(), config = {}, processes = undefined, flags = {}, runPass = runSessionWatchdogPass,
+} = {}) {
+  const { config: cfg, error: configError } = resolveSessionWatchdogConfig(config.sessionWatchdog);
+  const cachePath = join(dir, 'session-watchdog.json');
+  const fixture = flags['watchdog-agents-fixture'];
+  const anyFixture = !!(fixture || flags['watchdog-claims-fixture'] || flags['watchdog-heads-fixture']);
+  const scoped = !!(flags['logs-dir'] || flags['lock-root'] || flags['state-root']);
+  const isolated = anyFixture || scoped;
+  const prev = anyFixture ? null : readJson(cachePath, null);
+  const prevAt = Date.parse(prev?.at ?? '');
+  // 30 s of slack so a 5-minute tick that lands a few seconds early still runs a 5-minute pass.
+  if (prev && Number.isFinite(prevAt) && now - prevAt < cfg.intervalMinutes * MINUTE - 30_000) {
+    return { ...prev, cached: true, configError };
+  }
+  const readFix = (k) => JSON.parse(readFileSync(flags[k], 'utf8'));
+  const heads = flags['watchdog-heads-fixture'] ? readFix('watchdog-heads-fixture') : null;
+  const result = runPass({
+    nowMs: now, config: cfg,
+    act: cfg.act && !isolated && !flags['dry-run'] && !flags['no-watchdog-act'],
+    ...(fixture ? { agents: readFix('watchdog-agents-fixture') } : scoped ? { agents: [] } : {}),
+    ...(processes !== undefined ? { processes } : {}),
+    ...(flags['watchdog-claims-fixture'] ? { listClaims: () => readFix('watchdog-claims-fixture') } : scoped ? { listClaims: () => [] } : {}),
+    ...(heads ? { prHeadFor: (repo, pr) => heads[`${repo}#${pr}`] ?? null } : scoped ? { prHeadFor: () => null } : {}),
+    ...(isolated ? { eventDir: join(dir, 'session-watchdog-events'), readHeavy: () => null } : {}),
+  });
+  if (!anyFixture && !flags['dry-run']) writeJsonAtomic(cachePath, result);
+  return { ...result, cached: false, configError };
+}
+
+/**
  * #4068 — the drain daemon's own per-pass `history.jsonl` (`{at, ms, exit, considered, merged, deferred,
  * failed}` per pass — the same file `live-state` reads), trimmed to the last `windowMs` and to the fields the
  * `drain-pass-over-budget`/`drain-merge-rate-drop` signs read. `null` when the file is absent (a host with no
@@ -817,6 +861,9 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.processes = attempt('processes', () => (flags['ps-fixture']
     ? parsePsOutput(readFileSync(flags['ps-fixture'], 'utf8'))
     : probeProcesses()));
+  // xegykal — the session watchdog (its own interval, every-tick probe; see probeSessionWatchdog).
+  probes.sessionWatchdog = attempt('sessionWatchdog', () => probeSessionWatchdog({ dir, now, config, processes: probes.processes, flags }));
+  if (probes.sessionWatchdog?.configError) probeErrors.sessionWatchdogConfig = probes.sessionWatchdog.configError;
   probes.machineLoad = attempt('machineLoad', () => (flags['machine-load-fixture']
     ? JSON.parse(readFileSync(flags['machine-load-fixture'], 'utf8'))
     : probeMachineLoad()));

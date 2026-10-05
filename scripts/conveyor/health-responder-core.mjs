@@ -32,10 +32,13 @@ export const OBSERVATION_ONLY = Object.freeze({
   "drain-merge-rate-drop": "Throughput is aggregate, not authority to bypass a merge gate.",
   "drain-pass-over-budget": "Do not kill or lengthen a running drain budget; report the slow step.",
   "duplicate-live-sessions": "Do not stop either live worker; the dispatcher owns the duplicate claim.",
+  "fix-claim-held-no-progress": "A slow fix claim is not proof of a stuck holder; report only, never release the claim or push to the branch.",
+  "fixer-stuck": "Never kill the fixer or release its claim from the responder; the session watchdog and reaper own the stuck-session path.",
   "fixer-verify-never-settles": "Never reset/re-request a marker or kill a waiter; fix the verify-daemon pass that is not dispatching.",
   "gh-call-failures": "Inhibit responder GitHub actions, honor existing throttle; do not amplify failed writes.",
   "gh-graphql-budget": "Inhibit GitHub actions until the existing budget read permits them; no new poll/retry loop.",
   "gh-shim-lane-path": "Repair the shim producer via normal delivery, never patch a generated shim in place.",
+  "ghost-session-listed": "The session watchdog owns the ghost-session clear; no responder-driven clear-stuck-session.",
   "ghost-sessions-inflate-cap": "Session reaper owns cleanup; no autonomous clear-stuck-session human confirm.",
   "github-app-token": "Inhibit GitHub actions; existing auth refresh/operator owns recovery, no credential mutation.",
   "health-tick-overrun": "Hold actions if watch freshness is inadequate; watchdog/owner diagnoses the probe.",
@@ -53,6 +56,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "review-seat-cap-near-limit":"Low severity; report only, no provider/cap changes and no operator ping.",
   "ruling-needed-waiting": "A ruling is the operator's judgment; never record, infer or auto-answer one.",
   "self-sync-conflict": "Never force or hand-merge a clone/overlay from the responder.",
+  "session-stuck": "Silence or repetition is a warning, not proof of death; the session watchdog and reaper alone act on the worker.",
   "stood-down-prs": "Terminal questions need explicit operator answers; never auto-call stand-down-answer.",
   "untracked-backlog-card": "Do not adopt/commit unknown daemon-clone files; normal owner/file-item delivery is owed."
 });

@@ -19,7 +19,7 @@ describe('health responder closed decision table', () => {
     expect(c.provenance.urls.length).toBeGreaterThan(0);
   });
   it('covers every registered descriptor without evaluating detectors', () => {
-    expect(SMELLS.length).toBe(45);
+    expect(SMELLS.length).toBe(49);
     for (const s of SMELLS) {
       expect(Object.hasOwn(CATALOGUE, s.id), s.id).toBe(true);
       const i = input(); i.episodes[0].smell = s.id; i.episodes[0].key = `${s.id}::${i.episodes[0].subject}`;
