@@ -74,7 +74,7 @@ import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyS
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
-import { buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { phaseAdmissionKind, verifyPhaseAdmissionEnabled, buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
@@ -409,18 +409,32 @@ const ADMISSION_LOCK_ROOT = admissionLockRoot(REPO, process.env);
 const ADMISSION_CAP = resolveCap(process.env);
 const ADMISSION_TIMEOUT_MS = resolveTimeoutMs(process.env);
 const laneMatch = /lane-(\d+)/.exec(REPO);
-const admission = await acquireSlotBlocking({
-  lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
-  lane: laneMatch ? laneMatch[1] : null,
-  // Card xkyw1x4 — the gate's kind (a diff-driven `selected` run vs a FULL suite) picks its queue lane: a short
-  // selected check rides the fast lane and never waits behind a full-suite waiter.
-  kind: classifyCommandKind(GATE),
-});
-if (admission.timedOut) {
-  process.stderr.write(`⚠ heavy-command admission: timed out after ${admission.waitedMs}ms waiting for capacity (cap=${ADMISSION_CAP}) — proceeding unslotted.\n`);
-} else if (admission.waitedMs > 0) {
-  process.stderr.write(`heavy-command admission: acquired slot-${admission.slot} after waiting ${admission.waitedMs}ms (cap=${ADMISSION_CAP}).\n`);
+// #verify-phase-admission — acquire the first phase before dispatch's execution marker.
+const retryableGate = resolvedGate?.testCommand?.startsWith('npx vitest related ');
+const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
+const admissionPhases = {};
+async function acquireAdmission(phase) {
+  const routing = phaseAdmission ? phaseAdmissionKind({
+    phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
+  }) : { kind: classifyCommandKind(GATE) };
+  const acquired = await acquireSlotBlocking({
+    lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
+    lane: laneMatch ? laneMatch[1] : null, kind: routing.kind,
+  });
+  if (acquired.timedOut) {
+    process.stderr.write(`⚠ heavy-command admission: timed out after ${acquired.waitedMs}ms waiting for capacity (cap=${ADMISSION_CAP}) — proceeding unslotted.\n`);
+  } else if (acquired.waitedMs > 0) {
+    process.stderr.write(`heavy-command admission: acquired slot-${acquired.slot} after waiting ${acquired.waitedMs}ms (cap=${ADMISSION_CAP}).\n`);
+  }
+  if (phaseAdmission) {
+    const previous = admissionPhases[phase];
+    admissionPhases[phase] = { ...routing, waitedMs: (previous?.waitedMs ?? 0) + acquired.waitedMs,
+      slot: acquired.slot, timedOut: Boolean(previous?.timedOut || acquired.timedOut) };
+  }
+  return acquired;
 }
+const admission = await acquireAdmission('vitest');
+let firstPhaseAdmission = phaseAdmission ? admission : null;
 
 // 3. Run the gate in the FOREGROUND, waiting until it exits (forwarded stdio — the agent sees the output live).
 // #3383 (Skeptic review, 2026-09-14) — an UNCONDITIONAL marker, unlike the two admission log lines above
@@ -465,8 +479,10 @@ async function runGate(command, args) {
 const phaseMs = { vitestMs: null, scanMs: null, standardsMs: null };
 const outcomes = {};
 async function timedRunGate(phase, command, args) {
-  const started = performance.now();
   const kind = phase?.replace(/Ms$/, '');
+  const acquired = phaseAdmission ? firstPhaseAdmission ?? await acquireAdmission(kind) : null;
+  firstPhaseAdmission = null;
+  const started = performance.now();
   try {
     const result = await runGate(command, args);
     if (kind) outcomes[kind] = buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision });
@@ -477,12 +493,12 @@ async function timedRunGate(phase, command, args) {
     throw error;
   } finally {
     if (phase) phaseMs[phase] = (phaseMs[phase] ?? 0) + performance.now() - started;
+    if (acquired?.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
   }
 }
 const gateStarted = performance.now();
 let gateMs;
 try {
-  const retryableGate = resolvedGate?.testCommand?.startsWith('npx vitest related ');
   let result = await timedRunGate(retryableGate ? 'vitestMs' : null, retryableGate ? resolvedGate.testCommand : GATE);
   if (retryableGate && admission.ok && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
     // Edits during admission or test execution must also count as the change's own files.
@@ -514,10 +530,10 @@ try {
   exitCode = Number.isFinite(e && e.status) ? e.status : 2;
 } finally {
   gateMs = performance.now() - gateStarted;
-  if (admission.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
+  if ((!phaseAdmission && admission.ok) || firstPhaseAdmission?.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
 }
 
-const phases = buildVerifyPhases({ admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes });
+const phases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'phase' : 'gate', phases: admissionPhases }, admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes });
 
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }),
   ...(retriedTimeouts.length ? { retriedTimeouts } : {}) };
