@@ -532,3 +532,19 @@ describe('background gate failures reach the daemon log (awaitSettle:false leave
     expect(log.error).toHaveBeenLastCalledWith('verify-daemon: tick — dispatched 0, in flight 0, deferred 0, failed 0'); // counted once, not cumulative
   });
 });
+
+describe('drain marker — stop new dispatch, let in-flight gates settle (2026-10-05)', () => {
+  it('while draining, a tick never calls runVerify and logs (draining); without it, dispatch runs as before', async () => {
+    let draining = true;
+    const runVerify = vi.fn(async () => ({ dryRun: false, dispatched: [{}], failures: [] }));
+    const log = { error: vi.fn() };
+    const effects = buildCliDaemonEffects({ runVerify, log, isDraining: () => draining });
+    effects.onTick(await effects.tickOnce());
+    expect(runVerify).not.toHaveBeenCalled();
+    expect(log.error.mock.calls.at(-1)[0]).toMatch(/dispatched 0, in flight 0 \(draining\)/);
+    draining = false;
+    effects.onTick(await effects.tickOnce());
+    expect(runVerify).toHaveBeenCalledTimes(1);
+    expect(log.error.mock.calls.at(-1)[0]).not.toContain('draining');
+  });
+});
