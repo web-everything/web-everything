@@ -1,4 +1,5 @@
 ---
+bornAs: x26el1a
 kind: task
 status: open
 scope: ["we:scripts/"]
@@ -6,9 +7,9 @@ dateOpened: "2026-10-05"
 tags: []
 ---
 
-# Live-process refusal line names its holder
+# Pass-daemon idles with a named reason when its entry is missing from the clone
 
-formatRefusalLine omits the bound session name, pid and cwd. On #3794 the bound session has a LIVE pid line led to a wrong diagnosis (pid reuse); it was the review job review-3794. Add the name, pid and cwd to the line.
+The load-flake-reverify launchd job crash-looped every 10s because wev-review-daemon lacked #3945. It should idle with a named reason, not crash-loop.
 
 ## Done when
 

@@ -1,4 +1,5 @@
 ---
+bornAs: xx6rdcl
 kind: task
 status: open
 scope: ["we:scripts/"]
@@ -6,9 +7,9 @@ dateOpened: "2026-10-05"
 tags: []
 ---
 
-# Stale fixer-and-reviewer-disagree escalation
+# Live-process refusal line names its holder
 
-On #3794 (2026-10-05) the ruling-dispute note (3 findings the operator ruled block came back... a person must decide) fired though the reviewer had already ruled all 3 not-real at 03:27 ET. The dispute check must read the live referral state on the current head, including reviewer rulings, before escalating. Related: #3964, #3967.
+formatRefusalLine omits the bound session name, pid and cwd. On #3794 the bound session has a LIVE pid line led to a wrong diagnosis (pid reuse); it was the review job review-3794. Add the name, pid and cwd to the line.
 
 ## Done when
 

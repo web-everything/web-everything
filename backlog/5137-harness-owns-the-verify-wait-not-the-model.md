@@ -1,7 +1,8 @@
 ---
+bornAs: xjyvpkf
 kind: story
 size: 5
-parent: "xoa6kew"
+parent: "5140"
 status: open
 scope: ["we:scripts/"]
 dateOpened: "2026-10-05"

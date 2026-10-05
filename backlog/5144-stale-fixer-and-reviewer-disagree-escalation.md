@@ -1,4 +1,5 @@
 ---
+bornAs: xzugs2f
 kind: task
 status: open
 scope: ["we:scripts/"]
@@ -6,9 +7,9 @@ dateOpened: "2026-10-05"
 tags: []
 ---
 
-# Auto send-back only fires on the operator own block
+# Stale fixer-and-reviewer-disagree escalation
 
-On #202 the reviewer ruled 4 findings block. After the last operator ruling (not-real), record-referral-ruling did not send the PR back (#3952 follow-up), so a manual review-set-label --to=changes was needed. Send back when no referral is open and ANY ruling on the head (reviewer or operator) is block.
+On #3794 (2026-10-05) the ruling-dispute note (3 findings the operator ruled block came back... a person must decide) fired though the reviewer had already ruled all 3 not-real at 03:27 ET. The dispute check must read the live referral state on the current head, including reviewer rulings, before escalating. Related: #3964, #3967.
 
 ## Done when
 

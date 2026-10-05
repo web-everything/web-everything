@@ -1,14 +1,16 @@
 ---
-kind: task
+bornAs: x9yu5xa
+kind: story
+size: 3
 status: open
 scope: ["we:scripts/"]
 dateOpened: "2026-10-05"
 tags: []
 ---
 
-# Live-process check verifies process identity, not just pid
+# Fast lane for main-red fixes
 
-Hardening, no live case. The live-process check should verify process identity (start time plus command), not only that the pid exists, to guard against pid reuse.
+#3960 (main red: 5102 unnumbered) parked as an ordinary review:pending. There is no main-red label or urgent lane. Add one so main-red fixes jump the queue. Ties to the operator ask for a heavy urgency mode.
 
 ## Done when
 

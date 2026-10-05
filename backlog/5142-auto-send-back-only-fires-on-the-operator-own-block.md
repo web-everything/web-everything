@@ -1,15 +1,15 @@
 ---
-kind: story
-size: 3
+bornAs: xup2cje
+kind: task
 status: open
 scope: ["we:scripts/"]
 dateOpened: "2026-10-05"
 tags: []
 ---
 
-# Fix the 14-minute dispatching-checkout-behind-main blackout
+# Auto send-back only fires on the operator own block
 
-On 2026-10-04 from 20:07 to 20:21 ET every web-everything fix-dispatch tick refused (dispatching checkout is N commits behind main) until self-sync rebuilt. With #3929 the guard should give grace while a rebuild is due or in progress. Find out why it did not, and shorten the self-sync lag.
+On #202 the reviewer ruled 4 findings block. After the last operator ruling (not-real), record-referral-ruling did not send the PR back (#3952 follow-up), so a manual review-set-label --to=changes was needed. Send back when no referral is open and ANY ruling on the head (reviewer or operator) is block.
 
 ## Done when
 
