@@ -1728,7 +1728,29 @@ describe('#4315 mandatory referral protocol', () => {
       expect(validateReferralRecord({ ...r, rulings: [{ ...r.rulings[0], ...patch }] })).toBe(false);
     }
     expect(referralRecordState(r, { body: `<!-- authored-by-actor: ${r.reviewer.id} -->` }).pending).toHaveLength(1);
-    expect(referralRecordState(r, { body: '' }).pending).toHaveLength(1);
+    expect(referralRecordState(r, { body: '' }).pending).toEqual([]);
+  });
+  it('counts a run-derived reviewer ruling when the author stamp is missing', () => {
+    const r = record(); r.authorBody = ''; r.rulings = [rule(r)];
+    expect(validateReferralRecord(r)).toBe(true);
+    expect(referralRecordState(r, { createdAt: '2026-10-04T17:17:58Z' })).toMatchObject({
+      pending: [], independence: { status: 'stamp-lost', fallback: true },
+    });
+  });
+  it('names the missing stamp when policy refuses the fallback, including through the gate', () => {
+    const r = record(); r.authorBody = ''; r.rulings = [rule(r)];
+    const context = { createdAt: '2026-10-04T17:17:58Z', stampPolicy: 'refuse' };
+    const pending = [r.referrals[0].key, 'author-stamp-missing'];
+    expect(referralRecordState(r, context)).toMatchObject({
+      pending, independence: { status: 'stamp-lost', fallback: false },
+    });
+    expect(mandatoryReferralState([post(renderReferralRecord(r))], context).pending).toEqual(pending);
+  });
+  it('never applies the missing-stamp fallback to self-clear', () => {
+    const r = record(); r.rulings = [rule(r)];
+    expect(referralRecordState(r, { body: `<!-- authored-by-actor: ${r.reviewer.id} -->` })).toMatchObject({
+      pending: [r.referrals[0].key], independence: { status: 'self-clear', fallback: false },
+    });
   });
   it('requires a current head and readable card; block never grants acceptance', () => {
     for (const result of ['block', 'card', 'not-real']) {

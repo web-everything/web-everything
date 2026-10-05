@@ -78,6 +78,8 @@
  *     there is no reliable way to tell a delegated subagent's own primary-reporting verify apart from the main
  *     session's own laziness (#2335) — so this is a stderr nudge only, never a deny.
  *
+ *   • a raw `gh pr create` — omits the author stamp and silently voids mandatory referral rulings
+ *     (plateau-app #204). Use the cross-repo `open-pr` operation. Escape: `RAW_PR_CREATE_OK=1`.
  *   • a raw `gh pr merge <n>` or its REST equivalent `gh api repos/<owner>/<repo>/pulls/<n>/merge -X PUT` —
  *     found this session (2026-08-31): `scripts/lib/pr-merge-gate.mjs`'s `assertMayMerge` is the documented
  *     ONE place a PR may merge to `main` (#2290's sole-writer invariant), and it sits upstream of the
@@ -3089,6 +3091,10 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
       if (p.unreliable) return `${claimed[0].message} (this push follows a \`checkout\`/\`switch\`/\`cd\` in the same command, so its target cannot be resolved while a fix claim is live in the repo — run the checkout in its own command, or push an explicit \`HEAD:refs/heads/<lane>\`)`;
     }
   }
+
+  // Reuse command-position normalization so paths/env wrappers match, but quoted prose does not.
+  if (!hasLeadingEnvEscape(s, 'RAW_PR_CREATE_OK') && atCommand(/^gh\s+pr\s+create\b/))
+    return 'raw `gh pr create` opens a PR with no `authored-by-actor` stamp, so the review gate cannot prove reviewer independence and the mandatory referral reviewer\'s rulings are ignored (plateau-app #204). Open it with `node <web-everything lane>/scripts/operations/run.mjs open-pr --ref=<branch> …` run from the target repo\'s lane clone (works for plateau-app and frontierui too), or repair an existing PR with `node scripts/pr-body-edit.mjs --pr=<n> --repair`. Escape hatch: prefix `RAW_PR_CREATE_OK=1`.';
 
   // A raw `gh pr merge` or its REST equivalent bypasses `pr-merge-gate.mjs`'s `assertMayMerge` — the ONE
   // place a PR may merge to `main` (#2290's sole-writer invariant) — and, upstream of it, the
