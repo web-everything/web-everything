@@ -44,6 +44,8 @@ export default {
     const afterRejects = planReconcile({ prs: rejectedForever, agents: [], durableCounts: {}, now: Date.parse('2026-10-05T22:00:00Z'), requiredChecks: ['test'] });
     if (afterRejects.dispatch.some((d) => d.prNumber === 5 && d.kind === 'ci-timeout-rerun')) {
       violations.push('a re-run rejected 6 times is still re-planned as a mechanical re-run instead of falling through to ci-heal');
+    } else if (!afterRejects.dispatch.some((d) => d.prNumber === 5 && d.kind === 'ci-heal')) {
+      violations.push(`a re-run rejected 6 times neither re-runs nor reaches ci-heal; dispatch: ${afterRejects.dispatch.map((d) => d.kind).join(',') || '(none)'}`);
     }
     return { violations };
   },

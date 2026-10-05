@@ -34,21 +34,23 @@ export function isInfraCancelledJob(job) {
   return noRunner && Array.isArray(job.steps) && job.steps.length === 0;
 }
 
-/** The first step of the CI `test` aggregate job (`.github/workflows/ci.yml`): it fails closed when a `needs` dep did not succeed. */
+/** The step of the CI aggregate jobs (`.github/workflows/ci.yml`) that fails closed when a `needs` dep did not succeed. */
 export const AGGREGATE_GATE_STEP = 'Gate on shard results';
+/** The CI aggregate jobs that carry that gate step: `test` (over `test-shard`) and `daemon-soak` (over `soak-shard`). */
+export const AGGREGATE_GATE_JOBS = Object.freeze(['test', 'daemon-soak']);
 
 const PASSING = Object.freeze(['success', 'skipped', 'neutral']);
 
 /**
- * Is this failed job the DERIVED aggregate `test` gate — red only because a `needs` dep (a cancelled shard) did not
- * succeed — rather than a real failure that merely carries the name `test`? PURE. Decided STRUCTURALLY, never by name
- * alone (a job name is workflow-author controlled): the job is `test` AND the only step that did not pass is the
- * gate step itself. A `test` job whose gate step passed and a LATER step (check:standards, merge coverage…) failed,
- * or that failed any step besides the gate, is real evidence.
+ * Is this failed job a DERIVED aggregate gate (`test` / `daemon-soak`) — red only because a `needs` dep (a cancelled
+ * shard) did not succeed — rather than a real failure that merely carries such a name? PURE. Decided STRUCTURALLY,
+ * never by name alone (a job name is workflow-author controlled): the job is one of {@link AGGREGATE_GATE_JOBS} AND
+ * the only step that did not pass is the gate step itself. A job whose gate step passed and a LATER step
+ * (check:standards, merge coverage…) failed, or that failed any step besides the gate, is real evidence.
  * @param {{name?:string, steps?:Array<{name?:string, conclusion?:string}>}} job a `GET /actions/jobs/<id>` record
  */
 export function isAggregateGateFailure(job) {
-  if (job?.name !== 'test' || !Array.isArray(job.steps) || !job.steps.length) return false;
+  if (!AGGREGATE_GATE_JOBS.includes(job?.name) || !Array.isArray(job.steps) || !job.steps.length) return false;
   const notPassing = job.steps.filter((s) => !PASSING.includes(String(s?.conclusion ?? '').toLowerCase()));
   return notPassing.length === 1 && notPassing[0]?.name === AGGREGATE_GATE_STEP;
 }

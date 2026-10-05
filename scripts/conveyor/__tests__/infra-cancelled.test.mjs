@@ -43,6 +43,9 @@ describe('infra-cancelled classifier', () => {
     expect(isAggregateGateFailure(realLaterStep)).toBe(false);
     expect(isAggregateGateFailure(gateAndLater)).toBe(false);
     expect(isAggregateGateFailure({ ...gateOnly, name: 'build' })).toBe(false);
+    // `daemon-soak` is the other CI aggregate carrying the same gate step (over `soak-shard`).
+    expect(isAggregateGateFailure({ ...gateOnly, name: 'daemon-soak' })).toBe(true);
+    expect(isAggregateGateFailure({ ...realLaterStep, name: 'daemon-soak' })).toBe(false);
     expect(isAggregateGateFailure({ ...gateOnly, steps: [] })).toBe(false);
     expect(isAggregateGateFailure(undefined)).toBe(false);
   });
@@ -62,6 +65,7 @@ describe('infra-cancelled classifier', () => {
   // plutil/launchctl and the watcher it installs never loads. (Older templates carry the same pattern; that is a
   // separate, pre-existing cleanup this repair deliberately does not fold in.)
   it('the ci-red-recovery-watch launchd template is XML-comment-safe: no `--` inside a comment', () => {
+    // process.cwd() is the repo root under vitest — the same convention as the platformDefaults mirror test below.
     const file = resolve(process.cwd(), 'skills-src/conveyor/launchd/com.we.conveyor-pass-daemon.ci-red-recovery-watch-we.plist.example');
     const text = readFileSync(file, 'utf8');
     const comments = [...text.matchAll(/<!--([\s\S]*?)-->/g)].map((m) => m[1]);
@@ -160,8 +164,7 @@ describe('infra-cancelled evidence + planning', () => {
 
   it('a real failure in a job merely named `test` beside a cancelled job is NOT classed infra-only (no free mechanical re-runs)', () => {
     const e = readTimeoutEvidence(pr, { repo, exec: withTestJob([step('Gate on shard results', 'success'), step('Run check:standards', 'failure')]) });
-    expect(e.infraCancelled).not.toBe(true);
-    expect(e).not.toMatchObject({ eligible: true, infraCancelled: true });
+    expect(e).toEqual({ eligible: false, reason: 'mixed-infra-cancelled-and-real-failure' });
   });
 
   it('the genuine aggregate gate failure beside a cancelled job is still infra-only', () => {

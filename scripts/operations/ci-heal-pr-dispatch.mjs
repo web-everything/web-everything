@@ -644,7 +644,10 @@ export async function dispatchTimeoutRetry(evidence, {
   // been sent, so it is never released here.
   const releaseFresh = () => {
     if (reservation) timeoutTransaction(path, initial, (state) => {
-      if (state.requests[reservation.id]?.status === 'pending') state.requests[reservation.id].status = 'rejected';
+      const request = state.requests[reservation.id];
+      // `released` marks an early release (observation failed / stale head): no request was ever sent, so it is not an
+      // attempt the infra re-run cap should count (`readTimeoutBudget` skips it) — a flaky GitHub read must not burn the cap.
+      if (request?.status === 'pending') { request.status = 'rejected'; request.released = true; }
     });
   };
   let observed;

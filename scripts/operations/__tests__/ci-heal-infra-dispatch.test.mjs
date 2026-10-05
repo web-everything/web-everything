@@ -97,4 +97,16 @@ describe('infra-cancelled dispatch', () => {
     await dispatchTimeoutRetry({ ...e, jobs: [{ run: 10, job: 20, attempt: 2 }] }, { dir, repo, effects: { observe: observe('success'), request: vi.fn() } });
     expect(readTimeoutBudget({ repo, pr: 4023, head, dir })).toEqual({ confirmed: 0, rejected: 2, pending: false });
   }));
+
+  it('a transient early release (failed GitHub read, stale head) is NOT counted, so a flaky API cannot burn the infra cap', async () => harness(async (dir) => {
+    const e = infraEvidence();
+    const failingRead = { observe: () => { throw new Error('github 502'); }, request: vi.fn() };
+    for (let tick = 0; tick < 8; tick++) {
+      expect(await dispatchTimeoutRetry(e, { dir, repo, effects: failingRead })).toMatchObject({ reason: 'retry-observation-unknown:github 502' });
+    }
+    const stale = { observe: (ev, j) => ({ ...observe('cancelled')(ev, j), head: 'b'.repeat(40) }), request: vi.fn() };
+    expect(await dispatchTimeoutRetry(e, { dir, repo, effects: stale })).toMatchObject({ reason: 'stale-head-or-job' });
+    expect(failingRead.request).not.toHaveBeenCalled();
+    expect(readTimeoutBudget({ repo, pr: 4023, head, dir })).toEqual({ confirmed: 0, rejected: 0, pending: false });
+  }));
 });
