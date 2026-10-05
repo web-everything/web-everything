@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
-import { runLoadFlakeReverify, planLoadFlakeReverify, defaultReverifyIo } from '../load-flake-reverify.mjs';
+import os from 'node:os';
+import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { runBounded } from '../../lib/bounded-child.mjs';
+import { RUNNER_LOCK_ROOT } from '../../../skills-src/conveyor/runner-lock.mjs';
+import { runLoadFlakeReverify, planLoadFlakeReverify, defaultReverifyIo, reverifyConfig, VERIFY_ENV_ALLOWLIST } from '../load-flake-reverify.mjs';
 import { buildLoadFlakeHoldComment, buildLoadFlakeResolvedComment } from '../stand-down.mjs';
 const now = Date.parse('2026-10-04T22:00:00Z');
 const comment = (body, createdAt = '2026-10-04T18:51:50Z') => ({ body, createdAt, author: { login: 'web-everything' } });
@@ -155,7 +160,7 @@ describe('starvation, deleted alts and credentials (PR #3945 advisory)', () => {
   });
   it('verification runs without App credentials and a red summary is redacted before it is posted', async () => {
     const env = scrubVerifyEnv({ PATH: '/bin', HOME: '/h', WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/k.pem', GH_TOKEN: 'x', NPM_TOKEN: 'y' });
-    expect(env).toEqual({ PATH: '/bin', HOME: '/h' });
+    expect(env).toEqual({ PATH: '/bin' });
     const runVerification = vi.fn(async () => ''); const io = defaultReverifyIo({ run: vi.fn(), runVerification, root: '/repo' });
     await io.verify('/lane');
     expect(runVerification.mock.calls[0][2].env).not.toHaveProperty('WE_GITHUB_APP_PRIVATE_KEY_PATH');
@@ -212,5 +217,75 @@ describe('stale verification and push isolation (PR #3945 advisory, round 3)', (
     expect(args).toEqual(expect.arrayContaining(['-c', 'core.hooksPath=/dev/null', '--no-verify', 'origin', 'bbb2222:refs/heads/lane/fix']));
     expect(args.indexOf('-c')).toBeLessThan(args.indexOf('push'));
     expect(args).not.toContain('--force');
+  });
+});
+
+
+describe('verify environment allowlist', () => {
+  it('keeps only required knobs and replaces home and temp with scratch paths', () => {
+    expect(scrubVerifyEnv({ PATH: '/bin', FAKE_API_KEY: 'x', OPENAI_API_KEY: 'x', SSH_AUTH_SOCK: '/s',
+      AWS_ACCESS_KEY_ID: 'x', GH_TOKEN: 'x', HOME: '/Users/real', npm_config__authToken: 'x',
+      npm_config_cache: '/c', WE_HEAVY_ADMISSION_CAP: '2', WE_VITEST_MAX_WORKERS: '2',
+      npm_config_cert: 'x', npm_config_private_key: 'x', npm_config_userconfig: '/Users/real/.npmrc', npm_config_globalconfig: '/etc/npmrc', NPM_CONFIG_CACHE: '/no', UNKNOWN: 'x',
+    }, { scratchDir: '/s' })).toEqual({ PATH: '/bin', npm_config_cache: '/c', WE_HEAVY_ADMISSION_CAP: '2',
+      WE_VITEST_MAX_WORKERS: '2', HOME: '/s/home', TMPDIR: '/s/tmp', TMP: '/s/tmp', TEMP: '/s/tmp' });
+    expect(Object.isFrozen(VERIFY_ENV_ALLOWLIST)).toBe(true);
+  });
+  it('reads exact extension names and never extends secret or home access', () => {
+    expect(reverifyConfig({ WE_LOAD_FLAKE_VERIFY_ENV_ALLOW: ' MY_KNOB, ,OTHER_KNOB ' }).verifyEnvAllow).toEqual(['MY_KNOB', 'OTHER_KNOB']);
+    expect(scrubVerifyEnv({ MY_KNOB: 'yes', MY_KNOB_EXTRA: 'no', MY_API_KEY: 'x', HOME: '/real', TMPDIR: '/real/tmp' },
+      { allow: ['MY_KNOB', 'MY_API_KEY', 'HOME', 'TMPDIR'] })).toEqual({ MY_KNOB: 'yes' });
+  });
+  it.each(['MY_API_KEY', 'NODE_AUTH_TOKEN', 'AWS_ACCESS_KEY_ID', 'SSH_AUTH_SOCK', 'WE_GITHUB_APP_ID'])('rejects secret extension %s', (name) => {
+    expect(() => reverifyConfig({ WE_LOAD_FLAKE_VERIFY_ENV_ALLOW: name })).toThrow();
+  });
+  it.each([false, true])('a real verify child has private scratch directories, cleaned even on failure=%s', async (fail) => {
+    const cwd = mkdtempSync(join(os.tmpdir(), 'reverify-test-'));
+    const realHome = os.homedir();
+    let child, during;
+    vi.stubEnv('FAKE_API_KEY', 'x'); vi.stubEnv('MY_KNOB', 'yes');
+    vi.stubEnv('CONVEYOR_RUNNER_LOCK_ROOT', undefined); vi.stubEnv('PLAYWRIGHT_BROWSERS_PATH', undefined);
+    delete process.env.CONVEYOR_RUNNER_LOCK_ROOT; delete process.env.PLAYWRIGHT_BROWSERS_PATH;
+    try {
+      const io = defaultReverifyIo({ verifyEnvAllow: ['MY_KNOB'], runVerification: async (_bin, _args, opts) => {
+        during = [existsSync(opts.env.HOME), existsSync(opts.env.TMPDIR)];
+        child = JSON.parse(await runBounded(process.execPath, ['-e',
+          'process.stdout.write(JSON.stringify({ keys: Object.keys(process.env), home: process.env.HOME, tmp: process.env.TMPDIR, knob: process.env.MY_KNOB, lock: process.env.CONVEYOR_RUNNER_LOCK_ROOT, browsers: process.env.PLAYWRIGHT_BROWSERS_PATH }))',
+        ], { ...opts, timeoutMs: 10_000 }));
+        if (fail) throw new Error('verify failed');
+      } });
+      expect(await io.verify(cwd)).toMatchObject({ ok: !fail });
+      expect(child.keys).not.toContain('FAKE_API_KEY');
+      expect(child.home).not.toBe(realHome);
+      expect(child.knob).toBe('yes');
+      expect(child.lock).toBe(RUNNER_LOCK_ROOT);
+      expect(child.browsers).toBe(join(realHome, process.platform === 'darwin' ? 'Library/Caches' : '.cache', 'ms-playwright'));
+      expect(during).toEqual([true, true]);
+      expect(child.tmp).toBe(join(dirname(child.home), 'tmp'));
+      expect(existsSync(dirname(child.home))).toBe(false);
+    } finally { vi.unstubAllEnvs(); rmSync(cwd, { recursive: true, force: true }); }
+  });
+});
+
+describe('exact hold revalidation', () => {
+  it.each([
+    ['lane/new-alt', 'ccc3333'], ['lane/fix-alt', 'ccc3333'], ['lane/new-alt', 'bbb2222'], ['lane/fix-alt', 'bbb2222'],
+  ])('a newer hold for %s at %s prevents a stale push or result', async (alt, altSha) => {
+    const { io, pr } = fixture();
+    const newer = comment(buildLoadFlakeHoldComment({ head: pr.headRefOid, alt, altSha }), '2026-10-04T21:00:00Z');
+    io.readPr.mockResolvedValueOnce(pr).mockResolvedValue({ ...pr, comments: [hold, newer] });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'hold-changed' });
+    expect(io.verify).toHaveBeenCalled(); expect(io.release).toHaveBeenCalled();
+    expect(io.push).not.toHaveBeenCalled(); expect(io.comment).not.toHaveBeenCalled();
+  });
+  it('tries the next candidate when the verified hold changed', async () => {
+    const { io, pr } = fixture();
+    const younger = { ...pr, number: 3882, comments: [{ ...hold, createdAt: '2026-10-04T21:00:00Z' }] };
+    io.listPrs.mockResolvedValue([pr, younger]);
+    io.readPr.mockResolvedValueOnce(pr).mockResolvedValueOnce({ ...pr, comments: younger.comments }).mockResolvedValue(younger);
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ result: 'pushed', pr: 3882 });
+    expect(io.verify).toHaveBeenCalledTimes(2);
+    expect(io.comment).toHaveBeenCalledTimes(1);
+    expect(io.comment.mock.calls[0][1]).toBe(3882);
   });
 });

@@ -23,7 +23,7 @@ import { execFileSyncThrottled as execFileSync } from '../lib/gh-throttle.mjs';
  * DESIGN it changes no label — `review:human` stays whatever it already was, which for most stood-down PRs is
  * nothing at all. So a stood-down PR without `review:human` was in nobody's queue (live: PR #2505 sat stood down
  * and invisible). This section lists every OPEN PR carrying at least one stand-down comment, regardless of its
- * labels, reusing `countStandDownComments`/`STAND_DOWN_MARKER` rather than re-deriving the match rule — and never
+ * labels, reusing `standDownComments`/`STAND_DOWN_MARKER` rather than re-deriving the match rule — and never
  * duplicates a PR already shown in NEEDS YOU.
  */
 import { realpathSync } from 'node:fs';
@@ -41,7 +41,7 @@ import { readUnsupported } from '../conveyor/unsupported-repo.mjs';
 // `merge-ai-prs.mjs`), which broke this file's own mocked `node:child_process` test setup. See
 // `we:scripts/conveyor/stuck-pr-dispatch-marker.mjs`'s own header for the full story.
 import { stuckDispatchEpisodes } from '../conveyor/stuck-pr-dispatch-marker.mjs';
-import { countStandDownComments, standDownComments, standDownReason } from '../conveyor/stand-down.mjs';
+import { standDownComments, standDownReason } from '../conveyor/stand-down.mjs';
 import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
 // Loaded lazily and fail-soft, like `laneReclaimQueue`: the ledger pulls in `jury-core.mjs`'s whole graph, which this
 // file's header deliberately keeps out of its own (a copy staged without it must still run and print the queue).
@@ -150,7 +150,7 @@ export function stuckInspectedRow(repo, pr) {
 
 /**
  * Build the STOOD DOWN row for a PR that carries at least one stand-down comment, or `null` for a PR that carries
- * none. Pure — reuses {@link countStandDownComments}/{@link standDownComments}/{@link standDownReason} rather than
+ * none. Pure — reuses {@link standDownComments}/{@link standDownReason} rather than
  * re-deriving the leading-line marker match; this function only shapes the ones that already matched.
  *
  * When a PR has stood down more than once (cleared, then stood down again), the MOST RECENT comment is what's
@@ -371,10 +371,10 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
         if (row) report.rulingNeeded.push(row);
       }
       // STOOD DOWN — every OPEN PR (any labels) carrying a stand-down comment, minus anything already in NEEDS
-      // YOU above. `countStandDownComments` is the reused, single-sourced gate for "does this PR qualify at all".
+      // YOU above. `standDownComments` is the reused, single-sourced gate for "does this PR qualify at all".
       for (const pr of prs) {
         if (readyNumbersThisRepo.has(pr.number)) continue;
-        if (countStandDownComments(pr.comments) === 0) continue;
+        if (standDownComments(pr.comments).length === 0) continue;
         report.stoodDown.push(standDownRow(repo, pr));
       }
       // STUCK — INSPECTED (epic #3383's stuck-PR watch): every open PR the watch has already dispatched a

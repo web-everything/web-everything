@@ -304,7 +304,7 @@ export function buildLoadFlakeResolvedComment({ altSha, result, detail = '' }) {
 /**
  * we:scripts/conveyor/stand-down.mjs#standDownComments — every comment on a PR whose LEADING line is
  * {@link STAND_DOWN_MARKER}, normalized to `{ body, createdAt }` in the order `comments` was given. Pure, and the
- * ONE place the leading-line match rule is written — {@link countStandDownComments} is just its length, and any
+ * ONE place the leading-line match rule is written — {@link countStandDownComments} also counts a live hold; any
  * caller that needs to read a stand-down comment BACK (not just know one exists — e.g. the operator queue's
  * STOOD DOWN section, which surfaces when it stood down and why) filters through this, never re-derives the rule.
  *
@@ -336,18 +336,14 @@ export function standDownComments(comments) {
 }
 
 /**
- * we:scripts/conveyor/stand-down.mjs#countStandDownComments — the DURABLE, restart-surviving stand-down count for
- * a PR (#3296). Every fix-agent escalation posts exactly ONE comment whose leading line is
- * {@link STAND_DOWN_MARKER}, so counting those comments recovers "has a fixer already stopped to ask here" from
- * the PR ITSELF. `planReconcile` refuses to dispatch a fixer at any PR whose count is above zero — terminal, with
- * no decay and no clock, because re-running an agent that stood down only re-asks the same question.
- *
- * Pure — built on {@link standDownComments}, which is where the leading-line match rule actually lives.
+ * Durable stand-down count plus one for a live load-flake hold. Pass the current head and legacy supersession
+ * reader to exclude ended holds. Callers needing only human escalations use {@link standDownComments}.length.
+ * Pure; the optional supersession reader keeps this module import-light.
  * @param {Array<{body?:string}|string>|null|undefined} comments
  * @returns {number} the number of conveyor stand-down comments on the PR (0 for a non-array / empty input)
  */
-export function countStandDownComments(comments) {
-  return standDownComments(comments).length;
+export function countStandDownComments(comments, { headRefOid = null, isSuperseded } = {}) {
+  return standDownComments(comments).length + (loadFlakeHoldState({ comments, headRefOid, isSuperseded }).live ? 1 : 0);
 }
 
 /**

@@ -5,6 +5,8 @@
  *   dispatch idempotency, and the concurrency cap.
  */
 import { describe, it, expect } from 'vitest';
+import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
+import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import {
   STUCK_STAGES, DEFAULT_STUCK_THRESHOLD_MINUTES, STUCK_THRESHOLD_ENV, stuckThresholdMinutes,
   isDraftPr, isNeverStuckPr, classifyStuckStage, PROGRESS_TIMELINE_EVENTS, latestActivityAt,
@@ -13,7 +15,7 @@ import {
   MAX_CONCURRENT_INSPECTIONS_ENV, maxConcurrentInspections, planStuckDispatches, isStuckInspectionOwnComment,
   buildStuckDispatchRetractionComment, stuckDispatchRetractions,
 } from '../stuck-pr-watch-core.mjs';
-import { buildStandDownComment } from '../stand-down.mjs';
+import { buildStandDownComment, buildLoadFlakeHoldComment, buildLoadFlakeResolvedComment } from '../stand-down.mjs';
 
 describe('dispatch retraction (PR #2553 review — marker first, then launch)', () => {
   const T = '2026-09-23T17:00:00Z';
@@ -297,5 +299,23 @@ describe('concurrency cap', () => {
     const candidates = [{ num: 1, minutesSince: 50, thresholdMinutes: 45 }];
     const { toDispatch } = planStuckDispatches({ candidates, liveInspectCount: 99, maxConcurrent: 2 });
     expect(toDispatch).toEqual([]);
+  });
+});
+
+
+describe('load-flake hold exclusions', () => {
+  const comment = (body, createdAt = '2026-10-04T18:00:00Z') => ({ body, createdAt, author: { login: 'web-everything' } });
+  it('excludes a live hold until pushed or the recorded head moves', () => {
+    const hold = comment(buildLoadFlakeHoldComment({ head: 'aaa1111', alt: 'lane/fix-alt', altSha: 'bbb2222' }));
+    const pr = { headRefOid: 'aaa1111', comments: [hold] };
+    expect(isNeverStuckPr(pr)).toBe(true);
+    expect(isNeverStuckPr({ ...pr, headRefOid: 'ccc3333' })).toBe(false);
+    expect(isNeverStuckPr({ ...pr, comments: [hold, comment(buildLoadFlakeResolvedComment({ altSha: 'bbb2222', result: 'pushed' }), '2026-10-04T19:00:00Z')] })).toBe(false);
+  });
+  it('excludes a legacy hold only until an operator answer supersedes it', () => {
+    const hold = { ...comment(loadFlakeLegacyBody), id: 'IC_legacy_hold' };
+    expect(isNeverStuckPr({ comments: [hold] })).toBe(true);
+    const answer = comment(buildOperatorAnswer({ standDownId: hold.id, reason: 'handled', actor: 'chalbert', channel: 'test' }), '2026-10-04T19:00:00Z');
+    expect(isNeverStuckPr({ comments: [hold, answer] })).toBe(false);
   });
 });

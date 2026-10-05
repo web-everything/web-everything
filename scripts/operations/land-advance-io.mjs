@@ -18,7 +18,7 @@ import { resolvePidAlive, scanPsOutput, defaultIsPidAlive } from '../conveyor/dr
 import { planFixesFromReconcile, dispatchFix as realDispatchFix } from '../conveyor/reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../conveyor/parked-pr-conflict-watch.mjs';
 import { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore } from '../conveyor/ci-heal-mark.mjs';
-import { countStandDownComments } from '../conveyor/stand-down.mjs';
+import { standDownComments } from '../conveyor/stand-down.mjs';
 import { dispatchCiHeal as realDispatchCiHeal } from './ci-heal-pr-dispatch.mjs';
 import { isConflicting, followUpKindFor } from './land-advance-repair.mjs';
 import { defaultLoadItems, findItem } from './dispatch-lane-io.mjs';
@@ -152,7 +152,7 @@ export function createLandAdvanceReader(ports = {}) {
           restore: ports.ciHealBudgetRestore ?? resolveCiHealBudgetRestore(process.env),
         });
         const refunded = countCiHealComments(comments) - ciHealComments;
-        return { ciHealComments, standDownComments: countStandDownComments(comments), ...(refunded > 0 ? { refunded } : {}) };
+        return { ciHealComments, standDownComments: standDownComments(comments).length, ...(refunded > 0 ? { refunded } : {}) };
       }, {});
     }
     const ledger = get('follow-ups', () => readFollowUps({ store }), []);

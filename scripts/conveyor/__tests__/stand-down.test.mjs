@@ -516,3 +516,14 @@ describe('load-flake hold head comparison and supported repos', () => {
     expect(loadFlakeHoldRequest({ reason: 'gate-red', alt: 'lane/x-alt', altSha: 'bbb2222', repoKey: 'we' })).toBe(false);
   });
 });
+
+
+it('counts a live load-flake hold alongside terminal stand-downs, until the head moves or it resolves', () => {
+  const c = loadComment(buildLoadFlakeHoldComment({ head: 'abc0001', alt: 'lane/fix-alt', altSha: 'bbb2222' }));
+  expect(countStandDownComments([c], { headRefOid: 'abc0001' })).toBe(1);
+  expect(countStandDownComments([c])).toBe(1);
+  expect(countStandDownComments([c, loadComment(buildStandDownComment())])).toBe(2);
+  expect(countStandDownComments([c], { headRefOid: 'def0002' })).toBe(0);
+  expect(countStandDownComments([c, loadComment(buildLoadFlakeResolvedComment({ altSha: 'bbb2222', result: 'pushed' }), '2026-10-04T22:00:00Z')])).toBe(0);
+  expect(standDownComments([c])).toEqual([]);
+});
