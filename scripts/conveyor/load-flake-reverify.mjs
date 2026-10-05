@@ -73,7 +73,14 @@ export async function runLoadFlakeReverify({ repo = 'we', dryRun = false, config
   if (refusal) return refusal;
   if (attempts >= config.maxAttempts) { await post('exhausted'); return { result: 'exhausted' }; }
   // Legacy holds have no recorded head: the fresh discovery head is still required as an ancestor.
-  await io.prepare(slug, hold.alt.branch, pr.headRefName);
+  try {
+    await io.prepare(slug, hold.alt.branch, pr.headRefName);
+  } catch (e) {
+    // A deleted alt (or head) branch can never be pushed: end the hold. Any other fetch failure is transient and rethrown.
+    if (!/couldn't find remote ref/i.test(`${e?.stderr ?? ''}\n${e?.message ?? ''}`)) throw e;
+    await post('head-moved', 'The saved alt branch no longer exists on the remote, so it can no longer be pushed.');
+    return { deferred: 'alt-gone' };
+  }
   if (!await io.isAncestor(pr.headRefOid, hold.alt.sha)) {
     // The PR moved past the saved repair: end the hold so reconcile hands the PR back and this pass stops re-picking it.
     await post('head-moved', 'The saved alt commit is not a descendant of the PR head, so it can no longer be pushed.');

@@ -103,4 +103,16 @@ describe('superseded legacy holds and moved heads (PR #3945 review)', () => {
     expect(planLoadFlakeReverify({ prs: [ended], load: [1, 1], cores: 12, now })).toEqual({ deferred: 'no-candidate' });
     expect(io.acquire).not.toHaveBeenCalled();
   });
+  it('a hold whose saved alt branch was deleted is ended; a transient fetch failure is not', async () => {
+    const { io, pr } = fixture();
+    io.prepare.mockImplementation(() => { throw Object.assign(new Error('git fetch failed'), { stderr: "fatal: couldn't find remote ref refs/heads/alt" }); });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'alt-gone' });
+    expect(io.comment.mock.calls[0][2]).toContain('result=head-moved');
+    const ended = { ...pr, comments: [...pr.comments, comment(io.comment.mock.calls[0][2], '2026-10-04T22:00:01Z')] };
+    expect(planLoadFlakeReverify({ prs: [ended], load: [1, 1], cores: 12, now })).toEqual({ deferred: 'no-candidate' });
+    const transient = fixture();
+    transient.io.prepare.mockImplementation(() => { throw new Error('Could not resolve host: github.com'); });
+    await expect(runLoadFlakeReverify({}, transient.io)).rejects.toThrow('Could not resolve host');
+    expect(transient.io.comment).not.toHaveBeenCalled();
+  });
 });
