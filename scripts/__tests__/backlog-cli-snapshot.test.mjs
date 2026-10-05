@@ -4,6 +4,7 @@
  * own `ROOT`, derived from its copied `import.meta.url`, resolves INSIDE the throwaway clone — never the
  * real repo), run the REAL `node scripts/backlog.mjs <verb>` subprocess, assert its actual exit code +
  * the resulting file content on disk, `rmSync` in teardown.
+ * The shared clone skips `__tests__` dirs; the lane-guard test moves (not copies) the tree.
  *
  * This complements `golden-corpus-snapshot.test.mjs` (which replays the full 92-fixture historical
  * corpus, but only at the pure-function layer — `applyTransition`/`applySettle` take an injected `today`,
@@ -17,9 +18,9 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, cpSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, cpSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const WE_SCRIPTS_DIR = dirname(dirname(fileURLToPath(import.meta.url))); // .../scripts (this file is scripts/__tests__/*)
@@ -33,13 +34,16 @@ const WE_SCRIPTS_DIR = dirname(dirname(fileURLToPath(import.meta.url))); // .../
 const hostLocalDay = () => new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
 const TODAY = hostLocalDay();
 
+// The CLI never imports test files or fixtures, so omit their directories from the clone.
+const skipTestDirs = (source) => basename(source) !== '__tests__';
+
 let clone;
 beforeAll(() => {
   clone = mkdtempSync(join(tmpdir(), 'we-backlog-cli-snapshot-'));
-  // Copy the real scripts/ tree wholesale so backlog.mjs's own ROOT (derived from ITS OWN copied
+  // Copy the real scripts/ tree without test directories so backlog.mjs's own ROOT (derived from ITS OWN copied
   // import.meta.url) resolves inside the throwaway clone, not the real repo — the mutation genuinely
   // lands only in `clone/backlog/*`, never touches this lane's real `backlog/`.
-  cpSync(WE_SCRIPTS_DIR, join(clone, 'scripts'), { recursive: true });
+  cpSync(WE_SCRIPTS_DIR, join(clone, 'scripts'), { recursive: true, filter: skipTestDirs });
   // `claim`/`resolve`/etc unconditionally re-save reservations/claims state alongside the frontmatter
   // write (best-effort convenience bookkeeping, not gated on it existing) — seed empty state so that
   // save doesn't ENOENT on a directory this throwaway clone never had a reason to create otherwise.
@@ -366,20 +370,25 @@ describe('backlog.mjs CLI — overlap-yield-config (#4308)', () => {
     expect(readFileSync(configPath(), 'utf8')).toBe(before);
   });
 
-  // #4417 item 2 — the primary-checkout lane-guard refusal. A copy of scripts/ under a `webeverything` dir
+  // #4417 item 2 — the primary-checkout lane-guard refusal. Moving scripts/ under a `webeverything` dir
   // (a PRIMARY_REPOS name) resolves as the shared primary checkout.
   it('refuses to mutate the config from a primary checkout (lane-guard), file untouched', () => {
     const primary = join(clone, 'ws', 'webeverything');
-    cpSync(WE_SCRIPTS_DIR, join(primary, 'scripts'), { recursive: true });
-    const cfg = join(primary, 'scripts', 'drain-overlap-yield-config.json');
-    const before = readFileSync(cfg, 'utf8');
-    let code = 0; let out = '';
+    mkdirSync(primary, { recursive: true });
+    renameSync(join(clone, 'scripts'), join(primary, 'scripts'));
     try {
-      out = execFileSync('node', [join(primary, 'scripts', 'backlog.mjs'), 'overlap-yield-config', '--set-window=7', '--json'], { cwd: primary, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: childEnv() });
-    } catch (e) { code = e.status; out = `${e.stdout || ''}${e.stderr || ''}`; }
-    expect(code).toBe(1);
-    expect(out).toContain('BLOCKED');
-    expect(readFileSync(cfg, 'utf8')).toBe(before);
+      const cfg = join(primary, 'scripts', 'drain-overlap-yield-config.json');
+      const before = readFileSync(cfg, 'utf8');
+      let code = 0; let out = '';
+      try {
+        out = execFileSync('node', [join(primary, 'scripts', 'backlog.mjs'), 'overlap-yield-config', '--set-window=7', '--json'], { cwd: primary, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: childEnv() });
+      } catch (e) { code = e.status; out = `${e.stdout || ''}${e.stderr || ''}`; }
+      expect(code).toBe(1);
+      expect(out).toContain('BLOCKED');
+      expect(readFileSync(cfg, 'utf8')).toBe(before);
+    } finally {
+      renameSync(join(primary, 'scripts'), join(clone, 'scripts'));
+    }
   });
 
 });

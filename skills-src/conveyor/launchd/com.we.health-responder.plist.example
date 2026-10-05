@@ -20,6 +20,8 @@
   </array>
   <key>WorkingDirectory</key><string>/WORKSPACE/wev-health-responder</string>
   <key>EnvironmentVariables</key><dict>
+    <key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key>
+    <string>120000</string>
     <key>CONVEYOR_STATE_ROOT</key><string>/PINNED/conveyor-state</string>
     <key>WE_DISPATCH_PAUSE_FILE</key><string>/PINNED/dispatch-pause.json</string>
   </dict>

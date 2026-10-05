@@ -50,6 +50,8 @@
   <key>StandardErrorPath</key><string>/Users/YOU/workspace/webeverything/.conveyor/pass-daemon.stuck-pr-watch-we.log</string>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key>
+    <string>120000</string>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
 </dict>
