@@ -60,7 +60,8 @@ import { laneGuardDecision, resolveReal, isLaneLocus } from './guard-lane.mjs';
 import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed } from './lib/build-queue.mjs';
 import { loadOverlapYieldConfig, writeOverlapYieldConfig, defaultOverlapYieldConfigPath } from './conveyor/land-overlap-yield.mjs';
 import { localToday } from './lib/local-date.mjs';
-import { writeLineSync } from './lib/write-all-sync.mjs';
+import { buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
+import { writeAllSync, writeLineSync } from './lib/write-all-sync.mjs';
 import { writeBacklogMd as writeBacklogMdCore, writeBacklogMdUnguarded as writeBacklogMdUnguardedCore } from './backlog/guarded-write.mjs';
 // #3034 — `claim` runs through this declared operation, not a second hand-rolled implementation. See
 // `claimViaOperation` below (the `v === 'claim'` rewire of the old inline `transition()` guard block).
@@ -1072,6 +1073,26 @@ function overlapYieldConfig() {
  * rank) come straight off the loader (`...data`), which is authoritative for them.
  */
 function buildQueue() {
+  const cacheEnabled = JSON_MODE && !argv.some(arg => arg.startsWith('--config=') || arg.startsWith('--backlog-dir=')) &&
+    process.env.WE_BUILD_QUEUE_CACHE !== '0' &&
+    !(process.env.VITEST && process.env.WE_BUILD_QUEUE_CACHE === undefined);
+  const at = Date.now();
+  const key = cacheEnabled ? buildQueueCacheKey({ backlogDir: DIR, configPath: BUILD_QUEUE_CONFIG_PATH,
+    next: argv.includes('--next') }) : null;
+  const file = cacheEnabled ? buildQueueCacheFile(DIR) : null;
+  const configuredAge = Number(process.env.WE_BUILD_QUEUE_CACHE_MAX_AGE_MS ?? 60_000);
+  const maxAgeMs = Number.isFinite(configuredAge) && configuredAge >= 0 ? configuredAge : 60_000;
+  if (key !== null) {
+    const stdout = readBuildQueueCache({ file, key, now: at, maxAgeMs });
+    if (stdout !== null) { writeAllSync(1, stdout); process.exit(0); }
+  }
+  const emit = (payload, human) => {
+    if (key === null) return ok(payload, human);
+    const stdout = `${JSON.stringify({ ok: true, ...payload })}\n`;
+    writeBuildQueueCache({ file, key, at, stdout });
+    writeAllSync(1, stdout);
+    process.exit(0);
+  };
   // `--config=<path>` previews the order under a HYPOTHETICAL config (the console's live weights preview,
   // #2529) WITHOUT persisting it — validated, never written. Absent → the committed/default config.
   const configPath = flag('config');
@@ -1113,12 +1134,12 @@ function buildQueue() {
     // The builder's ACTUAL next = the top-ordered item the human has CLEARED for build (#2530), not merely the
     // top ready one. A ready, high-tier item that hasn't been cleared is never auto-built.
     const head = rows.find((r) => r.buildQueued) ?? null;
-    return ok({ verb: 'build-queue', next: head, config },
+    return emit({ verb: 'build-queue', next: head, config },
       head ? `${GRN}next → #${head.num}${RST} ${DIM}[${head.tier} · ${head.score.toFixed(2)}] ${head.title}${RST}`
            : `${DIM}build queue empty (no items cleared for build)${RST}`);
   }
   const clearedCount = rows.filter((r) => r.buildQueued).length;
-  return ok({ verb: 'build-queue', count: rows.length, cleared: clearedCount, queue: rows, config },
+  return emit({ verb: 'build-queue', count: rows.length, cleared: clearedCount, queue: rows, config },
     `${BLD}build queue${RST} ${DIM}(${rows.length} ready · ${clearedCount} cleared for build · next-to-build order)${RST}\n` +
     rows.slice(0, 25).map((r, i) => `  ${String(i + 1).padStart(2)}. ${r.buildQueued ? `${GRN}✓${RST}` : ' '} ${BLD}#${r.num}${RST} ${DIM}[${r.tier} · ${r.score.toFixed(2)}]${RST} ${r.title}`).join('\n') +
     (rows.length > 25 ? `\n  ${DIM}… +${rows.length - 25} more${RST}` : ''));

@@ -38,6 +38,7 @@
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
+import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { sweepOurTmp, readBusyTopLevel, formatTmpSweepLine } from './tmp-sweep.mjs';
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { execFileSync, spawn } from 'node:child_process';
@@ -593,7 +594,7 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
 }
 
 export function probeAgents({ exec = run } = {}) {
-  const arr = JSON.parse(exec('claude', ['agents', '--json'], { cwd: homedir() }));
+  const arr = JSON.parse(cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], { cwd: homedir() }) }));
   // `cwd`/`sessionId` carried through (additive — no existing smell reads `probes.agents` at all yet) so the
   // claude-auth-expired sign below can resolve each background session's own transcript.
   // #xrv69j6 — `status`/`waitingFor` ALSO carried through (additive, same reasoning): a background session

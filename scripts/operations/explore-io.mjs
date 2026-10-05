@@ -80,6 +80,7 @@
  * IMPURE by construction: `node`, `claude`, `fs`.
  */
 
+import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -550,10 +551,10 @@ export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => de
 /** `claude agents --json` — ACTIVE sessions only. `--all` would list completed ones too, so a finished
  *  investigation would read as `running` forever: the one mistake that makes an observer worse than none. */
 export function defaultListAgents({ exec = execFileSync } = {}) {
-  const out = exec('claude', ['agents', '--json'], {
+  const out = cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024,
     timeout: LIST_TIMEOUT_MS, killSignal: 'SIGKILL',
-  });
+  }) });
   return JSON.parse(String(out || '[]'));
 }
 

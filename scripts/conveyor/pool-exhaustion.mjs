@@ -10,6 +10,7 @@
  *
  * PURE CORE: {@link summarizePoolExhaustion}, {@link formatPoolExhaustion}. IO: {@link makePoolExhaustionLogger}.
  */
+import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { execFileSync } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -86,7 +87,7 @@ function defaultReadStatus({ lanePoolRepo = null } = {}) {
 
 function defaultReadAgents() {
   try {
-    const parsed = JSON.parse(execFileSync('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000 }));
+    const parsed = JSON.parse(cachedClaudeAgents({ fetch: () => execFileSync('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000 }) }));
     return Array.isArray(parsed) ? parsed : null;
   } catch { return null; }
 }

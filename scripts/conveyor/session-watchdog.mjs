@@ -64,6 +64,7 @@
  *   node scripts/conveyor/session-watchdog.mjs [--json]          # one pass, report only (never acts)
  *   node scripts/conveyor/session-watchdog.mjs --apply [--json]  # one pass that also takes its actions
  */
+import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
@@ -462,7 +463,7 @@ export function makeSnapshotHeadReader({ maxAgeMs = DEFAULT_SESSION_WATCHDOG.prH
 }
 
 export function defaultListAgentsJson(exec = execFileSync) {
-  return JSON.parse(String(exec('claude', ['agents', '--json'], { cwd: homedir(), encoding: 'utf8', timeout: 60_000 })));
+  return JSON.parse(String(cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], { cwd: homedir(), encoding: 'utf8', timeout: 60_000 }) })));
 }
 
 function defaultProcesses(exec = execFileSync) {

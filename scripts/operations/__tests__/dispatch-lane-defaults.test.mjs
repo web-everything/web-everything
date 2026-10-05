@@ -82,7 +82,7 @@ describe('the default subprocess calls are BOUNDED — every one of them', () =>
 
   it('the agent listing is bounded — it sits inside a waker pass that promises to be fail-soft per run', () => {
     const { exec, calls } = spyExec('[]');
-    defaultListAgents({ exec, env: {} });
+    defaultListAgents({ exec, env: { WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' } });
     // THE LITERAL, not only the constant: fifteen seconds is the claim, and a test written as
     // `timeout: LIST_TIMEOUT_MS` alone stays true for any value the constant is changed to.
     expect(LIST_TIMEOUT_MS).toBe(15 * 1000);
@@ -100,7 +100,7 @@ describe('the default subprocess calls are BOUNDED — every one of them', () =>
     expect(listTimeoutMs({ [LIST_TIMEOUT_ENV]: '0' })).toBe(0);
     expect(listTimeoutMs({ [LIST_TIMEOUT_ENV]: '90000' })).toBe(90000);
     const { exec, calls } = spyExec('[]');
-    defaultListAgents({ exec, env: { [LIST_TIMEOUT_ENV]: '0' } });
+    defaultListAgents({ exec, env: { [LIST_TIMEOUT_ENV]: '0', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' } });
     expect(calls[0].opts.timeout).toBe(0);
   });
 
