@@ -20,10 +20,16 @@ export const VERIFY_ENV_ALLOWLIST = Object.freeze([
   'SHELL', 'USER', 'LOGNAME', 'WE_HEAVY_*', 'npm_config_*',
 ]);
 const VERIFY_SECRET = /TOKEN|SECRET|PASSWORD|PRIVATE_KEY|CREDENTIAL|API_KEY|ACCESS_KEY|AUTH|SSH_AUTH_SOCK|^WE_GITHUB_APP_/i;
+// npm reads these names in ANY case (npm_config_*, NPM_CONFIG_*, mixed), so the match is case-insensitive.
+const NPM_CREDENTIAL_CONFIG = /^npm_config_.*(token|auth|password|_key|secret|cert|userconfig|globalconfig)/i;
+// Path-valued knobs: a literal leading `~` must resolve against the REAL home, not the scratch HOME the child gets.
+const VERIFY_PATH_VARS = new Set(['LANE_POOL_ROOT', 'CONVEYOR_RUNNER_LOCK_ROOT', 'PLAYWRIGHT_BROWSERS_PATH']);
+const expandTilde = (value, home) => (home && (value === '~' || value.startsWith('~/')) ? join(home, value.slice(1)) : value);
 
 export function reverifyConfig(env = process.env, maxLoadPerCore) {
   const verifyEnvAllow = (env.WE_LOAD_FLAKE_VERIFY_ENV_ALLOW ?? '').split(',').map((s) => s.trim()).filter(Boolean);
   if (verifyEnvAllow.some((name) => VERIFY_SECRET.test(name))) throw new Error('secret name in WE_LOAD_FLAKE_VERIFY_ENV_ALLOW');
+  if (verifyEnvAllow.some((name) => NPM_CREDENTIAL_CONFIG.test(name))) throw new Error('npm credential-config name in WE_LOAD_FLAKE_VERIFY_ENV_ALLOW');
   const positive = (value, fallback) => {
     const n = Number(value ?? fallback);
     if (!Number.isFinite(n) || n <= 0) throw new Error(`invalid reverify limit: ${value}`);
@@ -160,11 +166,12 @@ async function reverifyCandidate({ candidate, key, slug, config }, io) {
 /** Fixer-authored verification gets only required knobs and explicit non-secret extensions.
  *  HOME and temp paths point into disposable scratch directories, never the daemon's credential homes, and npm's
  *  user/global config paths are dropped so the child's npm never loads the daemon's ~/.npmrc auth. Pure. */
-export function scrubVerifyEnv(env = process.env, { allow = [], scratchDir } = {}) {
+export function scrubVerifyEnv(env = process.env, { allow = [], scratchDir, home = env.HOME || os.homedir() } = {}) {
   const clean = Object.fromEntries(Object.entries(env).filter(([k]) => !VERIFY_SECRET.test(k)
     && !/^(HOME|TMPDIR|TMP|TEMP|GIT_ASKPASS)$|^(GITHUB_|GH_|SSH_)/.test(k)
-    && !(k.startsWith('npm_config_') && /token|auth|password|_key|secret|cert|userconfig|globalconfig/i.test(k))
-    && (allow.includes(k) || VERIFY_ENV_ALLOWLIST.some((name) => name.endsWith('*') ? k.startsWith(name.slice(0, -1)) : k === name))));
+    && !NPM_CREDENTIAL_CONFIG.test(k)
+    && (allow.includes(k) || VERIFY_ENV_ALLOWLIST.some((name) => name.endsWith('*') ? k.startsWith(name.slice(0, -1)) : k === name)))
+    .map(([k, v]) => [k, VERIFY_PATH_VARS.has(k) && typeof v === 'string' ? expandTilde(v, home) : v]));
   if (scratchDir) Object.assign(clean, { HOME: join(scratchDir, 'home'), TMPDIR: join(scratchDir, 'tmp'), TMP: join(scratchDir, 'tmp'), TEMP: join(scratchDir, 'tmp') });
   return clean;
 }
@@ -200,7 +207,12 @@ export function defaultReverifyIo({ run = execFileSync, runVerification = runBou
         return { ok: true };
       }
       catch (e) { return { ok: false, summary: `${e.stdout ?? ''}\n${e.stderr ?? ''}\n${e.message ?? ''}`.slice(-1500) }; }
-      finally { rmSync(scratchDir, { recursive: true, force: true }); }
+      finally {
+        // Branch-authored code wrote into this directory: an unremovable entry must never replace the verify result
+        // (a throw in `finally` would turn a green or red outcome into a pass-level error and re-pick the candidate).
+        try { rmSync(scratchDir, { recursive: true, force: true }); }
+        catch (e) { console.warn(`load-flake reverify: could not remove scratch dir ${scratchDir}: ${e.message}`); }
+      }
     },
     // Pushed from the daemon's own checkout, never the lane: the lane just ran fixer-authored code that could have
     // planted hooks or git config there. `prepare` already fetched the saved commit into this checkout. Hooks are
