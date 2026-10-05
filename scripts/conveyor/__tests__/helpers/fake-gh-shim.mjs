@@ -87,6 +87,7 @@ try {
 const HTTP_401 = "HTTP 401: Bad credentials (https://api.github.com/graphql)\n";
 const HTTP_RATE_LIMIT = 'API rate limit exceeded for user ID 1\n';
 const HTTP_5XX = 'HTTP 502: Bad Gateway\n';
+const HTTP_406_TOO_LARGE = 'could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of files (300). Consider using \'List pull requests files\' API or locally cloning the repository instead.\nPullRequest.diff too_large\n';
 // #4075 soak harness gap (break `sticky-smoke-rejection`): `gh` is a Go binary — a real network failure prints
 // Go's net/http error text, never one of the HTTP_* fixtures above. Live 2026-09-25 08:14 ET both gh smoke checks
 // failed together with exactly this shape (`daemon-live-smoke.mjs#TRANSIENT_FAILURE_PATTERNS` added
@@ -101,6 +102,26 @@ function callVerb() {
   if ((argv[0] === 'pr' || argv[0] === 'label') && argv[1] && !argv[1].startsWith('-')) return `${argv[0]} ${argv[1]}`;
   return argv[0];
 }
+
+/** The fault buckets a call matches, most specific first. A `pulls/<n>/files` read ALSO matches the path-scoped
+ *  verb `'api pulls/files'`, so a scenario can fail that one endpoint without failing every `gh api` call (PR #3881). */
+function callFaultVerbs() {
+  const verb = callVerb();
+  if (verb === 'api' && argv.some((a) => /^repos\/[^/]+\/[^/]+\/pulls\/\d+\/files$/.test(a))) return ['api pulls/files', verb];
+  if (verb === 'api' && argv.some((a) => /^repos\/[^/]+\/[^/]+\/compare\/.+\.\.\..+$/.test(a))) return ['api compare', verb];
+  return [verb];
+}
+
+/** Set by the `no-files` fault (verb `'api compare'`): this call's compare answer carries no `files` array — an
+ *  answer that is not a file list at all, which must never read as "no files changed" (PR #3881 operator ruling). */
+let omitCompareFiles = false;
+
+/** GitHub's real list caps: `compare/<a>...<b>` lists at most 300 changed files (it paginates commits, not files);
+ *  `pulls/<n>/files` at most 3000. Modelled faithfully so a truncated answer is reproducible (PR #3881). */
+const COMPARE_FILES_CAP = 300;
+const PULLS_FILES_CAP = 3000;
+/** Only this many entries of a file list carry a `patch` (one `git diff` each; GitHub omits patches on huge diffs too). */
+const LARGE_DIFF_PATCHES = 100;
 
 // -------------------------------------------------------------------------------------------------------
 // Tiny argv helpers — hand-rolled per subcommand rather than one generic parser, so each handler's flag set
@@ -421,13 +442,15 @@ function handleApi(store, rest) {
   return guarded(() => {
     const method = flagValue(rest, '--method') || flagValue(rest, '-X') || 'GET';
     const jq = flagValue(rest, '--jq');
-    const path = rest.find((a, i) => {
+    let path = rest.find((a, i) => {
       if (a.startsWith('-')) return false;
       const prev = rest[i - 1];
       // skip values that belong to a preceding flag (-F k=v, --method/-X M, --jq Q)
       if (prev === '-F' || prev === '--method' || prev === '-X' || prev === '--jq') return false;
       return true;
     });
+    // Real `gh api` expands `{owner}/{repo}` from the cwd's remote; mirror that (PR #3794 fallback reads use it).
+    if (path && path.includes('{owner}/{repo}')) path = path.replace('{owner}/{repo}', resolveRepoSlug(store, null));
     if (method !== 'GET') return { stderr: `fake-gh: unsupported api --method ${method}\n`, exitCode: 1 };
     if (!path) return { stderr: 'fake-gh: api: no path given\n', exitCode: 1 };
 
@@ -444,8 +467,8 @@ function handleApi(store, rest) {
       const slug = `${m[1]}/${m[2]}`; const num = Number(m[3]);
       const repoState = requireRepo(store, slug); const pr = requirePr(repoState, num);
       const oids = resolveDiffOids(repoState, pr);
-      const filesRest = oids.headOid && oids.baseOid ? listChangedFilesRest(repoState.originPath, oids.baseOid, oids.headOid) : [];
-      return jsonResult(filesRest, jq);
+      const filesRest = oids.headOid && oids.baseOid ? listChangedFilesRest(repoState.originPath, oids.baseOid, oids.headOid, { maxPatched: LARGE_DIFF_PATCHES }) : [];
+      return jsonResult(filesRest.slice(0, PULLS_FILES_CAP), jq);
     }
     if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)$/))) {
       const slug = `${m[1]}/${m[2]}`; const num = Number(m[3]);
@@ -552,7 +575,7 @@ function handleApi(store, rest) {
       };
       return jsonResult({
         merge_base_commit: { sha: mergeBase }, ahead_by: count(`${a}..${b}`), behind_by: count(`${b}..${a}`),
-        files: listChangedFilesRest(repoState.originPath, a, b),
+        ...(omitCompareFiles ? {} : { files: listChangedFilesRest(repoState.originPath, a, b, { maxPatched: LARGE_DIFF_PATCHES }).slice(0, COMPARE_FILES_CAP) }),
       }, jq);
     }
     if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/contents\/(.+)$/))) {
@@ -605,18 +628,21 @@ const result = withStore(STORE_PATH, (store) => {
     return { stderr: HTTP_401, exitCode: 1 };
   }
 
-  const verb = callVerb();
-  const bucket = store.faults[verb];
+  const bucket = callFaultVerbs().map((v) => store.faults[v]).find((b) => b && b.length);
   if (bucket && bucket.length) {
     const f = bucket[0];
     f.timesLeft -= 1;
     if (f.timesLeft <= 0) bucket.shift();
     if (f.kind === 'rate-limit') return { stderr: HTTP_RATE_LIMIT, exitCode: 1 };
     if (f.kind === '5xx') return { stderr: HTTP_5XX, exitCode: 1 };
+    // PR #3794 — GitHub's answer to `gh pr diff` on a PR over 300 files; permanent for that endpoint.
+    if (f.kind === 'too-large') return { stderr: HTTP_406_TOO_LARGE, exitCode: 1 };
     if (f.kind === '401') return { stderr: HTTP_401, exitCode: 1 };
     if (f.kind === 'timeout') return { sleepMs: 120_000 };
     // #4075 soak harness gap — see GO_NETWORK_ERROR's own comment above.
     if (f.kind === 'network') return { stderr: GO_NETWORK_ERROR, exitCode: 1 };
+    // PR #3881 — NOT a failure: the call answers, but its compare body has no `files` array (falls through below).
+    if (f.kind === 'no-files') omitCompareFiles = true;
     // #3383 scenario A2 — NOT a failure: a real side-effecting push, mid-call, then fall through to the
     // ordinary verb handler below so THIS call still answers normally. See `fake-gh.mjs#pushCommitToRef`'s own
     // docblock for why this must live here (inside the shim's own dispatch) rather than a scenario play step.

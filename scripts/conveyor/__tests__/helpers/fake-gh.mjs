@@ -586,19 +586,23 @@ export function listChangedFilesNative(originPath, base, head) {
   });
 }
 
-/** REST shape: `{filename, status, patch}` — used by `pulls/{n}/files` and `compare/{a}...{b}`. */
-export function listChangedFilesRest(originPath, base, head) {
+/** REST shape: `{filename, status, patch}` — used by `pulls/{n}/files` and `compare/{a}...{b}`.
+ *  `maxPatched` bounds how many entries carry a `patch` (one `git diff` each — 300+ file PRs would otherwise run
+ *  past a daemon tick); the rest get `''`, as GitHub itself omits patches for very large diffs (PR #3881). */
+export function listChangedFilesRest(originPath, base, head, { maxPatched = Infinity } = {}) {
   const mb = mergeBaseOf(originPath, base, head);
   const lines = runGit(['diff', '--name-status', mb, head], originPath).split('\n').filter(Boolean);
-  return lines.map((line) => {
+  return lines.map((line, idx) => {
     const [code, path] = line.split('\t');
     const status = code.startsWith('A') ? 'added' : code.startsWith('D') ? 'removed' : code.startsWith('R') ? 'renamed' : 'modified';
     let patch = '';
-    try {
-      const raw = runGit(['diff', '--unified=3', mb, head, '--', path], originPath);
-      const at = raw.indexOf('\n@@');
-      patch = at === -1 ? '' : raw.slice(at + 1);
-    } catch { patch = ''; }
+    if (idx < maxPatched) {
+      try {
+        const raw = runGit(['diff', '--unified=3', mb, head, '--', path], originPath);
+        const at = raw.indexOf('\n@@');
+        patch = at === -1 ? '' : raw.slice(at + 1);
+      } catch { patch = ''; }
+    }
     return { filename: path, status, patch };
   });
 }
@@ -852,6 +856,8 @@ export function createFakeGithub({ root, repos, actor = 'we-daemon-bot' }) {
      *  net/http stderr text (`error connecting to api.github.com` / `dial tcp ...: i/o timeout`) — what a REAL
      *  `gh` (a Go binary) prints on a genuine network fault, distinct from the HTTP_* fixtures the other kinds
      *  use — see `fake-gh-shim.mjs`'s own `GO_NETWORK_ERROR` comment.
+     *  `kind: 'no-files'` (verb `'api compare'`, PR #3881) is not a failure either: the compare call answers, but
+     *  its body carries no `files` array.
      *  `kind: 'push-to-main'` (#3383, scenario A2 — origin advancing MID-TICK, deterministically, from INSIDE
      *  the daemon's own tick) is not a failure at all: the matching call still answers normally, but the shim
      *  first runs a real `git` push of `files`/`message` onto `branch` (default `main`) of `repo`'s own origin
