@@ -161,13 +161,13 @@ describe('the fix-agent brief actually CALLS it — the half that would otherwis
     }
   });
 
-  it('the brief\'s tool/permission-denial exit reports blocked-on-infra and does not call this script', () => {
+  it('the brief\'s tool/permission-denial exit reports blocked-on-permission (PR #3964) and does not call this script', () => {
     const denialAt = lines.findIndex((l) => l.includes('If applying an otherwise-CLEAR fix is denied'));
     expect(denialAt).toBeGreaterThanOrEqual(0);
-    const exitAt = lines.findIndex((l, i) => i > denialAt && l.includes('blocked-on-infra ('));
+    const exitAt = lines.findIndex((l, i) => i > denialAt && l.includes('blocked-on-permission ('));
     expect(exitAt).toBeGreaterThan(denialAt);
     const paragraph = lines.slice(denialAt, exitAt + 1).join('\n');
-    expect(paragraph).toMatch(/--outcome=blocked-on-infra/);
+    expect(paragraph).toMatch(/--outcome=blocked-on-permission --denied=/);
     // The paragraph is allowed to MENTION stand-down.mjs in prose (contrasting this exit with it) — it must
     // never actually INVOKE it, the shape every real escalation call takes (`node ".../stand-down.mjs" <pr>`).
     expect(paragraph).not.toMatch(/stand-down\.mjs"\s+\{\{PR_NUM\}\}/);
