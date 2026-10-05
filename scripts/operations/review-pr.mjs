@@ -1730,6 +1730,9 @@ function renderRevProvenance(netBasis) {
     : '';
 }
 
+/** The stated outcome of a note posted while mandatory referrals are unruled: neither `accept` nor `changes`. */
+const ADVISORY_PENDING_REFERRAL_OUTCOME = 'pending-referral';
+
 /**
  * THE ADVISORY'S OWN OUTCOME — `accept` or `changes` — with the human gate FACTORED OUT. PURE.
  *
@@ -1748,6 +1751,9 @@ function renderRevProvenance(netBasis) {
 export function deriveAdvisoryOutcome(verdict) {
   const v = verdict && typeof verdict === 'object' ? verdict : {};
   if (v.blockedReferrals?.length) return ADVISORY_OUTCOMES.CHANGES;
+  // Unruled mandatory referrals mean the panel is not done: no outcome (so no `advisory:*` label) rather than a
+  // clean `accept`. Not `changes` either: nothing is broken, a ruling is owed, and `changes` would dispatch a fixer.
+  if (v.pendingReferrals?.length) return null;
   const lensVerdicts = v.lensVerdicts && typeof v.lensVerdicts === 'object' ? v.lensVerdicts : {};
   const lenses = Array.isArray(v.lenses) && v.lenses.length ? v.lenses : Object.keys(lensVerdicts);
   try {
@@ -1829,7 +1835,10 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
       ? ['', `**Advisory outcome:** \`${outcome}\` — ${outcome === ADVISORY_OUTCOMES.ACCEPT
         ? 'no blocking findings on this head; `advisory:accepted` is applied'
         : 'blocking findings on this head; `advisory:changes` is applied'}.`]
-      : []),
+      // No outcome line parses back as `accept` (`parseAdvisories`), so unruled referrals state a non-accept word.
+      : v.pendingReferrals?.length
+        ? ['', `**Advisory outcome:** \`${ADVISORY_PENDING_REFERRAL_OUTCOME}\` — mandatory referrals still need a ruling; no \`advisory:*\` label is applied`]
+        : []),
     '',
     '---',
     '',
@@ -2486,11 +2495,14 @@ export function reviewPrOperation({
     // gets past). On a PR that is NOT `humanRequired` this declares `[]`, which `advance` resolves INLINE with
     // no suspend at all (`step-kinds.mjs`'s effect case) — so the `review:pending` path is byte-identical to
     // before this step existed: nothing happens here, exactly as nothing happened here before.
+    // Live #202 loop: pending referrals still need a visible advisory and label when the panel parks.
+    // Only an explicit WE_REVIEW_ADVISE_ON_PENDING_REFERRALS=0 restores the old silent skip.
     advise: effectStep({
       reads: ['input.pr', 'input.repo', 'findings.read', 'verdict'],
       effects: (view) => {
         const read = view.findings.read;
-        if (read.humanRequired !== true || view.verdict.pendingReferrals?.length) return [];
+        if (read.humanRequired !== true) return [];
+        if (view.verdict.pendingReferrals?.length && process.env.WE_REVIEW_ADVISE_ON_PENDING_REFERRALS === '0') return [];
         const effects = [{
           type: REVIEW_EFFECTS.ADVISORY_NOTE,
           payload: {

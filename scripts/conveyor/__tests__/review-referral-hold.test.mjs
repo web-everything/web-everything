@@ -10,7 +10,8 @@ import { runReconcilePass } from '../reconcile-pass.mjs';
 import { countFindings } from '../reconcile-core.mjs';
 import {
   reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
-  notifyReferralHold, REFERRAL_RETRY_MS,
+  notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
+  GH_LIST_COMMENT_CAP,
 } from '../review-referral-hold.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -225,6 +226,59 @@ describe('persistence failure retry budget', () => {
   });
 });
 
+describe('full comment thread enrichment', () => {
+  const comments = () => Array.from({ length: 100 }, () => comment('Bookkeeping', at - 120_000));
+
+  it.each([true, false])('releases a capped thread after an operator reply (parked: %s)', parked => {
+    const p = pr({ comments: comments() });
+    const readRuns = () => [{ ...evidence(), parked }];
+    expect(enrichPrsWithReferralHolds([p], { repo, readRuns,
+      readComments: () => p.comments })[0].referralHold).not.toBeNull();
+    const full = [...p.comments, comment('Please reconsider.', at + 1, 'chalbert')];
+    const readComments = vi.fn(() => full);
+    const [enriched] = enrichPrsWithReferralHolds([p], { repo, readRuns, readComments });
+    expect(enriched.referralHold).toBeNull();
+    expect(enriched.comments).toBe(full);
+    expect(readComments).toHaveBeenCalledOnce();
+    expect(readComments).toHaveBeenCalledWith({ repo, number: p.number });
+    expect(GH_LIST_COMMENT_CAP).toBe(100);
+  });
+
+  it('does not fetch threads below the list cap', () => {
+    const readComments = vi.fn();
+    enrichPrsWithReferralHolds([pr({ comments: comments().slice(1) })], {
+      repo, readRuns: () => [evidence()], readComments,
+    });
+    expect(readComments).not.toHaveBeenCalled();
+  });
+
+  it.each(['no runs', 'different head', 'different repo', 'different PR'])
+    ('does not fetch a capped thread with %s', mismatch => {
+      const rows = {
+        'no runs': [],
+        'different head': [{ ...evidence(), head: 'b'.repeat(40) }],
+        'different repo': [{ ...evidence(), repo: 'other/repo' }],
+        'different PR': [{ ...evidence(), pr: 99 }],
+      };
+      const readComments = vi.fn();
+      enrichPrsWithReferralHolds([pr({ comments: comments() })], {
+        repo, readRuns: () => rows[mismatch], readComments,
+      });
+      expect(readComments).not.toHaveBeenCalled();
+    });
+
+  it('keeps the truncated thread and hold when the full read throws', () => {
+    const p = pr({ comments: comments() });
+    const readComments = vi.fn(() => { throw new Error('read failed'); });
+    const [enriched] = enrichPrsWithReferralHolds([p], {
+      repo, readRuns: () => [evidence()], readComments,
+    });
+    expect(readComments).toHaveBeenCalledOnce();
+    expect(enriched.comments).toBe(p.comments);
+    expect(enriched.referralHold).not.toBeNull();
+  });
+});
+
 describe('one visible pause notice', () => {
   it('posts/logs once with a persistent receipt, even with a stale comment snapshot', () => {
     const dir = temp(), post = vi.fn(), log = vi.fn();
@@ -250,5 +304,106 @@ describe('one visible pause notice', () => {
     }
     notifyReferralHold({ ...args, dir: retryDir, post: unsent, now });
     expect(unsent).toHaveBeenCalledTimes(4);
+  });
+});
+
+
+describe('same-head review loop regression (live #202)', () => {
+  it('counts only finding keys and holds attempted referrals with a missing author stamp', () => {
+    const r = run();
+    r.findings.referralVerdict.pendingReferrals.push('author-stamp-missing');
+    const row = reviewRunEvidence(r);
+    expect(Object.isFrozen(PENDING_REASON_TOKENS)).toBe(true);
+    expect(PENDING_REASON_TOKENS.has('author-stamp-missing')).toBe(true);
+    expect(row).toMatchObject({ attempted: true, count: 1, parked: true });
+    expect(hold(pr(), [row])).not.toBeNull();
+  });
+  it.each(['referral-persistence-failed', 'malformed-referral-record', 'unreadable-referral-result'])
+    ('preserves the failure token %s', token => {
+      const r = run();
+      r.findings.referralVerdict.pendingReferrals = [token, 'author-stamp-missing'];
+      expect(reviewRunEvidence(r)).toMatchObject({ attempted: false, count: 1, parked: true,
+        persistenceFailed: token === 'referral-persistence-failed' });
+    });
+  it('holds a completed head, but releases for a trusted re-arm or new head', () => {
+    const rows = [{ ...evidence(), parked: false }];
+    const decided = decideSameHeadHold(pr(), rows, { repo, env: {} });
+    expect(decided).toMatchObject({ kind: 'same-head', head, count: 1, retryAt: null,
+      persistenceFailed: false, exhausted: false });
+    expect(decided.why).toMatch(/^review paused:/);
+    expect(decideSameHeadHold(pr({ comments: [comment(REARM_COMMENT_MARKER)] }), rows, { repo })).toBeNull();
+    expect(decideSameHeadHold(pr({ headRefOid: 'b'.repeat(40) }), rows, { repo })).toBeNull();
+    expect(decideSameHeadHold(pr({ number: 99 }), rows, { repo })).toBeNull();
+    expect(decideSameHeadHold(pr(), rows, { repo: 'other/repo' })).toBeNull();
+    expect(enrichPrsWithReferralHolds([pr()], { repo, readRuns: () => rows })[0].referralHold.kind).toBe('same-head');
+  });
+  it('respects the cap and leaves persistence retries to the referral hold', () => {
+    expect(decideSameHeadHold(pr(), [evidence()], { repo, env: { WE_REVIEW_SAME_HEAD_MAX_REVIEWS: '0' } })).toBeNull();
+    const rows = [evidence(), evidence({ time: at + 120_000 })];
+    expect(decideSameHeadHold(pr(), rows, { repo, env: { WE_REVIEW_SAME_HEAD_MAX_REVIEWS: '3' } })).toBeNull();
+    expect(decideSameHeadHold(pr(), [evidence({ failure: true })], { repo })).toBeNull();
+    for (const value of [undefined, '', 'junk', '-1', '1.5', '3oops']) {
+      expect(resolveSameHeadMaxReviews({ WE_REVIEW_SAME_HEAD_MAX_REVIEWS: value })).toBe(1);
+    }
+    expect(resolveSameHeadMaxReviews({ WE_REVIEW_SAME_HEAD_MAX_REVIEWS: '3' })).toBe(3);
+  });
+  // Review round 1, finding 2: a pending list of reason tokens only must not read as "attempted, 0 referrals".
+  it.each([
+    ['token only', ['author-stamp-missing'], { attempted: false, count: 0 }],
+    ['key only', [key], { attempted: true, count: 1 }],
+    ['token and key', ['author-stamp-missing', key], { attempted: true, count: 1 }],
+    ['empty', [], { attempted: false, count: 0, parked: false }],
+  ])('classifies a %s pending list', (_, pending, expected) => {
+    const r = run();
+    r.findings.referralVerdict.pendingReferrals = pending;
+    r.verdict = r.findings.referralVerdict;
+    if (!pending.includes(key)) r.findings.mandatoryReferrals.effects[0].result.records = [];
+    expect(reviewRunEvidence(r)).toMatchObject(expected);
+  });
+  it('a token-only parked run never produces a "0 referrals" hold', () => {
+    const r = run();
+    r.findings.referralVerdict.pendingReferrals = ['author-stamp-missing'];
+    r.verdict = r.findings.referralVerdict;
+    r.findings.mandatoryReferrals.effects[0].result.records = [];
+    expect(hold(pr(), [reviewRunEvidence(r)])).toBeNull();
+  });
+  // Review round 1, finding 1: the referral hold's deliberate live release must not be re-held by the same-head guard.
+  it('does not re-hold a PR whose referrals were ruled in the live thread before the parked run started', () => {
+    const r = record();
+    r.rulings = [{ id: 'r1', key, reviewerId: r.reviewer.id, lens: r.reviewer.lens,
+      result: 'block', rationale: 'confirmed', evidence: ['diff'] }];
+    const p = pr({ comments: [comment(renderReferralRecord(r), at - 120_000)] });
+    expect(hold(p)).toBeNull();
+    expect(enrichPrsWithReferralHolds([p], { repo, now: at + 1, readRuns: () => [evidence()] })[0].referralHold).toBeNull();
+  });
+  it.each([
+    ['live gate not yet cleared', pr({ comments: [comment(renderReferralRecord(record()), at - 120_000)] }), 'referral'],
+    ['no referral evidence at all', pr(), 'referral'],
+  ])('still holds when %s', (_, p) => {
+    expect(enrichPrsWithReferralHolds([p], { repo, now: at + 1, readRuns: () => [evidence()] })[0].referralHold)
+      .not.toBeNull();
+  });
+  it('a wake event after the parked run releases the PR through the enricher too', () => {
+    const p = pr({ comments: [comment(REARM_COMMENT_MARKER, at + 1)] });
+    // The completed run started before the wake event, so neither guard holds a fresh review back.
+    expect(enrichPrsWithReferralHolds([p], { repo, now: at + 2, readRuns: () => [evidence()] })[0].referralHold).toBeNull();
+  });
+  it('an elapsed persistence-failure retry releases the PR through the enricher too', () => {
+    const rows = [evidence({ failure: true })];
+    const early = enrichPrsWithReferralHolds([pr()], { repo, now: at + 1, readRuns: () => rows })[0].referralHold;
+    expect(early).toMatchObject({ persistenceFailed: true });
+    const late = enrichPrsWithReferralHolds([pr()], { repo, now: at + REFERRAL_RETRY_MS[0] + 1, readRuns: () => rows })[0].referralHold;
+    expect(late).toBeNull();
+  });
+  it('still applies the same-head guard when the referral hold returns null for a non-release reason', () => {
+    const rows = [{ ...evidence(), parked: false }];
+    expect(enrichPrsWithReferralHolds([pr()], { repo, now: at + 1, readRuns: () => rows })[0].referralHold.kind)
+      .toBe('same-head');
+  });
+  it('posts no extra notice for a same-head hold', () => {
+    const post = vi.fn(), log = vi.fn();
+    notifyReferralHold({ repo, prNumber: 3481, hold: { ...hold(), kind: 'same-head' }, dir: temp(), post, log });
+    expect(post).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
   });
 });
