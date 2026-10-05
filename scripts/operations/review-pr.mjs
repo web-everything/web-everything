@@ -2486,11 +2486,14 @@ export function reviewPrOperation({
     // gets past). On a PR that is NOT `humanRequired` this declares `[]`, which `advance` resolves INLINE with
     // no suspend at all (`step-kinds.mjs`'s effect case) — so the `review:pending` path is byte-identical to
     // before this step existed: nothing happens here, exactly as nothing happened here before.
+    // Live #202 loop: pending referrals still need a visible advisory and label when the panel parks.
+    // Only an explicit WE_REVIEW_ADVISE_ON_PENDING_REFERRALS=0 restores the old silent skip.
     advise: effectStep({
       reads: ['input.pr', 'input.repo', 'findings.read', 'verdict'],
       effects: (view) => {
         const read = view.findings.read;
-        if (read.humanRequired !== true || view.verdict.pendingReferrals?.length) return [];
+        if (read.humanRequired !== true) return [];
+        if (view.verdict.pendingReferrals?.length && process.env.WE_REVIEW_ADVISE_ON_PENDING_REFERRALS === '0') return [];
         const effects = [{
           type: REVIEW_EFFECTS.ADVISORY_NOTE,
           payload: {

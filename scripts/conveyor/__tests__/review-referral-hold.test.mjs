@@ -9,7 +9,7 @@ import { runReconcilePass } from '../reconcile-pass.mjs';
 import { countFindings } from '../reconcile-core.mjs';
 import {
   reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
-  notifyReferralHold, REFERRAL_RETRY_MS,
+  notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
 } from '../review-referral-hold.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -187,5 +187,53 @@ describe('one visible pause notice', () => {
     }
     notifyReferralHold({ ...args, dir: retryDir, post: unsent, now });
     expect(unsent).toHaveBeenCalledTimes(4);
+  });
+});
+
+
+describe('same-head review loop regression (live #202)', () => {
+  it('counts only finding keys and holds attempted referrals with a missing author stamp', () => {
+    const r = run();
+    r.findings.referralVerdict.pendingReferrals.push('author-stamp-missing');
+    const row = reviewRunEvidence(r);
+    expect(Object.isFrozen(PENDING_REASON_TOKENS)).toBe(true);
+    expect(PENDING_REASON_TOKENS.has('author-stamp-missing')).toBe(true);
+    expect(row).toMatchObject({ attempted: true, count: 1, parked: true });
+    expect(hold(pr(), [row])).not.toBeNull();
+  });
+  it.each(['referral-persistence-failed', 'malformed-referral-record', 'unreadable-referral-result'])
+    ('preserves the failure token %s', token => {
+      const r = run();
+      r.findings.referralVerdict.pendingReferrals = [token, 'author-stamp-missing'];
+      expect(reviewRunEvidence(r)).toMatchObject({ attempted: false, count: 1, parked: true,
+        persistenceFailed: token === 'referral-persistence-failed' });
+    });
+  it('holds a completed head, but releases for a trusted re-arm or new head', () => {
+    const rows = [{ ...evidence(), parked: false }];
+    const decided = decideSameHeadHold(pr(), rows, { repo, env: {} });
+    expect(decided).toMatchObject({ kind: 'same-head', head, count: 1, retryAt: null,
+      persistenceFailed: false, exhausted: false });
+    expect(decided.why).toMatch(/^review paused:/);
+    expect(decideSameHeadHold(pr({ comments: [comment(REARM_COMMENT_MARKER)] }), rows, { repo })).toBeNull();
+    expect(decideSameHeadHold(pr({ headRefOid: 'b'.repeat(40) }), rows, { repo })).toBeNull();
+    expect(decideSameHeadHold(pr({ number: 99 }), rows, { repo })).toBeNull();
+    expect(decideSameHeadHold(pr(), rows, { repo: 'other/repo' })).toBeNull();
+    expect(enrichPrsWithReferralHolds([pr()], { repo, readRuns: () => rows })[0].referralHold.kind).toBe('same-head');
+  });
+  it('respects the cap and leaves persistence retries to the referral hold', () => {
+    expect(decideSameHeadHold(pr(), [evidence()], { repo, env: { WE_REVIEW_SAME_HEAD_MAX_REVIEWS: '0' } })).toBeNull();
+    const rows = [evidence(), evidence({ time: at + 120_000 })];
+    expect(decideSameHeadHold(pr(), rows, { repo, env: { WE_REVIEW_SAME_HEAD_MAX_REVIEWS: '3' } })).toBeNull();
+    expect(decideSameHeadHold(pr(), [evidence({ failure: true })], { repo })).toBeNull();
+    for (const value of [undefined, '', 'junk', '-1', '1.5', '3oops']) {
+      expect(resolveSameHeadMaxReviews({ WE_REVIEW_SAME_HEAD_MAX_REVIEWS: value })).toBe(1);
+    }
+    expect(resolveSameHeadMaxReviews({ WE_REVIEW_SAME_HEAD_MAX_REVIEWS: '3' })).toBe(3);
+  });
+  it('posts no extra notice for a same-head hold', () => {
+    const post = vi.fn(), log = vi.fn();
+    notifyReferralHold({ repo, prNumber: 3481, hold: { ...hold(), kind: 'same-head' }, dir: temp(), post, log });
+    expect(post).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
   });
 });

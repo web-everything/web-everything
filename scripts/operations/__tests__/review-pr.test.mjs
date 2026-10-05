@@ -3832,3 +3832,22 @@ describe('xfkqowg historical ruling replay', () => {
     expect(assertMandatoryReferralsCleared(state, { repo: last.repo, pr: last.pr }).pending).toEqual([]);
   });
 });
+
+
+describe('pending-referral advisory (live #202)', () => {
+  it.each([undefined, '0'])('declares the advisory unless explicitly disabled (%s)', async setting => {
+    vi.stubEnv('WE_REVIEW_ADVISE_ON_PENDING_REFERRALS', setting);
+    try {
+      const { declaration } = registryFor({ labels: ['review:human', 'review:awaiting-advisory'], netRev: 'a'.repeat(40) });
+      const readStep = declaration.steps.find(s => s.name === 'read').step;
+      const read = await readStep.fn({ input: BASE_INPUT });
+      const advise = declaration.steps.find(s => s.name === 'advise').step;
+      const effects = advise.effects({ input: BASE_INPUT, findings: { read },
+        verdict: { verdict: 'needs-human', findings: [], pendingReferrals: ['finding-key'],
+          lensVerdicts: { [DEFAULT_LENS]: 'accept', [SECURITY_LENS]: 'accept' } } });
+      expect(effects.map(e => e.type)).toEqual(setting === '0' ? [] : [
+        REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.AWAITING_ADVISORY_CLEAR, REVIEW_EFFECTS.ADVISORY_LABEL,
+      ]);
+    } finally { vi.unstubAllEnvs(); }
+  });
+});

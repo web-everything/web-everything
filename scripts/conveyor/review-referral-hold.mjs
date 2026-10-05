@@ -15,6 +15,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
+export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing']));
 export const REFERRAL_RETRY_MS = [15, 30, 60].map(n => n * 60_000);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -31,14 +32,15 @@ export function reviewRunEvidence(run) {
   if (!sha(head) || !Number.isFinite(completedAt) || !Number.isFinite(startedAt)) return null;
   const state = run.findings?.mandatoryReferrals?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
   const pending = verdict?.pendingReferrals ?? [];
+  const findingKeys = pending.filter(key => !PENDING_REASON_TOKENS.has(key));
   const attempted = new Set((state?.records ?? [])
     .filter(r => r.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
     .flatMap(r => r.referrals.map(f => f.key)));
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
-    pending, attempted: pending.every(key => attempted.has(key)),
+    pending, attempted: findingKeys.every(key => attempted.has(key)),
     persistenceFailed: pending.includes('referral-persistence-failed'),
-    count: pending.includes('referral-persistence-failed') ? Math.max(1, verdict?.referrals?.length ?? 0) : pending.length,
+    count: pending.includes('referral-persistence-failed') ? Math.max(1, verdict?.referrals?.length ?? 0) : findingKeys.length,
     rulings: (state?.records ?? []).flatMap(r => r.rulings ?? []).map(r => JSON.stringify(r)),
   };
 }
@@ -119,9 +121,34 @@ export function decideReferralHold(pr, runs, { repo, now = Date.now(), env = pro
     why, retryAt, persistenceFailed: last.persistenceFailed, exhausted: last.persistenceFailed && retryAt === null };
 }
 
+/** One completed review per head/re-arm by default; persistence retries have their own budget. */
+export function resolveSameHeadMaxReviews(env = process.env) {
+  const value = env.WE_REVIEW_SAME_HEAD_MAX_REVIEWS;
+  if (value === '0') return 0;
+  const max = Number(value);
+  return /^\d+$/.test(value ?? '') && Number.isSafeInteger(max) && max > 0 ? max : 1;
+}
+
+export function decideSameHeadHold(pr, runs, { repo, env = process.env } = {}) {
+  const max = resolveSameHeadMaxReviews(env);
+  if (max === 0) return null;
+  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)
+    .sort((a, b) => b.completedAt - a.completedAt);
+  const last = history[0];
+  if (!last || last.persistenceFailed) return null;
+  const wake = wakeTime(pr, last);
+  const count = history.filter(r => r.startedAt >= wake).length;
+  if (count < max) return null;
+  const head = pr.headRefOid;
+  const why = `${REFERRAL_HOLD_MARKER} head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`;
+  return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count,
+    why, retryAt: null, persistenceFailed: false, exhausted: false };
+}
+
 export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRuns = readReviewRunEvidence } = {}) {
   const runs = readRuns();
-  return prs.map(pr => ({ ...pr, referralHold: decideReferralHold(pr, runs, { repo, now }) }));
+  return prs.map(pr => ({ ...pr, referralHold: decideReferralHold(pr, runs, { repo, now })
+    ?? decideSameHeadHold(pr, runs, { repo }) }));
 }
 
 /** Reserve before sending: an ambiguous transport failure must not create duplicate comments on every tick.
@@ -133,6 +160,7 @@ export function notifyReferralHold({ repo, prNumber, hold, comments = [],
   post = body => execFileSyncThrottled('gh', ['pr', 'comment', String(prNumber), '--repo', repo, '--body', body],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }),
 }) {
+  if (hold.kind === 'same-head') return;
   const marker = `<!-- review-referral-hold: ${hold.episode} -->`;
   const path = join(dir, `${hash([repo, prNumber, hold.episode])}.json`);
   mkdirSync(dir, { recursive: true });
