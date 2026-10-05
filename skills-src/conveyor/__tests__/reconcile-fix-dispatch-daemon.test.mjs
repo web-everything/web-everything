@@ -250,6 +250,18 @@ describe('buildCliDaemonEffects — the real-effect factory (heartbeat wiring on
 
 // #x0mn6x0 (epic #4075/#3383) — the shared per-refusal-line formatter `onTick` uses for BOTH populations.
 describe('formatRefusalLine — one printable line per refusal, whatever layer produced it', () => {
+  it('names the live-process holder with its pid and cwd (#5143)', () => {
+    expect(formatRefusalLine('reconcile-refused', {
+      kind: 'live-process', prNumber: 3794, repo: 'we',
+      why: 'a bound session has a LIVE pid', name: 'review-3794', pid: 12345, cwd: '/pool/lane-8',
+    })).toBe('reconcile-fix-dispatch-daemon: reconcile-refused live-process we PR #3794 — a bound session has a LIVE pid [name=review-3794 pid=12345 cwd=/pool/lane-8]');
+  });
+
+  it('uses readable placeholders for missing live-process holder fields', () => {
+    expect(formatRefusalLine('reconcile-refused', { kind: 'live-process', pr: 3794, repo: 'we' }))
+      .toBe('reconcile-fix-dispatch-daemon: reconcile-refused live-process we PR #3794 — (no reason given) [name=? pid=absent cwd=?]');
+  });
+
   it('reads pr OR prNumber (the two field names actually used across the fix/ci-heal/reconcile layers)', () => {
     expect(formatRefusalLine('refused', { kind: 'no-lane', pr: 5, repo: 'we', why: 'no free lane' }))
       .toBe('reconcile-fix-dispatch-daemon: refused no-lane we PR #5 — no free lane');

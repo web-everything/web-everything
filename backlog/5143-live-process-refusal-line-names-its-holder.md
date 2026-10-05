@@ -2,7 +2,7 @@
 bornAs: xx6rdcl
 kind: task
 status: open
-scope: ["we:scripts/"]
+scope: ["we:skills-src/conveyor/"]
 dateOpened: "2026-10-05"
 tags: []
 ---
@@ -13,6 +13,6 @@ formatRefusalLine omits the bound session name, pid and cwd. On #3794 the bound 
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+1. **Executable** — `npm run test:unit -- reconcile-fix-dispatch-daemon` runs `we:skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon.test.mjs` and proves live-process refusal lines include the supplied name, pid and cwd, with readable placeholders for missing holder fields.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
