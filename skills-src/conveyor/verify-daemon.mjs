@@ -52,7 +52,8 @@
  */
 
 import { hostname } from 'node:os';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
@@ -65,6 +66,12 @@ import { runVerifyDispatch } from '../../scripts/conveyor/verify-dispatch.mjs';
  *  and Review daemons' own keys (#3870, #3876), so none of them ever contend on the same lock dir (#3877).
  *  UNLIKE those two, this key gates real correctness, not just efficiency — see the file header. */
 export const VERIFY_DAEMON_LEASE_KEY = '<conveyor:verify-daemon-lease>';
+
+/** DRAIN marker (2026-10-05): while this file exists the daemon dispatches NO new gate but keeps ticking, so the
+ *  gates already in flight finish and settle their markers. Once a tick logs `in flight 0 (draining)` the job can
+ *  be booted out and bootstrapped (the only way launchd picks up plist env changes) without orphaning a `running`
+ *  marker. Remove the file to resume dispatch. */
+export const VERIFY_DAEMON_DRAIN_FILE = process.env.WE_VERIFY_DAEMON_DRAIN_FILE || join(RUNNER_LOCK_ROOT, 'verify-daemon.drain');
 
 /** Matches runner.mjs's own tick cadence (DEFAULT_TICK_INTERVAL_MS) and every sibling daemon in this epic —
  *  standing alone, there is no reason to run this pass faster or slower. */
@@ -234,7 +241,7 @@ export function startIndependentHeartbeat({
  *  {@link startIndependentHeartbeat} timer (#4130 — no longer built in here, since the heartbeat must run on
  *  its own clock, independent of this factory's caller). Kept as its own factory (mirroring
  *  `buildCliDaemonEffects` in the sibling daemons) so `main()` stays a thin wire-up. */
-export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAlive = () => true, log = console, runVerify = runVerifyDispatch } = {}) {
+export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAlive = () => true, log = console, runVerify = runVerifyDispatch, isDraining = () => existsSync(VERIFY_DAEMON_DRAIN_FILE) } = {}) {
   const inFlight = new Map();
   // `awaitSettle:false` returns before any gate settles, so `result.failures` is always empty here: failures
   // arrive later through `onSettled`, are logged as they land, and the next tick summary counts them.
@@ -246,12 +253,14 @@ export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAliv
   return {
     inFlight,
     intervalMs,
-    tickOnce: () => runVerifyTick({ runVerify, inFlight, awaitSettle: false, onSettled }),
+    tickOnce: () => (isDraining()
+      ? { dispatched: [], deferred: [], failures: [], draining: true }
+      : runVerifyTick({ runVerify, inFlight, awaitSettle: false, onSettled })),
     sleep: realSleep,
     isAlive,
     onTick: (result) => {
-      const { dispatched = [], deferred = [] } = result || {};
-      log.error(`verify-daemon: tick — dispatched ${dispatched.length}, in flight ${inFlight.size}, deferred ${deferred.length}, failed ${settledFailures}`);
+      const { dispatched = [], deferred = [], draining = false } = result || {};
+      log.error(`verify-daemon: tick — dispatched ${dispatched.length}, in flight ${inFlight.size}${draining ? ' (draining)' : ''}, deferred ${deferred.length}, failed ${settledFailures}`);
       settledFailures = 0;
     },
     onTickError: (error) => {
