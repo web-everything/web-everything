@@ -82,6 +82,17 @@ describe('ignoredRulings', () => {
     const unrelated = [...history, comment(record({ head: H2, runId: 'run-2', summary: 'button colour contrast is too low in dark theme' }), 20)];
     expect(ignoredRulings({ headRefOid: H2, comments: unrelated })).toBeNull();
   });
+  // plateau-app #202, 2026-10-04: a reviewer block on head 1 was overruled by the operator's not-real on head 2;
+  // the finding coming back on head 3 is not an ignored ruling, and must not raise advisory:ruling-needed.
+  it('is quiet when a later structured operator ruling overruled the earlier block', () => {
+    const r2 = record({ head: H2, runId: 'run-2' });
+    const overrule = buildOperatorRulingComment({ version: 1, repo, pr: r2.pr, head: H2, actor: 'chalbert',
+      channel: 'test', reason: 'fixed', at: t(12), clearerId: '',
+      rulings: [{ runId: r2.runId, key: r2.referrals[0].key, result: 'not-real' }] });
+    const comments = [...history, comment(r2, 10), { body: overrule, author: { login: 'chalbert' }, createdAt: t(12) },
+      comment(record({ head: H3, runId: 'run-3' }), 20)];
+    expect(ignoredRulings({ headRefOid: H3, comments })).toBeNull();
+  });
   it('is quiet when the earlier ruling was not block (card / not-real)', () => {
     const rulingCard = [comment(record({ head: H1, runId: 'run-1' }), 1),
       comment(record({ head: H1, runId: 'run-1', rulings: [{ result: 'not-real' }] }), 3),
