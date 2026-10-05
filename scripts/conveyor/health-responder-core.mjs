@@ -53,6 +53,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "pr-events-stale": "Existing polling fallback owns availability; no webhook/token/deployment edits.",
   "pr-stage-stall": "Cluster is not a per-PR action authorization; reuse inspections and specific episodes.",
   "review-label-missing": "A missing label is reported only; restoring review goes through the guarded re-arm command, never a responder label write.",
+  "review-same-head-unposted": "Alert only; inspect failed posting effects and the review caps, never re-arm or post a review from the responder.",
   "review-seat-cap-near-limit":"Low severity; report only, no provider/cap changes and no operator ping.",
   "ruling-needed-waiting": "A ruling is the operator's judgment; never record, infer or auto-answer one.",
   "self-sync-conflict": "Never force or hand-merge a clone/overlay from the responder.",
