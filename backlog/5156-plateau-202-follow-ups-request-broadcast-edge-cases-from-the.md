@@ -1,4 +1,5 @@
 ---
+bornAs: xnim2wm
 kind: story
 size: 3
 status: open
