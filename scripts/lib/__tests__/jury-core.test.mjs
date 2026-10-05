@@ -1,4 +1,4 @@
-import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, liveReferrals } from '../jury-core.mjs';
+import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, carrySummaryMatches, findCarriedOperatorRuling, findSupersedingNotReal, liveReferrals } from '../jury-core.mjs';
 import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER, REFERRAL_STAMP_POLICY_ENV, resolveReferralStampPolicy } from '../jury-core.mjs';
 /**
  * @file jury-core.test.mjs — proof of the #2654 (S2 of epic #2649) append-only JURY-LEDGER EVENT VOCABULARY:
@@ -1631,6 +1631,29 @@ describe('#4315 mandatory referral protocol', () => {
     const state = referralRecordState(r, { operatorRulings, cardReadable: () => true, stampPolicy: 'run-identity' });
     expect(state.blocked).toEqual(blocked ? [key] : []);
     expect(state.rulings.map(x => x.result)).toEqual([reviewerResult]);
+  });
+
+  // A carry lets an operator ruling clear the gate alone, so its summary match is stricter than the advisory
+  // supersede's (0.5 over the smaller word set): a different defect with a short, generic summary must not inherit it.
+  it.each([
+    ['exact normalized equality', 'Missing   NULL check on the parser', 'missing null check on the parser', true],
+    ['short generic summary, 1 of 2 words shared', 'missing check', 'missing guard', false],
+    ['half the words shared', 'parser drops trailing newline silently', 'parser rejects leading whitespace quietly', false],
+    ['high overlap over enough words', 'parser drops trailing newline silently here', 'parser drops trailing newline silently there', true],
+    ['too few words even at full overlap of the smaller set', 'drops newline', 'drops newline silently when parsing', false],
+    ['a short summary that is a subset of a long one', 'missing null check parser',
+      'missing null check parser when reading configuration files from remote storage during startup', false],
+    ['no words at all', '', 'anything', false],
+  ])('carry summary match — %s', (_name, a, b, matches) => {
+    expect(carrySummaryMatches(a, b)).toBe(matches);
+    // The carry lookup applies the same rule end to end.
+    const r = record(), key = r.referrals[0].key;
+    const old = { ...r, head: 'b'.repeat(40), runId: 'old', referrals: [{ ...r.referrals[0], finding: { ...r.referrals[0].finding, summary: a } }] };
+    old.referrals[0].key = key;
+    const operatorRulings = [{ head: old.head, repo: old.repo, pr: old.pr, runId: old.runId, key, result: 'not-real' }];
+    const referral = { finding: { ...old.referrals[0].finding, summary: b } };
+    const got = findCarriedOperatorRuling(referral, { records: [old], operatorRulings, head: r.head, repo: r.repo, pr: r.pr });
+    expect(got !== null).toBe(matches);
   });
 
   function supersession() {

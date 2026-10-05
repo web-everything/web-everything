@@ -1016,7 +1016,7 @@ describe('#xu2pp2m — `--cwd` decides which checkout the DIFF is read from', ()
   });
 });
 
-describe('changedLinesFromCompare (the compare payload → changed new-side lines)', () => {
+describe('changedLinesFromCompare (the compare payload → changed old-side and new-side lines)', () => {
   const patch = '@@ -1,2 +1,3 @@\n a\n+b\n c\n@@ -10 +20,2 @@\n-x\n+y\n+z\n';
   const file = (extra) => ({ filename: 'x.mjs', status: 'modified', patch, ...extra });
   it.each([
@@ -1024,7 +1024,6 @@ describe('changedLinesFromCompare (the compare payload → changed new-side line
     ['compare without a files array', undefined, null],
     ['hunks → the new-side lines of every hunk', [file()], [1, 2, 3, 20, 21]],
     ['single-line hunk counts one line', [file({ patch: '@@ -5 +7 @@\n-a\n+b\n' })], [7]],
-    ['file untouched by the compare → provably unchanged', [{ filename: 'other.mjs', patch }], []],
     ['300-file truncation → unknown', Array.from({ length: 300 }, (_, i) => ({ filename: `f${i}.mjs`, patch })), null],
     ['rename → unknown', [file({ status: 'renamed', previous_filename: 'old.mjs', filename: 'x.mjs' })], null],
     ['previous_filename match that is a rename → unknown', [file({ status: 'renamed', filename: 'y.mjs', previous_filename: 'x.mjs' })], null],
@@ -1036,7 +1035,37 @@ describe('changedLinesFromCompare (the compare payload → changed new-side line
     ['pure-deletion hunk still marks the region changed', [file({ patch: '@@ -5,3 +4,0 @@\n-a\n-b\n-c\n' })], [4]],
   ])('%s', (_name, files, expected) => {
     const got = changedLinesFromCompare(files, 'x.mjs');
-    expect(got === null ? null : [...got].sort((a, b) => a - b)).toEqual(expected);
+    expect(got === null ? null : [...got.new].sort((a, b) => a - b)).toEqual(expected);
+  });
+
+  it('keeps the OLD-side lines of every hunk apart from the new-side ones', () => {
+    // Deleting old lines 1–50 leaves new-side line 1 only; the old cited line 38 is in the OLD range.
+    const got = changedLinesFromCompare([file({ patch: '@@ -1,50 +0,0 @@\n-a\n' })], 'x.mjs');
+    expect([...got.new]).toEqual([0]);
+    expect(got.old.has(38) && got.old.size === 50).toBe(true);
+    // A pure insertion marks the old-side gap after `N`.
+    expect([...changedLinesFromCompare([file({ patch: '@@ -5,0 +6,2 @@\n+a\n+b\n' })], 'x.mjs').old]).toEqual([5]);
+  });
+
+  describe('a file ABSENT from the compare is unchanged only when it is a proven repo file', () => {
+    const files = [{ filename: 'src/lib/wip-read.ts', status: 'modified', patch }];
+    it.each([
+      ['a real repo file untouched by the compare', 'other.mjs', () => true, true],
+      ['no resolver supplied → unknown (fail-closed)', 'other.mjs', undefined, false],
+      ['the path does not resolve (a bare basename of a changed file)', 'wip-read.ts', () => false, false],
+      ['the resolver throws', 'other.mjs', () => { throw new Error('gh down'); }, false],
+      ['the resolver answers a truthy non-true value', 'other.mjs', () => 'yes', false],
+    ])('%s', (_name, cited, isRepoFile, proven) => {
+      const got = changedLinesFromCompare(files, cited, { isRepoFile });
+      if (proven) expect(got).toEqual({ old: new Set(), new: new Set() });
+      else expect(got).toBeNull();
+    });
+    it('does not ask the resolver for a file the compare lists, and a 300-file truncation never asks', () => {
+      const isRepoFile = vi.fn(() => true);
+      expect(changedLinesFromCompare(files, 'src/lib/wip-read.ts', { isRepoFile })).not.toBeNull();
+      expect(changedLinesFromCompare(Array.from({ length: 300 }, (_, i) => ({ filename: `f${i}.mjs`, patch })), 'x.mjs', { isRepoFile })).toBeNull();
+      expect(isRepoFile).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -1056,24 +1085,34 @@ describe('comparedFiles (a compare speaks for old→new only when old is an ance
 });
 
 describe('carryTouchesChange (the region a carried ruling spoke for)', () => {
+  const sides = ({ old = [], new: added = [] } = {}) => ({ old: new Set(old), new: new Set(added) });
   it.each([
-    ['change on the new line', [45], 38, 45, true],
-    ['change within the margin of the new line', [48], 38, 45, true],
-    ['change on the OLD line only (the rewritten region the operator ruled on)', [36], 38, 45, true],
-    ['change in the gap between the old and new lines', [41], 38, 45, true],
-    ['change beyond both margins', [10, 60], 38, 45, false],
-    ['no change', [], 38, 45, false],
-    ['no cited line + any change', [3], null, null, true],
-    ['no cited line + no change', [], null, null, false],
-    ['same line both sides', [20], 12, 12, false],
-    ['same line both sides, change at the margin', [15], 12, 12, true],
-  ])('%s', (_name, lines, oldLine, newLine, touched) => {
-    expect(carryTouchesChange(new Set(lines), oldLine, newLine)).toBe(touched);
+    ['change on the new line', { new: [45] }, 38, 45, true],
+    ['change within the margin of the new line', { new: [48] }, 38, 45, true],
+    ['change on the OLD line only (the rewritten region the operator ruled on)', { new: [36] }, 38, 45, true],
+    ['change in the gap between the old and new lines', { new: [41] }, 38, 45, true],
+    ['change beyond both margins', { new: [10, 60] }, 38, 45, false],
+    ['no change', {}, 38, 45, false],
+    ['no cited line + any change', { new: [3] }, null, null, true],
+    ['no cited line + an old-side-only change', { old: [3] }, null, null, true],
+    ['no cited line + no change', {}, null, null, false],
+    ['same line both sides', { new: [20] }, 12, 12, false],
+    ['same line both sides, change at the margin', { new: [15] }, 12, 12, true],
+    // The deletion shape: old lines 1–50 removed (new-side hunk is only `+0,0`), so the old cited line 38 is gone
+    // while a similar finding now sits at new line 38 (formerly 88). New-side coordinates alone cannot see that.
+    ['a deletion removes the old cited line, new finding at the same number', { old: Array.from({ length: 50 }, (_, i) => i + 1), new: [0] }, 38, 38, true],
+    ['an old-side change far from the old cited line', { old: [200] , new: [] }, 38, 38, false],
+    ['an old-side change at the margin of the old cited line', { old: [41] }, 38, 38, true],
+  ])('%s', (_name, changed, oldLine, newLine, touched) => {
+    expect(carryTouchesChange(sides(changed), oldLine, newLine)).toBe(touched);
   });
 });
 
 describe('#4315 durable referral effects', () => {
-  function harness({ result = 'not-real', failure, env = {}, readCompare, readChangedLines = readCompare ? undefined : () => new Set() } = {}) {
+  // The carry's changed-lines seam answers `{ old, new }` line sets (or null for unknown) — a bare Set is unknown.
+  const lineSets = ({ old = [], new: added = [] } = {}) => ({ old: new Set(old), new: new Set(added) });
+  function harness({ result = 'not-real', failure, env = {}, readCompare, fileExists = () => true,
+    readChangedLines = readCompare ? undefined : () => lineSets() } = {}) {
     const head = 'a'.repeat(40), trace = [], lines = [];
     let posts = 0;
     const state = { headRefOid: head, body: '<!-- authored-by-actor: author -->', comments: [], labels: ['review:pending'] };
@@ -1103,14 +1142,14 @@ describe('#4315 durable referral effects', () => {
           card: result === 'card' ? 'we:backlog/7-filed.md' : '',
         })) } };
     });
-    const make = () => createReviewPrSinks({ root, env, readChangedLines, readCompare, labelProvider: provider, referralJudge: judge,
+    const make = () => createReviewPrSinks({ root, env, readChangedLines, readCompare, fileExists, labelProvider: provider, referralJudge: judge,
       mirrorReferral: record => trace.push(`mirror:${record.attempted}`), out: line => lines.push(line), cardReadable: () => failure !== 'card' });
     return { state, trace, lines, payload, judge, make, provider };
   }
 
   it.each(['unchanged', 'changed', 'unknown', 'disabled'])('carries an earlier operator ruling only with unchanged lines: %s', async mode => {
     const h = harness({ failure: 'omitted', env: mode === 'disabled' ? { WE_REFERRAL_CARRY_OPERATOR_RULINGS: '0' } : {},
-      readChangedLines: () => mode === 'unknown' ? null : new Set(mode === 'changed' ? [12] : []) });
+      readChangedLines: () => mode === 'unknown' ? null : lineSets({ new: mode === 'changed' ? [12] : [] }) });
     h.payload.referrals[0].original.line = 12;
     const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
     const current = { ...old, head: h.state.headRefOid, runId: 'current',
@@ -1159,7 +1198,7 @@ describe('#4315 durable referral effects', () => {
     ['a rewrite of the new region only', [47], false],
     ['no change near either', [5, 90], true],
   ])('carries across an old/new line offset only when neither region changed: %s', async (_name, changed, carries) => {
-    const h = harness({ failure: 'omitted', readChangedLines: () => new Set(changed) });
+    const h = harness({ failure: 'omitted', readChangedLines: () => lineSets({ new: changed }) });
     const latest = await carryScenario(h, { oldLine: 38, newLine: 45 });
     // The earlier head's own finding is also carried onto this head (as its own record), so assert on `current`.
     const judged = h.judge.mock.calls.map(c => c[0].runId);
@@ -1183,6 +1222,56 @@ describe('#4315 durable referral effects', () => {
     else { expect(latest.carried).toBeUndefined(); expect(h.judge).toHaveBeenCalledOnce(); }
   });
 
+  // Through the DEFAULT compare reader: old lines 1–50 deleted removes the operator's cited line 38 while a similar
+  // finding now sits at new line 38 (formerly 88). The new-side hunk is `+0,0`, nowhere near 35–41.
+  it('does not carry when a deletion removes the old cited line', async () => {
+    const readCompare = () => ({ status: 'ahead', files: [{ filename: 'x.mjs', status: 'modified', patch: '@@ -1,50 +0,0 @@\n-a\n' }] });
+    const h = harness({ failure: 'omitted', readCompare });
+    const latest = await carryScenario(h, { oldLine: 38, newLine: 38 });
+    expect(latest.carried).toBeUndefined();
+    expect(h.judge).toHaveBeenCalledOnce();
+  });
+
+  it('carries when the deletion is far from both cited regions', async () => {
+    const readCompare = () => ({ status: 'ahead', files: [{ filename: 'x.mjs', status: 'modified', patch: '@@ -100,5 +99,0 @@\n-a\n' }] });
+    const h = harness({ failure: 'omitted', readCompare });
+    const latest = await carryScenario(h, { oldLine: 38, newLine: 38 });
+    expect(latest.carried).toHaveLength(1);
+    expect(h.judge).not.toHaveBeenCalled();
+  });
+
+  // The finding's `file` is free reviewer text. A string that is not a real repo file must read as unknown even
+  // though no compare entry matches it — the real file changed under its full path.
+  it.each([
+    ['a bare basename of the changed file', 'x.mjs', 'src/x.mjs', false],
+    ['the cited path is a real file the compare did not touch', 'x.mjs', 'x.mjs', true],
+  ])('an absent compare entry carries only for a proven repo file: %s', async (_name, cited, realPath, carries) => {
+    const readCompare = () => ({ status: 'ahead', files: [{ filename: 'src/x.mjs', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b\n' }] });
+    const h = harness({ failure: 'omitted', readCompare, fileExists: (_repo, _ref, path) => path === realPath });
+    h.payload.referrals[0].original.file = cited;
+    const latest = await carryScenario(h, { oldLine: 12, newLine: 12 });
+    if (carries) { expect(latest.carried).toHaveLength(1); expect(h.judge).not.toHaveBeenCalled(); }
+    else { expect(latest.carried).toBeUndefined(); expect(h.judge).toHaveBeenCalledOnce(); }
+  });
+
+  it('a path that exists at only one head is never proven unchanged', async () => {
+    const readCompare = () => ({ status: 'ahead', files: [{ filename: 'y.mjs', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b\n' }] });
+    const seen = [];
+    const h = harness({ failure: 'omitted', readCompare, fileExists: (_repo, ref) => { seen.push(ref); return ref === 'b'.repeat(40); } });
+    const latest = await carryScenario(h, { oldLine: 12, newLine: 12 });
+    expect(seen.length).toBeGreaterThan(0);
+    expect(latest.carried).toBeUndefined();
+  });
+
+  it('proves the path at BOTH heads before treating an absent compare entry as unchanged', async () => {
+    const readCompare = () => ({ status: 'ahead', files: [{ filename: 'y.mjs', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b\n' }] });
+    const seen = [];
+    const h = harness({ failure: 'omitted', readCompare, fileExists: (_repo, ref) => { seen.push(ref); return true; } });
+    const latest = await carryScenario(h, { oldLine: 12, newLine: 12 });
+    expect(new Set(seen)).toEqual(new Set(['a'.repeat(40), 'b'.repeat(40)]));
+    expect(latest.carried).toHaveLength(1);
+  });
+
   it('a failing compare call never carries', async () => {
     const h = harness({ failure: 'omitted', readCompare: () => { throw new Error('gh unavailable'); } });
     const latest = await carryScenario(h, { oldLine: 12, newLine: 12 });
@@ -1191,7 +1280,7 @@ describe('#4315 durable referral effects', () => {
   });
 
   it('never carries an operator ruling onto a finding the reviewer already ruled on this head', async () => {
-    const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    const h = harness({ failure: 'omitted', readChangedLines: () => lineSets() });
     h.payload.referrals[0].original.line = 12;
     const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
     const current = { ...old, head: h.state.headRefOid, runId: 'current',

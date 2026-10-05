@@ -487,33 +487,61 @@ export const CARRY_LINE_MARGIN = 3;
  */
 export function carryTouchesChange(changed, oldLine, newLine) {
   const cited = [oldLine, newLine].filter(Number.isInteger);
-  if (!cited.length) return changed.size > 0;
+  if (!cited.length) return changed.old.size > 0 || changed.new.size > 0;
   const lo = Math.min(...cited) - CARRY_LINE_MARGIN, hi = Math.max(...cited) + CARRY_LINE_MARGIN;
-  return [...changed].some(n => n >= lo && n <= hi);
+  // The two sides are different coordinate spaces (a deletion above shifts every later line), so each side's changed
+  // lines are checked on their own: old-side lines prove the old cited region survived, new-side lines the new one.
+  // The span is checked on both sides — over-rejecting only costs a fresh ruling, never a silent clearance.
+  const hit = (set) => [...set].some(n => n >= lo && n <= hi);
+  return hit(changed.old) || hit(changed.new);
+}
+
+/** Is `file` a plain file at `ref`? A missing path, a directory or any lookup failure is `false` (fail-closed). */
+export function fileExistsAtRef(repo, ref, file) {
+  try {
+    const path = file.split('/').map(encodeURIComponent).join('/');
+    const got = JSON.parse(execFileSyncThrottled('gh', ['api', `repos/${repo}/contents/${path}?ref=${ref}`],
+      { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }));
+    return !Array.isArray(got) && got?.type === 'file';
+  } catch { return false; }
 }
 
 /**
- * The new-side line numbers a GitHub compare (`files` array) changed in one file, or `null` when the compare
- * cannot PROVE which lines changed (missing/failed compare, a 300-file truncation, a rename, a missing or
- * hunk-less patch, a deleted file). `null` never clears anything: the caller treats it as "do not carry".
- * PURE — the `gh` call stays in the caller, so this parser is directly table-testable (#4315 review).
+ * The lines a GitHub compare (`files` array) changed in one file, as `{ old, new }` — the old-side and new-side line
+ * numbers of every hunk — or `null` when the compare cannot PROVE which lines changed (missing/failed compare, a
+ * 300-file truncation, a rename, a missing or hunk-less patch, a deleted file). `null` never clears anything: the
+ * caller treats it as "do not carry".
+ *
+ * A file ABSENT from the compare reads as "unchanged" only when `isRepoFile()` proves the cited string is a real
+ * file in the repo; the finding's `file` is free reviewer text (a basename, a `we:` path, a hallucinated name), and
+ * an unresolvable string must never match "nothing changed". With no `isRepoFile` the absent case is unknown.
+ * PURE — the `gh` calls stay in the caller, so this parser is directly table-testable (#4315 review).
  */
-export function changedLinesFromCompare(files, file) {
+export function changedLinesFromCompare(files, file, { isRepoFile } = {}) {
   if (!Array.isArray(files)) return null;
   const entry = files.find(f => f.filename === file || f.previous_filename === file);
-  if (!entry) return files.length >= 300 ? null : new Set();
+  if (!entry) {
+    if (files.length >= 300 || typeof isRepoFile !== 'function') return null;
+    let real = false;
+    try { real = isRepoFile() === true; } catch { real = false; }
+    return real ? { old: new Set(), new: new Set() } : null;
+  }
   // A deleted file has no new-side lines at all: an empty Set would read as "cited lines unchanged".
   if (entry.status === 'removed' || entry.status === 'renamed' || typeof entry.patch !== 'string' || !entry.patch) return null;
-  const lines = new Set();
+  const oldLines = new Set(), newLines = new Set();
   let hunks = 0;
-  for (const match of entry.patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
+  for (const match of entry.patch.matchAll(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm)) {
     hunks++;
-    const start = Number(match[1]), count = Number(match[2] ?? 1);
-    // A pure-deletion hunk (`+N,0`) has no new-side lines but still changed the region around `N`.
-    if (count === 0) lines.add(start);
-    for (let n = start; n < start + count; n++) lines.add(n);
+    const oldStart = Number(match[1]), oldCount = Number(match[2] ?? 1);
+    const start = Number(match[3]), count = Number(match[4] ?? 1);
+    // A pure-deletion hunk (`+N,0`) has no new-side lines but still changed the region around `N`; a
+    // pure-insertion hunk (`-N,0`) likewise marks the old-side gap after `N`.
+    if (count === 0) newLines.add(start);
+    for (let n = start; n < start + count; n++) newLines.add(n);
+    if (oldCount === 0) oldLines.add(oldStart);
+    for (let n = oldStart; n < oldStart + oldCount; n++) oldLines.add(n);
   }
-  return hunks ? lines : null;
+  return hunks ? { old: oldLines, new: newLines } : null;
 }
 
 /** Is this CLI error text one we can PROVE happened before any write? */
@@ -544,7 +572,8 @@ export function createReviewPrSinks({
   env = process.env,
   referralJudge = judgeSpawn,
   readChangedLines,
-  readCompare = (repo, base, head) => JSON.parse(execFileSyncThrottled('gh',
+  fileExists = fileExistsAtRef,
+  readCompare =(repo, base, head) => JSON.parse(execFileSyncThrottled('gh',
     ['api', `repos/${repo}/compare/${base}...${head}`],
     { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })),
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
@@ -589,7 +618,9 @@ export function createReviewPrSinks({
           try { comparisons.set(key, comparedFiles(readCompare(repo, base, head))); }
           catch { comparisons.set(key, null); }
         }
-        return changedLinesFromCompare(comparisons.get(key), file);
+        // Absent-from-compare means "unchanged" only for a path that is a real file at BOTH heads.
+        return changedLinesFromCompare(comparisons.get(key), file,
+          { isRepoFile: () => fileExists(repo, base, file) && fileExists(repo, head, file) });
       });
       const commentBudget = 60_000;
       const fresh = () => {
@@ -757,7 +788,8 @@ export function createReviewPrSinks({
                 const file = String(f.finding.file ?? '').trim().replace(/^(?:\.\/|[ab]\/)/, '').replace(/:\d+(?::\d+)?$/, '');
                 changed = await changedLines(record.repo, match.from.head, record.head, file);
               } catch { changed = null; }
-              if (!(changed instanceof Set)) continue;
+              // Both sides are required: a bare Set cannot say which coordinate space it is in, so it is unknown.
+              if (!(changed?.old instanceof Set && changed?.new instanceof Set)) continue;
               if (carryTouchesChange(changed, match.finding.line, f.finding.line)) continue;
               carried.push({ key: f.key, reason: REFERRAL_CARRY_REASON, from: match.from,
                 result: match.result, ...(match.card ? { card: match.card } : {}) });

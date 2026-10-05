@@ -2327,10 +2327,25 @@ export function findSupersedingNotReal(referral, { records = [], operatorRulings
   return null;
 }
 
+// A carry lets an operator ruling clear the gate by itself, so its summary match is stricter than the advisory
+// supersede's 0.5-over-the-smaller-set: exact normalized equality, or a high overlap over enough words that a short
+// generic summary ("missing check") can never inherit another defect's ruling by sharing half of two words.
+export const CARRY_MIN_WORD_OVERLAP = 0.8;
+export const CARRY_MIN_WORDS = 4;
+export function carrySummaryMatches(a, b) {
+  const norm = s => String(s ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+  if (norm(a) === norm(b)) return true;
+  const A = corroborationWords(a), B = corroborationWords(b);
+  if (A.size < CARRY_MIN_WORDS || B.size < CARRY_MIN_WORDS) return false;
+  // Over the LARGER set, unlike `wordOverlap`: a short summary that is a subset of a long one must not match it.
+  let hit = 0;
+  for (const w of A) if (B.has(w)) hit += 1;
+  return hit / Math.max(A.size, B.size) >= CARRY_MIN_WORD_OVERLAP;
+}
+
 /** Latest matching operator decision on an earlier head; the IO caller must prove unchanged cited lines. */
 export function findCarriedOperatorRuling(referral, { records = [], operatorRulings = [], head, repo, pr }) {
   const target = referral.finding;
-  const summary = s => String(s ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
   for (const o of [...operatorRulings].reverse()) {
     if (o.head === head || o.repo !== repo || o.pr !== pr) continue;
     const record = records.find(r => r.runId === o.runId && r.head === o.head && r.repo === repo && r.pr === pr);
@@ -2340,7 +2355,7 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
     if (!(finding.line == null && target.line == null)
       && !(Number.isInteger(finding.line) && Number.isInteger(target.line)
         && Math.abs(finding.line - target.line) <= CORROBORATION_LINE_WINDOW)) continue;
-    if (summary(finding.summary) !== summary(target.summary) && wordOverlap(finding.summary, target.summary) < 0.5) continue;
+    if (!carrySummaryMatches(finding.summary, target.summary)) continue;
     return { from: { head: o.head, runId: o.runId, key: o.key }, result: o.result, card: o.card, finding };
   }
   return null;
