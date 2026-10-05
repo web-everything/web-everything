@@ -11,15 +11,17 @@
  *   advancing (at least every 2 minutes) throughout, rather than lapsing mid-gate.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   runDaemonLoop, runVerifyTick, buildCliDaemonEffects, realSleep, cloneHeadChanged,
   startIndependentHeartbeat, DEFAULT_HEARTBEAT_INTERVAL_MS,
-  killInFlight, makeCodeChangedGuard, createCleanup, runDaemon,
+  reconcileInFlight, pidAlive, killInFlight, makeCodeChangedGuard, createCleanup, runDaemon,
   VERIFY_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS,
 } from '../verify-daemon.mjs';
+import { laneNeedsVerifyDispatch } from '../../../scripts/conveyor/verify-dispatch.mjs';
+import { VERIFY_FILENAME, verifyStartBody } from '../../../scripts/lib/lane-verify.mjs';
 import {
   acquireRunnerLease, heartbeatRunnerLease, runnerLeaseStatus, makeOwner,
 } from '../runner-lock.mjs';
@@ -546,5 +548,91 @@ describe('drain marker — stop new dispatch, let in-flight gates settle (2026-1
     effects.onTick(await effects.tickOnce());
     expect(runVerify).toHaveBeenCalledTimes(1);
     expect(log.error.mock.calls.at(-1)[0]).not.toContain('draining');
+  });
+});
+
+// #verify-inflight-reconcile — process exit must release a stuck close-event waiter.
+describe('in-flight PID reconciliation', () => {
+  const entry = (overrides = {}) => ({ pool: 'we', lane: 9, runId: '12345678-abcd', pid: 777,
+    sha: 'abc', startedMs: 1000, ...overrides });
+
+  it('drops a dead PID, kills its group, requeues and logs the orphan', () => {
+    const run = entry();
+    const inFlight = new Map([['lane', run]]);
+    const killGroup = vi.fn(); const requeue = vi.fn(); const log = vi.fn();
+    const result = reconcileInFlight(inFlight, { isAlive: () => false, killGroup, requeue, log });
+    expect(inFlight.size).toBe(0);
+    expect(killGroup).toHaveBeenCalledWith(-777);
+    expect(requeue).toHaveBeenCalledWith('lane', run);
+    expect(log).toHaveBeenCalledWith('verify-daemon: we/lane-9 in-flight run 12345678 orphaned (pid 777 gone) — dropped and re-queued');
+    expect(result).toEqual({ orphaned: [{ pool: 'we', lane: 9, runId: run.runId, pid: 777, reason: 'pid-gone' }] });
+  });
+
+  it('keeps a live PID even after the spawn grace', () => {
+    const inFlight = new Map([['lane', entry()]]);
+    const requeue = vi.fn(); const killGroup = vi.fn();
+    expect(reconcileInFlight(inFlight, { isAlive: () => true, nowMs: 999999, requeue, killGroup }).orphaned).toEqual([]);
+    expect(inFlight.size).toBe(1);
+    expect(requeue).not.toHaveBeenCalled(); expect(killGroup).not.toHaveBeenCalled();
+  });
+
+  it.each([null, 0])('allows the spawn grace for pid %s, then drops it', (pid) => {
+    const inFlight = new Map([['lane', entry({ pid })]]);
+    const killGroup = vi.fn(); const requeue = vi.fn(); const log = vi.fn();
+    expect(reconcileInFlight(inFlight, { nowMs: 121000, killGroup, requeue, log }).orphaned).toEqual([]);
+    expect(inFlight.size).toBe(1);
+    expect(reconcileInFlight(inFlight, { nowMs: 121001, killGroup, requeue, log }).orphaned[0].reason).toBe('never-spawned');
+    expect(inFlight.size).toBe(0);
+    expect(killGroup).not.toHaveBeenCalled(); expect(requeue).toHaveBeenCalledTimes(1);
+  });
+
+  it('pidAlive probes signal zero and treats EPERM as alive and ESRCH as dead', () => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      expect(pidAlive(777)).toBe(true);
+      expect(kill).toHaveBeenCalledWith(777, 0);
+      kill.mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
+      expect(pidAlive(777)).toBe(true);
+      kill.mockImplementation(() => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }); });
+      expect(pidAlive(777)).toBe(false);
+    } finally { kill.mockRestore(); }
+  });
+
+  it.each([true, false])('reconciles before draining/dispatch (draining=%s), despite effect failures', async (draining) => {
+    const log = { error: vi.fn() };
+    const runVerify = vi.fn(async ({ inFlight }) => {
+      expect(inFlight.size).toBe(0);
+      return { dispatched: [], deferred: [], failures: [] };
+    });
+    const effects = buildCliDaemonEffects({ log, runVerify, isDraining: () => draining,
+      processIsAlive: () => false, killGroup: () => { throw new Error('kill denied'); },
+      requeue: () => { throw new Error('disk full'); } });
+    effects.inFlight.set('lane', entry());
+    effects.onTick(await effects.tickOnce());
+    expect(effects.inFlight.size).toBe(0);
+    expect(runVerify).toHaveBeenCalledTimes(draining ? 0 : 1);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('disk full'));
+    expect(log.error).toHaveBeenLastCalledWith(`verify-daemon: tick — dispatched 0, in flight 0${draining ? ' (draining)' : ''}, deferred 0, failed 0, orphaned 1`);
+    expect(makeCodeChangedGuard({ inFlight: effects.inFlight, bootHead: 'a', readHead: () => 'b' })()).toBe(true);
+    effects.onTick(await effects.tickOnce());
+    expect(log.error).toHaveBeenLastCalledWith(`verify-daemon: tick — dispatched 0, in flight 0${draining ? ' (draining)' : ''}, deferred 0, failed 0`);
+  });
+
+  it.each(['owned', 'legacy', 'foreign', 'green', 'red', 'infrastructure-failure'])('default requeue preserves a %s marker', (kind) => {
+    const dir = mkdtempSync(join(tmpdir(), 'verify-reconcile-'));
+    try {
+      mkdirSync(join(dir, '.git'));
+      const marker = verifyStartBody({ sha: 'abc', suites: 'gate', startedAt: new Date().toISOString(),
+        runId: kind === 'legacy' ? undefined : kind === 'foreign' ? 'new-run' : '12345678-abcd' });
+      if (['green', 'red', 'infrastructure-failure'].includes(kind)) marker.status = kind;
+      const file = join(dir, '.git', VERIFY_FILENAME);
+      const bytes = JSON.stringify(marker);
+      writeFileSync(file, bytes);
+      const inFlight = new Map([[dir, entry()]]);
+      reconcileInFlight(inFlight, { isAlive: () => false, killGroup: vi.fn(), log: vi.fn() });
+      expect(inFlight.size).toBe(0);
+      expect(readFileSync(file, 'utf8')).toBe(bytes);
+      expect(laneNeedsVerifyDispatch(JSON.parse(readFileSync(file, 'utf8')), 'abc')).toBe(marker.status === 'running');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
