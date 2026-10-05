@@ -2186,6 +2186,35 @@ describe('case 5h — real web-everything/web-everything#2549 shape (measured 20
   });
 });
 
+// #3794 live case, 2026-10-04.
+describe('main-fixed signature before the heal cap', () => {
+  const window = { from: '2026-10-05T00:00:00Z', to: '2026-10-05T01:44:46Z' };
+  const comments = Array.from({ length: 3 }, () => ({
+    body: CI_HEAL_COMMENT_MARKER, author: AUTOMATION, createdAt: '2026-10-05T01:00:00Z',
+  }));
+  const pr = pr1563({ number: 3794, labels: [], statusCheckRollup: redRollup, comments,
+    aheadByOnMain: 3, requiredCheckName: 'test', requiredCheckCompletedAt: '2026-10-05T00:54:36Z' });
+  it('owes a rebase despite three spent heals; no facts preserves exhaustion', () => {
+    const mainFixedSignature = { signatures: [{ emitterFiles: ['scripts/check-standards.mjs'], fixCommits: ['e5c22481e'] }],
+      bugIntroducedAt: window.from, fixedAt: window.to };
+    const plan = planReconcile({ prs: [{ ...pr, mainFixedSignature }] });
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'owed-ci-rerun', why: expect.stringContaining('e5c22481e') })]);
+    expect(plan.notes.some((n) => n.kind === 'ci-heal-exhausted')).toBe(false);
+    expect(planReconcile({ prs: [pr] }).refusals[0].kind).toBe('cap-exhausted');
+  });
+  it('uses chargeable attempts after the rebase and exposes refunds; opt-out keeps the cap', () => {
+    const rebased = { ...pr, aheadByOnMain: 0, comments: [...comments, { author: AUTOMATION,
+      body: buildRebaseOntoMainComment({ attribution: 'main-fixed-signature', attributedWindow: window }),
+    }] };
+    expect(planReconcile({ prs: [rebased], ciHealBudgetRestore: true }).dispatch[0])
+      .toMatchObject({ kind: 'ci-heal', attempts: 0, refunded: 3 });
+    expect(planReconcile({ prs: [rebased], ciHealBudgetRestore: true, ciHealCap: 0 }).refusals[0])
+      .toMatchObject({ kind: 'cap-exhausted', attempts: 0, refunded: 3 });
+    expect(planReconcile({ prs: [rebased], ciHealBudgetRestore: false }).refusals[0])
+      .toMatchObject({ kind: 'cap-exhausted', attempts: 3 });
+  });
+});
+
 describe('case 5i — STACKED-BASE CONFLICT dispatch, a `conflicted` PR whose base is not `main` (#3383)', () => {
   // `web-everything/web-everything#2578`, shape measured live 2026-09-24: `review:accepted` (no `review:changes`, no
   // `review:human`), `mergeStateStatus: DIRTY`/`mergeable: CONFLICTING` (`classifyPr` reads `conflicted`), base
@@ -3500,31 +3529,3 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
   });
 });
 
-// #3794 live case, 2026-10-04.
-describe('main-fixed signature before the heal cap', () => {
-  const window = { from: '2026-10-05T00:00:00Z', to: '2026-10-05T01:44:46Z' };
-  const comments = Array.from({ length: 3 }, () => ({
-    body: CI_HEAL_COMMENT_MARKER, author: AUTOMATION, createdAt: '2026-10-05T01:00:00Z',
-  }));
-  const pr = pr1563({ number: 3794, labels: [], statusCheckRollup: redRollup, comments,
-    aheadByOnMain: 3, requiredCheckName: 'test', requiredCheckCompletedAt: '2026-10-05T00:54:36Z' });
-  it('owes a rebase despite three spent heals; no facts preserves exhaustion', () => {
-    const mainFixedSignature = { signatures: [{ emitterFiles: ['scripts/check-standards.mjs'], fixCommits: ['e5c22481e'] }],
-      bugIntroducedAt: window.from, fixedAt: window.to };
-    const plan = planReconcile({ prs: [{ ...pr, mainFixedSignature }] });
-    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'owed-ci-rerun', why: expect.stringContaining('e5c22481e') })]);
-    expect(plan.notes.some((n) => n.kind === 'ci-heal-exhausted')).toBe(false);
-    expect(planReconcile({ prs: [pr] }).refusals[0].kind).toBe('cap-exhausted');
-  });
-  it('uses chargeable attempts after the rebase and exposes refunds; opt-out keeps the cap', () => {
-    const rebased = { ...pr, aheadByOnMain: 0, comments: [...comments, { author: AUTOMATION,
-      body: buildRebaseOntoMainComment({ attribution: 'main-fixed-signature', attributedWindow: window }),
-    }] };
-    expect(planReconcile({ prs: [rebased], ciHealBudgetRestore: true }).dispatch[0])
-      .toMatchObject({ kind: 'ci-heal', attempts: 0, refunded: 3 });
-    expect(planReconcile({ prs: [rebased], ciHealBudgetRestore: true, ciHealCap: 0 }).refusals[0])
-      .toMatchObject({ kind: 'cap-exhausted', attempts: 0, refunded: 3 });
-    expect(planReconcile({ prs: [rebased], ciHealBudgetRestore: false }).refusals[0])
-      .toMatchObject({ kind: 'cap-exhausted', attempts: 3 });
-  });
-});
