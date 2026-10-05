@@ -231,3 +231,15 @@ it('defaultLaunch must be a boolean when present, and false excludes only from t
 it('does not register the dedicated heavy-run sampler as a pass', () => {
   expect(DAEMON_MANIFEST).not.toHaveProperty('heavy-run-sample');
 });
+
+describe('load-flake hold repositories have a reverify worker (PR #3945 advisory, round 3)', () => {
+  it('every repository allowed to record a load-flake hold is served by the registered reverify pass', async () => {
+    const { LOAD_FLAKE_REVERIFY_REPOS } = await import('../../../scripts/conveyor/stand-down.mjs');
+    const { REVERIFY_DEFAULT_REPO } = await import('../../../scripts/conveyor/load-flake-reverify.mjs');
+    const pass = DAEMON_MANIFEST['load-flake-reverify'];
+    expect(pass).toBeTruthy();
+    // The pass carries no --repo flag, so it sweeps the default repository only: that is the whole supported set.
+    expect(pass.args.some((a) => a.startsWith('--repo'))).toBe(false);
+    expect(LOAD_FLAKE_REVERIFY_REPOS).toEqual([REVERIFY_DEFAULT_REPO]);
+  });
+});

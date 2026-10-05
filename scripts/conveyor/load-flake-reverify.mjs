@@ -39,7 +39,10 @@ export function planLoadFlakeReverify({ prs = [], load, cores, now, config = rev
   return candidates.length ? { candidate: candidates[0], candidates } : { deferred: 'no-candidate' };
 }
 
-export async function runLoadFlakeReverify({ repo = 'we', dryRun = false, config = reverifyConfig() } = {}, io = defaultReverifyIo()) {
+/** The one repository the registered pass sweeps (the manifest entry has no --repo flag); see `LOAD_FLAKE_REVERIFY_REPOS`. */
+export const REVERIFY_DEFAULT_REPO = 'we';
+
+export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRun = false, config = reverifyConfig() } = {}, io = defaultReverifyIo()) {
   const now = io.now();
   const load = io.loadavg();
   const cores = io.cpuCount();
@@ -121,6 +124,10 @@ async function reverifyCandidate({ candidate, key, slug, config }, io) {
     }
     const verification = await io.verify(lane.path);
     if (!verification.ok) {
+      // Verify can run 40 minutes: a red result for a PR that moved, or whose hold ended, meanwhile is stale and must
+      // never post a terminal `exhausted` (or burn an attempt) against the current head.
+      refusal = await check();
+      if (refusal) return refusal;
       const result = attempts + 1 >= config.maxAttempts ? 'exhausted' : 'red-again';
       // Verify output is branch-authored text headed for a public comment: redact it, then cut.
       await post(result, redactSecrets(verification.summary ?? '').slice(-1500));
@@ -136,7 +143,8 @@ async function reverifyCandidate({ candidate, key, slug, config }, io) {
   }
 }
 
-/** The branch under verify is fixer-authored code: run it without the daemon's GitHub App credentials or any token. */
+/** The branch under verify is fixer-authored code: run it without the daemon's GitHub App credentials or any token.
+ *  HOME is kept (npm and git need it), so credentials already stored under it are NOT hidden from the verify child. */
 export function scrubVerifyEnv(env = process.env) {
   return Object.fromEntries(Object.entries(env).filter(([k]) => !/^WE_GITHUB_APP_|TOKEN|SECRET|PASSWORD|PRIVATE_KEY|CREDENTIAL/i.test(k)));
 }
@@ -165,7 +173,10 @@ export function defaultReverifyIo({ run = execFileSync, runVerification = runBou
       try { await runVerification(process.execPath, [resolve(root, 'scripts/verify-lane.mjs')], { cwd, env: scrubVerifyEnv(), timeoutMs: 40 * 60_000, maxBytes: 16 * 1024 * 1024 }); return { ok: true }; }
       catch (e) { return { ok: false, summary: `${e.stdout ?? ''}\n${e.stderr ?? ''}\n${e.message ?? ''}`.slice(-1500) }; }
     },
-    push: (cwd, sha, branch) => command('git', ['push', 'origin', `${sha}:refs/heads/${branch}`], { cwd }),
+    // Pushed from the daemon's own checkout, never the lane: the lane just ran fixer-authored code that could have
+    // planted hooks or git config there. `prepare` already fetched the saved commit into this checkout. Hooks are
+    // off, and a plain refspec (no force) means a non-fast-forward is refused.
+    push: (_laneCwd, sha, branch) => command('git', ['-c', 'core.hooksPath=/dev/null', 'push', '--no-verify', 'origin', `${sha}:refs/heads/${branch}`]),
     comment: (slug, pr, body) => command('gh', ['pr', 'comment', String(pr), '--repo', slug, '--body', body]),
   };
 }
@@ -174,6 +185,6 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const [action, ...args] = process.argv.slice(2);
   if (action !== 'sweep') throw new Error('usage: load-flake-reverify.mjs sweep [--repo=we] [--dry-run] [--max-load-per-core=N] [--json]');
   const flags = Object.fromEntries(args.map((a) => { const [k, ...v] = a.replace(/^--/, '').split('='); return [k, v.length ? v.join('=') : true]; }));
-  const result = await runLoadFlakeReverify({ repo: flags.repo ?? 'we', dryRun: !!flags['dry-run'], config: reverifyConfig(process.env, flags['max-load-per-core']) });
+  const result = await runLoadFlakeReverify({ repo: flags.repo ?? REVERIFY_DEFAULT_REPO, dryRun: !!flags['dry-run'], config: reverifyConfig(process.env, flags['max-load-per-core']) });
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }

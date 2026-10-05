@@ -78,7 +78,7 @@ describe('quiet-host reverify', () => {
   it('IO uses plain push, bounded verification and holder release', async () => {
     const run = vi.fn(() => ''); const runVerification = vi.fn(async () => ''); const io = defaultReverifyIo({ run, runVerification, root: '/repo' });
     io.push('/lane', 'bbb2222', 'lane/fix'); await io.verify('/lane'); io.release({ lane: 3, holder: 'owner' }, 'we');
-    expect(run.mock.calls[0][1]).toEqual(['push', 'origin', 'bbb2222:refs/heads/lane/fix']);
+    expect(run.mock.calls[0][1]).toEqual(['-c', 'core.hooksPath=/dev/null', 'push', '--no-verify', 'origin', 'bbb2222:refs/heads/lane/fix']);
     expect(runVerification.mock.calls[0][2]).toMatchObject({ cwd: '/lane', timeoutMs: 2400000 });
     expect(run.mock.calls[1][1]).toContain('--session=owner');
   });
@@ -173,5 +173,44 @@ describe('starvation, deleted alts and credentials (PR #3945 advisory)', () => {
     expect(loadFlakeHolds([mk('lane/fix-alt', 'bbb2222')])).toHaveLength(1);
     const forged = { ...mk('lane/fix-alt', 'bbb2222'), author: { login: 'stranger' } };
     expect(loadFlakeHolds([forged])).toEqual([]);
+  });
+});
+
+describe('stale verification and push isolation (PR #3945 advisory, round 3)', () => {
+  it.each(['red-again', 'exhausted'])('a red %s attempt on a PR that moved during verify posts head-moved, never a terminal result', async (kind) => {
+    const reds = kind === 'exhausted' ? [red('2026-10-04T19:00:00Z'), red('2026-10-04T20:00:00Z')] : [];
+    const { io, pr } = fixture(reds);
+    io.listPrs.mockResolvedValue([structuredClone(pr)]);
+    io.verify.mockImplementation(() => { pr.headRefOid = 'new'; return { ok: false, summary: 'timeout' }; });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'head-moved' });
+    expect(io.comment).toHaveBeenCalledTimes(1);
+    expect(io.comment.mock.calls[0][2]).toContain('result=head-moved');
+    expect(io.comment.mock.calls[0][2]).not.toContain('exhausted');
+    expect(io.release).toHaveBeenCalled(); expect(io.push).not.toHaveBeenCalled();
+  });
+  it('a red final attempt on a hold that was resolved during verify posts nothing', async () => {
+    const { io, pr } = fixture([red('2026-10-04T19:00:00Z'), red('2026-10-04T20:00:00Z')]);
+    io.listPrs.mockResolvedValue([structuredClone(pr)]);
+    io.verify.mockImplementation(() => {
+      pr.comments = [...pr.comments, comment(buildLoadFlakeResolvedComment({ altSha: 'bbb2222', result: 'pushed' }), '2026-10-04T21:59:00Z')];
+      return { ok: false, summary: 'timeout' };
+    });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'hold-ended' });
+    expect(io.comment).not.toHaveBeenCalled();
+  });
+  it('a red final attempt on a still-current head is still terminal', async () => {
+    const { io } = fixture([red('2026-10-04T19:00:00Z'), red('2026-10-04T20:00:00Z')]);
+    io.verify.mockReturnValue({ ok: false, summary: 'timeout' });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ result: 'exhausted' });
+  });
+  it('the push runs from the daemon checkout with hooks disabled, never from the lane that ran the branch code', () => {
+    const run = vi.fn(() => ''); const io = defaultReverifyIo({ run, root: '/repo' });
+    io.push('/lane', 'bbb2222', 'lane/fix');
+    const [bin, args, opts] = run.mock.calls[0];
+    expect(bin).toBe('git');
+    expect(opts.cwd).toBe('/repo');
+    expect(args).toEqual(expect.arrayContaining(['-c', 'core.hooksPath=/dev/null', '--no-verify', 'origin', 'bbb2222:refs/heads/lane/fix']));
+    expect(args.indexOf('-c')).toBeLessThan(args.indexOf('push'));
+    expect(args).not.toContain('--force');
   });
 });

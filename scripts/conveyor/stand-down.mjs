@@ -249,8 +249,18 @@ export function loadFlakeHoldState({ comments, headRefOid = null, now = 0, isSup
   const results = loadFlakeResults(comments).filter((r) => r.sha === hold.alt.sha
     && Date.parse(r.createdAt) >= Date.parse(hold.createdAt));
   const resolution = results.filter((r) => r.result !== 'red-again').at(-1);
-  return { hold, results, resolution, live: !resolution && !(hold.head && headRefOid && hold.head !== headRefOid) };
+  return { hold, results, resolution, live: !resolution && !(hold.head && headRefOid && !sameCommit(hold.head, headRefOid)) };
 }
+
+/** A recorded sha may be abbreviated (7–40 hex) while GitHub reports the full oid: equal when one prefixes the other. */
+const sameCommit = (a, b) => a.startsWith(b) || b.startsWith(a);
+
+/** Repositories whose load-flake holds a registered reverify pass actually works (the manifest's pass has no --repo flag). */
+export const LOAD_FLAKE_REVERIFY_REPOS = ['we'];
+
+/** Whether a `--reason=load-flake` stand-down may record a hold; anywhere nothing would ever reverify it, it stays terminal. */
+export const loadFlakeHoldRequest = ({ reason, alt, altSha, repoKey }) =>
+  reason === 'load-flake' && !!alt && !!altSha && LOAD_FLAKE_REVERIFY_REPOS.includes(repoKey);
 
 export function buildLoadFlakeHoldComment({ head, alt, altSha, detail = '' }) {
   if (!alt || !altSha) return buildStandDownComment({ reason: 'gate-red', detail });
@@ -521,7 +531,10 @@ if (IS_CLI) {
   // one: free `--detail` prose is never sniffed (PR #2821 review — an unrelated stand-down that merely mentioned
   // a "concurrent author" was re-armed). A legacy conflict-shaped post is still reclassified when READ.
   const concurrent = flags.reason === 'concurrent-author';
-  const loadHold = flags.reason === 'load-flake' && !!flags.alt && !!flags['alt-sha'];
+  const loadHold = loadFlakeHoldRequest({ reason: flags.reason, alt: flags.alt, altSha: flags['alt-sha'], repoKey: repoKeyForSlug(flags.repo) });
+  if (flags.reason === 'load-flake' && !loadHold) {
+    process.stderr.write('⚠ stand-down: no load-flake reverify worker serves this repo (or --alt/--alt-sha is missing); recording a terminal gate-red stand-down instead\n');
+  }
   const body = loadHold ? buildLoadFlakeHoldComment({ head: flags.head, alt: flags.alt, altSha: flags['alt-sha'], detail }) : concurrent
     ? buildConcurrentAuthorPauseComment({
       actor, detail,

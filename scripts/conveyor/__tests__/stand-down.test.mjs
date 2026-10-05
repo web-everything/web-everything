@@ -482,3 +482,27 @@ describe('superseded legacy load-flake holds', () => {
     expect(src).not.toMatch(/from '\.\/(advisory-fix-mark|stand-down-answer-core)\.mjs'/);
   });
 });
+
+// PR #3945 advisory (round 3): the recorded head may be abbreviated; GitHub reports the full 40-char OID.
+import { loadFlakeHoldRequest, LOAD_FLAKE_REVERIFY_REPOS } from '../stand-down.mjs';
+describe('load-flake hold head comparison and supported repos', () => {
+  const full = 'abc0001'.padEnd(40, '0');
+  const at = (head) => [loadComment(buildLoadFlakeHoldComment({ head, alt: 'lane/x-alt', altSha: 'bbb2222' }))];
+  it('an abbreviated recorded head matches the full PR head oid', () => {
+    expect(loadFlakeHoldState({ comments: at('abc0001'), headRefOid: full }).live).toBe(true);
+    expect(loadFlakeHoldState({ comments: at(full), headRefOid: 'abc0001' }).live).toBe(true);
+    expect(loadFlakeHoldState({ comments: at(full), headRefOid: full }).live).toBe(true);
+  });
+  it('a genuinely different head still ends the hold', () => {
+    expect(loadFlakeHoldState({ comments: at('abc0001'), headRefOid: 'def0002'.padEnd(40, '0') }).live).toBe(false);
+  });
+  it('only repositories with a registered reverify worker may record a load-flake hold', () => {
+    expect(LOAD_FLAKE_REVERIFY_REPOS).toEqual(['we']);
+    expect(loadFlakeHoldRequest({ reason: 'load-flake', alt: 'lane/x-alt', altSha: 'bbb2222', repoKey: 'we' })).toBe(true);
+    for (const repoKey of ['frontierui', 'plateau-app', null, undefined]) {
+      expect(loadFlakeHoldRequest({ reason: 'load-flake', alt: 'lane/x-alt', altSha: 'bbb2222', repoKey })).toBe(false);
+    }
+    expect(loadFlakeHoldRequest({ reason: 'load-flake', alt: undefined, altSha: 'bbb2222', repoKey: 'we' })).toBe(false);
+    expect(loadFlakeHoldRequest({ reason: 'gate-red', alt: 'lane/x-alt', altSha: 'bbb2222', repoKey: 'we' })).toBe(false);
+  });
+});
