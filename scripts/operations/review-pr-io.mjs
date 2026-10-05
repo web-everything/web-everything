@@ -475,7 +475,9 @@ export const CARRY_CHANGE_WINDOW = 3;
 export const COMPARE_FILE_CAP = 300;
 
 /**
- * The changed new-side lines of `file` in a compare payload, or `null` when that cannot be PROVEN (fail closed).
+ * The changed new-side lines of `file` in a compare payload (the returned Set's `.old` holds the changed OLD-side lines,
+ * so each citation can be checked in its own revision's coordinates), or `null` when that cannot be PROVEN (fail closed).
+ * A pure deletion or insertion (zero-count range) marks the two lines it sits between.
  * `null`: the base is not an ancestor of the head (`status` other than `ahead`/`identical` — a three-dot compare of
  * diverged heads diffs from the merge base, not from the ruled head), a missing/truncated file list, a rename, a
  * removed file, or a missing patch. A file absent from a complete list is unchanged only when `fileExists()` shows
@@ -489,11 +491,18 @@ export function changedLinesFromCompare(compare, file, fileExists = () => false)
   if (!entry) return files.length >= COMPARE_FILE_CAP || !fileExists() ? null : new Set();
   if (entry.status === 'removed' || entry.status === 'renamed' || typeof entry.patch !== 'string' || !entry.patch) return null;
   const lines = new Set();
+  lines.old = new Set();
   let hunks = 0;
-  for (const match of entry.patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
+  // A zero-count range (`+N,0` after a pure deletion, `-N,0` before a pure insertion) names the line AFTER which the
+  // change sits, so the change is adjacent to both N and N+1: record both, or a deletion would read as "no change".
+  const mark = (set, start, count) => {
+    if (count === 0) { set.add(start); set.add(start + 1); return; }
+    for (let n = start; n < start + count; n++) set.add(n);
+  };
+  for (const match of entry.patch.matchAll(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm)) {
     hunks++;
-    const start = Number(match[1]), count = Number(match[2] ?? 1);
-    for (let n = start; n < start + count; n++) lines.add(n);
+    mark(lines.old, Number(match[1]), Number(match[2] ?? 1));
+    mark(lines, Number(match[3]), Number(match[4] ?? 1));
   }
   return hunks ? lines : null;
 }
@@ -739,8 +748,14 @@ export function createReviewPrSinks({
           const operatorRulings = readOperatorRulings(state.comments, context(state)).rulings;
           for (let i = 0; i < existing.length; i++) {
             const record = existing[i], carried = [];
+            // Findings a reviewer's ruling on THIS head already settles (counted: independent clearer, readable card).
+            // `referralRecordState` reads `carried` before rulings, so a carry here would silently replace a
+            // current-head block with an earlier head's operator ruling. An UNcounted ruling settles nothing.
+            const stillPending = record.rulings.length
+              ? new Set(referralRecordState(record, { ...context(state), head: record.head, records, operatorRulings }).pending) : null;
             for (const f of activeReferrals(record)) {
               if ((record.carried ?? []).some(c => c.key === f.key)
+                || (stillPending && record.rulings.some(r => r.key === f.key) && !stillPending.has(f.key))
                 || operatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
                   && o.head === record.head && o.runId === record.runId && o.key === f.key)) continue;
               const match = findCarriedOperatorRuling(f, { records, operatorRulings,
@@ -752,8 +767,10 @@ export function createReviewPrSinks({
                 changed = await changedLines(record.repo, match.from.head, record.head, file);
               } catch { changed = null; }
               if (!(changed instanceof Set)) continue;
-              // Both the earlier ruled finding's cited line and this one's: the two can sit up to 8 lines apart.
-              if (changesTouchCitedLines(changed, [f.finding.line, match.finding.line])) continue;
+              // Each citation is checked in its own revision's coordinates: this finding's line against the new side,
+              // the earlier ruled finding's line against the old side (a plain injected Set serves for both).
+              if (changesTouchCitedLines(changed, [f.finding.line])
+                || changesTouchCitedLines(changed.old ?? changed, [match.finding.line])) continue;
               carried.push({ key: f.key, reason: REFERRAL_CARRY_REASON, from: match.from,
                 result: match.result, ...(match.card ? { card: match.card } : {}) });
             }

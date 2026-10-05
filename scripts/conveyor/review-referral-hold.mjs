@@ -4,7 +4,9 @@
  */
 import { createHash } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, mandatoryReferralState, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -85,7 +87,11 @@ function wakeTime(pr, run) {
   }));
 }
 
-export function decideReferralHold(pr, runs, { repo, now = Date.now(), env = process.env } = {}) {
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+export function decideReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
+  // The SAME reader the review gate uses, so a `card` ruling naming a card that does not exist yet keeps the hold.
+  cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number))
     .sort((a, b) => b.completedAt - a.completedAt);
   const last = history[0];
@@ -102,7 +108,7 @@ export function decideReferralHold(pr, runs, { repo, now = Date.now(), env = pro
   if (retryAt !== null && now >= retryAt) return null;
   if (!last.persistenceFailed && env.WE_REFERRAL_HOLD_LIVE_RELEASE !== '0') {
     const live = mandatoryReferralState(pr.comments, {
-      repo, pr: Number(pr.number), head: pr.headRefOid, cardReadable: () => true,
+      repo, pr: Number(pr.number), head: pr.headRefOid, cardReadable,
     });
     if (!live.pending.length && live.records.some(r => r.head === pr.headRefOid
       && r.repo === repo && r.pr === Number(pr.number))) return null;

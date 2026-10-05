@@ -120,6 +120,21 @@ export function sameFinding(a, b) {
   return claimSimilarity(a.summary, b.summary) >= SIMILARITY_FLOOR;
 }
 
+const OVERRULE_JACCARD_FLOOR = 0.6;
+/**
+ * Stricter than `sameFinding`, for CLEARING a standing block: shared words over the UNION, so a short operator ruling
+ * ("standards manifest missing") never overrules a longer, different block that merely contains its words.
+ */
+export function sameFindingStrict(a, b) {
+  if (!a.file || !b.file || normPath(a.file) !== normPath(b.file)) return false;
+  if (oneLine(a.summary).toLowerCase() === oneLine(b.summary).toLowerCase()) return true;
+  const x = tokens(a.summary), y = tokens(b.summary);
+  if (!x.size || !y.size) return false;
+  let shared = 0;
+  for (const w of x) if (y.has(w)) shared++;
+  return shared / (x.size + y.size - shared) >= OVERRULE_JACCARD_FLOOR;
+}
+
 /** The operator's own words for a ruling, one block of text for the fixer. */
 export function rulingText(ruling) {
   const parts = [`${ruling.result}${ruling.card ? ` (${ruling.card})` : ''}: ${oneLine(ruling.rationale)}`];
@@ -204,7 +219,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       if (ruled) overrules.push({ index, head: parsed.record.head, runId: x.runId, key: x.key, finding: findingView(ruled) });
     }
   });
-  const overruled = (b) => b.source === 'record' && overrules.some((o) => o.index > b.index && sameFinding(o.finding, b.finding));
+  const overruled = (b) => b.source === 'record' && overrules.some((o) => o.index > b.index && sameFindingStrict(o.finding, b.finding));
 
   const matchesBlock = (view, b) => b.source === 'record'
     ? sameFinding(view, b.finding)

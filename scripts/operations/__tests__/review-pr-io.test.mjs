@@ -1061,6 +1061,24 @@ describe('operator-ruling carry: default changed-lines reader', () => {
     const failing = createChangedLinesReader(() => { throw new Error('boom'); });
     expect(failing('o/r', 'b', 'h', 'a.mjs')).toBeNull();
   });
+  // Every way a diff can change code without ADDING a line: a pure deletion (`+N,0`), a pure insertion's old side
+  // (`-N,0`), and deleted old lines whose surviving new-side range sits somewhere else entirely.
+  it.each([
+    ['a pure deletion (+N,0) marks the neighbouring new lines', '@@ -10,3 +9,0 @@\n-a\n-b\n-c', [9, 10], [10, 11, 12]],
+    ['a deletion at the top of the file (+0,0)', '@@ -1,2 +0,0 @@\n-a\n-b', [0, 1], [1, 2]],
+    ['a pure insertion marks the neighbouring old lines (-N,0)', '@@ -5,0 +6,2 @@\n+a\n+b', [6, 7], [5, 6]],
+    ['a single-line hunk without counts', '@@ -4 +4 @@\n-a\n+b', [4], [4]],
+  ])('%s', (_, hunkPatch, expectedNew, expectedOld) => {
+    const changed = changedLinesFromCompare(compare([{ filename: 'a.mjs', status: 'modified', patch: hunkPatch }]), 'a.mjs');
+    expect([...changed].sort((a, b) => a - b)).toEqual(expectedNew);
+    expect([...changed.old].sort((a, b) => a - b)).toEqual(expectedOld);
+  });
+  it('a deletion next to a cited line blocks the carry (the empty-set bug)', () => {
+    const changed = changedLinesFromCompare(compare([{ filename: 'a.mjs', status: 'modified', patch: '@@ -13,2 +12,0 @@\n-a\n-b' }]), 'a.mjs');
+    expect(changed.size).toBeGreaterThan(0);
+    expect(changesTouchCitedLines(changed, [12, 12])).toBe(true);
+    expect(changesTouchCitedLines(changed, [null, null])).toBe(true);
+  });
   it('window boundary: a change within ±3 of either cited line blocks the carry, ±4 does not', () => {
     expect(changesTouchCitedLines(new Set([15]), [12, 40])).toBe(true);
     expect(changesTouchCitedLines(new Set([16]), [12, 40])).toBe(false);
@@ -1138,6 +1156,57 @@ describe('#4315 durable referral effects', () => {
         .some(f => f.key === current.referrals[0].key))).toBe(true);
       expect(result.pending).toContain(current.referrals[0].key);
     }
+  });
+
+  // An earlier-head operator not-real on `oldLine`, and the SAME finding on the current head at `curLine`.
+  function seedCarry(h, { oldLine = 12, curLine = 12, attempted = false, rule = () => [] } = {}) {
+    h.payload.referrals[0].original.line = oldLine;
+    const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
+    const original = { ...old.referrals[0].original, line: curLine };
+    const current = { ...old, head: h.state.headRefOid, runId: 'current',
+      referrals: [{ ...old.referrals[0], original, finding: normalizeFinding(original),
+        key: referralFindingKey('judgeCorrectnessAdvisory', original) }],
+      reviewer: mandatoryReferralReviewer('current'), attempted, rulings: [] };
+    current.rulings = rule(current);
+    h.state.comments.push({ body: renderReferralRecord(current), author: { login: 'web-everything' } });
+    h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+      version: 1, repo: old.repo, pr: old.pr, head: old.head, actor: 'chalbert', channel: 'test',
+      reason: 'not a defect', at: '2026-10-04T12:00:00Z', clearerId: '',
+      rulings: [{ runId: old.runId, key: old.referrals[0].key, result: 'not-real' }] }) });
+    return { old, current };
+  }
+  const realReader = patch => () => changedLinesFromCompare({ status: 'ahead', files: [{ filename: 'x.mjs', status: 'modified', patch }] }, 'x.mjs');
+
+  it.each([
+    ['a pure deletion next to the cited line', { oldLine: 12, curLine: 12 }, '@@ -13,2 +12,0 @@\n-a\n-b'],
+    ['a deletion of the OLD cited line whose surviving new-side range lies elsewhere', { oldLine: 15, curLine: 12 }, '@@ -15,1 +40,0 @@\n-a'],
+  ])('does not carry an operator ruling across %s', async (_, lines, patch) => {
+    const h = harness({ failure: 'omitted', readChangedLines: realReader(patch) });
+    const { current } = seedCarry(h, lines);
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
+    expect(result.pending).toContain(current.referrals[0].key);
+  });
+
+  it.each([['block'], ['not-real']])('never replaces a current-head reviewer %s ruling with an earlier-head operator ruling', async result => {
+    const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    const { current } = seedCarry(h, { attempted: true, rule: r => [{ id: 'r1', key: r.referrals[0].key, reviewerId: r.reviewer.id,
+      lens: r.reviewer.lens, result, rationale: 'Checked diff', evidence: ['diff:x'] }] });
+    const state = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const latest = readReferralRecords(h.state.comments).records.find(r => r.runId === 'current');
+    expect(latest.carried).toBeUndefined();
+    const key = current.referrals[0].key;
+    expect(mandatoryReferralState(h.state.comments, { head: h.state.headRefOid }).blocked).toEqual(result === 'block' ? [key] : []);
+    expect(state.pending).not.toContain(key);
+  });
+
+  it('still carries when the current-head reviewer ruling does not count (card naming an unreadable card)', async () => {
+    const h = harness({ failure: 'card', readChangedLines: () => new Set() });
+    const { current } = seedCarry(h, { attempted: true, rule: r => [{ id: 'r1', key: r.referrals[0].key, reviewerId: r.reviewer.id,
+      lens: r.reviewer.lens, result: 'card', card: 'we:backlog/7-filed.md', rationale: 'Checked diff', evidence: ['diff:x'] }] });
+    const state = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toHaveLength(1);
+    expect(state.pending).not.toContain(current.referrals[0].key);
   });
 
   function seedReferrals(h, seats, head = 'b'.repeat(40), rule = () => []) {

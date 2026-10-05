@@ -93,6 +93,31 @@ describe('ignoredRulings', () => {
       comment(record({ head: H3, runId: 'run-3' }), 20)];
     expect(ignoredRulings({ headRefOid: H3, comments })).toBeNull();
   });
+  describe('what an operator overrule does NOT overrule', () => {
+    const opNotReal = (rec, n) => ({ author: { login: 'chalbert' }, createdAt: t(n),
+      body: buildOperatorRulingComment({ version: 1, repo, pr: rec.pr, head: rec.head, actor: 'chalbert', channel: 'test',
+        reason: 'not a defect', at: t(n), clearerId: '', rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result: 'not-real' }] }) });
+    it('a reviewer block recorded AFTER the operator overrule stands (ordering)', () => {
+      const r1 = record({ head: H1, runId: 'run-1' });
+      const r2 = record({ head: H2, runId: 'run-2' });
+      const comments = [comment(r1, 1), comment(record({ head: H1, runId: 'run-1', rulings: [block] }), 3), opNotReal(r1, 4),
+        comment(r2, 10), comment(record({ head: H2, runId: 'run-2', rulings: [block] }), 12),
+        comment(record({ head: H3, runId: 'run-3' }), 20)];
+      const ig = ignoredRulings({ headRefOid: H3, comments });
+      expect(ig?.matches).toHaveLength(1);
+      expect(ig.matches[0].priorHead).toBe(H2);
+    });
+    it('a short operator not-real on a different same-file finding leaves the longer block standing (match gate)', () => {
+      const unrelated = record({ head: H1, runId: 'run-0', summary: 'standards manifest missing' });
+      const comments = [...history, comment(unrelated, 2), opNotReal(unrelated, 4), comment(record({ head: H2, runId: 'run-2' }), 20)];
+      expect(ignoredRulings({ headRefOid: H2, comments })?.matches).toHaveLength(1);
+    });
+    it('a reworded operator overrule of the SAME finding still overrules it', () => {
+      const reworded = record({ head: H1, runId: 'run-0', summary: 'the policy pointer files are still missing from the standards manifest, so the gate cannot see them' });
+      const comments = [...history, comment(reworded, 2), opNotReal(reworded, 4), comment(record({ head: H2, runId: 'run-2' }), 20)];
+      expect(ignoredRulings({ headRefOid: H2, comments })).toBeNull();
+    });
+  });
   // {reviewer block on an earlier head} x {what settles the finding on THIS head}.
   describe('a finding the operator settled on this head is never an ignored ruling', () => {
     const opComment = (rec, head, result, n) => ({ author: { login: 'chalbert' }, createdAt: t(n),
