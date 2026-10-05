@@ -1082,6 +1082,7 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
         const observed = collapseRollupToLatestPerName(rows).some(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
           && (row.status.toLowerCase() !== 'completed' || FAILING_CONCLUSIONS.includes(row.conclusion?.toLowerCase())));
         cache.set(key, { rows: rows.map(row => ({ ...row, status: row.status.toUpperCase(),
+          detailsUrl: row.detailsUrl ?? row.details_url ?? row.html_url ?? null,
           conclusion: row.conclusion?.toUpperCase() ?? null, completedAt: row.completed_at ?? null })),
         ...(absent.length && !observed ? { incomplete: `missing required checks: ${absent.join(', ')}` } : {}) });
       } catch (error) { cache.set(key, { error: String(error?.message ?? error) }); }

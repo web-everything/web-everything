@@ -950,6 +950,25 @@ it('xxh4zw8 hydrates the crowded snapshot before planning same-tick recovery', a
   expect(readChecks).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', sha: XX_HEAD });
 });
 
+it('hydrated REST check origins reach timeout enrichment', async () => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const detailsUrl = 'https://github.com/web-everything/web-everything/actions/runs/10/job/20';
+  const read = vi.fn(() => ({ eligible: false, reason: 'fixture-not-timeout' }));
+  const plan = runReconcilePass({ ...xxOptions(),
+    readChecks: () => xxRuns().map(row => ({ ...row,
+      conclusion: row.name === 'smoke' ? 'failure' : 'success', details_url: detailsUrl })),
+    enrichTimeouts: (prs, opts) => enrichPrsWithTimeoutEvidence(prs, { ...opts, enabled: true,
+      read, readBudget: () => ({ confirmed: 0, pending: false }) }),
+  });
+  expect(read).toHaveBeenCalledOnce();
+  expect(read.mock.calls[0][0].statusCheckRollup[1].detailsUrl).toBe(detailsUrl);
+  expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-ineligible',
+    why: 'PR #3336: fixture-not-timeout' }));
+  expect([...plan.notes, ...plan.refusals].some(row =>
+    (row.text ?? row.why ?? '').includes('missing-check-origin'))).toBe(false);
+  expect(plan.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+});
+
 it('xxh4zw8 hydrates shared-file input and preserves attribution timestamps and numeric rerun IDs', async () => {
   const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
