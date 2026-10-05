@@ -876,6 +876,17 @@ describe('the advise step applies the `advisory:*` label', () => {
       .toEqual([expect.objectContaining({ outcome: 'changes', head: PINNED_HEAD })]);
   });
 
+  // A note with no outcome line parses back as `accept`, so unruled referrals must state a non-accept word.
+  it('a note posted with pending referrals parses back as `pending-referral`, never `accept`', async () => {
+    const { out } = await driveAdvisory();
+    const read = out.run.findings.read;
+    const report = renderAdvisoryNote({ read, verdict: { ...out.run.verdict, pendingReferrals: ['finding-key'] } });
+    expect(report).toContain('**Advisory outcome:** `pending-referral`');
+    expect(report).not.toContain('`advisory:accepted` is applied');
+    expect(parseAdvisories([{ body: report, createdAt: '2026-10-03T12:00:00Z' }]))
+      .toEqual([expect.objectContaining({ outcome: 'pending-referral', head: PINNED_HEAD })]);
+  });
+
   it('the note it posts round-trips through the parser `operator-queue` reads: outcome AND head', async () => {
     for (const [answer, outcome] of [[CLEAN_ANSWER, 'accept'], [BLOCKING_ANSWER, 'changes']]) {
       const { applied } = await driveAdvisory({ answer, id: `run-advl-rt-${outcome}` });
@@ -917,6 +928,15 @@ describe('deriveAdvisoryOutcome', () => {
 
   it('is `changes` when any mandatory lens asks for changes', () => {
     expect(deriveAdvisoryOutcome({ verdict: 'needs-human', lensVerdicts: lensVerdicts('changes'), admittedFindings: [] })).toBe('changes');
+  });
+
+  // Review round 1 (security): unresolved mandatory referrals must never read as a clean advisory.
+  it('is null — no label — while mandatory referrals are still pending, even when every lens accepts', () => {
+    const accept = { verdict: 'needs-human', lensVerdicts: lensVerdicts('accept'), admittedFindings: [] };
+    expect(deriveAdvisoryOutcome({ ...accept, pendingReferrals: ['finding-key'] })).toBeNull();
+    expect(deriveAdvisoryOutcome({ ...accept, pendingReferrals: ['author-stamp-missing'] })).toBeNull();
+    expect(deriveAdvisoryOutcome({ ...accept, pendingReferrals: [] })).toBe('accept');
+    expect(deriveAdvisoryOutcome({ ...accept, pendingReferrals: ['finding-key'], blockedReferrals: ['k'] })).toBe('changes');
   });
 
   it('is null — no label — when no outcome can be honestly derived', () => {
@@ -3845,9 +3865,11 @@ describe('pending-referral advisory (live #202)', () => {
       const effects = advise.effects({ input: BASE_INPUT, findings: { read },
         verdict: { verdict: 'needs-human', findings: [], pendingReferrals: ['finding-key'],
           lensVerdicts: { [DEFAULT_LENS]: 'accept', [SECURITY_LENS]: 'accept' } } });
+      // The note and the awaiting-advisory flip post, but never an `advisory:*` label while referrals are unruled.
       expect(effects.map(e => e.type)).toEqual(setting === '0' ? [] : [
-        REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.AWAITING_ADVISORY_CLEAR, REVIEW_EFFECTS.ADVISORY_LABEL,
+        REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.AWAITING_ADVISORY_CLEAR,
       ]);
+      expect(effects.map(e => e.payload?.body).join('')).not.toContain('`advisory:accepted` is applied');
     } finally { vi.unstubAllEnvs(); }
   });
 });

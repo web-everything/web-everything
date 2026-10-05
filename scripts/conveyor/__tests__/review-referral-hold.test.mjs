@@ -284,6 +284,59 @@ describe('same-head review loop regression (live #202)', () => {
     }
     expect(resolveSameHeadMaxReviews({ WE_REVIEW_SAME_HEAD_MAX_REVIEWS: '3' })).toBe(3);
   });
+  // Review round 1, finding 2: a pending list of reason tokens only must not read as "attempted, 0 referrals".
+  it.each([
+    ['token only', ['author-stamp-missing'], { attempted: false, count: 0 }],
+    ['key only', [key], { attempted: true, count: 1 }],
+    ['token and key', ['author-stamp-missing', key], { attempted: true, count: 1 }],
+    ['empty', [], { attempted: false, count: 0, parked: false }],
+  ])('classifies a %s pending list', (_, pending, expected) => {
+    const r = run();
+    r.findings.referralVerdict.pendingReferrals = pending;
+    r.verdict = r.findings.referralVerdict;
+    if (!pending.includes(key)) r.findings.mandatoryReferrals.effects[0].result.records = [];
+    expect(reviewRunEvidence(r)).toMatchObject(expected);
+  });
+  it('a token-only parked run never produces a "0 referrals" hold', () => {
+    const r = run();
+    r.findings.referralVerdict.pendingReferrals = ['author-stamp-missing'];
+    r.verdict = r.findings.referralVerdict;
+    r.findings.mandatoryReferrals.effects[0].result.records = [];
+    expect(hold(pr(), [reviewRunEvidence(r)])).toBeNull();
+  });
+  // Review round 1, finding 1: the referral hold's deliberate live release must not be re-held by the same-head guard.
+  it('does not re-hold a PR whose referrals were ruled in the live thread before the parked run started', () => {
+    const r = record();
+    r.rulings = [{ id: 'r1', key, reviewerId: r.reviewer.id, lens: r.reviewer.lens,
+      result: 'block', rationale: 'confirmed', evidence: ['diff'] }];
+    const p = pr({ comments: [comment(renderReferralRecord(r), at - 120_000)] });
+    expect(hold(p)).toBeNull();
+    expect(enrichPrsWithReferralHolds([p], { repo, now: at + 1, readRuns: () => [evidence()] })[0].referralHold).toBeNull();
+  });
+  it.each([
+    ['live gate not yet cleared', pr({ comments: [comment(renderReferralRecord(record()), at - 120_000)] }), 'referral'],
+    ['no referral evidence at all', pr(), 'referral'],
+  ])('still holds when %s', (_, p) => {
+    expect(enrichPrsWithReferralHolds([p], { repo, now: at + 1, readRuns: () => [evidence()] })[0].referralHold)
+      .not.toBeNull();
+  });
+  it('a wake event after the parked run releases the PR through the enricher too', () => {
+    const p = pr({ comments: [comment(REARM_COMMENT_MARKER, at + 1)] });
+    // The completed run started before the wake event, so neither guard holds a fresh review back.
+    expect(enrichPrsWithReferralHolds([p], { repo, now: at + 2, readRuns: () => [evidence()] })[0].referralHold).toBeNull();
+  });
+  it('an elapsed persistence-failure retry releases the PR through the enricher too', () => {
+    const rows = [evidence({ failure: true })];
+    const early = enrichPrsWithReferralHolds([pr()], { repo, now: at + 1, readRuns: () => rows })[0].referralHold;
+    expect(early).toMatchObject({ persistenceFailed: true });
+    const late = enrichPrsWithReferralHolds([pr()], { repo, now: at + REFERRAL_RETRY_MS[0] + 1, readRuns: () => rows })[0].referralHold;
+    expect(late).toBeNull();
+  });
+  it('still applies the same-head guard when the referral hold returns null for a non-release reason', () => {
+    const rows = [{ ...evidence(), parked: false }];
+    expect(enrichPrsWithReferralHolds([pr()], { repo, now: at + 1, readRuns: () => rows })[0].referralHold.kind)
+      .toBe('same-head');
+  });
   it('posts no extra notice for a same-head hold', () => {
     const post = vi.fn(), log = vi.fn();
     notifyReferralHold({ repo, prNumber: 3481, hold: { ...hold(), kind: 'same-head' }, dir: temp(), post, log });

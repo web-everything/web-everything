@@ -39,7 +39,8 @@ export function reviewRunEvidence(run) {
     .flatMap(r => r.referrals.map(f => f.key)));
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
-    pending, attempted: findingKeys.every(key => attempted.has(key)),
+    // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
+    pending, attempted: findingKeys.length > 0 && findingKeys.every(key => attempted.has(key)),
     persistenceFailed: pending.includes('referral-persistence-failed'),
     count: pending.includes('referral-persistence-failed') ? Math.max(1, verdict?.referrals?.length ?? 0) : findingKeys.length,
     rulings: (state?.records ?? []).flatMap(r => r.rulings ?? []).map(r => JSON.stringify(r)),
@@ -92,15 +93,18 @@ function wakeTime(pr, run) {
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-export function decideReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
+/** The referral hold's decision, tagged: `released` names a DELIBERATE release (a ruling, wake event or retry), which
+ * the same-head guard must not override; `released: null` with no hold just means no parked run to hold on.
+ */
+function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
   // The SAME reader the review gate uses, so a `card` ruling naming a card that does not exist yet keeps the hold.
   cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number))
     .sort((a, b) => b.completedAt - a.completedAt);
   const last = history[0];
-  if (!last?.parked || last.head !== pr.headRefOid || (!last.attempted && !last.persistenceFailed)) return null;
+  if (!last?.parked || last.head !== pr.headRefOid || (!last.attempted && !last.persistenceFailed)) return { hold: null, released: null };
   const wake = wakeTime(pr, last);
-  if (wake > last.startedAt) return null;
+  if (wake > last.startedAt) return { hold: null, released: 'wake' };
   let streak = 0;
   for (const run of history) {
     if (run.head !== last.head || !run.parked || !run.persistenceFailed || run.startedAt < wake) break;
@@ -108,18 +112,22 @@ export function decideReferralHold(pr, runs, { repo, now = Date.now(), env = pro
   }
   const retryAt = last.persistenceFailed && streak <= REFERRAL_RETRY_MS.length
     ? last.completedAt + REFERRAL_RETRY_MS[streak - 1] : null;
-  if (retryAt !== null && now >= retryAt) return null;
+  if (retryAt !== null && now >= retryAt) return { hold: null, released: 'retry' };
   if (!last.persistenceFailed && env.WE_REFERRAL_HOLD_LIVE_RELEASE !== '0') {
     const live = mandatoryReferralState(pr.comments, {
       repo, pr: Number(pr.number), head: pr.headRefOid, cardReadable,
     });
     if (!live.pending.length && live.records.some(r => r.head === pr.headRefOid
-      && r.repo === repo && r.pr === Number(pr.number))) return null;
+      && r.repo === repo && r.pr === Number(pr.number))) return { hold: null, released: 'live-release' };
   }
   const why = `review paused: ${last.count} referrals need a ruling; it resumes on a new push, a ruling, or a send-back`;
   // Same episode across retries and daemon restarts. A new operator event gets a new notice only if it parks again.
-  return { head: last.head, episode: hash([repo, pr.number, last.head, wake]), count: last.count,
-    why, retryAt, persistenceFailed: last.persistenceFailed, exhausted: last.persistenceFailed && retryAt === null };
+  return { released: null, hold: { head: last.head, episode: hash([repo, pr.number, last.head, wake]), count: last.count,
+    why, retryAt, persistenceFailed: last.persistenceFailed, exhausted: last.persistenceFailed && retryAt === null } };
+}
+
+export function decideReferralHold(pr, runs, opts) {
+  return evaluateReferralHold(pr, runs, opts).hold;
 }
 
 /** One completed review per head/re-arm by default; persistence retries have their own budget. */
@@ -164,8 +172,9 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRu
       }
       catch { /* Keep the list snapshot when the full thread is unavailable. */ }
     }
-    return { ...pr, referralHold: decideReferralHold(pr, runs, { repo, now })
-      ?? decideSameHeadHold(pr, runs, { repo }) };
+    // A deliberate release (ruling cleared, new event, retry due) owes a fresh review: the same-head guard stays out.
+    const { hold, released } = evaluateReferralHold(pr, runs, { repo, now });
+    return { ...pr, referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo })) };
   });
 }
 
