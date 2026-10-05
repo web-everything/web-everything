@@ -21,7 +21,7 @@ import { pathToFileURL } from 'node:url';
 
 import {
   isClaimStampOnlyEdit, restoreStrayClaimStamps,
-  planRebuild, findUnsafeLocalState, rebuildClone, dryRunRebuild, readRebuildState, rebuildStatePath,
+  planRebuild, findUnsafeLocalState, rebuildClone, dryRunRebuild, readRebuildState, rebuildStatePath, readRebuildStarvation,
   isDaemonManagedClone, daemonConveyorStateRoot, materializeCandidate, removeCandidate, previewOverlayConflict,
   readyBuildVerified, resolveOverlayConflict, OVERLAY_EDGE_RESOLVE_ENV,
 } from '../daemon-rebuild.mjs';
@@ -354,6 +354,34 @@ describe('rebuildClone', () => {
     const lines = log.error.mock.calls.map(([m]) => m);
     expect(lines.some((m) => /waiting up to 60s for live reader\(s\) review-daemon-sim/.test(m))).toBe(true);
     expect(lines.some((m) => /gave up after 60s/.test(m))).toBe(true);
+  });
+
+  // live 2026-10-05 07:09-07:33 ET: two daemons' long ticks starved every 60s wait — no rebuild for 20+ min.
+  it('after 2 consecutive starved attempts the next waits the longer starved wait, and a success resets it', async () => {
+    const { originDir, cloneDir, env, lockDir } = makeFixture();
+    advanceMain(originDir, (dir) => writeFile(dir, 'y.txt', 'y\n'));
+    const { acquireRead, releaseRead } = await import('../daemon-clone-lock.mjs');
+    expect(acquireRead(cloneDir, { owner: 'review-daemon-sim', lockRoot: lockDir, pid: process.pid }).ok).toBe(true);
+    let t = 1_000_000;
+    const attempt = async (sleep = async (ms) => { t += ms; }) => rebuildClone({
+      root: cloneDir, env, runSmoke: passSmoke(), log: { error: vi.fn() }, prState: async () => null, now: () => t, sleep,
+      lockOpts: { pollMs: 1000 },
+    });
+    for (let i = 0; i < 2; i += 1) {
+      const s = t;
+      expect((await attempt()).reason).toBe('tick-in-progress');
+      expect(t - s).toBeLessThanOrEqual(61_000);
+    }
+    expect(readRebuildStarvation(cloneDir, env)).toBe(2);
+    // third attempt: the reader finishes its tick after 5 min — within the 15 min starved wait, so it adopts
+    const s = t;
+    const r = await attempt(async (ms) => {
+      t += ms;
+      if (t - s >= 5 * 60_000) releaseRead(cloneDir, { owner: 'review-daemon-sim', lockRoot: lockDir });
+    });
+    expect(r.reason).not.toBe('tick-in-progress');
+    expect(t - s).toBeGreaterThanOrEqual(5 * 60_000);
+    expect(readRebuildStarvation(cloneDir, env)).toBe(0);
   });
 
   // xa4qo7n: the smoke no longer holds any lock (it runs against a disposable candidate worktree) — this only

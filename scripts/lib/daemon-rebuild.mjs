@@ -920,6 +920,45 @@ function writeRebuildState(root, state, env = process.env) {
 // lock on purpose: only a build-lease holder writes it, the record fully describes itself, and every use of it
 // re-checks it against the live HEAD under the write lock.
 
+// ── rebuild starvation (live 2026-10-05 07:09-07:33 ET) ─────────────────────────────────────────────────────
+// Two daemons share wev-review-daemon. The review daemon's tick runs ~10 min, so the fix daemon's 60s write-lock
+// wait gave up EVERY tick (and vice versa): no rebuild at all for 20+ min, so a registered overlay fix never went
+// live. After STARVE_ESCALATE_AFTER consecutive `tick-in-progress` give-ups the next attempt waits the longer
+// starved wait. That wait is bounded by ticks already in flight: the writer reservation refuses every NEW read.
+export const STARVE_ESCALATE_AFTER_ENV = 'WE_DAEMON_REBUILD_STARVE_ESCALATE_AFTER';
+export const DEFAULT_STARVE_ESCALATE_AFTER = 2;
+export const STARVED_LOCK_WAIT_ENV = 'WE_DAEMON_REBUILD_STARVED_WAIT_MS';
+export const DEFAULT_STARVED_LOCK_WAIT_MS = 15 * 60_000;
+
+function starvePath(root, env = process.env) {
+  return join(stateDir(env), `${cloneKey(root)}.starve.json`);
+}
+
+/** Consecutive `tick-in-progress` give-ups for this clone (missing/corrupt = 0). */
+export function readRebuildStarvation(root, env = process.env) {
+  try {
+    const n = JSON.parse(readFileSync(starvePath(root, env), 'utf8'))?.count;
+    return Number.isInteger(n) && n > 0 ? n : 0;
+  } catch { return 0; }
+}
+
+function writeRebuildStarvation(root, count, env = process.env) {
+  try {
+    const file = starvePath(root, env);
+    mkdirSync(dirname(file), { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}`;
+    writeFileSync(tmp, `${JSON.stringify({ count, at: new Date().toISOString() })}\n`, 'utf8');
+    renameSync(tmp, file);
+  } catch { /* best-effort: a lost count only delays the escalation */ }
+}
+
+/** The write-lock wait for this attempt: the normal wait, or the starved wait once the clone has starved. */
+export function starvationLockWaitMs(baseWaitMs, starvedCount, env = process.env) {
+  const after = Number(env?.[STARVE_ESCALATE_AFTER_ENV]) > 0 ? Number(env[STARVE_ESCALATE_AFTER_ENV]) : DEFAULT_STARVE_ESCALATE_AFTER;
+  const starved = Number(env?.[STARVED_LOCK_WAIT_ENV]) > 0 ? Number(env[STARVED_LOCK_WAIT_ENV]) : DEFAULT_STARVED_LOCK_WAIT_MS;
+  return starvedCount >= after ? Math.max(baseWaitMs, starved) : baseWaitMs;
+}
+
 /** `<stateDir>/<cloneKey>.ready.json`. */
 export function readyCandidatePath(root, env = process.env) {
   return join(stateDir(env), `${cloneKey(root)}.ready.json`);
@@ -2004,7 +2043,10 @@ export async function rebuildClone({
   // 600s default for the review daemon's 10-minute tick to release its read slot — no ticks, no log line. A
   // rebuild is opportunistic (the next tick retries it), so it now waits at most WE_DAEMON_REBUILD_LOCK_WAIT_MS
   // (default 60s), says so when it starts waiting, and records the give-up.
-  const waitMs = Number(env?.[REBUILD_LOCK_WAIT_ENV]) > 0 ? Number(env[REBUILD_LOCK_WAIT_ENV]) : DEFAULT_REBUILD_LOCK_WAIT_MS;
+  const baseWaitMs = Number(env?.[REBUILD_LOCK_WAIT_ENV]) > 0 ? Number(env[REBUILD_LOCK_WAIT_ENV]) : DEFAULT_REBUILD_LOCK_WAIT_MS;
+  const starvedCount = readRebuildStarvation(root, { ...env, ...(stateOpts?.env || {}) });
+  const waitMs = starvationLockWaitMs(baseWaitMs, starvedCount, env);
+  if (waitMs > baseWaitMs) log.error?.(`daemon-rebuild: starved for ${starvedCount} consecutive attempt(s) — waiting up to ${Math.round(waitMs / 1000)}s for in-flight ticks this time`);
   const finalLockOpts = {
     ...(lockRootFromEnv ? { lockRoot: lockRootFromEnv } : {}),
     now,
@@ -2032,6 +2074,9 @@ export async function rebuildClone({
     root, env, log, run, prState, stateOpts, mainOnly, now,
   }), readyOnHead ? finalizeLockOpts : finalLockOpts);
 
+  if (prep.ok) {
+    if (starvedCount > 0) writeRebuildStarvation(root, 0, stEnv);
+  } else if (prep.reason === 'tick-in-progress') writeRebuildStarvation(root, starvedCount + 1, stEnv);
   if (!prep.ok) {
     if (prep.reason === 'tick-in-progress') {
       log.error?.(`daemon-rebuild: gave up after ${Math.round((now() - startedMs) / 1000)}s — reader ${prep.heldBy ?? '?'} still ticking; this tick runs on the current tree and the next one retries (#4044)`);
