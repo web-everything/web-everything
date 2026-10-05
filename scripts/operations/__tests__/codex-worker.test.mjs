@@ -235,6 +235,13 @@ describe('worker orchestration', () => {
     expect(harness({ reportChanges: false }).run().outcome).toBe('failed:codex');
   });
 
+  it('reads the PR number from open-pr --json output that carries no URL', () => {
+    const h = harness({ prOutput: JSON.stringify({ runId: 'open-pr-1', stopped: 'complete', pr: 4016 }, null, 2) });
+    const result = h.run();
+    expect(result.outcome).toBe('pr-opened');
+    expect(result.pr.number).toBe(4016);
+  });
+
   it('fails verify on a red verdict even though the verify process exited 0', () => {
     const h = harness({ verifyOutput: JSON.stringify({ verdict: { ok: false, passed: 0, failed: 1 } }, null, 2) });
     const result = h.run();

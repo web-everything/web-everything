@@ -328,9 +328,11 @@ export function runCodexWorker(opts, {
       const bodyFile = join(lane.path, '.git/codex-worker-pr-body.md');
       writeFile(bodyFile, composePrBody({ cardId, title, doneWhen, allowed, diffStat, codex, steps }), 'utf8');
       const output = String(command('node', ['scripts/operations/run.mjs', 'open-pr', `--ref=${branch}`, `--title=${prTitle}`, `--bodyFile=${bodyFile}`, '--json'], { cwd: lane.path, timeout: 40 * 60_000 }));
+      // open-pr's --json carries `"pr": <n>` (no URL) — live-proven on this wrapper's own PR; a URL is accepted too.
       const url = /https?:\/\/[^\s"<>\\]+\/pull\/(\d+)/.exec(output);
-      if (!url) throw new Error(`No PR URL in open-pr output: ${output.slice(-1500)}`);
-      pr = { url: url[0], number: Number(url[1]) };
+      const num = url ? Number(url[1]) : Number(/"pr":\s*(\d+)/.exec(output)?.[1] ?? /\bopened #(\d+)/.exec(output)?.[1]);
+      if (!num) throw new Error(`No PR number in open-pr output: ${output.slice(-1500)}`);
+      pr = { url: url?.[0] ?? `https://github.com/${opts.repoSlug ?? CONSTELLATION_REPOS.we.slug}/pull/${num}`, number: num };
       return pr.url;
     });
   };
