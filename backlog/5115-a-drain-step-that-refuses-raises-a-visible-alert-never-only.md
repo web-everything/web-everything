@@ -1,9 +1,10 @@
 ---
+bornAs: xq4p21a
 kind: story
 size: 3
-parent: "x0hvbwx"
+parent: "5112"
 status: open
-blockedBy: ["xcs4nce"]
+blockedBy: ["5113"]
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/merge-ai-prs-step-refusal-alert.test.mjs", "we:scripts/conveyor/health-smells/drain-step-refused.mjs", "we:scripts/conveyor/health-smells/__tests__/drain-step-refused.test.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs"]
 dateOpened: "2026-10-03"
 preparedDate: "2026-10-03"
@@ -37,7 +38,7 @@ story does not edit that file, but its replay test reuses the refusal fixture sh
    result. Pure apart from the injected `record`. Behaviour is unchanged except for the steps below.
 2. **Read the refusal.** When the result has `error`:
    - Always put it in the `--json` result as `numbered.error` (next to `numbered.warning`).
-   - Under `alert` (default): call `recordPolicyEvent` from the loader (story #xcs4nce) with key
+   - Under `alert` (default): call `recordPolicyEvent` from the loader (story #5113) with key
      `drain.onStepRefusal`, event `drain-step-refused`, subject `jit-numbering`, the error as reason, and the
      main tip SHA in detail.
    - Under `log`: today's behaviour, the `console.warn` only.
@@ -46,8 +47,8 @@ story does not edit that file, but its replay test reuses the refusal fixture sh
 4. **Cover the other silent step.** Do the same for resolve-on-land failures (`resolveOnLandReport.failed`,
    declared at `we:scripts/merge-ai-prs.mjs:5650`), with subject `resolve-on-land`.
    - **Subjects are an open set, with the same recovery rule.** Other drain stories raise this alert for a
-     step they cannot run safely, each under its own subject: `main-state-read` (story #xca0u65, the main-run
-     read failed) and `recheck-state` (story #xi8vgqq, the re-check counter could not be read or written).
+     step they cannot run safely, each under its own subject: `main-state-read` (story #5118, the main-run
+     read failed) and `recheck-state` (story #5117, the re-check counter could not be read or written).
      Each uses the same event pair: `drain-step-refused` when the step refuses, and `drain-step-ok` the next
      time that subject's step runs cleanly after a refusal, so its episode closes like the other two. The
      helper that records the pair takes the subject as an argument and holds no fixed list.
@@ -59,7 +60,7 @@ story does not edit that file, but its replay test reuses the refusal fixture sh
    - one row per subject; it breaches when the newest event for that subject is `drain-step-refused`;
    - its recommendation quotes the refusal reason, for example the file and hash that block numbering. The
      reason is text derived from repository content (a filename a PR chose), so it goes through the journal's
-     write-time cap and control-character strip (story #xcs4nce), and the WIP page renders it as plain text.
+     write-time cap and control-character strip (story #5113), and the WIP page renders it as plain text.
      Add a case to `we:scripts/conveyor/health-smells/__tests__/drain-step-refused.test.mjs`: a refusal reason
      carrying a control character, markup and a 5 000-character filename comes back truncated, stripped, and
      with the markup inert in the summary.

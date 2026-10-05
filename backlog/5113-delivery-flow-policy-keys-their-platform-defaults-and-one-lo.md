@@ -1,7 +1,8 @@
 ---
+bornAs: xcs4nce
 kind: story
 size: 3
-parent: "x0hvbwx"
+parent: "5112"
 status: open
 scope: ["we:config/defineConfig.ts", "we:config/platformDefaults.ts", "we:config/deliveryPolicyDefaults.ts", "we:config/index.ts", "we:config/__tests__/config-contract.test.ts", "we:scripts/lib/delivery-policy.mjs", "we:scripts/lib/__tests__/delivery-policy.test.mjs", "we:scripts/lib/gate-config.mjs", "we:scripts/lib/__tests__/gate-config.test.mjs"]
 dateOpened: "2026-10-03"
@@ -20,7 +21,7 @@ Declare the five delivery-flow policy dimensions (`prCi`, `mergeGate`, `dispatch
 in `we:config/defineConfig.ts`, with their safe defaults in `we:config/deliveryPolicyDefaults.ts` (re-exported
 by `we:config/platformDefaults.ts`). Add one loader
 the daemons call to get the resolved values, and one durable policy-event journal they write to. Every other
-story under epic #x0hvbwx reads its key through this loader.
+story under epic #5112 reads its key through this loader.
 
 ## Progress
 
@@ -30,7 +31,7 @@ Prepared 2026-10-03 against `838e849ab`. This preparation changes no runtime cod
 | --- | --- |
 | The repo has a config mechanism to extend. | Yes. `we:config/defineConfig.ts:91-111` is the open-set author surface, with one key per dimension. `we:config/platformDefaults.ts:38-49` holds platform default values as data. The rule is `config-extends-platform-default` (`we:docs/agent/platform-decisions.md:1684`). |
 | `crossProviderFallback` (PR #3789) is the fresh example. | It is on open PR #3789, not on main yet. It adds a typed value interface, a `DimensionEntry` key, a default in `PLATFORM_FLAVOR_DEFAULTS`, a separate numeric default constant, and contract tests. Follow that shape exactly. |
-| Daemons can already read a resolved config value. | **No.** No `webeverything.config` file exists at the repo root. No script under `we:scripts/` reads one: a grep for `webeverything.config` finds nothing. The TS contract is types and data only (`we:config/index.ts:1-8`). So this story must add the loader. Card #xp33bdf (on PR #3789) needs the same loader for `crossProviderFallback`. |
+| Daemons can already read a resolved config value. | **No.** No `webeverything.config` file exists at the repo root. No script under `we:scripts/` reads one: a grep for `webeverything.config` finds nothing. The TS contract is types and data only (`we:config/index.ts:1-8`). So this story must add the loader. Card #4880 (on PR #3789) needs the same loader for `crossProviderFallback`. |
 | Script code can read the TS defaults. | Yes, through the existing in-process esbuild pattern: `we:scripts/lib/component-tokens.mjs:25-41` transpiles TS and imports the result. Reuse it, so the defaults keep one source. |
 
 **Start after PR #3789 lands.** It edits the same three config files. Building on its shape avoids a conflict
@@ -177,7 +178,7 @@ types from `we:config/index.ts`.
     and caps the whole line at 4 KB (dropping `detail` fields last-first, never the key, event or subject).
     A truncated value ends in `…`. Readers still treat the text as plain text, never markup.
     `we:scripts/lib/delivery-policy.mjs` **exports `POLICY_EVENT_REASON_MAX`** so any gate that refuses an
-    over-long reason (story #x5qhw83) imports the one number instead of keeping its own.
+    over-long reason (story #5116) imports the one number instead of keeping its own.
 - CLI: `node we:scripts/lib/delivery-policy.mjs [--json] [--ref=<git-ref>]` prints the resolved policy, the
   source of each field and any warnings.
 
@@ -287,7 +288,7 @@ character and a 5 000-character reason, showing it stripped and cut.
 ## Follow-ups
 
 - TS and JS project config files, through the same esbuild path.
-- Card #xp33bdf reads `crossProviderFallback` through this loader instead of a private reader.
+- Card #4880 reads `crossProviderFallback` through this loader instead of a private reader.
 
 ## Done when
 

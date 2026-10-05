@@ -1,9 +1,10 @@
 ---
+bornAs: x5qhw83
 kind: story
 size: 5
-parent: "x0hvbwx"
+parent: "5112"
 status: open
-blockedBy: ["xcs4nce", "xq4p21a"]
+blockedBy: ["5113", "5115"]
 scope: ["we:scripts/readiness/overlap-chain.mjs", "we:scripts/readiness/__tests__/overlap-chain.test.mjs", "we:scripts/codex-direct-task.mjs", "we:scripts/gemini-direct-task.mjs", "we:scripts/__tests__/codex-direct-task.test.mjs", "we:scripts/__tests__/gemini-direct-task.test.mjs", "we:scripts/__tests__/direct-task-overlap-gate.test.mjs", "we:scripts/conveyor/health-smells/overlap-override-used.mjs", "we:scripts/conveyor/health-smells/__tests__/overlap-override-used.test.mjs"]
 dateOpened: "2026-10-03"
 preparedDate: "2026-10-03"
@@ -25,7 +26,7 @@ Prepared 2026-10-03 against `838e849ab`.
 | --- | --- |
 | Dispatch already checks open-PR overlap. | **For conveyor builds only.** `we:scripts/conveyor/build-dispatch-policy.mjs:271-274` holds a build whose scope overlaps an open PR's files (rule `scope-vs-open-prs`, declared at `:77`). Conveyor fix and CI-heal jobs compare only against live claims, not open PRs (`filterFixesByInFlightScope`, `we:scripts/conveyor/reconcile-fix-dispatch.mjs:1484`). The orchestrator's direct jobs (`we:scripts/codex-direct-task.mjs`, `we:scripts/gemini-direct-task.mjs`) take no scope and check nothing. |
 | An override exists and is logged. | **No.** There is no flag to override the dispatch-time check, and no durable override record. The only overlap overrides are land-time yield flags (`we:scripts/conveyor/land-overlap-yield.mjs:103-127`), resolved in memory. So on 2026-10-03 the orchestrator overrode by judgment, about five times on open PR #3507's files, and each time #3507 needed another conflict-fix and review round. |
-| The pieces to reuse exist. | `firstScopeOverlap` (`we:scripts/readiness/overlap-chain.mjs:96`), the open-PR fetch with files (`fetchOpenPrsRest` and `BUILD_DISPATCH_PR_FIELDS`, `we:scripts/conveyor/open-pr-fetch.mjs:48`, `:88`), and the policy-event journal and its health probe (stories #xcs4nce and #xq4p21a). |
+| The pieces to reuse exist. | `firstScopeOverlap` (`we:scripts/readiness/overlap-chain.mjs:96`), the open-PR fetch with files (`fetchOpenPrsRest` and `BUILD_DISPATCH_PR_FIELDS`, `we:scripts/conveyor/open-pr-fetch.mjs:48`, `:88`), and the policy-event journal and its health probe (stories #5113 and #5115). |
 
 The detached codex-job runner the orchestrator used on 2026-10-03 is not on main. When it lands, it calls the
 same gate (follow-up).
@@ -78,11 +79,11 @@ same gate (follow-up).
    - When `selfPrExempt` is set, also write one event `overlap-self-pr`, subject `<repo>#<selfPr>`, detail
      `{ files: selfPrExempt.files, dispatcher, mode }`, no reason (none is asked for), in every mode.
    - **Untrusted text.** The reason is free text typed by a dispatching agent, and file names come from
-     other PRs. `recordPolicyEvent` truncates and strips them on write (story #xcs4nce), and the smell and the
+     other PRs. `recordPolicyEvent` truncates and strips them on write (story #5113), and the smell and the
      WIP page treat them as plain text. The gate also rejects, before the length check, a reason containing a
      control character, and refuses a reason longer than `POLICY_EVENT_REASON_MAX` (a longer one is refused,
      not truncated, so the recorded reason is the one the dispatcher meant). That constant is **exported by
-     `we:scripts/lib/delivery-policy.mjs` (story #xcs4nce, value 200) and imported by the gate**: the gate's
+     `we:scripts/lib/delivery-policy.mjs` (story #5113, value 200) and imported by the gate**: the gate's
      cap and the journal's truncation are one number by construction, never two numbers kept in step by hand.
      A reason the gate accepts therefore always reads back from the journal intact.
    - **What the 15-character floor is, and is not.** It stops an empty or one-word reason by accident. It
@@ -90,7 +91,7 @@ same gate (follow-up).
      medium health episode that quotes the reason for 24 hours), not from the length check. The card does not
      claim more.
 4. **WIP.** Add `we:scripts/conveyor/health-smells/overlap-override-used.mjs` on the `policyEvents` probe from
-   story #xq4p21a: severity `medium`, action `alert`, one row per overlapped PR. A row's key is the subject
+   story #5115: severity `medium`, action `alert`, one row per overlapped PR. A row's key is the subject
    `<repo>#<pr>` of the `overlap-override` events (step 3: the overlapped PR, written once per PR), so it
    breaches when an override that overlapped that PR was recorded in the last 24 hours, and the summary quotes
    the reason. It also gets one row

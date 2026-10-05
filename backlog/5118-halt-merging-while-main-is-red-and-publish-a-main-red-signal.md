@@ -1,9 +1,10 @@
 ---
+bornAs: xca0u65
 kind: story
 size: 5
-parent: "x0hvbwx"
+parent: "5112"
 status: open
-blockedBy: ["xcs4nce", "xi8vgqq", "xq4p21a"]
+blockedBy: ["5113", "5117", "5115"]
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/merge-ai-prs-main-red-halt.test.mjs", "we:scripts/operations/live-state.mjs", "we:scripts/operations/live-state-io.mjs", "we:scripts/operations/__tests__/live-state-io.test.mjs", "we:scripts/operations/__tests__/live-state.test.mjs"]
 dateOpened: "2026-10-03"
 preparedDate: "2026-10-03"
@@ -41,15 +42,15 @@ Prepared 2026-10-03 against `838e849ab`.
    - **Commit identity, not start time.** A run's start time does not prove which main it tested: an old
      green run rerun after main turned red gets a new start time but still tests the old merge commit, and a
      queued run can start after the main it merged against went stale. So the exemption uses the run's tested
-     main SHA (`readTestedMainSha`, `we:scripts/lib/tested-main-base.mjs`, built by story #xi8vgqq): the PR is
+     main SHA (`readTestedMainSha`, `we:scripts/lib/tested-main-base.mjs`, built by story #5117): the PR is
      exempt only when `redSha` is an ancestor of, or equal to, that tested SHA. A run whose tested SHA is
-     `unknown` (no exact value can be derived; #xi8vgqq step 1 has no timestamp fallback) is not exempt. That SHA is **derived by the drain, never taken from a value the PR's own job publishes**
-     (see the provenance rule in #xi8vgqq step 1): a PR that could set it could exempt itself from the halt.
+     `unknown` (no exact value can be derived; #5117 step 1 has no timestamp fallback) is not exempt. That SHA is **derived by the drain, never taken from a value the PR's own job publishes**
+     (see the provenance rule in #5117 step 1): a PR that could set it could exempt itself from the halt.
    - **Unreadable main state fails closed.** `defaultReadMainRuns` can throw, hit a rate limit, or return no
      runs at all. The read returns `{ state: 'unknown' }`, distinct from `red` and `green`, and the gate treats
      `unknown` like `red` under `halt`: every PR is skipped with reason `main-state-unreadable` (no exemption
      is possible, because `redSha` is not known), and the drain raises the refusal alert through
-     `drain.onStepRefusal` (story #xq4p21a) under the subject `main-state-read`. The next pass reads again; a
+     `drain.onStepRefusal` (story #5115) under the subject `main-state-read`. The next pass reads again; a
      clean read records `drain-step-ok` for that subject, so this clears by itself when the read recovers. Under `warn` it lands and records the signal; under `off` it is ignored. The break-glass
      bypass (step 3) still applies. A halt that lasts only while the read is down is the safe direction; the
      unsafe one is landing on a red main because the read failed.
@@ -105,7 +106,7 @@ Steps 1 to 5 in WE. The band itself is a plateau-app follow-up.
     SHA (`readTestedMainSha` returns `{ state: 'unknown' }`: merge ref gone, field absent, call failed) is
     skipped under `halt`, even when the PR's own job published a hint naming main's current tip, and even
     when the run's `created_at` falls after `redSha`. The exemption never rests on a timestamp or on a
-    value the PR wrote (the backdated-commit fixture in `we:scripts/lib/__tests__/tested-main-base.test.mjs`, story #xi8vgqq, is
+    value the PR wrote (the backdated-commit fixture in `we:scripts/lib/__tests__/tested-main-base.test.mjs`, story #5117, is
     also run through this gate: not exempt).
   - Break-glass set: lands under `halt`.
   - One event per red window, not one per pass.
@@ -131,7 +132,7 @@ Steps 1 to 5 in WE. The band itself is a plateau-app follow-up.
 - plateau-app: add `mainState` to `WipHealthSectionKey` and render the high-alert band from
   `machineHealth.sections.mainState`. The band, and every health smell that quotes policy-journal text, must
   render that text as **plain text** (never as markup): journal fields are length-capped and stripped of
-  control characters on write (story #xcs4nce), but they can still contain markup characters.
+  control characters on write (story #5113), but they can still contain markup characters.
 - Card #4236 (an owed CI rerun waiting on a red main is bounded and surfaced) is related. It stays separate:
   it is about the CI-heal side, and this story is about landing.
 

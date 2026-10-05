@@ -1,9 +1,10 @@
 ---
+bornAs: xkpbs7b
 kind: story
 size: 5
-parent: "x0hvbwx"
+parent: "5112"
 status: open
-blockedBy: ["xcs4nce"]
+blockedBy: ["5113"]
 scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/__tests__/heavy-admission.test.mjs", "we:scripts/readiness/heavy-queue-projection.mjs", "we:scripts/readiness/__tests__/heavy-admission-repairs-first.test.mjs", "we:scripts/readiness/__tests__/heavy-queue-projection.test.mjs"]
 dateOpened: "2026-10-03"
 preparedDate: "2026-10-03"

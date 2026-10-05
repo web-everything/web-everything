@@ -2,9 +2,9 @@
 bornAs: xabqoah
 kind: story
 size: 3
-parent: "x0hvbwx"
+parent: "5112"
 status: open
-blockedBy: ["xcs4nce"]
+blockedBy: ["5113"]
 scope: ["we:scripts/check-standards.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/check-standards-main-state-parity.test.mjs", "we:scripts/lane-drain.mjs", "we:scripts/__tests__/lane-drain.test.mjs", "we:scripts/__tests__/lane-drain-numbering.test.mjs"]
 dateOpened: "2026-08-05"
 preparedDate: "2026-10-03"
@@ -14,7 +14,7 @@ tags: [backlog, gate, hygiene, policy, ci]
 
 # Gate in-flight backlog hash citations outside the drain's rewrite scope
 
-**Re-aimed 2026-10-03** under epic #x0hvbwx as the `prCi.mainStateParity` story. A PR's check now runs the
+**Re-aimed 2026-10-03** under epic #5112 as the `prCi.mainStateParity` story. A PR's check now runs the
 drain's post-land numbering as a dry run on the PR merged with current main, so a PR that would make the
 drain refuse fails on the PR, not on main. Governed by `prCi.mainStateParity` (default `on`).
 
@@ -110,7 +110,7 @@ run.
    `isPullRequestCiRun` or `inLane` for a rule that is not in the registry. So a new main-only difference
    cannot land without a PR-side twin.
 4. **Policy.** `on`: the dry-run rule runs. `off`: it is skipped (today's behaviour). Read through the loader
-   from story #xcs4nce. In PR CI and lanes, the policy is read from the **base** copy of the config
+   from story #5113. In PR CI and lanes, the policy is read from the **base** copy of the config
    (`ref` = `baseRef`), so a PR cannot switch this rule off for itself.
 
 This also covers failure mode (3), a CI heal turning a PR green without fixing the cause. Under `on`, a heal

@@ -19,7 +19,7 @@ tags: [policy, config, drain, conveyor]
 Operator ask 2026-10-03 (verbatim): "surely there must be many other such strategy that exist in the world and a
 decider could pick between? Opus+codex research as very important". The same day the operator made several
 delivery strategies configurable settings: verify mode (card 4991, PR #3811), overlap strategy (card 4992,
-PR #3813), the main-protection policy keys (cards xcs4nce, xi8vgqq, xkpbs7b, PR #3794) and backlog ids numbered
+PR #3813), the main-protection policy keys (cards 5113, 5117, 5114, PR #3794) and backlog ids numbered
 before publish (PR #3809). This card decides how a **decider** picks between strategies at run time, and how it
 sits under those settings.
 
@@ -37,7 +37,7 @@ compared there; about 50 strategies with sources).
 - **Serial testing cannot serve the merge rate.** About 312 merges in 12 h is 26/h; one 14-minute CI run at a
   time serves about 4/h. PRs today merge on their own green, about 6 merges stale at merge time.
 - **That already breaks a statute.** `#gate-on-merged-tree-lane-fast-fail` puts the binding gate on the merged
-  tree before main moves. Card xi8vgqq (re-check before merge) is the enforcement.
+  tree before main moves. Card 5117 (re-check before merge) is the enforcement.
 - **The batched merge-queue build is already ruled and deferred.** `#event-driven-land-is-wake-only` clause 3
   defers it behind measured land-serialization saturation; tripwire #2740 (open) watches
   `we:scripts/readiness/conveyor-instrument.mjs`; clause 4 surfaces and routes, never auto-builds. GitHub's native
@@ -46,7 +46,7 @@ compared there; about 50 strategies with sources).
   red-main fallout. No per-test flake signal exists (card 4999).
 - **Overlap:** 5 of 23 open PRs share a non-backlog file with another open PR.
 - **Auto-revert is built but dormant.** #3361 (deferred 2026-08-26, "recover manually until it hurts").
-- **The config surface exists in design.** Card xcs4nce adds `we:scripts/lib/delivery-policy.mjs`
+- **The config surface exists in design.** Card 5113 adds `we:scripts/lib/delivery-policy.mjs`
   (`loadDeliveryPolicy`, per-field `sources`, `recordPolicyEvent` journal). A second settings home already exists
   for one strategy: `we:scripts/drain-overlap-yield-config.json` under `#drain-overlap-yield-landing-order`.
 - **The heavy-slot cap is owned elsewhere.** `#heavy-command-admission-queue` keeps the cap a fixed number; epic
@@ -83,7 +83,7 @@ table and the mapping of every setting ruled today are sections 5.4 and 5.7 of t
   `#event-driven-land-is-wake-only` clause-3 build, after #2740 fires and the operator confirms it. The decider is
   never a way to start that build early.
 - **Correctness of what lands is enforced, not un-gated.** Merging on a stale own-green is closed by enforcing
-  `#gate-on-merged-tree-lane-fast-fail` through xi8vgqq. A second, correctness-based input to tripwire #2740 may be
+  `#gate-on-merged-tree-lane-fast-fail` through 5117. A second, correctness-based input to tripwire #2740 may be
   proposed only after 5000 and 5001 land and culprit-finding data shows integration-attributed red windows
   while `recheckWhenMainMoved` is `always`. Until then clause 3 is unchanged.
 - **Shadow mode first.** A field set to `auto` starts in shadow: the decider computes and journals its choice next
@@ -148,7 +148,7 @@ per-item override; safety-class fields are tighten-only (an `auto` that could pi
 heavy-slot cap stays with #3611; `#config-extends-platform-default` cited for shape only. The same pass dissolved
 two draft forks: "rule table vs bandit" (settled by `#deterministic-core-thin-judgment`) and "a correctness
 un-gate for the batched queue" (REFUTED: `#gate-on-merged-tree-lane-fast-fail` already covers it; enforce it
-through xi8vgqq instead of amending `#event-driven-land-is-wake-only` clause 3).
+through 5117 instead of amending `#event-driven-land-is-wake-only` clause 3).
 **Screen:** clear. The precedence rule is visible to the operator, and (b) loses on merit (it breaks the ruling),
 not on build order. The two dissolved draft forks were flagged by the screen too (impl detail; prioritization) and
 are now "supported by default" entries.
@@ -166,11 +166,11 @@ Already filed with this card (each useful without the decider):
 On ratification, file:
 
 1. `auto` values, tighten-only enforcement and the bound fields per Fork 1 in the delivery-policy loader
-   (extends card xcs4nce), and the one-home merge with `we:scripts/drain-overlap-yield-config.json`. Scope
+   (extends card 5113), and the one-home merge with `we:scripts/drain-overlap-yield-config.json`. Scope
    `we:config/defineConfig.ts`, `we:config/platformDefaults.ts`, `we:scripts/lib/delivery-policy.mjs`.
 2. The decider core: rule table for D1, D2, D3, D5, D6, D7, D8, D9, hold times, journal, `--explain`, shadow
    mode. Scope `we:scripts/lib/delivery-decider.mjs` and its tests.
-3. Wiring per consumer, inside the stories that own each point (4991, 4992, xi8vgqq, xca0u65, xkpbs7b).
+3. Wiring per consumer, inside the stories that own each point (4991, 4992, 5117, 5118, 5114).
 
 ## Ruling — RATIFIED 2026-10-03
 

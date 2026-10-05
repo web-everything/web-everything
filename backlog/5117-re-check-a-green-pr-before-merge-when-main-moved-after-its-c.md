@@ -1,9 +1,10 @@
 ---
+bornAs: xi8vgqq
 kind: story
 size: 5
-parent: "x0hvbwx"
+parent: "5112"
 status: open
-blockedBy: ["xcs4nce", "xq4p21a"]
+blockedBy: ["5113", "5115"]
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/merge-ai-prs-recheck-main-moved.test.mjs", "we:scripts/lib/tested-main-base.mjs", "we:scripts/lib/__tests__/tested-main-base.test.mjs", "we:.github/workflows/ci.yml"]
 dateOpened: "2026-10-03"
 preparedDate: "2026-10-03"
@@ -43,7 +44,7 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
      exact one**, the first parent of the merge commit GitHub built for the event (`refs/pull/<n>/merge` as
      of the run's trigger), read through the API by the drain.
    - **The rule, in one line (operator ruling on this card):** the tested main commit is either established
-     **exactly** or it is `unknown`, and `unknown` **refuses**: this gate re-checks, and #xca0u65 grants no
+     **exactly** or it is `unknown`, and `unknown` **refuses**: this gate re-checks, and #5118 grants no
      exemption. Nothing estimates it. The helper may never return a commit it only believes was tested.
    - **A pinned source must be proved to exist before it is relied on.** A probe on 2026-10-04 of a real
      merged PR's `CI` run (`gh api repos/<repo>/actions/runs?head_sha=<head>`) showed `pull_requests` empty and
@@ -52,7 +53,7 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
      merge commit, and record a real-run fixture of it (Proof plan step 0). **If no such source passes,
      the story still ships:** `readTestedMainSha` returns `unknown` for every run, so every run is re-checked
      whenever main is not proven contained (below), **whatever the run's age** (step 3 skips the age gate for
-     `unknown`), and #xca0u65 never grants an exemption. That is the intended refuse-by-default state, never
+     `unknown`), and #5118 never grants an exemption. That is the intended refuse-by-default state, never
      a reason to add a guess.
    - **The one other exact fact: what the run's own head contains.** Let `B = merge-base(head_sha, mainTip)`,
      with `head_sha` the run's own field. `B` is an ancestor of the head, so it is in the tree the run tested,
@@ -63,8 +64,8 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
      source exists, and merge A's own later numbering commit does not strand it. This relies on main being
      append-only (branch protection forbids force-push), and an ancestry check that fails, or a commit
      object that is missing, counts as **not contained** (moved). It is the only way an `unknown` run can
-     pass, it reads no clock, and it is used by this gate only: #xca0u65 reads `readTestedMainSha`, never
-     this containment walk, so for #xca0u65 an `unknown` run is still not exempt.
+     pass, it reads no clock, and it is used by this gate only: #5118 reads `readTestedMainSha`, never
+     this containment walk, so for #5118 an `unknown` run is still not exempt.
    - **No exact value means unknown, and unknown is never guessed.** There is **no timestamp fallback**. A
      commit date is not a push time, so "main's tip as of `created_at`" can name a commit the run never
      tested (a main commit pushed after the run was created can carry an older commit date, whatever
@@ -76,7 +77,7 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
      untested main. When no such pinned merge commit is available (the merge ref was deleted or rebuilt, the
      second parent does not match, the call fails, or the field is absent), `readTestedMainSha` returns `{ state: 'unknown' }`. The two
      callers then fail closed: this story's gate treats `unknown` as **moved** (re-check), and the main-red
-     gate (#xca0u65) grants **no exemption**. A re-check costs one CI cycle, bounded by the per-PR cap in
+     gate (#5118) grants **no exemption**. A re-check costs one CI cycle, bounded by the per-PR cap in
      step 3; a wrong "tested" costs an untested merge.
    - **A claim can only add re-checks, never remove them, and never stands in for the derived value.** Add a
      one-line step to `we:.github/workflows/ci.yml`, right after checkout, that records `git rev-parse HEAD^1`
@@ -87,7 +88,7 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
      on main's first-parent line is ignored. **When the derived value is `unknown`, the hint is not used at
      all** (the PR's own job wrote it, so it cannot establish a tested commit by itself): the result stays
      `unknown`.
-   Shared helpers live in `we:scripts/lib/tested-main-base.mjs`, which the main-red story (#xca0u65) also
+   Shared helpers live in `we:scripts/lib/tested-main-base.mjs`, which the main-red story (#5118) also
    uses: `readTestedMainSha(run)` (derive exactly, then apply the hint rule; returns `{ state: 'exact', sha }`
    or `{ state: 'unknown', reason }`) and `mainMovedSince(tested, mainTip, runHeadSha)`, which returns
    "moved" for an `unknown` input unless the walk from `merge-base(head_sha, mainTip)` to `mainTip` finds
@@ -131,7 +132,7 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
      - **Exact tested SHA:** it proceeds as `off` would. The main it tested is known, so the merge is a
        known, bounded risk, never a guess. So a busy main can delay such a PR by at most two CI cycles.
      - **`unknown` tested SHA (and main not contained in the head):** it is **held, never merged**: skipped
-       with reason `recheck-unknown-held`, and the refusal alert (story #xq4p21a) is raised under the subject
+       with reason `recheck-unknown-held`, and the refusal alert (story #5115) is raised under the subject
        `recheck-unknown-held`. The cap limits rebuilds; it never turns "unknown" into "tested". The hold
        clears on its own once the window passes (the PR is rebuilt again) or once main stops moving long
        enough for a rebuilt head to contain main's tip.
@@ -139,13 +140,13 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
      write-only audit (`recordPolicyEvent` never throws, so an unwritable or rotated journal silently loses
      events and would reset a journal-derived count to 0 on every pass, which is a rebuild loop). The count
 is a durable per-PR record (timestamps of each re-check) in a new JSON state file named `recheck-state` (a runtime file, not a repo path) in
-     the same logs directory as the journal (`defaultLogsDir`, story #xcs4nce) but a **separate file** with a
+     the same logs directory as the journal (`defaultLogsDir`, story #5113) but a **separate file** with a
      separate reader and writer (no existing per-PR drain store was found in `we:scripts/merge-ai-prs.mjs`).
      It is keyed `<repo>#<pr>`, written by write-to-temp-then-rename so a crash leaves the old file intact,
      and entries older than the window are dropped on write. **Order matters:** the drain writes the count
      first and rebuilds only if that write succeeded. If the file cannot be read (other than "does not exist
      yet", which is an empty count) or cannot be written, the drain does **not** re-check and raises the
-     refusal alert (story #xq4p21a) under the subject `recheck-state`. A PR with an exact tested SHA then
+     refusal alert (story #5115) under the subject `recheck-state`. A PR with an exact tested SHA then
      proceeds as `off` would; a PR with an `unknown` tested SHA that main moved past is **held** (skipped with
      `recheck-unknown-held`), never merged, exactly as at the cap. A clean
      read and write afterwards records `drain-step-ok`. A broken store can never produce an unbounded rebuild
@@ -187,7 +188,7 @@ Steps 1 to 5.
     10 minutes** but which arrived on main **after** the run (a backdated or cherry-picked commit; commit
     dates and arrival order disagree). With the API giving no exact merge-commit parent, `readTestedMainSha`
     returns `{ state: 'unknown' }` (not M1, not M0), `mainMovedSince` returns moved, and the PR is
-    re-checked. The same fixture under #xca0u65's exemption is **not exempt**. Also: the merge-commit
+    re-checked. The same fixture under #5118's exemption is **not exempt**. Also: the merge-commit
     field absent, the call throwing, and a deleted merge ref each give `unknown`. So does a **rebuilt merge
     ref**: the live merge commit's first parent is a newer main than the run tested, or its second parent
     differs from the run's `head_sha`; it is never read as the tested commit. (The 10 minutes in this
@@ -288,5 +289,5 @@ Steps 1 to 5.
    an unknown tested commit" and "Default policy, a fresh run with an unknown tested commit" cases in
    `we:scripts/__tests__/merge-ai-prs-recheck-main-moved.test.mjs`, fail before this lands and pass after.
    Under any policy value other than the `off` kill switch (itself a human-gated config edit, story
-   #xcs4nce), no path (age gate, re-check cap, broken re-check store, hint, or #xca0u65 exemption) merges a
+   #5113), no path (age gate, re-check cap, broken re-check store, hint, or #5118 exemption) merges a
    PR whose tested main is `unknown` and that main moved past since `merge-base(head_sha, mainTip)`.
