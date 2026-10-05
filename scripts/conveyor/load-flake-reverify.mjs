@@ -21,7 +21,11 @@ export const VERIFY_ENV_ALLOWLIST = Object.freeze([
 ]);
 const VERIFY_SECRET = /TOKEN|SECRET|PASSWORD|PRIVATE_KEY|CREDENTIAL|API_KEY|ACCESS_KEY|AUTH|SSH_AUTH_SOCK|^WE_GITHUB_APP_/i;
 // npm reads these names in ANY case (npm_config_*, NPM_CONFIG_*, mixed), so the match is case-insensitive.
-const NPM_CREDENTIAL_CONFIG = /^npm_config_.*(token|auth|password|_key|secret|cert|userconfig|globalconfig)/i;
+// Beyond auth/key/cert material this also covers proxy and registry knobs (their URLs can embed `user:pass@`),
+// one-time passwords, passphrases and CA bundles (`ca`, `cafile`).
+const NPM_CREDENTIAL_CONFIG = /^npm_config_(?:.*(?:token|auth|password|key|secret|cert|userconfig|globalconfig|proxy|registry|otp|passphrase).*|cafile|ca)$/i;
+// A URL carrying `user:pass@` credentials in ANY allowed value is dropped, whatever the variable is called.
+const URL_CREDENTIALS = /:\/\/[^/\s:@]*:[^/\s@]*@/;
 // Path-valued knobs: a literal leading `~` must resolve against the REAL home, not the scratch HOME the child gets.
 const VERIFY_PATH_VARS = new Set(['LANE_POOL_ROOT', 'CONVEYOR_RUNNER_LOCK_ROOT', 'PLAYWRIGHT_BROWSERS_PATH']);
 const expandTilde = (value, home) => (home && (value === '~' || value.startsWith('~/')) ? join(home, value.slice(1)) : value);
@@ -164,12 +168,15 @@ async function reverifyCandidate({ candidate, key, slug, config }, io) {
 }
 
 /** Fixer-authored verification gets only required knobs and explicit non-secret extensions.
- *  HOME and temp paths point into disposable scratch directories, never the daemon's credential homes, and npm's
- *  user/global config paths are dropped so the child's npm never loads the daemon's ~/.npmrc auth. Pure. */
+ *  HOME and temp paths point into disposable scratch directories, and npm's user/global config paths are dropped so
+ *  the child's npm never loads the daemon's ~/.npmrc auth. This is ENV HYGIENE, not a sandbox: the child still runs
+ *  as the daemon's OS user and can read credential files by absolute path or reach keychain-backed helpers.
+ *  Isolating it from those needs a separate OS user or a sandbox profile. Pure. */
 export function scrubVerifyEnv(env = process.env, { allow = [], scratchDir, home = env.HOME || os.homedir() } = {}) {
-  const clean = Object.fromEntries(Object.entries(env).filter(([k]) => !VERIFY_SECRET.test(k)
+  const clean = Object.fromEntries(Object.entries(env).filter(([k, v]) => !VERIFY_SECRET.test(k)
     && !/^(HOME|TMPDIR|TMP|TEMP|GIT_ASKPASS)$|^(GITHUB_|GH_|SSH_)/.test(k)
     && !NPM_CREDENTIAL_CONFIG.test(k)
+    && !(typeof v === 'string' && URL_CREDENTIALS.test(v))
     && (allow.includes(k) || VERIFY_ENV_ALLOWLIST.some((name) => name.endsWith('*') ? k.startsWith(name.slice(0, -1)) : k === name)))
     .map(([k, v]) => [k, VERIFY_PATH_VARS.has(k) && typeof v === 'string' ? expandTilde(v, home) : v]));
   if (scratchDir) Object.assign(clean, { HOME: join(scratchDir, 'home'), TMPDIR: join(scratchDir, 'tmp'), TMP: join(scratchDir, 'tmp'), TEMP: join(scratchDir, 'tmp') });

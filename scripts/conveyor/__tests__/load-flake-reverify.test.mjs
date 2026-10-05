@@ -246,6 +246,28 @@ describe('verify environment allowlist', () => {
     // Defence in depth: even a hand-built allow list that skipped config validation never reaches the child.
     expect(scrubVerifyEnv({ [name]: '/Users/real/.npmrc', PATH: '/bin' }, { allow: [name] })).toEqual({ PATH: '/bin' });
   });
+  it.each([
+    'npm_config_key', 'NPM_CONFIG_KEY', 'npm_config_otp', 'npm_config_proxy', 'npm_config_https_proxy', 'NPM_CONFIG_HTTPS_PROXY',
+    'npm_config_registry', 'npm_config_passphrase', 'npm_config_cafile', 'npm_config_ca',
+  ])('drops credential-bearing npm knob %s from the child env and rejects it as an extension', (name) => {
+    expect(scrubVerifyEnv({ [name]: 'secret-value', PATH: '/bin', npm_config_cache: '/c' }, { scratchDir: '/s' }))
+      .toEqual({ PATH: '/bin', npm_config_cache: '/c', HOME: '/s/home', TMPDIR: '/s/tmp', TMP: '/s/tmp', TEMP: '/s/tmp' });
+    expect(scrubVerifyEnv({ [name]: 'secret-value', PATH: '/bin' }, { allow: [name] })).toEqual({ PATH: '/bin' });
+    expect(() => reverifyConfig({ WE_LOAD_FLAKE_VERIFY_ENV_ALLOW: name })).toThrow(/npm credential-config/);
+  });
+  it.each(['npm_config_cache', 'npm_config_loglevel', 'npm_config_prefix', 'npm_config_offline', 'npm_config_prefer_offline'])(
+    'keeps non-credential npm knob %s', (name) => {
+      expect(scrubVerifyEnv({ [name]: 'v' })).toEqual({ [name]: 'v' });
+    });
+  it.each([
+    'http://user:pass@proxy.example:8080', 'https://u:p@registry.example/path', 'git+https://tok:x-oauth-basic@host/repo.git',
+  ])('drops any allowed value that embeds URL credentials: %s', (value) => {
+    expect(scrubVerifyEnv({ npm_config_cache: value, NODE_OPTIONS: value, PATH: '/bin' }, { allow: ['MY_KNOB'] })).toEqual({ PATH: '/bin' });
+    expect(scrubVerifyEnv({ MY_KNOB: value }, { allow: ['MY_KNOB'] })).toEqual({});
+  });
+  it('keeps a URL value with no embedded credentials', () => {
+    expect(scrubVerifyEnv({ MY_KNOB: 'https://example.com/a@b' }, { allow: ['MY_KNOB'] })).toEqual({ MY_KNOB: 'https://example.com/a@b' });
+  });
   it('a non-credential npm extension in any case is still allowed', () => {
     expect(reverifyConfig({ WE_LOAD_FLAKE_VERIFY_ENV_ALLOW: 'NPM_CONFIG_CACHE' }).verifyEnvAllow).toEqual(['NPM_CONFIG_CACHE']);
     expect(scrubVerifyEnv({ NPM_CONFIG_CACHE: '/c' }, { allow: ['NPM_CONFIG_CACHE'] })).toEqual({ NPM_CONFIG_CACHE: '/c' });
