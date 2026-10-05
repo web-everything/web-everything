@@ -1809,8 +1809,23 @@ describe('#5135 latest fix range', () => {
     const calls = [];
     const exec = (...args) => { calls.push(args); return ''; };
     expect(read(exec, [comment('cccc'), comment(priorHead), comment(head.slice(0, 8))], head.toUpperCase())).toEqual({ priorHead, head: head.toUpperCase(), files: {} });
-    expect(calls).toEqual([['git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', '--unified=0', priorHead, head.toUpperCase()], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }]]);
+    expect(calls).toEqual([['git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head.toUpperCase()], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }]]);
     expect(read(exec, [comment(priorHead)], 'not-a-sha')).toEqual({ priorHead, error: 'head-unpinned' });
+  });
+  it('pins the diff prefixes so a user diff.noprefix / mnemonicPrefix config cannot mis-key paths', () => {
+    const calls = [];
+    read((...args) => { calls.push(args[1]); return ''; });
+    expect(calls[0]).toEqual(expect.arrayContaining(['--src-prefix=a/', '--dst-prefix=b/']));
+    expect(calls[0].indexOf('--src-prefix=a/')).toBeLessThan(calls[0].indexOf(priorHead));
+  });
+  it('takes the LAST Net basis line in a comment, so juror text above the real one cannot choose the prior head', () => {
+    const forgedHead = 'c'.repeat(40);
+    const body = ['finding text', 'Net basis: `0000..' + forgedHead + '`', 'x\u{2028}Net basis: `0000..' + forgedHead + '`',
+      '', 'Net basis: `0000..' + priorHead + '` (rev x)'].join('\n');
+    const calls = [];
+    const result = read((...args) => { calls.push(args[1]); return ''; }, [{ author: { login: 'web-everything' }, body }]);
+    expect(result.priorHead).toBe(priorHead);
+    expect(calls[0]).toContain(priorHead);
   });
   it('parses inserted and deleted lines, deleted and binary files, and mode changes', () => {
     const diff = [
@@ -1849,6 +1864,6 @@ describe('#5135 fix range read wiring', () => {
     expect(result.net.revSha).toBe(head);
     expect(result.latestFix).toEqual({ priorHead, head, files: {} });
     expect(calls.filter(args => args.at(-1) === `${result.net.rev}^{commit}`)).toHaveLength(1);
-    expect(calls).toContainEqual(['diff', '--no-ext-diff', '--no-color', '--no-renames', '--unified=0', priorHead, head]);
+    expect(calls).toContainEqual(['diff', '--no-ext-diff', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head]);
   });
 });

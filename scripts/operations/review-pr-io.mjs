@@ -317,7 +317,9 @@ export function readLatestFixRange(options = {}) {
     const current = typeof head === 'string' && /^[0-9a-f]+$/i.test(head) ? head.toLowerCase() : null;
     for (const comment of (Array.isArray(comments) ? comments : []).slice().reverse()) {
       if (!isTrustedMarkerAuthor(comment) || typeof comment.body !== 'string') continue;
-      const reviewed = comment.body.match(/^Net basis: `([0-9a-f]+)\.\.([0-9a-f]+)`/im)?.[2]?.toLowerCase();
+      // The LAST line-anchored match: the renderer emits the real `Net basis:` line after the juror text, so a line
+      // forged above it by a PR author must not choose the prior head.
+      const reviewed = [...comment.body.matchAll(/^Net basis: `([0-9a-f]+)\.\.([0-9a-f]+)`/gim)].at(-1)?.[2]?.toLowerCase();
       if (reviewed && (!current || (!reviewed.startsWith(current) && !current.startsWith(reviewed)))) {
         priorHead = reviewed;
         break;
@@ -327,7 +329,7 @@ export function readLatestFixRange(options = {}) {
     if (!current) return { priorHead, error: 'head-unpinned' };
     let diff;
     try {
-      diff = String(exec('git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', '--unified=0', priorHead, head], {
+      diff = String(exec('git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head], {
         // A rebase between rounds can make this diff several MB; the 1 MB default would throw and fall back to `all`.
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER,
       }) ?? '');

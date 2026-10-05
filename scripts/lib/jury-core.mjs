@@ -1251,6 +1251,8 @@ export function classifyLaterRoundAdvisory(findings, options = {}) {
   const list = Array.isArray(findings) ? findings : [];
   const keepAll = (fellBack = null) => ({ kept: list, deferred: [], scope: fellBack ? 'all' : scope, fellBack });
   if (latestFix == null || latestFix.priorHead === null) return keepAll();
+  // `all` was asked for: nothing is scoped, so an unreadable range is not a fallback and must not be reported as one.
+  if (scope !== 'changed-only') return keepAll();
   if (latestFix.error) return keepAll(`changed-range-unreadable: ${latestFix.error}`);
   const files = latestFix.files;
   if (typeof latestFix.priorHead !== 'string' || !latestFix.priorHead
@@ -1278,9 +1280,19 @@ export function classifyLaterRoundAdvisory(findings, options = {}) {
   return { kept, deferred, scope, fellBack: null };
 }
 
-const outcomeCitation = f => f?.file
+/**
+ * Juror text is untrusted (a PR author can plant it in the diff). Fold every line terminator JS's multiline `^`
+ * recognises (and the other vertical-space characters) and drop backticks, so an interpolated value can never open
+ * a new line — e.g. a forged `**Advisory outcome:**` that `parseAdvisories` would read ahead of the real one — or
+ * break out of a code span. ONE helper for every renderer that interpolates juror text. PURE.
+ */
+export function foldUntrusted(text) {
+  return String(text ?? '').replace(/[\r\n\u{2028}\u{2029}\u{85}\v\f]+/gu, ' ').replace(/`/g, "'");
+}
+
+const outcomeCitation = f => foldUntrusted(f?.file
   ? `${f.file}${Number.isInteger(f.line) && f.line > 0 ? `:${f.line}` : ''}`
-  : String(f?.summary ?? '').slice(0, 60);
+  : String(f?.summary ?? '').slice(0, 60));
 
 export function explainPanelOutcome({ outcome, lensVerdicts = {}, findings = [], mandatoryLenses = MANDATORY_LENSES,
   blockedReferrals, pendingReferrals, deferredCount = 0, scopeFellBack = null } = {}) {
@@ -1304,8 +1316,8 @@ export function explainPanelOutcome({ outcome, lensVerdicts = {}, findings = [],
     else reason = 'Changes: the panel did not accept this head';
   }
   if (deferredCount > 0) reason += ` · ${deferredCount} later-round advisory finding(s) moved to card suggestions`;
-  if (scopeFellBack) reason += ` · advisory scope fell back to \`all\` (${scopeFellBack})`;
-  return reason.replace(/[\r\n]+/g, ' ');
+  if (scopeFellBack) reason += ` · advisory scope fell back to \`all\` (${foldUntrusted(scopeFellBack)})`;
+  return reason.replace(/[\r\n\u{2028}\u{2029}\u{85}\v\f]+/gu, ' ');
 }
 
 /** Lenses that are ALWAYS surfaced but never block the unanimous-accept land path (#2310) — see the module doc

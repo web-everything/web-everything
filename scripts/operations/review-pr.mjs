@@ -1,4 +1,4 @@
-import { requiresMandatoryReferral, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome } from '../lib/jury-core.mjs';
+import { requiresMandatoryReferral, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted } from '../lib/jury-core.mjs';
 /**
  * @file scripts/operations/review-pr.mjs
  * @description THE `review-pr` DECLARATION — the first real operation on the engine (#3035, under epic #3029).
@@ -1492,14 +1492,8 @@ export function buildReviewAntigravityJudgeRequest({ read, aim = '' }) {
   };
 }
 
-/**
- * Juror text is untrusted (a PR author can plant it in the diff). Fold every line terminator and drop backticks so
- * an interpolated value can never open a new line — e.g. a forged `**Advisory outcome:**` that `parseAdvisories`
- * would read ahead of the real one — or dress itself as a code span. PURE.
- */
-export function foldUntrusted(text) {
-  return String(text ?? '').replace(/[\r\n\u2028\u2029\u0085\v\f]+/g, ' ').replace(/`/g, "'");
-}
+// `foldUntrusted` lives in jury-core so `explainPanelOutcome` (the note's first line) shares it; re-exported here.
+export { foldUntrusted };
 
 /**
  * The "Card suggestions (filed later)" section for later-round advisory findings that were diverted out of

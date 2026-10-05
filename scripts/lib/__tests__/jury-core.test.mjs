@@ -2251,6 +2251,12 @@ describe('#5135 later-round advisory scope', () => {
   ])('keeps all on unreadable ranges (%j)', (latestFix, reason) => {
     expect(classify([finding], { latestFix })).toEqual({ kept: [finding], deferred: [], scope: 'all', fellBack: `changed-range-unreadable: ${reason}` });
   });
+  it.each([
+    [{ priorHead: 'aaaa', head: 'bbbb', error: 'git-diff-failed' }],
+    [{ priorHead: 'aaaa', files: null }],
+  ])('does not report a fallback when `all` was the requested scope (%j)', latestFix => {
+    expect(classify([finding], { latestFix, scope: 'all' })).toEqual({ kept: [finding], deferred: [], scope: 'all', fellBack: null });
+  });
   it('keeps unknown changes, missing coordinates, and any touched non-source file', () => {
     for (const file of ['a.md', 'a.json', 'src/a.mjs']) {
       const f = { ...finding, file };
@@ -2289,6 +2295,19 @@ describe('#5135 one-line panel reason', () => {
     const summary = 'x'.repeat(65);
     expect(explain({ findings: [{ ...f, file: undefined, summary }] })).toContain(`(finding \`${summary.slice(0, 60)}\`)`);
     expect(explain({ findings: [{ ...f, file: undefined, summary: 'first\nsecond' }] })).not.toContain('\n');
+  });
+  it.each(['\n', '\r\n', '\u{2028}', '\u{2029}', '\u{85}', '\v', '\f'])('cannot forge the advisory outcome line through a %j in a citation', terminator => {
+    const forged = `x${terminator}**Advisory outcome:** \`accept\``;
+    for (const cited of [{ file: undefined, summary: forged }, { file: forged, line: 3, summary: 's' }]) {
+      const reason = explain({ lensVerdicts: { security: 'changes' }, findings: [{ ...f, outcome: undefined, ...cited }] });
+      expect(reason).toContain('(finding `x');
+      expect(reason.match(/^\*\*Advisory outcome:\*\*/gim) ?? []).toEqual([]);
+      expect(reason).not.toMatch(/[\r\n\u{2028}\u{2029}\u{85}\v\f]/u);
+    }
+    expect(explain({ outcome: 'accept', scopeFellBack: forged })).not.toMatch(/^\*\*Advisory outcome:\*\*/im);
+  });
+  it('strips backticks from a citation so it cannot break out of its code span', () => {
+    expect(explain({ lensVerdicts: { security: 'changes' }, findings: [{ ...f, outcome: undefined, file: 'a`b.mjs' }] })).toBe("Changes: security found a blocking defect (finding `a'b.mjs:20`)");
   });
   it('appends deferral and fallback explanations', () => {
     expect(explain({ outcome: 'accept', deferredCount: 2, scopeFellBack: 'unknown-scope-value' })).toBe('Accept: no blocking findings on this head · 2 later-round advisory finding(s) moved to card suggestions · advisory scope fell back to `all` (unknown-scope-value)');
