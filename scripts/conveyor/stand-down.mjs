@@ -193,10 +193,27 @@ export const isSafeGitBranch = (v) => typeof v === 'string' && v.length <= 200
   && /^[A-Za-z0-9._][A-Za-z0-9._/-]*$/.test(v) && !/\.\.|\/\/|\.lock(\/|$)|\/$|\.$|^\./.test(v);
 export const LEGACY_LOAD_FLAKE_CUTOFF = '2026-10-05T00:00:00Z';
 
+/** The repo key a `gh` comment URL (`https://github.com/<owner>/<repo>/pull/N#issuecomment-…`) names, or `null` when the
+ *  comment carries no URL or one for an unknown repo. */
+const commentRepoKey = (c) => {
+  const m = /^https:\/\/github\.com\/([^/]+\/[^/]+)\//.exec(typeof c?.url === 'string' ? c.url : '');
+  return m ? repoKeyForSlug(m[1]) : null;
+};
+
+/**
+ * A pre-cutoff gate-red stand-down that names load flakiness and a saved alt sha reads as a load-flake hold, but only
+ * where the reverify pass actually works (`LOAD_FLAKE_REVERIFY_REPOS`). A comment whose URL names any other repo
+ * stays a terminal stand-down: nothing would ever reverify it, so reclassifying it would park the PR silently
+ * (PR #3945 advisory review). A comment with no URL (a fixture, a bare-string reader) cannot be placed in another
+ * repo, so it keeps the reclassification. `standDownComments`, `loadFlakeHolds` and the answer reader all
+ * share this one predicate, so a legacy comment is never both terminal and a hold, nor neither.
+ */
 export function isLoadFlakeStandDown(c) {
   const body = c?.body ?? '';
   const at = Date.parse(c?.createdAt ?? '');
-  return body.trimStart().startsWith(STAND_DOWN_MARKER)
+  const repoKey = commentRepoKey(c);
+  return (repoKey === null || LOAD_FLAKE_REVERIFY_REPOS.includes(repoKey))
+    && body.trimStart().startsWith(STAND_DOWN_MARKER)
     && STAND_DOWN_TRAILER_RE.exec(body)?.[1] === 'gate-red'
     && at < Date.parse(LEGACY_LOAD_FLAKE_CUTOFF)
     // #3881 says "load flakiness", #3932 (17:06 ET) says "load timeouts"; both name a saved alt sha. Bounded by

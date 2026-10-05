@@ -432,6 +432,16 @@ describe('load-flake holds', () => {
     expect(countTerminalStandDowns([loadComment(c.body.replace('load flakiness', 'test failure').replace('load timeouts', 'test failures'))])).toBe(1);
     expect(loadFlakeHolds([{ ...c, author: { login: 'stranger' } }])).toEqual([]);
   });
+  it('reclassifies only where the reverify pass works: a legacy comment on another repo stays terminal (PR #3945 review)', () => {
+    const on = (slug) => ({ ...loadComment(loadFlakeLegacyBody), url: `https://github.com/${slug}/pull/12#issuecomment-1` });
+    for (const slug of ['frontier-ui/frontierui', 'plateauapp/plateau-app']) {
+      expect(countTerminalStandDowns([on(slug)])).toBe(1);
+      expect(loadFlakeHolds([on(slug)])).toEqual([]);
+      expect(loadFlakeHoldsFull([on(slug)])).toEqual([]);
+    }
+    expect(countTerminalStandDowns([on('web-everything/web-everything')])).toBe(0);
+    expect(loadFlakeHolds([on('web-everything/web-everything')])).toHaveLength(1);
+  });
   it('reclassifies #3932\'s "load timeouts" wording too (17:06 ET stand-down)', () => {
     const c = loadComment(loadTimeoutLegacyBody, '2026-10-04T21:06:04Z');
     expect(countTerminalStandDowns([c])).toBe(0);

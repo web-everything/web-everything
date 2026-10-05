@@ -3535,3 +3535,12 @@ it('a legacy load-flake hold the thread superseded no longer refuses the PR (PR 
   expect(kinds([legacy, answer])).not.toContain('load-flake-hold');
   expect(kinds([legacy, answer])).not.toContain('stood-down');
 });
+
+it('a legacy load-flake stand-down on a repo the reverify pass never sweeps stays terminal (PR #3945 review)', () => {
+  const legacy = (slug) => ({ id: 'IC_legacy_hold', body: loadFlakeLegacyBody, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION,
+    url: `https://github.com/${slug}/pull/12#issuecomment-1` });
+  const kinds = (slug) => planReconcile({ prs: [pr1563({ comments: [finding(), legacy(slug)] })], agents: [], durableCounts: {}, now: NOW }).refusals.map((r) => r.kind);
+  expect(kinds('frontier-ui/frontierui')).toContain('stood-down');
+  expect(kinds('frontier-ui/frontierui')).not.toContain('load-flake-hold');
+  expect(kinds('web-everything/web-everything')).toContain('load-flake-hold');
+});

@@ -35,6 +35,10 @@ export default {
     if (countUnresolvedStandDowns([late]) !== 1) violations.push('post-cutoff prose was sniffed');
     const plain = { ...comment, body: BODY.replace(/load flakiness/g, 'a real failure') };
     if (countUnresolvedStandDowns([plain]) !== 1) violations.push('ordinary gate-red no longer terminal');
+    // PR #3945 review: the reverify pass sweeps only WE, so a legacy comment on another repo must stay terminal.
+    const { CONSTELLATION_REPOS } = await import(pathToFileURL(join(root, 'scripts/lib/constellation-repos.mjs')).href);
+    const elsewhere = { ...comment, url: `https://github.com/${CONSTELLATION_REPOS.frontierui.slug}/pull/12#issuecomment-1` };
+    if (countUnresolvedStandDowns([elsewhere]) !== 1) violations.push('legacy load-flake stand-down on a repo nothing reverifies was parked silently');
     return { violations };
   },
   judge(report) { return report.violations; },
