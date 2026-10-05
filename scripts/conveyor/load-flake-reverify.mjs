@@ -13,19 +13,24 @@ import { loadFlakeHoldState } from './load-flake-hold.mjs';
 import { redactSecrets } from './ci-heal-mark.mjs';
 
 export function reverifyConfig(env = process.env, maxLoadPerCore) {
-  const mode = env.WE_LOAD_FLAKE_REVERIFY_MODE ?? 'local';
-  if (!['local', 'ci'].includes(mode)) throw new Error('invalid reverify mode');
   const positive = (value, fallback) => {
     const n = Number(value ?? fallback);
     if (!Number.isFinite(n) || n <= 0) throw new Error(`invalid reverify limit: ${value}`);
     return n;
   };
   return {
-    mode,
     maxLoadPerCore: positive(maxLoadPerCore ?? env.WE_LOAD_FLAKE_REVERIFY_MAX_LOAD_PER_CORE, 0.75),
     maxAttempts: Math.max(1, Math.floor(positive(env.WE_LOAD_FLAKE_REVERIFY_MAX_ATTEMPTS, 3))),
     cooloffMs: positive(env.WE_LOAD_FLAKE_REVERIFY_COOLOFF_MIN, 30) * 60_000,
+    mode: reverifyMode(env),
   };
+}
+
+/** `local` (default) re-verifies the held fix on this host; `ci` pushes it unverified so the PR's CI judges it. */
+function reverifyMode(env) {
+  const mode = env.WE_LOAD_FLAKE_REVERIFY_MODE ?? 'local';
+  if (!['local', 'ci'].includes(mode)) throw new Error('invalid reverify mode');
+  return mode;
 }
 
 export function planLoadFlakeReverify({ prs = [], load, cores, now, config = reverifyConfig({}) }) {
