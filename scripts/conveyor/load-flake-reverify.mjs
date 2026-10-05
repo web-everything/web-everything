@@ -13,12 +13,15 @@ import { loadFlakeHoldState } from './load-flake-hold.mjs';
 import { redactSecrets } from './ci-heal-mark.mjs';
 
 export function reverifyConfig(env = process.env, maxLoadPerCore) {
+  const mode = env.WE_LOAD_FLAKE_REVERIFY_MODE ?? 'local';
+  if (!['local', 'ci'].includes(mode)) throw new Error('invalid reverify mode');
   const positive = (value, fallback) => {
     const n = Number(value ?? fallback);
     if (!Number.isFinite(n) || n <= 0) throw new Error(`invalid reverify limit: ${value}`);
     return n;
   };
   return {
+    mode,
     maxLoadPerCore: positive(maxLoadPerCore ?? env.WE_LOAD_FLAKE_REVERIFY_MAX_LOAD_PER_CORE, 0.75),
     maxAttempts: Math.max(1, Math.floor(positive(env.WE_LOAD_FLAKE_REVERIFY_MAX_ATTEMPTS, 3))),
     cooloffMs: positive(env.WE_LOAD_FLAKE_REVERIFY_COOLOFF_MIN, 30) * 60_000,
@@ -26,7 +29,7 @@ export function reverifyConfig(env = process.env, maxLoadPerCore) {
 }
 
 export function planLoadFlakeReverify({ prs = [], load, cores, now, config = reverifyConfig({}) }) {
-  if (!(cores > 0) || load.length < 2 || load.slice(0, 2).some((n) => !Number.isFinite(n) || n / cores > config.maxLoadPerCore)) {
+  if (config.mode !== 'ci' && (!(cores > 0) || load.length < 2 || load.slice(0, 2).some((n) => !Number.isFinite(n) || n / cores > config.maxLoadPerCore))) {
     return { deferred: 'host-load' };
   }
   const candidates = prs.flatMap((pr) => {
@@ -54,13 +57,13 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
   // Holding is the common case: name every PR it holds and the load it saw, so the log proves the pass is
   // evaluating them (a bare "host-load" line cannot be told apart from a pass that sees no holds). Read-only.
   if (plan.deferred === 'host-load') {
-    return { ...plan, load: load.slice(0, 2).map((n) => Math.round(n * 100) / 100), cores, maxLoadPerCore: config.maxLoadPerCore,
+    return { ...plan, mode: config.mode, load: load.slice(0, 2).map((n) => Math.round(n * 100) / 100), cores, maxLoadPerCore: config.maxLoadPerCore,
       holds: prs.flatMap((pr) => {
         const state = loadFlakeHoldState({ comments: pr.comments, headRefOid: pr.headRefOid, now });
         return state.live ? [{ pr: pr.number, alt: state.hold.alt.branch, altSha: state.hold.alt.sha }] : [];
       }) };
   }
-  if (!plan.candidate || dryRun) return { ...plan, dryRun };
+  if (!plan.candidate || dryRun) return { ...plan, dryRun, mode: config.mode };
   // Take candidates oldest-first until one makes progress. A hold that cannot be worked right now (fix claim
   // live, transient fetch failure) must never starve the younger holds behind it; a hold that can NEVER be worked
   // is ended on the PR instead, so it stops being picked at all.
@@ -69,13 +72,13 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
   for (const candidate of plan.candidates) {
     try {
       const out = await reverifyCandidate({ candidate, key, slug, config }, io);
-      if (!NON_PROGRESS.has(out.deferred)) return out;
+      if (!NON_PROGRESS.has(out.deferred)) return { ...out, mode: config.mode };
       lastDeferral = out;
     } catch (e) {
       firstError ??= e;
     }
   }
-  if (lastDeferral) return lastDeferral;
+  if (lastDeferral) return { ...lastDeferral, mode: config.mode };
   throw firstError;
 }
 
@@ -122,21 +125,24 @@ async function reverifyCandidate({ candidate, key, slug, config }, io) {
       await post('head-moved', 'The saved alt branch moved past the recorded commit, so the recorded repair can no longer be verified.');
       return { deferred: 'lane-head-mismatch' };
     }
-    const verification = await io.verify(lane.path);
-    if (!verification.ok) {
-      // Verify can run 40 minutes: a red result for a PR that moved, or whose hold ended, meanwhile is stale and must
-      // never post a terminal `exhausted` (or burn an attempt) against the current head.
-      refusal = await check();
-      if (refusal) return refusal;
-      const result = attempts + 1 >= config.maxAttempts ? 'exhausted' : 'red-again';
-      // Verify output is branch-authored text headed for a public comment: redact it, then cut.
-      await post(result, redactSecrets(verification.summary ?? '').slice(-1500));
-      return { result };
+    if (config.mode !== 'ci') {
+      const verification = await io.verify(lane.path);
+      if (!verification.ok) {
+        // Verify can run 40 minutes: a red result for a PR that moved, or whose hold ended, meanwhile is stale and must
+        // never post a terminal `exhausted` (or burn an attempt) against the current head.
+        refusal = await check();
+        if (refusal) return refusal;
+        const result = attempts + 1 >= config.maxAttempts ? 'exhausted' : 'red-again';
+        // Verify output is branch-authored text headed for a public comment: redact it, then cut.
+        await post(result, redactSecrets(verification.summary ?? '').slice(-1500));
+        return { result };
+      }
     }
     refusal = await check();
     if (refusal) return refusal;
     await io.push(lane.path, hold.alt.sha, pr.headRefName);
-    await post('pushed');
+    await post('pushed', config.mode === 'ci'
+      ? "Pushed without a local re-verify (WE_LOAD_FLAKE_REVERIFY_MODE=ci); the PR's CI judges it." : '');
     return { result: 'pushed', pr: pr.number };
   } finally {
     await io.release(lane, key);

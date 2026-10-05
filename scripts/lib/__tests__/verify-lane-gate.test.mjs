@@ -15,7 +15,7 @@ import { execSync } from 'node:child_process';
 import { LANE_RELEASE_LITTER_ALLOWLIST } from '../lane-litter.mjs';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { buildPhaseOutcome, firstStandardsErrorId, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
+import { verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -762,14 +762,14 @@ describe('verify phase telemetry (#5141)', () => {
     expect(buildVerifyPhases({ admissionWaitMs: 12.4, vitestMs: 3400.6, scanMs: 800.2,
       standardsMs: 5200.5, gateMs: 9400.4, decision: { targets: ['a', 'b'], changedFiles: ['a'] } })).toEqual({
       admissionWaitMs: 12, vitestMs: 3401, scanMs: 800, standardsMs: 5201, gateMs: 9400,
-      targetFileCount: 2, changedFileCount: 1, importGraphTargetCount: null, literalReferenceTargetCount: null, outcomes: skipped,
+      targetFileCount: 2, changedFileCount: 1, importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, outcomes: skipped,
     });
   });
   it('uses null for missing or non-finite timings and absent decisions', () => {
     expect(buildVerifyPhases({ admissionWaitMs: Infinity, vitestMs: NaN, scanMs: -Infinity,
       standardsMs: undefined })).toEqual({ admissionWaitMs: null, vitestMs: null, scanMs: null,
       standardsMs: null, gateMs: null, targetFileCount: null, changedFileCount: null,
-      importGraphTargetCount: null, literalReferenceTargetCount: null, outcomes: skipped });
+      importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, outcomes: skipped });
     expect(buildVerifyPhases({})).toEqual(buildVerifyPhases({ admissionWaitMs: NaN }));
   });
   it('guards counts with Array.isArray and preserves empty counts and zero timings', () => {
@@ -787,5 +787,29 @@ describe('verify phase telemetry (#5141)', () => {
       .toBe('phaseMs admission=12 vitest=3400 scan=800 standards=5200 gate=9400 targets=7 changed=3 vitest=skipped scan=skipped standards=skipped');
     expect(formatVerifyPhases(buildVerifyPhases({ admissionWaitMs: 0, gateMs: 4 })))
       .toBe('phaseMs admission=0 gate=4 vitest=skipped scan=skipped standards=skipped');
+  });
+});
+
+describe('WE_VERIFY_RELATED', () => {
+  it.each([undefined, '', 'all', 'invalid', 'import-only'])('normalizes %s', (value) => {
+    expect(verifyRelatedMode({ WE_VERIFY_RELATED: value })).toBe(value === 'import-only' ? 'import-only' : 'all');
+  });
+  it.each(['all', 'import-only'])('selects %s targets and reports the mode', (mode) => {
+    const calls = [];
+    const git = fakeGit(['scripts/verify-lane.mjs'], {
+      grepHits: { 'verify-lane.mjs': ['scripts/__tests__/verify-lane.test.mjs'] },
+    });
+    const { decision, command } = resolveDefaultGate({
+      env: mode === 'all' ? {} : { WE_VERIFY_RELATED: mode },
+      runGit: (args) => { calls.push(args); return git(args); },
+    });
+    expect(decision.relatedMode).toBe(mode);
+    expect(decision.referencedTests).toEqual(mode === 'all' ? ['scripts/__tests__/verify-lane.test.mjs'] : []);
+    expect(decision.targets).toEqual([...decision.relatedFiles, ...decision.referencedTests].sort());
+    expect(calls.some(args => args[0] === 'grep')).toBe(mode === 'all');
+    expect(command).toContain(" && npm run check:standards -- --local --files='scripts/verify-lane.mjs'");
+    const phases = buildVerifyPhases({ decision });
+    expect(phases.relatedMode).toBe(mode);
+    expect(formatVerifyPhases(phases)).toContain('related=' + mode);
   });
 });
