@@ -2,8 +2,8 @@
   "id": "benign-test-run",
   "cmd": "npm test -- run scripts/__tests__/a.test.mjs",
   "ctx": {},
-  "basis": "allowed baseline (xpnhz4o: targeted — `npm test -- run` alone is the bare full suite, see full-suite-npm-test-run.json)",
+  "basis": "heavy-enforce (2026-10-04) — a direct `npm test` is denied even when targeted; it names the admitted `npm run test:unit -- <file>` form (vitest's `run` mode word dropped, test:unit already runs `vitest run`).",
   "expect": {
-    "reason": null
+    "reason": "heavy-enforce: each direct run spawns ~6–11 workers outside the host cap of 2 queued heavy runs; load hit 25–48 on a 12-core host. There is no admission override. Use: `npm run test:unit -- scripts/__tests__/a.test.mjs`."
   }
 }

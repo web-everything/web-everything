@@ -357,6 +357,14 @@ describe('findHashPathCiteOutsideBacklog — #4075 follow-up (xmd4pfa): a hash-n
     expect(findHashPathCiteOutsideBacklog('see backlog/xr05jjl-describe-every-conveyor-flow.md', 'backlog/2200-other.md')).toHaveLength(0);
   });
 
+  it('exempts captured thread data in both the direct and shared grep scanners', () => {
+    const file = 'scripts/conveyor/soak/fixtures/pr-3794-live-thread.json';
+    const text = 'backlog/xcs4nce-card.md and backlog/xi8vgqq-card.md';
+    expect(findHashPathCiteOutsideBacklog(text, file)).toEqual([]);
+    expect(findHashPathCitesInGrepLines([`${file}:1:${text}`])).toEqual([]);
+    expect(findHashPathCiteOutsideBacklog(text, 'scripts/conveyor/soak/other.json')).toHaveLength(2);
+  });
+
   it('PASSES (empty) for a numeric backlog path — JIT numbering never renames an already-landed #NNN', () => {
     expect(findHashPathCiteOutsideBacklog('see backlog/4220-describe-every-conveyor-flow.md', 'docs/agent/rule.md')).toHaveLength(0);
   });
@@ -1214,13 +1222,17 @@ describe('findBlankLineLoci — gate 6f-ii-e (cited start line is blank)', () =>
 describe('classifyHashPathCite', () => {
   const real = 'backlog/xhash01-real-slug.md';
   const exists = (path) => path === real;
-  it('classifies an exact existing path as resolving', () => {
-    expect(classifyHashPathCite({ cited: real, exists })).toBe('resolving');
+  const citingFile = 'docs/agent/rule.md';
+  it.each([[new Set([citingFile])], [[citingFile]]])('classifies an owned exact existing path as resolving (%s)', (changedFiles) => {
+    expect(classifyHashPathCite({ cited: real, exists, citingFile, changedFiles })).toBe('resolving');
+  });
+  it.each([[new Set(['other.md'])], [['other.md']], [null], [undefined]])('keeps unowned or unknown changes non-resolving (%s)', (changedFiles) => {
+    expect(classifyHashPathCite({ cited: real, exists, citingFile, changedFiles })).toBe('unowned');
   });
   it('classifies a different slug with the same hash as dangling', () => {
-    expect(classifyHashPathCite({ cited: 'backlog/xhash01-fixture-slug.md', exists })).toBe('dangling');
+    expect(classifyHashPathCite({ cited: 'backlog/xhash01-fixture-slug.md', exists, citingFile, changedFiles: [citingFile] })).toBe('dangling');
   });
   it('classifies a missing card as dangling', () => {
-    expect(classifyHashPathCite({ cited: real, exists: () => false })).toBe('dangling');
+    expect(classifyHashPathCite({ cited: real, exists: () => false, citingFile, changedFiles: [citingFile] })).toBe('dangling');
   });
 });

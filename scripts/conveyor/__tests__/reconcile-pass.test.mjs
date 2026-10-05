@@ -950,6 +950,25 @@ it('xxh4zw8 hydrates the crowded snapshot before planning same-tick recovery', a
   expect(readChecks).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', sha: XX_HEAD });
 });
 
+it('hydrated REST check origins reach timeout enrichment', async () => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const detailsUrl = 'https://github.com/web-everything/web-everything/actions/runs/10/job/20';
+  const read = vi.fn(() => ({ eligible: false, reason: 'fixture-not-timeout' }));
+  const plan = runReconcilePass({ ...xxOptions(),
+    readChecks: () => xxRuns().map(row => ({ ...row,
+      conclusion: row.name === 'smoke' ? 'failure' : 'success', details_url: detailsUrl })),
+    enrichTimeouts: (prs, opts) => enrichPrsWithTimeoutEvidence(prs, { ...opts, enabled: true,
+      read, readBudget: () => ({ confirmed: 0, pending: false }) }),
+  });
+  expect(read).toHaveBeenCalledOnce();
+  expect(read.mock.calls[0][0].statusCheckRollup[1].detailsUrl).toBe(detailsUrl);
+  expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-ineligible',
+    why: 'PR #3336: fixture-not-timeout' }));
+  expect([...plan.notes, ...plan.refusals].some(row =>
+    (row.text ?? row.why ?? '').includes('missing-check-origin'))).toBe(false);
+  expect(plan.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+});
+
 it('xxh4zw8 hydrates shared-file input and preserves attribution timestamps and numeric rerun IDs', async () => {
   const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
@@ -1244,5 +1263,68 @@ describe('stacked PR required-check absence (#3915)', () => {
     expect(isStackedPr({ baseRefName: 'main' }, 'release')).toBe(true);
     expect(readStackedPrCheckPolicy({})).toBe('await-base');
     expect(readStackedPrCheckPolicy({ WE_STACKED_PR_CHECK_POLICY: 'strict' })).toBe('strict');
+  });
+});
+
+// #3794 live case, 2026-10-04.
+describe('main-fixed signature facts reader', () => {
+  const args = { repo: 'web-everything/web-everything', root: '/checkout',
+    detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/1/job/42',
+    failureCompletedAt: '2026-10-05T00:54:36Z' };
+  it('reads job logs, literal emitters and first-parent history with earliest fix time', async () => {
+    const { defaultReadMainFixedSignatureFacts } = await import('../reconcile-pass.mjs');
+    const exec = vi.fn((file, argv) => {
+      if (file === 'gh') return '2026-10-05T00:54:36.1177647Z \u001b[31m error\u001b[0m fixture.json: cites a card by its hash-named FILE PATH (`backlog/card.md`)\n2026-10-05T00:54:36Z ##[error]Process completed with exit code 1.';
+      if (argv.includes('grep')) return 'origin/main:scripts/check-standards.mjs\n';
+      if (argv.includes('--format=%H%x09%cI')) return 'aaaaaaa\t2026-10-05T02:00:00Z\ne5c22481e\t2026-10-05T01:44:46Z\n';
+      if (argv.includes('--format=%cI')) return '2026-10-04T23:00:00Z\n';
+      throw new Error('unexpected command');
+    });
+    expect(defaultReadMainFixedSignatureFacts({ ...args, exec })).toMatchObject({
+      signatures: [{ fragments: ['cites a card by its hash-named FILE PATH'],
+        emitterFiles: ['scripts/check-standards.mjs'], fixCommits: ['aaaaaaa', 'e5c22481e'] }],
+      fixCommits: ['aaaaaaa', 'e5c22481e'], bugIntroducedAt: '2026-10-04T23:00:00Z', fixedAt: '2026-10-05T01:44:46Z',
+    });
+    expect(exec).toHaveBeenCalledWith('gh', ['api', 'repos/web-everything/web-everything/actions/jobs/42/logs'],
+      expect.objectContaining({ maxBuffer: 64 * 1024 * 1024, timeout: expect.any(Number) }));
+    expect(exec).toHaveBeenCalledWith('git', ['-C', '/checkout', 'grep', '-l', '-F', '-e',
+      'cites a card by its hash-named FILE PATH', 'origin/main', '--', '.',
+      ':(exclude)**/__tests__/**', ':(exclude)**/fixtures/**', ':(exclude)backlog/**'], expect.any(Object));
+    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['--first-parent', '--since=2026-10-05T00:54:36Z',
+      '--end-of-options', 'origin/main', '--', 'scripts/check-standards.mjs']), expect.any(Object));
+  });
+  it('handles empty logs, no grep matches, command failures and invalid inputs conservatively', async () => {
+    const { defaultReadMainFixedSignatureFacts: read } = await import('../reconcile-pass.mjs');
+    expect(read({ ...args, exec: () => '' })).toEqual({ signatures: [] });
+    expect(read({ ...args, exec: () => { throw new Error('offline'); } })).toBeNull();
+    const exec = vi.fn();
+    expect(read({ ...args, defaultBranch: '--bad', exec })).toBeNull();
+    expect(read({ ...args, detailsUrl: 'no-job', exec })).toBeNull();
+    expect(exec).not.toHaveBeenCalled();
+    expect(read({ ...args, exec: (file) => {
+      if (file === 'gh') return 'error file.mjs: a long unexplained error message';
+      throw Object.assign(new Error('no matches'), { status: 1 });
+    } })).toMatchObject({ signatures: [{ emitterFiles: [], fixCommits: [] }], fixedAt: null });
+  });
+  it('enriches only a failing, behind PR not already owed via either older path', async () => {
+    const { enrichPrsWithMainRedFacts } = await import('../reconcile-pass.mjs');
+    const pr = { number: 3794, headRefOid: 'abc1234', statusCheckRollup: [{ name: 'test', status: 'COMPLETED',
+      conclusion: 'FAILURE', completedAt: args.failureCompletedAt, detailsUrl: args.detailsUrl }] };
+    const facts = { signatures: [{ emitterFiles: ['gate.mjs'], fixCommits: ['e5c22481e'] }] };
+    const readMainFixedSignatureFacts = vi.fn(() => facts);
+    const options = { repo: args.repo, readAheadBy: () => 3, readMainRuns: () => [],
+      readMainLatestCheckRuns: () => [], readMainFixedSignatureFacts };
+    expect(enrichPrsWithMainRedFacts([pr], options).prs[0].mainFixedSignature).toBe(facts);
+    expect(readMainFixedSignatureFacts).toHaveBeenCalledWith({ repo: args.repo, detailsUrl: args.detailsUrl,
+      failureCompletedAt: args.failureCompletedAt, defaultBranch: 'main' });
+    readMainFixedSignatureFacts.mockClear();
+    enrichPrsWithMainRedFacts([pr], { ...options, readAheadBy: () => 0 });
+    enrichPrsWithMainRedFacts([pr], { ...options, readAheadBy: () => null });
+    enrichPrsWithMainRedFacts([pr], { ...options, readMainRuns: () => [{ status: 'completed', conclusion: 'failure',
+      updatedAt: '2026-10-05T00:00:00Z', workflowName: 'CI' }] });
+    enrichPrsWithMainRedFacts([pr], { ...options, readMainLatestCheckRuns: () => [{ name: 'test', status: 'completed',
+      conclusion: 'success', head_sha: 'e5c22481e' }], readMainGreenFixFacts: () => ({ prContainsMainGreenSha: false,
+      mergeBaseCheckRuns: [{ name: 'test', status: 'completed', conclusion: 'failure' }] }) });
+    expect(readMainFixedSignatureFacts).not.toHaveBeenCalled();
   });
 });

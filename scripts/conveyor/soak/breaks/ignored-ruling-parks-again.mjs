@@ -79,7 +79,7 @@ process.stdout.write(JSON.stringify(out));
 export default {
   id: 'ignored-ruling-parks-again',
   title: 'a finding the operator already ruled block comes back on a new head and the review just parks again instead of going back to the fixer',
-  card: 'operator order 2026-10-04 ~08:15 ET; live incident PR #3794 (card xcs4nce, policy pointer files; also #3833, #3771)',
+  card: 'operator order 2026-10-04 ~08:15 ET; live incident PR #3794 (card 5113, policy pointer files; also #3833, #3771)',
   fixedBy: { sha: 'b01658095e2513f2b0ca7f5923b08ce0723f851c,9262954bee52086a168380dd4445d3170d1d7e7b,c144900a6da7ebb005f1e5d83adb73f84e16aa27,4a33d462c910fbbd29444b1600ff5b1d717570d7,3aeccaa0bf05f4ae5d2c565866f46b587787da8a', where: 'lane/fix-ruling-needed-surface', paths: [
     'scripts/conveyor/fixer-ladder.mjs',
     'scripts/conveyor/health-responder-core.mjs',

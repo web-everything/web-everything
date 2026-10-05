@@ -21,7 +21,7 @@ import {
   mainSessionDelegateNudge, hasLeadingEnvEscape, canonicalCommand, shellTokens, stripHeredocBodies,
   splitSegments, runnerInvocation, parseSegments, unparseableReason, heredocScan,
   nestedCommandStrings, fileWriteTargets, collateralStepsNotice, mergeBreakGlassUsed,
-  rawHeavyCommandReason, vitestRunFileTargetCount, RAW_VITEST_TARGETED_FILE_LIMIT,
+  rawHeavyCommandReason, vitestRunFileTargetCount,
 } from '../guard-bash.mjs';
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
 import { execFileSync } from 'node:child_process';
@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url';
 // skips the #3461 admission queue) than every arm that predates it. Older corpora asserting "always allowed"
 // or "untouched in a lane" for a raw command never anticipated this new denial, so both this predicate and the
 // exclusion pattern it powers are shared module-wide rather than re-derived per describe block.
-const isRawHeavyVerdict = (verdict) => /heavy-command admission queue|bare FULL-SUITE unit run/.test(String(verdict || ''));
+const isRawHeavyVerdict = (verdict) => /heavy-enforce|heavy-command admission queue|bare FULL-SUITE unit run/.test(String(verdict || ''));
 /** xpnhz4o — the bare full-suite deny specifically. */
 const isFullSuiteVerdict = (verdict) => /bare FULL-SUITE unit run/.test(String(verdict || ''));
 
@@ -181,7 +181,7 @@ describe('guard-bash — the raw heavy spellings join the verification set (xaip
       expect(dispatchedAgentVerificationReason(c, kind)).toBeNull();
     }
   });
-  it('an interactive session is never denied a foreground raw run, but may not background it (raw or wrapped)', () => {
+  it('an interactive session requires admission for heavy runs and may not background verification', () => {
     // xxna58l (#3383) — a subset of RAW is now ALSO denied in the foreground, for the unrelated reason that it
     // skips the #3461 admission queue entirely (a raw whole-suite `vitest run`, or any raw `playwright test`
     // — see the dedicated xxna58l describe block below). That is a NEW, deliberate exception to this test's
@@ -204,13 +204,18 @@ describe('guard-bash — the raw heavy spellings join the verification set (xaip
   it('xxna58l (#3383): the RAW entries it denies in the foreground are denied for the admission-queue reason specifically, and backgrounding them is STILL separately refused too', () => {
     const nowDeniedInForeground = RAW.filter((c) => isRawHeavyVerdict(decide(c)));
     expect(nowDeniedInForeground).toEqual([
-      'npx vitest run', 'npx --yes vitest run', './node_modules/.bin/vitest run',
+      'npx vitest run',
+      'npx vitest run scripts/__tests__/guard-bash.test.mjs',
+      'npx vitest related scripts/guard-bash.mjs --run',
+      'npx --yes vitest run', './node_modules/.bin/vitest run',
+      'node scripts/check-standards.mjs', 'node scripts/check-standards.mjs --json',
       'npx playwright test', 'npx playwright test tests/a11y',
+      'cd /x/.lanes/web-everything/lane-3 && npx vitest run a.test.mjs',
     ]);
     for (const c of nowDeniedInForeground) {
       // xpnhz4o — a whole-suite `vitest run` now hits the bare-full-suite arm (which names the diff-selected
       // gate); playwright keeps the admission-queue message.
-      expect(decide(c)).toMatch(isFullSuiteVerdict(decide(c)) ? /verify-lane\.mjs run/ : /heavy-admission\.mjs run/);
+      expect(decide(c)).toMatch(isFullSuiteVerdict(decide(c)) ? /verify-lane\.mjs run/ : /heavy-enforce|heavy-admission\.mjs run/);
       expect(backgroundedVerificationReason(c, true)).toMatch(/never backgrounded/); // still ALSO true
     }
   });
@@ -2368,7 +2373,7 @@ describe('commit identity override (#3269)', () => {
     // A `git config` write on its own is legitimate — the machine's identity is the operator's to set.
     for (const cmd of [
       'git add file.txt && git commit -m hi',
-      'npm test -- a.test.mjs && git commit -m ok',
+      'npm run test:unit -- a.test.mjs && git commit -m ok',
       'git config user.email noreply@anthropic.com',
       'git config user.email x@y && git log',
     ]) expect(decide(cmd, {}), cmd).toBeNull();
@@ -2855,7 +2860,7 @@ describe('guard-bash — a delivery agent may never run the mechanical lifecycle
 
   it('does NOT over-block ordinary build/test/git commands for a delivery-agent session', () => {
     const ordinary = [
-      'npm test -- scripts/operations/__tests__/deliver-item-wrapper.test.mjs', // xpnhz4o: a BARE full suite is denied for every session
+      'npm run test:unit -- scripts/operations/__tests__/deliver-item-wrapper.test.mjs', // xpnhz4o: a BARE full suite is denied for every session
       'npm run test:unit -- scripts/operations/__tests__/deliver-item-wrapper.test.mjs',
       'npm run check:standards',
       'node --test scripts/operations/__tests__/deliver-item-wrapper.test.mjs',
@@ -3078,7 +3083,6 @@ describe('rawHeavyCommandReason — a direct vitest/playwright/eleventy run skip
     expect(vitestRunFileTargetCount(' a.test.mjs b.test.mjs')).toBe(2);
     expect(vitestRunFileTargetCount(' --coverage a.test.mjs b.test.mjs')).toBe(2);
     expect(vitestRunFileTargetCount(' a.test.mjs b.test.mjs c.test.mjs')).toBe(3);
-    expect(RAW_VITEST_TARGETED_FILE_LIMIT).toBe(2);
   });
 
   it('does not count redirections or a flag value as file targets (#3383, the live miscounts of 2026-09-23)', () => {
@@ -3090,24 +3094,24 @@ describe('rawHeavyCommandReason — a direct vitest/playwright/eleventy run skip
     expect(vitestRunFileTargetCount(' a.test.mjs --testNamePattern=x')).toBe(1);
     // a whole-suite run with only a redirection is still the whole suite
     expect(vitestRunFileTargetCount(' > out.log 2>&1')).toBe(0);
-    expect(rawHeavyCommandReason('npx vitest run a.test.mjs 2>&1')).toBeNull();
-    expect(rawHeavyCommandReason('npx vitest run > out.log 2>&1')).toMatch(/the WHOLE suite/);
+    expect(rawHeavyCommandReason('npx vitest run a.test.mjs 2>&1')).toMatch(/heavy-enforce/);
+    expect(rawHeavyCommandReason('npx vitest run > out.log 2>&1')).toMatch(/heavy-enforce/);
   });
 
   it('denies a raw whole-suite `vitest run` (no files named), bare or via npx', () => {
-    expect(rawHeavyCommandReason('vitest run')).toMatch(/WHOLE suite/);
-    expect(rawHeavyCommandReason('npx vitest run')).toMatch(/verify-lane\.mjs run/); // xpnhz4o — never steers to the (denied) bare test:unit
-    expect(rawHeavyCommandReason('npx vitest run --coverage')).toMatch(/WHOLE suite/); // a flag alone names no file
+    expect(rawHeavyCommandReason('vitest run')).toMatch(/heavy-enforce/);
+    expect(rawHeavyCommandReason('npx vitest run')).toMatch(/heavy-enforce/); // xpnhz4o — never steers to the (denied) bare test:unit
+    expect(rawHeavyCommandReason('npx vitest run --coverage')).toMatch(/heavy-enforce/); // a flag alone names no file
   });
 
-  it('allows a targeted run of 1 or 2 explicit test files, bare or via npx, flags or not', () => {
-    expect(rawHeavyCommandReason('npx vitest run scripts/foo.test.mjs')).toBeNull();
-    expect(rawHeavyCommandReason('vitest run scripts/foo.test.mjs scripts/bar.test.mjs')).toBeNull();
-    expect(rawHeavyCommandReason('npx vitest run --coverage scripts/foo.test.mjs')).toBeNull();
+  it('denies a targeted run of 1 or 2 explicit test files, bare or via npx, flags or not', () => {
+    expect(rawHeavyCommandReason('npx vitest run scripts/foo.test.mjs')).toMatch(/heavy-enforce/);
+    expect(rawHeavyCommandReason('vitest run scripts/foo.test.mjs scripts/bar.test.mjs')).toMatch(/heavy-enforce/);
+    expect(rawHeavyCommandReason('npx vitest run --coverage scripts/foo.test.mjs')).toMatch(/heavy-enforce/);
   });
 
-  it('denies a run naming MORE than the targeted-file limit', () => {
-    expect(rawHeavyCommandReason('npx vitest run a.test.mjs b.test.mjs c.test.mjs')).toMatch(/3 files \(over the 2-file targeted limit\)/);
+  it('denies a run naming three files', () => {
+    expect(rawHeavyCommandReason('npx vitest run a.test.mjs b.test.mjs c.test.mjs')).toMatch(/heavy-enforce/);
   });
 
   it('never flags the WRAPPED form — `vitest run` appearing only as the heavy-admission wrapper\'s own argument, not as the command', () => {
@@ -3149,7 +3153,7 @@ describe('rawHeavyCommandReason — a direct vitest/playwright/eleventy run skip
   it('reaches decide() and reason() — the real enforcement points', () => {
     expect(String(decide('npx vitest run'))).toMatch(/bare FULL-SUITE.*verify-lane\.mjs run/s); // xpnhz4o arm runs first
     expect(String(reason('npx playwright test'))).toMatch(/heavy-admission\.mjs run/);
-    expect(decide('npx vitest run scripts/foo.test.mjs')).toBeNull();
+    expect(decide('npx vitest run scripts/foo.test.mjs')).toMatch(/heavy-enforce/);
     // chained: the deny fires even alongside an otherwise-benign command
     expect(String(decide('git status && npx vitest run'))).toMatch(/bare FULL-SUITE/);
   });

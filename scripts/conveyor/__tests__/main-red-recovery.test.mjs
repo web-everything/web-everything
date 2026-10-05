@@ -12,6 +12,7 @@ import { describe, it, expect } from 'vitest';
 import {
   MAIN_RED_CONCLUSIONS, computeMainRedWindows, isWithinRedWindow, isMainCurrentlyRed,
   classifyCiFailureAttribution, isPrCiFailureOwedRerun, planMainRedRebases,
+  extractCiErrorSignatures, signatureFragments, isMainFixedSignatureOwed,
   // landing-freeze fix (2026-09-27)
   latestCompletedMainRun, collapseMainCheckRunsToLatestPerName, isMainLatestCheckGreen,
   DEFAULT_HUNG_THRESHOLD_MS, DEFAULT_MAX_HUNG_RETRIES_PER_SHA,
@@ -926,5 +927,49 @@ describe('PR-scoped required checks are never main-attributable (configurable)',
     const out = planMainRedRebases({ candidates: [{ prNumber: 3903, aheadBy: 12, failureCompletedAt: '2026-10-04T16:24:27Z', failingCheckName: 'soak-replay-gate' }], mainRedWindows: WINDOWS });
     expect(out.dispatch).toEqual([]);
     expect(out.refusals[0]).toMatchObject({ prNumber: 3903, kind: 'own-failure' });
+  });
+});
+
+// #3794 live case, 2026-10-04.
+describe('main-fixed signature attribution', () => {
+  const log = [
+    '2026-10-05T00:54:36.1177647Z \u001b[31m error\u001b[0m scripts/conveyor/soak/fixtures/pr-3794-live-thread.json: cites a card by its hash-named FILE PATH (`backlog/xcs4nce-delivery-flow-policy-keys-their-platform-defaults-and-one-lo.md`) — the drain will hold this card from numbering (it would strand on main), cite it as `#xcs4nce` instead.',
+    '2026-10-05T00:54:36.1179344Z \u001b[31m error\u001b[0m scripts/conveyor/soak/fixtures/pr-3794-live-thread.json: cites a card by its hash-named FILE PATH (`backlog/xi8vgqq-re-check-a-green-pr-before-merge-when-main-moved-after-its-c.md`) — the drain will hold this card from numbering (it would strand on main), cite it as `#xi8vgqq` instead.',
+    '2026-10-05T00:54:36.1192496Z ##[error]Process completed with exit code 1.',
+  ].join('\n');
+  const facts = {
+    signatures: [{ emitterFiles: ['scripts/check-standards.mjs'], fixCommits: ['e5c22481e123456789'] }],
+    bugIntroducedAt: '2026-10-04T23:00:00Z', fixedAt: '2026-10-05T01:44:46Z',
+  };
+  it('extracts both ANSI errors, deduplicates job-prefixed logs, and preserves the literal emitter fragment', () => {
+    const signatures = extractCiErrorSignatures(log);
+    expect(signatures).toHaveLength(2);
+    expect(extractCiErrorSignatures(log + '\n' + log.split('\n').map((l) => `test\tstandards\t${l}`).join('\n'))).toEqual(signatures);
+    expect(signatureFragments(signatures[0])).toContain('cites a card by its hash-named FILE PATH');
+    expect(signatureFragments('file.mjs: stable literal message here `dynamic span` #token a/b 123 (another literal message here)'))
+      .toEqual(['stable literal message here', 'another literal message here']);
+    expect(extractCiErrorSignatures(null)).toEqual([]);
+  });
+  it('requires an explanation for every error and a head that is not current', () => {
+    expect(isMainFixedSignatureOwed(null)).toBe(false);
+    expect(isMainFixedSignatureOwed({ signatures: [] })).toBe(false);
+    expect(isPrCiFailureOwedRerun({ aheadBy: 3, mainFixedSignature: facts })).toBe(true);
+    expect(isPrCiFailureOwedRerun({ aheadBy: 0, mainFixedSignature: facts })).toBe(false);
+    expect(isPrCiFailureOwedRerun({ aheadBy: 3, mainFixedSignature: { signatures: [
+      ...facts.signatures, { emitterFiles: ['own.mjs'], fixCommits: [] },
+    ] } })).toBe(false);
+    expect(isMainFixedSignatureOwed({ signatures: [{ emitterFiles: [], fixCommits: ['abc1234'] }] })).toBe(false);
+  });
+  it('dispatches a rebase with the fix and durable attribution window', () => {
+    const candidate = { prNumber: 3794, aheadBy: 3, mainFixedSignature: facts };
+    const [row] = planMainRedRebases({ candidates: [candidate] }).dispatch;
+    expect(row).toMatchObject({ attribution: 'main-fixed-signature', attributedWindow: { from: facts.bugIntroducedAt, to: facts.fixedAt } });
+    expect(row.why).toContain('e5c22481e');
+    expect(buildRebaseOntoMainComment(row)).toContain(`attribution: main-fixed-signature\nattributed-window: ${facts.bugIntroducedAt} ${facts.fixedAt}`);
+    for (const [over, options, kind] of [
+      [{ aheadBy: null }, {}, 'unknown-ahead-by'], [{ aheadBy: 0 }, {}, 'already-current'],
+      [{ rebaseAttemptsForSha: 2 }, {}, 'rebase-cap-exhausted'],
+      [{}, { mainRedWindows: [{ start: facts.bugIntroducedAt, end: null }] }, 'main-still-red'],
+    ]) expect(planMainRedRebases({ candidates: [{ ...candidate, ...over }], ...options }).refusals[0].kind).toBe(kind);
   });
 });

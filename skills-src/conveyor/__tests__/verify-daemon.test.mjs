@@ -17,6 +17,7 @@ import { join } from 'node:path';
 import {
   runDaemonLoop, runVerifyTick, buildCliDaemonEffects, realSleep, cloneHeadChanged,
   startIndependentHeartbeat, DEFAULT_HEARTBEAT_INTERVAL_MS,
+  killInFlight, makeCodeChangedGuard, createCleanup, runDaemon,
   VERIFY_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS,
 } from '../verify-daemon.mjs';
 import {
@@ -313,15 +314,11 @@ describe('buildCliDaemonEffects — the real-effect factory (isAlive wiring only
     expect(effects.isAlive()).toBe(true);
   });
 
-  it('onTick logs a one-line summary, plus one line per failure, via the injected log', () => {
+  it('onTick logs a one-line summary via the injected log (failures arrive through onSettled — see below)', () => {
     const log = { error: vi.fn() };
     const effects = buildCliDaemonEffects({ log });
-    effects.onTick({
-      dispatched: [{ pool: 'we', lane: 1 }],
-      failures: [{ pool: 'we', lane: 2, timedOut: true, timedOutPhase: 'gate' }],
-    });
-    expect(log.error).toHaveBeenCalledWith('verify-daemon: tick — dispatched 1, failed 1');
-    expect(log.error).toHaveBeenCalledWith('verify-daemon: we/lane-2 failed (non-fatal) [timed out: gate]');
+    effects.onTick({ dispatched: [{ pool: 'we', lane: 1 }] });
+    expect(log.error).toHaveBeenCalledWith('verify-daemon: tick — dispatched 1, in flight 0, deferred 0, failed 0');
   });
 
   it('onTickError logs a non-fatal one-liner via the injected log', () => {
@@ -397,5 +394,141 @@ describe('code-change restart', () => {
     const tickOnce = async () => { ticks += 1; if (ticks === 2) head = 'b'; return {}; };
     const out = await runDaemonLoop({ tickOnce, sleep: async () => {}, codeChanged: () => cloneHeadChanged({ bootHead: 'a', readHead: () => head }), maxTicks: 10 });
     expect(out).toEqual({ ticks: 2, stoppedReason: 'code-changed' });
+  });
+});
+
+
+it('forwards the process-lifetime in-flight registry and non-blocking mode', async () => {
+  const runVerify = vi.fn(async () => ({}));
+  const effects = buildCliDaemonEffects({ runVerify });
+  expect(effects.inFlight).toBeInstanceOf(Map);
+  await effects.tickOnce();
+  await effects.tickOnce();
+  expect(runVerify).toHaveBeenCalledTimes(2);
+  expect(runVerify).toHaveBeenCalledWith({ inFlight: effects.inFlight, awaitSettle: false, onSettled: expect.any(Function) });
+  runVerify.mockClear();
+  await runVerifyTick({ runVerify, inFlight: effects.inFlight, awaitSettle: false });
+  expect(runVerify).toHaveBeenCalledWith({ inFlight: effects.inFlight, awaitSettle: false });
+});
+
+// PR #3972 review — the lifecycle decisions that used to live, untested, inside the unexported main().
+describe('killInFlight — the one cleanup every exit path shares', () => {
+  it('SIGKILLs the process group of every in-flight entry that has a pid, skipping pid-less (still queued) ones', () => {
+    const kill = vi.fn();
+    const inFlight = new Map([['a', { pid: 11 }], ['b', { pid: null }], ['c', { pid: 33 }]]);
+    killInFlight(inFlight, kill);
+    expect(kill.mock.calls).toEqual([[-11, 'SIGKILL'], [-33, 'SIGKILL']]);
+  });
+
+  it('a pid that already exited (kill throws) never aborts the sweep over the rest', () => {
+    const kill = vi.fn((pid) => { if (pid === -11) throw new Error('ESRCH'); });
+    killInFlight(new Map([['a', { pid: 11 }], ['b', { pid: 22 }]]), kill);
+    expect(kill).toHaveBeenCalledWith(-22, 'SIGKILL');
+  });
+});
+
+describe('makeCodeChangedGuard — a code-change restart defers until no gate is in flight', () => {
+  it('stays false while the registry is occupied, then flips once it drains (the restart waits, then happens)', () => {
+    const inFlight = new Map([['lane', { pid: 1 }]]);
+    const guard = makeCodeChangedGuard({ inFlight, bootHead: 'a', readHead: () => 'b' });
+    expect(guard()).toBe(false);
+    inFlight.delete('lane');
+    expect(guard()).toBe(true);
+  });
+
+  it('is false with an empty registry when the head did not move', () => {
+    expect(makeCodeChangedGuard({ inFlight: new Map(), bootHead: 'a', readHead: () => 'a' })()).toBe(false);
+  });
+
+  it('runDaemonLoop keeps ticking through the deferral and stops with code-changed only once the gate settles', async () => {
+    const inFlight = new Map([['lane', { pid: 1 }]]);
+    let ticks = 0;
+    const tickOnce = async () => { ticks += 1; if (ticks === 3) inFlight.clear(); return {}; };
+    const out = await runDaemonLoop({ tickOnce, sleep: async () => {}, maxTicks: 10,
+      codeChanged: makeCodeChangedGuard({ inFlight, bootHead: 'a', readHead: () => 'b' }) });
+    expect(out).toEqual({ ticks: 3, stoppedReason: 'code-changed' });
+  });
+});
+
+describe('createCleanup + runDaemon — every exit tears down the same way, signal or loop', () => {
+  const setup = (inFlight) => {
+    const order = [];
+    const f = {
+      kill: vi.fn(() => order.push('kill')), stopHeartbeat: vi.fn(() => order.push('heartbeat')),
+      release: vi.fn(() => order.push('release')), exit: vi.fn(() => order.push('exit')), log: { error: vi.fn() },
+    };
+    return { f, order, cleanup: createCleanup({ inFlight, ...f }) };
+  };
+
+  it("the signal path (stopAndExit) kills in-flight process groups, releases the lease, then exits — in that order", () => {
+    const { f, order, cleanup } = setup(new Map([['lane', { pid: 777 }], ['queued', { pid: null }]]));
+    cleanup.stopAndExit('SIGTERM');
+    expect(f.kill.mock.calls).toEqual([[-777, 'SIGKILL']]);
+    expect(order).toEqual(['kill', 'heartbeat', 'release', 'exit']);
+    expect(f.exit).toHaveBeenCalledWith(0);
+    expect(cleanup.isStopping()).toBe(true);
+  });
+
+  it('is idempotent — a second signal (or a loop exit after a signal) never kills or releases twice', () => {
+    const { f, cleanup } = setup(new Map([['lane', { pid: 5 }]]));
+    cleanup.stopAndExit('SIGTERM');
+    cleanup.stopAndExit('SIGINT');
+    expect(f.kill).toHaveBeenCalledTimes(1);
+    expect(f.release).toHaveBeenCalledTimes(1);
+    expect(f.exit).toHaveBeenCalledTimes(1);
+  });
+
+  it("a 'lease-lost' loop exit with gates in flight kills them, releases the lease, and exits immediately (so killed gates never stamp infrastructure-failure markers)", async () => {
+    const inFlight = new Map([['lane', { pid: 777 }]]);
+    const { f, order, cleanup } = setup(inFlight);
+    const out = await runDaemon({
+      effects: { tickOnce: async () => ({}), sleep: async () => {}, isAlive: () => false, inFlight },
+      cleanup,
+    });
+    expect(out.stoppedReason).toBe('lease-lost');
+    expect(f.kill).toHaveBeenCalledWith(-777, 'SIGKILL');
+    expect(order).toEqual(['kill', 'heartbeat', 'release', 'exit']);
+  });
+
+  it('a code-changed exit has an empty registry by construction, so nothing is killed but the lease is still released', async () => {
+    const inFlight = new Map();
+    const { f, cleanup } = setup(inFlight);
+    const out = await runDaemon({
+      effects: { tickOnce: async () => ({}), sleep: async () => {}, inFlight },
+      codeChanged: () => true, cleanup,
+    });
+    expect(out.stoppedReason).toBe('code-changed');
+    expect(f.kill).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledTimes(1);
+    expect(f.exit).toHaveBeenCalledWith(0);
+  });
+
+  it('when a signal already tore down, the loop exit does nothing further', async () => {
+    const inFlight = new Map([['l', { pid: 5 }]]);
+    const { f, cleanup } = setup(inFlight);
+    cleanup.stopAndExit('SIGTERM');
+    f.kill.mockClear(); f.release.mockClear(); f.exit.mockClear();
+    await runDaemon({ effects: { tickOnce: async () => ({}), sleep: async () => {}, isAlive: () => false, inFlight }, cleanup });
+    expect(f.kill).not.toHaveBeenCalled();
+    expect(f.release).not.toHaveBeenCalled();
+    expect(f.exit).not.toHaveBeenCalled();
+  });
+});
+
+describe('background gate failures reach the daemon log (awaitSettle:false leaves result.failures empty)', () => {
+  it('onSettled logs a per-failure line and the next tick summary counts it', async () => {
+    const log = { error: vi.fn() };
+    let settle;
+    const runVerify = vi.fn(async ({ onSettled }) => { settle = onSettled; return { dispatched: [], failures: [], deferred: [] }; });
+    const effects = buildCliDaemonEffects({ log, runVerify });
+    const first = await effects.tickOnce();
+    effects.onTick(first);
+    expect(log.error).toHaveBeenCalledWith('verify-daemon: tick — dispatched 0, in flight 0, deferred 0, failed 0');
+    settle({ pool: 'we', lane: 2, timedOut: true, timedOutPhase: 'gate' });
+    expect(log.error).toHaveBeenCalledWith('verify-daemon: we/lane-2 failed (non-fatal) [timed out: gate]');
+    effects.onTick(await effects.tickOnce());
+    expect(log.error).toHaveBeenLastCalledWith('verify-daemon: tick — dispatched 0, in flight 0, deferred 0, failed 1');
+    effects.onTick(await effects.tickOnce());
+    expect(log.error).toHaveBeenLastCalledWith('verify-daemon: tick — dispatched 0, in flight 0, deferred 0, failed 0'); // counted once, not cumulative
   });
 });

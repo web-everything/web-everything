@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	The load-flake re-verify pass (PR #3881 / #3932, operator-approved 2026-10-04). A fixer whose repair is
+	ready but whose local verify was red ONLY on host-load timeouts leaves a load-flake hold; this pass
+	re-runs verify on the saved alt branch once load per core is at or below
+	WE_LOAD_FLAKE_REVERIFY_MAX_LOAD_PER_CORE (default 0.75), and fast-forward pushes it to the PR head when
+	green. Shaped like com.we.conveyor-pass-daemon.merge-orphan-sweep, run from the wev-review-daemon clone
+	(the clone the fix/review daemons self-sync, so overlays reach this pass too).
+	INSTALL (the operator, or a session the operator has said yes to):
+	  1. Replace <app-id>, <installation-id>, <path-to-private-key.pem> with the same GitHub App values the
+	     merge-orphan-sweep plist uses (never commit them):
+	       plutil -extract EnvironmentVariables.WE_GITHUB_APP_ID raw ~/Library/LaunchAgents/com.we.conveyor-pass-daemon.merge-orphan-sweep.plist
+	  2. cp this file to ~/Library/LaunchAgents/com.we.conveyor-pass-daemon.load-flake-reverify.plist (drop `.example`)
+	  3. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.we.conveyor-pass-daemon.load-flake-reverify.plist
+	KNOBS: WE_LOAD_FLAKE_REVERIFY_INTERVAL_MS (default 300000 = 5 min), WE_LOAD_FLAKE_REVERIFY_MAX_LOAD_PER_CORE
+	  (0.75), WE_LOAD_FLAKE_REVERIFY_MAX_ATTEMPTS (3), WE_LOAD_FLAKE_REVERIFY_COOLOFF_MIN (30).
+	CHECK: tail the log below — every run prints one JSON line naming the held PRs and the load it saw.
+	STOP:  launchctl bootout gui/$(id -u)/com.we.conveyor-pass-daemon.load-flake-reverify
+	-->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>WE_GITHUB_APP_ID</key>
+		<string>&lt;app-id&gt;</string>
+		<key>WE_GITHUB_APP_INSTALLATION_ID</key>
+		<string>&lt;installation-id&gt;</string>
+		<key>WE_GITHUB_APP_PRIVATE_KEY_PATH</key>
+		<string>&lt;path-to-private-key.pem&gt;</string>
+		<key>WE_LOAD_FLAKE_REVERIFY_INTERVAL_MS</key>
+		<string>300000</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.we.conveyor-pass-daemon.load-flake-reverify</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin/node</string>
+		<string>/Users/nicolasgilbert/workspace/wev-review-daemon/skills-src/conveyor/pass-daemon.mjs</string>
+		<string>--pass=load-flake-reverify</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor/pass-daemon.load-flake-reverify.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor/pass-daemon.load-flake-reverify.log</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/nicolasgilbert/workspace/wev-review-daemon</string>
+</dict>
+</plist>

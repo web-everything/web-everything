@@ -4,10 +4,12 @@
  */
 import { createHash } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { referralCardReadable } from '../lib/referral-card-readable.mjs';
+import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
-import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -86,7 +88,11 @@ function wakeTime(pr, run) {
   }));
 }
 
-export function decideReferralHold(pr, runs, { repo, now = Date.now(), env = process.env } = {}) {
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+export function decideReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
+  // The SAME reader the review gate uses, so a `card` ruling naming a card that does not exist yet keeps the hold.
+  cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number))
     .sort((a, b) => b.completedAt - a.completedAt);
   const last = history[0];
@@ -104,7 +110,7 @@ export function decideReferralHold(pr, runs, { repo, now = Date.now(), env = pro
   if (!last.persistenceFailed && env.WE_REFERRAL_HOLD_LIVE_RELEASE !== '0') {
     // Read exactly as the gate reads it (readable-card rule, author stamp, PR body/createdAt): a release the
     // gate would immediately re-park loops the review on every tick, which this hold exists to prevent.
-    const live = liveReferralState(pr, { repo, pr: Number(pr.number) });
+    const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
     if (!live.pending.length && live.records.some(r => r.head === pr.headRefOid
       && r.repo === repo && r.pr === Number(pr.number))) return null;
   }

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
-import { referralCardReadable } from '../../lib/referral-live-context.mjs';
+import { referralCardReadable } from '../../lib/referral-card-readable.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { runReconcilePass } from '../reconcile-pass.mjs';
 import { countFindings } from '../reconcile-core.mjs';
@@ -73,6 +73,25 @@ describe('attempted mandatory referrals', () => {
     expect(hold(p)).toBeNull();
     expect(decideReferralHold(p, [evidence()], { repo, now: at + 1,
       env: { WE_REFERRAL_HOLD_LIVE_RELEASE: '0' } })).not.toBeNull();
+  });
+  // The live release must judge a `card` ruling the way the real gate does: only an existing readable card clears it.
+  it.each([
+    ['an unreadable card', 'we:backlog/9999999-not-yet-filed.md', undefined, false],
+    ['a card the gate can read', 'we:backlog/9999999-not-yet-filed.md', () => true, true],
+  ])('a card ruling naming %s %s the hold', (_, card, cardReadable, releases) => {
+    const r = record();
+    r.rulings = [{ id: 'r1', key, reviewerId: r.reviewer.id, lens: r.reviewer.lens,
+      result: 'card', card, rationale: 'tracked', evidence: ['diff'] }];
+    const p = pr({ comments: [comment(renderReferralRecord(r), at - 120_000)] });
+    const decided = decideReferralHold(p, [evidence()], { repo, now: at + 1, ...(cardReadable ? { cardReadable } : {}) });
+    expect(decided === null).toBe(releases);
+  });
+  it('a not-real or block ruling releases the hold (neither needs a card)', () => {
+    for (const result of ['not-real', 'block']) {
+      const r = record();
+      r.rulings = [{ id: 'r1', key, reviewerId: r.reviewer.id, lens: r.reviewer.lens, result, rationale: 'x', evidence: ['diff'] }];
+      expect(hold(pr({ comments: [comment(renderReferralRecord(r), at - 120_000)] }))).toBeNull();
+    }
   });
   it('reads real run-store shape and withholds an unchanged head in the shared planner, across repeated passes', () => {
     const dir = temp(); vi.stubEnv('OPERATION_RUNS_DIR', dir); writeRun(run(), dir);

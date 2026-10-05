@@ -202,3 +202,11 @@ it('passes the most recently posted valid answer even when older holds are answe
   const newerAnswer = trusted(buildOperatorAnswer({ ...record, standDownId: newerStop.id, reason: 'Second question answered first.' }));
   expect(latestOperatorAnswer([stop, newerStop, newerAnswer, answer])).toEqual(record);
 });
+
+import { buildLoadFlakeResolvedComment } from '../stand-down.mjs';
+it('exhausted load retries are terminal until the operator answers', () => {
+  const exhausted = trusted(buildLoadFlakeResolvedComment({ altSha: '9202eee8a', result: 'exhausted' }), record.standDownId);
+  expect(countUnresolvedStandDowns([exhausted])).toBe(1);
+  expect(latestUnresolvedStandDown([exhausted])).toEqual(exhausted);
+  expect(countUnresolvedStandDowns([exhausted, answer])).toBe(0);
+});

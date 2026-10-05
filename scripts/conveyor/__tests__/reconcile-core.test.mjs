@@ -2186,6 +2186,35 @@ describe('case 5h — real web-everything/web-everything#2549 shape (measured 20
   });
 });
 
+// #3794 live case, 2026-10-04.
+describe('main-fixed signature before the heal cap', () => {
+  const window = { from: '2026-10-05T00:00:00Z', to: '2026-10-05T01:44:46Z' };
+  const comments = Array.from({ length: 3 }, () => ({
+    body: CI_HEAL_COMMENT_MARKER, author: AUTOMATION, createdAt: '2026-10-05T01:00:00Z',
+  }));
+  const pr = pr1563({ number: 3794, labels: [], statusCheckRollup: redRollup, comments,
+    aheadByOnMain: 3, requiredCheckName: 'test', requiredCheckCompletedAt: '2026-10-05T00:54:36Z' });
+  it('owes a rebase despite three spent heals; no facts preserves exhaustion', () => {
+    const mainFixedSignature = { signatures: [{ emitterFiles: ['scripts/check-standards.mjs'], fixCommits: ['e5c22481e'] }],
+      bugIntroducedAt: window.from, fixedAt: window.to };
+    const plan = planReconcile({ prs: [{ ...pr, mainFixedSignature }] });
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'owed-ci-rerun', why: expect.stringContaining('e5c22481e') })]);
+    expect(plan.notes.some((n) => n.kind === 'ci-heal-exhausted')).toBe(false);
+    expect(planReconcile({ prs: [pr] }).refusals[0].kind).toBe('cap-exhausted');
+  });
+  it('uses chargeable attempts after the rebase and exposes refunds; opt-out keeps the cap', () => {
+    const rebased = { ...pr, aheadByOnMain: 0, comments: [...comments, { author: AUTOMATION,
+      body: buildRebaseOntoMainComment({ attribution: 'main-fixed-signature', attributedWindow: window }),
+    }] };
+    expect(planReconcile({ prs: [rebased], ciHealBudgetRestore: true }).dispatch[0])
+      .toMatchObject({ kind: 'ci-heal', attempts: 0, refunded: 3 });
+    expect(planReconcile({ prs: [rebased], ciHealBudgetRestore: true, ciHealCap: 0 }).refusals[0])
+      .toMatchObject({ kind: 'cap-exhausted', attempts: 0, refunded: 3 });
+    expect(planReconcile({ prs: [rebased], ciHealBudgetRestore: false }).refusals[0])
+      .toMatchObject({ kind: 'cap-exhausted', attempts: 3 });
+  });
+});
+
 describe('case 5i — STACKED-BASE CONFLICT dispatch, a `conflicted` PR whose base is not `main` (#3383)', () => {
   // `web-everything/web-everything#2578`, shape measured live 2026-09-24: `review:accepted` (no `review:changes`, no
   // `review:human`), `mergeStateStatus: DIRTY`/`mergeable: CONFLICTING` (`classifyPr` reads `conflicted`), base
@@ -3350,7 +3379,9 @@ describe('xng7q1p mechanical timeout precedence', () => {
   it('ineligible evidence retains normal healing with a visible reason', () => {
     const result = planReconcile({ prs: [pr({ timeoutRetry: { eligible: false, reason: 'changed-dependency:leaf.mjs' } })], now: NOW });
     expect(result.dispatch[0].kind).toBe('ci-heal');
-    expect(result.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-ineligible' }));
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-ineligible',
+      why: 'PR #3415: changed-dependency:leaf.mjs' }));
+    expect(result.notes).not.toContainEqual(expect.objectContaining({ kind: 'timeout-retry-ineligible' }));
   });
 });
 
@@ -3496,4 +3527,51 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
       expect(planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
     }
   });
+});
+
+import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
+import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
+it('legacy #3881 waits on host load, not a human', () => {
+  const comment = { body: loadFlakeLegacyBody, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION };
+  expect(countUnresolvedStandDowns([comment])).toBe(0);
+  const plan = planReconcile({ prs: [pr1563({ comments: [finding(), comment] })], agents: [], durableCounts: {}, now: NOW });
+  expect(plan.refusals[0].kind).toBe('load-flake-hold');
+});
+
+import { buildLoadFlakeHoldComment as loadHoldBody, buildLoadFlakeResolvedComment as loadResultBody } from '../stand-down.mjs';
+it('load-hold reconcile routing respects cutoff, head changes, and terminal exhaustion', () => {
+  const c = (body, createdAt = '2026-10-04T18:51:50Z') => ({ body, createdAt, author: AUTOMATION });
+  const hold = c(loadHoldBody({ head: 'abc1234', alt: 'lane/fix-alt', altSha: '9202eee8a' }));
+  for (const [comments, headRefOid, expected] of [
+    [[c(loadFlakeLegacyBody, '2026-10-05T00:00:00Z')], 'abc1234', 'stood-down'],
+    [[hold], 'abc1234', 'load-flake-hold'],
+    [[hold], 'def5678', null],
+    [[hold, c(loadResultBody({ altSha: '9202eee8a', result: 'pushed' }), '2026-10-04T20:00:00Z')], 'abc1234', null],
+    [[hold, c(loadResultBody({ altSha: '9202eee8a', result: 'exhausted' }), '2026-10-04T20:00:00Z')], 'abc1234', 'stood-down'],
+  ]) {
+    const plan = planReconcile({ prs: [pr1563({ comments: [finding(), ...comments], headRefOid })], agents: [], durableCounts: {}, now: NOW });
+    const kinds = plan.refusals.map((r) => r.kind);
+    if (expected) expect(kinds).toContain(expected);
+    else { expect(kinds).not.toContain('stood-down'); expect(kinds).not.toContain('load-flake-hold'); }
+  }
+});
+
+import { buildOperatorAnswer as buildLegacyHoldAnswer } from '../stand-down-answer-core.mjs';
+it('a legacy load-flake hold the thread superseded no longer refuses the PR (PR #3945 review)', () => {
+  const legacy = { id: 'IC_legacy_hold', body: loadFlakeLegacyBody, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION };
+  const answer = { id: 'IC_answer', createdAt: '2026-10-04T20:00:00Z', author: AUTOMATION,
+    body: buildLegacyHoldAnswer({ standDownId: 'IC_legacy_hold', reason: 'handled by hand', actor: 'chalbert', channel: 'test' }) };
+  const kinds = (comments) => planReconcile({ prs: [pr1563({ comments: [finding(), ...comments], headRefOid: 'advanced-past-alt' })], agents: [], durableCounts: {}, now: NOW }).refusals.map((r) => r.kind);
+  expect(kinds([legacy])).toContain('load-flake-hold');
+  expect(kinds([legacy, answer])).not.toContain('load-flake-hold');
+  expect(kinds([legacy, answer])).not.toContain('stood-down');
+});
+
+it('a legacy load-flake stand-down on a repo the reverify pass never sweeps stays terminal (PR #3945 review)', () => {
+  const legacy = (slug) => ({ id: 'IC_legacy_hold', body: loadFlakeLegacyBody, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION,
+    url: `https://github.com/${slug}/pull/12#issuecomment-1` });
+  const kinds = (slug) => planReconcile({ prs: [pr1563({ comments: [finding(), legacy(slug)] })], agents: [], durableCounts: {}, now: NOW }).refusals.map((r) => r.kind);
+  expect(kinds('frontier-ui/frontierui')).toContain('stood-down');
+  expect(kinds('frontier-ui/frontierui')).not.toContain('load-flake-hold');
+  expect(kinds('web-everything/web-everything')).toContain('load-flake-hold');
 });

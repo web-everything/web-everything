@@ -357,8 +357,15 @@ describe('countStandDownComments — a forged marker from a random commenter mus
 it('every fixer stand-down call in the brief passes --who={{SESSION_SLUG}}', () => {
   const calls = readFileSync(BRIEF, 'utf8').replace(/\\\n\s*/g, ' ').split('\n')
     .filter((line) => line.startsWith('node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs"'));
-  expect(calls).toHaveLength(4);
+  expect(calls).toHaveLength(5);
   for (const call of calls) expect(call).toContain('--who={{SESSION_SLUG}}');
+});
+
+it('every fenced stand-down exit block in the brief also releases the fix claim with fix-end (PR #3945 review)', () => {
+  const blocks = [...readFileSync(BRIEF, 'utf8').matchAll(/```bash\n([\s\S]*?)```/g)].map((m) => m[1])
+    .filter((block) => block.includes('conveyor/stand-down.mjs'));
+  expect(blocks.length).toBeGreaterThanOrEqual(5);
+  for (const block of blocks) expect(block, block).toContain('conveyor/fix-procedure.mjs" fix-end');
 });
 
 
@@ -408,5 +415,104 @@ describe('stand-down CLI releases only after a successful comment (#4897)', () =
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+// #3881: legacy local verify flakes must not request human judgment.
+import { loadFlakeHolds, loadFlakeHoldState, parseAltBranch, buildLoadFlakeHoldComment, buildLoadFlakeResolvedComment } from '../stand-down.mjs';
+import { loadFlakeLegacyBody, loadTimeoutLegacyBody } from './load-flake-fixture.mjs';
+const loadComment = (body, createdAt = '2026-10-04T18:51:50Z') => ({ body, createdAt, author: AUTOMATION });
+describe('load-flake holds', () => {
+  it('parses the real alt SHA and reclassifies only trusted pre-cutoff load flakes', () => {
+    const c = loadComment(loadFlakeLegacyBody);
+    expect(parseAltBranch(c.body)).toEqual({ branch: 'lane/fix-polluted-branch-scope-read-fix-3881-alt', sha: '9202eee8a' });
+    expect(countTerminalStandDowns([c])).toBe(0);
+    expect(loadFlakeHolds([c])[0]).toMatchObject({ head: null, legacy: true });
+    expect(countTerminalStandDowns([{ ...c, createdAt: '2026-10-05T00:00:00Z' }])).toBe(1);
+    expect(countTerminalStandDowns([loadComment(c.body.replace('load flakiness', 'test failure').replace('load timeouts', 'test failures'))])).toBe(1);
+    expect(loadFlakeHolds([{ ...c, author: { login: 'stranger' } }])).toEqual([]);
+  });
+  it('reclassifies only where the reverify pass works: a legacy comment on another repo stays terminal (PR #3945 review)', () => {
+    const on = (slug) => ({ ...loadComment(loadFlakeLegacyBody), url: `https://github.com/${slug}/pull/12#issuecomment-1` });
+    for (const slug of ['frontier-ui/frontierui', 'plateauapp/plateau-app']) {
+      expect(countTerminalStandDowns([on(slug)])).toBe(1);
+      expect(loadFlakeHolds([on(slug)])).toEqual([]);
+      expect(loadFlakeHoldsFull([on(slug)])).toEqual([]);
+    }
+    expect(countTerminalStandDowns([on('web-everything/web-everything')])).toBe(0);
+    expect(loadFlakeHolds([on('web-everything/web-everything')])).toHaveLength(1);
+  });
+  it('reclassifies #3932\'s "load timeouts" wording too (17:06 ET stand-down)', () => {
+    const c = loadComment(loadTimeoutLegacyBody, '2026-10-04T21:06:04Z');
+    expect(countTerminalStandDowns([c])).toBe(0);
+    expect(loadFlakeHolds([c])[0]).toMatchObject({ legacy: true, alt: { branch: 'lane/heavy-enforce-guard-fix-3932-alt', sha: 'ea104d91e' } });
+  });
+  it('holds until pushed or moved; red-again stays live; exhausted is terminal', () => {
+    const c = loadComment(buildLoadFlakeHoldComment({ head: 'abc0001', alt: 'lane/fix-alt', altSha: '9202eee8a' }));
+    expect(loadFlakeHoldState({ comments: [c], headRefOid: 'abc0001' }).live).toBe(true);
+    expect(loadFlakeHoldState({ comments: [c], headRefOid: 'def0002' }).live).toBe(false);
+    for (const result of ['pushed', 'red-again', 'exhausted']) {
+      const comments = [c, loadComment(buildLoadFlakeResolvedComment({ altSha: '9202eee8a', result }), '2026-10-04T20:00:00Z')];
+      expect(loadFlakeHoldState({ comments, headRefOid: 'abc0001' }).live).toBe(result === 'red-again');
+      expect(countTerminalStandDowns(comments)).toBe(result === 'exhausted' ? 1 : 0);
+    }
+    expect(buildLoadFlakeHoldComment({ head: 'old' })).toContain('stand-down reason=gate-red');
+  });
+});
+
+// PR #3945 review: a legacy gate-red load-flake stand-down that the thread has since superseded must stay inactive.
+import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
+import { loadFlakeHolds as loadFlakeHoldsFull, loadFlakeHoldState as loadFlakeHoldStateFull } from '../load-flake-hold.mjs';
+import { ADVISORY_FIX_COMMENT_MARKER } from '../advisory-fix-mark.mjs';
+import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
+describe('superseded legacy load-flake holds', () => {
+  const legacy = { ...loadComment(loadFlakeLegacyBody), id: 'IC_legacy_hold' };
+  const answer = {
+    id: 'IC_answer', author: AUTOMATION, createdAt: '2026-10-04T22:00:00Z',
+    body: buildOperatorAnswer({ standDownId: 'IC_legacy_hold', reason: 'ship the alt branch by hand', actor: 'chalbert', channel: 'test' }),
+  };
+  const note = { body: `${ADVISORY_NOTE_MARKER}\n\nadvisory note`, author: AUTOMATION, createdAt: '2026-10-04T18:00:00Z' };
+  const fixMark = { body: `${ADVISORY_FIX_COMMENT_MARKER}\n\nfixed`, author: AUTOMATION, createdAt: '2026-10-04T18:30:00Z' };
+  it('an operator answer naming the legacy hold ends it', () => {
+    expect(loadFlakeHoldsFull([legacy])).toHaveLength(1);
+    expect(loadFlakeHoldsFull([legacy, answer])).toEqual([]);
+    expect(loadFlakeHoldStateFull({ comments: [legacy], headRefOid: 'advanced-past-alt' }).live).toBe(true);
+    expect(loadFlakeHoldStateFull({ comments: [legacy, answer], headRefOid: 'advanced-past-alt' }).live).toBe(false);
+  });
+  it('an answer naming a different comment does not end it', () => {
+    const other = { ...answer, body: buildOperatorAnswer({ standDownId: 'IC_other', reason: 'x', actor: 'chalbert', channel: 'test' }) };
+    expect(loadFlakeHoldsFull([legacy, other])).toHaveLength(1);
+  });
+  it('an advisory finding already addressed before the hold ends it', () => {
+    expect(loadFlakeHoldsFull([note, fixMark, legacy])).toEqual([]);
+    expect(loadFlakeHoldsFull([note, legacy])).toHaveLength(1);
+  });
+  it('stand-down.mjs stays import-light: the operator queue stages it alone', () => {
+    const src = readFileSync(resolve(HERE, '..', 'stand-down.mjs'), 'utf8');
+    expect(src).not.toMatch(/from '\.\/(advisory-fix-mark|stand-down-answer-core)\.mjs'/);
+  });
+});
+
+// PR #3945 advisory (round 3): the recorded head may be abbreviated; GitHub reports the full 40-char OID.
+import { loadFlakeHoldRequest, LOAD_FLAKE_REVERIFY_REPOS } from '../stand-down.mjs';
+describe('load-flake hold head comparison and supported repos', () => {
+  const full = 'abc0001'.padEnd(40, '0');
+  const at = (head) => [loadComment(buildLoadFlakeHoldComment({ head, alt: 'lane/x-alt', altSha: 'bbb2222' }))];
+  it('an abbreviated recorded head matches the full PR head oid', () => {
+    expect(loadFlakeHoldState({ comments: at('abc0001'), headRefOid: full }).live).toBe(true);
+    expect(loadFlakeHoldState({ comments: at(full), headRefOid: 'abc0001' }).live).toBe(true);
+    expect(loadFlakeHoldState({ comments: at(full), headRefOid: full }).live).toBe(true);
+  });
+  it('a genuinely different head still ends the hold', () => {
+    expect(loadFlakeHoldState({ comments: at('abc0001'), headRefOid: 'def0002'.padEnd(40, '0') }).live).toBe(false);
+  });
+  it('only repositories with a registered reverify worker may record a load-flake hold', () => {
+    expect(LOAD_FLAKE_REVERIFY_REPOS).toEqual(['we']);
+    expect(loadFlakeHoldRequest({ reason: 'load-flake', alt: 'lane/x-alt', altSha: 'bbb2222', repoKey: 'we' })).toBe(true);
+    for (const repoKey of ['frontierui', 'plateau-app', null, undefined]) {
+      expect(loadFlakeHoldRequest({ reason: 'load-flake', alt: 'lane/x-alt', altSha: 'bbb2222', repoKey })).toBe(false);
+    }
+    expect(loadFlakeHoldRequest({ reason: 'load-flake', alt: undefined, altSha: 'bbb2222', repoKey: 'we' })).toBe(false);
+    expect(loadFlakeHoldRequest({ reason: 'gate-red', alt: 'lane/x-alt', altSha: 'bbb2222', repoKey: 'we' })).toBe(false);
   });
 });

@@ -14,8 +14,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
-  countCiHealComments, buildCiHealComment, CI_HEAL_COMMENT_MARKER, spawnCiHealRearm, sanitizeForPublicComment, redactSecrets, spawnCiHealRestamp, postOrOweCiHealComment, resolveHealHead,
+  countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore, readAttributedWindows, buildCiHealComment, CI_HEAL_COMMENT_MARKER, spawnCiHealRearm, sanitizeForPublicComment, redactSecrets, spawnCiHealRestamp, postOrOweCiHealComment, resolveHealHead,
 } from '../ci-heal-mark.mjs';
+import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
 import { readOwedWrites, owedWriteAlreadyLive } from '../ci-heal-owed.mjs';
 import { budgetBlockedMessage } from '../../lib/gh-throttle.mjs';
 
@@ -576,4 +577,35 @@ describe('PR #3577 review: failure detail is neutralised before it reaches a pub
     expect(body).toContain('git push failed');
     expect(buildCiHealComment({ attemptId: 'r', failed: true, detail: 'x'.repeat(50_000) }).length).toBeLessThan(3000);
   });
+});
+
+// #3794 live case, 2026-10-04.
+describe('attributed main-bug refunds', () => {
+  const window = { from: '2026-10-05T00:00:00Z', to: '2026-10-05T01:44:46Z' };
+  const marker = { author: AUTOMATION, body: buildRebaseOntoMainComment({
+    attribution: 'main-fixed-signature', attributedWindow: window,
+  }) };
+  const heal = (createdAt) => ({ author: AUTOMATION, body: CI_HEAL_COMMENT_MARKER, createdAt });
+  it('refunds inclusive boundaries and inside heals, preserving outside and undated attempts', () => {
+    const comments = [marker, heal(window.from), heal('2026-10-05T01:00:00Z'), heal(window.to),
+      heal('2026-10-04T23:59:59Z'), heal('2026-10-05T01:44:47Z'), heal(undefined)];
+    expect(readAttributedWindows(comments)).toEqual([window]);
+    expect(countChargeableCiHealComments(comments)).toBe(3);
+    expect(countChargeableCiHealComments(comments, { restore: false })).toBe(countCiHealComments(comments));
+  });
+  it('ignores untrusted, quoted and malformed window comments', () => {
+    for (const bad of [
+      { ...marker, author: { login: 'outsider' } }, { ...marker, body: `quoted:\n${marker.body}` },
+      { ...marker, body: marker.body.replace(window.to, 'not-a-date') },
+    ]) {
+      expect(readAttributedWindows([bad])).toEqual([]);
+      expect(countChargeableCiHealComments([bad, heal(window.from)])).toBe(1);
+    }
+    expect(countChargeableCiHealComments(null)).toBe(0);
+  });
+});
+
+it('enables budget restoration unless the environment explicitly disables it', () => {
+  for (const value of [undefined, '', '1', 'true', 'anything']) expect(resolveCiHealBudgetRestore({ WE_CI_HEAL_BUDGET_RESTORE: value })).toBe(true);
+  for (const value of ['0', 'false', 'FALSE']) expect(resolveCiHealBudgetRestore({ WE_CI_HEAL_BUDGET_RESTORE: value })).toBe(false);
 });

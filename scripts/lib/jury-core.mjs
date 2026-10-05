@@ -482,6 +482,43 @@ function wordOverlap(a, b) {
   return hit / Math.min(A.size, B.size);
 }
 
+/** Symmetric word overlap (|A∩B| / |A∪B|); unlike {@link wordOverlap} a subset of a longer text does not score 1. */
+function wordJaccard(a, b) {
+  const A = corroborationWords(a);
+  const B = corroborationWords(b);
+  if (!A.size || !B.size) return 0;
+  let hit = 0;
+  for (const w of A) if (B.has(w)) hit += 1;
+  return hit / (A.size + B.size - hit);
+}
+export const CARRY_SUMMARY_JACCARD_FLOOR = 0.6;
+
+/**
+ * The cited path AS WRITTEN, for every lookup against a real repository: only a `./` prefix and a `:line` suffix are
+ * dropped. A leading `a/` or `b/` is a real top-level directory as often as it is a diff prefix, so it is NEVER
+ * stripped here — an alias that names a different (root) file would be compared against the wrong file. The
+ * prefix-stripping `corroborationPath` stays for fuzzy label matching only.
+ */
+export const exactCitedPath = (file) => String(file ?? '').trim().replace(/^\.\//, '').replace(/:\d+(?::\d+)?$/, '');
+
+/**
+ * ONE definition of "the same finding" for CLEARING a standing obligation (carrying an operator ruling onto a new
+ * head, `findCarriedOperatorRuling`; overruling an earlier block, `ruling-ledger.mjs#ignoredRulings`): the same exact
+ * path, the same spot (both lines absent, or both within {@link CORROBORATION_LINE_WINDOW}), the same claim
+ * (identical, or symmetric word overlap of at least {@link CARRY_SUMMARY_JACCARD_FLOOR}), and the same severity
+ * ({@link CARRY_SEVERITY_FIELDS}). A ruling is scoped to the instance the operator saw. `a` and `b` are findings
+ * (`{ file, line, summary, verdict, impactIfUnfixed }`).
+ */
+export function sameFindingForClearing(a, b) {
+  const path = exactCitedPath(a?.file);
+  if (!path || path !== exactCitedPath(b?.file)) return false;
+  if (!(a.line == null && b.line == null)
+    && !(Number.isInteger(a.line) && Number.isInteger(b.line) && Math.abs(a.line - b.line) <= CORROBORATION_LINE_WINDOW)) return false;
+  const summary = (s) => String(s ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+  if (summary(a.summary) !== summary(b.summary) && wordJaccard(a.summary, b.summary) < CARRY_SUMMARY_JACCARD_FLOOR) return false;
+  return CARRY_SEVERITY_FIELDS.every((k) => a[k] === b[k]);
+}
+
 /**
  * #4194 — DID ANOTHER SEAT RAISE THE SAME PROBLEM? PURE, deterministic. Used to stamp an ADDED (non-Claude)
  * review seat's finding with whether one of Claude's own seats confirmed it. Two findings corroborate when they
@@ -2327,20 +2364,19 @@ export function findSupersedingNotReal(referral, { records = [], operatorRulings
   return null;
 }
 
-// A carry lets an operator ruling clear the gate by itself, so its summary match is stricter than the advisory
-// supersede's 0.5-over-the-smaller-set: exact normalized equality, or a high overlap over enough words that a short
-// generic summary ("missing check") can never inherit another defect's ruling by sharing half of two words.
-export const CARRY_MIN_WORD_OVERLAP = 0.8;
-export const CARRY_MIN_WORDS = 4;
-export function carrySummaryMatches(a, b) {
-  const norm = s => String(s ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
-  if (norm(a) === norm(b)) return true;
-  const A = corroborationWords(a), B = corroborationWords(b);
-  if (A.size < CARRY_MIN_WORDS || B.size < CARRY_MIN_WORDS) return false;
-  // Over the LARGER set, unlike `wordOverlap`: a short summary that is a subset of a long one must not match it.
-  let hit = 0;
-  for (const w of A) if (B.has(w)) hit += 1;
-  return hit / Math.max(A.size, B.size) >= CARRY_MIN_WORD_OVERLAP;
+/** The finding fields an operator ruling is scoped to: a carry requires every one to be equal. */
+export const CARRY_SEVERITY_FIELDS = Object.freeze(['verdict', 'impactIfUnfixed']);
+
+/**
+ * The operator ruling that still backs a `carried` entry, or null. The LATEST ruling on the carried-from
+ * (head, run, finding) decides, and it must still say what was carried (same result, same card): an operator who
+ * later re-rules that finding withdraws the backing. ONE definition for the gate (`referralRecordState`) and the
+ * ignored-ruling ledger (`ruling-ledger.mjs#ignoredRulings`), so they cannot disagree on whether a carry stands.
+ */
+export function carriedBackingHolds(carried, { repo, pr, operatorRulings = [] }) {
+  const backing = operatorRulings.filter(o => o.repo === repo && o.pr === pr
+    && o.head === carried.from.head && o.runId === carried.from.runId && o.key === carried.from.key).at(-1);
+  return backing && backing.result === carried.result && backing.card === carried.card ? backing : null;
 }
 
 /** Latest matching operator decision on an earlier head; the IO caller must prove unchanged cited lines. */
@@ -2350,12 +2386,9 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
     if (o.head === head || o.repo !== repo || o.pr !== pr) continue;
     const record = records.find(r => r.runId === o.runId && r.head === o.head && r.repo === repo && r.pr === pr);
     const finding = record?.referrals.find(f => f.key === o.key)?.finding;
-    if (!finding || !corroborationPath(finding.file)
-      || corroborationPath(finding.file) !== corroborationPath(target.file)) continue;
-    if (!(finding.line == null && target.line == null)
-      && !(Number.isInteger(finding.line) && Number.isInteger(target.line)
-        && Math.abs(finding.line - target.line) <= CORROBORATION_LINE_WINDOW)) continue;
-    if (!carrySummaryMatches(finding.summary, target.summary)) continue;
+    // Clearing a mandatory referral is stricter than merging duplicates (exact path, line window, symmetric word
+    // overlap, same severity): see `sameFindingForClearing`, the one definition the ledger's overrule shares.
+    if (!finding || !sameFindingForClearing(finding, target)) continue;
     return { from: { head: o.head, runId: o.runId, key: o.key }, result: o.result, card: o.card, finding };
   }
   return null;
@@ -2457,13 +2490,22 @@ export function referralRecordState(record, { head = record?.head, body = record
       else { rulings.push(operator); if (operator.result === 'block') blocked.push(f.key); }
       continue;
     }
-    const carried = (record.carried ?? []).find(c => c.key === f.key);
-    // Like `superseded` below, a carried earlier-head ruling never overrides a ruling the reviewer already
-    // recorded on THIS head: that ruling (a `block` above all) decides through the ordinary path.
-    if (carried && !recorded.length) {
-      const backing = operatorRulings.filter(o => o.repo === record.repo && o.pr === record.pr
-        && o.head === carried.from.head && o.runId === carried.from.runId && o.key === carried.from.key).at(-1);
-      if (head !== record.head || !backing || backing.result !== carried.result || backing.card !== carried.card
+    // The reviewer's own COUNTED ruling on this head (independent clearer, one outcome, readable card) — the same
+    // test the carry sink applies before it carries, so the two cannot disagree about what a carry may replace.
+    const history = independent ? recorded : [];
+    const active = history.filter(r => !history.some(next => supersededRulings(next).includes(r.id)));
+    const outcomes = new Set(active.map(r => JSON.stringify([r.result, r.result === 'card' ? r.card : null])));
+    const cardUnreadable = active.some(r => r.result === 'card' && !cardReadable(r.card));
+    // A carry only stands in for a ruling nobody has counted on THIS head: a counted reviewer ruling for the same
+    // finding (appended after the carry) wins over it, so a current-head `block` can never be masked by an earlier
+    // head's operator not-real. A reviewer `block` that contradicts another ruling on the finding still yields: the
+    // ordinary path below holds it pending. Any other uncounted ruling (non-independent clearer, unreadable card)
+    // settles nothing, so the carry still applies.
+    const counted = active.length > 0 && ((outcomes.size === 1 && !cardUnreadable) || active.some(r => r.result === 'block'));
+    const carried = counted ? undefined : (record.carried ?? []).find(c => c.key === f.key);
+    if (carried) {
+      const backing = carriedBackingHolds(carried, { repo: record.repo, pr: record.pr, operatorRulings });
+      if (head !== record.head || !backing
         || (carried.result === 'card' && !cardReadable(carried.card))) pending.push(f.key);
       else { rulings.push(backing); if (carried.result === 'block') blocked.push(f.key); }
       continue;
@@ -2481,11 +2523,7 @@ export function referralRecordState(record, { head = record?.head, body = record
     // Match audited drops: disabling an optional seat cannot erase an existing ruling (especially a block),
     // even one not yet counted because its clearer is not independent.
     if (!recorded.length && seatDisabled(f.seat)) continue;
-    const history = independent ? recorded : [];
-    const active = history.filter(r => !history.some(next => supersededRulings(next).includes(r.id)));
-    const outcomes = new Set(active.map(r => JSON.stringify([r.result, r.result === 'card' ? r.card : null])));
-    if (head !== record.head || outcomes.size !== 1
-      || active.some(r => r.result === 'card' && !cardReadable(r.card))) pending.push(f.key);
+    if (head !== record.head || outcomes.size !== 1 || cardUnreadable) pending.push(f.key);
     else { rulings.push(...active); if (active[0].result === 'block') blocked.push(f.key); }
   }
   // Named only when a finding actually stays held, so a fully operator-ruled record never shows it.

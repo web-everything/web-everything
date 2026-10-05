@@ -2282,3 +2282,16 @@ describe('planTick — KIND-SCOPED dispatch-pause (epic #3383): hold NEW-item ki
     expect(out.nextState.fixGuards).toEqual([]);
   });
 });
+
+// #3794 live case, 2026-10-04.
+it('refunds the durable and in-session heal floor without refunding again on the next tick', () => {
+  const args = { prs: [{ num: 40, prNumber: 99, state: 'OPEN', ci: 'fail', labels: ['ready-to-merge'] }],
+    launchedNums: [40], availableLanes: [5], prCiHealCounts: { 99: 0 }, prCiHealRefunds: { 99: 3 } };
+  const first = planCiHealSpawns({ ...args, ciHealAttempts: { 99: 3 } });
+  expect(first.spawns[0]).toMatchObject({ pr: 99, refunded: 3 });
+  expect(first.ciHealAttempts[99]).toBe(4);
+  const next = planCiHealSpawns({ ...args, ciHealAttempts: first.ciHealAttempts });
+  expect(next.ciHealAttempts[99]).toBe(5);
+  expect(planCiHealSpawns({ ...args, ciHealAttempts: { 99: 6 } }).notes[0])
+    .toMatchObject({ kind: 'ci-heal-exhausted', attempts: 3, refunded: 3 });
+});
