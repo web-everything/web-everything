@@ -97,6 +97,13 @@ export const FIX_END_MARKER = '🔓 conveyor fix-end — fix claim released';
  * The count is read off the PR thread, so the mark has to live there too. Pinned equal to the ledger's prefix.
  */
 export const FIX_END_INFRA_STALL_MARK = '<!-- fix-end-outcome: blocked-on-infra -->';
+/**
+ * Completion outcomes that end a fix turn on a product/infra wall rather than on the fix itself, so the turn is
+ * marked (and not counted as a fixer miss). `blocked-on-permission` is a permission denial of an otherwise-clear
+ * fix (PR #3990 review); it shares the mark because the ladder only prefix-matches `FIX_END_INFRA_STALL_PREFIX`.
+ * Add a sibling outcome HERE, not at a literal `'blocked-on-infra'` comparison.
+ */
+export const INFRA_STALL_OUTCOMES = Object.freeze(['blocked-on-infra', 'blocked-on-permission']);
 
 /** Normalize a repo slug or key to the claim store's repo KEY (`we`, `frontierui`, …). Throws on an unknown one. */
 export function repoKeyOf(repo) {
@@ -526,9 +533,9 @@ export function buildFixEndComment({ who, headSha = null, draft = false, infraSt
     `\`${who}\` released the fix claim${headSha ? ` at \`${String(headSha).slice(0, 9)}\`` : ''}. ${tail}`,
     ...(infraStall ? [
       '',
-      'This turn ended **blocked on infrastructure** (its completion record says `blocked-on-infra`), not on the '
-        + 'fix itself: it is retried after the infra cool-off and is **not** counted as a fixer miss on the '
-        + 'escalation ladder.',
+      'This turn ended **blocked on infrastructure or a permission wall** (its completion record says '
+        + '`blocked-on-infra` or `blocked-on-permission`), not on the fix itself: it is retried after the cool-off '
+        + 'and is **not** counted as a fixer miss on the escalation ladder.',
       FIX_END_INFRA_STALL_MARK,
     ] : []),
   ].join('\n');
@@ -542,7 +549,7 @@ export function buildFixEndComment({ who, headSha = null, draft = false, infraSt
  * @param {{sessionId?:string|null, claimedAt?:string|null}} o
  */
 export function isInfraStallCompletion(record, { sessionId = null, claimedAt = null } = {}) {
-  if (!record || record.status !== 'done' || record.outcome !== 'blocked-on-infra') return false;
+  if (!record || record.status !== 'done' || !INFRA_STALL_OUTCOMES.includes(record.outcome)) return false;
   if (record.sessionId && sessionId) return record.sessionId === sessionId;
   if (record.sessionId && !sessionId) return false;
   const updated = Date.parse(record.updatedAt ?? '');

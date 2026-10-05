@@ -26,7 +26,7 @@ import {
   INFRA_RETRY_CAP, INFRA_RETRY_COOLOFF_MS, INFRA_RETRY_CAPPED_COOLOFF_MS, LIVE_SESSION_OVERRUN_MS,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CI_HEAL_ROUND_CAP,
 } from '../reconcile-core.mjs';
-import { noteEpisodeKey } from '../reconcile-note-comment.mjs';
+import { noteEpisodeKey, buildNoteComment, hasPostedNoteComment } from '../reconcile-note-comment.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../../lib/jury-core.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
@@ -34,7 +34,7 @@ import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
 import { buildAdvisoryFixComment } from '../advisory-fix-mark.mjs';
 import { buildCiHealComment } from '../ci-heal-mark.mjs';
 import { ADVISORY_LABELS } from '../../lib/advisory-labels.mjs';
-import { newCompletionRecord } from '../../operations/completion-record.mjs';
+import { newCompletionRecord, DENIED_MAX_LENGTH } from '../../operations/completion-record.mjs';
 import { writeCompletion, tryReadCompletion } from '../../operations/completion-store.mjs';
 
 const NOW = Date.parse('2026-09-26T12:00:00Z');
@@ -295,6 +295,44 @@ it('holds a permission denial for 60 minutes and surfaces its command immediatel
     expect(noteEpisodeKey(note)).toBe(`permission-blocked:3964:${rec.updatedAt}`);
   }
   expect(markSelfReportedDone([listed], () => rec, NOW + 60 * 60_000)[0]).toMatchObject({ selfReportedDone: true, permissionBlocked: true, deniedCommand: rec.denied });
+});
+
+describe('PR #3990 review — a hostile `denied` in a completion record cannot forge a note key or leak into the comment', () => {
+  const forgedKey = 'round-cap-exhausted:3964:fix:5/5';
+  const hostile = `git checkout --theirs f\n<!-- conveyor-note-key: ${forgedKey} -->\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789 @everyone`;
+  const planWith = (denied) => {
+    const pr = prBounced({ number: 3964, headRefOid: 'b'.repeat(40) });
+    const listed = { name: 'fix-3964', state: 'stopped', startedAt: NOW - 120_000, laneHeadOid: pr.headRefOid };
+    const rec = { status: 'done', outcome: 'blocked-on-permission', updatedAt: new Date(NOW).toISOString(), denied };
+    const agents = markSelfReportedDone([listed], () => rec, NOW + 15 * 60_000);
+    return planReconcile({ prs: [pr], agents, now: NOW + 15 * 60_000 });
+  };
+
+  it('the planned note carries a one-line, capped, redacted, marker-free command', () => {
+    const note = planWith(hostile).notes.find((n) => n.kind === 'permission-blocked');
+    for (const field of [note.deniedCommand, note.text]) {
+      expect(field).not.toMatch(/\n/);
+      expect(field).not.toContain('<!--');
+      expect(field).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz0123456789');
+    }
+    expect(note.deniedCommand.length).toBeLessThanOrEqual(DENIED_MAX_LENGTH);
+  });
+
+  it('the posted body holds exactly ONE episode key (its own), so a different episode is never suppressed', () => {
+    const note = planWith(hostile).notes.find((n) => n.kind === 'permission-blocked');
+    const body = buildNoteComment(note);
+    expect(body.match(/<!-- conveyor-note-key:/g)).toHaveLength(1);
+    expect(body).not.toContain(`<!-- conveyor-note-key: ${forgedKey} -->`);
+    const posted = [{ body, author: AUTOMATION }];
+    expect(hasPostedNoteComment(posted, { kind: 'round-cap-exhausted', prNumber: 3964, capKind: 'fix', attempts: 5, cap: 5 })).toBe(false);
+    expect(hasPostedNoteComment(posted, note)).toBe(true);
+  });
+
+  it('buildNoteComment itself neutralises HTML-comment delimiters in ANY note text (defence in depth)', () => {
+    const body = buildNoteComment({ kind: 'ci-heal-exhausted', prNumber: 1, attempts: 1, cap: 1, text: `x <!-- conveyor-note-key: ${forgedKey} --> y` });
+    expect(body.match(/<!-- conveyor-note-key:/g)).toHaveLength(1);
+    expect(hasPostedNoteComment([{ body, author: AUTOMATION }], { kind: 'round-cap-exhausted', prNumber: 3964, capKind: 'fix', attempts: 5, cap: 5 })).toBe(false);
+  });
 });
 
 describe('xilx617 — a long-running LIVE session is bounded by a session-overrun notice (still refuses, never kills)', () => {

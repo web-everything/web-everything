@@ -114,7 +114,7 @@ const DEFAULT_FIXER_LADDER = Object.freeze({
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
 import { reduceCheckState } from '../operations/pr-status.mjs';
-import { isForeignCompletionSessionId } from '../operations/completion-record.mjs';
+import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
@@ -773,7 +773,9 @@ export function markSelfReportedDone(agents, completionFor, nowMs, { infraCoolof
     const startedMs = startedAtMs(a?.startedAt);
     if (!Number.isFinite(updatedMs) || !Number.isFinite(startedMs) || updatedMs < startedMs) return a;
     if (rec.outcome === 'blocked-on-permission') {
-      const evidence = { permissionBlocked: true, deniedCommand: rec.denied ?? null, permissionBlockedSince: rec.updatedAt };
+      // Re-sanitized at read time: a record written before the write-point sanitizer (or hand-edited) must never
+      // reach the bot-authored note comment verbatim (PR #3990 review).
+      const evidence = { permissionBlocked: true, deniedCommand: sanitizeDeniedCommand(rec.denied), permissionBlockedSince: rec.updatedAt };
       if (!(nowMs - updatedMs >= PERMISSION_BLOCKED_COOLOFF_MS)) {
         return { ...a, ...evidence, awaitingInfraCooloff: true };
       }
@@ -1644,7 +1646,7 @@ export function planReconcile({
     // past the cap (infra never recovers) still posts as ONE episode, not a fresh comment every tick.
     const permissionBlocked = bound.find((b) => b.agent?.permissionBlocked === true);
     if (permissionBlocked) {
-      const deniedCommand = permissionBlocked.agent.deniedCommand ?? null;
+      const deniedCommand = sanitizeDeniedCommand(permissionBlocked.agent.deniedCommand);
       const since = permissionBlocked.agent.permissionBlockedSince ?? null;
       notes.push({
         kind: 'permission-blocked', prNumber, deniedCommand, since,

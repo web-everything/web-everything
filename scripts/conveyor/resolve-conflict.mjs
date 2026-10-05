@@ -15,7 +15,7 @@
  * evidence cannot dirty the checkout. Logging failure never masks the actual result.
  */
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, lstatSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, lstatSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,24 +37,47 @@ export function parseArgs(argv) {
   return result;
 }
 
-/** PURE: missing side means deletion; union needs both sides and permits an empty add/add base. */
-export function planResolution({ take, stages }) {
+/**
+ * PURE: missing side means deletion; union needs both sides and permits an empty add/add base. `modes` are the
+ * index modes of the stages; the kept side's mode is carried so staging preserves it (union keeps ours').
+ */
+export function planResolution({ take, stages, modes = {} }) {
   if (!['ours', 'theirs', 'union'].includes(take)) throw new Error('--take must be ours, theirs, or union');
   const stage = take === 'ours' ? 2 : take === 'theirs' ? 3 : null;
-  if (stage) return { take, stage, action: stages[stage] == null ? 'deleted' : 'resolved', content: stages[stage] };
+  if (stage) return { take, stage, action: stages[stage] == null ? 'deleted' : 'resolved', content: stages[stage], mode: modes[stage] ?? '100644' };
   if (stages[2] == null || stages[3] == null) throw new Error('Union requires both ours and theirs; choose a side for a deletion');
-  return { take, stage, action: 'resolved', base: stages[1] ?? Buffer.alloc(0), ours: stages[2], theirs: stages[3] };
+  return { take, stage, action: 'resolved', base: stages[1] ?? Buffer.alloc(0), ours: stages[2], theirs: stages[3], mode: modes[2] ?? '100644' };
 }
 
-/** IO shell: git returns Buffers; argv arrays and literal pathspecs keep filenames out of shell syntax. */
+/**
+ * The default git runner. This helper is pre-allowed in the dispatcher's settings, so it must not be a way to run
+ * commands a lane's own (Edit/Write-reachable) `.git/config` chooses: `core.fsmonitor` and `core.hooksPath` are
+ * neutralised here, and staging goes through `hash-object --no-filters` + `update-index --cacheinfo` (never
+ * `git add`, which runs `filter.*.clean` drivers named by `.gitattributes`).
+ */
+const defaultGit = (args, cwd) => execFileSync(
+  'git',
+  ['--no-optional-locks', '--literal-pathspecs', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', ...args],
+  { cwd, stdio: ['ignore', 'pipe', 'pipe'] },
+);
+
+/**
+ * IO shell: git returns Buffers; argv arrays and literal pathspecs keep filenames out of shell syntax. Only the
+ * caller's OWN lane is eligible: `dir` must be the checkout the process itself is running in (`io.cwd`, default
+ * `process.cwd()`), so a pre-allowed invocation cannot resolve or overwrite a conflict in a sibling lane.
+ */
 export function resolveConflicts({ dir = process.cwd(), files = [], take, argumentError }, io = {}) {
-  const git = io.git ?? ((args, cwd) => execFileSync('git', ['--literal-pathspecs', ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'] }));
+  const git = io.git ?? defaultGit;
   const logPath = io.logPath ?? process.env.WE_RESOLVE_CONFLICT_LOG ?? join(homedir(), '.claude', 'conveyor', 'resolve-conflict.log.jsonl');
   const result = { ok: false, dir, take, files: [], loggedTo: null };
   try {
     if (argumentError) throw new Error(argumentError);
     dir = git(['rev-parse', '--show-toplevel'], dir).toString().trim(); result.dir = dir;
     if (!isLaneClonePath(dir)) throw new Error(`Refusing non-lane clone: ${dir}`);
+    let ownDir;
+    try { ownDir = git(['rev-parse', '--show-toplevel'], io.cwd ?? process.cwd()).toString().trim(); }
+    catch { throw new Error('Refusing: this process is not running inside a git checkout (no own lane to resolve)'); }
+    if (ownDir !== dir) throw new Error(`Refusing ${dir}: not the current lane (${ownDir}); run this from inside the lane you are resolving`);
     try { git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], dir); } catch { throw new Error('No merge in progress (MERGE_HEAD missing)'); }
     if (!files.length) throw new Error('At least one --file is required');
     const plans = [...new Set(files)].map((file) => {
@@ -68,13 +91,13 @@ export function resolveConflicts({ dir = process.cwd(), files = [], take, argume
       }
       const entries = git(['ls-files', '-u', '-z', '--', file], dir).toString();
       if (!entries) throw new Error(`File is not unmerged: ${file}`);
-      const stages = {};
+      const stages = {}; const modes = {};
       for (const entry of entries.split('\0').filter(Boolean)) {
         const match = /^(\d+) [a-f0-9]+ ([123])\t(.*)$/s.exec(entry);
         if (!match || match[3] !== file || !['100644', '100755'].includes(match[1])) throw new Error(`Unsupported conflict path or mode: ${file}`);
-        stages[match[2]] = git(['show', `:${match[2]}:${file}`], dir);
+        stages[match[2]] = git(['show', `:${match[2]}:${file}`], dir); modes[match[2]] = match[1];
       }
-      return { file, ...planResolution({ take, stages }) };
+      return { file, ...planResolution({ take, stages, modes }) };
     });
     for (const plan of plans) {
       const target = join(dir, plan.file);
@@ -89,8 +112,12 @@ export function resolveConflicts({ dir = process.cwd(), files = [], take, argume
             content = git(['merge-file', '-p', '--union', ...['ours', 'base', 'theirs'].map((s) => join(temp, s))], dir);
           } finally { rmSync(temp, { recursive: true, force: true }); }
         }
+        // The kept side's mode, not whatever the working-tree file happened to carry: write, chmod, then stage the
+        // raw bytes at exactly that mode (no clean filters — see `defaultGit`).
         mkdirSync(dirname(target), { recursive: true }); writeFileSync(target, content);
-        git(['add', '--', plan.file], dir);
+        chmodSync(target, plan.mode === '100755' ? 0o755 : 0o644);
+        const blob = git(['hash-object', '-w', '--no-filters', '--', plan.file], dir).toString().trim();
+        git(['update-index', '--add', '--cacheinfo', `${plan.mode},${blob},${plan.file}`], dir);
       }
       result.files.push({ file: plan.file, take, stage: plan.stage, action: plan.action });
     }

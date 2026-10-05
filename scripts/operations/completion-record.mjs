@@ -97,6 +97,40 @@ export function newCompletionRecord({
   };
 }
 
+/** Longest `denied` value kept (one line; it is rendered into a PR comment by the reconcile note path). */
+export const DENIED_MAX_LENGTH = 200;
+/** Input bound applied before any regex runs (the final cap is {@link DENIED_MAX_LENGTH}). */
+const DENIED_SCAN_LIMIT = 2000;
+
+/**
+ * we:scripts/operations/completion-record.mjs#sanitizeDeniedCommand — `denied` is agent-supplied free text (a
+ * fixer that read untrusted PR content echoes the command it was refused) that the reconciler later interpolates
+ * into a bot-authored PR comment (PR #3990 review). So it is made safe at the single write point AND again where
+ * the note is built: ONE line, capped at {@link DENIED_MAX_LENGTH}, HTML-comment delimiters and backticks removed
+ * (so it cannot forge a `conveyor-note-key` marker or break out of a code fence), token-like substrings redacted,
+ * `@mentions` defanged. Pure; a non-string yields `null`.
+ * @param {*} value
+ * @returns {string|null}
+ */
+export function sanitizeDeniedCommand(value) {
+  if (typeof value !== 'string') return null;
+  // Bound the input BEFORE any regex: the redaction patterns are quadratic on pathological runs of `-`.
+  let s = value.slice(0, DENIED_SCAN_LIMIT).replace(/\s+/g, ' ').trim();
+  s = s
+    .replace(/\/\/[^\s/@:"']+:[^\s/@"']+@/g, '//[redacted]@')
+    .replace(/\b(password|passwd|secret|token)\s*:\s*[^\s"']+/gi, '$1: [redacted]')
+    .replace(/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{8,}/g, '[redacted]')
+    .replace(/\b(?:sk|xox[abprs]|AKIA)[-A-Za-z0-9_]{12,}/g, '[redacted]')
+    .replace(/\b(Bearer|token|Basic)\s+[^\s"']+/gi, '$1 [redacted]')
+    .replace(/(--?[\w-]*(?:token|secret|password|passwd|api[-_]?key|authorization)[\w-]*[= ])[^\s"']+/gi, '$1[redacted]')
+    .replace(/\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY)[A-Za-z0-9_]*=)[^\s"']+/gi, '$1[redacted]');
+  // Replace (never delete) the delimiters: deleting can splice a NEW `<!--` together (`<!<!----` → `<!--`).
+  s = s.replace(/<!--|-->|`/g, ' ').replace(/@(?=[\w-])/g, '@​').replace(/\s+/g, ' ').trim();
+  if (/<!--|-->/.test(s)) s = s.replace(/[<>]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (s.length > DENIED_MAX_LENGTH) s = `${s.slice(0, DENIED_MAX_LENGTH - 1)}…`;
+  return s;
+}
+
 /**
  * PURE merge of a `patch` onto an existing record — bumps `updatedAt`, never touches `session`/`kind`/`pr`/
  * `item`/`startedAt`/`v`. Used by the io shell's "report done" path so a caller need only name what changed.
@@ -108,7 +142,7 @@ export function newCompletionRecord({
 export function applyCompletionUpdate(record, patch = {}, now = () => new Date().toISOString()) {
   const next = { ...record, updatedAt: now() };
   for (const key of ['status', 'outcome', 'verdict', 'label', 'runId', 'sessionId', 'denied']) {
-    if (Object.hasOwn(patch, key)) next[key] = patch[key];
+    if (Object.hasOwn(patch, key)) next[key] = key === 'denied' && patch[key] != null ? sanitizeDeniedCommand(patch[key]) : patch[key];
   }
   return next;
 }

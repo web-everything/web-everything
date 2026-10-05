@@ -125,12 +125,15 @@ export function noteHeadline(note) {
  */
 export function buildNoteComment(note) {
   const key = noteEpisodeKey(note);
+  // The text can carry agent-supplied strings (e.g. a fixer's `--denied` command). Break any HTML-comment
+  // delimiter so it can never forge the machine-read episode key below (which `hasPostedNoteComment` matches).
+  const text = String(note?.text ?? '(no detail recorded)').replace(/<!--/g, '<!- -').replace(/-->/g, '- ->');
   const lines = [
     NOTE_COMMENT_MARKER,
     '',
     noteHeadline(note),
     '',
-    note?.text ?? '(no detail recorded)',
+    text,
   ];
   if (note?.kind === 'ci-heal-exhausted' && note?.lastFailureReason) {
     lines.push('', `Last failure: ${note.lastFailureReason}`);

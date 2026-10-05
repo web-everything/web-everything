@@ -23,7 +23,9 @@ import {
   fixBegin, fixEnd, withAltBranchHint, repoKeyFromRemoteUrl, repoKeyForCheckout, DEFAULT_FIX_CLAIM_TTL_MINUTES,
   FIX_BEGIN_MARKER, FIX_END_MARKER, FIXING_LABEL, STOOD_DOWN_LABEL, parseGitPush, resolvePushDestination,
   fixBeginRefusalMessage, refuseHeldPush, parseGitPushes, resolvePushDestinations, pushTargetUnreliable,
+  isInfraStallCompletion,
 } from '../fix-procedure.mjs';
+import { FIX_END_INFRA_STALL_PREFIX } from '../../lib/ruling-ledger.mjs';
 import { acquireFixDispatchClaim, refreshLiveFixDispatchClaims, releaseSessionFixDispatchClaims, readFixDispatchClaim } from '../fix-dispatch-claim.mjs';
 import { fixDispatchClaimRoot } from '../fix-claim-store.mjs';
 import {
@@ -549,6 +551,36 @@ describe('stand-down semantics — a concurrent author is a pause, not a burial'
     const out = withAltBranchHint('P', { branch: 'lane/run-rating-slice1-fix-2811-alt', sha: '3b24fcc18' });
     expect(out).toMatch(/git fetch origin lane\/run-rating-slice1-fix-2811-alt/);
     expect(out).toMatch(/3b24fcc18/);
+  });
+});
+
+describe('PR #3990 review — a permission-wall turn is an infra stall, not a fixer miss', () => {
+  const rec = (outcome, over = {}) => ({ status: 'done', outcome, sessionId: 'sess-1', updatedAt: '2026-10-05T12:00:00.000Z', ...over });
+
+  it.each(['blocked-on-infra', 'blocked-on-permission'])('isInfraStallCompletion recognises %s', (outcome) => {
+    expect(isInfraStallCompletion(rec(outcome), { sessionId: 'sess-1' })).toBe(true);
+  });
+
+  it.each(['re-armed', 'gate-red', 'escalated-needs-judgment', null])('...and still refuses %s', (outcome) => {
+    expect(isInfraStallCompletion(rec(outcome), { sessionId: 'sess-1' })).toBe(false);
+  });
+
+  it('a blocked-on-permission record of ANOTHER session never counts', () => {
+    expect(isInfraStallCompletion(rec('blocked-on-permission'), { sessionId: 'sess-2' })).toBe(false);
+  });
+
+  it('fix-end of a blocked-on-permission turn carries the mark the ladder prefix-matches, so fixerReturnsAfter does not count a miss', async () => {
+    const comments = [];
+    const labels = { ensureLabel() {}, setLabels() {}, postComment: (_r, _p, body) => comments.push(body) };
+    const gh = async (args) => (args[1] === 'view' ? JSON.stringify({ headRefOid: 'a'.repeat(40) }) : '');
+    const r = await fixBegin({ repo: 'we', pr: 3990, who: 'fix-3990', sessionId: 'sess-3990', gh, labels, lockRoot: root, nowMs: T0 });
+    const end = await fixEnd({
+      repo: 'we', pr: 3990, who: 'fix-3990', sessionId: 'sess-3990', token: r.token, gh, labels, lockRoot: root,
+      readCompletion: async () => rec('blocked-on-permission', { sessionId: 'sess-3990' }),
+    });
+    expect(end).toMatchObject({ ok: true, infraStall: true });
+    const endComment = comments.find((c) => c.startsWith(FIX_END_MARKER));
+    expect(endComment).toContain(FIX_END_INFRA_STALL_PREFIX);
   });
 });
 
