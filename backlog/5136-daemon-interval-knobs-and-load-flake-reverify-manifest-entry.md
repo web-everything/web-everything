@@ -2,7 +2,7 @@
 bornAs: xj1zosg
 kind: task
 status: open
-scope: ["we:scripts/review-daemon.mjs"]
+scope: ["we:skills-src/conveyor/review-daemon.mjs", "we:skills-src/conveyor/__tests__/review-daemon-interval.test.mjs", "we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs", "we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs"]
 dateOpened: "2026-10-05"
 tags: []
 ---
