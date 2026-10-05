@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { decide, CATALOGUE, ACTION_ALLOWLIST, SHADOW_ACTUATORS, DEFAULT_CONFIG, familyKey } from '../health-responder-core.mjs';
 import { SMELLS } from '../health-smells/index.mjs';
+import { discoverModuleFiles } from '../registry-discovery.mjs';
 const replay = JSON.parse(readFileSync(new URL('./fixtures/health-responder/replay.json', import.meta.url)));
 export const green = replay.cases.find((c) => c.name === 'D1-fresh-green');
 export function input(c = green) {
@@ -19,7 +20,9 @@ describe('health responder closed decision table', () => {
     expect(c.provenance.urls.length).toBeGreaterThan(0);
   });
   it('covers every registered descriptor without evaluating detectors', () => {
-    expect(SMELLS.length).toBe(50);
+    expect(SMELLS.length).toBeGreaterThan(0);
+    expect(new Set(SMELLS.map((s) => s.id)).size).toBe(SMELLS.length);
+    expect(SMELLS.length).toBe(discoverModuleFiles(new URL('../health-smells/', import.meta.url)).length);
     for (const s of SMELLS) {
       expect(Object.hasOwn(CATALOGUE, s.id), s.id).toBe(true);
       const i = input(); i.episodes[0].smell = s.id; i.episodes[0].key = `${s.id}::${i.episodes[0].subject}`;
