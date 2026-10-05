@@ -680,6 +680,7 @@ function rewriteSoakCardCitation(content, visit) {
 export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   // Phase costs expose where the drain pass budget goes, including refused passes.
   const phaseMs = { read: 0, precheck: 0, resolve: 0, apply: 0, write: 0 };
+  let readSource = 'worktree';
   let phase = 'read';
   let phaseStart = performance.now();
   const nextPhase = (next) => {
@@ -690,8 +691,8 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   };
   const finish = (result) => {
     nextPhase(phase);
-    console.warn(`[numberPendingHashes] phaseMs ${Object.entries(phaseMs).map(([key, ms]) => `${key}=${ms.toFixed(2)}ms`).join(' ')}`);
-    return { ...result, phaseMs };
+    console.warn(`[numberPendingHashes] phaseMs source=${readSource} ${Object.entries(phaseMs).map(([key, ms]) => `${key}=${ms.toFixed(2)}ms`).join(' ')}`);
+    return { ...result, phaseMs, readSource };
   };
   const BL = join(CWD, 'backlog');
   const DOCS = join(CWD, 'docs', 'agent');
@@ -719,10 +720,9 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   try { docsNames = readdirSync(DOCS).filter((f) => f.endsWith('.md')); }
   catch { docsNames = []; } // docs/agent/ missing is not fatal — just nothing to sweep there
   const trackedDocs = new Set((quietGit(CWD, ['ls-files', 'docs/agent/*.md']) || '').split('\n').filter(Boolean));
-  const docsFiles = docsNames
+  const docsPaths = docsNames
     .map((f) => `docs/agent/${f}`)
-    .filter((rel) => trackedDocs.has(rel))
-    .map((rel) => ({ name: rel, content: readFileSync(join(CWD, rel), 'utf8') }));
+    .filter((rel) => trackedDocs.has(rel));
 
   // #3100 — extend the blind rewrite scope to `agent-memory-src/*.md`, the same way #2428 extended it to
   // `docs/agent/*.md`: the compiled agent-memory bundle every future session loads into context can cite a
@@ -735,10 +735,9 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   try { memoryNames = readdirSync(MEMORY).filter((f) => f.endsWith('.md')); }
   catch { memoryNames = []; } // agent-memory-src/ missing is not fatal — just nothing to sweep there
   const trackedMemory = new Set((quietGit(CWD, ['ls-files', 'agent-memory-src/*.md']) || '').split('\n').filter(Boolean));
-  const memoryFiles = memoryNames
+  const memoryPaths = memoryNames
     .map((f) => `agent-memory-src/${f}`)
-    .filter((rel) => trackedMemory.has(rel))
-    .map((rel) => ({ name: rel, content: readFileSync(join(CWD, rel), 'utf8') }));
+    .filter((rel) => trackedMemory.has(rel));
 
   // #4075/xmd4pfa — extend the blind rewrite scope to `scripts/conveyor/flows/*.flow.json`: a flow file
   // cites a pending hash's backlog file BY NAME (`backlog/<hash>-slug.md:LINE`) the same way a docs page or
@@ -752,10 +751,9 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   try { flowsNames = readdirSync(FLOWS).filter((f) => f.endsWith('.flow.json')); }
   catch { flowsNames = []; } // scripts/conveyor/flows/ missing is not fatal — just nothing to sweep there
   const trackedFlows = new Set((quietGit(CWD, ['ls-files', 'scripts/conveyor/flows/*.flow.json']) || '').split('\n').filter(Boolean));
-  const flowsFiles = flowsNames
+  const flowsPaths = flowsNames
     .map((f) => `scripts/conveyor/flows/${f}`)
-    .filter((rel) => trackedFlows.has(rel))
-    .map((rel) => ({ name: rel, content: readFileSync(join(CWD, rel), 'utf8') }));
+    .filter((rel) => trackedFlows.has(rel));
 
   // Soak definitions carry live `card` citations too. Leaving these outside the rewrite set made the
   // unswept-citation backstop refuse EVERY numbering pass (2026-10-03 main CI incident). Keep that
@@ -765,12 +763,53 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   try { breakNames = readdirSync(BREAKS).filter((f) => f.endsWith('.mjs') && !f.endsWith('.test.mjs')); }
   catch { breakNames = []; }
   const trackedBreaks = new Set((quietGit(CWD, ['ls-files', 'scripts/conveyor/soak/breaks/*.mjs']) || '').split('\n').filter(Boolean));
-  const breakFiles = breakNames
+  const breakPaths = breakNames
     .map((f) => `scripts/conveyor/soak/breaks/${f}`)
-    .filter((rel) => trackedBreaks.has(rel))
-    .map((rel) => ({ name: rel, content: readFileSync(join(CWD, rel), 'utf8') }));
+    .filter((rel) => trackedBreaks.has(rel));
 
-  const files = [...stems.map((name) => ({ name, content: readFileSync(join(BL, `${name}.md`), 'utf8') })), ...docsFiles, ...memoryFiles, ...flowsFiles];
+  const requestedSource = process.env.WE_JIT_READ_SOURCE || 'auto';
+  let headContents = null;
+  if (requestedSource !== 'worktree' && (requestedSource === 'head' ||
+      quietGit(CWD, ['diff-index', '--quiet', 'HEAD', '--']) != null)) {
+    const trackedPaths = [
+      ...stems.filter((stem) => trackedStems.has(stem)).map((stem) => `backlog/${stem}.md`),
+      ...docsPaths, ...memoryPaths, ...flowsPaths, ...breakPaths,
+    ];
+    try {
+      const batch = execFileSync('git', ['cat-file', '--batch'], {
+        cwd: CWD, input: trackedPaths.map((rel) => `HEAD:${rel}\n`).join(''),
+        stdio: ['pipe', 'pipe', 'ignore'], maxBuffer: 128 * 1024 * 1024,
+      });
+      const contents = new Map();
+      let offset = 0;
+      for (const rel of trackedPaths) {
+        const end = batch.indexOf(10, offset);
+        if (end < 0) throw new Error('Incomplete cat-file header');
+        const header = batch.subarray(offset, end).toString('utf8');
+        offset = end + 1;
+        if (header === `HEAD:${rel} missing`) continue;
+        const match = header.match(/^[0-9a-f]+ blob (\d+)$/);
+        if (!match) throw new Error('Unexpected cat-file header');
+        const size = Number(match[1]);
+        if (!Number.isSafeInteger(size) || offset + size >= batch.length || batch[offset + size] !== 10)
+          throw new Error('Incomplete cat-file blob');
+        // Git sizes are bytes, not UTF-8 character counts. Decode only the framed payload.
+        contents.set(rel, batch.subarray(offset, offset + size).toString('utf8'));
+        offset += size + 1;
+      }
+      headContents = contents;
+      readSource = 'head';
+    } catch { /* unavailable HEAD/batch: preserve the worktree read and precheck together */ }
+  }
+  // Untracked backlog cards and paths missing from HEAD retain the existing disk read semantics.
+  const readContent = (rel) => headContents?.has(rel)
+    ? headContents.get(rel) : readFileSync(join(CWD, rel), 'utf8');
+  const readFiles = (paths) => paths.map((name) => ({ name, content: readContent(name) }));
+  const docsFiles = readFiles(docsPaths);
+  const memoryFiles = readFiles(memoryPaths);
+  const flowsFiles = readFiles(flowsPaths);
+  const breakFiles = readFiles(breakPaths);
+  const files = [...stems.map((name) => ({ name, content: readContent(`backlog/${name}.md`) })), ...docsFiles, ...memoryFiles, ...flowsFiles];
   const contentByName = new Map(files.map((f) => [f.name, f.content]));
   // Resolve a `files` entry's `name` to its on-disk absolute + commit-relative path — a backlog stem (bare,
   // no `/`) lives under `backlog/`; a docs entry (`name` already a full repo-relative path) lives as-is.
@@ -824,6 +863,8 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   // copies); repo-wide is still cheap (`--threads=1`, the #4166-measured win: a few tens of ms here).
   //
   // Hold exact tracked card paths by default; fixtures/stale slugs cannot be broken by this rename.
+  // WE_JIT_READ_SOURCE=auto (default) reads HEAD blobs/precheck when tracked files are clean;
+  // worktree preserves disk reads, head forces HEAD. Batch failure falls back to worktree.
   // WE_JIT_UNSWEPT_CITE_MATCH=hash restores the legacy any-path-with-that-hash hold.
   // WE_JIT_UNSWEPT_CITE_POLICY=pass retains the legacy whole-pass refusal; other values use card policy.
   // Historical ledger hashes are irrelevant here: only pending cards could be renamed by this pass.
@@ -831,10 +872,11 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   let unsweptHashPathCites = [];
   try {
     const hits = execFileSync(
-      'git', ['grep', '--threads=1', '-nE', HASH_PATH_CITE_SOURCE, '--', '.', ':!node_modules', ':!backlog'],
+      'git', ['grep', '--threads=1', '-nE', HASH_PATH_CITE_SOURCE, ...(readSource === 'head' ? ['HEAD'] : []), '--', '.', ':!node_modules', ':!backlog'],
       { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 },
     ).split('\n').filter(Boolean);
-    unsweptHashPathCites = findHashPathCitesInGrepLines(hits)
+    unsweptHashPathCites = findHashPathCitesInGrepLines(readSource === 'head'
+      ? hits.map((line) => line.replace(/^HEAD:/, '')) : hits)
       // Soak modules are only partially swept: a repaired card field cannot hide a remaining
       // hash-path citation in code/comments (even the same hash on the same line).
       .filter((c) => (matchByHash ? pendingHashes.has(c.hash) : pendingPaths.has(c.path)) && (remainingBreakCites.has(c.file)
