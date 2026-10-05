@@ -25,5 +25,5 @@
 - **[Verification & Proof](index-verif.md)** — verify · prove · probe · grounding · closure · evidence (8 rules)
 - **[Batch · Commit · Git Hygiene](index-batch.md)** — batch · commit · git · stage · push · branch · claim (8 rules)
 - **[Testing · Gates · Build Infra](index-infra.md)** — gate · check:standards · vitest · build · vite · hook · dev-port · footgun (12 rules)
-- **[Agent Meta · Memory · Model Routing](index-meta.md)** — memory · agent · model routing · working style · context · orchestration (13 rules)
+- **[Agent Meta · Memory · Model Routing](index-meta.md)** — memory · agent · model routing · working style · context · orchestration (14 rules)
 - **[Exercise Apps · Configurator · Governance](index-app.md)** — exercise app · conformance loop · configurator · governance · personas (4 rules)
