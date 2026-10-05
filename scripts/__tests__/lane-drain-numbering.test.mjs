@@ -42,11 +42,11 @@ beforeEach(() => {
 afterEach(() => { try { rmSync(repo, { recursive: true, force: true }); } catch { /* best-effort */ } });
 
 // Observe real git subprocesses to guard the drain pass budget, as in #3383.
-function withGitLog(run) {
+function withGitLog(run, { failBatch = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'git-shim-'));
   const log = join(dir, 'calls.log');
   const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
-  writeFileSync(join(dir, 'git'), `#!/bin/sh\necho "$@" >> "${log}"\nexec "${real}" "$@"\n`);
+  writeFileSync(join(dir, 'git'), `#!/bin/sh\necho "$@" >> "${log}"\n${failBatch ? 'if [ "$1" = "cat-file" ]; then exit 1; fi\n' : ''}exec "${real}" "$@"\n`);
   execFileSync('chmod', ['+x', join(dir, 'git')]);
   const oldPath = process.env.PATH;
   process.env.PATH = `${dir}:${oldPath}`;
@@ -65,6 +65,101 @@ function pendingReferences() {
   git('add', '.'); git('commit', '-qm', 'pending references');
   git('update-ref', 'refs/remotes/origin/main', 'HEAD');
 }
+
+describe('numberPendingHashes read source', () => {
+  beforeEach(() => vi.stubEnv('WE_JIT_READ_SOURCE', undefined));
+  afterEach(() => vi.unstubAllEnvs());
+
+  function seed() {
+    write(QUEUED_REL, JSON.stringify({ queued: [] }));
+    write('backlog/2200-legacy.md', '---\nkind: story\n---\nLegacy — café\n');
+    write('backlog/xhash01-alpha.md', '---\nkind: story\n---\nAlpha — café\n');
+    write('docs/agent/rule.md', 'See #xhash01 — café\n');
+    write('agent-memory-src/note.md', 'See #xhash01\n');
+    write('scripts/conveyor/flows/example.flow.json', '{"cite":"backlog/xhash01-alpha.md"}\n');
+    write('scripts/conveyor/soak/breaks/example.mjs', "export default { card: '#xhash01' };\n");
+    git('add', '.'); git('commit', '-qm', 'seed read sources');
+  }
+
+  it('defaults to one HEAD batch with the same assignments and bytes as worktree', () => {
+    seed();
+    const base = git('rev-parse', 'HEAD').trim();
+    const snapshot = () => Object.fromEntries(git('ls-files').trim().split('\n')
+      .map((path) => [path, readFileSync(join(repo, path))]));
+    let head;
+    withGitLog((calls) => {
+      head = numberPendingHashes(repo);
+      expect(head.readSource).toBe('head');
+      expect(calls().filter((line) => line === 'cat-file --batch')).toHaveLength(1);
+      expect(calls().some((line) => line.includes(' HEAD -- . :!node_modules :!backlog'))).toBe(true);
+    });
+    expect(head.committed).toBe(true);
+    const headFiles = snapshot();
+    git('reset', '--hard', base);
+    rmSync(join(repo, LEDGER_REL), { force: true });
+    vi.stubEnv('WE_JIT_READ_SOURCE', 'worktree');
+    const worktree = numberPendingHashes(repo);
+    expect(worktree.readSource).toBe('worktree');
+    expect(worktree.committed).toBe(true);
+    expect(head.assigned).toEqual(worktree.assigned);
+    expect(headFiles).toEqual(snapshot());
+    expect(headFiles['backlog/2200-legacy.md']).toEqual(Buffer.from('---\nkind: story\n---\nLegacy — café\n'));
+    expect(headFiles['backlog/2201-alpha.md'].toString()).toContain('Alpha — café\n');
+  });
+
+  it.each(['unstaged', 'staged'])('falls back to worktree for a %s tracked edit', (state) => {
+    seed();
+    write('backlog/xhash01-alpha.md', '---\nkind: story\n---\nEdited — café\n');
+    if (state === 'staged') git('add', 'backlog/xhash01-alpha.md');
+    const result = numberPendingHashes(repo);
+    expect(result.readSource).toBe('worktree');
+    expect(readFileSync(join(repo, 'backlog/2201-alpha.md'), 'utf8')).toContain('Edited — café');
+  });
+
+  it('still rewrites references in an untracked hash card under auto', () => {
+    seed();
+    write('backlog/xlocal1-local.md', '---\nblockedBy: [xhash01]\n---\nLocal — café\n');
+    const result = numberPendingHashes(repo);
+    expect(result.readSource).toBe('head');
+    expect(result.assigned).toEqual([{ hash: 'xhash01', nnn: '2201' }]);
+    expect(readFileSync(join(repo, 'backlog/xlocal1-local.md'), 'utf8'))
+      .toBe('---\nblockedBy: [2201]\n---\nLocal — café\n');
+  });
+
+  it('can force HEAD on a dirty tree and read a staged path missing from HEAD from disk', () => {
+    seed();
+    write('docs/agent/new.md', 'See #xhash01 — café\n');
+    git('add', 'docs/agent/new.md');
+    vi.stubEnv('WE_JIT_READ_SOURCE', 'head');
+    const result = numberPendingHashes(repo);
+    expect(result.readSource).toBe('head');
+    expect(result.committed).toBe(true);
+    expect(readFileSync(join(repo, 'docs/agent/new.md'), 'utf8')).toBe('See #2201 — café\n');
+  });
+
+  it.each(['auto', 'head'])('falls back to worktree reads and precheck if the %s batch fails', (source) => {
+    seed();
+    vi.stubEnv('WE_JIT_READ_SOURCE', source);
+    withGitLog((calls) => {
+      const result = numberPendingHashes(repo);
+      expect(result.readSource).toBe('worktree');
+      expect(result.committed).toBe(true);
+      expect(readFileSync(join(repo, 'docs/agent/rule.md'), 'utf8')).toBe('See #2201 — café\n');
+      expect(calls().some((line) => line.includes(' HEAD -- . :!node_modules :!backlog'))).toBe(false);
+    }, { failBatch: true });
+  });
+
+  it('holds a committed unswept path citation under HEAD', () => {
+    seed();
+    write('scripts/other.mjs', '// backlog/xhash01-alpha.md\n');
+    git('add', '.'); git('commit', '-qm', 'unswept citation');
+    const result = numberPendingHashes(repo);
+    expect(result.readSource).toBe('head');
+    expect(result.assigned).toEqual([]);
+    expect(result.held).toEqual([{ hash: 'xhash01', citedBy: ['scripts/other.mjs'] }]);
+    expect(result.committed).toBe(false);
+  });
+});
 
 describe('numberPendingHashes — drain JIT numbering wire (#2288)', () => {
   it('numbers pending cards on main with soak-definition citations and repairs those citations atomically', () => {
@@ -399,7 +494,8 @@ describe('numberPendingHashes — drain JIT numbering wire (#2288)', () => {
     git('add', '.'); git('commit', '-qm', 'another pending card');
     try {
       withGitLog((calls) => {
-        const { phaseMs, ...result } = numberPendingHashes(repo, { dryRun: true });
+        const { phaseMs, readSource, ...result } = numberPendingHashes(repo, { dryRun: true });
+        expect(readSource).toBe('head');
         expect(result).toEqual({ assigned: [], committed: false,
           error: 'hash-path citation outside the rewrite scope: scripts/other.mjs cites xhash01' });
         expect(calls().filter((c) => c.startsWith('rev-list') ||
