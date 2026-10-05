@@ -11,7 +11,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { homedir } from 'node:os';
 import { REPO_ROOT } from '../../operations/dispatch-lane-io.mjs';
 import {
-  buildCandidates, sweepCiRedRecovery, refreshOntoMain, formatReport,
+  buildCandidates, sweepCiRedRecovery, refreshOntoMain, formatReport, defaultPostRebaseComment,
   HUNG_CI_COMMENT_MARKER, buildHungCiComment, countHungCiComments, countHungCiCommentsByJob, bodyHasExactLine,
   cancelAndRerunHungRun, cancelHungRun, describeExecError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
   defaultReadRequiredContexts, defaultReadHeadCommittedAt, triggerCiForPr, clearStaleCheckingLabel,
@@ -41,7 +41,7 @@ describe('ci-red-recovery-watch — buildCandidates', () => {
     expect(candidates).toEqual([
       {
         prNumber: 2635, headRefName: 'lane/xdzl6mb', headSha: 'ab9985630d90019a07b94e946bc75f8de7a6161f',
-        aheadBy: 33, failureCompletedAt: '2026-09-25T01:57:47Z', failingCheckName: 'test',
+        aheadBy: 33, failureCompletedAt: '2026-09-25T01:57:47Z', failingCheckName: 'test', detailsUrl: null,
       },
     ]);
     expect(readAheadBy).toHaveBeenCalledTimes(1);
@@ -1070,4 +1070,25 @@ describe('ci-red-recovery-watch — sweepMissingRunRecovery, partial rollup with
     });
     expect(result.dispatch).toEqual([]);
   });
+});
+
+// #3794 live case, 2026-10-04.
+it('sweeps a main-fixed signature and posts durable refund evidence', () => {
+  const facts = { signatures: [{ emitterFiles: ['gate.mjs'], fixCommits: ['e5c22481e'] }],
+    bugIntroducedAt: '2026-10-05T00:00:00Z', fixedAt: '2026-10-05T01:44:46Z' };
+  const detailsUrl = 'https://github.com/web-everything/web-everything/actions/runs/1/job/42';
+  const readMainFixedSignatureFacts = vi.fn(() => facts);
+  const exec = vi.fn();
+  const options = { apply: true, repo: 'web-everything/web-everything', requiredCheck: 'test',
+    readOpenPrs: () => [{ ...PR_2635, statusCheckRollup: [{ ...failingCheck('2026-10-05T00:54:36Z'), detailsUrl }] }],
+    readAheadBy: () => 3, readMainRuns: () => [], readMainLatestCheckRuns: () => [], readComments: () => [],
+    readMainFixedSignatureFacts, refresh: () => ({ ok: true, action: 'rebased' }),
+    postComment: (pr, opts) => defaultPostRebaseComment(pr, { ...opts, exec }),
+  };
+  expect(sweepCiRedRecovery(options).dispatch[0].attribution).toBe('main-fixed-signature');
+  expect(readMainFixedSignatureFacts).toHaveBeenCalledWith(expect.objectContaining({ detailsUrl, failureCompletedAt: '2026-10-05T00:54:36Z' }));
+  expect(exec.mock.calls[0][1][4]).toContain(`attribution: main-fixed-signature\nattributed-window: ${facts.bugIntroducedAt} ${facts.fixedAt}`);
+  readMainFixedSignatureFacts.mockClear();
+  sweepCiRedRecovery({ ...options, readAheadBy: () => 0 });
+  expect(readMainFixedSignatureFacts).not.toHaveBeenCalled();
 });

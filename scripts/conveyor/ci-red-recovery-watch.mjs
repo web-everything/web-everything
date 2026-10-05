@@ -77,10 +77,11 @@ import {
   buildMissingRunCandidates, planMissingRunRecoveries, countMissingRunComments, buildMissingRunComment,
   DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS, failingRequiredCheckForAttribution, isAnyRequiredCheckFailed,
   // landing-freeze fix (2026-09-27) — see `main-red-recovery.mjs`'s own "LANDING-FREEZE FIX" section header.
-  mainLatestGreenShaForCheck, isMainGreenFixOwed, isMainLatestCheckGreen,
+  mainLatestGreenShaForCheck, isMainGreenFixOwed, isMainLatestCheckGreen, isMainFixedSignatureOwed,
 } from './main-red-recovery.mjs';
 import {
   defaultReadMainRuns, defaultReadAheadBy, defaultReadMainLatestCheckRuns, defaultReadMainGreenFixFacts,
+  defaultReadMainFixedSignatureFacts,
 } from './reconcile-pass.mjs';
 import { rebaseDropManifest } from '../lib/rebase-drop-manifest.mjs';
 import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
@@ -138,7 +139,7 @@ export function buildCandidates(prs, {
     const aheadBy = pr?.headRefOid ? readAheadBy(pr.headRefOid, { repo, base: defaultBranch }) : null;
     out.push({
       prNumber, headRefName: pr?.headRefName ?? null, headSha: pr?.headRefOid ?? null, aheadBy,
-      failureCompletedAt: check?.completedAt ?? null,
+      failureCompletedAt: check?.completedAt ?? null, detailsUrl: latestRequiredCheck(pr, check?.name)?.detailsUrl ?? null,
       // landing-freeze fix (2026-09-27) — WHICH check is the one judged, so `planMainRedRebases` can ask
       // `isMainLatestCheckGreen` about THIS SAME check on main's own latest completed run. See that function's
       // own docblock.
@@ -179,9 +180,10 @@ export function refreshOntoMain(laneRef, { root = REPO_ROOT, base = 'origin/main
  */
 export function defaultPostRebaseComment(prNumber, {
   exec = execFileSyncThrottled, repo = null, headRefName = null, headSha = null, ok = true, action = 'rebased', error = null,
+  attribution = null, attributedWindow = null,
 } = {}) {
   const argv = ['pr', 'comment', String(prNumber), '--body', buildRebaseOntoMainComment({
-    headRefName, headSha, ok, action, error,
+    headRefName, headSha, ok, action, error, attribution, attributedWindow,
   })];
   if (repo) argv.push('--repo', repo);
   exec('gh', argv, {
@@ -206,6 +208,7 @@ export function sweepCiRedRecovery({
   readRequiredContexts = defaultReadRequiredContexts,
   // landing-freeze fix (2026-09-27) — see `main-red-recovery.mjs`'s own "LANDING-FREEZE FIX" section header.
   readMainLatestCheckRuns = defaultReadMainLatestCheckRuns, readMainGreenFixFacts = defaultReadMainGreenFixFacts,
+  readMainFixedSignatureFacts = defaultReadMainFixedSignatureFacts,
   readComments = defaultReadPrComments, refresh = refreshOntoMain, postComment = defaultPostRebaseComment,
   maxRebaseRetriesPerSha = DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
   // #2811 — injectable so a test can pin the restamp-first/rearm-fallback chain with no `gh`/child-process.
@@ -247,14 +250,20 @@ export function sweepCiRedRecovery({
     let comments;
     if (attribution !== 'main-red') {
       const greenSha = mainLatestGreenShaForCheck({ failingCheckName: c.failingCheckName, mainLatestCheckRuns });
-      if (!greenSha) return c;
-      withFacts = { ...c, ...readMainGreenFixFacts(c.headSha, { repo, greenSha, checkName: c.failingCheckName }) };
-      if (withFacts.prContainsMainGreenSha !== false || isMainLatestCheckGreen({
-        failingCheckName: c.failingCheckName, mainLatestCheckRuns: withFacts.mergeBaseCheckRuns,
-      })) return withFacts;
-      comments = readComments(c.prNumber, { repo });
-      withFacts.comments = comments;
-      if (!isMainGreenFixOwed({ failingCheckName: c.failingCheckName, mainLatestCheckRuns, ...withFacts })) return withFacts;
+      if (greenSha) {
+        withFacts = { ...c, ...readMainGreenFixFacts(c.headSha, { repo, greenSha, checkName: c.failingCheckName }) };
+        if (withFacts.prContainsMainGreenSha === false && !isMainLatestCheckGreen({
+          failingCheckName: c.failingCheckName, mainLatestCheckRuns: withFacts.mergeBaseCheckRuns,
+        })) {
+          comments = readComments(c.prNumber, { repo });
+          withFacts.comments = comments;
+        }
+      }
+      if (!isMainGreenFixOwed({ mainLatestCheckRuns, ...withFacts })) {
+        withFacts.mainFixedSignature = readMainFixedSignatureFacts({ repo, defaultBranch,
+          detailsUrl: c.detailsUrl, failureCompletedAt: c.failureCompletedAt });
+        if (!isMainFixedSignatureOwed(withFacts.mainFixedSignature)) return withFacts;
+      }
     }
     comments ??= readComments(c.prNumber, { repo });
     return { ...withFacts, rebaseAttemptsForSha: countRebaseOntoMainComments(comments, c.headSha) };
@@ -281,6 +290,7 @@ export function sweepCiRedRecovery({
       // retry forever silently.
       postComment(d.prNumber, {
         repo, headRefName: d.headRefName, headSha: d.headSha, ok: result.ok, action: result.action, error: result.error ?? null,
+        ...(d.attribution ? { attribution: d.attribution, attributedWindow: d.attributedWindow } : {}),
       });
       // #2811 — the ONE new step: this rebase just moved the head (`action === 'rebased'` — never on
       // `'current'`, which minted nothing new to re-verify against). Best-effort, never throws (see the

@@ -6,6 +6,7 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { allowedToolsArg, ALLOWED_TOOLS_BY_KIND } from '../land-advance-tools.mjs';
 import { dispatchCiHeal } from '../ci-heal-pr-dispatch.mjs';
 import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
+import { buildRebaseOntoMainComment } from '../../conveyor/main-red-recovery.mjs';
 import { CI_HEAL_COMMENT_MARKER } from '../../conveyor/ci-heal-mark.mjs';
 import { STAND_DOWN_MARKER } from '../../conveyor/stand-down.mjs';
 import { CONFLICT_LABEL } from '../../conveyor/parked-pr-conflict-watch.mjs';
@@ -122,4 +123,21 @@ describe('dispatchCiHeal (the tick sink, entered for a PR by number)', () => {
     const out = await dispatchCiHeal({ ...planned, itemNum: '3140' }, { sinks: { [DISPATCH_EFFECT]: sink }, repo: 'we' });
     expect(out).toEqual({ held: true, reason: 'held:pr' }); expect(sink.mock.calls[0][0].num).toBe('3140');
   });
+});
+
+// #3794 live case, 2026-10-04.
+it('reads chargeable repair evidence and refunds the ledger floor, with an opt-out', () => {
+  const comments = [...Array.from({ length: 3 }, () => ({ body: CI_HEAL_COMMENT_MARKER,
+    viewerDidAuthor: true, createdAt: '2026-10-05T01:00:00Z' })), { viewerDidAuthor: true,
+    body: buildRebaseOntoMainComment({ attribution: 'main-fixed-signature', attributedWindow: {
+      from: '2026-10-05T00:00:00Z', to: '2026-10-05T01:44:46Z',
+    } }),
+  }];
+  const readPrComments = () => comments;
+  const inputs = createLandAdvanceReader(ports({ readPrComments, ciHealBudgetRestore: true }))();
+  expect(inputs.repairEvidence['we#2349']).toMatchObject({ ciHealComments: 0, refunded: 3 });
+  inputs.followUps = Array.from({ length: 3 }, () => ({ target: 'we#2349', kind: 'ci-heal' }));
+  expect(planLandAdvance(inputs).rows.find((r) => r.pr === 2349)).toMatchObject({ owedAction: 'dispatch-ci-heal', refunded: 3 });
+  const disabled = createLandAdvanceReader(ports({ readPrComments, ciHealBudgetRestore: false }))();
+  expect(planLandAdvance(disabled).rows.find((r) => r.pr === 2349)).toMatchObject({ kind: 'ci-heal-exhausted' });
 });

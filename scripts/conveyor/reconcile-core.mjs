@@ -120,7 +120,7 @@ import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
-import { countCiHealComments, CI_HEAL_COMMENT_MARKER } from './ci-heal-mark.mjs';
+import { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore, CI_HEAL_COMMENT_MARKER } from './ci-heal-mark.mjs';
 import { latestCiHealEscalationForHead, CI_HEAL_ESCALATION_MARKER } from './ci-heal-escalation-mark.mjs';
 import {
   isStandDownSuperseded, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER,
@@ -153,7 +153,7 @@ import { ADVISORY_LABELS, latestAdvisory, advisoryCoversHead } from '../lib/advi
 // which would "repair" code that was never broken. `isPrCiFailureOwedRerun` is the PURE leaf that decides this
 // (see its own docblock for the full incident and the two facts it needs); this file only calls it.
 import {
-  isPrCiFailureOwedRerun, countRebaseOntoMainComments, DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
+  isPrCiFailureOwedRerun, isMainFixedSignatureOwed, isMainGreenFixOwed, countRebaseOntoMainComments, DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
   // landing-freeze fix (2026-09-27) — used only to word the `owed-ci-rerun` refusal's `why` accurately when
   // THIS path (not the red-window one) is what actually granted it; see that function's own docblock.
   classifyCiFailureAttribution,
@@ -1411,6 +1411,7 @@ export function missingReviewLabel(pr) {
 
 export function planReconcile({
   repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap = CI_HEAL_ROUND_CAP,
+  ciHealBudgetRestore = resolveCiHealBudgetRestore(process.env),
   conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP, defaultBranch = 'main',
   fixerLadder = DEFAULT_FIXER_LADDER,
   mainRedWindows = [], mainLatestCheckRuns = [],
@@ -1497,6 +1498,7 @@ export function planReconcile({
       // at this PR's merge base with it. EVIDENCE ONLY, injected by the IO shell; absent reads never excuse.
       prContainsMainGreenSha: typeof pr?.prContainsMainGreenSha === 'boolean' ? pr.prContainsMainGreenSha : null,
       mergeBaseCheckRuns: Array.isArray(pr?.mergeBaseCheckRuns) ? pr.mergeBaseCheckRuns : null,
+      mainFixedSignature: pr?.mainFixedSignature ?? null,
       mergeBaseRunConclusion: typeof pr?.mergeBaseRunConclusion === 'string' ? pr.mergeBaseRunConclusion : null,
       // #x9fbg1x-live-incident (2026-09-27) — the PR's OWN already-changed files, when the IO shell's `gh pr
       // list` read carried them (`reconcile-pass.mjs#PR_LIST_JSON_FIELDS` now asks for `files`, served for free
@@ -1860,13 +1862,19 @@ export function planReconcile({
         prContainsMainGreenSha: base.prContainsMainGreenSha,
         mergeBaseCheckRuns: base.mergeBaseCheckRuns,
         mergeBaseRunConclusion: base.mergeBaseRunConclusion,
+        mainFixedSignature: base.mainFixedSignature,
       })) {
         const viaMainGreen = classifyCiFailureAttribution({
           failureCompletedAt: base.requiredCheckCompletedAt, mainRedWindows,
         }) !== 'main-red';
+        const viaSignature = viaMainGreen && isMainFixedSignatureOwed(base.mainFixedSignature)
+          && !isMainGreenFixOwed({ ...base, failingCheckName: base.requiredCheckName, mainLatestCheckRuns,
+            comments: pr?.comments, headSha: pr?.headRefOid });
         refuse('owed-ci-rerun', {
           ...withPhase,
-          why: viaMainGreen
+          why: viaSignature
+            ? `the required check's error signatures were fixed on main by ${[...new Set(base.mainFixedSignature.signatures.flatMap((s) => s.fixCommits))].map((sha) => sha.slice(0, 9)).join(', ')} — owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs)`
+            : viaMainGreen
             ? `the required check \`${base.requiredCheckName}\` failed at ${base.requiredCheckCompletedAt}, but is passing on main's own latest completed run — main has since fixed this, this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs), never a ci-heal, which would misdiagnose main's own (now-fixed) breakage as a defect here`
             : `the required check failed at ${base.requiredCheckCompletedAt}, while main's own CI was red — this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs) once main has recovered, never a ci-heal, which would misdiagnose main's own breakage as a defect here`,
         });
@@ -1982,10 +1990,12 @@ export function planReconcile({
       }
       if (pr.timeoutRetry && !pr.timeoutRetry.eligible) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,
         why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });
-      const ciHealAttempts = countCiHealComments(pr?.comments);
+      const ciHealAttempts = countChargeableCiHealComments(pr?.comments, { restore: ciHealBudgetRestore });
+      const refunded = countCiHealComments(pr?.comments) - ciHealAttempts;
+      const refund = refunded > 0 ? { refunded } : {};
       if (ciHealAttempts >= ciHealCap) {
         refuse('cap-exhausted', {
-          ...withPhase, attempts: ciHealAttempts, cap: ciHealCap,
+          ...withPhase, ...refund, attempts: ciHealAttempts, cap: ciHealCap,
           why: `the PR's own durable CI-heal count is ${ciHealAttempts} against a cap of ${ciHealCap} — auto-heal is exhausted here and a person must take it`,
         });
         // #xznd5za (epic #3383/#4075) — a capped `ci-red` PR must never be MERELY refused. `cap-exhausted` was
@@ -2010,7 +2020,7 @@ export function planReconcile({
         });
       } else {
         dispatch.push({
-          ...base, ...withPhase, kind: 'ci-heal', attempts: ciHealAttempts,
+          ...base, ...withPhase, ...refund, kind: 'ci-heal', attempts: ciHealAttempts,
           why: `a required check is failing, nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`,
         });
       }
