@@ -74,7 +74,7 @@ import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyS
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
-import { resolveDefaultGate, explicitGateRefusal, describeGate, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
@@ -112,6 +112,13 @@ const MARKER = join(GIT_DIR, VERIFY_FILENAME);
 // pr-land's finish-guard can never drift. It resolves `<gitDir>/.lane-verify`, folds a valid-JSON non-object to
 // `{ corrupt: true }` (never `absent`, which would fail OPEN), and returns null only for a genuinely missing file.
 const readMarker = () => readVerifyMarker(GIT_DIR);
+
+// #5141 — older/corrupt markers have no phase telemetry to transport.
+function markerPhases(record) {
+  return record && typeof record === 'object' && !record.corrupt
+    && record.phases && typeof record.phases === 'object' && !Array.isArray(record.phases)
+    ? { phases: record.phases } : {};
+}
 
 function writeMarker(record) {
   // Atomic: write a temp sibling in the same git dir, then rename over the marker — so a concurrent reader
@@ -163,14 +170,14 @@ if (MODE === 'check') {
       // too keeps the two in visible agreement instead of one relying on a default the other never mentions.
       resolveLaneRelevantChangeSince: (record) => laneRelevantChangeSinceForRecord({ record, headSha, base: 'origin/main', runGit: git }),
     });
-    emit(result, result.ok ? 0 : 2);
+    emit({ ...result, ...markerPhases(readMarker()) }, result.ok ? 0 : 2);
   }
   const bareCheckRecord = readMarker();
   const v = verifyGateDecision({
     record: bareCheckRecord, headSha, breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
     laneRelevantChangeSince: laneRelevantChangeSinceForRecord({ record: bareCheckRecord, headSha, base: 'origin/main', runGit: git }),
   });
-  emit({ sha: headSha, ...v }, v.ok ? 0 : 2);
+  emit({ sha: headSha, ...v, ...markerPhases(bareCheckRecord) }, v.ok ? 0 : 2);
 }
 
 // #3378 review (rounds 2-4) — `isConfirmedOwnLease` itself now refuses an `ownerSession` match that is either
@@ -347,14 +354,15 @@ const cacheHit = MODE !== 'run' && preStart && !preStart.corrupt
 if (cacheHit) {
   const cachedDetail = `green for ${headSha.slice(0, 8)} — working tree unchanged since that verification (content hash + gate match); no new run needed.${describeTimeoutRetry(preStart.retriedTimeouts)}`;
   const cachedRetry = preStart.retriedTimeouts?.length ? { retriedTimeouts: preStart.retriedTimeouts } : {};
+  const cachedPhases = preStart.phases !== undefined ? { phases: preStart.phases } : {};
   if (MODE === 'request') {
     // Leave the marker exactly as it is: never overwrite a still-accurate terminal record with a fresh
     // `running` one — that overwrite is the ONLY thing that made `verify-dispatch.mjs` see `running` and
     // re-dispatch. A caller polling `check`/`check --wait=` next reads the SAME terminal record this emits.
-    emit({ sha: headSha, status: 'cached', reason: 'cached', exitCode: preStart.exitCode ?? null, ...cachedRetry, detail: `verification already ${cachedDetail}` }, 0);
+    emit({ sha: headSha, status: 'cached', reason: 'cached', exitCode: preStart.exitCode ?? null, ...cachedRetry, ...cachedPhases, detail: `verification already ${cachedDetail}` }, 0);
   }
   // Bare `verify`: report the cached terminal result directly — never touch the marker, never exec the gate.
-  emit({ sha: headSha, status: 'green', reason: 'cached', exitCode: preStart.exitCode ?? null, ...cachedRetry, detail: cachedDetail }, 0);
+  emit({ sha: headSha, status: 'green', reason: 'cached', exitCode: preStart.exitCode ?? null, ...cachedRetry, ...cachedPhases, detail: cachedDetail }, 0);
 }
 
 // #4161 — cached results need no server; only new requests require the daemon's live lease.
@@ -453,9 +461,29 @@ async function runGate(command, args) {
   });
   return { ...result, failureDetails: collector.finish(), output: bytes <= MAX_TIMEOUT_LOG_BYTES ? output : null };
 }
+// #5141 — retain null for phases never run; retries and multiple scans accumulate wall time.
+const phaseMs = { vitestMs: null, scanMs: null, standardsMs: null };
+const outcomes = {};
+async function timedRunGate(phase, command, args) {
+  const started = performance.now();
+  const kind = phase?.replace(/Ms$/, '');
+  try {
+    const result = await runGate(command, args);
+    if (kind) outcomes[kind] = buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision });
+    return result;
+  } catch (error) {
+    if (kind) outcomes[kind] = buildPhaseOutcome({ kind, signal: error?.signal,
+      exitCode: Number.isFinite(error?.status) ? error.status : 2, decision: resolvedGate?.decision });
+    throw error;
+  } finally {
+    if (phase) phaseMs[phase] = (phaseMs[phase] ?? 0) + performance.now() - started;
+  }
+}
+const gateStarted = performance.now();
+let gateMs;
 try {
   const retryableGate = resolvedGate?.testCommand?.startsWith('npx vitest related ');
-  let result = await runGate(retryableGate ? resolvedGate.testCommand : GATE);
+  let result = await timedRunGate(retryableGate ? 'vitestMs' : null, retryableGate ? resolvedGate.testCommand : GATE);
   if (retryableGate && admission.ok && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
     // Edits during admission or test execution must also count as the change's own files.
     const changedNow = localChangedSet({ runGit: git });
@@ -464,7 +492,7 @@ try {
     if (retriedTimeouts.length) {
       process.stderr.write(describeTimeoutRetry(retriedTimeouts).trim() + '\n');
       // Exact file filters, one worker, no related traversal, no passWithNoTests, and no second attempt.
-      result = await runGate('npx', ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism',
+      result = await timedRunGate('vitestMs', 'npx', ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism',
         ...retriedTimeouts.map(file => `./${file}`)]);
     }
   }
@@ -473,29 +501,33 @@ try {
   if (retryableGate && result.exitCode === 0) {
     for (const scanCommand of resolvedGate.scanCommands ?? []) {
       process.stderr.write(`⏱ repo-scanning tests (scoped to changed files): ${scanCommand.replace(/^VERIFY_SCAN_FILES='[^']*'/, 'VERIFY_SCAN_FILES=<changed files>')}\n`);
-      result = await runGate(scanCommand);
+      result = await timedRunGate('scanMs', scanCommand);
       if (result.exitCode !== 0) break;
     }
   }
   if (retryableGate && result.exitCode === 0 && resolvedGate.standardsCommand) {
-    result = await runGate(resolvedGate.standardsCommand);
+    result = await timedRunGate('standardsMs', resolvedGate.standardsCommand);
   }
   ({ exitCode, signal, failureDetails } = result);
 } catch (e) {
   signal = e?.signal || null;
   exitCode = Number.isFinite(e && e.status) ? e.status : 2;
 } finally {
+  gateMs = performance.now() - gateStarted;
   if (admission.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
 }
+
+const phases = buildVerifyPhases({ admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes });
 
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }),
   ...(retriedTimeouts.length ? { retriedTimeouts } : {}) };
 const retryDetail = describeTimeoutRetry(retriedTimeouts);
 
 const infrastructure = verificationInfrastructureFailure({ exitCode, signal });
-if (MODE === 'run' && infrastructure) emit({ sha: headSha, status: 'infrastructure-failure', reason: infrastructure.reason, exitCode, infrastructure, detail: infrastructure.detail }, 3);
+if (MODE === 'run') process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
+if (MODE === 'run' && infrastructure) emit({ sha: headSha, status: 'infrastructure-failure', reason: infrastructure.reason, exitCode, infrastructure, phases, detail: infrastructure.detail }, 3);
 if (MODE === 'run') {
-  emit({ sha: headSha, status: exitCode === 0 ? 'green' : 'red', reason: 'run', exitCode, ...diagnostic, detail: exitCode === 0 ? 'gate passed (run mode — no marker recorded).' + retryDetail : `gate FAILED (exit ${exitCode}) — run mode, no marker recorded.${retryDetail}` }, exitCode === 0 ? 0 : 2);
+  emit({ sha: headSha, status: exitCode === 0 ? 'green' : 'red', reason: 'run', exitCode, ...diagnostic, phases, detail: exitCode === 0 ? 'gate passed (run mode — no marker recorded).' + retryDetail : `gate FAILED (exit ${exitCode}) — run mode, no marker recorded.${retryDetail}` }, exitCode === 0 ? 0 : 2);
 }
 
 // 4. Rewrite the marker to its terminal green/red form — for the sha THIS run actually verified.
@@ -531,10 +563,11 @@ const finished = verifyFinishBody(startBody, {
   suites: GATE,
   treeHash: stableTreeHash(currentTreeHash, preGateTreeHash, treeHashNow()),
 });
-writeMarker(finished);
-if (infrastructure) emit({ sha: headSha, status: finished.status, reason: infrastructure.reason, exitCode, infrastructure, detail: infrastructure.detail }, 3);
+writeMarker({ ...finished, phases });
+process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
+if (infrastructure) emit({ sha: headSha, status: finished.status, reason: infrastructure.reason, exitCode, infrastructure, phases, detail: infrastructure.detail }, 3);
 
 emit(
-  { sha: headSha, status: finished.status, reason: finished.status, exitCode, ...diagnostic, detail: (finished.status === 'green' ? `suites passed — recorded green for ${headSha.slice(0, 8)} (delivery may proceed).` : `suites FAILED (exit ${exitCode}) — recorded red for ${headSha.slice(0, 8)}; the finish-guard will refuse to land until this is green.`) + retryDetail },
+  { sha: headSha, status: finished.status, reason: finished.status, exitCode, ...diagnostic, phases, detail: (finished.status === 'green' ? `suites passed — recorded green for ${headSha.slice(0, 8)} (delivery may proceed).` : `suites FAILED (exit ${exitCode}) — recorded red for ${headSha.slice(0, 8)}; the finish-guard will refuse to land until this is green.`) + retryDetail },
   finished.status === 'green' ? 0 : 2,
 );

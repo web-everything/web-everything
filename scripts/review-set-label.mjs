@@ -93,6 +93,7 @@ import {
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
 import { referralCardReadable } from './lib/referral-card-readable.mjs';
+import { referralLiveContext } from './lib/referral-live-context.mjs';
 // #2844 — WHO cleared this verdict, and the refusal when that is the PR's own author. See that module's header
 // for what the id rests on (the harness session identity, NOT the free-text `--actor`) and for the residual.
 import {
@@ -1983,8 +1984,8 @@ export { referralCardReadable };
 /** Fail closed at every acceptance entry point using the fresh durable PR record. */
 export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable = referralCardReadable,
   env = process.env, readRuns = readReviewRunEvidence } = {}) {
-  const context = { repo, pr, head: state.headRefOid, body: typeof state.body === 'string' ? state.body : '',
-    createdAt: state.createdAt, cardReadable, seatDisabled: seat => referralSeatDisabled(seat, env) };
+  const context = referralLiveContext(state, { repo, pr, cardReadable,
+    seatDisabled: seat => referralSeatDisabled(seat, env) });
   const result = mandatoryReferralState(state.comments, context);
   const head = state.headRefOid;
   const mine = r => r.repo === repo && r.pr === Number(pr) && r.head === head;

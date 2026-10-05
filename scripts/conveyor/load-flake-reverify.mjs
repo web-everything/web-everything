@@ -22,11 +22,19 @@ export function reverifyConfig(env = process.env, maxLoadPerCore) {
     maxLoadPerCore: positive(maxLoadPerCore ?? env.WE_LOAD_FLAKE_REVERIFY_MAX_LOAD_PER_CORE, 0.75),
     maxAttempts: Math.max(1, Math.floor(positive(env.WE_LOAD_FLAKE_REVERIFY_MAX_ATTEMPTS, 3))),
     cooloffMs: positive(env.WE_LOAD_FLAKE_REVERIFY_COOLOFF_MIN, 30) * 60_000,
+    mode: reverifyMode(env),
   };
 }
 
+/** `local` (default) re-verifies the held fix on this host; `ci` pushes it unverified so the PR's CI judges it. */
+function reverifyMode(env) {
+  const mode = env.WE_LOAD_FLAKE_REVERIFY_MODE ?? 'local';
+  if (!['local', 'ci'].includes(mode)) throw new Error('invalid reverify mode');
+  return mode;
+}
+
 export function planLoadFlakeReverify({ prs = [], load, cores, now, config = reverifyConfig({}) }) {
-  if (!(cores > 0) || load.length < 2 || load.slice(0, 2).some((n) => !Number.isFinite(n) || n / cores > config.maxLoadPerCore)) {
+  if (config.mode !== 'ci' && (!(cores > 0) || load.length < 2 || load.slice(0, 2).some((n) => !Number.isFinite(n) || n / cores > config.maxLoadPerCore))) {
     return { deferred: 'host-load' };
   }
   const candidates = prs.flatMap((pr) => {
@@ -122,21 +130,24 @@ async function reverifyCandidate({ candidate, key, slug, config }, io) {
       await post('head-moved', 'The saved alt branch moved past the recorded commit, so the recorded repair can no longer be verified.');
       return { deferred: 'lane-head-mismatch' };
     }
-    const verification = await io.verify(lane.path);
-    if (!verification.ok) {
-      // Verify can run 40 minutes: a red result for a PR that moved, or whose hold ended, meanwhile is stale and must
-      // never post a terminal `exhausted` (or burn an attempt) against the current head.
-      refusal = await check();
-      if (refusal) return refusal;
-      const result = attempts + 1 >= config.maxAttempts ? 'exhausted' : 'red-again';
-      // Verify output is branch-authored text headed for a public comment: redact it, then cut.
-      await post(result, redactSecrets(verification.summary ?? '').slice(-1500));
-      return { result };
+    if (config.mode !== 'ci') {
+      const verification = await io.verify(lane.path);
+      if (!verification.ok) {
+        // Verify can run 40 minutes: a red result for a PR that moved, or whose hold ended, meanwhile is stale and must
+        // never post a terminal `exhausted` (or burn an attempt) against the current head.
+        refusal = await check();
+        if (refusal) return refusal;
+        const result = attempts + 1 >= config.maxAttempts ? 'exhausted' : 'red-again';
+        // Verify output is branch-authored text headed for a public comment: redact it, then cut.
+        await post(result, redactSecrets(verification.summary ?? '').slice(-1500));
+        return { result };
+      }
     }
     refusal = await check();
     if (refusal) return refusal;
     await io.push(lane.path, hold.alt.sha, pr.headRefName);
-    await post('pushed');
+    await post('pushed', config.mode === 'ci'
+      ? "Pushed without a local re-verify (WE_LOAD_FLAKE_REVERIFY_MODE=ci); the PR's CI judges it." : '');
     return { result: 'pushed', pr: pr.number };
   } finally {
     await io.release(lane, key);
@@ -185,6 +196,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const [action, ...args] = process.argv.slice(2);
   if (action !== 'sweep') throw new Error('usage: load-flake-reverify.mjs sweep [--repo=we] [--dry-run] [--max-load-per-core=N] [--json]');
   const flags = Object.fromEntries(args.map((a) => { const [k, ...v] = a.replace(/^--/, '').split('='); return [k, v.length ? v.join('=') : true]; }));
-  const result = await runLoadFlakeReverify({ repo: flags.repo ?? REVERIFY_DEFAULT_REPO, dryRun: !!flags['dry-run'], config: reverifyConfig(process.env, flags['max-load-per-core']) });
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  const config = reverifyConfig(process.env, flags['max-load-per-core']);
+  const result = await runLoadFlakeReverify({ repo: flags.repo ?? REVERIFY_DEFAULT_REPO, dryRun: !!flags['dry-run'], config });
+  process.stdout.write(`${JSON.stringify({ mode: config.mode, ...result })}\n`);
 }

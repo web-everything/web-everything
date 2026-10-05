@@ -57,6 +57,7 @@
  * has both `test:unit` and `check:standards`, so it too gets today's gate unchanged.
  */
 import { createHash } from 'node:crypto';
+import { stripVTControlCharacters } from 'node:util';
 import { SELECTION_FLAG, pinnedMergeBase, decideLocalSelection, referencedTestNeedles, LOCAL_FULL_SUITE_TRIGGERS } from '../readiness/test-selection.mjs';
 import { isPolicyCorePath } from './gate-config.mjs';
 import { isAllowlistedLitterPath } from './lane-litter.mjs';
@@ -64,6 +65,27 @@ import { scanCommands } from './repo-scan-tests.mjs';
 
 /** The pathspecs `testsNaming` greps — every vitest test-file suffix (PR #2680 review: one list, pinned by a test). */
 export const VITEST_TEST_PATHSPECS = Object.freeze(['*.test.ts', '*.test.tsx', '*.test.js', '*.test.jsx', '*.test.mjs', '*.test.cjs', '*.test.mts', '*.test.cts']);
+
+/** Local discovery policy; unknown values preserve literal-reference discovery. */
+export function verifyRelatedMode(env) {
+  return env?.WE_VERIFY_RELATED === 'import-only' ? 'import-only' : 'all';
+}
+
+/** Vitest's own default per-test and per-hook timeouts, the base the local factor scales. */
+export const VITEST_BASE_TIMEOUTS = Object.freeze({ testTimeout: 5_000, hookTimeout: 10_000 });
+
+/** LOCAL-only timeout multiplier (`WE_VERIFY_TEST_TIMEOUT_FACTOR`, default 3; 1 = vitest defaults). CI never reads it. */
+export function verifyTestTimeoutFactor(env) {
+  const n = Number(env?.WE_VERIFY_TEST_TIMEOUT_FACTOR ?? 3);
+  return Number.isFinite(n) && n >= 1 ? n : 3;
+}
+
+/** The vitest flags for a factor: none at 1, so factor 1 is byte-identical to today's command. */
+export function scaledTimeoutFlags(factor) {
+  if (factor === 1) return '';
+  const { testTimeout, hookTimeout } = VITEST_BASE_TIMEOUTS;
+  return ` --testTimeout=${Math.round(testTimeout * factor)} --hookTimeout=${Math.round(hookTimeout * factor)}`;
+}
 
 /** Local target bound: refuse oversized selection; never promote it to a full suite. */
 export const MAX_RELATED_TARGETS = 300;
@@ -142,6 +164,9 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
   // plus untracked files), not HEAD's committed diff. The gate runs against the working tree, so that is the set
   // it must key on — and a fixer runs the gate BEFORE committing, which under the old "dirty ⇒ full" rule (#3389)
   // meant every fixer gate was a full-suite run.
+  const relatedMode = verifyRelatedMode(env);
+  const testTimeoutFactor = verifyTestTimeoutFactor(env);
+  const timeoutFlags = scaledTimeoutFlags(testTimeoutFactor);
   const diff = localChangedSet({ base, runGit });
   const changedFiles = diff ? diff.changedFiles : null;
   const optOut = String(env?.[SELECTION_FLAG] ?? '') === '0';
@@ -170,7 +195,7 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
     };
   }
   const blocked = (reasons, extra = {}) => ({ command: null, gateReasons: [], decision: {
-    ...local, mode: 'blocked', reasons, changedFiles, referencedTests: [], targets: [], ...extra,
+    ...local, mode: 'blocked', reasons, changedFiles, relatedMode, referencedTests: [], targets: [], ...extra,
   } });
   if (local.mode === 'full') return blocked([
     ...local.reasons.map((r) => r.replaceAll('full suite', 'broad selection')),
@@ -184,17 +209,17 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
     : 'npm run check:standards';
 
   if (local.mode === 'shrink') {
-    const referencedTests = testsNaming(referencedTestNeedles(local.relatedFiles), runGit);
+    const referencedTests = relatedMode === 'import-only' ? [] : testsNaming(referencedTestNeedles(local.relatedFiles), runGit);
     const targets = Array.from(new Set([...local.relatedFiles, ...referencedTests])).sort();
     if (targets.length > MAX_RELATED_TARGETS || Buffer.byteLength(targets.join(' '), 'utf8') > 32_000) {
       return blocked([`${targets.length} selection targets (limit ${MAX_RELATED_TARGETS}, 32000 bytes) — narrow the diff/base or supply an explicit affected-test --gate; no local full suite`], { referencedTests, targets });
     }
-    const decision = { ...local, changedFiles, referencedTests, targets };
+    const decision = { ...local, changedFiles, relatedMode, testTimeoutFactor, referencedTests, targets };
     // `--passWithNoTests`: a diff whose files no test reaches (docs, a backlog card) is a pass, not a failure.
     // Deletions or excluded untracked scratch can leave no target, and `vitest related` with no
     // positional file is an error (a false red); there is nothing for vitest to run, so say so and skip it.
     const vitestCmd = targets.length
-      ? `npx vitest related ${targets.map(shellQuote).join(' ')} --run --passWithNoTests`
+      ? `npx vitest related ${targets.map(shellQuote).join(' ')} --run --passWithNoTests${timeoutFlags}`
       : `echo ${shellQuote('verify-lane: no remaining changed file for vitest to relate — vitest half skipped (deletions or excluded untracked scratch)')}`;
     // #3887 — `vitest related` selects tests that IMPORT a changed file; a repo-SCANNING test reads files from disk and
     // imports nothing, so it was never selected. Run the marked scanners scoped to the changed files (cost ~ the number
@@ -202,7 +227,7 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
     // set (including scratch-excluded untracked files — a new file with a violation is exactly the case to catch).
     // `fileExists` is injected by the IO shell (this checkout's own files); omitted ⇒ no scan half, so a fixture or a
     // sibling checkout without these tests never gets a command naming a test it does not have.
-    const scanCmds = typeof fileExists === 'function' ? scanCommands({ changedFiles, fileExists }) : [];
+    const scanCmds = typeof fileExists === 'function' ? scanCommands({ changedFiles, fileExists }).map((c) => c + timeoutFlags) : [];
     return { ...composeGate({ vitestCmd, checkStandardsCmd, scripts, scanCmds }), decision };
   }
   throw new Error(`unexpected local selection mode: ${local.mode}`);
@@ -483,4 +508,59 @@ export function describeGate({ command, decision, scanCommands = [] }) {
   if (scanCommands.length) out.push(`  repo-scanning tests (#3887, not reachable by \`vitest related\`): ${scanCommands.length} command(s), scoped to the changed files where the test supports it`);
   out.push(`  command: ${command}`);
   return out.join('\n');
+}
+
+
+/** Extract the first text-mode standards error's rule id or bounded message (#5141). */
+export function firstStandardsErrorId(text) {
+  const message = stripVTControlCharacters(text).match(/^[\t ]*error[\t ]+([^\r\n]+)/m)?.[1].trim();
+  return message ? (message.match(/^([a-z0-9][a-z0-9-]*):/i)?.[1] ?? message).slice(0, 200) : null;
+}
+
+/** Derive non-gating telemetry from one phase's final command result (#5141). */
+export function buildPhaseOutcome({ kind, exitCode, signal, failureDetails, output, decision }) {
+  if (exitCode == null && !signal) return { result: 'skipped' };
+  if (exitCode === 0 && !signal) return { result: 'pass' };
+  const file = failureDetails?.tests?.[0]?.file;
+  const fallback = signal ? `signal ${signal}` : `exit ${exitCode}`;
+  const reason = kind === 'standards'
+    // Output over the capture cap is null; the collector's bounded tail still holds the last error lines.
+    ? firstStandardsErrorId(output ? `${output.stdout ?? ''}\n${output.stderr ?? ''}` : failureDetails?.summary ?? '') ?? fallback
+    : file || fallback;
+  return { result: 'fail', reason: reason.slice(0, 200), ...(kind === 'vitest' ? {
+    source: file && decision?.referencedTests?.includes(file) && !decision?.relatedFiles?.includes(file)
+      ? 'literal-reference' : 'import-graph',
+  } : {}) };
+}
+
+/** Build normalized, non-gating phase telemetry for verify markers and CLI results (#5141). */
+export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standardsMs, gateMs, decision, outcomes = {} }) {
+  const ms = value => Number.isFinite(value) ? Math.round(value) : null;
+  return {
+    relatedMode: decision?.relatedMode ?? null,
+    testTimeoutFactor: decision?.testTimeoutFactor ?? null,
+    admissionWaitMs: ms(admissionWaitMs),
+    vitestMs: ms(vitestMs),
+    scanMs: ms(scanMs),
+    standardsMs: ms(standardsMs),
+    gateMs: ms(gateMs),
+    targetFileCount: Array.isArray(decision?.targets) ? decision.targets.length : null,
+    changedFileCount: Array.isArray(decision?.changedFiles) ? decision.changedFiles.length : null,
+    importGraphTargetCount: Array.isArray(decision?.relatedFiles) ? decision.relatedFiles.length : null,
+    literalReferenceTargetCount: Array.isArray(decision?.referencedTests) && Array.isArray(decision?.relatedFiles)
+      ? decision.referencedTests.filter(file => !decision.relatedFiles.includes(file)).length : null,
+    outcomes: Object.fromEntries(['vitest', 'scan', 'standards'].map(kind => [kind, outcomes[kind] ?? { result: 'skipped' }])),
+  };
+}
+
+/** Format the available phase telemetry as one short stderr line (#5141). */
+export function formatVerifyPhases(phases) {
+  const fields = { admission: phases.admissionWaitMs, vitest: phases.vitestMs, scan: phases.scanMs,
+    standards: phases.standardsMs, gate: phases.gateMs, targets: phases.targetFileCount, changed: phases.changedFileCount };
+  const counts = { graph: phases.importGraphTargetCount, literal: phases.literalReferenceTargetCount, related: phases.relatedMode, timeoutFactor: phases.testTimeoutFactor };
+  return ['phaseMs', ...Object.entries(fields).filter(([, value]) => value != null)
+    .map(([name, value]) => `${name}=${value}`),
+  ...Object.entries(phases.outcomes ?? {}).map(([name, outcome]) =>
+    `${name}=${outcome.result}${outcome.reason ? `(${outcome.reason.replace(/[\r\n\u2028\u2029]/g, ' ')})` : ''}`),
+  ...Object.entries(counts).filter(([, value]) => value != null).map(([name, value]) => `${name}=${value}`)].join(' ');
 }

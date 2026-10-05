@@ -100,6 +100,7 @@
  * transcript's mtime) is INJECTED on the input records by `we:scripts/conveyor/reconcile-pass.mjs`, so every
  * branch below is reachable in a test with no network and no credential.
  */
+import { countGrantedRoundExtensions } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
@@ -361,7 +362,7 @@ export const BOOKKEEPING_MARKERS = Object.freeze([
  * The existing round cap already covers this population — `countAdvisoryComments` below was unioned in
  * specifically because a PR that is ALSO `review:human` can round forever without a rearm comment ever posting
  * (#2117), so a `needs-human` PR that keeps re-dispatching still hits `cap-exhausted` once its own advisory
- * comments reach `roundCap`, same as today's `bounced`+`review:human` population.
+ * comments exceed `roundCap`. At the cap its final review still runs; another fixer is refused.
  */
 const OWED = Object.freeze({ bounced: 'fix', 'needs-review': 'review', 'needs-human': 'review' });
 const OWED_ELSEWHERE = Object.freeze({
@@ -1165,8 +1166,16 @@ function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }
   return ci.allowed;
 }
 
+/** Positive integer cap override; malformed or absent configuration keeps the shared default. */
+export function resolveRoundCap(env = {}) {
+  const value = env.WE_REVIEW_ROUND_CAP;
+  return typeof value === 'string' && /^\d+$/.test(value.trim())
+    && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : NEGOTIATION_ROUND_CAP;
+}
+
 /**
- * Common review decision. Preserve draft, reviewed-head, advisory conversion and cap semantics;
+ * Common review decision. Allow the last fix its review at the cap; refuse only above it.
+ * Preserve draft, reviewed-head and advisory conversion semantics;
  * require complete successful CI immediately before emitting a review. CI-rerun and escalation
  * callers fold this refusal into their existing row so their repair ownership remains visible.
  */
@@ -1254,14 +1263,17 @@ function dispatchReviewRow({
     return;
   }
   // ── `no-findings` — refuse it (a fixer would invent work), but a review is still owed unless the review
-  // population's own cap is spent.
+  // count exceeds the cap: the last allowed fix is always owed its final review.
+  const finalReview = attempts >= roundCap;
+  const finalWhy = finalReview
+    ? ' — final review of the last allowed fix; if it returns changes the fix path escalates' : '';
   const findings = countFindings(pr?.comments);
   if (findings === 0) {
     refuse('no-findings', {
       ...withPhase, findings: 0, comments: Array.isArray(pr?.comments) ? pr.comments.length : 0, ...extra,
       why: 'no reviewer finding on this PR — a fix agent would invent work. A review, not a fix, is what an unreviewed PR is owed.',
     });
-    if (attempts >= roundCap) {
+    if (attempts > roundCap) {
       refuseCapExhausted({
         ...withPhase, attempts, cap: roundCap, findings: 0, capKind: 'review', ...extra,
         why: `no reviewer finding has ever landed on this PR, but its own durable attempt count is ${attempts}` +
@@ -1271,15 +1283,15 @@ function dispatchReviewRow({
     } else {
       if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
       dispatch.push({
-        ...base, ...withPhase, kind: 'review', findings: 0, attempts, ...extra,
+        ...base, ...withPhase, kind: 'review', findings: 0, attempts, ...extra, ...(finalReview ? { finalReview: true } : {}),
         why: `parked for an independent review and no finding has been raised yet — a review is owed` +
-          ` (#3279 runs it); ${attempts} of ${roundCap} attempts are spent`,
+          ` (#3279 runs it); ${attempts} of ${roundCap} attempts are spent` + finalWhy,
       });
     }
     return;
   }
-  // ── the shared attempt cap, then the dispatch itself.
-  if (attempts >= roundCap) {
+  // ── allow review at the shared cap; the fix path refuses another fixer at that cap.
+  if (attempts > roundCap) {
     refuseCapExhausted({
       ...withPhase, attempts, cap: roundCap, capKind: 'review', ...extra,
       why: `the PR's own durable attempt count is ${attempts} against a cap of ${roundCap} — auto-repair is exhausted here and a person must take it`,
@@ -1288,8 +1300,8 @@ function dispatchReviewRow({
   }
   if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
   dispatch.push({
-    ...base, ...withPhase, kind: 'review', findings, attempts, ...extra,
-    why: `parked for an independent review with ${findings} finding(s) on the thread and nothing live working it`,
+    ...base, ...withPhase, kind: 'review', findings, attempts, ...extra, ...(finalReview ? { finalReview: true } : {}),
+    why: `parked for an independent review with ${findings} finding(s) on the thread and nothing live working it` + finalWhy,
   });
 }
 
@@ -1349,8 +1361,8 @@ function operatorFixBudget(comments, roundCap) {
  * @param {number} [o.now] - epoch ms, used ONLY to age the surfaced permission-block notes. No decision reads it,
  *   so the plan for a given input is stable over time — a `stood-down` PR returns an identical result a week on.
  *   (we:backlog/4352 exception: {@link acceptLabelDropped}'s grace window reads it; `0` keeps that check off.)
- * @param {number} [o.roundCap] - the attempt cap; defaults to `NEGOTIATION_ROUND_CAP` (5), single-sourced from
- *   `we:scripts/lib/jury-core.mjs` rather than re-declared here.
+ * @param {number} [o.roundCap] - the base fix-attempt cap; defaults to `NEGOTIATION_ROUND_CAP` (5), single-sourced
+ *   from `we:scripts/lib/jury-core.mjs`. Audited operator grants extend it; review is allowed at the effective cap.
  * @param {number} [o.ciHealCap] - the `ci-red` attempt cap (multi-repo slice 7); defaults to
  *   {@link CI_HEAL_ROUND_CAP} (3). Deliberately its OWN cap, not `roundCap`: a CI-heal round and a fix/review
  *   negotiation round are different work (a rebase-and-repair vs. a finding-and-fix), so binding them to one
@@ -1464,9 +1476,12 @@ export function planReconcile({
 
     // The evidence every row carries, so a reader never has to go back to the listing to audit a verdict.
     const operatorAnswer = latestOperatorAnswer(pr?.comments);
-    const operatorBudget = operatorFixBudget(pr?.comments, roundCap);
-    const effectiveRoundCap = operatorBudget?.cap ?? roundCap;
+    const roundExtensions = countGrantedRoundExtensions(pr?.comments, { repo, pr: prNumber });
+    const baseRoundCap = roundCap + roundExtensions;
+    const operatorBudget = operatorFixBudget(pr?.comments, baseRoundCap);
+    const effectiveRoundCap = operatorBudget?.cap ?? baseRoundCap;
     const base = {
+      ...(roundExtensions > 0 ? { roundExtensions } : {}),
       ...(operatorBudget ? { operatorFixBudget: operatorBudget } : {}),
       ...(operatorAnswer ? { operatorAnswer } : {}),
       prNumber,
@@ -1541,6 +1556,7 @@ export function planReconcile({
       refuseFn('cap-exhausted', extra);
       notes.push({
         kind: 'round-cap-exhausted', prNumber, attempts: extra.attempts, cap: extra.cap, capKind: extra.capKind,
+        ...(extra.capKind === 'fix' ? { parkToHuman: true } : {}),
         text: roundCapExhaustedNoteText(prNumber, extra.attempts, extra.cap, extra.capKind),
       });
     };

@@ -43,6 +43,9 @@
  * `runReconcileFixDispatch`, a real interval sleep, and the real keyed runner-lock lease.
  */
 
+import { execFileSync } from 'node:child_process';
+import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
+import { decideParkToHuman } from '../../scripts/lib/review-escalation.mjs';
 import { hostname } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -311,21 +314,35 @@ export function defaultNoteCommentDryRun(env = process.env) {
   return env?.WE_CONVEYOR_POST_NOTE_COMMENTS === '0';
 }
 
+/** Apply the shared park decision through gh, resolving a constellation key to its slug. */
+export function defaultParkToHuman({ repo, pr, addLabel, removeLabels, exec = execFileSync }) {
+  const args = ['pr', 'edit', String(pr), '--repo', CONSTELLATION_REPOS[repo]?.slug ?? repo, '--add-label', addLabel];
+  for (const label of removeLabels) args.push('--remove-label', label);
+  try {
+    exec('gh', args, {
+      stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e?.message ?? e).split('\n')[0] };
+  }
+}
+
 /**
  * we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs#runReconcileNotesAllRepos — fan out
  * {@link defaultReadNotesForRepo} over every watched repo (mirrors {@link runReconcileFixDispatchAllRepos}'s own
  * per-repo isolation via {@link forEachRepo}), then plan — and, unless `dryRun`, actually post — exactly ONE
  * durable PR comment per note episode ({@link planNoteComment}, `we:scripts/conveyor/reconcile-note-comment.mjs`)
  * that a trusted principal has not already posted. `dryRun` defaults to {@link defaultNoteCommentDryRun}'s own
- * env-gated answer; diagnostic callers may pass `dryRun: true` explicitly.
- * @param {{repos?:string[], tick?:Function, postComment?:Function, dryRun?:boolean}} [o]
+ * env-gated answer. Parking retries even after the comment was posted; diagnostic callers may pass `dryRun: true` explicitly.
+ * @param {{repos?:string[], tick?:Function, postComment?:Function, parkToHuman?:Function, dryRun?:boolean}} [o]
  * @returns {{repos:Array<object>, notes:Array<object>, refusals:Array<object>, comments:Array<object>}}
  *   `comments` — one row per note this tick saw, `{repo, prNumber, kind, key, body?, alreadyPosted, posted,
- *   dryRun, error?}` (`body` is present only when a comment was newly planned — omitted once `alreadyPosted`,
+ *   dryRun, error?, parked?, parkError?}` (`body` is present only when a comment was newly planned — omitted once `alreadyPosted`,
  *   nothing new to show).
  */
 export function runReconcileNotesAllRepos({
-  repos = FIX_DISPATCH_DAEMON_REPOS, tick = defaultReadNotesForRepo, postComment = postNoteComment,
+  repos = FIX_DISPATCH_DAEMON_REPOS, tick = defaultReadNotesForRepo, postComment = postNoteComment, parkToHuman = defaultParkToHuman,
   dryRun = defaultNoteCommentDryRun(), ...tickOpts
 } = {}) {
   const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo }));
@@ -344,15 +361,29 @@ export function runReconcileNotesAllRepos({
       notes.push(tagged);
       const pr = prsByNumber.get(n.prNumber);
       const plan = planNoteComment(tagged, pr?.comments);
+      // Parking retries independently of the one-comment-per-episode dedup.
+      const parking = n.parkToHuman ? { parked: false } : {};
+      const labels = (pr?.labels ?? []).map((label) => typeof label === 'string' ? label : label.name);
+      if (n.parkToHuman && pr && !dryRun && !labels.includes('review:human')) {
+        const decision = decideParkToHuman({ currentLabels: labels });
+        try {
+          const outcome = parkToHuman({ repo, pr: n.prNumber, addLabel: decision.addLabel,
+            removeLabels: decision.removeLabels.filter((label) => labels.includes(label)) });
+          parking.parked = !!outcome.ok;
+          if (!outcome.ok) parking.parkError = outcome.error;
+        } catch (e) {
+          parking.parkError = String(e?.message ?? e).split('\n')[0];
+        }
+      }
       if (plan.alreadyPosted) {
         comments.push({
-          repo, prNumber: n.prNumber, kind: n.kind, key: plan.key, alreadyPosted: true, posted: false, dryRun,
+          repo, prNumber: n.prNumber, kind: n.kind, key: plan.key, ...parking, alreadyPosted: true, posted: false, dryRun,
         });
         continue;
       }
       if (dryRun) {
         comments.push({
-          repo, prNumber: n.prNumber, kind: n.kind, key: plan.key, body: plan.body, alreadyPosted: false, posted: false, dryRun: true,
+          repo, prNumber: n.prNumber, kind: n.kind, key: plan.key, ...parking, body: plan.body, alreadyPosted: false, posted: false, dryRun: true,
         });
         continue;
       }
@@ -362,6 +393,7 @@ export function runReconcileNotesAllRepos({
         prNumber: n.prNumber,
         kind: n.kind,
         key: plan.key,
+        ...parking,
         body: plan.body,
         alreadyPosted: false,
         posted: !!outcome.ok,

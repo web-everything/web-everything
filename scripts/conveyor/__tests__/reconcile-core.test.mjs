@@ -470,15 +470,15 @@ describe('case 4 — refusal 3: the round cap is derived from the PR and ONLY fr
     expect(plan.refusals).toHaveLength(0);
   });
 
-  it('xpprcdz — the SAME round cap that binds a bounced+review:human PR also binds a PURE review:human one — advisory comments alone trip it', () => {
+  it('xpprcdz — the SAME round cap that binds a bounced+review:human PR also binds a PURE review:human one — advisory comments above the cap trip it', () => {
     const advisoryRound = (n) => ({ body: `${ADVISORY_NOTE_MARKER} round ${n} — no commits changed since the last one`, author: AUTOMATION });
     const burned = pr1563({
       labels: lbl('review:human'),
-      comments: [finding(), ...Array.from({ length: NEGOTIATION_ROUND_CAP }, (_, i) => advisoryRound(i + 1))],
+      comments: [finding(), ...Array.from({ length: NEGOTIATION_ROUND_CAP + 1 }, (_, i) => advisoryRound(i + 1))],
     });
     const plan = planReconcile({ prs: [burned], agents: [], durableCounts: {}, now: NOW });
     expect(plan.dispatch).toHaveLength(0);
-    expect(plan.refusals[0]).toMatchObject({ kind: 'cap-exhausted', attempts: NEGOTIATION_ROUND_CAP, cap: NEGOTIATION_ROUND_CAP });
+    expect(plan.refusals[0]).toMatchObject({ kind: 'cap-exhausted', attempts: NEGOTIATION_ROUND_CAP + 1, cap: NEGOTIATION_ROUND_CAP });
   });
 
   it('xpprcdz — review:accepted supersedes review:human (classifyPr\'s own rule) — an already-cleared PR is not re-dispatched as needs-human', () => {
@@ -1390,30 +1390,30 @@ describe('review-while-main-red — retain rerun ownership while review waits fo
     expect(plan.dispatch).toEqual([]);
   });
 
-  it('at the round cap: `cap-exhausted` (folded) instead of dispatching a review forever, and the round-cap note still surfaces (zero-findings population, REARM-only thread)', () => {
-    const fiveRearms = Array.from({ length: NEGOTIATION_ROUND_CAP }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
+  it('above the round cap: `cap-exhausted` (folded) instead of dispatching a review forever, and the round-cap note still surfaces (zero-findings population, REARM-only thread)', () => {
+    const overCapRearms = Array.from({ length: NEGOTIATION_ROUND_CAP + 1 }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
     const plan = planReconcile({
-      prs: [prOwedCiRerunAndReview({ comments: fiveRearms })], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS,
+      prs: [prOwedCiRerunAndReview({ comments: overCapRearms })], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS,
     });
     expect(plan.dispatch).toEqual([]);
     expect(plan.refusals).toEqual([expect.objectContaining({
       kind: 'owed-ci-rerun',
-      reviewRefusal: expect.objectContaining({ kind: 'cap-exhausted', attempts: NEGOTIATION_ROUND_CAP, cap: NEGOTIATION_ROUND_CAP, capKind: 'review' }),
+      reviewRefusal: expect.objectContaining({ kind: 'cap-exhausted', attempts: NEGOTIATION_ROUND_CAP + 1, cap: NEGOTIATION_ROUND_CAP, capKind: 'review' }),
     })]);
     expect(plan.notes).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'round-cap-exhausted', prNumber: 2769, capKind: 'review' }),
     ]));
   });
 
-  it('at the round cap WITH a real finding present: `cap-exhausted` folds in directly (no `no-findings`)', () => {
-    const fiveRearms = [finding(), ...Array.from({ length: NEGOTIATION_ROUND_CAP }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }))];
+  it('above the round cap WITH a real finding present: `cap-exhausted` folds in directly (no `no-findings`)', () => {
+    const overCapRearms = [finding(), ...Array.from({ length: NEGOTIATION_ROUND_CAP + 1 }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }))];
     const plan = planReconcile({
-      prs: [prOwedCiRerunAndReview({ comments: fiveRearms })], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS,
+      prs: [prOwedCiRerunAndReview({ comments: overCapRearms })], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS,
     });
     expect(plan.dispatch).toEqual([]);
     expect(plan.refusals).toEqual([expect.objectContaining({
       kind: 'owed-ci-rerun',
-      reviewRefusal: expect.objectContaining({ kind: 'cap-exhausted', attempts: NEGOTIATION_ROUND_CAP, cap: NEGOTIATION_ROUND_CAP }),
+      reviewRefusal: expect.objectContaining({ kind: 'cap-exhausted', attempts: NEGOTIATION_ROUND_CAP + 1, cap: NEGOTIATION_ROUND_CAP }),
     })]);
   });
 
@@ -1888,14 +1888,14 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
 
   // The exemption is NARROW — a `needs-human` PR that carries NO `advisory:changes` at all (the ordinary
   // population `NEGOTIATION_ROUND_CAP` was built for) must stay EXACTLY as capped as before.
-  it('xaer296 FOLLOW-UP 2 — a normal PR at the shared cap (no advisory:changes at all) is STILL refused cap-exhausted', () => {
-    const rearms = Array.from({ length: NEGOTIATION_ROUND_CAP }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
+  it('xaer296 FOLLOW-UP 2 — a normal PR above the shared cap (no advisory:changes at all) is STILL refused cap-exhausted', () => {
+    const rearms = Array.from({ length: NEGOTIATION_ROUND_CAP + 1 }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
     const plan = planReconcile({
       prs: [prNeedsHuman({ labels: lbl('review:human'), comments: [finding(), ...rearms] })],
       agents: [], now: NOW,
     });
     expect(plan.dispatch).toHaveLength(0);
-    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'cap-exhausted', prNumber: 2601, attempts: NEGOTIATION_ROUND_CAP, cap: NEGOTIATION_ROUND_CAP })]);
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'cap-exhausted', prNumber: 2601, attempts: NEGOTIATION_ROUND_CAP + 1, cap: NEGOTIATION_ROUND_CAP })]);
   });
 
   // And a PR that carries `advisory:changes` but has NOT YET addressed the latest finding must stay governed
@@ -2946,17 +2946,17 @@ describe('#2588/review-loops — the zero-findings review population now hits th
     expect(plan.dispatch[0]).toMatchObject({ kind: 'review', prNumber: 2588, findings: 0, attempts: 2 });
   });
 
-  it('once the REAL attempt count reaches the round cap, a zero-findings review population is refused `cap-exhausted`, not dispatched again — THE FIX for the "re-dispatch forever" loop', () => {
-    const fiveRearms = Array.from({ length: NEGOTIATION_ROUND_CAP }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
-    const plan = planReconcile({ prs: [zeroFindingsPr({ comments: fiveRearms })], agents: [], durableCounts: {}, now: NOW });
+  it('once the REAL attempt count exceeds the round cap, a zero-findings review population is refused `cap-exhausted`, not dispatched again — THE FIX for the "re-dispatch forever" loop', () => {
+    const overCapRearms = Array.from({ length: NEGOTIATION_ROUND_CAP + 1 }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
+    const plan = planReconcile({ prs: [zeroFindingsPr({ comments: overCapRearms })], agents: [], durableCounts: {}, now: NOW });
     expect(plan.dispatch).toHaveLength(0);
     expect(plan.refusals.map((r) => r.kind)).toEqual(['no-findings', 'cap-exhausted']);
-    expect(plan.refusals[1]).toMatchObject({ prNumber: 2588, attempts: NEGOTIATION_ROUND_CAP, cap: NEGOTIATION_ROUND_CAP });
+    expect(plan.refusals[1]).toMatchObject({ prNumber: 2588, attempts: NEGOTIATION_ROUND_CAP + 1, cap: NEGOTIATION_ROUND_CAP });
   });
 
-  it('a `needs-human` PR (review:human) with zero findings is bound by the identical cap, via the SAME `attempts` value', () => {
-    const fiveRearms = Array.from({ length: NEGOTIATION_ROUND_CAP }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
-    const pr = zeroFindingsPr({ labels: lbl('review:human'), comments: fiveRearms });
+  it('a `needs-human` PR (review:human) with zero findings above the cap is bound by the identical cap, via the SAME `attempts` value', () => {
+    const overCapRearms = Array.from({ length: NEGOTIATION_ROUND_CAP + 1 }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
+    const pr = zeroFindingsPr({ labels: lbl('review:human'), comments: overCapRearms });
     const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: NOW });
     expect(plan.dispatch).toHaveLength(0);
     expect(plan.refusals.map((r) => r.kind)).toEqual(['no-findings', 'cap-exhausted']);

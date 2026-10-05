@@ -6,6 +6,7 @@
  *   own sibling suites (`runHungCiRecoveryAllRepos`, `runMainRedRebaseAllRepos`) — per-repo isolation via
  *   injected `tick`, then a `runTickAllRepos` merge proof, then a source-contract proof.
  */
+import { buildNoteComment } from '../../../scripts/conveyor/reconcile-note-comment.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -186,4 +187,38 @@ describe('runTickAllRepos — source contract: really calls runReconcileNotesAll
     expect(src).toMatch(/for \(const n of notes\) log\.error\(formatNoteLine\(n\)\);/);
     expect(src).toMatch(/for \(const c of noteComments\) log\.error\(formatNoteCommentLine\(c\)\);/);
   });
+});
+
+describe('exhausted fix parking', () => {
+  it.each([
+    { labels: ['review:pending', 'review:changes'], dryRun: false, alreadyPosted: false, calls: 1 },
+    { labels: ['review:pending'], dryRun: false, alreadyPosted: true, calls: 1 },
+    { labels: ['review:human'], dryRun: false, alreadyPosted: false, calls: 0 },
+    { labels: [], dryRun: true, alreadyPosted: false, calls: 0 },
+  ])('parks independently of comment dedup: %j', ({ labels, dryRun, alreadyPosted, calls }) => {
+    const note = { kind: 'round-cap-exhausted', capKind: 'fix', prNumber: 20, attempts: 5, cap: 5, parkToHuman: true };
+    const parkToHuman = vi.fn(() => ({ ok: true }));
+    const postComment = vi.fn(() => ({ ok: true }));
+    const tick = () => ({ notes: [note], prsByNumber: new Map([[20, {
+      labels: labels.map((name) => ({ name })),
+      comments: alreadyPosted ? [{ body: buildNoteComment(note), author: { login: 'web-everything' } }] : [],
+    }]]) });
+    const out = runReconcileNotesAllRepos({ repos: ['we'], tick, parkToHuman, postComment, dryRun });
+    expect(parkToHuman).toHaveBeenCalledTimes(calls);
+    if (calls) {
+      expect(parkToHuman).toHaveBeenCalledWith(expect.objectContaining({
+        repo: 'we', pr: 20, addLabel: 'review:human', removeLabels: ['review:pending'],
+      }));
+      expect(out.comments[0].parked).toBe(true);
+    }
+    expect(postComment).toHaveBeenCalledTimes(alreadyPosted || dryRun ? 0 : 1);
+  });
+});
+
+it.each([false, true])('records parking failure (throws=%s) without losing the note comment', (throws) => {
+  const parkToHuman = () => { if (throws) throw new Error('label failure'); return { ok: false, error: 'label failure' }; };
+  const tick = () => ({ notes: [{ kind: 'round-cap-exhausted', prNumber: 20, capKind: 'fix', parkToHuman: true }],
+    prsByNumber: new Map([[20, { labels: [], comments: [] }]]) });
+  const out = runReconcileNotesAllRepos({ repos: ['we'], tick, parkToHuman, postComment: () => ({ ok: true }), dryRun: false });
+  expect(out.comments[0]).toMatchObject({ parked: false, parkError: 'label failure', posted: true });
 });

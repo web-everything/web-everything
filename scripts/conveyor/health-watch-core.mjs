@@ -51,6 +51,9 @@ export const DEFAULT_HEALTH_CONFIG = Object.freeze({
   healthStaleAfterMs: 15 * MINUTE,
   // A parked review waiting on the operator's ruling alerts after this long (`ruling-needed-waiting`).
   rulingNeededAfterMs: 2 * HOUR,
+  // Repeated reviews on one head without a posted result (`review-same-head-unposted`).
+  sameHeadReviewWindowMs: 6 * HOUR,
+  sameHeadUnpostedReviews: 3,
   historyKeep: 100,
   // Sustained ungated heavy runs: minimum runs per sample, samples per window, and window length.
   heavyRunUngatedMinRuns: 1,

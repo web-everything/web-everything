@@ -122,6 +122,7 @@ function runReaperCli(args = [], { agents = '[]', env = {} } = {}) {
       STUB_ARGV_FILE: argvFile,
       STUB_GH_ARGV_FILE: ghArgvFile,
       STUB_STOP_COUNT_DIR: binDir,
+      WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0', // each case stubs its own listing — never share a cached one
       ...env,
     },
   });
