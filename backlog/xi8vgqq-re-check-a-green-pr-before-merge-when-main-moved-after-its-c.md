@@ -50,9 +50,21 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
      no base SHA on the run object, so that field is **not** a usable source. The builder's first step is a
      feasibility proof: find a source, tied to one run and not writable by the PR, that yields the exact
      merge commit, and record a real-run fixture of it (Proof plan step 0). **If no such source passes,
-     the story still ships:** `readTestedMainSha` returns `unknown` for every run, so every run past the age
-     cap is re-checked (bounded by step 3) and #xca0u65 never grants an exemption. That is the intended
-     refuse-by-default state, never a reason to add a guess.
+     the story still ships:** `readTestedMainSha` returns `unknown` for every run, so every run is re-checked
+     whenever main is not proven contained (below), **whatever the run's age** (step 3 skips the age gate for
+     `unknown`), and #xca0u65 never grants an exemption. That is the intended refuse-by-default state, never
+     a reason to add a guess.
+   - **The one other exact fact: what the run's own head contains.** Let `B = merge-base(head_sha, mainTip)`,
+     with `head_sha` the run's own field. `B` is an ancestor of the head, so it is in the tree the run tested,
+     whatever main commit the merge was built on: a known-tested floor, read from git, not a date. For an
+     `unknown` tested SHA, `mainMovedSince` walks `B..mainTip` instead of `tested..mainTip`, with the same
+     bookkeeping rule as step 2: when every commit in it is drain bookkeeping (or it is empty, the head
+     already contains the tip), main has **not moved**. So a PR rebuilt by step 5 converges when no pinned
+     source exists, and merge A's own later numbering commit does not strand it. This relies on main being
+     append-only (branch protection forbids force-push), and an ancestry check that fails, or a commit
+     object that is missing, counts as **not contained** (moved). It is the only way an `unknown` run can
+     pass, it reads no clock, and it is used by this gate only: #xca0u65 reads `readTestedMainSha`, never
+     this containment walk, so for #xca0u65 an `unknown` run is still not exempt.
    - **No exact value means unknown, and unknown is never guessed.** There is **no timestamp fallback**. A
      commit date is not a push time, so "main's tip as of `created_at`" can name a commit the run never
      tested (a main commit pushed after the run was created can carry an older commit date, whatever
@@ -77,9 +89,10 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
      `unknown`.
    Shared helpers live in `we:scripts/lib/tested-main-base.mjs`, which the main-red story (#xca0u65) also
    uses: `readTestedMainSha(run)` (derive exactly, then apply the hint rule; returns `{ state: 'exact', sha }`
-   or `{ state: 'unknown', reason }`) and `mainMovedSince(tested, mainTip)`, which returns "moved" for an
-   `unknown` input. A run for which no exact SHA can be derived (an older run, a deleted merge ref) counts
-   as "moved", the safe direction.
+   or `{ state: 'unknown', reason }`) and `mainMovedSince(tested, mainTip, runHeadSha)`, which returns
+   "moved" for an `unknown` input unless the walk from `merge-base(head_sha, mainTip)` to `mainTip` finds
+   only bookkeeping (the containment fact above). A run for which no exact SHA can be derived (an older run, a deleted merge ref) counts as
+   "moved", the safe direction.
 2. **What counts as "main moved".** `mainMovedSince` walks main's first-parent commits in
    `testedMainSha..mainTip`. Main moved when **any** of them is not a drain bookkeeping commit. Drain
    bookkeeping commits (the JIT-numbering commit and the resolve-on-land commit, which land minutes after each
@@ -113,8 +126,15 @@ Related, not a duplicate: card #2824 refreshes review-held `BEHIND` PRs. This st
    - `always`: re-check whenever main moved (per step 2).
    - `off`: never re-check (today's behaviour).
    - **Bounded.** A PR already re-checked `RECHECK_MAX_PER_PR` times (module constant, 2) in the last 6 hours
-     is **not** re-checked again: it proceeds as `off` would, and the drain records one `recheck-cap-reached`
-     event. So a busy main can delay a PR by at most two CI cycles, never stall it indefinitely.
+     is **not** re-checked again, and the drain records one `recheck-cap-reached` event. What happens next
+     depends on whether the tested commit is known:
+     - **Exact tested SHA:** it proceeds as `off` would. The main it tested is known, so the merge is a
+       known, bounded risk, never a guess. So a busy main can delay such a PR by at most two CI cycles.
+     - **`unknown` tested SHA (and main not contained in the head):** it is **held, never merged**: skipped
+       with reason `recheck-unknown-held`, and the refusal alert (story #xq4p21a) is raised under the subject
+       `recheck-unknown-held`. The cap limits rebuilds; it never turns "unknown" into "tested". The hold
+       clears on its own once the window passes (the PR is rebuilt again) or once main stops moving long
+       enough for a rebuilt head to contain main's tip.
    - **The count lives in state the drain owns, not in the journal.** The policy journal is best-effort and
      write-only audit (`recordPolicyEvent` never throws, so an unwritable or rotated journal silently loses
      events and would reset a journal-derived count to 0 on every pass, which is a rebuild loop). The count
@@ -124,8 +144,10 @@ is a durable per-PR record (timestamps of each re-check) in a new JSON state fil
      It is keyed `<repo>#<pr>`, written by write-to-temp-then-rename so a crash leaves the old file intact,
      and entries older than the window are dropped on write. **Order matters:** the drain writes the count
      first and rebuilds only if that write succeeded. If the file cannot be read (other than "does not exist
-     yet", which is an empty count) or cannot be written, the drain does **not** re-check (it proceeds as
-     `off` would) and raises the refusal alert (story #xq4p21a) under the subject `recheck-state`; a clean
+     yet", which is an empty count) or cannot be written, the drain does **not** re-check and raises the
+     refusal alert (story #xq4p21a) under the subject `recheck-state`. A PR with an exact tested SHA then
+     proceeds as `off` would; a PR with an `unknown` tested SHA that main moved past is **held** (skipped with
+     `recheck-unknown-held`), never merged, exactly as at the cap. A clean
      read and write afterwards records `drain-step-ok`. A broken store can never produce an unbounded rebuild
      loop.
 4. **Where.** Read the run from the same latest run that `isRequiredCheckGreen` selects
@@ -151,7 +173,7 @@ Steps 1 to 5.
 
 - **Capability (RED today, fails before this lands):** `we:scripts/__tests__/merge-ai-prs-recheck-main-moved.test.mjs`:
   - The predicate, per value: `always` re-checks on any move; `off` never; `if-older-than-N-min` with N = 30
-    merges a 10-minute-old run and re-checks a 45-minute-old one. A main that did not move never re-checks.
+    merges a 10-minute-old run whose tested SHA is exact and re-checks a 45-minute-old one. A main that did not move never re-checks.
   - **Bookkeeping only:** main's only new commits since the tested SHA are drain bookkeeping commits (a
     JIT-numbering commit, a resolve-on-land commit): no re-check. One real commit among them: re-check.
   - **Forged bookkeeping subject:** a commit with the drain's exact subject prefix and author whose diff
@@ -169,10 +191,22 @@ Steps 1 to 5.
     field absent, the call throwing, and a deleted merge ref each give `unknown`. So does a **rebuilt merge
     ref**: the live merge commit's first parent is a newer main than the run tested, or its second parent
     differs from the run's `head_sha`; it is never read as the tested commit. (The 10 minutes in this
-    fixture is a fixture value only; no such margin exists in the module.) After the per-PR re-check cap
-    is reached, a PR with an `unknown` tested commit proceeds as `off` would; that is intended and bounded,
-    not a hole. The module exports no
+    fixture is a fixture value only; no such margin exists in the module.) The module exports no
     fallback margin constant (a test asserts `TESTED_SHA_FALLBACK_MARGIN_MIN` is not exported).
+  - **Cap reached with an unknown tested commit (RED today):** a PR already re-checked twice in the window,
+    whose tested SHA is `unknown` and that fails the containment walk (step 1), is **not merged**: it is
+    skipped with `recheck-unknown-held` and the refusal alert path is called once. The same PR with an
+    **exact** tested SHA proceeds as `off` would. With every run `unknown` (pinned source stubbed out), no
+    PR ever merges against a main its head does not contain.
+  - **Default policy, a fresh run with an unknown tested commit (RED today):** under the default
+    `if-older-than-N-min` with no config, a run 10 minutes old (well inside 30), tested SHA `unknown`, main
+    moved to M1 by a commit that is not bookkeeping, M1 not contained in the run's `head_sha`: the PR is
+    **re-checked**, not merged. The age gate is not consulted for `unknown`.
+  - **Containment is the only pass for unknown:** the same fresh `unknown` run whose `head_sha` has main's
+    tip as an ancestor (a PR just rebuilt onto main) is not re-checked. So is one whose head contains M1
+    while main has since gained only a drain numbering commit M2 (`merge-base(head_sha, mainTip)` = M1, and
+    M1..M2 is bookkeeping). A head that contains an older main commit, with a real commit after it on main,
+    is re-checked. An ancestry call that throws, or a missing commit object, is re-checked.
   - **Refuse when not exact (RED today):** a test over a table of inputs (every shape the API can give:
     missing field, malformed SHA, an extra parent, a second parent that is not the run's `head_sha`, a
     first parent that is not on main's first-parent line, a call error, a timeout) asserts the **only** two
@@ -201,13 +235,15 @@ Steps 1 to 5.
     - `off`: the rerun is not re-checked (today's behaviour).
     - **Wiring:** the caller (the drain) passes the anchor computed from both fields, and a test asserts the
       predicate is never handed `run_started_at` alone.
-  - **Bounded:** a PR already re-checked twice in the window is not re-checked a third time; one
-    `recheck-cap-reached` event is recorded. After the window the count resets.
+  - **Bounded:** a PR (exact tested SHA) already re-checked twice in the window is not re-checked a third
+    time; one `recheck-cap-reached` event is recorded. After the window the count resets.
   - **Bounded with a broken journal:** with the journal path unwritable (every `recordPolicyEvent` a no-op),
     three passes over the same PR still re-check it at most twice, because the count is read from the
     drain's state, not the journal. With the drain's state store unreadable or unwritable, the PR is **not**
-    re-checked and the refusal alert path is called once.
-  - A run with no derivable tested SHA counts as moved, under every policy value that re-checks (`always`
+    re-checked and the refusal alert path is called once. **Store unreadable or unwritable, with an `unknown`
+    tested commit (RED today):** the PR is held with `recheck-unknown-held`, **not merged**.
+  - A run with no derivable tested SHA counts as moved (unless it passes the containment walk, step 1), under every
+    policy value that re-checks (`always`
     and the default `if-older-than-N-min` alike: an `unknown` tested commit is not subject to the age
     threshold, because without a tested commit the run's age proves nothing).
   - Default (no config): behaves as `if-older-than-N-min` with 30.
@@ -215,7 +251,8 @@ Steps 1 to 5.
   - **Replay of failure mode (2):** PRs A and B are both green against main M0, B's green run is older
     than 30 minutes by its age anchor (even if a rerun reset its start time). The pass merges A (main moves to M1). Before this story: B merges untested against
     M1. After it, under the default: B is skipped with `recheck-main-moved`, and `rebaseDropManifest` is
-    called with B's head ref. With B's run only 10 minutes old, the default merges B (fresh CI is trusted).
+    called with B's head ref. With B's run only 10 minutes old and its tested SHA exact, the default merges
+    B (fresh CI is trusted); with it `unknown`, B is re-checked.
     Under `always`, B is re-checked either way. Under `off`: B merges (the old behaviour is still selectable).
   - The rebuild never edits a `review:*` label or the `ready-to-merge` label. Dry-run pushes nothing.
 
@@ -236,14 +273,20 @@ Steps 1 to 5.
 ## Follow-ups
 
 - Throughput: under `always`, a pass merges at most one PR per CI cycle (bookkeeping commits no longer count
-  as a move, and a PR is re-checked at most twice, so the queue cannot stall). The default
-  `if-older-than-N-min` trusts a run younger than 30 minutes. Batching (test several PRs merged together)
-  would be a separate story.
+  as a move, and a PR with an exact tested SHA is re-checked at most twice). The default
+  `if-older-than-N-min` trusts a run younger than 30 minutes **only when its tested SHA is exact**. A PR
+  whose tested SHA is `unknown` can be held at the cap on a busy main; that hold is visible (alert) and
+  self-clearing, and is the price of never guessing. Batching (test several PRs merged together) would be a
+  separate story.
 
 ## Done when
 
 1. **Executable:** the replay case fails before this lands (B merges) and passes after (B is re-checked).
 2. Proof steps 0 and 1 are pasted in the PR.
 3. **Executable (the operator's no-guess ruling):** the "Unknown tested commit is never guessed" and "Refuse
-   when not exact" cases in `we:scripts/lib/__tests__/tested-main-base.test.mjs` fail before this lands and
-   pass after.
+   when not exact" cases in `we:scripts/lib/__tests__/tested-main-base.test.mjs`, and the "Cap reached with
+   an unknown tested commit" and "Default policy, a fresh run with an unknown tested commit" cases in
+   `we:scripts/__tests__/merge-ai-prs-recheck-main-moved.test.mjs`, fail before this lands and pass after.
+   Under any policy value other than the `off` kill switch (itself a human-gated config edit, story
+   #xcs4nce), no path (age gate, re-check cap, broken re-check store, hint, or #xca0u65 exemption) merges a
+   PR whose tested main is `unknown` and that main moved past since `merge-base(head_sha, mainTip)`.

@@ -3,7 +3,7 @@ kind: story
 size: 3
 parent: "x0hvbwx"
 status: open
-scope: ["we:config/defineConfig.ts", "we:config/platformDefaults.ts", "we:config/index.ts", "we:config/__tests__/config-contract.test.ts", "we:scripts/lib/delivery-policy.mjs", "we:scripts/lib/__tests__/delivery-policy.test.mjs", "we:scripts/lib/gate-config.mjs", "we:scripts/lib/__tests__/gate-config.test.mjs"]
+scope: ["we:config/defineConfig.ts", "we:config/platformDefaults.ts", "we:config/deliveryPolicyDefaults.ts", "we:config/index.ts", "we:config/__tests__/config-contract.test.ts", "we:scripts/lib/delivery-policy.mjs", "we:scripts/lib/__tests__/delivery-policy.test.mjs", "we:scripts/lib/gate-config.mjs", "we:scripts/lib/__tests__/gate-config.test.mjs"]
 dateOpened: "2026-10-03"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "838e849ab8b35fa4b94216b7d474b3138d979ba5"
@@ -17,7 +17,8 @@ Defaults ruled by the operator on 2026-10-03 (PR #3794 comment): `recheckWhenMai
 `dispatchGate` name is accepted.
 
 Declare the five delivery-flow policy dimensions (`prCi`, `mergeGate`, `dispatchGate`, `heavyQueue`, `drain`)
-in `we:config/defineConfig.ts`, with their safe defaults in `we:config/platformDefaults.ts`. Add one loader
+in `we:config/defineConfig.ts`, with their safe defaults in `we:config/deliveryPolicyDefaults.ts` (re-exported
+by `we:config/platformDefaults.ts`). Add one loader
 the daemons call to get the resolved values, and one durable policy-event journal they write to. Every other
 story under epic #x0hvbwx reads its key through this loader.
 
@@ -57,15 +58,32 @@ dispatched, not when a PR merges (`we:scripts/conveyor/build-dispatch-policy.mjs
 
 **Contract.** In `we:config/defineConfig.ts`, add one value interface and one typed key per dimension:
 `PrCiPolicyValue`, `MergeGatePolicyValue`, `DispatchGatePolicyValue`, `HeavyQueuePolicyValue` and
-`DrainPolicyValue`. Mirror `crossProviderFallback`. In `we:config/platformDefaults.ts`, export one constant
-`PLATFORM_DELIVERY_POLICY_DEFAULTS` that holds the five default value objects above. Re-export the types from
-`we:config/index.ts`.
+`DrainPolicyValue`. Mirror `crossProviderFallback`. In a new file `we:config/deliveryPolicyDefaults.ts`,
+export one constant `PLATFORM_DELIVERY_POLICY_DEFAULTS` that holds the five default value objects above, and
+re-export it from `we:config/platformDefaults.ts` (so the config surface still has one import point).
+The constant gets its own file because it **is** a policy value source: its file is human-gated (Trust,
+below), and gating it alone avoids putting every other flavor default behind `review:human`. The file has
+**no value imports** (`import type` only), so none of its values can come from an ungated file. Re-export the
+types from `we:config/index.ts`.
 
 **Loader** (`we:scripts/lib/delivery-policy.mjs`):
 
 - `loadDeliveryPolicy({ root, env, ref })` returns `{ prCi, mergeGate, dispatchGate, heavyQueue, drain, sources, warnings, filesRead }`.
   For each field, `sources` says `default` or `config`.
-- The defaults come from `we:config/platformDefaults.ts`, transpiled once per process.
+- The defaults come from `we:config/deliveryPolicyDefaults.ts`, transpiled once per `ref` (with no `ref`, again
+  whenever its mtime changes, like the project file). With a `ref`, that file too is read at the `ref`
+  (`git show` into a temp directory, then transpiled), never from the working tree, so a PR that weakens a
+  default is judged under the base's defaults.
+- **If the defaults file cannot be read or transpiled**, the loader does not throw and does not invent a
+  value: each field takes its **most protective** listed value (`on`, `always`, `halt`, `off`,
+  `repairs-first`, `alert`; for the numbers, `recheckMaxAgeMin` 30, `reservedForRepairs` 1,
+  `reservedBorrowAfterMin` 10), held in the loader as `DELIVERY_POLICY_FAILSAFE`, and adds a warning plus
+  one `policy-defaults-unreadable` journal event. A test asserts every `DELIVERY_POLICY_FAILSAFE` value is
+  the most protective value of its Keys-table row, so the failsafe can only be stricter than the defaults,
+  never a weaker, ungated value source.
+- An `extends-flavor` descriptor on a delivery-policy key takes its base from that dimension's
+  `PLATFORM_DELIVERY_POLICY_DEFAULTS` entry, never `PLATFORM_FLAVOR_DEFAULTS` (which stays ungated), so no
+  value reaches a daemon from `we:config/platformDefaults.ts` itself.
 - The project file is `we:webeverything.config.json` (at `root`), or the path in `WE_POLICY_CONFIG`. A dimension
   entry may be an inline value, an `extends-flavor` descriptor (its `overrides` apply over the default), or a
   string pointer to another JSON file. These are the three entry forms `we:config/defineConfig.ts:67-70`
@@ -75,16 +93,22 @@ dispatched, not when a PR merges (`we:scripts/conveyor/build-dispatch-policy.mjs
   `mainStateParity: off`). An ordinary PR must not be able to switch off the check that judges that same PR.
   - **PR-side gates read the base copy.** `loadDeliveryPolicy({ root, env, ref })` takes an optional `ref`.
     With a `ref`, the file (`we:webeverything.config.json`) is read from git at that ref with `git show`
-    (pointer files likewise), never from the working tree. `check:standards` in PR CI (story #2940) and any gate that judges a PR pass
+    (pointer files and `we:config/deliveryPolicyDefaults.ts` likewise), never from the working tree. `check:standards` in PR CI (story #2940) and any gate that judges a PR pass
     the PR's **base** ref. A PR that edits the policy file therefore runs under the policy that was already
     on the base. Daemons that act on main itself read the working tree of their own main checkout (no `ref`).
   - **The policy file is human-gated.** Register `we:webeverything.config.json` in
     `we:scripts/lib/gate-config.mjs` as a **policy-tier, `leash: 'spec'`** member (human review, not
-    agent-clearable), because it decides whether the merge protections fire. Register the loader
+    agent-clearable), because it decides whether the merge protections fire. **The defaults file is
+    human-gated the same way:** `we:config/deliveryPolicyDefaults.ts` is a registered policy-tier,
+    `leash: 'spec'` member, because with no config file its values **are** the policy, and a PR that sets a
+    default to `off` would otherwise weaken every daemon after landing without a person seeing it. Register the loader
     `we:scripts/lib/delivery-policy.mjs` at the **engine tier**, like `we:scripts/merge-ai-prs.mjs`. An `off`/`free`/weaker value in a
     PR is then reviewed by a person, never cleared by an agent verdict.
-  - **The rule, in one line (operator ruling on this card, twice):** a JSON file may supply a policy value
-    **only if a PR cannot edit it without `review:human`.** Pointers are therefore restricted to
+  - **The rule, in one line (operator ruling on this card, twice):** a file may supply a policy value
+    **only if a PR cannot edit it without `review:human`**: the root JSON file, every JSON file reachable
+    through a pointer, and the defaults file alike. (The one exception is a `WE_POLICY_CONFIG` file in the
+    daemon's own state dir, which is outside the repo, so no PR can edit it; it is recorded, below.)
+    Pointers are therefore restricted to
     already-protected paths; no pointer-reachable file sits outside the human-gated roster. The loader and the
     review gate ask the **same predicate**, `isPolicySpecPath`, which is **basename-matched** like the rest of
     the trust chain. So "the loader honours this file" and "an edit to this file forces `review:human`" are
@@ -118,18 +142,23 @@ dispatched, not when a PR merges (`we:scripts/conveyor/build-dispatch-policy.mjs
     - **JSON targets only.** A pointer target must end in `.json`; any other extension is refused even if
       registered.
     - **The reach set is auditable.** `loadDeliveryPolicy` returns `filesRead`, the list of every **policy-value
-      source** it opened: the root file and each honoured pointer target (never the platform defaults file,
-      which is code, not a project value). Every entry must be the root file `we:webeverything.config.json`
-      or pass the registry check above; a `WE_POLICY_CONFIG` file counts as a root file only when it is
-      inside the daemon's own state dir (operator-owned, not in the repo), and one inside `root` must itself
-      be registered or it is ignored with a warning. The loader asserts this before returning and drops
+      source** it opened: the defaults file `we:config/deliveryPolicyDefaults.ts`, the root file and each
+      honoured pointer target. Every entry must pass `isPolicySpecPath` (the root file and the defaults file
+      are registered, pointer targets must be). The one entry exempt from that predicate is a
+      `WE_POLICY_CONFIG` file inside the daemon's own state dir (operator-owned, outside the repo, so no PR
+      can edit it; recorded by a `policy-source-env` event, below); one inside `root` must itself be
+      registered or it is ignored with a warning. The loader asserts this before returning (that exemption
+      is written into the post-check itself) and drops
       (with a warning) any value that came from a file that fails, so "every file the loader can reach is human-gated" is
       checked on each run, not only argued.
   - **Confinement.** A pointer path must resolve **inside `root`** (after `realpath`, so a symlink out of the
     tree is refused); an absolute path, a `..` escape, or a symlink out falls back to the default for that
     field with a warning. This is checked in addition to the registered-target rule above, never instead of it. `WE_POLICY_CONFIG` is honoured only for a local daemon process (never when
     `GITHUB_ACTIONS` is set, so a workflow cannot be redirected to a file the PR controls) and must resolve
-    inside `root` or inside the daemon's own state dir; otherwise it is ignored with a warning.
+    inside `root` or inside the daemon's own state dir; otherwise it is ignored with a warning. Whenever a
+    `WE_POLICY_CONFIG` file supplies a value that differs from the default, the loader records one
+    `policy-source-env` event (key, file, the fields it changed) in the policy journal, so an override that
+    no review gates still leaves a durable trace for the WIP page.
 - Fields merge one by one over the default. A missing field keeps its default.
 - **Fail safe, never crash.** An unknown value, a wrong type, an unreadable file or bad JSON falls back to the
   default for that field and adds a warning. The loader never throws, because a daemon must keep running.
@@ -180,6 +209,14 @@ Types, defaults, the loader, the journal and the CLI. No consumer changes: each 
   - **Trust (base copy):** with a `ref`, a temp git repo whose base commit has `mergeGate.onMainRed: halt`
     and whose PR head commit sets it to `off` loads `halt`, even though the working tree says `off`. Without
     a `ref`, the working tree wins.
+  - **Defaults file edited by the PR (RED today):** a temp git repo with no config file, whose PR head sets
+    `mergeGate.onMainRed` to `off` and `prCi.mainStateParity` to `off` in `we:config/deliveryPolicyDefaults.ts`.
+    With `ref` = base, the loader returns `halt` and `on` (the base's defaults), with source `default`; the
+    PR's transpiled copy is never executed. `filesRead` lists the defaults file. A value import added to the
+    defaults file fails a test (only `import type` is allowed).
+  - **Env override is recorded:** a `WE_POLICY_CONFIG` file in the state dir that sets `onMainRed: off`
+    writes exactly one `policy-source-env` event naming the file and `mergeGate.onMainRed`. One that sets
+    only default values writes none.
   - **Confinement:** a pointer that climbs out of `root` with `..`, an absolute path, and a symlink pointing
     out of `root` each give the default plus one warning. `WE_POLICY_CONFIG` is ignored under `GITHUB_ACTIONS=true` and
     when it points outside `root` and the state dir.
@@ -201,12 +238,21 @@ Types, defaults, the loader, the journal and the CLI. No consumer changes: each 
     - A registered target that does not end in `.json` is refused.
     - A pointer inside a `WE_POLICY_CONFIG` file to an unregistered file is refused the same way.
     - **Reach set:** for each of the cases above and for a clean honoured pointer, every entry of
-      `filesRead` is the root file or passes `isPolicySpecPath`. A test double that makes the loader open
+      `filesRead` passes `isPolicySpecPath` (the defaults file and the root file included), except a
+      state-dir `WE_POLICY_CONFIG` file, which the post-check keeps (Proof step 2 still shows its value).
+      Unreadable defaults file: every field takes its `DELIVERY_POLICY_FAILSAFE` value with one warning,
+      and nothing throws. A test double that makes the loader open
       an unregistered file (forcing the internal check to be bypassed) still returns no value from that
       file: the loader's own post-check drops it with a warning.
 - **Capability (RED today, fails before this lands):** `we:scripts/lib/__tests__/gate-config.test.mjs`:
   `we:webeverything.config.json` is a registered policy-tier, `leash: 'spec'` member (so a PR touching it
-  forces `review:human`), and `we:scripts/lib/delivery-policy.mjs` is a registered engine-tier member.
+  forces `review:human`), `we:config/deliveryPolicyDefaults.ts` is a registered policy-tier, `leash: 'spec'`
+  member (a PR touching **only** it forces `review:human`), and `we:scripts/lib/delivery-policy.mjs` is a
+  registered engine-tier member.
+  **Every file the loader reads is gated:** the test runs `loadDeliveryPolicy` over a fixture with a
+  registered pointer target and asserts each entry of its `filesRead` (defaults file, root file, pointer
+  target) passes `isPolicySpecPath`. A loader change that opens a new value source without registering it
+  fails here.
   **Pointer files:** a test that a pointer-target file (a temp JSON file the loader is pointed at) forces
   `review:human` **when it is edited alone**, with `we:webeverything.config.json` untouched, once it is
   registered. Together with the loader's registered-only pointer test above (including its symlink and
@@ -257,4 +303,6 @@ character and a 5 000-character reason, showing it stripped and cut.
    `we:scripts/lib/__tests__/gate-config.test.mjs` shows a pointer-target JSON file, edited **alone** (the root
    file untouched), forces `review:human`; and a case in `we:scripts/lib/__tests__/delivery-policy.test.mjs`
    shows a pointer to an **unregistered** JSON file yields the default plus a warning naming the path. Both fail
-   before this lands.
+   before this lands. The "Every file the loader reads is gated" and "Defaults file edited by the PR" cases
+   also fail before and pass after, so no file that supplies a policy value (root, pointer target or
+   defaults) can be changed by a PR without `review:human`.

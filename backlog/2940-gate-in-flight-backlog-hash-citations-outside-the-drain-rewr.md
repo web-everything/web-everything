@@ -71,8 +71,9 @@ run.
      or not, even when it also carries an `error` string), that list contains
      the same `{ file, hash }`, and neither the file nor the hash is touched by the PR. A refusal that is
      **new against current main** is caused, even when its file is not in the PR's diff. Anything short of
-     that proof is caused, never downgraded (the one exception is a bare lane with no `baseRef`, below, and
-     PR CI judges the same tree again): the base run threw or returned no structured list; the merged
+     that proof is caused, never downgraded to a warning (a lane that cannot reach current main may report a
+     refusal its fork point already had as `not-judged`, below, which is neither a warning nor an inherited
+     verdict, and PR CI judges the same tree again): the base run threw or returned no structured list; the merged
      run refuses with an `error` string but no parsable `refusals` list (so the keys cannot be compared);
      `baseRef` is stale (the rule re-fetches `baseRef` first, and if the fetch fails in PR CI the base
      comparison counts as failed, below). The warning is reserved for a refusal main **already holds**.
@@ -87,11 +88,19 @@ run.
    - Inherited, in PR CI or a lane: a **warning** naming the refusal and saying it comes from main, never an
      error. An unrelated PR stays green on a main that already holds a refusing citation, and a CI heal is not
      asked to fix what it cannot.
-   - No `baseRef` available (a bare lane with no origin ref): everything is inherited, so a warning only. The
-     rule fails open to today's relaxed behaviour rather than wedging a lane. **In PR CI a `baseRef` always
-     exists**, so there the base run is never skipped: if the base run itself cannot be executed (the
-     worktree or the dry run throws), the rule does not guess "inherited"; it treats every merged-tree
-     refusal as caused and says in the error that the base comparison failed. Only a bare lane may fail open.
+   - **No current main to compare against, in a lane only** (a bare lane with no origin ref, or a lane whose
+     `baseRef` fetch failed): the rule still runs the differential, against **the lane's fork point**
+     (`git merge-base HEAD <the lane's local main>`, the commit the lane's work started from). A refusal not
+     in the fork-point run is **caused**, an error, exactly as above, so a change to the sweep is still
+     caught in the lane. A refusal that is in the fork-point run is not proven to be on **current** main, so
+     the rule does **not** call it inherited: it reports it as **`not-judged`**, a notice that says "not
+     compared against current main; PR CI will judge this", not a warning that says "from main". With no
+     fork point either (no local main at all), every refusal is `not-judged`. Neither case wedges the lane,
+     and `not-judged` is not a verdict: the PR's own CI run is where the rule is decided. **In PR CI there is no
+     `not-judged`:** a `baseRef` always exists there, so the base run is never skipped, and if the base run
+     cannot be executed (the worktree or the dry run throws), or `GITHUB_ACTIONS` is set with no `baseRef`,
+     every merged-tree refusal is caused and the error says the base comparison failed. So an indirectly
+     caused refusal can be left un-errored only in a lane that cannot see main, and never at the PR gate.
    - On main (push-to-main CI): any refusal is an error, because a strand is about to happen or has.
    - In PR CI, the checkout is the PR merged with current main (`we:.github/workflows/ci.yml:168-172`,
      check-standards at `:215`), and `baseRef` is the PR's base (`origin/<base>`).
@@ -149,8 +158,14 @@ Steps 1 to 4.
   - **Inherited stays inherited under the differential:** a refusal present in both the base run and the
     merged run, from a PR that touches neither the sweep, the file nor the card, is still a warning.
   - **Base comparison failure in PR CI:** with the base dry run injected to throw, every merged refusal is an
-    error and the message says the base comparison failed. In a bare lane with no `baseRef`, a warning only.
-  - No `baseRef`: the refusal is a warning only.
+    error and the message says the base comparison failed. With `GITHUB_ACTIONS=true` and no `baseRef`:
+    also an error.
+  - **Bare lane, indirectly caused (RED today):** the "Caused indirectly, by changing the sweep" fixture
+    (the PR changes only `we:scripts/lane-drain.mjs`), run in a lane with no `baseRef` but a local main:
+    the differential against the lane's fork point gives an **error**. With no local main either, the
+    result is `not-judged`, **never** `inherited`: no output line says the refusal comes from main. The same
+    tree in PR CI (with `baseRef`) is an error in both cases. A lane whose `baseRef` fetch fails behaves
+    like a lane with no `baseRef`.
   - The policy file is read from the base: a PR whose head sets `prCi.mainStateParity` to `off` is still
     judged under the base's `on`.
   - A clean tree (citations only in scope): no error under either value.
@@ -166,7 +181,7 @@ Steps 1 to 4.
 2a. In a scratch clone of current origin/main, make a one-file change that narrows the drain's rewrite scope
    (touching only `we:scripts/lane-drain.mjs`). **Before:** the PR-side check shows no error. **After:** it
    shows the error for the citation that now refuses, though that citation's file is not in the diff.
-3. Paste both outputs in the PR.
+3. Paste the outputs of steps 1, 2 and 2a in the PR.
 
 ## Follow-ups
 
@@ -178,8 +193,10 @@ Steps 1 to 4.
 
 1. **Executable:** the replay case in `we:scripts/__tests__/check-standards-main-state-parity.test.mjs` fails
    before this lands and passes after.
-2. Proof steps 1 and 2 are pasted in the PR.
+2. Proof steps 1, 2 and 2a are pasted in the PR (2a is the live indirect-cause before/after).
 3. **Executable (the operator's indirect-cause ruling):** the "Caused indirectly, by changing the sweep" and
    "New against current main is caused, wherever the file is" cases in
    `we:scripts/__tests__/check-standards-main-state-parity.test.mjs` fail before this lands (they assert an
-   error where today's relaxed rule gives none) and pass after.
+   error where today's relaxed rule gives none) and pass after. So does "Bare lane, indirectly caused": no
+   path labels an unproven refusal `inherited`, and the only non-error outcomes are an inherited refusal
+   proven against current main, or a lane-only `not-judged` notice that PR CI then decides.
