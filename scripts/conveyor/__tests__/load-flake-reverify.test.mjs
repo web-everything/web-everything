@@ -35,7 +35,7 @@ describe('quiet-host reverify', () => {
   it('records red-again and caps the third failure', async () => {
     for (const [reds, result] of [[[], 'red-again'], [[red('2026-10-04T19:00:00Z'), red('2026-10-04T20:00:00Z')], 'exhausted']]) {
       const { io } = fixture(reds); io.verify.mockReturnValue({ ok: false, summary: 'x'.repeat(2000) });
-      expect(await runLoadFlakeReverify({}, io)).toEqual({ mode: 'local', result });
+      expect(await runLoadFlakeReverify({}, io)).toEqual({ result });
       expect(io.comment.mock.calls[0][2]).toContain(`result=${result}`);
       expect(io.push).not.toHaveBeenCalled(); expect(io.release).toHaveBeenCalled();
     }
@@ -47,9 +47,9 @@ describe('quiet-host reverify', () => {
   });
   it('refuses non-ancestor and live fix claims', async () => {
     const { io } = fixture(); io.isAncestor.mockReturnValue(false);
-    expect(await runLoadFlakeReverify({}, io)).toEqual({ mode: 'local', deferred: 'non-ancestor' });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'non-ancestor' });
     io.pushRefusal.mockReturnValue({ refused: true });
-    expect(await runLoadFlakeReverify({}, io)).toEqual({ mode: 'local', deferred: 'fix-claimed' });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'fix-claimed' });
     expect(io.acquire).not.toHaveBeenCalled();
   });
   it('rechecks head and claims after verify', async () => {
@@ -58,7 +58,7 @@ describe('quiet-host reverify', () => {
       io.verify.mockImplementation(() => { if (moved) pr.headRefOid = 'new'; else io.pushRefusal.mockReturnValue({ refused: true }); return { ok: true }; });
       // Separate snapshots, as gh would return.
       io.listPrs.mockResolvedValue([structuredClone(pr)]);
-      expect(await runLoadFlakeReverify({}, io)).toEqual({ mode: 'local', deferred: moved ? 'head-moved' : 'fix-claimed' });
+      expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: moved ? 'head-moved' : 'fix-claimed' });
       expect(io.push).not.toHaveBeenCalled(); expect(io.release).toHaveBeenCalled();
     }
   });
@@ -97,7 +97,7 @@ describe('superseded legacy holds and moved heads (PR #3945 review)', () => {
   });
   it('a hold whose saved alt is no longer a descendant is ended, not retried forever', async () => {
     const { io, pr } = fixture(); io.isAncestor.mockReturnValue(false);
-    expect(await runLoadFlakeReverify({}, io)).toEqual({ mode: 'local', deferred: 'non-ancestor' });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'non-ancestor' });
     expect(io.comment.mock.calls[0][2]).toContain('result=head-moved');
     const ended = { ...pr, comments: [...pr.comments, comment(io.comment.mock.calls[0][2], '2026-10-04T22:00:01Z')] };
     expect(planLoadFlakeReverify({ prs: [ended], load: [1, 1], cores: 12, now })).toEqual({ deferred: 'no-candidate' });
@@ -121,7 +121,7 @@ describe('starvation, deleted alts and credentials (PR #3945 advisory)', () => {
     const { io } = twoHolds();
     io.head.mockImplementation((path) => 'moved-tip'); // lane checked out a newer tip than the recorded sha
     io.resolveSha.mockImplementation((sha) => sha);
-    expect(await runLoadFlakeReverify({}, io)).toEqual({ mode: 'local', deferred: 'lane-head-mismatch' });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'lane-head-mismatch' });
     expect(io.comment.mock.calls[0][0]).toBe('web-everything/web-everything');
     expect(io.comment.mock.calls[0][1]).toBe(3881);
     expect(io.comment.mock.calls[0][2]).toContain('result=head-moved');
@@ -136,7 +136,7 @@ describe('starvation, deleted alts and credentials (PR #3945 advisory)', () => {
       if (trouble === 'claim') io.pushRefusal.mockImplementation(({ branch }) => (branch === 'lane/fix' ? { refused: true } : null));
       else io.prepare.mockImplementation((_s, alt) => { if (alt === 'lane/fix-alt') throw new Error('Could not resolve host'); });
       io.head.mockReturnValue('ddd4444'); io.resolveSha.mockReturnValue('ddd4444');
-      expect(await runLoadFlakeReverify({}, io)).toEqual({ mode: 'local', result: 'pushed', pr: 3882 });
+      expect(await runLoadFlakeReverify({}, io)).toEqual({ result: 'pushed', pr: 3882 });
       expect(io.push).toHaveBeenCalledWith('/lane', 'ddd4444', 'lane/other');
     }
   });
@@ -148,7 +148,7 @@ describe('starvation, deleted alts and credentials (PR #3945 advisory)', () => {
   it('a hold whose saved alt branch was deleted is ended; a transient fetch failure is not', async () => {
     const { io, pr } = fixture();
     io.prepare.mockImplementation(() => { throw Object.assign(new Error('git fetch failed'), { stderr: "fatal: couldn't find remote ref refs/heads/alt" }); });
-    expect(await runLoadFlakeReverify({}, io)).toEqual({ mode: 'local', deferred: 'alt-gone' });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'alt-gone' });
     expect(io.comment.mock.calls[0][2]).toContain('result=head-moved');
     const ended = { ...pr, comments: [...pr.comments, comment(io.comment.mock.calls[0][2], '2026-10-04T22:00:01Z')] };
     expect(planLoadFlakeReverify({ prs: [ended], load: [1, 1], cores: 12, now })).toEqual({ deferred: 'no-candidate' });
@@ -182,7 +182,7 @@ describe('stale verification and push isolation (PR #3945 advisory, round 3)', (
     const { io, pr } = fixture(reds);
     io.listPrs.mockResolvedValue([structuredClone(pr)]);
     io.verify.mockImplementation(() => { pr.headRefOid = 'new'; return { ok: false, summary: 'timeout' }; });
-    expect(await runLoadFlakeReverify({}, io)).toEqual({ mode: 'local', deferred: 'head-moved' });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'head-moved' });
     expect(io.comment).toHaveBeenCalledTimes(1);
     expect(io.comment.mock.calls[0][2]).toContain('result=head-moved');
     expect(io.comment.mock.calls[0][2]).not.toContain('exhausted');
@@ -195,13 +195,13 @@ describe('stale verification and push isolation (PR #3945 advisory, round 3)', (
       pr.comments = [...pr.comments, comment(buildLoadFlakeResolvedComment({ altSha: 'bbb2222', result: 'pushed' }), '2026-10-04T21:59:00Z')];
       return { ok: false, summary: 'timeout' };
     });
-    expect(await runLoadFlakeReverify({}, io)).toEqual({ mode: 'local', deferred: 'hold-ended' });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ deferred: 'hold-ended' });
     expect(io.comment).not.toHaveBeenCalled();
   });
   it('a red final attempt on a still-current head is still terminal', async () => {
     const { io } = fixture([red('2026-10-04T19:00:00Z'), red('2026-10-04T20:00:00Z')]);
     io.verify.mockReturnValue({ ok: false, summary: 'timeout' });
-    expect(await runLoadFlakeReverify({}, io)).toEqual({ mode: 'local', result: 'exhausted' });
+    expect(await runLoadFlakeReverify({}, io)).toEqual({ result: 'exhausted' });
   });
   it('the push runs from the daemon checkout with hooks disabled, never from the lane that ran the branch code', () => {
     const run = vi.fn(() => ''); const io = defaultReverifyIo({ run, root: '/repo' });

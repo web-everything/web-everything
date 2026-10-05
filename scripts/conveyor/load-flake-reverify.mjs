@@ -62,13 +62,13 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
   // Holding is the common case: name every PR it holds and the load it saw, so the log proves the pass is
   // evaluating them (a bare "host-load" line cannot be told apart from a pass that sees no holds). Read-only.
   if (plan.deferred === 'host-load') {
-    return { ...plan, mode: config.mode, load: load.slice(0, 2).map((n) => Math.round(n * 100) / 100), cores, maxLoadPerCore: config.maxLoadPerCore,
+    return { ...plan, load: load.slice(0, 2).map((n) => Math.round(n * 100) / 100), cores, maxLoadPerCore: config.maxLoadPerCore,
       holds: prs.flatMap((pr) => {
         const state = loadFlakeHoldState({ comments: pr.comments, headRefOid: pr.headRefOid, now });
         return state.live ? [{ pr: pr.number, alt: state.hold.alt.branch, altSha: state.hold.alt.sha }] : [];
       }) };
   }
-  if (!plan.candidate || dryRun) return { ...plan, dryRun, mode: config.mode };
+  if (!plan.candidate || dryRun) return { ...plan, dryRun };
   // Take candidates oldest-first until one makes progress. A hold that cannot be worked right now (fix claim
   // live, transient fetch failure) must never starve the younger holds behind it; a hold that can NEVER be worked
   // is ended on the PR instead, so it stops being picked at all.
@@ -77,13 +77,13 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
   for (const candidate of plan.candidates) {
     try {
       const out = await reverifyCandidate({ candidate, key, slug, config }, io);
-      if (!NON_PROGRESS.has(out.deferred)) return { ...out, mode: config.mode };
+      if (!NON_PROGRESS.has(out.deferred)) return out;
       lastDeferral = out;
     } catch (e) {
       firstError ??= e;
     }
   }
-  if (lastDeferral) return { ...lastDeferral, mode: config.mode };
+  if (lastDeferral) return lastDeferral;
   throw firstError;
 }
 
@@ -196,6 +196,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const [action, ...args] = process.argv.slice(2);
   if (action !== 'sweep') throw new Error('usage: load-flake-reverify.mjs sweep [--repo=we] [--dry-run] [--max-load-per-core=N] [--json]');
   const flags = Object.fromEntries(args.map((a) => { const [k, ...v] = a.replace(/^--/, '').split('='); return [k, v.length ? v.join('=') : true]; }));
-  const result = await runLoadFlakeReverify({ repo: flags.repo ?? REVERIFY_DEFAULT_REPO, dryRun: !!flags['dry-run'], config: reverifyConfig(process.env, flags['max-load-per-core']) });
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  const config = reverifyConfig(process.env, flags['max-load-per-core']);
+  const result = await runLoadFlakeReverify({ repo: flags.repo ?? REVERIFY_DEFAULT_REPO, dryRun: !!flags['dry-run'], config });
+  process.stdout.write(`${JSON.stringify({ mode: config.mode, ...result })}\n`);
 }

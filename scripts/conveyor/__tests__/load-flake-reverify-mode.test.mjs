@@ -25,7 +25,7 @@ describe('WE_LOAD_FLAKE_REVERIFY_MODE', () => {
   it('pushes the saved SHA without verification even under high load, and releases', async () => {
     const { io } = fixture();
     io.loadavg = () => [100, 100];
-    expect(await runLoadFlakeReverify({ config }, io)).toEqual({ result: 'pushed', pr: 3881, mode: 'ci' });
+    expect(await runLoadFlakeReverify({ config }, io)).toEqual({ result: 'pushed', pr: 3881 });
     expect(io.verify).not.toHaveBeenCalled();
     expect(io.prepare).toHaveBeenCalled();
     expect(io.isAncestor).toHaveBeenCalledWith('aaa1111', 'bbb2222');
@@ -34,24 +34,24 @@ describe('WE_LOAD_FLAKE_REVERIFY_MODE', () => {
     expect(io.comment.mock.calls[0][2]).toContain("Pushed without a local re-verify (WE_LOAD_FLAKE_REVERIFY_MODE=ci); the PR's CI judges it.");
     expect(io.release).toHaveBeenCalled();
     expect(await runLoadFlakeReverify({ config: reverifyConfig({}) }, io))
-      .toMatchObject({ deferred: 'host-load', mode: 'local' });
+      .toMatchObject({ deferred: 'host-load' });
   });
   it.each(['non-ancestor', 'head-moved', 'lane-head-mismatch'])('still refuses %s', async (reason) => {
     const { io, pr } = fixture();
     if (reason === 'non-ancestor') io.isAncestor.mockReturnValue(false);
     if (reason === 'head-moved') io.readPr.mockResolvedValueOnce(pr).mockResolvedValue({ ...pr, headRefOid: 'moved' });
     if (reason === 'lane-head-mismatch') io.head.mockReturnValue('moved');
-    expect(await runLoadFlakeReverify({ config }, io)).toEqual({ deferred: reason, mode: 'ci' });
+    expect(await runLoadFlakeReverify({ config }, io)).toEqual({ deferred: reason });
     expect(io.verify).not.toHaveBeenCalled();
     expect(io.push).not.toHaveBeenCalled();
     if (reason !== 'non-ancestor') expect(io.release).toHaveBeenCalled();
   });
-  it('reports mode on dry-run and no-candidate results', async () => {
+  it('dry-run and no-candidate never touch a lane in ci mode', async () => {
     const { io } = fixture();
-    expect(await runLoadFlakeReverify({ config, dryRun: true }, io)).toMatchObject({ dryRun: true, mode: 'ci' });
+    expect(await runLoadFlakeReverify({ config, dryRun: true }, io)).toMatchObject({ dryRun: true });
     expect(io.acquire).not.toHaveBeenCalled();
     io.listPrs.mockResolvedValue([]);
     io.loadavg = () => [100, 100];
-    expect(await runLoadFlakeReverify({ config }, io)).toEqual({ deferred: 'no-candidate', dryRun: false, mode: 'ci' });
+    expect(await runLoadFlakeReverify({ config }, io)).toEqual({ deferred: 'no-candidate', dryRun: false });
   });
 });
