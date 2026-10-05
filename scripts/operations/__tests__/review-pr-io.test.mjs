@@ -1188,6 +1188,26 @@ describe('#4315 durable referral effects', () => {
     expect(result.pending).toContain(current.referrals[0].key);
   });
 
+  // A real top-level `a/` directory is a real path: the compare lookup must use the cited path as written, never
+  // a diff-prefix-stripped alias that may name a different (root) file.
+  it('looks a carried finding up by its exact cited path, and never carries across a diff-prefix alias', async () => {
+    const asked = [];
+    const h = harness({ failure: 'omitted', readChangedLines: (_repo, _base, _head, file) => { asked.push(file); return new Set(); } });
+    h.payload.referrals[0].original.file = 'a/x.mjs';
+    seedCarry(h, { curPatch: { file: 'a/x.mjs' } });
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toHaveLength(1);
+    expect(asked).toEqual(['a/x.mjs']);
+  });
+  it('does not carry a ruling on root x.mjs onto a finding cited at the different file a/x.mjs', async () => {
+    const asked = [];
+    const h = harness({ failure: 'omitted', readChangedLines: (_repo, _base, _head, file) => { asked.push(file); return new Set(); } });
+    const { current } = seedCarry(h, { curPatch: { file: 'a/x.mjs' } });
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
+    expect(result.pending).toContain(current.referrals[0].key);
+  });
+
   it.each([['block'], ['not-real']])('never replaces a current-head reviewer %s ruling with an earlier-head operator ruling', async result => {
     const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
     const { current } = seedCarry(h, { attempted: true, rule: r => [{ id: 'r1', key: r.referrals[0].key, reviewerId: r.reviewer.id,

@@ -494,6 +494,32 @@ function wordJaccard(a, b) {
 export const CARRY_SUMMARY_JACCARD_FLOOR = 0.6;
 
 /**
+ * The cited path AS WRITTEN, for every lookup against a real repository: only a `./` prefix and a `:line` suffix are
+ * dropped. A leading `a/` or `b/` is a real top-level directory as often as it is a diff prefix, so it is NEVER
+ * stripped here — an alias that names a different (root) file would be compared against the wrong file. The
+ * prefix-stripping `corroborationPath` stays for fuzzy label matching only.
+ */
+export const exactCitedPath = (file) => String(file ?? '').trim().replace(/^\.\//, '').replace(/:\d+(?::\d+)?$/, '');
+
+/**
+ * ONE definition of "the same finding" for CLEARING a standing obligation (carrying an operator ruling onto a new
+ * head, `findCarriedOperatorRuling`; overruling an earlier block, `ruling-ledger.mjs#ignoredRulings`): the same exact
+ * path, the same spot (both lines absent, or both within {@link CORROBORATION_LINE_WINDOW}), the same claim
+ * (identical, or symmetric word overlap of at least {@link CARRY_SUMMARY_JACCARD_FLOOR}), and the same severity
+ * ({@link CARRY_SEVERITY_FIELDS}). A ruling is scoped to the instance the operator saw. `a` and `b` are findings
+ * (`{ file, line, summary, verdict, impactIfUnfixed }`).
+ */
+export function sameFindingForClearing(a, b) {
+  const path = exactCitedPath(a?.file);
+  if (!path || path !== exactCitedPath(b?.file)) return false;
+  if (!(a.line == null && b.line == null)
+    && !(Number.isInteger(a.line) && Number.isInteger(b.line) && Math.abs(a.line - b.line) <= CORROBORATION_LINE_WINDOW)) return false;
+  const summary = (s) => String(s ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+  if (summary(a.summary) !== summary(b.summary) && wordJaccard(a.summary, b.summary) < CARRY_SUMMARY_JACCARD_FLOOR) return false;
+  return CARRY_SEVERITY_FIELDS.every((k) => a[k] === b[k]);
+}
+
+/**
  * #4194 — DID ANOTHER SEAT RAISE THE SAME PROBLEM? PURE, deterministic. Used to stamp an ADDED (non-Claude)
  * review seat's finding with whether one of Claude's own seats confirmed it. Two findings corroborate when they
  * cite the same file (the same path once a `./`/`a/`/`b/` prefix and a `:line` suffix are stripped — never a mere
@@ -2356,22 +2382,13 @@ export function carriedBackingHolds(carried, { repo, pr, operatorRulings = [] })
 /** Latest matching operator decision on an earlier head; the IO caller must prove unchanged cited lines. */
 export function findCarriedOperatorRuling(referral, { records = [], operatorRulings = [], head, repo, pr }) {
   const target = referral.finding;
-  const summary = s => String(s ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
   for (const o of [...operatorRulings].reverse()) {
     if (o.head === head || o.repo !== repo || o.pr !== pr) continue;
     const record = records.find(r => r.runId === o.runId && r.head === o.head && r.repo === repo && r.pr === pr);
     const finding = record?.referrals.find(f => f.key === o.key)?.finding;
-    if (!finding || !corroborationPath(finding.file)
-      || corroborationPath(finding.file) !== corroborationPath(target.file)) continue;
-    if (!(finding.line == null && target.line == null)
-      && !(Number.isInteger(finding.line) && Number.isInteger(target.line)
-        && Math.abs(finding.line - target.line) <= CORROBORATION_LINE_WINDOW)) continue;
-    // Clearing a mandatory referral is stricter than merging duplicates: symmetric (Jaccard) overlap, so a short
-    // earlier ruling cannot clear a longer, different claim that merely contains its words.
-    if (summary(finding.summary) !== summary(target.summary) && wordJaccard(finding.summary, target.summary) < CARRY_SUMMARY_JACCARD_FLOOR) continue;
-    // A ruling is scoped to the severity the operator saw: the same words re-reported as a different verdict or a
-    // higher impact (broken -> unrecoverable) is a new claim for the mandatory reviewer, never a carry.
-    if (CARRY_SEVERITY_FIELDS.some(k => finding[k] !== target[k])) continue;
+    // Clearing a mandatory referral is stricter than merging duplicates (exact path, line window, symmetric word
+    // overlap, same severity): see `sameFindingForClearing`, the one definition the ledger's overrule shares.
+    if (!finding || !sameFindingForClearing(finding, target)) continue;
     return { from: { head: o.head, runId: o.runId, key: o.key }, result: o.result, card: o.card, finding };
   }
   return null;

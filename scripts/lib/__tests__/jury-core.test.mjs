@@ -1626,6 +1626,23 @@ describe('#4315 mandatory referral protocol', () => {
       expect(carry('Missing authorization check, validation absent in handler', 46, 'Missing validation')).toBeNull();
     });
     it.each([
+      ['a diff-prefixed alias of the ruled path', 'a/scripts/api/handler.mjs'],
+      ['a b/-prefixed alias of the ruled path', 'b/scripts/api/handler.mjs'],
+    ])('does not carry across %s (a real a/ or b/ directory is a different file)', (_, alias) => {
+      const { r, ops } = ruled('Missing validation of the request payload');
+      const ctx = { records: [r], operatorRulings: ops, head: 'a'.repeat(40), repo: r.repo, pr: r.pr };
+      const same = { ...finding, file, line: 41, summary: 'Missing validation of the request payload' };
+      expect(findCarriedOperatorRuling({ finding: normalizeFinding(same) }, ctx)?.result).toBe('not-real'); // control
+      expect(findCarriedOperatorRuling({ finding: normalizeFinding({ ...same, file: alias }) }, ctx)).toBeNull();
+    });
+    it('still tolerates a ./ prefix and a :line suffix on the cited path', () => {
+      const { r, ops } = ruled('Missing validation of the request payload');
+      const ctx = { records: [r], operatorRulings: ops, head: 'a'.repeat(40), repo: r.repo, pr: r.pr };
+      const same = { ...finding, line: 41, summary: 'Missing validation of the request payload' };
+      expect(findCarriedOperatorRuling({ finding: normalizeFinding({ ...same, file: `./${file}` }) }, ctx)?.result).toBe('not-real');
+      expect(findCarriedOperatorRuling({ finding: normalizeFinding({ ...same, file: `${file}:41` }) }, ctx)?.result).toBe('not-real');
+    });
+    it.each([
       ['a higher impact', { impactIfUnfixed: 'unrecoverable' }],
       ['a different verdict', { verdict: 'PLAUSIBLE' }],
       ['no declared impact', { impactIfUnfixed: undefined }],

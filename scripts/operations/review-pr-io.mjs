@@ -1,7 +1,7 @@
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
-  findCarriedOperatorRuling, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
+  findCarriedOperatorRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
 import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
@@ -766,7 +766,8 @@ export function createReviewPrSinks({
               if (match.result === 'card' && !cardReadable(match.card)) continue;
               let changed;
               try {
-                const file = String(f.finding.file ?? '').trim().replace(/^(?:\.\/|[ab]\/)/, '').replace(/:\d+(?::\d+)?$/, '');
+                // The exact cited path: an `a/` or `b/` prefix may be a real directory, so it is never stripped for a lookup.
+                const file = exactCitedPath(f.finding.file);
                 changed = await changedLines(record.repo, match.from.head, record.head, file);
               } catch { changed = null; }
               if (!(changed instanceof Set)) continue;

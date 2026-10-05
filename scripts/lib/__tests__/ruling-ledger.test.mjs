@@ -8,11 +8,11 @@ import {
 const repo = 'web-everything/web-everything';
 const H1 = 'a'.repeat(40), H2 = 'b'.repeat(40), H3 = 'c'.repeat(40);
 const t = (n) => new Date(Date.parse('2026-10-03T08:00:00Z') + n * 60_000).toISOString();
-const finding = (summary, file = 'policy/pointer.md') => ({ summary, file, line: 12, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' });
+const finding = (summary, file = 'policy/pointer.md', extra = {}) => ({ summary, file, line: 12, verdict: 'CONFIRMED', impactIfUnfixed: 'broken', ...extra });
 const SUMMARY = 'policy pointer files are missing from the standards manifest so the gate cannot see them';
 
-function record({ head, runId, summary = SUMMARY, file, rulings = [] }) {
-  const original = finding(summary, file);
+function record({ head, runId, summary = SUMMARY, file, rulings = [], extra }) {
+  const original = finding(summary, file, extra);
   const key = referralFindingKey('judge', original);
   const reviewer = mandatoryReferralReviewer(runId);
   return { version: 1, repo, pr: 3794, head, runId, reviewer, authorBody: '<!-- authored-by-actor: author -->',
@@ -111,6 +111,39 @@ describe('ignoredRulings', () => {
       const unrelated = record({ head: H1, runId: 'run-0', summary: 'standards manifest missing' });
       const comments = [...history, comment(unrelated, 2), opNotReal(unrelated, 4), comment(record({ head: H2, runId: 'run-2' }), 20)];
       expect(ignoredRulings({ headRefOid: H2, comments })?.matches).toHaveLength(1);
+    });
+    // An operator overrule is scoped to the instance the operator saw: the same words at another place, or at another
+    // severity, are a different finding, so the earlier ruling must not overrule a standing block on it.
+    it.each([
+      ['a different line (beyond the window)', { line: 200 }],
+      ['a different impact', { impactIfUnfixed: 'unrecoverable' }],
+    ])('an operator not-real on one instance does not overrule a same-summary block at %s', (_, extra) => {
+      const ruledInstance = record({ head: H1, runId: 'run-0' });
+      const blocked = record({ head: H1, runId: 'run-1', extra });
+      const comments = [comment(blocked, 1), comment(record({ head: H1, runId: 'run-1', extra, rulings: [block] }), 3),
+        comment(ruledInstance, 4), opNotReal(ruledInstance, 5), comment(record({ head: H2, runId: 'run-2', extra }), 20)];
+      expect(ignoredRulings({ headRefOid: H2, comments })?.matches).toHaveLength(1);
+      // control: the SAME instance (same line and severity) is overruled
+      const same = [comment(record({ head: H1, runId: 'run-1' }), 1), comment(record({ head: H1, runId: 'run-1', rulings: [block] }), 3),
+        comment(ruledInstance, 4), opNotReal(ruledInstance, 5), comment(record({ head: H2, runId: 'run-2' }), 20)];
+      expect(ignoredRulings({ headRefOid: H2, comments: same })).toBeNull();
+    });
+    // reviewer block -> operator not-real -> operator block: the LATEST operator ruling decides, so the block stands.
+    it.each([false, true])('a later operator block withdraws an intervening operator not-real overrule (carried block: %s)', (carriedBlock) => {
+      const r1 = record({ head: H1, runId: 'run-1' });
+      const opBlock = (rec, n) => ({ author: { login: 'chalbert' }, createdAt: t(n),
+        body: buildOperatorRulingComment({ version: 1, repo, pr: rec.pr, head: rec.head, actor: 'chalbert', channel: 'test',
+          reason: 'it is real after all', at: t(n), clearerId: '', rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result: 'block' }] }) });
+      const r3 = record({ head: H3, runId: 'run-3' });
+      const key = r3.referrals[0].key;
+      const current = carriedBlock ? { ...r3, carried: [{ key, reason: REFERRAL_CARRY_REASON,
+        from: { head: H1, runId: 'run-1', key }, result: 'block' }] } : r3;
+      const base = [comment(r1, 1), comment(record({ head: H1, runId: 'run-1', rulings: [block] }), 3), opNotReal(r1, 4)];
+      // control: without the later block, the not-real overrule stands and nothing is ignored
+      expect(ignoredRulings({ headRefOid: H3, comments: [...base, comment(current, 20)] })).toBeNull();
+      const ig = ignoredRulings({ headRefOid: H3, comments: [...base, opBlock(r1, 6), comment(current, 20)] });
+      expect(ig?.matches).toHaveLength(1);
+      expect(ig.matches[0].priorHead).toBe(H1);
     });
     it('a reworded operator overrule of the SAME finding still overrules it', () => {
       const reworded = record({ head: H1, runId: 'run-0', summary: 'the policy pointer files are still missing from the standards manifest, so the gate cannot see them' });
