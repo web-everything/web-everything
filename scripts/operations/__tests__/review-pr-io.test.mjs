@@ -1838,6 +1838,18 @@ describe('#5135 latest fix range', () => {
     ].join('\n');
     expect(read(() => diff)).toEqual({ priorHead, head, files: { 'a.js': [1, 2, 12, 13, 21], 'old.js': null, 'pic.png': null, 'run.sh': [] } });
   });
+  it('keys a headers-only section by its real path when the path itself contains " b/"', () => {
+    const diff = [
+      'diff --git a/assets/a b/icon.png b/assets/a b/icon.png', 'Binary files a/assets/a b/icon.png and b/assets/a b/icon.png differ',
+      'diff --git a/run b/x.sh b/run b/x.sh', 'old mode 100644', 'new mode 100755',
+      'diff --git "a/q b/\\"z\\".png" "b/q b/\\"z\\".png"', 'Binary files differ',
+    ].join('\n');
+    expect(read(() => diff)).toEqual({ priorHead, head, files: { 'assets/a b/icon.png': null, 'run b/x.sh': [], 'q b/"z".png': null } });
+  });
+  it('refuses a headers-only section whose two sides do not name the same path', () => {
+    const diff = ['diff --git a/one b/two', 'old mode 100644', 'new mode 100755'].join('\n');
+    expect(read(() => diff)).toEqual({ priorHead, head, error: 'diff-unparseable' });
+  });
   it('splits file sections only at a real LF line start, so CR / U+2028 / U+2029 / NEL in an added line cannot forge one', () => {
     for (const breaker of ['\r', ' ', ' ', '\u0085', '\v', '\f']) {
       const diff = [

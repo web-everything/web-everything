@@ -2233,6 +2233,22 @@ describe('#5135 later-round advisory scope', () => {
     expect(finding).not.toHaveProperty('deferred');
   });
 
+  it('keeps a touched file cited by a basename, absolute path or prefixed alias, the same forms the admission step accepts', () => {
+    const files = { 'src/a.mjs': [100], 'docs/x b/n.md': null };
+    for (const file of ['a.mjs', '/abs/checkout/src/a.mjs', 'we:src/a.mjs', 'a/src/a.mjs', 'src/a.mjs:101']) {
+      const f = { ...finding, file, line: 101 };
+      expect(classify([f], { latestFix: { ...latestFix, files } }), file).toEqual({ kept: [f], deferred: [], scope: 'changed-only', fellBack: null });
+    }
+    const md = { ...finding, file: 'n.md', line: null };
+    expect(classify([md], { latestFix: { ...latestFix, files } }).kept).toEqual([md]);
+  });
+  it('still defers a far line on an alias-cited touched file and a file the fix never touched', () => {
+    const far = { ...finding, file: 'a.mjs', line: 150 };
+    const other = { ...finding, file: 'src/other.mjs', line: 100 };
+    const result = classify([far, other]);
+    expect(result.kept).toEqual([]);
+    expect(result.deferred.map(f => f.file)).toEqual(['a.mjs', 'src/other.mjs']);
+  });
   it.each(['correctness', 'security'])('never scopes %s', lens => {
     expect(classify([finding], { lens }).kept).toEqual([finding]);
   });

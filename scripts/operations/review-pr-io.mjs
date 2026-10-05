@@ -349,7 +349,16 @@ export function readLatestFixRange(options = {}) {
       const newPath = lines.find(line => line.startsWith('+++ '))?.slice(4);
       const oldPath = lines.find(line => line.startsWith('--- '))?.slice(4);
       const deleted = newPath === '/dev/null';
-      const headerPath = lines[0].match(/^(?:"a\/.*"|a\/.*?) ("b\/.*"|b\/.*)$/)?.[1];
+      // `--no-renames` makes both sides the same path, so the header is `a/P b/P`: split at the exact midpoint (a path
+      // may itself contain ` b/`) and refuse a header whose sides differ rather than guess.
+      const headerPath = (() => {
+        const quoted = lines[0].match(/^("a\/.*") ("b\/.*")$/);
+        if (quoted) return quoted[1].slice(2) === quoted[2].slice(2) ? quoted[2] : null;
+        const half = (lines[0].length - 5) / 2;
+        return Number.isInteger(half) && half > 0 && lines[0][2 + half] === ' '
+          && lines[0].startsWith('a/') && lines[0].slice(3 + half, 5 + half) === 'b/'
+          && lines[0].slice(2, 2 + half) === lines[0].slice(5 + half) ? lines[0].slice(3 + half) : null;
+      })();
       const rawPath = deleted ? oldPath : newPath ?? headerPath;
       const path = rawPath && decodePath(rawPath).replace(/^[ab]\//, '').replace(/\t$/, '');
       if (!path) return { priorHead, head, error: 'diff-unparseable' };

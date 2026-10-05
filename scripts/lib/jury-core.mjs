@@ -1267,7 +1267,10 @@ export function classifyLaterRoundAdvisory(findings, options = {}) {
   const kept = [];
   const deferred = [];
   for (const finding of list) {
-    const path = typeof finding?.file === 'string' ? exactCitedPath(finding.file) : '';
+    const cited = typeof finding?.file === 'string' ? exactCitedPath(finding.file) : '';
+    // Resolve through the SAME lenient matcher the admission step used (basename, absolute path, repo prefix), so a
+    // touched file cited in an alias form is never mistaken for an untouched one and deferred.
+    const path = cited && (Object.hasOwn(files, cited) ? cited : matchCitedPath(finding.file, Object.keys(files))) || cited;
     const line = Number.isInteger(finding?.line) && finding.line > 0 ? finding.line : null;
     const touched = Object.hasOwn(files, path);
     if (!path || (touched && (files[path] === null || !isSourcePath(path) || line === null
