@@ -1599,6 +1599,21 @@ describe('#4315 mandatory referral protocol', () => {
     }
   });
 
+  // Append-only prefix tamper: a later snapshot of the same record can neither drop nor rewrite a carry an earlier
+  // snapshot made (a stripped carry would silently re-open, or a rewritten one silently re-decide, the finding).
+  it.each(['dropped', 'result rewritten', 'origin rewritten'])('a later snapshot with the carry %s is malformed', kind => {
+    const first = record(), key = first.referrals[0].key;
+    first.carried = [{ key, result: 'not-real', from: { head: 'b'.repeat(40), runId: 'old', key },
+      reason: 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged' }];
+    const next = structuredClone(first);
+    if (kind === 'dropped') delete next.carried;
+    if (kind === 'result rewritten') next.carried[0].result = 'block';
+    if (kind === 'origin rewritten') next.carried[0].from.runId = 'other';
+    expect(validateReferralRecord(next)).toBe(true);
+    expect(readReferralRecords([first].map(r => post(renderReferralRecord(r))), { head: first.head }).malformed).toBe(false);
+    expect(readReferralRecords([first, next].map(r => post(renderReferralRecord(r))), { head: first.head }).malformed).toBe(true);
+  });
+
   // Precedence matrix: a carried operator ruling must never override a ruling the reviewer already recorded
   // on this head, whatever either one says. The reviewer's own ruling decides; carry only fills the gap.
   it.each([

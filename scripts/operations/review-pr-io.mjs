@@ -464,6 +464,35 @@ function boundedReferral(original, source) {
 }
 
 /**
+ * The `files` of a GitHub compare, or `null` when the compare cannot speak for "old head → new head". `base...head`
+ * is a THREE-dot compare: it diffs the merge base against `head`, so it equals the old→new diff only when `base`
+ * is an ancestor of `head` (`status` `ahead`, or `identical`). After a force-push/rebase the heads are `diverged`
+ * (or `behind`), and a file the old head changed but the new head reverted is absent from `files` — which would
+ * read as "provably unchanged". Anything else, including a missing `status`, is unknown and never clears.
+ * PURE — table-testable apart from the `gh` call.
+ */
+export function comparedFiles(compare) {
+  if (!compare || !Array.isArray(compare.files)) return null;
+  return compare.status === 'ahead' || compare.status === 'identical' ? compare.files : null;
+}
+
+/** How far around a cited line a change still counts as touching it (the carry's "cited lines" margin). */
+export const CARRY_LINE_MARGIN = 3;
+
+/**
+ * Does a change in `changed` (new-side lines) touch the region a carried ruling spoke for? The finding matcher
+ * tolerates a `CORROBORATION_LINE_WINDOW` offset between the old finding (the one the operator ruled on) and the
+ * new one, so the region is the whole span from the earlier cited line to the later one, plus the margin —
+ * checking only the new finding's line would let a rewrite of the old region slip through. PURE.
+ */
+export function carryTouchesChange(changed, oldLine, newLine) {
+  const cited = [oldLine, newLine].filter(Number.isInteger);
+  if (!cited.length) return changed.size > 0;
+  const lo = Math.min(...cited) - CARRY_LINE_MARGIN, hi = Math.max(...cited) + CARRY_LINE_MARGIN;
+  return [...changed].some(n => n >= lo && n <= hi);
+}
+
+/**
  * The new-side line numbers a GitHub compare (`files` array) changed in one file, or `null` when the compare
  * cannot PROVE which lines changed (missing/failed compare, a 300-file truncation, a rename, a missing or
  * hunk-less patch, a deleted file). `null` never clears anything: the caller treats it as "do not carry".
@@ -515,6 +544,9 @@ export function createReviewPrSinks({
   env = process.env,
   referralJudge = judgeSpawn,
   readChangedLines,
+  readCompare = (repo, base, head) => JSON.parse(execFileSyncThrottled('gh',
+    ['api', `repos/${repo}/compare/${base}...${head}`],
+    { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })),
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
   cardReadable = (ref) => referralCardReadable(ref, root),
   // #xstdout-json — A `--json` CALLER WANTS STDOUT TO BE ONE PARSEABLE DOCUMENT, END TO END. The `NOTICE`
@@ -554,12 +586,8 @@ export function createReviewPrSinks({
       const changedLines = readChangedLines ?? ((repo, base, head, file) => {
         const key = JSON.stringify([repo, base, head]);
         if (!comparisons.has(key)) {
-          try {
-            const value = JSON.parse(execFileSyncThrottled('gh',
-              ['api', `repos/${repo}/compare/${base}...${head}`],
-              { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024 }));
-            comparisons.set(key, Array.isArray(value.files) ? value.files : null);
-          } catch { comparisons.set(key, null); }
+          try { comparisons.set(key, comparedFiles(readCompare(repo, base, head))); }
+          catch { comparisons.set(key, null); }
         }
         return changedLinesFromCompare(comparisons.get(key), file);
       });
@@ -730,8 +758,7 @@ export function createReviewPrSinks({
                 changed = await changedLines(record.repo, match.from.head, record.head, file);
               } catch { changed = null; }
               if (!(changed instanceof Set)) continue;
-              const line = f.finding.line;
-              if (line == null ? changed.size > 0 : [...changed].some(n => n >= line - 3 && n <= line + 3)) continue;
+              if (carryTouchesChange(changed, match.finding.line, f.finding.line)) continue;
               carried.push({ key: f.key, reason: REFERRAL_CARRY_REASON, from: match.from,
                 result: match.result, ...(match.card ? { card: match.card } : {}) });
             }

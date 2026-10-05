@@ -1,6 +1,7 @@
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
 import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
+import { referralCardReadable, referralLiveContext } from './lib/referral-live-context.mjs';
 /**
  * review-set-label.mjs — swap a PR's review label, INVARIANT-2 guarded (#2470, increment 2 of 2). Also the
  * SINGLE HOME of the shared review-label CLI harness (#2644): a PURE `decideSetLabel` decides the swap for a
@@ -1976,30 +1977,14 @@ function ghErr(e, fallback) {
 }
 
 
-/** A deferral is discharged only by an existing readable backlog card, never an intention to file. */
-export function referralCardReadable(ref, root = process.cwd()) {
-  if (!/^we:backlog\/[^/]+\.md$/.test(ref ?? '')) return false;
-  const card = text => /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(text);
-  try { return card(readFileSync(`${root}/${ref.slice(3)}`, 'utf8')); }
-  catch {
-    // #4979 — a provisional card (`x…`) is renumbered when it lands (#2288 JIT numbering); a ruling that cited
-    // it by its birth name still names that card through the landed file's `bornAs:`.
-    const born = /^we:backlog\/(x[a-z0-9]{6})-/.exec(ref)?.[1];
-    if (!born) return false;
-    try {
-      return readdirSync(`${root}/backlog`).some(name => name.endsWith('.md') && /^\d+-/.test(name) && (() => {
-        const text = readFileSync(`${root}/backlog/${name}`, 'utf8');
-        return card(text) && new RegExp(`^bornAs:[ \\t]*["']?${born}["']?[ \\t]*$`, 'm').test(text.split(/\r?\n---\r?\n/)[0]);
-      })());
-    } catch { return false; }
-  }
-}
+// Defined once in the shared live-state module so the review hold reads the gate's exact card rule.
+export { referralCardReadable };
 
 /** Fail closed at every acceptance entry point using the fresh durable PR record. */
 export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable = referralCardReadable,
   env = process.env, readRuns = readReviewRunEvidence } = {}) {
-  const context = { repo, pr, head: state.headRefOid, body: typeof state.body === 'string' ? state.body : '',
-    createdAt: state.createdAt, cardReadable, seatDisabled: seat => referralSeatDisabled(seat, env) };
+  const context = referralLiveContext(state, { repo, pr, cardReadable,
+    seatDisabled: seat => referralSeatDisabled(seat, env) });
   const result = mandatoryReferralState(state.comments, context);
   const head = state.headRefOid;
   const mine = r => r.repo === repo && r.pr === Number(pr) && r.head === head;

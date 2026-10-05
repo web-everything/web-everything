@@ -6,7 +6,8 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
-import { parseOperatorRulingComment, mandatoryReferralState, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
+import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER } from '../lib/jury-core.mjs';
+import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -101,9 +102,9 @@ export function decideReferralHold(pr, runs, { repo, now = Date.now(), env = pro
     ? last.completedAt + REFERRAL_RETRY_MS[streak - 1] : null;
   if (retryAt !== null && now >= retryAt) return null;
   if (!last.persistenceFailed && env.WE_REFERRAL_HOLD_LIVE_RELEASE !== '0') {
-    const live = mandatoryReferralState(pr.comments, {
-      repo, pr: Number(pr.number), head: pr.headRefOid, cardReadable: () => true,
-    });
+    // Read exactly as the gate reads it (readable-card rule, author stamp, PR body/createdAt): a release the
+    // gate would immediately re-park loops the review on every tick, which this hold exists to prevent.
+    const live = liveReferralState(pr, { repo, pr: Number(pr.number) });
     if (!live.pending.length && live.records.some(r => r.head === pr.headRefOid
       && r.repo === repo && r.pr === Number(pr.number))) return null;
   }

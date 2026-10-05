@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  PR_VIEW_FIELDS, changedLinesFromCompare, createReviewPrReader, createReviewPrSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
+  PR_VIEW_FIELDS, carryTouchesChange, changedLinesFromCompare, comparedFiles, createReviewPrReader, createReviewPrSinks, filePrView, ghPrView, isPreWriteRefusal, priorRoundsFor,
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
   resolveSubjectCheckout,
 } from '../review-pr-io.mjs';
@@ -1040,8 +1040,40 @@ describe('changedLinesFromCompare (the compare payload → changed new-side line
   });
 });
 
+describe('comparedFiles (a compare speaks for old→new only when old is an ancestor of new)', () => {
+  const files = [{ filename: 'x.mjs', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b\n' }];
+  it.each([
+    ['ahead (old is an ancestor of new)', { status: 'ahead', files }, files],
+    ['identical', { status: 'identical', files: [] }, []],
+    ['diverged (force-push / rebase): the three-dot diff is merge-base→new, not old→new', { status: 'diverged', files }, null],
+    ['behind', { status: 'behind', files }, null],
+    ['no status', { files }, null],
+    ['no files array', { status: 'ahead' }, null],
+    ['no compare', null, null],
+  ])('%s', (_name, compare, expected) => {
+    expect(comparedFiles(compare)).toEqual(expected);
+  });
+});
+
+describe('carryTouchesChange (the region a carried ruling spoke for)', () => {
+  it.each([
+    ['change on the new line', [45], 38, 45, true],
+    ['change within the margin of the new line', [48], 38, 45, true],
+    ['change on the OLD line only (the rewritten region the operator ruled on)', [36], 38, 45, true],
+    ['change in the gap between the old and new lines', [41], 38, 45, true],
+    ['change beyond both margins', [10, 60], 38, 45, false],
+    ['no change', [], 38, 45, false],
+    ['no cited line + any change', [3], null, null, true],
+    ['no cited line + no change', [], null, null, false],
+    ['same line both sides', [20], 12, 12, false],
+    ['same line both sides, change at the margin', [15], 12, 12, true],
+  ])('%s', (_name, lines, oldLine, newLine, touched) => {
+    expect(carryTouchesChange(new Set(lines), oldLine, newLine)).toBe(touched);
+  });
+});
+
 describe('#4315 durable referral effects', () => {
-  function harness({ result = 'not-real', failure, env = {}, readChangedLines = () => new Set() } = {}) {
+  function harness({ result = 'not-real', failure, env = {}, readCompare, readChangedLines = readCompare ? undefined : () => new Set() } = {}) {
     const head = 'a'.repeat(40), trace = [], lines = [];
     let posts = 0;
     const state = { headRefOid: head, body: '<!-- authored-by-actor: author -->', comments: [], labels: ['review:pending'] };
@@ -1071,7 +1103,7 @@ describe('#4315 durable referral effects', () => {
           card: result === 'card' ? 'we:backlog/7-filed.md' : '',
         })) } };
     });
-    const make = () => createReviewPrSinks({ root, env, readChangedLines, labelProvider: provider, referralJudge: judge,
+    const make = () => createReviewPrSinks({ root, env, readChangedLines, readCompare, labelProvider: provider, referralJudge: judge,
       mirrorReferral: record => trace.push(`mirror:${record.attempted}`), out: line => lines.push(line), cardReadable: () => failure !== 'card' });
     return { state, trace, lines, payload, judge, make, provider };
   }
@@ -1100,6 +1132,62 @@ describe('#4315 durable referral effects', () => {
       expect(h.judge).toHaveBeenCalledOnce();
       expect(result.pending).toContain(current.referrals[0].key);
     }
+  });
+
+  // An earlier operator not-real on `oldLine` of the old head, re-emitted by a reviewer at `newLine` of this head.
+  async function carryScenario(h, { oldLine, newLine }) {
+    h.payload.referrals[0].original.line = oldLine;
+    const old = seedReferrals(h, ['judgeCorrectnessAdvisory']);
+    const original = { ...old.referrals[0].original, line: newLine };
+    const current = { ...old, head: h.state.headRefOid, runId: 'current', reviewer: mandatoryReferralReviewer('current'),
+      attempted: false, referrals: [{ seat: 'judgeCorrectnessAdvisory', original, finding: normalizeFinding(original),
+        key: referralFindingKey('judgeCorrectnessAdvisory', original) }] };
+    h.state.comments.push({ body: renderReferralRecord(current), author: { login: 'web-everything' } });
+    h.state.comments.push({ author: { login: 'chalbert' }, body: buildOperatorRulingComment({
+      version: 1, repo: old.repo, pr: old.pr, head: old.head, actor: 'chalbert', channel: 'test',
+      reason: 'not a defect', at: '2026-10-04T12:00:00Z', clearerId: '',
+      rulings: [{ runId: old.runId, key: old.referrals[0].key, result: 'not-real' }],
+    }) });
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    return readReferralRecords(h.state.comments).records.find(r => r.runId === 'current');
+  }
+
+  // The finding matcher tolerates an 8-line offset between the old and new cited lines, so the carry must check the
+  // region around BOTH: a rewrite of the old region sits next to, not on, the new finding's line.
+  it.each([
+    ['a rewrite of the old region only', [36], false],
+    ['a rewrite of the new region only', [47], false],
+    ['no change near either', [5, 90], true],
+  ])('carries across an old/new line offset only when neither region changed: %s', async (_name, changed, carries) => {
+    const h = harness({ failure: 'omitted', readChangedLines: () => new Set(changed) });
+    const latest = await carryScenario(h, { oldLine: 38, newLine: 45 });
+    // The earlier head's own finding is also carried onto this head (as its own record), so assert on `current`.
+    const judged = h.judge.mock.calls.map(c => c[0].runId);
+    if (carries) { expect(latest.carried).toHaveLength(1); expect(judged).not.toContain('current'); }
+    else { expect(latest.carried).toBeUndefined(); expect(judged).toContain('current'); }
+  });
+
+  // End to end through the DEFAULT compare reader: after a force-push the heads are `diverged`, and the three-dot
+  // payload omits a file the old head changed and the new head reverted. That must read as unknown, never unchanged.
+  it.each([
+    ['ahead', 'ahead', true],
+    ['diverged', 'diverged', false],
+    ['behind', 'behind', false],
+    ['status missing', undefined, false],
+  ])('divergent heads never prove the cited lines unchanged (compare status: %s)', async (_name, status, carries) => {
+    const readCompare = vi.fn(() => ({ ...(status ? { status } : {}), files: [{ filename: 'other.mjs', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b\n' }] }));
+    const h = harness({ failure: 'omitted', readCompare });
+    const latest = await carryScenario(h, { oldLine: 12, newLine: 12 });
+    expect(readCompare).toHaveBeenCalledOnce();
+    if (carries) { expect(latest.carried).toHaveLength(1); expect(h.judge).not.toHaveBeenCalled(); }
+    else { expect(latest.carried).toBeUndefined(); expect(h.judge).toHaveBeenCalledOnce(); }
+  });
+
+  it('a failing compare call never carries', async () => {
+    const h = harness({ failure: 'omitted', readCompare: () => { throw new Error('gh unavailable'); } });
+    const latest = await carryScenario(h, { oldLine: 12, newLine: 12 });
+    expect(latest.carried).toBeUndefined();
+    expect(h.judge).toHaveBeenCalledOnce();
   });
 
   it('never carries an operator ruling onto a finding the reviewer already ruled on this head', async () => {
