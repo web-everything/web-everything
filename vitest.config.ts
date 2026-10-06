@@ -1,5 +1,5 @@
 import { configDefaults, defineConfig } from 'vitest/config';
-import { maxTestWorkers, minimalGitTemplateEnv, weAlias } from './vitest.shared';
+import { hermeticGitEnv, maxTestWorkers, weAlias } from './vitest.shared';
 import { TRUST_CHAIN_TIER_FILES } from './scripts/lib/trust-chain-tier.mjs';
 
 export default defineConfig({
@@ -24,9 +24,9 @@ export default defineConfig({
     // tmp-leak fix: one private temp root per run, leak count reported + root removed at teardown
     // (scripts/lib/test-tmp-root.mjs; WE_TMP_LEAK_MODE / WE_TMP_LEAK_MAX).
     globalSetup: ['./vitest.globalSetup.mjs'],
-    // Minimal git template for every throwaway `git init`/`clone` (no inert sample-hook copies) — cuts file-event
-    // churn from the real-git lane-pool tests in this tier; see vitest.shared.ts#minimalGitTemplateEnv.
-    env: minimalGitTemplateEnv(),
+    // Isolate spawned git from host config and skip inert sample-hook copies in throwaway repos.
+    // See vitest.shared.ts#hermeticGitEnv.
+    env: hermeticGitEnv(),
     // #x1jcikc: cap this invocation's own worker count (see vitest.shared.ts#maxTestWorkers for the sizing
     // rationale) — otherwise the ~2000-file suite defaults to one thread per CPU core, which is how two
     // concurrently-admitted `test:unit` runs oversubscribe a 12-core host.

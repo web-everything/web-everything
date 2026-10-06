@@ -1,6 +1,6 @@
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { availableParallelism, cpus, tmpdir } from 'node:os';
 
 // #449 (per #606): WE consumes the plug platform layer as the `@frontierui/plugs` package — dev-time
@@ -60,4 +60,19 @@ export function minimalGitTemplateEnv(): { GIT_TEMPLATE_DIR: string } {
     writeFileSync(exclude, "# git ls-files --others --exclude-from=.git/info/exclude\n# Lines that start with '#' are comments.\n");
   }
   return { GIT_TEMPLATE_DIR: dir };
+}
+
+// Keep host performance settings and credential helpers out of test repos. Supply an identity
+// for fixtures that commit without setting one, while leaving git's default branch unchanged.
+export function hermeticGitEnv(): Record<string, string> {
+  const config = join(tmpdir(), 'we-test-gitconfig');
+  const contents = '[user]\n\tname = WE Test\n\temail = test@example.invalid\n';
+  if (!existsSync(config) || readFileSync(config, 'utf8') !== contents) {
+    writeFileSync(config, contents);
+  }
+  return {
+    ...minimalGitTemplateEnv(),
+    GIT_CONFIG_GLOBAL: config,
+    GIT_CONFIG_NOSYSTEM: '1',
+  };
 }
