@@ -4,6 +4,7 @@
 import { readFileSync } from 'node:fs';
 import { runGhSync, execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { ghRestGetPaged } from '../lib/gh-rest-read.mjs';
+import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
 
 // #3383 — `baseRefName` joined the union once `reconcile-pass.mjs` and `parked-pr-conflict-watch.mjs` each
 // started reading it (the STACKED-BASE CONFLICT branch needs it to tell a PR stacked on another lane/PR apart
@@ -17,12 +18,12 @@ export const OPEN_PR_LIST_FIELDS = 'number,headRefName,title,body,labels,files,m
 export const PR_LIST_LIMIT = 200;
 
 /** Throws on a failed fetch so the runner can fall back to each pass's standalone discovery. */
-export function defaultFetchOpenPrs({ repo = null, exec = runGhSync } = {}) {
+export function defaultFetchOpenPrs({ repo = null, exec = runGhSync, readComments } = {}) {
   const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', OPEN_PR_LIST_FIELDS];
   if (repo) argv.push('--repo', repo);
   const out = exec(argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
   const parsed = JSON.parse(String(out || '[]'));
-  return Array.isArray(parsed) ? parsed : [];
+  return Array.isArray(parsed) ? enrichPrsWithCompleteComments(parsed, { repo, ...(readComments ? { readComments } : {}) }) : [];
 }
 
 /** A missing, malformed, or non-array snapshot is an empty safe list, never another network read. */
