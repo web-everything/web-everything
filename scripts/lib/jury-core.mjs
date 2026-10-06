@@ -583,14 +583,54 @@ export function findingIdentityEntry(finding, findingId, { heads = [] } = {}) {
   return identity ? { findingId, ...identity, summary: normalizeFinding(finding).summary, heads: [...heads], keys: [], rulings: [] } : null;
 }
 
+// ── #76b DECLARED LINKS (`sameAs`) ─────────────────────────────────────────────────────────────────────────────
+// A re-wording that shares no normalized claim and no quote with its earlier self (#4017's "concurrent filing"
+// finding, worded four ways across six heads) is bound only by a DECLARED link: the mandatory referral reviewer, shown
+// the PR's identity table, answers `sameAs: <findingId>` per referral, recorded on its append-only ruling. A link is
+// honored only when the structure does not contradict it — same non-empty path, same lens, and (when both sides cite
+// lines) a cited line within CORROBORATION_LINE_WINDOW of one the id already holds. Anything else stays a separate id:
+// when unsure, keep separate. A link is never a clearance: it can make a wording inherit a BLOCK on its id (a
+// tightening), never a not-real or a card (see `linkedBlockedFindingIds`).
+
+/** The literal instruction the referral reviewer gets for `sameAs` (shared by the sink and the #76b replay). */
+export const FINDING_SAME_AS_MANDATE = 'Each referral carries its own findingId. Known findings on this PR are listed '
+  + 'with their findingId, path, lens, cited lines, summary and latest ruling. For each ruling also return sameAs: the '
+  + 'findingId of a known finding that this referral reports as the SAME defect (same file, same root cause, merely '
+  + 'worded differently), or "new". Answer "new" when unsure or when the defects merely look alike. sameAs never '
+  + 'changes your ruling: rule every referral on its own evidence.';
+
+/**
+ * May a declared `sameAs` bind `finding` to `entry`? The structural guard every declared link passes — at record time
+ * (the sink) and at read time ({@link findingIdentityTable}). PURE.
+ */
+export function sameAsLinkAllowed(entry, finding) {
+  const identity = normalizeFindingIdentity(finding);
+  if (!entry || !identity || !entry.path || entry.path !== identity.path || entry.lens !== identity.lens) return false;
+  const line = normalizeFinding(finding)?.line;
+  const lines = (entry.lines ?? []).filter(Number.isInteger);
+  return !Number.isInteger(line) || !lines.length || lines.some((l) => Math.abs(l - line) <= CORROBORATION_LINE_WINDOW);
+}
+
+/** The table rows the referral reviewer sees: one per id, never the raw finding bodies. PURE. */
+export function findingIdentityPromptRows(table = []) {
+  return (Array.isArray(table) ? table : []).map((e) => ({ findingId: e.findingId, path: e.path || null, lens: e.lens,
+    lines: [...new Set(e.lines ?? [])], summary: e.summary, latestRuling: e.rulings.at(-1)?.result ?? null }));
+}
+
+/** The `sameAs` a referral declares: on the referral entry (#76a), else on the latest ruling of its key (#76b). */
+const declaredSameAs = (record, f) => f.sameAs
+  ?? (record.rulings ?? []).filter((r) => r.key === f.key && FINDING_ID_PATTERN.test(r.sameAs ?? '')).at(-1)?.sameAs;
+
 /**
  * The PR's finding-identity table, folded over referral records in their append order. Each referral binds, in
- * order, to: its stored `findingId`; a declared `sameAs` naming an existing id on the SAME path (a mismatched path
- * is refused, i.e. treated as new); the deterministic test ({@link sameFindingIdentity}); else a freshly minted id.
+ * order, to: its stored `findingId`; a declared `sameAs` (on the referral entry, or on its key's ruling, #76b) naming
+ * an existing id that passes {@link sameAsLinkAllowed} (else refused, i.e. treated as new); the deterministic test
+ * ({@link sameFindingIdentity}); else a freshly minted id.
  * Binding is a lookup, never a clearance: the table says which records talk about one finding, and every gate rule
  * that could CLEAR on it adds its own unchanged-code test (#76b). PURE.
  * @returns {Array<{findingId: string, path: string, lens: string, normSummary: string, anchor: string,
- *   summary: string, firstSeenHead: string, heads: string[], keys: Array<{head: string, runId: string, key: string}>,
+ *   summary: string, firstSeenHead: string, heads: string[], lines: number[],
+ *   keys: Array<{head: string, runId: string, key: string}>,
  *   rulings: Array<{head: string, runId: string, key: string, result: string}>}>}
  */
 export function findingIdentityTable(records = []) {
@@ -601,14 +641,19 @@ export function findingIdentityTable(records = []) {
       const identity = normalizeFindingIdentity(f.original ?? f.finding);
       if (!identity) continue;
       let entry = FINDING_ID_PATTERN.test(f.findingId ?? '') ? byId.get(f.findingId) : undefined;
-      if (!entry && FINDING_ID_PATTERN.test(f.sameAs ?? '')) {
-        const declared = byId.get(f.sameAs);
-        if (declared && declared.path && declared.path === identity.path) entry = declared;
+      const sameAs = declaredSameAs(record, f);
+      if (!entry && FINDING_ID_PATTERN.test(sameAs ?? '')) {
+        const declared = byId.get(sameAs);
+        // #76b — the structural guard: same path, same lens, no contradicting cited line.
+        if (sameAsLinkAllowed(declared, f.original ?? f.finding)) entry = declared;
       }
       // A declared `sameAs: 'new'` is the record's own answer that this is a distinct finding: the deterministic
       // test must not override it.
       if (!entry && !FINDING_ID_PATTERN.test(f.findingId ?? '') && f.sameAs !== FINDING_SAME_AS_NEW) {
-        entry = table.find((e) => sameFindingIdentity(e, identity, { sameHead: e.heads.includes(record.head) }));
+        // Every wording already bound to an entry (deterministically or by a declared link) is one of its forms, so a
+        // later copy of ANY of them binds deterministically too (#76b).
+        entry = table.find((e) => (e.forms ?? [e]).some((form) => sameFindingIdentity({ ...e, ...form }, identity,
+          { sameHead: e.heads.includes(record.head) })));
       }
       if (!entry) {
         let findingId = FINDING_ID_PATTERN.test(f.findingId ?? '') ? f.findingId
@@ -619,9 +664,15 @@ export function findingIdentityTable(records = []) {
             normSummary: `${identity.normSummary}#${n}` });
         }
         entry = { findingId, ...identity, summary: normalizeFinding(f.original ?? f.finding).summary,
-          firstSeenHead: record.head, heads: [], keys: [], rulings: [] };
+          firstSeenHead: record.head, heads: [], lines: [], keys: [], rulings: [] };
         table.push(entry);
         byId.set(findingId, entry);
+      }
+      const line = normalizeFinding(f.original ?? f.finding)?.line;
+      if (Number.isInteger(line)) (entry.lines ??= []).push(line);
+      entry.forms ??= [];
+      if (!entry.forms.some((x) => x.normSummary === identity.normSummary && x.anchor === identity.anchor)) {
+        entry.forms.push({ normSummary: identity.normSummary, anchor: identity.anchor });
       }
       if (!entry.heads.includes(record.head)) entry.heads.push(record.head);
       entry.keys.push({ head: record.head, runId: record.runId, key: f.key });
@@ -649,7 +700,8 @@ export function bindFindingIds(findings, table, { sameHead = false, ignoreLens =
   return (Array.isArray(findings) ? findings : []).map((finding) => {
     const identity = normalizeFindingIdentity(finding);
     if (!identity) return null;
-    return (table ?? []).find((e) => sameFindingIdentity(e, identity, { sameHead, ignoreLens }))?.findingId ?? null;
+    return (table ?? []).find((e) => (e.forms ?? [e]).some((form) => sameFindingIdentity({ ...e, ...form }, identity,
+      { sameHead, ignoreLens })))?.findingId ?? null;
   });
 }
 
@@ -2689,6 +2741,8 @@ export function validateReferralRecord(r) {
       if (!rli || typeof rli.id !== 'string' || !rli.id || ids.has(rli.id)
         || !keys.has(rli.key) || rli.reviewerId !== reviewer.id || rli.lens !== reviewer.lens
         || !['block', 'card', 'not-real'].includes(rli.result)
+        // #76b — an optional declared link, recorded on the reviewer's own ruling; the table re-checks its structure.
+        || (rli.sameAs !== undefined && !FINDING_ID_PATTERN.test(rli.sameAs))
         || typeof rli.rationale !== 'string' || !rli.rationale.trim()
         || !Array.isArray(rli.evidence) || !rli.evidence.length
         || rli.evidence.some(e => typeof e !== 'string' || !e.trim())
@@ -2718,9 +2772,10 @@ export function resolveReferralStampPolicy(env = process.env) {
  * may also clear through its explicit same-subject, same-head not-real supersession reference.
  * Run-derived identities on other records confer no authority over this obligation.
  */
-export function referralRecordState(record, { head = record?.head, body = record?.authorBody ?? '', createdAt = '',
-  cardReadable = () => false, seatDisabled = () => false, operatorRulings = [], records = [],
-  stampPolicy = resolveReferralStampPolicy(), identityTable = null } = {}) {
+export function referralRecordState(record, options = {}) {
+  const { head = record?.head, body = record?.authorBody ?? '', createdAt = '',
+    cardReadable = () => false, seatDisabled = () => false, operatorRulings = [], records = [],
+    stampPolicy = resolveReferralStampPolicy(), identityTable = null, linkedBlocked } = options;
   if (!validateReferralRecord(record)) return { pending: ['malformed-referral-record'], blocked: [], blockedFindings: [], rulings: [] };
   const pending = [], blocked = [], rulings = [];
   const decision = decideClearerIndependence({ authorId: parseAuthorActorId(body),
@@ -2780,15 +2835,60 @@ export function referralRecordState(record, { head = record?.head, body = record
     if (head !== record.head || outcomes.size !== 1 || cardUnreadable) pending.push(f.key);
     else { rulings.push(...active); if (active[0].result === 'block') blocked.push(f.key); }
   }
+  // #76b — ONE RULING COVERS EVERY WORDING OF A FINDING, BUT ONLY TO HOLD. A finding whose id (deterministic or a
+  // declared `sameAs`) holds a counted block on this head is blocked too: pending or cleared alike, since two counted
+  // rulings on one id that disagree resolve to block. A link never clears anything, and an operator's own ruling on
+  // this exact finding (#4979) still decides it. `linkedBlocked: null` turns this off (the computation itself).
+  const allRecords = Array.isArray(records) && records.includes(record) ? records : [...(Array.isArray(records) ? records : []), record];
+  let table = identityTable;
+  if (head === record.head && linkedBlocked !== null) {
+    table ??= findingIdentityTable(allRecords);
+    const linked = linkedBlocked ?? linkedBlockedFindingIds(allRecords, { ...options, head, identityTable: table });
+    for (const f of linked.size ? activeReferrals(record) : []) {
+      if (blocked.includes(f.key) || (Array.isArray(operatorRulings) ? operatorRulings : []).some(o => o.repo === record.repo
+        && o.pr === record.pr && o.head === record.head && o.runId === record.runId && o.key === f.key)) continue;
+      const findingId = findingIdOf(table, { head: record.head, runId: record.runId, key: f.key });
+      const from = findingId ? linked.get(findingId) : undefined;
+      if (!from) continue;
+      for (let i = pending.indexOf(f.key); i !== -1; i = pending.indexOf(f.key)) pending.splice(i, 1);
+      blocked.push(f.key);
+      rulings.push({ key: f.key, result: 'block', linked: { findingId, ...from },
+        rationale: `linked: the same finding (${findingId}) is ruled block on this head` });
+    }
+  }
   // Named only when a finding actually stays held, so a fully operator-ruled record never shows it.
   if (missingStamp && stampPolicy === 'refuse' && pending.length) pending.push('author-stamp-missing');
   // #76a — `blocked` stays the gate's key list (every acceptance boundary matches on it); `blockedFindings` is the
   // same set, each with its finding identity and finding, so the fixer's note can NAME every block.
-  const table = blocked.length ? identityTable ?? findingIdentityTable(records.includes(record) ? records : [...records, record]) : [];
+  if (blocked.length) table ??= findingIdentityTable(allRecords);
+  else table = [];
   const blockedFindings = blocked.map((key) => ({ key,
     findingId: findingIdOf(table, { head: record.head, runId: record.runId, key }),
     finding: record.referrals.find((f) => f.key === key).finding }));
   return { pending, blocked, blockedFindings, rulings, independence: { status: decision.status, fallback } };
+}
+
+/**
+ * #76b — every finding id a COUNTED block holds on `head`, each mapped to the `{ runId, key }` that holds it. A block
+ * counts exactly when {@link referralRecordState} reports its key blocked (independent reviewer or operator), so the
+ * link can never make a block out of a ruling the gate itself would not count. PURE.
+ * @returns {Map<string, {runId: string, key: string}>}
+ */
+export function linkedBlockedFindingIds(records = [], options = {}) {
+  const { head, repo, pr } = options;
+  const out = new Map();
+  if (!/^[a-f0-9]{40}$/.test(head ?? '')) return out;
+  const list = Array.isArray(records) ? records : [];
+  const table = options.identityTable ?? findingIdentityTable(list);
+  for (const r of list) {
+    if (r?.head !== head || (repo && (r.repo !== repo || r.pr !== Number(pr)))) continue;
+    const state = referralRecordState(r, { ...options, head, records: list, identityTable: table, linkedBlocked: null });
+    for (const key of state.blocked) {
+      const findingId = findingIdOf(table, { head: r.head, runId: r.runId, key });
+      if (findingId && !out.has(findingId)) out.set(findingId, { runId: r.runId, key });
+    }
+  }
+  return out;
 }
 
 export const REFERRAL_RECORD_MARKER = 'mandatory-referrals-v1';
@@ -2984,12 +3084,20 @@ export function mandatoryReferralState(comments, context = {}) {
   const blocked = [];
   const blockedFindings = [];
   const identityTable = findingIdentityTable(records);
+  // #76b — computed once per head here, not once per record.
+  const linkedByHead = new Map();
+  const linkedFor = (h) => {
+    if (!linkedByHead.has(h)) linkedByHead.set(h, linkedBlockedFindingIds(records, { ...context, head: h, identityTable }));
+    return linkedByHead.get(h);
+  };
   // The review carries source findings into the new head's own records. Neither old holds nor old
   // clearance carry forward implicitly; explicit carried entries require operator backing.
   for (const r of records) {
     if (/^[a-f0-9]{40}$/.test(context.head ?? '') && r.head !== context.head) continue;
     if (context.repo && (r.repo !== context.repo || r.pr !== Number(context.pr))) { pending.push('wrong-subject'); continue; }
-    const state = referralRecordState(r, { ...context, records, identityTable });
+    const recordHead = context.head ?? r.head;
+    const state = referralRecordState(r, { ...context, records, identityTable,
+      ...(recordHead === r.head ? { linkedBlocked: linkedFor(r.head) } : {}) });
     pending.push(...state.pending);
     blocked.push(...state.blocked);
     for (const b of state.blockedFindings) if (!blockedFindings.some((x) => x.key === b.key)) blockedFindings.push(b);

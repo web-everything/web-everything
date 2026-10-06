@@ -1,3 +1,4 @@
+import { sameAsLinkAllowed } from '../jury-core.mjs';
 import { FINDING_ID_PATTERN, findingIdentityTable, bindFindingIds, mintFindingId, normalizeFindingIdentity } from '../jury-core.mjs';
 import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, findCarriedOperatorRuling, liveReferrals, carriedBackingHolds } from '../jury-core.mjs';
 import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER, REFERRAL_STAMP_POLICY_ENV, resolveReferralStampPolicy } from '../jury-core.mjs';
@@ -2453,5 +2454,87 @@ describe('#76a finding identity', () => {
     expect(reason).toMatch(/^Changes: 2 mandatory referrals were ruled block/);
     // Bare gate keys (an older caller) still name their files.
     expect(explainPanelOutcome({ outcome: 'changes', blockedReferrals: state.blocked })).toContain('scripts/worker-brief.mjs:63');
+  });
+});
+
+describe('#76b sameAs finding links', () => {
+  const seat = 'judgeCorrectnessAdvisory';
+  const H = (c) => c.repeat(40);
+  const AUTHOR = '<!-- authored-by-actor: author -->';
+  const f = (line, summary, extra = {}) => ({ file: 'scripts/held-cards-io.mjs', ...(line ? { line } : {}), summary,
+    category: 'correctness', verdict: 'CONFIRMED', impactIfUnfixed: 'broken', ...extra });
+  // #4017's real referral wordings of the "concurrent filing" race (rounds 3-6) and the unrelated, already-fixed
+  // "overwrite concurrent additions" finding on the SAME file and lens (lines 113/114).
+  const race = [
+    f(136, 'Concurrent file commands can file the same held cards twice because only the final annotation is locked.'),
+    f(null, 'Concurrent filing commands can file the same held cards twice because only the final marking operation is locked.'),
+    f(null, 'Concurrent held-card filing runs can file the same pending items into separate PRs.'),
+    f(133, 'Concurrent filing invocations can file the same held cards twice.'),
+  ];
+  const overwrite = [f(114, 'Concurrent additions overwrite each other in the shared held-card list.'),
+    f(113, 'Held-card updates can overwrite concurrent additions.')];
+  const rec = (head, runId, findings, rulings = []) => {
+    const r = { version: 1, repo: 'web-everything/web-everything', pr: 4017, head, runId, authorBody: AUTHOR,
+      reviewer: mandatoryReferralReviewer(runId), attempted: true,
+      referrals: findings.map((x) => ({ key: referralFindingKey(seat, x), seat, original: x, finding: normalizeFinding(x) })),
+      rulings: [] };
+    r.rulings = rulings.map(([i, result, sameAs], n) => ({ id: `${runId}:${n}`, key: r.referrals[i].key, reviewerId: r.reviewer.id,
+      lens: 'correctness', result, rationale: 'Checked diff', evidence: ['diff'], ...(sameAs ? { sameAs } : {}) }));
+    return r;
+  };
+
+  it('sameAs link: a reviewer-declared link on the ruling collapses the #4017 race wordings to one id, never the overwrite finding', () => {
+    const r1 = rec(H('1'), 'r1', [...overwrite, race[0]], [[0, 'not-real'], [1, 'not-real'], [2, 'block']]);
+    const raceId = findingIdentityTable([r1]).find((e) => e.summary === race[0].summary).findingId;
+    // Later heads: each new wording is declared the same as the race id; the overwrite wordings are wrongly declared
+    // too (the reviewer erred), and the guard refuses them (line 113/114 is far from 133/136).
+    const r2 = rec(H('2'), 'r2', [race[1], overwrite[1]], [[0, 'block', raceId], [1, 'not-real', raceId]]);
+    const r3 = rec(H('3'), 'r3', [race[2]], [[0, 'block', raceId]]);
+    const r4 = rec(H('4'), 'r4', [race[3], race[2]], [[0, 'block', raceId], [1, 'block']]);
+    for (const r of [r1, r2, r3, r4]) expect(validateReferralRecord(r)).toBe(true);
+    const table = findingIdentityTable([r1, r2, r3, r4]);
+    const raceEntry = table.find((e) => e.findingId === raceId);
+    expect(new Set(raceEntry.keys.map((k) => k.key))).toEqual(new Set(race.map((x) => referralFindingKey(seat, x))));
+    const overwriteIds = new Set(table.filter((e) => e.summary.includes('overwrite')).map((e) => e.findingId));
+    expect(overwriteIds.has(raceId)).toBe(false);
+    // Without the declared links the same records keep the race as four ids (76a's deterministic binding alone).
+    const strip = (r) => ({ ...r, rulings: r.rulings.map(({ sameAs, ...x }) => x) });
+    const unlinked = findingIdentityTable([r1, r2, r3, r4].map(strip));
+    expect(unlinked.filter((e) => /concurrent fil|held-card filing/i.test(e.summary))).toHaveLength(4);
+  });
+
+  it('sameAs link: refused across a path, a lens or a far cited line; a malformed ruling sameAs invalidates the record', () => {
+    const base = rec(H('1'), 'r1', [race[0]], [[0, 'block']]);
+    const id = findingIdentityTable([base])[0].findingId;
+    for (const other of [{ ...race[3], file: 'scripts/held-cards.mjs' }, { ...race[3], category: 'security' }, { ...race[3], line: 40 }]) {
+      expect(findingIdentityTable([base, rec(H('2'), 'r2', [other], [[0, 'block', id]])])).toHaveLength(2);
+    }
+    expect(findingIdentityTable([base, rec(H('2'), 'r2', [race[3]], [[0, 'block', id]])])).toHaveLength(1);
+    expect(sameAsLinkAllowed(findingIdentityTable([base])[0], race[1])).toBe(true);
+    const bad = rec(H('2'), 'r2', [race[3]], [[0, 'block', 'new']]);
+    expect(validateReferralRecord(bad)).toBe(false);
+  });
+
+  it('sameAs link: one block covers every linked wording on its head, and a link never clears', () => {
+    const r1 = rec(H('1'), 'r1', [race[0]], [[0, 'block']]);
+    const id = findingIdentityTable([r1])[0].findingId;
+    const r2 = rec(H('1'), 'r2', [race[3]], [[0, 'not-real', id]]);
+    const state = mandatoryReferralState([r1, r2].map((r) => ({ body: renderReferralRecord(r), author: { login: 'web-everything' } })), { head: H('1') });
+    expect(state.blocked).toEqual([r1.referrals[0].key, r2.referrals[0].key]);
+    expect(state.pending).toEqual([]);
+    expect(state.blockedFindings.map((b) => b.findingId)).toEqual([id, id]);
+    // An operator's own ruling on the linked wording still decides that wording (#4979); the block it was linked to stands.
+    const operatorRulings = [{ operator: true, repo: r2.repo, pr: r2.pr, head: H('1'), runId: 'r2', key: r2.referrals[0].key, result: 'not-real' }];
+    expect(referralRecordState(r2, { head: H('1'), records: [r1, r2], operatorRulings }).blocked).toEqual([]);
+    expect(referralRecordState(r1, { head: H('1'), records: [r1, r2], operatorRulings }).blocked).toEqual([r1.referrals[0].key]);
+    // A link to a NOT-REAL id never clears: the linked wording with no ruling of its own stays pending.
+    const n1 = rec(H('1'), 'n1', [race[0]], [[0, 'not-real']]);
+    const nId = findingIdentityTable([n1])[0].findingId;
+    const n2 = rec(H('1'), 'n2', [race[3]], []);
+    n2.referrals[0].sameAs = nId;
+    expect(findingIdentityTable([n1, n2])).toHaveLength(1);
+    expect(referralRecordState(n2, { head: H('1'), records: [n1, n2] }).pending).toEqual([n2.referrals[0].key]);
+    // A block on another head is not this head's ruling.
+    expect(referralRecordState(r2, { head: H('2'), records: [r1, r2] }).blocked).toEqual([]);
   });
 });
