@@ -10,12 +10,46 @@ import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
-import { mkdirSync, appendFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
 import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './candidate.mjs';
 import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
+
+const sha256 = (value) => createHash('sha256').update(value).digest('hex');
+
+/** Identity of a proven tree and the dependencies of its full smoke. */
+export function smokePassKey({ tree, lockHash, nodeVersion, harnessHash }) {
+  return sha256(JSON.stringify({ tree, lockHash, nodeVersion, harnessHash }));
+}
+
+/** Lifetime of a full smoke proof; invalid settings retain the two-hour default. */
+export function smokePassTtlMs(env = process.env) {
+  const ttl = Number(env.WE_DAEMON_SMOKE_PASS_TTL_MS ?? 2 * 60 * 60_000);
+  return Number.isFinite(ttl) && ttl >= 0 ? ttl : 2 * 60 * 60_000;
+}
+
+/** Read the candidate's content identity and the RUNNING harness; failures cannot prove a tree. */
+export function smokePassIdentity(git, sha) {
+  try {
+    const tree = verifyRev(git, `${sha}^{tree}`);
+    if (!tree) return null;
+    const lock = git(['show', `${sha}:package-lock.json`]);
+    // Distinguish an absent lockfile from a failed read of an existing one.
+    if (lock.status !== 0) {
+      const listed = git(['ls-tree', '--name-only', tree, '--', 'package-lock.json']);
+      if (listed.status !== 0 || String(listed.stdout ?? '').trim()) return null;
+    }
+    const lockHash = lock.status === 0 ? sha256(lock.stdout ?? '') : '';
+    const harnessHash = sha256(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../daemon-live-smoke.mjs')));
+    return { tree, key: smokePassKey({ tree, lockHash, nodeVersion: process.version, harnessHash }) };
+  } catch {
+    return null;
+  }
+}
 
 // ── smoke-rejection helpers ────────────────────────────────────────────────────────────────────────────────
 
@@ -151,6 +185,14 @@ export async function smokeAndAdopt({
         checks: (smokeResult?.smoke?.results || []).map((r) => `${r.name}:${r.skipped ? 'skipped' : `${r.ms}ms`}`).join(' '),
       });
     }
+    if (!threw && smokeResult?.verdict === 'pass' && changedFiles === null
+      && !smokeResult.cached && !busyPoolSkippedChecks(smokeResult).length && label !== 'confirm') {
+      const identity = smokePassIdentity(git, sha);
+      if (identity) await locked((st) => {
+        const prior = Array.isArray(st.smokePassed) ? st.smokePassed : [];
+        st.smokePassed = [{ ...identity, passedAt: nowIso() }, ...prior.filter((entry) => entry?.key !== identity.key)].slice(0, 5);
+      });
+    }
     return { smokeResult, threw, ms };
   };
 
@@ -219,6 +261,19 @@ export async function smokeAndAdopt({
   };
 
   // ── Candidate A: main + every overlay ──────────────────────────────────────────────────────────────────
+  const identity = smokePassIdentity(git, plan.finalSha);
+  const passes = readRebuildState(root, stEnv).smokePassed;
+  const proven = identity && Array.isArray(passes) && passes.find((entry) => {
+    const age = now() - Date.parse(entry?.passedAt);
+    return entry?.key === identity.key && age >= 0 && age <= smokePassTtlMs(env);
+  });
+  if (proven) {
+    alert('smoke-skipped-proven-tree', {
+      tree: identity.tree, provenAt: proven.passedAt,
+      reason: 'tree already passed a full smoke (same lock, node, harness)',
+    });
+    return finalize(plan, undefined, undefined, { verdict: 'pass', cached: true, smoke: { results: [] } });
+  }
   const a = await smokeSha(plan.finalSha, changedSince(plan.finalSha), null);
   if (a.worktreeFailed) {
     await locked(null, { release: true });
