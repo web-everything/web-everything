@@ -195,8 +195,13 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
   policy = loadCardBatchPolicy(), spawn = spawnChild } = {}) {
   let files;
   try { files = readdirSync(stateDir); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
-  const jobs = files.includes('sealed') ? await sealDueBatches({ now, stateDir: join(stateDir, 'sealed'), policy, spawn }) : [];
+  const jobs = [];
   const errors = [];
+  if (files.includes('sealed')) {
+    // A broken archive must not stop the active batches below from launching; its error joins the aggregate.
+    try { jobs.push(...await sealDueBatches({ now, stateDir: join(stateDir, 'sealed'), policy, spawn })); }
+    catch (error) { jobs.push(...(error.launched ?? [])); errors.push(error); }
+  }
   for (const file of files.filter(file => file.endsWith('.json'))) {
     // One unreadable or throwing state must not stop later batches from launching; the first error is rethrown after the scan.
     try {
@@ -207,7 +212,10 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
       const kind = kindOf(state, path);
       // Any seal reason launches (count beats age in shouldSeal); the lease serialises the worker against inline sealing.
       // A PR whose hold was never confirmed relaunches too, so the unheld-draft window closes without waiting for a seal.
-      if (!kind || (!state.sealedAt && !planPublish({ state, kind, policy, now }).reason && !holdPending(state))) continue;
+      // `now` was sampled at tick start; a batch admitted since has openedAt after it. Its age is zero, not an error.
+      const opened = typeof state.openedAt === 'number' ? state.openedAt : Date.parse(state.openedAt);
+      const at = Number.isFinite(opened) ? Math.max(now, opened) : now;
+      if (!kind || (!state.sealedAt && !planPublish({ state, kind, policy, now: at }).reason && !holdPending(state))) continue;
       const child = spawn(process.execPath, [join(ROOT, 'scripts/operations/card-batch-seal-job.mjs'), `--state=${path}`],
         { cwd: ROOT, detached: true, stdio: 'ignore' });
       // Wait only for OS launch, never child completion/verification. Launch failures reach probeErrors.

@@ -179,6 +179,39 @@ it('tick keeps launching later batches when one state file is unreadable, then r
   expect(error.launched).toEqual([f.statePath]);
   expect(spawn).toHaveBeenCalledOnce();
 });
+it('tick keeps launching active batches when the sealed archive is corrupt, then reports the archive error', async () => {
+  const f = fixture({ maxCards: 5 });
+  mkdirSync(join(f.dir, 'sealed'));
+  writeFileSync(join(f.dir, 'sealed', 'archive.json'), '{not json');
+  const spawn = vi.fn(fakeChild);
+  const error = await sealDueBatches({ now: 60000, stateDir: f.dir, policy: f.opts.policy, spawn }).catch(e => e);
+  expect(error).toBeInstanceOf(Error);
+  expect(error.launched).toEqual([f.statePath]);
+  expect(spawn).toHaveBeenCalledOnce();
+});
+it('tick keeps launching active batches when the sealed archive is unreadable as a directory', async () => {
+  const f = fixture({ maxCards: 5 });
+  writeFileSync(join(f.dir, 'sealed'), 'not a directory');
+  const spawn = vi.fn(fakeChild);
+  const error = await sealDueBatches({ now: 60000, stateDir: f.dir, policy: f.opts.policy, spawn }).catch(e => e);
+  expect(error).toBeInstanceOf(Error);
+  expect(error.launched).toEqual([f.statePath]);
+  expect(spawn).toHaveBeenCalledOnce();
+});
+it('tick treats a batch opened after the tick clock as age zero: no throw, no launch until due', async () => {
+  const f = fixture({ maxCards: 5 });
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, openedAt: 5000 }));
+  const iso = join(f.dir, 'org-repo-filing.json');
+  writeFileSync(iso, JSON.stringify({ ...f.state, batchRef: 'lane/card-batch-filing-1', openedAt: new Date(5000).toISOString() }));
+  const spawn = vi.fn(fakeChild);
+  expect(await sealDueBatches({ now: 1000, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual([]);
+  expect(spawn).not.toHaveBeenCalled();
+});
+it('tick still rejects a malformed openedAt rather than clamping it away', async () => {
+  const f = fixture({ maxCards: 5 });
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, openedAt: 'yesterday' }));
+  await expect(sealDueBatches({ now: 60000, stateDir: f.dir, policy: f.opts.policy, spawn: vi.fn(fakeChild) })).rejects.toThrow('openedAt');
+});
 it('refreshes the PR body on the retry that applies a missed hold', async () => {
   const f = fixture({ maxCards: 5 });
   let fail = true;
