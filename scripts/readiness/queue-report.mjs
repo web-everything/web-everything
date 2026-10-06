@@ -81,7 +81,8 @@ export const NOT_READY_REASONS = Object.freeze([
   // `needs-prepare` (card #4470) joins them too: the item needs a full prepare pass (premise check, scope
   // correction, design/MVP/test/proof plan, `preparedDate` stamp) before it can ever be picked up, independent
   // of lane capacity — same semantics, a different missing readiness ingredient.
-  'blocked', 'unshaped-no-scope', 'no-size', 'needs-prepare', 'needs-slice', 'needs-decision', 'needs-investigation', 'branch-drift-blocked', 'cleared-but-not-ready',
+  // `prepare-stale` (card 80): the stamp is too old or its scope drifted — a re-prepare first, same semantics.
+  'blocked', 'unshaped-no-scope', 'no-size', 'needs-prepare', 'prepare-stale', 'needs-slice', 'needs-decision', 'needs-investigation', 'branch-drift-blocked', 'cleared-but-not-ready',
 ]);
 
 /** Held reasons that are not a real held queue member at all — a signal to verify/clear, never to wait on. */
