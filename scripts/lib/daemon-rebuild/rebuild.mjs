@@ -77,6 +77,9 @@ export async function rebuildClone({
   if (!prep.ok) {
     if (prep.reason === 'tick-in-progress') {
       log.error?.(`daemon-rebuild: gave up after ${Math.round((now() - startedMs) / 1000)}s — reader ${prep.heldBy ?? '?'} still ticking; this tick runs on the current tree and the next one retries (#4044)`);
+    } else if (prep.reason === 'reader-priority') {
+      // Not counted as rebuild starvation: escalating to the long starved wait would re-block the very reader.
+      log.error?.(`daemon-rebuild: backed off — reader ${prep.heldBy ?? '?'} was refused ${prep.starved ?? '?'} consecutive time(s) and has priority; nothing was moved, the next tick retries (#4044 reader fairness)`);
     }
     return { moved: false, reason: prep.reason, ...(prep.heldBy ? { heldBy: prep.heldBy } : {}) };
   }

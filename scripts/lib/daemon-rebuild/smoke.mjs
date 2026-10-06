@@ -183,6 +183,8 @@ export async function smokeAndAdopt({
     if (!fin.ok) {
       if (fin.reason === 'tick-in-progress') {
         log.error?.(`daemon-rebuild: could not take the write lock to finalize ${p.finalSha} after a passing smoke (reader ${fin.heldBy ?? '?'} still ticking) — kept as the ready candidate; the next write-lock holder adopts it without re-smoking`);
+      } else if (fin.reason === 'reader-priority') {
+        log.error?.(`daemon-rebuild: backed off finalizing ${p.finalSha} — starved reader ${fin.heldBy ?? '?'} has priority; kept as the ready candidate, the next write-lock holder adopts it without re-smoking`);
       }
       return {
         moved: false, reason: fin.reason, ...(fin.heldBy ? { heldBy: fin.heldBy } : {}), plan: p, alerts: [...prepAlerts, ...alertsList],

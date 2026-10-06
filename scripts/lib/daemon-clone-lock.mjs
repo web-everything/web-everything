@@ -37,7 +37,7 @@
  */
 
 import { hostname, homedir } from 'node:os';
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -94,7 +94,89 @@ export function cloneLockKey(root) {
  *  one-key-per-owner `readers/`. Exported so the CLI / tests can point straight at them without recomputing. */
 export function cloneLockDirs(root, lockRoot = defaultLockRoot()) {
   const base = join(lockRoot, cloneLockKey(root));
-  return { base, writerRoot: join(base, 'writer'), readersRoot: join(base, 'readers') };
+  return { base, writerRoot: join(base, 'writer'), readersRoot: join(base, 'readers'), starvedRoot: join(base, 'starved') };
+}
+
+// ── reader fairness (live 2026-10-05 20:18-20:37 ET) ─────────────────────────────────────────────────────────
+// The review and fix-dispatch daemons share one clone and BOTH start every tick with a rebuild that reserves the
+// writer and then waits (60s, 180s, up to 900s when "starved") for the other's reader to drain — refusing every
+// NEW read for that whole wait. With main moving every few minutes the writer slot was almost never free when the
+// review daemon's tick began: 11 ticks in a row skipped `writer-active`, CI-green PRs got no review. Nothing
+// tracked a refused reader, so nothing ever yielded to it. Now a refused reader records a starvation claim; once
+// it has been refused READER_PRIORITY_AFTER times in a row, every writer still in its DRAIN wait (it has not
+// moved anything yet) backs off with `reader-priority`, and no new writer reserves until that reader gets in.
+// A writer that already holds the clone (drain done, moving the tree) is never interrupted, so the #4044
+// never-read-a-tree-mid-move guarantee is untouched: a reader still only ever gets in when no writer key exists.
+
+/** Setting: consecutive refused read attempts after which a reader has priority over waiting writers.
+ *  Default 3; `0` turns reader priority off (the old writer-preferring behaviour). */
+export const READER_PRIORITY_AFTER_ENV = 'WE_DAEMON_CLONE_LOCK_READER_PRIORITY_AFTER';
+export const DEFAULT_READER_PRIORITY_AFTER = 3;
+
+/** PURE: the reader-priority threshold from env (a non-negative integer, else the default; 0 = off). */
+export function resolveReaderPriorityAfter(env = process.env) {
+  const raw = env?.[READER_PRIORITY_AFTER_ENV];
+  const n = raw == null || String(raw).trim() === '' ? NaN : Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : DEFAULT_READER_PRIORITY_AFTER;
+}
+
+function starvedFile(starvedRoot, readerKey) {
+  return join(starvedRoot, `${lockIdFor(readerKey)}.json`);
+}
+
+function readStarvedRecords(starvedRoot) {
+  let names;
+  try { names = readdirSync(starvedRoot); } catch { return []; }
+  const out = [];
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    try {
+      const rec = JSON.parse(readFileSync(join(starvedRoot, name), 'utf8'));
+      if (rec && typeof rec.owner === 'string' && Number.isInteger(rec.count)) out.push({ ...rec, file: join(starvedRoot, name) });
+    } catch { /* corrupt/half-written — ignored */ }
+  }
+  return out;
+}
+
+/** Record one more consecutive refusal for `readerKey`; returns the new count. Best-effort (a lost write only
+ *  delays priority by a tick). */
+function noteReaderRefused(starvedRoot, { readerKey, owner, pid, nowMs, heldBy }) {
+  const file = starvedFile(starvedRoot, readerKey);
+  let prev = null;
+  try { prev = JSON.parse(readFileSync(file, 'utf8')); } catch { /* none yet */ }
+  const count = (Number.isInteger(prev?.count) ? prev.count : 0) + 1;
+  const nowIso = new Date(nowMs).toISOString();
+  const rec = {
+    readerKey, owner, pid, count, heldBy: heldBy ?? null, firstRefusedAt: prev?.firstRefusedAt ?? nowIso, lastRefusedAt: nowIso,
+  };
+  try {
+    mkdirSync(starvedRoot, { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}`;
+    writeFileSync(tmp, `${JSON.stringify(rec)}\n`, 'utf8');
+    renameSync(tmp, file);
+  } catch { /* best-effort */ }
+  return count;
+}
+
+function clearReaderStarved(starvedRoot, readerKey) {
+  try { rmSync(starvedFile(starvedRoot, readerKey), { force: true }); } catch { /* best-effort */ }
+}
+
+/** The live starved reader (if any, other than `owner`) that writers must yield to. A claim lapses with the same
+ *  lease as a lock entry (`lastRefusedAt` older than `leaseMinutes`) or when its same-host pid is dead — those
+ *  are removed on sight, so a crashed reader can never hold writers off. */
+function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, after }) {
+  if (!(after > 0)) return null;
+  for (const rec of readStarvedRecords(starvedRoot)) {
+    const asEntry = { owner: rec.owner, pid: rec.pid, heartbeatAt: rec.lastRefusedAt };
+    if (!entryIsLive(asEntry, nowMs, leaseMinutes, probe)) {
+      try { rmSync(rec.file, { force: true }); } catch { /* best-effort */ }
+      continue;
+    }
+    if (rec.owner === owner) continue;
+    if (rec.count >= after) return rec;
+  }
+  return null;
 }
 
 /**
@@ -168,7 +250,9 @@ function listReaderEntries(readersRoot) {
  * @param {string} root  the clone's working-tree path
  * @param {{owner?:string, lockRoot?:string, nowMs?:number, pid?:number, leaseMinutes?:number,
  *   probe?:(entry:object|null)=>('dead'|'alive'|'unknown')}} [opts]
- * @returns {{ok:true}|{ok:false, reason:'writer-active', heldBy:string}}
+ * A refusal is recorded as a reader-starvation claim (see "reader fairness" above) and its result carries
+ * `starved` — this reader's consecutive refusal count; a successful acquire clears the claim.
+ * @returns {{ok:true}|{ok:false, reason:'writer-active', heldBy:string, starved?:number}}
  */
 export function acquireRead(root, opts = {}) {
   const {
@@ -178,8 +262,12 @@ export function acquireRead(root, opts = {}) {
     pid = process.pid,
     leaseMinutes = DEFAULT_LEASE_MINUTES,
     probe = defaultProbePidLiveness,
+    // Reader fairness: `readerKey` names this reader across restarts (a daemon passes its entry script, so a
+    // restart keeps its refusal count); `trackStarvation: false` makes a refusal not count (a same-tick retry).
+    readerKey = owner,
+    trackStarvation = true,
   } = opts;
-  const { writerRoot, readersRoot } = cloneLockDirs(root, lockRoot);
+  const { writerRoot, readersRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
   const nowIso = new Date(nowMs).toISOString();
 
   const checkWriter = () => {
@@ -189,9 +277,13 @@ export function acquireRead(root, opts = {}) {
     }
     return null;
   };
+  const refuse = (r) => {
+    if (!trackStarvation) return r;
+    return { ...r, starved: noteReaderRefused(starvedRoot, { readerKey, owner, pid, nowMs, heldBy: r.heldBy }) };
+  };
 
   const refusedBefore = checkWriter();
-  if (refusedBefore) return refusedBefore;
+  if (refusedBefore) return refuse(refusedBefore);
 
   const currentOwnEntry = readLockEntry(readersRoot, owner);
   reserve(readersRoot, owner, owner, nowMs, nowIso, pid, probe(currentOwnEntry), leaseMinutes);
@@ -199,8 +291,10 @@ export function acquireRead(root, opts = {}) {
   const refusedAfter = checkWriter();
   if (refusedAfter) {
     releaseLockDir(readersRoot, owner);
-    return refusedAfter;
+    return refuse(refusedAfter);
   }
+  // In: our reader slot now holds any writer off by itself, so the priority claim has done its job.
+  clearReaderStarved(starvedRoot, readerKey);
   return { ok: true };
 }
 
@@ -227,7 +321,10 @@ const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * @param {string} root
  * @param {{owner?:string, lockRoot?:string, waitMs?:number, pollMs?:number, sleep?:(ms:number)=>Promise<void>,
  *   now?:()=>number, pid?:number, leaseMinutes?:number, probe?:(entry:object|null)=>('dead'|'alive'|'unknown')}} [opts]
- * @returns {Promise<{ok:true}|{ok:false, reason:'concurrent-mover'|'tick-in-progress', heldBy:string|null}>}
+ * Reader fairness: before reserving, and on every drain poll, a live starved reader (refused
+ * `readerPriorityAfter` times in a row) makes this writer back off — `reader-priority`, writer key released. Only
+ * ever during the drain wait, before anything moved; a writer that returned ok is never interrupted.
+ * @returns {Promise<{ok:true}|{ok:false, reason:'concurrent-mover'|'tick-in-progress'|'reader-priority', heldBy:string|null, starved?:number}>}
  */
 export async function acquireWrite(root, opts = {}) {
   const {
@@ -241,11 +338,18 @@ export async function acquireWrite(root, opts = {}) {
     leaseMinutes = DEFAULT_LEASE_MINUTES,
     probe = defaultProbePidLiveness,
     onBlocked = null,
+    readerPriorityAfter = resolveReaderPriorityAfter(),
   } = opts;
-  const { writerRoot, readersRoot } = cloneLockDirs(root, lockRoot);
+  const { writerRoot, readersRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
 
   const startMs = now();
   const startIso = new Date(startMs).toISOString();
+  // Reader fairness: a starved reader has priority — never even reserve while one is waiting to get in.
+  const priorityFor = (nowMsN) => findPriorityReader(starvedRoot, {
+    owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter,
+  });
+  const yieldTo = priorityFor(startMs);
+  if (yieldTo) return { ok: false, reason: 'reader-priority', heldBy: yieldTo.owner, starved: yieldTo.count };
   const currentWriter = readLockEntry(writerRoot, WRITER_KEY);
   const writerReserve = reserve(writerRoot, WRITER_KEY, owner, startMs, startIso, pid, probe(currentWriter), leaseMinutes);
   if (!writerReserve.ok) {
@@ -268,6 +372,12 @@ export async function acquireWrite(root, opts = {}) {
       }
     }
     lastBlockers = blockers;
+    // Still draining — nothing moved yet — so backing off to a starved reader is always safe.
+    const starvedReader = priorityFor(nowMsN);
+    if (starvedReader) {
+      releaseLockDir(writerRoot, WRITER_KEY);
+      return { ok: false, reason: 'reader-priority', heldBy: starvedReader.owner, starved: starvedReader.count };
+    }
     if (blockers.length === 0) return { ok: true };
     // #4044: a wait that blocks this process's own ticks is never silent — report it once, with who and how long.
     if (typeof onBlocked === 'function' && !reportedBlocked) {
@@ -363,7 +473,7 @@ export async function withWriteLock(root, fn, opts = {}) {
  * @param {string} root
  * @param {{lockRoot?:string, nowMs?:number, leaseMinutes?:number,
  *   probe?:(entry:object|null)=>('dead'|'alive'|'unknown')}} [opts]
- * @returns {{writer:object|null, writerLive:boolean, readers:Array<object & {live:boolean}>}}
+ * @returns {{writer:object|null, writerLive:boolean, readers:Array<object & {live:boolean}>, starved:Array<object>}}
  */
 export function inspectCloneLock(root, opts = {}) {
   const {
@@ -379,7 +489,12 @@ export function inspectCloneLock(root, opts = {}) {
     ...entry,
     live: entryIsLive(entry, nowMs, leaseMinutes, probe),
   }));
-  return { writer, writerLive, readers };
+  const starved = readStarvedRecords(cloneLockDirs(root, lockRoot).starvedRoot).map((rec) => {
+    const out = { ...rec };
+    delete out.file;
+    return out;
+  });
+  return { writer, writerLive, readers, starved };
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────────────────────────
@@ -424,6 +539,9 @@ async function runCli(argv) {
       process.stdout.write(`daemon-clone-lock status: ${root}\n  writer: ${w}\n  readers: ${snapshot.readers.length}\n`);
       for (const r of snapshot.readers) {
         process.stdout.write(`    - ${r.owner} (${r.live ? 'live' : 'stale'})\n`);
+      }
+      for (const r of snapshot.starved) {
+        process.stdout.write(`  starved reader: ${r.readerKey} (${r.owner}) refused ${r.count} time(s) in a row since ${r.firstRefusedAt}\n`);
       }
     }
     return;
