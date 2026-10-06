@@ -67,6 +67,7 @@
  * failed (couple stopped, main left as far as it got); 3 = bad input (no manifest, invalid, not queued).
  */
 import { execFileSync } from 'node:child_process';
+import { readGit, readGh } from './lib/proc-read.mjs';
 import { readFileSync, writeFileSync, readdirSync, mkdtempSync, rmSync, existsSync, renameSync } from 'node:fs';
 import { resolve, join, isAbsolute, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -336,7 +337,7 @@ export function planPostDrain(result) {
 // git toplevel from cwd and use it as the anchor for EVERY WE-side call — so the WE land targets the real WE
 // repo even if invoked from a subdir, rather than silently relying on cwd == WE root (review #1).
 function resolveWeRoot() {
-  try { return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: process.cwd(), encoding: 'utf8' }).trim(); }
+  try { return readGit(['rev-parse', '--show-toplevel'], { cwd: process.cwd(), encoding: 'utf8' }).trim(); }
   catch { return process.cwd(); }
 }
 
@@ -511,9 +512,9 @@ function readQueued(queuedPath) {
 // committed into the tree). Try the PR first via `gh pr list --head <ref>`; fall back to the legacy
 // tree-committed `.lane-manifest.json` off the ref for lanes queued BEFORE the cutover (drop the tree fallback
 // once the queue has fully turned over). Reading off an object/PR — never the working tree.
-function readManifestFromPrBody(CWD, ref) {
+export function readManifestFromPrBody(CWD, ref) {
   try {
-    const out = execFileSync('gh', ['pr', 'list', '--head', ref, '--state', 'open', '--json', 'body'], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const out = readGh(['pr', 'list', '--head', ref, '--state', 'open', '--json', 'body'], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
     return extractManifestFromBody(JSON.parse(out)?.[0]?.body);
   } catch { return null; } // gh absent / no open PR for the ref / no block → fall through to the ref file
 }
@@ -527,7 +528,7 @@ function readManifestOffRef(CWD, ref) {
   try { execFileSync('git', ['fetch', 'origin', ref, '--quiet'], { cwd: CWD, stdio: ['ignore', 'ignore', 'ignore'] }); } catch { /* best-effort; the ref may already be local */ }
   for (const rev of ['FETCH_HEAD', `origin/${ref}`, ref]) {
     try {
-      const txt = execFileSync('git', ['show', `${rev}:${MANIFEST_FILENAME}`], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const txt = readGit(['show', `${rev}:${MANIFEST_FILENAME}`], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
       const m = parseManifest(txt);
       if (m) return m;
     } catch { /* try the next candidate rev */ }
@@ -565,7 +566,7 @@ function regenDerived(CWD) {
 // A quiet, never-throwing git helper for the reconcile ops (best-effort — a failure is reported, never fatal:
 // the LAND already succeeded/failed, and reconcile is cleanup on top of it).
 function quietGit(CWD, a) {
-  try { return execFileSync('git', a, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim(); }
+  try { return readGit(a, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim(); }
   catch { return null; }
 }
 
@@ -986,7 +987,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     let cached = null;
     if (enabled) {
       try {
-        cachePath = resolve(CWD, execFileSync('git', ['rev-parse', '--git-path', 'we-jit-visible-hashes.json'],
+        cachePath = resolve(CWD, readGit(['rev-parse', '--git-path', 'we-jit-visible-hashes.json'],
           { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim());
         const value = JSON.parse(readFileSync(cachePath, 'utf8'));
         if (value.version === 1 && Array.isArray(value.tips) && Array.isArray(value.hashes) &&
@@ -1343,7 +1344,7 @@ export function cardPathInTree(CWD, num, { tree = 'origin/main', exec = null } =
 // local INDEX): for a freshly JIT-numbered item the `<NNN>`-named file is on main but was never in this
 // checkout's index, so the index probe reported it absent and the caller silently skipped the flip.
 function readResolveReachable(CWD, num) {
-  const tg = (a) => { try { return execFileSync('git', a, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim(); } catch { return null; } };
+  const tg = (a) => { try { return readGit(a, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim(); } catch { return null; } };
   tg(['fetch', 'origin', '--quiet']);
   const path = cardPathInTree(CWD, num);
   if (!path) return null;

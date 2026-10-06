@@ -46,7 +46,8 @@
  *
  * Exit codes: 0 = fired a drain OR intentionally no-op'd (both are success); 3 = could not spawn.
  */
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { readGit } from './lib/proc-read.mjs';
 import { openSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
@@ -140,7 +141,7 @@ if (IS_CLI) {
   const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
   // Resolve the PRIMARY checkout to drain from (never a lane clone): the cwd's git toplevel by default.
   let repo;
-  try { repo = resolve(expandHome(flags.repo) || execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: process.cwd(), encoding: 'utf8' }).trim()); }
+  try { repo = resolve(expandHome(flags.repo) || readGit(['rev-parse', '--show-toplevel'], { cwd: process.cwd(), encoding: 'utf8' }).trim()); }
   catch { repo = resolve(expandHome(flags.repo) || process.cwd()); }
   const drainScript = join(repo, 'scripts', 'merge-ai-prs.mjs');
   // Point the batch feed at the primary's copy so `--until-batches-idle` is not silently inert (#2330).

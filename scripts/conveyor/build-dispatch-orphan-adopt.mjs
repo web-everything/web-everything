@@ -71,7 +71,7 @@
  * PURE CORE / IO SHELL, the same split as `build-dispatch-daemon.mjs`.
  */
 
-import { execFileSync } from 'node:child_process';
+import { readGit } from '../lib/proc-read.mjs';
 import { normNum } from './queue-store.mjs';
 import { DISPATCH_EFFECT } from '../operations/dispatch-lane.mjs';
 // Through the REGISTRY, never `dispatch-providers/build.mjs` directly: `detached-dispatch.mjs` imports the
@@ -263,7 +263,7 @@ export function defaultCurrentLaneSession(lane, { run: runFn = run } = {}) {
  *  quoted (`core.quotePath=false`), so they compare as plain text. */
 export function defaultListLaneChangedFiles({ lane, base = 'origin/main' }) {
   try {
-    const out = execFileSync('git', ['-c', 'core.quotePath=false', 'diff', '--name-only', '--diff-filter=d', `${base}...HEAD`], {
+    const out = readGit(['-c', 'core.quotePath=false', 'diff', '--name-only', '--diff-filter=d', `${base}...HEAD`], {
       cwd: lane, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     });
     return out.split('\n').map((s) => s.trim()).filter(Boolean);
