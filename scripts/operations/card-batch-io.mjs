@@ -92,7 +92,7 @@ export async function admitCard(input, {
     const ref = `refs/heads/${recorded?.batchRef ?? `lane/card-batch-${input.kind}-${seq}`}`;
     scratch = mkdtempSync(join(tmpdir(), 'card-batch-'));
     const git = (args, options = {}) => execFileSync('git', args, {
-      cwd: scratch, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], ...options,
+      cwd: scratch, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], ...options,
       env: { ...process.env, GIT_AUTHOR_NAME: 'Card batch', GIT_AUTHOR_EMAIL: 'card-batch@localhost',
         GIT_COMMITTER_NAME: 'Card batch', GIT_COMMITTER_EMAIL: 'card-batch@localhost',
         GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
