@@ -39,11 +39,18 @@ describe('#5128 — related import graph', () => {
     expect(graph(files)).toEqual(new Map(targets.map(path => [path, new Set(['src/main.mjs'])])));
   });
 
+  it('reads vi.mock / importActual style specifiers as edges', () => {
+    const files = { 'src/a.mjs': '', 'src/b.mjs': '', 'src/c.mjs': '',
+      'src/x.test.mjs': "vi.mock('./a.mjs'); const m = await vi.importActual('./b.mjs'); vi.doMock('./c.mjs', () => ({}))" };
+    expect([...graph(files).keys()].sort()).toEqual(['src/a.mjs', 'src/b.mjs', 'src/c.mjs']);
+  });
+
   it.each([
+    ['./m.mjs', 'src/m.mts'], ['./folder2', 'src/folder2/index.tsx'], ['./folder3', 'src/folder3/index.cjs'],
     ['./g', 'src/g.mjs'], ['./h.js', 'src/h.ts'], ['./g.mjs?raw', 'src/g.mjs'],
     ['./folder', 'src/folder/index.ts'], ['node:fs', null], ['vitest', null], ['./missing', null], ['../../outside', null],
   ])('resolves %s to %s', (specifier, expected) => {
-    expect(resolveSpecifier('src/main.mjs', specifier, new Set(['src/g.mjs', 'src/h.ts', 'src/folder/index.ts'])))
+    expect(resolveSpecifier('src/main.mjs', specifier, new Set(['src/g.mjs', 'src/h.ts', 'src/folder/index.ts', 'src/m.mts', 'src/folder2/index.tsx', 'src/folder3/index.cjs'])))
       .toBe(expected);
   });
 
@@ -82,6 +89,37 @@ describe('#5128 — bounded related-test selection', () => {
     expect(selectHub({ changedFiles: ['hub.mjs'], reverse: graph(files) }))
       .toMatchObject({ status: 'selection-truncated', depth: 2, fullTestCount: 30, selectedTestCount: 30,
         tests: Object.keys(files).filter(path => path.startsWith('deep')).sort(), droppedCount: 0 });
+  });
+
+  it('keeps a changed hub reachable when an unrelated changed test would otherwise fill the list', () => {
+    const files = hubFiles();
+    delete files['direct0.test.mjs'];
+    delete files['direct1.test.mjs'];
+    const selected = selectHub({ reverse: graph(files) });
+    expect(selected.status).toBe('selection-truncated');
+    expect(selected.tests).toContain('changed.test.mjs');
+    expect(selected.tests.filter(path => path.startsWith('deep'))).toHaveLength(30);
+    expect(selected.depth).toBe(2);
+  });
+
+  it('does not add a ring for a changed file whose direct tests already run', () => {
+    expect(selectHub().tests).toEqual(['changed.test.mjs', 'direct0.test.mjs', 'direct1.test.mjs']);
+  });
+
+  it('keeps the direct importer of a changed JSON fixture alongside a truncated hub', () => {
+    const files = { ...hubFiles(), 'fixtures/data.json': '{}', 'json-user.test.mjs': "import data from './fixtures/data.json'" };
+    const selected = selectHub({ changedFiles: ['hub.mjs', 'fixtures/data.json'], reverse: graph(files) });
+    expect(selected.status).toBe('selection-truncated');
+    expect(selected.tests).toContain('json-user.test.mjs');
+    expect(selected.directTestCount).toBe(3);
+  });
+
+  it('skips a tracked file that cannot be read (deleted in the working tree) without dropping the rest of the graph', () => {
+    const files = hubFiles();
+    const reverse = buildReverseImportGraph({ files: [...Object.keys(files), 'gone.mjs'],
+      readFile: path => { if (path === 'gone.mjs') throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); return files[path]; } });
+    expect(selectRelatedTests({ changedFiles: ['hub.mjs', 'changed.test.mjs'], reverse, maxTests: 5, maxDepth: 2 }))
+      .toMatchObject({ status: 'selection-truncated', depth: 1, tests: ['changed.test.mjs', 'direct0.test.mjs', 'direct1.test.mjs'] });
   });
 
   it('ranks changed non-test hubs by transitive reach with direct counts', () => {

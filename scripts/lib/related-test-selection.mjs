@@ -13,7 +13,8 @@
  *   - Over `maxTests`: run an explicit list instead. It always holds the changed test files (which, under
  *     relatedMode 'all', include the tests that name a changed file) and every test within `maxDepth` import hops. If that is still over
  *     `maxTests`, the depth drops one hop at a time, but never below 1: a test that DIRECTLY imports a changed file
- *     always runs. The run is marked `selection-truncated` with the full and selected counts and the hub files.
+ *     always runs (a changed JSON/other tracked file counts as a target too), and every changed source file keeps at
+ *     least its nearest ring of tests. The run is marked `selection-truncated` with the full and selected counts and the hub files.
  * Helper files under a `__tests__/` directory that are not tests themselves add no depth (a shared test helper is
  * part of the test, not a separate hop).
  *
@@ -24,9 +25,9 @@
 
 // `from '<spec>'` is matched on its own, not anchored to its `import {`: a multi-line import list can hold a comment
 // with a quote or `;` in it. A stray match in a comment or string only ADDS an edge (more tests), never drops one.
-const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport\s+['"]([^'"\n]+)['"]|\brequire\s*\(\s*['"]([^'"\n]+)['"]\s*\)/g;
+const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport\s+['"]([^'"\n]+)['"]|\b(?:require|mock|doMock|unmock|doUnmock|importActual|importMock)\s*\(\s*['"]([^'"\n]+)['"]/g;
 const SOURCE_EXT_RE = /\.(?:mjs|cjs|js|jsx|ts|tsx|mts|cts)$/;
-const RESOLVE_SUFFIXES = ['', '.mjs', '.js', '.ts', '.tsx', '.cjs', '.mts', '.jsx', '/index.mjs', '/index.js', '/index.ts'];
+const RESOLVE_SUFFIXES = ['', '.mjs', '.js', '.ts', '.tsx', '.cjs', '.mts', '.jsx', '/index.mjs', '/index.js', '/index.ts', '/index.tsx', '/index.cjs', '/index.mts', '/index.jsx'];
 
 /** Is this path a vitest test file (`*.test.<js-ish>`)? */
 export function isVitestTestFile(path) {
@@ -60,18 +61,21 @@ export function resolveSpecifier(fromFile, spec, fileSet) {
   const base = normalizeJoin(fromFile, spec.split('?')[0]);
   if (base == null) return null;
   for (const suffix of RESOLVE_SUFFIXES) if (fileSet.has(base + suffix)) return base + suffix;
-  // TypeScript's `./x.js` import of `x.ts`.
-  if (/\.js$/.test(base)) for (const ext of ['.ts', '.tsx']) if (fileSet.has(base.slice(0, -3) + ext)) return base.slice(0, -3) + ext;
+  // TypeScript's `./x.js` import of `x.ts`/`x.tsx`, and `./x.mjs` / `./x.cjs` of `x.mts` / `x.cts`.
+  const swap = { '.js': ['.ts', '.tsx'], '.mjs': ['.mts'], '.cjs': ['.cts'] }[/\.(?:js|mjs|cjs)$/.exec(base)?.[0]];
+  if (swap) { const stem = base.replace(/\.(?:js|mjs|cjs)$/, ''); for (const ext of swap) if (fileSet.has(stem + ext)) return stem + ext; }
   return null;
 }
 
 /**
- * The reverse-import graph: `Map<imported file, Set<importing file>>`. Unreadable files are skipped.
+ * The reverse-import graph: `Map<imported file, Set<importing file>>`. Unreadable files (a tracked file deleted in the
+ * working tree, whose imports are gone with it) are skipped. Only source files are READ for imports, but any tracked
+ * file can be an import TARGET, so a test that imports a changed JSON fixture still has its edge.
  * @param {{files: string[], readFile: (path: string) => string}} args
  */
 export function buildReverseImportGraph({ files, readFile }) {
   const sources = files.filter(isGraphSourceFile);
-  const fileSet = new Set(sources);
+  const fileSet = new Set(files.filter((f) => !f.startsWith('node_modules/') && !f.includes('/node_modules/')));
   const reverse = new Map();
   for (const file of sources) {
     let text;
@@ -136,8 +140,16 @@ export function selectRelatedTests({ changedFiles, reverse, maxTests, maxDepth }
     if (selected.size <= maxTests || depth === 1) break;
     depth -= 1;
   }
-  // Never an empty list (an unfiltered `vitest run` is the whole suite): when no test sits within one hop, take the
-  // nearest ring of tests instead.
+  // Never an empty list (an unfiltered `vitest run` is the whole suite), and every changed source file keeps at least
+  // one test that reaches it: a changed file with no selected test in its reach (it has no test within the kept depth,
+  // or its only reach was dropped while an unrelated changed test filled the list) gets its nearest ring instead.
+  for (const file of changed.filter((f) => !isVitestTestFile(f))) {
+    const reach = testDepths([file], reverse);
+    if (!reach.size || [...reach.keys()].some((t) => selected.has(t))) continue;
+    const ring = Math.min(...reach.values());
+    for (const [test, d] of reach) if (d <= ring) selected.add(test);
+    depth = Math.max(depth, ring);
+  }
   if (selected.size === 0) {
     depth = Math.min(...depths.values());
     for (const [test, d] of depths) if (d <= depth) selected.add(test);

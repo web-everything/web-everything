@@ -969,6 +969,31 @@ describe('#5128 — bounded related-test selection', () => {
     expect(plan.decision.selection ?? null).toBeNull();
   });
 
+  it('keeps vitest related, with no selection, when git or the graph throws', () => {
+    const git = fakeGit(['scripts/hub.mjs']);
+    for (const [label, runGit, readRepoFile] of [
+      ['ls-files throws', args => { if (args[0] === 'ls-files' && args.includes('--cached')) throw new Error('git broke'); return git(args); }, () => ''],
+      ['every graph read throws', args => args[0] === 'ls-files' && args.includes('--cached') ? 'scripts/hub.mjs' : git(args),
+        () => { throw new TypeError('boom'); }],
+    ]) {
+      const gate = resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: 1, relatedDepth: 2 }, runGit, readRepoFile });
+      expect(gate.testCommand, label).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
+      expect(gate.decision, label).not.toHaveProperty('selection', expect.objectContaining({ status: 'selection-truncated' }));
+    }
+  });
+
+  it('keeps vitest related when the bounded list is longer than one command line can carry', () => {
+    const files = { 'scripts/hub.mjs': '' };
+    for (let i = 0; i < 400; i++) files[`scripts/${'x'.repeat(90)}${i}.test.mjs`] = "import './hub.mjs'";
+    const git = fakeGit(['scripts/hub.mjs']);
+    const gate = resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: 3, relatedDepth: 2 },
+      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
+      readRepoFile: path => files[path] });
+    expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
+    expect(gate.decision.selection).toMatchObject({ status: 'complete', tests: null });
+    expect(gate.decision.selection.reason).toContain('list unusable');
+  });
+
   it('keeps vitest related under the limit', () => {
     const gate = boundedGate(50);
     expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");

@@ -83,6 +83,26 @@ export const MAX_BUILD_RUNS = 5;
 export const DEFAULT_FAST_SLOTS = 1;
 export const FAST_SLOTS_ENV = 'WE_HEAVY_ADMISSION_FAST_SLOTS';
 
+const BOOLEAN_VITEST_FLAGS = new Set(['--run', '--passWithNoTests', '--silent']);
+/**
+ * #5128 — over every `vitest run` segment (split on `&&`, `||`, `;`, `|`, newline) of `cmd`: `null` when there is none,
+ * else whether EACH one names an explicit test file (the verify gate's bounded related list). A bare or flag-only
+ * `vitest run` is the whole suite. A flag's value (`--config x.ts`, `-c x.mjs`, `--reporter=./r.mjs`) is never a target:
+ * a token counts only when it does not start with `-` and does not follow a value-taking flag.
+ */
+function vitestRunSegmentsNameFiles(cmd) {
+  const segments = cmd.split(/&&|\|\||[;|\n]/).filter((s) => /\bvitest\s+run\b/.test(s));
+  if (!segments.length) return null;
+  return segments.every((segment) => {
+    const tokens = segment.slice(segment.search(/\bvitest\s+run\b/)).split(/\s+/).slice(2).map((t) => t.replace(/^['"]|['"]$/g, ''));
+    return tokens.some((t, i) => {
+      if (!/\.(?:mjs|cjs|js|jsx|ts|tsx|mts|cts)$/.test(t) || t.startsWith('-')) return false;
+      const prev = tokens[i - 1];
+      return !(prev && prev.startsWith('-') && !prev.includes('=') && !BOOLEAN_VITEST_FLAGS.has(prev));
+    });
+  });
+}
+
 /**
  * Classify a heavy command line into a {@link HEAVY_KINDS} kind. Pure. The order matters: an unconditional full
  * suite (`test:unit`, `test:coverage`, a bare `vitest run`) wins over everything else in the same chain; a
@@ -95,7 +115,10 @@ export function classifyCommandKind(command) {
   if (!cmd) return 'other';
   const standards = /check[-:]standards/.test(cmd);
   if (/\bnpm\s+(?:run\s+)?test(?::unit|:coverage)?\b/.test(cmd) || /\btest:(?:unit|coverage)\b/.test(cmd)) return 'FULL';
-  if (/\bvitest\s+related\b/.test(cmd)) return standards ? 'selected' : 'files';
+  // A `vitest run` segment without an explicit test file is a whole suite wherever it sits in the chain.
+  const runNamesFiles = vitestRunSegmentsNameFiles(cmd);
+  if (runNamesFiles === false) return 'FULL';
+  if (/\bvitest\s+related\b/.test(cmd) || runNamesFiles) return standards ? 'selected' : 'files';
   if (/\bvitest(?:\s+run)?\b/.test(cmd)) return 'FULL';
   if (standards) return 'standards';
   return 'other';
