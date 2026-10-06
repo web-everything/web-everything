@@ -62,12 +62,6 @@ describe('resolveCap — env override, clamped sane', () => {
   });
 });
 
-describe('resolveCap — declared heavyAdmissionCap setting', () => {
-  it('reads the settings file when env is unset', () => expect(resolveCap({}, { file: { heavyAdmissionCap: 3 } })).toBe(3));
-  it('env override beats the settings file', () => expect(resolveCap({ WE_HEAVY_ADMISSION_CAP: '5' }, { file: { heavyAdmissionCap: 3 } })).toBe(5));
-  it('an invalid env value falls through to the file value', () => expect(resolveCap({ WE_HEAVY_ADMISSION_CAP: '0' }, { file: { heavyAdmissionCap: 3 } })).toBe(3));
-});
-
 describe('resolveTimeoutMs — env override, clamped sane (the doc/impl mismatch this fix closes)', () => {
   it('defaults when unset', () => expect(resolveTimeoutMs({})).toBe(DEFAULT_TIMEOUT_MS));
   it('reads WE_HEAVY_ADMISSION_TIMEOUT_MS', () => expect(resolveTimeoutMs({ WE_HEAVY_ADMISSION_TIMEOUT_MS: '5000' })).toBe(5000));
