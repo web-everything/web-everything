@@ -96,16 +96,23 @@ export function gitControlFiles(dir) {
 }
 
 /**
- * HEAD + porcelain status (ignored files included) + a content hash of every file the status lists, so a further
- * edit to an already-dirty file is still seen (PR #4131 review). `control` is checked first by the caller.
+ * HEAD + porcelain status + a content hash of every file the status lists, so a further edit to an already-dirty file
+ * is still seen (PR #4131 review). `control` is checked first by the caller.
+ *
+ * IGNORED FILES ARE NOT SNAPSHOTTED, and a SHARED checkout (`untracked: false`) is watched on tracked files only.
+ * Measured on the first live shadow run (PR #4133, 2026-10-06): the review daemon's checkout lists ~25,800 ignored
+ * entries (run records, jury logs, daemon logs) that its concurrent runs rewrite every few seconds, so watching them
+ * voided a clean seat ("change outside the juror lane: this checkout") and hashing them cost minutes. A write the
+ * snapshot does not see is still caught by the transcript allowlist, which voids ANY completed non-read tool call
+ * wherever it points.
  */
-export function snapshotCheckout(dir, exec = defaultExec, { control = gitControlFiles } = {}) {
+export function snapshotCheckout(dir, exec = defaultExec, { control = gitControlFiles, untracked = true } = {}) {
   try {
     const head = exec('git', ['-C', dir, 'rev-parse', 'HEAD']).trim();
-    // `-z`: paths come back verbatim (no octal quoting of non-ASCII names, so each can be content-hashed). `matching`
-    // collapses a wholly-ignored directory (node_modules, _site) to one entry instead of listing tens of thousands of
-    // files; the transcript allowlist is the check for a write inside one.
-    const raw = exec('git', ['-C', dir, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']);
+    // `-z`: paths come back verbatim (no octal quoting of non-ASCII names, so each can be content-hashed). Ignored
+    // files are never listed (see this function's header: the live false void), and a shared checkout lists no
+    // untracked files either; the transcript allowlist is the check for a write there.
+    const raw = exec('git', ['-C', dir, 'status', '--porcelain=v1', '-z', `--untracked-files=${untracked ? 'all' : 'no'}`, '--ignored=no']);
     const entries = [];
     const fields = raw.split('\0');
     for (let i = 0; i < fields.length; i++) {
@@ -243,7 +250,9 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     // Reasons name a checkout by its ROLE, never its absolute path: they reach the run record and, for a skipped
     // advisory seat, the PR comment (PR #4131 review: no local username or lane layout there).
     const label = (d) => (d === resolve(laneCwd) ? 'the review lane' : d === resolve(repoRoot) ? 'this checkout' : `watched checkout #${watched.indexOf(d) + 1}`);
-    const before = Object.fromEntries(watched.map((d) => [d, snapshotCheckout(d, exec)]));
+    // The review lane is this review's own; every other watched checkout is shared with concurrent runs.
+    const snapOpts = (d) => ({ untracked: d === resolve(laneCwd) });
+    const before = Object.fromEntries(watched.map((d) => [d, snapshotCheckout(d, exec, snapOpts(d))]));
     const laneControl = gitControlFiles(jurorLane);
 
     let outcome;
@@ -274,7 +283,7 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     const controlAfter = Object.fromEntries(watched.map((d) => [d, gitControlFiles(d)]));
     const controlChanged = new Set(changedControl(before, controlAfter));
     for (const dir of controlChanged) reasons.push(`git config, hooks or attributes changed outside the juror lane: ${label(dir)}`);
-    const after = Object.fromEntries(watched.filter((d) => !controlChanged.has(d)).map((d) => [d, snapshotCheckout(d, exec)]));
+    const after = Object.fromEntries(watched.filter((d) => !controlChanged.has(d)).map((d) => [d, snapshotCheckout(d, exec, snapOpts(d))]));
     const comparable = Object.fromEntries(Object.entries(before).filter(([d]) => !controlChanged.has(d)));
     for (const dir of changedCheckouts(comparable, after)) reasons.push(`change outside the juror lane: ${label(dir)}`);
     const transcriptFile = outcome?.transcriptFile ?? spawnError?.telemetry?.transcriptFile ?? null;
@@ -288,7 +297,10 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     }
 
     const common = { sessionId: outcome?.sessionId || null, servedModel: outcome?.servedModel, transcriptFile };
-    if (reasons.length) return result('voided', { ...common, reasons });
+    // A voided run that ALSO failed keeps the failure, so the agreement row says why there was no answer.
+    if (spawnError) reasons.push(`and the juror gave no answer: ${scrubPaths(spawnError.message ?? spawnError, [jurorLane, laneCwd, repoRoot])}`);
+    if (reasons.length > (spawnError ? 1 : 0)) return result('voided', { ...common, reasons });
+    if (spawnError) reasons.pop();
     if (spawnError) return result('failed', { ...common, reasons: [scrubPaths(spawnError.message ?? spawnError, [jurorLane, laneCwd, repoRoot])] });
     const value = outcome.value && typeof outcome.value === 'object' ? outcome.value : {};
     return result('ok', {

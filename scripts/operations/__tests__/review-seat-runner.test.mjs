@@ -196,7 +196,7 @@ describe('void-on-escape — the agy juror\'s three escape checks (real git, fak
       expect(r.status).toBe('voided');
       expect(r.reasons.join('\n')).toContain('change outside the juror lane: the review lane');
       expect(r.reasons.join('\n')).not.toContain(fx.root); // no local paths in a reason that can reach the PR
-      const r2 = await run(fx, { act: () => writeFileSync(join(fx.other, 'evil.txt'), 'x') });
+      const r2 = await run(fx, { act: () => writeFileSync(join(fx.other, 'math.mjs'), 'tampered too\n') });
       expect(r2.status).toBe('voided');
       expect(r2.reasons.join('\n')).toContain('change outside the juror lane: this checkout');
     } finally { fx.cleanup(); }
@@ -272,9 +272,9 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
 describe('the agy spawn in read-cwd mode', () => {
   it('tells the juror it may read its checkout and must not run or write anything; the default stays tool-free', () => {
     const readOnly = buildAntigravityPrompt('M', 'I', { toolPolicy: 'read-cwd', readDir: '/tmp/juror' });
-    expect(readOnly).toContain('You MAY read files');
+    expect(readOnly).toContain('use ONLY these tools');
     expect(readOnly).toContain('"/tmp/juror"');
-    expect(readOnly).toContain('may NOT write');
+    expect(readOnly).toContain('Never write');
     expect(readOnly).not.toContain(ANTIGRAVITY_TOOL_FREE_CORRECTION);
     expect(buildAntigravityPrompt('M', 'I')).toContain(ANTIGRAVITY_TOOL_FREE_CORRECTION);
   });
@@ -408,5 +408,51 @@ describe('PR #4131 review fixes', () => {
       { step_type: 'tool', step_index: 3, state: 'ACTIVE', tool_name: 'write_to_file' },
       { step_type: 'tool', step_index: 3, state: 'DONE', status: 'TOOL_ERROR', tool_name: 'write_to_file' },
     ]))).toEqual([]);
+  });
+});
+
+describe('first live shadow run (PR #4133) — the shared checkout\'s own churn is not an escape', () => {
+  it('untracked and ignored files appearing in the shared checkout during the run do not void the seat', async () => {
+    const fx = fixtureLane();
+    try {
+      writeFileSync(join(fx.other, '.gitignore'), '.conveyor/\n');
+      execFileSync('git', ['-C', fx.other, 'add', '.gitignore']);
+      execFileSync('git', ['-C', fx.other, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'ignore']);
+      const r = await runAgyReviewJuror({
+        request: REQUEST, laneCwd: fx.lane, model: 'm',
+        deps: { repoRoot: fx.other, spawnJudge: async () => {
+          const t = join(fx.root, 't.jsonl'); writeFileSync(t, '');
+          execFileSync('mkdir', ['-p', join(fx.other, '.conveyor')]);
+          writeFileSync(join(fx.other, '.conveyor', 'daemon.log'), 'a concurrent run logged');
+          writeFileSync(join(fx.other, 'backlog-card.md'), 'a concurrent run filed a card');
+          return { value: { summary: 's', findings: [] }, sessionId: 'agy-1', transcriptFile: t };
+        } },
+      });
+      expect(r.status).toBe('ok');
+    } finally { fx.cleanup(); }
+  });
+
+  it('a juror that tried a shell command is voided, and the row keeps why it gave no answer', async () => {
+    const fx = fixtureLane();
+    try {
+      const r = await runAgyReviewJuror({
+        request: REQUEST, laneCwd: fx.lane, model: 'm',
+        deps: { repoRoot: fx.other, spawnJudge: async () => {
+          const t = join(fx.root, 't.jsonl');
+          writeFileSync(t, transcriptWith([{ step_type: 'tool', state: 'DONE', tool_name: 'run_command', tool_info: { parameters: { CommandLine: 'ls' } } }]));
+          const e = new Error('antigravity-judge-spawn: tool denied, no structured_output'); e.telemetry = { transcriptFile: t }; throw e;
+        } },
+      });
+      expect(r.status).toBe('voided');
+      expect(r.reasons[0]).toMatch(/run_command/);
+      expect(r.reasons.at(-1)).toMatch(/^and the juror gave no answer: .*tool denied/);
+    } finally { fx.cleanup(); }
+  });
+
+  it('the read-only correction leads and closes the prompt and names the allowed tools', () => {
+    const prompt = buildAntigravityPrompt('PANEL MANDATE: run the gate', 'I', { toolPolicy: 'read-cwd', readDir: '/tmp/j' });
+    expect(prompt.indexOf('NEVER use run_command')).toBeLessThan(prompt.indexOf('PANEL MANDATE'));
+    expect(prompt.lastIndexOf('NEVER use run_command')).toBeGreaterThan(prompt.indexOf('PANEL MANDATE'));
+    expect(prompt).toContain('list_dir, view_file, grep_search');
   });
 });
