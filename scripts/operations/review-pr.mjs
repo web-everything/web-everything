@@ -1,5 +1,7 @@
 import { requiresMandatoryReferral, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
-  referralKeyFinding, findingIdentityEntry, bindFindingIds } from '../lib/jury-core.mjs';
+  referralKeyFinding, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable } from '../lib/jury-core.mjs';
+// Card 84 — the per-seat provider directive (`review.seatProvider.<lens>`). PURE; the settings are read by the caller.
+import { seatProviderDirective } from '../lib/review-seat-provider.mjs';
 /**
  * @file scripts/operations/review-pr.mjs
  * @description THE `review-pr` DECLARATION — the first real operation on the engine (#3035, under epic #3029).
@@ -528,11 +530,23 @@ export const ANTIGRAVITY_REVIEW_LENS = 'antigravity-review';
 export const ANTIGRAVITY_REVIEW_SEAT = Object.freeze({ step: 'judgeAntigravityReview', lens: ANTIGRAVITY_REVIEW_LENS });
 
 /**
+ * Card 84 — THE SIXTH SEAT'S LENS: an ADVISORY agy juror (`review.advisorySeats.agyCorrectness`) judging for
+ * correctness from its OWN read-only checkout of the PR (`we:scripts/lib/agy-review-juror.mjs`). Same disjoint-lens
+ * reasoning as {@link CORRECTNESS_ADVISORY_LENS}: never a `MANDATORY_LENSES` or `PANEL_LENSES` member, so it can
+ * never block (operator: this seat is never mandatory; a mandatory seat moves to agy only through
+ * `review.seatProvider.<lens>` after shadow proof).
+ */
+export const AGY_CORRECTNESS_LENS = 'agy-correctness';
+
+/** Card 84 — THE SIXTH SEAT, AS DATA, opt-in via the settings (see `reviewPrOperation`'s `seatSettings`). */
+export const AGY_CORRECTNESS_SEAT = Object.freeze({ step: 'judgeAgyCorrectness', lens: AGY_CORRECTNESS_LENS });
+
+/**
  * #3907 — EVERY opt-in advisory seat (3, 4 and 5), by step. An advisory seat never blocks: its findings are left
  * out of `verdictAdmitted` (the basis `derivePanelVerdict` reduces over), because that reduction's prevention scan
  * reads `findings` without regard to `mandatoryLenses`, so an advisory lens left in it could still block.
  */
-export const ADVISORY_SEAT_STEPS = Object.freeze([ADVISORY_JUDGE_SEAT, CORRECTNESS_ADVISORY_SEAT, ANTIGRAVITY_REVIEW_SEAT].map((s) => s.step));
+export const ADVISORY_SEAT_STEPS = Object.freeze([ADVISORY_JUDGE_SEAT, CORRECTNESS_ADVISORY_SEAT, ANTIGRAVITY_REVIEW_SEAT, AGY_CORRECTNESS_SEAT].map((s) => s.step));
 
 /**
  * #3383 — THE ENV VAR NAME both `run.mjs` and `record-verdict-io.mjs` read to decide `antigravityReview`,
@@ -573,6 +587,20 @@ export function antigravityReviewFromEnv(env = process.env, { isOnProbation = de
 export function codexAdvisoryFromRun(record) {
   return Boolean(record && typeof record === 'object' && record.findings && typeof record.findings === 'object'
     && Object.prototype.hasOwnProperty.call(record.findings, ADVISORY_JUDGE_SEAT.step));
+}
+
+/**
+ * Card 84 — THE SEAT SETTINGS A SAVED RUN WAS STARTED WITH, for a resume: the provider directives come from the live
+ * settings (they change no step), but whether the advisory agy seat is declared is read off the RUN, exactly like
+ * {@link codexAdvisoryFromRun}, so a settings flip between start and resume cannot change the roster under it.
+ * @param {object|null|undefined} record
+ * @param {object|null} settings - the live resolved settings.
+ */
+export function seatSettingsForRun(record, settings) {
+  if (!settings) return settings;
+  const seated = Boolean(record && typeof record === 'object' && record.findings && typeof record.findings === 'object'
+    && Object.prototype.hasOwnProperty.call(record.findings, AGY_CORRECTNESS_SEAT.step));
+  return { ...settings, agyCorrectnessAdvisory: seated };
 }
 
 /**
@@ -1060,7 +1088,15 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
   // the write-up can state what the touch-set EARNED beside what actually SAT.
   const earnedShape = assertDeclaredShapeHolds({ careLevel, netChangedFiles, pr, repo });
 
+  // Card 84 — the PR's finding-identity table (#76a/#76b), for the agy shadow agreement. Only when referral records
+  // exist, so a run without any is byte-identical to before.
+  let findingIdentity = [];
+  try {
+    findingIdentity = findingIdentityTable(readReferralRecords(raw.comments ?? []).records)
+      .map(({ findingId, path, lens, normSummary, anchor, forms, heads }) => ({ findingId, path, lens, normSummary, anchor, forms, heads }));
+  } catch { findingIdentity = []; }
   return {
+    ...(findingIdentity.length ? { findingIdentity } : {}),
     hasReferralRecord: JSON.stringify(raw.comments ?? []).includes('mandatory-referrals-v1'),
     priorRounds: Number(raw?.priorRounds) || 0,
     latestFix: raw?.latestFix && typeof raw.latestFix === 'object' ? raw.latestFix : undefined,
@@ -1197,8 +1233,12 @@ export function overridesJuror({ verdict, answer } = {}) {
  * @param {string} [o.aim] - the caller's #3094 hypothesis, or `''`.
  * @returns {object} the judge request.
  */
-export function buildReviewJudgeRequest({ read, lens, aim = '' }) {
+export function buildReviewJudgeRequest({ read, lens, aim = '', seatProvider = null }) {
   return {
+    // Card 84 — `review.seatProvider.<lens>` = agy | shadow rides here (absent for a plain Claude seat), with what
+    // the seat runner needs to label its agreement row. `createDefaultJudge` hands such a request to
+    // `we:scripts/operations/review-seat-runner.mjs`.
+    ...(seatProvider ? { seatProvider: withSeatContext(seatProvider, read, lens) } : {}),
     // GROUND TRUTH goes in as the NET list, never `ghDiffStat` (#2450).
     // `fenced: true` (#2967) — `read.title` is the PR title straight off `gh pr view`, written by whoever
     // opened the PR, so it goes to the juror inside the #2438 labelled data fence rather than in
@@ -1490,6 +1530,56 @@ export function buildReviewAntigravityJudgeRequest({ read, aim = '' }) {
     // #3383 — PINS THIS SEAT TO ANTIGRAVITY, independent of the run's `--provider` flag, exactly like both
     // existing Codex seats pin themselves to `codex`. See `createDefaultJudge`.
     providerName: 'antigravity',
+  };
+}
+
+/** Card 84 — a seat directive plus the run context the seat runner records on its agreement row. PURE. */
+function withSeatContext(directive, read, seat) {
+  return {
+    ...directive, seat, repo: read.repo, pr: read.pr, head: read.netBasis?.rev ?? null,
+    ...(Array.isArray(read.findingIdentity) && read.findingIdentity.length ? { identityTable: read.findingIdentity } : {}),
+  };
+}
+
+/** Card 84 — the sixth seat's framing: advisory, independent, and confined to reading its own checkout. */
+export const AGY_CORRECTNESS_FRAMING = [
+  'You are an INDEPENDENT correctness reviewer running ALONGSIDE this PR\'s panel — a structurally different opinion',
+  'on the SAME diff a separate, mandatory `correctness`-lensed juror ALSO judges. You cannot see its findings and it',
+  'cannot see yours. Judge for genuine correctness bugs: logic errors, broken invariants, behaviour this diff',
+  'introduces that is actually wrong. Your verdict is ADVISORY: it is reported to the operator and never blocks this',
+  'PR on its own. Do NOT soften a finding because of that. You may READ files in your working directory (a checkout',
+  'of this PR) to check the diff against the code around it; you cannot run commands or change files.',
+].join(' ');
+
+/** Card 84 — the sixth seat's mandate (ungated `buildMandate`, like the fourth and fifth seats). PURE. */
+export function buildReviewAgyCorrectnessMandate({ read, aim = '' }) {
+  const base = buildMandate({ mandate: DEFAULT_LENS, goal: read.title, fenced: true });
+  const parts = [base, AGY_CORRECTNESS_FRAMING];
+  const aimText = typeof aim === 'string' ? aim.trim() : '';
+  if (aimText) {
+    if (!base.includes(FENCED_DATA_RULE)) parts.push(FENCED_DATA_RULE);
+    parts.push(
+      'WHERE THE CALLER THINKS THE DEFECT IS — A HYPOTHESIS, NOT ESTABLISHED. Search there first and report what you',
+      'actually find; if it is not there, say so. The hypothesis, quoted verbatim:',
+      fenceUntrusted('aim', aimText),
+    );
+  }
+  return parts.join(' ');
+}
+
+/**
+ * Card 84 — THE SIXTH SEAT'S RECIPE. No `allowedTools`, no `providerName`: the `seatProvider` directive
+ * (`mode: 'agy'`, `onEscape: 'skip'`) routes it to the agy juror, and an escape or failure records the seat as
+ * skipped rather than spending a Claude juror on an advisory opinion. PURE.
+ */
+export function buildReviewAgyCorrectnessJudgeRequest({ read, aim = '', model }) {
+  return {
+    mandate: buildReviewAgyCorrectnessMandate({ read, aim }),
+    input: renderJudgeInput(read),
+    shape: REVIEW_JUDGE_SHAPE,
+    lens: AGY_CORRECTNESS_LENS,
+    budget: JUDGE_BUDGET_USD,
+    seatProvider: withSeatContext({ mode: 'agy', model, onEscape: 'skip' }, read, AGY_CORRECTNESS_LENS),
   };
 }
 
@@ -1922,7 +2012,15 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
  */
 export function reviewPrOperation({
   readPr, codexAdvisory = false, correctnessAdvisory = false, antigravityReview = false,
+  // Card 84 — the resolved `review.*` seat settings (`we:scripts/lib/review-seat-provider.mjs`). `null` = every seat
+  // on Claude and no agy seat, i.e. exactly the declaration before this card.
+  seatSettings = null,
 } = {}) {
+  const agyCorrectness = seatSettings?.agyCorrectnessAdvisory === true;
+  if (agyCorrectness && (MANDATORY_LENSES.includes(AGY_CORRECTNESS_LENS) || PANEL_LENSES.includes(AGY_CORRECTNESS_LENS))) {
+    throw new Error(`review-pr: \`AGY_CORRECTNESS_LENS\` (${AGY_CORRECTNESS_LENS}) must stay outside MANDATORY_LENSES/PANEL_LENSES — it is advisory only.`);
+  }
+  const directiveFor = (lens) => (seatSettings ? seatProviderDirective(seatSettings, lens) : null);
   if (typeof readPr !== 'function') {
     throw new TypeError(
       'review-pr: needs a `readPr({pr, repo})` reader — the io is INJECTED so the declaration stays testable '
@@ -1988,6 +2086,7 @@ export function reviewPrOperation({
   if (codexAdvisory) seats = [...seats, ADVISORY_JUDGE_SEAT];
   if (correctnessAdvisory) seats = [...seats, CORRECTNESS_ADVISORY_SEAT];
   if (antigravityReview) seats = [...seats, ANTIGRAVITY_REVIEW_SEAT];
+  if (agyCorrectness) seats = [...seats, AGY_CORRECTNESS_SEAT];
   seats = Object.freeze(seats);
 
   const declaration = op(REVIEW_PR_OP, {
@@ -2163,6 +2262,7 @@ export function reviewPrOperation({
         // above: a step that consumes an input without declaring it is reading state the run record does not
         // record it as depending on.
         aim: typeof view.input.aim === 'string' ? view.input.aim : '',
+        seatProvider: directiveFor(view.input.lens),
       }),
     }),
 
@@ -2192,6 +2292,7 @@ export function reviewPrOperation({
         read: view.findings.read,
         lens: SECURITY_LENS,
         aim: typeof view.input.aim === 'string' ? view.input.aim : '',
+        seatProvider: directiveFor(SECURITY_LENS),
       }),
     }),
 
@@ -2269,6 +2370,21 @@ export function reviewPrOperation({
       }),
     } : {}),
 
+    // ── (opt-in) judgeAgyCorrectness ───────────────────────────────────────────────────────────────────────
+    // Card 84 — THE SIXTH SEAT, declared only when `review.advisorySeats.agyCorrectness` is on. Reads none of the
+    // sibling jurors' findings; advisory by construction (`AGY_CORRECTNESS_LENS` is outside `MANDATORY_LENSES`, and
+    // its step is in `ADVISORY_SEAT_STEPS`, so it never reaches the verdict basis).
+    ...(agyCorrectness ? {
+      judgeAgyCorrectness: judgeStep({
+        reads: ['input.aim', 'findings.read'],
+        request: (view) => buildReviewAgyCorrectnessJudgeRequest({
+          read: view.findings.read,
+          aim: typeof view.input.aim === 'string' ? view.input.aim : '',
+          model: seatSettings.agyModel,
+        }),
+      }),
+    } : {}),
+
     // ── 4. reduce ───────────────────────────────────────────────────────────────────────────────────────────
     // THE PANEL REDUCER DECIDES; this step only feeds it. `derivePanelVerdict` (`we:scripts/lib/jury-core.mjs`)
     // is #2310's ratified reduction and is IMPORTED, never restated — adding a second answer to "what does this
@@ -2304,6 +2420,8 @@ export function reviewPrOperation({
         ...(correctnessAdvisory ? ['findings.judgeCorrectnessAdvisory'] : []),
         // #3383 — SAME RULE, for the fifth seat, independent of both Codex seats' own flags.
         ...(antigravityReview ? ['findings.judgeAntigravityReview'] : []),
+        // Card 84 — SAME RULE, for the sixth seat.
+        ...(agyCorrectness ? ['findings.judgeAgyCorrectness'] : []),
       ],
       fn: (view) => {
         const read = view.findings.read;
@@ -2351,6 +2469,10 @@ export function reviewPrOperation({
               answer: view.findings.judgeAntigravityReview,
               provider: 'antigravity, advisory',
             }]
+            : []),
+          // Card 84 — THE SIXTH SEAT, ONLY WHEN SEATED.
+          ...(agyCorrectness
+            ? [{ step: AGY_CORRECTNESS_SEAT.step, lens: AGY_CORRECTNESS_LENS, answer: view.findings.judgeAgyCorrectness, provider: 'agy, advisory' }]
             : []),
         ];
 
@@ -2460,9 +2582,20 @@ export function reviewPrOperation({
         // #xqa9ttq — WHICH LENS RAN ON A NON-CLAUDE PROVIDER, keyed the same way as `lensVerdicts` so the
         // renderer can zip the two together. Built straight off `seats` (never re-derived from the lens name),
         // so a future non-codex provider seat carries its own label for free.
-        const lensProviders = Object.fromEntries(
-          seats.filter((s) => s.provider).map((s) => [s.lens, s.provider]),
-        );
+        const lensProviders = Object.fromEntries([
+          ...seats.filter((s) => s.provider).map((s) => [s.lens, s.provider]),
+          // Card 84 — a mandatory seat that ran on agy (`review.seatProvider.<lens>: agy`) or had an agy shadow says
+          // so in the panel table; a fallback to Claude reads as plain Claude.
+          ...seats.filter((s) => !s.provider && s.answer?.seatProvider?.provider === 'agy').map((s) => [s.lens, 'agy']),
+          ...seats.filter((s) => !s.provider && s.answer?.shadow).map((s) => [s.lens, `claude; agy shadow ${s.answer.shadow.status}`]),
+        ]);
+        // Card 84 — THE SHADOW RESULTS, recorded beside the verdict and never reduced into it.
+        const shadowSeats = seats.filter((s) => s.answer?.shadow && typeof s.answer.shadow === 'object').map((s) => ({
+          step: s.step, lens: s.lens, provider: 'agy', model: s.answer.shadow.model ?? null,
+          status: s.answer.shadow.status, reasons: s.answer.shadow.reasons ?? [],
+          claudeVerdict: s.answer.shadow.claudeVerdict ?? null, agyVerdict: s.answer.shadow.agyVerdict ?? null,
+          verdictAgree: s.answer.shadow.verdictAgree ?? null, overlap: s.answer.shadow.overlap ?? null,
+        }));
         const humanRequired = read.humanRequired === true;
         const verdict = derivePanelVerdict({
           lensVerdicts: panelLensVerdicts,
@@ -2514,6 +2647,7 @@ export function reviewPrOperation({
           unverifiableCitations: unverifiableCitations.length,
           summary: summaries.join(' | '),
           skippedSeats,
+          ...(shadowSeats.length ? { shadowSeats } : {}),
         };
       },
     }),
