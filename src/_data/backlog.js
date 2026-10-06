@@ -22,6 +22,12 @@
 const { readdirSync, readFileSync, existsSync } = require('node:fs');
 const { join } = require('node:path');
 const matter = require('gray-matter');
+const { createHash } = require('node:crypto');
+const { createBacklogIndex } = require('../../scripts/lib/backlog-index.cjs');
+const LOADER_VERSION = createHash('sha1')
+  .update(readFileSync(__filename))
+  .update(JSON.parse(readFileSync(require.resolve('gray-matter/package.json'), 'utf8')).version)
+  .digest('hex');
 const { normalizeRelatedReport } = require('../../scripts/lib/related-report.cjs');
 const MarkdownIt = require('markdown-it');
 
@@ -354,8 +360,11 @@ function buildBacklog(fileNames) {
   // Eleventy, check:readiness, check:standards. We catch per-item, skip the bad file, and collect
   // it so the failure degrades to a reported warning, not a crash.
   const malformed = [];
-  const items = (Array.isArray(fileNames) ? fileNames : readdirSync(BACKLOG_DIR).filter((f) => f.endsWith('.md')))
-    .map((file) => {
+  const files = Array.isArray(fileNames) ? fileNames : readdirSync(BACKLOG_DIR).filter((f) => f.endsWith('.md'));
+  const index = createBacklogIndex({
+    backlogDir: BACKLOG_DIR,
+    loaderVersion: LOADER_VERSION,
+    readCard(file, { skipCache }) {
       const id = file.replace(/\.md$/, '');
       // Filenames lead with EITHER a numeric `NNN` (a LANDED item) or a provisional `xNNNNNN` hash (an
       // in-flight item the drain has not numbered yet — #2288 JIT numbering). `num` is that leading
@@ -369,13 +378,16 @@ function buildBacklog(fileNames) {
       const slug = id.replace(new RegExp(`^(${ID_TOKEN})-`), '');
       let data, content;
       try {
-        ({ data, content } = matter(readFileSync(join(BACKLOG_DIR, file), 'utf8')));
+        // Explicit options bypass gray-matter's cache, which retains even failed parses.
+        ({ data, content } = matter(readFileSync(join(BACKLOG_DIR, file), 'utf8'), {}));
       } catch (err) {
         // Skip-and-report: one malformed item is a warning, never a crash.
         malformed.push({ file, reason: err.reason || err.message });
         return null;
       }
       const ownBody = content.trim();
+      // Report pointers depend on a separate, ROOT-relative file: always re-parse them.
+      if (!ownBody && typeof data.relatedReport === 'string') skipCache();
 
       // Own markdown body wins; else mirror the related report; else nothing.
       const src = ownBody
@@ -402,8 +414,9 @@ function buildBacklog(fileNames) {
         scope: normalizeScope(data.scope),
         details: src.details || data.details || undefined,
       };
-    })
-    .filter(Boolean); // drop items whose frontmatter failed to parse (reported below)
+    },
+  });
+  const items = index.load(files).filter(Boolean); // drop malformed cards (reported below)
 
   if (malformed.length) {
     const lines = malformed.map((m) => `  • ${m.file} — ${m.reason}`).join('\n');
