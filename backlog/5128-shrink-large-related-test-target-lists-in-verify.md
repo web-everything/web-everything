@@ -2,9 +2,10 @@
 bornAs: x25udmp
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/verify-lane.mjs", "we:scripts/lib/verify-lane-gate.mjs", "we:scripts/lib/related-test-selection.mjs", "we:scripts/lib/verify-settings.mjs", "we:scripts/verify-settings.json"]
 dateOpened: "2026-10-05"
+dateResolved: "2026-10-06"
 tags: []
 ---
 
