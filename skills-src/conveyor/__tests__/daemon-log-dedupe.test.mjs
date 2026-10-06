@@ -1,12 +1,15 @@
 /** Item 68b — collapse identical repeated daemon log lines, rotate by size, keep every health reader exact. */
 import { describe, it, expect } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, appendFileSync, mkdirSync, utimesSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, appendFileSync, mkdirSync, utimesSync, openSync, closeSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installDaemonLog, logSettings, dedupable, rotateLogIfNeeded, createDeduper } from '../daemon-log.mjs';
-import { expandRepeatedLines, formatRepeatLine, LOG_TIMESTAMP_RE } from '../../../scripts/lib/log-timestamp.mjs';
-import { parseDaemonLog } from '../../../scripts/conveyor/health-watch-core.mjs';
+import { installDaemonLog, logSettings, dedupable, rotateLogIfNeeded, createDeduper, DEFAULT_DEDUPE_WINDOW_MS } from '../daemon-log.mjs';
+import { expandRepeatedLines, formatRepeatLine, neutralizeMarkerText, LOG_TIMESTAMP_RE } from '../../../scripts/lib/log-timestamp.mjs';
+import { parseDaemonLog, foldDaemonMemory } from '../../../scripts/conveyor/health-watch-core.mjs';
+import daemonSilent from '../../../scripts/conveyor/health-smells/daemon-silent.mjs';
 import { foldPrAttempts } from '../../../scripts/conveyor/health-pr-attempts.mjs';
 import { liveProcessRefusals } from '../../../scripts/conveyor/health-smells/live-process-stale-transcript.mjs';
 import { probeDaemonLogs } from '../../../scripts/conveyor/health-watch.mjs';
@@ -49,12 +52,20 @@ describe('de-duplication', () => {
   });
   it('flushes a summary when the window ends, then logs the line in full again', () => {
     const d = createDeduper({ windowMs: 1000 });
-    expect(d.consider('a', 0)).toBe(true);
-    expect(d.consider('a', 10)).toBe(false);
-    expect(d.consider('a', 20)).toBe(false);
+    expect(d.consider('a', 0)).toEqual({ markers: [], plain: true });
+    expect(d.consider('a', 10)).toEqual({ markers: [], plain: false });
+    expect(d.consider('a', 20)).toEqual({ markers: [], plain: false });
     expect(d.due(500)).toEqual([]);
-    expect(d.due(1000)).toEqual([{ line: 'a', count: 2, since: 0 }]);
-    expect(d.consider('a', 1001)).toBe(true);
+    expect(d.due(1010)).toEqual([{ tag: 'log', line: 'a', count: 2, since: 10 }]);
+    expect(d.consider('a', 1011)).toEqual({ markers: [], plain: false }); // the run goes on: held back again
+    expect(d.due(2012)).toEqual([{ tag: 'log', line: 'a', count: 1, since: 1011 }]); // a new flush has its own `since`
+  });
+  it('a line that breaks the repeating run flushes what was held back, in order, before it', () => {
+    const d = createDeduper({ windowMs: 1000 });
+    const seq = [['a', 0], ['b', 1], ['a', 2], ['c', 3]];
+    const got = seq.map(([l, t]) => d.consider(l, t));
+    expect(got.map((g) => g.plain)).toEqual([true, true, false, true]);
+    expect(got[3].markers).toEqual([{ tag: 'log', line: 'a', count: 1, since: 2 }]);
   });
   it('only collapses single plain lines', () => {
     expect(dedupable('x: y')).toBe(true);
@@ -63,7 +74,7 @@ describe('de-duplication', () => {
     expect(dedupable('}')).toBe(false);
   });
   it('settings have safe defaults and reject junk', () => {
-    expect(logSettings({})).toMatchObject({ dedupeWindowMs: 600000, maxBytes: 20 * 1024 * 1024, keep: 2 });
+    expect(logSettings({})).toMatchObject({ dedupeWindowMs: 300000, maxBytes: 20 * 1024 * 1024, keep: 2 });
     expect(logSettings({ WE_DAEMON_LOG_MAX_BYTES: 'abc', WE_DAEMON_LOG_KEEP: '0' })).toMatchObject({ maxBytes: 20 * 1024 * 1024, keep: 1 });
   });
   it('expandRepeatedLines is exact and leaves plain logs byte-identical', () => {
@@ -249,5 +260,217 @@ describe('review round 1 — repairs', () => {
     const boom = (a) => { if (String(a).endsWith('.rot.tmp')) throw new Error('disk'); writeFileSync(a, ''); };
     expect(rotateLogIfNeeded(p, { maxBytes: 10, keep: 2, fs: { writeFileSync: boom } })).toBe(true);
     expect(statSync(p).size).toBe(0);
+  });
+});
+
+describe('review round 2 — repairs', () => {
+  const strip = (text) => text.split('\n').map((l) => l.replace(LOG_TIMESTAMP_RE, ''));
+
+  it('the default dedupe window (plus the flush timer lag) stays below daemon-silent\'s threshold, and a steady idle log never reads as silent', () => {
+    expect(DEFAULT_DEDUPE_WINDOW_MS + 30_000).toBeLessThan(daemonSilent.silentMinMs);
+    const start = Date.parse('2026-10-06T10:00:00.000Z');
+    let t = start;
+    const out = [];
+    const c = { log: (s) => out.push(s), info() {}, warn() {}, error() {} };
+    const restore = installDaemonLog({ target: c, env: {}, now: () => new Date(t), logPath: null, timers: false });
+    let mem; let sentLines = 0; let size = 0; let silentBreaches = 0;
+    for (let step = 0; step <= 180; step += 1) { // every 30 s for 90 min; an idle tick every 2 min
+      t = start + step * 30_000;
+      if (step % 4 === 0) c.log('review-daemon: tick (a) — dispatched 0, refused 0'); else restore.housekeeping?.();
+      if (step % 2 !== 0) continue; // the health watch samples once a minute
+      const fresh = out.slice(sentLines).join('\n'); sentLines = out.length; size += fresh.length;
+      mem = foldDaemonMemory(mem, { name: 'review-daemon', text: fresh ? `${fresh}\n` : '', sizeBytes: size, mtimeMs: t, bootstrap: false }, t);
+      if (step < 30) continue; // let the watch warm up
+      const [row] = daemonSilent.evaluate({ leases: [{ log: 'review-daemon', pidAlive: true, pid: 1, heartbeatAt: t }] }, { now: t, daemons: { 'review-daemon': mem } });
+      if (row.breach) silentBreaches += 1;
+    }
+    restore();
+    expect(silentBreaches).toBe(0);
+    expect(out.length).toBeLessThan(45 / 2); // and it still halves the ~45 ticks' lines
+  });
+
+  it('dedupe then expand reproduces the plain log across changing details, unequal repeats and unique lines', () => {
+    const lines = ['T: tick', 'T: tick', 'R1: x', 'T: tick', 'R2: y', 'T: tick', 'R1: x', 'T: tick', 'R2: y', 'U: once', 'T: tick', 'R1: x', 'T: tick', 'R1: x', 'T: tick'];
+    let seed = 7; const rnd = (n) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+    for (let trial = 0; trial < 300; trial += 1) {
+      const seq = Array.from({ length: 5 + rnd(60) }, () => lines[rnd(lines.length)]);
+      // a periodic stretch, so cycles actually form, then noise
+      const cycle = Array.from({ length: 1 + rnd(4) }, () => lines[rnd(lines.length)]);
+      const all = [...seq.slice(0, 5), ...Array.from({ length: cycle.length * (2 + rnd(12)) }, (_, i) => cycle[i % cycle.length]), ...seq.slice(5)];
+      const out = []; let t = 0;
+      const methods = ['log', 'info', 'warn', 'error'];
+      const c = Object.fromEntries(methods.map((m) => [m, (s) => out.push(s)]));
+      const restore = installDaemonLog({ target: c, env: { WE_DAEMON_LOG_DEDUPE_WINDOW_MS: '5000' }, now: () => new Date(t), logPath: null, timers: false });
+      const plain = [];
+      for (const l of all) {
+        const m = rnd(5) === 0 ? methods[rnd(4)] : 'log'; // mostly one method, some mixed
+        t += rnd(4) === 0 ? 3000 : 400; restore.housekeeping?.();
+        plain.push(l); c[m](l);
+      }
+      restore();
+      expect(strip(expandRepeatedLines(out.join('\n')))).toEqual(plain);
+    }
+  });
+
+  it('a deduped log with alternating detail lines parses to the same per-tick shape as the plain log', () => {
+    const shape = (text) => parseDaemonLog(text).ticks.map((x) => JSON.stringify(x));
+    const gen = (env) => {
+      const out = []; let t = Date.parse('2026-10-06T10:00:00.000Z');
+      const c = { log: (s) => out.push(s), info() {}, warn() {}, error() {} };
+      const restore = installDaemonLog({ target: c, env, now: () => new Date(t), logPath: null, timers: false });
+      for (let i = 0; i < 40; i += 1) {
+        c.log('fix-dispatch-daemon: tick (web-everything/web-everything) — dispatched 0, refused 1');
+        c.log(`fix-dispatch-daemon: reconcile-refused missing-run web-everything/web-everything PR #${i % 2 ? 7 : 9} — no run`);
+        t += 1000;
+      }
+      restore();
+      return out.join('\n');
+    };
+    expect(shape(gen({}))).toEqual(shape(gen({ WE_DAEMON_LOG_DEDUPE_WINDOW_MS: '0' })));
+  });
+
+  it('a summary goes out through the method its line was written with (separate stdout / stderr sinks stay self-consistent)', () => {
+    const so = []; const se = [];
+    const c = { log: (s) => so.push(s), info: (s) => so.push(s), warn: (s) => se.push(s), error: (s) => se.push(s) };
+    const restore = installDaemonLog({ target: c, env: {}, logPath: null, timers: false });
+    for (let i = 0; i < 6; i += 1) c.error('d: refused x');
+    c.log('d: refused x'); // same text on the other stream is a different line
+    restore();
+    expect(so.some((l) => /repeated/.test(l))).toBe(false);
+    expect(se.filter((l) => /repeated 5 times/.test(l))).toHaveLength(1);
+    expect(so.filter((l) => /d: refused x/.test(l))).toHaveLength(1);
+  });
+
+  it('the marker sanitiser is linear on whitespace-heavy text (no quadratic scan)', () => {
+    const hostile = `(repeated${'\n'.repeat(100_000)}x`;
+    const t0 = Date.now();
+    neutralizeMarkerText(hostile);
+    neutralizeMarkerText(`${' '.repeat(200_000)}\n(repeated`);
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(neutralizeMarkerText('(repeated 5 times since 2026-01-01T00:00:00.000Z) x')).not.toMatch(/^\(repeated \d/);
+  });
+
+  it('the pass-daemon relay caps what it buffers when a child writes without a newline', async () => {
+    const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+    const big = 'z'.repeat(3 * 1024 * 1024 + 5);
+    const spawnFn = () => { setImmediate(() => { for (let i = 0; i < big.length; i += 65536) child.stdout.emit('data', big.slice(i, i + 65536)); child.emit('close', 0, null); }); return child; };
+    const seen = [];
+    await spawnPassOnce({ script: 'x.mjs' }, { root: '/r', spawnFn, log: { log: (l) => seen.push(l), error: (l) => seen.push(l) } });
+    expect(Math.max(...seen.map((l) => l.length))).toBeLessThanOrEqual(1024 * 1024);
+    expect(seen.join('')).toBe(big);
+  });
+
+  it('a manual truncation (counter present on both sides, stale <log>.1) is a bootstrap, never a replay of <log>.1', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'probe5-'));
+    const p = join(dir, 'review-daemon.log');
+    writeFileSync(`${p}.rot`, '3\n');
+    writeFileSync(`${p}.1`, 'review-daemon: reconcile-refused missing-run o/r PR #2 — stale\n');
+    const old = new Date(Date.now() - 60_000); utimesSync(`${p}.1`, old, old);
+    writeFileSync(p, 'review-daemon: filler\n'.repeat(20));
+    const first = probeDaemonLogs(dir, {});
+    writeFileSync(p, 'review-daemon: fresh\n'); // an operator truncated it; the counter never moved
+    const second = probeDaemonLogs(dir, first.cursors);
+    expect(second.samples[0].text).not.toMatch(/stale/);
+    expect(second.samples[0].bootstrap).toBe(true);
+  });
+
+  it('a cursor from before the counter existed does not replay a stale <log>.1 after a manual truncation', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'probe6-'));
+    const p = join(dir, 'review-daemon.log');
+    writeFileSync(`${p}.1`, 'review-daemon: reconcile-refused missing-run o/r PR #2 — stale\n');
+    const old = new Date(Date.now() - 60_000); utimesSync(`${p}.1`, old, old);
+    writeFileSync(p, 'review-daemon: filler\n'.repeat(20));
+    const first = probeDaemonLogs(dir, {});
+    writeFileSync(p, 'review-daemon: fresh\n');
+    expect(probeDaemonLogs(dir, first.cursors).samples[0].text).not.toMatch(/stale/);
+  });
+
+  it('probeDaemonLogs delivers the unread rotated tail once even when an existing counter failed to bump', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'probe7-'));
+    const p = join(dir, 'review-daemon.log');
+    writeFileSync(p, 'review-daemon: filler\n'.repeat(5));
+    writeFileSync(`${p}.rot`, '4\n');
+    writeFileSync(`${p}.1`, 'review-daemon: older\n');
+    const old = new Date(Date.now() - 60_000); utimesSync(`${p}.1`, old, old);
+    const first = probeDaemonLogs(dir, {});
+    appendFileSync(p, `review-daemon: reconcile-refused missing-run o/r PR #6 — unread\n${'review-daemon: filler\n'.repeat(5)}`);
+    const boom = (a, ...rest) => { if (String(a).endsWith('.rot.tmp')) throw new Error('disk'); return writeFileSync(a, ...rest); };
+    expect(rotateLogIfNeeded(p, { maxBytes: 10, keep: 2, fs: { writeFileSync: boom } })).toBe(true);
+    expect(readFileSync(`${p}.rot`, 'utf8').trim()).toBe('4'); // the counter never moved
+    const rotated = new Date(Date.now() - 30_000); utimesSync(`${p}.1`, rotated, rotated); // past the in-flight hold
+    appendFileSync(p, 'review-daemon: tick (a) — dispatched 0, refused 0\n');
+    const second = probeDaemonLogs(dir, first.cursors);
+    expect(second.samples[0].text.match(/PR #6 — unread/g)).toHaveLength(1);
+    const third = probeDaemonLogs(dir, second.cursors);
+    expect(third.samples[0].text).not.toMatch(/PR #6/);
+  });
+
+  it('rotation still works for a real daemon: no explicit logPath, stdout redirected to a log in a log dir', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rot5-'));
+    const logPath = join(dir, 'd.log');
+    const fd = openSync(logPath, 'a');
+    const modUrl = pathToFileURL(join(process.cwd(), 'skills-src/conveyor/daemon-log.mjs')).href;
+    const script = `import { installDaemonLog } from ${JSON.stringify(modUrl)};
+      let t = Date.parse('2026-10-06T10:00:00Z');
+      installDaemonLog({ now: () => new Date(t), logDirs: [${JSON.stringify(dir)}], timers: false, env: { WE_DAEMON_LOG_MAX_BYTES: '2000', WE_DAEMON_LOG_DEDUPE_WINDOW_MS: '0' } });
+      for (let i = 0; i < 50; i++) { t += 31000; console.log('d: unique line number ' + i + ' ' + 'x'.repeat(60)); }`;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', fd, 'pipe'] });
+    closeSync(fd);
+    expect(r.status, String(r.stderr)).toBe(0);
+    expect(existsSync(`${logPath}.1`)).toBe(true);
+    expect(statSync(logPath).size).toBeLessThan(4000);
+  });
+
+  it('one flush is written as one write per method, so a sampling reader never sees half a cycle', () => {
+    const writes = [];
+    const c = { log: (s) => writes.push(s), info() {}, warn() {}, error() {} };
+    let t = 0;
+    const restore = installDaemonLog({ target: c, env: {}, now: () => new Date(t), logPath: null, timers: false });
+    for (let i = 0; i < 6; i += 1) { t += 1000; c.log('a: tick'); c.log('a: detail'); }
+    restore();
+    const flushWrites = writes.filter((w) => /repeated/.test(w));
+    expect(flushWrites).toHaveLength(1);
+    expect(flushWrites[0].split('\n')).toHaveLength(2);
+  });
+
+  it('a probe that sees two rotations since its cursor reads the old tail from <log>.2 and <log>.1 whole', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'probe8-'));
+    const p = join(dir, 'review-daemon.log');
+    const row = (i) => `review-daemon: reconcile-refused missing-run o/r PR #${100 + i} — row ${i}\n`;
+    writeFileSync(p, Array.from({ length: 10 }, (_, i) => row(i)).join(''));
+    const first = probeDaemonLogs(dir, {});
+    const seenFirst = first.samples[0].text;
+    for (let gen = 0; gen < 2; gen += 1) {
+      appendFileSync(p, Array.from({ length: 10 }, (_, i) => row(10 + gen * 10 + i)).join(''));
+      expect(rotateLogIfNeeded(p, { maxBytes: 10, keep: 2 })).toBe(true);
+      const old = new Date(Date.now() - 60_000 + gen * 1000); utimesSync(`${p}.1`, old, old);
+    }
+    appendFileSync(p, 'review-daemon: tick (a) — dispatched 0, refused 0\n');
+    const second = probeDaemonLogs(dir, first.cursors);
+    const rows = new Set([...`${seenFirst}\n${second.samples[0].text}`.matchAll(/ — row (\d+)/g)].map((m) => Number(m[1])));
+    expect([...rows].sort((a, b) => a - b)).toEqual(Array.from({ length: 30 }, (_, i) => i));
+  });
+
+  it('replay of a hostile group (one huge count beside thousands of tiny ones) stays fast', () => {
+    const since = '2026-01-01T00:00:00.000Z';
+    const lines = [`(repeated 100000 times since ${since}) big`, ...Array.from({ length: 8000 }, (_, i) => `(repeated 1 times since ${since}) s${i}`)];
+    const t0 = Date.now();
+    expandRepeatedLines(lines.join('\n'));
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it('the relay copes with a flood of tiny newline-free chunks in linear time', async () => {
+    const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+    const spawnFn = () => { setImmediate(() => { for (let i = 0; i < 300_000; i += 1) child.stdout.emit('data', 'x'); child.stdout.emit('data', '\n'); child.emit('close', 0, null); }); return child; };
+    const seen = [];
+    const t0 = Date.now();
+    await spawnPassOnce({ script: 'x.mjs' }, { root: '/r', spawnFn, log: { log: (l) => seen.push(l), error: (l) => seen.push(l) } });
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(seen.join('').length).toBe(300_000);
+  });
+
+  it('lines too long to hold are never collapsed', () => {
+    expect(dedupable('x'.repeat(100))).toBe(true);
+    expect(dedupable('x'.repeat(9000))).toBe(false);
   });
 });

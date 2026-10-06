@@ -60,6 +60,8 @@ import { StringDecoder } from 'node:string_decoder';
 import { installDaemonLog, stripLogTimestamp } from './daemon-log.mjs';
 
 const CLOSE_GRACE_MS = 5000;
+/** The most output a relayed child stream may buffer without a newline before it is flushed as a line of its own. */
+const MAX_RELAY_LINE_CHARS = 1024 * 1024;
 
 /** How often the INDEPENDENT heartbeat timer fires, regardless of whether a pass is mid-run. Deliberately
  *  much shorter than any pass's own `intervalMs` — it exists precisely to keep beating DURING a long single
@@ -203,10 +205,25 @@ export function spawnPassOnce({ script, args = [] }, { root = REPO_ROOT, log = c
       let pending = '';
       const decoder = new StringDecoder('utf8');
       stream.on('data', (chunk) => {
-        pending += typeof chunk === 'string' ? chunk : decoder.write(chunk);
-        const parts = pending.split('\n');
-        pending = parts.pop();
-        for (const l of parts) write(stripLogTimestamp(l));
+        const text = typeof chunk === 'string' ? chunk : decoder.write(chunk);
+        // Split only what just arrived, never the whole buffer again: a flood of tiny newline-free chunks would
+        // otherwise re-scan up to the cap on every event.
+        const nl = text.lastIndexOf('\n');
+        if (nl === -1) pending += text;
+        else {
+          const parts = (pending + text.slice(0, nl)).split('\n');
+          pending = text.slice(nl + 1);
+          for (const l of parts) write(stripLogTimestamp(l));
+        }
+        // A child that never ends a line must not grow this long-lived daemon's memory without bound: past the cap
+        // the buffered text goes out as a line of its own (never splitting a surrogate pair).
+        while (pending.length > MAX_RELAY_LINE_CHARS) {
+          let cut = MAX_RELAY_LINE_CHARS;
+          const last = pending.charCodeAt(cut - 1);
+          if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
+          write(stripLogTimestamp(pending.slice(0, cut)));
+          pending = pending.slice(cut);
+        }
       });
       return () => { pending += decoder.end(); if (pending) { write(stripLogTimestamp(pending)); pending = ''; } };
     };

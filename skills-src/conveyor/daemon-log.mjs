@@ -11,12 +11,13 @@
  *   Setting: `WE_DAEMON_LOG_TIMESTAMPS=0` (or `off`/`false`) turns stamping off. Default is on.
  *
  *   Item 68b adds two more declared settings, both with safe defaults:
- *   - De-duplication: an identical single-line message (timestamp aside) seen again inside a window is
- *     suppressed and counted; when the window ends one `<ISO> (repeated N times since <ISO>) <line>` line is written
- *     (see `formatRepeatLine`). Readers replay that line with `expandRepeatedLines`, so health counts stay exact.
- *     `WE_DAEMON_LOG_DEDUPE_WINDOW_MS` (default 600000; 0 turns it off).
- *   - Rotation by size: copy-truncate (launchd keeps the file open) of the daemon's own stdout log, found by
- *     matching fd 1's inode against `*.log` in the daemon log dirs (or `WE_DAEMON_LOG_PATH`). Checked at most every
+ *   - De-duplication: a repeating run of single-line messages (a tick's lines; timestamp aside) seen again inside
+ *     a window is suppressed and counted; when the window ends, or the run breaks, `<ISO> (repeated N times since
+ *     <ISO>) <line>` lines are written (see `formatRepeatLine`, `createDeduper`). Readers replay them with
+ *     `expandRepeatedLines`, so health counts AND per-tick line order stay exact.
+ *     `WE_DAEMON_LOG_DEDUPE_WINDOW_MS` (default 300000; 0 turns it off).
+ *   - Rotation by size: copy-truncate (launchd keeps the file open) of the daemon's own stdout and stderr logs, found
+ *     by matching fd 1 / fd 2's inode against `*.log` in the daemon log dirs (or `WE_DAEMON_LOG_PATH`). Checked at most every
  *     30s. `WE_DAEMON_LOG_MAX_BYTES` (default 20 MiB; 0 turns it off), `WE_DAEMON_LOG_KEEP` (rotated files kept,
  *     default 2: `<log>.1`, `<log>.2`).
  */
@@ -39,11 +40,14 @@ export const DEDUPE_WINDOW_ENV = 'WE_DAEMON_LOG_DEDUPE_WINDOW_MS';
 export const MAX_BYTES_ENV = 'WE_DAEMON_LOG_MAX_BYTES';
 export const KEEP_ENV = 'WE_DAEMON_LOG_KEEP';
 export const LOG_PATH_ENV = 'WE_DAEMON_LOG_PATH';
-export const DEFAULT_DEDUPE_WINDOW_MS = 10 * 60_000;
+/** Kept well under daemon-silent's 10 min threshold: a quiet window plus the 30 s flush timer must never read as a silent daemon. */
+export const DEFAULT_DEDUPE_WINDOW_MS = 5 * 60_000;
 export const DEFAULT_MAX_BYTES = 20 * 1024 * 1024;
 export const DEFAULT_KEEP = 2;
 const ROTATE_CHECK_MS = 30_000;
-const MAX_TRACKED = 500;
+/** The longest repeating run of lines (one tick's lines) the deduper will collapse. */
+const MAX_PERIOD = 64;
+const MAX_DEDUPE_LINE_CHARS = 8192;
 
 function nonNegInt(v, dflt) {
   if (v == null || String(v).trim() === '') return dflt;
@@ -65,33 +69,80 @@ export function logSettings(env = process.env) {
  * bare punctuation, so a pretty-printed multi-line object is never thinned out.
  */
 export function dedupable(msg) {
-  return typeof msg === 'string' && msg !== '' && !msg.includes('\n') && !/^\s/.test(msg) && !/^[\]\[{}(),;]*$/.test(msg) && !msg.startsWith('(repeated');
+  // The length cap bounds what the collapser retains (it holds up to MAX_PERIOD lines, twice over).
+  return typeof msg === 'string' && msg !== '' && msg.length <= MAX_DEDUPE_LINE_CHARS && !msg.includes('\n') && !/^\s/.test(msg) && !/^[\]\[{}(),;]*$/.test(msg) && !msg.startsWith('(repeated');
 }
 
 /**
- * Stateful collapser. `consider(line, nowMs)` -> true when the line must be written, false when it is a repeat that
- * was counted instead. `due(nowMs)` / `drain()` return `{ line, count, since }` summaries to write.
+ * Stateful collapser of a REPEATING RUN OF LINES (a tick is several lines: the tick line, then its details), exact
+ * by construction. It only suppresses a line that continues the cycle it just saw (`hist[-p]` .. `hist[-1]`, the p
+ * lines before it); the first line that breaks the cycle flushes what was suppressed and is written in full. So the
+ * suppressed lines are always an unbroken walk around one cycle, and the markers that stand for them (one per cycle
+ * position, in walk order, counts differing by at most one) replay in EXACT original order under the readers'
+ * round-robin replay — even when details change between ticks (then nothing collapses; nothing is misattributed).
+ *
+ * A line is `{ tag, line }`: `tag` is the console method, part of its identity, so a stdout line and the same text on
+ * stderr are different lines and each marker goes out through its own method.
+ *
+ * `consider(line, nowMs, tag)` -> `{ markers, plain }`: write `markers` (`{ tag, line, count, since }`), in order,
+ * then the line itself when `plain`. `due(nowMs)` / `drain()` -> markers to write.
  */
 export function createDeduper({ windowMs = DEFAULT_DEDUPE_WINDOW_MS } = {}) {
-  const seen = new Map(); // line -> { since, count }
-  const take = (key, e) => { seen.delete(key); return e.count > 0 ? { line: key, count: e.count, since: e.since } : null; };
+  let hist = []; // the last <= MAX_PERIOD lines written in full: { tag, line, key, at }
+  let cyc = null; // { items, pos, start, n, since }: the cycle being suppressed
+  // Every flush's markers share one `since`, and no two flushes share one (strictly increasing): that is how a reader
+  // tells where one cycle's markers end and the next's begin, with no separator line between them.
+  let lastSince = -Infinity;
+  const sinceFor = (nowMs) => { lastSince = Math.max(nowMs, lastSince + 1); return lastSince; };
+  const keyOf = (tag, line) => `${tag}\u0000${line}`;
+  const markers = () => {
+    if (!cyc || cyc.n === 0) return [];
+    const p = cyc.items.length; const base = Math.floor(cyc.n / p); const extra = cyc.n % p; const out = [];
+    for (let i = 0; i < Math.min(p, cyc.n); i += 1) {
+      const it = cyc.items[(cyc.start + i) % p];
+      out.push({ tag: it.tag, line: it.line, count: base + (i < extra ? 1 : 0), since: cyc.since });
+    }
+    cyc.n = 0; cyc.since = null;
+    return out;
+  };
   return {
-    consider(line, nowMs) {
-      if (!(windowMs > 0)) return true;
-      const e = seen.get(line);
-      if (e) { e.count += 1; return false; }
-      seen.set(line, { since: nowMs, count: 0 });
-      return true;
+    consider(line, nowMs, tag = 'log') {
+      if (!(windowMs > 0)) return { markers: [], plain: true };
+      const key = keyOf(tag, line);
+      if (cyc) {
+        if (key === cyc.items[cyc.pos].key) {
+          const at = cyc.pos;
+          cyc.pos = (cyc.pos + 1) % cyc.items.length;
+          if (cyc.n === 0) { cyc.start = at; cyc.since = sinceFor(nowMs); }
+          cyc.n += 1;
+          return { markers: [], plain: false };
+        }
+        const out = markers(); // the cycle broke: say what was suppressed, then write this line in full
+        cyc = null; hist = [];
+        hist.push({ tag, line, key, at: nowMs });
+        return { markers: out, plain: true };
+      }
+      // Hypothesise a cycle: this line equals one written p lines ago (recently), so the p lines since then repeat.
+      for (let p = 1; p <= Math.min(MAX_PERIOD, hist.length); p += 1) {
+        const first = hist[hist.length - p];
+        if (first.key === key && nowMs - first.at < windowMs) {
+          cyc = { items: hist.slice(-p), pos: 1 % p, start: 0, n: 1, since: sinceFor(nowMs) };
+          hist = [];
+          return { markers: [], plain: false };
+        }
+      }
+      hist.push({ tag, line, key, at: nowMs });
+      if (hist.length > MAX_PERIOD) hist.shift();
+      return { markers: [], plain: true };
     },
-    // One expired line flushes EVERY pending summary, in first-seen order, back to back: a repeating tick is several
-    // line kinds (tick line, detail line, ...), and readers replay adjacent markers round-robin to restore that
-    // interleaving, so the summaries of one cycle must never be split across flushes.
+    // Anything suppressed for a whole window is summarised, so the log never goes quiet for longer than the window.
     due(nowMs) {
-      let expired = seen.size > MAX_TRACKED;
-      for (const e of seen.values()) if (nowMs - e.since >= windowMs) expired = true;
-      return expired ? this.drain() : [];
+      if (!cyc || cyc.n === 0 || nowMs - cyc.since < windowMs) return [];
+      return markers();
     },
-    drain() { return [...seen].map(([k, e]) => take(k, e)).filter(Boolean); },
+    // A line the collapser cannot touch (multi-line, indented, ...) is about to be written, or the daemon is exiting:
+    // summarise now so it can neither jump ahead of the suppressed lines nor be separated from them.
+    drain() { const out = markers(); cyc = null; hist = []; return out; },
   };
 }
 
@@ -152,9 +203,9 @@ const INSTALLED = Symbol.for('we.daemonLog.installed');
 /**
  * Wrap `target`'s log/info/warn/error so each line is stamped, identical repeats are collapsed and the daemon's own
  * stdout log is size-rotated. Idempotent. Returns a restore function.
- * @param {{ target?: Console, env?: object, now?: () => Date, logPath?: string|null, timers?: boolean }} [opts]
+ * @param {{ target?: Console, env?: object, now?: () => Date, logPath?: string|null, logDirs?: string[], timers?: boolean }} [opts]
  */
-export function installDaemonLog({ target = console, env = process.env, now = () => new Date(), logPath, timers = true } = {}) {
+export function installDaemonLog({ target = console, env = process.env, now = () => new Date(), logPath, logDirs = defaultLogDirs(), timers = true } = {}) {
   if (target[INSTALLED]) return () => {};
   const stamp = timestampsEnabled(env);
   const cfg = logSettings(env);
@@ -163,25 +214,45 @@ export function installDaemonLog({ target = console, env = process.env, now = ()
   if (!stamp && !dedupe && !rotate) return () => {};
   const originals = {};
   for (const m of ['log', 'info', 'warn', 'error']) if (typeof target[m] === 'function') originals[m] = target[m];
-  const emit = (text) => originals.log.call(target, stamp ? timestampLines(text, now().getTime()) : text);
   const deduper = createDeduper({ windowMs: cfg.dedupeWindowMs });
-  const flush = (list) => { for (const s of list) originals.log.call(target, formatRepeatLine(s.line, s.count, s.since, now().getTime())); };
-  let path = logPath === undefined ? cfg.logPath : logPath;
-  let resolved = path !== undefined && path !== null;
+  // A summary goes out through the method its line was written with, so it lands in the same sink as that line.
+  // One write per run of same-method markers: a flush's markers are ONE cycle, and a reader that sampled the file
+  // between two of its lines would replay half a cycle (a single write lands whole).
+  const flush = (list) => {
+    const t = now().getTime();
+    for (let i = 0; i < list.length;) {
+      let j = i;
+      while (j < list.length && list[j].tag === list[i].tag) j += 1;
+      const text = list.slice(i, j).map((s) => formatRepeatLine(s.line, s.count, s.since, t)).join('\n');
+      (originals[list[i].tag] ?? originals.log).call(target, text);
+      i = j;
+    }
+  };
+  // Only an explicit `logPath: null` (a test) turns rotation's path discovery off; unset means "find this process's
+  // own stdout/stderr log" — what every real daemon wants.
+  const given = logPath ?? cfg.logPath;
+  let paths = given ? [given] : null; // null: not resolved yet
   let lastCheck = 0;
   const housekeeping = () => {
     const t = now().getTime();
     if (dedupe) flush(deduper.due(t));
     if (!rotate || t - lastCheck < ROTATE_CHECK_MS) return;
     lastCheck = t;
-    if (!resolved) { path = resolveStdoutLogPath(); resolved = true; }
-    if (path) rotateLogIfNeeded(path, { maxBytes: cfg.maxBytes, keep: cfg.keep });
+    // stdout and stderr may be different files (launchd's StandardOutPath / StandardErrorPath): cap both.
+    if (!paths) paths = logPath === null ? [] : [...new Set([resolveStdoutLogPath({ dirs: logDirs, fd: 1 }), resolveStdoutLogPath({ dirs: logDirs, fd: 2 })].filter(Boolean))];
+    for (const p of paths) rotateLogIfNeeded(p, { maxBytes: cfg.maxBytes, keep: cfg.keep });
   };
   for (const m of Object.keys(originals)) {
     target[m] = (...args) => {
       const msg = neutralizeMarkerText(format(...args)); // only this module writes real collapse markers
       housekeeping();
-      if (dedupe && dedupable(msg) && !deduper.consider(msg, now().getTime())) return;
+      if (dedupe) {
+        const t = now().getTime();
+        // A line the collapser cannot touch must not jump ahead of lines it is still holding back.
+        const r = dedupable(msg) ? deduper.consider(msg, t, m) : { markers: deduper.drain(), plain: true };
+        flush(r.markers);
+        if (!r.plain) return;
+      }
       originals[m].call(target, stamp ? timestampLines(msg, now().getTime()) : msg);
     };
   }
@@ -190,10 +261,12 @@ export function installDaemonLog({ target = console, env = process.env, now = ()
   const onExit = () => { if (dedupe) flush(deduper.drain()); };
   if (timers) process.on('exit', onExit);
   target[INSTALLED] = true;
-  return () => {
+  const restore = () => {
     onExit();
     if (timer) clearInterval(timer);
     if (timers) process.off('exit', onExit);
     Object.assign(target, originals); delete target[INSTALLED];
   };
+  restore.housekeeping = housekeeping; // what the timer runs; exposed so a test can drive it with a fake clock
+  return restore;
 }
