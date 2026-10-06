@@ -219,7 +219,7 @@ describe('void-on-escape — the agy juror\'s three escape checks (real git, fak
       { step_type: 'tool', state: 'DONE', tool_name: 'view_file' },
       { step_type: 'tool', state: 'DONE', tool_name: 'run_command' },
     ]))).toEqual(['run_command']);
-    expect(changedCheckouts({ '/a': { head: 'h', status: '' }, '/b': { unreadable: 'x' } }, { '/a': { head: 'h', status: ' M f' }, '/b': { head: 'h', status: '' } })).toEqual(['/a']);
+    expect(changedCheckouts({ '/a': { head: 'h', status: '' }, '/b': { unreadable: 'x' } }, { '/a': { head: 'h', status: ' M f' }, '/b': { head: 'h', status: '' } })).toEqual(['/a', '/b']); // unreadable before = check could not run = void
   });
 });
 
@@ -308,6 +308,52 @@ describe('PR #4131 review fixes', () => {
     await judge(REQUEST);
     expect(providerCalls).toHaveLength(2);
     expect(agyCalls).toHaveLength(2);
+  });
+
+  it('a real finish call (a tool step re-reported as a `finish` step with no name) is NOT a state-changing call', () => {
+    // Shape from a live agy 1.3.0 transcript: ACTIVE tool step, then the same index as a DONE `finish` step.
+    expect(stateChangingToolCalls(transcriptWith([
+      { step_index: 0, step_type: 'user_input', state: 'DONE' },
+      { step_index: 2, step_type: 'tool', state: 'ACTIVE', tool_name: 'finish', tool_info: { name: 'finish', parameters: { Result: '{}' } } },
+      { step_index: 2, step_type: 'finish', state: 'DONE' },
+    ]))).toEqual([]);
+    // an unlisted tool that changes step_type mid-step is still caught
+    expect(stateChangingToolCalls(transcriptWith([
+      { step_index: 4, step_type: 'tool', state: 'ACTIVE', tool_name: 'send_command_input' },
+      { step_index: 4, step_type: 'command', state: 'DONE' },
+    ]))).toEqual(['send_command_input']);
+  });
+
+  it('a completed read outside the juror lane voids; a read inside it (or a relative one) does not', () => {
+    const call = (p) => transcriptWith([{ step_index: 1, step_type: 'tool', state: 'DONE', tool_name: 'view_file', tool_info: { parameters: { AbsolutePath: p } } }]);
+    const roots = { allowedRoots: ['/var/folders/x/we-agy-juror-abc'] };
+    expect(stateChangingToolCalls(call('/var/folders/x/we-agy-juror-abc/scripts/a.mjs'), roots)).toEqual([]);
+    expect(stateChangingToolCalls(call('scripts/a.mjs'), roots)).toEqual([]);
+    expect(stateChangingToolCalls(call('/Users/someone/.ssh/id_ed25519'), roots)).toEqual(['view_file (read outside the juror lane)']);
+    expect(stateChangingToolCalls(call('/var/folders/x/we-agy-juror-abc/../../secret'), roots)).toEqual(['view_file (read outside the juror lane)']);
+    expect(stateChangingToolCalls(call('/var/folders/x/we-agy-juror-abcd/a'), roots)).toEqual(['view_file (read outside the juror lane)']);
+  });
+
+  it('a further edit to an already-dirty file with a non-ASCII name still voids the seat (status -z, no octal quoting)', async () => {
+    const fx = fixtureLane();
+    try {
+      writeFileSync(join(fx.lane, 'résumé.txt'), 'dirty before the run\n');
+      expect((await runWith(fx, null)).status).toBe('ok');
+      const r = await runWith(fx, () => writeFileSync(join(fx.lane, 'résumé.txt'), 'edited again\n'));
+      expect(r.status).toBe('voided');
+    } finally { fx.cleanup(); }
+  });
+
+  it('an agy juror that THROWS never leaks a local path into the published skip summary', async () => {
+    const out = await runSeatWithProvider({ ...REQUEST, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'm', onEscape: 'skip' } }, io({
+      claudeJudge: async () => { throw new Error('advisory seat must not spend Claude'); },
+      agyJuror: async () => { throw new Error('spawn failed in /lanes/review-lane/.git: ENOENT'); },
+    }));
+    const { value } = unwrapJudgeOutcome(out);
+    expect(value.skipped).toMatchObject({ provider: 'agy' });
+    expect(value.summary).toContain('agy seat failed');
+    expect(value.summary).not.toContain('/lanes/review-lane');
+    expect(value.summary).toContain('<local>');
   });
 
   it('two agy wordings of one Claude finding count one match, not a perfect overlap', () => {

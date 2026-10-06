@@ -17,7 +17,8 @@
  *      before and compared after. Any difference voids the seat.
  *   3. ITS OWN TRANSCRIPT. Any tool call that is not one of the read-only tools ({@link READ_ONLY_AGY_TOOLS}) and did
  *      not end in an error voids the seat, wherever it pointed — this is the check that catches a write (or a network
- *      fetch) to a place no snapshot watches, such as the home directory. It is an allowlist, so it fails closed.
+ *      fetch) to a place no snapshot watches, such as the home directory. It is an allowlist, so it fails closed. A
+ *      completed read whose path parameter points outside the juror lane voids it too.
  * The checks never let a checkout's own git config run code: control files are compared with plain fs reads first,
  * and git runs with fsmonitor and hooks forced off.
  *
@@ -32,7 +33,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -49,7 +50,12 @@ export const MODULE_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)),
  */
 export const READ_ONLY_AGY_TOOLS = Object.freeze([
   'view_file', 'list_dir', 'grep_search', 'find_by_name', 'view_file_outline', 'view_code_item', 'codebase_search',
+  // agy returns its structured answer through a `finish` tool step (live transcripts: ~1 in 4 runs end this way).
+  'finish',
 ]);
+
+/** A tool parameter whose key names a path (`AbsolutePath`, `DirectoryPath`, `SearchPath`, …). */
+const PATH_PARAM_KEY = /path|dir|file|root|folder|cwd|uri/i;
 
 /**
  * git is run with fsmonitor and hooks forced off, so a checkout's config can never make the CHECK itself run a
@@ -66,6 +72,15 @@ const defaultExec = (bin, args, opts = {}) => execFileSync(bin, bin === 'git' ? 
 const realpathOr = (p) => { try { return realpathSync(p); } catch { return p; } };
 const sha = (buf) => createHash('sha256').update(buf).digest('hex').slice(0, 16);
 const hashFile = (path) => { try { return sha(readFileSync(path)); } catch { return null; } };
+/** Content hash of a regular file under {@link MAX_HASH_BYTES}; size + mtime for a larger one; a symlink/FIFO by its stat alone (never read). */
+const MAX_HASH_BYTES = 5 * 1024 * 1024;
+const fingerprintFile = (path) => {
+  try {
+    const st = lstatSync(path);
+    if (!st.isFile() || st.size > MAX_HASH_BYTES) return `stat:${st.mode}:${st.size}:${Math.trunc(st.mtimeMs)}`;
+    return sha(readFileSync(path));
+  } catch { return null; }
+};
 
 /**
  * Hashes of the files that can make git run code or rewrite content: `.git/config`, every `.git/hooks/*`,
@@ -87,13 +102,22 @@ export function gitControlFiles(dir) {
 export function snapshotCheckout(dir, exec = defaultExec, { control = gitControlFiles } = {}) {
   try {
     const head = exec('git', ['-C', dir, 'rev-parse', 'HEAD']).trim();
-    const status = exec('git', ['-C', dir, 'status', '--porcelain=v1', '--untracked-files=all', '--ignored=traditional']);
-    const contents = {};
-    for (const line of status.split('\n').filter(Boolean)) {
-      const path = line.slice(3).replace(/^.* -> /, '').replace(/^"|"$/g, '');
-      if (!path.endsWith('/')) contents[path] = hashFile(join(dir, path));
+    // `-z`: paths come back verbatim (no octal quoting of non-ASCII names, so each can be content-hashed). `matching`
+    // collapses a wholly-ignored directory (node_modules, _site) to one entry instead of listing tens of thousands of
+    // files; the transcript allowlist is the check for a write inside one.
+    const raw = exec('git', ['-C', dir, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']);
+    const entries = [];
+    const fields = raw.split('\0');
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i];
+      if (!f) continue;
+      const xy = f.slice(0, 2);
+      entries.push({ line: f, path: f.slice(3) });
+      if (xy[0] === 'R' || xy[0] === 'C') i += 1; // a rename/copy entry is followed by its origin path
     }
-    return { head, status, contents, control: control(dir) };
+    const contents = {};
+    for (const { path } of entries) if (!path.endsWith('/')) contents[path] = fingerprintFile(join(dir, path));
+    return { head, status: entries.map((e) => e.line).join('\n') + (entries.length ? '\n' : ''), contents, control: control(dir) };
   } catch (e) {
     return { unreadable: String(e?.message ?? e).slice(0, 200), control: control(dir) };
   }
@@ -111,8 +135,8 @@ export function changedCheckouts(before = {}, after = {}) {
   return Object.keys(before).filter((dir) => {
     const a = before[dir];
     const b = after[dir];
-    if (a?.unreadable) return false; // nothing to compare against — never void on our own blind spot
-    return !b || b.unreadable || a.head !== b.head || a.status !== b.status || !sameJson(a.contents, b.contents);
+    // Unreadable on EITHER side means the check could not run: that voids (fail closed, like a missing transcript).
+    return !a || a.unreadable || !b || b.unreadable || a.head !== b.head || a.status !== b.status || !sameJson(a.contents, b.contents);
   });
 }
 
@@ -121,21 +145,39 @@ export function changedCheckouts(before = {}, after = {}) {
  * each step's LAST update (a denied call is first ACTIVE, then an error). Fail closed: a tool step with no name counts.
  * PURE.
  */
-export function stateChangingToolCalls(transcriptText) {
-  const last = new Map();
+export function stateChangingToolCalls(transcriptText, { allowedRoots = [] } = {}) {
+  // A step is tracked by (conversation, index) ACROSS step types: a `finish` tool call is first a `tool` step (ACTIVE)
+  // and then re-reported as a `finish` step (DONE) with no tool name — the name must come from the tool-typed update
+  // and the error status from any update (PR #4131 round 2: judging only the tool-typed update voided every finish).
+  const steps = new Map();
   let n = 0;
   for (const event of parseJsonlEvents(String(transcriptText ?? ''))) {
     const step = event?.event === 'step_update' ? event.step_update : null;
-    if (!step || step.step_type !== 'tool') continue;
-    const key = step.step_index != null ? JSON.stringify([step.conversation_id ?? null, step.step_index]) : `#${n++}`;
-    last.set(key, step);
+    if (!step) continue;
+    const key = step.step_index != null ? JSON.stringify([step.conversation_id ?? null, step.step_index]) : (step.step_type === 'tool' ? `#${n++}` : null);
+    if (key == null) continue;
+    const cur = steps.get(key) ?? { isTool: false, name: undefined, params: undefined, errored: false };
+    if (step.step_type === 'tool') {
+      cur.isTool = true;
+      cur.name ??= step.tool_name ?? step.tool_info?.name;
+      cur.params ??= step.tool_info?.parameters;
+    }
+    if (step.status === 'TOOL_ERROR' || step.state === 'ERROR' || step.tool_info?.error != null) cur.errored = true;
+    steps.set(key, cur);
   }
+  const roots = allowedRoots.filter(Boolean).map((r) => resolve(r));
+  const inside = (p) => roots.some((r) => p === r || p.startsWith(`${r}/`));
   const out = [];
-  for (const step of last.values()) {
-    const name = step.tool_name ?? step.tool_info?.name;
-    const errored = step.status === 'TOOL_ERROR' || step.tool_info?.error != null;
-    if (errored) continue;
-    if (typeof name !== 'string' || !READ_ONLY_AGY_TOOLS.includes(name)) out.push(typeof name === 'string' ? name : '<unnamed tool>');
+  for (const step of steps.values()) {
+    if (!step.isTool || step.errored) continue;
+    const name = step.name;
+    if (typeof name !== 'string' || !READ_ONLY_AGY_TOOLS.includes(name)) { out.push(typeof name === 'string' ? name : '<unnamed tool>'); continue; }
+    // A completed READ must stay inside the juror lane too: what it reads can be quoted into the published findings.
+    if (roots.length && name !== 'finish' && step.params && typeof step.params === 'object') {
+      for (const [k, v] of Object.entries(step.params)) {
+        if (typeof v === 'string' && PATH_PARAM_KEY.test(k) && v.startsWith('/') && !inside(resolve(v))) out.push(`${name} (read outside the juror lane)`);
+      }
+    }
   }
   return out;
 }
@@ -239,7 +281,7 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     if (transcriptFile) {
       let text = '';
       try { text = readFile(transcriptFile); } catch { reasons.push('transcript unreadable — escape check incomplete'); }
-      const calls = stateChangingToolCalls(text);
+      const calls = stateChangingToolCalls(text, { allowedRoots: [jurorLane, realpathOr(jurorLane)] });
       if (calls.length) reasons.push(`completed state-changing tool call(s): ${[...new Set(calls)].join(', ')}`);
     } else if (!spawnError) {
       reasons.push('no transcript — escape check incomplete');

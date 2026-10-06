@@ -20,7 +20,7 @@
  *
  * Every answer this returns carries `seatProvider: {provider, ...}` so the run record says who actually judged.
  */
-import { runAgyReviewJuror } from '../lib/agy-review-juror.mjs';
+import { runAgyReviewJuror, scrubPaths } from '../lib/agy-review-juror.mjs';
 import { appendShadowRow, buildShadowRow, compareShadowAnswers } from '../lib/review-shadow-agreement.mjs';
 
 /** The closed set of directive modes this runner accepts. */
@@ -45,12 +45,16 @@ export async function runSeatWithProvider(request, {
     throw new Error(`review-seat-runner: unknown seat provider mode ${JSON.stringify(directive?.mode)} — one of ${SEAT_RUN_MODES.join('|')}`);
   }
   const model = directive.model;
-  const runAgy = () => agyJuror({ request: plain, laneCwd: cwd, model });
+  const runAgy = async () => {
+    try { return await agyJuror({ request: plain, laneCwd: cwd, model }); } catch (e) {
+      // A thrown error's text reaches the run record and a skipped advisory seat's PR summary: no local paths there.
+      return { status: 'failed', reasons: [scrubPaths(e?.message ?? e, [cwd])] };
+    }
+  };
 
   if (directive.mode === 'shadow') {
     const claude = unwrap(await claudeJudge(plain));
-    let agyRun;
-    try { agyRun = await runAgy(); } catch (e) { agyRun = { status: 'failed', reasons: [String(e?.message ?? e)] }; }
+    let agyRun = await runAgy();
     const claudeSessionId = claude.telemetry?.sessionId ?? null;
     // Reviewer independence: the shadow juror must be a different actor from the Claude juror on this seat.
     if (agyRun.status === 'ok' && (!agyRun.sessionId || agyRun.sessionId === claudeSessionId)) {
@@ -75,8 +79,7 @@ export async function runSeatWithProvider(request, {
   }
 
   // mode === 'agy'
-  let agyRun;
-  try { agyRun = await runAgy(); } catch (e) { agyRun = { status: 'failed', reasons: [String(e?.message ?? e)] }; }
+  const agyRun = await runAgy();
   if (agyRun.status === 'ok' && agyRun.sessionId) {
     const t = agyRun.telemetry ?? {};
     return wrap(
