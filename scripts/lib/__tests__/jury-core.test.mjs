@@ -1,3 +1,4 @@
+import { FINDING_ID_PATTERN, findingIdentityTable, bindFindingIds, mintFindingId, normalizeFindingIdentity } from '../jury-core.mjs';
 import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, findCarriedOperatorRuling, liveReferrals, carriedBackingHolds } from '../jury-core.mjs';
 import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER, REFERRAL_STAMP_POLICY_ENV, resolveReferralStampPolicy } from '../jury-core.mjs';
 /**
@@ -2327,5 +2328,96 @@ describe('#5135 one-line panel reason', () => {
   });
   it('appends deferral and fallback explanations', () => {
     expect(explain({ outcome: 'accept', deferredCount: 2, scopeFellBack: 'unknown-scope-value' })).toBe('Accept: no blocking findings on this head · 2 later-round advisory finding(s) moved to card suggestions · advisory scope fell back to `all` (unknown-scope-value)');
+  });
+});
+
+describe('#76a finding identity', () => {
+  const seat = 'judgeCorrectnessAdvisory';
+  const H = (c) => c.repeat(40);
+  // The five wordings of ONE #4017 finding ("concurrent filing", rounds 1 and 3-6) and the unrelated, already-fixed
+  // "overwrite concurrent additions" finding, with the paths and lines the PR's notes cited
+  // (fls/bodies-4017.txt:49,221,348,425,501,584). Their word Jaccard spans 0.05-0.73 and the unrelated one scores
+  // 0.50 against one of them, which is why identity is never text similarity.
+  const wordings = [
+    { file: 'scripts/held-cards-io.mjs', summary: 'The list lock protects final marking but does not reserve cards during filing.' },
+    { file: 'scripts/held-cards-io.mjs', line: 136, summary: 'Concurrent file commands can file the same held cards twice because only the final annotation is locked.' },
+    { file: 'scripts/held-cards-io.mjs', summary: 'Concurrent filing commands can file the same held cards twice because only the final marking operation is locked.' },
+    { file: 'scripts/held-cards-io.mjs', summary: 'Concurrent held-card filing runs can file the same pending items into separate PRs.' },
+    { file: 'scripts/held-cards-io.mjs', line: 133, summary: 'Concurrent filing invocations can file the same held cards twice.' },
+  ].map(f => ({ ...f, category: 'correctness', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }));
+  const unrelated = { file: 'scripts/held-cards-io.mjs', line: 113, summary: 'Held-card updates can overwrite concurrent additions.', category: 'correctness', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+  const rec = (head, runId, findings, extra = []) => ({ version: 1, repo: 'web-everything/web-everything', pr: 4017, head, runId,
+    authorBody: '', reviewer: mandatoryReferralReviewer(runId), attempted: true,
+    referrals: findings.map((f, i) => ({ key: referralFindingKey(seat, f), seat, original: f, finding: normalizeFinding(f), ...(extra[i] ?? {}) })),
+    rulings: [] });
+
+  it('finding identity: deterministic binding never merges the unrelated #4017 finding', () => {
+    const records = [rec(H('1'), 'r1', [unrelated, wordings[0]]), ...wordings.slice(1).map((w, i) => rec(H(String(i + 3)), `r${i + 3}`, [w, unrelated]))];
+    const table = findingIdentityTable(records);
+    const other = table.find(e => e.summary === unrelated.summary);
+    // The unrelated finding keeps ONE id across all five heads, and it is never any wording's id.
+    expect(other.keys).toHaveLength(5);
+    expect(other.findingId).toMatch(FINDING_ID_PATTERN);
+    for (const w of wordings) expect(bindFindingIds([w], table)[0]).not.toBe(other.findingId);
+    expect(bindFindingIds([unrelated], table.filter(e => e !== other))).toEqual([null]);
+    // Re-wordings with no shared anchor stay separate ids until a declared `sameAs` (#76b): never merged by text.
+    expect(new Set(table.map(e => e.findingId)).size).toBe(6);
+  });
+
+  it('finding identity: one id across moved lines, re-quoting and heads; minted once', () => {
+    const a = { ...wordings[1] };
+    const moved = { ...a, line: 140, summary: 'Concurrent `file` commands can file the same "held cards" twice because only the final annotation is locked' };
+    const table = findingIdentityTable([rec(H('a'), 'ra', [a]), rec(H('b'), 'rb', [moved])]);
+    expect(table).toHaveLength(1);
+    expect(table[0].heads).toEqual([H('a'), H('b')]);
+    expect(table[0].findingId).toBe(mintFindingId({ repo: 'web-everything/web-everything', pr: 4017, firstSeenHead: H('a'),
+      ...normalizeFindingIdentity(a) }));
+    // A stored id is honored and never recomputed.
+    const stored = findingIdentityTable([rec(H('a'), 'ra', [a], [{ findingId: 'f-000000000abc' }])]);
+    expect(stored[0].findingId).toBe('f-000000000abc');
+  });
+
+  it('finding identity: a shared quote anchors a re-wording; a short quote, another path or another lens never does', () => {
+    const quote = 'await markFiled(list, filed);  // only this step is locked';
+    const base = { ...wordings[1], quote };
+    const table = findingIdentityTable([rec(H('a'), 'ra', [base])]);
+    expect(bindFindingIds([{ ...wordings[3], quote }], table)).toEqual([table[0].findingId]);
+    expect(bindFindingIds([{ ...wordings[3], quote: 'locked' }], table)).toEqual([null]);
+    expect(bindFindingIds([{ ...wordings[3], quote, file: 'scripts/held-cards.mjs' }], table)).toEqual([null]);
+    expect(bindFindingIds([{ ...wordings[3], quote, category: 'security' }], table)).toEqual([null]);
+    // No path: no cross-head identity; same head and exact claim only.
+    const pathless = { summary: 'Whole-PR claim', category: 'correctness' };
+    const t2 = findingIdentityTable([rec(H('a'), 'ra', [pathless])]);
+    expect(bindFindingIds([pathless], t2)).toEqual([null]);
+    expect(bindFindingIds([pathless], t2, { sameHead: true })).toEqual([t2[0].findingId]);
+  });
+
+  it('finding identity: a declared sameAs binds only on the same path; records accept the optional fields', () => {
+    const first = rec(H('a'), 'ra', [wordings[1]]);
+    const id = findingIdentityTable([first])[0].findingId;
+    const declared = rec(H('b'), 'rb', [wordings[3]], [{ sameAs: id }]);
+    expect(findingIdentityTable([first, declared])).toHaveLength(1);
+    const wrongPath = rec(H('b'), 'rb', [unrelated, { ...wordings[3], file: 'scripts/held-cards.mjs' }], [{}, { sameAs: id }]);
+    expect(findingIdentityTable([first, wrongPath])).toHaveLength(3);
+    expect(validateReferralRecord(declared)).toBe(true);
+    expect(validateReferralRecord(rec(H('b'), 'rb', [wordings[3]], [{ sameAs: 'new', findingId: id }]))).toBe(true);
+    expect(validateReferralRecord(rec(H('b'), 'rb', [wordings[3]], [{ sameAs: 'same as before' }]))).toBe(false);
+    expect(validateReferralRecord(rec(H('b'), 'rb', [wordings[3]], [{ findingId: 'f-XYZ' }]))).toBe(false);
+  });
+
+  it('blocked referral note names every finding', () => {
+    const r = rec(H('a'), 'ra', [wordings[1], { ...unrelated, file: 'scripts/worker-brief.mjs', line: 63 }]);
+    r.authorBody = '<!-- authored-by-actor: author -->';
+    r.rulings = r.referrals.map((f, i) => ({ id: `b${i}`, key: f.key, reviewerId: r.reviewer.id, lens: 'correctness',
+      result: 'block', rationale: 'Verified', evidence: ['diff'] }));
+    const state = mandatoryReferralState([{ body: renderReferralRecord(r), author: { login: 'web-everything' } }], { head: r.head });
+    expect(state.blocked).toHaveLength(2);
+    expect(state.blockedFindings.map(b => b.findingId)).toEqual(findingIdentityTable([r]).map(e => e.findingId));
+    const reason = explainPanelOutcome({ outcome: 'changes', blockedReferrals: state.blockedFindings });
+    expect(reason).toContain('scripts/held-cards-io.mjs:136');
+    expect(reason).toContain('scripts/worker-brief.mjs:63');
+    expect(reason).toMatch(/^Changes: 2 mandatory referrals were ruled block/);
+    // Bare gate keys (an older caller) still name their files.
+    expect(explainPanelOutcome({ outcome: 'changes', blockedReferrals: state.blocked })).toContain('scripts/worker-brief.mjs:63');
   });
 });

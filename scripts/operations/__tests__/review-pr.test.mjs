@@ -1,6 +1,6 @@
 import { ADVISORY_NOTE_MARKER, countAdvisoryComments } from '../../conveyor/advisory-round-count.mjs';
 import { readFileSync } from 'node:fs';
-import { renderReferralRecord, mandatoryReferralReviewer } from '../../lib/jury-core.mjs';
+import { renderReferralRecord, mandatoryReferralReviewer, explainPanelOutcome } from '../../lib/jury-core.mjs';
 import { createReviewPrSinks } from '../review-pr-io.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
 /**
@@ -3999,6 +3999,30 @@ describe('#5135 mandatory referrals survive advisory deferral', () => {
     expect(out.findings).toEqual([race]);
     expect(out.admittedFindings).toEqual([race]);
     expect(out.deferredAdvisory).toEqual([expect.objectContaining({ summary: 'nit' })]);
+  });
+  it('block-ruled finding is never a card suggestion', () => {
+    // #76a: the advisory seat and the referral seat word one finding differently (#4017 rounds 4-6). The same path,
+    // lens and quote make it the same finding identity, so the deferred copy is promoted; a different quote is not.
+    const { declaration } = registryFor({}, { codexAdvisory: true });
+    const step = declaration.steps.find(s => s.name === 'referralVerdict').step;
+    const quote = 'await markFiled(list, filed); // only this step is locked';
+    const blocked = { file: 'scripts/held-cards-io.mjs', line: 136, category: 'correctness', quote, verdict: 'CONFIRMED', impactIfUnfixed: 'broken',
+      summary: 'Concurrent file commands can file the same held cards twice because only the final annotation is locked.' };
+    const reworded = { file: 'scripts/held-cards-io.mjs', category: 'correctness/race', quote,
+      summary: 'Concurrent held-card filing runs can file the same pending items into separate PRs.' };
+    const unrelated = { file: 'scripts/held-cards-io.mjs', line: 113, category: 'correctness', quote: 'writeList(path, next); // no compare-and-swap',
+      summary: 'Held-card updates can overwrite concurrent additions.' };
+    const key = JSON.stringify(['judgeCorrectnessAdvisory', blocked.file, 136, blocked.summary]);
+    const out = step.fn({ findings: {
+      reduce: { verdict: 'accept', findings: [], admittedFindings: [], humanRequired: false,
+        deferredAdvisory: [{ ...reworded, deferred: 'later-round-advisory-untouched' }, { ...unrelated, deferred: 'later-round-advisory-untouched' }] },
+      mandatoryReferrals: { effects: [{ result: { pending: [], blocked: [key], blockedFindings: [{ key, findingId: 'f-0123456789ab', finding: blocked }] } }] },
+    } });
+    expect(out.verdict).toBe('changes');
+    expect(out.findings).toEqual([reworded]);
+    expect(out.deferredAdvisory).toEqual([expect.objectContaining({ summary: unrelated.summary })]);
+    expect(out.blockedReferrals).toEqual([{ key, findingId: 'f-0123456789ab', finding: blocked }]);
+    expect(explainPanelOutcome({ outcome: 'changes', blockedReferrals: out.blockedReferrals })).toContain('scripts/held-cards-io.mjs:136');
   });
   it('preserves an object range by identity and drops non-objects in the read shaper', () => {
     const raw = stubReader({})({ pr: 7, repo: 'o/n' });

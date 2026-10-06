@@ -1,4 +1,5 @@
-import { requiresMandatoryReferral, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted } from '../lib/jury-core.mjs';
+import { requiresMandatoryReferral, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
+  referralKeyFinding, findingIdentityEntry, bindFindingIds } from '../lib/jury-core.mjs';
 /**
  * @file scripts/operations/review-pr.mjs
  * @description THE `review-pr` DECLARATION — the first real operation on the engine (#3035, under epic #3029).
@@ -2532,14 +2533,17 @@ export function reviewPrOperation({
         const state = view.findings.mandatoryReferrals.effects[0]?.result;
         if (!state) return basis;
         const pendingReferrals = state.pending ?? ['unreadable-referral-result'];
-        const blockedReferrals = state.blocked ?? [];
-        // A block-ruled referral is mandatory work for the fixer: never a "card suggestion". Move any such finding
-        // out of the deferred list and into the admitted/published findings (keys are `referralFindingKey`s).
-        const blockedKeys = new Set(blockedReferrals.map((k) => {
-          try { const [, file, , summary] = JSON.parse(k); return `${file ?? ''}\u0000${summary ?? ''}`; } catch { return null; }
-        }).filter(Boolean));
-        const idOf = (f) => `${f?.file ?? ''}\u0000${String(f?.summary ?? '').trim().replace(/\s+/g, ' ')}`;
-        const promoted = blockedKeys.size ? (basis.deferredAdvisory ?? []).filter((f) => blockedKeys.has(idOf(f))) : [];
+        // #76a — one entry per gate key, each `{ key, findingId, finding }`, so the note names every block. A state
+        // without `blockedFindings` (an older result) still yields the finding its key encodes.
+        const blockedReferrals = (state.blocked ?? []).map((key) => state.blockedFindings?.find((b) => b?.key === key)
+          ?? { key, findingId: null, finding: referralKeyFinding(key) });
+        // A block-ruled referral is mandatory work for the fixer: never a "card suggestion". Move any deferred
+        // finding that IS a blocked finding out of the deferred list and into the admitted/published findings. "Is"
+        // means the one finding identity (#76a `bindFindingIds`: same path and lens, and the same normalized claim or
+        // the same quoted anchor), never a sixth matcher. Promotion only TIGHTENS, so a binding can never clear.
+        const blockedTable = blockedReferrals.map((b, i) => findingIdentityEntry(b.finding, b.findingId ?? `key:${i}`)).filter(Boolean);
+        const boundIds = blockedTable.length ? bindFindingIds(basis.deferredAdvisory ?? [], blockedTable, { sameHead: true }) : [];
+        const promoted = (basis.deferredAdvisory ?? []).filter((_f, i) => boundIds[i] != null);
         const deferredAdvisory = promoted.length ? basis.deferredAdvisory.filter((f) => !promoted.includes(f)) : basis.deferredAdvisory;
         const lifted = promoted.map(({ deferred: _d, ...f }) => f);
         const liftedFields = lifted.length ? {
