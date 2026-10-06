@@ -141,7 +141,7 @@ process.exitCode = await main(['add', '--title=' + process.argv[2]], { writeFile
   });
   it('does nothing when all cards are done', async () => {
     const h = harness();
-    fs.writeFileSync(h.list, '1. done BUILT\n');
+    fs.writeFileSync(h.list, '1. **Done.** BUILT\n');
     expect(await h.run(['file'])).toBe(0);
     expect(h.calls).toHaveLength(0);
     expect(h.out.join('')).toContain('nothing to file');

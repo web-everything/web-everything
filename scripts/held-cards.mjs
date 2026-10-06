@@ -16,6 +16,14 @@ export function heldTitle(firstLine) {
   return bold.trim().replace(/[.:,]+$/, '').trim();
 }
 
+/** FILED|BUILT when an item's FIRST line carries a completion marker, else null. Two shapes only: the bold
+ *  `**FILED …**` span `markFiled` appends, and the word right after a leading bold title (`**Title.** BUILT`).
+ *  An uppercase mention in a title, body, continuation line or metadata is ordinary prose, never a marker. */
+export function completionMarker(text) {
+  const rest = text.split('\n', 1)[0].replace(/^\d+\.\s+/, '');
+  return /\*\*(FILED|BUILT)\b[^*]*\*\*/.exec(rest)?.[1] ?? /^\*\*[^*]+\*\*\s+(FILED|BUILT)\b/.exec(rest)?.[1] ?? null;
+}
+
 export function parseHeldCards(md) {
   const lines = md.split(/\r?\n/);
   const items = [];
@@ -34,7 +42,7 @@ export function parseHeldCards(md) {
     if (metadata) {
       try { meta = JSON.parse(metadata[1]); } catch { /* Free-form notes can have malformed metadata. */ }
     }
-    const doneReason = /\b(FILED|BUILT)\b/.exec(text)?.[1] ?? null;
+    const doneReason = completionMarker(text);
     items.push({ num: Number(match[1]), title: heldTitle(match[2]),
       text, startLine, endLine, done: !!doneReason, doneReason, meta });
   }
@@ -92,7 +100,7 @@ export function markFiled(md, filings, { dateEt, pr }) {
   const lines = md.split('\n');
   const ids = new Map(filings.map(({ num, id }) => [num, id]));
   for (const item of parseHeldCards(md).items) {
-    if (ids.has(item.num) && !/\bFILED\b/.test(item.text)) {
+    if (ids.has(item.num) && completionMarker(item.text) !== 'FILED') {
       const cr = lines[item.startLine].endsWith('\r') ? '\r' : '';
       lines[item.startLine] = lines[item.startLine].replace(/\r$/, '') +
         ` — **FILED ${dateEt} as ${ids.get(item.num)}, PR #${pr}**${cr}`;
