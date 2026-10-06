@@ -2,19 +2,19 @@
 /** Real Git admission probes: remote trees, crash recovery and durable state, with no host repository writes. */
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout } from 'node:timers/promises';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
-import { admitCard } from '../card-batch-io.mjs';
+import { admitCard, gitIn } from '../card-batch-io.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const env = { ...process.env, GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@localhost',
   GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@localhost' };
 const git = (cwd, args, options = {}) => execFileSync('git', args, {
-  cwd, env, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], ...options,
+  cwd, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], ...options,
 });
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'card-batch-test-'));
@@ -221,6 +221,105 @@ describe('durable card batch IO', () => {
     const result = await admitCard(input, f.options);
     expect(result.batchRef).toBe('lane/card-batch-prevention-2');
     expect(f.head()).toBe(oldHead);
+  });
+
+  describe('lease edge cases', () => {
+    const lockOf = f => `${f.statePath}.lock`;
+    const successor = f => JSON.stringify({ owner: 'successor', expiresAt: f.now() + 600_000, token: 'successor-token' });
+    const age = (path, f, byMs) => { const seconds = (f.now() - byMs) / 1000; utimesSync(path, seconds, seconds); };
+
+    it('does not take a lock a successor created after the expiry was observed', async () => {
+      const f = fixture();
+      const lock = lockOf(f);
+      writeFileSync(lock, JSON.stringify({ owner: 'old', expiresAt: f.now() - 1, token: 'old-token' }));
+      const live = successor(f);
+      const hook = point => { if (point === 'before-stale-removal') { rmSync(lock); writeFileSync(lock, live); } };
+      expect(await admitCard(f.card(), { ...f.options, hook })).toEqual({ action: 'refuse', reason: 'lease-held' });
+      expect(readFileSync(lock, 'utf8')).toBe(live);
+      expect(readdirSync(f.stateDir)).toEqual(['org-repo-prevention.json.lock']);
+      expect(existsSync(f.statePath)).toBe(false);
+    });
+
+    it.each(['', '{"owner":"killed mid-wri'])('takes over an old lock left unparseable by a killed producer (%j)', async content => {
+      const f = fixture();
+      const input = f.card();
+      writeFileSync(lockOf(f), content);
+      age(lockOf(f), f, 120_000);
+      expect((await admitCard(input, f.options)).action).toBe('admit');
+      assertRecorded(f, [input]);
+    });
+
+    it('refuses while a fresh unparseable lock may still be mid-write', async () => {
+      const f = fixture();
+      writeFileSync(lockOf(f), '');
+      age(lockOf(f), f, 1000);
+      expect(await admitCard(f.card(), f.options)).toEqual({ action: 'refuse', reason: 'lease-held' });
+      expect(readFileSync(lockOf(f), 'utf8')).toBe('');
+      expect(existsSync(f.statePath)).toBe(false);
+    });
+
+    it.each(['after-commit', 'after-push'])('refuses without releasing a successor lease taken before %s is checked', async point => {
+      const f = fixture();
+      const live = successor(f);
+      const hook = p => { if (p === point) writeFileSync(lockOf(f), live); };
+      expect(await admitCard(f.card(), { ...f.options, hook })).toEqual({ action: 'refuse', reason: 'lease-held' });
+      expect(readFileSync(lockOf(f), 'utf8')).toBe(live);
+      expect(existsSync(f.statePath)).toBe(false);
+    });
+
+    it('still returns the admission when a successor is mid-write on the lock at release', async () => {
+      const f = fixture();
+      const hook = p => { if (p === 'after-record') writeFileSync(lockOf(f), ''); };
+      const result = await admitCard(f.card(), { ...f.options, hook });
+      expect(result.action).toBe('admit');
+      expect(readFileSync(lockOf(f), 'utf8')).toBe('');
+    });
+  });
+
+  it('refuses a non-fast-forward push, leaving state alone and releasing the lease', async () => {
+    const f = fixture();
+    await admitCard(f.card(), f.options);
+    const before = readFileSync(f.statePath);
+    const hook = point => {
+      if (point !== 'after-commit') return;
+      const tree = git(f.remote, ['rev-parse', `${f.ref}^{tree}`]).trim();
+      git(f.remote, ['update-ref', f.ref, git(f.remote, ['commit-tree', tree, '-p', f.head(), '-m', 'racing writer']).trim()]);
+    };
+    expect(await admitCard(f.card('5193'), { ...f.options, hook })).toEqual({ action: 'refuse', reason: 'ff-reject' });
+    expect(readFileSync(f.statePath)).toEqual(before);
+    expect(existsSync(`${f.statePath}.lock`)).toBe(false);
+  });
+
+  it('bounds captured git output at 16 MiB and lets no caller raise it', () => {
+    const f = fixture();
+    const run = gitIn(f.laneDir);
+    const blob = (size) => git(f.laneDir, ['hash-object', '-w', '--stdin'], { input: 'x'.repeat(size) }).trim();
+    expect(run(['cat-file', 'blob', blob(2 * 1024 * 1024)])).toHaveLength(2 * 1024 * 1024);
+    const over = blob(16 * 1024 * 1024 + 1);
+    expect(() => run(['cat-file', 'blob', over])).toThrow(/ENOBUFS/);
+    expect(() => run(['cat-file', 'blob', over], { maxBuffer: 64 * 1024 * 1024 })).toThrow(/ENOBUFS/);
+  }, 30_000);
+
+  describe('git argv from untrusted values', () => {
+    it.each(['--upload-pack=touch ${marker}', '-x', 'HEAD', 'abc123', ''])('rejects baseSha %j before any git runs', async template => {
+      const f = fixture();
+      const marker = join(f.root, 'pwned');
+      const input = { ...f.card(), baseSha: template.replace('${marker}', marker) };
+      await expect(admitCard(input, f.options)).rejects.toThrow(TypeError);
+      expect(existsSync(marker)).toBe(false);
+      expect(readdirSync(f.stateDir)).toEqual([]);
+    });
+
+    it('refuses a state file whose headSha is not a commit id', async () => {
+      const f = fixture();
+      await admitCard(f.card(), f.options);
+      const marker = join(f.root, 'pwned');
+      writeFileSync(f.statePath, JSON.stringify({ ...f.state(), headSha: `--upload-pack=touch ${marker}` }));
+      const before = readFileSync(f.statePath);
+      expect(await admitCard(f.card('5193'), f.options)).toEqual({ action: 'refuse', reason: 'head-mismatch' });
+      expect(existsSync(marker)).toBe(false);
+      expect(readFileSync(f.statePath)).toEqual(before);
+    });
   });
 
   it('has no force-push option anywhere in its source', () => {
