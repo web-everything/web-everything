@@ -24,8 +24,9 @@
  *
  * A marker file, a status line, a lease record or a label saying "fixing" OUTLIVES the agent that wrote it, and
  * from that moment on it lies — confidently, and in the exact direction that stops anyone looking. The whole
- * point of this command is to be un-lie-able, so the ONLY thing it will accept as proof that someone is working
- * is a LIVE PROCESS whose cwd is a lane that carries the PR branch's history. Nothing this command prints as
+ * point of this command is to require observed activity. Managed busy/working sessions now supplement lane
+ * process evidence through pr-state-core; claims alone never earn FIXING. The original lane probe accepts
+ * a LIVE PROCESS whose cwd is a lane that carries the PR branch's history. Nothing this command prints as
  * `FIXING` or `REVIEWING` can outlive the process that earns it, because the process IS the evidence.
  *
  * The ownership test is ANCESTRY (`git merge-base --is-ancestor <branch-head> <lane-head>`), never sha equality.
@@ -126,7 +127,7 @@
  * fixtures in `we:scripts/__tests__/pr-status.test.mjs` — no live process, no gh, no network, no git. The impure
  * shell at the bottom is only the probes that feed them: `gh pr list` · `git` · `pgrep`/`lsof`/`ps` · the two
  * ledger reads · the transcript read. Every one of them fails soft, and a probe that cannot answer costs a
- * column, never the run — the honest degradation being that with no process evidence everything reads STUCK.
+ * column, never the run. Managed-session probe failures are reported as unknown, never proof of a stall.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
@@ -139,6 +140,8 @@ import { REVIEW_LABELS } from './lib/review-escalation.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { DEFAULT_REPO_KEY, CONSTELLATION_REPOS } from './lib/constellation-repos.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
+import { readPrFacts } from './lib/pr-state-io.mjs';
+import { derivePrState, settingsFromEnv } from './lib/pr-state-core.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 /** The checkout this script lives in — the default root for the per-checkout `.conveyor/jury` ledger. */
@@ -545,10 +548,17 @@ function labelNames(labels) {
  *           ledgerOwed?: 'fix'|'review'|'human'|'prevention'|'none'|null }} o
  * @returns {{ phase: string, reason: string, display: string }} `display` is the printable phase cell.
  */
-export function derivePhase({ labels = [], worker = null, pendingQuestion = null, ledgerOwed = null } = {}) {
+export function derivePhase({ labels = [], worker = null, pendingQuestion = null, ledgerOwed = null, ownerState = null } = {}) {
   const names = labelNames(labels);
   const has = (l) => names.includes(l);
-  const stuck = (reason) => ({ phase: PHASES.STUCK, reason, display: `${PHASES.STUCK}: ${reason}` });
+  // Only absence-derived stalls accept the session-aware verdict. Human/prevention gates retain authority.
+  const stuck = (reason) => {
+    if (ownerState && [STUCK_REASONS.BOUNCED_NO_FIXER, STUCK_REASONS.NO_REVIEWER, STUCK_REASONS.NO_LABEL].includes(reason)) {
+      return { phase: ownerState.phase, reason: ownerState.headline,
+        display: `${ownerState.phase}: ${ownerState.headline}` };
+    }
+    return { phase: PHASES.STUCK, reason, display: `${PHASES.STUCK}: ${reason}` };
+  };
   const settled = (phase) => ({ phase, reason: '', display: phase });
 
   // When no label says what is owed, ask the LEDGER — the authority the label is derived from — instead of
@@ -781,7 +791,7 @@ function parseArgs(argv) {
  * Assemble one PR's row from the four probes. Every DECISION in here is a call into a pure exported function;
  * this only fetches the inputs and hands them over.
  */
-function buildRow(pr, { gitRoot, juryRoot, lanes, verdictRecords }) {
+function buildRow(pr, { gitRoot, juryRoot, lanes, verdictRecords, noSessions = false }) {
   let juryEvents = [];
   try { juryEvents = readJuryLog(`${SUBJECT_PREFIX}#${pr.number}`, { root: juryRoot }); } catch { juryEvents = []; }
 
@@ -797,7 +807,13 @@ function buildRow(pr, { gitRoot, juryRoot, lanes, verdictRecords }) {
   const ledgerOwed = owedFromLedgerVerdict(latestLedgerVerdict(verdictRecords, pr.number))
     ?? owedFromLedgerVerdict(ledgerPanelVerdict(juryEvents));
 
+  let ownerState = null;
+  if (!noSessions) {
+    try { ownerState = derivePrState(readPrFacts(pr.number), settingsFromEnv(process.env)); }
+    catch { /* a session probe cannot break the existing report */ }
+  }
   const { display } = derivePhase({
+    ownerState,
     labels: pr.labels,
     worker,
     pendingQuestion: { asked: transcript.asked, question: transcript.question },
@@ -828,6 +844,7 @@ function buildRow(pr, { gitRoot, juryRoot, lanes, verdictRecords }) {
  *                             point this at the primary when you want the ledgers the drain actually wrote.
  *   `--lanes-root=<dir>`      the pool ROOT (or a single pool dir) to scan for lanes and live workers
  *                             (default: derived from this checkout via `defaultPoolRoot`).
+ *   `--no-sessions`           skip managed session/completion/hand-off probes.
  *   `--no-fetch`              skip the `git fetch`, for a fast offline read of whatever refs are already local.
  *   `--json`                  emit the rows as JSON instead of the table.
  */
@@ -845,7 +862,7 @@ function main(argv) {
   // One read of the whole repo ledger, shared by every row — it is a single append-only file.
   let verdictRecords = [];
   try { verdictRecords = readVerdictLedger(CONSTELLATION_REPOS[SUBJECT_PREFIX].slug); } catch { verdictRecords = []; }
-  const rows = listOpenPrs(gitRoot).map((pr) => buildRow(pr, { gitRoot, juryRoot, lanes, verdictRecords }));
+  const rows = listOpenPrs(gitRoot).map((pr) => buildRow(pr, { gitRoot, juryRoot, lanes, verdictRecords, noSessions: flags['no-sessions'] }));
 
   writeAllSync(1, flags.json ? `${JSON.stringify(rows, null, 2)}\n` : renderReport(rows));
   return 0;
