@@ -1,9 +1,10 @@
 ---
+bornAs: xqrggm7
 kind: story
 size: 5
 parent: "4703"
 status: open
-blockedBy: ["xk15cr3"]
+blockedBy: ["5195"]
 scope: ["we:scripts/operations/probation-build-run.mjs", "we:scripts/operations/__tests__/probation-build-run.test.mjs", "we:scripts/lib/card-batch-policy.mjs", "we:scripts/lib/card-batch-policy.json", "we:scripts/lib/__tests__/card-batch-policy.test.mjs"]
 dateOpened: "2026-10-06"
 tags: []

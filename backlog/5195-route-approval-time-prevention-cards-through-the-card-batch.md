@@ -1,9 +1,10 @@
 ---
+bornAs: xk15cr3
 kind: story
 size: 3
 parent: "4703"
 status: open
-blockedBy: ["x2fvt08", "xuz8m83"]
+blockedBy: ["5193", "5194"]
 scope: ["we:scripts/operations/land-prevention-card.mjs", "we:scripts/operations/__tests__/land-prevention-card.test.mjs"]
 dateOpened: "2026-10-06"
 tags: []

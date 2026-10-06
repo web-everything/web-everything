@@ -1,9 +1,10 @@
 ---
+bornAs: xhceyny
 kind: story
 size: 5
 parent: "4703"
 status: open
-blockedBy: ["xk15cr3"]
+blockedBy: ["5195"]
 scope: ["plateau:src/wip/card-batch-config.ts", "plateau:src/wip/card-batch-config.test.ts", "plateau:src/wip/glance/glance-card-batch.ts", "plateau:src/wip/glance/glance-card-batch.test.ts", "plateau:tests/e2e/card-batch-settings.spec.ts", "we:scripts/lib/card-batch-policy.mjs", "we:scripts/lib/__tests__/card-batch-policy.test.mjs"]
 dateOpened: "2026-10-06"
 tags: []

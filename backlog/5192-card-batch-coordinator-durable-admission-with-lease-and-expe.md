@@ -1,9 +1,10 @@
 ---
+bornAs: xwnamtf
 kind: story
 size: 5
 parent: "4703"
 status: open
-blockedBy: ["xowd9o9"]
+blockedBy: ["5191"]
 scope: ["we:scripts/operations/card-batch.mjs", "we:scripts/operations/card-batch-io.mjs", "we:scripts/operations/__tests__/card-batch.test.mjs", "we:scripts/operations/__tests__/card-batch-io.test.mjs"]
 dateOpened: "2026-10-06"
 tags: []

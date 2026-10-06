@@ -1,9 +1,10 @@
 ---
+bornAs: x2fvt08
 kind: story
 size: 5
 parent: "4703"
 status: open
-blockedBy: ["xwnamtf"]
+blockedBy: ["5192"]
 scope: ["we:scripts/operations/card-batch-io.mjs", "we:scripts/operations/__tests__/card-batch-seal.test.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs"]
 dateOpened: "2026-10-06"
 tags: []

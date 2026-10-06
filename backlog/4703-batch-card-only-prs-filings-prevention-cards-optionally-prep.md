@@ -29,7 +29,7 @@ Operator goal, 2026-10-02: reduce PR count by grouping new filings and preventio
 
 Re-preparation and slicing (2026-10-06, against e93a583ab). Operator approval, 2026-10-06: MVP first = prevention cards only, sealing at **10 cards or 2 hours** (both settings), then filings, then Plateau settings and opt-in prepare batching. These replace the 15 cards / 60 minutes defaults above.
 
-Slices (DAG): xowd9o9 policy + eligibility core (3) → xwnamtf durable admission with lease and expected head (5) → x2fvt08 draft PR, count/age seal, publish (5) → xuz8m83 failed-card extraction (5) → xk15cr3 land-prevention-card integration + live proof (3, blocked by x2fvt08 and xuz8m83). **MVP = those five (21 points).** Then xazahhl filings (3), xhceyny Plateau settings (5) and xqrggm7 opt-in prepare batching (5), each blocked by xk15cr3.
+Slices (DAG): 5191 policy + eligibility core (3) → 5192 durable admission with lease and expected head (5) → 5193 draft PR, count/age seal, publish (5) → 5194 failed-card extraction (5) → 5195 land-prevention-card integration + live proof (3, blocked by 5193 and 5194). **MVP = those five (21 points).** Then 5196 filings (3), 5197 Plateau settings (5) and 5198 opt-in prepare batching (5), each blocked by 5195.
 
 Premises re-verified on origin/main:
 

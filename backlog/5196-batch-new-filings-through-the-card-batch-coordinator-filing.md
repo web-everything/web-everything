@@ -1,9 +1,10 @@
 ---
+bornAs: xazahhl
 kind: story
 size: 3
 parent: "4703"
 status: open
-blockedBy: ["xk15cr3"]
+blockedBy: ["5195"]
 scope: ["we:skills-src/file-item/SKILL.md", "we:scripts/operations/card-batch.mjs", "we:scripts/operations/__tests__/card-batch.test.mjs", "we:scripts/lib/card-batch-policy.json", "we:scripts/operations/sweep-orphan-backlog-cards.mjs", "we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs"]
 dateOpened: "2026-10-06"
 tags: []
