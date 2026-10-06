@@ -287,6 +287,11 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // review as a fake `claude --bg` session's actions. Pin the opt-in session path until the simulator models
     // the job (filed as its own follow-up) — this keeps the fix/lane/label scenarios exercising what they did.
     WE_REVIEW_DISPATCH_MODE: 'session',
+    // dispatch-throttle.mjs: the fix/ci-heal live-session cap and the host-load gate defer launches off the REAL
+    // host's loadavg and live claims — a soak must be hermetic, or a busy CI runner (4 shards in parallel) reads as
+    // an owed PR "never dispatched". Pinned wide open; dispatch-throttle.test.mjs owns the throttle itself.
+    WE_FIX_DISPATCH_MAX_CONCURRENT: '1000',
+    WE_MAX_LOAD_PER_CORE: '1000',
   };
   delete env.WE_GITHUB_APP_ID;
   delete env.WE_GITHUB_APP_INSTALLATION_ID;
