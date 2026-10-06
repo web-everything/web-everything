@@ -3,9 +3,10 @@ bornAs: xfoyxjf
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: active
 scope: ["we:backlog/2772-post-hoc-review-forensics-and-take-over-for-stalled-or-faile.md"]
 dateOpened: "2026-10-02"
+dateStarted: "2026-10-06"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "9058b677f1ec7e7bc3d749168aa7771b6d6db585"
 tags: []
@@ -21,6 +22,10 @@ Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outsta
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#3521@f934b9ff297206063ca63daf6d945f92fcf448ca
 
 ## Progress
+
+- **Implementation (2026-10-06):** sanity read confirmed #2772 still lacks the requested explicit guard/confidentiality requirements and named tests; the proposed WE collector/test files remain absent. Amended the target card's Design, MVP, Test plan, Proof plan and Follow-ups with independent custody header rejection and zero-mutation guarantees, filtering before forensic DTO serialization, both named implementation tests and positive controls. Preserved its existing scope/source-test pairings, custody round trip and per-repository delivery split. Reviewed the amendment against both approval debts; no runtime security proof is claimed.
+
+- **Validation (2026-10-06):** `node we:scripts/check-backlog-item.mjs 2772` passed with no warnings; `node we:scripts/check-backlog-item.mjs 4816` passed with one warning about the unchanged test-plan case classifications in this card. A Python comparison against pre-edit snapshots passed changed-line trailing-whitespace/conflict-marker, EOF and unchanged-frontmatter checks for both edited cards. No git commands or standards gate were run, per the delivery brief; the wrapper owns the gate and commit. The named runtime tests remain planned and were not executed.
 
 Preparation research at WE `9058b677f1ec7e7bc3d749168aa7771b6d6db585` and Plateau `7b9547db7bd6d45f87e15d19b6b50a05890d238d`; no implementation or runtime proof claimed.
 
