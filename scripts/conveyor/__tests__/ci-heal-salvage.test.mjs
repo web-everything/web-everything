@@ -87,3 +87,12 @@ describe('real git salvage', () => {
     expect(run(f.origin, 'rev-parse', 'refs/heads/lane/x')).toBe(f.sha);
   });
 });
+
+it.each(['3990', '#3990'])('recognizes item-backed brief titles for PR %s', number => {
+  const sha = 'a'.repeat(40);
+  expect(parseReflogSalvageCandidates(row(sha, `commit: WE #123: ci-heal — x (PR ${number})`), 3990)).toEqual([sha]);
+  expect(parseReflogSalvageCandidates(row(sha, `commit (amend): WE #123: ci-heal — x (PR ${number})`), 3990)).toEqual([sha]);
+});
+it.each(['39900', '399', '#39900', '#399'])('rejects item-backed titles for another PR %s', number => {
+  expect(parseReflogSalvageCandidates(row('a'.repeat(40), `commit: WE #123: ci-heal — x (PR ${number})`), 3990)).toEqual([]);
+});

@@ -325,8 +325,6 @@ describe('hard read deadlines', () => {
     const f = fixture({ records: [dispatch('live')] });
     const exec = vi.fn((file) => file === 'ps' ? 'node /driver/skills-src/conveyor/runner.mjs' : '[]');
     collectRunnerActivity({}, { ...f.io, listAgents: undefined, exec,
-      // The cache must be off: this bare env carries no VITEST, so a sibling test's fresh `[]` listing for the same
-      // (empty) PATH/HOME scope would be served and `claude` never exec'd — an order-dependent CI-only failure.
       env: { WE_DISPATCH_LIST_TIMEOUT_MS: '0', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' } });
     expect(exec.mock.calls.find(([file]) => file === 'claude')[2]).toMatchObject({ timeout: 2000, killSignal: 'SIGKILL' });
   });

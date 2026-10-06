@@ -24,10 +24,11 @@
  * acquire would be refused `writer-active` for the smoke's whole duration.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runSoak } from '../soak.mjs';
+import { rebuildMechanismSource } from '../rebuild-mechanism-source.mjs';
 
 const SMOKE_MS = 3_000; // stands in for the live ~65s smoke — long enough to observe reliably, short for a test.
 
@@ -42,7 +43,7 @@ export default {
   },
   fixPresent(root) {
     try {
-      return /materializeCandidate/.test(readFileSync(join(root, 'scripts/lib/daemon-rebuild.mjs'), 'utf8'));
+      return /materializeCandidate/.test(rebuildMechanismSource(root));
     } catch {
       return false;
     }

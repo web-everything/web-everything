@@ -1,9 +1,10 @@
 ---
 bornAs: x26el1a
 kind: task
-status: open
+status: resolved
 scope: ["we:scripts/"]
 dateOpened: "2026-10-05"
+dateResolved: "2026-10-05"
 tags: []
 ---
 
@@ -13,6 +14,11 @@ The load-flake-reverify launchd job crash-looped every 10s because wev-review-da
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+1. **Executable** — run from the WE checkout to prove the CLI stays alive with `manifest-entry-missing`, sleeps between checks, and preserves valid-entry startup and malformed-entry refusal:
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+   ```bash
+   npm run test:unit -- skills-src/conveyor/__tests__/pass-daemon.test.mjs
+   ```
+
+2. **Must** — a missing entry idles before lease acquisition or pass execution; update the clone and restart to load a newly registered entry.
+3. **Must** — malformed manifest configuration/data still fails closed; neither source paths nor docs/config/data paths supplied as pass names bypass the manifest allowlist.

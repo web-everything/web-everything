@@ -28,6 +28,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runSoak } from '../soak.mjs';
+import { rebuildMechanismSource } from '../rebuild-mechanism-source.mjs';
 import { cloneFacts } from '../invariants.mjs';
 
 const OVERLAY_REF = 'lane/4217-bad-overlay-fixture';
@@ -61,7 +62,7 @@ export default {
   // fixPresent probe (per the brief): `smokeAndAdopt` in daemon-rebuild.mjs — the 4217 fallback/hold body.
   fixPresent(root) {
     try {
-      return /smokeAndAdopt/.test(readFileSync(join(root, 'scripts/lib/daemon-rebuild.mjs'), 'utf8'));
+      return /smokeAndAdopt/.test(rebuildMechanismSource(root));
     } catch { return false; }
   },
   async run({ log } = {}) {

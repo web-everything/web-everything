@@ -102,6 +102,9 @@ export function computeMainRedWindows(mainRuns) {
   const windows = [];
   let redSince = null;
   for (const run of terminal) {
+    // Outage fix: a run red only because its jobs were cancelled / had no runner (infra-cancelled) says nothing
+    // about `main`'s code — ambiguous, like `cancelled`. `infraCancelledOnly` is set by `defaultReadMainRuns`.
+    if (run.infraCancelledOnly === true) continue;
     const concl = String(run.conclusion || '').toLowerCase();
     const isRed = MAIN_RED_CONCLUSIONS.includes(concl);
     const isGreen = concl === 'success'; // the ONLY conclusion that closes a window — see the docblock above.

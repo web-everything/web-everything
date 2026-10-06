@@ -3342,6 +3342,22 @@ describe('xng7q1p mechanical timeout precedence', () => {
     const result = planReconcile({ prs: [pr({ timeoutRetryBudget: undefined })], now: NOW });
     expect(result.dispatch.map((row) => row.kind)).toEqual(['ci-heal']);
   });
+  it('infra-cancelled red routes to a mechanical rerun while under its cap, then to ci-heal (never ci-heal first)', () => {
+    const infra = { eligible: true, infraCancelled: true, cap: 6, repo: 'web-everything/web-everything', pr: 3415, head, signature: 'infra', jobs: [{ run: 10, job: 20, attempt: 1 }] };
+    const under = planReconcile({ prs: [pr({ timeoutRetry: infra, timeoutRetryBudget: { confirmed: 3, pending: false } })], now: NOW });
+    expect(under.dispatch.map((row) => row.kind)).toEqual(['ci-timeout-rerun']);
+    const spent = planReconcile({ prs: [pr({ timeoutRetry: infra, timeoutRetryBudget: { confirmed: 6, pending: false } })], now: NOW });
+    expect(spent.dispatch.map((row) => row.kind)).toEqual(['ci-heal']);
+  });
+  it('infra-cancelled re-runs the API rejected or refused still spend the cap, so the PR reaches ci-heal (never refused forever)', () => {
+    const infra = { eligible: true, infraCancelled: true, cap: 6, repo: 'web-everything/web-everything', pr: 3415, head, signature: 'infra', jobs: [{ run: 10, job: 20, attempt: 1 }] };
+    const rejectedUnder = planReconcile({ prs: [pr({ timeoutRetry: infra, timeoutRetryBudget: { confirmed: 1, rejected: 4, pending: false } })], now: NOW });
+    expect(rejectedUnder.dispatch.map((row) => row.kind)).toEqual(['ci-timeout-rerun']);
+    const rejectedSpent = planReconcile({ prs: [pr({ timeoutRetry: infra, timeoutRetryBudget: { confirmed: 0, rejected: 6, pending: false } })], now: NOW });
+    expect(rejectedSpent.dispatch.map((row) => row.kind)).toEqual(['ci-heal']);
+    const mixedSpent = planReconcile({ prs: [pr({ timeoutRetry: infra, timeoutRetryBudget: { confirmed: 2, rejected: 4, pending: false } })], now: NOW });
+    expect(mixedSpent.dispatch.map((row) => row.kind)).toEqual(['ci-heal']);
+  });
   it('exhausted per-head retries fall through to normal healing', () => {
     const result = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 2, pending: false } })], now: NOW });
     expect(result.dispatch.map((row) => row.kind)).toEqual(['ci-heal']);

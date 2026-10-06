@@ -72,6 +72,15 @@ import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { salvageEnabled, laneDirsForRepo, findSalvageCommit, pushSalvage } from '../conveyor/ci-heal-salvage.mjs';
 
+import { readFixLoopRows, appendFixLoopRow, fixLoopConfig, fixLoopState, fixDispatchKilled,
+  fixDispatchKillFile, hasFixHoldLabel } from '../conveyor/fix-loop-ledger.mjs';
+
+const defaultFixLoop = {
+  readRows: () => process.env.VITEST && !process.env.WE_FIX_LOOP_LEDGER ? [] : readFixLoopRows(),
+  append: row => { if (!process.env.VITEST || process.env.WE_FIX_LOOP_LEDGER) appendFixLoopRow(row); },
+  killed: () => process.env.VITEST && !process.env.WE_FIX_DISPATCH_KILL_FILE ? false : fixDispatchKilled(),
+};
+
 function defaultSalvage({ entry, root, repoKey }) {
   if (process.env.VITEST && !process.env.LANE_POOL_ROOT) return null;
   const laneDirs = laneDirsForRepo({ poolRoot: defaultPoolRoot(root),
@@ -290,6 +299,9 @@ export async function runReconcileCiHealDispatch({
   flushTimeouts = flushTimeoutFollowups,
   timeoutHold = readTimeoutHold,
   salvage = defaultSalvage,
+  fixLoop = defaultFixLoop,
+  fixConfig = fixLoopConfig(),
+  now = Date.now(),
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`ci-heal-pr-dispatch: --repo ${repo} is not a constellation repo`);
@@ -304,8 +316,14 @@ export async function runReconcileCiHealDispatch({
   const timeoutResults = [];
   for (const entry of (reconciled.dispatch ?? []).filter((row) => row.kind === 'ci-timeout-rerun')) {
     try {
-      timeoutResults.push({ ...await retryTimeout(entry.timeoutRetry, { root, repo: CONSTELLATION_REPOS[repoKey].slug }),
-        kind: 'ci-timeout-rerun', pr: entry.prNumber });
+      // Infra-cancelled evidence names one target per cancelled run; request them all this tick (the per-head cap
+      // still bounds the total). A timeout retry stays one job per tick.
+      const rounds = entry.timeoutRetry?.infraCancelled ? Math.max(1, entry.timeoutRetry.jobs?.length ?? 1) : 1;
+      for (let i = 0; i < rounds; i++) {
+        const result = await retryTimeout(entry.timeoutRetry, { root, repo: CONSTELLATION_REPOS[repoKey].slug });
+        timeoutResults.push({ ...result, kind: 'ci-timeout-rerun', pr: entry.prNumber });
+        if (result.status !== 'requested') break;
+      }
     } catch (error) {
       timeoutResults.push({ kind: 'ci-timeout-rerun', pr: entry.prNumber, status: 'refused', reason: error.message });
     }
@@ -339,6 +357,15 @@ export async function runReconcileCiHealDispatch({
   const dispatched = [];
   const refusals = [];
   for (const entry of ciHealEntries) {
+    if (fixLoop.killed()) {
+      refusals.push({ pr: entry.prNumber, kind: 'fix-dispatch-killed', why: `kill file ${fixDispatchKillFile()} present` });
+      continue;
+    }
+    // TODO: expose PR labels in reconcile entries; the current plan only returns a PR count.
+    if (hasFixHoldLabel(entry.labels)) {
+      refusals.push({ pr: entry.prNumber, kind: 'fix-hold-label' });
+      continue;
+    }
     const unsettled =healObservations.find(row => row.pr === entry.prNumber && row.status !== 'resolved');
     if (unsettled) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-unsettled', why: unsettled.error ?? 'owned wrapper still running' }); continue; }
     if ((owedFlush.kept ?? []).some(row => row.pr === entry.prNumber)) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-accounting-owed', why: 'durable heal accounting is not confirmed' }); continue; }
@@ -355,6 +382,15 @@ export async function runReconcileCiHealDispatch({
       if (recovered?.pushed === false && recovered.sha) {
         refusals.push({ pr: entry.prNumber, kind: 'ci-heal-salvage-failed', why: recovered.reason });
       }
+    }
+    let loopRows = [];
+    try { loopRows = fixLoop.readRows(); } catch { /* An unreadable ledger never blocks dispatch. */ }
+    const loop = fixLoopState({ rows: loopRows, repo: repoKey, pr: entry.prNumber,
+      head: entry.headRefOid, now, config: fixConfig });
+    if (loop.held) {
+      refusals.push({ pr: entry.prNumber, kind: 'fix-loop-hold',
+        why: `${loop.count} ci-heal/fix sessions on head ${String(entry.headRefOid ?? '').slice(0, 7)} in ${fixConfig.windowHours}h with nothing pushed; auto-held until the head moves (WE_FIX_LOOP_HOLD=0 disables)` });
+      continue;
     }
     const q = queueBudget.tryAdmit('ci-heal', { id: entry.prNumber });
     if (!q.admit) {
@@ -399,6 +435,10 @@ export async function runReconcileCiHealDispatch({
         continue;
       }
       dispatched.push(result);
+      try {
+        await fixLoop.append({ repo: repoKey, pr: entry.prNumber, kind: 'ci-heal', head: entry.headRefOid,
+          session: result?.session ?? result?.sessionSlug ?? `ci-heal-${entry.prNumber}` });
+      } catch { /* Dispatch succeeded; ledger writes are best effort. */ }
     } catch (e) {
       refusals.push({ pr: entry.prNumber, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
     }
@@ -481,8 +521,10 @@ export function timeoutGithubEffects({ exec = execFileSyncThrottled } = {}) {
     },
     request(evidence, target) {
       try {
+        // Infra-cancelled: re-run the whole run's cancelled/failed jobs (a cancelled job has no log to re-run from).
+        const endpoint = evidence.infraCancelled ? `actions/runs/${target.run}/rerun-failed-jobs` : `actions/jobs/${target.job}/rerun`;
         const response = String(exec('gh', ['api', '--include', '--method', 'POST',
-          `repos/${evidence.repo}/actions/jobs/${target.job}/rerun`],
+          `repos/${evidence.repo}/${endpoint}`],
         { encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] }));
         return /^HTTP\/\S+ 201\b/m.test(response) ? { status: 'confirmed' } : { status: 'ambiguous' };
       } catch (error) {
@@ -509,7 +551,7 @@ export function readTimeoutHold({ repo, pr, head, dir = timeoutStateDir() }) {
 async function fileTimeoutFollowup(path, { root, fileFollowup } = {}) {
   let payload;
   timeoutTransaction(path, null, (state) => {
-    if (confirmedTimeouts(state) < 2 || state.card?.filed) return;
+    if (state.evidence.infraCancelled || confirmedTimeouts(state) < 2 || state.card?.filed) return;
     if (state.card?.filingPid) {
       try { process.kill(state.card.filingPid, 0); return; }
       catch (error) { if (error.code !== 'ESRCH') return; }
@@ -614,7 +656,7 @@ export async function dispatchTimeoutRetry(evidence, {
   };
   let reservation;
   const selected = timeoutTransaction(path, initial, (state) => {
-    if (confirmedTimeouts(state) >= 2) return { exhausted: true, card: state.card?.payload.num };
+    if (confirmedTimeouts(state) >= (evidence.infraCancelled ? (evidence.cap ?? 6) : 2)) return { exhausted: true, card: state.card?.payload.num };
     const pending = state.requests.find((r) => r.status === 'pending');
     if (pending) return { pending: structuredClone(pending) };
     const target = evidence.jobs.find((j) => !state.requests.some((r) => r.status === 'confirmed'
@@ -636,7 +678,10 @@ export async function dispatchTimeoutRetry(evidence, {
   // been sent, so it is never released here.
   const releaseFresh = () => {
     if (reservation) timeoutTransaction(path, initial, (state) => {
-      if (state.requests[reservation.id]?.status === 'pending') state.requests[reservation.id].status = 'rejected';
+      const request = state.requests[reservation.id];
+      // `released` marks an early release (observation failed / stale head): no request was ever sent, so it is not an
+      // attempt the infra re-run cap should count (`readTimeoutBudget` skips it) — a flaky GitHub read must not burn the cap.
+      if (request?.status === 'pending') { request.status = 'rejected'; request.released = true; }
     });
   };
   let observed;
@@ -657,7 +702,8 @@ export async function dispatchTimeoutRetry(evidence, {
     return refuse('retry-reconciled-wait-for-evidence');
   }
   if (observed.attempt !== target.attempt || observed.jobAttempt !== target.attempt
-      || observed.status !== 'completed' || observed.conclusion !== 'failure') {
+      || observed.status !== 'completed'
+      || (evidence.infraCancelled ? ['success', 'skipped', 'neutral'].includes(observed.conclusion) : observed.conclusion !== 'failure')) {
     timeoutTransaction(path, initial, (state) => { state.requests[reservation.id].status = 'rejected'; });
     return refuse('job-no-longer-failed-at-evidenced-attempt');
   }

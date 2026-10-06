@@ -29,9 +29,10 @@
  * fault is spent, and the clone catches back up within a few ticks.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { runSoak } from '../soak.mjs';
+import { rebuildMechanismSource } from '../rebuild-mechanism-source.mjs';
 
 export default {
   id: 'sticky-smoke-rejection',
@@ -46,7 +47,7 @@ export default {
   // module doesn't exist there) and on lane/4044 before eb7c540ea.
   fixPresent(root) {
     try {
-      return /export function rejectRetryDelayMs/.test(readFileSync(join(root, 'scripts/lib/daemon-rebuild.mjs'), 'utf8'));
+      return /export function rejectRetryDelayMs/.test(rebuildMechanismSource(root));
     } catch { return false; }
   },
   run({ log } = {}) {
