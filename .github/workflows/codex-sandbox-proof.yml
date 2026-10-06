@@ -1,0 +1,141 @@
+# Manual proof that the Codex native sandbox still refuses Git-metadata mutation under a writable-root grant
+# (#4807, prevention for #4443 / chalbert/web-everything#3376). Dispatch it with the candidate CLI version BEFORE
+# adopting a Codex CLI upgrade:   gh workflow run codex-sandbox-proof.yml -f codex_version=<x.y.z>
+#
+# WHAT IT RUNS: only the named proof + guard suites, with BOTH opt-in variables set (`WE_TEST_SANDBOX=0` lets the
+# real `codex` binary through the unit-test sandbox, `WE_CODEX_SANDBOX_TEST=1` turns the live suite on). The live
+# suite drives the raw `codex sandbox -P locked` wrapper — no model call, no authentication — against disposable
+# `git clone --reference` lane fixtures (the production topology).
+#
+# MACOS ONLY, deliberately: the documented claim is about macOS Seatbelt. A Linux run would prove a different
+# sandbox and must not be mistaken for this evidence.
+#
+# A REQUESTED RUN CANNOT PASS BY SKIPPING: a missing CLI or unusable sandbox fails the suite's own setup, a
+# version mismatch fails the install step, and the verify step rejects any skipped/todo/failed case or a case
+# count below the live suite's size. There is no `continue-on-error` anywhere; the report and the CLI/host
+# evidence are uploaded even on failure. This workflow is never triggered by a push or pull request, so it adds
+# no required check and no queue load. The assertions are pinned by
+# `we:scripts/operations/__tests__/codex-sandbox-proof-workflow.test.mjs`.
+name: Codex sandbox proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      codex_version:
+        description: Exact @openai/codex version to install and prove (for example 0.155.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CODEX_VERSION: ${{ inputs.codex_version }}
+      EVIDENCE_DIR: ${{ github.workspace }}/proof-evidence
+      # Size of the live suite (`codex-delivery-provider-sandbox.test.mjs`). The verify step fails below this.
+      LIVE_MIN_CASES: '6'
+    steps:
+      # Sibling layout so WE's `../frontierui` resolves (same as ci.yml's test shards): `we:vitest.config.ts` aliases
+      # `@frontierui/*` to that sibling, and the card (#4807) asks for the existing WE/FUI dependency install so the
+      # proof runs under the same test environment as the gate.
+      #   $GITHUB_WORKSPACE/web-everything, $GITHUB_WORKSPACE/frontierui
+      - name: Checkout WE
+        uses: actions/checkout@v4
+        with:
+          path: web-everything
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
+      - name: Checkout FUI (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
+          path: frontierui
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web-everything/package-lock.json
+            frontierui/package-lock.json
+
+      - name: Install + build FUI tools
+        working-directory: frontierui
+        run: |
+          npm ci
+          npm run build:tools
+
+      - name: Install WE
+        working-directory: web-everything
+        run: npm ci
+
+      # The version is passed through the environment, never interpolated into the script, and validated before
+      # it reaches npm.
+      - name: Install the exact Codex CLI version
+        run: |
+          if ! [[ "$CODEX_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "codex_version must be an exact version like 0.155.1, got: $CODEX_VERSION" >&2
+            exit 1
+          fi
+          npm install --global "@openai/codex@${CODEX_VERSION}"
+          mkdir -p "$EVIDENCE_DIR"
+          ACTUAL="$(codex --version)"
+          {
+            echo "requested: ${CODEX_VERSION}"
+            echo "actual: ${ACTUAL}"
+            echo "host: $(uname -srm)"
+            sw_vers
+          } | tee "$EVIDENCE_DIR/host.txt"
+          # `codex --version` prints "codex-cli <version>": compare the last word exactly, never a substring.
+          if [ "${ACTUAL##* }" != "$CODEX_VERSION" ]; then
+            echo "installed CLI '${ACTUAL}' does not match requested ${CODEX_VERSION}" >&2
+            exit 1
+          fi
+
+      - name: Run the live sandbox proof + process-check guards
+        working-directory: web-everything
+        env:
+          WE_TEST_SANDBOX: '0'
+          WE_CODEX_SANDBOX_TEST: '1'
+          WE_CODEX_SANDBOX_EVIDENCE: ${{ github.workspace }}/proof-evidence/live-evidence.json
+        run: >-
+          npx vitest run
+          scripts/operations/__tests__/codex-delivery-provider-sandbox.test.mjs
+          scripts/operations/__tests__/codex-delivery-provider-sandbox-guards.test.mjs
+          --reporter=default --reporter=json --outputFile.json="$EVIDENCE_DIR/vitest-report.json"
+
+      # Vitest 1.x's JSON totals count a skipped case as passed (`numPendingTests` stays 0), so every case's own
+      # `status` is checked instead of trusting the counters.
+      - name: Verify nothing was skipped
+        run: |
+          jq -e --argjson min "$LIVE_MIN_CASES" '
+            .success == true
+            and .numFailedTests == 0
+            and .numPendingTests == 0
+            and .numTodoTests == 0
+            and ([.testResults[].assertionResults[] | select(.status != "passed")] | length) == 0
+            and ([.testResults[] | select(.name | endswith("codex-delivery-provider-sandbox.test.mjs"))
+                  | .assertionResults[] | select(.status == "passed")] | length) >= $min
+          ' "$EVIDENCE_DIR/vitest-report.json"
+          jq -e --argjson min "$LIVE_MIN_CASES" '(.cases | length) >= $min' "$EVIDENCE_DIR/live-evidence.json"
+
+      - name: Upload report and CLI/host evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-sandbox-proof-${{ inputs.codex_version }}
+          path: proof-evidence/
+          if-no-files-found: warn
