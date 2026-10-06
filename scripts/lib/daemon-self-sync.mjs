@@ -121,6 +121,30 @@ export const READER_PRIORITY_WAIT_ENV = 'WE_DAEMON_CLONE_LOCK_PRIORITY_WAIT_MS';
 export const DEFAULT_READER_PRIORITY_WAIT_MS = 30_000;
 const PRIORITY_POLL_MS = 1000;
 
+/** Setting: the "clone stuck" smell — the clone has not moved for this long while `origin/main` moved past what
+ *  it last adopted (live 2026-10-06: 5.5 h of writer starvation went unnoticed). Default 30 min; 0 = off. */
+export const CLONE_STUCK_SMELL_ENV = 'WE_DAEMON_CLONE_STUCK_SMELL_MS';
+export const DEFAULT_CLONE_STUCK_SMELL_MS = 30 * 60_000;
+
+/** PURE: the clone-stuck smell threshold from env (non-negative number, else the default; 0 = off). */
+export function resolveCloneStuckSmellMs(env = process.env) {
+  const raw = env?.[CLONE_STUCK_SMELL_ENV];
+  const n = raw == null || String(raw).trim() === '' ? NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_CLONE_STUCK_SMELL_MS;
+}
+
+/** PURE: is the clone stuck? `adopted` is `state.adopted` ({at, mainSha}); `originMain` the current
+ *  `origin/main` sha. Stuck = main moved past the adopted main AND the last adoption is older than `thresholdMs`.
+ *  @returns {{stuck:false}|{stuck:true, ageMs:number}} */
+export function cloneStuckSmell({ adopted, originMain, nowMs, thresholdMs }) {
+  if (!(thresholdMs > 0) || !adopted || !originMain) return { stuck: false };
+  const at = Date.parse(adopted.at || '');
+  if (!Number.isFinite(at)) return { stuck: false };
+  const ageMs = nowMs - at;
+  if (adopted.mainSha === originMain || ageMs < thresholdMs) return { stuck: false };
+  return { stuck: true, ageMs };
+}
+
 /** PURE: the starved-reader wait from env — a non-negative integer, else the default. */
 export function resolvePriorityWaitMs(env = process.env) {
   const raw = env?.[READER_PRIORITY_WAIT_ENV];
@@ -485,6 +509,7 @@ export function withSelfSync(effects, {
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   readerPriorityAfter = resolveReaderPriorityAfter(env), priorityWaitMs = resolvePriorityWaitMs(env),
   readerKey = `reader:${basename(String(entries?.[0] || 'daemon'))}`,
+  cloneStuckSmellMs = resolveCloneStuckSmellMs(env),
 }) {
   const tick = effects.tickOnce;
   const resolvedPocBranch = resolvePocSyncBranch({ pocBranch, env });
@@ -499,7 +524,7 @@ export function withSelfSync(effects, {
   // `sync`/`gate` stay ACCEPTED (runner.mjs's `wireSelfSyncAndAppAuth` forwards them unconditionally) but are
   // UNUSED on the default path now — the live smoke gate they used to wire moved inside `rebuildClone` itself
   // (Module C). Referencing them here is a no-op that only silences an unused-destructure lint, never behavior.
-  void sync; void gate; void readOriginRef;
+  void sync; void gate;
   // Boot-time HEAD — read ONCE, here, before any tick ever runs. A read failure (null) permanently disables
   // the drift check for this process's lifetime rather than risk comparing against a wrong/stale value.
   const bootSha = readHead(syncOpts());
@@ -511,6 +536,7 @@ export function withSelfSync(effects, {
   let closure;
   let closureBuilt = false;
   const loggedHeads = new Set();
+  let lastStuckLogAt = -Infinity;
   const restartGate = (headNow, { urgent = false } = {}) => {
     if (!closureBuilt) {
       closureBuilt = true;
@@ -569,6 +595,22 @@ export function withSelfSync(effects, {
         }
       } else if (rebuildResult && rebuildResult.reason && rebuildResult.reason !== 'up-to-date') {
         log.error?.(`daemon-self-sync: rebuild did not move the clone (${rebuildResult.reason}) — ticking on the current code`);
+        // Smell (writer starvation, live 2026-10-06): the clone has been stuck while main moved on.
+        try {
+          const nowMs = now();
+          if (nowMs - lastStuckLogAt >= cloneStuckSmellMs) {
+            const smell = cloneStuckSmell({
+              adopted: readState(root, env)?.adopted,
+              originMain: readOriginRef({ ...syncOpts(), ref: `origin/${base}` }),
+              nowMs,
+              thresholdMs: cloneStuckSmellMs,
+            });
+            if (smell.stuck) {
+              lastStuckLogAt = nowMs;
+              log.error?.(`daemon-self-sync: SMELL clone-stuck — the clone has not moved for ${Math.round(smell.ageMs / 60_000)} min while origin/${base} moved on (last rebuild: ${rebuildResult.reason}); merged fixes and overlays are not reaching this daemon — check \`node scripts/lib/daemon-clone-lock.mjs status --clone=${root}\``);
+            }
+          }
+        } catch { /* a smell never breaks a tick */ }
       }
 
       // A stale refusal gets one immediate re-discovery after a successful gated rebuild.
@@ -589,6 +631,10 @@ export function withSelfSync(effects, {
             acquired = acquireRead(root, { ...cloneLockOpts(), readerKey, trackStarvation: false });
           }
           if (acquired.ok) log.error?.('daemon-self-sync: starved reader got its read slot — ticking (#4044 reader priority)');
+        }
+        if (!acquired.ok && acquired.reason === 'writer-priority') {
+          log.error?.(`daemon-self-sync: yielding this tick — writer ${acquired.heldBy ?? '?'} gave up ${acquired.writerStarved ?? '?'} consecutive time(s) waiting for in-flight ticks (since ${acquired.claimSince ?? '?'}); no new tick starts until a writer moves the clone (#4044 writer fairness)`);
+          return skippedTick(acquired.reason);
         }
         if (!acquired.ok) {
           log.error?.(`daemon-self-sync: read lock refused (${acquired.reason}) — skipping this tick, never reading a tree mid-move (#4044)`);

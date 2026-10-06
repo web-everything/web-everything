@@ -179,6 +179,97 @@ function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, af
   return null;
 }
 
+// ── writer fairness (live 2026-10-06 01:50-07:20 ET) ─────────────────────────────────────────────────────────
+// The mirror image of reader fairness above. The fix-dispatch daemon ticks back-to-back (event-driven wakes) and
+// each tick holds its read slot for minutes; the review daemon only tries to move the clone once per ITS tick
+// start, waits up to 900s for that read slot, gives up, ticks itself, and tries again — finding the sibling
+// mid-tick every time. Between attempts no writer key exists, so the sibling's next tick always got straight in:
+// the clone did not move for 5.5 h. Now a writer that gave up `tick-in-progress` WRITER_PRIORITY_AFTER times in a
+// row leaves a writer-priority claim; while it is live, NEW reads by anyone else are refused `writer-priority`
+// (ticks already in flight are never touched, so #4044 never-read-mid-move holds trivially), so the in-flight ticks
+// drain and the next writer gets the clone. Any writer that gets the clone clears the claim (the clone is moving).
+// No mutual back-off: the OLDER claim wins — a writer only yields to a starved reader whose starvation began
+// before the writer's claim, and a reader only ignores a writer claim younger than its own starvation. Refusals
+// by a writer claim never count toward reader starvation, so they can never re-trigger reader priority.
+
+/** Setting: consecutive `tick-in-progress` give-ups after which a writer's claim blocks NEW reads. Default 1;
+ *  `0` turns writer priority off (the pre-fix behaviour). */
+export const WRITER_PRIORITY_AFTER_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_AFTER';
+export const DEFAULT_WRITER_PRIORITY_AFTER = 1;
+/** Setting: how long a writer claim stays live without being refreshed by another attempt (its owner's next tick
+ *  start re-tries; a claim never outlives a dead owner pid). Default 30 min — longer than one sibling tick. */
+export const WRITER_CLAIM_TTL_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_CLAIM_TTL_MS';
+export const DEFAULT_WRITER_CLAIM_TTL_MS = 30 * 60_000;
+
+/** PURE: the writer-priority threshold from env (a non-negative integer, else the default; 0 = off). */
+export function resolveWriterPriorityAfter(env = process.env) {
+  const raw = env?.[WRITER_PRIORITY_AFTER_ENV];
+  const n = raw == null || String(raw).trim() === '' ? NaN : Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : DEFAULT_WRITER_PRIORITY_AFTER;
+}
+
+/** PURE: the writer-claim TTL from env (a positive number, else the default). */
+export function resolveWriterClaimTtlMs(env = process.env) {
+  const n = Number(env?.[WRITER_CLAIM_TTL_ENV]);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_WRITER_CLAIM_TTL_MS;
+}
+
+function writerClaimFile(starvedRoot) {
+  // Beside `starved/`, never inside it: every `.json` in there is read as a starved-reader record.
+  return join(starvedRoot, '..', 'writer-claim.json');
+}
+
+function readWriterClaim(starvedRoot) {
+  try {
+    const rec = JSON.parse(readFileSync(writerClaimFile(starvedRoot), 'utf8'));
+    return rec && typeof rec.owner === 'string' && Number.isInteger(rec.count) ? rec : null;
+  } catch { return null; }
+}
+
+/** Record one more consecutive `tick-in-progress` give-up by `owner`. A claim by a DIFFERENT live owner is kept
+ *  (first come keeps its age); our own is bumped. Best-effort. */
+function noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs, probe }) {
+  const prev = readWriterClaim(starvedRoot);
+  if (prev && prev.owner !== owner && writerClaimIsLive(prev, nowMs, ttlMs, probe)) return prev;
+  const same = prev && prev.owner === owner;
+  const nowIso = new Date(nowMs).toISOString();
+  const rec = {
+    owner, pid, count: (same ? prev.count : 0) + 1, heldBy: heldBy ?? null, since: same ? prev.since : nowIso, lastAt: nowIso,
+  };
+  try {
+    const file = writerClaimFile(starvedRoot);
+    mkdirSync(join(file, '..'), { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}`;
+    writeFileSync(tmp, `${JSON.stringify(rec)}\n`, 'utf8');
+    renameSync(tmp, file);
+  } catch { /* best-effort */ }
+  return rec;
+}
+
+function clearWriterClaim(starvedRoot) {
+  try { rmSync(writerClaimFile(starvedRoot), { force: true }); } catch { /* best-effort */ }
+}
+
+function writerClaimIsLive(rec, nowMs, ttlMs, probe) {
+  if (!rec) return false;
+  const last = Date.parse(rec.lastAt || '');
+  if (!Number.isFinite(last) || nowMs - last > ttlMs) return false;
+  return probe({ owner: rec.owner, pid: rec.pid }) !== 'dead';
+}
+
+/** The live, effective writer claim (count ≥ `after`) other than `owner`'s own, else null. A lapsed one is
+ *  removed on sight. */
+function findPriorityWriter(starvedRoot, { owner, nowMs, ttlMs, probe, after }) {
+  if (!(after > 0)) return null;
+  const rec = readWriterClaim(starvedRoot);
+  if (!rec) return null;
+  if (!writerClaimIsLive(rec, nowMs, ttlMs, probe)) { clearWriterClaim(starvedRoot); return null; }
+  if (rec.owner === owner || rec.count < after) return null;
+  return rec;
+}
+
+const isoMs = (s) => { const n = Date.parse(s || ''); return Number.isFinite(n) ? n : Infinity; };
+
 /**
  * Copy of `defaultProbePidLiveness` semantics (file header / #1936 Fork 2): a same-host PID probe is a FAST
  * PATH layered on top of the TTL lease, never primary (PIDs get reused). `kill(pid, 0)` throwing `ESRCH` means
@@ -266,9 +357,23 @@ export function acquireRead(root, opts = {}) {
     // restart keeps its refusal count); `trackStarvation: false` makes a refusal not count (a same-tick retry).
     readerKey = owner,
     trackStarvation = true,
+    writerPriorityAfter = resolveWriterPriorityAfter(),
+    writerClaimTtlMs = resolveWriterClaimTtlMs(),
   } = opts;
   const { writerRoot, readersRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
   const nowIso = new Date(nowMs).toISOString();
+
+  // Writer fairness: a starved writer's claim refuses NEW reads (never counted as reader starvation) — unless
+  // this reader's own starvation is OLDER than the claim (older claim wins, so the two never both back off).
+  const claim = findPriorityWriter(starvedRoot, {
+    owner, nowMs, ttlMs: writerClaimTtlMs, probe, after: writerPriorityAfter,
+  });
+  if (claim) {
+    const mine = readStarvedRecords(starvedRoot).find((r) => r.readerKey === readerKey);
+    if (!(mine && isoMs(mine.firstRefusedAt) < isoMs(claim.since))) {
+      return { ok: false, reason: 'writer-priority', heldBy: claim.owner, writerStarved: claim.count, claimSince: claim.since };
+    }
+  }
 
   const checkWriter = () => {
     const w = readLockEntry(writerRoot, WRITER_KEY);
@@ -339,15 +444,30 @@ export async function acquireWrite(root, opts = {}) {
     probe = defaultProbePidLiveness,
     onBlocked = null,
     readerPriorityAfter = resolveReaderPriorityAfter(),
+    writerPriorityAfter = resolveWriterPriorityAfter(),
+    writerClaimTtlMs = resolveWriterClaimTtlMs(),
   } = opts;
   const { writerRoot, readersRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
 
   const startMs = now();
   const startIso = new Date(startMs).toISOString();
+  // Writer fairness: our own live, effective claim (we already starved). Older claim wins — we only yield to a
+  // starved reader whose starvation began BEFORE our claim (see "writer fairness" above).
+  const ownClaim = () => {
+    if (!(writerPriorityAfter > 0)) return null;
+    const c = readWriterClaim(starvedRoot);
+    return c && c.owner === owner && c.count >= writerPriorityAfter
+      && writerClaimIsLive(c, now(), writerClaimTtlMs, probe) ? c : null;
+  };
   // Reader fairness: a starved reader has priority — never even reserve while one is waiting to get in.
-  const priorityFor = (nowMsN) => findPriorityReader(starvedRoot, {
-    owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter,
-  });
+  const priorityFor = (nowMsN) => {
+    const r = findPriorityReader(starvedRoot, {
+      owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter,
+    });
+    if (!r) return null;
+    const mine = ownClaim();
+    return mine && isoMs(mine.since) <= isoMs(r.firstRefusedAt) ? null : r;
+  };
   const yieldTo = priorityFor(startMs);
   if (yieldTo) return { ok: false, reason: 'reader-priority', heldBy: yieldTo.owner, starved: yieldTo.count };
   const currentWriter = readLockEntry(writerRoot, WRITER_KEY);
@@ -378,7 +498,10 @@ export async function acquireWrite(root, opts = {}) {
       releaseLockDir(writerRoot, WRITER_KEY);
       return { ok: false, reason: 'reader-priority', heldBy: starvedReader.owner, starved: starvedReader.count };
     }
-    if (blockers.length === 0) return { ok: true };
+    if (blockers.length === 0) {
+      clearWriterClaim(starvedRoot); // the clone is ours to move — any writer claim has done its job
+      return { ok: true };
+    }
     // #4044: a wait that blocks this process's own ticks is never silent — report it once, with who and how long.
     if (typeof onBlocked === 'function' && !reportedBlocked) {
       reportedBlocked = true;
@@ -386,7 +509,16 @@ export async function acquireWrite(root, opts = {}) {
     }
     if (nowMsN >= deadline) {
       releaseLockDir(writerRoot, WRITER_KEY);
-      return { ok: false, reason: 'tick-in-progress', heldBy: lastBlockers[0] || null };
+      // Writer fairness: leave (or bump) a claim so NEW reads yield until a writer gets the clone.
+      const claim = writerPriorityAfter > 0
+        ? noteWriterGaveUp(starvedRoot, {
+          owner, pid, nowMs: nowMsN, heldBy: lastBlockers[0] || null, ttlMs: writerClaimTtlMs, probe,
+        })
+        : null;
+      return {
+        ok: false, reason: 'tick-in-progress', heldBy: lastBlockers[0] || null,
+        ...(claim && claim.owner === owner ? { writerStarved: claim.count } : {}),
+      };
     }
     await sleep(pollMs);
   }
@@ -494,7 +626,8 @@ export function inspectCloneLock(root, opts = {}) {
     delete out.file;
     return out;
   });
-  return { writer, writerLive, readers, starved };
+  const writerClaim = readWriterClaim(cloneLockDirs(root, lockRoot).starvedRoot);
+  return { writer, writerLive, readers, starved, writerClaim };
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────────────────────────
@@ -539,6 +672,10 @@ async function runCli(argv) {
       process.stdout.write(`daemon-clone-lock status: ${root}\n  writer: ${w}\n  readers: ${snapshot.readers.length}\n`);
       for (const r of snapshot.readers) {
         process.stdout.write(`    - ${r.owner} (${r.live ? 'live' : 'stale'})\n`);
+      }
+      if (snapshot.writerClaim) {
+        const c = snapshot.writerClaim;
+        process.stdout.write(`  writer claim: ${c.owner} gave up ${c.count} time(s) in a row since ${c.since} (last ${c.lastAt}) — new reads yield\n`);
       }
       for (const r of snapshot.starved) {
         process.stdout.write(`  starved reader: ${r.readerKey} (${r.owner}) refused ${r.count} time(s) in a row since ${r.firstRefusedAt}\n`);
