@@ -95,6 +95,7 @@ export const DEFERRED_SCAN_TESTS = Object.freeze({
   'scripts/operations/__tests__/run.test.mjs': 'lists a throwaway run directory, not the repo',
   'scripts/operations/__tests__/review-loop-cli.test.mjs': 'lists a throwaway temp root, not the repo',
   'scripts/__tests__/review-set-label.approval-prevention-filing.test.mjs': 'lists a throwaway temp root, not the repo',
+  'scripts/operations/__tests__/codex-sandbox-proof-workflow.test.mjs': 'its `walk` helper recurses over one parsed workflow YAML object, not the repo tree; it reads exactly one named workflow file, so there is no repo-wide rule to re-judge per changed file',
 });
 
 /** The marker every manifest test must carry in its own header so a reader of the test sees it is a verify scanner. */

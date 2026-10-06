@@ -47,7 +47,7 @@ import { loadAdapters } from './lib/adapters-loader.cjs';
 import { localToday } from './lib/local-date.mjs';
 import { findUtcDaySlices, utcDaySliceMessage } from './lib/utc-day-slice-scan.mjs';
 import { scanInvisibleSourceTree } from './lib/invisible-source-scan.mjs';
-import { scanFilesCached, fileKeys } from './lib/standards-cache.mjs';
+import { scanFilesCached, gitGrepCached, cacheEnabled, fileKeys } from './lib/standards-cache.mjs';
 import { scanStdoutFlush, stdoutFlushMessage } from './lib/stdout-flush-scan.mjs';
 import { runWeScan } from './lib/rust-scan-bridge.mjs';
 import {
@@ -154,13 +154,15 @@ let profileT = process.hrtime.bigint();
 // #70b per-file result cache (see lib/standards-cache.mjs): ONLY per-file sections use it (6f, 6f-i-b); whole-repo
 // rules never do. Off under CI or WE_STANDARDS_CACHE=0. Hit/miss counts go to the profile output.
 const CACHE_ENTRIES = [fileURLToPath(import.meta.url), fileURLToPath(new URL('./check-standards-rules.mjs', import.meta.url))];
+// #70c: git-grep sections also depend on the pattern constants + detectors in citation-check.mjs.
+const GREP_CACHE_ENTRIES = [...CACHE_ENTRIES, fileURLToPath(new URL('./lib/citation-check.mjs', import.meta.url))];
 let cacheKeysMemo = null;
 const cacheKeys = () => (cacheKeysMemo ??= fileKeys(ROOT));
 const cacheStatLines = [];
 const mark = (label) => {
   if (!PROFILE) return;
   const now = process.hrtime.bigint();
-  profileEntries.push([label, Number(now - profileT) / 1e6]);
+  profileEntries.push([label, Number(now - profileT) / 1e6, process.memoryUsage().rss]);
   profileT = now;
 };
 
@@ -1457,13 +1459,21 @@ try {
   // #4168 — "Secret sweep stays in the lane, scoped": under `--local --files=…` this judges only the
   // lane's own changed files (`scopedReaddir`), and `scoped: SCOPE_TO_FILES` tells the bridge to skip the
   // (always whole-corpus) binary so its file-scoped JS fallback below actually runs instead of a full walk.
-  const findings = runWeScan('secret-scrub', [`--root=${ROOT}`], {
+  // #70c: with the cache on, the per-file JS scanner runs through the per-file cache (it judges each file's own
+  // content only; the Rust port is byte-identical to it). Cache off / any doubt -> the original Rust-or-JS path.
+  const secretDocFiles = cacheEnabled()
+    ? ['backlog', 'agent-memory-src'].flatMap((label) => scopedReaddir(`${label}/`, ['.md']).map((f) => `${label}/${f}`))
+    : null;
+  const findings = ((secretDocFiles && scanFilesCached({
+    section: '6f-i', entries: CACHE_ENTRIES, files: secretDocFiles, getKeys: cacheKeys, onStats: (l) => cacheStatLines.push(l),
+    load: (file) => readFileSync(join(ROOT, file), 'utf8'), scan: scanPublishSecrets,
+  })) || runWeScan('secret-scrub', [`--root=${ROOT}`], {
     referenceFiles: [
       join(ROOT, 'scripts', 'check-standards-rules.mjs'),
       join(ROOT, 'scripts', 'lib', 'secret-scrub.mjs'),
     ],
     scoped: SCOPE_TO_FILES,
-  }) ?? (() => {
+  })) ?? (() => {
     const docs = [];
     for (const label of ['backlog', 'agent-memory-src']) {
       for (const f of scopedReaddir(`${label}/`, ['.md']))
@@ -1774,13 +1784,20 @@ try {
     cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
   }) });
   const changedFiles = citationChanges ? new Set(citationChanges.changedFiles) : null;
-  let hits = [];
-  try {
-    hits = execFileSync(
-      'git', ['grep', '--threads=1', '-nE', HASH_PATH_CITE_SOURCE, '--', '.', ':!node_modules', ':!backlog'],
-      { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 },
-    ).split('\n').filter(Boolean);
-  } catch { /* git grep exits 1 on no match, or git unavailable — no findings either way, never a gate crash */ }
+  // #70c: per-file cached raw grep hits (classification below stays whole-tree); null = plain git grep.
+  let hits = gitGrepCached({
+    section: '6f-ii-c', entries: GREP_CACHE_ENTRIES, root: ROOT, pattern: HASH_PATH_CITE_SOURCE,
+    exclude: (f) => f.startsWith('node_modules/') || f.startsWith('backlog/'), getKeys: cacheKeys, onStats: (l) => cacheStatLines.push(l),
+  });
+  if (!hits) {
+    hits = [];
+    try {
+      hits = execFileSync(
+        'git', ['grep', '--threads=1', '-nE', HASH_PATH_CITE_SOURCE, '--', '.', ':!node_modules', ':!backlog'],
+        { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 },
+      ).split('\n').filter(Boolean);
+    } catch { /* git grep exits 1 on no match, or git unavailable — no findings either way, never a gate crash */ }
+  }
   const seen = new Set();
   for (const { file: rel, path: cited, hash } of findHashPathCitesInGrepLines(hits)) {
     const key = `${rel}\u0000${cited}`;
@@ -1832,24 +1849,31 @@ try {
   // stale, not just a hash). Calling the shared builder — not re-deriving the union inline — is what lets
   // this module's own tests exercise the EXACT construction this gate ships, not a copy of it.
   const resolvableIds = buildBacklogResolvableIds(backlog);
-  let hits = [];
-  try {
-    hits = execFileSync(
-      'git', ['grep', '--threads=1', '-nE', BACKLOG_GLOB_CITE_SOURCE, '--', '.', ':!node_modules'],
-      { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 },
-    ).split('\n').filter(Boolean);
-  } catch (e) {
-    // git grep exits 1 on "no match" — that is the common, expected empty case, never a gate crash. Any
-    // OTHER exit (git unavailable, output past maxBuffer, a real error) is NOT the same as "no findings" —
-    // independent review (#4318, security lens) caught the sibling gates' identical catch-all silently
-    // reporting clean on a real scan failure. Route it through the SAME emit4 the gate's own findings use
-    // (not a bare `warn`) so CITATION_GATES_ENFORCED promotes a real scan failure to a hard error exactly
-    // like it would promote a real finding — a scan that couldn't run is not entitled to a softer floor
-    // than a scan that ran and found something.
-    if (e?.status !== 1) {
-      emit4(`backlog-glob citation gate: git grep failed unexpectedly (${String(e?.message || e).split('\n')[0]}) ` +
-        `— this run's findings for gate 6f-ii-d may be INCOMPLETE, not clean.`,
-        { kind: 'citation-backlog-glob-scan-error', file: 'scripts/check-standards.mjs', global: true });
+  // #70c: per-file cached raw grep hits (classification below stays whole-tree); null = plain git grep.
+  let hits = gitGrepCached({
+    section: '6f-ii-d', entries: GREP_CACHE_ENTRIES, root: ROOT, pattern: BACKLOG_GLOB_CITE_SOURCE,
+    exclude: (f) => f.startsWith('node_modules/'), getKeys: cacheKeys, onStats: (l) => cacheStatLines.push(l),
+  });
+  if (!hits) {
+    hits = [];
+    try {
+      hits = execFileSync(
+        'git', ['grep', '--threads=1', '-nE', BACKLOG_GLOB_CITE_SOURCE, '--', '.', ':!node_modules'],
+        { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 },
+      ).split('\n').filter(Boolean);
+    } catch (e) {
+      // git grep exits 1 on "no match" — that is the common, expected empty case, never a gate crash. Any
+      // OTHER exit (git unavailable, output past maxBuffer, a real error) is NOT the same as "no findings" —
+      // independent review (#4318, security lens) caught the sibling gates' identical catch-all silently
+      // reporting clean on a real scan failure. Route it through the SAME emit4 the gate's own findings use
+      // (not a bare `warn`) so CITATION_GATES_ENFORCED promotes a real scan failure to a hard error exactly
+      // like it would promote a real finding — a scan that couldn't run is not entitled to a softer floor
+      // than a scan that ran and found something.
+      if (e?.status !== 1) {
+        emit4(`backlog-glob citation gate: git grep failed unexpectedly (${String(e?.message || e).split('\n')[0]}) ` +
+          `— this run's findings for gate 6f-ii-d may be INCOMPLETE, not clean.`,
+          { kind: 'citation-backlog-glob-scan-error', file: 'scripts/check-standards.mjs', global: true });
+      }
     }
   }
   for (const f of findDanglingBacklogGlobCitesInGrepLines(hits, { resolvableIds })) {
@@ -3181,7 +3205,8 @@ if (PROFILE) {
   const rows = [...profileEntries].sort((a, b) => b[1] - a[1]);
   const total = profileEntries.reduce((s, [, ms]) => s + ms, 0);
   console.error('\ncheck-standards profile (ms per section, sorted desc):');
-  for (const [label, ms] of rows) console.error(`  ${ms.toFixed(1).padStart(8)}ms  ${label}`);
+  for (const [label, ms, rss] of rows) console.error(`  ${ms.toFixed(1).padStart(8)}ms  ${String(Math.round(rss / 1048576)).padStart(5)}MB  ${label}`);
+  console.error(`  peak-so-far RSS at end: ${Math.round(Math.max(...profileEntries.map((e) => e[2])) / 1048576)}MB`);
   console.error(`  ${total.toFixed(1).padStart(8)}ms  TOTAL (${profileEntries.length} sections)`);
   for (const l of cacheStatLines) console.error(`  cache ${l}`);
 }

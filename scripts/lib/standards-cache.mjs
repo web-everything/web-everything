@@ -116,14 +116,23 @@ export function openSectionCache({ section, version, env = process.env }) {
       return undefined;
     },
     record(key, findings) { if (enabled && key && !done) pending[key] = findings; },
-    commit() {
+    // keep: optional Set of keys still live; stored entries outside it are dropped (a whole-tree section would otherwise grow without bound).
+    commit(keep) {
       if (!enabled || done) return false;
       done = true;
-      if (!Object.keys(pending).length) return false;
+      let merged = { ...stored, ...pending };
+      let pruned = false;
+      if (keep) {
+        const live = {};
+        for (const k of Object.keys(merged)) if (keep.has(k)) live[k] = merged[k];
+        pruned = Object.keys(live).length !== Object.keys(stored).length;
+        merged = live;
+      }
+      if (!Object.keys(pending).length && !pruned) return false;
       try {
         mkdirSync(dirname(file), { recursive: true });
         const tmp = `${file}.${process.pid}.tmp`;
-        writeFileSync(tmp, JSON.stringify({ ...stored, ...pending }));
+        writeFileSync(tmp, JSON.stringify(merged));
         renameSync(tmp, file);
         return true;
       } catch { return false; }
@@ -172,4 +181,60 @@ export function scanFilesCached({ section, entries, files, load, scan, getKeys, 
   cache.commit();
   if (onStats) onStats(cache.profileLine());
   return files.flatMap((f) => perFile.get(f));
+}
+
+const GREP_CHUNK = 1500;
+
+/**
+ * Cached `git grep -nE <pattern> -- . <excludes>` (perf item 70c). The raw hit lines of a file are a pure function of
+ * that file's content + the pattern, so they are cached per file (key = path + content key) and only files with no
+ * cached entry are grepped (in chunks, literal pathspecs). Returns the SAME lines, in the same order, as one whole-tree
+ * `git grep --threads=1` would: tracked files in index order, each file's lines in line order. `exclude(path)` mirrors
+ * the caller's `:!dir` pathspecs. Any doubt (cache off, no version, no keys, a line that cannot be attributed to a
+ * tracked file, a grep failure other than "no match") -> returns null and the caller runs its own plain git grep.
+ * Whole-tree classification (what a hit MEANS) stays with the caller and is never cached.
+ */
+export function gitGrepCached({ section, entries, root, pattern, exclude = () => false, getKeys, env = process.env, onStats }) {
+  try {
+    if (!cacheEnabled(env)) return null;
+    const git = (args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 1 << 28, stdio: ['ignore', 'pipe', 'ignore'] });
+    const base = ruleVersion(section, entries);
+    if (!base) return null;
+    const version = sha(`${base}\0${pattern}\0${git(['--version'])}`);
+    const cache = openSectionCache({ section, version, env });
+    if (!cache.enabled) return null;
+    const keys = getKeys();
+    const tracked = git(['ls-files', '-z']).split('\0').filter((f) => f && !exclude(f) && keys.has(f));
+    const keyOf = (f) => `${f}\0${keys.get(f)}`;
+    const perFile = new Map();
+    const misses = [];
+    for (const f of tracked) {
+      const hit = cache.lookup(keyOf(f));
+      if (hit) perFile.set(f, hit); else misses.push(f);
+    }
+    const known = new Set(tracked);
+    for (let i = 0; i < misses.length; i += GREP_CHUNK) {
+      const chunk = misses.slice(i, i + GREP_CHUNK);
+      let out = '';
+      try {
+        out = execFileSync('git', ['--literal-pathspecs', 'grep', '--threads=1', '-nE', pattern, '--', ...chunk],
+          { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1 << 28 });
+      } catch (e) { if (e?.status !== 1) { cache.abort(); return null; } }
+      const byFile = new Map(chunk.map((f) => [f, []]));
+      for (const line of out.split('\n')) {
+        if (!line) continue;
+        let file = null;
+        for (let c = line.indexOf(':'); c !== -1; c = line.indexOf(':', c + 1)) {
+          const cand = line.slice(0, c);
+          if (known.has(cand) && byFile.has(cand) && /^\d+:/.test(line.slice(c + 1))) { file = cand; break; }
+        }
+        if (!file) { cache.abort(); return null; }
+        byFile.get(file).push(line);
+      }
+      for (const f of chunk) { perFile.set(f, byFile.get(f)); cache.record(keyOf(f), byFile.get(f)); }
+    }
+    cache.commit(new Set(tracked.map(keyOf)));
+    if (onStats) onStats(cache.profileLine());
+    return tracked.flatMap((f) => perFile.get(f));
+  } catch { return null; }
 }

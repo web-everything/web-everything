@@ -2,9 +2,11 @@
 bornAs: x68ifx8
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/health-responder-state.mjs", "we:scripts/conveyor/__tests__/health-responder-state.test.mjs"]
 dateOpened: "2026-10-02"
+dateStarted: "2026-10-06"
+dateResolved: "2026-10-06"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "4cd29d605b95337785a59fb5463807f3317f8cda"
 scopeRationale: "we:scripts/conveyor/health-responder.mjs is named only as the existing shadowTick entry point the regression test imports; it needs no source edit, so it stays out of scope."
@@ -60,6 +62,13 @@ First add the cached-corruption and altered-receipt regressions and run them aga
 Measure verification cost with realistic retained history before pursuing optimization; any optimization must retain evidence that current segment bytes and returned receipts agree. Authentication of both journal and index, detection of deleted historical segments without an independent manifest, and concurrent external rewrites require separate work if demanded; this item supplies neither a signed audit log nor a new retention policy.
 
 ## Progress
+
+- **Delivery sanity read (2026-10-06):** the name-only cache shortcut remains present, so the spec is coherent and not superseded. Added real-filesystem regressions for partial lines, malformed JSON, invalid schema, and replaced/missing/injected/malformed receipt projections before changing the implementation.
+- **Red proof:** the unchanged implementation failed 5 regressions (14 passed): cached partial lines, malformed JSON and invalid schema were accepted, and replaced/injected receipts reached callers. Full output is retained in the delivery environment at `/tmp/conveyor-4732-before.log`.
+- **Implemented:** every enumerated segment is opened with the existing filesystem guards, parsed and hashed from the same raw chunks. Valid recorded digests are checked even when receipt metadata is malformed or duplicated. Returned receipts always come from validated rows; persisted projections are repaired only after all segments pass. Stale entries are removed, including when no segments remain.
+- **Persistence edge case:** the existing generic text scrubber can redact some valid SHA-256 hex strings. Archive persistence now scrubs receipt projections while retaining generated digest metadata; a real-writer regression proves that these digests survive and still detect changed bytes. Undefined JSON fields and scrubbed receipt strings do not cause repeated archive rewrites.
+- **Green proof:** `npx vitest run we:scripts/conveyor/__tests__/health-responder-state.test.mjs we:scripts/conveyor/__tests__/health-responder.test.mjs` passed all **52 tests** (45 state tests and 7 responder integration tests). Output is retained at `/tmp/conveyor-4732-after.log`. Coverage includes same-length edits, changes outside the receipt projection, blank-line bytes, UTF-8 chunk splits, archive recovery, atomic repairs, later-segment refusal without partial publication, symlinks/directories, and append/tick refusal with unchanged store bytes and an uncalled fact-reader tripwire.
+- **Wrapper handoff:** implementation and tests are complete; edits are intentionally uncommitted. The standards gate remains for the wrapper, per the delivery brief's prohibition on agent-run gate commands.
 
 - **Premise checked:** the original card pointed at `we:scripts/conveyor/health-responder-state.mjs:113` and described cached segments bypassing corruption freezes. The precise shortcut is `we:scripts/conveyor/health-responder-state.mjs:110-117`: parsing happens only for names absent from the cache. There is currently no segment digest field or comparison.
 - **Corrected premise:** checking segment hashes alone cannot validate cached receipt payloads. `we:scripts/conveyor/health-responder-state.mjs:108` accepts any receipt array, and line 119 flattens it directly. Both segment verification and a journal-derived receipt projection are needed for the original goal.
