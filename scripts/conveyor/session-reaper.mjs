@@ -102,6 +102,7 @@
  * `kind !== 'background'` guard above, but "should never happen" is not the same as "cannot happen".
  */
 
+import { makeAwaitingVerifyResolver } from './await-verify.mjs';
 import { parseSessionSlug } from './session-slug.mjs';
 import { rateAndRecordSession } from './run-rating.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
@@ -577,6 +578,7 @@ export function resolveLastActivityMs(session, {
  *   noOutcomeFor?: ((session:object) => ({stall:boolean, reason?:string}|null))|null,
  *   chatSpawnGuardFor?: ((session:object) => ({blocked:boolean, reason?:string})|null)|null,
  *   authExpiredFor?: ((session:object) => ({authExpired:boolean, reason?:string}|null))|null,
+ *   awaitingVerifyFor?: ((session:object) => ({awaiting:boolean}|null))|null,
  *   idleFinishedFor?: ((session:object) => ({finished:boolean, reason?:string}|null))|null,
  *   pidDeadFor?: ((session:object) => ({dead:boolean, reason?:string}|null))|null,
  * }} [opts]
@@ -585,9 +587,17 @@ export function resolveLastActivityMs(session, {
 export function classifySessionReapWithGroundTruth(session, groundTruthFor, opts = {}) {
   const {
     allowedCwd, neverReapWorking = false, completionFor = null, idleThresholdMs = 0, now = Date.now(),
-    hungFor = null, noOutcomeFor = null, chatSpawnGuardFor = null, authExpiredFor = null, idleFinishedFor = null,
+    hungFor = null, noOutcomeFor = null, chatSpawnGuardFor = null, authExpiredFor = null, idleFinishedFor = null, awaitingVerifyFor = null,
     pidDeadFor = null,
   } = opts || {};
+  // An awaiting session reads state:'done' because it ended its turn on purpose. The harness owns it
+  // until the verdict; DEFAULT_AWAIT_VERIFY_TTL_MS in we:scripts/conveyor/await-verify.mjs bounds the
+  // exemption so a crashed harness cannot pin it forever.
+  if (typeof awaitingVerifyFor === 'function') {
+    let info = null;
+    try { info = awaitingVerifyFor(session); } catch { info = null; }
+    if (info?.awaiting === true) return { reap: false, reason: 'awaiting-verify' };
+  }
   const base = classifySessionReap(session, { allowedCwd, chatSpawnGuardFor });
   if (base.reap) return base;
   // Live-caught 2026-09-26 (review-daemon log): `classifySessionReap` checks `cwd` BEFORE `state`, so a session
@@ -735,6 +745,7 @@ export function classifySessionReapWithGroundTruth(session, groundTruthFor, opts
  *   noOutcomeFor?: ((session:object) => ({stall:boolean, reason?:string}|null))|null,
  *   chatSpawnGuardFor?: ((session:object) => ({blocked:boolean, reason?:string})|null)|null,
  *   authExpiredFor?: ((session:object) => ({authExpired:boolean, reason?:string}|null))|null,
+ *   awaitingVerifyFor?: ((session:object) => ({awaiting:boolean}|null))|null,
  *   idleFinishedFor?: ((session:object) => ({finished:boolean, reason?:string}|null))|null,
  *   pidDeadFor?: ((session:object) => ({dead:boolean, reason?:string}|null))|null,
  * }} [opts]
@@ -2133,6 +2144,7 @@ export function makeReapedLedger({
  *   noOutcomeFor?: ((session:object) => ({stall:boolean, reason?:string}|null))|null,
  *   chatSpawnGuardFor?: ((session:object) => ({blocked:boolean, reason?:string})|null)|null,
  *   authExpiredFor?: ((session:object) => ({authExpired:boolean, reason?:string}|null))|null,
+ *   awaitingVerifyFor?: ((session:object) => ({awaiting:boolean}|null))|null,
  *   idleFinishedFor?: ((session:object) => ({finished:boolean, reason?:string}|null))|null,
  *   backstopCompletion?: boolean,
  *   readCompletionRecord?: (session:string) => object|null,
@@ -2174,6 +2186,7 @@ export function runSessionReaperPass({
   // #4075/xg7m2wq (live incident PR #2724, 2026-09-26) — the general idle-turn-ended backstop, default ON like
   // every other axis this epic ships: see `hung-session.mjs#classifyIdleFinished`'s own file header for why.
   idleFinishedFor = makeIdleFinishedResolver(),
+  awaitingVerifyFor = makeAwaitingVerifyResolver(),
   // #ghost-sessions-inflate-cap — UNLIKE this epic's other axes, `null` (OFF) is this FUNCTION's own default —
   // deliberately, not an oversight. `makePidDeadResolver()`'s real behavior answers "dead" for ANY session whose
   // `sessionId` does not appear in a real `ps aux` snapshot, which is true of EVERY synthetic test fixture this
@@ -2247,7 +2260,7 @@ export function runSessionReaperPass({
   }
   if (!Array.isArray(sessions)) sessions = [];
 
-  const plan = sessionReapPlan(sessions, { groundTruthFor, completionFor, allowedCwd, neverReapWorking, idleThresholdMs, now, hungFor, noOutcomeFor, chatSpawnGuardFor, authExpiredFor, idleFinishedFor, pidDeadFor });
+  const plan = sessionReapPlan(sessions, { groundTruthFor, completionFor, allowedCwd, neverReapWorking, idleThresholdMs, now, hungFor, noOutcomeFor, chatSpawnGuardFor, authExpiredFor, idleFinishedFor, awaitingVerifyFor, pidDeadFor });
   const { keep } = plan;
   let reap = plan.reap;
   let previouslyReaped = 0;
@@ -2474,6 +2487,8 @@ function main(argv) {
   // `--no-auth-expired-detection` is the same rollback escape hatch, for the Claude-auth-expired axis (live
   // incident, night of 2026-09-25/26 ET) — default ON, same convention as every other axis this epic ships.
   const authExpiredFor = flags['no-auth-expired-detection'] ? null : makeAuthExpiredResolver();
+  // Rollback escape hatch for the await record exemption (we:scripts/conveyor/await-verify.mjs).
+  const awaitingVerifyFor = flags['no-await-verify-exemption'] ? null : makeAwaitingVerifyResolver();
   // `--no-idle-finished-detection` is the same rollback escape hatch, for the general idle-turn-ended backstop
   // (#4075/xg7m2wq, live incident PR #2724, 2026-09-26) — default ON, same convention as every other axis this
   // epic ships. `--idle-finished-minutes=<n>` overrides `WE_IDLE_FINISHED_MINUTES` for this one invocation.
@@ -2510,7 +2525,7 @@ function main(argv) {
     });
   };
 
-  const result = runSessionReaperPass({ groundTruthFor, completionFor, allowedCwd, neverReapWorking, idleThresholdMs, dryRun, hungFor, backstopCompletion, noOutcomeFor, chatSpawnGuardFor, authExpiredFor, idleFinishedFor, pidDeadFor, rateSession });
+  const result = runSessionReaperPass({ groundTruthFor, completionFor, allowedCwd, neverReapWorking, idleThresholdMs, dryRun, hungFor, backstopCompletion, noOutcomeFor, chatSpawnGuardFor, authExpiredFor, idleFinishedFor, awaitingVerifyFor, pidDeadFor, rateSession });
   const retentionResult = runRetention ? runRetentionSweepPass({ dryRun }) : null;
   const dispatchScratchResult = runDispatchScratchSweep ? runDispatchScratchSweepPass({ dryRun }) : null;
 

@@ -3047,3 +3047,45 @@ describe('classifySessionReapWithGroundTruth pid-dead axis (#ghost-sessions-infl
     expect(verdict).toEqual({ reap: false, reason: 'not-terminal' });
   });
 });
+
+describe('awaiting-verify exemption (#5137)', () => {
+  const row = bg({ name: 'fix-4115', state: 'done', status: 'idle' });
+  it('awaiting-verify preserves a deliberately done background session', () => {
+    expect(classifySessionReapWithGroundTruth(row, null, { awaitingVerifyFor: () => ({ awaiting: true }) }))
+      .toEqual({ reap: false, reason: 'awaiting-verify' });
+  });
+  it('without awaiting-verify the same row is still reaped as done', () => {
+    expect(classifySessionReapWithGroundTruth(row, null)).toEqual({ reap: true, reason: 'done' });
+  });
+  it.each(['expired', 'foreign-session'])('awaiting-verify does not exempt %s', (reason) => {
+    expect(classifySessionReapWithGroundTruth(row, null, { awaitingVerifyFor: () => ({ awaiting: false, reason }) }))
+      .toEqual({ reap: true, reason: 'done' });
+  });
+  it('awaiting-verify reader failures do not exempt', () => {
+    expect(classifySessionReapWithGroundTruth(row, null, { awaitingVerifyFor: () => { throw Error('unreadable'); } }))
+      .toEqual({ reap: true, reason: 'done' });
+  });
+  it('awaiting-verify bypasses idle-finished and hung axes before they run', () => {
+    const idleFinishedFor = vi.fn(() => ({ finished: true }));
+    const hungFor = vi.fn(() => ({ hung: true }));
+    expect(classifySessionReapWithGroundTruth({ ...row, state: 'working' }, null, {
+      awaitingVerifyFor: () => ({ awaiting: true }), idleFinishedFor, hungFor,
+    })).toEqual({ reap: false, reason: 'awaiting-verify' });
+    expect(idleFinishedFor).not.toHaveBeenCalled();
+    expect(hungFor).not.toHaveBeenCalled();
+  });
+  it('awaiting-verify pass issues no stop and writes no backstop completion', () => {
+    const stop = vi.fn(() => ({ stopped: true, alreadyGone: false }));
+    const writeCompletionRecord = vi.fn();
+    const result = runSessionReaperPass({
+      listAgents: () => [row], groundTruthFor: () => null, completionFor: () => null,
+      awaitingVerifyFor: () => ({ awaiting: true }), hungFor: null, noOutcomeFor: null,
+      authExpiredFor: null, idleFinishedFor: null, chatSpawnGuardFor: null,
+      stop, readCompletionRecord: () => null, writeCompletionRecord, log: () => {}, rateSession: null,
+    });
+    expect(result.stopped).toBe(0);
+    expect(result.backstopWritten).toBe(0);
+    expect(stop).not.toHaveBeenCalled();
+    expect(writeCompletionRecord).not.toHaveBeenCalled();
+  });
+});
