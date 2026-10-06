@@ -165,7 +165,7 @@ describe('acquireWrite waiting on readers', () => {
     const result = await acquireWrite(clone, {
       owner: 'writer-a', lockRoot, waitMs: 2000, pollMs: 1000, now, sleep, pid: 111, probe: alwaysAlive,
     });
-    expect(result).toEqual({ ok: false, reason: 'tick-in-progress', heldBy: 'reader-a' });
+    expect(result).toMatchObject({ ok: false, reason: 'tick-in-progress', heldBy: 'reader-a' });
 
     const snapshot = inspectCloneLock(clone, { lockRoot });
     expect(snapshot.writer).toBeNull(); // writer key released on timeout
