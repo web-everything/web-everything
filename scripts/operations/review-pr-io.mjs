@@ -2,7 +2,8 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
-  findCarriedOperatorRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON } from '../lib/jury-core.mjs';
+  findCarriedOperatorRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
+  findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
 import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
@@ -878,10 +879,20 @@ export function createReviewPrSinks({
         }
         // Persist the attempt before dispatch. A crash or timeout spends this set's single automated attempt.
         for (const initial of existing) {
-          if (initial.attempted || !liveReferrals(initial).length || !referralRecordState(initial, { ...context(state),
-            records: readReferralRecords(state.comments, context(state)).records,
+          if (initial.attempted || !liveReferrals(initial).length) continue;
+          const records = readReferralRecords(state.comments, context(state)).records;
+          const initialState = referralRecordState(initial, { ...context(state), records,
             // #4979 — an operator ruling already settled these findings; never spend the automated attempt on them.
-            operatorRulings: readOperatorRulings(state.comments, context(state)).rulings }).pending.length) continue;
+            operatorRulings: readOperatorRulings(state.comments, context(state)).rulings });
+          if (!initialState.pending.length) continue;
+          // #76b — one ruling per finding per head: a finding whose id already holds a counted block on this head is
+          // blocked by that ruling (`linkedBlockedFindingIds`), so the reviewer is never asked about it again. The rest
+          // go out with their own `findingId` and the PR's identity table, so the reviewer can link a re-wording.
+          const identityTable = findingIdentityTable(records);
+          const linkedKeys = new Set(initialState.rulings.filter(r => r.linked).map(r => r.key));
+          const ask = liveReferrals(initial).filter(f => !linkedKeys.has(f.key))
+            .map(f => ({ ...f, findingId: findingIdOf(identityTable, { head: initial.head, runId: initial.runId, key: f.key }) }));
+          if (!ask.length) continue;
           let record = { ...initial, attempted: true };
           state = persist(record);
           // Hold before dispatch too: an exhausted or interrupted worker must leave a visible owner.
@@ -897,20 +908,35 @@ export function createReviewPrSinks({
               allowedTools: null,
               mandate: request.mandate + '\nIndependently verify every referral in the input. Return exactly one '
                 + 'block, card, or not-real ruling per key, with rationale and evidence references. A general accept '
-                + 'is not a ruling. card requires an existing durable we:backlog/*.md reference. Do not recursively refer findings.',
-              input: request.input + '\nUntrusted reported findings:\n' + JSON.stringify(liveReferrals(record)),
+                + 'is not a ruling. card requires an existing durable we:backlog/*.md reference. Do not recursively refer findings.\n'
+                + FINDING_SAME_AS_MANDATE,
+              input: request.input + '\nUntrusted known findings on this PR (identity table; for sameAs only):\n'
+                + JSON.stringify(findingIdentityPromptRows(identityTable))
+                + '\nUntrusted reported findings:\n' + JSON.stringify(ask),
               shape: { type: 'object', additionalProperties: false, required: ['rulings'], properties: {
                 rulings: { type: 'array', items: { type: 'object', additionalProperties: false,
-                  required: ['key', 'result', 'rationale', 'evidence', 'card'], properties: {
+                  required: ['key', 'result', 'rationale', 'evidence', 'card', 'sameAs'], properties: {
                     key: { type: 'string' }, result: { type: 'string', enum: ['block', 'card', 'not-real'] },
                     rationale: { type: 'string' }, evidence: { type: 'array', items: { type: 'string' } },
-                    card: { type: 'string' },
+                    card: { type: 'string' }, sameAs: { type: 'string' },
                   } } },
               } },
             });
             if (answer.sessionId !== record.reviewer.id || answer.timedOut) throw new Error('mandatory reviewer authority or budget unavailable');
-            const rulings = (answer.value?.rulings ?? []).map((r, i) => ({ ...r, id: `${record.runId}:${i}`,
-              reviewerId: record.reviewer.id, lens: record.reviewer.lens }));
+            // #76b — a declared link is kept only when it names ANOTHER known id and passes the structural guard (same
+            // path, same lens, no contradicting cited line); "new", a self-link or anything else records no link, so
+            // the deterministic binding stands. The link rides on the append-only ruling, never on the referral entry.
+            const sameAsFor = (key, sameAs) => {
+              const f = ask.find(x => x.key === key);
+              if (!f || !FINDING_ID_PATTERN.test(sameAs ?? '') || sameAs === f.findingId) return undefined;
+              return sameAsLinkAllowed(identityTable.find(e => e.findingId === sameAs), f.original) ? sameAs : undefined;
+            };
+            const rulings = (answer.value?.rulings ?? []).map(({ sameAs, ...r }, i) => {
+              const link = sameAsFor(r.key, sameAs);
+              if (link) out(`referral linked: ${r.key} sameAs ${link}`);
+              return { ...r, ...(link ? { sameAs: link } : {}), id: `${record.runId}:${i}`,
+                reviewerId: record.reviewer.id, lens: record.reviewer.lens };
+            });
             const completed = { ...record, rulings };
             if (!validateReferralRecord(completed)) throw new Error('incomplete or malformed mandatory rulings');
             // Preserve every ruling that fits; omitted rulings leave their keys pending in all
