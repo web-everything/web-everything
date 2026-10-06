@@ -4,7 +4,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { publishBatch, sealDueBatches, HOLD_LABEL } from '../card-batch-seal-io.mjs';
+import { publishBatch, sealDueBatches, HOLD_LABEL, VERIFY_UNRUN_CAP } from '../card-batch-seal-io.mjs';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
@@ -148,6 +148,47 @@ it.each([
   expect(f.calls.some(call => call.includes('release'))).toBe(true);
   expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('sealed');
   expect(f.read().seal.step).toBe('label-on-green');
+});
+it.each([
+  ['unrun checks', { ok: false, failed: 0, unrun: 1, blocking: [{ why: 'did-not-run' }] }],
+  ['an empty suite', { ok: false, failed: 0, unrun: 0, emptySuite: true, blocking: [] }],
+  ['a did-not-run blocker', { ok: false, blocking: [{ why: 'did-not-run' }] }],
+])('treats a parsed verdict with %s as retryable, and holds only after the cap', async (_name, verdict) => {
+  const f = fixture({ maxCards: 1 });
+  const exec = (cmd, args, options) => (args[1] === 'verify' ? JSON.stringify({ verdict }) : f.exec(cmd, args, options));
+  for (let attempt = 1; attempt < VERIFY_UNRUN_CAP; attempt++) {
+    await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('verify unrun');
+    expect(JSON.parse(readFileSync(f.statePath, 'utf8')).sealFailure).toBeUndefined();
+  }
+  expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('held');
+  expect(f.read().sealFailure.reason).toContain(`${VERIFY_UNRUN_CAP} times`);
+});
+it('still records a verdict that names a real failure as terminal at once, even alongside unrun checks', async () => {
+  const f = fixture({ maxCards: 1 });
+  const exec = (cmd, args, options) => (args[1] === 'verify'
+    ? JSON.stringify({ verdict: { ok: false, failed: 1, unrun: 1, blocking: [{ why: 'did-not-run' }, { why: 'failed' }] } }) : f.exec(cmd, args, options));
+  expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('held');
+  expect(f.read().sealFailure.reason).toContain('failed');
+});
+it('tick keeps launching later batches when one state file is unreadable, then reports the error', async () => {
+  const f = fixture({ maxCards: 5 });
+  writeFileSync(join(f.dir, 'a-corrupt.json'), '{not json');
+  const spawn = vi.fn(fakeChild);
+  const error = await sealDueBatches({ now: 60000, stateDir: f.dir, policy: f.opts.policy, spawn }).catch(e => e);
+  expect(error).toBeInstanceOf(Error);
+  expect(error.launched).toEqual([f.statePath]);
+  expect(spawn).toHaveBeenCalledOnce();
+});
+it('refreshes the PR body on the retry that applies a missed hold', async () => {
+  const f = fixture({ maxCards: 5 });
+  let fail = true;
+  const exec = (cmd, args, options) => {
+    if (cmd === 'gh' && args.includes('--add-label') && fail) { fail = false; throw Error('rate limited'); }
+    return f.exec(cmd, args, options);
+  };
+  await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('rate limited');
+  await publishBatch(f.input, { ...f.opts, exec });
+  expect(f.calls.at(-1)).toContain('--body-file');
 });
 it('records the PR before labelling, and a failed label is re-asserted before anything else on retry', async () => {
   const f = fixture({ maxCards: 5 });

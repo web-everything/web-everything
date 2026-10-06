@@ -14,6 +14,8 @@ import { parseRunJsonTail } from './land-prevention-card.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const CARD_BATCH_STATE_DIR = join(ROOT, '.operations/card-batch');
 export const HOLD_LABEL = 'review-status:draft-withdrawn';
+/** Unrun verifies tolerated before the batch is held for a person; keeps a permanently broken verify from looping forever. */
+export const VERIFY_UNRUN_CAP = 3;
 const refuse = reason => ({ action: 'refuse', reason });
 export const batchExec = (command, args, options = {}) => execFileSync(command, args, {
   encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: 30_000, ...options,
@@ -124,9 +126,8 @@ export async function publishBatch(input, opts = {}) {
       state.holdApplied = true;
       save();
       checkpoint('open-draft');
-    } else if (!state.sealedAt) {
-      await gh(['pr', 'edit', String(state.pr), '--repo', repo, '--body-file', bodyPath]);
     }
+    if (!opened && !state.sealedAt) await gh(['pr', 'edit', String(state.pr), '--repo', repo, '--body-file', bodyPath]);
     const reason = input.reason ?? plan.reason;
     if (!reason && !state.sealedAt) return { action: plan.action, state };
     const sealPlan = planSeal({ state, reason });
@@ -140,10 +141,22 @@ export async function publishBatch(input, opts = {}) {
         try { verified = parseRunJsonTail(await run('node', [join(cwd, 'scripts/operations/run.mjs'), 'verify',
           `--checkout=${cwd}`, '--mode=run', '--json'], { timeout: 70 * 60_000 })); }
         catch (error) { verified = parseRunJsonTail(error.stdout); }
-        // Only a parsed red verdict is terminal; a timeout, spawn error or missing verdict is unknown progress, retried by the next tick.
-        if (!verified?.verdict) throw new Error(`verify unrun: ${JSON.stringify(verified?.error ?? 'no verdict')}`);
-        if (!verified.verdict.ok) {
-          state.sealFailure = { reason: JSON.stringify(verified.verdict.blocking ?? 'verify red'), at: new Date(now()).toISOString() };
+        // Only a verdict that names a real failure is terminal. A timeout, spawn error, missing verdict, or a verdict
+        // whose checks did not run (ok:false with failed:0 — see assessChecks) is unknown progress: retried, bounded.
+        const verdict = verified?.verdict;
+        const unrun = !verdict || (!(verdict.failed > 0) && !verdict.ok && (verdict.unrun > 0 || verdict.emptySuite
+          || (verdict.blocking ?? []).some(item => item?.why === 'did-not-run')));
+        if (unrun) {
+          state.verifyUnrun = (state.verifyUnrun ?? 0) + 1;
+          const detail = JSON.stringify(verdict?.blocking ?? verified?.error ?? 'no verdict');
+          if (state.verifyUnrun < VERIFY_UNRUN_CAP) { save(); throw new Error(`verify unrun: ${detail}`); }
+          state.sealFailure = { reason: `verify did not run ${state.verifyUnrun} times: ${detail}`, at: new Date(now()).toISOString() };
+          save();
+          retire();
+          return { action: 'held', state };
+        }
+        if (!verdict.ok) {
+          state.sealFailure = { reason: JSON.stringify(verdict.blocking ?? 'verify red'), at: new Date(now()).toISOString() };
           save();
           retire();
           return { action: 'held', state };
@@ -183,24 +196,29 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
   let files;
   try { files = readdirSync(stateDir); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   const jobs = files.includes('sealed') ? await sealDueBatches({ now, stateDir: join(stateDir, 'sealed'), policy, spawn }) : [];
+  const errors = [];
   for (const file of files.filter(file => file.endsWith('.json'))) {
-    const path = resolve(stateDir, file);
-    const state = readState(path);
-    if (!state.batchRef) continue;
-    if (basename(stateDir) === 'sealed' && (state.sealFailure || state.seal?.step === 'label-on-green')) continue;
-    const kind = kindOf(state, path);
-    // Any seal reason launches (count beats age in shouldSeal); the lease serialises the worker against inline sealing.
-    // A PR whose hold was never confirmed relaunches too, so the unheld-draft window closes without waiting for a seal.
-    if (!kind || (!state.sealedAt && !planPublish({ state, kind, policy, now }).reason && !holdPending(state))) continue;
-    const child = spawn(process.execPath, [join(ROOT, 'scripts/operations/card-batch-seal-job.mjs'), `--state=${path}`],
-      { cwd: ROOT, detached: true, stdio: 'ignore' });
-    // Wait only for OS launch, never child completion/verification. Launch failures reach probeErrors.
-    await new Promise((resolve, reject) => {
-      child.once('error', reject);
-      child.once('spawn', resolve);
-      child.unref();
-    });
-    jobs.push(path);
+    // One unreadable or throwing state must not stop later batches from launching; the first error is rethrown after the scan.
+    try {
+      const path = resolve(stateDir, file);
+      const state = readState(path);
+      if (!state.batchRef) continue;
+      if (basename(stateDir) === 'sealed' && (state.sealFailure || state.seal?.step === 'label-on-green')) continue;
+      const kind = kindOf(state, path);
+      // Any seal reason launches (count beats age in shouldSeal); the lease serialises the worker against inline sealing.
+      // A PR whose hold was never confirmed relaunches too, so the unheld-draft window closes without waiting for a seal.
+      if (!kind || (!state.sealedAt && !planPublish({ state, kind, policy, now }).reason && !holdPending(state))) continue;
+      const child = spawn(process.execPath, [join(ROOT, 'scripts/operations/card-batch-seal-job.mjs'), `--state=${path}`],
+        { cwd: ROOT, detached: true, stdio: 'ignore' });
+      // Wait only for OS launch, never child completion/verification. Launch failures reach probeErrors.
+      await new Promise((resolve, reject) => {
+        child.once('error', reject);
+        child.once('spawn', resolve);
+        child.unref();
+      });
+      jobs.push(path);
+    } catch (error) { errors.push(error); }
   }
+  if (errors.length) throw Object.assign(errors[0], { launched: jobs });
   return jobs;
 }
