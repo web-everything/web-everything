@@ -8,5 +8,7 @@
   "supersede": "newer",
   "restartInFlight": "adopt",
   "runAllPhases": true,
-  "isolatedRetry": "untouched"
+  "isolatedRetry": "untouched",
+  "relatedMaxTests": 40,
+  "relatedDepth": 2
 }

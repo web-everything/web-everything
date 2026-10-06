@@ -765,14 +765,14 @@ describe('verify phase telemetry (#5141)', () => {
     expect(buildVerifyPhases({ admissionWaitMs: 12.4, vitestMs: 3400.6, scanMs: 800.2,
       standardsMs: 5200.5, gateMs: 9400.4, decision: { targets: ['a', 'b'], changedFiles: ['a'] } })).toEqual({
       admissionWaitMs: 12, vitestMs: 3401, scanMs: 800, standardsMs: 5201, gateMs: 9400,
-      targetFileCount: 2, changedFileCount: 1, importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, settingsSource: null, admissionMode: 'gate', admissionPhases: null, outcomes: skipped,
+      targetFileCount: 2, changedFileCount: 1, importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, settingsSource: null, admissionMode: 'gate', admissionPhases: null, selection: null, outcomes: skipped,
     });
   });
   it('uses null for missing or non-finite timings and absent decisions', () => {
     expect(buildVerifyPhases({ admissionWaitMs: Infinity, vitestMs: NaN, scanMs: -Infinity,
       standardsMs: undefined })).toEqual({ admissionWaitMs: null, vitestMs: null, scanMs: null,
       standardsMs: null, gateMs: null, targetFileCount: null, changedFileCount: null,
-      importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, settingsSource: null, admissionMode: 'gate', admissionPhases: null, outcomes: skipped });
+      importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, settingsSource: null, admissionMode: 'gate', admissionPhases: null, selection: null, outcomes: skipped });
     expect(buildVerifyPhases({})).toEqual(buildVerifyPhases({ admissionWaitMs: NaN }));
   });
   it('guards counts with Array.isArray and preserves empty counts and zero timings', () => {
@@ -929,5 +929,60 @@ describe('#verify-phase-admission', () => {
     expect(formatVerifyPhases(phases)).toContain('admission=phase');
     expect(formatVerifyPhases(phases)).toContain('vitestWait=7(fast)');
     expect(buildVerifyPhases({ admissionWaitMs: 8 })).toMatchObject({ admissionMode: 'gate', admissionPhases: null, admissionWaitMs: 8 });
+  });
+});
+
+// #5128 — graph reads and tracked-file discovery stay injected; no real repository graph.
+describe('#5128 — bounded related-test selection', () => {
+  function boundedGate(maxTests = 3, withReader = true) {
+    const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'",
+      'scripts/direct.test.mjs': "import './hub.mjs'" };
+    for (let i = 0; i < 6; i++) files[`scripts/deep${i}.test.mjs`] = "import './mid.mjs'";
+    const git = fakeGit(['scripts/hub.mjs']);
+    return resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: maxTests, relatedDepth: 2 },
+      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
+      ...(withReader ? { readRepoFile: path => files[path] } : {}),
+    });
+  }
+
+  it('runs direct tests explicitly while preserving admission targets', () => {
+    const gate = boundedGate();
+    expect(gate.testCommand).toBe("npx vitest run 'scripts/direct.test.mjs' --passWithNoTests");
+    expect(gate.decision.selection.status).toBe('selection-truncated');
+    expect(gate.decision.targets).toEqual(['scripts/hub.mjs']);
+    expect(describeGate(gate)).toContain('selection-truncated');
+  });
+
+  it('keeps vitest related under the limit', () => {
+    const gate = boundedGate(50);
+    expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
+    expect(gate.decision.selection.status).toBe('complete');
+  });
+
+  it('keeps the original command and omits selection without a reader', () => {
+    const gate = boundedGate(3, false);
+    expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
+    expect(gate.decision).not.toHaveProperty('selection');
+  });
+
+  it('emits selection counts in structured and formatted phase telemetry', () => {
+    const phases = buildVerifyPhases({ decision: boundedGate().decision });
+    expect(phases.selection).toMatchObject({ status: 'selection-truncated', fullTestCount: 7,
+      selectedTestCount: 1, droppedCount: 6 });
+    expect(formatVerifyPhases(phases)).toContain('selection=selection-truncated(1/7)');
+  });
+
+  it('wires the repository reader and retries both related and explicit test commands', () => {
+    const source = readFileSync(resolve('scripts/verify-lane.mjs'), 'utf8');
+    expect(source).toMatch(/const readRepoFile\s*=\s*\(p\)\s*=>\s*readFileSync\(join\(REPO, p\), 'utf8'\)/);
+    const calls = [...source.matchAll(/resolveDefaultGate\(\{([^;]+?)\}\)/g)];
+    expect(calls.length).toBeGreaterThan(0);
+    for (const [, args] of calls) expect(args).toMatch(/\breadRepoFile\b/);
+    const pattern = source.match(/const SELECTED_TEST_COMMAND = \/(.+)\//);
+    expect(pattern).not.toBeNull();
+    const selectedTestCommand = new RegExp(pattern[1]);
+    for (const mode of ['related', 'run']) expect(selectedTestCommand.test(`npx vitest ${mode} 'x.test.mjs'`)).toBe(true);
+    expect(selectedTestCommand.test('npm run test:unit')).toBe(false);
+    expect(source).toMatch(/const retryableGate = SELECTED_TEST_COMMAND\.test\(resolvedGate\?\.testCommand \?\? ''\)/);
   });
 });

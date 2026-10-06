@@ -65,6 +65,7 @@ import { isPolicyCorePath } from './gate-config.mjs';
 import { isAllowlistedLitterPath } from './lane-litter.mjs';
 import { queueLaneOf } from '../readiness/heavy-queue-projection.mjs';
 import { scanCommands } from './repo-scan-tests.mjs';
+import { buildReverseImportGraph, selectRelatedTests } from './related-test-selection.mjs';
 
 const defaultFileConfig = loadVerifySettingsFile();
 
@@ -261,7 +262,7 @@ export function phaseAdmissionKind({ phase, decision, standardsScoped, env, file
  * @param {{base?: string, runGit: (args:string[]) => string, env?: Record<string,string|undefined>, scripts?: Iterable<string>|null, fileExists?: (repoRelativePath: string) => boolean}} args
  * @returns {{ command: string, gateReasons: string[], decision: import('../readiness/test-selection.mjs').SelectionDecision & {changedFiles: string[]|null} }}
  */
-export function resolveDefaultGate({ base = 'origin/main', runGit, env = process.env, scripts, fileExists, fileConfig = defaultFileConfig } = {}) {
+export function resolveDefaultGate({ base = 'origin/main', runGit, env = process.env, scripts, fileExists, readRepoFile, fileConfig = defaultFileConfig } = {}) {
   // xpnhz4o — the changed set is the WORKING TREE against the pinned merge-base (tracked edits, staged or not,
   // plus untracked files), not HEAD's committed diff. The gate runs against the working tree, so that is the set
   // it must key on — and a fixer runs the gate BEFORE committing, which under the old "dirty ⇒ full" rule (#3389)
@@ -317,11 +318,17 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
     if (targets.length > MAX_RELATED_TARGETS || Buffer.byteLength(targets.join(' '), 'utf8') > 32_000) {
       return blocked([`${targets.length} selection targets (limit ${MAX_RELATED_TARGETS}, 32000 bytes) — narrow the diff/base or supply an explicit affected-test --gate; no local full suite`], { referencedTests, targets });
     }
-    const decision = { ...local, changedFiles, standards, settingsSource, relatedMode, testTimeoutFactor, referencedTests, targets };
+    // #5128 — a hub module can reach hundreds of tests through `vitest related`'s unbounded walk. Over the limit,
+    // run the bounded list (direct importers always kept) and mark the run `selection-truncated`.
+    const selection = relatedSelection({ targets, runGit, readRepoFile, settings });
+    const decision = { ...local, changedFiles, standards, settingsSource, relatedMode, testTimeoutFactor, referencedTests, targets,
+      ...(selection ? { selection } : {}) };
     // `--passWithNoTests`: a diff whose files no test reaches (docs, a backlog card) is a pass, not a failure.
     // Deletions or excluded untracked scratch can leave no target, and `vitest related` with no
     // positional file is an error (a false red); there is nothing for vitest to run, so say so and skip it.
-    const vitestCmd = targets.length
+    const vitestCmd = selection?.status === 'selection-truncated'
+      ? `npx vitest run ${selection.tests.map(shellQuote).join(' ')} --passWithNoTests${timeoutFlags}`
+      : targets.length
       ? `npx vitest related ${targets.map(shellQuote).join(' ')} --run --passWithNoTests${timeoutFlags}`
       : `echo ${shellQuote('verify-lane: no remaining changed file for vitest to relate — vitest half skipped (deletions or excluded untracked scratch)')}`;
     // #3887 — `vitest related` selects tests that IMPORT a changed file; a repo-SCANNING test reads files from disk and
@@ -336,6 +343,35 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
     return { ...composed, decision };
   }
   throw new Error(`unexpected local selection mode: ${local.mode}`);
+}
+
+const graphCache = new WeakMap();
+
+/**
+ * #5128 — the bounded related-test selection, or null when it does not apply (limit off, no reader injected, no
+ * target, or git/graph trouble — null keeps the plain `vitest related` gate, the pre-#5128 behaviour). The graph is
+ * cached per injected reader, so the #66 variant matching re-resolves cheaply. A truncated list that is empty or too
+ * long for one command line also falls back to `vitest related`.
+ */
+function relatedSelection({ targets, runGit, readRepoFile, settings }) {
+  if (typeof readRepoFile !== 'function' || !(settings.relatedMaxTests > 0) || !targets.length) return null;
+  try {
+    let reverse = graphCache.get(readRepoFile);
+    if (!reverse) {
+      const files = String(runGit(['ls-files', '--cached', '--others', '--exclude-standard'])).split('\n').map((f) => f.trim()).filter(Boolean);
+      reverse = buildReverseImportGraph({ files, readFile: readRepoFile });
+      graphCache.set(readRepoFile, reverse);
+    }
+    const selection = selectRelatedTests({ changedFiles: targets, reverse, maxTests: settings.relatedMaxTests,
+      maxDepth: settings.relatedDepth });
+    if (selection.status === 'selection-truncated'
+      && (!selection.tests.length || Buffer.byteLength(selection.tests.join(' '), 'utf8') > 32_000)) {
+      return { ...selection, status: 'complete', tests: null, reason: `${selection.reason}; list unusable — kept vitest related` };
+    }
+    return selection;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -606,6 +642,8 @@ export function describeGate({ command, decision, scanCommands = [] }) {
   const out = [];
   if (decision.mode === 'shrink') {
     out.push(`verify-lane gate: SELECTED tests only — ${decision.changedFiles.length} changed path(s) → \`vitest related\` on ${decision.targets.length} target(s) (${decision.referencedTests.length} added because they name a changed file). CI still runs the full suite.`);
+    if (decision.selection) out.push(`  related-test selection: ${decision.selection.status} — ${decision.selection.reason}`
+      + (decision.selection.hubs?.length ? ` (hubs: ${decision.selection.hubs.map((h) => `${h.file} ${h.direct}/${h.transitive}`).join(', ')})` : ''));
   } else {
     out.push('verify-lane gate: FULL SUITE (fallback) — the diff could not be safely scoped:');
   }
@@ -663,6 +701,13 @@ export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standards
     importGraphTargetCount: Array.isArray(decision?.relatedFiles) ? decision.relatedFiles.length : null,
     literalReferenceTargetCount: Array.isArray(decision?.referencedTests) && Array.isArray(decision?.relatedFiles)
       ? decision.referencedTests.filter(file => !decision.relatedFiles.includes(file)).length : null,
+    // #5128 — what the related-test selection ran and why; `status: 'selection-truncated'` means farther tests were left to CI.
+    selection: decision?.selection ? {
+      status: decision.selection.status, fullTestCount: decision.selection.fullTestCount,
+      selectedTestCount: decision.selection.selectedTestCount, directTestCount: decision.selection.directTestCount,
+      droppedCount: decision.selection.droppedCount, depth: decision.selection.depth, maxDepth: decision.selection.maxDepth,
+      maxTests: decision.selection.maxTests, hubs: decision.selection.hubs, reason: decision.selection.reason,
+    } : null,
     outcomes: Object.fromEntries(['vitest', 'scan', 'standards'].map(kind => [kind, outcomes[kind] ?? (kind === 'standards' ? standardsOutcome : { result: 'skipped' })])),
   };
 }
@@ -671,7 +716,7 @@ export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standards
 export function formatVerifyPhases(phases) {
   const fields = { admission: phases.admissionWaitMs, vitest: phases.vitestMs, scan: phases.scanMs,
     standards: phases.standardsMs, gate: phases.gateMs, targets: phases.targetFileCount, changed: phases.changedFileCount };
-  const counts = { graph: phases.importGraphTargetCount, literal: phases.literalReferenceTargetCount, related: phases.relatedMode, timeoutFactor: phases.testTimeoutFactor, standardsPolicy: phases.standardsPolicy, admission: phases.admissionMode };
+  const counts = { selection: phases.selection ? `${phases.selection.status}(${phases.selection.selectedTestCount}/${phases.selection.fullTestCount})` : null, graph: phases.importGraphTargetCount, literal: phases.literalReferenceTargetCount, related: phases.relatedMode, timeoutFactor: phases.testTimeoutFactor, standardsPolicy: phases.standardsPolicy, admission: phases.admissionMode };
   return ['phaseMs', ...Object.entries(fields).filter(([, value]) => value != null)
     .map(([name, value]) => `${name}=${value}`),
   ...Object.entries(phases.outcomes ?? {}).map(([name, outcome]) =>
