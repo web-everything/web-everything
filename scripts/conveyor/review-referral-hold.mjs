@@ -155,6 +155,20 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env } = {}) {
     why, retryAt: null, persistenceFailed: false, exhausted: false };
 }
 
+/** Block-ruled referrals on the PR's CURRENT head, once EVERY referral on it is ruled (none pending): the PR is owed a
+ * FIX, not a review. The same-head pause stops only a re-review of an unchanged head; the fix is what changes it
+ * (live 2026-10-06, #4017: three `block` rulings, the pause refused every fix tick, so no push ever came).
+ * Read exactly as the gate reads it. Any pending referral, or no block, answers `[]`. Never throws.
+ */
+export function blockRuledReferralsFor(pr, { repo, cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
+  try {
+    if (!sha(pr?.headRefOid)) return [];
+    const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
+    if (live.pending.length || !live.blockedFindings?.length) return [];
+    return live.blockedFindings.map(b => ({ key: b.key, findingId: b.findingId ?? null, finding: b.finding }));
+  } catch { return []; }
+}
+
 function defaultReadComments({ repo, number }) {
   return JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(number), ...(repo ? ['--repo', repo] : []), '--json', 'comments'],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })).comments;
@@ -175,7 +189,9 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), readRu
     }
     // A deliberate release (ruling cleared, new event, retry due) owes a fresh review: the same-head guard stays out.
     const { hold, released } = evaluateReferralHold(pr, runs, { repo, now });
-    return { ...pr, referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo })) };
+    const blockRuledReferrals = blockRuledReferralsFor(pr, { repo });
+    return { ...pr, blockRuledReferrals,
+      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo })) };
   });
 }
 

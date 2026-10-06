@@ -2147,6 +2147,29 @@ export function planReconcile({
       continue;
     }
 
+    // ── BLOCK-RULED REFERRALS ON THE CURRENT HEAD — owed a FIX, never the same-head review pause. Every mandatory
+    // referral on this head is ruled and at least one is `block`: the review will only repeat itself on an unchanged
+    // head (that pause is right), so the fix that CHANGES the head must go out with the blocked findings in its
+    // brief. Live 2026-10-06, #4017: three `block` rulings, the pause refused every tick, no push could ever come.
+    // Unruled referrals never reach here (`blockRuledReferrals` is empty while any is pending).
+    if (phase === 'needs-human' && Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length) {
+      const attempts = roundAttempts();
+      if (attempts >= effectiveRoundCap) {
+        refuseCapExhausted({
+          ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
+          why: `the PR's own durable attempt count is ${attempts} against a cap of ${effectiveRoundCap} — auto-repair of the block-ruled referrals is exhausted here and a person must take it`,
+        });
+        continue;
+      }
+      dispatch.push({
+        ...base, ...withPhase, kind: 'fix', mode: 'block-ruled-referral', findings: pr.blockRuledReferrals.length,
+        attempts, cap: effectiveRoundCap, blockRuledReferrals: pr.blockRuledReferrals,
+        why: `${pr.blockRuledReferrals.length} mandatory referral(s) on this head were ruled block and nothing live is working it`
+          + ' — the fix that changes the head is owed, not another review of the same head',
+      });
+      continue;
+    }
+
     // ── ADVISORY-FIX (#xkmu3gv) — its OWN branch, ahead of the generic `OWED` table, the same way `ci-red` sits
     // ahead of it above. A `needs-human` PR carrying an admitted `advisory:changes` finding that has NOT yet
     // been fixed for the CURRENT (latest) advisory note owes a FIX here, never the `review` the generic table

@@ -407,3 +407,41 @@ describe('same-head review loop regression (live #202)', () => {
     expect(log).not.toHaveBeenCalled();
   });
 });
+
+// Live 2026-10-06, #4017: every referral ruled `block` on head H, H reviewed once. The same-head pause refused every
+// tick, so the fix that would change H never went out. The pause stops a re-REVIEW only.
+describe('block-ruled referrals route to a fix, not the same-head pause', () => {
+  const ruledRecord = (result = 'block') => ({ ...record(), rulings: [{ id: 'r1', key, reviewerId: record().reviewer.id,
+    lens: record().reviewer.lens, result, rationale: 'confirmed', evidence: ['diff'] }] });
+  const reviewedOnce = [{ ...evidence(), parked: false }];
+  const plan = p => runReconcilePass({ repo, now: at + 1, readPrs: () => [p], readAgents: () => [], enrich: x => x,
+    enrichMainRed: prs => ({ prs }), enrichAlreadyLanded: x => x, enrichBaseRef: x => x,
+    enrichSystemFix: x => x, enrichFixClaims: x => x, enrichTimeouts: x => x,
+    enrichReferralHolds: prs => enrichPrsWithReferralHolds(prs, { repo, now: at + 1, readRuns: () => reviewedOnce }),
+    resolveMainSha: () => null, readRequiredChecks: () => ({ checks: ['test'] }) });
+  it('all referrals ruled block on the reviewed head: the review stays paused, a fix is dispatched with the findings', () => {
+    const p = pr({ comments: [comment(renderReferralRecord(ruledRecord()), at - 120_000)] });
+    const [enriched] = enrichPrsWithReferralHolds([p], { repo, now: at + 1, readRuns: () => reviewedOnce });
+    expect(enriched.referralHold.kind).toBe('same-head');
+    expect(enriched.blockRuledReferrals).toHaveLength(1);
+    const out = plan(p);
+    expect(out.dispatch).toContainEqual(expect.objectContaining({ kind: 'fix', mode: 'block-ruled-referral', prNumber: 3481,
+      blockRuledReferrals: [expect.objectContaining({ key, finding: expect.objectContaining({ summary: 'broken case' }) })] }));
+    expect(out.dispatch.some(d => d.kind === 'review')).toBe(false);
+  });
+  it('unruled referrals are still paused (no fix)', () => {
+    const p = pr({ comments: [comment(renderReferralRecord(record()), at - 120_000)] });
+    const [enriched] = enrichPrsWithReferralHolds([p], { repo, now: at + 1, readRuns: () => reviewedOnce });
+    expect(enriched.blockRuledReferrals).toEqual([]);
+    expect(enriched.referralHold).not.toBeNull();
+    expect(plan(p).dispatch.some(d => d.kind === 'fix')).toBe(false);
+  });
+  it('not-real rulings and no rulings leave behaviour unchanged', () => {
+    for (const comments of [[], [comment(renderReferralRecord(ruledRecord('not-real')), at - 120_000)]]) {
+      const [enriched] = enrichPrsWithReferralHolds([pr({ comments })], { repo, now: at + 1, readRuns: () => reviewedOnce });
+      expect(enriched.blockRuledReferrals).toEqual([]);
+      expect(enriched.referralHold?.kind).toBe('same-head');
+      expect(plan(pr({ comments })).dispatch.some(d => d.kind === 'fix')).toBe(false);
+    }
+  });
+});
