@@ -41,7 +41,7 @@
  *     trust chain must always see the unscoped whole-repo signal on a change to itself.
  * See {@link canScopeCheckStandards}.
  *
- * `resolveDefaultGate` is pure — no fs, no child_process, no clock. It takes an injectable `runGit` (mirroring
+ * `resolveDefaultGate` uses a cached settings file by default; inject fileConfig for pure tests. It takes an injectable `runGit` (mirroring
  * `test-selection.mjs`'s own convention) so tests drive it deterministically.
  *
  * PER-REPO SCRIPTS (#3919). The gate halves above name WE's own npm scripts (`test:unit`, `check:standards`), but
@@ -56,6 +56,8 @@
  * `scripts` omitted/unknown ⇒ assumed WE-shaped, so a WE checkout's command is byte-for-byte unchanged. frontierui
  * has both `test:unit` and `check:standards`, so it too gets today's gate unchanged.
  */
+import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings.mjs';
+
 import { createHash } from 'node:crypto';
 import { stripVTControlCharacters } from 'node:util';
 import { SELECTION_FLAG, pinnedMergeBase, decideLocalSelection, referencedTestNeedles, LOCAL_FULL_SUITE_TRIGGERS } from '../readiness/test-selection.mjs';
@@ -64,21 +66,22 @@ import { isAllowlistedLitterPath } from './lane-litter.mjs';
 import { queueLaneOf } from '../readiness/heavy-queue-projection.mjs';
 import { scanCommands } from './repo-scan-tests.mjs';
 
+const defaultFileConfig = loadVerifySettingsFile();
+
 /** The pathspecs `testsNaming` greps — every vitest test-file suffix (PR #2680 review: one list, pinned by a test). */
 export const VITEST_TEST_PATHSPECS = Object.freeze(['*.test.ts', '*.test.tsx', '*.test.js', '*.test.jsx', '*.test.mjs', '*.test.cjs', '*.test.mts', '*.test.cts']);
 
-/** Local discovery policy; unknown values preserve literal-reference discovery. */
-export function verifyRelatedMode(env) {
-  return env?.WE_VERIFY_RELATED === 'import-only' ? 'import-only' : 'all';
+/** Local discovery policy, resolved from environment, file, then safe built-ins. */
+export function verifyRelatedMode(env, fileConfig = defaultFileConfig) {
+  return resolveVerifySettings({ fileConfig, env }).values.relatedMode;
 }
 
 /** Vitest's own default per-test and per-hook timeouts, the base the local factor scales. */
 export const VITEST_BASE_TIMEOUTS = Object.freeze({ testTimeout: 5_000, hookTimeout: 10_000 });
 
 /** LOCAL-only timeout multiplier (`WE_VERIFY_TEST_TIMEOUT_FACTOR`, default 3; 1 = vitest defaults). CI never reads it. */
-export function verifyTestTimeoutFactor(env) {
-  const n = Number(env?.WE_VERIFY_TEST_TIMEOUT_FACTOR ?? 3);
-  return Number.isFinite(n) && n >= 1 ? n : 3;
+export function verifyTestTimeoutFactor(env, fileConfig = defaultFileConfig) {
+  return resolveVerifySettings({ fileConfig, env }).values.testTimeoutFactor;
 }
 
 /** The vitest flags for a factor: none at 1, so factor 1 is byte-identical to today's command. */
@@ -149,8 +152,8 @@ export function canScopeCheckStandards(changedFiles) {
 }
 
 // #verify-standards-auto — local policy; unknown settings preserve the existing gate.
-export function verifyStandardsPolicy(env) {
-  return ['auto', 'ci-only'].includes(env?.WE_VERIFY_STANDARDS) ? env.WE_VERIFY_STANDARDS : 'always';
+export function verifyStandardsPolicy(env, fileConfig = defaultFileConfig) {
+  return resolveVerifySettings({ fileConfig, env }).values.standards;
 }
 
 export const VERIFY_STANDARDS_POLICIES = Object.freeze(['always', 'auto', 'ci-only']);
@@ -186,19 +189,17 @@ export function decideStandardsHalf({ policy, changedFiles }) {
 }
 
 // #verify-phase-admission — only existing queue kinds determine fast/slow routing.
-export function verifyPhaseAdmissionEnabled(env) {
-  return env?.WE_VERIFY_PHASE_ADMISSION !== '0';
+export function verifyPhaseAdmissionEnabled(env, fileConfig = defaultFileConfig) {
+  return resolveVerifySettings({ fileConfig, env }).values.phaseAdmission;
 }
 
-export function verifyFastTargets(env) {
-  const value = env?.WE_VERIFY_FAST_TARGETS;
-  const n = Number(value);
-  return value != null && String(value).trim() !== '' && Number.isSafeInteger(n) && n >= 0 ? n : 5;
+export function verifyFastTargets(env, fileConfig = defaultFileConfig) {
+  return resolveVerifySettings({ fileConfig, env }).values.fastTargets;
 }
 
-export function phaseAdmissionKind({ phase, decision, standardsScoped, env }) {
+export function phaseAdmissionKind({ phase, decision, standardsScoped, env, fileConfig = defaultFileConfig }) {
   let kind = 'other';
-  if (phase === 'scan' || (phase === 'vitest' && decision?.targets?.length <= verifyFastTargets(env))) kind = 'files';
+  if (phase === 'scan' || (phase === 'vitest' && decision?.targets?.length <= verifyFastTargets(env, fileConfig))) kind = 'files';
   if (phase === 'standards' && standardsScoped) kind = 'standards';
   return { kind, lane: queueLaneOf(kind) };
 }
@@ -215,17 +216,17 @@ export function phaseAdmissionKind({ phase, decision, standardsScoped, env }) {
  * @param {{base?: string, runGit: (args:string[]) => string, env?: Record<string,string|undefined>, scripts?: Iterable<string>|null, fileExists?: (repoRelativePath: string) => boolean}} args
  * @returns {{ command: string, gateReasons: string[], decision: import('../readiness/test-selection.mjs').SelectionDecision & {changedFiles: string[]|null} }}
  */
-export function resolveDefaultGate({ base = 'origin/main', runGit, env = process.env, scripts, fileExists } = {}) {
+export function resolveDefaultGate({ base = 'origin/main', runGit, env = process.env, scripts, fileExists, fileConfig = defaultFileConfig } = {}) {
   // xpnhz4o — the changed set is the WORKING TREE against the pinned merge-base (tracked edits, staged or not,
   // plus untracked files), not HEAD's committed diff. The gate runs against the working tree, so that is the set
   // it must key on — and a fixer runs the gate BEFORE committing, which under the old "dirty ⇒ full" rule (#3389)
   // meant every fixer gate was a full-suite run.
-  const relatedMode = verifyRelatedMode(env);
-  const testTimeoutFactor = verifyTestTimeoutFactor(env);
+  const { values: settings, sources: settingsSource } = resolveVerifySettings({ fileConfig, env });
+  const { relatedMode, testTimeoutFactor } = settings;
   const timeoutFlags = scaledTimeoutFlags(testTimeoutFactor);
   const diff = localChangedSet({ base, runGit });
   const changedFiles = diff ? diff.changedFiles : null;
-  const standards = decideStandardsHalf({ policy: verifyStandardsPolicy(env), changedFiles });
+  const standards = decideStandardsHalf({ policy: settings.standards, changedFiles });
   const optOut = String(env?.[SELECTION_FLAG] ?? '') === '0';
   // #4540: only untracked allowlist matches are scratch; tracked names remain real inputs.
   // Keep the original diff for standards scoping and diagnostics.
@@ -252,7 +253,7 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
     };
   }
   const blocked = (reasons, extra = {}) => ({ command: null, gateReasons: [], decision: {
-    ...local, mode: 'blocked', reasons, changedFiles, standards, relatedMode, referencedTests: [], targets: [], ...extra,
+    ...local, mode: 'blocked', reasons, changedFiles, standards, settingsSource, relatedMode, referencedTests: [], targets: [], ...extra,
   } });
   if (local.mode === 'full') return blocked([
     ...local.reasons.map((r) => r.replaceAll('full suite', 'broad selection')),
@@ -271,7 +272,7 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
     if (targets.length > MAX_RELATED_TARGETS || Buffer.byteLength(targets.join(' '), 'utf8') > 32_000) {
       return blocked([`${targets.length} selection targets (limit ${MAX_RELATED_TARGETS}, 32000 bytes) — narrow the diff/base or supply an explicit affected-test --gate; no local full suite`], { referencedTests, targets });
     }
-    const decision = { ...local, changedFiles, standards, relatedMode, testTimeoutFactor, referencedTests, targets };
+    const decision = { ...local, changedFiles, standards, settingsSource, relatedMode, testTimeoutFactor, referencedTests, targets };
     // `--passWithNoTests`: a diff whose files no test reaches (docs, a backlog card) is a pass, not a failure.
     // Deletions or excluded untracked scratch can leave no target, and `vitest related` with no
     // positional file is an error (a false red); there is nothing for vitest to run, so say so and skip it.
@@ -603,6 +604,7 @@ export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standards
   return {
     admissionMode,
     admissionPhases,
+    settingsSource: decision?.settingsSource ?? null,
     standardsPolicy: decision?.standards?.policy ?? null,
     relatedMode: decision?.relatedMode ?? null,
     testTimeoutFactor: decision?.testTimeoutFactor ?? null,
@@ -630,5 +632,6 @@ export function formatVerifyPhases(phases) {
   ...Object.entries(phases.outcomes ?? {}).map(([name, outcome]) =>
     `${name}=${outcome.result}${outcome.reason ? `(${outcome.reason.replace(/[\r\n\u2028\u2029]/g, ' ')})` : ''}`),
   ...Object.entries(counts).filter(([, value]) => value != null).map(([name, value]) => `${name}=${value}`),
+  ...(phases.settingsSource ? [`settingsSource=${JSON.stringify(phases.settingsSource)}`] : []),
   ...Object.entries(phases.admissionPhases ?? {}).map(([name, phase]) => `${name}Wait=${phase.waitedMs}(${phase.lane})`)].join(' ');
 }

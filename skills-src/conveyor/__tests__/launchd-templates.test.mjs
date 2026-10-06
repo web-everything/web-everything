@@ -24,10 +24,23 @@ describe('launchd templates', () => {
     expect(env).toMatch(/<key>WE_LOAD_FLAKE_REVERIFY_MODE<\/key>\s*<string>ci<\/string>/);
   });
 
-  it('pins the verify settings', () => {
+  it('keeps verify defaults in the settings file and only distinct overrides in the template', () => {
+    const template = templates.find(({ name }) => name === 'com.we.verify-daemon.plist.example').text;
     const env = envFor('com.we.verify-daemon.plist.example');
-    expect(env).toMatch(/<key>WE_VERIFY_RELATED<\/key>\s*<string>import-only<\/string>/);
-    expect(env).toMatch(/<key>WE_VERIFY_TEST_TIMEOUT_FACTOR<\/key>\s*<string>3<\/string>/);
+    expect(template).not.toContain('WE_VERIFY_RELATED');
+    expect(template).not.toContain('WE_VERIFY_TEST_TIMEOUT_FACTOR');
+    expect(template).toContain('scripts/verify-settings.json');
+    expect(env).toMatch(/<key>WE_VERIFY_STANDARDS<\/key>\s*<string>auto<\/string>/);
+    const settings = JSON.parse(readFileSync(join(root, '../../scripts/verify-settings.json'), 'utf8'));
+    const keys = { relatedMode: 'WE_VERIFY_RELATED', testTimeoutFactor: 'WE_VERIFY_TEST_TIMEOUT_FACTOR',
+      standards: 'WE_VERIFY_STANDARDS', phaseAdmission: 'WE_VERIFY_PHASE_ADMISSION', fastTargets: 'WE_VERIFY_FAST_TARGETS' };
+    const overrides = Object.fromEntries([...env.matchAll(/<key>([^<]+)<\/key>\s*<string>([^<]*)<\/string>/g)]
+      .map(([, key, value]) => [key, value]));
+    for (const [key, value] of Object.entries(settings)) {
+      expect(keys[key], `unmapped setting ${key}`).toBeDefined();
+      const serialized = typeof value === 'boolean' ? (value ? '1' : '0') : String(value);
+      expect(overrides[keys[key]], key).not.toBe(serialized);
+    }
   });
 
   it('keeps private key paths as placeholders', () => {
