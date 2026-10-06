@@ -199,7 +199,7 @@ export function readCardFacts(id, io = {}) {
   } })({ ref: String(id).replace(/^card[-:]/, '') }), { found: false });
   const listing = soft(() => agents(exec), []);
   const prs = soft(() => JSON.parse(exec('gh', ['pr', 'list', '--repo', REPO, '--state', 'all', '--limit', '100',
-    '--search', String(context.id ?? id), '--json', 'number,title,headRefName'])), []);
+    '--json', 'number,title,headRefName'])), []);
   const map = buildPrToCardMap([{ repo: 'we', prs }]);
   const linked = array(prs).filter(p => String(map[`we:${p.number}`]) === String(context.id ?? id)).slice(0, 10);
   return { id: context.id ?? id, found: context.found, status: context.status ?? 'unknown',
@@ -209,5 +209,5 @@ export function readCardFacts(id, io = {}) {
       .map(a => ({ name: clean(a.name), state: a.status, startedAt: a.startedAt })),
     prs: linked.map(p => { const facts = readPrFacts(p.number, { ...io, agents: listing });
       return { pr: p.number, ...derivePrState(facts, settingsFromEnv(io.env ?? process.env)) }; }),
-    evidence: ['PR/card search bounded to 100 results and 10 linked PRs; no match does not prove no PR exists'] };
+    evidence: ['PR/card join bounded to the 100 most recent PRs and 10 linked PRs; no match does not prove no PR exists'] };
 }
