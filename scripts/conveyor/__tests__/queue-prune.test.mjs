@@ -69,6 +69,14 @@ describe('queue.mjs CLI', () => {
     env = { ...process.env, CONVEYOR_QUEUE_FILE: side, CONVEYOR_PRUNE_PROTECTED: '3', CONVEYOR_NO_READY_CHECK: '1' };
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  it('remove --ids-file matches a listed hash against its renamed landed NNN (bornAs)', () => {
+    // CONVEYOR_BACKLOG_DIR-free: the loader reads the lane's real backlog, so pick a real landed pair.
+    const items = JSON.parse(execFileSync('node', ['-e', "const l=require('./src/_data/backlog.js')();console.log(JSON.stringify(l.filter(i=>i.bornAs).slice(0,1).map(i=>({num:String(i.num),bornAs:i.bornAs}))))"], { encoding: 'utf8', cwd: join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..') }));
+    writeFileSync(side, JSON.stringify(q(items[0].num)));
+    const f = join(dir, 'ids2.txt'); writeFileSync(f, `${items[0].bornAs}\n`);
+    const dry = JSON.parse(run(['remove', `--ids-file=${f}`, '--dry-run', '--json']).out);
+    expect(dry.drop).toHaveLength(1);
+  });
   it('remove --ids-file needs a matching dry-run, then applies and skips protected', () => {
     const f = join(dir, 'ids.txt'); writeFileSync(f, '1 3\n');
     expect(run(['remove', `--ids-file=${f}`]).code).toBe(1);

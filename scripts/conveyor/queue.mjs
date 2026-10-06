@@ -243,6 +243,9 @@ function main(argv) {
     try { ids = parseIdsFile(readFileSync(flagVal('ids-file'), 'utf8')); }
     catch (e) { return fail(`cannot read --ids-file (${String(e.message || e).split('\n')[0]})`); }
     const queue = readQueueFile(path);
+    // A listed hash may have been renamed to its landed NNN (prune / migrate-bornas): match it by either spelling.
+    const bornIdx = bornAsIndexFromItems(loadBacklogItemsBestEffort());
+    ids = [...new Set(ids.map((id) => bornIdx.get(id) ?? id))];
     let prot;
     try { prot = loadProtectedNums(); }
     catch (e) { return fail(`cannot determine open PRs / claims (${String(e.message || e).split('\n')[0]}) — refusing (fail-closed)`); }
