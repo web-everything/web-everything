@@ -13,11 +13,11 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DEFAULT_REPOS } from './operations/free-scope.mjs';
-import { withFileLock } from './operations/free-scope-io.mjs';
+import { withPathLock } from './readiness/with-lock.mjs';
 import { appendHeldCard, parseHeldCards, planFiling, quietVerdict, markFiled } from './held-cards.mjs';
 
 /** A filing run holds its lock for minutes (verify + open-pr); a crashed one is reclaimed after this long untouched. */
-const FILING_LOCK_STALE_MS = 30 * 60 * 1000;
+const FILING_LOCK_LEASE_MINUTES = 30;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // Commands can print progress before their JSON result. Keep the last complete
@@ -117,7 +117,7 @@ export async function main(argv, deps = {}) {
           key === 'scope' ? String(flags[key]).split(',').map(s => s.trim()).filter(Boolean) : flags[key];
       }
       // Read, number and write under the list lock: two workers adding at once must not allocate one number.
-      const appended = withFileLock(list, ({ touch }) => {
+      const appended = withPathLock(list, ({ touch }) => {
         const result = appendHeldCard(read(list, ''), { title: flags.title, body: flags.body || '',
           nowEt: etTime(now()), meta: Object.keys(meta).length ? meta : null });
         touch(); // still the holder? Then commit.
@@ -148,8 +148,8 @@ export async function main(argv, deps = {}) {
     // ONE filing run at a time. The list lock only covers a single read-modify-write, but a run spends minutes
     // between planning and marking FILED: two runs would plan the same pending items and open two PRs for them.
     // So the whole run (plan → file → PR → mark) holds this lock and plans from a list read under it. A second
-    // run fails fast. The lock goes stale after 30 min, and the holder touches it before every subprocess.
-    const filing = withFileLock(`${list}.filing`, ({ touch }) => {
+    // run fails fast. The lease is 30 min, and the holder refreshes it (heartbeat) before every subprocess.
+    const filing = withPathLock(`${list}.filing`, ({ touch }) => {
     beat = touch;
     holdsFiling = true;
     const pending = planFiling(parseHeldCards(read(list, '')).items);
@@ -196,7 +196,7 @@ export async function main(argv, deps = {}) {
       // Re-read under the lock so an `add` that landed during filing is kept, not overwritten.
       // The PR exists now, so wait generously: failing here would leave its cards unmarked and refile them.
       beat();
-      withFileLock(list, ({ touch }) => {
+      withPathLock(list, ({ touch }) => {
         const marked = markFiled(read(list, ''), filed, { dateEt, pr });
         touch(); // still the holder? Then commit.
         writeFile(list, marked, 'utf8');
@@ -207,7 +207,7 @@ export async function main(argv, deps = {}) {
       // A malformed acquisition has nothing to release; releasing with undefined args would mask the real error.
       if (lane.lane && lane.holder) command('node', [path.join(root, 'scripts/lane-pool.mjs'), 'release', `--lane=${lane.lane}`, `--session=${lane.holder}`], root, false);
     }
-    }, { timeoutMs: 0, staleMs: FILING_LOCK_STALE_MS });
+    }, { timeoutMs: 0, leaseMinutes: FILING_LOCK_LEASE_MINUTES });
     return filing;
   } catch (error) {
     // Only a wait on the FILING lock means "another run is filing"; the inner list lock's timeout is its own error.

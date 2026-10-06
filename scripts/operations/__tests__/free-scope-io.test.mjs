@@ -3,12 +3,14 @@
  * @description Filesystem and CLI probes with a private registry and executable fake gh. No real host
  * or home state is read or written; fixtures exercise the same subprocess and YAML boundaries as production.
  */
-import { beforeEach, afterEach, it, expect, vi } from 'vitest';
+import { beforeEach, afterEach, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { defaultRegistryPath, readRegistry, writeRegistry, updateRegistry, withFileLock, stealStaleLock, ghExec, readOpenPrs, findCardFile, readCardScope, collectFreeScope } from '../free-scope-io.mjs';
+import { lockIdFor } from '../../readiness/file-locks.mjs';
+import { withPathLock } from '../../readiness/with-lock.mjs';
+import { defaultRegistryPath, readRegistry, writeRegistry, updateRegistry, ghExec, readOpenPrs, findCardFile, readCardScope, collectFreeScope } from '../free-scope-io.mjs';
 import { main } from '../free-scope-cli.mjs';
 let root, registry, env;
 const now = () => Date.parse('2026-10-05T10:00:00Z');
@@ -46,14 +48,18 @@ it('reads missing, bare and wrapped registries, refusing corruption', () => {
   fs.writeFileSync(registry, '{}');
   expect(() => readRegistry(registry)).toThrow(registry);
 });
-it('updates under a lock, steals stale locks and cleans up on callback failure', () => {
+it('updates under a lock, reclaims an abandoned lock and cleans up on callback failure', () => {
+  const lockRoot = path.join(path.dirname(registry), '.file-locks');
+  const held = () => fs.existsSync(lockRoot) && fs.readdirSync(lockRoot).length > 0;
   updateRegistry(registry, () => [{ agent: 'a' }]);
-  fs.mkdirSync(`${registry}.lock`);
-  fs.utimesSync(`${registry}.lock`, new Date(0), new Date(0));
+  // A crashed holder's lock (lease long expired) is reclaimed by the next update.
+  const dir = path.join(lockRoot, lockIdFor(path.resolve(registry)));
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, 'lock.json'), JSON.stringify({ owner: 'crashed:1:ab', path: registry, pid: null, heartbeatAt: new Date(0).toISOString() }));
   updateRegistry(registry, (entries) => [...entries, { agent: 'b' }]);
   expect(readRegistry(registry)).toHaveLength(2);
   expect(() => updateRegistry(registry, () => { throw new Error('failed'); })).toThrow('failed');
-  expect(fs.existsSync(`${registry}.lock`)).toBe(false);
+  expect(held()).toBe(false);
   expect(readRegistry(registry)).toHaveLength(2);
 });
 it('reads real fake-gh subprocess output and retains failures per repo', () => {
@@ -161,140 +167,31 @@ it('keeps two workers that share a slug apart through owner tokens on register, 
   expect(cli(['--files=x.mjs', '--exclude-agent=fix-widget', '--exclude-owner=T1']).code).toBe(0);
   expect(cli(['release', '--agent=fix-widget', '--owner=T1']).out).toBe('released 1\n');
 });
-it('does not let a second stealer remove a lock the first stealer just took', () => {
-  const lock = `${registry}.lock`;
-  fs.mkdirSync(path.dirname(registry), { recursive: true });
-  fs.mkdirSync(lock);
-  fs.utimesSync(lock, new Date(0), new Date(0));
-  let freshIno = 0, interleaved = false;
-  const realStat = fs.statSync;
-  // Worker B has just observed the stale lock; worker A then steals it and takes a fresh one before B acts on its observation.
-  const spy = vi.spyOn(fs, 'statSync').mockImplementation((p, ...rest) => {
-    const seen = realStat(p, ...rest);
-    if (!interleaved && p === lock) {
-      interleaved = true;
-      fs.rmdirSync(lock);
-      fs.mkdirSync(lock);
-      freshIno = realStat(lock).ino;
-    }
-    return seen;
+it('serializes registry updates through the shared lock primitive: a live holder blocks a second update, and a lock lost mid-update is reported', () => {
+  const lockRoot = path.join(path.dirname(registry), '.file-locks');
+  updateRegistry(registry, () => [{ agent: 'a' }]);
+  let nested;
+  // A second update from inside the first finds the lock held and (with the default wait shortened) times out.
+  updateRegistry(registry, (entries) => {
+    try { withPathLock(registry, () => {}, { timeoutMs: 0 }); } catch (e) { nested = e; }
+    return entries;
   });
-  let ran = false;
-  try { expect(() => withFileLock(registry, () => { ran = true; }, { timeoutMs: 150 })).toThrow('timed out acquiring'); }
-  finally { spy.mockRestore(); }
-  expect(ran).toBe(false);
-  expect(realStat(lock).ino).toBe(freshIno);
-  fs.rmSync(lock, { recursive: true, force: true });
-});
-it('detects a takeover even when the new lock directory reuses the old inode number', () => {
-  const lock = `${registry}.lock`;
-  const foreign = JSON.stringify({ nonce: 'someone-else', pid: 1, host: 'other' });
-  // Linux hands a freed inode number straight back, so rmdir+mkdir can leave the same ino behind. Pin it to prove
-  // the holder never trusts inode identity: only the owner token written inside the lock says who holds it.
-  const realStat = fs.statSync;
-  const pinned = 424242;
-  const spy = vi.spyOn(fs, 'statSync').mockImplementation((p, ...rest) => {
-    const st = realStat(p, ...rest);
-    return p === lock && st ? Object.assign(Object.create(Object.getPrototypeOf(st)), st, { ino: pinned }) : st;
-  });
-  const retake = () => { fs.rmSync(lock, { recursive: true, force: true }); fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, 'owner'), foreign); };
-  let lost, exit;
-  try {
-    // The loss also surfaces when the holder leaves, so a "successful" commit over a lost lock is never reported.
-    try {
-      withFileLock(registry, ({ touch }) => {
-        retake();
-        try { touch(); } catch (e) { lost = e; }
-      });
-    } catch (e) { exit = e; }
-    // The first holder's release must not remove the lock the second holder now owns.
-    expect(fs.readFileSync(path.join(lock, 'owner'), 'utf8')).toBe(foreign);
-  } finally { spy.mockRestore(); fs.rmSync(lock, { recursive: true, force: true }); }
-  expect(lost.code).toBe('ELOCKLOST');
-  expect(exit.code).toBe('ELOCKLOST');
-});
-it('lets a stalled stealer finish without removing the guard another stealer now holds', () => {
-  const lock = `${registry}.lock`, guard = `${lock}.steal`;
-  const foreign = JSON.stringify({ nonce: 'other-stealer', pid: 1, host: 'other' });
-  fs.mkdirSync(path.dirname(registry), { recursive: true });
-  fs.mkdirSync(lock);
-  fs.utimesSync(lock, new Date(0), new Date(0));
-  const seen = { ino: fs.statSync(lock).ino, mtimeMs: 0, owner: null };
-  const realStat = fs.statSync;
-  let swapped = false;
-  // While this stealer is stalled under its guard, the guard is reaped and retaken by a second stealer.
-  const spy = vi.spyOn(fs, 'statSync').mockImplementation((p, ...rest) => {
-    if (!swapped && p === lock) {
-      swapped = true;
-      fs.rmSync(guard, { recursive: true });
-      fs.mkdirSync(guard);
-      fs.writeFileSync(path.join(guard, 'owner'), foreign);
-    }
-    return realStat(p, ...rest);
-  });
-  try { expect(stealStaleLock(lock, seen)).toBe(true); } finally { spy.mockRestore(); }
-  expect(fs.readFileSync(path.join(guard, 'owner'), 'utf8')).toBe(foreign);
-  fs.rmSync(guard, { recursive: true, force: true });
-});
-it('puts back a lock that changed hands between the steal check and its removal', () => {
-  const lock = `${registry}.lock`;
-  const foreign = JSON.stringify({ nonce: 'fresh-holder', pid: 1, host: 'other' });
-  fs.mkdirSync(path.dirname(registry), { recursive: true });
-  fs.mkdirSync(lock);
-  fs.writeFileSync(path.join(lock, 'owner'), JSON.stringify({ nonce: 'abandoned', pid: 2, host: 'other' }));
-  fs.utimesSync(lock, new Date(0), new Date(0));
-  const seen = { ino: fs.statSync(lock).ino, mtimeMs: 0, owner: fs.readFileSync(path.join(lock, 'owner'), 'utf8') };
-  const realRename = fs.renameSync;
-  // A new holder takes the lock between the stealer's re-check and its rename.
-  const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, ...rest) => {
-    if (from === lock) { fs.rmSync(lock, { recursive: true }); fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, 'owner'), foreign); }
-    return realRename(from, ...rest);
-  });
-  try { expect(stealStaleLock(lock, seen)).toBe(false); } finally { spy.mockRestore(); }
-  expect(fs.readFileSync(path.join(lock, 'owner'), 'utf8')).toBe(foreign);
-  fs.rmSync(lock, { recursive: true, force: true });
-});
-it('reaps a steal guard orphaned by a crashed stealer well inside the acquire timeout', () => {
-  const lock = `${registry}.lock`;
-  fs.mkdirSync(path.dirname(registry), { recursive: true });
-  for (const dir of [lock, `${lock}.steal`]) { fs.mkdirSync(dir); fs.utimesSync(dir, new Date(0), new Date(0)); }
-  let ran = false;
-  withFileLock(registry, () => { ran = true; });
-  expect(ran).toBe(true);
-  expect(fs.existsSync(`${lock}.steal`)).toBe(false);
-  expect(fs.existsSync(lock)).toBe(false);
-});
-it('honours a longer staleMs, lets a long holder touch its lock alive, and tags a wait timeout', () => {
-  const lock = `${registry}.lock`;
-  fs.mkdirSync(path.dirname(registry), { recursive: true });
-  // 10 minutes old: stale at the 30s default, but not for a holder that declared a 30-minute window.
-  fs.mkdirSync(lock);
-  const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
-  fs.utimesSync(lock, tenMinutesAgo, tenMinutesAgo);
-  let ran = false;
-  let error;
-  try { withFileLock(registry, () => { ran = true; }, { timeoutMs: 0, staleMs: 30 * 60 * 1000 }); } catch (e) { error = e; }
-  expect(ran).toBe(false);
-  expect(error.code).toBe('ELOCKTIMEOUT');
-  // A holder that keeps touching is never stolen, even with the default window, and its own release still works.
-  fs.rmdirSync(lock);
-  withFileLock(registry, ({ touch }) => {
-    fs.utimesSync(lock, new Date(0), new Date(0));
-    touch();
-    expect(Date.now() - fs.statSync(lock).mtimeMs).toBeLessThan(5000);
-    expect(() => withFileLock(registry, () => {}, { timeoutMs: 0 })).toThrow('timed out acquiring');
-  });
-  expect(fs.existsSync(lock)).toBe(false);
-  // A holder whose lock was taken over must learn it, never refresh the new owner's lock.
-  let lost;
-  expect(() => withFileLock(registry, ({ touch }) => {
-    fs.rmSync(lock, { recursive: true });
-    expect(() => touch()).toThrow('lost');
-    fs.mkdirSync(lock);
-    try { touch(); } catch (e) { lost = e; }
-    fs.rmdirSync(lock);
+  expect(nested.code).toBe('ELOCKTIMEOUT');
+  // A holder reclaimed meanwhile (here: its entry replaced by another owner's) must not commit over the new owner.
+  const foreign = { owner: 'other-host:1:abc', path: registry, pid: null, heartbeatAt: new Date().toISOString() };
+  let committed = false;
+  expect(() => updateRegistry(registry, (entries) => {
+    const dir = path.join(lockRoot, fs.readdirSync(lockRoot).find((n) => !n.includes('.gone-')));
+    fs.writeFileSync(path.join(dir, 'lock.json'), JSON.stringify(foreign));
+    committed = true;
+    return [...entries, { agent: 'late' }];
   })).toThrow('lost');
-  expect(lost.code).toBe('ELOCKLOST');
+  expect(committed).toBe(true);
+  expect(readRegistry(registry)).toEqual([{ agent: 'a' }]); // the lost holder's write never landed
+  // …and the new owner's lock is still standing.
+  const dirs = fs.readdirSync(lockRoot);
+  expect(dirs).toHaveLength(1);
+  expect(JSON.parse(fs.readFileSync(path.join(lockRoot, dirs[0], 'lock.json'), 'utf8')).owner).toBe(foreign.owner);
 });
 it('reports unknown, refuses bad usage and keeps help side effect free', () => {
   const collect = (options) => collectFreeScope({ ...options, repos: ['bad/repo'] });

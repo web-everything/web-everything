@@ -1,10 +1,14 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { main } from '../held-cards-io.mjs';
+import { lockDirFor, readLockEntry } from '../readiness/file-locks.mjs';
+import { lockRootFor } from '../readiness/with-lock.mjs';
 
+/** The lock dir the shared primitive keeps for `file` (exists only while the lock is held). */
+const lockDir = (file) => lockDirFor(lockRootFor(file), path.resolve(file));
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 function harness({ load = 1, fail = '', count = 1 } = {}) {
@@ -73,7 +77,7 @@ process.exitCode = await main(['add', '--title=' + process.argv[2]], { writeFile
     const numbers = [...h.text().matchAll(/^(\d+)\. \*\*(\w+)\./gm)].map(m => [Number(m[1]), m[2]]);
     expect(numbers.map(([, title]) => title).sort()).toEqual(['Alpha', 'Beta', 'Delta', 'First', 'Gamma', 'Second']);
     expect(new Set(numbers.map(([num]) => num)).size).toBe(6);
-    expect(fs.existsSync(`${h.list}.lock`)).toBe(false);
+    expect(fs.existsSync(lockDir(h.list))).toBe(false);
   }, 20000);
   it('saves status and detects growth on the next observation', async () => {
     const h = harness();
@@ -132,36 +136,39 @@ process.exitCode = await main(['add', '--title=' + process.argv[2]], { writeFile
     for (const arg of ['acquire', 'commit', 'open-pr', 'release']) expect(h.matching(arg)).toHaveLength(1);
     expect(h.matching('file-item')).toHaveLength(2);
     expect(h.text().match(/FILED/g)).toHaveLength(2);
-    expect(fs.existsSync(`${h.list}.filing.lock`)).toBe(false);
+    expect(fs.existsSync(lockDir(`${h.list}.filing`))).toBe(false);
   });
-  it('stops and still releases its lane when its filing lock was taken over mid-run', async () => {
+  it('stops and still releases its lane when its filing lock was reclaimed mid-run, leaving the new owner\'s lock standing', async () => {
     const h = harness();
     const exec = h.deps.exec;
+    const foreign = { owner: 'other-host:1:abc', path: `${h.list}.filing`, pid: null, heartbeatAt: new Date().toISOString() };
     h.deps.exec = (bin, args, options) => {
       if (args.includes('file-item') && args.includes('--title=First')) {
-        // Another run reclaimed the lock as stale and took it: a different owner now holds the lock path.
-        const lock = `${h.list}.filing.lock`;
-        fs.rmSync(lock, { recursive: true });
-        fs.mkdirSync(lock);
-        fs.writeFileSync(path.join(lock, 'owner'), JSON.stringify({ nonce: 'someone-else', pid: 1, host: 'other' }));
+        // Another run reclaimed the (expired) lease and now owns the lock: a different owner is on its entry.
+        fs.writeFileSync(path.join(lockDir(`${h.list}.filing`), 'lock.json'), JSON.stringify(foreign));
       }
       return exec(bin, args, options);
     };
-    // Linux reuses a freed inode number, so pin it: the takeover must be caught by the owner token, never the inode.
-    const realStat = fs.statSync;
-    const spy = vi.spyOn(fs, 'statSync').mockImplementation((p, ...rest) => {
-      const st = realStat(p, ...rest);
-      return String(p) === `${h.list}.filing.lock` && st ? Object.assign(Object.create(Object.getPrototypeOf(st)), st, { ino: 424242 }) : st;
-    });
     const before = h.text();
-    try { expect(await h.run(['file', '--blocking'])).toBe(1); } finally { spy.mockRestore(); }
+    expect(await h.run(['file', '--blocking'])).toBe(1);
     expect(h.errors.join('')).toContain('lost');
     expect(h.matching('open-pr')).toHaveLength(0);
     expect(h.matching('release')).toHaveLength(1);
     expect(h.text()).toBe(before);
     // The first run's release must leave the second owner's lock standing.
-    expect(fs.existsSync(`${h.list}.filing.lock`)).toBe(true);
-    fs.rmSync(`${h.list}.filing.lock`, { recursive: true });
+    expect(JSON.parse(fs.readFileSync(path.join(lockDir(`${h.list}.filing`), 'lock.json'), 'utf8')).owner).toBe(foreign.owner);
+  });
+  it('refreshes the filing lease before every subprocess, so a long run is never reclaimed', async () => {
+    const h = harness();
+    const exec = h.deps.exec;
+    const beats = [];
+    h.deps.exec = (bin, args, options) => {
+      if (args.includes('file-item')) beats.push(readLockEntry(lockRootFor(`${h.list}.filing`), path.resolve(`${h.list}.filing`)).heartbeatAt);
+      return exec(bin, args, options);
+    };
+    expect(await h.run(['file', '--blocking'])).toBe(0);
+    expect(beats).toHaveLength(2);
+    expect(beats.every(at => Date.now() - Date.parse(at) < 60_000)).toBe(true);
   });
   it('files each held card once when several processes run file at the same moment', async () => {
     const h = harness();
@@ -190,7 +197,7 @@ process.exitCode = await main(['file', '--blocking'], { exec });
     expect(calls.filter(call => call === 'file-item')).toHaveLength(2);
     expect(calls.filter(call => call === 'open-pr')).toHaveLength(1);
     expect(h.text().match(/FILED/g)).toHaveLength(2);
-    expect(fs.existsSync(`${h.list}.filing.lock`)).toBe(false);
+    expect(fs.existsSync(lockDir(`${h.list}.filing`))).toBe(false);
   }, 30000);
   it('continues after an item failure and leaves that item unmarked', async () => {
     const h = harness({ fail: 'item' });

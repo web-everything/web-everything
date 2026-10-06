@@ -8,13 +8,14 @@
  *       lock root, proving mkdir is the race gate and reserve applies the decision end-to-end.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, utimesSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { createHash } from 'node:crypto';
 import {
-  DEFAULT_LEASE_MINUTES, lockIdFor, parseLockEntry, makeLockEntry, isLeaseExpired,
+  DEFAULT_LEASE_MINUTES, ENTRYLESS_LOCK_DIR_GRACE_MS, lockIdFor, parseLockEntry, makeLockEntry, isLeaseExpired,
   reclaimDecision, wasReclaimed, planReservations,
-  acquireLockDir, readLockEntry, heartbeat, releaseLockDir, reserve, lockDirFor,
+  acquireLockDir, readLockEntry, heartbeat, heartbeatOwn, releaseLockDir, releaseLockDirIf, reserve, lockDirFor,
 } from '../file-locks.mjs';
 
 const T0 = Date.parse('2026-06-28T12:00:00.000Z');
@@ -301,5 +302,96 @@ describe('reserve — a lock dir with no entry yet is a winner still writing, no
       expect(r2.ok).toBe(true);
       expect(readLockEntry(root, 'slot-0').owner).toBe('LATE');
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+// #4017 — a stalled owner or reclaimer must never delete or overwrite a replacement owner's live lock.
+describe('reclaim never destroys a lock another owner has taken since', () => {
+  let root;
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'we-locks-cas-')); });
+  afterEach(() => { rmSync(root, { recursive: true, force: true }); });
+
+  it('a stalled acquirer (mkdir won, entry not yet written) loses to the owner that reclaimed its dir — and leaves that owner\'s lock intact', () => {
+    const stalledEntry = makeLockEntry('A', 'p', iso(T0), 100);
+    let reclaim;
+    const won = acquireLockDir(root, 'p', stalledEntry, {
+      afterMkdir: () => {
+        // A stalls past the entry-less grace; B reclaims the dir and writes ITS entry first.
+        const old = (Date.now() - ENTRYLESS_LOCK_DIR_GRACE_MS - 5_000) / 1000;
+        utimesSync(lockDirFor(root, 'p'), old, old);
+        reclaim = reserve(root, 'p', 'B', Date.now(), new Date().toISOString(), 200);
+      },
+    });
+    expect(reclaim).toMatchObject({ ok: true, heldBy: 'B' });
+    expect(won).toBe(false);                                  // A's exclusive entry write failed: it lost
+    expect(readLockEntry(root, 'p').owner).toBe('B');         // B's entry not overwritten…
+    expect(existsSync(lockDirFor(root, 'p'))).toBe(true);     // …and B's dir not removed
+  });
+
+  it('a stalled acquirer whose dir was reclaimed AWAY (not yet re-taken) also loses without error', () => {
+    const won = acquireLockDir(root, 'p', makeLockEntry('A', 'p', iso(T0), 100), {
+      afterMkdir: () => rmSync(lockDirFor(root, 'p'), { recursive: true }),
+    });
+    expect(won).toBe(false);
+  });
+
+  it('releaseLockDirIf removes only the entry the caller judged', () => {
+    reserve(root, 'p', 'A', T0, iso(T0), 100);
+    expect(releaseLockDirIf(root, 'p', { owner: 'B' })).toBe(false);                // someone else's: left standing
+    expect(readLockEntry(root, 'p').owner).toBe('A');
+    expect(releaseLockDirIf(root, 'p', { owner: 'A', heartbeatAt: iso(T0 + 1) })).toBe(false); // refreshed since it was read
+    expect(readLockEntry(root, 'p').owner).toBe('A');
+    expect(releaseLockDirIf(root, 'p', { owner: 'A', heartbeatAt: iso(T0) })).toBe(true);
+    expect(existsSync(lockDirFor(root, 'p'))).toBe(false);
+    expect(releaseLockDirIf(root, 'p', { owner: 'A' })).toBe(false);                // already gone
+    expect(readdirSync(root)).toEqual([]);                                          // nothing left inside the lock root…
+    expect(readdirSync(dirname(root)).filter((n) => n.includes('.gone-'))).toEqual([]); // …and no tombstone beside it
+  });
+
+  it('heartbeatOwn refreshes the owner\'s lease without rewriting lock.json, and refuses a lock that is no longer the caller\'s', () => {
+    reserve(root, 'p', 'A', T0, iso(T0), 100);
+    const raw = () => readFileSync(join(lockDirFor(root, 'p'), 'lock.json'), 'utf8');
+    const before = raw();
+    expect(heartbeatOwn(root, 'p', 'A', iso(T0 + 60_000))).toBe(true);
+    expect(readLockEntry(root, 'p').heartbeatAt).toBe(iso(T0 + 60_000));
+    expect(raw()).toBe(before);                                                    // the entry itself is immutable
+    expect(heartbeatOwn(root, 'p', 'B', iso(T0 + 90_000))).toBe(false);
+    expect(readLockEntry(root, 'p').heartbeatAt).toBe(iso(T0 + 60_000));
+    releaseLockDir(root, 'p');
+    expect(heartbeatOwn(root, 'p', 'A', iso(T0))).toBe(false);                     // gone
+  });
+
+  it('a stalled former owner\'s heartbeat file written into a reclaimed dir is inert: it neither revives nor rewrites the new owner\'s lock', () => {
+    reserve(root, 'p', 'A', T0, iso(T0), 100);
+    heartbeatOwn(root, 'p', 'A', iso(T0 + 1000));
+    const after = T0 + LEASE_MS + 5000;
+    expect(reserve(root, 'p', 'B', after, iso(after), 200)).toMatchObject({ ok: true, reason: 'lease-expired' });
+    const bEntry = readFileSync(join(lockDirFor(root, 'p'), 'lock.json'), 'utf8');
+    // A woke from its stall just after its owner check passed and writes its heartbeat file into B's dir.
+    const aBeat = `hb.${createHash('sha256').update('A').digest('hex').slice(0, 16)}`;
+    writeFileSync(join(lockDirFor(root, 'p'), aBeat), iso(after + 1));
+    expect(readFileSync(join(lockDirFor(root, 'p'), 'lock.json'), 'utf8')).toBe(bEntry);
+    expect(readLockEntry(root, 'p')).toMatchObject({ owner: 'B', heartbeatAt: iso(after) });
+  });
+
+  it('reserve reclaim with a refreshed holder: a heartbeatOwn refresh keeps the lease alive', () => {
+    reserve(root, 'p', 'A', T0, iso(T0), 100);
+    const near = T0 + LEASE_MS - 1000;
+    heartbeatOwn(root, 'p', 'A', iso(near));
+    const r = reserve(root, 'p', 'B', T0 + LEASE_MS + 5000, iso(T0 + LEASE_MS + 5000), 200);
+    expect(r).toMatchObject({ ok: false, reason: 'held', heldBy: 'A' });
+  });
+
+  it('reserve: a reclaimer that read the SAME stale entry as a faster reclaimer leaves the faster one\'s lock standing', () => {
+    reserve(root, 'p', 'A', T0, iso(T0), 100);                // A: stale holder both reclaimers read
+    // The probe runs right after B reads A's entry and before B removes it: C (faster) reclaims A and takes the lock.
+    const probe = () => {
+      releaseLockDir(root, 'p');
+      reserve(root, 'p', 'C', T0 + LEASE_MS + 2, iso(T0 + LEASE_MS + 2), 300);
+      return 'dead';                                          // B's verdict on A: reclaimable
+    };
+    const r = reserve(root, 'p', 'B', T0 + LEASE_MS + 1, iso(T0 + LEASE_MS + 1), 200, probe);
+    expect(r).toMatchObject({ ok: false, reason: 'held', heldBy: 'C' });
+    expect(readLockEntry(root, 'p').owner).toBe('C');         // C's live lock was NOT deleted by B
   });
 });
