@@ -123,11 +123,20 @@
  * caller that FORGETS to pass the resolved option gets the strict gate, never the permissive one. The whole
  * defect class this item closes is a default that reads as "allow" when the answer is unknown.
  */
-import { describeTimeoutRetry } from './gate-timeout-retry.mjs';
+import { describeIsolatedRetry } from './gate-timeout-retry.mjs';
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { constants } from 'node:os';
 import { boundFailureDetails } from './verify-failures.mjs';
+
+/** 75c — the isolated-retry audit fields a record carries forward to every reader (marker, check, verdict). */
+function retryAuditOf(rec) {
+  return {
+    ...(rec?.retriedFailures?.length ? { retriedFailures: rec.retriedFailures } : {}),
+    ...(rec?.retriedFailures?.length && rec.isolatedRetry ? { isolatedRetry: rec.isolatedRetry } : {}),
+    ...(rec?.retriedTimeouts?.length ? { retriedTimeouts: rec.retriedTimeouts } : {}),
+  };
+}
 
 /** The marker lives in the lane clone's `.git/` (like `.lane-lease`): never tracked, never `git clean`-ed,
  *  invisible to `git status`, one-per-lane. */
@@ -282,7 +291,7 @@ export function verificationInfrastructureFailure({ exitCode, signal, timedOutPh
   };
 }
 
-export function verifyFinishBody(prev, { finishedAt, exitCode, sha, treeHash, suites, signal, infrastructure, failureDetails, retriedTimeouts } = {}) {
+export function verifyFinishBody(prev, { finishedAt, exitCode, sha, treeHash, suites, signal, infrastructure, failureDetails, retriedTimeouts, retriedFailures, isolatedRetry } = {}) {
   const base = prev && typeof prev === 'object' ? prev : {};
   const failure = infrastructure || verificationInfrastructureFailure({ exitCode, signal });
   const green = exitCode != null && Number(exitCode) === 0 && !failure;
@@ -290,7 +299,7 @@ export function verifyFinishBody(prev, { finishedAt, exitCode, sha, treeHash, su
     sha: sha ?? base.sha ?? null,
     status: failure ? 'infrastructure-failure' : green ? 'green' : 'red',
     ...(failure ? { infrastructure: failure } : {}),
-    ...(retriedTimeouts?.length ? { retriedTimeouts } : {}),
+    ...retryAuditOf({ retriedTimeouts, retriedFailures, isolatedRetry }),
     // A test verdict only: an infrastructure failure produced no verdict, so it carries no failing-test names.
     ...(!green && !failure && failureDetails ? { failureDetails: boundFailureDetails(failureDetails) } : {}),
     startedAt: base.startedAt ?? null,
@@ -530,8 +539,8 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
 
   if (matches && rec.status === 'green') {
     return { ok: true, status: 'green', reason: 'verified',
-      ...(rec.retriedTimeouts?.length ? { retriedTimeouts: rec.retriedTimeouts } : {}),
-      detail: `lane verified green for ${String(headSha).slice(0, 8)}${carriedForwardNote} (suites: ${rec.suites || 'recorded'}).${describeTimeoutRetry(rec.retriedTimeouts)}` };
+      ...retryAuditOf(rec),
+      detail: `lane verified green for ${String(headSha).slice(0, 8)}${carriedForwardNote} (suites: ${rec.suites || 'recorded'}).${describeIsolatedRetry(rec)}` };
   }
   if (matches && rec.status === 'running') {
     const abandoned = isVerifyAbandoned(rec, nowMs, ttlMs);
@@ -567,9 +576,9 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
   if (matches && rec.status === 'red') {
     const diagnostic = exactShaMatch ? {
       ...(rec.failureDetails ? { failureDetails: boundFailureDetails(rec.failureDetails) } : {}),
-      ...(rec.retriedTimeouts?.length ? { retriedTimeouts: rec.retriedTimeouts } : {}),
+      ...retryAuditOf(rec),
     } : {};
-    const retryDetail = describeTimeoutRetry(diagnostic.retriedTimeouts);
+    const retryDetail = describeIsolatedRetry(diagnostic);
     if (requireVerified) {
       return { ok: false, status: 'red', ...diagnostic, reason: 'verify-red', detail: `verification for ${String(headSha).slice(0, 8)} recorded a RED result (exit ${rec.exitCode ?? '?'}) — fix the failure and re-run \`node scripts/verify-lane.mjs\`.${retryDetail}` };
     }

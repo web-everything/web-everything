@@ -64,8 +64,8 @@ import { RUNNER_LOCK_ROOT, runnerLeaseStatus, probeRunnerLeaseLiveness } from '.
 import { VERIFY_DAEMON_LEASE_KEY } from '../skills-src/conveyor/verify-daemon.mjs';
 import { readLockEntry } from './readiness/file-locks.mjs';
 import { spawn } from 'node:child_process';
-import { createFailureCollector } from './lib/verify-failures.mjs';
-import { timeoutRetryFiles, describeTimeoutRetry, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
+import { createFailureCollector, mergeFailureDetails } from './lib/verify-failures.mjs';
+import { isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
 import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlinkSync, lstatSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
@@ -369,8 +369,12 @@ const cacheHit = MODE !== 'run' && preStart && !preStart.corrupt
   && preStart.suites === GATE;
 
 if (cacheHit) {
-  const cachedDetail = `green for ${headSha.slice(0, 8)} — working tree unchanged since that verification (content hash + gate match); no new run needed.${describeTimeoutRetry(preStart.retriedTimeouts)}`;
-  const cachedRetry = preStart.retriedTimeouts?.length ? { retriedTimeouts: preStart.retriedTimeouts } : {};
+  const cachedDetail = `green for ${headSha.slice(0, 8)} — working tree unchanged since that verification (content hash + gate match); no new run needed.${describeIsolatedRetry(preStart)}`;
+  const cachedRetry = {
+    ...(preStart.retriedFailures?.length ? { retriedFailures: preStart.retriedFailures } : {}),
+    ...(preStart.isolatedRetry ? { isolatedRetry: preStart.isolatedRetry } : {}),
+    ...(preStart.retriedTimeouts?.length ? { retriedTimeouts: preStart.retriedTimeouts } : {}),
+  };
   const cachedPhases = preStart.phases !== undefined ? { phases: preStart.phases } : {};
   if (MODE === 'request') {
     // Leave the marker exactly as it is: never overwrite a still-accurate terminal record with a fresh
@@ -469,7 +473,8 @@ process.stderr.write(`⏱ gate execution starting (suites: ${GATE})\n`);
 let exitCode = 0;
 let signal = null;
 let failureDetails;
-let retriedTimeouts = [];
+let retriedFailures = [];
+let isolatedRetry = null;
 async function runGate(command, args) {
   const collector = createFailureCollector({ cwd: REPO });
   const output = { stdout: '', stderr: '' };
@@ -526,33 +531,51 @@ async function timedRunGate(phase, command, args) {
 }
 const gateStarted = performance.now();
 let gateMs;
+// 75b — run every phase of the default gate even after a red one (`runAllPhases`), so a red test phase can no longer
+// hide a scan or standards failure (#3990: a red vitest half skipped repo-scan, and a literal U+200B reached CI).
+// Only an infrastructure failure (a signal / killed runner) stops early: a dead runner must not run more phases.
+const runAllPhases = verifySetting('runAllPhases', process.env) === true;
+const isolatedRetryMode = verifySetting('isolatedRetry', process.env);
+const phaseResults = [];
+const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
   let result = await timedRunGate(retryableGate ? 'vitestMs' : null, retryableGate ? resolvedGate.testCommand : GATE);
-  if (retryableGate && admission.ok && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
+  if (retryableGate && admission.ok && isolatedRetryMode !== 'off' && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
     // Edits during admission or test execution must also count as the change's own files.
     const changedNow = localChangedSet({ runGit: git });
-    retriedTimeouts = timeoutRetryFiles({ ...result.output, failureDetails: result.failureDetails,
+    // 75c — every failing file must be OUTSIDE the diff (an in-diff failure is never re-run away), the inventory
+    // complete, and at most 3 files. Timeouts and assertion failures alike (#3990's "303 ms vs 250 ms").
+    retriedFailures = isolatedRetryFailures({ ...result.output, failureDetails: result.failureDetails, mode: isolatedRetryMode,
       changedFiles: changedNow ? [...resolvedGate.decision.changedFiles, ...changedNow.changedFiles] : null, cwd: REPO });
-    if (retriedTimeouts.length) {
-      process.stderr.write(describeTimeoutRetry(retriedTimeouts).trim() + '\n');
+    if (retriedFailures.length) {
+      process.stderr.write(`Re-running ${retriedFailures.length} failing file(s) outside the diff once, alone: ${retriedFailures.map(f => `${f.file} (${f.kind})`).join(', ')}\n`);
       // Exact file filters, one worker, no related traversal, no passWithNoTests, and no second attempt.
       result = await timedRunGate('vitestMs', 'npx', ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism',
-        ...retriedTimeouts.map(file => `./${file}`)]);
+        ...retriedFailures.map(f => `./${f.file}`)]);
+      isolatedRetry = result.exitCode === 0 && !result.signal ? FLAKY_OUTSIDE_DIFF : STILL_RED_IN_ISOLATION;
     }
   }
+  phaseResults.push({ phase: 'vitest', result });
   // #3887 — the repo-scanning tests `vitest related` cannot select, scoped to the changed files (each command carries
   // its own VERIFY_SCAN_FILES). Before check:standards, so a scanner failure is reported with the tests.
-  if (retryableGate && result.exitCode === 0) {
+  if (retryableGate && continueAfter(result)) {
     for (const scanCommand of resolvedGate.scanCommands ?? []) {
       process.stderr.write(`⏱ repo-scanning tests (scoped to changed files): ${scanCommand.replace(/^VERIFY_SCAN_FILES='[^']*'/, 'VERIFY_SCAN_FILES=<changed files>')}\n`);
-      result = await timedRunGate('scanMs', scanCommand);
-      if (result.exitCode !== 0) break;
+      const scan = await timedRunGate('scanMs', scanCommand);
+      phaseResults.push({ phase: 'scan', result: scan });
+      if (!continueAfter(scan)) break;
     }
   }
-  if (retryableGate && result.exitCode === 0 && resolvedGate.standardsCommand) {
-    result = await timedRunGate('standardsMs', resolvedGate.standardsCommand);
+  if (retryableGate && resolvedGate.standardsCommand && phaseResults.every(p => continueAfter(p.result))) {
+    phaseResults.push({ phase: 'standards', result: await timedRunGate('standardsMs', resolvedGate.standardsCommand) });
   }
-  ({ exitCode, signal, failureDetails } = result);
+  // The verdict is the FIRST non-zero phase (an earlier red is never masked by a later green); failure details
+  // from every red phase are merged so each problem is visible in one run.
+  const red = phaseResults.filter(p => p.result.exitCode !== 0 || p.result.signal);
+  ({ exitCode, signal } = (red[0] ?? phaseResults.at(-1)).result);
+  failureDetails = red.length > 1
+    ? mergeFailureDetails(red.map(p => ({ phase: p.phase, details: p.result.failureDetails })))
+    : (red[0] ?? phaseResults.at(-1)).result.failureDetails;
 } catch (e) {
   signal = e?.signal || null;
   exitCode = Number.isFinite(e && e.status) ? e.status : 2;
@@ -564,9 +587,9 @@ try {
 const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'phase' : 'gate', phases: admissionPhases }, admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes });
 const phases = admissionFallback ? { ...builtPhases, admissionFallback } : builtPhases;
 
-const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }),
-  ...(retriedTimeouts.length ? { retriedTimeouts } : {}) };
-const retryDetail = describeTimeoutRetry(retriedTimeouts);
+const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
+const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
+const retryDetail = describeIsolatedRetry(retryAudit);
 
 const infrastructure = verificationInfrastructureFailure({ exitCode, signal });
 if (MODE === 'run') process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);

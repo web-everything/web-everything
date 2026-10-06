@@ -1003,13 +1003,16 @@ it('an unscopable default request refuses before stamping a runnable marker', ()
 });
 
 describe('local timeout-only retry under admission', () => {
-  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission } = {}) {
+  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission, scan = false, scanExit = 0 } = {}) {
     const files = truncated ? Array.from({ length: 21 }, (_, i) => `untouched-${i}.test.mjs`) : ['untouched-a.test.mjs', 'untouched-b.test.mjs'];
     // No trailing newline: a gate may end its stderr mid-line, and dispatch's markers must still start a line.
     const stderr = files.map((f, i) => ` FAIL  ${f} > case ${i}\n${mixed && i === 1 ? 'AssertionError: wrong value' : 'Error: Test timed out in 5000ms.'}\n`).join('').trimEnd();
     const stdout = ` Test Files  ${files.length} failed\n Tests  ${files.length} failed\n Duration  5.1s\n`;
     mkdirSync(join(dir, 'bin'));
     writeFileSync(join(dir, 'source.mjs'), 'export const x = 1;\n');
+    // 75b — a repo-scanning test (#3887) the default gate runs as its own phase for a changed source file.
+    const scanTest = 'scripts/lib/__tests__/review-policy.conformance.test.mjs';
+    if (scan) { mkdirSync(join(dir, 'scripts/lib/__tests__'), { recursive: true }); writeFileSync(join(dir, scanTest), '// scanner\n'); }
     for (const file of files) writeFileSync(join(dir, file), live ? `
 import './source.mjs';
 import { it } from ${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/dist/index.js'))};
@@ -1041,7 +1044,12 @@ if (args[0] === 'vitest' && args[1] === 'related') {
   process.stdout.write(${JSON.stringify(stdout)});
   process.exit(1);
 }
+if (args[0] === 'vitest' && args.some(a => a.includes('conformance'))) {
+  if (${scanExit}) process.stderr.write(' FAIL  scripts/lib/__tests__/review-policy.conformance.test.mjs > scans changed files\\n');
+  process.exit(${scanExit});
+}
 if (args[0] === 'vitest') process.exit(${retryExit});
+if (${standardsExit}) process.stdout.write('  error  invisible-characters: U+200B in source.mjs\\n');
 process.exit(${standardsExit});
 `;
     for (const name of ['npx', 'npm']) {
@@ -1099,8 +1107,9 @@ process.exit(${standardsExit});
     const result = f.invoke([`--gate=${gate}`, '--run-id=retry-proof']);
     expect(result.code).toBe(0);
     expect(result.json, result.stdout + result.stderr).toMatchObject({ status: 'green', retriedTimeouts: f.files });
-    expect(result.json.detail).toContain('timeout-only failures in untouched files');
-    expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'green', retriedTimeouts: f.files });
+    expect(result.json.detail).toContain('failures only in untouched files');
+    expect(result.json.detail).toContain('flaky-outside-diff');
+    expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'green', retriedTimeouts: f.files, isolatedRetry: 'flaky-outside-diff' });
     const calls = f.calls();
     expect(calls).toHaveLength(3);
     expect(calls[1].args).toEqual(['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', ...f.files.map(f => `./${f}`)]);
@@ -1195,21 +1204,86 @@ process.exit(${standardsExit});
     expect(f.calls()).toHaveLength(3);
   }, 15000);
 
+  // 75b — every red case still runs check:standards (the last call): a red test phase never skips it.
   it.each([
-    ['an edited failing file', { edited: true }, 1],
-    ['mixed failures', { mixed: true }, 1],
-    ['a second timeout', { retryExit: 1 }, 2],
-    ['truncated failure identities', { truncated: true }, 1],
-    ['standards failing after recovery', { standardsExit: 1 }, 3],
-  ])('keeps red for %s', (_, options, count) => {
+    ['an edited failing file', { edited: true }, 2, false],
+    ['mixed failures under the timeouts-only setting', { mixed: true, env: { WE_VERIFY_ISOLATED_RETRY: 'timeouts' } }, 2, false],
+    ['a second failure alone', { retryExit: 1 }, 3, true],
+    ['truncated failure identities', { truncated: true }, 2, false],
+    ['standards failing after recovery', { standardsExit: 1 }, 3, true],
+  ])('keeps red for %s', (_, { env, ...options }, count, retried) => {
     const f = fixture(options);
-    const result = f.invoke();
+    const result = f.invoke([], env);
     expect(result.code).toBe(2);
     expect(result.json.status).toBe('red');
     expect(JSON.parse(readFileSync(marker(), 'utf8')).status).toBe('red');
-    expect(f.calls()).toHaveLength(count);
-    if (count === 1) expect(result.json.retriedTimeouts).toBeUndefined();
+    const calls = f.calls();
+    expect(calls).toHaveLength(count);
+    expect(calls.at(-1).args.slice(0, 2)).toEqual(['run', 'check:standards']);
+    if (!retried) expect(result.json.retriedTimeouts).toBeUndefined();
     else expect(result.json.retriedTimeouts).toEqual(f.files);
+    if (options.retryExit) expect(result.json.isolatedRetry).toBe('still-red');
+  });
+
+  // 75c (1) — #3990's "303 ms vs 250 ms": an ASSERTION failure outside the diff used to disable the retry entirely.
+  it('an out-of-diff failure that passes alone is green, recorded flaky-outside-diff', () => {
+    const f = fixture({ mixed: true });
+    const result = f.invoke();
+    expect(result.code, result.stdout + result.stderr).toBe(0);
+    const expected = { status: 'green', isolatedRetry: 'flaky-outside-diff',
+      retriedFailures: [{ file: f.files[0], kind: 'timeout' }, { file: f.files[1], kind: 'assertion' }] };
+    expect(result.json).toMatchObject(expected);
+    expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject(expected);
+    expect(result.json.detail).toContain('flaky-outside-diff');
+    expect(f.calls()[1].args).toEqual(['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', ...f.files.map(file => `./${file}`)]);
+    const read = f.invoke(['check']);
+    expect(read.json).toMatchObject({ isolatedRetry: 'flaky-outside-diff' });
+  });
+
+  // 75c (2) — a failure in a file the change edited is never re-run away.
+  it('an in-diff failure is red with no isolated re-run', () => {
+    const f = fixture({ edited: true, mixed: true });
+    const result = f.invoke();
+    expect(result.code).toBe(2);
+    expect(result.json.status).toBe('red');
+    expect(result.json.retriedFailures).toBeUndefined();
+    expect(result.json.isolatedRetry).toBeUndefined();
+    expect(f.calls().some(call => call.args[0] === 'vitest' && call.args[1] === 'run')).toBe(false);
+  });
+
+  // 75b (3) — #3990 round 1: a red vitest half skipped repo-scan and standards, hiding a literal U+200B.
+  it('red vitest phase still runs scan and standards', () => {
+    const f = fixture({ edited: true, scan: true, scanExit: 1, standardsExit: 1 });
+    const result = f.invoke();
+    expect(result.code).toBe(2);
+    const calls = f.calls();
+    expect(calls.map(call => call.args.slice(0, 2))).toEqual([['vitest', 'related'], ['vitest', 'run'], ['run', 'check:standards']]);
+    expect(calls[1].args.some(a => a.includes('review-policy.conformance'))).toBe(true);
+    const finished = JSON.parse(readFileSync(marker(), 'utf8'));
+    expect(finished.status).toBe('red');
+    expect(finished.exitCode).toBe(1); // the FIRST red phase decides the verdict
+    expect(finished.phases.outcomes).toMatchObject({ vitest: { result: 'fail' }, scan: { result: 'fail' },
+      standards: { result: 'fail', reason: 'invisible-characters' } });
+    expect(finished.failureDetails.tests.map(t => t.file)).toEqual(expect.arrayContaining([f.files[0], 'scripts/lib/__tests__/review-policy.conformance.test.mjs']));
+    expect(finished.failureDetails.summary).toContain('invisible-characters');
+    expect(result.json.failureDetails.summary).toContain('[vitest]');
+  });
+
+  it('runAllPhases off keeps the old stop-at-first-red behaviour (declared setting)', () => {
+    const f = fixture({ edited: true, standardsExit: 1 });
+    const result = f.invoke([], { WE_VERIFY_RUN_ALL_PHASES: '0' });
+    expect(result.code).toBe(2);
+    expect(f.calls()).toHaveLength(1);
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).phases.outcomes.standards.result).toBe('skipped');
+  });
+
+  it('a killed test phase stops the gate: no scan or standards after an infrastructure failure', () => {
+    const f = fixture({ scan: true });
+    // The related run dies by signal; nothing after it may run.
+    writeFileSync(join(dir, 'bin', 'npx'), `#!/bin/sh\necho '{"args":["killed"]}' >> calls.jsonl\nkill -KILL $$\n`);
+    const result = f.invoke();
+    expect(result.code).toBe(3);
+    expect(f.calls()).toHaveLength(1);
   });
 });
 

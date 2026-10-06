@@ -3,10 +3,31 @@ import { stripVTControlCharacters } from 'node:util';
 
 export const MAX_TIMEOUT_LOG_BYTES = 2 * 1024 * 1024;
 
-/** A complete default-reporter inventory is required; a timeout substring is never enough. */
-export function timeoutRetryFiles({ stdout = '', stderr = '', failureDetails, changedFiles, cwd }) {
+/** 75c — more failing files than this is not a flake; the gate stays red with no retry. */
+export const MAX_ISOLATED_RETRY_FILES = 3;
+
+/** The marker label for a retry that passed alone: every failure was in an untouched file and went green in isolation. */
+export const FLAKY_OUTSIDE_DIFF = 'flaky-outside-diff';
+/** The marker label for a retry that still failed alone: the gate stays red. */
+export const STILL_RED_IN_ISOLATION = 'still-red';
+
+/**
+ * 75c — which failing test files may be re-run once, alone, before the gate is declared red. Returns one
+ * `{file, kind}` per file (`kind`: 'timeout' when every failure in the file was a Vitest timeout, else
+ * 'assertion'), or `[]` when no retry is allowed.
+ *
+ * A complete default-reporter inventory is required: not truncated, no suite/unhandled errors, and the counted
+ * failures must match the summary lines and the collector's identities. EVERY failing file must be outside the
+ * change's own edited set: an in-diff failure is never re-run away.
+ *
+ * `mode`: 'untouched' (any failure kind, at most `maxFiles` files), 'timeouts' (the pre-75c rule: only timeouts,
+ * no file cap), 'off' (never).
+ */
+export function isolatedRetryFailures({ stdout = '', stderr = '', failureDetails, changedFiles, cwd, mode = 'untouched', maxFiles = MAX_ISOLATED_RETRY_FILES }) {
+  if (mode !== 'untouched' && mode !== 'timeouts') return [];
   if (!failureDetails || failureDetails.truncated || !Array.isArray(failureDetails.tests) || !Array.isArray(changedFiles)
       || Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > MAX_TIMEOUT_LOG_BYTES) return [];
+  const timeoutsOnly = mode === 'timeouts';
   const localPath = (file) => {
     const path = normalize(isAbsolute(file) ? relative(cwd, file) : file);
     return path === '..' || path.startsWith('../') || isAbsolute(path) ? null : path;
@@ -31,24 +52,63 @@ export function timeoutRetryFiles({ stdout = '', stderr = '', failureDetails, ch
       const file = localPath(match[1]);
       if (!file || edited.has(file)) return [];
       // Vitest groups consecutive FAIL headers sharing one error body.
-      if (current.some(f => f.timeout)) current = [];
-      const failure = { file, name: match[2], timeout: false };
+      if (current.some(f => f.errored)) current = [];
+      const failure = { file, name: match[2], errored: false, timeout: false, other: false };
       current.push(failure);
       failures.push(failure);
     } else if (current.length && /^(?:\w*Error|Caused by):/.test(line)) {
-      if (!/^Error: Test timed out in \d+ms\./.test(line)) return [];
-      for (const failure of current) failure.timeout = true;
+      const timeout = /^Error: Test timed out in \d+ms\./.test(line);
+      if (!timeout && timeoutsOnly) return [];
+      for (const failure of current) {
+        failure.errored = true;
+        if (timeout) failure.timeout = true; else failure.other = true;
+      }
     }
   }
   const files = [...new Set(failures.map(f => f.file))];
   if (summaries !== 1 || fileSummaries !== 1 || !duration || !failures.length
       || failures.length !== failedCount || files.length !== failedFiles
-      || failures.some(f => !f.timeout)
+      || (timeoutsOnly && failures.some(f => !f.timeout))
+      || (!timeoutsOnly && files.length > maxFiles)
       || failureDetails.tests.length !== failures.length
       || failures.some(f => !failureDetails.tests.some(t => localPath(t.file) === f.file && t.name === f.name))) return [];
-  return files;
+  return files.map(file => ({
+    file,
+    kind: failures.filter(f => f.file === file).every(f => f.timeout && !f.other) ? 'timeout' : 'assertion',
+  }));
+}
+
+/** The pre-75c contract (timeout-only failures in untouched files), kept for its callers and tests. */
+export function timeoutRetryFiles(args) {
+  return isolatedRetryFailures({ ...args, mode: 'timeouts', maxFiles: Infinity }).map(f => f.file);
 }
 
 export function describeTimeoutRetry(files) {
   return files?.length ? ` Retried once serially after timeout-only failures in untouched files: ${files.join(', ')}.` : '';
+}
+
+/**
+ * One audit sentence for a marker / verdict / CLI result. Falls back to the pre-75c wording for an older
+ * record that carries only `retriedTimeouts`.
+ */
+export function describeIsolatedRetry(record) {
+  const failures = Array.isArray(record?.retriedFailures) ? record.retriedFailures : null;
+  if (!failures?.length) return describeTimeoutRetry(record?.retriedTimeouts);
+  const list = failures.map(f => `${f.file} (${f.kind})`).join(', ');
+  const outcome = record.isolatedRetry === FLAKY_OUTSIDE_DIFF
+    ? `each passed alone — recorded ${FLAKY_OUTSIDE_DIFF}; CI still runs the full suite`
+    : 'still failed alone — red';
+  return ` Retried once serially in isolation after failures only in untouched files: ${list}; ${outcome}.`;
+}
+
+/** The marker fields for one isolated retry (empty when none ran). */
+export function isolatedRetryAudit(retriedFailures, isolatedRetry) {
+  if (!retriedFailures?.length) return {};
+  const retriedTimeouts = retriedFailures.filter(f => f.kind === 'timeout').map(f => f.file);
+  return {
+    retriedFailures,
+    ...(isolatedRetry ? { isolatedRetry } : {}),
+    // Back-compat: older readers know only `retriedTimeouts`.
+    ...(retriedTimeouts.length ? { retriedTimeouts } : {}),
+  };
 }
