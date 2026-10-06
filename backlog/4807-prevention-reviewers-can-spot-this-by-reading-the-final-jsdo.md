@@ -3,9 +3,11 @@ bornAs: xezin1k
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/lib/isolation-provider.mjs", "we:scripts/lib/__tests__/isolation-provider.test.mjs", "we:scripts/operations/__tests__/codex-delivery-provider-sandbox.test.mjs", "we:scripts/operations/__tests__/codex-delivery-provider-sandbox-guards.test.mjs", "we:scripts/operations/__tests__/helpers/codex-sandbox-fixture.mjs", "we:.github/workflows/codex-sandbox-proof.yml", "we:scripts/operations/__tests__/codex-sandbox-proof-workflow.test.mjs"]
 dateOpened: "2026-10-01"
+dateStarted: "2026-10-06"
+dateResolved: "2026-10-06"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "90837f5123f59dc02e9af0d79a3c1b33cf0cd7fb"
 tags: []
