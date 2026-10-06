@@ -26,7 +26,7 @@ describe('health responder closed decision table', () => {
     for (const s of SMELLS) {
       const i = input(); i.episodes[0].smell = s.id; i.episodes[0].key = `${s.id}::${i.episodes[0].subject}`;
       i.config.smells = { [s.id]: true }; i.subjectFacts = {};
-      if (s.id === 'fix-loop-no-push') {
+      if (s.id === 'fix-loop-no-push' || s.id === 'load-flake-hold-no-pickup') {
         // Alert-only; this smell grants the responder no action authority.
         expect(s.action).toBe('alert');
         expect(Object.hasOwn(CATALOGUE, s.id)).toBe(false);
