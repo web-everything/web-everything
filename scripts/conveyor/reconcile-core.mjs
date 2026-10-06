@@ -2006,9 +2006,16 @@ export function planReconcile({
       }
       // xng7q1p: same-head mechanical retries never consume or rewrite heal markers.
       // All main-red, escalation and live-owner guards above retain precedence.
-      if (retryBudget?.confirmed < 2 && pr.timeoutRetry?.eligible && pr.timeoutRetry.head === pr.headRefOid && pr.timeoutRetry.pr === prNumber) {
+      // An infra-cancelled re-run is bounded by ALL attempts (confirmed + rejected/refused), so a re-run the API keeps
+      // rejecting falls through to ci-heal instead of being re-planned forever; ordinary timeouts keep confirmed-only.
+      // (No observed budget stays `undefined`, which never authorizes a re-run.)
+      const retrySpent = pr.timeoutRetry?.infraCancelled && retryBudget?.confirmed !== undefined
+        ? retryBudget.confirmed + (retryBudget.rejected ?? 0) : retryBudget?.confirmed;
+      if (retrySpent < (pr.timeoutRetry?.infraCancelled ? (pr.timeoutRetry.cap ?? 6) : 2) && pr.timeoutRetry?.eligible && pr.timeoutRetry.head === pr.headRefOid && pr.timeoutRetry.pr === prNumber) {
         dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', timeoutRetry: pr.timeoutRetry,
-          why: 'complete timeout inventory and unchanged dependency closure; independent retry budget' });
+          why: pr.timeoutRetry.infraCancelled
+            ? 'every red required check is infra-cancelled (cancelled / startup_failure / no runner) — mechanical re-run, no heal budget'
+            : 'complete timeout inventory and unchanged dependency closure; independent retry budget' });
         continue;
       }
       if (pr.timeoutRetry && !pr.timeoutRetry.eligible) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,

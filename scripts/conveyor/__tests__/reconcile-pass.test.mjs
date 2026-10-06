@@ -939,7 +939,7 @@ const xxPr = () => ({ number: 3336, headRefOid: XX_HEAD, headRefName: 'lane/3336
 const xxOptions = () => ({ repo: 'we', readPrs: () => [xxPr()], readAgents: () => [], enrich: a => a,
   readRequiredChecks: () => ({ checks: XX_REQUIRED }), enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
   enrichAlreadyLanded: prs => prs, enrichBaseRef: prs => prs, enrichSystemFix: prs => prs,
-  enrichFixClaims: prs => prs, resolveMainSha: () => null });
+  enrichFixClaims: prs => prs, resolveMainSha: () => null, enrichTimeouts: prs => prs });
 
 it('xxh4zw8 hydrates the crowded snapshot before planning same-tick recovery', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');

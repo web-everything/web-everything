@@ -325,7 +325,7 @@ describe('hard read deadlines', () => {
     const f = fixture({ records: [dispatch('live')] });
     const exec = vi.fn((file) => file === 'ps' ? 'node /driver/skills-src/conveyor/runner.mjs' : '[]');
     collectRunnerActivity({}, { ...f.io, listAgents: undefined, exec,
-      env: { WE_DISPATCH_LIST_TIMEOUT_MS: '0' } });
+      env: { WE_DISPATCH_LIST_TIMEOUT_MS: '0', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' } });
     expect(exec.mock.calls.find(([file]) => file === 'claude')[2]).toMatchObject({ timeout: 2000, killSignal: 'SIGKILL' });
   });
 });

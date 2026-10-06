@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	The CI-red recovery watcher (backlog x5uqim1, #4075/#3383), pass `ci-red-recovery-watch-we`. A PR whose required
+	check failed while main's own CI was red (or outage-cancelled) is refused by reconcile as `owed-ci-rerun`: "owed a
+	mechanical rebase onto main by scripts/conveyor/ci-red-recovery-watch.mjs". The manifest entry in
+	daemon-manifest.mjs declared this watcher but NO launchd template existed, so nothing ever installed it and those
+	PRs sat refused forever (live: PRs 3990/4019/4021 after the 2026-10-05 Actions outage). Shaped like
+	com.we.conveyor-pass-daemon.ci-red-recovery-watch-we, run from the wev-review-daemon clone (self-synced, so overlays
+	reach this pass too). Sibling repos: copy this file and change the pass name (the ProgramArguments entry after the
+	pass flag) to ci-red-recovery-watch-frontierui or ci-red-recovery-watch-plateau-app. (No double hyphen may appear
+	inside an XML comment, so the flag itself is not spelled out here.)
+	INSTALL (the operator, or a session the operator has said yes to):
+	  1. Replace <app-id>, <installation-id>, <path-to-private-key.pem> with the same GitHub App values the
+	     merge-orphan-sweep plist uses (never commit them):
+	       plutil -extract EnvironmentVariables.WE_GITHUB_APP_ID raw ~/Library/LaunchAgents/com.we.conveyor-pass-daemon.merge-orphan-sweep.plist
+	  2. cp this file to ~/Library/LaunchAgents/com.we.conveyor-pass-daemon.ci-red-recovery-watch-we.plist (drop `.example`)
+	  3. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.we.conveyor-pass-daemon.ci-red-recovery-watch-we.plist
+	CHECK: tail the log below.
+	STOP:  launchctl bootout gui/$(id -u)/com.we.conveyor-pass-daemon.ci-red-recovery-watch-we
+	-->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key>
+		<string>120000</string>
+		<key>PATH</key>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>WE_GITHUB_APP_ID</key>
+		<string>&lt;app-id&gt;</string>
+		<key>WE_GITHUB_APP_INSTALLATION_ID</key>
+		<string>&lt;installation-id&gt;</string>
+		<key>WE_GITHUB_APP_PRIVATE_KEY_PATH</key>
+		<string>&lt;path-to-private-key.pem&gt;</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.we.conveyor-pass-daemon.ci-red-recovery-watch-we</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin/node</string>
+		<string>/Users/nicolasgilbert/workspace/wev-review-daemon/skills-src/conveyor/pass-daemon.mjs</string>
+		<string>--pass=ci-red-recovery-watch-we</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor/pass-daemon.ci-red-recovery-watch-we.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor/pass-daemon.ci-red-recovery-watch-we.log</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/nicolasgilbert/workspace/wev-review-daemon</string>
+</dict>
+</plist>

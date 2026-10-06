@@ -598,7 +598,7 @@ describe('xng7q1p retry reservation and restart soak', () => {
     await flushTimeoutFollowups({ dir, repo: e.repo, now: () => t0,
       effects: { observe: (...args) => ({ ...observe(...args), open: false }) } });
     expect(readTimeoutHold({ ...e, dir })).toEqual({ status: 'refused', reason: 'retry-outcome-pending' });
-    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 0, pending: true });
+    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 0, rejected: 0, pending: true });
   }));
   it('confirms the last closed-PR observation and still retries owed filing after retirement', async () => harness(async (dir) => {
     const e = evidence(); await reservePending(dir, e);
@@ -635,11 +635,11 @@ describe('xng7q1p retry reservation and restart soak', () => {
     const e = evidence();
     for (let i = 0; i < 2; i++) writeFileSync(join(dir, `legacy-${i}.json`), JSON.stringify({ version: 1,
       evidence: { ...e, signature: `old-${i}` }, requests: [{ id: 0, target: { ...e.jobs[0], job: 20 + i }, status: 'confirmed' }] }));
-    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 2, pending: false });
+    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 2, rejected: 0, pending: false });
     expect(await dispatchTimeoutRetry(e, { dir, repo: e.repo, fileFollowup: async () => {},
       effects: { observe, request: () => { throw new Error('budget already spent'); } } }))
       .toMatchObject({ reason: 'timeout-retries-exhausted' });
-    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 2, pending: false });
+    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 2, rejected: 0, pending: false });
   }));
   it('different signatures on one head share two requests and a new head receives a fresh budget', async () => harness(async (dir) => {
     const e = evidence(); let requests = 0;
@@ -649,7 +649,7 @@ describe('xng7q1p retry reservation and restart soak', () => {
       expect(result.status).toBe(i < 2 ? 'requested' : 'refused');
     }
     expect(requests).toBe(2);
-    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 2, pending: false });
+    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 2, rejected: 0, pending: false });
     expect(await dispatchTimeoutRetry({ ...e, head: 'b'.repeat(40) }, opts)).toMatchObject({ status: 'requested' });
     expect(requests).toBe(3);
   }));

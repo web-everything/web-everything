@@ -23,7 +23,12 @@ export function readTimeoutBudget({ dir, ...evidence }) {
   try {
     dir ??= timeoutStateDir(); // resolved inside the guard: an unreadable lock root is "unreadable state", never a throw
     const requests = readTimeoutStates(evidence, dir).flatMap((state) => state.requests);
+    // `rejected` = requests GitHub refused (4xx) or whose job was no longer failed at the evidenced attempt. They spend
+    // no confirmed budget, but the planner counts them against the infra re-run cap so a persistently rejected re-run
+    // reaches ci-heal instead of being re-planned forever. An early `released` reservation (a failed observation or a
+    // stale head: nothing was ever sent) is transient and is NOT counted.
     return { confirmed: requests.filter((r) => r.status === 'confirmed').length,
+      rejected: requests.filter((r) => r.status === 'rejected' && !r.released).length,
       pending: requests.some((r) => r.status === 'pending') };
   } catch (error) { return { pending: true, reason: `timeout-state-unreadable:${error.message}` }; }
 }
