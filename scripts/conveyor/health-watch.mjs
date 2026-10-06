@@ -142,6 +142,17 @@ export function readRange(path, start, end) {
 
 // ── probes ───────────────────────────────────────────────────────────────────────────────────────────────────
 
+/** PURE-ish: the part of a just-rotated `<log>.1` we had not read (from byte `from`, whole lines only), capped. */
+export function readRotatedTail(path, from) {
+  try {
+    const size = statSync(path).size;
+    if (size <= from) return '';
+    const start = Math.max(from, size - MAX_READ_BYTES);
+    const text = readRangeBuf(path, start, size).toString('utf8');
+    return start > from ? text.slice(text.indexOf('\n') + 1) : text;
+  } catch { return ''; }
+}
+
 /** Incrementally read every `*.log` in the daemon logs dir from its cursor (bootstrap: the last 512 KB). */
 export function probeDaemonLogs(logsDir, cursors = {}) {
   const out = [];
@@ -152,8 +163,12 @@ export function probeDaemonLogs(logsDir, cursors = {}) {
     const name = f.replace(/\.log$/, '');
     const st = statSync(path);
     const cur = cursors[name];
-    const bootstrap = !cur || cur.ino !== st.ino || st.size < cur.size;
-    let start = bootstrap ? Math.max(0, st.size - BOOTSTRAP_TAIL_BYTES) : cur.size;
+    const rotated = !!cur && cur.ino === st.ino && st.size < cur.size;
+    const bootstrap = !cur || cur.ino !== st.ino || (st.size < cur.size && !rotated);
+    // 68b: copy-truncate rotation keeps the inode but shrinks the file; what we had not read yet is the tail of
+    // `<log>.1`, so read it first and then the fresh file from the top, losing no refusal lines.
+    const rotatedTail = rotated ? readRotatedTail(`${path}.1`, cur.size) : '';
+    let start = bootstrap ? Math.max(0, st.size - BOOTSTRAP_TAIL_BYTES) : rotated ? 0 : cur.size;
     if (st.size - start > MAX_READ_BYTES) start = st.size - MAX_READ_BYTES;
     // Consume only through the LAST complete line: a line still being written (no trailing newline yet) is left
     // for the next sample, so a refusal split across two reads is parsed whole, never dropped.
@@ -162,6 +177,7 @@ export function probeDaemonLogs(logsDir, cursors = {}) {
     const consumed = lastNl === -1 ? 0 : lastNl + 1;
     let text = buf.subarray(0, consumed).toString('utf8');
     if (start > 0 && (bootstrap || start !== cur?.size)) text = text.slice(text.indexOf('\n') + 1); // drop a partial first line
+    if (rotatedTail) text = rotatedTail + text;
     const passName = name;
     out.push({ name, mtimeMs: st.mtimeMs, sizeBytes: st.size, text, bootstrap, defaultIntervalMs: DAEMON_MANIFEST[passName]?.intervalMs });
     nextCursors[name] = { ino: st.ino, size: start + consumed };

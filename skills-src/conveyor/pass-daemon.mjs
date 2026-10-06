@@ -189,8 +189,24 @@ export async function waitForManifestEntry(passName, { manifest = DAEMON_MANIFES
  *  path). */
 export function spawnPassOnce({ script, args = [] }, { root = REPO_ROOT, log = console, env = process.env, spawnFn = spawn } = {}) {
   return new Promise((resolve) => {
-    const child = spawnFn(process.execPath, [join(root, script), ...args], { stdio: ['ignore', 'inherit', 'inherit'], env });
+    // 68b: the child's output is relayed line by line through this process's own (stamped, de-duplicated, rotated)
+    // console instead of inherited, so the big health-watch logs get timestamps and a size cap too.
+    const child = spawnFn(process.execPath, [join(root, script), ...args], { stdio: ['ignore', 'pipe', 'pipe'], env });
+    const relay = (stream, write) => {
+      if (!stream || typeof stream.on !== 'function') return () => {};
+      let pending = '';
+      stream.on('data', (chunk) => {
+        pending += String(chunk);
+        const parts = pending.split('\n');
+        pending = parts.pop();
+        for (const l of parts) write(l);
+      });
+      return () => { if (pending) { write(pending); pending = ''; } };
+    };
+    const flushOut = relay(child.stdout, (l) => log.log(l));
+    const flushErr = relay(child.stderr, (l) => log.error(l));
     child.on('exit', (code, signal) => {
+      flushOut(); flushErr();
       if (code !== 0) log.error(`pass-daemon: ${script} exited ${signal ? `on ${signal}` : `with code ${code}`}`);
       resolve({ code, signal });
     });

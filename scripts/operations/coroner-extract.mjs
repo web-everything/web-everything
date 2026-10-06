@@ -10,7 +10,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
-import { stripLogTimestamp } from '../lib/log-timestamp.mjs';
+import { expandRepeatedLines, stripLogTimestamp } from '../lib/log-timestamp.mjs';
 
 const MiB = 1024 * 1024;
 const MAX_LINE = 256 * 1024;
@@ -348,7 +348,16 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
     session.transcript = { entries: rows(data.lines), truncated: data.truncated, bytesRead: data.bytesRead };
     if (data.found) { sources.transcripts.found = true; sources.transcripts.count++; if (file === fallback) sources.projects.count++; }
   }
-  const log = (key, file) => { const data = read(file, { cap: positive(env.WE_CORONER_LOG_TAIL, 2 * MiB), tailOnly: true }); sources[key] = { found: data.found, count: data.lines.length }; return data.lines; };
+  // 68b: a size-rotated log keeps its older half in `<log>.1`, and collapsed repeats are replayed, so the counts
+  // are the same as if the log had never been rotated or de-duplicated.
+  const log = (key, file) => {
+    const cap = positive(env.WE_CORONER_LOG_TAIL, 2 * MiB);
+    const data = read(file, { cap, tailOnly: true });
+    const older = read(`${file}.1`, { cap, tailOnly: true });
+    const all = [...(older.found ? older.lines : []), ...data.lines].flatMap((l) => expandRepeatedLines(l).split('\n'));
+    sources[key] = { found: data.found || older.found, count: all.length };
+    return all;
+  };
   const verifyLines = log('verifyDaemon', paths.verify);
   const refusalLines = ['fix-dispatch-daemon.log', 'review-daemon.log'].flatMap((name) => log(name, join(paths.daemon, name)));
   const ledger = (name) => { const data = read(join(paths.admission, `${name}.jsonl`)); const entries = rows(data.lines); sources[name] = { found: data.found, count: entries.length }; return entries; };
