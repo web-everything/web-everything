@@ -775,7 +775,9 @@ export function reapStaleWaiters({ lockRoot, nowMs = Date.now(), ttlMs = WAITING
   const reaped = [];
   const kept = [];
   for (const { file, marker } of listWaitingFiles(lockRoot)) {
-    const verdict = classifyWaiter(marker, { nowMs, ttlMs, ...seams });
+    const verdict = isDeadOwnerWaiter(marker, seams)
+      ? { reap: true, reason: 'pid-dead' }
+      : classifyWaiter(marker, { nowMs, ttlMs, ...seams });
     const row = { owner: marker && marker.owner, lane: marker && marker.lane, requestedAt: marker && marker.requestedAt, reason: verdict.reason };
     if (!verdict.reap) { kept.push(row); continue; }
     if (apply) {
@@ -839,6 +841,14 @@ export function isRankableWaiter(marker, {
   return !classifyWaiter(marker, { nowMs, ttlMs, host, pidLiveness, ...seams }).reap;
 }
 
+/** Positive same-host evidence permits removal at any age; unknown liveness never does. */
+export function isDeadOwnerWaiter(marker, {
+  host = hostname(), pidLiveness = (pid) => probeSlotHolderLiveness(pid, process.pid),
+} = {}) {
+  return !!marker && Number.isInteger(marker.pid)
+    && (!marker.host || marker.host === host) && pidLiveness(marker.pid) === 'dead';
+}
+
 /**
  * Is `owner` the one waiter currently permitted to attempt a slot? True when either nobody else holds a live
  * waiting marker (including `owner`'s own — a caller that has not yet written one, or whose write raced,
@@ -900,7 +910,7 @@ export async function acquireSlotBlocking({
   pollMs = DEFAULT_POLL_MS, ceilingMs = DEFAULT_ADMISSION_CEILING_MS, leaseMinutes = ADMISSION_LEASE_MINUTES,
   stillWaitingLogMs = STILL_WAITING_LOG_MS,
   pid = process.pid, now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-  log = (m) => process.stderr.write(m), env = process.env,
+  log = (m) => process.stderr.write(m), env = process.env, ...seams
 }) {
   if (isAdmissionOff(env)) return { ok: false, slot: null, timedOut: false, disabled: true, waitedMs: 0 };
 
@@ -910,7 +920,7 @@ export async function acquireSlotBlocking({
   const fastSlots = resolveFastSlots(env);
   const slotOrder = slotOrderFor(jobKind, cap, fastSlots);
   // xaipsbs — every admission attempt first clears stale waiters, so debris never outlives the next caller.
-  reapStaleWaiters({ lockRoot, nowMs: startedAt, apply: true });
+  reapStaleWaiters({ lockRoot, nowMs: startedAt, apply: true, ...seams });
   // MECHANICAL FAIRNESS (#3383 card xb0iuxq) — mark BEFORE the first attempt, not only after it fails, so
   // even this caller's very first, otherwise-uncontended attempt is ranked against whoever else is ALREADY
   // waiting: a caller landing behind an older live waiter must never cut in front of it just because
@@ -922,11 +932,12 @@ export async function acquireSlotBlocking({
   try {
     for (;;) {
       const attempt = now();
+      reapStaleWaiters({ lockRoot, nowMs: attempt, apply: true, ...seams });
       if (attempt - startedAt >= ceilingMs) {
         log(`⚠⚠ heavy-command admission: HARD CEILING of ${Math.round(ceilingMs / 60_000)}m exceeded waiting for capacity (cap=${cap}) — a slot holder may be wedged; proceeding unslotted. Escape hatch: WE_HEAVY_ADMISSION=off.\n`);
         return { ok: false, slot: null, timedOut: true, ceilingHit: true, waitedMs: attempt - startedAt };
       }
-      if (isOldestLiveWaiter({ lockRoot, owner, nowMs: attempt, kind: jobKind })) {
+      if (isOldestLiveWaiter({ lockRoot, owner, nowMs: attempt, kind: jobKind, ...seams })) {
         const nowIso = new Date(attempt).toISOString();
         // `meta` carries the kind + acquire time so the release can record the hold duration by kind.
         const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null };
@@ -1131,7 +1142,7 @@ export function admissionStatus({ lockRoot, cap, nowMs = Date.now(), fastSlots =
   // `fastSlots` (card xkyw1x4): the heavy-admission CLI passes its fast-lane slots so they show as held / free;
   // other pools on these primitives (gh-throttle) have none.
   const held = heldSlots({ lockRoot, cap, fastSlots });
-  const waiting = listWaiting(lockRoot);
+  const waiting = listWaiting(lockRoot).filter((marker) => isRankableWaiter(marker, { nowMs, ...reapSeams }));
   // xaipsbs — `reaped` is what the reap has removed so far; `staleWaiting` is what it WOULD remove right now.
   const staleWaiting = reapStaleWaiters({ lockRoot, nowMs, apply: false, ...reapSeams }).reaped.length;
   const heavyHeld = held.filter((h) => h.slot < cap).length;
