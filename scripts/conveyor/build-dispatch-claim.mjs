@@ -60,9 +60,12 @@ export function acquireBuildDispatchClaim({
   repo = 'we', num, scope = [], owner = buildDispatchClaimOwner(), pid = process.pid,
   nowMs = Date.now(), nowIso = new Date(nowMs).toISOString(),
   leaseMinutes = DEFAULT_BUILD_DISPATCH_CLAIM_TTL_MINUTES, lockRoot = buildDispatchClaimRoot(),
+  replacesStamp,
 } = {}) {
   const resource = buildDispatchResource({ repo, num });
-  const meta = { repo, num: normNum(num), kind: 'build', scope: Array.isArray(scope) ? scope.map(String) : [], claimedAt: nowIso };
+  const meta = { repo, num: normNum(num), kind: 'build', scope: Array.isArray(scope) ? scope.map(String) : [], claimedAt: nowIso,
+    // A prepare claim records the card's stamp at spawn (`null` = unstamped) so its result can be told from it.
+    ...(replacesStamp !== undefined ? { replacesStamp } : {}) };
   const result = reserve(lockRoot, resource, owner, nowMs, nowIso, pid, 'unknown', leaseMinutes, meta);
   return { ...result, resource, lockRoot };
 }
@@ -140,9 +143,12 @@ export function placeBuildDispatchHold({
   repo = 'we', num, reason = null, owner = buildDispatchClaimOwner(), pid = process.pid,
   nowMs = Date.now(), nowIso = new Date(nowMs).toISOString(),
   holdMinutes = DEFAULT_BUILD_DISPATCH_HOLD_MINUTES, lockRoot = buildDispatchHoldRoot(),
+  replacesStamp,
 } = {}) {
   const resource = buildDispatchResource({ repo, num });
-  const meta = { repo, num: normNum(num), kind: 'hold', reason: reason == null ? null : String(reason), heldAt: nowIso };
+  const meta = { repo, num: normNum(num), kind: 'hold', reason: reason == null ? null : String(reason), heldAt: nowIso,
+    // A prepare hold carries the stamp its (now released) claim recorded — see {@link acquireBuildDispatchClaim}.
+    ...(replacesStamp !== undefined ? { replacesStamp } : {}) };
   // A hold that already exists for this item (a second `not-ready` before the first one lapsed) is simply
   // refreshed to the new reason/TTL — `releaseLockDir` first makes `reserve` unconditional, matching a
   // cooldown's "restart the clock" semantics rather than a mutex's "refuse a second holder".

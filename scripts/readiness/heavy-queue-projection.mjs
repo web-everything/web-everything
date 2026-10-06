@@ -16,9 +16,10 @@
  * THE DESIGN (operator-approved 2026-09-25):
  *   1. STANDARD TIME per heavy-command KIND ({@link HEAVY_KINDS}) — a seed ({@link DEFAULT_STANDARD_MINUTES}),
  *      replaced by the rolling median of real hold durations once there are enough samples ({@link typicalMinutes}).
- *   2. EXPECTED DEMAND per DISPATCH kind ({@link dispatchDemandMinutes}): review and the prepare family are
- *      EXEMPT (never held); fix and ci-heal cost one selected run plus one check:standards; a build costs that
- *      same unit times a count scaled by the card's `size`.
+ *   2. EXPECTED DEMAND per DISPATCH kind ({@link dispatchDemandMinutes}): review is EXEMPT; the prepare family is
+ *      charged its rolling measured per-session demand, seeded with one selected run + one check:standards.
+ *      `WE_QUEUE_ADMISSION_PREPARE=exempt` restores the old exemption. Fix and ci-heal cost that same seed unit;
+ *      a build costs the unit times a count scaled by the card's `size`.
  *   3. PROJECTED WAIT, per queue lane ({@link laneProjection}). The backlog (remaining time on held slots +
  *      standard time of every live waiter + expected demand of sessions dispatched but not yet queued + the new
  *      dispatch) is split by kind: FULL-suite / other demand ÷ the HEAVY slots; short-job demand ÷ (the fast slots
@@ -69,9 +70,15 @@ export const QUEUE_ADMISSION_SWITCH_ENV = 'WE_QUEUE_ADMISSION';
  *  from its lane lease; after this window it is assumed to have arrived (or to be doing something else). */
 export const DEFAULT_ARRIVAL_WINDOW_MINUTES = 10;
 
-/** Dispatch kinds that are never held: a review runs no heavy command of its own, and the prepare family runs at
- *  most one check:standards (~15 s) — holding them would cost throughput for no queue relief. */
-export const EXEMPT_DISPATCH_KINDS = Object.freeze(['review', 'prepare', 'prepare-scope', 'prepare-decision', 'investigate']);
+/** Review runs no heavy command; the prepare family is charged (operator decision 2026-10-06). */
+export const EXEMPT_DISPATCH_KINDS = Object.freeze(['review']);
+export const PREPARE_DISPATCH_KINDS = Object.freeze(['prepare', 'prepare-scope', 'prepare-decision', 'prepare-item', 'investigate']);
+export const PREPARE_ADMISSION_ENV = 'WE_QUEUE_ADMISSION_PREPARE';
+
+/** Charge prepares by default; only an explicit `exempt` restores the exemption. */
+export function resolvePrepareAdmission(env = {}) {
+  return /^exempt$/i.test(env?.[PREPARE_ADMISSION_ENV]) ? 'exempt' : 'charge';
+}
 
 /** A build with no declared size is costed as this size. */
 export const DEFAULT_BUILD_SIZE = 3;
@@ -141,6 +148,25 @@ export function typicalMinutes(records = [], { seeds = DEFAULT_STANDARD_MINUTES,
   return { minutes, source };
 }
 
+/** Rolling median of per-session heavy time; prepare subkinds share one measurement. */
+export function typicalDispatchMinutes(records = [], { window = TYPICAL_WINDOW, minSamples = TYPICAL_MIN_SAMPLES } = {}) {
+  const minutes = {};
+  const source = {};
+  for (const kind of ['prepare']) {
+    const sessions = new Map();
+    for (const r of Array.isArray(records) ? records : []) {
+      if (!r || !PREPARE_DISPATCH_KINDS.includes(r.dispatchKind) || !Number.isFinite(r.ms) || r.ms < 0) continue;
+      const key = typeof r.session === 'string' && r.session.length > 0 ? r.session : `${r.repo}|${r.leaseAcquiredAt ?? r.at}`;
+      sessions.set(key, (sessions.get(key) || 0) + r.ms);
+    }
+    const samples = [...sessions.values()].slice(-window).map((ms) => ms / 60_000);
+    const m = samples.length >= minSamples ? median(samples) : null;
+    minutes[kind] = m != null ? Math.round(m * 100) / 100 : null;
+    source[kind] = { from: m != null ? 'rolling' : 'seed', samples: samples.length };
+  }
+  return { minutes, source };
+}
+
 /**
  * Classify a dispatched session from its lane lease (`purpose` / `session`) into a dispatch kind, or `null` when
  * the lease is not a recognised dispatched session (a human or ad-hoc worker lane — not counted as pending).
@@ -160,16 +186,20 @@ export function classifyDispatchKind(lease) {
 
 /**
  * Expected heavy-slot minutes a NEW session of `kind` will add to the queue. Pure.
- *   review / prepare family → 0 (exempt); fix, ci-heal → one selected run + one check:standards;
+ *   review → 0; prepare family → measured session demand (or the fix-sized seed), unless exempt;
+ *   fix, ci-heal → one selected run + one check:standards;
  *   build → that same unit × clamp(ceil(size ÷ {@link BUILD_SIZE_POINTS_PER_RUN}), 1, {@link MAX_BUILD_RUNS}).
  *   Anything else is costed like a fix (a conservative small unit, never zero).
  * @param {string} kind
- * @param {{size?:number|null, standardMinutes?:Record<string,number>}} [o]
+ * @param {{size?:number|null, standardMinutes?:Record<string,number>, dispatchMinutes?:object|null, prepareAdmission?:string}} [o]
  */
-export function dispatchDemandMinutes(kind, { size = null, standardMinutes = DEFAULT_STANDARD_MINUTES } = {}) {
+export function dispatchDemandMinutes(kind, { size = null, standardMinutes = DEFAULT_STANDARD_MINUTES, dispatchMinutes = null, prepareAdmission = 'charge' } = {}) {
   if (EXEMPT_DISPATCH_KINDS.includes(kind)) return 0;
   const std = { ...DEFAULT_STANDARD_MINUTES, ...(standardMinutes || {}) };
   const unit = std.selected + std.standards;
+  if (PREPARE_DISPATCH_KINDS.includes(kind)) {
+    return prepareAdmission === 'exempt' ? 0 : round1(Number.isFinite(dispatchMinutes?.prepare) && dispatchMinutes.prepare > 0 ? dispatchMinutes.prepare : unit);
+  }
   if (kind === 'build') {
     const s = Number(size);
     const pts = Number.isFinite(s) && s > 0 ? s : DEFAULT_BUILD_SIZE;
@@ -290,8 +320,10 @@ export function createQueueBudget(baseline, { extraMinutes = 0 } = {}) {
      * @param {{size?:number|null, id?:*}} [o]
      */
     tryAdmit(kind, { size = null, id = null } = {}) {
-      const demandMinutes = dispatchDemandMinutes(kind, { size, standardMinutes: baseline?.standardMinutes });
-      const exempt = EXEMPT_DISPATCH_KINDS.includes(kind);
+      const demandMinutes = dispatchDemandMinutes(kind, {
+        size, standardMinutes: baseline?.standardMinutes, dispatchMinutes: baseline?.dispatchMinutes, prepareAdmission: baseline?.prepareAdmission ?? 'charge',
+      });
+      const exempt = EXEMPT_DISPATCH_KINDS.includes(kind) || (PREPARE_DISPATCH_KINDS.includes(kind) && baseline?.prepareAdmission === 'exempt');
       if (!active || exempt) {
         const d = { id, kind, admit: true, exempt, demandMinutes, projectedMinutes: projectFor(demandMinutes), maxWaitMinutes: maxWait };
         decisions.push(d);

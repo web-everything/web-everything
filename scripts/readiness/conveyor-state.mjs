@@ -100,6 +100,8 @@ export function shapeQueue(buildQueue, clearedNums = null) {
   return rows.map((r) => ({
     num: r?.num != null ? String(r.num) : null,
     rank: r?.rank ?? null,
+    // Card 80 — the build-queue tier (`pinned` first), read by the prepare-ahead window. Omitted when absent.
+    ...(r?.tier != null ? { tier: r.tier } : {}),
     // buildQueued: sidecar membership when a cleared set is injected (#2613), else the committed frontmatter flag.
     buildQueued: clearedSet ? clearedSet.has(normNum(r?.num)) : r?.buildQueued === true,
     // openBlockers: explicit field if present, else the item's `blockedBy`, else [] (a ready row has none).

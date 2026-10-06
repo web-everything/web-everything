@@ -18,6 +18,57 @@ import { tmpdir } from 'node:os';
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 
+import { isDeliveredLease, laneAuthoredSince } from '../lib/lane-lease.mjs';
+
+describe('isDeliveredLease', () => {
+  const delivered = { porcelain: '', headIsAncestorOfUpstream: true, headCommitMs: 2000, acquiredAtMs: 1000, authoredSinceAcquire: true };
+  it('accepts a clean, landed commit made after acquisition (including equality)', () => {
+    expect(isDeliveredLease(delivered)).toBe(true);
+    expect(isDeliveredLease({ ...delivered, headCommitMs: 1000 })).toBe(true);
+  });
+  it.each([
+    { porcelain: ' M file.txt' },
+    { headIsAncestorOfUpstream: false },
+    { headCommitMs: 999 },
+    { porcelain: null },
+    { headCommitMs: NaN },
+    { acquiredAtMs: NaN },
+    // a clean lane that only synced to a newer main has a HEAD newer than acquiredAt but authored nothing
+    { authoredSinceAcquire: false },
+    { authoredSinceAcquire: undefined },
+  ])('refuses live or unproven work: %j', (change) => {
+    expect(isDeliveredLease({ ...delivered, ...change })).toBe(false);
+  });
+});
+
+describe('laneAuthoredSince', () => {
+  const at = (s, subject, sha = 'abc123') => `${s}\t${sha}\t${subject}`;
+  it('counts only a commit that LANDED — a WIP commit reset away does not make a live lane releasable', () => {
+    const lines = [at(2, 'commit: wip', 'wip111'), at(3, 'reset: moving to origin/main', 'main222')];
+    expect(laneAuthoredSince(lines, 1000, (sha) => sha === 'main222')).toBe(false);
+    expect(laneAuthoredSince(lines, 1000, (sha) => sha === 'wip111')).toBe(true);
+  });
+  it('counts a commit / amend / cherry-pick the lane made at or after acquisition', () => {
+    expect(laneAuthoredSince([at(2, 'commit: work')], 1000)).toBe(true);
+    expect(laneAuthoredSince([at(1, 'commit (amend): work')], 1000)).toBe(true);
+    expect(laneAuthoredSince([at(3, 'cherry-pick: work')], 1000)).toBe(true);
+  });
+  it.each([
+    [[at(2, 'reset: moving to origin/main')]],
+    [[at(2, 'checkout: moving from main to main')]],
+    [[at(2, 'merge origin/main: Fast-forward')]],
+    [[at(2, 'pull: Fast-forward')]],
+    [[at(0, 'commit: made before the lease was taken')]],
+    [[]],
+    [undefined],
+  ])('does not count a sync or an older commit: %j', (lines) => {
+    expect(laneAuthoredSince(lines, 1000)).toBe(false);
+  });
+  it('is false when the acquisition time is unknown', () => {
+    expect(laneAuthoredSince([at(2, 'commit: work')], NaN)).toBe(false);
+  });
+});
+
 function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 }
@@ -206,6 +257,56 @@ describe('lane-pool #2997 — a TARGETED release of a CONTESTED lease needs the 
     expect(right.code).toBe(0);
     expect(JSON.parse(right.out).released).toBe(1);
     expect(right.out + right.err).not.toMatch(/not yours/);
+  });
+
+  it.each(['delivered', 'synced', 'abandoned', 'dirty', 'unlanded', 'foreign', 'sweep'])('contested release with stale lane origin/main: %s', (state) => {
+    const { b } = acquireTwoSiblings();
+    const dir = join(poolRoot, 'releaseowner', `lane-${b.lane}`);
+    const marker = join(dir, '.git', '.lane-lease');
+    const oldTip = git(['rev-parse', 'HEAD'], dir);
+    git(['update-ref', 'refs/remotes/origin/main', oldTip], dir);
+    // Git records seconds, whereas acquiredAt has milliseconds; keep the ordering deterministic.
+    const later = {
+      ...process.env, GIT_COMMITTER_DATE: new Date(Date.now() + 2000).toISOString(),
+      GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com',
+    };
+    if (state === 'synced' || state === 'abandoned') {
+      // A LIVE lane that made no commit and only fast-forwarded to a main that moved after its acquire:
+      // clean, HEAD on upstream, newer than acquiredAt — and still not delivered work. `abandoned` is the same
+      // lane after it committed WIP and then reset it away: a `commit` reflog entry exists, but it never landed.
+      if (state === 'abandoned') {
+        writeFileSync(join(dir, 'wip.txt'), 'wip\n');
+        git(['add', 'wip.txt'], dir);
+        execFileSync('git', ['commit', '--quiet', '-m', 'wip'], { cwd: dir, env: later });
+      }
+      writeFileSync(join(referenceDir, 'file.txt'), 'someone else landed this\n');
+      git(['add', 'file.txt'], referenceDir);
+      execFileSync('git', ['commit', '--quiet', '-m', 'landed by another'], { cwd: referenceDir, env: later });
+      const head = git(['rev-parse', 'HEAD'], referenceDir);
+      git(['update-ref', 'refs/remotes/origin/main', head], referenceDir);
+      // The lane reads the new object through its existing alternates, while its own main ref stays stale.
+      git(['reset', '--hard', head], dir);
+    } else {
+      // The holder's own commit, which then landed on upstream main.
+      writeFileSync(join(dir, 'file.txt'), 'landed work\n');
+      git(['add', 'file.txt'], dir);
+      execFileSync('git', ['commit', '--quiet', '-m', 'delivered'], { cwd: dir, env: later });
+      if (state !== 'unlanded') git(['update-ref', 'refs/remotes/origin/main', git(['rev-parse', 'HEAD'], dir)], dir);
+      if (state === 'dirty') writeFileSync(join(dir, 'file.txt'), 'unfinished work\n');
+    }
+    const release = runPool([
+      'release', state === 'sweep' ? '--all' : `--lane=${b.lane}`, ...poolArgs(), '--session=finishing-agent', '--json',
+    ], state === 'foreign' ? 'sess-foreign' : 'sess-uuid-shared');
+    expect(release.code).toBe(0);
+    expect(JSON.parse(release.out).released).toBe(state === 'delivered' ? 1 : 0);
+    if (state === 'delivered') {
+      expect(release.err).toContain(`lane-${b.lane}: contested lease released — its work is fully landed`);
+      expect(() => readFileSync(marker)).toThrow();
+    } else {
+      expect(release.err).toContain('not yours');
+      expect(JSON.parse(readFileSync(marker, 'utf8')).holder).toBe(b.holder);
+      if (state === 'dirty') expect(readFileSync(join(dir, 'file.txt'), 'utf8')).toBe('unfinished work\n');
+    }
   });
 
   it('the OPERATOR escape is intact — --force still breaks a contested lease (stale-lane cleanup keeps working)', () => {

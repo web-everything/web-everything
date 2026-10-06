@@ -171,7 +171,7 @@ import { driftDefaults, findPocBranch, readRegistry } from '../lib/poc-branches.
  *  `planFixSpawns`/CI-heal sibling), which this function never touches, so it is never held by this. The
  *  operator gloss is {@link PR_LIMIT_HINT}. */
 export const HELD_REASONS = Object.freeze([
-  'already-done', 'blocked', 'unshaped-no-scope', 'no-size', 'needs-prepare', 'needs-slice', 'needs-decision', 'needs-investigation', 'branch-drift-blocked', 'no free lane', 'capacity-cap', 'overlaps lane-<n>', 'cleared-but-not-ready', 'dispatch-paused', 'pr-limit',
+  'already-done', 'blocked', 'unshaped-no-scope', 'no-size', 'needs-prepare', 'prepare-stale', 'needs-slice', 'needs-decision', 'needs-investigation', 'branch-drift-blocked', 'no free lane', 'capacity-cap', 'overlaps lane-<n>', 'cleared-but-not-ready', 'dispatch-paused', 'pr-limit',
 ]);
 
 /** The operator-facing gloss for an `unshaped-no-scope` hold — surfaced beside the token in the CLI and the
@@ -605,6 +605,17 @@ export function dispatchPlan({ queue, leases, freeLanes, driftBlockedScope, drif
       held.push({ num, reason: 'needs-prepare' });
       continue;
     }
+    // 4.46. Card 80 (b) — PREPARE GONE STALE, under `preparePolicy.maxAgeDays` (operator OK 2026-10-06): a stamp
+    //    older than the max age, or one whose scope files changed on main since its `preparedAgainstSha`
+    //    (`item.prepDrift`, computed by the IO shell), holds `prepare-stale` — re-prepared before it builds.
+    //    Off unless the policy names a max age (every direct caller keeps today's behavior).
+    if (preparePolicy?.requirePreparedDate && Number.isFinite(preparePolicy.maxAgeDays) && item.kind !== 'prepare-item' && !sizeExempt) {
+      const stale = prepareStaleness(item, preparePolicy);
+      if (stale) {
+        held.push({ num, reason: 'prepare-stale', detail: stale });
+        continue;
+      }
+    }
 
     // 4.5. Overlaps a currently-BLOCKED long-lived dispatched-work branch's own drifting scope (#3464) — that
     //    branch is carrying unreconciled changes over these paths; piling MORE independently-scoped work onto
@@ -672,6 +683,26 @@ export function dispatchPlan({ queue, leases, freeLanes, driftBlockedScope, drif
   }
 
   return { launch, held, ...(trace ? { admission } : {}) };
+}
+
+/**
+ * Card 80 (b) — why a prepared card's stamp is too stale to build on, or `null` when it is fresh. Age is measured
+ * in whole days from `preparedDate` to `policy.today` (both `YYYY-MM-DD`); drift is the IO shell's
+ * `item.prepDrift` (`{stale, changedFiles}` from `prep-staleness.mjs`). An unknown age or an unchecked drift is
+ * never stale (fail open — the stamp gate above already proved the card was prepared). Pure.
+ * @returns {string|null}
+ */
+export function prepareStaleness(item, { maxAgeDays, today } = {}) {
+  const ok = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+  if (Number.isFinite(maxAgeDays) && ok(item?.preparedDate) && ok(today)) {
+    const age = Math.round((Date.parse(`${today}T00:00:00Z`) - Date.parse(`${item.preparedDate}T00:00:00Z`)) / 86_400_000);
+    if (age > maxAgeDays) return `prepared ${item.preparedDate}, ${age}d ago (max ${maxAgeDays}d)`;
+  }
+  if (item?.prepDrift?.stale === true) {
+    const files = Array.isArray(item.prepDrift.changedFiles) ? item.prepDrift.changedFiles : [];
+    return `scope changed since ${String(item.preparedAgainstSha || '?').slice(0, 8)}: ${files.slice(0, 3).join(', ')}${files.length > 3 ? ` +${files.length - 3}` : ''}`;
+  }
+  return null;
 }
 
 /**
@@ -912,6 +943,9 @@ async function main(argv) {
       // reads as unprepared under the live default policy, held `needs-prepare` rather than launching blind on
       // a card nobody has actually prepared).
       preparedDate: it?.preparedDate,
+      // Card 80 (b) — the scope-drift input, read only when the prepare-staleness policy is on (below).
+      preparedAgainstSha: it?.preparedAgainstSha,
+      rawScope: Array.isArray(it?.scope) ? it.scope : undefined,
     };
   });
 
@@ -1053,6 +1087,26 @@ async function main(argv) {
   //     Skippable via `--no-prepare-check` (mirrors `--no-size-check`/`--no-drift-check`/`--no-pause-check`) —
   //     the same emergency escape hatch every other axis above already gets.
   const preparePolicy = flags['no-prepare-check'] ? null : { requirePreparedDate: true };
+  // Card 80 (b) — `--prepared-max-age-days=N` (the build daemon passes its `preparedMaxAgeDays` through
+  // tick-core) turns on the `prepare-stale` gate: a stamp older than N days, or one whose `we:` scope files
+  // changed on origin/main since `preparedAgainstSha`, is re-prepared before it builds. A failed drift read is
+  // "can't tell" and never holds.
+  const maxAgeDays = Number(flags['prepared-max-age-days']);
+  if (preparePolicy && flags['prepared-max-age-days'] !== undefined && Number.isFinite(maxAgeDays) && maxAgeDays >= 0) {
+    preparePolicy.maxAgeDays = maxAgeDays;
+    const d = new Date();
+    preparePolicy.today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    try {
+      const { checkPrepStaleness } = await import('./prep-staleness.mjs');
+      for (const item of queue) {
+        if (!item.preparedAgainstSha || !item.preparedDate) continue;
+        const r = checkPrepStaleness({ scope: item.rawScope, preparedAgainstSha: item.preparedAgainstSha, cwd: join(HERE, '..', '..'), head: 'origin/main' });
+        if (r.checked) item.prepDrift = { stale: r.stale, changedFiles: r.changedFiles };
+      }
+    } catch (e) {
+      log(`  ⚠ prepare drift check skipped (${String(e.message || e).split('\n')[0]}) — age check only`);
+    }
+  }
 
   // 3.8 OPEN-PR BACKPRESSURE LIMIT (we:xniq7xs) — read the live open-PR count for WE (this core's own build
   //     queue) against its cap, resolved through the SAME module `pr-land.mjs`'s pre-create check uses, so the

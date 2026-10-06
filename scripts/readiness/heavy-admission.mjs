@@ -150,7 +150,7 @@ import { execContainerized, containerCliAvailable, containerImageAvailable, reso
 import { resolveHostRoot, readHostToday, extractSamplesByName, utcDayKey } from '../operations/telemetry-summary-io.mjs'; // #4076 — REUSE the host-sampler's own root-resolution + tail-read + metric-extraction primitives (never reimplemented — see loadAdmissionDecision's section header below)
 import { latestValue, median } from '../lib/telemetry-machine.mjs'; // #4076/#4343 — the SAME "latest sample wins" reducer + median telemetry-machine.mjs already uses/exports — never a second implementation
 import {
-  classifyCommandKind, normalizeKind, queueLaneOf, typicalMinutes, classifyDispatchKind, dispatchDemandMinutes,
+  classifyCommandKind, normalizeKind, queueLaneOf, typicalMinutes, typicalDispatchMinutes, resolvePrepareAdmission, classifyDispatchKind, dispatchDemandMinutes,
   queueBacklog, laneProjection, resolveFastSlots, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
@@ -966,12 +966,17 @@ const DURATIONS_LOG = 'durations.jsonl';
 export const DURATIONS_LOG_MAX_LINES = 2000;
 
 /** Append one hold-duration record. Never throws. */
-export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = null, at = new Date().toISOString() }) {
+export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = null, at = new Date().toISOString(), dispatchKind = null, session = null, leaseAcquiredAt = null }) {
   if (!Number.isFinite(ms) || ms < 0) return false;
   const file = join(lockRoot, DURATIONS_LOG);
   try {
     mkdirSync(lockRoot, { recursive: true });
-    appendFileSync(file, JSON.stringify({ kind: normalizeKind(kind), ms: Math.round(ms), lane, repo, at }) + '\n', 'utf8');
+    appendFileSync(file, JSON.stringify({
+      kind: normalizeKind(kind), ms: Math.round(ms), lane, repo, at,
+      ...(dispatchKind != null ? { dispatchKind } : {}),
+      ...(session != null ? { session } : {}),
+      ...(leaseAcquiredAt != null ? { leaseAcquiredAt } : {}),
+    }) + '\n', 'utf8');
     const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
     if (lines.length > DURATIONS_LOG_MAX_LINES) writeFileSync(file, lines.slice(-Math.floor(DURATIONS_LOG_MAX_LINES / 2)).join('\n') + '\n', 'utf8');
     return true;
@@ -985,7 +990,13 @@ function recordReleasedHold(lockRoot, entry, nowMs = Date.now()) {
   if (!kind) return;
   const started = Date.parse(entry.meta.acquiredAt || entry.heartbeatAt);
   if (Number.isNaN(started)) return;
-  recordHoldDuration({ lockRoot, kind, ms: nowMs - started, lane: entry.meta.lane ?? null, repo: repoOfOwner(entry.owner), at: new Date(nowMs).toISOString() });
+  const repo = repoOfOwner(entry.owner);
+  let lease = null;
+  try { if (repo) lease = readLaneLease(repo); } catch { /* lease metadata is best-effort */ }
+  recordHoldDuration({
+    lockRoot, kind, ms: nowMs - started, lane: entry.meta.lane ?? null, repo, at: new Date(nowMs).toISOString(),
+    dispatchKind: classifyDispatchKind(lease), session: lease?.holder || lease?.session || null, leaseAcquiredAt: lease?.acquiredAt || null,
+  });
 }
 
 /** Parsed duration records, oldest first. Corrupt lines are skipped. */
@@ -1070,6 +1081,8 @@ export function resolveQueueBaseline({
 
   const { minutes: standardMinutes, source: standardSource } = readStandardMinutes(lockRoot);
   const durations = readHoldDurations(lockRoot);
+  const { minutes: dispatchMinutes, source: dispatchSource } = typicalDispatchMinutes(durations);
+  const prepareAdmission = resolvePrepareAdmission(env);
   const held = heldSlots({ lockRoot, cap, fastSlots }).map((h) => {
     const startedIso = h.meta?.acquiredAt || h.heartbeatAt;
     const started = Date.parse(startedIso);
@@ -1096,7 +1109,7 @@ export function resolveQueueBaseline({
     if (durations.some((d) => d.repo === repo && Date.parse(d.at) >= acquired)) continue;
     const dispatchKind = classifyDispatchKind(lease);
     if (!dispatchKind) continue;
-    const demandMinutes = dispatchDemandMinutes(dispatchKind, { standardMinutes });
+    const demandMinutes = dispatchDemandMinutes(dispatchKind, { standardMinutes, dispatchMinutes, prepareAdmission });
     if (demandMinutes <= 0) continue;
     pending.push({
       repo, lane: (/lane-(\d+)$/.exec(repo) || [])[1] ?? null, dispatchKind, purpose: lease.purpose ?? null,
@@ -1110,7 +1123,7 @@ export function resolveQueueBaseline({
     heldHeavyCount: backlog.heldHeavyCount, waitingHeavyCount: backlog.waitingHeavyCount,
   });
   return {
-    ...base, standardMinutes, standardSource,
+    ...base, standardMinutes, standardSource, dispatchMinutes, dispatchSource, prepareAdmission,
     heldRemainingMinutes: backlog.heldRemainingMinutes, waitingMinutes: backlog.waitingMinutes, pendingMinutes: backlog.pendingMinutes,
     backlogMinutes: backlog.backlogMinutes,
     heavyBacklogMinutes: backlog.heavyBacklogMinutes, shortBacklogMinutes: backlog.shortBacklogMinutes,

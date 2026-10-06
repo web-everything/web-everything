@@ -9,7 +9,7 @@ import { describe, it, expect } from 'vitest';
 import {
   classifyCommandKind, queueLaneOf, typicalMinutes, DEFAULT_STANDARD_MINUTES, TYPICAL_MIN_SAMPLES,
   classifyDispatchKind, dispatchDemandMinutes, queueBacklog, projectedWaitMinutes, createQueueBudget,
-  resolveFastSlots, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, laneProjection,
+  resolvePrepareAdmission, typicalDispatchMinutes, PREPARE_DISPATCH_KINDS, resolveFastSlots, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, laneProjection,
 } from '../heavy-queue-projection.mjs';
 
 describe('classifyCommandKind — the gate / wrapped command line → heavy kind', () => {
@@ -171,5 +171,62 @@ describe('laneProjection — full-suite demand ÷ heavy slots, short demand ÷ (
     const budget = createQueueBudget(baseline);
     // short: (20 + 3.25n) / 1 → 23.25, 26.5, 29.75, 33 — the 4th quick fix is held; the 90-min heavy queue is not counted.
     expect([1, 2, 3, 4].map(() => budget.tryAdmit('fix').admit)).toEqual([true, true, true, false]);
+  });
+});
+
+
+describe('prepare admission — operator decision 2026-10-06', () => {
+  it('charges every prepare kind its seed or measured session demand; exemption is explicit', () => {
+    for (const kind of PREPARE_DISPATCH_KINDS) {
+      expect(dispatchDemandMinutes(kind)).toBe(DEFAULT_STANDARD_MINUTES.selected + DEFAULT_STANDARD_MINUTES.standards);
+      expect(dispatchDemandMinutes(kind, { dispatchMinutes: { prepare: 7.1 } })).toBe(7.1);
+      expect(dispatchDemandMinutes(kind, { prepareAdmission: 'exempt', dispatchMinutes: { prepare: 7.1 } })).toBe(0);
+      for (const prepare of [null, 0, -1, NaN, Infinity, '7.1']) {
+        expect(dispatchDemandMinutes(kind, { dispatchMinutes: { prepare }, standardMinutes: { selected: 4, standards: 0.5 } })).toBe(4.5);
+      }
+    }
+    expect(dispatchDemandMinutes('review', { dispatchMinutes: { prepare: 7.1 } })).toBe(0);
+  });
+
+  it('defaults to charge and accepts only the explicit case-insensitive exempt setting', () => {
+    expect(resolvePrepareAdmission({})).toBe('charge');
+    for (const value of ['exempt', 'EXEMPT']) expect(resolvePrepareAdmission({ WE_QUEUE_ADMISSION_PREPARE: value })).toBe('exempt');
+    for (const value of ['charge', 'off', '', ' exempt ']) expect(resolvePrepareAdmission({ WE_QUEUE_ADMISSION_PREPARE: value })).toBe('charge');
+  });
+
+  it('holds prepare-item at the max wait, and admits it only with the escape hatch', () => {
+    const baseline = { slots: 2, backlogMinutes: 60, maxWaitMinutes: 30, dispatchMinutes: { prepare: 7.1 } };
+    // prepare-item must join the charged prepare family, even at the queue boundary.
+    expect(createQueueBudget(baseline).tryAdmit('prepare-item')).toMatchObject({ admit: false, exempt: false, demandMinutes: 7.1, projectedMinutes: 33.55 });
+    expect(createQueueBudget({ ...baseline, prepareAdmission: 'exempt' }).tryAdmit('prepare-item')).toMatchObject({ admit: true, exempt: true, demandMinutes: 0 });
+    expect(createQueueBudget(baseline).tryAdmit('prepare')).toMatchObject({ admit: false, exempt: false });
+  });
+});
+
+describe('typicalDispatchMinutes — total heavy time per prepare session', () => {
+  const records = [
+    { dispatchKind: 'prepare-item', session: 'a', ms: 3 * 60_000 },
+    { dispatchKind: 'prepare-scope', session: 'b', ms: 9 * 60_000 },
+    { dispatchKind: 'prepare-item', session: 'a', ms: 4.1 * 60_000 },
+    { dispatchKind: 'investigate', session: 'c', ms: 5 * 60_000 },
+    { kind: 'FULL', ms: 99 * 60_000 }, // historical rows without dispatch identity are ignored
+    { dispatchKind: 'build', session: 'd', ms: 99 * 60_000 },
+  ];
+  it('sums both checks of one session before taking the median across three sessions', () => {
+    expect(typicalDispatchMinutes(records)).toEqual({ minutes: { prepare: 7.1 }, source: { prepare: { from: 'rolling', samples: 3 } } });
+    expect(typicalDispatchMinutes(records.slice(0, 3))).toEqual({ minutes: { prepare: null }, source: { prepare: { from: 'seed', samples: 2 } } });
+    expect(typicalDispatchMinutes()).toEqual({ minutes: { prepare: null }, source: { prepare: { from: 'seed', samples: 0 } } });
+  });
+  it('windows sessions by first appearance, even when an earlier session finishes later', () => {
+    expect(typicalDispatchMinutes(records, { window: 2, minSamples: 2 })).toEqual({ minutes: { prepare: 7 }, source: { prepare: { from: 'rolling', samples: 2 } } });
+  });
+  it('falls back to repo and lease acquisition, then record time, when session is absent', () => {
+    const rows = [
+      { repo: '/lane-1', leaseAcquiredAt: 'a', at: '1', session: '', ms: 60_000 },
+      { repo: '/lane-1', leaseAcquiredAt: 'a', at: '2', ms: 2 * 60_000 },
+      { repo: '/lane-2', leaseAcquiredAt: 'a', ms: 4 * 60_000 },
+      { repo: '/lane-1', at: '3', ms: 5 * 60_000 },
+    ].map((r) => ({ ...r, dispatchKind: 'prepare-decision' }));
+    expect(typicalDispatchMinutes(rows)).toEqual({ minutes: { prepare: 4 }, source: { prepare: { from: 'rolling', samples: 3 } } });
   });
 });

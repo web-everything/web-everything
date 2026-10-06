@@ -50,6 +50,11 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
   // separate cap from `maxConcurrentBuilds` (which only bounds builds actually running right now). Unmeasured
   // starting point per the operator's own framing — see `planBuildDispatch`'s `wip-cap` rule below.
   maxOpenItems: 7,
+  // Card 80 — prepare just in time (operator OK 2026-10-06). Only the next `prepareAheadWindow` cards to build
+  // (pinned first) get a prepare; a stamp older than `preparedMaxAgeDays`, or one whose scope files changed since
+  // its `preparedAgainstSha`, is re-prepared before it builds (`prepare-stale`). Flags/env override both.
+  prepareAheadWindow: 4,
+  preparedMaxAgeDays: 3,
   // Live incident 2026-09-28 (we#2852): ONE PR mislabelled `review-status:ci-heal-stalled` (a ci-heal session
   // that had actually finished — see we:scripts/conveyor/review-status-tag.mjs's own fix for that bug) froze
   // EVERY queued build, unrelated scope or not, because these three per-PR labels used to feed the SAME global
@@ -85,6 +90,8 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
     // this row is DOCUMENTATION PARITY (every operator rule visible here, per this file's own header) — no
     // logic in this planner changes for it.
     { id: 'needs-prepare', text: 'a candidate carrying no truthful preparedDate is never built — held for a prepare pass first', enforcedBy: 'readiness/dispatch-plan.mjs' },
+    { id: 'prepare-ahead-window', text: 'only the next prepareAheadWindow cards to build (pinned first) are prepared', enforcedBy: 'conveyor/tick-core.mjs (prepareAheadNums)' },
+    { id: 'prepare-stale', text: 'a stamp older than preparedMaxAgeDays, or whose scope files changed since preparedAgainstSha, is re-prepared before build', enforcedBy: 'readiness/dispatch-plan.mjs' },
   ]),
 });
 
@@ -321,4 +328,102 @@ export function planBuildDispatch({
  *  pinned by a test independent of the daemon's IO shell. */
 export function reportOpenItems(openItems) {
   return { count: openItems.count, cap: openItems.cap, filling: openItems.nums };
+}
+
+// ── Card 80 — prepare just in time ───────────────────────────────────────────────────────────────────────────
+
+/** Hold reasons (dispatch-plan) of a cleared item that is on its way to a build: it builds as soon as a lane,
+ *  the cap, an overlap or a prepare pass clears. Anything else (blocked, an epic, a decision, unscoped, unsized,
+ *  already done) is not "about to build", so it never counts toward the prepare-ahead window. */
+const BUILD_BOUND_REASONS = new Set([
+  'needs-prepare', 'prepare-stale', 'no free lane', 'capacity-cap', 'dispatch-paused', 'pr-limit', 'branch-drift-blocked',
+]);
+const isBuildBound = (reason) => BUILD_BOUND_REASONS.has(reason) || /^overlaps lane-/.test(String(reason));
+
+/**
+ * Card 80 (a) — the items within the next `window` to build: the cleared queue in build order (pinned tier
+ * first, then the queue's own rank order), keeping only items that are launching now or held for a reason that
+ * clears on its own (see {@link BUILD_BOUND_REASONS}). A prepare is spent only on these, so a card is prepared
+ * shortly before its build — never days ahead, when its scope may drift. Pure.
+ * @param {{queue?:Array<{num:*, tier?:string|null}>, launch?:Array<{num:*}>, held?:Array<{num:*, reason:string}>, window?:number}} o
+ * @returns {Set<string>|null} the in-window nums (normalized), or `null` when the window is off (not a finite number ≥ 0)
+ */
+export function prepareAheadNums({ queue = [], launch = [], held = [], window = Infinity } = {}) {
+  if (!Number.isFinite(window) || window < 0) return null;
+  const launching = new Set((Array.isArray(launch) ? launch : []).map((l) => normNum(l?.num)));
+  const reasonOf = new Map((Array.isArray(held) ? held : []).map((h) => [normNum(h?.num), h?.reason]));
+  const rows = (Array.isArray(queue) ? queue : []).filter((r) => r && r.num != null)
+    .map((r, i) => ({ num: normNum(r.num), pinned: r.tier === 'pinned', i }))
+    .sort((a, b) => (b.pinned - a.pinned) || (a.i - b.i));
+  const out = new Set();
+  for (const r of rows) {
+    if (out.size >= window) break;
+    if (launching.has(r.num) || isBuildBound(reasonOf.get(r.num))) out.add(r.num);
+  }
+  return out;
+}
+
+/** Card 80 (b) — the day count between two `YYYY-MM-DD` dates (`to − from`), or `null` when either is malformed. */
+export function daysBetween(from, to) {
+  const ok = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+  if (!ok(from) || !ok(to)) return null;
+  return Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000);
+}
+
+/**
+ * Card 80 (b) — is a card's main-branch prepare stamp the RESULT of a prepare attempt claimed at `claimedAt`, or
+ * an older stamp that attempt is replacing? A re-prepare (a `prepare-stale` card) starts with a stamp already on
+ * main; reading that stamp as "prepared on main" would retire the claim at once.
+ *
+ * `replaces` is the stamp the claim recorded when it was taken: `null` (the card was unstamped, so ANY stamp is
+ * the result) or `{preparedDate, preparedAgainstSha}`. The stamp is the result exactly when it is not that same
+ * stamp — a revision comparison, not a date one, because a scope-drift re-prepare can start hours after the
+ * stamp it replaces, so a same-day or yesterday stamp is still the OLD one.
+ *
+ * Only a claim that recorded nothing (`replaces === undefined`: taken by an older daemon, or its read failed) falls
+ * back to dates. `prepare-stamp` writes the LOCAL date while a claim time is UTC, so that fallback allows one day
+ * of slack. Pure.
+ */
+export function stampCoversClaim(preparedDate, claimedAt, { replaces, preparedAgainstSha } = {}) {
+  if (!preparedDate) return false;
+  if (replaces === null) return true;
+  if (replaces && typeof replaces === 'object') {
+    return !(replaces.preparedDate === preparedDate && (replaces.preparedAgainstSha ?? null) === (preparedAgainstSha ?? null));
+  }
+  if (typeof claimedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}/.test(claimedAt)) return true;
+  const d = daysBetween(claimedAt.slice(0, 10), preparedDate);
+  return d == null || d >= -1;
+}
+
+// ── Build-hold visibility ───────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * One row per cleared card that is NOT dispatched this tick, with the stage that held it and why — the tick log
+ * and the dry-run both print this, so a held card always names its reason (queue-cap and load-cap included,
+ * which used to show only as "not a candidate"). Stages, first match wins: `daemon` (this planner's own
+ * rules), `cooldown` (a recent non-PR outcome), `prepare` (a prepare is in flight), `tick-core` (a gate in the
+ * tick core after planning: queue-cap / load-cap / capacity-cap / guard), `plan` (dispatch-plan's hold reason).
+ * Pure.
+ * @returns {Array<{num:string, stage:string, reason:string, detail?:string}>}
+ */
+export function collectBuildHolds({ queue = [], planHeld = [], suppressed = [], prepareQueueHeld = [], policyHold = [], cooldown = [], prepareBusy = [], dispatched = [] } = {}) {
+  const out = new Map();
+  const put = (num, row) => { const n = normNum(num); if (n && !out.has(n)) out.set(n, { num: n, ...row }); };
+  const sent = new Set((Array.isArray(dispatched) ? dispatched : []).map((d) => normNum(d?.num ?? d)));
+  for (const h of Array.isArray(policyHold) ? policyHold : []) if (!sent.has(normNum(h.num))) put(h.num, { stage: 'daemon', reason: h.rule, detail: h.reason });
+  for (const n of Array.isArray(cooldown) ? cooldown : []) put(n, { stage: 'cooldown', reason: 'recent non-PR outcome (hold)' });
+  for (const n of Array.isArray(prepareBusy) ? prepareBusy : []) put(n, { stage: 'prepare', reason: 'prepare in flight' });
+  for (const s of Array.isArray(suppressed) ? suppressed : []) {
+    const detail = s.by === 'queue-cap' ? `projected heavy-test wait ${s.projectedMinutes ?? '?'}m (this build +${s.demandMinutes ?? '?'}m)` : undefined;
+    put(s.num, { stage: 'tick-core', reason: s.by || 'suppressed', ...(detail ? { detail } : {}) });
+  }
+  // A prepare tick-core held on queue-cap (`decisions.queueCapHeld.prepare`) must beat the plan's own bare
+  // `needs-prepare` / `prepare-stale` row below, or the hold the operator needs to see reads as a plain prepare wait.
+  for (const h of Array.isArray(prepareQueueHeld) ? prepareQueueHeld : []) {
+    put(h.num, { stage: 'tick-core', reason: 'queue-cap',
+      detail: `prepare${h.kind ? ` (${h.kind})` : ''} held: projected heavy-test wait ${h.projectedMinutes ?? '?'}m (this prepare +${h.demandMinutes ?? '?'}m)` });
+  }
+  for (const h of Array.isArray(planHeld) ? planHeld : []) put(h.num, { stage: 'plan', reason: h.reason, ...(h.detail ? { detail: h.detail } : {}) });
+  const order = new Map((Array.isArray(queue) ? queue : []).map((r, i) => [normNum(r?.num), i]));
+  return [...out.values()].sort((a, b) => (order.get(a.num) ?? Infinity) - (order.get(b.num) ?? Infinity));
 }

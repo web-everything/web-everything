@@ -10,6 +10,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   qualifyPaths,
+  pickFreshestTip,
   parseObservedFiles,
   resolvePredictedScope,
   collectSnapshot,
@@ -20,6 +21,32 @@ import {
   GHOST_GRACE_MS,
 } from '../scope-lease-collect.mjs';
 import { liveScopePicture } from '../scope-lease-live.mjs';
+
+describe('pickFreshestTip', () => {
+  const isAncestor = (a, b) => a <= b;
+  it('picks the descendant regardless of candidate order', () => {
+    expect(pickFreshestTip(['a', 'c', 'b'], isAncestor)).toBe('c');
+    expect(pickFreshestTip(['c', 'a', 'b'], isAncestor)).toBe('c');
+  });
+  it('keeps the first candidate when no tip contains all others', () => {
+    expect(pickFreshestTip(['a', 'b', 'c'], (a, b) => a === b || (a === 'a' && b === 'b'))).toBe('a');
+  });
+  it('returns null for an empty list', () => {
+    expect(pickFreshestTip([], isAncestor)).toBeNull();
+  });
+  it('ignores duplicates and falsy candidates', () => {
+    const calls = [];
+    expect(pickFreshestTip([null, 'a', '', 'a', undefined, 'b', 'b'], (a, b) => {
+      calls.push([a, b]);
+      return isAncestor(a, b);
+    })).toBe('b');
+    expect(calls).toEqual([['b', 'a'], ['a', 'b']]);
+    expect(pickFreshestTip([null, '', undefined], isAncestor)).toBeNull();
+  });
+  it('keeps the first candidate when ancestry throws', () => {
+    expect(pickFreshestTip(['a', 'b'], () => { throw new Error('unreadable'); })).toBe('a');
+  });
+});
 
 describe('qualifyPaths — repo-qualify, skip empties, pass through when no key', () => {
   it('qualifies each path with the repo key', () => {

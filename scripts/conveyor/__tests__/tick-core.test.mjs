@@ -45,6 +45,7 @@ import {
   buildDecisionTrace,
   lanePoolListArgsForRepo,
 } from '../tick-core.mjs';
+import { HELD_REASONS } from '../../readiness/dispatch-plan.mjs';
 import { sessionSlugFor } from '../../operations/dispatch-lane.mjs';
 import { repoProfile } from '../../lib/repo-profile.mjs';
 
@@ -1465,8 +1466,8 @@ describe('planTick — composes the tick and threads nextState', () => {
         // #3842's prepare-scope agent authors either (or both) in one turn.
         expect.objectContaining({ kind: 'auto-preparing-scope', nums: [90] }),
       ]));
-      // The exclusion set itself is exactly the six reasons that have their own note elsewhere.
-      expect(HELD_NOTE_EXCLUDED_REASONS).toEqual(['needs-slice', 'needs-decision', 'needs-investigation', 'needs-prepare', 'unshaped-no-scope', 'no-size']);
+      // The exclusion set itself is exactly the seven reasons that have their own note elsewhere.
+      expect(HELD_NOTE_EXCLUDED_REASONS).toEqual(['needs-slice', 'needs-decision', 'needs-investigation', 'needs-prepare', 'prepare-stale', 'unshaped-no-scope', 'no-size']);
     });
 
     it('emits NO held notes when the queue is empty (plan.held absent or [])', () => {
@@ -2294,4 +2295,51 @@ it('refunds the durable and in-session heal floor without refunding again on the
   expect(next.ciHealAttempts[99]).toBe(5);
   expect(planCiHealSpawns({ ...args, ciHealAttempts: { 99: 6 } }).notes[0])
     .toMatchObject({ kind: 'ci-heal-exhausted', attempts: 3, refunded: 3 });
+});
+
+describe('card 80 — prepare just in time', () => {
+  const held = (num, reason) => ({ num, reason });
+  const tick = (config, extraHeld = []) => planTick({
+    state: { queue: [{ num: '1' }, { num: '2' }, { num: '3' }, { num: '4' }, { num: '5', tier: 'pinned' }], lanes: [], prs: [] },
+    plan: { launch: [], held: [held('1', 'overlaps lane-19'), held('2', 'needs-prepare'), held('3', 'needs-prepare'), held('4', 'prepare-stale'), held('5', 'needs-prepare'), ...extraHeld] },
+    freeLanes: [7, 8, 9, 10], bookkeeping: { tick: 1 },
+    config: { maxConcurrentLanes: 10, maxConcurrentItemPrepares: 5, ...config },
+  });
+
+  it('only prepares cards within the next N to build, pinned first; the rest wait with a note', () => {
+    const r = tick({ prepareAheadWindow: 3 });
+    // build order: pinned #5, then #1 (overlap, already prepared), #2 → window {5, 1, 2}
+    expect(r.decisions.spawnPrepareItems.map((s) => s.num)).toEqual(['2', '5']);
+    const waits = r.decisions.notes.filter((n) => n.kind === 'prepare-ahead-window').map((n) => n.num);
+    expect(waits).toEqual(['3', '4']);
+  });
+
+  it('a prepare-stale card is a re-prepare candidate like needs-prepare', () => {
+    const r = tick({});
+    expect(r.decisions.spawnPrepareItems.map((s) => s.num)).toEqual(['2', '3', '4', '5']);
+  });
+
+  it('a prepare-stale card gets no generic `held` note on top of its own prepare note', () => {
+    for (const config of [{}, { prepareAheadWindow: 1 }]) {
+      const r = tick(config);
+      expect(r.decisions.notes.filter((n) => n.kind === 'held' && n.reason === 'prepare-stale')).toEqual([]);
+      expect(r.decisions.notes.filter((n) => n.kind === 'held' && n.reason === 'needs-prepare')).toEqual([]);
+    }
+    // …and never reads as a self-diagnosed stall, which is fed from the same held entries.
+    expect(tick({}).decisions.stalled).toEqual([]);
+  });
+
+  it('every dispatch-plan held reason is either excluded from the generic note or deliberately generic', () => {
+    // Adding a HELD_REASONS entry forces a choice here, instead of silently doubling its note (the prepare-stale miss).
+    const GENERIC = ['already-done', 'blocked', 'branch-drift-blocked', 'no free lane', 'capacity-cap', 'overlaps lane-<n>',
+      'cleared-but-not-ready', 'dispatch-paused', 'pr-limit'];
+    const unclassified = HELD_REASONS.filter((r) => !HELD_NOTE_EXCLUDED_REASONS.includes(r) && !GENERIC.includes(r));
+    expect(unclassified).toEqual([]);
+    expect(GENERIC.filter((r) => HELD_NOTE_EXCLUDED_REASONS.includes(r))).toEqual([]);
+  });
+
+  it('without the window every candidate is offered (other callers unchanged)', () => {
+    const r = tick({});
+    expect(r.decisions.notes.some((n) => n.kind === 'prepare-ahead-window')).toBe(false);
+  });
 });

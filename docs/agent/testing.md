@@ -739,6 +739,14 @@ or the admitted `npm run test:unit -- <file>` / `npm run check:standards` script
 assert the suggested command verbatim and probe stdin-to-stdout hook wiring; unrelated
 allow-case fixtures must use admitted commands.
 
+### Prepare queue admission
+
+Operator decision 2026-10-06: prepare-family dispatches (`prepare`, `prepare-scope`, `prepare-decision`,
+`prepare-item`, `investigate`) are gated by the same heavy-test queue budget (`queue-cap`) as builds. Each is
+charged the rolling median of a prepare session's summed heavy holds (seeded with one selected run plus one
+check:standards until three sessions are recorded). `WE_QUEUE_ADMISSION_PREPARE=exempt` restores the old
+exemption. Review stays exempt.
+
 ### Ungated heavy-run observations
 
 `we:scripts/conveyor/heavy-run-ungated.mjs` classifies executable/argv positions and walks

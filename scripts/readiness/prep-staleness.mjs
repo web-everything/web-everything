@@ -27,13 +27,15 @@ import { idFromName } from '../backlog/id.mjs';
  * @param {string[]} [opts.scope]
  * @param {string} [opts.preparedAgainstSha]
  * @param {string} [opts.cwd=process.cwd()]
+ * @param {string} [opts.head='HEAD'] - the tip to compare against (the build daemon passes `origin/main`, card 80:
+ *   a daemon clone's HEAD can carry overlay commits that are not on main).
  * @returns {{ checked: true, stale: boolean, changedFiles: string[], skipped: string[] } | { checked: false, reason: string }}
  *   checked:false when the card has no preparedAgainstSha (nothing to compare) or the sha is unreachable
  *   (e.g. squash-merged and gc'd) — NOT an error, a "can't tell" result the caller must handle explicitly.
  *   `skipped`: scope entries this repo's diff cannot check (non-`we:` locus prefixes — another repo's
  *   files) — listed, never silently dropped.
  */
-export function checkPrepStaleness({ scope, preparedAgainstSha, cwd = process.cwd() } = {}) {
+export function checkPrepStaleness({ scope, preparedAgainstSha, cwd = process.cwd(), head = 'HEAD' } = {}) {
   if (!preparedAgainstSha || typeof preparedAgainstSha !== 'string' || !preparedAgainstSha.trim()) {
     return { checked: false, reason: 'no preparedAgainstSha' };
   }
@@ -76,7 +78,7 @@ export function checkPrepStaleness({ scope, preparedAgainstSha, cwd = process.cw
   }
 
   try {
-    const stdout = execFileSync('git', ['diff', '--name-only', sha, 'HEAD', '--', ...scopeFiles], {
+    const stdout = execFileSync('git', ['diff', '--name-only', sha, head, '--', ...scopeFiles], {
       cwd,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
