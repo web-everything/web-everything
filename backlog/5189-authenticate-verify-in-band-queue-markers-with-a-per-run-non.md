@@ -17,7 +17,7 @@ Goal: gate output must not stretch its own ceiling by printing a line-anchored q
 
 ## Progress
 
-Prepare pass (2026-10-06): premise check against `main` @ cc47a8e8. `git log --grep` for 5189/xhtuli0 finds only the JIT-numbering commit, so the goal is undelivered. All cited lines hold: `GATE_QUEUED_MARKER` at `we:scripts/conveyor/verify-dispatch.mjs:162`, `scanLaterMarkers` at `:447-454` (accepts `line.startsWith('⏳ gate queueing for admission')`), spawn at `:404`, writer at `we:scripts/verify-lane.mjs:513`/`:515`, existing test at `we:scripts/conveyor/__tests__/verify-dispatch.test.mjs:364`. No drift; scope and size 2 unchanged.
+Prepare pass (2026-10-06): premise check against `main` @ cc47a8e8. `git log --grep` for 5189/5189 finds only the JIT-numbering commit, so the goal is undelivered. All cited lines hold: `GATE_QUEUED_MARKER` at `we:scripts/conveyor/verify-dispatch.mjs:162`, `scanLaterMarkers` at `:447-454` (accepts `line.startsWith('⏳ gate queueing for admission')`), spawn at `:404`, writer at `we:scripts/verify-lane.mjs:513`/`:515`, existing test at `we:scripts/conveyor/__tests__/verify-dispatch.test.mjs:364`. No drift; scope and size 2 unchanged.
 
 ## Design
 
