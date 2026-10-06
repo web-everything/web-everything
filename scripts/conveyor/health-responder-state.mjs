@@ -1,6 +1,7 @@
 /** Pinned diagnostic store. Journal is authoritative; receipts are a rebuildable atomic index. */
 import { openSync, closeSync, readFileSync, readSync, fstatSync, writeSync, fsyncSync, mkdirSync, renameSync, constants, lstatSync, readdirSync, existsSync, linkSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { createHash } from 'node:crypto';
 import { healthDir } from './health-watch-section.mjs';
 import { scrubDeep } from './health-watch-core.mjs';
 import { DEFAULT_CONFIG, RECEIPT_STATES } from './health-responder-core.mjs';
@@ -48,18 +49,19 @@ export function readResponderConfig(dir) {
   catch (e) { return e.code === 'ENOENT' ? { ...DEFAULT_CONFIG, smells: {} } : null; }
 }
 const JOURNAL = 'decisions.jsonl';
-/** The active segment is rotated out once it reaches this size, so a tick only ever reads a small file. */
+/** Bounds the active file; receipt verification still reads all historical segments. */
 export const JOURNAL_ROTATE_BYTES = 8 * 1024 * 1024;
 const SEGMENT = /^decisions\.\d{8}T\d{9}Z(-\d+)?\.jsonl$/;
 const ARCHIVE = 'receipts-archive.json';
 /** Chunked line reader: memory stays bounded by one chunk plus one line, whatever the file size. */
-function forEachLine(file, onLine) {
+function forEachLine(file, onLine, hash) {
   const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     if (!fstatSync(fd).isFile()) throw new Error('non-regular or oversized input');
     const chunk = Buffer.alloc(1024 * 1024);
     let carry = Buffer.alloc(0), n;
     while ((n = readSync(fd, chunk, 0, chunk.length, null)) > 0) {
+      hash?.update(chunk.subarray(0, n)); // Exact bytes, including blank lines and delimiters.
       const data = carry.length ? Buffer.concat([carry, chunk.subarray(0, n)]) : chunk.subarray(0, n);
       let start = 0, end;
       while ((end = data.indexOf(10, start)) !== -1) {
@@ -94,28 +96,38 @@ function segmentNames(dir) {
   catch (e) { if (e.code === 'ENOENT') return []; throw e; }
 }
 /**
- * Receipts held by rotated segments. Rebuildable cache: a segment missing from the archive (a crash between rename
- * and index, or a lost/corrupt archive file) is re-read from the segment itself, so the journal stays authoritative.
+ * Validate every segment and derive receipts from its rows. The archive is a rebuildable projection plus
+ * a byte-integrity baseline, not an authenticated log; losing it also loses the previous digest baseline.
  */
 export function archivedReceipts(dir) {
   const names = segmentNames(dir);
-  if (!names.length) return [];
   let known = [];
   try {
     const archive = JSON.parse(boundedText(join(dir, ARCHIVE), Infinity)); // size must never stop a tick; it holds receipts only
     if (archive?.schema === 1 && Array.isArray(archive.segments)) known = archive.segments;
   } catch (e) { if (!(e.code === 'ENOENT' || e instanceof SyntaxError)) throw e; }
-  const byName = new Map(known.filter((s) => s && Array.isArray(s.receipts)).map((s) => [s.name, s.receipts]));
-  let dirty = byName.size !== known.length || [...byName.keys()].some((n) => !names.includes(n));
+  const byName = new Map();
+  for (const entry of known) {
+    if (!entry || typeof entry.name !== 'string') continue;
+    if (!byName.has(entry.name)) byName.set(entry.name, []);
+    byName.get(entry.name).push(entry);
+  }
   const segments = names.map((name) => {
-    if (!byName.has(name)) {
-      const acts = [];
-      forEachLine(join(dir, name), (line) => { const row = parseRow(line); if (row.decision === 'act-would-have') acts.push(row); });
-      byName.set(name, receiptsFromJournal(acts)); dirty = true;
+    const acts = [], hash = createHash('sha256');
+    forEachLine(join(dir, name), (line) => { const row = parseRow(line); if (row.decision === 'act-would-have') acts.push(row); }, hash);
+    const contentHash = hash.digest('hex');
+    // Even malformed receipt projections (or duplicate entries) must not discard a valid baseline.
+    for (const entry of byName.get(name) ?? []) {
+      if (typeof entry.contentHash === 'string' && /^[a-f0-9]{64}$/i.test(entry.contentHash)
+        && entry.contentHash.toLowerCase() !== contentHash) throw new Error(`journal segment integrity mismatch: ${name}`);
     }
-    return { name, receipts: byName.get(name) };
+    return { name, contentHash, receipts: receiptsFromJournal(acts) };
   });
-  if (dirty) atomic(dir, ARCHIVE, { schema: 1, segments });
+  // Scrub receipt strings, but preserve generated digests: entropy scrubbing can redact valid SHA-256 hex.
+  const persisted = segments.map((s) => ({ ...s, receipts: scrubDeep(s.receipts) }));
+  // Compare persisted JSON so undefined receipt fields do not cause perpetual repairs.
+  // Publish only after every segment passed, so a later failure cannot commit a partial repair.
+  if (JSON.stringify(known) !== JSON.stringify(persisted)) atomic(dir, ARCHIVE, { schema: 1, segments: persisted }, JSON.stringify);
   return segments.flatMap((s) => s.receipts);
 }
 /** Every receipt the responder knows about: rotated segments plus the active one. */
@@ -123,7 +135,7 @@ export function readReceipts(dir) {
   return [...archivedReceipts(dir), ...receiptsFromJournal(readJournal(dir))];
 }
 /**
- * Keeps the journal append-only and complete while bounding what a tick reads: once the active segment reaches
+ * Keeps the journal append-only and complete while bounding the active file: once the active segment reaches
  * `rotateBytes` it is renamed (never rewritten, truncated or deleted) to a timestamped segment and indexed.
  */
 export function rotateJournalIfNeeded(dir, { rotateBytes = JOURNAL_ROTATE_BYTES, now = Date.now } = {}) {
@@ -158,10 +170,10 @@ function ensureStore(dir) {
   mkdirSync(dir, { recursive: true });
   if (lstatSync(dir).isSymbolicLink()) throw new Error('responder store must not be a symlink');
 }
-function atomic(dir, name, value) {
+function atomic(dir, name, value, serialize = (v) => JSON.stringify(scrubDeep(v))) {
   const tmp = join(dir, `${name}.${process.pid}.tmp`);
   const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
-  try { writeSync(fd, JSON.stringify(scrubDeep(value)) + '\n'); fsyncSync(fd); } finally { closeSync(fd); }
+  try { writeSync(fd, serialize(value) + '\n'); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(tmp, join(dir, name));
   const d = openSync(dir, 'r'); try { fsyncSync(d); } finally { closeSync(d); }
 }

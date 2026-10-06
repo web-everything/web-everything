@@ -1,10 +1,14 @@
 // @vitest-environment node
-import { it, expect, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { it, expect, afterEach, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readWatchGeneration, readJournal, appendDecisions, receiptsFromJournal, readResponderConfig, readReceipts, archivedReceipts, rotateJournalIfNeeded, readLatestDecisions, responderDir } from '../health-responder-state.mjs';
 import { decide } from '../health-responder-core.mjs';
+import { shadowTick } from '../health-responder.mjs';
+import { healthDir } from '../health-watch-section.mjs';
+import { scrubDeep } from '../health-watch-core.mjs';
 const replay = JSON.parse(readFileSync(new URL('./fixtures/health-responder/replay.json', import.meta.url)));
 const green = replay.cases.find((c) => c.name === 'D1-fresh-green');
 const roots = []; const temp = () => { const p = mkdtempSync(join(tmpdir(), 'health-responder-')); roots.push(p); return p; };
@@ -68,6 +72,184 @@ it('missing config defaults disabled, corrupt config stays unknown', () => {
 const actRows = () => decide({ now: replay.now, episodes: [green.episode], watchGeneration: { valid: true, completedAt: replay.now },
   subjectFacts: { [green.episode.key]: green.facts }, config: { version: 1, enabled: true, mode: 'shadow', smells: { [green.episode.smell]: true } } });
 const segmentsOf = (dir) => readdirSync(dir).filter((n) => /^decisions\..+\.jsonl$/.test(n)).sort();
+function cachedStore(dir = temp()) {
+  appendDecisions(dir, actRows());
+  rotateJournalIfNeeded(dir, { rotateBytes: 1 });
+  return { dir, segment: join(dir, segmentsOf(dir)[0]), archive: join(dir, 'receipts-archive.json') };
+}
+const storeBytes = (dir) => Object.fromEntries(readdirSync(dir).sort().map((name) => [name, readFileSync(join(dir, name))]));
+it.each([
+  ['partial final line', (text) => text + '{partial'],
+  ['malformed JSON', () => '{broken}\n'],
+  ['invalid schema', (text) => text.replace('"schema":1', '"schema":2')],
+])('refuses a cached segment with %s without changing store bytes', (_, corrupt) => {
+  const { dir, segment } = cachedStore();
+  writeFileSync(segment, corrupt(readFileSync(segment, 'utf8')));
+  const before = storeBytes(dir);
+  expect(() => readReceipts(dir)).toThrow();
+  expect(storeBytes(dir)).toEqual(before);
+});
+it.each(['replace', 'remove', 'inject', 'malformed'])('repairs %s cached receipts from journal rows', (change) => {
+  const { dir, segment, archive } = cachedStore();
+  const expected = readReceipts(dir), bytes = readFileSync(segment);
+  const cached = JSON.parse(readFileSync(archive));
+  const forged = { ...expected[0], familyKey: 'forged', identity: 'forged' };
+  if (change === 'replace') cached.segments[0].receipts = [forged];
+  if (change === 'remove') delete cached.segments[0].receipts;
+  if (change === 'inject') cached.segments[0].receipts.push(forged);
+  if (change === 'malformed') cached.segments[0].receipts = { forged: true };
+  writeFileSync(archive, JSON.stringify(cached));
+  const inode = statSync(archive).ino;
+  expect(readReceipts(dir)).toEqual(expected);
+  expect(statSync(archive).ino).not.toBe(inode);
+  expect(readdirSync(dir).filter((name) => name.endsWith('.tmp'))).toEqual([]);
+  expect(JSON.parse(readFileSync(archive)).segments[0].receipts).toEqual(JSON.parse(JSON.stringify(expected)));
+  expect(readFileSync(segment)).toEqual(bytes);
+});
+it.each(['same-length identity', 'non-receipt field', 'blank line'])('rejects a digest mismatch for %s bytes', (change) => {
+  const { dir, segment, archive } = cachedStore();
+  const original = readFileSync(segment, 'utf8'), row = JSON.parse(original);
+  if (change === 'same-length identity') row.episodeIdentity.id = row.episodeIdentity.id.replace(/[a-z]/, (c) => c === 'x' ? 'y' : 'x');
+  if (change === 'non-receipt field') row.rule = 'x'.repeat(row.rule.length);
+  const changed = change === 'blank line' ? original + '\n' : JSON.stringify(row) + '\n';
+  if (change !== 'blank line') expect(Buffer.byteLength(changed)).toBe(Buffer.byteLength(original));
+  if (change === 'non-receipt field') expect(receiptsFromJournal([row])).toEqual(receiptsFromJournal([JSON.parse(original)]));
+  writeFileSync(segment, changed);
+  // A broken projection must not turn the retained hash into a cache miss.
+  const cached = JSON.parse(readFileSync(archive)); delete cached.segments[0].receipts;
+  writeFileSync(archive, JSON.stringify(cached));
+  const before = storeBytes(dir);
+  expect(() => readReceipts(dir)).toThrow(`journal segment integrity mismatch: ${segmentsOf(dir)[0]}`);
+  expect(storeBytes(dir)).toEqual(before);
+});
+it.each([undefined, null, '', 'bad', 'a'.repeat(63), 'g'.repeat(64), 123, {}])('rebuilds invalid or legacy digest metadata %j only from valid segments', (contentHash) => {
+  const { dir, segment, archive } = cachedStore(), expected = readReceipts(dir);
+  const cached = JSON.parse(readFileSync(archive));
+  cached.segments[0].contentHash = contentHash;
+  cached.segments[0].receipts = [];
+  const stale = JSON.stringify(cached);
+  writeFileSync(archive, stale);
+  expect(readReceipts(dir)).toEqual(expected);
+  expect(JSON.parse(readFileSync(archive)).segments[0].contentHash).toBe(createHash('sha256').update(readFileSync(segment)).digest('hex'));
+  writeFileSync(archive, stale);
+  writeFileSync(segment, '{broken}\n');
+  const before = storeBytes(dir);
+  expect(() => readReceipts(dir)).toThrow();
+  expect(storeBytes(dir)).toEqual(before);
+});
+it.each(['missing', 'broken', 'empty', 'stale', 'wrong schema'])('validates segments before rebuilding a %s archive', (kind) => {
+  const { dir, segment, archive } = cachedStore(), expected = readReceipts(dir);
+  const invalidate = () => {
+    if (kind === 'missing') rmSync(archive);
+    else if (kind === 'broken') writeFileSync(archive, '{broken');
+    else writeFileSync(archive, JSON.stringify({ schema: kind === 'wrong schema' ? 2 : 1,
+      segments: kind === 'stale' ? [{ name: 'stale', receipts: [] }] : [] }));
+  };
+  invalidate();
+  expect(readReceipts(dir)).toEqual(expected);
+  const rebuilt = readFileSync(archive);
+  invalidate();
+  expect(readReceipts(dir)).toEqual(expected);
+  expect(readFileSync(archive)).toEqual(rebuilt);
+  invalidate(); writeFileSync(segment, '{broken}\n');
+  const before = storeBytes(dir);
+  expect(() => readReceipts(dir)).toThrow();
+  expect(storeBytes(dir)).toEqual(before);
+});
+it('removes stale index entries, including after the final segment is removed', () => {
+  const { dir, segment, archive } = cachedStore(), expected = readReceipts(dir);
+  const cached = JSON.parse(readFileSync(archive));
+  cached.segments.unshift({ ...cached.segments[0], name: 'stale' });
+  writeFileSync(archive, JSON.stringify(cached));
+  expect(readReceipts(dir)).toEqual(expected);
+  expect(JSON.parse(readFileSync(archive)).segments.map((s) => s.name)).toEqual(segmentsOf(dir));
+  rmSync(segment);
+  expect(readReceipts(dir)).toEqual([]);
+  expect(JSON.parse(readFileSync(archive)).segments).toEqual([]);
+});
+it('keeps every valid duplicate digest baseline when rebuilding a malformed index', () => {
+  const { dir, segment, archive } = cachedStore();
+  const cached = JSON.parse(readFileSync(archive));
+  cached.segments.push({ name: cached.segments[0].name, receipts: [] });
+  writeFileSync(archive, JSON.stringify(cached));
+  writeFileSync(segment, readFileSync(segment, 'utf8') + '\n');
+  const before = storeBytes(dir);
+  expect(() => readReceipts(dir)).toThrow('integrity mismatch');
+  expect(storeBytes(dir)).toEqual(before);
+});
+it.each(['partial', 'digest'])('publishes no partial repair when a later segment fails %s validation', (failure) => {
+  const { dir, archive } = cachedStore();
+  appendDecisions(dir, actRows()); rotateJournalIfNeeded(dir, { rotateBytes: 1 });
+  const cached = JSON.parse(readFileSync(archive));
+  delete cached.segments[0].contentHash; cached.segments[0].receipts = [];
+  writeFileSync(archive, JSON.stringify(cached));
+  const later = join(dir, cached.segments[1].name);
+  writeFileSync(later, readFileSync(later, 'utf8') + (failure === 'partial' ? '{partial' : '\n'));
+  const before = storeBytes(dir);
+  expect(() => readReceipts(dir)).toThrow();
+  expect(storeBytes(dir)).toEqual(before);
+});
+it.each(['symlink', 'directory'])('rejects a cached segment replaced by a %s', (kind) => {
+  const { dir, segment, archive } = cachedStore(), before = readFileSync(archive);
+  const target = join(temp(), 'target.jsonl'), original = readFileSync(segment);
+  writeFileSync(target, original); rmSync(segment);
+  if (kind === 'symlink') symlinkSync(target, segment); else mkdirSync(segment);
+  expect(() => readReceipts(dir)).toThrow();
+  expect(readFileSync(archive)).toEqual(before);
+  expect(readFileSync(target)).toEqual(original);
+});
+it.each(['partial', 'digest'])('blocks append and shadowTick before facts or decisions on cached %s corruption', async (failure) => {
+  const root = temp(), { dir, segment } = cachedStore(responderDir(root));
+  mkdirSync(healthDir(root), { recursive: true }); watch(healthDir(root));
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ version: 1, enabled: true, mode: 'shadow', smells: { [green.episode.smell]: true } }));
+  writeFileSync(join(dir, 'last-tick.json'), JSON.stringify({ completedAt: replay.now - 1 }));
+  expect(readWatchGeneration(healthDir(root)).watchGeneration.valid).toBe(true);
+  expect(readResponderConfig(dir).enabled).toBe(true);
+  writeFileSync(segment, readFileSync(segment, 'utf8') + (failure === 'partial' ? '{partial' : '\n'));
+  const before = storeBytes(dir);
+  expect(() => appendDecisions(dir, actRows())).toThrow();
+  expect(storeBytes(dir)).toEqual(before);
+  const readFacts = vi.fn(async () => { throw new Error('fact-reader tripwire'); });
+  await expect(shadowTick({ stateRoot: root, now: replay.now, clock: () => replay.now, readFacts })).rejects.toThrow();
+  expect(readFacts).not.toHaveBeenCalled();
+  expect(storeBytes(dir)).toEqual(before);
+});
+it('hashes raw multi-byte chunks and avoids rewriting intact persisted projections', () => {
+  const dir = temp(), row = { ...actRows()[0], schema: 1, familyKey: 'token ' + 'a'.repeat(20), pad: 'é'.repeat(700_000) };
+  delete row.expectedHeadOrLease; // undefined receipt fields are omitted by JSON persistence.
+  let bytes = Buffer.from('\n' + JSON.stringify(row) + '\n\n');
+  if (bytes[1024 * 1024] !== 0xa9) bytes = Buffer.concat([Buffer.from('\n'), bytes]);
+  expect(bytes[1024 * 1024]).toBe(0xa9); // The next chunk starts midway through é.
+  writeFileSync(join(dir, 'decisions.jsonl'), bytes);
+  rotateJournalIfNeeded(dir, { rotateBytes: 1 });
+  const archive = join(dir, 'receipts-archive.json'), before = readFileSync(archive), stat = statSync(archive);
+  const cached = JSON.parse(before).segments[0];
+  expect(cached.contentHash).toBe(createHash('sha256').update(bytes).digest('hex'));
+  expect(cached.receipts).toEqual(JSON.parse(JSON.stringify(scrubDeep(receiptsFromJournal([row])))));
+  for (let i = 0; i < 2; i++) expect(readReceipts(dir)).toEqual(receiptsFromJournal([row]));
+  expect(readFileSync(archive)).toEqual(before);
+  expect(statSync(archive).ino).toBe(stat.ino);
+  expect(statSync(archive).mtimeMs).toBe(stat.mtimeMs);
+  expect(readFileSync(join(dir, segmentsOf(dir)[0]))).toEqual(bytes);
+});
+it('preserves generated digest baselines even when the text scrubber considers them secret-shaped', () => {
+  const dir = temp(), row = { ...actRows()[0], schema: 1 };
+  let bytes, digest;
+  for (let nonce = 0; nonce < 1000; nonce++) {
+    bytes = JSON.stringify({ ...row, nonce }) + '\n';
+    digest = createHash('sha256').update(bytes).digest('hex');
+    if (scrubDeep(digest) !== digest) break;
+  }
+  expect(scrubDeep(digest)).not.toBe(digest);
+  writeFileSync(join(dir, 'decisions.jsonl'), bytes);
+  rotateJournalIfNeeded(dir, { rotateBytes: 1 });
+  expect(JSON.parse(readFileSync(join(dir, 'receipts-archive.json'))).segments[0].contentHash).toBe(digest);
+  const segment = join(dir, segmentsOf(dir)[0]);
+  writeFileSync(segment, bytes + '\n');
+  const before = storeBytes(dir);
+  expect(() => readReceipts(dir)).toThrow('integrity mismatch');
+  expect(storeBytes(dir)).toEqual(before);
+});
 it('rotates the active journal at the size threshold; segments are complete and receipts survive rotation', () => {
   const dir = temp(), rows = actRows();
   appendDecisions(dir, rows, { rotateBytes: 1 << 30 });
