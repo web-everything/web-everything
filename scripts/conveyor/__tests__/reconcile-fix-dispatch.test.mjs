@@ -652,6 +652,27 @@ describe('freeLaneNumbers', () => {
   });
 });
 
+describe('dispatchFix — permission preparation never blocks a dispatch (PR #3990 review)', () => {
+  it('still spawns exactly once when grantConflictHelper THROWS (a failing settings write must not abort the fix)', () => {
+    const calls = [];
+    const grantConflictHelper = vi.fn(() => { throw new Error('EACCES: settings.local.json is read-only'); });
+    const result = dispatchFix(
+      { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:scripts/conveyor/reconcile-fix-dispatch.mjs'], lane: 9 },
+      {
+        root: '/repo',
+        grantConflictHelper,
+        readBrief: () => REAL_TEMPLATE_STUB,
+        mintSessionId: () => '22222222-2222-4222-8222-222222222222',
+        spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
+      },
+    );
+    expect(grantConflictHelper).toHaveBeenCalledTimes(1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].opts.cwd).toBe(dispatchSessionCwd('22222222-2222-4222-8222-222222222222', { root: '/repo' }));
+    expect(result.sessionId).toBe('22222222-2222-4222-8222-222222222222');
+  });
+});
+
 describe('dispatchFix — the composition: plan → fill → mint → spawn', () => {
   it('spawns exactly once, with a freshly minted session id, the assigned lane, and the filled brief as the prompt', () => {
     const calls = [];

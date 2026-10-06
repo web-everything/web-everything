@@ -81,7 +81,9 @@ export function noteEpisodeKey(note) {
   if (note?.kind === 'round-cap-exhausted') {
     return `round-cap-exhausted:${pr}:${note.capKind ?? 'unknown-population'}:${note.attempts}/${note.cap}`;
   }
-  if (note?.kind === 'permission-blocked') return `permission-blocked:${pr}:${note.since ?? 'unknown-since'}`;
+  // Keyed on the streak's first timestamp, so every cycle of ONE streak shares one comment; reaching the cap is
+  // the one further episode (`:capped`) — at most two comments per streak, never one per cycle.
+  if (note?.kind === 'permission-blocked') return `permission-blocked:${pr}:${note.since ?? 'unknown-since'}${note.capped ? ':capped' : ''}`;
   if (note?.kind === 'infra-retry-exhausted') {
     return `infra-retry-exhausted:${pr}:${note.since ?? 'unknown-since'}`;
   }

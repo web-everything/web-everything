@@ -710,6 +710,20 @@ export const INFRA_RETRY_CAPPED_COOLOFF_MS = 60 * 60 * 1000;
 export const PERMISSION_BLOCKED_COOLOFF_MS = INFRA_RETRY_CAPPED_COOLOFF_MS;
 
 /**
+ * we:scripts/conveyor/reconcile-core.mjs#PERMISSION_RETRY_CAP — the durable per-SESSION `blocked-on-permission`
+ * STREAK cap (PR #3990 review, security/resource-exhaustion). Without it a permission-walled PR (or a fixer that
+ * keeps reporting the outcome) was re-dispatched every {@link PERMISSION_BLOCKED_COOLOFF_MS} forever, each run
+ * burning an agent seat and a lane. The streak is persisted by the completion store
+ * (`we:scripts/operations/completion-store.mjs#writeCompletion`, `permissionStreak`), read back here. At the cap
+ * the retry slows to {@link PERMISSION_CAPPED_COOLOFF_MS} — a wall can clear when an allow rule lands, so it is
+ * never stopped outright (same rule as {@link INFRA_RETRY_CAP}) — and {@link planReconcile} surfaces it once more.
+ */
+export const PERMISSION_RETRY_CAP = 3;
+
+/** The lengthened cool-off (24 hours) once the `blocked-on-permission` streak reaches {@link PERMISSION_RETRY_CAP}. */
+export const PERMISSION_CAPPED_COOLOFF_MS = 24 * 60 * 60 * 1000;
+
+/**
  * we:scripts/conveyor/reconcile-core.mjs#LIVE_SESSION_OVERRUN_MS — xilx617 (epic #4075/#3383): the default bound
  * past which a `live-process` refusal (a bound session with a probed-live pid — see {@link assessLiveness}) also
  * gets a surfaced `kind:'session-overrun'` note, so a session that has been "just working" for hours does not
@@ -776,8 +790,20 @@ export function markSelfReportedDone(agents, completionFor, nowMs, { infraCoolof
     if (rec.outcome === 'blocked-on-permission') {
       // Re-sanitized at read time: a record written before the write-point sanitizer (or hand-edited) must never
       // reach the bot-authored note comment verbatim (PR #3990 review).
-      const evidence = { permissionBlocked: true, deniedCommand: sanitizeDeniedCommand(rec.denied), permissionBlockedSince: rec.updatedAt };
-      if (!(nowMs - updatedMs >= PERMISSION_BLOCKED_COOLOFF_MS)) {
+      // The durable per-session streak (the completion STORE's own write path maintains it; a record that predates
+      // it counts as 1). `permissionBlockedSince` is the STREAK's first timestamp, so a note episode spans the whole
+      // streak instead of changing with every completion's `updatedAt`.
+      const permissionStreak = Number.isInteger(rec.permissionStreak) && rec.permissionStreak > 0 ? rec.permissionStreak : 1;
+      const permissionStreakCapped = permissionStreak >= PERMISSION_RETRY_CAP;
+      const evidence = {
+        permissionBlocked: true,
+        deniedCommand: sanitizeDeniedCommand(rec.denied),
+        permissionBlockedSince: rec.permissionStreakSince ?? rec.updatedAt,
+        permissionStreak,
+        permissionStreakCapped,
+      };
+      const permissionCooloffMs = permissionStreakCapped ? PERMISSION_CAPPED_COOLOFF_MS : PERMISSION_BLOCKED_COOLOFF_MS;
+      if (!(nowMs - updatedMs >= permissionCooloffMs)) {
         return { ...a, ...evidence, awaitingInfraCooloff: true };
       }
       return { ...a, ...evidence, awaitingInfraCooloff: false, selfReportedDone: true, selfReportedOutcome: rec.outcome };
@@ -1664,9 +1690,12 @@ export function planReconcile({
     if (permissionBlocked) {
       const deniedCommand = sanitizeDeniedCommand(permissionBlocked.agent.deniedCommand);
       const since = permissionBlocked.agent.permissionBlockedSince ?? null;
+      const capped = permissionBlocked.agent.permissionStreakCapped === true;
+      const streak = Number.isInteger(permissionBlocked.agent.permissionStreak) ? permissionBlocked.agent.permissionStreak : 1;
       notes.push({
-        kind: 'permission-blocked', prNumber, deniedCommand, since,
-        text: `PR #${prNumber}: fixer stopped by a permission denial (${deniedCommand ?? 'denied command not recorded'}) — retrying blindly will hit the same wall; the product needs a sanctioned path or allow rule`,
+        kind: 'permission-blocked', prNumber, deniedCommand, since, streak, cap: PERMISSION_RETRY_CAP, capped,
+        text: `PR #${prNumber}: fixer stopped by a permission denial (${deniedCommand ?? 'denied command not recorded'}) — retrying blindly will hit the same wall; the product needs a sanctioned path or allow rule`
+          + (capped ? ` — the blocked-on-permission streak reached the cap (${PERMISSION_RETRY_CAP}); retries are now slowed to one per ${PERMISSION_CAPPED_COOLOFF_MS / 3_600_000} hours until the denied command is allowed` : ''),
       });
     }
     const infraCapped = bound.find((b) => b.agent?.infraStreakCapped === true);

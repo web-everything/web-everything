@@ -24,6 +24,7 @@ import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 import {
   resolveRoundCap, planReconcile, markSelfReportedDone, assessLiveness,
   INFRA_RETRY_CAP, INFRA_RETRY_COOLOFF_MS, INFRA_RETRY_CAPPED_COOLOFF_MS, LIVE_SESSION_OVERRUN_MS,
+  PERMISSION_RETRY_CAP, PERMISSION_BLOCKED_COOLOFF_MS, PERMISSION_CAPPED_COOLOFF_MS,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CI_HEAL_ROUND_CAP,
 } from '../reconcile-core.mjs';
 import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
@@ -327,6 +328,10 @@ describe('PR #3990 review — a hostile `denied` in a completion record cannot f
     ['a double-quoted --token=', 'tool --token="supersecretvalue123" go'],
     ['a space-separated quoted --password', 'tool --password "supersecretvalue123" go'],
     ['an X-Api-Key header', 'curl -H "X-Api-Key: supersecretvalue123" https://x'],
+    // PR #3990 review round 4 (CONFIRMED): a shell-escaped quote inside the value must not end redaction early.
+    ['an escaped quote inside a double-quoted --password=', 'tool --password="prefix\\"supersecretvalue123" go'],
+    ['an escaped quote inside a double-quoted env assignment', 'API_TOKEN="prefix\\"supersecretvalue123" node run.mjs'],
+    ['an escaped quote inside a single-quoted --token', "tool --token 'prefix\\'supersecretvalue123' go"],
   ])('never posts a literal secret from %s into the PR comment body', (_label, quoted) => {
     const note = planWith(quoted).notes.find((n) => n.kind === 'permission-blocked');
     expect(note.deniedCommand).not.toContain('supersecretvalue123');
@@ -481,5 +486,155 @@ describe('audited extension lifts the generic fixer cap', () => {
       expect(plan.dispatch).toHaveLength(0);
       expect(plan.notes).toContainEqual(expect.objectContaining({ capKind: 'fix', parkToHuman: true }));
     }
+  });
+});
+
+// PR #3990 review round 4 (security/resource-exhaustion): a `blocked-on-permission` turn fed NO counter, so a
+// permission-walled PR was re-dispatched every 60 minutes forever, and every completion's fresh `updatedAt`
+// minted a NEW note episode (a new bot comment per cycle). The streak is persisted by the completion store (like
+// `infraStreak`), capped at PERMISSION_RETRY_CAP, and the note is keyed on the streak's first timestamp.
+describe('PR #3990 review round 4 — blocked-on-permission is bounded by a persisted streak', () => {
+  let dir;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'we-op-completions-perm-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  const started = (session = 'fix-3964') => newCompletionRecord({ session, kind: 'fix', pr: 3964, now: () => '2026-09-26T10:00:00.000Z' });
+  const doneAt = (rec, outcome, updatedAt) => writeCompletion({ ...rec, status: 'done', outcome, updatedAt, ...(outcome === 'blocked-on-permission' ? { denied: 'git checkout --theirs f' } : {}) }, dir);
+
+  it('a FIRST blocked-on-permission done write starts the streak at 1 with `since` == its own updatedAt', () => {
+    doneAt(started(), 'blocked-on-permission', '2026-09-26T10:05:00.000Z');
+    const stored = tryReadCompletion('fix-3964', dir);
+    expect(stored.permissionStreak).toBe(1);
+    expect(stored.permissionStreakSince).toBe('2026-09-26T10:05:00.000Z');
+  });
+
+  it('consecutive blocked-on-permission writes increment it, carrying it across a fresh `started` record and keeping the FIRST `since`', () => {
+    doneAt(started(), 'blocked-on-permission', '2026-09-26T10:05:00.000Z');
+    writeCompletion(started(), dir); // a fresh dispatch generation mints a brand-new record
+    const midway = tryReadCompletion('fix-3964', dir);
+    expect(midway.permissionStreak).toBe(1);
+    expect(midway.permissionStreakSince).toBe('2026-09-26T10:05:00.000Z');
+    doneAt(midway, 'blocked-on-permission', '2026-09-26T11:10:00.000Z');
+    const stored = tryReadCompletion('fix-3964', dir);
+    expect(stored.permissionStreak).toBe(2);
+    expect(stored.permissionStreakSince).toBe('2026-09-26T10:05:00.000Z');
+    // The two streaks are independent: a permission wall is not an infra outage.
+    expect(stored.infraStreak).toBeUndefined();
+  });
+
+  it.each(['constructor', 'toString', 'hasOwnProperty', '__proto__'])('an agent-supplied outcome %j never throws and starts no streak', (outcome) => {
+    expect(() => doneAt(started(), outcome, '2026-09-26T10:05:00.000Z')).not.toThrow();
+    const stored = tryReadCompletion('fix-3964', dir);
+    expect(stored.permissionStreak).toBeUndefined();
+    expect(stored.infraStreak).toBeUndefined();
+  });
+
+  it.each(['accepted', 'blocked-on-infra', 'gate-red'])('a %s outcome ends the permission streak', (outcome) => {
+    doneAt(started(), 'blocked-on-permission', '2026-09-26T10:05:00.000Z');
+    writeCompletion(started(), dir);
+    doneAt(tryReadCompletion('fix-3964', dir), outcome, '2026-09-26T11:05:00.000Z');
+    const stored = tryReadCompletion('fix-3964', dir);
+    expect(stored.permissionStreak).toBeUndefined();
+    expect(stored.permissionStreakSince).toBeUndefined();
+  });
+
+  it('a blocked-on-permission outcome ends an infra streak (and vice versa) — consecutive means the SAME outcome', () => {
+    doneAt(started(), 'blocked-on-infra', '2026-09-26T10:05:00.000Z');
+    writeCompletion(started(), dir);
+    doneAt(tryReadCompletion('fix-3964', dir), 'blocked-on-permission', '2026-09-26T11:05:00.000Z');
+    const stored = tryReadCompletion('fix-3964', dir);
+    expect(stored.infraStreak).toBeUndefined();
+    expect(stored.permissionStreak).toBe(1);
+  });
+
+  const listed = { name: 'fix-3964', state: 'stopped', startedAt: NOW - 120_000 };
+  const permRec = (streak, over = {}) => ({
+    status: 'done', outcome: 'blocked-on-permission', updatedAt: new Date(NOW).toISOString(), denied: 'git checkout --theirs f',
+    permissionStreak: streak, permissionStreakSince: '2026-09-26T08:00:00.000Z', ...over,
+  });
+
+  it('BELOW the cap the 60-minute cool-off still applies and the row is not flagged capped', () => {
+    const agents = markSelfReportedDone([listed], () => permRec(PERMISSION_RETRY_CAP - 1), NOW + PERMISSION_BLOCKED_COOLOFF_MS);
+    expect(agents[0]).toMatchObject({ selfReportedDone: true, permissionStreak: PERMISSION_RETRY_CAP - 1, permissionStreakCapped: false });
+  });
+
+  it('AT the cap the cool-off grows to PERMISSION_CAPPED_COOLOFF_MS, and the row is flagged capped', () => {
+    const rec = permRec(PERMISSION_RETRY_CAP);
+    for (const elapsed of [PERMISSION_BLOCKED_COOLOFF_MS, 6 * 60 * 60_000, PERMISSION_CAPPED_COOLOFF_MS - 1]) {
+      expect(markSelfReportedDone([listed], () => rec, NOW + elapsed)[0]).toMatchObject({
+        awaitingInfraCooloff: true, permissionStreakCapped: true, permissionStreak: PERMISSION_RETRY_CAP,
+      });
+    }
+    expect(markSelfReportedDone([listed], () => rec, NOW + PERMISSION_CAPPED_COOLOFF_MS)[0]).toMatchObject({
+      selfReportedDone: true, permissionStreakCapped: true,
+    });
+  });
+
+  it('a record with no persisted streak (written before this existed) counts as a streak of 1', () => {
+    const { permissionStreak, permissionStreakSince, ...legacy } = permRec(1);
+    expect(markSelfReportedDone([listed], () => legacy, NOW + 1)[0]).toMatchObject({ permissionStreak: 1, permissionStreakCapped: false, permissionBlockedSince: legacy.updatedAt });
+  });
+
+  it('the note episode is keyed on the STREAK start, so one episode posts ONE comment however many cycles it runs', () => {
+    const pr = prBounced({ number: 3964, headRefOid: 'b'.repeat(40) });
+    const noteAt = (streak, updatedAt) => {
+      const rec = permRec(streak, { updatedAt });
+      const now = Date.parse(updatedAt) + 1000;
+      // The session started BEFORE its own completion record was written (else the record reads as a stale one).
+      const row = { ...listed, startedAt: Date.parse(updatedAt) - 120_000, laneHeadOid: pr.headRefOid };
+      return planReconcile({ prs: [pr], agents: markSelfReportedDone([row], () => rec, now), now }).notes.find((n) => n.kind === 'permission-blocked');
+    };
+    const first = noteAt(1, '2026-09-26T08:05:00.000Z');
+    const second = noteAt(2, '2026-09-26T09:10:00.000Z');
+    expect(noteEpisodeKey(first)).toBe(noteEpisodeKey(second)); // a new completion no longer mints a new comment
+    expect(noteEpisodeKey(first)).toBe('permission-blocked:3964:2026-09-26T08:00:00.000Z');
+  });
+
+  it('reaching the cap posts exactly one MORE note (a distinct episode key) that says retries are now slowed', () => {
+    const pr = prBounced({ number: 3964, headRefOid: 'b'.repeat(40) });
+    const noteFor = (streak) => {
+      const agents = markSelfReportedDone([{ ...listed, laneHeadOid: pr.headRefOid }], () => permRec(streak), NOW + 1000);
+      return planReconcile({ prs: [pr], agents, now: NOW + 1000 }).notes.find((n) => n.kind === 'permission-blocked');
+    };
+    const below = noteFor(PERMISSION_RETRY_CAP - 1);
+    const capped = noteFor(PERMISSION_RETRY_CAP);
+    const cappedLater = noteFor(PERMISSION_RETRY_CAP + 4);
+    expect(noteEpisodeKey(capped)).not.toBe(noteEpisodeKey(below));
+    expect(noteEpisodeKey(capped)).toBe(noteEpisodeKey(cappedLater));
+    expect(capped).toMatchObject({ streak: PERMISSION_RETRY_CAP, cap: PERMISSION_RETRY_CAP });
+    expect(capped.text).toMatch(/streak reached the cap/);
+    expect(below.text).not.toMatch(/streak reached the cap/);
+  });
+
+  it('SIMULATION: a PR whose fixer hits the same permission wall every run is dispatched a bounded number of times over 3 days, with at most 2 note comments', () => {
+    const pr = prBounced({ number: 3964, headRefOid: 'b'.repeat(40) });
+    const T0 = NOW;
+    const HORIZON = 72 * 60 * 60_000;
+    const TICK = 15 * 60_000;
+    let gen = 0;
+    let startedAtMs = T0 - 120_000; // the original (pre-wall) generation
+    const dispatches = [];
+    const noteKeys = new Set();
+    // The wall: the very first run already reported blocked-on-permission one minute after it started.
+    writeCompletion({ ...started(), status: 'done', outcome: 'blocked-on-permission', denied: 'git checkout --theirs f', updatedAt: new Date(T0 - 60_000).toISOString() }, dir);
+    for (let t = T0; t <= T0 + HORIZON; t += TICK) {
+      const row = { name: 'fix-3964', state: 'stopped', startedAt: startedAtMs, laneHeadOid: pr.headRefOid };
+      const agents = markSelfReportedDone([row], (name) => tryReadCompletion(name, dir), t);
+      const plan = planReconcile({ prs: [pr], agents, now: t });
+      for (const n of plan.notes) if (n.kind === 'permission-blocked') noteKeys.add(noteEpisodeKey(n));
+      if (plan.dispatch.length > 0) {
+        dispatches.push(t - T0);
+        gen += 1;
+        startedAtMs = t;
+        writeCompletion(newCompletionRecord({ session: 'fix-3964', kind: 'fix', pr: 3964, now: () => new Date(t).toISOString() }), dir);
+        // the new generation hits the same wall one minute in
+        writeCompletion({ ...tryReadCompletion('fix-3964', dir), status: 'done', outcome: 'blocked-on-permission', denied: 'git checkout --theirs f', updatedAt: new Date(t + 60_000).toISOString() }, dir);
+      }
+    }
+    // Uncapped (the bug): one dispatch per ~60 min ≈ 72. Capped: the first PERMISSION_RETRY_CAP-1 cycles are 60 min
+    // apart, then one per PERMISSION_CAPPED_COOLOFF_MS.
+    const bound = PERMISSION_RETRY_CAP + Math.ceil(HORIZON / PERMISSION_CAPPED_COOLOFF_MS);
+    expect(gen).toBeGreaterThan(0);
+    expect(gen).toBeLessThanOrEqual(bound);
+    expect(noteKeys.size).toBeLessThanOrEqual(2);
   });
 });

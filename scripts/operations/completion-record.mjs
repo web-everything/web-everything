@@ -105,9 +105,12 @@ const DENIED_SCAN_LIMIT = 2000;
  * One secret VALUE as it can appear in a shell command: a double-quoted or single-quoted string (the closing quote
  * is optional so a truncated/unterminated command still redacts to its end) or a bare run. The earlier bare-only
  * `[^\s"']+` could not match a value that STARTS with a quote, so `--token="x"` / `K='x'` / `--password "x"` kept
- * the secret (PR #3990 review). Linear: the input is already bounded by {@link DENIED_SCAN_LIMIT}.
+ * the secret (PR #3990 review). A backslash escapes the next character in all three forms, so an escaped quote
+ * (`--password="a\"b"`) does not end the value early and leave its tail visible (round 4). Every alternative
+ * starts on a different character, so matching never backtracks; the input is also bounded by
+ * {@link DENIED_SCAN_LIMIT}.
  */
-const SECRET_VALUE = `(?:"[^"]*"?|'[^']*'?|[^\\s"']+)`;
+const SECRET_VALUE = `(?:"(?:\\\\.|[^"\\\\])*"?|'(?:\\\\.|[^'\\\\])*'?|(?:\\\\.|[^\\s"'\\\\])+)`;
 
 /**
  * we:scripts/operations/completion-record.mjs#sanitizeDeniedCommand — `denied` is agent-supplied free text (a
@@ -134,7 +137,7 @@ export function sanitizeDeniedCommand(value) {
     // `Name: value` headers and JSON-ish `"name":"value"` fields: `X-Api-Key: v`, `Authorization: v`, `"token":"v"`.
     // Runs AFTER the Bearer/token/Basic pass so an already-redacted scheme word is consumed with its value.
     .replace(
-      new RegExp(`\\b([\\w-]*(?:token|secret|password|passwd|api[-_]?key|auth(?:orization)?)[\\w-]*["']?\\s*:\\s*["']?)(?:(?:Bearer|Basic|token)\\s+)?${SECRET_VALUE}`, 'gi'),
+      new RegExp(`\\b([\\w-]*(?:token|secret|password|passwd|api[-_]?key|auth(?:orization)?)[\\w-]*\\\\?["']?\\s*:\\s*\\\\?["']?)(?:(?:Bearer|Basic|token)\\s+)?${SECRET_VALUE}`, 'gi'),
       '$1[redacted]',
     );
   // Replace (never delete) the delimiters: deleting can splice a NEW `<!--` together (`<!<!----` → `<!--`).

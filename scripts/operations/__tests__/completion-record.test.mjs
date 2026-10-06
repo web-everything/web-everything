@@ -83,6 +83,46 @@ describe('`denied` is agent-supplied free text — sanitized at the single write
     expect(out).toContain('[redacted]');
   });
 
+  // PR #3990 review round 4 (codex-correctness, CONFIRMED): the quoted-value pattern stopped at the FIRST quote
+  // character, so a shell-escaped quote INSIDE the value (`\"`) ended redaction early and the tail was posted.
+  // A matrix, not one case: every quoting form × an escaped quote placed before the secret's tail. Each value is
+  // checked for the PREFIX and the TAIL separately — neither fragment may survive.
+  const PREFIX = 'prefixfragment';
+  const TAIL = 'sensitiveSuffix';
+  it.each([
+    ['--password="…\\"…" (the reviewed repro)', `tool --password="${PREFIX}\\"${TAIL}" go`],
+    ['double-quoted env assignment', `API_TOKEN="${PREFIX}\\"${TAIL}" node run.mjs`],
+    ['space-separated double-quoted --password', `tool --password "${PREFIX}\\"${TAIL}" go`],
+    ['single-quoted --token with an escaped quote', `tool --token '${PREFIX}\\'${TAIL}' go`],
+    ['single-quoted env assignment with an escaped quote', `API_TOKEN='${PREFIX}\\'${TAIL}' node run.mjs`],
+    ['an escaped backslash before the closing quote', `tool --password="${PREFIX}\\\\${TAIL}" go`],
+    ['several escaped quotes', `tool --password="${PREFIX}\\"x\\"y\\"${TAIL}" go`],
+    ['an escaped quote inside an X-Api-Key header', `curl -H "X-Api-Key: ${PREFIX}\\"${TAIL}" https://x`],
+    ['a BARE value with an escaped quote', `tool --password=${PREFIX}\\"${TAIL} go`],
+    ['an escaped quote with a space after it', `tool --password="${PREFIX}\\" ${TAIL}" go`],
+    ['an unterminated quote after an escaped quote', `tool --token="${PREFIX}\\"${TAIL}`],
+    ['a JSON body whose quotes are shell-escaped', `curl -d "{\\"token\\":\\"${PREFIX}${TAIL}\\"}" https://x`],
+  ])('never lets a fragment survive an escaped quote in %s', (_label, input) => {
+    const out = denied(input);
+    expect(out).not.toContain(PREFIX);
+    expect(out).not.toContain(TAIL);
+    expect(out).toContain('[redacted]');
+    // Sanitizing twice (the note path re-sanitizes) must not change it and must not reveal anything new.
+    expect(sanitizeDeniedCommand(out)).toBe(out);
+  });
+
+  it('still keeps the arguments AFTER an escaped-quote secret readable', () => {
+    expect(denied(`node run.mjs --token="${PREFIX}\\"${TAIL}" --verbose`)).toContain('--verbose');
+  });
+
+  it('is linear-time on a long run of escaped quotes (no backtracking blow-up)', () => {
+    const t0 = Date.now();
+    sanitizeDeniedCommand(`--password="${'\\"'.repeat(900)}`);
+    sanitizeDeniedCommand(`--password="${'\\'.repeat(1900)}`);
+    sanitizeDeniedCommand(`API_TOKEN=${'\\"'.repeat(900)}`);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
   it('is idempotent (the note path sanitizes the already-sanitized value a second time)', () => {
     const once = sanitizeDeniedCommand(`API_TOKEN="${SECRET}" tool --password "${SECRET}" -H "X-Api-Key: ${SECRET}"`);
     expect(sanitizeDeniedCommand(once)).toBe(once);
