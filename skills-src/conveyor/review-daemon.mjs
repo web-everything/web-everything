@@ -118,6 +118,8 @@ import {
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
+import { warmReviewFacts, readReviewCiGateFactsFirst, withFactsLabels } from '../../scripts/lib/review-facts.mjs';
+import { createGhProvider } from '../../scripts/lib/review-label-provider.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel, #3870's Fix-dispatch key,
  *  and any future daemon's own key (#3877). */
@@ -794,10 +796,20 @@ export function buildCliDaemonEffects({
   // #4133 — likewise, the real daemon opts INTO the shared-reads optimization by wiring the real
   // `defaultReadPrs`/`defaultReadAgents` through; `runReviewTick`'s own default stays `null` (see that
   // function's own doc for why) so every pre-existing test of it is unaffected here too.
-  runReview = (opts) => runReviewTickAllRepos({
-    acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
-    poolExhaustion: DAEMON_POOL_EXHAUSTION, ...opts,
-  }),
+  // C1c — PR facts (head SHA, labels, completed checks) come from the shared store first (`WE_REVIEW_FACTS=0`
+  // turns that off). The dispatch gate re-reads the live head after its checks and falls back to GitHub when the
+  // store is stale or partial; label READS try the store, label WRITES and the drain/merge path never do.
+  runReview = (opts) => {
+    const factsProvider = withFactsLabels(createGhProvider());
+    return runReviewTickAllRepos({
+      acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
+      poolExhaustion: DAEMON_POOL_EXHAUSTION,
+      dispatch: (o) => dispatchReviewByMode({ ...o, ciGate: readReviewCiGateFactsFirst }),
+      tagRound: (o) => tagReviewRound({ ...o, provider: factsProvider }),
+      tagStatus: (o) => tagReviewStatus({ ...o, provider: factsProvider }),
+      ...opts,
+    });
+  },
   // #xconv1 — the SAME shared-reads optimization `runReview` above opts into, wired the same way for its own
   // separate, additive async stage (see `runConvertAdvisoryTick`'s own doc for why this is not folded into
   // `runReview`/`runReviewTick`).
@@ -842,6 +854,8 @@ export function buildCliDaemonEffects({
       } catch (e) {
         log.error(`review-daemon: session-reap failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
       }
+      const warm = await warmReviewFacts(REVIEW_DAEMON_REPOS); // once a tick: refresh the facts mirror from the Worker (not GitHub)
+      log.error(`review-daemon: pr-facts ${warm.skipped ? `off (${warm.skipped})` : (warm.warmed ?? []).map((w) => `${w.repo.split('/')[1]}=${w.ok ? 'store' : `github (${w.reason})`}`).join(' ')}`);
       const result = await runReview();
       // Refreshed for the NEXT tick's own reap call, above — always recomputed from THIS tick's fresh
       // discovery, never accumulated, so a PR that frees up (or a new one that blocks) is reflected within

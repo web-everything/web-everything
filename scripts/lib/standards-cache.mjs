@@ -132,3 +132,44 @@ export function openSectionCache({ section, version, env = process.env }) {
     profileLine() { return `${section}: ${stats.hits} hit / ${stats.misses} miss`; },
   };
 }
+
+/**
+ * Per-file cached scan for a section whose scanner judges each doc's OWN content only (perf item 70b).
+ * `files` = labels (repo-relative paths), `load(file)` reads the content, `scan(docs)` is the section's
+ * pure scanner (docs -> findings, each carrying `.file`). Cached files replay stored findings; misses are
+ * scanned together in ONE call and attributed by `.file`. Findings come back grouped in `files` order, which
+ * equals the uncached scan's order because the scanner iterates docs in order. Any doubt (cache off, no
+ * version, key lookup failed, a finding with a foreign `.file`) -> plain uncached scan, nothing recorded.
+ * `getKeys()` -> Map(path -> blob sha) (memoized by the caller); a throw means "no keys".
+ */
+export function scanFilesCached({ section, entries, files, load, scan, getKeys, env = process.env, onStats }) {
+  const plain = () => scan(files.map((file) => ({ file, content: load(file) })));
+  let cache;
+  let keys;
+  try {
+    if (!cacheEnabled(env)) return plain();
+    cache = openSectionCache({ section, version: ruleVersion(section, entries), env });
+    if (!cache.enabled) return plain();
+    keys = getKeys();
+  } catch { return plain(); }
+  const keyOf = (f) => (keys.has(f) ? `${f}\0${keys.get(f)}` : null);
+  const perFile = new Map();
+  const misses = [];
+  for (const f of files) {
+    const hit = keyOf(f) && cache.lookup(keyOf(f));
+    if (hit) perFile.set(f, hit); else { if (!keyOf(f)) cache.stats.misses++; misses.push(f); }
+  }
+  let fresh = [];
+  try {
+    fresh = scan(misses.map((file) => ({ file, content: load(file) })));
+  } catch (e) { cache.abort(); throw e; }
+  const byFile = new Map(misses.map((f) => [f, []]));
+  for (const finding of fresh) {
+    if (!byFile.has(finding.file)) { cache.abort(); return plain(); }
+    byFile.get(finding.file).push(finding);
+  }
+  for (const f of misses) { perFile.set(f, byFile.get(f)); if (keyOf(f)) cache.record(keyOf(f), byFile.get(f)); }
+  cache.commit();
+  if (onStats) onStats(cache.profileLine());
+  return files.flatMap((f) => perFile.get(f));
+}

@@ -1781,6 +1781,116 @@ describe('#4315 durable referral effects', () => {
     await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, { ...CTX, runId: 'another-checkout' });
     expect(h.judge).toHaveBeenCalledTimes(1);
   });
+
+  describe('#76b finding identity referral rulings', () => {
+    const seat = 'judgeCorrectnessAdvisory';
+    const reportedSection = '\nUntrusted reported findings:\n';
+    const knownSection = '\nUntrusted known findings on this PR (identity table; for sameAs only):\n';
+    const findingA = { summary: 'Concurrent writers overwrite reservations', file: 'x.mjs', line: 136,
+      category: 'correctness', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    const findingB = { ...findingA, summary: 'Parallel submissions lose ownership', line: 133 };
+    const recordsOf = h => readReferralRecords(h.state.comments).records;
+
+    function seedFinding(h, original, runId, result, sameAs) {
+      h.payload.referrals = [{ seat, original }];
+      return seedReferrals(h, [seat], h.state.headRefOid, record => {
+        record.runId = runId;
+        record.reviewer = mandatoryReferralReviewer(runId);
+        record.referrals = [{ seat, original, finding: normalizeFinding(original), key: referralFindingKey(seat, original) }];
+        return [{ id: `${runId}:0`, key: record.referrals[0].key, reviewerId: record.reviewer.id,
+          lens: record.reviewer.lens, result, rationale: 'Checked diff', evidence: ['diff:x'],
+          ...(sameAs ? { sameAs } : {}) }];
+      });
+    }
+
+    function answerWith(h, sameAs) {
+      h.judge.mockImplementation(async request => ({ sessionId: request.sessionId, value: {
+        rulings: JSON.parse(request.input.split(reportedSection)[1]).map(f => ({
+          key: f.key, result: 'not-real', rationale: 'Checked diff', evidence: ['diff:x'], card: '', sameAs: sameAs(f),
+        })),
+      } }));
+    }
+
+    it('one referral ruling per finding per head: a re-worded finding linked by sameAs to a block is not asked again', async () => {
+      const { findingIdentityTable } = await import('../../lib/jury-core.mjs');
+      const h = harness();
+      const head = h.state.headRefOid;
+      const first = seedFinding(h, findingA, 'first', 'block');
+      const aId = findingIdentityTable(recordsOf(h))[0].findingId;
+      const second = seedFinding(h, findingB, 'second', 'not-real', aId);
+      const aKey = first.referrals[0].key, bKey = second.referrals[0].key;
+      const state = mandatoryReferralState(h.state.comments, { head });
+      expect(state.blocked).toEqual(expect.arrayContaining([aKey, bKey]));
+      expect(state.pending).toEqual([]);
+
+      const unlinked = structuredClone(second);
+      delete unlinked.rulings[0].sameAs;
+      const withoutLink = [first, unlinked].map(record => ({ body: renderReferralRecord(record), author: { login: 'web-everything' } }));
+      const control = mandatoryReferralState(withoutLink, { head });
+      expect(control.blocked).toEqual([aKey]);
+      expect(control.blocked).not.toContain(bKey);
+      expect(control.pending).toEqual([]);
+
+      const findingC = { ...findingB, line: 134 };
+      const cKey = referralFindingKey(seat, findingC);
+      expect(cKey).not.toBe(bKey);
+      h.payload.referrals = [{ seat, original: findingC }];
+      const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+      const askedKeys = h.judge.mock.calls.flatMap(([request]) => JSON.parse(request.input.split(reportedSection)[1]).map(f => f.key));
+      expect(askedKeys).not.toContain(cKey);
+      expect(result.blocked).toContain(cKey);
+    });
+
+    it('one referral ruling per finding per head: the judge sees the identity table and a valid sameAs is recorded on the ruling', async () => {
+      const { findingIdentityTable } = await import('../../lib/jury-core.mjs');
+      const h = harness();
+      const first = seedFinding(h, findingA, 'first', 'block');
+      const aId = findingIdentityTable(recordsOf(h))[0].findingId;
+      h.payload.referrals = [{ seat, original: findingB }];
+      answerWith(h, () => aId);
+      await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+      expect(h.judge).toHaveBeenCalledOnce();
+      const request = h.judge.mock.calls[0][0];
+      expect(request.input).toContain(knownSection);
+      expect(request.input.indexOf(knownSection)).toBeLessThan(request.input.indexOf(reportedSection));
+      const rows = JSON.parse(request.input.split(knownSection)[1].split(reportedSection)[0]);
+      expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ findingId: aId })]));
+      const bKey = referralFindingKey(seat, findingB);
+      const reported = JSON.parse(request.input.split(reportedSection)[1]);
+      expect(reported).toEqual([expect.objectContaining({ key: bKey, findingId: expect.stringMatching(/^f-[0-9a-f]{12}$/) })]);
+      expect(reported[0].findingId).not.toBe(aId);
+      expect(request.shape.properties.rulings.items.required).toContain('sameAs');
+      expect(request.shape.properties.rulings.items.properties.sameAs).toEqual({ type: 'string' });
+      const records = recordsOf(h);
+      expect(records.flatMap(r => r.rulings).find(r => r.key === bKey).sameAs).toBe(aId);
+      const table = findingIdentityTable(records);
+      expect(table).toHaveLength(1);
+      expect(table[0].keys.map(k => k.key)).toEqual(expect.arrayContaining([first.referrals[0].key, bKey]));
+    });
+
+    it.each(['new', 'self', 'unknown', 'different file', 'far line'])(
+      'one referral ruling per finding per head: a refused sameAs is never recorded (%s)', async mode => {
+        const { findingIdentityTable } = await import('../../lib/jury-core.mjs');
+        const h = harness();
+        const original = { ...findingA, ...(mode === 'different file' ? { file: 'y.mjs' } : {}),
+          ...(mode === 'far line' ? { line: 40 } : {}) };
+        seedFinding(h, original, 'first', 'block');
+        const aId = findingIdentityTable(recordsOf(h))[0].findingId;
+        h.payload.referrals = [{ seat, original: findingB }];
+        answerWith(h, f => mode === 'new' ? 'new' : mode === 'self' ? f.findingId : mode === 'unknown' ? 'f-000000000000' : aId);
+        await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+        expect(h.judge).toHaveBeenCalledOnce();
+        const reported = JSON.parse(h.judge.mock.calls[0][0].input.split(reportedSection)[1]);
+        expect(reported[0].findingId).toMatch(/^f-[0-9a-f]{12}$/);
+        const bKey = referralFindingKey(seat, findingB);
+        const records = recordsOf(h);
+        const ruling = records.flatMap(r => r.rulings).find(r => r.key === bKey);
+        expect(ruling).toBeDefined();
+        expect(ruling).not.toHaveProperty('sameAs');
+        expect(findingIdentityTable(records)).toHaveLength(2);
+      });
+  });
+
 });
 
 describe('legacy vs current owner slugs compare equal (outage 2026-10-03)', () => {

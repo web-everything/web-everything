@@ -68,6 +68,7 @@ import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
@@ -1485,14 +1486,24 @@ export function isDerivedTimeoutCheck(check, checks = []) {
  * This deliberately declines logs with aggregate/build failures: every failed check must carry a
  * complete test inventory. That includes the historical #3415 aggregate "test" failure.
  */
-export function readTimeoutEvidence(pr, { repo, exec = execFileSyncThrottled, ts } = {}) {
+export function readTimeoutEvidence(pr, { repo, exec = execFileSyncThrottled, ts, reader: readerOverride = null, facts: factsOverride = null } = {}) {
   const deadline = Date.now() + 15_000;
-  const api = (path, raw = false) => {
+  // perf C1d — facts-first stale-head refusal, ETag reads and the immutable job/log/file cache live in `fix-facts.mjs`
+  // (`WE_FIX_FACTS=0` = the plain `gh api` reads this function always made). An injected `exec` (tests, soak) keeps
+  // the plain path unless the caller also injects `reader`.
+  const reader = readerOverride ?? (exec === execFileSyncThrottled
+    ? makeFixEvidenceReader({ repo, pr: pr.number, head: pr.headRefOid, exec, deadline })
+    : null);
+  const plainApi = (path, raw = false) => {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error('evidence-read-deadline');
     const value = exec('gh', ['api', path], { encoding: 'utf8', timeout: remaining, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     return raw ? String(value) : JSON.parse(value);
   };
+  const api = reader?.api ?? plainApi;
+  const readLog = reader?.readLog ?? ((job) => plainApi(`repos/${repo}/actions/jobs/${job.id}/logs`, true));
+  const factsGate = reader || factsOverride ? (factsOverride ?? checkFixFacts)({ repo, number: pr.number, head: pr.headRefOid }) : null;
+  if (factsGate?.stale) return { eligible: false, reason: `timeout-evidence:${factsGate.reason}` };
   const head = pr.headRefOid;
   try {
     const pull = api(`repos/${repo}/pulls/${pr.number}`);
@@ -1534,7 +1545,7 @@ export function readTimeoutEvidence(pr, { repo, exec = execFileSyncThrottled, ts
       const infra = isInfraCancelledJob(job);
       return { repo, head, run: run.id, job: job.id, name: job.name, attempt: job.run_attempt, workflow: run.path,
         aggregateGate: isAggregateGateFailure(job), status: job.status, conclusion: job.conclusion, logJob: job.id, logAttempt: job.run_attempt,
-        url: job.html_url, infra, log: infra ? '' : api(`repos/${repo}/actions/jobs/${job.id}/logs`, true) };
+        url: job.html_url, infra, log: infra ? '' : readLog(job) };
     });
     const infraClass = classifyInfraCancelled(jobs);
     if (infraClass.kind === 'infra-only') {

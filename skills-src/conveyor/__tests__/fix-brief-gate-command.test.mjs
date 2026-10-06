@@ -65,3 +65,140 @@ for (const file of ['fix-agent-brief.md', 'fix-agent-ci-brief.md', 'delivery-age
     expect(text).toContain('infrastructure-failure');
   });
 }
+
+const readBrief = (file) => readFileSync(join(HERE, '..', file), 'utf8');
+
+/** The literals of `required` that `text` does not contain — the brief-lint core, mutation-checked below. */
+const missing = (text, required) => required.filter((literal) => !text.includes(literal));
+
+/**
+ * Assert every literal is present in the real brief text, and that removing any ONE of them is detected — so each
+ * guard is proven to redden on a mutated brief, not just to pass on today's wording.
+ */
+function expectEachGuarded(text, required) {
+  expect(missing(text, required)).toEqual([]);
+  for (const literal of required) expect(missing(text.replaceAll(literal, ''), required), `dropping "${literal}"`).toEqual([literal]);
+}
+
+const REVERIFY_WORKER = 'Only `web-everything/web-everything` has a reverify worker';
+
+// The exit's three eligibility conditions (failures only outside the change, each passing alone, a repo that has a
+// reverify worker) plus the tokens and the fallback — dropping any one tells an agent to hand off a genuinely failing
+// change, or to wait on a worker that does not exist.
+const LOAD_FLAKE_REQUIRED = {
+  'fix-agent-brief.md': [
+    'red ONLY on timeouts',
+    'pass alone',
+    REVERIFY_WORKER,
+    'so use the gate-red exit below there',
+    'FULL 40-character head sha',
+    '--reason=load-flake',
+    '--alt-sha=',
+    'blocked-on-load-flake',
+  ],
+  'fix-agent-ci-brief.md': [
+    'red ONLY on failures in files your heal did not touch',
+    'each of those files passes when run alone',
+    REVERIFY_WORKER,
+    'for any other repo use the gate-red exit below',
+    'FULL 40-character head sha',
+    '--reason=load-flake',
+    '--alt-sha=',
+    'blocked-on-load-flake',
+  ],
+};
+
+/** The "Load-flake exception." paragraph, up to its bash fence — so a literal elsewhere in the brief cannot satisfy a guard. */
+function loadFlakeParagraph(text) {
+  const start = text.indexOf('**Load-flake exception.**');
+  expect(start, 'brief has a Load-flake exception paragraph').toBeGreaterThanOrEqual(0);
+  const fence = text.indexOf('```bash', start);
+  // indexOf -1 would make slice(start, -1) swallow the rest of the brief and void the isolation guarantee.
+  expect(fence, 'Load-flake exception paragraph is followed by a bash fence').toBeGreaterThan(start);
+  return text.slice(start, fence);
+}
+
+/** The load-flake exit's bash fence itself — the commands an agent actually runs, not the prose that describes them. */
+function loadFlakeFence(text) {
+  const start = text.indexOf('**Load-flake exception.**');
+  const open = text.indexOf('```bash\n', start);
+  expect(open, 'Load-flake exception paragraph is followed by a bash fence').toBeGreaterThan(start);
+  const close = text.indexOf('```', open + 8);
+  expect(close, 'Load-flake bash fence is closed').toBeGreaterThan(open);
+  return text.slice(open, close);
+}
+
+// Every token the exit's commands need, each asserted inside the fence only: the same literals recur in the prose
+// ("Report `blocked-on-load-flake`…") and in other exits, so a whole-brief `toContain` stays green when the fence loses one.
+const LOAD_FLAKE_FENCE_REQUIRED = [
+  'stand-down.mjs',
+  '--reason=load-flake',
+  '--head=<pr-head-sha>',
+  '--alt=<saved-alt-branch>',
+  '--alt-sha=<saved-sha>',
+  '--outcome=blocked-on-load-flake',
+  'fix-end',
+];
+
+describe('ci-heal load-flake exit', () => {
+  for (const [file, required] of Object.entries(LOAD_FLAKE_REQUIRED)) {
+    it(`${file} states every load-flake eligibility condition, each guarded against removal`, () => {
+      const text = readBrief(file);
+      const paragraph = loadFlakeParagraph(text);
+      // Conditions live in the paragraph; the command tokens live in the fence that follows it.
+      expectEachGuarded(paragraph, required.filter((l) => !/^(--|blocked-on)/.test(l)));
+    });
+
+    it(`${file} carries every load-flake command token inside its bash fence, each guarded against removal`, () => {
+      expectEachGuarded(loadFlakeFence(readBrief(file)), LOAD_FLAKE_FENCE_REQUIRED);
+    });
+  }
+
+  it('ci-heal load-flake exit precedes the gate-red exit and preserves the saved heal', () => {
+    const text = readBrief('fix-agent-ci-brief.md');
+    expect(text).toContain('--outcome=gate-red');
+    expect(text.indexOf('--reason=load-flake')).toBeLessThan(text.indexOf('--outcome=gate-red'));
+    expect(text).toContain('Otherwise a red gate is a hard stop');
+    // The saved heal is what the reverify worker retries: the push target and the `--alt=` handoff must both survive.
+    expect(text).toContain('--alt=<saved-alt-branch>');
+    // The exit is only safe under its three eligibility conditions: this ordering test must redden if any is dropped,
+    // not only the dedicated eligibility test above (the paragraph precedes the command, which precedes the hard stop).
+    const paragraph = loadFlakeParagraph(text);
+    expectEachGuarded(paragraph, [
+      'files your heal did not touch',
+      'passes when run alone',
+      'push the heal to `{{LANE_REF}}-heal-{{PR_NUM}}-alt`',
+      REVERIFY_WORKER,
+    ]);
+    // Order against the fence's own command, not the first stray mention of the flag elsewhere in the brief.
+    const fenceAt = text.indexOf(loadFlakeFence(text));
+    expect(text.indexOf(paragraph)).toBeLessThan(fenceAt);
+    expect(fenceAt).toBeLessThan(text.indexOf('Otherwise a red gate is a hard stop'));
+  });
+});
+
+// Each normative sentence's distinctive literal is asserted positively; a `not.toMatch` alone passes whether or not
+// the sentence exists, so it can never be the guard.
+const FIX_THE_CLASS_REQUIRED = [
+  'Fix the class, not the instance',
+  'Fix every variant inside `{{SCOPE}}`',
+  'does the repair meet the reviewer\'s finding',
+  'next variant',
+  'is must-fix before re-push',
+  'You may dismiss any other self-review finding only as "not the same class" or "outside `{{SCOPE}}` (filed as <card>)"',
+  'filed through `file-item`',
+  'does the repair itself introduce a new problem',
+  'A defect the repair itself introduces is must-fix regardless of class',
+  'Deferring ("later", "follow-up") is not a dismissal.',
+  'Variants considered:',
+];
+
+describe('fix the class', () => {
+  it('requires variant discovery, adversarial review, and evidence without deferral', () => {
+    expectEachGuarded(readBrief('fix-agent-brief.md'), FIX_THE_CLASS_REQUIRED);
+  });
+
+  it('does not restore the old "fix it, or dismiss it with a one-line reason" loophole', () => {
+    expect(readBrief('fix-agent-brief.md')).not.toMatch(/fix it, or dismiss it/i);
+  });
+});

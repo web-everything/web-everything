@@ -1112,7 +1112,7 @@ process.exit(${standardsExit});
     expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'green', retriedTimeouts: f.files, isolatedRetry: 'flaky-outside-diff' });
     const calls = f.calls();
     expect(calls).toHaveLength(3);
-    expect(calls[1].args).toEqual(['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', ...f.files.map(f => `./${f}`)]);
+    expect(calls[1].args).toEqual(['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', '--testTimeout=15000', '--hookTimeout=30000', ...f.files.map(f => `./${f}`)]);
     expect(calls[2].args.slice(0, 2)).toEqual(['run', 'check:standards']);
     for (const call of calls) {
       expect(call.held).toHaveLength(1);
@@ -1146,6 +1146,26 @@ process.exit(${standardsExit});
     const finished = JSON.parse(readFileSync(marker(), 'utf8'));
     expect(finished.phases.admissionMode).toBe('phase');
     expect(finished.suites).toBe(stamped); // the marker still names the requested gate
+  });
+
+  // Item 59 (b) — the daemon's policy must also govern a recognized default gate whose test half is NOT
+  // `vitest related` (a checkout with only `npm test`): before, the stamped GATE ran verbatim, so the REQUESTER's
+  // policy ran check:standards.
+  it('applies the daemon\'s ci-only policy to a stamped always-policy default gate with a non-related test half (item 59)', () => {
+    const f = fixture();
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts: { test: 'vitest run', 'check:standards': 'true' } }));
+    execFileSync('git', ['add', 'package.json'], { cwd: dir });
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'scripts'], { cwd: dir });
+    execFileSync('git', ['branch', '-f', 'origin/main'], { cwd: dir });
+    const req = f.invoke(['request']);
+    expect(req.code, req.stdout + req.stderr).toBe(0); // always
+    const stamped = JSON.parse(readFileSync(marker(), 'utf8')).suites;
+    expect(stamped).toContain('npm test');
+    expect(stamped).toContain('check:standards');
+    const result = f.invoke([`--gate=${stamped}`, '--run-id=full-policy'], { WE_VERIFY_STANDARDS: 'ci-only' });
+    expect(result.code, result.stdout + result.stderr).toBe(0);
+    expect(f.calls().some(call => call.args[0] === 'run' && call.args[1] === 'check:standards')).toBe(false);
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).suites).toBe(stamped);
   });
 
   // #66 (coroner-2, 2026-10-05) — a lane on an older base (no settings file) or a session without the daemon's env
@@ -1235,7 +1255,8 @@ process.exit(${standardsExit});
     expect(result.json).toMatchObject(expected);
     expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject(expected);
     expect(result.json.detail).toContain('flaky-outside-diff');
-    expect(f.calls()[1].args).toEqual(['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', ...f.files.map(file => `./${file}`)]);
+    // The retry carries the gate's scaled timeouts (factor 3 default), else it falls back to vitest's 5 s and flakes again.
+    expect(f.calls()[1].args).toEqual(['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', '--testTimeout=15000', '--hookTimeout=30000', ...f.files.map(file => `./${file}`)]);
     const read = f.invoke(['check']);
     expect(read.json).toMatchObject({ isolatedRetry: 'flaky-outside-diff' });
   });

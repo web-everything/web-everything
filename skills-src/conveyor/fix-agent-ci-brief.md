@@ -355,7 +355,17 @@ A default local selection never expands into the full suite. **Never run the ful
 (`npm run test:unit`, `npm test`, a bare `vitest run`): the verify runner runs the same gate for you, CI runs it
 anyway, and the Bash guard denies it.
 
-A red gate is a hard stop: do **not** re-push, and report the completion record and report `#{{ITEM_NUM}} →
+**Load-flake exception.** When verify is red ONLY on failures in files your heal did not touch, and each of those files passes when run alone (`node {{WE_ROOT}}/scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`), save and push the heal to `{{LANE_REF}}-heal-{{PR_NUM}}-alt`, then use the load-flake exit instead of the gate-red exit below. Pass the PR's FULL 40-character head sha (`git rev-parse origin/<head ref>`). Only `web-everything/web-everything` has a reverify worker; for any other repo use the gate-red exit below.
+
+```bash
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=load-flake --head=<pr-head-sha> --alt=<saved-alt-branch> --alt-sha=<saved-sha>
+node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=blocked-on-load-flake
+node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
+```
+
+Report `blocked-on-load-flake` and exit; the quiet-host reverify pass retries the saved heal automatically.
+
+Otherwise a red gate is a hard stop: do **not** re-push, and report the completion record and report `#{{ITEM_NUM}} →
 ci-heal gate-red`:
 
 ```bash

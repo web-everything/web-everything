@@ -74,7 +74,7 @@ import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyS
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
-import { matchRequestedDefaultGate, verifySetting, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { matchRequestedDefaultGate, verifySetting, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
@@ -539,7 +539,11 @@ const isolatedRetryMode = verifySetting('isolatedRetry', process.env);
 const phaseResults = [];
 const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
-  let result = await timedRunGate(retryableGate ? 'vitestMs' : null, retryableGate ? resolvedGate.testCommand : GATE);
+  let result = await timedRunGate(retryableGate ? 'vitestMs' : null,
+    // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (`npm test`, a skipped-vitest echo)
+    // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
+    // `GATE` stays the marker's `suites`, so the cache key still matches.
+    retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
   if (retryableGate && admission.ok && isolatedRetryMode !== 'off' && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
     // Edits during admission or test execution must also count as the change's own files.
     const changedNow = localChangedSet({ runGit: git });
@@ -550,8 +554,11 @@ try {
     if (retriedFailures.length) {
       process.stderr.write(`Re-running ${retriedFailures.length} failing file(s) outside the diff once, alone: ${retriedFailures.map(f => `${f.file} (${f.kind})`).join(', ')}\n`);
       // Exact file filters, one worker, no related traversal, no passWithNoTests, and no second attempt.
+      // The isolated run keeps the gate's OWN scaled timeouts: without them vitest falls back to its 5 s default and a
+      // load-slow file that passed the main run's 15 s budget times out again alone (ci-heal-4017: still-red at load 25).
+      const timeoutFlags = scaledTimeoutFlags(resolvedGate.decision?.testTimeoutFactor ?? 1).split(' ').filter(Boolean);
       result = await timedRunGate('vitestMs', 'npx', ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism',
-        ...retriedFailures.map(f => `./${f.file}`)]);
+        ...timeoutFlags, ...retriedFailures.map(f => `./${f.file}`)]);
       isolatedRetry = result.exitCode === 0 && !result.signal ? FLAKY_OUTSIDE_DIFF : STILL_RED_IN_ISOLATION;
     }
   }
