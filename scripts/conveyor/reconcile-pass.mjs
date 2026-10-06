@@ -70,6 +70,7 @@ import { resolve } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
+import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
 import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
 import { REPO_ROOT, defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
@@ -172,8 +173,8 @@ export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCo
  * @param {{exec?:Function, repo?:string|null}} [o]
  * @returns {Array<object>}
  */
-export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo } = {}) {
-  const enrich = rows => enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) });
+export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo, readComments } = {}) {
+  const enrich = rows => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}) });
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
   if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
