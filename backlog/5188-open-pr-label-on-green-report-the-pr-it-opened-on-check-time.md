@@ -2,6 +2,7 @@
 bornAs: x8xgcj9
 kind: story
 size: 1
+tier: pinned
 status: open
 scope: ["we:scripts/operations/open-pr.mjs"]
 dateOpened: "2026-10-06"

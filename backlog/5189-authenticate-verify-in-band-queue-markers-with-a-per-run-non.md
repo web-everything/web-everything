@@ -2,6 +2,7 @@
 bornAs: xhtuli0
 kind: story
 size: 2
+tier: pinned
 status: open
 scope: ["we:scripts/conveyor/verify-dispatch.mjs", "we:scripts/verify-lane.mjs", "we:scripts/conveyor/__tests__/verify-dispatch.test.mjs"]
 dateOpened: "2026-10-06"
