@@ -1,4 +1,5 @@
 ---
+bornAs: xrhj90i
 kind: story
 size: 3
 parent: "4075"

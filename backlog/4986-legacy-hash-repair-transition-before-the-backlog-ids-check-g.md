@@ -23,7 +23,7 @@ From #3732: hashes already on main are repaired by number-stranded. The repair P
 
 ## Progress
 
-- 2026-10-06 prepare pass. Premise check against `origin/main` `75c39659a`: `git log` for `4986`/`x4qfbpf` shows only the drain's numbering commit `2efe1dc3b`; no repair transition exists. `backlog/` currently holds zero hash-named files, so the repair is not yet needed on main, but the card blocks activating `backlog-ids` (#4989 `blockedBy` 4986), so the transition must exist before activation. Premise holds. Size unchanged. Scope widened by `we:scripts/check-standards.mjs` (the gate call sites at :774/:782 must be wired; review finding). `we:scripts/backlog.mjs` stays in scope for the proof run only.
+- 2026-10-06 prepare pass. Premise check against `origin/main` `75c39659a`: `git log` for `4986`/`4986` shows only the drain's numbering commit `2efe1dc3b`; no repair transition exists. `backlog/` currently holds zero hash-named files, so the repair is not yet needed on main, but the card blocks activating `backlog-ids` (#4989 `blockedBy` 4986), so the transition must exist before activation. Premise holds. Size unchanged. Scope widened by `we:scripts/check-standards.mjs` (the gate call sites at :774/:782 must be wired; review finding). `we:scripts/backlog.mjs` stays in scope for the proof run only.
 
 ## Design
 

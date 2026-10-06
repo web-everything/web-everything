@@ -26,7 +26,7 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#3
 
 Premise holds on current `main` (no commit delivers it; `git log --grep=4705` shows only the JIT-number drain). The gap is real: the proposed-edge path matches digits only, while the repo's two-form id is `NNN` or a provisional `x[0-9a-z]{6}` hash (`we:scripts/check-standards-rules.mjs:663`, `ITEM_REF_RX`).
 
-- `we:scripts/lib/probation-launcher.mjs:228` — `parseProposedBlockedBy` bullet regex uses `(\d+)`, so `- add x2c7uas — …` is silently dropped (no violation, no edge).
+- `we:scripts/lib/probation-launcher.mjs:228` — `parseProposedBlockedBy` bullet regex uses `(\d+)`, so `- add 4705 — …` is silently dropped (no violation, no edge).
 - `we:scripts/operations/probation-build-run.mjs:744-758` — `realIo().blockedByGraph` keys cards by `/^(\d+)-.*\.md$/`, so hash-named cards are absent from the graph; a proposal against one would read "does not resolve".
 - `we:scripts/operations/probation-build-run.mjs:571-577` — the prepare branch parses the proposal, loads the graph, calls `validateProposedBlockedBy`, and abandons `gate-red` on violations; `writePrBody` (`:617`) receives `proposedEdges`. None of this has a runner-level test.
 - Mechanism: export ONE id-pattern constant (`BACKLOG_ID_SOURCE = '\\d{1,5}|x[0-9a-z]{6}'`, exactly the shape of `ITEM_REF_RX` minus its `#`; `we:scripts/lib/citation-check.mjs:79` `HASH_SLUG` is also `{6}`, while its `:107`/`:168` use `{6,7}` for file-name globs — the constant follows the `{6}` id form) from `we:scripts/lib/probation-launcher.mjs`; use it in the parser regex and in the `blockedByGraph` filename regex. Add the tests below. `ITEM_REF_RX` is a non-exported const in `we:scripts/check-standards-rules.mjs:663` (outside this card's scope), so the contract test reads that file's text, extracts the `ITEM_REF_RX` literal, and asserts it equals `#(?:` + constant + `)\b`; exporting it is a Follow-up.
@@ -43,20 +43,20 @@ Out of scope (Follow-ups): the check:standards rule requiring every `abandon(` r
 ## Test plan
 
 In `we:scripts/lib/__tests__/probation-launcher.test.mjs`:
-- `parses alphanumeric ids` — asserts `- add x2c7uas — …` yields target `x2c7uas`. RED today: `\d+` drops the line, result `[]`.
-- `validates and walks a graph with hash ids` — builds the edges by feeding card TEXT through `parseProposedBlockedBy` (not hand-built edges, which the id-agnostic validator already accepts), graph with `x2c7uas`; the resulting add closes a cycle and reports `cycle`. RED today: the parser emits no edge, so no cycle is reported.
-- `ignores ids outside the proposal section` — an `- add x2c7uas` bullet under another `##` heading and an `x2c7uas` token in prose yield no edge (non-code-input Must). Characterization, green today; mutation proof: loosen the section-scoped regex to scan the whole card and this test fails.
-- `id constant matches ITEM_REF_RX` — the extracted `ITEM_REF_RX` literal equals `#(?:` + constant + `)\b`; samples `4705`, `x2c7uas` accepted, `x2c7uasq` (7 chars) rejected. RED today: the constant does not exist.
+- `parses alphanumeric ids` — asserts `- add 4705 — …` yields target `4705`. RED today: `\d+` drops the line, result `[]`.
+- `validates and walks a graph with hash ids` — builds the edges by feeding card TEXT through `parseProposedBlockedBy` (not hand-built edges, which the id-agnostic validator already accepts), graph with `4705`; the resulting add closes a cycle and reports `cycle`. RED today: the parser emits no edge, so no cycle is reported.
+- `ignores ids outside the proposal section` — an `- add 4705` bullet under another `##` heading and an `4705` token in prose yield no edge (non-code-input Must). Characterization, green today; mutation proof: loosen the section-scoped regex to scan the whole card and this test fails.
+- `id constant matches ITEM_REF_RX` — the extracted `ITEM_REF_RX` literal equals `#(?:` + constant + `)\b`; samples `4705`, `4705` accepted, `x2c7uasq` (7 chars) rejected. RED today: the constant does not exist.
 
 In `we:scripts/operations/__tests__/probation-build-run.test.mjs` (build on `prepareIo`, `:798`; append the proposal section to `postWorkerRaw`, set `io.blockedByGraph = () => new Map(...)` — `fakeIo` defines neither — and override `io.writePrBody` to capture its args, since the fake drops them; `self` is `4291`). The two runner tests below use numeric ids and are CHARACTERIZATION tests (green today) guarded by the mutation check, not RED:
 - `abandons gate-red on a cyclic proposal` — card body carries `## Proposed blockedBy changes` adding a cycle edge, `io.blockedByGraph` supplied; asserts outcome `gate-red`, detail `blockedBy cycle`, no `openPr`/`prBody` call. RED if the validation branch (`:577`) is removed (mutation check).
 - `passes a valid proposal to writePrBody` — preservation (green today): asserts `proposedEdges` in the args equals the parsed edge and PR opens; mutation proof: drop `proposedEdges` from the `writePrBody` call (`:617`) and this test fails.
-- `realIo().blockedByGraph includes hash-named cards` — temp backlog dir holding a hash-named card file (`we:backlog/x2c7uas-foo.md` shape); asserts the key is present. RED today: regex `\d+` skips it.
+- `realIo().blockedByGraph includes hash-named cards` — temp backlog dir holding a hash-named card file (`we:backlog/4705-foo.md` shape); asserts the key is present. RED today: regex `\d+` skips it.
 
 ## Proof plan
 
 - `npx vitest run probation-launcher probation-build-run` — before (tests added, constant not yet used): exactly four cases fail — parser alphanumeric, hash-id cycle, `blockedByGraph` hash-card, id-constant/`ITEM_REF_RX`; after: all green.
-- Live probe: `node -e` importing `parseProposedBlockedBy` from the launcher module with a card containing `- add x2c7uas — r (we:a:1)`; before prints `[]`, after prints one edge.
+- Live probe: `node -e` importing `parseProposedBlockedBy` from the launcher module with a card containing `- add 4705 — r (we:a:1)`; before prints `[]`, after prints one edge.
 - Mutation check: temporarily delete the `bad.length` abandon at `we:scripts/operations/probation-build-run.mjs:577`; the cyclic-proposal test must fail; restore.
 
 ## Follow-ups

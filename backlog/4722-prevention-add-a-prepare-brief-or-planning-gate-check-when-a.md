@@ -23,7 +23,7 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#3
 
 - **Old premise / scope:** `scope:` named card 4800 (a different card, cited by a stale slug). That is the sibling guard "reject prepared cards that supersede their own scope rationale", not this item's subject.
 - **Corrected scope:** the pure rule and its wiring live in `we:scripts/check-standards-rules.mjs` (sibling card lints `findGuardRelaxationGaps` line 972, `findTestPlanGaps` line 1014, `findMustWithoutDoneWhen` line 1091, wired in `lintBacklogItemRendering` lines 1195–1236); tests go in `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs` (existing sibling describes at lines 679 and 784).
-- **Premise check:** `git log -S4722` and `bornAs x4ujrqz` show no delivering commit; a search of `we:scripts/check-standards-rules.mjs` finds no detector for "hard-error rule without corpus reconcile". Not already delivered.
+- **Premise check:** `git log -S4722` and `bornAs 4722` show no delivering commit; a search of `we:scripts/check-standards-rules.mjs` finds no detector for "hard-error rule without corpus reconcile". Not already delivered.
 
 ## Design
 
