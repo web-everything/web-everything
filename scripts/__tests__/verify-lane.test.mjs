@@ -19,6 +19,7 @@ import { join, resolve } from 'node:path';
 import { acquireRunnerLease, makeOwner, heartbeatRunnerLease, RUNNER_LEASE_MINUTES } from '../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../../skills-src/conveyor/verify-daemon.mjs';
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
+import { GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../conveyor/verify-dispatch.mjs';
 
 const VERIFY_LANE = resolve(process.cwd(), 'scripts/verify-lane.mjs');
 const OTHER_SHA = 'b'.repeat(40); // "Y" — the sha the overlapping run's marker belongs to (never this HEAD)
@@ -1002,9 +1003,10 @@ it('an unscopable default request refuses before stamping a runnable marker', ()
 });
 
 describe('local timeout-only retry under admission', () => {
-  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false } = {}) {
+  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission } = {}) {
     const files = truncated ? Array.from({ length: 21 }, (_, i) => `untouched-${i}.test.mjs`) : ['untouched-a.test.mjs', 'untouched-b.test.mjs'];
-    const stderr = files.map((f, i) => ` FAIL  ${f} > case ${i}\n${mixed && i === 1 ? 'AssertionError: wrong value' : 'Error: Test timed out in 5000ms.'}\n`).join('');
+    // No trailing newline: a gate may end its stderr mid-line, and dispatch's markers must still start a line.
+    const stderr = files.map((f, i) => ` FAIL  ${f} > case ${i}\n${mixed && i === 1 ? 'AssertionError: wrong value' : 'Error: Test timed out in 5000ms.'}\n`).join('').trimEnd();
     const stdout = ` Test Files  ${files.length} failed\n Tests  ${files.length} failed\n Duration  5.1s\n`;
     mkdirSync(join(dir, 'bin'));
     writeFileSync(join(dir, 'source.mjs'), 'export const x = 1;\n');
@@ -1051,13 +1053,43 @@ process.exit(${standardsExit});
     execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'baseline'], { cwd: dir });
     execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
     writeFileSync(join(dir, edited ? files[0] : 'source.mjs'), '// changed\n');
-    const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_HEAVY_ADMISSION_CAP: '1' };
-    function invoke(args = []) {
-      const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env, encoding: 'utf8' });
+    const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission };
+    function invoke(args = [], extraEnv = {}) {
+      const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env: { ...env, ...extraEnv }, encoding: 'utf8' });
       return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout, stderr: result.stderr };
     }
     return { files, invoke, calls: () => readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };
   }
+
+  // #verify-phase-admission — real slots across the related run, retry, and standards.
+  it.each([undefined, '0'])('records phase admission or the opt-out (%s)', phaseAdmission => {
+    const f = fixture({ phaseAdmission });
+    const result = f.invoke();
+    expect(result.code).toBe(0);
+    const phases = JSON.parse(readFileSync(marker(), 'utf8')).phases;
+    expect(phases.admissionMode).toBe(phaseAdmission === '0' ? 'gate' : 'phase');
+    const calls = f.calls();
+    expect(calls).toHaveLength(3);
+    // Dispatch's contract: every wait AFTER the one-shot started marker is announced (queued → started again),
+    // so it is charged to the queue ceiling, never the gate ceiling. The opt-out never waits after the marker.
+    const markerLines = result.stderr.split('\n').flatMap(line => line.startsWith(`⏳ ${GATE_QUEUED_MARKER}`) ? ['queued']
+      : line.startsWith(`⏱ ${GATE_STARTED_MARKER}`) ? ['started'] : []);
+    expect(markerLines).toEqual(phaseAdmission === '0' ? ['started'] : ['started', 'queued', 'started', 'queued', 'started']);
+    for (const call of calls) {
+      expect(call.held).toHaveLength(1);
+      expect(call.inherited).toBe('1');
+    }
+    if (phaseAdmission === '0') {
+      expect(phases.admissionPhases).toBeNull();
+      expect(calls.map(call => call.held[0])).toEqual(Array(3).fill(calls[0].held[0]));
+    } else {
+      expect(phases.admissionPhases).toMatchObject({
+        vitest: { kind: 'files', lane: 'fast', waitedMs: expect.any(Number), timedOut: false },
+        standards: { kind: 'standards', lane: 'fast', waitedMs: expect.any(Number), timedOut: false },
+      });
+      expect(phases.admissionWaitMs).toBe(phases.admissionPhases.vitest.waitedMs + phases.admissionPhases.standards.waitedMs);
+    }
+  });
 
   it('retries only failed files once with one worker, then runs standards and records why', () => {
     const f = fixture();
@@ -1084,6 +1116,34 @@ process.exit(${standardsExit});
       expect(read.json.detail).toContain('Retried once serially');
     }
     expect(f.calls()).toHaveLength(3);
+  });
+
+  // The daemon owns WE_VERIFY_STANDARDS (its plist sets it); the requesting agent's environment usually does not.
+  // A gate stamped under the agent's policy must still run under the daemon's, not fall back to the opaque path.
+  it.each([
+    ['auto', 'a code-only diff skips standards', 2, false],
+    ['ci-only', 'ci-only skips standards', 2, false],
+    ['always', 'the same policy runs standards as stamped', 3, true],
+  ])('applies the dispatching daemon\'s standards policy to a gate stamped under another (%s: %s)', (policy, _, callCount, ranStandards) => {
+    const f = fixture();
+    expect(f.invoke(['request']).code).toBe(0); // agent environment: no policy ⇒ 'always'
+    const stamped = JSON.parse(readFileSync(marker(), 'utf8')).suites;
+    expect(stamped).toContain('check:standards');
+    const result = f.invoke([`--gate=${stamped}`, '--run-id=policy-mismatch'], { WE_VERIFY_STANDARDS: policy });
+    expect(result.code, result.stdout + result.stderr).toBe(0);
+    const calls = f.calls();
+    expect(calls).toHaveLength(callCount);
+    expect(calls.some(call => call.args[0] === 'run' && call.args[1] === 'check:standards')).toBe(ranStandards);
+    const finished = JSON.parse(readFileSync(marker(), 'utf8'));
+    expect(finished.phases.admissionMode).toBe('phase');
+    expect(finished.suites).toBe(stamped); // the marker still names the requested gate
+  });
+
+  it('never re-derives an arbitrary --gate under the daemon policy', () => {
+    const f = fixture();
+    const result = f.invoke(['--gate=npm run check:standards && true', '--run-id=arbitrary'], { WE_VERIFY_STANDARDS: 'auto' });
+    expect(result.code, result.stdout + result.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).phases.admissionMode).toBe('gate');
   });
 
   it('recovers actual Vitest timeouts using the installed reporter and single-worker flags', () => {
@@ -1172,7 +1232,7 @@ describe('verify phase telemetry (#5141)', () => {
   });
   const explicitPhases = { admissionWaitMs: expect.any(Number), gateMs: expect.any(Number),
     vitestMs: null, scanMs: null, standardsMs: null, targetFileCount: null, changedFileCount: null,
-    importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null,
+    importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, admissionMode: 'gate', admissionPhases: null,
     outcomes: { vitest: { result: 'skipped' }, scan: { result: 'skipped' }, standards: { result: 'skipped' } } };
   function invoke(args) {
     const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, encoding: 'utf8' });

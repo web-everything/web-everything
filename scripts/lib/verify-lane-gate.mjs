@@ -61,6 +61,7 @@ import { stripVTControlCharacters } from 'node:util';
 import { SELECTION_FLAG, pinnedMergeBase, decideLocalSelection, referencedTestNeedles, LOCAL_FULL_SUITE_TRIGGERS } from '../readiness/test-selection.mjs';
 import { isPolicyCorePath } from './gate-config.mjs';
 import { isAllowlistedLitterPath } from './lane-litter.mjs';
+import { queueLaneOf } from '../readiness/heavy-queue-projection.mjs';
 import { scanCommands } from './repo-scan-tests.mjs';
 
 /** The pathspecs `testsNaming` greps — every vitest test-file suffix (PR #2680 review: one list, pinned by a test). */
@@ -113,7 +114,7 @@ export function composeGate({ vitestCmd, checkStandardsCmd, scripts, scanCmds = 
   } else gateReasons.push('no `test:unit` or `test` script in this checkout — test half skipped');
   let standardsHalf = null;
   if (have.has('check:standards')) standardsHalf = checkStandardsCmd;
-  else gateReasons.push('no `check:standards` script in this checkout — health-gate half skipped');
+  else if (checkStandardsCmd !== null) gateReasons.push('no `check:standards` script in this checkout — health-gate half skipped');
   // #3887 — repo-scanning tests `vitest related` can never select; run after the related half, only where a test half exists.
   const scanHalves = testHalf && have.has('test:unit') ? scanCmds : [];
   const halves = [testHalf, ...scanHalves, standardsHalf].filter(Boolean);
@@ -147,6 +148,61 @@ export function canScopeCheckStandards(changedFiles) {
   return !changedFiles.some((f) => isBacklogPath(f) || isPolicyCorePath(f));
 }
 
+// #verify-standards-auto — local policy; unknown settings preserve the existing gate.
+export function verifyStandardsPolicy(env) {
+  return ['auto', 'ci-only'].includes(env?.WE_VERIFY_STANDARDS) ? env.WE_VERIFY_STANDARDS : 'always';
+}
+
+export const VERIFY_STANDARDS_POLICIES = Object.freeze(['always', 'auto', 'ci-only']);
+
+export const STANDARDS_AUTO_PREFIXES =Object.freeze([
+  'backlog/', 'docs/', 'config/', 'agent-memory-src/', 'skills-src/', '.claude/',
+  '.github/', 'src/', 'blocks/', 'research/', 'site/',
+]);
+
+export function standardsRelevantPath(path) {
+  return STANDARDS_AUTO_PREFIXES.some(prefix => path.startsWith(prefix))
+    || (!path.includes('/') && (path.endsWith('.md') || ['package.json', 'package-lock.json'].includes(path)))
+    || isPolicyCorePath(path);
+}
+
+export function decideStandardsHalf({ policy, changedFiles }) {
+  const scoped = canScopeCheckStandards(changedFiles);
+  if (changedFiles?.some(isPolicyCorePath)) {
+    return { policy, run: true, scoped: false, reason: 'gate-self/policy-core path — unscoped run kept' };
+  }
+  if (policy === 'ci-only') {
+    return { policy, run: false, scoped: false, reason: 'skipped (ci-only: CI runs check:standards)' };
+  }
+  if (policy === 'auto') {
+    if (!changedFiles?.length) return { policy, run: true, scoped: false, reason: 'auto: diff unknown — run kept' };
+    const relevant = changedFiles.find(standardsRelevantPath);
+    return relevant
+      ? { policy, run: true, scoped, reason: `auto: standards-relevant path ${relevant}` }
+      : { policy, run: false, scoped: false, reason: 'skipped (auto: code-only diff)' };
+  }
+  return { policy, run: true, scoped,
+    reason: 'always' + (scoped ? '' : '; unscoped: backlog/ or gate-self/policy-core path or unknown diff') };
+}
+
+// #verify-phase-admission — only existing queue kinds determine fast/slow routing.
+export function verifyPhaseAdmissionEnabled(env) {
+  return env?.WE_VERIFY_PHASE_ADMISSION !== '0';
+}
+
+export function verifyFastTargets(env) {
+  const value = env?.WE_VERIFY_FAST_TARGETS;
+  const n = Number(value);
+  return value != null && String(value).trim() !== '' && Number.isSafeInteger(n) && n >= 0 ? n : 5;
+}
+
+export function phaseAdmissionKind({ phase, decision, standardsScoped, env }) {
+  let kind = 'other';
+  if (phase === 'scan' || (phase === 'vitest' && decision?.targets?.length <= verifyFastTargets(env))) kind = 'files';
+  if (phase === 'standards' && standardsScoped) kind = 'standards';
+  return { kind, lane: queueLaneOf(kind) };
+}
+
 /**
  * Decide verify-lane's DEFAULT gate command from the actual diff against `base` (default `origin/main`).
  *   - the VITEST half: graph/reference selection, including shared helpers; at most 300 targets and
@@ -169,6 +225,7 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
   const timeoutFlags = scaledTimeoutFlags(testTimeoutFactor);
   const diff = localChangedSet({ base, runGit });
   const changedFiles = diff ? diff.changedFiles : null;
+  const standards = decideStandardsHalf({ policy: verifyStandardsPolicy(env), changedFiles });
   const optOut = String(env?.[SELECTION_FLAG] ?? '') === '0';
   // #4540: only untracked allowlist matches are scratch; tracked names remain real inputs.
   // Keep the original diff for standards scoping and diagnostics.
@@ -195,7 +252,7 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
     };
   }
   const blocked = (reasons, extra = {}) => ({ command: null, gateReasons: [], decision: {
-    ...local, mode: 'blocked', reasons, changedFiles, relatedMode, referencedTests: [], targets: [], ...extra,
+    ...local, mode: 'blocked', reasons, changedFiles, standards, relatedMode, referencedTests: [], targets: [], ...extra,
   } });
   if (local.mode === 'full') return blocked([
     ...local.reasons.map((r) => r.replaceAll('full suite', 'broad selection')),
@@ -204,7 +261,7 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
 
   // #1937: scope only the local, non-authoritative fast-fail — the central, unscoped check:standards CI runs
   // against the real merged tree remains the actual authority and is untouched by this local shrink.
-  const checkStandardsCmd = canScopeCheckStandards(changedFiles)
+  const checkStandardsCmd = !standards.run ? null : standards.scoped
     ? `npm run check:standards -- --local --files=${shellQuote(changedFiles.join(','))}`
     : 'npm run check:standards';
 
@@ -214,7 +271,7 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
     if (targets.length > MAX_RELATED_TARGETS || Buffer.byteLength(targets.join(' '), 'utf8') > 32_000) {
       return blocked([`${targets.length} selection targets (limit ${MAX_RELATED_TARGETS}, 32000 bytes) — narrow the diff/base or supply an explicit affected-test --gate; no local full suite`], { referencedTests, targets });
     }
-    const decision = { ...local, changedFiles, relatedMode, testTimeoutFactor, referencedTests, targets };
+    const decision = { ...local, changedFiles, standards, relatedMode, testTimeoutFactor, referencedTests, targets };
     // `--passWithNoTests`: a diff whose files no test reaches (docs, a backlog card) is a pass, not a failure.
     // Deletions or excluded untracked scratch can leave no target, and `vitest related` with no
     // positional file is an error (a false red); there is nothing for vitest to run, so say so and skip it.
@@ -228,7 +285,9 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
     // `fileExists` is injected by the IO shell (this checkout's own files); omitted ⇒ no scan half, so a fixture or a
     // sibling checkout without these tests never gets a command naming a test it does not have.
     const scanCmds = typeof fileExists === 'function' ? scanCommands({ changedFiles, fileExists }).map((c) => c + timeoutFlags) : [];
-    return { ...composeGate({ vitestCmd, checkStandardsCmd, scripts, scanCmds }), decision };
+    const composed = composeGate({ vitestCmd, checkStandardsCmd, scripts, scanCmds });
+    if (!standards.run) composed.gateReasons.push(standards.reason);
+    return { ...composed, decision };
   }
   throw new Error(`unexpected local selection mode: ${local.mode}`);
 }
@@ -506,6 +565,7 @@ export function describeGate({ command, decision, scanCommands = [] }) {
   }
   for (const r of decision.reasons || []) out.push(`  - ${r}`);
   if (scanCommands.length) out.push(`  repo-scanning tests (#3887, not reachable by \`vitest related\`): ${scanCommands.length} command(s), scoped to the changed files where the test supports it`);
+  if (decision.standards?.run === false) out.push(`  check:standards: ${decision.standards.reason}`);
   out.push(`  command: ${command}`);
   return out.join('\n');
 }
@@ -534,12 +594,19 @@ export function buildPhaseOutcome({ kind, exitCode, signal, failureDetails, outp
 }
 
 /** Build normalized, non-gating phase telemetry for verify markers and CLI results (#5141). */
-export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standardsMs, gateMs, decision, outcomes = {} }) {
+export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standardsMs, gateMs, decision, outcomes = {}, admission }) {
   const ms = value => Number.isFinite(value) ? Math.round(value) : null;
+  const admissionMode = admission?.mode === 'phase' ? 'phase' : 'gate';
+  const admissionPhases = admissionMode === 'phase' ? admission.phases ?? {} : null;
+  const standardsOutcome = decision?.standards?.run === false
+    ? { result: 'skipped', reason: decision.standards.reason } : { result: 'skipped' };
   return {
+    admissionMode,
+    admissionPhases,
+    standardsPolicy: decision?.standards?.policy ?? null,
     relatedMode: decision?.relatedMode ?? null,
     testTimeoutFactor: decision?.testTimeoutFactor ?? null,
-    admissionWaitMs: ms(admissionWaitMs),
+    admissionWaitMs: ms(admissionPhases ? Object.values(admissionPhases).reduce((sum, phase) => sum + phase.waitedMs, 0) : admissionWaitMs),
     vitestMs: ms(vitestMs),
     scanMs: ms(scanMs),
     standardsMs: ms(standardsMs),
@@ -549,7 +616,7 @@ export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standards
     importGraphTargetCount: Array.isArray(decision?.relatedFiles) ? decision.relatedFiles.length : null,
     literalReferenceTargetCount: Array.isArray(decision?.referencedTests) && Array.isArray(decision?.relatedFiles)
       ? decision.referencedTests.filter(file => !decision.relatedFiles.includes(file)).length : null,
-    outcomes: Object.fromEntries(['vitest', 'scan', 'standards'].map(kind => [kind, outcomes[kind] ?? { result: 'skipped' }])),
+    outcomes: Object.fromEntries(['vitest', 'scan', 'standards'].map(kind => [kind, outcomes[kind] ?? (kind === 'standards' ? standardsOutcome : { result: 'skipped' })])),
   };
 }
 
@@ -557,10 +624,11 @@ export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standards
 export function formatVerifyPhases(phases) {
   const fields = { admission: phases.admissionWaitMs, vitest: phases.vitestMs, scan: phases.scanMs,
     standards: phases.standardsMs, gate: phases.gateMs, targets: phases.targetFileCount, changed: phases.changedFileCount };
-  const counts = { graph: phases.importGraphTargetCount, literal: phases.literalReferenceTargetCount, related: phases.relatedMode, timeoutFactor: phases.testTimeoutFactor };
+  const counts = { graph: phases.importGraphTargetCount, literal: phases.literalReferenceTargetCount, related: phases.relatedMode, timeoutFactor: phases.testTimeoutFactor, standardsPolicy: phases.standardsPolicy, admission: phases.admissionMode };
   return ['phaseMs', ...Object.entries(fields).filter(([, value]) => value != null)
     .map(([name, value]) => `${name}=${value}`),
   ...Object.entries(phases.outcomes ?? {}).map(([name, outcome]) =>
     `${name}=${outcome.result}${outcome.reason ? `(${outcome.reason.replace(/[\r\n\u2028\u2029]/g, ' ')})` : ''}`),
-  ...Object.entries(counts).filter(([, value]) => value != null).map(([name, value]) => `${name}=${value}`)].join(' ');
+  ...Object.entries(counts).filter(([, value]) => value != null).map(([name, value]) => `${name}=${value}`),
+  ...Object.entries(phases.admissionPhases ?? {}).map(([name, phase]) => `${name}Wait=${phase.waitedMs}(${phase.lane})`)].join(' ');
 }
