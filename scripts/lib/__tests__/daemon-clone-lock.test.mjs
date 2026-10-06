@@ -49,7 +49,7 @@ describe('acquireRead / acquireWrite — basic handshake', () => {
     const writerResult = await acquireWrite(clone, { owner: 'writer-a', lockRoot, nowMs: 0, pid: 111, probe: alwaysAlive });
     expect(writerResult.ok).toBe(true);
     const readResult = acquireRead(clone, { owner: 'reader-a', lockRoot, nowMs: 1000, pid: 222, probe: alwaysAlive });
-    expect(readResult).toEqual({ ok: false, reason: 'writer-active', heldBy: 'writer-a' });
+    expect(readResult).toEqual({ ok: false, reason: 'writer-active', heldBy: 'writer-a', starved: 1 });
   });
 
   it('second writer while first is live → concurrent-mover', async () => {
@@ -105,7 +105,7 @@ describe('Dekker ordering between acquireRead and acquireWrite', () => {
     // case the recheck also covers). This proves acquireRead never reserves a reader key while any writer
     // check — first or second — sees a live foreign writer, i.e. the recheck can never let one through either.
     const readResult = acquireRead(clone, { owner: 'reader-a', lockRoot, nowMs: 100, pid: 222, probe: alwaysAlive });
-    expect(readResult).toEqual({ ok: false, reason: 'writer-active', heldBy: 'writer-a' });
+    expect(readResult).toEqual({ ok: false, reason: 'writer-active', heldBy: 'writer-a', starved: 1 });
     // and no reader key was left behind
     const snapshot = inspectCloneLock(clone, { lockRoot });
     expect(snapshot.readers).toEqual([]);

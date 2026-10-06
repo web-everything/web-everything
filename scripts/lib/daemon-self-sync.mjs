@@ -109,7 +109,24 @@ import { collectImportClosure, closureHits } from './import-closure.mjs';
 export { collectImportClosure };
 import { gateMergedCommit } from './daemon-live-smoke.mjs';
 import { rebuildClone, readRebuildState } from './daemon-rebuild.mjs';
-import { acquireRead as acquireReadLock, releaseRead as releaseReadLock } from './daemon-clone-lock.mjs';
+import {
+  acquireRead as acquireReadLock, releaseRead as releaseReadLock, resolveReaderPriorityAfter,
+} from './daemon-clone-lock.mjs';
+import { basename } from 'node:path';
+
+/** Setting: how long a STARVED reader (see `daemon-clone-lock.mjs` "reader fairness") waits, within the same
+ *  tick, for draining writers to back off before it skips. Default 30s; a writer that already holds the clone
+ *  is never interrupted, so this only has to outlast a fast locked step. */
+export const READER_PRIORITY_WAIT_ENV = 'WE_DAEMON_CLONE_LOCK_PRIORITY_WAIT_MS';
+export const DEFAULT_READER_PRIORITY_WAIT_MS = 30_000;
+const PRIORITY_POLL_MS = 1000;
+
+/** PURE: the starved-reader wait from env — a non-negative integer, else the default. */
+export function resolvePriorityWaitMs(env = process.env) {
+  const raw = env?.[READER_PRIORITY_WAIT_ENV];
+  const n = raw == null || String(raw).trim() === '' ? NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_READER_PRIORITY_WAIT_MS;
+}
 
 /**
  * Pure: what should a daemon's clone do, given where it stands against `origin/main`?
@@ -465,6 +482,9 @@ export function withSelfSync(effects, {
   }), acquireRead = acquireReadLock, releaseRead = releaseReadLock, readState = readRebuildState,
   entries = [process.argv[1]], diffFiles = changedFilesBetween, importClosure = collectImportClosure,
   minRestartIntervalMs = resolveRestartMinIntervalMs(env), now = Date.now,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  readerPriorityAfter = resolveReaderPriorityAfter(env), priorityWaitMs = resolvePriorityWaitMs(env),
+  readerKey = `reader:${basename(String(entries?.[0] || 'daemon'))}`,
 }) {
   const tick = effects.tickOnce;
   const resolvedPocBranch = resolvePocSyncBranch({ pocBranch, env });
@@ -558,7 +578,18 @@ export function withSelfSync(effects, {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         // 2. Acquire the READ lock — refused (a writer, possibly a sibling process's rebuild, is active) means
         //    skip this tick entirely rather than ever read a tree mid-move.
-        const acquired = acquireRead(root, cloneLockOpts());
+        let acquired = acquireRead(root, { ...cloneLockOpts(), readerKey });
+        if (!acquired.ok && readerPriorityAfter > 0 && acquired.starved >= readerPriorityAfter) {
+          // Starvation smell + reader priority: every writer still draining now backs off (it has moved nothing
+          // yet), so wait a bounded moment for the slot instead of losing yet another tick.
+          log.error?.(`daemon-self-sync: reader starved — read refused ${acquired.starved} consecutive time(s) (writer ${acquired.heldBy ?? '?'}); claiming reader priority, waiting up to ${Math.round(priorityWaitMs / 1000)}s for draining writers to back off (#4044 never-read-mid-move kept)`);
+          const until = now() + priorityWaitMs;
+          while (!acquired.ok && now() < until) {
+            await sleep(PRIORITY_POLL_MS);
+            acquired = acquireRead(root, { ...cloneLockOpts(), readerKey, trackStarvation: false });
+          }
+          if (acquired.ok) log.error?.('daemon-self-sync: starved reader got its read slot — ticking (#4044 reader priority)');
+        }
         if (!acquired.ok) {
           log.error?.(`daemon-self-sync: read lock refused (${acquired.reason}) — skipping this tick, never reading a tree mid-move (#4044)`);
           return skippedTick(acquired.reason);
