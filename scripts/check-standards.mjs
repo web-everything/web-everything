@@ -20,7 +20,10 @@ import { relatedReportRefs } from './lib/related-report.cjs';
  *                         findings `--local` would ALWAYS demote this way doesn't run at all under `--local` —
  *                         it checks `LOCAL_MODE` (declared right below, before any section runs) and skips its
  *                         own work instead of computing a finding this mode discards anyway. Same verdict, less
- *                         work; the default no-flag run is untouched (`LOCAL_MODE` is false).
+ *                         work; the default no-flag run is untouched (`LOCAL_MODE` is false). #70d: under
+ *                         `--local --files=…`, a whole-repo section whose declared inputs
+ *                         (we:scripts/lib/standards-sections.mjs) match no touched file is skipped and listed in
+ *                         `summary.skippedSections` as `skipped (scoped: no input touched)`.
  */
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -50,6 +53,7 @@ import { scanInvisibleSourceTree } from './lib/invisible-source-scan.mjs';
 import { scanFilesCached, gitGrepCached, cacheEnabled, fileKeys } from './lib/standards-cache.mjs';
 import { scanStdoutFlush, stdoutFlushMessage } from './lib/stdout-flush-scan.mjs';
 import { runWeScan } from './lib/rust-scan-bridge.mjs';
+import { createSectionGate, SKIP_REASON } from './lib/standards-sections.mjs';
 import {
   BACKLOG_STATUSES, BACKLOG_KINDS, FIB, FILE, blockSpecFile,
   dMissingField, dUnresolvedRef, dMissingDescription, buildGraduatedKinds, validateBacklogItem, validatePolyglotWideningGate, isCanonicalGraduated, detectClassificationCollapse, computeNativeFirstConformance, computeDesignKnowledgeConformance,
@@ -269,6 +273,26 @@ const LINKED_FILES = CHANGED_BACKLOG_FILES.length
 // one), so it only ever promotes a demoted finding to blocking, never the reverse. Equal to `LOCAL_FILES`
 // whenever no `--files=` was given at all (LINKED_FILES is then `null` too).
 const EFFECTIVE_FILES = LOCAL_FILES ? new Set([...LOCAL_FILES, ...(LINKED_FILES || [])]) : null;
+// #70d — under `--local --files=…` a whole-repo section whose declared inputs (we:scripts/lib/standards-sections.mjs)
+// match no file in EFFECTIVE_FILES is skipped and recorded as `skipped (scoped: no input touched)`. Unscoped runs
+// (CI, close-out, the default) never consult it: `shouldRun` is unconditionally true when SCOPE_TO_FILES is false.
+const sectionGate = createSectionGate({ scoped: SCOPE_TO_FILES, touched: EFFECTIVE_FILES, root: ROOT });
+// #70d — the two git-grep citation gates (6f-ii-c/d) attribute every finding to the CITING file, so under
+// `--local --files=…` they grep only the lane's own existing files (a finding on any other file is demoted to a
+// note anyway). Returns null when unscoped, so those gates keep their whole-tree (cached) grep unchanged.
+const scopedGrepLines = (pattern, keep) => {
+  if (!SCOPE_TO_FILES) return null;
+  const targets = [...EFFECTIVE_FILES].filter((f) => keep(f) && existsSync(join(ROOT, f))).sort();
+  if (!targets.length) return [];
+  try {
+    return execFileSync('git', ['grep', '--threads=1', '-nE', pattern, '--', ...targets.map((f) => `:(literal)${f}`)],
+      { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 }).split('\n').filter(Boolean);
+  } catch (e) {
+    if (e?.status === 1) return []; // no match
+    return null; // anything else → fall back to the unscoped path below, never a silent "clean"
+  }
+};
+const skippedMark = (id) => { if (PROFILE) profileEntries.push([`  (${id} ${SKIP_REASON})`, 0, process.memoryUsage().rss]); };
 
 // Each entry is { message, descriptor? }. The optional descriptor is the structured,
 // agent-targetable form of the failure — populated for every class a fixer (deterministic
@@ -950,7 +974,9 @@ mark("6d-bis. Per-item RENDERING lints (#290 raw-HTML · #441 buried-fork · mis
 // trigger; YAML reads it as a nested mapping and the parse dies, silently dropping the item from the
 // board. Error (not warn): a vanished backlog item escapes every other check, so the gate must catch
 // the typo at author time and prompt the quote-fix.
-for (const file of readdirSync(join(ROOT, 'backlog')).filter((f) => f.endsWith('.md'))) {
+// #70d — per-file (judges one file's own frontmatter), so `scopedReaddir` narrows it to the lane's own files
+// under `--local --files=…` exactly as #4168 did for 6f; unchanged (every file) otherwise.
+for (const file of scopedReaddir('backlog/', ['.md'])) {
   const raw = readFileSync(join(ROOT, 'backlog', file), 'utf8');
   const { colonHits: hits, parseReason } = describeUnparseableFrontmatter(raw);
   // Non-colon parse failure (unclosed quote, tab indent, bad flow collection…) — the colon scan found nothing
@@ -1197,10 +1223,13 @@ try {
   err(`Backlog workflow-intent invariants check failed: ${e.message}`);
 }
 
+// #70d — the three whole-tree scans below share one declared input set ('6d-ter-tree-scans').
+const runTreeScans = sectionGate.shouldRun('6d-ter-tree-scans');
+if (!runTreeScans) skippedMark('6d-ter-tree-scans');
 // Operator-local date stamps (#2747). The rule "a date-only stamp is the operator's calendar day, never
 // the runtime's UTC day" is enforced here rather than left as prose in `scripts/lib/local-date.mjs`: the
 // idiom it replaces is one line and re-introduces the bug silently (see lib/utc-day-slice-scan.mjs).
-try {
+if (runTreeScans) try {
   // Each hit carries its own `file`/`line`, so it MUST be attributed (#952/#1389/#1144): without a
   // descriptor, `--scope=<slug>` classes it "unattributable" and reds a concurrent session on a file it
   // never touched, while `--local --files=<lane set>` demotes it to a note — a false green at this seam.
@@ -1211,7 +1240,7 @@ try {
 }
 
 // #2866: backstop for shell writes and the existing scripts/docs source corpus.
-try {
+if (runTreeScans) try {
   for (const finding of scanInvisibleSourceTree(ROOT)) err(finding.message, finding.descriptor);
 } catch (e) {
   err(`Invisible-character scan failed: ${e.message}`);
@@ -1221,7 +1250,7 @@ try {
 // (~8 KB) whenever a parent CAPTURES stdout — silently, with a zero status. Eight live CLIs carried it, four
 // losing over 99 % of their payload, including this gate. Prose did not stop it: five files had each
 // rediscovered the mechanism in a local comment. Deterministic and script-decidable ⇒ a scan (memory rule #51).
-try {
+if (runTreeScans) try {
   // Attributed per hit (#952/#1389/#1144) — an unattributed finding reds a concurrent session on a file it
   // never touched, and `--local --files=<lane set>` would demote a real one to a note.
   // #3417 — the optional Rust `we-scan stdout-flush` port, verified byte-identical to scanStdoutFlush; falls
@@ -1785,7 +1814,7 @@ try {
   }) });
   const changedFiles = citationChanges ? new Set(citationChanges.changedFiles) : null;
   // #70c: per-file cached raw grep hits (classification below stays whole-tree); null = plain git grep.
-  let hits = gitGrepCached({
+  let hits = scopedGrepLines(HASH_PATH_CITE_SOURCE, (f) => !f.startsWith('node_modules/') && !f.startsWith('backlog/')) ?? gitGrepCached({
     section: '6f-ii-c', entries: GREP_CACHE_ENTRIES, root: ROOT, pattern: HASH_PATH_CITE_SOURCE,
     exclude: (f) => f.startsWith('node_modules/') || f.startsWith('backlog/'), getKeys: cacheKeys, onStats: (l) => cacheStatLines.push(l),
   });
@@ -1850,7 +1879,7 @@ try {
   // this module's own tests exercise the EXACT construction this gate ships, not a copy of it.
   const resolvableIds = buildBacklogResolvableIds(backlog);
   // #70c: per-file cached raw grep hits (classification below stays whole-tree); null = plain git grep.
-  let hits = gitGrepCached({
+  let hits = scopedGrepLines(BACKLOG_GLOB_CITE_SOURCE, (f) => !f.startsWith('node_modules/')) ?? gitGrepCached({
     section: '6f-ii-d', entries: GREP_CACHE_ENTRIES, root: ROOT, pattern: BACKLOG_GLOB_CITE_SOURCE,
     exclude: (f) => f.startsWith('node_modules/'), getKeys: cacheKeys, onStats: (l) => cacheStatLines.push(l),
   });
@@ -2384,7 +2413,14 @@ mark("9. Vite dev-proxy allowlist must cover every 11ty catalog route");
 // anchor with no body is a rule in name only. All four rules live in scripts/lib/validate-rules-anchors.cjs
 // (standalone: `npm run check:statute`), re-using the loader's anchor extraction so the gate and the
 // rendered page can never disagree.
-try {
+// #70d — `dynamicInputs`: every enforcer path the invariant catalogue names is an input too (the rule checks
+// that it exists), so a lane deleting/renaming one still runs this section in scoped mode.
+if (!sectionGate.shouldRun('9a-rules', { dynamicInputs: () => {
+  const { collectEnforcerPaths, enforcerPathCandidates } = require('./lib/validate-rules-anchors.cjs');
+  const cat = JSON.parse(readFileSync(join(ROOT, 'scripts', 'lib', 'invariant-catalogue.json'), 'utf8'));
+  return cat.invariants.flatMap((inv) => collectEnforcerPaths(inv?.howChecked).flatMap(enforcerPathCandidates));
+} })) skippedMark('9a-rules');
+else try {
   const { runStatuteCheck } = require('./lib/validate-rules-anchors.cjs');
   const { errors: re, warnings: rw } = runStatuteCheck();
   for (const e of re) err(e.message, e.descriptor);
@@ -2401,7 +2437,8 @@ mark("9a-rules. Statute-layer integrity gate (#1828 resolution + #2083 duplicate
 // unsettled `kind: decision`, orphaned `docs/agent/*.md#anchor`) into the everyday gate. WARNINGS only —
 // a curation nudge, never build-breaking (a leaf may deliberately cite an open decision). Standalone:
 // `npm run check:memory-freshness`.
-try {
+if (!sectionGate.shouldRun('9a-prime')) skippedMark('9a-prime');
+else try {
   const { runMemoryFreshnessCheck } = require('./lib/memory-freshness.cjs');
   const { warnings: fw } = runMemoryFreshnessCheck();
   for (const w of fw) warn(w.message, w.descriptor);
@@ -2417,7 +2454,8 @@ mark("9a′. Agent-memory freshness (#2087)");
 // any existing gate caught. A leaf making a false claim about the repo is a wrong INSTRUCTION every future
 // session loads before acting, so these are ERRORS, not curation nudges. Standalone: none — folded
 // straight into check:standards since the whole point is gate-time visibility (#2921 Why-now).
-try {
+if (!sectionGate.shouldRun('9a-prime-ii')) skippedMark('9a-prime-ii');
+else try {
   const { runMemoryCitationLintCheck } = require('./lib/memory-freshness.cjs');
   const { errors: ce } = runMemoryCitationLintCheck();
   for (const e of ce) err(e.message, e.descriptor);
@@ -2494,7 +2532,8 @@ mark("9b. Module-resolution exports-lock (#274/#271)");
 // (2) The WE-side `serve()` form catalog stays frozen to the ratified reference-runtime set — a new
 // framework dialect can't be slipped into the WE renderer to manufacture a WE-side codegen consumer; it
 // must go through the FUI genWrapper pattern. The fs gather lives here; the pure rules do the asserting.
-try {
+if (!sectionGate.shouldRun('9c')) skippedMark('9c');
+else try {
   // (1) gather every in-repo package.json manifest (root + nested, excluding node_modules) → name + exports.
   const manifests = [];
   const walkPkgs = (dir) => {
@@ -2667,7 +2706,8 @@ mark("13. Playwright container-image pin lockstep (#2234)");
 // checked total), never a hand list — so a new consumer a future PR adds can't regress a table nobody remembered to
 // list. The member set is DERIVED from the real `VERDICTS` import, so the gate can't drift from the enum it guards.
 // Pure rule in `lib/verdict-totality.mjs`; the fs walk stays here (mirrors scanRepoLocusPrefixes).
-{
+if (!sectionGate.shouldRun('14')) skippedMark('14');
+else {
   const scanDirs = ['scripts', 'skills-src'];
   const SKIP_DIRS = new Set(['node_modules', '.git', '__tests__']);
   const walkSource = (dir, acc = []) => {
@@ -2745,7 +2785,8 @@ mark("15. Review-label swap must stay in its single home (#2882)");
 // round-2 panel review (#2416) traced a live `.cjs` sibling family under `scripts/lib/` (e.g. loader hooks) that
 // the first cut's `.mjs`-only walk never visited; `.js` has no callers under `scripts/` today, so it stays out
 // until one exists.
-{
+if (!sectionGate.shouldRun('15b')) skippedMark('15b');
+else {
   const SKIP_DIRS = new Set(['node_modules', '.git', '__tests__', '__fixtures__']);
   const isScannableScript = (name) => (name.endsWith('.mjs') || name.endsWith('.cjs')) && !name.endsWith('.test.mjs') && !name.endsWith('.test.cjs');
   const walkMjs = (dir, acc = []) => {
@@ -2875,7 +2916,8 @@ mark("17. Small-file preference: size+collision composite soft-warn (#2678 rulin
 // multi-juror lenses collapsed last-writer-wins. WARN-first (`TEST_ONLY_EXPORT_ENFORCED`). Pure rule in
 // check-standards-rules.mjs; the fs read and the two STRUCTURAL carve-out sets it needs stay here (rule 16's
 // split). Rule 19 — the other rule that review named — follows.
-try {
+if (!sectionGate.shouldRun('18')) skippedMark('18');
+else try {
   const SKIP_DIRS = new Set(['node_modules', 'dist', '.git', '__snapshots__']);
   const isTestPath = (p) => p.includes('/__tests__/') || p.includes('/__fixtures__/') || p.endsWith('.test.mjs');
   const everyModule = [];
@@ -3070,7 +3112,8 @@ mark("18c. Operation IO modules with no real-mechanism test (#2949 fidelity qual
 // whole suite green. `scanUnfencedMandateParams` is what the test imports, so neutering it reddens.
 // Runs OUTSIDE any try/catch on purpose: this rule ERRORS, and a catch-all that demoted its failure to a
 // warning would be a gate that fails OPEN — the exact shape #2967 exists to stop shipping.
-{
+if (!sectionGate.shouldRun('19')) skippedMark('19');
+else {
   const unfenced = scanUnfencedMandateParams(ROOT);
   for (const e of unfenced.errors) err(e.message, e.descriptor);
   for (const w of unfenced.warnings) warn(w.message, w.descriptor);
@@ -3148,6 +3191,8 @@ const summary = {
   errors: errors.length, warnings: warnings.length,
   ...(scopeSession ? { scope: scopeSession, externalErrors: externalErrors.length } : {}),
   ...(filesArg || LOCAL_MODE ? { local: LOCAL_MODE, files: list ?? null, externalErrors: externalErrors.length } : {}),
+  // #70d — only a scoped run can skip a section, so only a scoped run carries this key (unscoped output unchanged).
+  ...(SCOPE_TO_FILES ? { skippedSections: Object.fromEntries(sectionGate.skipped.map((id) => [id, SKIP_REASON])) } : {}),
 };
 
 if (JSON_MODE) {
@@ -3185,6 +3230,8 @@ if (JSON_MODE) {
   console.log(diffBranchCoverage.message);
   if (scopeNote) console.log(`${CYN}  scope${RST} ${DIM}${scopeNote}${RST}`);
   if (localNote) console.log(`${CYN}  local${RST} ${DIM}${localNote}${RST}`);
+  if (SCOPE_TO_FILES && sectionGate.skipped.length)
+    console.log(`${CYN}  local${RST} ${DIM}${SKIP_REASON}: ${sectionGate.skipped.join(', ')}${RST}`);
   for (const w of warnings) console.log(`${YEL}  warn${RST} ${w.message}`);
   for (const e of externalErrors) console.log(`${DIM}  note (external) ${e.message}${RST}`);
   for (const e of errors) console.log(`${RED} error${RST} ${e.message}`);

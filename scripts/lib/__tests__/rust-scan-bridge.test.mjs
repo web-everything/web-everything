@@ -10,11 +10,11 @@
  * The shape-validation and staleness tests are the direct regression coverage for PR #1741's two review
  * findings — see rust-scan-bridge.mjs's own header for the full incident writeup.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, chmodSync, rmSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createWeScanRunner } from '../rust-scan-bridge.mjs';
+import { createWeScanRunner, SHARED_SUBCOMMANDS } from '../rust-scan-bridge.mjs';
 
 let dir;
 afterEach(() => {
@@ -159,5 +159,73 @@ describe('createWeScanRunner — the fallback contract (#3417)', () => {
       const run = createWeScanRunner(bin);
       expect(() => run('secret-scrub', ['--root=.'], { scoped: true })).not.toThrow();
     });
+  });
+});
+
+describe('createWeScanRunner — resolveSharedBin', () => {
+  it('runs the shared binary when the local binary is missing and forwards references and subcommand', () => {
+    const shared = fixtureScript('echo \'["shared"]\'');
+    const referenceFiles = [join(dir, 'reference.mjs')];
+    touchAt(referenceFiles[0], 2000_000);
+    const resolveSharedBin = vi.fn(() => shared);
+    const run = createWeScanRunner(join(dir, 'missing'), { resolveSharedBin });
+    expect(run('secret-scrub', ['--root=.'], { referenceFiles })).toEqual(['shared']);
+    expect(resolveSharedBin).toHaveBeenCalledTimes(1);
+    expect(resolveSharedBin).toHaveBeenCalledWith(referenceFiles, 'secret-scrub');
+  });
+
+  it('runs the shared binary even when an existing local binary is stale', () => {
+    const shared = fixtureScript('echo \'["shared"]\'');
+    // fixtureScript owns the outer cleanup dir; keep the second script independent.
+    const localDir = mkdtempSync(join(tmpdir(), 'we-scan-bridge-local-'));
+    try {
+      const local = join(localDir, 'we-scan');
+      writeFileSync(local, '#!/bin/sh\necho \'["local"]\'\n');
+      chmodSync(local, 0o755);
+      utimesSync(local, 1000, 1000);
+      utimesSync(shared, 1000, 1000);
+      const ref = join(localDir, 'reference.mjs');
+      touchAt(ref, 2000_000);
+      const resolveSharedBin = vi.fn(() => shared);
+      const run = createWeScanRunner(local, { resolveSharedBin });
+      expect(run('stdout-flush', [], { referenceFiles: [ref] })).toEqual(['shared']);
+      expect(resolveSharedBin).toHaveBeenCalledTimes(1);
+      expect(resolveSharedBin).toHaveBeenCalledWith([ref], 'stdout-flush');
+    } finally {
+      rmSync(localDir, { recursive: true, force: true });
+    }
+  });
+
+  describe.each(['null', 'throws'])('when the resolver %s', (outcome) => {
+    it.each(['missing', 'fresh', 'stale'])('preserves the %s local binary behavior without throwing', (state) => {
+      const local = fixtureScript('echo \'["local"]\'');
+      const ref = join(dir, 'reference.mjs');
+      touchAt(ref, 2000_000);
+      utimesSync(local, state === 'stale' ? 1000 : 3000, state === 'stale' ? 1000 : 3000);
+      const resolveSharedBin = vi.fn(() => {
+        if (outcome === 'throws') throw new Error('cache unavailable');
+        return null;
+      });
+      const run = createWeScanRunner(state === 'missing' ? join(dir, 'missing') : local, { resolveSharedBin });
+      let result;
+      expect(() => { result = run('stdout-flush', [], { referenceFiles: [ref] }); }).not.toThrow();
+      expect(result).toEqual(state === 'fresh' ? ['local'] : null);
+      expect(resolveSharedBin).toHaveBeenCalledTimes(1);
+      expect(resolveSharedBin).toHaveBeenCalledWith([ref], 'stdout-flush');
+    });
+  });
+
+  it('never consults the shared resolver for scoped calls', () => {
+    const bin = fixtureScript('echo \'["shared"]\'');
+    const resolveSharedBin = vi.fn(() => bin);
+    const run = createWeScanRunner(bin, { resolveSharedBin });
+    expect(run('secret-scrub', [], { scoped: true })).toBeNull();
+    expect(resolveSharedBin).not.toHaveBeenCalled();
+  });
+
+  it('shares secret-scrub and stdout-flush but not citation-check', () => {
+    expect(SHARED_SUBCOMMANDS.has('secret-scrub')).toBe(true);
+    expect(SHARED_SUBCOMMANDS.has('stdout-flush')).toBe(true);
+    expect(SHARED_SUBCOMMANDS.has('citation-check')).toBe(false);
   });
 });

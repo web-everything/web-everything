@@ -41,8 +41,16 @@
  *   fallback runs instead — never the binary silently re-doing the whole-corpus walk the caller scoped
  *   down specifically to avoid, and never a wrong/ignored `--files`-shaped flag invented for a binary that
  *   doesn't parse one. One choke point for this instead of every call site re-deciding it.
+ *
+ * ── #70d — the shared, content-keyed binary (`deps.resolveSharedBin`) ───────────────────────────────────
+ *   The mtime check above misjudges a lane clone both ways: a fresh clone resets every mtime (an old binary reads
+ *   "stale", so lanes fell back to JS), and an old clone keeps a binary built from OLDER Rust source that still
+ *   reads "fresh". The default runner now first asks we:scripts/lib/we-scan-cache.mjs for a host-wide binary
+ *   built from origin/main's Rust source and trusted by CONTENT against the call's reference files. Only with no
+ *   trusted match does it use this checkout's own binary under the original mtime check — then JS, as before.
  */
 import { existsSync, statSync } from 'node:fs';
+import { resolveSharedWeScan } from './we-scan-cache.mjs';
 import { execFileSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -59,9 +67,11 @@ function mtimeMs(path) {
  * exercise the missing/stale/malformed/erroring fallback paths without needing a real `cargo build` (see
  * scripts/lib/__tests__/rust-scan-bridge.test.mjs). `runWeScan` below is just this bound to the real path.
  * @param {string} binPath
+ * @param {{resolveSharedBin?: (referenceFiles: string[], subcommand: string) => string|null}} [deps] #70d — a
+ *   content-trusted shared binary for this call, tried BEFORE `binPath`; null → `binPath` with its usual checks.
  * @returns {(subcommand: string, args: string[], opts?: {referenceFiles?: string[], scoped?: boolean}) => unknown|null}
  */
-export function createWeScanRunner(binPath) {
+export function createWeScanRunner(binPath, { resolveSharedBin } = {}) {
   // One notice per RUNNER, not per call — check-standards.mjs calls this from more than one section, and a
   // missing/stale binary is one fact worth stating once, not once per subcommand.
   const warned = new Set(); // reasons already logged this run
@@ -80,26 +90,35 @@ export function createWeScanRunner(binPath) {
       return null;
     }
 
-    if (!existsSync(binPath)) {
-      note('missing', `note: ${binPath} not built — falling back to the JS scan(s) it would otherwise ` +
-        'replace (run `cargo build --release` in scripts/rust-scan for the faster, parallel path)\n');
-      return null;
-    }
+    // #70d — a content-trusted shared build (see we-scan-cache.mjs) wins over this checkout's own binary, whose
+    // freshness is only an mtime guess; with no trusted shared build, the original local checks apply unchanged.
+    let bin = null;
+    try { bin = resolveSharedBin ? resolveSharedBin(referenceFiles, subcommand) : null; } catch { bin = null; }
+    if (bin) {
+      note('shared', `note: using the shared we-scan build ${bin} (#70d)\n`);
+    } else {
+      if (!existsSync(binPath)) {
+        note('missing', `note: ${binPath} not built — falling back to the JS scan(s) it would otherwise ` +
+          'replace (run `cargo build --release` in scripts/rust-scan for the faster, parallel path)\n');
+        return null;
+      }
 
-    const binMtime = mtimeMs(binPath);
-    const staleAgainst = referenceFiles.find((f) => {
-      const m = mtimeMs(f);
-      return m != null && binMtime != null && m > binMtime;
-    });
-    if (staleAgainst) {
-      note('stale', `note: ${binPath} is STALE (older than ${staleAgainst}) — falling back to the JS scan ` +
-        'until it is rebuilt (`cargo build --release` in scripts/rust-scan)\n');
-      return null;
+      const binMtime = mtimeMs(binPath);
+      const staleAgainst = referenceFiles.find((f) => {
+        const m = mtimeMs(f);
+        return m != null && binMtime != null && m > binMtime;
+      });
+      if (staleAgainst) {
+        note('stale', `note: ${binPath} is STALE (older than ${staleAgainst}) — falling back to the JS scan ` +
+          'until it is rebuilt (`cargo build --release` in scripts/rust-scan)\n');
+        return null;
+      }
+      bin = binPath;
     }
 
     let out;
     try {
-      out = execFileSync(binPath, [subcommand, ...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+      out = execFileSync(bin, [subcommand, ...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
     } catch (e) {
       note(`exec-${subcommand}`, `note: we-scan ${subcommand} failed (${e.message}) — falling back to the JS scan\n`);
       return null;
@@ -135,4 +154,15 @@ export function createWeScanRunner(binPath) {
  *   JS fallback ready; skip the (always whole-corpus) binary and return `null` immediately.
  * @returns {unknown[]|null}
  */
-export const runWeScan = createWeScanRunner(DEFAULT_BIN);
+/**
+ * #70d — subcommands the shared build may serve: only those measured NOT slower than their JS fallback. Measured
+ * 2026-10-06 on this repo (host load ~15 on 12 cores): secret-scrub 0.9 s vs JS 1.7 s; stdout-flush 0.9 s vs JS
+ * 1.1 s; citation-check 12.3 s vs JS 1.5 s — so citation-check stays JS unless a checkout built its own binary.
+ */
+export const SHARED_SUBCOMMANDS = new Set(['secret-scrub', 'stdout-flush']);
+
+export const runWeScan = createWeScanRunner(DEFAULT_BIN, {
+  resolveSharedBin: (referenceFiles, subcommand) => (SHARED_SUBCOMMANDS.has(subcommand)
+    ? resolveSharedWeScan({ root: join(HERE, '..', '..'), referenceFiles })
+    : null),
+});

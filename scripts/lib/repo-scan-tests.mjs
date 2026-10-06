@@ -84,6 +84,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
 export const DEFERRED_SCAN_TESTS = Object.freeze({
   'scripts/__tests__/stdout-flush.test.mjs': 'its one-home drain-loop guard lives in a test the default vitest config excludes (runs under vitest.integration.config.ts with real child processes), so `vitest run <file>` cannot select it; CI runs it',
   'scripts/__tests__/check-standards.test.mjs': 'asserts over the real tracked tree via check-standards itself; the verify gate already runs `check:standards --local --files=<changed>`',
+  'scripts/lib/__tests__/standards-sections.test.mjs': 'runs check-standards itself and imports the section registry it pins (standards-sections.mjs), so `vitest related` already selects it when the registry changes; not a rule scan',
   'scripts/__tests__/check-standards-rules-backlog-integrity.test.mjs': 'walks backlog/ cards; a backlog/ change already runs check:standards UNSCOPED in the same gate',
   'scripts/__tests__/check-standards-rules-conformance-gates.test.mjs': 'classifies every tracked src/** path; the same rule runs in check:standards',
   'scripts/__tests__/check-backlog-item.test.mjs': 'reads one backlog dir to assert an id is absent; not a rule scan',
