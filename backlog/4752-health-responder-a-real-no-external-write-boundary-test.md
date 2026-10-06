@@ -62,3 +62,11 @@ Follow-up from the #3490 advisory (2026-10-02). The replay in `we:scripts/convey
 
 - Broader OS-enforced isolation and complete resident-daemon import-graph auditing are outside this tick-boundary test. Do not describe this result as proof of those properties.
 - If a future responder adds a legitimate facts subprocess or live actuator, its owning change must explicitly extend the allowlist and add positive/negative boundary cases; do not weaken this test by silently permitting all `gh` or `git` commands.
+
+## Findings (standalone worker, 2026-10-06)
+
+The build-dispatch daemon held #4752 with:
+
+> worker-declined: scope exceeds the test-fix envelope — route to the builder: the heal changed 277 lines (limit 150)
+
+Implementation changes were discarded. The card is held for the builder; its declared scope is preserved.
