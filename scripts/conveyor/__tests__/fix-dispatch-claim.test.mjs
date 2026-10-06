@@ -573,3 +573,43 @@ it('releaseSessionFixDispatchClaims releases only the claim minted for that who'
     expect(readFixDispatchClaim({ repo: 'we', pr, kind, lockRoot: claimRoot })).not.toBeNull();
   }
 });
+
+describe('awaiting-verify claim exemption (#5137)', () => {
+  const key = () => ({ repo: 'we', pr: 4115, kind: 'fixing', lockRoot: claimRoot });
+  const setup = () => {
+    expect(acquireFixClaim({ ...key(), who: 'fix-4115', sessionId: 'S1', nowMs: T0 }).ok).toBe(true);
+    return readFixDispatchClaim(key());
+  };
+  const sweep = (awaitingVerifyFor, nowMs = T0 + 1000) => refreshLiveFixDispatchClaims({
+    lockRoot: claimRoot, nowMs, nowIso: () => iso(nowMs), hungInfoFor: () => null, awaitingVerifyFor,
+    listAgentsAll: () => [{ name: 'fix-4115', sessionId: 'S1', state: 'done', status: 'idle', startedAt: T0 - 1000 }],
+  });
+  it('without awaiting-verify a done fixing session releases its claim', () => {
+    const entry = setup();
+    expect(sweep(null).released).toEqual([{ repo: 'we', pr: 4115, kind: 'fixing', owner: entry.owner }]);
+    expect(readFixDispatchClaim(key())).toBeNull();
+  });
+  it('awaiting-verify heartbeats a done fixing session and reports awaiting', () => {
+    const entry = setup();
+    const result = sweep((row, { pr }) => ({ awaiting: row.sessionId === 'S1' && pr === 4115 }));
+    const expected = { repo: 'we', pr: 4115, kind: 'fixing', owner: entry.owner };
+    expect(result.awaiting).toEqual([expected]);
+    expect(result.refreshed).toEqual([{ ...expected, headSha: null }]);
+    expect(result.released).toBeUndefined();
+    expect(readFixDispatchClaim(key()).heartbeatAt).toBe(iso(T0 + 1000));
+  });
+  it('awaiting-verify for a different PR does not keep the claim', () => {
+    setup();
+    const result = sweep((row, { pr }) => ({ awaiting: pr === 4116 }));
+    expect(result.awaiting).toBeUndefined();
+    expect(result.released).toHaveLength(1);
+    expect(readFixDispatchClaim(key())).toBeNull();
+  });
+  it('awaiting-verify cannot bypass the four-hour ceiling', () => {
+    setup();
+    const result = sweep(() => ({ awaiting: true }), T0 + MAX_FIX_DISPATCH_CLAIM_REFRESH_MS + 1);
+    expect(result.refreshed).toEqual([]);
+    expect(result.awaiting).toBeUndefined();
+    expect(readFixDispatchClaim(key()).heartbeatAt).toBe(iso(T0));
+  });
+});

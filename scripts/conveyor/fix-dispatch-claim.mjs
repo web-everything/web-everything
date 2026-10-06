@@ -73,6 +73,7 @@
  * an unknown/missing session retains the plain TTL to cover spawn-listing lag. Old terminal sessions
  * sharing the same name cannot release a new dispatch's claim.
  */
+import { makeAwaitingVerifyResolver } from './await-verify.mjs';
 import { hostname } from 'node:os';
 import {
   reserve, readLockEntry, releaseLockDir, heartbeat, isLeaseExpired,
@@ -226,14 +227,18 @@ export const MAX_FIX_DISPATCH_CLAIM_REFRESH_MS = 4 * 60 * 60 * 1000;
  *  - A session judged hung, or older than the ceiling, deliberately LOSES its claim to the plain TTL — so a
  *    genuinely slow-but-alive run past those bounds can be re-dispatched. That matches the reaper's own view.
  *  - SYNC ONLY: `listAgentsAll` must return an array; a Promise throws, rather than reading as "no agents".
+ * Await records (we:scripts/conveyor/await-verify.mjs) keep deliberately ended turns live for their own
+ * PR. They bypass terminal release but retain the owner re-read and four-hour refresh ceiling; successful
+ * await heartbeats are also reported under `awaiting` (omitted when empty).
  * @param {{lockRoot?:string, listAgentsAll?:Function, hungInfoFor?:Function, hungThresholdMs?:number,
- *   nowMs?:number, nowIso?:()=>string}} [o]
+ *   awaitingVerifyFor?:Function|null, nowMs?:number, nowIso?:()=>string}} [o]
  * @returns {{checked:number, refreshed:Array<{repo:string, pr:number, kind:string, headSha:string|null, owner:string}>}}
  */
 export function refreshLiveFixDispatchClaims({
   lockRoot = fixDispatchClaimRoot(),
   listAgentsAll = () => defaultListAgents({ all: true }),
   hungInfoFor = readHungInfo,
+  awaitingVerifyFor = makeAwaitingVerifyResolver(),
   hungThresholdMs = resolveHungThresholdMs(),
   nowIso = () => new Date().toISOString(),
   nowMs = Date.parse(nowIso()),
@@ -246,6 +251,7 @@ export function refreshLiveFixDispatchClaims({
   }
   const refreshed = [];
   const released = [];
+  const awaiting = [];
   for (const entry of claims) {
     const { repo, pr, kind, headSha = null, claimedAt = null } = entry.meta;
     const claimedMs = Date.parse(claimedAt ?? '');
@@ -263,7 +269,10 @@ export function refreshLiveFixDispatchClaims({
         try { info = hungInfoFor(a, nowMs, hungThresholdMs); } catch { info = null; }
         return info?.hung === true ? { ...a, hung: true } : a;
       });
-    if (!isClaimSessionLive({ repo, pr, kind, agentsAll, name })) {
+    const isAwaiting = typeof awaitingVerifyFor === 'function' && agentsAll.some((row) => {
+      try { return awaitingVerifyFor(row, { pr })?.awaiting === true; } catch { return false; }
+    });
+    if (!isAwaiting && !isClaimSessionLive({ repo, pr, kind, agentsAll, name })) {
       // A terminal row must belong to THIS dispatch, not an older round with the
       // same reusable name. Missing/failed listings and the spawn-listing lag
       // never release a claim. A live sibling above always wins over old rows.
@@ -289,9 +298,10 @@ export function refreshLiveFixDispatchClaims({
     // the ceiling applies to it from here on.
     const meta = current.meta?.claimedAt ? current.meta : { ...(current.meta ?? entry.meta), claimedAt: nowIso() };
     heartbeat(lockRoot, resource, current.owner, nowIso(), current.pid ?? null, meta);
+    if (isAwaiting) awaiting.push({ repo, pr, kind, owner: entry.owner });
     refreshed.push({
       repo, pr, kind, headSha, owner: entry.owner,
     });
   }
-  return { checked: claims.length, refreshed, ...(released.length ? { released } : {}) };
+  return { checked: claims.length, refreshed, ...(released.length ? { released } : {}), ...(awaiting.length ? { awaiting } : {}) };
 }
