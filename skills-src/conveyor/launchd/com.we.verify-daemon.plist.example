@@ -37,9 +37,7 @@
 		<key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key>
 		<string>120000</string>
 		<!-- Shared defaults live in scripts/verify-settings.json in the running control clone. -->
-		<!-- Explicit override of standards=always: run locally only for standards-relevant diffs; CI always runs it. -->
-		<key>WE_VERIFY_STANDARDS</key>
-		<string>auto</string>
+		<!-- standards=auto is the file default: local check:standards runs only for standards-relevant diffs; CI always runs it. -->
 		<key>WE_GITHUB_APP_ID</key>
 		<string>&lt;app-id&gt;</string>
 		<key>WE_GITHUB_APP_INSTALLATION_ID</key>
