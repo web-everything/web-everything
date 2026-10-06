@@ -59,6 +59,8 @@ import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promo
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
 import { runReconcilePass, defaultReadPrs } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
+import { createDispatchThrottle } from '../../scripts/lib/dispatch-throttle.mjs'; // fix-cap + host-load
+import { listFixDispatchClaims } from '../../scripts/conveyor/fix-claim-store.mjs';
 import { refreshLiveFixDispatchClaims } from '../../scripts/conveyor/fix-dispatch-claim.mjs'; // dup-heal-dispatch
 import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconcile-note-comment.mjs'; // #4191
 import { applyReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs'; // #3383 follow-up — tag at dispatch, see runTickAllRepos
@@ -623,10 +625,12 @@ export async function runTickAllRepos({
   // Only read when a real tick runs (an injected test tick never needs it) AND dispatch is not paused (card
   // x5kagse — no reason to read live queue capacity for a pass that is about to dispatch nothing at all).
   const queueAdmission = (authGate.paused || (fixTick && ciHealTick)) ? null : createQueueBudget(resolveLiveQueueBaseline({ checkoutRoot: DAEMON_REPO_ROOT }));
+  // ONE throttle per pass shared by fix + ci-heal: live fix/ci-heal cap and host-load gate (defer-only).
+  const dispatchThrottle = queueAdmission ? createDispatchThrottle({ listClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }) }) : null;
   const fix = authGate.paused ? pausedDispatchResult()
-    : runReconcileFixDispatchAllRepos({ repos, ...(fixTick ? { tick: fixTick } : { queueAdmission }) });
+    : runReconcileFixDispatchAllRepos({ repos, ...(fixTick ? { tick: fixTick } : { queueAdmission, dispatchThrottle }) });
   const ciHeal = authGate.paused ? pausedDispatchResult()
-    : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { queueAdmission }) });
+    : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { queueAdmission, dispatchThrottle }) });
   const hungCi = runHungCiRecoveryAllRepos({ repos, ...(hungCiTick ? { tick: hungCiTick } : {}) });
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
   // {@link runMainRedRebaseAllRepos}'s own docblock for why this daemon, specifically, is where it lives (same

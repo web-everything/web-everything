@@ -1,0 +1,5 @@
+{
+  "heavyAdmissionCap": 2,
+  "fixDispatchMaxConcurrent": 2,
+  "maxLoadPerCore": 2.0
+}
