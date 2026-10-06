@@ -140,6 +140,7 @@ describe('#2997 Gap 1 — laneGuardDecision refuses a write into a lane a DIFFER
 
   it('the deny NAMES the holder and the remedy — a bare refusal is the next false-deny footgun (#2986/#2994)', () => {
     const msg = laneGuardDecision(LANE_FILE, WE_ROOT, { lease: occupiedBy('sess-OTHER'), mySessionId: 'sess-MINE' });
+    expect(msg).toContain('status --json --leased-only');
     expect(msg).toMatch(/leased by Mac:39423 \(review-1222-r2\)/); // who holds it
     expect(msg).toMatch(/lane-pool\.mjs acquire/);                  // what to do instead
     expect(msg).toMatch(/adopt --lane=N/);                          // …or claim it, if it was handed to you

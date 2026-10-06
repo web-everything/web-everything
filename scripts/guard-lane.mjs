@@ -198,7 +198,7 @@ export function laneGuardDecision(real, weRoot, { lease = null, mySessionId = nu
       `declared it is working in (${describeLease(lease)}; occupant session ${laneWorkerSession(lease)}). ` +
       `Writing here overwrites their in-flight work, and unlike a Bash \`git reset\` an Edit/Write leaves no ` +
       `reflog entry to recover from (#2997/#2367). Work in the lane YOU acquired instead:\n` +
-      `  node scripts/lane-pool.mjs status --json     # who holds what right now\n` +
+      `  node scripts/lane-pool.mjs status --json --leased-only     # who holds what right now\n` +
       `  node scripts/lane-pool.mjs acquire --purpose=<why> --adopt   # lease your own lane and edit THERE\n` +
       `If this lane really was handed to you, claim it explicitly (\`adopt --lane=N\`); if its lease is ` +
       `stale/abandoned, release it deliberately (\`release --lane=N --force\`) rather than writing over it.`

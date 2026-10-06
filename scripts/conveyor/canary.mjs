@@ -106,7 +106,7 @@ function refExistsOnOrigin(ref, { root = REPO_ROOT } = {}) {
  *  failure, so the caller keeps "could not tell" distinct from a confirmed release. */
 function laneLeasedTo(lane, session) {
   try {
-    const out = execFileSync('node', ['scripts/lane-pool.mjs', 'status', '--json'], {
+    const out = execFileSync('node', ['scripts/lane-pool.mjs', 'status', '--json', `--lane=${lane}`, '--leased-only'], {
       cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'ignore'],
     });
     const row = (JSON.parse(out).lanes || []).find((l) => l?.lane === lane);

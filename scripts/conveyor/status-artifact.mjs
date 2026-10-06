@@ -233,7 +233,7 @@ const rowsFor = (bk) => remainingItems.filter((i) => i.bucket === bk).sort((a, b
 const stamp = `${today} · live @ ${new Date().toISOString().slice(11, 16)}Z`;
 
 // ---- lane pool ----
-const poolLanes = (() => { const a = j('node scripts/lane-pool.mjs status --json'); return Array.isArray(a) ? a : (a && a.lanes) || []; })();
+const poolLanes = (() => { const a = j('node scripts/lane-pool.mjs status --json --max-age-ms=60000'); return Array.isArray(a) ? a : (a && a.lanes) || []; })();
 const busyCount = poolLanes.filter((l) => l.leased).length;
 let ghostLaneCount = 0;
 const laneChips = [...poolLanes].sort((a, b) => (a.lane || 0) - (b.lane || 0)).map((l) => {
