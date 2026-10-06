@@ -21,8 +21,8 @@
  * `--actor`, and the optional-`--repo` fallback. The refusal STILL lives in the pure core, so the CLI cannot
  * route around it. Scripted per [we:docs/agent/platform-decisions.md#deterministic-core-thin-judgment] (#2607).
  */
+import { readGit } from '../lib/proc-read.mjs';
 import { resolve } from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { decideSetLabel, runReviewLabelCli, presentRemoveLabels } from '../review-set-label.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -99,7 +99,7 @@ export function decideRearm({ currentLabels = [] } = {}) {
  */
 export function resolveLocalRefSha(ref) {
   try {
-    const out = execFileSync('git', ['rev-parse', `origin/${ref}`], {
+    const out = readGit(['rev-parse', `origin/${ref}`], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
     });
     const sha = String(out || '').trim();

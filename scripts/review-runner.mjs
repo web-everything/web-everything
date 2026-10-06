@@ -51,6 +51,7 @@
  * Exit codes: 0 = a pass ran (or a live runner already held the lease — a benign no-op); 2 = usage error
  * (`--enforce`, or a discovery/gh failure that left nothing to do). A per-PR error never aborts the batch.
  */
+import { readGh } from './lib/proc-read.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolve, join } from 'node:path';
 import { homedir, hostname } from 'node:os';
@@ -282,7 +283,7 @@ function main(argv) {
     // Resolve short constellation names via gh rather than inventing an owner. This too is best-effort.
     try {
       const candidate = repoSlug.includes('/') ? repoSlug : CONSTELLATION_REPOS[repoKey].slug;
-      const ledgerRepo = candidate.includes('/') ? candidate : JSON.parse(execFileSync('gh', [
+      const ledgerRepo = candidate.includes('/') ? candidate : JSON.parse(readGh([
         'repo', 'view', candidate, '--json', 'nameWithOwner',
       ], { encoding: 'utf8' })).nameWithOwner;
       appendShadowRecords(records, ledgerRepo);

@@ -30,7 +30,8 @@
  *   node scripts/apply-review-request.mjs <request.json> --repoRoot=<dir> # apply it, from that checkout
  *   node scripts/apply-review-request.mjs <request.json> --check          # validate only, run nothing
  */
-import { execFileSync, spawnSync } from 'node:child_process';
+import { readGit } from './lib/proc-read.mjs';
+import { spawnSync } from 'node:child_process';
 import { readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -204,7 +205,7 @@ export function buildEnv(request, base = process.env) {
  */
 export function defaultOriginRepo(cwd) {
   try {
-    const url = String(execFileSync('git', ['remote', 'get-url', 'origin'], {
+    const url = String(readGit(['remote', 'get-url', 'origin'], {
       encoding: 'utf8', cwd, stdio: ['ignore', 'pipe', 'ignore'],
     })).trim();
     const m = url.match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?$/);

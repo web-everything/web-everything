@@ -79,6 +79,7 @@
 // used to *claim* was closed while a local `.find(...)` quietly held the opposite rule. `merge-ai-prs.mjs` has
 // no module-scope side effects (its CLI is behind an `IS_CLI` guard) and does not import this file, so there is
 // no cycle and no daemon-startup cost: importing it measures the same ~50ms as importing this file alone.
+import { readGh } from '../lib/proc-read.mjs';
 import { latestRequiredCheck } from '../merge-ai-prs.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 
@@ -403,7 +404,7 @@ async function main(argv) {
     const args = ['pr', 'view', String(prNumber), '--json', 'state,mergedAt,labels,statusCheckRollup,reviewDecision'];
     if (typeof flags.repo === 'string') args.push('--repo', flags.repo);
     // #x5n4zn3 — was bare (no timeout).
-    const out = execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+    const out = readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
     return JSON.parse(out);
   };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

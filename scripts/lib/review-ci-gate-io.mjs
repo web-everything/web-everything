@@ -1,11 +1,11 @@
 /** Fresh repo-explicit review eligibility, with injectable read-only GitHub IO. */
-import { execFileSync } from 'node:child_process';
+import { readGh } from './proc-read.mjs';
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
 
 const MAX_STALE_CACHE_AGE_MS = 24 * 60 * 60_000;
 
-const gh = argv => execFileSync('gh', argv, { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] });
+const gh = argv => readGh(argv, { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] });
 export const readReviewHead = ({ repo, pr, run = gh }) => JSON.parse(run(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid'])).headRefOid;
 /**
  * Every check run PLUS every legacy commit status (`{context, state}`) for the SHA: a required context may be

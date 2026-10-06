@@ -528,7 +528,7 @@ export function withInfraLock(path, fn, { staleMs = 15_000, timeoutMs = 5_000, r
 export function originSlugOf(cwd = INFRA_ROOT) {
   try {
     // #x5n4zn3 — was bare (no timeout); a local config read, short budget.
-    const url = execFileSync('git', ['remote', 'get-url', 'origin'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15_000, killSignal: 'SIGKILL' }).trim();
+    const url = execFileSync('git', ['remote', 'get-url', 'origin'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15_000, killSignal: 'SIGKILL', maxBuffer: 256 * 1024 * 1024 }).trim();
     const m = url.match(/[:/]([^/]+\/[^/]+?)(?:\.git)?$/);
     return m ? canonicalizeSlug(m[1]) : null;
   } catch {
@@ -650,7 +650,7 @@ function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
   }
   // PR #2899 review — pin the resume to the RECORDED (verified) sha, and refuse if the ref moved since.
   let tipSha = null;
-  try { tipSha = execFileSync('git', ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${ref}^{commit}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000 }).trim() || null; }
+  try { tipSha = execFileSync('git', ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${ref}^{commit}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000, maxBuffer: 256 * 1024 * 1024 }).trim() || null; }
   catch { tipSha = null; }
   const pin = resumeShaDecision({ recordedSha: entry.sha, tipSha, ref });
   if (!pin.ok) return { ok: false, refused: true, reason: pin.reason, detail: pin.detail };
