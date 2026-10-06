@@ -1112,7 +1112,7 @@ process.exit(${standardsExit});
     expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'green', retriedTimeouts: f.files, isolatedRetry: 'flaky-outside-diff' });
     const calls = f.calls();
     expect(calls).toHaveLength(3);
-    expect(calls[1].args).toEqual(['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', ...f.files.map(f => `./${f}`)]);
+    expect(calls[1].args).toEqual(['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', '--testTimeout=15000', '--hookTimeout=30000', ...f.files.map(f => `./${f}`)]);
     expect(calls[2].args.slice(0, 2)).toEqual(['run', 'check:standards']);
     for (const call of calls) {
       expect(call.held).toHaveLength(1);
@@ -1255,7 +1255,8 @@ process.exit(${standardsExit});
     expect(result.json).toMatchObject(expected);
     expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject(expected);
     expect(result.json.detail).toContain('flaky-outside-diff');
-    expect(f.calls()[1].args).toEqual(['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', ...f.files.map(file => `./${file}`)]);
+    // The retry carries the gate's scaled timeouts (factor 3 default), else it falls back to vitest's 5 s and flakes again.
+    expect(f.calls()[1].args).toEqual(['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', '--testTimeout=15000', '--hookTimeout=30000', ...f.files.map(file => `./${file}`)]);
     const read = f.invoke(['check']);
     expect(read.json).toMatchObject({ isolatedRetry: 'flaky-outside-diff' });
   });
