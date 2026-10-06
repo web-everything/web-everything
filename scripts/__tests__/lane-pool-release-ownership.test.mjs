@@ -18,6 +18,26 @@ import { tmpdir } from 'node:os';
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 
+import { isDeliveredLease } from '../lib/lane-lease.mjs';
+
+describe('isDeliveredLease', () => {
+  const delivered = { porcelain: '', headIsAncestorOfUpstream: true, headCommitMs: 2000, acquiredAtMs: 1000 };
+  it('accepts a clean, landed commit made after acquisition (including equality)', () => {
+    expect(isDeliveredLease(delivered)).toBe(true);
+    expect(isDeliveredLease({ ...delivered, headCommitMs: 1000 })).toBe(true);
+  });
+  it.each([
+    { porcelain: ' M file.txt' },
+    { headIsAncestorOfUpstream: false },
+    { headCommitMs: 999 },
+    { porcelain: null },
+    { headCommitMs: NaN },
+    { acquiredAtMs: NaN },
+  ])('refuses live or unproven work: %j', (change) => {
+    expect(isDeliveredLease({ ...delivered, ...change })).toBe(false);
+  });
+});
+
 function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 }
@@ -206,6 +226,38 @@ describe('lane-pool #2997 — a TARGETED release of a CONTESTED lease needs the 
     expect(right.code).toBe(0);
     expect(JSON.parse(right.out).released).toBe(1);
     expect(right.out + right.err).not.toMatch(/not yours/);
+  });
+
+  it.each(['delivered', 'dirty', 'unlanded', 'foreign', 'sweep'])('contested release with stale lane origin/main: %s', (state) => {
+    const { b } = acquireTwoSiblings();
+    const dir = join(poolRoot, 'releaseowner', `lane-${b.lane}`);
+    const marker = join(dir, '.git', '.lane-lease');
+    const oldTip = git(['rev-parse', 'HEAD'], dir);
+    git(['update-ref', 'refs/remotes/origin/main', oldTip], dir);
+    writeFileSync(join(referenceDir, 'file.txt'), 'landed work\n');
+    git(['add', 'file.txt'], referenceDir);
+    // Git records seconds, whereas acquiredAt has milliseconds; keep the ordering deterministic.
+    execFileSync('git', ['commit', '--quiet', '-m', 'delivered'], {
+      cwd: referenceDir, env: { ...process.env, GIT_COMMITTER_DATE: new Date(Date.now() + 2000).toISOString() },
+    });
+    const head = git(['rev-parse', 'HEAD'], referenceDir);
+    git(['update-ref', 'refs/remotes/origin/main', state === 'unlanded' ? oldTip : head], referenceDir);
+    // The lane reads the new object through its existing alternates, while its own main ref stays stale.
+    git(['reset', '--hard', head], dir);
+    if (state === 'dirty') writeFileSync(join(dir, 'file.txt'), 'unfinished work\n');
+    const release = runPool([
+      'release', state === 'sweep' ? '--all' : `--lane=${b.lane}`, ...poolArgs(), '--session=finishing-agent', '--json',
+    ], state === 'foreign' ? 'sess-foreign' : 'sess-uuid-shared');
+    expect(release.code).toBe(0);
+    expect(JSON.parse(release.out).released).toBe(state === 'delivered' ? 1 : 0);
+    if (state === 'delivered') {
+      expect(release.err).toContain(`lane-${b.lane}: contested lease released — its work is fully landed`);
+      expect(() => readFileSync(marker)).toThrow();
+    } else {
+      expect(release.err).toContain('not yours');
+      expect(JSON.parse(readFileSync(marker, 'utf8')).holder).toBe(b.holder);
+      if (state === 'dirty') expect(readFileSync(join(dir, 'file.txt'), 'utf8')).toBe('unfinished work\n');
+    }
   });
 
   it('the OPERATOR escape is intact — --force still breaks a contested lease (stale-lane cleanup keeps working)', () => {

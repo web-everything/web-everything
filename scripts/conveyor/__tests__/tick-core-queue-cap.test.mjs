@@ -5,7 +5,8 @@
  *   --json` prints), never a real read.
  */
 import { describe, it, expect } from 'vitest';
-import { planTick, freshSpawnDemandMinutes } from '../tick-core.mjs';
+import { createQueueBudget } from '../../readiness/heavy-queue-projection.mjs';
+import { planTick, freshSpawnDemandMinutes, applyQueueCapToPrepareSpawns } from '../tick-core.mjs';
 
 /** A busy queue: 2 slots, 50 slot-minutes already on the way (e.g. 2 full suites + a waiter + pending). */
 const busy = (backlogMinutes = 50) => ({
@@ -139,5 +140,82 @@ describe('freshSpawnDemandMinutes — this conveyor\'s own spawns the baseline c
     });
     expect(out.decisions.spawnFixes).toEqual([]);
     expect(out.decisions.notes.some((n) => n.kind === 'queue-cap' && n.pr === 99)).toBe(true);
+  });
+});
+
+
+describe('prepare queue-cap — shared with builds, fixes and CI heals', () => {
+  const input = {
+    state: { queue: [], lanes: [], prs: [] },
+    plan: { launch: [], held: [{ num: 77, reason: 'needs-prepare' }] },
+    freeLanes: [4], bookkeeping: { tick: 0 },
+  };
+  it('holds a needs-prepare item near the maximum without consuming its guard or lane', () => {
+    const out = planTick({ ...input, queueAdmission: busy(58) });
+    expect(out.decisions.spawnPrepareItems).toEqual([]);
+    expect(out.nextState.prepareGuards).toEqual([]);
+    expect(out.nextState.launchedNums).not.toContain('77');
+    expect(out.decisions.queueCapHeld.prepare).toEqual([{ num: 77, lane: 4, kind: 'prepare-item', projectedMinutes: 30.63, demandMinutes: 3.25 }]);
+    expect(out.decisions.notes).toContainEqual(expect.objectContaining({ kind: 'queue-cap', num: 77, prepareKind: 'prepare-item', text: expect.stringContaining('prepare (prepare-item) #77') }));
+  });
+  it('a held prepare returns its only lane to a smaller fix', () => {
+    const out = planTick({
+      ...input, state: { ...input.state, prs: [changesPr(99, 40)] }, bookkeeping: { tick: 0, launchedNums: [40] },
+      queueAdmission: { ...busy(54), dispatchMinutes: { prepare: 7.1 } },
+    });
+    expect(out.decisions.spawnPrepareItems).toEqual([]);
+    expect(out.decisions.spawnFixes).toEqual([{ pr: 99, num: 40, lane: 4 }]);
+    expect(out.nextState.prepareGuards).toEqual([]);
+  });
+  it('spawns as before with a roomy budget or explicit exemption', () => {
+    for (const queueAdmission of [busy(0), { ...busy(100), prepareAdmission: 'exempt' }]) {
+      const out = planTick({ ...input, queueAdmission });
+      expect(out.decisions.spawnPrepareItems).toEqual([{ num: 77, lane: 4 }]);
+      expect(out.nextState.prepareGuards).toEqual([expect.objectContaining({ num: 77, lane: 4, kind: 'prepare-item' })]);
+      expect(out.decisions.queueCapHeld.prepare).toEqual([]);
+    }
+  });
+  it('a prepare sees the build demand already admitted in the same tick', () => {
+    const out = planTick({ ...input,
+      state: { ...input.state, queue: [{ num: 10, buildQueued: true }] },
+      plan: { ...input.plan, launch: [{ num: 10, lane: 5 }] }, freeLanes: [4, 5],
+      queueAdmission: busy(54), itemSizes: { 10: 1 },
+    });
+    expect(out.decisions.spawnBuilds).toEqual([{ num: 10, lane: 5 }]);
+    expect(out.decisions.spawnPrepareItems).toEqual([]);
+    expect(out.decisions.queueCapHeld.prepare).toHaveLength(1);
+  });
+  it('filters every prepare list, dropping a held spawn\'s guard by num (a scope spawn\'s guard kind is `prepare`), without mutating the input', () => {
+    const prep = {
+      scopeSpawns: [{ num: 1, lane: 4 }], decisionSpawns: [{ num: 2, lane: 5 }],
+      investigationSpawns: [{ num: 3, lane: 6 }], itemPrepareSpawns: [{ num: 4, lane: 7 }],
+      newGuards: [
+        { num: 1, kind: 'prepare' }, { num: 2, kind: 'prepare-decision' },
+        { num: 3, kind: 'investigate' }, { num: 4, kind: 'prepare-item' },
+      ], consumedLanes: [4, 5, 6, 7], notes: [],
+    };
+    for (const budget of [null, createQueueBudget(null)]) expect(applyQueueCapToPrepareSpawns(prep, budget)).toEqual({ prep, held: [] });
+    const out = applyQueueCapToPrepareSpawns(prep, createQueueBudget(busy(54)));
+    expect(out.prep.scopeSpawns).toEqual([{ num: 1, lane: 4 }]);
+    expect(out.prep.decisionSpawns).toEqual([]);
+    expect(out.prep.investigationSpawns).toEqual([]);
+    expect(out.prep.itemPrepareSpawns).toEqual([]);
+    expect(out.held.map((h) => h.kind)).toEqual(['prepare-decision', 'investigate', 'prepare-item']);
+    expect(out.prep.newGuards).toEqual([{ num: 1, kind: 'prepare' }]);
+    expect(out.prep.consumedLanes).toEqual([4]);
+    expect(prep.consumedLanes).toEqual([4, 5, 6, 7]);
+    expect(prep.newGuards).toHaveLength(4);
+  });
+  it('charges fresh prepare guards by measured demand, excluding leased and expired guards', () => {
+    const now = Date.parse('2026-10-06T12:00:00Z');
+    const guards = { prepare: [
+      { num: 1, lane: 4, kind: 'prepare-item', spawnedAt: now - 60_000 },
+      { num: 2, lane: 5, spawnedAt: now - 60_000 },
+      { num: 3, lane: 6, kind: 'investigate', spawnedAt: now - 60_000 },
+      { num: 4, lane: 7, kind: 'prepare-scope', spawnedAt: now - 11 * 60_000 },
+    ] };
+    const options = { now, lanes: [{ lane: 6 }], queueAdmission: { ...busy(), dispatchMinutes: { prepare: 7.1 } } };
+    expect(freshSpawnDemandMinutes(guards, options)).toBe(14.2);
+    expect(freshSpawnDemandMinutes(guards, { ...options, queueAdmission: { ...options.queueAdmission, prepareAdmission: 'exempt' } })).toBe(0);
   });
 });

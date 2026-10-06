@@ -24,8 +24,7 @@ import {
   // we:xniq7xs — the open-PR backpressure limit's intake hold.
   PR_LIMIT_HINT, readPrLimitHeld,
   // #4347 — the capacity-cap operator gloss, naming the real active count and room.
-  capacityCapHint,
-} from '../dispatch-plan.mjs';
+  capacityCapHint, prepareStaleness } from '../dispatch-plan.mjs';
 import { PAUSABLE_KINDS } from '../dispatch-pause.mjs';
 import { normNum, bornAsIndexFromItems, resolveBornAsRefs } from '../../conveyor/queue-store.mjs';
 
@@ -1394,5 +1393,36 @@ describe('queueFileRows (--queue-file)', () => {
   it('refuses anything that is not a JSON array', () => {
     expect(() => queueFileRows('{"a":1}', norm)).toThrow(/JSON array/);
     expect(() => queueFileRows('nope', norm)).toThrow();
+  });
+});
+
+describe('card 80 (b) — prepare-stale: an old or drifted stamp is re-prepared before build', () => {
+  const policy = { requirePreparedDate: true, maxAgeDays: 3, today: '2026-10-06' };
+  const item = (extra) => ({ num: 1, kind: 'story', scope: ['we:scripts/a.mjs'], size: 2, preparedDate: '2026-10-05', ...extra });
+
+  it('a stamp within the max age and with no drift launches', () => {
+    const plan = dispatchPlan({ queue: [item()], leases: [], freeLanes: [7], preparePolicy: policy });
+    expect(plan.launch).toEqual([{ num: 1, lane: 7 }]);
+  });
+
+  it('a stamp older than maxAgeDays holds prepare-stale with the age', () => {
+    const plan = dispatchPlan({ queue: [item({ preparedDate: '2026-10-01' })], leases: [], freeLanes: [7], preparePolicy: policy });
+    expect(plan.launch).toEqual([]);
+    expect(plan.held).toEqual([{ num: 1, reason: 'prepare-stale', detail: 'prepared 2026-10-01, 5d ago (max 3d)' }]);
+  });
+
+  it('scope drift since preparedAgainstSha holds prepare-stale naming the files', () => {
+    const plan = dispatchPlan({ queue: [item({ preparedAgainstSha: 'abcdef1234', prepDrift: { stale: true, changedFiles: ['scripts/a.mjs'] } })], leases: [], freeLanes: [7], preparePolicy: policy });
+    expect(plan.held).toEqual([{ num: 1, reason: 'prepare-stale', detail: 'scope changed since abcdef12: scripts/a.mjs' }]);
+  });
+
+  it('is off without maxAgeDays (every existing caller unchanged)', () => {
+    const plan = dispatchPlan({ queue: [item({ preparedDate: '2020-01-01' })], leases: [], freeLanes: [7], preparePolicy: { requirePreparedDate: true } });
+    expect(plan.launch).toEqual([{ num: 1, lane: 7 }]);
+  });
+
+  it('prepareStaleness fails open on an unknown age or unchecked drift', () => {
+    expect(prepareStaleness({ preparedDate: 'bad' }, policy)).toBeNull();
+    expect(prepareStaleness({ preparedDate: '2026-10-05' }, { maxAgeDays: 3 })).toBeNull();
   });
 });

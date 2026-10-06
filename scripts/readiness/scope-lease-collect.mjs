@@ -86,6 +86,16 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 
 // ── PURE CORE (no fs / git / Date / child_process — every dependency is injected) ────────────────────────────
 
+/** Prefer a tip only when it contains every candidate; divergent or unreadable history keeps the first. */
+export function pickFreshestTip(candidates, isAncestor) {
+  const tips = [...new Set(candidates.filter(Boolean))];
+  try {
+    return tips.find((tip) => tips.every((other) => other === tip || isAncestor(other, tip))) ?? tips[0] ?? null;
+  } catch {
+    return tips[0] ?? null;
+  }
+}
+
 /**
  * Repo-qualify a list of repo-relative file paths → "<repoKey>:<path>". Skips empty/falsy entries. When
  * `repoKey` is null/empty the path passes through UNQUALIFIED (the observer's path convention tolerates an
@@ -504,6 +514,25 @@ function main(argv) {
 
   const poolStatus = readPoolStatus(flags);
 
+  const upstreamCache = new Map();
+  const upstreamAt = (path, gitDir = false) => {
+    if (!upstreamCache.has(path)) {
+      upstreamCache.set(path, tryGit([...(gitDir ? [`--git-dir=${path}`] : []), 'rev-parse', 'origin/main'], gitDir ? process.cwd() : path));
+    }
+    return upstreamCache.get(path);
+  };
+  const cwdTip = upstreamAt(process.cwd());
+  const upstreamForLane = (path) => {
+    const candidates = [upstreamAt(path), cwdTip];
+    try {
+      const objects = readFileSync(join(path, '.git/objects/info/alternates'), 'utf8').split('\n')[0].trim();
+      if (objects) candidates.push(upstreamAt(dirname(objects), true));
+    } catch { /* No readable alternates owner. */ }
+    const available = [...new Set(candidates.filter(Boolean))]
+      .filter((sha) => tryGit(['cat-file', '-e', `${sha}^{commit}`], path) !== null);
+    return pickFreshestTip(available, (a, b) => tryGit(['merge-base', '--is-ancestor', a, b], path) !== null) || 'origin/main';
+  };
+
   // Injected real collector fns (own all git IO; every git call is guarded — a lane whose git fails
   // contributes [] observed and is logged, never crashing the whole run).
   const repoKeyCache = new Map();
@@ -531,12 +560,16 @@ function main(argv) {
     let observed;
     try {
       const repoKey = repoKeyForLane(lane);
-      // Diff base: merge-base(origin/main, HEAD); fall back to origin/main if merge-base fails.
-      const base = tryGit(['merge-base', 'origin/main', 'HEAD'], path) || 'origin/main';
-      // #3521/lane-2 GUARD: a lane whose HEAD is BOTH ahead of AND behind its own `origin/main` never got a
+      // 2026-10-06, lane-19 / PR #4072: a stale lane ref read merged work as live → false `overlaps lane-19`.
+      // The DIFF BASE uses the freshest upstream tip the lane can see, so commits already on main drop out.
+      const upstream = upstreamForLane(path);
+      const base = tryGit(['merge-base', upstream, 'HEAD'], path) || upstream;
+      // #3521/lane-2 GUARD: a lane whose HEAD is BOTH ahead of AND behind its OWN `origin/main` never got a
       // clean reset onto current upstream — its merge-base can sit far in the past, so the committed-range diff
       // below would sweep in the entire intervening history (see {@link isDivergedHistory}'s header for the
-      // live incident this reproduces). Detect it BEFORE trusting that diff.
+      // live incident this reproduces). Detect it BEFORE trusting that diff. Measured against the lane's own
+      // ref, never the fresh tip: every live lane is "behind" a tip that moved on, and reading that as diverged
+      // would drop its real committed scope from the overlap picture.
       const aheadCount = Number.parseInt(tryGit(['rev-list', '--count', 'origin/main..HEAD'], path) ?? '', 10);
       const behindCount = Number.parseInt(tryGit(['rev-list', '--count', 'HEAD..origin/main'], path) ?? '', 10);
       const diverged = isDivergedHistory(aheadCount, behindCount);

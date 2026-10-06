@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   BUILD_DISPATCH_POLICY, parseScopeEntry, pathsOverlap, firstScopeOverlap, branchRefPolicy, plannedBuildRef,
   prDeliversNum, normalizeOpenPrs, planBuildDispatch, reportOpenItems,
+  prepareAheadNums, daysBetween, stampCoversClaim, collectBuildHolds,
 } from '../build-dispatch-policy.mjs';
 
 const cand = (num, scope) => ({ num, lane: null, scope });
@@ -164,7 +165,7 @@ describe('planBuildDispatch', () => {
       .toEqual([{ repo: 'we', number: 1, headRefName: 'lane/1-x', labels: ['l'], files: [{ repo: 'we', path: 'a' }] }]);
   });
   it('declares every operator rule with who enforces it', () => {
-    expect(BUILD_DISPATCH_POLICY.rules.map((r) => r.id)).toEqual(['cap', 'wip-cap', 'landing-freeze', 'scope-vs-open-prs', 'hot-file', 'branch-name', 'scratch-prefix', 'draft-first', 'needs-prepare']);
+    expect(BUILD_DISPATCH_POLICY.rules.map((r) => r.id)).toEqual(['cap', 'wip-cap', 'landing-freeze', 'scope-vs-open-prs', 'hot-file', 'branch-name', 'scratch-prefix', 'draft-first', 'needs-prepare', 'prepare-ahead-window', 'prepare-stale']);
     expect(BUILD_DISPATCH_POLICY.maxConcurrentBuilds).toBe(1);
     expect(BUILD_DISPATCH_POLICY.maxConcurrentExternalBuilds).toBe(4);
     expect(BUILD_DISPATCH_POLICY.maxOpenItems).toBe(7);
@@ -399,5 +400,72 @@ describe('executor concurrency caps (#4531)', () => {
     expect(r.dispatch.map(c => c.num)).toEqual(['2']);
     const full = planBuildDispatch({ candidates: [candidate('2', 'codex')], inFlight: running.slice(0, 4), policy: { ...BUILD_DISPATCH_POLICY, maxOpenItems: 4 } });
     expect(full.hold[0].rule).toBe('wip-cap');
+  });
+});
+
+describe('card 80 — prepare just in time', () => {
+  it('declares the two settings with safe defaults', () => {
+    expect(BUILD_DISPATCH_POLICY.prepareAheadWindow).toBe(4);
+    expect(BUILD_DISPATCH_POLICY.preparedMaxAgeDays).toBe(3);
+  });
+
+  it('prepareAheadNums keeps only the next N build-bound cards, pinned first', () => {
+    const queue = [{ num: '1' }, { num: '2' }, { num: '3' }, { num: '4' }, { num: '5' }, { num: '6' }, { num: '7', tier: 'pinned' }];
+    const launch = [{ num: '1' }];
+    const held = [
+      { num: '2', reason: 'blocked' }, // not build-bound — never counts
+      { num: '3', reason: 'overlaps lane-19' },
+      { num: '4', reason: 'needs-prepare' },
+      { num: '5', reason: 'needs-prepare' },
+      { num: '6', reason: 'needs-prepare' },
+      { num: '7', reason: 'needs-prepare' },
+    ];
+    expect([...prepareAheadNums({ queue, launch, held, window: 4 })]).toEqual(['7', '1', '3', '4']);
+    expect(prepareAheadNums({ queue, launch, held, window: 4 }).has('6')).toBe(false);
+  });
+
+  it('prepareAheadNums is off (null) for a non-finite or negative window', () => {
+    expect(prepareAheadNums({ queue: [{ num: '1' }], window: Infinity })).toBeNull();
+    expect(prepareAheadNums({ queue: [{ num: '1' }], window: -1 })).toBeNull();
+  });
+
+  it('daysBetween counts whole days and rejects malformed dates', () => {
+    expect(daysBetween('2026-10-01', '2026-10-06')).toBe(5);
+    expect(daysBetween('2026-10-06', '2026-10-05')).toBe(-1);
+    expect(daysBetween('nope', '2026-10-05')).toBeNull();
+  });
+
+  it('stampCoversClaim: an older stamp is the one a re-prepare replaces; a same/next-day stamp is its result', () => {
+    expect(stampCoversClaim('2026-10-01', '2026-10-06T15:00:00Z')).toBe(false);
+    expect(stampCoversClaim('2026-10-06', '2026-10-06T15:00:00Z')).toBe(true);
+    // prepare-stamp writes the LOCAL date; a 21:00 ET claim is already the next UTC day.
+    expect(stampCoversClaim('2026-10-05', '2026-10-06T01:00:00Z')).toBe(true);
+    expect(stampCoversClaim('2026-10-01', undefined)).toBe(true);
+    expect(stampCoversClaim(null, '2026-10-06T15:00:00Z')).toBe(false);
+  });
+});
+
+describe('collectBuildHolds — every held card names its stage and reason', () => {
+  it('reports queue-cap with the projection, policy, cooldown, prepare and plan holds, in queue order', () => {
+    const rows = collectBuildHolds({
+      queue: [{ num: '5187' }, { num: '10' }, { num: '11' }, { num: '12' }, { num: '13' }, { num: '14' }],
+      suppressed: [{ num: '5187', by: 'queue-cap', projectedMinutes: 34.5, demandMinutes: 6.5 }],
+      policyHold: [{ num: '10', rule: 'hot-file', reason: 'same file as #9' }],
+      cooldown: ['11'],
+      prepareBusy: ['12'],
+      planHeld: [{ num: '13', reason: 'overlaps lane-19' }, { num: '14', reason: 'prepare-stale', detail: 'prepared 2026-10-01, 5d ago (max 3d)' }],
+    });
+    expect(rows).toEqual([
+      { num: '5187', stage: 'tick-core', reason: 'queue-cap', detail: 'projected heavy-test wait 34.5m (this build +6.5m)' },
+      { num: '10', stage: 'daemon', reason: 'hot-file', detail: 'same file as #9' },
+      { num: '11', stage: 'cooldown', reason: 'recent non-PR outcome (hold)' },
+      { num: '12', stage: 'prepare', reason: 'prepare in flight' },
+      { num: '13', stage: 'plan', reason: 'overlaps lane-19' },
+      { num: '14', stage: 'plan', reason: 'prepare-stale', detail: 'prepared 2026-10-01, 5d ago (max 3d)' },
+    ]);
+  });
+
+  it('never lists a card that was dispatched this tick', () => {
+    expect(collectBuildHolds({ policyHold: [{ num: '1', rule: 'cap', reason: 'x' }], dispatched: [{ num: '1' }] })).toEqual([]);
   });
 });

@@ -2295,3 +2295,31 @@ it('refunds the durable and in-session heal floor without refunding again on the
   expect(planCiHealSpawns({ ...args, ciHealAttempts: { 99: 6 } }).notes[0])
     .toMatchObject({ kind: 'ci-heal-exhausted', attempts: 3, refunded: 3 });
 });
+
+describe('card 80 — prepare just in time', () => {
+  const held = (num, reason) => ({ num, reason });
+  const tick = (config, extraHeld = []) => planTick({
+    state: { queue: [{ num: '1' }, { num: '2' }, { num: '3' }, { num: '4' }, { num: '5', tier: 'pinned' }], lanes: [], prs: [] },
+    plan: { launch: [], held: [held('1', 'overlaps lane-19'), held('2', 'needs-prepare'), held('3', 'needs-prepare'), held('4', 'prepare-stale'), held('5', 'needs-prepare'), ...extraHeld] },
+    freeLanes: [7, 8, 9, 10], bookkeeping: { tick: 1 },
+    config: { maxConcurrentLanes: 10, maxConcurrentItemPrepares: 5, ...config },
+  });
+
+  it('only prepares cards within the next N to build, pinned first; the rest wait with a note', () => {
+    const r = tick({ prepareAheadWindow: 3 });
+    // build order: pinned #5, then #1 (overlap, already prepared), #2 → window {5, 1, 2}
+    expect(r.decisions.spawnPrepareItems.map((s) => s.num)).toEqual(['2', '5']);
+    const waits = r.decisions.notes.filter((n) => n.kind === 'prepare-ahead-window').map((n) => n.num);
+    expect(waits).toEqual(['3', '4']);
+  });
+
+  it('a prepare-stale card is a re-prepare candidate like needs-prepare', () => {
+    const r = tick({});
+    expect(r.decisions.spawnPrepareItems.map((s) => s.num)).toEqual(['2', '3', '4', '5']);
+  });
+
+  it('without the window every candidate is offered (other callers unchanged)', () => {
+    const r = tick({});
+    expect(r.decisions.notes.some((n) => n.kind === 'prepare-ahead-window')).toBe(false);
+  });
+});

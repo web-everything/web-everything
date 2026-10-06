@@ -157,6 +157,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // `build` gate, so the two cores can never disagree about what a given marker holds. No fs comes in with it.
 import { resolvePausedKinds, isScopedPause } from '../readiness/dispatch-pause.mjs';
 import { createQueueBudget, dispatchDemandMinutes, DEFAULT_ARRIVAL_WINDOW_MINUTES } from '../readiness/heavy-queue-projection.mjs'; // card xkyw1x4 — the pure queue-time admission (the IO half lives in heavy-admission.mjs)
+import { prepareAheadNums } from './build-dispatch-policy.mjs'; // card 80 — prepare just in time (pure)
 
 /** Held reasons (from {@link ../readiness/dispatch-plan.mjs HELD_REASONS}) that already have their OWN dedicated
  *  note elsewhere in {@link planTick} — `needs-slice` from `state.needsSlice`, `needs-decision` from
@@ -1179,7 +1180,7 @@ export function buildStatusLine({ queue = [], lanes = [], prs = [], health = {},
  *                                      // `held:false` (the default) changes nothing observable.
  *   queueAdmission?: object|null,       // card xkyw1x4 — the heavy-test QUEUE BASELINE (`heavy-admission.mjs
  *                                      // queue-status --json`: backlog slot-minutes, slots, max wait, standard
- *                                      // times). Each new build / fix / ci-heal spawn is costed at its expected
+ *                                      // times). Each new build / prepare / fix / ci-heal spawn is costed at its expected
  *                                      // heavy-slot demand and ADMITTED only while the projected wait stays ≤ the
  *                                      // max (30 min default); the rest are held as `queue-cap`, beside `load-cap`.
  *                                      // Several spawns in one tick each see the ones admitted before them. Omitted
@@ -1256,9 +1257,24 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // read straight off THIS TICK's dispatch plan, same pattern as `needs-investigation` above (#3567): a
   // needs-prepare item has no separate `state` derivation step either. Guard RETENTION for this kind uses
   // `heldGuardPending` (the wide set just above), never this narrow one — see that set's own comment for why.
-  const needsPrepareHeld = (Array.isArray(plan.held) ? plan.held : [])
-    .filter((h) => h && h.reason === 'needs-prepare' && h.num != null)
+  // Card 80 — a `prepare-stale` card (old stamp, or scope drift since `preparedAgainstSha`) is re-prepared the
+  // same way. And with `config.prepareAheadWindow` set (the build daemon passes 4), only the cards within the next
+  // N to build (pinned first) are prepared now; the rest wait, noted `prepare-ahead-window`.
+  const prepareWindow = prepareAheadNums({
+    queue, launch: plan.launch, held: plan.held,
+    window: Number.isFinite(config.prepareAheadWindow) ? config.prepareAheadWindow : Infinity,
+  });
+  const prepareCandidates = (Array.isArray(plan.held) ? plan.held : [])
+    .filter((h) => h && (h.reason === 'needs-prepare' || h.reason === 'prepare-stale') && h.num != null);
+  const needsPrepareHeld = prepareCandidates
+    .filter((h) => !prepareWindow || prepareWindow.has(normNum(h.num)))
     .map((h) => ({ num: h.num }));
+  const prepareWindowNotes = prepareWindow
+    ? prepareCandidates.filter((h) => !prepareWindow.has(normNum(h.num))).map((h) => ({
+      kind: 'prepare-ahead-window', num: h.num,
+      text: `⏸ #${h.num} — prepare waits: not within the next ${config.prepareAheadWindow} to build`,
+    }))
+    : [];
 
   // #3849 — the `no-size` holds, read straight off THIS TICK's dispatch plan, same pattern as
   // `needs-investigation` just above (#3567): a no-size item has no separate `state` derivation step either.
@@ -1363,9 +1379,9 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // Card xkyw1x4 — THE QUEUE-TIME GATE (`queue-cap`), applied after load-cap. One budget per tick, seeded with the
   // baseline (held + waiting + dispatched-not-yet-queued) plus this conveyor's OWN fresh spawns whose lane is not
   // leased yet (the baseline reads leases, so a session spawned moments ago would otherwise be invisible), then
-  // charged spawn by spawn — builds first, then fixes, then CI-heals — so the Nth quick dispatch is the one held.
+  // charged spawn by spawn — builds first, then prepares, fixes and CI-heals — so the Nth quick dispatch is the one held.
   const queueBudget = createQueueBudget(queueAdmission, {
-    extraMinutes: freshSpawnDemandMinutes({ build: build.live, fix: fix.live, ciHeal: ciHeal.live }, { lanes, now, queueAdmission, itemSizes }),
+    extraMinutes: freshSpawnDemandMinutes({ build: build.live, prepare: prepare.live, fix: fix.live, ciHeal: ciHeal.live }, { lanes, now, queueAdmission, itemSizes }),
   });
   const queueHeldBuilds = [];
   const queueAdmittedBuilds = [];
@@ -1464,7 +1480,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   //    KIND-SCOPED (epic #3383): the three prepare-family kinds are held INDEPENDENTLY. `pausedKinds` is handed
   //    straight to `planPrepareSpawns`, so a held kind short-circuits at its OWN `dispatch-paused` admission gate
   //    (traced, #xupukxa) and consumes no lane — an UNHELD sibling kind still gets the lanes it would have had.
-  const prep = planPrepareSpawns({
+  let prep = planPrepareSpawns({
     unshaped: scopeOrSizeNeeded,
     decisions,
     investigations,
@@ -1481,6 +1497,8 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     trace: true,
     pausedKinds,
   });
+  const prepareQueue = applyQueueCapToPrepareSpawns(prep, queueBudget);
+  prep = prepareQueue.prep;
   const consumed = new Set(prep.consumedLanes.map(String));
   availableLanes = availableLanes.filter((l) => !consumed.has(String(l)));
   const livePrepareGuards = [...prepare.live, ...prep.newGuards];
@@ -1564,6 +1582,9 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     if (s.by === 'load-cap') notes.push({ kind: 'load-cap', num: s.num, text: `⏸ #${s.num} — load-cap (${loadCapReading(loadAdmission)})` });
     if (s.by === 'queue-cap') notes.push({ kind: 'queue-cap', num: s.num, text: `⏸ #${s.num} — queue-cap (${queueCapReading(s, queueBudget)})` });
   }
+  for (const h of prepareQueue.held) {
+    notes.push({ kind: 'queue-cap', num: h.num, prepareKind: h.kind, text: `⏸ prepare (${h.kind}) #${h.num} — queue-cap (${queueCapReading(h, queueBudget)})` });
+  }
   // Card xkyw1x4 — held fix / CI-heal spawns get the same `queue-cap` note, naming the PR.
   for (const [what, q] of [['fix', fixQueue], ['CI-heal', ciHealQueue]]) {
     for (const h of q.held) notes.push({ kind: 'queue-cap', num: h.num, pr: h.pr, text: `⏸ ${what} PR #${h.pr} (#${h.num}) — queue-cap (${queueCapReading(h, queueBudget)})` });
@@ -1586,6 +1607,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   if (prep.itemPrepareSpawns.length) notes.push({ kind: 'auto-preparing-item', nums: prep.itemPrepareSpawns.map((s) => s.num), text: `⚠ ${prep.itemPrepareSpawns.length} auto-preparing item: ${prep.itemPrepareSpawns.map((s) => `#${s.num}`).join(' ')}` });
   if (prep.investigationSpawns.length) notes.push({ kind: 'auto-investigating', nums: prep.investigationSpawns.map((s) => s.num), text: `⚠ ${prep.investigationSpawns.length} auto-investigating: ${prep.investigationSpawns.map((s) => `#${s.num}`).join(' ')}` });
   notes.push(...prep.notes.map((n) => ({ kind: n.kind, num: n.num, text: n.text })));
+  notes.push(...prepareWindowNotes);
   notes.push(...fixPlan.notes.map((n) => ({ kind: n.kind, num: n.num, pr: n.pr, text: n.text })));
   notes.push(...ciHealPlan.notes.map((n) => ({ kind: n.kind, num: n.num, pr: n.pr, text: n.text })));
   for (const e of Array.isArray(needsSlice) ? needsSlice : []) notes.push({ kind: 'needs-slice', num: e.num, epicState: e.epicState, text: `⚠ epic #${e.num} needs slicing (/slice ${e.num})` });
@@ -1697,6 +1719,10 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     spawnInvestigations: prep.investigationSpawns,
     spawnFixes: fixPlan.spawns,
     spawnCiHeals: ciHealPlan.spawns,
+    queueCapHeld: {
+      prepare: prepareQueue.held,
+      build: queueHeldBuilds.map((l) => ({ num: l.num, lane: l.lane, projectedMinutes: l.projectedMinutes, demandMinutes: l.demandMinutes })),
+    },
     // Card xkyw1x4 — the queue-time gate's verdict for this tick (null when no baseline was supplied).
     queueAdmission: queueBudget.active ? {
       maxWaitMinutes: queueBudget.maxWaitMinutes,
@@ -1751,7 +1777,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
 
 /**
  * Expected heavy-slot demand of THIS conveyor's own recent spawns that the queue baseline cannot see yet: a live
- * build / fix / CI-heal guard spawned within the arrival window whose lane is not leased (not in `state.lanes`) —
+ * build / prepare / fix / CI-heal guard spawned within the arrival window whose lane is not leased (not in `state.lanes`) —
  * the session exists but has not acquired its lane, so no lease, holder or waiter reflects it. Once the lane is
  * leased, the baseline's lease scan counts it instead, so nothing is counted twice. Pure.
  */
@@ -1760,11 +1786,14 @@ export function freshSpawnDemandMinutes(guards, { lanes = [], now = null, queueA
   const windowMs = (Number.isFinite(queueAdmission.arrivalWindowMinutes) ? queueAdmission.arrivalWindowMinutes : DEFAULT_ARRIVAL_WINDOW_MINUTES) * 60_000;
   const leased = new Set((Array.isArray(lanes) ? lanes : []).map((l) => String(l?.lane ?? l)));
   let total = 0;
-  for (const [kind, list] of [['build', guards.build], ['fix', guards.fix], ['ci-heal', guards.ciHeal]]) {
+  for (const [kind, list] of [['build', guards.build], ['fix', guards.fix], ['ci-heal', guards.ciHeal], ['prepare', guards.prepare]]) {
     for (const g of Array.isArray(list) ? list : []) {
       if (!g || g.lane == null || !Number.isFinite(g.spawnedAt)) continue;
       if (now - g.spawnedAt > windowMs || leased.has(String(g.lane))) continue;
-      total += dispatchDemandMinutes(kind, { size: kind === 'build' ? (itemSizes?.[normNum(g.num)] ?? null) : null, standardMinutes: queueAdmission.standardMinutes });
+      total += dispatchDemandMinutes(kind === 'prepare' ? (g.kind || 'prepare') : kind, {
+        size: kind === 'build' ? (itemSizes?.[normNum(g.num)] ?? null) : null, standardMinutes: queueAdmission.standardMinutes,
+        dispatchMinutes: queueAdmission.dispatchMinutes, prepareAdmission: queueAdmission.prepareAdmission,
+      });
     }
   }
   return total;
@@ -1795,6 +1824,29 @@ export function applyQueueCapToSpawns(plan, kind, budget) {
     },
     held,
   };
+}
+
+/** Apply the shared queue budget to prepare lists; held entries release their guards and lanes. Pure. */
+export function applyQueueCapToPrepareSpawns(prep, budget) {
+  if (!budget?.active) return { prep, held: [] };
+  const held = [];
+  const filtered = { ...prep };
+  for (const [list, kind] of [
+    ['scopeSpawns', 'prepare-scope'], ['decisionSpawns', 'prepare-decision'],
+    ['investigationSpawns', 'investigate'], ['itemPrepareSpawns', 'prepare-item'],
+  ]) {
+    filtered[list] = prep[list].filter((sp) => {
+      const d = budget.tryAdmit(kind, { id: sp.num });
+      if (!d.admit) held.push({ num: sp.num, lane: sp.lane, kind, projectedMinutes: d.projectedMinutes, demandMinutes: d.demandMinutes });
+      return d.admit;
+    });
+  }
+  if (held.length === 0) return { prep, held };
+  const heldLanes = new Set(held.map((h) => String(h.lane)));
+  // Match on num alone: the four prepare lists never share a num, and a scope spawn's guard kind is `prepare`.
+  filtered.newGuards = prep.newGuards.filter((g) => !held.some((h) => normNum(h.num) === normNum(g.num)));
+  filtered.consumedLanes = prep.consumedLanes.filter((l) => !heldLanes.has(String(l)));
+  return { prep: filtered, held };
 }
 
 /** Put back the prior attempt count for PRs whose planned spawn was held (a held spawn is not an attempt). */
@@ -1918,6 +1970,8 @@ async function main(argv) {
 
   const stateArgs = ['--json'];
   const planArgs = ['--json'];
+  // Card 80 (b) — the build daemon's `preparedMaxAgeDays` turns on dispatch-plan's `prepare-stale` gate.
+  if (Number.isFinite(config.preparedMaxAgeDays) && config.preparedMaxAgeDays >= 0) planArgs.push(`--prepared-max-age-days=${config.preparedMaxAgeDays}`);
   if (typeof flags.repo === 'string') { stateArgs.push(`--repo=${flags.repo}`); }
   // `--backlog-dir` (#3445) points BOTH children at a fixture corpus instead of the live `backlog/` directory
   // — the dispatcher-fixture-root thread (#3402) that lets a harness test validate this whole

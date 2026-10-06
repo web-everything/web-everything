@@ -50,6 +50,7 @@ import { normNum } from '../../scripts/conveyor/queue-store.mjs';
 import { collectProtectedNums } from '../../scripts/conveyor/queue-prune.mjs';
 import {
   BUILD_DISPATCH_POLICY, planBuildDispatch, normalizeOpenPrs, prDeliversNum, prDeliveredNum, reportOpenItems,
+  collectBuildHolds, stampCoversClaim,
 } from '../../scripts/conveyor/build-dispatch-policy.mjs';
 import {
   acquireBuildDispatchClaim, releaseBuildDispatchClaim, listBuildDispatchClaims,
@@ -320,7 +321,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Exclude held candidates BEFORE the tick core allocates its two prepare slots.
   bookkeeping = { ...bookkeeping, prepareHeldNums: holds.map((h) => normNum(h.num)) };
   const tickBookkeeping = bookkeeping;
-  const out = await effects.planTick(tickBookkeeping);
+  // Card 80 — the just-in-time prepare settings ride to tick-core as config (window) and on to dispatch-plan
+  // (max age + scope drift → `prepare-stale`).
+  const out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
   // The plan's age is what dispatch-lane's freshness bound must measure, so stamp it here, once, right after
   // planning — never at each (possibly much later) dispatch.
   const tickAt = new Date(effects.now?.() ?? Date.now()).toISOString();
@@ -708,6 +711,12 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     // or the live status line can say WHY an otherwise-cleared item was not offered.
     dispatchHolds: held,
     dispatched,
+    // Every cleared card not dispatched this tick, with the stage and reason that held it (queue-cap included).
+    buildHolds: collectBuildHolds({
+      queue: admission.queue || [], planHeld: admission.held || [], suppressed: d.suppressedBuilds || [],
+      policyHold: plan.hold, cooldown: held, dispatched,
+      prepareBusy: spawn.map((s) => normNum(s.num)).filter((n) => prepareRows.some((r) => normNum(r.num) === n) && !completedPrepares.has(n)),
+    }),
     prepare,
     failures,
     // #4348-open-pr-retry — `{retried, resumed, surfaced, waiting}` from `infra-blocked.mjs retry` (or an
@@ -773,11 +782,11 @@ export const BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE = '1000000';
 
 // EXPORTED (#4464) so a test can assert the env override directly, against an injected `exec` — mirrors this
 // file's own established `{ exec = execFileSync }` seam (`cliRetryInfraBlocked`, below).
-export function cliPlanTick(payload, { exec = execFileSync } = {}) {
+export function cliPlanTick(payload, { exec = execFileSync, config = null } = {}) {
   const snapshotDir = mkdtempSync(join(tmpdir(), 'builder-plan-'));
   try {
     const text = exec('node', [join(SCRIPTS, 'conveyor', 'tick-core.mjs')], {
-      input: JSON.stringify({ bookkeeping: payload || {} }), encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+      input: JSON.stringify({ bookkeeping: payload || {}, ...(config ? { config } : {}) }), encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
       env: { ...process.env, [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, [PLANNING_SNAPSHOT_ENV]: snapshotDir },
     });
     return JSON.parse(text);
@@ -1193,9 +1202,12 @@ export function createPrepareStatusReader({ exec = execFileSync } = {}) {
       const card = loadTree().get(normNum(num));
       if (!card) throw new Error(`prepare card #${num} not found on origin/main`);
       loadBlobs([card]);
-      const main = prepareBlobStatuses.get(card.sha);
+      const stamped = prepareBlobStatuses.get(card.sha);
       const { path } = card;
-      if (main.preparedDate) return { ...main, path };
+      // Card 80 — a stamp older than this claim is the one a re-prepare (`prepare-stale`) is replacing, not its
+      // result: read it as unprepared so the claim is not retired at once, and look for the attempt's PR.
+      if (stamped.preparedDate && stampCoversClaim(stamped.preparedDate, claimedAt)) return { ...stamped, path };
+      const main = stamped.preparedDate ? { ...stamped, preparedDate: null, replacedPreparedDate: stamped.preparedDate } : stamped;
       // Same-repo only: a fork PR with a lookalike branch name must never retire a claim or place a hold.
       const pr = prsFor(num, claimedAt).filter(p => !p.isCrossRepository && p.headRefName.startsWith(`lane/${normNum(num)}-prepare-`)
         && (!claimedAt || p.createdAt >= claimedAt)).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
@@ -1467,7 +1479,7 @@ function cliEffects() {
     },
     acquirePrepareClaim: (o) => acquireBuildDispatchClaim({ ...o, lockRoot: prepareClaimRoot() }),
     releasePrepareClaim: (o) => releaseBuildDispatchClaim({ ...o, lockRoot: prepareClaimRoot() }),
-    planTick: cliPlanTick,
+    planTick: (payload, { config } = {}) => cliPlanTick(payload, { config }),
     predictRoute: cliPredictRoute,
     fetchOpenPrs: cliFetchOpenPrs,
     listClaims: () => listBuildDispatchClaims(),
@@ -1555,7 +1567,26 @@ export function policyFrom(flags, env = process.env) {
     maxConcurrentExternalBuilds: n(flags['max-concurrent-external'] ?? env.WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL, BUILD_DISPATCH_POLICY.maxConcurrentExternalBuilds),
     maxOpenPrs: n(flags['max-open-prs'], BUILD_DISPATCH_POLICY.maxOpenPrs),
     maxOpenItems: n(flags['max-open-items'], BUILD_DISPATCH_POLICY.maxOpenItems),
+    // Card 80 — declared settings; `off` (or a negative value) disables the window / the staleness gate.
+    prepareAheadWindow: offOr(flags['prepare-ahead-window'] ?? env.WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW, BUILD_DISPATCH_POLICY.prepareAheadWindow),
+    preparedMaxAgeDays: offOr(flags['prepared-max-age-days'] ?? env.WE_BUILD_DAEMON_PREPARED_MAX_AGE_DAYS, BUILD_DISPATCH_POLICY.preparedMaxAgeDays),
   };
+}
+
+/** A count setting that can be switched off: unset → the default; `off` / a negative number → `null` (off). */
+function offOr(v, d) {
+  if (v === undefined || v === null || v === '' || v === true) return d;
+  if (/^off$/i.test(String(v))) return null;
+  const x = Number(v);
+  return Number.isFinite(x) ? (x < 0 ? null : x) : d;
+}
+
+/** Card 80 — the tick-core config this daemon's policy implies. EXPORTED for the test. */
+export function planConfigFrom(policy = BUILD_DISPATCH_POLICY) {
+  const cfg = {};
+  if (Number.isFinite(policy?.prepareAheadWindow)) cfg.prepareAheadWindow = policy.prepareAheadWindow;
+  if (Number.isFinite(policy?.preparedMaxAgeDays)) cfg.preparedMaxAgeDays = policy.preparedMaxAgeDays;
+  return cfg;
 }
 
 /**
@@ -1600,7 +1631,8 @@ async function dryRun(flags) {
   const ifFreed = planBuildDispatch({ candidates: reportCandidates, inFlight, openPrs: normalizeOpenPrs(openPrs), externalBuilding: core.building, killSwitch: cliKillSwitch(), policy, dispatchedByBuilder, fixInFlight: liveFixInFlight() });
   const focus = String(flags.focus || '').split(',').map(normNum).filter(Boolean);
   const rows = [];
-  const nums = new Set([...ifFreed.dispatch.map((x) => x.num), ...ifFreed.hold.map((x) => x.num)]);
+  const holdByNum = new Map((tick.buildHolds || []).map((h) => [normNum(h.num), h]));
+  const nums = new Set([...ifFreed.dispatch.map((x) => x.num), ...ifFreed.hold.map((x) => x.num), ...holdByNum.keys()]);
   for (const num of focus) nums.add(num);
   for (const num of nums) {
     if (focus.length && !focus.includes(num)) continue;
@@ -1608,11 +1640,12 @@ async function dryRun(flags) {
     const coreWhy = coreSpawn ? 'launchable now' : (heldByCore.get(num) || (scopeByNum.has(num) ? 'not planned' : 'not in the ready build queue'));
     const pick = ifFreed.dispatch.find((x) => x.num === num);
     const held = ifFreed.hold.find((x) => x.num === num);
-    const route = await cliPredictRoute(num, scopeByNum.get(num) || []);
+    // A card only the hold list names needs no route read (it is not a dispatch candidate this tick).
+    const route = (pick || held || focus.includes(num)) ? await cliPredictRoute(num, scopeByNum.get(num) || []) : null;
     rows.push({
       num,
       tickCore: coreWhy,
-      daemon: pick ? (coreSpawn ? 'WOULD DISPATCH NOW' : 'would dispatch once the tick core frees a lane') : held ? `hold [${held.rule}] ${held.reason}` : 'not a candidate',
+      daemon: pick ? (coreSpawn ? 'WOULD DISPATCH NOW' : 'would dispatch once the tick core frees a lane') : held ? `hold [${held.rule}] ${held.reason}` : holdText(holdByNum.get(num)),
       route,
     });
   }
@@ -1639,6 +1672,7 @@ async function dryRun(flags) {
     prepare: tick.prepare,
     draftRecovery: tick.draftRecovery,
     wouldDispatchNow: tick.plan.dispatch.map((x) => x.num),
+    buildHolds: tick.buildHolds,
     wouldRetireClaims: tick.retired,
     dispatchHolds: tick.dispatchHolds, // #4349 — items excluded this tick by a non-PR terminal-outcome cooldown
     // #4465 — every LIVE hold's classified route (`already-done`/`out-of-scope`/`other`), read-only here: a
@@ -1661,9 +1695,15 @@ async function dryRun(flags) {
   w(`  would dispatch now: ${report.wouldDispatchNow.map((n) => `#${n}`).join(', ') || 'nothing'}`);
   w(`  held items, routed: ${report.holdRouting.map((h) => `#${h.num}→${h.route}${h.commit ? `(${h.commit})` : ''}`).join(', ') || 'none'}`);
   for (const r of rows) {
+    if (!r.route) { w(`  #${r.num}: tick-core=${r.tickCore} → ${r.daemon}`); continue; }
     const rt = r.route?.error ? `route ? (${r.route.error})` : `marker=${r.route.marker ?? '-'} taskType=${r.route.taskType ?? '-'} routed=${r.route.routed ?? '-'} executed=${r.route.executed ?? '-'} executor=${r.route.executor ?? '-'}${r.route.refusal ? ` REFUSED: ${r.route.refusal}` : ''}`;
     w(`  #${r.num}: tick-core=${r.tickCore} → ${r.daemon}\n      ${rt}`);
   }
+}
+
+/** One held card's reason as the dry-run prints it (`held [tick-core] queue-cap — projected …`). */
+export function holdText(h) {
+  return h ? `held [${h.stage}] ${h.reason}${h.detail ? ` — ${h.detail}` : ''}` : 'not a candidate';
 }
 
 async function live(flags) {
@@ -1715,7 +1755,7 @@ async function live(flags) {
       // or for an older record with none) so the operator's tick line names WHO is running each build without
       // reading scorecards. Additive over the previous bare-num array — nothing on `main` parses this stdout
       // JSON as a strict array-of-strings today (grepped 2026-09-29).
-      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult })}\n`);
+      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult })}\n`);
     },
     onTickError: (e, _tick, loop) => {
       // Keep the health watcher's existing failure-line contract; timings are an additive JSON line.
@@ -1732,7 +1772,7 @@ async function main(argv) {
   if (flags['dry-run']) return dryRun(flags);
   if (flags.live) return live(flags);
   console.error('usage: build-dispatch-daemon.mjs --dry-run [--json] [--focus=N,M]   (read-only: what it would dispatch now)\n'
-    + '       build-dispatch-daemon.mjs --live [--once] [--self-sync] [--no-prepare] [--max-concurrent=1] [--max-concurrent-external=4] [--max-open-prs=12] [--max-open-items=7] [--interval-ms=120000]\n'
+    + '       build-dispatch-daemon.mjs --live [--once] [--self-sync] [--no-prepare] [--max-concurrent=1] [--max-concurrent-external=4] [--max-open-prs=12] [--max-open-items=7] [--prepare-ahead-window=4|off] [--prepared-max-age-days=3|off] [--interval-ms=120000]\n'
     + 'red draft age env: WE_BUILD_DAEMON_RED_DRAFT_MINUTES (default 60)\n'
     + 'caps env: WE_BUILD_DAEMON_MAX_CONCURRENT (Claude), WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL (Codex/agy); flags win\n'
     + `paused ticks: ${PAUSED_PREP_ENV}=1 restores full preparation; ${PAUSED_SYNC_MS_ENV} sets clone sync interval (default ${DEFAULT_PAUSED_SYNC_MS}ms)\n`

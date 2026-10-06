@@ -7,12 +7,12 @@
  *   leases are injected.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   acquireSlotBlocking, tryAcquireSlot, markWaiting, releaseOwnedSlot, heldSlots, listWaiting, clearWaiting,
-  readHoldDurations, readStandardMinutes, resolveQueueBaseline, resolveLiveQueueBaseline,
+  recordHoldDuration, readHoldDurations, readStandardMinutes, resolveQueueBaseline, resolveLiveQueueBaseline,
 } from '../heavy-admission.mjs';
 
 const roots = [];
@@ -191,5 +191,51 @@ describe('resolveQueueBaseline — held + waiting + dispatched-not-yet-queued', 
   it('the live resolver never reads the real host pool from a test worker (fails open instead)', () => {
     const b = resolveLiveQueueBaseline({ checkoutRoot: '/nonexistent/checkout', env: { VITEST: 'true', HOME: '/nonexistent-home' } });
     expect(b.bypassed).toBe('error');
+  });
+});
+
+
+describe('prepare hold identity and pending demand', () => {
+  it('records the lane lease identity on release, preferring holder over session', () => {
+    const lockRoot = tempRoot();
+    const repo = tempRoot();
+    const acquiredAt = iso(Date.now() - 5 * 60_000);
+    mkdirSync(join(repo, '.git'));
+    writeFileSync(join(repo, '.git', '.lane-lease'), JSON.stringify({ purpose: 'prepare-item', holder: 'worker-uuid', session: 'prepare-123', acquiredAt }));
+    holdSlot(lockRoot, 1, `${repo}#123`, 'selected');
+    releaseOwnedSlot({ lockRoot, cap: 1, owner: `${repo}#123` });
+    expect(readHoldDurations(lockRoot)).toEqual([expect.objectContaining({ repo, dispatchKind: 'prepare', session: 'worker-uuid', leaseAcquiredAt: acquiredAt })]);
+    writeFileSync(join(repo, '.git', '.lane-lease'), JSON.stringify({ purpose: 'prepare-item', session: 'prepare-123', acquiredAt }));
+    holdSlot(lockRoot, 1, `${repo}#123`, 'standards');
+    releaseOwnedSlot({ lockRoot, cap: 1, owner: `${repo}#123` });
+    expect(readHoldDurations(lockRoot)[1]).toMatchObject({ session: 'prepare-123', dispatchKind: 'prepare' });
+  });
+  it('omits optional identity fields for old callers or missing leases', () => {
+    const lockRoot = tempRoot();
+    recordHoldDuration({ lockRoot, kind: 'selected', ms: 60_000 });
+    holdSlot(lockRoot, 1, '/nonexistent/lane-4#123', 'selected');
+    releaseOwnedSlot({ lockRoot, cap: 1, owner: '/nonexistent/lane-4#123' });
+    for (const row of readHoldDurations(lockRoot)) {
+      expect(row).not.toHaveProperty('dispatchKind');
+      expect(row).not.toHaveProperty('session');
+      expect(row).not.toHaveProperty('leaseAcquiredAt');
+    }
+  });
+  it('counts a fresh prepare lease with the seed, then rolling session demand; exempt removes it', () => {
+    const lockRoot = tempRoot();
+    const leases = [{ repo: '/p/we/lane-3', lease: { purpose: 'prepare-item', session: 'prepare-123', acquiredAt: iso(T0 - 60_000), ttlMinutes: 240 } }];
+    const options = { lockRoot, cap: 2, nowMs: T0, env: {}, readLeases: () => leases };
+    const seed = resolveQueueBaseline(options);
+    expect(seed.pending).toEqual([expect.objectContaining({ dispatchKind: 'prepare', demandMinutes: 3.25 })]);
+    expect(seed).toMatchObject({ prepareAdmission: 'charge', dispatchMinutes: { prepare: null }, dispatchSource: { prepare: { from: 'seed', samples: 0 } } });
+    for (const session of ['a', 'b', 'c']) {
+      for (const minutes of [3.55, 3.55]) recordHoldDuration({ lockRoot, kind: 'selected', ms: minutes * 60_000, dispatchKind: 'prepare-item', session });
+    }
+    const rolling = resolveQueueBaseline(options);
+    expect(rolling).toMatchObject({ pendingMinutes: 7.1, dispatchMinutes: { prepare: 7.1 }, dispatchSource: { prepare: { from: 'rolling', samples: 3 } } });
+    expect(rolling.pending[0].demandMinutes).toBe(7.1);
+    const exempt = resolveQueueBaseline({ ...options, env: { WE_QUEUE_ADMISSION_PREPARE: 'exempt' } });
+    expect(exempt.prepareAdmission).toBe('exempt');
+    expect(exempt.pending).toEqual([]);
   });
 });

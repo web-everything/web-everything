@@ -506,3 +506,10 @@ export function ownLaneNumber(cwdReal, poolDir, sepChar = '/') {
   const m = rest.match(/^lane-(\d+)(?:$|[/\\])/);
   return m ? Number(m[1]) : null;
 }
+
+/** A clean, landed HEAD must also belong to this lease, not predate a freshly acquired empty lane. */
+export function isDeliveredLease({ porcelain, headIsAncestorOfUpstream, headCommitMs, acquiredAtMs }) {
+  return porcelain === '' && headIsAncestorOfUpstream === true
+    && Number.isFinite(headCommitMs) && Number.isFinite(acquiredAtMs)
+    && headCommitMs >= acquiredAtMs;
+}

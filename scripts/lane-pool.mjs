@@ -107,6 +107,7 @@ import {
   laneWorkerSession,
   isContestedLease,
   isTransientRefLockError,
+  isDeliveredLease,
 } from './lib/lane-lease.mjs';
 // #4122 — the free-lane list `acquire`'s auto-pick reads as a fast pre-filter before paying for its own scan
 // (see that module's own header for the full incident/design writeup).
@@ -148,6 +149,7 @@ import { journalLaneEvent, laneStateSnapshot, laneHead, destructiveActionVerdict
 // the acquire-time twin of `cleanLaneLitter`'s release-time cleanup — same allowlist, same verdict, never a
 // second hand-rolled classifier.
 import { cleanLaneLitter, planLitterCleanup } from './lib/lane-litter.mjs';
+import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // #3383 gap 2 (auto-reclaim) — the SAME preservation primitives `lane-whois.mjs` itself uses to prove a lane's
 // uncommitted/ahead content is provably preserved (identical blob in origin, or a pushed/patch-equivalent
 // commit), reused verbatim by `cmdReclaim`'s own re-check below rather than re-derived. Side-effect-free at
@@ -2468,6 +2470,27 @@ function cmdReleaseAllPools(repo) {
   if (flags.json) process.stdout.write(JSON.stringify({ session: session || null, item: wantItem, released, pools: perPool }, null, 2) + '\n');
 }
 
+function deliveredLeaseForLane(dir, lease) {
+  const porcelain = tryGit(['status', '--porcelain'], dir);
+  if (porcelain === null) return false;
+  const { leaveDirty } = planLitterCleanup(porcelain);
+  if (leaveDirty.length) return false;
+  const candidates = [tryGit(['rev-parse', 'origin/main'], dir)];
+  try {
+    const objects = readFileSync(join(dir, '.git/objects/info/alternates'), 'utf8').split('\n')[0].trim();
+    if (objects) candidates.push(tryGit([`--git-dir=${dirname(objects)}`, 'rev-parse', 'origin/main'], dir));
+  } catch { /* No readable alternates owner. */ }
+  const available = [...new Set(candidates.filter(Boolean))]
+    .filter((sha) => tryGit(['cat-file', '-e', `${sha}^{commit}`], dir) !== null);
+  const upstream = pickFreshestTip(available, (a, b) => tryGit(['merge-base', '--is-ancestor', a, b], dir) !== null);
+  return isDeliveredLease({
+    porcelain: '', // Only the shared cleanup allowlist was set aside; no mutation before ownership.
+    headIsAncestorOfUpstream: !!upstream && tryGit(['merge-base', '--is-ancestor', 'HEAD', upstream], dir) !== null,
+    headCommitMs: Number.parseInt(tryGit(['log', '-1', '--format=%ct', 'HEAD'], dir) ?? '', 10) * 1000,
+    acquiredAtMs: Date.parse(lease.acquiredAt),
+  });
+}
+
 function cmdRelease(repo) {
   assertReleaseReservedScoped();
   if (flags['all-pools']) return cmdReleaseAllPools(repo); // #2667 — cross-pool release-by-session
@@ -2525,7 +2548,10 @@ function cmdRelease(repo) {
     // A dead holder has nothing to protect: there is no one to be confused with, so nothing to prove.
     const contested = !isLeaseStale(lease, nowMs, ttlMs)
       && isContestedLease({ lease, siblingLeases: liveLeasesInPoolExcept(repo, n, nowMs, ttlMs) });
-    if (!bypassOwnership && !leaseOwnedByCaller({ lease, session, mySessionId, targeted, contested })) {
+    const owned = leaseOwnedByCaller({ lease, session, mySessionId, targeted, contested });
+    const delivered = !bypassOwnership && !owned && contested && targeted
+      && !!mySessionId && lease.ownerSession === mySessionId && deliveredLeaseForLane(dir, lease);
+    if (!bypassOwnership && !owned && !delivered) {
       const holder = laneHolderSlug(lease);
       log(
         `  lane-${n}: ${describeLease(lease)} — not yours; pass --force to break` +
@@ -2569,6 +2595,7 @@ function cmdRelease(repo) {
       log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
       continue;
     }
+    if (delivered) log(`  lane-${n}: contested lease released — its work is fully landed (clean tree, HEAD on upstream main), nothing to lose`);
     // #3383 — record the release in the lane-history ledger (best-effort; the marker is confirmed ours to drop).
     appendLaneHistory(dir, laneHistoryEntry({
       event: 'release', session, ownerSession: lease.ownerSession || null, workerSession: lease.workerSession || null,

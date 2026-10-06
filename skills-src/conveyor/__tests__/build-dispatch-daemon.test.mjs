@@ -5,7 +5,7 @@ import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync,
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // #4465 review — `cliRouteHeldItems`'s (a)/(b) routes ultimately call `cliSpawnHoldLand`, which spawns a REAL
@@ -42,6 +42,8 @@ import {
   cliRouteHeldItems, cliSpawnHoldLand, cliStampPrepare, cliReadStampFailure, STAMP_RECOVERY_LEASE_MINUTES, cliPrepareFailureEvidence,
   // xovjhwh — the shared attribution derivation `runBuildDispatchTick` and `dryRun` both call
   deriveDispatchedByBuilder,
+  // card 80 + hold visibility
+  planConfigFrom, holdText,
 } from '../build-dispatch-daemon.mjs';
 import { listHoldFindings } from '../../../scripts/conveyor/build-dispatch-hold-router.mjs';
 import { MAX_CONCURRENT_LANES_ENV } from '../../../scripts/lib/lane-concurrency.mjs';
@@ -2445,5 +2447,76 @@ describe('runBuildDispatchTick — queue prune wiring', () => {
     const effects = { ...prEffects([]), pruneQueue: () => { throw new Error('boom\nstack'); } };
     const r = await runBuildDispatchTick({ live: true, effects });
     expect(r.queuePrune).toEqual({ error: 'boom' });
+  });
+});
+
+describe('card 80 — prepare just in time (daemon wiring)', () => {
+  it('policyFrom declares the two settings with defaults, flag/env overrides and an off switch', () => {
+    expect(policyFrom({}, {})).toMatchObject({ prepareAheadWindow: 4, preparedMaxAgeDays: 3 });
+    expect(policyFrom({ 'prepare-ahead-window': '2' }, { WE_BUILD_DAEMON_PREPARED_MAX_AGE_DAYS: '7' })).toMatchObject({ prepareAheadWindow: 2, preparedMaxAgeDays: 7 });
+    expect(policyFrom({ 'prepare-ahead-window': 'off', 'prepared-max-age-days': 'off' }, {})).toMatchObject({ prepareAheadWindow: null, preparedMaxAgeDays: null });
+  });
+
+  it('planConfigFrom passes only the settings that are on', () => {
+    expect(planConfigFrom(policyFrom({}, {}))).toEqual({ prepareAheadWindow: 4, preparedMaxAgeDays: 3 });
+    expect(planConfigFrom(policyFrom({ 'prepare-ahead-window': 'off' }, {}))).toEqual({ preparedMaxAgeDays: 3 });
+  });
+
+  it('cliPlanTick forwards the config to tick-core on STDIN beside the bookkeeping', () => {
+    let input;
+    const exec = (cmd, args, opts) => { input = JSON.parse(opts.input); return JSON.stringify({ decisions: {}, nextState: {} }); };
+    cliPlanTick({ tick: 3 }, { exec, config: { prepareAheadWindow: 4 } });
+    expect(input).toEqual({ bookkeeping: { tick: 3 }, config: { prepareAheadWindow: 4 } });
+  });
+
+  it('runBuildDispatchTick hands the policy-derived config to planTick', async () => {
+    let seen;
+    const effects = {
+      planTick: (bk, opts) => { seen = opts; return { decisions: { admission: { queue: [], cleared: [] } }, nextState: {} }; },
+      fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [], listSettledBuilds: () => [],
+      killSwitch: () => ({ engaged: false }),
+    };
+    await runBuildDispatchTick({ live: false, effects, policy: policyFrom({}, {}) });
+    expect(seen).toEqual({ config: { prepareAheadWindow: 4, preparedMaxAgeDays: 3 } });
+  });
+
+  it('the status reader reads an older main stamp as UNPREPARED for a newer re-prepare claim, and looks for its PR', () => {
+    const exec = prepareGitFixture({ 8801: '---\npreparedDate: 2026-09-20\n---\ncard 80 stale stamp' },
+      [{ number: 9001, state: 'MERGED', headRefName: 'lane/8801-prepare-again', createdAt: '2026-10-06T16:00:00Z', isCrossRepository: false }]);
+    const stale = createPrepareStatusReader({ exec }).read({ num: 8801, claimedAt: '2026-10-06T15:00:00Z' });
+    expect(stale.preparedDate).toBeNull();
+    expect(stale.replacedPreparedDate).toBe('2026-09-20');
+    expect(stale.pr.state).toBe('MERGED');
+    // No claim (or an older claim) still reads the stamp as prepared — today's behavior.
+    expect(createPrepareStatusReader({ exec }).read({ num: 8801 }).preparedDate).toBe('2026-09-20');
+  });
+});
+
+describe('build-hold visibility', () => {
+  it('a queue-cap held build is reported per card with the projection (tick log + dry-run)', async () => {
+    const effects = {
+      planTick: () => ({
+        decisions: {
+          statusLine: 't', counts: { building: 0 }, spawnBuilds: [],
+          suppressedBuilds: [{ num: '5187', lane: 3, by: 'queue-cap', projectedMinutes: 41, demandMinutes: 6.5 }],
+          admission: { queue: [{ num: '5187', scope: ['we:a'] }, { num: '9', scope: ['we:b'] }], cleared: [{ num: '5187' }, { num: '9' }], held: [{ num: '9', reason: 'overlaps lane-19' }] },
+        },
+        nextState: {},
+      }),
+      fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [], listSettledBuilds: () => [],
+      killSwitch: () => ({ engaged: false }),
+    };
+    const r = await runBuildDispatchTick({ live: false, effects });
+    expect(r.buildHolds).toEqual([
+      { num: '5187', stage: 'tick-core', reason: 'queue-cap', detail: 'projected heavy-test wait 41m (this build +6.5m)' },
+      { num: '9', stage: 'plan', reason: 'overlaps lane-19' },
+    ]);
+    expect(holdText(r.buildHolds[0])).toBe('held [tick-core] queue-cap — projected heavy-test wait 41m (this build +6.5m)');
+    expect(holdText(undefined)).toBe('not a candidate');
+  });
+
+  it('the live tick line carries buildHolds', () => {
+    const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', 'build-dispatch-daemon.mjs'), 'utf8');
+    expect(src).toMatch(/buildHolds: r\.buildHolds/);
   });
 });
