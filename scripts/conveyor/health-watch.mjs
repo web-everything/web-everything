@@ -163,7 +163,7 @@ export function probeDaemonLogs(logsDir, cursors = {}) {
     const name = f.replace(/\.log$/, '');
     const st = statSync(path);
     const cur = cursors[name];
-    const rotated = !!cur && cur.ino === st.ino && st.size < cur.size;
+    const rotated = !!cur && cur.ino === st.ino && st.size < cur.size && existsSync(`${path}.1`);
     const bootstrap = !cur || cur.ino !== st.ino || (st.size < cur.size && !rotated);
     // 68b: copy-truncate rotation keeps the inode but shrinks the file; what we had not read yet is the tail of
     // `<log>.1`, so read it first and then the fresh file from the top, losing no refusal lines.
