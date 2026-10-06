@@ -62,7 +62,8 @@ export function derivePrState(facts, settings = {}) {
     return result('READY-TO-MERGE', `required checks green on ${sha}`, f.drainDeferral || 'drain merges the PR');
   if (count(f.referrals?.pending)) return result('NEEDS-RULING', 'pending referral', 'mandatory reviewer records a ruling',
     `referrals: ${count(f.referrals.pending)} pending; ${count(f.referrals.ruled)} ruled`);
-  if (labels.includes('review:human') || f.roundCapNote || f.needsDecisionNote
+  if (labels.includes('review:human') || f.roundCapNote
+    || (f.needsDecisionNote && !checks.some(c => ['pending', 'missing'].includes(c.state))) // a transient note never outranks CI still running
     || (f.refusals ?? []).some(r => /cap[- ]exhausted/i.test(r.text))) {
     const advisory = f.advisory;
     const old = advisory?.coveredHead && f.head?.sha && !f.head.sha.startsWith(advisory.coveredHead);
