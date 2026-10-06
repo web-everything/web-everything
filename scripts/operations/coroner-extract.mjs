@@ -10,7 +10,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
-import { stripLogTimestamp } from '../../skills-src/conveyor/daemon-log.mjs';
+import { stripLogTimestamp } from '../lib/log-timestamp.mjs';
 
 const MiB = 1024 * 1024;
 const MAX_LINE = 256 * 1024;

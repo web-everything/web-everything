@@ -2,7 +2,7 @@
  * Untimestamped log ticks use the watch's existing bootstrap interval estimate.
  * Count outcome lines, never echoed command stderr or aggregate tick counts.
  */
-import { stripLogTimestamp } from '../../skills-src/conveyor/daemon-log.mjs';
+import { stripLogTimestamp } from '../lib/log-timestamp.mjs';
 
 export const ATTEMPT_WINDOW_MS = 60 * 60_000;
 export const MIN_PR_ATTEMPTS = 5;

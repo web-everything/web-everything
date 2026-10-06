@@ -12,25 +12,14 @@
  *   Out of scope (68b): rotation and de-duplication.
  */
 import { format } from 'node:util';
+import { LOG_TIMESTAMP_RE, stripLogTimestamp, timestampLines } from '../../scripts/lib/log-timestamp.mjs';
+
+export { LOG_TIMESTAMP_RE, stripLogTimestamp };
 
 export const LOG_TIMESTAMP_ENV = 'WE_DAEMON_LOG_TIMESTAMPS';
-/** An ISO-8601 UTC stamp plus its one separating space, at the start of a line. */
-export const LOG_TIMESTAMP_RE = /^\d{4}-\d\d-\d\dT[\d:.]+Z /;
-
-/** PURE: drop a leading daemon-log timestamp, if any. Unstamped lines are returned unchanged. */
-export function stripLogTimestamp(line) {
-  return typeof line === 'string' ? line.replace(LOG_TIMESTAMP_RE, '') : line;
-}
-
 /** PURE: is stamping enabled under this env? */
 export function timestampsEnabled(env = process.env) {
   return !/^(?:0|off|false|no)$/i.test(String(env?.[LOG_TIMESTAMP_ENV] ?? '').trim());
-}
-
-/** PURE: stamp every line of a formatted message. */
-export function stampLines(text, now = new Date()) {
-  const iso = now.toISOString();
-  return String(text).split('\n').map((l) => `${iso} ${l}`).join('\n');
 }
 
 const INSTALLED = Symbol.for('we.daemonLog.installed');
@@ -46,7 +35,7 @@ export function installDaemonLog({ target = console, env = process.env, now = ()
     const orig = target[m];
     if (typeof orig !== 'function') continue;
     originals[m] = orig;
-    target[m] = (...args) => orig.call(target, stampLines(format(...args), now()));
+    target[m] = (...args) => orig.call(target, timestampLines(format(...args), now().getTime()));
   }
   target[INSTALLED] = true;
   return () => { Object.assign(target, originals); delete target[INSTALLED]; };

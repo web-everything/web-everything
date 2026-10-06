@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { installDaemonLog, stripLogTimestamp, stampLines, timestampsEnabled } from '../daemon-log.mjs';
+import { installDaemonLog, stripLogTimestamp, timestampsEnabled } from '../daemon-log.mjs';
 import { parseDaemonLog } from '../../../scripts/conveyor/health-watch-core.mjs';
 import { foldPrAttempts } from '../../../scripts/conveyor/health-pr-attempts.mjs';
 import { liveProcessRefusals } from '../../../scripts/conveyor/health-smells/live-process-stale-transcript.mjs';
@@ -51,7 +51,6 @@ describe('installDaemonLog', () => {
   it('strips only a leading stamp', () => {
     expect(stripLogTimestamp(`${TS}review-daemon: x`)).toBe('review-daemon: x');
     expect(stripLogTimestamp('review-daemon: x')).toBe('review-daemon: x');
-    expect(stampLines('a\nb', new Date(0))).toBe('1970-01-01T00:00:00.000Z a\n1970-01-01T00:00:00.000Z b');
   });
 });
 

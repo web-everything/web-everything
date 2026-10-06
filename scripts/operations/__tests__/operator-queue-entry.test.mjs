@@ -58,6 +58,8 @@ const stage = (root) => {
   // `daemon-rebuild.mjs`, which would drag its whole build/smoke/child_process graph into this leaf; that file
   // is itself node-builtins-only — "import-light", see its own header — so no further leaf needs staging).
   copyFileSync(join(dirname(LEAF), 'daemon-last-good.mjs'), join(root, 'lib/daemon-last-good.mjs'));
+  // item 68a — the health parsers strip the daemon-log timestamp via the import-free `../lib/log-timestamp.mjs`.
+  copyFileSync(join(dirname(LEAF), 'log-timestamp.mjs'), join(root, 'lib/log-timestamp.mjs'));
 };
 
 let dir;
