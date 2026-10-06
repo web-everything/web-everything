@@ -12,6 +12,7 @@ import {
 } from '../codex-worker.mjs';
 
 const BASE_SHA = 'a'.repeat(40);
+const COMMIT_SHA = 'c'.repeat(40);
 
 const markdown = `---
 status: open
@@ -146,9 +147,9 @@ describe('task, branch and reporting', () => {
 
 // All effects stay in memory: no real git, gh, Codex, lane or record file.
 // `gitStates` scripts the successive `.git` snapshots (before Codex, after Codex, before open-pr); the last one repeats.
-function harness({ prs = [], status = ' M scripts/a.js\n', committed = '', fail, reportChanges = true, acquire, codexOutput, prOutput, verifyOutput, failWrite, failRecord, gitStates = [{}], lsFiles = [''] } = {}) {
+function harness({ prs = [], status = ' M scripts/a.js\n', committed = '', fail, reportChanges = true, acquire, codexOutput, prOutput, verifyOutput, failWrite, failRecord, gitStates = [{}], lsFiles = [''], afterVerify = {} } = {}) {
   const calls = [], writes = [], records = [];
-  let tick = 0, snapshots = 0, lsCalls = 0;
+  let tick = 0, snapshots = 0, lsCalls = 0, revParses = 0, verified = false;
   const exec = (cmd, args, opts) => {
     calls.push({ cmd, args, opts });
     if (fail?.(cmd, args)) throw Object.assign(new Error('command failed'), {
@@ -157,12 +158,13 @@ function harness({ prs = [], status = ' M scripts/a.js\n', committed = '', fail,
     if (cmd === 'gh') return JSON.stringify(prs);
     if (args.includes('acquire')) return acquire ?? 'acquiring\n' + JSON.stringify({ path: '/fake/lane', lane: 54, holder: 'session' });
     if (args[0] === 'scripts/codex-direct-task.mjs') return codexOutput ?? JSON.stringify({ events: { threadId: 'thread', usage: { input_tokens: 12, output_tokens: 9 } }, quotaUsedPercent: 3, gate: { pass: false }, diff: { hasChanges: reportChanges } });
-    if (args.includes('rev-parse')) return `${BASE_SHA}\n`;
+    // The first rev-parse pins the pre-Codex base; later ones read the post-commit HEAD (which verify may move).
+    if (args.includes('rev-parse')) return `${revParses++ === 0 ? BASE_SHA : (verified ? afterVerify.head : undefined) ?? COMMIT_SHA}\n`;
     if (args.includes('ls-files')) return lsFiles[Math.min(lsCalls++, lsFiles.length - 1)];
-    if (args.includes('status')) return status;
-    if (args.includes('--name-only')) return committed;
+    if (args.includes('status')) return (verified ? afterVerify.status : undefined) ?? status;
+    if (args.includes('--name-only')) return (verified ? afterVerify.committed : undefined) ?? committed;
     if (args.includes('--stat')) return '1 file changed';
-    if (args.includes('verify')) return verifyOutput ?? JSON.stringify({ verdict: { ok: true, passed: 1, failed: 0 } }, null, 2);
+    if (args.includes('verify')) { verified = true; return verifyOutput ?? JSON.stringify({ verdict: { ok: true, passed: 1, failed: 0 } }, null, 2); }
     if (args.includes('open-pr')) return prOutput ?? 'opened\n{"url":"https://github.com/example/repo/pull/42"}';
     return '';
   };
@@ -255,7 +257,9 @@ describe('worker orchestration', () => {
     const gitCalls = h.calls.filter(({ cmd }) => cmd === 'git');
     expect(gitCalls.length).toBeGreaterThanOrEqual(5);
     for (const { args } of gitCalls) expect(args.slice(0, 2 + GIT_HARDENING.length)).toEqual(['-C', '/fake/lane', ...GIT_HARDENING]);
-    expect(GIT_HARDENING).toEqual(expect.arrayContaining(['core.hooksPath=/dev/null', 'core.fsmonitor=false', 'core.sshCommand=', 'commit.gpgSign=false']));
+    expect(GIT_HARDENING).toEqual(expect.arrayContaining(['core.hooksPath=/dev/null', 'core.fsmonitor=false', 'commit.gpgSign=false']));
+    // An empty core.sshCommand makes git run the empty command ("cannot run : No such file"), breaking every SSH push/fetch.
+    expect(GIT_HARDENING.filter((arg) => arg.startsWith('core.sshCommand'))).toEqual([]);
     expect(gitCalls.find(({ args }) => args.includes('commit')).args).toContain('--no-verify');
   });
 
@@ -344,6 +348,32 @@ describe('worker orchestration', () => {
     expect(h.calls.some(({ args }) => args.includes('verify'))).toBe(true);
     expect(h.calls.some(({ args }) => args.includes('--stat') || args.includes('open-pr'))).toBe(false);
     expect(h.calls.some(({ args }) => args.includes('release'))).toBe(false);
+  });
+
+  // Review finding: verify runs Codex-written tests unsandboxed; a test can commit/amend an out-of-scope file
+  // or move HEAD, and the .git-only re-check never sees it while open-pr publishes HEAD.
+  it('refuses to open the PR when verify committed an out-of-scope path', () => {
+    const h = harness({ afterVerify: { committed: 'scripts/a.js\n.github/workflows/ci.yml\n', head: 'd'.repeat(40) } });
+    const result = h.run();
+    expect(result.outcome).toBe('failed:open-pr');
+    expect(result.steps.find((step) => step.name === 'open-pr').detail).toContain('.github/workflows/ci.yml');
+    expect(h.calls.some(({ args }) => args.includes('open-pr'))).toBe(false);
+  });
+
+  it('refuses to open the PR when verify left an out-of-scope path in the working tree', () => {
+    const h = harness({ afterVerify: { status: ' M scripts/a.js\n M package.json\n' } });
+    const result = h.run();
+    expect(result.outcome).toBe('failed:open-pr');
+    expect(result.steps.find((step) => step.name === 'open-pr').detail).toContain('package.json');
+    expect(h.calls.some(({ args }) => args.includes('open-pr'))).toBe(false);
+  });
+
+  it('refuses to open the PR when verify moved HEAD, even to a still in-scope commit', () => {
+    const h = harness({ afterVerify: { head: 'e'.repeat(40) } });
+    const result = h.run();
+    expect(result.outcome).toBe('failed:open-pr');
+    expect(result.steps.find((step) => step.name === 'open-pr').detail).toMatch(/HEAD moved/);
+    expect(h.calls.some(({ args }) => args.includes('open-pr'))).toBe(false);
   });
 
   it('feeds the scope guard a rename-free diff against the pre-Codex HEAD, not origin/main', () => {
@@ -581,6 +611,30 @@ describe('scope guard against a real git repo', () => {
       pinned('add', 'a.txt');
       pinned('commit', '-q', '-m', 'pinned by env only (no -c, no --no-verify)');
       expect({ hook: existsSync(marker('hook-ran')), fsmonitor: existsSync(marker('fsmonitor-ran')) }).toEqual({ hook: false, fsmonitor: false });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Review finding (real git, real transport path): the pins ride into every child, including open-pr's push.
+  // A stub `ssh` on PATH stands in for the network; the pins must leave git able to launch it.
+  it('GIT_CONFIG_* env pins still let git launch the SSH transport (no GIT_SSH_COMMAND set)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-worker-ssh-'));
+    try {
+      const bin = join(dir, 'bin');
+      const marker = join(dir, 'ssh-ran');
+      mkdirSync(bin);
+      writeFileSync(join(bin, 'ssh'), `#!/bin/sh\ntouch "${marker}"\nexit 1\n`, { mode: 0o755 });
+      const { GIT_SSH_COMMAND, GIT_SSH, ...base } = gitEnv;
+      const env = { ...base, ...GIT_HARDENING_ENV, PATH: `${bin}:${process.env.PATH}`, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+      let stderr = '';
+      try {
+        execFileSync('git', ['ls-remote', 'git@example.invalid:o/r.git'], { encoding: 'utf8', env, stdio: 'pipe', timeout: 30_000 });
+      } catch (error) {
+        stderr = String(error.stderr);
+      }
+      expect(stderr).not.toMatch(/cannot run/);
+      expect(existsSync(marker)).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

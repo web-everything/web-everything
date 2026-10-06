@@ -38,10 +38,12 @@ const MAX_BUFFER = 64 * 1024 * 1024;
 export const OPEN_PR_LIMIT = 1000;
 // Codex can write the lane's .git/config and .git/hooks, which git status/add/commit would then execute
 // outside Codex's sandbox. Every wrapper git call pins these over any repo-local value. Pins cannot cover a
-// clean/smudge filter driver: snapshotGitState below refuses those instead.
+// clean/smudge filter driver: snapshotGitState below refuses those instead. core.sshCommand is deliberately NOT
+// pinned: an empty value makes git run the empty command ("cannot run : No such file"), breaking every SSH
+// push/fetch (open-pr, lane-pool). A planted repo-local value lives in .git/config, which the snapshot refuses.
 // The same pins ride into every child process as GIT_CONFIG_COUNT/KEY_n/VALUE_n, which git ranks above repo
 // config, so the shared tools' own raw git calls (codex-direct-task, run.mjs, lane-pool) inherit them too.
-export const GIT_HARDENING = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.sshCommand=', '-c', 'commit.gpgSign=false', '-c', 'core.attributesFile=/dev/null'];
+export const GIT_HARDENING = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'commit.gpgSign=false', '-c', 'core.attributesFile=/dev/null'];
 const GIT_PINS = GIT_HARDENING.filter((_, i) => i % 2 === 1).map((pin) => [pin.slice(0, pin.indexOf('=')), pin.slice(pin.indexOf('=') + 1)]);
 export const GIT_HARDENING_ENV = Object.fromEntries([
   ['GIT_CONFIG_COUNT', String(GIT_PINS.length)],
@@ -311,7 +313,7 @@ export function runCodexWorker(opts, {
   const branch = planBranch(cardId, title);
   const prTitle = cardId != null ? `${title} (#${cardId})` : title;
   let lane = null, changed = [], dirty = [], baseSha = null, codex = {}, pr = null, record = null, gitState = null, gitlinks = null;
-  let tampered = false;
+  let tampered = false, publishSha = null;
   let outcome = 'pr-opened';
   const command = (cmd, args, options = {}) => exec(cmd, args, {
     cwd: repoRoot, encoding: 'utf8', timeout: 5 * 60_000, maxBuffer: MAX_BUFFER,
@@ -416,11 +418,15 @@ export function runCodexWorker(opts, {
       // Lanes stay on a detached HEAD (no local branches in pool checkouts); open-pr publishes HEAD to `branch`.
       // Codex may have committed its own work despite rule 4: nothing is left to stage, and `git commit`
       // would fail "nothing to commit". The guard already vetted those commits, so publish them as they are.
-      if (!dirty.length) return `Work already committed by Codex; nothing to stage (${branch})`;
-      // Stage only the dirty paths: a path deleted in a Codex commit no longer matches a pathspec.
-      git('--literal-pathspecs', 'add', '--', ...dirty);
-      git('commit', '--no-verify', '-m', `${prTitle}\n\ncodex-direct pilot: coded by Codex, wrapped by scripts/operations/codex-worker.mjs.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`);
-      return branch;
+      if (dirty.length) {
+        // Stage only the dirty paths: a path deleted in a Codex commit no longer matches a pathspec.
+        git('--literal-pathspecs', 'add', '--', ...dirty);
+        git('commit', '--no-verify', '-m', `${prTitle}\n\ncodex-direct pilot: coded by Codex, wrapped by scripts/operations/codex-worker.mjs.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`);
+      }
+      // The vetted commit open-pr must still be publishing: verify runs Codex-written tests unsandboxed.
+      publishSha = String(git('rev-parse', '--verify', 'HEAD^{commit}')).trim();
+      if (!/^[0-9a-f]{40}$/.test(publishSha)) throw new Error('Could not resolve the vetted HEAD after commit');
+      return dirty.length ? branch : `Work already committed by Codex; nothing to stage (${branch})`;
     })) return;
     if (!step('verify', () => {
       // `run.mjs verify` exits 0 even on a RED verdict (live-proven on this wrapper's own PR), so the verdict is read, never the exit code.
@@ -432,7 +438,14 @@ export function runCodexWorker(opts, {
     step('open-pr', () => {
       // verify ran Codex-written tests in the lane, which could have planted a hook/filter since the scope guard.
       assertGitIntact();
-      const diffStat = String(git('diff', '--stat', '--no-renames', '--no-ext-diff', baseSha, 'HEAD')).trim();
+      // Re-run the scope guard: a test run by verify may have committed/amended an out-of-scope path or moved HEAD,
+      // and open-pr publishes HEAD. Same collect+check as the pre-commit guard, plus the pinned commit.
+      const after = collectScopeChanges(git, baseSha);
+      const guard = checkAllowedDiff([...after.dirty, ...after.committed], allowed);
+      if (!guard.ok) throw new Error(`Outside allowed scope after verify: ${guard.outside.join(', ')}`);
+      const head = String(git('rev-parse', '--verify', 'HEAD^{commit}')).trim();
+      if (head !== publishSha) throw new Error(`HEAD moved during verify: ${publishSha} -> ${head}`);
+      const diffStat =String(git('diff', '--stat', '--no-renames', '--no-ext-diff', baseSha, 'HEAD')).trim();
       const bodyFile = join(lane.path, '.git/codex-worker-pr-body.md');
       writeFile(bodyFile, composePrBody({ cardId, title, doneWhen, allowed, diffStat, codex, steps }), 'utf8');
       const output = String(command('node', ['scripts/operations/run.mjs', 'open-pr', `--ref=${branch}`, `--title=${prTitle}`, `--bodyFile=${bodyFile}`, '--json'], { cwd: lane.path, timeout: 40 * 60_000 }));
