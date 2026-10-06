@@ -840,9 +840,9 @@ describe('WE_VERIFY_TEST_TIMEOUT_FACTOR (local-only scaled vitest timeouts)', ()
 
 describe('#verify-standards-auto', () => {
   it.each([undefined, '', 'unknown', 'always', 'auto', 'ci-only'])('normalizes policy %s', value => {
-    expect(verifyStandardsPolicy({ WE_VERIFY_STANDARDS: value })).toBe(['auto', 'ci-only'].includes(value) ? value : 'always');
+    expect(verifyStandardsPolicy({ WE_VERIFY_STANDARDS: value })).toBe(['always', 'auto', 'ci-only'].includes(value) ? value : 'auto');
   });
-  it('defaults without an environment', () => expect(verifyStandardsPolicy()).toBe('always'));
+  it('defaults without an environment', () => expect(verifyStandardsPolicy()).toBe('auto'));
   it('freezes the relevant prefixes', () => {
     expect(Object.isFrozen(STANDARDS_AUTO_PREFIXES)).toBe(true);
     expect(STANDARDS_AUTO_PREFIXES).toEqual(['backlog/', 'docs/', 'config/', 'agent-memory-src/', 'skills-src/', '.claude/', '.github/', 'src/', 'blocks/', 'research/', 'site/']);

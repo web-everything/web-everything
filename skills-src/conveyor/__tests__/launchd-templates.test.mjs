@@ -30,7 +30,7 @@ describe('launchd templates', () => {
     expect(template).not.toContain('WE_VERIFY_RELATED');
     expect(template).not.toContain('WE_VERIFY_TEST_TIMEOUT_FACTOR');
     expect(template).toContain('scripts/verify-settings.json');
-    expect(env).toMatch(/<key>WE_VERIFY_STANDARDS<\/key>\s*<string>auto<\/string>/);
+    expect(env).not.toContain('WE_VERIFY_STANDARDS');
     const settings = JSON.parse(readFileSync(join(root, '../../scripts/verify-settings.json'), 'utf8'));
     const keys = { relatedMode: 'WE_VERIFY_RELATED', testTimeoutFactor: 'WE_VERIFY_TEST_TIMEOUT_FACTOR',
       standards: 'WE_VERIFY_STANDARDS', phaseAdmission: 'WE_VERIFY_PHASE_ADMISSION', fastTargets: 'WE_VERIFY_FAST_TARGETS' };

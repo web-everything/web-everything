@@ -24,8 +24,18 @@ describe('verify settings', () => {
   it('resolves the running module settings path and applies the shipped file with an empty env', () => {
     expect(defaultVerifySettingsPath()).toBe(resolve(dirname(fileURLToPath(import.meta.url)), '../../verify-settings.json'));
     expect(resolveVerifySettings({ fileConfig: loadVerifySettingsFile(defaultVerifySettingsPath()), env: {} }))
-      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only' }, sources: allSources('file') });
+      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only', standards: 'auto' }, sources: allSources('file') });
     expect(verifyRelatedMode({})).toBe('import-only');
+  });
+
+  it('defaults the shipped standards policy to auto with no env, and env always still forces it', () => {
+    const fileConfig = loadVerifySettingsFile(defaultVerifySettingsPath());
+    expect(resolveVerifySettings({ fileConfig, env: {} }).values.standards).toBe('auto');
+    expect(verifyStandardsPolicy({})).toBe('auto');
+    const forced = resolveVerifySettings({ fileConfig, env: { WE_VERIFY_STANDARDS: 'always' } });
+    expect(forced.values.standards).toBe('always');
+    expect(forced.sources.standards).toBe('env');
+    expect(verifyStandardsPolicy({ WE_VERIFY_STANDARDS: 'always' })).toBe('always');
   });
 
   it('lets valid environment values override every key independently', () => {
