@@ -2,10 +2,11 @@
 bornAs: x68ifx8
 kind: story
 size: 2
-status: active
+status: resolved
 scope: ["we:scripts/conveyor/health-responder-state.mjs", "we:scripts/conveyor/__tests__/health-responder-state.test.mjs"]
 dateOpened: "2026-10-02"
 dateStarted: "2026-10-06"
+dateResolved: "2026-10-06"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "4cd29d605b95337785a59fb5463807f3317f8cda"
 scopeRationale: "we:scripts/conveyor/health-responder.mjs is named only as the existing shadowTick entry point the regression test imports; it needs no source edit, so it stays out of scope."
