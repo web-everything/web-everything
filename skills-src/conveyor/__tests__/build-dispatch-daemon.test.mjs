@@ -3,6 +3,7 @@ import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,7 +31,7 @@ vi.mock('../../../scripts/operations/detached-dispatch.mjs', async (importOrigin
 
 import {
   prepareRouteFallback, cliDispatch, runBuildDispatchTick, settleBookkeeping, readKillSwitch, readDispatchOutcome, KILL_SWITCH_ENV,
-  cliReadPrepareStatus, cliPredictRoute, cliListSettledBuilds, cliListRunStoreInFlight, cliListHolds, policyFrom,
+  createPrepareStatusReader, cliReadPrepareStatus, cliPredictRoute, cliListSettledBuilds, cliListRunStoreInFlight, cliListHolds, policyFrom,
   // #4348-open-pr-retry
   primaryInfraStoreEnv, cliRetryInfraBlocked,
   // #4464 builder-cap-machine-wide
@@ -51,6 +52,154 @@ import {
 import { BUILD_DISPATCH_POLICY } from '../../../scripts/conveyor/build-dispatch-policy.mjs';
 import { createFileRunStore, newRunRecord } from '../../../scripts/operations/run-store.mjs';
 import { DISPATCH_EFFECT } from '../../../scripts/operations/dispatch-lane.mjs';
+
+// Real git blob IDs keep the module memo faithful across independent fixture readers.
+function prepareGitFixture(cards, prs = []) {
+  const blobs = new Map();
+  const tree = Object.entries(cards).map(([num, text]) => {
+    const bytes = Buffer.from(text);
+    const sha = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+    blobs.set(sha, bytes);
+    return `100644 blob ${sha}\tbacklog/${num}-card.md`;
+  }).join('\n') + '\n';
+  return vi.fn((cmd, args, opts) => {
+    if (cmd === 'git' && args[0] === 'fetch') return '';
+    if (cmd === 'git' && args[0] === 'ls-tree') {
+      expect(args).toEqual(['ls-tree', '-r', 'origin/main', '--', 'backlog/']);
+      return tree;
+    }
+    if (cmd === 'git' && args[0] === 'cat-file') {
+      expect(args).toEqual(['cat-file', '--batch']);
+      expect(opts.stdio[0]).toBe('pipe');
+      return Buffer.concat(opts.input.trim().split('\n').flatMap(sha => {
+        const bytes = blobs.get(sha);
+        return [Buffer.from(`${sha} blob ${bytes.length}\n`), bytes, Buffer.from('\n')];
+      }));
+    }
+    if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify(prs);
+    throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+  });
+}
+
+describe('prepare status batched', () => {
+  it.each([false, true])('batches 50 tracked prepares (unstamped=%s)', unstamped => {
+    const items = Array.from({ length: 50 }, (_, i) => ({ num: String(6000 + i), claimedAt: '2026-09-28T12:00:00Z' }));
+    const cards = Object.fromEntries(items.map(({ num }) => [num,
+      `---\n${unstamped ? 'status: open' : 'preparedDate: 2026-09-29'}\n---\nMultibyte café 🌍 ${num} ${unstamped}\n`]));
+    const prs = items.map(({ num }) => ({ number: Number(num), state: 'MERGED', headRefName: `lane/${num}-prepare-new`, createdAt: '2026-09-29', isCrossRepository: false }));
+    const exec = prepareGitFixture(cards, prs);
+    const reader = createPrepareStatusReader({ exec });
+    reader.prime(items);
+    for (const item of items) {
+      const status = reader.read(item);
+      if (unstamped) expect(status.pr.state).toBe('MERGED');
+      else expect(status.preparedDate).toBe('2026-09-29');
+    }
+    const calls = exec.mock.calls;
+    expect(calls.filter(([, args]) => args.some(a => a.includes('contents/')))).toHaveLength(0);
+    for (const verb of ['fetch', 'ls-tree', 'cat-file']) expect(calls.filter(([cmd, args]) => cmd === 'git' && args[0] === verb)).toHaveLength(1);
+    const listings = calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr');
+    expect(listings).toHaveLength(unstamped ? 1 : 0);
+    if (unstamped) expect(listings[0][1]).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'all', '--search', 'head:lane/ created:>=2026-09-28', '--json', 'number,state,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', '500']);
+    const second = createPrepareStatusReader({ exec });
+    second.prime(items);
+    second.read(items[0]);
+    expect(exec.mock.calls.filter(([, args]) => args[0] === 'cat-file')).toHaveLength(1);
+  });
+  it('omits the date filter when any primed claim date is missing and reads unprimed cards lazily', () => {
+    const exec = prepareGitFixture({ 7100: '---\nstatus: open\n---\nmissing date', 7101: '---\npreparedDate: 2026-09-29\n---\nlazy' });
+    const reader = createPrepareStatusReader({ exec });
+    reader.prime([{ num: 7100, claimedAt: '2026-09-28' }, { num: 9999 }]);
+    expect(reader.read({ num: 7100 }).pr).toBeNull();
+    expect(reader.read({ num: 7101 }).preparedDate).toBe('2026-09-29');
+    const args = exec.mock.calls.find(([cmd]) => cmd === 'gh')[1];
+    expect(args[args.indexOf('--search') + 1]).toBe('head:lane/');
+    expect(args[args.indexOf('--limit') + 1]).toBe('1000');
+    expect(exec.mock.calls.filter(([, args]) => args[0] === 'cat-file')).toHaveLength(2);
+    expect(() => reader.read({ num: 9999 })).toThrow('prepare card #9999 not found on origin/main');
+  });
+  it.each(['fetch', 'ls-tree', 'cat-file', 'pr'])('throws on failed %s observations', verb => {
+    const git = prepareGitFixture({ 7200: `---\nstatus: open\n---\nfailure ${verb}` });
+    const exec = vi.fn((cmd, args, opts) => {
+      if (args[0] === verb) throw new Error(`${verb} unavailable`);
+      return git(cmd, args, opts);
+    });
+    const reader = createPrepareStatusReader({ exec });
+    expect(() => reader.read({ num: 7200 })).toThrow(`${verb} unavailable`);
+  });
+  it('caches successful open-PR status by head SHA and refuses unavailable new heads', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'prepare-head-cache-'));
+    vi.stubEnv('WE_PR_SNAPSHOT_DIR', dir);
+    vi.stubEnv('WE_PR_SNAPSHOT', '1');
+    const pr = { number: 7400, state: 'OPEN', headRefName: 'lane/7400-prepare-new', headRefOid: 'a'.repeat(40), createdAt: '2026-09-29', isCrossRepository: false };
+    const git = prepareGitFixture({ 7400: '---\nstatus: open\n---\nhead cache' }, [pr]);
+    const exec = vi.fn((cmd, args, opts) => {
+      if (cmd === 'gh' && args[0] === 'api') {
+        if (!args[1].endsWith(pr.headRefOid) || pr.headRefOid !== 'a'.repeat(40)) throw new Error('head unavailable');
+        return JSON.stringify({ encoding: 'base64', content: Buffer.from('---\npreparedDate: 2026-09-29\n---').toString('base64') });
+      }
+      return git(cmd, args, opts);
+    });
+    try {
+      for (let i = 0; i < 2; i++) expect(createPrepareStatusReader({ exec }).read({ num: 7400 }).pr.preparedDate).toBe('2026-09-29');
+      expect(exec.mock.calls.filter(([, args]) => args[0] === 'api')).toHaveLength(1);
+      pr.headRefOid = 'b'.repeat(40);
+      expect(() => createPrepareStatusReader({ exec }).read({ num: 7400 })).toThrow('head unavailable');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  describe('shared listing completeness', () => {
+    const prFor = (num, createdAt = '2026-10-02') => ({ number: Number(num), state: 'CLOSED', headRefName: `lane/${num}-prepare-x`, createdAt, isCrossRepository: false });
+    const filler = n => Array.from({ length: n }, (_, i) => ({ number: 90000 + i, state: 'MERGED', headRefName: `lane/${80000 + i}-build`, createdAt: '2026-10-05', isCrossRepository: false }));
+    /** gh answers per `--search`: the shared `head:lane/` listing vs a per-item `head:lane/<n>-prepare-` one. */
+    function searchExec(cards, answer) {
+      const git = prepareGitFixture(cards);
+      return vi.fn((cmd, args, opts) => {
+        if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify(answer(args[args.indexOf('--search') + 1], Number(args[args.indexOf('--limit') + 1])));
+        return git(cmd, args, opts);
+      });
+    }
+    it('rejects saturated shared PR listings instead of reporting absent PRs', () => {
+      const exec = searchExec({ 7500: '---\nstatus: open\n---\nsaturated' }, (search, limit) =>
+        search.includes('-prepare-') ? [prFor(7500)] : filler(limit));
+      const reader = createPrepareStatusReader({ exec });
+      reader.prime([{ num: 7500, claimedAt: '2026-10-01T00:00:00Z' }]);
+      expect(reader.read({ num: 7500, claimedAt: '2026-10-01T00:00:00Z' }).pr.state).toBe('CLOSED');
+    });
+    it('throws when even the per-item fallback listing is saturated', () => {
+      const exec = searchExec({ 7501: '---\nstatus: open\n---\nsaturated item' }, (search, limit) => filler(limit));
+      const reader = createPrepareStatusReader({ exec });
+      expect(() => reader.read({ num: 7501 })).toThrow('saturated');
+    });
+    it('does not trust the dated shared listing for a read claimed before its date floor', () => {
+      const exec = searchExec({ 7502: '---\nstatus: open\n---\nprimed', 7503: '---\nstatus: open\n---\nearlier' }, search =>
+        search.includes('7503-prepare-') ? [prFor(7503, '2026-10-02')] : [prFor(7502, '2026-10-04T01:00:00Z')]);
+      const reader = createPrepareStatusReader({ exec });
+      reader.prime([{ num: 7502, claimedAt: '2026-10-04T00:00:00Z' }]);
+      expect(reader.read({ num: 7502, claimedAt: '2026-10-04T00:00:00Z' }).pr.state).toBe('CLOSED');
+      expect(reader.read({ num: 7503, claimedAt: '2026-10-01T00:00:00Z' }).pr.state).toBe('CLOSED');
+      expect(reader.read({ num: 7503 }).pr.state).toBe('CLOSED');
+    });
+    it('gives every git/gh read an explicit large maxBuffer', () => {
+      const exec = searchExec({ 7504: '---\nstatus: open\n---\nbuffer' }, () => []);
+      const reader = createPrepareStatusReader({ exec });
+      reader.prime([{ num: 7504, claimedAt: '2026-10-01' }]);
+      reader.read({ num: 7504, claimedAt: '2026-10-01' });
+      expect(exec.mock.calls.length).toBeGreaterThan(3);
+      for (const [, , opts] of exec.mock.calls) expect(opts.maxBuffer).toBeGreaterThanOrEqual(16 * 1024 * 1024);
+    });
+  });
+  it('rejects truncated byte framing', () => {
+    const git = prepareGitFixture({ 7300: '---\nstatus: open\n---\ntruncated' });
+    const reader = createPrepareStatusReader({ exec: (cmd, args, opts) => {
+      const output = git(cmd, args, opts);
+      return args[0] === 'cat-file' ? output.subarray(0, output.length - 2) : output;
+    } });
+    expect(() => reader.read({ num: 7300 })).toThrow('unavailable or malformed');
+  });
+});
 
 // xbrndtm — `fixedCadence: true` in `live()` is the one-line opt-in that turns the builder's loop from
 // sleep-after-work (180s tick + 120s sleep = a 300s start interval) into a fixed start-to-start cadence. The loop
@@ -1663,9 +1812,37 @@ describe('automatic item preparation', () => {
     expect(tick.prepare.retired).toEqual([]);
     expect(tick.prepare.inFlight).toContain('4501');
   });
+  describe('prepare status batched claim handling', () => {
+    it('never retires a claim for a fork PR in the shared listing', async () => {
+      const effects = fixture();
+      claimed(effects, '4501', { alive: true });
+      const exec = prepareGitFixture({ 4501: '---\nstatus: open\n---\nfork batch' }, [
+        { state: 'CLOSED', headRefName: 'lane/4501-prepare-fork', createdAt: '2099-01-01', isCrossRepository: true },
+      ]);
+      const reader = createPrepareStatusReader({ exec });
+      effects.primePrepareStatus = vi.fn(({ nums, claims }) => reader.prime(nums.map(num => ({ num, claimedAt: claims.find(c => c.meta.num === num)?.meta.claimedAt }))));
+      effects.readPrepareStatus = args => reader.read(args);
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.prepare.retired).toEqual([]);
+      expect(effects.listPrepareClaims().map(c => c.meta.num)).toContain('4501');
+      expect(effects.placePrepareHold).not.toHaveBeenCalled();
+      expect(effects.primePrepareStatus).toHaveBeenCalledTimes(1);
+      expect(exec.mock.calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'pr')).toHaveLength(1);
+    });
+    it('falls back to individual reads after a failed prime', async () => {
+      const effects = fixture();
+      claimed(effects);
+      effects.primePrepareStatus = () => { throw new Error('batch unavailable'); };
+      effects.readPrepareStatus = vi.fn(() => ({ preparedDate: '2026-09-29' }));
+      await runBuildDispatchTick({ live: true, effects });
+      expect(effects.readPrepareStatus).toHaveBeenCalled();
+      expect(effects.listPrepareClaims().map(c => c.meta.num)).not.toContain('4501');
+    });
+  });
   it('ignores fork PRs when reading prepare status', () => {
-    const exec = vi.fn((cmd, args) => {
-      if (cmd === 'git') return 'backlog/4501-card.md\n';
+    const git = prepareGitFixture({ 4501: '---\nstatus: open\n---' });
+    const exec = vi.fn((cmd, args, opts) => {
+      if (cmd === 'git') return git(cmd, args, opts);
       if (args[0] === 'pr') {
         expect(args.join(' ')).toContain('isCrossRepository');
         return JSON.stringify([{ state: 'CLOSED', headRefName: 'lane/4501-prepare-x', createdAt: '2026-09-29', isCrossRepository: true }]);
@@ -1675,13 +1852,15 @@ describe('automatic item preparation', () => {
     expect(cliReadPrepareStatus({ num: '4501', claimedAt: '2026-09-28' }, { exec }).pr).toBeNull();
   });
   it('reads the stamp from remote main and an open PR head, ignoring older PRs', () => {
-    const exec = vi.fn((cmd, args) => {
-      if (cmd === 'git') return 'backlog/4501-card.md\n';
+    const git = prepareGitFixture({ 4501: '---\nstatus: open\n---' });
+    const exec = vi.fn((cmd, args, opts) => {
+      if (cmd === 'git') return git(cmd, args, opts);
       if (args[0] === 'pr') return JSON.stringify([
         { state: 'MERGED', headRefName: 'lane/4501-prepare-old', createdAt: '2026-01-01' },
         { state: 'OPEN', headRefName: 'lane/4501-prepare-new', headRefOid: 'abcd', createdAt: '2026-09-29' },
       ]);
-      return JSON.stringify({ content: Buffer.from(args[1].endsWith('ref=main') ? '---\nstatus: open\n---' : '---\npreparedDate: 2026-09-29\n---').toString('base64') });
+      expect(args[1]).toContain('contents/backlog/4501-card.md?ref=abcd');
+      return JSON.stringify({ content: Buffer.from('---\npreparedDate: 2026-09-29\n---').toString('base64') });
     });
     const status = cliReadPrepareStatus({ num: '4501', claimedAt: '2026-09-28' }, { exec });
     expect(status.preparedDate).toBeNull();

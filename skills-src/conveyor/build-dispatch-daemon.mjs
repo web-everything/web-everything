@@ -32,6 +32,7 @@
  */
 
 import { PLANNING_SNAPSHOT_ENV } from '../../scripts/lib/planning-snapshot.mjs';
+import { readShaCache, writeShaCache } from '../../scripts/lib/pr-snapshot.mjs';
 import { createPhaseTimer } from '../../scripts/lib/phase-timer.mjs';
 import { resolveOperationRoute, routingPolicyEnv } from '../../scripts/lib/dispatch-routing-policy-io.mjs';
 import { childFailure } from '../../scripts/lib/child-failure.mjs';
@@ -275,6 +276,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     ...prepareClaims.map(c => normNum(c.meta.num)),
     ...(bookkeeping.prepareGuards ?? []).filter(g => g.kind === 'prepare-item').map(g => normNum(g.num)),
     ...holds.filter(isPrepareHold).map(h => normNum(h.num))]);
+  try { await effects.primePrepareStatus?.({ nums: [...trackedPrepares], claims: prepareClaims }); }
+  catch { /* Individual reads retain their own failure handling and can load lazily. */ }
   for (const num of trackedPrepares) {
     if (prepareRows.some(r => normNum(r.num) === num && prepareIsLive(r))) continue;
     try {
@@ -1056,27 +1059,131 @@ export async function cliPredictRoute(num, scope, { root = REPO_ROOT, env = proc
   }
 }
 
-/** Read the card on remote main, not this daemon lane's possibly stale working tree. Errors propagate:
- * an unavailable main/PR observation must never be mistaken for a missing stamp. */
-export function cliReadPrepareStatus({ num, claimedAt }, { exec = execFileSync } = {}) {
-  const opts = { cwd: REPO_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000 };
-  const paths = exec('git', ['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], opts).trim().split('\n');
-  const path = paths.find((p) => p.startsWith(`backlog/${normNum(num)}-`) && p.endsWith('.md'));
-  if (!path) throw new Error(`prepare card #${num} not found on origin/main`);
-  const readCard = (ref) => {
-    const file = JSON.parse(exec('gh', ['api', `repos/${CONSTELLATION_REPOS.we.slug}/contents/${path}?ref=${encodeURIComponent(ref)}`], opts));
-    if (file.encoding !== undefined && file.encoding !== 'base64') throw new Error('unreadable prepare card encoding');
-    if (typeof file.content !== 'string') throw new Error('prepare card content unavailable');
-    return prepareCardStatus(Buffer.from(file.content, 'base64').toString('utf8'));
+// Content-addressed statuses remain valid across ticks, even when origin/main advances.
+const prepareBlobStatuses = new Map();
+
+/** Tick-scoped main snapshot and prepare PR discovery. Unavailable observations always throw. */
+export function createPrepareStatusReader({ exec = execFileSync } = {}) {
+  // maxBuffer is explicit: the default 1 MiB overflows on a large backlog tree / card batch (cf. 21ce5ea4b).
+  const opts = { cwd: REPO_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000, maxBuffer: 64 * 1024 * 1024 };
+  const ITEM_PR_LIMIT = 100;
+  let tree, treeError, listing, prError, minClaimedAt;
+  const itemListings = new Map();
+  function loadTree() {
+    if (treeError) throw treeError;
+    if (tree) return tree;
+    try {
+      exec('git', ['fetch', '-q', 'origin', 'main'], opts);
+      const output = exec('git', ['ls-tree', '-r', 'origin/main', '--', 'backlog/'], opts);
+      tree = new Map();
+      for (const line of output.trim().split('\n')) {
+        const match = line.match(/^\d+ blob ([0-9a-f]+)\t(backlog\/(\d+)-.*\.md)$/);
+        if (match && !tree.has(normNum(match[3]))) tree.set(normNum(match[3]), { sha: match[1], path: match[2] });
+      }
+      return tree;
+    } catch (error) { treeError = error; throw error; }
+  }
+  function loadBlobs(cards) {
+    const shas = [...new Set(cards.map(c => c.sha))].filter(sha => !prepareBlobStatuses.has(sha));
+    if (!shas.length) return;
+    const output = exec('git', ['cat-file', '--batch'], { ...opts, encoding: null,
+      stdio: ['pipe', 'pipe', 'pipe'], input: shas.join('\n') + '\n' });
+    const bytes = Buffer.from(output);
+    const statuses = [];
+    let offset = 0;
+    for (const sha of shas) {
+      const end = bytes.indexOf(10, offset);
+      const header = end < 0 ? null : bytes.subarray(offset, end).toString('ascii').match(/^([0-9a-f]+) blob (\d+)$/);
+      const size = header ? Number(header[2]) : NaN;
+      const start = end + 1;
+      if (!header || header[1] !== sha || !Number.isSafeInteger(size) || start + size >= bytes.length || bytes[start + size] !== 10) {
+        throw new Error(`prepare card blob ${sha} unavailable or malformed`);
+      }
+      statuses.push([sha, prepareCardStatus(bytes.subarray(start, start + size).toString('utf8'))]);
+      offset = start + size + 1;
+    }
+    if (offset !== bytes.length) throw new Error('unexpected prepare card batch output');
+    for (const [sha, status] of statuses) prepareBlobStatuses.set(sha, status);
+  }
+  function ghPrList(search, limit) {
+    const list = JSON.parse(exec('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
+      '--search', search, '--json', 'number,state,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', String(limit)], opts));
+    if (!Array.isArray(list)) throw new Error('prepare PR listing unavailable');
+    return list;
+  }
+  /** The shared listing, with the date floor and limit it was actually fetched with. */
+  function listPrs() {
+    if (prError) throw prError;
+    if (listing) return listing;
+    try {
+      const floor = minClaimedAt?.slice(0, 10);
+      const limit = floor ? 500 : 1000;
+      const prs = ghPrList(`head:lane/${floor ? ` created:>=${floor}` : ''}`, limit);
+      return (listing = { prs, floor, complete: prs.length < limit });
+    } catch (error) { prError = error; throw error; }
+  }
+  /** One item's own listing: the fallback when the shared one cannot be trusted. Saturation fails closed. */
+  function itemPrs(num) {
+    const key = normNum(num);
+    if (!itemListings.has(key)) {
+      const prs = ghPrList(`head:lane/${key}-prepare-`, ITEM_PR_LIMIT);
+      if (prs.length >= ITEM_PR_LIMIT) throw new Error(`prepare PR listing for #${key} saturated at ${ITEM_PR_LIMIT}`);
+      itemListings.set(key, prs);
+    }
+    return itemListings.get(key);
+  }
+  /**
+   * The shared listing answers only when it is provably complete for this read: not capped (a truncated listing is
+   * indistinguishable from "no PR"), and dated no later than this read's claim (a read with an earlier or missing
+   * claim date can have its PR outside the date window). Otherwise fall back to the item's own search.
+   */
+  function prsFor(num, claimedAt) {
+    const floor = listing ? listing.floor : minClaimedAt?.slice(0, 10);
+    if (!floor || (claimedAt && claimedAt.slice(0, 10) >= floor)) {
+      const shared = listPrs();
+      if (shared.complete) return shared.prs;
+    }
+    return itemPrs(num);
+  }
+  return {
+    prime(items) {
+      const entries = items.map(item => typeof item === 'object' ? item : { num: item });
+      minClaimedAt = entries.length && entries.every(item => item.claimedAt)
+        ? entries.map(item => item.claimedAt).sort()[0] : undefined;
+      if (entries.length) loadBlobs(entries.map(item => loadTree().get(normNum(item.num))).filter(Boolean));
+    },
+    read({ num, claimedAt }) {
+      const card = loadTree().get(normNum(num));
+      if (!card) throw new Error(`prepare card #${num} not found on origin/main`);
+      loadBlobs([card]);
+      const main = prepareBlobStatuses.get(card.sha);
+      const { path } = card;
+      if (main.preparedDate) return { ...main, path };
+      // Same-repo only: a fork PR with a lookalike branch name must never retire a claim or place a hold.
+      const pr = prsFor(num, claimedAt).filter(p => !p.isCrossRepository && p.headRefName.startsWith(`lane/${normNum(num)}-prepare-`)
+        && (!claimedAt || p.createdAt >= claimedAt)).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+      if (!pr) return { ...main, path, pr: null };
+      let status = { preparedDate: null };
+      if (pr.state === 'OPEN') {
+        if (!pr.headRefOid) throw new Error('prepare PR head unavailable');
+        const key = { kind: 'prepare-card', repo: CONSTELLATION_REPOS.we.slug, num: pr.number, sha: pr.headRefOid };
+        status = readShaCache(key);
+        if (status === undefined) {
+          const file = JSON.parse(exec('gh', ['api', `repos/${CONSTELLATION_REPOS.we.slug}/contents/${path}?ref=${encodeURIComponent(pr.headRefOid)}`], opts));
+          if (file.encoding !== undefined && file.encoding !== 'base64') throw new Error('unreadable prepare card encoding');
+          if (typeof file.content !== 'string') throw new Error('prepare card content unavailable');
+          status = prepareCardStatus(Buffer.from(file.content, 'base64').toString('utf8'));
+          writeShaCache({ ...key, value: status });
+        }
+      }
+      return { ...main, path, pr: { ...pr, ...status } };
+    },
   };
-  const main = readCard('main');
-  if (main.preparedDate) return { ...main, path };
-  const prs = JSON.parse(exec('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
-    '--search', `head:lane/${normNum(num)}-prepare-`, '--json', 'number,state,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', '100'], opts));
-  // Same-repo only: a fork PR with a lookalike branch name must never retire a claim or place a hold.
-  const pr = prs.filter((p) => !p.isCrossRepository && p.headRefName.startsWith(`lane/${normNum(num)}-prepare-`)
-    && (!claimedAt || p.createdAt >= claimedAt)).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-  return { ...main, path, pr: pr ? { ...pr, ...(pr.state === 'OPEN' ? readCard(pr.headRefOid) : { preparedDate: null }) } : null };
+}
+
+/** One-off callers use the same reader with a fresh remote-main snapshot. */
+export function cliReadPrepareStatus(args, { exec = execFileSync } = {}) {
+  return createPrepareStatusReader({ exec }).read(args);
 }
 
 export const STAMP_RECOVERY_LEASE_MINUTES = 6 * 60;
@@ -1288,6 +1395,7 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
 }
 
 function cliEffects() {
+  let prepareReader;
   return {
     completePrepareFailures,
     listPrepareFailures: () => Object.values(readFailureState().failures),
@@ -1302,7 +1410,12 @@ function cliEffects() {
     },
     listPrepareClaims: () => listBuildDispatchClaims({ lockRoot: prepareClaimRoot(), ignoreExpiry: true }),
     listSettledPrepares: () => cliListSettledBuilds({ launchKind: 'prepare-item' }),
-    readPrepareStatus: cliReadPrepareStatus,
+    primePrepareStatus: ({ nums, claims }) => {
+      prepareReader = createPrepareStatusReader();
+      prepareReader.prime(nums.map(num => ({ num,
+        claimedAt: claims.find(c => normNum(c.meta.num) === normNum(num))?.meta?.claimedAt })));
+    },
+    readPrepareStatus: args => (prepareReader ??= createPrepareStatusReader()).read(args),
     readPrepareEvidence: cliPrepareFailureEvidence,
     stampPrepare: cliStampPrepare,
     placePrepareHold: (o) => placeBuildDispatchHold(o),

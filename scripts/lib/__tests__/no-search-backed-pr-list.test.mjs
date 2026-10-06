@@ -37,10 +37,10 @@ const ALLOWLIST = {
   // `resolvePrBouncedViaGh`: `--search 'head:lane/<item>-' --state all`, a branch-PREFIX lookup against the same
   // unbounded PR history (`--head` is exact-match only), called only by the one-off backfill, never a polling loop.
   'scripts/conveyor/run-rating.mjs': ['--search'],
-  // `cliReadPrepareStatus`: `--search 'head:lane/<item>-prepare-' --state all`, the same branch-PREFIX lookup
-  // (`--head` is exact-match only; the prepare slug is unknown), run only when main's card carries no stamp yet AND the
-  // item has prepare-attempt evidence (a claim, in-flight row, current settled row or hold) — at most one search per
-  // tracked item per tick, never one per offered candidate.
+  // `createPrepareStatusReader`: one lazy `--search 'head:lane/ created:>=<earliest claim date>'`
+  // listing per tick, only when a tracked main card is unstamped; local filtering matches each item's
+  // prepare prefix and excludes forks. Missing claim dates omit the date filter (limit 1000 vs 500). A saturated
+  // or too-recently-dated shared listing falls back to a per-item `head:lane/<n>-prepare-` search (fails closed at 100).
   'skills-src/conveyor/build-dispatch-daemon.mjs': ['--search'],
 };
 
