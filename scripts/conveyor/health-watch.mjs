@@ -75,6 +75,7 @@ import { readVerifyMarker } from '../lib/lane-verify.mjs';
 // this probe's notion of "a daemon clone" can never drift from the guards'.
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
 import { workspaceOf } from '../lib/automation-home.mjs';
+import { probeBuildSessions, probeExternalRuns } from './build-supervision.mjs';
 import { collectCredentialInventory, normalizeInventory } from './credential-inventory.mjs';
 import { readGithubAppStatus, defaultCachePath } from '../lib/github-app-auth-env.mjs';
 import { resolvePrLimit, readLimitState, isGlobalOffNow } from '../lib/pr-limit.mjs';
@@ -947,6 +948,13 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // never reads the host's real file, same rule as `appToken` below.
   probes.drainHistory = flags['lock-root'] && !flags['drain-history'] ? null
     : attempt('drainHistory', () => probeDrainHistory({ ...(flags['drain-history'] ? { path: flags['drain-history'] } : {}), nowMs: now }));
+  // Build/prepare supervision — external (Codex) runs live only in the build daemon's dispatch run records; fs-only,
+  // bounded, every tick. A fixture tick (`--lock-root`) never reads the host's real records.
+  if (!flags['lock-root']) {
+    probes.externalRuns = attempt('externalRuns', () => probeExternalRuns({
+      runsDir: process.env.OPERATION_RUNS_DIR || join(workspaceOf(REPO_ROOT), '.operations', 'coordination', 'build-dispatch-runs'),
+      lanesRoot: process.env.LANE_POOL_ROOT || join(workspaceOf(REPO_ROOT), '.lanes'), nowMs: now }));
+  }
   // #4066 `open-prs-over-limit` — fs/env only; pairs with the gh-cadenced `prs` read below.
   probes.prLimit = attempt('prLimit', () => probePrLimit());
 
@@ -983,6 +991,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     // #4068 — same `agents` listing, same gating: what can hold a PR as `live-process` (review jobs + PR-bound
     // sessions) and how long since each last did anything.
     if (agents) probes.liveBindings = attempt('liveBindings', () => probeLiveBindings(agents, { nowMs: now }));
+    // Build/prepare supervision (operator 2026-10-06) — same `agents` listing, bounded transcript tail reads.
+    if (agents && !flags['lock-root']) probes.buildSessions = attempt('buildSessions', () => probeBuildSessions(agents, { nowMs: now, prs: prs || [] }));
     // stale-claim's two probes ride the same 'gh' cadence (both are gh/git-heavy reads); independent of the
     // prs/agents pairing above — one failing never blocks the other.
     const staleState = attempt('staleState', () => probeStaleState());
