@@ -1064,8 +1064,11 @@ const prepareBlobStatuses = new Map();
 
 /** Tick-scoped main snapshot and prepare PR discovery. Unavailable observations always throw. */
 export function createPrepareStatusReader({ exec = execFileSync } = {}) {
-  const opts = { cwd: REPO_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000 };
-  let tree, treeError, prs, prError, minClaimedAt;
+  // maxBuffer is explicit: the default 1 MiB overflows on a large backlog tree / card batch (cf. 21ce5ea4b).
+  const opts = { cwd: REPO_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000, maxBuffer: 64 * 1024 * 1024 };
+  const ITEM_PR_LIMIT = 100;
+  let tree, treeError, listing, prError, minClaimedAt;
+  const itemListings = new Map();
   function loadTree() {
     if (treeError) throw treeError;
     if (tree) return tree;
@@ -1102,16 +1105,45 @@ export function createPrepareStatusReader({ exec = execFileSync } = {}) {
     if (offset !== bytes.length) throw new Error('unexpected prepare card batch output');
     for (const [sha, status] of statuses) prepareBlobStatuses.set(sha, status);
   }
+  function ghPrList(search, limit) {
+    const list = JSON.parse(exec('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
+      '--search', search, '--json', 'number,state,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', String(limit)], opts));
+    if (!Array.isArray(list)) throw new Error('prepare PR listing unavailable');
+    return list;
+  }
+  /** The shared listing, with the date floor and limit it was actually fetched with. */
   function listPrs() {
     if (prError) throw prError;
-    if (prs) return prs;
+    if (listing) return listing;
     try {
-      prs = JSON.parse(exec('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
-        '--search', `head:lane/${minClaimedAt ? ` created:>=${minClaimedAt.slice(0, 10)}` : ''}`,
-        '--json', 'number,state,headRefName,headRefOid,createdAt,isCrossRepository', '--limit', minClaimedAt ? '500' : '1000'], opts));
-      if (!Array.isArray(prs)) throw new Error('prepare PR listing unavailable');
-      return prs;
+      const floor = minClaimedAt?.slice(0, 10);
+      const limit = floor ? 500 : 1000;
+      const prs = ghPrList(`head:lane/${floor ? ` created:>=${floor}` : ''}`, limit);
+      return (listing = { prs, floor, complete: prs.length < limit });
     } catch (error) { prError = error; throw error; }
+  }
+  /** One item's own listing: the fallback when the shared one cannot be trusted. Saturation fails closed. */
+  function itemPrs(num) {
+    const key = normNum(num);
+    if (!itemListings.has(key)) {
+      const prs = ghPrList(`head:lane/${key}-prepare-`, ITEM_PR_LIMIT);
+      if (prs.length >= ITEM_PR_LIMIT) throw new Error(`prepare PR listing for #${key} saturated at ${ITEM_PR_LIMIT}`);
+      itemListings.set(key, prs);
+    }
+    return itemListings.get(key);
+  }
+  /**
+   * The shared listing answers only when it is provably complete for this read: not capped (a truncated listing is
+   * indistinguishable from "no PR"), and dated no later than this read's claim (a read with an earlier or missing
+   * claim date can have its PR outside the date window). Otherwise fall back to the item's own search.
+   */
+  function prsFor(num, claimedAt) {
+    const floor = listing ? listing.floor : minClaimedAt?.slice(0, 10);
+    if (!floor || (claimedAt && claimedAt.slice(0, 10) >= floor)) {
+      const shared = listPrs();
+      if (shared.complete) return shared.prs;
+    }
+    return itemPrs(num);
   }
   return {
     prime(items) {
@@ -1128,7 +1160,7 @@ export function createPrepareStatusReader({ exec = execFileSync } = {}) {
       const { path } = card;
       if (main.preparedDate) return { ...main, path };
       // Same-repo only: a fork PR with a lookalike branch name must never retire a claim or place a hold.
-      const pr = listPrs().filter(p => !p.isCrossRepository && p.headRefName.startsWith(`lane/${normNum(num)}-prepare-`)
+      const pr = prsFor(num, claimedAt).filter(p => !p.isCrossRepository && p.headRefName.startsWith(`lane/${normNum(num)}-prepare-`)
         && (!claimedAt || p.createdAt >= claimedAt)).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
       if (!pr) return { ...main, path, pr: null };
       let status = { preparedDate: null };

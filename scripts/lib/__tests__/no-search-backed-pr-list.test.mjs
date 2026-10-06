@@ -39,7 +39,8 @@ const ALLOWLIST = {
   'scripts/conveyor/run-rating.mjs': ['--search'],
   // `createPrepareStatusReader`: one lazy `--search 'head:lane/ created:>=<earliest claim date>'`
   // listing per tick, only when a tracked main card is unstamped; local filtering matches each item's
-  // prepare prefix and excludes forks. Missing claim dates omit the date filter (limit 1000 vs 500).
+  // prepare prefix and excludes forks. Missing claim dates omit the date filter (limit 1000 vs 500). A saturated
+  // or too-recently-dated shared listing falls back to a per-item `head:lane/<n>-prepare-` search (fails closed at 100).
   'skills-src/conveyor/build-dispatch-daemon.mjs': ['--search'],
 };
 

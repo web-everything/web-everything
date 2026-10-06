@@ -150,6 +150,47 @@ describe('prepare status batched', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+  describe('shared listing completeness', () => {
+    const prFor = (num, createdAt = '2026-10-02') => ({ number: Number(num), state: 'CLOSED', headRefName: `lane/${num}-prepare-x`, createdAt, isCrossRepository: false });
+    const filler = n => Array.from({ length: n }, (_, i) => ({ number: 90000 + i, state: 'MERGED', headRefName: `lane/${80000 + i}-build`, createdAt: '2026-10-05', isCrossRepository: false }));
+    /** gh answers per `--search`: the shared `head:lane/` listing vs a per-item `head:lane/<n>-prepare-` one. */
+    function searchExec(cards, answer) {
+      const git = prepareGitFixture(cards);
+      return vi.fn((cmd, args, opts) => {
+        if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify(answer(args[args.indexOf('--search') + 1], Number(args[args.indexOf('--limit') + 1])));
+        return git(cmd, args, opts);
+      });
+    }
+    it('rejects saturated shared PR listings instead of reporting absent PRs', () => {
+      const exec = searchExec({ 7500: '---\nstatus: open\n---\nsaturated' }, (search, limit) =>
+        search.includes('-prepare-') ? [prFor(7500)] : filler(limit));
+      const reader = createPrepareStatusReader({ exec });
+      reader.prime([{ num: 7500, claimedAt: '2026-10-01T00:00:00Z' }]);
+      expect(reader.read({ num: 7500, claimedAt: '2026-10-01T00:00:00Z' }).pr.state).toBe('CLOSED');
+    });
+    it('throws when even the per-item fallback listing is saturated', () => {
+      const exec = searchExec({ 7501: '---\nstatus: open\n---\nsaturated item' }, (search, limit) => filler(limit));
+      const reader = createPrepareStatusReader({ exec });
+      expect(() => reader.read({ num: 7501 })).toThrow('saturated');
+    });
+    it('does not trust the dated shared listing for a read claimed before its date floor', () => {
+      const exec = searchExec({ 7502: '---\nstatus: open\n---\nprimed', 7503: '---\nstatus: open\n---\nearlier' }, search =>
+        search.includes('7503-prepare-') ? [prFor(7503, '2026-10-02')] : [prFor(7502, '2026-10-04T01:00:00Z')]);
+      const reader = createPrepareStatusReader({ exec });
+      reader.prime([{ num: 7502, claimedAt: '2026-10-04T00:00:00Z' }]);
+      expect(reader.read({ num: 7502, claimedAt: '2026-10-04T00:00:00Z' }).pr.state).toBe('CLOSED');
+      expect(reader.read({ num: 7503, claimedAt: '2026-10-01T00:00:00Z' }).pr.state).toBe('CLOSED');
+      expect(reader.read({ num: 7503 }).pr.state).toBe('CLOSED');
+    });
+    it('gives every git/gh read an explicit large maxBuffer', () => {
+      const exec = searchExec({ 7504: '---\nstatus: open\n---\nbuffer' }, () => []);
+      const reader = createPrepareStatusReader({ exec });
+      reader.prime([{ num: 7504, claimedAt: '2026-10-01' }]);
+      reader.read({ num: 7504, claimedAt: '2026-10-01' });
+      expect(exec.mock.calls.length).toBeGreaterThan(3);
+      for (const [, , opts] of exec.mock.calls) expect(opts.maxBuffer).toBeGreaterThanOrEqual(16 * 1024 * 1024);
+    });
+  });
   it('rejects truncated byte framing', () => {
     const git = prepareGitFixture({ 7300: '---\nstatus: open\n---\ntruncated' });
     const reader = createPrepareStatusReader({ exec: (cmd, args, opts) => {
