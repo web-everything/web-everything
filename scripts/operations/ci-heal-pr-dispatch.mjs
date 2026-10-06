@@ -293,6 +293,7 @@ export async function runReconcileCiHealDispatch({
   // `reconcile-fix-dispatch.mjs#runReconcileFixDispatch`'s own `queueAdmission`: a CI-heal costs like a fix, and is
   // refused `queue-cap` while the projected queue wait would pass the max. `null` = no gate.
   queueAdmission = null,
+  dispatchThrottle = null, // fix-cap / host-load defer-only gate (dispatch-throttle.mjs); null = no gate
   flushOwed = (key) => flushOwedWrites({ repo: key }),
   pollAttempts = pollHealAttempts,
   retryTimeout = dispatchTimeoutRetry,
@@ -392,6 +393,8 @@ export async function runReconcileCiHealDispatch({
         why: `${loop.count} ci-heal/fix sessions on head ${String(entry.headRefOid ?? '').slice(0, 7)} in ${fixConfig.windowHours}h with nothing pushed; auto-held until the head moves (WE_FIX_LOOP_HOLD=0 disables)` });
       continue;
     }
+    const t = dispatchThrottle ? dispatchThrottle.tryAdmit('ci-heal') : { admit: true };
+    if (!t.admit) { refusals.push({ pr: entry.prNumber, kind: t.kind, why: t.why }); continue; }
     const q = queueBudget.tryAdmit('ci-heal', { id: entry.prNumber });
     if (!q.admit) {
       refusals.push({ pr: entry.prNumber, kind: 'queue-cap', why: queueCapWhy(q) });

@@ -148,6 +148,7 @@ import { defaultPoolRoot, guardedPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { execContainerized, containerCliAvailable, containerImageAvailable, resolveContainerImage, resolveNodeModulesVolume, nodeModulesVolumeAvailable } from '../lib/container-exec.mjs'; // #3621 sequencing note (tracked on #3383) — the heavy-command-pool container POC; see that module's own header for proven scope (check:standards + test:unit)
 import { resolveHostRoot, readHostToday, extractSamplesByName, utcDayKey } from '../operations/telemetry-summary-io.mjs'; // #4076 — REUSE the host-sampler's own root-resolution + tail-read + metric-extraction primitives (never reimplemented — see loadAdmissionDecision's section header below)
+import { resolveHeavyAdmissionCap } from '../lib/dispatch-throttle.mjs'; // one declared source for the cap
 import { latestValue, median } from '../lib/telemetry-machine.mjs'; // #4076/#4343 — the SAME "latest sample wins" reducer + median telemetry-machine.mjs already uses/exports — never a second implementation
 import {
   classifyCommandKind, normalizeKind, queueLaneOf, typicalMinutes, classifyDispatchKind, dispatchDemandMinutes,
@@ -215,8 +216,7 @@ const REAP_LOG = 'reaped.jsonl';
 /** Resolve the admission cap from env, clamped to a sane minimum of 1 (a cap of 0 would wedge every caller
  *  forever, which is a config bug, not a valid "admit nothing" policy). */
 export function resolveCap(env = process.env) {
-  const n = Number(env.WE_HEAVY_ADMISSION_CAP);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_ADMISSION_CAP;
+  return resolveHeavyAdmissionCap({ env }); // declared in we:scripts/dispatch-settings.json; env wins
 }
 
 /** Resolve the wait-then-give-up timeout from env, mirroring {@link resolveCap}. Clamped to a sane minimum of

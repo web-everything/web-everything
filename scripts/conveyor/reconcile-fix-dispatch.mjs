@@ -1274,6 +1274,8 @@ export function runReconcileFixDispatch({
   // #4295 — live in-flight claims the scope-overlap filter reads; injectable so tests never touch the real sidecar.
   listBuildClaims = () => listBuildDispatchClaims(),
   listFixClaims = () => listFixDispatchClaims(undefined, { liveOnly: true }),
+  // fix-cap / host-load: a DEFER-ONLY throttle (`dispatch-throttle.mjs#createDispatchThrottle`); null = no gate.
+  dispatchThrottle = null,
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-fix-dispatch: --repo ${repo} is not a constellation repo`);
@@ -1358,6 +1360,9 @@ export function runReconcileFixDispatch({
   const queueBudget = queueBudgetFrom(queueAdmission, { root, repo: repoKey });
   const dispatched = [];
   for (const entry of planned) {
+    // fix-cap / host-load — defer BEFORE any claim, resume or lane pop; the PR simply waits for a later pass.
+    const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix') : { admit: true };
+    if (!t.admit) { refusals.push({ pr: entry.pr, kind: t.kind, why: t.why }); continue; }
     // Card xkyw1x4 — queue-cap BEFORE a resume or a lane pop: either way a fix session runs its checks next.
     const q = queueBudget.tryAdmit('fix', { id: entry.pr });
     if (!q.admit) {
