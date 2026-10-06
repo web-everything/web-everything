@@ -48,10 +48,61 @@ describe('temp sweep', () => {
     expect(await sweep({ batchSize: 1, sleep })).toMatchObject({ deleted: 2, complete: true });
   });
   it('counts entry errors and observes the time budget between batches', async () => {
-    entry('gh-t-AbC123'); entry('gh-t-AbC124');
-    expect(await sweep({ fs: { ...fs, lstatSync: () => { throw Error('denied'); } } })).toMatchObject({ errors: 2, deleted: 0 });
+    entry('gh-t-AbC123'); entry('gh-t-AbC124'); entry('gh-t-AbC125');
+    expect(await sweep({ fs: { ...fs, lstatSync: () => { throw Error('denied'); } } })).toMatchObject({ errors: 3, deleted: 0 });
     let clock = now; vi.spyOn(Date, 'now').mockImplementation(() => clock);
     expect(await sweep({ batchSize: 1, timeBudgetMs: 10, sleep: async () => { clock += 11; } })).toMatchObject({ deleted: 1, complete: false });
+  });
+  it('resumes past 5000 young entries and eventually deletes all 200 old entries', async () => {
+    let clock = now;
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    const names = new Set(Array.from({ length: 5200 }, (_, i) => `gh-t-${String(i).padStart(6, '0')}`));
+    const fakeFs = {
+      readdirSync: () => [...names].reverse(),
+      lstatSync: (path) => { clock++; return { mtimeMs: Number(path.slice(-6)) < 5000 ? now : now - 10000 }; },
+      rmSync: (path) => { clock++; names.delete(path.slice(path.lastIndexOf('/') + 1)); },
+    };
+    const opts = { fs: fakeFs, scanBudgetMs: 5000, timeBudgetMs: 50, pauseMs: 0 };
+    const first = await sweep(opts);
+    expect(first).toMatchObject({ deleted: 0, nextCursor: 'gh-t-004999', complete: false });
+    // Restarting at the front reproduces starvation on every invocation.
+    for (let i = 0; i < 3; i++) expect(await sweep(opts)).toMatchObject({ deleted: 0, nextCursor: first.nextCursor });
+    let result = await sweep({ ...opts, cursor: first.nextCursor });
+    expect(result.deleted).toBe(50);
+    let total = result.deleted;
+    for (let i = 0; !result.complete && i < 10; i++) {
+      result = await sweep({ ...opts, cursor: result.nextCursor });
+      total += result.deleted;
+    }
+    expect(total).toBe(200);
+    expect(result).toMatchObject({ complete: true, nextCursor: null, topPrefixes: [['gh-t', 5000]] });
+    expect(names.size).toBe(5000);
+    expect(await sweep({ ...opts, cursor: result.nextCursor })).toMatchObject({ young: 5000, complete: true, nextCursor: null });
+  });
+  it('budgets deletion and pauses separately from scanning, with a total wall cap', async () => {
+    let clock = now;
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    const rmSync = vi.fn(() => { clock += 2; });
+    const fakeFs = {
+      readdirSync: () => ['gh-t-000002', 'gh-t-000000', 'gh-t-000001'],
+      lstatSync: () => { clock += 8; return { mtimeMs: now - 10000 }; },
+      rmSync,
+    };
+    const opts = { fs: fakeFs, timeBudgetMs: 5, scanBudgetMs: 100, batchSize: 1, sleep: async () => { clock += 3; } };
+    expect(await sweep(opts)).toMatchObject({ deleted: 1, complete: false, nextCursor: 'gh-t-000000' });
+    expect(rmSync).toHaveBeenCalledTimes(1);
+    expect(await sweep({ ...opts, scanBudgetMs: 8 })).toMatchObject({ deleted: 0, complete: false, nextCursor: null });
+    expect(await sweep({ ...opts, batchSize: 10 })).toMatchObject({ deleted: 3, complete: true, nextCursor: null });
+  });
+  it('handles missing cursor names, end-of-list wrap-around, and remaining prefix counts', async () => {
+    entry('gh-t-000000', false); entry('gh-t-000002'); entry('gh-t-000004');
+    const result = await sweep({ cursor: 'gh-t-000001', maxDeletes: 1 });
+    expect(result).toMatchObject({ deleted: 1, nextCursor: 'gh-t-000002', topPrefixes: [['gh-t', 2]] });
+    expect(formatTmpSweepLine(result)).toContain('listed 3');
+    expect(formatTmpSweepLine(result)).toContain('[["gh-t",2]]');
+    expect(await sweep({ cursor: result.nextCursor })).toMatchObject({ deleted: 1, complete: true, nextCursor: null });
+    expect(await sweep({ cursor: 'zzz' })).toMatchObject({ deleted: 0, complete: true, nextCursor: null });
+    expect(await sweep({ dryRun: true, olderThanMs: 0 })).toMatchObject({ deleted: 1, topPrefixes: [['gh-t', 1]] });
   });
   it('reads cwd once, handles realpath aliases and partial stdout', () => {
     const alias = join(root, 'alias'); const actual = join(root, 'actual'); fs.mkdirSync(actual); fs.symlinkSync(actual, alias);
@@ -83,7 +134,7 @@ describe('temp sweep', () => {
       expect(result).toMatchObject({ deleted: 0, young: 1 });
       expect(fs.existsSync(path)).toBe(true);
     }
-    for (const knob of [{ batchSize: 'x' }, { batchSize: NaN }, { maxDeletes: 'x' }, { timeBudgetMs: 'x' }, { pauseMs: NaN }]) {
+    for (const knob of [{ batchSize: 'x' }, { batchSize: NaN }, { maxDeletes: 'x' }, { timeBudgetMs: 'x' }, { scanBudgetMs: 'x' }, { scanBudgetMs: NaN }, { scanBudgetMs: -1 }, { pauseMs: NaN }]) {
       expect(await sweep({ olderThanMs: 0, busy: new Set(), dryRun: true, ...knob })).toMatchObject({ deleted: 1, complete: true });
     }
   });

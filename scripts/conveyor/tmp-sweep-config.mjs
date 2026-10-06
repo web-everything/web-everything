@@ -7,5 +7,6 @@ export const TMP_SWEEP_DEFAULTS = Object.freeze({
   tmpSweepBatchSize: 200,
   tmpSweepPauseMs: 50,
   tmpSweepMaxDeletesPerRun: 20000,
-  tmpSweepTimeBudgetMs: 15000, // keeps the sweep well inside the 60s tick budget; a capped run resumes next tick
+  tmpSweepTimeBudgetMs: 15000, // deletion + batch pauses only
+  tmpSweepScanBudgetMs: 30000, // total walk wall time; a capped run resumes next tick
 });

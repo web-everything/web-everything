@@ -42,6 +42,7 @@ const knob = (value, fallback, min = 0) => (typeof value === 'number' && Number.
 export async function sweepOurTmp({
   tmpRoot, prefixes, olderThanMs: olderThanOpt, now = Date.now(),
   batchSize: batchSizeOpt, pauseMs: pauseMsOpt, maxDeletes: maxDeletesOpt, timeBudgetMs: timeBudgetOpt,
+  scanBudgetMs: scanBudgetOpt, cursor,
   busy = readBusyTopLevel(tmpRoot), dryRun = false, fs = nodeFs, sleep = setTimeout, log = () => {},
 }) {
   const olderThanMs = knob(olderThanOpt, TMP_SWEEP_DEFAULTS.tmpSweepOlderThanMs);
@@ -49,34 +50,60 @@ export async function sweepOurTmp({
   const pauseMs = knob(pauseMsOpt, TMP_SWEEP_DEFAULTS.tmpSweepPauseMs);
   const maxDeletes = knob(maxDeletesOpt, TMP_SWEEP_DEFAULTS.tmpSweepMaxDeletesPerRun);
   const timeBudgetMs = knob(timeBudgetOpt, TMP_SWEEP_DEFAULTS.tmpSweepTimeBudgetMs);
+  const scanBudgetMs = knob(scanBudgetOpt, TMP_SWEEP_DEFAULTS.tmpSweepScanBudgetMs);
   const started = Date.now();
   const names = fs.readdirSync(tmpRoot);
   const pattern = ourTmpEntryPattern(prefixes);
-  const matches = names.filter((name) => pattern.test(name));
-  const result = { listed: names.length, matched: matches.length, busy: 0, young: 0, eligible: 0, deleted: 0, errors: 0, complete: true, durationMs: 0 };
-  let inBatch = 0;
+  const matches = names.filter((name) => pattern.test(name)).sort();
+  // Matching names end in a separator plus six random characters; the rest is the exact allowlist prefix.
+  const remaining = new Map();
   for (const name of matches) {
-    if (result.deleted >= maxDeletes || Date.now() - started >= timeBudgetMs) { result.complete = false; break; }
+    const prefix = name.slice(0, -7);
+    remaining.set(prefix, (remaining.get(prefix) || 0) + 1);
+  }
+  const result = { listed: names.length, matched: matches.length, busy: 0, young: 0, eligible: 0, deleted: 0, errors: 0, complete: true, durationMs: 0, nextCursor: null, topPrefixes: [] };
+  let inBatch = 0;
+  let deleteMs = 0;
+  // A removed cursor still defines a position. Missing/non-string cursors start a fresh lap.
+  let index = typeof cursor === 'string' ? matches.findIndex((name) => name > cursor) : 0;
+  if (index < 0) index = matches.length;
+  const startIndex = index;
+  let lastExamined = typeof cursor === 'string' ? cursor : null;
+  const exhausted = () => Date.now() - started >= scanBudgetMs || deleteMs >= timeBudgetMs;
+  for (; index < matches.length; index++) {
+    if (result.deleted >= maxDeletes || exhausted()) break;
+    const name = matches[index];
+    lastExamined = name;
     if (busy.has(name)) { result.busy++; continue; }
     try {
       const path = join(tmpRoot, name);
       if (!(now - fs.lstatSync(path).mtimeMs >= olderThanMs)) { result.young++; continue; } // fails closed on NaN
       result.eligible++;
-      if (inBatch >= batchSize) {
-        await sleep(pauseMs);
+      if (!exhausted() && inBatch >= batchSize) {
+        const pauseStarted = Date.now();
+        try { await sleep(pauseMs); } finally { deleteMs += Date.now() - pauseStarted; }
         inBatch = 0;
       }
-      if (Date.now() - started >= timeBudgetMs) { result.complete = false; break; }
-      if (!dryRun) fs.rmSync(path, { recursive: true, force: true });
+      if (exhausted()) { lastExamined = index > startIndex ? matches[index - 1] : (typeof cursor === 'string' ? cursor : null); break; } // retry this entry next run
+      if (!dryRun) {
+        const deleteStarted = Date.now();
+        try { fs.rmSync(path, { recursive: true, force: true }); } finally { deleteMs += Date.now() - deleteStarted; }
+        const prefix = name.slice(0, -7);
+        remaining.set(prefix, remaining.get(prefix) - 1);
+      }
       result.deleted++;
       inBatch++;
     } catch { result.errors++; }
   }
+  result.complete = index >= matches.length;
+  result.nextCursor = result.complete ? null : lastExamined;
+  result.topPrefixes = [...remaining].filter(([, count]) => count > 0)
+    .sort(([a, ac], [b, bc]) => bc - ac || (a < b ? -1 : a > b ? 1 : 0)).slice(0, 5);
   result.durationMs = Date.now() - started;
   log(formatTmpSweepLine(result));
   return result;
 }
 
 export function formatTmpSweepLine(result) {
-  return `tmp-sweep: deleted ${result.deleted}/${result.eligible} eligible (matched ${result.matched}, young ${result.young}, busy ${result.busy}, errors ${result.errors}) in ${result.durationMs}ms, ${result.complete ? 'complete' : 'incomplete'}`;
+  return `tmp-sweep: deleted ${result.deleted}/${result.eligible} eligible (listed ${result.listed}, matched ${result.matched}, young ${result.young}, busy ${result.busy}, errors ${result.errors}) in ${result.durationMs}ms, ${result.complete ? 'complete' : 'incomplete'}, top prefixes ${JSON.stringify(result.topPrefixes)}`;
 }
