@@ -29,6 +29,14 @@ vi.mock('../branch-sync.mjs', async (original) => ({
   ...await original(), notifyDesktopChecked: episodeReplay.send,
 }));
 
+const sealTestRoot = vi.hoisted(() => ({ path: null }));
+vi.mock('../health-watch-section.mjs', async original => {
+  const real = await original();
+  return { ...real, healthDir: root => real.healthDir(root ?? sealTestRoot.path ?? undefined) };
+});
+const cardBatchSeal = vi.hoisted(() => vi.fn(() => []));
+vi.mock('../../operations/card-batch-seal-io.mjs', () => ({ sealDueBatches: cardBatchSeal }));
+
 let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'health-watch-test-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
@@ -1206,4 +1214,25 @@ describe('Claude jobs archive tick integration', () => {
     expect((await tick(flags)).claudeJobsArchive).toBeNull();
     expect((await tick({ ...flags, 'dry-run': true })).claudeJobsArchive).toBeNull();
   }, 30000);
+});
+
+// The hook is intentionally disabled for fixture roots and dry-run ticks.
+it('skips card batch sealing for state-root and dry-run ticks', async () => {
+  cardBatchSeal.mockClear();
+  await tick({ 'no-diagnose': true, 'state-root': dir, 'dry-run': true, 'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks') });
+  expect(cardBatchSeal).not.toHaveBeenCalled();
+});
+
+it('records a cardBatchSeal launch error as a probe error', async () => {
+  sealTestRoot.path = dir;
+  const hd = healthDir(dir); mkdirSync(hd, { recursive: true });
+  writeFileSync(join(hd, 'config.json'), JSON.stringify({ tmpSweepEnabled: false, claudeJobsArchiveEnabled: false }));
+  const ps = join(dir, 'ps.txt'); writeFileSync(ps, '');
+  cardBatchSeal.mockImplementationOnce(() => { throw Error('seal launch failed'); });
+  try {
+    const out = await tick({ 'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'),
+      'self-sync-dir': join(dir, 'sync'), 'ps-fixture': ps, 'no-gh': true, 'no-diagnose': true });
+    expect(out.probeErrors.cardBatchSeal).toBe('seal launch failed');
+    expect(cardBatchSeal).toHaveBeenCalledWith({ now: expect.any(Number) });
+  } finally { sealTestRoot.path = null; }
 });

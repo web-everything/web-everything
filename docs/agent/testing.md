@@ -769,3 +769,12 @@ The grant must be posted under the operator's own GitHub credential: the operati
 login, and a grant counts only when the comment's GitHub author is an operator and names a registered operator actor
 (an automation-authored comment never counts, whatever its body says). Repo keys and slugs are equivalent.
 Grants on one PR together add at most 10 rounds; a further grant is refused and the count is clamped.
+
+### Card batch publication recovery
+
+Batch publication shares admission's token lock. A seal journals each completed step and retains the
+actual green `.lane-verify` receipt for the pinned head across lane release/reacquisition. A finished
+or failed seal is archived before the active slot is replaced with its sequence seed; admission's
+existing successor rule then allocates `seq + 1`. Keep real bare-origin coverage alongside transport
+fakes: the former proves ref checks and rollover, while the latter pins park → hold-label ordering,
+red verification, and each durable crash boundary. Health ticks only launch detached seal workers.
