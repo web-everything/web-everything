@@ -110,6 +110,35 @@ function vitestRunSegmentsNameFiles(cmd) {
   });
 }
 
+/** x1ds37v — a fixer's single-test debug run (`npm run test:unit -- <files>`, no chained standards) rides the fast
+ *  lane only while its target list is small; more files than this is a real suite and stays `FULL`. */
+export const FAST_FILES_ENV = 'WE_HEAVY_ADMISSION_FAST_MAX_FILES';
+export const DEFAULT_FAST_MAX_FILES = 5;
+export function resolveFastMaxFiles(env = {}) {
+  const n = Number(env?.[FAST_FILES_ENV]);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_FAST_MAX_FILES;
+}
+/** x1ds37v — per-run timeout (ms) for a bare `files` run: fits under the 10-minute Bash cap. */
+export const FAST_RUN_TIMEOUT_ENV = 'WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS';
+export const DEFAULT_FAST_RUN_TIMEOUT_MS = 8 * 60_000;
+export function resolveFastRunTimeoutMs(env = {}) {
+  const n = Number(env?.[FAST_RUN_TIMEOUT_ENV]);
+  return Number.isFinite(n) && n >= 1000 ? Math.floor(n) : DEFAULT_FAST_RUN_TIMEOUT_MS;
+}
+function countVitestRunFileTargets(cmd) {
+  let max = 0;
+  for (const segment of cmd.split(/&&|\|\||[;|\n]/).filter((x) => /\bvitest\s+run\b/.test(x))) {
+    const tokens = segment.slice(segment.search(/\bvitest\s+run\b/)).split(/\s+/).slice(2).map((t) => t.replace(/^['"]|['"]$/g, ''));
+    const n = tokens.filter((t, i) => {
+      if (!/\.(?:mjs|cjs|js|jsx|ts|tsx|mts|cts)$/.test(t) || t.startsWith('-')) return false;
+      const prev = tokens[i - 1];
+      return !(prev && prev.startsWith('-') && !prev.includes('=') && !BOOLEAN_VITEST_FLAGS.has(prev));
+    }).length;
+    max = Math.max(max, n);
+  }
+  return max;
+}
+
 /**
  * Classify a heavy command line into a {@link HEAVY_KINDS} kind. Pure. The order matters: an unconditional full
  * suite (`test:unit`, `test:coverage`, a bare `vitest run`) wins over everything else in the same chain; a
@@ -117,7 +146,7 @@ function vitestRunSegmentsNameFiles(cmd) {
  * @param {string|null|undefined} command
  * @returns {'selected'|'FULL'|'standards'|'files'|'other'}
  */
-export function classifyCommandKind(command) {
+export function classifyCommandKind(command, env = {}) {
   const cmd = String(command || '').trim();
   if (!cmd) return 'other';
   const standards = /check[-:]standards/.test(cmd);
@@ -125,6 +154,7 @@ export function classifyCommandKind(command) {
   // A `vitest run` segment without an explicit test file is a whole suite wherever it sits in the chain.
   const runNamesFiles = vitestRunSegmentsNameFiles(cmd);
   if (runNamesFiles === false) return 'FULL';
+  if (!standards && !/\bvitest\s+related\b/.test(cmd) && runNamesFiles && countVitestRunFileTargets(cmd) > resolveFastMaxFiles(env)) return 'FULL';
   if (/\bvitest\s+related\b/.test(cmd) || runNamesFiles) return standards ? 'selected' : 'files';
   if (/\bvitest(?:\s+run)?\b/.test(cmd)) return 'FULL';
   if (standards) return 'standards';

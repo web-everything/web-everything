@@ -36,6 +36,13 @@ describe('classifyCommandKind — the gate / wrapped command line → heavy kind
       'npx vitest run a.test.mjs && npx vitest run', "npx vitest run\nnode scripts/x.mjs"]) expect(classifyCommandKind(cmd), cmd).toBe('FULL');
     expect(classifyCommandKind('npx vitest run --config c.ts a.test.mjs --passWithNoTests')).toBe('files');
   });
+  it('x1ds37v — a bare run of <=5 test files is `files` (fast lane); more is `FULL`; the cap is env-tunable', () => {
+    expect(classifyCommandKind('vitest run a.test.mjs b.test.mjs c.test.mjs d.test.mjs e.test.mjs')).toBe('files');
+    expect(classifyCommandKind('vitest run a.test.mjs b.test.mjs c.test.mjs d.test.mjs e.test.mjs f.test.mjs')).toBe('FULL');
+    expect(classifyCommandKind('vitest run a.test.mjs b.test.mjs', { WE_HEAVY_ADMISSION_FAST_MAX_FILES: '1' })).toBe('FULL');
+    // the chained verify gate is never demoted by the count
+    expect(classifyCommandKind('vitest run a.test.mjs b.test.mjs c.test.mjs d.test.mjs e.test.mjs f.test.mjs && npm run check:standards')).toBe('selected');
+  });
   it('check:standards alone is `standards`; a bare vitest related is `files`; anything else `other`', () => {
     expect(classifyCommandKind('node scripts/check-standards.mjs')).toBe('standards');
     expect(classifyCommandKind('npx vitest related x.mjs --run')).toBe('files');
