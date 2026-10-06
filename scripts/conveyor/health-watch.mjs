@@ -817,11 +817,11 @@ function acquireTickLock(dir) {
   } catch { return null; }
 }
 
-function sweepOptions(config, tmpRoot, dryRun, now, run) {
+function sweepOptions(config, tmpRoot, dryRun, now, run, cursor) {
   return { tmpRoot, dryRun, now, busy: readBusyTopLevel(tmpRoot, { run }),
     olderThanMs: config.tmpSweepOlderThanMs, batchSize: config.tmpSweepBatchSize,
     pauseMs: config.tmpSweepPauseMs, maxDeletes: config.tmpSweepMaxDeletesPerRun,
-    timeBudgetMs: config.tmpSweepTimeBudgetMs };
+    timeBudgetMs: config.tmpSweepTimeBudgetMs, scanBudgetMs: config.tmpSweepScanBudgetMs, cursor };
 }
 
 function archiveOptions(config, flags, now) {
@@ -850,7 +850,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const sweepDue = config.tmpSweepEnabled && (!prev.tmpSweep?.completedAt
     || now - prev.tmpSweep.completedAt >= config.tmpSweepEveryMs || prev.tmpSweep.complete === false);
   const tmpSweep = sweepAllowed && sweepDue
-    ? await attempt('tmpSweep', () => sweepOurTmp(sweepOptions(config, flags['tmp-sweep-root'] || tmpdir(), !!flags['dry-run'], now, tmpSweepRun)))
+    ? await attempt('tmpSweep', () => sweepOurTmp(sweepOptions(config, flags['tmp-sweep-root'] || tmpdir(), !!flags['dry-run'], now, tmpSweepRun, prev.tmpSweep?.nextCursor)))
     : null;
 
   const archiveAllowed = flags['claude-jobs-root'] || (!flags['state-root'] && !flags['dry-run']);

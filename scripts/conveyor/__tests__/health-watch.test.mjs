@@ -1150,12 +1150,14 @@ describe('tmp sweep tick integration', () => {
     writeFileSync(join(hd, 'config.json'), JSON.stringify({ tmpSweepOlderThanMs: 0, tmpSweepEveryMs: 0, tmpSweepMaxDeletesPerRun: 1 }));
     oldEntry(join(root, 'gh-t-AbC124'));
     const capped = await tick(flags, { tmpSweepRun });
-    expect(capped.tmpSweep).toMatchObject({ deleted: 1, complete: false });
+    expect(capped.tmpSweep).toMatchObject({ deleted: 1, complete: false, nextCursor: 'gh-t-AbC123' });
+    expect(JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).tmpSweep.nextCursor).toBe('gh-t-AbC123');
+    oldEntry(path); // recreated behind the cursor: this tick must resume beyond it
     expect(JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).tmpSweep.completedAt).toBeUndefined();
     writeFileSync(join(hd, 'config.json'), JSON.stringify({ tmpSweepOlderThanMs: 0 }));
-    expect((await tick(flags, { tmpSweepRun })).tmpSweep).toMatchObject({ deleted: 1, complete: true });
+    expect((await tick(flags, { tmpSweepRun })).tmpSweep).toMatchObject({ deleted: 1, complete: true, nextCursor: null });
+    expect(existsSync(path)).toBe(true);
     flags['state-root'] = join(dir, 'dry-state');
-    oldEntry(path);
     const dryHd = healthDir(flags['state-root']); mkdirSync(dryHd, { recursive: true });
     writeFileSync(join(dryHd, 'config.json'), JSON.stringify({ tmpSweepOlderThanMs: 0 }));
     expect((await tick({ ...flags, 'dry-run': true }, { tmpSweepRun })).tmpSweep.deleted).toBe(1);
