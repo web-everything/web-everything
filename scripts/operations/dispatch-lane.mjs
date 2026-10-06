@@ -1202,7 +1202,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes } = {}) {
  * BUILD THE DECLARATION. `readTick` is the injected reader; {@link ./dispatch-lane-io.mjs} supplies the real
  * one and tests supply a stub. Built per call so nothing leaks between registries.
  *
- * @param {{readTick: (o: {num: string, bookkeepingFile: string}) => object}} deps
+ * @param {{readTick: (o: {num: string, bookkeepingFile: string, tickFile: string}) => object}} deps
  * @returns {object} the frozen declaration from `op()`.
  */
 export function dispatchLaneOperation({ readTick } = {}) {
@@ -1225,6 +1225,8 @@ export function dispatchLaneOperation({ readTick } = {}) {
       // reads whatever the caller already has. Omitted → the read runs with no in-flight guards, which the
       // finding reports as `bookkeepingSource: 'none'`.
       bookkeepingFile: { type: 'string', required: false, default: '' },
+      // Optional recent tick from the caller, bound to the forwarded bookkeeping by its hash.
+      tickFile: { type: 'string', required: false, default: '' },
       expectedWithinMinutes: { type: 'number', required: false, default: DEFAULT_EXPECTED_WITHIN_MINUTES },
       // #3857 — the ONE way a hand-set `--model` in `WE_DISPATCH_AGENT_ARGS` is honoured: the spawn point
       // (`dispatch-lane-io.mjs#resolveWorkerModel`) refuses it unless this reason rides the SAME call. Not
@@ -1236,9 +1238,9 @@ export function dispatchLaneOperation({ readTick } = {}) {
     // ── 1. read ─────────────────────────────────────────────────────────────────────────────────────────────
     // ONE tick read, already selected for this num by the shell, shaped and turned into a filled brief.
     read: compute({
-      reads: ['input.num', 'input.bookkeepingFile', 'input.expectedWithinMinutes'],
+      reads: ['input.num', 'input.bookkeepingFile', 'input.tickFile', 'input.expectedWithinMinutes'],
       fn: (view) => shapeDispatchRead(
-        readTick({ num: view.input.num, bookkeepingFile: view.input.bookkeepingFile }),
+        readTick({ num: view.input.num, bookkeepingFile: view.input.bookkeepingFile, tickFile: view.input.tickFile }),
         { num: view.input.num, expectedWithinMinutes: view.input.expectedWithinMinutes },
       ),
     }),

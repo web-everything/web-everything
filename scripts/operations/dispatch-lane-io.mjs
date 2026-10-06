@@ -65,7 +65,7 @@ import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -236,13 +236,15 @@ export const LISTING_GRACE_MS = DISPATCH_LISTING_GRACE_MINUTES * 60 * 1000;
 /**
  * READ ONE TICK and select this item's row. The `readTick` the declaration is injected with.
  *
- * ONE `tick-core` call. Its STDIN is the caller's session-ephemeral bookkeeping — read from `bookkeepingFile`
- * when given, `{}` otherwise. The file is the CALLER'S (the runner's `nextState`); this function neither
+ * Reuses a valid caller-supplied tick or makes ONE `tick-core` call. Its STDIN is the caller's
+ * session-ephemeral bookkeeping — read from `bookkeepingFile` when given, `{}` otherwise.
+ * The file is the CALLER'S (the runner's `nextState`); this function neither
  * creates nor writes one, so no parallel state store comes into existence (#2612).
  *
  * @param {object} o
  * @param {string|number} o.num - the item to dispatch.
  * @param {string} [o.bookkeepingFile] - path to the caller's `{ bookkeeping, signals, config }` JSON.
+ * @param {string} [o.tickFile] - optional `{ at, bookkeepingHash, tick }` handoff, valid for under five minutes.
  * @param {string} [o.root]
  * @param {Function} [o.runNode] - injectable `(argv, opts) => stdout`, so the reader is testable without a tick.
  * @param {Function} [o.exec] - the `execFileSync`-shaped call the DEFAULT `runNode` goes through. Separate from
@@ -251,7 +253,7 @@ export const LISTING_GRACE_MS = DISPATCH_LISTING_GRACE_MINUTES * 60 * 1000;
  *   #1211 review, where a tested default reached by nothing was the whole defect.
  * @param {Function} [o.readText] - injectable file reader.
  * @param {Function} [o.loadItems] - injectable backlog loader.
- * @param {() => Date} [o.now] - injectable clock; stamps `observedAt`, which is how the pure declaration ages
+ * @param {() => Date|number} [o.now] - injectable clock; stamps `observedAt`, which is how the pure declaration ages
  *   its double-dispatch guard out without reading a clock of its own.
  * @param {() => object[]} [o.listAgents] - injectable `claude agents --json` reader. The double-dispatch
  *   guard's PRIMARY axis is liveness, not age (PR #1211 round 2, G1), so the read asks the same question the
@@ -271,6 +273,7 @@ export const LISTING_GRACE_MS = DISPATCH_LISTING_GRACE_MINUTES * 60 * 1000;
 export function readTick({
   num,
   bookkeepingFile = '',
+  tickFile = '',
   root = REPO_ROOT,
   // #4415 round 2 — this `exec` feeds `checkAlreadyDone`/`laneRefForPr`/`listAgents` below, ALL of which
   // shell `gh` (or `claude`) directly with whatever this default is; it must be `execFileSyncThrottled`, never
@@ -327,6 +330,8 @@ export function readTick({
     droppedKeys = forwarded.dropped;
     bookkeepingSource = 'file';
   }
+  // Bind the handoff to the exact forwardable input, before diagnostic config changes it.
+  const bookkeepingHash = createHash('sha256').update(stdin).digest('hex');
 
   // An explicit verbose setting bypasses tick-core's read-and-advance of the
   // persisted diagnostic window. Read-only reports must supply false.
@@ -338,17 +343,29 @@ export function readTick({
   // Local run-store lookup precedes the full planner. Only probe agents when a row exists.
   // Re-read each invocation: terminal settlement invalidates this hold without a timer.
   const inFlight = all ? null : recordLiveness(stampLiveness(listInFlightDispatches(key), { listAgents, isPidAlive }));
-  const observedAt = now().toISOString();
+  const observedAt = new Date(now()).toISOString();
   if (inFlight?.runs?.some(r => dispatchStillHolds(r, observedAt))) {
     return { resolvedNum: key, launch: null, suppressed: null, nextState: JSON.parse(stdin).bookkeeping ?? {},
       bookkeepingSource, droppedBookkeepingKeys: droppedKeys, inFlightDispatches: inFlight, observedAt };
   }
   let tick;
-  try {
-    tick = JSON.parse(String(runNode([tickCli(root)], { cwd: root, input: stdin })));
-  } catch (e) {
-    const msg = String((e && (e.stderr || e.message)) || e).split('\n').filter(Boolean).pop() || 'tick-core failed';
-    throw new Error(`dispatch-lane-io: could not read the conveyor tick — ${msg}`);
+  if (tickFile && !all) {
+    try {
+      const file = JSON.parse(readText(tickFile));
+      const age = Date.parse(observedAt) - Date.parse(file.at);
+      if (age >= -60_000 && age < 5 * 60_000 && file.bookkeepingHash === bookkeepingHash
+        && file.tick && typeof file.tick === 'object' && !Array.isArray(file.tick)) {
+        tick = file.tick;
+      }
+    } catch { /* An unavailable or malformed handoff falls back to the planner. */ }
+  }
+  if (!tick) {
+    try {
+      tick = JSON.parse(String(runNode([tickCli(root)], { cwd: root, input: stdin })));
+    } catch (e) {
+      const msg = String((e && (e.stderr || e.message)) || e).split('\n').filter(Boolean).pop() || 'tick-core failed';
+      throw new Error(`dispatch-lane-io: could not read the conveyor tick — ${msg}`);
+    }
   }
   const decisions = tick && typeof tick.decisions === 'object' && tick.decisions ? tick.decisions : {};
   if (all) {
@@ -580,7 +597,7 @@ export function readTick({
     // WHEN THIS READ WAS TAKEN. The declaration ages the double-dispatch guard out (`dispatchStillHolds`) and
     // is pure, so the clock has to arrive as DATA rather than be read there. Omitted or unparseable → nothing
     // ages out and every in-flight record holds, which is the fail-closed direction.
-    observedAt: now().toISOString(),
+    observedAt: new Date(now()).toISOString(),
   };
 }
 
@@ -1060,7 +1077,7 @@ export function resolveDeliveryBase(target, num, registry) {
 
 /** `readTick` bound to one root — the shape the declaration wants. */
 export function createTickReader(bindings = {}) {
-  return ({ num, bookkeepingFile, all = false, verbose = bindings.verbose }) => readTick({ ...bindings, num, bookkeepingFile, all, verbose });
+  return ({ num, bookkeepingFile, tickFile, all = false, verbose = bindings.verbose }) => readTick({ ...bindings, num, bookkeepingFile, tickFile, all, verbose });
 }
 
 /**

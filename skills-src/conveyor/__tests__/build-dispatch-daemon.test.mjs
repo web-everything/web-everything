@@ -1,7 +1,7 @@
 import { recordPrepareFailure, readFailureState } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
 import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -1540,6 +1540,57 @@ describe('automatic item preparation', () => {
     effects.readPrepareStatus = () => ({ preparedDate: null });
     effects.placePrepareHold = vi.fn();
   }
+  it('passes its tick to dispatch-lane', async () => {
+    const effects = fixture();
+    const preparePlan = effects.planTick;
+    effects.planTick = vi.fn((bk) => {
+      const out = preparePlan(bk);
+      out.decisions.spawnBuilds = [{ num: '4503', lane: 3 }];
+      out.decisions.admission = { queue: [{ num: '4503', scope: ['we:scripts/example.mjs'] }] };
+      return out;
+    });
+    effects.acquireClaim = vi.fn(() => ({ ok: true }));
+    effects.releaseClaim = vi.fn();
+    const result = await runBuildDispatchTick({ live: true, bookkeeping: { tick: 7 }, effects });
+    expect(result.dispatched.map(r => r.num)).toEqual(['4503']);
+    expect(result.prepare.launched).toHaveLength(2);
+    expect(effects.planTick).toHaveBeenCalledTimes(1);
+    expect(effects.dispatch).toHaveBeenCalledTimes(3);
+    for (const [args] of effects.dispatch.mock.calls) {
+      expect(args.tick).toBe(effects.planTick.mock.results[0].value);
+      expect(args.tickBookkeeping).toBe(effects.planTick.mock.calls[0][0]);
+      expect(args.bookkeeping).toBe(args.tickBookkeeping);
+    }
+
+    const tick = effects.planTick.mock.results[0].value;
+    const tickBookkeeping = effects.planTick.mock.calls[0][0];
+    let tickPath;
+    const exec = vi.fn((_cmd, argv) => {
+      const file = argv.find(arg => arg.startsWith('--bookkeepingFile=')).split('=')[1];
+      tickPath = argv.find(arg => arg.startsWith('--tickFile='))?.slice('--tickFile='.length);
+      expect(tickPath).toBe(join(file, '..', 'tick.json'));
+      const envelope = JSON.parse(readFileSync(tickPath, 'utf8'));
+      expect(envelope.tick).toEqual(tick);
+      expect(envelope.bookkeepingHash).toBe(createHash('sha256')
+        .update(JSON.stringify({ bookkeeping: tickBookkeeping })).digest('hex'));
+      expect(Date.now() - Date.parse(envelope.at)).toBeLessThan(5000);
+      expect(statSync(tickPath).mode & 0o777).toBe(0o600);
+      return JSON.stringify({ verdict: { dispatching: true }, effects: [
+        { type: DISPATCH_EFFECT, status: 'in-flight', handle: 'tick-handoff-session' },
+      ] });
+    });
+    expect(cliDispatch({ num: '4503', bookkeeping: tickBookkeeping, tick, tickBookkeeping }, { exec }))
+      .toMatchObject({ dispatching: true });
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(existsSync(tickPath)).toBe(false);
+
+    const withoutTick = vi.fn(() => JSON.stringify({ dispatching: true }));
+    cliDispatch({ num: '4503', bookkeeping: tickBookkeeping }, { exec: withoutTick });
+    expect(withoutTick.mock.calls[0][1]).toEqual([
+      expect.stringContaining('/operations/run.mjs'), 'dispatch-lane', '--num=4503',
+      expect.stringMatching(/^--bookkeepingFile=/), '--json',
+    ]);
+  });
   it.each([false, true])('reconciles a stamped prepare before next-tick planning (live=%s)', async (workerLive) => {
     const row = { num: '4501', row: { runId: 'original', entry: {
       key: 'original#2#0', live: workerLive, status: 'in-flight' } } };

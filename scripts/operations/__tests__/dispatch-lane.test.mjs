@@ -215,8 +215,8 @@ describe('the operation is callable at all', () => {
 describe('the lane comes from the tick core or nowhere', () => {
   it('does not declare a `lane` input — a caller cannot ask for one', () => {
     const { declaration } = registryFor();
-    // #3857 — `modelReason` is the one input added since: the reason a hand-set `--model` needs.
-    expect(Object.keys(declaration.input).sort()).toEqual(['bookkeepingFile', 'expectedWithinMinutes', 'modelReason', 'num']);
+    // `modelReason` records a model override; `tickFile` reuses the caller's bookkeeping-bound tick.
+    expect(Object.keys(declaration.input).sort()).toEqual(['bookkeepingFile', 'expectedWithinMinutes', 'modelReason', 'num', 'tickFile']);
     expect(declaration.input.num.type).toBe('string'); // an id may be a `xNNNNNN` hash, never only a number
     expect(declaration.input.expectedWithinMinutes.default).toBe(DEFAULT_EXPECTED_WITHIN_MINUTES);
   });
