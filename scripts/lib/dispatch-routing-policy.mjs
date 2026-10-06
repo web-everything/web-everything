@@ -6,7 +6,9 @@ const CATALOG = Object.freeze({
   claude: ['claude-haiku-4-5-20251001', 'claude-sonnet-5-5', 'claude-opus-5'],
   codex: ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra'],
   antigravity: ['claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro'],
-  'agy-claude': ['claude-sonnet-4-6', 'claude-opus-4-6-thinking'],
+  // Card 84 — agy 1.3.0 serves the 5.5 family with the effort baked into the id (`agy models`, 2026-10-06).
+  'agy-claude': ['claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'claude-opus-5-5-high', 'claude-opus-5-5-medium', 'claude-opus-5-5-low',
+    'claude-sonnet-5-5-high', 'claude-sonnet-5-5-medium', 'claude-sonnet-5-5-low'],
   'agy-gemini': ['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro'],
 });
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -67,7 +69,12 @@ export function validateRoutingPolicy(input) {
       const path = `${group}.${name}`;
       if (!name.trim()) fail(`${group} has an empty key`);
       if (entry?.inherit === true) { keys(entry, ['inherit', 'effort'], path); validateEffort(entry.effort); continue; }
-      keys(entry, ['provider', 'model', 'effort', 'fallback'], path);
+      keys(entry, ['provider', 'model', 'effort', 'fallback', 'mode'], path);
+      // Card 84 — `mode: "shadow"`: the primary provider runs as a recorded shadow beside the first Claude route in
+      // `fallback`, which alone counts. Only review seats read it (we:scripts/lib/review-seat-provider.mjs).
+      if (entry.mode !== undefined && (entry.mode !== 'shadow' || !entry.fallback?.some?.((f) => f?.provider === 'claude'))) {
+        fail(`${path}.mode must be "shadow", with a claude route in fallback to count`);
+      }
       modelFor(policy, entry.provider, entry.model, path);
       validateEffort(entry.effort, entry.provider);
       if (!Array.isArray(entry.fallback)) fail(`${path}.fallback must be an array`);
@@ -92,7 +99,7 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
     .filter(route => (!gateClosed || route.provider === 'claude') && (route.provider === 'claude' || !vetoes.some(veto => veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider))));
   const selected = chain.find(route => (!gateClosed || route.provider === 'claude') && (!available || available.includes(route.provider)));
   if (!selected) fail(`${operation}: no available route${gateClosed ? ' permitted by critical-work gate' : ''}`);
-  return { ...selected, fallback: chain.slice(chain.indexOf(selected) + 1), source: 'routing-policy' };
+  return { ...selected, fallback: chain.slice(chain.indexOf(selected) + 1), source: 'routing-policy', ...(entry.mode && selected === chain[0] ? { mode: entry.mode } : {}) };
 }
 
 /**

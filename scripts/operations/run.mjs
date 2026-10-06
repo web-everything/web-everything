@@ -170,7 +170,7 @@ export const OPERATIONS = Object.freeze({
       codexAdvisory: codexAdvisoryFromEnv(),
       correctnessAdvisory: correctnessAdvisoryFromEnv(),
       antigravityReview: antigravityReviewFromEnv(),
-      // Card 84 — `review.seatProvider.<lens>` + the advisory agy seat (we:scripts/lib/review-seat-provider.json).
+      // Card 84 — `review.seatProvider.<lens>` + the advisory agy seat (the `review-seat:mandatory:*` / `review-seat:advisory:agy-correctness` entries of we:scripts/lib/dispatch-routing-policy.json).
       seatSettings: loadReviewSeatSettings(),
     }),
     sinks: createReviewPrSinks({ json }),

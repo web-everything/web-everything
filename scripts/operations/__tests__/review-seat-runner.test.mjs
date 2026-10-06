@@ -8,8 +8,9 @@ import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  REVIEW_SEAT_PLATFORM_DEFAULT, resolveReviewSeatSettings, loadReviewSeatSettings, seatProviderDirective,
+  REVIEW_SEAT_PLATFORM_DEFAULT, settingsFromRoutingPolicy, loadReviewSeatSettings, seatProviderDirective,
 } from '../../lib/review-seat-provider.mjs';
+import { DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from '../../lib/dispatch-routing-policy.mjs';
 import { runSeatWithProvider } from '../review-seat-runner.mjs';
 import {
   compareShadowAnswers, summarizeShadowAgreement, renderShadowReport, appendShadowRow, readShadowRows,
@@ -23,39 +24,43 @@ const OTHER = { summary: 'a log line leaks the token value', file: 'scripts/y.mj
 const REQUEST = { mandate: 'judge correctness', input: 'the diff', shape: { type: 'object' }, lens: 'correctness', runId: 'run-1', allowedTools: ['Read'] };
 const io = (extra) => ({ unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: '/lanes/review-lane', ...extra });
 
-describe('settings — review.seatProvider.<lens> extends the platform default', () => {
-  it('the platform flavor is native: Claude on every seat, no agy seat', () => {
-    const s = resolveReviewSeatSettings({});
-    expect(s.seatProvider).toEqual({ correctness: 'claude', security: 'claude' });
-    expect(s.agyCorrectnessAdvisory).toBe(false);
-    expect(s.agyModel).toBe(REVIEW_SEAT_PLATFORM_DEFAULT.review.agyModel);
+describe('settings — review.seatProvider.<lens> comes from the routing policy (one source)', () => {
+  const withEntries = (entries) => validateRoutingPolicy({ ...structuredClone(DEFAULT_ROUTING_POLICY), operations: { ...structuredClone(DEFAULT_ROUTING_POLICY.operations), ...entries } });
+  const strip = () => {
+    const ops = structuredClone(DEFAULT_ROUTING_POLICY.operations);
+    for (const k of Object.keys(ops)) if (k.startsWith('review-seat:mandatory:') || k.startsWith('review-seat:advisory:')) delete ops[k];
+    return validateRoutingPolicy({ ...structuredClone(DEFAULT_ROUTING_POLICY), operations: ops });
+  };
+  const agy = (extra = {}) => ({ provider: 'agy-claude', model: 'opus-5-5', effort: { 'agy-claude': 'high', claude: 'high' }, fallback: [{ provider: 'claude', model: 'sonnet', effort: 'high' }], ...extra });
+
+  it('no review-seat entries is the platform flavor: Claude on every seat, no agy seat', () => {
+    const s = settingsFromRoutingPolicy(strip());
+    expect(s).toEqual({ ...REVIEW_SEAT_PLATFORM_DEFAULT, seatProvider: { correctness: 'claude', security: 'claude' }, seatModel: {} });
     expect(seatProviderDirective(s, 'correctness')).toBeNull();
   });
 
-  it('a project layer wins per key (nearest-wins), leaving every other key on the platform value', () => {
-    const s = resolveReviewSeatSettings({ extends: ['platform'], review: { seatProvider: { security: 'agy' } } });
-    expect(s.seatProvider).toEqual({ correctness: 'claude', security: 'agy' });
+  it('an agy entry is agy, an agy entry with mode shadow is shadow, a claude entry is claude', () => {
+    const s = settingsFromRoutingPolicy(withEntries({
+      'review-seat:mandatory:correctness': agy({ mode: 'shadow' }),
+      'review-seat:mandatory:security': agy(),
+    }));
+    expect(s.seatProvider).toEqual({ correctness: 'shadow', security: 'agy' });
     expect(seatProviderDirective(s, 'security')).toEqual({ mode: 'agy', model: 'claude-opus-5-5-high', onEscape: 'claude' });
+    const c = settingsFromRoutingPolicy(withEntries({ 'review-seat:mandatory:correctness': { provider: 'claude', model: 'sonnet', fallback: [] } }));
+    expect(c.seatProvider.correctness).toBe('claude');
   });
 
-  it('the shipped project config: correctness and security in shadow, the advisory agy seat on', () => {
-    const s = loadReviewSeatSettings();
+  it('the shipped routing policy: correctness and security in shadow on claude-opus-5-5-high, the advisory agy seat on', () => {
+    const s = loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY });
     expect(s.seatProvider).toEqual({ correctness: 'shadow', security: 'shadow' });
+    expect(s.seatModel).toEqual({ correctness: 'claude-opus-5-5-high', security: 'claude-opus-5-5-high' });
     expect(s.agyCorrectnessAdvisory).toBe(true);
     expect(s.agyModel).toBe('claude-opus-5-5-high');
   });
 
-  it('refuses an unknown provider, an unknown seat, a flag-shaped model and a non-boolean switch', () => {
-    expect(() => resolveReviewSeatSettings({ review: { seatProvider: { correctness: 'gemini' } } })).toThrow(/claude\|agy\|shadow/);
-    expect(() => resolveReviewSeatSettings({ review: { seatProvider: { simplicity: 'agy' } } })).toThrow(/no such seat/);
-    expect(() => resolveReviewSeatSettings({ review: { agyModel: '--yolo' } })).toThrow(/plain model id/);
-    expect(() => resolveReviewSeatSettings({ review: { advisorySeats: { agyCorrectness: 'yes' } } })).toThrow(/true or false/);
-    expect(() => resolveReviewSeatSettings({ extends: ['elsewhere'] })).toThrow(/extends/);
-  });
-
-  it('a missing project file is the platform flavor alone', () => {
-    const missing = () => { const e = new Error('nope'); e.code = 'ENOENT'; throw e; };
-    expect(loadReviewSeatSettings({ read: missing }).seatProvider).toEqual({ correctness: 'claude', security: 'claude' });
+  it('the policy refuses a shadow with no Claude route to count, and an unknown mode', () => {
+    expect(() => withEntries({ 'review-seat:mandatory:correctness': agy({ mode: 'shadow', fallback: [] }) })).toThrow(/claude route in fallback/);
+    expect(() => withEntries({ 'review-seat:mandatory:correctness': agy({ mode: 'replace' }) })).toThrow(/mode must be "shadow"/);
   });
 });
 

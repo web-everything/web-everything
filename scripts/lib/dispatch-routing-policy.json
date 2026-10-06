@@ -4,6 +4,7 @@
     "An entry with inherit:true preserves the existing evidence/tier router. taskTypes entries override inherited operations; operations may also use operation:taskType keys (review-seat:security, for example).",
     "Aliases below resolve to explicit model IDs. Every policy-routed dispatch requires the critical-work check; criticalWorkGate.kinds also governs inherited routing. A closed gate takes the Claude fallback.",
     "Fallbacks are tried in order for unavailable providers BEFORE launch. Never retry an indeterminate or already-started launch. Invalid edits retain the last good policy and log the validation error.",
+    "Card 84: review-seat:mandatory:<correctness|security> picks a review-pr mandatory seat's provider — absent or claude = Claude only; agy-claude with mode shadow = agy judges beside Claude and only Claude counts (agreement report: node scripts/lib/review-shadow-agreement.mjs --report); agy-claude without mode = agy judges, Claude on escape. review-seat:advisory:agy-correctness seats the advisory agy juror (delete the entry to turn it off).",
     "Review operation judges use judge:<operation> (for example judge:review-pr); review-seat:<lens> selects an added seat. Native agent-only adapters take the first Claude entry; unsupported or missing adapters take the declared fallback. Existing CLI pins remain explicit per-run choices.",
     "Astra effort correctness is unproven (see CODEX_TIER_EFFORT in we:scripts/lib/codex-model-routing.mjs): effort is a cost/latency dial until measured.",
     "Operator 2026-09-30: Gemini only with confidence of value. smallPrepare controls the <=3, explicitly well-scoped, no-design prepare exception; widen it here as evidence arrives. Unknown size/design stays Codex."
@@ -31,7 +32,8 @@
     },
     "agy-claude": {
       "sonnet": "claude-sonnet-4-6",
-      "opus": "claude-opus-4-6-thinking"
+      "opus": "claude-opus-4-6-thinking",
+      "opus-5-5": "claude-opus-5-5-high"
     },
     "agy-gemini": {
       "flash": "gemini-3.8-flash",
@@ -89,7 +91,10 @@
     "prevention-card": {"provider": "codex","model": "astra","effort": {"claude": "low","codex": "low","antigravity": "low","agy-claude": "low","agy-gemini": "low"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]},
     "prepare-card": {"provider": "codex","model": "astra","effort": {"claude": "low","codex": "low","antigravity": "low","agy-claude": "low","agy-gemini": "low"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]},
     "doc-fix": {"provider": "codex","model": "astra","effort": {"claude": "low","codex": "low","antigravity": "low","agy-claude": "low","agy-gemini": "low"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]},
-    "review-seat:red-team": {"inherit": true,"effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"}}
+    "review-seat:red-team": {"inherit": true,"effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"}},
+    "review-seat:mandatory:correctness": {"provider": "agy-claude","model": "opus-5-5","mode": "shadow","effort": {"claude": "high","agy-claude": "high"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},
+    "review-seat:mandatory:security": {"provider": "agy-claude","model": "opus-5-5","mode": "shadow","effort": {"claude": "high","agy-claude": "high"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},
+    "review-seat:advisory:agy-correctness": {"provider": "agy-claude","model": "opus-5-5","effort": {"agy-claude": "high"},"fallback": []}
   },
   "taskTypes": {
     "doc-fix": {"provider": "codex","model": "astra","effort": {"claude": "low","codex": "low","antigravity": "low","agy-claude": "low","agy-gemini": "low"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]},
