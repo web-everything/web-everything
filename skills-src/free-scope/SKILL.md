@@ -37,7 +37,8 @@ node scripts/operations/free-scope-cli.mjs list
 ## Pre-push recheck
 
 Right before `open-pr`, re-run the check while excluding yourself:
-`check --files=<list> --exclude-agent=<purpose>` (and `--exclude-pr=<N>` when re-pushing your own PR).
+`check --files=<list> --exclude-agent=<purpose>` (and `--exclude-pr=<N>` when re-pushing your own web-everything PR; `--exclude-pr=plateau-app#<N>` for a PR in another repo, since PR numbers repeat across repos).
+If a repo has 200 or more open PRs the list may be cut off, so the verdict is `unknown`, never `free`.
 If something new holds your files, stop and report. Do not push over it.
 
 ## Read only

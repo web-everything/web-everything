@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { main } from '../held-cards-io.mjs';
 
 const dirs = [];
@@ -53,6 +54,27 @@ describe('held cards CLI with isolated files and fake subprocesses', () => {
     expect(JSON.parse(h.out.at(-1)).at(-1).doneReason).toBe('BUILT');
     expect(h.calls).toHaveLength(0);
   });
+  it('keeps every card when several processes add at the same moment', async () => {
+    const h = harness();
+    // Each worker pauses between its read and its write, so unlocked writers would all read the same list.
+    const driver = path.join(h.dir, 'slow-add.mjs');
+    fs.writeFileSync(driver, `import fs from 'node:fs';
+import { main } from ${JSON.stringify(path.resolve('scripts/held-cards-io.mjs'))};
+const pause = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+const writeFile = (file, data, enc) => { if (String(file) === process.env.WE_HELD_CARDS_PATH) pause(); fs.writeFileSync(file, data, enc); };
+process.exitCode = await main(['add', '--title=' + process.argv[2]], { writeFile });
+`);
+    const titles = ['Alpha.', 'Beta.', 'Gamma.', 'Delta.'];
+    const codes = await Promise.all(titles.map(title => new Promise((resolve) => {
+      const child = spawn(process.execPath, [driver, title], { env: { ...process.env, ...h.deps.env }, stdio: 'ignore' });
+      child.on('exit', resolve);
+    })));
+    expect(codes).toEqual([0, 0, 0, 0]);
+    const numbers = [...h.text().matchAll(/^(\d+)\. \*\*(\w+)\./gm)].map(m => [Number(m[1]), m[2]]);
+    expect(numbers.map(([, title]) => title).sort()).toEqual(['Alpha', 'Beta', 'Delta', 'First', 'Gamma', 'Second']);
+    expect(new Set(numbers.map(([num]) => num)).size).toBe(6);
+    expect(fs.existsSync(`${h.list}.lock`)).toBe(false);
+  }, 20000);
   it('saves status and detects growth on the next observation', async () => {
     const h = harness();
     expect(await h.run(['status'])).toBe(0);

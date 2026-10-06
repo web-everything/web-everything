@@ -32,7 +32,11 @@ export function writeRegistry(file, entries) {
   try { fs.writeFileSync(temp, `${JSON.stringify({ entries }, null, 2)}\n`); fs.renameSync(temp, file); }
   finally { fs.rmSync(temp, { force: true }); }
 }
-export function updateRegistry(file, fn) {
+/**
+ * Run `fn` while holding the exclusive `<file>.lock` directory lock, so a read-modify-write of `file` by
+ * concurrent processes is serialized. A lock older than 30s is treated as abandoned and stolen.
+ */
+export function withFileLock(file, fn) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const lock = `${file}.lock`, deadline = Date.now() + 5000;
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
@@ -47,23 +51,30 @@ export function updateRegistry(file, fn) {
       Atomics.wait(sleeper, 0, 0, 25);
     }
   }
-  try { const entries = fn(readRegistry(file)); writeRegistry(file, entries); return entries; }
+  try { return fn(); }
   finally {
     try { if (fs.statSync(lock).ino === identity.ino) fs.rmdirSync(lock); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
+}
+export function updateRegistry(file, fn) {
+  return withFileLock(file, () => { const entries = fn(readRegistry(file)); writeRegistry(file, entries); return entries; });
 }
 export function ghExec(env = process.env) {
   return (args) => env.WE_FREE_SCOPE_GH_BIN
     ? execFileSync(env.WE_FREE_SCOPE_GH_BIN, args, { encoding: 'utf8' })
     : runGhSync(args, { encoding: 'utf8' });
 }
+/** `gh pr list --limit` page size. A page this full may have been cut off, so it is never trusted as complete. */
+export const OPEN_PR_LIMIT = 200;
 export function readOpenPrs({ repos = DEFAULT_REPOS, exec }) {
   const prs = [], unreadable = [];
   for (const repo of repos) {
     try {
-      const rows = JSON.parse(exec(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json', 'number,title,url,files']));
+      const rows = JSON.parse(exec(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,url,files']));
       prs.push(...rows.map(({ number, title, url, files }) => ({ repo, number, title, url, files: files.map((f) => f.path) })));
+      // The rows read still count as holders, but the snapshot is incomplete: never let it answer "free".
+      if (rows.length >= OPEN_PR_LIMIT) unreadable.push({ repo, error: `open PR list hit the ${OPEN_PR_LIMIT}-row limit and may be truncated` });
     } catch (error) { unreadable.push({ repo, error: error.message.split(/\r?\n/)[0] }); }
   }
   return { prs, unreadable };

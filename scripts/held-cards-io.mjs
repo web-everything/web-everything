@@ -13,6 +13,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DEFAULT_REPOS } from './operations/free-scope.mjs';
+import { withFileLock } from './operations/free-scope-io.mjs';
 import { appendHeldCard, parseHeldCards, planFiling, quietVerdict, markFiled } from './held-cards.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -110,9 +111,13 @@ export async function main(argv, deps = {}) {
         if (flags[key] !== undefined) meta[key] = key === 'size' ? Number(flags[key]) :
           key === 'scope' ? String(flags[key]).split(',').map(s => s.trim()).filter(Boolean) : flags[key];
       }
-      const appended = appendHeldCard(md, { title: flags.title, body: flags.body || '',
-        nowEt: etTime(now()), meta: Object.keys(meta).length ? meta : null });
-      writeFile(list, appended.md, 'utf8');
+      // Read, number and write under the list lock: two workers adding at once must not allocate one number.
+      const appended = withFileLock(list, () => {
+        const result = appendHeldCard(read(list, ''), { title: flags.title, body: flags.body || '',
+          nowEt: etTime(now()), meta: Object.keys(meta).length ? meta : null });
+        writeFile(list, result.md, 'utf8');
+        return result;
+      });
       say(`held as item ${appended.num}`);
       return 0;
     }
@@ -173,7 +178,8 @@ export async function main(argv, deps = {}) {
       let pr = prNumber(String(output));
       if (!pr) { try { pr = prNumber(lastJson(output)); } catch { /* no JSON either — refused below */ } }
       if (!pr) throw new Error('open-pr returned no PR number');
-      writeFile(list, markFiled(read(list, ''), filed, { dateEt, pr }), 'utf8');
+      // Re-read under the lock so an `add` that landed during filing is kept, not overwritten.
+      withFileLock(list, () => writeFile(list, markFiled(read(list, ''), filed, { dateEt, pr }), 'utf8'));
       say(flags.json ? JSON.stringify({ filed, failed, pr }) : filed.map(item => `FILED ${item.num} as ${item.id}, PR #${pr}`).join('\n'));
       return 0;
     } finally {

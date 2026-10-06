@@ -5,10 +5,10 @@
  * and clock keep command tests isolated from the real GitHub host and shared registry.
  */
 import { pathToFileURL } from 'node:url';
-import { assessFreeScope, formatFreeScope, partitionRegistry, registerScope, releaseScope, DEFAULT_TTL_HOURS } from './free-scope.mjs';
+import { assessFreeScope, formatFreeScope, parseExcludePr, partitionRegistry, registerScope, releaseScope, DEFAULT_TTL_HOURS } from './free-scope.mjs';
 import { collectFreeScope, defaultRegistryPath, readRegistry, updateRegistry } from './free-scope-io.mjs';
 const usage = `Usage: free-scope [check|register|release|list] [options]
-  --files=a,b --card=<id> --exclude-agent=<name> --exclude-pr=<n> --json
+  --files=a,b --card=<id> --exclude-agent=<name> --exclude-pr=<n>|<repo>#<n> --json
   register --agent=<name> --purpose=<text> (--files=a,b | --card=<id>) [--ttl-hours=N]
   release --agent=<name>
   list [--json]
@@ -49,13 +49,12 @@ export function main(argv, { env = process.env, stdout = process.stdout, stderr 
       updateRegistry(registry, (entries) => { const result = releaseScope(entries, options.agent); released = result.released; return result.entries; });
       print(`released ${released}`); return 0;
     }
-    const excludePr = Number(options['exclude-pr'] ?? 0);
-    if (!Number.isInteger(excludePr) || excludePr < 0) throw new TypeError('free-scope: --exclude-pr must be a nonnegative integer');
+    const { repo: excludeRepo, number: excludePr } = parseExcludePr(options['exclude-pr']);
     const ttlHours = Number(options['ttl-hours'] ?? DEFAULT_TTL_HOURS);
     if (command === 'register' && (!Number.isFinite(ttlHours) || ttlHours <= 0)) throw new TypeError('free-scope: --ttl-hours must be positive');
     const snapshot = collect({ files: options.files ?? '', card: options.card ?? '', env, now });
     const assess = (agents) => assessFreeScope({ ...snapshot, agents,
-      excludeAgent: command === 'register' ? options.agent : options['exclude-agent'] ?? '', excludePr });
+      excludeAgent: command === 'register' ? options.agent : options['exclude-agent'] ?? '', excludePr, excludeRepo });
     let check, registered;
     if (command === 'register') {
       updateRegistry(registry, (entries) => {

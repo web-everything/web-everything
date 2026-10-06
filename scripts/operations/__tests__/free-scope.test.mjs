@@ -3,7 +3,7 @@
  * @description Pure conflict and expiry contract tests, including the declared reader/assessor boundary.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { qualifyFile, repoKeyFor, partitionRegistry, registerScope, releaseScope, assessFreeScope, formatFreeScope, freeScopeOperation } from '../free-scope.mjs';
+import { qualifyFile, repoKeyFor, partitionRegistry, registerScope, releaseScope, assessFreeScope, formatFreeScope, freeScopeOperation, parseExcludePr } from '../free-scope.mjs';
 const startedAt = '2026-10-05T10:00:00.000Z';
 const nowMs = Date.parse(startedAt);
 const agent = { agent: 'build-x', purpose: 'build', files: ['we:scripts/lib/'], startedAt };
@@ -51,6 +51,25 @@ describe('free-scope core', () => {
     expect(verdict.headline).toContain('1 stale registry entry ignored');
     expect(formatFreeScope(verdict)).toContain('stale (ignored):');
     expect(formatFreeScope(verdict)).toContain('FREE      we:scripts/lib/x.mjs');
+  });
+  it('excludes only the named repo and PR pair, never an equal number in another repo', () => {
+    const other = { ...pr, repo: 'plateauapp/plateau-app', title: 'Other repo same number' };
+    // The scope spans both repos, and PR #12 in each touches the same relative path.
+    const both = { files: ['we:scripts/lib/x.mjs', 'plateau-app:scripts/lib/x.mjs'], prs: [pr, other], excludePr: 12 };
+    const heldBy = (verdict) => verdict.files.map((row) => row.holders.map((h) => h.repo));
+    const defaulted = assess(both);
+    expect(defaulted.status).toBe('occupied');
+    expect(heldBy(defaulted)).toEqual([[], ['plateauapp/plateau-app']]);
+    const plateau = assess({ ...both, excludeRepo: 'plateauapp/plateau-app' });
+    expect(heldBy(plateau)).toEqual([['web-everything/web-everything'], []]);
+    expect(heldBy(assess({ ...both, excludeRepo: 'nobody/else' }))).toEqual([['web-everything/web-everything'], ['plateauapp/plateau-app']]);
+  });
+  it('resolves an exclude-pr spec to a repo slug and number', () => {
+    expect(parseExcludePr('12')).toEqual({ repo: 'web-everything/web-everything', number: 12 });
+    expect(parseExcludePr('plateau-app#7')).toEqual({ repo: 'plateauapp/plateau-app', number: 7 });
+    expect(parseExcludePr('plateauapp/plateau-app#7')).toEqual({ repo: 'plateauapp/plateau-app', number: 7 });
+    expect(parseExcludePr(undefined)).toEqual({ repo: 'web-everything/web-everything', number: 0 });
+    for (const bad of ['bad', '-1', '1.5', 'nope#3', '#3', 'we#x']) expect(() => parseExcludePr(bad)).toThrow(TypeError);
   });
   it('never declares a partial snapshot free and rejects empty scope', () => {
     const unreadable = [{ repo: 'bad/repo', error: 'unavailable' }];

@@ -20,7 +20,10 @@ beforeEach(() => {
 const args = process.argv.slice(2);
 const repo = args[args.indexOf('--repo') + 1];
 if (repo === 'bad/repo') { process.stderr.write('unavailable\\n'); process.exit(1); }
-console.log(JSON.stringify(repo === 'fixture/repo' ? [{number: 12, title: 'Fixture', url: 'https://example.test/12', files: [{path: 'held.mjs'}]}] : []));
+const full = Array.from({length: Number(args[args.indexOf('--limit') + 1])}, (_, i) => ({number: i + 1, title: 'P', url: 'u', files: [{path: 'f' + i + '.mjs'}]}));
+const twin = [{number: 12, title: 'Twin ' + repo, url: 'u', files: [{path: 'twin.mjs'}]}];
+const fixture = [{number: 12, title: 'Fixture', url: 'https://example.test/12', files: [{path: 'held.mjs'}]}];
+console.log(JSON.stringify(repo === 'full/repo' ? full : require('node:fs').existsSync(__filename + '.twins') ? twin : repo === 'fixture/repo' ? fixture : []));
 `, { mode: 0o755 });
   env = { WE_AGENT_SCOPES_PATH: registry, WE_FREE_SCOPE_GH_BIN: gh };
   fs.mkdirSync(path.join(root, 'backlog'));
@@ -58,6 +61,34 @@ it('reads real fake-gh subprocess output and retains failures per repo', () => {
   expect(result.unreadable).toHaveLength(1);
   expect(result.unreadable[0].repo).toBe('bad/repo');
   expect(result.unreadable[0].error).not.toContain('\n');
+});
+it('treats a full page of open PRs as unreadable, so a truncated snapshot is never free', () => {
+  const result = readOpenPrs({ repos: ['full/repo', 'fixture/repo'], exec: ghExec(env) });
+  expect(result.unreadable).toHaveLength(1);
+  expect(result.unreadable[0]).toMatchObject({ repo: 'full/repo' });
+  expect(result.unreadable[0].error).toMatch(/200/);
+  expect(result.prs.filter((p) => p.repo === 'fixture/repo')).toHaveLength(1);
+  const collect = (options) => collectFreeScope({ ...options, repos: ['full/repo'] });
+  const verdict = cli(['--files=untouched.mjs', '--json'], { collect });
+  expect(verdict.code).toBe(2);
+  expect(JSON.parse(verdict.out)).toMatchObject({ status: 'unknown', unreadable: [{ repo: 'full/repo' }] });
+  const seen = cli(['--files=repo:f3.mjs', '--json'], { collect });
+  expect(seen.code).toBe(1);
+  expect(JSON.parse(seen.out).status).toBe('occupied');
+});
+it('qualifies --exclude-pr by repo through the CLI', () => {
+  // Both default repos report an open PR #12 touching the same file.
+  fs.writeFileSync(path.join(root, 'gh.twins'), '');
+  const twin = (extra) => cli(['--files=twin.mjs,plateau-app:twin.mjs', '--json', ...extra]);
+  const holders = (result) => JSON.parse(result.out).files.map((row) => row.holders.map((h) => h.repo));
+  const defaulted = twin(['--exclude-pr=12']);
+  expect(defaulted.code).toBe(1);
+  expect(holders(defaulted)).toEqual([[], ['plateauapp/plateau-app']]);
+  const plateau = twin(['--exclude-pr=plateau-app#12']);
+  expect(plateau.code).toBe(1);
+  expect(holders(plateau)).toEqual([['web-everything/web-everything'], []]);
+  expect(holders(twin([]))).toEqual([['web-everything/web-everything'], ['plateauapp/plateau-app']]);
+  expect(cli(['--files=x.mjs', '--exclude-pr=nope#3']).code).toBe(2);
 });
 it('matches exact card IDs and combines qualified scope with CLI files', () => {
   expect(findCardFile('#123', { root })).toBe(path.join(root, 'backlog/123-some-card.md'));
