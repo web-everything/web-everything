@@ -248,7 +248,7 @@ function listAllRuns(store) {
  *  {@link checkResumable}'s own safety check below. */
 export function defaultCurrentLaneSession(lane, { run: runFn = run } = {}) {
   try {
-    const out = runFn('node', ['scripts/lane-pool.mjs', 'status', '--json']);
+    const out = runFn('node', ['scripts/lane-pool.mjs', 'status', '--json', `--lane=${lane}`, '--leased-only']);
     const parsed = JSON.parse(out);
     const rows = Array.isArray(parsed.lanes) ? parsed.lanes : [];
     const found = rows.find((r) => Number(r.lane) === Number(lane));

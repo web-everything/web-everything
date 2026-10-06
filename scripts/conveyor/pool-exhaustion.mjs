@@ -80,6 +80,8 @@ export function makePoolExhaustionLogger({
 }
 
 function defaultReadStatus({ lanePoolRepo = null } = {}) {
+  // Keep full status: summarizePoolExhaustion distinguishes dirty unleased lanes from clean ones;
+  // --leased-only omits their clean field and would incorrectly count dirty lanes as clean.
   const argv = [join(REPO_ROOT, 'scripts', 'lane-pool.mjs'), 'status', '--json'];
   if (lanePoolRepo) argv.push(`--repo=${lanePoolRepo}`);
   return JSON.parse(execFileSync('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024, timeout: 120_000, killSignal: 'SIGKILL' }));

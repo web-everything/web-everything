@@ -100,6 +100,43 @@ afterEach(() => {
 });
 
 describe('status --leased-only (#4345)', () => {
+  it('single lane status spawns git only in lane-3, including with cache and lease flags', () => {
+    const full = runPool(['status', ...poolArgs(), '--json']);
+    expect(full.code).toBe(0);
+    const expected = JSON.parse(full.out).lanes.find((row) => row.lane === 3);
+    const shimDir = join(base, 'bin');
+    mkdirSync(shimDir, { recursive: true });
+    const spawnLog = join(base, 'git-spawns.log');
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    writeFileSync(join(shimDir, 'git'), `#!/bin/bash\necho "$PWD|$*" >> "${spawnLog}"\nexec "${realGit}" "$@"\n`);
+    chmodSync(join(shimDir, 'git'), 0o755);
+
+    // Match the existing spawn observer: count pool-lane probes, excluding repo discovery at startup.
+    const laneSpawns = () => readFileSync(spawnLog, 'utf8').split('\n').filter((line) => line.startsWith(join(poolRoot, 'leasedonly') + '/'));
+    const env = { PATH: `${shimDir}:${process.env.PATH}`, WE_LANE_STATUS_MAX_AGE_MS: '' };
+    for (const extra of [[], ['--max-age-ms=60000']]) {
+      writeFileSync(spawnLog, '');
+      const result = runPool(['status', ...poolArgs(), '--json', '--lane=3', ...extra], env);
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.out).lanes).toEqual([expected]);
+      const spawns = laneSpawns();
+      expect(spawns.length).toBeGreaterThanOrEqual(4);
+      expect(spawns.filter((line) => !line.startsWith(laneDirOf(3) + '|'))).toEqual([]);
+    }
+    writeFileSync(spawnLog, '');
+    const skipped = runPool(['status', ...poolArgs(), '--json', '--lane=3', '--leased-only', '--max-age-ms=60000'], env);
+    expect(skipped.code).toBe(0);
+    expect(JSON.parse(skipped.out).lanes).toEqual([expect.objectContaining({ lane: 3, leased: false })]);
+    expect(JSON.parse(skipped.out).lanes[0]).not.toHaveProperty('clean');
+    expect(laneSpawns()).toEqual([]);
+    for (const lane of ['999', 'unknown']) {
+      const missing = runPool(['status', ...poolArgs(), '--json', `--lane=${lane}`], env);
+      expect(missing.code).toBe(0);
+      expect(JSON.parse(missing.out).lanes).toEqual([]);
+    }
+    expect(laneSpawns()).toEqual([]);
+  });
+
   it('spawns git only in the leased lane, and returns the same row for it as full status', () => {
     const full = runPool(['status', ...poolArgs(), '--json']);
     expect(full.code).toBe(0);

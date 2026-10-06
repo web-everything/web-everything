@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  classifyClaimLiveness, decideOrphanAction, findLatestBuildRow, findLatestInFlightBuildRow,
+  defaultCurrentLaneSession, classifyClaimLiveness, decideOrphanAction, findLatestBuildRow, findLatestInFlightBuildRow,
   adoptOrphanedBuildClaims, checkResumable, spawnResumeDelivery, MAX_RESUME_ATTEMPTS,
 } from '../build-dispatch-orphan-adopt.mjs';
 import {
@@ -673,5 +673,18 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
       isPidAlive: () => { throw new Error('must never be consulted for a non-build claim'); },
     });
     expect(results).toEqual([]);
+  });
+});
+
+
+describe('defaultCurrentLaneSession', () => {
+  it('requests only the selected lane with lease-only status', () => {
+    const run = (command, argv) => {
+      expect(command).toBe('node');
+      expect(argv).toEqual(['scripts/lane-pool.mjs', 'status', '--json', '--lane=3', '--leased-only']);
+      return JSON.stringify({ lanes: [{ lane: 3, lease: { session: 'holder' } }] });
+    };
+    expect(defaultCurrentLaneSession(3, { run })).toBe('holder');
+    expect(defaultCurrentLaneSession(3, { run: () => '{"lanes":[]}' })).toBeNull();
   });
 });
