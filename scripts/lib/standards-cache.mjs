@@ -45,7 +45,9 @@ export function fileKeys(root) {
   return keys;
 }
 
-const IMPORT_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+)['"](\.{1,2}\/[^'"]+)['"]/gm;
+const IMPORT_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+)['"](\.{1,2}\/[^'"\n]+)['"]/gm;
+// Whole-line // comments are skipped (block comments are NOT stripped: a `/*` inside a string could hide a real import) so prose that mentions an import cannot trigger a lookup.
+const stripComments = (src) => src.replace(/^\s*\/\/.*$/gm, '');
 
 /** Static import closure of an entry file (relative specifiers only). Throws on an unresolvable one. */
 export function importClosure(entry) {
@@ -54,7 +56,7 @@ export function importClosure(entry) {
     if (seen.has(file)) return;
     const src = readFileSync(file, 'utf8');
     seen.set(file, src);
-    for (const m of src.matchAll(IMPORT_RE)) {
+    for (const m of stripComments(src).matchAll(IMPORT_RE)) {
       const target = resolve(dirname(file), m[1]);
       if (!existsSync(target)) throw new Error(`unresolved import ${m[1]} from ${file}`);
       if (/\.(mjs|cjs|js)$/.test(target)) walk(target);

@@ -42,6 +42,13 @@ describe('standards-cache', () => {
     expect(ruleVersion('s', [join(d, 'main.mjs')])).toBeNull();
   });
 
+  it('prose that mentions an import is not followed; the real check-standards closure resolves', () => {
+    const d = mk();
+    writeFileSync(join(d, 'main.mjs'), "// see import x from './nope.mjs'\n/* wrapped from './ai-pr-\n authorship.mjs' */\n");
+    expect(ruleVersion('s', [join(d, 'main.mjs')])).toBeTypeOf('string');
+    expect(ruleVersion('s', ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs'])).toBeTypeOf('string');
+  });
+
   it('CI=1 is always a miss, and the setting disables it', () => {
     const dir = mk();
     const on = { WE_STANDARDS_CACHE_DIR: dir };
