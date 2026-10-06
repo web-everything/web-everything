@@ -68,7 +68,9 @@ describe('the verify gate wires the scanners in', () => {
     return '';
   };
   it('a new scanned file adds the scoped scan to the gate command; docs-only leaves it unchanged', () => {
-    const withScan = resolveDefaultGate({ runGit: git(['scripts/lib/new-thing.mjs']), env: {}, fileExists: () => true });
+    // pin the policy: the shipped default is `auto`, which skips check:standards for a scripts/ diff — and this
+    // assertion is about the scan half's position relative to the check:standards half
+    const withScan = resolveDefaultGate({ runGit: git(['scripts/lib/new-thing.mjs']), env: { WE_VERIFY_STANDARDS: 'always' }, fileExists: () => true });
     expect(withScan.scanCommands.length).toBeGreaterThan(0);
     expect(withScan.command).toContain(SCAN_FILES_ENV);
     expect(withScan.command.indexOf('vitest related')).toBeLessThan(withScan.command.indexOf(SCAN_FILES_ENV));
