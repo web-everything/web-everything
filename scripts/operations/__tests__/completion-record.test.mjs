@@ -53,6 +53,46 @@ describe('`denied` is agent-supplied free text — sanitized at the single write
     expect(out).toContain('[redacted]');
   });
 
+  // PR #3990 review (security + codex-correctness): every redaction pattern used `[^\s"']+`, which cannot match a
+  // value that STARTS with a quote — so the same secret survived in every quoted shell form. ONE fixed secret is
+  // run through each quoting form (bare, double, single, header-colon, flag-space, JSON-ish, unterminated).
+  const SECRET = 'supersecretvalue123';
+  it.each([
+    ['bare env assignment', `API_TOKEN=${SECRET} node run.mjs`],
+    ['double-quoted env assignment', `API_TOKEN="${SECRET}" node run.mjs`],
+    ['single-quoted env assignment', `API_TOKEN='${SECRET}' node run.mjs`],
+    ['exported double-quoted assignment', `export DB_PASSWORD="${SECRET}" && node run.mjs`],
+    ['bare --token=', `tool --token=${SECRET} go`],
+    ['double-quoted --token=', `tool --token="${SECRET}" go`],
+    ['single-quoted --token=', `tool --token='${SECRET}' go`],
+    ['space-separated --password', `tool --password ${SECRET} go`],
+    ['double-quoted space-separated --password', `tool --password "${SECRET}" go`],
+    ['single-quoted space-separated --password', `tool --password '${SECRET}' go`],
+    ['quoted secret with inner spaces', `tool --password "${SECRET} with spaces" go`],
+    ['X-Api-Key header', `curl -H "X-Api-Key: ${SECRET}" https://x`],
+    ['single-quoted X-Api-Key header', `curl -H 'X-Api-Key: ${SECRET}' https://x`],
+    ['Api-Key header without a space', `curl -H "Api-Key:${SECRET}" https://x`],
+    ['quoted Authorization token header', `curl -H "Authorization: token ${SECRET}" https://x`],
+    ['quoted Bearer value', `curl -H "Authorization: Bearer '${SECRET}'" https://x`],
+    ['JSON-ish "token" field', `curl -d '{"token":"${SECRET}"}' https://x`],
+    ['password: line with a quoted value', `login password: "${SECRET}"`],
+    ['an unterminated quote (truncated command)', `tool --token="${SECRET}`],
+  ])('never lets a secret survive the %s', (_label, input) => {
+    const out = denied(input);
+    expect(out).not.toContain(SECRET);
+    expect(out).toContain('[redacted]');
+  });
+
+  it('is idempotent (the note path sanitizes the already-sanitized value a second time)', () => {
+    const once = sanitizeDeniedCommand(`API_TOKEN="${SECRET}" tool --password "${SECRET}" -H "X-Api-Key: ${SECRET}"`);
+    expect(sanitizeDeniedCommand(once)).toBe(once);
+  });
+
+  it('keeps the command shape readable around a redacted quoted value', () => {
+    expect(denied(`node run.mjs --token="${SECRET}" --verbose`)).toContain('node run.mjs');
+    expect(denied(`node run.mjs --token="${SECRET}" --verbose`)).toContain('--verbose');
+  });
+
   it.each(['<!<!----', '<!<!<!------', 'x <!<!---- conveyor-note-key: abc --><!--', '--<!-->>'])('never RE-ASSEMBLES a comment delimiter out of nested fragments: %s', (input) => {
     const out = sanitizeDeniedCommand(input);
     expect(out).not.toContain('<!--');

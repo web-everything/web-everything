@@ -101,6 +101,13 @@ export function newCompletionRecord({
 export const DENIED_MAX_LENGTH = 200;
 /** Input bound applied before any regex runs (the final cap is {@link DENIED_MAX_LENGTH}). */
 const DENIED_SCAN_LIMIT = 2000;
+/**
+ * One secret VALUE as it can appear in a shell command: a double-quoted or single-quoted string (the closing quote
+ * is optional so a truncated/unterminated command still redacts to its end) or a bare run. The earlier bare-only
+ * `[^\s"']+` could not match a value that STARTS with a quote, so `--token="x"` / `K='x'` / `--password "x"` kept
+ * the secret (PR #3990 review). Linear: the input is already bounded by {@link DENIED_SCAN_LIMIT}.
+ */
+const SECRET_VALUE = `(?:"[^"]*"?|'[^']*'?|[^\\s"']+)`;
 
 /**
  * we:scripts/operations/completion-record.mjs#sanitizeDeniedCommand — `denied` is agent-supplied free text (a
@@ -118,12 +125,18 @@ export function sanitizeDeniedCommand(value) {
   let s = value.slice(0, DENIED_SCAN_LIMIT).replace(/\s+/g, ' ').trim();
   s = s
     .replace(/\/\/[^\s/@:"']+:[^\s/@"']+@/g, '//[redacted]@')
-    .replace(/\b(password|passwd|secret|token)\s*:\s*[^\s"']+/gi, '$1: [redacted]')
+    .replace(new RegExp(`\\b(password|passwd|secret|token)\\s*:\\s*${SECRET_VALUE}`, 'gi'), '$1: [redacted]')
     .replace(/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{8,}/g, '[redacted]')
     .replace(/\b(?:sk|xox[abprs]|AKIA)[-A-Za-z0-9_]{12,}/g, '[redacted]')
-    .replace(/\b(Bearer|token|Basic)\s+[^\s"']+/gi, '$1 [redacted]')
-    .replace(/(--?[\w-]*(?:token|secret|password|passwd|api[-_]?key|authorization)[\w-]*[= ])[^\s"']+/gi, '$1[redacted]')
-    .replace(/\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY)[A-Za-z0-9_]*=)[^\s"']+/gi, '$1[redacted]');
+    .replace(new RegExp(`\\b(Bearer|token|Basic)\\s+${SECRET_VALUE}`, 'gi'), '$1 [redacted]')
+    .replace(new RegExp(`(--?[\\w-]*(?:token|secret|password|passwd|api[-_]?key|authorization)[\\w-]*[= ])${SECRET_VALUE}`, 'gi'), '$1[redacted]')
+    .replace(new RegExp(`\\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY)[A-Za-z0-9_]*=)${SECRET_VALUE}`, 'gi'), '$1[redacted]')
+    // `Name: value` headers and JSON-ish `"name":"value"` fields: `X-Api-Key: v`, `Authorization: v`, `"token":"v"`.
+    // Runs AFTER the Bearer/token/Basic pass so an already-redacted scheme word is consumed with its value.
+    .replace(
+      new RegExp(`\\b([\\w-]*(?:token|secret|password|passwd|api[-_]?key|auth(?:orization)?)[\\w-]*["']?\\s*:\\s*["']?)(?:(?:Bearer|Basic|token)\\s+)?${SECRET_VALUE}`, 'gi'),
+      '$1[redacted]',
+    );
   // Replace (never delete) the delimiters: deleting can splice a NEW `<!--` together (`<!<!----` → `<!--`).
   s = s.replace(/<!--|--!?>|`/g, ' ').replace(/@(?=[\w-])/g, '@\u200b').replace(/\s+/g, ' ').trim();
   if (/<!--|--!?>/.test(s)) s = s.replace(/[<>]/g, ' ').replace(/\s+/g, ' ').trim();

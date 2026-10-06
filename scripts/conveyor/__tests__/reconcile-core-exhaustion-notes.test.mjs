@@ -320,6 +320,20 @@ describe('PR #3990 review — a hostile `denied` in a completion record cannot f
     expect(note.deniedCommand.length).toBeLessThanOrEqual(DENIED_MAX_LENGTH);
   });
 
+  // PR #3990 review (security + codex-correctness): a QUOTED secret reached the posted comment — the note path
+  // re-sanitizes, but the shared sanitizer missed quoted values. Wiring test: raw record → plan → posted body.
+  it.each([
+    ['a double-quoted env assignment', 'API_TOKEN="supersecretvalue123" node run.mjs'],
+    ['a double-quoted --token=', 'tool --token="supersecretvalue123" go'],
+    ['a space-separated quoted --password', 'tool --password "supersecretvalue123" go'],
+    ['an X-Api-Key header', 'curl -H "X-Api-Key: supersecretvalue123" https://x'],
+  ])('never posts a literal secret from %s into the PR comment body', (_label, quoted) => {
+    const note = planWith(quoted).notes.find((n) => n.kind === 'permission-blocked');
+    expect(note.deniedCommand).not.toContain('supersecretvalue123');
+    expect(note.text).not.toContain('supersecretvalue123');
+    expect(buildNoteComment(note)).not.toContain('supersecretvalue123');
+  });
+
   it('the posted body holds exactly ONE episode key (its own), so a different episode is never suppressed', () => {
     const note = planWith(hostile).notes.find((n) => n.kind === 'permission-blocked');
     const body = buildNoteComment(note);

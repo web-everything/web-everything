@@ -67,6 +67,25 @@ describe('classifyAgentReturn — #3412 free-form-question fixture', () => {
     expect(isStructuredReturn(text)).toBe(true);
     expect(classifyAgentReturn({ num: 3945, text })).toBeNull();
   });
+
+  // PR #3990 review (correctness): the brief tells a fixer to return `#N → blocked-on-permission (<denied
+  // command>)`, and nothing defended the widened `blocked-on-(?:infra|permission)` pattern — a regression to
+  // `infra` only would file a spurious hiccup for every permission denial.
+  it('recognizes the fix-agent-brief\'s `blocked-on-permission` return (with its denied-command detail) as KNOWN', () => {
+    const text = '#1 → blocked-on-permission (git checkout --theirs f)';
+    expect(isStructuredReturn(text)).toBe(true);
+    expect(classifyAgentReturn({ num: 1, text })).toBeNull();
+    const briefLine = '# → blocked-on-permission (tool/permission denial applying an otherwise-clear fix on PR #3990)';
+    expect(isStructuredReturn(briefLine)).toBe(true);
+  });
+
+  it.each(['blocked-on-infra', 'blocked-on-permission'])('recognizes `→ %s` in every spacing/case the brief can emit', (word) => {
+    for (const text of [`#7 → ${word}`, `#7 →  ${word.toUpperCase()} (x)`, `# → ${word} (y)`]) expect(isStructuredReturn(text)).toBe(true);
+  });
+
+  it('does not match the bare word without the `→` return arrow (free prose stays a hiccup)', () => {
+    expect(isStructuredReturn('I was blocked-on-permission earlier, so I asked what to do next?')).toBe(false);
+  });
 });
 
 describe('assessMissingOperationConfidence — #3421 addendum axis', () => {

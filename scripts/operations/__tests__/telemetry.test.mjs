@@ -73,6 +73,14 @@ describe('vocabularies — the closed sets that make aggregation possible', () =
     for (const o of ERROR_OUTCOMES) expect(OK_OUTCOMES).not.toContain(o);
   });
 
+  // PR #3990 review (correctness): `blocked-on-permission` consumed a lane and an agent turn and produced no
+  // landable diff, exactly like `blocked-on-infra` — it must stay an error outcome.
+  it('counts the fix brief\'s `blocked-on-permission` as an error outcome, like `blocked-on-infra`', () => {
+    expect(ERROR_OUTCOMES).toContain('blocked-on-permission');
+    expect(classifyOutcomeStatus('blocked-on-permission')).toBe('error');
+    expect(classifyOutcomeStatus('blocked-on-permission')).toBe(classifyOutcomeStatus('blocked-on-infra'));
+  });
+
   it('classifyOutcomeStatus never guesses: an unknown word is `unset`, not `ok`', () => {
     expect(classifyOutcomeStatus('gate-red')).toBe('error');
     expect(classifyOutcomeStatus('pr-opened')).toBe('ok');
