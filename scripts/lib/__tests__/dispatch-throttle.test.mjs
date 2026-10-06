@@ -6,7 +6,6 @@ import {
   createDispatchThrottle, hostLoadGate, countLiveFixSessions, resolveFixDispatchMaxConcurrent,
   resolveMaxLoadPerCore, resolveHeavyAdmissionCap,
 } from '../dispatch-throttle.mjs';
-import { resolveCap } from '../../readiness/heavy-admission.mjs';
 import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { runReconcileCiHealDispatch } from '../../operations/ci-heal-pr-dispatch.mjs';
 
@@ -22,9 +21,8 @@ describe('declared settings', () => {
     expect(resolveFixDispatchMaxConcurrent({ env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '0' } })).toBe(2);
     expect(resolveMaxLoadPerCore({ env: { WE_MAX_LOAD_PER_CORE: 'x' } })).toBe(2);
   });
-  it('heavy-admission resolveCap reads the declared setting, env still wins', () => {
-    expect(resolveCap({})).toBe(2);
-    expect(resolveCap({ WE_HEAVY_ADMISSION_CAP: '3' })).toBe(3);
+  it('heavy cap resolves from the declared file, env still wins', () => {
+    expect(resolveHeavyAdmissionCap({ env: { WE_HEAVY_ADMISSION_CAP: '3' } })).toBe(3);
     expect(resolveHeavyAdmissionCap({ env: {}, file: { heavyAdmissionCap: 5 } })).toBe(5);
   });
 });
