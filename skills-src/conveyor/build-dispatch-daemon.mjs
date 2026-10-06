@@ -37,6 +37,7 @@ import { createPhaseTimer } from '../../scripts/lib/phase-timer.mjs';
 import { resolveOperationRoute, routingPolicyEnv } from '../../scripts/lib/dispatch-routing-policy-io.mjs';
 import { childFailure } from '../../scripts/lib/child-failure.mjs';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync } from 'node:fs';
 import { tmpdir, hostname, homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -317,7 +318,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   });
   // Exclude held candidates BEFORE the tick core allocates its two prepare slots.
   bookkeeping = { ...bookkeeping, prepareHeldNums: holds.map((h) => normNum(h.num)) };
-  const out = await effects.planTick(bookkeeping);
+  const tickBookkeeping = bookkeeping;
+  const out = await effects.planTick(tickBookkeeping);
+  // The plan's age is what dispatch-lane's freshness bound must measure, so stamp it here, once, right after
+  // planning — never at each (possibly much later) dispatch.
+  const tickAt = new Date(effects.now?.() ?? Date.now()).toISOString();
   const d = out?.decisions || {};
   const admission = d.admission || {};
   const scopeByNum = new Map((admission.queue || []).map((r) => [normNum(r.num), Array.isArray(r.scope) ? r.scope : []]));
@@ -459,7 +464,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const claim = effects.acquireClaim({ num: pick.num, scope: pick.scope });
       if (!claim.ok) { failures.push({ num: pick.num, stage: 'claim', reason: `${claim.reason}${claim.heldBy ? ` by ${claim.heldBy}` : ''}` }); continue; }
       let res;
-      try { res = await effects.dispatch({ num: pick.num, bookkeeping }); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
+      try { res = await effects.dispatch({ num: pick.num, bookkeeping, tick: out, tickBookkeeping, tickAt }); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
       if (res?.dispatching) dispatched.push({ num: pick.num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null });
       else { effects.releaseClaim({ num: pick.num }); failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched' }); }
     }
@@ -647,7 +652,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         continue;
       }
       let res;
-      try { res = await effects.dispatch({ num, bookkeeping, launchKind: 'prepare-item', prepareFallback: fallback }); }
+      try { res = await effects.dispatch({ num, bookkeeping, launchKind: 'prepare-item', prepareFallback: fallback, tick: out, tickBookkeeping, tickAt }); }
       catch (e) { res = { dispatching: false, reason: String(e?.message || e) }; }
       if (res?.dispatching) {
         prepareBusy.add(num);
@@ -891,16 +896,28 @@ export function cliListHolds() {
     .map((h) => ({ num: normNum(h.meta.num), reason: h.meta.reason ?? null }));
 }
 
-export function cliDispatch({ num, bookkeeping, launchKind = 'build', prepareFallback = false }, { exec = execFileSync } = {}) {
+export function cliDispatch({ num, bookkeeping, launchKind = 'build', prepareFallback = false, tick, tickBookkeeping, tickAt }, { exec = execFileSync } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'build-dispatch-daemon-'));
   const file = join(dir, 'bookkeeping.json');
   try {
-    // dispatch-lane re-reads the tick for this num and infers prepare-item from spawnPrepareItems.
-    // Keep the re-read under the same lane-cap policy as cliPlanTick; otherwise a planned
+    // dispatch-lane reuses the supplied tick, falling back to a re-read if the handoff is invalid.
+    // Keep that re-read under the same lane-cap policy as cliPlanTick; otherwise a planned
     // prepare can disappear and be reported as the build-only needs-prepare hold.
     // Its model override travels in JSON argv plus a recorded reason, not a run.mjs control flag.
     writeFileSync(file, JSON.stringify({ bookkeeping: bookkeeping || {} }), { mode: 0o600 });
-    const text = exec('node', [join(SCRIPTS, 'operations', 'run.mjs'), 'dispatch-lane', `--num=${num}`, `--bookkeepingFile=${file}`, '--json'], {
+    const argv = [join(SCRIPTS, 'operations', 'run.mjs'), 'dispatch-lane', `--num=${num}`, `--bookkeepingFile=${file}`, '--json'];
+    // `at` is the PLAN time (`tickAt`), so dispatch-lane's under-5-min bound measures the plan's real age. A
+    // caller that cannot say when the plan was made hands off nothing: dispatch-lane re-plans.
+    if (tick && Number.isFinite(Date.parse(tickAt))) {
+      const tickFile = join(dir, 'tick.json');
+      writeFileSync(tickFile, JSON.stringify({
+        at: tickAt,
+        bookkeepingHash: createHash('sha256').update(JSON.stringify({ bookkeeping: tickBookkeeping || {} })).digest('hex'),
+        tick,
+      }), { mode: 0o600 });
+      argv.push(`--tickFile=${tickFile}`);
+    }
+    const text = exec('node', argv, {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, cwd: REPO_ROOT,
       env: { ...process.env, ...routingPolicyEnv(), ...(launchKind === 'prepare-item' && prepareFallback ? { WE_PROBATION_LAUNCH: 'off' } : {}), [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, WE_BUILD_DISPATCH_MODE: process.env.WE_BUILD_DISPATCH_MODE || 'mechanical' },
     });
