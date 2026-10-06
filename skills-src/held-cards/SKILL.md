@@ -38,8 +38,9 @@ node scripts/held-cards-io.mjs file               # refuses when busy
 ```
 
 When quiet, it files every item not marked `FILED` or `BUILT`. A marker counts only on the item's first line: the
-bold `**FILED …**` span it writes, or the word right after a leading bold title (`N. **Title.** BUILT`). The words
-in a title, body or later line are ordinary text and never mark an item done. It uses ONE lane and the sanctioned `file-item`
+bold `**FILED …**` span it writes at the end of that line, or the word right after a leading bold title
+(`N. **Title.** BUILT`). The words in a title (even a title that starts with them), body or later line are ordinary
+text and never mark an item done. It uses ONE lane and the sanctioned `file-item`
 operation once per item. Then it makes one commit, runs `verify`, opens ONE PR via `open-pr`, marks each item
 `FILED <date> as <id>, PR #N` in the list, and always releases the lane. An item that `file-item` refuses stays
 unfiled and is listed as `NOT FILED`. `--blocking` skips the quiet check; use it only under rule 21's exception.

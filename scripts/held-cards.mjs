@@ -17,11 +17,13 @@ export function heldTitle(firstLine) {
 }
 
 /** FILED|BUILT when an item's FIRST line carries a completion marker, else null. Two shapes only: the bold
- *  `**FILED …**` span `markFiled` appends, and the word right after a leading bold title (`**Title.** BUILT`).
- *  An uppercase mention in a title, body, continuation line or metadata is ordinary prose, never a marker. */
+ *  `**FILED …**` span `markFiled` appends at the END of the line (never the leading title span itself), and the
+ *  word right after a leading bold title (`**Title.** BUILT`). An uppercase mention in a title, body,
+ *  continuation line or metadata is ordinary prose, never a marker. */
 export function completionMarker(text) {
   const rest = text.split('\n', 1)[0].replace(/^\d+\.\s+/, '');
-  return /\*\*(FILED|BUILT)\b[^*]*\*\*/.exec(rest)?.[1] ?? /^\*\*[^*]+\*\*\s+(FILED|BUILT)\b/.exec(rest)?.[1] ?? null;
+  const afterTitle = rest.replace(/^\*\*[^*]+\*\*/, '');
+  return /\*\*(FILED|BUILT)\b[^*]*\*\*\s*$/.exec(afterTitle)?.[1] ?? /^\*\*[^*]+\*\*\s+(FILED|BUILT)\b/.exec(rest)?.[1] ?? null;
 }
 
 export function parseHeldCards(md) {

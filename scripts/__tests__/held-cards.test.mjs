@@ -45,11 +45,15 @@ describe('held cards', () => {
       '5. Fix the BUILT label',
       '6. **Marked.** body — **FILED 2026-10-05 as x1, PR #7**',
       '7. **Built.** BUILT today',
-      '8. **Filed.** FILED 2026-10-05 as x2'].join('\n');
+      '8. **Filed.** FILED 2026-10-05 as x2',
+      '9. **FILED marker handling.** Fix the parser',
+      '10. **BUILT-in cards.** Handle them',
+      '11. **FILED** and **BUILT** are words in a title'].join('\n');
     const { items } = parseHeldCards(md);
     expect(items.map(i => [i.num, i.doneReason])).toEqual(
-      [[1, null], [2, null], [3, null], [4, null], [5, null], [6, 'FILED'], [7, 'BUILT'], [8, 'FILED']]);
-    expect(planFiling(items).map(f => f.num)).toEqual([1, 2, 3, 4, 5]);
+      [[1, null], [2, null], [3, null], [4, null], [5, null], [6, 'FILED'], [7, 'BUILT'], [8, 'FILED'],
+        [9, null], [10, null], [11, null]]);
+    expect(planFiling(items).map(f => f.num)).toEqual([1, 2, 3, 4, 5, 9, 10, 11]);
     const marked = markFiled(md, [{ num: 1, id: 'x9' }, { num: 3, id: 'x10' }, { num: 6, id: 'x11' }], { dateEt: '2026-10-06', pr: 1 });
     expect(marked).toContain('1. **Fix FILED marker handling.** body — **FILED 2026-10-06 as x9, PR #1**');
     expect(marked).toContain('3. **Gamma.** first line — **FILED 2026-10-06 as x10, PR #1**');
