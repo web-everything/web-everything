@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	The advisory label sweep, pass `advisory-label-sweep-we`. Drops an `advisory:*` label whose head moved, and repairs a
+	human-gated PR whose newest covering advisory note disagrees with its labels (live: PR 4015, 2026-10-05, an old
+	advisory:changes sat under an accept note after the advise label write hit a rate limit). The manifest entry and the
+	script existed, but only the retired runner ever ran it. Run from the wev-review-daemon clone (self-synced).
+	Sibling repos: copy this file and change the pass name (the ProgramArguments entry after the pass flag) to
+	advisory-label-sweep-frontierui or advisory-label-sweep-plateau-app. (No double hyphen may appear inside an XML
+	comment, so the flag itself is not spelled out here.)
+	INSTALL (the operator, or a session the operator has said yes to):
+	  1. Replace <app-id>, <installation-id>, <path-to-private-key.pem> with the same GitHub App values the
+	     merge-orphan-sweep plist uses (never commit them):
+	       plutil -extract EnvironmentVariables.WE_GITHUB_APP_ID raw ~/Library/LaunchAgents/com.we.conveyor-pass-daemon.merge-orphan-sweep.plist
+	  2. cp this file to ~/Library/LaunchAgents/com.we.conveyor-pass-daemon.advisory-label-sweep-we.plist (drop `.example`)
+	  3. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.we.conveyor-pass-daemon.advisory-label-sweep-we.plist
+	CHECK: tail the log below.
+	STOP:  launchctl bootout gui/$(id -u)/com.we.conveyor-pass-daemon.advisory-label-sweep-we
+	-->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key>
+		<string>120000</string>
+		<key>PATH</key>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>WE_GITHUB_APP_ID</key>
+		<string>&lt;app-id&gt;</string>
+		<key>WE_GITHUB_APP_INSTALLATION_ID</key>
+		<string>&lt;installation-id&gt;</string>
+		<key>WE_GITHUB_APP_PRIVATE_KEY_PATH</key>
+		<string>&lt;path-to-private-key.pem&gt;</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.we.conveyor-pass-daemon.advisory-label-sweep-we</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin/node</string>
+		<string>/Users/nicolasgilbert/workspace/wev-review-daemon/skills-src/conveyor/pass-daemon.mjs</string>
+		<string>--pass=advisory-label-sweep-we</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor/pass-daemon.advisory-label-sweep-we.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor/pass-daemon.advisory-label-sweep-we.log</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/nicolasgilbert/workspace/wev-review-daemon</string>
+</dict>
+</plist>

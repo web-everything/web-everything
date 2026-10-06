@@ -87,4 +87,28 @@ describe('sweepAdvisoryLabels', () => {
       { num: 11, remove: ['advisory:accepted'] },
     ]);
   });
+
+  // Live 2026-10-05, PR #4015: the advise label write hit a rate limit, the accept note still posted, and an
+  // older advisory:changes sat under it on the same head. The sweep must re-derive the label from the comment.
+  it('repairs advisory:changes under a newer accept note that covers the live head', () => {
+    const p = provider();
+    p.ensureLabel = (...a) => { p.calls.ensured = a; };
+    const older = { body: advisory(HEAD).body.replace('`accept`', '`changes`'), createdAt: '2026-09-19T11:00:00Z' };
+    const results = sweepAdvisoryLabels({
+      repo: 'o/n', provider: p,
+      listPrs: () => [pr(12, ['review:human', 'review:pending', 'advisory:changes'], HEAD, [older, advisory(HEAD)])],
+    });
+    expect(results).toEqual([{ num: 12, remove: ['advisory:changes', 'review:pending'], add: 'advisory:accepted' }]);
+    expect(p.calls.set).toEqual([{ repo: 'o/n', number: 12, spec: { add: 'advisory:accepted', remove: ['advisory:changes', 'review:pending'] } }]);
+    expect(p.calls.ensured[1]).toBe('advisory:accepted');
+  });
+
+  it('adds the missing label on a human-gated PR with a covering advisory, but never without review:human', () => {
+    const p = provider();
+    const results = sweepAdvisoryLabels({
+      repo: 'o/n', provider: p,
+      listPrs: () => [pr(13, ['review:human'], HEAD), pr(14, ['review:accepted'], HEAD)],
+    });
+    expect(results).toEqual([{ num: 13, remove: [], add: 'advisory:accepted' }]);
+  });
 });

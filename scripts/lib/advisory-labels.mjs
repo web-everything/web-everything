@@ -135,3 +135,26 @@ export function planAdvisoryStaleLabels({ currentLabels = [], comments = [], hea
   const latest = latestAdvisory(comments);
   return { remove: latest && advisoryCoversHead(latest, headRefOid) ? [] : present };
 }
+
+/**
+ * PURE: the label REPAIR for a human-gated PR whose newest advisory covers the live head but whose labels do not
+ * show that advisory's outcome. This is the backstop for a missed label write: the `advise` step posts its note
+ * and THEN writes the label as a separate effect, and that second write can fail (live 2026-10-05, PR #4015: a
+ * GitHub rate-limit left the effect pending while the note already said "`advisory:accepted` is applied", so an
+ * older `advisory:changes` sat under an accept note). The comment is the truth; the label is a derived view, so
+ * the sweep re-derives it. Refuses (empty plan) unless the PR still carries `review:human`, the head is known,
+ * and the newest advisory both covers the head and states a clearing/blocking outcome.
+ *
+ * @param {{currentLabels?: Array, comments?: Array, headRefOid?: string}} o
+ * @returns {{add: string|null, remove: string[]}}
+ */
+export function planAdvisoryRepairLabels({ currentLabels = [], comments = [], headRefOid = '' } = {}) {
+  const none = { add: null, remove: [] };
+  const names = labelNames(currentLabels);
+  if (!names.includes(REVIEW_HUMAN) || !String(headRefOid ?? '')) return none;
+  const latest = latestAdvisory(comments);
+  if (!latest || !advisoryCoversHead(latest, headRefOid)) return none;
+  const plan = planAdvisoryLabels({ outcome: latest.outcome, currentLabels: names });
+  if (plan.reason) return none;
+  return { add: plan.add, remove: plan.remove };
+}

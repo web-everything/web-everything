@@ -17,9 +17,10 @@
  * itself and reports a label that outlived its head as a disagreement in NOT READY, so a stale label can never
  * put a PR in NEEDS YOU even before this sweep removes it.
  *
- * WHAT IT NEVER DOES: add a label, touch `review:human` / `review:pending` / `review:changes` / `review:accepted`,
- * or post a comment. It only ever REMOVES `advisory:*` labels, and only via the pure
- * `we:scripts/lib/advisory-labels.mjs#planAdvisoryStaleLabels`. Removing a label the PR does not carry is a `gh`
+ * WHAT IT NEVER DOES: touch `review:human` / `review:pending` / `review:changes` / `review:accepted`,
+ * or post a comment. It removes stale `advisory:*` labels (`planAdvisoryStaleLabels`) and, as the
+ * backstop for a missed `advise` label write, REPAIRS a human-gated PR whose newest covering advisory disagrees
+ * with its labels (`planAdvisoryRepairLabels`; adds only `advisory:*`, never `review:accepted`). Removing a label the PR does not carry is a `gh`
  * error, so removals are intersected with the live labels by construction (the plan only lists present ones).
  *
  * PURE-CORE / IO-SHELL: the plan is pure; {@link sweepAdvisoryLabels} is the shell, with the PR list and the
@@ -31,12 +32,17 @@ import { fileURLToPath } from 'node:url';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
-import { ADVISORY_LABELS, planAdvisoryStaleLabels } from '../lib/advisory-labels.mjs';
+import { ADVISORY_LABELS, ADVISORY_LABEL_META, labelNames, planAdvisoryRepairLabels, planAdvisoryStaleLabels } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 
 export const PR_LIST_LIMIT = 200;
+
+/** True when the PR is human-gated: a covering advisory may be owed a label (see `planAdvisoryRepairLabels`). */
+export function isHumanGated(pr) {
+  return labelNames(pr?.labels).includes('review:human');
+}
 
 /** True when the PR carries either advisory label — the only PRs this pass has any business with. */
 export function carriesAdvisoryLabel(pr) {
@@ -78,16 +84,19 @@ export function sweepAdvisoryLabels({
   // Resolved lazily and once, only when a write is about to happen — `GH_ARGV.setLabels` splices `--repo` into
   // its argv unconditionally, so a null repo must never reach it (the #xoh8fkw bug the conflict watch documents).
   let resolvedRepo = repo;
-  for (const pr of (Array.isArray(prs) ? prs : []).filter(carriesAdvisoryLabel)) {
-    const plan = planAdvisoryStaleLabels({
-      currentLabels: pr.labels, comments: pr.comments, headRefOid: pr.headRefOid,
-    });
-    if (plan.remove.length === 0) continue;
-    const entry = { num: pr.number, remove: plan.remove };
+  for (const pr of (Array.isArray(prs) ? prs : []).filter((p) => carriesAdvisoryLabel(p) || isHumanGated(p))) {
+    const input = { currentLabels: pr.labels, comments: pr.comments, headRefOid: pr.headRefOid };
+    // Stale first (head moved past the advisory), else REPAIR (advisory covers head but the label is missing/wrong).
+    const stale = planAdvisoryStaleLabels(input);
+    const plan = stale.remove.length > 0 ? { add: null, remove: stale.remove } : planAdvisoryRepairLabels(input);
+    if (!plan.add && plan.remove.length === 0) continue;
+    const entry = { num: pr.number, remove: plan.remove, ...(plan.add ? { add: plan.add } : {}) };
     if (!dryRun) {
       try {
         if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
-        provider.setLabels(resolvedRepo, pr.number, { remove: plan.remove });
+        // `gh pr edit --add-label` refuses a label the repo has never had; ensure is create-or-update.
+        if (plan.add) provider.ensureLabel?.(resolvedRepo, plan.add, ADVISORY_LABEL_META[plan.add]);
+        provider.setLabels(resolvedRepo, pr.number, { add: plan.add ?? undefined, remove: plan.remove });
       } catch (e) {
         entry.error = String((e && e.message) || e).split('\n')[0];
       }
@@ -115,7 +124,9 @@ if (IS_CLI) {
       });
       for (const r of results) {
         const did = dryRun ? 'would' : r.error ? 'FAILED to' : 'did';
-        writeLineSync(2, `  ⚠ PR #${r.num}: ${did} remove ${r.remove.join(',')} (head moved past the advisory)${r.error ? ` (${r.error})` : ''}`);
+        const what = r.add ? `set ${r.add}${r.remove.length ? ` and remove ${r.remove.join(',')}` : ''} (advisory covers head, label missing)`
+          : `remove ${r.remove.join(',')} (head moved past the advisory)`;
+        writeLineSync(2, `  ⚠ PR #${r.num}: ${did} ${what}${r.error ? ` (${r.error})` : ''}`);
       }
       writeAllSync(1, `${JSON.stringify({ checked: true, changed: results.length, results })}\n`);
     } catch (e) {

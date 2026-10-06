@@ -172,6 +172,11 @@ export const DAEMON_MANIFEST = {
   // cadence safe — the same "efficiency no-op, not a safety refusal" trade `merge-orphan-sweep` above already
   // documents for its own always-on entry.
   ...perRepoEntries('ci-red-recovery-watch', 'scripts/conveyor/ci-red-recovery-watch.mjs', ['sweep', '--apply']),
+  // The `advisory:*` label backstop (`we:scripts/conveyor/advisory-label-sweep.mjs`): drops a label whose head
+  // moved AND repairs a human-gated PR whose newest covering advisory disagrees with its labels (the `advise`
+  // step's label write is a separate effect that can fail after its note posts — live PR #4015, 2026-10-05).
+  // It only ever ran inside the legacy `runner.mjs` tick, which the daemon split retired, so nothing ran it.
+  ...perRepoEntries('advisory-label-sweep', 'scripts/conveyor/advisory-label-sweep.mjs', ['sweep']),
   ...perRepoEntries('parked-pr-conflict-watch', 'scripts/conveyor/parked-pr-conflict-watch.mjs', ['sweep']),
   ...perRepoEntries('parked-pr-progress-watch', 'scripts/conveyor/parked-pr-progress-watch.mjs', ['sweep']),
   ...perRepoEntries('lane-pool-health-watch', 'scripts/conveyor/lane-pool-health-watch.mjs', []),
