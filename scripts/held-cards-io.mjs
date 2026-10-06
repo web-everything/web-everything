@@ -16,6 +16,8 @@ import { DEFAULT_REPOS } from './operations/free-scope.mjs';
 import { withFileLock } from './operations/free-scope-io.mjs';
 import { appendHeldCard, parseHeldCards, planFiling, quietVerdict, markFiled } from './held-cards.mjs';
 
+/** A filing run holds its lock for minutes (verify + open-pr); a crashed one is reclaimed after this long untouched. */
+const FILING_LOCK_STALE_MS = 30 * 60 * 1000;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // Commands can print progress before their JSON result. Keep the last complete
@@ -82,7 +84,10 @@ export async function main(argv, deps = {}) {
       throw error;
     }
   };
-  const command = (bin, args, cwd = root) => exec(bin, args, { cwd, encoding: 'utf8' });
+  // Every subprocess first refreshes the filing lock (a no-op outside a filing run), so a long run is never "stale".
+  let beat = () => {}, holdsFiling = false;
+  // A run whose lock was lost stops before its next step; the lane release passes `alive = false` so it still runs.
+  const command = (bin, args, cwd = root, alive = true) => { if (alive) beat(); return exec(bin, args, { cwd, encoding: 'utf8' }); };
   const verdict = () => {
     const previous = JSON.parse(read(state, 'null'));
     const openPrs = DEFAULT_REPOS.reduce((count, repo) => {
@@ -139,6 +144,15 @@ export async function main(argv, deps = {}) {
       say(flags.json ? JSON.stringify(plan) : plan.map(item => `${item.num}. ${item.kind} ${item.size} ${item.title}`).join('\n'));
       return 0;
     }
+    // ONE filing run at a time. The list lock only covers a single read-modify-write, but a run spends minutes
+    // between planning and marking FILED: two runs would plan the same pending items and open two PRs for them.
+    // So the whole run (plan → file → PR → mark) holds this lock and plans from a list read under it. A second
+    // run fails fast. The lock goes stale after 30 min, and the holder touches it before every subprocess.
+    const filing = withFileLock(`${list}.filing`, ({ touch }) => {
+    beat = touch;
+    holdsFiling = true;
+    const pending = planFiling(parseHeldCards(read(list, '')).items);
+    if (!pending.length) { say('nothing to file'); return 0; }
     if (!flags.blocking) {
       const result = verdict();
       if (!result.quiet) { say(flags.json ? JSON.stringify(result) : `BUSY — ${result.reasons.join('; ')}`); return 1; }
@@ -151,7 +165,7 @@ export async function main(argv, deps = {}) {
     try {
       if (!lane.lane || !lane.path || !lane.holder) throw new Error('invalid lane acquisition result');
       const operation = args => command('node', [path.join(lane.path, 'scripts/operations/run.mjs'), ...args, '--json'], lane.path);
-      for (const item of plan) {
+      for (const item of pending) {
         try {
           const result = lastJson(operation(['file-item', `--title=${item.title}`, `--kind=${item.kind}`,
             `--size=${item.size}`, `--digest=${item.digest}`, ...(item.scope.length ? [`--scope=${item.scope.join(',')}`] : []),
@@ -179,14 +193,23 @@ export async function main(argv, deps = {}) {
       if (!pr) { try { pr = prNumber(lastJson(output)); } catch { /* no JSON either — refused below */ } }
       if (!pr) throw new Error('open-pr returned no PR number');
       // Re-read under the lock so an `add` that landed during filing is kept, not overwritten.
-      withFileLock(list, () => writeFile(list, markFiled(read(list, ''), filed, { dateEt, pr }), 'utf8'));
+      // The PR exists now, so wait generously: failing here would leave its cards unmarked and refile them.
+      beat();
+      withFileLock(list, () => writeFile(list, markFiled(read(list, ''), filed, { dateEt, pr }), 'utf8'), { timeoutMs: 60000 });
       say(flags.json ? JSON.stringify({ filed, failed, pr }) : filed.map(item => `FILED ${item.num} as ${item.id}, PR #${pr}`).join('\n'));
       return 0;
     } finally {
       // A malformed acquisition has nothing to release; releasing with undefined args would mask the real error.
-      if (lane.lane && lane.holder) command('node', [path.join(root, 'scripts/lane-pool.mjs'), 'release', `--lane=${lane.lane}`, `--session=${lane.holder}`]);
+      if (lane.lane && lane.holder) command('node', [path.join(root, 'scripts/lane-pool.mjs'), 'release', `--lane=${lane.lane}`, `--session=${lane.holder}`], root, false);
     }
+    }, { timeoutMs: 0, staleMs: FILING_LOCK_STALE_MS });
+    return filing;
   } catch (error) {
+    // Only a wait on the FILING lock means "another run is filing"; the inner list lock's timeout is its own error.
+    if (error.code === 'ELOCKTIMEOUT' && argv[0] === 'file' && !holdsFiling) {
+      stderr.write('another held-cards filing run is in progress; not filing the same cards twice\n');
+      return 1;
+    }
     stderr.write(`${error.message}\n`);
     return 1;
   }

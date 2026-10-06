@@ -48,7 +48,7 @@ const sameDir = (a, b) => a.ino === b.ino && a.mtimeMs === b.mtimeMs;
  * for a stat and an rmdir). Reaping a guard is a best-effort rmdir; a double crash plus a simultaneous reap is the
  * one residual window, far rarer than the crashed-holder case this lock exists for.
  */
-export function stealStaleLock(lock, seen) {
+export function stealStaleLock(lock, seen, staleMs = LOCK_STALE_MS) {
   const guard = `${lock}.steal`;
   try { fs.mkdirSync(guard); }
   catch (error) {
@@ -58,7 +58,7 @@ export function stealStaleLock(lock, seen) {
   }
   try {
     const now = fs.statSync(lock);
-    if (!sameDir(now, seen) || !isStale(now)) return false;
+    if (!sameDir(now, seen) || !isStale(now, staleMs)) return false;
     fs.rmdirSync(lock);
     return true;
   } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
@@ -66,9 +66,12 @@ export function stealStaleLock(lock, seen) {
 }
 /**
  * Run `fn` while holding the exclusive `<file>.lock` directory lock, so a read-modify-write of `file` by
- * concurrent processes is serialized. A lock older than 30s is treated as abandoned and stolen (see `stealStaleLock`).
+ * concurrent processes is serialized. A lock older than `staleMs` (default 30s) is treated as abandoned and stolen
+ * (see `stealStaleLock`). A holder that runs longer than that (a multi-minute filing run) passes a larger `staleMs`
+ * and calls the `touch()` it is handed between steps: touching changes the lock's mtime, so it counts as alive and a
+ * waiter that saw the older mtime cannot steal it. A wait that times out throws with `code: 'ELOCKTIMEOUT'`.
  */
-export function withFileLock(file, fn, { timeoutMs = 5000 } = {}) {
+export function withFileLock(file, fn, { timeoutMs = 5000, staleMs = LOCK_STALE_MS } = {}) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const lock = `${file}.lock`, deadline = Date.now() + timeoutMs;
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
@@ -77,13 +80,24 @@ export function withFileLock(file, fn, { timeoutMs = 5000 } = {}) {
     try { fs.mkdirSync(lock); identity = fs.statSync(lock); break; }
     catch (error) {
       if (error.code !== 'EEXIST') throw error;
-      try { const seen = fs.statSync(lock); if (isStale(seen) && stealStaleLock(lock, seen)) continue; }
+      try { const seen = fs.statSync(lock); if (isStale(seen, staleMs) && stealStaleLock(lock, seen, staleMs)) continue; }
       catch (race) { if (race.code !== 'ENOENT') throw race; }
-      if (Date.now() >= deadline) throw new Error(`free-scope: timed out acquiring ${lock}`);
+      if (Date.now() >= deadline) throw Object.assign(new Error(`free-scope: timed out acquiring ${lock}`), { code: 'ELOCKTIMEOUT' });
       Atomics.wait(sleeper, 0, 0, 25);
     }
   }
-  try { return fn(); }
+  // Refresh only OUR lock: if it was stolen (and maybe re-taken by someone else) refreshing would keep their lock
+  // alive for us, so report the loss instead of touching.
+  const touch = () => {
+    try {
+      if (fs.statSync(lock).ino !== identity.ino) throw Object.assign(new Error(`free-scope: lost ${lock}`), { code: 'ELOCKLOST' });
+      const t = new Date(); fs.utimesSync(lock, t, t);
+    } catch (error) {
+      if (error.code === 'ENOENT') throw Object.assign(new Error(`free-scope: lost ${lock}`), { code: 'ELOCKLOST' });
+      throw error;
+    }
+  };
+  try { return fn({ touch }); }
   finally {
     try { if (fs.statSync(lock).ino === identity.ino) fs.rmdirSync(lock); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }

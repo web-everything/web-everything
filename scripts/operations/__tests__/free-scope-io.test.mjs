@@ -196,6 +196,38 @@ it('reaps a steal guard orphaned by a crashed stealer well inside the acquire ti
   expect(fs.existsSync(`${lock}.steal`)).toBe(false);
   expect(fs.existsSync(lock)).toBe(false);
 });
+it('honours a longer staleMs, lets a long holder touch its lock alive, and tags a wait timeout', () => {
+  const lock = `${registry}.lock`;
+  fs.mkdirSync(path.dirname(registry), { recursive: true });
+  // 10 minutes old: stale at the 30s default, but not for a holder that declared a 30-minute window.
+  fs.mkdirSync(lock);
+  const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+  fs.utimesSync(lock, tenMinutesAgo, tenMinutesAgo);
+  let ran = false;
+  let error;
+  try { withFileLock(registry, () => { ran = true; }, { timeoutMs: 0, staleMs: 30 * 60 * 1000 }); } catch (e) { error = e; }
+  expect(ran).toBe(false);
+  expect(error.code).toBe('ELOCKTIMEOUT');
+  // A holder that keeps touching is never stolen, even with the default window, and its own release still works.
+  fs.rmdirSync(lock);
+  withFileLock(registry, ({ touch }) => {
+    fs.utimesSync(lock, new Date(0), new Date(0));
+    touch();
+    expect(Date.now() - fs.statSync(lock).mtimeMs).toBeLessThan(5000);
+    expect(() => withFileLock(registry, () => {}, { timeoutMs: 0 })).toThrow('timed out acquiring');
+  });
+  expect(fs.existsSync(lock)).toBe(false);
+  // A holder whose lock was taken over must learn it, never refresh the new owner's lock.
+  let lost;
+  withFileLock(registry, ({ touch }) => {
+    fs.rmdirSync(lock);
+    expect(() => touch()).toThrow('lost');
+    fs.mkdirSync(lock);
+    try { touch(); } catch (e) { lost = e; }
+    fs.rmdirSync(lock);
+  });
+  expect(lost.code).toBe('ELOCKLOST');
+});
 it('reports unknown, refuses bad usage and keeps help side effect free', () => {
   const collect = (options) => collectFreeScope({ ...options, repos: ['bad/repo'] });
   expect(cli(['--files=x.mjs', '--json'], { collect }).code).toBe(2);

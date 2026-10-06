@@ -114,6 +114,74 @@ process.exitCode = await main(['add', '--title=' + process.argv[2]], { writeFile
     const bodyArg = h.matching('open-pr')[0].args.find(a => a.startsWith('--bodyFile='));
     expect(fs.readFileSync(bodyArg.slice(11), 'utf8')).toContain('Held item 1 → 4001: First');
   });
+  it('refuses a second filing run while one is in progress, so no card is filed twice', async () => {
+    const h = harness();
+    let nested, started = false;
+    const exec = h.deps.exec;
+    h.deps.exec = (bin, args, options) => {
+      // Start the second run while the first is between planning and marking FILED.
+      if (args.includes('file-item') && !started) {
+        started = true;
+        nested = h.run(['file', '--blocking', `--repo-root=${h.dir}`]);
+      }
+      return exec(bin, args, options);
+    };
+    expect(await h.run(['file', '--blocking', `--repo-root=${h.dir}`])).toBe(0);
+    expect(await nested).toBe(1);
+    expect(h.errors.join('')).toContain('another held-cards filing run is in progress');
+    for (const arg of ['acquire', 'commit', 'open-pr', 'release']) expect(h.matching(arg)).toHaveLength(1);
+    expect(h.matching('file-item')).toHaveLength(2);
+    expect(h.text().match(/FILED/g)).toHaveLength(2);
+    expect(fs.existsSync(`${h.list}.filing.lock`)).toBe(false);
+  });
+  it('stops and still releases its lane when its filing lock was taken over mid-run', async () => {
+    const h = harness();
+    const exec = h.deps.exec;
+    h.deps.exec = (bin, args, options) => {
+      if (args.includes('file-item') && args.includes('--title=First')) {
+        // Another run reclaimed the lock as stale: a different directory now stands at the lock path.
+        fs.rmdirSync(`${h.list}.filing.lock`);
+        fs.mkdirSync(`${h.list}.filing.lock`);
+      }
+      return exec(bin, args, options);
+    };
+    const before = h.text();
+    expect(await h.run(['file', '--blocking'])).toBe(1);
+    expect(h.errors.join('')).toContain('lost');
+    expect(h.matching('open-pr')).toHaveLength(0);
+    expect(h.matching('release')).toHaveLength(1);
+    expect(h.text()).toBe(before);
+    fs.rmdirSync(`${h.list}.filing.lock`);
+  });
+  it('files each held card once when several processes run file at the same moment', async () => {
+    const h = harness();
+    const log = path.join(h.dir, 'calls.log');
+    const driver = path.join(h.dir, 'slow-file.mjs');
+    fs.writeFileSync(driver, `import fs from 'node:fs';
+import { main } from ${JSON.stringify(path.resolve('scripts/held-cards-io.mjs'))};
+const pause = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+const note = (what) => fs.appendFileSync(process.env.CALLS_LOG, what + '\\n');
+const exec = (bin, args) => {
+  if (args.includes('acquire')) return JSON.stringify({ lane: 'lane-1', path: process.env.LANE_DIR, holder: 'session-' + process.pid });
+  if (args.includes('file-item')) { pause(); note('file-item'); return JSON.stringify({ verdict: { num: 5000 + process.pid, rel: 'backlog/' + process.pid + '.md' } }); }
+  if (args.includes('open-pr')) { note('open-pr'); return JSON.stringify({ number: 4300 }); }
+  return '{}';
+};
+process.exitCode = await main(['file', '--blocking'], { exec });
+`);
+    const env = { ...process.env, ...h.deps.env, CALLS_LOG: log, LANE_DIR: h.dir };
+    const codes = await Promise.all([0, 1, 2].map(() => new Promise((resolve) => {
+      const child = spawn(process.execPath, [driver], { env, stdio: 'ignore' });
+      child.on('exit', resolve);
+    })));
+    // One run files both cards and the rest back off (1) or find nothing left (0); never a second filing.
+    expect(codes.filter(code => code === 0).length).toBeGreaterThanOrEqual(1);
+    const calls = fs.readFileSync(log, 'utf8').trim().split('\n');
+    expect(calls.filter(call => call === 'file-item')).toHaveLength(2);
+    expect(calls.filter(call => call === 'open-pr')).toHaveLength(1);
+    expect(h.text().match(/FILED/g)).toHaveLength(2);
+    expect(fs.existsSync(`${h.list}.filing.lock`)).toBe(false);
+  }, 30000);
   it('continues after an item failure and leaves that item unmarked', async () => {
     const h = harness({ fail: 'item' });
     expect(await h.run(['file', '--blocking'])).toBe(0);
