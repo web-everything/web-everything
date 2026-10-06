@@ -31,13 +31,15 @@ import {
 } from './await-verify.mjs';
 import { readVerifyMarker, verifyGateDecision } from '../lib/lane-verify.mjs';
 import { computeWorkingTreeHash } from '../lib/verify-lane-gate.mjs';
+import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /** Policy limits. `maxReds` counts the record's own `attempt` (the fixer bumps it on each re-mark). */
 export const AWAIT_VERIFY_LIMITS = Object.freeze({ maxReds: 3, maxRetries: 2, maxResumeFailures: 3 });
-/** Repos with a quiet-host reverify worker (mirrors stand-down.mjs#LOAD_FLAKE_REVERIFY_REPOS). */
-export const AWAIT_LOAD_FLAKE_REPOS = Object.freeze(['web-everything/web-everything']);
+/** Repo keys with a quiet-host reverify worker (mirrors stand-down.mjs#LOAD_FLAKE_REVERIFY_REPOS). */
+export const AWAIT_LOAD_FLAKE_REPO_KEYS = Object.freeze(['we']);
+const repoKeyOrNull = (slug) => { try { return repoKeyForSlug(slug) ?? null; } catch { return null; } };
 
 const SHA_RE = /^[a-f\d]{40}$/i;
 const lower = (s) => String(s ?? '').toLowerCase();
@@ -89,7 +91,7 @@ export function classifyAwaitVerdict({ record, marker, lane, nowMs, ttlMs, limit
     return age > ttlMs ? rerequest('verify-overdue') : { action: 'wait', reason: 'running' };
   }
   if (v.status === 'red') {
-    if (AWAIT_LOAD_FLAKE_REPOS.includes(record.repo) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake' };
+    if (AWAIT_LOAD_FLAKE_REPO_KEYS.includes(repoKeyOrNull(record.repo)) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake' };
     if ((record.attempt ?? 1) >= limits.maxReds) return { action: 'resume', reason: `red on attempt ${record.attempt}`, resume: 'escalate' };
     return { action: 'resume', reason: 'red', resume: 'red' };
   }
