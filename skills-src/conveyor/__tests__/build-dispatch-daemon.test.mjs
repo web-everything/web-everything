@@ -1573,13 +1573,15 @@ describe('automatic item preparation', () => {
       expect(envelope.tick).toEqual(tick);
       expect(envelope.bookkeepingHash).toBe(createHash('sha256')
         .update(JSON.stringify({ bookkeeping: tickBookkeeping })).digest('hex'));
-      expect(Date.now() - Date.parse(envelope.at)).toBeLessThan(5000);
+      expect(envelope.at).toBe(args0.tickAt);
       expect(statSync(tickPath).mode & 0o777).toBe(0o600);
       return JSON.stringify({ verdict: { dispatching: true }, effects: [
         { type: DISPATCH_EFFECT, status: 'in-flight', handle: 'tick-handoff-session' },
       ] });
     });
-    expect(cliDispatch({ num: '4503', bookkeeping: tickBookkeeping, tick, tickBookkeeping }, { exec }))
+    const args0 = effects.dispatch.mock.calls[0][0];
+    expect(args0.tickAt).toEqual(expect.any(String));
+    expect(cliDispatch({ num: '4503', bookkeeping: tickBookkeeping, tick, tickBookkeeping, tickAt: args0.tickAt }, { exec }))
       .toMatchObject({ dispatching: true });
     expect(exec).toHaveBeenCalledTimes(1);
     expect(existsSync(tickPath)).toBe(false);
@@ -1590,6 +1592,50 @@ describe('automatic item preparation', () => {
       expect.stringContaining('/operations/run.mjs'), 'dispatch-lane', '--num=4503',
       expect.stringMatching(/^--bookkeepingFile=/), '--json',
     ]);
+  });
+  it('stamps the handoff with the PLAN time, not the later dispatch time', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const plannedAt = new Date('2026-10-06T12:00:00.000Z');
+      vi.setSystemTime(plannedAt);
+      const effects = fixture();
+      const preparePlan = effects.planTick;
+      effects.planTick = vi.fn((bk) => {
+        const out = preparePlan(bk);
+        out.decisions.spawnBuilds = [{ num: '4503', lane: 3 }];
+        out.decisions.admission = { queue: [{ num: '4503', scope: ['we:scripts/example.mjs'] }] };
+        return out;
+      });
+      effects.acquireClaim = vi.fn(() => ({ ok: true }));
+      effects.releaseClaim = vi.fn();
+      // Every launch is slow: the clock is 6 min further on by the time the next one starts.
+      const dispatch = effects.dispatch;
+      effects.dispatch = vi.fn((c) => { vi.setSystemTime(Date.now() + 6 * 60_000); return dispatch(c); });
+      await runBuildDispatchTick({ live: true, bookkeeping: { tick: 7 }, effects });
+      const calls = effects.dispatch.mock.calls.map(([c]) => c);
+      expect(calls.length).toBeGreaterThan(1);
+      for (const c of calls) expect(c.tickAt).toBe(plannedAt.toISOString());
+
+      // The envelope written for the LAST (latest) dispatch still carries the plan time, so the reader's
+      // "under 5 min old" bound fails and dispatch-lane falls back to re-planning.
+      const last = calls.at(-1);
+      expect(Date.now() - Date.parse(last.tickAt)).toBeGreaterThan(5 * 60_000);
+      let at;
+      const exec = vi.fn((_cmd, argv) => {
+        const tickPath = argv.find(arg => arg.startsWith('--tickFile=')).slice('--tickFile='.length);
+        at = JSON.parse(readFileSync(tickPath, 'utf8')).at;
+        return JSON.stringify({ dispatching: true });
+      });
+      cliDispatch(last, { exec });
+      expect(at).toBe(plannedAt.toISOString());
+
+      // A caller that cannot say when the plan was made hands off no tick at all (never a fresh-looking one).
+      const bare = vi.fn(() => JSON.stringify({ dispatching: true }));
+      cliDispatch({ ...last, tickAt: undefined }, { exec: bare });
+      expect(bare.mock.calls[0][1].some(a => a.startsWith('--tickFile='))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
   it.each([false, true])('reconciles a stamped prepare before next-tick planning (live=%s)', async (workerLive) => {
     const row = { num: '4501', row: { runId: 'original', entry: {

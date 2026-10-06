@@ -320,6 +320,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   bookkeeping = { ...bookkeeping, prepareHeldNums: holds.map((h) => normNum(h.num)) };
   const tickBookkeeping = bookkeeping;
   const out = await effects.planTick(tickBookkeeping);
+  // The plan's age is what dispatch-lane's freshness bound must measure, so stamp it here, once, right after
+  // planning — never at each (possibly much later) dispatch.
+  const tickAt = new Date(effects.now?.() ?? Date.now()).toISOString();
   const d = out?.decisions || {};
   const admission = d.admission || {};
   const scopeByNum = new Map((admission.queue || []).map((r) => [normNum(r.num), Array.isArray(r.scope) ? r.scope : []]));
@@ -461,7 +464,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const claim = effects.acquireClaim({ num: pick.num, scope: pick.scope });
       if (!claim.ok) { failures.push({ num: pick.num, stage: 'claim', reason: `${claim.reason}${claim.heldBy ? ` by ${claim.heldBy}` : ''}` }); continue; }
       let res;
-      try { res = await effects.dispatch({ num: pick.num, bookkeeping, tick: out, tickBookkeeping }); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
+      try { res = await effects.dispatch({ num: pick.num, bookkeeping, tick: out, tickBookkeeping, tickAt }); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
       if (res?.dispatching) dispatched.push({ num: pick.num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null });
       else { effects.releaseClaim({ num: pick.num }); failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched' }); }
     }
@@ -649,7 +652,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         continue;
       }
       let res;
-      try { res = await effects.dispatch({ num, bookkeeping, launchKind: 'prepare-item', prepareFallback: fallback, tick: out, tickBookkeeping }); }
+      try { res = await effects.dispatch({ num, bookkeeping, launchKind: 'prepare-item', prepareFallback: fallback, tick: out, tickBookkeeping, tickAt }); }
       catch (e) { res = { dispatching: false, reason: String(e?.message || e) }; }
       if (res?.dispatching) {
         prepareBusy.add(num);
@@ -893,7 +896,7 @@ export function cliListHolds() {
     .map((h) => ({ num: normNum(h.meta.num), reason: h.meta.reason ?? null }));
 }
 
-export function cliDispatch({ num, bookkeeping, launchKind = 'build', prepareFallback = false, tick, tickBookkeeping }, { exec = execFileSync } = {}) {
+export function cliDispatch({ num, bookkeeping, launchKind = 'build', prepareFallback = false, tick, tickBookkeeping, tickAt }, { exec = execFileSync } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'build-dispatch-daemon-'));
   const file = join(dir, 'bookkeeping.json');
   try {
@@ -903,10 +906,12 @@ export function cliDispatch({ num, bookkeeping, launchKind = 'build', prepareFal
     // Its model override travels in JSON argv plus a recorded reason, not a run.mjs control flag.
     writeFileSync(file, JSON.stringify({ bookkeeping: bookkeeping || {} }), { mode: 0o600 });
     const argv = [join(SCRIPTS, 'operations', 'run.mjs'), 'dispatch-lane', `--num=${num}`, `--bookkeepingFile=${file}`, '--json'];
-    if (tick) {
+    // `at` is the PLAN time (`tickAt`), so dispatch-lane's under-5-min bound measures the plan's real age. A
+    // caller that cannot say when the plan was made hands off nothing: dispatch-lane re-plans.
+    if (tick && Number.isFinite(Date.parse(tickAt))) {
       const tickFile = join(dir, 'tick.json');
       writeFileSync(tickFile, JSON.stringify({
-        at: new Date().toISOString(),
+        at: tickAt,
         bookkeepingHash: createHash('sha256').update(JSON.stringify({ bookkeeping: tickBookkeeping || {} })).digest('hex'),
         tick,
       }), { mode: 0o600 });
