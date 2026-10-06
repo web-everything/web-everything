@@ -18,7 +18,8 @@
  *   3. ITS OWN TRANSCRIPT. Any tool call that is not one of the read-only tools ({@link READ_ONLY_AGY_TOOLS}) and did
  *      not end in an error voids the seat, wherever it pointed — this is the check that catches a write (or a network
  *      fetch) to a place no snapshot watches, such as the home directory. It is an allowlist, so it fails closed. A
- *      completed read whose path parameter points outside the juror lane voids it too.
+ *      completed read voids it too when ANY path-like parameter (relative, `~`, URI, array or nested; symlinks
+ *      followed; any `..` segment) does not resolve inside the juror lane.
  * The checks never let a checkout's own git config run code: control files are compared with plain fs reads first,
  * and git runs with fsmonitor and hooks forced off.
  *
@@ -33,9 +34,9 @@
  */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { antigravityJudgeSpawn } from './antigravity-judge-spawn.mjs';
 import { buildScratchCloneArgv, parseJsonlEvents } from '../gemini-direct-task.mjs';
@@ -55,7 +56,90 @@ export const READ_ONLY_AGY_TOOLS = Object.freeze([
 ]);
 
 /** A tool parameter whose key names a path (`AbsolutePath`, `DirectoryPath`, `SearchPath`, …). */
-const PATH_PARAM_KEY = /path|dir|file|root|folder|cwd|uri/i;
+const PATH_PARAM_KEY = /path|dir|file|root|folder|cwd|uri|target|location|source|src/i;
+
+/**
+ * Symlinks in `dir` (its own `.git` excluded) whose real target is outside `dir`, as repo-relative paths (at most
+ * `limit`). A recursive read tool (`grep_search`, `find_by_name`, `codebase_search` at the lane root) names no path
+ * the transcript check could judge, yet follows a committed `docs/x -> /Users/someone/.ssh` into it; such a link is
+ * refused before the juror runs. Directory links are never followed while walking. A dangling link reads nothing.
+ */
+export function escapingSymlinks(dir, limit = 5) {
+  const root = canonicalPath(resolve(dir)) ?? resolve(dir);
+  const found = [];
+  const stack = [''];
+  while (stack.length && found.length < limit) {
+    const rel = stack.pop();
+    let entries;
+    try { entries = readdirSync(join(root, rel), { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const child = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isSymbolicLink()) {
+        let real = null;
+        try { real = realpathSync(join(root, child)); } catch (err) { if (err?.code === 'ENOENT') continue; }
+        if (real == null || !(real === root || real.startsWith(`${root}/`))) found.push(child);
+      } else if (e.isDirectory() && !(rel === '' && e.name === '.git')) stack.push(child);
+    }
+  }
+  return found.slice(0, limit);
+}
+
+/**
+ * A path as the OS would see it: the real path of its nearest existing ancestor (so a symlink anywhere along it is
+ * followed, even for a file that does not exist yet) plus the not-yet-existing remainder. `null` when it cannot be
+ * resolved at all (a symlink loop, no permission): the caller treats that as outside. Reads the filesystem only.
+ */
+function canonicalPath(p) {
+  let head = p;
+  const rest = [];
+  for (;;) {
+    try { return rest.length ? join(realpathSync(head), ...rest) : realpathSync(head); } catch (e) {
+      if (e?.code !== 'ENOENT' && e?.code !== 'ENOTDIR') return null;
+      const parent = dirname(head);
+      if (parent === head) return null;
+      rest.unshift(basename(head));
+      head = parent;
+    }
+  }
+}
+
+/**
+ * Does one string path value point outside every root? Fails closed: a NUL byte, a `~` form (the juror never expands
+ * a home directory), any `..` segment (it would be collapsed textually while the OS follows a symlink first), a
+ * non-`file:` URI, and a path whose real location cannot be resolved all count as outside. A relative path is read
+ * against the juror lane (agy's cwd), and symlinks are followed before the containment test. `roots` are already
+ * canonical and non-empty; `cwd` is the juror lane.
+ */
+function readsOutside(value, roots, cwd) {
+  let p = value;
+  if (p.includes('\0')) return true;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(p)) {
+    if (!/^file:\/\//i.test(p)) return true;
+    try { p = fileURLToPath(p); } catch { return true; }
+  }
+  if (p.startsWith('~') || p.split('/').includes('..')) return true;
+  const real = canonicalPath(resolve(cwd, p));
+  return real == null || !roots.some((r) => real === r || real.startsWith(`${r}/`));
+}
+
+/**
+ * A string under a key that does NOT name a path (`Where`, `Base`, `Url`, a key agy adds tomorrow) is still judged as a
+ * path when it can only be one: a `~` form, a `..` segment, a `file://` URI, or an absolute path that exists on disk.
+ * (An absolute-looking search query such as `/api/users` that names nothing on disk is left alone.)
+ */
+const suspectPath = (s) => /^~|(^|\/)\.\.(\/|$)|^file:\/\//i.test(s) || (s.startsWith('/') && !s.includes('\0') && existsSync(s));
+
+/** Every string leaf under a tool parameter value that names a path (arrays and nested objects included); anything nested too deep to inspect counts as a leaf that voids. */
+function pathLeaves(value, underPathKey, depth = 0) {
+  if (typeof value === 'string') return underPathKey || suspectPath(value) ? [value] : [];
+  if (!value || typeof value !== 'object') return [];
+  if (depth >= 4) return ['\0'];
+  const leaves = [];
+  for (const [k, v] of Array.isArray(value) ? value.map((x) => ['', x]) : Object.entries(value)) {
+    leaves.push(...pathLeaves(v, underPathKey || PATH_PARAM_KEY.test(k), depth + 1));
+  }
+  return leaves;
+}
 
 /**
  * git is run with fsmonitor and hooks forced off, so a checkout's config can never make the CHECK itself run a
@@ -172,18 +256,23 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [] } = {
     if (step.status === 'TOOL_ERROR' || step.state === 'ERROR' || step.tool_info?.error != null) cur.errored = true;
     steps.set(key, cur);
   }
-  const roots = allowedRoots.filter(Boolean).map((r) => resolve(r));
-  const inside = (p) => roots.some((r) => p === r || p.startsWith(`${r}/`));
+  const lanes = allowedRoots.filter(Boolean).map((r) => resolve(r));
+  const cwd = lanes[0];
+  const roots = lanes.map((r) => canonicalPath(r) ?? r);
   const out = [];
   for (const step of steps.values()) {
     if (!step.isTool || step.errored) continue;
     const name = step.name;
     if (typeof name !== 'string' || !READ_ONLY_AGY_TOOLS.includes(name)) { out.push(typeof name === 'string' ? name : '<unnamed tool>'); continue; }
     // A completed READ must stay inside the juror lane too: what it reads can be quoted into the published findings.
-    if (roots.length && name !== 'finish' && step.params && typeof step.params === 'object') {
-      for (const [k, v] of Object.entries(step.params)) {
-        if (typeof v === 'string' && PATH_PARAM_KEY.test(k) && v.startsWith('/') && !inside(resolve(v))) out.push(`${name} (read outside the juror lane)`);
-      }
+    // Every path-like parameter is judged — relative, `~`, URI, array and nested forms included — after following symlinks.
+    if (roots.length && name !== 'finish' && step.params != null) {
+      // Parameters can arrive as a JSON string; one that does not parse, or parses to a bare scalar, cannot be judged: void.
+      let params = step.params;
+      if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = '\0'; } }
+      // A bare array names no key to say what its elements are, so every element is judged as a path.
+      const leaves = typeof params === 'object' ? pathLeaves(params, Array.isArray(params)) : ['\0'];
+      if (leaves.some((leaf) => readsOutside(leaf, roots, cwd))) out.push(`${name} (read outside the juror lane)`);
     }
   }
   return out;
@@ -254,6 +343,12 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     const snapOpts = (d) => ({ untracked: d === resolve(laneCwd) });
     const before = Object.fromEntries(watched.map((d) => [d, snapshotCheckout(d, exec, snapOpts(d))]));
     const laneControl = gitControlFiles(jurorLane);
+
+    // A committed symlink that leaves the lane would let a recursive read tool walk out of it without naming a path.
+    const escaping = (deps.escapingLinks ?? escapingSymlinks)(jurorLane);
+    if (escaping.length) {
+      return result('voided', { reasons: [`the juror lane holds symlink(s) that leave it, so no juror was run: ${escaping.slice(0, 5).join(', ')}`] });
+    }
 
     let outcome;
     let spawnError = null;

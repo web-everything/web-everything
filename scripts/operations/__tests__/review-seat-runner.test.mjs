@@ -4,7 +4,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -15,7 +15,7 @@ import { runSeatWithProvider } from '../review-seat-runner.mjs';
 import {
   compareShadowAnswers, summarizeShadowAgreement, renderShadowReport, appendShadowRow, readShadowRows,
 } from '../../lib/review-shadow-agreement.mjs';
-import { runAgyReviewJuror, stateChangingToolCalls, changedCheckouts } from '../../lib/agy-review-juror.mjs';
+import { runAgyReviewJuror, stateChangingToolCalls, changedCheckouts, escapingSymlinks } from '../../lib/agy-review-juror.mjs';
 import { judgeOutcome, unwrapJudgeOutcome, createDefaultJudge } from '../cli-adapter.mjs';
 import { existsSync } from 'node:fs';
 import { buildAntigravityPrompt, ANTIGRAVITY_TOOL_FREE_CORRECTION, antigravityJudgeSpawn } from '../../lib/antigravity-judge-spawn.mjs';
@@ -332,6 +332,139 @@ describe('PR #4131 review fixes', () => {
     expect(stateChangingToolCalls(call('/Users/someone/.ssh/id_ed25519'), roots)).toEqual(['view_file (read outside the juror lane)']);
     expect(stateChangingToolCalls(call('/var/folders/x/we-agy-juror-abc/../../secret'), roots)).toEqual(['view_file (read outside the juror lane)']);
     expect(stateChangingToolCalls(call('/var/folders/x/we-agy-juror-abcd/a'), roots)).toEqual(['view_file (read outside the juror lane)']);
+  });
+
+  describe('the read-path guard canonicalizes every path-like parameter against the juror lane (PR #4131 round 3)', () => {
+    // A real lane with a committed-looking symlink that leaves it, one that stays inside, and a secret outside.
+    const withLane = (fn) => {
+      const base = mkdtempSync(join(tmpdir(), 'we-guard-'));
+      try {
+        const lane = join(base, 'lane');
+        const outside = join(base, 'outside');
+        mkdirSync(join(lane, 'scripts'), { recursive: true });
+        mkdirSync(outside);
+        writeFileSync(join(lane, 'scripts', 'a.mjs'), 'x\n');
+        writeFileSync(join(outside, 'secret'), 'top secret\n');
+        symlinkSync(outside, join(lane, 'link-out'));
+        symlinkSync(join(lane, 'scripts'), join(lane, 'link-in'));
+        fn({ lane, roots: { allowedRoots: [lane, realpathSync(lane)] } });
+      } finally { rmSync(base, { recursive: true, force: true }); }
+    };
+    const read = (params, tool = 'view_file') => transcriptWith([{ step_index: 1, step_type: 'tool', state: 'DONE', tool_name: tool, tool_info: { parameters: params } }]);
+    const OUT = (tool = 'view_file') => [`${tool} (read outside the juror lane)`];
+
+    it('a relative path is resolved against the juror lane, so `..` traversal voids and a plain relative path does not', () => {
+      withLane(({ roots }) => {
+        expect(stateChangingToolCalls(read({ AbsolutePath: 'scripts/a.mjs' }), roots)).toEqual([]);
+        expect(stateChangingToolCalls(read({ AbsolutePath: './scripts/a.mjs' }), roots)).toEqual([]);
+        expect(stateChangingToolCalls(read({ DirectoryPath: '.' }), roots)).toEqual([]);
+        expect(stateChangingToolCalls(read({ AbsolutePath: '../../.ssh/id_ed25519' }), roots)).toEqual(OUT());
+        expect(stateChangingToolCalls(read({ AbsolutePath: '../outside/secret' }), roots)).toEqual(OUT());
+        // a `..` segment is never trusted, even one that lexically stays inside (`link-out/..` is NOT the lane)
+        expect(stateChangingToolCalls(read({ AbsolutePath: 'scripts/../scripts/a.mjs' }), roots)).toEqual(OUT());
+        expect(stateChangingToolCalls(read({ AbsolutePath: 'link-out/../scripts/a.mjs' }), roots)).toEqual(OUT());
+      });
+    });
+
+    it('a `~` path, a file:// URI and any other URI scheme void', () => {
+      withLane(({ roots }) => {
+        for (const p of ['~/.ssh/id_ed25519', '~', '~root/x', 'file:///Users/someone/.ssh/id_ed25519', 'https://example.com/a']) {
+          expect(stateChangingToolCalls(read({ AbsolutePath: p }), roots), p).toEqual(OUT());
+        }
+      });
+    });
+
+    it('a file:// URI INSIDE the lane is judged as that path', () => {
+      withLane(({ lane, roots }) => {
+        expect(stateChangingToolCalls(read({ Uri: `file://${join(lane, 'scripts', 'a.mjs')}` }), roots)).toEqual([]);
+      });
+    });
+
+    it('an array or nested value is checked element by element: ONE outside element voids', () => {
+      withLane(({ lane, roots }) => {
+        const inside = join(lane, 'scripts', 'a.mjs');
+        expect(stateChangingToolCalls(read({ TargetDirectories: [inside, 'scripts'] }, 'codebase_search'), roots)).toEqual([]);
+        expect(stateChangingToolCalls(read({ TargetDirectories: [inside, '/Users/someone/.ssh'] }, 'codebase_search'), roots)).toEqual(OUT('codebase_search'));
+        expect(stateChangingToolCalls(read({ SearchPaths: ['scripts', '../../x'] }, 'grep_search'), roots)).toEqual(OUT('grep_search'));
+        expect(stateChangingToolCalls(read({ Target: { FilePath: '/Users/someone/.ssh' } }), roots)).toEqual(OUT());
+        expect(stateChangingToolCalls(read({ AbsolutePath: ['~/x'] }), roots)).toEqual(OUT());
+      });
+    });
+
+    it('a symlink that leaves the lane voids — absolute or relative, existing target or not; one that stays inside does not', () => {
+      withLane(({ lane, roots }) => {
+        expect(stateChangingToolCalls(read({ AbsolutePath: join(lane, 'link-out', 'secret') }), roots)).toEqual(OUT());
+        expect(stateChangingToolCalls(read({ AbsolutePath: 'link-out/secret' }), roots)).toEqual(OUT());
+        expect(stateChangingToolCalls(read({ DirectoryPath: 'link-out' }), roots)).toEqual(OUT());
+        expect(stateChangingToolCalls(read({ AbsolutePath: 'link-out/not-there-yet' }), roots)).toEqual(OUT());
+        expect(stateChangingToolCalls(read({ AbsolutePath: 'link-in/a.mjs' }), roots)).toEqual([]);
+        expect(stateChangingToolCalls(read({ AbsolutePath: 'scripts/not-there-yet.mjs' }), roots)).toEqual([]);
+      });
+    });
+
+    it('parameters that arrive as a JSON string or an array root are judged too; an unparseable or scalar form voids', () => {
+      withLane(({ roots }) => {
+        const raw = (parameters) => transcriptWith([{ step_index: 1, step_type: 'tool', state: 'DONE', tool_name: 'view_file', tool_info: { parameters } }]);
+        expect(stateChangingToolCalls(raw('{"AbsolutePath":"/Users/someone/.ssh/id_ed25519"}'), roots)).toEqual(OUT());
+        expect(stateChangingToolCalls(raw('{"AbsolutePath":"scripts/a.mjs"}'), roots)).toEqual([]);
+        expect(stateChangingToolCalls(raw(['/Users/someone/.ssh/id_ed25519']), roots)).toEqual(OUT());
+        expect(stateChangingToolCalls(raw('not json'), roots)).toEqual(OUT());
+        expect(stateChangingToolCalls(raw('"/etc/passwd"'), roots)).toEqual(OUT());
+      });
+    });
+
+    it('a path under a key the guard does not know is still judged when it can only be a path', () => {
+      withLane(({ roots }) => {
+        for (const params of [{ Where: '/etc' }, { Base: '~/x' }, { Name: '../../etc/passwd' }, { Url: 'file:///etc/passwd' }, { Includes: ['../../**'] }]) {
+          expect(stateChangingToolCalls(read(params, 'find_by_name'), roots), JSON.stringify(params)).toEqual(OUT('find_by_name'));
+        }
+        // a search query that merely looks absolute but names nothing on disk is not a read of anything
+        expect(stateChangingToolCalls(read({ Query: '/api/users/not-a-real-dir-xyz', SearchPath: 'scripts' }, 'grep_search'), roots)).toEqual([]);
+        expect(stateChangingToolCalls(read({ Query: 'TODO', Pattern: '*.mjs' }, 'find_by_name'), roots)).toEqual([]);
+      });
+    });
+
+    it('escapingSymlinks lists committed links that leave the lane — and only those', () => {
+      withLane(({ lane }) => {
+        mkdirSync(join(lane, '.git'));
+        symlinkSync('/etc', join(lane, '.git', 'ignored-link'));
+        symlinkSync('/nonexistent-target-xyz', join(lane, 'dangling'));
+        mkdirSync(join(lane, 'docs'));
+        symlinkSync('/etc/hosts', join(lane, 'docs', 'hosts'));
+        expect(escapingSymlinks(lane).sort()).toEqual(['docs/hosts', 'link-out']);
+        rmSync(join(lane, 'link-out'));
+        rmSync(join(lane, 'docs', 'hosts'));
+        expect(escapingSymlinks(lane)).toEqual([]);
+      });
+    });
+
+    it('a juror lane that holds an escaping symlink voids before any juror runs', async () => {
+      const fx = fixtureLane();
+      try {
+        const git = (...a) => execFileSync('git', a, { cwd: fx.lane, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+        mkdirSync(join(fx.lane, 'docs'));
+        symlinkSync('/etc', join(fx.lane, 'docs', 'sys'));
+        git('add', '.');
+        git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'add a link that leaves the repo');
+        let spawned = 0;
+        const r = await runAgyReviewJuror({
+          request: REQUEST, laneCwd: fx.lane, model: 'claude-opus-5-5-high',
+          deps: { repoRoot: fx.other, spawnJudge: async () => { spawned += 1; return { value: { summary: 's', findings: [] } }; } },
+        });
+        expect(spawned).toBe(0);
+        expect(r.status).toBe('voided');
+        expect(r.reasons.join('\n')).toContain('docs/sys');
+        expect(r.reasons.join('\n')).not.toContain(fx.root);
+      } finally { fx.cleanup(); }
+    });
+
+    it('a NUL byte in a path, or no allowed root to resolve against, fails closed / is skipped as before', () => {
+      withLane(({ roots }) => {
+        expect(stateChangingToolCalls(read({ AbsolutePath: 'scripts/a.mjs\0../../x' }), roots)).toEqual(OUT());
+      });
+      // no roots given (the legacy call shape) leaves the path check off, exactly as before
+      expect(stateChangingToolCalls(read({ AbsolutePath: '../../x' }))).toEqual([]);
+    });
   });
 
   it('a further edit to an already-dirty file with a non-ASCII name still voids the seat (status -z, no octal quoting)', async () => {

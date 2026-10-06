@@ -92,7 +92,10 @@ import {
   antigravityReviewFromEnv,
   ANTIGRAVITY_REVIEW_ENV_VAR,
   defaultAntigravityReviewProbationCheck,
+  seatSettingsForRun,
 } from '../review-pr.mjs';
+import { advanceReviewPrToWriteUp } from '../record-verdict-io.mjs';
+import { loadReviewSeatSettings } from '../../lib/review-seat-provider.mjs';
 import { buildJudgeArgv, deriveSessionId, sessionSeed } from '../../lib/judge-spawn.mjs';
 // #xwk0tzu — the stamps the refusal reads, built through their OWN home rather than hand-written here: a
 // test that spells the marker by hand still passes when the marker's shape changes, which is the mutant the
@@ -4120,6 +4123,51 @@ describe('card 84 — review.seatProvider.<lens> and the advisory agy-correctnes
     expect(run.findings.reduce.verdict).toBe('accept');
     expect(run.findings.reduce.lensVerdicts['agy-correctness']).toBe('changes');
     expect(run.findings.reduce.lensProviders['agy-correctness']).toBe('agy, advisory');
+  });
+
+  describe('seatSettingsForRun — a resume reads the agy-correctness roster off the SAVED run, not the live settings', () => {
+    it('a record WITH the step seats it, a record WITHOUT it does not, whatever the live settings say', () => {
+      const withStep = { findings: { judgeAgyCorrectness: { summary: 'x', findings: [] } } };
+      const withoutStep = { findings: { judge: {} } };
+      for (const live of [true, false]) {
+        const settings = { ...AGY_SEAT_SETTINGS, agyCorrectnessAdvisory: live };
+        expect(seatSettingsForRun(withStep, settings).agyCorrectnessAdvisory).toBe(true);
+        expect(seatSettingsForRun(withoutStep, settings).agyCorrectnessAdvisory).toBe(false);
+      }
+    });
+
+    it('a null, empty or findings-less record seats nothing; the provider directives still come from the live settings', () => {
+      for (const record of [null, undefined, {}, { findings: null }, { findings: 'x' }]) {
+        expect(seatSettingsForRun(record, AGY_SEAT_SETTINGS).agyCorrectnessAdvisory).toBe(false);
+      }
+      const out = seatSettingsForRun({ findings: {} }, AGY_SEAT_SETTINGS);
+      expect(out.seatProvider).toEqual(AGY_SEAT_SETTINGS.seatProvider);
+      expect(out.agyModel).toBe(AGY_SEAT_SETTINGS.agyModel);
+    });
+
+    it('no live settings at all stays no settings (the pre-card declaration)', () => {
+      expect(seatSettingsForRun({ findings: { judgeAgyCorrectness: {} } }, null)).toBeNull();
+    });
+
+    it('a run started WITHOUT the agy seat resumes through advanceReviewPrToWriteUp under live settings that DO seat it', async () => {
+      // The call site (record-verdict-io.mjs) must register the roster the run was started with: were it to pass the
+      // live settings through, it would declare a sixth seat the saved run never had and the resume would stall.
+      expect(loadReviewSeatSettings().agyCorrectnessAdvisory, 'precondition: the live routing policy seats the advisory agy juror').toBe(true);
+      // Seats 4 and 5 read the same env the resume reads, so start the run under the SAME values; only seat 6 differs.
+      const { registry } = registryFor({}, {
+        correctnessAdvisory: correctnessAdvisoryFromEnv(), antigravityReview: antigravityReviewFromEnv(),
+        seatSettings: { ...AGY_SEAT_SETTINGS, agyCorrectnessAdvisory: false },
+      });
+      const { run } = atConfirm({ registry, input: BASE_INPUT, id: 'run-resume-roster' });
+      expect(run.findings).not.toHaveProperty('judgeAgyCorrectness');
+      const store = createMemoryRunStore();
+      store.write(run);
+      const writes = [];
+      const sinks = { [REVIEW_EFFECTS.WRITE_UP]: async (payload) => { writes.push(payload); return { path: 'stub', bytes: 0 }; } };
+      const advanced = await advanceReviewPrToWriteUp(run, { to: 'accepted', store, sinks });
+      expect(writes).toHaveLength(1);
+      expect(advanced.findings.stageVerdict).toMatchObject({ applied: true });
+    });
   });
 
   it('records the shadow result beside the verdict and never reduces the shadow findings into it', () => {
