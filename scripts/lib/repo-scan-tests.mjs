@@ -43,6 +43,15 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/lib/__tests__/exec-output-guard.test.mjs',
+    scope: 'files',
+    why: 'captured gh/git reads cannot exceed the per-file unbounded-output baseline',
+    matches: (f) => /\.(mjs|js)$/.test(f) && !skipped(f) && !/\.test\./.test(f)
+      && inTree(f, ['scripts', 'skills-src'])
+      && !/^scripts\/lib\/(?:proc-read|exec-output-guard)\.mjs$/.test(f),
+    inputs: ['scripts/lib/exec-output-guard.mjs', 'scripts/exec-output-baseline.json', 'scripts/lib/__tests__/exec-output-guard.test.mjs'],
+  },
+  {
     test: 'scripts/__tests__/multi-repo-checks.test.mjs',
     scope: 'files',
     why: 'every scanned source names its repo explicitly (gh --repo / no repo literal) — the #3887 case',
