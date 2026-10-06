@@ -69,6 +69,8 @@ export function settleLaunches({ root, readOutcome, isPidAlive, kill = (pid) => 
         ? readOutcome(text)
         : { dispatching: false, reason: `launch-died: dispatch-lane exited with no output (${read(record.errFile).replace(/\s+/g, ' ').trim().slice(0, 300) || 'no stderr'})` };
     }
+    // Keep a bounded excerpt of what the child actually printed, so an unexplained failure is diagnosable.
+    if (!outcome.dispatching) outcome = { ...outcome, reason: `${outcome.reason ?? 'not dispatched'} [stdout: ${read(record.outFile).replace(/\s+/g, ' ').trim().slice(0, 300) || 'empty'}] [stderr: ${read(record.errFile).replace(/\s+/g, ' ').trim().slice(0, 200) || 'empty'}]` };
     settled.push({ record, outcome });
     for (const p of [record.outFile, record.errFile, recordPath(root, record.id)]) { try { rmSync(p, { force: true }); } catch { /* best effort */ } }
     if (record.workDir) { try { rmSync(record.workDir, { recursive: true, force: true }); } catch { /* best effort */ } }

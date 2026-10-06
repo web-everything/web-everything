@@ -104,3 +104,19 @@ describe('builder host-load gate (#4139)', () => {
     expect(cliHostLoadGate({ env: { WE_MAX_LOAD_PER_CORE: '4' }, loadavg: () => 36, cpuCount: () => 12 }).admit).toBe(true);
   });
 });
+
+describe('one detached launch at a time (78b)', () => {
+  it('never starts a second launch while one is pending or just started', async () => {
+    const lockRoot = mkdtempSync(join(tmpdir(), 'bdd-one-'));
+    try {
+      const t = tickOut();
+      t.decisions.spawnBuilds.push({ num: '2662', lane: 14 });
+      t.decisions.admission.queue.push({ num: '2662', scope: ['plateau-app:src/b.ts'] });
+      t.decisions.admission.cleared.push({ num: '2662', ready: true });
+      const dispatch = vi.fn(() => ({ dispatching: true, pending: true }));
+      const r = await runBuildDispatchTick({ live: true, effects: effectsFor(lockRoot, { planTick: () => t, dispatch, settleLaunches: async () => ({ pending: [], settled: [] }) }) });
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(r.dispatched).toHaveLength(1);
+    } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+  });
+});

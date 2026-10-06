@@ -520,6 +520,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // #4139 host-load gate on NEW launches only: refuse with a logged `host-load` reason, never touch running work, and
   // take no claim (so nothing needs releasing). Re-read per launch: a detached launch raises the load immediately.
   const loadHolds = [];
+  // 78b — ONE detached launch in flight at a time. Two concurrent `dispatch-lane` runs (same tick) both failed to
+  // confirm live; they share the lane pool and run store. Launching is now instant, so serializing costs one tick.
+  let startedThisTick = 0;
+  const launchSlotBusy = () => typeof effects.settleLaunches === 'function'
+    && (pendingLaunch.build.size + pendingLaunch.prepare.size + startedThisTick) > 0;
   const loadGateFor = (kind, num) => {
     const gate = effects.hostLoadGate?.() ?? { admit: true };
     if (!gate.admit) {
@@ -530,12 +535,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   };
   if (live) {
     for (const pick of plan.dispatch) {
+      if (launchSlotBusy()) continue;
       const gate = loadGateFor('build', pick.num);
       if (!gate.admit) continue;
       const claim = effects.acquireClaim({ num: pick.num, scope: pick.scope });
       if (!claim.ok) { failures.push({ num: pick.num, stage: 'claim', reason: `${claim.reason}${claim.heldBy ? ` by ${claim.heldBy}` : ''}` }); continue; }
       let res;
       try { res = await effects.dispatch({ num: pick.num, bookkeeping, tick: out, tickBookkeeping, tickAt }); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
+      if (res?.pending) startedThisTick += 1;
       if (res?.dispatching) dispatched.push({ num: pick.num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null });
       else { effects.releaseClaim({ num: pick.num }); failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched' }); }
     }
@@ -722,6 +729,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       if (finishedPrepares.has(num) || heldNums.has(num) || prepareBusy.has(num) || prepareBusy.size >= 2) continue;
       prepare.planned.push({ ...pick, num });
       if (!live) { prepareBusy.add(num); continue; }
+      if (launchSlotBusy()) continue;
       if (!loadGateFor('prepare', num).admit) continue;
       // Record the stamp this attempt starts from (`null` = unstamped), so a re-prepare's result is told from the
       // stamp it replaces by identity, not by how recent its date is. A failed read does NOT spawn: without the
@@ -747,6 +755,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       let res;
       try { res = await effects.dispatch({ num, bookkeeping, launchKind: 'prepare-item', prepareFallback: fallback, tick: out, tickBookkeeping, tickAt }); }
       catch (e) { res = { dispatching: false, reason: String(e?.message || e) }; }
+      if (res?.pending) startedThisTick += 1;
       if (res?.dispatching) {
         prepareBusy.add(num);
         prepare.launched.push({ num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null });
