@@ -25,3 +25,15 @@ export function timestampLines(text, nowMs = Date.now()) {
 export function timestampedStderr(text) {
   return process.stderr.write(timestampLines(text));
 }
+
+/** An ISO-8601 UTC stamp plus its one separating space, at the start of a line (what {@link timestampLines} writes). */
+export const LOG_TIMESTAMP_RE = /^\d{4}-\d\d-\d\dT[\d:.]+Z /;
+
+/**
+ * PURE (item 68a): drop a leading timestamp so the health parsers' `^name:` anchors still match a stamped daemon
+ * log line. Unstamped (old) lines pass through unchanged. Kept in this import-free leaf so read-only modules can
+ * reach it through the parsers.
+ */
+export function stripLogTimestamp(line) {
+  return typeof line === 'string' ? line.replace(LOG_TIMESTAMP_RE, '') : line;
+}

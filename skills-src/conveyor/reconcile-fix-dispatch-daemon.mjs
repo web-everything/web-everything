@@ -76,6 +76,7 @@ export const FIX_DISPATCH_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
 import { withSelfSync } from '../../scripts/lib/daemon-self-sync.mjs';
 import { withPrEvents } from '../../scripts/lib/pr-events.mjs';
 import { isStaleMainRefusalMessage } from '../../scripts/lib/main-staleness.mjs';
+import { installDaemonLog } from './daemon-log.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel and from the Verify
  *  daemon's own key (#3878), so none of the three ever contend on the same lock dir (#3877). */
@@ -920,6 +921,7 @@ export function withFixDispatchClaimRefresh(effects, { log = console, refresh = 
 }
 
 async function main() {
+  installDaemonLog(); // item 68a: ISO-stamp every log line (WE_DAEMON_LOG_TIMESTAMPS=0 turns it off)
   const owner = makeOwner('reconcile-fix-dispatch-daemon');
   const acquired = acquireRunnerLease(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY });
   if (!acquired.ok) {
