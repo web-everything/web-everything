@@ -46,6 +46,7 @@ import {
 } from './runner-lock.mjs';
 import { runDaemonLoop, startIndependentHeartbeat, realSleep } from './verify-daemon.mjs';
 import { normNum } from '../../scripts/conveyor/queue-store.mjs';
+import { collectProtectedNums } from '../../scripts/conveyor/queue-prune.mjs';
 import {
   BUILD_DISPATCH_POLICY, planBuildDispatch, normalizeOpenPrs, prDeliversNum, prDeliveredNum, reportOpenItems,
 } from '../../scripts/conveyor/build-dispatch-policy.mjs';
@@ -340,12 +341,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   let queuePrune = null;
   if (live && typeof effects.pruneQueue === 'function') {
     try {
-      const protectedNums = [
-        ...openPrs.map((p) => prDeliveredNum(p)),
-        ...effects.listClaims().map((c) => c.meta?.num),
-        ...(effects.listFixClaims?.() ?? []).map((c) => c?.num),
-        ...effects.listRunStoreInFlight().map((r) => r.num),
-      ].filter(Boolean);
+      // The same builder the `queue.mjs prune` CLI uses (queue-prune.mjs#collectProtectedNums). A fix claim is
+      // keyed by its PR, so it resolves through `openPrs` (it carries no item num of its own).
+      const protectedNums = collectProtectedNums({
+        prs: openPrs,
+        claims: effects.listClaims(),
+        fixClaims: effects.listFixClaims?.() ?? [],
+        runs: effects.listRunStoreInFlight(),
+        prNum: prDeliveredNum,
+      });
       queuePrune = await effects.pruneQueue({ protectedNums });
     } catch (e) { queuePrune = { error: String(e?.message || e).split('\n')[0] }; }
   }
@@ -1502,7 +1506,10 @@ export function makeCliPruneQueue({ env = process.env, io = {} } = {}) {
     const prune = io.prune ?? await import('../../scripts/conveyor/queue-prune.mjs');
     const items = io.items ? io.items() : (await import('node:module')).createRequire(import.meta.url)('../../src/_data/backlog.js')();
     const path = io.path ?? store.resolveQueuePath();
-    const plan = prune.planPrune({ queue: store.readQueueFile(path), items, protectedNums });
+    // `items` is THIS checkout's backlog, which can lag origin/main: a card filed on main since would read as
+    // missing. So `missing-card` needs origin/main to confirm the absence (`confirmMissing`), never the working tree alone.
+    const confirmMissing = io.confirmMissing ?? prune.makeConfirmMissingOnMain();
+    const plan = prune.planPrune({ queue: store.readQueueFile(path), items, protectedNums, confirmMissing });
     if (!plan.ok) return { refused: plan.reason };
     if (plan.drop.length || plan.rename.length) (io.apply ?? prune.applyPlan)(plan, path);
     for (const d of plan.drop) console.error(`build-dispatch-daemon: queue prune dropped #${d.num} (${d.reason}${d.detail ? `: ${d.detail}` : ''})`);

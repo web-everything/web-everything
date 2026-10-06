@@ -43,7 +43,8 @@ import {
   resolveQueueSource, migrateLegacyQueue, legacyQueueDivergence, bornAsIndexFromItems, resolveBornAsRefs,
 } from './queue-store.mjs';
 import {
-  planPrune, applyPlan, protectedFrom, parseIdsFile, bulkRemovePlan, planDigest, writeReceipt, receiptMatches,
+  planPrune, applyPlan, collectProtectedNums, protectedOverride, makeConfirmMissingOnMain, parseIdsFile, bulkRemovePlan,
+  planDigest, writeReceipt, receiptMatches,
 } from './queue-prune.mjs';
 import { readField } from '../backlog/frontmatter.mjs';
 import { idFromName, normalizeId } from '../backlog/id.mjs';
@@ -51,6 +52,7 @@ import { fetchOpenPrsRest } from './open-pr-fetch.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { prDeliveredNum } from './build-dispatch-policy.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
+import { listFixDispatchClaims } from './fix-claim-store.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 
@@ -150,18 +152,24 @@ function readinessOf(num) {
  * list cannot be read (callers fail closed). `CONVEYOR_PRUNE_PROTECTED` (comma list) replaces the live reads
  * for hermetic tests.
  */
-function loadProtectedNums() {
-  const fixed = process.env.CONVEYOR_PRUNE_PROTECTED;
-  if (fixed != null) return protectedFrom({ prNums: fixed.split(',').map((x) => x.trim()).filter(Boolean) });
-  const prNums = [];
-  for (const { slug } of Object.values(CONSTELLATION_REPOS)) {
-    for (const pr of fetchOpenPrsRest({ repo: slug })) { const n = prDeliveredNum(pr); if (n) prNums.push(n); }
-  }
-  const claimNums = listBuildDispatchClaims().map((c) => c.meta?.num);
-  return protectedFrom({ prNums, claimNums });
+async function loadProtectedNums() {
+  const override = protectedOverride(process.env.CONVEYOR_PRUNE_PROTECTED);
+  if (override) return override;
+  const prs = [];
+  for (const { slug } of Object.values(CONSTELLATION_REPOS)) prs.push(...fetchOpenPrsRest({ repo: slug }));
+  // The in-flight run store reader lives with the daemon. A failure to LOAD it refuses the prune; the reader itself
+  // degrades an unreadable run-store directory to `[]` (same as the daemon tick), so that case does not refuse.
+  const { cliListRunStoreInFlight } = await import('../../skills-src/conveyor/build-dispatch-daemon.mjs');
+  return collectProtectedNums({
+    prs,
+    claims: listBuildDispatchClaims(),
+    fixClaims: listFixDispatchClaims(undefined, { liveOnly: true }),
+    runs: await cliListRunStoreInFlight(),
+    prNum: prDeliveredNum,
+  });
 }
 
-function main(argv) {
+async function main(argv) {
   const args = argv.filter((a) => !a.startsWith('--'));
   const flagArgs = argv.filter((a) => a.startsWith('--')).map((a) => a.slice(2));
   const flags = new Set(flagArgs.map((a) => a.split('=')[0]));
@@ -220,9 +228,9 @@ function main(argv) {
     const items = loadBacklogItemsBestEffort();
     const queue = readQueueFile(path);
     let prot;
-    try { prot = loadProtectedNums(); }
+    try { prot = await loadProtectedNums(); }
     catch (e) { return fail(`cannot determine open PRs / claims (${String(e.message || e).split('\n')[0]}) — refusing to prune (fail-closed)`); }
-    const plan = planPrune({ queue, items, protectedNums: prot });
+    const plan = planPrune({ queue, items, protectedNums: prot, confirmMissing: makeConfirmMissingOnMain() });
     if (!plan.ok) return fail(`prune refused: ${plan.reason}`);
     const dry = flags.has('dry-run');
     const after = !dry && (plan.drop.length || plan.rename.length) ? applyPlan(plan, path) : null;
@@ -243,13 +251,12 @@ function main(argv) {
     try { ids = parseIdsFile(readFileSync(flagVal('ids-file'), 'utf8')); }
     catch (e) { return fail(`cannot read --ids-file (${String(e.message || e).split('\n')[0]})`); }
     const queue = readQueueFile(path);
-    // A listed hash may have been renamed to its landed NNN (prune / migrate-bornas): match it by either spelling.
-    const bornIdx = bornAsIndexFromItems(loadBacklogItemsBestEffort());
-    ids = [...new Set(ids.map((id) => bornIdx.get(id) ?? id))];
+    // A card may be queued (or listed) under its hash OR its landed NNN: the plan matches both spellings.
+    const bornAsIndex = bornAsIndexFromItems(loadBacklogItemsBestEffort());
     let prot;
-    try { prot = loadProtectedNums(); }
+    try { prot = await loadProtectedNums(); }
     catch (e) { return fail(`cannot determine open PRs / claims (${String(e.message || e).split('\n')[0]}) — refusing (fail-closed)`); }
-    const plan = bulkRemovePlan({ queue, ids, protectedNums: prot, dropClass });
+    const plan = bulkRemovePlan({ queue, ids, protectedNums: prot, dropClass, bornAsIndex });
     const digest = planDigest(plan, dropClass);
     const dry = flags.has('dry-run');
     if (dry) writeReceipt(path, digest);
@@ -329,5 +336,5 @@ function main(argv) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main(process.argv.slice(2));
+  main(process.argv.slice(2)).catch((e) => { process.stderr.write(`${RED}✗${RST} ${String(e?.message || e).split('\n')[0]}\n`); process.exit(1); });
 }
