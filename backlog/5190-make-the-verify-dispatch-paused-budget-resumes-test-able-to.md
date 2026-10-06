@@ -2,6 +2,7 @@
 bornAs: xupq4c2
 kind: story
 size: 1
+tier: pinned
 status: open
 scope: ["we:scripts/conveyor/__tests__/verify-dispatch.test.mjs"]
 dateOpened: "2026-10-06"

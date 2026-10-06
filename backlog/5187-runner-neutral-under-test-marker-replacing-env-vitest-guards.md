@@ -2,6 +2,7 @@
 bornAs: x4cdc8i
 kind: story
 size: 2
+tier: pinned
 status: open
 scope: ["we:scripts/lib/under-test.mjs", "we:vitest.setup.ts", "we:bun-test.preload.ts", "we:scripts/backlog.mjs", "we:scripts/lib/lane-pool-paths.mjs", "we:scripts/lib/gh-rest-read.mjs", "we:scripts/operations/ci-heal-pr-dispatch.mjs", "we:skills-src/conveyor/verify-daemon.mjs"]
 dateOpened: "2026-10-06"
