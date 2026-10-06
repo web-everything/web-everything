@@ -130,6 +130,7 @@ import { collapseRollupToLatestPerName, rollupRowKind } from './lib/rollup-colla
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
 import { execFileSync, execFile, spawnSync } from 'node:child_process';
+import { readGit, readGh } from './lib/proc-read.mjs';
 import { promisify } from 'node:util';
 import { existsSync, readFileSync, writeFileSync, realpathSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -1313,7 +1314,7 @@ export function runStrandedSweepStep({
   lockFn = withLandWriteLock,
   syncFn = defaultStrandedSweepSync,
   pushFn = (o) => pushNumberingOnLand({ exec: execFileSync, ...o }),
-  rollbackFn = (sha) => { try { execFileSync('git', ['reset', '--keep', sha], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); return true; } catch { return false; } },
+  rollbackFn = (sha) => { try { readGit(['reset', '--keep', sha], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); return true; } catch { return false; } },
   log = (msg) => process.stderr.write(msg),
 } = {}) {
   const errored = (e) => {
@@ -1718,7 +1719,7 @@ function attachManifestToVerdict(v, m, { repo = null, isLocalRepo = () => false,
 export function defaultFetchLandGuardSignals(c) {
   try {
     const args = ['pr', 'view', String(c?.num), ...(c?.repo ? ['--repo', c.repo] : []), '--json', 'body,files'];
-    const out = execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const out = readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     const data = JSON.parse(out || '{}');
     return { body: data.body || '', changedFiles: Array.isArray(data.files) ? data.files.map((f) => f?.path).filter(Boolean) : null };
   } catch {
@@ -1752,9 +1753,9 @@ export function defaultResolveHashNumber(hash) {
 export function defaultFetchDiff(c) {
   try {
     const args = ['pr', 'diff', String(c?.num), ...(c?.repo ? ['--repo', c.repo] : [])];
-    return execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   } catch {
-    return '';
+    return null; // 74b — a failed/oversize read is UNKNOWN (null), never an empty diff
   }
 }
 
@@ -1828,7 +1829,9 @@ export function landedIdsForCandidate(c, { isLocalRepo = () => false, fetchGuard
   // on `changedFiles` naming some backlog card file (numbered or hash-named) — the only possible match.
   const hasBacklogCardFile = Array.isArray(changedFiles)
     && changedFiles.some((f) => /(?:^|\/)backlog\/(?:\d{2,5}|x[0-9a-z]{6})-[^/]+\.md$/i.test(String(f?.path ?? f)));
-  const diff = hasBacklogCardFile ? (fetchDiff(c) || '') : '';
+  const diffRead = hasBacklogCardFile ? fetchDiff(c) : '';
+  if (diffRead == null) process.stderr.write(`  ⚠ ${c?.repo ? `${c.repo}#` : '#'}${c?.num} diff read failed — ride-along resolve ids skipped this pass (74b)\n`);
+  const diff = diffRead || '';
   for (const n of declaredResolvedIdsFromPr(c.headRef, c.title, { body, changedFiles, diff, landedNumberFor: resolveHashNumber })) ids.add(asItemId(n));
   return [...ids];
 }
@@ -3907,7 +3910,7 @@ async function runCli() {
   const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, 6, (pr) => resolveChecks(repo, pr));
   const fetchFreshPrForRevalidation = async (repo, num) => {
     try {
-      const raw = execFileSync('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json',
+      const raw = readGh(['pr', 'view', String(num), ...repoFlag(repo), '--json',
         'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,labels,commits'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
@@ -3958,7 +3961,7 @@ async function runCli() {
     try { execFileSync('git', ['fetch', '--quiet', '--end-of-options', 'origin', headRef], { stdio: ['ignore', 'ignore', 'ignore'] }); } catch { /* ref may be local */ }
     for (const rev of ['FETCH_HEAD', `origin/${headRef}`, headRef]) {
       try {
-        const m = JSON.parse(execFileSync('git', ['show', '--end-of-options', `${rev}:.lane-manifest.json`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
+        const m = JSON.parse(readGit(['show', '--end-of-options', `${rev}:.lane-manifest.json`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
         if (m && m.item != null) return m;
       } catch { /* try next rev */ }
     }
@@ -4033,7 +4036,7 @@ async function runCli() {
   // itself refuses an already-merged PR, so a probe hiccup can never CAUSE a double-land, only fail to short it).
   const isPrAlreadyMerged = (repo, num) => {
     try {
-      const out = execFileSync('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json', 'state,mergedAt'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const out = readGh(['pr', 'view', String(num), ...repoFlag(repo), '--json', 'state,mergedAt'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
       const j = JSON.parse(out || '{}');
       return String(j.state || '').toUpperCase() === 'MERGED' || !!j.mergedAt;
     } catch { return false; }
@@ -4781,7 +4784,7 @@ async function runCli() {
       }
       if (!netScored) {
         try {
-          const files = JSON.parse(execFileSync('gh', ['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'files'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}').files || [];
+          const files = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'files'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}').files || [];
           changedFiles = files.map((f) => f.path).filter(Boolean);
           diffLines = files.reduce((s, f) => s + (Number(f.additions) || 0) + (Number(f.deletions) || 0), 0);
           // The gh files list is the PR's full diff vs its base branch (main) — already cumulative, so it IS the
@@ -4904,7 +4907,7 @@ async function runCli() {
       let humanClearedSha = null;
       if (netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted)) {
         try {
-          const cd = JSON.parse(execFileSync('gh', ['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
+          const cd = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
           tamperHeadSha = typeof cd.headRefOid === 'string' ? cd.headRefOid : null;
           humanClearedSha = parseLatestHumanClearedSha(cd.comments || []);
         } catch { /* fetch miss → both stay null → shouldReparkForTestTampering fails closed (still true) */ }
@@ -5124,17 +5127,18 @@ async function runCli() {
         // surfaced, never fatal: the label already carries the signal).
         if (gate.humanRequired && !DRY_RUN) {
           let liveBody = '';
-          try { liveBody = JSON.parse(execFileSync('gh', ['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'body'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}').body || ''; } catch { /* fetch miss — augment from empty, still best-effort */ }
+          let liveBodyRead = false; // 74b — an unread body is UNKNOWN: never reconcile/overwrite from '' (that would clobber the PR body)
+          try { liveBody = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'body'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}').body || ''; liveBodyRead = true; } catch { /* fetch miss — unknown body: skip the write, fall to the loud skip-stamp */ }
           // Reconciling against '' when the fetch misses is the same fail-soft the old raw-guard took: worst
           // case is a duplicate/overwritten block on the NEXT successful fetch, never a crash here.
-          const reconciled = reconcileEscalationReasonBlock(liveBody, parkReasons);
+          const reconciled = liveBodyRead ? reconcileEscalationReasonBlock(liveBody, parkReasons) : { changed: false, body: liveBody };
           let verified = false;
           if (reconciled.changed) {
             try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--body', reconciled.body], { stdio: ['ignore', 'ignore', 'pipe'] }); }
             catch { if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} could not write the review:human escalation reason into the PR body (#2324) — add it by hand: ${parkReasons.join('; ')}\n`); }
             // Verify the write actually landed (never trust the edit call's exit code alone — gh can succeed
             // against a stale body if two edits race). A miss is loud, not silent.
-            try { verified = bodyHasEscalationReason(JSON.parse(execFileSync('gh', ['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'body'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}').body || ''); } catch { /* verify miss — reported below as unverified */ }
+            try { verified = bodyHasEscalationReason(JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'body'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}').body || ''); } catch { /* verify miss — reported below as unverified */ }
             if (!verified && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} review:human body still missing the escalation reason after the write (#2324) — verify by hand: ${parkReasons.join('; ')}\n`);
           }
           // #3044-review F7 — the attest decision is the PURE `decideDurableEscalationRecord`, not two inline
@@ -5665,7 +5669,7 @@ async function runCli() {
   let localSynced = false;
   const landedLocal = !DRY_RUN && merged.some((m) => isLocalRepo(m.repo));
   if (landedLocal) {
-    try { execFileSync('git', ['pull', '--ff-only', '--autostash'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); localSynced = true; }
+    try { readGit(['pull', '--ff-only', '--autostash'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); localSynced = true; }
     catch { localSynced = false; }
     if (!AS_JSON) process.stderr.write(localSynced ? `  ✓ local main fast-forwarded to origin (autostash preserved local edits)\n` : `  · local main NOT fast-forwarded (diverged, or a reapplied local edit conflicts) — reconcile by hand\n`);
   }
@@ -5701,7 +5705,7 @@ async function runCli() {
   if (landedLocal) {
     const primary = resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY });
     const hinted = (typeof flags.primary === 'string' && flags.primary.trim()) || (typeof process.env.WE_PRIMARY === 'string' && process.env.WE_PRIMARY.trim());
-    const gitAt = (a) => execFileSync('git', a, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const gitAt = (a) => readGit(a, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     const isCwd = (p) => { try { return realpathSync(p) === realpathSync(process.cwd()); } catch { return false; } };
     const r = syncPrimaryOnLand({ exec: gitAt, primary, hinted: !!hinted, isCwd });
     // null = benign no-op (cwd is the primary, or hint-less unlocatable); true = synced; false = actionable skip.
