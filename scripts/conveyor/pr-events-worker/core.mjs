@@ -105,6 +105,16 @@ export function parseGithubEvent(eventName, payload, { deliveryId = null, receiv
   return { ...base, prs: prNumbers([payload.pull_request]), sha: rv.commit_id || null, state: rv.state ? String(rv.state).toLowerCase() : null };
 }
 
+/**
+ * The `checks` projection key of one (repo-lowercased) check_run/check_suite observation. Exported so a reader-side
+ * mirror of this projection (`we:scripts/lib/pr-facts.mjs`) keys its seeded rows exactly as later folds will.
+ */
+export function checkProjectionKey(event) {
+  const { repo, sha, type } = event;
+  return JSON.stringify([repo, sha, type, type === 'check_run' ? [event.name, event.app ?? null] : event.app,
+    sha ? null : [...(event.prs || [])].sort((a, b) => a - b)]);
+}
+
 /** Fold only received evidence. Field clocks protect concurrent bootstrap imports. */
 export function foldObservation(storage, observed) {
   // GitHub spells a repo one way, an operator may type another: the projection identifies a repo case-insensitively.
@@ -117,8 +127,7 @@ export function foldObservation(storage, observed) {
     // Preserve explicit attachment evidence across later empty-array deliveries.
     // A null SHA is not a join key: unrelated unknown-head observations stay separate.
     // A check run is identified by name AND app: two apps may report the same name for the same SHA.
-    const checkKey = key(repo, sha, type, type === 'check_run' ? [event.name, event.app ?? null] : event.app,
-      sha ? null : [...(event.prs || [])].sort((a, b) => a - b));
+    const checkKey = checkProjectionKey(event);
     const previous = get('checks', checkKey);
     put('checks', checkKey, { ...event, prs: [...new Set([...(previous?.prs || []), ...(event.prs || [])])] });
   }
@@ -162,7 +171,8 @@ export function foldObservation(storage, observed) {
   }
 }
 
-function snapshot(storage) {
+/** The served per-PR rows (`GET /prs`'s `prs`) of a projection storage. Exported for the reader-side mirror. */
+export function projectPrRows(storage) {
   // One pass over checks, one SHA→PRs lookup per distinct (repo, sha): bounded by distinct SHAs, never PRs × checks.
   const byPr = new Map();
   const shaPrs = new Map();
@@ -254,7 +264,7 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
     }); },
     readPrs(cursor, limit) { return storage.transaction(() => {
       const envelope = log.read(cursor, limit);
-      return { ...envelope, prs: snapshot(storage), stateCursor: envelope.head,
+      return { ...envelope, prs: projectPrRows(storage), stateCursor: envelope.head,
         coverage: { ...JSON.parse(storage.getMeta('coverage')), bootstrap: storage.listProjection('bootstrap') } };
     }); },
     /** A verified delivery we chose not to store (ping, ignored action) still proves the pipe is alive. */
