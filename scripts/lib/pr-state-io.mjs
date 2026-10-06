@@ -97,6 +97,9 @@ export function readPrFacts(pr, io = {}) {
     comments = [...array(more.nodes), ...comments]; page = more.pageInfo;
   }
   const trusted = trustedAdvisoryComments(comments);
+  // Conveyor notes describe the head they were posted against: a note older than the current head is history.
+  const headAt = Date.parse(commit?.committedDate || '') || 0;
+  const noteAfterHead = trusted.filter(c => (Date.parse(c.createdAt) || 0) >= headAt);
   const advisory = latestAdvisory(trusted);
   const referrals = probe('referrals', () => liveReferralState({ ...p, comments }, { repo: REPO, pr: Number(pr) }), {});
   const names = ['fix', 'ci-heal', 'review'].map(kind => fixDispatchSessionName({ repo: 'we', pr: Number(pr), kind }));
@@ -185,8 +188,8 @@ export function readPrFacts(pr, io = {}) {
     labelChangedAt: array(tail?.timelineItems?.nodes).filter(n => ['review:changes', 'review:pending'].includes(n.label?.name)).at(-1)?.createdAt,
     advisory: advisory ? { coveredHead: advisory.head, text: clean(trusted[advisory.index]?.body) } : null,
     referrals: { pending: referrals.pending ?? [], ruled: referrals.operatorRulings ?? [] },
-    roundCapNote: trusted.some(c => /round[- ]cap|cap[- ]exhausted/i.test(c.body)),
-    needsDecisionNote: trusted.some(c => /needs[ -]your[ -]decision/i.test(c.body)),
+    roundCapNote: noteAfterHead.some(c => /round[- ]cap|cap[- ]exhausted/i.test(c.body)),
+    needsDecisionNote: noteAfterHead.some(c => /needs[ -]your[ -]decision/i.test(c.body)),
     roundExtensions: countGrantedRoundExtensions(comments, { repo: REPO, pr: Number(pr) }),
     sessions, claim, refusals, handoffs, drainDeferral: drainDeferral ? clean(drainDeferral) : null, probeErrors: errors };
 }
