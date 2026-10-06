@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  acquireSlotBlocking, tryAcquireSlot, markWaiting, releaseOwnedSlot, heldSlots, listWaiting, clearWaiting,
+  runUnderAdmission, acquireSlotBlocking, tryAcquireSlot, markWaiting, releaseOwnedSlot, heldSlots, listWaiting, clearWaiting,
   recordHoldDuration, readHoldDurations, readStandardMinutes, resolveQueueBaseline, resolveLiveQueueBaseline,
 } from '../heavy-admission.mjs';
 
@@ -237,5 +237,17 @@ describe('prepare hold identity and pending demand', () => {
     const exempt = resolveQueueBaseline({ ...options, env: { WE_QUEUE_ADMISSION_PREPARE: 'exempt' } });
     expect(exempt.prepareAdmission).toBe('exempt');
     expect(exempt.pending).toEqual([]);
+  });
+});
+
+describe('x1ds37v — a single-test debug run is bounded by a per-run timeout', () => {
+  it('a `files` run gets the fast-run timeout; a FULL run gets none; a timeout exits 124', async () => {
+    const seen = [];
+    const base = { lockRoot: tempRoot(), cap: 2, owner: 'o', log: () => {}, env: { WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS: '5000' } };
+    await runUnderAdmission({ ...base, command: 'vitest run a.test.mjs', exec: (_c, o) => seen.push(o.timeout) });
+    await runUnderAdmission({ ...base, command: 'vitest run', exec: (_c, o) => seen.push(o.timeout) });
+    expect(seen).toEqual([5000, undefined]);
+    const r = await runUnderAdmission({ ...base, command: 'vitest run a.test.mjs', exec: () => { throw Object.assign(new Error('t'), { code: 'ETIMEDOUT', status: null }); } });
+    expect(r.exitCode).toBe(124);
   });
 });

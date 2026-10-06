@@ -150,7 +150,7 @@ import { execContainerized, containerCliAvailable, containerImageAvailable, reso
 import { resolveHostRoot, readHostToday, extractSamplesByName, utcDayKey } from '../operations/telemetry-summary-io.mjs'; // #4076 — REUSE the host-sampler's own root-resolution + tail-read + metric-extraction primitives (never reimplemented — see loadAdmissionDecision's section header below)
 import { latestValue, median } from '../lib/telemetry-machine.mjs'; // #4076/#4343 — the SAME "latest sample wins" reducer + median telemetry-machine.mjs already uses/exports — never a second implementation
 import {
-  classifyCommandKind, normalizeKind, queueLaneOf, typicalMinutes, typicalDispatchMinutes, resolvePrepareAdmission, classifyDispatchKind, dispatchDemandMinutes,
+  classifyCommandKind, resolveFastRunTimeoutMs, normalizeKind, queueLaneOf, typicalMinutes, typicalDispatchMinutes, resolvePrepareAdmission, classifyDispatchKind, dispatchDemandMinutes,
   queueBacklog, laneProjection, resolveFastSlots, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
@@ -1242,7 +1242,8 @@ export async function runUnderAdmission({
   // xhlriy2: `log`/`env` threaded through so acquireSlotBlocking's still-waiting/ceiling warnings and its own
   // `WE_HEAVY_ADMISSION=off` check apply to the `run` wrapper's wait too, not just this function's own messages.
   // Card xkyw1x4 — the kind is read off the wrapped command itself unless the caller names it.
-  const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: kind ?? classifyCommandKind(command), ceilingMs, leaseMinutes, now, sleep, log, env });
+  const runKind = kind ?? classifyCommandKind(command, env);
+  const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, ceilingMs, leaseMinutes, now, sleep, log, env });
   if (admission.timedOut) {
     log(`⚠ heavy-command admission: timed out after ${admission.waitedMs}ms waiting for capacity (cap=${cap}) — proceeding unslotted.\n`);
   } else if (admission.waitedMs > 0) {
@@ -1250,9 +1251,13 @@ export async function runUnderAdmission({
   }
   let exitCode = 0;
   try {
-    exec(command, { cwd, stdio: 'inherit', env: childEnv });
+    // x1ds37v — a single-test debug run (`files`) is bounded to fit under the 10-minute Bash cap.
+    const execOpts = { cwd, stdio: 'inherit', env: childEnv };
+    if (runKind === 'files') execOpts.timeout = resolveFastRunTimeoutMs(env);
+    exec(command, execOpts);
   } catch (e) {
     exitCode = Number.isFinite(e && e.status) ? e.status : 1;
+    if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: single-test run exceeded ${resolveFastRunTimeoutMs(env)}ms and was stopped.\n`); }
   } finally {
     if (admission.ok) releaseOwnedSlot({ lockRoot, cap, owner, fastSlots: resolveFastSlots(env) });
   }
