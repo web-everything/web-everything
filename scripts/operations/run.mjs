@@ -50,6 +50,7 @@ import { createTelemetrySummaryReader } from './telemetry-summary-io.mjs';
 import { graduationProgressReportOperation, GRADUATION_PROGRESS_REPORT_OP } from './graduation-progress-report.mjs';
 import { createScorecardReader, createPromotionsReader, createProbationReader } from './graduation-progress-report-io.mjs';
 import { selectSupervisionLevel, DEFAULT_BACKDOWN_THRESHOLDS } from '../lib/provider-routing.mjs';
+import { loadReviewSeatSettings } from '../lib/review-seat-provider.mjs';
 import { prStatusOperation, PR_STATUS_OP } from './pr-status.mjs';
 import { createPrReader } from './pr-status-io.mjs';
 import { staleStateOperation, STALE_STATE_OP } from './stale-state.mjs';
@@ -169,6 +170,8 @@ export const OPERATIONS = Object.freeze({
       codexAdvisory: codexAdvisoryFromEnv(),
       correctnessAdvisory: correctnessAdvisoryFromEnv(),
       antigravityReview: antigravityReviewFromEnv(),
+      // Card 84 — `review.seatProvider.<lens>` + the advisory agy seat (the `review-seat:mandatory:*` / `review-seat:advisory:agy-correctness` entries of we:scripts/lib/dispatch-routing-policy.json).
+      seatSettings: loadReviewSeatSettings(),
     }),
     sinks: createReviewPrSinks({ json }),
   }),

@@ -49,8 +49,9 @@ import { applyPendingEffects } from './effect-executor.mjs';
 import { createRegistry } from './registry.mjs';
 import {
   reviewPrOperation, REVIEW_EFFECTS, confirmAnswerFor, codexAdvisoryFromRun, correctnessAdvisoryFromEnv,
-  antigravityReviewFromEnv,
+  antigravityReviewFromEnv, seatSettingsForRun,
 } from './review-pr.mjs';
+import { loadReviewSeatSettings } from '../lib/review-seat-provider.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 /** Resolved by SCRIPT LOCATION, never cwd — same reason `run-store.mjs` and `review-pr-io.mjs` do it. */
@@ -289,6 +290,8 @@ export async function advanceReviewPrToWriteUp(record, { to, store, sinks = crea
     codexAdvisory: codexAdvisoryFromRun(record),
     correctnessAdvisory: correctnessAdvisoryFromEnv(),
     antigravityReview: antigravityReviewFromEnv(),
+    // Card 84 — the advisory agy seat's presence is read off the saved run, like seat 3.
+    seatSettings: seatSettingsForRun(record, loadReviewSeatSettings()),
   }));
   if (runStatus(record, { registry }) !== 'awaiting-confirm') return record;
 

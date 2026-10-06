@@ -21,6 +21,21 @@ describe('classifyCommandKind — the gate / wrapped command line → heavy kind
     expect(classifyCommandKind('vitest run --reporter=dot')).toBe('FULL');
     expect(classifyCommandKind('npm run test:coverage')).toBe('FULL');
   });
+  it('#5128 — the bounded explicit-list gate (`vitest run <files>`) is `selected`, never `FULL`', () => {
+    expect(classifyCommandKind("npx vitest run 'a.test.mjs' 'b/c.test.mjs' --passWithNoTests && npm run check:standards -- --local --files='a.mjs'")).toBe('selected');
+    expect(classifyCommandKind("npx vitest run 'a.test.mjs' --passWithNoTests")).toBe('files');
+    expect(classifyCommandKind('npx vitest run a.test.ts --run --testTimeout=60000 && npm run check:standards')).toBe('selected');
+  });
+  it('#5128 — a bare or flag-only `vitest run` stays `FULL`, even with a flag value or a chained standards run', () => {
+    for (const cmd of ['npx vitest run', 'npx vitest run --reporter dot', 'npx vitest run --passWithNoTests && npm run check:standards',
+      'npx vitest run --reporter=dot && node x.mjs',
+      // A flag value that looks like a script file is not a test target (package.json test:integration:vitest / test:soak).
+      'vitest run --config vitest.integration.config.ts', 'vitest run --config vitest.soak.config.ts', 'npx vitest run -c vitest.config.mjs',
+      'npx vitest run --reporter=./r.mjs', 'npx vitest run --setupFiles ./s.js && npm run check:standards',
+      // A full suite chained after a bounded list, or split by a newline, is still a full suite.
+      'npx vitest run a.test.mjs && npx vitest run', "npx vitest run\nnode scripts/x.mjs"]) expect(classifyCommandKind(cmd), cmd).toBe('FULL');
+    expect(classifyCommandKind('npx vitest run --config c.ts a.test.mjs --passWithNoTests')).toBe('files');
+  });
   it('check:standards alone is `standards`; a bare vitest related is `files`; anything else `other`', () => {
     expect(classifyCommandKind('node scripts/check-standards.mjs')).toBe('standards');
     expect(classifyCommandKind('npx vitest related x.mjs --run')).toBe('files');

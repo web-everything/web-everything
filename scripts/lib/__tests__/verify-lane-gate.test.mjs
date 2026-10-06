@@ -15,7 +15,7 @@ import { execSync } from 'node:child_process';
 import { LANE_RELEASE_LITTER_ALLOWLIST } from '../lane-litter.mjs';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
+import { verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -765,14 +765,14 @@ describe('verify phase telemetry (#5141)', () => {
     expect(buildVerifyPhases({ admissionWaitMs: 12.4, vitestMs: 3400.6, scanMs: 800.2,
       standardsMs: 5200.5, gateMs: 9400.4, decision: { targets: ['a', 'b'], changedFiles: ['a'] } })).toEqual({
       admissionWaitMs: 12, vitestMs: 3401, scanMs: 800, standardsMs: 5201, gateMs: 9400,
-      targetFileCount: 2, changedFileCount: 1, importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, settingsSource: null, admissionMode: 'gate', admissionPhases: null, outcomes: skipped,
+      targetFileCount: 2, changedFileCount: 1, importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, settingsSource: null, admissionMode: 'gate', admissionPhases: null, selection: null, outcomes: skipped,
     });
   });
   it('uses null for missing or non-finite timings and absent decisions', () => {
     expect(buildVerifyPhases({ admissionWaitMs: Infinity, vitestMs: NaN, scanMs: -Infinity,
       standardsMs: undefined })).toEqual({ admissionWaitMs: null, vitestMs: null, scanMs: null,
       standardsMs: null, gateMs: null, targetFileCount: null, changedFileCount: null,
-      importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, settingsSource: null, admissionMode: 'gate', admissionPhases: null, outcomes: skipped });
+      importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, settingsSource: null, admissionMode: 'gate', admissionPhases: null, selection: null, outcomes: skipped });
     expect(buildVerifyPhases({})).toEqual(buildVerifyPhases({ admissionWaitMs: NaN }));
   });
   it('guards counts with Array.isArray and preserves empty counts and zero timings', () => {
@@ -929,5 +929,101 @@ describe('#verify-phase-admission', () => {
     expect(formatVerifyPhases(phases)).toContain('admission=phase');
     expect(formatVerifyPhases(phases)).toContain('vitestWait=7(fast)');
     expect(buildVerifyPhases({ admissionWaitMs: 8 })).toMatchObject({ admissionMode: 'gate', admissionPhases: null, admissionWaitMs: 8 });
+  });
+});
+
+// #5128 — graph reads and tracked-file discovery stay injected; no real repository graph.
+describe('#5128 — bounded related-test selection', () => {
+  function boundedGate(maxTests = 3, withReader = true) {
+    const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'",
+      'scripts/direct.test.mjs': "import './hub.mjs'" };
+    for (let i = 0; i < 6; i++) files[`scripts/deep${i}.test.mjs`] = "import './mid.mjs'";
+    const git = fakeGit(['scripts/hub.mjs']);
+    return resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: maxTests, relatedDepth: 2 },
+      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
+      ...(withReader ? { readRepoFile: path => files[path] } : {}),
+    });
+  }
+
+  it('runs direct tests explicitly while preserving admission targets', () => {
+    const gate = boundedGate();
+    expect(gate.testCommand).toBe("npx vitest run 'scripts/direct.test.mjs' --passWithNoTests");
+    expect(gate.decision.selection.status).toBe('selection-truncated');
+    expect(gate.decision.targets).toEqual(['scripts/hub.mjs']);
+    expect(describeGate(gate)).toContain('selection-truncated');
+  });
+
+  it('recognizes a requester without the limit (older base) as the default gate, not a whole-gate fallback', () => {
+    const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'", 'scripts/direct.test.mjs': "import './hub.mjs'" };
+    for (let i = 0; i < 6; i++) files[`scripts/deep${i}.test.mjs`] = "import './mid.mjs'";
+    const git = fakeGit(['scripts/hub.mjs']);
+    const readRepoFile = (path) => files[path];
+    const resolveUnder = (env) => resolveDefaultGate({ env, fileConfig: { relatedMaxTests: 3, relatedDepth: 2 }, readRepoFile,
+      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args) });
+    const resolved = resolveUnder(TODAY);
+    expect(resolved.testCommand).toMatch(/^npx vitest run /);
+    const stamped = resolveUnder({ ...TODAY, WE_VERIFY_RELATED_MAX_TESTS: '0' }).command;
+    expect(stamped).toMatch(/^npx vitest related 'scripts\/hub\.mjs'/);
+    const plan = matchRequestedDefaultGate({ gate: stamped, env: TODAY, resolved, resolveUnder });
+    expect(plan?.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
+    expect(plan.decision.selection ?? null).toBeNull();
+  });
+
+  it('keeps vitest related, with no selection, when git or the graph throws', () => {
+    const git = fakeGit(['scripts/hub.mjs']);
+    for (const [label, runGit, readRepoFile] of [
+      ['ls-files throws', args => { if (args[0] === 'ls-files' && args.includes('--cached')) throw new Error('git broke'); return git(args); }, () => ''],
+      ['every graph read throws', args => args[0] === 'ls-files' && args.includes('--cached') ? 'scripts/hub.mjs' : git(args),
+        () => { throw new TypeError('boom'); }],
+    ]) {
+      const gate = resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: 1, relatedDepth: 2 }, runGit, readRepoFile });
+      expect(gate.testCommand, label).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
+      expect(gate.decision, label).not.toHaveProperty('selection', expect.objectContaining({ status: 'selection-truncated' }));
+    }
+  });
+
+  it('keeps vitest related when the bounded list is longer than one command line can carry', () => {
+    const files = { 'scripts/hub.mjs': '' };
+    for (let i = 0; i < 400; i++) files[`scripts/${'x'.repeat(90)}${i}.test.mjs`] = "import './hub.mjs'";
+    const git = fakeGit(['scripts/hub.mjs']);
+    const gate = resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: 3, relatedDepth: 2 },
+      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
+      readRepoFile: path => files[path] });
+    expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
+    expect(gate.decision.selection).toMatchObject({ status: 'complete', tests: null });
+    expect(gate.decision.selection.reason).toContain('list unusable');
+  });
+
+  it('keeps vitest related under the limit', () => {
+    const gate = boundedGate(50);
+    expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
+    expect(gate.decision.selection.status).toBe('complete');
+  });
+
+  it('keeps the original command and omits selection without a reader', () => {
+    const gate = boundedGate(3, false);
+    expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
+    expect(gate.decision).not.toHaveProperty('selection');
+  });
+
+  it('emits selection counts in structured and formatted phase telemetry', () => {
+    const phases = buildVerifyPhases({ decision: boundedGate().decision });
+    expect(phases.selection).toMatchObject({ status: 'selection-truncated', fullTestCount: 7,
+      selectedTestCount: 1, droppedCount: 6 });
+    expect(formatVerifyPhases(phases)).toContain('selection=selection-truncated(1/7)');
+  });
+
+  it('wires the repository reader and retries both related and explicit test commands', () => {
+    const source = readFileSync(resolve('scripts/verify-lane.mjs'), 'utf8');
+    expect(source).toMatch(/const readRepoFile\s*=\s*\(p\)\s*=>\s*readFileSync\(join\(REPO, p\), 'utf8'\)/);
+    const calls = [...source.matchAll(/resolveDefaultGate\(\{([^;]+?)\}\)/g)];
+    expect(calls.length).toBeGreaterThan(0);
+    for (const [, args] of calls) expect(args).toMatch(/\breadRepoFile\b/);
+    const pattern = source.match(/const SELECTED_TEST_COMMAND = \/(.+)\//);
+    expect(pattern).not.toBeNull();
+    const selectedTestCommand = new RegExp(pattern[1]);
+    for (const mode of ['related', 'run']) expect(selectedTestCommand.test(`npx vitest ${mode} 'x.test.mjs'`)).toBe(true);
+    expect(selectedTestCommand.test('npm run test:unit')).toBe(false);
+    expect(source).toMatch(/const retryableGate = SELECTED_TEST_COMMAND\.test\(resolvedGate\?\.testCommand \?\? ''\)/);
   });
 });

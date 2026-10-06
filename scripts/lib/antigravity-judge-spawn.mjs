@@ -368,8 +368,36 @@ export const ANTIGRAVITY_TOOL_FREE_CORRECTION = [
  * @param {string} input
  * @returns {string}
  */
-export function buildAntigravityPrompt(mandate, input) {
+export function buildAntigravityPrompt(mandate, input, { toolPolicy = 'none', readDir = null } = {}) {
+  if (toolPolicy === 'read-cwd') {
+    // Card 84 live run (PR #4133, 2026-10-06): with the correction only AFTER a tool-bearing panel mandate, the juror's
+    // FIRST action was `run_command ls` — denied, turn over, no answer. So the correction leads AND closes the mandate.
+    const correction = buildAntigravityReadOnlyCorrection(readDir);
+    return `${correction}\n\n${mandate}\n\n${correction}\n\n---\n\nThe material to judge follows.\n\n${input}`;
+  }
   return `${mandate}\n\n${ANTIGRAVITY_TOOL_FREE_CORRECTION}\n\n---\n\nThe material to judge follows.\n\n${input}`;
+}
+
+/**
+ * Card 84 — THE READ-ONLY JUROR CORRECTION, for a seat that runs in its own throwaway checkout of the PR (an agy
+ * review-seat juror, `we:scripts/lib/agy-review-juror.mjs`). Without `--dangerously-skip-permissions` agy's
+ * headless check allows a file READ inside its cwd and denies every shell command and every write (re-probed live on
+ * agy 1.3.0, 2026-10-06: `view_file` inside the cwd succeeded; `write_to_file` came back in `denied_actions`). A
+ * denied call ends the turn with NO structured answer (#3633 probe 7), so the juror is told plainly not to try one.
+ * @param {string|null} readDir - the checkout the juror may read.
+ */
+export function buildAntigravityReadOnlyCorrection(readDir) {
+  const where = readDir ? ` (${JSON.stringify(readDir)})` : '';
+  return [
+    'CORRECTION FOR THIS SEAT, OVERRIDING ANYTHING SAID ABOVE ABOUT A SHELL OR TOOLS: your working directory is a',
+    `checkout of this PR's head${where}. To look at code use ONLY these tools: list_dir, view_file, grep_search,`,
+    'find_by_name — inside that directory. NEVER use run_command or any shell, not even `ls`, `cat`, `git` or a',
+    'test run, whatever the instructions above say about running gates or mutation probes: a shell call is denied',
+    'and a denied call ends your turn with NO answer. Never write, edit, create or delete any file anywhere — any',
+    'change on disk voids this seat. Do not read outside that directory. Cite files by their path RELATIVE to that',
+    'directory. Say plainly what you could not verify instead of describing checks you did not run. Answer with the',
+    'required structured output.',
+  ].join(' ');
 }
 
 /**
@@ -627,7 +655,17 @@ export async function antigravityJudgeSpawn({
   // #3383 mechanical-dispatcher Gap 1 fix — see the call site below, right after `transcriptFile` is known.
   recordScorecard = recordAntigravityRunScorecard,
   readHold = readAgyHold, saveHold = saveAgyHold,
+  // Card 84 — `'read-cwd'` lets the juror read inside `cwd` (an agy review-seat juror's own checkout). Still no
+  // `--dangerously-skip-permissions`, so shell and writes stay denied. `role` labels the scorecard row.
+  toolPolicy = 'none',
+  role = 'advisory-review',
 } = {}) {
+  if (toolPolicy !== 'none' && toolPolicy !== 'read-cwd') {
+    throw new TypeError(`antigravity-judge-spawn: \`toolPolicy\` must be none|read-cwd, got ${JSON.stringify(toolPolicy)}`);
+  }
+  if (toolPolicy === 'read-cwd' && (typeof cwd !== 'string' || !cwd.trim())) {
+    throw new TypeError('antigravity-judge-spawn: a read-cwd juror needs its own checkout as `cwd`');
+  }
   if (typeof mandate !== 'string' || !mandate.trim()) {
     throw new TypeError('antigravity-judge-spawn: `mandate` must be a non-empty string');
   }
@@ -641,7 +679,7 @@ export async function antigravityJudgeSpawn({
 
   const hold = readHold(model);
   if (hold) {
-    recordScorecard({ provider: 'antigravity', model: 'unknown', ...hold, dispatchKind: 'advisory-review', kind: 'review', role: 'advisory-review' });
+    recordScorecard({ provider: 'antigravity', model: 'unknown', ...hold, dispatchKind: role, kind: 'review', role });
     throw agyEvidenceError(hold);
   }
   const workDir = mkTempDir(join(tmpdir(), 'antigravity-judge-'));
@@ -650,7 +688,7 @@ export async function antigravityJudgeSpawn({
   writeFile(schemaFile, JSON.stringify(shape));
 
   const argv = buildAntigravityJudgeArgv({ schemaFile, model, effort });
-  const streamInput = buildAntigravityStreamInput(buildAntigravityPrompt(mandate, input));
+  const streamInput = buildAntigravityStreamInput(buildAntigravityPrompt(mandate, input, { toolPolicy, readDir: cwd }));
 
   const startedAt = Date.now();
   let result;
@@ -706,7 +744,7 @@ export async function antigravityJudgeSpawn({
   } catch (error) {
     const evidence = agyRunEvidence({ requestedModel: model });
     error.telemetry = evidence;
-    recordScorecard({ ...evidence, model: 'unknown', provider: 'antigravity', dispatchKind: 'advisory-review', kind: 'review', role: 'advisory-review' });
+    recordScorecard({ ...evidence, model: 'unknown', provider: 'antigravity', dispatchKind: role, kind: 'review', role });
     throw error;
   } finally {
     try { removeFile(workDir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
@@ -733,7 +771,7 @@ export async function antigravityJudgeSpawn({
   try { saveHold(evidence); } catch (error) { holdError = error; }
   recordScorecard({
     ...evidence,
-    transcriptFile, dispatchKind: 'advisory-review', kind: 'review', role: 'advisory-review',
+    transcriptFile, dispatchKind: role, kind: 'review', role,
     provider: 'antigravity', model: evidence.servedModel, effort,
   });
 

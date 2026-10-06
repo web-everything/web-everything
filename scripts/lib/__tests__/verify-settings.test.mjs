@@ -10,7 +10,7 @@ import { verifyRelatedMode, verifyTestTimeoutFactor, verifyStandardsPolicy, veri
 
 const allSources = source => Object.fromEntries(Object.keys(BUILT_IN_VERIFY_SETTINGS).map(key => [key, source]));
 const custom = { relatedMode: 'import-only', testTimeoutFactor: 4, standards: 'ci-only', phaseAdmission: false, fastTargets: 2,
-  matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off' };
+  matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off', relatedMaxTests: 12, relatedDepth: 3 };
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function file(contents) {
@@ -25,7 +25,7 @@ describe('verify settings', () => {
   it('resolves the running module settings path and applies the shipped file with an empty env', () => {
     expect(defaultVerifySettingsPath()).toBe(resolve(dirname(fileURLToPath(import.meta.url)), '../../verify-settings.json'));
     expect(resolveVerifySettings({ fileConfig: loadVerifySettingsFile(defaultVerifySettingsPath()), env: {} }))
-      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only', standards: 'auto' }, sources: allSources('file') });
+      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only', standards: 'auto', relatedMaxTests: 40, relatedDepth: 2 }, sources: allSources('file') });
     expect(verifyRelatedMode({})).toBe('import-only');
   });
 
@@ -43,9 +43,9 @@ describe('verify settings', () => {
     const env = { WE_VERIFY_RELATED: 'all', WE_VERIFY_TEST_TIMEOUT_FACTOR: '2.5', WE_VERIFY_STANDARDS: 'auto',
       WE_VERIFY_PHASE_ADMISSION: '1', WE_VERIFY_FAST_TARGETS: '0', WE_VERIFY_MATCH_REQUEST_VARIANTS: '1',
       WE_VERIFY_SUPERSEDE: 'any', WE_VERIFY_RESTART_IN_FLIGHT: 'adopt', WE_VERIFY_RUN_ALL_PHASES: '1',
-      WE_VERIFY_ISOLATED_RETRY: 'timeouts' };
+      WE_VERIFY_ISOLATED_RETRY: 'timeouts', WE_VERIFY_RELATED_MAX_TESTS: '5', WE_VERIFY_RELATED_DEPTH: '1' };
     const values = { relatedMode: 'all', testTimeoutFactor: 2.5, standards: 'auto', phaseAdmission: true, fastTargets: 0,
-      matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts' };
+      matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts', relatedMaxTests: 5, relatedDepth: 1 };
     expect(resolveVerifySettings({ fileConfig: custom, env })).toEqual({ values, sources: allSources('env') });
     expect(resolveVerifySettings({ fileConfig: custom, env: { WE_VERIFY_RELATED: 'all' } }))
       .toEqual({ values: { ...custom, relatedMode: 'all' }, sources: { ...allSources('file'), relatedMode: 'env' } });
@@ -120,5 +120,40 @@ describe('verify settings', () => {
     const blocked = resolveDefaultGate({ runGit: () => { throw Error('unreadable diff'); }, env: {}, fileConfig: null });
     expect(blocked.decision.mode).toBe('blocked');
     expect(blocked.decision.settingsSource).toEqual(allSources('default'));
+  });
+});
+
+// #5128 — the bounded graph is opt-in by default, enabled by the host settings file.
+describe('#5128 — related selection settings', () => {
+  it('defaults to off and depth two, with a shipped limit of forty', () => {
+    expect(resolveVerifySettings({ fileConfig: null, env: {} }).values)
+      .toMatchObject({ relatedMaxTests: 0, relatedDepth: 2 });
+    expect(loadVerifySettingsFile(defaultVerifySettingsPath()))
+      .toMatchObject({ relatedMaxTests: 40, relatedDepth: 2 });
+  });
+
+  it('accepts file values and environment overrides including a zero limit', () => {
+    const fileConfig = { relatedMaxTests: 8, relatedDepth: 4 };
+    expect(resolveVerifySettings({ fileConfig, env: {} })).toMatchObject({
+      values: fileConfig, sources: { relatedMaxTests: 'file', relatedDepth: 'file' },
+    });
+    expect(resolveVerifySettings({ fileConfig, env: { WE_VERIFY_RELATED_MAX_TESTS: '0', WE_VERIFY_RELATED_DEPTH: '1' } }))
+      .toMatchObject({ values: { relatedMaxTests: 0, relatedDepth: 1 },
+        sources: { relatedMaxTests: 'env', relatedDepth: 'env' } });
+  });
+
+  it.each([
+    ['relatedMaxTests', 'WE_VERIFY_RELATED_MAX_TESTS', 0, [-1, 1.5]],
+    ['relatedDepth', 'WE_VERIFY_RELATED_DEPTH', 2, [-1, 0, 1.5]],
+  ])('keeps fallbacks for invalid %s values', (key, envKey, fallback, invalid) => {
+    for (const value of invalid) {
+      expect(validateVerifySettings({ [key]: value })[key]).toBe(fallback);
+      expect(resolveVerifySettings({ fileConfig: { [key]: value }, env: {} }))
+        .toMatchObject({ values: { [key]: fallback }, sources: { [key]: 'default' } });
+      expect(resolveVerifySettings({ fileConfig: { [key]: 9 }, env: { [envKey]: String(value) } }))
+        .toMatchObject({ values: { [key]: 9 }, sources: { [key]: 'file' } });
+      expect(resolveVerifySettings({ fileConfig: null, env: { [envKey]: String(value) } }))
+        .toMatchObject({ values: { [key]: fallback }, sources: { [key]: 'default' } });
+    }
   });
 });

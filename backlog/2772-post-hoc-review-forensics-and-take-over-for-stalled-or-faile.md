@@ -37,7 +37,11 @@ Proposed GET `/api/backlog/forensics` accepts a configured repository key, item 
 
 Implement the WE collector as proposed we:scripts/readiness/lane-forensics.mjs with injectable IO and a pure projection. Read existing conveyor health and lane evidence. Diff sections distinguish committed changes since the recorded attempt base, staged changes, unstaged changes and untracked filenames; report binary files, truncation and unavailable base separately. Use fixed argv, no shell interpolation, bounded output/time, and no external diff/text conversion. Never reset, fetch, acquire, release or disclose raw transcript contents during GET. Revalidate attempt/lease/head around collection; flag an inconsistent snapshot and disable its actions instead of presenting it as current. The panel renders patch text as text, with loading, empty, partial, stale and unavailable states.
 
+- **Forensic confidentiality:** untracked files contribute filenames only, never file contents. Exclude or redact gitignored and known secret paths from patch bodies across committed, staged and unstaged categories. Filter before serialization, not only during panel rendering; secret contents must not leak through error or truncation metadata. This is a path-based confidentiality contract, not a claim of general-purpose secret detection.
+
 ### Operator custody and hand-back
+
+Every custody POST must independently validate JSON content type, same-origin Origin and loopback Host before invoking a custody backend or changing runner/lease state. Reject non-JSON content types, a mismatched Origin and a non-loopback Host with no mutation; JSON alone is not the complete guard.
 
 Proposed POST custody actions carry the same attempt identity, an expected lease version and an idempotency key. Re-read eligibility immediately before any mutation. Unknown repo, stale attempt, recycled lane, reserved lane, changed owner or unconfirmed worker shutdown yields a named refusal with no mutation. Do not map the UI directly to forced adoption: today's command writes `workerSession` and requires a session environment (we:scripts/lane-pool.mjs:3889–3904); it does not supply the required full transfer protocol.
 
@@ -60,12 +64,19 @@ Land and verify the predecessor first, then the consumer. Neither intermediate v
 
 - A keyboard-accessible interrupted-build panel shows current identity, last state, evidence-backed reason or “unknown,” and every diff category with explicit missing/truncated markers.
 - Every read is bounded and non-mutating; stale or mismatched snapshots cannot authorize a mutation.
+- Untracked evidence contains filenames only, never file contents. Gitignored and known secret-path contents are absent from the serialized forensic DTO, including committed, staged and unstaged patch bodies and error/truncation metadata.
+- Every custody POST independently rejects non-JSON content types, a mismatched Origin and a non-loopback Host before any custody backend call, runner stop or lease write. Rejection causes zero mutation; a valid same-origin loopback JSON request reaches the backend.
 - Take-over holds the original lane only after worker termination and fresh ownership validation. Refreshing the UI or restarting its server restores the durable custody view.
 - Hand-back continues the same changes in the same lane; failed transfer keeps custody. Concurrent/duplicate actions and delayed cleanup cannot free another holder's lane.
 - Existing normal builds retain cleanup behavior. Failure state precedence remains unchanged. Alternatives show honest availability and consequences; no automatic discard or reassignment is introduced.
 - Both delivery slices include their tests and observed proof before the original end-to-end goal is complete.
 
 ## Test plan
+
+These named tests are implementation obligations, not runtime tests delivered by the #4816 documentation amendment:
+
+- **Capability (Red today; handler/test are proposed, not executed here):** **“custody POST rejects non-JSON, mismatched Origin and non-loopback Host without mutation”** in proposed plateau:src/backlog-view/post-hoc-api.test.ts. Exercise real handler dispatch with an injected backend for every custody action. Vary each invalid header independently while keeping the other headers valid; assert refusal and zero backend calls, runner stops or lease writes. Include a valid same-origin loopback JSON request that reaches the injected backend, so rejecting all requests cannot satisfy the test.
+- **Capability (Red today; collector/test are proposed, not executed here):** **“lane forensics omits secret contents and lists untracked names only”** in proposed we:scripts/readiness/__tests__/lane-forensics.test.mjs. Exercise the collector's real read/serialization path in an isolated git repository seeded with unique fake-secret sentinels in an ignored file, a known secret-path fixture and an ordinary untracked file. Cover secret-path changes in committed, staged and unstaged patch categories. Assert that the serialized DTO contains none of the sentinels, including error/truncation metadata; the ordinary untracked filename is present without its contents; and an ordinary tracked patch still appears. Compare repository state before/after to assert no mutation. Use fake values, never local credentials.
 
 **WE:** proposed we:scripts/readiness/__tests__/lane-forensics.test.mjs exercises stale/missing activity, explicit stop/failure, infra cause versus silence, missing base, recycled lane, staged/unstaged/committed/untracked/binary changes, bounded patch output, read errors and non-mutating collection. Extend we:scripts/__tests__/lane-pool-release-ownership.test.mjs with temporary git repos and controlled processes to prove atomic transfer, shutdown refusal, durable hold, duplicate request, stale version, concurrent takeover, cleanup races, failed hand-back and same-lane acknowledgement. Extend we:scripts/__tests__/lane-pool-release-reap-race.test.mjs to pin successor protection. Run these real-process suites via `npm run test:integration:vitest -- <test-paths>`; they are deliberately excluded from the unit tier (we:vitest.config.ts:183 and we:vitest.integration.config.ts:5–14). Run the existing conveyor-state tests as regression coverage; do not change their inactivity policy.
 
@@ -78,14 +89,17 @@ Proposed we:../plateau-app/tests/e2e/post-hoc-review.spec.ts covers each interru
 Implementation proof, not claimed performed by this preparation:
 
 1. Seed an isolated temporary pool with identifiable committed, staged, unstaged and untracked changes and controlled failed/stopped/stalled/orphaned attempts. Never use live production leases or launch a paid worker for these checks.
-2. Curl the real read endpoint; compare all diff categories against git and hash HEAD/index/worktree/untracked contents before and after to prove GET did not mutate them. Record missing/truncated evidence cases and timestamps.
+2. Curl the real read endpoint against a disposable secret-fixture repository; compare all diff categories against git and hash HEAD/index/worktree/untracked contents before and after to prove GET did not mutate them. Inspect the actual serialized response for sentinel absence, ordinary tracked patch presence and filename-only untracked evidence, including error/truncation metadata. A screenshot hiding secret text is insufficient. Record missing/truncated evidence cases and timestamps.
 3. Drive the running Plateau panel by keyboard; capture the state, evidence, focus return and narrow viewport rendering. Inspect the actual endpoint response as well as pixels.
 4. Take over a controlled stopped worker. Observe lease/custody state, unchanged contents and exclusion from acquire/reap. Reload and restart the product server, then show the same held attempt.
 5. Hand back to a controlled receiver. Observe the identical checkout and contents, new ownership and continuation without reset. Race a stale second client and old cleanup; both must preserve the new holder. Kill the receiver before acknowledgement and prove the operator retains custody.
 6. Record exact repo SHAs, commands, responses and artifacts in the implementing cards. A green classifier test alone does not prove lease custody or a functioning endpoint.
+7. Send non-JSON, mismatched-Origin and non-loopback-Host requests independently to each real custody action against a disposable backend/pool, keeping other headers valid. Record refusal, zero backend/stop/lease writes and unchanged ownership. Send the valid same-origin loopback JSON control separately and observe backend dispatch.
 
 ## Follow-ups
 
+- Consider a shared origin-guard helper and lint/standards enforcement for new mutating development middleware routes separately. This amendment does not mandate a repository-wide middleware migration or select a new standards rule.
+- Make exact secret-path matching and missing-Origin handling explicit and test them during API/collector implementation; this amendment does not settle those policy details.
 - Author the two single-repo cards/edge before dispatch; this session only proposes the split. Keep full scope until that explicit decomposition occurs.
 - Extend recovery alternatives beyond the custody round trip only with their own acceptance and destructive-action proof; do not silently broaden this into arbitrary process termination, discard or a new orchestration policy.
 - Testing lesson: a runner stop is not proof of lane retention, and an adoption marker is not proof the previous process exited. Keep the preservation and delayed-cleanup race tests on the implementing cards; no shared agent-document edits are needed.
