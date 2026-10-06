@@ -36,6 +36,7 @@
  * real run costs a few minutes on the operator's own default (Sonnet) worker tier, not a full delivery's worth
  * of tokens.
  */
+import { readGit } from '../lib/proc-read.mjs';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
@@ -89,7 +90,7 @@ function log(line) {
  *  caller treats "could not tell" distinctly from a confirmed absence. */
 function refExistsOnOrigin(ref, { root = REPO_ROOT } = {}) {
   try {
-    const out = execFileSync('git', ['ls-remote', '--exit-code', 'origin', `refs/heads/${ref}`], {
+    const out = readGit(['ls-remote', '--exit-code', 'origin', `refs/heads/${ref}`], {
       cwd: root, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'],
     });
     return String(out || '').trim().length > 0;

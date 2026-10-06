@@ -125,9 +125,10 @@
  * lets #3878's standalone `we:skills-src/conveyor/verify-daemon.mjs` tick it directly. `main()` below is now a
  * thin CLI shell over it.
  */
+import { readGit } from '../lib/proc-read.mjs';
 import { existsSync, readFileSync, readdirSync, writeFileSync, renameSync, openSync, closeSync, readSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
-import { execFileSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -306,7 +307,7 @@ function tryGit(args, cwd) {
     // #x5n4zn3 — was bare (no timeout). This file's own main `verify-lane.mjs` spawn already has its own
     // dedicated two-phase queue/gate timeout (see file header) — deliberately untouched here — but this SEPARATE
     // small git helper (pool-scan / marker reads) had none at all.
-    return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' }).trim();
+    return readGit(args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' }).trim();
   } catch {
     return null;
   }

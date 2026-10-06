@@ -347,7 +347,7 @@ if (IS_CLI) {
   const args = ['pr', 'comment', String(pr), '--body', body];
   if (typeof flags.repo === 'string') args.push(`--repo=${flags.repo}`); // the fix agent runs in its WE lane clone; a missing --repo derives from cwd.
   try {
-    execFileSync('gh', args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+    execFileSync('gh', args, { /* #74c write-only call: stdout is never read, so it is not captured (nothing to overflow or truncate) */ stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
   } catch (e) {
     fail(`could not post advisory-fix comment on PR #${pr}: ${String(e.message || e).split('\n')[0]}`);
   }
