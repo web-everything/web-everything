@@ -133,6 +133,16 @@ describe('ci-heal load-flake exit', () => {
     expect(text).toContain('--outcome=gate-red');
     expect(text.indexOf('--reason=load-flake')).toBeLessThan(text.indexOf('--outcome=gate-red'));
     expect(text).toContain('Otherwise a red gate is a hard stop');
+    // The exit is only safe under its three eligibility conditions: this ordering test must redden if any is dropped,
+    // not only the dedicated eligibility test above (the paragraph precedes the command, which precedes the hard stop).
+    const paragraph = loadFlakeParagraph(text);
+    expectEachGuarded(paragraph, [
+      'files your heal did not touch',
+      'passes when run alone',
+      REVERIFY_WORKER,
+    ]);
+    expect(text.indexOf(paragraph)).toBeLessThan(text.indexOf('--reason=load-flake'));
+    expect(text.indexOf('--reason=load-flake')).toBeLessThan(text.indexOf('Otherwise a red gate is a hard stop'));
   });
 });
 
