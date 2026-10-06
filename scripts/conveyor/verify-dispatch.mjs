@@ -125,7 +125,8 @@
  * lets #3878's standalone `we:skills-src/conveyor/verify-daemon.mjs` tick it directly. `main()` below is now a
  * thin CLI shell over it.
  */
-import { existsSync, readFileSync, readdirSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync, renameSync, openSync, closeSync, readSync } from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -136,6 +137,7 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { resolveCeilingMs as resolveAdmissionCeilingMs } from '../readiness/heavy-admission.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { branchMatchesQueueIds, isQueueScopeEnabled, readScopedQueueIds } from './queue-scope.mjs';
+import { loadVerifySettingsFile, resolveVerifySettings } from '../lib/verify-settings.mjs';
 
 /** Several multiples of the gate's documented 150-350s normal range — generous on purpose (see file header):
  *  a slow-but-healthy GATE run under contention must never be mistaken for a stuck one. Applies ONLY to the
@@ -232,15 +234,37 @@ export function resolveMaxInFlight(env) {
   return Number.isInteger(value) && value > 0 ? value : 8;
 }
 
-/** Whether a pending marker belongs to a different request than this in-flight run.
- * @param {{runId:string, requestStartedAt:string|null}} entry
- * @param {object|null} marker
- * @param {string|null} headSha
+/** #65 — is a re-stamped marker the SAME request this in-flight run already serves: same sha, same gate command,
+ *  and the same (known) working-tree hash? An agent that re-runs `verify-lane request` after a wait timeout does
+ *  exactly this; the running gate already answers it, so killing it only throws away minutes of gate work.
+ * @param {{sha?:string, suites?:string, treeHash?:string|null}} entry
+ * @param {{sha?:string, suites?:string, treeHash?:string|null}} marker
  * @returns {boolean}
  */
-export function inFlightSuperseded(entry, marker, headSha) {
-  return laneNeedsVerifyDispatch(marker, headSha)
+export function sameVerifyRequest(entry, marker) {
+  return !!entry?.sha && entry.sha === marker?.sha && entry.suites === marker?.suites
+    && entry.treeHash != null && entry.treeHash === marker?.treeHash;
+}
+
+/** Whether a pending marker belongs to a different request than this in-flight run AND that request may kill it,
+ *  per the declared `supersede` setting (#65): `newer` (default) kills only for a different sha, gate or tree —
+ *  never an identical re-request; `never` kills nothing; `any` is the old behaviour (every re-stamp kills).
+ * @param {{runId:string, requestStartedAt:string|null, sha?:string, suites?:string, treeHash?:string|null}} entry
+ * @param {object|null} marker
+ * @param {string|null} headSha
+ * @param {'newer'|'never'|'any'} [policy]
+ * @returns {boolean}
+ */
+export function inFlightSuperseded(entry, marker, headSha, policy = 'newer') {
+  const differentRequest = laneNeedsVerifyDispatch(marker, headSha)
     && marker.runId !== entry.runId && marker.startedAt !== entry.requestStartedAt;
+  if (!differentRequest || policy === 'never') return false;
+  return policy === 'any' || !sameVerifyRequest(entry, marker);
+}
+
+/** The declared `supersede` setting (env `WE_VERIFY_SUPERSEDE` over the running checkout's settings file). */
+export function resolveSupersedePolicy(env = process.env, fileConfig = loadVerifySettingsFile()) {
+  return resolveVerifySettings({ fileConfig, env }).values.supersede;
 }
 
 // ── IO SHELL (runs only as a CLI) ───────────────────────────────────────────────────────────────────────────
@@ -286,6 +310,13 @@ function tryGit(args, cwd) {
   } catch {
     return null;
   }
+}
+
+/** #65 — where a dispatched child's stderr is written (next to the marker, overwritten per run). */
+export const DISPATCH_LOG_FILENAME = '.lane-verify.dispatch.log';
+function dispatchLogPath(laneDir) {
+  const gitDir = tryGit(['rev-parse', '--absolute-git-dir'], laneDir) || join(laneDir, '.git');
+  return join(gitDir, DISPATCH_LOG_FILENAME);
 }
 
 /** Read a lane's `.lane-verify` marker via the real (possibly worktree-relocated) git dir — mirrors
@@ -362,9 +393,16 @@ function parseFlags(argv) {
  *   shaped like `execFileSync`'s own timeout/non-zero errors, plus `timedOutPhase` so the caller can log which
  *   ceiling actually fired.
  */
-export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateStarted, onSpawn } = {}) {
+export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateStarted, onSpawn, logPath, onNotice, tailIntervalMs = 250 } = {}) {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn('node', args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    // #65 — with `logPath`, stderr is a FILE the child owns (stdout is discarded, as before) and is tailed here,
+    // so the gate never depends on this process staying alive to read a pipe: a restarted daemon can adopt it.
+    let logFd = null;
+    if (logPath) {
+      try { logFd = openSync(logPath, 'w'); } catch { logFd = null; }
+    }
+    const child = spawn('node', args, { stdio: logFd != null ? ['ignore', 'ignore', logFd] : ['ignore', 'pipe', 'pipe'], detached: true });
+    if (logFd != null) { try { closeSync(logFd); } catch {} }
     // Observer hooks cannot interfere with process supervision.
     try { onSpawn?.(child.pid); } catch {}
     let stderrTail = '';
@@ -380,8 +418,6 @@ export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateSt
       }
     };
     let timer = setTimeout(onTimeout('queue'), queueCeilingMs);
-    // Decode across read boundaries: the marker lines carry a multi-byte emoji a raw chunk could split.
-    child.stderr.setEncoding('utf8');
     // After the first marker: the gate budget left while the child re-queues for a later phase's slot, and the
     // partial trailing line carried between chunks (only complete lines can be a line-anchored marker).
     let gateBudgetMs = gateCeilingMs;
@@ -417,7 +453,18 @@ export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateSt
       }
     };
 
-    child.stderr.on('data', (chunk) => {
+    // #66 — child notices (`⚠ verify-lane: …` at a line start) are surfaced to the caller's log, whole lines only.
+    let noticeCarry = '';
+    const scanNotices = (text) => {
+      if (typeof onNotice !== 'function') return;
+      const lines = (noticeCarry + text).split('\n');
+      noticeCarry = lines.pop().slice(-4096);
+      for (const line of lines) {
+        if (line.startsWith('⚠ verify-lane:')) { try { onNotice(line); } catch {} }
+      }
+    };
+    const onStderr = (chunk) => {
+      scanNotices(chunk.toString('utf8'));
       if (markerSeen) {
         scanLaterMarkers(chunk.toString('utf8'));
         return;
@@ -440,17 +487,46 @@ export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateSt
           }
         }
       }
-    });
-    // Drain stdout so a full pipe buffer can never back-pressure/stall the child — this file never reads it
-    // (mirrors the old `execFileSync` call site, which discarded it too).
-    child.stdout.on('data', () => {});
+    };
+    let tail = null;
+    let drainTail = () => {};
+    if (logFd != null) {
+      // Decode across read boundaries: the marker lines carry a multi-byte emoji a raw read could split.
+      const decoder = new StringDecoder('utf8');
+      let offset = 0;
+      drainTail = () => {
+        let fd;
+        try { fd = openSync(logPath, 'r'); } catch { return; }
+        try {
+          const buffer = Buffer.alloc(64 * 1024);
+          for (;;) {
+            const read = readSync(fd, buffer, 0, buffer.length, offset);
+            if (read <= 0) break;
+            offset += read;
+            const text = decoder.write(buffer.subarray(0, read));
+            if (text) onStderr(text);
+          }
+        } catch { /* a transient read failure retries on the next poll */ } finally { try { closeSync(fd); } catch {} }
+      };
+      tail = setInterval(drainTail, tailIntervalMs);
+    } else {
+      // Decode across read boundaries: the marker lines carry a multi-byte emoji a raw chunk could split.
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', onStderr);
+      // Drain stdout so a full pipe buffer can never back-pressure/stall the child — this file never reads it
+      // (mirrors the old `execFileSync` call site, which discarded it too).
+      child.stdout.on('data', () => {});
+    }
+    const stopTail = () => { if (tail) { clearInterval(tail); tail = null; drainTail(); } };
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      stopTail();
       rejectPromise(err);
     });
     child.on('close', (code, signal) => {
       clearTimeout(timer);
+      stopTail();
       if (timedOutPhase) {
         const e = new Error(`verify-lane exceeded the ${timedOutPhase}-phase ceiling`);
         e.status = null;
@@ -503,6 +579,7 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
   const scopeEnabled = isQueueScopeEnabled();
   const scopeIds = scopeEnabled ? readScopedQueueIds() : [];
   const skippedOutOfScope = [];
+  const supersedePolicy = resolveSupersedePolicy(process.env);
   if (scopeEnabled) {
     log(`⊂ queue-scoped: verify-dispatch will run the gate only for lanes on ${scopeIds.length ? scopeIds.join(', ') : '(nothing — the queue is empty)'}`);
   }
@@ -530,8 +607,14 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
 
       const entry = inFlight?.get(dir);
       if (entry) {
+        if (!dryRun && laneNeedsVerifyDispatch(marker, headSha) && marker.runId !== entry.runId
+          && marker.startedAt !== entry.requestStartedAt && sameVerifyRequest(entry, marker)
+          && entry.keptFor !== marker.startedAt) {
+          entry.keptFor = marker.startedAt;
+          log(`  ↺ ${pool}/lane-${lane}: identical re-request for in-flight run ${String(entry.runId).slice(0, 8)} — kept running (it answers this request)`);
+        }
         if (!dryRun && process.env.VERIFY_DISPATCH_KILL_SUPERSEDED !== '0'
-          && inFlightSuperseded(entry, marker, headSha)) {
+          && inFlightSuperseded(entry, marker, headSha, supersedePolicy)) {
           try { if (entry.pid > 0) process.kill(-entry.pid, 'SIGKILL'); } catch {}
           log(`  ✂ ${pool}/lane-${lane}: in-flight run ${String(entry.runId).slice(0, 8)} superseded by a newer request — killed`);
           superseded.push({ pool, lane, runId: entry.runId });
@@ -563,7 +646,9 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
     // `runId` rides into the marker via the child's own start stamp (`--run-id`), so a queue-phase kill — before
     // `onGateStarted` could capture a `startedAt` — can still tell this run's marker from a newer request's.
     const runId = randomUUID();
-    const entry = { pool, lane, runId, pid: null, sha: headSha, requestStartedAt: marker.startedAt ?? null, startedMs: Date.now() };
+    const logPath = dispatchLogPath(dir);
+    const entry = { pool, lane, dir, runId, pid: null, sha: headSha, suites: marker.suites, treeHash: marker.treeHash ?? null,
+      requestStartedAt: marker.startedAt ?? null, startedMs: Date.now(), logPath };
     inFlight?.set(dir, entry);
     if (!awaitSettle) dispatched.push({ pool, lane, sha: headSha, launched: true });
     let owned = { ...marker, startedAt: null, requestStartedAt: marker.startedAt ?? null, runId };
@@ -573,6 +658,10 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
     let gate;
     try { gate = spawnGate(args, {
       onSpawn: (pid) => { entry.pid = pid; },
+      // #65 — the child's stderr goes to a file, not a pipe into this process, so a daemon restart that adopts
+      // in-flight gates (restartInFlight: adopt) never breaks the gate's output stream mid-run.
+      logPath,
+      onNotice: (line) => log(`  ${line.trim().replace(/^⚠ verify-lane:/, `⚠ ${pool}/lane-${lane}:`)}`),
       queueCeilingMs: QUEUE_PHASE_CEILING_MS,
       gateCeilingMs: VERIFY_DISPATCH_TIMEOUT_MS,
       // #4360 — the live proof this card's Proof plan needs: a real per-lane timestamp for when the gate

@@ -3,5 +3,8 @@
   "testTimeoutFactor": 3,
   "standards": "auto",
   "phaseAdmission": true,
-  "fastTargets": 5
+  "fastTargets": 5,
+  "matchRequestVariants": true,
+  "supersede": "newer",
+  "restartInFlight": "adopt"
 }

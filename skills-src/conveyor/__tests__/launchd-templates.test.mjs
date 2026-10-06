@@ -33,7 +33,8 @@ describe('launchd templates', () => {
     expect(env).not.toContain('WE_VERIFY_STANDARDS');
     const settings = JSON.parse(readFileSync(join(root, '../../scripts/verify-settings.json'), 'utf8'));
     const keys = { relatedMode: 'WE_VERIFY_RELATED', testTimeoutFactor: 'WE_VERIFY_TEST_TIMEOUT_FACTOR',
-      standards: 'WE_VERIFY_STANDARDS', phaseAdmission: 'WE_VERIFY_PHASE_ADMISSION', fastTargets: 'WE_VERIFY_FAST_TARGETS' };
+      standards: 'WE_VERIFY_STANDARDS', phaseAdmission: 'WE_VERIFY_PHASE_ADMISSION', fastTargets: 'WE_VERIFY_FAST_TARGETS',
+      matchRequestVariants: 'WE_VERIFY_MATCH_REQUEST_VARIANTS', supersede: 'WE_VERIFY_SUPERSEDE', restartInFlight: 'WE_VERIFY_RESTART_IN_FLIGHT' };
     const overrides = Object.fromEntries([...env.matchAll(/<key>([^<]+)<\/key>\s*<string>([^<]*)<\/string>/g)]
       .map(([, key, value]) => [key, value]));
     for (const [key, value] of Object.entries(settings)) {

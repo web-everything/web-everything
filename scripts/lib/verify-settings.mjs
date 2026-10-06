@@ -4,6 +4,13 @@ import { dirname, resolve } from 'node:path';
 
 export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
   relatedMode: 'all', testTimeoutFactor: 3, standards: 'always', phaseAdmission: true, fastTargets: 5,
+  // #66 — a dispatched child recognizes the requester's default gate under any declared settings variant.
+  matchRequestVariants: true,
+  // #65 — which in-flight gates a newer request may kill: 'newer' (a different sha, tree or gate; never an
+  // identical re-request), 'never', or 'any' (the old behaviour: every re-stamp kills).
+  supersede: 'newer',
+  // #65 — on a daemon SIGTERM: 'adopt' leaves running gates alive for the successor, 'kill' is the old teardown.
+  restartInFlight: 'adopt',
 });
 
 /** Use the WE root RUNNING verify-lane, never the target lane REPO or cwd:
@@ -18,11 +25,17 @@ const rules = {
   standards: value => ['always', 'auto', 'ci-only'].includes(value),
   phaseAdmission: value => typeof value === 'boolean',
   fastTargets: value => Number.isSafeInteger(value) && value >= 0,
+  matchRequestVariants: value => typeof value === 'boolean',
+  supersede: value => ['newer', 'never', 'any'].includes(value),
+  restartInFlight: value => ['adopt', 'kill'].includes(value),
 };
 const envKeys = {
   relatedMode: 'WE_VERIFY_RELATED', testTimeoutFactor: 'WE_VERIFY_TEST_TIMEOUT_FACTOR',
   standards: 'WE_VERIFY_STANDARDS', phaseAdmission: 'WE_VERIFY_PHASE_ADMISSION', fastTargets: 'WE_VERIFY_FAST_TARGETS',
+  matchRequestVariants: 'WE_VERIFY_MATCH_REQUEST_VARIANTS', supersede: 'WE_VERIFY_SUPERSEDE',
+  restartInFlight: 'WE_VERIFY_RESTART_IN_FLIGHT',
 };
+const booleanKeys = new Set(['phaseAdmission', 'matchRequestVariants']);
 // Preserve which keys survived validation without adding configuration keys to the file shape.
 const fileKeys = new WeakMap();
 
@@ -55,7 +68,7 @@ export function resolveVerifySettings({ fileConfig, env = {} } = {}) {
   for (const [key, check] of Object.entries(rules)) {
     sources[key] = fileKeys.get(validated).has(key) ? 'file' : 'default';
     let value = env?.[envKeys[key]];
-    if (key === 'phaseAdmission') value = value === '0' ? false : value === '1' ? true : undefined;
+    if (booleanKeys.has(key)) value = value === '0' ? false : value === '1' ? true : undefined;
     else if (key === 'testTimeoutFactor' || key === 'fastTargets') {
       value = value != null && String(value).trim() !== '' ? Number(value) : undefined;
     }

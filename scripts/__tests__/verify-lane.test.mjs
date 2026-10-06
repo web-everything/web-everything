@@ -1139,6 +1139,48 @@ process.exit(${standardsExit});
     expect(finished.suites).toBe(stamped); // the marker still names the requested gate
   });
 
+  // #66 (coroner-2, 2026-10-05) — a lane on an older base (no settings file) or a session without the daemon's env
+  // stamps its default gate under DIFFERENT selection settings than the daemon child. Only the standards policy was
+  // varied, so the stamped command went unrecognized and the run fell back to whole-gate admission
+  // (`admissionMode: gate`, `relatedMode: null`): 16-21 min instead of 3-5.
+  it.each([
+    ['timeout factor', { WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' }, {}],
+    ['related mode + timeout factor', { WE_VERIFY_RELATED: 'all', WE_VERIFY_TEST_TIMEOUT_FACTOR: '2' }, { WE_VERIFY_RELATED: 'import-only' }],
+  ])('recognizes a default gate stamped under another %s and keeps phase admission (#66)', (_, requesterEnv, daemonEnv) => {
+    const f = fixture();
+    expect(f.invoke(['request'], requesterEnv).code).toBe(0);
+    const stamped = JSON.parse(readFileSync(marker(), 'utf8')).suites;
+    const result = f.invoke([`--gate=${stamped}`, '--run-id=settings-drift'], daemonEnv);
+    expect(result.code, result.stdout + result.stderr).toBe(0);
+    const finished = JSON.parse(readFileSync(marker(), 'utf8'));
+    expect(finished.phases.admissionMode).toBe('phase');
+    expect(finished.phases.relatedMode).not.toBeNull(); // the selected path, not the opaque whole-gate one
+    expect(finished.phases.admissionFallback).toBeUndefined();
+    expect(finished.suites).toBe(stamped);
+    // The requester's own selection ran — the same vitest command it stamped, never a weaker one.
+    const first = f.calls()[0].args;
+    expect(first.slice(0, 2)).toEqual(['vitest', 'related']);
+    expect(first.some(a => a.startsWith('--testTimeout'))).toBe(stamped.includes('--testTimeout'));
+    expect(result.stderr).not.toContain('whole-gate admission');
+  });
+
+  it('says so, and records why, when a dispatched default-shaped gate still falls back to whole-gate admission (#66)', () => {
+    const f = fixture();
+    const result = f.invoke(['--gate=npx vitest related source.mjs --run --passWithNoTests --someOtherFlag', '--run-id=unknown-shape']);
+    expect(result.stderr).toContain('⚠ verify-lane: whole-gate admission');
+    const finished = JSON.parse(readFileSync(marker(), 'utf8'));
+    expect(finished.phases.admissionMode).toBe('gate');
+    expect(finished.phases.admissionFallback).toMatch(/not this checkout's default selection/);
+  });
+
+  it('matchRequestVariants off keeps the old standards-only matching (declared setting)', () => {
+    const f = fixture();
+    expect(f.invoke(['request'], { WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' }).code).toBe(0);
+    const stamped = JSON.parse(readFileSync(marker(), 'utf8')).suites;
+    f.invoke([`--gate=${stamped}`, '--run-id=variants-off'], { WE_VERIFY_MATCH_REQUEST_VARIANTS: '0' });
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).phases.admissionMode).toBe('gate');
+  });
+
   it('never re-derives an arbitrary --gate under the daemon policy', () => {
     const f = fixture();
     const result = f.invoke(['--gate=npm run check:standards && true', '--run-id=arbitrary'], { WE_VERIFY_STANDARDS: 'auto' });

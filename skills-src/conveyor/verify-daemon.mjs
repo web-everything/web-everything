@@ -53,14 +53,15 @@
 
 import { hostname } from 'node:os';
 import { dirname, resolve, join } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
-import { runVerifyDispatch } from '../../scripts/conveyor/verify-dispatch.mjs';
+import { runVerifyDispatch, recordKilledVerification } from '../../scripts/conveyor/verify-dispatch.mjs';
+import { loadVerifySettingsFile, resolveVerifySettings } from '../../scripts/lib/verify-settings.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel and from the Fix-dispatch
  *  and Review daemons' own keys (#3870, #3876), so none of them ever contend on the same lock dir (#3877).
@@ -257,10 +258,21 @@ export function processGroupAlive(pid) {
 export function reconcileInFlight(inFlight, {
   isAlive = pidAlive, groupAlive = processGroupAlive, nowMs = Date.now(), spawnGraceMs = 120_000,
   killGroup = (group) => process.kill(group, 'SIGKILL'), log = console.error,
+  adoptedCeilingMs = DEFAULT_ADOPTED_CEILING_MS, settleKilled = settleKilledAdopted,
 } = {}) {
   const orphaned = [];
   for (const [dir, entry] of inFlight) {
     const { pool, lane, runId, pid, startedMs } = entry;
+    // #65 — an ADOPTED gate (left running by a predecessor daemon) has no spawn promise here, so its ceilings are
+    // not armed: bound its total age instead, and settle its marker like any ceiling kill.
+    if (entry.adopted && pid > 0 && isAlive(pid) && nowMs - startedMs > adoptedCeilingMs) {
+      try { if (groupAlive(pid)) killGroup(-pid); } catch {}
+      inFlight.delete(dir);
+      try { settleKilled(entry, adoptedCeilingMs); } catch {}
+      log(`verify-daemon: ${pool}/lane-${lane} adopted run ${String(runId).slice(0, 8)} exceeded ${adoptedCeilingMs}ms — killed`);
+      orphaned.push({ pool, lane, runId, pid, reason: 'adopted-ceiling' });
+      continue;
+    }
     const reason = pid > 0
       ? (!isAlive(pid) ? 'pid-gone' : null)
       : ((pid == null || pid === 0) && nowMs - startedMs > spawnGraceMs ? 'never-spawned' : null);
@@ -271,7 +283,10 @@ export function reconcileInFlight(inFlight, {
     // pid recycled between two ticks is not detectable here.)
     try { if (pid > 0 && groupAlive(pid)) killGroup(-pid); } catch {}
     inFlight.delete(dir);
-    log(`verify-daemon: ${pool}/lane-${lane} in-flight run ${String(runId).slice(0, 8)} orphaned (pid ${pid} gone) — dropped and re-queued`);
+    // An adopted run that exited wrote its own terminal marker; only a run that died unsettled is re-queued.
+    log(entry.adopted
+      ? `verify-daemon: ${pool}/lane-${lane} adopted run ${String(runId).slice(0, 8)} finished (pid ${pid} gone) — released`
+      : `verify-daemon: ${pool}/lane-${lane} in-flight run ${String(runId).slice(0, 8)} orphaned (pid ${pid} gone) — dropped and re-queued`);
     orphaned.push({ pool, lane, runId, pid, reason });
   }
   return { orphaned };
@@ -320,6 +335,68 @@ export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAliv
   };
 }
 
+/** #65 — the in-flight hand-off file a stopping daemon writes and its successor adopts from. */
+export const VERIFY_DAEMON_INFLIGHT_FILE = process.env.WE_VERIFY_DAEMON_INFLIGHT_FILE || join(RUNNER_LOCK_ROOT, 'verify-daemon.inflight.json');
+
+/** An adopted run's total-age bound: the dispatcher's own queue + gate ceilings (2 h + 5 min + 30 min by default). */
+export const DEFAULT_ADOPTED_CEILING_MS = (Number(process.env.VERIFY_DISPATCH_QUEUE_CEILING_MS) || 125 * 60_000)
+  + (Number(process.env.VERIFY_DISPATCH_TIMEOUT_MS) || 30 * 60_000);
+
+function settleKilledAdopted(entry, ceilingMs) {
+  recordKilledVerification(entry.dir, { ...entry, startedAt: null }, { status: null, signal: 'SIGKILL', timedOutPhase: 'gate' }, ceilingMs);
+}
+
+/** #65 — the declared `restartInFlight` setting: `adopt` (default) or `kill` (the old teardown). */
+export function resolveRestartInFlight(env = process.env, fileConfig = loadVerifySettingsFile()) {
+  return resolveVerifySettings({ fileConfig, env }).values.restartInFlight;
+}
+
+/** Serialize the spawned in-flight gates for a successor. Pure: returns the records written. */
+export function inFlightHandoff(inFlight) {
+  return [...inFlight.values()]
+    .filter((e) => e.pid > 0 && e.dir && e.runId)
+    .map(({ pool, lane, dir, runId, pid, sha, suites, treeHash, requestStartedAt, startedMs, logPath }) =>
+      ({ pool, lane, dir, runId, pid, sha, suites, treeHash: treeHash ?? null, requestStartedAt: requestStartedAt ?? null, startedMs, logPath: logPath ?? null }));
+}
+
+export function writeInFlightHandoff(inFlight, path = VERIFY_DAEMON_INFLIGHT_FILE) {
+  const records = inFlightHandoff(inFlight);
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ writtenAt: new Date().toISOString(), records }, null, 2) + '\n');
+  renameSync(tmp, path);
+  return records;
+}
+
+/** Is `pid` still the exact verify-lane child a predecessor spawned (its argv carries the run id)? Guards pid reuse. */
+export function isDispatchedRun(pid, runId, readCommand = (p) => execFileSync('ps', ['-o', 'command=', '-p', String(p)],
+  { encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] })) {
+  try {
+    const command = readCommand(pid);
+    return command.includes('verify-lane.mjs') && command.includes(`--run-id=${runId}`);
+  } catch { return false; }
+}
+
+/**
+ * #65 — adopt a predecessor's still-running gates into this daemon's in-flight registry, so the next tick neither
+ * re-dispatches nor kills them (an identical re-request is kept by the dispatcher's supersede policy). The file is
+ * consumed (removed) whatever it held; a record whose pid is gone or is no longer our child is skipped — its
+ * marker either already settled or stays `running` and is re-dispatched as before.
+ */
+export function adoptInFlight(inFlight, { path = VERIFY_DAEMON_INFLIGHT_FILE, isOurs = isDispatchedRun, log = console.error } = {}) {
+  let parsed;
+  try { parsed = JSON.parse(readFileSync(path, 'utf8')); } catch { return []; }
+  try { rmSync(path, { force: true }); } catch {}
+  const adopted = [];
+  for (const record of Array.isArray(parsed?.records) ? parsed.records : []) {
+    if (!(record?.pid > 0) || !record.dir || !record.runId || inFlight.has(record.dir)) continue;
+    if (!isOurs(record.pid, record.runId)) continue;
+    inFlight.set(record.dir, { ...record, adopted: true });
+    adopted.push(record);
+    log(`verify-daemon: adopted in-flight run ${String(record.runId).slice(0, 8)} for ${record.pool}/lane-${record.lane} @ ${String(record.sha).slice(0, 8)} (pid ${record.pid})`);
+  }
+  return adopted;
+}
+
 /** SIGKILL the detached process group of every in-flight gate that has spawned. Shared by the signal handler
  *  and every loop exit, so no path can leave a gate running under a daemon that no longer holds the lease
  *  (a successor would then double-dispatch the same lane). An entry without a pid has not spawned yet; a pid
@@ -342,15 +419,28 @@ export function makeCodeChangedGuard({ inFlight, bootHead, readHead }) {
  *  killed gates' settle chain from running, so their markers stay `running` and a successor re-dispatches the
  *  lane — letting that chain run would stamp a daemon-initiated kill as an `infrastructure-failure` the
  *  successor then skips. Everything effectful is injected so the lifecycle is unit-tested with fakes. */
-export function createCleanup({ inFlight, stopHeartbeat, release, kill, exit = (code) => process.exit(code), log = console }) {
+export function createCleanup({ inFlight, stopHeartbeat, release, kill, exit = (code) => process.exit(code), log = console,
+  restartInFlight = 'kill', handoff = writeInFlightHandoff }) {
   let stopping = false;
   return {
     isStopping: () => stopping,
-    stopAndExit(why) {
+    /** `adoptable` — a restart (SIGTERM/SIGINT): under `restartInFlight: adopt` the running gates are handed to the
+     *  successor instead of killed (#65). A lease loss still kills: another live daemon already owns dispatch. */
+    stopAndExit(why, { adoptable = false } = {}) {
       if (stopping) return;
       stopping = true;
       log.error(`verify-daemon: ${why} — releasing the lease and exiting.`);
-      killInFlight(inFlight, kill);
+      let handedOff = false;
+      if (adoptable && restartInFlight === 'adopt' && inFlight.size > 0) {
+        try {
+          const records = handoff(inFlight);
+          handedOff = true;
+          log.error(`verify-daemon: left ${records.length} in-flight gate(s) running for the successor to adopt (restartInFlight: adopt).`);
+        } catch (error) {
+          log.error(`verify-daemon: in-flight hand-off failed (${String(error?.message || error)}) — killing them instead.`);
+        }
+      }
+      if (!handedOff) killInFlight(inFlight, kill);
       stopHeartbeat();
       release();
       exit(0);
@@ -386,9 +476,12 @@ async function main() {
     kill: process.kill.bind(process),
     stopHeartbeat,
     release: () => releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: VERIFY_DAEMON_LEASE_KEY }),
+    restartInFlight: resolveRestartInFlight(process.env),
   });
-  process.on('SIGTERM', () => cleanup.stopAndExit('SIGTERM'));
-  process.on('SIGINT', () => cleanup.stopAndExit('SIGINT'));
+  process.on('SIGTERM', () => cleanup.stopAndExit('SIGTERM', { adoptable: true }));
+  process.on('SIGINT', () => cleanup.stopAndExit('SIGINT', { adoptable: true }));
+  // #65 — take over the gates a predecessor left running (a restart under restartInFlight: adopt).
+  adoptInFlight(effects.inFlight);
   console.error(`verify-daemon: started on ${hostname()}:${process.pid}, tick every ${DEFAULT_INTERVAL_MS}ms, heartbeat every ${DEFAULT_HEARTBEAT_INTERVAL_MS}ms.`);
   const cloneRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
   const readHead = () => { try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: cloneRoot, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } };

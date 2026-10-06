@@ -13,7 +13,7 @@ import { spawnSync, spawn as spawnProcess, execFileSync } from 'node:child_proce
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { laneNeedsVerifyDispatch, inFlightSuperseded, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../verify-dispatch.mjs';
+import { laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../../../skills-src/conveyor/verify-daemon.mjs';
@@ -970,4 +970,113 @@ describe('onSettled — background failures reach the caller when awaitSettle is
     expect(onSettled).toHaveBeenCalledTimes(1);
     expect(inFlight.size).toBe(0);
   }, 2000);
+});
+
+// #65 (coroner-2, 2026-10-05) — 87 gate starts, 11 killed as "superseded by a newer request": an agent whose
+// `check --wait` timed out re-ran `request` for the SAME sha, gate and tree, and the daemon killed the running gate
+// to start it again (lane-2 @3257ba1d killed twice; lane-5 @49556db0 dispatched three times).
+describe('#65 — an identical same-sha re-request never kills the in-flight gate', () => {
+  function inFlightWithKnownTree() {
+    runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true'], laneDir);
+    const path = join(laneDir, '.git', '.lane-verify');
+    // A real lane (with origin/main) always stamps a tree hash; this fixture has no base, so stamp one.
+    writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), treeHash: 'tree-1' }));
+    const inFlight = new Map();
+    const spawnGate = vi.fn((_args, { onSpawn }) => { onSpawn(12345); return new Promise(() => {}); });
+    return { path, inFlight, spawnGate, opts: { poolRoot, inFlight, spawnGate, awaitSettle: false } };
+  }
+  const restamp = (path, fields) => {
+    const next = { ...JSON.parse(readFileSync(path, 'utf8')), runId: undefined, startedAt: '2099-01-01T00:00:00.000Z', ...fields };
+    writeFileSync(path, JSON.stringify(next));
+    return next;
+  };
+
+  it('keeps the running gate for an identical re-request, and dispatches nothing new', async () => {
+    const { path, inFlight, spawnGate, opts } = inFlightWithKnownTree();
+    await runVerifyDispatch(opts);
+    expect(inFlight.get(laneDir)).toMatchObject({ treeHash: 'tree-1', suites: 'true' });
+    restamp(path, {});
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const result = await runVerifyDispatch(opts);
+      expect(result.superseded).toEqual([]);
+      expect(kill).not.toHaveBeenCalled();
+      expect(spawnGate).toHaveBeenCalledTimes(1);
+      expect(inFlight.size).toBe(1);
+    } finally { kill.mockRestore(); }
+  }, 5000);
+
+  it.each([
+    ['a changed working tree', { treeHash: 'tree-2' }],
+    ['a different gate', { suites: 'true && true' }],
+  ])('still supersedes for %s under the default policy', async (_, fields) => {
+    const { path, opts } = inFlightWithKnownTree();
+    await runVerifyDispatch(opts);
+    restamp(path, fields);
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      expect((await runVerifyDispatch(opts)).superseded).toHaveLength(1);
+      expect(kill).toHaveBeenCalledWith(-12345, 'SIGKILL');
+    } finally { kill.mockRestore(); }
+  }, 5000);
+
+  it.each([
+    ['never', { treeHash: 'tree-2' }, 0],
+    ['any', {}, 1],
+  ])('the declared supersede setting governs it (WE_VERIFY_SUPERSEDE=%s)', async (policy, fields, kills) => {
+    const { path, opts } = inFlightWithKnownTree();
+    await runVerifyDispatch(opts);
+    restamp(path, fields);
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    vi.stubEnv('WE_VERIFY_SUPERSEDE', policy);
+    try {
+      expect((await runVerifyDispatch(opts)).superseded).toHaveLength(kills);
+    } finally { kill.mockRestore(); vi.unstubAllEnvs(); }
+  }, 5000);
+
+  it('the pure decision: identical request is never superseded under newer; never/any are explicit', () => {
+    const entry = { runId: 'old', requestStartedAt: 'before', sha: 'head', suites: 'g', treeHash: 't' };
+    const same = { status: 'running', sha: 'head', suites: 'g', treeHash: 't', startedAt: 'after' };
+    expect(sameVerifyRequest(entry, same)).toBe(true);
+    expect(inFlightSuperseded(entry, same, 'head')).toBe(false);
+    expect(inFlightSuperseded(entry, same, 'head', 'any')).toBe(true);
+    expect(inFlightSuperseded(entry, { ...same, treeHash: 'u' }, 'head')).toBe(true);
+    expect(inFlightSuperseded(entry, { ...same, treeHash: 'u' }, 'head', 'never')).toBe(false);
+    // An unknown tree hash cannot prove identity: the old behaviour (supersede) applies.
+    expect(inFlightSuperseded({ ...entry, treeHash: null }, { ...same, treeHash: null }, 'head')).toBe(true);
+    expect(resolveSupersedePolicy({})).toBe('newer');
+  });
+});
+
+describe('#65 — a dispatched gate writes stderr to a file, so it survives the daemon that spawned it', () => {
+  it('tails markers and notices from the log file', async () => {
+    const script = join(base, 'file-gate.mjs');
+    writeFileSync(script, `process.stderr.write('\\n⚠ verify-lane: whole-gate admission — test\\n⏱ ${GATE_STARTED_MARKER}\\n'); setTimeout(() => process.exit(0), 300);`);
+    const notices = [];
+    let started = 0;
+    await spawnGateBounded([script], { queueCeilingMs: 5000, gateCeilingMs: 5000, logPath: join(base, 'gate.log'), tailIntervalMs: 20,
+      onNotice: (line) => notices.push(line), onGateStarted: () => { started += 1; } });
+    expect(started).toBe(1);
+    expect(notices).toEqual(['⚠ verify-lane: whole-gate admission — test']);
+    expect(readFileSync(join(base, 'gate.log'), 'utf8')).toContain(GATE_STARTED_MARKER);
+  }, 10000);
+
+  it('the gate keeps running and finishes after its parent (the daemon) exits mid-run', async () => {
+    const done = join(base, 'gate-finished');
+    const gate = join(base, 'long-gate.mjs');
+    // Like verify-lane's execSync'd gate, a SHELL step writes stderr AFTER the parent is gone. With a pipe into the
+    // dead daemon the shell takes SIGPIPE and the gate dies mid-run before `done` is written.
+    writeFileSync(gate, `import { spawnSync } from 'node:child_process';
+process.stderr.write('⏱ ${GATE_STARTED_MARKER}\\n');
+const r = spawnSync('sh', ['-c', 'sleep 0.8; i=0; while [ $i -lt 200 ]; do echo progress >&2; i=$((i+1)); done; touch ' + ${JSON.stringify(JSON.stringify(done))}], { stdio: 'inherit' });
+process.exit(r.status ?? 1);`);
+    const parent = join(base, 'parent.mjs');
+    writeFileSync(parent, `import { spawnGateBounded } from ${JSON.stringify(resolve(process.cwd(), 'scripts/conveyor/verify-dispatch.mjs'))};
+spawnGateBounded([${JSON.stringify(gate)}], { queueCeilingMs: 60000, gateCeilingMs: 60000, logPath: ${JSON.stringify(join(base, 'parent-gate.log'))},
+  tailIntervalMs: 20, onGateStarted: () => process.exit(0) });`);
+    execFileSync('node', [parent], { stdio: 'ignore', timeout: 10000 });
+    expect(existsSync(done)).toBe(false); // the parent exited while the gate was still running
+    for (let i = 0; i < 100 && !existsSync(done); i += 1) await new Promise(r => setTimeout(r, 50));
+    expect(existsSync(done)).toBe(true);
+  }, 15000);
 });
