@@ -47,7 +47,7 @@ import {
 import { runDaemonLoop, startIndependentHeartbeat, realSleep } from './verify-daemon.mjs';
 import { normNum } from '../../scripts/conveyor/queue-store.mjs';
 import {
-  BUILD_DISPATCH_POLICY, planBuildDispatch, normalizeOpenPrs, prDeliversNum, reportOpenItems,
+  BUILD_DISPATCH_POLICY, planBuildDispatch, normalizeOpenPrs, prDeliversNum, prDeliveredNum, reportOpenItems,
 } from '../../scripts/conveyor/build-dispatch-policy.mjs';
 import {
   acquireBuildDispatchClaim, releaseBuildDispatchClaim, listBuildDispatchClaims,
@@ -333,6 +333,21 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   if (live && typeof effects.adoptOrphans === 'function') {
     try { orphanAdoption = await effects.adoptOrphans({ allowResume: !freeze.frozen, frozenReason: freeze.reasons.join('; ') }); }
     catch (e) { orphanAdoption = { error: String(e?.message || e).split('\n')[0] }; }
+  }
+  // Queue hygiene (automatic classes only: resolved / duplicate alias / missing card). LIVE only, best-effort, and
+  // BEFORE the claim-retire loop so the protected set still holds every active claim. Never drops an entry with an
+  // open PR, an active claim, or an in-flight run (see `scripts/conveyor/queue-prune.mjs`).
+  let queuePrune = null;
+  if (live && typeof effects.pruneQueue === 'function') {
+    try {
+      const protectedNums = [
+        ...openPrs.map((p) => prDeliveredNum(p)),
+        ...effects.listClaims().map((c) => c.meta?.num),
+        ...(effects.listFixClaims?.() ?? []).map((c) => c?.num),
+        ...effects.listRunStoreInFlight().map((r) => r.num),
+      ].filter(Boolean);
+      queuePrune = await effects.pruneQueue({ protectedNums });
+    } catch (e) { queuePrune = { error: String(e?.message || e).split('\n')[0] }; }
   }
   // A delivered draft is still its builder's responsibility. This pass precedes candidate/hold
   // filtering: an "already delivers it" hold must never suppress repair of that very PR.
@@ -693,6 +708,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     // per live claim), or an `{error}` on a best-effort failure, `null` on a dry-run tick or an older effects
     // stub with no such call.
     orphanAdoption,
+    queuePrune,
     draftRecovery,
     // #4465 — `planHoldRouting`'s own plan (always present, pure) plus `routeHeldItems`'s outcome array (or an
     // `{error}` on a best-effort failure), `null` on a dry-run tick or an older effects stub with no such call.
@@ -1454,8 +1470,43 @@ function cliEffects() {
     // tick's own claim retirement read — see that function's own docblock.
     adoptOrphans: (o) => adoptOrphanedBuildClaims(o),
     recoverDrafts: cliRecoverBuilderDrafts,
+    // Queue hygiene every N live ticks (`WE_BUILD_DAEMON_QUEUE_PRUNE_EVERY_TICKS`, default 5; 0 = off).
+    pruneQueue: makeCliPruneQueue(),
     // #4465 — only called by `runBuildDispatchTick` when `live` (never on a `--dry-run` tick).
     routeHeldItems: (plan) => cliRouteHeldItems(plan),
+  };
+}
+
+/** The declared setting: prune the conveyor queue every N live ticks. 0 turns the automatic prune off. */
+export const QUEUE_PRUNE_EVERY_TICKS_ENV = 'WE_BUILD_DAEMON_QUEUE_PRUNE_EVERY_TICKS';
+export const DEFAULT_QUEUE_PRUNE_EVERY_TICKS = 5;
+export function queuePruneEveryTicks(env = process.env) {
+  const raw = env?.[QUEUE_PRUNE_EVERY_TICKS_ENV];
+  if (raw == null || String(raw).trim() === '') return DEFAULT_QUEUE_PRUNE_EVERY_TICKS;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : DEFAULT_QUEUE_PRUNE_EVERY_TICKS;
+}
+
+/**
+ * Build the daemon's `pruneQueue` effect: runs {@link planPrune}'s AUTOMATIC classes on the cadence above and
+ * logs every drop. `io` is injectable for tests. Fail-closed: an unloadable backlog plans nothing.
+ */
+export function makeCliPruneQueue({ env = process.env, io = {} } = {}) {
+  let ticks = 0;
+  return async ({ protectedNums = [] } = {}) => {
+    const every = queuePruneEveryTicks(env);
+    if (every === 0) return { skipped: 'disabled' };
+    ticks += 1;
+    if ((ticks - 1) % every !== 0) return { skipped: 'cadence' };
+    const store = io.store ?? await import('../../scripts/conveyor/queue-store.mjs');
+    const prune = io.prune ?? await import('../../scripts/conveyor/queue-prune.mjs');
+    const items = io.items ? io.items() : (await import('node:module')).createRequire(import.meta.url)('../../src/_data/backlog.js')();
+    const path = io.path ?? store.resolveQueuePath();
+    const plan = prune.planPrune({ queue: store.readQueueFile(path), items, protectedNums });
+    if (!plan.ok) return { refused: plan.reason };
+    if (plan.drop.length || plan.rename.length) (io.apply ?? prune.applyPlan)(plan, path);
+    for (const d of plan.drop) console.error(`build-dispatch-daemon: queue prune dropped #${d.num} (${d.reason}${d.detail ? `: ${d.detail}` : ''})`);
+    return { dropped: plan.drop.map((d) => ({ num: d.num, reason: d.reason })), renamed: plan.rename.length, protectedKept: plan.protectedKept.length };
   };
 }
 
@@ -1640,7 +1691,7 @@ async function live(flags) {
       // or for an older record with none) so the operator's tick line names WHO is running each build without
       // reading scorecards. Additive over the previous bare-num array — nothing on `main` parses this stdout
       // JSON as a strict array-of-strings today (grepped 2026-09-29).
-      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult })}\n`);
+      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult })}\n`);
     },
     onTickError: (e, _tick, loop) => {
       // Keep the health watcher's existing failure-line contract; timings are an additive JSON line.
