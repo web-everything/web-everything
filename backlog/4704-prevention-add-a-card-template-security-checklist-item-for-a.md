@@ -3,10 +3,11 @@ bornAs: x2b8ziv
 kind: story
 size: 3
 parent: "4075"
-status: active
+status: resolved
 scope: ["we:scripts/backlog/scaffold.mjs", "we:scripts/backlog/__tests__/scaffold.test.mjs", "we:backlog/2776-owner-review-triage-screen-for-feedback-suggestions.md"]
 dateOpened: "2026-10-02"
 dateStarted: "2026-10-06"
+dateResolved: "2026-10-06"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "8a4b96161632caafcc5da32b896d16e3758787ec"
 tags: []
