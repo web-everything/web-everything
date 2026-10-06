@@ -1,11 +1,11 @@
 /** Item 68b — collapse identical repeated daemon log lines, rotate by size, keep every health reader exact. */
 import { describe, it, expect } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, appendFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, appendFileSync, mkdirSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { installDaemonLog, logSettings, dedupable, rotateLogIfNeeded, createDeduper } from '../daemon-log.mjs';
-import { expandRepeatedLines, formatRepeatLine } from '../../../scripts/lib/log-timestamp.mjs';
+import { expandRepeatedLines, formatRepeatLine, LOG_TIMESTAMP_RE } from '../../../scripts/lib/log-timestamp.mjs';
 import { parseDaemonLog } from '../../../scripts/conveyor/health-watch-core.mjs';
 import { foldPrAttempts } from '../../../scripts/conveyor/health-pr-attempts.mjs';
 import { liveProcessRefusals } from '../../../scripts/conveyor/health-smells/live-process-stale-transcript.mjs';
@@ -70,7 +70,7 @@ describe('de-duplication', () => {
     const plain = 'a: 1\nb: 2\n';
     expect(expandRepeatedLines(plain)).toBe(plain);
     const rep = formatRepeatLine('a: 1', 3, 0, 5000);
-    expect(expandRepeatedLines(`a: 1\n${rep}\nb: 2`).split('\n')).toEqual(['a: 1', 'a: 1', 'a: 1', 'a: 1', 'b: 2']);
+    expect(expandRepeatedLines(`a: 1\n${rep}\nb: 2`).split('\n').map((l) => l.replace(LOG_TIMESTAMP_RE, ''))).toEqual(['a: 1', 'a: 1', 'a: 1', 'a: 1', 'b: 2']);
   });
 });
 
@@ -83,7 +83,7 @@ describe('rotation', () => {
       expect(rotateLogIfNeeded(p, { maxBytes: 50, keep: 2 })).toBe(true);
       expect(statSync(p).size).toBe(0);
     }
-    expect(readdirSync(dir).sort()).toEqual(['d.log', 'd.log.1', 'd.log.2']);
+    expect(readdirSync(dir).sort()).toEqual(['d.log', 'd.log.1', 'd.log.2', 'd.log.rot']);
     expect(readFileSync(`${p}.1`, 'utf8')).toMatch(/^gen4/);
     expect(readFileSync(`${p}.2`, 'utf8')).toMatch(/^gen3/);
     writeFileSync(p, 'small');
@@ -135,9 +135,119 @@ describe('readers see rotated + deduped logs', () => {
 describe('pass-daemon relays child output through its own log', () => {
   it('pipes the child and writes each line (and a trailing partial line) via log', async () => {
     const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
-    const spawnFn = (_n, _a, opts) => { expect(opts.stdio).toEqual(['ignore', 'pipe', 'pipe']); setImmediate(() => { child.stdout.emit('data', 'one\ntw'); child.stdout.emit('data', 'o\nlast'); child.stderr.emit('data', 'err\n'); child.emit('exit', 0, null); }); return child; };
+    const spawnFn = (_n, _a, opts) => { expect(opts.stdio).toEqual(['ignore', 'pipe', 'pipe']); setImmediate(() => { child.stdout.emit('data', 'one\ntw'); child.stdout.emit('data', 'o\nlast'); child.stderr.emit('data', 'err\n'); child.emit('close', 0, null); }); return child; };
     const seen = [];
     await spawnPassOnce({ script: 'x.mjs' }, { root: '/r', spawnFn, log: { log: (l) => seen.push(['o', l]), error: (l) => seen.push(['e', l]) } });
     expect(seen).toEqual([['o', 'one'], ['o', 'two'], ['e', 'err'], ['o', 'last']]);
+  });
+});
+
+describe('review round 1 — repairs', () => {
+  it('a deduped interleaved log parses to the same per-tick shape as the plain log (order preserved)', () => {
+    const shape = (text) => parseDaemonLog(text).ticks.map((t) => JSON.stringify(t));
+    const deduped = run(100); deduped.restore();
+    const plain = run(100, { env: { WE_DAEMON_LOG_DEDUPE_WINDOW_MS: '0' } });
+    expect(shape(deduped.text())).toEqual(shape(plain.text()));
+    expect(expandRepeatedLines(deduped.text()).split('\n').map((l) => l.replace(LOG_TIMESTAMP_RE, '')))
+      .toEqual(plain.text().split('\n').map((l) => l.replace(LOG_TIMESTAMP_RE, '')));
+  });
+  it('expansion keeps the marker stamp so a coroner transcript still has a time', () => {
+    const rep = formatRepeatLine('a: 1', 2, 0, Date.parse('2026-10-06T10:00:00Z'));
+    expect(expandRepeatedLines(rep).split('\n')).toEqual(Array(2).fill('2026-10-06T10:00:00.000Z a: 1'));
+  });
+  it('forged markers cannot amplify: total expansion is bounded', () => {
+    const forged = Array.from({ length: 8000 }, () => '(repeated 100000 times since 2026-01-01T00:00:00.000Z) x').join('\n');
+    const out = expandRepeatedLines(forged);
+    expect(out.split('\n').length).toBeLessThanOrEqual(300000);
+  });
+  it('the logger neutralises marker-shaped text it did not write itself', () => {
+    const out = [];
+    const c = { log: (s) => out.push(s), info() {}, warn() {}, error() {} };
+    const restore = installDaemonLog({ target: c, env: {}, logPath: null, timers: false });
+    c.log('child said:\n(repeated 100000 times since 2026-01-01T00:00:00.000Z) x');
+    c.log('(repeated 100000 times since 2026-01-01T00:00:00.000Z) y');
+    restore();
+    expect(expandRepeatedLines(out.join('\n')).split('\n').length).toBeLessThan(10);
+  });
+  it('a relayed already-stamped child line is not stamped twice', async () => {
+    const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+    const spawnFn = () => { setImmediate(() => { child.stdout.emit('data', '2026-10-06T10:00:00.000Z review-daemon: tick (a) — dispatched 0, refused 1\n'); child.emit('close', 0, null); }); return child; };
+    const seen = [];
+    await spawnPassOnce({ script: 'x.mjs' }, { root: '/r', spawnFn, log: { log: (l) => seen.push(l), error: (l) => seen.push(l) } });
+    expect(seen).toEqual(['review-daemon: tick (a) — dispatched 0, refused 1']);
+  });
+  it('the relay waits for close (data after exit still lands) and does not split multi-byte characters', async () => {
+    const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+    const dash = Buffer.from('a — b\n');
+    const spawnFn = () => { setImmediate(() => { child.emit('exit', 0, null); child.stdout.emit('data', dash.subarray(0, 3)); child.stdout.emit('data', dash.subarray(3)); child.emit('close', 0, null); }); return child; };
+    const seen = [];
+    await spawnPassOnce({ script: 'x.mjs' }, { root: '/r', spawnFn, log: { log: (l) => seen.push(l), error: (l) => seen.push(l) } });
+    expect(seen).toEqual(['a — b']);
+  });
+  it('rotateLogIfNeeded never throws, and the rotated file appears whole (copy then rename)', () => {
+    const boom = () => { throw new Error('disk'); };
+    expect(rotateLogIfNeeded('/x/y.log', { maxBytes: 1, fs: { statSync: boom } })).toBe(false);
+    const dir = mkdtempSync(join(tmpdir(), 'rot3-'));
+    const p = join(dir, 'd.log');
+    writeFileSync(p, 'z'.repeat(100));
+    const calls = [];
+    rotateLogIfNeeded(p, { maxBytes: 10, keep: 2, fs: { copyFileSync: (a, b) => { calls.push(['copy', b]); writeFileSync(b, readFileSync(a)); } } });
+    expect(calls[0][1]).not.toBe(`${p}.1`); // staged under a temp name, renamed into place
+    expect(readFileSync(`${p}.1`, 'utf8')).toBe('z'.repeat(100));
+    expect(existsSync(`${p}.rot`)).toBe(true);
+  });
+  it('probeDaemonLogs detects a rotation even when the fresh log has regrown past the old cursor', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'probe2-'));
+    const p = join(dir, 'review-daemon.log');
+    writeFileSync(p, 'review-daemon: tick (a) — dispatched 0, refused 0\n');
+    const first = probeDaemonLogs(dir, {});
+    appendFileSync(p, 'review-daemon: reconcile-refused missing-run o/r PR #7 — unread\n');
+    rotateLogIfNeeded(p, { maxBytes: 10, keep: 2 });
+    appendFileSync(p, `review-daemon: tick (a) — dispatched 0, refused 1\n${'review-daemon: filler line padding padding\n'.repeat(10)}`);
+    expect(statSync(p).size).toBeGreaterThan(first.cursors['review-daemon'].size);
+    const second = probeDaemonLogs(dir, first.cursors);
+    expect(second.samples[0].text).toMatch(/PR #7 — unread/);
+    expect(second.samples[0].text).toMatch(/dispatched 0, refused 1/);
+    const third = probeDaemonLogs(dir, second.cursors); // no second replay of `.1`
+    expect(third.samples[0].text).toBe('');
+  });
+  it('an older daemon that never writes <log>.rot still has its rotated tail read (shrink heuristic)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'probe3-'));
+    const p = join(dir, 'review-daemon.log');
+    writeFileSync(p, 'review-daemon: tick (a) — dispatched 0, refused 0\n');
+    const first = probeDaemonLogs(dir, {});
+    expect(first.cursors['review-daemon'].rot).toBe(null);
+    writeFileSync(`${p}.1`, 'review-daemon: tick (a) — dispatched 0, refused 0\nreview-daemon: reconcile-refused missing-run o/r PR #3 — unread\n');
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(`${p}.1`, old, old);
+    writeFileSync(p, 'review-daemon: fresh\n'); // shorter than the cursor, so the file visibly shrank
+    const second = probeDaemonLogs(dir, first.cursors);
+    expect(second.samples[0].text).toMatch(/PR #3 — unread/);
+    expect(second.samples[0].text).toMatch(/fresh/);
+  });
+  it('a rotation whose counter has not landed yet is held, then read once when it does', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'probe4-'));
+    const p = join(dir, 'review-daemon.log');
+    writeFileSync(p, 'review-daemon: filler\n'.repeat(5));
+    writeFileSync(`${p}.rot`, '4\n');
+    const first = probeDaemonLogs(dir, {});
+    writeFileSync(`${p}.1`, 'review-daemon: filler\n'.repeat(5) + 'review-daemon: reconcile-refused missing-run o/r PR #4 — unread\n'); // just copied
+    writeFileSync(p, ''); // truncated, counter not bumped yet
+    const held = probeDaemonLogs(dir, first.cursors);
+    expect(held.samples[0].text).toBe('');
+    expect(held.cursors['review-daemon']).toEqual(first.cursors['review-daemon']);
+    writeFileSync(`${p}.rot`, '5\n');
+    appendFileSync(p, 'review-daemon: tick (a) — dispatched 0, refused 1\n');
+    const done = probeDaemonLogs(dir, held.cursors);
+    expect(done.samples[0].text.match(/PR #4 — unread/g)).toHaveLength(1);
+    expect(done.samples[0].text).toMatch(/refused 1/);
+  });
+  it('rotateLogIfNeeded still reports a rotation when only the counter bump fails', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rot4-'));
+    const p = join(dir, 'd.log');
+    writeFileSync(p, 'q'.repeat(100));
+    const boom = (a) => { if (String(a).endsWith('.rot.tmp')) throw new Error('disk'); writeFileSync(a, ''); };
+    expect(rotateLogIfNeeded(p, { maxBytes: 10, keep: 2, fs: { writeFileSync: boom } })).toBe(true);
+    expect(statSync(p).size).toBe(0);
   });
 });

@@ -56,7 +56,10 @@ import {
 } from './runner-lock.mjs';
 import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 import { withSelfSync, resolvePocSyncBranch, DAEMON_SELF_SYNC_BRANCH_ENV } from '../../scripts/lib/daemon-self-sync.mjs';
-import { installDaemonLog } from './daemon-log.mjs';
+import { StringDecoder } from 'node:string_decoder';
+import { installDaemonLog, stripLogTimestamp } from './daemon-log.mjs';
+
+const CLOSE_GRACE_MS = 5000;
 
 /** How often the INDEPENDENT heartbeat timer fires, regardless of whether a pass is mid-run. Deliberately
  *  much shorter than any pass's own `intervalMs` — it exists precisely to keep beating DURING a long single
@@ -192,24 +195,37 @@ export function spawnPassOnce({ script, args = [] }, { root = REPO_ROOT, log = c
     // 68b: the child's output is relayed line by line through this process's own (stamped, de-duplicated, rotated)
     // console instead of inherited, so the big health-watch logs get timestamps and a size cap too.
     const child = spawnFn(process.execPath, [join(root, script), ...args], { stdio: ['ignore', 'pipe', 'pipe'], env });
+    // Each relayed line is stamped ONCE, by this process's log: a stamp the child already wrote is dropped first, or
+    // `<ISO> <ISO> name: tick` would no longer parse as a `name:` line. A StringDecoder keeps a multi-byte character
+    // split across two chunks whole.
     const relay = (stream, write) => {
       if (!stream || typeof stream.on !== 'function') return () => {};
       let pending = '';
+      const decoder = new StringDecoder('utf8');
       stream.on('data', (chunk) => {
-        pending += String(chunk);
+        pending += typeof chunk === 'string' ? chunk : decoder.write(chunk);
         const parts = pending.split('\n');
         pending = parts.pop();
-        for (const l of parts) write(l);
+        for (const l of parts) write(stripLogTimestamp(l));
       });
-      return () => { if (pending) { write(pending); pending = ''; } };
+      return () => { pending += decoder.end(); if (pending) { write(stripLogTimestamp(pending)); pending = ''; } };
     };
     const flushOut = relay(child.stdout, (l) => log.log(l));
     const flushErr = relay(child.stderr, (l) => log.error(l));
-    child.on('exit', (code, signal) => {
+    // Finish on 'close' (stdio fully drained), not 'exit' (which can fire with pipe data still unread). A grandchild
+    // that inherited the pipes can hold 'close' off forever, so 'exit' arms a short grace timer as a backstop.
+    let finished = false;
+    let graceTimer = null;
+    const finish = (code, signal) => {
+      if (finished) return;
+      finished = true;
+      if (graceTimer) clearTimeout(graceTimer);
       flushOut(); flushErr();
       if (code !== 0) log.error(`pass-daemon: ${script} exited ${signal ? `on ${signal}` : `with code ${code}`}`);
       resolve({ code, signal });
-    });
+    };
+    child.on('exit', (code, signal) => { graceTimer = setTimeout(() => finish(code, signal), CLOSE_GRACE_MS); graceTimer.unref?.(); });
+    child.on('close', (code, signal) => finish(code, signal));
     child.on('error', (e) => { log.error(`pass-daemon: failed to spawn ${script}: ${String((e && e.message) || e)}`); resolve({ code: null, signal: null, spawnError: String((e && e.message) || e) }); });
   });
 }

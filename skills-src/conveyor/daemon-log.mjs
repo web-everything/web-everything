@@ -21,13 +21,13 @@
  *     default 2: `<log>.1`, `<log>.2`).
  */
 import { format } from 'node:util';
-import { copyFileSync, existsSync, fstatSync, readdirSync, renameSync, statSync, truncateSync, unlinkSync } from 'node:fs';
+import { copyFileSync, existsSync, fstatSync, readFileSync, readdirSync, renameSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { LOG_TIMESTAMP_RE, expandRepeatedLines, formatRepeatLine, stripLogTimestamp, timestampLines } from '../../scripts/lib/log-timestamp.mjs';
+import { LOG_TIMESTAMP_RE, expandRepeatedLines, formatRepeatLine, neutralizeMarkerText, stripLogTimestamp, timestampLines } from '../../scripts/lib/log-timestamp.mjs';
 
-export { LOG_TIMESTAMP_RE, expandRepeatedLines, formatRepeatLine, stripLogTimestamp };
+export { LOG_TIMESTAMP_RE, expandRepeatedLines, formatRepeatLine, neutralizeMarkerText, stripLogTimestamp };
 
 export const LOG_TIMESTAMP_ENV = 'WE_DAEMON_LOG_TIMESTAMPS';
 /** PURE: is stamping enabled under this env? */
@@ -65,7 +65,7 @@ export function logSettings(env = process.env) {
  * bare punctuation, so a pretty-printed multi-line object is never thinned out.
  */
 export function dedupable(msg) {
-  return typeof msg === 'string' && msg !== '' && !msg.includes('\n') && !/^\s/.test(msg) && !/^[\]\[{}(),;]*$/.test(msg);
+  return typeof msg === 'string' && msg !== '' && !msg.includes('\n') && !/^\s/.test(msg) && !/^[\]\[{}(),;]*$/.test(msg) && !msg.startsWith('(repeated');
 }
 
 /**
@@ -83,31 +83,48 @@ export function createDeduper({ windowMs = DEFAULT_DEDUPE_WINDOW_MS } = {}) {
       seen.set(line, { since: nowMs, count: 0 });
       return true;
     },
+    // One expired line flushes EVERY pending summary, in first-seen order, back to back: a repeating tick is several
+    // line kinds (tick line, detail line, ...), and readers replay adjacent markers round-robin to restore that
+    // interleaving, so the summaries of one cycle must never be split across flushes.
     due(nowMs) {
-      const out = [];
-      for (const [key, e] of [...seen]) {
-        if (nowMs - e.since >= windowMs || seen.size > MAX_TRACKED) { const s = take(key, e); if (s) out.push(s); else seen.delete(key); }
-      }
-      return out;
+      let expired = seen.size > MAX_TRACKED;
+      for (const e of seen.values()) if (nowMs - e.since >= windowMs) expired = true;
+      return expired ? this.drain() : [];
     },
     drain() { return [...seen].map(([k, e]) => take(k, e)).filter(Boolean); },
   };
 }
 
+/** The sidecar a reader compares to its cursor to learn, deterministically, that a rotation completed. */
+export function rotationCountPath(logPath) { return `${logPath}.rot`; }
+
 /**
  * Copy-truncate rotation: `<log>.(keep-1)` -> `<log>.keep` ... `<log>` -> `<log>.1`, then empty `<log>` in place.
- * Returns true when it rotated. Never throws.
+ * `<log>.1` is staged under a temp name and renamed into place, so a reader never sees a half-copied file; the
+ * rotation counter in `<log>.rot` is bumped LAST (after the truncate), so a reader that sees it change knows both
+ * `<log>.1` and the emptied `<log>` are final. Returns true when it rotated. Never throws.
  */
 export function rotateLogIfNeeded(logPath, { maxBytes = DEFAULT_MAX_BYTES, keep = DEFAULT_KEEP, fs = {} } = {}) {
-  const io = { statSync, existsSync, renameSync, copyFileSync, truncateSync, unlinkSync, ...fs };
+  const io = { statSync, existsSync, renameSync, copyFileSync, truncateSync, unlinkSync, writeFileSync, readFileSync, ...fs };
   try {
     if (!logPath || !(maxBytes > 0) || io.statSync(logPath).size <= maxBytes) return false;
     if (io.existsSync(`${logPath}.${keep}`)) io.unlinkSync(`${logPath}.${keep}`);
     for (let i = keep - 1; i >= 1; i -= 1) if (io.existsSync(`${logPath}.${i}`)) io.renameSync(`${logPath}.${i}`, `${logPath}.${i + 1}`);
-    io.copyFileSync(logPath, `${logPath}.1`);
+    io.copyFileSync(logPath, `${logPath}.1.tmp`);
+    io.renameSync(`${logPath}.1.tmp`, `${logPath}.1`);
     io.truncateSync(logPath, 0);
+    // The log IS rotated now: a failed counter bump must not report otherwise (readers fall back to the shrink check).
+    try {
+      let count = 0;
+      try { const n = Number(String(io.readFileSync(rotationCountPath(logPath), 'utf8')).trim()); if (Number.isInteger(n) && n >= 0) count = n; } catch { /* first rotation */ }
+      io.writeFileSync(`${rotationCountPath(logPath)}.tmp`, `${count + 1}\n`);
+      io.renameSync(`${rotationCountPath(logPath)}.tmp`, rotationCountPath(logPath));
+    } catch { /* best effort */ }
     return true;
-  } catch { return false; }
+  } catch {
+    try { io.unlinkSync(`${logPath}.1.tmp`); } catch { /* nothing staged */ }
+    return false;
+  }
 }
 
 const HERE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -162,7 +179,7 @@ export function installDaemonLog({ target = console, env = process.env, now = ()
   };
   for (const m of Object.keys(originals)) {
     target[m] = (...args) => {
-      const msg = format(...args);
+      const msg = neutralizeMarkerText(format(...args)); // only this module writes real collapse markers
       housekeeping();
       if (dedupe && dedupable(msg) && !deduper.consider(msg, now().getTime())) return;
       originals[m].call(target, stamp ? timestampLines(msg, now().getTime()) : msg);

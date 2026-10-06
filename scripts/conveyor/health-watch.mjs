@@ -153,6 +153,13 @@ export function readRotatedTail(path, from) {
   } catch { return ''; }
 }
 
+/** IO: the rotation counter the daemon's rotator keeps in `<log>.rot`; null when absent or unreadable (an older daemon). */
+export function readRotationCount(logPath) {
+  try { const n = Number(readFileSync(`${logPath}.rot`, 'utf8').trim()); return Number.isInteger(n) && n >= 0 ? n : null; } catch { return null; }
+}
+/** A `<log>.1` this young may be a rotation whose counter bump has not landed yet. */
+const ROTATION_IN_FLIGHT_MS = 5000;
+
 /** Incrementally read every `*.log` in the daemon logs dir from its cursor (bootstrap: the last 512 KB). */
 export function probeDaemonLogs(logsDir, cursors = {}) {
   const out = [];
@@ -163,7 +170,27 @@ export function probeDaemonLogs(logsDir, cursors = {}) {
     const name = f.replace(/\.log$/, '');
     const st = statSync(path);
     const cur = cursors[name];
-    const rotated = !!cur && cur.ino === st.ino && st.size < cur.size && existsSync(`${path}.1`);
+    // The rotator bumps `<log>.rot` after `<log>.1` is final and the log is emptied, so a changed counter means a
+    // rotation completed even when the fresh file has already regrown past the old cursor. A cursor from before the
+    // counter existed (no `rot`) falls back to the shrink heuristic; a manual truncation never moves the counter, so
+    // it is never mistaken for a rotation (no stale `<log>.1` replay). When either side has no counter (a cursor from
+    // before it existed, or an older daemon that never writes it) the shrink heuristic still applies; a counter
+    // that newly appears means a rotation completed.
+    const rot = readRotationCount(path);
+    const hasOne = existsSync(`${path}.1`);
+    const sameFile = !!cur && cur.ino === st.ino;
+    const shrank = sameFile && st.size < cur.size;
+    const bothCounted = typeof rot === 'number' && typeof cur?.rot === 'number';
+    const counted = sameFile && hasOne && (bothCounted ? rot !== cur.rot : rot != null && cur.rot == null);
+    // The rotator empties the log BEFORE it bumps the counter: a shrink with no counter move yet and a brand-new
+    // `<log>.1` is a rotation mid-flight, so hold the cursor and read nothing; the next sample sees the counter move
+    // (an older daemon that never writes it just waits out the few seconds, then takes the shrink heuristic below).
+    if (!counted && sameFile && shrank && hasOne && Date.now() - statSync(`${path}.1`).mtimeMs < ROTATION_IN_FLIGHT_MS) {
+      out.push({ name, mtimeMs: st.mtimeMs, sizeBytes: st.size, text: '', bootstrap: false, defaultIntervalMs: DAEMON_MANIFEST[name]?.intervalMs });
+      nextCursors[name] = cur;
+      continue;
+    }
+    const rotated = counted || (sameFile && hasOne && shrank && !bothCounted);
     const bootstrap = !cur || cur.ino !== st.ino || (st.size < cur.size && !rotated);
     // 68b: copy-truncate rotation keeps the inode but shrinks the file; what we had not read yet is the tail of
     // `<log>.1`, so read it first and then the fresh file from the top, losing no refusal lines.
@@ -180,7 +207,7 @@ export function probeDaemonLogs(logsDir, cursors = {}) {
     if (rotatedTail) text = rotatedTail + text;
     const passName = name;
     out.push({ name, mtimeMs: st.mtimeMs, sizeBytes: st.size, text, bootstrap, defaultIntervalMs: DAEMON_MANIFEST[passName]?.intervalMs });
-    nextCursors[name] = { ino: st.ino, size: start + consumed };
+    nextCursors[name] = { ino: st.ino, size: start + consumed, rot };
   }
   return { samples: out, cursors: nextCursors };
 }

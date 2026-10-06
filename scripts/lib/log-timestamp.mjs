@@ -43,8 +43,23 @@ export function stripLogTimestamp(line) {
  * stands for N MORE copies of `<line>` (the first copy was already written in full). Readers call
  * {@link expandRepeatedLines} so tick and attempt counts stay one per occurrence.
  */
-export const REPEAT_LINE_RE = /^(?:\d{4}-\d\d-\d\dT[\d:.]+Z )?\(repeated (\d+) times since \d{4}-\d\d-\d\dT[\d:.]+Z\) (.*)$/;
+export const REPEAT_LINE_RE = /^(?:(\d{4}-\d\d-\d\dT[\d:.]+Z) )?\(repeated (\d+) times since \d{4}-\d\d-\d\dT[\d:.]+Z\) (.*)$/;
+/** Per-marker cap, and the cap on EXTRA lines one call may add across all markers (a forged marker can not amplify). */
 const MAX_EXPANSION = 100000;
+export const MAX_TOTAL_EXPANSION = 200000;
+
+const NO_BREAK_SPACE = String.fromCharCode(0xa0);
+/** The marker-shaped start of a line that the daemon did not write itself; {@link neutralizeMarkerText} breaks it. */
+const MARKER_SHAPED_RE = /^(\s*(?:\d{4}-\d\d-\d\dT[\d:.]+Z )?\(repeated) (?=\d+ times since )/gm;
+/**
+ * PURE: break any marker-shaped line inside `text` (a no-break space replaces the space after `(repeated`) so text
+ * the daemon merely echoes — child stderr, `gh` output, PR text — can never be mistaken for a collapse marker. Only
+ * {@link formatRepeatLine} writes real ones.
+ */
+export function neutralizeMarkerText(text) {
+  const s = String(text ?? '');
+  return s.includes('(repeated') ? s.replace(MARKER_SHAPED_RE, (_m, head) => head + NO_BREAK_SPACE) : s;
+}
 
 /** PURE: the one-line collapse marker for `count` suppressed repeats of `line` (no stamp on `line`). */
 export function formatRepeatLine(line, count, sinceMs, nowMs = Date.now()) {
@@ -60,10 +75,28 @@ export function formatRepeatLine(line, count, sinceMs, nowMs = Date.now()) {
 export function expandRepeatedLines(text) {
   const s = String(text ?? '');
   if (!s.includes('(repeated ')) return s;
-  return s.split('\n').map((raw) => {
-    const m = REPEAT_LINE_RE.exec(raw);
-    if (!m) return raw;
-    const n = Math.min(Number(m[1]), MAX_EXPANSION);
-    return Array.from({ length: n }, () => m[2]).join('\n');
-  }).join('\n');
+  const lines = s.split('\n');
+  const out = [];
+  let budget = MAX_TOTAL_EXPANSION;
+  for (let i = 0; i < lines.length;) {
+    if (!REPEAT_LINE_RE.test(lines[i])) { out.push(lines[i]); i += 1; continue; }
+    // Back-to-back markers are one flush of an interleaved cycle (tick line, detail line, tick line, ...): replay
+    // them round-robin so the original order — and so each detail's tick — survives. Beyond the shared budget a
+    // marker is left as the single line it is.
+    const group = [];
+    for (; i < lines.length; i += 1) {
+      const m = REPEAT_LINE_RE.exec(lines[i]);
+      if (!m) break;
+      const n = Math.min(Number(m[2]), MAX_EXPANSION);
+      if (n > budget) { group.push({ left: 0, raw: lines[i] }); continue; }
+      budget -= n;
+      group.push({ left: n, text: m[1] ? `${m[1]} ${m[3]}` : m[3] });
+    }
+    for (const g of group) if (g.raw !== undefined) out.push(g.raw);
+    for (let more = true; more;) {
+      more = false;
+      for (const g of group) if (g.left > 0) { out.push(g.text); g.left -= 1; more = true; }
+    }
+  }
+  return out.join('\n');
 }

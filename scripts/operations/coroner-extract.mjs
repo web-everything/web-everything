@@ -354,7 +354,9 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
     const cap = positive(env.WE_CORONER_LOG_TAIL, 2 * MiB);
     const data = read(file, { cap, tailOnly: true });
     const older = read(`${file}.1`, { cap, tailOnly: true });
-    const all = [...(older.found ? older.lines : []), ...data.lines].flatMap((l) => expandRepeatedLines(l).split('\n'));
+    // One pass over the joined lines, so back-to-back markers interleave and the expansion budget is shared.
+    const joined = expandRepeatedLines([...(older.found ? older.lines : []), ...data.lines].join('\n'));
+    const all = joined === '' ? [] : joined.split('\n');
     sources[key] = { found: data.found || older.found, count: all.length };
     return all;
   };
