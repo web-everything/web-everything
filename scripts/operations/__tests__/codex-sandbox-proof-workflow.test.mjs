@@ -22,9 +22,9 @@ const SUITES = [
 
 const stepNamed = (doc, re) => doc.jobs.proof.steps.find((s) => re.test(s.name ?? ''));
 const runText = (step) => String(step?.run ?? '').replace(/\s+/g, ' ');
-const walk = (value, visit) => {
+const visitAll = (value, visit) => {
   visit(value);
-  if (value && typeof value === 'object') Object.values(value).forEach((v) => walk(v, visit));
+  if (value && typeof value === 'object') Object.values(value).forEach((v) => visitAll(v, visit));
 };
 
 /** Every contract violation in a parsed workflow document (empty = trustworthy). */
@@ -35,7 +35,7 @@ export function workflowIssues(doc) {
   const input = (doc.on ?? doc.true)?.workflow_dispatch?.inputs?.codex_version;
   if (!input || input.required !== true) issues.push('codex_version input must be required');
   if (!/^macos-/.test(doc.jobs?.proof?.['runs-on'] ?? '')) issues.push('job must run on a macos runner (documented Seatbelt claim)');
-  walk(doc, (node) => { if (node && typeof node === 'object' && 'continue-on-error' in node) issues.push('continue-on-error is forbidden'); });
+  visitAll(doc, (node) => { if (node && typeof node === 'object' && 'continue-on-error' in node) issues.push('continue-on-error is forbidden'); });
   for (const step of doc.jobs?.proof?.steps ?? []) {
     if (/\|\|\s*(true|:)/.test(String(step.run ?? ''))) issues.push(`step "${step.name}" swallows failure with || true`);
   }
