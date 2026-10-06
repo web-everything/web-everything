@@ -18,6 +18,10 @@
  *   node scripts/conveyor/queue.mjs list [--json]          # print the current session queue
  *   node scripts/conveyor/queue.mjs migrate [--dry-run] [--json]  # one-time move of the OLD in-checkout sidecar
  *                                                          # into the automation's state home (decouple-primary-checkout)
+ *   node scripts/conveyor/queue.mjs prune [--dry-run] [--json]  # drop resolved / missing-card / duplicate-alias rows
+ *                                                          # (never an open-PR or actively-claimed one)
+ *   node scripts/conveyor/queue.mjs remove --ids-file=F [--drop-class=L] --dry-run   # operator bulk removal: dry-run
+ *   node scripts/conveyor/queue.mjs remove --ids-file=F [--drop-class=L]             # first, then apply the same list
  *   node scripts/conveyor/queue.mjs migrate-bornas [--dry-run] [--json]  # rewrite stale JIT-hash rows to their
  *                                                          # landed NNN (the drain's `bornAs:` stamp, #2288/#2392)
  *
@@ -38,8 +42,17 @@ import {
   readQueueFile, writeQueueFile, addToQueue, removeFromQueue, queueHas, resolveQueuePath, normNum,
   resolveQueueSource, migrateLegacyQueue, legacyQueueDivergence, bornAsIndexFromItems, resolveBornAsRefs,
 } from './queue-store.mjs';
+import {
+  planPrune, applyPlan, collectProtectedNums, protectedOverride, makeConfirmMissingOnMain, parseIdsFile, bulkRemovePlan,
+  planDigest, writeReceipt, receiptMatches,
+} from './queue-prune.mjs';
 import { readField } from '../backlog/frontmatter.mjs';
 import { idFromName, normalizeId } from '../backlog/id.mjs';
+import { fetchOpenPrsRest } from './open-pr-fetch.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { prDeliveredNum } from './build-dispatch-policy.mjs';
+import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
+import { listFixDispatchClaims } from './fix-claim-store.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 
@@ -134,9 +147,33 @@ function readinessOf(num) {
   }
 }
 
-function main(argv) {
+/**
+ * Ids prune must never touch: open-PR deliveries, active build claims, in-flight runs. THROWS when the open-PR
+ * list cannot be read (callers fail closed). `CONVEYOR_PRUNE_PROTECTED` (comma list) replaces the live reads
+ * for hermetic tests.
+ */
+async function loadProtectedNums() {
+  const override = protectedOverride(process.env.CONVEYOR_PRUNE_PROTECTED);
+  if (override) return override;
+  const prs = [];
+  for (const { slug } of Object.values(CONSTELLATION_REPOS)) prs.push(...fetchOpenPrsRest({ repo: slug }));
+  // The in-flight run store reader lives with the daemon. A failure to LOAD it refuses the prune; the reader itself
+  // degrades an unreadable run-store directory to `[]` (same as the daemon tick), so that case does not refuse.
+  const { cliListRunStoreInFlight } = await import('../../skills-src/conveyor/build-dispatch-daemon.mjs');
+  return collectProtectedNums({
+    prs,
+    claims: listBuildDispatchClaims(),
+    fixClaims: listFixDispatchClaims(undefined, { liveOnly: true }),
+    runs: await cliListRunStoreInFlight(),
+    prNum: prDeliveredNum,
+  });
+}
+
+async function main(argv) {
   const args = argv.filter((a) => !a.startsWith('--'));
-  const flags = new Set(argv.filter((a) => a.startsWith('--')).map((a) => a.slice(2)));
+  const flagArgs = argv.filter((a) => a.startsWith('--')).map((a) => a.slice(2));
+  const flags = new Set(flagArgs.map((a) => a.split('=')[0]));
+  const flagVal = (name) => { const f = flagArgs.find((a) => a.startsWith(`${name}=`)); return f ? f.slice(name.length + 1) : null; };
   const json = flags.has('json');
   const [action, rawNum] = args;
   // Strip a leading `#` sigil (UI/`list` render ids as `#NNN`) so `add '#2613'` stores `2613` and matches the
@@ -187,6 +224,52 @@ function main(argv) {
     return emit({ ok: true, verb: 'queue', action: 'migrate-bornas', dryRun: flags.has('dry-run'), resolved, queue: after, path }, human);
   }
 
+  if (action === 'prune') {
+    const items = loadBacklogItemsBestEffort();
+    const queue = readQueueFile(path);
+    let prot;
+    try { prot = await loadProtectedNums(); }
+    catch (e) { return fail(`cannot determine open PRs / claims (${String(e.message || e).split('\n')[0]}) — refusing to prune (fail-closed)`); }
+    const plan = planPrune({ queue, items, protectedNums: prot, confirmMissing: makeConfirmMissingOnMain() });
+    if (!plan.ok) return fail(`prune refused: ${plan.reason}`);
+    const dry = flags.has('dry-run');
+    const after = !dry && (plan.drop.length || plan.rename.length) ? applyPlan(plan, path) : null;
+    const lines = [
+      ...plan.drop.map((d) => `  - #${d.num}  ${d.reason}${d.detail ? ` (${d.detail})` : ''}`),
+      ...plan.rename.map((r) => `  ~ #${r.from} -> #${r.to}  renamed (landed)`),
+      ...plan.protectedKept.map((p) => `  = #${p.num}  kept (open PR / active claim)`),
+    ];
+    const counts = {}; for (const d of plan.drop) counts[d.reason] = (counts[d.reason] || 0) + 1;
+    const summary = `${dry ? 'would drop' : 'dropped'} ${plan.drop.length} of ${queue.length} (${Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}); rename ${plan.rename.length}; protected ${plan.protectedKept.length}; queue after: ${queue.length - plan.drop.length}`;
+    return emit({ ok: true, verb: 'queue', action: 'prune', dryRun: dry, counts, ...plan, before: queue.length, after: after ? after.length : queue.length - plan.drop.length, path },
+      `${GRN}${dry ? 'dry-run:' : '✓'}${RST} ${summary}${lines.length ? `\n${lines.join('\n')}` : ''}`);
+  }
+
+  if (action === 'remove' && flagVal('ids-file') != null) {
+    const dropClass = flagVal('drop-class') || 'operator';
+    let ids;
+    try { ids = parseIdsFile(readFileSync(flagVal('ids-file'), 'utf8')); }
+    catch (e) { return fail(`cannot read --ids-file (${String(e.message || e).split('\n')[0]})`); }
+    const queue = readQueueFile(path);
+    // A card may be queued (or listed) under its hash OR its landed NNN: the plan matches both spellings.
+    const bornAsIndex = bornAsIndexFromItems(loadBacklogItemsBestEffort());
+    let prot;
+    try { prot = await loadProtectedNums(); }
+    catch (e) { return fail(`cannot determine open PRs / claims (${String(e.message || e).split('\n')[0]}) — refusing (fail-closed)`); }
+    const plan = bulkRemovePlan({ queue, ids, protectedNums: prot, dropClass, bornAsIndex });
+    const digest = planDigest(plan, dropClass);
+    const dry = flags.has('dry-run');
+    if (dry) writeReceipt(path, digest);
+    else if (!receiptMatches(path, digest)) return fail('bulk removal needs a matching --dry-run of the SAME list first (none found, or the plan changed) — run with --dry-run, review, then re-run');
+    const after = !dry && plan.drop.length ? applyPlan(plan, path) : null;
+    const lines = [
+      ...plan.drop.map((d) => `  - #${d.num}  ${dropClass}`),
+      ...plan.protectedKept.map((p) => `  = #${p.num}  kept (open PR / active claim)`),
+    ];
+    return emit({ ok: true, verb: 'queue', action: 'remove-bulk', dryRun: dry, dropClass, ...plan, before: queue.length, after: after ? after.length : queue.length - plan.drop.length, path },
+      `${GRN}${dry ? 'dry-run:' : '✓'}${RST} ${dry ? 'would remove' : 'removed'} ${plan.drop.length} of ${ids.length} listed (${plan.absent.length} not in queue, ${plan.protectedKept.length} protected); queue after: ${queue.length - plan.drop.length}${lines.length ? `\n${lines.join('\n')}` : ''}`);
+  }
+
   if (action === 'list') {
     const queue = readQueueFile(path);
     const src = resolveQueueSource(path);
@@ -205,7 +288,7 @@ function main(argv) {
   }
 
   if (action !== 'add' && action !== 'remove') {
-    fail('usage: queue.mjs {add|remove|list|migrate|migrate-bornas} <NNN> [--json]');
+    fail('usage: queue.mjs {add|remove|prune|list|migrate|migrate-bornas} <NNN> [--json]');
   }
   if (num == null || !num) fail(`${action} needs an item id — e.g. queue.mjs ${action} 2613`);
 
@@ -253,5 +336,5 @@ function main(argv) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main(process.argv.slice(2));
+  main(process.argv.slice(2)).catch((e) => { process.stderr.write(`${RED}✗${RST} ${String(e?.message || e).split('\n')[0]}\n`); process.exit(1); });
 }

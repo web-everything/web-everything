@@ -2412,3 +2412,38 @@ describe('gatePausedTicks', () => {
     expect(tickOnce).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('runBuildDispatchTick — queue prune wiring', () => {
+  let lockRoot;
+  beforeEach(() => { lockRoot = mkdtempSync(join(tmpdir(), 'bdd-prune-')); });
+  afterEach(() => { rmSync(lockRoot, { recursive: true, force: true }); });
+  const prEffects = (calls) => ({
+    ...effectsFor({
+      lockRoot, pid: 1, dispatches: [],
+      openPrs: [{ number: 801, headRefName: 'lane/601-a', labels: [], files: [] }, { number: 802, headRefName: 'lane/602-b', labels: [], files: [] }],
+      runStoreInFlight: [{ num: '604', scope: [] }],
+    }),
+    listClaims: () => [{ meta: { num: '603' } }],
+    listFixClaims: () => [{ pr: 802, scope: ['x'] }, { num: '605' }],
+    pruneQueue: (o) => { calls.push([...o.protectedNums].sort()); return { skipped: 'stub' }; },
+  });
+
+  it('a LIVE tick prunes, handing it every protected source: open PRs, build claims, fix claims, in-flight runs', async () => {
+    const calls = [];
+    const r = await runBuildDispatchTick({ live: true, effects: prEffects(calls) });
+    expect(calls).toEqual([['601', '602', '603', '604', '605']]);
+    expect(r.queuePrune).toEqual({ skipped: 'stub' });
+  });
+
+  it('a dry-run tick never prunes', async () => {
+    const calls = [];
+    await runBuildDispatchTick({ live: false, effects: prEffects(calls) });
+    expect(calls).toEqual([]);
+  });
+
+  it('a prune failure is reported, never thrown (best-effort hygiene)', async () => {
+    const effects = { ...prEffects([]), pruneQueue: () => { throw new Error('boom\nstack'); } };
+    const r = await runBuildDispatchTick({ live: true, effects });
+    expect(r.queuePrune).toEqual({ error: 'boom' });
+  });
+});
