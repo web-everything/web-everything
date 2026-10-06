@@ -65,3 +65,28 @@ for (const file of ['fix-agent-brief.md', 'fix-agent-ci-brief.md', 'delivery-age
     expect(text).toContain('infrastructure-failure');
   });
 }
+
+describe('ci-heal load-flake exit', () => {
+  it('ci-heal load-flake exit precedes the gate-red exit and preserves the saved heal', () => {
+    for (const file of ['fix-agent-brief.md', 'fix-agent-ci-brief.md']) {
+      const text = readFileSync(join(HERE, '..', file), 'utf8');
+      expect(text).toContain('--reason=load-flake');
+      expect(text).toContain('--alt-sha=');
+      expect(text).toContain('blocked-on-load-flake');
+    }
+    const text = readFileSync(join(HERE, '..', 'fix-agent-ci-brief.md'), 'utf8');
+    expect(text).toContain('--outcome=gate-red');
+    expect(text.indexOf('--reason=load-flake')).toBeLessThan(text.indexOf('--outcome=gate-red'));
+    expect(text).toContain('Otherwise a red gate is a hard stop');
+  });
+});
+
+describe('fix the class', () => {
+  it('requires variant discovery, adversarial review, and evidence without deferral', () => {
+    const text = readFileSync(join(HERE, '..', 'fix-agent-brief.md'), 'utf8');
+    expect(text).toContain('Fix the class, not the instance');
+    expect(text).toContain('next variant');
+    expect(text).toContain('Variants considered:');
+    expect(text).not.toMatch(/dismiss[^.]*\bowed\b/i);
+  });
+});
