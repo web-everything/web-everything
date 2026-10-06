@@ -56,6 +56,7 @@ import {
 } from './runner-lock.mjs';
 import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 import { withSelfSync, resolvePocSyncBranch, DAEMON_SELF_SYNC_BRANCH_ENV } from '../../scripts/lib/daemon-self-sync.mjs';
+import { installDaemonLog } from './daemon-log.mjs';
 
 /** How often the INDEPENDENT heartbeat timer fires, regardless of whether a pass is mid-run. Deliberately
  *  much shorter than any pass's own `intervalMs` — it exists precisely to keep beating DURING a long single
@@ -198,6 +199,7 @@ export function spawnPassOnce({ script, args = [] }, { root = REPO_ROOT, log = c
 }
 
 async function main(argv) {
+  installDaemonLog(); // item 68a: ISO-stamp every log line (WE_DAEMON_LOG_TIMESTAMPS=0 turns it off)
   const flags = {};
   for (const a of argv) {
     if (!a.startsWith('--')) continue;

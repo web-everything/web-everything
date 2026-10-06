@@ -10,6 +10,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
+import { stripLogTimestamp } from '../../skills-src/conveyor/daemon-log.mjs';
 
 const MiB = 1024 * 1024;
 const MAX_LINE = 256 * 1024;
@@ -268,7 +269,7 @@ export function extractMetrics({ window, sessions = [], durations = [], reaped =
   }
   const verifyDaemon = { starts: 0, superseded: 0, codeNull: 0, codeChanged: 0, sigterm: 0, note: 'untimestamped log tail window' };
   const patterns = { starts: /^\s*dispatching verify for /, superseded: /superseded by a newer request/, codeNull: /exited with code null/, codeChanged: /loop stopped \(code-changed\)/, sigterm: /^verify-daemon: SIGTERM/ };
-  for (const line of verifyLines) for (const [key, pattern] of Object.entries(patterns)) if (pattern.test(line)) verifyDaemon[key]++;
+  for (const raw of verifyLines) { const line = stripLogTimestamp(raw); for (const [key, pattern] of Object.entries(patterns)) if (pattern.test(line)) verifyDaemon[key]++; }
   for (const line of refusalLines) {
     // Tick summaries report counts, not individual refusal events/reasons.
     if (/\bdispatched \d+, refused \d+\b/.test(line)) continue;

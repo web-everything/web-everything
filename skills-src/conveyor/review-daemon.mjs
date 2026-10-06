@@ -117,6 +117,7 @@ import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
+import { installDaemonLog } from './daemon-log.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel, #3870's Fix-dispatch key,
  *  and any future daemon's own key (#3877). */
@@ -914,6 +915,7 @@ export function buildCliDaemonEffects({
 }
 
 async function main() {
+  installDaemonLog(); // item 68a: ISO-stamp every log line (WE_DAEMON_LOG_TIMESTAMPS=0 turns it off)
   const intervalMs = resolveReviewIntervalMs();
   const owner = makeOwner('review-daemon');
   const acquired = acquireRunnerLease(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY });

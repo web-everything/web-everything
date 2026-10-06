@@ -2,6 +2,8 @@
  * Untimestamped log ticks use the watch's existing bootstrap interval estimate.
  * Count outcome lines, never echoed command stderr or aggregate tick counts.
  */
+import { stripLogTimestamp } from '../../skills-src/conveyor/daemon-log.mjs';
+
 export const ATTEMPT_WINDOW_MS = 60 * 60_000;
 export const MIN_PR_ATTEMPTS = 5;
 const BENIGN = /^(?:live-process|nothing-owed|no-findings|stood-down|load-flake-hold|owed-elsewhere|held|main-still-red)$/;
@@ -32,7 +34,7 @@ export function attemptAction(text, fallback = '') {
 }
 
 export function foldPrAttempts(previous, sample, now, intervalMs) {
-  const lines = String(sample.text ?? '').split('\n');
+  const lines = String(sample.text ?? '').split('\n').map(stripLogTimestamp);
   const tickCount = lines.filter((l) => /^[\w.-]+: tick \(/.test(l)).length;
   let tick = -1;
   const rows = [];

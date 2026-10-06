@@ -33,6 +33,7 @@
 import { CLAUDE_JOBS_ARCHIVE_DEFAULTS } from './claude-jobs-archive-config.mjs';
 import { TMP_SWEEP_DEFAULTS } from './tmp-sweep-config.mjs';
 import { foldPrAttempts } from './health-pr-attempts.mjs';
+import { stripLogTimestamp } from '../../skills-src/conveyor/daemon-log.mjs';
 import { isHighEntropyToken } from '../lib/secret-scrub.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from './health-smells-notify-list.mjs';
 
@@ -137,7 +138,7 @@ export function parseDaemonLog(text) {
   let started = false;
   const close = () => { if (cur) { out.ticks.push(cur); cur = null; } };
   for (const raw of String(text ?? '').split('\n')) {
-    const line = raw.trimEnd();
+    const line = stripLogTimestamp(raw.trimEnd());
     if (!line) continue;
     out.lines += 1;
     if (AUTH_ERROR.test(line)) out.authErrors += 1;
