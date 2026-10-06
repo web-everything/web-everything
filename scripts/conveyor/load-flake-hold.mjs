@@ -22,3 +22,23 @@ export function isLegacyLoadFlakeHoldSuperseded(comments, index) {
 export const loadFlakeHolds = (comments) => readHolds(comments, isLegacyLoadFlakeHoldSuperseded);
 
 export const loadFlakeHoldState = (args) => readHoldState({ ...args, isSuperseded: isLegacyLoadFlakeHoldSuperseded });
+
+/** Minutes a live hold may wait for the reverify pass before it counts as unattended. */
+export const loadFlakeNoPickupMinutes = (env = process.env) => {
+  const n = Number(env.WE_LOAD_FLAKE_NO_PICKUP_MINUTES);
+  return Number.isFinite(n) && n > 0 ? n : 60;
+};
+
+/**
+ * Live holds nobody has worked: older than the limit and with no reverify result (pushed / red-again / ...) recorded
+ * since. Reads the hold with the same `loadFlakeHoldState` that reconcile and the reverify pass use, so the three
+ * can never disagree about what a hold is.
+ */
+export function loadFlakeHoldsWithoutPickup({ prs = [], now, limitMinutes = loadFlakeNoPickupMinutes() }) {
+  return prs.flatMap((pr) => {
+    const state = loadFlakeHoldState({ comments: pr.comments, headRefOid: pr.headRefOid, now });
+    if (!state.live || state.results.length) return [];
+    const ageMinutes = Math.floor((now - Date.parse(state.hold.createdAt)) / 60_000);
+    return ageMinutes >= limitMinutes ? [{ pr, hold: state.hold, ageMinutes, limitMinutes }] : [];
+  });
+}

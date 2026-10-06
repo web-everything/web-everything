@@ -365,3 +365,16 @@ describe('exact hold revalidation', () => {
     expect(io.comment.mock.calls[0][1]).toBe(3882);
   });
 });
+
+describe('reverify discovery reads the complete comment thread', () => {
+  it('sees a hold that sits past the first 100 comments (live #4017)', async () => {
+    const { buildLoadFlakeHoldComment } = await import('../stand-down.mjs');
+    const filler = Array.from({ length: 100 }, (_, i) => ({ body: `noise ${i}`, createdAt: '2026-10-06T10:00:00Z' }));
+    const hold = { body: buildLoadFlakeHoldComment({ alt: 'lane/x-alt', altSha: 'bbb2222' }), createdAt: '2026-10-06T19:51:00Z', author: { login: 'web-everything' } };
+    const listed = [{ number: 4017, headRefName: 'lane/x', headRefOid: 'aaa1111', comments: filler }];
+    const io = defaultReverifyIo({ run: () => JSON.stringify(listed), readComments: () => [...filler, hold] });
+    const prs = await io.listPrs('web-everything/web-everything');
+    const plan = planLoadFlakeReverify({ prs, load: [0, 0], cores: 8, now: Date.parse('2026-10-06T21:00:00Z'), config: reverifyConfig({ WE_LOAD_FLAKE_REVERIFY_MODE: 'ci' }) });
+    expect(plan.candidate?.pr.number).toBe(4017);
+  });
+});

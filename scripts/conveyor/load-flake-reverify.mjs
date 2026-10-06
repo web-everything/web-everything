@@ -11,6 +11,7 @@ import { runBounded } from '../lib/bounded-child.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
 import { loadFlakeResults, buildLoadFlakeResolvedComment } from './stand-down.mjs';
 import { loadFlakeHoldState } from './load-flake-hold.mjs';
+import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
 import { redactSecrets } from './ci-heal-mark.mjs';
 import { RUNNER_LOCK_ROOT } from '../../skills-src/conveyor/runner-lock.mjs';
 
@@ -194,13 +195,17 @@ export function scrubVerifyEnv(env = process.env, { allow = [], scratchDir, home
   return clean;
 }
 
-export function defaultReverifyIo({ run = execFileSync, runVerification = runBounded, verifyEnvAllow = [], root = resolve(dirname(fileURLToPath(import.meta.url)), '../..') } = {}) {
+export function defaultReverifyIo({ run = execFileSync, runVerification = runBounded, verifyEnvAllow = [], readComments, root = resolve(dirname(fileURLToPath(import.meta.url)), '../..') } = {}) {
   const command = (bin, args, opts = {}) => run(bin, args, { cwd: root, encoding: 'utf8', timeout: 120_000, maxBuffer: 16 * 1024 * 1024, ...opts });
   const gh = (args) => JSON.parse(command('gh', args));
   const lanePool = (...args) => command(process.execPath, [resolve(root, 'scripts/lane-pool.mjs'), ...args]);
   return {
     now: Date.now, loadavg: os.loadavg, cpuCount: () => os.cpus().length,
-    listPrs: (slug) => gh(['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid,baseRefName,comments']),
+    // `gh pr list --json comments` stops at 100: a hold past that was invisible here while fix-dispatch (which reads the
+    // complete thread) kept refusing the PR as `load-flake-hold` (live #4017, 286 comments). Same complete reader as fix-dispatch.
+    listPrs: (slug) => enrichPrsWithCompleteComments(
+      gh(['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid,baseRefName,comments']),
+      { repo: slug, ...(readComments ? { readComments } : {}) }),
     readPr: (slug, pr) => gh(['pr', 'view', String(pr), '--repo', slug, '--json', 'state,headRefName,headRefOid,comments']),
     pushRefusal,
     isAncestor: (head, sha) => {
