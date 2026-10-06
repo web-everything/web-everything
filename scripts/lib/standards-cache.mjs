@@ -3,7 +3,7 @@
 // results are written only by commit() after a complete run; a crash (abort / no commit) writes nothing.
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, existsSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync, existsSync, statSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -49,7 +49,7 @@ const IMPORT_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+
 // Whole-line // comments are skipped (block comments are NOT stripped: a `/*` inside a string could hide a real import) so prose that mentions an import cannot trigger a lookup.
 const stripComments = (src) => src.replace(/^\s*\/\/.*$/gm, '');
 
-/** Static import closure of an entry file (relative specifiers only). Throws on an unresolvable one. */
+/** Static import closure of an entry file (relative specifiers only). Throws on an unresolvable or non-file one; non-JS files are hashed, not walked. */
 export function importClosure(entry) {
   const seen = new Map();
   const walk = (file) => {
@@ -59,7 +59,9 @@ export function importClosure(entry) {
     for (const m of stripComments(src).matchAll(IMPORT_RE)) {
       const target = resolve(dirname(file), m[1]);
       if (!existsSync(target)) throw new Error(`unresolved import ${m[1]} from ${file}`);
+      if (!statSync(target).isFile()) throw new Error(`import ${m[1]} from ${file} is not a file`);
       if (/\.(mjs|cjs|js)$/.test(target)) walk(target);
+      else if (!seen.has(target)) seen.set(target, readFileSync(target)); // data import (e.g. JSON): hash its bytes, do not parse it
     }
   };
   walk(resolve(entry));

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { mkdtempSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -34,6 +34,24 @@ describe('standards-cache', () => {
     writeFileSync(join(d, 'helper.mjs'), "export const h = 2;\n");
     resetClosureMemo();
     expect(ruleVersion('s', [join(d, 'main.mjs')])).not.toBe(v1);
+  });
+
+  it('an edit to an imported JSON file changes the rule version', () => {
+    const d = mk();
+    writeFileSync(join(d, 'main.mjs'), "import rules from './rules.json' with { type: 'json' };\n");
+    writeFileSync(join(d, 'rules.json'), '{"a":1}');
+    const v1 = ruleVersion('s', [join(d, 'main.mjs')]);
+    expect(v1).toBeTypeOf('string');
+    writeFileSync(join(d, 'rules.json'), '{"a":2}');
+    resetClosureMemo();
+    expect(ruleVersion('s', [join(d, 'main.mjs')])).not.toBe(v1);
+  });
+
+  it('an imported non-file target (directory) means no version, never a silently unhashed dependency', () => {
+    const d = mk();
+    mkdirSync(join(d, 'data'));
+    writeFileSync(join(d, 'main.mjs'), "import x from './data';\n");
+    expect(ruleVersion('s', [join(d, 'main.mjs')])).toBeNull();
   });
 
   it('an unresolvable import means no version (cache off)', () => {
