@@ -10,7 +10,7 @@ import { verifyRelatedMode, verifyTestTimeoutFactor, verifyStandardsPolicy, veri
 
 const allSources = source => Object.fromEntries(Object.keys(BUILT_IN_VERIFY_SETTINGS).map(key => [key, source]));
 const custom = { relatedMode: 'import-only', testTimeoutFactor: 4, standards: 'ci-only', phaseAdmission: false, fastTargets: 2,
-  matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill' };
+  matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off' };
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function file(contents) {
@@ -42,13 +42,22 @@ describe('verify settings', () => {
   it('lets valid environment values override every key independently', () => {
     const env = { WE_VERIFY_RELATED: 'all', WE_VERIFY_TEST_TIMEOUT_FACTOR: '2.5', WE_VERIFY_STANDARDS: 'auto',
       WE_VERIFY_PHASE_ADMISSION: '1', WE_VERIFY_FAST_TARGETS: '0', WE_VERIFY_MATCH_REQUEST_VARIANTS: '1',
-      WE_VERIFY_SUPERSEDE: 'any', WE_VERIFY_RESTART_IN_FLIGHT: 'adopt' };
+      WE_VERIFY_SUPERSEDE: 'any', WE_VERIFY_RESTART_IN_FLIGHT: 'adopt', WE_VERIFY_RUN_ALL_PHASES: '1',
+      WE_VERIFY_ISOLATED_RETRY: 'timeouts' };
     const values = { relatedMode: 'all', testTimeoutFactor: 2.5, standards: 'auto', phaseAdmission: true, fastTargets: 0,
-      matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt' };
+      matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts' };
     expect(resolveVerifySettings({ fileConfig: custom, env })).toEqual({ values, sources: allSources('env') });
     expect(resolveVerifySettings({ fileConfig: custom, env: { WE_VERIFY_RELATED: 'all' } }))
       .toEqual({ values: { ...custom, relatedMode: 'all' }, sources: { ...allSources('file'), relatedMode: 'env' } });
     expect(verifyPhaseAdmissionEnabled({ WE_VERIFY_PHASE_ADMISSION: '0' }, BUILT_IN_VERIFY_SETTINGS)).toBe(false);
+  });
+
+  it('75b/75c: ships the tightening defaults (run every phase; isolated retry of untouched files only)', () => {
+    expect(BUILT_IN_VERIFY_SETTINGS).toMatchObject({ runAllPhases: true, isolatedRetry: 'untouched' });
+    const shipped = resolveVerifySettings({ fileConfig: loadVerifySettingsFile(defaultVerifySettingsPath()), env: {} }).values;
+    expect(shipped).toMatchObject({ runAllPhases: true, isolatedRetry: 'untouched' });
+    expect(resolveVerifySettings({ fileConfig: null, env: { WE_VERIFY_RUN_ALL_PHASES: '0', WE_VERIFY_ISOLATED_RETRY: 'off' } }).values)
+      .toMatchObject({ runAllPhases: false, isolatedRetry: 'off' });
   });
 
   it('uses built-ins for unreadable files, malformed JSON and invalid top-level shapes', () => {
@@ -69,6 +78,7 @@ describe('verify settings', () => {
       relatedMode: ['bad', null, 1], testTimeoutFactor: [0, -1, 0.5, Infinity, NaN, '3', true],
       standards: ['bad', false], phaseAdmission: ['0', 0, null], fastTargets: [-1, 2.5, Infinity, Number.MAX_SAFE_INTEGER + 1, '5'],
       matchRequestVariants: ['1', 1, null], supersede: ['bad', true], restartInFlight: ['bad', false],
+      runAllPhases: ['1', 0, null], isolatedRetry: ['all', true, null],
     })) {
       for (const bad of badValues) {
         const config = validateVerifySettings({ ...custom, [key]: bad });
@@ -81,7 +91,8 @@ describe('verify settings', () => {
   it('ignores invalid env values, falling back to file then built-ins', () => {
     const env = { WE_VERIFY_RELATED: 'bad', WE_VERIFY_TEST_TIMEOUT_FACTOR: 'Infinity', WE_VERIFY_STANDARDS: '',
       WE_VERIFY_PHASE_ADMISSION: 'false', WE_VERIFY_FAST_TARGETS: '2.5', WE_VERIFY_MATCH_REQUEST_VARIANTS: 'yes',
-      WE_VERIFY_SUPERSEDE: 'always', WE_VERIFY_RESTART_IN_FLIGHT: 'drain' };
+      WE_VERIFY_SUPERSEDE: 'always', WE_VERIFY_RESTART_IN_FLIGHT: 'drain', WE_VERIFY_RUN_ALL_PHASES: 'yes',
+      WE_VERIFY_ISOLATED_RETRY: 'always' };
     expect(resolveVerifySettings({ fileConfig: custom, env })).toEqual({ values: custom, sources: allSources('file') });
     expect(resolveVerifySettings({ fileConfig: null, env })).toEqual({ values: BUILT_IN_VERIFY_SETTINGS, sources: allSources('default') });
     for (const bad of ['', ' ', '-1', 'NaN']) {

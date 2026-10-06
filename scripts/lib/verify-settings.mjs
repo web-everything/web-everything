@@ -11,6 +11,13 @@ export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
   supersede: 'newer',
   // #65 — on a daemon SIGTERM: 'adopt' leaves running gates alive for the successor, 'kill' is the old teardown.
   restartInFlight: 'adopt',
+  // 75b — a red test phase still runs the scan and standards phases (only an infrastructure failure stops early),
+  // so one run shows every problem. A tightening: it never turns a red green.
+  runAllPhases: true,
+  // 75c — failing test files outside the diff are re-run once, alone, before the gate is declared red:
+  // 'untouched' (any failure kind, at most 3 files), 'timeouts' (only timeout failures), 'off'.
+  // A pass alone is recorded on the marker as `isolatedRetry: 'flaky-outside-diff'`; CI still runs the full suite.
+  isolatedRetry: 'untouched',
 });
 
 /** Use the WE root RUNNING verify-lane, never the target lane REPO or cwd:
@@ -28,14 +35,17 @@ const rules = {
   matchRequestVariants: value => typeof value === 'boolean',
   supersede: value => ['newer', 'never', 'any'].includes(value),
   restartInFlight: value => ['adopt', 'kill'].includes(value),
+  runAllPhases: value => typeof value === 'boolean',
+  isolatedRetry: value => ['untouched', 'timeouts', 'off'].includes(value),
 };
 const envKeys = {
   relatedMode: 'WE_VERIFY_RELATED', testTimeoutFactor: 'WE_VERIFY_TEST_TIMEOUT_FACTOR',
   standards: 'WE_VERIFY_STANDARDS', phaseAdmission: 'WE_VERIFY_PHASE_ADMISSION', fastTargets: 'WE_VERIFY_FAST_TARGETS',
   matchRequestVariants: 'WE_VERIFY_MATCH_REQUEST_VARIANTS', supersede: 'WE_VERIFY_SUPERSEDE',
   restartInFlight: 'WE_VERIFY_RESTART_IN_FLIGHT',
+  runAllPhases: 'WE_VERIFY_RUN_ALL_PHASES', isolatedRetry: 'WE_VERIFY_ISOLATED_RETRY',
 };
-const booleanKeys = new Set(['phaseAdmission', 'matchRequestVariants']);
+const booleanKeys = new Set(['phaseAdmission', 'matchRequestVariants', 'runAllPhases']);
 // Preserve which keys survived validation without adding configuration keys to the file shape.
 const fileKeys = new WeakMap();
 

@@ -65,3 +65,24 @@ export function createFailureCollector({ cwd = process.cwd() } = {}) {
     },
   };
 }
+
+/**
+ * 75b — fold the failure details of several red gate phases into one bounded record, so the agent sees a scan or
+ * standards failure next to the test failure. Each phase keeps an equal share of the summary (its own tail, labelled
+ * with the phase), and identities keep phase order. A single part is returned unchanged.
+ * @param {{phase: string, details: object|undefined}[]} parts
+ */
+export function mergeFailureDetails(parts) {
+  const present = parts.filter(p => p.details && Array.isArray(p.details.tests) && typeof p.details.summary === 'string');
+  if (present.length <= 1) return present[0]?.details;
+  const share = Math.floor(2000 / present.length) - 16;
+  const tail = (s) => { const chars = Array.from(s); return chars.length > share ? chars.slice(-share).join('') : s; };
+  const tests = [];
+  for (const { details } of present) for (const t of details.tests) if (!tests.some(e => e.file === t.file && e.name === t.name)) tests.push(t);
+  return boundFailureDetails({
+    tests,
+    summary: present.map(({ phase, details }) => `[${phase}] ${tail(details.summary)}`).join('\n'),
+    // The summary is a rolling tail by design (see the collector); only dropped identities count as truncated.
+    truncated: present.some(p => p.details.truncated),
+  });
+}

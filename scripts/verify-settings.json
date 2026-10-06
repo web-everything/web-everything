@@ -6,5 +6,7 @@
   "fastTargets": 5,
   "matchRequestVariants": true,
   "supersede": "newer",
-  "restartInFlight": "adopt"
+  "restartInFlight": "adopt",
+  "runAllPhases": true,
+  "isolatedRetry": "untouched"
 }

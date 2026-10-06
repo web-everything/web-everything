@@ -1202,3 +1202,16 @@ describe('verifyServerVerdict (#4161)', () => {
     expect(verifyServerVerdict({ leaseStatus, pidLiveness })).toEqual({ alive: false, reason });
   });
 });
+
+it('75c: the isolated-retry audit (flaky-outside-diff) survives finish, check and verdict reads', () => {
+  const retriedFailures = [{ file: 'untouched.test.mjs', kind: 'assertion' }];
+  const record = verifyFinishBody({ sha: 'ours' }, { exitCode: 0, retriedFailures, isolatedRetry: 'flaky-outside-diff' });
+  expect(record).toMatchObject({ status: 'green', retriedFailures, isolatedRetry: 'flaky-outside-diff' });
+  expect(record.retriedTimeouts).toBeUndefined();
+  const verdict = verifyGateDecision({ record, headSha: 'ours' });
+  expect(verdict).toMatchObject({ ok: true, retriedFailures, isolatedRetry: 'flaky-outside-diff' });
+  expect(verdict.detail).toContain('flaky-outside-diff');
+  const red = verifyFinishBody({ sha: 'ours' }, { exitCode: 1, retriedFailures, isolatedRetry: 'still-red' });
+  expect(verifyGateDecision({ record: red, headSha: 'ours' })).toMatchObject({ ok: false, isolatedRetry: 'still-red' });
+  expect(verifyFinishBody(record, { exitCode: 0 }).retriedFailures).toBeUndefined();
+});
