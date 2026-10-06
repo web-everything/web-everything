@@ -18,6 +18,10 @@ export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
   // 'untouched' (any failure kind, at most 3 files), 'timeouts' (only timeout failures), 'off'.
   // A pass alone is recorded on the marker as `isolatedRetry: 'flaky-outside-diff'`; CI still runs the full suite.
   isolatedRetry: 'untouched',
+  // #5128 — over this many related tests (any import depth), run only tests within `relatedDepth` import hops (never
+  // fewer than the direct importers) and mark the run `selection-truncated`. 0 = off (plain `vitest related`).
+  relatedMaxTests: 0,
+  relatedDepth: 2,
 });
 
 /** Use the WE root RUNNING verify-lane, never the target lane REPO or cwd:
@@ -37,6 +41,8 @@ const rules = {
   restartInFlight: value => ['adopt', 'kill'].includes(value),
   runAllPhases: value => typeof value === 'boolean',
   isolatedRetry: value => ['untouched', 'timeouts', 'off'].includes(value),
+  relatedMaxTests: value => Number.isSafeInteger(value) && value >= 0,
+  relatedDepth: value => Number.isSafeInteger(value) && value >= 1,
 };
 const envKeys = {
   relatedMode: 'WE_VERIFY_RELATED', testTimeoutFactor: 'WE_VERIFY_TEST_TIMEOUT_FACTOR',
@@ -44,6 +50,7 @@ const envKeys = {
   matchRequestVariants: 'WE_VERIFY_MATCH_REQUEST_VARIANTS', supersede: 'WE_VERIFY_SUPERSEDE',
   restartInFlight: 'WE_VERIFY_RESTART_IN_FLIGHT',
   runAllPhases: 'WE_VERIFY_RUN_ALL_PHASES', isolatedRetry: 'WE_VERIFY_ISOLATED_RETRY',
+  relatedMaxTests: 'WE_VERIFY_RELATED_MAX_TESTS', relatedDepth: 'WE_VERIFY_RELATED_DEPTH',
 };
 const booleanKeys = new Set(['phaseAdmission', 'matchRequestVariants', 'runAllPhases']);
 // Preserve which keys survived validation without adding configuration keys to the file shape.
@@ -79,7 +86,7 @@ export function resolveVerifySettings({ fileConfig, env = {} } = {}) {
     sources[key] = fileKeys.get(validated).has(key) ? 'file' : 'default';
     let value = env?.[envKeys[key]];
     if (booleanKeys.has(key)) value = value === '0' ? false : value === '1' ? true : undefined;
-    else if (key === 'testTimeoutFactor' || key === 'fastTargets') {
+    else if (['testTimeoutFactor', 'fastTargets', 'relatedMaxTests', 'relatedDepth'].includes(key)) {
       value = value != null && String(value).trim() !== '' ? Number(value) : undefined;
     }
     if (check(value)) {

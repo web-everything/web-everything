@@ -257,6 +257,10 @@ if (MODE === 'reset') {
 function readCheckoutScripts() {
   try { return Object.keys(JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8')).scripts || {}); } catch { return undefined; }
 }
+// #5128 — one reader for the related-test graph; its identity keys the graph cache across the #66 variant matching.
+const readRepoFile = (p) => readFileSync(join(REPO, p), 'utf8');
+// The default gate's selected test half: `vitest related <changed>` or (#5128) a bounded `vitest run <tests>`.
+const SELECTED_TEST_COMMAND = /^npx vitest (?:related|run) /;
 let GATE;
 let resolvedGate;
 if (typeof flags.gate === 'string') {
@@ -271,7 +275,7 @@ if (typeof flags.gate === 'string') {
     // Only a KNOWN diff whose selection is blocked counts; an unresolvable diff (no `origin/main`) is unchanged.
     let defaultBlocked = false;
     try {
-      const { decision } = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)) });
+      const { decision } = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile });
       defaultBlocked = decision.mode === 'blocked' && Array.isArray(decision.changedFiles) && decision.changedFiles.length > 0;
     } catch { /* cannot tell ⇒ unchanged behaviour */ }
     const refusal = defaultBlocked ? explicitGateRefusal(GATE) : null;
@@ -286,7 +290,7 @@ if (typeof flags.gate === 'string') {
     }
   }
 } else {
-  const resolved = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)) });
+  const resolved = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile });
   if (resolved.decision.mode === 'blocked') emit({ sha: headSha, status: 'selection-required', reason: 'local-selection-bound', ok: false, detail: describeGate(resolved) }, 3);
   GATE = resolved.command;
   resolvedGate = resolved;
@@ -300,7 +304,7 @@ if (typeof flags.gate === 'string') {
 let admissionFallback = null;
 if (!resolvedGate && typeof flags.gate === 'string') {
   try {
-    const resolveUnder = (env) => resolveDefaultGate({ runGit: git, env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)) });
+    const resolveUnder = (env) => resolveDefaultGate({ runGit: git, env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile });
     const resolved = resolveUnder(process.env);
     if (resolved.command === GATE) resolvedGate = resolved;
     // The requester (an agent session, often on an older lane base) resolves its default gate under ITS settings,
@@ -315,7 +319,7 @@ if (!resolvedGate && typeof flags.gate === 'string') {
   } catch { /* Unknown selection cannot authorize a retry. */ }
   // #66 — never fall back to whole-gate admission silently: say so on stderr (the dispatcher copies this line into
   // the daemon log) and record the reason in the marker's phases.
-  if (!resolvedGate && MODE === 'verify' && typeof flags['run-id'] === 'string' && GATE.startsWith('npx vitest related ')) {
+  if (!resolvedGate && MODE === 'verify' && typeof flags['run-id'] === 'string' && SELECTED_TEST_COMMAND.test(GATE)) {
     admissionFallback = 'requested gate is not this checkout\'s default selection under any declared settings variant';
     process.stderr.write(`\n⚠ verify-lane: whole-gate admission — ${admissionFallback}\n`);
   }
@@ -431,7 +435,7 @@ const ADMISSION_CAP = resolveCap(process.env);
 const ADMISSION_TIMEOUT_MS = resolveTimeoutMs(process.env);
 const laneMatch = /lane-(\d+)/.exec(REPO);
 // #verify-phase-admission — acquire the first phase before dispatch's execution marker.
-const retryableGate = resolvedGate?.testCommand?.startsWith('npx vitest related ');
+const retryableGate = SELECTED_TEST_COMMAND.test(resolvedGate?.testCommand ?? '');
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
 const admissionPhases = {};
