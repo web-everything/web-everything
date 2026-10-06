@@ -630,3 +630,31 @@ describe('renderReport', () => {
     expect(() => renderReport(null)).not.toThrow();
   });
 });
+
+// Managed-session evidence closes the lane-only false STUCK reports (#3990/#4017).
+describe('owner-aware absence verdicts', () => {
+  const live = { phase: 'FIXING', headline: 'live fix-3990 since 2026-10-06T11:00:00Z' };
+  it('review:changes with an observed live fixer is not stuck', () => {
+    const result = derivePhase({ labels: ['review:changes'], ownerState: live });
+    expect(result.phase).toBe('FIXING');
+    expect(result.display).toContain('fix-3990');
+    expect(result.display).not.toContain('STUCK');
+  });
+  it.each(['HANDED-OFF', 'WAITING-CI', 'IN-REVIEW', 'STUCK'])('uses the sharper %s evidence for absence-derived stalls', phase => {
+    for (const labels of [[], ['review:changes'], ['review:pending']]) {
+      expect(derivePhase({ labels, ownerState: { phase, headline: 'observed reason' } }).display).toBe(`${phase}: observed reason`);
+    }
+  });
+  it('an observed headline cannot carry a terminal escape or CR into the table', () => {
+    const hostile = { phase: 'FIXING', headline: 'live fix-1\x1b]0;pwned\x07\rSTUCK\x1b[2K' };
+    const { display, reason } = derivePhase({ labels: ['review:changes'], ownerState: hostile });
+    // eslint-disable-next-line no-control-regex
+    expect(display + reason).not.toMatch(/[\x00-\x1f\x7f]/);
+    expect(display).toContain('live fix-1');
+  });
+  it('keeps the existing human and prevention gates', () => {
+    expect(derivePhase({ labels: ['review:human'], ownerState: live }).reason).toBe(STUCK_REASONS.HUMAN_GATE);
+    expect(derivePhase({ pendingQuestion: { asked: true }, ownerState: live }).reason).toBe(STUCK_REASONS.NEEDS_HUMAN);
+    expect(derivePhase({ ledgerOwed: 'prevention', ownerState: live }).reason).toBe(STUCK_REASONS.PREVENTION_UNFILED);
+  });
+});
