@@ -145,6 +145,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
 import { reserve, releaseLockDir, readLockEntry } from './file-locks.mjs';
 import { defaultPoolRoot, guardedPoolRoot } from '../lib/lane-pool-paths.mjs';
+import { resolveHeavyAdmissionCap } from '../lib/dispatch-throttle.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { execContainerized, containerCliAvailable, containerImageAvailable, resolveContainerImage, resolveNodeModulesVolume, nodeModulesVolumeAvailable } from '../lib/container-exec.mjs'; // #3621 sequencing note (tracked on #3383) — the heavy-command-pool container POC; see that module's own header for proven scope (check:standards + test:unit)
 import { resolveHostRoot, readHostToday, extractSamplesByName, utcDayKey } from '../operations/telemetry-summary-io.mjs'; // #4076 — REUSE the host-sampler's own root-resolution + tail-read + metric-extraction primitives (never reimplemented — see loadAdmissionDecision's section header below)
@@ -214,9 +215,9 @@ const REAP_LOG = 'reaped.jsonl';
 
 /** Resolve the admission cap from env, clamped to a sane minimum of 1 (a cap of 0 would wedge every caller
  *  forever, which is a config bug, not a valid "admit nothing" policy). */
-export function resolveCap(env = process.env) {
-  const n = Number(env.WE_HEAVY_ADMISSION_CAP);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_ADMISSION_CAP;
+export function resolveCap(env = process.env, { file } = {}) {
+  // Declared setting (we:scripts/dispatch-settings.json `heavyAdmissionCap`); a valid WE_HEAVY_ADMISSION_CAP env still wins.
+  return resolveHeavyAdmissionCap({ env, file });
 }
 
 /** Resolve the wait-then-give-up timeout from env, mirroring {@link resolveCap}. Clamped to a sane minimum of
