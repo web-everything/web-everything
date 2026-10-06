@@ -1,5 +1,6 @@
 /** Pure card-batch decisions; the platform JSON is the only IO. */
 import { readFileSync } from 'node:fs';
+import { URL as NodeURL } from 'node:url'; // bound at import: some suites stub the global URL
 import { isCardPath } from '../ci-card-only.mjs';
 
 export const CARD_BATCH_KINDS = Object.freeze(['prevention', 'filing', 'prepare']);
@@ -40,7 +41,7 @@ export function validateCardBatchPolicy(raw) {
   }
 }
 
-const platformResult = validateCardBatchPolicy(JSON.parse(readFileSync(new URL('./card-batch-policy.json', import.meta.url), 'utf8')));
+const platformResult = validateCardBatchPolicy(JSON.parse(readFileSync(new NodeURL('./card-batch-policy.json', import.meta.url), 'utf8')));
 if (!platformResult.ok) fail(platformResult.reason);
 const defaults = platformResult.policy;
 
