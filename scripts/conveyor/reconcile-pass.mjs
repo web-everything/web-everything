@@ -1453,6 +1453,25 @@ export function classifyTimeoutEvidence(evidence, { repo, pr, head, ts }) {
   return { eligible: true, repo, pr, head, signature, failures, jobs: evidence.jobs.map(({ log, ...job }) => job) };
 }
 
+/** Name the origin of a failed check. Tolerates `?query`, `/attempts/N` and run-level URLs (resolved to a job via the
+ *  run's jobs list, by check name; not exactly one match refuses `ambiguous-check-job`). A check from an app other than
+ *  `github-actions` refuses `non-actions-check:<app>`; anything else refuses `unknown-check-origin:<name>:<app>:<url>`.
+ *  Every refusal names the check so the next occurrence explains itself. Returns [full, repo, run, job]. */
+export function resolveCheckOrigin(c, { repo, api }) {
+  const url = c.details_url ?? null;
+  const app = c.app?.slug ?? null;
+  const where = (() => { try { const u = new URL(url); return `${u.host}${u.pathname}`; } catch { return url; } })();
+  const m = url?.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)(?:\/attempts\/\d+)?(?:\/job\/(\d+))?(?:[?#].*)?$/);
+  if (!m || m[1] !== repo) {
+    if (app && app !== 'github-actions') throw new Error(`non-actions-check:${app}:${c.name}`);
+    throw new Error(`unknown-check-origin:${c.name}:${app}:${where}`);
+  }
+  if (m[3]) return [m[0], m[1], m[2], m[3]];
+  const jobs = (api(`repos/${repo}/actions/runs/${m[2]}/jobs?filter=latest&per_page=100`).jobs ?? []).filter((j) => j.name === c.name);
+  if (jobs.length !== 1) throw new Error(`ambiguous-check-job:${c.name}:${jobs.length}`);
+  return [m[0], m[1], m[2], String(jobs[0].id)];
+}
+
 /** A failed check that is not primary evidence: `review-gate` (red by design under a review hold) and the
  *  aggregate `test` job when at least one `test-shard (N)` job also failed (it only mirrors its shards). */
 export function isDerivedTimeoutCheck(check, checks = []) {
@@ -1504,8 +1523,7 @@ export function readTimeoutEvidence(pr, { repo, exec = execFileSyncThrottled, ts
     const failed = checks.filter((c) => !['success', 'skipped', 'neutral'].includes(c.conclusion))
       .filter((c) => !isDerivedTimeoutCheck(c, checks));
     const jobs = failed.map((c) => {
-      const match = c.details_url?.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)\/job\/(\d+)$/);
-      if (!match || match[1] !== repo) throw new Error('unknown-check-origin');
+      const match = resolveCheckOrigin(c, { repo, api });
       const job = api(`repos/${repo}/actions/jobs/${match[3]}`);
       const run = api(`repos/${repo}/actions/runs/${match[2]}`);
       if (job.id !== Number(match[3]) || job.run_id !== run.id || run.head_sha !== head || job.head_sha !== head

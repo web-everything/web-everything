@@ -1347,3 +1347,32 @@ it('threads the injected round-cap environment into the fixer decision', async (
   expect(runReconcilePass({ ...options, env: { WE_REVIEW_ROUND_CAP: '7' } }).dispatch)
     .toContainEqual(expect.objectContaining({ kind: 'fix' }));
 });
+
+describe('item 69 resolveCheckOrigin', () => {
+  const repo = 'web-everything/web-everything';
+  const base = `https://github.com/${repo}/actions/runs/10`;
+  const mk = (name, details_url, slug = 'github-actions') => ({ name, details_url, app: { slug } });
+  const get = async (c, api = () => { throw new Error('no api'); }) => {
+    const { resolveCheckOrigin } = await import('../reconcile-pass.mjs');
+    return resolveCheckOrigin(c, { repo, api });
+  };
+  it('accepts query strings and attempts', async () => {
+    expect((await get(mk('t', `${base}/job/20?pr=1`)))[3]).toBe('20');
+    expect((await get(mk('t', `${base}/attempts/2/job/20`)))[3]).toBe('20');
+  });
+  it('resolves a run-level URL through the jobs list by check name', async () => {
+    const api = vi.fn(() => ({ jobs: [{ id: 7, name: 'smoke' }, { id: 8, name: 'other' }] }));
+    expect((await get(mk('smoke', base), api))[3]).toBe('7');
+    expect(api.mock.calls[0][0]).toContain('/runs/10/jobs');
+  });
+  it('refuses an ambiguous run-level match naming the check', async () => {
+    await expect(get(mk('smoke', base), () => ({ jobs: [] }))).rejects.toThrow('ambiguous-check-job:smoke:0');
+  });
+  it('refuses a non-Actions app with a stable named reason', async () => {
+    await expect(get(mk('Cloudflare Pages', 'https://dash.cloudflare.com/x', 'cloudflare-workers-and-pages')))
+      .rejects.toThrow('non-actions-check:cloudflare-workers-and-pages:Cloudflare Pages');
+  });
+  it('names the check for a null URL', async () => {
+    await expect(get(mk('mystery', null))).rejects.toThrow('unknown-check-origin:mystery:github-actions:null');
+  });
+});
