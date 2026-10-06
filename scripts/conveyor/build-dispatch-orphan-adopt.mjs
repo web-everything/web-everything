@@ -183,8 +183,17 @@ export function resumeMarkerBindsRow(marker, row) {
  *   row: {runId:string, entry:object}|null, marker: object|null}}
  */
 export function classifyClaimLiveness({
-  row, resumeMarker, ownerPid = null, isPidAlive = defaultIsPidAlive, nowMs = Date.now(),
+  row: foundRow, resumeMarker, ownerPid = null, isPidAlive = defaultIsPidAlive, nowMs = Date.now(), claimedAt = null,
 }) {
+  // A run row that STARTED BEFORE this claim was taken is an older attempt's leftover, never this claim's own
+  // dispatch (same rule as `build-dispatch-daemon.mjs#doneWhy`'s claimedAt guard). Live incident 2026-10-06:
+  // #4688's claim (18:59Z, daemon pid dead before its dispatch wrote any run row) was classified from the
+  // 18:10Z attempt's settled row -> `settled-elsewhere` -> left for the full 240-min TTL, pinning the Claude
+  // build slot (cap 1) so every Claude build held `cap` for hours. A predating row reads as NO row: the
+  // claim's own owner pid decides.
+  const stale = !!foundRow && typeof claimedAt === 'string' && claimedAt !== ''
+    && typeof foundRow.entry?.startedAt === 'string' && foundRow.entry.startedAt !== '' && foundRow.entry.startedAt < claimedAt;
+  const row = stale ? null : foundRow;
   const byOwnerPid = () => (Number.isInteger(ownerPid) && ownerPid > 0
     ? { status: isPidAlive(ownerPid) ? 'no-record' : 'dead', row, marker: null }
     : { status: 'no-record', row, marker: null });
@@ -437,10 +446,11 @@ export async function adoptOrphanedBuildClaims({
     if (claim.meta?.kind !== 'build') continue;
     const num = normNum(claim.meta?.num);
     try {
-      const row = findRow(num, runs);
+      const foundRow = findRow(num, runs);
       const resumeMarker = readResumeMarker(num);
       const ownerPid = Number.isInteger(claim.pid) ? claim.pid : null;
-      const liveness = classifyClaimLiveness({ row, resumeMarker, ownerPid, isPidAlive, nowMs: now() });
+      const liveness = classifyClaimLiveness({ row: foundRow, resumeMarker, ownerPid, isPidAlive, nowMs: now(), claimedAt: claim.meta?.claimedAt ?? null });
+      const row = liveness.row; // null when the found row predates this claim
       // A marker bound to some OLDER row (or to none at all) is stale — it must never answer for this claim
       // again.
       if (resumeMarker && !liveness.marker) clearMarker(num);
