@@ -139,6 +139,29 @@ process.exitCode = await main(['add', '--title=' + process.argv[2]], { writeFile
     expect(h.matching('release')).toHaveLength(1);
     if (fail === 'verify') expect(h.matching('open-pr')).toHaveLength(0);
   });
+  // A lane we do hold (lane + holder) is still released; one we cannot name is not.
+  it.each([[{}, 0], [{ lane: 'lane-1', path: '/x' }, 0], [{ holder: 'session-1', path: '/x' }, 0], [{ lane: 'lane-1', holder: 'session-1' }, 1]])(
+    'reports the real cause on a malformed lane acquisition %j', async (acquired, releases) => {
+      const h = harness();
+      const exec = h.deps.exec;
+      h.deps.exec = (bin, args, options) => {
+        if (args.includes('acquire')) { h.calls.push({ bin, args, options }); return JSON.stringify(acquired); }
+        // The real lane-pool refuses a release with no lane/session, which is what masked the cause.
+        if (args.includes('release') && args.some(a => a.endsWith('=undefined'))) throw new Error('release: --lane is required');
+        return exec(bin, args, options);
+      };
+      const before = h.text();
+      expect(await h.run(['file', '--blocking'])).toBe(1);
+      expect(h.errors.join('')).toContain('invalid lane acquisition result');
+      expect(h.errors.join('')).not.toContain('release');
+      expect(h.matching('release')).toHaveLength(releases);
+      expect(h.text()).toBe(before);
+    });
+  it('still releases a well-formed lane when filing fails', async () => {
+    const h = harness({ fail: 'verify' });
+    expect(await h.run(['file', '--blocking'])).toBe(1);
+    expect(h.matching('release')).toHaveLength(1);
+  });
   it('does nothing when all cards are done', async () => {
     const h = harness();
     fs.writeFileSync(h.list, '1. **Done.** BUILT\n');

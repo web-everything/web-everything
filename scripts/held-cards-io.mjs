@@ -183,7 +183,8 @@ export async function main(argv, deps = {}) {
       say(flags.json ? JSON.stringify({ filed, failed, pr }) : filed.map(item => `FILED ${item.num} as ${item.id}, PR #${pr}`).join('\n'));
       return 0;
     } finally {
-      command('node', [path.join(root, 'scripts/lane-pool.mjs'), 'release', `--lane=${lane.lane}`, `--session=${lane.holder}`]);
+      // A malformed acquisition has nothing to release; releasing with undefined args would mask the real error.
+      if (lane.lane && lane.holder) command('node', [path.join(root, 'scripts/lane-pool.mjs'), 'release', `--lane=${lane.lane}`, `--session=${lane.holder}`]);
     }
   } catch (error) {
     stderr.write(`${error.message}\n`);

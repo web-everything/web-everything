@@ -108,6 +108,17 @@ it('qualifies --exclude-pr by repo through the CLI', () => {
   expect(holders(twin([]))).toEqual([['web-everything/web-everything'], ['plateauapp/plateau-app']]);
   expect(cli(['--files=x.mjs', '--exclude-pr=nope#3']).code).toBe(2);
 });
+it('refuses an executable front-matter block and runs none of it', () => {
+  const marker = path.join(root, 'executed.txt');
+  for (const lang of ['js', 'javascript', 'coffee', 'cson']) {
+    fs.writeFileSync(path.join(root, 'backlog/77-hostile.md'),
+      `---${lang}\n{ scope: [require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran')] }\n---\n`);
+    expect(() => readCardScope('77', { root })).toThrow();
+    expect(fs.existsSync(marker)).toBe(false);
+  }
+  fs.writeFileSync(path.join(root, 'backlog/77-hostile.md'), '{"scope":["x.mjs"]}\n');
+  expect(() => readCardScope('77', { root })).toThrow('plain YAML');
+});
 it('matches exact card IDs and combines qualified scope with CLI files', () => {
   expect(findCardFile('#123', { root })).toBe(path.join(root, 'backlog/123-some-card.md'));
   expect(findCardFile('12', { root })).toBeNull();

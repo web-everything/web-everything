@@ -125,10 +125,16 @@ export function findCardFile(card, { root }) {
   const name = names.sort().find((n) => n.startsWith(`${id}-`) && n.endsWith('.md'));
   return name ? path.resolve(root, 'backlog', name) : null;
 }
+/** gray-matter's executable engines, each replaced by one that refuses (same guard as probation-build-run.mjs, #4291). */
+const REFUSE_ENGINE = () => { throw new Error('executable frontmatter refused'); };
+const NO_EXEC_ENGINES = Object.freeze({ js: REFUSE_ENGINE, javascript: REFUSE_ENGINE, coffee: REFUSE_ENGINE, coffeescript: REFUSE_ENGINE, cson: REFUSE_ENGINE });
 export function readCardScope(card, { root }) {
   const file = findCardFile(card, { root });
   if (!file) throw new Error(`free-scope: card ${card} not found`);
-  const scope = matter(fs.readFileSync(file, 'utf8')).data.scope;
+  const text = fs.readFileSync(file, 'utf8');
+  // gray-matter's default engines `eval` a `---js` block, and a card may come from an unreviewed PR checkout.
+  if (!/^---\r?\n/.test(text)) throw new Error(`free-scope: card ${card} front matter is not a plain YAML block`);
+  const scope = matter(text, { language: 'yaml', engines: NO_EXEC_ENGINES }).data.scope;
   const entries = scope == null ? [] : Array.isArray(scope) ? scope : [scope];
   if (!entries.length || entries.some((e) => typeof e !== 'string' || !e.trim())) throw new Error(`free-scope: card ${card} has no scope of strings`);
   return entries;
