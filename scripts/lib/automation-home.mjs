@@ -32,6 +32,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
+import { logicalCloneRoot } from './daemon-clone-layout.mjs';
 import { daemonConveyorStateRoot } from './daemon-last-good.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
@@ -45,12 +46,12 @@ const LANE_MARKER = `${sep}.lanes${sep}`;
 
 /**
  * The WORKSPACE a checkout sits in — the shared parent of every primary checkout, daemon clone and `.lanes/`.
- * A lane (`<ws>/.lanes/<pool>/lane-N`) answers `<ws>`; any other checkout answers its parent directory. PURE.
+ * A lane or daemon version folder answers `<ws>`; any other checkout answers its parent directory. PURE.
  * Deliberately NOT `bootstrap-session.mjs#primaryCheckout`: this must resolve without the primary existing.
  * @param {string} root
  */
 export function workspaceOf(root) {
-  const path = resolve(String(root));
+  const path = logicalCloneRoot(resolve(String(root)));
   const i = path.indexOf(LANE_MARKER);
   return i >= 0 ? path.slice(0, i) : dirname(path);
 }

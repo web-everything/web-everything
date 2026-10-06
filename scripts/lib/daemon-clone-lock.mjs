@@ -21,9 +21,9 @@
  * Lock home is DELIBERATELY OUTSIDE any git tree (`~/.claude/daemon-clone-locks` by default, overridable via
  * `WE_DAEMON_CLONE_LOCK_ROOT`): a lock file living INSIDE the clone would itself be wiped/moved by the very
  * `git reset --hard` it is meant to guard, and would show up as clone-dirty state to every git status check.
- * Per-clone dirs are keyed by `lockIdFor(realpath(root))` (falling back to `path.resolve` if the clone doesn't
- * exist yet / realpath throws) so two different path SPELLINGS of the same clone (a symlink, a relative vs.
- * absolute invocation) collide on the same lock — exactly the property `daemon-overlays.mjs`'s `cloneKey`
+ * Per-clone dirs are keyed by `lockIdFor(canonicalCloneRoot(root))`: realpath first (falling back if it doesn't
+ * exist yet / realpath throws), then logical clone mapping, so different spellings of the same clone
+ * (a symlink, a relative vs. absolute invocation) collide on the same lock — exactly the property `daemon-overlays.mjs`'s `cloneKey`
  * independently needs for its own per-clone state file, and exactly why both use `realpath`-first.
  *
  * Reclaim: liveness of ANY entry here (a writer or a reader) is `!isLeaseExpired(...) && probe(entry) !== 'dead'`
@@ -39,7 +39,7 @@
 import { hostname, homedir } from 'node:os';
 import { readdirSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
-import { realpathSync } from 'node:fs';
+import { canonicalCloneRoot } from './daemon-clone-layout.mjs';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import {
@@ -77,17 +77,9 @@ export function defaultOwner(pid = process.pid) {
   return `${hostname()}:${pid}`;
 }
 
-/** Stable per-clone key: `lockIdFor(realpath(root))`, falling back to `path.resolve(root)` when the clone
- *  doesn't exist yet (a fresh clone about to be created) or `realpathSync` otherwise throws — this way two
- *  spellings of the SAME clone (symlink, relative path, trailing slash) always land in the same lock dir. */
+/** Stable per-clone key: realpath-or-resolve, then the logical identity shared by every version. */
 export function cloneLockKey(root) {
-  let real;
-  try {
-    real = realpathSync(root);
-  } catch {
-    real = resolvePath(root);
-  }
-  return lockIdFor(real);
+  return lockIdFor(canonicalCloneRoot(root));
 }
 
 /** The three directories a clone's lock lives under: a per-clone `base`, its single-key `writer/`, and its

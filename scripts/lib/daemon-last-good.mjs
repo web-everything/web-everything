@@ -18,16 +18,17 @@
  *     keeps the clone on its last-good build, and clears it on the next adoption; the health watch's
  *     `daemon-held-on-last-good` sign reads the same record.
  *
- *   Deliberately import-light (node builtins only): `main-staleness.mjs` imports this, and `daemon-rebuild.mjs`
- *   imports `main-staleness.mjs`, so importing `daemon-overlays.mjs` (→ `daemon-self-sync.mjs` →
+ *   Deliberately import-light (node builtins and the standalone clone-layout helper only):
+ *   `main-staleness.mjs` imports this, and `daemon-rebuild.mjs` imports `main-staleness.mjs`, so importing `daemon-overlays.mjs` (→ `daemon-self-sync.mjs` →
  *   `daemon-rebuild.mjs`) from here would close an import cycle. {@link cloneKeyOf} therefore re-states
- *   `daemon-overlays.mjs#cloneKey`'s three lines; a unit test pins the two to the same value.
+ *   `daemon-overlays.mjs#cloneKey`'s hash using the shared canonical root; a test pins their values.
  */
 
-import { readFileSync, realpathSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import { createHash } from 'node:crypto';
+import { canonicalCloneRoot } from './daemon-clone-layout.mjs';
 
 /** Env var pinning the rebuild-state root (same one `daemon-rebuild.mjs` uses). */
 export const WE_DAEMON_STATE_DIR_ENV = 'WE_DAEMON_STATE_DIR';
@@ -70,11 +71,9 @@ export function daemonConveyorStateRoot(env = process.env) {
   return pinned ?? join(daemonStateDir(env), 'conveyor-state');
 }
 
-/** Same value as `daemon-overlays.mjs#cloneKey` (sha256 of the realpath, 16 hex) — see the file header. */
+/** Same value as `daemon-overlays.mjs#cloneKey` (sha256 of the canonical logical root, 16 hex) — see the file header. */
 export function cloneKeyOf(root) {
-  let p;
-  try { p = realpathSync(root); } catch { p = resolvePath(root); }
-  return createHash('sha256').update(p).digest('hex').slice(0, 16);
+  return createHash('sha256').update(canonicalCloneRoot(root)).digest('hex').slice(0, 16);
 }
 
 /** @returns {number} */
