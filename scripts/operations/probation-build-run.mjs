@@ -87,7 +87,7 @@ import { AGY_CLAUDE_MODEL_BY_TIER, PROBATION_WORKERS, PROVEN_TASK_ENVELOPES, isS
 import { isDocScopePath } from '../lib/dispatch-task-type.mjs';
 import {
   buildCheckerArgv, parseCheckerVerdict, buildDocFixCommitMessage, buildDocFixTask, buildWorkerArgv, frontmatterTamperedBeyondClaim, PREPARE_OWNED_FRONTMATTER_KEYS,
-  parseProposedBlockedBy, validateProposedBlockedBy,
+  BACKLOG_ID_SOURCE, parseProposedBlockedBy, validateProposedBlockedBy,
   healDiffWithinEnvelope, launchScorecardRow, newUntrackedPaths, summarizeNumstat,
 } from '../lib/probation-launcher.mjs';
 import { defaultPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
@@ -746,9 +746,10 @@ export function realIo({ session, env = process.env, repoRoot = WE_ROOT } = {}) 
     // num -> {status, blockedBy} for every card: the graph the proposed-edge DAG check (ruling #4670) walks.
     blockedByGraph: (dir) => {
       const graph = new Map();
+      const cardFilename = new RegExp(`^(${BACKLOG_ID_SOURCE})-.*\\.md$`);
       try {
         for (const f of readdirSync(join(dir, 'backlog'))) {
-          const m = /^(\d+)-.*\.md$/.exec(f);
+          const m = cardFilename.exec(f);
           if (!m) continue;
           let fm = {};
           try { fm = parseYamlFrontmatter(readFileSync(join(dir, 'backlog', f), 'utf8')) ?? {}; } catch { /* unreadable card: no edges, unknown status */ }

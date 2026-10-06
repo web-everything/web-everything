@@ -214,9 +214,14 @@ export const CLAIM_OWNED_FRONTMATTER_KEYS = Object.freeze([
  */
 export const PREPARE_OWNED_FRONTMATTER_KEYS = Object.freeze(['scope', 'size', 'preparedDate', 'preparedAgainstSha']);
 
+// Two-form backlog id; the contract test keeps this aligned with check-standards' ITEM_REF_RX.
+export const BACKLOG_ID_SOURCE = '\\d{1,5}|x[0-9a-z]{6}';
+const PROPOSED_BLOCKED_BY_BULLET = new RegExp(`^\\s*[-*]\\s+(add|remove)\\s+#?(${BACKLOG_ID_SOURCE})\\b`, 'i');
+
 /**
  * The edges a prepare worker PROPOSED in the card's `## Proposed blockedBy changes` section. PURE.
- * One bullet per edge: `- add NNN — reason (file:line)` or `- remove NNN — reason (file:line)`.
+ * One bullet per edge: `- add ID — reason (file:line)` or `- remove ID — reason (file:line)`.
+ * IDs are numeric or provisional hashes, as defined by {@link BACKLOG_ID_SOURCE}.
  * @param {string} raw - the card's whole text.
  * @returns {{op: 'add'|'remove', target: string, line: string}[]}
  */
@@ -225,7 +230,7 @@ export function parseProposedBlockedBy(raw) {
   if (!m) return [];
   const out = [];
   for (const line of m[1].split(/\r?\n/)) {
-    const b = /^\s*[-*]\s+(add|remove)\s+#?(\d+)\b/i.exec(line);
+    const b = PROPOSED_BLOCKED_BY_BULLET.exec(line);
     if (b) out.push({ op: b[1].toLowerCase(), target: b[2], line: line.trim() });
   }
   return out;
