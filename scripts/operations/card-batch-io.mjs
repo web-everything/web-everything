@@ -36,7 +36,7 @@ function readLock(path) {
 /** A lock with no readable expiry (a producer died between creating and writing it) ages out by mtime. */
 const lockExpiry = (lock, leaseMs) => Number.isFinite(ms(lock.lease?.expiresAt)) ? ms(lock.lease.expiresAt) : lock.mtimeMs + leaseMs;
 /** Token of the lease currently on disk; any unreadable lock reads as nobody's. */
-const tokenOf = path => readLock(path)?.lease?.token;
+export const tokenOf = path => readLock(path)?.lease?.token;
 
 /** Git runner whose captured output is bounded at 16 MiB; `maxBuffer` follows `...options`, so a caller cannot raise it. */
 export const gitIn = cwd => (args, options = {}) => execFileSync('git', args, {
@@ -47,7 +47,7 @@ export const gitIn = cwd => (args, options = {}) => execFileSync('git', args, {
 });
 
 /** A token prevents a finishing, expired producer from releasing its successor's lease. */
-function acquireLease(path, owner, now, leaseMs, hook) {
+export function acquireLease(path, owner, now, leaseMs, hook) {
   const lease = { owner, expiresAt: now + leaseMs, token: randomUUID() };
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -77,7 +77,7 @@ function acquireLease(path, owner, now, leaseMs, hook) {
   return null;
 }
 
-function atomicRecord(path, state) {
+export function atomicRecord(path, state) {
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
     writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { flag: 'wx' });

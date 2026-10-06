@@ -40,6 +40,7 @@
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
+import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
 import { readFixLoopRows } from './fix-loop-ledger.mjs';
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { archiveClaudeJobs, formatClaudeJobsArchiveLine } from './claude-jobs-archive.mjs';
@@ -853,6 +854,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const tmpSweep = sweepAllowed && sweepDue
     ? await attempt('tmpSweep', () => sweepOurTmp(sweepOptions(config, flags['tmp-sweep-root'] || tmpdir(), !!flags['dry-run'], now, tmpSweepRun, prev.tmpSweep?.nextCursor)))
     : null;
+
+  if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
   const archiveAllowed = flags['claude-jobs-root'] || (!flags['state-root'] && !flags['dry-run']);
   const archiveDue = config.claudeJobsArchiveEnabled && (!prev.claudeJobsArchive?.completedAt
