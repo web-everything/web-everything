@@ -4,8 +4,8 @@ kind: epic
 parent: "4376"
 status: open
 dateOpened: "2026-10-02"
-preparedDate: "2026-10-02"
-preparedAgainstSha: "5c6afdb4253d148a2b3e162e61d94236d1e397a0"
+preparedDate: "2026-10-06"
+preparedAgainstSha: "e93a583ab5c84530e7b4bdf858f92bf4f762fb92"
 tags: []
 scope:
   - "we:scripts/lib/card-batch-policy.mjs"
@@ -26,6 +26,25 @@ scope:
 Operator goal, 2026-10-02: reduce PR count by grouping new filings and prevention cards into rolling card-only PRs, with delivery-policy controls in Plateau. Prepares are a separate opt-in kind because they unblock builds. Preserve one commit per card, ordinary verification and review, source attribution, and extraction of a rejected card into its own PR. Proposed defaults remain filings/prevention enabled, 15 cards or 60 minutes, prepares disabled.
 
 ## Progress
+
+Re-preparation and slicing (2026-10-06, against e93a583ab). Operator approval, 2026-10-06: MVP first = prevention cards only, sealing at **10 cards or 2 hours** (both settings), then filings, then Plateau settings and opt-in prepare batching. These replace the 15 cards / 60 minutes defaults above.
+
+Slices (DAG): xowd9o9 policy + eligibility core (3) → xwnamtf durable admission with lease and expected head (5) → x2fvt08 draft PR, count/age seal, publish (5) → xuz8m83 failed-card extraction (5) → xk15cr3 land-prevention-card integration + live proof (3, blocked by x2fvt08 and xuz8m83). **MVP = those five (21 points).** Then xazahhl filings (3), xhceyny Plateau settings (5) and xqrggm7 opt-in prepare batching (5), each blocked by xk15cr3.
+
+Premises re-verified on origin/main:
+
+- **Measured baseline (replaces "31 recent PRs").** Of the 200 most recently merged PRs (2026-10-04 02:06Z to 2026-10-06), 93 were single-file `lane/*-prevention-card` PRs (47 of the latest 100). Each one is a lane acquire, a local verify, a PR CI run, several review-gate runs, a drain landing, and a full CI run on the main push (CI always runs the full suite on push to main). Example PR #4080: CI 89 s, four review-gate runs, a soak gate, landed 3 min after open.
+- **Stale: "each pays a full CI".** Since 5c670c674 (2026-10-03) a backlog-only PR takes the CI light path: check:standards only, no unit shards (we:.github/workflows/ci.yml:59-91, detector we:scripts/ci-card-only.mjs:17). Batching still saves PR CI runs, review-gate runs, drain landings and, above all, one full main-push CI run per card. Measure those, not shard time.
+- **New: a draft alone is not a hold.** The reconcile pass un-drafts every green draft PR (`promote-draft`, we:scripts/conveyor/reconcile-core.mjs:1806-1816). It skips a draft only when it carries `review-status:draft-withdrawn` (line 1807). An accumulating batch must carry that label until sealed. The drain already skips DRAFT PRs (we:scripts/merge-ai-prs.mjs:749).
+- **New: CI runs on draft PRs.** The CI workflow has no draft filter (default pull_request types), so each pushed append costs one light CI run. The seal slice measures this.
+- **New: label-on-green cannot open a draft.** pr-land opens only `park` PRs as drafts; a draft in label-on-green would spin its poll (we:scripts/pr-land.mjs:276-290). It does re-run on an already open PR (we:scripts/pr-land.mjs:413). So: open the draft through park or a new hold variant, then at seal mark it ready and run label-on-green on the same ref.
+- **Still true, lines unchanged:** per-card landing at we:scripts/operations/land-prevention-card.mjs:304-423 (acquire 326-337, file 347-363, commit 365-377, verify 379-388, open-pr 390-407). The retraction now sits in `runLandPreventionCardCli` (we:scripts/operations/land-prevention-card.mjs:468-479). The file is unchanged since Oct 2.
+- **Changed: two spawners, one funnel.** Since #4493, both we:scripts/review-set-label.mjs and we:scripts/operations/review-loop-cli.mjs spawn through we:scripts/lib/prevention-landing-job.mjs. The header of land-prevention-card still names only the first. Integrating at land-prevention-card covers both.
+- **Line drift only:** guarded writer lane guard now we:scripts/backlog/guarded-write.mjs:56-69, content gate 109-128 (behaviour unchanged). Scaffold sink we:scripts/operations/scaffold-io.mjs:65-75 and file-item landing note we:scripts/operations/file-item.mjs:26-37 unchanged; queue clearance now 97-110. Prepare delivery moved to `openPrArgv` at we:scripts/operations/probation-build-run.mjs:666-672 (park `review:pending`, draft first), called at :618.
+- **Platform decision still holds:** [we:docs/agent/platform-decisions.md#pr-flow-rollout-mechanism](../docs/agent/platform-decisions.md#pr-flow-rollout-mechanism) is still at line 2698 with the five bullets at 2702-2723. Batching changes how many cards ride one PR, not who writes main.
+- **Today's related work:** #4048 (merged) upserts the drain's held park-reason comment, so a held batch PR will not spam comments. #4053 (merged) promotes block-ruled referrals out of card suggestions, so fewer prevention cards get filed per review. #4069 (open) gives each finding one identity; the extraction slice can use it but does not wait for it. #4386 made open-pr report a refused submit truthfully, which the fallback path relies on. Open #4399 (duplicate landing job) overlaps the integration slice; keying admission by the approval-prevention idempotency key removes the duplicate.
+- **Settings home:** follow the committed-policy precedent we:scripts/lib/dispatch-routing-policy.json. Unlike we:scripts/lib/verify-settings.mjs (bad keys fall back silently), the batch validator refuses on bad or unknown values. Plateau later layers an operator override, following plateau:src/wip/ci-queue-config.ts.
+- No Plateau or shared #4376 policy contract exists yet; the Plateau slice consumes it if it lands first.
 
 Preparation premise check (2026-10-02):
 
