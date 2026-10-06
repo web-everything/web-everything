@@ -9,6 +9,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tailLines, PROJECTS_DIR } from '../../skills-src/inspect-agent-health/agent-health.mjs';
+import { redactCommandLine, REDACTED } from '../operations/command-redact.mjs';
 import { reduceCheckState } from '../operations/pr-status.mjs';
 import { FALLBACK_REQUIRED_STATUS_CHECKS } from './required-status-checks.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
@@ -25,9 +26,23 @@ import { derivePrState, settingsFromEnv } from './pr-state-core.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const REPO = CONSTELLATION_REPOS.we.slug;
 const LIMIT = 64 * 1024;
-const clean = value => String(value ?? '').replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
-  .replace(/(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+)/g, '[REDACTED]')
-  .replace(/((?:token|password|authorization|api[_-]?key)\s*[:=]\s*)\S+/gi, '$1[REDACTED]').slice(0, 1200);
+// ESC-initiated sequences (OSC clipboard/title/hyperlink, CSI), then every other control character.
+/* eslint-disable no-control-regex */
+const OSC = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g;
+const CSI = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+const OTHER_ESC = /\x1b[@-Z\\-_]/g;
+const CONTROL = /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g;
+/* eslint-enable no-control-regex */
+// `"token": "…"` — JSON-quoted secrets that the shared argv redactor's `name=value` / `Header: value` shapes miss.
+const JSON_SECRET = /("[\w.-]*(?:token|secret|passw(?:or)?d|pwd|key|auth|credential|cookie)[\w.-]*"\s*:\s*)(?:"(?:[^"\\]|\\.)*"|[\w.+-]+)/gi;
+// Bidi overrides/isolates reorder a printed line without any control character.
+const BIDI = /[‎‏‪-‮⁦-⁩]/g;
+/** Make untrusted text safe to print: no terminal control sequences, CR/newline collapsed so a line cannot rewrite the headline. */
+export const stripTerminal = value => String(value ?? '').slice(0, 4096).replace(OSC, '').replace(CSI, '').replace(OTHER_ESC, '')
+  .replace(BIDI, '').replace(/\s+/g, ' ').replace(CONTROL, '?');
+/** stripTerminal + credential redaction through the repo's shared redactor, bounded for display. */
+export const cleanText = value => redactCommandLine(stripTerminal(value).replace(JSON_SECRET, `$1"${REDACTED}"`)).slice(0, 1200);
+const clean = cleanText;
 const soft = (fn, fallback = null) => { try { return fn(); } catch { return fallback; } };
 function entries(dir, cap = 500) {
   return soft(() => {
@@ -50,6 +65,10 @@ function agents(exec) {
   const raw = JSON.parse(exec('claude', ['agents', '--json']));
   if (!Array.isArray(raw) && !Array.isArray(raw?.agents)) throw new Error('unrecognized agents listing');
   return array(raw?.agents ?? raw).slice(0, 500);
+}
+/** The one `claude agents` probe, shared by the PR and card paths: a failure is an error to show, never an empty listing. */
+function probeAgents(exec) {
+  try { return { listing: agents(exec), error: null }; } catch { return { listing: [], error: 'claude agents unavailable' }; }
 }
 /** io may inject run(bin,argv), now(), env, home, root, and agents (a shared listing). */
 export function readPrFacts(pr, io = {}) {
@@ -83,8 +102,13 @@ export function readPrFacts(pr, io = {}) {
   const rollup = collapseRollupToLatestPerName(array(commit?.statusCheckRollup?.contexts?.nodes).map(c => c.context
     ? { name: c.context, status: c.state === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED',
       conclusion: c.state === 'SUCCESS' ? 'SUCCESS' : c.state === 'PENDING' ? null : 'FAILURE', completedAt: c.createdAt } : c));
+  // The rollup describes the current head only when BOTH probes answered for the same sha. Otherwise a check is
+  // UNKNOWN — never "missing", which would read as CI still running and mask a stalled PR.
+  const rollupKnown = !!commit?.oid && commit.oid === p.headRefOid;
+  const truncated = !!commit?.statusCheckRollup?.contexts?.pageInfo?.hasNextPage;
   const checks = required.map(name => {
-    const runs = commit?.oid === p.headRefOid ? rollup.filter(c => c.name === name) : [];
+    const runs = rollupKnown ? rollup.filter(c => c.name === name) : [];
+    if (!rollupKnown || (truncated && !runs.length)) return { name, state: 'unknown' };
     const reduced = reduceCheckState(runs, [name]).state;
     return { name, state: runs[0]?.conclusion === 'CANCELLED' ? 'cancelled' : reduced === 'unchecked' ? 'missing' : reduced };
   });
@@ -105,7 +129,9 @@ export function readPrFacts(pr, io = {}) {
   const names = ['fix', 'ci-heal', 'review'].map(kind => fixDispatchSessionName({ repo: 'we', pr: Number(pr), kind }));
   const matches = a => !/^(?:fix|ci-heal|review)-(?:pa|fui)-/.test(a?.name || '') &&
     (names.includes(a?.name) || array(a?.children).some(c => new RegExp(`(?:github.com/${REPO}/|^/?)pull/${pr}(?:$|[/?#])`).test(c.href || '')));
-  const listing = io.agents ?? probe('claude agents', () => agents(exec), []);
+  let listing = io.agents;
+  if (!listing) { const probed = probeAgents(exec); listing = probed.listing; if (probed.error) errors.push(probed.error); }
+  else if (io.agentsError) errors.push(io.agentsError);
   const records = [];
   for (const base of [join(home, '.claude/jobs'), join(home, '.claude/jobs-archive')]) {
     const dirs = entries(base);
@@ -151,7 +177,7 @@ export function readPrFacts(pr, io = {}) {
     const observed = array(listing).find(a => a.name === s.name && ['busy', 'working'].includes(a.status)
       && (!s.sessionId || !a.sessionId || s.sessionId === a.sessionId));
     s.live = !!observed;
-    if (observed) { s.state = observed.status; s.startedAt = observed.startedAt || s.startedAt; }
+    if (observed) { s.state = observed.status; s.startedAt = iso(observed.startedAt) || s.startedAt; }
     if (s.sessionId && /^[a-zA-Z0-9-]+$/.test(s.sessionId)) {
       // At most 100 project directories, one named transcript each; never search arbitrary paths from prose.
       for (const project of entries(PROJECTS_DIR, 100)) {
@@ -170,9 +196,12 @@ export function readPrFacts(pr, io = {}) {
   }
   let claim = null;
   for (const kind of ['fix', 'ci-heal']) {
-    const entry = probe(`${kind} claim`, () => readFixDispatchClaim({ repo: 'we', pr: Number(pr), kind }), null);
+    const entry = probe(`${kind} claim`, () => (io.readClaim ?? readFixDispatchClaim)({ repo: 'we', pr: Number(pr), kind }), null);
     if (entry) { claim = { held: true, owner: clean(entry.owner), kind, meta: { headSha: entry.meta?.headSha, sessionId: entry.meta?.sessionId, sessionName: fixDispatchSessionName({ repo: 'we', pr: Number(pr), kind }) } }; break; }
   }
+  // The claim records the head the owner started from: a head that differs now is a push, even one made mid-session.
+  for (const s of sessions) { s.name = clean(s.name); s.state = clean(s.state); } // clean first: claim.owner is already clean
+  for (const s of sessions) if (claim?.meta?.headSha && (s.name === claim.owner || (claim.meta.sessionId && s.sessionId === claim.meta.sessionId))) s.headAtStart = claim.meta.headSha;
   const mentions = new RegExp(`(?:^|[^0-9])${pr}(?:$|[^0-9])`);
   const log = file => soft(() => tailLines(join(daemon, '.conveyor', file), 400, LIMIT).lines, []).filter(l => mentions.test(l));
   const at = line => line.match(/\d{4}-\d\d-\d\dT[0-9:.]+Z/)?.[0] ?? null;
@@ -183,7 +212,7 @@ export function readPrFacts(pr, io = {}) {
     handoffs.push({ kind: s.outcome.slice('blocked-on-'.length), at: s.endedAt, detail: `${s.name}: ${s.outcome}` });
   const drainDeferral = log('drain-daemon.log').filter(l => /deferr/i.test(l)).at(-1);
   return { pr: Number(pr), now: io.now?.() ?? new Date().toISOString(), state: p.state ?? null,
-    isDraft: p.isDraft, mergeState: p.mergeStateStatus, labels: array(p.labels).map(l => l.name),
+    isDraft: p.isDraft, mergeState: p.mergeStateStatus, labels: array(p.labels).map(l => stripTerminal(l.name)),
     head: { sha: p.headRefOid, committedAt: commit?.committedDate }, requiredChecks: checks,
     labelChangedAt: array(tail?.timelineItems?.nodes).filter(n => ['review:changes', 'review:pending'].includes(n.label?.name)).at(-1)?.createdAt,
     advisory: advisory ? { coveredHead: advisory.head, text: clean(trusted[advisory.index]?.body) } : null,
@@ -200,9 +229,10 @@ export function readCardFacts(id, io = {}) {
     if (statSync(path).size > LIMIT) throw new Error('card too large');
     return readFileSync(path, 'utf8');
   } })({ ref: String(id).replace(/^card[-:]/, '') }), { found: false });
-  const listing = soft(() => agents(exec), []);
-  const prs = soft(() => JSON.parse(exec('gh', ['pr', 'list', '--repo', REPO, '--state', 'all', '--limit', '100',
-    '--json', 'number,title,headRefName'])), []);
+  const { listing, error: agentsError } = io.agents ? { listing: io.agents, error: null } : probeAgents(exec);
+  let prsError = null;
+  const prs = (() => { try { return JSON.parse(exec('gh', ['pr', 'list', '--repo', REPO, '--state', 'all', '--limit', '100',
+    '--json', 'number,title,headRefName'])); } catch { prsError = 'GitHub PR list unavailable'; return []; } })();
   const map = buildPrToCardMap([{ repo: 'we', prs }]);
   const linked = array(prs).filter(p => String(map[`we:${p.number}`]) === String(context.id ?? id)).slice(0, 10);
   return { id: context.id ?? id, found: context.found, status: context.status ?? 'unknown',
@@ -210,7 +240,9 @@ export function readCardFacts(id, io = {}) {
     activeSessions: listing.filter(a => ['busy', 'working'].includes(a.status)
       && (['conveyor', 'prepare', 'prepare-decision', 'prepare-item'].some(kind => a.name === `${kind}-${context.id ?? id}`) || array(a.children).some(c => String(c.href || '').endsWith(`/backlog/${context.id ?? id}/`))))
       .map(a => ({ name: clean(a.name), state: a.status, startedAt: a.startedAt })),
-    prs: linked.map(p => { const facts = readPrFacts(p.number, { ...io, agents: listing });
+    activeSessionsKnown: !agentsError,
+    prs: linked.map(p => { const facts = readPrFacts(p.number, { ...io, agents: listing, agentsError });
       return { pr: p.number, ...derivePrState(facts, settingsFromEnv(io.env ?? process.env)) }; }),
-    evidence: ['PR/card join bounded to the 100 most recent PRs and 10 linked PRs; no match does not prove no PR exists'] };
+    evidence: ['PR/card join bounded to the 100 most recent PRs and 10 linked PRs; no match does not prove no PR exists',
+      ...[agentsError && `${agentsError}: active sessions unknown, not absent`, prsError && `${prsError}: linked PRs unknown, not absent`].filter(Boolean)] };
 }

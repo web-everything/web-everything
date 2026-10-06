@@ -645,6 +645,13 @@ describe('owner-aware absence verdicts', () => {
       expect(derivePhase({ labels, ownerState: { phase, headline: 'observed reason' } }).display).toBe(`${phase}: observed reason`);
     }
   });
+  it('an observed headline cannot carry a terminal escape or CR into the table', () => {
+    const hostile = { phase: 'FIXING', headline: 'live fix-1\x1b]0;pwned\x07\rSTUCK\x1b[2K' };
+    const { display, reason } = derivePhase({ labels: ['review:changes'], ownerState: hostile });
+    // eslint-disable-next-line no-control-regex
+    expect(display + reason).not.toMatch(/[\x00-\x1f\x7f]/);
+    expect(display).toContain('live fix-1');
+  });
   it('keeps the existing human and prevention gates', () => {
     expect(derivePhase({ labels: ['review:human'], ownerState: live }).reason).toBe(STUCK_REASONS.HUMAN_GATE);
     expect(derivePhase({ pendingQuestion: { asked: true }, ownerState: live }).reason).toBe(STUCK_REASONS.NEEDS_HUMAN);

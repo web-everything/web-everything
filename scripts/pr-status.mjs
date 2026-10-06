@@ -140,7 +140,7 @@ import { REVIEW_LABELS } from './lib/review-escalation.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { DEFAULT_REPO_KEY, CONSTELLATION_REPOS } from './lib/constellation-repos.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
-import { readPrFacts } from './lib/pr-state-io.mjs';
+import { readPrFacts, stripTerminal } from './lib/pr-state-io.mjs';
 import { derivePrState, settingsFromEnv } from './lib/pr-state-core.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -554,8 +554,8 @@ export function derivePhase({ labels = [], worker = null, pendingQuestion = null
   // Only absence-derived stalls accept the session-aware verdict. Human/prevention gates retain authority.
   const stuck = (reason) => {
     if (ownerState && [STUCK_REASONS.BOUNCED_NO_FIXER, STUCK_REASONS.NO_REVIEWER, STUCK_REASONS.NO_LABEL].includes(reason)) {
-      return { phase: ownerState.phase, reason: ownerState.headline,
-        display: `${ownerState.phase}: ${ownerState.headline}` };
+      const headline = stripTerminal(ownerState.headline); // observed text never carries a terminal escape into the table
+      return { phase: ownerState.phase, reason: headline, display: `${ownerState.phase}: ${headline}` };
     }
     return { phase: PHASES.STUCK, reason, display: `${PHASES.STUCK}: ${reason}` };
   };

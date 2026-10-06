@@ -2,11 +2,22 @@
 /** @file /state: one read-only answer about a PR or card, including the evidence and next event. */
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
-import { readPrFacts, readCardFacts } from './lib/pr-state-io.mjs';
+import { readPrFacts, readCardFacts, stripTerminal } from './lib/pr-state-io.mjs';
 import { derivePrState, settingsFromEnv } from './lib/pr-state-core.mjs';
+/** Every printed line passes the sanitizer, so no field (named or not) can carry a terminal escape or a CR. */
+const line = text => stripTerminal(text);
 export function renderPrState(state, subject) {
-  return [`${state.phase} — ${subject}: ${state.headline}`, `Next: ${state.next}`,
-    ...state.evidence.map(line => `  • ${line}`)].join('\n');
+  return [line(`${state.phase} — ${subject}: ${state.headline}`), line(`Next: ${state.next}`),
+    ...state.evidence.map(e => `  • ${line(e)}`)].join('\n');
+}
+export function renderCard(card) {
+  const sessions = card.activeSessionsKnown === false ? 'unknown (claude agents unavailable)'
+    : card.activeSessions.map(s => s.name).join(', ') || 'none observed';
+  return [
+    line(`CARD ${card.id} — ${card.status}${card.found ? '' : ' (not found or unreadable)'}`),
+    line(`Claim: ${card.claim.held ? 'held' : 'none observed'}${card.claim.owner ? ` by ${card.claim.owner}` : ''}; active sessions: ${sessions}`),
+    ...card.prs.map(p => renderPrState(p, `PR #${p.pr}`)), ...card.evidence.map(line),
+  ].join('\n');
 }
 export function main(argv = process.argv.slice(2)) {
   const args = argv.filter(a => a !== '--json');
@@ -22,11 +33,7 @@ export function main(argv = process.argv.slice(2)) {
       console.log(argv.includes('--json') ? JSON.stringify({ ...state, facts }, null, 2) : renderPrState(state, `PR #${facts.pr}`));
     } else {
       const card = readCardFacts(arg);
-      console.log(argv.includes('--json') ? JSON.stringify(card, null, 2) : [
-        `CARD ${card.id} — ${card.status}${card.found ? '' : ' (not found or unreadable)'}`,
-        `Claim: ${card.claim.held ? 'held' : 'none observed'}${card.claim.owner ? ` by ${card.claim.owner}` : ''}; active sessions: ${card.activeSessions.map(s => s.name).join(', ') || 'none observed'}`,
-        ...card.prs.map(p => renderPrState(p, `PR #${p.pr}`)), ...card.evidence,
-      ].join('\n'));
+      console.log(argv.includes('--json') ? JSON.stringify(card, null, 2) : renderCard(card));
     }
   } catch {
     const state = { phase: 'NEEDS-OPERATOR', headline: 'state probes unavailable', next: 'retry the state command', evidence: ['No verdict inferred from an unreadable probe'] };
