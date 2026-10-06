@@ -1,0 +1,7 @@
+{
+  "relatedMode": "import-only",
+  "testTimeoutFactor": 3,
+  "standards": "always",
+  "phaseAdmission": true,
+  "fastTargets": 5
+}

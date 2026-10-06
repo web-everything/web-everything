@@ -1232,7 +1232,7 @@ describe('verify phase telemetry (#5141)', () => {
   });
   const explicitPhases = { admissionWaitMs: expect.any(Number), gateMs: expect.any(Number),
     vitestMs: null, scanMs: null, standardsMs: null, targetFileCount: null, changedFileCount: null,
-    importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, admissionMode: 'gate', admissionPhases: null,
+    importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, settingsSource: null, admissionMode: 'gate', admissionPhases: null,
     outcomes: { vitest: { result: 'skipped' }, scan: { result: 'skipped' }, standards: { result: 'skipped' } } };
   function invoke(args) {
     const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, encoding: 'utf8' });

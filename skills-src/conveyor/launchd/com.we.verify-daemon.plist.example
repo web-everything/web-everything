@@ -36,13 +36,8 @@
 		<string>3</string>
 		<key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key>
 		<string>120000</string>
-		<!-- Select related tests by imports; skip literal-reference discovery. -->
-		<key>WE_VERIFY_RELATED</key>
-		<string>import-only</string>
-		<!-- Triple local Vitest test and hook timeouts; CI is unaffected. -->
-		<key>WE_VERIFY_TEST_TIMEOUT_FACTOR</key>
-		<string>3</string>
-		<!-- Run check:standards locally only when the diff touches standards-relevant paths; CI always runs it. -->
+		<!-- Shared defaults live in scripts/verify-settings.json in the running control clone. -->
+		<!-- Explicit override of standards=always: run locally only for standards-relevant diffs; CI always runs it. -->
 		<key>WE_VERIFY_STANDARDS</key>
 		<string>auto</string>
 		<key>WE_GITHUB_APP_ID</key>
