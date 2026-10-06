@@ -108,7 +108,7 @@ describe('collectHeavyQueue — against a REAL (temp) admission lock root, real 
         // The lock-root resolution seam isn't exposed on `collectHeavyQueue` directly, so bind the REAL
         // `admissionStatus` export to this temp root via closure — proving the real function's shape flows
         // through untouched (the injected-fakes test above already proves the row-building math independently).
-        readAdmission: (opts) => admissionStatus({ ...opts, lockRoot }),
+        readAdmission: (opts) => admissionStatus({ ...opts, lockRoot, pidLiveness: () => 'alive' }), // fake pid 222 must read as a live waiter
         readCommand: () => 'node scripts/verify-lane.mjs run --repo=.',
         isAncestor: () => true,
         readLease: () => null,
