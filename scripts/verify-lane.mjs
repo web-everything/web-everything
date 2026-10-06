@@ -539,7 +539,11 @@ const isolatedRetryMode = verifySetting('isolatedRetry', process.env);
 const phaseResults = [];
 const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
-  let result = await timedRunGate(retryableGate ? 'vitestMs' : null, retryableGate ? resolvedGate.testCommand : GATE);
+  let result = await timedRunGate(retryableGate ? 'vitestMs' : null,
+    // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (`npm test`, a skipped-vitest echo)
+    // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
+    // `GATE` stays the marker's `suites`, so the cache key still matches.
+    retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
   if (retryableGate && admission.ok && isolatedRetryMode !== 'off' && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
     // Edits during admission or test execution must also count as the change's own files.
     const changedNow = localChangedSet({ runGit: git });

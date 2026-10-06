@@ -1148,6 +1148,26 @@ process.exit(${standardsExit});
     expect(finished.suites).toBe(stamped); // the marker still names the requested gate
   });
 
+  // Item 59 (b) — the daemon's policy must also govern a recognized default gate whose test half is NOT
+  // `vitest related` (a checkout with only `npm test`): before, the stamped GATE ran verbatim, so the REQUESTER's
+  // policy ran check:standards.
+  it('applies the daemon\'s ci-only policy to a stamped always-policy default gate with a non-related test half (item 59)', () => {
+    const f = fixture();
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts: { test: 'vitest run', 'check:standards': 'true' } }));
+    execFileSync('git', ['add', 'package.json'], { cwd: dir });
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'scripts'], { cwd: dir });
+    execFileSync('git', ['branch', '-f', 'origin/main'], { cwd: dir });
+    const req = f.invoke(['request']);
+    expect(req.code, req.stdout + req.stderr).toBe(0); // always
+    const stamped = JSON.parse(readFileSync(marker(), 'utf8')).suites;
+    expect(stamped).toContain('npm test');
+    expect(stamped).toContain('check:standards');
+    const result = f.invoke([`--gate=${stamped}`, '--run-id=full-policy'], { WE_VERIFY_STANDARDS: 'ci-only' });
+    expect(result.code, result.stdout + result.stderr).toBe(0);
+    expect(f.calls().some(call => call.args[0] === 'run' && call.args[1] === 'check:standards')).toBe(false);
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).suites).toBe(stamped);
+  });
+
   // #66 (coroner-2, 2026-10-05) — a lane on an older base (no settings file) or a session without the daemon's env
   // stamps its default gate under DIFFERENT selection settings than the daemon child. Only the standards policy was
   // varied, so the stamped command went unrecognized and the run fell back to whole-gate admission
