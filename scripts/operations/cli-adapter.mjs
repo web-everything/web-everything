@@ -786,7 +786,7 @@ export function createDefaultJudge({
   logGracefulOutcome = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* best effort */ } },
 } = {}) {
   const providerName = factoryProviderName ?? 'claude';
-  return async (request) => {
+  const judge = async (request) => {
     // #xqa9ttq — A REQUEST MAY PIN ITS OWN PROVIDER (`request.providerName`), overriding this factory's. This
     // is what lets ONE run seat a tool-free Codex juror (`review-pr`'s opt-in `judgeAdvisory` seat) while its
     // OTHER judge steps stay on the factory's own provider (`claude` by default, or whatever `--provider`
@@ -912,6 +912,14 @@ export function createDefaultJudge({
     // NOT a spread of `outcome`: it also carries `argv` (which embeds the whole mandate) and the answer itself.
     // The record keeps the meter, never the material. `normalizeJudgeTelemetry` whitelists again on arrival.
     return judgeOutcome(outcome.value, judgeTelemetryFrom(outcome, effective));
+  };
+  // Card 84 — a request carrying a `seatProvider` directive (`review.seatProvider.<lens>` = agy | shadow, or the
+  // advisory agy seat) runs through the seat runner, which calls `judge` above for every Claude juror it needs.
+  // A DYNAMIC import, like `defaultProviderQuotaHold`'s: this file is loaded by lightweight CLIs that never seat one.
+  return async (request) => {
+    if (request?.seatProvider == null) return judge(request);
+    const { runSeatWithProvider } = await import('./review-seat-runner.mjs');
+    return runSeatWithProvider(request, { claudeJudge: judge, unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: cwd ?? null });
   };
 }
 

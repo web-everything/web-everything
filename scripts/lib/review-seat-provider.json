@@ -1,0 +1,13 @@
+{
+  "_howTo": "Project review-seat settings (card 84). Extends the platform flavor in review-seat-provider.mjs; set only what differs. review.seatProvider.<correctness|security> = claude | agy | shadow. Switching a seat from shadow to agy is an operator settings flip after the shadow agreement report (node scripts/lib/review-shadow-agreement.mjs --report) shows enough agreement. advisorySeats.agyCorrectness seats an advisory agy juror that never blocks.",
+  "extends": ["platform"],
+  "review": {
+    "seatProvider": {
+      "correctness": "shadow",
+      "security": "shadow"
+    },
+    "advisorySeats": {
+      "agyCorrectness": true
+    }
+  }
+}

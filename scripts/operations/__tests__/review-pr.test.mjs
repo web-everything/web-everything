@@ -162,9 +162,9 @@ function stubReader({
  *   #xqa9ttq/#x8n4crp/#3383 — forwarded to `reviewPrOperation`. All three default to `false` so every EXISTING
  *   caller of this helper keeps building today's two-seat declaration unchanged.
  */
-function registryFor(readerOptions, { codexAdvisory = false, correctnessAdvisory = false, antigravityReview = false } = {}) {
+function registryFor(readerOptions, { codexAdvisory = false, correctnessAdvisory = false, antigravityReview = false, seatSettings = null } = {}) {
   const declaration = reviewPrOperation({
-    readPr: stubReader(readerOptions), codexAdvisory, correctnessAdvisory, antigravityReview,
+    readPr: stubReader(readerOptions), codexAdvisory, correctnessAdvisory, antigravityReview, seatSettings,
   });
   const registry = createRegistry();
   registry.register(declaration);
@@ -249,6 +249,10 @@ async function driveToRecordDeclared({
 }
 
 const BASE_INPUT = { pr: 1234, repo: 'web-everything/web-everything' };
+/** Card 84 — both mandatory seats shadowed by agy, plus the advisory agy seat. */
+const AGY_SEAT_SETTINGS = Object.freeze({
+  seatProvider: { correctness: 'shadow', security: 'shadow' }, agyModel: 'claude-opus-5-5-high', agyCorrectnessAdvisory: true,
+});
 
 // ── PROPERTY 1: THE DIFF ARRIVES ON THE NET BASIS ─────────────────────────────────────────────────────────
 describe('the net basis', () => {
@@ -3063,7 +3067,7 @@ describe('#xqa9ttq — the opt-in Codex advisory seat (judgeAdvisory)', () => {
 // ── #4446 guard 4 — `gracefulOnUnavailable` is set ONLY on advisory seats ──────────────────────────────────────
 describe('#4446 — gracefulOnUnavailable implies an advisory seat; no mandatory seat ever carries it', () => {
   it('over every seat step reachable at confirm time', () => {
-    const { registry } = registryFor({}, { codexAdvisory: true, correctnessAdvisory: true, antigravityReview: true });
+    const { registry } = registryFor({}, { codexAdvisory: true, correctnessAdvisory: true, antigravityReview: true, seatSettings: AGY_SEAT_SETTINGS });
     const { requests } = atConfirm({ registry, input: BASE_INPUT, id: 'run-graceful-table' });
     const steps = Object.keys(requests);
     for (const step of [...JUDGE_STEPS, ...ADVISORY_SEAT_STEPS]) expect(steps).toContain(step);
@@ -4076,5 +4080,75 @@ describe('#5135 mandatory referrals survive advisory deferral', () => {
     const latestFix = { priorHead: null };
     expect(shapeReadFinding({ ...raw, latestFix }, { pr: 7, repo: 'o/n' }).latestFix).toBe(latestFix);
     expect(shapeReadFinding({ ...raw, latestFix: 'bad' }, { pr: 7, repo: 'o/n' }).latestFix).toBeUndefined();
+  });
+});
+
+// ── Card 84 — PER-SEAT PROVIDER (review.seatProvider.<lens>) + THE ADVISORY agy SEAT ─────────────────────────
+describe('card 84 — review.seatProvider.<lens> and the advisory agy-correctness seat', () => {
+  it('a claude seat carries no directive; a shadow/agy seat carries its mode, model and run context', () => {
+    const plain = registryFor({}, { seatSettings: { ...AGY_SEAT_SETTINGS, seatProvider: { correctness: 'claude', security: 'claude' }, agyCorrectnessAdvisory: false } });
+    const { requests: plainRequests } = atConfirm({ registry: plain.registry, input: BASE_INPUT, id: 'run-seat-claude' });
+    expect(plainRequests.judge.seatProvider).toBeUndefined();
+    expect(plainRequests.judgeSecurity.seatProvider).toBeUndefined();
+
+    const mixed = registryFor({}, { seatSettings: { ...AGY_SEAT_SETTINGS, seatProvider: { correctness: 'shadow', security: 'agy' }, agyCorrectnessAdvisory: false } });
+    const { requests } = atConfirm({ registry: mixed.registry, input: BASE_INPUT, id: 'run-seat-mixed' });
+    expect(requests.judge.seatProvider).toMatchObject({ mode: 'shadow', model: 'claude-opus-5-5-high', onEscape: 'claude', seat: 'correctness', pr: 1234 });
+    expect(requests.judgeSecurity.seatProvider).toMatchObject({ mode: 'agy', onEscape: 'claude', seat: 'security' });
+    // The Claude juror is still fully tool-bearing — the directive adds a juror, it does not weaken this one.
+    expect(requests.judge.allowedTools).toEqual(REVIEW_JUROR_TOOLS);
+  });
+
+  it('no settings at all is the pre-card declaration (no directive, no sixth seat)', () => {
+    const { declaration, registry } = registryFor({});
+    expect(declaration.steps.map((s) => s.name)).not.toContain('judgeAgyCorrectness');
+    const { requests } = atConfirm({ registry, input: BASE_INPUT, id: 'run-seat-none' });
+    expect(requests.judge.seatProvider).toBeUndefined();
+  });
+
+  it('seats the advisory agy-correctness juror: agy-only, skip on escape, never in the verdict basis', () => {
+    const { declaration, registry } = registryFor({}, { seatSettings: AGY_SEAT_SETTINGS });
+    expect(declaration.steps.map((s) => s.name)).toContain('judgeAgyCorrectness');
+    expect(ADVISORY_SEAT_STEPS).toContain('judgeAgyCorrectness');
+    const { run, requests } = atConfirm({
+      registry, input: BASE_INPUT, id: 'run-seat-agy-adv', answers: { judgeAgyCorrectness: BLOCKING_ANSWER },
+    });
+    expect(requests.judgeAgyCorrectness.seatProvider).toMatchObject({ mode: 'agy', onEscape: 'skip', model: 'claude-opus-5-5-high' });
+    expect(requests.judgeAgyCorrectness.allowedTools).toBeUndefined();
+    expect(requests.judgeAgyCorrectness.providerName).toBeUndefined();
+    // A blocker from the advisory agy seat is published, labelled, and does NOT flip the panel.
+    expect(run.findings.reduce.verdict).toBe('accept');
+    expect(run.findings.reduce.lensVerdicts['agy-correctness']).toBe('changes');
+    expect(run.findings.reduce.lensProviders['agy-correctness']).toBe('agy, advisory');
+  });
+
+  it('records the shadow result beside the verdict and never reduces the shadow findings into it', () => {
+    const { registry } = registryFor({}, { seatSettings: { ...AGY_SEAT_SETTINGS, agyCorrectnessAdvisory: false } });
+    const shadowed = {
+      ...CLEAN_ANSWER,
+      seatProvider: { provider: 'claude', shadow: 'agy' },
+      shadow: {
+        provider: 'agy', model: 'claude-opus-5-5-high', status: 'ok', reasons: [], claudeVerdict: 'accept', agyVerdict: 'changes',
+        verdictAgree: false, overlap: { claudeCount: 0, agyCount: 1, matched: 0, claudeOnly: 0, agyOnly: 1, jaccard: 0 },
+        findings: BLOCKING_ANSWER.findings, summary: 'one blocker',
+      },
+    };
+    const { run } = atConfirm({ registry, input: BASE_INPUT, id: 'run-seat-shadow', answers: { judge: shadowed } });
+    const reduce = run.findings.reduce;
+    expect(reduce.verdict).toBe('accept');
+    expect(reduce.findings).toHaveLength(0);
+    expect(reduce.shadowSeats).toEqual([expect.objectContaining({
+      step: 'judge', lens: 'correctness', status: 'ok', claudeVerdict: 'accept', agyVerdict: 'changes', verdictAgree: false,
+    })]);
+    expect(reduce.lensProviders.correctness).toBe('claude; agy shadow ok');
+  });
+
+  it('labels a mandatory seat that actually ran on agy', () => {
+    const { registry } = registryFor({}, { seatSettings: { ...AGY_SEAT_SETTINGS, seatProvider: { correctness: 'agy', security: 'claude' }, agyCorrectnessAdvisory: false } });
+    const { run } = atConfirm({
+      registry, input: BASE_INPUT, id: 'run-seat-agy', answers: { judge: { ...CLEAN_ANSWER, seatProvider: { provider: 'agy', sessionId: 'c-1' } } },
+    });
+    expect(run.findings.reduce.lensProviders.correctness).toBe('agy');
+    expect(run.findings.reduce.lensProviders.security).toBeUndefined();
   });
 });
