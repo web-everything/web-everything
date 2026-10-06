@@ -23,7 +23,8 @@
  * Optional --record-file=<path> overrides ~/workspace/.operations/coordination/codex-pilot.jsonl.
  */
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { appendFileSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -36,8 +37,16 @@ const MAX_BUFFER = 64 * 1024 * 1024;
 // The occupancy listing is fail-closed: a result that reaches this size may be truncated, so it proves nothing.
 export const OPEN_PR_LIMIT = 1000;
 // Codex can write the lane's .git/config and .git/hooks, which git status/add/commit would then execute
-// outside Codex's sandbox. Every wrapper git call pins these over any repo-local value.
+// outside Codex's sandbox. Every wrapper git call pins these over any repo-local value. Pins cannot cover a
+// clean/smudge filter driver: snapshotGitState below refuses those instead.
+// The same pins ride into every child process as GIT_CONFIG_COUNT/KEY_n/VALUE_n, which git ranks above repo
+// config, so the shared tools' own raw git calls (codex-direct-task, run.mjs, lane-pool) inherit them too.
 export const GIT_HARDENING = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.sshCommand=', '-c', 'commit.gpgSign=false', '-c', 'core.attributesFile=/dev/null'];
+const GIT_PINS = GIT_HARDENING.filter((_, i) => i % 2 === 1).map((pin) => [pin.slice(0, pin.indexOf('=')), pin.slice(pin.indexOf('=') + 1)]);
+export const GIT_HARDENING_ENV = Object.fromEntries([
+  ['GIT_CONFIG_COUNT', String(GIT_PINS.length)],
+  ...GIT_PINS.flatMap(([key, value], i) => [[`GIT_CONFIG_KEY_${i}`, key], [`GIT_CONFIG_VALUE_${i}`, value]]),
+]);
 
 // ── pure planning ─────────────────────────────────────────────────────────────
 
@@ -149,6 +158,54 @@ export function collectScopeChanges(git, baseSha) {
   return { dirty, committed };
 }
 
+// `-c` pins cannot name every code-running knob in a Codex-writable `.git` (a clean/smudge filter driver is
+// config + info/attributes; hooks and remotes are read by the shared run.mjs verify/open-pr git calls we do not
+// control). So the wrapper also fingerprints the files that can make git run code and refuses on any change.
+// `commondir`/`gitdir` redirect where git reads config, attributes and hooks from; alternates/grafts/shallow
+// redirect object lookup, so they are fingerprinted with the rest.
+const GIT_STATE_FILES = ['config', 'config.worktree', 'info/attributes', 'commondir', 'gitdir', 'objects/info/alternates', 'info/grafts', 'shallow'];
+
+function fingerprint(path, { lstat, readFile, readlink }) {
+  try {
+    const stat = lstat(path);
+    if (stat.isSymbolicLink()) return `link:${readlink(path)}`;
+    if (stat.isDirectory()) return 'dir';
+    return createHash('sha256').update(readFile(path)).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+/** Map of relative path → content fingerprint for the config, attributes and every hook under `gitDir` (null = absent). */
+export function snapshotGitState(gitDir, { lstat = lstatSync, readFile = readFileSync, readlink = readlinkSync, readDir = readdirSync } = {}) {
+  const io = { lstat, readFile, readlink };
+  const state = {};
+  for (const name of GIT_STATE_FILES) state[name] = fingerprint(join(gitDir, name), io);
+  const walk = (rel) => {
+    state[rel] = fingerprint(join(gitDir, rel), io);
+    if (state[rel] !== 'dir') return;
+    let names = [];
+    try { names = readDir(join(gitDir, rel)); } catch { return; }
+    for (const name of names) walk(`${rel}/${name}`);
+  };
+  walk('hooks');
+  return state;
+}
+
+/** Relative paths whose fingerprint differs between two snapshots (added, changed, deleted or re-linked). */
+export function diffGitState(before, after) {
+  return [...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .filter((path) => (before[path] ?? null) !== (after[path] ?? null));
+}
+
+/**
+ * Paths of gitlink (mode 160000) index entries from `git ls-files --stage -z`. A gitlink points `git status` at a
+ * nested repository whose own `.git/config` + attributes Codex can also write, and the snapshot above never sees.
+ */
+export function parseGitlinks(text) {
+  return String(text).split('\0').filter((record) => record.startsWith('160000 ')).map((record) => record.slice(record.indexOf('\t') + 1)).sort();
+}
+
 export function findScopeConflicts(openPrs, allowed) {
   return openPrs.flatMap((pr) => {
     const files = [...new Set(pr.files.map(({ path }) => path).filter((path) => isAllowed(path, allowed)))];
@@ -245,7 +302,7 @@ function errorDetail(error) {
 /** opts supplies the already parsed card/brief (composeTask fields), allowed paths and optional IO roots. */
 export function runCodexWorker(opts, {
   exec = execFileSync, now = Date.now, appendRecord = appendRunRecord,
-  log = () => {}, writeFile = writeFileSync,
+  log = () => {}, writeFile = writeFileSync, snapshotGit = snapshotGitState,
 } = {}) {
   const { cardId, title, doneWhen, allowed } = opts;
   const repoRoot = opts.repoRoot ?? REPO_ROOT;
@@ -253,12 +310,30 @@ export function runCodexWorker(opts, {
   const steps = [];
   const branch = planBranch(cardId, title);
   const prTitle = cardId != null ? `${title} (#${cardId})` : title;
-  let lane = null, changed = [], dirty = [], baseSha = null, codex = {}, pr = null, record = null;
+  let lane = null, changed = [], dirty = [], baseSha = null, codex = {}, pr = null, record = null, gitState = null, gitlinks = null;
+  let tampered = false;
   let outcome = 'pr-opened';
   const command = (cmd, args, options = {}) => exec(cmd, args, {
-    cwd: repoRoot, encoding: 'utf8', timeout: 5 * 60_000, maxBuffer: MAX_BUFFER, ...options,
+    cwd: repoRoot, encoding: 'utf8', timeout: 5 * 60_000, maxBuffer: MAX_BUFFER,
+    env: { ...process.env, ...GIT_HARDENING_ENV }, ...options,
   });
   const git = (...args) => command('git', ['-C', lane.path, ...GIT_HARDENING, ...args]);
+  // Must run BEFORE any git call that follows Codex or Codex-written tests: a planted filter, hook or remote
+  // executes inside that very call.
+  const listGitlinks = () => parseGitlinks(git('ls-files', '--stage', '-z'));
+  const assertGitIntact = () => {
+    const changedState = diffGitState(gitState, snapshotGit(join(lane.path, '.git')));
+    if (changedState.length) {
+      tampered = true;
+      throw new Error(`Lane .git state changed (hooks/config/attributes can run code): ${changedState.join(', ')}`);
+    }
+    // Only after the file check: ls-files reads the index alone, so no filter/hook/fsmonitor can run in it.
+    const added = listGitlinks().filter((path) => !gitlinks.includes(path));
+    if (added.length) {
+      tampered = true;
+      throw new Error(`Lane index gained gitlink (nested repo) entries: ${added.join(', ')}`);
+    }
+  };
   const fail = (name) => {
     if (outcome === 'pr-opened') outcome = `${['free-scope', 'scope-guard'].includes(name) ? 'refused' : 'failed'}:${name}`;
   };
@@ -301,6 +376,8 @@ export function runCodexWorker(opts, {
       // Pin the scope-guard base NOW, before Codex can touch the lane's refs: origin/main is writable by Codex.
       baseSha = String(git('rev-parse', '--verify', 'HEAD^{commit}')).trim();
       if (!/^[0-9a-f]{40}$/.test(baseSha)) throw new Error('Could not resolve the lane HEAD before running Codex');
+      gitState = snapshotGit(join(lane.path, '.git'));
+      gitlinks = listGitlinks();
       return lane.path;
     })) return;
     const taskFile = join(lane.path, '.git/codex-worker-task.md');
@@ -326,6 +403,7 @@ export function runCodexWorker(opts, {
       return detail;
     })) return;
     if (!step('scope-guard', () => {
+      assertGitIntact();
       const scope = collectScopeChanges(git, baseSha);
       dirty = scope.dirty;
       changed = [...new Set([...scope.dirty, ...scope.committed])];
@@ -352,6 +430,8 @@ export function runCodexWorker(opts, {
       return `verify green (${verdict.passed} passed)`;
     })) return;
     step('open-pr', () => {
+      // verify ran Codex-written tests in the lane, which could have planted a hook/filter since the scope guard.
+      assertGitIntact();
       const diffStat = String(git('diff', '--stat', '--no-renames', '--no-ext-diff', baseSha, 'HEAD')).trim();
       const bodyFile = join(lane.path, '.git/codex-worker-pr-body.md');
       writeFile(bodyFile, composePrBody({ cardId, title, doneWhen, allowed, diffStat, codex, steps }), 'utf8');
@@ -370,6 +450,10 @@ export function runCodexWorker(opts, {
     try {
       step('release', () => {
         if (lane?.lane == null || !lane.holder) return 'Skipped: no acquired lane identity';
+        // release runs raw `git status` in the lane, which would execute whatever Codex planted: leave it held.
+        // A failed codex step never reached assertGitIntact, so look at the files once more (no git involved).
+        if (!tampered && gitState && diffGitState(gitState, snapshotGit(join(lane.path, '.git'))).length) tampered = true;
+        if (tampered) return `Skipped: lane ${lane.lane} .git was tampered with — left held for manual inspection, NOT released`;
         command('node', ['scripts/lane-pool.mjs', 'release', `--lane=${lane.lane}`, `--session=${lane.holder}`]);
         return `Released lane ${lane.lane}`;
       });
