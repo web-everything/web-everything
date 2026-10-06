@@ -16,7 +16,8 @@ import {
   compareShadowAnswers, summarizeShadowAgreement, renderShadowReport, appendShadowRow, readShadowRows,
 } from '../../lib/review-shadow-agreement.mjs';
 import { runAgyReviewJuror, stateChangingToolCalls, changedCheckouts } from '../../lib/agy-review-juror.mjs';
-import { judgeOutcome, unwrapJudgeOutcome } from '../cli-adapter.mjs';
+import { judgeOutcome, unwrapJudgeOutcome, createDefaultJudge } from '../cli-adapter.mjs';
+import { existsSync } from 'node:fs';
 import { buildAntigravityPrompt, ANTIGRAVITY_TOOL_FREE_CORRECTION, antigravityJudgeSpawn } from '../../lib/antigravity-judge-spawn.mjs';
 
 const FINDING = { summary: 'the guard is inverted so every caller passes', file: 'scripts/x.mjs', line: 10, disposition: 'blocker' };
@@ -193,10 +194,11 @@ describe('void-on-escape — the agy juror\'s three escape checks (real git, fak
     try {
       const r = await run(fx, { act: () => writeFileSync(join(fx.lane, 'math.mjs'), 'tampered\n') });
       expect(r.status).toBe('voided');
-      expect(r.reasons.join('\n')).toContain(`change outside the juror lane: ${fx.lane}`);
+      expect(r.reasons.join('\n')).toContain('change outside the juror lane: the review lane');
+      expect(r.reasons.join('\n')).not.toContain(fx.root); // no local paths in a reason that can reach the PR
       const r2 = await run(fx, { act: () => writeFileSync(join(fx.other, 'evil.txt'), 'x') });
       expect(r2.status).toBe('voided');
-      expect(r2.reasons.join('\n')).toContain(`change outside the juror lane: ${fx.other}`);
+      expect(r2.reasons.join('\n')).toContain('change outside the juror lane: this checkout');
     } finally { fx.cleanup(); }
   });
 
@@ -280,5 +282,85 @@ describe('the agy spawn in read-cwd mode', () => {
   it('refuses a read-cwd juror with no checkout of its own, and an unknown tool policy', async () => {
     await expect(antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: {}, toolPolicy: 'read-cwd' })).rejects.toThrow(/own checkout/);
     await expect(antigravityJudgeSpawn({ mandate: 'm', input: 'i', shape: {}, toolPolicy: 'write' })).rejects.toThrow(/none\|read-cwd/);
+  });
+});
+
+describe('PR #4131 review fixes', () => {
+  it('createDefaultJudge routes a seatProvider request to the seat runner with the lane cwd; a plain request never reaches it', async () => {
+    const providerCalls = [];
+    const agyCalls = [];
+    const provider = async (r) => { providerCalls.push(r); return { value: { summary: 'claude', findings: [] }, sessionId: 'claude-s' }; };
+    const seatRunner = (request, ioArg) => runSeatWithProvider(request, {
+      ...ioArg, agyJuror: async (o) => { agyCalls.push(o); return { status: 'voided', reasons: ['x'] }; }, appendRow: () => true,
+    });
+    const judge = createDefaultJudge({ provider, cwd: '/lanes/review-lane', seatRunner });
+    // advisory agy seat: voided → skipped; Claude provider never called
+    const skipped = unwrapJudgeOutcome(await judge({ ...REQUEST, allowedTools: undefined, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'm', onEscape: 'skip' } }));
+    expect(skipped.value.skipped).toMatchObject({ provider: 'agy' });
+    expect(providerCalls).toHaveLength(0);
+    expect(agyCalls[0].laneCwd).toBe('/lanes/review-lane');
+    // shadow: Claude provider called once, without the directive
+    const shadow = unwrapJudgeOutcome(await judge({ ...REQUEST, seatProvider: { mode: 'shadow', model: 'm' } }));
+    expect(providerCalls).toHaveLength(1);
+    expect(providerCalls[0].seatProvider).toBeUndefined();
+    expect(shadow.value.shadow.status).toBe('voided');
+    // plain request: straight to the provider, no agy
+    await judge(REQUEST);
+    expect(providerCalls).toHaveLength(2);
+    expect(agyCalls).toHaveLength(2);
+  });
+
+  it('two agy wordings of one Claude finding count one match, not a perfect overlap', () => {
+    const c = compareShadowAnswers({ claude: { findings: [FINDING] }, agy: { findings: [FINDING, { ...FINDING, line: 11 }] } });
+    expect(c.overlap).toMatchObject({ matched: 1, agyOnly: 1, claudeOnly: 0, jaccard: 0.5 });
+  });
+
+  const runWith = (fx, act, transcript = '') => runAgyReviewJuror({
+    request: REQUEST, laneCwd: fx.lane, model: 'm',
+    deps: { repoRoot: fx.other, spawnJudge: async ({ cwd }) => {
+      const t = join(fx.root, 'transcript.jsonl'); writeFileSync(t, transcript); act?.(cwd);
+      return { value: { summary: 's', findings: [] }, sessionId: 'agy-1', transcriptFile: t };
+    } },
+  });
+
+  it('a further edit to an already-dirty file outside the lane still voids the seat', async () => {
+    const fx = fixtureLane();
+    try {
+      writeFileSync(join(fx.lane, 'math.mjs'), 'dirty before the run\n');
+      expect((await runWith(fx, null)).status).toBe('ok');
+      const r = await runWith(fx, () => writeFileSync(join(fx.lane, 'math.mjs'), 'edited again\n'));
+      expect(r.status).toBe('voided');
+      expect(r.reasons.join('\n')).toContain('change outside the juror lane: the review lane');
+    } finally { fx.cleanup(); }
+  });
+
+  it('a planted core.fsmonitor in a watched checkout voids the seat and is never executed by the check', async () => {
+    const fx = fixtureLane();
+    try {
+      const marker = join(fx.root, 'fsmonitor-ran');
+      const r = await runWith(fx, (cwd) => {
+        for (const dir of [cwd, fx.lane]) {
+          execFileSync('git', ['-C', dir, 'config', 'core.fsmonitor', `touch ${marker}`]);
+        }
+      });
+      expect(r.status).toBe('voided');
+      expect(r.reasons.join('\n')).toContain('juror lane git config, hooks or attributes changed');
+      expect(r.reasons.join('\n')).toContain('git config, hooks or attributes changed outside the juror lane: the review lane');
+      expect(existsSync(marker)).toBe(false);
+    } finally { fx.cleanup(); }
+  });
+
+  it('the transcript check is an allowlist: a network fetch or an unnamed tool voids; reads do not', () => {
+    expect(stateChangingToolCalls(transcriptWith([
+      { step_type: 'tool', state: 'DONE', tool_name: 'view_file' },
+      { step_type: 'tool', state: 'DONE', tool_name: 'list_dir' },
+    ]))).toEqual([]);
+    expect(stateChangingToolCalls(transcriptWith([{ step_type: 'tool', state: 'DONE', tool_name: 'read_url_content' }]))).toEqual(['read_url_content']);
+    expect(stateChangingToolCalls(transcriptWith([{ step_type: 'tool', state: 'DONE' }]))).toEqual(['<unnamed tool>']);
+    // a denied call is judged on its LAST update
+    expect(stateChangingToolCalls(transcriptWith([
+      { step_type: 'tool', step_index: 3, state: 'ACTIVE', tool_name: 'write_to_file' },
+      { step_type: 'tool', step_index: 3, state: 'DONE', status: 'TOOL_ERROR', tool_name: 'write_to_file' },
+    ]))).toEqual([]);
   });
 });

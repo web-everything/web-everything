@@ -784,6 +784,9 @@ export function createDefaultJudge({
   checkProviderHold = defaultProviderQuotaHold,
   now = () => Date.now(),
   logGracefulOutcome = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* best effort */ } },
+  // Card 84 — the seat runner a `seatProvider` request goes to. Injectable so a test drives THIS wrapper (not the
+  // runner alone) with no agy; the default is a dynamic import (see the call site).
+  seatRunner = async (...args) => (await import('./review-seat-runner.mjs')).runSeatWithProvider(...args),
 } = {}) {
   const providerName = factoryProviderName ?? 'claude';
   const judge = async (request) => {
@@ -918,8 +921,7 @@ export function createDefaultJudge({
   // A DYNAMIC import, like `defaultProviderQuotaHold`'s: this file is loaded by lightweight CLIs that never seat one.
   return async (request) => {
     if (request?.seatProvider == null) return judge(request);
-    const { runSeatWithProvider } = await import('./review-seat-runner.mjs');
-    return runSeatWithProvider(request, { claudeJudge: judge, unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: cwd ?? null });
+    return seatRunner(request, { claudeJudge: judge, unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: cwd ?? null });
   };
 }
 

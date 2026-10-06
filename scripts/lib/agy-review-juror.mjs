@@ -12,10 +12,14 @@
  *   1. ITS OWN LANE. The juror lane is a throwaway local clone of the review lane's committed HEAD (the same clone
  *      `gemini-direct-task.mjs` builds — reused, not re-implemented). A review seat is read-only, so ANY change there
  *      (a modified, added or deleted file, or a moved HEAD) voids the seat.
- *   2. OUTSIDE ITS LANE. The review lane it was cloned from and this checkout are snapshotted (HEAD + full porcelain
- *      status) before and compared after. Any difference voids the seat.
- *   3. ITS OWN TRANSCRIPT. Any write/edit/delete/command tool call that completed WITHOUT an error voids the seat,
- *      wherever it pointed — this is the check that catches a write to a path no snapshot watches.
+ *   2. OUTSIDE ITS LANE. The review lane it was cloned from and this checkout are snapshotted (HEAD, porcelain status
+ *      with ignored files, a content hash of every listed file, and fs hashes of `.git/config`, hooks and attributes)
+ *      before and compared after. Any difference voids the seat.
+ *   3. ITS OWN TRANSCRIPT. Any tool call that is not one of the read-only tools ({@link READ_ONLY_AGY_TOOLS}) and did
+ *      not end in an error voids the seat, wherever it pointed — this is the check that catches a write (or a network
+ *      fetch) to a place no snapshot watches, such as the home directory. It is an allowlist, so it fails closed.
+ * The checks never let a checkout's own git config run code: control files are compared with plain fs reads first,
+ * and git runs with fsmonitor and hooks forced off.
  *
  * A voided or failed seat returns `status: 'voided' | 'failed'` with the reasons and NO answer; the caller
  * (`we:scripts/operations/review-seat-runner.mjs`) falls back to Claude for that seat. False alarms are possible
@@ -27,8 +31,9 @@
  * Never prints a token: nothing here reads credentials; agy uses its own login.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { antigravityJudgeSpawn } from './antigravity-judge-spawn.mjs';
@@ -37,24 +42,68 @@ import { buildScratchCloneArgv, parseJsonlEvents } from '../gemini-direct-task.m
 /** This checkout — watched for outside-the-lane changes. */
 export const MODULE_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-/** A tool name that changes state. A completed (non-error) call to one voids the seat. */
-export const STATE_CHANGING_TOOL = /(write|replace|edit|delete|remove|move|rename|create|run_command|exec|shell|notebook)/i;
+/**
+ * The ONLY agy tools a read-only juror may complete (PR #4131 review: a denylist of state-changing names fails open
+ * on any tool it does not name). Any other tool step that did not end in an error — a write, a command, a network
+ * fetch, a tool with no name, a tool agy adds tomorrow — voids the seat.
+ */
+export const READ_ONLY_AGY_TOOLS = Object.freeze([
+  'view_file', 'list_dir', 'grep_search', 'find_by_name', 'view_file_outline', 'view_code_item', 'codebase_search',
+]);
 
-const defaultExec = (bin, args, opts = {}) => execFileSync(bin, args, {
-  encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, ...opts,
+/**
+ * git is run with fsmonitor and hooks forced off, so a checkout's config can never make the CHECK itself run a
+ * program (PR #4131 review: a planted `core.fsmonitor` would turn the post-run `git status` into the payload). The
+ * config/hook/attribute files are hashed with plain fs reads BEFORE any post-run git call (see {@link gitControlFiles}),
+ * and a change there voids the seat without git ever touching that checkout again.
+ */
+const SAFE_GIT = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.untrackedCache=false'];
+const defaultExec = (bin, args, opts = {}) => execFileSync(bin, bin === 'git' ? [...SAFE_GIT, ...args] : args, {
+  encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+  env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_OPTIONAL_LOCKS: '0' }, ...opts,
 });
 
 const realpathOr = (p) => { try { return realpathSync(p); } catch { return p; } };
+const sha = (buf) => createHash('sha256').update(buf).digest('hex').slice(0, 16);
+const hashFile = (path) => { try { return sha(readFileSync(path)); } catch { return null; } };
 
-/** HEAD + porcelain status of one checkout, or a marker when it cannot be read. */
-export function snapshotCheckout(dir, exec = defaultExec) {
+/**
+ * Hashes of the files that can make git run code or rewrite content: `.git/config`, every `.git/hooks/*`,
+ * `.git/info/attributes` and the top-level `.gitattributes`. Plain fs reads — no git. PURE apart from the reads.
+ */
+export function gitControlFiles(dir) {
+  const out = {};
+  for (const rel of ['.git/config', '.git/info/attributes', '.gitattributes']) out[rel] = hashFile(join(dir, rel));
+  let hooks = [];
+  try { hooks = readdirSync(join(dir, '.git', 'hooks')).sort(); } catch { hooks = []; }
+  for (const h of hooks) out[`.git/hooks/${h}`] = hashFile(join(dir, '.git', 'hooks', h));
+  return out;
+}
+
+/**
+ * HEAD + porcelain status (ignored files included) + a content hash of every file the status lists, so a further
+ * edit to an already-dirty file is still seen (PR #4131 review). `control` is checked first by the caller.
+ */
+export function snapshotCheckout(dir, exec = defaultExec, { control = gitControlFiles } = {}) {
   try {
     const head = exec('git', ['-C', dir, 'rev-parse', 'HEAD']).trim();
-    const status = exec('git', ['-C', dir, 'status', '--porcelain=v1', '--untracked-files=all', '--ignored=no']);
-    return { head, status };
+    const status = exec('git', ['-C', dir, 'status', '--porcelain=v1', '--untracked-files=all', '--ignored=traditional']);
+    const contents = {};
+    for (const line of status.split('\n').filter(Boolean)) {
+      const path = line.slice(3).replace(/^.* -> /, '').replace(/^"|"$/g, '');
+      if (!path.endsWith('/')) contents[path] = hashFile(join(dir, path));
+    }
+    return { head, status, contents, control: control(dir) };
   } catch (e) {
-    return { unreadable: String(e?.message ?? e).slice(0, 200) };
+    return { unreadable: String(e?.message ?? e).slice(0, 200), control: control(dir) };
   }
+}
+
+const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+/** Which watched checkouts' git control files changed. PURE. */
+export function changedControl(before = {}, after = {}) {
+  return Object.keys(before).filter((dir) => !sameJson(before[dir]?.control, after[dir]));
 }
 
 /** Which watched checkouts differ between two snapshots. PURE. */
@@ -63,22 +112,41 @@ export function changedCheckouts(before = {}, after = {}) {
     const a = before[dir];
     const b = after[dir];
     if (a?.unreadable) return false; // nothing to compare against — never void on our own blind spot
-    return !b || b.unreadable || a.head !== b.head || a.status !== b.status;
+    return !b || b.unreadable || a.head !== b.head || a.status !== b.status || !sameJson(a.contents, b.contents);
   });
 }
 
-/** Completed state-changing tool calls in an agy stream-json transcript. PURE. */
+/**
+ * Tool steps in an agy stream-json transcript that were NOT a read-only tool and did NOT end in an error, judged on
+ * each step's LAST update (a denied call is first ACTIVE, then an error). Fail closed: a tool step with no name counts.
+ * PURE.
+ */
 export function stateChangingToolCalls(transcriptText) {
-  const out = [];
+  const last = new Map();
+  let n = 0;
   for (const event of parseJsonlEvents(String(transcriptText ?? ''))) {
     const step = event?.event === 'step_update' ? event.step_update : null;
     if (!step || step.step_type !== 'tool') continue;
+    const key = step.step_index != null ? JSON.stringify([step.conversation_id ?? null, step.step_index]) : `#${n++}`;
+    last.set(key, step);
+  }
+  const out = [];
+  for (const step of last.values()) {
     const name = step.tool_name ?? step.tool_info?.name;
-    if (typeof name !== 'string' || !STATE_CHANGING_TOOL.test(name)) continue;
     const errored = step.status === 'TOOL_ERROR' || step.tool_info?.error != null;
-    if (step.state === 'DONE' && !errored) out.push(name);
+    if (errored) continue;
+    if (typeof name !== 'string' || !READ_ONLY_AGY_TOOLS.includes(name)) out.push(typeof name === 'string' ? name : '<unnamed tool>');
   }
   return out;
+}
+
+/** Drop local absolute paths (lanes, this checkout, the home directory) from a free-text reason. PURE. */
+export function scrubPaths(text, roots = [], home = homedir()) {
+  let out = String(text ?? '');
+  for (const r of [...roots.filter(Boolean).flatMap((x) => [x, realpathOr(x)]), home].filter(Boolean).sort((a, b) => b.length - a.length)) {
+    out = out.split(r).join('<local>');
+  }
+  return out.slice(0, 300);
 }
 
 /**
@@ -130,7 +198,11 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     const startHead = exec('git', ['-C', jurorLane, 'rev-parse', 'HEAD']).trim();
     const watched = [...new Set([resolve(laneCwd), resolve(repoRoot), ...watch.map((w) => resolve(w))])]
       .filter((d) => d !== resolve(jurorLane));
+    // Reasons name a checkout by its ROLE, never its absolute path: they reach the run record and, for a skipped
+    // advisory seat, the PR comment (PR #4131 review: no local username or lane layout there).
+    const label = (d) => (d === resolve(laneCwd) ? 'the review lane' : d === resolve(repoRoot) ? 'this checkout' : `watched checkout #${watched.indexOf(d) + 1}`);
     const before = Object.fromEntries(watched.map((d) => [d, snapshotCheckout(d, exec)]));
+    const laneControl = gitControlFiles(jurorLane);
 
     let outcome;
     let spawnError = null;
@@ -145,15 +217,24 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
 
     // The escape checks run whether the juror answered or not: an escape is evidence even from a failed run.
     const reasons = [];
-    const lane = snapshotCheckout(jurorLane, exec);
-    if (lane.unreadable) reasons.push(`juror lane unreadable after the run: ${lane.unreadable}`);
+    // Control files FIRST, by fs alone: a checkout whose git config/hooks/attributes changed is never handed to git.
+    const laneControlChanged = !sameJson(laneControl, gitControlFiles(jurorLane));
+    if (laneControlChanged) reasons.push('juror lane git config, hooks or attributes changed');
     else {
-      if (lane.head !== startHead) reasons.push(`juror lane HEAD moved (${startHead.slice(0, 12)} -> ${lane.head.slice(0, 12)})`);
-      const changed = lane.status.split('\n').filter(Boolean);
-      if (changed.length) reasons.push(`juror lane changed on a read-only seat: ${changed.slice(0, 5).join('; ')}`);
+      const lane = snapshotCheckout(jurorLane, exec);
+      if (lane.unreadable) reasons.push('juror lane unreadable after the run');
+      else {
+        if (lane.head !== startHead) reasons.push(`juror lane HEAD moved (${startHead.slice(0, 12)} -> ${lane.head.slice(0, 12)})`);
+        const changed = lane.status.split('\n').filter(Boolean);
+        if (changed.length) reasons.push(`juror lane changed on a read-only seat: ${changed.slice(0, 5).join('; ')}`);
+      }
     }
-    const after = Object.fromEntries(watched.map((d) => [d, snapshotCheckout(d, exec)]));
-    for (const dir of changedCheckouts(before, after)) reasons.push(`change outside the juror lane: ${dir}`);
+    const controlAfter = Object.fromEntries(watched.map((d) => [d, gitControlFiles(d)]));
+    const controlChanged = new Set(changedControl(before, controlAfter));
+    for (const dir of controlChanged) reasons.push(`git config, hooks or attributes changed outside the juror lane: ${label(dir)}`);
+    const after = Object.fromEntries(watched.filter((d) => !controlChanged.has(d)).map((d) => [d, snapshotCheckout(d, exec)]));
+    const comparable = Object.fromEntries(Object.entries(before).filter(([d]) => !controlChanged.has(d)));
+    for (const dir of changedCheckouts(comparable, after)) reasons.push(`change outside the juror lane: ${label(dir)}`);
     const transcriptFile = outcome?.transcriptFile ?? spawnError?.telemetry?.transcriptFile ?? null;
     if (transcriptFile) {
       let text = '';
@@ -166,7 +247,7 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
 
     const common = { sessionId: outcome?.sessionId || null, servedModel: outcome?.servedModel, transcriptFile };
     if (reasons.length) return result('voided', { ...common, reasons });
-    if (spawnError) return result('failed', { ...common, reasons: [String(spawnError.message ?? spawnError).slice(0, 500)] });
+    if (spawnError) return result('failed', { ...common, reasons: [scrubPaths(spawnError.message ?? spawnError, [jurorLane, laneCwd, repoRoot])] });
     const value = outcome.value && typeof outcome.value === 'object' ? outcome.value : {};
     return result('ok', {
       ...common,
@@ -175,7 +256,7 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
       telemetry: outcome,
     });
   } catch (e) {
-    return result('failed', { reasons: [String(e?.message ?? e).slice(0, 500)] });
+    return result('failed', { reasons: [scrubPaths(e?.message ?? e, [jurorLane, laneCwd, repoRoot])] });
   } finally {
     if (jurorLane) { try { removeDir(jurorLane); } catch { /* best effort */ } }
   }

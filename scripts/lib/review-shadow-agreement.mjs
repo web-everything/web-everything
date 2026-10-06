@@ -52,13 +52,17 @@ export function compareShadowAnswers({ claude, agy, prTable = [] }) {
   const viaPr = Array.isArray(prTable) && prTable.length
     ? { claude: bindFindingIds(claudeFindings, prTable), agy: bindFindingIds(agyFindings, prTable) }
     : null;
+  // ONE-TO-ONE: each Claude finding is matched by at most one agy finding, so two agy wordings of one Claude finding
+  // count one match and one agy-only duplicate — never an inflated overlap (PR #4131 review).
   const matchedClaude = new Set();
-  let matchedAgy = 0;
   agyFindings.forEach((_f, i) => {
     let hit = direct[i] != null ? Number(direct[i].slice(1)) : -1;
-    if (hit < 0 && viaPr && viaPr.agy[i] != null) hit = viaPr.claude.findIndex((id) => id === viaPr.agy[i]);
-    if (hit >= 0) { matchedClaude.add(hit); matchedAgy += 1; }
+    if ((hit < 0 || matchedClaude.has(hit)) && viaPr && viaPr.agy[i] != null) {
+      hit = viaPr.claude.findIndex((id, j) => id === viaPr.agy[i] && !matchedClaude.has(j));
+    }
+    if (hit >= 0 && !matchedClaude.has(hit)) matchedClaude.add(hit);
   });
+  const matchedAgy = matchedClaude.size;
   const union = claudeFindings.length + agyFindings.length - matchedAgy;
   return {
     claudeVerdict,
