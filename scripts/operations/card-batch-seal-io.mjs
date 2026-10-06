@@ -19,6 +19,9 @@ export const batchExec = (command, args, options = {}) => execFileSync(command, 
   encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: 30_000, ...options,
 });
 const readState = path => JSON.parse(readFileSync(path, 'utf8'));
+/** Hold already lifted once the seal has passed `remove-hold`; re-asserting it then would undo a verified seal. */
+const holdReleased = state => ['remove-hold', 'ready', 'label-on-green'].includes(state.seal?.step);
+const holdPending = state => Boolean(state.pr) && !state.holdApplied && !holdReleased(state);
 const kindOf = (state, path) => state.kind ?? CARD_BATCH_KINDS.find(kind => path.endsWith(`-${kind}.json`));
 
 /** Call after admission. All commands, including lane acquisition, pass through the injected runner. */
@@ -108,11 +111,17 @@ export async function publishBatch(input, opts = {}) {
     };
     mismatch = await check();
     if (mismatch) return refuse(mismatch);
-    if (!state.pr) {
+    const opened = !state.pr;
+    if (opened) {
       const pr = await open('park');
-      // Deliberately the VERY NEXT external command: park's review label alone does not hold green drafts.
-      await gh(['pr', 'edit', String(pr), '--repo', repo, '--add-label', HOLD_LABEL]);
+      // Record the PR before labelling, so a crash or label failure leaves a retry that re-asserts the hold.
       state = { ...state, pr, kind, repo };
+      save();
+    }
+    if (!state.holdApplied && !holdReleased(state)) {
+      // Park's review label alone does not hold green drafts. Adding a label is idempotent, so retry is safe.
+      await gh(['pr', 'edit', String(state.pr), '--repo', repo, '--add-label', HOLD_LABEL]);
+      state.holdApplied = true;
       save();
       checkpoint('open-draft');
     } else if (!state.sealedAt) {
@@ -131,8 +140,10 @@ export async function publishBatch(input, opts = {}) {
         try { verified = parseRunJsonTail(await run('node', [join(cwd, 'scripts/operations/run.mjs'), 'verify',
           `--checkout=${cwd}`, '--mode=run', '--json'], { timeout: 70 * 60_000 })); }
         catch (error) { verified = parseRunJsonTail(error.stdout); }
-        if (!verified?.verdict?.ok) {
-          state.sealFailure = { reason: JSON.stringify(verified?.verdict?.blocking ?? verified?.error ?? 'verify unrun'), at: new Date(now()).toISOString() };
+        // Only a parsed red verdict is terminal; a timeout, spawn error or missing verdict is unknown progress, retried by the next tick.
+        if (!verified?.verdict) throw new Error(`verify unrun: ${JSON.stringify(verified?.error ?? 'no verdict')}`);
+        if (!verified.verdict.ok) {
+          state.sealFailure = { reason: JSON.stringify(verified.verdict.blocking ?? 'verify red'), at: new Date(now()).toISOString() };
           save();
           retire();
           return { action: 'held', state };
@@ -178,7 +189,9 @@ export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_S
     if (!state.batchRef) continue;
     if (basename(stateDir) === 'sealed' && (state.sealFailure || state.seal?.step === 'label-on-green')) continue;
     const kind = kindOf(state, path);
-    if (!kind || (!state.sealedAt && planPublish({ state, kind, policy, now }).reason !== 'age')) continue;
+    // Any seal reason launches (count beats age in shouldSeal); the lease serialises the worker against inline sealing.
+    // A PR whose hold was never confirmed relaunches too, so the unheld-draft window closes without waiting for a seal.
+    if (!kind || (!state.sealedAt && !planPublish({ state, kind, policy, now }).reason && !holdPending(state))) continue;
     const child = spawn(process.execPath, [join(ROOT, 'scripts/operations/card-batch-seal-job.mjs'), `--state=${path}`],
       { cwd: ROOT, detached: true, stdio: 'ignore' });
     // Wait only for OS launch, never child completion/verification. Launch failures reach probeErrors.

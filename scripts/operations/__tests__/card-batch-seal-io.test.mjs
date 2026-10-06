@@ -116,6 +116,63 @@ it('reports asynchronous spawn failures without waiting for verification', async
   const spawn = () => ({ once(event, callback) { if (event === 'error') queueMicrotask(() => callback(Error('spawn failed'))); }, unref() {} });
   await expect(sealDueBatches({ now: 60000, stateDir: f.dir, policy: f.opts.policy, spawn })).rejects.toThrow('spawn failed');
 });
+const fakeChild = () => ({ once: vi.fn((event, callback) => { if (event === 'spawn') queueMicrotask(callback); }), unref: vi.fn() });
+it.each([
+  ['below count, past age', { maxCards: 5, now: 60000, launches: true }],
+  ['at count, past age', { maxCards: 1, now: 60000, launches: true }],
+  ['over count, past age', { maxCards: 1, members: 3, now: 60000, launches: true }],
+  ['at count, before age', { maxCards: 1, now: 1000, launches: true }],
+  ['below count, before age', { maxCards: 5, now: 1000, launches: false }],
+])('tick launches an unsealed batch that is due by any reason: %s', async (_name, { maxCards, members = 1, now, launches }) => {
+  const f = fixture({ maxCards });
+  const member = f.state.members[0];
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, members: Array.from({ length: members }, () => member) }));
+  const spawn = vi.fn(fakeChild);
+  expect(await sealDueBatches({ now, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual(launches ? [f.statePath] : []);
+});
+it.each([
+  ['a verify run that throws with no stdout (timeout / spawn error)', () => { throw Error('ETIMEDOUT'); }],
+  ['a verify run that prints no JSON', () => 'not json'],
+  ['a parsed result with no verdict', () => JSON.stringify({ error: 'lane torn down' })],
+])('treats %s as retryable, never a terminal seal failure', async (_name, unrun) => {
+  const f = fixture({ maxCards: 1 });
+  let first = true;
+  const exec = (cmd, args, options) => {
+    if (args[1] === 'verify' && first) { first = false; return unrun(); }
+    return f.exec(cmd, args, options);
+  };
+  await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow();
+  const saved = JSON.parse(readFileSync(f.statePath, 'utf8'));
+  expect(saved.sealFailure).toBeUndefined();
+  expect(saved.lastSealedState).toBeUndefined();
+  expect(f.calls.some(call => call.includes('release'))).toBe(true);
+  expect((await publishBatch(f.input, { ...f.opts, exec })).action).toBe('sealed');
+  expect(f.read().seal.step).toBe('label-on-green');
+});
+it('records the PR before labelling, and a failed label is re-asserted before anything else on retry', async () => {
+  const f = fixture({ maxCards: 5 });
+  let fail = true;
+  const exec = (cmd, args, options) => {
+    if (cmd === 'gh' && args.includes('--add-label') && fail) { fail = false; throw Error('rate limited'); }
+    return f.exec(cmd, args, options);
+  };
+  await expect(publishBatch(f.input, { ...f.opts, exec })).rejects.toThrow('rate limited');
+  expect(JSON.parse(readFileSync(f.statePath, 'utf8')).pr).toBe(9);
+  const before = f.calls.length;
+  await publishBatch(f.input, { ...f.opts, exec });
+  const retry = f.calls.slice(before).filter(call => call[0] === 'gh');
+  expect(retry[0]).toEqual(['gh', 'pr', 'edit', '9', '--repo', 'org/repo', '--add-label', HOLD_LABEL]);
+  expect(f.calls.filter(call => call.includes('--mode=park'))).toHaveLength(1);
+});
+it('tick relaunches a batch whose PR exists but whose hold was never confirmed, even if it is not yet due', async () => {
+  const f = fixture({ maxCards: 5 });
+  const state = { ...f.state, pr: 9 };
+  writeFileSync(f.statePath, JSON.stringify(state));
+  const spawn = vi.fn(fakeChild);
+  expect(await sealDueBatches({ now: 1000, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual([f.statePath]);
+  writeFileSync(f.statePath, JSON.stringify({ ...state, holdApplied: true }));
+  expect(await sealDueBatches({ now: 1000, stateDir: f.dir, policy: f.opts.policy, spawn })).toEqual([]);
+});
 it('keeps the sealed archive terminal when its job is explicitly retried', async () => {
   const f = fixture({ maxCards: 1 });
   await publishBatch(f.input, f.opts);
