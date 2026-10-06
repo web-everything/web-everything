@@ -122,7 +122,10 @@ export function gitRun(args, cwd) {
     // #x5n4zn3 — was bare (no timeout at all). Reuses `we:scripts/lib/bounded-child.mjs`'s shared budget
     // constant so a hung git (the class of hang #3383 filed this whole rollout for) fails THIS one call, never
     // the whole watchdog/branch-sync pass that calls it in a loop.
-    const stdout = execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+    const stdout = execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+      // #74c — explicit 256 MiB bound (this file is in the watchdog's minimal import graph, so it cannot import proc-read);
+      // an oversize read throws ENOBUFS -> `ok:false`, never a truncated stdout.
+      maxBuffer: 256 * 1024 * 1024 });
     return { ok: true, stdout, stderr: '' };
   } catch (e) {
     return { ok: false, stdout: e.stdout != null ? String(e.stdout) : '', stderr: e.stderr != null ? String(e.stderr) : String(e.message || e) };

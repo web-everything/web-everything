@@ -26,6 +26,7 @@
  * has this PR cost" question is a pure, script-decidable count over the PR's comments — it lives here as a pure
  * function the tick core shells, never a rule the conveyor SKILL re-derives in prose.
  */
+import { readGh } from '../lib/proc-read.mjs';
 import { resolve } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -266,7 +267,7 @@ function missingHealRouting(labels) {
 function restoreHealRouting({ pr, repo, headSha, currentHead = false }) {
   const skip = reason => ({ skipped: true, reason });
   const repoArgs = repo ? [`--repo=${repo}`] : [];
-  const gh = args => execFileSync('gh', args, {
+  const gh = args => readGh(args, {
     stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8',
     timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
   });

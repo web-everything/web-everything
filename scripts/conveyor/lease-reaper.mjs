@@ -78,6 +78,7 @@
  * RESERVED (permanent memory, #2350) leases are NEVER reaped, on every axis.
  */
 
+import { readGit } from '../lib/proc-read.mjs';
 import { parseSessionSlug } from './session-slug.mjs';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -325,7 +326,7 @@ export function laneRefAttemptTag(headRef) {
  *  fail-closed git readers (`readLease`, `fetchPrStatesForRepo`). */
 function defaultGitSymbolicRef(dir) {
   try {
-    return execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], {
+    return readGit(['symbolic-ref', '--short', 'HEAD'], {
       cwd: dir,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -362,7 +363,7 @@ export function laneBranchItemNum(dir, { git = defaultGitSymbolicRef } = {}) {
  *  failure (unreadable dir) — the caller then treats "can't confirm clean" as unknown, never as clean. */
 function defaultGitStatusPorcelain(dir) {
   try {
-    return execFileSync('git', ['status', '--porcelain'], {
+    return readGit(['status', '--porcelain'], {
       cwd: dir,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],

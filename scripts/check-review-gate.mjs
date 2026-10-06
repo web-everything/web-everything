@@ -26,7 +26,7 @@
  * Exit codes: 0 = clear (no hold label — check is green); 1 = held (a hold label is present — check is red);
  * 3 = usage error (neither --labels-json nor --pr given, or the gh fetch failed).
  */
-import { execFileSync } from 'node:child_process';
+import { readGh } from './lib/proc-read.mjs';
 import { REVIEW_HOLD_LABELS, isReviewHoldLabel } from './lib/review-escalation.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 
@@ -66,8 +66,10 @@ function main() {
   } else if (flags.pr) {
     const repoFlag = flags.repo ? ['--repo', String(flags.repo)] : [];
     try {
-      const data = JSON.parse(execFileSync('gh', ['pr', 'view', String(flags.pr), ...repoFlag, '--json', 'labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
-      labels = Array.isArray(data.labels) ? data.labels : [];
+      const data = JSON.parse(readGh(['pr', 'view', String(flags.pr), ...repoFlag, '--json', 'labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+      // Empty/oversize/malformed output is "unknown", never "no labels" (#74c): fail instead of passing the gate.
+      if (!Array.isArray(data?.labels)) throw new Error('labels missing from gh output');
+      labels = data.labels;
     } catch (e) { return fail(`could not read labels for PR ${flags.pr}: ${String(e.message || e).split('\n')[0]}`); }
   } else {
     return fail('pass --labels-json=<JSON array> or --pr=<number> [--repo=<owner/name>]');
