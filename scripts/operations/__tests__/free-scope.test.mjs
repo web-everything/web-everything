@@ -32,6 +32,32 @@ describe('free-scope core', () => {
     expect(() => registerScope([], { agent: '', files: ['x'] }, startedAt)).toThrow(TypeError);
     expect(() => registerScope([], { agent: 'x', files: [' '] }, startedAt)).toThrow(TypeError);
   });
+  it('refuses to overwrite a live same-named entry owned by another worker, and releases only its own', () => {
+    const first = registerScope([], { agent: 'fix-widget', purpose: 'a', files: ['x.mjs'], owner: 'T1' }, startedAt);
+    expect(first[0].owner).toBe('T1');
+    const soon = new Date(nowMs + 60e3).toISOString();
+    // A second worker with the same slug but its own owner token is refused, not silently replacing the first.
+    expect(() => registerScope(first, { agent: 'fix-widget', purpose: 'b', files: ['y.mjs'], owner: 'T2' }, soon)).toThrow(/fix-widget.*owner/);
+    expect(() => registerScope(first, { agent: 'fix-widget', purpose: 'b', files: ['y.mjs'] }, soon)).toThrow(/owner/);
+    expect(registerScope(first, { agent: 'fix-widget', purpose: 'a2', files: ['z.mjs'], owner: 'T1' }, soon)[0]).toMatchObject({ owner: 'T1', files: ['we:z.mjs'] });
+    // an empty owner (`--owner=$UNSET`) is the tokenless flow, consistently on register and release
+    const bare = registerScope([], { agent: 'w', purpose: 'a', files: ['x.mjs'], owner: '' }, startedAt);
+    expect(bare[0]).not.toHaveProperty('owner');
+    expect(registerScope(bare, { agent: 'w', purpose: 'a', files: ['x.mjs'], owner: '' }, soon)).toHaveLength(1);
+    expect(releaseScope(bare, 'w', '').released).toBe(1);
+    // An expired entry is no longer anyone's: a new owner may take the name.
+    const later = new Date(nowMs + 5 * 3600e3).toISOString();
+    expect(registerScope(first, { agent: 'fix-widget', purpose: 'b', files: ['y.mjs'], owner: 'T2' }, later)).toHaveLength(1);
+    // release by a different owner leaves the first worker's entry in place
+    expect(releaseScope(first, 'fix-widget', 'T2')).toEqual({ entries: first, released: 0 });
+    expect(releaseScope(first, 'fix-widget', 'T1')).toEqual({ entries: [], released: 1 });
+    // the pre-push recheck excludes only the caller's own entry when it names its owner
+    const other = registerScope([], { agent: 'fix-widget', purpose: 'a', files: ['x.mjs'], owner: 'T1' }, startedAt);
+    const seen = (excludeOwner) => assess({ files: ['we:x.mjs'], agents: other, excludeAgent: 'fix-widget', excludeOwner, nowMs: nowMs + 1 });
+    expect(seen('T2').status).toBe('occupied');
+    expect(seen('T1').status).toBe('free');
+    expect(seen(undefined).status).toBe('free');
+  });
   it('names every PR and agent holding a file, including subtrees', () => {
     const verdict = assess({ prs: [pr], agents: [agent, { ...agent, agent: 'exact', files: ['scripts/lib/x.mjs'] }] });
     expect(verdict.status).toBe('occupied');

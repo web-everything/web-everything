@@ -8,9 +8,9 @@ import { pathToFileURL } from 'node:url';
 import { assessFreeScope, formatFreeScope, parseExcludePr, partitionRegistry, registerScope, releaseScope, DEFAULT_TTL_HOURS } from './free-scope.mjs';
 import { collectFreeScope, defaultRegistryPath, readRegistry, updateRegistry } from './free-scope-io.mjs';
 const usage = `Usage: free-scope [check|register|release|list] [options]
-  --files=a,b --card=<id> --exclude-agent=<name> --exclude-pr=<n>|<repo>#<n> --json
-  register --agent=<name> --purpose=<text> (--files=a,b | --card=<id>) [--ttl-hours=N]
-  release --agent=<name>
+  --files=a,b --card=<id> --exclude-agent=<name> [--exclude-owner=<token>] --exclude-pr=<n>|<repo>#<n> --json
+  register --agent=<name> [--owner=<token>] --purpose=<text> (--files=a,b | --card=<id>) [--ttl-hours=N]
+  release --agent=<name> [--owner=<token>]
   list [--json]
   --help
 `;
@@ -21,7 +21,7 @@ export function main(argv, { env = process.env, stdout = process.stdout, stderr 
   try {
     let command = 'check', selected = false;
     const options = {};
-    const names = ['files', 'card', 'exclude-agent', 'exclude-pr', 'agent', 'purpose', 'ttl-hours'];
+    const names = ['files', 'card', 'exclude-agent', 'exclude-pr', 'agent', 'purpose', 'ttl-hours', 'owner', 'exclude-owner'];
     for (let i = 0; i < argv.length; i++) {
       const arg = argv[i];
       if (['check', 'register', 'release', 'list'].includes(arg.replace(/^--/, ''))) {
@@ -46,7 +46,7 @@ export function main(argv, { env = process.env, stdout = process.stdout, stderr 
     if (['release', 'register'].includes(command) && !options.agent?.trim()) throw new TypeError('free-scope: give --agent=<name>');
     if (command === 'release') {
       let released;
-      updateRegistry(registry, (entries) => { const result = releaseScope(entries, options.agent); released = result.released; return result.entries; });
+      updateRegistry(registry, (entries) => { const result = releaseScope(entries, options.agent, options.owner); released = result.released; return result.entries; });
       print(`released ${released}`); return 0;
     }
     const { repo: excludeRepo, number: excludePr } = parseExcludePr(options['exclude-pr']);
@@ -54,13 +54,16 @@ export function main(argv, { env = process.env, stdout = process.stdout, stderr 
     if (command === 'register' && (!Number.isFinite(ttlHours) || ttlHours <= 0)) throw new TypeError('free-scope: --ttl-hours must be positive');
     const snapshot = collect({ files: options.files ?? '', card: options.card ?? '', env, now });
     const assess = (agents) => assessFreeScope({ ...snapshot, agents,
-      excludeAgent: command === 'register' ? options.agent : options['exclude-agent'] ?? '', excludePr, excludeRepo });
+      excludeAgent: command === 'register' ? options.agent : options['exclude-agent'] ?? '',
+      // register ignores only its OWN entry; a check names its owner via --exclude-owner, else excludes every entry of that name
+      excludeOwner: command === 'register' ? options.owner ?? null : options['exclude-owner'], excludePr, excludeRepo });
     let check, registered;
     if (command === 'register') {
       updateRegistry(registry, (entries) => {
         check = assess(entries);
+        // registerScope refuses a live entry held by a different owner BEFORE anything is printed or written
+        const updated = registerScope(entries, { agent: options.agent, purpose: options.purpose ?? '', files: snapshot.files, ttlHours, owner: options.owner }, new Date(snapshot.nowMs).toISOString());
         if (!options.json) print(formatFreeScope(check));
-        const updated = registerScope(entries, { agent: options.agent, purpose: options.purpose ?? '', files: snapshot.files, ttlHours }, new Date(snapshot.nowMs).toISOString());
         registered = updated.at(-1);
         return updated;
       });

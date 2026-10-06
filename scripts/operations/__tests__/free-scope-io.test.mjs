@@ -3,12 +3,12 @@
  * @description Filesystem and CLI probes with a private registry and executable fake gh. No real host
  * or home state is read or written; fixtures exercise the same subprocess and YAML boundaries as production.
  */
-import { beforeEach, afterEach, it, expect } from 'vitest';
+import { beforeEach, afterEach, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { defaultRegistryPath, readRegistry, writeRegistry, updateRegistry, ghExec, readOpenPrs, findCardFile, readCardScope, collectFreeScope } from '../free-scope-io.mjs';
+import { defaultRegistryPath, readRegistry, writeRegistry, updateRegistry, withFileLock, ghExec, readOpenPrs, findCardFile, readCardScope, collectFreeScope } from '../free-scope-io.mjs';
 import { main } from '../free-scope-cli.mjs';
 let root, registry, env;
 const now = () => Date.parse('2026-10-05T10:00:00Z');
@@ -137,6 +137,53 @@ it('registers, checks, excludes, lists and releases via the CLI', () => {
   expect(cli(['release', '--agent=build-x']).out).toBe('released 1\n');
   expect(cli(['--release', '--agent=build-x']).code).toBe(0);
   expect(cli(['--files=x.mjs']).code).toBe(0);
+});
+it('keeps two workers that share a slug apart through owner tokens on register, recheck and release', () => {
+  expect(cli(['register', '--agent=fix-widget', '--owner=T1', '--files=x.mjs']).code).toBe(0);
+  const second = cli(['register', '--agent=fix-widget', '--owner=T2', '--files=y.mjs']);
+  expect(second.code).toBe(2);
+  expect(second.err).toMatch(/fix-widget.*owner/);
+  expect(JSON.parse(cli(['list', '--json']).out).live).toHaveLength(1);
+  // the loser's cleanup must not delete the winner's registration
+  expect(cli(['release', '--agent=fix-widget', '--owner=T2']).out).toBe('released 0\n');
+  expect(cli(['--files=x.mjs', '--exclude-agent=fix-widget', '--exclude-owner=T2']).code).toBe(1);
+  expect(cli(['--files=x.mjs', '--exclude-agent=fix-widget', '--exclude-owner=T1']).code).toBe(0);
+  expect(cli(['release', '--agent=fix-widget', '--owner=T1']).out).toBe('released 1\n');
+});
+it('does not let a second stealer remove a lock the first stealer just took', () => {
+  const lock = `${registry}.lock`;
+  fs.mkdirSync(path.dirname(registry), { recursive: true });
+  fs.mkdirSync(lock);
+  fs.utimesSync(lock, new Date(0), new Date(0));
+  let freshIno = 0, interleaved = false;
+  const realStat = fs.statSync;
+  // Worker B has just observed the stale lock; worker A then steals it and takes a fresh one before B acts on its observation.
+  const spy = vi.spyOn(fs, 'statSync').mockImplementation((p, ...rest) => {
+    const seen = realStat(p, ...rest);
+    if (!interleaved && p === lock) {
+      interleaved = true;
+      fs.rmdirSync(lock);
+      fs.mkdirSync(lock);
+      freshIno = realStat(lock).ino;
+    }
+    return seen;
+  });
+  let ran = false;
+  try { expect(() => withFileLock(registry, () => { ran = true; }, { timeoutMs: 150 })).toThrow('timed out acquiring'); }
+  finally { spy.mockRestore(); }
+  expect(ran).toBe(false);
+  expect(realStat(lock).ino).toBe(freshIno);
+  fs.rmSync(lock, { recursive: true, force: true });
+});
+it('reaps a steal guard orphaned by a crashed stealer well inside the acquire timeout', () => {
+  const lock = `${registry}.lock`;
+  fs.mkdirSync(path.dirname(registry), { recursive: true });
+  for (const dir of [lock, `${lock}.steal`]) { fs.mkdirSync(dir); fs.utimesSync(dir, new Date(0), new Date(0)); }
+  let ran = false;
+  withFileLock(registry, () => { ran = true; });
+  expect(ran).toBe(true);
+  expect(fs.existsSync(`${lock}.steal`)).toBe(false);
+  expect(fs.existsSync(lock)).toBe(false);
 });
 it('reports unknown, refuses bad usage and keeps help side effect free', () => {
   const collect = (options) => collectFreeScope({ ...options, repos: ['bad/repo'] });

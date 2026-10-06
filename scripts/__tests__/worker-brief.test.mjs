@@ -2,10 +2,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { main, renderWorkerBrief } from '../worker-brief.mjs';
 
-const params = { purpose: 'fix-widget', files: ['scripts/x.mjs', 'plateau-app:src/y.ts'] };
+const params = { purpose: 'fix-widget', files: ['scripts/x.mjs', 'plateau-app:src/y.ts'], owner: 'tok12345' };
 const files = 'we:scripts/x.mjs,plateau-app:src/y.ts';
 const defaultProof = 'Prove the change on the live case with before/after evidence (command + output), not only unit tests.';
-const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn() });
+const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
   it('renders every standard section in order and the qualified scope in commands', () => {
@@ -24,14 +24,14 @@ describe('renderWorkerBrief', () => {
     for (const text of [
       '- we:scripts/x.mjs', '- plateau-app:src/y.ts',
       `free-scope-cli.mjs check --files=${files}`,
-      `register --agent=fix-widget --purpose="fix-widget" --files=${files}`,
-      'free-scope-cli.mjs release --agent=fix-widget',
+      `register --agent=fix-widget --owner=tok12345 --purpose="fix-widget" --files=${files}`,
+      'free-scope-cli.mjs release --agent=fix-widget --owner=tok12345',
       'lane-pool.mjs acquire --purpose=fix-widget --adopt',
       'lane-pool.mjs release --lane=<N> --session=<holder slug it printed>',
       'codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=standards',
       'npm run test:unit -- <test files>', 'operations/run.mjs verify --checkout=<lane>',
       'open-pr --ref=lane/fix-widget',
-      `check --files=${files} --exclude-agent=fix-widget`,
+      `check --files=${files} --exclude-agent=fix-widget --exclude-owner=tok12345`,
       defaultProof, 'report it as PENDING', 'exact command', '10\nminutes',
       '`pkill`, `killall`', 'operator\'s dev server', 'No `--force`', 'no `--no-verify`',
       'no history rewrite', 'no `git add -A`', 'America/New_York (ET)', 'at most 8 lines',
@@ -115,6 +115,18 @@ describe('main', () => {
     deps.writeFile.mockRejectedValue(new Error('disk full'));
     expect(await main(['--purpose=ok', '--files=a', '--out=brief.md'], deps)).toBe(1);
     expect(deps.stderr.write.mock.calls.flat().join('')).toContain('disk full');
+  });
+});
+
+describe('per-dispatch owner token', () => {
+  it('mints a different token per brief by default and rejects a malformed one', () => {
+    const { owner, ...rest } = params;
+    const token = (brief) => /--owner=(\S+) --purpose/.exec(brief)[1];
+    expect(token(renderWorkerBrief(rest))).not.toBe(token(renderWorkerBrief(rest)));
+    expect(() => renderWorkerBrief({ ...rest, owner: 'bad token' })).toThrow('--owner');
+    // the same token is used to register, release and exclude yourself at the pre-push recheck
+    const brief = renderWorkerBrief({ ...rest, owner: 'abc123' });
+    expect(brief.match(/--(?:exclude-)?owner=abc123/g)).toHaveLength(3);
   });
 });
 

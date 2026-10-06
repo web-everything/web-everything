@@ -24,10 +24,15 @@ node scripts/operations/free-scope-cli.mjs check --card=<NNN or xHASH>     # use
 ## Register and release (every worker)
 
 ```bash
-node scripts/operations/free-scope-cli.mjs register --agent=<purpose> --purpose="<what>" --files=<list> [--ttl-hours=4]
-node scripts/operations/free-scope-cli.mjs release --agent=<purpose>
+node scripts/operations/free-scope-cli.mjs register --agent=<purpose> --owner=<token> --purpose="<what>" --files=<list> [--ttl-hours=4]
+node scripts/operations/free-scope-cli.mjs release --agent=<purpose> --owner=<token>
 node scripts/operations/free-scope-cli.mjs list
 ```
+
+- `--owner` is a per-dispatch token (`worker-brief.mjs` mints one). Entries are keyed by agent name, so without it two
+  workers sharing a slug would overwrite each other. With it, `register` exits `2` when a LIVE entry of that name belongs
+  to a different owner, and `release` only removes an entry whose owner matches (`released 0` otherwise). Omitting
+  `--owner` everywhere keeps the old name-only behaviour.
 
 - The registry is `~/workspace/.operations/coordination/agent-scopes.json` (override: `WE_AGENT_SCOPES_PATH`).
   Entries past their TTL are ignored and listed as stale. They are never trusted, and never deleted by the check.
@@ -37,7 +42,7 @@ node scripts/operations/free-scope-cli.mjs list
 ## Pre-push recheck
 
 Right before `open-pr`, re-run the check while excluding yourself:
-`check --files=<list> --exclude-agent=<purpose>` (and `--exclude-pr=<N>` when re-pushing your own web-everything PR; `--exclude-pr=plateau-app#<N>` for a PR in another repo, since PR numbers repeat across repos).
+`check --files=<list> --exclude-agent=<purpose> --exclude-owner=<token>` (the owner narrows the exclusion to your own entry, so a same-named worker still shows as OCCUPIED; and `--exclude-pr=<N>` when re-pushing your own web-everything PR; `--exclude-pr=plateau-app#<N>` for a PR in another repo, since PR numbers repeat across repos).
 If a repo has 200 or more open PRs, or any PR lists 100 files (the `gh` cap), the snapshot may be cut off. The verdict is `unknown`, never `free`, and every file not already held reads `UNKNOWN` (`state: "unknown"`, `free: false`) in the rows too.
 If something new holds your files, stop and report. Do not push over it.
 

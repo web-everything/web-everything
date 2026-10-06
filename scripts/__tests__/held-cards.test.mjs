@@ -65,6 +65,24 @@ describe('held cards', () => {
     expect(result.md).toContain('50. Unbolded title\n\n51. **New.** first\n    second\n    (held 2026-10-05 14:40 ET)\n    <!-- held-card: {"size":3} -->');
     expect(() => appendHeldCard('', { title: ' ' })).toThrow(TypeError);
   });
+  it('refuses a title or body that would mint a second card, a done marker or forged metadata', () => {
+    const add = (fields) => appendHeldCard(fixture, { nowEt: '2026-10-05 14:40', ...fields });
+    const injected = ['X.\n99. **Injected.** body', 'X.\r99. **Injected.**', 'X\nY'];
+    for (const title of injected) expect(() => add({ title }), JSON.stringify(title)).toThrow(/title/);
+    // a first body line that would read as a completion marker silently marks the new card done
+    for (const body of ['detail **FILED 2026-10-05 as 1, PR #9**', 'BUILT already', 'detail **BUILT**'])
+      expect(() => add({ title: 'Real', body }), body).toThrow(/marker|done/);
+    expect(() => add({ title: 'Fix **x** parser' })).toThrow(/title/);
+    expect(() => add({ title: 'Real', body: 'a\r99. **X**' })).toThrow(/bare CR/);
+    // a body line carrying its own metadata comment would shadow the real one
+    expect(() => add({ title: 'Real', body: 'a\n<!-- held-card: {"size":99} -->', meta: { size: 1 } })).toThrow(/metadata/);
+    // ordinary multi-line bodies are untouched, and the new card parses back as the only addition
+    const ok = add({ title: 'Real.', body: 'first\n1. not an item\nlast', meta: { size: 2 } });
+    const before = parseHeldCards(fixture).items.length;
+    const after = parseHeldCards(ok.md);
+    expect(after.items).toHaveLength(before + 1);
+    expect(after.items.at(-1)).toMatchObject({ num: ok.num, done: false, meta: { size: 2 } });
+  });
   it('judges load and growth independently of the unknown-growth note', () => {
     expect(quietVerdict({ load1: 1, openPrs: 4 })).toMatchObject({ quiet: true, reasons: ['no previous PR snapshot; growth unknown'] });
     expect(quietVerdict({ load1: 24.9, openPrs: 7, previous: { openPrs: 4 } })).toMatchObject({ quiet: false, reasons: ['load 24.9 ≥ 15', 'PR queue grew 4 → 7'] });

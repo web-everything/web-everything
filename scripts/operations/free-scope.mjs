@@ -50,22 +50,37 @@ export function partitionRegistry(entries, nowMs) {
   for (const entry of entries) (Number.isFinite(expiry(entry)) && expiry(entry) > nowMs ? live : stale).push(entry);
   return { live, stale };
 }
-export function registerScope(entries, { agent, purpose, files, ttlHours = DEFAULT_TTL_HOURS }, nowIso) {
+/** An absent, null or empty owner is the same thing: the tokenless legacy flow (`--owner=$UNSET` must not diverge from none). */
+const ownerOf = (owner) => owner || null;
+/**
+ * Entries are keyed by agent name, so two workers can share a slug. The optional `owner` token tells them apart:
+ * re-registering a name replaces the entry only for the SAME owner (both absent counts as the same, the legacy
+ * tokenless flow); a LIVE entry held by a different owner is refused, never silently overwritten. An expired entry
+ * belongs to no one.
+ */
+export function registerScope(entries, { agent, purpose, files, ttlHours = DEFAULT_TTL_HOURS, owner }, nowIso) {
   if (typeof agent !== 'string' || !agent.trim()) throw new TypeError('free-scope: give --agent=<name>');
   const scope = qualified(files || []);
   if (!scope.length) throw new TypeError('free-scope: give --files=a,b or --card=<id>');
   if (!Number.isFinite(ttlHours) || ttlHours <= 0) throw new TypeError('free-scope: ttlHours must be positive');
-  return [...entries.filter((e) => e.agent !== agent), { agent, purpose, files: scope, startedAt: nowIso, ttlHours }];
+  const nowMs = Date.parse(nowIso);
+  const held = entries.find((e) => e.agent === agent && ownerOf(e.owner) !== ownerOf(owner) && partitionRegistry([e], nowMs).live.length);
+  if (held) throw new TypeError(`free-scope: agent ${agent} is already registered by a different owner (since ${held.startedAt}); release it, wait for its TTL, or use a unique --agent name`);
+  return [...entries.filter((e) => e.agent !== agent), { agent, purpose, files: scope, startedAt: nowIso, ttlHours, ...(owner ? { owner } : {}) }];
 }
-export function releaseScope(entries, agent) {
-  const remaining = entries.filter((e) => e.agent !== agent);
+/** Release only entries this caller owns: a different owner's entry under the same name is left in place. */
+export function releaseScope(entries, agent, owner) {
+  const mine = (e) => e.agent === agent && ownerOf(e.owner) === ownerOf(owner);
+  const remaining = entries.filter((e) => !mine(e));
   return { entries: remaining, released: entries.length - remaining.length };
 }
 const holderName = (h) => h.type === 'pr' ? `PR #${h.number} (${h.repo})` : `agent ${h.agent}`;
-export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAgent = '', excludePr = 0, excludeRepo = DEFAULT_REPOS[0], unreadable = [] }) {
+/** `excludeOwner` narrows `excludeAgent` to the caller's own entry; left undefined, every entry of that name is excluded. */
+export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAgent = '', excludeOwner, excludePr = 0, excludeRepo = DEFAULT_REPOS[0], unreadable = [] }) {
   const scope = qualified(files || []);
   if (!scope.length) throw new TypeError('free-scope: give --files=a,b or --card=<id>');
-  const { live, stale } = partitionRegistry(agents.filter((e) => e.agent !== excludeAgent), nowMs);
+  const excluded = (e) => e.agent === excludeAgent && (excludeOwner === undefined || ownerOf(e.owner) === ownerOf(excludeOwner));
+  const { live, stale } = partitionRegistry(agents.filter((e) => !excluded(e)), nowMs);
   const candidates = [];
   for (const pr of prs) {
     if (excludePr > 0 && pr.number === excludePr && pr.repo === excludeRepo) continue;

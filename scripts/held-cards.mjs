@@ -66,12 +66,26 @@ export function parseHeldCards(md) {
 
 export function appendHeldCard(md, { title, body = '', meta = null, nowEt }) {
   if (typeof title !== 'string' || !title.trim()) throw new TypeError('title must not be empty');
-  const { nextNum: num } = parseHeldCards(md);
+  // A newline in the title would start a column-0 line, and `N. ` there reads as a second card.
+  if (/[\r\n]/.test(title.trim())) throw new TypeError('title must be a single line (no CR/LF)');
+  // parseHeldCards splits only on \r?\n; a lone CR in the body would look like a line break to other readers.
+  if (/\r(?!\n)/.test(body)) throw new TypeError('body must not contain a bare CR');
+  const { nextNum: num, items: before } = parseHeldCards(md);
   const [first, ...rest] = body.split(/\r?\n/);
   const entry = [`${num}. **${title.trim().replace(/\.$/, '')}.**${first ? ` ${first}` : ''}`,
     ...rest.map(line => `    ${line}`), `    (held ${nowEt} ET)`,
     ...(meta === null ? [] : [`    <!-- held-card: ${JSON.stringify(meta)} -->`])].join('\n');
-  return { md: `${md.trimEnd()}\n\n${entry}\n`, num };
+  const next = `${md.trimEnd()}\n\n${entry}\n`;
+  // Round-trip the result through the parser instead of guessing every hostile shape: it must read back as exactly
+  // one new, not-done card carrying exactly the metadata given (a body can otherwise forge a trailing FILED/BUILT
+  // marker on the first line, or a `held-card:` comment that shadows the real one).
+  const parsed = parseHeldCards(next).items;
+  const added = parsed.at(-1);
+  if (parsed.length !== before.length + 1 || added?.num !== num) throw new TypeError('held card would not parse back as a single new card');
+  if (added.title !== title.trim().replace(/[.:,]+$/, '').trim()) throw new TypeError('title does not survive as one bold title (stray ** in it?)');
+  if (added.done) throw new TypeError(`held card reads as a ${added.doneReason} done marker (first body line, or a FILED/BUILT line elsewhere in the list naming this number)`);
+  if (JSON.stringify(added.meta) !== JSON.stringify(meta)) throw new TypeError('held card metadata does not read back as given (a body line carrying its own held-card comment, or meta text containing "-->")');
+  return { md: next, num };
 }
 
 export function quietVerdict({ load1, openPrs, previous, maxLoad = DEFAULT_MAX_LOAD, maxPrGrowth = DEFAULT_MAX_PR_GROWTH }) {

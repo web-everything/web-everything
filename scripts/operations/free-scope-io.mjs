@@ -32,20 +32,52 @@ export function writeRegistry(file, entries) {
   try { fs.writeFileSync(temp, `${JSON.stringify({ entries }, null, 2)}\n`); fs.renameSync(temp, file); }
   finally { fs.rmSync(temp, { force: true }); }
 }
+const LOCK_STALE_MS = 30000;
+/** The steal guard is held for microseconds, so one orphaned by a crashed stealer is reaped far sooner than a lock
+ *  (and well inside withFileLock's 5s wait), instead of blocking every acquirer for the full 30s. */
+const GUARD_STALE_MS = 1000;
+const isStale = (stat, ms = LOCK_STALE_MS) => Date.now() - stat.mtimeMs > ms;
+const sameDir = (a, b) => a.ino === b.ino && a.mtimeMs === b.mtimeMs;
+/**
+ * Remove `lock` if it is STILL the abandoned lock the caller observed (`seen`). A bare stat-then-rmdir lets two
+ * waiters that both saw the stale lock each remove a directory: the second removes the fresh lock the first
+ * just took, and both then hold the "exclusive" lock. So stealers take a short-lived `<lock>.steal` guard
+ * (mkdir is atomic, one winner), then re-stat under it and require the same inode and mtime and a still-stale age
+ * before removing. A loser backs off and re-reads the lock, which by then is the winner's fresh one.
+ * A steal guard abandoned by a crashed stealer is itself reaped after GUARD_STALE_MS (the guard is only ever held
+ * for a stat and an rmdir). Reaping a guard is a best-effort rmdir; a double crash plus a simultaneous reap is the
+ * one residual window, far rarer than the crashed-holder case this lock exists for.
+ */
+export function stealStaleLock(lock, seen) {
+  const guard = `${lock}.steal`;
+  try { fs.mkdirSync(guard); }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    try { if (isStale(fs.statSync(guard), GUARD_STALE_MS)) fs.rmdirSync(guard); } catch (race) { if (race.code !== 'ENOENT') throw race; }
+    return false;
+  }
+  try {
+    const now = fs.statSync(lock);
+    if (!sameDir(now, seen) || !isStale(now)) return false;
+    fs.rmdirSync(lock);
+    return true;
+  } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  finally { fs.rmSync(guard, { recursive: true, force: true }); }
+}
 /**
  * Run `fn` while holding the exclusive `<file>.lock` directory lock, so a read-modify-write of `file` by
- * concurrent processes is serialized. A lock older than 30s is treated as abandoned and stolen.
+ * concurrent processes is serialized. A lock older than 30s is treated as abandoned and stolen (see `stealStaleLock`).
  */
-export function withFileLock(file, fn) {
+export function withFileLock(file, fn, { timeoutMs = 5000 } = {}) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const lock = `${file}.lock`, deadline = Date.now() + 5000;
+  const lock = `${file}.lock`, deadline = Date.now() + timeoutMs;
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
   let identity;
   for (;;) {
     try { fs.mkdirSync(lock); identity = fs.statSync(lock); break; }
     catch (error) {
       if (error.code !== 'EEXIST') throw error;
-      try { if (Date.now() - fs.statSync(lock).mtimeMs > 30000) { fs.rmdirSync(lock); continue; } }
+      try { const seen = fs.statSync(lock); if (isStale(seen) && stealStaleLock(lock, seen)) continue; }
       catch (race) { if (race.code !== 'ENOENT') throw race; }
       if (Date.now() >= deadline) throw new Error(`free-scope: timed out acquiring ${lock}`);
       Atomics.wait(sleeper, 0, 0, 25);

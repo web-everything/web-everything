@@ -5,6 +5,7 @@
  * The pure renderer is shared by the injectable CLI and in-process callers.
  */
 import { writeFile as defaultWriteFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 
 const DEFAULT_PROOF = 'Prove the change on the live case with before/after evidence (command + output), not only unit tests.';
@@ -15,6 +16,7 @@ const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b
   --edge-clone=<path>     Include daemon overlay and adoption instructions
   --proof=<text>          Override the live before/after proof requirement
   --repo=we|plateau-app   Lane repository (default: we)
+  --owner=<token>         Scope-registry owner token (default: fresh per brief, so two workers with one slug stay apart)
   --report-lines=N        Positive report line limit (default: 8)
   --out=<path>            Write the brief to a file instead of stdout
   --help                 Print this usage
@@ -29,9 +31,12 @@ const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b
  * @param {string} [params.proof]
  * @param {'we'|'plateau-app'} [params.repo]
  * @param {number} [params.reportLines]
+ * @param {string} [params.owner] Registry owner token; the default is minted per call (per dispatch), which is what
+ *   keeps a re-dispatch or a generic slug from colliding with another live worker's registration.
  * @returns {string} Markdown with a trailing newline.
  */
-export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_PROOF, repo = 'we', reportLines = 8 } = {}) {
+export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_PROOF, repo = 'we', reportLines = 8, owner = randomUUID().slice(0, 8) } = {}) {
+  if (typeof owner !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(owner)) throw new Error('--owner must be an alphanumeric token.');
   if (typeof purpose !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(purpose)) {
     throw new Error('--purpose must be a lowercase slug ([a-z0-9][a-z0-9-]*).');
   }
@@ -62,8 +67,10 @@ Anything else is out of scope: stop and report.
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList}\`.
    If any file is OCCUPIED (an open PR or a running agent holds it), stop and report who holds it. Do not start.
    If the verdict is UNKNOWN (exit 2: a PR list was cut off or unreadable), the scope is NOT proven free: stop and report it. Do not start.
-2. **Register your scope.** \`node scripts/operations/free-scope-cli.mjs register --agent=${purpose} --purpose="${purpose}" --files=${commaList}\`.
-   Release it when you finish, succeed or fail: \`node scripts/operations/free-scope-cli.mjs release --agent=${purpose}\`.
+2. **Register your scope.** \`node scripts/operations/free-scope-cli.mjs register --agent=${purpose} --owner=${owner} --purpose="${purpose}" --files=${commaList}\`.
+   The \`--owner\` token is yours alone: if register refuses because the name is held by a different owner, another live worker
+   shares your slug. Stop and report; never release or overwrite their entry.
+   Release it when you finish, succeed or fail: \`node scripts/operations/free-scope-cli.mjs release --agent=${purpose} --owner=${owner}\`.
 3. **Lane.** \`node scripts/lane-pool.mjs acquire --purpose=${purpose} --adopt${laneRepo}\` (for plateau-app add \`--repo=<plateau-app checkout>\`).
    Work only in the lane path it prints. Never branch or edit the primary checkout. Release the lane at the end:
    \`node scripts/lane-pool.mjs release --lane=<N> --session=<holder slug it printed>\`.
@@ -77,7 +84,7 @@ Anything else is out of scope: stop and report.
    \`node scripts/operations/run.mjs verify --checkout=<lane>\`, then open exactly one PR:
    \`node scripts/operations/run.mjs open-pr --ref=lane/${purpose} --title="<title>" --bodyFile=<path> --json\`.
 7. **Pre-push recheck.** Right before open-pr, re-run the free-scope check excluding yourself:
-   \`node scripts/operations/free-scope-cli.mjs check --files=${commaList} --exclude-agent=${purpose}\`.
+   \`node scripts/operations/free-scope-cli.mjs check --files=${commaList} --exclude-agent=${purpose} --exclude-owner=${owner}\`.
    If something new holds your files (OCCUPIED), or the verdict is UNKNOWN (exit 2), stop and report instead of pushing.
 ${edge}
 **Proof.** ${proof}
@@ -100,8 +107,9 @@ with its check command.
 }
 
 /** Run the CLI with injectable writable streams and an async or sync file writer. */
-export async function main(argv, { stdout = process.stdout, stderr = process.stderr, writeFile = defaultWriteFile } = {}) {
-  const flags = new Set(['purpose', 'files', 'edge-clone', 'proof', 'repo', 'report-lines', 'out']);
+export async function main(argv, { stdout = process.stdout, stderr = process.stderr, writeFile = defaultWriteFile,
+  newOwner = () => randomUUID().slice(0, 8) } = {}) {
+  const flags = new Set(['purpose', 'files', 'edge-clone', 'proof', 'repo', 'report-lines', 'out', 'owner']);
   const options = {};
   let brief;
   try {
@@ -115,7 +123,7 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
     if (options.help) { stdout.write(USAGE); return 0; }
     brief = renderWorkerBrief({
       purpose: options.purpose, files: options.files, edgeClone: options['edge-clone'],
-      proof: options.proof, repo: options.repo,
+      proof: options.proof, repo: options.repo, owner: options.owner ?? newOwner(),
       reportLines: options['report-lines'] === undefined ? 8 : Number(options['report-lines']),
     });
   } catch (error) {
