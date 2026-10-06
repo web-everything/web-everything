@@ -111,6 +111,48 @@ describe('`denied` is agent-supplied free text — sanitized at the single write
     expect(sanitizeDeniedCommand(out)).toBe(out);
   });
 
+  // PR #3990 review round 6 (codex-correctness, CONFIRMED): a shell word is a CONCATENATION of quoted and bare
+  // segments, and redaction stopped at the first one (`--password="prefix"'sensitiveSuffix'` kept the tail).
+  // Matrix of segment-order × quoting × flag form; the whole shell word must go, never one fragment of it.
+  const MID = 'middlefragment';
+  it.each([
+    ['double then single (the reviewed repro)', `tool --password="${PREFIX}"'${TAIL}' go`],
+    ['single then double', `tool --password='${PREFIX}'"${TAIL}" go`],
+    ['double then bare', `tool --password="${PREFIX}"${TAIL} go`],
+    ['bare then double', `tool --password=${PREFIX}"${TAIL}" go`],
+    ['bare then single', `tool --password=${PREFIX}'${TAIL}' go`],
+    ['three segments', `tool --password="${PREFIX}"'${MID}'${TAIL} go`],
+    ['four segments, quote kinds alternating', `tool --password="${PREFIX}"'${MID}'"x"${TAIL} go`],
+    ['space-separated flag value', `tool --password "${PREFIX}"'${TAIL}' go`],
+    ['env assignment', `API_TOKEN="${PREFIX}"'${TAIL}' node run.mjs`],
+    ['--token flag with a bare tail', `tool --token '${PREFIX}'${TAIL} go`],
+    ['concatenated with escaped quotes inside a segment', `tool --password="${PREFIX}\\""'${TAIL}' go`],
+    ['Bearer scheme', `curl -H "Authorization: Bearer ${PREFIX}"'${TAIL}' https://x`],
+    ['password: key', `tool password: "${PREFIX}"'${TAIL}' go`],
+    ['unterminated last segment', `tool --password="${PREFIX}"'${TAIL}`],
+  ])('redacts every segment of a concatenated shell secret: %s', (_label, input) => {
+    const out = denied(input);
+    expect(out).not.toContain(PREFIX);
+    expect(out).not.toContain(MID);
+    expect(out).not.toContain(TAIL);
+    expect(out).toContain('[redacted]');
+    expect(sanitizeDeniedCommand(out)).toBe(out);
+  });
+
+  it('keeps the arguments AFTER a concatenated secret readable', () => {
+    const out = denied(`node run.mjs --token="${PREFIX}"'${TAIL}' --verbose`);
+    expect(out).toContain('node run.mjs');
+    expect(out).toContain('--verbose');
+  });
+
+  it('is linear-time on a long run of concatenated segments (no nested-quantifier blow-up)', () => {
+    const t0 = Date.now();
+    sanitizeDeniedCommand(`--password=${'"a"\'b\''.repeat(300)}`);
+    sanitizeDeniedCommand(`--password=${'a'.repeat(1900)}!`);
+    sanitizeDeniedCommand(`API_TOKEN=${'"'.repeat(1900)}`);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
   it('still keeps the arguments AFTER an escaped-quote secret readable', () => {
     expect(denied(`node run.mjs --token="${PREFIX}\\"${TAIL}" --verbose`)).toContain('--verbose');
   });

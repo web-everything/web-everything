@@ -109,8 +109,13 @@ const DENIED_SCAN_LIMIT = 2000;
  * (`--password="a\"b"`) does not end the value early and leave its tail visible (round 4). Every alternative
  * starts on a different character, so matching never backtracks; the input is also bounded by
  * {@link DENIED_SCAN_LIMIT}.
+ *
+ * A shell WORD is a concatenation of such segments (`--password="pre"'mid'tail` is ONE argument), so the value is
+ * one-or-more segments back to back, up to the next unquoted whitespace (round 6). The bare segment is a SINGLE
+ * character (or backslash pair) under the outer `+`, never a nested `(?:…+)+` run, so every position has exactly
+ * one way to match and the scan stays linear.
  */
-const SECRET_VALUE = `(?:"(?:\\\\.|[^"\\\\])*"?|'(?:\\\\.|[^'\\\\])*'?|(?:\\\\.|[^\\s"'\\\\])+)`;
+const SECRET_VALUE = `(?:"(?:\\\\.|[^"\\\\])*"?|'(?:\\\\.|[^'\\\\])*'?|\\\\.|[^\\s"'\\\\])+`;
 
 /**
  * we:scripts/operations/completion-record.mjs#sanitizeDeniedCommand — `denied` is agent-supplied free text (a
