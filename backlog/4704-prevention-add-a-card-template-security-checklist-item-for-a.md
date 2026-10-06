@@ -3,9 +3,10 @@ bornAs: x2b8ziv
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: active
 scope: ["we:scripts/backlog/scaffold.mjs", "we:scripts/backlog/__tests__/scaffold.test.mjs", "we:backlog/2776-owner-review-triage-screen-for-feedback-suggestions.md"]
 dateOpened: "2026-10-02"
+dateStarted: "2026-10-06"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "8a4b96161632caafcc5da32b896d16e3758787ec"
 tags: []
@@ -20,6 +21,12 @@ Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outsta
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#3555@e974a229d79cf04905ad54d9e5f3712ec6d37b64
 
 ## Progress
+
+Delivery sanity read (2026-10-06): before implementation, the shared renderer and the feedback port test-plan stub still omitted the four security prompts; the spec was coherent and not already implemented. Added generated-output regression coverage for all four supported card kinds before changing the renderer. Delivery is limited to authoring guidance and future test obligations, not endpoint hardening.
+
+- Red proof: `npx vitest run we:scripts/backlog/__tests__/scaffold.test.mjs` against the unchanged renderer produced 4 missing-hint failures (story, epic, task, decision) and 14 passes; existing metadata and acceptance assertions passed before the missing-hint assertion.
+- Added the conditional four-part authoring hint beside the verbatim guard-relaxation hint. Extended the existing proposed port suite's test-plan bullet with body-size boundaries (including streams), rate-budget boundaries, origin/CSRF cases, reset/wakeup abuse and unchanged stored state on rejection; retained its prior cases. No endpoint controls or proposed Plateau tests are implemented by this item.
+- Green proof: the same scoped Vitest command passed all 18 tests after the renderer edit. Rendered a task skeleton in memory and inspected its metadata, executable TODO, unchanged guard hint and conditional security hint; no backlog card was generated. Direct content review confirmed all four port obligations, explicit transport-specific non-applicability, rejection/state preservation and retention of existing cases. The proposed Plateau tests were not run. `npm run check:standards` is deferred to the wrapper because the delivery brief prohibits agent-run gates; edits remain uncommitted for the wrapper.
 
 Preparation inspected the current checkout; no delivery or endpoint-security proof is claimed.
 

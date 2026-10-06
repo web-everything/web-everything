@@ -110,6 +110,8 @@ export function renderItem(spec) {
   // implementing lane to invent at review time (docs/agent/backlog-workflow.md → the determinism
   // ladder). Emits one `**Executable**` TODO line; the author fills in a real tier-1 command, or drops
   // to tier-2/3 (or an explicit "why not" line) when no command applies.
-  const doneWhen = '## Done when\n\n1. **Executable** — TODO: a command that fails before this item lands and passes after.\n\n' + `${GUARD_RELAXATION_HINT}\n`;
+  const doneWhen = '## Done when\n\n1. **Executable** — TODO: a command that fails before this item lands and passes after.\n\n'
+    + `${GUARD_RELAXATION_HINT}\n\n`
+    + 'Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.\n';
   return `${fm.join('\n')}\n# ${title}\n\n${lead}\n\n${doneWhen}`;
 }

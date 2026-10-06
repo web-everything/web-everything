@@ -86,3 +86,43 @@ describe('renderItem — guard-relaxation hint (#4409)', () => {
     expect(out.indexOf('## Done when')).toBeLessThan(out.indexOf(GUARD_RELAXATION_HINT));
   });
 });
+
+describe('renderItem — conditional endpoint-security guidance (#4704)', () => {
+  it.each([
+    ['story', 3, undefined],
+    ['epic', 5, undefined],
+    ['task', undefined, undefined],
+    ['decision', undefined, 'author-session'],
+  ])('preserves %s metadata and acceptance guidance', (kind, size, scaffoldedBy) => {
+    const out = renderItem({
+      kind, size, scaffoldedBy, title: 'Example', today: '2026-10-06',
+      parent: '4075', blockedBy: ['2774'], digest: 'Example digest.',
+      scope: [' we:example ', 'we:example'],
+    });
+    const metadata = [
+      '---', `kind: ${kind}`,
+      ...(size === undefined ? [] : [`size: ${size}`]),
+      'parent: "4075"',
+      ...(scaffoldedBy
+        ? ['status: active', 'scaffoldedBy: "author-session"', 'dateScaffolded: "2026-10-06"']
+        : ['status: open']),
+      'blockedBy: ["2774"]', 'scope: ["we:example"]',
+      'dateOpened: "2026-10-06"', 'tags: []', '---',
+    ].join('\n');
+    expect(out.split('\n\n# ')[0]).toBe(metadata);
+    expect(out).toContain('# Example\n\nExample digest.\n\n## Done when\n\n');
+    expect(out).toContain('1. **Executable** — TODO: a command that fails before this item lands and passes after.');
+    const guardHint = 'Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.';
+    expect(out).toContain(guardHint);
+
+    const securityHint = out.split('\n').find((line) => line.startsWith('Hint: For any receive or write endpoint,'));
+    expect(securityHint).toBeDefined();
+    for (const obligation of [
+      'specify the body-size cap', 'rate limit', 'CSRF/origin check',
+      'protection against abuse of state-resetting triggers',
+      'mirror each in the port test plan, or explain why it does not apply',
+    ]) expect(securityHint).toContain(obligation);
+    expect(out.indexOf('## Done when')).toBeLessThan(out.indexOf(securityHint));
+    expect(out).toContain(`${guardHint}\n\n${securityHint}\n`);
+  });
+});
