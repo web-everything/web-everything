@@ -15,7 +15,7 @@ import {
   ADMISSION_LEASE_MINUTES, resolveCap, resolveTimeoutMs, resolveCeilingMs, isAdmissionOff, slotPath,
   tryAcquireSlot, releaseOwnedSlot, heldSlots, probeSlotHolderLiveness,
   markWaiting, clearWaiting, listWaiting,
-  acquireSlotBlocking, admissionStatus, isOldestLiveWaiter,
+  acquireSlotBlocking, admissionStatus, isOldestLiveWaiter, isDeadOwnerWaiter,
   runUnderAdmission, shellQuoteWord,
   WAITING_TTL_MINUTES, ADMISSION_HELD_ENV, classifyWaiter, reapStaleWaiters, reapHistory, waiterRepo,
   admissionBypassReason, poolRootOf, admittedArgv, admittedShellCommand, HEAVY_ADMISSION_CLI,
@@ -676,6 +676,68 @@ describe('stale-waiter reap (xaipsbs)', () => {
     expect(listWaiting(lockRoot).map((w) => w.owner)).toEqual(['fresh']);
     expect(reapHistory(lockRoot)).toMatchObject({ count: 1, last: { owner: '/gone/lane-9', reason: 'no-lease' } });
     expect(admissionStatus({ lockRoot, cap: 1, nowMs: T0 })).toMatchObject({ staleWaiting: 0, reaped: { count: 1 } });
+  });
+
+  it('reaps a ten-second-old dead owner immediately and omits it from status waiting', () => {
+    markWaiting({ lockRoot, owner: 'CRASHED', pid: 4141, nowIso: iso(T0 - 10_000) });
+    const seams = { pidLiveness: () => 'dead' };
+    expect(reapStaleWaiters({ lockRoot, nowMs: T0, ...seams })).toMatchObject({
+      reaped: [{ owner: 'CRASHED', reason: 'pid-dead' }], kept: [],
+    });
+    expect(admissionStatus({ lockRoot, cap: 1, nowMs: T0, ...seams })).toMatchObject({
+      waiting: [], staleWaiting: 1,
+    });
+    expect(listWaiting(lockRoot)).toHaveLength(1); // preview remains read-only
+    reapStaleWaiters({ lockRoot, nowMs: T0, apply: true, ...seams });
+    expect(listWaiting(lockRoot)).toEqual([]);
+    expect(reapHistory(lockRoot)).toMatchObject({ count: 1, last: { owner: 'CRASHED', reason: 'pid-dead' } });
+  });
+
+  it.each(['alive', 'unknown'])('keeps a fresh owner whose pid is %s', (liveness) => {
+    markWaiting({ lockRoot, owner: '/p/lane-1', pid: 4141, nowIso: iso(T0 - 10_000) });
+    const seams = { pidLiveness: () => liveness, readLease: () => null };
+    expect(reapStaleWaiters({ lockRoot, nowMs: T0, apply: true, ...seams })).toMatchObject({
+      reaped: [], kept: [{ owner: '/p/lane-1', reason: 'fresh' }],
+    });
+    expect(listWaiting(lockRoot)).toHaveLength(1);
+    expect(admissionStatus({ lockRoot, cap: 1, nowMs: T0, ...seams }).waiting).toHaveLength(1);
+  });
+
+  it('requires an integer pid on this host or a legacy marker with no host to prove death', () => {
+    const seams = { host: 'here', pidLiveness: () => 'dead' };
+    expect(isDeadOwnerWaiter({ pid: 4141, host: 'here' }, seams)).toBe(true);
+    expect(isDeadOwnerWaiter({ pid: 4141 }, seams)).toBe(true);
+    for (const marker of [null, {}, { pid: '4141' }, { pid: 1.5 }, { pid: 4141, host: 'elsewhere' }]) {
+      expect(isDeadOwnerWaiter(marker, seams)).toBe(false);
+    }
+    for (const liveness of ['alive', 'unknown']) {
+      expect(isDeadOwnerWaiter({ pid: 4141 }, { pidLiveness: () => liveness })).toBe(false);
+    }
+  });
+
+  it('a blocked poll reaps a dead marker that appears mid-wait while preserving live waiters', async () => {
+    tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0) });
+    let clock = T0;
+    let polls = 0;
+    const result = await acquireSlotBlocking({
+      lockRoot, cap: 1, owner: 'REAL', pollMs: 1000, ceilingMs: 5000, env: {},
+      now: () => clock, pidLiveness: (pid) => pid === 4141 ? 'dead' : 'alive',
+      sleep: async (ms) => {
+        clock += ms;
+        polls += 1;
+        if (polls === 1) {
+          markWaiting({ lockRoot, owner: 'CRASHED', pid: 4141, nowIso: iso(clock) });
+          expect(listWaiting(lockRoot).map((m) => m.owner)).toContain('CRASHED');
+        } else {
+          expect(listWaiting(lockRoot).map((m) => m.owner)).toEqual(['REAL']);
+          expect(reapHistory(lockRoot)).toMatchObject({ count: 1, last: { owner: 'CRASHED', reason: 'pid-dead' } });
+          releaseOwnedSlot({ lockRoot, cap: 1, owner: 'HOLDER' });
+        }
+      },
+    });
+    expect(polls).toBe(2);
+    expect(result).toMatchObject({ ok: true, waitedMs: 2000 });
+    expect(listWaiting(lockRoot)).toEqual([]);
   });
 
   it('the next admission attempt reaps (real lease read: a lane path with no lease marker)', async () => {
