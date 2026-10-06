@@ -268,7 +268,8 @@ describe('realSleep — regression, live-caught on the sibling #3870/#3876 daemo
 describe('spawnPassOnce — env passthrough to the child process (#gh-write-burst)', () => {
   const fakeChild = () => {
     const emitter = new EventEmitter();
-    setImmediate(() => emitter.emit('exit', 0, null));
+    // A real ChildProcess emits 'close' once stdio is drained, right after 'exit'; spawnPassOnce finishes on 'close'.
+    setImmediate(() => { emitter.emit('exit', 0, null); emitter.emit('close', 0, null); });
     return emitter;
   };
 
