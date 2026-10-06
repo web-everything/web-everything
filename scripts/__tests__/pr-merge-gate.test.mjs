@@ -6,7 +6,7 @@
  *   a loud audit line). The gh shell is injected (never actually called).
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mergePr, assertMayMerge, buildGateMergeArgs, mergeMethodFlag, hasNonEmptyBody, isTestPath, parseUnifiedDiff, scanTestTampering, buildStackedPrListArgs, buildRetargetArgs, retargetStackedPrs, describeStackedTestGamingOrigin } from '../lib/pr-merge-gate.mjs';
+import { mergePr, assertMayMerge, buildGateMergeArgs, decideDeleteBranch, mergeMethodFlag, hasNonEmptyBody, isTestPath, parseUnifiedDiff, scanTestTampering, buildStackedPrListArgs, buildRetargetArgs, retargetStackedPrs, describeStackedTestGamingOrigin } from '../lib/pr-merge-gate.mjs';
 
 // A capturing fake gh exec + a capturing stderr sink, so nothing shells out and the audit line is observable.
 const fakeExec = () => { const calls = []; const exec = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { ok: true }; }; return { exec, calls }; };
@@ -48,6 +48,43 @@ describe('pr-merge-gate — buildGateMergeArgs (mirrors the merge-ai-prs inline 
     const { exec, calls } = fakeExec();
     mergePr({ pr: 5, repo: null, method: 'merge', matchHeadCommit: 'cafef00d', caller: 'drain', exec, env: {} });
     expect(calls[0].args).toEqual(['pr', 'merge', '5', '--merge', '--delete-branch', '--match-head-commit', 'cafef00d']);
+  });
+  it('omits --delete-branch when false while retaining --match-head-commit', () => {
+    expect(buildGateMergeArgs({ pr: 12, deleteBranch: false, matchHeadCommit: 'abc1234' }))
+      .toEqual(['pr', 'merge', '12', '--merge', '--match-head-commit', 'abc1234']);
+  });
+  it('keeps default argv unchanged with deletion omitted or explicitly true', () => {
+    for (const options of [{}, { deleteBranch: undefined }, { deleteBranch: true }]) {
+      expect(buildGateMergeArgs({ pr: 7, repo: 'frontier-ui/frontierui', method: 'squash', matchHeadCommit: 'deadbeef', ...options }))
+        .toEqual(['pr', 'merge', '7', '--repo', 'frontier-ui/frontierui', '--squash', '--delete-branch', '--match-head-commit', 'deadbeef']);
+    }
+  });
+  it('mergePr passes deleteBranch false through while retaining matchHeadCommit', () => {
+    const { exec, calls } = fakeExec();
+    mergePr({ pr: 5, deleteBranch: false, matchHeadCommit: 'cafef00d', caller: 'drain', exec, env: {} });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args).toEqual(['pr', 'merge', '5', '--merge', '--match-head-commit', 'cafef00d']);
+  });
+});
+
+describe('pr-merge-gate — decideDeleteBranch', () => {
+  it('preserves the branch when one retarget failed', () => {
+    expect(decideDeleteBranch({ retarget: { retargeted: [11], failed: [12] } })).toBe(false);
+  });
+  it('allows deletion when no retarget failed', () => {
+    expect(decideDeleteBranch({ retarget: { retargeted: [11], failed: [] } })).toBe(true);
+  });
+  it('allows deletion for undefined or empty inputs', () => {
+    expect(decideDeleteBranch()).toBe(true);
+    expect(decideDeleteBranch(undefined)).toBe(true);
+    expect(decideDeleteBranch({})).toBe(true);
+    expect(decideDeleteBranch({ retarget: undefined })).toBe(true);
+    expect(decideDeleteBranch({ retarget: {} })).toBe(true);
+  });
+  it('allows deletion when failures are not an array', () => {
+    expect(decideDeleteBranch({ retarget: null })).toBe(true);
+    expect(decideDeleteBranch({ retarget: { failed: 'failure' } })).toBe(true);
+    expect(decideDeleteBranch({ retarget: { failed: { length: 1 } } })).toBe(true);
   });
 });
 
