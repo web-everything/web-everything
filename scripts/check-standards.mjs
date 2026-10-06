@@ -1032,9 +1032,7 @@ mark("6d-quinquies. Unquoted-colon scalar in frontmatter (#453)");
   const changedScopeCards = new Set(scopeChanges.changedFiles.filter((f) =>
     f.startsWith('backlog/') && f.endsWith('.md') && !scopeChanges.deletedFiles.includes(f)
     && (!LOCAL_FILES || LOCAL_FILES.has(f))));
-  // #70d — every finding below is about ONE card's own raw frontmatter/body, so `scopedReaddir` narrows the
-  // loop to the lane's own cards under `--local --files=…`; unchanged (every card) otherwise.
-  for (const file of scopedReaddir('backlog/', ['.md'])) {
+  for (const file of readdirSync(join(ROOT, 'backlog')).filter((f) => f.endsWith('.md'))) {
     let raw, body = '';
     try { const fm = matterFm(readFileSync(join(ROOT, 'backlog', file), 'utf8')); raw = fm.data; body = fm.content; }
     catch { continue; } // a malformed-YAML item is already reported by the frontmatter-parse scan above
