@@ -652,19 +652,103 @@ describe('freeLaneNumbers', () => {
   });
 });
 
-describe('dispatchFix — the composition: plan → fill → mint → spawn', () => {
-  it('spawns exactly once, with a freshly minted session id, the assigned lane, and the filled brief as the prompt', () => {
+describe('dispatchFix — permission preparation never blocks a dispatch (PR #3990 review)', () => {
+  it('still spawns exactly once when grantConflictHelper THROWS (a failing settings write must not abort the fix)', () => {
     const calls = [];
+    const grantConflictHelper = vi.fn(() => { throw new Error('EACCES: settings.local.json is read-only'); });
     const result = dispatchFix(
       { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:scripts/conveyor/reconcile-fix-dispatch.mjs'], lane: 9 },
       {
         root: '/repo',
+        grantConflictHelper,
+        readBrief: () => REAL_TEMPLATE_STUB,
+        mintSessionId: () => '22222222-2222-4222-8222-222222222222',
+        spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
+      },
+    );
+    expect(grantConflictHelper).toHaveBeenCalledTimes(1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].opts.cwd).toBe(dispatchSessionCwd('22222222-2222-4222-8222-222222222222', { root: '/repo' }));
+    expect(result.sessionId).toBe('22222222-2222-4222-8222-222222222222');
+  });
+});
+
+describe('dispatchFix — the DEFAULT conflict-helper grant really lands on disk (PR #3990 review round 6)', () => {
+  // Every other dispatchFix test injects a mock `grantConflictHelper`, so dropping the default grant — or letting
+  // the later default `isolateSession` write clobber it — would leave them all green while every fixer hit the
+  // permission wall. This one runs the real defaults against a real tmpdir and reads the file back.
+  const dispatchIntoTmp = async (seed) => {
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const scratch = mkdtempSync(join(tmpdir(), 'fix-helper-grant-'));
+    const sessionId = '33333333-3333-4333-8333-333333333333';
+    const cwd = join(scratch, sessionId);
+    if (seed) { mkdirSync(join(cwd, '.claude'), { recursive: true }); writeFileSync(join(cwd, '.claude', 'settings.local.json'), seed); }
+    const calls = [];
+    dispatchFix(
+      { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:scripts/conveyor/reconcile-fix-dispatch.mjs'], lane: 9 },
+      {
+        root: '/repo',
+        readBrief: () => REAL_TEMPLATE_STUB,
+        mintSessionId: () => sessionId,
+        sessionCwdFor: () => cwd,
+        // The default would grant trust in the operator's real `~/.claude.json`; only the mkdir is wanted here.
+        ensureSessionCwd: (d) => { mkdirSync(d, { recursive: true }); return d; },
+        resolveSettingsEnv: () => null,
+        spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
+        // `grantConflictHelper` and `isolateSession` are deliberately NOT injected: the real defaults run.
+      },
+    );
+    return { scratch, cwd, calls };
+  };
+
+  it('leaves the helper allow rules in <sessionCwd>/.claude/settings.local.json after the isolation write, next to bgIsolation', async () => {
+    const { rmSync, readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { scratch, cwd, calls } = await dispatchIntoTmp();
+    try {
+      const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.local.json'), 'utf8'));
+      expect(settings.permissions.allow).toEqual(expect.arrayContaining([
+        'Bash(node /repo/scripts/conveyor/resolve-conflict.mjs:*)',
+        'Bash(node "/repo/scripts/conveyor/resolve-conflict.mjs":*)',
+      ]));
+      expect(settings.worktree).toEqual({ bgIsolation: 'none' });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].opts.cwd).toBe(cwd);
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
+  it('keeps rules and env already in the file, adding the helper rules exactly once', async () => {
+    const { rmSync, readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const seed = JSON.stringify({ permissions: { allow: ['Bash(echo ok:*)'] }, env: { KEEP: '1' } });
+    const { scratch, cwd } = await dispatchIntoTmp(seed);
+    try {
+      const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.local.json'), 'utf8'));
+      expect(settings.permissions.allow).toContain('Bash(echo ok:*)');
+      expect(settings.permissions.allow.filter((r) => r.includes('resolve-conflict.mjs'))).toHaveLength(2);
+      expect(settings.env).toEqual({ KEEP: '1' });
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+});
+
+describe('dispatchFix — the composition: plan → fill → mint → spawn', () => {
+  it('spawns exactly once, with a freshly minted session id, the assigned lane, and the filled brief as the prompt', () => {
+    const calls = [];
+    const grantConflictHelper = vi.fn();
+    const result = dispatchFix(
+      { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:scripts/conveyor/reconcile-fix-dispatch.mjs'], lane: 9 },
+      {
+        root: '/repo',
+        grantConflictHelper,
         readBrief: () => REAL_TEMPLATE_STUB,
         mintSessionId: () => '11111111-1111-4111-8111-111111111111',
         spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
       },
     );
 
+    expect(grantConflictHelper).toHaveBeenCalledWith(calls[0].opts.cwd);
     expect(calls).toHaveLength(1);
     // #4174 — cwd is a scratch directory outside `root`, never `root` itself.
     expect(calls[0].opts).toEqual({ cwd: dispatchSessionCwd('11111111-1111-4111-8111-111111111111', { root: '/repo' }) });

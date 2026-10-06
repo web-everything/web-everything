@@ -66,6 +66,9 @@
  * infra-blocked recovery / the lease-reaper / the session-reaper / the hiccup sink — best-effort, never gating
  * the tick.
  */
+import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
+import { ensureSettingsFilePermissions } from '../lib/gh-app-shim.mjs';
+
 import { withOperatorAnswer } from './stand-down-answer-core.mjs';
 import { fixerRulingBrief, renderRulingNotAddressed } from '../lib/ruling-ledger.mjs';
 import { withSalvageHint } from '../lib/salvage-index.mjs';
@@ -1008,6 +1011,7 @@ export function dispatchFix(planned, {
   // never `root` itself) and making that directory real. See `dispatchSessionCwd`'s own header at the io shell.
   sessionCwdFor = (sessionId) => dispatchSessionCwd(sessionId, { root }),
   ensureSessionCwd = ensureDispatchSessionCwd,
+  grantConflictHelper = (cwd) => ensureSettingsFilePermissions({ cwd, allow: conflictHelperAllowRules(root) }),
   // build-path-codex-isolation — the shared bg-isolation helper (writes `<sessionCwd>/.claude/settings.local.json`
   // and returns the `--settings` worktree patch). Before this, only dispatch-lane's sink applied it, so this
   // path's sessions hit Claude Code's "Call EnterWorktree first" guard on their first Edit.
@@ -1087,6 +1091,7 @@ export function dispatchFix(planned, {
     // #4174 — THE FIX: this session's cwd is a scratch directory outside `root`, never `root` itself (see
     // `dispatchSessionCwd`'s own header at the io shell for why — the identical bug `createDispatchSinks` had).
     const sessionCwd = ensureSessionCwd(sessionCwdFor(sessionId));
+    try { grantConflictHelper(sessionCwd); } catch { /* Permission preparation must never abort dispatch. */ }
     spawnCwd = sessionCwd;
     const argv = buildAgentArgv({
       sessionId,

@@ -721,6 +721,15 @@ and cache replay assertions on that fallback. Keep the fake host's throttle stor
 suite cannot consume its budget. Numbering fixtures likewise pass a private `lockRoot` to the real
 mutex instead of acquiring the developer's shared drain lock.
 
+### Dispatched conflict resolution
+
+`we:scripts/conveyor/resolve-conflict.mjs` uses index stages only inside a lane clone with
+an active merge. Probe with real conflicting repositories under `.lanes/<repo>/lane-<n>`;
+assert stage 0 content and no unmerged entries (taking ours can leave no cached diff).
+Redirect `WE_RESOLVE_CONFLICT_LOG` to temporary storage. Permission-denial completions carry
+`denied`, hold for 60 minutes, and surface a `permission-blocked` note immediately; they are
+separate from transient infrastructure failures and their retry streak.
+
 ### Direct heavy-run hook probes
 
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,

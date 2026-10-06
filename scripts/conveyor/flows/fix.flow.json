@@ -299,6 +299,26 @@
         "cite": "scripts/conveyor/reconcile-core.mjs:940-948,1171-1176,1267-1272,1379-1384,1422-1426"
       },
       "notes": "4227 (epic #4075/#3383) — FIXED. refuse('cap-exhausted', ...) fires for whichever population is stuck: ordinary bounce (reconcile-core.mjs:1422-1426, NEGOTIATION_ROUND_CAP=5), advisory-fix (reconcile-core.mjs:1171-1176, ADVISORY_FIX_ROUND_CAP=3), conflict-fix bounce (reconcile-core.mjs:1379-1384, CONFLICT_FIX_ROUND_CAP=3), or stacked-rebase (reconcile-core.mjs:1267-1272, same cap, capKind `stacked-rebase`). Every ONE of these now ALSO pushes a `kind:'round-cap-exhausted'` note (reconcile-core.mjs#refuseCapExhausted, :895-903) — the SAME 'refuse AND surface' shape the sibling ci-heal-exhausted path (reconcile-core.mjs:1103-1122) already used, now shared by every non-ci-heal cap population, each carrying `capKind` so the note names which population is exhausted (`fix`/`review`/`advisory-fix`/`conflict-fix`/`stacked-rebase`). Formerly a refusal-only entry (logged by the daemon's own formatRefusalLine, skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs:520-538, to its own stderr/log file) — now also a durable PR comment via reconcile-note-comment.mjs and listed by `scripts/operations/operator-queue.mjs --with-reconcile-notes`."
+    },
+    {
+      "id": "fixer-permission-denied",
+      "label": "Fixer self-reported blocked-on-permission",
+      "terminal": false,
+      "owner": "scripts/conveyor/reconcile-core.mjs#markSelfReportedDone",
+      "ownerCite": "scripts/conveyor/reconcile-core.mjs#markSelfReportedDone",
+      "wait": {
+        "for": "PERMISSION_BLOCKED_COOLOFF_MS since completion updatedAt",
+        "timeout": "60m",
+        "onTimeout": "pr-flagged-for-fix",
+        "cite": "scripts/conveyor/reconcile-core.mjs#PERMISSION_BLOCKED_COOLOFF_MS"
+      },
+      "retries": null,
+      "escalation": {
+        "to": "operator",
+        "how": "permission-blocked note → PR comment naming the denied command",
+        "cite": "scripts/conveyor/reconcile-note-comment.mjs#noteEpisodeKey"
+      },
+      "notes": "PR #3964: a permission wall requires a sanctioned helper or allow rule. Surface immediately; retry slowly without incrementing the infra streak."
     }
   ],
   "transitions": [
@@ -483,6 +503,20 @@
       "on": "PR re-enters ordinary review/CI",
       "kind": "normal",
       "cite": "skills-src/conveyor/fix-agent-brief.md:427-439"
+    },
+    {
+      "from": "fixer-spawned",
+      "to": "fixer-permission-denied",
+      "on": "fixer self-reports blocked-on-permission",
+      "kind": "failure",
+      "cite": "scripts/conveyor/reconcile-core.mjs#markSelfReportedDone"
+    },
+    {
+      "from": "fixer-permission-denied",
+      "to": "pr-flagged-for-fix",
+      "on": "60-minute permission cooloff elapses",
+      "kind": "timeout",
+      "cite": "scripts/conveyor/reconcile-core.mjs#PERMISSION_BLOCKED_COOLOFF_MS"
     }
   ],
   "steps": [

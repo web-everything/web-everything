@@ -228,16 +228,18 @@ to do if it, or anything else, gets refused).
 
 **If applying an otherwise-CLEAR fix is denied by a permission or tool-use guard, that is INFRASTRUCTURE
 FRICTION, not a judgment call — do NOT stand down.** The reviewer's finding still says exactly what to do; only
-the *mechanism* to do it failed. Report it as `blocked-on-infra` instead, so the reconciler retries this PR
-once the friction has had time to clear (`we:scripts/conveyor/reconcile-core.mjs#INFRA_RETRY_COOLOFF_MS`) —
-never `stand-down.mjs`, which is terminal and reserved for a genuine judgment call (see step 2):
+the *mechanism* to do it failed. Report it as `blocked-on-permission` with `--denied="<the exact denied command,
+one line>"` — never `stand-down.mjs`, which is terminal and reserved for a genuine judgment call (see step 2). A
+permission wall does not clear by waiting, so the reconciler surfaces it at once and holds retries for 60 minutes
+(`we:scripts/conveyor/reconcile-core.mjs#PERMISSION_BLOCKED_COOLOFF_MS`) until the product grows a sanctioned
+path. Keep `blocked-on-infra` (no `--denied`) for outages and rate limits.
 
 ```bash
-node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=blocked-on-infra
+node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=blocked-on-permission --denied="<the exact denied command, one line>"
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
 ```
 
-Then report `#{{ITEM_NUM}} → blocked-on-infra (tool/permission denial applying an otherwise-clear fix on PR
+Then report `#{{ITEM_NUM}} → blocked-on-permission (tool/permission denial applying an otherwise-clear fix on PR
 #{{PR_NUM}})` and exit — do not retry the same denied action yourself in a loop, and do not fall back to a
 Bash rewrite to work around the denial (that is the exact shape that got denied).
 
@@ -268,6 +270,13 @@ BASE_SHA=$(git rev-parse FETCH_HEAD) || exit 1
 git merge --no-edit "$BASE_SHA" || exit 1
 git merge-base --is-ancestor "$BASE_SHA" HEAD || exit 1
 ```
+
+To take one side of a conflicted file, or union both, use ONLY
+`node {{WE_ROOT}}/scripts/conveyor/resolve-conflict.mjs --dir=<your lane path> --file=<path> --take=ours|theirs|union`
+(unquoted script path, exactly this shape; pre-allowed in this session's settings).
+NEVER use `git checkout --ours/--theirs`, `git checkout -- <file>`, `git restore`, or `git reset` on a file:
+the auto-mode classifier denies those as "[Irreversible Local Destruction]" (live: fix-3964, PR #3964).
+Hand-merged hunks still use the Edit tool, then `git add`.
 
 If `origin/main` advanced under the lane and a **conflict**
 blocks the gate, resolve it the `/finish` way (regenerate derived artifacts, take-main for coordination JSON) —
@@ -541,7 +550,7 @@ Skip only if you genuinely hit no generalizable friction.
 (`scripts/conveyor/pr-watch.mjs {{PR_NUM}}`) is re-armed by the conveyor skill, sees the PR return to
 `review:pending` (still parked, exit 2), and surfaces it for `/review`. Return a one-line result:
 `#{{ITEM_NUM}} → PR #{{PR_NUM}} (re-armed review:pending | fix escalated <reason> | fix gate-red)`, or, for the
-tooling-denial exit in step 3, `#{{ITEM_NUM}} → blocked-on-infra (...)`, or, for ADVISORY-FIX MODE (step 7a),
+tooling-denial exit in step 3, `#{{ITEM_NUM}} → blocked-on-permission (<exact denied command>)`, or, for ADVISORY-FIX MODE (step 7a),
 `#{{ITEM_NUM}} → PR #{{PR_NUM}} (advisory finding addressed — a fresh review is owed next, not by this agent)`,
 or, for STACKED-BASE MODE, `#{{ITEM_NUM}} → PR #{{PR_NUM}} (stacked-base conflict resolved against <baseRefName> —
 review labels untouched)`.
@@ -563,6 +572,12 @@ it. When a human takes over a `review:changes` bounce (the `/finish` `review-cha
 2. **Read the reviewer's finding** off the PR's latest changes-requested comment (step 2 above).
 3. **Repair only the finding**, resolve any conflict the `/finish` way (regenerate derived artifacts; take-main
    for coordination JSON; STOP on a genuine same-line overlap), get the locus gate green (steps 3–5 above).
+   To take one side of a conflicted file, or union both, use ONLY
+   `node {{WE_ROOT}}/scripts/conveyor/resolve-conflict.mjs --dir=<your lane path> --file=<path> --take=ours|theirs|union`
+   (unquoted script path, exactly this shape; pre-allowed in this session's settings).
+   NEVER use `git checkout --ours/--theirs`, `git checkout -- <file>`, `git restore`, or `git reset` on a file:
+   the auto-mode classifier denies those as "[Irreversible Local Destruction]" (live: fix-3964, PR #3964).
+   Hand-merged hunks still use the Edit tool, then `git add`.
    If you stop instead, run `node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --reason=conflict`
    so the PR records that a repair was attempted and deliberately abandoned — the auto-fix loop then leaves it
    to you (#3296).

@@ -142,6 +142,17 @@ export function readCompletion(session, dir = resolveCompletionsDir()) {
 }
 
 /**
+ * The per-outcome STREAK fields {@link writeCompletion} maintains: `outcome → [countField, sinceField]`. One row
+ * per self-reported "blocked" outcome the reconciler caps (`INFRA_RETRY_CAP`, `PERMISSION_RETRY_CAP`).
+ */
+const STREAK_FIELDS = {
+  'blocked-on-infra': ['infraStreak', 'infraStreakSince'],
+  'blocked-on-permission': ['permissionStreak', 'permissionStreakSince'],
+};
+
+const positiveStreak = (n) => (Number.isInteger(n) && n > 0 ? n : 0);
+
+/**
  * we:scripts/operations/completion-store.mjs#writeCompletion — persist a completion record. ATOMIC (temp file +
  * rename), so a reader mid-write never sees partial JSON.
  *
@@ -158,6 +169,9 @@ export function readCompletion(session, dir = resolveCompletionsDir()) {
  *   - `status:'done'` + any OTHER outcome — drops both fields; the streak is over.
  *   - `status:'started'` — carries the previous on-disk streak through UNCHANGED (this write represents no
  *     outcome at all), so it survives to the NEXT `done` write.
+ * `blocked-on-permission` keeps its own `permissionStreak`/`permissionStreakSince` the same way (PR #3990
+ * review: it fed no counter, so a permission-walled PR was re-dispatched forever); a `done` write of one
+ * blocked outcome ends the other's streak.
  * The previous record is read straight out of this SAME directory/file about to be overwritten — one extra
  * small JSON read, not a new fact source — so this needs no new IO wiring.
  * {@link ../conveyor/reconcile-core.mjs#markSelfReportedDone} is the reader: it uses the persisted
@@ -190,19 +204,26 @@ export function writeCompletion(record, dir = resolveCompletionsDir(), { expectP
       return { written: false, reason: 'changed' };
     }
     mkdirSync(dir, { recursive: true });
-    const prevStreak = Number.isInteger(prev?.infraStreak) && prev.infraStreak > 0 ? prev.infraStreak : 0;
-
     let toWrite = record;
     if (record.status === 'done') {
-      if (record.outcome === 'blocked-on-infra') {
-        const since = prevStreak > 0 && prev?.infraStreakSince ? prev.infraStreakSince : record.updatedAt;
-        toWrite = { ...record, infraStreak: prevStreak + 1, infraStreakSince: since };
-      } else if (prevStreak > 0) {
-        const { infraStreak, infraStreakSince, ...rest } = record;
-        toWrite = rest;
+      // A `done` write ends every streak but its OWN outcome's — "consecutive" means the same outcome again.
+      // `outcome` is agent-supplied free text: `Object.hasOwn`, so `constructor`/`__proto__` cannot reach the prototype.
+      const own = Object.hasOwn(STREAK_FIELDS, record.outcome) ? STREAK_FIELDS[record.outcome] : null;
+      const rest = { ...record };
+      for (const [count, since] of Object.values(STREAK_FIELDS)) { delete rest[count]; delete rest[since]; }
+      toWrite = rest;
+      if (own) {
+        const [count, since] = own;
+        const prevStreak = positiveStreak(prev?.[count]);
+        toWrite = { ...rest, [count]: prevStreak + 1, [since]: prevStreak > 0 && prev?.[since] ? prev[since] : record.updatedAt };
       }
-    } else if (prevStreak > 0) {
-      toWrite = { ...record, infraStreak: prevStreak, infraStreakSince: prev.infraStreakSince ?? prev.updatedAt };
+    } else {
+      const carried = {};
+      for (const [count, since] of Object.values(STREAK_FIELDS)) {
+        const prevStreak = positiveStreak(prev?.[count]);
+        if (prevStreak > 0) { carried[count] = prevStreak; carried[since] = prev[since] ?? prev.updatedAt; }
+      }
+      toWrite = { ...record, ...carried };
     }
 
     // #4314 (prevention guard owed by web-everything/web-everything#2831's independent review, finding 4) —

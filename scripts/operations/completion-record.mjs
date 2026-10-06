@@ -97,18 +97,73 @@ export function newCompletionRecord({
   };
 }
 
+/** Longest `denied` value kept (one line; it is rendered into a PR comment by the reconcile note path). */
+export const DENIED_MAX_LENGTH = 200;
+/** Input bound applied before any regex runs (the final cap is {@link DENIED_MAX_LENGTH}). */
+const DENIED_SCAN_LIMIT = 2000;
+/**
+ * One secret VALUE as it can appear in a shell command: a double-quoted or single-quoted string (the closing quote
+ * is optional so a truncated/unterminated command still redacts to its end) or a bare run. The earlier bare-only
+ * `[^\s"']+` could not match a value that STARTS with a quote, so `--token="x"` / `K='x'` / `--password "x"` kept
+ * the secret (PR #3990 review). A backslash escapes the next character in all three forms, so an escaped quote
+ * (`--password="a\"b"`) does not end the value early and leave its tail visible (round 4). Every alternative
+ * starts on a different character, so matching never backtracks; the input is also bounded by
+ * {@link DENIED_SCAN_LIMIT}.
+ *
+ * A shell WORD is a concatenation of such segments (`--password="pre"'mid'tail` is ONE argument), so the value is
+ * one-or-more segments back to back, up to the next unquoted whitespace (round 6). The bare segment is a SINGLE
+ * character (or backslash pair) under the outer `+`, never a nested `(?:…+)+` run, so every position has exactly
+ * one way to match and the scan stays linear.
+ */
+const SECRET_VALUE = `(?:"(?:\\\\.|[^"\\\\])*"?|'(?:\\\\.|[^'\\\\])*'?|\\\\.|[^\\s"'\\\\])+`;
+
+/**
+ * we:scripts/operations/completion-record.mjs#sanitizeDeniedCommand — `denied` is agent-supplied free text (a
+ * fixer that read untrusted PR content echoes the command it was refused) that the reconciler later interpolates
+ * into a bot-authored PR comment (PR #3990 review). So it is made safe at the single write point AND again where
+ * the note is built: ONE line, capped at {@link DENIED_MAX_LENGTH}, HTML-comment delimiters and backticks removed
+ * (so it cannot forge a `conveyor-note-key` marker or break out of a code fence), token-like substrings redacted,
+ * `@mentions` defanged. Pure; a non-string yields `null`.
+ * @param {*} value
+ * @returns {string|null}
+ */
+export function sanitizeDeniedCommand(value) {
+  if (typeof value !== 'string') return null;
+  // Bound the input BEFORE any regex: the redaction patterns are quadratic on pathological runs of `-`.
+  let s = value.slice(0, DENIED_SCAN_LIMIT).replace(/\s+/g, ' ').trim();
+  s = s
+    .replace(/\/\/[^\s/@:"']+:[^\s/@"']+@/g, '//[redacted]@')
+    .replace(new RegExp(`\\b(password|passwd|secret|token)\\s*:\\s*${SECRET_VALUE}`, 'gi'), '$1: [redacted]')
+    .replace(/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{8,}/g, '[redacted]')
+    .replace(/\b(?:sk|xox[abprs]|AKIA)[-A-Za-z0-9_]{12,}/g, '[redacted]')
+    .replace(new RegExp(`\\b(Bearer|token|Basic)\\s+${SECRET_VALUE}`, 'gi'), '$1 [redacted]')
+    .replace(new RegExp(`(--?[\\w-]*(?:token|secret|password|passwd|api[-_]?key|authorization)[\\w-]*[= ])${SECRET_VALUE}`, 'gi'), '$1[redacted]')
+    .replace(new RegExp(`\\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY)[A-Za-z0-9_]*=)${SECRET_VALUE}`, 'gi'), '$1[redacted]')
+    // `Name: value` headers and JSON-ish `"name":"value"` fields: `X-Api-Key: v`, `Authorization: v`, `"token":"v"`.
+    // Runs AFTER the Bearer/token/Basic pass so an already-redacted scheme word is consumed with its value.
+    .replace(
+      new RegExp(`\\b([\\w-]*(?:token|secret|password|passwd|api[-_]?key|auth(?:orization)?)[\\w-]*\\\\?["']?\\s*:\\s*\\\\?["']?)(?:(?:Bearer|Basic|token)\\s+)?${SECRET_VALUE}`, 'gi'),
+      '$1[redacted]',
+    );
+  // Replace (never delete) the delimiters: deleting can splice a NEW `<!--` together (`<!<!----` → `<!--`).
+  s = s.replace(/<!--|--!?>|`/g, ' ').replace(/@(?=[\w-])/g, '@\u200b').replace(/\s+/g, ' ').trim();
+  if (/<!--|--!?>/.test(s)) s = s.replace(/[<>]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (s.length > DENIED_MAX_LENGTH) s = `${s.slice(0, DENIED_MAX_LENGTH - 1)}…`;
+  return s;
+}
+
 /**
  * PURE merge of a `patch` onto an existing record — bumps `updatedAt`, never touches `session`/`kind`/`pr`/
  * `item`/`startedAt`/`v`. Used by the io shell's "report done" path so a caller need only name what changed.
  * @param {object} record
- * @param {{status?:string, outcome?:string|null, verdict?:string|null, label?:string|null, runId?:string|null, sessionId?:string|null}} patch
+ * @param {{status?:string, outcome?:string|null, verdict?:string|null, label?:string|null, runId?:string|null, sessionId?:string|null, denied?:string|null}} patch
  * @param {() => string} [now]
  * @returns {object}
  */
 export function applyCompletionUpdate(record, patch = {}, now = () => new Date().toISOString()) {
   const next = { ...record, updatedAt: now() };
-  for (const key of ['status', 'outcome', 'verdict', 'label', 'runId', 'sessionId']) {
-    if (Object.hasOwn(patch, key)) next[key] = patch[key];
+  for (const key of ['status', 'outcome', 'verdict', 'label', 'runId', 'sessionId', 'denied']) {
+    if (Object.hasOwn(patch, key)) next[key] = key === 'denied' && patch[key] != null ? sanitizeDeniedCommand(patch[key]) : patch[key];
   }
   return next;
 }
@@ -128,7 +183,7 @@ export function validateCompletionRecord(record) {
   if (!isOptionalString(record.pr)) errors.push('`pr` must be a string or null');
   if (!isOptionalString(record.item)) errors.push('`item` must be a string or null');
   if (!COMPLETION_STATUSES.includes(record.status)) errors.push(`\`status\` must be one of ${COMPLETION_STATUSES.join('/')}`);
-  for (const key of ['outcome', 'verdict', 'label', 'runId', 'sessionId']) {
+  for (const key of ['outcome', 'verdict', 'label', 'runId', 'sessionId', 'denied']) {
     if (!isOptionalString(record[key])) errors.push(`\`${key}\` must be a string or null`);
   }
   if (typeof record.startedAt !== 'string' || Number.isNaN(Date.parse(record.startedAt))) errors.push('missing or unparseable `startedAt`');

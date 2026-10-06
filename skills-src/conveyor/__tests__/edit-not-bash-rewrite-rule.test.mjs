@@ -70,7 +70,7 @@ describe('fix-agent-brief.md step 3 — Edit/Write for the repair itself', () =>
   });
 });
 
-describe('fix-agent-brief.md step 3 — permission/tool denial is blocked-on-infra, NOT a stand-down', () => {
+describe('fix-agent-brief.md step 3 — permission/tool denial is blocked-on-permission (PR #3964), NOT a stand-down', () => {
   const text = read('../fix-agent-brief.md');
   const step3 = text.match(/^### 3\. [^\n]*\n([\s\S]*?)(?=^### 4\. )/m)[1];
 
@@ -79,12 +79,12 @@ describe('fix-agent-brief.md step 3 — permission/tool denial is blocked-on-inf
     expect(step3).toMatch(/not a judgment call/i);
   });
 
-  it('reports the completion record with outcome=blocked-on-infra', () => {
-    expect(step3).toMatch(/completion-cli\.mjs" report[^\n]*--status=done --outcome=blocked-on-infra/);
+  it('reports the completion record with outcome=blocked-on-permission and the denied command', () => {
+    expect(step3).toMatch(/completion-cli\.mjs" report[^\n]*--status=done --outcome=blocked-on-permission --denied=/);
   });
 
-  it('returns the structured `→ blocked-on-infra` line hiccup-classify.mjs already recognizes', () => {
-    expect(step3).toMatch(/→ blocked-on-infra/);
+  it('returns the structured `→ blocked-on-permission` line hiccup-classify.mjs recognizes', () => {
+    expect(step3).toMatch(/→ blocked-on-permission/);
   });
 
   it('does NOT call stand-down.mjs for this exit — that script is reserved for a real judgment call', () => {

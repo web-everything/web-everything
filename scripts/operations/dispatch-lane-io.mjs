@@ -1,3 +1,4 @@
+import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
 import { observeHealAttempt } from './probation-heal-run.mjs';
 import { dispatchProviderAvailable } from '../lib/dispatch-provider-availability.mjs';
 import { claudeSpawnAlias, resolvePolicyEffort } from '../lib/dispatch-routing-policy.mjs';
@@ -2105,6 +2106,7 @@ export function dispatchLaneGrant(payload, { root = REPO_ROOT, exists = existsSy
     ? [laneDirFor(lane, { root, exists, repoKey })]
     : laneRootsFor(root, exists, repoKey);
   const rules = dirs.flatMap((d) => [`Edit(${d}/**)`, `Write(${d}/**)`]);
+  if (['fix', 'ci-heal'].includes(payload?.launchKind)) rules.push(...conflictHelperAllowRules(root));
   return { additionalDirectories: dirs, allow: rules };
 }
 

@@ -308,6 +308,12 @@ describe('classifyOutcome', () => {
     expect(classifyOutcome('parked')).toBe('escalated');
     expect(classifyOutcome('blocked-on-infra')).toBe('escalated');
   });
+  // PR #3990 review (correctness): the fix brief's `blocked-on-permission` outcome had no guard on its
+  // OUTCOME_MAP entry — losing it would silently rate a permission-blocked fix as an unclassified run.
+  it('maps the fix brief\'s `blocked-on-permission` outcome (same bucket as its `blocked-on-infra` sibling)', () => {
+    expect(classifyOutcome('blocked-on-permission')).toBe('escalated');
+    expect(classifyOutcome('blocked-on-permission')).toBe(classifyOutcome('blocked-on-infra'));
+  });
   it('resolves any unlisted escalated-* word to escalated via the closed prefix rule', () => {
     expect(classifyOutcome('escalated-some-future-reason')).toBe('escalated');
   });
