@@ -1,7 +1,7 @@
 /**
  * @file scripts/lib/advisory-labels.mjs
  * @description THE `advisory:*` LABEL PAIR — the machine-maintained, at-a-glance answer to "did the independent
- *   AI advisory clear this `review:human` PR, on its CURRENT head?" PURE and a true leaf (no imports), so the
+ *   AI advisory clear this `review:human` PR, on its CURRENT head?" PURE (its one import, `marker-authorship.mjs`, is itself a pure leaf), so the
  *   `advise` step, its sink, the staleness sweep and `operator-queue.mjs` all read ONE definition.
  *
  * WHY THESE LABELS EXIST. On a PR carrying `review:human` the independent review deliberately records no verdict
@@ -19,6 +19,7 @@
  * WHAT THIS PAIR NEVER DOES: touch `review:human`, or add `review:accepted`. Only a human's `/review` ceremony
  * clears the human gate; the strongest thing an advisory can do is say "nothing blocking on this head".
  */
+import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 /** The two advisory labels. Mutually exclusive on a PR; both are dropped the moment the head moves. */
 export const ADVISORY_LABELS = Object.freeze({
@@ -112,6 +113,18 @@ export function latestAdvisory(comments) {
   return parseAdvisories(comments)[0];
 }
 
+/**
+ * PURE: the comments a LABEL WRITE may be derived from — only those a trusted principal (the conveyor automation
+ * or the operator, `isTrustedMarkerAuthor`) posted. `parseAdvisories` reads any comment with the right lines, and
+ * any GitHub user can post those lines, so a pass that ADDS a label from comment text must filter first, or a
+ * forged note could label an unreviewed PR `advisory:accepted` and drop `review:pending` (PR #4035 review). A
+ * comment with no author information fails closed. The stale pass filters too: a forged note naming another head
+ * would otherwise strip a legitimate label that the (filtered) repair then re-adds, flapping every tick.
+ */
+export function trustedAdvisoryComments(comments) {
+  return (Array.isArray(comments) ? comments : []).filter((c) => isTrustedMarkerAuthor(c));
+}
+
 /** PURE: does an advisory's reviewed head (a sha or sha prefix) name the PR's current head? False when either is blank. */
 export function advisoryCoversHead(advisory, headRefOid) {
   const head = String(headRefOid ?? '').toLowerCase();
@@ -132,7 +145,7 @@ export function advisoryCoversHead(advisory, headRefOid) {
 export function planAdvisoryStaleLabels({ currentLabels = [], comments = [], headRefOid = '' } = {}) {
   const present = labelNames(currentLabels).filter((n) => Object.values(ADVISORY_LABELS).includes(n));
   if (present.length === 0 || !String(headRefOid ?? '')) return { remove: [] };
-  const latest = latestAdvisory(comments);
+  const latest = latestAdvisory(trustedAdvisoryComments(comments));
   return { remove: latest && advisoryCoversHead(latest, headRefOid) ? [] : present };
 }
 
@@ -143,7 +156,8 @@ export function planAdvisoryStaleLabels({ currentLabels = [], comments = [], hea
  * GitHub rate-limit left the effect pending while the note already said "`advisory:accepted` is applied", so an
  * older `advisory:changes` sat under an accept note). The comment is the truth; the label is a derived view, so
  * the sweep re-derives it. Refuses (empty plan) unless the PR still carries `review:human`, the head is known,
- * and the newest advisory both covers the head and states a clearing/blocking outcome.
+ * and the newest TRUSTED-author advisory (see {@link trustedAdvisoryComments}) both covers the head and states a
+ * clearing/blocking outcome. Idempotent: labels that already show the outcome plan nothing.
  *
  * @param {{currentLabels?: Array, comments?: Array, headRefOid?: string}} o
  * @returns {{add: string|null, remove: string[]}}
@@ -152,7 +166,7 @@ export function planAdvisoryRepairLabels({ currentLabels = [], comments = [], he
   const none = { add: null, remove: [] };
   const names = labelNames(currentLabels);
   if (!names.includes(REVIEW_HUMAN) || !String(headRefOid ?? '')) return none;
-  const latest = latestAdvisory(comments);
+  const latest = latestAdvisory(trustedAdvisoryComments(comments));
   if (!latest || !advisoryCoversHead(latest, headRefOid)) return none;
   const plan = planAdvisoryLabels({ outcome: latest.outcome, currentLabels: names });
   if (plan.reason) return none;

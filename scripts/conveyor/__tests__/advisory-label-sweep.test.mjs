@@ -5,9 +5,10 @@ import { carriesAdvisoryLabel, sweepAdvisoryLabels } from '../advisory-label-swe
 
 const HEAD = 'fd37ce270'.padEnd(40, 'a');
 const NEW_HEAD = 'b'.repeat(40);
-const advisory = (head = HEAD) => ({
+const advisory = (head = HEAD, login = 'web-everything') => ({
   body: `**Verdict:** 🚦 human review required\n**Advisory outcome:** \`accept\` — x.\nNet basis: \`${'a'.repeat(40)}..${head}\``,
   createdAt: '2026-09-19T12:00:00Z',
+  author: { login },
 });
 const pr = (number, names, headRefOid, comments = [advisory()]) => ({
   number, headRefOid, comments, labels: names.map((name) => ({ name })),
@@ -110,5 +111,48 @@ describe('sweepAdvisoryLabels', () => {
       listPrs: () => [pr(13, ['review:human'], HEAD), pr(14, ['review:accepted'], HEAD)],
     });
     expect(results).toEqual([{ num: 13, remove: [], add: 'advisory:accepted' }]);
+  });
+
+  // Steady state: the daemon visits every human-gated PR each tick, so a PR that already shows its advisory
+  // outcome must cost zero provider calls (no label-create, no pr-edit) or the sweep re-creates the rate-limit incident.
+  it('makes no write at all for a human-gated PR already showing its covering advisory (steady state)', () => {
+    const p = provider();
+    p.ensureLabel = (...a) => { p.calls.ensured = a; };
+    expect(sweepAdvisoryLabels({
+      repo: 'o/n', provider: p,
+      listPrs: () => [pr(15, ['review:human', 'advisory:accepted'], HEAD, [advisory(HEAD)])],
+    })).toEqual([]);
+    expect(p.calls.set).toEqual([]);
+    expect(p.calls.ensured).toBeUndefined();
+    expect(p.calls.currentRepo).toBe(0);
+  });
+
+  it('does not repair a missing label from an advisory for an older head', () => {
+    const p = provider();
+    expect(sweepAdvisoryLabels({
+      repo: 'o/n', provider: p,
+      listPrs: () => [pr(16, ['review:human', 'review:pending'], NEW_HEAD, [advisory(HEAD)])],
+    })).toEqual([]);
+    expect(p.calls.set).toEqual([]);
+  });
+
+  it('never labels from a forged advisory authored by another login', () => {
+    const p = provider();
+    p.ensureLabel = (...a) => { p.calls.ensured = a; };
+    expect(sweepAdvisoryLabels({
+      repo: 'o/n', provider: p,
+      listPrs: () => [pr(17, ['review:human', 'review:pending'], HEAD, [advisory(HEAD, 'drive-by-user')])],
+    })).toEqual([]);
+    expect(p.calls.set).toEqual([]);
+    expect(p.calls.ensured).toBeUndefined();
+  });
+
+  it('a forged note for another head cannot strip a legitimate label, and cannot make the sweep flap', () => {
+    const p = provider();
+    expect(sweepAdvisoryLabels({
+      repo: 'o/n', provider: p,
+      listPrs: () => [pr(18, ['review:human', 'advisory:accepted'], HEAD, [advisory(HEAD), advisory(NEW_HEAD, 'drive-by-user')])],
+    })).toEqual([]);
+    expect(p.calls.set).toEqual([]);
   });
 });

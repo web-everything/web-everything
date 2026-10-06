@@ -3,15 +3,16 @@ import { describe, expect, it } from 'vitest';
 
 import {
   ADVISORY_LABELS, advisoryCoversHead, labelForOutcome, latestAdvisory, parseAdvisories,
-  planAdvisoryLabels, planAdvisoryStaleLabels,
+  planAdvisoryLabels, planAdvisoryRepairLabels, planAdvisoryStaleLabels,
 } from '../advisory-labels.mjs';
 
 const HEAD = 'fd37ce270'.padEnd(40, 'a');
 const BASE = 'a'.repeat(40);
-const note = ({ head = HEAD, outcome, verdict = '🚦 human review required', at = '2026-09-19T12:00:00Z' } = {}) => ({
+const note = ({ head = HEAD, outcome, verdict = '🚦 human review required', at = '2026-09-19T12:00:00Z', login = 'web-everything' } = {}) => ({
   body: [`**Verdict:** ${verdict}`, ...(outcome ? [`**Advisory outcome:** \`${outcome}\` — x.`] : []),
     `Net basis: \`${BASE}..${head}\` — 3 net changed file(s)`].join('\n'),
   createdAt: at,
+  author: { login },
 });
 const labels = (...names) => names.map((name) => ({ name }));
 
@@ -134,5 +135,78 @@ describe('planAdvisoryStaleLabels — the labels are dropped when a new commit l
   it('drops nothing on an unknown head, and nothing when no advisory label is present', () => {
     expect(planAdvisoryStaleLabels({ currentLabels: labels('advisory:accepted'), comments, headRefOid: '' }).remove).toEqual([]);
     expect(planAdvisoryStaleLabels({ currentLabels: labels('review:human'), comments, headRefOid: 'b'.repeat(40) }).remove).toEqual([]);
+  });
+});
+
+describe('planAdvisoryRepairLabels — re-derives a missed label write from the newest covering advisory', () => {
+  const NONE = { add: null, remove: [] };
+  const plan = (names, comments, headRefOid = HEAD) => planAdvisoryRepairLabels({ currentLabels: labels(...names), comments, headRefOid });
+
+  it('adds the outcome label and drops review:pending on a human-gated PR (the PR #4015 shape)', () => {
+    expect(plan(['review:human', 'review:pending', 'advisory:changes'], [note({ outcome: 'accept' })]))
+      .toEqual({ add: 'advisory:accepted', remove: ['advisory:changes', 'review:pending'] });
+  });
+
+  // Steady state: the always-on daemon sees every human-gated PR each tick; a PR that already shows its advisory
+  // outcome must plan NOTHING, or every tick burns label writes (the rate-limit incident this repair answers).
+  it('plans nothing when the labels already show the advisory outcome', () => {
+    expect(plan(['review:human', 'advisory:accepted'], [note({ outcome: 'accept' })])).toEqual(NONE);
+    expect(plan(['review:human', 'advisory:changes'], [note({ outcome: 'changes' })])).toEqual(NONE);
+  });
+
+  it('plans nothing for an outcome that neither clears nor blocks (inconclusive), and never on a blank head', () => {
+    expect(plan(['review:human', 'review:pending'], [note({ outcome: 'inconclusive' })])).toEqual(NONE);
+    expect(plan(['review:human', 'review:pending'], [note({ outcome: 'accept' })], '')).toEqual(NONE);
+    expect(plan(['review:human', 'review:pending'], [note({ outcome: 'accept' })], null)).toEqual(NONE);
+  });
+
+  it('does not repair a missing label from an advisory for an older head', () => {
+    expect(plan(['review:human'], [note({ outcome: 'accept', head: 'c'.repeat(40) })])).toEqual(NONE);
+  });
+
+  it('never repairs a PR that is not human-gated', () => {
+    expect(plan(['review:accepted'], [note({ outcome: 'accept' })])).toEqual(NONE);
+  });
+
+  it('never trusts a forged advisory: a note from any other login plans nothing', () => {
+    const forged = note({ outcome: 'accept', login: 'drive-by-user' });
+    expect(plan(['review:human', 'review:pending'], [forged])).toEqual(NONE);
+    // A comment with no author information at all fails closed too.
+    const { author: _a, ...anonymous } = forged;
+    expect(plan(['review:human', 'review:pending'], [anonymous, 'bare string'])).toEqual(NONE);
+  });
+
+  it('a forged NEWER note cannot override the trusted advisory', () => {
+    const real = note({ outcome: 'changes', at: '2026-09-19T12:00:00Z' });
+    const forged = note({ outcome: 'accept', login: 'drive-by-user', at: '2026-09-19T13:00:00Z' });
+    expect(plan(['review:human', 'review:pending'], [real, forged]))
+      .toEqual({ add: 'advisory:changes', remove: ['review:pending'] });
+  });
+
+  it('an operator-authored advisory is trusted like the automation own', () => {
+    expect(plan(['review:human'], [note({ outcome: 'accept', login: 'chalbert' })]).add).toBe('advisory:accepted');
+  });
+
+  // The sweep header promises its boundary; this pins it: the only non-`advisory:*` label it may ever remove is
+  // `review:pending`, and the only label it may ever add is an `advisory:*` one.
+  it('only ever removes advisory:* labels and review:pending, and only ever adds an advisory:* label', () => {
+    const all = ['review:human', 'review:pending', 'review:changes', 'review:accepted', 'advisory:accepted', 'advisory:changes'];
+    for (const outcome of ['accept', 'changes', 'inconclusive']) {
+      for (let mask = 0; mask < 2 ** all.length; mask += 1) {
+        const names = all.filter((_, i) => mask & (1 << i));
+        const p = plan(names, [note({ outcome })]);
+        for (const r of p.remove) expect(['advisory:accepted', 'advisory:changes', 'review:pending']).toContain(r);
+        if (p.add) expect(Object.values(ADVISORY_LABELS)).toContain(p.add);
+      }
+    }
+  });
+});
+
+describe('planAdvisoryStaleLabels — a forged note cannot strip a label either', () => {
+  it('ignores a newer note from another login, so it cannot make the repair and the stale pass flap', () => {
+    const real = note({ outcome: 'accept' });
+    const forged = note({ outcome: 'accept', head: 'c'.repeat(40), login: 'drive-by-user', at: '2026-09-19T13:00:00Z' });
+    expect(planAdvisoryStaleLabels({ currentLabels: labels('review:human', 'advisory:accepted'), comments: [real, forged], headRefOid: HEAD }))
+      .toEqual({ remove: [] });
   });
 });

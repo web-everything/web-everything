@@ -17,11 +17,15 @@
  * itself and reports a label that outlived its head as a disagreement in NOT READY, so a stale label can never
  * put a PR in NEEDS YOU even before this sweep removes it.
  *
- * WHAT IT NEVER DOES: touch `review:human` / `review:pending` / `review:changes` / `review:accepted`,
- * or post a comment. It removes stale `advisory:*` labels (`planAdvisoryStaleLabels`) and, as the
- * backstop for a missed `advise` label write, REPAIRS a human-gated PR whose newest covering advisory disagrees
- * with its labels (`planAdvisoryRepairLabels`; adds only `advisory:*`, never `review:accepted`). Removing a label the PR does not carry is a `gh`
- * error, so removals are intersected with the live labels by construction (the plan only lists present ones).
+ * WHAT IT NEVER DOES: touch `review:human` / `review:changes` / `review:accepted`, add anything but an
+ * `advisory:*` label, or post a comment. The ONE non-`advisory:*` label it may remove is `review:pending`, and
+ * only in the repair path, where the advisory has demonstrably run (pinned by a test over every label mix). It
+ * removes stale `advisory:*` labels (`planAdvisoryStaleLabels`) and, as the backstop for a missed `advise` label
+ * write, REPAIRS a human-gated PR whose newest covering advisory disagrees with its labels
+ * (`planAdvisoryRepairLabels`). BOTH plans read only advisory comments posted by a trusted principal (automation
+ * or operator login — `trustedAdvisoryComments`), so a forged note from any other account changes no label.
+ * Removing a label the PR does not carry is a `gh` error, so removals are intersected with the live labels by
+ * construction (the plan only lists present ones).
  *
  * PURE-CORE / IO-SHELL: the plan is pure; {@link sweepAdvisoryLabels} is the shell, with the PR list and the
  * label provider injectable so the whole pass is testable with no `gh`.
