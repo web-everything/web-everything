@@ -47,6 +47,7 @@ import { loadAdapters } from './lib/adapters-loader.cjs';
 import { localToday } from './lib/local-date.mjs';
 import { findUtcDaySlices, utcDaySliceMessage } from './lib/utc-day-slice-scan.mjs';
 import { scanInvisibleSourceTree } from './lib/invisible-source-scan.mjs';
+import { scanFilesCached, fileKeys } from './lib/standards-cache.mjs';
 import { scanStdoutFlush, stdoutFlushMessage } from './lib/stdout-flush-scan.mjs';
 import { runWeScan } from './lib/rust-scan-bridge.mjs';
 import {
@@ -150,6 +151,12 @@ const LOCAL_MODE = process.argv.includes('--local');
 const PROFILE = !!process.env.CHECK_STANDARDS_PROFILE;
 const profileEntries = [];
 let profileT = process.hrtime.bigint();
+// #70b per-file result cache (see lib/standards-cache.mjs): ONLY per-file sections use it (6f, 6f-i-b); whole-repo
+// rules never do. Off under CI or WE_STANDARDS_CACHE=0. Hit/miss counts go to the profile output.
+const CACHE_ENTRIES = [fileURLToPath(import.meta.url), fileURLToPath(new URL('./check-standards-rules.mjs', import.meta.url))];
+let cacheKeysMemo = null;
+const cacheKeys = () => (cacheKeysMemo ??= fileKeys(ROOT));
+const cacheStatLines = [];
 const mark = (label) => {
   if (!PROFILE) return;
   const now = process.hrtime.bigint();
@@ -1410,11 +1417,12 @@ mark("6e-ii. Untracked derived artifacts — local-vs-CI divergence guard (#2180
   // `--local --files=…`; unchanged (full corpus) otherwise. This check judges each file's OWN content
   // (a bare code-path reference in ITS body), so a file this lane never touched can't newly need a locus
   // prefix it didn't already have — safe to skip entirely, not just demote after the fact.
-  const docs = [];
-  for (const f of scopedReaddir('backlog/', ['.md']))
-    docs.push({ file: `backlog/${f}`, content: readFileSync(join(ROOT, 'backlog', f), 'utf8') });
-  for (const f of scopedReportFiles) docs.push({ file: `reports/${f}`, content: readFileSync(join(REPORTS, f), 'utf8') });
-  for (const finding of scanRepoLocusPrefixes(docs)) {
+  const docFiles = [...scopedReaddir('backlog/', ['.md']).map((f) => `backlog/${f}`), ...scopedReportFiles.map((f) => `reports/${f}`)];
+  const scanned = scanFilesCached({
+    section: '6f', entries: CACHE_ENTRIES, files: docFiles, getKeys: cacheKeys, onStats: (l) => cacheStatLines.push(l),
+    load: (file) => readFileSync(join(ROOT, file), 'utf8'), scan: scanRepoLocusPrefixes,
+  });
+  for (const finding of scanned) {
     const msg =
       `${finding.count} code-path reference(s) in ${finding.file} lack a <repo>: locus prefix ` +
       `(#883 convention; #884 detection, #885 enforces) — e.g. ${finding.sample}`;
@@ -1486,11 +1494,12 @@ mark("6f-i. PUBLISH-SEAM secret sweep on the committed corpus (#3015, under #297
 {
   // #4168 — same scoping as 6f above: judges each file's own content, so a file outside the lane's
   // `--files` list can be skipped entirely under `--local --files=…`.
-  const docs = [];
-  for (const f of scopedReaddir('backlog/', ['.md']))
-    docs.push({ file: `backlog/${f}`, content: readFileSync(join(ROOT, 'backlog', f), 'utf8') });
-  for (const f of scopedReportFiles) docs.push({ file: `reports/${f}`, content: readFileSync(join(REPORTS, f), 'utf8') });
-  for (const { file, hits } of scanHarnessScaffolding(docs)) {
+  const docFiles = [...scopedReaddir('backlog/', ['.md']).map((f) => `backlog/${f}`), ...scopedReportFiles.map((f) => `reports/${f}`)];
+  const scanned = scanFilesCached({
+    section: '6f-i-b', entries: CACHE_ENTRIES, files: docFiles, getKeys: cacheKeys, onStats: (l) => cacheStatLines.push(l),
+    load: (file) => readFileSync(join(ROOT, file), 'utf8'), scan: scanHarnessScaffolding,
+  });
+  for (const { file, hits } of scanned) {
     for (const hit of hits) {
       err(
         `${file}:${hit.line} carries a ${hit.label} outside a fenced code block (${JSON.stringify(hit.match)}) — ` +
@@ -3174,6 +3183,7 @@ if (PROFILE) {
   console.error('\ncheck-standards profile (ms per section, sorted desc):');
   for (const [label, ms] of rows) console.error(`  ${ms.toFixed(1).padStart(8)}ms  ${label}`);
   console.error(`  ${total.toFixed(1).padStart(8)}ms  TOTAL (${profileEntries.length} sections)`);
+  for (const l of cacheStatLines) console.error(`  cache ${l}`);
 }
 
 process.exitCode = errors.length ? 1 : 0;
