@@ -120,6 +120,7 @@
 // `hasLabel` are imported normally (this file's OWN code below still calls both directly); the other three
 // are re-exported ONLY (mirrors `pr-land.mjs`'s own `forge-land-provider.mjs` split of used-here vs.
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
+import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
 import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';
 // #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
@@ -2589,6 +2590,31 @@ export function hasDrainReasonComment(comments, kind, reasonText, auditLine) {
   });
 }
 
+/** Max stdout for the PR-comments read. Node's execFileSync default is 1 MiB; a PR with ~190 comments
+ *  (PR #4017: 1.23 MB of JSON) overflowed it, the read threw, the catch returned `[]`, and `hasDrainReasonComment`
+ *  then saw "no prior comment" every pass and re-posted the park reason every ~1-2 min (99 comments, API quota
+ *  burn). */
+export const PR_COMMENTS_MAX_BUFFER = 256 * 1024 * 1024;
+
+const HELD_PARK_PREFIX = `${drainReasonMarker('park')}\n⏸ **Parked for review by the drain**\n\nheld \u2014 a review hold`;
+
+/** Plan the write for the #2832 "held" park reason: ONE comment per PR, edited in place only when the reason
+ *  changes, no write at all when unchanged. Pure. Comment-writing only; never feeds a merge decision.
+ *  @returns {{action:'none'}|{action:'edit',commentId:string}|{action:'post'}} */
+export function planHeldParkUpsert(comments, reasonText) {
+  const body = buildDrainReasonComment('park', reasonText);
+  let latest = null;
+  for (const c of Array.isArray(comments) ? comments : []) {
+    const b = String(c?.body || '');
+    if (!b.startsWith(HELD_PARK_PREFIX) || !isTrustedMarkerAuthor(c)) continue;
+    latest = c;
+  }
+  if (!latest) return { action: 'post' };
+  if (String(latest.body).trim() === body.trim()) return { action: 'none' };
+  const m = /#issuecomment-(\d+)/.exec(String(latest.url || ''));
+  return m ? { action: 'edit', commentId: m[1] } : { action: 'none' }; // cannot address it: never post a duplicate
+}
+
 // ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 // #3308 — ANNOUNCE A SKIPPED OR DEGRADED REVIEW ON THE PR ITSELF.
 //
@@ -3837,17 +3863,33 @@ async function runCli() {
   // "there are none" — see the land-path call site.
   const fetchPrComments = (repo, num) => {
     try {
-      const data = JSON.parse(execFileSync('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json', 'comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
+      const data = JSON.parse(execFileSync('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json', 'comments'], { encoding: 'utf8', maxBuffer: PR_COMMENTS_MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
       return { comments: Array.isArray(data.comments) ? data.comments : [], read: true };
     } catch { return { comments: [], read: false }; }
   };
 
   const postDrainReasonComment = (repo, num, kind, reasonText, auditLine, preread = null) => {
     if (DRY_RUN || !reasonText) return false;
-    const comments = Array.isArray(preread) ? preread : fetchPrComments(repo, num).comments;
+    const fetched = Array.isArray(preread) ? { comments: preread, read: true } : fetchPrComments(repo, num);
+    // A failed read is "could not read", never "there are none": posting on a blind read is what spammed #4017.
+    if (!fetched.read) return false;
+    const comments = fetched.comments;
     if (hasDrainReasonComment(comments, kind, reasonText, auditLine)) return false;
     try { execFileSync('gh', ['pr', 'comment', String(num), ...repoFlag(repo), '--body', buildDrainReasonComment(kind, reasonText, auditLine)], { stdio: ['ignore', 'ignore', 'pipe'] }); return true; }
     catch { return false; }
+  };
+
+  // One held-park comment per PR: edited in place when the reason changes, no write when unchanged.
+  const upsertHeldParkComment = (repo, num, reasonText) => {
+    if (DRY_RUN || !reasonText) return false;
+    const fetched = fetchPrComments(repo, num);
+    if (!fetched.read) return false;
+    const plan = planHeldParkUpsert(fetched.comments, reasonText);
+    try {
+      if (plan.action === 'post') { execFileSync('gh', ['pr', 'comment', String(num), ...repoFlag(repo), '--body', buildDrainReasonComment('park', reasonText)], { stdio: ['ignore', 'ignore', 'pipe'] }); return true; }
+      if (plan.action === 'edit') { execFileSync('gh', ['api', '-X', 'PATCH', `repos/${repo || '{owner}/{repo}'}/issues/comments/${plan.commentId}`, '-f', `body=${buildDrainReasonComment('park', reasonText)}`], { stdio: ['ignore', 'ignore', 'pipe'] }); return true; }
+    } catch { /* best-effort */ }
+    return false;
   };
 
   // xvzc4v4 (merge-safety review, bug 1) — the SAME fields `classifyPr` scored at pass-start (labels,
@@ -4134,7 +4176,7 @@ async function runCli() {
         // escalation-reason block), not just the label category (was `review:human` with no file attribution —
         // see PR #1814, whose only sensitive file of three, `docs/agent/platform-decisions.md`, was never named).
         const heldReason = buildHeldReviewHoldReason({ labels: p.labels, body: p.body, label });
-        if (!DRY_RUN) postDrainReasonComment(repo, p.number, 'park', heldReason, null);
+        if (!DRY_RUN) upsertHeldParkComment(repo, p.number, heldReason);
         if (!AS_JSON) process.stderr.write(`  ⏸ ${repoTag(repo)}${p.number} green but HELD — "${label}" withheld (#2832)\n`);
       }
       // ── The #2421 TOTAL branch: every producer-owned open PR gets its checking/ci:failed/blocked state
