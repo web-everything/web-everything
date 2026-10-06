@@ -1503,6 +1503,9 @@ export function planReconcile({
     // The evidence every row carries, so a reader never has to go back to the listing to audit a verdict.
     const operatorAnswer = latestOperatorAnswer(pr?.comments);
     const roundExtensions = countGrantedRoundExtensions(pr?.comments, { repo, pr: prNumber });
+    // Operator grants extend EVERY auto-repair cap kind (review/fix, advisory-fix, conflict-fix), never just one.
+    const advisoryFixCapHere = advisoryFixCap + roundExtensions;
+    const conflictFixCapHere = conflictFixCap + roundExtensions;
     const baseRoundCap = roundCap + roundExtensions;
     const operatorBudget = operatorFixBudget(pr?.comments, baseRoundCap);
     const effectiveRoundCap = operatorBudget?.cap ?? baseRoundCap;
@@ -2166,7 +2169,7 @@ export function planReconcile({
     // header for the full incident, and `countUnresolvedStandDowns`/`isAdvisoryMechanismStandDownSuperseded`
     // for how a stand-down already caused by this exact bug is recognized as non-terminal).
     // `advisoryFixes` (the durable attempt COUNT) is still read below, but ONLY for the CAP — a genuinely
-    // unfixable finding must still stop after `advisoryFixCap` real attempts.
+    // unfixable finding must still stop after `advisoryFixCapHere` real attempts.
     //
     // xconv1-evidence FOLLOW-UP (web-everything/web-everything#2766/#2767, 2026-09-27) — `advisoryFixes` MUST count
     // COMPLETED EPISODES, never raw fix-mark COMMENTS: CONFIRMED LIVE, once the #xconv1-evidence fix correctly
@@ -2194,7 +2197,7 @@ export function planReconcile({
           });
           continue;
         }
-        if (advisoryFixes >= advisoryFixCap) {
+        if (advisoryFixes >= advisoryFixCapHere) {
           // advisory-after-cap (web-everything/web-everything#2766, live-caught 2026-09-27): the cap above is right to
           // stop ANOTHER FIXER — but it must never ALSO block the one fresh review a head that moved AFTER the
           // last advisory note is still owed. Live shape: a fixer (a merge-conflict resolution, `main` merged in
@@ -2240,8 +2243,8 @@ export function planReconcile({
             if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
             dispatch.push({
               ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
-              attempts: advisoryFixes, cap: advisoryFixCap,
-              why: `the advisory-fix cap is exhausted (${advisoryFixes} of ${advisoryFixCap}) so no further fixer` +
+              attempts: advisoryFixes, cap: advisoryFixCapHere,
+              why: `the advisory-fix cap is exhausted (${advisoryFixes} of ${advisoryFixCapHere}) so no further fixer` +
                 ` is dispatched, but the newest advisory (reviewed head \`${latest.head}\`) does not cover this` +
                 ` PR's current head \`${headSha}\` — a fresh review is owed so the operator has a current` +
                 ' advisory to act on, never another auto-repair attempt',
@@ -2249,16 +2252,16 @@ export function planReconcile({
             continue;
           }
           refuseCapExhausted({
-            ...withPhase, attempts: advisoryFixes, cap: advisoryFixCap, capKind: 'advisory-fix',
-            why: `this PR's own durable advisory-fix count is ${advisoryFixes} against a cap of ${advisoryFixCap}` +
+            ...withPhase, attempts: advisoryFixes, cap: advisoryFixCapHere, capKind: 'advisory-fix',
+            why: `this PR's own durable advisory-fix count is ${advisoryFixes} against a cap of ${advisoryFixCapHere}` +
               ' — auto-repair of the advisory finding is exhausted here and a person must take it',
           });
           continue;
         }
         dispatch.push({
           ...base, ...withPhase, kind: 'fix', mode: 'advisory-fix', findings: advisoryFindingsHere,
-          attempts: advisoryFixes, cap: advisoryFixCap,
-          why: `carries an admitted advisory:changes finding, ${advisoryFixes} of ${advisoryFixCap} advisory-fix` +
+          attempts: advisoryFixes, cap: advisoryFixCapHere,
+          why: `carries an admitted advisory:changes finding, ${advisoryFixes} of ${advisoryFixCapHere} advisory-fix` +
             ' attempts are spent, and nothing live is working it — the fixer addresses the advisory finding' +
             ' only, never review:human, never a verdict',
         });
@@ -2289,7 +2292,7 @@ export function planReconcile({
       // immediately flips {@link isLatestAdvisoryFindingAddressed} back to `false` for the NEXT tick. So this
       // exemption can fire AT MOST ONCE per completed advisory-fix round, and advisory-fix rounds are already
       // bounded by {@link ADVISORY_FIX_ROUND_CAP} (checked above, on the `!addressed` branch) — a PR cannot
-      // cycle through this exemption more than `advisoryFixCap` times before THAT cap (not this one) correctly
+      // cycle through this exemption more than `advisoryFixCapHere` times before THAT cap (not this one) correctly
       // stops it and hands it to a person. A normal PR that has never addressed its advisory finding (the
       // ordinary `!addressed` branch above) is completely unaffected — it never reaches this line at all.
       const advisoryFindingsHere = countFindings(pr?.comments);
@@ -2360,23 +2363,23 @@ export function planReconcile({
         const { stale: conflictAttempts, total: conflictTotal } = countStaleConflictFixRounds(pr?.comments, {
           currentRef: baseRefName, currentSha: base.baseRefSha,
         });
-        if (conflictAttempts >= conflictFixCap || conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING) {
+        if (conflictAttempts >= conflictFixCapHere || conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING) {
           refuseCapExhausted({
-            ...withPhase, attempts: conflictAttempts, cap: conflictFixCap, capKind: 'stacked-rebase',
+            ...withPhase, attempts: conflictAttempts, cap: conflictFixCapHere, capKind: 'stacked-rebase',
             why: conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING
               ? `this PR's own durable conflict-fix count is ${conflictTotal} against the hard ceiling of ` +
                 `${CONFLICT_FIX_ABSOLUTE_CEILING} (${conflictAttempts} against its current target, base ` +
                 `\`${baseRefName}\`) — this PR keeps re-conflicting no matter how many rounds run; a person must take it over`
-              : `this PR's own durable conflict-fix count is ${conflictAttempts} against a cap of ${conflictFixCap}` +
+              : `this PR's own durable conflict-fix count is ${conflictAttempts} against a cap of ${conflictFixCapHere}` +
                 ` — mechanical rebase against its base \`${baseRefName}\` is exhausted here and a person must take it`,
           });
         } else {
           dispatch.push({
             ...base, ...withPhase, kind: 'fix', isConflict: true, mode: 'stacked-rebase', baseRefName,
-            attempts: conflictAttempts, cap: conflictFixCap,
+            attempts: conflictAttempts, cap: conflictFixCapHere,
             why: `conflicts with its own base \`${baseRefName}\` (not \`${defaultBranch}\`) — a stacked PR the ` +
               'drain will never land regardless of labels, so this is a mechanical rebase against its base, ' +
-              `never a rebase owed to the drain; ${conflictAttempts} of ${conflictFixCap} conflict-fix attempts are spent` +
+              `never a rebase owed to the drain; ${conflictAttempts} of ${conflictFixCapHere} conflict-fix attempts are spent` +
               (conflictTotal > conflictAttempts ? ` (${conflictTotal} total rounds ever run, against earlier targets)` : ''),
           });
         }
@@ -2453,14 +2456,14 @@ export function planReconcile({
       const { stale: conflictAttempts, total: conflictTotal } = countStaleConflictFixRounds(pr?.comments, {
         currentRef: defaultBranch, currentSha: mainSha,
       });
-      if (conflictAttempts >= conflictFixCap || conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING) {
+      if (conflictAttempts >= conflictFixCapHere || conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING) {
         refuseCapExhausted({
-          ...withPhase, attempts: conflictAttempts, cap: conflictFixCap, capKind: 'conflict-fix',
+          ...withPhase, attempts: conflictAttempts, cap: conflictFixCapHere, capKind: 'conflict-fix',
           why: conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING
             ? `this PR's own durable conflict-fix count is ${conflictTotal} against the hard ceiling of ` +
               `${CONFLICT_FIX_ABSOLUTE_CEILING} (${conflictAttempts} against its current target, \`${defaultBranch}\`)` +
               ' — this PR keeps re-conflicting no matter how many rounds run; a person must take it over'
-            : `this PR's own durable conflict-fix count is ${conflictAttempts} against a cap of ${conflictFixCap}` +
+            : `this PR's own durable conflict-fix count is ${conflictAttempts} against a cap of ${conflictFixCapHere}` +
               ' — mechanical conflict-resolution is exhausted here and a person must take it',
         });
         continue;
@@ -2473,9 +2476,9 @@ export function planReconcile({
       const advisoryAlsoPending = withPhase.labels.includes(ADVISORY_LABELS.CHANGES);
       dispatch.push({
         ...base, ...withPhase, kind: 'fix', isConflict: true, advisoryPending: advisoryAlsoPending,
-        findings, attempts: conflictAttempts, cap: conflictFixCap,
+        findings, attempts: conflictAttempts, cap: conflictFixCapHere,
         why: `bounced with ${findings} finding(s) via a mechanical conflict-resolution route (merge-status:conflicting),`
-          + ` nothing live is working it, and ${conflictAttempts} of ${conflictFixCap} conflict-fix attempts are spent`
+          + ` nothing live is working it, and ${conflictAttempts} of ${conflictFixCapHere} conflict-fix attempts are spent`
           + (conflictTotal > conflictAttempts ? ` (${conflictTotal} total rounds ever run, against earlier targets)` : '')
           + (advisoryAlsoPending
             ? ' — this PR also carries an admitted advisory:changes finding, owed its own advisory-fix round once this conflict clears'

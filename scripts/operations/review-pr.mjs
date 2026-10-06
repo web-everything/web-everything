@@ -2533,7 +2533,20 @@ export function reviewPrOperation({
         if (!state) return basis;
         const pendingReferrals = state.pending ?? ['unreadable-referral-result'];
         const blockedReferrals = state.blocked ?? [];
-        return { ...basis, pendingReferrals, blockedReferrals,
+        // A block-ruled referral is mandatory work for the fixer: never a "card suggestion". Move any such finding
+        // out of the deferred list and into the admitted/published findings (keys are `referralFindingKey`s).
+        const blockedKeys = new Set(blockedReferrals.map((k) => {
+          try { const [, file, , summary] = JSON.parse(k); return `${file ?? ''}\u0000${summary ?? ''}`; } catch { return null; }
+        }).filter(Boolean));
+        const idOf = (f) => `${f?.file ?? ''}\u0000${String(f?.summary ?? '').trim().replace(/\s+/g, ' ')}`;
+        const promoted = blockedKeys.size ? (basis.deferredAdvisory ?? []).filter((f) => blockedKeys.has(idOf(f))) : [];
+        const deferredAdvisory = promoted.length ? basis.deferredAdvisory.filter((f) => !promoted.includes(f)) : basis.deferredAdvisory;
+        const lifted = promoted.map(({ deferred: _d, ...f }) => f);
+        const liftedFields = lifted.length ? {
+          findings: [...(basis.findings ?? []), ...lifted],
+          admittedFindings: [...(basis.admittedFindings ?? []), ...lifted],
+        } : {};
+        return { ...basis, ...liftedFields, deferredAdvisory, pendingReferrals, blockedReferrals,
           verdict: pendingReferrals.length ? 'needs-human'
             : blockedReferrals.length && basis.verdict !== 'needs-human' ? 'changes' : basis.verdict,
           humanRequired: basis.humanRequired || pendingReferrals.length > 0 };

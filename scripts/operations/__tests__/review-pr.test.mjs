@@ -3984,6 +3984,22 @@ describe('#5135 mandatory referrals survive advisory deferral', () => {
       expect(result.admittedFindings).toEqual([]);
     } finally { vi.unstubAllEnvs(); }
   });
+  it('a block-ruled referral is promoted out of card suggestions into the fixer-visible findings', () => {
+    const { declaration } = registryFor({}, { codexAdvisory: true });
+    const step = declaration.steps.find(s => s.name === 'referralVerdict').step;
+    const race = { file: NET_PATHS[0], line: 20, summary: 'concurrent held-cards filing race', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    const other = { file: NET_PATHS[0], line: 40, summary: 'nit', category: 'simplicity' };
+    const key = JSON.stringify(['judgeAdvisory', race.file, 20, race.summary]);
+    const out = step.fn({ findings: {
+      reduce: { verdict: 'accept', findings: [], admittedFindings: [], humanRequired: false,
+        deferredAdvisory: [{ ...race, deferred: 'later-round-advisory-untouched' }, { ...other, deferred: 'later-round-advisory-untouched' }] },
+      mandatoryReferrals: { effects: [{ result: { pending: [], blocked: [key] } }] },
+    } });
+    expect(out.verdict).toBe('changes');
+    expect(out.findings).toEqual([race]);
+    expect(out.admittedFindings).toEqual([race]);
+    expect(out.deferredAdvisory).toEqual([expect.objectContaining({ summary: 'nit' })]);
+  });
   it('preserves an object range by identity and drops non-objects in the read shaper', () => {
     const raw = stubReader({})({ pr: 7, repo: 'o/n' });
     const latestFix = { priorHead: null };
