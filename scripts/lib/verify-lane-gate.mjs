@@ -188,16 +188,23 @@ export function matchRequestedDefaultGate({ gate, env, resolved, resolveUnder, v
   const ours = { relatedMode: resolved.decision?.relatedMode, factor: resolved.decision?.testTimeoutFactor };
   const relatedModes = variants ? [...new Set([ours.relatedMode, 'all', 'import-only'].filter(Boolean))] : [ours.relatedMode];
   const factors = variants ? [...new Set([ours.factor, stampedTimeoutFactor(gate)].filter((f) => Number.isFinite(f) && f >= 1))] : [ours.factor];
+  // #5128 — a requester without the bounded related selection (an older base, or the limit off) stamps plain
+  // `vitest related`; the "limit off" variant recognizes it so it keeps phase admission instead of whole-gate.
+  const ourLimit = resolved.decision?.selection?.maxTests;
+  const limits = variants && ourLimit > 0 ? [null, 0] : [null];
   for (const relatedMode of relatedModes) {
     for (const factor of factors) {
-      const selection = { WE_VERIFY_RELATED: relatedMode, WE_VERIFY_TEST_TIMEOUT_FACTOR: String(factor) };
-      for (const policy of VERIFY_STANDARDS_POLICIES) {
-        let variant;
-        try { variant = resolveUnder({ ...env, ...selection, WE_VERIFY_STANDARDS: policy }); } catch { continue; }
-        if (variant?.command !== gate || !sameDiff(variant)) continue;
-        if (relatedMode === ours.relatedMode && factor === ours.factor) return resolved;
-        const plan = resolveUnder({ ...env, ...selection });
-        return sameDiff(plan) ? plan : null;
+      for (const limit of limits) {
+        const selection = { WE_VERIFY_RELATED: relatedMode, WE_VERIFY_TEST_TIMEOUT_FACTOR: String(factor),
+          ...(limit === null ? {} : { WE_VERIFY_RELATED_MAX_TESTS: String(limit) }) };
+        for (const policy of VERIFY_STANDARDS_POLICIES) {
+          let variant;
+          try { variant = resolveUnder({ ...env, ...selection, WE_VERIFY_STANDARDS: policy }); } catch { continue; }
+          if (variant?.command !== gate || !sameDiff(variant)) continue;
+          if (relatedMode === ours.relatedMode && factor === ours.factor && limit === null) return resolved;
+          const plan = resolveUnder({ ...env, ...selection });
+          return sameDiff(plan) ? plan : null;
+        }
       }
     }
   }

@@ -15,7 +15,7 @@ import { execSync } from 'node:child_process';
 import { LANE_RELEASE_LITTER_ALLOWLIST } from '../lane-litter.mjs';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
+import { verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -951,6 +951,22 @@ describe('#5128 — bounded related-test selection', () => {
     expect(gate.decision.selection.status).toBe('selection-truncated');
     expect(gate.decision.targets).toEqual(['scripts/hub.mjs']);
     expect(describeGate(gate)).toContain('selection-truncated');
+  });
+
+  it('recognizes a requester without the limit (older base) as the default gate, not a whole-gate fallback', () => {
+    const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'", 'scripts/direct.test.mjs': "import './hub.mjs'" };
+    for (let i = 0; i < 6; i++) files[`scripts/deep${i}.test.mjs`] = "import './mid.mjs'";
+    const git = fakeGit(['scripts/hub.mjs']);
+    const readRepoFile = (path) => files[path];
+    const resolveUnder = (env) => resolveDefaultGate({ env, fileConfig: { relatedMaxTests: 3, relatedDepth: 2 }, readRepoFile,
+      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args) });
+    const resolved = resolveUnder(TODAY);
+    expect(resolved.testCommand).toMatch(/^npx vitest run /);
+    const stamped = resolveUnder({ ...TODAY, WE_VERIFY_RELATED_MAX_TESTS: '0' }).command;
+    expect(stamped).toMatch(/^npx vitest related 'scripts\/hub\.mjs'/);
+    const plan = matchRequestedDefaultGate({ gate: stamped, env: TODAY, resolved, resolveUnder });
+    expect(plan?.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
+    expect(plan.decision.selection ?? null).toBeNull();
   });
 
   it('keeps vitest related under the limit', () => {
