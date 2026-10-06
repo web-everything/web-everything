@@ -436,7 +436,7 @@ deliberate stop from a crash, and re-dispatches a fixer at this PR forever.
 
 For anything beyond a trivial one-liner, spawn **one adversarial code-review subagent** on your repair diff and
 **AWAIT its returned report as the verdict** — the same converge-before-handback discipline the delivery brief
-uses ([we:skills-src/conveyor/delivery-agent-brief.md](delivery-agent-brief.md) step 6). Ask the subagent two things: does the repair meet the reviewer's finding, and **what is the next variant of the same defect class that still gets through?** A same-class variant it names inside `{{SCOPE}}` is must-fix before re-push. You may dismiss a self-review finding only as "not the same class" or "outside `{{SCOPE}}` (filed as <card>)". Deferring ("later", "follow-up") is not a dismissal. Only then re-push. A trivial, obviously-correct fix (a typo, a
+uses ([we:skills-src/conveyor/delivery-agent-brief.md](delivery-agent-brief.md) step 6). Ask the subagent three things: does the repair meet the reviewer's finding, does the repair itself introduce a new problem, and **what is the next variant of the same defect class that still gets through?** A same-class variant it names inside `{{SCOPE}}` is must-fix before re-push. A defect the repair itself introduces is must-fix regardless of class — "not the same class" never dismisses it. You may dismiss any other self-review finding only as "not the same class" or "outside `{{SCOPE}}` (filed as <card>)". Deferring ("later", "follow-up") is not a dismissal. Only then re-push. A trivial, obviously-correct fix (a typo, a
 pinned-count bump) may skip the subagent — but never skip re-reading the reviewer's finding to confirm you met it.
 
 ### 6. Commit + re-push HEAD to the SAME lane ref (update the existing PR in place)

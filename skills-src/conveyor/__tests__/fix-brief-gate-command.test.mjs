@@ -112,7 +112,10 @@ const LOAD_FLAKE_REQUIRED = {
 function loadFlakeParagraph(text) {
   const start = text.indexOf('**Load-flake exception.**');
   expect(start, 'brief has a Load-flake exception paragraph').toBeGreaterThanOrEqual(0);
-  return text.slice(start, text.indexOf('```bash', start));
+  const fence = text.indexOf('```bash', start);
+  // indexOf -1 would make slice(start, -1) swallow the rest of the brief and void the isolation guarantee.
+  expect(fence, 'Load-flake exception paragraph is followed by a bash fence').toBeGreaterThan(start);
+  return text.slice(start, fence);
 }
 
 describe('ci-heal load-flake exit', () => {
@@ -133,12 +136,15 @@ describe('ci-heal load-flake exit', () => {
     expect(text).toContain('--outcome=gate-red');
     expect(text.indexOf('--reason=load-flake')).toBeLessThan(text.indexOf('--outcome=gate-red'));
     expect(text).toContain('Otherwise a red gate is a hard stop');
+    // The saved heal is what the reverify worker retries: the push target and the `--alt=` handoff must both survive.
+    expect(text).toContain('--alt=<saved-alt-branch>');
     // The exit is only safe under its three eligibility conditions: this ordering test must redden if any is dropped,
     // not only the dedicated eligibility test above (the paragraph precedes the command, which precedes the hard stop).
     const paragraph = loadFlakeParagraph(text);
     expectEachGuarded(paragraph, [
       'files your heal did not touch',
       'passes when run alone',
+      'push the heal to `{{LANE_REF}}-heal-{{PR_NUM}}-alt`',
       REVERIFY_WORKER,
     ]);
     expect(text.indexOf(paragraph)).toBeLessThan(text.indexOf('--reason=load-flake'));
@@ -152,7 +158,10 @@ const FIX_THE_CLASS_REQUIRED = [
   'Fix the class, not the instance',
   'next variant',
   'is must-fix before re-push',
-  'You may dismiss a self-review finding only as "not the same class" or "outside `{{SCOPE}}`',
+  'You may dismiss any other self-review finding only as "not the same class" or "outside `{{SCOPE}}` (filed as <card>)"',
+  'filed through `file-item`',
+  'does the repair itself introduce a new problem',
+  'A defect the repair itself introduces is must-fix regardless of class',
   'Deferring ("later", "follow-up") is not a dismissal.',
   'Variants considered:',
 ];
