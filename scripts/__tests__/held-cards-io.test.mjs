@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -139,19 +139,29 @@ process.exitCode = await main(['add', '--title=' + process.argv[2]], { writeFile
     const exec = h.deps.exec;
     h.deps.exec = (bin, args, options) => {
       if (args.includes('file-item') && args.includes('--title=First')) {
-        // Another run reclaimed the lock as stale: a different directory now stands at the lock path.
-        fs.rmdirSync(`${h.list}.filing.lock`);
-        fs.mkdirSync(`${h.list}.filing.lock`);
+        // Another run reclaimed the lock as stale and took it: a different owner now holds the lock path.
+        const lock = `${h.list}.filing.lock`;
+        fs.rmSync(lock, { recursive: true });
+        fs.mkdirSync(lock);
+        fs.writeFileSync(path.join(lock, 'owner'), JSON.stringify({ nonce: 'someone-else', pid: 1, host: 'other' }));
       }
       return exec(bin, args, options);
     };
+    // Linux reuses a freed inode number, so pin it: the takeover must be caught by the owner token, never the inode.
+    const realStat = fs.statSync;
+    const spy = vi.spyOn(fs, 'statSync').mockImplementation((p, ...rest) => {
+      const st = realStat(p, ...rest);
+      return String(p) === `${h.list}.filing.lock` && st ? Object.assign(Object.create(Object.getPrototypeOf(st)), st, { ino: 424242 }) : st;
+    });
     const before = h.text();
-    expect(await h.run(['file', '--blocking'])).toBe(1);
+    try { expect(await h.run(['file', '--blocking'])).toBe(1); } finally { spy.mockRestore(); }
     expect(h.errors.join('')).toContain('lost');
     expect(h.matching('open-pr')).toHaveLength(0);
     expect(h.matching('release')).toHaveLength(1);
     expect(h.text()).toBe(before);
-    fs.rmdirSync(`${h.list}.filing.lock`);
+    // The first run's release must leave the second owner's lock standing.
+    expect(fs.existsSync(`${h.list}.filing.lock`)).toBe(true);
+    fs.rmSync(`${h.list}.filing.lock`, { recursive: true });
   });
   it('files each held card once when several processes run file at the same moment', async () => {
     const h = harness();

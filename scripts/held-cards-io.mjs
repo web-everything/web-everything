@@ -117,9 +117,10 @@ export async function main(argv, deps = {}) {
           key === 'scope' ? String(flags[key]).split(',').map(s => s.trim()).filter(Boolean) : flags[key];
       }
       // Read, number and write under the list lock: two workers adding at once must not allocate one number.
-      const appended = withFileLock(list, () => {
+      const appended = withFileLock(list, ({ touch }) => {
         const result = appendHeldCard(read(list, ''), { title: flags.title, body: flags.body || '',
           nowEt: etTime(now()), meta: Object.keys(meta).length ? meta : null });
+        touch(); // still the holder? Then commit.
         writeFile(list, result.md, 'utf8');
         return result;
       });
@@ -195,7 +196,11 @@ export async function main(argv, deps = {}) {
       // Re-read under the lock so an `add` that landed during filing is kept, not overwritten.
       // The PR exists now, so wait generously: failing here would leave its cards unmarked and refile them.
       beat();
-      withFileLock(list, () => writeFile(list, markFiled(read(list, ''), filed, { dateEt, pr }), 'utf8'), { timeoutMs: 60000 });
+      withFileLock(list, ({ touch }) => {
+        const marked = markFiled(read(list, ''), filed, { dateEt, pr });
+        touch(); // still the holder? Then commit.
+        writeFile(list, marked, 'utf8');
+      }, { timeoutMs: 60000 });
       say(flags.json ? JSON.stringify({ filed, failed, pr }) : filed.map(item => `FILED ${item.num} as ${item.id}, PR #${pr}`).join('\n'));
       return 0;
     } finally {
