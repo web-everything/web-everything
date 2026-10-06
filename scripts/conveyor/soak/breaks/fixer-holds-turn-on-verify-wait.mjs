@@ -14,6 +14,7 @@
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..', '..');
 const PASS = 'scripts/conveyor/await-verify-pass.mjs';
@@ -33,7 +34,7 @@ export async function replay(root = REPO_ROOT) {
   const store = new Map();
   const pushes = []; const resumes = []; const rerequests = [];
   const state = {};
-  const base = { v: 1, sessionId: '0c5f3830-1522-49ab-8f20-e4108ccc926b', who: 'fix-4115', repo: 'web-everything/web-everything',
+  const base = { v: 1, sessionId: '0c5f3830-1522-49ab-8f20-e4108ccc926b', who: 'fix-4115', repo: CONSTELLATION_REPOS.we.slug,
     pr: 4115, lane: '/lanes/lane-5', ref: 'lane/item-68b', kind: 'fix' };
   const io = {
     listRecords: () => [...store.entries()].map(([key, record]) => ({ key, record })),
