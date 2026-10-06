@@ -1,9 +1,10 @@
 ---
 bornAs: x1ds37v
 kind: task
-status: open
+status: resolved
 scope: ["we:scripts/readiness/heavy-admission.mjs"]
 dateOpened: "2026-10-05"
+dateResolved: "2026-10-06"
 tags: []
 ---
 
