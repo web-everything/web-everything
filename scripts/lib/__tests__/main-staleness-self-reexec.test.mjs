@@ -161,6 +161,7 @@ process.stdout.write('dispatched mode=' + MODE + '\\n');
     mkdirSync(join(pusher, 'scripts', 'lib'), { recursive: true });
     copyFileSync(MODULE, join(pusher, 'scripts', 'lib', 'main-staleness.mjs'));
     // x5wbsbc — main-staleness.mjs imports its last-good read; the toy checkout needs it too.
+    copyFileSync(join(dirname(MODULE), 'daemon-clone-layout.mjs'), join(pusher, 'scripts', 'lib', 'daemon-clone-layout.mjs'));
     copyFileSync(join(dirname(MODULE), 'daemon-last-good.mjs'), join(pusher, 'scripts', 'lib', 'daemon-last-good.mjs'));
     writeFileSync(join(pusher, 'cli.mjs'), cli('session'));
     git(pusher, 'add', '.'); git(pusher, 'commit', '-qm', 'old: session mode');

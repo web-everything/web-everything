@@ -40,6 +40,8 @@ const stage = (root) => {
   // every marker counter runs a comment through) — stage it too, or the staged copy fails to import and
   // `main()` silently never runs (the exact failure mode this file's own header names).
   copyFileSync(join(dirname(LEAF), 'marker-authorship.mjs'), join(root, 'lib/marker-authorship.mjs'));
+  // card 89 S1 — daemon-last-good.mjs now imports the daemon-clone-layout leaf (logical clone identity).
+  copyFileSync(join(dirname(LEAF), 'daemon-clone-layout.mjs'), join(root, 'lib/daemon-clone-layout.mjs'));
   // #4077 — the HEALTH section (`--with-health`) reads the health store via `../conveyor/health-watch-section.mjs`,
   // which renders through the pure core (+ its `../lib/secret-scrub.mjs` leaf) — stage all three, same reason as
   // above.
