@@ -3,9 +3,10 @@ bornAs: xjyvpkf
 kind: story
 size: 5
 parent: "5140"
-status: open
+status: resolved
 scope: ["we:scripts/"]
 dateOpened: "2026-10-05"
+dateResolved: "2026-10-06"
 tags: []
 ---
 
