@@ -44,8 +44,8 @@ function logHit(env, repo, caller, op) {
 }
 
 /** Once per tick: refresh the mirror for each repo from the Worker (never GitHub). Best-effort; never throws. */
-export async function warmReviewFacts(repos, { env = process.env, load = loadMirror } = {}) {
-  if (!reviewFactsEnabled(env)) return { warmed: [], skipped: `${REVIEW_FACTS_ENV}=0` };
+export async function warmReviewFacts(repos, { env = process.env, load = loadMirror, switchEnv = REVIEW_FACTS_ENV } = {}) {
+  if (String(env[switchEnv] ?? '').trim() === '0') return { warmed: [], skipped: `${switchEnv}=0` };
   const warmed = [];
   for (const repo of repos || []) {
     try { const r = await load({ repo, env }); warmed.push({ repo, ok: !!r.mirror, reason: r.reason ?? null }); }
@@ -55,8 +55,9 @@ export async function warmReviewFacts(repos, { env = process.env, load = loadMir
 }
 
 /** Sync facts lookup from the on-disk mirror. `{ facts, source:'store', reason }` or `{ facts:null, source:'github', reason }`. */
-export function lookupReviewFacts({ repo, number, env = process.env, now = Date.now(), caller = 'review-daemon.mjs', dir = null } = {}) {
-  if (!reviewFactsEnabled(env)) return { facts: null, source: 'github', reason: `${REVIEW_FACTS_ENV}=0` };
+export function lookupReviewFacts({ repo, number, env = process.env, now = Date.now(), caller = 'review-daemon.mjs', dir = null, switchEnv = REVIEW_FACTS_ENV } = {}) {
+  // `switchEnv` lets another daemon reuse this lookup under its OWN off-switch (the fix dispatcher: `WE_FIX_FACTS`).
+  if (String(env[switchEnv] ?? '').trim() === '0') return { facts: null, source: 'github', reason: `${switchEnv}=0` };
   const cfg = resolvePrFactsConfig(env);
   if (!cfg.enabled) return { facts: null, source: 'github', reason: `disabled: ${cfg.disabledReason}` };
   const path = mirrorPath(dir ?? cfg.dir, repo);

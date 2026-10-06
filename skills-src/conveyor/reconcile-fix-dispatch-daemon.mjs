@@ -77,6 +77,7 @@ import { withSelfSync } from '../../scripts/lib/daemon-self-sync.mjs';
 import { withPrEvents } from '../../scripts/lib/pr-events.mjs';
 import { isStaleMainRefusalMessage } from '../../scripts/lib/main-staleness.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
+import { warmFixFacts, takeFixReadStats, formatFixReadStats } from '../../scripts/lib/fix-facts.mjs'; // perf C1d (`WE_FIX_FACTS=0` = off)
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel and from the Verify
  *  daemon's own key (#3878), so none of the three ever contend on the same lock dir (#3877). */
@@ -607,6 +608,10 @@ export async function runTickAllRepos({
   // ONLY for a genuine production tick — mirrors `queueAdmission`'s own "only read when a real tick runs" rule
   // just below: a test that injects EITHER `fixTick` or `ciHealTick` never wants this file to shell out for a
   // gate decision it did not ask about, unless it explicitly injects `authGateOverride` to test the gate itself.
+  // perf C1d — once a real tick: refresh the PR-facts mirror from the Worker (NOT a GitHub call). Best-effort; the
+  // timeout-evidence reads then try the store first and fall back to GitHub on stale/partial (see `fix-facts.mjs`).
+  const realTick = !fixTick && !ciHealTick;
+  const factsWarm = realTick ? await warmFixFacts(repos) : null;
   const authGate = authGateOverride ? authGateOverride()
     : ((fixTick || ciHealTick) ? { paused: false, reason: null } : planClaudeAuthDispatchGate());
   const pausedDispatchResult = () => ({
@@ -676,6 +681,7 @@ export async function runTickAllRepos({
     notes: notes.notes, // #4191 — every surfaced note this tick saw, repo-tagged
     noteComments: notes.comments, // #4191 — one row per note: posted / would-post (dryRun) / already-posted
     statusTags, // #3383 follow-up — one row per dispatch-time `review-status:*` tag attempt this tick made
+    ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
   };
 }
 
@@ -813,6 +819,10 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
         repos = [], dispatched = [], refusals = [], reconcileRefusals = [], hungCi, mainRedRebase, missingRun, promoteDraft, notes = [], noteComments = [],
         authPaused = false, authPauseReason = null, statusTags = [],
       } = result || {};
+      if (result?.factsStats) {
+        const w = result.factsWarm;
+        log.error(`reconcile-fix-dispatch-daemon: pr-facts ${w?.skipped ? `off (${w.skipped})` : (w?.warmed ?? []).map((x) => `${x.repo.split('/')[1]}=${x.ok ? 'store' : `github (${x.reason})`}`).join(' ')} — reads: ${formatFixReadStats(result.factsStats)}`);
+      }
       log.error(`reconcile-fix-dispatch-daemon: tick (${repos.map((r) => r.repo).join(', ')}) — dispatched ${dispatched.length}, refused ${refusals.length}`);
       // card x5kagse (epic #4075/#3383) — logged EVERY tick fix/ci-heal dispatch stays paused, exact wording
       // required by the card and matched by the soak scenario/live-proof read; never merely implied by an
