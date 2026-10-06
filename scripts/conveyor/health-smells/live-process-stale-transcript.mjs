@@ -13,6 +13,7 @@
  * reported clean with `bindings: 0` (nothing to judge), never guessed stale.
  */
 import { MINUTE, fmtAge } from '../health-watch-core.mjs';
+import { expandRepeatedLines } from '../../lib/log-timestamp.mjs';
 
 export const LIVE_PROCESS_REFUSAL_RE = /reconcile-refused live-process (\S+) PR #(\d+)/g;
 
@@ -20,7 +21,7 @@ export const LIVE_PROCESS_REFUSAL_RE = /reconcile-refused live-process (\S+) PR 
 export function liveProcessRefusals(daemonLogs) {
   const byKey = new Map();
   for (const s of daemonLogs || []) {
-    for (const m of String(s?.text || '').matchAll(LIVE_PROCESS_REFUSAL_RE)) {
+    for (const m of expandRepeatedLines(s?.text || '').matchAll(LIVE_PROCESS_REFUSAL_RE)) {
       const key = `${m[1]}#${m[2]}`;
       const e = byKey.get(key) ?? { repo: m[1], pr: Number(m[2]), count: 0 };
       e.count += 1;

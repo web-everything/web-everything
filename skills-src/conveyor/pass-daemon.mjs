@@ -56,7 +56,12 @@ import {
 } from './runner-lock.mjs';
 import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 import { withSelfSync, resolvePocSyncBranch, DAEMON_SELF_SYNC_BRANCH_ENV } from '../../scripts/lib/daemon-self-sync.mjs';
-import { installDaemonLog } from './daemon-log.mjs';
+import { StringDecoder } from 'node:string_decoder';
+import { installDaemonLog, stripLogTimestamp } from './daemon-log.mjs';
+
+const CLOSE_GRACE_MS = 5000;
+/** The most output a relayed child stream may buffer without a newline before it is flushed as a line of its own. */
+const MAX_RELAY_LINE_CHARS = 1024 * 1024;
 
 /** How often the INDEPENDENT heartbeat timer fires, regardless of whether a pass is mid-run. Deliberately
  *  much shorter than any pass's own `intervalMs` — it exists precisely to keep beating DURING a long single
@@ -189,11 +194,55 @@ export async function waitForManifestEntry(passName, { manifest = DAEMON_MANIFES
  *  path). */
 export function spawnPassOnce({ script, args = [] }, { root = REPO_ROOT, log = console, env = process.env, spawnFn = spawn } = {}) {
   return new Promise((resolve) => {
-    const child = spawnFn(process.execPath, [join(root, script), ...args], { stdio: ['ignore', 'inherit', 'inherit'], env });
-    child.on('exit', (code, signal) => {
+    // 68b: the child's output is relayed line by line through this process's own (stamped, de-duplicated, rotated)
+    // console instead of inherited, so the big health-watch logs get timestamps and a size cap too.
+    const child = spawnFn(process.execPath, [join(root, script), ...args], { stdio: ['ignore', 'pipe', 'pipe'], env });
+    // Each relayed line is stamped ONCE, by this process's log: a stamp the child already wrote is dropped first, or
+    // `<ISO> <ISO> name: tick` would no longer parse as a `name:` line. A StringDecoder keeps a multi-byte character
+    // split across two chunks whole.
+    const relay = (stream, write) => {
+      if (!stream || typeof stream.on !== 'function') return () => {};
+      let pending = '';
+      const decoder = new StringDecoder('utf8');
+      stream.on('data', (chunk) => {
+        const text = typeof chunk === 'string' ? chunk : decoder.write(chunk);
+        // Split only what just arrived, never the whole buffer again: a flood of tiny newline-free chunks would
+        // otherwise re-scan up to the cap on every event.
+        const nl = text.lastIndexOf('\n');
+        if (nl === -1) pending += text;
+        else {
+          const parts = (pending + text.slice(0, nl)).split('\n');
+          pending = text.slice(nl + 1);
+          for (const l of parts) write(stripLogTimestamp(l));
+        }
+        // A child that never ends a line must not grow this long-lived daemon's memory without bound: past the cap
+        // the buffered text goes out as a line of its own (never splitting a surrogate pair).
+        while (pending.length > MAX_RELAY_LINE_CHARS) {
+          let cut = MAX_RELAY_LINE_CHARS;
+          const last = pending.charCodeAt(cut - 1);
+          if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
+          write(stripLogTimestamp(pending.slice(0, cut)));
+          pending = pending.slice(cut);
+        }
+      });
+      return () => { pending += decoder.end(); if (pending) { write(stripLogTimestamp(pending)); pending = ''; } };
+    };
+    const flushOut = relay(child.stdout, (l) => log.log(l));
+    const flushErr = relay(child.stderr, (l) => log.error(l));
+    // Finish on 'close' (stdio fully drained), not 'exit' (which can fire with pipe data still unread). A grandchild
+    // that inherited the pipes can hold 'close' off forever, so 'exit' arms a short grace timer as a backstop.
+    let finished = false;
+    let graceTimer = null;
+    const finish = (code, signal) => {
+      if (finished) return;
+      finished = true;
+      if (graceTimer) clearTimeout(graceTimer);
+      flushOut(); flushErr();
       if (code !== 0) log.error(`pass-daemon: ${script} exited ${signal ? `on ${signal}` : `with code ${code}`}`);
       resolve({ code, signal });
-    });
+    };
+    child.on('exit', (code, signal) => { graceTimer = setTimeout(() => finish(code, signal), CLOSE_GRACE_MS); graceTimer.unref?.(); });
+    child.on('close', (code, signal) => finish(code, signal));
     child.on('error', (e) => { log.error(`pass-daemon: failed to spawn ${script}: ${String((e && e.message) || e)}`); resolve({ code: null, signal: null, spawnError: String((e && e.message) || e) }); });
   });
 }

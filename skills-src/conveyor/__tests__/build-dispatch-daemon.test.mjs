@@ -1431,7 +1431,7 @@ describe('build-dispatch-daemon.mjs boots as a fresh `node` process — the clas
       status = e.status;
     }
     expect(stderr).not.toMatch(/ReferenceError|before initialization/);
-    expect(stderr).toMatch(/^usage: build-dispatch-daemon\.mjs/);
+    expect(stderr).toMatch(/^(?:\d{4}-\d\d-\d\dT\S+Z )?usage: build-dispatch-daemon\.mjs/); // 68b: main() stamps its output
     expect(status).toBe(2);
   });
 });

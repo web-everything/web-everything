@@ -32,6 +32,7 @@
  */
 
 import { PLANNING_SNAPSHOT_ENV } from '../../scripts/lib/planning-snapshot.mjs';
+import { installDaemonLog } from './daemon-log.mjs';
 import { readShaCache, writeShaCache } from '../../scripts/lib/pr-snapshot.mjs';
 import { createPhaseTimer } from '../../scripts/lib/phase-timer.mjs';
 import { resolveOperationRoute, routingPolicyEnv } from '../../scripts/lib/dispatch-routing-policy-io.mjs';
@@ -1820,6 +1821,7 @@ async function live(flags) {
 }
 
 async function main(argv) {
+  installDaemonLog(); // item 68a/68b: ISO stamp, collapse identical repeats, size-rotate (see daemon-log.mjs)
   const flags = parseFlags(argv);
   if (flags['dry-run']) return dryRun(flags);
   if (flags.live) return live(flags);
