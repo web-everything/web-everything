@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, existsSync } from '
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { fileKeys, ruleVersion, resetClosureMemo, openSectionCache, cacheEnabled } from '../standards-cache.mjs';
+import { fileKeys, ruleVersion, resetClosureMemo, openSectionCache, cacheEnabled, gitGrepCached } from '../standards-cache.mjs';
 
 const mk = () => mkdtempSync(join(tmpdir(), 'stdcache-'));
 
@@ -89,5 +89,52 @@ describe('standards-cache', () => {
     expect(readdirSync(dir)).toEqual([]);
     const d = openSectionCache({ section: 's', version: 'v1', env }); d.record('k', []); d.commit();
     expect(openSectionCache({ section: 's', version: 'v2', env }).lookup('k')).toBeUndefined();
+  });
+});
+
+describe('gitGrepCached (70c)', () => {
+  const setup = () => {
+    const r = mk();
+    const g = (...a) => execFileSync('git', a, { cwd: r });
+    g('init', '-q');
+    mkdirSync(join(r, 'skip'));
+    writeFileSync(join(r, 'a.txt'), 'x\nhit one\nhit two\n');
+    writeFileSync(join(r, 'b:c.txt'), 'hit colon-name\n');
+    writeFileSync(join(r, 'skip', 'z.txt'), 'hit skipped\n');
+    writeFileSync(join(r, 'n.txt'), 'nothing\n');
+    g('add', '.');
+    const entry = join(r, 'rule.mjs');
+    writeFileSync(entry, 'export const a = 1;\n');
+    return { r, entry, cache: mk() };
+  };
+  const plain = (r) => execFileSync('git', ['grep', '--threads=1', '-nE', 'hit', '--', '.', ':!skip'], { cwd: r, encoding: 'utf8' }).split('\n').filter(Boolean);
+  const run = (s, extra = {}, stats = []) => gitGrepCached({
+    section: 'g', entries: [s.entry], root: s.r, pattern: 'hit', exclude: (f) => f.startsWith('skip/'),
+    getKeys: () => fileKeys(s.r), env: { WE_STANDARDS_CACHE_DIR: s.cache, ...extra }, onStats: (l) => stats.push(l),
+  });
+
+  it('cold == warm == plain git grep; an edit re-greps only that file; off/CI return null', () => {
+    const s = setup();
+    resetClosureMemo();
+    const st = [];
+    expect(run(s, {}, st)).toEqual(plain(s.r));
+    expect(run(s, {}, st)).toEqual(plain(s.r));
+    expect(st[0]).toMatch(/0 hit \/ 3 miss/);
+    expect(st[1]).toMatch(/3 hit \/ 0 miss/);
+    writeFileSync(join(s.r, 'n.txt'), 'hit now\n');
+    expect(run(s, {}, st)).toEqual(plain(s.r));
+    expect(st[2]).toMatch(/2 hit \/ 1 miss/);
+    expect(run(s, { WE_STANDARDS_CACHE: '0' })).toBeNull();
+    expect(run(s, { CI: '1' })).toBeNull();
+  });
+
+  it('a changed rule module (pattern host) invalidates the cache', () => {
+    const s = setup();
+    const st = [];
+    run(s, {}, st);
+    writeFileSync(s.entry, 'export const a = 2;\n');
+    resetClosureMemo();
+    run(s, {}, st);
+    expect(st[1]).toMatch(/0 hit/);
   });
 });

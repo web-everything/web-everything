@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { scanFilesCached, fileKeys } from '../standards-cache.mjs';
-import { scanRepoLocusPrefixes, scanHarnessScaffolding } from '../../check-standards-rules.mjs';
+import { scanRepoLocusPrefixes, scanHarnessScaffolding, scanPublishSecrets } from '../../check-standards-rules.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const scripts = join(here, '..', '..');
@@ -57,5 +57,20 @@ describe.each([['6f', scanRepoLocusPrefixes], ['6f-i-b', scanHarnessScaffolding]
     run(r, cache, scan, section);
     const ci = run(r, cache, scan, section, { CI: '1' });
     expect(ci.stat).toBe('');
+  });
+});
+
+describe('cache parity 6f-i (secret sweep)', () => {
+  it('cold == warm == uncached; an edit that adds a secret is found, not replayed from cache', () => {
+    const { r, cache } = fixture();
+    const go = (extra = {}) => run(r, cache, scanPublishSecrets, '6f-i', extra);
+    const uncached = go({ WE_STANDARDS_CACHE: '0' }).out;
+    expect(go().out).toBe(uncached);
+    expect(go().out).toBe(uncached);
+    writeFileSync(join(r, 'backlog', 'b.md'), 'reach me at bob@example.com\n');
+    const edited = go();
+    expect(edited.stat).toMatch(/2 hit \/ 1 miss/);
+    expect(edited.out).toBe(go({ WE_STANDARDS_CACHE: '0' }).out);
+    expect(edited.out).toContain('backlog/b.md');
   });
 });
