@@ -300,6 +300,24 @@ describe('computeOverlapContext — the drain\'s IO orchestration (2026-09-29 re
     expect(skips.get('we#2')).toEqual([{ pr: 1, repo: 'we', reason: 'red-ci', token: 'overlap-yield-skipped:#1(red-ci)' }]);
   });
 
+  it('skipRed:false (WE_DRAIN_YIELD_SKIP_RED=0) keeps the red-target wait through trial and final passes', () => {
+    const red = row(1, { requiredCheckRed: true, files: [{ path: 'shared.md', additions: 500 }] });
+    const { waits, skips, settings } = computeOverlapContext({
+      candidateRows: [xRow(2)], openPrRows: [red], nowMs: T0,
+      exec: trustedExec, ghExec: readyGhExec, overrides: { windowMinutes: 5, skipRed: false },
+    });
+    expect(settings.skipRed).toBe(false);
+    expect(waits.get('we#2').yieldTo).toBe(1);
+    expect(skips.size).toBe(0);
+
+    const control = computeOverlapContext({
+      candidateRows: [xRow(2)], openPrRows: [red], nowMs: T0,
+      exec: trustedExec, ghExec: readyGhExec, overrides: { windowMinutes: 5, skipRed: true },
+    });
+    expect(control.waits.get('we#2')?.yieldTo).not.toBe(1);
+    expect(control.skips.get('we#2')).toContainEqual(expect.objectContaining({ pr: 1, reason: 'red-ci' }));
+  });
+
   it('with NO override, a trusted history value is used', () => {
     const { waits } = computeOverlapContext({
       candidateRows: [xRow(2)], openPrRows: [xRow(2), row(1, { files: [{ path: 'shared.md', additions: 500, deletions: 0 }] })],
