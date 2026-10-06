@@ -74,7 +74,7 @@ import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyS
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
-import { VERIFY_STANDARDS_POLICIES, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { matchRequestedDefaultGate, verifySetting, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
@@ -297,22 +297,28 @@ if (typeof flags.gate === 'string') {
 
 // The dispatcher passes the requested default command back via --gate. Recognize that exact command,
 // without interpreting arbitrary shell overrides or accidentally skipping their remaining steps.
+let admissionFallback = null;
 if (!resolvedGate && typeof flags.gate === 'string') {
   try {
     const resolveUnder = (env) => resolveDefaultGate({ runGit: git, env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)) });
     const resolved = resolveUnder(process.env);
     if (resolved.command === GATE) resolvedGate = resolved;
-    // The standards policy belongs to the dispatching daemon's environment, which the requesting agent's
-    // usually lacks, so the stamped command can differ from this child's only by that policy. If it is exactly
-    // what some policy resolves to for this diff it is still the default gate: apply OUR policy, and keep
-    // `GATE` (the marker's `suites`) as requested so the request/check/cache key still matches.
-    // Each resolution reads git afresh, so the matching variant must also have seen the diff `resolved` saw.
-    else if (MODE === 'verify' && typeof flags['run-id'] === 'string'
-        && VERIFY_STANDARDS_POLICIES.some((policy) => {
-          const variant = resolveUnder({ ...process.env, WE_VERIFY_STANDARDS: policy });
-          return variant.command === GATE && JSON.stringify(variant.decision.changedFiles) === JSON.stringify(resolved.decision.changedFiles);
-        })) resolvedGate = resolved;
+    // The requester (an agent session, often on an older lane base) resolves its default gate under ITS settings,
+    // which can differ from this dispatched child's (the daemon's env + checkout file): the standards policy,
+    // and (#66) the related-test mode or timeout factor. If the stamped command is exactly what some declared
+    // variant resolves to for this same diff, it is still the default gate: run the requester's selection with
+    // OUR standards policy, and keep `GATE` (the marker's `suites`) as requested so the cache key still matches.
+    else if (MODE === 'verify' && typeof flags['run-id'] === 'string') {
+      resolvedGate = matchRequestedDefaultGate({ gate: GATE, env: process.env, resolved, resolveUnder,
+        variants: verifySetting('matchRequestVariants', process.env) }) ?? undefined;
+    }
   } catch { /* Unknown selection cannot authorize a retry. */ }
+  // #66 — never fall back to whole-gate admission silently: say so on stderr (the dispatcher copies this line into
+  // the daemon log) and record the reason in the marker's phases.
+  if (!resolvedGate && MODE === 'verify' && typeof flags['run-id'] === 'string' && GATE.startsWith('npx vitest related ')) {
+    admissionFallback = 'requested gate is not this checkout\'s default selection under any declared settings variant';
+    process.stderr.write(`\n⚠ verify-lane: whole-gate admission — ${admissionFallback}\n`);
+  }
 }
 
 // 1. Stamp the `running` marker BEFORE the suites start, so a kill mid-run leaves a stranded (detectably
@@ -555,7 +561,8 @@ try {
   if ((!phaseAdmission && admission.ok) || firstPhaseAdmission?.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
 }
 
-const phases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'phase' : 'gate', phases: admissionPhases }, admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes });
+const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'phase' : 'gate', phases: admissionPhases }, admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes });
+const phases = admissionFallback ? { ...builtPhases, admissionFallback } : builtPhases;
 
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }),
   ...(retriedTimeouts.length ? { retriedTimeouts } : {}) };

@@ -19,6 +19,7 @@ import {
   startIndependentHeartbeat, DEFAULT_HEARTBEAT_INTERVAL_MS,
   reconcileInFlight, pidAlive, processGroupAlive, killInFlight, makeCodeChangedGuard, createCleanup, runDaemon,
   VERIFY_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS,
+  resolveRestartInFlight, writeInFlightHandoff, adoptInFlight, isDispatchedRun,
 } from '../verify-daemon.mjs';
 import { laneNeedsVerifyDispatch } from '../../../scripts/conveyor/verify-dispatch.mjs';
 import { VERIFY_FILENAME, verifyStartBody } from '../../../scripts/lib/lane-verify.mjs';
@@ -676,5 +677,93 @@ describe('in-flight PID reconciliation', () => {
       expect(readFileSync(file, 'utf8')).toBe(bytes);
       expect(laneNeedsVerifyDispatch(JSON.parse(readFileSync(file, 'utf8')), 'abc')).toBe(marker.status === 'running');
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+// #65 (coroner-2, 2026-10-05) — a daemon restart (launchd SIGTERM) SIGKILLed every running gate; the successor
+// then re-ran the same lane+sha from scratch (lane-7 @e7f260d3, lane-2 @32303b3e at 19:44Z).
+describe('#65 — a daemon restart hands in-flight gates to its successor instead of killing them', () => {
+  const setup = (inFlight, restartInFlight) => {
+    const order = [];
+    const f = {
+      kill: vi.fn(() => order.push('kill')), stopHeartbeat: vi.fn(() => order.push('heartbeat')),
+      release: vi.fn(() => order.push('release')), exit: vi.fn(() => order.push('exit')), log: { error: vi.fn() },
+      handoff: vi.fn((m) => { order.push('handoff'); return [...m.values()]; }),
+    };
+    return { f, order, cleanup: createCleanup({ inFlight, restartInFlight, ...f }) };
+  };
+
+  it('SIGTERM under restartInFlight: adopt leaves the gates running and writes the hand-off', () => {
+    const inFlight = new Map([['lane', { pid: 777, dir: 'lane', runId: 'r' }]]);
+    const { f, order, cleanup } = setup(inFlight, 'adopt');
+    cleanup.stopAndExit('SIGTERM', { adoptable: true });
+    expect(f.kill).not.toHaveBeenCalled();
+    expect(f.handoff).toHaveBeenCalledWith(inFlight);
+    expect(order).toEqual(['handoff', 'heartbeat', 'release', 'exit']);
+  });
+
+  it('restartInFlight: kill keeps the old teardown; a lease loss always kills; a failed hand-off kills', async () => {
+    const a = setup(new Map([['lane', { pid: 777 }]]), 'kill');
+    a.cleanup.stopAndExit('SIGTERM', { adoptable: true });
+    expect(a.f.kill).toHaveBeenCalledWith(-777, 'SIGKILL');
+    const inFlight = new Map([['lane', { pid: 778 }]]);
+    const b = setup(inFlight, 'adopt');
+    await runDaemon({ effects: { tickOnce: async () => ({}), sleep: async () => {}, isAlive: () => false, inFlight }, cleanup: b.cleanup });
+    expect(b.f.kill).toHaveBeenCalledWith(-778, 'SIGKILL');
+    expect(b.f.handoff).not.toHaveBeenCalled();
+    const c = setup(new Map([['lane', { pid: 779 }]]), 'adopt');
+    c.f.handoff.mockImplementation(() => { throw new Error('disk full'); });
+    c.cleanup.stopAndExit('SIGTERM', { adoptable: true });
+    expect(c.f.kill).toHaveBeenCalledWith(-779, 'SIGKILL');
+  });
+
+  it('defaults to adopt (declared setting), and the env can restore the old kill', () => {
+    expect(resolveRestartInFlight({})).toBe('adopt');
+    expect(resolveRestartInFlight({ WE_VERIFY_RESTART_IN_FLIGHT: 'kill' })).toBe('kill');
+  });
+
+  it('the successor adopts a still-running dispatched gate (real process, real argv check) and skips the rest', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'verify-adopt-'));
+    const { spawn } = await import('node:child_process');
+    const script = join(root, 'verify-lane.mjs');
+    writeFileSync(script, 'setTimeout(() => {}, 20000);');
+    const child = spawn('node', [script, '--repo=x', '--json', '--run-id=run-live'], { stdio: 'ignore', detached: true });
+    try {
+      const path = join(root, 'inflight.json');
+      const before = new Map([
+        ['/lanes/a', { pool: 'p', lane: 1, dir: '/lanes/a', runId: 'run-live', pid: child.pid, sha: 'aaa', suites: 'g', treeHash: 't', requestStartedAt: 's', startedMs: 1, logPath: null }],
+        ['/lanes/b', { pool: 'p', lane: 2, dir: '/lanes/b', runId: 'run-reused', pid: process.pid, sha: 'bbb', suites: 'g', treeHash: 't', requestStartedAt: 's', startedMs: 1 }],
+        ['/lanes/c', { pool: 'p', lane: 3, dir: '/lanes/c', runId: 'run-unspawned', pid: null }],
+      ]);
+      expect(writeInFlightHandoff(before, path)).toHaveLength(2);
+      for (let i = 0; i < 50 && !isDispatchedRun(child.pid, 'run-live'); i += 1) await new Promise(r => setTimeout(r, 20));
+      const inFlight = new Map();
+      const adopted = adoptInFlight(inFlight, { path, log: () => {} });
+      expect(adopted.map(r => r.runId)).toEqual(['run-live']); // this test process is not a verify-lane child
+      expect(inFlight.get('/lanes/a')).toMatchObject({ adopted: true, sha: 'aaa', suites: 'g', treeHash: 't', pid: child.pid });
+      expect(existsSync(path)).toBe(false);
+      expect(adoptInFlight(new Map(), { path })).toEqual([]);
+    } finally {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 10000);
+
+  it('an adopted run that exits is released (its child wrote the marker); one past the ceiling is killed and settled', () => {
+    const log = vi.fn();
+    const killGroup = vi.fn();
+    const settleKilled = vi.fn();
+    const inFlight = new Map([
+      ['done', { pool: 'p', lane: 1, runId: 'r1', pid: 11, startedMs: 0, adopted: true }],
+      ['hung', { pool: 'p', lane: 2, runId: 'r2', pid: 22, startedMs: 0, adopted: true }],
+      ['fresh', { pool: 'p', lane: 3, runId: 'r3', pid: 33, startedMs: 9_000, adopted: true }],
+    ]);
+    const { orphaned } = reconcileInFlight(inFlight, { isAlive: (pid) => pid !== 11, groupAlive: () => true, killGroup,
+      nowMs: 10_000, adoptedCeilingMs: 5_000, settleKilled, log });
+    expect(orphaned.map(o => o.reason)).toEqual(['pid-gone', 'adopted-ceiling']);
+    expect(settleKilled).toHaveBeenCalledWith(expect.objectContaining({ runId: 'r2' }), 5_000);
+    expect(killGroup).toHaveBeenCalledWith(-22);
+    expect([...inFlight.keys()]).toEqual(['fresh']);
+    expect(log.mock.calls.flat().join('\n')).toMatch(/adopted run r1.*finished/);
   });
 });

@@ -158,6 +158,51 @@ export function verifyStandardsPolicy(env, fileConfig = defaultFileConfig) {
 
 export const VERIFY_STANDARDS_POLICIES = Object.freeze(['always', 'auto', 'ci-only']);
 
+/** The resolved value of one declared verify setting (environment over the running checkout's file). */
+export function verifySetting(key, env, fileConfig = defaultFileConfig) {
+  return resolveVerifySettings({ fileConfig, env }).values[key];
+}
+
+/** The timeout factor a stamped gate command was composed with (`--testTimeout=N`), or 1 when it carries none. */
+export function stampedTimeoutFactor(gate) {
+  const match = /--testTimeout=(\d+)(?:\s|$)/.exec(String(gate ?? ''));
+  return match ? Number(match[1]) / VITEST_BASE_TIMEOUTS.testTimeout : 1;
+}
+
+/**
+ * #66 — recognize a dispatched child's `--gate` as the requester's DEFAULT gate even when the requester resolved it
+ * under different settings than this child (an older lane base without the settings file, or a session whose env
+ * lacks the daemon's `WE_VERIFY_*`). Before this, only the standards policy was varied: a `relatedMode` or timeout
+ * factor drift made the stamped command unrecognized, so the run fell back to whole-gate admission
+ * (`admissionMode: gate`, `relatedMode: null`) — 16-21 min instead of 3-5 under contention (coroner-2, 2026-10-05).
+ *
+ * Returns the run plan, or null. The plan keeps the REQUESTER's target selection (relatedMode + timeout factor —
+ * the exact vitest and scan commands that were stamped) and this child's own standards policy (the pre-existing
+ * rule). Every variant must also have seen the same changed set as `resolved`. Pure over the injected resolver.
+ * @param {{gate:string, env:object, resolved:object, resolveUnder:(env:object)=>object, variants?:boolean}} o
+ */
+export function matchRequestedDefaultGate({ gate, env, resolved, resolveUnder, variants = true }) {
+  if (!resolved || typeof gate !== 'string') return null;
+  const sameDiff = (variant) => JSON.stringify(variant.decision?.changedFiles) === JSON.stringify(resolved.decision?.changedFiles);
+  const ours = { relatedMode: resolved.decision?.relatedMode, factor: resolved.decision?.testTimeoutFactor };
+  const relatedModes = variants ? [...new Set([ours.relatedMode, 'all', 'import-only'].filter(Boolean))] : [ours.relatedMode];
+  const factors = variants ? [...new Set([ours.factor, stampedTimeoutFactor(gate)].filter((f) => Number.isFinite(f) && f >= 1))] : [ours.factor];
+  for (const relatedMode of relatedModes) {
+    for (const factor of factors) {
+      const selection = { WE_VERIFY_RELATED: relatedMode, WE_VERIFY_TEST_TIMEOUT_FACTOR: String(factor) };
+      for (const policy of VERIFY_STANDARDS_POLICIES) {
+        let variant;
+        try { variant = resolveUnder({ ...env, ...selection, WE_VERIFY_STANDARDS: policy }); } catch { continue; }
+        if (variant?.command !== gate || !sameDiff(variant)) continue;
+        if (relatedMode === ours.relatedMode && factor === ours.factor) return resolved;
+        const plan = resolveUnder({ ...env, ...selection });
+        return sameDiff(plan) ? plan : null;
+      }
+    }
+  }
+  return null;
+}
+
 export const STANDARDS_AUTO_PREFIXES =Object.freeze([
   'backlog/', 'docs/', 'config/', 'agent-memory-src/', 'skills-src/', '.claude/',
   '.github/', 'src/', 'blocks/', 'research/', 'site/',
