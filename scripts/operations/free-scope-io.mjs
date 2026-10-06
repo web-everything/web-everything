@@ -67,6 +67,8 @@ export function ghExec(env = process.env) {
 }
 /** `gh pr list --limit` page size. A page this full may have been cut off, so it is never trusted as complete. */
 export const OPEN_PR_LIMIT = 200;
+/** `gh pr list --json files` lists at most this many files per PR; a PR at the cap may touch more than it shows. */
+export const PR_FILES_LIMIT = 100;
 export function readOpenPrs({ repos = DEFAULT_REPOS, exec }) {
   const prs = [], unreadable = [];
   for (const repo of repos) {
@@ -74,7 +76,11 @@ export function readOpenPrs({ repos = DEFAULT_REPOS, exec }) {
       const rows = JSON.parse(exec(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,url,files']));
       prs.push(...rows.map(({ number, title, url, files }) => ({ repo, number, title, url, files: files.map((f) => f.path) })));
       // The rows read still count as holders, but the snapshot is incomplete: never let it answer "free".
-      if (rows.length >= OPEN_PR_LIMIT) unreadable.push({ repo, error: `open PR list hit the ${OPEN_PR_LIMIT}-row limit and may be truncated` });
+      const why = [];
+      if (rows.length >= OPEN_PR_LIMIT) why.push(`open PR list hit the ${OPEN_PR_LIMIT}-row limit and may be truncated`);
+      const capped = rows.filter(({ files }) => files.length >= PR_FILES_LIMIT).map(({ number }) => `#${number}`);
+      if (capped.length) why.push(`PR ${capped.join(', ')} list${capped.length === 1 ? 's' : ''} ${PR_FILES_LIMIT} files (the gh cap) and may touch more`);
+      if (why.length) unreadable.push({ repo, error: why.join('; ') });
     } catch (error) { unreadable.push({ repo, error: error.message.split(/\r?\n/)[0] }); }
   }
   return { prs, unreadable };

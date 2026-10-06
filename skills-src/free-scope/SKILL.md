@@ -18,7 +18,7 @@ node scripts/operations/free-scope-cli.mjs check --card=<NNN or xHASH>     # use
 
 - Bare paths are read as `we:`. A trailing `/`, a glob, or an extensionless last segment is a whole subtree.
 - Exit `0` = all free, `1` = occupied (each line names the PR number or the agent holding it),
-  `2` = unknown (a repo's open PRs could not be read; never treat that as free) or bad usage.
+  `2` = unknown (a repo's open PRs could not be read in full; never treat that as free) or bad usage.
 - The same check is a declared operation: `node scripts/operations/run.mjs free-scope --files=… [--card=…]`.
 
 ## Register and release (every worker)
@@ -38,7 +38,7 @@ node scripts/operations/free-scope-cli.mjs list
 
 Right before `open-pr`, re-run the check while excluding yourself:
 `check --files=<list> --exclude-agent=<purpose>` (and `--exclude-pr=<N>` when re-pushing your own web-everything PR; `--exclude-pr=plateau-app#<N>` for a PR in another repo, since PR numbers repeat across repos).
-If a repo has 200 or more open PRs the list may be cut off, so the verdict is `unknown`, never `free`.
+If a repo has 200 or more open PRs, or any PR lists 100 files (the `gh` cap), the snapshot may be cut off. The verdict is `unknown`, never `free`, and every file not already held reads `UNKNOWN` (`state: "unknown"`, `free: false`) in the rows too.
 If something new holds your files, stop and report. Do not push over it.
 
 ## Read only

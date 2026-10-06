@@ -77,6 +77,27 @@ describe('free-scope core', () => {
     expect(assess({ unreadable, prs: [pr] }).status).toBe('occupied');
     expect(() => assess({ files: [] })).toThrow('free-scope: give --files=a,b or --card=<id>');
   });
+  it('reads every unproven file as unknown, in rows, lists and text, when the snapshot is incomplete', () => {
+    const unreadable = [{ repo: 'bad/repo', error: 'unavailable' }];
+    const files = ['we:scripts/lib/x.mjs', 'we:scripts/other.mjs'];
+    const partial = assess({ files, unreadable });
+    expect(partial.status).toBe('unknown');
+    expect(partial.files.map((row) => [row.file, row.state, row.free])).toEqual([
+      ['we:scripts/lib/x.mjs', 'unknown', false], ['we:scripts/other.mjs', 'unknown', false]]);
+    expect(partial.freeFiles).toEqual([]);
+    expect(partial.unknownFiles).toEqual(files);
+    const text = formatFreeScope(partial);
+    expect(text).not.toMatch(/\bFREE\b/);
+    expect(text).toContain('UNKNOWN   we:scripts/other.mjs');
+    // A file with a named holder is still OCCUPIED; only the unobserved one turns unknown.
+    const mixed = assess({ files, unreadable, prs: [pr] });
+    expect(mixed.files.map((row) => row.state)).toEqual(['occupied', 'unknown']);
+    expect(mixed.freeFiles).toEqual([]);
+    expect(mixed.headline).toContain('0 of 2 files free');
+    expect(formatFreeScope(mixed)).not.toMatch(/\bFREE\b/);
+    // A complete snapshot still proves a file free.
+    expect(assess({ files }).files.map((row) => [row.state, row.free])).toEqual([['free', true], ['free', true]]);
+  });
   it('declares only read and assess compute steps and forwards inputs', () => {
     expect(() => freeScopeOperation({})).toThrow(TypeError);
     const collect = vi.fn(() => ({ files: ['x.mjs'], nowMs, prs: [], agents: [] }));

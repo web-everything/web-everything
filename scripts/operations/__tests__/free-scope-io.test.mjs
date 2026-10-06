@@ -23,7 +23,8 @@ if (repo === 'bad/repo') { process.stderr.write('unavailable\\n'); process.exit(
 const full = Array.from({length: Number(args[args.indexOf('--limit') + 1])}, (_, i) => ({number: i + 1, title: 'P', url: 'u', files: [{path: 'f' + i + '.mjs'}]}));
 const twin = [{number: 12, title: 'Twin ' + repo, url: 'u', files: [{path: 'twin.mjs'}]}];
 const fixture = [{number: 12, title: 'Fixture', url: 'https://example.test/12', files: [{path: 'held.mjs'}]}];
-console.log(JSON.stringify(repo === 'full/repo' ? full : require('node:fs').existsSync(__filename + '.twins') ? twin : repo === 'fixture/repo' ? fixture : []));
+const capped = [{number: 7, title: 'Capped', url: 'u', files: Array.from({length: 100}, (_, i) => ({path: 'c' + i + '.mjs'}))}];
+console.log(JSON.stringify(repo === 'full/repo' ? full : repo === 'capped/repo' ? capped : require('node:fs').existsSync(__filename + '.twins') ? twin : repo === 'fixture/repo' ? fixture : []));
 `, { mode: 0o755 });
   env = { WE_AGENT_SCOPES_PATH: registry, WE_FREE_SCOPE_GH_BIN: gh };
   fs.mkdirSync(path.join(root, 'backlog'));
@@ -75,6 +76,23 @@ it('treats a full page of open PRs as unreadable, so a truncated snapshot is nev
   const seen = cli(['--files=repo:f3.mjs', '--json'], { collect });
   expect(seen.code).toBe(1);
   expect(JSON.parse(seen.out).status).toBe('occupied');
+});
+it('treats a PR whose file list is at the gh cap as unreadable, so its unlisted files are never free', () => {
+  const result = readOpenPrs({ repos: ['capped/repo', 'fixture/repo'], exec: ghExec(env) });
+  expect(result.unreadable).toHaveLength(1);
+  expect(result.unreadable[0]).toMatchObject({ repo: 'capped/repo' });
+  expect(result.unreadable[0].error).toMatch(/PR #7.*100 files/);
+  expect(result.prs.filter((p) => p.repo === 'capped/repo')[0].files).toHaveLength(100);
+  const collect = (options) => collectFreeScope({ ...options, repos: ['capped/repo'] });
+  const beyond = cli(['--files=c150.mjs', '--json'], { collect });
+  expect(beyond.code).toBe(2);
+  const verdict = JSON.parse(beyond.out);
+  expect(verdict.status).toBe('unknown');
+  expect(verdict.files).toMatchObject([{ file: 'we:c150.mjs', state: 'unknown', free: false }]);
+  const text = cli(['--files=c150.mjs'], { collect });
+  expect(text.out).not.toMatch(/\bFREE\b/);
+  expect(JSON.parse(cli(['--files=repo:c3.mjs', '--json'], { collect }).out).status).toBe('occupied');
+  expect(readOpenPrs({ repos: ['fixture/repo'], exec: ghExec(env) }).unreadable).toEqual([]);
 });
 it('qualifies --exclude-pr by repo through the CLI', () => {
   // Both default repos report an open PR #12 touching the same file.

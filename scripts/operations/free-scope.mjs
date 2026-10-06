@@ -75,20 +75,23 @@ export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAg
   for (const entry of live) for (const file of qualified(entry.files || [])) candidates.push({ type: 'agent',
     agent: entry.agent, purpose: entry.purpose, startedAt: entry.startedAt,
     expiresAt: new Date(expiry(entry)).toISOString(), file });
+  // A file is only FREE when the snapshot is complete AND nothing holds it; with an incomplete snapshot an
+  // unheld file is `unknown` in every output (row, list and text), never free.
   const rows = scope.map((file) => {
     const holders = candidates.filter((h) => scopeEntriesOverlap(file, h.file));
-    return { file, free: holders.length === 0, holders };
+    const state = holders.length ? 'occupied' : unreadable.length ? 'unknown' : 'free';
+    return { file, state, free: state === 'free', holders };
   });
-  const freeFiles = rows.filter((r) => r.free).map((r) => r.file);
-  const occupiedFiles = rows.filter((r) => !r.free).map((r) => r.file);
+  const filesIn = (state) => rows.filter((r) => r.state === state).map((r) => r.file);
+  const freeFiles = filesIn('free'), occupiedFiles = filesIn('occupied'), unknownFiles = filesIn('unknown');
   const status = occupiedFiles.length ? 'occupied' : unreadable.length ? 'unknown' : 'free';
   let headline = status === 'occupied'
-    ? `${freeFiles.length} of ${rows.length} files free — ${rows.filter((r) => !r.free).map((r) => `${r.file} held by ${r.holders.map(holderName).join(', ')}`).join('; ')}`
+    ? `${freeFiles.length} of ${rows.length} files free — ${rows.filter((r) => r.state === 'occupied').map((r) => `${r.file} held by ${r.holders.map(holderName).join(', ')}`).join('; ')}`
     : status === 'unknown' ? `UNKNOWN — could not read open PRs for ${unreadable.map((r) => r.repo).join(', ')}`
       : `all ${rows.length} files free`;
   if (status === 'occupied' && unreadable.length) headline += ` — could not read open PRs for ${unreadable.map((r) => r.repo).join(', ')}`;
   if (stale.length) headline += ` — ${stale.length} stale registry entr${stale.length === 1 ? 'y' : 'ies'} ignored`;
-  return { observedAt: new Date(nowMs).toISOString(), status, files: rows, freeFiles, occupiedFiles,
+  return { observedAt: new Date(nowMs).toISOString(), status, files: rows, freeFiles, occupiedFiles, unknownFiles,
     staleAgents: stale.map(({ agent, purpose, startedAt, ttlHours = DEFAULT_TTL_HOURS }) => ({ agent, purpose, startedAt, ttlHours })),
     unreadable, headline };
 }
@@ -102,7 +105,8 @@ export function etTime(iso) {
 }
 export function formatFreeScope(verdict) {
   const lines = [verdict.headline];
-  for (const row of verdict.files) lines.push(`${row.free ? 'FREE      ' : 'OCCUPIED  '}${row.file}${row.holders.map((h) =>
+  const label = { free: 'FREE      ', occupied: 'OCCUPIED  ', unknown: 'UNKNOWN   ' };
+  for (const row of verdict.files) lines.push(`${label[row.state]}${row.file}${row.holders.map((h) =>
     h.type === 'pr' ? `  ← PR #${h.number} "${h.title}" (${h.repo})`
       : `  ← agent ${h.agent} (${h.purpose}, since ${etTime(h.startedAt)})`).join('')}`);
   if (verdict.staleAgents.length) lines.push('stale (ignored):', ...verdict.staleAgents.map((e) => `  ${e.agent} (${e.purpose}, since ${etTime(e.startedAt)}, ttl ${e.ttlHours}h)`));
