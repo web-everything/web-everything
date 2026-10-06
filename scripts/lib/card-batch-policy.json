@@ -1,0 +1,1 @@
+{"prevention":{"enabled":true,"maxCards":10,"maxAgeMinutes":120,"highPriorityBypass":true},"filing":{"enabled":false,"maxCards":10,"maxAgeMinutes":120,"highPriorityBypass":true},"prepare":{"enabled":false,"maxCards":10,"maxAgeMinutes":120,"highPriorityBypass":true}}
