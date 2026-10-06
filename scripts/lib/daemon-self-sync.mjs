@@ -356,9 +356,9 @@ export function selfSyncCheckoutPoc({ root, base = 'main', pocBranch, run = gitR
 // from disk every time and always see the new tree. So the restart decision is now: which files changed between
 // this process's boot sha and HEAD now, and does any of them sit in this daemon's static import closure?
 
-/** Env var: minimum time (ms) a daemon process runs before a code-change restart is taken. Default 10 min. */
+/** Env var: minimum time (ms) a daemon process runs before a code-change restart is taken. Default 2 min. */
 export const RESTART_MIN_INTERVAL_ENV = 'WE_DAEMON_RESTART_MIN_INTERVAL_MS';
-export const DEFAULT_RESTART_MIN_INTERVAL_MS = 10 * 60 * 1000;
+export const DEFAULT_RESTART_MIN_INTERVAL_MS = 2 * 60 * 1000;
 
 /** PURE: the restart window from env — a non-negative integer, else the default. */
 export function resolveRestartMinIntervalMs(env = process.env) {

@@ -830,11 +830,14 @@ describe('decideRestart — pure (#4044 restart gate)', () => {
     expect(decideRestart({ changedFiles: ['backlog/1.md', 'scripts/__tests__/a.test.mjs'], closure: null, uptimeMs: 1e9, minIntervalMs: 0 }).restart).toBe(false);
     expect(decideRestart({ changedFiles: ['backlog/1.md', 'scripts/a.mjs'], closure: { ...closure, complete: false }, uptimeMs: 1e9, minIntervalMs: 0 }).restart).toBe(true);
   });
-  it('the window reads WE_DAEMON_RESTART_MIN_INTERVAL_MS, defaulting to 10 minutes', () => {
+  it('the window reads WE_DAEMON_RESTART_MIN_INTERVAL_MS, defaulting to 2 minutes', () => {
     expect(resolveRestartMinIntervalMs({})).toBe(DEFAULT_RESTART_MIN_INTERVAL_MS);
-    expect(DEFAULT_RESTART_MIN_INTERVAL_MS).toBe(600_000);
+    expect(DEFAULT_RESTART_MIN_INTERVAL_MS).toBe(120_000);
     expect(resolveRestartMinIntervalMs({ WE_DAEMON_RESTART_MIN_INTERVAL_MS: '0' })).toBe(0);
+    expect(resolveRestartMinIntervalMs({ WE_DAEMON_RESTART_MIN_INTERVAL_MS: '45000' })).toBe(45000);
     expect(resolveRestartMinIntervalMs({ WE_DAEMON_RESTART_MIN_INTERVAL_MS: 'junk' })).toBe(DEFAULT_RESTART_MIN_INTERVAL_MS);
+    expect(resolveRestartMinIntervalMs({ WE_DAEMON_RESTART_MIN_INTERVAL_MS: '-5' })).toBe(DEFAULT_RESTART_MIN_INTERVAL_MS);
+    expect(resolveRestartMinIntervalMs({ WE_DAEMON_RESTART_MIN_INTERVAL_MS: '' })).toBe(DEFAULT_RESTART_MIN_INTERVAL_MS);
   });
 });
 
