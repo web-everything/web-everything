@@ -2539,10 +2539,14 @@ export function reviewPrOperation({
           ?? { key, findingId: null, finding: referralKeyFinding(key) });
         // A block-ruled referral is mandatory work for the fixer: never a "card suggestion". Move any deferred
         // finding that IS a blocked finding out of the deferred list and into the admitted/published findings. "Is"
-        // means the one finding identity (#76a `bindFindingIds`: same path and lens, and the same normalized claim or
-        // the same quoted anchor), never a sixth matcher. Promotion only TIGHTENS, so a binding can never clear.
+        // means the one finding identity (#76a `bindFindingIds`: same path, and the same normalized claim or the same
+        // quoted anchor), never a sixth matcher. Lens is ignored HERE: within one run path plus claim already name one
+        // finding, and the two sides' lenses differ by construction (a referral carries the juror's raw category, or
+        // none, or none for a legacy blocked key; its deferred copy carries the seat lens). Promotion only TIGHTENS,
+        // so a binding can never clear.
         const blockedTable = blockedReferrals.map((b, i) => findingIdentityEntry(b.finding, b.findingId ?? `key:${i}`)).filter(Boolean);
-        const boundIds = blockedTable.length ? bindFindingIds(basis.deferredAdvisory ?? [], blockedTable, { sameHead: true }) : [];
+        const boundIds = blockedTable.length
+          ? bindFindingIds(basis.deferredAdvisory ?? [], blockedTable, { sameHead: true, ignoreLens: true }) : [];
         const promoted = (basis.deferredAdvisory ?? []).filter((_f, i) => boundIds[i] != null);
         const deferredAdvisory = promoted.length ? basis.deferredAdvisory.filter((f) => !promoted.includes(f)) : basis.deferredAdvisory;
         const lifted = promoted.map(({ deferred: _d, ...f }) => f);

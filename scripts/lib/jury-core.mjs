@@ -567,9 +567,11 @@ export function mintFindingId({ repo, pr, path, lens, firstSeenHead, normSummary
  * THE deterministic identity test (binding rule 1), shared by every cross-record matcher that binds an id. Same
  * non-empty path, same lens, and the same normalized claim or the same anchor. A finding with no path has no
  * cross-head identity: it binds only on the same head (`sameHead`), and only by its exact normalized claim.
+ * `ignoreLens` drops the lens test for a match WITHIN ONE RUN, where path plus claim already name one finding and the
+ * two sides' lenses are not comparable (a referral carries the juror's raw category, its deferred copy the seat's).
  */
-export function sameFindingIdentity(a, b, { sameHead = false } = {}) {
-  if (!a || !b || a.lens !== b.lens) return false;
+export function sameFindingIdentity(a, b, { sameHead = false, ignoreLens = false } = {}) {
+  if (!a || !b || (!ignoreLens && a.lens !== b.lens)) return false;
   if (!a.path || !b.path) return sameHead && !a.path && !b.path && a.normSummary === b.normSummary;
   if (a.path !== b.path) return false;
   return a.normSummary === b.normSummary || (Boolean(a.anchor) && a.anchor === b.anchor);
@@ -603,12 +605,19 @@ export function findingIdentityTable(records = []) {
         const declared = byId.get(f.sameAs);
         if (declared && declared.path && declared.path === identity.path) entry = declared;
       }
-      if (!entry && !FINDING_ID_PATTERN.test(f.findingId ?? '')) {
+      // A declared `sameAs: 'new'` is the record's own answer that this is a distinct finding: the deterministic
+      // test must not override it.
+      if (!entry && !FINDING_ID_PATTERN.test(f.findingId ?? '') && f.sameAs !== FINDING_SAME_AS_NEW) {
         entry = table.find((e) => sameFindingIdentity(e, identity, { sameHead: e.heads.includes(record.head) }));
       }
       if (!entry) {
-        const findingId = FINDING_ID_PATTERN.test(f.findingId ?? '') ? f.findingId
+        let findingId = FINDING_ID_PATTERN.test(f.findingId ?? '') ? f.findingId
           : mintFindingId({ repo: record.repo, pr: record.pr, firstSeenHead: record.head, ...identity });
+        // Only a declared-new copy can mint a taken id (anything else that matched would have bound above): salt it.
+        for (let n = 1; !FINDING_ID_PATTERN.test(f.findingId ?? '') && byId.has(findingId); n++) {
+          findingId = mintFindingId({ repo: record.repo, pr: record.pr, firstSeenHead: record.head, ...identity,
+            normSummary: `${identity.normSummary}#${n}` });
+        }
         entry = { findingId, ...identity, summary: normalizeFinding(f.original ?? f.finding).summary,
           firstSeenHead: record.head, heads: [], keys: [], rulings: [] };
         table.push(entry);
@@ -632,14 +641,15 @@ export function findingIdOf(table, { head, runId, key }) {
 /**
  * Bind each finding to an existing id in `table` by the DETERMINISTIC rule only (no declared `sameAs`, no text
  * similarity). Returns one id or null per finding, aligned with `findings`. `sameHead` asserts that the findings and
- * the table come from one head, which is the only case a pathless finding may bind. PURE.
+ * the table come from one head, which is the only case a pathless finding may bind. `ignoreLens` is for a match within
+ * one run (see {@link sameFindingIdentity}). PURE.
  * @returns {Array<string|null>}
  */
-export function bindFindingIds(findings, table, { sameHead = false } = {}) {
+export function bindFindingIds(findings, table, { sameHead = false, ignoreLens = false } = {}) {
   return (Array.isArray(findings) ? findings : []).map((finding) => {
     const identity = normalizeFindingIdentity(finding);
     if (!identity) return null;
-    return (table ?? []).find((e) => sameFindingIdentity(e, identity, { sameHead }))?.findingId ?? null;
+    return (table ?? []).find((e) => sameFindingIdentity(e, identity, { sameHead, ignoreLens }))?.findingId ?? null;
   });
 }
 

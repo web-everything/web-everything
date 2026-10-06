@@ -4024,6 +4024,53 @@ describe('#5135 mandatory referrals survive advisory deferral', () => {
     expect(out.blockedReferrals).toEqual([{ key, findingId: 'f-0123456789ab', finding: blocked }]);
     expect(explainPanelOutcome({ outcome: 'changes', blockedReferrals: out.blockedReferrals })).toContain('scripts/held-cards-io.mjs:136');
   });
+  it('a blocked referral is promoted when its category differs from the seat lens on the deferred copy', () => {
+    // Pipeline level: `reduce` feeds `referralVerdict`. The juror omits `category` (optional in the schema) or writes a
+    // free-form slug, while the deferred copy is rewritten to the seat lens, so a lens-sensitive matcher misses it.
+    vi.stubEnv('WE_REVIEW_LATER_ROUND_ADVISORY_SCOPE', 'changed-only');
+    try {
+      const { declaration } = registryFor({}, { codexAdvisory: true });
+      const read = shapeReadFinding(stubReader({})({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+      for (const category of [undefined, 'concurrency']) {
+        const original = { file: NET_PATHS[0], line: 20, summary: 'confirmed defect', verdict: 'CONFIRMED', impactIfUnfixed: 'broken',
+          ...(category ? { category } : {}) };
+        const basis = declaration.steps.find(s => s.name === 'reduce').step.fn({
+          input: { lens: 'correctness' }, findings: {
+            read: { ...read, latestFix: { priorHead: 'aaaa', head: 'bbbb', files: {} } },
+            judge: CLEAN_ANSWER, judgeSecurity: CLEAN_ANSWER,
+            judgeAdvisory: { summary: 'confirmed defect', findings: [original] },
+          },
+        });
+        expect(basis.deferredAdvisory).toHaveLength(1);
+        const key = JSON.stringify(['judgeAdvisory', original.file, 20, original.summary]);
+        const out = declaration.steps.find(s => s.name === 'referralVerdict').step.fn({ findings: {
+          reduce: basis,
+          mandatoryReferrals: { effects: [{ result: { pending: [], blocked: [key],
+            blockedFindings: [{ key, findingId: 'f-0123456789ab', finding: basis.referrals[0].original }] } }] },
+        } });
+        expect(out.verdict).toBe('changes');
+        expect(out.deferredAdvisory).toEqual([]);
+        expect(out.findings).toEqual([expect.objectContaining({ summary: 'confirmed defect' })]);
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('legacy blocked keys promote categorized deferred findings', () => {
+    // An older result has `blocked` keys and no `blockedFindings`; the key encodes no category.
+    const { declaration } = registryFor({}, { codexAdvisory: true });
+    const step = declaration.steps.find(s => s.name === 'referralVerdict').step;
+    const race = { file: NET_PATHS[0], line: 20, summary: 'concurrent held-cards filing race', verdict: 'CONFIRMED', impactIfUnfixed: 'broken',
+      category: 'correctness/race' };
+    const other = { file: NET_PATHS[0], line: 40, summary: 'nit', category: 'simplicity' };
+    const key = JSON.stringify(['judgeAdvisory', race.file, 20, race.summary]);
+    const out = step.fn({ findings: {
+      reduce: { verdict: 'accept', findings: [], admittedFindings: [], humanRequired: false,
+        deferredAdvisory: [{ ...race, deferred: 'later-round-advisory-untouched' }, { ...other, deferred: 'later-round-advisory-untouched' }] },
+      mandatoryReferrals: { effects: [{ result: { pending: [], blocked: [key] } }] },
+    } });
+    expect(out.verdict).toBe('changes');
+    expect(out.findings).toEqual([race]);
+    expect(out.deferredAdvisory).toEqual([expect.objectContaining({ summary: 'nit' })]);
+  });
   it('preserves an object range by identity and drops non-objects in the read shaper', () => {
     const raw = stubReader({})({ pr: 7, repo: 'o/n' });
     const latestFix = { priorHead: null };

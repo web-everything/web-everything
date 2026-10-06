@@ -2405,6 +2405,40 @@ describe('#76a finding identity', () => {
     expect(validateReferralRecord(rec(H('b'), 'rb', [wordings[3]], [{ findingId: 'f-XYZ' }]))).toBe(false);
   });
 
+  it('finding identity: a declared sameAs new prevents deterministic binding', () => {
+    const first = rec(H('a'), 'ra', [wordings[1]]);
+    const id = findingIdentityTable([first])[0].findingId;
+    // Same path, lens and claim as an existing entry, but the record says "this is a new finding" and carries no findingId.
+    const declaredNew = rec(H('b'), 'rb', [{ ...wordings[1], line: 140 }], [{ sameAs: 'new' }]);
+    const table = findingIdentityTable([first, declaredNew]);
+    expect(table).toHaveLength(2);
+    expect(new Set(table.map(e => e.findingId)).size).toBe(2);
+    expect(table[0].findingId).toBe(id);
+    expect(table[0].keys).toHaveLength(1);
+    // Without the declaration the same record still merges deterministically.
+    expect(findingIdentityTable([first, rec(H('b'), 'rb', [{ ...wordings[1], line: 140 }])])).toHaveLength(1);
+    // Two declared-new copies on one head stay two entries with two ids (the minted hash alone would collide).
+    const twice = rec(H('b'), 'rb', [wordings[1], wordings[1]], [{ sameAs: 'new' }, { sameAs: 'new' }]);
+    const t2 = findingIdentityTable([twice]);
+    expect(t2).toHaveLength(2);
+    expect(t2[0].findingId).not.toBe(t2[1].findingId);
+  });
+
+  it('finding identity: promotion ignores lens, since path and claim already name one finding within a run', () => {
+    const table = findingIdentityTable([rec(H('a'), 'ra', [{ ...wordings[1], category: undefined }])]);
+    const tagged = { ...wordings[1], category: 'correctness' };
+    expect(bindFindingIds([tagged], table)).toEqual([null]);
+    expect(bindFindingIds([tagged], table, { ignoreLens: true })).toEqual([table[0].findingId]);
+    // Still never merges another path or another claim.
+    expect(bindFindingIds([{ ...tagged, file: 'scripts/held-cards.mjs' }], table, { ignoreLens: true })).toEqual([null]);
+    expect(bindFindingIds([unrelated], table, { ignoreLens: true })).toEqual([null]);
+    // Pathless: same head and exact claim only.
+    const pathless = { summary: 'Whole-PR claim' };
+    const t2 = findingIdentityTable([rec(H('a'), 'ra', [pathless])]);
+    expect(bindFindingIds([{ ...pathless, category: 'correctness' }], t2, { ignoreLens: true })).toEqual([null]);
+    expect(bindFindingIds([{ ...pathless, category: 'correctness' }], t2, { ignoreLens: true, sameHead: true })).toEqual([t2[0].findingId]);
+  });
+
   it('blocked referral note names every finding', () => {
     const r = rec(H('a'), 'ra', [wordings[1], { ...unrelated, file: 'scripts/worker-brief.mjs', line: 63 }]);
     r.authorBody = '<!-- authored-by-actor: author -->';
