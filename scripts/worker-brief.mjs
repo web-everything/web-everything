@@ -61,6 +61,7 @@ Anything else is out of scope: stop and report.
 1. **Free-scope pre-check.** Before editing, run
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList}\`.
    If any file is OCCUPIED (an open PR or a running agent holds it), stop and report who holds it. Do not start.
+   If the verdict is UNKNOWN (exit 2: a PR list was cut off or unreadable), the scope is NOT proven free: stop and report it. Do not start.
 2. **Register your scope.** \`node scripts/operations/free-scope-cli.mjs register --agent=${purpose} --purpose="${purpose}" --files=${commaList}\`.
    Release it when you finish, succeed or fail: \`node scripts/operations/free-scope-cli.mjs release --agent=${purpose}\`.
 3. **Lane.** \`node scripts/lane-pool.mjs acquire --purpose=${purpose} --adopt${laneRepo}\` (for plateau-app add \`--repo=<plateau-app checkout>\`).
@@ -77,7 +78,7 @@ Anything else is out of scope: stop and report.
    \`node scripts/operations/run.mjs open-pr --ref=lane/${purpose} --title="<title>" --bodyFile=<path> --json\`.
 7. **Pre-push recheck.** Right before open-pr, re-run the free-scope check excluding yourself:
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList} --exclude-agent=${purpose}\`.
-   If something new holds your files, stop and report instead of pushing.
+   If something new holds your files (OCCUPIED), or the verdict is UNKNOWN (exit 2), stop and report instead of pushing.
 ${edge}
 **Proof.** ${proof}
 

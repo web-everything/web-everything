@@ -38,6 +38,14 @@ describe('renderWorkerBrief', () => {
     ]) expect(brief).toContain(text);
     expect(brief).not.toContain('8. **Edge.**');
     expect(brief).not.toContain('daemon-overlay');
+    // An UNKNOWN verdict (exit 2) is never free: both checks must say to stop on it, not only on OCCUPIED.
+    const section = (from, to) => brief.slice(brief.indexOf(from), brief.indexOf(to));
+    for (const text of [section('1. **Free-scope pre-check.**', '2. **Register'),
+      section('7. **Pre-push recheck.**', '**Proof.**')]) {
+      expect(text).toMatch(/OCCUPIED/);
+      expect(text).toMatch(/UNKNOWN/);
+      expect(text).toMatch(/exit(?:s)? 2/);
+    }
   });
 
   it('includes the optional edge section as the last numbered rule', () => {
