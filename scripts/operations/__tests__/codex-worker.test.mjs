@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,11 +8,14 @@ import {
   parseCard, resolveAllowedFiles, isAllowed, checkAllowedDiff, parsePorcelain,
   findScopeConflicts, REPO_RULES_PREAMBLE, composeTask, planBranch, composePrBody,
   buildRunRecord, parseLastJson, runCodexWorker, GIT_HARDENING, OPEN_PR_LIMIT, collectScopeChanges,
-  snapshotGitState, diffGitState, parseGitlinks, GIT_HARDENING_ENV,
+  snapshotGitState, diffGitState, parseGitlinks, parseHiddenIndexFlags, GIT_HARDENING_ENV,
 } from '../codex-worker.mjs';
 
 const BASE_SHA = 'a'.repeat(40);
 const COMMIT_SHA = 'c'.repeat(40);
+// Every tool script is an absolute path under the TRUSTED repo root, never a lane-relative one.
+const CODEX_TASK = '/fake/repo/scripts/codex-direct-task.mjs';
+const SCRATCH = '/fake/scratch/codex-worker-x';
 
 const markdown = `---
 status: open
@@ -147,21 +150,23 @@ describe('task, branch and reporting', () => {
 
 // All effects stay in memory: no real git, gh, Codex, lane or record file.
 // `gitStates` scripts the successive `.git` snapshots (before Codex, after Codex, before open-pr); the last one repeats.
-function harness({ prs = [], status = ' M scripts/a.js\n', committed = '', fail, reportChanges = true, acquire, codexOutput, prOutput, verifyOutput, failWrite, failRecord, gitStates = [{}], lsFiles = [''], afterVerify = {} } = {}) {
-  const calls = [], writes = [], records = [];
-  let tick = 0, snapshots = 0, lsCalls = 0, revParses = 0, verified = false;
+function harness({ prs = [], status = ' M scripts/a.js\n', baselineStatus, committed = '', fail, reportChanges = true, acquire, codexOutput, prOutput, verifyOutput, failWrite, failRecord, gitStates = [{}], lsFiles = [''], lsHidden = [''], afterVerify = {}, realFs = false } = {}) {
+  const calls = [], writes = [], records = [], removed = [];
+  let tick = 0, snapshots = 0, lsCalls = 0, hiddenCalls = 0, statusCalls = 0, revParses = 0, verified = false;
   const exec = (cmd, args, opts) => {
     calls.push({ cmd, args, opts });
     if (fail?.(cmd, args)) throw Object.assign(new Error('command failed'), {
-      stdout: args[0] === 'scripts/codex-direct-task.mjs' ? JSON.stringify({ events: { threadId: 'failed-thread' }, diff: { hasChanges: true } }) : 'x'.repeat(3000), stderr: 'failure tail',
+      stdout: args[0] === CODEX_TASK ? JSON.stringify({ events: { threadId: 'failed-thread' }, diff: { hasChanges: true } }) : 'x'.repeat(3000), stderr: 'failure tail',
     });
     if (cmd === 'gh') return JSON.stringify(prs);
     if (args.includes('acquire')) return acquire ?? 'acquiring\n' + JSON.stringify({ path: '/fake/lane', lane: 54, holder: 'session' });
-    if (args[0] === 'scripts/codex-direct-task.mjs') return codexOutput ?? JSON.stringify({ events: { threadId: 'thread', usage: { input_tokens: 12, output_tokens: 9 } }, quotaUsedPercent: 3, gate: { pass: false }, diff: { hasChanges: reportChanges } });
+    if (args[0] === CODEX_TASK) return codexOutput ?? JSON.stringify({ events: { threadId: 'thread', usage: { input_tokens: 12, output_tokens: 9 } }, quotaUsedPercent: 3, gate: { pass: false }, diff: { hasChanges: reportChanges } });
     // The first rev-parse pins the pre-Codex base; later ones read the post-commit HEAD (which verify may move).
     if (args.includes('rev-parse')) return `${revParses++ === 0 ? BASE_SHA : (verified ? afterVerify.head : undefined) ?? COMMIT_SHA}\n`;
+    if (args.includes('ls-files') && args.includes('-v')) return lsHidden[Math.min(hiddenCalls++, lsHidden.length - 1)];
     if (args.includes('ls-files')) return lsFiles[Math.min(lsCalls++, lsFiles.length - 1)];
-    if (args.includes('status')) return (verified ? afterVerify.status : undefined) ?? status;
+    // The first status call is the pre-Codex baseline taken at lane-acquire.
+    if (args.includes('status')) return statusCalls++ === 0 && baselineStatus !== undefined ? baselineStatus : (verified ? afterVerify.status : undefined) ?? status;
     if (args.includes('--name-only')) return (verified ? afterVerify.committed : undefined) ?? committed;
     if (args.includes('--stat')) return '1 file changed';
     if (args.includes('verify')) { verified = true; return verifyOutput ?? JSON.stringify({ verdict: { ok: true, passed: 1, failed: 0 } }, null, 2); }
@@ -169,17 +174,22 @@ function harness({ prs = [], status = ' M scripts/a.js\n', committed = '', fail,
     return '';
   };
   return {
-    calls, writes, records,
+    calls, writes, records, removed,
     run: () => runCodexWorker({ ...task, repoRoot: '/fake/repo', recordFile: '/fake/records.jsonl' }, {
       exec, now: () => tick++ * 10, log: () => {},
       snapshotGit: (gitDir) => {
         calls.push({ cmd: 'snapshot', args: [gitDir], opts: {} });
         return gitStates[Math.min(snapshots++, gitStates.length - 1)];
       },
-      writeFile: (path, text) => {
-        if (failWrite) throw new Error('write failed');
-        writes.push({ path, text });
-      },
+      // realFs keeps the real scratch-dir + exclusive-create writers, to prove a planted symlink is never followed.
+      ...(realFs ? {} : {
+        makeScratchDir: () => SCRATCH,
+        removeDir: (path) => removed.push(path),
+        writeFile: (path, text) => {
+          if (failWrite) throw new Error('write failed');
+          writes.push({ path, text });
+        },
+      }),
       appendRecord: (record, path) => {
         if (failRecord) throw new Error('record failed');
         records.push({ record, path });
@@ -221,14 +231,57 @@ describe('worker orchestration', () => {
     expect(h.records[0]).toEqual({ record: result.record, path: '/fake/records.jsonl' });
     expect(result.record).toMatchObject({ outcome: 'pr-opened', pr: { number: 42 }, codex: { threadId: 'thread', quotaUsedPercent: 3 } });
     expect(h.calls.find(({ args }) => args.includes('add')).args).toEqual(['-C', '/fake/lane', ...GIT_HARDENING, '--literal-pathspecs', 'add', '--', 'scripts/a.js']);
-    expect(h.calls.find(({ args }) => args[0] === 'scripts/codex-direct-task.mjs')).toMatchObject({
-      args: ['scripts/codex-direct-task.mjs', '--task-file=/fake/lane/.git/codex-worker-task.md', '--dir=/fake/lane', '--gate=standards', '--no-stream', '--json', '--no-install'],
+    expect(h.calls.find(({ args }) => args[0] === CODEX_TASK)).toMatchObject({
+      args: [CODEX_TASK, `--task-file=${SCRATCH}/task.md`, '--dir=/fake/lane', '--gate=standards', '--no-stream', '--json', '--no-install'],
       opts: { cwd: '/fake/repo', timeout: 45 * 60_000, maxBuffer: 64 * 1024 * 1024 },
     });
     expect(h.calls.find(({ args }) => args.includes('verify')).opts.timeout).toBe(40 * 60_000);
     expect(h.calls.find(({ args }) => args.includes('open-pr')).opts.cwd).toBe('/fake/lane');
-    expect(h.calls.find(({ args }) => args.includes('release')).args).toEqual(['scripts/lane-pool.mjs', 'release', '--lane=54', '--session=session']);
-    expect(h.writes.map(({ path }) => path)).toEqual(['/fake/lane/.git/codex-worker-task.md', '/fake/lane/.git/codex-worker-pr-body.md']);
+    expect(h.calls.find(({ args }) => args.includes('release')).args).toEqual(['/fake/repo/scripts/lane-pool.mjs', 'release', '--lane=54', '--session=session']);
+    // wrapper-authored files live in a scratch dir OUTSIDE the Codex-writable lane, and the dir is removed at the end
+    expect(h.writes.map(({ path }) => path)).toEqual([`${SCRATCH}/task.md`, `${SCRATCH}/pr-body.md`]);
+    expect(h.removed).toEqual([SCRATCH]);
+  });
+
+  // Review finding (security, CONFIRMED): open-pr ran `node scripts/operations/run.mjs` with cwd = the lane, so Node
+  // executed the LANE's copy (Codex-writable when the scope covers scripts/) with the operator's git/gh credentials.
+  it('runs every tool script from an absolute path under the trusted repo root, never one inside the lane', () => {
+    const h = harness();
+    h.run();
+    const nodeCalls = h.calls.filter(({ cmd }) => cmd === 'node');
+    expect(nodeCalls.length).toBeGreaterThanOrEqual(5);
+    for (const { args, opts } of nodeCalls) {
+      expect(args[0].startsWith('/fake/repo/scripts/')).toBe(true);
+      expect(args[0].startsWith('/fake/lane')).toBe(false);
+      expect(opts.cwd === '/fake/repo' || opts.cwd === '/fake/lane').toBe(true);
+    }
+    const openPr = h.calls.find(({ args }) => args.includes('open-pr'));
+    expect(openPr.args[0]).toBe('/fake/repo/scripts/operations/run.mjs');
+    expect(openPr.opts.cwd).toBe('/fake/lane');
+  });
+
+  // Review finding (security, PLAUSIBLE): the PR body / task file were written INTO the Codex-writable `.git/` with
+  // symlinks followed, so a planted link overwrote any operator-writable file. Real fs: plant the links, assert untouched.
+  it('never follows a symlink planted where the wrapper writes its files (task file, PR body)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'codex-worker-symlink-'));
+    try {
+      const lanePath = join(root, 'lane');
+      const victim = join(root, 'victim.txt');
+      mkdirSync(join(lanePath, '.git'), { recursive: true });
+      writeFileSync(victim, 'precious\n');
+      for (const name of ['codex-worker-task.md', 'codex-worker-pr-body.md']) symlinkSync(victim, join(lanePath, '.git', name));
+      const h = harness({ realFs: true, acquire: JSON.stringify({ path: lanePath, lane: 54, holder: 'session' }) });
+      const result = h.run();
+      expect(result.outcome).toBe('pr-opened');
+      expect(readFileSync(victim, 'utf8')).toBe('precious\n');
+      const taskFlag = h.calls.find(({ args }) => args[0] === CODEX_TASK).args.find((arg) => arg.startsWith('--task-file='));
+      const bodyFlag = h.calls.find(({ args }) => args.includes('open-pr')).args.find((arg) => arg.startsWith('--bodyFile='));
+      for (const flag of [taskFlag, bodyFlag]) expect(flag.split('=')[1].startsWith(lanePath)).toBe(false);
+      // the scratch dir is gone after the run
+      expect(existsSync(dirname(taskFlag.split('=')[1]))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('guards committed changes too and refuses an empty changed set', () => {
@@ -269,7 +322,7 @@ describe('worker orchestration', () => {
     const snaps = h.calls.map(({ cmd, args }, i) => (cmd === 'snapshot' ? [i, args[0]] : null)).filter(Boolean);
     // before Codex, after Codex (scope-guard), after verify (open-pr), and once more before deciding to release
     expect(snaps.map(([, dir]) => dir)).toEqual(Array(4).fill('/fake/lane/.git'));
-    const codexRun = h.calls.findIndex(({ args }) => args[0] === 'scripts/codex-direct-task.mjs');
+    const codexRun = h.calls.findIndex(({ args }) => args[0] === CODEX_TASK);
     const firstGitAfterCodex = h.calls.findIndex(({ cmd }, i) => i > codexRun && cmd === 'git');
     expect(snaps[0][0]).toBeLessThan(codexRun);
     expect(snaps[1][0]).toBeGreaterThan(codexRun);
@@ -281,7 +334,7 @@ describe('worker orchestration', () => {
     const result = h.run();
     expect(result.outcome).toBe('refused:scope-guard');
     expect(result.steps.find((step) => step.name === 'scope-guard').detail).toMatch(/\.git state changed.*config.*info\/attributes/s);
-    const afterCodex = h.calls.slice(h.calls.findIndex(({ args }) => args[0] === 'scripts/codex-direct-task.mjs') + 1);
+    const afterCodex = h.calls.slice(h.calls.findIndex(({ args }) => args[0] === CODEX_TASK) + 1);
     expect(afterCodex.filter(({ cmd }) => cmd === 'git')).toEqual([]);
     expect(afterCodex.some(({ args }) => args.includes('verify') || args.includes('open-pr'))).toBe(false);
     // release runs a raw `git status` in the lane, which would execute the planted payload: it must NOT run
@@ -291,7 +344,7 @@ describe('worker orchestration', () => {
 
   it('also refuses to release a lane whose .git Codex changed when the codex step itself failed', () => {
     const h = harness({
-      fail: (cmd, args) => args[0] === 'scripts/codex-direct-task.mjs',
+      fail: (cmd, args) => args[0] === CODEX_TASK,
       gitStates: [{ config: 'a' }, { config: 'evil' }],
     });
     const result = h.run();
@@ -307,14 +360,96 @@ describe('worker orchestration', () => {
     expect(result.outcome).toBe('refused:scope-guard');
     expect(result.steps.find((step) => step.name === 'scope-guard').detail).toContain('gitlink');
     expect(result.steps.find((step) => step.name === 'scope-guard').detail).toContain('sub');
-    const afterCodex = h.calls.slice(h.calls.findIndex(({ args }) => args[0] === 'scripts/codex-direct-task.mjs') + 1);
+    const afterCodex = h.calls.slice(h.calls.findIndex(({ args }) => args[0] === CODEX_TASK) + 1);
     expect(afterCodex.filter(({ cmd, args }) => cmd === 'git' && !args.includes('ls-files'))).toEqual([]);
     expect(afterCodex.some(({ args }) => args.includes('release'))).toBe(false);
+  });
+
+  // Review finding (codex-correctness, PLAUSIBLE): a failed/invalid/no-change Codex run never reached assertGitIntact, and
+  // the release-time check only looked at .git FILES — so a gitlink Codex added to the index was released into raw `git status`.
+  it.each([
+    ['a nonzero exit', { fail: (_cmd, args) => args[0] === CODEX_TASK }, 'failed:codex'],
+    ['a malformed report', { codexOutput: 'not JSON' }, 'failed:codex'],
+    ['a no-change report', { reportChanges: false }, 'failed:codex'],
+  ])('refuses to release a newly added gitlink when the Codex step fails with %s', (_label, options, outcome) => {
+    const link = '160000 ' + 'b'.repeat(40) + '\t0\tsub\0';
+    const h = harness({ ...options, lsFiles: ['', link] });
+    const result = h.run();
+    expect(result.outcome).toBe(outcome);
+    expect(h.calls.some(({ args }) => args.includes('release'))).toBe(false);
+    expect(result.steps.find((step) => step.name === 'release').detail).toContain('NOT released');
+  });
+
+  it('still releases a failed Codex run whose lane .git and index are untouched', () => {
+    const h = harness({ fail: (_cmd, args) => args[0] === CODEX_TASK });
+    expect(h.run().outcome).toBe('failed:codex');
+    expect(h.calls.some(({ args }) => args.includes('release'))).toBe(true);
+  });
+
+  // Review finding (correctness, PLAUSIBLE): release re-snapshotted .git AFTER open-pr, so any benign config write by
+  // open-pr/gh/push (branch.*.gh-merge-base, remote.*.gh-resolved) read as Codex tampering and the lane leaked.
+  it('still releases the lane after a fully successful run whose open-pr wrote benign .git/config keys', () => {
+    const h = harness({ gitStates: [{ config: 'a' }, { config: 'a' }, { config: 'a' }, { config: 'a+gh-resolved' }] });
+    const result = h.run();
+    expect(result.outcome).toBe('pr-opened');
+    expect(h.calls.some(({ args }) => args.includes('release'))).toBe(true);
+    expect(result.steps.find((step) => step.name === 'release').detail).toBe('Released lane 54');
+  });
+
+  // Only `.git/config` is exempt after the post-verify check: a detached child of a Codex-written test could still
+  // plant a hook between that check and release, and release runs a raw `git status` in the lane.
+  it('still refuses to release when something other than .git/config changed after the post-verify check', () => {
+    const h = harness({ gitStates: [{ config: 'a' }, { config: 'a' }, { config: 'a' }, { config: 'a+gh', 'hooks/post-checkout': 'evil' }] });
+    const result = h.run();
+    expect(result.outcome).toBe('pr-opened');
+    expect(h.calls.some(({ args }) => args.includes('release'))).toBe(false);
+    expect(result.steps.find((step) => step.name === 'release').detail).toContain('NOT released');
+  });
+
+  it('does not leak the lane when a pre-Codex baseline call fails (the release re-check is only armed once all baselines exist)', () => {
+    const h = harness({ fail: (_cmd, args) => args.includes('ls-files') && args.includes('-v') });
+    expect(h.run().outcome).toBe('failed:lane-acquire');
+    expect(h.calls.some(({ args }) => args.includes('release'))).toBe(true);
   });
 
   it('tolerates gitlinks that were already in the lane before Codex ran', () => {
     const link = '160000 ' + 'b'.repeat(40) + '\t0\tvendor/sub\0';
     expect(harness({ lsFiles: [link, link] }).run().outcome).toBe('pr-opened');
+  });
+
+  // Review finding (security, PLAUSIBLE): the guard saw only `git status` (no --ignored) and the diff, so a gitignored
+  // file, a path hidden via .git/info/exclude, or an assume-unchanged / skip-worktree tracked edit slipped past.
+  it('refuses an ignored path that appeared since the pre-Codex baseline, before commit/verify/open-pr', () => {
+    const h = harness({ baselineStatus: '!! node_modules/\n', status: ' M scripts/a.js\n!! node_modules/\n!! .env\n' });
+    const result = h.run();
+    expect(result.outcome).toBe('refused:scope-guard');
+    expect(result.steps.find((step) => step.name === 'scope-guard').detail).toMatch(/ignored.*\.env/s);
+    expect(h.calls.some(({ args }) => args.includes('commit') || args.includes('verify') || args.includes('open-pr'))).toBe(false);
+    expect(h.calls.find(({ args }) => args.includes('status')).args).toContain('--ignored=matching');
+  });
+
+  it('tolerates ignored paths that were already in the lane (a restored node_modules) and never stages them', () => {
+    const h = harness({ baselineStatus: '!! node_modules/\n', status: ' M scripts/a.js\n!! node_modules/\n' });
+    expect(h.run().outcome).toBe('pr-opened');
+    expect(h.calls.find(({ args }) => args.includes('add')).args.slice(-3)).toEqual(['add', '--', 'scripts/a.js']);
+  });
+
+  it('refuses a tracked path newly hidden by assume-unchanged or skip-worktree', () => {
+    const h = harness({ lsHidden: ['H scripts/a.js\0', 'H scripts/a.js\0h outside/x.js\0'] });
+    const result = h.run();
+    expect(result.outcome).toBe('refused:scope-guard');
+    expect(result.steps.find((step) => step.name === 'scope-guard').detail).toMatch(/assume-unchanged|skip-worktree/);
+    expect(result.steps.find((step) => step.name === 'scope-guard').detail).toContain('outside/x.js');
+    expect(h.calls.some(({ args }) => args.includes('verify') || args.includes('open-pr'))).toBe(false);
+    expect(harness({ lsHidden: ['S sparse/a.js\0', 'S sparse/a.js\0'] }).run().outcome).toBe('pr-opened');
+  });
+
+  // Review finding (codex-correctness, CONFIRMED): a replacement ref for the pinned base hides an outside-scope commit.
+  it('turns object replacement off for every child process (a refs/replace/<base> must not rewrite the pinned base)', () => {
+    expect(GIT_HARDENING_ENV.GIT_NO_REPLACE_OBJECTS).toBe('1');
+    const h = harness();
+    h.run();
+    for (const call of h.calls.filter(({ cmd }) => cmd !== 'snapshot' && cmd !== 'gh')) expect(call.opts.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
   });
 
   it('hands every child process (Codex, verify, open-pr, release) the git pins as GIT_CONFIG_* env', () => {
@@ -326,7 +461,7 @@ describe('worker orchestration', () => {
     });
     const pairs = Object.entries(GIT_HARDENING_ENV).filter(([key]) => key.startsWith('GIT_CONFIG_KEY_')).map(([key, name]) => `${name}=${GIT_HARDENING_ENV[key.replace('KEY', 'VALUE')]}`);
     expect(pairs).toEqual(GIT_HARDENING.filter((_, i) => i % 2 === 1));
-    for (const marker of ['scripts/codex-direct-task.mjs', 'verify', 'open-pr', 'release']) {
+    for (const marker of [CODEX_TASK, 'verify', 'open-pr', 'release']) {
       const call = h.calls.find(({ args }) => args[0] === marker || args.includes(marker));
       expect(call.opts.env).toMatchObject(GIT_HARDENING_ENV);
     }
@@ -380,7 +515,7 @@ describe('worker orchestration', () => {
     const h = harness();
     h.run();
     const revParse = h.calls.findIndex(({ args }) => args.includes('rev-parse'));
-    const codexRun = h.calls.findIndex(({ args }) => args[0] === 'scripts/codex-direct-task.mjs');
+    const codexRun = h.calls.findIndex(({ args }) => args[0] === CODEX_TASK);
     expect(revParse).toBeGreaterThan(-1);
     expect(revParse).toBeLessThan(codexRun);
     const diff = h.calls.find(({ args }) => args.includes('--name-only')).args;
@@ -398,7 +533,7 @@ describe('worker orchestration', () => {
     const h = harness({ fail: (_cmd, args) => args.includes('rev-parse') });
     expect(h.run().outcome).toBe('failed:lane-acquire');
     expect(h.calls.some(({ args }) => args.includes('release'))).toBe(true);
-    expect(h.calls.some(({ args }) => args[0] === 'scripts/codex-direct-task.mjs')).toBe(false);
+    expect(h.calls.some(({ args }) => args[0] === CODEX_TASK)).toBe(false);
   });
 
   it('refuses incomplete PR occupancy results (listing reached its limit)', () => {
@@ -425,11 +560,13 @@ describe('worker orchestration', () => {
   });
 
   it('fails Codex on nonzero exit but retains the report from stdout', () => {
-    const h = harness({ fail: (_cmd, args) => args[0] === 'scripts/codex-direct-task.mjs' });
+    const h = harness({ fail: (_cmd, args) => args[0] === CODEX_TASK });
     const result = h.run();
     expect(result.outcome).toBe('failed:codex');
     expect(result.record.codex.threadId).toBe('failed-thread');
-    expect(h.calls.some(({ args }) => args.includes('status'))).toBe(false);
+    // only the pre-Codex baseline status (at lane-acquire) ran; nothing entered the lane via git status after the failure
+    const afterCodex = h.calls.slice(h.calls.findIndex(({ args }) => args[0] === CODEX_TASK) + 1);
+    expect(afterCodex.some(({ args }) => args.includes('status'))).toBe(false);
     expect(h.records).toHaveLength(1);
   });
 
@@ -488,9 +625,11 @@ describe('worker orchestration', () => {
 // Real git (temp repo): the scope guard must see what git really reports, which a fake exec cannot.
 describe('scope guard against a real git repo', () => {
   const gitEnv = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
-  function fixture(mutate) {
+  // `guardEnv` is what the wrapper hands its own git runner (GIT_HARDENING_ENV); mutations always use the plain env.
+  function fixture(mutate, { guardEnv = {}, after } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'codex-worker-guard-'));
     const git = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', env: gitEnv });
+    const guardGit = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', env: { ...gitEnv, ...guardEnv } });
     try {
       git('init', '-q');
       mkdirSync(join(dir, 'outside'));
@@ -501,7 +640,7 @@ describe('scope guard against a real git repo', () => {
       git('commit', '-q', '-m', 'base');
       const base = git('rev-parse', 'HEAD').trim();
       mutate({ dir, git });
-      return { base, changed: collectScopeChanges((...args) => git(...args), base) };
+      return { base, changed: collectScopeChanges(guardGit, base), extra: after?.({ dir, guardGit }) };
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -531,7 +670,55 @@ describe('scope guard against a real git repo', () => {
   });
 
   it('is clean when nothing changed since the base', () => {
-    expect(fixture(() => {}).changed).toEqual({ dirty: [], committed: [] });
+    expect(fixture(() => {}).changed).toEqual({ dirty: [], committed: [], ignored: [] });
+  });
+
+  // Review finding (codex-correctness, CONFIRMED): Codex commits an outside-scope edit C on top of the base B, installs
+  // refs/replace/B -> C, and leaves an allowed edit dirty. Git then resolves the pinned base B through the replacement,
+  // so `git diff B HEAD` hides C. The control proves the attack bites; the env pin proves the wrapper defeats it.
+  it('refs/replace cannot hide an outside-scope commit once GIT_NO_REPLACE_OBJECTS is pinned (control: it can without)', () => {
+    const attack = ({ dir, git }) => {
+      writeFileSync(join(dir, 'outside/secret.js'), 'tampered\n');
+      git('commit', '-q', '-am', 'outside edit');
+      const evil = git('rev-parse', 'HEAD').trim();
+      git('replace', git('rev-parse', 'HEAD~1').trim(), evil);
+      writeFileSync(join(dir, 'scripts/a.js'), 'edited\n');
+    };
+    expect(fixture(attack).changed.committed).toEqual([]);
+    expect(fixture(attack, { guardEnv: GIT_HARDENING_ENV }).changed.committed).toEqual(['outside/secret.js']);
+  });
+
+  it('reports ignored paths (collapsed per directory) separately from dirty ones, so they are never staged', () => {
+    const { changed } = fixture(({ dir, git }) => {
+      writeFileSync(join(dir, '.gitignore'), 'node_modules/\n.env\n');
+      git('add', '.gitignore');
+      git('commit', '-q', '-m', 'ignore');
+      mkdirSync(join(dir, 'node_modules/pkg'), { recursive: true });
+      writeFileSync(join(dir, 'node_modules/pkg/index.js'), 'planted\n');
+      writeFileSync(join(dir, '.env'), 'SECRET=1\n');
+      writeFileSync(join(dir, 'scripts/a.js'), 'edited\n');
+    });
+    expect(changed.dirty).toEqual(['scripts/a.js']);
+    expect(changed.ignored.sort()).toEqual(['.env', 'node_modules/']);
+  });
+
+  it('sees a path hidden through .git/info/exclude only as an ignored entry, and the snapshot fingerprints the exclude file', () => {
+    const { changed, extra } = fixture(({ dir }) => {
+      writeFileSync(join(dir, '.git/info/exclude'), 'scripts/hidden.js\n');
+      writeFileSync(join(dir, 'scripts/hidden.js'), 'planted\n');
+    }, { after: ({ dir }) => diffGitState({ 'info/exclude': null }, snapshotGitState(join(dir, '.git'))) });
+    expect(changed.dirty).toEqual([]);
+    expect(changed.ignored).toEqual(['scripts/hidden.js']);
+    expect(extra).toContain('info/exclude');
+  });
+
+  it('parseHiddenIndexFlags finds assume-unchanged and skip-worktree entries, and nothing in an ordinary index', () => {
+    const { extra } = fixture(({ git }) => {
+      git('update-index', '--assume-unchanged', 'outside/secret.js');
+      git('update-index', '--skip-worktree', 'scripts/a.js');
+    }, { after: ({ guardGit }) => parseHiddenIndexFlags(guardGit('ls-files', '-v', '-z')) });
+    expect(extra).toEqual(['outside/secret.js', 'scripts/a.js']);
+    expect(fixture(() => {}, { after: ({ guardGit }) => parseHiddenIndexFlags(guardGit('ls-files', '-v', '-z')) }).extra).toEqual([]);
   });
 
   it('reports untracked, spaced and unicode paths intact', () => {
