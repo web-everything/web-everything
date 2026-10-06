@@ -443,6 +443,21 @@ describe('card 80 — prepare just in time', () => {
     expect(stampCoversClaim('2026-10-01', undefined)).toBe(true);
     expect(stampCoversClaim(null, '2026-10-06T15:00:00Z')).toBe(false);
   });
+
+  it('stampCoversClaim: a claim that recorded its replaced stamp judges by stamp identity, not date proximity', () => {
+    const claimedAt = '2026-10-06T15:00:00Z';
+    const replaces = { preparedDate: '2026-10-06', preparedAgainstSha: 'aaaa1111' };
+    // the SAME stamp (same-day scope-drift re-prepare, or yesterday's) is the one being replaced
+    expect(stampCoversClaim('2026-10-06', claimedAt, { replaces, preparedAgainstSha: 'aaaa1111' })).toBe(false);
+    expect(stampCoversClaim('2026-10-05', claimedAt, { replaces: { preparedDate: '2026-10-05' } })).toBe(false);
+    // a different sha or date is a new stamp — the re-prepare's result, even if the date is unchanged
+    expect(stampCoversClaim('2026-10-06', claimedAt, { replaces, preparedAgainstSha: 'bbbb2222' })).toBe(true);
+    expect(stampCoversClaim('2026-10-07', claimedAt, { replaces, preparedAgainstSha: 'aaaa1111' })).toBe(true);
+    // the card was unstamped at claim: any stamp is the result
+    expect(stampCoversClaim('2026-10-06', claimedAt, { replaces: null })).toBe(true);
+    // no stamp at all is never a result
+    expect(stampCoversClaim(null, claimedAt, { replaces })).toBe(false);
+  });
 });
 
 describe('collectBuildHolds — every held card names its stage and reason', () => {
@@ -462,6 +477,18 @@ describe('collectBuildHolds — every held card names its stage and reason', () 
       { num: '12', stage: 'prepare', reason: 'prepare in flight' },
       { num: '13', stage: 'plan', reason: 'overlaps lane-19' },
       { num: '14', stage: 'plan', reason: 'prepare-stale', detail: 'prepared 2026-10-01, 5d ago (max 3d)' },
+    ]);
+  });
+
+  it('a prepare held on queue-cap beats the plan\'s bare needs-prepare / prepare-stale row', () => {
+    const rows = collectBuildHolds({
+      queue: [{ num: '20' }, { num: '21' }],
+      prepareQueueHeld: [{ num: '20', kind: 'prepare-item', projectedMinutes: 41, demandMinutes: 3.5 }, { num: '21', projectedMinutes: 40 }],
+      planHeld: [{ num: '20', reason: 'needs-prepare' }, { num: '21', reason: 'prepare-stale', detail: 'old' }],
+    });
+    expect(rows).toEqual([
+      { num: '20', stage: 'tick-core', reason: 'queue-cap', detail: 'prepare (prepare-item) held: projected heavy-test wait 41m (this prepare +3.5m)' },
+      { num: '21', stage: 'tick-core', reason: 'queue-cap', detail: 'prepare held: projected heavy-test wait 40m (this prepare +?m)' },
     ]);
   });
 

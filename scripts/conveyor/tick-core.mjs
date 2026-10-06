@@ -163,9 +163,10 @@ import { prepareAheadNums } from './build-dispatch-policy.mjs'; // card 80 — p
  *  note elsewhere in {@link planTick} — `needs-slice` from `state.needsSlice`, `needs-decision` from
  *  `state.decisions`, `unshaped-no-scope` AND `no-size` (#3849) from the SAME prepare-spawn notes
  *  (`auto-preparing-scope` / `prepare-no-lane` — one prepare-scope agent authors both `scope:` and a missing
- *  size/estimate, #3842). The held-reason note loop below skips these so an item is never double-reported under
- *  two note kinds. */
-export const HELD_NOTE_EXCLUDED_REASONS = Object.freeze(['needs-slice', 'needs-decision', 'needs-investigation', 'needs-prepare', 'unshaped-no-scope', 'no-size']);
+ *  size/estimate, #3842), and `prepare-stale` (card 80) — re-prepared by the same item-prepare spawn as
+ *  `needs-prepare`, so it gets that spawn's note, a `prepare-ahead-window` note or a prepare `queue-cap` note.
+ *  The held-reason note loop below skips these so an item is never double-reported under two note kinds. */
+export const HELD_NOTE_EXCLUDED_REASONS = Object.freeze(['needs-slice', 'needs-decision', 'needs-investigation', 'needs-prepare', 'prepare-stale', 'unshaped-no-scope', 'no-size']);
 
 /**
  * SELF-DIAGNOSED STALL DETECTION (2026-09-14, live incident: #3521 held `overlaps lane-2` for 85+ minutes across

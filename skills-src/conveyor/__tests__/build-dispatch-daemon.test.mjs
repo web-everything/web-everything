@@ -1738,6 +1738,51 @@ describe('automatic item preparation', () => {
       expect(effects.stampPrepare).not.toHaveBeenCalled();
     }
   });
+  it('records the stamp each prepare starts from on its claim, and does NOT spawn when it cannot read it', async () => {
+    const effects = fixture();
+    effects.readPreparedStamp = vi.fn(({ num }) => {
+      if (num === '4502') throw new Error('main unreadable');
+      return { preparedDate: '2026-10-06', preparedAgainstSha: 'aaaa1111' };
+    });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    const metas = Object.fromEntries(effects.listPrepareClaims().map((c) => [c.meta.num, c.meta]));
+    expect(metas['4501'].replacesStamp).toEqual({ preparedDate: '2026-10-06', preparedAgainstSha: 'aaaa1111' });
+    // no record, no spawn: a claim without it would fall back to the date rule this repair removes
+    expect(metas['4502']).toBeUndefined();
+    expect(effects.dispatch.mock.calls.map(([r]) => r.num)).toEqual(['4501']);
+    expect(tick.prepare.failures).toContainEqual(expect.objectContaining({ num: '4502', stage: 'stamp-read', retry: true }));
+    // an unstamped card records an explicit null — distinct from "recorded nothing"
+    const unstamped = fixture();
+    unstamped.readPreparedStamp = () => ({ preparedDate: null });
+    rmSync(lockRoot, { recursive: true, force: true });
+    await runBuildDispatchTick({ live: true, effects: unstamped });
+    expect(unstamped.listPrepareClaims().map((c) => c.meta.replacesStamp)).toEqual([null, null]);
+  });
+  describe('a drift re-prepare claim whose card already carries a same-day stamp', () => {
+    const card = (sha) => `---\npreparedDate: 2026-10-06\npreparedAgainstSha: "${sha}"\n---\nsame-day drift`;
+    function retirement(currentSha) {
+      const effects = fixture();
+      acquireBuildDispatchClaim({ num: '4501', lockRoot, owner: 'host:10', pid: 10, nowMs: Date.now() - 60_000,
+        replacesStamp: { preparedDate: '2026-10-06', preparedAgainstSha: 'aaaa1111' } });
+      effects.hostname = () => 'host';
+      effects.isPidAlive = () => true;
+      const reader = createPrepareStatusReader({ exec: prepareGitFixture({ 4501: card(currentSha) }) });
+      effects.readPrepareStatus = (args) => reader.read(args);
+      return runBuildDispatchTick({ live: true, effects }).then((tick) => ({ tick, effects }));
+    }
+    it('keeps the claim while the card still carries the stamp being replaced (no duplicate prepare)', async () => {
+      const { tick, effects } = await retirement('aaaa1111');
+      expect(tick.prepare.retired).toEqual([]);
+      expect(tick.prepare.inFlight).toContain('4501');
+      expect(effects.listPrepareClaims().map((c) => c.meta.num)).toContain('4501');
+      expect(effects.dispatch.mock.calls.map(([r]) => r.num)).not.toContain('4501');
+    });
+    it('retires the claim once the card carries a NEW stamp', async () => {
+      const { tick, effects } = await retirement('bbbb2222');
+      expect(tick.prepare.retired).toEqual([{ num: '4501', why: 'prepared on main', released: true }]);
+      expect(effects.listPrepareClaims().map((c) => c.meta.num)).not.toContain('4501');
+    });
+  });
   it('retires a dead owner past TTL and logs it; clears prior guards', async () => {
     const effects = fixture();
     claimed(effects);
@@ -1777,6 +1822,36 @@ describe('automatic item preparation', () => {
     expect(effects.listHolds()[0].reason).toBe('prepare-unstamped');
     await runBuildDispatchTick({ live: true, effects });
     expect(effects.dispatch.mock.calls.map(([r]) => r.num)).toEqual(['4502']);
+  });
+  it('keeps the replaced stamp on the hold when an attempt ends unstamped, so the released claim\'s identity is not lost', async () => {
+    const replacesStamp = { preparedDate: '2026-10-06', preparedAgainstSha: 'aaaa1111' };
+    const effects = fixture();
+    acquireBuildDispatchClaim({ num: '4501', lockRoot, owner: 'host:10', pid: 10, nowMs: Date.now() - 60 * 60_000, replacesStamp });
+    effects.hostname = () => 'host';
+    effects.isPidAlive = () => false;
+    const holdRoot = join(lockRoot, 'holds');
+    effects.placePrepareHold = (o) => placeBuildDispatchHold({ ...o, lockRoot: holdRoot });
+    effects.listHolds = () => listBuildDispatchHolds({ lockRoot: holdRoot }).map((c) => c.meta);
+    // the card still carries the OLD same-day stamp (the session ended without restamping it) and its PR closed
+    effects.readPrepareStatus = vi.fn(({ num, replacesStamp: r }) => ({ preparedDate: null, replacedPreparedDate: r?.preparedDate ?? null,
+      pr: num === '4501' ? { state: 'CLOSED' } : null }));
+    await runBuildDispatchTick({ live: true, effects });
+    expect(effects.listHolds().find((h) => h.num === '4501')).toMatchObject({ reason: 'prepare-unstamped', replacesStamp });
+    expect(effects.listPrepareClaims().map((c) => c.meta.num)).not.toContain('4501'); // the claim is gone…
+    effects.readPrepareStatus.mockClear();
+    await runBuildDispatchTick({ live: true, effects });
+    // …but the next tick still reads the card against the stamp that claim recorded
+    expect(effects.readPrepareStatus.mock.calls.filter(([a]) => a.num === '4501').map(([a]) => a.replacesStamp)).toEqual([replacesStamp]);
+  });
+  it('cliListHolds exposes a recorded replaced stamp, and a null one, but no key when none was recorded', () => {
+    const nowMs = Date.now();
+    placeBuildDispatchHold({ num: '2101', reason: 'prepare-unstamped', nowMs, replacesStamp: { preparedDate: '2026-10-06', preparedAgainstSha: 'aaaa1111' } });
+    placeBuildDispatchHold({ num: '2102', reason: 'prepare-unstamped', nowMs, replacesStamp: null });
+    placeBuildDispatchHold({ num: '2103', reason: 'prepare-unstamped', nowMs });
+    const rows = Object.fromEntries(cliListHolds().map((h) => [h.num, h]));
+    expect(rows['2101'].replacesStamp).toEqual({ preparedDate: '2026-10-06', preparedAgainstSha: 'aaaa1111' });
+    expect(rows['2102'].replacesStamp).toBeNull();
+    expect('replacesStamp' in rows['2103']).toBe(false);
   });
   it('holds a settled unstamped run without a PR, but accepts a stamped open PR awaiting merge', async () => {
     const effects = fixture();
@@ -2490,6 +2565,48 @@ describe('card 80 — prepare just in time (daemon wiring)', () => {
     // No claim (or an older claim) still reads the stamp as prepared — today's behavior.
     expect(createPrepareStatusReader({ exec }).read({ num: 8801 }).preparedDate).toBe('2026-09-20');
   });
+
+  describe('a scope-drift re-prepare starts from a RECENT stamp (same-day / yesterday)', () => {
+    const card = (date, sha) => `---\npreparedDate: ${date}\npreparedAgainstSha: "${sha}"\n---\ndrift re-prepare`;
+    const claimedAt = '2026-10-06T15:00:00Z';
+    const read = (cardText, args) => createPrepareStatusReader({ exec: prepareGitFixture({ 8802: cardText }) })
+      .read({ num: 8802, claimedAt, ...args });
+    const replaces = { preparedDate: '2026-10-06', preparedAgainstSha: 'aaaa1111' };
+
+    it('the stamp the claim recorded is the OLD one — unprepared, whatever its date', () => {
+      for (const date of ['2026-10-06', '2026-10-05']) {
+        const old = read(card(date, 'aaaa1111'), { replacesStamp: { preparedDate: date, preparedAgainstSha: 'aaaa1111' } });
+        expect(old.preparedDate).toBeNull();
+        expect(old.replacedPreparedDate).toBe(date);
+      }
+    });
+    it('a stamp that differs from the recorded one (new sha, or new date) IS the re-prepare result', () => {
+      expect(read(card('2026-10-06', 'bbbb2222'), { replacesStamp: replaces }).preparedDate).toBe('2026-10-06');
+      expect(read(card('2026-10-07', 'aaaa1111'), { replacesStamp: replaces }).preparedDate).toBe('2026-10-07');
+    });
+    it('a claim taken on an UNSTAMPED card (recorded null) reads any stamp as its result', () => {
+      expect(read(card('2026-10-06', 'aaaa1111'), { replacesStamp: null }).preparedDate).toBe('2026-10-06');
+    });
+    it('a claim that recorded nothing keeps the date rule (older claims, a failed read)', () => {
+      expect(read(card('2026-09-20', 'aaaa1111'), {}).preparedDate).toBeNull();
+      expect(read(card('2026-10-06', 'aaaa1111'), {}).preparedDate).toBe('2026-10-06');
+    });
+    it('stamp() re-fetches main — it never answers from the reader\'s tick-start snapshot', () => {
+      let current = prepareGitFixture({ 8802: card('2026-10-06', 'aaaa1111') });
+      const exec = vi.fn((...args) => current(...args));
+      const reader = createPrepareStatusReader({ exec });
+      expect(reader.read({ num: 8802, claimedAt }).preparedAgainstSha).toBe('aaaa1111');
+      current = prepareGitFixture({ 8802: card('2026-10-06', 'bbbb2222') }); // a stamp landed after the snapshot
+      expect(reader.stamp({ num: 8802 }).preparedAgainstSha).toBe('bbbb2222');
+      expect(exec.mock.calls.filter(([cmd, args]) => cmd === 'git' && args[0] === 'fetch')).toHaveLength(2);
+    });
+    it('stamp() reads the stamp as it stands, with its sha and no PR lookup', () => {
+      const exec = prepareGitFixture({ 8802: card('2026-10-06', 'aaaa1111') });
+      expect(createPrepareStatusReader({ exec }).stamp({ num: 8802 })).toMatchObject(replaces);
+      expect(exec.mock.calls.filter(([cmd]) => cmd === 'gh')).toEqual([]);
+      expect(() => createPrepareStatusReader({ exec }).stamp({ num: 1 })).toThrow('not found on origin/main');
+    });
+  });
 });
 
 describe('build-hold visibility', () => {
@@ -2513,6 +2630,26 @@ describe('build-hold visibility', () => {
     ]);
     expect(holdText(r.buildHolds[0])).toBe('held [tick-core] queue-cap — projected heavy-test wait 41m (this build +6.5m)');
     expect(holdText(undefined)).toBe('not a candidate');
+  });
+
+  it('a prepare held on queue-cap names the queue-cap in buildHolds, not a bare needs-prepare plan hold', async () => {
+    const effects = {
+      planTick: () => ({
+        decisions: {
+          statusLine: 't', counts: { building: 0 }, spawnBuilds: [],
+          queueCapHeld: { prepare: [{ num: '9', lane: 4, kind: 'prepare-item', projectedMinutes: 41, demandMinutes: 3.5 }], build: [] },
+          admission: { queue: [{ num: '9', scope: ['we:b'] }], cleared: [{ num: '9' }], held: [{ num: '9', reason: 'needs-prepare' }] },
+        },
+        nextState: {},
+      }),
+      fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [], listSettledBuilds: () => [],
+      killSwitch: () => ({ engaged: false }),
+    };
+    const r = await runBuildDispatchTick({ live: false, effects });
+    expect(r.buildHolds).toEqual([
+      { num: '9', stage: 'tick-core', reason: 'queue-cap', detail: 'prepare (prepare-item) held: projected heavy-test wait 41m (this prepare +3.5m)' },
+    ]);
+    expect(holdText(r.buildHolds[0])).toMatch(/^held \[tick-core\] queue-cap — prepare/);
   });
 
   it('the live tick line carries buildHolds', () => {

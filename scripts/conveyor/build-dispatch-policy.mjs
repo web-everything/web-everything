@@ -373,11 +373,23 @@ export function daysBetween(from, to) {
 /**
  * Card 80 (b) — is a card's main-branch prepare stamp the RESULT of a prepare attempt claimed at `claimedAt`, or
  * an older stamp that attempt is replacing? A re-prepare (a `prepare-stale` card) starts with a stamp already on
- * main; reading that stamp as "prepared on main" would retire the claim at once. `prepare-stamp` writes the LOCAL
- * date while a claim time is UTC, so one day of slack is allowed. Pure.
+ * main; reading that stamp as "prepared on main" would retire the claim at once.
+ *
+ * `replaces` is the stamp the claim recorded when it was taken: `null` (the card was unstamped, so ANY stamp is
+ * the result) or `{preparedDate, preparedAgainstSha}`. The stamp is the result exactly when it is not that same
+ * stamp — a revision comparison, not a date one, because a scope-drift re-prepare can start hours after the
+ * stamp it replaces, so a same-day or yesterday stamp is still the OLD one.
+ *
+ * Only a claim that recorded nothing (`replaces === undefined`: taken by an older daemon, or its read failed) falls
+ * back to dates. `prepare-stamp` writes the LOCAL date while a claim time is UTC, so that fallback allows one day
+ * of slack. Pure.
  */
-export function stampCoversClaim(preparedDate, claimedAt) {
+export function stampCoversClaim(preparedDate, claimedAt, { replaces, preparedAgainstSha } = {}) {
   if (!preparedDate) return false;
+  if (replaces === null) return true;
+  if (replaces && typeof replaces === 'object') {
+    return !(replaces.preparedDate === preparedDate && (replaces.preparedAgainstSha ?? null) === (preparedAgainstSha ?? null));
+  }
   if (typeof claimedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}/.test(claimedAt)) return true;
   const d = daysBetween(claimedAt.slice(0, 10), preparedDate);
   return d == null || d >= -1;
@@ -394,7 +406,7 @@ export function stampCoversClaim(preparedDate, claimedAt) {
  * Pure.
  * @returns {Array<{num:string, stage:string, reason:string, detail?:string}>}
  */
-export function collectBuildHolds({ queue = [], planHeld = [], suppressed = [], policyHold = [], cooldown = [], prepareBusy = [], dispatched = [] } = {}) {
+export function collectBuildHolds({ queue = [], planHeld = [], suppressed = [], prepareQueueHeld = [], policyHold = [], cooldown = [], prepareBusy = [], dispatched = [] } = {}) {
   const out = new Map();
   const put = (num, row) => { const n = normNum(num); if (n && !out.has(n)) out.set(n, { num: n, ...row }); };
   const sent = new Set((Array.isArray(dispatched) ? dispatched : []).map((d) => normNum(d?.num ?? d)));
@@ -404,6 +416,12 @@ export function collectBuildHolds({ queue = [], planHeld = [], suppressed = [], 
   for (const s of Array.isArray(suppressed) ? suppressed : []) {
     const detail = s.by === 'queue-cap' ? `projected heavy-test wait ${s.projectedMinutes ?? '?'}m (this build +${s.demandMinutes ?? '?'}m)` : undefined;
     put(s.num, { stage: 'tick-core', reason: s.by || 'suppressed', ...(detail ? { detail } : {}) });
+  }
+  // A prepare tick-core held on queue-cap (`decisions.queueCapHeld.prepare`) must beat the plan's own bare
+  // `needs-prepare` / `prepare-stale` row below, or the hold the operator needs to see reads as a plain prepare wait.
+  for (const h of Array.isArray(prepareQueueHeld) ? prepareQueueHeld : []) {
+    put(h.num, { stage: 'tick-core', reason: 'queue-cap',
+      detail: `prepare${h.kind ? ` (${h.kind})` : ''} held: projected heavy-test wait ${h.projectedMinutes ?? '?'}m (this prepare +${h.demandMinutes ?? '?'}m)` });
   }
   for (const h of Array.isArray(planHeld) ? planHeld : []) put(h.num, { stage: 'plan', reason: h.reason, ...(h.detail ? { detail: h.detail } : {}) });
   const order = new Map((Array.isArray(queue) ? queue : []).map((r, i) => [normNum(r?.num), i]));

@@ -507,9 +507,32 @@ export function ownLaneNumber(cwdReal, poolDir, sepChar = '/') {
   return m ? Number(m[1]) : null;
 }
 
-/** A clean, landed HEAD must also belong to this lease, not predate a freshly acquired empty lane. */
-export function isDeliveredLease({ porcelain, headIsAncestorOfUpstream, headCommitMs, acquiredAtMs }) {
-  return porcelain === '' && headIsAncestorOfUpstream === true
+/**
+ * Did THIS lane author a commit since the lease was taken, and did that commit LAND? Read off the lane's own HEAD
+ * reflog (`%gt<TAB>%H<TAB>%gs` per line — reflog entry time, the commit the entry points at, its subject): a
+ * `commit…` / `cherry-pick…` entry at or after `acquiredAtMs` whose commit `isLanded` is work the holder produced
+ * and finished. A lane that merely synced forward (`reset` / `checkout` / fast-forward `merge` / `pull`) to a newer
+ * main records no such entry, and one that committed WIP then `reset --hard` to main abandoned that commit, so it
+ * is not on upstream and does not count. A commit's own date is no proof either — a live, still-empty lane that
+ * fast-forwards to a main that moved after its acquire also has a HEAD newer than `acquiredAt`. Pure; a missing or
+ * empty reflog reads as "no".
+ */
+export function laneAuthoredSince(reflogLines, acquiredAtMs, isLanded = () => true) {
+  if (!Array.isArray(reflogLines) || !Number.isFinite(acquiredAtMs)) return false;
+  return reflogLines.some((line) => {
+    const [ts, sha, ...rest] = String(line).split('\t');
+    const ms = Number.parseInt(ts, 10) * 1000;
+    return Number.isFinite(ms) && ms >= acquiredAtMs && /^(commit|cherry-pick)\b/.test(rest.join('\t').trim())
+      && Boolean(sha) && isLanded(sha) === true;
+  });
+}
+
+/**
+ * A clean, landed HEAD that THIS lease's holder produced. `authoredSinceAcquire` ({@link laneAuthoredSince}) is
+ * required: a clean tree whose HEAD sits on upstream also describes a live lane that only synced to a newer main.
+ */
+export function isDeliveredLease({ porcelain, headIsAncestorOfUpstream, headCommitMs, acquiredAtMs, authoredSinceAcquire }) {
+  return porcelain === '' && headIsAncestorOfUpstream === true && authoredSinceAcquire === true
     && Number.isFinite(headCommitMs) && Number.isFinite(acquiredAtMs)
     && headCommitMs >= acquiredAtMs;
 }

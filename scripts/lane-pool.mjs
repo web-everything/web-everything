@@ -108,6 +108,7 @@ import {
   isContestedLease,
   isTransientRefLockError,
   isDeliveredLease,
+  laneAuthoredSince,
 } from './lib/lane-lease.mjs';
 // #4122 — the free-lane list `acquire`'s auto-pick reads as a fast pre-filter before paying for its own scan
 // (see that module's own header for the full incident/design writeup).
@@ -2488,6 +2489,15 @@ function deliveredLeaseForLane(dir, lease) {
     headIsAncestorOfUpstream: !!upstream && tryGit(['merge-base', '--is-ancestor', 'HEAD', upstream], dir) !== null,
     headCommitMs: Number.parseInt(tryGit(['log', '-1', '--format=%ct', 'HEAD'], dir) ?? '', 10) * 1000,
     acquiredAtMs: Date.parse(lease.acquiredAt),
+    // A clean lane on upstream is also a live lane that only synced to a newer main, or one that committed WIP and
+    // reset it away: require a commit the lane itself made since acquire AND that is on upstream (landed).
+    authoredSinceAcquire: !!upstream && laneAuthoredSince(
+      // `HEAD@{<unix>}` carries the reflog ENTRY time (there is no %-placeholder for it); rewritten to `<unix>\t<sha>\t<subject>`.
+      (tryGit(['reflog', 'show', '--date=unix', '--format=%gd%x09%H%x09%gs', 'HEAD'], dir) ?? '').split('\n')
+        .map((line) => line.replace(/^[^@]*@\{(\d+)\}/, '$1')).filter(Boolean),
+      Date.parse(lease.acquiredAt),
+      (sha) => tryGit(['merge-base', '--is-ancestor', sha, upstream], dir) !== null,
+    ),
   });
 }
 

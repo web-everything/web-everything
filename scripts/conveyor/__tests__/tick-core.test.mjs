@@ -45,6 +45,7 @@ import {
   buildDecisionTrace,
   lanePoolListArgsForRepo,
 } from '../tick-core.mjs';
+import { HELD_REASONS } from '../../readiness/dispatch-plan.mjs';
 import { sessionSlugFor } from '../../operations/dispatch-lane.mjs';
 import { repoProfile } from '../../lib/repo-profile.mjs';
 
@@ -1465,8 +1466,8 @@ describe('planTick — composes the tick and threads nextState', () => {
         // #3842's prepare-scope agent authors either (or both) in one turn.
         expect.objectContaining({ kind: 'auto-preparing-scope', nums: [90] }),
       ]));
-      // The exclusion set itself is exactly the six reasons that have their own note elsewhere.
-      expect(HELD_NOTE_EXCLUDED_REASONS).toEqual(['needs-slice', 'needs-decision', 'needs-investigation', 'needs-prepare', 'unshaped-no-scope', 'no-size']);
+      // The exclusion set itself is exactly the seven reasons that have their own note elsewhere.
+      expect(HELD_NOTE_EXCLUDED_REASONS).toEqual(['needs-slice', 'needs-decision', 'needs-investigation', 'needs-prepare', 'prepare-stale', 'unshaped-no-scope', 'no-size']);
     });
 
     it('emits NO held notes when the queue is empty (plan.held absent or [])', () => {
@@ -2316,6 +2317,25 @@ describe('card 80 — prepare just in time', () => {
   it('a prepare-stale card is a re-prepare candidate like needs-prepare', () => {
     const r = tick({});
     expect(r.decisions.spawnPrepareItems.map((s) => s.num)).toEqual(['2', '3', '4', '5']);
+  });
+
+  it('a prepare-stale card gets no generic `held` note on top of its own prepare note', () => {
+    for (const config of [{}, { prepareAheadWindow: 1 }]) {
+      const r = tick(config);
+      expect(r.decisions.notes.filter((n) => n.kind === 'held' && n.reason === 'prepare-stale')).toEqual([]);
+      expect(r.decisions.notes.filter((n) => n.kind === 'held' && n.reason === 'needs-prepare')).toEqual([]);
+    }
+    // …and never reads as a self-diagnosed stall, which is fed from the same held entries.
+    expect(tick({}).decisions.stalled).toEqual([]);
+  });
+
+  it('every dispatch-plan held reason is either excluded from the generic note or deliberately generic', () => {
+    // Adding a HELD_REASONS entry forces a choice here, instead of silently doubling its note (the prepare-stale miss).
+    const GENERIC = ['already-done', 'blocked', 'branch-drift-blocked', 'no free lane', 'capacity-cap', 'overlaps lane-<n>',
+      'cleared-but-not-ready', 'dispatch-paused', 'pr-limit'];
+    const unclassified = HELD_REASONS.filter((r) => !HELD_NOTE_EXCLUDED_REASONS.includes(r) && !GENERIC.includes(r));
+    expect(unclassified).toEqual([]);
+    expect(GENERIC.filter((r) => HELD_NOTE_EXCLUDED_REASONS.includes(r))).toEqual([]);
   });
 
   it('without the window every candidate is offered (other callers unchanged)', () => {
