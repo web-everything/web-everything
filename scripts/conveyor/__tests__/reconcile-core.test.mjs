@@ -40,6 +40,7 @@ import {
 import {
   STAND_DOWN_MARKER, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER, buildStandDownComment,
 } from '../stand-down.mjs';
+import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { CI_HEAL_COMMENT_MARKER, buildCiHealComment } from '../ci-heal-mark.mjs';
@@ -1927,6 +1928,32 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
     expect(plan.refusals).toEqual([expect.objectContaining({
       kind: 'cap-exhausted', prNumber: 2601, attempts: ADVISORY_FIX_ROUND_CAP, cap: ADVISORY_FIX_ROUND_CAP, capKind: 'advisory-fix',
     })]);
+  });
+
+  describe('operator round-extension grants reach the advisory-fix cap', () => {
+    const exhausted = () => {
+      const comments = [];
+      for (let i = 0; i < ADVISORY_FIX_ROUND_CAP; i += 1) {
+        comments.push({ body: `${ADVISORY_NOTE_MARKER}\n\nround ${i}`, author: AUTOMATION });
+        comments.push({ body: buildAdvisoryFixComment({}), author: AUTOMATION });
+      }
+      comments.push({ body: `${ADVISORY_NOTE_MARKER}\n\none more, still broken`, author: AUTOMATION });
+      return comments;
+    };
+    const grant = (login) => ({
+      author: { login },
+      body: buildRoundExtensionComment({ repo: 'we', pr: 2601, by: 1, actor: 'chalbert', channel: 'test', reason: 'one more', at: '2026-10-06T10:44:00Z' }),
+    });
+    it('an operator-authored grant lets a PR at the advisory-fix cap dispatch again', () => {
+      const plan = planReconcile({ prs: [prNeedsHuman({ comments: [...exhausted(), grant('chalbert')] })], agents: [], now: NOW });
+      expect(plan.refusals).toEqual([]);
+      expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'advisory-fix', prNumber: 2601, cap: ADVISORY_FIX_ROUND_CAP + 1 })]);
+    });
+    it('an automation-authored grant does not', () => {
+      const plan = planReconcile({ prs: [prNeedsHuman({ comments: [...exhausted(), grant('web-everything')] })], agents: [], now: NOW });
+      expect(plan.dispatch).toHaveLength(0);
+      expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'cap-exhausted', capKind: 'advisory-fix' })]);
+    });
   });
 
   // xconv1-evidence FOLLOW-UP (web-everything/web-everything#2766/#2767, 2026-09-27), reconstructed from the real
