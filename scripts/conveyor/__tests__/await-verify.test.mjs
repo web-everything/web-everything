@@ -8,6 +8,7 @@ import {
   AWAIT_VERIFY_FILE, DEFAULT_AWAIT_VERIFY_TTL_MS, AWAIT_VERIFY_FUTURE_SKEW_MS,
   resolveAwaitVerifyTtlMs, resolveAwaitVerifyPath, readAwaitVerifyRecord, classifyAwaitVerify,
   makeAwaitingVerifyResolver, writeAwaitVerifyRecord, clearAwaitVerifyRecord,
+  AWAIT_VERIFY_STORE_ENV, listStoredAwaitVerify, readStoredAwaitVerify,
 } from '../await-verify.mjs';
 import { DEFAULT_ADMISSION_CEILING_MS } from '../../readiness/heavy-admission.mjs';
 
@@ -106,7 +107,7 @@ it('CLI mark/show/clear in a temporary git repo binds the environment sessionId'
   execFileSync('git', ['-C', cwd, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'fixture'], { stdio: 'pipe' });
   const script = SCRIPT;
   const cli = (...args) => JSON.parse(execFileSync(process.execPath, [script, ...args, `--cwd=${cwd}`], {
-    encoding: 'utf8', env: { ...process.env, CLAUDE_CODE_SESSION_ID: 'cli-session' },
+    encoding: 'utf8', env: { ...process.env, CLAUDE_CODE_SESSION_ID: 'cli-session', [AWAIT_VERIFY_STORE_ENV]: join(cwd, '.store') },
   }));
   const marked = cli('mark', '--repo=web-everything/web-everything', '--pr=4115', '--who=fix-4115');
   expect(marked).toMatchObject({ v: 1, sessionId: 'cli-session', who: 'fix-4115', pr: 4115, attempt: 1 });
@@ -136,4 +137,52 @@ it('CLI malformed mark refuses with exit 2 and writes no record', () => {
   expect(failure?.status).toBe(2);
   expect(String(failure?.stderr)).toContain('malformed');
   expect(readAwaitVerifyRecord(cwd)).toBeNull();
+});
+
+describe('#5137 slices 2+3 — the shared store a dispatched session is found by', () => {
+  const gitRepo = () => {
+    execFileSync('git', ['init', cwd], { stdio: 'pipe' });
+    execFileSync('git', ['-C', cwd, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'fixture'], { stdio: 'pipe' });
+  };
+  const run = (args, store) => execFileSync(process.execPath, [SCRIPT, ...args, `--cwd=${cwd}`], {
+    encoding: 'utf8', stdio: 'pipe', env: { ...process.env, CLAUDE_CODE_SESSION_ID: 'S-live', [AWAIT_VERIFY_STORE_ENV]: store },
+  });
+  const MARK = ['mark', '--repo=web-everything/web-everything', '--pr=4115', '--who=fix-4115', '--ref=lane/item-68b', '--kind=fix'];
+
+  it('a real dispatched row (cwd = per-dispatch scratch dir, no .git) is seen as awaiting once its lane marks', () => {
+    // Before this slice the resolver only read `<row.cwd>/.git/.fix-await-verify`, but a dispatched fixer's row
+    // cwd is `.operations/dispatch/<uuid>` — never its lane — so the reaper exemption could never fire live.
+    gitRepo();
+    const store = join(cwd, '.store');
+    const scratch = mkdtempSync(join(tmpdir(), 'dispatch-scratch-'));
+    try {
+      const marked = JSON.parse(run(MARK, store));
+      expect(marked).toMatchObject({ sessionId: 'S-live', lane: execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim(), ref: 'lane/item-68b', kind: 'fix' });
+      const row = { sessionId: 'S-live', name: 'fix-4115', cwd: scratch, state: 'done' };
+      const prior = process.env[AWAIT_VERIFY_STORE_ENV];
+      process.env[AWAIT_VERIFY_STORE_ENV] = store; // the DEFAULT reader (what the reaper and claim sweep use)
+      try {
+        const resolver = makeAwaitingVerifyResolver({ now: () => Date.parse(marked.requestedAt) + 1000 });
+        expect(resolver(row, { pr: 4115 })).toMatchObject({ awaiting: true, reason: 'awaiting-verify' });
+        expect(resolver({ ...row, sessionId: 'someone-else', name: 'fix-9' }, { pr: 4115 })).toMatchObject({ awaiting: false });
+      } finally { if (prior === undefined) delete process.env[AWAIT_VERIFY_STORE_ENV]; else process.env[AWAIT_VERIFY_STORE_ENV] = prior; }
+      expect(readStoredAwaitVerify('S-live', { dir: store })).toMatchObject({ pr: 4115 });
+      expect(listStoredAwaitVerify({ dir: store }).map((e) => e.key)).toEqual(['S-live']);
+      expect(JSON.parse(run(['clear'], store))).toEqual({ cleared: true });
+      expect(listStoredAwaitVerify({ dir: store })).toEqual([]);
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
+  it('mark --ref refuses a dirty tree, a non-HEAD sha, a non-lane ref and an unknown kind (exit 2, nothing stored)', () => {
+    gitRepo();
+    const store = join(cwd, '.store');
+    const fails = (args) => { try { run(args, store); return null; } catch (e) { return e; } };
+    writeFileSync(join(cwd, 'untracked.txt'), 'x');
+    expect(String(fails(MARK)?.stderr)).toMatch(/dirty working tree/);
+    rmSync(join(cwd, 'untracked.txt'));
+    expect(String(fails([...MARK, `--sha=${'b'.repeat(40)}`])?.stderr)).toMatch(/is not HEAD/);
+    for (const ref of ['main', 'refs/heads/main', 'lane/../main']) expect(fails([...MARK.filter((a) => !a.startsWith('--ref')), `--ref=${ref}`])?.status).toBe(2);
+    expect(String(fails([...MARK.filter((a) => !a.startsWith('--kind')), '--kind=build'])?.stderr)).toMatch(/--kind/);
+    expect(listStoredAwaitVerify({ dir: store })).toEqual([]);
+  });
 });
