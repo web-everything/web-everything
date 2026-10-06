@@ -33,6 +33,11 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const RECORD_FILE = join(homedir(), 'workspace/.operations/coordination/codex-pilot.jsonl');
 const MAX_BUFFER = 64 * 1024 * 1024;
+// The occupancy listing is fail-closed: a result that reaches this size may be truncated, so it proves nothing.
+export const OPEN_PR_LIMIT = 1000;
+// Codex can write the lane's .git/config and .git/hooks, which git status/add/commit would then execute
+// outside Codex's sandbox. Every wrapper git call pins these over any repo-local value.
+export const GIT_HARDENING = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.sshCommand=', '-c', 'commit.gpgSign=false', '-c', 'core.attributesFile=/dev/null'];
 
 // ── pure planning ─────────────────────────────────────────────────────────────
 
@@ -131,6 +136,19 @@ export function parsePorcelain(text) {
   }))];
 }
 
+/**
+ * Everything the lane changed since `baseSha` (the HEAD captured before Codex ran): `dirty` is the working
+ * tree + index, `committed` is what Codex committed despite rule 4. Rename detection is off so a rename's
+ * SOURCE path is reported too — otherwise a committed `git mv outside/x scripts/x` hides the deletion.
+ * `git` is a (...args) => stdout runner already pinned to the lane.
+ */
+export function collectScopeChanges(git, baseSha) {
+  const dirty = parsePorcelain(git('status', '--porcelain=v1', '-uall', '--no-renames'));
+  const committed = [...new Set(String(git('diff', '--name-only', '--no-renames', '--no-ext-diff', baseSha, 'HEAD'))
+    .split('\n').filter(Boolean).map(unquoteGitPath))];
+  return { dirty, committed };
+}
+
 export function findScopeConflicts(openPrs, allowed) {
   return openPrs.flatMap((pr) => {
     const files = [...new Set(pr.files.map(({ path }) => path).filter((path) => isAllowed(path, allowed)))];
@@ -155,10 +173,11 @@ export function planBranch(cardId, title) {
   return `lane/codex-${cardId ?? 'brief'}-${slug || 'task'}`;
 }
 
-function stepTable(steps) {
+// `redact` drops the per-step detail (local lane/task paths, changed files) for anything published to GitHub.
+function stepTable(steps, { redact = false } = {}) {
   const cell = (value) => String(value ?? '').replace(/\|/g, '\\|').replace(/[\r\n]+/g, ' ');
-  return ['| Step | OK | ms | Detail |', '| --- | --- | ---: | --- |',
-    ...steps.map((step) => `| ${cell(step.name)} | ${step.ok ? 'yes' : 'no'} | ${step.ms} | ${cell(step.detail)} |`)].join('\n');
+  return [redact ? '| Step | OK | ms |' : '| Step | OK | ms | Detail |', redact ? '| --- | --- | ---: |' : '| --- | --- | ---: | --- |',
+    ...steps.map((step) => `| ${cell(step.name)} | ${step.ok ? 'yes' : 'no'} | ${step.ms} |${redact ? '' : ` ${cell(step.detail)} |`}`)].join('\n');
 }
 
 export function composePrBody({ cardId, title, doneWhen, allowed, diffStat, codex = {}, steps = [] }) {
@@ -184,7 +203,7 @@ ${diffStat ?? ''}
 Input tokens: ${usage.input_tokens ?? 'unknown'}; output tokens: ${usage.output_tokens ?? 'unknown'}; quota used: ${codex.quotaUsedPercent == null ? 'unknown' : `${codex.quotaUsedPercent}%`}.
 
 ## Steps
-${stepTable(steps)}
+${stepTable(steps, { redact: true })}
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 `;
@@ -234,12 +253,12 @@ export function runCodexWorker(opts, {
   const steps = [];
   const branch = planBranch(cardId, title);
   const prTitle = cardId != null ? `${title} (#${cardId})` : title;
-  let lane = null, changed = [], codex = {}, pr = null, record = null;
+  let lane = null, changed = [], dirty = [], baseSha = null, codex = {}, pr = null, record = null;
   let outcome = 'pr-opened';
   const command = (cmd, args, options = {}) => exec(cmd, args, {
     cwd: repoRoot, encoding: 'utf8', timeout: 5 * 60_000, maxBuffer: MAX_BUFFER, ...options,
   });
-  const git = (...args) => command('git', ['-C', lane.path, ...args]);
+  const git = (...args) => command('git', ['-C', lane.path, ...GIT_HARDENING, ...args]);
   const fail = (name) => {
     if (outcome === 'pr-opened') outcome = `${['free-scope', 'scope-guard'].includes(name) ? 'refused' : 'failed'}:${name}`;
   };
@@ -261,7 +280,9 @@ export function runCodexWorker(opts, {
   const forward = () => {
     if (!step('free-scope', () => {
       // free-scope.mjs has no shared interface yet; use the specified gh query directly.
-      const prs = JSON.parse(command('gh', ['pr', 'list', '--repo', opts.repoSlug ?? CONSTELLATION_REPOS.we.slug, '--state', 'open', '--limit', '200', '--json', 'number,title,headRefName,files']));
+      const prs = JSON.parse(command('gh', ['pr', 'list', '--repo', opts.repoSlug ?? CONSTELLATION_REPOS.we.slug, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,headRefName,files']));
+      // Fail closed: a full page may have dropped an overlapping PR, so "no conflict" would be unproven.
+      if (prs.length >= OPEN_PR_LIMIT) throw new Error(`Open PR listing reached its ${OPEN_PR_LIMIT} limit; scope occupancy cannot be proven`);
       const conflicts = findScopeConflicts(prs, allowed);
       if (conflicts.length) throw new Error(conflicts.map((pr) => `#${pr.number}: ${pr.files.join(', ')}`).join('\n'));
       return 'No overlapping open PR files';
@@ -277,6 +298,9 @@ export function runCodexWorker(opts, {
       lane = parseLastJson(output);
       if (!lane?.path || typeof lane.path !== 'string') throw new Error('Lane acquisition returned no path');
       if (lane.lane == null || !lane.holder) throw new Error('Lane acquisition returned no lane/session release identity');
+      // Pin the scope-guard base NOW, before Codex can touch the lane's refs: origin/main is writable by Codex.
+      baseSha = String(git('rev-parse', '--verify', 'HEAD^{commit}')).trim();
+      if (!/^[0-9a-f]{40}$/.test(baseSha)) throw new Error('Could not resolve the lane HEAD before running Codex');
       return lane.path;
     })) return;
     const taskFile = join(lane.path, '.git/codex-worker-task.md');
@@ -302,9 +326,9 @@ export function runCodexWorker(opts, {
       return detail;
     })) return;
     if (!step('scope-guard', () => {
-      const status = parsePorcelain(git('status', '--porcelain=v1', '-uall'));
-      const committed = String(git('diff', '--name-only', 'origin/main...HEAD')).split('\n').filter(Boolean).map(unquoteGitPath);
-      changed = [...new Set([...status, ...committed])];
+      const scope = collectScopeChanges(git, baseSha);
+      dirty = scope.dirty;
+      changed = [...new Set([...scope.dirty, ...scope.committed])];
       const guard = checkAllowedDiff(changed, allowed);
       if (!guard.ok) throw new Error(`Outside allowed scope: ${guard.outside.join(', ')}`);
       if (!changed.length) throw new Error('No changed paths');
@@ -312,8 +336,12 @@ export function runCodexWorker(opts, {
     })) return;
     if (!step('commit', () => {
       // Lanes stay on a detached HEAD (no local branches in pool checkouts); open-pr publishes HEAD to `branch`.
-      git('add', '--', ...changed);
-      git('commit', '-m', `${prTitle}\n\ncodex-direct pilot: coded by Codex, wrapped by scripts/operations/codex-worker.mjs.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`);
+      // Codex may have committed its own work despite rule 4: nothing is left to stage, and `git commit`
+      // would fail "nothing to commit". The guard already vetted those commits, so publish them as they are.
+      if (!dirty.length) return `Work already committed by Codex; nothing to stage (${branch})`;
+      // Stage only the dirty paths: a path deleted in a Codex commit no longer matches a pathspec.
+      git('--literal-pathspecs', 'add', '--', ...dirty);
+      git('commit', '--no-verify', '-m', `${prTitle}\n\ncodex-direct pilot: coded by Codex, wrapped by scripts/operations/codex-worker.mjs.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`);
       return branch;
     })) return;
     if (!step('verify', () => {
@@ -324,7 +352,7 @@ export function runCodexWorker(opts, {
       return `verify green (${verdict.passed} passed)`;
     })) return;
     step('open-pr', () => {
-      const diffStat = String(git('diff', '--stat', 'origin/main...HEAD')).trim();
+      const diffStat = String(git('diff', '--stat', '--no-renames', '--no-ext-diff', baseSha, 'HEAD')).trim();
       const bodyFile = join(lane.path, '.git/codex-worker-pr-body.md');
       writeFile(bodyFile, composePrBody({ cardId, title, doneWhen, allowed, diffStat, codex, steps }), 'utf8');
       const output = String(command('node', ['scripts/operations/run.mjs', 'open-pr', `--ref=${branch}`, `--title=${prTitle}`, `--bodyFile=${bodyFile}`, '--json'], { cwd: lane.path, timeout: 40 * 60_000 }));
