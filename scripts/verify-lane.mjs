@@ -66,20 +66,38 @@ import { readLockEntry } from './readiness/file-locks.mjs';
 import { spawn } from 'node:child_process';
 import { createFailureCollector, mergeFailureDetails } from './lib/verify-failures.mjs';
 import { isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
-import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlinkSync, lstatSync } from 'node:fs';
+import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlinkSync, lstatSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs } from './lib/lane-verify.mjs';
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
-import { matchRequestedDefaultGate, verifySetting, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening.mjs';
+import { classifyRedCause, reachesChanged } from './lib/red-cause.mjs';
+import { alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
 const flags = {};
 const positionals = [];
+// #item-98 — `--help`/`-h` prints usage and exits 0 BEFORE any git read, admission or gate. Without this the stray flag
+// fell through to the default `verify` mode and ran (and stamped a green marker from) the whole gate.
+if (process.argv.slice(2).some((a) => a === '--help' || a === '-h')) {
+  process.stdout.write(`verify-lane — verify a lane clone before it lands (writes the .lane-verify marker).
+
+Usage: node scripts/verify-lane.mjs [verify|request|check|reset|run] [flags]
+  (none)    run the diff-selected gate here and stamp the marker
+  request   stamp a running marker; the verify daemon runs the gate
+  check     read-only verdict for HEAD (--wait=<ms> blocks until it settles)
+  reset     clear a stale marker
+  run       synchronous marker-less run
+Flags: --repo=<dir> --json --require-verified --help/-h
+Exit: 0 ok, 2 red, 3 usage/refused. Full docs: the header of scripts/verify-lane.mjs.
+`);
+  process.exit(0);
+}
 for (const a of process.argv.slice(2)) {
   if (a.startsWith('--')) {
     const eq = a.indexOf('=');
@@ -98,7 +116,11 @@ const { requireVerified: REQUIRE_VERIFIED, breakGlass: VERIFY_BREAK_GLASS } = re
 const MODE = positionals[0] === 'check' ? 'check' : positionals[0] === 'reset' ? 'reset'
   : positionals[0] === 'request' ? 'request' : positionals[0] === 'run' ? 'run' : 'verify';
 
-const git = (args) => execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+// The lane is agent-writable, and the fix daemon runs `request` against it: its `.git/config` must never be able to execute
+// a command here (`core.fsmonitor`, hooks, `diff.external`/textconv). Env-pinned config + argument rewrites; a lane that defines a
+// `filter.*` driver is refused by the daemon before it spawns this (scripts/lib/lane-git-hardening.mjs#laneFilterDrivers).
+const GIT_ENV = laneGitHardeningEnv(process.env);
+const git = (args) => execFileSync('git', hardenLaneGitArgs(args), { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: GIT_ENV }).trim();
 const tryGit = (args) => { try { return git(args); } catch { return null; } };
 
 // Resolve the marker inside the REAL git dir. `.git` is a DIRECTORY in a clone (the lane case) but a FILE in a
@@ -118,6 +140,13 @@ function markerPhases(record) {
   return record && typeof record === 'object' && !record.corrupt
     && record.phases && typeof record.phases === 'object' && !Array.isArray(record.phases)
     ? { phases: record.phases } : {};
+}
+
+// Item 99 — the recorded red cause rides along on `check` and cached output, so a reader of the marker sees it.
+// Only for a marker that belongs to THIS head: a red cause for another commit would describe the wrong code.
+function markerRedCause(record) {
+  return record && typeof record === 'object' && !record.corrupt && record.sha === headSha && typeof record.redCause === 'string'
+    ? { redCause: record.redCause, redCauseFiles: Array.isArray(record.redCauseFiles) ? record.redCauseFiles : [], ...(record.redCauseUncertain === true ? { redCauseUncertain: true } : {}) } : {};
 }
 
 function writeMarker(record) {
@@ -170,14 +199,15 @@ if (MODE === 'check') {
       // too keeps the two in visible agreement instead of one relying on a default the other never mentions.
       resolveLaneRelevantChangeSince: (record) => laneRelevantChangeSinceForRecord({ record, headSha, base: 'origin/main', runGit: git }),
     });
-    emit({ ...result, ...markerPhases(readMarker()) }, result.ok ? 0 : 2);
+    const settled = readMarker();
+    emit({ ...result, ...markerPhases(settled), ...markerRedCause(settled) }, result.ok ? 0 : 2);
   }
   const bareCheckRecord = readMarker();
   const v = verifyGateDecision({
     record: bareCheckRecord, headSha, breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
     laneRelevantChangeSince: laneRelevantChangeSinceForRecord({ record: bareCheckRecord, headSha, base: 'origin/main', runGit: git }),
   });
-  emit({ sha: headSha, ...v, ...markerPhases(bareCheckRecord) }, v.ok ? 0 : 2);
+  emit({ sha: headSha, ...v, ...markerPhases(bareCheckRecord), ...markerRedCause(bareCheckRecord) }, v.ok ? 0 : 2);
 }
 
 // #3378 review (rounds 2-4) — `isConfirmedOwnLease` itself now refuses an `ownerSession` match that is either
@@ -283,15 +313,15 @@ if (typeof flags.gate === 'string') {
       // A dispatched child must leave a TERMINAL record (red, exit 3) — leaving the `running` request as it was would
       // make the dispatcher re-spawn this same refusal on every sweep. A plain `request` records nothing.
       if (dispatchedChild) {
-        writeMarker(verifyFinishBody(verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: null }),
-          { finishedAt: new Date().toISOString(), exitCode: 3, sha: headSha, suites: GATE, treeHash: null }));
+        writeMarker({ ...verifyFinishBody(verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: null }),
+          { finishedAt: new Date().toISOString(), exitCode: 3, sha: headSha, suites: GATE, treeHash: null }), redCause: 'refused', redCauseFiles: [] });
       }
-      emit({ sha: headSha, status: 'gate-refused', reason: 'explicit-gate-not-affected-test', ok: false, detail: `${refusal}. The default selection is blocked for this diff, so supply an affected-test gate such as \`--gate="npx vitest related <files> --run"\`; ${dispatchedChild ? 'recorded a red marker so it is not re-dispatched' : 'no marker was recorded'}.` }, 3);
+      emit({ sha: headSha, status: 'gate-refused', reason: 'explicit-gate-not-affected-test', ok: false, redCause: 'refused', redCauseFiles: [], detail: `${refusal}. The default selection is blocked for this diff, so supply an affected-test gate such as \`--gate="npx vitest related <files> --run"\`; ${dispatchedChild ? 'recorded a red marker so it is not re-dispatched' : 'no marker was recorded'}.` }, 3);
     }
   }
 } else {
   const resolved = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile });
-  if (resolved.decision.mode === 'blocked') emit({ sha: headSha, status: 'selection-required', reason: 'local-selection-bound', ok: false, detail: describeGate(resolved) }, 3);
+  if (resolved.decision.mode === 'blocked') emit({ sha: headSha, status: 'selection-required', reason: 'local-selection-bound', ok: false, redCause: 'refused', redCauseFiles: [], detail: describeGate(resolved) }, 3);
   GATE = resolved.command;
   resolvedGate = resolved;
   // xpnhz4o — always SAY whether this is a selected run or a full-suite fallback, and why (stderr, so `--json`
@@ -378,6 +408,7 @@ if (cacheHit) {
     ...(preStart.retriedFailures?.length ? { retriedFailures: preStart.retriedFailures } : {}),
     ...(preStart.isolatedRetry ? { isolatedRetry: preStart.isolatedRetry } : {}),
     ...(preStart.retriedTimeouts?.length ? { retriedTimeouts: preStart.retriedTimeouts } : {}),
+    ...markerRedCause(preStart),
   };
   const cachedPhases = preStart.phases !== undefined ? { phases: preStart.phases } : {};
   if (MODE === 'request') {
@@ -479,6 +510,7 @@ let signal = null;
 let failureDetails;
 let retriedFailures = [];
 let isolatedRetry = null;
+let editedDuringRun = [];
 async function runGate(command, args) {
   const collector = createFailureCollector({ cwd: REPO });
   const output = { stdout: '', stderr: '' };
@@ -505,7 +537,14 @@ async function runGate(command, args) {
 // #5141 — retain null for phases never run; retries and multiple scans accumulate wall time.
 const phaseMs = { vitestMs: null, scanMs: null, standardsMs: null };
 const outcomes = {};
-async function timedRunGate(phase, command, args) {
+// An outcome is keyed by what ran: a later green phase of the same kind never hides an earlier red one (two scanners,
+// a scanner then the guard). The vitest key is the one exception — the isolated retry legitimately supersedes it.
+function recordOutcome(key, outcome) {
+  if (key !== 'vitest' && outcomes[key]?.result === 'fail' && outcome.result !== 'fail') return;
+  outcomes[key] = outcome;
+}
+// `outcomeKey` separates the always-run guard's outcome from the scanners' (it shares the `scan` admission kind).
+async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
   const kind = phase?.replace(/Ms$/, '');
   let acquired = null;
   if (phaseAdmission && firstPhaseAdmission) acquired = firstPhaseAdmission;
@@ -522,11 +561,11 @@ async function timedRunGate(phase, command, args) {
   const started = performance.now();
   try {
     const result = await runGate(command, args);
-    if (kind) outcomes[kind] = buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision });
+    if (kind) recordOutcome(outcomeKey ?? kind, buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision }));
     return result;
   } catch (error) {
-    if (kind) outcomes[kind] = buildPhaseOutcome({ kind, signal: error?.signal,
-      exitCode: Number.isFinite(error?.status) ? error.status : 2, decision: resolvedGate?.decision });
+    if (kind) recordOutcome(outcomeKey ?? kind, buildPhaseOutcome({ kind, signal: error?.signal,
+      exitCode: Number.isFinite(error?.status) ? error.status : 2, decision: resolvedGate?.decision }));
     throw error;
   } finally {
     if (phase) phaseMs[phase] = (phaseMs[phase] ?? 0) + performance.now() - started;
@@ -541,6 +580,15 @@ let gateMs;
 const runAllPhases = verifySetting('runAllPhases', process.env) === true;
 const isolatedRetryMode = verifySetting('isolatedRetry', process.env);
 const phaseResults = [];
+// The guard run writes vitest's JSON report here: the inventory of files that ACTUALLY executed, which is the only
+// proof every declared guard ran (vitest treats file arguments as filters, so a config-excluded guard is dropped
+// silently while the rest still pass). Removed in the gate's `finally`.
+const alwaysRunReportDir = retryableGate && verifySetting('alwaysRunTests', process.env)?.length ? mkdtempSync(join(tmpdir(), 'verify-always-run-')) : null;
+const alwaysRunReport = alwaysRunReportDir ? join(alwaysRunReportDir, 'report.json') : null;
+const alwaysRun = retryableGate
+  ? alwaysRunPlan({ declared: verifySetting('alwaysRunTests', process.env), fileExists: (p) => existsSync(join(REPO, p)),
+    scanCommands: resolvedGate.scanCommands ?? [], testTimeoutFactor: resolvedGate.decision?.testTimeoutFactor ?? 1, reportFile: alwaysRunReport })
+  : { command: null, declared: [], files: [], skipped: [] };
 const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
   let result = await timedRunGate(retryableGate ? 'vitestMs' : null,
@@ -551,6 +599,7 @@ try {
   if (retryableGate && admission.ok && isolatedRetryMode !== 'off' && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
     // Edits during admission or test execution must also count as the change's own files.
     const changedNow = localChangedSet({ runGit: git });
+    editedDuringRun = changedNow?.changedFiles ?? [];
     // 75c — every failing file must be OUTSIDE the diff (an in-diff failure is never re-run away), the inventory
     // complete, and at most 3 files. Timeouts and assertion failures alike (#3990's "303 ms vs 250 ms").
     retriedFailures = isolatedRetryFailures({ ...result.output, failureDetails: result.failureDetails, mode: isolatedRetryMode,
@@ -577,6 +626,35 @@ try {
       if (!continueAfter(scan)) break;
     }
   }
+  // #99 — the always-run guard set, independent of how many tests the related selection picked. Same phase kind as
+  // the scanners ('scan'): admission, timing and outcome telemetry are shared; a red here is a `scan` redCause.
+  if (retryableGate && alwaysRun.command && continueAfter(phaseResults.at(-1).result)) {
+    process.stderr.write(`⏱ always-run guard tests (#99): ${alwaysRun.files.length} file(s)\n`);
+    const started = performance.now();
+    let guard = await timedRunGate('scanMs', alwaysRun.command, undefined, { outcomeKey: 'guard' });
+    alwaysRun.executed = true;
+    alwaysRun.ms = performance.now() - started;
+    {
+      // `ran` is vitest's own executed-file inventory, red or green; a GREEN guard only counts when EVERY planned
+      // guard is in it.
+      let reportText = null;
+      try { reportText = readFileSync(alwaysRunReport, 'utf8'); } catch { /* no report → nothing is proven */ }
+      // vitest names files under its own cwd, which is always the real path.
+      const inventory = alwaysRunInventory({ reportText, files: alwaysRun.files, cwd: realpathSync(REPO) });
+      alwaysRun.ran = inventory.executed;
+      alwaysRun.missing = inventory.missing;
+      if (inventory.missing.length && guard.exitCode === 0 && !guard.signal) {
+        const why = inventory.reason === 'inventory-unavailable'
+          ? 'vitest wrote no readable executed-file report, so no guard is proven to have run'
+          : 'vitest did not execute these declared guard files (excluded by its config, or matched no test)';
+        process.stderr.write(`FAIL always-run guard: ${why}: ${inventory.missing.join(', ')}\n`);
+        guard = { ...guard, exitCode: 1, failureDetails: { tests: inventory.missing.map(file => ({ file, name: null })), summary: `${why}: ${inventory.missing.join(', ')}`, truncated: false } };
+        outcomes.guard = buildPhaseOutcome({ kind: 'scan', exitCode: 1, failureDetails: guard.failureDetails });
+      }
+    }
+    alwaysRun.result = guard.exitCode === 0 && !guard.signal ? 'passed' : 'failed';
+    phaseResults.push({ phase: 'scan', guard: true, result: guard });
+  }
   if (retryableGate && resolvedGate.standardsCommand && phaseResults.every(p => continueAfter(p.result))) {
     phaseResults.push({ phase: 'standards', result: await timedRunGate('standardsMs', resolvedGate.standardsCommand) });
   }
@@ -591,22 +669,30 @@ try {
   signal = e?.signal || null;
   exitCode = Number.isFinite(e && e.status) ? e.status : 2;
 } finally {
+  if (alwaysRunReportDir) rmSync(alwaysRunReportDir, { recursive: true, force: true });
   gateMs = performance.now() - gateStarted;
   if ((!phaseAdmission && admission.ok) || firstPhaseAdmission?.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
 }
 
-const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'phase' : 'gate', phases: admissionPhases }, admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes });
+const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'phase' : 'gate', phases: admissionPhases }, admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes,
+  alwaysRun: alwaysRun.declared.length ? alwaysRun : null });
 const phases = admissionFallback ? { ...builtPhases, admissionFallback } : builtPhases;
 
 const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
 const retryDetail = describeIsolatedRetry(retryAudit);
-
+// Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
 const infrastructure = verificationInfrastructureFailure({ exitCode, signal });
+// The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
+const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;
+// An UNEDITED failing test that imports the edited source is the change's own regression (`testReachesChanged`).
+const redCauseFields = classifyRedCause({ exitCode, signal, infrastructure, phaseResults, isolatedRetry, retriedFailures, changedFiles: diffFiles,
+  touchesDiff: (file) => { const r = reachesChanged({ testFile: file, changedFiles: diffFiles, readFile: readRepoFile }); return r === 'unknown' ? 'unknown' : r === 'reaches'; } }) ?? {};
+
 if (MODE === 'run') process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
-if (MODE === 'run' && infrastructure) emit({ sha: headSha, status: 'infrastructure-failure', reason: infrastructure.reason, exitCode, infrastructure, phases, detail: infrastructure.detail }, 3);
+if (MODE === 'run' && infrastructure) emit({ sha: headSha, status: 'infrastructure-failure', reason: infrastructure.reason, exitCode, infrastructure, ...redCauseFields, phases, detail: infrastructure.detail }, 3);
 if (MODE === 'run') {
-  emit({ sha: headSha, status: exitCode === 0 ? 'green' : 'red', reason: 'run', exitCode, ...diagnostic, phases, detail: exitCode === 0 ? 'gate passed (run mode — no marker recorded).' + retryDetail : `gate FAILED (exit ${exitCode}) — run mode, no marker recorded.${retryDetail}` }, exitCode === 0 ? 0 : 2);
+  emit({ sha: headSha, status: exitCode === 0 ? 'green' : 'red', reason: 'run', exitCode, ...diagnostic, ...redCauseFields, phases, detail: exitCode === 0 ? 'gate passed (run mode — no marker recorded).' + retryDetail : `gate FAILED (exit ${exitCode}) — run mode, no marker recorded.${retryDetail}` }, exitCode === 0 ? 0 : 2);
 }
 
 // 4. Rewrite the marker to its terminal green/red form — for the sha THIS run actually verified.
@@ -620,7 +706,7 @@ const onDisk = readMarker();
 if (onDisk && !onDisk.corrupt && onDisk.sha && onDisk.sha !== headSha) {
   emit(
     {
-      sha: headSha, status: 'superseded', reason: 'superseded', exitCode,
+      sha: headSha, status: 'superseded', reason: 'superseded', exitCode, ...redCauseFields,
       detail: `suites finished (exit ${exitCode}) for ${headSha.slice(0, 8)}, but the on-disk marker now belongs to ${String(onDisk.sha).slice(0, 8)} (an overlapping verify-lane run) — refusing to overwrite it; no marker written for this run.`,
     },
     3,
@@ -642,11 +728,11 @@ const finished = verifyFinishBody(startBody, {
   suites: GATE,
   treeHash: stableTreeHash(currentTreeHash, preGateTreeHash, treeHashNow()),
 });
-writeMarker({ ...finished, phases });
+writeMarker({ ...finished, ...redCauseFields, phases });
 process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
-if (infrastructure) emit({ sha: headSha, status: finished.status, reason: infrastructure.reason, exitCode, infrastructure, phases, detail: infrastructure.detail }, 3);
+if (infrastructure) emit({ sha: headSha, status: finished.status, reason: infrastructure.reason, exitCode, infrastructure, ...redCauseFields, phases, detail: infrastructure.detail }, 3);
 
 emit(
-  { sha: headSha, status: finished.status, reason: finished.status, exitCode, ...diagnostic, phases, detail: (finished.status === 'green' ? `suites passed — recorded green for ${headSha.slice(0, 8)} (delivery may proceed).` : `suites FAILED (exit ${exitCode}) — recorded red for ${headSha.slice(0, 8)}; the finish-guard will refuse to land until this is green.`) + retryDetail },
+  { sha: headSha, status: finished.status, reason: finished.status, exitCode, ...diagnostic, ...redCauseFields, phases, detail: (finished.status === 'green' ? `suites passed — recorded green for ${headSha.slice(0, 8)} (delivery may proceed).` : `suites FAILED (exit ${exitCode}) — recorded red for ${headSha.slice(0, 8)}; the finish-guard will refuse to land until this is green.`) + retryDetail },
   finished.status === 'green' ? 0 : 2,
 );

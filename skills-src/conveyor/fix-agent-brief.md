@@ -58,7 +58,8 @@
 ## Your job (one sentence)
 
 Reconstitute the bounced PR's work in a lane clone, **apply the reviewer's requested change** (repair only the
-broken part — reuse, don't rebuild), get the gate green, **re-push HEAD to the same `lane/*` ref**, then
+broken part — reuse, don't rebuild), commit it and hand the verify wait to the harness (which **re-pushes that
+commit to the same `lane/*` ref** on green and resumes you), then
 **re-arm the review** (`review:changes → review:pending`) and **EXIT WITHOUT MERGING**. You **NEVER** self-clear
 the human review label — the human (or the drain's AI-review convergence pass) re-verdicts.
 
@@ -356,10 +357,19 @@ test if the finding touches a call path, not only a unit test of the isolated pi
 
 ### 4. Run the gate GREEN (the item's own locus gate)
 
+**The harness owns the wait, not you (#5137).** The gate verifies a COMMIT and the harness pushes exactly that
+commit, so first finish step 5's self-review, re-run the step-2 test (below), and make step 6's commit — but NOT
+its push. Then hand the wait over:
+
 ```bash
 node {{WE_ROOT}}/scripts/verify-lane.mjs request --repo=.                        # returns almost instantly — nothing has run yet
-node {{WE_ROOT}}/scripts/verify-lane.mjs check --wait=540000 --json --repo=.     # blocks (bounded, fits one foreground call) until the verify runner settles the marker
+node {{WE_ROOT}}/scripts/conveyor/await-verify.mjs mark --repo={{REPO}} --pr={{PR_NUM}} --who={{SESSION_SLUG}} --ref={{LANE_REF}} --kind=fix --attempt=1
 ```
+
+Then **end your turn**: reply with one line (`awaiting verify for <sha>`) and stop. Never `check --wait`, never
+`sleep`, never `run_in_background`, never read output files in a loop (#x36vidg), never `reset` or re-`request`
+yourself. `mark` refuses a dirty tree or a sha that is not HEAD — commit first. The fix daemon reads the verdict
+every tick and resumes THIS session with a message that starts `[harness verify verdict — #5137]`.
 
 A dispatched agent cannot run the gate itself: `we:scripts/guard-bash.mjs` denies any `verify-lane.mjs` invocation
 except `request` / `check` / `reset` (#3105) — including a bare `run --repo=.` and `run` wrapped in
@@ -367,22 +377,21 @@ except `request` / `check` / `reset` (#3105) — including a bare `run --repo=.`
 quoted path is denied). Do not run `verify-lane.mjs run` here; `request` stamps a marker the verify runner
 (`we:scripts/conveyor/verify-dispatch.mjs`) picks up and settles with the same diff-selected gate.
 
-Read the verdict from the **`check` output**, never the `request` acknowledgement:
-`green` → proceed; `red` (exit 2) → the hard stop below; `infrastructure-failure` → report the
-signal/ceiling evidence, without claiming a test failure or automatically resetting/re-requesting.
-`timeout` (the 9-minute wait elapsed with the request still `running`) → run the SAME `check --wait=540000`
-again. Every call is ONE blocking foreground call that fits the Bash tool's `timeout: 600000` ceiling, so a
-gate that legitimately takes 30+ minutes is waited out in chunks, never in a call the tool would kill. Stop after
-18 consecutive `timeout`s (~160 minutes: the admission + execution ceilings, after which the dispatcher itself
-kills a hung run and settles the marker as `infrastructure-failure`) and report the stalled request once.
-Never `sleep`, never `run_in_background`, never read output files in a loop (#x36vidg), and never `reset` or
-re-`request` automatically.
+The harness acts on the same verdict `verify-lane.mjs check` prints — the **`check` output**, never the `request`
+acknowledgement — and the resume message tells you which branch you are on:
+`green` → the harness has already pushed your exact sha to `{{LANE_REF}}`; continue at step 6's evidence comment
+and never push `{{LANE_REF}}` yourself. `red` (exit 2) → the failing tests are in the message: repair, commit,
+`request`, `mark` again with `--attempt=<n+1>`, and end your turn; on the third red the message tells you to take
+the gate-red hard stop below. A red the gate classifies as load-only → the message tells you to take the load-flake
+exit below. `infrastructure-failure` or no verdict → the harness re-requests on its own; after repeated failures
+the message tells you to report the stalled request with the blocked-on-infra exit (the signal/ceiling evidence,
+without claiming a test failure). A moved or dirty lane → re-commit, `request`, `mark` again.
 Other statuses follow [we:skills-src/conveyor/delivery-agent-brief.md](delivery-agent-brief.md).
 
-After you re-push (step 6), do not wait on CI or the merge — report and exit.
+After the harness pushes, do not wait on CI or the merge — finish the hand-back, report and exit.
 
 If the repair also touches a WE-side file (docs, the backlog item itself, WE-side glue) — i.e. `{{SCOPE}}` names
-anything outside `{{REPO}}` — additionally run `npm run check:standards` from `{{WE_ROOT}}` before re-pushing:
+anything outside `{{REPO}}` — additionally run `npm run check:standards` from `{{WE_ROOT}}` before step 4's `request`:
 the gate is `{{REPO}}`'s own gate and does not check WE's cross-repo invariants. For WE itself
 (`{{REPO}}` == WE), the gate already includes WE's own check:standards (scoped to your diff), so this is
 a no-op today.
@@ -399,9 +408,10 @@ It never expands a default local selection into the full suite. **Never run the 
 (`npm run test:unit`, `npm test`, a bare `vitest run`): the verify runner runs the same gate for you, CI runs it
 anyway, and the Bash guard denies it.
 For any test run of your own (e.g. re-running one test file), use the queued form only — `node {{WE_ROOT}}/scripts/readiness/heavy-admission.mjs run -- npx vitest run <test-file>` or `npm run test:unit -- <test-file>`; a direct `npx vitest`, `npm test` or bare `check-standards.mjs` run skips the host's heavy-run queue and the Bash guard denies it.
+To debug one or two tests, run `npm run test:unit -- <file(s)>` (≤5 files, 8-minute cap); it uses the fast lane. Run the full verify (request + mark + end turn, per the await flow in step 4) once before the harness pushes — never push yourself.
 
 A green gate proves the **checks** pass; it does not, by itself, prove the reviewer's finding is actually fixed.
-Re-run the SAME test from step 2 — it must now be green — and, where the finding had a real-surface probe,
+Re-run the SAME test from step 2 before you request verify — it must now be green — and, where the finding had a real-surface probe,
 re-run that SAME probe and confirm it now shows the fixed behavior. Keep the trimmed after-output next to the
 before-output from step 2; step 6 posts both as the evidence.
 
@@ -434,25 +444,27 @@ deliberate stop from a crash, and re-dispatches a fixer at this PR forever.
 
 ### 5. Converge before handback — self-review the repair (proportionate to the change)
 
+Run this BEFORE step 4's `request`: the harness pushes exactly the commit it verified, so review comes first.
+
 For anything beyond a trivial one-liner, spawn **one adversarial code-review subagent** on your repair diff and
 **AWAIT its returned report as the verdict** — the same converge-before-handback discipline the delivery brief
-uses ([we:skills-src/conveyor/delivery-agent-brief.md](delivery-agent-brief.md) step 6). Ask the subagent three things: does the repair meet the reviewer's finding, does the repair itself introduce a new problem, and **what is the next variant of the same defect class that still gets through?** A same-class variant it names inside `{{SCOPE}}` is must-fix before re-push. A defect the repair itself introduces is must-fix regardless of class — "not the same class" never dismisses it. You may dismiss any other self-review finding only as "not the same class" or "outside `{{SCOPE}}` (filed as <card>)". Deferring ("later", "follow-up") is not a dismissal. Only then re-push. A trivial, obviously-correct fix (a typo, a
+uses ([we:skills-src/conveyor/delivery-agent-brief.md](delivery-agent-brief.md) step 6). Ask the subagent three things: does the repair meet the reviewer's finding, does the repair itself introduce a new problem, and **what is the next variant of the same defect class that still gets through?** A same-class variant it names inside `{{SCOPE}}` is must-fix before re-push. A defect the repair itself introduces is must-fix regardless of class — "not the same class" never dismisses it. You may dismiss any other self-review finding only as "not the same class" or "outside `{{SCOPE}}` (filed as <card>)". Deferring ("later", "follow-up") is not a dismissal. Only then commit and request verify (step 4). A trivial, obviously-correct fix (a typo, a
 pinned-count bump) may skip the subagent — but never skip re-reading the reviewer's finding to confirm you met it.
 
-### 6. Commit + re-push HEAD to the SAME lane ref (update the existing PR in place)
+### 6. Commit (before step 4's request) — the harness re-pushes it to the SAME lane ref
 
 Commit only the repair's files (explicit paths, never `git add -A`; one commit) on the lane's current branch,
-then push HEAD to `{{LANE_REF}}` — this **updates the existing PR**, it does not open a new one (never
-`gh pr create`, never `pr-land` — the PR already exists; you are pushing a new head to it):
+BEFORE step 4's `request`. Do **not** push `{{LANE_REF}}` yourself: on a green verdict for exactly this commit the
+harness pushes it to `{{LANE_REF}}` — this **updates the existing PR**, it does not open a new one (never
+`gh pr create`, never `pr-land` — the PR already exists):
 
 ```bash
 printf '%s\n' "{{ATTRIBUTION}}: fix — <specific correction> (PR {{PR_NUM}})" "" \
   "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>" > <msgfile>
 git commit -F <msgfile> <explicit-paths>
-git push origin HEAD:refs/heads/{{LANE_REF}}
 ```
 
-**If the push is rejected because the branch moved** (someone else pushed while you worked — rare now that
+**If the harness reports the push was rejected because the branch moved** (someone else pushed while you worked — rare now that
 the fix claim refuses other pushes, but a push from outside the guarded paths can still land), do not force and
 do not merge two designs. Save your repair on a side branch, record a **pause** (not a stand-down — it is not
 terminal and needs no person), release the claim, and return:
@@ -602,7 +614,8 @@ re-push, re-arm-never-clear shape is identical — which is the point (#2630).
 - **Prove it, don't just gate it** — reproduce the finding red (step 2), re-confirm it green (step 4), and post
   the trimmed before/after evidence as a PR comment (step 6) before you re-arm. A genuine non-repro is stated
   explicitly, with the reason — never silently skipped.
-- **Work only through the normal verbs** — `acquire --base=<ref>` → repair → `git push … lane/*` →
+- **Work only through the normal verbs** — `acquire --base=<ref>` → repair → commit → `verify-lane.mjs request` +
+  `await-verify.mjs mark` → end turn (the harness pushes `lane/*` on green) →
   `rearm-review.mjs` (or, in ADVISORY-FIX MODE, `advisory-fix-mark.mjs` — never `rearm-review.mjs`, there is no
   `review:changes` to swap) → daemon/human re-review. No parallel state store (#2612 ruling).
 - **ADVISORY-FIX MODE never touches any `review:*` or `advisory:*` label** (#xkmu3gv) — its only output is the

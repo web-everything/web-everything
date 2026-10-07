@@ -4,11 +4,12 @@
  * requests verification, records the wait, and ends the turn; the harness resumes the SAME session.
  * This slice only supplies the record and liveness exemptions; no fixer writes it automatically yet.
  */
-import { statSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { statSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync, readdirSync } from 'node:fs';
+import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 
 /** Lane-local await record filename. */
 export const AWAIT_VERIFY_FILE = '.fix-await-verify';
@@ -77,11 +78,11 @@ export function classifyAwaitVerify({ record, session, nowMs, ttlMs, pr = null }
 }
 
 /** Build an injectable reader/clock resolver; failures never claim liveness. */
-export function makeAwaitingVerifyResolver({ ttlMs = resolveAwaitVerifyTtlMs(), now = Date.now, read = readAwaitVerifyRecord } = {}) {
+export function makeAwaitingVerifyResolver({ ttlMs = resolveAwaitVerifyTtlMs(), now = Date.now, read = readAwaitVerifyRecordForSession } = {}) {
   return (session, options = {}) => {
     try {
       if (typeof session?.cwd !== 'string') return null;
-      return classifyAwaitVerify({ record: read(session.cwd), session, nowMs: now(), ttlMs, pr: options?.pr });
+      return classifyAwaitVerify({ record: read(session.cwd, session), session, nowMs: now(), ttlMs, pr: options?.pr });
     } catch { return null; }
   };
 }
@@ -114,10 +115,90 @@ export function clearAwaitVerifyRecord(cwd, { unlinkSyncFn = unlinkSync, ...io }
   } catch { return { cleared: false }; }
 }
 
-/** Thin CLI shell; filesystem, subprocess, environment, clock and output ports are injectable. */
+// ── Slice 2/3: the shared store the fix daemon's verdict pass reads ──────────────────────────────────────────
+// A dispatched fixer's session cwd is a per-dispatch scratch directory (dispatch-lane-io.mjs#dispatchSessionCwd),
+// never its lane, so a lane-local record is invisible to anything that starts from a `claude agents` row. Every
+// mark therefore also lands in one host-wide store keyed by the session id (or `who` when there is none); the
+// row's own `sessionId`/`name` finds it without knowing the lane.
+
+/** Env override for the store directory (tests, other hosts). */
+export const AWAIT_VERIFY_STORE_ENV = 'WE_AWAIT_VERIFY_STORE';
+/** Where await records live: `<coordination root>/await-verify` unless overridden. */
+export function awaitVerifyStoreDir(env = process.env) {
+  const override = String(env?.[AWAIT_VERIFY_STORE_ENV] ?? '').trim();
+  return override ? resolve(override) : join(resolveCoordinationRoot({ env }), 'await-verify');
+}
+const STORE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+/** The store filename for a record or session: session id first, else `who`/name. Null when neither is safe. */
+export function awaitVerifyStoreKey({ sessionId = null, who = null } = {}) {
+  for (const key of [sessionId, who]) if (nonEmpty(key) && STORE_KEY_RE.test(key)) return key;
+  return null;
+}
+/** Read one store record by key; missing or malformed is null. */
+export function readStoredAwaitVerify(key, { dir = awaitVerifyStoreDir(), readFileSyncFn = readFileSync } = {}) {
+  try {
+    if (!nonEmpty(key) || !STORE_KEY_RE.test(key)) return null;
+    const record = JSON.parse(readFileSyncFn(join(dir, `${key}.json`), 'utf8'));
+    return isObject(record) ? record : null;
+  } catch { return null; }
+}
+/** A session row's record: lane-local at its cwd (slice 1 shape), else the store by session id, then name. */
+export function readAwaitVerifyRecordForSession(cwd, session, { dir = awaitVerifyStoreDir(), ...io } = {}) {
+  return readAwaitVerifyRecord(cwd, io)
+    ?? readStoredAwaitVerify(session?.sessionId, { dir, ...io })
+    ?? readStoredAwaitVerify(session?.name, { dir, ...io });
+}
+/** Every parseable store record with its key; unreadable entries are skipped. */
+export function listStoredAwaitVerify({ dir = awaitVerifyStoreDir(), readdirSyncFn = readdirSync, readFileSyncFn = readFileSync } = {}) {
+  let names = [];
+  try { names = readdirSyncFn(dir); } catch { return []; }
+  return names.filter((n) => n.endsWith('.json')).sort().map((n) => n.slice(0, -5))
+    .map((key) => ({ key, record: readStoredAwaitVerify(key, { dir, readFileSyncFn }) }))
+    .filter((e) => e.record);
+}
+/** Atomically write (or replace) one store record. */
+export function writeStoredAwaitVerify(record, { dir = awaitVerifyStoreDir(), writeFileSyncFn = writeFileSync,
+  renameSyncFn = renameSync, unlinkSyncFn = unlinkSync, mkdirSyncFn = mkdirSync, uniqueId = randomUUID } = {}) {
+  if (!validRecord(record)) return { ok: false, reason: 'malformed' };
+  const key = awaitVerifyStoreKey(record);
+  if (!key) return { ok: false, reason: 'malformed' };
+  const path = join(dir, `${key}.json`);
+  let tmp;
+  try {
+    mkdirSyncFn(dir, { recursive: true });
+    tmp = `${path}.${uniqueId()}.tmp`;
+    writeFileSyncFn(tmp, `${JSON.stringify(record)}\n`, { encoding: 'utf8', flag: 'wx' });
+    renameSyncFn(tmp, path);
+    return { ok: true, path, key };
+  } catch {
+    if (tmp) { try { unlinkSyncFn(tmp); } catch { /* best-effort temporary cleanup */ } }
+    return { ok: false, reason: 'write-failed' };
+  }
+}
+/** Remove one store record by key. */
+export function clearStoredAwaitVerify(key, { dir = awaitVerifyStoreDir(), unlinkSyncFn = unlinkSync } = {}) {
+  try {
+    if (!nonEmpty(key) || !STORE_KEY_RE.test(key)) return { cleared: false };
+    unlinkSyncFn(join(dir, `${key}.json`));
+    return { cleared: true };
+  } catch { return { cleared: false }; }
+}
+
+/** Lane refs a record may name for the daemon's push: `lane/*` only, never `main` or a flag-shaped string. */
+export const AWAIT_VERIFY_REF_RE = /^lane\/[A-Za-z0-9._/-]+$/;
+/** Session kinds whose briefs know how to be resumed by the verdict pass. */
+export const AWAIT_VERIFY_KINDS = Object.freeze(['fix', 'ci-heal']);
+
+/**
+ * Thin CLI shell; filesystem, subprocess, environment, clock and output ports are injectable.
+ * `mark` refuses a dirty working tree: the harness pushes the committed sha, so the verified tree must BE that
+ * commit (we:scripts/conveyor/await-verify-pass.mjs re-checks this before any push). It writes the lane-local
+ * record (slice 1) and the shared store record the fix daemon's verdict pass reads.
+ */
 export function main(argv = process.argv.slice(2), {
   env = process.env, exec = execFileSync, now = Date.now, write = writeAwaitVerifyRecord,
   read = readAwaitVerifyRecord, clear = clearAwaitVerifyRecord, out = console.log, err = console.error,
+  writeStore = writeStoredAwaitVerify, readStore = readStoredAwaitVerify, clearStore = clearStoredAwaitVerify,
 } = {}) {
   const [command, ...args] = argv;
   const flags = Object.fromEntries(args.filter((arg) => arg.startsWith('--')).map((arg) => {
@@ -125,22 +206,59 @@ export function main(argv = process.argv.slice(2), {
     return eq < 0 ? [arg.slice(2), true] : [arg.slice(2, eq), arg.slice(eq + 1)];
   }));
   const cwd = flags.cwd ?? '.';
+  const git = (gitArgs) => String(exec('git', ['-C', cwd, ...gitArgs], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+  // The runtime's own session id wins over a typed `--session-id`: a session may only ever address its own record.
+  const callerSessionId = () => env.CLAUDE_CODE_SESSION_ID || flags['session-id'] || null;
+  const storeKey = () => awaitVerifyStoreKey({ sessionId: callerSessionId(), who: flags.who ?? null });
+  const callerLane = () => { try { return resolve(git(['rev-parse', '--show-toplevel']).trim()); } catch { return null; } };
+  // A store record already bound to a lane belongs to the session working in THAT lane; no other lane may replace or clear it.
+  const foreignRecord = (key, lane) => { const existing = key ? readStore(key) : null; return Boolean(existing?.lane) && existing.lane !== lane; };
   try {
-    if (command === 'show') { out(JSON.stringify(read(cwd))); return 0; }
-    if (command === 'clear') { out(JSON.stringify(clear(cwd))); return 0; }
+    if (command === 'show') { out(JSON.stringify(read(cwd) ?? readStore(storeKey()))); return 0; }
+    if (command === 'clear') {
+      const key = storeKey();
+      if (foreignRecord(key, callerLane())) { err(`refusing to clear ${key}: its record belongs to another lane`); return 2; }
+      const lane = clear(cwd);
+      const store = clearStore(key);
+      out(JSON.stringify({ cleared: lane.cleared || store.cleared }));
+      return 0;
+    }
     if (command !== 'mark') { err('expected mark, show or clear'); return 2; }
     const record = {
-      v: 1, sessionId: flags['session-id'] ?? env.CLAUDE_CODE_SESSION_ID ?? null,
+      v: 1, sessionId: callerSessionId(),
       who: flags.who, repo: flags.repo, pr: Number(flags.pr),
-      sha: flags.sha ?? String(exec('git', ['-C', cwd, 'rev-parse', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim(),
+      sha: flags.sha ?? git(['rev-parse', 'HEAD']).trim(),
       requestedAt: new Date(now()).toISOString(), attempt: Number(flags.attempt ?? 1),
     };
     if (!nonEmpty(record.who) || !/^[^/\s]+\/[^/\s]+$/.test(record.repo ?? '')
       || !/^[a-f\d]{40}$/i.test(record.sha) || !Number.isInteger(record.attempt) || record.attempt < 1) {
       err('malformed'); return 2;
     }
+    // The harness-owned fields (slice 2/3). Optional so a slice-1 style mark (no --ref) still records the wait;
+    // the verdict pass refuses to push for a record without a valid ref and resumes the session instead.
+    if (flags.ref !== undefined) {
+      // A harness record must bind to ONE session id: an id-less record is found by `who` name, which a same-named session could adopt.
+      if (!nonEmpty(record.sessionId)) { err('malformed: --ref needs a session id (CLAUDE_CODE_SESSION_ID or --session-id)'); return 2; }
+      if (!AWAIT_VERIFY_REF_RE.test(String(flags.ref)) || String(flags.ref).includes('..')) { err('malformed --ref (must be lane/*)'); return 2; }
+      const kind = flags.kind ?? 'fix';
+      if (!AWAIT_VERIFY_KINDS.includes(kind)) { err(`malformed --kind (one of ${AWAIT_VERIFY_KINDS.join(', ')})`); return 2; }
+      if (git(['status', '--porcelain', '--untracked-files=all']).trim()) {
+        err('dirty working tree: commit the repair first — the harness pushes the committed sha, so the verified tree must be exactly that commit');
+        return 2;
+      }
+      const head = git(['rev-parse', 'HEAD']).trim();
+      if (head.toLowerCase() !== record.sha.toLowerCase()) { err(`--sha ${record.sha} is not HEAD (${head})`); return 2; }
+      Object.assign(record, { lane: resolve(git(['rev-parse', '--show-toplevel']).trim()), ref: String(flags.ref), kind });
+    }
+    if (record.lane && foreignRecord(awaitVerifyStoreKey(record), record.lane)) {
+      err(`refusing to overwrite the await record for ${awaitVerifyStoreKey(record)}: it belongs to another lane`); return 2;
+    }
     const result = write({ cwd, record });
     if (!result.ok) { err(result.reason); return 2; }
+    if (record.lane) {
+      const stored = writeStore(record);
+      if (!stored.ok) { clear(cwd); err(`store ${stored.reason}`); return 2; }
+    }
     out(JSON.stringify(record));
     return 0;
   } catch (error) { err(String(error?.message ?? error)); return 2; }

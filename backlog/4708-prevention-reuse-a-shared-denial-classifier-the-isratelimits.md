@@ -3,9 +3,11 @@ bornAs: x2kmk7v
 kind: story
 size: 3
 parent: "4075"
-status: open
-scope: ["we:scripts/lib/required-status-checks.mjs", "we:scripts/lib/__tests__/required-status-checks.test.mjs"]
+status: resolved
+scope: ["we:scripts/lib/required-status-checks.mjs", "we:scripts/lib/__tests__/required-status-checks.test.mjs", "we:scripts/lib/__tests__/review-ci-gate-io.test.mjs", "we:scripts/conveyor/__tests__/reconcile-pass.test.mjs", "we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs"]
 dateOpened: "2026-10-03"
+dateStarted: "2026-10-06"
+dateResolved: "2026-10-06"
 preparedDate: "2026-10-06"
 preparedAgainstSha: "75c39659a06fefd7ee76fb1af223d53880109a25"
 tags: []
@@ -66,3 +68,4 @@ Run a scratch script from the lane (cache in a temp dir) that seeds a `live` ent
 - Export a single `isProtectionDenied(error)` from `we:scripts/lib/gh-throttle.mjs` so other readers share it.
 - Sweep other bare `/\b(?:403|404)\b/` status regexes under `we:scripts/` for the same rate-limit confusion.
 - Consider structured `gh` exit/HTTP status instead of text matching.
+- Bound the live-entry protection by age (found by the #4708 converge red-team): a live entry kept on a genuine denial is returned `stale-cache` forever; once older than the admission gate's max-stale age (1 day) the gate refuses it, and a real, permanent denial (e.g. protection removed, `Branch not protected (HTTP 404)`) never self-heals until the sidecar is deleted. Past that age, a denial should fall back to the declared policy again.

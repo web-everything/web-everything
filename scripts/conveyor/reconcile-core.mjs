@@ -1353,6 +1353,36 @@ function operatorFixBudget(comments, roundCap) {
 }
 
 /**
+ * #101 — the operator's own must-fix text out of a canonical send-back comment (`review-set-label --to=changes`).
+ * Returns the body that follows the heading + "Recorded by <login>" line, markers stripped, or '' when the
+ * send-back carried no body. Authentication is NOT done here: the caller got the comment from
+ * {@link operatorFixBudget}, which already required an operator-authored login.
+ */
+function operatorSendBackBody(commentBody) {
+  const parts = String(commentBody ?? '').split(/\n\n/);
+  return parts.slice(2).join('\n\n').replace(/<!--[\s\S]*?-->/g, '').trim();
+}
+
+/**
+ * #101 — an operator-authored send-back with a body re-arms a red-CI PR ONCE: a FIX, never a ci-heal, with the body
+ * as the must-fix brief. One-shot = no repair round (rearm or advisory comment) has been recorded since it; the
+ * grant counts against the operator budget's round cap. Null when there is no such send-back.
+ */
+function operatorSendBackRearm(pr, operatorBudget) {
+  if (!operatorBudget) return null;
+  const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  const c = comments.find((x) => x?.id === operatorBudget.verdictId);
+  if (!c) return null;
+  const labels = (Array.isArray(pr?.labels) ? pr.labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
+  if (labels.includes('review:accepted')) return null; // a later accept supersedes the send-back
+  const after = comments.slice(comments.indexOf(c) + 1);
+  if (Math.max(countRearmComments(after), countAdvisoryComments(after)) > 0) return null;
+  const body = operatorSendBackBody(c.body);
+  if (!body) return null;
+  return { verdictId: c.id, login: c.author.login, body };
+}
+
+/**
  * we:scripts/conveyor/reconcile-core.mjs#planReconcile — THE PASS. Given every open PR, every live session, and
  * the durable per-PR attempt counts, return what to dispatch and every refusal with the fact it turned on. Pure,
  * total, and keyed by PR number throughout.
@@ -1888,6 +1918,29 @@ export function planReconcile({
     // is owed from the PR alone, and leaves "can this repo's worker actually do it" to the dispatcher that
     // reads this plan (`we:scripts/operations/ci-heal-pr-dispatch.mjs#runReconcileCiHealDispatch`, mirroring
     // `reconcile-fix-dispatch.mjs#runReconcileFixDispatch`'s own capability gate for `fix`).
+    // #101 — LIVE PR #4141: an operator send-back with a body is owed a FIXER, not another ci-heal (which the loop
+    // guard / timeout-evidence refusal then held with nobody working it). Authenticated by comment author in
+    // {@link operatorFixBudget}, never by text; one-shot; counted against the round grants; the loop guard stays
+    // for automatic ci-heals.
+    const sendBack = (ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
+      ? operatorSendBackRearm(pr, operatorBudget) : null;
+    if (sendBack) {
+      const attempts = roundAttempts();
+      if (attempts >= effectiveRoundCap) {
+        refuseCapExhausted({
+          ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
+          why: `the PR's own durable attempt count is ${attempts} against a cap of ${effectiveRoundCap} — the operator send-back re-arm is exhausted and a person must take it`,
+        });
+        continue;
+      }
+      dispatch.push({
+        ...base, ...withPhase, kind: 'fix', mode: 'operator-send-back', findings: 1, attempts, cap: effectiveRoundCap,
+        operatorSendBack: sendBack,
+        why: `operator send-back by @${sendBack.login} with a must-fix body on a red-CI PR — re-armed once as a fix (operator re-arm), not a ci-heal`,
+      });
+      continue;
+    }
+
     if (ciRepairOwed) {
       // we:backlog/x9wz0ir-*.md (#4075/#3383) — LIVE INCIDENT 2026-09-25: PRs #2635/#2636 are BOTH `owed-ci-
       // rerun` (their required check failed inside one of `main`'s own red windows) AND `mergeStateStatus:

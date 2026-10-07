@@ -32,9 +32,21 @@ for (const [file, kind] of [['fix-agent-brief.md', 'fix'], ['fix-agent-ci-brief.
     const filled = fill(readFileSync(join(HERE, '..', file), 'utf8'));
     const gateLines = fencedCommands(filled).filter((c) => /verify-lane|test:unit|heavy-admission/.test(c));
 
-    it('names a verify-lane request and a check in its bash fences', () => {
+    it('names a verify-lane request and hands the wait to the harness (#5137) in its bash fences', () => {
       expect(gateLines.some((c) => /verify-lane\.mjs request\b/.test(c))).toBe(true);
-      expect(gateLines.some((c) => /verify-lane\.mjs check --wait=540000 --json\b/.test(c))).toBe(true);
+      const marks = fencedCommands(filled).filter((c) => /conveyor\/await-verify\.mjs mark\b/.test(c));
+      expect(marks).toHaveLength(1);
+      // The record must name the PR's own lane ref and this brief's kind, or the harness cannot push or resume it.
+      expect(marks[0]).toContain('--ref={{LANE_REF}}');
+      expect(marks[0]).toContain(`--kind=${kind}`);
+      expect(marks[0]).toContain('--who={{SESSION_SLUG}}');
+      expect(marks[0]).toContain('--attempt=1');
+    });
+
+    it('never tells the agent to hold its turn on a blocking check or to push the PR ref itself (#5137)', () => {
+      expect(filled).not.toMatch(/check --wait=\d+/);
+      expect(fencedCommands(filled).some((c) => /git push origin HEAD:refs\/heads\/\{\{LANE_REF\}\}$/.test(c))).toBe(false);
+      expect(filled).toMatch(/\*\*end your turn\*\*/);
     });
 
     it('no gate/verify command in a bash fence is denied for this kind', () => {
@@ -49,7 +61,9 @@ for (const [file, kind] of [['fix-agent-brief.md', 'fix'], ['fix-agent-ci-brief.
   });
 }
 
-for (const file of ['fix-agent-brief.md', 'fix-agent-ci-brief.md', 'delivery-agent-brief.md']) {
+// #5137 — the fix and ci-heal briefs hand the wait to the harness (asserted above); only the delivery brief still
+// waits in bounded chunks itself.
+for (const file of ['delivery-agent-brief.md']) {
   it(`${file} instructs bounded waits that are feasible inside the Bash tool's foreground timeout`, () => {
     const text = readFileSync(join(HERE, '..', file), 'utf8');
     const waits = [...text.matchAll(/check --wait=(\d+)/g)].map((m) => Number(m[1]));

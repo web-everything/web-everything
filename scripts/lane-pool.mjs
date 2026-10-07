@@ -76,6 +76,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { homedir, hostname } from 'node:os';
 import { join, basename, resolve, dirname, sep } from 'node:path';
 import { resolveReal } from './guard-lane.mjs';
+import { readGit } from './lib/proc-read.mjs';
 // #4415 — live incident 2026-09-29: `deadLeasePlan`'s own `gh pr list --state all` (below) was a bare,
 // unattributed, GraphQL-backed `execFileSync`, run on EVERY `acquire` and EVERY `list --acquirable` scan
 // across every session in every pool — measured as the top unattributed slice of the app's GraphQL bucket
@@ -171,6 +172,7 @@ import {
   resolveChildTimeoutMs, NPM_INSTALL_TIMEOUT_MS, NETWORK_GIT_TIMEOUT_MS as SHARED_NETWORK_GIT_TIMEOUT_MS,
 } from './lib/bounded-child.mjs';
 import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/lane-verify.mjs';
+import { laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
 const parseScopeFlag = (v) => (typeof v === 'string' && v ? normScope(v.split(',')) : []);
@@ -201,7 +203,9 @@ for (const a of rest) {
 // it — optional locks are exactly what a mutating command must keep. `remote` only counts for `get-url`.
 const READ_ONLY_GIT = new Set(['status', 'rev-list', 'rev-parse', 'for-each-ref', 'ls-remote', 'cherry', 'ls-tree', 'show', 'symbolic-ref', 'merge-base', 'log', 'cat-file']);
 const isReadOnlyGit = (args) => READ_ONLY_GIT.has(args[0]) || (args[0] === 'remote' && args[1] === 'get-url');
-const readOnlyGitEnv = (args) => (isReadOnlyGit(args) ? { env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } } : {});
+// A lane's `.git/config` is agent-writable and this script (and the resident health watch that shells it) runs git in lanes
+// the agent may have released, so `git status` must never execute a lane-chosen `core.fsmonitor` / hook (scripts/lib/lane-git-hardening.mjs).
+const readOnlyGitEnv = (args) => (isReadOnlyGit(args) ? { env: laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' }) } : {});
 // #xn432dz — while a bounded `list --acquirable` scan runs, every git child is capped at the scan's REMAINING
 // budget, so one hung git can't outlive the overall timeout. A killed child reads as `null` through `tryGit`,
 // which some probes read fail-OPEN (e.g. porcelain null ⇒ "clean") — so the scan loop re-checks the deadline
@@ -240,7 +244,7 @@ const scanTimeoutOpt = () => (scanDeadlineMs === null ? {} : { timeout: Math.max
 const NETWORK_GIT_TIMEOUT_MS = SHARED_NETWORK_GIT_TIMEOUT_MS;
 const defaultGitTimeoutOpt = () => ({ timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
 const git = (args, cwd, opts = {}) =>
-  execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(args), ...scanTimeoutOpt(), ...opts }).trim();
+  readGit(args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(args), ...scanTimeoutOpt(), ...opts }).trim(); // #74d: throws on failure/oversize
 const gitQuiet = (args, cwd, opts = {}) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'ignore', 'inherit'], timeout: NETWORK_GIT_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts });
 const tryGit = (args, cwd, opts = {}) => {
@@ -717,7 +721,7 @@ function laneFingerprint(dir, branch) {
   const dirtyPaths = [...trackedModifiedPaths, ...untrackedPaths].sort();
   const aheadShas = aheadCommits(dir, branchRef).map((c) => c.sha).sort();
   let headSha = null;
-  try { headSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8', ...defaultGitTimeoutOpt() }).trim(); } catch { /* unborn/corrupt HEAD — null is a valid, never-matching fingerprint value */ }
+  try { headSha = readGit(['rev-parse', 'HEAD'], { cwd: dir, ...defaultGitTimeoutOpt() }).trim(); } catch { /* unborn/corrupt HEAD — null is a valid, never-matching fingerprint value */ }
   return { headSha, dirtyPaths, aheadShas };
 }
 
@@ -3792,8 +3796,8 @@ function cmdReclaim(repo) {
     if (flags.json) process.stdout.write(`${JSON.stringify({ lane: n, path: dir, dryRun, reclaimed: false, ...reproof }, null, 2)}\n`);
     return;
   }
-  execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt() });
-  execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt() });
+  execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(process.env) });
+  execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(process.env) });
   rmSync(file, { force: true }); // back to the free-pool state — the same end state a normal `release` leaves
   journalLaneEvent(dir, {
     action: 'reclaim-reset', before, headAfter: laneHead(dir),
@@ -3865,9 +3869,9 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
           try {
             const { trackedModifiedPaths, untrackedPaths } = gitStatusSummary(dir);
             // HEAD's subject only names THIS lane's work when HEAD is not already on origin (else it is main's tip).
-            const ahead = Number(execFileSync('git', ['rev-list', '--count', `origin/${repo.branch}..HEAD`], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()) || 0;
-            const subject = ahead ? execFileSync('git', ['log', '-1', '--format=%s'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() : '';
-            const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+            const ahead = Number(readGit(['rev-list', '--count', `origin/${repo.branch}..HEAD`], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).trim()) || 0;
+            const subject = ahead ? readGit(['log', '-1', '--format=%s'], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).trim() : '';
+            const branch = readGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
             return guessCardIds({ paths: [...trackedModifiedPaths, ...untrackedPaths], commitSubject: subject, branch });
           } catch { return []; }
         })(),
@@ -3881,8 +3885,8 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
   }
   const before = laneStateSnapshot(dir, `origin/${repo.branch}`);
   const removedWorktrees = removeLitterWorktrees(dir, salvage.worktrees);
-  execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt() });
-  execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt() });
+  execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(process.env) });
+  execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(process.env) });
   rmSync(file, { force: true });
   // #4370 — unpushed content here was SAVED first (a verified bundle), and the owner was proven gone (g2).
   journalLaneEvent(dir, {

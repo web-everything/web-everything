@@ -29,7 +29,7 @@
  *     or any untracked file NOT on the allowlist, is left exactly as-is: this only shrinks the false-positive
  *     "dirty" set (#2267's data-loss guard), it never widens what counts as safe to discard.
  */
-import { execFileSync } from 'node:child_process';
+import { readGit } from './proc-read.mjs';
 
 /**
  * The exact live-observed set of scratch files a delivery agent's own arc (`delivery-agent-brief.md`) writes
@@ -201,7 +201,7 @@ export function planLitterCleanup(porcelain, allowlist = LANE_RELEASE_LITTER_ALL
 
 const tryGit = (args, cwd) => {
   try {
-    return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    return readGit(args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   } catch {
     return null;
   }

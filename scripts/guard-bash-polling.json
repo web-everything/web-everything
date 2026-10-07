@@ -1,0 +1,8 @@
+{
+  "_comment": "Settings for the guard-bash NO-POLLING rule (scripts/guard-bash.mjs, pollingLoopReason). Agents may not run wait/poll loops or long sleeps; end the turn and let the harness/daemon resume you.",
+  "maxSleepSeconds": 30,
+  "heartbeat": {
+    "_comment": "Sanctioned allowlist entry: a BARE `sleep N` run with Bash run_in_background:true is the harness-tracked heartbeat used by .claude/commands/workflow.md and .claude/commands/conveyor.md (its exit re-invokes the session). Nothing else is allowlisted; `verify-lane check --wait=` contains no sleep so needs no entry.",
+    "maxSeconds": 120
+  }
+}

@@ -12,7 +12,7 @@
  *   sibling run B would claim the marker.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -979,9 +979,9 @@ describe('request with an explicit --gate when the default selection is blocked'
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { 'test:unit': 'echo must-not-run' } }));
     const r = spawnSync('node', [VERIFY_LANE, '--gate=true', '--run-id=run-x', '--json'], { cwd: dir, encoding: 'utf8' });
     expect(r.status).toBe(3);
-    expect(JSON.parse(r.stdout)).toMatchObject({ status: 'gate-refused', reason: 'explicit-gate-not-affected-test' });
+    expect(JSON.parse(r.stdout)).toMatchObject({ status: 'gate-refused', reason: 'explicit-gate-not-affected-test', redCause: 'refused', redCauseFiles: [] });
     // Terminal red — not left `running`, so the dispatcher does not re-spawn the same refusal every sweep.
-    expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'red', exitCode: 3 });
+    expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'red', exitCode: 3, redCause: 'refused' });
   });
 
   it('leaves an explicit gate alone when the default selection is NOT blocked (pre-existing capability)', () => {
@@ -1003,7 +1003,7 @@ it('an unscopable default request refuses before stamping a runnable marker', ()
 });
 
 describe('local timeout-only retry under admission', () => {
-  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission, scan = false, scanExit = 0 } = {}) {
+  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true } = {}) {
     const files = truncated ? Array.from({ length: 21 }, (_, i) => `untouched-${i}.test.mjs`) : ['untouched-a.test.mjs', 'untouched-b.test.mjs'];
     // No trailing newline: a gate may end its stderr mid-line, and dispatch's markers must still start a line.
     const stderr = files.map((f, i) => ` FAIL  ${f} > case ${i}\n${mixed && i === 1 ? 'AssertionError: wrong value' : 'Error: Test timed out in 5000ms.'}\n`).join('').trimEnd();
@@ -1023,12 +1023,17 @@ it('first attempt times out', async () => {
   writeFileSync(attempt, 'attempted');
   await new Promise(() => {});
 }, 40);
-` : '// baseline\n');
+` : importsSource ? "import './source.mjs';\n" : '// baseline\n');
+    if (guard) writeFileSync(join(dir, 'guard.test.mjs'), '// repo-wide guard\n');
+    // A second declared guard the stub vitest "excludes by config": it is dropped from the executed-file report
+    // while the other guard passes — the run still exits 0.
+    if (guardExcluded) writeFileSync(join(dir, 'excluded.test.mjs'), '// guard vitest config excludes\n');
+    mkdirSync(join(dir, 'tmp'));
     if (live) writeFileSync(join(dir, 'vitest.config.mjs'), 'export default { test: { environment: "node", include: ["*.test.mjs"] } };\n');
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts: { 'test:unit': 'vitest run', 'check:standards': 'true' } }));
     const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
     const fake = `#!/usr/bin/env node
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import { admissionLockRoot, heldSlots } from ${JSON.stringify(admissionModule)};
 const args = process.argv.slice(2);
 const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fastSlots: 1 });
@@ -1048,6 +1053,15 @@ if (args[0] === 'vitest' && args.some(a => a.includes('conformance'))) {
   if (${scanExit}) process.stderr.write(' FAIL  scripts/lib/__tests__/review-policy.conformance.test.mjs > scans changed files\\n');
   process.exit(${scanExit});
 }
+if (args[0] === 'vitest' && args.some(a => a.includes('guard.test'))) {
+  if (${guardExit}) process.stderr.write(' FAIL  guard.test.mjs > repo-wide guard\\n');
+  const report = args.find(a => a.startsWith('--outputFile.json='));
+  if (report && ${guardReport}) {
+    const names = args.filter(a => a.endsWith('.test.mjs') && !a.includes('excluded')).map(a => process.cwd() + '/' + a);
+    writeFileSync(report.slice('--outputFile.json='.length), JSON.stringify({ testResults: names.map(name => ({ name, status: 'passed' })) }));
+  }
+  process.exit(${guardExit});
+}
 if (args[0] === 'vitest') process.exit(${retryExit});
 if (${standardsExit}) process.stdout.write('  error  invisible-characters: U+200B in source.mjs\\n');
 process.exit(${standardsExit});
@@ -1061,7 +1075,7 @@ process.exit(${standardsExit});
     execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'baseline'], { cwd: dir });
     execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
     writeFileSync(join(dir, edited ? files[0] : 'source.mjs'), '// changed\n');
-    const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always' };
+    const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
     function invoke(args = [], extraEnv = {}) {
       const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env: { ...env, ...extraEnv }, encoding: 'utf8' });
       return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout, stderr: result.stderr };
@@ -1305,6 +1319,109 @@ process.exit(${standardsExit});
     const result = f.invoke();
     expect(result.code).toBe(3);
     expect(f.calls()).toHaveLength(1);
+    // item 99 — the infrastructure branch carries the cause too, in the marker and the output (verify mode and `run`).
+    expect(result.json).toMatchObject({ status: 'infrastructure-failure', redCause: 'killed-superseded', redCauseFiles: [] });
+    expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ redCause: 'killed-superseded', redCauseFiles: [] });
+    expect(f.invoke(['run']).json).toMatchObject({ status: 'infrastructure-failure', redCause: 'killed-superseded' });
+  });
+
+  // item 99 — the always-run guard set is wired into the runner independent of the related selection.
+  describe('always-run guard tests', () => {
+    it('runs the declared guard though the related selection did not pick it, and a red guard turns the gate red as a `scan` cause', () => {
+      const f = fixture({ guard: true, guardExit: 1 });
+      const result = f.invoke();
+      expect(result.code, result.stdout + result.stderr).toBe(2);
+      const calls = f.calls();
+      expect(calls.map(c => c.args.slice(0, 2))).toEqual([['vitest', 'related'], ['vitest', 'run'], ['vitest', 'run'], ['run', 'check:standards']]);
+      expect(calls[2].args[2]).toBe('guard.test.mjs');
+      expect(result.json).toMatchObject({ status: 'red', redCause: 'scan', redCauseFiles: ['guard.test.mjs'] });
+      const finished = JSON.parse(readFileSync(marker(), 'utf8'));
+      expect(finished).toMatchObject({ status: 'red', redCause: 'scan', redCauseFiles: ['guard.test.mjs'] });
+      expect(finished.phases.alwaysRun).toMatchObject({ planned: ['guard.test.mjs'], ran: ['guard.test.mjs'], executed: true, result: 'failed' });
+      // `check` — what the harness reads — carries the cause as well.
+      expect(f.invoke(['check']).json).toMatchObject({ redCause: 'scan', redCauseFiles: ['guard.test.mjs'] });
+    });
+    it('a passing guard keeps the gate green and is recorded as executed', () => {
+      const f = fixture({ guard: true });
+      const result = f.invoke();
+      expect(result.code, result.stdout + result.stderr).toBe(0);
+      expect(f.calls().some(c => c.args[2] === 'guard.test.mjs')).toBe(true);
+      expect(JSON.parse(readFileSync(marker(), 'utf8')).phases.alwaysRun).toMatchObject({ ran: ['guard.test.mjs'], executed: true, result: 'passed' });
+    });
+    // Review finding (#4163, codex-correctness): vitest treats file arguments as filters, so one config-excluded guard
+    // is dropped silently while the other still passes and the combined run exits 0.
+    it('one included + one vitest-excluded guard: the gate is RED, the excluded guard is named, and `ran` lists only what executed', () => {
+      const f = fixture({ guard: true, guardExcluded: true });
+      const result = f.invoke();
+      expect(result.code, result.stdout + result.stderr).toBe(2);
+      expect(result.json).toMatchObject({ status: 'red', redCause: 'scan', redCauseFiles: ['excluded.test.mjs'] });
+      const finished = JSON.parse(readFileSync(marker(), 'utf8'));
+      expect(finished.phases.alwaysRun).toMatchObject({ planned: ['guard.test.mjs', 'excluded.test.mjs'], ran: ['guard.test.mjs'], missing: ['excluded.test.mjs'], executed: true, result: 'failed' });
+      expect(finished.phases.outcomes.guard).toMatchObject({ result: 'fail', reason: 'excluded.test.mjs' });
+      expect(result.stderr).toContain('did not execute these declared guard files');
+    });
+    it('a guard run that leaves no executed-file report proves nothing: red, every guard missing', () => {
+      const f = fixture({ guard: true, guardReport: false });
+      const result = f.invoke();
+      expect(result.code, result.stdout + result.stderr).toBe(2);
+      expect(result.json).toMatchObject({ status: 'red', redCause: 'scan', redCauseFiles: ['guard.test.mjs'] });
+      expect(JSON.parse(readFileSync(marker(), 'utf8')).phases.alwaysRun).toMatchObject({ ran: [], missing: ['guard.test.mjs'], result: 'failed' });
+    });
+    it('a RED guard with no report does not claim its files ran', () => {
+      const f = fixture({ guard: true, guardExit: 1, guardReport: false });
+      expect(f.invoke().code).toBe(2);
+      expect(JSON.parse(readFileSync(marker(), 'utf8')).phases.alwaysRun).toMatchObject({ ran: [], missing: ['guard.test.mjs'], result: 'failed' });
+    });
+    it.each([{ guard: true }, { guard: true, guardExit: 1 }])('the guard report directory is removed whether the gate was green or red (%j)', (options) => {
+      fixture(options).invoke();
+      expect(readdirSync(join(dir, 'tmp'))).toEqual([]);
+    });
+    // Review finding (#4163, correctness): the guard shared the `scan` outcome key and overwrote a red scanner.
+    it('a green guard after a red scanner leaves the scanner\'s `scan` outcome failed and gets its own `guard` outcome', () => {
+      const f = fixture({ guard: true, scan: true, scanExit: 1 });
+      const result = f.invoke();
+      expect(result.code, result.stdout + result.stderr).toBe(2);
+      expect(result.json).toMatchObject({ status: 'red', redCause: 'scan' });
+      const { outcomes } = JSON.parse(readFileSync(marker(), 'utf8')).phases;
+      expect(outcomes.scan).toMatchObject({ result: 'fail', reason: 'scripts/lib/__tests__/review-policy.conformance.test.mjs' });
+      expect(outcomes.guard).toEqual({ result: 'pass' });
+      expect(result.stderr).toContain('scan=fail(');
+    });
+    it('when an earlier red stops the gate the guard is NOT claimed as run', () => {
+      const f = fixture({ guard: true, edited: true });
+      const result = f.invoke([], { WE_VERIFY_RUN_ALL_PHASES: '0' });
+      expect(result.code).toBe(2);
+      expect(f.calls().some(c => c.args[2] === 'guard.test.mjs')).toBe(false);
+      expect(JSON.parse(readFileSync(marker(), 'utf8')).phases.alwaysRun).toMatchObject({ planned: ['guard.test.mjs'], ran: [], executed: false, result: null });
+    });
+  });
+
+  // item 99 — the cause on the verdict: a source-only edit that breaks its own untouched test is the change's own regression.
+  describe('redCause on a red gate', () => {
+    it('in-diff-failure: the untouched test imports the changed source and stays red alone', () => {
+      const f = fixture({ importsSource: true, retryExit: 1 });
+      const result = f.invoke();
+      expect(result.code).toBe(2);
+      expect(result.json).toMatchObject({ isolatedRetry: 'still-red', redCause: 'in-diff-failure', redCauseFiles: f.files });
+      expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ redCause: 'in-diff-failure', redCauseFiles: f.files });
+    });
+    it('out-of-diff-still-red: the failing test never reaches the changed source', () => {
+      const f = fixture({ retryExit: 1 });
+      const result = f.invoke();
+      expect(result.code).toBe(2);
+      expect(result.json).toMatchObject({ redCause: 'out-of-diff-still-red', redCauseFiles: f.files });
+    });
+    it('`check` never attaches the cause of a marker that belongs to another commit', () => {
+      const f = fixture({ importsSource: true, retryExit: 1 });
+      expect(f.invoke().code).toBe(2);
+      const record = JSON.parse(readFileSync(marker(), 'utf8'));
+      writeFileSync(marker(), JSON.stringify({ ...record, sha: OTHER_SHA }) + '\n');
+      expect(f.invoke(['check']).json.redCause).toBeUndefined();
+    });
+    it('run mode reports it too', () => {
+      const f = fixture({ importsSource: true, retryExit: 1 });
+      expect(f.invoke(['run']).json).toMatchObject({ status: 'red', redCause: 'in-diff-failure' });
+    });
   });
 });
 
@@ -1408,4 +1525,30 @@ describe('verify phase telemetry (#5141)', () => {
         expect(invoke(args).json).not.toHaveProperty('phases');
       }
     });
+});
+
+describe('item 98 — --help prints usage without running the gate', () => {
+  for (const flag of ['--help', '-h']) {
+    it(`${flag} exits 0 with usage and writes no marker`, () => {
+      const r = spawnSync('node', [VERIFY_LANE, flag, `--repo=${dir}`], { encoding: 'utf8', timeout: 20000 });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/Usage: node scripts\/verify-lane\.mjs/);
+      expect(existsSync(join(dir, '.git', '.lane-verify'))).toBe(false);
+    });
+
+    // Help must not depend on repository discovery: a nonexistent --repo (or a cwd outside any repo) still prints usage.
+    it(`${flag} exits 0 with usage even for a nonexistent repository path`, () => {
+      const missing = join(dir, 'does-not-exist');
+      const r = spawnSync('node', [VERIFY_LANE, flag, `--repo=${missing}`], { encoding: 'utf8', timeout: 20000 });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/Usage: node scripts\/verify-lane\.mjs/);
+      expect(existsSync(missing)).toBe(false);
+    });
+
+    it(`${flag} also wins over a subcommand and prints usage outside any git repository`, () => {
+      const r = spawnSync('node', [VERIFY_LANE, 'request', flag], { cwd: tmpdir(), encoding: 'utf8', timeout: 20000 });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/Usage: node scripts\/verify-lane\.mjs/);
+    });
+  }
 });

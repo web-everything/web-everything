@@ -28,17 +28,20 @@
  * DEGRADATION, on the same "never lose the read" principle `we:scripts/progress-board.mjs` documents: a fresh
  * live fetch wins when available; a live fetch that fails falls back to the last cache written (even stale —
  * a branch-protection change is rare, so a day-old required set is still far more accurate than guessing);
- * a protection 403/404 instead selects the repo's declared policy, cached for the normal TTL as `declared`.
+ * a protection 403/404 (never a rate-limit 403 — that is transient) instead selects the repo's declared
+ * policy, cached for the normal TTL as `declared`, unless a live entry already exists: that is returned as
+ * `stale-cache` and left untouched on disk.
  * Other failures still retry and prefer the cache, with its original age exposed to admission gates.
  * With no cache, failures return `fallback` for a declared repo; undeclared repos return [] with `fallback`
  * on 403/404 or `unavailable` otherwise. The shared check reducer then evaluates observed
  * CI checks, retaining red/pending/unchecked evidence rather than treating an empty required set as green.
  * Cache entries coexist by repo@branch; legacy single-entry sidecars are migrated on the next write.
  */
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
+import { readGh } from './proc-read.mjs';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { resolvePersonalRouteEnabled, runGhCliPassthrough } from './gh-throttle.mjs';
+import { looksLikePersonalAccessDenial, resolvePersonalRouteEnabled, runGhCliPassthrough } from './gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
 /**
@@ -63,9 +66,13 @@ export const DECLARED_REQUIRED_STATUS_CHECKS = Object.freeze({
 
 const DEFAULT_CACHE_TTL_MS = 15 * 60_000;
 
+/**
+ * Is this a protection ACCESS denial (gh's `HTTP 403`/`HTTP 404` that is not a rate limit)? Delegates to the
+ * shared, `isRateLimitShaped`-guarded classifier so a rate-limit/abuse 403 is a transient failure, never a
+ * denial — it must not select the declared policy or overwrite a live cache entry.
+ */
 function protectionAccessDenied(error) {
-  const message = `${error?.message ?? ''}\n${error?.stderr ?? ''}`;
-  return /\b(?:403|404)\b/.test(message);
+  return looksLikePersonalAccessDenial(`${error?.message ?? ''}\n${error?.stderr ?? ''}`);
 }
 
 /** Where the cache sidecar lives — mirrors `we:scripts/progress-board.mjs#cachePathFor`'s own convention. */
@@ -99,7 +106,7 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main' } = {}) 
     }
     out = String(result.stdout ?? '');
   } else {
-    out = execFileSync('gh', args, opts);
+    out = readGh(args, opts); // #74d: failure/oversize throws; never parsed as empty
   }
   const parsed = JSON.parse(out.trim() || '[]');
   if (!Array.isArray(parsed)) throw new Error('required-status-checks: unexpected shape from branch protection');
@@ -174,8 +181,14 @@ export function getRequiredStatusChecks({
     }
   } catch (error) {
     if (protectionAccessDenied(error)) {
-      if (declared) return save([...declared], 'declared');
-      if (!cache) return { checks: [], source: 'fallback' };
+      // An existing live entry (source `live`, or a legacy source-less one) is real branch-protection data: a
+      // denial must never clobber it with the declared policy. Fall through to the stale-cache tail instead —
+      // the file is untouched, so the next call re-reads live once more.
+      const hasLiveCache = cache && cache.source !== 'declared' && cache.source !== 'unavailable';
+      if (!hasLiveCache) {
+        if (declared) return save([...declared], 'declared');
+        if (!cache) return { checks: [], source: 'fallback' };
+      }
     }
     /* gh missing, unauthenticated, offline, rate-limited, or an unexpected response shape — degrade below */
   }
