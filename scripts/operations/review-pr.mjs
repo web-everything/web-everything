@@ -2,6 +2,7 @@ import { requiresMandatoryReferral, laterRoundAdvisoryScopeFromEnv, classifyLate
   referralKeyFinding, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable } from '../lib/jury-core.mjs';
 // Card 84 — the per-seat provider directive (`review.seatProvider.<lens>`). PURE; the settings are read by the caller.
 import { seatProviderDirective } from '../lib/review-seat-provider.mjs';
+import { isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
 /**
  * @file scripts/operations/review-pr.mjs
  * @description THE `review-pr` DECLARATION — the first real operation on the engine (#3035, under epic #3029).
@@ -2587,7 +2588,7 @@ export function reviewPrOperation({
           // Card 84 — a mandatory seat that ran on agy (`review.seatProvider.<lens>: agy`) or had an agy shadow says
           // so in the panel table; a fallback to Claude reads as plain Claude.
           ...seats.filter((s) => !s.provider && s.answer?.seatProvider?.provider === 'agy').map((s) => [s.lens, 'agy']),
-          ...seats.filter((s) => !s.provider && s.answer?.shadow).map((s) => [s.lens, `claude; agy shadow ${s.answer.shadow.status}`]),
+          ...seats.filter((s) => !s.provider && s.answer?.shadow).map((s) => [s.lens, `claude; agy shadow ${isQuotaHeldShadow(s.answer.shadow) ? 'held (agy quota)' : s.answer.shadow.status}`]),
         ]);
         // Card 84 — THE SHADOW RESULTS, recorded beside the verdict and never reduced into it.
         const shadowSeats = seats.filter((s) => s.answer?.shadow && typeof s.answer.shadow === 'object').map((s) => ({

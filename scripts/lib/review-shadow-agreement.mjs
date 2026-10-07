@@ -26,6 +26,10 @@ import { fileURLToPath } from 'node:url';
 import { bindFindingIds, deriveVerdict, findingIdentityEntry, normalizeFindings } from './jury-core.mjs';
 import { daemonConveyorStateRoot } from './daemon-last-good.mjs';
 
+/** A quota hold/exhaustion is the agy backend being out of budget: no juror ran, so it is neither a failure of the seat nor evidence about agy. */
+export const isQuotaHeldShadow = (row) => row?.status !== 'ok' && row?.status !== 'voided'
+  && (row?.reasons ?? []).some((r) => /antigravity: skip-quota-(?:hold|exhausted)/.test(String(r)));
+
 /** The shadow store path. Every reader and writer resolves it here. */
 export function resolveShadowAgreementPath(env = process.env) {
   return join(daemonConveyorStateRoot(env), '.conveyor', 'agy-shadow-agreement.jsonl');
@@ -123,10 +127,11 @@ export function summarizeShadowAgreement(rows = []) {
   const byLens = new Map();
   for (const row of rows) {
     if (!row || typeof row.lens !== 'string') continue;
-    const s = byLens.get(row.lens) ?? { lens: row.lens, runs: 0, compared: 0, voided: 0, failed: 0, agree: 0, overlapSum: 0, prs: new Set() };
+    const s = byLens.get(row.lens) ?? { lens: row.lens, runs: 0, compared: 0, voided: 0, failed: 0, held: 0, agree: 0, overlapSum: 0, prs: new Set() };
     s.runs += 1;
     if (row.pr != null) s.prs.add(`${row.repo}#${row.pr}`);
     if (row.status === 'voided') s.voided += 1;
+    else if (isQuotaHeldShadow(row)) s.held += 1;
     else if (row.status !== 'ok') s.failed += 1;
     else if (row.overlap) {
       s.compared += 1;
@@ -141,6 +146,7 @@ export function summarizeShadowAgreement(rows = []) {
     compared: s.compared,
     voided: s.voided,
     failed: s.failed,
+    held: s.held,
     verdictAgreement: s.compared ? Number((s.agree / s.compared).toFixed(3)) : null,
     meanFindingOverlap: s.compared ? Number((s.overlapSum / s.compared).toFixed(3)) : null,
     prs: s.prs.size,
@@ -154,7 +160,7 @@ export function renderShadowReport(summary) {
   return [
     'agy shadow agreement, per seat (only the Claude verdict counted on these runs):',
     ...summary.map((s) => `  ${s.lens}: ${s.runs} run(s) on ${s.prs} PR(s) — ${s.compared} compared, `
-      + `${s.voided} voided (escaped its lane), ${s.failed} failed; verdict agreement ${pct(s.verdictAgreement)}, `
+      + `${s.voided} voided (escaped its lane), ${s.failed} failed, ${s.held} held (agy quota); verdict agreement ${pct(s.verdictAgreement)}, `
       + `mean finding overlap ${pct(s.meanFindingOverlap)}`),
   ];
 }
