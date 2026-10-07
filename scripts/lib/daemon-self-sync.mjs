@@ -504,7 +504,7 @@ export function withSelfSync(effects, {
   root, onRestart, sync = selfSyncCheckout, syncPoc = selfSyncCheckoutPoc, base = 'main', pocBranch, env = process.env,
   log = console, timeoutMs, readHead = readHeadSha, readOriginRef = readOriginRefSha, hasStaleRefusal, gate = gateMergedCommit,
   mainOnly = false, rebuild = (o = {}) => rebuildClone({
-    root, env, log, mainOnly, ...o,
+    root, env, log, mainOnly, entries, ...o,
   }), acquireRead = acquireReadLock, releaseRead = releaseReadLock, readState = readRebuildState,
   entries = [process.argv[1]], diffFiles = changedFilesBetween, importClosure = collectImportClosure,
   minRestartIntervalMs = resolveRestartMinIntervalMs(env), now = Date.now,

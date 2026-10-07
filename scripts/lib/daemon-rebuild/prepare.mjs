@@ -32,7 +32,7 @@ import {
  * smoke a candidate — see {@link rebuildClone}).
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -379,6 +379,27 @@ export async function prepareRebuild({
     if (colliding.length > 0) {
       alert('untracked-collision', { paths: colliding });
       return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
+    }
+  }
+
+  // daemonRebuild.skipUnrelated — the move changes nothing this daemon runs (see skip-unrelated.mjs): adopt the
+  // target without the candidate build + live smoke. Only from a clone that is itself on its smoke-verified
+  // build (adopted === HEAD, not held), so an unverified tree is never carried forward unsmoked.
+  if (typeof skipCheck === 'function' && state.adopted?.head === prevHead && !state.held && !state.quarantine) {
+    const diff = git(['diff', '--name-only', prevHead, plan.finalSha]);
+    const changedFiles = diff.status === 0 ? String(diff.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean) : null;
+    const d = skipCheck(changedFiles);
+    if (d?.skip) {
+      log?.error?.(`daemon-rebuild: skipped rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — ${d.reason} (daemonRebuild.skipUnrelated)`);
+      const fin = await finalizeRebuild({
+        root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
+      });
+      const { alerts: finAlerts = [], ...finResult } = fin;
+      return {
+        terminal: true,
+        result: { ...finResult, ...(finResult.adopted ? { reason: 'skipped-unrelated', skippedSmoke: true } : {}) },
+        alerts: [...alertsList, ...finAlerts],
+      };
     }
   }
 
