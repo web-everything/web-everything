@@ -3,67 +3,76 @@ bornAs: x3ni496
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/__tests__/"]
+scope: ["we:scripts/operations/__tests__/helpers/fake-claude.mjs", "we:scripts/operations/__tests__/fake-claude-sessions.test.mjs", "we:scripts/operations/__tests__/fake-claude-etxtbsy.test.mjs"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-09-30"
-preparedAgainstSha: "88396bb20d4b7b7ecca6b442d0ace2f85eee66db"
+preparedDate: "2026-10-07"
+preparedAgainstSha: "45d426ce98ca541f7a2ed18ef1b9bdfac26fa506"
 tags: []
 ---
 
 # Fix flaky fake-claude-sessions test: ETXTBSY spawning the fake claude binary
 
-CI run 36495657201 (PR #2875, 2026-09-28) failed in we:scripts/operations/__tests__/fake-claude-sessions.test.mjs ('scripted actions — writeCompletion / exit / setState, through the real completion-store') with 'spawnSync claude ETXTBSY': the test writes the fake claude executable and spawns it while a write handle is still open (a Linux race). A cards-only PR went red on it. MVP: close/fsync the file before chmod+spawn (or write to a temp name and rename), and retry once on ETXTBSY in the test helper. Must: the test passes 50 runs in a loop on Linux CI.
+The original report records CI run 36495657201 (PR #2875, 2026-09-28) failing in the scripted-actions group of `we:scripts/operations/__tests__/fake-claude-sessions.test.mjs` with `spawnSync claude ETXTBSY`. Preserve the goal: tolerate transient executable-busy failures in this fake's test execution seam, with deterministic regression coverage and 50 consecutive passing Linux runs.
 
 ## Design
 
-Premise checked against `main` (88396bb): still live. `createFakeClaude` does `writeFileSync(bin, …)` then `chmodSync(bin, 0o755)` at `we:scripts/operations/__tests__/helpers/fake-claude.mjs:311-312` (the path the failing test uses; `withFakeClaude` has the same shape at `:211-212` but is not the failing path). No ETXTBSY handling exists in `we:scripts/operations/`.
+The helper writes the executable synchronously and then makes it executable at `we:scripts/operations/__tests__/helpers/fake-claude.mjs:311-312`. There is no explicit retained write descriptor in this code. The historical CI symptom does not establish which process held a descriptor or that a fork inherited it. Treat that mechanism as an unverified hypothesis; neither an extra fsync nor rename is established as a fix by the current evidence.
 
-Mechanism: Linux `execve` fails with ETXTBSY while ANY process holds a write fd on that inode. `writeFileSync` closes its own fd, but a fork from elsewhere in the process (other test code spawning via `execFileSync`) between our `open(O_WRONLY)` and `close` inherits a copy that lives until that child `exec`s. **Temp-name + rename does NOT help**: `rename(2)` keeps the inode, so the inherited fd still pins it under the new name. (The card's original "or rename" idea is therefore dropped.) Only a bounded retry of the exec is reliable, and it belongs in the test helper — production `defaultSpawnAgent` must not gain a test-only retry.
+Add a synchronous `retryEtxtbsy(fn)` helper in `we:scripts/operations/__tests__/helpers/fake-claude.mjs`. Return the callback result unchanged. Retry only errors whose `code` is exactly `ETXTBSY`, at most five attempts total, with 25 ms via `Atomics.wait` between attempts (four waits maximum). Rethrow the original final error; all other failures propagate immediately. Do not match message text, which could mistake a command's application error for a pre-execution failure.
 
-Fix: add `retryEtxtbsy(fn)` to `we:scripts/operations/__tests__/helpers/fake-claude.mjs`: call `fn`; on `e.code === 'ETXTBSY'` (or message match) sleep ~25ms via `Atomics.wait` and retry, up to 5 attempts total, then rethrow the last error; any other error rethrows immediately. Expose `fake.exec(cmd, argv, opts)` on the `createFakeClaude` return: `execFileSync` wrapped in `retryEtxtbsy`. Every site in the sessions test that execs the fake `claude` routes through it, not only spawn:
-- `defaultSpawnAgent(..., { exec: fake.exec })` (`we:scripts/operations/dispatch-lane-io.mjs:1752`, injectable third arg);
-- `defaultListAgents({ exec: fake.exec, env })` (it accepts `{ exec }`; called on many lines of the test, sometimes as the FIRST exec after `createFakeClaude()`);
-- `stopSession({ exec: fake.exec })` (builds its own exec lambda today, `we:scripts/operations/dispatch-abort.mjs:72`);
-- the bare `execFileSync('claude', bg(7, …))` in the test.
-Production code paths still run unmodified; only the low-level exec gains the retry.
+Extend `createFakeClaude` with optional `execImpl = execFileSync` and returned `exec(cmd, argv, opts)` that invokes that implementation through the retry helper. Forward arguments and options unchanged on every attempt. In particular, do not rebuild the environment inside this wrapper: the production spawner's token sanitization must survive it.
+
+Route every fake executable invocation in `we:scripts/operations/__tests__/fake-claude-sessions.test.mjs` through the corresponding instance's `exec`:
+
+- Pass `{ exec: fake.exec }` as the third argument to `defaultSpawnAgent`, whose injection point is `we:scripts/operations/dispatch-lane-io.mjs:1839`.
+- Pass `exec: fake.exec` alongside the existing environment to `defaultListAgents`, whose fetch seam is `we:scripts/operations/dispatch-lane-io.mjs:3273`.
+- Keep the stop adapter's environment merge, but call `fake.exec(cmd, args, { ...opts, env })` instead of the bare executor. `stopSession` supplies no environment itself at `we:scripts/operations/dispatch-abort.mjs:72-76`.
+- Replace the direct token-observation invocation at `we:scripts/operations/__tests__/fake-claude-sessions.test.mjs:140`; also cover the separate `local` instance in the cleanup case at `we:scripts/operations/__tests__/fake-claude-sessions.test.mjs:202-204`.
+
+Production spawn, listing, and stop implementations remain the exercised behavior; the retry sits below their existing injection seams. The helper's existing callers remain compatible.
 
 ## MVP
 
-Musts only:
-- `retryEtxtbsy` (bounded, 5 tries) + `fake.exec` on `createFakeClaude`.
-- `we:scripts/operations/__tests__/fake-claude-sessions.test.mjs` routes ALL its `claude` execs (spawn, list, stop, bare) through `fake.exec`.
-- Unit tests for the wrapper and for routing.
+1. Implement the bounded retry and instance executor in `we:scripts/operations/__tests__/helpers/fake-claude.mjs`, including the helper's return/options documentation.
+2. Route all existing session-suite executable calls through it in `we:scripts/operations/__tests__/fake-claude-sessions.test.mjs`, preserving environments, timeouts, fault expectations, and cleanup.
+3. Add pure deterministic wrapper tests in planned `we:scripts/operations/__tests__/fake-claude-etxtbsy.test.mjs`; put real-process retry/routing cases in existing `we:scripts/operations/__tests__/fake-claude-sessions.test.mjs`.
 
-Deliberately OUT (see Follow-ups): atomic write/rename (proven useless above); touching `withFakeClaude` (not the failing path); production retry; other createFakeClaude/withFakeClaude consumers.
+This is one test-infrastructure fix. No production retry, file-publication redesign, or migration of other consumers is required.
 
 ## Test plan
 
-New `we:scripts/operations/__tests__/fake-claude-etxtbsy.test.mjs` (unit tier):
-- **retries then succeeds** — `fn` throws `{code:'ETXTBSY'}` twice then returns → value returned, called 3 times. RED before: `retryEtxtbsy` does not exist (import fails) and a bare exec would propagate the first error.
-- **bounded** — always ETXTBSY → rethrown after exactly 5 calls.
-- **no blanket catch** — `{code:'ENOENT'}` → rethrown after 1 call.
-- **`fake.exec` retries on a real exec** — create a fake, wrap so the underlying exec throws ETXTBSY on first call per invocation (inject a stub via an optional `{ execImpl }` on `createFakeClaude`), then assert `defaultListAgents({ exec: fake.exec })`, `defaultSpawnAgent(..., { exec: fake.exec })` and `stopSession({ exec: fake.exec })` each succeed. RED before: `fake.exec` does not exist; this proves all three sites route through the retry.
-- Regression: the existing `fake-claude-sessions` suite stays green.
+Matching coverage for `we:scripts/operations/__tests__/helpers/fake-claude.mjs` is the planned unit file `we:scripts/operations/__tests__/fake-claude-etxtbsy.test.mjs` plus the existing integration file `we:scripts/operations/__tests__/fake-claude-sessions.test.mjs`; both are explicitly in scope.
+
+In the unit file, prove first-attempt success, two ETXTBSY failures then success (three calls), exhaustion (five calls and identical final error), immediate ENOENT/application-error propagation (one call), and no retry for a message containing ETXTBSY without that error code. Use an injected executor with `createFakeClaude` to verify argument/options forwarding and return/error identity; clean the fixture in a finally block. These tests may create temporary files but must not spawn children.
+
+In the integration file, inject an executor that throws a coded ETXTBSY once before delegating to real `execFileSync` for each exercised spawn/list/stop/direct invocation. Count attempts so a cache hit cannot falsely prove listing retry. Use a fresh fixture/environment and ensure the list fetch actually executes. Assert one session is created, listing returns it, stop succeeds, direct token observation still works, and cleanup kills recorded children. Keep the existing sanitized-token and deliberate-fault assertions intact. Inspect all executable call sites, including the local cleanup fixture, for unwrapped calls.
+
+The unit glob already includes the planned file (`we:vitest.config.ts:121`). The session suite is excluded from that tier (`we:vitest.config.ts:273`) and included in the integration tier (`we:vitest.integration.config.ts:120`); no configuration edit is needed.
 
 ## Proof plan
 
-- The race is Linux-only, so the required proof is Linux: the PR's CI `test` check (green) AND one Linux container run (`node:22`, repo mounted) of `npx vitest run --config we:vitest.integration.config.ts fake-claude-sessions` looped 50×, pass count recorded in the PR body. A darwin loop is a smoke check only and is labelled as such.
-- Before/after: the unit tests above with an injected ETXTBSY fail without the wrapper and pass with it. This does not reproduce the real race; the Linux loop is the evidence for that.
+Execution belongs to the implementation phase; preparation does not claim the flake reproduced or tests passed. Run all tests and gates through the host heavy-run queue entry point `we:scripts/readiness/heavy-admission.mjs`. Commands below use repository-prefixed path notation: remove the `we:` notation when passing each path to the shell from the WE checkout.
+
+- Unit: `node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/operations/__tests__/fake-claude-etxtbsy.test.mjs`.
+- Integration: `node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run --config we:vitest.integration.config.ts we:scripts/operations/__tests__/fake-claude-sessions.test.mjs`.
+- Standards: `node we:scripts/readiness/heavy-admission.mjs run -- npm run check:standards`.
+
+Demonstrate red/green by bypassing the retry in the implementation workspace: injected ETXTBSY cases must fail, then pass with the retry restored. On a Linux checkout with dependencies installed, execute the queued integration command 50 times sequentially, stopping at the first failure; record OS, Node version, tested SHA, commands, and pass count. Do not bypass admission with a container or a bare test loop. Require the relevant CI integration check as well; a generic unit check does not select this suite. A macOS pass is only a smoke check. Fifty green runs provide stress evidence, not proof of the hypothesized descriptor race or impossibility of future flakes.
 
 ## Follow-ups
 
-- Route other fake-claude consumers (`dispatch-spawn-live`, `judge-provider-port`, `parked-pr-conflict-dispatch-integration`, sim-clock, sim-scenarios-smoke, the soak breaks) through `fake.exec` / `retryEtxtbsy` and apply it to `withFakeClaude`.
-- Audit other test helpers that write an executable then exec it (grep test dirs for `chmodSync` with 0o755).
-- A periodic Linux stress job for the simulator tier.
+- Separately assess other consumers of `createFakeClaude` and the older `withFakeClaude` helper in `we:scripts/operations/__tests__/helpers/fake-claude.mjs:207`; migrate only where evidence warrants it.
+- If ETXTBSY survives the bounded retry, capture Linux process/descriptor evidence before changing executable publication or retry limits.
+- Consider a periodic Linux stress check separately from this bounded repair.
 
 ## Done when
 
-1. **Executable** — `for i in $(seq 50); do npx vitest run --config we:vitest.integration.config.ts fake-claude-sessions || exit 1; done` exits 0 on Linux, and `npx vitest run fake-claude-etxtbsy` passes (it fails before this lands because `retryEtxtbsy` / `fake.exec` do not exist).
+The deterministic tests prove retry classification, boundedness, forwarding, and failure preservation; every session-suite fake executable call uses the wrapper; the existing behaviors remain green; and the queued Linux integration run passes 50 consecutive times with evidence recorded.
 
-## Findings (standalone worker, 2026-09-30)
+## Progress
 
-The build-dispatch daemon held #4388 with:
-
-> worker-declined: scope exceeds the test-fix envelope — route to the builder: the heal changed 210 lines (limit 150)
-
-Implementation changes were discarded. The card is held for the builder; its declared scope is preserved.
+- Historical preparation (2026-09-30) reported a discarded 210-line implementation exceeding the automated 150-line test-fix envelope. That report is history, not evidence that a fix landed. Current inspection finds neither `retryEtxtbsy` nor an instance executor in `we:scripts/operations/__tests__/helpers/fake-claude.mjs:298-366`.
+- Old premise: an open writer/fork-inheritance race was asserted as the cause, and closing/fsync/rename was initially offered as a fix. Corrected premise: the helper uses sequential synchronous write/chmod at `we:scripts/operations/__tests__/helpers/fake-claude.mjs:311-312`; the responsible writer was not observed. Retain the already-proposed bounded test-only retry as mitigation, without asserting a root cause.
+- Old scope was the entire `we:scripts/operations/__tests__/` directory. Corrected scope names the helper, existing session integration suite, and planned unit regression file explicitly. The production injection seams already exist at `we:scripts/operations/dispatch-lane-io.mjs:1839`, `we:scripts/operations/dispatch-lane-io.mjs:3273`, and `we:scripts/operations/dispatch-abort.mjs:72`, so no production edits are required. The old spawn citation at `we:scripts/operations/dispatch-lane-io.mjs:1752` is replaced above.
+- Corrected test placement: pure retry coverage belongs in the planned unit file; real-process routing coverage belongs in the existing integration suite, as established by `we:vitest.config.ts:273` and `we:vitest.integration.config.ts:120`. The earlier plan put both in the unit tier and supplied commands with an unusable repository prefix as a literal CLI path.
+- Size remains 2: one helper, one existing consumer suite, one focused new test file; no new production API or configuration work. Preparation leaves the existing stamps untouched for the runner and proposes no blockedBy changes.
