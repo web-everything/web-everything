@@ -69,7 +69,7 @@ In `we:scripts/operations/__tests__/probation-build-run.test.mjs` (build on `pre
 
 ## Progress
 
-- Sanity read confirmed the numeric-only parser and graph loader still need the specified change. Using `x2c7uas` for the hash examples whose text now says `4705`; the intended six-character hash contract is explicit in Design.
+- Sanity read confirmed the numeric-only parser and graph loader still need the specified change. Using `4705` for the hash examples whose text now says `4705`; the intended six-character hash contract is explicit in Design.
 - Added parser/validator/real graph-loader contracts and prepare-runner refusal/publication tests. Confirmed the four pre-change failures (hash parsing, hash cycle, hash graph entry, and absent id constant); fixed a test-environment URL issue before confirming the constant failure.
 - Implemented `BACKLOG_ID_SOURCE` in both consumers. Contracts cover unknown/resolved/self/cyclic targets in both id forms and valid numeric/hash publication; the live parser probe changed from `[]` to one hash edge.
 - Mutation checks each failed as intended when removing invalid-proposal validation, omitting `proposedEdges` from PR-body arguments, or scanning outside the proposal section. Restored all three mutations.
