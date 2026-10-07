@@ -131,7 +131,7 @@ export function runReport(flags) {
       return { changed: false, refused: true, why: ownership.why };
     }
     const patch = {};
-    for (const key of ['outcome', 'verdict', 'label', 'runId', 'denied']) {
+    for (const key of ['outcome', 'verdict', 'label', 'runId', 'denied', 'cause']) {
       if (Object.hasOwn(flags, key)) patch[key] = flags[key];
     }
     patch.sessionId = ownership.sessionId;

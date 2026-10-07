@@ -701,7 +701,7 @@ describe('a failed store write or delete never repeats an effect (#5137 review)'
     for (let i = 0; i < 6; i += 1) await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000 + i * 120_000, ttlMs: TTL });
     expect(h.calls.push).toHaveLength(AWAIT_VERIFY_LIMITS.maxRetries + 1);
     expect(h.calls.resume).toHaveLength(1);
-    expect(h.calls.resume[0].prompt).toMatch(/did NOT push/);
+    expect(h.calls.resume[0].prompt).toMatch(/kept failing[\s\S]*not a moved branch[\s\S]*--cause=transient/);
   });
   it('a pending resume that cannot be saved is not delivered; the unsaved red re-decides next tick', async () => {
     const h = harness();
