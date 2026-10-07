@@ -15,7 +15,7 @@ import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 import { DAEMON_ENTRY_MODULES } from '../daemon-boot-smoke.mjs';
 import { collectImportClosure } from '../import-closure.mjs';
-import { decideSkipRebuild, resolveSkipUnrelated, smokeSurfaceEntries } from '../daemon-rebuild/skip-unrelated.mjs';
+import { decideSkipRebuild, makeSkipCheck, resolveSkipUnrelated, smokeSurfaceEntries } from '../daemon-rebuild/skip-unrelated.mjs';
 
 const LOCK_OPTS = { waitMs: 0 };
 
@@ -416,6 +416,155 @@ describe('a non-ASCII changed path is matched, not C-quoted past the closure', (
     const runSmoke = passSmoke();
     const r = await rebuildClone({
       root: f.cloneDir, env: { ...f.env, WE_DAEMON_REBUILD_SKIP_UNRELATED: '1' }, entries: [entry], runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+    expect(r.reason).not.toBe('skipped-unrelated');
+  });
+});
+
+// ── review round 2 (#4272): a script a daemon SPAWNS by path is code it runs, though no `import` names it ───────
+describe('a script the daemon spawns by path is part of what it runs (not "unrelated")', () => {
+  const ENV = { WE_DAEMON_REBUILD_SKIP_UNRELATED: '1' };
+  /** A throwaway tree (no git) holding `files`, and the real `makeSkipCheck` built over it. */
+  function treeCheck(files, entries = ['scripts/d.mjs']) {
+    const root = mktemp('we-skip-spawn-');
+    for (const [name, body] of Object.entries(files)) writeFile(root, name, body);
+    return makeSkipCheck({ root, entries, env: ENV });
+  }
+  const spawnUrl = "import { spawn } from 'node:child_process';\nspawn(process.execPath, [new URL('./child.mjs', import.meta.url).pathname]);\n";
+
+  it('new URL(./child.mjs, import.meta.url): the spawned child and what IT imports take the smoke', () => {
+    const check = treeCheck({
+      'scripts/d.mjs': spawnUrl,
+      'scripts/child.mjs': "import './lib/helper.mjs';\n",
+      'scripts/lib/helper.mjs': 'export const h = 1;\n',
+      'scripts/other.mjs': 'export const o = 1;\n',
+    });
+    expect(check(['scripts/child.mjs']).skip).toBe(false);
+    expect(check(['scripts/lib/helper.mjs']).skip).toBe(false);
+    expect(check(['scripts/other.mjs']).skip).toBe(true); // a code file nobody runs still skips
+    expect(check(['docs/a.md']).skip).toBe(true);
+  });
+
+  it('variants: join(__dirname, x), a repo-relative literal, a template literal, .js/.cjs, a spawn of a spawn', () => {
+    const check = treeCheck({
+      'scripts/d.mjs': [
+        "spawn(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'viadir.mjs')]);",
+        "spawn(process.execPath, ['scripts/tools/rel.mjs']);",
+        'spawn(process.execPath, [`${here}/tpl.cjs`]);',
+        "fork('./plain.js');",
+        "spawn(process.execPath, [new URL('./hop1.mjs', import.meta.url).pathname]);",
+      ].join('\n'),
+      'scripts/viadir.mjs': '1;\n',
+      'scripts/tools/rel.mjs': '1;\n',
+      'scripts/tpl.cjs': '1;\n',
+      'scripts/plain.js': '1;\n',
+      'scripts/hop1.mjs': "spawn(process.execPath, [new URL('./hop2.mjs', import.meta.url).pathname]);\n",
+      'scripts/hop2.mjs': "import './deep.mjs';\n",
+      'scripts/deep.mjs': '1;\n',
+    });
+    for (const f of ['viadir.mjs', 'tools/rel.mjs', 'tpl.cjs', 'plain.js', 'hop1.mjs', 'hop2.mjs', 'deep.mjs']) {
+      expect(check([`scripts/${f}`]).skip, f).toBe(false);
+    }
+  });
+
+  it('a spawned script the move ADDS (absent before it) is still relevant', () => {
+    const check = treeCheck({ 'scripts/d.mjs': spawnUrl });
+    expect(check(['scripts/child.mjs']).skip).toBe(false);
+  });
+
+  /** Same, but the tree is a git repo: the basename fallback for a path assembled from pieces reads `git ls-files`. */
+  function gitTreeCheck(files, entries = ['scripts/d.mjs'], extra = {}) {
+    const root = mktemp('we-skip-spawn-git-');
+    for (const [name, body] of Object.entries(files)) writeFile(root, name, body);
+    gitOk(root, ['init', '-q', '-b', 'main']);
+    gitOk(root, ['add', '-A']);
+    return makeSkipCheck({ root, entries, env: ENV, ...extra });
+  }
+
+  it('a path assembled from pieces (join(ROOT, "scripts", "tools", "c.mjs")) still reaches the child and ITS imports', () => {
+    const check = gitTreeCheck({
+      'scripts/d.mjs': "spawn(process.execPath, [join(ROOT, 'scripts', 'tools', 'c.mjs')]);\n",
+      'scripts/tools/c.mjs': "import '../lib/helper.mjs';\n",
+      'scripts/lib/helper.mjs': 'export const h = 1;\n',
+      'scripts/lib/unrelated.mjs': 'export const u = 1;\n',
+    });
+    expect(check(['scripts/tools/c.mjs']).skip).toBe(false);
+    expect(check(['scripts/lib/helper.mjs']).skip).toBe(false); // the only change is the child's own import
+    expect(check(['scripts/lib/unrelated.mjs']).skip).toBe(true);
+  });
+
+  it('a shell command string with arguments (exec("node scripts/x.mjs --flag")) and a query suffix are scanned', () => {
+    const check = gitTreeCheck({
+      'scripts/d.mjs': "exec('node scripts/x.mjs --flag');\nawait import(`./y.mjs?v=1`);\n",
+      'scripts/x.mjs': "import './xdep.mjs';\n",
+      'scripts/xdep.mjs': '1;\n',
+      'scripts/y.mjs': '1;\n',
+    });
+    for (const f of ['x.mjs', 'xdep.mjs', 'y.mjs']) expect(check([`scripts/${f}`]).skip, f).toBe(false);
+  });
+
+  it('a package.json scripts entry names a script the daemon runs by name', () => {
+    const check = gitTreeCheck({
+      'scripts/d.mjs': "spawn('npm', ['run', 'sweep']);\n",
+      'package.json': '{"scripts":{"sweep":"node scripts/sweep.mjs --all"}}\n',
+      'scripts/sweep.mjs': '1;\n',
+    });
+    expect(check(['scripts/sweep.mjs']).skip).toBe(false);
+  });
+
+  it('code after a leading block comment on the same line is scanned; a wholly-prose line is not', () => {
+    const check = treeCheck({
+      'scripts/d.mjs': "/* run it */ spawn(process.execPath, ['./live.mjs']);\n// spawn(process.execPath, ['./dead.mjs']);\n * 'also-dead.mjs'\n",
+      'scripts/live.mjs': '1;\n',
+      'scripts/dead.mjs': '1;\n',
+    });
+    expect(check(['scripts/live.mjs']).skip).toBe(false);
+    expect(check(['scripts/dead.mjs']).skip).toBe(true);
+  });
+
+  it('path text is compared case- and Unicode-form-insensitively (git spelling vs the closure spelling)', () => {
+    const closure = { complete: true, files: new Set(['scripts/Child.mjs', 'scripts/caf\u00e9.mjs']), bareDeps: false, jsonNames: new Set(), spawnedNames: new Set(['x.mjs']) };
+    expect(decideSkipRebuild({ changedFiles: ['scripts/child.mjs'], closure }).skip).toBe(false);
+    expect(decideSkipRebuild({ changedFiles: ['scripts/cafe\u0301.mjs'], closure }).skip).toBe(false);
+    expect(decideSkipRebuild({ changedFiles: ['scripts/X.MJS'], closure }).skip).toBe(false);
+  });
+
+  it('a .ts file nothing imports is never "unrelated" (it can be run directly)', () => {
+    const closure = { complete: true, files: new Set(['scripts/d.mjs']), bareDeps: false, jsonNames: new Set() };
+    expect(decideSkipRebuild({ changedFiles: ['scripts/tool.ts'], closure }).skip).toBe(false);
+  });
+
+  it('an unreadable closure file makes the closure incomplete: any code file takes the smoke', () => {
+    const check = treeCheck({ 'scripts/d.mjs': spawnUrl, 'scripts/other.mjs': '1;\n' });
+    const root = mktemp('we-skip-unreadable-');
+    writeFile(root, 'scripts/d.mjs', 'export {};\n');
+    writeFile(root, 'scripts/other.mjs', '1;\n');
+    const broken = makeSkipCheck({ root, entries: ['scripts/d.mjs'], env: ENV, readFile: () => { throw new Error('EIO'); } });
+    expect(check(['scripts/other.mjs']).skip).toBe(true);
+    expect(broken(['scripts/other.mjs']).skip).toBe(false);
+    expect(broken(['docs/a.md']).skip).toBe(true);
+  });
+
+  it('the pure decision honours closure.spawnedNames and still skips unrelated code', () => {
+    const closure = { complete: true, files: new Set(['scripts/d.mjs']), bareDeps: false, jsonNames: new Set(), spawnedNames: new Set(['child.mjs']) };
+    expect(decideSkipRebuild({ changedFiles: ['scripts/child.mjs'], closure }).skip).toBe(false);
+    expect(decideSkipRebuild({ changedFiles: ['scripts/other.mjs'], closure }).skip).toBe(true);
+  });
+
+  it('end to end through rebuildClone: a move changing only a spawned sibling is smoked', async () => {
+    const f = makeFixture();
+    advanceMain(f.originDir, (dir) => {
+      writeFile(dir, entry, spawnUrl);
+      writeFile(dir, 'scripts/child.mjs', 'export const c = 1;\n');
+      writeFile(dir, 'package.json', '{}\n');
+    });
+    const baseline = await rebuildClone({ root: f.cloneDir, env: f.env, runSmoke: passSmoke(), prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(baseline.adopted).toBe(true);
+    advanceMain(f.originDir, (dir) => writeFile(dir, 'scripts/child.mjs', 'export const c = ;\n')); // a syntax error
+    const runSmoke = passSmoke();
+    const r = await rebuildClone({
+      root: f.cloneDir, env: { ...f.env, ...ENV }, entries: [entry], runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
     });
     expect(runSmoke).toHaveBeenCalledTimes(1);
     expect(r.reason).not.toBe('skipped-unrelated');
