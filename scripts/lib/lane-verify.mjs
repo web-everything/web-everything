@@ -579,6 +579,12 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
       ...retryAuditOf(rec),
     } : {};
     const retryDetail = describeIsolatedRetry(diagnostic);
+    // Perf 42 — every failing test also fails on main's tip, outside this diff: main's problem, not this push's.
+    // Exact-sha only (a carried-forward record was measured against another base) and never for an in-diff red.
+    if (exactShaMatch && rec.redCause === 'pre-existing-on-main' && rec.redCauseEvidence?.baseSha) {
+      return { ok: true, status: 'red', ...diagnostic, reason: 'verify-red-preexisting', redCause: rec.redCause, redCauseEvidence: rec.redCauseEvidence,
+        detail: `verification for ${String(headSha).slice(0, 8)} is RED only on tests that also fail on origin/main @ ${String(rec.redCauseEvidence.baseSha).slice(0, 8)} (outside this diff) — pre-existing, not blocking this push; surfaced to the health watch.` };
+    }
     if (requireVerified) {
       return { ok: false, status: 'red', ...diagnostic, reason: 'verify-red', detail: `verification for ${String(headSha).slice(0, 8)} recorded a RED result (exit ${rec.exitCode ?? '?'}) — fix the failure and re-run \`node scripts/verify-lane.mjs\`.${retryDetail}` };
     }

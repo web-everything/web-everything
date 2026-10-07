@@ -8,6 +8,8 @@
  *   out-of-diff-flaky      failing files outside the diff passed when re-run alone (the run itself went green)
  *   out-of-diff-still-red  failing files outside the diff, still red alone / not retried
  *   test-timeout           the failing tests timed out
+
+ *   pre-existing-on-main   every failing test outside the diff also fails on origin/main's tip (verify-base-rerun.mjs)
  *   standards              the check:standards phase was red
  *   scan                   a repo-scanning or always-run guard phase was red
  *   killed-superseded      the gate process was killed by a signal (a newer request, daemon restart)
@@ -18,7 +20,7 @@ import { posix } from 'node:path';
 import { FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION } from './gate-timeout-retry.mjs';
 
 export const RED_CAUSES = Object.freeze(['in-diff-failure', 'out-of-diff-flaky', 'out-of-diff-still-red', 'test-timeout',
-  'standards', 'scan', 'killed-superseded', 'refused', 'infra']);
+  'standards', 'scan', 'killed-superseded', 'refused', 'infra', 'pre-existing-on-main']);
 
 const TIMEOUT = /timed out in \d+\s*ms|Test timed out/i;
 const filesOf = (details) => [...new Set((details?.tests ?? []).map(t => t.file))];

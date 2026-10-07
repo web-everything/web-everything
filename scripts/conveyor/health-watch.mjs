@@ -508,7 +508,13 @@ export function probeLaneVerifyMarkers({ poolRoot, readHead } = {}) {
       const dir = join(poolRoot, pool, `lane-${lane}`);
       let marker;
       try { marker = readVerifyMarker(join(dir, '.git')); } catch { continue; }
-      if (!marker || marker.corrupt || marker.status !== 'running') continue;
+      if (!marker || marker.corrupt) continue;
+      // Perf 42 — a red marker whose failures all reproduce on origin/main (read by `pre-existing-red-on-main`).
+      if (marker.status === 'red' && marker.redCause === 'pre-existing-on-main') {
+        out.push({ pool, lane, sha: marker.sha ?? null, head: head(dir), status: 'red', redCause: marker.redCause, redCauseEvidence: marker.redCauseEvidence ?? null, finishedAt: marker.finishedAt ?? null });
+        continue;
+      }
+      if (marker.status !== 'running') continue;
       out.push({ pool, lane, sha: marker.sha ?? null, head: head(dir), startedAt: marker.startedAt ?? null, runId: marker.runId ?? null, suites: marker.suites ?? null });
     }
   }
