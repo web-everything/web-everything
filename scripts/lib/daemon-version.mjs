@@ -122,7 +122,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
         || args.some(arg => !/^--(?:clone|home|id|expect-current|to|reason|by)=.+$/.test(arg)
           && !['--json', '--force', '--dry-run'].includes(arg))
         || (args.includes('--dry-run') && !['switch', 'status'].includes(command))) {
-        throw new Error('Usage: daemon-version.mjs switch|rollback|gc|status --clone=<path> --home=<dir> [--id=<id> --expect-current=<id|null>] [--to=<id>] [--reason=<text>] [--by=<actor>] [--force] [--dry-run] [--json]');
+        throw new Error('Usage: daemon-version.mjs switch|rollback|gc|status --clone=<path> --home=<dir> [--id=<id> --expect-current=<id|null>] [--to=<id>] [--reason=<text>] [--by=<actor>] [--force] [--dry-run] [--json] (always prints one JSON line; exit 0 = done, 1 = error, 2 = not done: busy|aborted|refused|no-previous|recovery-pending, or disabled for switch/rollback)');
       }
       const api = await import('./daemon-version-switch.mjs');
       const name = basename(logicalCloneRoot(value('clone')));
@@ -133,6 +133,11 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
         settings: args.includes('--force') ? { enabled: { [name]: true } } : undefined,
       });
       console.log(JSON.stringify(result));
+      // Exit 0 means the command did what was asked (or the feature is dormant); 2 means it did not,
+      // so a caller that only checks the exit code never mistakes a lost lock or a refusal for success.
+      // `disabled` is a failure only for a command that was meant to change something.
+      if (['busy', 'aborted', 'refused', 'no-previous', 'recovery-pending', 'probation-failed'].includes(result?.status)
+        || (result?.status === 'disabled' && ['switch', 'rollback'].includes(command))) process.exitCode = 2;
     } catch (error) {
       console.error(error.message);
       process.exitCode = 1;

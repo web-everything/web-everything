@@ -22,6 +22,14 @@ function validId(id) {
   }
   return id;
 }
+// A leading dot marks staging (.building-*) and deletion (.trash-*) directories: never a version.
+const hidden = name => name.startsWith('.');
+/** The one gate for any id that names a version (switch, rollback, pin, probation, recorded intents). */
+function validVersionId(id) {
+  validId(id);
+  if (hidden(id)) throw new Error(`Invalid version id: ${id}`);
+  return id;
+}
 function context({ clone, home, settings, deps = {} }) {
   const name = basename(logicalCloneRoot(clone));
   if (!isVersionedClone(name, settings)) return null;
@@ -61,12 +69,12 @@ function context({ clone, home, settings, deps = {} }) {
     if (!stat(path).isSymbolicLink()) throw new Error(`Unsafe version link: ${name}`);
     const target = fs.readlinkSync(path);
     if (!target.startsWith('versions/')) throw new Error(`Unsafe version link: ${target}`);
-    const id = validId(target.slice('versions/'.length));
+    const id = validVersionId(target.slice('versions/'.length));
     safe(`versions/${id}`, true);
     return id;
   };
   const state = () => ({ adopted: null, retired: {}, hold: null, probation: null, ...read('state.json') });
-  const record = id => read(`versions/${validId(id)}/.version.json`);
+  const record = id => read(`versions/${validVersionId(id)}/.version.json`);
   safe();
   const c = { fs, root, now, stat, safe, read, linkId, state, record, deps,
     config: validateDaemonVersionsSettings(settings),
@@ -154,13 +162,13 @@ function replaceLink(c, name, id) {
   const temp = join(c.root, `${name}.tmp.${process.pid}`);
   let created = false;
   try {
-    c.fs.symlinkSync(`versions/${validId(id)}`, temp); created = true;
+    c.fs.symlinkSync(`versions/${validVersionId(id)}`, temp); created = true;
     c.fs.renameSync(temp, join(c.root, name));
   } finally { if (created) c.fs.rmSync(temp, { force: true }); }
 }
 function switchInside(c, { id, expectCurrent, rollback = false, reason, by, reject = null, dryRun = false }) {
-  validId(id);
-  if (expectCurrent !== null) validId(expectCurrent);
+  validVersionId(id);
+  if (expectCurrent !== null) validVersionId(expectCurrent);
   // A crashed earlier switch is finished or discarded first: every decision below (current,
   // previous, whether a version is still built) must see the recovered state, not the half-done one.
   // A dry run is read-only so it cannot recover; it says so rather than judging a half-done switch.
@@ -181,7 +189,7 @@ function switchInside(c, { id, expectCurrent, rollback = false, reason, by, reje
   const intent = { id, actual, rollback, since: new Date(c.now()).toISOString(),
     probation: !rollback && c.config.autoRollback, reason: reason ?? 'rollback', by: by ?? 'operator',
     oldPrevious: c.linkId('previous'),
-    reject: reject ? { id: validId(reject), record: { ...c.record(reject), id: reject, status: 'rejected' } } : null };
+    reject: reject ? { id: validVersionId(reject), record: { ...c.record(reject), id: reject, status: 'rejected' } } : null };
   // Intent first: a crash after the pointer rename can then be completed by settle().
   state.pending = intent; c.atomic('state.json', state);
   c.deps.failBeforeRename?.();
@@ -202,7 +210,7 @@ function switchInside(c, { id, expectCurrent, rollback = false, reason, by, reje
 /** Every effect of a switch beyond the pointers; idempotent so a crashed one can be replayed. */
 function commit(c, state, { id, actual, rollback, since, probation, reason, by, reject }, probationSince = since) {
   // Best effort once the pointers have moved: a vanished or corrupt record must not wedge recovery.
-  if (reject && c.stat(c.safe(`versions/${validId(reject.id)}`, true))) {
+  if (reject && c.stat(c.safe(`versions/${validVersionId(reject.id)}`, true))) {
     try { c.atomic(`versions/${reject.id}/.version.json`, reject.record); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
@@ -237,8 +245,8 @@ function settle(c, state) {
 /** Explicit expectation is mandatory, including null for the first adoption. */
 export async function switchCurrent(options) {
   const c = context(options); if (!c) return disabled;
-  validId(options.id);
-  if (options.expectCurrent !== null) validId(options.expectCurrent);
+  validVersionId(options.id);
+  if (options.expectCurrent !== null) validVersionId(options.expectCurrent);
   if (options.dryRun) return switchInside(c, options);
   return locked(c, () => switchInside(c, options));
 }
@@ -256,7 +264,7 @@ export async function reconcile(options) {
   });
 }
 function pinPath(c, { id, pid = process.pid, host = c.host() }) {
-  validId(id); validId(host);
+  validVersionId(id); validId(host);
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('Invalid pin pid');
   return { path: `pins/${host}-${pid}.json`, value: { id, pid, host, since: new Date(c.now()).toISOString() } };
 }
@@ -281,8 +289,8 @@ export async function unpin(options) {
 function versions(c) {
   const path = c.safe('versions', true);
   if (!c.stat(path)) return [];
-  return c.fs.readdirSync(path, { withFileTypes: true }).filter(e => e.isDirectory() && !e.name.startsWith('.')).map(e => {
-    validId(e.name);
+  return c.fs.readdirSync(path, { withFileTypes: true }).filter(e => e.isDirectory() && !hidden(e.name)).map(e => {
+    validVersionId(e.name);
     let record;
     try { record = c.record(e.name); }
     catch (error) { if (!(error instanceof SyntaxError)) throw error; }
@@ -306,7 +314,8 @@ function livePins(c, prune = false) {
     let live = false;
     if (value?.id) {
       validId(value.id);
-      if (Number.isSafeInteger(value.pid) && value.pid > 0 && typeof value.host === 'string') {
+      // A pin naming a reserved (hidden) directory protects nothing: drop it rather than wedge gc and status on it.
+      if (!hidden(value.id) && Number.isSafeInteger(value.pid) && value.pid > 0 && typeof value.host === 'string') {
         const age = c.now() - Date.parse(value.since);
         live = value.host === c.host() ? alive(value.pid) !== false
           : !Number.isFinite(age) || age < c.config.retainMinAgeMs;
@@ -354,12 +363,20 @@ export async function gc(options) {
         c.fs.rmSync(trash, { recursive: true, force: true }); removed.push(id);
       }
     }
+    // A retirement stamp only protects a directory that still exists; drop the rest (also heals a crash
+    // between a deletion and this write) so state.json does not grow by one key per switch.
+    const alive = new Set(entries.map(e => e.id).filter(id => !removed.includes(id)));
+    const stale = Object.keys(state.retired).filter(id => !alive.has(id));
+    if (stale.length) {
+      state.retired = Object.fromEntries(Object.entries(state.retired).filter(([id]) => alive.has(id)));
+      c.atomic('state.json', state);
+    }
     return { removed, kept };
   });
 }
 export async function rollback(options) {
   const c = context(options); if (!c) return disabled;
-  if (options.to != null) validId(options.to);
+  if (options.to != null) validVersionId(options.to);
   return locked(c, () => {
     // The target is read from `previous`, which a crashed switch can have half-updated: recover first.
     if (!options.dryRun) settle(c, c.state());
@@ -381,7 +398,7 @@ export async function checkProbation(options) {
     return { probation: state.probation };
   });
   if (!initial.probation) return initial;
-  const p = initial.probation; validId(p.id); if (p.prev != null) validId(p.prev);
+  const p = initial.probation; validVersionId(p.id); if (p.prev != null) validVersionId(p.prev);
   if (!c.deps.health) throw new Error('Probation requires a health dependency');
   const health = await c.deps.health({ id: p.id, clone: options.clone });
   return locked(c, () => {

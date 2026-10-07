@@ -1,7 +1,7 @@
 /** @file scripts/lib/__tests__/daemon-version-switch.test.mjs — S4 offline switching contracts. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import * as api from '../daemon-version-switch.mjs';
@@ -353,6 +353,18 @@ describe('daemon version switching', () => {
     await call('gc');
     expect(fs.readdirSync(`${root}/versions`).filter(name => name.startsWith('.trash-'))).toEqual([]);
   });
+  it('gc drops the retirement stamp of every version it removes, and of any whose directory is already gone', async () => {
+    version('old', 'built', 900000); version('young', 'built', 900000); version('older', 'built', 900000);
+    writeState({ ...state(), retired: {
+      a: new Date(now - 1).toISOString(), old: new Date(now - 20000).toISOString(),
+      young: new Date(now - 100).toISOString(), ghost: new Date(now - 20000).toISOString() } });
+    const result = await call('gc');
+    expect(result.removed).toEqual(expect.arrayContaining(['old', 'older']));
+    expect(result.kept.map(v => v.id)).toContain('young');
+    expect(Object.keys(state().retired).sort()).toEqual(['a', 'young']);
+    expect((await call('gc')).removed).toEqual([]);
+    expect(Object.keys(state().retired).sort()).toEqual(['a', 'young']);
+  });
   it('GC respects protected versions, cleans stale pins and retains one failed build', async () => {
     link('previous', 'b');
     for (const id of ['live', 'dead', 'young', 'old', 'new1', 'new2']) version(id, 'built', id.startsWith('new') ? -1000 : 200000);
@@ -448,10 +460,34 @@ describe('daemon version switching', () => {
       expect(await call(name, { settings: {}, id: '../bad', deps: { fs: new Proxy({}, { get() { throw new Error('filesystem touched'); } }) } })).toEqual({ status: 'disabled' });
     }
   });
-  it.each(['../bad', 'a/b', 'a..b', '.', '', 'bad\\name'])('rejects unsafe id %j', async id => {
+  it.each(['../bad', 'a/b', 'a..b', '.', '', 'bad\\name', '.building-x', '.trash-old', '.hidden'])('rejects unsafe id %j', async id => {
     await expect(call('switchCurrent', { id, expectCurrent: 'a' })).rejects.toThrow(/Invalid/);
+    await expect(call('switchCurrent', { id: 'b', expectCurrent: id })).rejects.toThrow(/Invalid/);
     await expect(call('pin', { id, host: 'local', pid: 123 })).rejects.toThrow(/Invalid/);
     await expect(call('rollback', { to: id })).rejects.toThrow(/Invalid/);
+  });
+  it.each(['.building-x', '.trash-old'])('refuses rollback, switch and pin to the reserved directory %s even with a valid record and a leftover directory', async name => {
+    version(name, 'built'); // the shape a crashed build or gc leaves behind
+    const before = state();
+    await expect(call('rollback', { to: name })).rejects.toThrow(/Invalid/);
+    await expect(call('switchCurrent', { id: name, expectCurrent: 'a' })).rejects.toThrow(/Invalid/);
+    await expect(call('pin', { id: name, host: 'local', pid: 123 })).rejects.toThrow(/Invalid/);
+    expect(current()).toBe('versions/a'); expect(state()).toEqual(before);
+    expect(fs.existsSync(join(root, 'pins'))).toBe(false);
+  });
+  it('refuses a recorded rejection, probation or pin that names a reserved directory', async () => {
+    version('.trash-old', 'built');
+    writeState({ ...state(), probation: { id: '.trash-old', since: new Date(now).toISOString(), prev: 'a' } });
+    await expect(call('checkProbation')).rejects.toThrow(/Invalid/);
+    writeState({ ...state(), probation: null });
+    fs.mkdirSync(join(root, 'pins'));
+    fs.writeFileSync(join(root, 'pins/local-123.json'), JSON.stringify({ id: '.trash-old', pid: 123, host: 'local', since: new Date(now).toISOString() }));
+    // A stale pin on a reserved directory protects nothing: gc drops it instead of wedging.
+    await expect(call('gc')).resolves.toMatchObject({ removed: expect.any(Array) });
+    expect(fs.existsSync(join(root, 'pins/local-123.json'))).toBe(false);
+    expect(fs.existsSync(join(root, 'versions/.trash-old'))).toBe(false); // gc also finishes the leftover deletion
+    link('current', '.trash-old');
+    await expect(call('status')).rejects.toThrow(/Invalid/);
   });
   it('refuses external directory and metadata symlinks', async () => {
     fs.symlinkSync(fixture, join(root, 'versions/outside'));
@@ -478,5 +514,26 @@ describe('daemon version switching', () => {
     expect(current()).toBe('versions/a');
     expect(cli('switch', '--id=b', '--expect-current=a', '--force').status).toBe('switched');
     expect(cli('status', '--force').adopted).toBe('b');
+  });
+  it('CLI exits nonzero for every outcome that did not do what was asked', () => {
+    const run = (...args) => {
+      const r = spawnSync(process.execPath, [resolve('scripts/lib/daemon-version.mjs'), ...args, `--clone=${clone}`, `--home=${home}`, '--json'], { encoding: 'utf8' });
+      return { code: r.status, out: r.stdout.trim() ? JSON.parse(r.stdout) : null };
+    };
+    expect(run('switch', '--id=b', '--expect-current=a', '--force')).toMatchObject({ code: 0, out: { status: 'switched' } });
+    expect(run('switch', '--id=b', '--expect-current=b', '--force')).toMatchObject({ code: 0, out: { status: 'noop' } });
+    expect(run('status')).toMatchObject({ code: 0, out: { status: 'disabled' } }); // a read that has nothing to read
+    expect(run('switch', '--id=c', '--expect-current=b')).toMatchObject({ code: 2, out: { status: 'disabled' } });
+    expect(run('rollback')).toMatchObject({ code: 2, out: { status: 'disabled' } });
+    expect(run('switch', '--id=c', '--expect-current=a', '--force')).toMatchObject({ code: 2, out: { status: 'aborted' } });
+    version('bad', 'rejected');
+    expect(run('switch', '--id=bad', '--expect-current=b', '--force')).toMatchObject({ code: 2, out: { status: 'refused' } });
+    fs.rmSync(join(root, 'previous'));
+    expect(run('rollback', '--force')).toMatchObject({ code: 2, out: { status: 'no-previous' } });
+    // A live holder, as seen by the CLI's real clock: reopen the top generation and touch it.
+    const top = join(root, lockDirs().at(-1)); fs.rmSync(join(top, 'released')); fs.utimesSync(top, new Date(), new Date());
+    expect(run('switch', '--id=c', '--expect-current=b', '--force')).toMatchObject({ code: 2, out: { status: 'busy' } });
+    expect(run('gc', '--force')).toMatchObject({ code: 2, out: { status: 'busy' } });
+    expect(run('switch', '--id=%%', '--expect-current=b', '--force')).toMatchObject({ code: 1, out: null });
   });
 });
