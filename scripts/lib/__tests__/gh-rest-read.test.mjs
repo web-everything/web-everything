@@ -254,3 +254,7 @@ describe('#4429 REST prevention boundaries', () => {
     expect(seen).toBe(path);
   });
 });
+
+it('suppresses real state with WE_UNDER_TEST alone', () => {
+  expect(ghEtagCacheEnabled({ WE_UNDER_TEST: '1' })).toBe(false);
+});

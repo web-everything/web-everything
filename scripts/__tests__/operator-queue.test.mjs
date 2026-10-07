@@ -1,18 +1,22 @@
 /** @file Operator readiness gates (label gate, label/comment cross-check, transient mergeability) and the read-only CLI report over inline gh fixtures. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { evaluatePr, main, pollMergeable, standDownRow, stuckInspectedRow } from '../operations/operator-queue.mjs';
-import { STAND_DOWN_MARKER, buildStandDownComment } from '../conveyor/stand-down.mjs';
-import { STUCK_DISPATCH_MARKER, buildStuckDispatchComment } from '../conveyor/stuck-pr-dispatch-marker.mjs';
 
 vi.mock('node:child_process', () => {
   const execFileSync = vi.fn();
   return { execFileSync, default: { execFileSync } };
 });
-vi.mock('../lib/gh-throttle.mjs', async (original) => ({
-  ...await original(),
+// Register after Bun has loaded the real copy; Vitest still supplies importOriginal.
+if (process.versions.bun) await import('../lib/gh-throttle.mjs?real');
+const mockModule = vi.mock;
+mockModule('../lib/gh-throttle.mjs', async (original) => ({
+  ...(typeof original === 'function' ? await original() : await import('../lib/gh-throttle.mjs?real')),
   execFileSyncThrottled: (...args) => execFileSync(...args),
 }));
+const { evaluatePr, main, pollMergeable, standDownRow, stuckInspectedRow } = await import('../operations/operator-queue.mjs');
+const { STAND_DOWN_MARKER, buildStandDownComment } = await import('../conveyor/stand-down.mjs');
+const { STUCK_DISPATCH_MARKER, buildStuckDispatchComment } = await import('../conveyor/stuck-pr-dispatch-marker.mjs');
+
 afterEach(() => vi.restoreAllMocks());
 
 /** A path that never exists, so `main` never reads the real `.conveyor/unsupported-repo.json` sidecar. */
@@ -195,11 +199,11 @@ describe('pollMergeable', () => {
 });
 
 describe('main', () => {
-  const list = (...prs) => vi.mocked(execFileSync).mockReset().mockReturnValueOnce(JSON.stringify(prs));
+  const list = (...prs) => execFileSync.mockReset().mockReturnValueOnce(JSON.stringify(prs));
 
   it('filters out PRs without review:human and continues after a repo error', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    vi.mocked(execFileSync).mockReset()
+    execFileSync.mockReset()
       .mockImplementationOnce(() => { throw new Error('unavailable'); })
       .mockReturnValueOnce(JSON.stringify([
         fixture({ number: 1, labels: [] }), fixture(), fixture({ number: 43, labels: [HUMAN] }),
@@ -231,7 +235,7 @@ describe('main', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const sleep = vi.fn();
     list(fixture({ number: 43, mergeable: 'UNKNOWN' }));
-    vi.mocked(execFileSync).mockReturnValueOnce(JSON.stringify({ mergeable: 'UNKNOWN' }))
+    execFileSync.mockReturnValueOnce(JSON.stringify({ mergeable: 'UNKNOWN' }))
       .mockReturnValueOnce(JSON.stringify({ mergeable: 'MERGEABLE' }));
     main(['--repo=o/n', '--json'], { sleep, unsupportedPath: NO_UNSUPPORTED });
     expect(JSON.parse(log.mock.calls[0][0])).toEqual({
@@ -244,7 +248,7 @@ describe('main', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const sleep = vi.fn();
     list(fixture({ number: 43, mergeable: 'UNKNOWN' }));
-    vi.mocked(execFileSync).mockReturnValue(JSON.stringify({ mergeable: 'UNKNOWN' }));
+    execFileSync.mockReturnValue(JSON.stringify({ mergeable: 'UNKNOWN' }));
     main(['--repo=o/n', '--json'], { sleep, unsupportedPath: NO_UNSUPPORTED });
     expect(JSON.parse(log.mock.calls[0][0])).toEqual({
       ready: [], rulingNeeded: [], pending: [{ repo: 'o/n', number: 43, title: 'Ready for review' }], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [], laneDecisions: [], backpressure: [], reconcileNotes: [],
@@ -265,7 +269,7 @@ describe('main', () => {
   it('prints all three sections in the text report, PENDING labelled as transient', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     list(fixture({ number: 43, mergeable: 'UNKNOWN' }));
-    vi.mocked(execFileSync).mockReturnValue(JSON.stringify({ mergeable: 'UNKNOWN' }));
+    execFileSync.mockReturnValue(JSON.stringify({ mergeable: 'UNKNOWN' }));
     main(['--repo=o/n'], { sleep: vi.fn(), unsupportedPath: NO_UNSUPPORTED });
     expect(log.mock.calls.map(([line]) => line)).toEqual([
       'NEEDS YOU (review:human + advisory:accepted, all gates pass):', '(none)',
@@ -281,7 +285,7 @@ describe('main', () => {
 
   it('prints exactly the empty sections and queries all default repos', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    vi.mocked(execFileSync).mockReset().mockReturnValue('[]');
+    execFileSync.mockReset().mockReturnValue('[]');
     main([], { unsupportedPath: NO_UNSUPPORTED });
     expect(log.mock.calls.map(([line]) => line)).toEqual([
       'NEEDS YOU (review:human + advisory:accepted, all gates pass):', '(none)',
@@ -293,7 +297,7 @@ describe('main', () => {
       'STUCK — inspected (epic #3383 dispatched a diagnosis-only agent; read its comment):', '(none)',
       'LANE RECLAIM — needs your decision (#3383, see `node scripts/lane-whois.mjs`):', '(none)',
     ]);
-    expect(vi.mocked(execFileSync).mock.calls.map(([, args]) => args[3])).toEqual([
+    expect(execFileSync.mock.calls.map(([, args]) => args[3])).toEqual([
       'web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app',
     ]);
   });
@@ -339,7 +343,7 @@ describe('standDownRow', () => {
 });
 
 describe('main — STOOD DOWN section', () => {
-  const list = (...prs) => vi.mocked(execFileSync).mockReset().mockReturnValueOnce(JSON.stringify(prs));
+  const list = (...prs) => execFileSync.mockReset().mockReturnValueOnce(JSON.stringify(prs));
 
   it('lists an open PR with a leading-line stand-down comment regardless of labels, with its reason', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -432,7 +436,7 @@ describe('stuckInspectedRow', () => {
 });
 
 describe('main — STUCK section', () => {
-  const list = (...prs) => vi.mocked(execFileSync).mockReset().mockReturnValueOnce(JSON.stringify(prs));
+  const list = (...prs) => execFileSync.mockReset().mockReturnValueOnce(JSON.stringify(prs));
 
   it('lists an open PR carrying a stuck-watch dispatch marker, with its episode count', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});

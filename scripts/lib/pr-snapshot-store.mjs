@@ -15,6 +15,7 @@
  * Layout: `<dir>/<owner>__<name>.json` = `{ v, repo, fetchedAtMs, fields:[...], limit, count, prs:[...] }`, and a
  * sibling `<owner>__<name>.dirty` (or `_all.dirty`) whose mtime marks "a write landed after this snapshot".
  */
+import { isUnderTest } from './under-test.mjs';
 import { existsSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -34,7 +35,7 @@ const ALL_DIRTY = '_all';
 export function prSnapshotEnabled(env = process.env) {
   if (String(env[PR_SNAPSHOT_DISABLE_ENV] ?? '').trim() === '0') return false;
   if (String(env[PR_SNAPSHOT_DIR_ENV] ?? '').trim()) return true;
-  if (env.VITEST || env.FAKE_GH_FIXTURE) return false;
+  if (isUnderTest(env) || env.FAKE_GH_FIXTURE) return false;
   return true;
 }
 

@@ -31,6 +31,7 @@
  *   node scripts/backlog.mjs build-queue add|remove <NNN>            # MANUAL CLEAR-FOR-BUILD gate (#2530): `add` sets buildQueued:true (the supervised builder may pull it); `remove` clears it. Frontmatter-only, lane-gated; never touches blockedBy/readiness. The builder pulls ONLY cleared items, so re-prioritizing never arms a build
  *   add --json to any verb for machine-readable output.
  */
+import { isUnderTest } from './lib/under-test.mjs';
 import { readdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, dirname, sep } from 'node:path';
@@ -1075,7 +1076,7 @@ function overlapYieldConfig() {
 function buildQueue() {
   const cacheEnabled = JSON_MODE && !argv.some(arg => arg.startsWith('--config=') || arg.startsWith('--backlog-dir=')) &&
     process.env.WE_BUILD_QUEUE_CACHE !== '0' &&
-    !(process.env.VITEST && process.env.WE_BUILD_QUEUE_CACHE === undefined);
+    !(isUnderTest() && process.env.WE_BUILD_QUEUE_CACHE === undefined);
   const at = Date.now();
   const key = cacheEnabled ? buildQueueCacheKey({ backlogDir: DIR, configPath: BUILD_QUEUE_CONFIG_PATH,
     next: argv.includes('--next') }) : null;

@@ -84,3 +84,7 @@ describe('#3383 integration — lane-pool.mjs itself refuses the real root under
     }
   });
 });
+
+it('suppresses real state with WE_UNDER_TEST alone', () => {
+  expect(() => guardedPoolRoot('/some/checkout', { WE_UNDER_TEST: '1' })).toThrow(/refusing to resolve the REAL lane-pool root/);
+});

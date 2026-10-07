@@ -20,6 +20,7 @@
  *
  * Follow-up (not here): webhook-driven invalidation of the cache.
  */
+import { isUnderTest } from './under-test.mjs';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -36,7 +37,7 @@ const CACHE_VERSION = 1;
 export function ghEtagCacheEnabled(env = process.env) {
   if (String(env[GH_ETAG_DISABLE_ENV] ?? '').trim() === '0') return false;
   if (String(env[GH_ETAG_DIR_ENV] ?? '').trim()) return true;
-  if (env.VITEST || env.FAKE_GH_FIXTURE) return false;
+  if (isUnderTest(env) || env.FAKE_GH_FIXTURE) return false;
   return true;
 }
 
@@ -90,7 +91,7 @@ function readCache(file) {
 
 function logNotModified(env, entry) {
   // Never append to the REAL host call log from a test run (only an explicitly isolated lock root).
-  if ((env.VITEST || env.FAKE_GH_FIXTURE) && !env.WE_GH_THROTTLE_LOCK_ROOT && !env.LANE_POOL_ROOT) return;
+  if ((isUnderTest(env) || env.FAKE_GH_FIXTURE) && !env.WE_GH_THROTTLE_LOCK_ROOT && !env.LANE_POOL_ROOT) return;
   try { recordGhCallLogEntry(ghThrottleLogPath(ghThrottleLockRoot(undefined, env)), { ...entry, outcome: 'not_modified', resource: 'core' }); } catch { /* best-effort */ }
 }
 

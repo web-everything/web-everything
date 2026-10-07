@@ -51,6 +51,7 @@
  * file once several exist there together.
  */
 
+import { isUnderTest } from '../../scripts/lib/under-test.mjs';
 import { hostname } from 'node:os';
 import { dirname, resolve, join } from 'node:path';
 import { existsSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
@@ -76,7 +77,7 @@ export const VERIFY_DAEMON_LEASE_KEY = '<conveyor:verify-daemon-lease>';
 export const VERIFY_DAEMON_DRAIN_FILE = process.env.WE_VERIFY_DAEMON_DRAIN_FILE || join(RUNNER_LOCK_ROOT, 'verify-daemon.drain');
 
 /** The real drain probe. Under vitest it is off, so a live marker on the host can never change a unit test's dispatch. */
-function defaultIsDraining() { return !process.env.VITEST && existsSync(VERIFY_DAEMON_DRAIN_FILE); }
+function defaultIsDraining() { return !isUnderTest() && existsSync(VERIFY_DAEMON_DRAIN_FILE); }
 
 /** Matches runner.mjs's own tick cadence (DEFAULT_TICK_INTERVAL_MS) and every sibling daemon in this epic —
  *  standing alone, there is no reason to run this pass faster or slower. */

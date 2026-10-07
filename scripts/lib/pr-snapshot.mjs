@@ -23,6 +23,7 @@
  * {@link MIN_LIMIT}), re-fetching larger only when the page came back full — so a repo with 14 open PRs costs 1
  * point per refresh instead of 2-5, and an empty repo 1 instead of 2-5.
  */
+import { isUnderTest } from './under-test.mjs';
 import { isGhDeferred } from './gh-deferred.mjs';
 import { mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
@@ -109,7 +110,7 @@ export function fetchSnapshot({ repo, prevCount, exec = execFileSyncThrottled, n
 
 function logHit(env, caller, repo) {
   // Never append to the REAL host call log from a test run (only an explicitly isolated lock root).
-  if ((env.VITEST || env.FAKE_GH_FIXTURE) && !env.WE_GH_THROTTLE_LOCK_ROOT && !env.LANE_POOL_ROOT) return;
+  if ((isUnderTest(env) || env.FAKE_GH_FIXTURE) && !env.WE_GH_THROTTLE_LOCK_ROOT && !env.LANE_POOL_ROOT) return;
   try { recordGhCallLogEntry(ghThrottleLogPath(ghThrottleLockRoot(undefined, env)), { op: 'pr list (snapshot)', outcome: 'snapshot_hit', repo, caller }); } catch { /* best-effort */ }
 }
 

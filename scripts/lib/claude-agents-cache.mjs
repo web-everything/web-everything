@@ -1,3 +1,4 @@
+import { isUnderTest } from './under-test.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -5,7 +6,7 @@ import { createHash } from 'node:crypto';
 
 export function claudeAgentsCacheTtlMs(env = process.env) {
   const value = env.WE_CLAUDE_AGENTS_CACHE_TTL_MS;
-  if (value === undefined) return env.VITEST ? 0 : 20_000;
+  if (value === undefined) return isUnderTest(env) ? 0 : 20_000;
   const ttl = Number(value);
   return Number.isFinite(ttl) && ttl > 0 ? ttl : 0;
 }

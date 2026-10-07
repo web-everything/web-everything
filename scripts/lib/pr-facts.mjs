@@ -39,6 +39,7 @@
  *
  * CLI: node scripts/lib/pr-facts.mjs <owner/repo> <number>   → prints `{ source, reason, facts }`
  */
+import { isUnderTest } from './under-test.mjs';
 import { closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -83,7 +84,7 @@ export function resolvePrFactsConfig(env = process.env, { readFile = readFileSyn
   const ev = resolvePrEventsConfig({ ...env, [PR_EVENTS_FLAG_ENV]: '1' }, { readFile });
   const off = String(env[PR_FACTS_DISABLE_ENV] ?? '').trim() === '0';
   // A test run never reaches a real Worker unless it opts in explicitly.
-  const testOff = !!(env.VITEST || env.FAKE_GH_FIXTURE) && String(env[PR_FACTS_DISABLE_ENV] ?? '').trim() !== '1';
+  const testOff = !!(isUnderTest(env) || env.FAKE_GH_FIXTURE) && String(env[PR_FACTS_DISABLE_ENV] ?? '').trim() !== '1';
   return {
     enabled: !off && !testOff && ev.enabled, url: ev.url, token: ev.token, dir: prFactsDir(env),
     disabledReason: off ? `${PR_FACTS_DISABLE_ENV}=0` : testOff ? 'test run' : ev.enabled ? null : `not configured (missing ${ev.missing.join(', ') || ev.tokenError})`,
@@ -294,7 +295,7 @@ export async function refreshMirror(prev, { repo, url, token, fetchImpl = global
 
 function logFactsHit(env, caller, repo, n) {
   // Never append to the REAL host call log from a test run (only an explicitly isolated lock root).
-  if ((env.VITEST || env.FAKE_GH_FIXTURE) && !env.WE_GH_THROTTLE_LOCK_ROOT && !env.LANE_POOL_ROOT) return;
+  if ((isUnderTest(env) || env.FAKE_GH_FIXTURE) && !env.WE_GH_THROTTLE_LOCK_ROOT && !env.LANE_POOL_ROOT) return;
   try { recordGhCallLogEntry(ghThrottleLogPath(ghThrottleLockRoot(undefined, env)), { op: 'pr facts', outcome: 'facts_hit', repo, caller, n }); } catch { /* best-effort */ }
 }
 

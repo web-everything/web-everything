@@ -96,6 +96,7 @@
  * Reads NEVER throw: a blank, unparseable or schema-invalid line is skipped, mirroring `parseJuryLog`.
  */
 
+import { isUnderTest } from './under-test.mjs';
 import { appendFileSync, readFileSync, mkdirSync, readdirSync, existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -824,7 +825,7 @@ export function defaultVerdictLedgerDir(home = homedir()) {
 export function verdictLedgerDir() {
   const env = process.env.WE_VERDICT_LEDGER_DIR;
   if (env && env.trim()) return env;
-  if (process.env.VITEST) return join(tmpdir(), 'we-verdict-ledger-vitest');
+  if (isUnderTest()) return join(tmpdir(), 'we-verdict-ledger-vitest');
   return defaultVerdictLedgerDir();
 }
 

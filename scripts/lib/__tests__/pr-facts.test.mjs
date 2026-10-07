@@ -286,3 +286,7 @@ describe('contract: store answer = GitHub answer', () => {
     expect(store).toMatchObject({ state: 'closed', merged: true });
   });
 });
+
+it('suppresses real state with WE_UNDER_TEST alone', () => {
+  expect(resolvePrFactsConfig({ WE_UNDER_TEST: '1' })).toMatchObject({ enabled: false, disabledReason: 'test run' });
+});
