@@ -6,7 +6,7 @@
  *
  * SETTINGS live in `we:scripts/dispatch-settings.json` (declared), each overridable by an env var (a launchd
  *   plist `EnvironmentVariables` entry):
- *   - heavyAdmissionCap          (env WE_HEAVY_ADMISSION_CAP)            default 2 — heavy-command slots. The
+ *   - heavyAdmissionCap          (env WE_HEAVY_ADMISSION_CAP)            default 3 — heavy-command slots. The
  *     per-daemon plist override lives in ~/Library/LaunchAgents/com.we.<daemon>.plist (templates:
  *     we:skills-src/conveyor/launchd/*.plist.example); remove it to follow this file.
  *   - fixDispatchMaxConcurrent   (env WE_FIX_DISPATCH_MAX_CONCURRENT)    default 2 — live fix-* + ci-heal-* sessions.
@@ -27,7 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { sampleHost } from './host-sample.mjs';
 
 export const CPU_IDLE_MIN_BUILT_IN = Object.freeze({ fix: 8, 'ci-heal': 8, build: 15, prepare: 20, review: 10 });
-export const DISPATCH_SETTINGS_BUILT_IN = Object.freeze({ heavyAdmissionCap: 2, fixDispatchMaxConcurrent: 2, maxLoadPerCore: 2.0, memFreeMinPct: 15 });
+export const DISPATCH_SETTINGS_BUILT_IN = Object.freeze({ heavyAdmissionCap: 3, fixDispatchMaxConcurrent: 2, maxLoadPerCore: 2.0, memFreeMinPct: 15 });
 export const DISPATCH_SETTINGS_ENV = Object.freeze({
   heavyAdmissionCap: 'WE_HEAVY_ADMISSION_CAP',
   fixDispatchMaxConcurrent: 'WE_FIX_DISPATCH_MAX_CONCURRENT',
