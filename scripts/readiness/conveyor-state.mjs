@@ -835,7 +835,13 @@ async function main(argv) {
     const scopeArgs = ['--json', '--no-track-attempts'];
     if (typeof flags.repo === 'string') scopeArgs.push(`--repo=${flags.repo}`);
     if (typeof flags.name === 'string') scopeArgs.push(`--name=${flags.name}`);
-    scopeRead = readWithErrors('scope-lease-collect', (own) => runJson('node', [SCOPE_COLLECT_CLI, ...scopeArgs], { errors: own, label: 'scope-lease-collect' }));
+    // scope-lease-collect makes the IDENTICAL `lane-pool status --leased-only` read through the same planning
+    // snapshot, so it must start only AFTER the read above has settled: started alongside it, both miss the (still
+    // empty) snapshot and the slow per-lane pool walk runs twice per round. It still overlaps build-queue / gh.
+    scopeRead = readWithErrors('scope-lease-collect', async (own) => {
+      await poolRead.promise.catch(() => {});
+      return runJson('node', [SCOPE_COLLECT_CLI, ...scopeArgs], { errors: own, label: 'scope-lease-collect' });
+    });
   }
   const prRead = readWithErrors('gh pr list', async (own) => {
     try {
