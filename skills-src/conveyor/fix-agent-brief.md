@@ -121,7 +121,7 @@ The work is intact on the `{{LANE_REF}}` ref (the pushed PR head). Acquire a fre
 ```bash
 export LANE_SESSION={{SESSION_SLUG}}
 LANE=$(node "{{WE_ROOT}}/scripts/lane-pool.mjs" acquire --repo={{LANE_REPO}} --lane={{LANE}} --purpose=conveyor-fix \
-  --session={{SESSION_SLUG}} --scope={{SCOPE}} --base={{LANE_REF}}) && cd "$LANE"
+  --session={{SESSION_SLUG}} --scope='{{SCOPE}}' --base={{LANE_REF}}) && cd "$LANE"
 ```
 
 - `--base={{LANE_REF}}` lands the clone on the pushed lane tip (via `checkout -B main <ref>`), so you **reuse

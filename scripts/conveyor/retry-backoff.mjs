@@ -48,6 +48,16 @@ export const BACKOFF_REASON_CODES = Object.freeze(RULES.map(([code]) => code));
  */
 export const CLONE_WIDE_REASON_CODES = Object.freeze(['checkout-behind-origin']);
 export const isCloneWideReasonCode = (code) => CLONE_WIDE_REASON_CODES.includes(code);
+/**
+ * A CARD-LEVEL permanent refusal: a `dispatch-lane` step refused because of what the CARD says (a scope value the
+ * brief cannot carry, an unfillable placeholder, no scope, no backlog file, a bad delivery target). Re-running it
+ * refuses identically, so it is never retried on a cooldown: the card is held and surfaced to the operator.
+ * Matches the daemon's own `step-refused at \`<step>\`: <error>` account (`readDispatchOutcome`); a refusal
+ * about the CLONE or the tick (stale checkout, unreadable tick) deliberately does not match.
+ */
+export const CARD_REFUSAL_CODE = 'card-refused';
+const CARD_REFUSAL_RE = /^step-refused at `[^`]+`: dispatch-lane(?:: (?:no value for the brief placeholder|the value for \{\{|the brief carries a MISSPELLED)|\.read: (?:#|no backlog file resolved))/;
+export const isCardRefusal = (text) => CARD_REFUSAL_RE.test(String(text ?? ''));
 export function reasonCodeOf(text) {
   const s = String(text ?? '');
   for (const [code, re] of RULES) if (re.test(s)) return code;
@@ -59,5 +69,6 @@ export function reasonCodeOf(text) {
 export function evidenceReasonCode(evidence) {
   // `reason` is the daemon's own account of the failure; `error` is raw agent/child output that may merely QUOTE a
   // known failure's text. `error` is only consulted when there is no `reason` at all.
-  return reasonCodeOf(evidence?.reason ?? evidence?.error);
+  const text = evidence?.reason ?? evidence?.error;
+  return reasonCodeOf(text) ?? (isCardRefusal(text) ? CARD_REFUSAL_CODE : null);
 }

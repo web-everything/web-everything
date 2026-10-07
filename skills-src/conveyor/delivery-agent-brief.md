@@ -49,7 +49,7 @@ claim and the resolve ride the PR — step 8), open a PR (`ready-to-merge`, or p
 ```bash
 export LANE_SESSION={{SESSION_SLUG}}
 LANE=$(node "{{WE_ROOT}}/scripts/lane-pool.mjs" acquire --lane={{LANE}} --purpose=conveyor-delivery \
-  --session={{SESSION_SLUG}} --scope={{SCOPE}} --item={{ITEM_NUM}} --base={{DELIVERY_BASE}} --adopt) && cd "$LANE"
+  --session={{SESSION_SLUG}} --scope='{{SCOPE}}' --item={{ITEM_NUM}} --base={{DELIVERY_BASE}} --adopt) && cd "$LANE"
 ```
 
 - `--adopt` stamps YOU (the process running this acquire) as the lane's declared occupant
@@ -61,7 +61,7 @@ LANE=$(node "{{WE_ROOT}}/scripts/lane-pool.mjs" acquire --lane={{LANE}} --purpos
 
 - `--lane={{LANE}}` takes the exact lane the dispatch plan assigned (it was in the free-lane set at plan time).
   If that lane lost its race to a sibling, `acquire` fails loud — report it and exit; the conveyor re-plans.
-- `--scope={{SCOPE}}` declares this lane's predicted file-scope into the lease marker. It is **advisory** — it
+- `--scope='{{SCOPE}}'` declares this lane's predicted file-scope into the lease marker. It is **advisory** — it
   NEVER gates the acquire (the whole-clone lease is the real lock), but the scope-lease collector reads it so
   the dispatch plan won't launch an overlapping sibling. All work happens in `$LANE`, never the primary.
 - `--base={{DELIVERY_BASE}}` (#3637) forks the lane from the branch this item delivers to. It is `main` for

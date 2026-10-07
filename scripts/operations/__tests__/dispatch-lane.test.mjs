@@ -442,6 +442,23 @@ describe('the lane comes from the tick core or nowhere', () => {
     expect(() => runTo(tickRead({ launch: { num: '3037', lane: null } }))).toThrow(/assigned it no lane/);
   });
 
+  it('dispatches a card whose scope names a test glob (#4701) — `*` is carried, the brief quotes it', () => {
+    const read = tickRead();
+    const globScope = ['we:scripts/lib/daemon-rebuild/prepare.mjs', 'we:scripts/lib/daemon-rebuild/__tests__/prepare*.test.mjs'];
+    const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope: globScope } }, { num: '3037' });
+    expect(shaped.dispatching).toBe(true);
+    expect(shaped.scope).toEqual(globScope);
+    expect(shaped.prompt).toContain('prepare*.test.mjs');
+  });
+
+  it('every brief that hands {{SCOPE}} to a shell single-quotes it, so a glob never expands', () => {
+    for (const f of ['delivery-agent-brief', 'fix-agent-brief', 'fix-agent-ci-brief', 'investigation-agent-brief']) {
+      const text = readFileSync(resolvePath(dirname(fileURLToPath(import.meta.url)), '../../../skills-src/conveyor', `${f}.md`), 'utf8');
+      expect(text, f).toContain("--scope='{{SCOPE}}'");
+      expect(text, f).not.toMatch(/--scope=\{\{SCOPE\}\}/);
+    }
+  });
+
   it('refuses an unscoped item — an empty scope declares a lane that owns no paths', () => {
     const read = tickRead();
     expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: [] } }, { num: '3037' }))
@@ -483,7 +500,7 @@ describe('filling the delivery brief', () => {
     const { prompt, unknownTokens } = fillBrief(readFileSync(briefPath(), 'utf8'), VALUES);
     expect(prompt).toContain('--lane=8');
     expect(prompt).toContain('--session=conveyor-3037');
-    expect(prompt).toContain('--scope=we:a,we:b');
+    expect(prompt).toContain("--scope='we:a,we:b'");
     expect(prompt).toContain('backlog/3037-x.md');
     // Not one of the five remains, and neither does #3110's `{{ATTEMPT_TAG}}` — it is a REQUIRED-BUT-OPTIONAL
     // name for a `build` fill (`BRIEF_REQUIRED_BY_KIND.build`), so with no value supplied it substitutes as

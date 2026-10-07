@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { backoffDelayMs, backoffVerdict, readBackoffSettings, reasonCodeOf, evidenceReasonCode } from '../retry-backoff.mjs';
+import { backoffDelayMs, backoffVerdict, readBackoffSettings, reasonCodeOf, evidenceReasonCode, isCardRefusal } from '../retry-backoff.mjs';
 import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, rearmFalseHolds, completePrepareFailures, classifyPrepareFailure } from '../prepare-failure-policy.mjs';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures } from '../build-dispatch-failures.mjs';
 import { runBuildDispatchTick, releaseOwnPrepareHolds } from '../../../skills-src/conveyor/build-dispatch-daemon.mjs';
@@ -10,6 +10,25 @@ import { listBuildDispatchClaims, acquireBuildDispatchClaim, releaseBuildDispatc
 
 const S = { baseMs: 1000, maxMs: 5000, maxAttempts: 3 };
 const NOT_CONFIRMED = 'dispatch launch not confirmed (missing effect; no running session)';
+
+describe('card-level refusal (#4701)', () => {
+  const CARD = 'step-refused at `read`: dispatch-lane: the value for {{SCOPE}} ("we:a/prepare*.test.mjs") has characters the brief cannot carry safely';
+  it('classifies a refusal about what the card says, not the clone or the tick', () => {
+    expect(evidenceReasonCode({ reason: CARD })).toBe('card-refused');
+    expect(isCardRefusal('step-refused at `read`: dispatch-lane.read: #4701 has no `scope:`')).toBe(true);
+    expect(isCardRefusal('step-refused at `read`: dispatch-lane-io: could not read the conveyor tick — boom')).toBe(false);
+    expect(evidenceReasonCode({ reason: 'step-refused at `read`: dispatching checkout is 4 commit(s) behind' })).toBe('checkout-behind-origin');
+  });
+  it('is withheld at once (exhausted, no cooldown) and charged to the card', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cardref-'));
+    const path = join(dir, 'f.json');
+    try {
+      const rec = recordBuildFailure({ num: '4701', reason: CARD }, { path, now: 0, settings: S });
+      expect(rec).toMatchObject({ reasonCode: 'card-refused', attempts: 1, exhausted: true, retryAfter: null });
+      expect(listBuildBackoffs({ path, now: 1 }).map(b => b.num)).toEqual(['4701']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
 
 describe('backoff schedule', () => {
   it('doubles from base, caps at max, exhausts at maxAttempts', () => {
@@ -121,6 +140,37 @@ describe('build dispatch failures back off and keep their output (item 96)', () 
       clock = 1000;
       await runBuildDispatchTick({ live: true, effects: effects(dispatch) });
       expect(dispatch).toHaveBeenCalledTimes(2);
+    } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+  });
+
+  it('a card-level refusal names the step, holds the card, lists it under needsYou, and is never retried', async () => {
+    const lockRoot = mkdtempSync(join(tmpdir(), 'bdd-cr-'));
+    let clock = 0;
+    const placePrepareHold = vi.fn();
+    const scope = ['we:scripts/a/prepare*.test.mjs'];
+    const effects = (dispatch) => ({
+      planTick: () => ({ decisions: { statusLine: 't', counts: { building: 0 }, spawnBuilds: [{ num: '4701', lane: 1 }],
+        admission: { queue: [{ num: '4701', scope }], cleared: [{ num: '4701', ready: true }] } }, nextState: { tick: 1, buildGuards: [], launchedNums: [] } }),
+      fetchOpenPrs: () => [{ repo: 'we', prs: [] }],
+      listClaims: () => listBuildDispatchClaims({ lockRoot }),
+      releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num, lockRoot }),
+      acquireClaim: ({ num, scope: sc }) => acquireBuildDispatchClaim({ num, scope: sc, owner: 'h:1', pid: process.pid, lockRoot }),
+      listRunStoreInFlight: () => [], listSettledBuilds: () => [], killSwitch: () => ({ engaged: false }),
+      dispatch, placePrepareHold,
+      recordBuildFailure: (o) => recordBuildFailure(o, { path, now: clock, settings: S }),
+      clearBuildFailure: ({ num }) => clearBuildFailure(num, { path }),
+      listBuildBackoffs: () => listBuildBackoffs({ path, now: clock }),
+    });
+    try {
+      const reason = 'step-refused at `read`: dispatch-lane: the value for {{SCOPE}} ("we:a/prepare*.test.mjs") has characters the brief cannot carry safely';
+      const dispatch = vi.fn(() => ({ dispatching: false, reason, stepRefused: { step: 'read', error: reason } }));
+      const a = await runBuildDispatchTick({ live: true, effects: effects(dispatch) });
+      expect(a.failures[0]).toMatchObject({ num: '4701', step: 'read', reasonCode: 'card-refused', retryAfter: null });
+      expect(a.needsYou).toEqual([{ num: '4701', step: 'read', reason }]);
+      expect(placePrepareHold).toHaveBeenCalledWith({ num: '4701', reason: `card-refused: ${reason}` });
+      clock = 10 * 60 * 60_000; // far past any cooldown
+      await runBuildDispatchTick({ live: true, effects: effects(dispatch) });
+      expect(dispatch).toHaveBeenCalledTimes(1);
     } finally { rmSync(lockRoot, { recursive: true, force: true }); }
   });
 });

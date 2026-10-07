@@ -717,6 +717,9 @@ describe('driveRun parks on a dispatch instead of spinning', () => {
     expect(outcomePayload(outcome).inFlight).toEqual([KEY]);
     // Stable shape: the field is present even when nothing is in flight.
     expect(outcomePayload({ run, stopped: 'complete' }).inFlight).toEqual([]);
+    // a step-refused stop names the refusing step; every other stop leaves the key out
+    expect(outcomePayload({ run, stopped: 'step-refused', step: 'read', error: new Error('x') })).toMatchObject({ step: 'read', error: 'x' });
+    expect(outcomePayload({ run, stopped: 'complete', step: 'read' })).not.toHaveProperty('step');
   });
 
   // Re-driving reports the same park and does not start the work a second time.

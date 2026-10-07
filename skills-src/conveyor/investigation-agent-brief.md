@@ -53,12 +53,12 @@ reason**) — then **EXIT WITHOUT MERGING**. You never build a fix yourself and 
 ```bash
 export LANE_SESSION={{SESSION_SLUG}}
 LANE=$(node "{{WE_ROOT}}/scripts/lane-pool.mjs" acquire --lane={{LANE}} --purpose=conveyor-investigate \
-  --session={{SESSION_SLUG}} --scope={{SCOPE}} --item={{ITEM_NUM}} --adopt) && cd "$LANE"
+  --session={{SESSION_SLUG}} --scope='{{SCOPE}}' --item={{ITEM_NUM}} --adopt) && cd "$LANE"
 ```
 
 - `--lane={{LANE}}` takes the exact lane the tick assigned. If it lost its race to a sibling, `acquire` fails
   loud — report it and exit; the conveyor re-plans.
-- `--scope={{SCOPE}}` declares the lane's a-priori-known file: your own resolve + report. If you end up filing
+- `--scope='{{SCOPE}}'` declares the lane's a-priori-known file: your own resolve + report. If you end up filing
   child items too, those are ADDITIONAL files in the SAME commit/PR — the lease is advisory (never gates the
   acquire), so this never blocks you; it only tells a sibling dispatch this lane is not free for that path.
 - `--item={{ITEM_NUM}}` records this lane→item into the primary checkout's lane-ports registry, same as a build

@@ -8,7 +8,7 @@
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { readBackoffSettings, backoffVerdict, evidenceReasonCode, isCloneWideReasonCode } from './retry-backoff.mjs';
+import { readBackoffSettings, backoffVerdict, evidenceReasonCode, isCloneWideReasonCode, CARD_REFUSAL_CODE } from './retry-backoff.mjs';
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 
 export const buildFailurePath = () => join(resolveCoordinationRoot(), 'build-dispatch-failures.json');
@@ -50,7 +50,8 @@ export function recordBuildFailure({ num, reason, output }, { path = buildFailur
     reason: redactSpawnText(reason ?? '').slice(0, 400),
     output: text.slice(0, OUTPUT_CAP),
     recordedAt: new Date(now).toISOString(),
-    ...backoffVerdict({ attempts, now, settings }),
+    // A card-level refusal is permanent: it is withheld at once (exhausted), not re-tried on a cooldown.
+    ...(reasonCode === CARD_REFUSAL_CODE ? { retryAfter: null, exhausted: true } : backoffVerdict({ attempts, now, settings })),
   };
   state.items[key] = record;
   save(state, path);
