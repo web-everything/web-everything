@@ -207,18 +207,25 @@ export function main(argv = process.argv.slice(2), {
   }));
   const cwd = flags.cwd ?? '.';
   const git = (gitArgs) => String(exec('git', ['-C', cwd, ...gitArgs], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
-  const storeKey = () => awaitVerifyStoreKey({ sessionId: flags['session-id'] ?? env.CLAUDE_CODE_SESSION_ID ?? null, who: flags.who ?? null });
+  // The runtime's own session id wins over a typed `--session-id`: a session may only ever address its own record.
+  const callerSessionId = () => env.CLAUDE_CODE_SESSION_ID || flags['session-id'] || null;
+  const storeKey = () => awaitVerifyStoreKey({ sessionId: callerSessionId(), who: flags.who ?? null });
+  const callerLane = () => { try { return resolve(git(['rev-parse', '--show-toplevel']).trim()); } catch { return null; } };
+  // A store record already bound to a lane belongs to the session working in THAT lane; no other lane may replace or clear it.
+  const foreignRecord = (key, lane) => { const existing = key ? readStore(key) : null; return Boolean(existing?.lane) && existing.lane !== lane; };
   try {
     if (command === 'show') { out(JSON.stringify(read(cwd) ?? readStore(storeKey()))); return 0; }
     if (command === 'clear') {
+      const key = storeKey();
+      if (foreignRecord(key, callerLane())) { err(`refusing to clear ${key}: its record belongs to another lane`); return 2; }
       const lane = clear(cwd);
-      const store = clearStore(storeKey());
+      const store = clearStore(key);
       out(JSON.stringify({ cleared: lane.cleared || store.cleared }));
       return 0;
     }
     if (command !== 'mark') { err('expected mark, show or clear'); return 2; }
     const record = {
-      v: 1, sessionId: flags['session-id'] ?? env.CLAUDE_CODE_SESSION_ID ?? null,
+      v: 1, sessionId: callerSessionId(),
       who: flags.who, repo: flags.repo, pr: Number(flags.pr),
       sha: flags.sha ?? git(['rev-parse', 'HEAD']).trim(),
       requestedAt: new Date(now()).toISOString(), attempt: Number(flags.attempt ?? 1),
@@ -230,6 +237,8 @@ export function main(argv = process.argv.slice(2), {
     // The harness-owned fields (slice 2/3). Optional so a slice-1 style mark (no --ref) still records the wait;
     // the verdict pass refuses to push for a record without a valid ref and resumes the session instead.
     if (flags.ref !== undefined) {
+      // A harness record must bind to ONE session id: an id-less record is found by `who` name, which a same-named session could adopt.
+      if (!nonEmpty(record.sessionId)) { err('malformed: --ref needs a session id (CLAUDE_CODE_SESSION_ID or --session-id)'); return 2; }
       if (!AWAIT_VERIFY_REF_RE.test(String(flags.ref)) || String(flags.ref).includes('..')) { err('malformed --ref (must be lane/*)'); return 2; }
       const kind = flags.kind ?? 'fix';
       if (!AWAIT_VERIFY_KINDS.includes(kind)) { err(`malformed --kind (one of ${AWAIT_VERIFY_KINDS.join(', ')})`); return 2; }
@@ -240,6 +249,9 @@ export function main(argv = process.argv.slice(2), {
       const head = git(['rev-parse', 'HEAD']).trim();
       if (head.toLowerCase() !== record.sha.toLowerCase()) { err(`--sha ${record.sha} is not HEAD (${head})`); return 2; }
       Object.assign(record, { lane: resolve(git(['rev-parse', '--show-toplevel']).trim()), ref: String(flags.ref), kind });
+    }
+    if (record.lane && foreignRecord(awaitVerifyStoreKey(record), record.lane)) {
+      err(`refusing to overwrite the await record for ${awaitVerifyStoreKey(record)}: it belongs to another lane`); return 2;
     }
     const result = write({ cwd, record });
     if (!result.ok) { err(result.reason); return 2; }

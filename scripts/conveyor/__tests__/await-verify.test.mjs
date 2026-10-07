@@ -8,7 +8,7 @@ import {
   AWAIT_VERIFY_FILE, DEFAULT_AWAIT_VERIFY_TTL_MS, AWAIT_VERIFY_FUTURE_SKEW_MS,
   resolveAwaitVerifyTtlMs, resolveAwaitVerifyPath, readAwaitVerifyRecord, classifyAwaitVerify,
   makeAwaitingVerifyResolver, writeAwaitVerifyRecord, clearAwaitVerifyRecord,
-  AWAIT_VERIFY_STORE_ENV, listStoredAwaitVerify, readStoredAwaitVerify,
+  AWAIT_VERIFY_STORE_ENV, listStoredAwaitVerify, readStoredAwaitVerify, writeStoredAwaitVerify,
 } from '../await-verify.mjs';
 import { DEFAULT_ADMISSION_CEILING_MS } from '../../readiness/heavy-admission.mjs';
 
@@ -184,5 +184,35 @@ describe('#5137 slices 2+3 — the shared store a dispatched session is found by
     for (const ref of ['main', 'refs/heads/main', 'lane/../main']) expect(fails([...MARK.filter((a) => !a.startsWith('--ref')), `--ref=${ref}`])?.status).toBe(2);
     expect(String(fails([...MARK.filter((a) => !a.startsWith('--kind')), '--kind=build'])?.stderr)).toMatch(/--kind/);
     expect(listStoredAwaitVerify({ dir: store })).toEqual([]);
+  });
+
+  it('a session cannot address another session\'s record: the runtime id wins over --session-id, and a foreign lane is refused', () => {
+    gitRepo();
+    const other = mkdtempSync(join(tmpdir(), 'other-lane-'));
+    const store = join(other, '.store'); // outside the repo under test, so mark's clean-tree check stays satisfied
+    try {
+      // A's record, bound to a different lane, stored under A's session id.
+      const victim = { v: 1, sessionId: 'S-victim', who: 'fix-1', repo: 'web-everything/web-everything', pr: 1, sha: 'c'.repeat(40),
+        requestedAt: new Date().toISOString(), attempt: 1, lane: other, ref: 'lane/victim', kind: 'fix' };
+      expect(writeStoredAwaitVerify(victim, { dir: store }).ok).toBe(true);
+      const fails = (args) => { try { run(args, store); return null; } catch (e) { return e; } };
+      // typed --session-id is ignored while the runtime id (S-live) is set: the victim record is untouched either way
+      expect(fails([...MARK, '--session-id=S-victim'])).toBeNull();
+      expect(readStoredAwaitVerify('S-victim', { dir: store })).toMatchObject({ ref: 'lane/victim', lane: other });
+      expect(readStoredAwaitVerify('S-live', { dir: store })).toMatchObject({ sessionId: 'S-live', ref: 'lane/item-68b' });
+      expect(JSON.parse(run(['clear', '--session-id=S-victim'], store))).toEqual({ cleared: true });
+      expect(readStoredAwaitVerify('S-victim', { dir: store })).toMatchObject({ lane: other });
+      expect(readStoredAwaitVerify('S-live', { dir: store })).toBeNull();
+      // no runtime id (typed id is all there is): overwriting or clearing a record bound to another lane is refused
+      const runBare = (args) => execFileSync(process.execPath, [SCRIPT, ...args, `--cwd=${cwd}`], {
+        encoding: 'utf8', stdio: 'pipe', env: { ...process.env, CLAUDE_CODE_SESSION_ID: '', [AWAIT_VERIFY_STORE_ENV]: store },
+      });
+      const failsBare = (args) => { try { runBare(args); return null; } catch (e) { return e; } };
+      expect(String(failsBare([...MARK, '--session-id=S-victim'])?.stderr)).toMatch(/belongs to another lane/);
+      expect(String(failsBare(['clear', '--session-id=S-victim'])?.stderr)).toMatch(/belongs to another lane/);
+      expect(readStoredAwaitVerify('S-victim', { dir: store })).toMatchObject({ ref: 'lane/victim', lane: other });
+      // an id-less harness record is refused outright: it would be found by `who`, which a same-named session could adopt
+      expect(String(failsBare(MARK)?.stderr)).toMatch(/needs a session id/);
+    } finally { rmSync(other, { recursive: true, force: true }); }
   });
 });

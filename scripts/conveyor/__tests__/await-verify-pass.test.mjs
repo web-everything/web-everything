@@ -224,3 +224,114 @@ describe('replay: fix-4115 through the harness-owned wait', () => {
     expect(h.store.size).toBe(0);
   });
 });
+
+describe('findAwaitSession — an explicit session id never falls back by name (#5137 review)', () => {
+  it('does not fall back by name when a recorded session id is missing', () => {
+    const replacement = [{ sessionId: 'new', name: 'fix-4115', startedAt: 9 }];
+    expect(findAwaitSession(rec({ sessionId: 'old', who: 'fix-4115' }), replacement)).toBeNull();
+  });
+});
+
+describe('defaultAwaitVerifyIo — the real push and resume ports (#5137 review)', () => {
+  const PR_HEAD = 'lane/item-68b';
+  /** An exec double that records every call and answers git/gh like a healthy host. */
+  const fakeExec = ({ head = PR_HEAD, state = 'OPEN', remote = SHA, failPush = null } = {}) => {
+    const calls = [];
+    const exec = (cmd, args) => {
+      calls.push([cmd, ...args]);
+      if (cmd === 'gh') { if (head === null) throw new Error('gh down'); return `${state} ${head}\n`; }
+      if (args.includes('push')) { if (failPush) throw Object.assign(new Error(failPush), { stderr: failPush }); return ''; }
+      if (args.includes('ls-remote')) return `${remote}\trefs/heads/${PR_HEAD}\n`;
+      return '';
+    };
+    return { exec, calls };
+  };
+  const pushArg = (over = {}) => ({ lane: '/lanes/lane-5', sha: SHA, ref: PR_HEAD, repo: 'web-everything/web-everything', pr: 4115, who: 'fix-4115', sessionId: 'S', ...over });
+  const build = async (exec, over = {}) => (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({
+    weRoot: '/we', exec, env: {}, pushRefusalFn: () => null, ...over,
+  });
+  const gitPushes = (calls) => calls.filter((c) => c[0] === 'git' && c.includes('push'));
+
+  it('pushes sha:refs/heads/<ref> only — never --force, --no-verify or a + refspec — with the lane config pinned', async () => {
+    const { exec, calls } = fakeExec();
+    const result = (await build(exec)).push(pushArg());
+    expect(result).toEqual({ ok: true });
+    const [push] = gitPushes(calls);
+    expect(push).toEqual(expect.arrayContaining(['push', 'origin', `${SHA}:refs/heads/${PR_HEAD}`]));
+    for (const arg of push) {
+      expect(arg).not.toMatch(/^--force|^-f$|--no-verify|--force-with-lease/);
+      expect(arg).not.toMatch(/^\+/);
+    }
+    // every git call neutralizes the lane-config keys that execute code (a hooks path would still run lane-relative scripts)
+    for (const c of calls.filter((x) => x[0] === 'git')) {
+      expect(c).toEqual(expect.arrayContaining(['core.fsmonitor=false', 'core.hooksPath=/dev/null', 'diff.external=', 'core.sshCommand=ssh']));
+    }
+  });
+
+  it('a live fix claim held by another session short-circuits before any git or gh call', async () => {
+    const { exec, calls } = fakeExec();
+    const io = await build(exec, { pushRefusalFn: () => ({ refused: true, message: 'held by fix-9' }) });
+    expect(io.push(pushArg())).toEqual({ ok: false, reason: 'held by fix-9' });
+    expect(calls).toEqual([]);
+  });
+
+  it('refuses a recorded ref that is not the PR\'s head (ref/PR mismatch table), without pushing', async () => {
+    for (const ref of ['lane/other-item', 'lane/item-68b-alt', 'lane/ITEM-68B']) {
+      const { exec, calls } = fakeExec();
+      const result = (await build(exec)).push(pushArg({ ref }));
+      expect(result.ok).toBe(false);
+      expect(result.transient).toBeUndefined();
+      expect(result.reason).toMatch(/not PR #4115's head/);
+      expect(gitPushes(calls)).toEqual([]);
+    }
+  });
+
+  it('refuses to push to a PR that is no longer open', async () => {
+    const { exec, calls } = fakeExec({ state: 'MERGED' });
+    expect((await build(exec)).push(pushArg())).toMatchObject({ ok: false, reason: expect.stringMatching(/not open/) });
+    expect(gitPushes(calls)).toEqual([]);
+  });
+
+  it('an unresolvable PR head is a transient refusal (retried), never a push', async () => {
+    const { exec, calls } = fakeExec({ head: null });
+    const result = (await build(exec)).push(pushArg());
+    expect(result).toMatchObject({ ok: false, transient: true });
+    expect(gitPushes(calls)).toEqual([]);
+  });
+
+  it('a rejected (non-fast-forward) push is terminal, and a remote that did not take the sha is not ok', async () => {
+    const rejected = fakeExec({ failPush: '! [rejected] (non-fast-forward)' });
+    expect(await (await build(rejected.exec)).push(pushArg())).toMatchObject({ ok: false, transient: false });
+    const stale = fakeExec({ remote: OTHER });
+    expect((await build(stale.exec)).push(pushArg())).toMatchObject({ ok: false, reason: expect.stringMatching(/after push/) });
+  });
+
+  describe('resume cleanup', () => {
+    const session = { sessionId: 'S-target', cwd: '/scratch' };
+    const dispatchIo = (printed, resumed) => ({
+      buildAgentArgv: () => ['--resume'], defaultSpawnAgent: () => `backgrounded ${printed}`,
+      parseBackgroundedId: () => printed, defaultListAgents: () => [], resumeSucceeded: () => ({ resumed }),
+    });
+    const run = async (printed, resumed) => {
+      const stopped = [];
+      const io = await build(fakeExec().exec, { dispatchIo: dispatchIo(printed, resumed), stopSessionFn: (a) => stopped.push(a.handle), sleep: () => {} });
+      return { result: io.resume({ session, prompt: 'p' }), stopped };
+    };
+
+    it('never stops the requested session after an unconfirmed resume that printed its own id', async () => {
+      const { result, stopped } = await run('S-target', false);
+      expect(stopped).toEqual([]);
+      expect(result).toMatchObject({ resumed: false, reason: 'resume-unconfirmed' });
+    });
+    it('stops a forked copy (a different printed id) when the resume is unconfirmed', async () => {
+      const { result, stopped } = await run('S-fork', false);
+      expect(stopped).toEqual(['S-fork']);
+      expect(result).toMatchObject({ resumed: false, reason: 'forked-copy-stopped' });
+    });
+    it('a confirmed resume stops nothing', async () => {
+      const { result, stopped } = await run('S-target', true);
+      expect(stopped).toEqual([]);
+      expect(result.resumed).toBe(true);
+    });
+  });
+});

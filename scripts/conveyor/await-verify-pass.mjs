@@ -133,13 +133,14 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
   }
 }
 
-/** Find the session row a record speaks for: session id first, else the newest row with its `who` name. Pure. */
+/**
+ * Find the session row a record speaks for. A record that names a session id binds to THAT session only — a
+ * replacement fixer reusing the same `who` name must never receive the old session's verdict. Only a record with
+ * no session id falls back to the newest row with its `who` name. Pure.
+ */
 export function findAwaitSession(record, rows) {
   const list = Array.isArray(rows) ? rows : [];
-  if (record.sessionId) {
-    const hit = list.find((r) => r?.sessionId === record.sessionId);
-    if (hit) return hit;
-  }
+  if (record.sessionId) return list.find((r) => r?.sessionId === record.sessionId) ?? null;
   return list.filter((r) => r?.name === record.who).sort((a, b) => (b?.startedAt ?? 0) - (a?.startedAt ?? 0))[0] ?? null;
 }
 
@@ -172,7 +173,7 @@ export async function runAwaitVerifyPass({
       }
       let pending = record.pendingResume ?? null;
       if (d.action === 'push') {
-        const pushed = io.push({ lane: record.lane, sha: record.sha, ref: record.ref, repo: record.repo, who: record.who, sessionId: record.sessionId });
+        const pushed = io.push({ lane: record.lane, sha: record.sha, ref: record.ref, repo: record.repo, pr: record.pr, who: record.who, sessionId: record.sessionId });
         if (!pushed?.ok && pushed?.transient && (record.retries ?? 0) < limits.maxRetries) {
           // A network/auth hiccup is not a moved branch: retry the same push next tick.
           io.writeRecord({ ...record, retries: (record.retries ?? 0) + 1, lastRetry: `push: ${pushed.reason}` });
@@ -238,12 +239,36 @@ export function formatAwaitVerifyLines(result) {
 // ── IO shell ───────────────────────────────────────────────────────────────────────────────────────────────
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
-/** Real ports. `deps` lets the daemon reuse its own `claude` spawn/list/stop seams. */
-export async function defaultAwaitVerifyIo({ weRoot = ROOT, exec = execFileSync, env = process.env } = {}) {
-  const io = await import('../operations/dispatch-lane-io.mjs');
-  const { stopSession } = await import('../operations/dispatch-abort.mjs');
-  const { pushRefusal } = await import('./fix-procedure.mjs');
-  const git = (lane, args, opts = {}) => String(exec('git', ['-C', lane, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, ...opts }));
+/**
+ * Real ports; every seam is injectable so the push/resume guarantees below are testable without git or claude.
+ *
+ * The lane is agent-writable, so its own `.git/config` is untrusted input to the daemon: every git call turns off
+ * `core.fsmonitor`, lane hooks (`core.hooksPath=/dev/null` — a hook runs lane-relative scripts, so ANY hooks path
+ * would still execute lane code), `diff.external` and `core.attributesFile`, and pins `core.sshCommand`. The
+ * `guard-git-push` hook is replaced by two checks the daemon makes itself: the ref must match `lane/*`
+ * (`AWAIT_VERIFY_REF_RE`, so `main` is unreachable) and equal the head ref of the OPEN PR. Filter drivers, `url.*.insteadOf`
+ * and credential helpers in the lane config are NOT neutralized here; the structural fix (push from a
+ * daemon-owned clone / explicit slug URL) is carded.
+ */
+export async function defaultAwaitVerifyIo({
+  weRoot = ROOT, exec = execFileSync, env = process.env, sleep = sleepSync,
+  dispatchIo = null, stopSessionFn = null, pushRefusalFn = null,
+} = {}) {
+  const io = dispatchIo ?? await import('../operations/dispatch-lane-io.mjs');
+  const stopSession = stopSessionFn ?? (await import('../operations/dispatch-abort.mjs')).stopSession;
+  const pushRefusal = pushRefusalFn ?? (await import('./fix-procedure.mjs')).pushRefusal;
+  const hardening = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=',
+    '-c', 'core.attributesFile=/dev/null', '-c', 'core.sshCommand=ssh'];
+  const git = (lane, args, opts = {}) => String(exec('git', ['-C', lane, ...hardening, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, ...opts }));
+  /** The head branch of the PR and whether it is OPEN, read from GitHub (never from the lane or the record). Null when unresolved. */
+  const prHead = (repo, pr) => {
+    try {
+      const out = String(exec('gh', ['pr', 'view', String(pr), '--repo', String(repo), '--json', 'headRefName,state', '--jq', '.state + " " + .headRefName'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 60_000 })).trim();
+      const [state, ...rest] = out.split(' ');
+      return state && rest.length ? { open: state === 'OPEN', ref: rest.join(' ') } : null;
+    } catch { return null; }
+  };
   return {
     listRecords: () => listStoredAwaitVerify(),
     writeRecord: (record) => writeStoredAwaitVerify(record),
@@ -271,9 +296,14 @@ export async function defaultAwaitVerifyIo({ weRoot = ROOT, exec = execFileSync,
         try { return { ok: false, ...JSON.parse(String(e?.stdout ?? '').trim().split('\n').pop()) }; } catch { return { ok: false, status: 'request-failed' }; }
       }
     },
-    push: ({ lane, sha, ref, repo, who, sessionId }) => {
+    push: ({ lane, sha, ref, repo, pr, who, sessionId }) => {
       const refusal = pushRefusal({ repo, branch: ref, sessionId, who });
       if (refusal?.refused) return { ok: false, reason: refusal.message };
+      // The record's ref was typed by the fixer: bind it to the PR it claims to be repairing before pushing.
+      const head = prHead(repo, pr);
+      if (!head) return { ok: false, transient: true, reason: `could not resolve the head ref of ${repo} PR #${pr}` };
+      if (head.ref !== ref) return { ok: false, reason: `recorded ref ${ref} is not PR #${pr}'s head (${head.ref}); refusing to push` };
+      if (!head.open) return { ok: false, reason: `PR #${pr} is not open; refusing to push ${ref}` };
       try {
         // Hooks stay on (guard-git-push refuses main); never --force, so a moved branch is rejected, not overwritten.
         git(lane, ['push', 'origin', `${sha}:refs/heads/${ref}`], { timeout: 180_000 });
@@ -297,10 +327,12 @@ export async function defaultAwaitVerifyIo({ weRoot = ROOT, exec = execFileSync,
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         outcome = io.resumeSucceeded({ printedId, requestedSessionId: session.sessionId, agentsAfter: io.defaultListAgents({ all: true, env }) });
         if (outcome.resumed || attempt === 3) break;
-        sleepSync(2_000);
+        sleep(2_000);
       }
-      if (!outcome.resumed && printedId) { try { stopSession({ handle: printedId }); } catch { /* best-effort: never the target */ } }
-      return { resumed: !!outcome.resumed, reason: outcome.resumed ? null : (printedId ? 'forked-copy-stopped' : 'no-backgrounded-id') };
+      // Only a DIFFERENT printed id is a forked copy to stop; the requested session itself is never the cleanup target.
+      const forked = Boolean(printedId) && printedId !== session.sessionId;
+      if (!outcome.resumed && forked) { try { stopSession({ handle: printedId }); } catch { /* best-effort cleanup of the copy */ } }
+      return { resumed: !!outcome.resumed, reason: outcome.resumed ? null : (forked ? 'forked-copy-stopped' : (printedId ? 'resume-unconfirmed' : 'no-backgrounded-id')) };
     },
   };
 }
