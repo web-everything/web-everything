@@ -9,6 +9,8 @@
  *   store      = only a full pass, from a whole-file run (no -t filter, no shard, no `.only`, no run-level error).
  */
 
+import { sameTracedMap } from './test-cache-trace.mjs';
+
 const TIMEOUT_RE = /timed out|timeout of \d+\s*ms|hook timed out/i;
 
 function collectTests(tasks, out = []) {
@@ -62,13 +64,23 @@ export function falseSkipCategory(summary, stored) {
  * @param {{row: {file: string, key: string|null, cacheable: boolean, tier: string, reason: string|null},
  *   summary: ReturnType<typeof summarizeFile>, stored: object|null, quarantined: boolean,
  *   run: {runId: string, lane: string, baseSha: string|null, storeAllowed: boolean, now?: string}}} a
+ * @param {{trace?: null | {denies: string[], traced: number, tracedMap: Record<string,string>, admitted: boolean, cleanRuns: number}}} [a.trace]
+ *   prepare-124 S3: what the runtime tracer saw for this file (null = not traced this run).
  * @returns {{record: object, store: object|null, quarantine: {category: string}|null}}
  */
-export function decideShadow({ row, summary, stored, quarantined, run }) {
+export function decideShadow({ row, summary, stored, quarantined, run, trace = null }) {
+  const denies = trace?.denies ?? [];
+  const needsList = Boolean(trace) && (row.needsTrace || Object.keys(trace.tracedMap ?? {}).length > 0);
+  const keyMiss = Boolean(stored && stored.outcome === 'pass' && stored.traced && trace && !sameTracedMap(stored.traced, trace.tracedMap));
   let reason;
   if (!row.cacheable) reason = `not-cacheable: ${row.reason ?? 'unknown'}`;
   else if (quarantined) reason = 'quarantined';
+  else if (denies.length) reason = `traced-deny: ${denies[0]}`;
+  else if (row.needsTrace && !trace) reason = 'no-trace';
+  else if (row.needsTrace && !trace.admitted) reason = 'not-admitted';
   else if (!stored || stored.outcome !== 'pass') reason = 'no-entry';
+  else if (needsList && !stored.traced) reason = 'no-entry';
+  else if (keyMiss) reason = 'traced-changed';
   else reason = 'hit';
   const wouldSkip = reason === 'hit';
   const category = wouldSkip ? falseSkipCategory(summary, stored) : null;
@@ -78,10 +90,12 @@ export function decideShadow({ row, summary, stored, quarantined, run }) {
     wouldSkip, reason, outcome: summary.state, falseSkip: category,
     tests: { passed: summary.passed, failed: summary.failed, skipped: summary.skipped },
     durationMs: summary.durationMs, storedDurationMs: wouldSkip ? stored.durationMs ?? null : null,
+    needsTrace: Boolean(row.needsTrace), keyMiss,
+    trace: trace ? { denies, tracedInputs: Object.keys(trace.tracedMap ?? {}).length, admitted: trace.admitted, cleanRuns: trace.cleanRuns } : null,
   };
-  const canStore = run.storeAllowed && row.cacheable && !quarantined && !summary.hasOnly && isFullPass(summary) && !category;
+  const canStore = run.storeAllowed && row.cacheable && !quarantined && !summary.hasOnly && isFullPass(summary) && !category && denies.length === 0;
   const store = canStore
-    ? { file: row.file, outcome: 'pass', passed: summary.passed, skipped: summary.skipped, durationMs: summary.durationMs, recordedAt: now, lane: run.lane, baseSha: run.baseSha }
+    ? { file: row.file, outcome: 'pass', passed: summary.passed, skipped: summary.skipped, durationMs: summary.durationMs, recordedAt: now, lane: run.lane, baseSha: run.baseSha, ...(trace && needsList ? { traced: trace.tracedMap } : {}) }
     : null;
   return { record, store, quarantine: category ? { category } : null };
 }
