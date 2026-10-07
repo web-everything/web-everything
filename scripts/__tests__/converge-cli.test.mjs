@@ -15,6 +15,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSy
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { workingTreeOf } from '../lib/pre-pr-review.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const CLI = join(ROOT, 'scripts', 'converge-cli.mjs');
@@ -398,6 +399,32 @@ describe('the action table — one case per row', () => {
     // The SKILL's land report mandates every dismissed finding with its stated reason; there was no `dismissed`
     // key on the land output at all, so 100% of successful runs under-reported.
     expect(j.dismissed).toEqual([{ summary: 'argued away', reason: 'not a real defect' }]);
+  });
+
+  it('LAND records WHAT it reviewed (the lane and its working-tree hash) so `receipt` can bind to it', () => {
+    const fresh = statePath();
+    cli(initArgs(fresh, ['--care=high']));
+    const mid = step(fresh, { round: 1, readResult, lensResults: cleanPanel() });
+    expect(mid.json().action).toBe('red-team');
+    expect(JSON.parse(readFileSync(fresh, 'utf8')).reviewed).toBeUndefined(); // only a landed run carries it
+    step(fresh, { round: 1, readResult, lensResults: cleanPanel(), redTeamResult: { ran: true, findings: [] } });
+    const env = JSON.parse(readFileSync(fresh, 'utf8'));
+    expect(env.final).toBe('land');
+    expect(env.reviewed).toEqual({ lane: realpathSync(lane), tree: workingTreeOf(lane) });
+  });
+
+  it('LAND records NO reviewed content when the lane was edited after the panel last read it', () => {
+    const fresh = statePath();
+    cli(initArgs(fresh, ['--care=high']));
+    step(fresh, { round: 1, readResult, lensResults: cleanPanel() });
+    const late = join(lane, 'edited-after-read.txt');
+    writeFileSync(late, 'not seen by the panel\n');
+    try {
+      step(fresh, { round: 1, readResult, lensResults: cleanPanel(), redTeamResult: { ran: true, findings: [] } });
+    } finally { rmSync(late, { force: true }); }
+    const env = JSON.parse(readFileSync(fresh, 'utf8'));
+    expect(env.final).toBe('land');
+    expect(env.reviewed).toBeNull(); // `receipt` refuses a landed run it cannot bind to reviewed content
   });
 
   it('LAND is unreachable on an UNRUN red-team', () => {

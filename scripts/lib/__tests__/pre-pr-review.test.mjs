@@ -2,7 +2,7 @@
  * @file pre-pr-review.test.mjs — the pre-PR review gate (perf sweep card 2): risk rule, knob, receipt, and the
  * open-pr runner refusing a risky head without a receipt. Real git sandboxes; no gh, no network.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync, readdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,7 +10,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   classifyPrRisk, decidePrePrReview, resolvePrePrSettings, loadPrePrSettings, checkPrePrReview, isPreparedCard,
-  buildReceipt, gitDirOf, treeOf, RECEIPT_FILE, BUILT_IN_PRE_PR_SETTINGS,
+  buildReceipt, gitDirOf, treeOf, workingTreeOf, readDiffFiles, codeSpan, renderBypassNote, RECEIPT_FILE, BUILT_IN_PRE_PR_SETTINGS,
 } from '../pre-pr-review.mjs';
 import { createPrLandRunner } from '../../operations/open-pr-io.mjs';
 import { planOpen } from '../../operations/open-pr.mjs';
@@ -59,6 +59,25 @@ describe('knob and decision', () => {
     expect(r.settings.mode).toBe('advise');
     expect(r.ignored).toEqual(['mode', 'maxLines']);
   });
+  it('a present-but-broken settings file fails CLOSED to enforce and says why; only a missing file is advise', () => {
+    const enoent = Object.assign(new Error('nope'), { code: 'ENOENT' });
+    const eacces = Object.assign(new Error('denied'), { code: 'EACCES' });
+    const load = (read) => loadPrePrSettings({ path: '/x.json', read });
+    expect(load(() => { throw enoent; })).toMatchObject({ settings: { mode: 'advise' }, error: '' });
+    expect(load(() => '{ "mode": "enforce", ')).toMatchObject({ settings: { mode: 'enforce' }, error: expect.stringMatching(/not valid JSON/) });
+    expect(load(() => { throw eacces; })).toMatchObject({ settings: { mode: 'enforce' }, error: expect.stringMatching(/unreadable/) });
+    expect(load(() => '{"mode":"enforse"}')).toMatchObject({ settings: { mode: 'enforce' }, error: expect.stringMatching(/no valid `mode` \(got "enforse"/) });
+    expect(load(() => 'null')).toMatchObject({ settings: { mode: 'enforce' }, error: expect.stringMatching(/not a JSON object/) });
+    expect(load(() => '[]')).toMatchObject({ settings: { mode: 'enforce' } });
+    // a present file must name a valid `mode` and only understood keys/values: these lenient reads were fail-open
+    expect(load(() => '{}')).toMatchObject({ settings: { mode: 'enforce' }, error: expect.stringMatching(/no valid `mode`/) });
+    expect(load(() => '{"prePrReview":{"mode":"off"}}')).toMatchObject({ settings: { mode: 'enforce' } });
+    expect(load(() => '{"Mode":"off"}')).toMatchObject({ settings: { mode: 'enforce' } });
+    expect(load(() => '{"mode":"advise","maxLines":"264"}')).toMatchObject({ settings: { mode: 'enforce' }, error: expect.stringMatching(/maxLines/) });
+    expect(load(() => '{"mode":"advise","maxFile":5}')).toMatchObject({ settings: { mode: 'enforce' }, error: expect.stringMatching(/maxFile/) });
+    expect(load(() => '{"mode":"advise","maxLines":100}')).toMatchObject({ settings: { mode: 'advise', maxLines: 100 }, error: '' });
+    expect(load(() => '{"mode":"off"}')).toMatchObject({ settings: { mode: 'off' }, error: '' }); // a deliberate off still works
+  });
   it('enforce refuses a risky head with no receipt, with a clear message', () => {
     const d = decidePrePrReview({ settings: { ...S, mode: 'enforce' }, risk: risky, receipt: null, headTree: 't1' });
     expect(d.action).toBe('refuse');
@@ -75,6 +94,17 @@ describe('knob and decision', () => {
     expect(decidePrePrReview({ settings: { ...S, mode: 'off' }, risk: risky, receipt: null, headTree: 't1' }).action).toBe('pass');
     expect(decidePrePrReview({ settings: e, risk: risky, receipt: null, headTree: 't1', skip: '   ' }).action).toBe('refuse');
     expect(decidePrePrReview({ settings: e, risk: risky, receipt: null, headTree: 't1', skip: 'hotfix' }).why).toBe('bypass');
+  });
+  it('a rename carries its source path: moving code under backlog/ is NOT card-only, and both ends count as subsystems', () => {
+    const moved = classifyPrRisk({ files: [{ path: 'backlog/gate.md', from: 'scripts/gate.mjs', additions: 0, deletions: 0 }], hasPreparedCard: true, operatorAgent: false });
+    expect(moved).toMatchObject({ gated: false, cardOnly: false, subsystems: 2 });
+    const noCard = classifyPrRisk({ files: [{ path: 'backlog/gate.md', from: 'scripts/gate.mjs' }], hasPreparedCard: false, operatorAgent: false });
+    expect(noCard).toMatchObject({ gated: true, cardOnly: false });
+    const three = classifyPrRisk({ files: [{ path: 'backlog/a.md', from: 'scripts/a/x.mjs' }, f('docs/b/y.md')], hasPreparedCard: true, operatorAgent: false });
+    expect(three.subsystems).toBe(3);
+    expect(three.reasons.join(' ')).toMatch(/3 subsystems/);
+    // a card renamed to a card is still card-only
+    expect(classifyPrRisk({ files: [{ path: 'backlog/b.md', from: 'backlog/a.md' }] }).cardOnly).toBe(true);
   });
   it('card-only and low-risk pass untouched', () => {
     const e = { ...S, mode: 'enforce' };
@@ -121,7 +151,13 @@ describe('lane sandbox: checkPrePrReview + open-pr runner', () => {
     commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
     process.env.WE_PRE_PR_BYPASS_DIR = join(dir, 'bypass-records');
     const spawned = [];
-    const spawn = (...a) => { spawned.push(a); return { status: 0, stdout: '{"pr":1,"url":"u"}\n', stderr: '' }; };
+    let sentBody = ''; // the temp body copy is removed once the spawn returns, so read it inside the spawn
+    const spawn = (...a) => {
+      spawned.push(a);
+      const bf = a[1].find((x) => x.startsWith('--body-file='));
+      if (bf) sentBody = readFileSync(bf.slice(12), 'utf8');
+      return { status: 0, stdout: '{"pr":1,"url":"u"}\n', stderr: '' };
+    };
     const run = createPrLandRunner({ spawn, cwd: dir, env: OPERATOR });
     const argv = ['--ref=lane/x', '--base=main', '--body-file=/tmp/b.md', '--label-on-green'];
     const out = run({ argv });
@@ -138,8 +174,7 @@ describe('lane sandbox: checkPrePrReview + open-pr runner', () => {
     const argv2 = ['--ref=lane/x', '--base=main', `--body-file=${body}`, '--label-on-green'];
     const ok = run({ argv: argv2, skipPrePrReview: 'emergency hotfix', actor: 'nic', operatorInstruction: 'operator said: ship the hotfix' });
     expect(ok.outcome).toBe('opened');
-    const sentBody = spawned[0][1].find((a) => a.startsWith('--body-file=')).slice(12);
-    expect(readFileSync(sentBody, 'utf8')).toMatch(/bypassed.*nic.*ship the hotfix/s);
+    expect(sentBody).toMatch(/bypassed.*nic.*ship the hotfix/s);
     expect(readFileSync(join(gitDirOf(dir), 'pre-pr-review-bypass.log'), 'utf8')).toMatch(/ship the hotfix/);
     expect(readdirSync(join(dir, 'bypass-records'))).toHaveLength(1);
     delete process.env.WE_PRE_PR_BYPASS_DIR;
@@ -147,6 +182,161 @@ describe('lane sandbox: checkPrePrReview + open-pr runner', () => {
     expect(spawned[0][1].join(' ')).not.toMatch(/skipPrePrReview/);
     expect(spawned[0][1].join(' ')).not.toMatch(/skipPrePrReview|operatorInstruction/);
     expect(readFileSync(join(gitDirOf(dir), 'pre-pr-review-bypass.log'), 'utf8')).toMatch(/emergency hotfix/);
+  });
+});
+
+describe('gate hardening (PR #4271 review)', () => {
+  let dir; let tmpBefore;
+  const git = (...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8' }).trim();
+  const commit = (files) => {
+    for (const [p, c] of Object.entries(files)) { mkdirSync(dirname(join(dir, p)), { recursive: true }); writeFileSync(join(dir, p), c); }
+    git('add', '-A'); git('-c', 'user.email=a@b', '-c', 'user.name=t', 'commit', '-qm', 'x');
+  };
+  const bypassTmp = () => readdirSync(tmpdir()).filter((n) => n.startsWith('open-pr-bypass-'));
+  const OPERATOR = { PATH: process.env.PATH };
+  const enforceSettings = () => ({ settings: { ...S, mode: 'enforce' }, error: '' });
+  const okSpawn = (spawned) => (...a) => { spawned.push(a); return { status: 0, stdout: '{"pr":1,"url":"u"}\n', stderr: '' }; };
+  beforeEach(() => {
+    dir = realpathSync(mkdtempSync(join(tmpdir(), 'pre-pr-h-')));
+    git('init', '-q', '-b', 'main'); commit({ 'README.md': 'x\n' });
+    git('checkout', '-q', '-b', 'lane/x');
+    tmpBefore = new Set(bypassTmp());
+  });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); delete process.env.WE_PRE_PR_BYPASS_DIR; });
+
+  describe('fail closed', () => {
+    it('refuses before spawning pr-land when the enforced pre-review check throws', () => {
+      const spawned = [];
+      const run = createPrLandRunner({ prePrReview: () => { throw new Error('boom'); }, loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+      expect(run({ argv: ['--ref=lane/x', '--base=main'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error', detail: expect.stringMatching(/boom.*fail closed/s) });
+      expect(spawned).toHaveLength(0);
+    });
+    it('under advise/off a thrown check proceeds, loudly', () => {
+      const spawned = [];
+      const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        for (const mode of ['advise', 'off']) {
+          const run = createPrLandRunner({ prePrReview: () => { throw new Error('boom'); }, loadSettings: () => ({ settings: { ...S, mode }, error: '' }), spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+          expect(run({ argv: ['--ref=lane/x'] }).outcome).toBe('opened');
+        }
+        expect(err.mock.calls.map((c) => c[0]).join('')).toMatch(/advisory — the pre-PR review check itself failed \(`` boom ``\)/);
+      } finally { err.mockRestore(); }
+      expect(spawned).toHaveLength(2);
+    });
+    it('a REAL check error (unresolvable --base) refuses under the repo\'s enforce setting', () => {
+      commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
+      const spawned = [];
+      const run = createPrLandRunner({ spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+      expect(run({ argv: ['--ref=lane/x', '--base=no-such-base'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
+      expect(spawned).toHaveLength(0);
+    });
+    it('a settings file that cannot be trusted warns on stderr (the gate result carries settingsError)', () => {
+      const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        const run = createPrLandRunner({ prePrReview: () => ({ action: 'pass', why: 'x', settingsError: 'settings broken' }), spawn: okSpawn([]), cwd: dir, env: OPERATOR });
+        run({ argv: ['--ref=lane/x'] });
+        expect(err.mock.calls.map((c) => c[0]).join('')).toMatch(/WARNING — settings broken/);
+      } finally { err.mockRestore(); }
+    });
+    it('a bypass whose audit log cannot be written is refused, not admitted', () => {
+      commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
+      mkdirSync(join(gitDirOf(dir), 'pre-pr-review-bypass.log')); // appendFileSync -> EISDIR
+      const spawned = [];
+      const run = createPrLandRunner({ loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+      const body = join(dir, 'b.md'); writeFileSync(body, 'body\n');
+      expect(run({ argv: ['--ref=lane/x', '--base=main', `--body-file=${body}`], skipPrePrReview: 'hotfix', actor: 'nic', operatorInstruction: 'ship it' }))
+        .toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
+      expect(spawned).toHaveLength(0);
+    });
+  });
+
+  describe('gate and push are bound to one commit', () => {
+    it('judges --sha, not the checkout HEAD: an explicit risky sha is refused while HEAD is on main', () => {
+      commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
+      const risky = git('rev-parse', 'HEAD');
+      git('checkout', '-q', 'main');
+      const r = checkPrePrReview({ cwd: dir, sha: risky, env: OPERATOR, settings: { ...S, mode: 'enforce' } });
+      expect(r).toMatchObject({ action: 'refuse', sha: risky });
+      expect(r.risk.lines).toBeGreaterThan(264);
+    });
+    it('pins --sha to the judged commit in the argv pr-land receives (HEAD is resolved once)', () => {
+      commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
+      const head = git('rev-parse', 'HEAD');
+      writeFileSync(join(gitDirOf(dir), RECEIPT_FILE), JSON.stringify(buildReceipt({ tree: treeOf(dir), head, envelope: {} })));
+      const spawned = [];
+      const run = createPrLandRunner({ loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+      expect(run({ argv: ['--ref=lane/x', '--base=main'] }).outcome).toBe('opened');
+      expect(spawned[0][1].filter((a) => a.startsWith('--sha='))).toEqual([`--sha=${head}`]);
+      // an explicit short/symbolic --sha is replaced by the full judged commit, never passed twice
+      spawned.length = 0;
+      run({ argv: ['--ref=lane/x', '--base=main', '--sha=lane/x'] });
+      expect(spawned[0][1].filter((a) => a.startsWith('--sha='))).toEqual([`--sha=${head}`]);
+    });
+    it('an unresolvable --sha is a check error and refuses under enforce', () => {
+      const run = createPrLandRunner({ loadSettings: enforceSettings, spawn: okSpawn([]), cwd: dir, env: OPERATOR });
+      expect(run({ argv: ['--ref=lane/x', '--base=main', '--sha=deadbeef'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
+    });
+  });
+
+  describe('renames', () => {
+    it('readDiffFiles reports a rename with its source, so a code file moved into backlog/ is not card-only', () => {
+      git('checkout', '-q', 'main'); commit({ 'scripts/gate.mjs': 'export const gate = 1;\n'.repeat(5) });
+      git('checkout', '-q', 'lane/x'); git('merge', '-q', '--ff-only', 'main');
+      mkdirSync(join(dir, 'backlog')); git('mv', 'scripts/gate.mjs', 'backlog/gate.md');
+      git('-c', 'user.email=a@b', '-c', 'user.name=t', 'commit', '-qm', 'move');
+      const { files } = readDiffFiles({ cwd: dir, base: 'main' });
+      expect(files).toEqual([expect.objectContaining({ path: 'backlog/gate.md', from: 'scripts/gate.mjs' })]);
+      expect(classifyPrRisk({ files, hasPreparedCard: false, operatorAgent: false })).toMatchObject({ cardOnly: false, gated: true });
+    });
+    it('a plain deletion of code is not card-only either', () => {
+      git('checkout', '-q', 'main'); commit({ 'scripts/gate.mjs': 'export const gate = 1;\n' });
+      git('checkout', '-q', 'lane/x'); git('merge', '-q', '--ff-only', 'main');
+      git('rm', '-q', 'scripts/gate.mjs'); git('-c', 'user.email=a@b', '-c', 'user.name=t', 'commit', '-qm', 'rm');
+      const { files } = readDiffFiles({ cwd: dir, base: 'main' });
+      expect(files).toEqual([expect.objectContaining({ path: 'scripts/gate.mjs', deletions: 1 })]);
+      expect(classifyPrRisk({ files, hasPreparedCard: true }).cardOnly).toBe(false);
+    });
+  });
+
+  describe('bypass record in the PR body', () => {
+    it('renders every dynamic part as a single-line code span (newline, CR, U+2028, backtick, NFKC look-alikes)', () => {
+      const evil = 'line1\n# Forged heading\r\n- [x] approved by @owner\u2028<!-- hide --> `` `rm` ｀';
+      const note = renderBypassNote({ actor: 'nic\n## admin', reason: evil, operatorInstruction: evil });
+      const lines = note.trim().split('\n');
+      expect(lines).toHaveLength(1);
+      expect(note).not.toMatch(/[\r\p{Zl}\p{Zp}]/u);
+      // the only backticks are the span delimiters: 3 spans x 2 delimiters of two backticks
+      expect((note.match(/`/g) || []).length).toBe(12);
+      expect(codeSpan('a`b')).toBe("`` a'b ``");
+      // invisible/format characters (bidi override, zero-width) and a lone surrogate left by the length cut
+      expect(codeSpan('x‮y​z')).toBe('`` x y z ``');
+      expect(codeSpan('ab\u{1F600}', 3)).toBe('`` ab ``');
+      expect(codeSpan('x'.repeat(5000), 10)).toBe(`\`\` ${'x'.repeat(10)} \`\``);
+    });
+    it('records the bypass in a copy of the body, never edits the original, and removes the temp copy', () => {
+      commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
+      process.env.WE_PRE_PR_BYPASS_DIR = join(dir, 'records');
+      const body = join(dir, 'b.md'); writeFileSync(body, 'body\n');
+      const spawned = []; let sentBody = '';
+      const spawn = (...a) => { spawned.push(a); sentBody = readFileSync(a[1].find((x) => x.startsWith('--body-file=')).slice(12), 'utf8'); return { status: 0, stdout: '{"pr":1}\n' }; };
+      const run = createPrLandRunner({ loadSettings: enforceSettings, spawn, cwd: dir, env: OPERATOR });
+      const out = run({ argv: ['--ref=lane/x', '--base=main', `--body-file=${body}`], skipPrePrReview: 'hotfix', actor: 'nic', operatorInstruction: 'ship it\n# forged' });
+      expect(out.outcome).toBe('opened');
+      expect(sentBody).toMatch(/^body\n\n\n\*\*Pre-PR review bypassed\*\* by `` nic `` — reason: `` hotfix ``\. Operator instruction: `` ship it # forged ``\n$/);
+      expect(readFileSync(body, 'utf8')).toBe('body\n');
+      expect(bypassTmp().filter((n) => !tmpBefore.has(n))).toEqual([]);
+    });
+    it('refuses (and spawns nothing, leaks nothing) when the body note cannot be written', () => {
+      commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
+      process.env.WE_PRE_PR_BYPASS_DIR = join(dir, 'records');
+      const spawned = [];
+      const run = createPrLandRunner({ loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+      const bypass = { skipPrePrReview: 'hotfix', actor: 'nic', operatorInstruction: 'ship it' };
+      expect(run({ argv: ['--ref=lane/x', '--base=main', `--body-file=${join(dir, 'missing.md')}`], ...bypass })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded' });
+      expect(run({ argv: ['--ref=lane/x', '--base=main'], ...bypass })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: expect.stringMatching(/no --body-file/) });
+      expect(spawned).toHaveLength(0);
+      expect(bypassTmp().filter((n) => !tmpBefore.has(n))).toEqual([]);
+    });
   });
 });
 
@@ -170,20 +360,66 @@ describe('converge-cli receipt', () => {
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); rmSync(state, { force: true }); });
   const cli = (...a) => spawnSync(process.execPath, [CLI, ...a], { encoding: 'utf8' });
 
+  const st = { round: 2, careLevel: 'elevated', activeLenses: ['correctness'], dismissed: [] };
+  const landed = (extra = {}) => ({ ctx: { laneRoot: dir }, state: st, final: 'land', reviewed: { lane: dir, tree: workingTreeOf(dir) }, ...extra });
+  const commitAll = (name, body) => { writeFileSync(join(dir, name), body); git('add', '-A'); git('-c', 'user.email=a@b', '-c', 'user.name=t', 'commit', '-qm', name); };
+
   it('refuses a run that did not land, and stamps the head tree for one that did', () => {
-    const st = { round: 2, careLevel: 'elevated', activeLenses: ['correctness'], dismissed: [] };
-    writeFileSync(state, JSON.stringify({ ctx: { laneRoot: dir }, state: st, final: 'escalate' }));
+    writeFileSync(state, JSON.stringify(landed({ final: 'escalate' })));
     const bad = cli('receipt', `--state=${state}`, `--lane=${dir}`);
     expect(bad.status).not.toBe(0);
     expect(bad.stderr).toMatch(/did not end in `land`/);
-    writeFileSync(state, JSON.stringify({ ctx: { laneRoot: dir }, state: st, final: 'land' }));
+    writeFileSync(state, JSON.stringify(landed()));
     const ok = cli('receipt', `--state=${state}`, `--lane=${dir}`);
     expect(ok.status).toBe(0);
     const rec = JSON.parse(readFileSync(join(dir, '.git', RECEIPT_FILE), 'utf8'));
     expect(rec).toMatchObject({ tree: treeOf(dir), verdict: 'land', rounds: 2 });
   });
+  it('refuses receipt issuance for a tree different from the landed review (work committed after the review)', () => {
+    writeFileSync(state, JSON.stringify(landed()));
+    commitAll('more.txt', 'added after the panel landed\n');
+    const r = cli('receipt', `--state=${state}`, `--lane=${dir}`);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/not the content the panel reviewed/);
+    expect(existsSync(join(dir, '.git', RECEIPT_FILE))).toBe(false);
+  });
+  it('refuses a state file that reviewed another lane (cross-lane reuse), including via the default --lane', () => {
+    const other = realpathSync(mkdtempSync(join(tmpdir(), 'pre-pr-other-')));
+    try {
+      execFileSync('git', ['-C', other, 'init', '-q', '-b', 'main']); writeFileSync(join(other, 'a'), 'x');
+      execFileSync('git', ['-C', other, 'add', '-A']); execFileSync('git', ['-C', other, '-c', 'user.email=a@b', '-c', 'user.name=t', 'commit', '-qm', 'x']);
+      writeFileSync(state, JSON.stringify(landed({ reviewed: { lane: other, tree: workingTreeOf(dir) } })));
+      const r = cli('receipt', `--state=${state}`, `--lane=${dir}`);
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/review was of lane/);
+      expect(existsSync(join(dir, '.git', RECEIPT_FILE))).toBe(false);
+    } finally { rmSync(other, { recursive: true, force: true }); }
+  });
+  it('refuses with an explicit message when untracked files are left uncommitted (not a misleading "changed")', () => {
+    writeFileSync(state, JSON.stringify(landed()));
+    writeFileSync(join(dir, 'scratch.txt'), 'left behind\n');
+    const r = cli('receipt', `--state=${state}`, `--lane=${dir}`);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/untracked files.*scratch\.txt.*Commit or delete/s);
+    expect(existsSync(join(dir, '.git', RECEIPT_FILE))).toBe(false);
+  });
+  it('refuses a landed state that records no reviewed lane/content (hand-written or pre-binding)', () => {
+    const { reviewed: _drop, ...bare } = landed();
+    writeFileSync(state, JSON.stringify(bare));
+    const r = cli('receipt', `--state=${state}`, `--lane=${dir}`);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/records no reviewed lane/);
+  });
+  it('workingTreeOf equals the committed tree once the reviewed content (incl. untracked files) is committed, and leaves the lane\'s index alone', () => {
+    writeFileSync(join(dir, 'a'), 'edited'); writeFileSync(join(dir, 'fresh.txt'), 'untracked\n');
+    const before = git('status', '--porcelain');
+    const reviewed = workingTreeOf(dir);
+    expect(git('status', '--porcelain')).toBe(before); // nothing staged by the hash
+    git('add', '-A'); git('-c', 'user.email=a@b', '-c', 'user.name=t', 'commit', '-qm', 'reviewed');
+    expect(treeOf(dir)).toBe(reviewed);
+  });
   it('refuses when tracked files are dirty', () => {
-    writeFileSync(state, JSON.stringify({ ctx: { laneRoot: dir }, state: {}, final: 'land' }));
+    writeFileSync(state, JSON.stringify(landed()));
     writeFileSync(join(dir, 'a'), 'changed');
     expect(cli('receipt', `--state=${state}`, `--lane=${dir}`).stderr).toMatch(/uncommitted/);
     expect(existsSync(join(dir, '.git', RECEIPT_FILE))).toBe(false);

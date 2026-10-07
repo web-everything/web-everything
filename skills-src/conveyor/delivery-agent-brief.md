@@ -304,8 +304,12 @@ node scripts/converge-cli.mjs init --lane="$LANE" --state="$STATE" --care=elevat
   operator-agent builder. A card-only PR, or a small prepared conveyor PR, is unaffected. **Run `/converge`
   WHILE the step-5 verify is running** (the verify wait is 4-9 minutes anyway), fix its findings in this session,
   commit, then on the final committed head stamp the receipt:
-  `node scripts/converge-cli.mjs receipt --lane="$LANE" --state="$STATE"` (it only stamps a run that ended in `land`
-  and a clean tracked tree; any later edit changes the tree and voids it). This ADDS to the post-PR review gate; it
+  `node scripts/converge-cli.mjs receipt --lane="$LANE" --state="$STATE"` (it only stamps a run that ended in `land`,
+  for the SAME lane and the exact content that run reviewed, on a clean tracked tree: commit what the panel read —
+  anything committed after it, or a state file from another lane, is refused; re-run `/converge`). The gate fails
+  closed: if its own check errors in `enforce` mode, `open-pr` refuses rather than admits, and a broken settings
+  file counts as `enforce`. It stops honest mistakes, not a hostile worker who writes the state or receipt file
+  by hand. This ADDS to the post-PR review gate; it
   never replaces it. A bypass is `--skipPrePrReview=<reason> --actor=<name> --operatorInstruction="<quoted operator instruction>"` on `open-pr`, interactive sessions only (a dispatched worker can never bypass); it is recorded in the PR body and `.operations/pre-pr-bypass/<day>.jsonl`.
 - **Outside that gate this step stays ADVISORY — an `escalate` never blocks PR-open.** Blocking would gate every drain lane,
   doc-only lane, and the lane shipping this very change (the reason #2971 dropped its `pr-land` refusal).

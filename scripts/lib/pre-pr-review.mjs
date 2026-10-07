@@ -14,7 +14,8 @@
  *  - the RECEIPT: `converge-cli.mjs receipt` writes `<git-dir>/pre-pr-review-receipt.json` keyed by the head
  *    TREE hash after a converge run ended in `land`. A new tree (any further edit) invalidates it.
  */
-import { readFileSync, appendFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -47,8 +48,35 @@ export function resolvePrePrSettings(raw = {}) {
   return { settings, ignored };
 }
 
+/**
+ * Never throws. A MISSING file is the product default (`advise`). A file that is present but unreadable, not
+ * JSON, or carrying an unrecognised `mode` fails CLOSED to `enforce` (and says why in `error`): a typo in the
+ * settings file must never silently downgrade the gate. The caller surfaces `error` loudly.
+ */
 export function loadPrePrSettings({ path = defaultPrePrSettingsPath(), read = readFileSync } = {}) {
-  try { return resolvePrePrSettings(JSON.parse(read(path, 'utf8'))); } catch { return resolvePrePrSettings({}); }
+  let text;
+  try { text = read(path, 'utf8'); } catch (e) {
+    if (e && e.code === 'ENOENT') return { ...resolvePrePrSettings({}), error: '' };
+    return { ...resolvePrePrSettings({ mode: 'enforce' }), error: `pre-PR review settings unreadable (${e?.message || e}) — failing closed to enforce` };
+  }
+  let parsed;
+  try { parsed = JSON.parse(text); } catch (e) {
+    return { ...resolvePrePrSettings({ mode: 'enforce' }), error: `pre-PR review settings are not valid JSON (${e.message}) — failing closed to enforce` };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ...resolvePrePrSettings({ mode: 'enforce' }), error: 'pre-PR review settings are not a JSON object — failing closed to enforce' };
+  }
+  const resolved = resolvePrePrSettings(parsed);
+  // A present file must say a valid `mode`, and carry only keys/values the loader understands: a missing,
+  // misspelled or nested `mode` (`{"prePrReview":{"mode":"off"}}`, `{"Mode":"off"}`), or a threshold written as a
+  // string, would otherwise silently fall back to the lenient default.
+  if (!PRE_PR_MODES.includes(parsed.mode) || resolved.ignored.length > 0) {
+    const why = !PRE_PR_MODES.includes(parsed.mode)
+      ? `has no valid \`mode\` (got ${JSON.stringify(parsed.mode)}; expected ${PRE_PR_MODES.join(' | ')})`
+      : `carries keys or values it does not understand (${resolved.ignored.join(', ')})`;
+    return { settings: { ...resolved.settings, mode: 'enforce' }, ignored: resolved.ignored, error: `pre-PR review settings ${why} — failing closed to enforce` };
+  }
+  return { ...resolved, error: '' };
 }
 
 /** Subsystem = up to two leading directories (`backlog` alone); a root file is `.` (same rule as the coroner). */
@@ -61,9 +89,12 @@ export const subsystemOf = (p) => p.split('/').slice(0, -1).slice(0, p.startsWit
  */
 export function classifyPrRisk({ files = [], hasPreparedCard = false, operatorAgent = false, settings = BUILT_IN_PRE_PR_SETTINGS } = {}) {
   const lines = files.reduce((n, f) => n + (f.additions || 0) + (f.deletions || 0), 0);
-  const subsystems = new Set(files.map((f) => subsystemOf(f.path))).size;
+  // A rename carries its SOURCE path (`from`): moving a code file under `backlog/` must not read as card-only,
+  // and both ends count as touched subsystems.
+  const paths = files.flatMap((f) => [f.path, f.from].filter(Boolean));
+  const subsystems = new Set(paths.map(subsystemOf)).size;
   const base = { lines, subsystems, files: files.length };
-  if (files.length === 0 || files.every((f) => isCardPath(f.path))) return { gated: false, cardOnly: true, reasons: [], ...base };
+  if (files.length === 0 || paths.every((p) => isCardPath(p))) return { gated: false, cardOnly: true, reasons: [], ...base };
   const reasons = [];
   if (lines > settings.maxLines) reasons.push(`${lines} lines changed (> ${settings.maxLines})`);
   if (subsystems > settings.maxSubsystems) reasons.push(`${subsystems} subsystems (> ${settings.maxSubsystems})`);
@@ -98,7 +129,9 @@ export function decidePrePrReview({ settings, risk, receipt, headTree, skip = ''
   return { action: 'refuse', why, message: msg };
 }
 
-const gitIn = (cwd, args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+/** Bounded: a hung git is a thrown check error (which `open-pr` refuses under enforce), never a silent hang. */
+export const GIT_TIMEOUT_MS = 60 * 1000;
+const gitIn = (cwd, args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
 
 export function gitDirOf(cwd) { return resolve(cwd, gitIn(cwd, ['rev-parse', '--git-dir']).trim()); }
 export function treeOf(cwd, sha = 'HEAD') { return gitIn(cwd, ['rev-parse', `${sha}^{tree}`]).trim(); }
@@ -115,8 +148,9 @@ export function readDiffFiles({ cwd, base = 'main', sha = 'HEAD', git = (a) => g
     const m = /^(\d+|-)\t(\d+|-)\t(.*)$/s.exec(parts[i]);
     if (!m) continue;
     let path = m[3];
-    if (path === '') { path = parts[i + 2] ?? ''; i += 2; }
-    if (path) files.push({ path, additions: m[1] === '-' ? 0 : Number(m[1]), deletions: m[2] === '-' ? 0 : Number(m[2]) });
+    let from = '';
+    if (path === '') { from = parts[i + 1] ?? ''; path = parts[i + 2] ?? ''; i += 2; }
+    if (path) files.push({ path, ...(from ? { from } : {}), additions: m[1] === '-' ? 0 : Number(m[1]), deletions: m[2] === '-' ? 0 : Number(m[2]) });
   }
   return { files, ref };
 }
@@ -144,6 +178,21 @@ export function recordBypass(cwd, { reason, head, risk, actor = '', operatorInst
 /** `<repo root>/.operations/pre-pr-bypass`, resolved from this file's location. */
 export function defaultBypassRecordDir() { return process.env.WE_PRE_PR_BYPASS_DIR || resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '.operations', 'pre-pr-bypass'); }
 
+/** One untrusted string as a single-line markdown code span: line breaks (CR, LF, NEL, U+2028/9, VT, FF) and other
+ *  control characters become spaces, backticks become `'`, so the text can never open a new block, a heading, a
+ *  mention or an HTML comment in the PR body. NFKC-folded first so look-alike backticks/newlines fold too. */
+export function codeSpan(text, max = 1000) {
+  // Cut to length FIRST, then strip: control, format (bidi overrides, zero-width), lone surrogates (a cut can leave
+  // half a pair), and line/paragraph separators all become a space.
+  const flat = String(text ?? '').normalize('NFKC').slice(0, max).replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]+/gu, ' ').replace(/`/g, "'").trim();
+  return `\`\` ${flat} \`\``;
+}
+
+/** The PR-body line recording a bypass. Every dynamic part is a code span. */
+export function renderBypassNote({ actor = '', reason = '', operatorInstruction = '' } = {}) {
+  return `\n\n**Pre-PR review bypassed** by ${codeSpan(actor, 200)} — reason: ${codeSpan(reason, 500)}. Operator instruction: ${codeSpan(operatorInstruction, 1000)}\n`;
+}
+
 /**
  * Who may bypass. A dispatched worker (WE_CONVEYOR_WORKER=1) never; an unrecognised marker fails closed; an
  * interactive session only with an explicit `--actor` plus a quoted operator instruction (the same honesty tax
@@ -162,8 +211,13 @@ export function authoriseBypass({ role, actor = '', operatorInstruction = '' }) 
  * The whole open-pr pre-check, over a lane checkout. IO only through `cwd` git. Returns the decision plus the risk.
  */
 export function checkPrePrReview({ cwd, base = 'main', sha = 'HEAD', env = process.env, skip = '', actor = '', operatorInstruction = '', settings, role, recordDir } = {}) {
-  const { settings: s } = settings ? { settings } : loadPrePrSettings();
+  const loaded = settings ? { settings, error: '' } : loadPrePrSettings();
+  const { settings: s } = loaded;
+  const settingsError = loaded.error || '';
   if (s.mode === 'off') return { ...decidePrePrReview({ settings: s, risk: { gated: false }, headTree: '' }), settings: s };
+  // Pin the commit ONCE: the diff, the card reads, the tree and (via the returned `sha`) the commit pr-land
+  // publishes are all this one object, never a `HEAD` that can move between the gate and the push.
+  sha = gitIn(cwd, ['rev-parse', '--verify', `${sha}^{commit}`]).trim();
   const { files } = readDiffFiles({ cwd, base, sha });
   const cards = files.filter((f) => isCardPath(f.path)).map((f) => f.path);
   const hasPreparedCard = cards.some((p) => { try { return isPreparedCard(gitIn(cwd, ['show', `${sha}:${p}`])); } catch { return false; } });
@@ -179,7 +233,19 @@ export function checkPrePrReview({ cwd, base = 'main', sha = 'HEAD', env = proce
     recordBypass(cwd, { reason: skip, head: sha, risk, actor, operatorInstruction, ...(recordDir ? { recordDir } : {}) });
     decision.bypass = { reason: skip.trim(), actor: actor.trim(), operatorInstruction: operatorInstruction.trim() };
   }
-  return { ...decision, risk, headTree, settings: s };
+  return { ...decision, risk, headTree, sha, settings: s, ...(settingsError ? { settingsError } : {}) };
+}
+
+/**
+ * The tree hash of the lane's WORKING TREE as `/converge` reads it (tracked edits plus untracked, non-ignored
+ * files — `git add -A` semantics) — computed through a throwaway index, so the lane's real index and HEAD are
+ * untouched. After the reviewed content is committed, the commit's tree equals this.
+ */
+export function workingTreeOf(cwd) {
+  const tmp = mkdtempSync(join(tmpdir(), 'pre-pr-idx-'));
+  const env = { ...process.env, GIT_INDEX_FILE: join(tmp, 'index') };
+  const run = (args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+  try { run(['read-tree', 'HEAD']); run(['add', '-A']); return run(['write-tree']).trim(); } finally { rmSync(tmp, { recursive: true, force: true }); }
 }
 
 const sessionRole = (env) => classifySession(env).role;

@@ -47,7 +47,7 @@ import {
   applyJurorInvite,
   buildEscalationPacket,
 } from './lib/converge-core.mjs';
-import { gitDirOf, treeOf, buildReceipt, RECEIPT_FILE } from './lib/pre-pr-review.mjs';
+import { gitDirOf, treeOf, workingTreeOf, buildReceipt, RECEIPT_FILE } from './lib/pre-pr-review.mjs';
 import { resolveTransport, validateLaneTarget } from './lib/converge-transports.mjs';
 import { MANDATORY_LENSES, PANEL_LENSES, panelRigorForCareLevel } from './lib/jury-core.mjs';
 import { CARE_LEVELS } from './lib/review-escalation.mjs';
@@ -135,6 +135,21 @@ function gitAt(root, args) {
   } catch {
     return null;
   }
+}
+
+/** The working-tree hash at the moment a READ is issued (the content `readMaterial` shows the panel); null on error. */
+function readTreeOf(laneRoot) {
+  try { return workingTreeOf(laneRoot); } catch { return null; }
+}
+
+/** What a landed run reviewed: the lane's real path + the tree the panel last READ — recorded only if the lane is
+ *  still exactly that content now (an edit between the last read and the land is not reviewed content). Null when
+ *  anything cannot be proven — `receipt` then refuses to stamp this run. */
+function reviewedContent(laneRoot, readTree) {
+  try {
+    const now = workingTreeOf(laneRoot);
+    return readTree && now === readTree ? { lane: realpathSync(laneRoot), tree: readTree } : null;
+  } catch { return null; }
 }
 
 /**
@@ -295,6 +310,7 @@ function init(flags) {
     roster: plan.lenses,
     dialOverrides: dial.overrides,
     state,
+    readTree: readTreeOf(target.laneRoot), // what the first READ will show; `step` refreshes it on every later READ
   };
   writeState(outPath, envelope);
 
@@ -403,7 +419,14 @@ function step(flags) {
 
   const result = convergeStep(state, obs);
   // `final` records HOW the loop ended (land | escalate) so `receipt` can refuse anything but a landed run.
-  writeState(path, { ...envelope, state: result.state, carry: carryFor(result.state.round, result.findings), ...(result.state.done ? { final: result.action } : {}) });
+  // A landed run also records WHAT it reviewed (the lane's real path and its working-tree hash — the exact content
+  // the panel read), so `receipt` can refuse a different lane or content committed after the review.
+  writeState(path, {
+    ...envelope, state: result.state, carry: carryFor(result.state.round, result.findings),
+    ...(result.action === CONVERGE_ACTIONS.READ ? { readTree: readTreeOf(envelope.ctx?.laneRoot) } : {}),
+    ...(result.state.done ? { final: result.action } : {}),
+    ...(result.state.done && result.action === CONVERGE_ACTIONS.LAND ? { reviewed: reviewedContent(envelope.ctx?.laneRoot, envelope.readTree) } : {}),
+  });
 
   /** Build the caller's next instruction — the ONE place an action becomes something to run. */
   const instruction = {};
@@ -469,7 +492,21 @@ function receipt(flags) {
   const dirty = gitAt(lane, ['status', '--porcelain', '--untracked-files=no']);
   if (dirty === null) return fail(`not a git checkout: ${lane}`);
   if (dirty.trim()) return fail('no receipt: the lane has uncommitted tracked changes. Commit first, so the receipt covers the head that will be pushed.');
+  // The panel read untracked files too, so any left uncommitted are content the receipt would not cover.
+  const untracked = (gitAt(lane, ['ls-files', '--others', '--exclude-standard']) || '').trim();
+  if (untracked) return fail(`no receipt: the lane has untracked files the panel read but the head does not contain (${untracked.split('\n').slice(0, 3).join(', ')}${untracked.split('\n').length > 3 ? ', …' : ''}). Commit or delete them, then re-run /converge if the content changed.`);
   const tree = treeOf(lane);
+  // Bind the receipt to the reviewed run: same lane, same content. (Defence against honest mistakes — reusing an
+  // old landed state file for another lane, or committing more work after the review. It is NOT tamper-proof
+  // against a hostile worker, who can write the state file or the receipt directly.)
+  const reviewed = envelope.reviewed;
+  if (!reviewed || !reviewed.lane || !reviewed.tree) {
+    return fail('no receipt: the state file records no reviewed lane/content for its `land` (it predates this check or was not produced by `step`). Re-run /converge to a fresh `land`.');
+  }
+  let realLane = lane;
+  try { realLane = realpathSync(lane); } catch { /* keep the resolved path */ }
+  if (realLane !== reviewed.lane) return fail(`no receipt: this state file's review was of lane ${reviewed.lane}, not ${realLane}.`);
+  if (tree !== reviewed.tree) return fail(`no receipt: the lane's head tree ${tree.slice(0, 12)} is not the content the panel reviewed (${String(reviewed.tree).slice(0, 12)}) — it changed after the review. Re-run /converge over the committed head.`);
   const head = gitAt(lane, ['rev-parse', 'HEAD']).trim();
   const out = resolve(gitDirOf(lane), RECEIPT_FILE);
   writeFileSync(out, `${JSON.stringify(buildReceipt({ tree, head, envelope }), null, 2)}\n`, 'utf8');

@@ -1,0 +1,18 @@
+---
+kind: task
+status: active
+scaffoldedBy: "fix-4271"
+dateScaffolded: "2026-10-07"
+dateOpened: "2026-10-07"
+tags: []
+---
+
+# Pre-PR review gate: follow-ups from PR #4271 review (lint for fail-open catch, binary-file size, flag-parse parity, trust boundary)
+
+Follow-ups left out of PR #4271 repair: (1) a standards lint against catch blocks returning a pass action inside gate code; (2) binary files count 0 lines in the risk size rule; (3) open-pr-io arg() reads the first --base/--ref while pr-land reads the last; (4) pr-land rev-parses SRC without ^{commit}; (5) bypass audit log keeps raw text while the PR body shows the normalized span; (6) a lane can edit its own copy of the settings file or receipt if open-pr runs from the lane's scripts — decide the trust boundary.
+
+## Done when
+
+1. **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/pre-pr-review.test.mjs` fails before this item lands and passes after, with one test per follow-up above (the lint in (1) as a `check:standards` rule fixture).
+2. **Must (error path)** — a gate check that errors in `enforce` mode refuses; no follow-up may add a `catch` that returns a pass action.
+3. **Must (input kinds)** — binary files, renames, and non-source files (docs, config, data) are all counted by the risk rule, never skipped.
