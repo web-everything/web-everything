@@ -5,6 +5,6 @@
   "fixDispatch": {
     "borrowBuildSlots": "on",
     "borrowAfterMinutes": 15,
-    "borrowExecutor": "claude"
+    "borrowExecutor": "codex"
   }
 }

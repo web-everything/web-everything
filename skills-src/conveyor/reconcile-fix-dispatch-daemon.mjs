@@ -63,8 +63,7 @@ import { runReconcilePass, defaultReadPrs } from '../../scripts/conveyor/reconci
 import { createDispatchThrottle } from '../../scripts/lib/dispatch-throttle.mjs'; // fix-cap + host-load
 import { createFixBorrowGate } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
 import { listBuildDispatchClaims } from '../../scripts/conveyor/build-dispatch-claim.mjs';
-import { FIX_RUN_SCRIPT } from '../../scripts/operations/dispatch-providers/fix.mjs';
-import { existsSync } from 'node:fs';
+import { fixLauncherAvailable } from '../../scripts/operations/dispatch-providers/fix.mjs';
 import { listFixDispatchClaims } from '../../scripts/conveyor/fix-claim-store.mjs';
 import { refreshLiveFixDispatchClaims } from '../../scripts/conveyor/fix-dispatch-claim.mjs'; // dup-heal-dispatch
 import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconcile-note-comment.mjs'; // #4191
@@ -643,7 +642,7 @@ export async function runTickAllRepos({
   // Card 87 — ONE borrow gate per pass (fix only; ci-heal never borrows). OFF unless `fixDispatch.borrowBuildSlots` is on.
   const borrowGate = dispatchThrottle ? createFixBorrowGate({
     listBuildClaims: () => listBuildDispatchClaims(), listFixClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }),
-    launcherAvailable: (executor) => executor === 'claude' || existsSync(FIX_RUN_SCRIPT),
+    launcherAvailable: (executor) => fixLauncherAvailable(executor),
   }) : null;
   const fix = authGate.paused ? pausedDispatchResult()
     : runReconcileFixDispatchAllRepos({ repos, ...(fixTick ? { tick: fixTick } : { queueAdmission, dispatchThrottle, borrowGate }) });
