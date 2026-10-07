@@ -8,6 +8,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { localDateString } from './local-date.mjs';
 
 const sha = (s) => createHash('sha256').update(s).digest('hex');
 
@@ -30,7 +31,7 @@ function readJson(path) {
 
 export const entryPath = (dir, key) => join(dir, 'entries', key.slice(0, 2), `${key}.json`);
 export const quarantinePath = (dir, file) => join(dir, 'quarantine', `${sha(file)}.json`);
-export const shadowLogPath = (dir, runId, date = new Date()) => join(dir, 'shadow', date.toISOString().slice(0, 10), `${runId}.jsonl`);
+export const shadowLogPath = (dir, runId, date = new Date()) => join(dir, 'shadow', localDateString(date), `${runId}.jsonl`);
 
 /** The stored result for a key, or null (missing / unparsable / a different key inside). */
 export function readEntry(dir, key) {
