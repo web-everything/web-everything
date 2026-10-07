@@ -17,7 +17,7 @@ import { isAnnotationPr } from '../backlog-stranded-sweep.mjs'; // #3441 round 2
 
 /** Default gh runner — spawnSync (returns non-zero without throwing). */
 export function ghRun(args, opts = {}) {
-  const r = spawnSync('gh', args, { encoding: 'utf8', ...opts });
+  const r = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, ...opts }) // #74d: oversize => status null => status 1, never a truncated success;
   return { status: r.status == null ? 1 : r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
 }
 

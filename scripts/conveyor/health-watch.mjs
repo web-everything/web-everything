@@ -46,6 +46,7 @@ import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { archiveClaudeJobs, formatClaudeJobsArchiveLine } from './claude-jobs-archive.mjs';
 import { sweepOurTmp, readBusyTopLevel, formatTmpSweepLine } from './tmp-sweep.mjs';
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
+import { readGit } from '../lib/proc-read.mjs';
 import { execFileSync, spawn } from 'node:child_process';
 import {
   existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, openSync, readSync, closeSync, unlinkSync,
@@ -500,7 +501,7 @@ export function probeLanePools(logsDir) {
  */
 export function probeLaneVerifyMarkers({ poolRoot, readHead } = {}) {
   if (!poolRoot) return [];
-  const head = readHead || ((dir) => { try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } });
+  const head = readHead || ((dir) => { try { return readGit(['rev-parse', 'HEAD'], { cwd: dir, timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } });
   const out = [];
   for (const pool of poolsWithLanes(poolRoot)) {
     for (const lane of laneIndicesIn(join(poolRoot, pool))) {

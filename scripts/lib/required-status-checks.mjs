@@ -37,7 +37,8 @@
  * CI checks, retaining red/pending/unchecked evidence rather than treating an empty required set as green.
  * Cache entries coexist by repo@branch; legacy single-entry sidecars are migrated on the next write.
  */
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
+import { readGh } from './proc-read.mjs';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { looksLikePersonalAccessDenial, resolvePersonalRouteEnabled, runGhCliPassthrough } from './gh-throttle.mjs';
@@ -105,7 +106,7 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main' } = {}) 
     }
     out = String(result.stdout ?? '');
   } else {
-    out = execFileSync('gh', args, opts);
+    out = readGh(args, opts); // #74d: failure/oversize throws; never parsed as empty
   }
   const parsed = JSON.parse(out.trim() || '[]');
   if (!Array.isArray(parsed)) throw new Error('required-status-checks: unexpected shape from branch protection');
