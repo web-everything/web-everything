@@ -17,6 +17,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOperatorRulings } from '../lib/jury-core.mjs';
 import { currentActorId } from '../lib/review-independence.mjs';
 import { referralCardReadable } from '../review-set-label.mjs';
+import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { idFromName, normalizeId } from '../backlog/id.mjs';
 import { openReferralFindings, OPERATOR_RULING_POST_EFFECT, OPERATOR_RULING_FOLLOW_UP_EFFECT, RULING_NEEDED_LABEL } from './record-referral-ruling.mjs';
 
@@ -66,8 +67,11 @@ export function resolveCardRef(requested, { root = REPO_ROOT, listFiles = (d) =>
 }
 
 export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = ghJson, now = () => new Date().toISOString(),
-  env = process.env, readable = referralCardReadable } = {}) {
+  env = process.env, readable = referralCardReadable,
+  // Item 113 — the ruling is judged with THIS checkout's code; refuse from a stale one (see `assertOperatorCliFresh`).
+  assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-referral-ruling', env }) } = {}) {
   return ({ repo, pr, card }) => {
+    assertFresh();
     const thread = readPrThread(repo, pr, { readJson });
     const cardReadable = (ref) => readable(ref, root);
     const open = openReferralFindings({ comments: thread.comments, repo, pr: Number(pr), head: thread.headRefOid,
