@@ -101,7 +101,8 @@ it.each([
 });
 
 it.each([
-  ['Resource not accessible by integration (HTTP 403)', 60_000, true, 'declared'],
+  // A denial past TTL no longer replaces the seeded live entry with the declared set (#4708): stale-cache wins.
+  ['Resource not accessible by integration (HTTP 403)', 60_000, true, 'stale-cache'],
   ['offline', 60_000, true, 'stale-cache'],
   ['offline', 24 * 60 * 60_000, true, 'stale-cache'],
   ['offline', 2 * 24 * 60 * 60_000, false, 'stale-cache'],
