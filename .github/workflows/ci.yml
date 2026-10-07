@@ -172,8 +172,20 @@ jobs:
         working-directory: web-everything
         # Card 11: files are assigned to this shard by MEASURED time (scripts/ci/shard-assign.mjs +
         # scripts/ci/test-timings.json), not vitest's blind `--shard=i/N`. Every file is in exactly one shard.
+        # The assignment is captured with `out=$(…)` (not `mapfile < <(…)`): bash drops a process substitution's
+        # exit status, so a rejected assignment used to leave `files` empty and run the WHOLE suite in this shard.
+        # Under the default `bash -e`, a failing `out=$(…)` fails the step; an empty list is refused too, because
+        # no filters means every test. (A `while read` loop keeps this portable to bash 3.2, which the test runs on.)
         run: |
-          mapfile -t files < <(node scripts/ci/shard-assign.mjs --suite=unit --shard=${{ matrix.shard }}/${{ strategy.job-total }})
+          out=$(node scripts/ci/shard-assign.mjs --suite=unit --shard=${{ matrix.shard }}/${{ strategy.job-total }})
+          files=()
+          while IFS= read -r f; do
+            if [ -n "$f" ]; then files+=("$f"); fi
+          done <<<"$out"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::shard-assign returned no test files for unit shard ${{ matrix.shard }}/${{ strategy.job-total }}; refusing to run vitest with no filters (that is the whole suite)"
+            exit 1
+          fi
           echo "unit shard ${{ matrix.shard }}/${{ strategy.job-total }}: ${#files[@]} files"
           npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}"
 
