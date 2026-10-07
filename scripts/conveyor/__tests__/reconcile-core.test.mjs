@@ -3652,3 +3652,26 @@ it('a legacy load-flake stand-down on a repo the reverify pass never sweeps stay
   expect(kinds('frontier-ui/frontierui')).not.toContain('load-flake-hold');
   expect(kinds('web-everything/web-everything')).toContain('load-flake-hold');
 });
+
+// ── xuz8m83 — a rejected card batch is extracted, not fixed in place ──────────────────────────────────────────
+describe('card-batch extraction routing (#4703, xuz8m83)', () => {
+  const plan = (over) => planReconcile({ prs: [pr1563(over)], agents: [], durableCounts: {}, now: NOW });
+
+  it('plans `card-batch-extract` (not `fix`) for a lane/card-batch-* PR labelled review:changes', () => {
+    const { dispatch } = plan({ headRefName: 'lane/card-batch-prevention-4' });
+    expect(dispatch.map((d) => d.kind)).toEqual(['card-batch-extract']);
+    expect(dispatch[0].prNumber).toBe(1563);
+    expect(dispatch[0].headRefName).toBe('lane/card-batch-prevention-4');
+    expect(DISPATCH_KINDS).toContain('card-batch-extract');
+  });
+
+  it('plans a rebuilt remainder batch (…-r1) the same way', () => {
+    expect(plan({ headRefName: 'lane/card-batch-prevention-4-r1' }).dispatch.map((d) => d.kind)).toEqual(['card-batch-extract']);
+  });
+
+  it('any other PR, including look-alike names, still plans `fix` exactly as before', () => {
+    for (const headRefName of ['lane/2612-converge-pr-drive', 'lane/card-extract-5-abc1234', 'card-batch-prevention-1', 'lane/xx-card-batch-1']) {
+      expect(plan({ headRefName }).dispatch.map((d) => d.kind)).toEqual(['fix']);
+    }
+  });
+});

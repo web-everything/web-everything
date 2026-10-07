@@ -205,7 +205,7 @@ import {
 // gate below), so the review this pass would otherwise dispatch the moment CI finishes is instead HELD until
 // this fires and un-drafts it — closing the "6 of 26 PRs got reviewed before their own first CI run even
 // finished" measurement (operator, 2026-09-27) that motivated this whole feature.
-export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label', 'close-superseded']);
+export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label', 'close-superseded', 'card-batch-extract']);
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#REFUSAL_KINDS — every reason this pass declines to dispatch. Frozen and
@@ -2588,14 +2588,18 @@ export function planReconcile({
       continue;
     }
 
+    // A rejected card batch (`lane/card-batch-*`, #4703) is not repaired in place: the one rejected card is extracted
+    // into its own PR (`we:scripts/operations/card-batch-extract.mjs`) and the rest are re-sealed. Only this plain
+    // bounce routes there; conflict/advisory/ruling fixes above keep their own `fix` kind.
+    const isCardBatch = String(pr?.headRefName ?? '').startsWith('lane/card-batch-');
     dispatch.push({
-      ...base, ...withPhase, kind: 'fix', findings, attempts,
-      why: `bounced with ${findings} finding(s), nothing live is working it, and ${attempts} of ${effectiveRoundCap} attempts are spent`,
+      ...base, ...withPhase, kind: isCardBatch ? 'card-batch-extract' : 'fix', findings, attempts,
+      why: `bounced with ${findings} finding(s), nothing live is working it, and ${attempts} of ${effectiveRoundCap} attempts are spent${isCardBatch ? ' — card batch: extract the rejected card instead of an in-place fix' : ''}`,
     });
   }
 
   for (const entry of dispatch) {
-    if (entry.kind !== 'fix') continue;
+    if (entry.kind !== 'fix' && entry.kind !== 'card-batch-extract') continue;
     const sourcePr = prs.find((pr) => Number(pr?.number) === entry.prNumber);
     // Older/hand-opened PRs may lack an episode marker; creation still bounds starvation.
     const since = fixWaitingSince(sourcePr?.comments) || sourcePr?.createdAt;
