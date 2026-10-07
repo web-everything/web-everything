@@ -67,3 +67,10 @@ it('kill file and label helpers honor overrides', () => {
   expect(hasFixHoldLabel(['custom'], { WE_FIX_HOLD_LABEL: 'custom' })).toBe(true);
   expect(hasFixHoldLabel(undefined, {})).toBe(false);
 });
+it('stub sessions from the daemon smoke never count as repair attempts (#4194 mixed-state: real heal still owed)', () => {
+  const stubs = [row({ session: 'stub-ci-heal' }), row({ session: 'stub-ci-heal' }), row({ session: 'stub-fix' })];
+  expect(state(stubs)).toEqual({ count: 0, held: false, since: null, sessions: [] });
+  expect(fixLoopBreaches({ rows: stubs, prs: [{ repo: 'we', number: 3990, headRefOid: head }], now, config })).toEqual([]);
+  // real sessions on the same head still hold
+  expect(state([...stubs, row({ session: 'ci-heal-3990' }), row({ session: 'ci-heal-3990' }), row({ session: 'fix-3990' })]).held).toBe(true);
+});

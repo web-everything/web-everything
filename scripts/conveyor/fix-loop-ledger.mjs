@@ -21,8 +21,11 @@ export function fixLoopConfig(env = process.env) {
     hold: env.WE_FIX_LOOP_HOLD !== '0',
   };
 }
+/** Rows written by the daemon-live-smoke's stub dispatchers (`stub-ci-heal`, `stub-fix`) are not real sessions:
+ *  they once poisoned the live ledger and auto-held real red PRs (#4194, 2026-10-07). Never evidence. */
+export const isStubSession = (session) => typeof session === 'string' && /^stub-/.test(session);
 function validRow(row) {
-  return row?.v === 1 && typeof row.repo === 'string' && Number.isInteger(row.pr) && row.pr > 0
+  return !isStubSession(row?.session) && row?.v === 1 && typeof row.repo === 'string' && Number.isInteger(row.pr) && row.pr > 0
     && ['ci-heal', 'fix'].includes(row.kind) && /^[a-f\d]{40}$/i.test(row.head ?? '')
     && typeof row.at === 'string' && Number.isFinite(Date.parse(row.at));
 }
