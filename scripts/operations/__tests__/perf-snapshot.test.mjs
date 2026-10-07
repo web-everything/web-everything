@@ -233,11 +233,15 @@ describe('perf-snapshot IO with isolated stores and injected gh', () => {
     }
   }));
 
+  it('refuses to write a baseline with a silent CI gap when gh fails', () => withTemp(({ archive, env, home }) => {
+    expect(() => backfillBaseline({ archive, env, home, gh: () => null })).toThrow(/CI wall read failed/);
+  }));
+
   it('appends a baseline and snapshots, retains raw JSON and compares both references', () => withTemp(async ({ archive, env, home }) => {
     const dir = join(home, 'perf'), store = join(dir, 'snapshots.jsonl');
     const sink = createPerfSnapshotSinks({ env, home, gh: () => null })[PERF_SNAPSHOT_EFFECT];
     const payload = { store, dir, archive, hours: 24, now: '2026-10-08T14:05:00.000Z' };
-    await sink({ ...payload, backfill: true });
+    await sink({ ...payload, backfill: true, noCi: true });
     const first = await sink({ ...payload, backfill: false });
     const rows = () => parseStore(readFileSync(store, 'utf8'));
     expect(rows().map((r) => r.kind)).toEqual(['baseline', 'snapshot']);
