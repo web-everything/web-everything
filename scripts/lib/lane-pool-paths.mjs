@@ -18,6 +18,7 @@
  */
 import { homedir } from 'node:os';
 import { join, dirname, sep } from 'node:path';
+import { CLONES_DIR_NAME } from './daemon-clone-layout.mjs';
 
 /** `~`-expansion against a supplied home, so the whole module stays pure over its inputs. */
 const expandHome = (p, home) => (p && p.startsWith('~') ? join(home, p.slice(1)) : p);
@@ -32,7 +33,7 @@ const expandHome = (p, home) => (p && p.startsWith('~') ? join(home, p.slice(1))
  * `.operations`) likewise resolves above `.operations` (coroner #32). From a primary checkout it is simply
  * the parent.
  *
- * The `.lanes` and `.operations` matches take the FIRST (OUTERMOST) marker — the same reason
+ * The `.lanes`, `.operations` and `.daemon-clones/<name>` matches take the FIRST (OUTERMOST) marker — the same reason
  * `judge-spawn.mjs#laneRootOf` is non-greedy: a path that happens to contain a nested `.lanes` must not
  * re-root the answer.
  *
@@ -46,8 +47,12 @@ export function workspaceFor(path) {
   const operationsIndex = s.indexOf(`${operationsMarker}${sep}`);
   const operationsStart = operationsIndex >= 0 ? operationsIndex
     : s.endsWith(operationsMarker) ? s.length - operationsMarker.length : -1;
-  const i = laneIndex < 0 ? operationsStart
-    : operationsStart < 0 ? laneIndex : Math.min(laneIndex, operationsStart);
+  const cloneMarker = `${sep}${CLONES_DIR_NAME}${sep}`;
+  const cloneIndex = s.indexOf(cloneMarker);
+  const cloneStart = cloneIndex >= 0 && s.slice(cloneIndex + cloneMarker.length).split(sep)[0]
+    ? cloneIndex : -1;
+  const indices = [laneIndex, operationsStart, cloneStart].filter(index => index >= 0);
+  const i = indices.length ? Math.min(...indices) : -1;
   return i >= 0 ? s.slice(0, i) : dirname(s);
 }
 

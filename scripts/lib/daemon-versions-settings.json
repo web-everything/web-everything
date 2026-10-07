@@ -1,0 +1,17 @@
+{
+  "enabled": {},
+  "clonesRoot": null,
+  "keep": 3,
+  "retainMinAgeMs": 21600000,
+  "nodeModules": "store-link",
+  "nodeModulesStore": null,
+  "carryPaths": ["scripts/rust-scan/target"],
+  "statePaths": [".conveyor", ".operations", ".claude/settings.local.json", ".claude/lane-ports.json", "reports/.required-status-checks-cache.json"],
+  "carryUntracked": true,
+  "pickup": "per-tick",
+  "updater": "in-tick",
+  "probationMs": 900000,
+  "autoRollback": true,
+  "restartJitterMs": 30000,
+  "requestPollMs": 5000
+}

@@ -27,6 +27,7 @@ const FIXTURE = fileURLToPath(new URL('./fixtures/queue-op.mjs', import.meta.url
 const MODULE_FILES = [
   'scripts/conveyor/queue-store.mjs',
   'scripts/lib/automation-home.mjs',
+  'scripts/lib/daemon-clone-layout.mjs', // card 89 S1 — logical clone identity, imported by automation-home + daemon-last-good
   'scripts/lib/daemon-last-good.mjs',
   'scripts/lib/constellation-repos.mjs',
 ];

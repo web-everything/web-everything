@@ -1195,6 +1195,7 @@ describe('the watchdog shares NONE of the driver\'s own decision logic', () => {
       'branch-sync.mjs',            // gitRun / notifyDesktop / decideEscalation / defaultAppendLog (#3472)
       'claude-agents-cache.mjs',    // hot-cache — short-TTL file cache for `claude agents --json` (leaf: builtins only)
       'constellation-repos.mjs',   // decouple-primary-checkout — the primary's dir names, for the legacy queue read
+      'daemon-clone-layout.mjs',    // card 89 S1 — logical clone identity for daemon-last-good's cloneKeyOf (leaf: builtins only)
       'daemon-last-good.mjs',       // decouple-primary-checkout — daemonConveyorStateRoot (the state home)
       'driver-mode.mjs',            // the launch-posture sidecar's GRAMMAR — bounded vs resident, path+parse only
       'driver-watchdog.mjs',

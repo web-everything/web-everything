@@ -10,7 +10,7 @@
  * WHY THE STATE FILE LIVES OUTSIDE THE CLONE. Clause 3(iii) pins per-clone daemon state (queue, scorecard,
  * overlay list) to a root given by env/flag, never inside the git tree the daemon rebuilds — a `git reset
  * --hard` (Module C) must never wipe the record of what to merge back in. `cloneKey(root)` derives a stable,
- * filesystem-safe id from the clone's realpath (falling back to a plain `resolve` if `realpathSync` throws,
+ * filesystem-safe id from the clone's canonical logical root (realpath first, falling back to a plain `resolve` if `realpathSync` throws,
  * e.g. a path that does not exist yet) so two different spellings of the same clone (a symlink vs. its
  * target) collide on the same state file, mirroring `daemon-clone-lock.mjs`'s own per-clone id scheme
  * (Module A, same ruling clause) — reuse this one function everywhere per-clone state lives, never re-derive.
@@ -35,11 +35,12 @@
  */
 
 import {
-  readFileSync, writeFileSync, renameSync, mkdirSync, appendFileSync, realpathSync, rmdirSync, statSync,
+  readFileSync, writeFileSync, renameSync, mkdirSync, appendFileSync, rmdirSync, statSync,
 } from 'node:fs';
-import { join, dirname, resolve as resolvePath } from 'node:path';
+import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { canonicalCloneRoot } from './daemon-clone-layout.mjs';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
 
 /** Env var that pins the overlay state root outside any git tree (ruling clause 3(iii)). */
@@ -51,19 +52,13 @@ function overlayDir(env = process.env) {
   return fromEnv || join(homedir(), '.claude', 'daemon-overlays');
 }
 
-/** PURE-ish (one fs stat, no writes): the clone's realpath, falling back to a plain `resolve` if the path does
- *  not exist yet or `realpathSync` otherwise throws — same fallback `daemon-clone-lock.mjs` (Module A) uses
- *  for its own per-clone lock id, so both modules key the SAME clone identically. */
+/** Resolve symlinks before mapping version folders back to their logical clone identity. */
 function resolveCloneRoot(root) {
-  try {
-    return realpathSync(root);
-  } catch {
-    return resolvePath(root);
-  }
+  return canonicalCloneRoot(root);
 }
 
 /**
- * Stable, filesystem-safe id for a clone root: sha256 of its resolved path, first 16 hex chars. Two spellings
+ * Stable, filesystem-safe id for a clone root: sha256 of its canonical logical path, first 16 hex chars. Two spellings
  * of the same clone (symlink vs. target) collide on the same id. Reuse this everywhere per-clone state lives.
  * @param {string} root
  * @returns {string}
