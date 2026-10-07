@@ -1034,16 +1034,32 @@ describe('alwaysRunPlan (item 99)', () => {
     const plan = alwaysRunPlan({ declared, fileExists: (f) => !f.startsWith('c/'), testTimeoutFactor: 3 });
     expect(plan.files).toEqual(['a/guard.test.mjs', 'b/contract.test.mjs']);
     expect(plan.skipped).toEqual(['c/missing.test.mjs']);
-    expect(plan.command).toMatch(/^npx vitest run 'a\/guard\.test\.mjs' 'b\/contract\.test\.mjs' --passWithNoTests --testTimeout=/);
+    expect(plan.command).toMatch(/^npx vitest run 'a\/guard\.test\.mjs' 'b\/contract\.test\.mjs' --testTimeout=/);
+    // No --passWithNoTests: a guard the vitest config excludes must fail loudly, not "pass" having run zero tests.
+    expect(plan.command).not.toContain('--passWithNoTests');
   });
   it('skips files a scan command already runs, and yields no command for an empty set', () => {
     const plan = alwaysRunPlan({ declared, fileExists: () => true, scanCommands: ["npx vitest run 'a/guard.test.mjs'"] });
     expect(plan.files).toEqual(['b/contract.test.mjs', 'c/missing.test.mjs']);
     expect(alwaysRunPlan({ declared: [], fileExists: () => true }).command).toBeNull();
   });
-  it('is recorded in the phase telemetry', () => {
-    const phases = buildVerifyPhases({ decision: {}, alwaysRun: { files: ['a'], skipped: ['b'], ms: 1234.4, result: 'passed' } });
-    expect(phases.alwaysRun).toEqual({ ran: ['a'], skipped: ['b'], ms: 1234, result: 'passed' });
+  it('never lets a declared entry become a vitest option, even if validation was bypassed', () => {
+    const plan = alwaysRunPlan({ declared: ['-u', '--bail', 'ok.test.mjs'], fileExists: () => true });
+    expect(plan.files).toEqual(['ok.test.mjs']);
+    expect(plan.skipped).toEqual(['-u', '--bail']);
+    expect(plan.command).toMatch(/^npx vitest run 'ok\.test\.mjs'/);
+    expect(plan.command).not.toMatch(/'-/);
+  });
+  it('treats ./x.test.mjs and x.test.mjs as one entry', () => {
+    expect(alwaysRunPlan({ declared: ['x.test.mjs', './x.test.mjs'], fileExists: () => true }).files).toEqual(['x.test.mjs']);
+  });
+  it('is recorded in the phase telemetry, and `ran` is empty unless the guard actually executed', () => {
+    const ranPhases = buildVerifyPhases({ decision: {}, alwaysRun: { files: ['a'], skipped: ['b'], executed: true, ms: 1234.4, result: 'passed' } });
+    expect(ranPhases.alwaysRun).toEqual({ planned: ['a'], ran: ['a'], executed: true, skipped: ['b'], ms: 1234, result: 'passed' });
+    const notRun = buildVerifyPhases({ decision: {}, alwaysRun: { files: ['a'], skipped: [] } });
+    expect(notRun.alwaysRun).toEqual({ planned: ['a'], ran: [], executed: false, skipped: [], ms: null, result: null });
+    expect(formatVerifyPhases(notRun)).toContain('alwaysRun=not-run');
+    expect(formatVerifyPhases(ranPhases)).toContain('alwaysRun=1files/1234ms');
     expect(buildVerifyPhases({ decision: {} }).alwaysRun).toBeUndefined();
   });
 });

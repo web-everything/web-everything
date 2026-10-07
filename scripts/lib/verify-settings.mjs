@@ -48,7 +48,9 @@ const rules = {
   relatedMaxTests: value => Number.isSafeInteger(value) && value >= 0,
   relatedDepth: value => Number.isSafeInteger(value) && value >= 1,
   alwaysRunTests: value => Array.isArray(value) && value.length <= 50
-    && value.every(f => typeof f === 'string' && /^[\w./@-]+$/.test(f) && !f.startsWith('/') && !f.split('/').includes('..')),
+    // Each entry becomes a vitest file argument: it must start with a word character (never `-`, so `-u` / `--bail`
+    // cannot become a vitest option), be a test file, and stay inside the repo.
+    && value.every(f => typeof f === 'string' && /^(?:\.\/)?[\w@][\w./@-]*\.test\.[cm]?[jt]sx?$/.test(f) && !f.split('/').includes('..')),
 };
 const envKeys = {
   relatedMode: 'WE_VERIFY_RELATED', testTimeoutFactor: 'WE_VERIFY_TEST_TIMEOUT_FACTOR',

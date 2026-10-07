@@ -164,9 +164,15 @@ describe('#5128 — related selection settings', () => {
 
 describe('alwaysRunTests setting (#99)', () => {
   it('rejects unsafe entries per key and an empty-but-set env switches the set off', () => {
-    for (const bad of ['a.test.mjs', ['/abs.test.mjs'], ['../x.test.mjs'], [1], ['a b.test.mjs']]) {
+    for (const bad of ['a.test.mjs', ['/abs.test.mjs'], ['../x.test.mjs'], [1], ['a b.test.mjs'],
+      // a leading dash is a vitest option, not a path; a non-test file would not be a guard at all
+      ['-u'], ['--bail'], ['--passWithNoTests'], ['-u.test.mjs'], ['--config=x.test.mjs'], ['ok.test.mjs', '--bail'], ['package.json'], ['scripts/x.mjs']]) {
       expect(resolveVerifySettings({ fileConfig: { alwaysRunTests: bad }, env: {} }).values.alwaysRunTests).toEqual([]);
     }
+    for (const bad of ['-u', '--bail', 'a.test.mjs,--bail', 'package.json']) {
+      expect(resolveVerifySettings({ fileConfig: { alwaysRunTests: ['k.test.mjs'] }, env: { WE_VERIFY_ALWAYS_RUN_TESTS: bad } }).values.alwaysRunTests, bad).toEqual(['k.test.mjs']);
+    }
+    expect(resolveVerifySettings({ fileConfig: {}, env: { WE_VERIFY_ALWAYS_RUN_TESTS: './a/b.test.ts,c/d.test.cjs' } }).values.alwaysRunTests).toEqual(['./a/b.test.ts', 'c/d.test.cjs']);
     expect(resolveVerifySettings({ fileConfig: { alwaysRunTests: ['a.test.mjs'] }, env: { WE_VERIFY_ALWAYS_RUN_TESTS: '' } }).values.alwaysRunTests).toEqual([]);
   });
 });

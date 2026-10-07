@@ -14,6 +14,7 @@
  *   refused                the gate was refused before it ran
  *   infra                  the verification infrastructure failed (dispatcher ceiling, no verdict)
  */
+import { posix } from 'node:path';
 import { FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION } from './gate-timeout-retry.mjs';
 
 export const RED_CAUSES = Object.freeze(['in-diff-failure', 'out-of-diff-flaky', 'out-of-diff-still-red', 'test-timeout',
@@ -22,13 +23,62 @@ export const RED_CAUSES = Object.freeze(['in-diff-failure', 'out-of-diff-flaky',
 const TIMEOUT = /timed out in \d+\s*ms|Test timed out/i;
 const filesOf = (details) => [...new Set((details?.tests ?? []).map(t => t.file))];
 
+// A relative module specifier: `from './x'`, `import './x'`, and any call taking one as its first argument —
+// `import('./x')`, `require('./x')`, `vi.mock('./x')`, `vi.importActual('./x')`. Each `\s*` is preceded by a distinct
+// literal, so matching is linear (no adjacent quantifiers); the text is also capped per file.
+const RELATIVE_SPECIFIER = /(?:\bfrom|\bimport|\()\s*(['"])(\.{1,2}\/[^'"\n]*)\1/g;
+const MAX_SOURCE_CHARS = 200_000;
+const RESOLVE_SUFFIXES = ['', '.mjs', '.js', '.ts', '.cjs', '.mts', '.jsx', '.tsx', '/index.mjs', '/index.js', '/index.ts'];
+// `./foo.js` is often written for a `foo.ts` on disk (TS ESM convention).
+const TS_TWINS = { '.js': ['.ts', '.tsx'], '.mjs': ['.mts'], '.jsx': ['.tsx'] };
+
+/**
+ * Does `testFile` import (directly or through other repo files, up to `maxDepth` hops) one of the `changedFiles`?
+ * That is what makes a failure in an UNEDITED test the change's own regression: a source-only edit breaks the test
+ * that imports it, and the test file itself is not in the diff. Pure over the injected `readFile` (repo-relative path →
+ * text, throws when absent); a cycle or an unreadable file ends that branch. False when the diff is unknown. When the
+ * walk is cut short by `maxDepth` / `maxFiles` the answer is TRUE: the test is deep in the diff's import graph, and
+ * "unknown" must not be read as "outside the diff".
+ * @param {{testFile: string, changedFiles: string[]|null|undefined, readFile: (path: string) => string, maxDepth?: number, maxFiles?: number}} a
+ */
+export function testReachesChanged({ testFile, changedFiles, readFile, maxDepth = 4, maxFiles = 300 }) {
+  if (!Array.isArray(changedFiles) || !changedFiles.length || typeof readFile !== 'function') return false;
+  const changed = new Set(changedFiles.map(f => posix.normalize(f)));
+  if (changed.has(posix.normalize(testFile))) return true;
+  const seen = new Set([posix.normalize(testFile)]);
+  let frontier = [posix.normalize(testFile)];
+  let reads = 0;
+  for (let depth = 0; depth < maxDepth && frontier.length; depth++) {
+    const next = [];
+    for (const file of frontier) {
+      let text;
+      try { text = String(readFile(file)).slice(0, MAX_SOURCE_CHARS); } catch { continue; }
+      if (++reads > maxFiles) return true;
+      for (const [, , specifier] of text.matchAll(RELATIVE_SPECIFIER)) {
+        const base = posix.normalize(posix.join(posix.dirname(file), specifier));
+        const ext = Object.keys(TS_TWINS).find(e => base.endsWith(e));
+        const candidates = [...RESOLVE_SUFFIXES.map(s => base + s), ...(ext ? TS_TWINS[ext].map(t => base.slice(0, -ext.length) + t) : [])];
+        for (const candidate of candidates) {
+          if (changed.has(candidate)) return true;
+          if (!seen.has(candidate)) { seen.add(candidate); next.push(candidate); }
+        }
+      }
+    }
+    frontier = next;
+  }
+  // Frontier files still unread when the depth cap hit (only those that exist count): unknown → treat as reaching.
+  return frontier.some((file) => { try { readFile(file); return true; } catch { return false; } });
+}
+
 /**
  * @param {{exitCode?: number|null, signal?: string|null, infrastructure?: {reason?: string}|null,
  *   phaseResults?: {phase: string, result: {exitCode: number, signal?: string|null, failureDetails?: object}}[],
- *   isolatedRetry?: string|null, retriedFailures?: {file: string}[], changedFiles?: string[]|null, refused?: boolean}} a
+ *   isolatedRetry?: string|null, retriedFailures?: {file: string}[], changedFiles?: string[]|null, refused?: boolean,
+ *   touchesDiff?: (file: string) => boolean}} a  `touchesDiff` says an UNEDITED failing test reaches the diff (see
+ *   `testReachesChanged`): such a failure is the change's own regression, not one "outside the diff".
  * @returns {{redCause: string, redCauseFiles: string[]}|null} null when nothing was red (and no flake was absorbed)
  */
-export function classifyRedCause({ exitCode, signal, infrastructure, phaseResults = [], isolatedRetry, retriedFailures = [], changedFiles, refused } = {}) {
+export function classifyRedCause({ exitCode, signal, infrastructure, phaseResults = [], isolatedRetry, retriedFailures = [], changedFiles, refused, touchesDiff } = {}) {
   const retried = (retriedFailures ?? []).map(f => f.file);
   if (refused) return { redCause: 'refused', redCauseFiles: [] };
   if (infrastructure) {
@@ -47,9 +97,15 @@ export function classifyRedCause({ exitCode, signal, infrastructure, phaseResult
   if (first.phase === 'standards') return { redCause: 'standards', redCauseFiles: files };
   if (first.phase === 'scan') return { redCause: 'scan', redCauseFiles: files };
   const vitestFiles = filesOf(first.result.failureDetails);
-  if (isolatedRetry === STILL_RED_IN_ISOLATION) return { redCause: 'out-of-diff-still-red', redCauseFiles: retried.length ? retried : vitestFiles };
-  if (TIMEOUT.test(first.result.failureDetails?.summary ?? '')) return { redCause: 'test-timeout', redCauseFiles: vitestFiles };
   const changed = new Set(changedFiles ?? []);
-  const outside = vitestFiles.length > 0 && Array.isArray(changedFiles) && vitestFiles.every(f => !changed.has(f));
+  // In the diff: the failing file was edited, or it (transitively) imports an edited file.
+  const inDiff = (f) => changed.has(f) || (typeof touchesDiff === 'function' && touchesDiff(f) === true);
+  if (isolatedRetry === STILL_RED_IN_ISOLATION) {
+    const failing = retried.length ? retried : vitestFiles;
+    return { redCause: failing.some(inDiff) ? 'in-diff-failure' : 'out-of-diff-still-red', redCauseFiles: failing };
+  }
+  if (TIMEOUT.test(first.result.failureDetails?.summary ?? '')) return { redCause: 'test-timeout', redCauseFiles: vitestFiles };
+  // A truncated failure list cannot prove every failing file is outside the diff, so it never yields "outside".
+  const outside = vitestFiles.length > 0 && Array.isArray(changedFiles) && !first.result.failureDetails?.truncated && vitestFiles.every(f => !inDiff(f));
   return { redCause: outside ? 'out-of-diff-still-red' : 'in-diff-failure', redCauseFiles: vitestFiles };
 }
