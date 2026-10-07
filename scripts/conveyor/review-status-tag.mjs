@@ -195,6 +195,8 @@ export function describeReviewState({ labels = [], status = null } = {}) {
     }
     return { code: 'changes-waiting-then-human', text: 'send-back waiting for a fix, then needs operator approval' };
   }
+  // A preserved draft-withdrawn label is a durable state that wins over a derived one (see the label planner).
+  if (names.includes('review-status:draft-withdrawn')) return { code: 'draft-withdrawn', text: 'draft withdrawn' };
   if (state) return { code: state, text: state.replaceAll('-', ' ') };
   const lone = names.find((n) => /^review:(changes|human|pending|accepted)$/.test(n));
   return lone ? { code: lone, text: lone.replace(':', ' ') } : null;

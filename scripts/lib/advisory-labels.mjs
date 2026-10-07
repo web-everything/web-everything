@@ -166,6 +166,9 @@ export function planAdvisoryRepairLabels({ currentLabels = [], comments = [], he
   const none = { add: null, remove: [] };
   const names = labelNames(currentLabels);
   if (!names.includes(REVIEW_HUMAN) || !String(headRefOid ?? '')) return none;
+  // #4177 follow-up (item 108): a send-back (review:changes) strips the advisory labels while the head is
+  // unchanged, so the old advisory still "covers" it. Never re-add one onto a sent-back PR.
+  if (names.includes('review:changes')) return none;
   const latest = latestAdvisory(trustedAdvisoryComments(comments));
   if (!latest || !advisoryCoversHead(latest, headRefOid)) return none;
   const plan = planAdvisoryLabels({ outcome: latest.outcome, currentLabels: names });
