@@ -808,7 +808,56 @@ async function main(argv) {
     buildQueueArgs.push(`--backlog-dir=${flags['backlog-dir']}`);
     process.env.WE_BACKLOG_DIR = flags['backlog-dir'];
   }
-  const buildQueue = await runJson('node', [BACKLOG_CLI, ...buildQueueArgs], { errors, label: 'build-queue' });
+  // 78c — every independent child read starts HERE and is awaited where the sequential code used it, so the
+  // wall time is the slowest read, not their sum. Each read collects its errors privately and they are merged in
+  // the original order below, so `errors[]` (and so the health verdict) is identical to the sequential run.
+  const subTimings = {};
+  const timedRead = (label, fn) => {
+    const t0 = performance.now();
+    return Promise.resolve().then(fn).finally(() => { subTimings[label] = Math.round(performance.now() - t0); });
+  };
+  const readWithErrors = (label, fn) => {
+    const own = [];
+    const promise = timedRead(label, () => fn(own));
+    promise.catch(() => {});
+    return { promise, own };
+  };
+  const skipLanePool = typeof flags['backlog-dir'] === 'string' || flags['no-lane-pool'] === true;
+  const bqRead = readWithErrors('build-queue', (own) => runJson('node', [BACKLOG_CLI, ...buildQueueArgs], { errors: own, label: 'build-queue' }));
+  let poolRead = null;
+  let scopeRead = null;
+  if (!skipLanePool) {
+    const poolArgs = ['status', '--leased-only', '--json'];
+    if (typeof flags.repo === 'string') poolArgs.push(`--repo=${flags.repo}`);
+    if (typeof flags.name === 'string') poolArgs.push(`--name=${flags.name}`);
+    poolRead = readWithErrors('lane-pool status', (own) => runJson('node', [LANE_POOL_CLI, ...poolArgs], { errors: own, label: 'lane-pool status' }));
+    // `--no-track-attempts` keeps this a PURE read (no breach-counter sidecar writes) — a state read must not mutate.
+    const scopeArgs = ['--json', '--no-track-attempts'];
+    if (typeof flags.repo === 'string') scopeArgs.push(`--repo=${flags.repo}`);
+    if (typeof flags.name === 'string') scopeArgs.push(`--name=${flags.name}`);
+    scopeRead = readWithErrors('scope-lease-collect', (own) => runJson('node', [SCOPE_COLLECT_CLI, ...scopeArgs], { errors: own, label: 'scope-lease-collect' }));
+  }
+  const prRead = readWithErrors('gh pr list', async (own) => {
+    try {
+      // `comments` (#3296) is read so `shapePrs` can derive `stoodDown` — the durable stand-down marker lives on
+      // the PR's own comment thread, and this is the tick's only PR read, so it must carry the field or `shapePrs`
+      // has nothing to scan.
+      const prArgs = ['pr', 'list', '--state', 'open', '--limit', '100', '--json', 'number,state,statusCheckRollup,labels,headRefName,mergeStateStatus,comments'];
+      if (typeof flags.repo === 'string') prArgs.push(`--repo=${flags.repo}`);
+      const out = await runBounded('gh', prArgs, { cwd: ROOT, timeoutMs: RUN_JSON_TIMEOUT_MS, maxBytes: 32 * 1024 * 1024 });
+      return JSON.parse(out || '[]');
+    } catch (e) {
+      own.push(`gh pr list: ${String(e.message || e).split('\n')[0]}`);
+      return [];
+    }
+  });
+  // The daemon is explicitly best-effort + cross-repo: no errors sink, so a failed read degrades to null.
+  const daemonCli = findDaemonCli();
+  const daemonRead = daemonCli
+    ? readWithErrors('drain-daemon status', () => runJson('node', [daemonCli, 'status', '--json'], { cwd: dirname(daemonCli), label: 'drain-daemon status' }))
+    : null;
+  const buildQueue = await bqRead.promise;
+  errors.push(...bqRead.own);
 
   // 1b. Enrich the build-queue rows with each item's predicted `scope`, `kind`, `epicState`, and `preparedDate`
   //     (the `build-queue` view omits them) so the tick picture can flag UNSHAPED armed items — cleared-for-build
@@ -825,10 +874,12 @@ async function main(argv) {
   // 5b below even on a tick whose build-queue happens to be empty — a stale-hash sidecar row must still resolve
   // (or fail to) the same way regardless of what's currently ready.
   let backlogItems = [];
+  const backlogLoadT0 = performance.now();
   try {
     const require = createRequire(import.meta.url);
     const loadBacklog = require(join(ROOT, 'src', '_data', 'backlog.js'));
     backlogItems = typeof loadBacklog === 'function' ? loadBacklog() : [];
+    subTimings['backlog-load'] = Math.round(performance.now() - backlogLoadT0);
   } catch (e) {
     log(`  ⚠ could not load backlog for scope/kind enrichment (${String(e.message || e).split('\n')[0]}) — armed items read as unshaped, non-epic`);
   }
@@ -857,58 +908,26 @@ async function main(argv) {
   //    #x7xv2xt — FIXTURE MODE (`--backlog-dir`, or an explicit `--no-lane-pool`) never touches the real lane
   //    pool: both reads would scan every real lane (a `git` walk per lane) for a synthetic corpus that has no
   //    lanes at all. The picture gets an empty pool instead, and says so in `lanePool`.
-  const skipLanePool = typeof flags['backlog-dir'] === 'string' || flags['no-lane-pool'] === true;
   let poolStatus;
   let scopePicture;
   if (skipLanePool) {
     poolStatus = { lanes: [] };
     scopePicture = { leases: [] };
   } else {
-    // #4345 — `--leased-only`: `shapeLanes` below and `computeFreeSlots`'s free-slot count only ever need LEASED
-    // rows (the latter by construction — its `clean !== false` test already reads a missing `clean` as clean),
-    // so the git probe (rev-parse ×2, `status --porcelain`, rev-list) is wasted on the ~88/90 lanes that are NOT
-    // leased on a typical tick — skipping it there cuts ~364 git spawns/tick to a handful (measured live: 8).
-    // Deliberately NOT switched to also fetch `list --acquirable` for a stricter freeSlots count: that read is
-    // its own, separately-scanned cost (its own single-flight cache, #xn432dz), and folding it into EVERY
-    // conveyor-state.mjs call (not just inside a tick-core tick, where a nearby call already pays it) would trade
-    // this card's whole saving right back — live-measured at 170 git spawns / 42.6s on the real pool when tried.
-    const poolArgs = ['status', '--leased-only', '--json'];
-    if (typeof flags.repo === 'string') poolArgs.push(`--repo=${flags.repo}`);
-    if (typeof flags.name === 'string') poolArgs.push(`--name=${flags.name}`);
-    poolStatus = await runJson('node', [LANE_POOL_CLI, ...poolArgs], { errors, label: 'lane-pool status' });
-    // `--no-track-attempts` keeps this a PURE read (no breach-counter sidecar writes) — a state read must not mutate.
-    const scopeArgs = ['--json', '--no-track-attempts'];
-    if (typeof flags.repo === 'string') scopeArgs.push(`--repo=${flags.repo}`);
-    if (typeof flags.name === 'string') scopeArgs.push(`--name=${flags.name}`);
-    scopePicture = await runJson('node', [SCOPE_COLLECT_CLI, ...scopeArgs], { errors, label: 'scope-lease-collect' });
+    // #4345 — `--leased-only`: only LEASED rows are needed (see the read started above).
+    poolStatus = await poolRead.promise;
+    errors.push(...poolRead.own);
+    scopePicture = await scopeRead.promise;
+    errors.push(...scopeRead.own);
   }
 
   // 3. In-flight lane PRs (this repo's open PRs).
-  let prList;
-  try {
-    // `comments` (#3296) is read so `shapePrs` can derive `stoodDown` — the durable stand-down marker lives on
-    // the PR's own comment thread, and this is the tick's only PR read, so it must carry the field or `shapePrs`
-    // has nothing to scan.
-    const prArgs = ['pr', 'list', '--state', 'open', '--limit', '100', '--json', 'number,state,statusCheckRollup,labels,headRefName,mergeStateStatus,comments'];
-    if (typeof flags.repo === 'string') prArgs.push(`--repo=${flags.repo}`);
-    const out = await runBounded('gh', prArgs, { cwd: ROOT, timeoutMs: RUN_JSON_TIMEOUT_MS, maxBytes: 32 * 1024 * 1024 });
-    prList = JSON.parse(out || '[]');
-  } catch (e) {
-    errors.push(`gh pr list: ${String(e.message || e).split('\n')[0]}`);
-    prList = [];
-  }
+  const prList = await prRead.promise;
+  errors.push(...prRead.own);
 
-  // 4. Drain daemon status (cross-repo, graceful degrade to `"unavailable"`).
-  let daemonReport = null;
-  const daemonCli = findDaemonCli();
-  if (daemonCli) {
-    // The daemon is explicitly best-effort + cross-repo, so a present-but-THROWING daemon must degrade IDENTICALLY
-    // to an absent one: NO `errors` sink is passed here, so a failed read returns undefined → null → shapeDaemon
-    // "unavailable", and a cross-repo daemon hiccup never flips the whole tick's health verdict to warn.
-    daemonReport = (await runJson('node', [daemonCli, 'status', '--json'], { cwd: dirname(daemonCli), label: 'drain-daemon status' })) ?? null;
-  }
-  // A null report (absent CLI OR a failed/throwing read) shapes to "unavailable" — expected degradation, never an
-  // `errors[]` row (the contract: the daemon section can vanish without warning the whole tick).
+  // 4. Drain daemon status (cross-repo, graceful degrade to `"unavailable"`). A null report (absent CLI OR a
+  //    failed/throwing read) shapes to "unavailable" — expected degradation, never an `errors[]` row.
+  const daemonReport = daemonRead ? ((await daemonRead.promise) ?? null) : null;
 
   // 5. Idle-clock inputs: queued.json for last queue-add (last merge comes from the daemon report).
   const queuedState = readJsonFile(QUEUED_PATH, { queued: [] });
@@ -971,6 +990,8 @@ async function main(argv) {
   void flags.json;
   // #x7xv2xt — flag a picture whose lane section is a stand-in, not the real pool. Absent on a normal run.
   if (skipLanePool) picture.lanePool = 'skipped';
+  // 78c — each read's own wall time (they overlap, so they do not sum to the run). Observation only.
+  picture.timings = subTimings;
   // Emit the payload SYNCHRONOUSLY so it fully drains before the process exits — a plain
   // `process.stdout.write` is async to a pipe and `process.exit(0)` would drop the unflushed tail, truncating
   // this ~23 KB JSON for an `execFileSync`/pipe consumer. `writeLineSync` is remedy (b) from

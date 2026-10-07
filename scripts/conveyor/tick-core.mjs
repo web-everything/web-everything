@@ -147,7 +147,7 @@
  *   mechanism.
  */
 
-import { planningRead } from '../lib/planning-snapshot.mjs';
+import { planningRead, PLANNING_SNAPSHOT_ENV } from '../lib/planning-snapshot.mjs';
 import { childFailure } from '../lib/child-failure.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
 import { normNum } from './queue-store.mjs';
@@ -1903,7 +1903,7 @@ async function readStdin() {
 }
 
 async function main(argv) {
-  const { execFileSync } = await import('node:child_process');
+  const { execFileSync, execFile } = await import('node:child_process');
   const { fileURLToPath } = await import('node:url');
   const { dirname, join } = await import('node:path');
 
@@ -1981,7 +1981,20 @@ async function main(argv) {
     stateArgs.push(`--backlog-dir=${flags['backlog-dir']}`);
     planArgs.push(`--backlog-dir=${flags['backlog-dir']}`);
   }
+  // 78c — dispatch-plan's slowest read is `lane-pool list --acquirable` (a git probe per lane, 19 s measured idle).
+  // Start it NOW, into the tick's planning snapshot, so it overlaps the conveyor-state read instead of following it;
+  // dispatch-plan then finds it cached. Same command, same args, same result: only the start time moves. No-op
+  // without a snapshot dir (nothing could share the result) or when dispatch-plan would not make that read.
+  let lanePoolPrefetch = Promise.resolve();
+  if (process.env[PLANNING_SNAPSHOT_ENV] && typeof flags['backlog-dir'] !== 'string' && !process.env.WE_DISPATCH_FREE_LANES) {
+    const t0 = performance.now();
+    lanePoolPrefetch = Promise.resolve(planningRead([LANE_POOL_CLI, 'list', '--acquirable', '--json'], () => new Promise((resolveRead, rejectRead) => {
+      execFile('node', [LANE_POOL_CLI, 'list', '--acquirable', '--json'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs() * 2, killSignal: 'SIGKILL' },
+        (err, out) => { if (err) return rejectRead(err); try { resolveRead(JSON.parse(out)); } catch (e) { rejectRead(e); } });
+    }))).catch(() => {}).finally(() => { timings.lanePoolPrefetchMs = Math.round(performance.now() - t0); });
+  }
   const state = time('stateReadMs', () => runJson('node', [STATE_CLI, ...stateArgs], 'conveyor-state'));
+  await lanePoolPrefetch;
   const plan = time('planReadMs', () => runJson('node', [PLAN_CLI, ...planArgs], 'dispatch-plan'));
 
   // Free lane ids — the same acquirable picker dispatch-plan's shell uses (ascending, deterministic assignment).

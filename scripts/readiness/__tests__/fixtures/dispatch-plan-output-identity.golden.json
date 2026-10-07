@@ -1,0 +1,555 @@
+{
+  "launch": [
+    {
+      "num": "8001",
+      "lane": 1
+    },
+    {
+      "num": "8003",
+      "lane": 2
+    }
+  ],
+  "held": [
+    {
+      "num": "8002",
+      "reason": "overlaps lane-1"
+    },
+    {
+      "num": "8004",
+      "reason": "needs-prepare"
+    },
+    {
+      "num": "8005",
+      "reason": "unshaped-no-scope"
+    },
+    {
+      "num": "8006",
+      "reason": "needs-slice"
+    },
+    {
+      "num": "8007",
+      "reason": "cleared-but-not-ready"
+    }
+  ],
+  "admission": [
+    {
+      "num": "8001",
+      "gates": [
+        {
+          "name": "already-done",
+          "pass": true,
+          "observed": null
+        },
+        {
+          "name": "blockedBy",
+          "pass": true,
+          "observed": {
+            "openBlockers": [],
+            "blockedBy": []
+          }
+        },
+        {
+          "name": "grouping-kind",
+          "pass": true,
+          "observed": "story"
+        },
+        {
+          "name": "decision-kind",
+          "pass": true,
+          "observed": "story"
+        },
+        {
+          "name": "scope",
+          "pass": true,
+          "observed": [
+            "scripts/a.mjs"
+          ]
+        },
+        {
+          "name": "branch-drift",
+          "pass": true,
+          "observed": {
+            "scope": [
+              "scripts/a.mjs"
+            ],
+            "driftScope": [],
+            "graduationSlice": false
+          }
+        },
+        {
+          "name": "scope-overlap-lease",
+          "pass": true,
+          "observed": {
+            "scope": [
+              "scripts/a.mjs"
+            ],
+            "lease": null
+          }
+        },
+        {
+          "name": "scope-overlap-rival",
+          "pass": true,
+          "observed": {
+            "scope": [
+              "scripts/a.mjs"
+            ],
+            "rival": null
+          }
+        },
+        {
+          "name": "dispatch-paused",
+          "pass": true,
+          "observed": false
+        },
+        {
+          "name": "pr-limit",
+          "pass": true,
+          "observed": {
+            "prLimitHeld": false,
+            "scope": [
+              "scripts/a.mjs"
+            ]
+          }
+        },
+        {
+          "name": "lane-capacity",
+          "pass": true,
+          "observed": {
+            "freeLanes": [
+              1,
+              2,
+              3
+            ],
+            "capacityLimited": false
+          }
+        }
+      ]
+    },
+    {
+      "num": "8002",
+      "gates": [
+        {
+          "name": "already-done",
+          "pass": true,
+          "observed": null
+        },
+        {
+          "name": "blockedBy",
+          "pass": true,
+          "observed": {
+            "openBlockers": [],
+            "blockedBy": []
+          }
+        },
+        {
+          "name": "grouping-kind",
+          "pass": true,
+          "observed": "story"
+        },
+        {
+          "name": "decision-kind",
+          "pass": true,
+          "observed": "story"
+        },
+        {
+          "name": "scope",
+          "pass": true,
+          "observed": [
+            "scripts/a.mjs"
+          ]
+        },
+        {
+          "name": "branch-drift",
+          "pass": true,
+          "observed": {
+            "scope": [
+              "scripts/a.mjs"
+            ],
+            "driftScope": [],
+            "graduationSlice": false
+          }
+        },
+        {
+          "name": "scope-overlap-lease",
+          "pass": true,
+          "observed": {
+            "scope": [
+              "scripts/a.mjs"
+            ],
+            "lease": null
+          }
+        },
+        {
+          "name": "scope-overlap-rival",
+          "pass": false,
+          "observed": {
+            "scope": [
+              "scripts/a.mjs"
+            ],
+            "rival": {
+              "num": "8001",
+              "lane": 1,
+              "scope": [
+                "scripts/a.mjs"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "num": "8003",
+      "gates": [
+        {
+          "name": "already-done",
+          "pass": true,
+          "observed": null
+        },
+        {
+          "name": "blockedBy",
+          "pass": true,
+          "observed": {
+            "openBlockers": [],
+            "blockedBy": []
+          }
+        },
+        {
+          "name": "grouping-kind",
+          "pass": true,
+          "observed": "story"
+        },
+        {
+          "name": "decision-kind",
+          "pass": true,
+          "observed": "story"
+        },
+        {
+          "name": "scope",
+          "pass": true,
+          "observed": [
+            "scripts/c.mjs"
+          ]
+        },
+        {
+          "name": "branch-drift",
+          "pass": true,
+          "observed": {
+            "scope": [
+              "scripts/c.mjs"
+            ],
+            "driftScope": [],
+            "graduationSlice": false
+          }
+        },
+        {
+          "name": "scope-overlap-lease",
+          "pass": true,
+          "observed": {
+            "scope": [
+              "scripts/c.mjs"
+            ],
+            "lease": null
+          }
+        },
+        {
+          "name": "scope-overlap-rival",
+          "pass": true,
+          "observed": {
+            "scope": [
+              "scripts/c.mjs"
+            ],
+            "rival": null
+          }
+        },
+        {
+          "name": "dispatch-paused",
+          "pass": true,
+          "observed": false
+        },
+        {
+          "name": "pr-limit",
+          "pass": true,
+          "observed": {
+            "prLimitHeld": false,
+            "scope": [
+              "scripts/c.mjs"
+            ]
+          }
+        },
+        {
+          "name": "lane-capacity",
+          "pass": true,
+          "observed": {
+            "freeLanes": [
+              2,
+              3
+            ],
+            "capacityLimited": false
+          }
+        }
+      ]
+    },
+    {
+      "num": "8004",
+      "gates": [
+        {
+          "name": "already-done",
+          "pass": true,
+          "observed": null
+        },
+        {
+          "name": "blockedBy",
+          "pass": true,
+          "observed": {
+            "openBlockers": [],
+            "blockedBy": []
+          }
+        },
+        {
+          "name": "grouping-kind",
+          "pass": true,
+          "observed": "story"
+        },
+        {
+          "name": "decision-kind",
+          "pass": true,
+          "observed": "story"
+        },
+        {
+          "name": "scope",
+          "pass": true,
+          "observed": [
+            "scripts/d.mjs"
+          ]
+        }
+      ]
+    },
+    {
+      "num": "8005",
+      "gates": [
+        {
+          "name": "already-done",
+          "pass": true,
+          "observed": null
+        },
+        {
+          "name": "blockedBy",
+          "pass": true,
+          "observed": {
+            "openBlockers": [],
+            "blockedBy": []
+          }
+        },
+        {
+          "name": "grouping-kind",
+          "pass": true,
+          "observed": "story"
+        },
+        {
+          "name": "decision-kind",
+          "pass": true,
+          "observed": "story"
+        },
+        {
+          "name": "scope",
+          "pass": false,
+          "observed": []
+        }
+      ]
+    },
+    {
+      "num": "8006",
+      "gates": [
+        {
+          "name": "already-done",
+          "pass": true,
+          "observed": null
+        },
+        {
+          "name": "blockedBy",
+          "pass": true,
+          "observed": {
+            "openBlockers": [],
+            "blockedBy": []
+          }
+        },
+        {
+          "name": "grouping-kind",
+          "pass": false,
+          "observed": "epic"
+        }
+      ]
+    }
+  ],
+  "groundTruth": {
+    "checkedLocally": 0,
+    "cached": 0,
+    "pending": 0,
+    "refresh": {
+      "started": false,
+      "ids": []
+    }
+  },
+  "selection": [
+    {
+      "num": "8001",
+      "gates": [
+        {
+          "name": "queue-membership",
+          "pass": true,
+          "observed": {
+            "cleared": true
+          }
+        },
+        {
+          "name": "readiness",
+          "pass": true,
+          "observed": {
+            "inReadyBuildQueue": true
+          }
+        }
+      ]
+    },
+    {
+      "num": "8002",
+      "gates": [
+        {
+          "name": "queue-membership",
+          "pass": true,
+          "observed": {
+            "cleared": true
+          }
+        },
+        {
+          "name": "readiness",
+          "pass": true,
+          "observed": {
+            "inReadyBuildQueue": true
+          }
+        }
+      ]
+    },
+    {
+      "num": "8003",
+      "gates": [
+        {
+          "name": "queue-membership",
+          "pass": true,
+          "observed": {
+            "cleared": true
+          }
+        },
+        {
+          "name": "readiness",
+          "pass": true,
+          "observed": {
+            "inReadyBuildQueue": true
+          }
+        }
+      ]
+    },
+    {
+      "num": "8004",
+      "gates": [
+        {
+          "name": "queue-membership",
+          "pass": true,
+          "observed": {
+            "cleared": true
+          }
+        },
+        {
+          "name": "readiness",
+          "pass": true,
+          "observed": {
+            "inReadyBuildQueue": true
+          }
+        }
+      ]
+    },
+    {
+      "num": "8005",
+      "gates": [
+        {
+          "name": "queue-membership",
+          "pass": true,
+          "observed": {
+            "cleared": true
+          }
+        },
+        {
+          "name": "readiness",
+          "pass": true,
+          "observed": {
+            "inReadyBuildQueue": true
+          }
+        }
+      ]
+    },
+    {
+      "num": "8006",
+      "gates": [
+        {
+          "name": "queue-membership",
+          "pass": true,
+          "observed": {
+            "cleared": true
+          }
+        },
+        {
+          "name": "readiness",
+          "pass": true,
+          "observed": {
+            "inReadyBuildQueue": true
+          }
+        }
+      ]
+    },
+    {
+      "num": "8007",
+      "gates": [
+        {
+          "name": "readiness",
+          "pass": false,
+          "observed": {
+            "inReadyBuildQueue": false
+          }
+        }
+      ]
+    }
+  ],
+  "cleared": [
+    {
+      "num": "8001",
+      "ready": true
+    },
+    {
+      "num": "8002",
+      "ready": true
+    },
+    {
+      "num": "8003",
+      "ready": true
+    },
+    {
+      "num": "8004",
+      "ready": true
+    },
+    {
+      "num": "8005",
+      "ready": true
+    },
+    {
+      "num": "8006",
+      "ready": true
+    },
+    {
+      "num": "8007",
+      "ready": false
+    }
+  ],
+  "lanePool": {
+    "freeLanes": "explicit",
+    "leases": "fixture-empty"
+  }
+}

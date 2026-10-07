@@ -37,7 +37,7 @@ import { readShaCache, writeShaCache } from '../../scripts/lib/pr-snapshot.mjs';
 import { createPhaseTimer } from '../../scripts/lib/phase-timer.mjs';
 import { resolveOperationRoute, routingPolicyEnv } from '../../scripts/lib/dispatch-routing-policy-io.mjs';
 import { childFailure } from '../../scripts/lib/child-failure.mjs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync } from 'node:fs';
 import os, { tmpdir, hostname, homedir } from 'node:os';
@@ -1291,11 +1291,15 @@ export async function cliPredictRoute(num, scope, { root = REPO_ROOT, env = proc
   }
 }
 
+const defaultExecAsync = (cmd, args, opts) => new Promise((resolveExec, rejectExec) => {
+  execFile(cmd, args, { ...opts, maxBuffer: opts?.maxBuffer }, (err, out) => err ? rejectExec(err) : resolveExec(out));
+});
+
 // Content-addressed statuses remain valid across ticks, even when origin/main advances.
 const prepareBlobStatuses = new Map();
 
 /** Tick-scoped main snapshot and prepare PR discovery. Unavailable observations always throw. */
-export function createPrepareStatusReader({ exec = execFileSync } = {}) {
+export function createPrepareStatusReader({ exec = execFileSync, execAsync = null, prefetchConcurrency = 8 } = {}) {
   // maxBuffer is explicit: the default 1 MiB overflows on a large backlog tree / card batch (cf. 21ce5ea4b).
   const opts = { cwd: REPO_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000, maxBuffer: 64 * 1024 * 1024 };
   const ITEM_PR_LIMIT = 100;
@@ -1378,12 +1382,51 @@ export function createPrepareStatusReader({ exec = execFileSync } = {}) {
     }
     return itemPrs(num);
   }
+  /** Would `prsFor` fall back to this item's own listing? Mirrors its test exactly; never throws. */
+  function needsItemListing(num, claimedAt) {
+    if (itemListings.has(normNum(num))) return false;
+    const floor = listing ? listing.floor : minClaimedAt?.slice(0, 10);
+    if (!floor || (claimedAt && claimedAt.slice(0, 10) >= floor)) {
+      try { if (listPrs().complete) return false; } catch { return false; } // the lazy read rethrows the cached error
+    }
+    return true;
+  }
+  /**
+   * Item 94 — when the shared listing cannot answer (a held card with no claim date leaves the date floor unset, so
+   * the 1000-PR cap saturates it), every read paid one sequential `gh pr list` (~0.5 s). Fetch exactly those same
+   * per-item listings concurrently instead, up front. Same commands, same results, same saturation check; a failed
+   * prefetch is dropped so the lazy read hits (and reports) the same failure it always did.
+   */
+  async function prefetchItemListings(entries) {
+    const todo = [...new Set(entries.filter(e => {
+      const card = tree?.get(normNum(e.num));
+      if (!card) return false;
+      const stamped = prepareBlobStatuses.get(card.sha);
+      if (stamped?.preparedDate && stampCoversClaim(stamped.preparedDate, e.claimedAt,
+        { replaces: undefined, preparedAgainstSha: stamped.preparedAgainstSha })) return false;
+      return needsItemListing(e.num, e.claimedAt);
+    }).map(e => normNum(e.num)))];
+    let next = 0;
+    const worker = async () => {
+      while (next < todo.length) {
+        const key = todo[next++];
+        try {
+          const prs = JSON.parse(await execAsync('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
+            '--search', `head:lane/${key}-prepare-`, '--json', 'number,state,headRefName,headRefOid,createdAt,isCrossRepository',
+            '--limit', String(ITEM_PR_LIMIT)], opts));
+          if (Array.isArray(prs) && prs.length < ITEM_PR_LIMIT) itemListings.set(key, prs);
+        } catch { /* the lazy read repeats this call and reports its own failure */ }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(prefetchConcurrency, todo.length) }, worker));
+  }
   return {
     prime(items) {
       const entries = items.map(item => typeof item === 'object' ? item : { num: item });
       minClaimedAt = entries.length && entries.every(item => item.claimedAt)
         ? entries.map(item => item.claimedAt).sort()[0] : undefined;
       if (entries.length) loadBlobs(entries.map(item => loadTree().get(normNum(item.num))).filter(Boolean));
+      return execAsync && entries.length ? prefetchItemListings(entries) : undefined;
     },
     /**
      * The card's stamp on origin/main RIGHT NOW — a fresh fetch, never this reader's tick-start snapshot (a stamp that
@@ -1674,8 +1717,8 @@ function cliEffects() {
     listPrepareClaims: () => listBuildDispatchClaims({ lockRoot: prepareClaimRoot(), ignoreExpiry: true }),
     listSettledPrepares: () => cliListSettledBuilds({ launchKind: 'prepare-item' }),
     primePrepareStatus: ({ nums, claims }) => {
-      prepareReader = createPrepareStatusReader();
-      prepareReader.prime(nums.map(num => ({ num,
+      prepareReader = createPrepareStatusReader({ execAsync: defaultExecAsync });
+      return prepareReader.prime(nums.map(num => ({ num,
         claimedAt: claims.find(c => normNum(c.meta.num) === normNum(num))?.meta?.claimedAt })));
     },
     readPrepareStatus: args => (prepareReader ??= createPrepareStatusReader()).read(args),
