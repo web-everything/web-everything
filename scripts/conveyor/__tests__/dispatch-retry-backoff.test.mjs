@@ -477,6 +477,36 @@ describe('a late launch (effect-in-flight) retries quickly, not on the failure p
     expect(total).toBeGreaterThanOrEqual(1000 + 2000);
     expect(n).toBeGreaterThanOrEqual(3);
   });
+  // One assertion per call site that threads `code` into backoffVerdict (PR #4323 review): dropping it at any of them
+  // silently sends a late launch back to the 5-60 min failure path.
+  it('a BUILD dispatch failure with that evidence also waits 30s (recordBuildFailure threads the reason code)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'quick-retry-build-'));
+    try {
+      const path = join(dir, 'b.json');
+      const now = Date.parse('2026-10-07T20:00:00Z');
+      const r = recordBuildFailure({ num: '4647', reason: IN_FLIGHT }, { path, now, settings: DEFAULTS });
+      expect(r).toMatchObject({ reasonCode: 'launch-in-flight', attempts: 1, exhausted: false });
+      expect(Date.parse(r.retryAfter) - now).toBe(30_000);
+      expect(Date.parse(recordBuildFailure({ num: '4647', reason: IN_FLIGHT }, { path, now, settings: DEFAULTS }).retryAfter) - now).toBe(60_000);
+      // the same record under the slow path still waits 5 min, so the assertion above can only pass via the code
+      expect(Date.parse(recordBuildFailure({ num: '4648', reason: NOT_CONFIRMED }, { path, now, settings: DEFAULTS }).retryAfter) - now).toBe(5 * 60_000);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('a healed (unknown -> transient) prepare record with that evidence is released on the quick window (releaseDuePrepareRetries threads the reason code)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'quick-retry-healed-'));
+    try {
+      const path = join(dir, 'f.json');
+      const at = Date.parse('2026-10-07T20:00:00Z');
+      writeFileSync(path, JSON.stringify({ cards: {}, failures: {
+        a: { num: '4647', attempt: 'a', stage: 'dispatch', cause: 'unknown', held: true, retry: false, evidence: { reason: IN_FLIGHT }, recordedAt: new Date(at).toISOString() },
+      } }));
+      expect(releaseDuePrepareRetries({ path, now: at + 29_000, settings: DEFAULTS })).toEqual([]);
+      const healed = readFailureState(path).failures.a;
+      expect(healed).toMatchObject({ cause: 'dispatch-transient', healedFrom: 'unknown', reasonCode: 'launch-in-flight' });
+      expect(Date.parse(healed.retryAfter) - at).toBe(30_000);
+      expect(releaseDuePrepareRetries({ path, now: at + 31_000, settings: DEFAULTS })).toEqual(['4647']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('a prepare failure with that evidence is held for a short retry and released on the next tick after it', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'quick-retry-'));
     try {

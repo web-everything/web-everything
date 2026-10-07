@@ -491,7 +491,12 @@ export async function runProbationBuild(args, io) {
         io.discardChanges(lanePath, baseSha, preexisting);
         const landed = io.landAlreadyDone(done, lanePath, { citation: 'prepare' });
         if (landed.status === 'landed') return finish('prepare-already-done', worker.executor, `already-done: ${done.commit}; verified independently; opened resolve PR #${landed.pr}`, { diff: diffRow, pr: landed.pr });
-        return finish('prepare-needs-you', worker.executor, needsYouReason('already-done', `claimed commit ${report.commit} was not verified: ${landed.error}`), { diff: diffRow });
+        // Replace the already-done hold installed above: left in place it would keep describing an automatically
+        // routable claim the landing pass just refused (PR #4323 review). The needs-you hold overwrites it.
+        const reason = needsYouReason('already-done', `claimed commit ${report.commit} was not verified: ${landed.error}`);
+        const [route] = planHoldRouting([{ num, reason }]);
+        io.holdWorkerDecline(route);
+        return finish('prepare-needs-you', worker.executor, reason, { diff: diffRow });
       }
       if (report?.outcome === 'blocked' && report.blocker.kind === 'spec-defect') {
         // A bad scope is re-derived from the code the card cites (one hop through a cited backlog card's own

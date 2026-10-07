@@ -955,6 +955,11 @@ describe('standalone prepare', () => {
     expect(result).toMatchObject({ outcome: 'prepare-needs-you', detail: expect.stringContaining('was not verified') });
     expect(result).not.toHaveProperty('cause');
     expect(calls.some(c => c[0] === 'resolve')).toBe(false);
+    // The already-done hold installed before the landing pass is REPLACED, so the stored hold no longer describes an
+    // automatically routable claim (PR #4323 review): the last hold written is a needs-you 'other' route.
+    const holds = calls.filter(c => c[0] === 'hold').map(c => c[1]);
+    expect(holds[0]).toMatchObject({ route: 'already-done' });
+    expect(holds.at(-1)).toMatchObject({ route: 'other', reason: expect.stringMatching(/^needs-you: prepare blocked \(already-done\).*was not verified: cited commit does not credit the card/) });
   });
   it('an already-done with no cited commit is never resolved: needs-you hold', async () => {
     const { io, calls } = prepareIo({ numstat: '', postWorkerRaw: ITEM_RAW, lastMessage: 'already-done - shipped last week' });
