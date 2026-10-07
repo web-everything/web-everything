@@ -42,6 +42,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync } from 'node:fs';
 import os, { tmpdir, hostname, homedir } from 'node:os';
 import { hostLoadGate, resolveMaxLoadPerCore } from '../../scripts/lib/dispatch-throttle.mjs';
+import { builderExecutorFor } from '../../scripts/lib/fix-slot-borrow.mjs';
 import { startDetachedLaunch, settleLaunches, PENDING_LAUNCHES_DIRNAME } from '../../scripts/conveyor/pending-launches.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -196,6 +197,16 @@ export function readDispatchOutcome(text) {
  * scope (written before scope rode in `meta`) is skipped: unknown is not proven overlapping.
  * @returns {Array<{pr:number, scope:string[]}>}
  */
+/** Card 87 — live fixes running in a BORROWED builder slot, as in-flight rows the planner counts against that class. */
+export function liveBorrowedFixInFlight(listClaims = () => listFixDispatchClaims(undefined, { liveOnly: true })) {
+  return listClaims()
+    .filter((c) => c?.meta?.borrowed?.executor && c.meta.pr != null)
+    .map((c) => ({
+      num: `fix-${c.meta.pr}`, scope: Array.isArray(c.meta.scope) ? c.meta.scope : [], source: `borrowed fix claim ${c.owner}`,
+      executor: builderExecutorFor(c.meta.borrowed.executor), borrowedFix: true,
+    }));
+}
+
 export function liveFixInFlight() {
   return listFixDispatchClaims(undefined, { liveOnly: true })
     .filter((c) => Array.isArray(c.meta.scope) && c.meta.scope.length)
@@ -526,6 +537,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   for (const r of runStoreInFlight) {
     if (!doneWhy(r.num)) inFlight.push(r);
   }
+  // Card 87 — a fix borrowing a builder slot occupies it (no build may be started over it).
+  try { inFlight.push(...(effects.listBorrowedFixes?.() ?? [])); } catch { /* an unreadable claim set never blocks the tick */ }
 
   const spawn = Array.isArray(d.spawnBuilds) ? d.spawnBuilds : [];
   // #4349 — a held item (a recent non-PR terminal-outcome cooldown) is dropped from candidates entirely, same
@@ -1743,6 +1756,7 @@ function cliEffects() {
     fetchOpenPrs: cliFetchOpenPrs,
     listClaims: () => listBuildDispatchClaims(),
     listFixClaims: () => liveFixInFlight(),
+    listBorrowedFixes: () => liveBorrowedFixInFlight(),
     releaseClaim: ({ num }) => releaseBuildDispatchClaim({ num }),
     acquireClaim: ({ num, scope }) => acquireBuildDispatchClaim({ num, scope }),
     listRunStoreInFlight: () => [],
@@ -1880,6 +1894,7 @@ async function dryRun(flags) {
   const inFlight = [
     ...listBuildDispatchClaims().map((c) => ({ num: normNum(c.meta.num), scope: c.meta.scope || [], source: `claim ${c.owner}` })),
     ...runStoreRows,
+    ...liveBorrowedFixInFlight(),
   ];
   // xovjhwh — the SAME shared derivation `runBuildDispatchTick` calls internally for `tick.plan` (unavailable
   // here since it is local to that function's own call); recomputed from the same two rows this dry-run already

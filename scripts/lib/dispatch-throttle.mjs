@@ -11,6 +11,10 @@
  *     we:skills-src/conveyor/launchd/*.plist.example); remove it to follow this file.
  *   - fixDispatchMaxConcurrent   (env WE_FIX_DISPATCH_MAX_CONCURRENT)    default 2 — live fix-* + ci-heal-* sessions.
  *   - maxLoadPerCore             (env WE_MAX_LOAD_PER_CORE)              default 2.0 — 1-min loadavg / cores.
+ *   - fixDispatch.borrowBuildSlots (env WE_FIX_BORROW_BUILD_SLOTS)       default OFF (product); `on`/`off`. When ON, a
+ *     fix held ONLY by the fixer cap may borrow a FREE builder slot (card 87; see `fix-slot-borrow.mjs`).
+ *   - fixDispatch.borrowAfterMinutes (env WE_FIX_BORROW_AFTER_MINUTES)   default 15 — how long the fix must have waited.
+ *   - fixDispatch.borrowExecutor (env WE_FIX_BORROW_EXECUTOR)            default codex; `codex` | `claude` | `agy-claude`.
  */
 import { readFileSync } from 'node:fs';
 import os from 'node:os';
@@ -24,6 +28,12 @@ export const DISPATCH_SETTINGS_ENV = Object.freeze({
   maxLoadPerCore: 'WE_MAX_LOAD_PER_CORE',
 });
 const INTEGER_KEYS = new Set(['heavyAdmissionCap', 'fixDispatchMaxConcurrent']);
+
+export const FIX_BORROW_BUILT_IN = Object.freeze({ borrowBuildSlots: 'off', borrowAfterMinutes: 15, borrowExecutor: 'codex' });
+export const FIX_BORROW_EXECUTORS = Object.freeze(['codex', 'claude', 'agy-claude']);
+const FIX_BORROW_ENV = Object.freeze({
+  borrowBuildSlots: 'WE_FIX_BORROW_BUILD_SLOTS', borrowAfterMinutes: 'WE_FIX_BORROW_AFTER_MINUTES', borrowExecutor: 'WE_FIX_BORROW_EXECUTOR',
+});
 
 export function defaultDispatchSettingsPath() {
   return resolve(dirname(fileURLToPath(import.meta.url)), '../dispatch-settings.json');
@@ -86,5 +96,33 @@ export function createDispatchThrottle({
       live += 1;
       return { admit: true };
     },
+  };
+}
+
+/**
+ * Card 87 — the borrow-a-builder-slot settings (`fixDispatch` block). Env wins, then a valid file value, then the
+ * built-in (product default OFF). Never throws; an invalid value falls to the next source, never to ON.
+ * @returns {{enabled:boolean, afterMinutes:number, executor:'codex'|'claude'|'agy-claude'}}
+ */
+export function resolveFixBorrowSettings({ env = process.env, file } = {}) {
+  let raw = file;
+  if (raw === undefined) {
+    try { raw = JSON.parse(readFileSync(defaultDispatchSettingsPath(), 'utf8')); } catch { raw = null; }
+  }
+  const block = raw && typeof raw === 'object' && raw.fixDispatch && typeof raw.fixDispatch === 'object' ? raw.fixDispatch : {};
+  const pick = (key, ok) => {
+    const e = env?.[FIX_BORROW_ENV[key]];
+    if (e !== undefined && e !== '' && ok(e)) return e;
+    const v = block[key];
+    if (v !== undefined && ok(v)) return v;
+    return FIX_BORROW_BUILT_IN[key];
+  };
+  const onOff = (v) => ['on', 'off'].includes(String(v).trim().toLowerCase());
+  const minutes = (v) => Number.isFinite(Number(v)) && Number(v) >= 0 && String(v).trim() !== '';
+  const executor = (v) => FIX_BORROW_EXECUTORS.includes(String(v).trim().toLowerCase());
+  return {
+    enabled: String(pick('borrowBuildSlots', onOff)).trim().toLowerCase() === 'on',
+    afterMinutes: Number(pick('borrowAfterMinutes', minutes)),
+    executor: String(pick('borrowExecutor', executor)).trim().toLowerCase(),
   };
 }

@@ -107,6 +107,8 @@ import {
 } from './fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
+import { BORROW_REASON } from '../lib/fix-slot-borrow.mjs';
+import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
 import { runReconcilePass, resolveLaneHead } from './reconcile-pass.mjs';
 import { readUnsupported, recordUnsupported } from './unsupported-repo.mjs';
@@ -1011,6 +1013,10 @@ export function dispatchFix(planned, {
   spawnAgent = defaultSpawnAgent,
   extraArgs = [],
   resumeAttempt = null,
+  // Card 87 — `{executor, reason}` when this fix runs in a borrowed builder slot: recorded on the claim, and a
+  // non-Claude executor launches through the fix run script instead of `claude --bg` (same brief, same review).
+  borrowed = null,
+  spawnBorrowed = (request) => fixDetachedProvider(request),
   // #x8mpubm — same never-throwing, opt-in-gated resolver `we:scripts/operations/dispatch-lane-io.mjs`'s own
   // `createDispatchSinks` uses for a fresh build dispatch; a fix dispatch is a SEPARATE fresh-dispatch call
   // site (see the `buildAgentArgv` call below) so it needs its own seam, but reuses the SAME wrapper rather
@@ -1066,6 +1072,7 @@ export function dispatchFix(planned, {
   }
   const claim = acquireClaim({
     repo, pr: planned.pr, kind: 'fix', headSha: planned.headRefOid, scope: planned.overlapScope ?? planned.scope, owner: claimOwner, lockRoot: claimRoot,
+    ...(borrowed ? { borrowed } : {}),
   });
   if (!claim.ok) {
     return {
@@ -1109,6 +1116,17 @@ export function dispatchFix(planned, {
     }
     if (planned.rulingNotAddressed?.rung) {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ruling-not-addressed rung ${planned.rulingNotAddressed.rung.at} (${planned.rulingNotAddressed.rung.id}) model=${ladderTable?.model ?? 'default-fix-route'}`);
+    }
+    if (borrowed && borrowed.executor !== 'claude') {
+      // Card 87 — the borrowed slot belongs to a non-Claude executor: same claim and brief, other launcher.
+      const handle = spawnBorrowed({
+        pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
+        policyRoute: { provider: borrowed.executor === 'codex' ? 'codex' : 'antigravity-claude' },
+      });
+      return {
+        sessionId: null, agentId: String(handle), sessionSlug, pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane,
+        unknownTokens, resumed: false, ...(resumeAttempt ? { resumeAttempt } : {}),
+      };
     }
     const sessionId = String(mintSessionId());
     // #4174 — THE FIX: this session's cwd is a scratch directory outside `root`, never `root` itself (see
@@ -1287,6 +1305,8 @@ export function runReconcileFixDispatch({
   listFixClaims = () => listFixDispatchClaims(undefined, { liveOnly: true }),
   // fix-cap / host-load: a DEFER-ONLY throttle (`dispatch-throttle.mjs#createDispatchThrottle`); null = no gate.
   dispatchThrottle = null,
+  // Card 87 — `createFixBorrowGate`: a fix held ONLY by the fixer cap may borrow a free builder slot. null = never.
+  borrowGate = null,
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-fix-dispatch: --repo ${repo} is not a constellation repo`);
@@ -1373,7 +1393,14 @@ export function runReconcileFixDispatch({
   for (const entry of planned) {
     // fix-cap / host-load — defer BEFORE any claim, resume or lane pop; the PR simply waits for a later pass.
     const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix') : { admit: true };
-    if (!t.admit) { refusals.push({ pr: entry.pr, kind: t.kind, why: t.why }); continue; }
+    // Card 87 — ONLY the fixer cap may be borrowed past (never host-load, never a scope wait: those never get here).
+    let borrowed = null;
+    if (!t.admit) {
+      const b = t.kind === 'fix-cap' && borrowGate ? borrowGate.consider({ repo: repoKey, pr: entry.pr }) : null;
+      if (!b?.borrow) { refusals.push({ pr: entry.pr, kind: t.kind, why: b?.why && b.why !== 'borrow-off' ? `${t.why}; not borrowing a builder slot: ${b.why}` : t.why }); continue; }
+      borrowed = { executor: b.executor, reason: b.reason ?? BORROW_REASON };
+      console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${BORROW_REASON} (executor ${b.executor}, waited ${b.waitedMinutes} min on the fixer cap)`);
+    } else if (borrowGate) borrowGate.clear({ repo: repoKey, pr: entry.pr });
     // Card xkyw1x4 — queue-cap BEFORE a resume or a lane pop: either way a fix session runs its checks next.
     const q = queueBudget.tryAdmit('fix', { id: entry.pr });
     if (!q.admit) {
@@ -1407,7 +1434,8 @@ export function runReconcileFixDispatch({
     // rather than refusing just this one entry — the same per-entry isolation `dispatch(...)` below already
     // gets, now extended to cover this earlier call site too.
     let resumeAttempt = null;
-    if (entry.isConflict) {
+    // A resume continues an existing Claude session and claim; a borrowed fix always starts fresh so its claim records the slot.
+    if (entry.isConflict && !borrowed) {
       let attempt;
       try {
         attempt = tryResume(entry, { root, repo: repoKey });
@@ -1428,7 +1456,7 @@ export function runReconcileFixDispatch({
     }
     const lane = lanes.shift();
     try {
-      const result = dispatch({ ...entry, lane }, { root, repo: repoKey, extraArgs: agentArgsFromEnv(), resumeAttempt });
+      const result = dispatch({ ...entry, lane }, { root, repo: repoKey, extraArgs: agentArgsFromEnv(), resumeAttempt, ...(borrowed ? { borrowed } : {}) });
       if (result?.held) {
         // #x0jphk5 — a `(repo, pr, headRefOid)` claim already held elsewhere: nothing was spawned, so the lane
         // this iteration popped went unused — return it to the pool for the NEXT entry, exactly as a
@@ -1441,7 +1469,7 @@ export function runReconcileFixDispatch({
         });
         continue;
       }
-      dispatched.push(result);
+      dispatched.push(borrowed ? { ...result, borrowed, reason: BORROW_REASON } : result);
     } catch (e) {
       refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
     }

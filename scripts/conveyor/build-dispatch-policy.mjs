@@ -257,7 +257,8 @@ export function planBuildDispatch({
   // an attribution set at all (every pre-existing caller/test): keep counting every delivered PR, unchanged. A
   // caller that DOES supply one (only `build-dispatch-daemon.mjs`, live) gets the filtered union instead.
   const ownedNums = dispatchedByBuilder == null ? null : new Set([...dispatchedByBuilder].map(normNum).filter(Boolean));
-  const openItemsInitial = new Set(inFlightByNum.keys());
+  // Card 87 — a borrowed FIX holds a builder slot (counted in `running`) but is not a backlog item for the WIP cap.
+  const openItemsInitial = new Set([...inFlightByNum].filter(([, f]) => !f.borrowedFix).map(([k]) => k));
   for (const pr of openPrs) {
     const n = prDeliveredNum(pr);
     if (n && (ownedNums == null || ownedNums.has(n))) openItemsInitial.add(n);
