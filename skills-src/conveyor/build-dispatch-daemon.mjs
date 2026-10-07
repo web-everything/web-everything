@@ -40,7 +40,9 @@ import { childFailure } from '../../scripts/lib/child-failure.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync } from 'node:fs';
-import { tmpdir, hostname, homedir } from 'node:os';
+import os, { tmpdir, hostname, homedir } from 'node:os';
+import { hostLoadGate, resolveMaxLoadPerCore } from '../../scripts/lib/dispatch-throttle.mjs';
+import { startDetachedLaunch, settleLaunches, PENDING_LAUNCHES_DIRNAME } from '../../scripts/conveyor/pending-launches.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -330,6 +332,29 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Exclude held candidates BEFORE the tick core allocates its two prepare slots.
   bookkeeping = { ...bookkeeping, prepareHeldNums: holds.map((h) => normNum(h.num)) };
   const tickBookkeeping = bookkeeping;
+  // 78b — settle detached launches from earlier ticks BEFORE planning: a launched one keeps its claim (the run-store
+  // row owns it from here); a failed one releases its claim and records the failure the same way a blocking launch did.
+  // A still-pending one keeps its claim and keeps the item busy. Optional-chained for older effects stubs.
+  const pendingLaunch = { build: new Set(), prepare: new Set() };
+  const launchSettlement = { settled: [], pending: [] };
+  const deferredLaunchFailures = [];
+  if (live && typeof effects.settleLaunches === 'function') {
+    try {
+      const r = await effects.settleLaunches();
+      for (const p of r.pending ?? []) (p.kind === 'prepare-item' ? pendingLaunch.prepare : pendingLaunch.build).add(normNum(p.num));
+      launchSettlement.pending = r.pending ?? [];
+      for (const st of r.settled ?? []) {
+        const num = normNum(st.num);
+        const isPrepare = st.kind === 'prepare-item';
+        launchSettlement.settled.push({ num, kind: st.kind, launched: Boolean(st.outcome?.dispatching), reason: st.outcome?.reason ?? null });
+        if (st.outcome?.dispatching) continue;
+        // The claim goes NOW (so this tick's own claim read already sees it freed); the failure record waits for
+        // `failPrepare`/`failures`, declared further down.
+        if (isPrepare) effects.releasePrepareClaim({ num }); else effects.releaseClaim({ num });
+        deferredLaunchFailures.push({ num, isPrepare, outcome: st.outcome, attempt: st.attempt });
+      }
+    } catch (e) { launchSettlement.error = String(e?.message || e).split('\n')[0]; }
+  }
   // Card 80 — the just-in-time prepare settings ride to tick-core as config (window) and on to dispatch-plan
   // (max age + scope drift → `prepare-stale`).
   const out = await effects.planTick(tickBookkeeping, { config: planConfigFrom(policy) });
@@ -349,7 +374,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const freeze = planBuildDispatch({ openPrs, killSwitch: effects.killSwitch(), policy }).freeze;
   let orphanAdoption = null;
   if (live && typeof effects.adoptOrphans === 'function') {
-    try { orphanAdoption = await effects.adoptOrphans({ allowResume: !freeze.frozen, frozenReason: freeze.reasons.join('; ') }); }
+    try { orphanAdoption = await effects.adoptOrphans({ allowResume: !freeze.frozen, frozenReason: freeze.reasons.join('; '), skipNums: pendingLaunch.build }); }
     catch (e) { orphanAdoption = { error: String(e?.message || e).split('\n')[0] }; }
   }
   // Queue hygiene (automatic classes only: resolved / duplicate alias / missing card). LIVE only, best-effort, and
@@ -433,6 +458,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     const n = normNum(num);
     const pr = openPrs.find((p) => prDeliversNum(p, n));
     if (pr) return `${pr.repo}#${pr.number} delivers it`;
+    // 78b — a launch still being started has no run-store row yet; its claim is the only thing keeping the item ours.
+    if (pendingLaunch.build.has(n)) return null;
     const settled = settledByNum.get(n);
     if (settled && settled.outcome !== 'pr-opened' && !inFlightNums.has(n)) {
       const stale = claimedAt && typeof settled.startedAt === 'string' && settled.startedAt !== '' && settled.startedAt < claimedAt;
@@ -490,12 +517,32 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
 
   const dispatched = [];
   const failures = [];
+  // #4139 host-load gate on NEW launches only: refuse with a logged `host-load` reason, never touch running work, and
+  // take no claim (so nothing needs releasing). Re-read per launch: a detached launch raises the load immediately.
+  const loadHolds = [];
+  // 78b — ONE detached launch in flight at a time. Two concurrent `dispatch-lane` runs (same tick) both failed to
+  // confirm live; they share the lane pool and run store. Launching is now instant, so serializing costs one tick.
+  let startedThisTick = 0;
+  const launchSlotBusy = () => typeof effects.settleLaunches === 'function'
+    && (pendingLaunch.build.size + pendingLaunch.prepare.size + startedThisTick) > 0;
+  const loadGateFor = (kind, num) => {
+    const gate = effects.hostLoadGate?.() ?? { admit: true };
+    if (!gate.admit) {
+      loadHolds.push({ num: normNum(num), kind, reason: 'host-load', why: gate.why });
+      console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} deferred (host-load): ${gate.why}`);
+    }
+    return gate;
+  };
   if (live) {
     for (const pick of plan.dispatch) {
+      if (launchSlotBusy()) continue;
+      const gate = loadGateFor('build', pick.num);
+      if (!gate.admit) continue;
       const claim = effects.acquireClaim({ num: pick.num, scope: pick.scope });
       if (!claim.ok) { failures.push({ num: pick.num, stage: 'claim', reason: `${claim.reason}${claim.heldBy ? ` by ${claim.heldBy}` : ''}` }); continue; }
       let res;
       try { res = await effects.dispatch({ num: pick.num, bookkeeping, tick: out, tickBookkeeping, tickAt }); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
+      if (res?.pending) startedThisTick += 1;
       if (res?.dispatching) dispatched.push({ num: pick.num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null });
       else { effects.releaseClaim({ num: pick.num }); failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched' }); }
     }
@@ -513,7 +560,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Release applies to the LATEST attempt only: pick it first, then drop it. Filtering releases before picking
   // would let an older unreleased failure resurface and re-hold an item whose latest attempt was released.
   for (const [num, row] of settledPrepares) if (releasedAttempt(releases, row.num, row.source)) settledPrepares.delete(num);
-  const prepareBusy = new Set(prepareRows.map((r) => normNum(r.num)));
+  const prepareBusy = new Set([...prepareRows.map((r) => normNum(r.num)), ...pendingLaunch.prepare]);
   const probationRecords = (await effects.listProbationPrepares?.() ?? []).map(row => ({
     ...row, evidence: row.evidence ?? releases.find(r => r.probationAttempt === `${row.handle}:${row.scoredAt}`)?.failureEvidence,
   }));
@@ -548,7 +595,12 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     ...prepareBusy, ...prepareSpawns.map((s) => normNum(s.num)),
     ...(bookkeeping.prepareGuards ?? []).filter((g) => g.kind === 'prepare-item').map((g) => normNum(g.num)),
     ...holds.filter((h) => ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason)).map((h) => normNum(h.num))]);
+  for (const f of deferredLaunchFailures) {
+    if (f.isPrepare) await failPrepare(f.num, f.outcome?.refused ? 'dispatch-refused' : 'dispatch', f.outcome?.reason ?? 'not dispatched', f.outcome?.evidence ?? {}, f.attempt ?? new Date().toISOString());
+    else failures.push({ num: f.num, stage: 'dispatch', reason: f.outcome?.reason ?? 'not dispatched' });
+  }
   for (const num of inspectNums) {
+    if (pendingLaunch.prepare.has(num)) { prepareBusy.add(num); continue; } // 78b — launch still starting; the claim stays
     const claim = prepareClaims.find((c) => normNum(c.meta.num) === num);
     const settled = settledPrepares.get(num);
     // As with build retirement, an older attempt must not settle a fresh claim.
@@ -677,6 +729,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       if (finishedPrepares.has(num) || heldNums.has(num) || prepareBusy.has(num) || prepareBusy.size >= 2) continue;
       prepare.planned.push({ ...pick, num });
       if (!live) { prepareBusy.add(num); continue; }
+      if (launchSlotBusy()) continue;
+      if (!loadGateFor('prepare', num).admit) continue;
       // Record the stamp this attempt starts from (`null` = unstamped), so a re-prepare's result is told from the
       // stamp it replaces by identity, not by how recent its date is. A failed read does NOT spawn: without the
       // record the claim would fall back to the date rule, which retires it on the very stamp it replaces. (An
@@ -701,6 +755,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       let res;
       try { res = await effects.dispatch({ num, bookkeeping, launchKind: 'prepare-item', prepareFallback: fallback, tick: out, tickBookkeeping, tickAt }); }
       catch (e) { res = { dispatching: false, reason: String(e?.message || e) }; }
+      if (res?.pending) startedThisTick += 1;
       if (res?.dispatching) {
         prepareBusy.add(num);
         prepare.launched.push({ num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null });
@@ -736,6 +791,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     // or the live status line can say WHY an otherwise-cleared item was not offered.
     dispatchHolds: held,
     dispatched,
+    // 78b/#4139 — launches deferred by the host-load gate, and the detached-launch settlement this tick did.
+    loadHolds,
+    launchSettlement,
     // Every cleared card not dispatched this tick, with the stage and reason that held it (queue-cap included).
     buildHolds: collectBuildHolds({
       queue: admission.queue || [], planHeld: admission.held || [], suppressed: d.suppressedBuilds || [],
@@ -952,31 +1010,35 @@ export function cliListHolds() {
       ...('replacesStamp' in h.meta ? { replacesStamp: h.meta.replacesStamp } : {}) }));
 }
 
-export function cliDispatch({ num, bookkeeping, launchKind = 'build', prepareFallback = false, tick, tickBookkeeping, tickAt }, { exec = execFileSync } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'build-dispatch-daemon-'));
+/** The dispatch-lane argv + env for one launch, with its bookkeeping/tick handoff files written under `dir`. */
+function prepareDispatchLaunch({ num, bookkeeping, launchKind = 'build', prepareFallback = false, tick, tickBookkeeping, tickAt }, dir) {
   const file = join(dir, 'bookkeeping.json');
+  // dispatch-lane reuses the supplied tick, falling back to a re-read if the handoff is invalid.
+  // Keep that re-read under the same lane-cap policy as cliPlanTick; otherwise a planned
+  // prepare can disappear and be reported as the build-only needs-prepare hold.
+  // Its model override travels in JSON argv plus a recorded reason, not a run.mjs control flag.
+  writeFileSync(file, JSON.stringify({ bookkeeping: bookkeeping || {} }), { mode: 0o600 });
+  const argv = [join(SCRIPTS, 'operations', 'run.mjs'), 'dispatch-lane', `--num=${num}`, `--bookkeepingFile=${file}`, '--json'];
+  // `at` is the PLAN time (`tickAt`), so dispatch-lane's under-5-min bound measures the plan's real age. A
+  // caller that cannot say when the plan was made hands off nothing: dispatch-lane re-plans.
+  if (tick && Number.isFinite(Date.parse(tickAt))) {
+    const tickFile = join(dir, 'tick.json');
+    writeFileSync(tickFile, JSON.stringify({
+      at: tickAt,
+      bookkeepingHash: createHash('sha256').update(JSON.stringify({ bookkeeping: tickBookkeeping || {} })).digest('hex'),
+      tick,
+    }), { mode: 0o600 });
+    argv.push(`--tickFile=${tickFile}`);
+  }
+  const env = { ...process.env, ...routingPolicyEnv(), ...(launchKind === 'prepare-item' && prepareFallback ? { WE_PROBATION_LAUNCH: 'off' } : {}), [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, WE_BUILD_DISPATCH_MODE: process.env.WE_BUILD_DISPATCH_MODE || 'mechanical' };
+  return { argv, env };
+}
+
+export function cliDispatch(args, { exec = execFileSync } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'build-dispatch-daemon-'));
   try {
-    // dispatch-lane reuses the supplied tick, falling back to a re-read if the handoff is invalid.
-    // Keep that re-read under the same lane-cap policy as cliPlanTick; otherwise a planned
-    // prepare can disappear and be reported as the build-only needs-prepare hold.
-    // Its model override travels in JSON argv plus a recorded reason, not a run.mjs control flag.
-    writeFileSync(file, JSON.stringify({ bookkeeping: bookkeeping || {} }), { mode: 0o600 });
-    const argv = [join(SCRIPTS, 'operations', 'run.mjs'), 'dispatch-lane', `--num=${num}`, `--bookkeepingFile=${file}`, '--json'];
-    // `at` is the PLAN time (`tickAt`), so dispatch-lane's under-5-min bound measures the plan's real age. A
-    // caller that cannot say when the plan was made hands off nothing: dispatch-lane re-plans.
-    if (tick && Number.isFinite(Date.parse(tickAt))) {
-      const tickFile = join(dir, 'tick.json');
-      writeFileSync(tickFile, JSON.stringify({
-        at: tickAt,
-        bookkeepingHash: createHash('sha256').update(JSON.stringify({ bookkeeping: tickBookkeeping || {} })).digest('hex'),
-        tick,
-      }), { mode: 0o600 });
-      argv.push(`--tickFile=${tickFile}`);
-    }
-    const text = exec('node', argv, {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, cwd: REPO_ROOT,
-      env: { ...process.env, ...routingPolicyEnv(), ...(launchKind === 'prepare-item' && prepareFallback ? { WE_PROBATION_LAUNCH: 'off' } : {}), [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, WE_BUILD_DISPATCH_MODE: process.env.WE_BUILD_DISPATCH_MODE || 'mechanical' },
-    });
+    const { argv, env } = prepareDispatchLaunch(args, dir);
+    const text = exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, cwd: REPO_ROOT, env });
     return readDispatchOutcome(text);
   } catch (e) {
     if (e?.stdout) {
@@ -987,6 +1049,52 @@ export function cliDispatch({ num, bookkeeping, launchKind = 'build', prepareFal
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
   }
+}
+
+const pendingLaunchesRoot = () => join(resolveCoordinationRoot(), PENDING_LAUNCHES_DIRNAME);
+
+/**
+ * 78b — the NON-BLOCKING launch: spawn `dispatch-lane` detached, record it, return at once. The caller's claim stays
+ * held; a later tick settles the launch ({@link cliSettleLaunches}). `pending: true` marks the result as "started,
+ * not yet confirmed" — never a failure.
+ */
+export function cliDispatchDetached(args, { spawn, root = pendingLaunchesRoot() } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'build-dispatch-daemon-'));
+  try {
+    const { argv, env } = prepareDispatchLaunch(args, dir);
+    const record = startDetachedLaunch({ root, num: args.num, kind: args.launchKind ?? 'build', argv, env, cwd: REPO_ROOT, workDir: dir, ...(spawn ? { spawn } : {}) });
+    return { dispatching: true, pending: true, lane: null, sessionSlug: null, attempt: record.attempt };
+  } catch (e) {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    return { dispatching: false, reason: `launch-spawn-failed: ${String(e?.message || e).replace(/\s+/g, ' ').slice(0, 300)}` };
+  }
+}
+
+/** Settle detached launches; a "launch not confirmed" outcome is first checked against live sessions. */
+export async function cliSettleLaunches({ root = pendingLaunchesRoot(), isPidAlive = defaultIsPidAlive, now = Date.now, confirmed = null } = {}) {
+  const { pending, settled } = settleLaunches({ root, readOutcome: readDispatchOutcome, isPidAlive, now });
+  for (const s of settled) {
+    if (!s.outcome.dispatching && /launch not confirmed/.test(s.outcome.reason ?? '') && confirmed) {
+      try {
+        if (await confirmed({ num: s.record.num, kind: s.record.kind })) s.outcome = { ...s.outcome, dispatching: true, confirmedBy: 'live-session' };
+      } catch { /* an unreadable liveness stays a failure the next attempt retries */ }
+    }
+  }
+  return { pending: pending.map((r) => ({ num: r.num, kind: r.kind, pid: r.pid, startedAt: r.startedAt })),
+    settled: settled.map((s) => ({ num: s.record.num, kind: s.record.kind, attempt: s.record.attempt, outcome: s.outcome })) };
+}
+
+/** A launch whose result file said "not confirmed" still counts as launched when a live run-store row exists for it. */
+export async function cliLaunchConfirmed({ num, kind }) {
+  const launchKind = kind === 'prepare-item' ? 'prepare-item' : 'build';
+  const rows = await cliListRunStoreInFlight({ launchKind });
+  return rows.some((r) => normNum(r.num) === normNum(num) && (launchKind === 'build' || r.row?.entry?.live !== false));
+}
+
+/** Host-load gate for NEW launches (#4139's shared helper). Fails open on an unreadable load. */
+export function cliHostLoadGate({ env = process.env, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length } = {}) {
+  try { return hostLoadGate({ load: loadavg(), cores: cpuCount(), maxLoadPerCore: resolveMaxLoadPerCore({ env }) }); }
+  catch { return { admit: true }; }
 }
 
 function cliKillSwitch() {
@@ -1549,12 +1657,18 @@ function cliEffects() {
     listHolds: () => [...cliListHolds(), ...Object.values(readFailureState().failures)
       .filter(f => f.held && !f.completed).map(f => ({ num: f.num, reason: 'prepare-unstamped' }))],
     killSwitch: cliKillSwitch,
-    dispatch: cliDispatch,
+    dispatch: cliDispatchDetached,
+    settleLaunches: (o) => cliSettleLaunches({ confirmed: cliLaunchConfirmed, ...o }),
+    hostLoadGate: cliHostLoadGate,
     // #4348-open-pr-retry — only called by `runBuildDispatchTick` when `live` (never on a `--dry-run` tick).
     retryInfraBlocked: cliRetryInfraBlocked,
     // #4131/#4382 build-orphan-adopt — only called by `runBuildDispatchTick` when `live`, and BEFORE this same
     // tick's own claim retirement read — see that function's own docblock.
-    adoptOrphans: (o) => adoptOrphanedBuildClaims(o),
+    adoptOrphans: ({ skipNums, ...o } = {}) => adoptOrphanedBuildClaims({
+      ...o,
+      // 78b — a claim whose detached launch is still starting has no run row yet; never read it as an orphan.
+      ...(skipNums?.size ? { listClaims: () => listBuildDispatchClaims({ ignoreExpiry: true }).filter((c) => !skipNums.has(normNum(c.meta?.num))) } : {}),
+    }),
     recoverDrafts: cliRecoverBuilderDrafts,
     // Queue hygiene every N live ticks (`WE_BUILD_DAEMON_QUEUE_PRUNE_EVERY_TICKS`, default 5; 0 = off).
     pruneQueue: makeCliPruneQueue(),
@@ -1808,7 +1922,7 @@ async function live(flags) {
       // or for an older record with none) so the operator's tick line names WHO is running each build without
       // reading scorecards. Additive over the previous bare-num array — nothing on `main` parses this stdout
       // JSON as a strict array-of-strings today (grepped 2026-09-29).
-      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult })}\n`);
+      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult, loadHolds: r.loadHolds, launchSettlement: r.launchSettlement })}\n`);
     },
     onTickError: (e, _tick, loop) => {
       // Keep the health watcher's existing failure-line contract; timings are an additive JSON line.
