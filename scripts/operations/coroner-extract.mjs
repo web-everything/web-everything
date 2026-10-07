@@ -264,6 +264,7 @@ export function ciCheckName(jobName, runName = '') {
   if (SOAK.test(name) || SOAK.test(runName)) return 'soak-shard';
   if (/smoke/i.test(name)) return 'smoke';
   if (/review.?gate/i.test(name) || /review.?gate/i.test(runName)) return 'review-gate';
+  if (/^integration$/i.test(name)) return 'integration';
   if (/^test|shard|vitest|unit/i.test(name)) return 'test-shard';
   return name ? name.replace(/\s*\([^)]*\)\s*$/, '') || 'unknown' : 'ci-unspecified';
 }
