@@ -68,6 +68,8 @@ import {
   acquireFixDispatchClaim, releaseFixDispatchClaim, fixDispatchClaimOwner,
 } from '../conveyor/fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from '../conveyor/fix-procedure.mjs';
+import { createCiHealReserve } from '../lib/ci-heal-reserve.mjs';
+import { listFixDispatchClaims } from '../conveyor/fix-claim-store.mjs';
 import { flushOwedWrites } from '../conveyor/ci-heal-owed.mjs';
 import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
@@ -295,6 +297,8 @@ export async function runReconcileCiHealDispatch({
   // refused `queue-cap` while the projected queue wait would pass the max. `null` = no gate.
   queueAdmission = null,
   dispatchThrottle = null, // fix-cap / host-load defer-only gate (dispatch-throttle.mjs); null = no gate
+  // A PR's own red CI is owed a ci-heal owner: when the shared cap is full of review fixes, one reserved slot past it.
+  ciHealReserve = dispatchThrottle ? createCiHealReserve({ listClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }) }) : null,
   flushOwed = (key) => flushOwedWrites({ repo: key }),
   pollAttempts = pollHealAttempts,
   retryTimeout = dispatchTimeoutRetry,
@@ -394,7 +398,8 @@ export async function runReconcileCiHealDispatch({
         why: `${loop.count} ci-heal/fix sessions on head ${String(entry.headRefOid ?? '').slice(0, 7)} in ${fixConfig.windowHours}h with nothing pushed; auto-held until the head moves (WE_FIX_LOOP_HOLD=0 disables)` });
       continue;
     }
-    const t = dispatchThrottle ? dispatchThrottle.tryAdmit('ci-heal') : { admit: true };
+    let t = dispatchThrottle ? dispatchThrottle.tryAdmit('ci-heal') : { admit: true };
+    if (!t.admit && t.kind === 'fix-cap' && ciHealReserve) t = ciHealReserve.tryAdmit();
     if (!t.admit) { refusals.push({ pr: entry.prNumber, kind: t.kind, why: t.why }); continue; }
     const q = queueBudget.tryAdmit('ci-heal', { id: entry.prNumber });
     if (!q.admit) {

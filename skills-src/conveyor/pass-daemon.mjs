@@ -57,6 +57,7 @@ import {
 import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 import { withSelfSync, resolvePocSyncBranch, DAEMON_SELF_SYNC_BRANCH_ENV } from '../../scripts/lib/daemon-self-sync.mjs';
 import { StringDecoder } from 'node:string_decoder';
+import { notifyDesktopChecked } from '../../scripts/conveyor/branch-sync.mjs';
 import { installDaemonLog, stripLogTimestamp } from './daemon-log.mjs';
 
 const CLOSE_GRACE_MS = 5000;
@@ -137,10 +138,23 @@ export async function runPassDaemonLoop({
   runPass, sleep, isAlive = () => true, onRun = () => {}, onRunError = () => {},
   refreshAuth = async () => {}, onRefreshError = () => {},
   intervalMs, maxRuns = Infinity,
+  failureAlertAfter = 0, onConsecutiveFailures = () => {},
 }) {
   if (typeof runPass !== 'function') throw new TypeError('runPassDaemonLoop requires a runPass effect');
   if (!Number.isFinite(intervalMs) || intervalMs <= 0) throw new TypeError('runPassDaemonLoop requires a positive intervalMs');
   let run = 0;
+  let streak = 0;
+  const failed = (result) => !result || result.spawnError != null || result.signal != null || (result.code ?? 1) !== 0;
+  // Who watches the watcher: a pass that fails `failureAlertAfter` runs in a row (non-zero exit, killed, OOM,
+  // spawn error, throw) is reported through `onConsecutiveFailures` — from THIS daemon, never the pass itself,
+  // which is the thing that is broken. Fires at the threshold, then at every 6th multiple, not on every tick.
+  const noteRun = (bad, detail) => {
+    streak = bad ? streak + 1 : 0;
+    if (failureAlertAfter > 0 && bad && streak >= failureAlertAfter
+      && (streak - failureAlertAfter) % (failureAlertAfter * 6) === 0) {
+      try { onConsecutiveFailures({ count: streak, detail }); } catch { /* alerting must never stop the loop */ }
+    }
+  };
   for (;;) {
     try {
       await refreshAuth();
@@ -150,8 +164,10 @@ export async function runPassDaemonLoop({
     try {
       const result = await runPass();
       onRun(result, run);
+      noteRun(failed(result), result);
     } catch (error) {
       onRunError(error, run);
+      noteRun(true, { error: String((error && error.message) || error) });
     }
     if (!isAlive()) return { runs: run + 1, stoppedReason: 'lease-lost' };
     if (run + 1 >= maxRuns) return { runs: run + 1, stoppedReason: 'max-runs' };
@@ -169,6 +185,28 @@ export async function runPassDaemonLoop({
 // resident daemon needs here: the sleep IS the reason it stays alive between runs. (The heartbeat
 // `setInterval` below is correctly left `.unref()`'d — it is not meant to be a standalone keep-alive; this
 // timer already guarantees survival once fixed.)
+/** Consecutive failed runs before a watched pass raises an operator alert (knob `WE_PASS_FAILURE_ALERT_AFTER`,
+ *  default 2). Only manifest entries marked `alertOnConsecutiveFailures` are watched; 0 turns it off. PURE. */
+export const DEFAULT_FAILURE_ALERT_AFTER = 2;
+export function resolveFailureAlertAfter(entry, env = process.env) {
+  if (!entry?.alertOnConsecutiveFailures) return 0;
+  const raw = env.WE_PASS_FAILURE_ALERT_AFTER;
+  const n = raw == null || raw === '' ? DEFAULT_FAILURE_ALERT_AFTER : Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : DEFAULT_FAILURE_ALERT_AFTER;
+}
+
+/** The operator-visible alert: a desktop notification (the existing `notifyDesktopChecked` path) plus a log line
+ *  that survives a missed notification. Never throws. */
+export function alertConsecutiveFailures(passName, count, detail, { notify = notifyDesktopChecked, log = console } = {}) {
+  const why = detail?.error ?? (detail?.spawnError ?? (detail?.signal ? `killed by ${detail.signal}` : `exit code ${detail?.code}`));
+  const body = `"${passName}" has failed ${count} runs in a row (last: ${why}). The watcher is not watching — check its log.`;
+  log.error(`pass-daemon: ALERT ${body}`);
+  try {
+    const r = notify({ title: `${passName} is failing`, body });
+    if (r && r.ok === false) log.error(`pass-daemon: desktop alert for "${passName}" not delivered: ${r.error}`);
+  } catch (e) { log.error(`pass-daemon: alert for "${passName}" threw: ${String((e && e.message) || e)}`); }
+}
+
 export function realSleep(ms) { return new Promise((resolve) => { setTimeout(resolve, ms); }); }
 
 /** #5129 — an older clone may not yet register a launchd job's pass. Stay resident before acquiring a
@@ -330,12 +368,15 @@ async function main(argv) {
     }).tickOnce
     : () => spawnPassOnce(entry, { env: passEnv });
 
+  const failureAlertAfter = resolveFailureAlertAfter(entry, process.env);
   console.error(`pass-daemon: started "${passName}" (${entry.script}) on interval ${intervalMs}ms, heartbeat every ${heartbeatIntervalMs}ms.`);
   const { stoppedReason } = await runPassDaemonLoop({
     runPass: runPassSelfSynced,
     sleep: realSleep,
     isAlive: () => alive,
     intervalMs,
+    failureAlertAfter,
+    onConsecutiveFailures: ({ count, detail }) => alertConsecutiveFailures(passName, count, detail),
     refreshAuth: () => ensureFreshGithubAppEnv(FLEET_APP_AUTH_OPTS),
     onRunError: (e) => console.error(`pass-daemon: "${passName}" run failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`),
     onRefreshError: (e) => console.error(`pass-daemon: "${passName}" GitHub App token refresh failed (non-fatal, falling back to personal auth): ${String((e && e.message) || e).split('\n')[0]}`),

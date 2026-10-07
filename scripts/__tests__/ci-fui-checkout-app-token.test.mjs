@@ -50,7 +50,7 @@ describe('FUI sibling checkout uses a GitHub App token', () => {
     });
   }
 
-  it('covers all 7 checkouts', () => {
-    expect(total).toBe(7);
+  it('covers all 8 checkouts', () => {
+    expect(total).toBe(8);
   });
 });

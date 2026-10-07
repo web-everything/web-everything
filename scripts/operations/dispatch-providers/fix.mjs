@@ -118,6 +118,7 @@ export function fixDetachedProvider(request, {
   if (request.ref) argv.push(`--ref=${request.ref}`);
   if (request.repo) argv.push(`--repo=${request.repo}`);
   if (request.laneRepo) argv.push(`--lane-repo=${request.laneRepo}`);
+  if (request.claimRepo) argv.push(`--claim-repo=${request.claimRepo}`);
   if (request.scope) argv.push(`--scope=${request.scope}`);
   // build-path-codex-isolation — the run record's ONE executor field comes from here: the vendor this wrapper
   // is actually told to run, never the router's recommendation (see dispatch-lane-io.mjs#dispatchExecutorFor).

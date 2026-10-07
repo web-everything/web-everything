@@ -23,7 +23,7 @@ reason to escalate, never to guess. You do the JUDGMENT (read the item + the cod
 every script-decidable step around it is a script you shell, per
 [we:docs/agent/platform-decisions.md#deterministic-core-thin-judgment](../../docs/agent/platform-decisions.md#deterministic-core-thin-judgment).
 
-## The method — premise check, scope check, then author the five sections
+## The method — premise check, scope check, then author the six sections
 
 There is no separate skill for this yet (unlike decision-prepare, which delegates to
 `we:skills-src/prepare-decision-item/SKILL.md`) — the method is stated here, and if it changes, edit this brief.
@@ -47,6 +47,17 @@ There is no separate skill for this yet (unlike decision-prepare, which delegate
    - `## Test plan` — each case named with what it asserts and why it fails RED before the fix.
    - `## Proof plan` — how the fix will be shown working live (a before/after on a real surface, a dry-run, a
      CLI probe), not just "tests pass".
+   - `## Edge cases this change must handle` — **required** (opus perf sweep 2026-10-07: a checklist that lacked a
+     requirement was the largest cause of review rounds). One line per class, each either the handling the build
+     must implement and test, or `n/a: <why>` — a bare `n/a` or a missing class is not filled. A class that applies
+     also gets a case in `## Test plan`:
+     1. **Untrusted text** — any LLM, PR, comment, card or CLI text that reaches a note, a shell, argv, a path or a regex: fold newlines and backticks (`foldUntrusted`, `we:scripts/lib/jury-core.mjs`); never let a value starting with `--` reach argv; NFKC and invisible characters.
+     2. **Truncated reads** — every `gh`/`git` read: full pages (`readCompletePrComments`, `we:scripts/conveyor/pr-comments-complete.mjs`), `maxBuffer` (`proc-read.mjs`), and a `--limit` hit is an error, never "none".
+     3. **Shared state files** — two writers at once: atomic write plus lock (`writeJsonAtomic`, `withFileLock` in `we:scripts/lib/atomic-json-file.mjs`), compare-and-set on re-read, stale-lock steal only under a guard.
+     4. **Fail closed** — a failed read, parse or spawn is never empty, `[]`, "not stamped" or "no PR"; name the refusal reason.
+     5. **Identity scoping** — every key is scoped by repo + number + head sha / session id; hash and NNN spellings both resolve.
+     6. **State over time** — old records after a new head, repeat suppression across ticks, TTL and clock skew, and what happens on restart mid-operation.
+     7. **Who wrote it** — any comment, ref, label or job name that grants trust: check the author or source, not just the name.
    - `## Follow-ups` — anything beyond the MVP cut, each nameable as a future backlog item (do not file them
      yourself here — that is the eventual BUILDER's job, per the standard delivery-agent brief's step 4).
 4. **Stamp `preparedDate`** (step 3 below) once every section above genuinely holds — a prepare pass that is
@@ -153,8 +164,15 @@ printf '%s\n' "WE #{{ITEM_NUM}}: prepare — <short card title>" "" \
 git commit -F <msgfile> {{ITEM_SPEC_PATH}}
 
 node scripts/verify-lane.mjs request --repo=.
-node scripts/verify-lane.mjs check --wait=540000 --repo=.   # re-run on `timeout`
+node {{WE_ROOT}}/scripts/conveyor/await-verify.mjs mark --who={{SESSION_SLUG}} --item={{ITEM_NUM}} --ref=lane/{{ITEM_NUM}}-prepare-item-<slug> --kind=prepare --attempt=1
 ```
+
+**The harness owns the wait, not you (#5137).** After `mark`, **end your turn**: reply with one line
+(`awaiting verify for <sha>`) and stop. Never `check --wait`, never `sleep`, never `run_in_background`, never
+`reset` or re-`request` yourself. The fix daemon resumes THIS session with a message that starts
+`[harness verify verdict — #5137]`: `green` → continue at step 5; `red` → repair the card, commit (or amend), `request`,
+`mark` again with `--attempt=<n+1>` and end your turn (the third red is a hard stop); no verdict → the harness
+re-requests on its own and then tells you to report blocked-on-infra. Nothing is pushed for you.
 
 This is the ONLY gate run for a card-only prepare. On a `backlog/`-only diff the gate takes its light path
 (no Vitest, but an UNSCOPED `check:standards` — a `backlog/` path always keeps the whole-repo run, so expect it
@@ -163,7 +181,7 @@ to take longer than a scoped one) and stamps the marker `open-pr` requires. Do N
 suite itself). Never pass `--help`/`-h` expecting a dry run: it prints usage only.
 
 If step 5's review makes you change the card, fold the change into that same commit
-(`git commit --amend --no-edit {{ITEM_SPEC_PATH}}`) and `request` once more: the amended commit is a new HEAD,
+(`git commit --amend --no-edit {{ITEM_SPEC_PATH}}`), `request` and `mark` once more (and end your turn again): the amended commit is a new HEAD,
 so that is the gate for the HEAD you will open, not a second run of the same one.
 
 The gate checks item shape; it does not replace the explicit `preparedDate` check above. A red gate is a

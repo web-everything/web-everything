@@ -319,3 +319,43 @@ it('two real processes contend on the responder runner-lock; losing owner cannot
     expect(heartbeatRunnerLease(root, owner, { key })).toBe(false);
   } finally { releaseRunnerLeaseIfOwned(root, owner, { key }); rmSync(root, { recursive: true, force: true }); }
 });
+
+describe('who watches the watcher — consecutive failed runs raise an operator alert', () => {
+  const run = (results, extra = {}) => {
+    const alerts = [];
+    let i = 0;
+    return runPassDaemonLoop({
+      runPass: async () => { const r = results[i]; i += 1; if (r instanceof Error) throw r; return r; },
+      sleep: async () => {}, intervalMs: 1000, maxRuns: results.length,
+      onConsecutiveFailures: (a) => alerts.push(a), ...extra,
+    }).then(() => alerts);
+  };
+  it('alerts at the 2nd consecutive failure (OOM abort, watchdog kill, throw all count)', async () => {
+    expect(await run([{ code: 1 }, { code: 3 }], { failureAlertAfter: 2 })).toHaveLength(1);
+    expect(await run([{ code: null, signal: 'SIGABRT' }, new Error('boom')], { failureAlertAfter: 2 })).toHaveLength(1);
+  });
+  it('a success resets the streak, and a lone failure never alerts', async () => {
+    expect(await run([{ code: 1 }, { code: 0 }, { code: 1 }], { failureAlertAfter: 2 })).toEqual([]);
+  });
+  it('does not alert every tick: next alert is 6 thresholds later', async () => {
+    const alerts = await run(Array.from({ length: 8 }, () => ({ code: 1 })), { failureAlertAfter: 2 });
+    expect(alerts.map((a) => a.count)).toEqual([2]);
+  });
+  it('is off by default (threshold 0) and the health-watch manifest entry opts in', async () => {
+    expect(await run([{ code: 1 }, { code: 1 }, { code: 1 }])).toEqual([]);
+    const { resolveFailureAlertAfter } = await import('../pass-daemon.mjs');
+    const { DAEMON_MANIFEST } = await import('../daemon-manifest.mjs');
+    expect(resolveFailureAlertAfter(DAEMON_MANIFEST['health-watch'], {})).toBe(2);
+    expect(resolveFailureAlertAfter(DAEMON_MANIFEST['health-watch'], { WE_PASS_FAILURE_ALERT_AFTER: '5' })).toBe(5);
+    expect(resolveFailureAlertAfter(DAEMON_MANIFEST['health-watch'], { WE_PASS_FAILURE_ALERT_AFTER: '0' })).toBe(0);
+    expect(resolveFailureAlertAfter({}, {})).toBe(0);
+  });
+  it('alertConsecutiveFailures sends the desktop notification and logs', async () => {
+    const { alertConsecutiveFailures } = await import('../pass-daemon.mjs');
+    const sent = []; const lines = [];
+    alertConsecutiveFailures('health-watch', 2, { code: 134 }, { notify: (n) => { sent.push(n); return { ok: true }; }, log: { error: (l) => lines.push(l) } });
+    expect(sent[0].title).toMatch(/health-watch is failing/);
+    expect(sent[0].body).toMatch(/2 runs in a row/);
+    expect(lines[0]).toMatch(/ALERT/);
+  });
+});

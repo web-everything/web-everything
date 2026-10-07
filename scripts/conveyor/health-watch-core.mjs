@@ -53,6 +53,10 @@ export const DEFAULT_HEALTH_CONFIG = Object.freeze({
   reminderAfterMs: 4 * HOUR,
   silenceDefaultMs: 72 * HOUR,
   healthStaleAfterMs: 15 * MINUTE,
+  // `daemon-silent`: a live daemon with no tick for this long is flagged (floor), and slow recent ticks can stretch
+  // that threshold by at most up to the ceiling (live 2026-10-07: a 35-minute tick had stretched it past 1.5 h).
+  daemonSilentMinMs: 10 * MINUTE,
+  daemonSilentCeilingMs: 30 * MINUTE,
   // A parked review waiting on the operator's ruling alerts after this long (`ruling-needed-waiting`).
   rulingNeededAfterMs: 2 * HOUR,
   // Repeated reviews on one head without a posted result (`review-same-head-unposted`).

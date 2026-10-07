@@ -85,6 +85,7 @@ import {
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { startedAtMs } from './reconcile-core.mjs';
 import { readHungInfo, resolveHungThresholdMs } from './hung-session.mjs';
+import { isBorrowedRunnerDead, isPidAlive } from '../lib/dispatch-throttle.mjs';
 
 // The light store helpers live in `fix-claim-store.mjs` (no dispatch graph — see its header); re-exported here so
 // every existing importer of this module is unchanged.
@@ -138,6 +139,21 @@ export function acquireFixDispatchClaim({
   // actively wrong here (the acquiring dispatcher's own exit is expected completion, not a crash).
   const result = reserve(lockRoot, resource, owner, nowMs, nowIso, pid, 'unknown', leaseMinutes, meta);
   return { ...result, resource, lockRoot };
+}
+
+/**
+ * Stamp the borrowed runner's pid onto the claim it was launched under, so the cap and the claim sweep can tell a live
+ * borrowed fix from a dead one. Owner-checked (never rewrites a claim someone else now holds). Best effort.
+ * @returns {boolean} whether the stamp landed
+ */
+export function stampBorrowedRunnerPid({
+  repo, pr, kind = 'fix', owner, pid, nowIso = new Date().toISOString(), lockRoot = fixDispatchClaimRoot(),
+} = {}) {
+  if (!owner || !Number.isInteger(pid) || pid <= 0) return false;
+  const resource = fixDispatchResource({ repo, pr, kind });
+  const current = readLockEntry(lockRoot, resource);
+  if (!current || current.owner !== owner) return false;
+  return heartbeat(lockRoot, resource, owner, nowIso, current.pid ?? null, { ...(current.meta ?? {}), runnerPid: pid });
 }
 
 /** Release only dispatch claims minted for the session that just posted its stand-down. */
@@ -242,6 +258,7 @@ export function refreshLiveFixDispatchClaims({
   hungInfoFor = readHungInfo,
   awaitingVerifyFor = makeAwaitingVerifyResolver(),
   hungThresholdMs = resolveHungThresholdMs(),
+  alive = isPidAlive,
   nowIso = () => new Date().toISOString(),
   nowMs = Date.parse(nowIso()),
 } = {}) {
@@ -265,6 +282,20 @@ export function refreshLiveFixDispatchClaims({
     if (kind === 'fixing') name = entry.meta.who ? String(entry.meta.who) : null;
     else { try { name = fixDispatchSessionName({ repo, pr, kind }); } catch { name = null; } }
     if (!name) continue;
+    // A BORROWED (non-Claude) fix has no `claude agents` row: its liveness is its runner pid. Dead -> release now,
+    // with a reason; alive -> heartbeat. (No pid stamped yet -> falls through to the plain TTL like any new claim.)
+    if (entry.meta.borrowed && Number.isInteger(entry.meta.runnerPid)) {
+      const cur = readLockEntry(lockRoot, fixDispatchResource({ repo, pr, kind }));
+      if (!cur || cur.owner !== entry.owner) continue;
+      if (isBorrowedRunnerDead(cur, alive)) {
+        const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
+        if (result.released) released.push({ repo, pr, kind, owner: entry.owner, reason: `borrowed-runner-dead (pid ${entry.meta.runnerPid} is gone)` });
+      } else {
+        heartbeat(lockRoot, fixDispatchResource({ repo, pr, kind }), cur.owner, nowIso(), cur.pid ?? null, cur.meta);
+        refreshed.push({ repo, pr, kind, headSha, owner: entry.owner });
+      }
+      continue;
+    }
     const agentsAll = (Array.isArray(listed) ? listed : []).filter((a) => a && String(a.name ?? '') === name)
       .map((a) => {
         let info = null;

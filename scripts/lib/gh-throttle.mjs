@@ -1425,6 +1425,19 @@ function resolveBudgetBlockUntil({ headers, resource, probe }) {
  * @param {string} logPath
  * @param {{op:string, attempt:number, points:number, outcome:('call'|'retry_exhausted'|'fail_open'), ok?:boolean, caller?:string, w?:boolean}} entry
  */
+/**
+ * A concurrency-slot acquire that TIMED OUT used to proceed ungated with no trace at all — the 2026-10-07 stall
+ * cost every gh call on the host 2 minutes and nothing said so. Now it is a `slot_timeout` line in `calls.jsonl`
+ * (with how long it waited) plus a stderr warning, so a starved pool is visible the first time it happens.
+ */
+export function noteSlotTimeout(logPath, acq, entry, warn) {
+  if (!acq || !acq.timedOut) return false;
+  recordGhCallLogEntry(logPath, { ...entry, points: 0, outcome: 'slot_timeout', waitedMs: acq.waitedMs ?? null });
+  const msg = `gh-throttle: waited ${Math.round((acq.waitedMs ?? 0) / 1000)}s for a gh concurrency slot (pool full) — running this call ungated`;
+  try { (warn || ((m) => process.stderr.write(m + '\n')))(msg); } catch { /* best-effort */ }
+  return true;
+}
+
 export function recordGhCallLogEntry(logPath, entry) {
   try {
     appendFileSync(logPath, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n', 'utf8');
@@ -1564,6 +1577,7 @@ export function runGhSync(args, opts = {}) {
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       return acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: acquireTimeoutMs, now, sleep });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
+    noteSlotTimeout(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, throttle.warn);
     // Fail OPEN on an acquire timeout too — proceeding unslotted rather than stranding this `gh` call forever
     // (the residual-risk policy heavy-admission.mjs itself names: a fixed cap bounds concurrency and makes the
     // wait observable, it does not claim to eliminate contention).
@@ -1767,11 +1781,19 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
       : (callEnv === env
         ? { stdio: ['inherit', 'pipe', 'pipe'], maxBuffer }
         : { stdio: ['inherit', 'pipe', 'pipe'], maxBuffer, env: callEnv });
-    const acq = gated ? failOpenGate('acquire', () => {
+    // NESTED (live 2026-10-07 13:39-14:06Z conveyor stall): an `outer` invocation is a {@link runGhSync} in some
+    // parent process that ALREADY passed every gate and HOLDS a concurrency slot for THIS exact call — its real
+    // `gh` resolved to the App shim, which landed here. Acquiring a second slot was hold-and-wait: five daemon
+    // ticks/smokes each held one slot while their nested child waited for another, the cap (6) was exhausted by
+    // holders that could never release, and EVERY gh call on the host paid the full 2-minute acquire timeout.
+    // The fix daemon's tick ran 25+ min with its log silent, the drain's live smoke took 25 min and was rejected.
+    // A nested call rides the outer's slot (and its already-charged points/write budget) — one call, one slot.
+    const acq = gated && !outer ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       return acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: acquireTimeoutMs, now, sleep });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
+    noteSlotTimeout(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, throttle.warn);
     let r;
     try {
       const deferred = deferGhCall({ lockRoot, identity, resource, caller, args: argv, nowMs: now(), logPath, op: opLabel }, () => {});

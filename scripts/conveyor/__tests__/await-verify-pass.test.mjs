@@ -927,3 +927,42 @@ describe('resume port: stop-before-resume guards', () => {
     expect(seen.length).toBeGreaterThanOrEqual(2);
   });
 });
+
+describe('delivery and prepare waits (card 4): no PR, no push, the session\'s own open-pr publishes', () => {
+  const del = (over = {}) => rec({ kind: 'delivery', pr: undefined, item: 4300, who: 'build-4300', ref: 'lane/4300-slug', ...over });
+  it('is a harness record keyed by its item, and a PR-less fix record still is not', () => {
+    expect(isHarnessRecord(del())).toBe(true);
+    expect(isHarnessRecord(del({ kind: 'prepare' }))).toBe(true);
+    expect(isHarnessRecord(rec({ pr: undefined, item: 4300 }))).toBe(false);
+  });
+  it('green with the same tree resumes (never pushes), even while the lane is dirty (the step-5 gate runs before the commit)', () => {
+    expect(classify({ record: del(), marker: marker('green') })).toMatchObject({ action: 'resume', resume: 'green' });
+    expect(classify({ record: del(), marker: marker('green'), lane: lane({ dirty: true }) })).toMatchObject({ action: 'resume', resume: 'green' });
+  });
+  it('a dirty lane with a different tree is never trusted', () => {
+    expect(classify({ record: del(), marker: marker('green'), lane: lane({ dirty: true, treeHash: 'e'.repeat(64) }) })).toMatchObject({ action: 'rerequest', reason: 'tree-unproven' });
+  });
+  it('a load-only red is a plain red for a delivery (no quiet-host reverify worker owns it)', () => {
+    const flaky = marker('red', { retriedFailures: [{ file: 'a.test.mjs', kind: 'timeout' }], failureDetails: { tests: [{ file: 'a.test.mjs', name: 'x' }] } });
+    expect(classify({ record: del(), marker: flaky })).toMatchObject({ resume: 'red' });
+  });
+  it('the whole pass: green resumes the same session with the delivery brief\'s next step and pushes nothing', async () => {
+    const r = del();
+    const h = harness({ records: [r], session: { sessionId: r.sessionId, name: 'build-4300', cwd: '/scratch', state: 'done' } });
+    h.state.marker = marker('green');
+    await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
+    expect(h.calls.push).toEqual([]);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toMatch(/item #4300/);
+    expect(h.calls.resume[0].prompt).toMatch(/pushed NOTHING/);
+    expect(h.calls.resume[0].prompt).toMatch(/delivery brief/);
+    expect(h.store.size).toBe(0);
+  });
+  it('red and escalate prompts name the delivery brief, not the fix brief', () => {
+    const red = buildAwaitVerifyResumePrompt({ kind: 'red', record: del(), marker: marker('red', { failureDetails: { tests: [{ file: 'a.test.mjs', name: 'b' }] } }) });
+    expect(red).toContain('a.test.mjs > b');
+    expect(red).not.toMatch(/fix brief/);
+    expect(buildAwaitVerifyResumePrompt({ kind: 'escalate', record: del({ attempt: 3 }), marker: marker('red') })).toMatch(/delivery brief's gate-red hard stop/);
+    expect(buildAwaitVerifyResumePrompt({ kind: 'green', record: del({ kind: 'prepare' }) })).toMatch(/prepare brief/);
+  });
+});

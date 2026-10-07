@@ -23,7 +23,7 @@ describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
 
   it('has the host passes plus 7 passes per repo', () => {
     expect(Object.keys(DAEMON_MANIFEST).sort()).toEqual([
-      'branch-drift', 'load-flake-reverify', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'merge-orphan-sweep', 'lease-reaper', 'health-watch', 'health-responder',
+      'branch-drift', 'load-flake-reverify', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'merge-orphan-sweep', 'lease-reaper', 'health-watch', 'health-responder', 'pr-movement-sweep', 'coroner-sweep', 'opus-sweep',
       ...['ci-queue-watch', 'parked-pr-conflict-watch', 'parked-pr-progress-watch', 'lane-pool-health-watch', 'stuck-pr-watch', 'ci-red-recovery-watch', 'advisory-label-sweep']
         .flatMap((p) => REPO_KEYS.map((k) => `${p}-${k}`)),
     ].sort());

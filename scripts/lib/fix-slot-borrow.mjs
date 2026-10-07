@@ -23,7 +23,7 @@ import os from 'node:os';
 import { dirname, join } from 'node:path';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { BUILD_DISPATCH_POLICY } from '../conveyor/build-dispatch-policy.mjs';
-import { hostLoadGate, resolveFixBorrowSettings, resolveMaxLoadPerCore } from './dispatch-throttle.mjs';
+import { hostLoadGate, isBorrowedRunnerDead, isPidAlive, resolveFixBorrowSettings, resolveMaxLoadPerCore } from './dispatch-throttle.mjs';
 
 export const BORROW_REASON = 'borrowed-build-slot';
 /** A PR not deferred on the cap for this long starts its wait over. */
@@ -33,6 +33,32 @@ export const BORROW_WAIT_GAP_MS = 20 * 60_000;
 export const borrowClass = (executor) => (executor === 'claude' ? 'claude' : 'external');
 /** The executor name the build daemon's planner counts (`codex`/`antigravity` are external, `claude` is Claude). */
 export const builderExecutorFor = (executor) => (executor === 'claude' ? 'claude' : executor === 'codex' ? 'codex' : 'antigravity');
+
+/** Borrowed launches that ended without a push (failed / no-change) this many times inside the window stop borrowing for
+ *  that PR: it falls back to the normal fixer queue. */
+export const BORROW_MAX_UNPRODUCTIVE = 2;
+export const BORROW_FAILURE_WINDOW_MS = 60 * 60_000;
+
+export const defaultBorrowOutcomePath = () => join(resolveCoordinationRoot(), 'fix-borrow-outcomes.json');
+
+/** Durable per-PR record of how borrowed launches ended: `{ "<repo>#<pr>": [{at, outcome, reason}] }`. */
+export function fileOutcomeStore(path = defaultBorrowOutcomePath()) {
+  return fileLedger(path);
+}
+
+/** Record one borrowed launch's end. `pushed` clears the PR's history; anything else is appended (last 10 kept). */
+export function recordBorrowOutcome({ repo, pr, outcome, reason = '', now = Date.now(), store = fileOutcomeStore() }) {
+  const t = store.read() ?? {};
+  const k = `${repo ?? 'we'}#${pr}`;
+  if (outcome === 'pushed') delete t[k];
+  else t[k] = [...(t[k] ?? []), { at: now, outcome, reason: String(reason).slice(0, 300) }].slice(-10);
+  store.write(t);
+}
+
+/** Pure: the unproductive borrowed launches for this PR inside the window. */
+export function recentBorrowFailures(table, { repo, pr, now = Date.now(), windowMs = BORROW_FAILURE_WINDOW_MS } = {}) {
+  return (table?.[`${repo ?? 'we'}#${pr}`] ?? []).filter((o) => o && o.outcome !== 'pushed' && now - Number(o.at) <= windowMs);
+}
 
 export const defaultBorrowLedgerPath = () => join(resolveCoordinationRoot(), 'fix-cap-waits.json');
 
@@ -62,7 +88,8 @@ export function createFixBorrowGate({
   env = process.env, settings = resolveFixBorrowSettings({ env }), now = () => Date.now(),
   ledger = fileLedger(defaultBorrowLedgerPath()),
   listBuildClaims = () => [], listFixClaims = () => [], caps = resolveBuilderCaps(env),
-  loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length,
+  loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length, alive = isPidAlive,
+  outcomes = fileOutcomeStore(),
   launcherAvailable = (executor) => executor === 'claude',
 } = {}) {
   let table = null;
@@ -74,6 +101,12 @@ export function createFixBorrowGate({
     clear(id) { const t = load(); if (t[key(id)]) { delete t[key(id)]; try { ledger.write(t); } catch { /* best-effort */ } } },
     consider(id) {
       if (!settings.enabled) return { borrow: false, why: 'borrow-off' };
+      let failures = [];
+      try { failures = recentBorrowFailures(outcomes.read() ?? {}, { ...id, now: now() }); } catch { /* unreadable: borrow as before */ }
+      if (failures.length >= BORROW_MAX_UNPRODUCTIVE) {
+        const last = failures.at(-1);
+        return { borrow: false, why: `borrowed launch ended without a push ${failures.length}x for this PR (last: ${last.outcome}${last.reason ? ` - ${last.reason}` : ''}); using the normal fixer queue` };
+      }
       const t = load();
       const at = now();
       const prev = t[key(id)];
@@ -92,7 +125,7 @@ export function createFixBorrowGate({
       const klass = borrowClass(executor);
       let builds = 0; let borrowedLive = 0;
       try { builds = listBuildClaims().length; } catch { /* unreadable claims: assume none, the build daemon still caps */ }
-      try { borrowedLive = listFixClaims().filter((c) => c?.meta?.borrowed && borrowClass(c.meta.borrowed.executor) === klass).length; } catch { /* as above */ }
+      try { borrowedLive = listFixClaims().filter((c) => c?.meta?.borrowed && !isBorrowedRunnerDead(c, alive) && borrowClass(c.meta.borrowed.executor) === klass).length; } catch { /* as above */ }
       const free = caps[klass] - builds - borrowedLive - taken[klass];
       if (free <= 0) return { borrow: false, why: `no free ${klass} builder slot (cap ${caps[klass]}, ${builds} build(s), ${borrowedLive + taken[klass]} borrowed)` };
       taken[klass] += 1;

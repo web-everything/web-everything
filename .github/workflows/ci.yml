@@ -192,11 +192,11 @@ jobs:
   # mis-read by branch protection as satisfied, which would let a broken shard merge green. Failing
   # explicitly makes `test` a real red instead.
   test:
-    needs: [changes, test-shard]
+    needs: [changes, test-shard, integration]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     # xd1sfms (#4075/#3383) — same measurement pass as `test-shard` above: 15 successful runs sampled
-    # 2026-09-25 gave this job (merge coverage + check:standards + the real-git integration suite)
+    # 2026-09-25 gave this job (merge coverage + check:standards; the integration suite moved to its own job)
     # min=243s max=380s p50=343s p95=380s — 3x380s≈19min, rounded up.
     timeout-minutes: 20
     steps:
@@ -212,6 +212,12 @@ jobs:
           fi
           if [ "${{ needs.test-shard.result }}" != "success" ]; then
             echo "One or more test shards did not succeed (test-shard result: ${{ needs.test-shard.result }})."
+            exit 1
+          fi
+          # The real-git integration suite is its own parallel job now; `test` still goes red when it does, so the
+          # required `test` check means exactly what it did when the suite ran inside this job.
+          if [ "${{ needs.integration.result }}" != "success" ]; then
+            echo "The integration job did not succeed (result: ${{ needs.integration.result }})."
             exit 1
           fi
 
@@ -277,12 +283,91 @@ jobs:
         working-directory: web-everything
         run: npm run check:standards
 
-      # The real-git/real-subprocess tier `vitest.config.ts` excludes (see its `test.exclude` comment) —
-      # split out so `npm run test:unit` (and everything that shells it locally: `verify-lane.mjs`'s gate,
-      # `npm test`) no longer pays real git/subprocess cost per lane. Runs here so the required `test` gate
-      # still verifies these on every push before merge — only the LOCAL per-lane cost dropped.
+  # Real-git integration suite as its OWN job, parallel with the shards (card 6, perf sweep 2026-10-07). It used
+  # to be the last step of `test`, which `needs: test-shard`, so its 5.8-8.4 min started only after every shard
+  # finished. It never used the shards' output (only the coverage merge does), so it now needs just `changes` and
+  # runs beside them: the critical path drops from shards + (merge + standards + integration) to
+  # max(shards + merge + standards, integration).
+  #
+  # The real-git/real-subprocess tier `vitest.config.ts` excludes (see its `test.exclude` comment) is split out
+  # so `npm run test:unit` (and everything that shells it locally) no longer pays real git/subprocess cost per lane.
+  #
+  # Check names: `integration` is its own check and is meant to be REQUIRED in branch protection alongside `test`,
+  # `smoke` and `daemon-soak`. `test` ALSO still fails when this job fails (see its "Gate on shard results" step),
+  # so nothing that is required today became skippable.
+  #
+  # Card-only PRs: like `test`/`smoke`, it stays a REAL running job (not job-level skipped) that passes in
+  # seconds, because a SKIPPED required check is not read as success by the drain's `reviewCiGate`. Fail closed:
+  # if `changes` did not succeed, the first step fails the job.
+  integration:
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    # Measured 5.8-8.4 min (perf sweep 2026-10-07); ~2.5x the worst case.
+    timeout-minutes: 20
+    steps:
+      - name: Gate on changes
+        id: gate
+        run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "changes (card-only detection) did not succeed (result: ${{ needs.changes.result }}) - failing closed."
+            exit 1
+          fi
+          if [ "${{ needs.changes.outputs.light }}" = "true" ]; then
+            echo "Card-only PR: integration suite intentionally not run."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Same sibling layout as the shards.
+      - name: Checkout WE
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          path: web-everything
+          fetch-depth: 0
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
+      - name: Checkout FUI (sibling)
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
+          path: frontierui
+
+      - uses: actions/setup-node@v4
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web-everything/package-lock.json
+            frontierui/package-lock.json
+
+      - name: Install + build FUI tools
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        working-directory: frontierui
+        run: |
+          npm ci
+          npm run build:tools
+
+      - name: Install
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        working-directory: web-everything
+        run: npm ci
+
       - name: Real-git integration suite (lane-pool, operations transport)
-        if: ${{ needs.changes.outputs.light != 'true' }}
+        if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
         run: npm run test:integration:vitest
 

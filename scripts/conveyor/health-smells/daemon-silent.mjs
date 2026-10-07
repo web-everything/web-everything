@@ -25,9 +25,17 @@ export default {
   // for `silentMinMs` — the 2026-09-25 10:28 ET fix-dispatch signature.
   observedGapFactor: 3,
   heartbeatStaleMs: 5 * MINUTE,
+  // Ceiling on the observed-gap scaling (live 2026-10-07): when a daemon's ticks themselves slow to a crawl (the
+  // fix daemon went 13:03 -> 13:38Z on one tick, every gh call starved), `observedGapFactor x gap` grew with the
+  // stall and pushed the threshold to 1.5-3 h — the watchdog learned to tolerate exactly the silence it exists
+  // to catch. The scaling now stops at this ceiling; the configured-interval floor still governs slow daemons.
+  // Both numbers are knobs: `daemonSilentMinMs` / `daemonSilentCeilingMs` in the health config.json.
+  silentCeilingMs: 30 * MINUTE,
   recommendationHint: 'A daemon holds its lease but is not ticking — read its log tail and `ps` the pid; a hung child call is the usual cause.',
-  evaluate({ leases }, { now, daemons }) {
+  evaluate({ leases }, { now, daemons, config }) {
     const out = [];
+    const minMs = Number.isFinite(config?.daemonSilentMinMs) ? config.daemonSilentMinMs : this.silentMinMs;
+    const ceilingMs = Number.isFinite(config?.daemonSilentCeilingMs) ? config.daemonSilentCeilingMs : this.silentCeilingMs;
     for (const lease of leases) {
       // A daemon whose log this watch does not read (the plateau drain daemon, or — live 2026-09-27 — any
       // `pass-daemon.mjs` watcher split into its own dedicated clone, e.g. `merge-orphan-sweep` — see
@@ -42,11 +50,11 @@ export default {
       const lastActivity = mem.ticksSeen > 0 && mem.lastTickAt != null ? mem.lastTickAt : mem.lastGrowthAt;
       const lastHour = (mem.recentTicks || []).filter((t) => now - t.at <= 60 * MINUTE).length;
       const observedGap = lastHour > 0 ? (60 * MINUTE) / lastHour : 0;
-      const threshold = Math.max(this.silentMinMs, this.silentIntervals * (mem.intervalMs || 120_000), this.observedGapFactor * observedGap);
+      const threshold = Math.max(minMs, this.silentIntervals * (mem.intervalMs || 120_000), Math.min(ceilingMs, this.observedGapFactor * observedGap));
       const silentFor = lastActivity == null ? null : now - lastActivity;
       const outputSilentFor = mem.lastGrowthAt == null ? null : now - mem.lastGrowthAt;
       const hbAge = lease.heartbeatAt ? now - lease.heartbeatAt : null;
-      const hung = lease.pidAlive && hbAge != null && hbAge > this.heartbeatStaleMs && outputSilentFor != null && outputSilentFor > this.silentMinMs;
+      const hung = lease.pidAlive && hbAge != null && hbAge > this.heartbeatStaleMs && outputSilentFor != null && outputSilentFor > minMs;
       const breach = !lease.pidAlive || hung || (silentFor != null && silentFor > threshold);
       const state = !lease.pidAlive ? 'dead (lease left behind, pid gone)' : hung ? 'alive but hung (pid up, lease heartbeat stale, no output)' : 'alive but not ticking (heartbeat fresh, no tick)';
       out.push({

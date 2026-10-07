@@ -355,6 +355,23 @@ test if the finding touches a call path, not only a unit test of the isolated pi
 
 **Fix the class, not the instance.** Before editing, write a short variant list: the defect class in one line, each shape of it you can name (for input handling: quoting, escaping, concatenation, encoding, alternate Unicode), and every call site with the same pattern (`git grep` the helper or the pattern). Fix every variant inside `{{SCOPE}}`. A variant outside `{{SCOPE}}` is listed with the file and filed through `file-item`, never silently left.
 
+**The variant matrix.** The generic sentence above is not enough on its own: fixes keep introducing a sibling defect of
+the same class one call site away. So fill this matrix, in your `Variants considered:` block (step 6's evidence
+comment). Every row your finding touches gets `fixed at <file:line, every site>` or `n/a: <why>`; a row you did not
+look at is not `n/a`.
+
+| defect class | variants to check at every call site |
+|---|---|
+| untrusted text | newline, CR/U+2028, backtick, quote, leading `--`, path `..`, NFKC/invisible, concatenation of two safe parts |
+| truncated read | page limit, `--limit` hit, 1 MiB buffer, last-N-lines parsing, empty-on-error |
+| shared state | two writers, crash between write and rename, stale lock, re-read after lock, expired holder resumes |
+| rollback / switch | target chosen before recovery, id validation (dot names), explicit vs default target |
+| normalization | the same value hashed or compared in two places (trim, case, NFKC, line endings) |
+| resource bounds | unbounded buffer or line, quadratic regex, missing timeout |
+| trust boundary | which process runs the write, cwd the agent could change, author check |
+
+The self-review below asks: **which row did this fix not cover?**
+
 ### 4. Run the gate GREEN (the item's own locus gate)
 
 **The harness owns the wait, not you (#5137).** The gate verifies a COMMIT and the harness pushes exactly that
@@ -448,7 +465,7 @@ Run this BEFORE step 4's `request`: the harness pushes exactly the commit it ver
 
 For anything beyond a trivial one-liner, spawn **one adversarial code-review subagent** on your repair diff and
 **AWAIT its returned report as the verdict** — the same converge-before-handback discipline the delivery brief
-uses ([we:skills-src/conveyor/delivery-agent-brief.md](delivery-agent-brief.md) step 6). Ask the subagent three things: does the repair meet the reviewer's finding, does the repair itself introduce a new problem, and **what is the next variant of the same defect class that still gets through?** A same-class variant it names inside `{{SCOPE}}` is must-fix before re-push. A defect the repair itself introduces is must-fix regardless of class — "not the same class" never dismisses it. You may dismiss any other self-review finding only as "not the same class" or "outside `{{SCOPE}}` (filed as <card>)". Deferring ("later", "follow-up") is not a dismissal. Only then commit and request verify (step 4). A trivial, obviously-correct fix (a typo, a
+uses ([we:skills-src/conveyor/delivery-agent-brief.md](delivery-agent-brief.md) step 6). Ask the subagent four things: does the repair meet the reviewer's finding, does the repair itself introduce a new problem, **what is the next variant of the same defect class that still gets through?**, and **which row of the variant matrix did this fix not cover?** A same-class variant it names inside `{{SCOPE}}` is must-fix before re-push. A defect the repair itself introduces is must-fix regardless of class — "not the same class" never dismisses it. You may dismiss any other self-review finding only as "not the same class" or "outside `{{SCOPE}}` (filed as <card>)". Deferring ("later", "follow-up") is not a dismissal. Only then commit and request verify (step 4). A trivial, obviously-correct fix (a typo, a
 pinned-count bump) may skip the subagent — but never skip re-reading the reviewer's finding to confirm you met it.
 
 ### 6. Commit (before step 4's request) — the harness re-pushes it to the SAME lane ref
@@ -488,7 +505,7 @@ single-branch guard; pushing to `main` is not.
 **Post the before/after proof as a PR comment before re-arming.** A reviewer must be able to SEE that the fix
 works, not just infer it from a green gate: post a comment carrying the trimmed red output (step 2) followed by
 the trimmed green output (step 4) — or, if reproduction was genuinely impossible, the explicit statement of why
-(step 2). The comment must also carry a `Variants considered:` block: the list from step 3, each marked fixed, or out of scope + card.
+(step 2). The comment must also carry a `Variants considered:` block: the list from step 3, each marked fixed, or out of scope + card, followed by the variant matrix from step 3 with every touched row marked `fixed at <sites>` or `n/a: <why>`.
 
 ```bash
 gh pr comment {{PR_NUM}} --repo {{REPO}} --body-file <evidence-file>

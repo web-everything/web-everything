@@ -136,6 +136,17 @@ built (this is the one pre-build stop; see *Escalations*).
 Do the actual work in `$LANE`: implement `{{ITEM_SPEC_PATH}}`, keep `## Progress` synced, capture any
 leftover work as new backlog items (`scaffold` with `blockedBy` + a digest) rather than half-doing them.
 
+- **Handle the card's edge cases — all seven classes (opus perf sweep 2026-10-07).** Read the card's
+  `## Edge cases this change must handle` section and implement and test each handling it names. If the section is
+  missing or a class is unfilled, fill it yourself from the diff before you build (your answer, or `n/a: <why>`);
+  never skip a class silently. The classes, each with the shared helper to reuse instead of re-inventing it:
+  1. **Untrusted text** — any LLM, PR, comment, card or CLI text that reaches a note, a shell, argv, a path or a regex: fold newlines and backticks (`foldUntrusted`, `we:scripts/lib/jury-core.mjs`); never let a value starting with `--` reach argv; NFKC and invisible characters.
+  2. **Truncated reads** — every `gh`/`git` read: full pages (`readCompletePrComments`, `we:scripts/conveyor/pr-comments-complete.mjs`), `maxBuffer` (`proc-read.mjs`), and a `--limit` hit is an error, never "none".
+  3. **Shared state files** — two writers at once: atomic write plus lock (`writeJsonAtomic`, `withFileLock` in `we:scripts/lib/atomic-json-file.mjs`), compare-and-set on re-read, stale-lock steal only under a guard.
+  4. **Fail closed** — a failed read, parse or spawn is never empty, `[]`, "not stamped" or "no PR"; name the refusal reason.
+  5. **Identity scoping** — every key is scoped by repo + number + head sha / session id; hash and NNN spellings both resolve.
+  6. **State over time** — old records after a new head, repeat suppression across ticks, TTL and clock skew, and what happens on restart mid-operation.
+  7. **Who wrote it** — any comment, ref, label or job name that grants trust: check the author or source, not just the name.
 - **Fixing a bug? Reproduce it before you fix it — a green gate alone is not proof.** When
   `{{ITEM_SPEC_PATH}}` describes a defect to fix (not a fresh capability to add), the same before/after
   discipline the conveyor's fix-agent brief owes a bounced PR
@@ -247,29 +258,29 @@ turn's window) runs the gate for you:
 
 ```bash
 node scripts/verify-lane.mjs request              # returns almost instantly — nothing has run yet — @operation-home-ok: #xab3jh7 — request has no operation-level equivalent yet; folding it in is #xab3jh7
-# One bounded blocking call (fits the Bash tool's `timeout: 600000`); re-run it on `timeout` — see below.
-node scripts/verify-lane.mjs check --wait=540000 --json   # returns as soon as the marker settles — @operation-home-ok: #xab3jh7 — check has no operation-level equivalent yet; folding it in is #xab3jh7
+node scripts/conveyor/await-verify.mjs mark --who={{SESSION_SLUG}} --item={{ITEM_NUM}} --ref=lane/{{ITEM_NUM}}{{ATTEMPT_TAG}}-<slug> --kind=delivery --attempt=1
 ```
 
-`--wait=<ms>` (#4358) polls the marker **internally** and returns the FIRST result that is genuinely final —
-never the old "one bare `check`, then come back and ask again next turn" loop. `running` is the ONLY status it
-actually spends the ceiling waiting out (the one status a background process can still move off of); every
-other status ends the wait **immediately** instead of burning the ceiling on something more waiting cannot
-change (see the status table below for what each one means and what to do about it). Every `check --wait=540000` is ONE blocking foreground call that fits the Bash tool's `timeout: 600000`
-ceiling (a longer wait would be killed by the tool before a 30+ minute gate settles). On `timeout` (still
-`running` after 9 minutes) run the SAME call again; stop after 18 consecutive `timeout`s (~160 minutes: the
-admission + execution ceilings, after which the dispatcher itself settles a hung run as `infrastructure-failure`)
-and report the stalled request once. Never `sleep`, never `run_in_background`, never poll output files, and never
-`reset` or re-`request` automatically.
+**The harness owns the wait, not you (#5137).** `mark` records that you are waiting on THIS tree; then **end your
+turn**: reply with one line (`awaiting verify for <sha>`) and stop. Never `check --wait`, never `sleep`, never
+`run_in_background`, never read output files in a loop (#x36vidg), never `reset` or re-`request` yourself. The fix
+daemon reads the verdict every tick and resumes THIS session with a message that starts
+`[harness verify verdict — #5137]`; nothing is pushed for you (your own `open-pr` publishes the ref).
+`mark` records the `--ref` only to bind your session; use the same `<slug>` you will pass to `open-pr` in step 8.
 
-**Read `check`'s `status`/`ok`, never just its exit code — and never read `ok:true` alone as "settled".**
-`{sha, status, reason, ok, detail}` — `status` is `green` (ok — the only one that satisfies this gate) / `red`
-(ok:false, a real gate failure) / `infrastructure-failure` (ok:false, killed or timed out; report its reason, do not automatically retry) / `running` (not yet settled — this is NOT a failure) / `corrupt` (ok:false — the
-marker itself is torn; `request` again) / `absent` (ok:false — nothing was ever requested for this HEAD, or the
-marker is for an older commit; `request` it, don't just re-`check --wait=`) / `break-glass` (`ok:true`, but an
-OVERRIDE, not a verified result — only relevant if `WE_LAND_UNVERIFIED=1` is set) / `timeout` (ok:false,
-`--wait=` only — this call's 9-minute wait elapsed while still `running`; re-run the same `check --wait=540000`, up to 18 consecutive times, then report the stall) / `head-moved` (ok:false,
-`--wait=` only — a new commit landed on the lane mid-wait; re-`request` for the new HEAD).
+The resume message tells you which branch you are on, and it is the same verdict `verify-lane.mjs check` prints:
+- `green` → the gate settled GREEN for exactly that tree: continue at the step after this gate (step 6). If you change
+  any file after `mark`, `request` and `mark` again — a green is for the tree that was marked.
+- `red` → the failing tests are in the message: repair, `request`, `mark` again with `--attempt=<n+1>`, and end your
+  turn. On the third red the message tells you to take the gate-red hard stop (see *Escalations*).
+- `infrastructure-failure` / no verdict → the harness re-requests on its own; after repeated failures the message tells
+  you to report the stalled request with the blocked-on-infra exit (the signal/ceiling evidence, no test failure claimed).
+- a moved lane (a new commit landed mid-wait) → `request` and `mark` again for the current HEAD.
+
+Reading `check`'s `status`/`ok` yourself is only for diagnosing a stuck handoff, and then only a single bare
+`node scripts/verify-lane.mjs check --json` (never a `--wait=` loop): `green` (ok — the only one that satisfies this gate) /
+`red` / `infrastructure-failure` / `running` (not a failure) / `corrupt` (`request` again) / `absent` (nothing was
+requested for this HEAD; `request` it) / `break-glass` (`ok:true` but an OVERRIDE — only with `WE_LAND_UNVERIFIED=1`).
 
 ### 6. Converge your diff — run `/converge` against the lane clone (BEFORE the PR)
 
@@ -389,16 +400,15 @@ printf '%s\n' "WE #{{ITEM_NUM}}: <one-line summary>" "" \
   "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>" > <msgfile>
 git commit -F <msgfile> <explicit-paths>
 
-# #2833/#3105/#4358 — verify the FINAL HEAD you are about to land, keyed to this exact commit. Same
-# request-then-WAIT shape as step 5 — you cannot run this yourself (guard-bash denies it); request it, then let
-# `check --wait=` block (bounded, internally-polling) until it settles GREEN. Do NOT interpret a `timeout` or a
-# lingering `running` status as a failure: it means the runner hasn't finished yet (or hasn't picked it up), not
-# of a test failure — re-run the same bounded `check` (up to 18 consecutive `timeout`s), then report the stalled
-# request. A `head-moved` result means the commit below is no
-# longer HEAD (something else moved it) — re-`request` for the new HEAD before re-checking.
+# #2833/#3105/#5137 — verify the FINAL HEAD you are about to land, keyed to this exact commit. Same request-then-hand-off
+# shape as step 5 — you cannot run this yourself (guard-bash denies it); request it, record the wait with `mark`, and END YOUR
+# TURN (`awaiting verify for <sha>`). The harness resumes this session with the verdict: a `green` means run the `open-pr`
+# below; a `red` is repaired and re-marked (the third is a hard stop, see *Escalations*). A moved HEAD (something else
+# committed) means `request` and `mark` again for the new HEAD. Never loop on `check`, never sleep-poll.
 node scripts/verify-lane.mjs request              # targets HEAD as of the commit you just made — @operation-home-ok: #xab3jh7 — request has no operation-level equivalent yet; folding it in is #xab3jh7
-# … re-run the SAME bounded check on `timeout` if the gate outruns one 9-minute wait (never sleep-poll) …
-node scripts/verify-lane.mjs check --wait=540000 --json   # proceed ONLY once status is `green`; `red` is a hard stop (see *Escalations*) — @operation-home-ok: #xab3jh7 — check has no operation-level equivalent yet; folding it in is #xab3jh7
+node scripts/conveyor/await-verify.mjs mark --who={{SESSION_SLUG}} --item={{ITEM_NUM}} --ref=lane/{{ITEM_NUM}}{{ATTEMPT_TAG}}-<slug> --kind=delivery --attempt=1
+
+# … END YOUR TURN HERE. After the harness's green resume message, and only then, publish: …
 
 node scripts/operations/run.mjs open-pr --ref=lane/{{ITEM_NUM}}{{ATTEMPT_TAG}}-<slug> --sha=HEAD --base={{DELIVERY_BASE}} \
   --bodyFile=<pr-body> --mode=label-on-green --requireVerified=true --json
