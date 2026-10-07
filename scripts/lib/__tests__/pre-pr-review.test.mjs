@@ -4,7 +4,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync, readdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -119,6 +119,7 @@ describe('lane sandbox: checkPrePrReview + open-pr runner', () => {
   });
   it('the open-pr runner refuses before spawning pr-land, and a recorded bypass admits', () => {
     commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
+    process.env.WE_PRE_PR_BYPASS_DIR = join(dir, 'bypass-records');
     const spawned = [];
     const spawn = (...a) => { spawned.push(a); return { status: 0, stdout: '{"pr":1,"url":"u"}\n', stderr: '' }; };
     const run = createPrLandRunner({ spawn, cwd: dir, env: OPERATOR });
@@ -126,10 +127,25 @@ describe('lane sandbox: checkPrePrReview + open-pr runner', () => {
     const out = run({ argv });
     expect(out).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-missing' });
     expect(spawned).toHaveLength(0);
-    const ok = run({ argv, skipPrePrReview: 'emergency hotfix' });
+    // worker bypass is refused, even with an actor and an instruction
+    const w = createPrLandRunner({ spawn, cwd: dir, env: { WE_CONVEYOR_WORKER: '1' } });
+    expect(w({ argv, skipPrePrReview: 'x', actor: 'nic', operatorInstruction: 'ok it' })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-missing' });
+    // an interactive bypass with no operator instruction is refused
+    expect(run({ argv, skipPrePrReview: 'emergency hotfix' })).toMatchObject({ outcome: 'refused' });
+    expect(run({ argv, skipPrePrReview: 'emergency hotfix', actor: 'nic' })).toMatchObject({ outcome: 'refused' });
+    expect(spawned).toHaveLength(0);
+    const body = join(dir, 'b.md'); writeFileSync(body, 'body\n');
+    const argv2 = ['--ref=lane/x', '--base=main', `--body-file=${body}`, '--label-on-green'];
+    const ok = run({ argv: argv2, skipPrePrReview: 'emergency hotfix', actor: 'nic', operatorInstruction: 'operator said: ship the hotfix' });
     expect(ok.outcome).toBe('opened');
+    const sentBody = spawned[0][1].find((a) => a.startsWith('--body-file=')).slice(12);
+    expect(readFileSync(sentBody, 'utf8')).toMatch(/bypassed.*nic.*ship the hotfix/s);
+    expect(readFileSync(join(gitDirOf(dir), 'pre-pr-review-bypass.log'), 'utf8')).toMatch(/ship the hotfix/);
+    expect(readdirSync(join(dir, 'bypass-records'))).toHaveLength(1);
+    delete process.env.WE_PRE_PR_BYPASS_DIR;
     expect(spawned).toHaveLength(1);
     expect(spawned[0][1].join(' ')).not.toMatch(/skipPrePrReview/);
+    expect(spawned[0][1].join(' ')).not.toMatch(/skipPrePrReview|operatorInstruction/);
     expect(readFileSync(join(gitDirOf(dir), 'pre-pr-review-bypass.log'), 'utf8')).toMatch(/emergency hotfix/);
   });
 });

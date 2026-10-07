@@ -14,7 +14,7 @@
  *  - the RECEIPT: `converge-cli.mjs receipt` writes `<git-dir>/pre-pr-review-receipt.json` keyed by the head
  *    TREE hash after a converge run ended in `land`. A new tree (any further edit) invalidates it.
  */
-import { readFileSync, appendFileSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -92,7 +92,7 @@ export function decidePrePrReview({ settings, risk, receipt, headTree, skip = ''
     : 'no pre-PR review receipt exists for this head';
   const msg = `pre-PR review required — this PR is risky (${risk.reasons.join('; ')}) and ${detail}. `
     + 'Run `/converge` against this lane (brief step 6), then `node scripts/converge-cli.mjs receipt --lane=<lane> --state=<file>` '
-    + 'on the committed head, and open the PR again. Bypass only with `--skipPrePrReview=<reason>` (the reason is recorded).';
+    + 'on the committed head, and open the PR again. Bypass only with `--skipPrePrReview=<reason>` (the reason is recorded). A bypass also needs `--actor=<name>` and `--operatorInstruction="<quoted operator instruction>"`; a dispatched worker can never bypass.';
   if (settings.mode === 'advise') return { action: 'advise', why, message: msg };
   if (typeof skip === 'string' && skip.trim()) return { action: 'pass', why: 'bypass', message: '' };
   return { action: 'refuse', why, message: msg };
@@ -133,24 +133,52 @@ export function buildReceipt({ tree, head, envelope, now = new Date() }) {
   };
 }
 
-export function recordBypass(cwd, { reason, head, risk, now = new Date() }) {
-  appendFileSync(join(gitDirOf(cwd), BYPASS_LOG_FILE), `${JSON.stringify({ at: now.toISOString(), head, reason: String(reason).slice(0, 500), risk: risk.reasons })}\n`);
+export function recordBypass(cwd, { reason, head, risk, actor = '', operatorInstruction = '', now = new Date(), recordDir = defaultBypassRecordDir() }) {
+  const row = { at: now.toISOString(), head, reason: String(reason).slice(0, 500), actor: String(actor).slice(0, 200), operatorInstruction: String(operatorInstruction).slice(0, 1000), risk: risk.reasons };
+  appendFileSync(join(gitDirOf(cwd), BYPASS_LOG_FILE), `${JSON.stringify(row)}\n`);
+  // Durable + countable: the coroner hook is not built yet, so every bypass is ALSO one JSONL line under
+  // `.operations/pre-pr-bypass/` (gitignored with the rest of `.operations/`), which a coroner pass can count.
+  try { mkdirSync(recordDir, { recursive: true }); appendFileSync(join(recordDir, `${row.at.slice(0, 10)}.jsonl`), `${JSON.stringify(row)}\n`); } catch { /* the per-checkout log above still holds the row */ }
+}
+
+/** `<repo root>/.operations/pre-pr-bypass`, resolved from this file's location. */
+export function defaultBypassRecordDir() { return process.env.WE_PRE_PR_BYPASS_DIR || resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '.operations', 'pre-pr-bypass'); }
+
+/**
+ * Who may bypass. A dispatched worker (WE_CONVEYOR_WORKER=1) never; an unrecognised marker fails closed; an
+ * interactive session only with an explicit `--actor` plus a quoted operator instruction (the same honesty tax
+ * as review-set-label's clear-human). @returns {{ok:boolean, refusal:string}}
+ */
+export function authoriseBypass({ role, actor = '', operatorInstruction = '' }) {
+  if (role === 'worker') return { ok: false, refusal: 'a dispatched worker (WE_CONVEYOR_WORKER=1) can never bypass the pre-PR review — run /converge and stamp the receipt instead' };
+  if (role !== 'orchestrator') return { ok: false, refusal: 'the session role is unknown (unrecognised WE_CONVEYOR_WORKER marker), so the bypass is refused' };
+  if (!String(actor).trim() || !String(operatorInstruction).trim()) {
+    return { ok: false, refusal: '--skipPrePrReview needs an operator-approved instruction: pass --actor=<name> and --operatorInstruction="<the operator instruction authorising it, quoted>"' };
+  }
+  return { ok: true, refusal: '' };
 }
 
 /**
  * The whole open-pr pre-check, over a lane checkout. IO only through `cwd` git. Returns the decision plus the risk.
  */
-export function checkPrePrReview({ cwd, base = 'main', sha = 'HEAD', env = process.env, skip = '', settings, role } = {}) {
+export function checkPrePrReview({ cwd, base = 'main', sha = 'HEAD', env = process.env, skip = '', actor = '', operatorInstruction = '', settings, role, recordDir } = {}) {
   const { settings: s } = settings ? { settings } : loadPrePrSettings();
   if (s.mode === 'off') return { ...decidePrePrReview({ settings: s, risk: { gated: false }, headTree: '' }), settings: s };
   const { files } = readDiffFiles({ cwd, base, sha });
   const cards = files.filter((f) => isCardPath(f.path)).map((f) => f.path);
   const hasPreparedCard = cards.some((p) => { try { return isPreparedCard(gitIn(cwd, ['show', `${sha}:${p}`])); } catch { return false; } });
-  const operatorAgent = (role ?? sessionRole(env)) !== 'worker';
+  const sessRole = role ?? sessionRole(env);
+  const operatorAgent = sessRole !== 'worker';
   const risk = classifyPrRisk({ files, hasPreparedCard, operatorAgent, settings: s });
   const headTree = treeOf(cwd, sha);
-  const decision = decidePrePrReview({ settings: s, risk, receipt: readReceipt(cwd), headTree, skip });
-  if (decision.why === 'bypass') recordBypass(cwd, { reason: skip, head: sha, risk });
+  const wantsSkip = typeof skip === 'string' && skip.trim() !== '';
+  const auth = wantsSkip ? authoriseBypass({ role: sessRole, actor, operatorInstruction }) : { ok: true, refusal: '' };
+  const decision = decidePrePrReview({ settings: s, risk, receipt: readReceipt(cwd), headTree, skip: auth.ok ? skip : '' });
+  if (wantsSkip && !auth.ok && decision.action === 'refuse') decision.message = `bypass refused — ${auth.refusal}. ${decision.message}`;
+  if (decision.why === 'bypass') {
+    recordBypass(cwd, { reason: skip, head: sha, risk, actor, operatorInstruction, ...(recordDir ? { recordDir } : {}) });
+    decision.bypass = { reason: skip.trim(), actor: actor.trim(), operatorInstruction: operatorInstruction.trim() };
+  }
   return { ...decision, risk, headTree, settings: s };
 }
 
