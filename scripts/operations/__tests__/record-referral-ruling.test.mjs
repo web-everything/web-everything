@@ -264,7 +264,8 @@ describe('operator finding selectors and follow-up', () => {
   it('resumes for cleared findings and waits while any pending finding remains', () => {
     expect(follow({ ruling: 'not-real' })).toEqual({ action: 'resume' });
     expect(follow({ ruling: 'card' })).toEqual({ action: 'resume' });
-    expect(follow({ selected: [open[0]] })).toBeNull();
+    // #4271: findings still waiting do not drop the follow-up; the ruling re-arms the review and names what remains.
+    expect(follow({ selected: [open[0]] })).toMatchObject({ action: 'rearm', remaining: [{ summary: open[1].summary }] });
     expect(follow({ enabled: false })).toBeNull();
     expect(planOperatorRuling(read(), input({ sendBack: false })).followUp).toBeNull();
   });
@@ -276,7 +277,7 @@ describe('operator finding selectors and follow-up', () => {
     expect(context.followUpEnabled).toBe(false);
     expect(planOperatorRuling(context, input()).followUp).toBeNull();
   });
-  it('declares the follow-up after posting, but no follow-up while pending and no preview effects', () => {
+  it('declares the follow-up after posting (a re-arm while findings remain), and no preview effects', () => {
     const op = recordReferralRulingOperation({ readRulingContext: () => read() });
     const write = op.steps.find((s) => s.name === 'write').step;
     const plan = op.steps.find((s) => s.name === 'plan').step;
@@ -286,7 +287,7 @@ describe('operator finding selectors and follow-up', () => {
     expect(effects.map((e) => e.type)).toEqual([OPERATOR_RULING_POST_EFFECT, OPERATOR_RULING_FOLLOW_UP_EFFECT]);
     expect(effects[1]).toMatchObject({ idempotent: true, payload: { repo, pr: 7, head, action: 'send-back', body: verdict.followUp.body, actor: 'chalbert', channel: 'chat' } });
     expect(write.effects({ verdict, input: { preview: true } })).toEqual([]);
-    expect(write.effects({ verdict: planOperatorRuling(read(), input({ finding: '1' })), input: {} })).toHaveLength(1);
+    expect(write.effects({ verdict: planOperatorRuling(read(), input({ finding: '1' })), input: {} }).map((e) => e.payload.action ?? 'post')).toEqual(['post', 'rearm']);
   });
 
   const payload = { repo, pr: 7, head, action: 'send-back', body: 'blocked body', actor: 'chalbert', channel: 'chat' };

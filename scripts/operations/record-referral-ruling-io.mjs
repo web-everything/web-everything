@@ -116,9 +116,12 @@ export function createRecordReferralRulingSinks({ readJson = ghJson,
   ['pr', 'comment', String(pr), '--repo', repo, '--body', body], { encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }) } = {}) {
   return {
-    [OPERATOR_RULING_FOLLOW_UP_EFFECT]: async ({ repo, pr, head, action, body, actor, channel }) => {
+    [OPERATOR_RULING_FOLLOW_UP_EFFECT]: async ({ repo, pr, head, action, body, actor, channel, remaining = [] }) => {
       const before = await readPr(repo, pr);
       if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing changed — re-run against the new head`);
+      // Others still wait: the ruling comment woke the paused review (a fresh advisory follows on this head); the
+      // label stays because the gate still holds them. Report the exact set that remains.
+      if (action === 'rearm') return { action, sentBack: false, labelCleared: false, rearmed: true, remaining };
       const labels = before.labels.map((l) => typeof l === 'string' ? l : l.name);
       let sentBack = false;
       if (action === 'send-back' && !labels.includes('review:changes')) {

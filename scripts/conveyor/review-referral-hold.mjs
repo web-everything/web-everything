@@ -250,7 +250,7 @@ export function notifyReferralHold({ repo, prNumber, hold, comments = [],
   // "N referrals need a ruling" named nothing). A read failure just leaves the old, shorter notice.
   let findings = '';
   try {
-    const need = rulingNeeded({ headRefOid: hold.head, comments });
+    const need = rulingNeeded({ headRefOid: hold.head, comments }, { cardReadable: ref => referralCardReadable(ref, REPO_ROOT) });
     if (need) findings = `\n\nWaiting on your ruling (block, card or not-real):\n${need.findings
       .map(f => `- \`${f.file ?? 'no file'}${f.line ? `:${f.line}` : ''}\` — ${f.summary}`).join('\n')}`;
   } catch { /* the short notice still posts */ }

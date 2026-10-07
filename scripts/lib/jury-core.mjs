@@ -1484,7 +1484,7 @@ const outcomeCitation = f => foldUntrusted(f?.file
   : String(f?.summary ?? '').slice(0, 60));
 
 export function explainPanelOutcome({ outcome, lensVerdicts = {}, findings = [], mandatoryLenses = MANDATORY_LENSES,
-  blockedReferrals, pendingReferrals, deferredCount = 0, scopeFellBack = null } = {}) {
+  blockedReferrals, pendingReferrals, pendingFindings, deferredCount = 0, scopeFellBack = null } = {}) {
   const cited = f => outcomeCitation(f) ? ` (finding \`${outcomeCitation(f)}\`)` : '';
   const prevention = (lens, f) => `Changes: ${lens}${mandatoryLenses.includes(lens) ? '' : ' advisory'} owes a prevention card${cited(f)}`;
   let reason;
@@ -1498,7 +1498,13 @@ export function explainPanelOutcome({ outcome, lensVerdicts = {}, findings = [],
       : `Changes: ${blockedReferrals.length} mandatory referrals were ruled block`
         + (citations.length ? ` (${citations.length === 1 ? 'finding' : 'findings'} ${citations.map((c) => `\`${c}\``).join(', ')})` : '');
   }
-  else if (pendingReferrals?.length) reason = `Pending: ${pendingReferrals.length} mandatory referral(s) await a ruling`;
+  else if (pendingReferrals?.length) {
+    // The count is the NAMED findings (the list the note prints), never the raw gate list: that one also carries
+    // hold tokens that name no finding (live #4271, 2026-10-07: "7 await a ruling" beside a shorter listed set).
+    const n = Array.isArray(pendingFindings) ? pendingFindings.length : pendingReferrals.length;
+    reason = n > 0 ? `Pending: ${n} mandatory referral(s) await a ruling`
+      : `Pending: the mandatory referral record is held (${pendingReferrals.map(foldUntrusted).join(', ')})`;
+  }
   else if (outcome === 'accept') reason = 'Accept: no blocking findings on this head';
   else if (outcome == null) reason = 'No outcome: the reviewed head is not pinned, so no advisory label is applied';
   else {
@@ -3216,6 +3222,7 @@ export function mandatoryReferralState(comments, context = {}) {
   }
   const blocked = [];
   const blockedFindings = [];
+  const pendingFindings = [];
   const identityTable = findingIdentityTable(records);
   // #76b — computed once per head here, not once per record.
   const linkedByHead = new Map();
@@ -3234,7 +3241,20 @@ export function mandatoryReferralState(comments, context = {}) {
     pending.push(...state.pending);
     blocked.push(...state.blocked);
     for (const b of state.blockedFindings) if (!blockedFindings.some((x) => x.key === b.key)) blockedFindings.push(b);
+    // The findings THIS record leaves pending, named. The one list every surface counts and prints.
+    for (const f of activeReferrals(r)) {
+      if (!state.pending.includes(f.key)) continue;
+      if (pendingFindings.some((x) => x.runId === r.runId && x.key === f.key)) continue;
+      pendingFindings.push({ runId: r.runId, key: f.key, seat: f.seat, attempted: r.attempted === true,
+        file: f.finding?.file ?? null, line: Number.isInteger(f.finding?.line) ? f.finding.line : null,
+        summary: String(f.finding?.summary ?? '').replace(/\s+/g, ' ').trim() });
+    }
   }
-  return { records, operatorRulings: operator.rulings, pending: [...new Set(pending)], blocked: [...new Set(blocked)],
-    blockedFindings, malformed };
+  const pendingAll = [...new Set(pending)];
+  const listedKeys = new Set(pendingFindings.map((f) => f.key));
+  return { records, operatorRulings: operator.rulings, pending: pendingAll, blocked: [...new Set(blocked)],
+    blockedFindings, malformed,
+    // SINGLE SOURCE FOR "HOW MANY AWAIT A RULING": `pendingFindings` is the named list, `pendingReasons` is every
+    // other hold token (a malformed record, a missing author stamp). `pending` stays the gate's own list.
+    pendingFindings, pendingReasons: pendingAll.filter((p) => !listedKeys.has(p)) };
 }

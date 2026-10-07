@@ -14,7 +14,7 @@
  * covers the head, and a parked review posts no fresh note, so a member of that pair would flap off every tick.
  * It never touches `review:*` or `advisory:accepted|changes`.
  */
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
@@ -22,8 +22,13 @@ import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { labelNames } from '../lib/advisory-labels.mjs';
 import { RULING_NEEDED_LABEL, RULING_NEEDED_LABEL_META, rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
+import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+/** The gate's own card rule, so the label never clears while the gate still holds a `card` ruling on a missing card. */
+const gateCardReadable = (ref) => referralCardReadable(ref, REPO_ROOT);
 
 /** PURE: what to do about the label on one PR. */
 export function planRulingNeededLabel(pr, opts = {}) {
@@ -55,7 +60,7 @@ export function sweepRulingNeededLabels({ repo = null, listPrs = defaultListPrs,
   let humanAt;
   try { humanAt = loadFixerLadder().humanAt; } catch { /* the platform default stands */ }
   for (const pr of Array.isArray(prs) ? prs : []) {
-    const plan = planRulingNeededLabel(pr, humanAt === undefined ? {} : { humanAt });
+    const plan = planRulingNeededLabel(pr, { cardReadable: gateCardReadable, ...(humanAt === undefined ? {} : { humanAt }) });
     if (plan.action === 'none') continue;
     const entry = { num: pr.number, action: plan.action };
     if (!dryRun) {

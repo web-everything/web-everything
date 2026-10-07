@@ -78,7 +78,7 @@ function currentRecords(snaps, head) {
  * @param {{comments?: Array, headRefOid?: string}} pr
  * @returns {null|{head:string, since:number|null, findings:Array<{key:string,seat:string,file:?string,line:?number,summary:string,reason:string}>}}
  */
-export function rulingNeeded(pr, { humanAt = DEFAULT_HUMAN_AT } = {}) {
+export function rulingNeeded(pr, { humanAt = DEFAULT_HUMAN_AT, cardReadable = () => true } = {}) {
   const head = String(pr?.headRefOid ?? '').toLowerCase();
   if (!SHA.test(head)) return null;
   const snaps = recordSnapshots(pr?.comments, head);
@@ -91,10 +91,14 @@ export function rulingNeeded(pr, { humanAt = DEFAULT_HUMAN_AT } = {}) {
     if (at !== null && (since === null || at < since)) since = at;
   }
   if (operatorVerdictAfter(pr?.comments, firstIndex)) return null;
-  const pending = mandatoryReferralState(pr.comments, { head, cardReadable: () => true }).pending;
+  // THE SAME LIST THE ADVISORY COUNTS (`mandatoryReferralState().pendingFindings`), read with the same card rule the
+  // gate uses when the caller passes one. It once re-derived the set with `cardReadable: () => true`, so the label
+  // listed fewer findings than the gate held (live #4271, 2026-10-07: 7 held, a shorter list shown).
+  const state = mandatoryReferralState(pr.comments, { head, cardReadable,
+    ...(typeof pr?.body === 'string' ? { body: pr.body } : {}), ...(pr?.createdAt ? { createdAt: pr.createdAt } : {}) });
   const live = new Map();
-  for (const { record } of currentRecords(snaps, head)) {
-    for (const f of record.referrals) if (pending.includes(f.key) && !live.has(f.key)) live.set(f.key, { ...findingView(f), reason: 'pending' });
+  for (const f of state.pendingFindings) {
+    if (f.attempted && !live.has(f.key)) live.set(f.key, { key: f.key, seat: f.seat, file: f.file, line: f.line, summary: f.summary, reason: 'pending' });
   }
   const ig = ignoredRulings(pr, { humanAt });
   if (ig?.escalate) for (const m of ig.matches) if (!live.has(m.finding.key)) live.set(m.finding.key, { ...m.finding, reason: 'dispute' });
