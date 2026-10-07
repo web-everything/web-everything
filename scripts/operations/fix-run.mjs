@@ -26,7 +26,11 @@ import { basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { REPO_ROOT } from './detached-dispatch.mjs';
-import { resolveDeliveryAgentProvider } from './deliver-item-wrapper.mjs';
+
+// LAZY on purpose: `deliver-item-wrapper.mjs` reaches `dispatch-providers/fix.mjs` (which imports this file) through
+// `dispatch-lane-io.mjs` -> `dispatch-provider-registry.mjs`, so a static import here is a cycle that makes the
+// wrapper load before its own mocked/initialised dependencies are bound.
+const resolveDeliveryAgentProvider = async (name) => (await import('./deliver-item-wrapper.mjs')).resolveDeliveryAgentProvider(name);
 
 /** Executors this launcher can run today (each needs a write-capable delivery provider). */
 export const FIX_RUN_EXECUTORS = Object.freeze(['codex']);
@@ -115,7 +119,7 @@ export async function runFixCli(argv = [], {
       `--lane=${laneNum}`, `--session=${sessionSlug}`,
     ], { cwd: weRoot });
     const before = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath });
-    const provider = resolveProvider(launch.provider);
+    const provider = await resolveProvider(launch.provider);
     await provider.spawn({
       sessionId: undefined, prompt: SANDBOX_PREAMBLE + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
       ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
