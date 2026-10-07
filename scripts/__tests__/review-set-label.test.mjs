@@ -3335,6 +3335,96 @@ describe('#3334 route 1/3 — the direct CLI refuses a reasonless bounce and wri
 });
 
 /**
+ * F4 (`#verdict-ledger-pr-state-store` rule 4), caller contract for `review-set-label`: a CLEARING verdict whose git
+ * ledger write missed must not swap the label; a HOLDING one still swaps. The miss is forced the way production
+ * would meet it: the operator NAMES the `dual` store and no git board resolves.
+ */
+describe('F4 — review-set-label honours a clearing ledger write miss', () => {
+  const CFG = {
+    defaultActor: 'test',
+    usage: 'usage: test',
+    buildComment: () => '# verdict body',
+    successResult: (o) => ({ ok: true, ...o }),
+    refusalResult: ({ decision }) => ({ error: decision.reason }),
+  };
+  const saved = {};
+  let ledgerDir;
+  beforeEach(() => {
+    ledgerDir = mkdtempSync(join(tmpdir(), 'rsl-f4-'));
+    for (const k of ['WE_VERDICT_LEDGER_DIR', 'WE_VERDICT_LEDGER_STORE', 'WE_VERDICT_LEDGER_BOARD']) saved[k] = process.env[k];
+    process.env.WE_VERDICT_LEDGER_DIR = ledgerDir;
+    process.env.WE_VERDICT_LEDGER_STORE = 'dual';
+    delete process.env.WE_VERDICT_LEDGER_BOARD;
+  });
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    rmSync(ledgerDir, { recursive: true, force: true });
+    rmSync(`${ledgerDir}-locks`, { recursive: true, force: true });
+  });
+
+  function stubProvider(labels) {
+    const calls = [];
+    return {
+      calls,
+      name: 'stub',
+      currentRepo: () => 'o/n',
+      readPrState: () => ({ labels: labels.map((name) => ({ name })), comments: [], headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body: '' }),
+      readLabels: () => labels.map((name) => ({ name })),
+      setLabels: () => { calls.push('setLabels'); },
+      postComment: () => { calls.push('postComment'); },
+    };
+  }
+  function run(provider, argv) {
+    const chunks = [];
+    const realExit = process.exit.bind(process);
+    const realErr = process.stderr.write.bind(process.stderr);
+    process.exit = (code) => { const e = new Error('process.exit'); e.exitCode = code; throw e; };
+    process.stderr.write = () => true;
+    let exitCode = 0;
+    try { runReviewLabelCli({ ...CFG, emit: (l) => chunks.push(String(l)), provider, argv, verdictBody: 'prose verdict' }); }
+    catch (e) { if (typeof e.exitCode === 'number') exitCode = e.exitCode; else throw e; }
+    finally { process.exit = realExit; process.stderr.write = realErr; }
+    return { exitCode, payload: JSON.parse(chunks.join('') || '{}') };
+  }
+
+  it('a CLEARING target (accepted) whose git write missed makes no label swap, posts no comment, and exits non-zero', () => {
+    const p = stubProvider(['review:pending']);
+    const { exitCode, payload } = run(p, ['77', '--repo=o/n', '--to=accepted', '--actor=op']);
+    expect(exitCode).toBe(1);
+    expect(payload.error).toMatch(/write refused for a clearing verdict/);
+    expect(p.calls).toEqual([]);
+  });
+
+  it('a CLEARING target whose git write landed but whose HOME write failed also makes no label swap', () => {
+    // Point the home ledger under a regular file so the home write throws, with a board whose git write succeeds is
+    // not injectable through the CLI; the unwritable home dir alone refuses the append (ok:false, no ledgerWriteMiss).
+    const blocker = join(ledgerDir, 'blocker');
+    writeFileSync(blocker, 'x');
+    process.env.WE_VERDICT_LEDGER_DIR = join(blocker, 'ledger');
+    delete process.env.WE_VERDICT_LEDGER_STORE; // default store under test = home: the home failure is the only failure
+    const p = stubProvider(['review:pending']);
+    const { exitCode } = run(p, ['77', '--repo=o/n', '--to=accepted', '--actor=op']);
+    expect(exitCode).toBe(1);
+    expect(p.calls).toEqual([]);
+  });
+
+  it('a HOLDING target (changes) whose git write missed STILL swaps: the hold must apply with the transport down', () => {
+    const p = stubProvider(['review:pending']);
+    const { exitCode } = run(p, ['77', '--repo=o/n', '--to=changes', '--actor=op', '--reason=needs a fix']);
+    expect(exitCode).toBe(0);
+    expect(p.calls).toContain('setLabels');
+  });
+
+  it('on the default store (no named store, no board): a clearing target is NOT refused (unconfigured default stays home)', () => {
+    delete process.env.WE_VERDICT_LEDGER_STORE;
+    const p = stubProvider(['review:pending']);
+    const { exitCode } = run(p, ['77', '--repo=o/n', '--to=accepted', '--actor=op']);
+    expect(exitCode).toBe(0);
+    expect(p.calls).toContain('setLabels');
+  });
+});
+
+/**
  * ROUTE 2 of 3 — `we:scripts/operations/review-pr.mjs`'s `record` step. That step SHELLS this CLI
  * (`we:scripts/operations/review-pr-io.mjs`'s label sink builds the argv), so its enforcement point is the CLI
  * above — but with one property that route alone has: the sink passes `--body-file=` and NO `--reason`, because

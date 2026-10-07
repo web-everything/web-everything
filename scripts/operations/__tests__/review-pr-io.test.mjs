@@ -233,6 +233,27 @@ describe('the ledger and notice sinks', () => {
     expect(rows[0]).toMatchObject({ pr: 9, verdict: 'accepted', source: 'operation-reconcile', clears: true });
   });
 
+  it('F4: a CLEARING verdict whose git write missed is NOT applied and leaves no home row, so the next run retries instead of reconciling', async () => {
+    const prevStore = process.env.WE_VERDICT_LEDGER_STORE;
+    const prevBoard = process.env.WE_VERDICT_LEDGER_BOARD;
+    process.env.WE_VERDICT_LEDGER_STORE = 'dual'; // operator-named dual + no board = a git write miss, with no git spawned
+    delete process.env.WE_VERDICT_LEDGER_BOARD;
+    try {
+      const sinks = createReviewPrSinks({ root });
+      const payload = { pr: 12, repo: 'o/n', to: 'accepted', actor: 'operator', lens: 'correctness', findings: [] };
+      await expect(sinks[REVIEW_EFFECTS.LEDGER](payload, CTX)).rejects.toThrow(/verdict-ledger append refused/);
+      expect(readVerdictLedger('o/n')).toHaveLength(0);
+      // Transport back (store no longer named): the retry is a real append, not "already reconciled".
+      if (prevStore === undefined) delete process.env.WE_VERDICT_LEDGER_STORE; else process.env.WE_VERDICT_LEDGER_STORE = prevStore;
+      const retry = await sinks[REVIEW_EFFECTS.LEDGER](payload, CTX);
+      expect(retry).toMatchObject({ reconciled: false, source: 'operation-reconcile' });
+      expect(readVerdictLedger('o/n')).toHaveLength(1);
+    } finally {
+      if (prevStore === undefined) delete process.env.WE_VERDICT_LEDGER_STORE; else process.env.WE_VERDICT_LEDGER_STORE = prevStore;
+      if (prevBoard === undefined) delete process.env.WE_VERDICT_LEDGER_BOARD; else process.env.WE_VERDICT_LEDGER_BOARD = prevBoard;
+    }
+  });
+
   // ───────────────────────────────────────────────────────────────────────────────────────────────────────
   // THE MULTI-ROUND CASE (PR #1149 review). "Already reconciled" is about THIS ROUND'S VERDICT, never about
   // the PR having any row at all. A PR that got `changes` and later `accepted` is the ordinary shape of a

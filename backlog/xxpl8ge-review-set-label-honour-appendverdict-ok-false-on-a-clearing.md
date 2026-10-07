@@ -2,29 +2,37 @@
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/review-set-label.mjs", "we:scripts/__tests__/review-set-label.test.mjs"]
+scope: ["we:scripts/lib/verdict-ledger.mjs", "we:scripts/lib/__tests__/verdict-ledger.test.mjs"]
 dateOpened: "2026-10-07"
 tags: []
 ---
 
-# review-set-label: honour appendVerdict ok:false on a clearing verdict (block the label swap)
+# verdict ledger: backfill between home and dual/git when the store setting is switched
 
-Found by the PR 4311 review (ledger plan slice C2). With the dual-write, we:scripts/lib/verdict-ledger.mjs#appendVerdict returns ok:false plus ledgerWriteMiss for a clearing verdict whose git write missed. we:scripts/review-set-label.mjs only logs 'append REFUSED (#3007 shadow)' to stderr and still swaps the PR label, so the F4 promise 'a clearing verdict that missed git does not clear' does not hold on that caller. review-pr-io and merge-ai-prs already honour ok. Make the swap consume the miss for a clearing verdict, and add a contract test per appendVerdict caller (review-set-label, merge-ai-prs, review-pr-io) with a failing gitAppend that asserts no label swap.
+Found by the PR 4311 review (ledger plan slice C2). The two caller gaps the review first listed here were fixed IN that PR on the operator's ruling (2026-10-07, "Fix"):
 
-Second caller gap (same review round): after a clearing verdict misses git in `dual`, the home row already exists, so the next `review-pr-io` run folds home in `we:scripts/operations/review-pr-io.mjs`, sees the verdict, returns `reconciled: true`, and never retries the git write — the label swap then proceeds. The row needs an "un-mirrored" marker the fold (or the reconcile effect) can see, and `store=git` rows stay invisible to `foldRepo` until the read slice, so each re-run appends a duplicate git row. Also open: no backfill between `home` and `dual`/`git` when the store setting is switched.
+- `we:scripts/review-set-label.mjs` now consumes a `ledgerWriteMiss` for a clearing verdict (no label swap, non-zero exit; a holding target still swaps), covered in `we:scripts/__tests__/review-set-label.test.mjs`.
+- `appendVerdict` writes a clearing verdict to git FIRST and to home only after git succeeded, so a miss leaves no home row for `review-pr-io`'s fold to mistake for "already decided"; the next run retries cleanly. Covered in `we:scripts/lib/__tests__/verdict-ledger.test.mjs` and `we:scripts/operations/__tests__/review-pr-io.test.mjs`.
+
+What stays open: there is no backfill between the stores when `verdictLedger.store` is switched. Rows written while the store was `home` are not in git after a switch to `dual`/`git`, and `git`-only rows stay invisible to `foldRepo` until the read slice lands. Build a one-shot, idempotent backfill (home → git, keyed by repo + PR + `at` + verdict so a re-run appends nothing twice) and run it as part of the store switch.
+
+Two more gaps the PR 4311 self-review named, both outside that PR's scope, to build here:
+
+- `we:scripts/operations/record-referral-ruling-io.mjs` (`appendLedgerEventsHome`) writes ruling and send-back events to the HOME file only, so a clearing ruling (`card`, `not-real`) clears and posts without ever reaching git. It needs the same git-first ordering for clearing events once `appendLedgerRows` is event-capable.
+- The GitHub Actions applier (`we:.github/workflows/apply-review-request.yml`, `contents: read`) cannot push, so on a runner the git board is deliberately not auto-resolved and verdicts it applies stay home-only (ephemeral). Give the applier a path to the ledger (a write token, or the apply step staging the row on the transport branch) so its clearing verdicts reach git too.
 
 ## Done when
 
-1. **Executable** — `npm run test:unit -- we:scripts/__tests__/review-set-label.test.mjs` fails before this lands and passes after: with `appendVerdict` returning `ok:false` + `ledgerWriteMiss` for a clearing target, `review-set-label` makes no `gh pr edit` label swap and exits non-zero; a holding target still swaps.
+1. **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/verdict-ledger.test.mjs` fails before this lands and passes after: with rows only in the home ledger, the backfill appends each to git once, and a second run appends none.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — n/a: the change reads only the typed `ok`/`ledgerWriteMiss` result, no free text.
-2. **Truncated reads** — n/a: no read path changes.
-3. **Shared state files** — the home row already exists when the git write misses, so a retry must not append a duplicate row (assert one home row after a refused swap and a retry).
-4. **Fail closed** — a clearing verdict whose ledger write missed refuses the swap; a holding verdict still holds.
-5. **Identity scoping** — n/a: the record's repo/PR are unchanged.
-6. **State over time** — the ledger is behind the label after a refused swap; the operator retry path must clear it once the transport is reachable.
-7. **Who wrote it** — n/a: the caller and actor fields are unchanged.
+1. **Untrusted text** — rows are re-validated through `serializeVerdictRecord` before they are pushed; an invalid home line is skipped and counted, never pushed.
+2. **Truncated reads** — an unreadable git ledger (`readLedgerFromGit` status `unreadable`) aborts the backfill; it never treats "unreadable" as "empty" and re-pushes everything.
+3. **Shared state files** — the dedupe key (repo + PR + `at` + verdict) makes a concurrent or repeated run idempotent; the push uses the existing bounded-retry append.
+4. **Fail closed** — a backfill miss is loud and changes no verdict; nothing clears because of it.
+5. **Identity scoping** — rows are matched per repo; one repo's backfill never reads another repo's home file.
+6. **State over time** — running the backfill after rows were already dual-written appends nothing.
+7. **Who wrote it** — n/a: the original `actor` and `source` fields are copied unchanged.

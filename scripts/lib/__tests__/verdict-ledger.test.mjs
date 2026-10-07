@@ -13,6 +13,8 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { appendLedgerRows, ledgerGitPath, LEDGER_TRANSPORT_BRANCH } from '../verdict-ledger-io.mjs';
+import { withBareOrigin } from '../../operations/__tests__/helpers/real-repo.mjs';
 
 import {
   VERDICTS, VERDICT_VALUES, VERDICT_LEDGER_VERSION, VERDICT_LEDGER_KIND, ACTOR_PROVES,
@@ -21,7 +23,7 @@ import {
   verdictClears, verdictLabel, verdictForLabelTarget, labelVerdictOf, foldVerdictLedger, ledgerCoversHead,
   compareLedgerToLabels, summarizeAgreement, summarizeShadowAgreement,
   NON_BEARING, verdictBears,
-  appendVerdict, resolveLedgerStore, resolveLedgerStoreChoice, resetLedgerDowngradeWarning, DEFAULT_VERDICT_LEDGER_STORE, readVerdictLedger, foldRepo, verdictLedgerPath, verdictLedgerDir, defaultVerdictLedgerDir,
+  appendVerdict, resolveLedgerBoard, resolveLedgerStore, resolveLedgerStoreChoice, resetLedgerDowngradeWarning, DEFAULT_VERDICT_LEDGER_STORE, readVerdictLedger, foldRepo, verdictLedgerPath, verdictLedgerDir, defaultVerdictLedgerDir,
   listLedgerRepos,
   EVENT_TYPES, EVENT_TYPE_VALUES, LEDGER_EVENT_VERSION, eventBears,
   buildLedgerEvent, validateLedgerEvent, serializeLedgerEvent, parseLedgerEvents,
@@ -1020,7 +1022,7 @@ describe('#3255 C2 dual-write: appendVerdict behind verdictLedger.store', () => 
     expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(0);
   });
 
-  it('F4: a CLEARING row that misses git does not clear, is loud, and is not dropped', () => {
+  it('F4: a CLEARING row that misses git does not clear, is loud, and leaves NO home row (home is what the fold reads)', () => {
     const warns = [];
     const r = appendVerdict(mk('accepted'), {
       store: 'dual', board: '/board', gitAppend: () => { throw new Error('push exhausted'); }, warn: (m) => warns.push(m),
@@ -1029,7 +1031,7 @@ describe('#3255 C2 dual-write: appendVerdict behind verdictLedger.store', () => 
     expect(r.ledgerWriteMiss).toBe(true);
     expect(r.errors.join()).toMatch(/ledger-write-miss: push exhausted/);
     expect(warns.join()).toMatch(/GIT WRITE MISS/);
-    expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(1);
+    expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(0);
   });
 
   it('F4: a HOLDING row that misses git still holds (ok) but flags ledgerWriteMiss', () => {
@@ -1082,8 +1084,12 @@ describe('#3255 C2 review fix: the production default path, home-fails-too spill
     return fn();
   };
 
-  it('production default (no opts, no board env, test flags off): a clearing verdict is still ok:true and writes home, with no git attempt and no miss', () => {
-    const r = asProduction(() => appendVerdict(mk('accepted'), { warn: () => {} }));
+  // This checkout is the real web-everything clone, so a production-shaped call would resolve it as the REAL board and
+  // push for real. Every `asProduction` test that wants "no board" therefore says the checkout is not this repo's.
+  const NOT_THE_BOARD = { originRepo: () => 'some-other/repo' };
+
+  it('production default, no board resolves (the checkout is another repo): a clearing verdict is still ok:true and writes home, with no git attempt and no miss', () => {
+    const r = asProduction(() => appendVerdict(mk('accepted'), { warn: () => {}, ...NOT_THE_BOARD }));
     expect(r.ok).toBe(true);
     expect(r.ledgerWriteMiss).toBeUndefined();
     expect(r.store).toBe('home');
@@ -1113,13 +1119,13 @@ describe('#3255 C2 review fix: the production default path, home-fails-too spill
 
   it('an EXPLICIT dual/git store with no board stays a loud miss (only the unconfigured default falls back to home)', () => {
     const warns = [];
-    const r = asProduction(() => appendVerdict(mk('accepted'), { store: 'dual', warn: (m) => warns.push(m) }));
+    const r = asProduction(() => appendVerdict(mk('accepted'), { store: 'dual', warn: (m) => warns.push(m), ...NOT_THE_BOARD }));
     expect(r.ok).toBe(false);
     expect(r.ledgerWriteMiss).toBe(true);
     expect(warns.join()).toMatch(/no git board/);
     const viaEnv = asProduction(() => {
       process.env.WE_VERDICT_LEDGER_STORE = 'dual';
-      return appendVerdict(mk('accepted', 22), { warn: () => {} });
+      return appendVerdict(mk('accepted', 22), { warn: () => {}, ...NOT_THE_BOARD });
     });
     expect(viaEnv.ok).toBe(false);
   });
@@ -1135,19 +1141,23 @@ describe('#3255 C2 review fix: the production default path, home-fails-too spill
         store: 'git', board: '/board', gitAppend: () => { throw new Error('push exhausted'); }, warn: (m) => warns.push(m),
       });
       expect(r.ok, verdict).toBe(false);
-      expect(r.errors.join('; '), verdict).toMatch(/ENOTDIR|not a directory|home/i);
+      // A clearing verdict never reaches home (nothing to spill), so only its git miss is reported; a holding one
+      // spills, and the spill's reason is what surfaces.
+      expect(r.errors.join('; '), verdict).toMatch(verdict === 'accepted' ? /ledger-write-miss: push exhausted/ : /ENOTDIR|not a directory|home/i);
       expect(r.errors.length, verdict).toBeGreaterThan(0);
       expect(warns.join(), verdict).toMatch(/GIT WRITE MISS/);
     }
   });
 
-  it('store=git where git misses and home fails by an invalid-for-home reason keeps every error (home errors first, then the miss)', () => {
+  it('store=git where git misses: a CLEARING verdict makes no home write at all (only the miss is reported); a HOLDING one keeps every error (home errors first)', () => {
+    let homeCalls = 0;
     const r = appendVerdict(mk('accepted'), {
       store: 'git', board: '/board', gitAppend: () => { throw new Error('push exhausted'); }, warn: () => {},
-      homeAppend: () => ({ ok: false, path: null, record: null, locked: false, errors: ['home boom'] }),
+      homeAppend: () => { homeCalls += 1; return { ok: false, path: null, record: null, locked: false, errors: ['home boom'] }; },
     });
     expect(r.ok).toBe(false);
-    expect(r.errors).toEqual(['home boom', 'ledger-write-miss: push exhausted']);
+    expect(r.errors).toEqual(['ledger-write-miss: push exhausted']);
+    expect(homeCalls).toBe(0);
     const hold = appendVerdict(mk('human'), {
       store: 'git', board: '/board', gitAppend: () => { throw new Error('push exhausted'); }, warn: () => {},
       homeAppend: () => ({ ok: false, path: null, record: null, locked: false, errors: ['home boom'] }),
@@ -1183,8 +1193,8 @@ describe('#3255 C2 review fix: the production default path, home-fails-too spill
     resetLedgerDowngradeWarning();
     const warns = [];
     asProduction(() => {
-      appendVerdict(mk('accepted', 31), { warn: (m) => warns.push(m) });
-      appendVerdict(mk('accepted', 32), { warn: (m) => warns.push(m) });
+      appendVerdict(mk('accepted', 31), { warn: (m) => warns.push(m), ...NOT_THE_BOARD });
+      appendVerdict(mk('accepted', 32), { warn: (m) => warns.push(m), ...NOT_THE_BOARD });
     });
     expect(warns).toHaveLength(1);
     expect(warns[0]).toMatch(/running as `home`/);
@@ -1194,24 +1204,27 @@ describe('#3255 C2 review fix: the production default path, home-fails-too spill
     expect(named).toHaveLength(0);
   });
 
-  it('ruling (PR 4311): a real production process, NO opts at all and no ledger env, clears with ok:true on home', () => {
+  it('ruling (PR 4311): a real production process, NO opts at all, for a repo this checkout is not the board of, clears with ok:true on home', () => {
     // A child process, so nothing of the test runner leaks in: no VITEST, no WE_UNDER_TEST, no store or board knob.
+    // The record is for ANOTHER repo on purpose: for this checkout's own repo the board now resolves and the call
+    // would push for real. (The own-repo case is covered with a fixture remote below.)
+    const sibling = 'acme/widgets';
     const env = { ...process.env, WE_VERDICT_LEDGER_DIR: dir };
     for (const k of FLAGS) delete env[k];
     // Repo-root cwd, like the shadow-agreement CLI test above (import.meta.url is not a file: URL under this runner).
     const src = `const m = await import('./scripts/lib/verdict-ledger.mjs');
-      const r = m.appendVerdict(m.buildVerdictRecord({ repo: ${JSON.stringify(REPO)}, pr: 41, verdict: 'accepted', at: '2026-10-07T12:00:00.000Z', source: 'test' }));
+      const r = m.appendVerdict(m.buildVerdictRecord({ repo: ${JSON.stringify(sibling)}, pr: 41, verdict: 'accepted', at: '2026-10-07T12:00:00.000Z', source: 'test' }));
       process.stdout.write(JSON.stringify({ ok: r.ok, store: r.store, miss: r.ledgerWriteMiss ?? null, errors: r.errors }));`;
     const out = execFileSync(process.execPath, ['--input-type=module', '-e', src], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     expect(JSON.parse(out)).toEqual({ ok: true, store: 'home', miss: null, errors: [] });
-    expect(readVerdictLedger(REPO)).toHaveLength(1);
+    expect(readVerdictLedger(sibling)).toHaveLength(1);
   });
 
   it('a BLANK board (empty or whitespace-only, env or opts) is no board: the production default clears on home and never calls the transport', () => {
     for (const [i, place] of [['env', '   '], ['env', ''], ['env', '\t\n'], ['opts', '  '], ['opts', '']].entries()) {
       const calls = [];
       const r = asProduction(() => {
-        const o = { gitAppend: (a) => { calls.push(a); throw new Error(`git spawned with cwd ${JSON.stringify(a.board)}`); }, warn: () => {} };
+        const o = { gitAppend: (a) => { calls.push(a); throw new Error(`git spawned with cwd ${JSON.stringify(a.board)}`); }, warn: () => {}, ...NOT_THE_BOARD };
         if (place[0] === 'env') process.env.WE_VERDICT_LEDGER_BOARD = place[1]; else o.board = place[1];
         return appendVerdict(mk('accepted', 50 + i), o);
       });
@@ -1241,4 +1254,192 @@ describe('#3255 C2 review fix: the production default path, home-fails-too spill
     expect(resolveLedgerStoreChoice(undefined, { VITEST: '1' })).toEqual({ store: 'home', named: false });
   });
 
+});
+
+describe('PR 4311 operator ruling: the default dual reaches git in production, and a failed git write never lets a clearing verdict through', () => {
+  let dir;
+  const FLAGS = ['VITEST', 'WE_UNDER_TEST', 'WE_VERDICT_LEDGER_STORE', 'WE_VERDICT_LEDGER_BOARD'];
+  const saved = {};
+  const REPO = 'web-everything/web-everything';
+  const mk = (verdict, pr = 61) => buildVerdictRecord({ repo: REPO, pr, verdict, at: '2026-10-07T12:00:00.000Z', source: 'test' });
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'we-verdict-ledger-ruling-'));
+    for (const k of [...FLAGS, 'WE_VERDICT_LEDGER_DIR']) saved[k] = process.env[k];
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+  });
+  afterEach(() => {
+    for (const k of [...FLAGS, 'WE_VERDICT_LEDGER_DIR']) {
+      if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+    }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(`${dir}-locks`, { recursive: true, force: true });
+  });
+  const asProduction = (fn) => { for (const k of FLAGS) delete process.env[k]; return fn(); };
+  const gitRows = (ctx) => ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+
+  describe('must-fix 1: the board resolves from the repo\'s own checkout', () => {
+    it('PRODUCTION-SHAPED caller (no board, no store, no gitAppend, test flags off): the default dual writes BOTH stores, through real git', async () => {
+      await withBareOrigin(async (ctx) => {
+        ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+        // `boardRoot` stands in for "the checkout this module lives in"; the origin probe is the REAL one (no seam).
+        const r = asProduction(() => appendVerdict(mk('accepted'), { boardRoot: ctx.clone, warn: () => {} }));
+        expect(r).toMatchObject({ ok: true, store: 'dual' });
+        expect(r.ledgerWriteMiss).toBeUndefined();
+        expect(readVerdictLedger(REPO)).toHaveLength(1);
+        expect(gitRows(ctx).map((x) => [x.pr, x.verdict])).toEqual([[61, 'accepted']]);
+      });
+    });
+
+    it('resolveLedgerBoard: explicit opts, then env, then the checkout whose origin is the record\'s repo; never a checkout of another repo', () => {
+      const own = { boardRoot: '/checkout', originRepo: () => REPO };
+      expect(resolveLedgerBoard(REPO, { board: ' /explicit ', ...own }, {})).toBe('/explicit');
+      expect(resolveLedgerBoard(REPO, own, { WE_VERDICT_LEDGER_BOARD: ' /env \n' })).toBe('/env');
+      expect(resolveLedgerBoard(REPO, own, {})).toBe('/checkout');
+      expect(resolveLedgerBoard(REPO, { board: '  ', ...own }, { WE_VERDICT_LEDGER_BOARD: '\t' })).toBe('/checkout');
+      // origin compared case-insensitively and through the legacy-slug canonicalizer
+      expect(resolveLedgerBoard(REPO, { boardRoot: '/c', originRepo: () => 'Web-Everything/Web-Everything' }, {})).toBe('/c');
+      // another repo's checkout is never the board (each repo owns its own notes, #3261)
+      expect(resolveLedgerBoard('acme/widgets', own, {})).toBeNull();
+      expect(resolveLedgerBoard(REPO, { boardRoot: '/c', originRepo: () => '' }, {})).toBeNull();
+      expect(resolveLedgerBoard('', own, {})).toBeNull();
+      expect(resolveLedgerBoard(undefined, own, {})).toBeNull();
+    });
+
+    it('a SIBLING repo\'s record resolves that sibling\'s own checkout (constellation path), not this one', () => {
+      const probed = [];
+      const originRepo = (root) => { probed.push(root); return root.endsWith('/plateau-app') ? 'plateauapp/plateau-app' : REPO; };
+      const board = resolveLedgerBoard('plateauapp/plateau-app', { originRepo }, {});
+      expect(board).toMatch(/\/workspace\/plateau-app$/);
+      expect(probed.length).toBeGreaterThan(1); // this checkout was probed first and rejected
+      expect(resolveLedgerBoard('unknown/repo', { originRepo }, {})).toBeNull();
+    });
+
+    it('on a GitHub Actions runner (the read-only applier) the checkout is NOT the board unless named; an explicit board still wins', () => {
+      const own = { originRepo: () => REPO };
+      expect(resolveLedgerBoard(REPO, own, { GITHUB_ACTIONS: 'true' })).toBeNull();
+      expect(resolveLedgerBoard(REPO, { ...own, boardRoot: '/c' }, { GITHUB_ACTIONS: 'true' })).toBe('/c');
+      expect(resolveLedgerBoard(REPO, own, { GITHUB_ACTIONS: 'true', WE_VERDICT_LEDGER_BOARD: '/named' })).toBe('/named');
+      expect(resolveLedgerBoard(REPO, own, { GITHUB_ACTIONS: 'false' })).not.toBeNull();
+    });
+
+    it('a failed origin probe is not pinned: the next call probes again', () => {
+      let calls = 0;
+      const flaky = () => { calls += 1; return calls === 1 ? '' : REPO; };
+      // The injected seam bypasses the memo, so assert the contract on the real probe with a missing directory:
+      // it returns null both times and (via the memo guard `if (have)`) leaves nothing cached to read back stale.
+      const missing = join(dir, 'does-not-exist');
+      expect(resolveLedgerBoard(REPO, { boardRoot: missing }, {})).toBeNull();
+      expect(resolveLedgerBoard(REPO, { boardRoot: missing }, {})).toBeNull();
+      expect(resolveLedgerBoard(REPO, { originRepo: flaky, boardRoot: '/c' }, {})).toBeNull();
+      expect(resolveLedgerBoard(REPO, { originRepo: flaky, boardRoot: '/c' }, {})).toBe('/c');
+    });
+
+    it('under a test run the checkout is NOT probed unless the test names a boardRoot (a suite never reaches the real remote)', () => {
+      let probed = 0;
+      const originRepo = () => { probed += 1; return REPO; };
+      expect(resolveLedgerBoard(REPO, { originRepo }, { VITEST: 'true' })).toBeNull();
+      expect(probed).toBe(0);
+      expect(resolveLedgerBoard(REPO, { originRepo, boardRoot: '/c' }, { VITEST: 'true' })).toBe('/c');
+    });
+
+    it('a repo this checkout is not the board of still falls back to home (unconfigured default), with the loud once-per-process notice', () => {
+      resetLedgerDowngradeWarning();
+      const warns = [];
+      const r = asProduction(() => appendVerdict(mk('accepted'), { boardRoot: '/checkout', originRepo: () => 'acme/widgets', warn: (m) => warns.push(m) }));
+      expect(r).toMatchObject({ ok: true, store: 'home' });
+      expect(warns.join()).toMatch(/no git board configured/);
+    });
+  });
+
+  describe('must-fix 2: a failed git write never lets a clearing verdict through', () => {
+    const missing = () => { throw new Error('push exhausted'); };
+
+    it('CLEARING + git miss: ok:false, NO home row, so the fold sees no verdict (a home row would read as "already decided")', () => {
+      const r = appendVerdict(mk('accepted'), { store: 'dual', board: '/board', gitAppend: missing, warn: () => {} });
+      expect(r).toMatchObject({ ok: false, ledgerWriteMiss: true, record: null, path: null });
+      expect(readVerdictLedger(REPO)).toHaveLength(0);
+      expect(foldRepo(REPO).get(61)).toBeUndefined();
+    });
+
+    it('every clearing verdict is refused the same way (accepted, clear-human, restamp-class members of the CLEARING set)', () => {
+      const clearing = VERDICT_VALUES.filter((v) => verdictClears(v));
+      expect(clearing.length).toBeGreaterThan(0);
+      for (const [i, verdict] of clearing.entries()) {
+        const r = appendVerdict(mk(verdict, 70 + i), { store: 'dual', board: '/board', gitAppend: missing, warn: () => {} });
+        expect(r.ok, verdict).toBe(false);
+        expect(r.ledgerWriteMiss, verdict).toBe(true);
+      }
+      expect(readVerdictLedger(REPO)).toHaveLength(0);
+    });
+
+    it('the result is NOT authoritative on any path: store=git and an unresolved named board refuse a clearing verdict with no home row too', () => {
+      const viaGit = appendVerdict(mk('accepted', 62), { store: 'git', board: '/board', gitAppend: missing, warn: () => {} });
+      const noBoard = appendVerdict(mk('accepted', 63), { store: 'dual', warn: () => {} });
+      for (const r of [viaGit, noBoard]) expect(r).toMatchObject({ ok: false, ledgerWriteMiss: true });
+      expect(readVerdictLedger(REPO)).toHaveLength(0);
+    });
+
+    it('a HOLDING verdict is still written home-first and still holds when git misses', () => {
+      const r = appendVerdict(mk('human'), { store: 'dual', board: '/board', gitAppend: missing, warn: () => {} });
+      expect(r).toMatchObject({ ok: true, ledgerWriteMiss: true });
+      expect(readVerdictLedger(REPO)).toHaveLength(1);
+      expect(foldRepo(REPO).get(61).clears).toBe(false);
+    });
+
+    it('a home row never suppresses the git retry: after a miss, the very next append (transport back) lands in BOTH stores exactly once', () => {
+      const calls = [];
+      let up = false;
+      const gitAppend = (a) => { calls.push(a); if (!up) throw new Error('unreachable'); return { status: 'appended' }; };
+      const first = appendVerdict(mk('accepted'), { store: 'dual', board: '/board', gitAppend, warn: () => {} });
+      expect(first.ok).toBe(false);
+      up = true;
+      const retry = appendVerdict(mk('accepted'), { store: 'dual', board: '/board', gitAppend, warn: () => {} });
+      expect(retry).toMatchObject({ ok: true, store: 'dual' });
+      expect(retry.ledgerWriteMiss).toBeUndefined();
+      expect(calls).toHaveLength(2);
+      expect(readVerdictLedger(REPO)).toHaveLength(1);
+      expect(foldRepo(REPO).get(61).clears).toBe(true);
+    });
+
+    it('ORDER: a clearing verdict reaches git BEFORE home; a holding one reaches home BEFORE git', () => {
+      for (const [verdict, expected] of [['accepted', ['git', 'home']], ['human', ['home', 'git']]]) {
+        const order = [];
+        const homeAppend = (r) => { order.push('home'); return { ok: true, path: '/h', record: r, locked: true, errors: [] }; };
+        const gitAppend = () => { order.push('git'); return { status: 'appended' }; };
+        appendVerdict(mk(verdict), { store: 'dual', board: '/board', gitAppend, homeAppend, warn: () => {} });
+        expect(order, verdict).toEqual(expected);
+      }
+    });
+
+    it('a clearing verdict whose git write landed but whose home write failed is ok:false with the home reason', () => {
+      const r = appendVerdict(mk('accepted'), {
+        store: 'dual', board: '/board', gitAppend: () => ({ status: 'appended' }), warn: () => {},
+        homeAppend: () => ({ ok: false, path: null, record: null, locked: false, errors: ['home boom'] }),
+      });
+      expect(r.ok).toBe(false);
+      expect(r.errors).toEqual(['home boom']);
+    });
+
+    it('an invalid record is refused before any write, in either order', () => {
+      const calls = [];
+      const r = appendVerdict({ nope: true }, { store: 'dual', board: '/board', gitAppend: (a) => { calls.push(a); }, homeAppend: () => { calls.push('home'); }, warn: () => {} });
+      expect(r.ok).toBe(false);
+      expect(calls).toEqual([]);
+    });
+
+    it('REAL git: the transport rejecting every push leaves the clearing verdict unwritten in both stores', async () => {
+      await withBareOrigin(async (ctx) => {
+        ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+        // A pre-receive hook that refuses everything: a real, persistent push failure (not an injected throw).
+        const hook = join(ctx.origin, 'hooks', 'pre-receive');
+        writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+        const r = asProduction(() => appendVerdict(mk('accepted'), {
+          boardRoot: ctx.clone, warn: () => {},
+          gitAppend: (a) => appendLedgerRows({ ...a, attempts: 2, sleep: () => {} }),
+        }));
+        expect(r).toMatchObject({ ok: false, ledgerWriteMiss: true });
+        expect(readVerdictLedger(REPO)).toHaveLength(0);
+      });
+    });
+  });
 });
