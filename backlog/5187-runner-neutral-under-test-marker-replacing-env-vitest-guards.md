@@ -3,10 +3,11 @@ bornAs: x4cdc8i
 kind: story
 size: 3
 tier: pinned
-status: active
+status: resolved
 scope: ["we:scripts/lib/under-test.mjs", "we:scripts/lib/__tests__/under-test.test.mjs", "we:scripts/lib/under-test.cjs", "we:vitest.setup.ts", "we:scripts/lib/__tests__/under-test-bootstrap.test.mjs", "we:bun-test.preload.ts", "we:scripts/backlog.mjs", "we:scripts/__tests__/backlog-under-test.test.mjs", "we:scripts/lib/backlog-index.cjs", "we:scripts/__tests__/backlog-index.test.mjs", "we:scripts/lib/claude-agents-cache.mjs", "we:scripts/lib/__tests__/claude-agents-cache.test.mjs", "we:scripts/lib/gh-rest-read.mjs", "we:scripts/lib/__tests__/gh-rest-read.test.mjs", "we:scripts/lib/lane-pool-paths.mjs", "we:scripts/lib/__tests__/lane-pool-paths-under-test.test.mjs", "we:scripts/lib/pr-snapshot-store.mjs", "we:scripts/lib/__tests__/pr-snapshot.test.mjs", "we:scripts/lib/pr-snapshot.mjs", "we:scripts/lib/pr-facts.mjs", "we:scripts/lib/__tests__/pr-facts.test.mjs", "we:scripts/lib/salvage-index.mjs", "we:scripts/lib/__tests__/salvage-index.test.mjs", "we:scripts/lib/target-registry.mjs", "we:scripts/__tests__/target-registry.test.mjs", "we:scripts/lib/verdict-ledger.mjs", "we:scripts/lib/__tests__/verdict-ledger.test.mjs", "we:scripts/operations/ci-heal-pr-dispatch.mjs", "we:scripts/operations/__tests__/ci-heal-pr-dispatch.test.mjs", "we:scripts/operations/dispatch-providers/probation-worker.mjs", "we:scripts/operations/__tests__/probation-heal-run.test.mjs", "we:skills-src/conveyor/verify-daemon.mjs", "we:skills-src/conveyor/__tests__/verify-daemon.test.mjs", "we:scripts/__tests__/lane-pool-root-and-shallow.test.mjs", "we:scripts/__tests__/lane-pool-vitest-real-root-guard.test.mjs", "we:__tests__/vitest.setup*.test.ts", "we:__tests__/bun-test.preload*.test.ts", "we:scripts/lib/__tests__/backlog-index*.test.cjs", "we:scripts/lib/__tests__/pr-snapshot-store*.test.mjs", "we:scripts/lib/__tests__/target-registry*.test.mjs", "we:scripts/operations/dispatch-providers/__tests__/probation-worker*.test.mjs"]
 dateOpened: "2026-10-06"
 dateStarted: "2026-10-06"
+dateResolved: "2026-10-06"
 preparedDate: "2026-10-06"
 preparedAgainstSha: "cc47a8e8dfc7a0ddc9a7142e4d94bdf9ab5cacd7"
 tags: []
