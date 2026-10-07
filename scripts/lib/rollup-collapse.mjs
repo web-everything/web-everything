@@ -94,6 +94,29 @@ export function collapseRollupToLatestPerName(rollup) {
  */
 function latestOf(runs) {
   const ids = runs.map((c) => Number(c?.id));
-  if (!ids.every((id) => Number.isSafeInteger(id) && id > 0)) return runs[runs.length - 1];
+  if (!ids.every((id) => Number.isSafeInteger(id) && id > 0)) return latestByTime(runs);
   return runs[ids.indexOf(Math.max(...ids))];
+}
+
+/**
+ * No ids (the rollup): the rollup is NOT reliably oldest→newest (live 2026-10-07, PR #4290: `soak-replay-gate`
+ * listed FAILURE@17:27 BEFORE its superseded SUCCESS@17:13, so "last wins" read stale green — the fix daemon saw
+ * no red check and owed no ci-heal, while the review dispatch gate, reading REST by run id, saw the real red).
+ * A run still in flight (no real `completedAt` — absent or the zero date) is the newest; otherwise the greatest
+ * `completedAt` wins, ties broken by position (later wins). Any run with no usable timestamp at all keeps the
+ * old positional rule for the whole group.
+ */
+function latestByTime(runs) {
+  const stamp = (c) => {
+    const done = Date.parse(c?.completedAt);
+    if (Number.isFinite(done) && done > Date.parse('2000-01-01T00:00:00Z')) return done;
+    const status = String(c?.status ?? '').toUpperCase();
+    if (status && status !== 'COMPLETED') return Infinity; // queued / in progress: the newest run
+    return null;
+  };
+  const stamps = runs.map(stamp);
+  if (stamps.some((s) => s === null)) return runs[runs.length - 1];
+  let best = 0;
+  for (let i = 1; i < runs.length; i++) if (stamps[i] >= stamps[best]) best = i;
+  return runs[best];
 }

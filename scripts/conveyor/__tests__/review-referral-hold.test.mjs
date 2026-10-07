@@ -445,3 +445,21 @@ describe('block-ruled referrals route to a fix, not the same-head pause', () => 
     }
   });
 });
+
+describe('same-head hold never silences a review whose verdict never landed (live #4288, 2026-10-07)', () => {
+  const lost = (over = {}) => ({ ...evidence(), parked: false, completedAt: Date.now() - 3600_000, startedAt: Date.now() - 3700_000, ...over });
+  const labelled = (labels, over = {}) => pr({ labels: labels.map(name => ({ name })), ...over });
+  it('releases (null) when the only completed run left the PR review:pending with no reviewed-sha marker', () => {
+    expect(decideSameHeadHold(labelled(['review:pending', 'review-round:1']), [lost()], { repo, env: {} })).toBeNull();
+  });
+  it('is bounded: after the extra automatic runs it holds again and says why', () => {
+    const runs = [lost(), lost({ id: 'b', startedAt: Date.now() - 3600_000 }), lost({ id: 'c', startedAt: Date.now() - 3500_000 })];
+    const held = decideSameHeadHold(labelled(['review:pending']), runs, { repo, env: {} });
+    expect(held).toMatchObject({ kind: 'same-head', count: 3 });
+    expect(held.why).toMatch(/no verdict ever landed/);
+  });
+  it('still holds when a verdict label landed, or the run is too fresh to judge', () => {
+    expect(decideSameHeadHold(labelled(['review:pending', 'review:changes']), [lost()], { repo, env: {} })).not.toBeNull();
+    expect(decideSameHeadHold(labelled(['review:pending']), [lost({ completedAt: Date.now() - 60_000 })], { repo, env: {} })).not.toBeNull();
+  });
+});
