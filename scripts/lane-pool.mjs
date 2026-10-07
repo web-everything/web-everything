@@ -76,6 +76,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { homedir, hostname } from 'node:os';
 import { join, basename, resolve, dirname, sep } from 'node:path';
 import { resolveReal } from './guard-lane.mjs';
+import { readGit } from './lib/proc-read.mjs';
 // #4415 — live incident 2026-09-29: `deadLeasePlan`'s own `gh pr list --state all` (below) was a bare,
 // unattributed, GraphQL-backed `execFileSync`, run on EVERY `acquire` and EVERY `list --acquirable` scan
 // across every session in every pool — measured as the top unattributed slice of the app's GraphQL bucket
@@ -243,7 +244,7 @@ const scanTimeoutOpt = () => (scanDeadlineMs === null ? {} : { timeout: Math.max
 const NETWORK_GIT_TIMEOUT_MS = SHARED_NETWORK_GIT_TIMEOUT_MS;
 const defaultGitTimeoutOpt = () => ({ timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
 const git = (args, cwd, opts = {}) =>
-  execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(args), ...scanTimeoutOpt(), ...opts }).trim();
+  readGit(args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(args), ...scanTimeoutOpt(), ...opts }).trim(); // #74d: throws on failure/oversize
 const gitQuiet = (args, cwd, opts = {}) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'ignore', 'inherit'], timeout: NETWORK_GIT_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts });
 const tryGit = (args, cwd, opts = {}) => {
@@ -720,7 +721,7 @@ function laneFingerprint(dir, branch) {
   const dirtyPaths = [...trackedModifiedPaths, ...untrackedPaths].sort();
   const aheadShas = aheadCommits(dir, branchRef).map((c) => c.sha).sort();
   let headSha = null;
-  try { headSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8', ...defaultGitTimeoutOpt() }).trim(); } catch { /* unborn/corrupt HEAD — null is a valid, never-matching fingerprint value */ }
+  try { headSha = readGit(['rev-parse', 'HEAD'], { cwd: dir, ...defaultGitTimeoutOpt() }).trim(); } catch { /* unborn/corrupt HEAD — null is a valid, never-matching fingerprint value */ }
   return { headSha, dirtyPaths, aheadShas };
 }
 
@@ -3868,9 +3869,9 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
           try {
             const { trackedModifiedPaths, untrackedPaths } = gitStatusSummary(dir);
             // HEAD's subject only names THIS lane's work when HEAD is not already on origin (else it is main's tip).
-            const ahead = Number(execFileSync('git', ['rev-list', '--count', `origin/${repo.branch}..HEAD`], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()) || 0;
-            const subject = ahead ? execFileSync('git', ['log', '-1', '--format=%s'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() : '';
-            const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+            const ahead = Number(readGit(['rev-list', '--count', `origin/${repo.branch}..HEAD`], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).trim()) || 0;
+            const subject = ahead ? readGit(['log', '-1', '--format=%s'], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).trim() : '';
+            const branch = readGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
             return guessCardIds({ paths: [...trackedModifiedPaths, ...untrackedPaths], commitSubject: subject, branch });
           } catch { return []; }
         })(),

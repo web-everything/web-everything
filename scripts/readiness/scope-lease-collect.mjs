@@ -64,6 +64,7 @@
  */
 
 import { planningRead } from '../lib/planning-snapshot.mjs';
+import { readGit } from '../lib/proc-read.mjs';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -412,7 +413,8 @@ function tryGit(args, cwd) {
     // process) could hang this ONE lane's read forever, and every caller here treats a `tryGit` failure as
     // "contributes [] observed, log and move on" — so failing fast on a timeout is strictly an improvement, never
     // a new failure mode.
-    return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' }).trimEnd();
+    // #74d — proc-read: an oversize/failed read THROWS into the catch below (null = unknown), never a truncated string.
+    return readGit(args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' }).trimEnd();
   } catch {
     return null;
   }

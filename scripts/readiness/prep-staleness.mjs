@@ -12,7 +12,7 @@
  *   node scripts/readiness/prep-staleness.mjs --item=<NNN> [--json]
  */
 
-import { execFileSync } from 'node:child_process';
+import { readGit } from '../lib/proc-read.mjs';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -44,7 +44,7 @@ export function checkPrepStaleness({ scope, preparedAgainstSha, cwd = process.cw
 
   // Verify that the sha is reachable in git
   try {
-    execFileSync('git', ['rev-parse', '--verify', '--quiet', `${sha}^{commit}`], {
+    readGit(['rev-parse', '--verify', '--quiet', `${sha}^{commit}`], {
       cwd,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -78,7 +78,7 @@ export function checkPrepStaleness({ scope, preparedAgainstSha, cwd = process.cw
   }
 
   try {
-    const stdout = execFileSync('git', ['diff', '--name-only', sha, head, '--', ...scopeFiles], {
+    const stdout = readGit(['diff', '--name-only', sha, head, '--', ...scopeFiles], {
       cwd,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],

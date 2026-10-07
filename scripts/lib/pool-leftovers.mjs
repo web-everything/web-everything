@@ -19,6 +19,7 @@
  * PURE: {@link classifyPoolLeftover}. IO: {@link sweepPoolLeftovers}.
  */
 import { execFileSync } from 'node:child_process';
+import { readGit } from './proc-read.mjs';
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { resolveSalvageRoot, salvageLane, salvageStamp, appendSalvageIndex, readLiveCwds, pidsWithCwdIn } from './lane-salvage.mjs';
@@ -44,7 +45,7 @@ export function classifyPoolLeftover(e, { nowMs, maxAgeDays = LEFTOVER_MAX_AGE_D
   return { action: 'delete', reason: `loose file, idle ${ageDays.toFixed(0)}d` };
 }
 
-const tryGit = (dir, args) => { try { return execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000 }); } catch { return null; } };
+const tryGit = (dir, args) => { try { return readGit(args, { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000 }); } catch { return null; } };
 
 function newestMtime(path, isDir, isGit) {
   let m = lstatSync(path).mtimeMs;
