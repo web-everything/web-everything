@@ -30,12 +30,18 @@ import { REPO_ROOT } from './detached-dispatch.mjs';
 // Imported FROM the leaf, never the other way round (see `fix.mjs#FIX_RUN_EXECUTORS`): this file's top-level `await`
 // below deadlocks if `dispatch-providers/fix.mjs` imports it back.
 import { FIX_RUN_EXECUTORS } from './dispatch-providers/fix.mjs';
+import { recordBorrowOutcome } from '../lib/fix-slot-borrow.mjs';
 import { LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 
 // LAZY on purpose: `deliver-item-wrapper.mjs` reaches `dispatch-providers/fix.mjs` (which imports this file) through
 // `dispatch-lane-io.mjs` -> `dispatch-provider-registry.mjs`, so a static import here is a cycle that makes the
 // wrapper load before its own mocked/initialised dependencies are bound.
 const resolveDeliveryAgentProvider = async (name) => (await import('./deliver-item-wrapper.mjs')).resolveDeliveryAgentProvider(name);
+
+// LAZY for the same cycle reason: `fix-dispatch-claim.mjs` reaches `dispatch-lane-io.mjs`.
+// LAZY too: the complete (paginated) comment reader — a plain `--json comments` read truncates a long thread.
+const readAllComments = async (pr, o) => (await import('../conveyor/pr-comments-complete.mjs')).readCompletePrComments(pr, o);
+const releaseBorrowedClaim = async (o) => (await import('../conveyor/fix-dispatch-claim.mjs')).releaseSessionFixDispatchClaims(o);
 
 export { FIX_RUN_EXECUTORS };
 
@@ -111,7 +117,7 @@ export function parseFixRunArgv(argv = []) {
   return {
     pr: String(flags.pr).trim(), sessionSlug: String(flags.session).trim(), ref: String(flags.ref).trim(),
     promptFile: String(flags['prompt-file']).trim(),
-    item: opt('num'), repo: opt('repo'), laneRepo: opt('lane-repo'), scope: opt('scope'),
+    item: opt('num'), repo: opt('repo'), claimRepo: opt('claim-repo'), laneRepo: opt('lane-repo'), scope: opt('scope'),
     provider: opt('provider') ?? 'codex', effort: opt('effort'), model: opt('model'),
   };
 }
@@ -121,6 +127,8 @@ export const SANDBOX_PREAMBLE = [
   '## LAUNCHER OVERRIDE (read first — it wins over the brief below)',
   'You run in a sandbox with NO network, inside a lane clone that is ALREADY acquired and already at the PR head.',
   'Do NOT run `gh`, `lane-pool.mjs`, `fix-procedure.mjs`, `rearm-review.mjs` or `git push`; skip every brief step that does.',
+  'The reviewer\'s finding is in the "PR CONTEXT (fetched by the launcher)" section right below. Brief step 2 / 2a\'s `gh pr view` is',
+  'already done for you: take the latest changes-requested (or advisory) comment in that section as the authoritative ask.',
   'Do the judgment work only: apply the reviewer finding in this directory, then `git commit` it here.',
   'The launcher pushes your commit(s) and re-arms review after you exit. If nothing needs changing, commit nothing.',
   '',
@@ -129,6 +137,31 @@ export const SANDBOX_PREAMBLE = [
 ].join('\n');
 
 const sh = (cmd, args, opts) => String(execFileSync(cmd, args, { encoding: 'utf8', ...opts }) ?? '').trim();
+
+
+const CHANGES_COMMENT_RE = /changes requested|THIS IS AN ADVISORY REVIEW/i;
+const cap = (t, n) => (String(t ?? '').length > n ? `${String(t).slice(0, n)}\n[... truncated ...]` : String(t ?? ''));
+
+/**
+ * PURE. `gh pr view --json title,body,comments` output -> the section the launcher prepends to the brief. The agent's
+ * sandbox has no network, so it cannot read the reviewer's finding itself (live 2026-10-07: codex answered "the finding
+ * was omitted" and committed nothing, 4 launches in a row). Throws when there is no changes-requested / advisory
+ * comment: launching an agent with nothing to fix is a failure, not a no-change.
+ */
+export function renderPrContext(json) {
+  const pr = typeof json === 'string' ? JSON.parse(json) : json;
+  const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  const found = comments.filter((c) => CHANGES_COMMENT_RE.test(String(c?.body ?? '')));
+  const latest = found.sort((a, b) => String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? ''))).at(-1);
+  if (!latest) throw new Error('no-finding: the PR has no changes-requested or advisory comment to apply');
+  return [
+    '## PR CONTEXT (fetched by the launcher)',
+    `Title: ${String(pr?.title ?? '')}`,
+    '', 'PR body:', cap(pr?.body, 8000),
+    '', `LATEST finding comment (authoritative ask)${latest.createdAt ? `, posted ${latest.createdAt}` : ''}:`, cap(latest.body, 12000),
+    '', '---', '', '',
+  ].join('\n');
+}
 
 /** Lane path = last non-empty stdout line of `lane-pool acquire` (it prints the path last). */
 export function parseAcquiredLanePath(stdout) {
@@ -148,12 +181,28 @@ export async function runFixCli(argv = [], {
   removePrompt = removePromptFile,
   pendingRearm = defaultPendingRearm(),
   resolveProvider = resolveDeliveryAgentProvider,
+  readComments = readAllComments,
+  releaseClaim = releaseBorrowedClaim,
+  recordOutcome = recordBorrowOutcome,
   weRoot = REPO_ROOT,
   write = (l) => process.stdout.write(l),
   writeErr = (l) => process.stderr.write(l),
 } = {}) {
   let launch;
   let laneRelease = null;
+  // How this borrowed launch ended. Recorded (so repeated failures stop the PR borrowing) and the claim is released on
+  // EVERY exit: a borrowed fix that ends must not keep holding its claim and a cap slot until the TTL.
+  let outcome = 'failed';
+  let reason = 'launch did not complete';
+  const settle = async () => {
+    if (!launch?.pr) return;
+    const repo = launch.claimRepo ?? 'we';
+    try { recordOutcome({ repo, pr: launch.pr, outcome, reason }); } catch (e) { writeErr(`fix-run: could not record the outcome: ${String(e?.message ?? e)}\n`); }
+    try {
+      const r = await releaseClaim({ repo, pr: Number(launch.pr), who: launch.sessionSlug });
+      write(`fix-run: PR #${launch.pr} ${outcome} (${reason}); claim ${r?.released?.length ? 'released' : 'not held / already released'}\n`);
+    } catch (e) { writeErr(`fix-run: claim release failed: ${String(e?.message ?? e)}\n`); }
+  };
   try {
     launch = parseFixRunArgv(argv);
     if (!FIX_RUN_EXECUTORS.includes(launch.provider)) {
@@ -163,12 +212,17 @@ export async function runFixCli(argv = [], {
     writeErr(`error: ${String(e?.message ?? e)}\n`);
     const raw = (Array.isArray(argv) ? argv : []).find((a) => typeof a === 'string' && a.startsWith('--prompt-file='));
     if (raw) removePrompt(raw.slice('--prompt-file='.length)); // never leave the brief behind on a refused launch
+    reason = String(e?.message ?? e);
+    await settle();
     return { code: 1, result: null };
   }
   const { pr, sessionSlug, ref } = launch;
   write(`fix-run: starting borrowed repair of PR #${pr} (session ${sessionSlug}, provider ${launch.provider}) - pid ${process.pid}\n`);
   try {
     const brief = readPrompt(launch.promptFile);
+    // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.
+    const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
+    const prContext = renderPrContext({ ...prHead, comments: await readComments(pr, { repo: launch.repo }) });
     const poolArgs = [
       resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'acquire', ...(launch.laneRepo ? [`--repo=${launch.laneRepo}`] : []),
       '--purpose=conveyor-fix', `--session=${sessionSlug}`, ...(launch.scope ? [`--scope=${launch.scope}`] : []), `--base=${ref}`,
@@ -192,18 +246,20 @@ export async function runFixCli(argv = [], {
       rearm();
       pendingRearm.clear(launch.repo, pr);
       const result = `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
+      outcome = 'pushed'; reason = 'finished an earlier push';
       write(`fix-run: PR #${pr} finished - ${result}\n`);
       return { code: 0, result };
     }
     const provider = await resolveProvider(launch.provider);
     await provider.spawn({
-      sessionId: undefined, prompt: SANDBOX_PREAMBLE + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
+      sessionId: undefined, prompt: SANDBOX_PREAMBLE + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
       ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
     }, { resolveLane: () => lanePath });
     const after = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath });
     let result;
     if (after === before) {
-      result = 'no-change (agent committed nothing; claim lapses and the PR is re-planned)';
+      result = 'no-change (agent committed nothing; claim released, PR is re-planned)';
+      outcome = 'no-change'; reason = 'agent committed nothing';
     } else {
       // The agent could write the lane's `.git`; this push runs outside its sandbox with our credentials, so refuse
       // if its repo-local config (remote URL, sshCommand, insteadOf, credential helper, includes...) changed or is now
@@ -218,15 +274,18 @@ export async function runFixCli(argv = [], {
       rearm();
       pendingRearm.clear(launch.repo, pr);
       result = `PR #${pr} (pushed ${after.slice(0, 9)}, re-armed review:pending)`;
+      outcome = 'pushed'; reason = `pushed ${after.slice(0, 9)}`;
     }
     write(`fix-run: PR #${pr} finished - ${result}\n`);
     return { code: 0, result };
   } catch (e) {
     writeErr(`fix-run: PR #${pr} FAILED: ${String(e?.message ?? e)}\n`);
+    outcome = 'failed'; reason = String(e?.message ?? e).split('\n')[0];
     return { code: 1, result: null };
   } finally {
     removePrompt(launch.promptFile); // one-shot, untrusted text: gone on every exit, success or not
     try { laneRelease?.(); } catch (e) { writeErr(`fix-run: lane release failed: ${String(e?.message ?? e)}\n`); }
+    await settle();
   }
 }
 

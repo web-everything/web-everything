@@ -104,7 +104,7 @@ import { BRIEF_REQUIRED_BY_KIND, OPTIONAL_BRIEF_PLACEHOLDERS, REPO_AWARE_VALUE_P
 import { parseAuthorActorId } from '../lib/review-independence.mjs';
 import { laneRefItemNum } from './lease-reaper.mjs';
 import {
-  acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, fixDispatchClaimOwner, listFixDispatchClaims,
+  acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, stampBorrowedRunnerPid, fixDispatchClaimOwner, listFixDispatchClaims,
 } from './fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
@@ -1032,6 +1032,8 @@ export function dispatchFix(planned, {
   // non-Claude executor launches through the fix run script instead of `claude --bg` (same brief, same review).
   borrowed = null,
   spawnBorrowed = (request) => fixDetachedProvider(request),
+  // Stamp the runner pid onto the claim so a dead borrowed fix stops counting against the cap (see `stampBorrowedRunnerPid`).
+  stampRunner = stampBorrowedRunnerPid,
   // The filled brief is handed to the non-Claude launcher as a file (it cannot ride argv); a test stubs the write.
   writeBorrowedPrompt = writePrivateBorrowedPrompt,
   // #x8mpubm — same never-throwing, opt-in-gated resolver `we:scripts/operations/dispatch-lane-io.mjs`'s own
@@ -1142,13 +1144,17 @@ export function dispatchFix(planned, {
         handle = spawnBorrowed({
           pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
           ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
-          promptFile,
+          promptFile, claimRepo: repo,
           policyRoute: { provider: borrowed.executor === 'codex' ? 'codex' : 'antigravity-claude' },
         });
       } catch (e) {
         removePromptFile(promptFile); // the launcher never started, so nothing else will delete the brief
         throw e;
       }
+      try {
+        const runnerPid = Number(String(handle).replace(/^pid:/, ''));
+        stampRunner({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, pid: runnerPid, ...(claimRoot ? { lockRoot: claimRoot } : {}) });
+      } catch { /* best effort: without a stamp the plain TTL still applies */ }
       return {
         sessionId: null, agentId: String(handle), sessionSlug, pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane,
         unknownTokens, resumed: false, ...(resumeAttempt ? { resumeAttempt } : {}),
