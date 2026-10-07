@@ -227,7 +227,7 @@ describe('classifyPath — real repository paths', () => {
    * headline number and is the operator's call — but it must not be able to change without a visible diff.
    */
   it('pins where the shape rules still reach — an uncovered directory is NOT protected', () => {
-    for (const d of ['audits', 'config', 'design-refs', 'design-systems', 'eleventy', 'functions', 'site', 'test-pages']) {
+    for (const d of ['audits', 'bun-trial', 'config', 'design-refs', 'design-systems', 'eleventy', 'functions', 'site', 'test-pages']) {
       expect(classOf(`${d}/probe.ts`), `${d}/ is no longer uncovered`).toBe('other');
       expect(classOf(`${d}/nested/contract.ts`), `${d}/ shape exposure changed`).toBe('product');
       expect(classOf(`${d}/nested/x.vectors.ts`), `${d}/ shape exposure changed`).toBe('product');
@@ -288,7 +288,7 @@ describe('classifyPath — real repository paths', () => {
  *     so the paragraph a reader trusts and the list a test enforces can never drift.
  */
 describe('rule-list coverage over the real tree', () => {
-  const KNOWN_UNCOVERED = ['audits', 'config', 'design-refs', 'design-systems', 'eleventy', 'functions', 'site', 'test-pages'];
+  const KNOWN_UNCOVERED = ['audits', 'bun-trial', 'config', 'design-refs', 'design-systems', 'eleventy', 'functions', 'site', 'test-pages'];
 
   /** The declaration homes ruled `product` by this revision — the machinery-coverage test's counterpart. */
   const PRODUCT_HOMES = [
