@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { extractRefs, prMentionsItem, mergedSlices, assessItem, wordStems } from '../held-cards-check.mjs';
+import { extractRefs, prMentionsItem, mergedSlices, assessItem, wordStems, stripHtmlComments } from '../held-cards-check.mjs';
 import { main } from '../held-cards-io.mjs';
 
 const none = { paths: [], symbols: [], prs: [], mentions: [], slicesDone: new Map(), commits: [] };
@@ -64,5 +64,16 @@ describe('held-cards-io check', () => {
     expect(fs.readFileSync(list, 'utf8')).toBe(md);
     expect(calls.every(([bin, ...a]) => bin === 'gh' ? a[0] === 'pr' && ['list', 'view'].includes(a[1]) : !a.some(x => ['add', 'commit', 'push', 'checkout'].includes(x)))).toBe(true);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('stripHtmlComments (CodeQL incomplete multi-character sanitization)', () => {
+  it.each(['<!-<!---->-', '<!<!---->--> x', '<!-<!-<!---->-->-', '<!--<!-- a -->', 'a <!-- b --> c'])('leaves no comment delimiter in %s', input => {
+    const out = stripHtmlComments(input);
+    expect(out).not.toContain('<!--');
+    expect(out).not.toContain('-->');
+  });
+  it('hides refs inside nested comments from extractRefs', () => {
+    expect(extractRefs('<!-<!---->- scripts/secret.mjs -->').paths).not.toContain('scripts/secret.mjs');
   });
 });
