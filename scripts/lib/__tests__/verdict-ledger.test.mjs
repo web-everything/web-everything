@@ -21,7 +21,7 @@ import {
   verdictClears, verdictLabel, verdictForLabelTarget, labelVerdictOf, foldVerdictLedger, ledgerCoversHead,
   compareLedgerToLabels, summarizeAgreement, summarizeShadowAgreement,
   NON_BEARING, verdictBears,
-  appendVerdict, resolveLedgerStore, DEFAULT_VERDICT_LEDGER_STORE, readVerdictLedger, foldRepo, verdictLedgerPath, verdictLedgerDir, defaultVerdictLedgerDir,
+  appendVerdict, resolveLedgerStore, resolveLedgerStoreChoice, resetLedgerDowngradeWarning, DEFAULT_VERDICT_LEDGER_STORE, readVerdictLedger, foldRepo, verdictLedgerPath, verdictLedgerDir, defaultVerdictLedgerDir,
   listLedgerRepos,
   EVENT_TYPES, EVENT_TYPE_VALUES, LEDGER_EVENT_VERSION, eventBears,
   buildLedgerEvent, validateLedgerEvent, serializeLedgerEvent, parseLedgerEvents,
@@ -998,9 +998,17 @@ describe('#3255 C2 dual-write: appendVerdict behind verdictLedger.store', () => 
     expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(1);
   });
 
-  it('default store is dual outside tests, and unrecognised values fall back to it', () => {
-    expect(resolveLedgerStore('git')).toBe('git');
-    expect(resolveLedgerStore('nonsense')).toBe(process.env.VITEST ? 'home' : 'dual');
+  it('default store is dual outside tests, home under a test run; both branches asserted explicitly', () => {
+    expect(resolveLedgerStore('git', {})).toBe('git');
+    // Outside a test run (an injected env bag with no under-test flag) the default — and any unrecognised value — is dual.
+    expect(resolveLedgerStore(undefined, {})).toBe('dual');
+    expect(resolveLedgerStore('nonsense', {})).toBe('dual');
+    expect(resolveLedgerStore(undefined, { WE_VERDICT_LEDGER_STORE: 'bogus' })).toBe('dual');
+    expect(resolveLedgerStore(undefined, { WE_VERDICT_LEDGER_STORE: ' HOME ' })).toBe('home');
+    // Under a test run (either runner flag) an unconfigured store is home, but a named store is honoured.
+    expect(resolveLedgerStore(undefined, { VITEST: 'true' })).toBe('home');
+    expect(resolveLedgerStore('nonsense', { WE_UNDER_TEST: '1' })).toBe('home');
+    expect(resolveLedgerStore('dual', { VITEST: 'true' })).toBe('dual');
     expect(DEFAULT_VERDICT_LEDGER_STORE).toBe('dual');
   });
 
@@ -1048,4 +1056,149 @@ describe('#3255 C2 dual-write: appendVerdict behind verdictLedger.store', () => 
     expect(r.ok).toBe(false);
     expect(s.calls).toHaveLength(0);
   });
+});
+
+describe('#3255 C2 review fix: the production default path, home-fails-too spill, store=git visibility', () => {
+  let dir;
+  const FLAGS = ['VITEST', 'WE_UNDER_TEST', 'WE_VERDICT_LEDGER_STORE', 'WE_VERDICT_LEDGER_BOARD'];
+  const saved = {};
+  const REPO = 'web-everything/web-everything';
+  const mk = (verdict, pr = 21) => buildVerdictRecord({ repo: REPO, pr, verdict, at: '2026-10-07T12:00:00.000Z', source: 'test' });
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'we-verdict-ledger-c2fix-'));
+    for (const k of [...FLAGS, 'WE_VERDICT_LEDGER_DIR']) saved[k] = process.env[k];
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+  });
+  afterEach(() => {
+    for (const k of [...FLAGS, 'WE_VERDICT_LEDGER_DIR']) {
+      if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+    }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(`${dir}-locks`, { recursive: true, force: true });
+  });
+  /** Run `fn` as production would see it: the under-test shims and every ledger env knob unset. */
+  const asProduction = (fn) => {
+    for (const k of FLAGS) delete process.env[k];
+    return fn();
+  };
+
+  it('production default (no opts, no board env, test flags off): a clearing verdict is still ok:true and writes home, with no git attempt and no miss', () => {
+    const r = asProduction(() => appendVerdict(mk('accepted'), { warn: () => {} }));
+    expect(r.ok).toBe(true);
+    expect(r.ledgerWriteMiss).toBeUndefined();
+    expect(r.store).toBe('home');
+    expect(readVerdictLedger(REPO)).toHaveLength(1);
+  });
+
+  it('production default with a board configured: dual-writes both stores', () => {
+    const calls = [];
+    const r = asProduction(() => appendVerdict(mk('accepted'), {
+      board: '/board', gitAppend: (a) => { calls.push(a); return { status: 'appended' }; }, warn: () => {},
+    }));
+    expect(r.ok).toBe(true);
+    expect(r.store).toBe('dual');
+    expect(calls).toHaveLength(1);
+    expect(readVerdictLedger(REPO)).toHaveLength(1);
+  });
+
+  it('production default with the board in env: dual-writes both stores', () => {
+    const calls = [];
+    const r = asProduction(() => {
+      process.env.WE_VERDICT_LEDGER_BOARD = '/env-board';
+      return appendVerdict(mk('accepted'), { gitAppend: (a) => { calls.push(a); return { status: 'appended' }; }, warn: () => {} });
+    });
+    expect(r.ok).toBe(true);
+    expect(calls[0].board).toBe('/env-board');
+  });
+
+  it('an EXPLICIT dual/git store with no board stays a loud miss (only the unconfigured default falls back to home)', () => {
+    const warns = [];
+    const r = asProduction(() => appendVerdict(mk('accepted'), { store: 'dual', warn: (m) => warns.push(m) }));
+    expect(r.ok).toBe(false);
+    expect(r.ledgerWriteMiss).toBe(true);
+    expect(warns.join()).toMatch(/no git board/);
+    const viaEnv = asProduction(() => {
+      process.env.WE_VERDICT_LEDGER_STORE = 'dual';
+      return appendVerdict(mk('accepted', 22), { warn: () => {} });
+    });
+    expect(viaEnv.ok).toBe(false);
+  });
+
+  it('store=git where git misses AND the home spill fails: ok:false, and the home failure reason is kept (clearing and holding)', () => {
+    // Point the home ledger at a path under a regular file so every home write throws ENOTDIR.
+    const blocker = join(dir, 'blocker');
+    writeFileSync(blocker, 'x');
+    process.env.WE_VERDICT_LEDGER_DIR = join(blocker, 'ledger');
+    for (const verdict of ['accepted', 'human']) {
+      const warns = [];
+      const r = appendVerdict(mk(verdict), {
+        store: 'git', board: '/board', gitAppend: () => { throw new Error('push exhausted'); }, warn: (m) => warns.push(m),
+      });
+      expect(r.ok, verdict).toBe(false);
+      expect(r.errors.join('; '), verdict).toMatch(/ENOTDIR|not a directory|home/i);
+      expect(r.errors.length, verdict).toBeGreaterThan(0);
+      expect(warns.join(), verdict).toMatch(/GIT WRITE MISS/);
+    }
+  });
+
+  it('store=git where git misses and home fails by an invalid-for-home reason keeps every error (home errors first, then the miss)', () => {
+    const r = appendVerdict(mk('accepted'), {
+      store: 'git', board: '/board', gitAppend: () => { throw new Error('push exhausted'); }, warn: () => {},
+      homeAppend: () => ({ ok: false, path: null, record: null, locked: false, errors: ['home boom'] }),
+    });
+    expect(r.ok).toBe(false);
+    expect(r.errors).toEqual(['home boom', 'ledger-write-miss: push exhausted']);
+    const hold = appendVerdict(mk('human'), {
+      store: 'git', board: '/board', gitAppend: () => { throw new Error('push exhausted'); }, warn: () => {},
+      homeAppend: () => ({ ok: false, path: null, record: null, locked: false, errors: ['home boom'] }),
+    });
+    expect(hold.ok).toBe(false);
+    expect(hold.errors).toEqual(['home boom']);
+  });
+
+  it('store=git success is announced loudly: readers still read home, so a git-only row is invisible to the fold', () => {
+    const warns = [];
+    const r = appendVerdict(mk('human'), {
+      store: 'git', board: '/board', gitAppend: () => ({ status: 'appended' }), warn: (m) => warns.push(m),
+    });
+    expect(r.ok).toBe(true);
+    expect(warns.join()).toMatch(/store=git/);
+    expect(warns.join()).toMatch(/readers still read home/);
+    // The documented consequence the warning names: the fold does not see the git-only hold.
+    expect(foldRepo(REPO).get(21)).toBeUndefined();
+  });
+  it('a THROWING home write in dual/home mode is an ok:false result with its reason, never an escape (and the reason is one capped line)', () => {
+    const boom = () => { throw new Error('disk full\nsecond line'.padEnd(2000, 'x')); };
+    for (const store of ['home', 'dual']) {
+      const r = appendVerdict(mk('accepted'), { store, board: '/board', homeAppend: boom, gitAppend: () => ({ status: 'appended' }), warn: () => {} });
+      expect(r.ok, store).toBe(false);
+      expect(r.errors, store).toHaveLength(1);
+      expect(r.errors[0], store).toMatch(/^home ledger write failed: disk full/);
+      expect(r.errors[0].length, store).toBeLessThan(400);
+      expect(r.errors[0], store).not.toMatch(/second line/);
+    }
+  });
+
+  it('the unconfigured-default downgrade to home is announced once per process; a named store never triggers it', () => {
+    resetLedgerDowngradeWarning();
+    const warns = [];
+    asProduction(() => {
+      appendVerdict(mk('accepted', 31), { warn: (m) => warns.push(m) });
+      appendVerdict(mk('accepted', 32), { warn: (m) => warns.push(m) });
+    });
+    expect(warns).toHaveLength(1);
+    expect(warns[0]).toMatch(/running as `home`/);
+    resetLedgerDowngradeWarning();
+    const named = [];
+    asProduction(() => appendVerdict(mk('accepted', 33), { store: 'home', warn: (m) => named.push(m) }));
+    expect(named).toHaveLength(0);
+  });
+
+  it('resolveLedgerStoreChoice derives store and named-ness together', () => {
+    expect(resolveLedgerStoreChoice(undefined, {})).toEqual({ store: 'dual', named: false });
+    expect(resolveLedgerStoreChoice('bogus', { WE_VERDICT_LEDGER_STORE: 'git' })).toEqual({ store: 'dual', named: false });
+    expect(resolveLedgerStoreChoice(undefined, { WE_VERDICT_LEDGER_STORE: ' Git ' })).toEqual({ store: 'git', named: true });
+    expect(resolveLedgerStoreChoice(undefined, { VITEST: '1' })).toEqual({ store: 'home', named: false });
+  });
+
 });

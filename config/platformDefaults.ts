@@ -70,9 +70,12 @@ export const PLATFORM_CROSS_PROVIDER_FALLBACK_WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1
 /**
  * Verdict-ledger settings (statute `#verdict-ledger-pr-state-store`; plan slice C2 = #3255 part 2). Mirrored in
  * `scripts/lib/verdict-ledger.mjs` (env `WE_VERDICT_LEDGER_STORE`), because .mjs cannot import this file.
- * `store`: `dual` writes the machine-local file AND the `ops/review-requests` git transport (default); `home` is
- * the one-setting rollback (git untouched); `git` writes the transport only. A git write miss never drops a row
- * and is loud: a clearing verdict does not clear, a holding verdict still holds (ratified F4).
+ * `store`: `dual` writes the machine-local file AND the `ops/review-requests` git transport (default, once a git
+ * board resolves — with none configured the unconfigured default stays on `home`); `home` is the one-setting
+ * rollback (git untouched); `git` writes the transport only, and is for the read-slice cut-over: readers still read
+ * home, so a git-only row is invisible to the fold. A git write miss never drops a row and is loud: a clearing
+ * verdict returns `ok: false` (a caller that honours `ok` does not swap the label), a holding verdict still holds
+ * (ratified F4).
  */
 export const PLATFORM_VERDICT_LEDGER_DEFAULTS = {
   store: 'dual' as 'home' | 'dual' | 'git',

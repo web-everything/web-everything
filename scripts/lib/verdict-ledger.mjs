@@ -1075,33 +1075,61 @@ export function verdictLedgerPath(repo) {
  * transport via `verdict-ledger-io.mjs`; `git` writes git only. A git write miss follows the ratified F4 posture
  * (see `finishGitMiss`): never silent, never dropped. Reads are unchanged (home).
  *
+ * The UNCONFIGURED default is `dual` only once a git board resolves (`opts.board` or env
+ * `WE_VERDICT_LEDGER_BOARD`); with no board it is `home`, so a deployment that has not provisioned the board keeps
+ * the pre-C2 contract (a successful home append is `ok: true`) instead of failing every clearing verdict. A store
+ * NAMED by the operator (`opts.store` / env `WE_VERDICT_LEDGER_STORE`) is honoured as written: `dual`/`git` with no
+ * board is a loud miss, never a silent downgrade. `git` is for the read-slice cut-over only: every reader still
+ * reads home, so a git-only row is invisible to the fold until readers move (each `git` write says so on stderr).
+ *
+ * `opts.env` governs store, board and test-mode only; the home directory still reads `process.env`.
+ *
  * @param {VerdictRecord} record - from {@link buildVerdictRecord}.
- * @param {{store?: string, board?: string, gitAppend?: Function, warn?: Function}} [opts] - test seams.
+ * @param {{store?: string, board?: string, env?: object, gitAppend?: Function, homeAppend?: Function, warn?: Function}} [opts] - test seams.
  * @returns {{ok: boolean, path: string|null, record: VerdictRecord|null, locked: boolean, errors: string[]}}
  */
 export function appendVerdict(record, opts = {}) {
-  const store = resolveLedgerStore(opts.store);
-  const board = opts.board ?? process.env.WE_VERDICT_LEDGER_BOARD ?? null;
-  const gitAppend = opts.gitAppend ?? appendLedgerRows;
+  const env = opts.env ?? process.env;
+  const board = opts.board ?? env.WE_VERDICT_LEDGER_BOARD ?? null;
   const loud = opts.warn ?? ((m) => process.stderr.write(`${m}\n`));
+  // One derivation of the store AND whether the operator named it, so the two can never disagree.
+  const choice = resolveLedgerStoreChoice(opts.store, env);
+  let store = choice.store;
+  // Unconfigured default + no board to write to: stay on home rather than miss on every call (see header).
+  if (!choice.named && store === DEFAULT_VERDICT_LEDGER_STORE && !board) {
+    store = 'home';
+    warnDowngradeOnce(loud);
+  }
+  const gitAppend = opts.gitAppend ?? appendLedgerRows;
+  // A home write that THROWS (bad ledger dir, full disk) is a failed write with a reason, never an escape: every
+  // caller branches on `ok`, and `review-pr-io` has no catch around this call.
+  const rawHome = opts.homeAppend ?? appendVerdictHome;
+  const homeAppend = (r) => {
+    try { return rawHome(r); } catch (e) {
+      return { ok: false, path: null, record: null, locked: false, errors: [`home ledger write failed: ${errFirstLine(e)}`] };
+    }
+  };
   const writeGit = (normalized) => {
     if (!board) return { status: 'miss', error: 'no git board configured (set WE_VERDICT_LEDGER_BOARD or pass opts.board)' };
     try {
       gitAppend({ board, repo: normalized.repo, records: [normalized] });
       return { status: 'appended' };
-    } catch (e) { return { status: 'miss', error: String(e?.message ?? e) }; }
+    } catch (e) { return { status: 'miss', error: errFirstLine(e) }; }
   };
   if (store === 'git') {
     // Validate first: an invalid record is refused and nothing is written anywhere.
     const v = serializeVerdictRecord(record);
     if (!v.ok) return { ok: false, path: null, record: null, locked: false, errors: v.errors, store };
     const g = writeGit(v.record);
-    if (g.status === 'appended') return { ok: true, path: null, record: v.record, locked: false, errors: [], store, git: g };
-    // Write miss: the row must never be silently dropped, so it spills to the home ledger.
-    const home = appendVerdictHome(record);
-    return finishGitMiss({ home, g, store, loud, record: v.record });
+    if (g.status === 'appended') {
+      loud(`verdict-ledger: store=git wrote ${v.record.repo}#${v.record.pr} verdict=${v.record.verdict} to the git transport ONLY — readers still read home, so the fold does not see this row until the read slice lands (use store=dual)`);
+      return { ok: true, path: null, record: v.record, locked: false, errors: [], store, git: g };
+    }
+    // Write miss: the row must never be silently dropped, so it spills to the home ledger. A failed spill is
+    // reported with its reason alongside the git miss.
+    return finishGitMiss({ home: homeAppend(record), g, store, loud, record: v.record });
   }
-  const home = appendVerdictHome(record);
+  const home = homeAppend(record);
   if (store === 'home' || !home.ok) return { ...home, store };
   const g = writeGit(home.record);
   if (g.status === 'appended') return { ...home, store, git: g };
@@ -1109,9 +1137,11 @@ export function appendVerdict(record, opts = {}) {
 }
 
 /** The ratified F4 write-miss posture (`#verdict-ledger-pr-state-store` rule 4). The home row already exists, so
- *  nothing is lost. A CLEARING verdict that missed git does NOT clear (`ok: false`, so the caller must not swap
- *  the label); a HOLDING verdict still applies (`ok: true`) but carries `ledgerWriteMiss: true` for the smell.
- *  Both are loud on stderr. */
+ *  nothing is lost. A CLEARING verdict that missed git does NOT clear: the result is `ok: false`. That signal only
+ *  holds for a caller that honours `ok` before it swaps the label (`review-pr-io`, `merge-ai-prs` do;
+ *  `review-set-label` still swaps — its append is a non-fatal shadow today). A HOLDING verdict still applies
+ *  (`ok: true`) but carries `ledgerWriteMiss: true` for the smell. Both are loud on stderr. When the home spill
+ *  ALSO failed, its errors come first, so the cause is never hidden behind the git miss. */
 function finishGitMiss({ home, g, store, loud, record }) {
   const clears = verdictClears(record.verdict);
   loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} verdict=${record.verdict}: ${g.error}`
@@ -1122,7 +1152,7 @@ function finishGitMiss({ home, g, store, loud, record }) {
     store,
     git: g,
     ledgerWriteMiss: true,
-    errors: clears ? [`ledger-write-miss: ${g.error}`] : [],
+    errors: [...(home.errors ?? []), ...(clears ? [`ledger-write-miss: ${g.error}`] : [])],
   };
 }
 
@@ -1130,13 +1160,34 @@ function finishGitMiss({ home, g, store, loud, record }) {
  *  import the .ts). Env `WE_VERDICT_LEDGER_STORE`; anything unrecognised falls back to the default `dual`. */
 export const VERDICT_LEDGER_STORES = Object.freeze(['home', 'dual', 'git']);
 export const DEFAULT_VERDICT_LEDGER_STORE = 'dual';
-export function resolveLedgerStore(explicit) {
-  const v = String(explicit ?? process.env.WE_VERDICT_LEDGER_STORE ?? '').trim().toLowerCase();
-  if (VERDICT_LEDGER_STORES.includes(v)) return v;
+/** The store and whether the operator NAMED it (a recognised value from `explicit` or env), derived once.
+ *  @param {string} [explicit] @param {Record<string, string|undefined>} [env] injectable, so both under-test branches are testable.
+ *  @returns {{store: string, named: boolean}} */
+export function resolveLedgerStoreChoice(explicit, env = process.env) {
+  const v = String(explicit ?? env.WE_VERDICT_LEDGER_STORE ?? '').trim().toLowerCase();
+  if (VERDICT_LEDGER_STORES.includes(v)) return { store: v, named: true };
   // Under a test run an unconfigured store is `home`, so an unrelated suite never pushes to a real remote.
   // Production (and any test that names the store) gets the `dual` default.
-  return isUnderTest() ? 'home' : DEFAULT_VERDICT_LEDGER_STORE;
+  return { store: isUnderTest(env) ? 'home' : DEFAULT_VERDICT_LEDGER_STORE, named: false };
 }
+export function resolveLedgerStore(explicit, env = process.env) {
+  return resolveLedgerStoreChoice(explicit, env).store;
+}
+
+/** First line of an error, capped, so a hostile or huge message cannot flood the result or stderr. */
+function errFirstLine(e) {
+  return String(e?.message ?? e).split('\n')[0].slice(0, 300);
+}
+
+let downgradeWarned = false;
+/** Say ONCE per process that an unconfigured deployment (no git board) is running on `home`. */
+function warnDowngradeOnce(loud) {
+  if (downgradeWarned) return;
+  downgradeWarned = true;
+  loud('verdict-ledger: no git board configured (WE_VERDICT_LEDGER_BOARD) — the unconfigured default store is running as `home`; set a board to enable the dual write');
+}
+/** Test seam: re-arm the once-per-process downgrade notice. */
+export function resetLedgerDowngradeWarning() { downgradeWarned = false; }
 
 function appendVerdictHome(record) {
   const lockRoot = verdictLedgerLockRoot();
