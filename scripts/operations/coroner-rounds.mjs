@@ -370,22 +370,18 @@ export function readReceipts(dir, io = fs) {
   return byPr;
 }
 
-/** gh + git reads for the PRs opened in the window. Caps: `maxPrs` PRs, 3 comment pages each, `maxCompares` compares. */
+/** gh + git reads for the PRs opened in the window. Caps: `maxPrs` PRs (all comment pages, commits, files) and `maxCompares` compares. */
 export function collectChangeRequests({ prs, prKinds = {}, prFiles = {}, ciRuns = [], gh, git = null, backlogDir, receiptsDir, repo, io = fs, maxPrs = 300, maxCompares = 150 }) {
-  const notes = { prs: 0, commentPagesTruncated: 0, compares: 0, comparesSkipped: 0 };
+  const notes = { prs: 0, commentReadsFailed: 0, compares: 0, comparesSkipped: 0 };
   if (typeof gh !== 'function') return { report: buildChangeRequests([]), notes: { ...notes, skipped: 'no gh' } };
   const cards = cardIndex(backlogDir, io), receipts = readReceipts(receiptsDir, io);
   const inputs = [];
   for (const pr of prs.slice(0, maxPrs)) {
     notes.prs++;
-    const comments = [];
-    for (let page = 1; page <= 3; page++) {
-      const data = gh(['api', `repos/${repo}/issues/${pr.number}/comments?per_page=100&page=${page}`]);
-      if (!Array.isArray(data)) break;
-      comments.push(...data);
-      if (data.length < 100) break;
-      if (page === 3) notes.commentPagesTruncated++;
-    }
+    // Every page (a long fix loop runs past 300 comments); the gh runner's maxBuffer bounds the read.
+    const pages = gh(['api', '--paginate', '--slurp', `repos/${repo}/issues/${pr.number}/comments?per_page=100`]);
+    const comments = Array.isArray(pages) ? pages.flat() : [];
+    if (!Array.isArray(pages)) notes.commentReadsFailed++;
     let files = prFiles[pr.number];
     if (!files) { const data = gh(['api', `repos/${repo}/pulls/${pr.number}/files?per_page=100`]); files = Array.isArray(data) ? data : []; }
     files = files.map((f) => ({ filename: f.filename, additions: f.additions, deletions: f.deletions, patch: f.patch }));

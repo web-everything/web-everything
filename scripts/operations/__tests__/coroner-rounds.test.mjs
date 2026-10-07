@@ -117,7 +117,7 @@ describe('coroner change-request IO', () => {
     fs.writeFileSync(join(root, 'backlog', '5232-prevention.md'), '---\nbornAs: x4ol7l8\nkind: story\nsize: 1\n---\nbody\n');
     expect(cardIndex(join(root, 'backlog')).get('x4ol7l8')).toMatchObject({ id: '5232', size: 1 });
     const calls = [];
-    const gh = (args) => { calls.push(args[1]); return /comments/.test(args[1]) ? [] : /commits/.test(args[1]) ? [] : /files/.test(args[1]) ? [] : null; };
+    const gh = (args) => { calls.push(args.at(-1)); return /comments/.test(args.at(-1)) ? [[]] : /commits|files/.test(args.at(-1)) ? [] : null; };
     const prs = [1, 2, 3].map((n) => ({ number: n, createdAt: t(0), headRef: 'lane/x4ol7l8-prevention-card' }));
     const { report, notes } = collectChangeRequests({ prs, gh, backlogDir: join(root, 'backlog'), receiptsDir: join(root, 'none'), repo: 'o/r', maxPrs: 2 });
     expect(notes.prs).toBe(2);
@@ -126,7 +126,7 @@ describe('coroner change-request IO', () => {
   });
 
   it('ties a CI run with no PR link to the PR through its head sha', () => {
-    const gh = (args) => /commits/.test(args[1]) ? [commit('c1', 0), commit('c2', 50)] : /comments|files/.test(args[1]) ? [] : null;
+    const gh = (args) => /commits/.test(args.at(-1)) ? [commit('c1', 0), commit('c2', 50)] : /comments|files/.test(args.at(-1)) ? [] : null;
     const ciRuns = [{ name: 'test', conclusion: 'failure', headSha: 'c1', pr: null, createdAt: t(5), updatedAt: t(15), jobs: [{ name: 'test-shard (2)', conclusion: 'failure' }] }];
     const { report } = collectChangeRequests({ prs: [{ number: 1, createdAt: t(0), headRef: 'lane/item-1' }], ciRuns, gh, backlogDir: root, receiptsDir: root, repo: 'o/r' });
     expect(report.byKind.code.records[0].rounds).toMatchObject([{ head: 'c1', triggers: ['ci-red'], findings: [{ lens: 'ci', category: 'test-shard (2)', hint: 'gate-missed-catching-test' }] }]);
@@ -134,9 +134,9 @@ describe('coroner change-request IO', () => {
 
   it('runCoroner puts changeRequests right after errorRates when gh is available', () => {
     const env = Object.fromEntries(['JOBS', 'JOBS_ARCHIVE', 'PROJECTS', 'DAEMON_DIR', 'VERIFY_LOG', 'ADMISSION', 'LANES', 'STATE', 'COORD', 'BACKLOG', 'RECEIPTS'].map((k) => [`WE_CORONER_${k}`, join(root, k.toLowerCase())]));
-    const gh = (args) => /pulls\?state=all/.test(args[1]) ? [{ number: 5, created_at: '2026-10-05T12:30:00Z', merged_at: null, head: { ref: 'lane/item-1' }, user: { login: 'chalbert' } }]
-      : /issues\/5\/comments/.test(args[1]) ? [comment(40, reviewBody('h1', [['scripts/a.mjs', 1, 'Bug']]))]
-        : /pulls\/5\/commits/.test(args[1]) ? [commit('h1', 0), commit('h2', 50)] : /pulls\/5\/files/.test(args[1]) ? [{ filename: 'scripts/a.mjs', additions: 1, deletions: 0 }] : null;
+    const gh = (args) => /pulls\?state=all/.test(args.at(-1)) ? [{ number: 5, created_at: '2026-10-05T12:30:00Z', merged_at: null, head: { ref: 'lane/item-1' }, user: { login: 'chalbert' } }]
+      : /issues\/5\/comments/.test(args.at(-1)) ? [[comment(40, reviewBody('h1', [['scripts/a.mjs', 1, 'Bug']]))]]
+        : /pulls\/5\/commits/.test(args.at(-1)) ? [commit('h1', 0), commit('h2', 50)] : /pulls\/5\/files/.test(args.at(-1)) ? [{ filename: 'scripts/a.mjs', additions: 1, deletions: 0 }] : null;
     const { metrics } = runCoroner(['--since=2026-10-05T12:00:00Z', '--until=2026-10-05T14:00:00Z', '--json', '--no-save'], { env, home: root, gh });
     expect(Object.keys(metrics).slice(0, 3)).toEqual(['window', 'errorRates', 'changeRequests']);
     expect(metrics.changeRequests.byKind.code.records[0]).toMatchObject({ pr: 5, rounds: [{ head: 'h1', triggers: ['review-changes'], findings: [{ file: 'scripts/a.mjs', line: 1 }] }] });

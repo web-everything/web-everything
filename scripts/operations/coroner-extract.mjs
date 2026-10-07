@@ -6,7 +6,7 @@
  * errorRates is the first output key. WE_CORONER_COORD (build-dispatch log), WE_CORONER_BUILD_TAIL (tick-row tail bytes) and
  * WE_CORONER_NO_CI (skip gh) are the extra knobs; the gh read is bounded to 5 run pages and 40 job lookups.
  * changeRequests (card 102, coroner-rounds.mjs): per-PR change-request rounds + attributes; WE_CORONER_NO_ROUNDS skips it,
- * WE_CORONER_RECEIPTS overrides the builder-receipt dir. Bounded: 300 PRs x (3 comment pages + commits) and 150 compares.
+ * WE_CORONER_RECEIPTS overrides the builder-receipt dir. Bounded: 300 PRs x (comments + commits + files) and 150 compares.
  */
 import fs from 'node:fs';
 import { homedir } from 'node:os';
@@ -693,7 +693,7 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
   let changeRequests = null;
   if (gh && !env.WE_CORONER_NO_ROUNDS) {
     const repoDir = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-    const git = (args) => { try { return execFileSync('git', ['-C', repoDir, ...args], { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] }); } catch { return null; } };
+    const git = (args) => { try { return execFileSync('git', ['-C', repoDir, ...args], { encoding: 'utf8', timeout: 10000, maxBuffer: MiB, stdio: ['ignore', 'pipe', 'ignore'] }); } catch { return null; } };
     const cr = collectChangeRequests({ prs: opened.prs, prKinds, prFiles, ciRuns: ci.runs, gh, git, backlogDir, receiptsDir: env.WE_CORONER_RECEIPTS || join(paths.coord, 'build-pr-authorship'), repo: CONSTELLATION_REPOS.we.slug, io });
     changeRequests = { ...cr.report, reads: cr.notes };
     sources.changeRequests = { found: cr.notes.prs > 0, count: cr.notes.prs, compares: cr.notes.compares };
