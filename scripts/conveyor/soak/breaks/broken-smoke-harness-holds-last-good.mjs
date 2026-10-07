@@ -81,6 +81,9 @@ export default {
         // A broken harness now adopts the candidate as no worse by default; this scenario pins the opt-out
         // hold-on-last-good path (WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE=0).
         w.env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '0';
+        // The code-path fixture below is imported by nothing, so daemonRebuild.skipUnrelated (default on) would
+        // adopt the move with no smoke at all and the harness-broken path would never run. Pin the knob off.
+        w.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
         return {};
       },
       async perRound(w, round, ctx, api) {

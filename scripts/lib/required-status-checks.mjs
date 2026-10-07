@@ -42,6 +42,7 @@ import { readGh } from './proc-read.mjs';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { looksLikePersonalAccessDenial, resolvePersonalRouteEnabled, runGhCliPassthrough } from './gh-throttle.mjs';
+import { REQUIRED_CHECK_IMPLIED_BY, withoutImpliedRequiredChecks } from './required-check-implication.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
 /**
@@ -50,7 +51,9 @@ import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
  * or as an untrusted fallback for other failures when no cache exists. A successful live fetch always wins,
  * so a real branch-protection change is picked up on the next successful read regardless of this constant.
  */
-export const FALLBACK_REQUIRED_STATUS_CHECKS = Object.freeze(['test', 'smoke', 'daemon-soak']);
+export const FALLBACK_REQUIRED_STATUS_CHECKS = Object.freeze(['test', 'smoke', 'daemon-soak', 'integration']);
+
+export { REQUIRED_CHECK_IMPLIED_BY, withoutImpliedRequiredChecks };
 
 /**
  * PR requirements when protection cannot be read. Sibling CI workflows inspected 2026-10-02:

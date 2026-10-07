@@ -64,7 +64,7 @@ import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.
 // check failed rather than "any check outside a hand-maintained exclusion list" — see that module's own header
 // for the full incident this closes. Anchored at the TOP of the import block (rather than beside the other
 // `reconcile-core.mjs`-adjacent imports below) so it never collides with an overlay editing that region.
-import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
+import { getRequiredStatusChecks, withoutImpliedRequiredChecks } from '../lib/required-status-checks.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -76,7 +76,7 @@ import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
 import { REPO_ROOT, defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { countRearmComments } from './rearm-review.mjs';
-import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls } from './reconcile-core.mjs';
+import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls } from './reconcile-core.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // we:backlog/x5uqim1-*.md (#4075/#3383) — the two extra facts `reconcile-core.mjs#isPrCiFailureOwedRerun` needs
@@ -234,7 +234,7 @@ export function defaultReadAgents({
   // pid, so a PR with a review job in flight is refused `live-process` exactly as a live review session was.
   const listed = listAgentsWithReviewJobs({ listAgents: () => defaultListAgents({ exec, env }), listJobs });
   // xpb0zyq — a session that already wrote its own completion record is finished, whatever the listing says.
-  const selfReported = markSelfReportedDone(Array.isArray(listed) ? listed : [], completionFor, now, { infraCooloffMs: resolveInfraRetryCooloffMs(env) });
+  const selfReported = markSelfReportedDone(Array.isArray(listed) ? listed : [], completionFor, now, { infraCooloffMs: resolveInfraRetryCooloffMs(env), transientCooloffMs: resolveInfraTransientCooloffMs(env) });
   // #3383 continuation — a session whose OWN transcript has gone stale is finished too, self-report or not.
   const hungMarked = markHungSessions(selfReported, hungInfoFor, now, hungThresholdMs);
   // Live incident fix, night of 2026-09-25/26 ET — a session whose OWN transcript shows the Claude CLI's own
@@ -1119,7 +1119,7 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
   const stackedPolicy = readStackedPrCheckPolicy();
   for (const pr of prs) {
     const runs = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
-    const missing = (requiredChecks ?? []).filter(name => !runs.some(run => run?.name === name));
+    const missing = withoutImpliedRequiredChecks(requiredChecks ?? [], runs).filter(name => !runs.some(run => run?.name === name));
     if (runs.length < 100 && !missing.length) { ready.push(pr); continue; }
     if (stackedPolicy === 'await-base' && isStackedPr(pr, defaultBranch)
       && runs.length < 100 && missing.length === (requiredChecks ?? []).length) {
@@ -1162,7 +1162,7 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
         // reducer (red precedence, so a cancelled check heals). Only when NOTHING observed speaks for the
         // missing names is the evidence incomplete — the reducer then reports `unchecked`, which never heals
         // or promotes, and the refusal below keeps that visible.
-        const absent = (requiredChecks ?? []).filter(name => !rows.some(row => row.name === name));
+        const absent = withoutImpliedRequiredChecks(requiredChecks ?? [], rows).filter(name => !rows.some(row => row.name === name));
         const observed = collapseRollupToLatestPerName(rows).some(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
           && (row.status.toLowerCase() !== 'completed' || FAILING_CONCLUSIONS.includes(row.conclusion?.toLowerCase())));
         cache.set(key, { rows: rows.map(row => ({ ...row, status: row.status.toUpperCase(),

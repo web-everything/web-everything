@@ -468,6 +468,20 @@ export function classifyGhRead(argvRaw) {
 }
 
 /**
+ * Is this `gh` call answered from local state alone (no GitHub request)? `gh auth token` reads the stored login
+ * from the local keyring/hosts file. Such a call spends no budget, so the shared budget-block gate must never
+ * fail it: live 2026-10-07 17:09Z a primary-budget block on the `default` identity made `gh auth token` throw
+ * instantly, so missing-run recovery failed "during credential" for PR #4244 and the PR stayed without checks.
+ * Deliberately NOT `auth status` (it calls the API). PURE.
+ * @param {string[]} argvRaw
+ * @returns {boolean}
+ */
+export function isGhLocalOnly(argvRaw) {
+  const args = stripLeadingGhGlobalFlags(Array.isArray(argvRaw) ? argvRaw.map(String) : []);
+  return (args[0] === 'auth' && args[1] === 'token') || args[0] === 'version' || args[0] === '--version';
+}
+
+/**
  * Best-effort caller attribution for a `gh` call, recorded on every `calls.jsonl` line (see {@link
  * recordGhCallLogEntry}) so the NEXT burst is traceable in one grep instead of the forensic, multi-log,
  * multi-transcript correlation the 2026-09-27 incident needed. Precedence, most to least specific:
@@ -1484,6 +1498,8 @@ export function recordGhCallLogEntry(logPath, entry) {
  */
 export function runGhSync(args, opts = {}) {
   const { throttle = {}, ...execOpts } = opts;
+  // Local-only calls (see isGhLocalOnly) bypass every gate: no GitHub budget, slot or block applies to them.
+  if (isGhLocalOnly(args)) return throttle.exec ? throttle.exec(args, execOpts) : execFileSync(throttle.bin || 'gh', args, execOpts);
   const env = throttle.env || process.env;
   const repo = throttle.repo || process.cwd();
   const lockRoot = throttle.lockRoot || ghThrottleLockRoot(repo, env);
