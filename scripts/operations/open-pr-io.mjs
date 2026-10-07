@@ -28,7 +28,7 @@ import { buildGhShimSettingsEnv, defaultShimDir, ghShimPathOverride, shimGhPath 
  */
 export function deriveLaneRef({
   cwd = process.cwd(),
-  read = (c) => readFileSync(execFileSync('git', ['rev-parse', '--git-path', '.lane-lease'], { cwd: c, encoding: 'utf8' }).trim().replace(/^(?!\/)/, c + '/'), 'utf8'),
+  read = (c) => readFileSync(execFileSync('git', ['rev-parse', '--git-path', '.lane-lease'], { cwd: c, encoding: 'utf8', maxBuffer: 1024 * 1024 }).trim().replace(/^(?!\/)/, c + '/'), 'utf8'),
 } = {}) {
   try {
     const slug = String(JSON.parse(read(cwd))?.purpose ?? '').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
