@@ -38,7 +38,14 @@
 /** Every heavy-command kind the queue distinguishes. Same vocabulary `we:scripts/operations/heavy-queue.mjs`
  *  already reported (`FULL` is the whole unit suite; `selected` a verify-lane diff-driven run; `files` a bare
  *  `vitest related`; `standards` check:standards alone; `other` anything else routed through the pool). */
-export const HEAVY_KINDS = Object.freeze(['selected', 'FULL', 'standards', 'files', 'other']);
+export const HEAVY_KINDS = Object.freeze(['selected', 'FULL', 'standards', 'files', 'verify', 'soak', 'coverage', 'build', 'agent', 'other']);
+
+/** Item 100 — `other` held 60% of heavy minutes because it was the bucket for every command the classifier did not
+ *  name. These kinds split it: `verify` (a verify-lane gate phase — the gate decides selected/FULL inside the
+ *  process, and its larger vitest phase and unscoped standards phase used to land in `other`), `soak` (the
+ *  conveyor soak shards), `coverage` (`test:coverage`), `build` (npm ci / install / build / tsc),
+ *  `agent` (a delegated codex / gemini task). `other` is now only a truly unknown command, and the command is
+ *  recorded beside it (`command` on the slot meta + durations log). All ride the slow lane, as `other` did. */
 
 /** Seed standard hold times in MINUTES, measured 2026-09-25 under real load: a selected run took ~1-5 min, a
  *  full suite ~10-25 min, check:standards ~12-16 s of CPU. `files` (a bare `vitest related`) is the vitest half
@@ -49,6 +56,11 @@ export const DEFAULT_STANDARD_MINUTES = Object.freeze({
   FULL: 18,
   standards: 0.25,
   files: 1.5,
+  verify: 5,
+  soak: 10,
+  coverage: 18,
+  build: 5,
+  agent: 5,
   other: 5,
 });
 
@@ -150,6 +162,9 @@ export function classifyCommandKind(command, env = {}) {
   const cmd = String(command || '').trim();
   if (!cmd) return 'other';
   const standards = /check[-:]standards/.test(cmd);
+  if (/\btest:coverage\b|\bvitest\b[^\n]*--coverage\b/.test(cmd)) return 'coverage';
+  if (/vitest\.soak\.config|conveyor\/soak\//.test(cmd)) return 'soak';
+  if (/\b(?:codex|gemini)-direct-task\.mjs\b/.test(cmd)) return 'agent';
   if (/\bnpm\s+(?:run\s+)?test(?::unit|:coverage)?\b/.test(cmd) || /\btest:(?:unit|coverage)\b/.test(cmd)) return 'FULL';
   // A `vitest run` segment without an explicit test file is a whole suite wherever it sits in the chain.
   const runNamesFiles = vitestRunSegmentsNameFiles(cmd);
@@ -158,7 +173,49 @@ export function classifyCommandKind(command, env = {}) {
   if (/\bvitest\s+related\b/.test(cmd) || runNamesFiles) return standards ? 'selected' : 'files';
   if (/\bvitest(?:\s+run)?\b/.test(cmd)) return 'FULL';
   if (standards) return 'standards';
+  if (/verify-lane\.mjs/.test(cmd)) return 'verify';
+  if (/\bnpm\s+(?:ci|install|i)\b|\bnpm\s+run\s+build\b|\bvite\s+build\b|\btsc\b|\besbuild\b/.test(cmd)) return 'build';
   return 'other';
+}
+
+/** Item 100 — the label for WHO is acquiring: the entry script's basename plus its subcommand word
+ *  (`verify-lane.mjs run`). Pure over an argv. Used when the caller passed no kind and no command, so a hold the
+ *  classifier cannot read off a command line (a direct `acquireSlotBlocking`, like verify-lane's phases) still says
+ *  what it is. */
+export function holderLabel(argv = []) {
+  const script = String(argv[1] || '').split('/').pop();
+  if (!script) return null;
+  const sub = /^[a-z][a-z-]*$/.test(String(argv[2] || '')) ? ` ${argv[2]}` : '';
+  return `${script}${sub}`;
+}
+
+/** Item 100 — refine a caller-supplied kind: only a missing / `other` kind is re-derived (from the command, else
+ *  from the holder label). An explicit named kind is never overridden. */
+export function refineKind(kind, { command = null, holder = null, env = {} } = {}) {
+  const k = normalizeKind(kind);
+  if (k !== 'other') return k;
+  if (command) { const c = classifyCommandKind(command, env); if (c !== 'other') return c; }
+  if (holder) { const h = classifyCommandKind(holder, env); if (h !== 'other') return h; }
+  return 'other';
+}
+
+/** Item 100 — minutes held per kind, and for `other` per holder/command, over duration records. Pure. */
+export function holdBreakdown(records = [], { sinceIso = null } = {}) {
+  const kinds = {};
+  const otherBy = {};
+  for (const r of Array.isArray(records) ? records : []) {
+    if (!r || !Number.isFinite(r.ms) || (sinceIso && String(r.at) < sinceIso)) continue;
+    const k = normalizeKind(r.kind);
+    const e = (kinds[k] ||= { holds: 0, minutes: 0 });
+    e.holds += 1; e.minutes += r.ms / 60_000;
+    if (k === 'other') {
+      const who = r.command || r.holder || r.dispatchKind || String(r.session || 'unknown').replace(/\d[\w-]*$/, '').replace(/-lane-$/, '') || 'unknown';
+      const o = (otherBy[who] ||= { holds: 0, minutes: 0 });
+      o.holds += 1; o.minutes += r.ms / 60_000;
+    }
+  }
+  const round = (m) => Object.fromEntries(Object.entries(m).map(([k, v]) => [k, { holds: v.holds, minutes: Math.round(v.minutes) }]));
+  return { kinds: round(kinds), other: round(otherBy) };
 }
 
 /** Normalise any kind-ish value to a {@link HEAVY_KINDS} member (`null`/unknown → `other`). */

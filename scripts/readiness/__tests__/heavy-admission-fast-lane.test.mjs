@@ -139,6 +139,25 @@ describe('hold durations — recorded by kind on release, rolled into the standa
     expect(source.selected.from).toBe('seed');
   });
 
+  it('item 100 — a kind-less acquire is labelled from its command or holder, and the command is recorded', async () => {
+    const lockRoot = tempRoot();
+    const t = () => Date.now() - 60_000;
+    const cases = [
+      ['o1', { command: 'npm ci' }, 'build'],
+      ['o2', { holder: 'verify-lane.mjs run' }, 'verify'],
+      ['o3', { kind: 'other', command: 'node scripts/mystery.mjs', holder: 'mystery.mjs' }, 'other'],
+    ];
+    for (const [owner, extra, want] of cases) {
+      const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner, env: {}, log: () => {}, now: t, sleep: async () => {}, ...extra });
+      expect(r.ok).toBe(true);
+      releaseOwnedSlot({ lockRoot, cap: 1, owner });
+      expect(readHoldDurations(lockRoot).at(-1).kind, owner).toBe(want);
+    }
+    const last = readHoldDurations(lockRoot).at(-1);
+    expect(last.command).toBe('node scripts/mystery.mjs');
+    expect(last.holder).toBe('mystery.mjs');
+  });
+
   it('a slot acquired by older code (no kind recorded) is released without writing a guessed duration', () => {
     const lockRoot = tempRoot();
     tryAcquireSlot({ lockRoot, cap: 1, owner: 'legacy', pid: process.pid, nowMs: T0, nowIso: iso(T0) });
