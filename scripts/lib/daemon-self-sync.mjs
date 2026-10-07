@@ -109,6 +109,8 @@ import { collectImportClosure, closureHits } from './import-closure.mjs';
 export { collectImportClosure };
 import { gateMergedCommit } from './daemon-live-smoke.mjs';
 import { rebuildClone, readRebuildState } from './daemon-rebuild.mjs';
+import { resolveVersionedContext, isInsideVersions, currentVersion } from './daemon-version-runtime.mjs';
+import { pin as pinVersion, unpin as unpinVersion } from './daemon-version-switch.mjs';
 import {
   acquireRead as acquireReadLock, releaseRead as releaseReadLock, resolveReaderPriorityAfter,
 } from './daemon-clone-lock.mjs';
@@ -510,8 +512,12 @@ export function withSelfSync(effects, {
   readerPriorityAfter = resolveReaderPriorityAfter(env), priorityWaitMs = resolvePriorityWaitMs(env),
   readerKey = `reader:${basename(String(entries?.[0] || 'daemon'))}`,
   cloneStuckSmellMs = resolveCloneStuckSmellMs(env),
+  // Card 89 S5. `versions`: undefined resolves from the settings (default off), null forces the legacy path.
+  // `tickContext.tickRoot` is set for the duration of each versioned tick: the folder this tick's children run from.
+  versions, tickContext = {}, versionApi = { currentVersion, pin: pinVersion, unpin: unpinVersion },
 }) {
   const tick = effects.tickOnce;
+  const vctx = resolvePocSyncBranch({ pocBranch, env }) ? null : (versions === undefined ? resolveVersionedContext({ root, env }) : versions);
   const resolvedPocBranch = resolvePocSyncBranch({ pocBranch, env });
   const syncOpts = () => ({ root, ...(timeoutMs != null ? { timeoutMs } : {}) });
   // #4044 Module E — every child process this daemon spawns (a dispatched session's own `git status`, `gh`,
@@ -537,12 +543,12 @@ export function withSelfSync(effects, {
   let closureBuilt = false;
   const loggedHeads = new Set();
   let lastStuckLogAt = -Infinity;
-  const restartGate = (headNow, { urgent = false } = {}) => {
+  const restartGate = (headNow, { urgent = false, diffRoot = root } = {}) => {
     if (!closureBuilt) {
       closureBuilt = true;
       try { closure = importClosure({ root, entries }); } catch { closure = null; }
     }
-    const changedFiles = diffFiles({ root, from: bootSha, to: headNow, ...(timeoutMs != null ? { timeoutMs } : {}) });
+    const changedFiles = diffFiles({ root: diffRoot, from: bootSha, to: headNow, ...(timeoutMs != null ? { timeoutMs } : {}) });
     const d = decideRestart({ changedFiles, closure, uptimeMs: now() - bootAt, minIntervalMs: urgent ? 0 : minRestartIntervalMs });
     if (!d.restart && !loggedHeads.has(`${headNow}:${d.reason}`)) {
       loggedHeads.add(`${headNow}:${d.reason}`);
@@ -551,6 +557,51 @@ export function withSelfSync(effects, {
         : `daemon-self-sync: clone moved to ${headNow} (${changedFiles.length} file(s) changed since boot, none imported by this daemon) — no restart needed, ticking on (#4044 restart gate)`);
     }
     return d;
+  };
+  // Card 89 S5 — the lock-free tick. A version is immutable and a switch is one atomic pointer rename, so a
+  // tick never needs a read slot: it pins the version it runs from (so gc keeps it), runs its children from that
+  // folder, and unpins. A switch mid-tick leaves this tick on its old folder; the next tick reads `current` again.
+  // Restarting is only meaningful when this process itself runs from a version folder; a daemon still booted from
+  // the plain clone just keeps ticking its children from `current` until it is migrated (S6).
+  const inVersion = !!vctx && isInsideVersions(vctx, root);
+  const versionedTick = async (args) => {
+    const rebuildResult = await rebuild();
+    if (rebuildResult && rebuildResult.moved && rebuildResult.adopted) {
+      const cur = versionApi.currentVersion(vctx);
+      if (inVersion && cur && restartGate(rebuildResult.head, { diffRoot: cur.dir }).restart) {
+        log.error?.(`daemon-self-sync: switched to a new version ${cur.id} (${rebuildResult.head}) — restarting onto the new code (card 89)`);
+        return onRestart(rebuildResult);
+      }
+    } else if (rebuildResult && rebuildResult.reason && rebuildResult.reason !== 'up-to-date') {
+      log.error?.(`daemon-self-sync: version rebuild did not switch (${rebuildResult.reason}) — ticking on the current version`);
+    }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const cur = versionApi.currentVersion(vctx);
+      if (inVersion && cur && bootSha != null && cur.sha !== bootSha && restartGate(cur.sha, { urgent: attempt > 0, diffRoot: cur.dir }).restart) {
+        log.error?.(`daemon-self-sync: current moved from ${bootSha} to ${cur.sha} since this process booted — restarting onto the new code (card 89)`);
+        return onRestart({ merged: false, commits: 0, reason: 'head-moved', headSha: cur.sha });
+      }
+      let pinned = false;
+      let tickResult;
+      try {
+        if (cur) {
+          await versionApi.pin({ clone: vctx.clone, home: vctx.home, id: cur.id, settings: vctx.settings });
+          pinned = true;
+        }
+        tickContext.tickRoot = cur ? cur.dir : root;
+        tickResult = await tick(...args);
+      } finally {
+        tickContext.tickRoot = undefined;
+        if (pinned) {
+          try { await versionApi.unpin({ clone: vctx.clone, home: vctx.home, id: cur.id, settings: vctx.settings }); } catch { /* an orphan pin ages out */ }
+        }
+      }
+      if (attempt === 0 && typeof hasStaleRefusal === 'function' && hasStaleRefusal(tickResult)) {
+        const r2 = await rebuild();
+        if (r2 && r2.moved && r2.adopted) continue;
+      }
+      return tickResult;
+    }
   };
   return {
     ...effects,
@@ -582,6 +633,9 @@ export function withSelfSync(effects, {
         }
         return tick(...args);
       }
+
+      // ---- VERSIONED path (card 89 S5) — rebuild builds a version and flips `current`; NO read/write lock ----
+      if (vctx) return versionedTick(args);
 
       // ---- DEFAULT (non-POC) path — full clone rebuild (#4044 Module E, see file header) ----
 

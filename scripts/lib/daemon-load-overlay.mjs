@@ -20,7 +20,8 @@
  * again. Registering it as a real overlay is the only way a manual early load survives past this one CLI run.
  *
  * USAGE:
- *   node scripts/lib/daemon-load-overlay.mjs --clone=<path to a daemon's dedicated clone> --ref=<branch to overlay> [--pr=N] [--base=<home branch, default main>] [--dry-run] [--json]
+ *   node scripts/lib/daemon-load-overlay.mjs --clone=<path to a daemon's dedicated clone> --ref=<branch to overlay> [--pr=N] [--base=<home branch, default main>] [--dry-run] [--wait [--wait-ms=N]] [--json]
+ *   (versioned clones, card 89 S5: queues a request file for the in-tick updater; --wait blocks on its result)
  *
  * WHAT IT DOES (real run): `addOverlay(root, {ref, pr, addedBy, reason})` (Module B — validates `ref` with
  * `isSafeBranchName`, updates an existing entry in place rather than duplicating it), THEN `rebuildClone(...)`
@@ -42,6 +43,7 @@ import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { addOverlay } from './daemon-overlays.mjs';
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
+import { resolveVersionedContext, submitRequest, waitForResult } from './daemon-version-runtime.mjs';
 
 /** Throw unless `ref` passes {@link isSafeBranchName} — same argv-injection defense
  *  `daemon-self-sync.mjs#assertSafeBranchName` applies to a POC branch; `--ref` is operator input here, but
@@ -144,6 +146,7 @@ export async function runDaemonLoadOverlay({
   clone, ref, pr = null, base = 'main', dryRun = false, env = process.env, log = console,
   addedBy, reason = null, now,
   addOverlayFn = addOverlay, rebuild = rebuildClone, dryRunRebuildFn = dryRunRebuild,
+  wait = false, waitMs, versions, submit = submitRequest, waitFor = waitForResult,
 }) {
   if (!clone || typeof clone !== 'string') throw new TypeError('daemon-load-overlay: --clone=<path> is required');
   if (!ref || typeof ref !== 'string') throw new TypeError('daemon-load-overlay: --ref=<branch to overlay> is required');
@@ -158,6 +161,19 @@ export async function runDaemonLoadOverlay({
   addOverlayFn(root, {
     ref, pr, addedBy: by, reason, now,
   }, { env });
+  // Card 89 S5: a versioned clone has no lock to take and is never rebuilt from this CLI. The request file is
+  // the daemon's in-tick updater's input; `--wait` blocks on its result file instead of on a clone lock.
+  const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
+  if (vctx) {
+    const requestId = submit(vctx, { ref, pr, by });
+    if (!wait) return { root, ref, homeBranch: base, registered: true, versioned: true, requestId, pending: true };
+    const result = await waitFor(vctx, requestId, waitMs != null ? { timeoutMs: waitMs } : {});
+    return {
+      root, ref, homeBranch: base, registered: true, versioned: true, requestId, request: result,
+      mergedAnything: !!result.moved, adopted: !!result.adopted, reason: result.reason ?? result.status, head: result.head,
+      timedOut: result.status === 'timeout',
+    };
+  }
   const rebuildResult = await rebuild({
     root, env, log, mainOnly: false,
   });
@@ -188,8 +204,10 @@ if (IS_CLI) {
   const reason = typeof flags.reason === 'string' ? flags.reason : null;
   const addedBy = typeof flags.by === 'string' ? flags.by : (process.env.USER || null);
   const dryRun = !!flags['dry-run'];
+  const wait = !!flags.wait;
+  const waitMs = flags['wait-ms'] !== undefined && Number(flags['wait-ms']) > 0 ? Number(flags['wait-ms']) : undefined;
   runDaemonLoadOverlay({
-    clone, ref, pr, base, dryRun, addedBy, reason,
+    clone, ref, pr, base, dryRun, addedBy, reason, wait, waitMs,
   })
     .then((result) => {
       if (flags.json) {
@@ -199,6 +217,10 @@ if (IS_CLI) {
           `daemon-load-overlay --dry-run: ${result.root} onMain=${result.onMain} safe=${result.unsafe?.safe} `
           + `wouldDo=${result.wouldDo} finalSha=${result.plan?.finalSha ?? 'n/a'}\n`,
         );
+      } else if (result.versioned) {
+        process.stdout.write(result.pending
+          ? `daemon-load-overlay: registered ${ref} — versioned clone, request ${result.requestId} queued for the in-tick updater (use --wait to block on its result) (${result.root})\n`
+          : `daemon-load-overlay: registered ${ref} — versioned request ${result.requestId} ${result.timedOut ? 'TIMED OUT' : `answered: ${result.reason}`} (${result.root})\n`);
       } else if (!result.mergedAnything) {
         process.stdout.write(`daemon-load-overlay: registered ${ref} — nothing adopted this pass (${result.reason}) (${result.root})\n`);
       } else if (result.adopted) {
@@ -207,7 +229,7 @@ if (IS_CLI) {
         process.stdout.write(`daemon-load-overlay: registered ${ref} but the rebuild was REJECTED (${result.reason}) at ${result.root}\n`);
       }
       for (const a of result.alerts || []) process.stdout.write(`  ! ${a.kind}\n`);
-      process.exitCode = result.mergedAnything && !result.adopted ? 1 : 0;
+      process.exitCode = (result.mergedAnything && !result.adopted) || result.timedOut ? 1 : 0;
     })
     .catch((e) => {
       process.stderr.write(`daemon-load-overlay: fatal: ${String((e && e.message) || e)}\n`);
