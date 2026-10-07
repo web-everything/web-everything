@@ -823,3 +823,71 @@ describe('findGuardRelaxationGaps — #4409 guard-relaxation Must lines', () => 
     expect(lintBacklogItemRendering({ item: { id: '9', kind: 'story', status: 'resolved' }, body }).warnings.some((w) => /relaxes a refusal/.test(w))).toBe(false);
   });
 });
+
+describe('unfinished executable acceptance beside a mutation-proof claim (#4738)', () => {
+  const PLACEHOLDER = '1. **Executable** — TODO: a command that fails before this item lands and passes after.';
+  const PROOF = 'Mutation proof: remove the boundary and the test fails.';
+  const card = ({ top = PROOF, done = PLACEHOLDER, after = '' } = {}) =>
+    `Add a boundary test.\n\n${top}\n\n## Done when\n\n${done}\n${after}`;
+  const lint = (body, status = 'open') =>
+    lintBacklogItemRendering({ item: { id: '4999', kind: 'story', status }, body });
+  const hits = (body, status) => lint(body, status).errors.filter((e) => /unfinished executable acceptance/.test(e));
+  const F = '```';
+  const T = '~~~';
+
+  it('rejects open mutation-proof cards with unfinished executable acceptance', () => {
+    const { errors, warnings } = lint(card());
+    const hit = errors.filter((e) => /unfinished executable acceptance/.test(e));
+    expect(hit).toHaveLength(1);
+    expect(hit[0]).toContain('"4999"');
+    expect(hit[0]).toMatch(/replace .*TODO: a command/i);
+    expect(warnings.some((w) => /unfinished executable acceptance/.test(w))).toBe(false);
+  });
+  it('matches bold and hyphenated wording', () => {
+    expect(hits(card({ top: '**Mutation proof:** remove the boundary.' }))).toHaveLength(1);
+    expect(hits(card({ top: 'This carries a mutation-proof claim in prose.' }))).toHaveLength(1);
+  });
+  it('matches a subordinate heading and bold/list markup around the placeholder', () => {
+    expect(hits(card({ done: `### Executable\n\n- **TODO: a command** that fails first.` }))).toHaveLength(1);
+    expect(hits(card({ done: `* _TODO: a command_` }))).toHaveLength(1);
+  });
+  it('a real command alongside the placeholder does not suppress the error', () => {
+    expect(hits(card({ done: `${PLACEHOLDER}\n2. **Executable** — \`npx vitest run x.test.mjs\` passes.` }))).toHaveLength(1);
+  });
+  it('the claim may sit after the Done when section', () => {
+    expect(hits(card({ top: '', after: `\n## Proof plan\n\n${PROOF}\n` }))).toHaveLength(1);
+  });
+  it('emits one error per card even with several claims', () => {
+    expect(hits(card({ top: `${PROOF}\n\nMutation proof again.` }))).toHaveLength(1);
+  });
+
+  it('non-open statuses get no new diagnostic', () => {
+    for (const status of ['active', 'preparing', 'parked', 'resolved']) expect(hits(card(), status)).toHaveLength(0);
+  });
+  it('placeholder only, claim only, or a completed command is silent', () => {
+    expect(hits(card({ top: '' }))).toHaveLength(0);
+    expect(hits(card({ done: '1. **Executable** — `npm test` passes.' }))).toHaveLength(0);
+    expect(hits('No proof words here.\n\n## Done when\n\n1. **Executable** — `npm test` passes.\n')).toHaveLength(0);
+  });
+  it('a placeholder outside Done when is ignored; the section ends at the next level-two heading', () => {
+    expect(hits(`${PROOF}\n\n## Progress\n\n${PLACEHOLDER}\n\n## Done when\n\n1. \`npm test\` passes.\n`)).toHaveLength(0);
+    expect(hits(card({ done: '1. `npm test` passes.', after: `\n## Follow-ups\n\n${PLACEHOLDER}\n` }))).toHaveLength(0);
+  });
+  it('fenced examples (backtick and tilde) are ignored for both the claim and the placeholder', () => {
+    expect(hits(card({ top: `${F}\n${PROOF}\n${F}` }))).toHaveLength(0);
+    expect(hits(card({ top: `${T}\n${PROOF}\n${T}` }))).toHaveLength(0);
+    expect(hits(card({ done: `${F}\n${PLACEHOLDER}\n${F}\n1. \`npm test\` passes.` }))).toHaveLength(0);
+    expect(hits(card({ done: `${T}md\n${PLACEHOLDER}\n${T}\n1. \`npm test\` passes.` }))).toHaveLength(0);
+  });
+  it('an inline-code-only mention of mutation proof, or a heading alone, is not a prose claim', () => {
+    expect(hits(card({ top: 'Cases name `mutation proof` wording.' }))).toHaveLength(0);
+    expect(hits(card({ top: '## Mutation proof' }))).toHaveLength(0);
+    expect(hits(card({ top: '### Mutation-proof plan' }))).toHaveLength(0);
+  });
+  it('the real scaffold output is the placeholder source of truth: silent alone, rejected beside a proof claim', async () => {
+    const { renderItem } = await import('../backlog/scaffold.mjs');
+    const body = renderItem({ kind: 'story', size: 3, slug: 'x', title: 'X', digest: 'Add a thing.', today: '2026-07-27' });
+    expect(hits(body)).toHaveLength(0);
+    expect(hits(`${body}\n${PROOF}\n`)).toHaveLength(1);
+  });
+});

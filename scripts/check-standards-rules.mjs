@@ -1127,6 +1127,35 @@ export function findDanglingBacklogRefs(body, knownIds) {
   return gaps;
 }
 
+// ── Unfinished executable acceptance beside a mutation-proof claim (#4738) ───────────────────────────
+// The scaffold emits `TODO: a command` as the `## Done when` placeholder. An OPEN card that still carries it
+// while its prose claims "mutation proof" dresses an unfinished acceptance up as a proven one → hard error.
+// Scan is one fence-aware pass (backtick AND tilde fences; inline code stripped): the placeholder counts only
+// inside `## Done when` (to the next level-two heading, subordinate headings included); the claim counts on any
+// non-heading prose line. Literal match only — no attempt to judge whether other commands are executable.
+const UNFINISHED_ACCEPTANCE_RE = /TODO:\s*a command/i;
+const MUTATION_PROOF_CLAIM_RE = /mutation[- ]proof/i;
+
+function hasUnfinishedAcceptanceBesideProofClaim(body) {
+  let fenceChar = null, fenceLen = 0;
+  let inDoneWhen = false, placeholder = false, claim = false;
+  for (const line of String(body ?? '').split(/\r?\n/)) {
+    const fm = /^\s*(`{3,}|~{3,})/.exec(line);
+    if (fenceChar) {
+      if (fm && fm[1][0] === fenceChar && fm[1].length >= fenceLen) { fenceChar = null; fenceLen = 0; }
+      continue;
+    }
+    if (fm) { fenceChar = fm[1][0]; fenceLen = fm[1].length; continue; }
+    const h2 = /^##\s+(.*)$/.exec(line);
+    if (h2) { inDoneWhen = /^done when\b/i.test(h2[1].trim()); continue; }
+    if (/^#{1,6}\s/.test(line)) continue; // a heading is never a prose claim
+    const prose = line.replace(/`[^`]*`/g, '');
+    if (inDoneWhen && UNFINISHED_ACCEPTANCE_RE.test(prose)) placeholder = true;
+    if (MUTATION_PROOF_CLAIM_RE.test(prose)) claim = true;
+  }
+  return placeholder && claim;
+}
+
 // ── Per-item backlog RENDERING lint (#845) ────────────────────────────────────
 // The structural/rendering checks that operate on ONE backlog item in isolation — no registry/cross-item
 // context needed, so they're cheap enough to run on every edit (a scoped `check:standards --item NNN`
@@ -1191,6 +1220,13 @@ export function lintBacklogItemRendering({ item, body, pocRegistry = null, known
         `already resolved or deferred elsewhere, reframe the heading or cite the decision (#NNN). ` +
         `See docs/agent/backlog-workflow.md → the carve rule.`);
     }
+  }
+
+  // Unfinished executable acceptance beside a mutation-proof claim (#4738) — ERROR, exactly-open cards only.
+  if (item.status === 'open' && hasUnfinishedAcceptanceBesideProofClaim(body)) {
+    errors.push(`Backlog item "${id}" has unfinished executable acceptance beside a mutation-proof claim — its ## Done when ` +
+      `still carries the scaffold placeholder, and a proof narrative must not disguise it. ` +
+      `Replace "TODO: a command" with a concrete command/test that fails before the item lands and passes after.`);
   }
 
   // Test-plan gaps (#4332) — WARNING only, open/active cards (the resolved corpus predates the rule).
