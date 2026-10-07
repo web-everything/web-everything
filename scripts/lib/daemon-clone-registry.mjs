@@ -34,7 +34,7 @@
  * the seed list or the daemon's own first overlay catches up).
  */
 
-import { readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { readdirSync, readFileSync, realpathSync, unlinkSync, appendFileSync } from 'node:fs';
 import path from 'node:path';
 import { homedir } from 'node:os';
 
@@ -68,31 +68,77 @@ function realpathOrResolve(p) {
   try { return realpathSync(p); } catch { return path.resolve(p); }
 }
 
-/**
- * Every `.clone` this machine's daemon-overlay state has ever recorded (`~/.claude/daemon-overlays/*.json`,
- * written by `daemon-overlays.mjs#writeOverlays`), realpath'd. A missing dir, an unreadable file, or a
- * corrupt/wrong-shaped JSON is skipped — this is ADDITIVE ONLY (the seed list stands on its own), so a
- * partial or absent state directory can only under-protect relative to a fully-populated one, never wedge
- * the guard. Mirrors `daemon-overlays.mjs#readOverlayState`'s own fail-closed-per-file, fail-open-overall
- * shape without importing it (that module's read path throws on a corrupt LIST WRITE, which is the wrong
- * failure mode for a read-only registry scan).
- * @param {NodeJS.ProcessEnv} [env]
- * @returns {string[]}
- */
-function overlayRegisteredClones(env = process.env) {
-  const dir = (typeof env?.WE_DAEMON_OVERLAY_DIR === 'string' && env.WE_DAEMON_OVERLAY_DIR.trim())
+function overlayDirOf(env = process.env) {
+  return (typeof env?.WE_DAEMON_OVERLAY_DIR === 'string' && env.WE_DAEMON_OVERLAY_DIR.trim())
     || path.join(homedir(), '.claude', 'daemon-overlays');
+}
+
+function seedRoots(workspace) {
+  return DAEMON_CLONE_SEED.map((rel) => realpathOrResolve(path.join(workspace, rel)));
+}
+
+/**
+ * THE ONE PREDICATE (item 116). Does an overlay-state record make its `.clone` a daemon clone? Only when it is
+ * a known daemon clone (a seed root) OR it carries a non-empty overlay list — AND it is not a path under the
+ * lane pool (`<workspace>/.lanes/`, seed roots excepted: the drain's own clone lives there). A stale record
+ * (empty list, or a pool lane such as one leaked by an old overlay `add`) therefore NEVER protects its path,
+ * so `guard-lane` cannot lock an ordinary leased lane out of its own edits.
+ * PURE. Returns `{live:true}` or `{live:false, reason}`.
+ * @param {{clone?:unknown, overlays?:unknown}|null} record  parsed state file
+ * @param {string} workspace
+ * @returns {{live:boolean, reason?:string}}
+ */
+export function classifyOverlayRecord(record, workspace) {
+  if (!record || typeof record.clone !== 'string' || !record.clone) return { live: false, reason: 'no clone path' };
+  const real = realpathOrResolve(record.clone);
+  if (isDaemonCloneRealpath(real, seedRoots(workspace))) return { live: true };
+  const pool = path.join(realpathOrResolve(workspace), '.lanes');
+  if (isDaemonCloneRealpath(real, [pool])) return { live: false, reason: `path is under the lane pool (${pool}); a pool lane is never a daemon clone` };
+  if (!Array.isArray(record.overlays) || record.overlays.length === 0) return { live: false, reason: 'empty overlay list and not a known daemon clone' };
+  return { live: true };
+}
+
+function readRecords(env) {
+  const dir = overlayDirOf(env);
   const out = [];
   let entries;
   try { entries = readdirSync(dir); } catch { return out; }
   for (const name of entries) {
     if (!name.endsWith('.json')) continue; // skips the sibling `.events.jsonl` audit trail too
     try {
-      const parsed = JSON.parse(readFileSync(path.join(dir, name), 'utf8'));
-      if (parsed && typeof parsed.clone === 'string' && parsed.clone) out.push(parsed.clone);
+      const file = path.join(dir, name);
+      out.push({ file, record: JSON.parse(readFileSync(file, 'utf8')) });
     } catch { /* corrupt/partial file — skip it, fail-open */ }
   }
   return out;
+}
+
+/** Clones recorded by LIVE overlay-state records only (see `classifyOverlayRecord`). Fail-open, additive. */
+function overlayRegisteredClones(workspace, env = process.env) {
+  return readRecords(env)
+    .filter(({ record }) => classifyOverlayRecord(record, workspace).live)
+    .map(({ record }) => record.clone);
+}
+
+/**
+ * Self-heal: drop every stale overlay-state record (the `.json`; the `.events.jsonl` audit trail is kept and
+ * gets a `stale-record-dropped` line carrying the reason). Called by the overlay CLI. Never throws.
+ * @returns {Array<{file:string, clone:string, reason:string}>} what was dropped
+ */
+export function pruneStaleOverlayRecords(workspace, { env = process.env, log = (m) => process.stderr.write(`${m}\n`) } = {}) {
+  const dropped = [];
+  for (const { file, record } of readRecords(env)) {
+    const c = classifyOverlayRecord(record, workspace);
+    if (c.live) continue;
+    try {
+      unlinkSync(file);
+      const entry = { file, clone: record?.clone ?? null, reason: c.reason };
+      dropped.push(entry);
+      try { appendFileSync(file.replace(/\.json$/, '.events.jsonl'), JSON.stringify({ at: new Date().toISOString(), event: 'stale-record-dropped', clone: entry.clone, reason: entry.reason }) + '\n'); } catch { /* audit best-effort */ }
+      log(`daemon-overlay: dropped stale record ${path.basename(file)} (${entry.clone}): ${entry.reason}`);
+    } catch { /* fail-open */ }
+  }
+  return dropped;
 }
 
 /**
@@ -105,7 +151,7 @@ function overlayRegisteredClones(env = process.env) {
  */
 export function daemonCloneRoots(workspace, { env = process.env } = {}) {
   const seeded = DAEMON_CLONE_SEED.map((rel) => path.join(workspace, rel));
-  const discovered = overlayRegisteredClones(env);
+  const discovered = overlayRegisteredClones(workspace, env);
   const all = seeded.concat(discovered).map(realpathOrResolve);
   return Array.from(new Set(all));
 }

@@ -7,13 +7,13 @@
  *   `<primary>/agent-memory-src/`), must be denied and routed to a lane.
  */
 import { describe, it, expect, afterAll } from 'vitest';
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, existsSync, rmSync, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { laneGuardDecision, resolveReal, workspaceRootOf } from '../guard-lane.mjs';
-import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
+import { daemonCloneRoots, classifyOverlayRecord, pruneStaleOverlayRecords } from '../lib/daemon-clone-registry.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -419,7 +419,7 @@ describe('#xpt9fvd — the guard-lane CLI protects a clone discovered via the da
   const fakeClone = path.join(root, 'some-new-daemon-clone'); // deliberately NOT in DAEMON_CLONE_SEED
   mkdirSync(overlayDir, { recursive: true });
   mkdirSync(fakeClone, { recursive: true });
-  writeFileSync(path.join(overlayDir, 'abc123.json'), JSON.stringify({ clone: fakeClone, overlays: [] }));
+  writeFileSync(path.join(overlayDir, 'abc123.json'), JSON.stringify({ clone: fakeClone, overlays: [{ ref: 'lane/x', pr: null }] }));
 
   const runHook = (targetFile) => {
     mkdirSync(path.dirname(targetFile), { recursive: true });
@@ -441,5 +441,46 @@ describe('#xpt9fvd — the guard-lane CLI protects a clone discovered via the da
 
   it('exits 0 (allow) for an unrelated file elsewhere', () => {
     expect(runHook(path.join(root, 'unrelated', 'x.md')).code).toBe(0);
+  });
+
+  // item 116 — stale records must not lock anything out.
+  it('an EMPTY-overlay record does not make its path a daemon clone', () => {
+    const empty = path.join(root, 'empty-clone');
+    mkdirSync(empty, { recursive: true });
+    writeFileSync(path.join(overlayDir, 'empty.json'), JSON.stringify({ clone: empty, overlays: [] }));
+    expect(runHook(path.join(empty, 'notes.md')).code).toBe(0);
+  });
+
+  it('a record naming a POOL LANE never makes it a daemon clone, even with overlays', () => {
+    const ws = path.join(root, 'ws116');
+    const lane = path.join(ws, '.lanes', 'web-everything', 'lane-9');
+    mkdirSync(lane, { recursive: true });
+    for (const [n, overlays] of [['pool-empty', []], ['pool-full', [{ ref: 'lane/x', pr: 1 }]]]) {
+      writeFileSync(path.join(overlayDir, `${n}.json`), JSON.stringify({ clone: lane, overlays }));
+    }
+    expect(daemonCloneRoots(ws, { env: { WE_DAEMON_OVERLAY_DIR: overlayDir } })).not.toContain(lane);
+    expect(classifyOverlayRecord({ clone: lane, overlays: [{ ref: 'a' }] }, ws).live).toBe(false);
+  });
+
+  it('the drain daemon seed clone under .lanes stays protected; a real overlay clone stays protected', () => {
+    const ws = path.join(root, 'ws116b');
+    const drain = path.join(ws, '.lanes', 'we-drain-daemon', 'lane-1');
+    mkdirSync(drain, { recursive: true });
+    expect(classifyOverlayRecord({ clone: drain, overlays: [] }, ws).live).toBe(true);
+    expect(classifyOverlayRecord({ clone: fakeClone, overlays: [{ ref: 'a' }] }, ws).live).toBe(true);
+  });
+
+  it('pruneStaleOverlayRecords drops stale records with a logged reason and keeps live ones', () => {
+    const dir = path.join(root, 'prune-state');
+    mkdirSync(dir, { recursive: true });
+    const ws = path.join(root, 'ws116c');
+    writeFileSync(path.join(dir, 'stale.json'), JSON.stringify({ clone: path.join(ws, '.lanes', 'web-everything', 'lane-9'), overlays: [] }));
+    writeFileSync(path.join(dir, 'live.json'), JSON.stringify({ clone: fakeClone, overlays: [{ ref: 'a' }] }));
+    const logs = [];
+    const dropped = pruneStaleOverlayRecords(ws, { env: { WE_DAEMON_OVERLAY_DIR: dir }, log: (m) => logs.push(m) });
+    expect(dropped.map((d) => path.basename(d.file))).toEqual(['stale.json']);
+    expect(logs.join('\n')).toMatch(/dropped stale record stale\.json.*lane pool/);
+    expect(existsSync(path.join(dir, 'stale.json'))).toBe(false);
+    expect(existsSync(path.join(dir, 'live.json'))).toBe(true);
   });
 });
