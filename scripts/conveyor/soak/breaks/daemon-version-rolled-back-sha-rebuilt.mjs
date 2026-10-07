@@ -39,7 +39,7 @@ export default {
         rt = await import(join(TREE, 'scripts/lib/daemon-version-runtime.mjs'));
         sw = await import(join(TREE, 'scripts/lib/daemon-version-switch.mjs'));
       } catch (e) { v('crash', String(e?.message ?? e)); return { violations }; }
-      const git = (cwd, ...a) => execFileSync('git', ['-C', cwd, ...a], { encoding: 'utf8' }).trim();
+      const git = (cwd, ...a) => execFileSync('git', ['-C', cwd, ...a], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).trim();
       const origin = join(fixture, 'origin.git');
       git(fixture, 'init', '--quiet', '--bare', '-b', 'main', origin);
       const work = join(fixture, 'work');
