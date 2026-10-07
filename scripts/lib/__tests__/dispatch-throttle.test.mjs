@@ -12,10 +12,10 @@ import { runReconcileCiHealDispatch } from '../../operations/ci-heal-pr-dispatch
 const claim = (kind, pr) => ({ meta: { kind, pr, repo: 'we' } });
 
 describe('declared settings', () => {
-  it('defaults: fix cap 2, 2.0 load/core, heavy cap 2; env overrides; junk falls back', () => {
+  it('defaults: fix cap 2, 2.0 load/core, heavy cap 3; env overrides; junk falls back', () => {
     expect(resolveFixDispatchMaxConcurrent({ env: {} })).toBe(2);
     expect(resolveMaxLoadPerCore({ env: {} })).toBe(2);
-    expect(resolveHeavyAdmissionCap({ env: {} })).toBe(2);
+    expect(resolveHeavyAdmissionCap({ env: {} })).toBe(3);
     expect(resolveFixDispatchMaxConcurrent({ env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '4' } })).toBe(4);
     expect(resolveMaxLoadPerCore({ env: { WE_MAX_LOAD_PER_CORE: '1.5' } })).toBe(1.5);
     expect(resolveFixDispatchMaxConcurrent({ env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '0' } })).toBe(2);
