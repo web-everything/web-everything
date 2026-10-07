@@ -2,7 +2,7 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
-  findCarriedOperatorRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
+  findCarriedOperatorRuling, findCarriedReviewerRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
   findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
@@ -843,8 +843,12 @@ export function createReviewPrSinks({
                 || (stillPending && record.rulings.some(r => r.key === f.key) && !stillPending.has(f.key))
                 || operatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
                   && o.head === record.head && o.runId === record.runId && o.key === f.key)) continue;
+              // #76c — else the mandatory reviewer's own counted not-real/card on the same deterministic finding
+              // identity (never a block, never a declared link); the same unchanged-lines proof applies below.
               const match = findCarriedOperatorRuling(f, { records, operatorRulings,
-                head: record.head, repo: record.repo, pr: record.pr });
+                head: record.head, repo: record.repo, pr: record.pr })
+                ?? findCarriedReviewerRuling(f, { records, operatorRulings, head: record.head, repo: record.repo,
+                  pr: record.pr, body: state.body ?? '', createdAt: state.createdAt ?? '', cardReadable });
               if (!match) continue;
               // `referralRecordState` keeps a carried `card` pending while its card is unreadable, yet `liveReferrals`
               // drops a carried finding from dispatch: that pairing would hold the gate with no reviewer to clear it.
@@ -873,7 +877,7 @@ export function createReviewPrSinks({
             existing[i] = updated;
             for (const c of carried) {
               const f = record.referrals.find(f => f.key === c.key).finding;
-              out(`referral carried: ${f.file ?? ''}${f.line == null ? '' : `:${f.line}`} — operator ${c.result} from ${c.from.head.slice(0, 8)} stands (cited lines unchanged)`);
+              out(`referral carried: ${f.file ?? ''}${f.line == null ? '' : `:${f.line}`} — ${c.from.rulingId !== undefined ? 'reviewer' : 'operator'} ${c.result} from ${c.from.head.slice(0, 8)} stands (cited lines unchanged)`);
             }
           }
         }

@@ -1189,6 +1189,49 @@ describe('#4315 durable referral effects', () => {
     expect(result.pending).toContain(current.referrals[0].key);
   });
 
+  // #76c — the mandatory reviewer's OWN earlier counted ruling carries onto the same finding (moved line, same
+  // identity) on the new head, with no operator involved, and never a block, never over changed cited lines.
+  const reviewerCarryHarness = (h, result, { curLine = 12, card } = {}) => {
+    h.payload.referrals[0].original.line = 12;
+    h.payload.referrals[0].original.quote = 'await withListLock(() => writeHeld(list));';
+    const old = seedReferrals(h, ['judgeCorrectnessAdvisory'], 'c'.repeat(40), (r) => [{
+      id: 'earlier-run:0', key: r.referrals[0].key, reviewerId: r.reviewer.id, lens: r.reviewer.lens, result,
+      rationale: 'Checked the diff', evidence: ['diff:x'], ...(card ? { card } : {}) }]);
+    const original = { ...old.referrals[0].original, line: curLine, summary: 'Reworded: two runs can file one held card twice' };
+    const current = { ...old, head: h.state.headRefOid, runId: 'current', rulings: [],
+      referrals: [{ seat: 'judgeCorrectnessAdvisory', original, finding: normalizeFinding(original),
+        key: referralFindingKey('judgeCorrectnessAdvisory', original) }],
+      reviewer: mandatoryReferralReviewer('current'), attempted: false };
+    h.state.comments.push({ body: renderReferralRecord(current), author: { login: 'web-everything' } });
+    return { old, current };
+  };
+
+  it.each(['not-real', 'card'])('carries the reviewer\'s own earlier %s ruling onto a re-worded finding with unchanged lines', async (result) => {
+    const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    const { current } = reviewerCarryHarness(h, result, { card: result === 'card' ? 'we:backlog/7-filed.md' : undefined });
+    const out = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const latest = readReferralRecords(h.state.comments).records.find(r => r.runId === 'current');
+    expect(latest.carried).toHaveLength(1);
+    expect(latest.carried[0]).toMatchObject({ result, from: { rulingId: 'earlier-run:0', runId: 'earlier-run' } });
+    expect(h.judge).not.toHaveBeenCalled();           // one ruling stands: the reviewer is not asked again
+    expect(out.pending).toEqual([]);
+    expect(h.lines.join('\n')).toContain('reviewer ' + result);
+    expect(current.referrals[0].key).toBe(latest.referrals[0].key);
+  });
+
+  it('never carries a reviewer BLOCK, and not a not-real over changed cited lines', async () => {
+    const blocked = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    const b = reviewerCarryHarness(blocked, 'block');
+    await blocked.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](blocked.payload, CTX);
+    expect(readReferralRecords(blocked.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
+    const changed = harness({ failure: 'omitted', readChangedLines: () => new Set([12]) });
+    const c = reviewerCarryHarness(changed, 'not-real');
+    const out = await changed.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](changed.payload, CTX);
+    expect(readReferralRecords(changed.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
+    expect(out.pending).toContain(c.current.referrals[0].key);
+    expect(b.current.referrals[0].key).toBeTruthy();
+  });
+
   // A real top-level `a/` directory is a real path: the compare lookup must use the cited path as written, never
   // a diff-prefix-stripped alias that may name a different (root) file.
   it('looks a carried finding up by its exact cited path, and never carries across a diff-prefix alias', async () => {

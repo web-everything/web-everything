@@ -2697,6 +2697,77 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
   return null;
 }
 
+// ── #76c — THE REVIEWER'S OWN not-real / card RULING STANDS ACROSS HEADS ────────────────────────────────────────
+// #4017 was re-ruled ~60 times: every push re-raised the same finding (new line, new wording) and a fresh reviewer
+// pass ruled it again, sometimes the other way a minute later. Operator rulings already carried (above); the
+// mandatory reviewer's own did not. This carries a COUNTED reviewer `not-real` or `card` onto the same finding on a
+// later head — same finding means the DETERMINISTIC identity of #76a (same path, lens, and claim or quote anchor),
+// never a declared `sameAs` (a link only ever tightens) and never text similarity — and the sink still proves the
+// cited lines unchanged before it writes the carry. A BLOCK is never carried: it is only ever held (`linkedBlocked`)
+// and any block on the finding's id, on any later record or by the operator, withdraws a carried clearance.
+
+/**
+ * The earlier reviewer ruling that still backs a reviewer-backed `carried` entry (`from.rulingId`), or null. It
+ * stands only while: the source record carries that ruling on that key with the carried result (and card); the gate
+ * COUNTS it on its own head (independent clearer, readable card — the test every ruling passes); nothing supersedes
+ * it; and no `block` has been ruled on the finding's id since — in a later record or by the operator. ONE definition
+ * for the gate (`referralRecordState`) and the sink (`findCarriedReviewerRuling`), so they cannot disagree. PURE.
+ */
+export function reviewerCarryBacking(carried, { records = [], operatorRulings = [], repo, pr, identityTable = null, ...options } = {}) {
+  const from = carried?.from;
+  if (!from || typeof from.rulingId !== 'string' || !['not-real', 'card'].includes(carried.result)) return null;
+  const list = Array.isArray(records) ? records : [];
+  const index = list.findIndex(r => r.head === from.head && r.runId === from.runId && r.repo === repo && r.pr === pr);
+  const source = list[index];
+  const ruling = source?.rulings.find(x => x.id === from.rulingId && x.key === from.key);
+  if (!ruling || ruling.result !== carried.result || (ruling.result === 'card' && ruling.card !== carried.card)) return null;
+  if (source.rulings.some(x => supersededRulings(x).includes(ruling.id))) return null;
+  // Counted on ITS OWN head, without recursing into the source's own carries or links.
+  const own = referralRecordState({ ...source, carried: undefined }, { ...options, head: source.head, records: [],
+    operatorRulings, linkedBlocked: null, identityTable: null });
+  if (!own.rulings.includes(ruling)) return null;
+  const table = identityTable ?? findingIdentityTable(list);
+  const id = findingIdOf(table, { head: source.head, runId: source.runId, key: from.key });
+  if (!id) return null;
+  const sameId = (head, runId, key) => findingIdOf(table, { head, runId, key }) === id;
+  for (const later of list.slice(index + 1)) {
+    if (later.repo !== repo || later.pr !== pr) continue;
+    if (later.referrals.some(f => sameId(later.head, later.runId, f.key)
+      && later.rulings.some(x => x.key === f.key && x.result === 'block'))) return null;
+  }
+  if ((Array.isArray(operatorRulings) ? operatorRulings : []).some(o => o.repo === repo && o.pr === pr
+    && o.result === 'block' && sameId(o.head, o.runId, o.key))) return null;
+  return ruling;
+}
+
+/**
+ * The earlier counted reviewer `not-real`/`card` ruling a referral on a new head inherits, or null. The LATEST
+ * ruling on the same deterministic identity decides: if it is not a clearance (a `block`), nothing carries. The
+ * caller must still prove the cited lines unchanged ({@link findCarriedOperatorRuling}'s same obligation). PURE.
+ */
+export function findCarriedReviewerRuling(referral, { records = [], operatorRulings = [], head, repo, pr, ...options } = {}) {
+  const target = normalizeFindingIdentity(referral.original ?? referral.finding);
+  if (!target) return null;
+  const list = Array.isArray(records) ? records : [];
+  const identityTable = findingIdentityTable(list);
+  for (let i = list.length - 1; i >= 0; i--) {
+    const r = list[i];
+    if (r.head === head || r.repo !== repo || r.pr !== pr) continue;
+    for (const ruling of [...r.rulings].reverse()) {
+      const g = r.referrals.find(f => f.key === ruling.key);
+      if (!g || !sameFindingIdentity(normalizeFindingIdentity(g.original ?? g.finding), target)) continue;
+      // The latest ruling on this finding decides, whatever it said: a block (or an unlike severity) ends the search.
+      if (!['not-real', 'card'].includes(ruling.result)
+        || !CARRY_SEVERITY_FIELDS.every(k => g.finding[k] === referral.finding[k])) return null;
+      const entry = { result: ruling.result, ...(ruling.card ? { card: ruling.card } : {}),
+        from: { head: r.head, runId: r.runId, key: ruling.key, rulingId: ruling.id } };
+      return reviewerCarryBacking(entry, { ...options, records: list, operatorRulings, repo, pr, identityTable })
+        ? { ...entry, finding: g.finding } : null;
+    }
+  }
+  return null;
+}
+
 /** Versioned snapshot of the append-only referral history, mirrored into the jury ledger. */
 export function validateReferralRecord(r) {
   try {
@@ -2734,6 +2805,8 @@ export function validateReferralRecord(r) {
         || !c.from || !/^[a-f0-9]{40}$/.test(c.from.head) || c.from.head === r.head
         || typeof c.from.runId !== 'string' || !c.from.runId.trim()
         || typeof c.from.key !== 'string' || !c.from.key.trim()
+        // #76c — a reviewer-backed carry names the ruling it stands on, and is never a block.
+        || (c.from.rulingId !== undefined && (typeof c.from.rulingId !== 'string' || !c.from.rulingId.trim() || c.result === 'block'))
         || !['block', 'card', 'not-real'].includes(c.result)
         || (c.result === 'card' ? !/^we:backlog\/[^/]+\.md$/.test(c.card ?? '') : c.card !== undefined)))) return false;
     const ids = new Set();
@@ -2813,7 +2886,10 @@ export function referralRecordState(record, options = {}) {
     const counted = active.length > 0 && ((outcomes.size === 1 && !cardUnreadable) || active.some(r => r.result === 'block'));
     const carried = counted ? undefined : (record.carried ?? []).find(c => c.key === f.key);
     if (carried) {
-      const backing = carriedBackingHolds(carried, { repo: record.repo, pr: record.pr, operatorRulings });
+      const backing = carried.from.rulingId !== undefined
+        ? reviewerCarryBacking(carried, { repo: record.repo, pr: record.pr, operatorRulings, records, identityTable,
+          body, createdAt, cardReadable, stampPolicy, seatDisabled })
+        : carriedBackingHolds(carried, { repo: record.repo, pr: record.pr, operatorRulings });
       if (head !== record.head || !backing
         || (carried.result === 'card' && !cardReadable(carried.card))) pending.push(f.key);
       else { rulings.push(backing); if (carried.result === 'block') blocked.push(f.key); }
@@ -2900,7 +2976,7 @@ export function renderReferralRecord(record) {
     + `CONFIRMED broken/unrecoverable findings require a finding-specific block/card/not-real ruling.\n`
     + record.referrals.map(f => `- ${f.key}: ${f.finding.summary}`).join('\n')
     + (record.superseded ?? []).map(s => `\n- ${s.key}: ${s.reason} (by run ${s.by.runId})`).join('')
-    + (record.carried ?? []).map(c => `\n- ${c.key}: ${c.reason} (operator ${c.result}, from ${c.from.head}, run ${c.from.runId})`).join('')
+    + (record.carried ?? []).map(c => `\n- ${c.key}: ${c.reason} (${c.from.rulingId !== undefined ? 'reviewer' : 'operator'} ${c.result}, from ${c.from.head}, run ${c.from.runId})`).join('')
     + (record.dropped ?? []).map(d => `\n- ${d.key}: ${d.reason}`).join('')
     + `\nAttempt recorded: ${record.attempted}. Reason: ${record.failure ?? (referralRecordState(record).pending.length ? 'mandatory finding-specific review required' : 'finding-specific rulings recorded')}. Rulings: ${JSON.stringify(record.rulings)}\n`
     + `Record any missing finding-specific rulings with the mandatory reviewer identified above, retaining prior rulings and explicit supersedes IDs. Then start a fresh review-pr --pr=${record.pr} --repo=${record.repo}; it reuses this PR record without another automated attempt. card requires a readable backlog reference.\n`
