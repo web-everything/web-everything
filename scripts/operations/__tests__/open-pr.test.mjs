@@ -119,7 +119,7 @@ describe('planOpen — the home\'s rules as a pre-flight, and nothing more', () 
   it('does NOT re-decide the lane-verification gate — that has one home', () => {
     const plan = planOpen(good());
     expect(Object.keys(plan).sort())
-      .toEqual(['argv', 'base', 'bodyFile', 'dryRun', 'mode', 'parkLabel', 'ref', 'requireVerified', 'sha', 'skipPrePrReview', 'title']);
+      .toEqual(['actor', 'argv', 'base', 'bodyFile', 'dryRun', 'mode', 'operatorInstruction', 'parkLabel', 'ref', 'requireVerified', 'sha', 'skipPrePrReview', 'title']);
     // No marker, no verdict, no gate decision — only the caller's own request, echoed back.
     expect(plan.requireVerified).toBe(false);
     expect(JSON.stringify(plan)).not.toMatch(/marker|break-glass|verifyGate/i);
