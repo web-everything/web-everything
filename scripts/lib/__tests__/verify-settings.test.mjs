@@ -33,6 +33,13 @@ describe('verify settings', () => {
     expect(verifyRelatedMode({})).toBe('import-only');
   });
 
+  it('card-only skipping defaults to disabled without file or environment configuration', () => {
+    expect(BUILT_IN_VERIFY_SETTINGS.skipLocalForCardOnly).toBe(false);
+    const resolved = resolveVerifySettings({ fileConfig: {}, env: {} });
+    expect(resolved.values.skipLocalForCardOnly).toBe(false);
+    expect(resolved.sources.skipLocalForCardOnly).toBe('default');
+  });
+
   it('defaults the shipped standards policy to auto with no env, and env always still forces it', () => {
     const fileConfig = loadVerifySettingsFile(defaultVerifySettingsPath());
     expect(resolveVerifySettings({ fileConfig, env: {} }).values.standards).toBe('auto');

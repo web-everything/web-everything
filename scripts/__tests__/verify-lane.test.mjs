@@ -120,6 +120,19 @@ describe('verify-lane — card-only diff skips the local gate (skipLocalForCardO
     const onDisk = JSON.parse(readFileSync(marker(), 'utf8'));
     expect(onDisk).toMatchObject({ status: 'green', sha: headSha(), skipped: 'card-only' });
   });
+  // The fix / ci-heal reproduce-and-confirm gate (`gateFor` → `verify-lane run`): a card-only PR is CI-red exactly
+  // when CI's full check:standards fails on a card, so a no-op green here would hide the red from the agent that is
+  // meant to reproduce it. Only the marker-producing modes may skip.
+  it('`run` mode is NOT skipped on a card-only diff: the real gate command is resolved and no skip marker is written', () => {
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    commitFile('backlog/zz1-card.md');
+    const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000, env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot } });
+    const out = `${r.stdout}\n${r.stderr}`;
+    expect(out).not.toContain('card-only-skip');
+    expect(out).not.toContain('local gate skipped');
+    expect(out).toContain('check:standards');
+    expect(existsSync(marker())).toBe(false);
+  });
   it('a diff that also touches code is NOT skipped (no card-only marker)', () => {
     git('update-ref', 'refs/remotes/origin/main', 'HEAD');
     commitFile('backlog/zz1-card.md');

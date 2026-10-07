@@ -290,7 +290,7 @@ export function phaseAdmissionKind({ phase, decision, standardsScoped, env, file
  * @param {{base?: string, runGit: (args:string[]) => string, env?: Record<string,string|undefined>, scripts?: Iterable<string>|null, fileExists?: (repoRelativePath: string) => boolean}} args
  * @returns {{ command: string, gateReasons: string[], decision: import('../readiness/test-selection.mjs').SelectionDecision & {changedFiles: string[]|null} }}
  */
-export function resolveDefaultGate({ base = 'origin/main', runGit, env = process.env, scripts, fileExists, readRepoFile, fileConfig = defaultFileConfig } = {}) {
+export function resolveDefaultGate({ base = 'origin/main', runGit, env = process.env, scripts, fileExists, readRepoFile, fileConfig = defaultFileConfig, allowCardOnlySkip = true } = {}) {
   // xpnhz4o — the changed set is the WORKING TREE against the pinned merge-base (tracked edits, staged or not,
   // plus untracked files), not HEAD's committed diff. The gate runs against the working tree, so that is the set
   // it must key on — and a fixer runs the gate BEFORE committing, which under the old "dirty ⇒ full" rule (#3389)
@@ -300,7 +300,9 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
   const timeoutFlags = scaledTimeoutFlags(testTimeoutFactor);
   const diff = localChangedSet({ base, runGit });
   const changedFiles = diff ? diff.changedFiles : null;
-  if (settings.skipLocalForCardOnly && localDiffIsCardOnly({ base, runGit })) {
+  // `allowCardOnlySkip: false` is verify-lane `run` mode — the fix / ci-heal reproduce-and-confirm gate, which must
+  // actually run on a card-only PR that is CI-red; only the marker-producing modes may skip.
+  if (allowCardOnlySkip && settings.skipLocalForCardOnly && localDiffIsCardOnly({ base, runGit })) {
     return { command: CARD_ONLY_SKIP_GATE, gateReasons: ['card-only diff (CI\'s definition) - local gate skipped; CI runs the full check:standards and stays the merge authority'],
       decision: { mode: 'card-only-skip', reasons: ['card-only diff'], changedFiles, standards: { policy: settings.standards, run: false, scoped: false, reason: 'skipped (card-only: CI runs check:standards)' },
         settingsSource, relatedMode, referencedTests: [], targets: [], relatedFiles: [], triggerFiles: [], deletedSourceFiles: [] } };

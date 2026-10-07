@@ -1130,6 +1130,12 @@ describe('skipLocalForCardOnly — card-only diffs skip the local gate (CI keeps
     expect(r.decision.mode).not.toBe('card-only-skip');
     expect(r.command).toContain('check:standards');
   });
+  it('allowCardOnlySkip: false (verify-lane `run` mode) resolves the real gate even with the knob on', () => {
+    const r = resolveDefaultGate({ runGit: gitFor(['backlog/a.md']), env: {}, fileConfig: on, allowCardOnlySkip: false });
+    expect(r.decision.mode).not.toBe('card-only-skip');
+    expect(r.command).not.toBe(CARD_ONLY_SKIP_GATE);
+    expect(r.command).toContain('check:standards');
+  });
   it('the env override WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY=0 turns it off', () => {
     const r = resolveDefaultGate({ runGit: gitFor(['backlog/a.md']), env: { WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '0' }, fileConfig: on });
     expect(r.decision.mode).not.toBe('card-only-skip');
