@@ -74,8 +74,8 @@
  */
 
 import { randomUUID, createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { cpus, homedir, loadavg } from 'node:os';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpus, homedir, loadavg, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runBounded, resolveChildTimeoutMs, resolveLaneAcquireTimeoutMs } from './bounded-child.mjs';
 import { buildGhShimSettingsEnv, sanitizeSpawnEnv } from './gh-app-shim.mjs';
@@ -567,12 +567,17 @@ export const DISPATCH_DRY_RUN_CODE_ENTRIES = Object.freeze([
 
 async function checkDispatchDryRun({ root, budgets, runChild, env }) {
   let out;
+  // The stubbed dispatchers still reach the real fix-loop ledger append; an isolated ledger keeps the smoke's
+  // stub sessions from counting as real repair attempts on live PRs (#4194: 3 stub rows => fix-loop-hold).
+  const ledgerDir = mkdtempSync(join(tmpdir(), 'smoke-fix-loop-'));
   try {
     out = await runChild('node', ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT], {
-      cwd: root, timeoutMs: budgets.dispatchDryRunMs, env,
+      cwd: root, timeoutMs: budgets.dispatchDryRunMs, env: { ...env, WE_FIX_LOOP_LEDGER: join(ledgerDir, 'ledger.jsonl') },
     });
   } catch (e) {
     return { ok: false, detail: `dispatch dry-run child failed: ${failureLine(e)}` };
+  } finally {
+    try { rmSync(ledgerDir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
   let parsed;
   try {
