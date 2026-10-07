@@ -5,13 +5,15 @@
  * and the run.mjs operations are a recording double.
  */
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { withNarrowClone } from './helpers/real-repo.mjs';
-import { admitCard } from '../card-batch-io.mjs';
+import { acquireLease, admitCard } from '../card-batch-io.mjs';
 import { atomicRecord } from '../card-batch-io.mjs';
-import { attributeFindings, extractCard, findBatchState, isCardBatchRef } from '../card-batch-extract.mjs';
+import { HOLD_LABEL } from '../card-batch-seal-io.mjs';
+import { planSeal } from '../card-batch-seal.mjs';
+import { attributeFindings, extractCard, findBatchState, isCardBatchRef, pushArgs } from '../card-batch-extract.mjs';
 
 const CARDS = [['5201', 'one'], ['5202', 'two'], ['5203', 'three']];
 const members = CARDS.map(([id]) => ({ cardId: id, cardPath: `backlog/${id}-card.md` }));
@@ -38,6 +40,16 @@ describe('attributeFindings', () => {
   it('recognises only lane/card-batch-* heads', () => {
     expect(isCardBatchRef('lane/card-batch-prevention-1')).toBe(true);
     expect(isCardBatchRef('lane/card-extract-1-abc')).toBe(false);
+  });
+});
+
+describe('pushArgs', () => {
+  // Git runs through execFileSync, not the gh/run.mjs recording double, so the push argv is pinned here directly.
+  it('is a plain create of a fresh ref: no force flag, no leased force, no `+` refspec', () => {
+    const argv = pushArgs('/some/remote', { sha: 'a'.repeat(40), ref: 'lane/card-extract-1-abc1234' });
+    expect(argv).toEqual(['push', '/some/remote', `${'a'.repeat(40)}:refs/heads/lane/card-extract-1-abc1234`]);
+    expect(argv.some(arg => /^--?(f|force|force-with-lease|force-if-includes)\b/.test(arg) || arg.startsWith('+'))).toBe(false);
+    expect(argv.every(arg => !arg.includes(':+'))).toBe(true);
   });
 });
 
@@ -117,6 +129,11 @@ describe('extractCard (real git)', () => {
         // No approval or verify carried over; the seal job must re-verify.
         expect(manifest.verificationMarker).toBeUndefined();
         expect(manifest.seal.step).toBeUndefined();
+        // The remainder is held off main by the hold label, and the seal job's first remaining step is a fresh verify.
+        expect(manifest.holdApplied).toBe(true);
+        expect(calls.filter(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'edit' && call.includes('--add-label')))
+          .toEqual([['gh', 'pr', 'edit', '102', '--repo', 'org/repo', '--add-label', HOLD_LABEL]]);
+        expect(planSeal({ state: manifest }).steps[0]).toBe('verify');
         expect(JSON.stringify(calls)).not.toMatch(/review:accepted|ready-to-merge|--requireVerified/);
         // Old PR closed with pointers to both new PRs; findings posted on the standalone PR; no force anywhere.
         const close = calls.find(call => call[1] === 'pr' && call[2] === 'close');
@@ -171,6 +188,138 @@ describe('extractCard (real git)', () => {
       } finally { rmSync(stateDir, { recursive: true, force: true }); }
     });
   }, 30000);
+
+  it('resumes after a crash between the two pushes even though main advanced, keeping the planned shas', async () => {
+    await withNarrowClone(async ctx => {
+      const stateDir = mkdtempSync(join(tmpdir(), 'extract-'));
+      try {
+        const { baseSha } = await sealedBatch(ctx, stateDir);
+        const d = doubles();
+        const input = { pr: 50, findings: [finding('backlog/5202-card.md')], laneDir: ctx.clone };
+        await expect(extractCard(input, { stateDir, exec: d.exec, gh: d.gh, crashAt: 'push-0' })).rejects.toThrow('crash');
+        const planned = JSON.parse(readFileSync(join(stateDir, 'extractions/org-repo-50.json'), 'utf8')).plan;
+        // The standalone ref is on the remote; the remainder ref and journal.pushed are not.
+        expect(lsRemote(ctx, planned.standalone.ref)).toBe(planned.standalone.sha);
+        expect(lsRemote(ctx, planned.remainder.ref)).toBe('');
+        // main moves on before the retry.
+        ctx.seedOriginBranch('main', { 'unrelated.md': 'main moved\n' }, 'main');
+        expect(lsRemote(ctx, 'main')).not.toBe(baseSha);
+        const result = await extractCard(input, { stateDir, exec: d.exec, gh: d.gh });
+        expect(result.action).toBe('extracted');
+        expect(result.journal.plan.baseSha).toBe(baseSha);
+        expect(result.journal.plan.standalone.sha).toBe(planned.standalone.sha);
+        expect(result.journal.plan.remainder.sha).toBe(planned.remainder.sha);
+        expect(lsRemote(ctx, planned.remainder.ref)).toBe(planned.remainder.sha);
+      } finally { rmSync(stateDir, { recursive: true, force: true }); }
+    });
+  }, 30000);
+
+  it('resumes the same card after a partial push even if the retry reports findings on another card', async () => {
+    await withNarrowClone(async ctx => {
+      const stateDir = mkdtempSync(join(tmpdir(), 'extract-'));
+      try {
+        await sealedBatch(ctx, stateDir);
+        const d = doubles();
+        const first = { pr: 50, findings: [finding('backlog/5202-card.md')], laneDir: ctx.clone };
+        await expect(extractCard(first, { stateDir, exec: d.exec, gh: d.gh, crashAt: 'push-0' })).rejects.toThrow('crash');
+        const planned = JSON.parse(readFileSync(join(stateDir, 'extractions/org-repo-50.json'), 'utf8')).plan;
+        const result = await extractCard({ ...first, findings: [finding('backlog/5203-card.md')] }, { stateDir, exec: d.exec, gh: d.gh });
+        expect(result.action).toBe('extracted');
+        expect(result.journal.plan.standalone).toEqual(planned.standalone);
+        expect(result.journal.plan.remainder.sha).toBe(planned.remainder.sha);
+      } finally { rmSync(stateDir, { recursive: true, force: true }); }
+    });
+  }, 30000);
+
+  describe('refusals that never overwrite a ref', () => {
+    it('refuses `ref-exists` when the standalone ref is already on the remote at another sha', async () => {
+      await withNarrowClone(async ctx => {
+        const stateDir = mkdtempSync(join(tmpdir(), 'extract-'));
+        try {
+          const { state } = await sealedBatch(ctx, stateDir);
+          const d = doubles();
+          const squatter = `lane/card-extract-5202-${state.members[1].commitSha.slice(0, 7)}`;
+          ctx.seedOriginBranch(squatter, { 'other.md': 'someone else\n' }, 'main');
+          const squatterSha = lsRemote(ctx, squatter);
+          const result = await extractCard({ pr: 50, findings: [finding('backlog/5202-card.md')], laneDir: ctx.clone }, { stateDir, exec: d.exec, gh: d.gh });
+          expect(result).toEqual({ action: 'refuse', reason: 'ref-exists' });
+          expect(lsRemote(ctx, squatter)).toBe(squatterSha);
+          expect(d.calls).toEqual([]);
+        } finally { rmSync(stateDir, { recursive: true, force: true }); }
+      });
+    }, 30000);
+
+    it('refuses `ff-reject` when the remote rejects the push as non-fast-forward, opening nothing', async () => {
+      await withNarrowClone(async ctx => {
+        const stateDir = mkdtempSync(join(tmpdir(), 'extract-'));
+        try {
+          await sealedBatch(ctx, stateDir);
+          const d = doubles();
+          // A remote that reports a lost race, as a concurrent push to the same ref would.
+          const hook = join(ctx.origin, 'hooks', 'pre-receive');
+          mkdirSync(join(ctx.origin, 'hooks'), { recursive: true });
+          writeFileSync(hook, '#!/bin/sh\necho "non-fast-forward: ref moved" >&2\nexit 1\n');
+          chmodSync(hook, 0o755);
+          const result = await extractCard({ pr: 50, findings: [finding('backlog/5202-card.md')], laneDir: ctx.clone }, { stateDir, exec: d.exec, gh: d.gh });
+          expect(result).toEqual({ action: 'refuse', reason: 'ff-reject' });
+          expect(d.calls).toEqual([]);
+        } finally { rmSync(stateDir, { recursive: true, force: true }); }
+      });
+    }, 30000);
+
+    it('refuses `lease-held` while another run holds the extraction lease', async () => {
+      await withNarrowClone(async ctx => {
+        const stateDir = mkdtempSync(join(tmpdir(), 'extract-'));
+        try {
+          await sealedBatch(ctx, stateDir);
+          const d = doubles();
+          mkdirSync(join(stateDir, 'extractions'), { recursive: true });
+          expect(acquireLease(join(stateDir, 'extractions/org-repo-50.json.lock'), 'other-run', Date.now(), 60 * 60_000)).toBeTruthy();
+          const result = await extractCard({ pr: 50, findings: [finding('backlog/5202-card.md')], laneDir: ctx.clone }, { stateDir, exec: d.exec, gh: d.gh });
+          expect(result).toEqual({ action: 'refuse', reason: 'lease-held' });
+          expect(d.calls).toEqual([]);
+        } finally { rmSync(stateDir, { recursive: true, force: true }); }
+      });
+    }, 30000);
+  });
+
+  describe('a failed GitHub call while holding does not lose the human signal', () => {
+    // `failOnce('edit')` makes the first `gh pr edit` throw (as a rate limit would); calls that fail are not recorded.
+    const flaky = (d, verb) => {
+      let armed = true;
+      return args => {
+        if (armed && args[1] === verb) { armed = false; throw new Error('gh: API rate limit exceeded'); }
+        return d.gh(args);
+      };
+    };
+    const labels = d => d.calls.filter(call => call[2] === 'edit' && call.includes('review:human'));
+    const comments = d => d.calls.filter(call => call[2] === 'comment');
+
+    // The comment goes first and the label last, so a failed comment never leaves the label set with nothing explained.
+    it.each([['comment', 0, 0], ['edit', 0, 1]])('retries the comment and label after a failed `gh pr %s`', async (verb, labelsBeforeRetry, commentsBeforeRetry) => {
+      await withNarrowClone(async ctx => {
+        const stateDir = mkdtempSync(join(tmpdir(), 'extract-'));
+        try {
+          await sealedBatch(ctx, stateDir);
+          const d = doubles();
+          const gh = flaky(d, verb);
+          const input = { pr: 50, findings: [finding('scripts/gate.mjs')], laneDir: ctx.clone };
+          await expect(extractCard(input, { stateDir, exec: d.exec, gh })).rejects.toThrow('rate limit');
+          expect(labels(d)).toHaveLength(labelsBeforeRetry);
+          expect(comments(d)).toHaveLength(commentsBeforeRetry);
+          // The retry finishes whichever effect is still owed, and applies each exactly once overall.
+          const result = await extractCard(input, { stateDir, exec: d.exec, gh });
+          expect(result.action).toBe('hold');
+          expect(labels(d)).toHaveLength(1);
+          expect(comments(d)).toHaveLength(1);
+          // Then it is settled: a further run sends nothing.
+          const before = d.calls.length;
+          expect((await extractCard(input, { stateDir, exec: d.exec, gh })).action).toBe('hold');
+          expect(d.calls).toHaveLength(before);
+        } finally { rmSync(stateDir, { recursive: true, force: true }); }
+      });
+    }, 30000);
+  });
 
   it.each([
     ['no card file', [{ summary: 'gate says no' }]],

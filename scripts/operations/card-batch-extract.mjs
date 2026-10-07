@@ -97,6 +97,9 @@ const scratchGit = (cwd, date) => (args, options = {}) => execFileSync('git', ar
     ...(date ? { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } : {}) },
 });
 
+/** The one push argv: a plain create of a fresh ref, never forced (no flags, no `+` refspec). */
+export const pushArgs = (target, { sha, ref }) => ['push', target, `${sha}:refs/heads/${ref}`];
+
 /** Message carried over; the Card-Batch marker is re-pointed at the new batch ref so admission recovery still reads it. */
 function rebrandMessage(message, batchRef) {
   return message.split('\n').map(line => {
@@ -142,8 +145,25 @@ export async function extractCard(input, opts = {}) {
       if (!held()) throw new Error('lease-held');
       atomicRecord(journalPath, journal);
     };
+    // The hold is journaled first (so it stays terminal), then its two GitHub effects are each journaled once done, so a
+    // rerun after a failed `gh` call finishes whichever effect is still owed instead of returning silently.
+    const completeHold = async () => {
+      // Comment first, label last: the label is what marks the hold as seen, so it must not land while the comment is owed.
+      if (!journal.heldCommented) {
+        await gh(['pr', 'comment', String(old.pr), '--repo', repo, '--body-file',
+          bodyFile(`Card extraction held for a person: ${journal.held.reason}. Nothing was extracted or dropped.\n`)]);
+        journal.heldCommented = true;
+        save();
+      }
+      if (!journal.heldLabelled) {
+        await gh(['pr', 'edit', String(old.pr), '--repo', repo, '--add-label', HUMAN_LABEL]);
+        journal.heldLabelled = true;
+        save();
+      }
+      return hold(journal.held.reason);
+    };
     if (journal.done) return { action: 'extracted', journal };
-    if (journal.held) return hold(journal.held.reason);
+    if (journal.held) return await completeHold(); // awaited: `finally` must not release the lease mid-effect
     if (!old.sealedAt && !old.seal) return refuse('batch-not-sealed');
     if (!COMMIT_ID.test(String(old.headSha))) return refuse('head-mismatch');
 
@@ -156,15 +176,23 @@ export async function extractCard(input, opts = {}) {
     if (target.startsWith('-')) throw new TypeError('remote url must not start with "-"');
     git(['init', '--bare', '-q', scratch]);
 
-    // Built objects live only in this scratch repo, so a plan that never reached the remote is rebuilt (deterministically).
-    if (journal.plan && !journal.pushed) journal.plan = null;
+    // Built objects live only in this scratch repo, so a plan that never finished pushing is rebuilt. It is rebuilt on
+    // the SAME base it was planned on: a push may already have landed one ref, and a newer main would change its sha.
+    // The extracted card is pinned with it: a retry's findings may differ, but refs already pushed name this card.
+    const pinnedBase = journal.plan && !journal.pushed ? journal.plan.baseSha : null;
+    const pinnedCard = pinnedBase ? journal.plan.standalone.member : null;
+    if (pinnedBase) journal.plan = null;
     // ── PLAN (once): attribute, then compute every ref and commit so a rerun reproduces identical shas.
     if (!journal.plan) {
       const advertised = git(['ls-remote', '--refs', target, `refs/heads/${old.batchRef}`]).trim().split(/\s+/)[0];
       if (advertised !== old.headSha) return refuse('head-mismatch');
       git(['fetch', '--no-tags', target, `refs/heads/${old.batchRef}`]);
       git(['fetch', '--no-tags', target, `refs/heads/${base}`]);
-      const baseSha = git(['rev-parse', 'FETCH_HEAD^{commit}']).trim();
+      let baseSha = git(['rev-parse', 'FETCH_HEAD^{commit}']).trim();
+      if (pinnedBase && pinnedBase !== baseSha) {
+        // Reuse the planned base while it is still part of main's history; otherwise (main was rewritten) plan afresh.
+        try { git(['merge-base', '--is-ancestor', pinnedBase, baseSha]); baseSha = pinnedBase; } catch { /* plan on current main */ }
+      }
       const members = old.members.map(member => {
         git(['merge-base', '--is-ancestor', member.commitSha, old.headSha]);
         const rows = git(['diff-tree', '--no-commit-id', '--name-status', '-r', '-z', member.commitSha]).split('\0').filter(Boolean);
@@ -174,14 +202,14 @@ export async function extractCard(input, opts = {}) {
         if (!cardOnlyEligibility([{ status: 'A', mode, path: cardPath }]).ok) throw new Error(`member ${member.cardId} is not an eligible card`);
         return { ...member, cardPath };
       });
-      const attribution = attributeFindings({ findings: input.findings, members });
+      const planned = pinnedCard && members.find(member => member.cardId === pinnedCard);
+      const attribution = planned
+        ? { action: 'extract', member: planned, survivors: members.filter(member => member !== planned) }
+        : attributeFindings({ findings: input.findings, members });
       if (attribution.action === 'hold') {
         journal.held = { reason: attribution.reason, at: new Date(now()).toISOString() };
         save();
-        await gh(['pr', 'edit', String(old.pr), '--repo', repo, '--add-label', HUMAN_LABEL]);
-        await gh(['pr', 'comment', String(old.pr), '--repo', repo, '--body-file',
-          bodyFile(`Card extraction held for a person: ${attribution.reason}. Nothing was extracted or dropped.\n`)]);
-        return attribution;
+        return await completeHold();
       }
       const build = (parentSha, member, message, date) => {
         git(['read-tree', parentSha]);
@@ -216,16 +244,17 @@ export async function extractCard(input, opts = {}) {
     const { plan } = journal;
     const refs = [plan.standalone, plan.remainder].filter(Boolean);
     if (!journal.pushed) {
-      for (const entry of refs) {
+      for (const [index, entry] of refs.entries()) {
         const advertised = git(['ls-remote', '--refs', target, `refs/heads/${entry.ref}`]).trim().split(/\s+/)[0];
         if (advertised && advertised !== entry.sha) return refuse('ref-exists');
         if (advertised) continue;
         if (!held()) return refuse('lease-held');
-        try { git(['push', target, `${entry.sha}:refs/heads/${entry.ref}`]); }
+        try { git(pushArgs(target, entry)); }
         catch (error) {
           if (/\[rejected\]|non-fast-forward|fetch first|cannot lock ref/.test(String(error.stderr))) return refuse('ff-reject');
           throw error;
         }
+        checkpoint(`push-${index}`);
       }
       journal.pushed = true;
       save();
