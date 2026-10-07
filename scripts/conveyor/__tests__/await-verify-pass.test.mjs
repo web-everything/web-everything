@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   classifyAwaitVerdict, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession,
-  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, laneTreeHash,
+  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, laneTreeHash, isSessionBusy,
 } from '../await-verify-pass.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
@@ -244,4 +244,12 @@ it('laneTreeHash matches verify-lane\'s own (trimmed) tree hash on a real repo â
     expect(laneTreeHash(dir)).toBe(verifyLaneStyle);
     expect(untrimmed).not.toBe(verifyLaneStyle);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('isSessionBusy reads the live turn signal: a turn-ended bg session is state working / status idle', () => {
+  expect(isSessionBusy({ state: 'working', status: 'idle' })).toBe(false); // fix-4151, live 2026-10-07
+  expect(isSessionBusy({ status: 'busy' })).toBe(true);
+  expect(isSessionBusy({ state: 'done' })).toBe(false);
+  expect(isSessionBusy({ state: 'stopped' })).toBe(false);
+  expect(isSessionBusy({ state: 'working' })).toBe(true);
 });

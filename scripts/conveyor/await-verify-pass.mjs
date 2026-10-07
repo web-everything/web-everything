@@ -144,6 +144,16 @@ export function findAwaitSession(record, rows) {
 }
 
 const BUSY = new Set(['working', 'running', 'busy', 'starting']);
+/**
+ * Is the session mid-turn? A live background session whose turn ENDED lists as `state:'working', status:'idle'`
+ * (found live 2026-10-07 on fix-4151: the pass pushed its green, then deferred the resume forever as "busy").
+ * `status` is the turn signal when present; `state` only for rows without one. Pure.
+ */
+export function isSessionBusy(session) {
+  const status = String(session?.status ?? '').toLowerCase();
+  if (status) return status !== 'idle';
+  return BUSY.has(String(session?.state ?? '').toLowerCase());
+}
 
 /**
  * Apply the policy to every stored record once. Every effect is an injected port, so the whole pass replays
@@ -198,7 +208,7 @@ export async function runAwaitVerifyPass({
         row.result = `${row.result ? `${row.result}; ` : ''}session-gone`;
         rows.push(row); continue;
       }
-      if (BUSY.has(String(session.state ?? '').toLowerCase())) { row.result = row.result ?? 'session-busy'; rows.push(row); continue; }
+      if (isSessionBusy(session)) { row.result = row.result ?? 'session-busy'; rows.push(row); continue; }
       const prompt = buildAwaitVerifyResumePrompt({
         kind: record.pendingResume.kind, record, marker: record.pendingResume.marker ?? marker, detail: record.pendingResume.detail,
       });
