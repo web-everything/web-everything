@@ -74,6 +74,13 @@ export const SUBMIT_OUTCOMES = Object.freeze(['opened', 'refused', 'unrun']);
  * happened — but they are the home's rules, restated as a pre-flight, and the home still applies them. The
  * verify marker is deliberately NOT among them: that decision has one home and this is not it.
  */
+/** #81 — `--branch=lane/<slug>` is the caller-facing spelling of `ref`; `ref` wins when both are given. */
+export function resolveRef({ ref, branch, derive = () => '' } = {}) {
+  if (typeof ref === 'string' && ref.trim()) return ref.trim();
+  if (typeof branch === 'string' && branch.trim()) return branch.trim();
+  return derive();
+}
+
 export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = '', requireVerified = false, dryRun = false } = {}) {
   const prepareItem = prepareItemFromRef(ref);
   if (prepareItem) title = preparePrTitle(prepareItem);
@@ -190,7 +197,7 @@ export function defaultParkLabel(parkLabels) {
   return pending;
 }
 
-export function openPrOperation({ parkLabels } = {}) {
+export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
   if (!Array.isArray(parkLabels) || parkLabels.length === 0) {
     throw new TypeError(
       'open-pr: needs `pr-land.mjs`\'s own PARK_LABELS — the set of labels a PR may be parked with has one '
@@ -202,7 +209,10 @@ export function openPrOperation({ parkLabels } = {}) {
     declaresOver: DECLARED_HOMES['open-pr'],
     input: {
       // A lane ref, never a local branch — the home's rule, and the pre-flight above states it early.
-      ref: { type: 'string', required: true },
+      // #81 — optional now: `--branch=` is the same thing, and with neither the ref derives from the lane lease's
+      // purpose. pr-land itself pushes `<sha>:refs/heads/<ref>`, so no local branch is ever created.
+      ref: { type: 'string', required: false, default: '' },
+      branch: { type: 'string', required: false, default: '' },
       base: { type: 'string', required: false, default: 'main' },
       // Optional — see `planOpen`. Empty means "the home derives it from the commit subject".
       title: { type: 'string', required: false, default: '' },
@@ -235,11 +245,11 @@ export function openPrOperation({ parkLabels } = {}) {
       // field missing from this list arrives as `undefined` no matter what the caller passed — the wiring bug
       // PR #1516's round-1 juror found in `verify`, where the io layer was tested and this layer was not.
       reads: [
-        'input.ref', 'input.base', 'input.title', 'input.bodyFile', 'input.mode', 'input.parkLabel',
+        'input.ref', 'input.branch', 'input.base', 'input.title', 'input.bodyFile', 'input.mode', 'input.parkLabel',
         'input.sha', 'input.requireVerified', 'input.dryRun',
       ],
       fn: (view) => planOpen({
-        ref: view.input.ref,
+        ref: resolveRef({ ref: view.input.ref, branch: view.input.branch, derive: deriveRef }),
         base: view.input.base,
         title: view.input.title,
         bodyFile: view.input.bodyFile,
@@ -306,6 +316,15 @@ export function classifySubmit({ status, signal, stdout = '', stderr = '', error
   if (parsed.reason) {
     // The home's OWN word for what happened decides, not the exit code and not the presence of a `pr`:
     // pr-land exits 3 for a guard refusal AND for an environment failure, so neither signal separates them.
+    // #79 — `check-timeout` AFTER the PR opened is not "not opened": the PR is real, only the green-wait label
+    // step is pending, and the drain's ci-lifecycle reconcile finishes it (#2421). Report that truthfully.
+    if (parsed.reason === 'check-timeout' && parsed.pr) {
+      return {
+        outcome: 'opened', reason: 'check-timeout', labelStep: 'deferred',
+        detail: `PR #${parsed.pr} open; label step deferred to the drain's ci-lifecycle reconcile`,
+        pr: parsed.pr, url: parsed.url ?? null,
+      };
+    }
     const known = HOME_REASONS[parsed.reason];
     const outcome = known === 'opened' ? 'opened' : (known ?? 'unrun');
     return {
@@ -360,6 +379,9 @@ export function extractSubmitResult(payload) {
 
 /** Human submit summary; the effect completing does not mean the home opened a PR. */
 export function describeSubmit(result) {
+  if (result.outcome === 'opened' && result.labelStep === 'deferred') {
+    return { line: `submit: opened #${result.pr}${result.url ? ` ${result.url}` : ''} — ${result.detail}`, failed: false };
+  }
   if (result.outcome === 'opened') {
     return { line: `submit: opened #${result.pr} ${result.url}`, failed: false };
   }

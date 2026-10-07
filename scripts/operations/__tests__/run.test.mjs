@@ -234,8 +234,8 @@ describe('runner freshness real repository witnesses', () => {
       ctx.seedOriginBranch('main', { 'data.json': '{}' });
       for (const env of [{ WE_DAEMON_MANAGED_CLONE: '1' }, { WE_OPERATION_ALLOW_STALE: '1' }]) {
         const r = runCli(ctx, ['open-pr', '--json'], env);
-        expect(r.status).toBe(2); // missing required inputs; cannot invoke a PR sink
-        expect(r.stdout).toMatch(/required/);
+        expect(r.status).toBe(1); // no ref, no --branch, no lane lease (#81): the plan refuses; no PR sink is invoked
+        expect(r.stdout).toMatch(/cannot plan this PR/);
         if (env.WE_OPERATION_ALLOW_STALE) expect(r.stderr).toMatch(/override: open-pr.*1 commits behind/);
       }
       const r = runCli(ctx, ['verify', '--resume=missing', '--json']);
@@ -260,8 +260,8 @@ it('real lane slot passes while override cannot suppress the dispatch guard', as
     mkdirSync(dirname(lane), { recursive: true });
     renameSync(ctx.clone, lane);
     const r = runCli({ ...ctx, clone: lane }, ['open-pr', '--json']);
-    expect(r.status).toBe(2);
-    expect(r.stdout).toMatch(/required/);
+    expect(r.status).toBe(1);
+    expect(r.stdout).toMatch(/cannot plan this PR/);
     expect(r.stderr).not.toMatch(/Refusing|override/);
   });
 }, 120_000);

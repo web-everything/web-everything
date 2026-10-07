@@ -19,6 +19,39 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { classifySubmit } from './open-pr.mjs';
+import { existsSync, readFileSync } from 'node:fs';
+import { buildGhShimSettingsEnv, defaultShimDir, ghShimPathOverride, shimGhPath } from '../lib/gh-app-shim.mjs';
+
+/**
+ * #81 — a lane's ref, when the caller did not name one. `lane/<slug>` from the lane lease's `purpose`
+ * (`git rev-parse --git-path .lane-lease`). Returns '' when there is no lease/purpose. `read` is injected.
+ */
+export function deriveLaneRef({
+  cwd = process.cwd(),
+  read = (c) => readFileSync(execFileSync('git', ['rev-parse', '--git-path', '.lane-lease'], { cwd: c, encoding: 'utf8', maxBuffer: 1024 * 1024 }).trim().replace(/^(?!\/)/, c + '/'), 'utf8'),
+} = {}) {
+  try {
+    const slug = String(JSON.parse(read(cwd))?.purpose ?? '').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+    return slug ? `lane/${slug}` : '';
+  } catch { return ''; }
+}
+
+/**
+ * #79 — the credential the rest of the conveyor uses. A background subagent has no app-token shim on PATH, so
+ * `gh` ran unauthenticated and pr-land reported a false "no credential". Prefer this checkout's shim (App
+ * opted in), else the shared shim dir if it exists and is not already first on PATH; else leave env alone.
+ */
+export function resolveGhCredentialEnv({ env = process.env, exists = existsSync, build = buildGhShimSettingsEnv } = {}) {
+  try {
+    const built = build({ env, pathEnv: env.PATH || '' });
+    if (built?.PATH) return { ...env, ...built };
+  } catch { /* fall through */ }
+  const dir = defaultShimDir();
+  if (exists(shimGhPath(dir)) && !(env.PATH || '').split(':').includes(dir)) {
+    return { ...env, PATH: ghShimPathOverride({ dir, currentPath: env.PATH || '' }) };
+  }
+  return env;
+}
 import { prepareItemFromRef, preparePrTitle, verifyPreparePr } from './prepare-pr.mjs';
 
 /** The single home. Resolved from THIS file's location, never cwd — the lane being opened is not this repo. */
@@ -31,7 +64,7 @@ export const OPEN_PR_TIMEOUT_MS = 30 * 60 * 1000;
  * The runner the declaration is injected with. ONE spawn; `spawn` is injected so every branch of
  * `classifySubmit` is reachable with no `gh`, no network and no PR.
  */
-export function createPrLandRunner({ spawn = spawnSync, cwd = process.cwd(),
+export function createPrLandRunner({ spawn = spawnSync, cwd = process.cwd(), env = resolveGhCredentialEnv(),
   git = (args) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }),
 } = {}) {
   return ({ argv }) => {
@@ -49,7 +82,7 @@ export function createPrLandRunner({ spawn = spawnSync, cwd = process.cwd(),
     }
     try {
       r = spawn(process.execPath, [PR_LAND_CLI, ...argv, '--json'], {
-        encoding: 'utf8', timeout: OPEN_PR_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, cwd,
+        encoding: 'utf8', timeout: OPEN_PR_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, cwd, env,
       });
     } catch (e) {
       r = { error: e };
@@ -77,6 +110,10 @@ export function createOpenPrSinks({ run = createPrLandRunner() } = {}) {
       // error, kill signal, unparseable stdout) before pr-land ever reaches its own dry-run branch; keying
       // on the request would silently swallow that as an unremarkable rehearsal instead of throwing it,
       // masking a real infrastructure failure. Found by independent review of this very fix (PR #1715).
+      if (out.outcome === 'unrun' && out.reason !== 'dry-run' && out.pr != null) {
+        // #79 — the PR exists; never claim it was not opened.
+        throw new Error(`open-pr: PR #${out.pr} is open${out.url ? ` (${out.url})` : ''}, but the home stopped after opening it: ${out.reason}${out.detail ? ` — ${out.detail}` : ''}`);
+      }
       if (out.outcome === 'unrun' && out.reason !== 'dry-run') {
         throw new Error(
           `open-pr: pr-land did not report a result — ${out.reason}${out.detail ? ` — ${out.detail}` : ''}. The PR was NOT opened, and this is not a `

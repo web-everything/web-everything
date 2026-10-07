@@ -908,7 +908,10 @@ describe('lane-resume — submitPrMissingOpen (#xcf4556 review: the spawn + repo
       expect(v.prOpened).toBe(true);
       expect(v.pr).toBe(2636);
       expect(v.reason).toBe(reason);
-      expect(v.outcome).not.toBe('opened'); // pr-land's own stop is still surfaced, not hidden
+      // pr-land's own stop is still surfaced, not hidden. A check-timeout AFTER the open is the one stop classifySubmit
+      // now reports truthfully as `opened` (#79): the PR is real and only the label step is deferred to the drain.
+      if (reason === 'check-timeout') expect(v.outcome).toBe('opened');
+      else expect(v.outcome).not.toBe('opened');
     });
   }
 
