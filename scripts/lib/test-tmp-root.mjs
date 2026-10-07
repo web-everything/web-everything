@@ -15,7 +15,8 @@
 //   WE_TMP_LEAK_MODE  'warn' (default) | 'fail' | 'off'
 //   WE_TMP_LEAK_MAX   leftover entries allowed before warn/fail fires (default 50)
 //   WE_TMP_LEAK_KEEP  '1' keeps the root on disk for debugging instead of removing it
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 
 export const RUN_ROOT_PARENT = 'we-vitest';
@@ -104,4 +105,49 @@ export function finishRunTmpRoot({ root, policy = resolveTmpLeakPolicy(), log = 
   }
   if (!policy.keep) rmSync(root, { recursive: true, force: true });
   return { ...summary, exceeded, failed: exceeded && policy.mode === 'fail' };
+}
+
+// test-churn cut (2026-10-07): helpers for the lazy / write-once temp state `vitest.setup.ts` now uses.
+
+// A unique path under `baseTmp` that is NOT created. The caller (or the code under test) creates it on demand.
+export function lazyTmpPath(prefix, baseTmp) {
+  return join(baseTmp, `${prefix}${randomBytes(6).toString('hex')}`);
+}
+
+// The fake `gh` every sandboxed test file puts first on PATH: fails like an unauthenticated `gh`. Written ONCE
+// PER RUN by `vitest.globalSetup.mjs` (dir passed to workers via FAKE_GH_DIR_ENV), not once per test file.
+export const FAKE_GH_DIR_ENV = 'VITEST_SHARED_FAKE_GH_DIR';
+export function writeFakeGhShim(dir) {
+  const path = join(dir, 'gh');
+  writeFileSync(
+    path,
+    '#!/bin/sh\n'
+    + 'echo "To get started with GitHub CLI, please run:  gh auth login" >&2\n'
+    + 'echo "Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token." >&2\n'
+    + 'exit 1\n',
+  );
+  chmodSync(path, 0o755);
+  return path;
+}
+
+// Run-wide shared state (the fake `gh` dir) lives in a dot-dir inside the run root; removed before the leak
+// count so it never shows up as a leftover.
+export const SHARED_DIR_NAME = '.we-run-shared';
+export function createSharedFakeGh(root) {
+  const dir = join(root, SHARED_DIR_NAME, 'fake-gh');
+  mkdirSync(dir, { recursive: true });
+  writeFakeGhShim(dir);
+  return dir;
+}
+export function removeSharedDir(root) {
+  rmSync(join(root, SHARED_DIR_NAME), { recursive: true, force: true });
+}
+
+// Explicit opt-in for a test that reads a lazy root BEFORE anything wrote to it (and for the old "dir already
+// exists, empty" contract): `ensureTestTmpDir('WE_COORDINATION_ROOT')` creates and returns it.
+export function ensureTestTmpDir(envKey, env = process.env) {
+  const dir = env[envKey];
+  if (!dir) throw new Error(`ensureTestTmpDir: ${envKey} is not set`);
+  mkdirSync(dir, { recursive: true });
+  return dir;
 }
