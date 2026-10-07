@@ -89,6 +89,16 @@ a lint, a brief rule). Then report, with **card-only and code PRs as separate ta
 2. the `correlation` table (attribute, buckets with mean extra rounds, effect, rho, n, 2 example PRs), top rows first,
    and say plainly when n is too small to trust.
 
+## 2c. Executor comparison (`executors`)
+
+`executors.{claude,codex,agy}` (from `scripts/operations/coroner-executors.mjs`) compares runs, tasks, rounds per task,
+error rate, median/p90 minutes, tokens (codex, agy only) and tool errors. Sources, all bounded and read-only:
+Codex rollouts `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (linked to a card via `codex-pilot.jsonl` threadId, else the PR
+in the prompt; role from cwd `we-review-seat-*` = review) and agy stream-json transcripts
+`~/.antigravity-judge-transcripts/antigravity-judge-<id>.jsonl` (review seats; the transcript carries no PR id, so tasks
+are per session). Never print tokens or secrets: only counts. Use it for card 64 / agy routing; set
+`WE_CORONER_NO_EXECUTORS=1` to skip.
+
 ## 3. Mark NEW vs COVERED
 
 Compare each friction against, in this order:
