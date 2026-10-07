@@ -145,3 +145,13 @@ export function guardedPoolRoot(checkoutRoot = process.cwd(), env = process.env)
 export function referenceArgs(referencePath, isShallow) {
   return isShallow === true ? [] : ['--reference', referencePath];
 }
+
+/**
+ * builder-starved-2 (2026-10-07) — the checkout `lane-pool.mjs` works against. Inside a git work tree it is that
+ * tree's top level (unchanged). Outside one (a dispatched agent's fresh scratch cwd, #4174) it is the checkout the
+ * script itself lives in, never the bare cwd: the cwd has no origin, so `acquire` failed with `could not determine
+ * an origin URL` and the pool root was derived from a scratch path. PURE.
+ */
+export function checkoutRootFor({ cwdTopLevel, scriptCheckout, cwd }) {
+  return cwdTopLevel || scriptCheckout || cwd;
+}
