@@ -112,7 +112,7 @@ export function fixDispatchClaimOwner({ host = hostname(), pid = process.pid } =
  * @returns {{ok:boolean, reason:string, heldBy:string|null, resource:string, lockRoot:string}}
  */
 export function acquireFixDispatchClaim({
-  repo, pr, kind = 'fix', headSha = null, scope = null, owner = fixDispatchClaimOwner(), sessionId = null,
+  repo, pr, kind = 'fix', headSha = null, scope = null, borrowed = null, owner = fixDispatchClaimOwner(), sessionId = null,
   pid = process.pid, host = hostname(), nowMs = Date.now(), nowIso = new Date(nowMs).toISOString(),
   leaseMinutes = DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES, lockRoot = fixDispatchClaimRoot(),
 } = {}) {
@@ -131,6 +131,8 @@ export function acquireFixDispatchClaim({
     host, sessionId, repo, pr, kind, headSha: headSha ?? null, claimedAt,
     // #4295 — declared scope (repo-qualified) so build/fix dispatch can serialize on overlap; omitted when unknown.
     ...(Array.isArray(scope) && scope.length ? { scope: scope.map(String) } : {}),
+    // Card 87 — this fix runs in a BORROWED builder slot (`{executor, reason}`); the build daemon counts it there.
+    ...(borrowed && typeof borrowed === 'object' && borrowed.executor ? { borrowed: { executor: String(borrowed.executor), reason: String(borrowed.reason ?? 'borrowed-build-slot') } } : {}),
   };
   // `pidLiveness` is ALWAYS 'unknown' — see this file's own header for why a fast PID-dead reclaim would be
   // actively wrong here (the acquiring dispatcher's own exit is expected completion, not a crash).

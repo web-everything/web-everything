@@ -61,6 +61,10 @@ import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admissio
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
 import { runReconcilePass, defaultReadPrs } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
 import { createDispatchThrottle } from '../../scripts/lib/dispatch-throttle.mjs'; // fix-cap + host-load
+import { createFixBorrowGate } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
+import { listBuildDispatchClaims } from '../../scripts/conveyor/build-dispatch-claim.mjs';
+import { FIX_RUN_SCRIPT } from '../../scripts/operations/dispatch-providers/fix.mjs';
+import { existsSync } from 'node:fs';
 import { listFixDispatchClaims } from '../../scripts/conveyor/fix-claim-store.mjs';
 import { refreshLiveFixDispatchClaims } from '../../scripts/conveyor/fix-dispatch-claim.mjs'; // dup-heal-dispatch
 import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconcile-note-comment.mjs'; // #4191
@@ -636,8 +640,13 @@ export async function runTickAllRepos({
   const queueAdmission = (authGate.paused || (fixTick && ciHealTick)) ? null : createQueueBudget(resolveLiveQueueBaseline({ checkoutRoot: DAEMON_REPO_ROOT }));
   // ONE throttle per pass shared by fix + ci-heal: live fix/ci-heal cap and host-load gate (defer-only).
   const dispatchThrottle = queueAdmission ? createDispatchThrottle({ listClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }) }) : null;
+  // Card 87 — ONE borrow gate per pass (fix only; ci-heal never borrows). OFF unless `fixDispatch.borrowBuildSlots` is on.
+  const borrowGate = dispatchThrottle ? createFixBorrowGate({
+    listBuildClaims: () => listBuildDispatchClaims(), listFixClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }),
+    launcherAvailable: (executor) => executor === 'claude' || existsSync(FIX_RUN_SCRIPT),
+  }) : null;
   const fix = authGate.paused ? pausedDispatchResult()
-    : runReconcileFixDispatchAllRepos({ repos, ...(fixTick ? { tick: fixTick } : { queueAdmission, dispatchThrottle }) });
+    : runReconcileFixDispatchAllRepos({ repos, ...(fixTick ? { tick: fixTick } : { queueAdmission, dispatchThrottle, borrowGate }) });
   const ciHeal = authGate.paused ? pausedDispatchResult()
     : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { queueAdmission, dispatchThrottle }) });
   const hungCi = runHungCiRecoveryAllRepos({ repos, ...(hungCiTick ? { tick: hungCiTick } : {}) });

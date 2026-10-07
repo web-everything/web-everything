@@ -1,5 +1,10 @@
 {
   "heavyAdmissionCap": 2,
   "fixDispatchMaxConcurrent": 2,
-  "maxLoadPerCore": 2.0
+  "maxLoadPerCore": 2.0,
+  "fixDispatch": {
+    "borrowBuildSlots": "on",
+    "borrowAfterMinutes": 15,
+    "borrowExecutor": "claude"
+  }
 }
