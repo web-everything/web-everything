@@ -2634,7 +2634,10 @@ export const REFERRAL_DROP_REASON = 'dropped: seat disabled by operator config';
 export const activeReferrals = (record) => record.referrals.filter(f => !(record.dropped ?? []).some(d => d.key === f.key)
   || record.rulings.some(r => r.key === f.key));
 
-export const liveReferrals = (record) => activeReferrals(record).filter(f => ![...(record.superseded ?? []), ...(record.carried ?? [])].some(s => s.key === f.key)
+// `withdrawn` is the set of carried keys whose carry no longer stands at read time (`referralRecordState` holds them
+// pending): such a finding is live again, so the reviewer is asked about it instead of the hold having no owner.
+export const liveReferrals = (record, { withdrawn = null } = {}) => activeReferrals(record).filter(f => ![...(record.superseded ?? []),
+  ...(record.carried ?? []).filter(c => !withdrawn?.has(c.key))].some(s => s.key === f.key)
   || record.rulings.some(r => r.key === f.key));
 
 /** Same-head owner decisions may retire advisory duplicates; never infer clearance from prose alone. */
@@ -2722,6 +2725,20 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
 // and any block on the finding's id, on any later record or by the operator, withdraws a carried clearance.
 
 /**
+ * Is `b` the SAME instance of a finding the reviewer ruled on as `a`, for a clearance to ride across heads? The
+ * identical normalized claim (case, quoting, whitespace, `:line` refs and trailing punctuation folded — the claim
+ * half of the #76a identity), at the same spot and severity ({@link sameFindingForClearing}). The word-overlap floor
+ * `sameFindingForClearing` also accepts is NOT enough for a reviewer's own clearance: it ignores words under four
+ * characters, so "token is validated" and "token is not validated" overlap fully and a ruling on one would clear the
+ * opposite claim. A re-worded claim is a new instance the reviewer rules once more. PURE.
+ */
+function sameInstanceForCarry(a, b) {
+  const ia = normalizeFindingIdentity(a);
+  const ib = normalizeFindingIdentity(b);
+  return Boolean(ia && ib && ia.normSummary === ib.normSummary) && sameFindingForClearing(a, b);
+}
+
+/**
  * The earlier reviewer ruling that still backs a reviewer-backed `carried` entry (`from.rulingId`), or null. It
  * stands only while: the source record carries that ruling on that key with the carried result (and card); the gate
  * COUNTS it on its own head (independent clearer, readable card — the test every ruling passes); nothing supersedes
@@ -2737,14 +2754,17 @@ export function reviewerCarryBacking(carried, { records = [], operatorRulings = 
   const ruling = source?.rulings.find(x => x.id === from.rulingId && x.key === from.key);
   if (!ruling || ruling.result !== carried.result || (ruling.result === 'card' && ruling.card !== carried.card)) return null;
   // The carry must be for the SAME finding it stands on: the destination (`target`, the referral the carry is on —
-  // required, so a caller that forgets it fails closed) shares the source finding's deterministic identity and
-  // severity. The sink only ever writes such a carry; this holds a hand-built or buggy one to the same rule.
+  // required, so a caller that forgets it fails closed) shares the source finding's deterministic identity AND passes
+  // `sameInstanceForCarry` (the identical claim at the same spot and severity, on top of `sameFindingForClearing`).
+  // The identity alone binds on a quote anchor, so it cannot tell a re-wording from a different defect at the same
+  // line of code; a ruling is scoped to the instance the reviewer saw. The sink only ever writes such a carry; this
+  // holds a hand-built or buggy one to the same rule.
   const sourceFinding = source.referrals.find(f => f.key === from.key);
   const destIdentity = target ? normalizeFindingIdentity(target.original ?? target.finding) : null;
   const sourceIdentity = sourceFinding ? normalizeFindingIdentity(sourceFinding.original ?? sourceFinding.finding) : null;
   if (!destIdentity || !sourceIdentity || (carried.key !== undefined && target.key !== carried.key)
     || !sameFindingIdentity(sourceIdentity, destIdentity)
-    || !CARRY_SEVERITY_FIELDS.every(k => sourceFinding.finding[k] === target.finding[k])) return null;
+    || !sameInstanceForCarry(sourceFinding.finding, target.finding)) return null;
   if (source.rulings.some(x => supersededRulings(x).includes(ruling.id))) return null;
   // Counted on ITS OWN head, without recursing into the source's own carries or links.
   const own = referralRecordState({ ...source, carried: undefined }, { ...options, head: source.head, records: [],
@@ -2757,13 +2777,22 @@ export function reviewerCarryBacking(carried, { records = [], operatorRulings = 
   // A block anywhere on the SOURCE head (an earlier record, the source record itself, another key sharing the id) or
   // in any later record holds the finding: two counted rulings that disagree on one head resolve to the block, so
   // the clearance never stood on that head and cannot be carried off it.
+  // Only a STANDING block holds: a block the reviewer superseded in its own record (a later ruling naming it in
+  // `supersedes`) is replaced, not in force — the clearance that replaced it is the latest counted word. A `card`
+  // that cannot be read is not yet a clearance, so it does not replace the block it names.
+  const cardOk = typeof options.cardReadable === 'function' ? options.cardReadable : () => false;
   for (const [at, other] of list.entries()) {
     if (other.repo !== repo || other.pr !== pr || (at < index && other.head !== source.head)) continue;
     if (other.referrals.some(f => sameId(other.head, other.runId, f.key)
-      && other.rulings.some(x => x.key === f.key && x.result === 'block'))) return null;
+      && other.rulings.some(x => x.key === f.key && x.result === 'block'
+        && !other.rulings.some(next => supersededRulings(next).includes(x.id)
+          && (next.result !== 'card' || cardOk(next.card)))))) return null;
   }
-  if ((Array.isArray(operatorRulings) ? operatorRulings : []).some(o => o.repo === repo && o.pr === pr
-    && o.result === 'block' && sameId(o.head, o.runId, o.key))) return null;
+  // An operator ruling is decided by the LATEST one on its (head, run, finding): a block the operator later re-ruled
+  // is no longer standing (the same rule `carriedBackingHolds` applies to an operator carry).
+  const ops = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => o.repo === repo && o.pr === pr);
+  if (ops.some(o => o.result === 'block' && sameId(o.head, o.runId, o.key)
+    && ops.filter(p => p.head === o.head && p.runId === o.runId && p.key === o.key).at(-1) === o)) return null;
   return ruling;
 }
 
@@ -2783,9 +2812,10 @@ export function findCarriedReviewerRuling(referral, { records = [], operatorRuli
     for (const ruling of [...r.rulings].reverse()) {
       const g = r.referrals.find(f => f.key === ruling.key);
       if (!g || !sameFindingIdentity(normalizeFindingIdentity(g.original ?? g.finding), target)) continue;
-      // The latest ruling on this finding decides, whatever it said: a block (or an unlike severity) ends the search.
+      // The latest ruling on this finding decides, whatever it said: a block, or a ruling on another instance of the
+      // identity (another spot, another claim, another severity: `sameFindingForClearing`), ends the search.
       if (!['not-real', 'card'].includes(ruling.result)
-        || !CARRY_SEVERITY_FIELDS.every(k => g.finding[k] === referral.finding[k])) return null;
+        || !sameInstanceForCarry(g.finding, referral.finding)) return null;
       const entry = { result: ruling.result, ...(ruling.card ? { card: ruling.card } : {}),
         from: { head: r.head, runId: r.runId, key: ruling.key, rulingId: ruling.id } };
       return reviewerCarryBacking(entry, { ...options, records: list, operatorRulings, repo, pr, identityTable, target: referral })
