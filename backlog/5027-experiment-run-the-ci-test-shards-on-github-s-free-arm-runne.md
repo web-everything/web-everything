@@ -3,10 +3,11 @@ bornAs: xx5u6zt
 kind: story
 size: 2
 parent: "3383"
-status: active
+status: resolved
 scope: ["we:.github/workflows/ci.yml", "we:scripts/ci/shard-runner-compare.mjs", "we:scripts/ci/__tests__/shard-runner-compare.test.mjs", "we:scripts/ci/__tests__/ci-shard-runner-switch.test.mjs"]
 dateOpened: "2026-10-03"
 dateStarted: "2026-10-06"
+dateResolved: "2026-10-06"
 preparedDate: "2026-10-06"
 preparedAgainstSha: "75c39659a06fefd7ee76fb1af223d53880109a25"
 tags: []
