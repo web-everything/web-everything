@@ -211,7 +211,7 @@ describe('daemon version switching', () => {
     for (const id of ['x1', 'x2', 'x3', 'x4']) version(id, 'built', 500000);
     let removals = 0, rival;
     deps2.fs = { ...fs, rmSync: (...args) => {
-      if (String(args[0]).includes('/versions/x')) {
+      if (String(args[0]).includes('/versions/.trash-x') && fs.existsSync(args[0])) { // the deletion of a version moved aside
         now += 20000; removals++;
         // 40s after acquisition but only 20s since the last renewal: still held.
         if (removals === 2) rival = api.switchCurrent({ clone, home, settings, deps, id: 'b', expectCurrent: 'a' });
@@ -224,6 +224,134 @@ describe('daemon version switching', () => {
     expect(await rival).toEqual({ status: 'busy' });
     expect(result).toEqual({ status: 'busy' }); // noticed the takeover before the fourth removal
     expect(['x1', 'x2', 'x3', 'x4'].filter(id => fs.existsSync(join(root, 'versions', id)))).toHaveLength(1);
+  });
+  // Lets a rival run to completion at a seam, after our lease has expired, then hands control back.
+  const supersede = (id, expectCurrent) => {
+    now += 30001;
+    return api.switchCurrent({ clone, home, settings, deps, id, expectCurrent });
+  };
+  it('superseded switch holder cannot overwrite a completed switch', async () => {
+    let rival;
+    // We stall after recording our intent and before any pointer moves; the lease expires and a rival wins a→c.
+    deps2.failBeforeRename = () => { rival = supersede('c', 'a'); };
+    expect(await api.switchCurrent({ clone, home, settings, deps: deps2, id: 'b', expectCurrent: 'a' })).toEqual({ status: 'busy' });
+    expect(await rival).toMatchObject({ status: 'switched', id: 'c' });
+    expect(current()).toBe('versions/c'); expect(fs.readlinkSync(join(root, 'previous'))).toBe('versions/a');
+    expect(state()).toMatchObject({ adopted: 'c', probation: { id: 'c', prev: 'a' } });
+    expect(state().pending).toBeUndefined();
+    expect(files()).toEqual(['current', 'previous', 'state.json', 'versions']);
+  });
+  it('a superseded holder stops between the previous and current pointer renames', async () => {
+    let rival;
+    const real = fs.renameSync;
+    deps2.fs = { ...fs, renameSync: (...args) => {
+      const done = real(...args);
+      if (String(args[1]).endsWith('/previous') && !rival) rival = supersede('c', 'a'); // lands after our previous move
+      return done;
+    } };
+    expect(await api.switchCurrent({ clone, home, settings, deps: deps2, id: 'b', expectCurrent: 'a' })).toEqual({ status: 'busy' });
+    expect(await rival).toMatchObject({ status: 'switched', id: 'c' });
+    expect(current()).toBe('versions/c'); expect(state()).toMatchObject({ adopted: 'c' });
+    expect(files()).toEqual(['current', 'previous', 'state.json', 'versions']);
+  });
+  it('a superseded reconcile cannot write state it read before the takeover', async () => {
+    writeState({ ...state(), adopted: 'x' });
+    let rival, stalled = false;
+    deps2.fs = { ...fs, readFileSync: (...args) => {
+      const text = fs.readFileSync(...args); // what we read before stalling
+      if (!stalled && String(args[0]).endsWith('/state.json')) { stalled = true; rival = supersede('c', 'a'); }
+      return text;
+    } };
+    expect(await api.reconcile({ clone, home, settings, deps: deps2 })).toEqual({ status: 'busy' });
+    expect(await rival).toMatchObject({ status: 'switched', id: 'c' });
+    expect(state()).toMatchObject({ adopted: 'c', probation: { id: 'c', prev: 'a' } });
+  });
+  it('rollback recovers pending pointer changes before selecting previous', async () => {
+    link('previous', 'c');
+    const real = fs.renameSync; let renames = 0;
+    deps.fs = { ...fs, renameSync: (...args) => { if (String(args[1]).endsWith('/current') && !renames++) throw new Error('crash'); return real(...args); } };
+    await expect(call('switchCurrent', { id: 'b', expectCurrent: 'a' })).rejects.toThrow('crash');
+    delete deps.fs;
+    // current and previous both name a now; the intent remembers that previous was c.
+    expect(fs.readlinkSync(join(root, 'previous'))).toBe('versions/a');
+    expect(await call('rollback', { reason: 'broken', by: 'operator' })).toMatchObject({ status: 'switched', id: 'c', previous: 'a' });
+    expect(current()).toBe('versions/c'); expect(fs.readlinkSync(join(root, 'previous'))).toBe('versions/a');
+    expect(state()).toMatchObject({ adopted: 'c', hold: { version: 'a', reason: 'broken' } }); expect(state().pending).toBeUndefined();
+  });
+  it('rollback after a crash past the pointer rename rolls back the version that really became current', async () => {
+    deps.failAfterRename = () => { throw new Error('crash'); };
+    await expect(call('switchCurrent', { id: 'b', expectCurrent: 'a' })).rejects.toThrow('crash');
+    delete deps.failAfterRename;
+    expect(await call('rollback')).toMatchObject({ status: 'switched', id: 'a' });
+    expect(state()).toMatchObject({ adopted: 'a', probation: null, retired: { a: expect.any(String), b: expect.any(String) } });
+  });
+  it('a switch right after a crashed probation rollback does not resurrect the rejected version', async () => {
+    await call('switchCurrent', { id: 'b', expectCurrent: 'a' });
+    deps.health.mockResolvedValue({ ok: false, reason: 'unhealthy' });
+    deps.failAfterRename = () => { throw new Error('crash'); };
+    await expect(call('checkProbation')).rejects.toThrow('crash');
+    delete deps.failAfterRename;
+    expect(json(join(root, 'versions/b/.version.json')).status).toBe('built'); // rejection not applied yet
+    expect(await call('switchCurrent', { id: 'b', expectCurrent: 'a' })).toMatchObject({ status: 'refused', reason: 'not-built' });
+    expect(current()).toBe('versions/a'); expect(json(join(root, 'versions/b/.version.json')).status).toBe('rejected');
+  });
+  it('reports a switch that already moved the pointer as switched even if a successor took over before the state write', async () => {
+    let rival;
+    deps2.failAfterRename = () => { rival = supersede('c', 'b'); }; // we stall after current moved to b
+    expect(await api.switchCurrent({ clone, home, settings, deps: deps2, id: 'b', expectCurrent: 'a' })).toMatchObject({ status: 'switched', id: 'b' });
+    expect(await rival).toMatchObject({ status: 'switched', id: 'c' });
+    expect(current()).toBe('versions/c');
+    expect(state()).toMatchObject({ adopted: 'c', probation: { id: 'c', prev: 'b' } }); // not clobbered by our stale state
+    expect(state().pending).toBeUndefined();
+  });
+  it('probation rollback that landed before a takeover still raises its alert', async () => {
+    await call('switchCurrent', { id: 'b', expectCurrent: 'a' });
+    deps.health.mockResolvedValue({ ok: false, reason: 'unhealthy' });
+    deps2.failAfterRename = () => { supersede('c', 'a'); };
+    expect(await api.checkProbation({ clone, home, settings, deps: { ...deps2 } })).toMatchObject({ status: 'switched', id: 'a' });
+    expect(deps2.alert).toHaveBeenCalledTimes(1); // deps2 shares the alert mock with deps
+  });
+  it('a dry run during a half-done switch says recovery is pending instead of judging it', async () => {
+    link('previous', 'c');
+    const real = fs.renameSync; let renames = 0;
+    deps.fs = { ...fs, renameSync: (...args) => { if (String(args[1]).endsWith('/current') && !renames++) throw new Error('crash'); return real(...args); } };
+    await expect(call('switchCurrent', { id: 'b', expectCurrent: 'a' })).rejects.toThrow('crash');
+    delete deps.fs;
+    expect(await call('rollback', { dryRun: true })).toEqual({ status: 'recovery-pending' });
+    expect(await call('switchCurrent', { id: 'b', expectCurrent: 'a', dryRun: true })).toEqual({ status: 'recovery-pending' });
+    expect((await call('status')).pending).toMatchObject({ id: 'b', actual: 'a', oldPrevious: 'c' });
+    expect(state().pending).toBeTruthy(); // read-only: nothing was recovered or written
+    expect(await call('reconcile')).toEqual({ status: 'reconciled' });
+    expect(await call('rollback', { dryRun: true })).toEqual({ status: 'dry-run', current: 'a', target: 'c' });
+    expect((await call('status')).pending).toBe(null);
+  });
+  it('restores a leftover previous when a first adoption crashes before the current rename', async () => {
+    fs.rmSync(join(root, 'current')); link('previous', 'c');
+    const real = fs.renameSync;
+    deps.fs = { ...fs, renameSync: (...args) => { if (String(args[1]).endsWith('/current')) throw new Error('crash'); return real(...args); } };
+    await expect(call('switchCurrent', { id: 'b', expectCurrent: null })).rejects.toThrow('crash');
+    expect(fs.existsSync(join(root, 'previous'))).toBe(false); // removed before the crash
+    delete deps.fs;
+    expect(await call('reconcile')).toMatchObject({ status: expect.stringMatching(/reconciled|ok/) });
+    expect(fs.readlinkSync(join(root, 'previous'))).toBe('versions/c');
+    expect(fs.existsSync(join(root, 'current'))).toBe(false); expect(state().pending).toBeUndefined();
+  });
+  it('gc hides a version from every reader before it starts deleting it, and finishes a crashed deletion', async () => {
+    version('old1', 'built', 900000); version('old2', 'built', 900000);
+    let seen;
+    deps2.fs = { ...fs, rmSync: (...args) => {
+      // Mid-deletion (which can outlast the lease): the version id must already be gone, so nobody can switch or pin to it.
+      if (String(args[0]).includes('/versions/.trash-old1') && fs.existsSync(args[0])) seen = { visible: fs.existsSync(join(root, 'versions/old1')) };
+      if (String(args[0]).includes('/versions/.trash-old2') && fs.existsSync(args[0])) throw new Error('crash mid-delete');
+      return fs.rmSync(...args);
+    } };
+    await expect(api.gc({ clone, home, settings, deps: deps2 })).rejects.toThrow('crash mid-delete');
+    expect(seen).toEqual({ visible: false });
+    expect(fs.existsSync(join(root, 'versions/old2'))).toBe(false);
+    expect(await call('switchCurrent', { id: 'old2', expectCurrent: 'a' })).toMatchObject({ status: 'refused' });
+    expect((await call('status')).versions.map(v => v.id)).not.toContain('old2');
+    await call('gc');
+    expect(fs.readdirSync(join(root, 'versions')).filter(name => name.startsWith('.trash-'))).toEqual([]);
   });
   it('GC respects protected versions, cleans stale pins and retains one failed build', async () => {
     link('previous', 'b');

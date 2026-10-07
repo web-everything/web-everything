@@ -54,15 +54,6 @@ function context({ clone, home, settings, deps = {} }) {
     if (!entry.isFile()) throw new Error(`Unsafe metadata file: ${path}`);
     return JSON.parse(fs.readFileSync(path, 'utf8'));
   };
-  const atomic = (relative, value) => {
-    const path = safe(relative);
-    const temp = `${path}.tmp.${process.pid}.${sequence++}`;
-    let created = false;
-    try {
-      fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { flag: 'wx' }); created = true;
-      fs.renameSync(temp, path);
-    } finally { if (created) fs.rmSync(temp, { force: true }); }
-  };
   const linkId = name => {
     safe();
     const path = join(root, name);
@@ -77,10 +68,21 @@ function context({ clone, home, settings, deps = {} }) {
   const state = () => ({ adopted: null, retired: {}, hold: null, probation: null, ...read('state.json') });
   const record = id => read(`versions/${validId(id)}/.version.json`);
   safe();
-  return { fs, root, now, stat, safe, read, atomic, linkId, state, record, deps,
+  const c = { fs, root, now, stat, safe, read, linkId, state, record, deps,
     config: validateDaemonVersionsSettings(settings),
     host: () => typeof deps.hostname === 'string' ? deps.hostname : (deps.hostname ?? hostname)(),
   };
+  c.atomic = (relative, value) => {
+    fence(c); // a holder whose lease expired must not publish state it read before the takeover
+    const path = safe(relative);
+    const temp = `${path}.tmp.${process.pid}.${sequence++}`;
+    let created = false;
+    try {
+      fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { flag: 'wx' }); created = true;
+      fs.renameSync(temp, path);
+    } finally { if (created) fs.rmSync(temp, { force: true }); }
+  };
+  return c;
 }
 /**
  * The lock is a numbered generation of directories, switch.lock.<n>; the highest n is the
@@ -89,8 +91,14 @@ function context({ clone, home, settings, deps = {} }) {
  * break a lock, so there is no stat-then-remove window. Holders mark their generation
  * released rather than deleting it (generations must never repeat); the winner of a higher
  * generation removes the lower ones. Long actions call renew() so they never look stale.
+ * A holder can still stall past its lease (pause, swap, SIGSTOP), so every write checks, just
+ * before it happens, that the holder is still the top generation (fence). A holder that finds
+ * itself superseded stops with `busy`. Only the instant between that check and the rename
+ * itself stays open: a pointer rename has no compare-and-swap.
  */
 const LOCK = 'switch.lock.';
+const TRASH = '.trash-'; // a version being deleted by gc; hidden from versions()
+class Superseded extends Error {}
 function lockGenerations(c) {
   // Only canonical generation directories count; anything else in the home is not ours.
   return c.fs.readdirSync(c.safe('', true), { withFileTypes: true })
@@ -121,6 +129,9 @@ function locked(c, action) {
     const time = new Date(c.now()); fs.utimesSync(path, time, time);
     for (const old of generations) fs.rmSync(join(root, `${LOCK}${old}`), { recursive: true, force: true });
     return action();
+  } catch (error) {
+    if (error instanceof Superseded) return { status: 'busy' };
+    throw error;
   } finally {
     c.held = null;
     // If this fails the generation simply expires; a superseded holder's directory is already gone.
@@ -135,8 +146,11 @@ function renew(c) {
   catch (error) { if (error.code === 'ENOENT') return false; throw error; } // taken over just now
   return true;
 }
+/** Throws Superseded (turned into `busy` by locked) unless we still hold the lock; renews the lease too. */
+function fence(c) { if (!renew(c)) throw new Superseded(); }
 function replaceLink(c, name, id) {
   c.linkId(name); // Refuse unsafe existing pointers, even though rename would replace them.
+  fence(c);
   const temp = join(c.root, `${name}.tmp.${process.pid}`);
   let created = false;
   try {
@@ -147,6 +161,12 @@ function replaceLink(c, name, id) {
 function switchInside(c, { id, expectCurrent, rollback = false, reason, by, reject = null, dryRun = false }) {
   validId(id);
   if (expectCurrent !== null) validId(expectCurrent);
+  // A crashed earlier switch is finished or discarded first: every decision below (current,
+  // previous, whether a version is still built) must see the recovered state, not the half-done one.
+  // A dry run is read-only so it cannot recover; it says so rather than judging a half-done switch.
+  if (dryRun && c.state().pending) return { status: 'recovery-pending' };
+  const state = dryRun ? null : c.state();
+  if (state) settle(c, state);
   const actual = c.linkId('current');
   if (actual !== expectCurrent) return { status: 'aborted', reason: 'current-moved', actual };
   const dir = c.safe(`versions/${id}`, true);
@@ -157,9 +177,6 @@ function switchInside(c, { id, expectCurrent, rollback = false, reason, by, reje
   }
   if (actual === id) return { status: 'noop' };
   if (dryRun) return { status: 'dry-run', current: actual, target: id };
-  const state = c.state();
-  // A crashed earlier switch is finished or discarded before this one builds on its state.
-  settle(c, state);
   // Everything that can fail on bad metadata is read here, before any pointer moves.
   const intent = { id, actual, rollback, since: new Date(c.now()).toISOString(),
     probation: !rollback && c.config.autoRollback, reason: reason ?? 'rollback', by: by ?? 'operator',
@@ -170,11 +187,16 @@ function switchInside(c, { id, expectCurrent, rollback = false, reason, by, reje
   c.deps.failBeforeRename?.();
   if (actual) replaceLink(c, 'previous', actual);
   else {
-    c.linkId('previous'); c.fs.rmSync(join(c.root, 'previous'), { force: true });
+    c.linkId('previous'); fence(c); c.fs.rmSync(join(c.root, 'previous'), { force: true });
   }
   replaceLink(c, 'current', id);
   c.deps.failAfterRename?.();
-  commit(c, state, intent); c.atomic('state.json', state);
+  try { commit(c, state, intent); c.atomic('state.json', state); }
+  catch (error) {
+    // The pointer already moved. A successor that took over replays our recorded intent (or has
+    // already), so this is a switch that happened, not a refusal; our stale state must not be written.
+    if (!(error instanceof Superseded)) throw error;
+  }
   return { status: 'switched', id, previous: actual };
 }
 /** Every effect of a switch beyond the pointers; idempotent so a crashed one can be replayed. */
@@ -202,9 +224,9 @@ function settle(c, state) {
   else {
     // The pointer rename never landed. If `previous` was already replaced, put it back: otherwise
     // it equals `current` and the way back (and its gc protection) is lost.
-    if (current === intent.actual && intent.actual && c.linkId('previous') !== intent.oldPrevious) {
+    if (current === intent.actual && c.linkId('previous') !== intent.oldPrevious) { // also a first adoption (actual null)
       if (intent.oldPrevious && c.stat(c.safe(`versions/${intent.oldPrevious}`, true))) replaceLink(c, 'previous', intent.oldPrevious);
-      else c.fs.rmSync(join(c.root, 'previous'), { force: true });
+      else { fence(c); c.fs.rmSync(join(c.root, 'previous'), { force: true }); }
     }
     delete state.pending;
   }
@@ -252,7 +274,7 @@ export async function unpin(options) {
   const { path, value } = pinPath(c, options);
   return locked(c, () => {
     // A delayed cleanup from an old adoption must not erase this PID's new pin.
-    if (c.read(path)?.id === value.id) c.fs.rmSync(c.safe(path), { force: true });
+    if (c.read(path)?.id === value.id) { fence(c); c.fs.rmSync(c.safe(path), { force: true }); }
     return { status: 'unpinned' };
   });
 }
@@ -291,7 +313,7 @@ function livePins(c, prune = false) {
       }
     }
     if (live) ids.add(value.id);
-    else if (prune) c.fs.rmSync(c.safe(relative), { force: true });
+    else if (prune) { fence(c); c.fs.rmSync(c.safe(relative), { force: true }); }
   }
   return ids;
 }
@@ -303,6 +325,10 @@ export async function gc(options) {
     settle(c, state); // a half-done switch must not have its previous/current judged unprotected
     const current = c.linkId('current'), previous = c.linkId('previous');
     const pins = livePins(c, true), entries = versions(c);
+    // Finish deletions a crashed gc started; trash is unreachable by id, so nothing can race this.
+    for (const entry of c.stat(c.safe('versions', true)) ? c.fs.readdirSync(c.safe('versions', true), { withFileTypes: true }) : []) {
+      if (entry.isDirectory() && entry.name.startsWith(TRASH)) c.fs.rmSync(join(c.root, 'versions', entry.name), { recursive: true, force: true });
+    }
     const built = e => e.record?.id === e.id && e.record.status === 'built';
     const failed = e => e.record?.id === e.id && ['rejected', 'smoke-failed'].includes(e.record.status);
     const newest = (a, b) => (Date.parse(b.record?.builtAt) || 0) - (Date.parse(a.record?.builtAt) || 0) || b.id.localeCompare(a.id);
@@ -320,7 +346,12 @@ export async function gc(options) {
       else {
         // A takeover means another process may now be mutating versions; stop rather than race it.
         if (!renew(c)) return { status: 'busy' };
-        c.fs.rmSync(c.safe(`versions/${id}`, true), { recursive: true }); removed.push(id);
+        // Move it out of sight in one fenced rename, then delete: a deletion that outlives our lease
+        // must never leave a half-removed tree that a successor can still see, pin or switch to.
+        const trash = join(c.safe('versions', true), `${TRASH}${id}`);
+        c.fs.rmSync(trash, { recursive: true, force: true });
+        c.fs.renameSync(c.safe(`versions/${id}`, true), trash);
+        c.fs.rmSync(trash, { recursive: true, force: true }); removed.push(id);
       }
     }
     return { removed, kept };
@@ -330,6 +361,9 @@ export async function rollback(options) {
   const c = context(options); if (!c) return disabled;
   if (options.to != null) validId(options.to);
   return locked(c, () => {
+    // The target is read from `previous`, which a crashed switch can have half-updated: recover first.
+    if (!options.dryRun) settle(c, c.state());
+    else if (c.state().pending) return { status: 'recovery-pending' };
     const id = options.to ?? c.linkId('previous');
     if (!id) return { status: 'no-previous' };
     return switchInside(c, { ...options, id, expectCurrent: c.linkId('current'), rollback: true });
@@ -351,7 +385,9 @@ export async function checkProbation(options) {
   if (!c.deps.health) throw new Error('Probation requires a health dependency');
   const health = await c.deps.health({ id: p.id, clone: options.clone });
   return locked(c, () => {
-    const state = c.state(), actual = c.linkId('current');
+    const state = c.state();
+    settle(c, state); // another process may have crashed mid-switch while health ran
+    const actual = c.linkId('current');
     if (actual !== p.id || JSON.stringify(state.probation) !== JSON.stringify(p)) {
       return { status: 'aborted', reason: 'current-moved', actual };
     }
@@ -370,7 +406,7 @@ export async function status(options) {
   const c = context(options); if (!c) return disabled;
   const state = c.state(), pins = livePins(c);
   return { current: c.linkId('current'), previous: c.linkId('previous'), adopted: state.adopted,
-    hold: state.hold, probation: state.probation,
+    hold: state.hold, probation: state.probation, pending: state.pending ?? null, // non-null: pointers/probation below are mid-recovery
     versions: versions(c).map(({ id, record }) => ({ id, status: record?.status ?? 'unknown', pinned: pins.has(id), retiredAt: Object.hasOwn(state.retired, id) ? state.retired[id] : null })),
   };
 }
