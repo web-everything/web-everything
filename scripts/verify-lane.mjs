@@ -82,6 +82,22 @@ import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, r
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
 const flags = {};
 const positionals = [];
+// #item-98 — `--help`/`-h` prints usage and exits 0 BEFORE any git read, admission or gate. Without this the stray flag
+// fell through to the default `verify` mode and ran (and stamped a green marker from) the whole gate.
+if (process.argv.slice(2).some((a) => a === '--help' || a === '-h')) {
+  process.stdout.write(`verify-lane — verify a lane clone before it lands (writes the .lane-verify marker).
+
+Usage: node scripts/verify-lane.mjs [verify|request|check|reset|run] [flags]
+  (none)    run the diff-selected gate here and stamp the marker
+  request   stamp a running marker; the verify daemon runs the gate
+  check     read-only verdict for HEAD (--wait=<ms> blocks until it settles)
+  reset     clear a stale marker
+  run       synchronous marker-less run
+Flags: --repo=<dir> --json --require-verified --help/-h
+Exit: 0 ok, 2 red, 3 usage/refused. Full docs: the header of scripts/verify-lane.mjs.
+`);
+  process.exit(0);
+}
 for (const a of process.argv.slice(2)) {
   if (a.startsWith('--')) {
     const eq = a.indexOf('=');

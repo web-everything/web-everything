@@ -144,8 +144,14 @@ The Codex probation route already delegates stamping and committed-stamp verific
 ### 4. Run the gate GREEN
 
 ```bash
-npm run check:standards
+node scripts/verify-lane.mjs request --repo=.
+node scripts/verify-lane.mjs check --wait=540000 --repo=.   # re-run on `timeout`
 ```
+
+This is the ONLY gate run for a card-only prepare. On a `backlog/`-only diff the gate takes its light path
+(scoped `check:standards`, no Vitest) and stamps the marker `open-pr` requires. Do NOT also run
+`npm run check:standards`, and do NOT run `verify-lane` again after `open-pr` (CI runs the light card-only
+suite itself). Never pass `--help`/`-h` expecting a dry run: it prints usage only.
 
 The gate checks item shape; it does not replace the explicit `preparedDate` check above. A red gate is a
 hard stop — fix the authoring until it is green.

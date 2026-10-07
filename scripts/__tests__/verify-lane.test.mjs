@@ -1526,3 +1526,14 @@ describe('verify phase telemetry (#5141)', () => {
       }
     });
 });
+
+describe('item 98 — --help prints usage without running the gate', () => {
+  for (const flag of ['--help', '-h']) {
+    it(`${flag} exits 0 with usage and writes no marker`, () => {
+      const r = spawnSync('node', [VERIFY_LANE, flag, `--repo=${dir}`], { encoding: 'utf8', timeout: 20000 });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/Usage: node scripts\/verify-lane\.mjs/);
+      expect(existsSync(join(dir, '.git', '.lane-verify'))).toBe(false);
+    });
+  }
+});

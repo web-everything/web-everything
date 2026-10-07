@@ -174,3 +174,14 @@ describe('lane-pool acquire --purpose=conveyor-prepare-item', () => {
     expect(g(['rev-parse', 'HEAD'], JSON.parse(r.out).path)).toBe(originMain);
   }));
 });
+
+describe('item 98 — prepare-item brief runs the gate once, via the marker-writing light path', () => {
+  it('step 4 uses verify-lane request/check and forbids a second gate run', async () => {
+    const brief = readFileSync(join(process.cwd(), 'skills-src/conveyor/prepare-item-agent-brief.md'), 'utf8');
+    const step4 = brief.slice(brief.indexOf('### 4. Run the gate GREEN'), brief.indexOf('### 5'));
+    expect(step4).toMatch(/verify-lane\.mjs request/);
+    expect(step4).toMatch(/check --wait=/);
+    expect(step4).not.toMatch(/^npm run check:standards$/m);
+    expect(step4).toMatch(/ONLY gate run/);
+  });
+});
