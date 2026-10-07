@@ -26,6 +26,11 @@
  *     `gh run watch`) — the drain/pr-watch own merge+CI, report and exit — or a sleep loop over a background
  *     task's `tasks/<id>.output` / a `subagents/*.jsonl` transcript — re-run the gate in the foreground with an
  *     explicit timeout instead. The interactive main session gets a WARN (`systemMessage`), never a deny.
+ *   • NO-POLLING — a shell loop (`for|while|until`) whose body sleeps/waits (`sleep`, `perl -e 'sleep'|select(undef…)`,
+ *     `node -e` setTimeout, `python -c time.sleep`, `read -t`), or ANY single wait longer than `maxSleepSeconds`
+ *     (scripts/guard-bash-polling.json, default 30), in EVERY session kind. A session stuck in a wait cannot be
+ *     messaged (incident: a build agent sat ~20 min in such a loop). Allowlist: a bare background `sleep N<=120`
+ *     heartbeat only. Alternatives: end the turn (#5137 await-verify), one `verify-lane check --wait=`, report pending. No override.
  *   • a BACKGROUNDED codex-direct-task.mjs / gemini-direct-task.mjs invocation — both scripts are
  *     synchronous by contract (see their FOREGROUND ONLY banners). No override (#3383).
  *   • a backlog item-mutation (claim/scaffold/…) run in a lane clone whose HEAD is BEHIND origin/main —
@@ -2034,6 +2039,110 @@ export function interactiveWaitPollNudge(command, { agentSession = false } = {})
   return null;
 }
 
+// ── NO-POLLING — agents may not run wait/poll loops or long sleeps ──────────────────────────────────────────
+// Incident: a build agent sat ~20 min in `for i in $(seq 1 38); do if grep … daemon.log …; then break; fi;
+// perl -e 'select(undef,undef,undef,…)'; done` — unable to receive messages, and had to be killed. Other agents
+// used `perl -e 'sleep 330'` and `until …; do …; perl -e 'sleep 120'; done`. A session that is inside a Bash
+// call cannot be messaged or resumed, so a wait loop is a stall the harness cannot see. Rule: (1) a shell loop
+// (`for|while|until`) whose body sleeps/waits is DENIED, however it waits; (2) any SINGLE wait longer than
+// `maxSleepSeconds` (scripts/guard-bash-polling.json, default 30) is DENIED. Applies to EVERY session kind
+// (main, subagent, conveyor). No override. Sanctioned allowlist (see the json): a bare `sleep N` (N <=
+// heartbeat.maxSeconds) run with run_in_background:true — the harness-tracked heartbeat of /workflow and
+// /conveyor. `verify-lane check --wait=<ms>` contains no sleep (it polls internally) so it is simply not matched.
+const POLLING_DEFAULTS = { maxSleepSeconds: 30, heartbeatMaxSeconds: 120 };
+function loadPollingSettings() {
+  try {
+    const j = JSON.parse(readFileSync(new URL('./guard-bash-polling.json', import.meta.url), 'utf8'));
+    const max = Number(j.maxSleepSeconds);
+    const hb = Number(j.heartbeat && j.heartbeat.maxSeconds);
+    return {
+      maxSleepSeconds: Number.isFinite(max) && max > 0 ? max : POLLING_DEFAULTS.maxSleepSeconds,
+      heartbeatMaxSeconds: Number.isFinite(hb) && hb >= 0 ? hb : POLLING_DEFAULTS.heartbeatMaxSeconds,
+    };
+  } catch { return { ...POLLING_DEFAULTS }; }
+}
+const POLLING_UNIT = { s: 1, m: 60, h: 3600, d: 86400 };
+/** Seconds named by the args of a `sleep` (GNU/BSD: `30`, `1m`, `1h 30m`), Infinity for `infinity`, NaN if unknown. */
+function sleepArgsSeconds(args) {
+  const toks = args.trim().split(/\s+/).filter(Boolean);
+  if (!toks.length) return NaN;
+  let total = 0;
+  for (const t of toks) {
+    if (/^infinity$/i.test(t)) return Infinity;
+    const m = t.match(/^(\d+(?:\.\d+)?)([smhd]?)$/);
+    if (!m) return toks.length && total > 0 ? total : NaN;
+    total += Number(m[1]) * POLLING_UNIT[m[2] || 's'];
+  }
+  return total;
+}
+/** Every wait in `text` as `{ seconds }` (seconds may be NaN when the duration is not a literal). Pure. */
+function waitsIn(text) {
+  const masked = maskQuoted(text);
+  const waits = [];
+  const sleepRe = new RegExp(`${CMD_POS}(?:\\S*/)?(?:sleep|usleep)\\b([^;&|\\n)]*)`, 'g');
+  for (const m of masked.matchAll(sleepRe)) {
+    const isU = /usleep/.test(m[0]);
+    const s = sleepArgsSeconds(m[1]);
+    waits.push({ seconds: isU ? Number(m[1].trim()) / 1e6 : s });
+  }
+  if (new RegExp(`(?:${CMD_POS}|\\b(?:while|until|if)\\s+)read\\s+(?:-\\S+\\s+)*?-[A-Za-z]*t\\b`).test(masked)) waits.push({ seconds: NaN });
+  // Interpreter one-liners: the wait lives INSIDE the quoted script, so scan the raw text.
+  for (const m of text.matchAll(/\bperl\b[^\n]*?\s-\w*e\s*(['"])([\s\S]*?)\1/g)) {
+    const body = m[2];
+    for (const x of body.matchAll(/\bsleep\b\s*\(?\s*([\d.]+)?/g)) waits.push({ seconds: x[1] ? Number(x[1]) : NaN });
+    for (const x of body.matchAll(/select\s*\(\s*undef\s*,\s*undef\s*,\s*undef\s*,\s*([^)]*)\)/g)) {
+      const n = Number(x[1].trim());
+      waits.push({ seconds: Number.isFinite(n) ? n : NaN });
+    }
+  }
+  for (const m of text.matchAll(/\b(?:node|bun|deno)\b[^\n]*?\s(?:-e|--eval|-p|--print)\s*(['"`])([\s\S]*?)\1/g)) {
+    const body = m[2];
+    for (const x of body.matchAll(/setTimeout\s*\([^,]*,\s*([\d_.*\s]+)\)/g)) {
+      let ms = NaN; try { ms = Function(`return (${x[1].replace(/_/g, '')})`)(); } catch { /* unknown */ }
+      waits.push({ seconds: Number.isFinite(ms) ? ms / 1000 : NaN });
+    }
+    if (/setTimeout\s*\(/.test(body) && !/setTimeout\s*\([^,]*,\s*[\d_.*\s]+\)/.test(body)) waits.push({ seconds: NaN });
+    for (const x of body.matchAll(/Atomics\.wait\s*\([^,]*,[^,]*,[^,]*,\s*([\d_.]+)/g)) waits.push({ seconds: Number(x[1].replace(/_/g, '')) / 1000 });
+  }
+  for (const m of text.matchAll(/\bpython3?\b[^\n]*?\s-c\s*(['"])([\s\S]*?)\1/g)) {
+    for (const x of m[2].matchAll(/time\.sleep\s*\(\s*([\d.]+)?/g)) waits.push({ seconds: x[1] ? Number(x[1]) : NaN });
+  }
+  return waits;
+}
+/** Is `command` the allowlisted heartbeat: a bare `sleep N` (N <= limit), run in the background? Pure. */
+function isSanctionedHeartbeat(command, { runInBackground = false, heartbeatMaxSeconds }) {
+  if (!runInBackground) return false;
+  const m = String(command || '').trim().match(/^sleep\s+(\d+)$/);
+  return !!m && Number(m[1]) <= heartbeatMaxSeconds;
+}
+const POLLING_ADVICE = ' Do not wait in a shell. Instead: (a) END YOUR TURN and let the harness/daemon resume you (the #5137 await-verify flow — '
+  + 'request the gate, report what is pending, stop); (b) for the verify gate use ONE bounded foreground call, '
+  + '`node scripts/verify-lane.mjs check --wait=540000 --json` (it polls internally); or (c) report what is still pending and finish. '
+  + 'Ordinary non-waiting loops (`for f in *.mjs; do …; done`) and a short `sleep` (<= the limit) are fine. No override.';
+/** The DENY reason for a polling loop / long sleep, else null. Pure; every session kind. `settings` is injectable for tests. */
+export function pollingLoopReason(command, { runInBackground = false, settings = loadPollingSettings() } = {}) {
+  const raw = heredocScan(String(command || '')).text;
+  if (!raw.trim()) return null;
+  if (isSanctionedHeartbeat(raw, { runInBackground, heartbeatMaxSeconds: settings.heartbeatMaxSeconds })) return null;
+  let nested = [];
+  const peelTimeout = (seg) => seg.replace(/^\s*timeout\s+(?:-\S+\s+)*\S+\s+/, '');
+  try { nested = parseSegments(raw).segments.flatMap((seg) => nestedCommandStrings(peelTimeout(seg))); } catch { nested = []; }
+  // A nested `-c`/`$()` script is scanned separately, but the OUTER text also contains it (quoted); the loop
+  // keyword must be at command position of the text being scanned, so each view is judged on its own.
+  for (const text of [raw, ...nested]) {
+    const waits = waitsIn(text);
+    if (!waits.length) continue;
+    if (POLL_LOOP_KEYWORD.test(maskQuoted(text))) {
+      return `a shell loop (for/while/until) whose body sleeps or waits is a POLLING LOOP — denied (an agent stuck in one cannot receive messages; a build agent sat ~20 min in exactly this and had to be killed).${POLLING_ADVICE}`;
+    }
+    const long = waits.find((w) => w.seconds > settings.maxSleepSeconds);
+    if (long) {
+      return `a single wait of ${Number.isFinite(long.seconds) ? `${Math.round(long.seconds)}s` : 'unbounded length'} exceeds the ${settings.maxSleepSeconds}s limit (scripts/guard-bash-polling.json) — denied (a session blocked in a long sleep cannot receive messages).${POLLING_ADVICE}`;
+    }
+  }
+  return null;
+}
+
 /**
  * Is `cwd` a constellation PRIMARY checkout (not a lane clone)? Pure. A lane clone lives under `/.lanes/` so
  * it is always allowed; otherwise cwd must sit at/under one of the `primaries` roots. `primaries` is injected
@@ -3865,6 +3974,9 @@ export function decide(command, ctx = {}) {
   // sit in different segments), so it is checked here, never per segment. Agent sessions only.
   const waitPoll = agentWaitPollReason(command, { agentSession: ctx.agentSession });
   if (waitPoll) return waitPoll;
+  // NO-POLLING — every session kind; after the agent-specific wait-poll arm so that one keeps its sharper message.
+  const polling = pollingLoopReason(command, { runInBackground: ctx.runInBackground });
+  if (polling) return polling;
   // #2968 — the pipe/xargs, while-read, and `-exec` enumerate-then-`git add` sink shapes all need more than
   // one segment to see (the enumeration source is a DIFFERENT segment, or the `git add` sits inside a
   // compound whose head word is `while`/`find`). Whole-command, same shape as the two checks above it.
