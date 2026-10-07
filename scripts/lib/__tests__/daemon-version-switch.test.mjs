@@ -351,7 +351,7 @@ describe('daemon version switching', () => {
     expect(await call('switchCurrent', { id: 'old2', expectCurrent: 'a' })).toMatchObject({ status: 'refused' });
     expect((await call('status')).versions.map(v => v.id)).not.toContain('old2');
     await call('gc');
-    expect(fs.readdirSync(join(root, 'versions')).filter(name => name.startsWith('.trash-'))).toEqual([]);
+    expect(fs.readdirSync(`${root}/versions`).filter(name => name.startsWith('.trash-'))).toEqual([]);
   });
   it('GC respects protected versions, cleans stale pins and retains one failed build', async () => {
     link('previous', 'b');
