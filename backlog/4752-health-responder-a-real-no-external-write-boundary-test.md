@@ -3,7 +3,7 @@ bornAs: x8xwdlc
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/conveyor/__tests__/health-responder.test.mjs"]
+
 dateOpened: "2026-10-02"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "eb0677e86b2a5a17c060b7f6c6566e990bfaad83"
@@ -70,3 +70,12 @@ The build-dispatch daemon held #4752 with:
 > worker-declined: scope exceeds the test-fix envelope — route to the builder: the heal changed 277 lines (limit 150)
 
 Implementation changes were discarded. The card is held for the builder; its declared scope is preserved.
+
+## Findings (standalone worker, 2026-10-06)
+
+The build-dispatch daemon held #4752 with:
+
+> worker-declined: I have launched the git log search in the background to check if #4752 was already committed to main, and will inspect the results. I have initiated a search of git history to see the prior implementation or discarded attempts for item #4752. I will wait for the git log query to return. This item is not buildable within the test-fix probation launch constraints. ### Analysis & Rationale 1. **Rule Constraint:** &gt; "Keep the change small: at most 3 files and about 150 changed lines (the proven 'test-fix' envelope). A bigger change exceeds the envelope — stop and say so in your final message r…
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
