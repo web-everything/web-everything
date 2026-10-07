@@ -33,6 +33,7 @@ import { OPERATIONS, resolveOperation } from '../run.mjs';
 import {
   BRIEF_PLACEHOLDERS,
   BRIEF_VALUE_RE,
+  BRIEF_SCOPE_VALUE_RE,
   BRIEF_REQUIRED_BY_KIND,
   BRIEF_TOKEN_RE,
   DEFAULT_EXPECTED_WITHIN_MINUTES,
@@ -457,6 +458,33 @@ describe('the lane comes from the tick core or nowhere', () => {
       expect(text, f).toContain("--scope='{{SCOPE}}'");
       expect(text, f).not.toMatch(/--scope=\{\{SCOPE\}\}/);
     }
+  });
+
+  it('no conveyor brief carries {{SCOPE}} unquoted — scanned over every brief, not a hard-coded list', () => {
+    const dir = resolvePath(dirname(fileURLToPath(import.meta.url)), '../../../skills-src/conveyor');
+    let quoted = 0;
+    for (const f of readdirSync(dir).filter((n) => n.endsWith('.md'))) {
+      const text = readFileSync(join(dir, f), 'utf8');
+      // Every `{{SCOPE}}` occurrence must sit directly between single quotes: `'{{SCOPE}}'`.
+      for (const m of text.matchAll(/\{\{SCOPE\}\}/g)) {
+        const around = text.slice(Math.max(0, m.index - 1), m.index + m[0].length + 1);
+        // Prose mentions in a code span or a table cell (backtick/pipe delimited) are not shell fences.
+        if (/^[`|]/.test(around) || /[`|]$/.test(around)) continue;
+        expect(around, `${f} @${m.index}`).toBe("'{{SCOPE}}'");
+        quoted += 1;
+      }
+    }
+    // A floor, so the scan cannot pass vacuously if the briefs move or the directory is empty.
+    expect(quoted).toBeGreaterThanOrEqual(4);
+  });
+
+  it('refuses a {{SCOPE}} value that could close the quote or inject — `\'`, space, `;`, `$`, backtick, newline, `"`, `|`, `\\`', () => {
+    const read = tickRead();
+    for (const bad of ["we:a';id;'", 'we:a b', 'we:a;b', 'we:a$(id)', 'we:a`id`', 'we:a\nb', 'we:a"b', 'we:a|b', 'we:a\\b']) {
+      expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: [bad] } }, { num: '3037' }), JSON.stringify(bad))
+        .toThrow(/characters the brief cannot carry/);
+    }
+    expect(BRIEF_SCOPE_VALUE_RE.test("we:a'b")).toBe(false);
   });
 
   it('refuses an unscoped item — an empty scope declares a lane that owns no paths', () => {

@@ -590,7 +590,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     const reason = outcome?.reason ?? rec.reason;
     needsYou.push({ num: normNum(num), step, reason });
     heldNums.add(normNum(num));
-    try { effects.placePrepareHold?.({ num: normNum(num), reason: `card-refused: ${reason}` }); } catch { /* best-effort: the ledger already withholds it */ }
+    // The hold reason carries NO card-authored text: the hold router (`classifyHoldReason`) scans it unanchored for
+    // `spec already done on main: commit …` / `spec superseded`, which are routes that spawn lane work. The refusal
+    // text quotes the card's own scope value, so quoting it here would let a card steer that router. The full reason
+    // stays in the failure ledger and `needsYou`.
+    try { effects.placePrepareHold?.({ num: normNum(num), reason: `card-refused: dispatch-lane step ${step ?? 'unknown'} refused the card` }); } catch { /* best-effort: the ledger already withholds it */ }
   };
   // #4139 host-load gate on NEW launches only: refuse with a logged `host-load` reason, never touch running work, and
   // take no claim (so nothing needs releasing). Re-read per launch: a detached launch raises the load immediately.
