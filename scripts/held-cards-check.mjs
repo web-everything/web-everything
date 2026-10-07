@@ -27,9 +27,20 @@ export function wordStems(text) {
   return out;
 }
 
+/** Strip HTML comments until stable, so nested/overlapping input (`<!-<!---->-`) cannot rebuild a `<!--`. */
+export function stripHtmlComments(text) {
+  let prev;
+  let out = String(text);
+  do {
+    prev = out;
+    out = out.replace(/<!--.*?-->/gs, '');
+  } while (out !== prev);
+  return out.replace(/<!--/g, '').replace(/-->/g, '');
+}
+
 /** Named paths (`we:` prefix dropped; `:line` dropped), backticked or camelCase symbols, #PR numbers, slice names. */
 export function extractRefs(text) {
-  const body = String(text).replace(/<!--.*?-->/gs, '');
+  const body = stripHtmlComments(text);
   const paths = new Set();
   for (const m of body.matchAll(/(?:\bwe:)?((?:scripts|skills-src|docs|backlog|standards|tests|\.claude)\/[\w./<>*@-]*[\w>*])(?::\d+)?/g)) {
     paths.add(m[1].replace(TRAILING, ''));
