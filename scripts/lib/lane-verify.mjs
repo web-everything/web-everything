@@ -239,6 +239,19 @@ export function resolveVerifyOptions({ flags = {}, env = {} } = {}) {
   };
 }
 
+/** Env var the dispatcher (`verify-dispatch.mjs`) sets to a fresh per-run random nonce. `verify-lane.mjs` echoes it on
+ *  its later in-band queue markers (`⏳ gate queueing …` / `⏱ gate execution starting (phase: …)`) via
+ *  {@link markerNonceSuffix} and then deletes it from its own env, so gate commands cannot read it; the dispatcher
+ *  only honours a marker line that ends with the current run's suffix. Gate OUTPUT that merely prints a marker
+ *  therefore cannot move the dispatcher's timers (#5189). */
+export const VERIFY_MARKER_NONCE_ENV = 'WE_VERIFY_MARKER_NONCE';
+
+/** The exact line suffix an authenticated marker carries (` [nonce=<nonce>]`); empty when there is no nonce
+ *  (verify-lane run directly, outside a dispatcher). Shared so writer and checker cannot drift on the format. */
+export function markerNonceSuffix(nonce) {
+  return typeof nonce === 'string' && /^[0-9a-f]{8,128}$/.test(nonce) ? ` [nonce=${nonce}]` : '';
+}
+
 /** How long a `running` marker may sit before it reads as ABANDONED rather than still-in-flight. This only
  *  refines the human message (`abandoned` vs `in-flight`) — a `running` marker is "verification unfinished"
  *  either way, so the gate refuses regardless of age. Long enough to outlast a genuinely slow suite. */

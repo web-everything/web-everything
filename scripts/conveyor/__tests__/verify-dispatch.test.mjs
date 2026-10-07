@@ -305,11 +305,12 @@ function writeRequeueGate(dir, { firstGateMs, requeueWaitMs, secondGateMs, resum
     p,
     [
       `const say = (line) => process.stderr.write(line + '\\n');`,
+      `const tag = ' [nonce=' + process.env.WE_VERIFY_MARKER_NONCE + ']';`,
       `say('⏱ ' + ${JSON.stringify(GATE_STARTED_MARKER)} + ' (suites: fixture)');`,
       `setTimeout(() => {`,
-      `  say('⏳ ' + ${JSON.stringify(GATE_QUEUED_MARKER)} + ' (phase: standards)');`,
+      `  say('⏳ ' + ${JSON.stringify(GATE_QUEUED_MARKER)} + ' (phase: standards)' + tag);`,
       `  setTimeout(() => {`,
-      `    ${resume ? `say('⏱ ' + ${JSON.stringify(GATE_STARTED_MARKER)} + ' (phase: standards)');` : ''}`,
+      `    ${resume ? `say('⏱ ' + ${JSON.stringify(GATE_STARTED_MARKER)} + ' (phase: standards)' + tag);` : ''}`,
       `    setTimeout(() => process.exit(0), ${secondGateMs});`,
       `  }, ${requeueWaitMs});`,
       `}, ${firstGateMs});`,
@@ -348,7 +349,7 @@ describe('spawnGateBounded — later-phase admission waits are queue time (#veri
     const p = join(base, `fixture-split-${Math.random().toString(36).slice(2)}.mjs`);
     writeFileSync(p, [
       `process.stderr.write('⏱ ' + ${JSON.stringify(GATE_STARTED_MARKER)} + '\\n');`,
-      `const queued = Buffer.from('⏳ ' + ${JSON.stringify(GATE_QUEUED_MARKER)} + ' (phase: standards)\\n');`,
+      `const queued = Buffer.from('⏳ ' + ${JSON.stringify(GATE_QUEUED_MARKER)} + ' (phase: standards) [nonce=' + process.env.WE_VERIFY_MARKER_NONCE + ']\\n');`,
       `setTimeout(() => {`,
       `  process.stderr.write(queued.subarray(0, 1));`,
       `  setTimeout(() => {`,
@@ -358,6 +359,45 @@ describe('spawnGateBounded — later-phase admission waits are queue time (#veri
       `}, 50);`,
     ].join('\n'), 'utf8');
     // 900ms of queue-time silence against a 300ms gate ceiling: only a recognised marker can save it.
+    await expect(spawnGateBounded([p], { queueCeilingMs: 5000, gateCeilingMs: 300 })).resolves.toBeTruthy();
+  });
+
+  // #5189 — the queue marker is authenticated by a per-run nonce the dispatcher hands the child by env: gate OUTPUT
+  // that prints a forged line-anchored marker must not swap the gate timer for the ~2 h queue ceiling.
+  const writeSpoofGate = (tag) => {
+    const p = join(base, `fixture-spoof-${Math.random().toString(36).slice(2)}.mjs`);
+    writeFileSync(p, [
+      `process.stderr.write('⏱ ' + ${JSON.stringify(GATE_STARTED_MARKER)} + '\\n');`,
+      `process.stderr.write('⏳ ' + ${JSON.stringify(GATE_QUEUED_MARKER)} + ' (phase: standards)' + ${tag} + '\\n');`,
+      `setTimeout(() => process.exit(0), 5000);`,
+    ].join('\n'), 'utf8');
+    return p;
+  };
+
+  it('a spoofed queue marker with NO nonce, then a hang, is killed at the GATE ceiling (not the queue ceiling)', async () => {
+    const script = writeSpoofGate(`''`);
+    const started = Date.now();
+    await expect(spawnGateBounded([script], { queueCeilingMs: 4000, gateCeilingMs: 300 })).rejects.toMatchObject({ timedOutPhase: 'gate' });
+    expect(Date.now() - started).toBeLessThan(2500);
+  });
+
+  it('a queue marker carrying a WRONG nonce is ignored too', async () => {
+    const script = writeSpoofGate(`' [nonce=deadbeefdeadbeefdeadbeefdeadbeef]'`);
+    await expect(spawnGateBounded([script], { queueCeilingMs: 4000, gateCeilingMs: 300 })).rejects.toMatchObject({ timedOutPhase: 'gate' });
+  });
+
+  it('the nonce embedded mid-line (not as the line suffix) does not authenticate', async () => {
+    const script = writeSpoofGate(`' [nonce=' + process.env.WE_VERIFY_MARKER_NONCE + '] trailing'`);
+    await expect(spawnGateBounded([script], { queueCeilingMs: 4000, gateCeilingMs: 300 })).rejects.toMatchObject({ timedOutPhase: 'gate' });
+  });
+
+  it('a queue marker with the REAL nonce, in the same chunk as the started marker, still pauses the budget', async () => {
+    const p = join(base, `fixture-samechunk-${Math.random().toString(36).slice(2)}.mjs`);
+    writeFileSync(p, [
+      `const tag = ' [nonce=' + process.env.WE_VERIFY_MARKER_NONCE + ']';`,
+      `process.stderr.write('⏱ ' + ${JSON.stringify(GATE_STARTED_MARKER)} + '\\n⏳ ' + ${JSON.stringify(GATE_QUEUED_MARKER)} + ' (phase: standards)' + tag + '\\n');`,
+      `setTimeout(() => process.exit(0), 900);`,
+    ].join('\n'), 'utf8');
     await expect(spawnGateBounded([p], { queueCeilingMs: 5000, gateCeilingMs: 300 })).resolves.toBeTruthy();
   });
 
