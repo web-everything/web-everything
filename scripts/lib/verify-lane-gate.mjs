@@ -59,6 +59,7 @@
 import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings.mjs';
 
 import { createHash } from 'node:crypto';
+import { relative, sep } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 import { SELECTION_FLAG, pinnedMergeBase, decideLocalSelection, referencedTestNeedles, LOCAL_FULL_SUITE_TRIGGERS } from '../readiness/test-selection.mjs';
 import { isPolicyCorePath } from './gate-config.mjs';
@@ -684,8 +685,57 @@ export function buildPhaseOutcome({ kind, exitCode, signal, failureDetails, outp
   } : {}) };
 }
 
+/**
+ * #99 — the always-run guard command: the declared `alwaysRunTests` files that exist in this checkout and are not
+ * already run by a scan command, as ONE `vitest run` (one startup). Independent of the related selection, so a small
+ * or truncated selection can never skip them. Null when nothing applies (empty set, sibling checkout, no test half).
+ * Pure over the injected `fileExists`. With `reportFile` the run ALSO writes vitest's JSON report there (the default
+ * reporter stays on, so failure output is unchanged): vitest treats file arguments as filters, so a guard its config
+ * excludes is dropped silently while the others still pass — `alwaysRunInventory` reads the report to prove each ran.
+ * @returns {{command: string|null, declared: string[], files: string[], skipped: string[]}}
+ */
+export function alwaysRunPlan({ declared = [], fileExists, scanCommands = [], testTimeoutFactor = 1, reportFile = null } = {}) {
+  const wanted = [...new Set(declared.map(f => typeof f === 'string' ? f.replace(/^\.\//, '') : f))];
+  const files = [], skipped = [];
+  for (const f of wanted) {
+    // Defence in depth behind the settings validation: an entry is a file argument, never a vitest option.
+    if (typeof f !== 'string' || !f || f.startsWith('-')) skipped.push(f);
+    else if (typeof fileExists === 'function' && !fileExists(f)) skipped.push(f);
+    else if (scanCommands.some(c => c.includes(shellQuote(f)))) skipped.push(f);
+    else files.push(f);
+  }
+  const reporter = reportFile ? ` --reporter=default --reporter=json --outputFile.json=${shellQuote(reportFile)}` : '';
+  const command = files.length ? `npx vitest run ${files.map(shellQuote).join(' ')}${reporter}${scaledTimeoutFlags(testTimeoutFactor)}` : null;
+  return { command, declared: wanted, files, skipped };
+}
+
+/**
+ * #99 — which planned guard files appear in vitest's executed-file inventory (its JSON report). Pure. A planned file
+ * missing from the report was excluded or matched no test; an absent / unparseable report proves nothing, so every
+ * file is missing (`reason: 'inventory-unavailable'`). A file counts as executed when it has a result entry, whatever
+ * its outcome — a red guard is reported by the run's own exit code, not here.
+ * @param {{reportText: string|null|undefined, files: string[], cwd: string}} a
+ * @returns {{executed: string[], missing: string[], reason: 'ok'|'inventory-unavailable'}}
+ */
+export function alwaysRunInventory({ reportText, files = [], cwd }) {
+  let names;
+  try {
+    const parsed = JSON.parse(String(reportText ?? ''));
+    if (!parsed || !Array.isArray(parsed.testResults)) throw new Error('no testResults');
+    // A file whose every assertion was skipped / todo ran nothing: only an entry with a real result counts.
+    const ranSomething = (r) => !Array.isArray(r?.assertionResults) || !r.assertionResults.length
+      || r.assertionResults.some(a => a?.status !== 'skipped' && a?.status !== 'pending' && a?.status !== 'todo');
+    names = new Set(parsed.testResults.filter(ranSomething)
+      .map(r => relative(cwd, String(r?.name ?? '')).split(sep).join('/').replace(/^\.\//, '')));
+  } catch {
+    return { executed: [], missing: [...files], reason: 'inventory-unavailable' };
+  }
+  const executed = files.filter(f => names.has(f.replace(/^\.\//, '')));
+  return { executed, missing: files.filter(f => !executed.includes(f)), reason: 'ok' };
+}
+
 /** Build normalized, non-gating phase telemetry for verify markers and CLI results (#5141). */
-export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standardsMs, gateMs, decision, outcomes = {}, admission }) {
+export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standardsMs, gateMs, decision, outcomes = {}, admission, alwaysRun }) {
   const ms = value => Number.isFinite(value) ? Math.round(value) : null;
   const admissionMode = admission?.mode === 'phase' ? 'phase' : 'gate';
   const admissionPhases = admissionMode === 'phase' ? admission.phases ?? {} : null;
@@ -715,7 +765,13 @@ export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standards
       droppedCount: decision.selection.droppedCount, depth: decision.selection.depth, maxDepth: decision.selection.maxDepth,
       maxTests: decision.selection.maxTests, hubs: decision.selection.hubs, reason: decision.selection.reason,
     } : null,
-    outcomes: Object.fromEntries(['vitest', 'scan', 'standards'].map(kind => [kind, outcomes[kind] ?? (kind === 'standards' ? standardsOutcome : { result: 'skipped' })])),
+    // #99 — the always-run guard files planned, whether they actually executed (`ran` is empty when an earlier red or
+    // a signal stopped the gate first), the files declared but skipped, and the result.
+    // `ran` is vitest's own executed-file inventory when one was read; `missing` are planned guards it did NOT execute.
+    ...(alwaysRun ? { alwaysRun: { planned: alwaysRun.files, ran: alwaysRun.executed === true ? (alwaysRun.ran ?? alwaysRun.files) : [], executed: alwaysRun.executed === true,
+      missing: alwaysRun.missing ?? [], skipped: alwaysRun.skipped, ms: ms(alwaysRun.ms), result: alwaysRun.result ?? null } } : {}),
+    // The guard's own outcome appears only when it ran, so a scanner's `scan` outcome is never replaced by it.
+    outcomes: Object.fromEntries([...['vitest', 'scan', 'standards'], ...(outcomes.guard ? ['guard'] : [])].map(kind => [kind, outcomes[kind] ?? (kind === 'standards' ? standardsOutcome : { result: 'skipped' })])),
   };
 }
 
@@ -723,7 +779,7 @@ export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standards
 export function formatVerifyPhases(phases) {
   const fields = { admission: phases.admissionWaitMs, vitest: phases.vitestMs, scan: phases.scanMs,
     standards: phases.standardsMs, gate: phases.gateMs, targets: phases.targetFileCount, changed: phases.changedFileCount };
-  const counts = { selection: phases.selection ? `${phases.selection.status}(${phases.selection.selectedTestCount}/${phases.selection.fullTestCount})` : null, graph: phases.importGraphTargetCount, literal: phases.literalReferenceTargetCount, related: phases.relatedMode, timeoutFactor: phases.testTimeoutFactor, standardsPolicy: phases.standardsPolicy, admission: phases.admissionMode };
+  const counts = { alwaysRun: phases.alwaysRun ? (phases.alwaysRun.executed ? `${phases.alwaysRun.ran.length}files/${phases.alwaysRun.ms ?? '?'}ms` : 'not-run') : null, selection: phases.selection ? `${phases.selection.status}(${phases.selection.selectedTestCount}/${phases.selection.fullTestCount})` : null, graph: phases.importGraphTargetCount, literal: phases.literalReferenceTargetCount, related: phases.relatedMode, timeoutFactor: phases.testTimeoutFactor, standardsPolicy: phases.standardsPolicy, admission: phases.admissionMode };
   return ['phaseMs', ...Object.entries(fields).filter(([, value]) => value != null)
     .map(([name, value]) => `${name}=${value}`),
   ...Object.entries(phases.outcomes ?? {}).map(([name, outcome]) =>

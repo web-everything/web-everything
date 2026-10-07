@@ -22,6 +22,10 @@ export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
   // fewer than the direct importers) and mark the run `selection-truncated`. 0 = off (plain `vitest related`).
   relatedMaxTests: 0,
   relatedDepth: 2,
+  // #99 — guard/contract/repo-scan test files the default gate ALWAYS runs, whatever the related selection picked
+  // (they read the whole repo, import nothing the diff touches, and so were the CI-only reds). Repo-relative paths;
+  // missing files are skipped (a sibling checkout). A tightening only: CI is unchanged.
+  alwaysRunTests: [],
 });
 
 /** Use the WE root RUNNING verify-lane, never the target lane REPO or cwd:
@@ -43,6 +47,10 @@ const rules = {
   isolatedRetry: value => ['untouched', 'timeouts', 'off'].includes(value),
   relatedMaxTests: value => Number.isSafeInteger(value) && value >= 0,
   relatedDepth: value => Number.isSafeInteger(value) && value >= 1,
+  alwaysRunTests: value => Array.isArray(value) && value.length <= 50
+    // Each entry becomes a vitest file argument: it must start with a word character (never `-`, so `-u` / `--bail`
+    // cannot become a vitest option), be a test file, and stay inside the repo.
+    && value.every(f => typeof f === 'string' && /^(?:\.\/)?[\w@][\w./@-]*\.test\.[cm]?[jt]sx?$/.test(f) && !f.split('/').includes('..')),
 };
 const envKeys = {
   relatedMode: 'WE_VERIFY_RELATED', testTimeoutFactor: 'WE_VERIFY_TEST_TIMEOUT_FACTOR',
@@ -51,6 +59,7 @@ const envKeys = {
   restartInFlight: 'WE_VERIFY_RESTART_IN_FLIGHT',
   runAllPhases: 'WE_VERIFY_RUN_ALL_PHASES', isolatedRetry: 'WE_VERIFY_ISOLATED_RETRY',
   relatedMaxTests: 'WE_VERIFY_RELATED_MAX_TESTS', relatedDepth: 'WE_VERIFY_RELATED_DEPTH',
+  alwaysRunTests: 'WE_VERIFY_ALWAYS_RUN_TESTS',
 };
 const booleanKeys = new Set(['phaseAdmission', 'matchRequestVariants', 'runAllPhases']);
 // Preserve which keys survived validation without adding configuration keys to the file shape.
@@ -88,6 +97,10 @@ export function resolveVerifySettings({ fileConfig, env = {} } = {}) {
     if (booleanKeys.has(key)) value = value === '0' ? false : value === '1' ? true : undefined;
     else if (['testTimeoutFactor', 'fastTargets', 'relatedMaxTests', 'relatedDepth'].includes(key)) {
       value = value != null && String(value).trim() !== '' ? Number(value) : undefined;
+    }
+    else if (key === 'alwaysRunTests') {
+      // Comma-separated list; an empty-but-set value switches the always-run set off.
+      value = value != null ? String(value).split(',').map(f => f.trim()).filter(Boolean) : undefined;
     }
     if (check(value)) {
       values[key] = value;
