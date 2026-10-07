@@ -13,7 +13,19 @@ export default defineConfig({
   },
   test: {
     globals: true,
-    environment: 'happy-dom',
+    // Default to plain Node: ~1,040 of ~1,078 test files never touch the DOM, so they should not pay for
+    // happy-dom setup. Only the DOM-using planes below get happy-dom (a file can still force either way
+    // with a `// @vitest-environment <name>` pragma, which beats these globs).
+    environment: 'node',
+    environmentMatchGlobs: [
+      ['blocks/**', 'happy-dom'],
+      ['src/**', 'happy-dom'],
+      // The few plane tests outside blocks/ + src/ that read `document` (found by running them under node).
+      ['error-summary/__tests__/model.test.ts', 'happy-dom'],
+      ['source-resolution/__tests__/{provider,registry}.test.ts', 'happy-dom'],
+      ['wrapper-conformance/__tests__/runner.test.ts', 'happy-dom'],
+      ['interaction-state/__tests__/model.test.ts', 'happy-dom'],
+    ],
     // #3383 bugfix: default delivery-telemetry OFF for the whole run (`WE_TELEMETRY=0`) so wrapper tests
     // that invoke the real dispatch wrappers don't append fixture spans to the shared
     // `.operations/telemetry/*.jsonl` log — see `vitest.setup.ts`'s own header for the full story.
