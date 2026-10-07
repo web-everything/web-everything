@@ -598,7 +598,7 @@ describe('xng7q1p retry reservation and restart soak', () => {
     await flushTimeoutFollowups({ dir, repo: e.repo, now: () => t0,
       effects: { observe: (...args) => ({ ...observe(...args), open: false }) } });
     expect(readTimeoutHold({ ...e, dir })).toEqual({ status: 'refused', reason: 'retry-outcome-pending' });
-    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 0, rejected: 0, pending: true });
+    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 0, rejected: 0, pending: true, pendingSince: expect.any(String) });
   }));
   it('confirms the last closed-PR observation and still retries owed filing after retirement', async () => harness(async (dir) => {
     const e = evidence(); await reservePending(dir, e);

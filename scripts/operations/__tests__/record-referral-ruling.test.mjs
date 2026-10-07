@@ -302,6 +302,7 @@ describe('operator finding selectors and follow-up', () => {
         return result;
       },
       setLabels: (...args) => calls.push(args),
+      appendEvents: () => {},
     })[OPERATOR_RULING_FOLLOW_UP_EFFECT];
     return { run, calls, path: () => bodyPath };
   }

@@ -2,6 +2,7 @@ import { configDefaults, defineConfig } from 'vitest/config';
 import { hermeticGitEnv, maxTestWorkers, weAlias } from './vitest.shared';
 import { TRUST_CHAIN_TIER_FILES } from './scripts/lib/trust-chain-tier.mjs';
 import { cacheEnabled as testCacheEnabled } from './scripts/lib/test-result-cache.mjs';
+import { traceEnabled as testTraceEnabled } from './scripts/lib/test-cache-trace.mjs';
 import ShadowReporter from './scripts/test-cache/shadow-reporter.mjs';
 
 export default defineConfig({
@@ -22,7 +23,9 @@ export default defineConfig({
     // The same setup file also hands every test its own throwaway `WE_COORDINATION_ROOT` (#3901), which
     // `action-cli.test.mjs`/`action-records.test.mjs` rely on: their `createActionStore()` calls take no
     // explicit root, so without it they would write real attempts to `~/workspace/.operations/coordination`.
-    setupFiles: ['./vitest.setup.ts'],
+    // prepare-124 S3: the shadow tracer setup file goes FIRST so it snapshots env before vitest.setup.ts strips `WE_*`.
+    // Same off switches as the reporter, plus WE_TEST_CACHE_TRACE=0 (it records only; it never skips a test).
+    setupFiles: [...(testTraceEnabled(process.env) ? ['./scripts/test-cache/trace-setup.mjs'] : []), './vitest.setup.ts'],
     // prepare-124 S2: SHADOW-ONLY test-result cache. The reporter never skips or changes a test; it records "would
     // skip" next to the real outcome in ~/.cache/we-vitest-results. Absent under CI / GITHUB_ACTIONS / WE_TEST_CACHE=0
     // (no reporter is even constructed). A CLI `--reporter=...` replaces this list, so such runs are not logged.

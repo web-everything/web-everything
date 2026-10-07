@@ -184,7 +184,9 @@ export function recordReferralRulingOperation({ readRulingContext } = {}) {
       // byte-identical ruling already present, so a replay after a crash cannot double-post.
       effects: (view) => (view.input.preview ? [] : [{
         type: OPERATOR_RULING_POST_EFFECT, idempotent: false,
-        payload: { repo: view.verdict.record.repo, pr: view.verdict.record.pr, head: view.verdict.record.head, body: view.verdict.body },
+        payload: { repo: view.verdict.record.repo, pr: view.verdict.record.pr, head: view.verdict.record.head, body: view.verdict.body,
+          rulings: view.verdict.record.rulings.map((r) => ({ key: r.key, result: r.result })),
+          actor: view.verdict.record.actor, channel: view.verdict.record.channel },
       }, ...(view.verdict.followUp ? [{
         type: OPERATOR_RULING_FOLLOW_UP_EFFECT, idempotent: true,
         payload: { repo: view.verdict.record.repo, pr: view.verdict.record.pr, head: view.verdict.record.head,

@@ -80,3 +80,14 @@ export const PLATFORM_CROSS_PROVIDER_FALLBACK_WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1
 export const PLATFORM_VERDICT_LEDGER_DEFAULTS = {
   store: 'dual' as 'home' | 'dual' | 'git',
 } as const;
+
+/**
+ * Merge-gate settings (statute `#verdict-ledger-pr-state-store` rule 3; plan slice I1). Mirrored in
+ * `scripts/lib/pr-merge-gate.mjs` (`DEFAULT_REVIEW_AUTHORITY`), because .mjs cannot import this file; a test pins it.
+ * `reviewAuthority`: `labels` (default; today's behaviour) | `both` (merge only when labels AND ledger clear; tighter,
+ * a normal setting change) | `ledger` (drops the label input; a loosening, so a human-ratified statute PR).
+ * Nothing on the live merge path reads this yet.
+ */
+export const PLATFORM_MERGE_GATE_DEFAULTS = {
+  reviewAuthority: 'labels' as 'labels' | 'both' | 'ledger',
+} as const;
