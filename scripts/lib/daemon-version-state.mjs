@@ -1,0 +1,113 @@
+/**
+ * @file scripts/lib/daemon-version-state.mjs
+ * @description Card 89 S2 — dormant module, no runtime consumer yet.
+ */
+import { execFileSync } from 'node:child_process';
+import { appendFileSync, constants, copyFileSync, lstatSync, mkdirSync, readFileSync,
+  readdirSync, readlinkSync, rmSync, symlinkSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { collectUntrackedPaths, pruneLandedBacklogSidecars } from './daemon-rebuild/local-state.mjs';
+
+const gitAt = (root, args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+const tracked = (root, path) => gitAt(root, ['ls-files', '-z', '--', `:(literal)${path}`]).length > 0;
+function stat(path) {
+  try { return lstatSync(path); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
+
+/** Copy missing entries only; existing target entries (including symlinks) win. */
+function mergeMissing(source, target) {
+  const sourceStat = lstatSync(source);
+  const targetStat = stat(target);
+  if (sourceStat.isDirectory()) {
+    if (targetStat && !targetStat.isDirectory()) return;
+    mkdirSync(target, { recursive: true });
+    for (const name of readdirSync(source)) mergeMissing(join(source, name), join(target, name));
+  } else if (!targetStat) {
+    if (sourceStat.isSymbolicLink()) symlinkSync(readlinkSync(source), target);
+    else copyFileSync(source, target, constants.COPYFILE_EXCL);
+  }
+}
+
+/** Link persistent state; merged paths are reported separately from ordinary links. */
+export function linkVersionState({ versionDir, stateDir, statePaths, alert }) {
+  const result = { linked: [], merged: [], refused: [] };
+  for (const path of statePaths) {
+    const source = join(versionDir, path);
+    const target = resolve(stateDir, path);
+    mkdirSync(dirname(target), { recursive: true });
+    const entry = stat(source);
+    if (tracked(versionDir, path) || (entry?.isSymbolicLink()
+      && resolve(dirname(source), readlinkSync(source)) !== target)) {
+      result.refused.push(path);
+      alert('state-link-collision', { path });
+      continue;
+    }
+    if (entry && !entry.isSymbolicLink()) {
+      mergeMissing(source, target);
+      rmSync(source, { recursive: true });
+      symlinkSync(target, source);
+      result.merged.push(path);
+      alert('state-link-merged', { path });
+    } else {
+      if (!entry) {
+        mkdirSync(dirname(source), { recursive: true });
+        symlinkSync(target, source);
+      }
+      result.linked.push(path);
+    }
+  }
+  const paths = [...result.linked, ...result.merged];
+  if (paths.length) {
+    const exclude = resolve(versionDir, gitAt(versionDir, ['rev-parse', '--git-path', 'info/exclude']).trim());
+    mkdirSync(dirname(exclude), { recursive: true });
+    const content = stat(exclude) ? readFileSync(exclude, 'utf8') : '';
+    const lines = new Set(content.split(/\r?\n/));
+    const additions = [...new Set(paths.map(path => `/${path}`))].filter(line => !lines.has(line));
+    if (additions.length) appendFileSync(exclude,
+      `${content && !content.endsWith('\n') ? '\n' : ''}${additions.join('\n')}\n`);
+  }
+  return result;
+}
+
+/** Prune main-proven sidecars before carrying the remaining untracked files. */
+export function carryUntrackedSidecars({ git, fromRoot, toRoot, mainSha, alert, skipPaths = [] }) {
+  const result = { carried: [], skipped: [], refused: [] };
+  let paths = collectUntrackedPaths(git);
+  if (paths === null) { alert('status-failed'); return result; }
+  pruneLandedBacklogSidecars({ git, root: fromRoot, paths, mainSha, alert });
+  paths = collectUntrackedPaths(git);
+  if (paths === null) { alert('status-failed'); return result; }
+  for (const path of paths) {
+    if (skipPaths.some(skip => path === skip || path.startsWith(`${skip.replace(/\/+$/, '')}/`))) {
+      result.skipped.push(path);
+      continue;
+    }
+    const target = join(toRoot, path);
+    if (stat(target) || tracked(toRoot, path)) {
+      result.refused.push(path);
+      alert('untracked-collision', { path });
+      continue;
+    }
+    mkdirSync(dirname(target), { recursive: true });
+    copyFileSync(join(fromRoot, path), target, constants.COPYFILE_EXCL);
+    result.carried.push(path);
+  }
+  return result;
+}
+
+/** Report both names of renames/copies, preserving whitespace in porcelain -z paths. */
+export function reportOutgoingDirt({ git, alert }) {
+  const status = git(['status', '--porcelain', '-z']);
+  if (status.status !== 0) { alert('status-failed'); return []; }
+  const entries = String(status.stdout ?? '').split('\0').filter(Boolean);
+  const paths = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    paths.push(entry.slice(3));
+    if (/[RC]/.test(entry.slice(0, 2)) && i + 1 < entries.length) paths.push(entries[++i]);
+  }
+  const changed = [...new Set(paths)];
+  if (changed.length) alert('version-dirty', { paths: changed });
+  return changed;
+}
