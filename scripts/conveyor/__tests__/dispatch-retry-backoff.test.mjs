@@ -291,3 +291,45 @@ describe('review round 1 — release, re-arm and ledger hardening', () => {
     expect(r.reasonCode).toBe('launch-died');
   });
 });
+
+describe('builder-starved — clone-wide refusals and stale holds self-heal (2026-10-07)', () => {
+  let dir, path, bpath, fileCard;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'starved-')); path = join(dir, 'f.json'); bpath = join(dir, 'b.json'); fileCard = vi.fn(async () => ({ ok: true })); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  const BEHIND = 'launch-died: dispatch-lane exited with no output (dispatch-lane: the dispatching checkout is 3 commit(s) behind origin/main — refusing to dispatch a review that would run STALE code';
+
+  it('a stale-clone build refusal is never charged to the card (4701 exhausted on seven of them overnight)', () => {
+    for (let i = 0; i < 8; i += 1) {
+      const r = recordBuildFailure({ num: '4701', reason: BEHIND, output: BEHIND }, { path: bpath, now: i * 1000, settings: S });
+      expect(r).toMatchObject({ reasonCode: 'checkout-behind-origin', cloneWide: true, attempts: 0, exhausted: false });
+    }
+    expect(listBuildBackoffs({ path: bpath, now: 9000 })).toEqual([]);
+  });
+
+  it('an exhausted stale-clone build record written by older code no longer withholds the card', () => {
+    writeFileSync(bpath, JSON.stringify({ items: { 4701: { num: '4701', attempts: 7, reasonCode: 'checkout-behind-origin', exhausted: true, retryAfter: null } } }));
+    expect(listBuildBackoffs({ path: bpath, now: 0 })).toEqual([]);
+  });
+
+  it('a stale-clone prepare dispatch refusal never holds the card or enters the ledger', async () => {
+    const f = await recordPrepareFailure({ num: '4425', attempt: 'a', stage: 'dispatch', evidence: { reason: BEHIND } }, { path, fileCard, now: 0, settings: S });
+    expect(f).toMatchObject({ cause: 'clone-wide', held: false, retry: true });
+    expect(fileCard).not.toHaveBeenCalled();
+    expect(Object.keys(readFailureState(path).failures)).toEqual([]);
+  });
+
+  it('held dispatch failures the current policy would not hold are released by the per-tick release (no re-arm)', () => {
+    // Written by pre-item-95 code: cause `unknown`, held forever, a diagnose card queued.
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: {
+      'a': { num: '4425', attempt: 'a', stage: 'dispatch', cause: 'unknown', held: true, retry: false, evidence: { reason: BEHIND }, recordedAt: new Date(0).toISOString() },
+      'b': { num: '4382', attempt: 'b', stage: 'dispatch', cause: 'unknown', held: true, retry: false, evidence: { reason: 'Command failed: node run.mjs dispatch-lane --num=4382' }, recordedAt: new Date(0).toISOString() },
+      'c': { num: '4560', attempt: 'c', stage: 'result', cause: 'unknown', held: true, retry: false, evidence: { reason: 'prepare-unstamped' }, recordedAt: new Date(0).toISOString() },
+    } }));
+    const due = releaseDuePrepareRetries({ path, now: 10_000, settings: S });
+    expect(due.sort()).toEqual(['4382', '4425']);
+    const st = readFailureState(path).failures;
+    expect(st.a).toMatchObject({ held: false, cause: 'clone-wide', healedFrom: 'unknown' });
+    expect(st.b).toMatchObject({ held: false, cause: 'dispatch-transient', healedFrom: 'unknown', reasonCode: 'dispatch-command-failed' });
+    expect(st.c).toMatchObject({ held: true, cause: 'unknown' }); // a result-stage failure keeps its diagnose hold
+  });
+});

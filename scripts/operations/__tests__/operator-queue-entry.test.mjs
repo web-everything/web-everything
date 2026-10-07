@@ -46,7 +46,7 @@ const stage = (root) => {
   // which renders through the pure core (+ its `../lib/secret-scrub.mjs` leaf) — stage all three, same reason as
   // above.
   // Stage both import-free maintenance defaults leaves that the core spreads into its config.
-  for (const f of ['health-watch-section.mjs', 'health-watch-core.mjs', 'health-pr-attempts.mjs', 'tmp-sweep-config.mjs', 'claude-jobs-archive-config.mjs']) {
+  for (const f of ['health-watch-section.mjs', 'health-watch-core.mjs', 'health-pr-attempts.mjs', 'health-builder-ticks.mjs', 'tmp-sweep-config.mjs', 'claude-jobs-archive-config.mjs']) {
     copyFileSync(join(dirname(LEAF), '../conveyor', f), join(root, 'conveyor', f));
   }
   copyFileSync(join(dirname(LEAF), 'secret-scrub.mjs'), join(root, 'lib/secret-scrub.mjs'));

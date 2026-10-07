@@ -2585,8 +2585,8 @@ describe('card 80 — prepare just in time (daemon wiring)', () => {
   });
 
   it('planConfigFrom passes only the settings that are on', () => {
-    expect(planConfigFrom(policyFrom({}, {}))).toEqual({ prepareAheadWindow: 4, preparedMaxAgeDays: 3 });
-    expect(planConfigFrom(policyFrom({ 'prepare-ahead-window': 'off' }, {}))).toEqual({ preparedMaxAgeDays: 3 });
+    expect(planConfigFrom(policyFrom({}, {}))).toEqual({ launchKinds: ['prepare-item'], prepareAheadWindow: 4, preparedMaxAgeDays: 3 });
+    expect(planConfigFrom(policyFrom({ 'prepare-ahead-window': 'off' }, {}))).toEqual({ launchKinds: ['prepare-item'], preparedMaxAgeDays: 3 });
   });
 
   it('cliPlanTick forwards the config to tick-core on STDIN beside the bookkeeping', () => {
@@ -2604,7 +2604,7 @@ describe('card 80 — prepare just in time (daemon wiring)', () => {
       killSwitch: () => ({ engaged: false }),
     };
     await runBuildDispatchTick({ live: false, effects, policy: policyFrom({}, {}) });
-    expect(seen).toEqual({ config: { prepareAheadWindow: 4, preparedMaxAgeDays: 3 } });
+    expect(seen).toEqual({ config: { launchKinds: ['prepare-item'], prepareAheadWindow: 4, preparedMaxAgeDays: 3 } });
   });
 
   it('the status reader reads an older main stamp as UNPREPARED for a newer re-prepare claim, and looks for its PR', () => {

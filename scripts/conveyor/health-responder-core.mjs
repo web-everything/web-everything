@@ -19,6 +19,7 @@ export const ACTION_ALLOWLIST = Object.freeze({
 export const OBSERVATION_ONLY = Object.freeze({
   "bad-credentials": "Authentication must be repaired by its owner; never rotate a secret or switch credentials.",
   "bg-isolation-stall": "Permission/isolation grants change authority; owning dispatcher/operator must repair them.",
+  "builder-starved": "A builder that launches nothing is read from its tick record; never restart, kill or hand-dispatch from the responder. Fix the gate that holds every card via normal delivery.",
   "claude-auth-expired": "Interactive login is owed; never synthesize credentials or resume another owner\u2019s worker.",
   "clone-stale": "Existing gated self-sync owns clone repair; never clean/reset/rebase a daemon clone.",
   "clone-behind-main": "A clone that trails main is repaired by its owning daemon refresh path; never clean/reset/rebase a daemon clone.",

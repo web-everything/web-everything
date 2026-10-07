@@ -346,11 +346,18 @@ const isBuildBound = (reason) => BUILD_BOUND_REASONS.has(reason) || /^overlaps l
  * first, then the queue's own rank order), keeping only items that are launching now or held for a reason that
  * clears on its own (see {@link BUILD_BOUND_REASONS}). A prepare is spent only on these, so a card is prepared
  * shortly before its build — never days ahead, when its scope may drift. Pure.
- * @param {{queue?:Array<{num:*, tier?:string|null}>, launch?:Array<{num:*}>, held?:Array<{num:*, reason:string}>, window?:number}} o
+ *
+ * builder-starved (2026-10-07) — `skip` is the set of nums the CALLER holds this tick (the build daemon's own
+ * holds: a prepare-failure hold, a dispatch backoff, a non-PR cooldown). A held card cannot move this tick, so it
+ * never takes a window slot: the window is the next `window` cards that CAN move. Before, two failure-held cards
+ * at the head of the pinned tier filled half of the 4-slot window every tick, and with the other two starved
+ * behind them nothing was ever prepared, so nothing ever became build-ready.
+ * @param {{queue?:Array<{num:*, tier?:string|null}>, launch?:Array<{num:*}>, held?:Array<{num:*, reason:string}>, window?:number, skip?:Iterable<*>}} o
  * @returns {Set<string>|null} the in-window nums (normalized), or `null` when the window is off (not a finite number ≥ 0)
  */
-export function prepareAheadNums({ queue = [], launch = [], held = [], window = Infinity } = {}) {
+export function prepareAheadNums({ queue = [], launch = [], held = [], window = Infinity, skip = [] } = {}) {
   if (!Number.isFinite(window) || window < 0) return null;
+  const skipped = new Set([...(skip ?? [])].map(normNum));
   const launching = new Set((Array.isArray(launch) ? launch : []).map((l) => normNum(l?.num)));
   const reasonOf = new Map((Array.isArray(held) ? held : []).map((h) => [normNum(h?.num), h?.reason]));
   const rows = (Array.isArray(queue) ? queue : []).filter((r) => r && r.num != null)
@@ -359,6 +366,7 @@ export function prepareAheadNums({ queue = [], launch = [], held = [], window = 
   const out = new Set();
   for (const r of rows) {
     if (out.size >= window) break;
+    if (skipped.has(r.num)) continue;
     if (launching.has(r.num) || isBuildBound(reasonOf.get(r.num))) out.add(r.num);
   }
   return out;

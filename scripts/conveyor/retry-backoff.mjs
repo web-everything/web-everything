@@ -39,6 +39,15 @@ const RULES = [
   ['dispatch-command-failed', /^Command failed\b/i],
 ];
 export const BACKOFF_REASON_CODES = Object.freeze(RULES.map(([code]) => code));
+/**
+ * builder-starved (2026-10-07) — reason codes that describe the DISPATCHING CLONE, not the card: every card the
+ * daemon tried in that window was refused the same way. Charging them to the card is wrong twice over: the card
+ * burns its backoff budget on a condition it cannot cause (4701 went to `exhausted` on seven stale-clone refusals
+ * overnight), and the daemon keeps re-picking it, so it is dispatched again and again while the clone lags. A
+ * clone-wide failure is never charged to the card and never holds it; the clone's own self-sync clears the cause.
+ */
+export const CLONE_WIDE_REASON_CODES = Object.freeze(['checkout-behind-origin']);
+export const isCloneWideReasonCode = (code) => CLONE_WIDE_REASON_CODES.includes(code);
 export function reasonCodeOf(text) {
   const s = String(text ?? '');
   for (const [code, re] of RULES) if (re.test(s)) return code;

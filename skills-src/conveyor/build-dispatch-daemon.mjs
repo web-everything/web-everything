@@ -1860,9 +1860,26 @@ function offOr(v, d) {
   return Number.isFinite(x) ? (x < 0 ? null : x) : d;
 }
 
+/**
+ * builder-starved — the free capacity a tick ended with, logged on every tick record so the health watch's
+ * `builder-starved` smell can tell "nothing to do / no room" from "room, a queue, and still nothing launched".
+ * `buildSlots` is the per-executor-class room left after this tick's picks; `prepareSlots` the item-prepare room
+ * (two workers). A frozen tick (kill switch / landing freeze) reports `frozen` — it is idle on purpose.
+ */
+export function tickCapacity(r) {
+  const buildSlots = r?.plan?.slotsByClass ?? {};
+  const prepareSlots = Math.max(0, 2 - (Array.isArray(r?.prepare?.inFlight) ? r.prepare.inFlight.length : 0));
+  return { buildSlots, prepareSlots, frozen: r?.plan?.freeze?.frozen === true,
+    free: r?.plan?.freeze?.frozen !== true && (prepareSlots > 0 || Object.values(buildSlots).some((n) => Number(n) > 0)) };
+}
+
+/** builder-starved — the tick-core spawn kinds this daemon launches (it reads `spawnBuilds` + `spawnPrepareItems`). */
+export const BUILD_DAEMON_LAUNCH_KINDS = Object.freeze(['prepare-item']);
+
 /** Card 80 — the tick-core config this daemon's policy implies. EXPORTED for the test. */
 export function planConfigFrom(policy = BUILD_DISPATCH_POLICY) {
-  const cfg = {};
+  // builder-starved — this daemon launches builds and item prepares only; the tick core plans nothing else for it.
+  const cfg = { launchKinds: BUILD_DAEMON_LAUNCH_KINDS };
   if (Number.isFinite(policy?.prepareAheadWindow)) cfg.prepareAheadWindow = policy.prepareAheadWindow;
   if (Number.isFinite(policy?.preparedMaxAgeDays)) cfg.preparedMaxAgeDays = policy.preparedMaxAgeDays;
   return cfg;
@@ -2035,7 +2052,7 @@ async function live(flags) {
       // or for an older record with none) so the operator's tick line names WHO is running each build without
       // reading scorecards. Additive over the previous bare-num array — nothing on `main` parses this stdout
       // JSON as a strict array-of-strings today (grepped 2026-09-29).
-      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult, loadHolds: r.loadHolds, launchSettlement: r.launchSettlement })}\n`);
+      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult, loadHolds: r.loadHolds, launchSettlement: r.launchSettlement, capacity: tickCapacity(r) })}\n`);
     },
     onTickError: (e, _tick, loop) => {
       // Keep the health watcher's existing failure-line contract; timings are an additive JSON line.

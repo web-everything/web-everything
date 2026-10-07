@@ -33,6 +33,7 @@
 import { CLAUDE_JOBS_ARCHIVE_DEFAULTS } from './claude-jobs-archive-config.mjs';
 import { TMP_SWEEP_DEFAULTS } from './tmp-sweep-config.mjs';
 import { foldPrAttempts } from './health-pr-attempts.mjs';
+import { foldBuilderTicks } from './health-builder-ticks.mjs';
 import { expandRepeatedLines, stripLogTimestamp } from '../lib/log-timestamp.mjs';
 import { isHighEntropyToken } from '../lib/secret-scrub.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from './health-smells-notify-list.mjs';
@@ -710,6 +711,8 @@ export function runHealthTick(prevState, probes, smells, now, { config = {}, act
   const state = { ...emptyHealthState(), ...(prevState || {}) };
   const daemons = { ...(state.daemons || {}) };
   for (const s of probes.daemonLogs || []) daemons[s.name] = foldDaemonMemory(daemons[s.name], s, now);
+  // builder-starved — the build-dispatch daemon's own JSON tick records, folded across samples.
+  const builder = probes.builderLog ? (foldBuilderTicks(state.builder, probes.builderLog.text) ?? state.builder ?? null) : (state.builder ?? null);
   // Probe-error streaks (smell 15's input).
   const errs = { ...(state.probeErrors || {}) };
   // An IO probe's streak resets when that probe succeeds; a smell's own `smell:<id>` streak resets only when that
@@ -728,7 +731,7 @@ export function runHealthTick(prevState, probes, smells, now, { config = {}, act
     }
     heavyHeldSince = next;
   }
-  const ctx = { now, config: cfg, daemons, probeErrors: errs, lastTick: state.lastTick, heavyHeldSince };
+  const ctx = { now, config: cfg, daemons, builder, probeErrors: errs, lastTick: state.lastTick, heavyHeldSince };
   const evaluations = smells.map((smell) => {
     const needs = smell.probes ?? [];
     const missing = needs.filter((p) => probes[p] === undefined);
@@ -742,7 +745,7 @@ export function runHealthTick(prevState, probes, smells, now, { config = {}, act
       return { smell, results: null, error: String(e?.message || e) };
     }
   });
-  const stepped = stepEpisodes({ ...state, daemons, probeErrors: errs, heavyHeldSince }, evaluations, now, { config: cfg, activeCards });
+  const stepped = stepEpisodes({ ...state, daemons, builder, probeErrors: errs, heavyHeldSince }, evaluations, now, { config: cfg, activeCards });
   const smellsById = Object.fromEntries(smells.map((s) => [s.id, s]));
   const plan = planActions(stepped.transitions, smellsById, { mode: cfg.mode, investigateDispatch: cfg.investigateDispatch, fileDispatch: cfg.fileDispatch });
   return { state: stepped.state, transitions: stepped.transitions, plan, evaluations };
