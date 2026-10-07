@@ -205,7 +205,11 @@ import {
 // gate below), so the review this pass would otherwise dispatch the moment CI finishes is instead HELD until
 // this fires and un-drafts it — closing the "6 of 26 PRs got reviewed before their own first CI run even
 // finished" measurement (operator, 2026-09-27) that motivated this whole feature.
-export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label', 'close-superseded']);
+// `card-batch-extract` is planned only once something consumes it: `reconcile-fix-dispatch.mjs` skips every kind but
+// `fix`, so until the wiring slice (#4703 slice 5) lands, a rejected card batch keeps its in-place `fix` dispatch
+// instead of stalling on an entry nobody acts on. That slice flips this to true.
+export const CARD_BATCH_EXTRACT_WIRED = false;
+export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label', 'close-superseded', 'card-batch-extract']);
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#REFUSAL_KINDS — every reason this pass declines to dispatch. Frozen and
@@ -1423,6 +1427,8 @@ function operatorSendBackRearm(pr, operatorBudget) {
  *   {@link CI_HEAL_ROUND_CAP} (3). Deliberately its OWN cap, not `roundCap`: a CI-heal round and a fix/review
  *   negotiation round are different work (a rebase-and-repair vs. a finding-and-fix), so binding them to one
  *   shared counter would let a PR burn through one cap doing the other kind of work.
+ * @param {boolean} [o.cardBatchExtract] - route a bounced `lane/card-batch-*` PR to `card-batch-extract` instead of
+ *   `fix` (xuz8m83); defaults to {@link CARD_BATCH_EXTRACT_WIRED}.
  * @param {number} [o.conflictFixCap] - the mechanical conflict-resolution attempt cap (#xkmu3gv); defaults to
  *   {@link CONFLICT_FIX_ROUND_CAP} (3). See that constant's own docblock for why it is separate from `roundCap`.
  * @param {number} [o.advisoryFixCap] - the advisory-fix attempt cap on a `needs-human` PR (#xkmu3gv); defaults
@@ -1495,6 +1501,7 @@ export function planReconcile({
   repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap = CI_HEAL_ROUND_CAP,
   ciHealBudgetRestore = resolveCiHealBudgetRestore(process.env),
   conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP, defaultBranch = 'main',
+  cardBatchExtract = CARD_BATCH_EXTRACT_WIRED,
   fixerLadder = DEFAULT_FIXER_LADDER,
   mainRedWindows = [], mainLatestCheckRuns = [],
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — the repo's REQUIRED status-check names (branch
@@ -2588,14 +2595,18 @@ export function planReconcile({
       continue;
     }
 
+    // A rejected card batch (`lane/card-batch-*`, #4703) is not repaired in place: the one rejected card is extracted
+    // into its own PR (`we:scripts/operations/card-batch-extract.mjs`) and the rest are re-sealed. Only this plain
+    // bounce routes there; conflict/advisory/ruling fixes above keep their own `fix` kind.
+    const isCardBatch = cardBatchExtract && String(pr?.headRefName ?? '').startsWith('lane/card-batch-');
     dispatch.push({
-      ...base, ...withPhase, kind: 'fix', findings, attempts,
-      why: `bounced with ${findings} finding(s), nothing live is working it, and ${attempts} of ${effectiveRoundCap} attempts are spent`,
+      ...base, ...withPhase, kind: isCardBatch ? 'card-batch-extract' : 'fix', findings, attempts,
+      why: `bounced with ${findings} finding(s), nothing live is working it, and ${attempts} of ${effectiveRoundCap} attempts are spent${isCardBatch ? ' — card batch: extract the rejected card instead of an in-place fix' : ''}`,
     });
   }
 
   for (const entry of dispatch) {
-    if (entry.kind !== 'fix') continue;
+    if (entry.kind !== 'fix' && entry.kind !== 'card-batch-extract') continue;
     const sourcePr = prs.find((pr) => Number(pr?.number) === entry.prNumber);
     // Older/hand-opened PRs may lack an episode marker; creation still bounds starvation.
     const since = fixWaitingSince(sourcePr?.comments) || sourcePr?.createdAt;
