@@ -54,6 +54,7 @@ import {
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
 import { runReconcileFixDispatch } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
+import { runAwaitVerifyPassDefault, formatAwaitVerifyLines } from '../../scripts/conveyor/await-verify-pass.mjs';
 import { runReconcileCiHealDispatch } from '../../scripts/operations/ci-heal-pr-dispatch.mjs';
 import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
@@ -594,6 +595,9 @@ export function runMissingRunRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPO
 export async function runTickAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, notesTick, notesDryRun,
   authGateOverride,
+  // #5137 slices 2+3 — the verify-verdict pass (we:scripts/conveyor/await-verify-pass.mjs). Injectable like every
+  // other half; a test tick (fixTick/ciHealTick injected) never runs the real one.
+  awaitVerifyTick,
   // #3383 follow-up (live-caught 2026-09-26, PR #2771) — apply this daemon's OWN `review-status:*` tag the
   // instant it dispatches a fix/ci-heal session, never waiting on the SEPARATE Review daemon's own tick to
   // notice (see `we:scripts/conveyor/review-status-tag.mjs#applyReviewStatus`'s own docblock for the full
@@ -616,6 +620,11 @@ export async function runTickAllRepos({
   const factsWarm = realTick ? await warmFixFacts(repos) : null;
   const authGate = authGateOverride ? authGateOverride()
     : ((fixTick || ciHealTick) ? { paused: false, reason: null } : planClaudeAuthDispatchGate());
+  // #5137 — FIRST, before any fresh dispatch: a fixer that ended its turn awaiting a verdict is pushed (green,
+  // exact sha) or resumed (red) here, so the model never holds a turn open on `check --wait`. Pushing needs no
+  // Claude login; resuming does, so a paused login only defers the resume (the record keeps it pending).
+  const awaitVerify = awaitVerifyTick ? await awaitVerifyTick({ allowResume: !authGate.paused })
+    : (realTick ? await runAwaitVerifyPassDefault({ allowResume: !authGate.paused }) : { rows: [] });
   const pausedDispatchResult = () => ({
     repos: repos.map((repo) => ({ repo, result: { dispatched: [], refusals: [] } })),
     dispatched: [], refusals: [], reconcileRefusals: [],
@@ -685,6 +694,7 @@ export async function runTickAllRepos({
     notes: notes.notes, // #4191 — every surfaced note this tick saw, repo-tagged
     noteComments: notes.comments, // #4191 — one row per note: posted / would-post (dryRun) / already-posted
     statusTags, // #3383 follow-up — one row per dispatch-time `review-status:*` tag attempt this tick made
+    awaitVerify, // #5137 — one row per recorded verify wait this tick read (wait / push / rerequest / resume)
     ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
   };
 }
@@ -821,8 +831,10 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
     onTick: (result) => {
       const {
         repos = [], dispatched = [], refusals = [], reconcileRefusals = [], hungCi, mainRedRebase, missingRun, promoteDraft, notes = [], noteComments = [],
-        authPaused = false, authPauseReason = null, statusTags = [],
+        authPaused = false, authPauseReason = null, statusTags = [], awaitVerify = null,
       } = result || {};
+      // #5137 — one line per verify wait the harness acted on (pushed / re-requested / resumed), plus a waiting count.
+      for (const line of formatAwaitVerifyLines(awaitVerify)) log.error(`reconcile-fix-dispatch-daemon: ${line}`);
       if (result?.factsStats) {
         const w = result.factsWarm;
         log.error(`reconcile-fix-dispatch-daemon: pr-facts ${w?.skipped ? `off (${w.skipped})` : (w?.warmed ?? []).map((x) => `${x.repo.split('/')[1]}=${x.ok ? 'store' : `github (${x.reason})`}`).join(' ')} — reads: ${formatFixReadStats(result.factsStats)}`);

@@ -2776,7 +2776,7 @@ describe('#3960: the fix/ci-heal briefs fill repo-aware, and reproduce WE\'s pre
     expect(prompt).toContain('printf \'%s\\n\' "WE #2608: fix — <specific correction> (PR 701)"');
     // xpnhz4o — the gate is the diff-selected verify-lane run, never the bare full suite.
     expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/verify-lane.mjs request --repo=.`); // #4369 — request/check, never the guard-denied `run`
-    expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/verify-lane.mjs check --wait=540000 --json --repo=.`);
+    expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/conveyor/await-verify.mjs mark --repo=web-everything/web-everything --pr=701 --who=fix-701 --ref=lane/2608-x --kind=fix --attempt=1`); // #5137
     expect(prompt).not.toContain(`verify-lane.mjs run --repo=.          #`);
     expect(prompt).not.toContain('npm run test:unit && npm run check:standards');
     // Landing-freeze fix (lane-leftover-reclaim) — `--repo=` is now `{{LANE_REPO}}`, an absolute path equal to
@@ -2790,7 +2790,7 @@ describe('#3960: the fix/ci-heal briefs fill repo-aware, and reproduce WE\'s pre
     const { prompt } = fillBrief(CI_HEAL_BRIEF, { ...BASE_CI_HEAL_VALUES, ...tokens }, BRIEF_REQUIRED_BY_KIND['ci-heal'], undefined, REPO_AWARE_VALUE_PATTERNS);
     expect(prompt).toContain('printf \'%s\\n\' "WE #2638: ci-heal — <failing check and repair> (PR 743)"');
     expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/verify-lane.mjs request --repo=.`); // #4369 — request/check, never the guard-denied `run`
-    expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/verify-lane.mjs check --wait=540000 --json --repo=.`);
+    expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/conveyor/await-verify.mjs mark --repo=web-everything/web-everything --pr=743 --who=ci-heal-743 --ref=lane/2638-x --kind=ci-heal --attempt=1`); // #5137
     expect(prompt).not.toContain(`verify-lane.mjs run --repo=.          #`);
   });
 
@@ -2812,7 +2812,7 @@ describe('#3960: the fix/ci-heal briefs fill repo-aware, and reproduce WE\'s pre
     expect(prompt).not.toContain('node "/home/test/workspace/plateau-app/scripts');
     // The gate runs against the plateau lane (`--repo=.`), with WE's own verify-lane choosing plateau's scripts.
     expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/verify-lane.mjs request --repo=.`);
-    expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/verify-lane.mjs check --wait=540000 --json --repo=.`);
+    expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/conveyor/await-verify.mjs mark --repo=plateauapp/plateau-app --pr=701 --who=fix-701 --ref=lane/2608-x --kind=fix --attempt=1`); // #5137
     expect(prompt).toContain('printf \'%s\\n\' "PLATEAU #2608: fix — <specific correction> (PR 701)"');
   });
 });

@@ -48,7 +48,8 @@
 
 Reconstitute the PR's work in a lane clone reset to its pushed ref, **merge the live PR base into the lane**, **diagnose and
 repair the failing required check** (repair only the CI break — do NOT touch the item's substance beyond what the
-check needs), get the gate green, **re-push HEAD to the same `lane/*` ref**, **post the durable CI-heal comment**,
+check needs), commit it and hand the verify wait to the harness (which **re-pushes that commit to the same `lane/*`
+ref** on green and resumes you), **post the durable CI-heal comment**,
 then **EXIT WITHOUT LANDING THE PR** — and **NEVER touch the review label** (`review:human` / `review:pending` /
 `review:changes` stay exactly as they were; only CI is repaired).
 
@@ -311,10 +312,19 @@ as "closes"/"fixes" the item itself — it heals CI on an already-open PR, it do
 
 ### 4. Run the gate GREEN (the item's own locus gate)
 
+**The harness owns the wait, not you (#5137).** The gate verifies a COMMIT and the harness pushes exactly that
+commit, so first finish step 5's self-review and make step 6's commit (the step-2 merge commit alone counts when
+the merge healed it) — but NOT its push. Then hand the wait over:
+
 ```bash
 node {{WE_ROOT}}/scripts/verify-lane.mjs request --repo=.                        # returns almost instantly — nothing has run yet
-node {{WE_ROOT}}/scripts/verify-lane.mjs check --wait=540000 --json --repo=.     # blocks (bounded, fits one foreground call) until the verify runner settles the marker
+node {{WE_ROOT}}/scripts/conveyor/await-verify.mjs mark --repo={{REPO}} --pr={{PR_NUM}} --who={{SESSION_SLUG}} --ref={{LANE_REF}} --kind=ci-heal --attempt=1
 ```
+
+Then **end your turn**: reply with one line (`awaiting verify for <sha>`) and stop. Never `check --wait`, never
+`sleep`, never `run_in_background`, never read output files in a loop (#x36vidg), never `reset` or re-`request`
+yourself. `mark` refuses a dirty tree or a sha that is not HEAD — commit first. The fix daemon reads the verdict
+every tick and resumes THIS session with a message that starts `[harness verify verdict — #5137]`.
 
 A dispatched agent cannot run the gate itself: `we:scripts/guard-bash.mjs` denies any `verify-lane.mjs` invocation
 except `request` / `check` / `reset` (#3105) — including a bare `run --repo=.` and `run` wrapped in
@@ -322,23 +332,22 @@ except `request` / `check` / `reset` (#3105) — including a bare `run --repo=.`
 quoted path is denied). Do not run `verify-lane.mjs run` here; `request` stamps a marker the verify runner
 (`we:scripts/conveyor/verify-dispatch.mjs`) picks up and settles with the same diff-selected gate.
 
-Read the verdict from the **`check` output**, never the `request` acknowledgement:
-`green` → proceed; `red` (exit 2) → the hard stop below; `infrastructure-failure` → report the
-signal/ceiling evidence, without claiming a test failure or automatically resetting/re-requesting.
-`timeout` (the 9-minute wait elapsed with the request still `running`) → run the SAME `check --wait=540000`
-again. Every call is ONE blocking foreground call that fits the Bash tool's `timeout: 600000` ceiling, so a
-gate that legitimately takes 30+ minutes is waited out in chunks, never in a call the tool would kill. Stop after
-18 consecutive `timeout`s (~160 minutes: the admission + execution ceilings, after which the dispatcher itself
-kills a hung run and settles the marker as `infrastructure-failure`) and report the stalled request once.
-Never `sleep`, never `run_in_background`, never read output files in a loop (#x36vidg), and never `reset` or
-re-`request` automatically.
+The harness acts on the same verdict `verify-lane.mjs check` prints — the **`check` output**, never the `request`
+acknowledgement — and the resume message tells you which branch you are on:
+`green` → the harness has already pushed your exact sha to `{{LANE_REF}}`; continue at step 7's CI-heal comment
+and never push `{{LANE_REF}}` yourself. `red` (exit 2) → the failing tests are in the message: repair, commit,
+`request`, `mark` again with `--attempt=<n+1>`, and end your turn; on the third red the message tells you to take
+the gate-red hard stop below. A red the gate classifies as load-only → the message tells you to take the load-flake
+exit below. `infrastructure-failure` or no verdict → the harness re-requests on its own; after repeated failures
+the message tells you to report the stalled request with the blocked-on-infra exit (the signal/ceiling evidence,
+without claiming a test failure). A moved or dirty lane → re-commit, `request`, `mark` again.
 Other statuses follow [we:skills-src/conveyor/delivery-agent-brief.md](delivery-agent-brief.md).
 
-After the re-push, do NOT wait for the new CI run to go green (no `gh pr checks --watch`, no `sleep` loop on
+After the harness pushes, do NOT wait for the new CI run to go green (no `gh pr checks --watch`, no `sleep` loop on
 `gh pr checks`/`statusCheckRollup`) — the ci-heal tally comment is your last write; report and exit.
 
 If the heal also touches a WE-side file (docs, the backlog item itself, WE-side glue) — i.e. `{{SCOPE}}` names
-anything outside `{{REPO}}` — additionally run `npm run check:standards` from `{{WE_ROOT}}` before re-pushing:
+anything outside `{{REPO}}` — additionally run `npm run check:standards` from `{{WE_ROOT}}` before step 4's `request`:
 the gate is `{{REPO}}`'s own gate and does not check WE's cross-repo invariants. For WE itself
 (`{{REPO}}` == WE), the gate already includes WE's own check:standards (scoped to your diff), so this is
 a no-op today.
@@ -354,6 +363,8 @@ at run time leaves a red marker).
 A default local selection never expands into the full suite. **Never run the full suite yourself**
 (`npm run test:unit`, `npm test`, a bare `vitest run`): the verify runner runs the same gate for you, CI runs it
 anyway, and the Bash guard denies it.
+
+To debug one or two tests, run `npm run test:unit -- <file(s)>` (≤5 files, 8-minute cap); it uses the fast lane. Run the full verify (request + mark + end turn, per the await flow in step 4) once before the harness pushes — never push yourself.
 
 **Load-flake exception.** When verify is red ONLY on failures in files your heal did not touch, and each of those files passes when run alone (`node {{WE_ROOT}}/scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`), save and push the heal to `{{LANE_REF}}-heal-{{PR_NUM}}-alt`, then use the load-flake exit instead of the gate-red exit below. Pass the PR's FULL 40-character head sha (`git rev-parse origin/<head ref>`). Only `web-everything/web-everything` has a reverify worker; for any other repo use the gate-red exit below.
 
@@ -375,33 +386,35 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 
 ### 5. Converge before re-push — self-review the heal (proportionate to the change)
 
+Run this BEFORE step 4's `request`: the harness pushes exactly the commit it verified, so review comes first.
+
 For anything beyond a trivial merge-only heal, spawn **one adversarial code-review subagent** on your heal diff
 and **AWAIT its returned report as the verdict** — the same converge-before-handback discipline the delivery brief
 uses ([delivery-agent-brief.md](delivery-agent-brief.md) step 6). Confirm the repair addresses the failing check
 and introduces no new problem. Address every finding to convergence (fix it, or dismiss it with a one-line reason).
 A trivial, obviously-correct heal (a clean merge with no code change) may skip the subagent.
 
-### 6. Commit + re-push HEAD to the SAME lane ref (update the existing PR in place)
+### 6. Commit (before step 4's request) — the harness re-pushes it to the SAME lane ref
 
-Commit only the heal's files (explicit paths, never `git add -A`; one commit) on the lane's current branch.
-Push normally to update the existing PR's head — this **updates the PR**, it does not
+Commit only the heal's files (explicit paths, never `git add -A`; one commit) on the lane's current branch, BEFORE
+step 4's `request`. Do **not** push `{{LANE_REF}}` yourself: on a green verdict for exactly this commit the harness
+pushes it to update the existing PR's head — this **updates the PR**, it does not
 open a new one (never `gh pr create`, never `pr-land` — the PR already exists):
 
 ```bash
 printf '%s\n' "{{ATTRIBUTION}}: ci-heal — <failing check and repair> (PR {{PR_NUM}})" "" \
   "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>" > <msgfile>
 git commit -F <msgfile> <explicit-paths>   # omit if the merge alone healed it and there is nothing new to commit
-git push origin HEAD:refs/heads/{{LANE_REF}}
 ```
 
 Write the commit message to a file and `commit -F` it — a heredoc runs backticks (e.g. `` `scope:` ``) as a
 subshell (`bad substitution`); a message file has no such footgun. Pushing to `lane/*` is allowed by the
-single-branch guard; pushing to `main` is not. A non-fast-forward push refusal means the remote moved; reconcile with the current PR head before retrying.
-Never force-push over that refusal.
+single-branch guard; pushing to `main` is not. If the harness reports a non-fast-forward push refusal, the remote
+moved; reconcile with the current PR head, commit, and request + mark again. Never force-push over that refusal.
 
 ### 7. Post the durable CI-heal comment — the restart-surviving attempt tally (NEVER a label swap)
 
-The heal is re-pushed. Record it with a durable comment — this is **the ONLY thing you write to the PR**, and it is
+The harness re-pushed the heal. Record it with a durable comment — this is **the ONLY thing you write to the PR**, and it is
 a comment, **NOT** a label change:
 
 ```bash
@@ -475,7 +488,8 @@ repair-only-CI, re-push, guarded-completion shape is identical.
 - **Reuse the ref, never rebuild** — reconstitute from `{{LANE_REF}}`; if the ref is gone, report it, don't redo.
 - **Repair only the CI break** — do not fold unrelated work in; do not weaken or delete a test to go green; if the
   diff itself is genuinely wrong (not a CI/merge break), escalate — don't paper over it.
-- **Work only through the normal verbs** — `acquire --base=<ref>` → merge → repair → `git push … lane/*` →
+- **Work only through the normal verbs** — `acquire --base=<ref>` → merge → repair → commit → `verify-lane.mjs request` +
+  `await-verify.mjs mark` → end turn (the harness pushes `lane/*` on green) →
   `ci-heal-mark.mjs` → daemon/human. No parallel state store or hand-written review-label swap; the shared guarded completion command owns the handoff.
 - **If you stop, say so IN YOUR COMPLETION RECORD** (#4075/xg7m2wq) — every exit above runs
   `completion-cli.mjs report --status=done` before it returns, starting with `report --status=started` at step

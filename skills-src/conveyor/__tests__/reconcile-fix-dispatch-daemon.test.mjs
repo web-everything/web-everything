@@ -1157,3 +1157,35 @@ describe('runTickAllRepos — source contract: really calls runMissingRunRecover
     result: { scopeRanks: [{ pr: 3311, rank: 1, blocks: 5, ageHours: 2, score: 7, aged: false }] } }] });
   expect(log.error).toHaveBeenCalledWith('reconcile-fix-dispatch-daemon: scope-rank web-everything/web-everything PR #3311 — rank 1, blocks 5, age 2h, score 7, aged-FIFO false');
 });
+
+// #5137 slices 2+3 review — the verify-verdict pass is wired FIRST in the tick, and a paused login defers only
+// the resume (`allowResume`), never the push. Without this a dropped/reordered call leaves every test green while
+// fixers end their turn awaiting a verdict nothing acts on.
+describe('runTickAllRepos — the await-verify verdict pass wiring (#5137)', () => {
+  const tickOpts = (calls, extra = {}) => ({
+    repos: ['repo-a'],
+    fixTick: vi.fn(() => { calls.push('fix'); return { dispatched: [], refusals: [] }; }),
+    ciHealTick: vi.fn(async () => { calls.push('ci-heal'); return { dispatched: [], refusals: [] }; }),
+    hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick,
+    notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick, ...extra,
+  });
+
+  it('unpaused login: the pass runs BEFORE the dispatch ticks with allowResume true, and its rows ride on the result', async () => {
+    const calls = [];
+    const awaitVerifyTick = vi.fn(async (arg) => { calls.push('await-verify'); return { rows: [{ pr: 7, action: 'push', arg }] }; });
+    const out = await runTickAllRepos(tickOpts(calls, { awaitVerifyTick, authGateOverride: () => ({ paused: false, reason: null }) }));
+    expect(awaitVerifyTick).toHaveBeenCalledTimes(1);
+    expect(awaitVerifyTick).toHaveBeenCalledWith({ allowResume: true });
+    expect(calls).toEqual(['await-verify', 'fix', 'ci-heal']);
+    expect(out.awaitVerify.rows).toHaveLength(1);
+  });
+
+  it('paused login: the pass STILL runs (the push needs no login) but is told allowResume false', async () => {
+    const calls = [];
+    const awaitVerifyTick = vi.fn(async () => { calls.push('await-verify'); return { rows: [] }; });
+    const out = await runTickAllRepos(tickOpts(calls, { awaitVerifyTick, authGateOverride: () => ({ paused: true, reason: 'paused' }) }));
+    expect(awaitVerifyTick).toHaveBeenCalledWith({ allowResume: false });
+    expect(calls).toEqual(['await-verify']); // dispatch halves skipped while paused, the pass was not
+    expect(out.awaitVerify).toEqual({ rows: [] });
+  });
+});
