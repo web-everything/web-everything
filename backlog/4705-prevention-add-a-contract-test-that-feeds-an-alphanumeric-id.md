@@ -3,10 +3,11 @@ bornAs: x2c7uas
 kind: story
 size: 3
 parent: "4075"
-status: active
+status: resolved
 scope: ["we:scripts/lib/probation-launcher.mjs", "we:scripts/operations/probation-build-run.mjs", "we:scripts/lib/__tests__/probation-launcher.test.mjs", "we:scripts/operations/__tests__/probation-build-run.test.mjs"]
 dateOpened: "2026-10-03"
 dateStarted: "2026-10-06"
+dateResolved: "2026-10-06"
 preparedDate: "2026-10-06"
 preparedAgainstSha: "75c39659a06fefd7ee76fb1af223d53880109a25"
 tags: []
