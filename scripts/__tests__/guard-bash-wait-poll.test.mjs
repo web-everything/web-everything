@@ -68,7 +68,7 @@ describe('session scoping', () => {
   });
   it('decide() only fires the arm with ctx.agentSession', () => {
     expect(decide(PR_POLLS[1], { agentSession: true })).toMatch(/WAIT-POLL/);
-    expect(decide(PR_POLLS[1], {})).toBeNull();
+    expect(decide(PR_POLLS[1], {})).toMatch(/POLLING LOOP/); // the generic no-polling arm now covers every session
     for (const c of ALLOWED) expect(decide(c, { agentSession: true }) || '').not.toMatch(/WAIT-POLL|SLEEP-POLL/);
   });
 });
@@ -109,15 +109,16 @@ describe('CLI — live PreToolUse payloads', () => {
   });
   it('an unrecognised worker-marker value is not an agent session (warn only)', () => {
     const r = run(PR_POLLS[0], {}, { WE_CONVEYOR_WORKER: '0' });
-    expect(r.hookSpecificOutput).toBeUndefined();
+    expect(r.hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(r.hookSpecificOutput.permissionDecisionReason).toMatch(/POLLING LOOP/); // not the agent-scoped arm
   });
-  it('only warns the interactive session', () => {
+  it('the interactive session is denied too, by the generic no-polling arm', () => {
     const r = run(PR_POLLS[0]);
-    expect(r.hookSpecificOutput).toBeUndefined();
-    expect(r.systemMessage).toMatch(/would be DENIED/);
+    expect(r.hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(r.hookSpecificOutput.permissionDecisionReason).toMatch(/POLLING LOOP/);
   });
   it('passes a one-shot read and a non-PR poll from a subagent', () => {
     expect(run('gh pr view 2583 --json state,labels', { agent_id: 'a1' })).toBeNull();
-    expect(run('until curl -sf http://localhost:4000/; do sleep 1; done', { agent_id: 'a1' })).toBeNull();
+    expect(run('sleep 5 && curl -sf http://localhost:4000/', { agent_id: 'a1' })).toBeNull();
   });
 });

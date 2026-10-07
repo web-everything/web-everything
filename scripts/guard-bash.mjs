@@ -26,6 +26,11 @@
  *     `gh run watch`) — the drain/pr-watch own merge+CI, report and exit — or a sleep loop over a background
  *     task's `tasks/<id>.output` / a `subagents/*.jsonl` transcript — re-run the gate in the foreground with an
  *     explicit timeout instead. The interactive main session gets a WARN (`systemMessage`), never a deny.
+ *   • NO-POLLING — a shell loop (`for|while|until`) whose body sleeps/waits (`sleep`, `perl -e 'sleep'|select(undef…)`,
+ *     `node -e` setTimeout, `python -c time.sleep`, `read -t`), or ANY single wait longer than `maxSleepSeconds`
+ *     (scripts/guard-bash-polling.json, default 30), in EVERY session kind. A session stuck in a wait cannot be
+ *     messaged (incident: a build agent sat ~20 min in such a loop). Allowlist: a bare background `sleep N<=120`
+ *     heartbeat only. Alternatives: end the turn (#5137 await-verify), one `verify-lane check --wait=`, report pending. No override.
  *   • a BACKGROUNDED codex-direct-task.mjs / gemini-direct-task.mjs invocation — both scripts are
  *     synchronous by contract (see their FOREGROUND ONLY banners). No override (#3383).
  *   • a backlog item-mutation (claim/scaffold/…) run in a lane clone whose HEAD is BEHIND origin/main —
@@ -2034,6 +2039,291 @@ export function interactiveWaitPollNudge(command, { agentSession = false } = {})
   return null;
 }
 
+// ── NO-POLLING — agents may not run wait/poll loops or long sleeps ──────────────────────────────────────────
+// Incident: a build agent sat ~20 min in `for i in $(seq 1 38); do if grep … daemon.log …; then break; fi;
+// perl -e 'select(undef,undef,undef,…)'; done` — unable to receive messages, and had to be killed. Other agents
+// used `perl -e 'sleep 330'` and `until …; do …; perl -e 'sleep 120'; done`. A session that is inside a Bash
+// call cannot be messaged or resumed, so a wait loop is a stall the harness cannot see. Rule: (1) a loop whose
+// body (or condition) sleeps/waits is DENIED, however it waits — a shell `for|while|until … done`, or a loop
+// inside a perl/python/node/ruby/php/awk one-liner or a heredoc fed to one; a wait OUTSIDE the loop's `done` is
+// just a short sleep; (2) any SINGLE wait longer than `maxSleepSeconds` (scripts/guard-bash-polling.json,
+// default 30), any wait whose length is not a plain literal (`sleep $N`, `1e3` is read, `0x10` is not), and the
+// SUM of the waits in one command above that limit are DENIED. Applies to EVERY session kind (main,
+// subagent, conveyor). No override. Sanctioned allowlist (see the json): a bare `sleep N` (N <=
+// heartbeat.maxSeconds) run with run_in_background:true — the harness-tracked heartbeat of /workflow and
+// /conveyor. `verify-lane check --wait=<ms>` contains no sleep (it polls internally) so it is simply not matched.
+// COVERAGE is best-effort, the same accidental-collision threat model as the rest of this file (#2367), NOT a
+// proof that polling is impossible. Scanned: the command, every `bash -c`/`$()` script it re-executes, wrapper
+// prefixes (nohup/env/time/xargs/timeout/…), interpreter one-liners and heredocs fed to a shell or interpreter.
+// Heredoc bodies fed to anything else (`cat`, `git commit -F -`, or a shell/interpreter given a script FILE) are
+// data and never scanned. A script is only judged by CALL syntax (`sleep(5)`, `time.sleep(5)`, `system("sleep 5")`):
+// the bare word `sleep` in a program that edits or searches text is not a wait. KNOWN GAPS: a script FILE written
+// and then run, `find -exec sleep`, interpreters not listed, `bash <<< '…'` / `echo '…' | bash`, blocking waiters
+// that are not a sleep (`tail -f`, `watch`, `inotifywait`, `kubectl wait`), `s=sleep; $s 100`, and a loop split
+// across separate Bash calls — none of these is reliably detectable from one command line.
+const POLLING_DEFAULTS = { maxSleepSeconds: 30, heartbeatMaxSeconds: 120 };
+function loadPollingSettings() {
+  try {
+    const j = JSON.parse(readFileSync(new URL('./guard-bash-polling.json', import.meta.url), 'utf8'));
+    const max = Number(j.maxSleepSeconds);
+    const hb = Number(j.heartbeat && j.heartbeat.maxSeconds);
+    return {
+      maxSleepSeconds: Number.isFinite(max) && max > 0 ? max : POLLING_DEFAULTS.maxSleepSeconds,
+      heartbeatMaxSeconds: Number.isFinite(hb) && hb >= 0 ? hb : POLLING_DEFAULTS.heartbeatMaxSeconds,
+    };
+  } catch { return { ...POLLING_DEFAULTS }; }
+}
+const POLLING_UNIT = { s: 1, m: 60, h: 3600, d: 86400 };
+const SLEEP_NUMBER = /^(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+/** Seconds named by the args of a `sleep` (GNU/BSD: `30`, `1m`, `1h 30m`, `1e3`), Infinity for `infinity`, and NaN
+ *  when ANY token is not a plain literal (`$N`, `$((60*10))`, `0x10`). NaN means "unbounded" — callers deny it. */
+function sleepArgsSeconds(args) {
+  // `args` is the RAW text after `sleep`, capped so a pathological line cannot make the strip below quadratic;
+  // quotes are dropped (`sleep "5"` is `sleep 5`) and so are redirections (`2>/dev/null`, `2>&1`, `>&2`).
+  const toks = args.slice(0, 512).replace(/['"]/g, '').replace(/\d*[<>]+&?\s*\S*/g, ' ').trim().split(/\s+/).filter(Boolean);
+  if (!toks.length) return NaN;
+  let total = 0;
+  for (const t of toks) {
+    if (/^--?(?:help|version)$/.test(t)) return 0;
+    if (/^\+?(?:inf|infinity)$/i.test(t)) return Infinity;
+    const unit = /[smhd]$/.test(t) ? t.slice(-1) : '';
+    const num = unit ? t.slice(0, -1) : t;
+    if (!SLEEP_NUMBER.test(num)) return NaN;
+    total += Number(num) * POLLING_UNIT[unit || 's'];
+  }
+  return total;
+}
+/** Seconds a `read -t` blocks for, NaN when its value is not a literal, null when `read` has no timeout. `opts` is the
+ *  quote-masked text after `read`. */
+function readTimeoutSeconds(opts) {
+  const toks = opts.trim().split(/\s+/).filter(Boolean);
+  for (let i = 0; i < toks.length; i++) {
+    const m = toks[i].match(/^-[A-Za-z]*t(\S*)$/);
+    if (m) { const arg = m[1] || toks[i + 1] || ''; return SLEEP_NUMBER.test(arg) ? Number(arg) : NaN; }
+    if (!toks[i].startsWith('-') && !/^[\d.]+$/.test(toks[i])) break;     // first variable name ends the options
+  }
+  return null;
+}
+// Command wrappers that may stand in front of a wait (`nohup sleep 100`, `time sleep`, `xargs -n1 sleep`,
+// `timeout 200 sleep`): each takes flags, `VAR=val`, or a bare number/duration before the real program.
+// `command -v sleep` / `-V` is a lookup, not a run, so `command` is a wrapper only without that flag.
+const WAIT_WRAPPERS = String.raw`(?:(?:nohup|env|time|command(?!\s+-\w*[vV])|exec|eval|builtin|nice|ionice|stdbuf|setsid|sudo|doas|caffeinate|xargs|timeout)\s+(?:-\S+\s+|[A-Za-z_]\w*=\S*\s+|\d+(?:\.\d+)?[smhd]?\s+)*)*`;
+// Where a command may START: after a separator or backtick, after a loop/conditional keyword (`while sleep 1; do`,
+// `if sleep 1; then`), and after a negating `!`. `\`` is a literal backtick.
+const POLL_CMD_POS = String.raw`(?:^|[;&|(){}\n\`]|\b(?:do|then|else|elif|if|while|until)\b)\s*(?:!\s*)?`;
+const WAIT_INTERPRETERS = String.raw`perl|ruby|python[\d.]*|node|nodejs|bun|deno|php|awk|gawk|mawk|nawk`;
+/** Where each interpreter's inline script lives on its command line: `[program, regex → group 2 is the script]`. */
+const INTERPRETER_SCRIPT = [
+  [/^(?:perl|ruby)$/, /\s-\w*[eE]\s*(['"])([\s\S]*?)\1/],
+  [/^python[\d.]*$/, /\s-\w*c\s*(['"])([\s\S]*?)\1/],
+  [/^(?:node|nodejs|bun|deno)$/, /\s(?:-\w*[ep]|--eval|--print|eval)\s*(['"`])([\s\S]*?)\1/],
+  [/^php$/, /\s-\w*r\s*(['"])([\s\S]*?)\1/],
+  [/^(?:awk|gawk|mawk|nawk)$/, /\s(['"])([\s\S]*?)\1/],
+];
+/** A loop construct in some interpreter's script (a wait inside one is a polling loop whatever the language). */
+const SCRIPT_LOOP = /\b(?:while|until|for|foreach|loop|forever|setInterval)\b/;
+/** Every wait an interpreter SCRIPT (a one-liner body or a heredoc fed to the interpreter) performs, in seconds
+ *  (NaN when not a literal), plus whether the script loops. Pure. Only CALL syntax counts, never a bare word — a
+ *  script that merely MENTIONS sleep (`print('sleep deprivation')`, `/sleep/`, a `.replace("sleep 100", …)` edit of
+ *  this very guard) is data: `sleep(N)` / `time.sleep(N)` / `asyncio.sleep(N)`, `usleep(N)`, `system("sleep N")` and
+ *  friends, perl `select(undef,undef,undef,N)`, node `setTimeout(` / `setInterval(` / `Atomics.wait(`; plus the bare
+ *  statement `sleep N` / `sleep $n` for `prog` perl/ruby only. */
+function scriptWaits(body, prog = '') {
+  body = body.slice(0, 65536);                    // bounded scan: the idiom regexes below are not linear on junk
+  const waits = [];
+  const lit = (s) => (s ? Number(String(s).replace(/_/g, '')) : NaN);
+  const NUM = String.raw`(?:\d[\d_]*\.?\d*|\.\d+)(?:[eE][+-]?\d+)?`;
+  for (const x of body.matchAll(new RegExp(String.raw`\bsleep\s*\(\s*(${NUM})?`, 'g'))) waits.push(lit(x[1]));
+  if (/^(?:perl|ruby)$/.test(prog)) {
+    for (const x of body.matchAll(new RegExp(String.raw`(?<![\w/"'.$@%:-])sleep\s+(?:(${NUM})|\$\w+)`, 'g'))) waits.push(lit(x[1]));
+  }
+  for (const x of body.matchAll(/\b(?:system|exec\w*|popen|qx|spawn\w*|call|run)\s*\(\s*\[?\s*['"`]\s*sleep\s+([^\s'"`)\]]+)/g)) {
+    waits.push(new RegExp(`^${NUM}$`).test(x[1]) ? lit(x[1]) : NaN);
+  }
+  for (const x of body.matchAll(/\busleep\s*\(\s*([\d_.]+)?/g)) waits.push(lit(x[1]) / 1e6);
+  for (const x of body.matchAll(/select\s*\(\s*undef\s*,\s*undef\s*,\s*undef\s*,\s*([^)]*)\)/g)) {
+    const n = Number(x[1].trim());
+    waits.push(Number.isFinite(n) ? n : NaN);
+  }
+  for (const x of body.matchAll(/setTimeout\s*\([^,]*,\s*([\d_.*\s]+)\)/g)) {
+    let ms = NaN; try { ms = Function(`return (${x[1].replace(/_/g, '')})`)(); } catch { /* unknown */ }
+    waits.push(Number.isFinite(ms) ? ms / 1000 : NaN);
+  }
+  if (/setTimeout\s*\(/.test(body) && !/setTimeout\s*\([^,]*,\s*[\d_.*\s]+\)/.test(body)) waits.push(NaN);
+  if (/\bsetInterval\s*\(/.test(body)) waits.push(NaN);
+  for (const x of body.matchAll(/Atomics\.wait\s*\([^,]*,[^,]*,[^,]*,\s*([\d_.]+)/g)) waits.push(Number(x[1].replace(/_/g, '')) / 1000);
+  return { waits, loops: SCRIPT_LOOP.test(body) };
+}
+/** `[start, end)` offsets of every shell loop (`for|while|until` … matching `done`) in QUOTE-MASKED text; an unclosed
+ *  loop runs to the end. A wait counts as a polling-loop wait only when it sits inside one of these (the loop's
+ *  condition included) — a settle-sleep before or after a harmless loop is just a short sleep. Pure. */
+function loopSpans(masked) {
+  const stack = [];
+  const spans = [];
+  for (const m of masked.matchAll(new RegExp(`(${POLL_CMD_POS})(for|while|until|done)\\b`, 'g'))) {
+    const at = m.index + m[1].length;
+    if (m[2] === 'done') { const a = stack.pop(); if (a !== undefined) spans.push([a, at + 4]); }
+    else stack.push(at);
+  }
+  for (const a of stack) spans.push([a, masked.length]);
+  return spans;
+}
+/** Every wait in one shell text as `{ seconds, index, looping }` — `index` is the offset in `text`, `looping` marks a
+ *  wait inside an interpreter script that itself loops. `seconds` NaN = not a literal. Pure. */
+function shellWaits(text) {
+  text = text.replace(/\\\n/g, '  ');            // a `\`+newline continuation is whitespace (same length: offsets hold)
+  const masked = maskQuoted(text);
+  const waits = [];
+  const sleepRe = new RegExp(`(${POLL_CMD_POS})${WAIT_WRAPPERS}\\\\?((?:\\S*/)?(?:sleep|usleep))(?=[\\s;&|)\`]|$)([^;&|\\n)\`]*)`, 'g');
+  for (const m of masked.matchAll(sleepRe)) {
+    const index = m.index + m[1].length;
+    const end = m.index + m[0].length;
+    const args = text.slice(end - m[3].length, end);           // RAW args: `sleep "5"` is a literal 5
+    if (/usleep$/.test(m[2])) {
+      const t = args.slice(0, 512).replace(/['"]/g, '').trim().split(/\s+/)[0];
+      waits.push({ seconds: SLEEP_NUMBER.test(t) ? Number(t) / 1e6 : NaN, index });
+    } else waits.push({ seconds: sleepArgsSeconds(args), index });
+  }
+  // A condition-driven loop whose body does nothing (`while ! curl -sf x; do :; done`) is a spin-wait: no sleep word,
+  // same stall. `for` loops are bounded and left alone.
+  for (const m of masked.matchAll(/\b(?:while|until)\b[^;\n]*;\s*do\s*(?::|true)\s*;?\s*done\b/g)) waits.push({ seconds: 0, index: m.index, looping: true });
+  const readRe = new RegExp(`(${POLL_CMD_POS})read(?=\\s)([^;&|\\n)<]*)`, 'g');
+  for (const m of masked.matchAll(readRe)) {
+    const seconds = readTimeoutSeconds(m[2]);
+    if (seconds !== null) waits.push({ seconds, index: m.index + m[1].length });
+  }
+  // Interpreter one-liners: the script is the QUOTED argument, so find the command in the masked text (a commit
+  // message that merely mentions `perl -e 'sleep 100'` is not one) and read its script out of the raw text.
+  const interpRe = new RegExp(`(${POLL_CMD_POS})${WAIT_WRAPPERS}(?:\\S*/)?(${WAIT_INTERPRETERS})(?=[\\s;&|)]|$)`, 'g');
+  for (const m of masked.matchAll(interpRe)) {
+    const start = m.index + m[1].length;
+    const stop = masked.slice(start).search(/[;&|\n)]/);
+    const cmdRaw = text.slice(start, stop < 0 ? undefined : start + stop);
+    const entry = INTERPRETER_SCRIPT.find(([re]) => re.test(m[2]));
+    const body = entry && cmdRaw.match(entry[1]);
+    if (!body) continue;
+    const { waits: sw, loops } = scriptWaits(body[2], m[2].replace(/\d.*$/, ''));
+    for (const seconds of sw) waits.push({ seconds, index: start, looping: loops });
+  }
+  return waits;
+}
+const HEREDOC_OPERATOR = /<<-?\s*(?:'[^']*'|"[^"]*"|\\?\w+)/g;
+/** What does a heredoc's HEAD line feed its body to: `{ kind: 'shell', prog }` (bash/sh/…, the body is a script of
+ *  commands), `{ kind: 'script', prog }` (python/node/perl/…, the body is a program), or null — `cat`,
+ *  `git commit -F -`, or a shell/interpreter given a script FILE (`node x.mjs <<EOF`: the body is that script's
+ *  stdin DATA). A `cat <<EOF | bash` pipe is followed to its consumer. */
+function heredocInterpreter(head) {
+  let segs;
+  try { segs = parseSegments(String(head || '')).segments; } catch { return null; }
+  const progOf = (words) => (words[0] || '').replace(/^.*\//, '');
+  const wordsOf = (seg) => headWords(canonicalCommand(seg.replace(HEREDOC_OPERATOR, ' '))).map((w) => w.text);
+  const interpreters = new RegExp(`^(?:${WAIT_INTERPRETERS})$`);
+  const kindOf = (seg) => {
+    const words = wordsOf(seg);
+    const prog = progOf(words);
+    const shell = SHELL_PROGRAMS.has(prog);
+    if (!shell && !interpreters.test(prog)) return null;
+    const rest = words.slice(1);
+    if (shell && rest.includes('-s')) return { kind: 'shell', prog };
+    if (rest.some((w) => w !== '-' && !w.startsWith('-'))) return null;   // a script file / `-c` string: stdin is data
+    return { kind: shell ? 'shell' : 'script', prog };
+  };
+  const at = segs.findIndex((s) => s.includes('<<'));
+  if (at < 0) return null;
+  const direct = kindOf(segs[at]);
+  if (direct) return direct;
+  return /^(?:cat|tee|printf|echo)$/.test(progOf(wordsOf(segs[at]))) && segs.length > at + 1 ? kindOf(segs[segs.length - 1]) : null;
+}
+/** A segment as its command: drop the loop/conditional keyword (`do bash -c '…'`) and a `timeout <dur>` prefix. */
+const peelPollingSegment = (seg) => seg.replace(/^\s*(?:(?:do|then|else|elif|if|while|until)\s+)+(?:!\s*)?/, '').replace(/^\s*timeout\s+(?:-\S+\s+)*\S+\s+/, '');
+/** The shell texts `command` really executes: itself with heredoc bodies stripped (they are data), plus every script
+ *  it re-executes (`bash -c '…'`, `$( … )`, backticks), recursively. Each view carries `inLoop` when the text that
+ *  spawned it sits inside a loop of its parent, and the stripped `heredocs` so interpreter-fed ones can be scanned. */
+function pollingViews(command) {
+  const views = [];
+  const seen = new Set();
+  const add = (t, depth, inLoop) => {
+    if (depth > 4 || seen.has(t)) return;
+    seen.add(t);
+    const hs = heredocScan(t);
+    views.push({ text: hs.text, heredocs: hs.heredocs || [], inLoop });
+    const masked = maskQuoted(hs.text);
+    const spans = loopSpans(masked);
+    let nested = [];
+    try { nested = parseSegments(hs.text).segments.flatMap((seg) => nestedCommandStrings(peelPollingSegment(seg))); } catch { nested = []; }
+    for (const n of nested) {
+      // A body that is visible UNQUOTED in this view (`$(sleep 20)`, a `( … )` group, backticks) is already scanned
+      // by it — scanning it again as its own view would count the same wait twice. Quoted ones (`bash -c '…'`,
+      // `"$( … )"`) are blanked in the masked view and are only reached here.
+      if (masked.includes(n)) continue;
+      const at = hs.text.indexOf(n);
+      add(n, depth + 1, inLoop || (at >= 0 && spans.some(([a, b]) => at >= a && at < b)));
+    }
+  };
+  add(String(command || ''), 0, false);
+  return views;
+}
+/** `{ loopWait, waits }` for a command: `loopWait` = some wait sits inside a loop (shell or interpreter), `waits` =
+ *  every wait's seconds (NaN = not a literal). Pure. */
+function analyzePolling(command) {
+  let loopWait = false;
+  const waits = [];
+  for (const view of pollingViews(command)) {
+    const spans = loopSpans(maskQuoted(view.text));
+    const inSpan = (i) => spans.some(([a, b]) => i >= a && i < b);
+    for (const w of shellWaits(view.text)) {
+      waits.push(w.seconds);
+      if (view.inLoop || w.looping || inSpan(w.index)) loopWait = true;
+    }
+    for (const h of view.heredocs) {
+      const fed = heredocInterpreter(h.head);
+      if (!fed) continue;
+      const at = Math.max(0, view.text.indexOf(h.head));
+      const carried = view.inLoop || inSpan(at);
+      if (fed.kind === 'shell') {
+        const sub = analyzePolling(h.body);
+        if (sub.loopWait || (carried && sub.waits.length)) loopWait = true;
+        waits.push(...sub.waits);
+      } else {
+        const { waits: sw, loops } = scriptWaits(h.body, fed.prog.replace(/\d.*$/, ''));
+        if (sw.length && (loops || carried)) loopWait = true;
+        waits.push(...sw);
+      }
+    }
+  }
+  return { loopWait, waits };
+}
+/** Is `command` the allowlisted heartbeat: a bare `sleep N` (N <= limit), run in the background? Pure. */
+function isSanctionedHeartbeat(command, { runInBackground = false, heartbeatMaxSeconds }) {
+  if (!runInBackground) return false;
+  const m = String(command || '').trim().match(/^sleep\s+(\d+)$/);
+  return !!m && Number(m[1]) <= heartbeatMaxSeconds;
+}
+const POLLING_ADVICE = ' Do not wait in a shell. Instead: (a) END YOUR TURN and let the harness/daemon resume you (the #5137 await-verify flow — '
+  + 'request the gate, report what is pending, stop); (b) for the verify gate use ONE bounded foreground call, '
+  + '`node scripts/verify-lane.mjs check --wait=540000 --json` (it polls internally); or (c) report what is still pending and finish. '
+  + 'Ordinary non-waiting loops (`for f in *.mjs; do …; done`) and a short `sleep` (<= the limit) are fine. No override.';
+/** The DENY reason for a polling loop / long sleep, else null. Pure; every session kind. `settings` is injectable for tests. */
+export function pollingLoopReason(command, { runInBackground = false, settings = loadPollingSettings() } = {}) {
+  const raw = heredocScan(String(command || '')).text;
+  if (!raw.trim()) return null;
+  if (isSanctionedHeartbeat(raw, { runInBackground, heartbeatMaxSeconds: settings.heartbeatMaxSeconds })) return null;
+  const { loopWait, waits } = analyzePolling(command);
+  if (loopWait) {
+    return `a loop (shell for/while/until, or one inside a perl/python/node/ruby/php/awk script) whose body sleeps or waits is a POLLING LOOP — denied (an agent stuck in one cannot receive messages; a build agent sat ~20 min in exactly this and had to be killed).${POLLING_ADVICE}`;
+  }
+  const max = settings.maxSleepSeconds;
+  const long = waits.find((s) => !(s <= max));      // `!(<=)`, not `>`: a non-literal duration is NaN and must deny
+  if (long !== undefined) {
+    return `a single wait of ${Number.isFinite(long) ? `${Math.round(long)}s` : 'unbounded or non-literal length'} exceeds the ${max}s limit (scripts/guard-bash-polling.json) — denied (a session blocked in a long sleep cannot receive messages).${POLLING_ADVICE}`;
+  }
+  const total = waits.reduce((a, s) => a + s, 0);
+  if (total > max) {
+    return `${waits.length} waits in one command total ${Math.round(total)}s, which exceeds the ${max}s limit (scripts/guard-bash-polling.json) — denied (chaining short sleeps is still one long block).${POLLING_ADVICE}`;
+  }
+  return null;
+}
+
 /**
  * Is `cwd` a constellation PRIMARY checkout (not a lane clone)? Pure. A lane clone lives under `/.lanes/` so
  * it is always allowed; otherwise cwd must sit at/under one of the `primaries` roots. `primaries` is injected
@@ -3534,7 +3824,7 @@ export function stripHeredocBodies(command) {
  *  heredoc BODY is data and is never reported (that is the whole point of a heredoc). */
 export function heredocScan(command) {
   const text = String(command || '');
-  if (!text.includes('<<')) return { text, unterminated: parseSegments(text).unterminated };
+  if (!text.includes('<<')) return { text, unterminated: parseSegments(text).unterminated, heredocs: [] };
   const OPENER = /^<<-?\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z_]\w*))/;
   const kept = [];
   let line = '';
@@ -3542,6 +3832,7 @@ export function heredocScan(command) {
   let inComment = false;
   let pending = null;
   let unterminated = false;
+  const heredocs = [];
   let i = 0;
   // r3 audit — the opener used to be matched with a line-wide regex, so a `<<` that is not an operator at
   // all (`echo "a << b"`, `# see <<EOF`) minted a phantom heredoc and DROPPED every following line from
@@ -3551,6 +3842,7 @@ export function heredocScan(command) {
   while (i < text.length) {
     const ch = text[i];
     if (ch === '\n') {
+      const head = line;
       kept.push(line);
       line = '';
       atWordStart = true;
@@ -3559,12 +3851,15 @@ export function heredocScan(command) {
       if (pending !== null) {                                  // consume the heredoc BODY + its terminator
         const delim = pending;
         pending = null;
+        const bodyLines = [];
         while (i < text.length) {
           const nl = text.indexOf('\n', i);
           const body = text.slice(i, nl === -1 ? text.length : nl);
           i = nl === -1 ? text.length : nl + 1;
           if (body.trim() === delim) break;
+          bodyLines.push(body);
         }
+        heredocs.push({ head, body: bodyLines.join('\n') });
       }
       continue;
     }
@@ -3586,7 +3881,7 @@ export function heredocScan(command) {
     i += 1;
   }
   kept.push(line);
-  return { text: kept.join('\n'), unterminated };
+  return { text: kept.join('\n'), unterminated, heredocs };
 }
 
 // ── #3311 — NAME THE COLLATERAL a refusal takes with it ────────────────────────────────────────────────
@@ -3836,6 +4131,7 @@ export function decide(command, ctx = {}) {
   // (it never sees a later opener, and the body then re-parses as commands one quoting phase out). Deny
   // before trusting anything it produced.
   if (hd.unterminated) return unparseableReason(command);
+  const fullCommand = command;      // heredoc bodies intact — the NO-POLLING arm scans the ones fed to an interpreter
   command = hd.text;
   // (`>|`, the noclobber-override redirect, used to be pre-normalized to `>` here because the quote-blind
   // split tore it in half at its `|` — r3 finding 2. `splitSegments` consumes a redirect operator run whole,
@@ -3865,6 +4161,9 @@ export function decide(command, ctx = {}) {
   // sit in different segments), so it is checked here, never per segment. Agent sessions only.
   const waitPoll = agentWaitPollReason(command, { agentSession: ctx.agentSession });
   if (waitPoll) return waitPoll;
+  // NO-POLLING — every session kind; after the agent-specific wait-poll arm so that one keeps its sharper message.
+  const polling = pollingLoopReason(fullCommand, { runInBackground: ctx.runInBackground });
+  if (polling) return polling;
   // #2968 — the pipe/xargs, while-read, and `-exec` enumerate-then-`git add` sink shapes all need more than
   // one segment to see (the enumeration source is a DIFFERENT segment, or the `git add` sits inside a
   // compound whose head word is `while`/`find`). Whole-command, same shape as the two checks above it.
