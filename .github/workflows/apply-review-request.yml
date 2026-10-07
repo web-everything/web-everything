@@ -30,12 +30,21 @@ name: Apply review request
 on:
   push:
     branches: [ops/review-requests]
+    # Request files only. The ledger lives in the sibling `verdict-ledger/` directory (and `*` never crosses a
+    # `/`), so the applier's own ledger push does not match this filter and cannot re-trigger the workflow. A
+    # push made with GITHUB_TOKEN does not start workflow runs at all; this filter is the second, explicit guard.
     paths: ['ops/review-requests/*.json']
 
 permissions:
   pull-requests: write   # the label swap
   issues: write          # a PR's comments are issue comments
-  contents: read         # never pushes — see the "only what this push added" note above
+  # C3 of the verdict-ledger plan (#3255 part 3, statute #verdict-ledger-pr-state-store): the applier now
+  # appends the verdict's ledger row to `ops/review-requests` (`verdict-ledger/<repo>.jsonl`). That push is the
+  # ONLY reason this is write. GitHub cannot scope `contents: write` to one branch, so the narrowing is by
+  # construction instead: the only push path is `we:scripts/lib/verdict-ledger-io.mjs`, which pushes an explicit
+  # refspec to `ops/review-requests` and never forces. It is NOT a way around branch protection: `main` still
+  # requires its checks and a PR, and this token has no bypass. Deliberately the one-line diff to review.
+  contents: write
 
 concurrency:
   # Serialised deliberately. The #2964 ordering is a two-write sequence with no rollback, and two runs
@@ -54,6 +63,14 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          # Kept explicit: the ledger append pushes to `origin` with this credential. Needs `contents: write`.
+          persist-credentials: true
+
+      # The ledger append commits to the transport branch, and git refuses a commit with no identity.
+      - name: Set the bot's git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - uses: actions/setup-node@v4
         with:

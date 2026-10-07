@@ -25,7 +25,9 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import yaml from 'js-yaml';
+import { LEDGER_DIR, LEDGER_TRANSPORT_BRANCH, ledgerGitPath } from '../lib/verdict-ledger-io.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -288,5 +290,44 @@ describe('the checkout the child is pinned to', () => {
       expect(main([path, '--check'], { spawn, originRepo: originExplodes, cwd: REPO_ROOT })).toBe(0);
     } finally { cleanup(); }
     expect(calls).toHaveLength(0);
+  });
+});
+
+/**
+ * Ledger plan slice C3 (#3255 part 3): the applier workflow may push ledger rows, and a ledger-only push must
+ * not re-trigger it. The workflow's permissions and trigger filter are the contract, so they are asserted
+ * on the parsed YAML, not by grepping text.
+ */
+describe('the applier workflow can push ledger rows without re-triggering itself (C3)', () => {
+  const wf = yaml.load(readFileSync(join(REPO_ROOT, '.github', 'workflows', 'apply-review-request.yml'), 'utf8'));
+  const push = wf.on.push;
+
+  it('has contents: write and keeps the other grants exactly as narrow as before', () => {
+    expect(wf.permissions).toEqual({ 'pull-requests': 'write', issues: 'write', contents: 'write' });
+  });
+
+  it('triggers only on the transport branch', () => {
+    expect(push.branches).toEqual([LEDGER_TRANSPORT_BRANCH]);
+  });
+
+  it('has a path filter that leaves the ledger directory out', () => {
+    expect(push.paths).toEqual([`${LEDGER_TRANSPORT_BRANCH}/*.json`]);
+    const ledgerFile = ledgerGitPath('web-everything/web-everything');
+    expect(ledgerFile.startsWith(`${LEDGER_DIR}/`)).toBe(true);
+    // GitHub's `*` does not cross `/`: a pattern matches a file only at the same directory depth.
+    const matches = (pattern, file) => new RegExp(`^${pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*')}$`).test(file);
+    for (const pattern of push.paths) expect(matches(pattern, ledgerFile)).toBe(false);
+    expect(matches(push.paths[0], `${LEDGER_TRANSPORT_BRANCH}/request-1.json`)).toBe(true);
+  });
+
+  it('checks out main with a pushable credential and sets a git identity before applying', () => {
+    const steps = wf.jobs.apply.steps;
+    const checkout = steps.find((s) => String(s.uses ?? '').startsWith('actions/checkout'));
+    expect(checkout.with.ref).toBe('main');
+    expect(checkout.with['persist-credentials']).toBe(true);
+    const identity = steps.findIndex((s) => /user\.email/.test(s.run ?? ''));
+    const apply = steps.findIndex((s) => /apply-review-request\.mjs/.test(s.run ?? ''));
+    expect(identity).toBeGreaterThan(-1);
+    expect(identity).toBeLessThan(apply);
   });
 });
