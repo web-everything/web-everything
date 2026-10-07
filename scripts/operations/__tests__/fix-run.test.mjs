@@ -261,26 +261,26 @@ describe('fix-run as a CLI entry (red before: exit 13, unsettled top-level await
   const here = dirname(fileURLToPath(import.meta.url));
   it('dispatch-providers/fix.mjs never reaches fix-run.mjs through its local import graph', () => {
     const seen = new Set();
-    const walk = (file) => {
+    const follow = (file) => {
       if (seen.has(file)) return;
       seen.add(file);
       let src;
       try { src = readFileSync(file, 'utf8'); } catch { return; }
-      for (const m of src.matchAll(/(?:from|import)\s*\(?\s*['"](\.{1,2}\/[^'"]+\.mjs)['"]/g)) walk(resolve(dirname(file), m[1]));
+      for (const m of src.matchAll(/(?:from|import)\s*\(?\s*['"](\.{1,2}\/[^'"]+\.mjs)['"]/g)) follow(resolve(dirname(file), m[1]));
     };
-    walk(resolve(here, '..', 'dispatch-providers', 'fix.mjs'));
+    follow(resolve(here, '..', 'dispatch-providers', 'fix.mjs'));
     expect([...seen].filter((f) => f.endsWith('operations/fix-run.mjs'))).toEqual([]);
   });
   it('fix-run.mjs static (non-lazy) imports never reach the wrapper chain it imports lazily', () => {
     const seen = new Set();
-    const walk = (file) => {
+    const follow = (file) => {
       if (seen.has(file)) return;
       seen.add(file);
       let src;
       try { src = readFileSync(file, 'utf8'); } catch { return; }
-      for (const m of src.matchAll(/^(?:import|export)\b[^;]*?from\s*['"](\.{1,2}\/[^'"]+\.mjs)['"]/gm)) walk(resolve(dirname(file), m[1]));
+      for (const m of src.matchAll(/^(?:import|export)\b[^;]*?from\s*['"](\.{1,2}\/[^'"]+\.mjs)['"]/gm)) follow(resolve(dirname(file), m[1]));
     };
-    walk(resolve(here, '..', 'fix-run.mjs'));
+    follow(resolve(here, '..', 'fix-run.mjs'));
     expect([...seen].filter((f) => /deliver-item-wrapper|dispatch-provider-registry|dispatch-lane-io/.test(f))).toEqual([]);
   });
   it('runs as a real process and fails fast on bad args instead of hanging', () => {
