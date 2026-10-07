@@ -1,6 +1,6 @@
 /** derivePrState over ledger events: one table row per lifecycle state, the hold rules, #5083 and the replays. */
 import { describe, it, expect } from 'vitest';
-import { derivePrState, labelsToLedgerState } from '../../pr-state.mjs';
+import { derivePrState, labelsToLedgerState, ledgerView } from '../../pr-state.mjs';
 import { deriveReferrals } from '../referrals.mjs';
 import { evaluateHolds } from '../holds/index.mjs';
 import { LIFECYCLE_STATE_NAMES, renderLabels, HUMAN_HOLD_CI_RED } from '../../../conveyor/pr-lifecycle.mjs';
@@ -14,7 +14,7 @@ const verdict = (v, m, head = H1) => buildVerdictRecord({ repo, pr: PR, verdict:
 const ev = (type, m, o = {}) => buildLedgerEvent({ type, repo, pr: PR, at: at(m), source: 'test', ...o });
 const referral = (m, head, ...keys) => ev('referral', m, { headSha: head, findingKeys: keys });
 const ruling = (m, key, r) => ev('ruling', m, { findingKey: key, ruling: r });
-const facts = (o = {}) => ({ pr: PR, now: at(300), state: 'OPEN', isDraft: false, head: { sha: H1, committedAt: at(0) },
+const facts = (o = {}) => ({ pr: PR, repo, now: at(300), state: 'OPEN', isDraft: false, head: { sha: H1, committedAt: at(0) },
   requiredChecks: [{ name: 'test', state: 'green' }], sessions: [], handoffs: [], refusals: [], ...o });
 const live = { name: 'rev', kind: 'review', live: true, state: 'busy', startedAt: at(290) };
 const state = (events, f, s) => derivePrState(events, f, s);
@@ -104,8 +104,9 @@ describe('hold rules', () => {
   });
   it('a crashing rule holds with rule-crashed:<id>, and a malformed one too; the others still run', () => {
     const rules = [{ id: 'boom', evaluate() { throw new Error('x'); } }, { id: 'junk', evaluate: () => ({ nope: 1 }) }, { id: 'ok', evaluate: () => ({ code: 'c', reason: 'r' }) }];
-    const codes = evaluateHolds({}, rules).map(h => h.code);
-    expect(codes).toEqual(['rule-crashed:boom', 'rule-crashed:junk', 'c']);
+    const ctx = { view: ledgerView([], facts()), facts: facts(), settings: {} };
+    const codes = evaluateHolds(ctx, rules).map(h => h.code);
+    expect(codes).toEqual(['rule-crashed:boom', 'rule-crashed:junk', 'c']); // built-ins ran too and had nothing to say
     const out = state([verdict(VERDICTS.ACCEPTED, 1)], facts(), { holdRules: rules });
     expect(out.lifecycleState).toBe('NEEDS-OPERATOR');
     expect(out.clears).toBe(false);
@@ -150,5 +151,142 @@ describe('replays: no ruling needed', () => {
     const out = state(events, facts({ head: { sha: H2, committedAt: at(8) } }));
     noRuling(out);
     expect(out).toMatchObject({ lifecycleState: 'READY-TO-MERGE', clears: true, needsYou: [] });
+  });
+});
+
+describe('fail closed: every hold rule defaults to deny (review of PR #4326)', () => {
+  const approval = (m, d) => ev('approval', m, { approval: 'judge', delegation: d });
+  const expired = { by: 'op', scope: 'pr', expires: at(10) };
+  const live10 = { by: 'op', scope: 'pr', expires: at(600) };
+  const held = out => expect(out.lifecycleState).toBe('NEEDS-OPERATOR');
+
+  describe('approval validity is one predicate for the verdict and the label-input path', () => {
+    const humanVerdict = [verdict(VERDICTS.HUMAN, 1)];
+    const handLabel = [verdict(VERDICTS.ACCEPTED, 1), ev('label-input', 4, { label: 'review:human', sender: 'someone', change: 'added' })];
+    it.each([['verdict-based human hold', humanVerdict], ['hand-added human label', handLabel]])('%s: an expired delegation keeps the hold, a live one lifts it', (_n, base) => {
+      held(state([...base, approval(5, expired)], facts({ now: at(60) })));
+      expect(state([...base, approval(5, live10)], facts({ now: at(60) })).lifecycleState).toBe('READY-TO-MERGE');
+      expect(state([...base, approval(5, null)], facts({ now: at(60) })).lifecycleState).toBe('READY-TO-MERGE');
+    });
+    it.each([['verdict-based human hold', humanVerdict], ['hand-added human label', handLabel]])('%s: a missing or unparseable now, or a non-finite expiry, never lifts a delegated approval', (_n, base) => {
+      held(state([...base, approval(5, expired)], facts({ now: undefined })));
+      held(state([...base, approval(5, expired)], facts({ now: 'not a time' })));
+      const hand = { ...approval(5, expired), delegation: { ...expired, expires: 'garbage' } }; // the builder refuses this; a raw ledger row might not
+      held(state([...base, hand], facts()));
+    });
+    it('an approval that PRECEDES the human verdict lifts nothing', () => {
+      held(state([approval(0, null), verdict(VERDICTS.HUMAN, 1)], facts()));
+    });
+  });
+
+  describe('a clearing verdict lifts a hand-added hold only if it covers the current head', () => {
+    const added = ev('label-input', 4, { label: 'review:human', sender: 'someone', change: 'added' });
+    it('an accept witnessed on another head, or on no head, leaves the label hold', () => {
+      const f = facts({ head: { sha: H2, committedAt: at(3) } });
+      expect(state([added, verdict(VERDICTS.ACCEPTED, 9, H1)], f).holds.map(h => h.code)).toContain('label-input:review:human');
+      expect(state([added, verdict(VERDICTS.ACCEPTED, 9, null)], f).holds.map(h => h.code)).toContain('label-input:review:human');
+      expect(state([added, verdict(VERDICTS.ACCEPTED, 9, H2)], f).holds.map(h => h.code)).not.toContain('label-input:review:human');
+    });
+  });
+
+  describe('the ledger is scoped to this PR in this repo', () => {
+    const other = (o = {}) => buildVerdictRecord({ repo, pr: PR, verdict: VERDICTS.ACCEPTED, at: at(1), source: 'test', headSha: H1, reason: 'r', ...o });
+    it('facts without pr or repo hold (unknown scope is never "all PRs")', () => {
+      const events = [other({ pr: 999 })];
+      expect(state(events, facts({ pr: undefined })).holds.map(h => h.code)).toEqual(['scope-unknown']);
+      expect(state([other()], facts({ repo: undefined })).holds.map(h => h.code)).toEqual(['scope-unknown']);
+      held(state([other()], facts({ pr: undefined })));
+    });
+    it("another PR's accept, or the same number in another repo, never clears this one", () => {
+      expect(state([other({ pr: 999 })], facts()).clears).toBe(false);
+      expect(state([other({ repo: 'other-org/other-repo' })], facts()).clears).toBe(false);
+      expect(state([other({ repo: 'Web-Everything/Web-Everything' })], facts()).clears).toBe(true); // slugs compare case-insensitively
+    });
+  });
+
+  describe('settings.holdRules adds to the built-ins and never replaces them', () => {
+    it.each([[[]], [undefined], [null], ['junk']])('holdRules=%j still holds on a human verdict and on a stale acceptance', holdRules => {
+      expect(state([verdict(VERDICTS.HUMAN, 1)], facts(), { holdRules }).lifecycleState).toBe('NEEDS-OPERATOR');
+      const stale = state([verdict(VERDICTS.ACCEPTED, 1, H1)], facts({ head: { sha: H2, committedAt: at(5) } }), { holdRules });
+      expect(stale.holds.map(h => h.code)).toContain('stale-acceptance');
+    });
+    it('a custom rule adds its own hold next to the built-ins', () => {
+      const out = state([verdict(VERDICTS.HUMAN, 1)], facts(), { holdRules: [{ id: 'extra', evaluate: () => ({ code: 'extra', reason: 'r' }) }] });
+      expect(out.holds.map(h => h.code)).toEqual(['verdict:human', 'extra']);
+    });
+  });
+
+  describe('an acceptance with no witnessed head does not cover a known head', () => {
+    it('accepted with no headSha holds as stale; with the right head it clears', () => {
+      const out = state([verdict(VERDICTS.ACCEPTED, 1, null)], facts());
+      expect(out.holds.map(h => h.code)).toContain('stale-acceptance');
+      expect(out.clears).toBe(false);
+      expect(state([verdict(VERDICTS.ACCEPTED, 1, H1)], facts()).clears).toBe(true);
+    });
+  });
+
+  describe('a block ruling keeps holding until a fix is observed', () => {
+    const base = [referral(1, H1, 'k1'), ruling(2, 'k1', 'block')];
+    it('block then accept on the SAME head: still held, in NEEDS-OPERATOR (not a ruling anyone owes)', () => {
+      const out = state([...base, verdict(VERDICTS.ACCEPTED, 5, H1)], facts());
+      expect(deriveReferrals([...base, verdict(VERDICTS.ACCEPTED, 5, H1)]).get('k1').state).toBe('blocking');
+      expect(out.holds.map(h => h.code)).toEqual(['referral-blocked']);
+      expect(out.lifecycleState).toBe('NEEDS-OPERATOR');
+      expect(out.clears).toBe(false);
+    });
+    it('block then accept on a NEW head: resolved-by-fix, clear', () => {
+      const events = [...base, verdict(VERDICTS.ACCEPTED, 5, H2)];
+      expect(deriveReferrals(events).get('k1')).toMatchObject({ state: 'resolved-by-fix', resolvedAtHead: H2 });
+      expect(state(events, facts({ head: { sha: H2, committedAt: at(4) } })).lifecycleState).toBe('READY-TO-MERGE');
+    });
+    it('not-real and card rulings still close the finding', () => {
+      for (const r of ['not-real', 'card']) {
+        const out = state([referral(1, H1, 'k1'), ruling(2, 'k1', r), verdict(VERDICTS.ACCEPTED, 5, H1)], facts());
+        expect(out.holds).toEqual([]);
+      }
+    });
+  });
+
+  describe('the send-back releases on a new head SHA, never on a commit timestamp', () => {
+    const events = [verdict(VERDICTS.ACCEPTED, 1, H1), ev('send-back', 10, { cause: 'changes' })];
+    it('the same SHA with a future-dated committedAt stays sent back', () => {
+      expect(state(events, facts({ head: { sha: H1, committedAt: at(500) } })).holds.map(h => h.code)).toContain('send-back');
+    });
+    it('a new SHA with a committedAt older than the send-back (clock skew) is released', () => {
+      expect(state(events, facts({ head: { sha: H2, committedAt: at(2) } })).holds.map(h => h.code)).not.toContain('send-back');
+    });
+    it('no recorded head before the send-back, or no current head: stays sent back until a later event witnesses the current head', () => {
+      const bare = [ev('send-back', 10, { cause: 'changes' })];
+      const f = facts({ head: { sha: H2, committedAt: at(20) } });
+      expect(state(bare, f).holds.map(h => h.code)).toContain('send-back');
+      expect(state([...bare, ev('review-run', 15, { headSha: H2, phase: 'started', posted: null })], f).holds.map(h => h.code)).not.toContain('send-back');
+      expect(state(events, facts({ head: undefined })).holds.map(h => h.code)).toContain('send-back');
+    });
+  });
+
+  describe('same-class variants found in self-review', () => {
+    it('a hand-added hold is not lifted by an accept when the current head is unknown', () => {
+      const added = ev('label-input', 4, { label: 'review:human', sender: 'someone', change: 'added' });
+      expect(state([added, verdict(VERDICTS.ACCEPTED, 9, H1)], facts({ head: undefined })).holds.map(h => h.code)).toContain('label-input:review:human');
+    });
+    it('head SHAs compare case-insensitively, trimmed, and a short prefix never matches', () => {
+      const out = state([verdict(VERDICTS.ACCEPTED, 1, H1)], facts({ head: { sha: ` ${H1.toUpperCase()} `, committedAt: at(0) } }));
+      expect(out.holds).toEqual([]);
+      expect(state([verdict(VERDICTS.ACCEPTED, 1, H1)], facts({ head: { sha: 'a', committedAt: at(0) } })).holds.map(h => h.code)).toContain('stale-acceptance');
+    });
+    it('an unknown or mis-cased ruling value closes nothing', () => {
+      const forged = { ...ruling(2, 'k1', 'block'), ruling: 'Block' };
+      expect(deriveReferrals([referral(1, H1, 'k1'), forged]).get('k1').state).toBe('open');
+    });
+    it('hold keys that join to the same string do not collide', () => {
+      const h = (m, src, code) => ev('hold', m, { holdSource: src, reasonCode: code });
+      const r = (m, src, code) => ev('release', m, { holdSource: src, reasonCode: code });
+      const out = state([verdict(VERDICTS.ACCEPTED, 1), h(2, 'a:b', 'c'), r(3, 'a', 'b:c')], facts());
+      expect(out.holds.map(x => x.code)).toEqual(['hold:a:b:c']);
+    });
+    it('a non-array or junk-entry ledger holds instead of throwing', () => {
+      expect(state({}, facts()).holds.map(h => h.code)).toEqual(['ledger-unreadable']);
+      expect(state([null], facts()).holds.map(h => h.code)).toEqual(['ledger-unreadable']);
+    });
   });
 });

@@ -14,25 +14,26 @@ import { derivePrState as derivePrPhase } from './pr-state-core.mjs';
 import { EVENT_TYPES, foldVerdictLedger, verdictLabel, verdictClears } from './verdict-ledger.mjs';
 import { deriveReferrals, openReferralKeys } from './pr-state/referrals.mjs';
 import { evaluateHolds } from './pr-state/holds/index.mjs';
+import { approvalLiftsAfter } from './pr-state/holds/verdict.mjs';
 import { HUMAN_HOLD_CI_RED, lifecycleRow, renderLabels } from '../conveyor/pr-lifecycle.mjs';
 
 const isVerdictRow = e => e.type === EVENT_TYPES.VERDICT || e.type === undefined;
-const time = v => (typeof v === 'number' ? v : Date.parse(v));
+const slug = r => String(r ?? '').trim().toLowerCase();
+/** The PR this derive is about: both its number and its repo are required, or the scope is unknown. */
+const scopeOf = facts => {
+  const pr = Number(facts?.pr);
+  return Number.isInteger(pr) && pr > 0 && slug(facts?.repo) ? { pr, repo: slug(facts.repo) } : null;
+};
 
-/** A human hold is lifted by a LATER approval event whose delegation (if any) has not expired. */
-function approvalLifts(events, cur, now) {
-  const at = events.indexOf(cur);
-  return events.slice(at + 1).some(e => e.type === EVENT_TYPES.APPROVAL
-    && (!e.delegation || !Number.isFinite(time(now)) || time(e.delegation.expires) > time(now)));
-}
-
-/** Fold one PR's events into the view every hold rule reads. */
+/** Fold ONE PR's events (this repo, this number; never "all PRs") into the view every hold rule reads. */
 export function ledgerView(events, facts) {
-  const mine = events.filter(e => !facts?.pr || e.pr === facts.pr);
-  const folded = foldVerdictLedger(mine.filter(isVerdictRow)).get(facts?.pr ?? mine[0]?.pr) ?? null;
+  const scope = scopeOf(facts);
+  const mine = scope ? events.filter(e => Number(e.pr) === scope.pr && slug(e.repo) === scope.repo) : [];
+  const folded = scope ? foldVerdictLedger(mine.filter(isVerdictRow)).get(scope.pr) ?? null : null;
   const cur = folded?.current ?? null;
   let clears = !!folded?.clears;
-  if (cur && !clears && cur.verdict === 'human' && approvalLifts(mine, cur, facts?.now)) clears = true;
+  // A human hold is lifted by a LATER valid approval (unexpired delegation, provable clock); an unknown position never lifts.
+  if (cur && !clears && cur.verdict === 'human' && approvalLiftsAfter(mine, mine.indexOf(cur), facts?.now)) clears = true;
   return { events: mine, folded, clears, referrals: deriveReferrals(mine) };
 }
 
@@ -40,7 +41,7 @@ export function ledgerView(events, facts) {
 function lifecycleOf(core, { holds, humanGate, facts }) {
   let state = core.phase;
   if (state === 'READY-TO-MERGE' && holds.length) {
-    state = holds.every(h => h.rule === 'referral-unruled') ? 'NEEDS-RULING' : 'NEEDS-OPERATOR';
+    state = holds.every(h => h.code === 'referral-unruled') ? 'NEEDS-RULING' : 'NEEDS-OPERATOR';
   }
   if (state === 'NEEDS-OPERATOR' && humanGate && (facts.requiredChecks ?? []).some(c => c.state === 'red')) state = HUMAN_HOLD_CI_RED;
   return state;
@@ -49,16 +50,16 @@ function lifecycleOf(core, { holds, humanGate, facts }) {
 /**
  * @param {object[]|null} events This PR's ledger events (any types, append order). `null` = the ledger was
  *   unreadable, which is a hold and never "empty".
- * @param {object} facts The GitHub facts, in `pr-state-core.mjs`'s shape. `facts.labels` is ignored.
- * @param {object} [settings] pr-state-core DEFAULTS overrides plus `sameHeadMaxReviews` (default 1; 0 = off) and `holdRules`.
+ * @param {object} facts The GitHub facts, in `pr-state-core.mjs`'s shape plus `repo` (required with `pr`, or the
+ *   derive holds as `scope-unknown`). `facts.labels` is ignored.
+ * @param {object} [settings] pr-state-core DEFAULTS overrides plus `sameHeadMaxReviews` (default 1; 0 = off) and
+ *   `holdRules` (extra rules that run NEXT TO the built-ins; they never replace them).
  * @returns {{lifecycleState:string, verdict:string|null, clears:boolean, holds:object[], needsYou:string[],
  *   labels:string[], reasons:string[], next:string, owner:string|null, maxTimeInState:number|null, phase:object}}
  */
 export function derivePrState(events, facts, settings = {}) {
-  if (events == null) {
-    const hold = { code: 'ledger-unreadable', reason: 'the verdict ledger could not be read; unreadable is a hold, never empty', needsYou: null, rule: 'ledger' };
-    return finish({ lifecycleState: 'NEEDS-OPERATOR', verdict: null, clears: false, holds: [hold], phase: { phase: 'NEEDS-OPERATOR', headline: hold.reason, next: 'retry the ledger read', evidence: [] } });
-  }
+  if (!Array.isArray(events) || events.some(e => !e || typeof e !== 'object')) return heldOutright('ledger-unreadable', 'the verdict ledger could not be read; unreadable is a hold, never empty', 'retry the ledger read');
+  if (!scopeOf(facts)) return heldOutright('scope-unknown', 'facts.pr and facts.repo are both required to scope the ledger; an unknown scope is a hold, never "all PRs"', 'pass the PR number and repo');
   const view = ledgerView(events, facts);
   const holds = evaluateHolds({ view, facts, settings }, settings.holdRules);
   const cur = view.folded?.current ?? null;
@@ -73,6 +74,12 @@ export function derivePrState(events, facts, settings = {}) {
   const humanGate = (cur?.verdict === 'human' && !view.clears) || holds.some(h => h.code === 'label-input:review:human');
   const lifecycleState = lifecycleOf(phase, { holds, humanGate, facts });
   return finish({ lifecycleState, verdict: cur?.verdict ?? null, clears: view.clears && holds.length === 0, holds, phase });
+}
+
+/** A derive that cannot trust its input holds the PR in NEEDS-OPERATOR without consulting the core. */
+function heldOutright(code, reason, next) {
+  const hold = { code, reason, needsYou: null, rule: 'input' };
+  return finish({ lifecycleState: 'NEEDS-OPERATOR', verdict: null, clears: false, holds: [hold], phase: { phase: 'NEEDS-OPERATOR', headline: reason, next, evidence: [] } });
 }
 
 function finish({ lifecycleState, verdict, clears, holds, phase }) {

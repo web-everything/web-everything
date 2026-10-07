@@ -2,7 +2,8 @@
  * The `pr-state.hold` extension point: mode `all` (every rule runs, the strictest wins), effect `restrict`
  * (a rule can only add a hold, never clear one), and a rule that throws or returns junk holds the PR with
  * `rule-crashed:<id>`; it never merges. Rules are pure: `evaluate(ctx) -> null | Hold | Hold[]`.
- * Hold = { code, reason, needsYou?: string|null }.
+ * Hold = { code, reason, needsYou?: string|null }. The built-in rules ALWAYS run; `settings.holdRules` can only
+ * add rules next to them (an empty or partial list never disables a built-in).
  */
 import verdict from './verdict.mjs';
 import referralUnruled from './referral-unruled.mjs';
@@ -17,9 +18,9 @@ export const HOLD_RULES = Object.freeze([verdict, referralUnruled, sameHeadCap, 
 const valid = h => h && typeof h === 'object' && typeof h.code === 'string' && h.code && typeof h.reason === 'string';
 
 /** @returns {Array<{code:string,reason:string,needsYou:string|null,rule:string}>} */
-export function evaluateHolds(ctx, rules = HOLD_RULES) {
+export function evaluateHolds(ctx, extraRules = []) {
   const holds = [];
-  for (const rule of rules) {
+  for (const rule of [...HOLD_RULES, ...(Array.isArray(extraRules) ? extraRules : [])]) {
     let out;
     try {
       out = rule.evaluate(ctx);
