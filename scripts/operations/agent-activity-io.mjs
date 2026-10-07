@@ -150,7 +150,7 @@ export function leasesFromLanePoolStatus(parsed) {
   if (!Array.isArray(parsed?.lanes)) return [];
   // Keep the lane number (and repo) on the lease: the `/sessions` row shows which lane a session holds.
   return parsed.lanes.filter((l) => l?.lease)
-    .map((l) => ({ ...l.lease, lane: l.lane ?? null, repo: parsed.repo ?? null }));
+    .map((l) => ({ ...l.lease, ...(l.lane != null ? { lane: l.lane } : {}), ...(parsed.repo ? { repo: parsed.repo } : {}) }));
 }
 
 /** `~/.claude/jobs` (the harness's per-background-session records). */
