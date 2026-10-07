@@ -12,7 +12,8 @@ import {
   classifyPrRisk, decidePrePrReview, resolvePrePrSettings, loadPrePrSettings, checkPrePrReview, isPreparedCard,
   buildReceipt, gitDirOf, treeOf, RECEIPT_FILE, BUILT_IN_PRE_PR_SETTINGS,
 } from '../pre-pr-review.mjs';
-import { createPrLandRunner } from "../../operations/open-pr-io.mjs";
+import { createPrLandRunner } from '../../operations/open-pr-io.mjs';
+import { planOpen } from '../../operations/open-pr.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const CLI = join(ROOT, 'scripts', 'converge-cli.mjs');
