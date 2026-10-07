@@ -147,7 +147,39 @@ export function readLaneLeases({ run = execFileSync, root = REPO_ROOT } = {}) {
 
 /** Shared pure lease projection; malformed status is the same fail-soft empty join. */
 export function leasesFromLanePoolStatus(parsed) {
-  return Array.isArray(parsed?.lanes) ? parsed.lanes.map((l) => l?.lease).filter(Boolean) : [];
+  if (!Array.isArray(parsed?.lanes)) return [];
+  // Keep the lane number (and repo) on the lease: the `/sessions` row shows which lane a session holds.
+  return parsed.lanes.filter((l) => l?.lease)
+    .map((l) => ({ ...l.lease, ...(l.lane != null ? { lane: l.lane } : {}), ...(parsed.repo ? { repo: parsed.repo } : {}) }));
+}
+
+/** `~/.claude/jobs` (the harness's per-background-session records). */
+export function claudeJobsDir(env = process.env) {
+  return env?.AGENT_ACTIVITY_JOBS_DIR || join(homedir(), '.claude', 'jobs');
+}
+
+/** The `--model <x>` value in a job's `respawnFlags`, or null. PURE. */
+export function modelFromRespawnFlags(flags) {
+  if (!Array.isArray(flags)) return null;
+  const i = flags.indexOf('--model');
+  return i >= 0 && typeof flags[i + 1] === 'string' && flags[i + 1] ? flags[i + 1] : null;
+}
+
+/** `Map<sessionId, {name, model}>` from `<jobsDir>/*\/state.json` (one directory read, each small file once).
+ *  Tolerant: a missing dir or an unreadable/odd record is skipped, never thrown. */
+export function readJobIndex(jobsDir = claudeJobsDir()) {
+  const out = new Map();
+  let dirs;
+  try { dirs = readdirSync(jobsDir); } catch { return out; }
+  for (const d of dirs) {
+    try {
+      const st = JSON.parse(readFileSync(join(jobsDir, d, 'state.json'), 'utf8'));
+      if (typeof st?.sessionId === 'string' && st.sessionId) {
+        out.set(st.sessionId, { name: typeof st.name === 'string' ? st.name : null, model: modelFromRespawnFlags(st.respawnFlags) });
+      }
+    } catch { /* skip */ }
+  }
+  return out;
 }
 
 /** `Map<sessionId, lease>`, keyed by BOTH `ownerSession` and `workerSession` — either can name the row
@@ -260,7 +292,7 @@ export const RECENT_MS = STALE_ROW_MS; // matches active-progress-watch.mjs's ow
 /** Top-level session transcripts NOT already accounted for by `claude agents` — the operator's own
  *  interactive chats, or an agent whose harness process has already exited. Recency-bounded (6h) so a full
  *  sweep of `~/.claude/projects` stays cheap; only reachable via `input.all` (see this file's header). */
-export function interactiveRows(knownSessionIds, projectsDir = claudeProjectsDir(), now = Date.now()) {
+export function interactiveRows(knownSessionIds, projectsDir = claudeProjectsDir(), now = Date.now(), jobIndex = new Map()) {
   const rows = [];
   let slugs;
   try { slugs = readdirSync(projectsDir); } catch { return rows; }
@@ -275,8 +307,11 @@ export function interactiveRows(knownSessionIds, projectsDir = claudeProjectsDir
       let mtimeMs;
       try { mtimeMs = statSync(path).mtimeMs; } catch { continue; }
       if ((now - mtimeMs) > RECENT_MS) continue;
+      // A transcript whose sessionId belongs to a job is that worker (exited or not in `claude agents`), not a chat.
+      const job = jobIndex.get(m[1]) ?? null;
       rows.push({
-        id: m[1], sessionId: m[1], runtime: 'claude', kind: 'interactive', name: null, cwd: null,
+        id: m[1], sessionId: m[1], runtime: 'claude', kind: job ? 'background' : 'interactive',
+        name: job?.name ?? null, model: job?.model ?? null, cwd: null,
         state: null, startedAt: null, lastEventAt: new Date(mtimeMs).toISOString(), transcriptPath: path,
         firstMessageText: firstMessageText(path), claimedNums: claimedNumsFromTranscript(path),
       });
@@ -305,12 +340,14 @@ export function createAgentActivityReader({
   codexHome = resolveCodexHome(),
   run = execFileSync,
   readLeases = () => readLaneLeases({ run, root }),
+  readJobs = () => readJobIndex(),
   subagentRecentMs = null,
   now = Date.now,
 } = {}) {
   return (input = {}) => {
     const base = listAgentsWithReviewJobs({ listAgents, ...(listJobs ? { listJobs } : {}) });
     const leaseIndex = indexLeasesBySession(readLeases());
+    const jobIndex = readJobs();
     const known = new Set();
     const rows = [];
     for (const a of base) {
@@ -329,7 +366,7 @@ export function createAgentActivityReader({
         ? jobLogPath(a.name)
         : (sessionId && a.cwd ? join(projectsDir, projectSlugFor(a.cwd), `${sessionId}.jsonl`) : null);
       const row = {
-        id: a.id ?? sessionId ?? a.name, sessionId, name: a.name ?? null, runtime: 'claude', kind,
+        id: a.id ?? sessionId ?? a.name, sessionId, name: a.name ?? null, runtime: 'claude', kind, model: (sessionId && jobIndex.get(sessionId)?.model) || null,
         cwd: a.cwd ?? null, state: a.state ?? null, startedAt: a.startedAt ?? null, lastEventAt: null,
         // `pid`/`status`/`waitingFor` ride straight off the `claude agents --json` row (or the job record's own
         // `pid`, `./review-job-store.mjs#jobRecordToAgentRow`) — the SAME three fields `session-verdicts.mjs`'s
@@ -350,7 +387,7 @@ export function createAgentActivityReader({
       rows.push(row);
     }
     if (input.all) {
-      for (const row of interactiveRows(known, projectsDir, now())) {
+      for (const row of interactiveRows(known, projectsDir, now(), jobIndex)) {
         row.lease = leaseIndex.get(row.sessionId) ?? null;
         rows.push(row);
       }
