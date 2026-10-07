@@ -63,16 +63,17 @@ describe('knob and decision', () => {
   it('product default is advise; this repo ships enforce; bad values are ignored', () => {
     expect(BUILT_IN_PRE_PR_SETTINGS.mode).toBe('advise');
     expect(loadPrePrSettings().settings.mode).toBe('enforce');
-    expect(loadPrePrSettings({ path: '/nonexistent' }).settings.mode).toBe('advise');
+    expect(loadPrePrSettings({ path: '/nonexistent' }).settings.mode).toBe('enforce'); // a missing file fails closed
     const r = resolvePrePrSettings({ mode: 'sometimes', maxLines: -1 });
     expect(r.settings.mode).toBe('advise');
     expect(r.ignored).toEqual(['mode', 'maxLines']);
   });
-  it('a present-but-broken settings file fails CLOSED to enforce and says why; only a missing file is advise', () => {
+  it('a missing, unreadable or broken settings file fails CLOSED to enforce and says why', () => {
     const enoent = Object.assign(new Error('nope'), { code: 'ENOENT' });
     const eacces = Object.assign(new Error('denied'), { code: 'EACCES' });
     const load = (read) => loadPrePrSettings({ path: '/x.json', read });
-    expect(load(() => { throw enoent; })).toMatchObject({ settings: { mode: 'advise' }, error: '' });
+    // the file ships with the repo, so a missing one is a broken install — never a silent downgrade to advise
+    expect(load(() => { throw enoent; })).toMatchObject({ settings: { mode: 'enforce' }, error: expect.stringMatching(/missing.*failing closed to enforce/) });
     expect(load(() => '{ "mode": "enforce", ')).toMatchObject({ settings: { mode: 'enforce' }, error: expect.stringMatching(/not valid JSON/) });
     expect(load(() => { throw eacces; })).toMatchObject({ settings: { mode: 'enforce' }, error: expect.stringMatching(/unreadable/) });
     expect(load(() => '{"mode":"enforse"}')).toMatchObject({ settings: { mode: 'enforce' }, error: expect.stringMatching(/no valid `mode` \(got "enforse"/) });
@@ -219,6 +220,31 @@ describe('gate hardening (PR #4271 review)', () => {
       const run = createPrLandRunner({ prePrReview: () => { throw new Error('boom'); }, loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
       expect(run({ argv: ['--ref=lane/x', '--base=main'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error', detail: expect.stringMatching(/boom.*fail closed/s) });
       expect(spawned).toHaveLength(0);
+    });
+    it('refuses before spawning pr-land when the check returns no usable decision (null, {}, an unknown action)', () => {
+      for (const result of [null, undefined, {}, { action: 'bogus' }, { action: 'PASS' }]) {
+        const spawned = [];
+        const run = createPrLandRunner({ prePrReview: () => result, loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+        expect(run({ argv: ['--ref=lane/x', '--base=main'] }), JSON.stringify(result)).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
+        expect(spawned).toHaveLength(0);
+      }
+    });
+    it('refuses (never throws, never spawns) when even the settings read on the failure path throws', () => {
+      const spawned = [];
+      const run = createPrLandRunner({
+        prePrReview: () => { throw new Error('boom'); }, loadSettings: () => { throw new Error('settings exploded'); },
+        spawn: okSpawn(spawned), cwd: dir, env: OPERATOR,
+      });
+      expect(run({ argv: ['--ref=lane/x', '--base=main'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error', detail: expect.stringMatching(/boom.*settings exploded/s) });
+      expect(spawned).toHaveLength(0);
+    });
+    it('refuses a thrown check when the mode on the failure path is anything but advise/off (unknown means enforce)', () => {
+      for (const loadSettings of [() => ({ settings: {} }), () => ({ settings: { mode: 'enforse' } }), () => ({})]) {
+        const spawned = [];
+        const run = createPrLandRunner({ prePrReview: () => { throw new Error('boom'); }, loadSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+        expect(run({ argv: ['--ref=lane/x', '--base=main'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
+        expect(spawned).toHaveLength(0);
+      }
     });
     it('under advise/off a thrown check proceeds, loudly', () => {
       const spawned = [];

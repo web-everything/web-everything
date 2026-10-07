@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -572,6 +572,119 @@ describe('the subcommand surface', () => {
 
   it('rejects an unknown subcommand', () => {
     expect(cli(['frobnicate']).code).toBe(2);
+  });
+});
+
+// ── PR #4271 rulings: the brief's literal flow, run end to end (init → step → land → commit → receipt), with the
+// state and observation files INSIDE the lane exactly where the brief puts them — never a hand-written landed state.
+describe('pre-PR receipt — the brief\'s flow end to end (PR #4271)', () => {
+  let n = 0;
+  /** A fresh lane-shaped clone with uncommitted work: one tracked edit and one untracked file. */
+  const freshLane = () => {
+    const dir = join(sandbox, '.lanes', 'we-test', `lane-${100 + ++n}`);
+    seedRepo(dir, { 'a.txt': 'hello\n' });
+    writeFileSync(join(dir, 'a.txt'), 'hello world\n');
+    writeFileSync(join(dir, 'new.txt'), 'brand new\n');
+    return dir;
+  };
+  /** `step` with the observations file inside the lane (`$LANE/.converge-obs-N.json`), as the brief does. */
+  const stepIn = (dir, state, observations) => {
+    const obs = join(dir, `.converge-obs-${++n}.json`);
+    writeFileSync(obs, JSON.stringify(observations));
+    return cli(['step', `--state=${state}`, `--obs=${obs}`]);
+  };
+  const landIn = (dir) => {
+    const state = join(dir, '.converge-state.json');
+    expect(cli(['init', `--lane=${dir}`, `--state=${state}`, '--base-ref=forkpoint', '--care=high']).code).toBe(0);
+    expect(stepIn(dir, state, { round: 1, readResult, lensResults: cleanPanel() }).json().action).toBe('red-team');
+    expect(stepIn(dir, state, { round: 1, readResult, lensResults: cleanPanel(), redTeamResult: { ran: true, findings: [] } }).json().action).toBe('land');
+    return state;
+  };
+  const commitWork = (dir, paths = ['a.txt', 'new.txt']) => { git(['add', '--', ...paths], dir); git(['commit', '-qm', 'work'], dir); };
+  const receiptFile = (dir) => join(dir, '.git', 'pre-pr-review-receipt.json');
+
+  it('state + obs inside the lane: init → step → land → commit → receipt stamps the committed head tree', () => {
+    const dir = freshLane();
+    const state = landIn(dir);
+    commitWork(dir);
+    const r = cli(['receipt', `--lane=${dir}`, `--state=${state}`]);
+    expect(r.code, r.err).toBe(0);
+    expect(JSON.parse(readFileSync(receiptFile(dir), 'utf8')).tree).toBe(git(['rev-parse', 'HEAD^{tree}'], dir).trim());
+  });
+
+  it('an edit round (EDIT → READ → land) binds the receipt to the edited content the panel re-read', () => {
+    const dir = freshLane();
+    const state = join(dir, '.converge-state.json');
+    cli(['init', `--lane=${dir}`, `--state=${state}`, '--base-ref=forkpoint', '--care=high']);
+    const finding = [{ lens: 'correctness', ok: true, findings: [blocker] }, ...cleanPanel().slice(1)];
+    expect(stepIn(dir, state, { round: 1, readResult, lensResults: finding }).json().action).toBe('edit');
+    writeFileSync(join(dir, 'a.txt'), 'hello fixed world\n'); // the editor's revision
+    expect(stepIn(dir, state, { round: 1, readResult, lensResults: finding, editResult: { advanced: true, dismissed: [] } }).json().action).toBe('read');
+    expect(stepIn(dir, state, { round: 2, readResult, lensResults: cleanPanel() }).json().action).toBe('red-team');
+    expect(stepIn(dir, state, { round: 2, readResult, lensResults: cleanPanel(), redTeamResult: { ran: true, findings: [] } }).json().action).toBe('land');
+    commitWork(dir);
+    const r = cli(['receipt', `--lane=${dir}`, `--state=${state}`]);
+    expect(r.code, r.err).toBe(0);
+  });
+
+  it('refuses receipt issuance for a tree different from the landed review (work committed after the land)', () => {
+    const dir = freshLane();
+    const state = landIn(dir);
+    commitWork(dir);
+    writeFileSync(join(dir, 'late.txt'), 'never reviewed\n');
+    commitWork(dir, ['late.txt']);
+    const r = cli(['receipt', `--lane=${dir}`, `--state=${state}`]);
+    expect(r.code).not.toBe(0);
+    expect(r.err).toMatch(/not the content the panel reviewed/);
+    expect(existsSync(receiptFile(dir))).toBe(false);
+  });
+
+  it('refuses a landed state pointed (--lane) at a different checkout, even one with identical content', () => {
+    const dir = freshLane();
+    const state = landIn(dir);
+    commitWork(dir);
+    const other = freshLane();
+    commitWork(other);
+    const r = cli(['receipt', `--lane=${other}`, `--state=${state}`]);
+    expect(r.code).not.toBe(0);
+    expect(r.err).toMatch(/review was of lane/);
+    expect(existsSync(receiptFile(other))).toBe(false);
+  });
+
+  it('a land that could not bind (content changed after the last read) is refused with THAT cause, not "predates this check"', () => {
+    const dir = freshLane();
+    const state = join(dir, '.converge-state.json');
+    cli(['init', `--lane=${dir}`, `--state=${state}`, '--base-ref=forkpoint', '--care=high']);
+    stepIn(dir, state, { round: 1, readResult, lensResults: cleanPanel() });
+    writeFileSync(join(dir, 'a.txt'), 'edited after the panel read it\n');
+    expect(stepIn(dir, state, { round: 1, readResult, lensResults: cleanPanel(), redTeamResult: { ran: true, findings: [] } }).json().action).toBe('land');
+    commitWork(dir);
+    const r = cli(['receipt', `--lane=${dir}`, `--state=${state}`]);
+    expect(r.code).not.toBe(0);
+    expect(r.err).toMatch(/changed between the panel's last read and the land/);
+    expect(r.err).not.toMatch(/predates this check/);
+  });
+
+  it('untracked .converge-* scratch with a non-ASCII name does not block the receipt', () => {
+    const dir = freshLane();
+    const state = landIn(dir);
+    writeFileSync(join(dir, '.converge-obs-é.json'), '{}');
+    commitWork(dir);
+    const r = cli(['receipt', `--lane=${dir}`, `--state=${state}`]);
+    expect(r.code, r.err).toBe(0);
+  });
+
+  it('a READ issued by an accepted invite records the tree it shows, so the later land binds to it', () => {
+    const dir = freshLane();
+    const state = join(dir, '.converge-state.json');
+    cli(['init', `--lane=${dir}`, `--state=${state}`, '--base-ref=forkpoint', '--care=high']);
+    writeFileSync(join(dir, 'a.txt'), 'hello invited world\n'); // content changes before the invite's READ
+    const inv = stepIn(dir, state, {
+      round: 1, inviteEcho: { accepted: true, jurorsPerLens: 2, addedLenses: ['a11y'] },
+      invite: { lens: 'a11y', citedFinding: 'no accessible name' }, findings: [blocker],
+    }).json();
+    expect(inv.action).toBe('read');
+    expect(JSON.parse(readFileSync(state, 'utf8')).readTree).toBe(workingTreeOf(dir));
   });
 });
 

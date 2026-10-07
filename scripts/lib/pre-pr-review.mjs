@@ -6,8 +6,8 @@
  *
  * Pure policy + small git readers. Three parts:
  *  - settings knob `prePrReview.mode` = off | advise | enforce (we:scripts/pre-pr-review-settings.json; the
- *    built-in/product default is `advise`; this repo's file sets `enforce`). Read from the WE root RUNNING
- *    open-pr, never from the lane, so a lane cannot weaken its own gate.
+ *    built-in base is `advise`; this repo's file sets `enforce`, and a missing or broken file fails closed to
+ *    `enforce`). Read from the WE root RUNNING open-pr, never from the lane, so a lane cannot weaken its own gate.
  *  - the RISK rule (coroner predictors): a code PR is gated when ANY of lines > 264, subsystems > 2, files > 5,
  *    no prepared card, or the builder is an operator agent (not a conveyor worker). Card-only PRs (every path
  *    under backlog/) are never gated.
@@ -50,14 +50,15 @@ export function resolvePrePrSettings(raw = {}) {
 }
 
 /**
- * Never throws. A MISSING file is the product default (`advise`). A file that is present but unreadable, not
- * JSON, or carrying an unrecognised `mode` fails CLOSED to `enforce` (and says why in `error`): a typo in the
- * settings file must never silently downgrade the gate. The caller surfaces `error` loudly.
+ * Never throws. The file ships with the repo, so it is always expected: a MISSING file (a broken install or a
+ * deletion), or one that is unreadable, not JSON, or carrying an unrecognised `mode`, fails CLOSED to `enforce`
+ * (and says why in `error`) — nothing about the settings file may silently downgrade the gate. The built-in
+ * `advise` is only the base the file's thresholds merge over. The caller surfaces `error` loudly.
  */
 export function loadPrePrSettings({ path = defaultPrePrSettingsPath(), read = readFileSync } = {}) {
   let text;
   try { text = read(path, 'utf8'); } catch (e) {
-    if (e && e.code === 'ENOENT') return { ...resolvePrePrSettings({}), error: '' };
+    if (e && e.code === 'ENOENT') return { ...resolvePrePrSettings({ mode: 'enforce' }), error: `pre-PR review settings file is missing (${path}) — failing closed to enforce` };
     return { ...resolvePrePrSettings({ mode: 'enforce' }), error: `pre-PR review settings unreadable (${e?.message || e}) — failing closed to enforce` };
   }
   let parsed;
@@ -259,7 +260,7 @@ export function checkPrePrReview({ cwd, base = 'main', sha = 'HEAD', env = proce
 export function workingTreeOf(cwd) {
   const tmp = mkdtempSync(join(tmpdir(), 'pre-pr-idx-'));
   const env = { ...process.env, GIT_INDEX_FILE: join(tmp, 'index') };
-  const run = (args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+  const run = (args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env, maxBuffer: 64 * 1024 * 1024, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
   try {
     run(['read-tree', 'HEAD']);
     // Against the temp index (= HEAD), `--others` is exactly the untracked set; skip the scratch among it by literal path.

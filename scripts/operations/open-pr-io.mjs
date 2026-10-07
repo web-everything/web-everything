@@ -80,14 +80,23 @@ function withBypassInBody(argv, b) {
   } catch (e) { cleanup(); throw e; }
 }
 
-/** The gate when its own check threw: enforce fails CLOSED (refuse); advise/off proceed, loudly. */
+/** The decisions a gate may return; anything else (null, `{}`, a typo'd action) is a check error, never a pass. */
+const GATE_ACTIONS = Object.freeze(['pass', 'advise', 'refuse']);
+
+/** The gate when its own check threw (or returned no usable decision): enforce fails CLOSED (refuse); advise/off
+ *  proceed, loudly. If even the mode cannot be read here, that too is a refusal — this path never throws. */
 function failedGate(e, loadSettings) {
-  const { settings } = loadSettings();
   // the error text can embed agent-supplied argv (`--sha=…`), so it is rendered as an inert one-line span
-  const message = `the pre-PR review check itself failed (${codeSpan(e && e.message ? e.message : e, 300)}); prePrReview.mode is ${settings.mode}`;
-  return settings.mode === 'enforce'
-    ? { action: 'refuse', why: 'check-error', reason: 'pre-pr-review-error', message: `${message} — refusing (fail closed). Fix the cause and open the PR again.` }
-    : { action: 'advise', why: 'check-error', message };
+  const cause = codeSpan(e && e.message ? e.message : e, 300);
+  let mode;
+  try { mode = loadSettings()?.settings?.mode; } catch (se) {
+    return { action: 'refuse', why: 'check-error', reason: 'pre-pr-review-error', message: `the pre-PR review check itself failed (${cause}) and its mode could not be read (${codeSpan(se && se.message ? se.message : se, 300)}) — refusing (fail closed).` };
+  }
+  const message = `the pre-PR review check itself failed (${cause}); prePrReview.mode is ${codeSpan(mode, 40)}`;
+  // Only an explicit advise/off proceeds; enforce, a missing mode or an unknown one refuses.
+  return mode === 'advise' || mode === 'off'
+    ? { action: 'advise', why: 'check-error', message }
+    : { action: 'refuse', why: 'check-error', reason: 'pre-pr-review-error', message: `${message} — refusing (fail closed). Fix the cause and open the PR again.` };
 }
 
 /**
@@ -106,8 +115,10 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
     // Any failure of the check is mode-aware (`failedGate`): enforce refuses, it never silently admits.
     if (!argv.includes('--dry-run')) {
       let gate;
-      try { gate = prePrReview({ cwd, base: arg('base') || 'main', sha: arg('sha') || 'HEAD', env, skip: skipPrePrReview, actor, operatorInstruction }); }
-      catch (e) { gate = failedGate(e, loadSettings); }
+      try {
+        gate = prePrReview({ cwd, base: arg('base') || 'main', sha: arg('sha') || 'HEAD', env, skip: skipPrePrReview, actor, operatorInstruction });
+        if (!gate || !GATE_ACTIONS.includes(gate.action)) throw new Error(`the check returned no usable decision (action: ${JSON.stringify(gate?.action)})`);
+      } catch (e) { gate = failedGate(e, loadSettings); }
       if (gate.settingsError) process.stderr.write(`open-pr: WARNING — ${gate.settingsError}\n`);
       if (gate.action === 'refuse') return { outcome: 'refused', reason: gate.reason || 'pre-pr-review-missing', detail: gate.message };
       // Gate and push are bound to the SAME commit: pr-land publishes exactly the sha the gate judged.

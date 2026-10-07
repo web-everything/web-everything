@@ -47,7 +47,7 @@ import {
   applyJurorInvite,
   buildEscalationPacket,
 } from './lib/converge-core.mjs';
-import { gitDirOf, treeOf, workingTreeOf, buildReceipt, RECEIPT_FILE, isScratchPath } from './lib/pre-pr-review.mjs';
+import { gitDirOf, treeOf, workingTreeOf, buildReceipt, RECEIPT_FILE, isScratchPath, GIT_TIMEOUT_MS } from './lib/pre-pr-review.mjs';
 import { resolveTransport, validateLaneTarget } from './lib/converge-transports.mjs';
 import { MANDATORY_LENSES, PANEL_LENSES, panelRigorForCareLevel } from './lib/jury-core.mjs';
 import { CARE_LEVELS } from './lib/review-escalation.mjs';
@@ -131,7 +131,7 @@ function readObservations(flags) {
 /** Read-only git at an explicit root. Returns null rather than throwing — the caller decides what absence means. */
 function gitAt(root, args) {
   try {
-    return execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: GIT_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 });
   } catch {
     return null;
   }
@@ -372,7 +372,11 @@ function step(flags) {
   // confidence, because the only shipped caller could not reach it.
   if (Object.prototype.hasOwnProperty.call(input, 'inviteEcho') && input.invite) {
     const applied = applyJurorInvite(state, input.inviteEcho, input.invite);
-    writeState(path, { ...envelope, state: applied.state, carry: carryFor(applied.state.round, carriedFindings) });
+    // Every READ records the tree it shows — this one too — so a later `land` binds to what the panel re-read.
+    writeState(path, {
+      ...envelope, state: applied.state, carry: carryFor(applied.state.round, carriedFindings),
+      ...(applied.action === CONVERGE_ACTIONS.READ ? { readTree: readTreeOf(envelope.ctx?.laneRoot) } : {}),
+    });
 
     // A REJECTED invite falls through to an editor round on the SAME round — so this call must hand back the
     // editor prompt, or the caller is told to `edit` with nothing to run. That needs the round's findings, which
@@ -494,13 +498,18 @@ function receipt(flags) {
   if (dirty.trim()) return fail('no receipt: the lane has uncommitted tracked changes. Commit first, so the receipt covers the head that will be pushed.');
   // The panel read untracked files too, so any left uncommitted are content the receipt would not cover.
   // Untracked brief-sanctioned scratch (`.converge-*` state, `.commit-msg.txt`, …) is not reviewed content — see workingTreeOf.
-  const leftover = (gitAt(lane, ['ls-files', '--others', '--exclude-standard']) || '').split('\n').map((s) => s.trim()).filter((p) => p && !isScratchPath(p));
+  // `-z`: the same raw paths `workingTreeOf` matches, so a non-ASCII scratch name is not C-quoted past `isScratchPath`.
+  const leftover = (gitAt(lane, ['ls-files', '--others', '--exclude-standard', '-z']) || '').split('\0').filter((p) => p && !isScratchPath(p));
   if (leftover.length) return fail(`no receipt: the lane has untracked files the panel read but the head does not contain (${leftover.slice(0, 3).join(', ')}${leftover.length > 3 ? ', …' : ''}). Commit or delete them, then re-run /converge if the content changed.`);
   const tree = treeOf(lane);
   // Bind the receipt to the reviewed run: same lane, same content. (Defence against honest mistakes — reusing an
   // old landed state file for another lane, or committing more work after the review. It is NOT tamper-proof
   // against a hostile worker, who can write the state file or the receipt directly.)
   const reviewed = envelope.reviewed;
+  // `step` writes `reviewed: null` when the lane at land was not the content the panel last read.
+  if (reviewed === null) {
+    return fail('no receipt: the lane\'s content changed between the panel\'s last read and the land (an edit, or a new untracked non-`.converge-*` file, after the READ), so the land reviewed nothing that can be bound. Re-run /converge to a fresh `land`, keeping scratch files named `.converge-*` at the lane root.');
+  }
   if (!reviewed || !reviewed.lane || !reviewed.tree) {
     return fail('no receipt: the state file records no reviewed lane/content for its `land` (it predates this check or was not produced by `step`). Re-run /converge to a fresh `land`.');
   }
