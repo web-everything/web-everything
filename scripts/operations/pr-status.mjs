@@ -78,7 +78,7 @@ import { compute } from './step-kinds.mjs';
 // act, and `merge-ai-prs.mjs` imports `node:child_process`/`node:fs` writes/etc. throughout. See that lib
 // module's own header for the full reasoning.
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
-import { withoutImpliedRequiredChecks } from '../lib/required-status-checks.mjs';
+import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
 
 export const PR_STATUS_OP = 'pr-status';
 

@@ -1,6 +1,6 @@
 /** Strict review prerequisite; independent of the general merge/CI reducer. */
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
-import { withoutImpliedRequiredChecks } from './required-status-checks.mjs';
+import { withoutImpliedRequiredChecks } from './required-check-implication.mjs';
 
 /**
  * A legacy commit status / rollup `StatusContext` (`{context, state}`, no check-run `status`/`conclusion`) read as
