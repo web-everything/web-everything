@@ -10,5 +10,14 @@
   "runAllPhases": true,
   "isolatedRetry": "untouched",
   "relatedMaxTests": 40,
-  "relatedDepth": 2
+  "relatedDepth": 2,
+  "alwaysRunTests": [
+    "skills-src/conveyor/__tests__/runner-pass-coverage.test.mjs",
+    "skills-src/conveyor/__tests__/launchd-templates.test.mjs",
+    "scripts/lib/__tests__/operation-io-fidelity.test.mjs",
+    "scripts/lib/__tests__/exec-output-guard.test.mjs",
+    "scripts/__tests__/repo-scan-tests.test.mjs",
+    "scripts/lib/__tests__/verify-settings.test.mjs",
+    "scripts/lib/__tests__/no-search-backed-pr-list.test.mjs"
+  ]
 }

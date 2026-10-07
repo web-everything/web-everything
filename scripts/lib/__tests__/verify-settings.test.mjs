@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +10,7 @@ import { verifyRelatedMode, verifyTestTimeoutFactor, verifyStandardsPolicy, veri
 
 const allSources = source => Object.fromEntries(Object.keys(BUILT_IN_VERIFY_SETTINGS).map(key => [key, source]));
 const custom = { relatedMode: 'import-only', testTimeoutFactor: 4, standards: 'ci-only', phaseAdmission: false, fastTargets: 2,
-  matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off', relatedMaxTests: 12, relatedDepth: 3 };
+  matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off', relatedMaxTests: 12, relatedDepth: 3, alwaysRunTests: ['a/b.test.mjs'] };
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function file(contents) {
@@ -23,9 +23,13 @@ function file(contents) {
 
 describe('verify settings', () => {
   it('resolves the running module settings path and applies the shipped file with an empty env', () => {
+    const shippedAlwaysRun = JSON.parse(readFileSync(defaultVerifySettingsPath(), 'utf8')).alwaysRunTests;
+    // #99 — the declared always-run guard set is non-empty and every file in it exists in this checkout.
+    expect(shippedAlwaysRun.length).toBeGreaterThan(0);
+    for (const f of shippedAlwaysRun) expect(existsSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../..', f)), f).toBe(true);
     expect(defaultVerifySettingsPath()).toBe(resolve(dirname(fileURLToPath(import.meta.url)), '../../verify-settings.json'));
     expect(resolveVerifySettings({ fileConfig: loadVerifySettingsFile(defaultVerifySettingsPath()), env: {} }))
-      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only', standards: 'auto', relatedMaxTests: 40, relatedDepth: 2 }, sources: allSources('file') });
+      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only', standards: 'auto', relatedMaxTests: 40, relatedDepth: 2, alwaysRunTests: shippedAlwaysRun }, sources: allSources('file') });
     expect(verifyRelatedMode({})).toBe('import-only');
   });
 
@@ -43,9 +47,9 @@ describe('verify settings', () => {
     const env = { WE_VERIFY_RELATED: 'all', WE_VERIFY_TEST_TIMEOUT_FACTOR: '2.5', WE_VERIFY_STANDARDS: 'auto',
       WE_VERIFY_PHASE_ADMISSION: '1', WE_VERIFY_FAST_TARGETS: '0', WE_VERIFY_MATCH_REQUEST_VARIANTS: '1',
       WE_VERIFY_SUPERSEDE: 'any', WE_VERIFY_RESTART_IN_FLIGHT: 'adopt', WE_VERIFY_RUN_ALL_PHASES: '1',
-      WE_VERIFY_ISOLATED_RETRY: 'timeouts', WE_VERIFY_RELATED_MAX_TESTS: '5', WE_VERIFY_RELATED_DEPTH: '1' };
+      WE_VERIFY_ISOLATED_RETRY: 'timeouts', WE_VERIFY_RELATED_MAX_TESTS: '5', WE_VERIFY_RELATED_DEPTH: '1', WE_VERIFY_ALWAYS_RUN_TESTS: 'x/y.test.mjs, z.test.mjs' };
     const values = { relatedMode: 'all', testTimeoutFactor: 2.5, standards: 'auto', phaseAdmission: true, fastTargets: 0,
-      matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts', relatedMaxTests: 5, relatedDepth: 1 };
+      matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts', relatedMaxTests: 5, relatedDepth: 1, alwaysRunTests: ['x/y.test.mjs', 'z.test.mjs'] };
     expect(resolveVerifySettings({ fileConfig: custom, env })).toEqual({ values, sources: allSources('env') });
     expect(resolveVerifySettings({ fileConfig: custom, env: { WE_VERIFY_RELATED: 'all' } }))
       .toEqual({ values: { ...custom, relatedMode: 'all' }, sources: { ...allSources('file'), relatedMode: 'env' } });
@@ -155,5 +159,20 @@ describe('#5128 — related selection settings', () => {
       expect(resolveVerifySettings({ fileConfig: null, env: { [envKey]: String(value) } }))
         .toMatchObject({ values: { [key]: fallback }, sources: { [key]: 'default' } });
     }
+  });
+});
+
+describe('alwaysRunTests setting (#99)', () => {
+  it('rejects unsafe entries per key and an empty-but-set env switches the set off', () => {
+    for (const bad of ['a.test.mjs', ['/abs.test.mjs'], ['../x.test.mjs'], [1], ['a b.test.mjs'],
+      // a leading dash is a vitest option, not a path; a non-test file would not be a guard at all
+      ['-u'], ['--bail'], ['--passWithNoTests'], ['-u.test.mjs'], ['--config=x.test.mjs'], ['ok.test.mjs', '--bail'], ['package.json'], ['scripts/x.mjs']]) {
+      expect(resolveVerifySettings({ fileConfig: { alwaysRunTests: bad }, env: {} }).values.alwaysRunTests).toEqual([]);
+    }
+    for (const bad of ['-u', '--bail', 'a.test.mjs,--bail', 'package.json']) {
+      expect(resolveVerifySettings({ fileConfig: { alwaysRunTests: ['k.test.mjs'] }, env: { WE_VERIFY_ALWAYS_RUN_TESTS: bad } }).values.alwaysRunTests, bad).toEqual(['k.test.mjs']);
+    }
+    expect(resolveVerifySettings({ fileConfig: {}, env: { WE_VERIFY_ALWAYS_RUN_TESTS: './a/b.test.ts,c/d.test.cjs' } }).values.alwaysRunTests).toEqual(['./a/b.test.ts', 'c/d.test.cjs']);
+    expect(resolveVerifySettings({ fileConfig: { alwaysRunTests: ['a.test.mjs'] }, env: { WE_VERIFY_ALWAYS_RUN_TESTS: '' } }).values.alwaysRunTests).toEqual([]);
   });
 });

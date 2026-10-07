@@ -15,7 +15,7 @@ import { execSync } from 'node:child_process';
 import { LANE_RELEASE_LITTER_ALLOWLIST } from '../lane-litter.mjs';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
+import { alwaysRunPlan, alwaysRunInventory, verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -1025,5 +1025,86 @@ describe('#5128 — bounded related-test selection', () => {
     for (const mode of ['related', 'run']) expect(selectedTestCommand.test(`npx vitest ${mode} 'x.test.mjs'`)).toBe(true);
     expect(selectedTestCommand.test('npm run test:unit')).toBe(false);
     expect(source).toMatch(/const retryableGate = SELECTED_TEST_COMMAND\.test\(resolvedGate\?\.testCommand \?\? ''\)/);
+  });
+});
+
+describe('alwaysRunPlan (item 99)', () => {
+  const declared = ['a/guard.test.mjs', 'b/contract.test.mjs', 'c/missing.test.mjs'];
+  it('runs every declared file that exists in ONE vitest command, independent of any selection', () => {
+    const plan = alwaysRunPlan({ declared, fileExists: (f) => !f.startsWith('c/'), testTimeoutFactor: 3 });
+    expect(plan.files).toEqual(['a/guard.test.mjs', 'b/contract.test.mjs']);
+    expect(plan.skipped).toEqual(['c/missing.test.mjs']);
+    expect(plan.command).toMatch(/^npx vitest run 'a\/guard\.test\.mjs' 'b\/contract\.test\.mjs' --testTimeout=/);
+    // No --passWithNoTests: a guard the vitest config excludes must fail loudly, not "pass" having run zero tests.
+    expect(plan.command).not.toContain('--passWithNoTests');
+  });
+  it('skips files a scan command already runs, and yields no command for an empty set', () => {
+    const plan = alwaysRunPlan({ declared, fileExists: () => true, scanCommands: ["npx vitest run 'a/guard.test.mjs'"] });
+    expect(plan.files).toEqual(['b/contract.test.mjs', 'c/missing.test.mjs']);
+    expect(alwaysRunPlan({ declared: [], fileExists: () => true }).command).toBeNull();
+  });
+  it('never lets a declared entry become a vitest option, even if validation was bypassed', () => {
+    const plan = alwaysRunPlan({ declared: ['-u', '--bail', 'ok.test.mjs'], fileExists: () => true });
+    expect(plan.files).toEqual(['ok.test.mjs']);
+    expect(plan.skipped).toEqual(['-u', '--bail']);
+    expect(plan.command).toMatch(/^npx vitest run 'ok\.test\.mjs'/);
+    expect(plan.command).not.toMatch(/'-/);
+  });
+  it('treats ./x.test.mjs and x.test.mjs as one entry', () => {
+    expect(alwaysRunPlan({ declared: ['x.test.mjs', './x.test.mjs'], fileExists: () => true }).files).toEqual(['x.test.mjs']);
+  });
+  it('is recorded in the phase telemetry, and `ran` is empty unless the guard actually executed', () => {
+    const ranPhases = buildVerifyPhases({ decision: {}, alwaysRun: { files: ['a'], skipped: ['b'], executed: true, ms: 1234.4, result: 'passed' } });
+    expect(ranPhases.alwaysRun).toEqual({ planned: ['a'], ran: ['a'], executed: true, missing: [], skipped: ['b'], ms: 1234, result: 'passed' });
+    const notRun = buildVerifyPhases({ decision: {}, alwaysRun: { files: ['a'], skipped: [] } });
+    expect(notRun.alwaysRun).toEqual({ planned: ['a'], ran: [], executed: false, missing: [], skipped: [], ms: null, result: null });
+    expect(formatVerifyPhases(notRun)).toContain('alwaysRun=not-run');
+    expect(formatVerifyPhases(ranPhases)).toContain('alwaysRun=1files/1234ms');
+    expect(buildVerifyPhases({ decision: {} }).alwaysRun).toBeUndefined();
+  });
+  it("adds vitest's JSON report (default reporter kept) only when a report file is given", () => {
+    const plan = alwaysRunPlan({ declared: ['a.test.mjs'], fileExists: () => true, reportFile: "/r/it's/report.json" });
+    expect(plan.command).toContain("--reporter=default --reporter=json --outputFile.json='/r/it'\\''s/report.json'");
+    expect(alwaysRunPlan({ declared: ['a.test.mjs'], fileExists: () => true }).command).not.toContain('--reporter');
+  });
+  it('records the vitest-executed inventory as `ran` and the unexecuted guards as `missing`', () => {
+    const phases = buildVerifyPhases({ decision: {}, alwaysRun: { files: ['a', 'b'], ran: ['a'], missing: ['b'], executed: true, ms: 5, result: 'failed' } });
+    expect(phases.alwaysRun).toMatchObject({ planned: ['a', 'b'], ran: ['a'], missing: ['b'], executed: true, result: 'failed' });
+  });
+  it("the guard has its own outcome key, shown only when it ran, so a scanner's `scan` outcome is never replaced", () => {
+    const outcomes = { scan: { result: 'fail', reason: 'scan.test.mjs' }, guard: { result: 'pass' } };
+    const phases = buildVerifyPhases({ decision: {}, outcomes });
+    expect(phases.outcomes.scan).toEqual({ result: 'fail', reason: 'scan.test.mjs' });
+    expect(phases.outcomes.guard).toEqual({ result: 'pass' });
+    expect(buildVerifyPhases({ decision: {} }).outcomes.guard).toBeUndefined();
+  });
+});
+
+describe('alwaysRunInventory (item 99): a guard counts as run only if vitest executed it', () => {
+  const cwd = '/repo';
+  const report = (...names) => JSON.stringify({ testResults: names.map(name => ({ name, status: 'passed' })) });
+  it('one included + one excluded guard: the excluded one is reported missing even though the run exited 0', () => {
+    expect(alwaysRunInventory({ reportText: report('/repo/a/guard.test.mjs'), files: ['a/guard.test.mjs', 'b/excluded.test.mjs'], cwd }))
+      .toEqual({ executed: ['a/guard.test.mjs'], missing: ['b/excluded.test.mjs'], reason: 'ok' });
+  });
+  it('every guard executed: nothing missing', () => {
+    expect(alwaysRunInventory({ reportText: report('/repo/a.test.mjs', '/repo/b.test.mjs'), files: ['a.test.mjs', './b.test.mjs'], cwd }).missing).toEqual([]);
+  });
+  it("a red guard is still executed (the run's own exit code carries the failure)", () => {
+    const reportText = JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status: 'failed' }] });
+    expect(alwaysRunInventory({ reportText, files: ['a.test.mjs'], cwd }).missing).toEqual([]);
+  });
+  it.each([undefined, null, '', 'not json', '{}', '{"testResults":"x"}', '[]'])('an absent or unreadable report (%j) proves nothing: every guard is missing', (reportText) => {
+    expect(alwaysRunInventory({ reportText, files: ['a.test.mjs', 'b.test.mjs'], cwd }))
+      .toEqual({ executed: [], missing: ['a.test.mjs', 'b.test.mjs'], reason: 'inventory-unavailable' });
+  });
+  it('a guard whose every assertion was skipped / todo ran nothing and counts as missing', () => {
+    const entry = (name, ...statuses) => ({ name, status: 'passed', assertionResults: statuses.map(status => ({ status })) });
+    const reportText = JSON.stringify({ testResults: [entry('/repo/skipped.test.mjs', 'skipped', 'todo'), entry('/repo/real.test.mjs', 'skipped', 'passed')] });
+    expect(alwaysRunInventory({ reportText, files: ['skipped.test.mjs', 'real.test.mjs'], cwd }))
+      .toEqual({ executed: ['real.test.mjs'], missing: ['skipped.test.mjs'], reason: 'ok' });
+  });
+  it('a report entry for a differently-located file does not count for a similarly named guard', () => {
+    expect(alwaysRunInventory({ reportText: report('/repo/x/a.test.mjs'), files: ['a.test.mjs'], cwd }).missing).toEqual(['a.test.mjs']);
   });
 });
