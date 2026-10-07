@@ -136,6 +136,17 @@ built (this is the one pre-build stop; see *Escalations*).
 Do the actual work in `$LANE`: implement `{{ITEM_SPEC_PATH}}`, keep `## Progress` synced, capture any
 leftover work as new backlog items (`scaffold` with `blockedBy` + a digest) rather than half-doing them.
 
+- **Handle the card's edge cases — all seven classes (opus perf sweep 2026-10-07).** Read the card's
+  `## Edge cases this change must handle` section and implement and test each handling it names. If the section is
+  missing or a class is unfilled, fill it yourself from the diff before you build (your answer, or `n/a: <why>`);
+  never skip a class silently. The classes, each with the shared helper to reuse instead of re-inventing it:
+  1. **Untrusted text** — any LLM, PR, comment, card or CLI text that reaches a note, a shell, argv, a path or a regex: fold newlines and backticks (`foldUntrusted`, `we:scripts/lib/jury-core.mjs`); never let a value starting with `--` reach argv; NFKC and invisible characters.
+  2. **Truncated reads** — every `gh`/`git` read: full pages (`readCompletePrComments`, `we:scripts/conveyor/pr-comments-complete.mjs`), `maxBuffer` (`proc-read.mjs`), and a `--limit` hit is an error, never "none".
+  3. **Shared state files** — two writers at once: atomic write plus lock (`writeJsonAtomic`, `withFileLock` in `we:scripts/lib/atomic-json-file.mjs`), compare-and-set on re-read, stale-lock steal only under a guard.
+  4. **Fail closed** — a failed read, parse or spawn is never empty, `[]`, "not stamped" or "no PR"; name the refusal reason.
+  5. **Identity scoping** — every key is scoped by repo + number + head sha / session id; hash and NNN spellings both resolve.
+  6. **State over time** — old records after a new head, repeat suppression across ticks, TTL and clock skew, and what happens on restart mid-operation.
+  7. **Who wrote it** — any comment, ref, label or job name that grants trust: check the author or source, not just the name.
 - **Fixing a bug? Reproduce it before you fix it — a green gate alone is not proof.** When
   `{{ITEM_SPEC_PATH}}` describes a defect to fix (not a fresh capability to add), the same before/after
   discipline the conveyor's fix-agent brief owes a bounced PR
