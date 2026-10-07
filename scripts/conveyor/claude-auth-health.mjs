@@ -61,6 +61,7 @@ import { join } from 'node:path';
 import { healthDir } from './health-watch-section.mjs';
 import { readClaudeAuthExpiredInfo } from './hung-session.mjs';
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
+import { readMaintenanceMarker } from './maintenance-marker.mjs';
 
 /** The exact line both daemons log while paused — the card's own required wording, matched by the soak
  *  scenario and the live-proof read, never re-typed anywhere else. */
@@ -192,7 +193,11 @@ export function decideClaudeAuthDispatchGate(health, loggedIn) {
  */
 export function planClaudeAuthDispatchGate({
   stateRoot, listAgents = () => defaultListAgents({ all: true }), health = readClaudeAuthHealth, probe = probeClaudeLoggedIn, now = Date.now(),
+  readMaintenance = readMaintenanceMarker,
 } = {}) {
+  // Card 105 — an operator-declared maintenance window pauses every Claude-starting daemon regardless of login health.
+  const maintenance = readMaintenance();
+  if (maintenance) return { paused: true, reason: `paused: maintenance — ${maintenance.reason ?? 'no reason given'}`, source: 'maintenance' };
   let agents = [];
   try { agents = listAgents(); } catch { agents = []; }
   const healthResult = health({ stateRoot, agents, now });

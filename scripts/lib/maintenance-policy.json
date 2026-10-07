@@ -1,0 +1,9 @@
+{
+  "_comment": "Card 105 — policy for `run.mjs maintenance`. testSession is the one minimal Claude session `--action=end` runs to prove the login works before lifting the pause.",
+  "testSession": {
+    "prompt": "Reply with exactly the single word: OK",
+    "expect": "OK",
+    "timeoutSeconds": 120,
+    "model": "haiku"
+  }
+}

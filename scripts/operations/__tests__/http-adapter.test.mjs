@@ -68,6 +68,7 @@ import { PR_OWNERSHIP_OP } from '../pr-ownership.mjs';
 import { DAEMON_STATUS_OP } from '../daemon-status.mjs';
 import { HEAVY_QUEUE_OP } from '../heavy-queue.mjs';
 import { FREE_SCOPE_OP } from '../free-scope.mjs';
+import { MAINTENANCE_OP } from '../maintenance.mjs';
 import { REVIEW_SEAT_CAPS_OP } from '../review-seat-caps.mjs';
 import { LIVE_STATE_OP } from '../live-state.mjs';
 import { LIVE_WORK_OP } from '../live-work.mjs';
@@ -463,6 +464,9 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // module imports only `registry.mjs` and `step-kinds.mjs`, and the scorecard-store read lives behind the
     // injected `collect` reader `../run.mjs` binds to `review-extra-seats.mjs#readSeatCapUsage`.
     [REVIEW_SEAT_CAPS_OP]: 'review-seat-caps.mjs',
+    // Card 105 — NOT read-only: its one `act` step is an effect (pause files, kill file, test session); the
+    // declaring module is a leaf and every write lives in `maintenance-io.mjs`, behind the sink `../run.mjs` wires.
+    [MAINTENANCE_OP]: 'maintenance.mjs',
   });
 
   it('the module map covers every operation the repo declares — a new one cannot slip past this file', () => {

@@ -81,6 +81,7 @@ describe('runner freshness policy', () => {
         "land-advance",
         "live-state",
         "live-work",
+        "maintenance",
         "mutation-check",
         "open-pr",
         "pr-ownership",
