@@ -31,6 +31,7 @@ function readJson(path) {
 
 export const entryPath = (dir, key) => join(dir, 'entries', key.slice(0, 2), `${key}.json`);
 export const quarantinePath = (dir, file) => join(dir, 'quarantine', `${sha(file)}.json`);
+export const admissionPath = (dir, file) => join(dir, 'admission', `${sha(file)}.json`);
 export const shadowLogPath = (dir, runId, date = new Date()) => join(dir, 'shadow', localDateString(date), `${runId}.jsonl`);
 
 /** The stored result for a key, or null (missing / unparsable / a different key inside). */
@@ -63,4 +64,14 @@ export function writeShadowLog(dir, runId, records, date = new Date()) {
   const path = shadowLogPath(dir, runId, date);
   atomicWrite(path, records.map((r) => JSON.stringify(r)).join('\n') + (records.length ? '\n' : ''));
   return path;
+}
+
+/** prepare-124 S3: per-test-file admission state (clean traced runs in a row), or null. */
+export function readAdmission(dir, file) {
+  const a = readJson(admissionPath(dir, file));
+  return a && a.file === file ? a : null;
+}
+
+export function writeAdmission(dir, file, state) {
+  atomicWrite(admissionPath(dir, file), `${JSON.stringify({ ...state, file })}\n`);
 }
