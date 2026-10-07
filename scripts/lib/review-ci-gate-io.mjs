@@ -67,5 +67,7 @@ export function formatReviewCiSkip(ci) {
     .replace(/\b(gh[opsur]_|github_pat_)[A-Za-z0-9_]+/g, '<redacted>')
     .replace(/(authorization:\s*)(token|bearer)?\s*\S+/gi, '$1<redacted>')
     .slice(0, 300);
-  return detail ? `review-ci: ${reason} (${detail})` : `review-ci: ${reason}`;
+  const affected = Array.isArray(ci?.affected) && ci.affected.length
+    ? `: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}` : '';
+  return detail ? `review-ci: ${reason}${affected} (${detail})` : `review-ci: ${reason}${affected}`;
 }

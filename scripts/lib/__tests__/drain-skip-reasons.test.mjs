@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { unlandableStateReason } from '../../merge-ai-prs.mjs';
 import { buildSkipReasons, classifySkipReason, formatSkipSummary, formatSkipReasonsLine } from '../drain-skip-reasons.mjs';
 
 describe('drain skip reasons (card 122 slice 1)', () => {
@@ -36,5 +37,11 @@ describe('drain skip reasons (card 122 slice 1)', () => {
     expect(src).toMatch(/heldCoupleMembers, skipReasons,/);
     expect(src).toMatch(/formatSkipReasonsLine\(skipReasons\)/);
     expect(src).toMatch(/formatSkipSummary\(skipReasons\)/);
+  });
+
+  it('a BLOCKED merge state is not classified as behind (#4235 was read as an unowned rebase)', () => {
+    expect(classifySkipReason(unlandableStateReason('BLOCKED'))).toBe('checks-pending');
+    expect(unlandableStateReason('BLOCKED')).toMatch(/ci-heal/);
+    expect(classifySkipReason(unlandableStateReason('BEHIND'))).toBe('behind');
   });
 });

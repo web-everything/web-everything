@@ -143,4 +143,9 @@ describe('formatReviewCiSkip — the real error behind unreadable-ci is logged (
     expect(formatReviewCiSkip({ allowed: false, reason: 'required-checks-not-successful' })).toBe('review-ci: required-checks-not-successful');
     expect(formatReviewCiSkip(undefined)).toBe('review-ci: unreadable-ci');
   });
+  it('names the failing required checks in the skip reason (#4290 was an unexplained "required-checks-not-successful")', () => {
+    expect(formatReviewCiSkip({ allowed: false, reason: 'required-checks-not-successful',
+      affected: [{ name: 'soak-replay-gate', reason: 'failure' }, { name: 'test', reason: 'pending' }] }))
+      .toBe('review-ci: required-checks-not-successful: soak-replay-gate=failure, test=pending');
+  });
 });

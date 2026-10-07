@@ -197,8 +197,11 @@ export function explainPendingNotDispatched({ prs, plan, dispatchable = [], defe
     const n = Number(pr?.number);
     if (!Number.isInteger(n) || sent.has(n)) continue;
     // Referral holds have one durable notice/log, never one explanation per tick.
+    // EXCEPT the same-head pause: it has no notice comment and no other log line, so skipping it left a
+    // `review:pending` PR (#4288, 2026-10-07) with no logged reason at all.
     if (plan?.refusals?.some(r => r.prNumber === n
-      && (r.kind === 'review-referrals-pending' || r.reviewRefusal?.kind === 'review-referrals-pending'))) continue;
+      && (r.kind === 'review-referrals-pending' || r.reviewRefusal?.kind === 'review-referrals-pending')
+      && (r.referralHold ?? r.reviewRefusal?.referralHold)?.kind !== 'same-head')) continue;
     const held = (pr?.labels ?? []).map(labelName).filter((l) => EXPLAINED_HOLD_LABELS.includes(l));
     if (held.length === 0) continue;
     const reasons = [];
