@@ -8,7 +8,7 @@ import { appendFileSync, constants, copyFileSync, lstatSync, mkdirSync, readFile
 import { dirname, join, resolve } from 'node:path';
 import { collectUntrackedPaths, pruneLandedBacklogSidecars } from './daemon-rebuild/local-state.mjs';
 
-const gitAt = (root, args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+const gitAt = (root, args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
 const tracked = (root, path) => gitAt(root, ['ls-files', '-z', '--', `:(literal)${path}`]).length > 0;
 function stat(path) {
   try { return lstatSync(path); }
