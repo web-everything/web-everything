@@ -11,12 +11,12 @@
  *
  * IMPURE by construction: fs, child `git`, `gh`.
  */
-import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { readGit } from '../lib/proc-read.mjs';
 import { collectInputs, extractMetrics, makeGh, readBounded } from './coroner-extract.mjs';
 import {
   BASELINE_DATE, BASELINE_TAKEN_AT, OPUS_REPORT, PERF_SNAPSHOT_EFFECT, REPORT_SOURCED, SCHEMA_VERSION,
@@ -76,14 +76,25 @@ export function fetchCiWallRuns(window, gh, { maxRuns = 40 } = {}) {
   return runs;
 }
 
-/** PRs merged after `sinceIso` (newest first), or `null` when gh failed. Titles are data. */
-export function fetchMergedSince(sinceIso, gh, { limit = 300 } = {}) {
+/**
+ * PRs merged after `sinceIso`, or `null` when gh failed. Reads closed PRs newest-updated first through the REST list
+ * (not a search-backed list, which rate-limits separately) and keeps those with a `merged_at` after the cut; stops at the first page
+ * whose oldest update is before the cut. Bounded to `maxPages` pages of 100.
+ */
+export function fetchMergedSince(sinceIso, gh, { maxPages = 5 } = {}) {
   if (typeof gh !== 'function') return null;
-  const data = gh(['pr', 'list', '--repo', REPO, '--state', 'merged', '--search', `merged:>=${sinceIso}`, '--json', 'number,title,mergedAt', '--limit', String(limit)]);
-  return Array.isArray(data) ? data.filter((p) => Date.parse(p.mergedAt) > Date.parse(sinceIso)) : null;
+  const out = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const data = gh(['api', `repos/${REPO}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=${page}`]);
+    if (!Array.isArray(data)) return page === 1 ? null : out;
+    for (const p of data) if (p.merged_at && Date.parse(p.merged_at) > Date.parse(sinceIso)) out.push({ number: p.number, title: p.title, mergedAt: p.merged_at });
+    if (data.length < 100 || Date.parse(data.at(-1)?.updated_at) < Date.parse(sinceIso)) break;
+  }
+  return out.sort((a, b) => Date.parse(b.mergedAt) - Date.parse(a.mergedAt));
 }
 
-const headSha = () => { try { return execFileSync('git', ['rev-parse', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } };
+/** The short HEAD of `cwd`'s checkout, or null. */
+export const headSha = (cwd = process.cwd()) => { try { return readGit(['rev-parse', '--short', 'HEAD'], { cwd, stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null; } catch { return null; } };
 const readJson = (file) => JSON.parse(readFileSync(file, 'utf8'));
 
 /** The metrics gh and the logs add on top of the coroner JSON, for one window. */
