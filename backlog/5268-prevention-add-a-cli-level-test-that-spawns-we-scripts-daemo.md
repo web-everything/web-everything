@@ -1,4 +1,5 @@
 ---
+bornAs: x8ybft8
 kind: story
 size: 3
 status: open
