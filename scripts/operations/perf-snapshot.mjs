@@ -242,25 +242,33 @@ export function standardsSplit(markers, window) {
   for (const [scope, xs] of Object.entries(groups)) {
     put(out, `std.${scope}.count`, xs.length, 'runs');
     if (xs.length) {
-      put(out, `std.${scope}.medianSec`, r1(percentile(xs, 0.5) / 1000), 's');
+      // `.sec` (the median) is the key the baseline's report-sourced range uses, so `diffSnapshots` can compare the two.
+      put(out, `std.${scope}.sec`, r1(percentile(xs, 0.5) / 1000), 's');
       put(out, `std.${scope}.p90Sec`, r1(percentile(xs, 0.9) / 1000), 's');
     }
   }
   return out;
 }
 
+/** The `test` job's step that runs the unscoped `npm run check:standards` in CI (`.github/workflows/ci.yml`). */
+export const CI_GATE_STEP = 'Repo health gate';
+
 /**
  * CI wall times from completed, successful `CI` runs with their jobs. A run with any `test-shard` job is a code PR;
  * one without is card-only. Per run: wall = run end - run start; slowest unit shard; slowest soak shard; the `test`
- * job. Medians and p90s over the sampled runs. PURE.
- * @param {{wallMs:number, jobs:{name:string, ms:number}[]}[]} runs
+ * job; the `test` job's {@link CI_GATE_STEP} step (`std.unscoped.ciSec`, the live twin of the report-sourced baseline
+ * key). Medians and p90s over the sampled runs. PURE.
+ * @param {{wallMs:number, jobs:{name:string, ms:number, steps?:{name:string, ms:number}[]}[]}[]} runs
  */
 export function ciWallMetrics(runs) {
-  const code = [], card = [], shard = [], soak = [], testJob = [], unitSpread = [];
+  const code = [], card = [], shard = [], soak = [], testJob = [], unitSpread = [], gateStep = [];
   for (const r of Array.isArray(runs) ? runs : []) {
     if (!Number.isFinite(r?.wallMs) || r.wallMs <= 0) continue;
     const jobs = Array.isArray(r.jobs) ? r.jobs : [];
     const of = (re) => jobs.filter((j) => re.test(j.name) && Number.isFinite(j.ms) && j.ms > 0).map((j) => j.ms);
+    const gate = jobs.filter((j) => /^test$/.test(j.name)).flatMap((j) => (Array.isArray(j.steps) ? j.steps : []))
+      .filter((s) => s?.name === CI_GATE_STEP && Number.isFinite(s.ms) && s.ms > 0);
+    if (gate.length) gateStep.push(gate[0].ms);
     const shards = of(/^test-shard/);
     if (!shards.length) { card.push(r.wallMs); continue; }
     code.push(r.wallMs);
@@ -279,6 +287,7 @@ export function ciWallMetrics(runs) {
   if (unitSpread.length) put(out, 'ci.shardSpreadMedianMin', min(unitSpread, 0.5), 'min');
   if (soak.length) put(out, 'ci.slowestSoakMedianMin', min(soak, 0.5), 'min');
   if (testJob.length) put(out, 'ci.testJobMedianMin', min(testJob, 0.5), 'min');
+  if (gateStep.length) put(out, 'std.unscoped.ciSec', r1(percentile(gateStep, 0.5) / 1000), 's');
   if (card.length) { put(out, 'ci.cardOnly.runs', card.length, 'runs'); put(out, 'ci.cardOnly.wallMedianMin', min(card, 0.5), 'min'); }
   return out;
 }

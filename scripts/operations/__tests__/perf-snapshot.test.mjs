@@ -5,9 +5,9 @@ import { join } from 'node:path';
 import {
   percentile, midpoint, rootCauseTotals, standardsScope, standardsSplit, ciWallMetrics,
   builderStarvation, deriveFromCoroner, diffSnapshots, formatDiff, tagChange,
-  parseStore, pickReferences, planPerfSnapshot, finishPerfSnapshot, PERF_SNAPSHOT_EFFECT,
+  parseStore, pickReferences, planPerfSnapshot, finishPerfSnapshot, PERF_SNAPSHOT_EFFECT, REPORT_SOURCED,
 } from '../perf-snapshot.mjs';
-import { backfillBaseline, createPerfSnapshotSinks } from '../perf-snapshot-io.mjs';
+import { backfillBaseline, createPerfSnapshotSinks, fetchCiWallRuns, fetchMergedSince } from '../perf-snapshot-io.mjs';
 
 const at = (time) => `2026-10-07T${time}:00.000Z`;
 const window = { since: at('10:00'), until: at('11:00') };
@@ -98,9 +98,33 @@ describe('perf-snapshot pure metrics', () => {
       marker('g', 'npm run test:unit', 1000),
     ], window);
     expect(metrics).toEqual({
-      'std.scoped.count': m(2, 'runs'), 'std.scoped.medianSec': m(9, 's'), 'std.scoped.p90Sec': m(34, 's'),
-      'std.unscoped.count': m(2, 'runs'), 'std.unscoped.medianSec': m(113, 's'), 'std.unscoped.p90Sec': m(308, 's'),
+      'std.scoped.count': m(2, 'runs'), 'std.scoped.sec': m(9, 's'), 'std.scoped.p90Sec': m(34, 's'),
+      'std.unscoped.count': m(2, 'runs'), 'std.unscoped.sec': m(113, 's'), 'std.unscoped.p90Sec': m(308, 's'),
     });
+  });
+
+  it('emits a live key for every report-sourced baseline key, so the baseline diff can compare it', () => {
+    const scoped = "npm run check:standards -- --local --files='a.mjs'";
+    const marker = (sha, suites, ms) => ({ sha, suites, startedAt: at('10:00'), finishedAt: at('10:30'), phases: { standardsMs: ms } });
+    const step = (ms, name = 'Repo health gate') => ({ name, ms });
+    const live = {
+      ...standardsSplit([marker('a', scoped, 9000), marker('b', 'npm run check:standards', 113000)], window),
+      ...ciWallMetrics([
+        { wallMs: 600000, jobs: [{ name: 'test-shard (1)', ms: 120000 }, { name: 'test', ms: 60000, steps: [step(2000, 'Install'), step(20000)] }] },
+        { wallMs: 120000, jobs: [{ name: 'test', ms: 60000, steps: [step(30000)] }] },
+      ]),
+    };
+    for (const key of Object.keys(REPORT_SOURCED)) expect(live[key], `${key} is never emitted live`).toBeDefined();
+    expect(live['std.unscoped.ciSec']).toEqual(m(20, 's'));
+    const baseline = row('baseline', Object.fromEntries(Object.entries(REPORT_SOURCED).map(([k, r]) => [k, m(r.v, r.unit, 'opus-report')])));
+    const keys = diffSnapshots(baseline, row('snapshot', live)).map((c) => c.key);
+    expect(keys).toEqual(expect.arrayContaining(Object.keys(REPORT_SOURCED).filter((k) => k !== 'std.unscoped.ciSec')));
+    expect(formatDiff('vs baseline', baseline, row('snapshot', live), []).join('\n')).toMatch(/std\.scoped\.sec: ~9-34 -> 9 s/);
+  });
+
+  it('leaves the CI gate-step key out when no sampled run carries the step', () => {
+    expect(ciWallMetrics([{ wallMs: 600000, jobs: [{ name: 'test', ms: 60000, steps: [{ name: 'Install', ms: 1000 }] }] }])['std.unscoped.ciSec']).toBeUndefined();
+    expect(ciWallMetrics([{ wallMs: 600000, jobs: [{ name: 'test', ms: 60000 }] }])['std.unscoped.ciSec']).toBeUndefined();
   });
 
   it('separates code CI walls, shard timings and card-only runs', () => {
@@ -235,6 +259,96 @@ describe('perf-snapshot IO with isolated stores and injected gh', () => {
 
   it('refuses to write a baseline with a silent CI gap when gh fails', () => withTemp(({ archive, env, home }) => {
     expect(() => backfillBaseline({ archive, env, home, gh: () => null })).toThrow(/CI wall read failed/);
+  }));
+
+  // A gh double: the workflow-run list succeeds with `ids`, each jobs read answers per `jobsFor(id)` (null = failed read).
+  const ciGh = (ids, jobsFor) => (args) => {
+    const path = args[1];
+    if (/workflows\/ci\.yml\/runs/.test(path)) return { workflow_runs: ids.map((id) => ({ id, run_started_at: at('10:00'), updated_at: at('10:10'), created_at: at('10:00') })) };
+    const id = Number(/runs\/(\d+)\/jobs/.exec(path)?.[1]);
+    return jobsFor(id);
+  };
+  const goodJobs = { jobs: [{ name: 'test-shard (1)', started_at: at('10:00'), completed_at: at('10:05') }, { name: 'test', started_at: at('10:05'), completed_at: at('10:06'), steps: [{ name: 'Repo health gate', started_at: at('10:05'), completed_at: '2026-10-07T10:05:20.000Z' }] }] };
+
+  it('refuses a baseline when the run list works but every jobs read fails, or the list is empty', () => withTemp(({ archive, env, home }) => {
+    expect(() => backfillBaseline({ archive, env, home, gh: ciGh([1, 2, 3], () => null) })).toThrow(/CI wall .*(incomplete|failed)/);
+    expect(() => backfillBaseline({ archive, env, home, gh: ciGh([], () => goodJobs) })).toThrow(/CI wall/);
+  }));
+
+  it('refuses a baseline when only some jobs reads fail, and accepts a complete CI read', () => withTemp(({ archive, env, home }) => {
+    expect(() => backfillBaseline({ archive, env, home, gh: ciGh([1, 2, 3], (id) => (id === 2 ? null : goodJobs)) })).toThrow(/CI wall .*incomplete.*1 of 3/);
+    expect(() => backfillBaseline({ archive, env, home, gh: ciGh([1, 2, 3], () => ({ jobs: 'not-an-array' })) })).toThrow(/CI wall/);
+    const row = backfillBaseline({ archive, env, home, gh: ciGh([1, 2, 3], () => goodJobs) });
+    expect(row.metrics['ci.sampleRuns']).toEqual(m(3, 'runs'));
+    expect(row.metrics['std.unscoped.ciSec']).toEqual(m({ lo: 18, hi: 30 }, 's', 'opus-report'));
+  }));
+
+  it('a daily snapshot keeps the CI metrics it read and says how many jobs reads failed', () => withTemp(async ({ archive, env, home }) => {
+    const dir = join(home, 'perf'), store = join(dir, 'snapshots.jsonl');
+    const gh = ciGh([1, 2, 3], (id) => (id === 2 ? null : goodJobs));
+    const sink = createPerfSnapshotSinks({ env, home, gh })[PERF_SNAPSHOT_EFFECT];
+    const payload = { store, dir, archive, hours: 24, now: '2026-10-08T14:05:00.000Z' };
+    await sink({ ...payload, backfill: true, noCi: true });
+    const { row, lines } = await sink({ ...payload, backfill: false });
+    expect(row.metrics['ci.sampleRuns'].v).toBe(2);
+    expect(lines.join('\n')).toMatch(/CI wall is incomplete: 1 of 3 jobs reads failed/);
+  }));
+
+  it('fetchCiWallRuns reports failed jobs reads instead of dropping them, retrying each once', () => {
+    const calls = [];
+    const gh = ciGh([1, 2], (id) => { calls.push(id); return id === 2 ? null : goodJobs; });
+    const got = fetchCiWallRuns({ since: at('09:00'), until: at('11:00') }, gh);
+    expect(got.runs).toHaveLength(1);
+    expect(got.failed).toBe(1);
+    expect(calls).toEqual([1, 2, 2]);
+    expect(got.runs[0].jobs.find((j) => j.name === 'test').steps).toEqual([{ name: 'Repo health gate', ms: 20000 }]);
+    expect(fetchCiWallRuns({ since: at('09:00'), until: at('11:00') }, () => null)).toBeNull();
+    expect(fetchCiWallRuns({ since: at('09:00'), until: at('11:00') }, ciGh([], () => null))).toEqual({ runs: [], failed: 0, total: 0 });
+  });
+
+  it('merged-PR tags are unavailable, not silently short, when a later page fails', () => {
+    const page = (n) => Array.from({ length: 100 }, (_, i) => ({ number: n * 1000 + i, title: 't', merged_at: '2026-10-08T01:00:00Z', updated_at: '2026-10-08T01:00:00Z' }));
+    expect(fetchMergedSince('2026-10-07T14:00:00.000Z', (args) => (/page=1$/.test(args[1]) ? page(1) : null))).toBeNull();
+  });
+
+  it('merged-PR tags are unavailable when every page is full and the cut is never reached', () => {
+    const full = Array.from({ length: 100 }, (_, i) => ({ number: i, title: 't', merged_at: '2026-10-08T01:00:00Z', updated_at: '2026-10-08T01:00:00Z' }));
+    expect(fetchMergedSince('2026-10-07T14:00:00.000Z', () => full, { maxPages: 2 })).toBeNull();
+  });
+
+  it('says when CI wall is a sample of a longer run list, and counts an over-long jobs list as a failed read', () => {
+    const list = (args) => (/workflows\/ci\.yml\/runs/.test(args[1])
+      ? { total_count: 150, workflow_runs: [1, 2].map((id) => ({ id, run_started_at: at('10:00'), updated_at: at('10:10'), created_at: at('10:00') })) }
+      : { total_count: /runs\/2\//.test(args[1]) ? 101 : 2, jobs: goodJobs.jobs });
+    const got = fetchCiWallRuns({ since: at('09:00'), until: at('11:00') }, list);
+    expect(got).toMatchObject({ failed: 1, total: 150 });
+    expect(got.runs).toHaveLength(1);
+  });
+
+  it('a daily snapshot notes the sample size when the window held more runs than were read', () => withTemp(async ({ archive, env, home }) => {
+    const dir = join(home, 'perf'), store = join(dir, 'snapshots.jsonl');
+    const gh = (args) => (/workflows\/ci\.yml\/runs/.test(args[1])
+      ? { total_count: 150, workflow_runs: [1].map((id) => ({ id, run_started_at: at('10:00'), updated_at: at('10:10'), created_at: at('10:00') })) }
+      : goodJobs);
+    const sink = createPerfSnapshotSinks({ env, home, gh })[PERF_SNAPSHOT_EFFECT];
+    const payload = { store, dir, archive, hours: 24, now: '2026-10-08T14:05:00.000Z' };
+    await sink({ ...payload, backfill: true, noCi: true });
+    expect((await sink({ ...payload, backfill: false })).lines.join('\n')).toMatch(/CI wall is a sample: the newest 1 of 150 successful CI runs/);
+  }));
+
+  it('a baseline then a snapshot with standards markers prints the standards trend against the baseline', () => withTemp(async ({ archive, env, home }) => {
+    const lane = join(env.WE_CORONER_LANES, 'lane-1', '.git');
+    mkdirSync(lane, { recursive: true });
+    const marker = (sha, suites, ms) => JSON.stringify({ sha, suites, startedAt: '2026-10-08T10:00:00.000Z', finishedAt: '2026-10-08T10:30:00.000Z', phases: { standardsMs: ms } });
+    writeFileSync(join(lane, '.lane-verify'), `${marker('a', "npm run check:standards -- --local --files='a.mjs'", 4000)}\n${marker('b', 'npm run check:standards', 60000)}\n`);
+    const dir = join(home, 'perf'), store = join(dir, 'snapshots.jsonl');
+    const sink = createPerfSnapshotSinks({ env, home, gh: () => null })[PERF_SNAPSHOT_EFFECT];
+    const payload = { store, dir, archive, hours: 24, now: '2026-10-08T14:05:00.000Z' };
+    await sink({ ...payload, backfill: true, noCi: true });
+    const { lines } = await sink({ ...payload, backfill: false });
+    const text = lines.join('\n');
+    expect(text).toMatch(/std\.scoped\.sec: ~9-34 -> 4 s/);
+    expect(text).toMatch(/std\.unscoped\.sec: ~113-308 -> 60 s/);
   }));
 
   it('appends a baseline and snapshots, retains raw JSON and compares both references', () => withTemp(async ({ archive, env, home }) => {

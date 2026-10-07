@@ -58,7 +58,11 @@ export function readTicks({ env = process.env, home = homedir() } = {}) {
   return out;
 }
 
-/** CI wall inputs for the pure {@link ciWallMetrics}: up to `maxRuns` successful `CI` runs created in the window. */
+/**
+ * CI wall inputs for the pure {@link ciWallMetrics}: up to `maxRuns` successful `CI` runs created in the window, as
+ * `{runs, failed}`. `failed` counts runs whose jobs read failed twice (so they are NOT in `runs`): a caller that needs a
+ * complete sample must check it, a short sample is never silent. `null` when the run list itself could not be read.
+ */
 export function fetchCiWallRuns(window, gh, { maxRuns = 40 } = {}) {
   if (typeof gh !== 'function') return null;
   const created = encodeURIComponent(`${window.since}..${window.until}`);
@@ -67,15 +71,24 @@ export function fetchCiWallRuns(window, gh, { maxRuns = 40 } = {}) {
   const data = gh(listArgs) ?? gh(listArgs);
   if (!data || !Array.isArray(data.workflow_runs)) return null;
   const runs = [];
+  let failed = 0;
+  // The newest `maxRuns` of however many the window held: `total` lets the caller say so instead of reading as the whole window.
+  const total = Math.max(Number.isFinite(data.total_count) ? data.total_count : 0, data.workflow_runs.length);
   for (const r of data.workflow_runs.slice(0, maxRuns)) {
-    const jobs = gh(['api', `repos/${REPO}/actions/runs/${r.id}/jobs?per_page=100`]);
-    if (!jobs || !Array.isArray(jobs.jobs)) continue;
+    const jobsArgs = ['api', `repos/${REPO}/actions/runs/${r.id}/jobs?per_page=100`];
+    const jobs = gh(jobsArgs) ?? gh(jobsArgs);
+    // A jobs list longer than one page would drop jobs (and shards) silently, so it counts as a failed read.
+    if (!jobs || !Array.isArray(jobs.jobs) || jobs.total_count > jobs.jobs.length) { failed++; continue; }
     runs.push({
       wallMs: Date.parse(r.updated_at) - Date.parse(r.run_started_at || r.created_at),
-      jobs: jobs.jobs.map((j) => ({ name: j.name, ms: Date.parse(j.completed_at) - Date.parse(j.started_at) })),
+      jobs: jobs.jobs.map((j) => ({
+        name: j.name,
+        ms: Date.parse(j.completed_at) - Date.parse(j.started_at),
+        steps: Array.isArray(j.steps) ? j.steps.map((s) => ({ name: s.name, ms: Date.parse(s.completed_at) - Date.parse(s.started_at) })) : [],
+      })),
     });
   }
-  return runs;
+  return { runs, failed, total };
 }
 
 /**
@@ -86,13 +99,16 @@ export function fetchCiWallRuns(window, gh, { maxRuns = 40 } = {}) {
 export function fetchMergedSince(sinceIso, gh, { maxPages = 5 } = {}) {
   if (typeof gh !== 'function') return null;
   const out = [];
+  let reachedCut = false;
   for (let page = 1; page <= maxPages; page++) {
     const data = gh(['api', `repos/${REPO}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=${page}`]);
-    if (!Array.isArray(data)) return page === 1 ? null : out;
+    // A later page failing must not hand back a short list: tags missing PRs would misattribute a change, so say "unavailable".
+    if (!Array.isArray(data)) return null;
     for (const p of data) if (p.merged_at && Date.parse(p.merged_at) > Date.parse(sinceIso)) out.push({ number: p.number, title: p.title, mergedAt: p.merged_at });
-    if (data.length < 100 || Date.parse(data.at(-1)?.updated_at) < Date.parse(sinceIso)) break;
+    if (data.length < 100 || Date.parse(data.at(-1)?.updated_at) < Date.parse(sinceIso)) { reachedCut = true; break; }
   }
-  return out.sort((a, b) => Date.parse(b.mergedAt) - Date.parse(a.mergedAt));
+  // `maxPages` full pages and the cut never reached: the list is short, so it is "unavailable" too, never a quiet truncation.
+  return reachedCut ? out.sort((a, b) => Date.parse(b.mergedAt) - Date.parse(a.mergedAt)) : null;
 }
 
 /** The short HEAD of `cwd`'s checkout, or null. */
@@ -100,7 +116,7 @@ export const headSha = (cwd = process.cwd()) => { try { return readGit(['rev-par
 const readJson = (file) => JSON.parse(readFileSync(file, 'utf8'));
 
 /** The metrics gh and the logs add on top of the coroner JSON, for one window. */
-function extras({ window, markers, gh, env, home, notes }) {
+function extras({ window, markers, gh, env, home, notes, gaps = [] }) {
   const out = {};
   if (markers) Object.assign(out, standardsSplit(markers, window));
   try {
@@ -109,8 +125,18 @@ function extras({ window, markers, gh, env, home, notes }) {
     notes.push(`builder.starvedMin is a lower bound: the tick log tail held ${starved['builder.ticks']?.v ?? 0} ticks for this window`);
   } catch (e) { notes.push(`builder starvation unavailable: ${e.message}`); }
   if (gh) {
-    const runs = fetchCiWallRuns(window, gh);
-    if (runs) Object.assign(out, ciWallMetrics(runs)); else notes.push('CI wall unavailable: gh read failed');
+    const ci = fetchCiWallRuns(window, gh);
+    if (!ci) { notes.push('CI wall unavailable: gh read failed'); gaps.push('the CI wall read failed (gh)'); }
+    else {
+      Object.assign(out, ciWallMetrics(ci.runs));
+      if (ci.failed) {
+        const why = `CI wall is incomplete: ${ci.failed} of ${ci.runs.length + ci.failed} jobs reads failed (gh); the CI metrics cover only the runs that read`;
+        notes.push(why); gaps.push(why);
+      }
+      if (!ci.runs.length) gaps.push('no CI run was sampled in the window');
+      const read = ci.runs.length + ci.failed;
+      if (ci.total > read) notes.push(`CI wall is a sample: the newest ${read} of ${ci.total} successful CI runs in the window`);
+    }
   } else notes.push('CI wall skipped (--no-ci)');
   return out;
 }
@@ -126,11 +152,14 @@ export function backfillBaseline({ archive, gh, env = process.env, home = homedi
     Object.assign(metrics, deriveChangeRequests(j48.changeRequests, 'rc48'));
     notes.push(`rc48.* / pred48.* from coroner-48h.json (window ${j48.window.since} to ${j48.window.until}): the report's root-cause and predictor tables are 48 h`);
   }
+  const gaps = [];
+  Object.assign(metrics, extras({ window: j24.window, markers: null, gh, env, home, notes, gaps }));
+  // After the live reads: a report-sourced key shares its name with a live one (`std.unscoped.ciSec`), and the report's range wins.
   for (const [key, v] of Object.entries(REPORT_SOURCED)) metrics[key] = metric(v.v, v.unit, OPUS_REPORT);
   notes.push(`source "opus-report": ${Object.keys(REPORT_SOURCED).join(', ')} (lane markers keep only each lane's last two runs, so the scoped/unscoped standards split cannot be recomputed)`);
-  Object.assign(metrics, extras({ window: j24.window, markers: null, gh, env, home, notes }));
-  // A baseline with a silent gap would make every later CI diff read "no baseline": refuse instead (re-run, or --no-ci).
-  if (gh && !metrics['ci.sampleRuns']) throw new Error('perf-snapshot: the CI wall read failed (gh); not writing a baseline with a gap. Re-run, or pass --no-ci to accept one.');
+  // A baseline with a silent gap (the run list failed, some jobs reads failed, or nothing was sampled) would make every
+  // later CI diff read "no baseline": refuse instead (re-run, or --no-ci to accept one).
+  if (gh && gaps.length) throw new Error(`perf-snapshot: CI wall: ${gaps.join('; ')}; not writing a baseline with a gap. Re-run, or pass --no-ci to accept one.`);
   return buildSnapshot({ kind: 'baseline', date: BASELINE_DATE, takenAt: BASELINE_TAKEN_AT, window: j24.window, metrics, notes, head: headSha() });
 }
 
