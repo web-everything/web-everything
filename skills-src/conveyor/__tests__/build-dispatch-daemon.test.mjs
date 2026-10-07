@@ -108,6 +108,58 @@ describe('prepare status batched', () => {
     second.read(items[0]);
     expect(exec.mock.calls.filter(([, args]) => args[0] === 'cat-file')).toHaveLength(1);
   });
+  it('item 94: prefetches per-item listings concurrently when the shared listing is saturated, with identical results', async () => {
+    const nums = Array.from({ length: 12 }, (_, i) => String(7600 + i));
+    const cards = Object.fromEntries(nums.map(n => [n, `---\nstatus: open\n---\nheld ${n}`]));
+    const own = n => ({ number: Number(n) + 1000, state: n === '7603' ? 'OPEN' : 'MERGED', headRefName: `lane/${n}-prepare-x`, headRefOid: 'b'.repeat(40), createdAt: '2026-09-29', isCrossRepository: false });
+    const filler = Array.from({ length: 1000 }, (_, i) => ({ number: i, state: 'MERGED', headRefName: `lane/other-${i}`, createdAt: '2026-09-29', isCrossRepository: false }));
+    const git = prepareGitFixture(cards);
+    const answer = (cmd, args, opts) => {
+      if (cmd === 'gh' && args[0] === 'pr') {
+        const search = args[args.indexOf('--search') + 1];
+        const m = /^head:lane\/(\d+)-prepare-$/.exec(search);
+        return JSON.stringify(m ? [own(m[1])] : filler); // the shared listing is capped (saturated), so it cannot answer
+      }
+      if (cmd === 'gh' && args[0] === 'api') return JSON.stringify({ encoding: 'base64', content: Buffer.from('---\nstatus: open\n---\nx').toString('base64') });
+      return git(cmd, args, opts);
+    };
+    const items = nums.map(num => ({ num }));
+    const plainExec = vi.fn(answer);
+    const plain = createPrepareStatusReader({ exec: plainExec });
+    plain.prime(items);
+    const expected = items.map(i => plain.read(i));
+
+    let inFlight = 0, peak = 0;
+    const execAsync = vi.fn(async (cmd, args, opts) => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise(r => setTimeout(r, 5));
+      inFlight--;
+      return answer(cmd, args, opts);
+    });
+    const syncExec = vi.fn(answer);
+    const fast = createPrepareStatusReader({ exec: syncExec, execAsync });
+    await fast.prime(items);
+    const syncItemCallsAfterPrime = syncExec.mock.calls.filter(([cmd, a]) => cmd === 'gh' && a[0] === 'pr' && /prepare-$/.test(a[a.indexOf('--search') + 1])).length;
+    const actual = items.map(i => fast.read(i));
+    expect(actual).toEqual(expected);
+    expect(syncItemCallsAfterPrime).toBe(0);
+    expect(syncExec.mock.calls.filter(([cmd, a]) => cmd === 'gh' && a[0] === 'pr' && /prepare-$/.test(a[a.indexOf('--search') + 1]))).toHaveLength(0);
+    expect(execAsync).toHaveBeenCalledTimes(nums.length);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(8);
+  });
+  it('item 94: a failed prefetch falls back to the lazy read, which reports the same failure', async () => {
+    const git = prepareGitFixture({ 7700: '---\nstatus: open\n---\nfail' });
+    const filler = Array.from({ length: 1000 }, (_, i) => ({ number: i, state: 'MERGED', headRefName: `lane/o-${i}`, createdAt: '2026-09-29', isCrossRepository: false }));
+    const exec = vi.fn((cmd, args, opts) => {
+      if (cmd === 'gh' && /prepare-$/.test(args[args.indexOf('--search') + 1] ?? '')) throw new Error('item listing unavailable');
+      return cmd === 'gh' ? JSON.stringify(filler) : git(cmd, args, opts);
+    });
+    const execAsync = vi.fn(async () => { throw new Error('item listing unavailable'); });
+    const reader = createPrepareStatusReader({ exec, execAsync });
+    await reader.prime([{ num: 7700 }]);
+    expect(() => reader.read({ num: 7700 })).toThrow('item listing unavailable');
+  });
   it('omits the date filter when any primed claim date is missing and reads unprimed cards lazily', () => {
     const exec = prepareGitFixture({ 7100: '---\nstatus: open\n---\nmissing date', 7101: '---\npreparedDate: 2026-09-29\n---\nlazy' });
     const reader = createPrepareStatusReader({ exec });

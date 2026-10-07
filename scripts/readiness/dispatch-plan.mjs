@@ -876,14 +876,41 @@ async function main(argv) {
     bqArgs.push(`--backlog-dir=${flags['backlog-dir']}`);
     process.env.WE_BACKLOG_DIR = flags['backlog-dir'];
   }
+  // 78c — every independent child read starts HERE (before the in-process backlog load, which blocks this
+  // process) and is awaited where the sequential code used it. Wall time becomes the slowest read, not the sum.
+  // `fail()` exits the process exactly as before; only the order in which a failing read is reported can differ.
+  const subTimings = {};
+  const startRead = (label, fn) => {
+    const t0 = performance.now();
+    const promise = Promise.resolve().then(fn).finally(() => { subTimings[label] = Math.round(performance.now() - t0); });
+    promise.catch(() => {});
+    return promise;
+  };
+  const bqPromise = queueFile ? null
+    : startRead('build-queue', () => runJson('node', [BACKLOG_CLI, ...bqArgs], 'backlog build-queue'));
+  const scopePromise = fixtureMode ? null
+    : startRead('scope-lease-collect', () => runJson('node', [SCOPE_COLLECT_CLI, '--json', '--no-track-attempts'], 'scope-lease-collect'));
+  const poolPromise = (freeLanesOverride !== null || fixtureMode) ? null
+    : startRead('lane-pool-list', () => runJson('node', [LANE_POOL_CLI, 'list', '--acquirable', '--json'], 'lane-pool list'));
+  const driftPromise = flags['no-drift-check'] ? null : startRead('drift-check', async () => {
+    const DRIFT_CLI = join(HERE, '..', 'conveyor', 'branch-drift.mjs');
+    const branch = typeof flags['drift-branch'] === 'string' ? flags['drift-branch'] : DEFAULT_DRIFT_BRANCH;
+    const target = typeof flags['drift-target'] === 'string' ? flags['drift-target'] : DEFAULT_DRIFT_TARGET;
+    // #3637 — no branch to check means nothing carries unreconciled drift: skip (the caller's catch logs it).
+    if (!branch) throw new Error('no POC branch registered and no --drift-branch given — nothing to check');
+    const out = await runBounded('node', [DRIFT_CLI, 'check', `--branch=${branch}`, `--target=${target}`, '--no-fetch', '--json'], { timeoutMs: childTimeoutMs });
+    return { verdict: JSON.parse(out), branch };
+  });
   let byNum = new Map();
   let backlogItems = [];
+  const backlogLoadT0 = performance.now();
   try {
     const { createRequire } = await import('node:module');
     const require = createRequire(import.meta.url);
     const loadBacklog = require(join(HERE, '..', '..', 'src', '_data', 'backlog.js'));
     backlogItems = typeof loadBacklog === 'function' ? loadBacklog() : [];
     byNum = new Map(backlogItems.map((it) => [String(it.num), it]));
+    subTimings['backlog-load'] = Math.round(performance.now() - backlogLoadT0);
   } catch (e) {
     log(`  ⚠ could not load backlog for scope/openBlockers enrichment (${String(e.message || e).split('\n')[0]}) — items read as unshaped (no scope → held unshaped-no-scope, auto-prepared)`);
   }
@@ -907,7 +934,7 @@ async function main(argv) {
     try { rows = queueFileRows(readFileSync(queueFile, 'utf8'), normNum); }
     catch (e) { fail(`could not read --queue-file ${queueFile}: ${String(e.message || e).split('\n')[0]}`); }
   } else {
-    const bq = await runJson('node', [BACKLOG_CLI, ...bqArgs], 'backlog build-queue');
+    const bq = await bqPromise;
     bqRows = Array.isArray(bq?.queue) ? bq.queue : [];
     observeSelection = (num, gate) => {
       const key = normNum(num);
@@ -954,6 +981,7 @@ async function main(argv) {
   // attempt still runs its mandatory already-done guard before launching any worker.
   const alreadyDoneNotReady = new Map();
   let groundTruth = { checkedLocally: 0, cached: 0, pending: 0, refresh: { started: false, ids: [] } };
+  const groundT0 = performance.now();
   if (!flags['no-ground-truth']) {
     const { readLocalDoneFacts, localDoneVerdict, startAlreadyDoneRefresh } = await import('./already-done-refresh.mjs');
     const nowMs = Date.now();
@@ -985,10 +1013,11 @@ async function main(argv) {
     groundTruth.refresh = startAlreadyDoneRefresh(pending, resolveAlreadyDoneCacheStorePath(), { readOnly: Boolean(flags['no-already-done-cache']) });
     if (groundTruth.refresh.error) log(`already-done refresh unavailable: ${groundTruth.refresh.error}`);
   }
+  subTimings['ground-truth'] = Math.round(performance.now() - groundT0);
 
   // 2. THE ACTIVE LEASES — reuse the live scope-lease collector. Each lease's held scope = predicted ∪ observed.
   //    Fixture mode (#x7xv2xt) skips it: a synthetic corpus has no real leases.
-  const picture = fixtureMode ? { leases: [] } : await runJson('node', [SCOPE_COLLECT_CLI, '--json', '--no-track-attempts'], 'scope-lease-collect');
+  const picture = fixtureMode ? { leases: [] } : await scopePromise;
   const leases = (Array.isArray(picture?.leases) ? picture.leases : []).map((l) => ({
     lane: l.lane,
     scope: toRepoRelative([...(l.predicted || []), ...(l.observed || [])]),
@@ -1001,7 +1030,7 @@ async function main(argv) {
   if (freeLanesOverride !== null) freeLanes = freeLanesOverride;
   else if (fixtureMode) freeLanes = [];
   else {
-    const paths = await runJson('node', [LANE_POOL_CLI, 'list', '--acquirable', '--json'], 'lane-pool list');
+    const paths = await poolPromise;
     freeLanes = (Array.isArray(paths) ? paths : [])
       .map((p) => { const m = /lane-(\d+)\/?$/.exec(String(p)); return m ? Number(m[1]) : null; })
       .filter((n) => n != null)
@@ -1019,16 +1048,8 @@ async function main(argv) {
   let driftGraduationItem = null;
   if (!flags['no-drift-check']) {
     try {
-      const DRIFT_CLI = join(HERE, '..', 'conveyor', 'branch-drift.mjs');
-      const branch = typeof flags['drift-branch'] === 'string' ? flags['drift-branch'] : DEFAULT_DRIFT_BRANCH;
-      const target = typeof flags['drift-target'] === 'string' ? flags['drift-target'] : DEFAULT_DRIFT_TARGET;
+      const { verdict, branch } = await driftPromise;
       const scope = typeof flags['drift-scope'] === 'string' ? flags['drift-scope'].split(',').filter(Boolean) : [...DEFAULT_DRIFT_SCOPE];
-      // #3637 — no branch to check (an EMPTY POC-branch registry and no `--drift-branch=`) means there is
-      // nothing carrying unreconciled drift, so there is nothing to hold on. Skip rather than shelling out
-      // with a `null` branch name and relying on the fail-open catch to clean it up.
-      if (!branch) throw new Error('no POC branch registered and no --drift-branch given — nothing to check');
-      const out = await runBounded('node', [DRIFT_CLI, 'check', `--branch=${branch}`, `--target=${target}`, '--no-fetch', '--json'], { timeoutMs: childTimeoutMs });
-      const verdict = JSON.parse(out);
       if (verdict?.status === 'blocked') {
         driftBlockedScope = scope;
         // #3836 — the blocked branch's registered graduation item; its children are graduation slices, exempt
@@ -1096,6 +1117,7 @@ async function main(argv) {
     preparePolicy.maxAgeDays = maxAgeDays;
     const d = new Date();
     preparePolicy.today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const stalenessT0 = performance.now();
     try {
       const { checkPrepStaleness } = await import('./prep-staleness.mjs');
       for (const item of queue) {
@@ -1106,6 +1128,7 @@ async function main(argv) {
     } catch (e) {
       log(`  ⚠ prepare drift check skipped (${String(e.message || e).split('\n')[0]}) — age check only`);
     }
+    subTimings['prep-staleness'] = Math.round(performance.now() - stalenessT0);
   }
 
   // 3.8 OPEN-PR BACKPRESSURE LIMIT (we:xniq7xs) — read the live open-PR count for WE (this core's own build
@@ -1117,6 +1140,7 @@ async function main(argv) {
   //     build queue this core schedules is WE's own; a multi-repo build queue is a follow-on, not this core's
   //     job to invent.
   let prLimitHeld = false;
+  const prLimitT0 = performance.now();
   if (!flags['no-pr-limit-check']) {
     try {
       prLimitHeld = (await readPrLimitHeld()).held;
@@ -1124,12 +1148,15 @@ async function main(argv) {
       log(`  ⚠ pr-limit check skipped (${String(e.message || e).split('\n')[0]}) — dispatch proceeds unheld on this axis`);
     }
   }
+  subTimings['pr-limit-check'] = Math.round(performance.now() - prLimitT0);
 
   // #xupukxa — the concurrency ceiling, env-overridable exactly like heavy-admission.mjs's own cap knob.
   const maxConcurrentLanes = resolveMaxConcurrentLanes(process.env);
   const plan = dispatchPlan({ queue, leases, freeLanes, driftBlockedScope, driftGraduationItem, maxConcurrentLanes, dispatchPaused, dispatchPausedKinds, sizePolicy, preparePolicy, prLimitHeld, trace: true });
   // Surface cleared-but-not-ready ids as held entries so a clear never silently vanishes (#2613 review, 2b).
   plan.groundTruth = groundTruth;
+  // 78c — each read's own wall time (they overlap). Observation only; the decision never reads it.
+  plan.timings = subTimings;
 
   // #3457/#3460: a `notReady` id the ground-truth pass above CONFIRMED already done (the exact `#3435` live
   // shape — a RESOLVED item whose sidecar clear was never removed) is surfaced as `already-done`, naming the
