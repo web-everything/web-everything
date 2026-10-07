@@ -15,6 +15,6 @@ Goal: the test 'paused budget resumes, does not reset' must go red if armGate re
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+1. **Executable** — `npx vitest run we:scripts/conveyor/__tests__/verify-dispatch.test.mjs -t "paused budget resumes"` passes five consecutive runs; with `onRequeue` skipping the `gateBudgetMs` reduction the same command fails.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.

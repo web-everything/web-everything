@@ -3,9 +3,11 @@ bornAs: x6yigy0
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-content-lint.test.mjs"]
 dateOpened: "2026-10-02"
+dateStarted: "2026-10-06"
+dateResolved: "2026-10-06"
 preparedDate: "2026-10-03"
 preparedAgainstSha: "e2ca80ac2a75e42cb204b6d736bdf55bf87f5e38"
 tags: []
