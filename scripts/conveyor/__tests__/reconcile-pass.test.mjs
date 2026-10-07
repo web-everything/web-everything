@@ -1216,6 +1216,9 @@ describe('timeout re-run eligibility — card-only diff + derived red checks (PR
     const soak = [{ name: 'soak-shard (3)', conclusion: 'failure' }, { name: 'daemon-soak', conclusion: 'failure' }];
     expect(soak.filter((c) => !isDerivedTimeoutCheck(c, soak)).map((c) => c.name)).toEqual(['soak-shard (3)']);
     expect(isDerivedTimeoutCheck({ name: 'daemon-soak', conclusion: 'failure' }, [{ name: 'soak-shard (1)', conclusion: 'success' }])).toBe(false);
+    // integration is a sibling aggregate input: a red integration job is the evidence, `test` only mirrors it.
+    expect(isDerivedTimeoutCheck({ name: 'test', conclusion: 'failure' }, [{ name: 'integration', conclusion: 'failure' }])).toBe(true);
+    expect(isDerivedTimeoutCheck({ name: 'test', conclusion: 'failure' }, [{ name: 'integration', conclusion: 'success' }])).toBe(false);
   });
   it('the re-run is on by default and WE_CI_TIMEOUT_RERUN_ENABLED=0 is only a kill switch', () => {
     const pr = { number: 1, headRefOid: 'h', statusCheckRollup: [{ name: 'test-shard (2)', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/2' }] };

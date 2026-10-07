@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { classifyCardOnly, isCardPath } from '../ci-card-only.mjs';
+import { classifyCardOnly, isCardPath, isCardOnlyDiff } from '../ci-card-only.mjs';
 import { REVIEW_HOLD_LABELS } from '../lib/review-escalation.mjs';
 
 describe('ci-card-only detection', () => {
@@ -23,6 +23,15 @@ describe('ci-card-only detection', () => {
     expect(isCardPath('backlog-tools/x.mjs')).toBe(false);
     expect(isCardPath('backlog/../scripts/x.mjs')).toBe(false);
     expect(isCardPath('backlog/')).toBe(false);
+  });
+});
+
+describe('isCardOnlyDiff — the one definition shared with the local verify gate', () => {
+  it('is exactly the light verdict of a pull_request classification', () => {
+    const cases = [['backlog/a.md'], ['backlog/a.md', 'scripts/x.mjs'], [], null, undefined, ['backlog/../x'], ['backlog-tools/x.mjs'], ['backlog/a.md', 'src/old.ts']];
+    for (const files of cases) expect(isCardOnlyDiff(files)).toBe(classifyCardOnly({ event: 'pull_request', files: files ?? undefined }).light);
+    expect(isCardOnlyDiff(['backlog/a.md'])).toBe(true);
+    expect(isCardOnlyDiff([])).toBe(false);
   });
 });
 

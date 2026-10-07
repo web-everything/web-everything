@@ -26,6 +26,10 @@ export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
   // (they read the whole repo, import nothing the diff touches, and so were the CI-only reds). Repo-relative paths;
   // missing files are skipped (a sibling checkout). A tightening only: CI is unchanged.
   alwaysRunTests: [],
+  // A PR whose diff is card-only (exactly CI's `scripts/ci-card-only.mjs` definition) skips the local gate and records a
+  // green marker saying so; CI still runs its full check:standards on it and stays the merge authority. Off by
+  // built-in (other checkouts keep the full gate); `verify-settings.json` turns it on for this repo.
+  skipLocalForCardOnly: false,
 });
 
 /** Use the WE root RUNNING verify-lane, never the target lane REPO or cwd:
@@ -47,6 +51,7 @@ const rules = {
   isolatedRetry: value => ['untouched', 'timeouts', 'off'].includes(value),
   relatedMaxTests: value => Number.isSafeInteger(value) && value >= 0,
   relatedDepth: value => Number.isSafeInteger(value) && value >= 1,
+  skipLocalForCardOnly: value => typeof value === 'boolean',
   alwaysRunTests: value => Array.isArray(value) && value.length <= 50
     // Each entry becomes a vitest file argument: it must start with a word character (never `-`, so `-u` / `--bail`
     // cannot become a vitest option), be a test file, and stay inside the repo.
@@ -59,9 +64,9 @@ const envKeys = {
   restartInFlight: 'WE_VERIFY_RESTART_IN_FLIGHT',
   runAllPhases: 'WE_VERIFY_RUN_ALL_PHASES', isolatedRetry: 'WE_VERIFY_ISOLATED_RETRY',
   relatedMaxTests: 'WE_VERIFY_RELATED_MAX_TESTS', relatedDepth: 'WE_VERIFY_RELATED_DEPTH',
-  alwaysRunTests: 'WE_VERIFY_ALWAYS_RUN_TESTS',
+  alwaysRunTests: 'WE_VERIFY_ALWAYS_RUN_TESTS', skipLocalForCardOnly: 'WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY',
 };
-const booleanKeys = new Set(['phaseAdmission', 'matchRequestVariants', 'runAllPhases']);
+const booleanKeys = new Set(['phaseAdmission', 'matchRequestVariants', 'runAllPhases', 'skipLocalForCardOnly']);
 // Preserve which keys survived validation without adding configuration keys to the file shape.
 const fileKeys = new WeakMap();
 
