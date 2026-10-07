@@ -10,6 +10,7 @@ import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 
 /** Lane-local await record filename. */
 export const AWAIT_VERIFY_FILE = '.fix-await-verify';
@@ -42,9 +43,12 @@ export function resolveAwaitVerifyPath(cwd, { statFn = statSync, readFileSyncFn 
 
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonEmpty = (value) => typeof value === 'string' && value.trim().length > 0;
+/** Kinds that hold no PR yet and push nothing: the harness only reports the verdict, the agent's own `open-pr` pushes. */
+export const AWAIT_VERIFY_NO_PUSH_KINDS = Object.freeze(['delivery', 'prepare']);
 const validRecord = (record) => isObject(record) && record.v === 1
   && typeof record.requestedAt === 'string' && Number.isFinite(Date.parse(record.requestedAt))
-  && Number.isInteger(record.pr) && record.pr > 0;
+  && ((Number.isInteger(record.pr) && record.pr > 0)
+    || (AWAIT_VERIFY_NO_PUSH_KINDS.includes(record.kind) && Number.isInteger(record.item) && record.item > 0));
 
 /** Read JSON objects only; missing, unreadable and malformed files are unknown. */
 export function readAwaitVerifyRecord(cwd, io = {}) {
@@ -187,7 +191,7 @@ export function clearStoredAwaitVerify(key, { dir = awaitVerifyStoreDir(), unlin
 /** Lane refs a record may name for the daemon's push: `lane/*` only, never `main` or a flag-shaped string. */
 export const AWAIT_VERIFY_REF_RE = /^lane\/[A-Za-z0-9._/-]+$/;
 /** Session kinds whose briefs know how to be resumed by the verdict pass. */
-export const AWAIT_VERIFY_KINDS = Object.freeze(['fix', 'ci-heal']);
+export const AWAIT_VERIFY_KINDS = Object.freeze(['fix', 'ci-heal', 'delivery', 'prepare']);
 
 /**
  * Thin CLI shell; filesystem, subprocess, environment, clock and output ports are injectable.
@@ -224,9 +228,13 @@ export function main(argv = process.argv.slice(2), {
       return 0;
     }
     if (command !== 'mark') { err('expected mark, show or clear'); return 2; }
+    // A delivery or prepare session has no PR yet (it hands the wait over BEFORE `open-pr`): it names its ITEM instead,
+    // and the harness never pushes for it.
+    const noPush = AWAIT_VERIFY_NO_PUSH_KINDS.includes(flags.kind);
     const record = {
       v: 1, sessionId: callerSessionId(),
-      who: flags.who, repo: flags.repo, pr: Number(flags.pr),
+      who: flags.who, repo: noPush ? (flags.repo ?? ghRepoSlug(DEFAULT_REPO_KEY)) : flags.repo,
+      ...(noPush ? { item: Number(flags.item) } : { pr: Number(flags.pr) }),
       sha: flags.sha ?? git(['rev-parse', 'HEAD']).trim(),
       requestedAt: new Date(now()).toISOString(), attempt: Number(flags.attempt ?? 1),
     };
@@ -242,7 +250,10 @@ export function main(argv = process.argv.slice(2), {
       if (!AWAIT_VERIFY_REF_RE.test(String(flags.ref)) || String(flags.ref).includes('..')) { err('malformed --ref (must be lane/*)'); return 2; }
       const kind = flags.kind ?? 'fix';
       if (!AWAIT_VERIFY_KINDS.includes(kind)) { err(`malformed --kind (one of ${AWAIT_VERIFY_KINDS.join(', ')})`); return 2; }
-      if (git(['status', '--porcelain', '--untracked-files=all']).trim()) {
+      if (noPush && !(Number.isInteger(record.item) && record.item > 0)) { err('malformed: --kind=delivery|prepare needs --item=<NNN>'); return 2; }
+      // A fix pushes the committed sha, so its tree must BE that commit. A delivery/prepare lane pushes nothing here: its
+      // verified working-tree hash is re-proven against the marker instead (a step-5 gate runs before the commit).
+      if (!noPush && git(['status', '--porcelain', '--untracked-files=all']).trim()) {
         err('dirty working tree: commit the repair first — the harness pushes the committed sha, so the verified tree must be exactly that commit');
         return 2;
       }

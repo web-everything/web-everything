@@ -149,6 +149,18 @@ describe('#5137 slices 2+3 — the shared store a dispatched session is found by
   });
   const MARK = ['mark', '--repo=web-everything/web-everything', '--pr=4115', '--who=fix-4115', '--ref=lane/item-68b', '--kind=fix'];
 
+  it('card 4: a delivery or prepare mark names its ITEM (no PR), may be dirty, and is stored', () => {
+    gitRepo();
+    const store = join(cwd, '.store');
+    writeFileSync(join(cwd, 'wip.txt'), 'uncommitted\n');
+    const marked = JSON.parse(run(['mark', '--who=build-4300', '--item=4300', '--ref=lane/4300-slug', '--kind=delivery'], store));
+    expect(marked).toMatchObject({ kind: 'delivery', item: 4300, sessionId: 'S-live' });
+    expect(marked.pr).toBeUndefined();
+    expect(readStoredAwaitVerify('S-live', { dir: store })).toMatchObject({ item: 4300 });
+    expect(() => run(['mark', '--who=build-4300', '--ref=lane/4300-slug', '--kind=prepare'], store)).toThrow(); // no --item
+    expect(() => run(['mark', '--repo=web-everything/web-everything', '--who=fix-1', '--pr=1', '--ref=lane/x', '--kind=fix'], store)).toThrow(); // a fix still needs a clean tree
+  });
+
   it('a real dispatched row (cwd = per-dispatch scratch dir, no .git) is seen as awaiting once its lane marks', () => {
     // Before this slice the resolver only read `<row.cwd>/.git/.fix-await-verify`, but a dispatched fixer's row
     // cwd is `.operations/dispatch/<uuid>` — never its lane — so the reaper exemption could never fire live.
