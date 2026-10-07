@@ -107,6 +107,42 @@ describe('verify-lane writer — overlapping-runs race (#2833 finding 1)', () =>
   });
 });
 
+describe('verify-lane — card-only diff skips the local gate (skipLocalForCardOnly)', () => {
+  const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+  const verify = (extra = []) => spawnSync('node', [VERIFY_LANE, 'verify', '--json', ...extra], { cwd: dir, encoding: 'utf8', env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot } });
+  const commitFile = (rel) => { mkdirSync(join(dir, rel.split('/').slice(0, -1).join('/')), { recursive: true }); writeFileSync(join(dir, rel), 'x\n'); git('add', '-A'); git('commit', '-qm', rel); };
+  it('records a green marker for HEAD without running any gate, for a backlog-only diff', () => {
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    commitFile('backlog/zz1-card.md');
+    const r = verify();
+    const json = JSON.parse(r.stdout.trim().split('\n').pop());
+    expect(json).toMatchObject({ status: 'green', reason: 'card-only-skip' });
+    const onDisk = JSON.parse(readFileSync(marker(), 'utf8'));
+    expect(onDisk).toMatchObject({ status: 'green', sha: headSha(), skipped: 'card-only' });
+  });
+  // The fix / ci-heal reproduce-and-confirm gate (`gateFor` → `verify-lane run`): a card-only PR is CI-red exactly
+  // when CI's full check:standards fails on a card, so a no-op green here would hide the red from the agent that is
+  // meant to reproduce it. Only the marker-producing modes may skip.
+  it('`run` mode is NOT skipped on a card-only diff: the real gate command is resolved and no skip marker is written', () => {
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    commitFile('backlog/zz1-card.md');
+    const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000, env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot } });
+    const out = `${r.stdout}\n${r.stderr}`;
+    expect(out).not.toContain('card-only-skip');
+    expect(out).not.toContain('local gate skipped');
+    expect(out).toContain('check:standards');
+    expect(existsSync(marker())).toBe(false);
+  });
+  it('a diff that also touches code is NOT skipped (no card-only marker)', () => {
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    commitFile('backlog/zz1-card.md');
+    commitFile('scripts/other.mjs');
+    const r = verify();
+    expect(r.stdout).not.toContain('card-only-skip');
+    expect(existsSync(marker()) ? JSON.parse(readFileSync(marker(), 'utf8')).skipped : undefined).toBeUndefined();
+  });
+});
+
 describe('verify-lane — a terminal record for an EARLIER commit of this lane is archived, not a blocker (#3751, #3383)', () => {
   it('a second verify after a new commit starts, runs, and keeps the old record in .lane-verify.previous', () => {
     const first = runVerify('true');

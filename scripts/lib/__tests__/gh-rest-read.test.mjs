@@ -65,6 +65,28 @@ describe('ghRestGetJson — conditional requests', () => {
     expect(again).toEqual({ status: 304, json: { a: 1 }, etag: 'W/"e1"', notModified: true });
   });
 
+  // Live 2026-10-07 (#4235): `gh: HTTP 500` on a conditional read was logged as `Command failed: gh api -i -H
+  // If-None-Match: ...` (read as a 304 failure) and the same cached ETag was re-sent, failing every pass.
+  const serverError = (status = 500) => Object.assign(new Error('Command failed: gh api -i -H If-None-Match: W/"e1" p\ngh: HTTP ' + status),
+    { status: 1, stdout: `HTTP/2.0 ${status} Internal Server Error\r\n\r\n`, stderr: `gh: HTTP ${status}\n` });
+
+  it('a 5xx on a conditional read retries once unconditionally and replaces the cached ETag', () => {
+    const { exec, calls } = scripted([ok('{"a":1}'), serverError(), ok('{"a":2}', 'W/"e2"')]);
+    ghRestGetJson('p5', o(exec));
+    const again = ghRestGetJson('p5', o(exec));
+    expect(again).toMatchObject({ status: 200, json: { a: 2 }, etag: 'W/"e2"', notModified: false });
+    expect(calls[1].argv).toContain('If-None-Match: W/"e1"');
+    expect(calls[2].argv).toEqual(['api', '-i', 'p5']);
+  });
+
+  it('a failure names its HTTP status in the first line of the message', () => {
+    const { exec } = scripted([serverError(), serverError()]);
+    let err;
+    try { ghRestGetJson('p6', o(exec)); } catch (e) { err = e; }
+    expect(err.httpStatus).toBe(500);
+    expect(err.message.split('\n')[0]).toMatch(/HTTP 500/);
+  });
+
   it('a changed resource (200 after a cached ETag) replaces the cache', () => {
     const { exec } = scripted([ok('{"a":1}'), ok('{"a":2}', 'W/"e2"'), notModified()]);
     ghRestGetJson('p', o(exec));

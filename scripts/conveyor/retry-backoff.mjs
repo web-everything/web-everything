@@ -48,6 +48,22 @@ export const BACKOFF_REASON_CODES = Object.freeze(RULES.map(([code]) => code));
  */
 export const CLONE_WIDE_REASON_CODES = Object.freeze(['checkout-behind-origin']);
 export const isCloneWideReasonCode = (code) => CLONE_WIDE_REASON_CODES.includes(code);
+/**
+ * A CARD-LEVEL permanent refusal: a `dispatch-lane` step refused because of what the CARD says — a card-derived
+ * placeholder (`SCOPE`, `ITEM_SPEC_PATH`, `ITEM_NUM`, `DELIVERY_BASE`) it cannot fill or carry, or no `scope:`.
+ * Re-running it refuses identically, so it is never retried on a cooldown: the card is held and surfaced.
+ * Matches the daemon's own `step-refused at \`<step>\`: <error>` account (`readDispatchOutcome`), ANCHORED at the
+ * start. A refusal about the CLONE, the daemon's environment (`WE_ROOT`, `SESSION_SLUG`, `GATE_COMMAND`), the
+ * tick, or the loader (`no backlog file resolved`, a MISSPELLED brief token) deliberately does not match: those
+ * hit every card, so holding each one would flood the operator with per-card holds for one daemon fault.
+ */
+export const CARD_REFUSAL_CODE = 'card-refused';
+const CARD_PLACEHOLDERS = 'SCOPE|ITEM_SPEC_PATH|ITEM_NUM|DELIVERY_BASE';
+const CARD_REFUSAL_RE = new RegExp(
+  '^step-refused at `[^`]+`: dispatch-lane(?:: (?:no value for the brief placeholder|the value for) '
+  + `\\{\\{(?:${CARD_PLACEHOLDERS})\\}\\}|\\.read: #\\S+ has no \`scope:\`)`,
+);
+export const isCardRefusal = (text) => CARD_REFUSAL_RE.test(String(text ?? ''));
 export function reasonCodeOf(text) {
   const s = String(text ?? '');
   for (const [code, re] of RULES) if (re.test(s)) return code;
@@ -60,4 +76,16 @@ export function evidenceReasonCode(evidence) {
   // `reason` is the daemon's own account of the failure; `error` is raw agent/child output that may merely QUOTE a
   // known failure's text. `error` is only consulted when there is no `reason` at all.
   return reasonCodeOf(evidence?.reason ?? evidence?.error);
+}
+
+/**
+ * BUILD-path only: {@link evidenceReasonCode} plus the card-refusal code. Kept out of the shared reader because the
+ * prepare ledger (`prepare-failure-policy.mjs`) also calls `evidenceReasonCode`, and any non-null code there is
+ * classed `dispatch-transient` and retried on backoff — a card refusal must stay `unknown` (held + diagnose card)
+ * on that path. The card-refusal match is ANCHORED and checked FIRST, so card text that merely quotes a reason-code
+ * token (a scope naming `checkout-behind-origin`) is not misread as a clone-wide refusal.
+ */
+export function buildEvidenceReasonCode(evidence) {
+  const text = evidence?.reason ?? evidence?.error;
+  return isCardRefusal(text) ? CARD_REFUSAL_CODE : reasonCodeOf(text);
 }

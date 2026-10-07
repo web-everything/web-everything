@@ -1340,6 +1340,16 @@ describe('review:pending PRs the tick did not dispatch — the daemon prints why
     expect(explainPendingNotDispatched({ prs: null, plan })).toEqual([]);
   });
 
+  it('explainPendingNotDispatched: a same-head pause is logged (it has no notice), a referral pause is not', () => {
+    const plan = { dispatch: [], refusals: [
+      { kind: 'review-referrals-pending', prNumber: 7, why: 'review paused: head abc was already reviewed 1 time(s)', referralHold: { kind: 'same-head' } },
+      { kind: 'review-referrals-pending', prNumber: 8, why: 'review paused: 2 referrals', referralHold: { kind: undefined } },
+    ] };
+    const out = explainPendingNotDispatched({ prs: [pending(7), pending(8)], plan });
+    expect(out.map(o => o.prNumber)).toEqual([7]);
+    expect(out[0].reasons[0]).toMatch(/already reviewed 1 time/);
+  });
+
   it('runReviewTick (shared reads) returns pendingNotDispatched, and onTick prints one line per PR', () => {
     const prs = [pending(2746), pending(2758)];
     const out = runReviewTick({
@@ -1403,7 +1413,7 @@ it('x6n7c2p required checks before review — synthetic #3432 four-tick soak spe
     });
     dispatched.push(out.dispatched.length);
     if (conclusion !== 'success') {
-      expect(out.notStarted).toEqual([{ prNumber: 3432, reason: 'review-ci: required-checks-not-successful' }]);
+      expect(out.notStarted).toEqual([{ prNumber: 3432, reason: expect.stringMatching(/^review-ci: required-checks-not-successful: daemon-soak=\w+$/) }]);
       expect(tagRound).not.toHaveBeenCalled();
       expect(spawnAgent).not.toHaveBeenCalled();
     }

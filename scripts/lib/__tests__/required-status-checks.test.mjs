@@ -101,7 +101,7 @@ describe('getRequiredStatusChecks', () => {
   it.each([
     ['plateauapp/plateau-app', ['test', 'e2e']],
     ['frontier-ui/frontierui', ['test']],
-    ['web-everything/web-everything', ['test', 'smoke', 'daemon-soak']],
+    ['web-everything/web-everything', ['test', 'smoke', 'daemon-soak', 'integration']],
   ])('caches the declared set for %s on a plan-feature 403, then retries after TTL', (repo, checks) => {
     const readChecks = vi.fn(plan403);
     expect(getRequiredStatusChecks({ repo, cachePath, now: 1000, ttlMs: 1000, readChecks }))
@@ -299,5 +299,30 @@ describe('defaultReadRequiredStatusChecks', () => {
       ['api', 'repos/{owner}/{repo}/branches/main/protection', '--jq', '.required_status_checks.contexts'],
       expect.objectContaining({ encoding: 'utf8' }),
     );
+  });
+});
+
+describe('adding a required check never stalls reviews (live 2026-10-07, `integration`, #4261)', () => {
+  const ok = (name) => ({ name, status: 'completed', conclusion: 'success' });
+  it('the declared fallback names `integration`', async () => {
+    const m = await import('../required-status-checks.mjs');
+    expect(m.FALLBACK_REQUIRED_STATUS_CHECKS).toContain('integration');
+  });
+  it('integration is implied by a green `test`, only when it has no row of its own', async () => {
+    const { withoutImpliedRequiredChecks: w } = await import('../required-status-checks.mjs');
+    const req = ['test', 'integration'];
+    expect(w(req, [ok('test')])).toEqual(['test']);
+    expect(w(req, [])).toEqual(req);
+    expect(w(req, [{ name: 'test', status: 'in_progress' }])).toEqual(req);
+    expect(w(req, [{ name: 'test', status: 'completed', conclusion: 'failure' }])).toEqual(req);
+    expect(w(req, [ok('test'), { name: 'integration', status: 'completed', conclusion: 'failure' }])).toEqual(req);
+  });
+  it('the review gate and the check reducer accept a head that predates the job', async () => {
+    const { reviewCiGate } = await import('../review-ci-gate.mjs');
+    const { reduceCheckState } = await import('../../operations/pr-status.mjs');
+    const req = ['test', 'integration'];
+    expect(reviewCiGate({ headSha: 'a'.repeat(40), requiredChecks: req, checks: [ok('test')] }).allowed).toBe(true);
+    expect(reviewCiGate({ headSha: 'a'.repeat(40), requiredChecks: req, checks: [] }).allowed).toBe(false);
+    expect(reduceCheckState([ok('test')], req).state).toBe('green');
   });
 });

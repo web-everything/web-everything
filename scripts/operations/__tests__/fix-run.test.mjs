@@ -13,7 +13,7 @@ import { parseFixRunArgv, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED
 const MIN = 60_000;
 let clock = 1_000_000;
 const ledger = () => { let v = {}; return { read: () => v, write: (x) => { v = x; } }; };
-const codexGate = () => createFixBorrowGate({
+const codexGate = () => createFixBorrowGate({ sample: () => ({ ok: false }),
   env: {}, settings: { enabled: true, afterMinutes: 15, executor: 'codex' }, ledger: ledger(), now: () => clock,
   loadavg: () => 1, cpuCount: () => 12, caps: { claude: 1, external: 4 },
   launcherAvailable: (e) => fixLauncherAvailable(e),

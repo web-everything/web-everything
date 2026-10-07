@@ -1,6 +1,8 @@
 import { configDefaults, defineConfig } from 'vitest/config';
 import { hermeticGitEnv, maxTestWorkers, weAlias } from './vitest.shared';
 import { TRUST_CHAIN_TIER_FILES } from './scripts/lib/trust-chain-tier.mjs';
+import { cacheEnabled as testCacheEnabled } from './scripts/lib/test-result-cache.mjs';
+import ShadowReporter from './scripts/test-cache/shadow-reporter.mjs';
 
 export default defineConfig({
   // Mirror vite.config.mts so .tsx files (the shared mapping fixtures + conformance suites)
@@ -21,6 +23,10 @@ export default defineConfig({
     // `action-cli.test.mjs`/`action-records.test.mjs` rely on: their `createActionStore()` calls take no
     // explicit root, so without it they would write real attempts to `~/workspace/.operations/coordination`.
     setupFiles: ['./vitest.setup.ts'],
+    // prepare-124 S2: SHADOW-ONLY test-result cache. The reporter never skips or changes a test; it records "would
+    // skip" next to the real outcome in ~/.cache/we-vitest-results. Absent under CI / GITHUB_ACTIONS / WE_TEST_CACHE=0
+    // (no reporter is even constructed). A CLI `--reporter=...` replaces this list, so such runs are not logged.
+    reporters: ['default', ...(testCacheEnabled(process.env) ? [new ShadowReporter()] : [])],
     // tmp-leak fix: one private temp root per run, leak count reported + root removed at teardown
     // (scripts/lib/test-tmp-root.mjs; WE_TMP_LEAK_MODE / WE_TMP_LEAK_MAX).
     globalSetup: ['./vitest.globalSetup.mjs'],

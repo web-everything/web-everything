@@ -1243,7 +1243,7 @@ export function renderSpendLines(run) {
  *          ownedBy?: (string|null)}} outcome
  * @returns {object}
  */
-export function outcomePayload({ run, stopped, error = null, applied = [], ownedBy = null }) {
+export function outcomePayload({ run, stopped, error = null, applied = [], ownedBy = null, step = null }) {
   // #3316 — THE SKILL THAT OWNS THE REST OF THE RUN, for the headless caller. The engine stamps it onto
   // `pending`, so a suspend carries it on the record itself and every route that echoes the record gets it
   // free. That is not enough on its own: a `step-refused` stop clears `pending`, and a refusal is exactly the
@@ -1255,6 +1255,9 @@ export function outcomePayload({ run, stopped, error = null, applied = [], owned
   const owner = run.pending?.ownedBy ?? ownedBy ?? null;
   return {
     runId: run.id, op: run.op, stopped, applied,
+    // WHICH STEP refused — carried on a `step-refused` stop so a headless caller (the build daemon) can name it
+    // instead of reporting "no verdict". Omitted on every other stop, so their payloads stay byte-identical.
+    ...(stopped === 'step-refused' && step ? { step: String(step) } : {}),
     ...(owner ? { ownedBy: owner } : {}),
     // #3073 — WHICH effects are still going, so a consumer does not have to re-scan `run.effects` to find out
     // why a parked run is parked.

@@ -416,7 +416,7 @@ it('x6n7c2p required checks before review — default job four-tick soak spends 
     });
     dispatched.push(out.dispatched.length);
     if (conclusion !== 'success') {
-      expect(out.notStarted).toEqual([{ prNumber: 3432, reason: 'review-ci: required-checks-not-successful' }]);
+      expect(out.notStarted).toEqual([{ prNumber: 3432, reason: expect.stringMatching(/^review-ci: required-checks-not-successful: daemon-soak=\w+$/) }]);
       expect(rounds).toEqual([]);
       expect(spawns).toBe(0);
       expect(readJobRecord('review-3432', dir)).toBeNull();

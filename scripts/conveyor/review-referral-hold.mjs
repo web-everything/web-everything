@@ -14,6 +14,7 @@ import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authors
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
+import { parseReviewedSha } from '../lib/review-escalation.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
@@ -139,7 +140,25 @@ export function resolveSameHeadMaxReviews(env = process.env) {
   return /^\d+$/.test(value ?? '') && Number.isSafeInteger(max) && max > 0 ? max : 1;
 }
 
-export function decideSameHeadHold(pr, runs, { repo, env = process.env } = {}) {
+/** Extra automatic review runs allowed on one head when none of the prior runs left a verdict on the PR. */
+export const VERDICT_RETRY_EXTRA = 2;
+/** A just-finished run gets this long for its verdict write-back to show up in the (cached) PR listing. */
+export const VERDICT_GRACE_MS = 10 * 60_000;
+const VERDICT_LABELS = ['review:accepted', 'review:changes', 'review:human'];
+
+/**
+ * True when `last` (a completed review run on the PR's current head) left NO visible verdict: the PR still holds
+ * only `review:pending`, and no `reviewed-sha` accept marker names this head. Pure.
+ */
+export function verdictNeverLanded(pr, last, now = Date.now()) {
+  if (!last || !Number.isFinite(last.completedAt) || now - last.completedAt < VERDICT_GRACE_MS) return false;
+  const names = (pr?.labels ?? []).map(l => (typeof l === 'string' ? l : l?.name));
+  if (!names.includes('review:pending') || names.some(n => VERDICT_LABELS.includes(n))) return false;
+  const head = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
+  return !(head && parseReviewedSha(pr?.comments) === head);
+}
+
+export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now() } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)
@@ -149,8 +168,15 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env } = {}) {
   const wake = wakeTime(pr, last);
   const count = history.filter(r => r.startedAt >= wake).length;
   if (count < max) return null;
+  // A completed run whose verdict NEVER LANDED on the PR (GitHub refused the comment/label write; live 2026-10-07,
+  // #4288: GraphQL error as the review finished, so the PR stayed `review:pending` with no verdict and this hold
+  // then silenced it forever, unlogged) did not review the head in any way the PR can see. Re-arm it ourselves,
+  // bounded to VERDICT_RETRY_EXTRA extra runs, and past that keep the hold with an explicit reason.
+  const noVerdict = verdictNeverLanded(pr, last, now);
+  if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
   const head = pr.headRefOid;
-  const why = `${REFERRAL_HOLD_MARKER} head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`;
+  const why = `${REFERRAL_HOLD_MARKER} head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
+    + (noVerdict ? ` (no verdict ever landed on the PR for those runs, and the ${VERDICT_RETRY_EXTRA} automatic re-runs are spent: a person must look at why the review's write-back fails)` : '');
   return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count,
     why, retryAt: null, persistenceFailed: false, exhausted: false };
 }

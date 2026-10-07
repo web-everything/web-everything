@@ -1,0 +1,8 @@
+{
+  "deny": [
+    { "pattern": "scripts/__tests__/check-standards*.test.mjs", "reason": "runs the real gate against the whole checkout (cwd: ROOT)" },
+    { "pattern": "scripts/**/check-backlog-item*.test.mjs", "reason": "reads and runs against the whole checkout" },
+    { "pattern": "scripts/**/learnings-drop.test.mjs", "reason": "touches the real learnings pool under $HOME" }
+  ],
+  "allow": []
+}

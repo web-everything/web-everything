@@ -11,6 +11,9 @@ import { addOverlay } from '../daemon-overlays.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { smokePassKey, smokePassIdentity, smokePassTtlMs } from '../daemon-rebuild/smoke.mjs';
 
+// Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
+process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
+
 const tempDirs = [];
 function mktemp(prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix));

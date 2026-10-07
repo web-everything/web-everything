@@ -75,3 +75,30 @@ describe('daemon-silent — evaluate() basics', () => {
     expect(r.measure.judgedOn).toBe('last tick line');
   });
 });
+
+describe('daemon-silent — live 2026-10-07: slow ticks must not teach the watchdog to tolerate the stall', () => {
+  // The fix daemon ticked 12:58, 13:03, then 13:38Z (one 35-minute tick: every gh call starved), then nothing.
+  // Its heartbeat timer kept the lease fresh between blocking calls, so only the tick gap can catch it.
+  const T = Date.parse('2026-10-07T14:05:00Z');
+  const lease = { log: 'fix-dispatch-daemon', pid: 67216, pidAlive: true, heartbeatAt: T - 1 * MINUTE };
+  const mem = {
+    ticksSeen: 4, intervalMs: 30_000, lastGrowthAt: T - 2 * MINUTE, lastTickAt: Date.parse('2026-10-07T13:38:36Z'),
+    recentTicks: [{ at: Date.parse('2026-10-07T13:38:36Z') }],
+  };
+
+  it('a 26-minute silence breaches at the default 30-minute ceiling (old code: 3 x 60 min observed gap = 180 min, no breach)', () => {
+    const [r] = daemonSilent.evaluate({ leases: [lease] }, { now: T, daemons: { 'fix-dispatch-daemon': mem } });
+    expect(r.measure.silentForMin).toBe(26);
+    expect(r.measure.thresholdMin).toBeLessThanOrEqual(30);
+    expect(r.breach).toBe(false); // 26 < 30: not yet...
+    const [later] = daemonSilent.evaluate({ leases: [lease] }, { now: T + 5 * MINUTE, daemons: { 'fix-dispatch-daemon': mem } });
+    expect(later.breach).toBe(true); // ...31 min: flagged, where old code waited until 3 h
+  });
+
+  it('the floor and the ceiling are knobs in the health config', () => {
+    const config = { daemonSilentMinMs: 5 * MINUTE, daemonSilentCeilingMs: 15 * MINUTE };
+    const [r] = daemonSilent.evaluate({ leases: [lease] }, { now: T, daemons: { 'fix-dispatch-daemon': mem }, config });
+    expect(r.measure.thresholdMin).toBe(15);
+    expect(r.breach).toBe(true);
+  });
+});

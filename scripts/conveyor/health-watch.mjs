@@ -50,7 +50,7 @@ import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { readGit } from '../lib/proc-read.mjs';
 import { execFileSync, spawn } from 'node:child_process';
 import {
-  existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, openSync, readSync, closeSync, unlinkSync,
+  existsSync, mkdirSync, readFileSync, readdirSync, statSync, realpathSync, writeFileSync, renameSync, openSync, readSync, closeSync, unlinkSync,
 } from 'node:fs';
 import { homedir, loadavg, cpus, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -231,21 +231,57 @@ export function probeDaemonLogs(logsDir, cursors = {}, { only = null } = {}) {
   return { samples: out, cursors: nextCursors };
 }
 
-/** Local run evidence only; fixture ticks never inspect host records. */
-export function probeOperationRuns({ roots = [REPO_ROOT, ...daemonCloneRoots(workspaceOf(REPO_ROOT))], jobsRoot = daemonJobsRoot() } = {}) {
+/** Run records older than this are never read: the smells that consume them look back 6 h at most. */
+export const OPERATION_RUNS_MAX_AGE_MS = 7 * 3_600_000;
+/** A single run record bigger than this is skipped (live review runs reach ~4 MB; nothing legitimate is 8x that). */
+export const OPERATION_RUNS_MAX_FILE_BYTES = 8 * 1024 * 1024;
+/** At most this many (newest) records are parsed per tick, whatever the directories hold. */
+export const OPERATION_RUNS_MAX_RECORDS = 1500;
+/** At most this many bytes of record text are parsed per tick, so the tick's memory is bounded by a constant. */
+export const OPERATION_RUNS_MAX_TOTAL_BYTES = 192 * 1024 * 1024;
+
+/**
+ * Local run evidence only; fixture ticks never inspect host records. BOUNDED: the run directories grow without
+ * limit (live: ~80,000 records, several GB, across the clone roots), and reading them all OOM-killed the tick. So
+ * only stat each entry (cheap), keep the newest records inside the look-back window, and parse at most
+ * `maxRecords` / `maxTotalBytes` of them. Directories are de-duplicated by real path (a symlinked checkout).
+ */
+export function probeOperationRuns({
+  roots = [REPO_ROOT, ...daemonCloneRoots(workspaceOf(REPO_ROOT))], jobsRoot = daemonJobsRoot(),
+  nowMs = Date.now(), maxAgeMs = OPERATION_RUNS_MAX_AGE_MS, maxFileBytes = OPERATION_RUNS_MAX_FILE_BYTES,
+  maxRecords = OPERATION_RUNS_MAX_RECORDS, maxTotalBytes = OPERATION_RUNS_MAX_TOTAL_BYTES,
+} = {}) {
   const dirs = roots.map((root) => join(root, '.operations', 'runs'));
   if (jobsRoot && existsSync(jobsRoot)) {
     for (const entry of readdirSync(jobsRoot, { withFileTypes: true })) {
       if (entry.isDirectory()) dirs.push(join(jobsRoot, entry.name));
     }
   }
-  const records = [];
-  for (const dir of new Set(dirs)) {
+  const real = new Set();
+  const candidates = [];
+  for (const dir of dirs) {
     if (!existsSync(dir)) continue;
-    for (const name of readdirSync(dir).filter((n) => n.endsWith('.json'))) {
-      const rec = readJson(join(dir, name), null);
-      if (rec) records.push(rec);
+    let key = dir;
+    try { key = realpathSync(dir); } catch { /* keep the given path */ }
+    if (real.has(key)) continue;
+    real.add(key);
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith('.json')) continue;
+      const path = join(dir, name);
+      let st;
+      try { st = statSync(path); } catch { continue; }
+      if (nowMs - st.mtimeMs > maxAgeMs || st.size > maxFileBytes) continue;
+      candidates.push({ path, mtimeMs: st.mtimeMs, size: st.size });
     }
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const records = [];
+  let bytes = 0;
+  for (const c of candidates) {
+    if (records.length >= maxRecords || bytes + c.size > maxTotalBytes) break;
+    const rec = readJson(c.path, null);
+    bytes += c.size;
+    if (rec) records.push(rec);
   }
   return records;
 }

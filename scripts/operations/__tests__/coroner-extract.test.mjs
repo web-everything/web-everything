@@ -284,6 +284,7 @@ describe('coroner error rates (reported first)', () => {
     expect(fetchCiRuns({ since, until }, () => (++n, { workflow_runs: Array.from({ length: 100 }, (_, i) => ({ id: i, conclusion: 'success' })) }), { maxPages: 2 })).toMatchObject({ calls: 2, truncated: true });
     expect(ciCheckName('CodeQL / Analyze')).toBe('CodeQL');
     expect(ciCheckName('daemon-soak (1/2)')).toBe('daemon-soak');
+    expect(ciCheckName('integration')).toBe('integration');
   });
 
   it('fix/ci-heal sessions: outcomes with causes and rounds per PR', () => {

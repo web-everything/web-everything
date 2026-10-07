@@ -830,8 +830,8 @@ describe('failingRequiredCheckForAttribution — every required check, not test 
   const row = (name, conclusion, completedAt) => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion, completedAt });
   const pr = (...rows) => ({ number: 2783, statusCheckRollup: rows });
 
-  it('defaults to the required contexts test / smoke / daemon-soak', () => {
-    expect(DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS).toEqual(['test', 'smoke', 'daemon-soak']);
+  it('defaults to the required contexts test / smoke / daemon-soak / integration', () => {
+    expect(DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS).toEqual(['test', 'smoke', 'daemon-soak', 'integration']);
   });
 
   it('DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS is the SAME binding as required-status-checks.mjs\'s FALLBACK (#4501 — never a second hardcoded copy)', async () => {

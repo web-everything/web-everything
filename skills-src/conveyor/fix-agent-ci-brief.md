@@ -126,7 +126,7 @@ your clone opens at the exact HEAD that was pushed:
 ```bash
 export LANE_SESSION={{SESSION_SLUG}}
 LANE=$(node "{{WE_ROOT}}/scripts/lane-pool.mjs" acquire --repo={{LANE_REPO}} --lane={{LANE}} --purpose=conveyor-ci-heal \
-  --session={{SESSION_SLUG}} --scope={{SCOPE}} --base={{LANE_REF}}) && cd "$LANE"
+  --session={{SESSION_SLUG}} --scope='{{SCOPE}}' --base={{LANE_REF}}) && cd "$LANE"
 ```
 
 - `--base={{LANE_REF}}` lands the clone on the pushed lane tip, so you **reuse the built work** — you are healing a

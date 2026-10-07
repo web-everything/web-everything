@@ -189,7 +189,10 @@ export const DAEMON_MANIFEST = {
   // 5-minute tick; the script's own watchdog caps a tick at 3x its 60 s budget and writes its own
   // last-tick-completed stamp. Runs from its OWN dedicated clone (4065 Fork 1) with self-sync set explicitly in
   // its plist — see we:skills-src/conveyor/launchd/com.we.health-watch.plist.example.
-  'health-watch': { script: 'scripts/conveyor/health-watch.mjs', args: ['tick'], intervalMs: HEALTH_WATCH_INTERVAL_MS },
+  'health-watch': { script: 'scripts/conveyor/health-watch.mjs', args: ['tick'], intervalMs: HEALTH_WATCH_INTERVAL_MS,
+    // Who watches the watcher: the health watch cannot report its own death, so pass-daemon alerts the operator
+    // after N consecutive failed ticks (`WE_PASS_FAILURE_ALERT_AFTER`, default 2). See pass-daemon.mjs.
+    alertOnConsecutiveFailures: true },
   // Card 106 — durable schedules (we:scripts/operations/scheduled-sweep.mjs). Opt-in: `defaultLaunch:false` keeps
   // them out of the supervisor's default set; the operator installs them with install-scheduled-sweeps.mjs.
   'pr-movement-sweep': { script: 'scripts/operations/scheduled-sweep.mjs', args: ['run', 'pr-movement'], intervalMs: 30 * 60_000, defaultLaunch: false },

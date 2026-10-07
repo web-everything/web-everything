@@ -14,7 +14,7 @@ const memLedger = () => { let v = {}; return { read: () => v, write: (x) => { v 
 const ON = { enabled: true, afterMinutes: 15, executor: 'claude' };
 let clock;
 const gateWith = (o = {}) => createFixBorrowGate({
-  env: {}, settings: ON, ledger: memLedger(), now: () => clock, loadavg: () => 1, cpuCount: () => 12,
+  env: {}, settings: ON, ledger: memLedger(), now: () => clock, sample: () => ({ ok: false }), loadavg: () => 1, cpuCount: () => 12,
   caps: { claude: 1, external: 4 }, ...o,
 });
 const MIN = 60_000;
@@ -56,7 +56,7 @@ describe('createFixBorrowGate', () => {
   const waited = (g) => { g.consider({ pr: 7 }); clock += 16 * MIN; return g.consider({ pr: 7 }); };
   it('does not borrow when the host is loaded', () => {
     clock = 1_000_000;
-    expect(waited(gateWith({ loadavg: () => 36 }))).toMatchObject({ borrow: false });
+    expect(waited(gateWith({ sample: () => ({ ok: false }), loadavg: () => 36 }))).toMatchObject({ borrow: false });
   });
   it('does not borrow when the builder has no free slot (a build is running) and never takes a taken one', () => {
     clock = 1_000_000;
@@ -79,8 +79,8 @@ describe('createFixBorrowGate', () => {
 });
 
 describe('runReconcileFixDispatch borrows a builder slot', () => {
-  const full = () => createDispatchThrottle({ loadavg: () => 1, cpuCount: () => 12, env: {}, listClaims: () => [claim('fix', 1), claim('ci-heal', 2)] });
-  const hot = () => createDispatchThrottle({ loadavg: () => 36, cpuCount: () => 12, env: {}, listClaims: () => [] });
+  const full = () => createDispatchThrottle({ sample: () => ({ ok: false }), loadavg: () => 1, cpuCount: () => 12, env: {}, listClaims: () => [claim('fix', 1), claim('ci-heal', 2)] });
+  const hot = () => createDispatchThrottle({ sample: () => ({ ok: false }), loadavg: () => 36, cpuCount: () => 12, env: {}, listClaims: () => [] });
   const run = (o) => runReconcileFixDispatch({
     root: '/repo', dispatch: vi.fn((e) => ({ pr: e.pr, lane: e.lane })), tryResume: () => ({ resumed: false, resumeAttempt: null }),
     reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: 7, headRefName: 'lane/7-x' }], refusals: [] }),
@@ -130,7 +130,7 @@ describe('runReconcileFixDispatch borrows a builder slot', () => {
     expect(dispatch).not.toHaveBeenCalled();
     expect(r.refusals).toContainEqual(expect.objectContaining({ pr: 7, kind: 'host-load' }));
     // and the cap-full case under load: the gate itself refuses on load
-    const loaded = gateWith({ loadavg: () => 36 });
+    const loaded = gateWith({ sample: () => ({ ok: false }), loadavg: () => 36 });
     clock = 1_000_000; loaded.consider({ repo: 'we', pr: 7 }); clock += 16 * MIN;
     const d2 = vi.fn();
     run({ dispatchThrottle: full(), borrowGate: loaded, dispatch: d2 });

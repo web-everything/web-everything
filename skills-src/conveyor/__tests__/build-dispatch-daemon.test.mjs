@@ -1230,6 +1230,13 @@ describe('kill switch + dispatch outcome', () => {
     expect(readKillSwitch({ env: { [KILL_SWITCH_ENV]: '1' } }).engaged).toBe(true);
     expect(readKillSwitch({ env: {}, killFileExists: true, killFilePath: '/k' })).toEqual({ engaged: true, reason: 'kill file /k' });
   });
+  it('names the refusing step and its reason for a step-refused stop, never just "no verdict"', () => {
+    const out = readDispatchOutcome(JSON.stringify({ runId: 'r', op: 'dispatch-lane', stopped: 'step-refused', step: 'read', applied: [], verdict: null, error: 'dispatch-lane: the value for {{SCOPE}} ("we:a/b*.mjs") has characters the brief cannot carry safely' }));
+    expect(out.dispatching).toBe(false);
+    expect(out.reason).toMatch(/^step-refused at `read`: dispatch-lane: the value for \{\{SCOPE\}\}/);
+    expect(out.reason).not.toMatch(/no verdict/);
+    expect(out.stepRefused).toMatchObject({ step: 'read' });
+  });
   it('finds the nested dispatch verdict and fails closed on junk', () => {
     expect(readDispatchOutcome(JSON.stringify({ run: { verdict: { dispatching: true, lane: 3 }, effects: [{ type: 'conveyor.dispatch-delivery-agent', status: 'in-flight', handle: 'session-123' }] } }))).toMatchObject({ dispatching: true, lane: 3 });
     expect(readDispatchOutcome('not json').dispatching).toBe(false);

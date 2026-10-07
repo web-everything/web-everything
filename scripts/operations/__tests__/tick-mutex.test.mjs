@@ -3,11 +3,12 @@ import { it, expect, beforeEach } from 'vitest';
 import { mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
+import { ensureTestTmpDir } from '../../lib/test-tmp-root.mjs';
 import { tryAcquireTickMutex, withTickMutex } from '../tick-mutex.mjs';
 let clock, root;
 const acquire = (driverId, options = {}) => tryAcquireTickMutex({ root, owner: { driverId, pid: 42, host: 'test' }, tickId: `${driverId}#1`,
   now: () => clock, staleMs: 10, maxHoldMs: 100, isPidAlive: () => true, ...options });
-beforeEach(() => { clock = 100; root = process.env.WE_COORDINATION_ROOT; });
+beforeEach(() => { clock = 100; root = ensureTestTmpDir('WE_COORDINATION_ROOT'); });
 it('is exclusive, nonblocking, and release is idempotent', () => {
   const a = acquire('a');
   expect(a.ok).toBe(true);

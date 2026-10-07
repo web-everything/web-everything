@@ -2,7 +2,7 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
-  findCarriedOperatorRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
+  findCarriedOperatorRuling, findCarriedReviewerRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
   findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
@@ -535,6 +535,8 @@ const PRE_WRITE_REFUSALS = Object.freeze([
 // Keep v1's identity-bearing fields intact: old readers recompute the key from them.
 // In particular, a huge summary/key cannot be hashed away without breaking those readers.
 const referralHash = (text) => createHash('sha256').update(text).digest('hex');
+/** Parks a re-ask of a carried finding whose backing was withdrawn: it is asked once, then held for a person. */
+const WITHDRAWN_CARRY_REASK = 'withdrawn carry: the reviewer was asked once more for a carried finding whose backing no longer stands';
 function boundedReferral(original, source) {
   const bounded = { ...original };
   for (const [field, value] of Object.entries(original)) {
@@ -843,8 +845,12 @@ export function createReviewPrSinks({
                 || (stillPending && record.rulings.some(r => r.key === f.key) && !stillPending.has(f.key))
                 || operatorRulings.some(o => o.repo === record.repo && o.pr === record.pr
                   && o.head === record.head && o.runId === record.runId && o.key === f.key)) continue;
+              // #76c — else the mandatory reviewer's own counted not-real/card on the same deterministic finding
+              // identity (never a block, never a declared link); the same unchanged-lines proof applies below.
               const match = findCarriedOperatorRuling(f, { records, operatorRulings,
-                head: record.head, repo: record.repo, pr: record.pr });
+                head: record.head, repo: record.repo, pr: record.pr })
+                ?? findCarriedReviewerRuling(f, { records, operatorRulings, head: record.head, repo: record.repo,
+                  pr: record.pr, body: state.body ?? '', createdAt: state.createdAt ?? '', cardReadable });
               if (!match) continue;
               // `referralRecordState` keeps a carried `card` pending while its card is unreadable, yet `liveReferrals`
               // drops a carried finding from dispatch: that pairing would hold the gate with no reviewer to clear it.
@@ -873,27 +879,39 @@ export function createReviewPrSinks({
             existing[i] = updated;
             for (const c of carried) {
               const f = record.referrals.find(f => f.key === c.key).finding;
-              out(`referral carried: ${f.file ?? ''}${f.line == null ? '' : `:${f.line}`} — operator ${c.result} from ${c.from.head.slice(0, 8)} stands (cited lines unchanged)`);
+              out(`referral carried: ${f.file ?? ''}${f.line == null ? '' : `:${f.line}`} — ${c.from.rulingId !== undefined ? 'reviewer' : 'operator'} ${c.result} from ${c.from.head.slice(0, 8)} stands (cited lines unchanged)`);
             }
           }
         }
         // Persist the attempt before dispatch. A crash or timeout spends this set's single automated attempt.
         for (const initial of existing) {
-          if (initial.attempted || !liveReferrals(initial).length) continue;
+          // A record already attempted (or parked on a failure) is never re-asked wholesale; only a carried finding
+          // whose backing was withdrawn since (below) is asked again, once.
+          if (initial.attempted && (initial.failure || !(initial.carried ?? []).length)) continue;
+          if (!liveReferrals(initial).length && !(initial.carried ?? []).length) continue;
           const records = readReferralRecords(state.comments, context(state)).records;
           const initialState = referralRecordState(initial, { ...context(state), records,
             // #4979 — an operator ruling already settled these findings; never spend the automated attempt on them.
             operatorRulings: readOperatorRulings(state.comments, context(state)).rulings });
           if (!initialState.pending.length) continue;
+          // A carry the gate holds pending no longer stands (its backing was withdrawn: a later block, a superseded or
+          // re-ruled source, an unreadable card). `liveReferrals` drops carried keys from dispatch, so without this the
+          // hold would have no owner and no automatic way out — the reviewer rules the finding afresh instead.
+          const withdrawn = new Set((initial.carried ?? [])
+            .filter(c => initialState.pending.includes(c.key) && !initial.rulings.some(r => r.key === c.key)).map(c => c.key));
+          const reask = initial.attempted;
+          const askable = liveReferrals(initial, { withdrawn }).filter(f => !reask || withdrawn.has(f.key));
           // #76b — one ruling per finding per head: a finding whose id already holds a counted block on this head is
           // blocked by that ruling (`linkedBlockedFindingIds`), so the reviewer is never asked about it again. The rest
           // go out with their own `findingId` and the PR's identity table, so the reviewer can link a re-wording.
           const identityTable = findingIdentityTable(records);
           const linkedKeys = new Set(initialState.rulings.filter(r => r.linked).map(r => r.key));
-          const ask = liveReferrals(initial).filter(f => !linkedKeys.has(f.key))
+          const ask = askable.filter(f => !linkedKeys.has(f.key))
             .map(f => ({ ...f, findingId: findingIdOf(identityTable, { head: initial.head, runId: initial.runId, key: f.key }) }));
           if (!ask.length) continue;
-          let record = { ...initial, attempted: true };
+          // A re-ask of a withdrawn carry spends its single attempt the same way, with a durable marker (cleared when
+          // the reviewer answers): a crash or an omitted ruling leaves the record parked, never asked again.
+          let record = { ...initial, attempted: true, ...(reask ? { failure: WITHDRAWN_CARRY_REASK } : {}) };
           state = persist(record);
           // Hold before dispatch too: an exhausted or interrupted worker must leave a visible owner.
           if (!labelNames(state.labels).includes('review:human')) {
@@ -931,13 +949,19 @@ export function createReviewPrSinks({
               if (!f || !FINDING_ID_PATTERN.test(sameAs ?? '') || sameAs === f.findingId) return undefined;
               return sameAsLinkAllowed(identityTable.find(e => e.findingId === sameAs), f.original) ? sameAs : undefined;
             };
-            const rulings = (answer.value?.rulings ?? []).map(({ sameAs, ...r }, i) => {
+            // A re-ask lands on a record that already holds rulings (`runId:0`…): number past them, or the duplicate id
+            // makes the whole record invalid and the answer is lost.
+            const takenIds = new Set(record.rulings.map(r => r.id));
+            let nextId = 0;
+            const rulings = (answer.value?.rulings ?? []).map(({ sameAs, ...r }) => {
               const link = sameAsFor(r.key, sameAs);
               if (link) out(`referral linked: ${r.key} sameAs ${link}`);
-              return { ...r, ...(link ? { sameAs: link } : {}), id: `${record.runId}:${i}`,
-                reviewerId: record.reviewer.id, lens: record.reviewer.lens };
+              while (takenIds.has(`${record.runId}:${nextId}`)) nextId++;
+              const id = `${record.runId}:${nextId}`;
+              takenIds.add(id);
+              return { ...r, ...(link ? { sameAs: link } : {}), id, reviewerId: record.reviewer.id, lens: record.reviewer.lens };
             });
-            const completed = { ...record, rulings };
+            const completed = { ...record, rulings: [...record.rulings, ...rulings] };
             if (!validateReferralRecord(completed)) throw new Error('incomplete or malformed mandatory rulings');
             // Preserve every ruling that fits; omitted rulings leave their keys pending in all
             // existing readers. Never lose an otherwise durable batch to one verbose answer.
@@ -953,6 +977,11 @@ export function createReviewPrSinks({
             // The attempted record is already durable; no second automatic dispatch on resume.
             record = { ...record, failure: String(error.message).slice(0, 400) };
             out(`Mandatory referral review parked: ${error.message}`);
+          }
+          // The re-ask marker only parks a re-ask that produced no ruling: an answered one leaves no failure behind.
+          if (record.failure === WITHDRAWN_CARRY_REASK && ask.every(f => record.rulings.some(r => r.key === f.key))) {
+            const { failure, ...answered } = record;
+            record = answered;
           }
           state = persist(record);
         }

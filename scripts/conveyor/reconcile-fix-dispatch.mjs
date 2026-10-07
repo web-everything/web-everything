@@ -1425,6 +1425,7 @@ export function runReconcileFixDispatch({
   for (const entry of planned) {
     // fix-cap / host-load — defer BEFORE any claim, resume or lane pop; the PR simply waits for a later pass.
     const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix') : { admit: true };
+    if (t.admit && t.note) console.error(`reconcile-fix-dispatch: PR #${entry.pr} fix launch admitted: ${t.note}`);
     // Card 87 — ONLY the fixer cap may be borrowed past (never host-load, never a scope wait: those never get here).
     let borrowed = null;
     if (!t.admit) {
