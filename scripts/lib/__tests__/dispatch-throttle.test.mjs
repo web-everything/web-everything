@@ -73,7 +73,7 @@ describe('wired into the dispatchers', () => {
     const dispatch = vi.fn();
     try {
       const result = await runReconcileCiHealDispatch({
-        root: '/repo', dispatchThrottle: full(), dispatch, queueAdmission: null, salvage: async () => null,
+        root: '/repo', dispatchThrottle: full(), ciHealReserve: null, dispatch, queueAdmission: null, salvage: async () => null,
         reconcile: () => ({ dispatch: [{ kind: 'ci-heal', prNumber: 9, headRefName: 'lane/x', headRefOid: 'a'.repeat(40) }], refusals: [] }),
         checkStaleness: () => ({ fresh: true, behind: 0 }), flushOwed: () => ({}), pollAttempts: () => [],
         flushTimeouts: async () => [], timeoutHold: () => null,
