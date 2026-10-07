@@ -298,7 +298,16 @@ node scripts/converge-cli.mjs init --lane="$LANE" --state="$STATE" --care=elevat
   panel size, or a ledger yourself — that is exactly the un-bounded prose loop this step replaces.
 - **`land`** — a non-author panel accepted the final diff and an independent red-team failed to break it;
   proceed to the PR.
-- **This step stays ADVISORY — an `escalate` never blocks PR-open.** Blocking would gate every drain lane,
+- **RISKY code PRs MUST have a receipt — `open-pr` refuses without one** (`prePrReview.mode` in
+  `we:scripts/pre-pr-review-settings.json`: `off`|`advise`|`enforce`; this repo is `enforce`). A PR is risky when
+  ANY of: more than 264 lines, more than 2 subsystems, more than 5 files, no prepared card in the diff, or an
+  operator-agent builder. A card-only PR, or a small prepared conveyor PR, is unaffected. **Run `/converge`
+  WHILE the step-5 verify is running** (the verify wait is 4-9 minutes anyway), fix its findings in this session,
+  commit, then on the final committed head stamp the receipt:
+  `node scripts/converge-cli.mjs receipt --lane="$LANE" --state="$STATE"` (it only stamps a run that ended in `land`
+  and a clean tracked tree; any later edit changes the tree and voids it). This ADDS to the post-PR review gate; it
+  never replaces it. A bypass is `--skip-pre-pr-review=<reason>` on `open-pr` and the reason is recorded.
+- **Outside that gate this step stays ADVISORY — an `escalate` never blocks PR-open.** Blocking would gate every drain lane,
   doc-only lane, and the lane shipping this very change (the reason #2971 dropped its `pr-land` refusal).
   `escalate` is **terminal for this run** — the core already spent its round budget resolving what it could
   before landing on it, so do not hand-invoke another `init`/`step` cycle hoping for a different answer. On

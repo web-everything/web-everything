@@ -47,6 +47,7 @@ import {
   applyJurorInvite,
   buildEscalationPacket,
 } from './lib/converge-core.mjs';
+import { gitDirOf, treeOf, buildReceipt, RECEIPT_FILE } from './lib/pre-pr-review.mjs';
 import { resolveTransport, validateLaneTarget } from './lib/converge-transports.mjs';
 import { MANDATORY_LENSES, PANEL_LENSES, panelRigorForCareLevel } from './lib/jury-core.mjs';
 import { CARE_LEVELS } from './lib/review-escalation.mjs';
@@ -401,7 +402,8 @@ function step(flags) {
   });
 
   const result = convergeStep(state, obs);
-  writeState(path, { ...envelope, state: result.state, carry: carryFor(result.state.round, result.findings) });
+  // `final` records HOW the loop ended (land | escalate) so `receipt` can refuse anything but a landed run.
+  writeState(path, { ...envelope, state: result.state, carry: carryFor(result.state.round, result.findings), ...(result.state.done ? { final: result.action } : {}) });
 
   /** Build the caller's next instruction — the ONE place an action becomes something to run. */
   const instruction = {};
@@ -451,12 +453,36 @@ function step(flags) {
   }, null, 2)}\n`);
 }
 
+/**
+ * `receipt` — after a converge run ended in `land`, stamp the lane's COMMITTED head tree so `open-pr` can see the
+ * pre-PR review ran on exactly this content (we:scripts/lib/pre-pr-review.mjs). Refuses an unfinished or escalated
+ * run, and a dirty tracked tree (the receipt would not describe what gets pushed).
+ */
+function receipt(flags) {
+  const path = statePath(flags, { mustExist: true });
+  const envelope = readState(path);
+  if (envelope.final !== CONVERGE_ACTIONS.LAND) {
+    return fail(`no receipt: the converge run did not end in \`land\` (final: ${envelope.final ?? 'unfinished'}). Finish the loop first.`);
+  }
+  const lane = typeof flags.lane === 'string' && flags.lane.trim() ? resolve(flags.lane) : envelope.ctx?.laneRoot;
+  if (!lane || !existsSync(lane)) return fail('--lane=<path> is required (or a state file that recorded it)');
+  const dirty = gitAt(lane, ['status', '--porcelain', '--untracked-files=no']);
+  if (dirty === null) return fail(`not a git checkout: ${lane}`);
+  if (dirty.trim()) return fail('no receipt: the lane has uncommitted tracked changes. Commit first, so the receipt covers the head that will be pushed.');
+  const tree = treeOf(lane);
+  const head = gitAt(lane, ['rev-parse', 'HEAD']).trim();
+  const out = resolve(gitDirOf(lane), RECEIPT_FILE);
+  writeFileSync(out, `${JSON.stringify(buildReceipt({ tree, head, envelope }), null, 2)}\n`, 'utf8');
+  process.stdout.write(`${JSON.stringify({ receipt: out, tree, head }, null, 2)}\n`);
+}
+
 function main(argv) {
   const subcommand = argv[0];
   const flags = parseFlags(argv.slice(1));
   if (subcommand === 'init') return init(flags);
   if (subcommand === 'step') return step(flags);
-  return fail(`unknown subcommand "${subcommand || ''}" — expected init | step`);
+  if (subcommand === 'receipt') return receipt(flags);
+  return fail(`unknown subcommand "${subcommand || ''}" — expected init | step | receipt`);
 }
 
 try {

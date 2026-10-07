@@ -81,7 +81,7 @@ export function resolveRef({ ref, branch, derive = () => '' } = {}) {
   return derive();
 }
 
-export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = '', requireVerified = false, dryRun = false } = {}) {
+export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = '', requireVerified = false, dryRun = false, skipPrePrReview = '' } = {}) {
   const prepareItem = prepareItemFromRef(ref);
   if (prepareItem) title = preparePrTitle(prepareItem);
   const problems = [];
@@ -237,6 +237,7 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
       requireVerified: { type: 'boolean', required: false, default: false },
       // Rehearsal: the home prints the exact gh sequence and executes nothing.
       dryRun: { type: 'boolean', required: false, default: false },
+      skipPrePrReview: { type: 'string', required: false, default: '' },
     },
     verdictFrom: 'plan',
 
@@ -246,7 +247,7 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
       // PR #1516's round-1 juror found in `verify`, where the io layer was tested and this layer was not.
       reads: [
         'input.ref', 'input.branch', 'input.base', 'input.title', 'input.bodyFile', 'input.mode', 'input.parkLabel',
-        'input.sha', 'input.requireVerified', 'input.dryRun',
+        'input.sha', 'input.requireVerified', 'input.dryRun', 'input.skipPrePrReview',
       ],
       fn: (view) => planOpen({
         ref: resolveRef({ ref: view.input.ref, branch: view.input.branch, derive: deriveRef }),
@@ -258,6 +259,7 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
         sha: view.input.sha,
         requireVerified: view.input.requireVerified,
         dryRun: view.input.dryRun,
+        skipPrePrReview: view.input.skipPrePrReview,
       }),
     }),
 
@@ -269,7 +271,7 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
       effects: (view) => [{
         type: SUBMIT_PR_EFFECT,
         idempotent: false,
-        payload: { argv: view.verdict.argv, ref: view.verdict.ref, mode: view.verdict.mode },
+        payload: { argv: view.verdict.argv, ref: view.verdict.ref, mode: view.verdict.mode, skipPrePrReview: view.verdict.skipPrePrReview },
       }],
     }),
   });

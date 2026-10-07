@@ -52,6 +52,7 @@ export function resolveGhCredentialEnv({ env = process.env, exists = existsSync,
   }
   return env;
 }
+import { checkPrePrReview } from '../lib/pre-pr-review.mjs';
 import { prepareItemFromRef, preparePrTitle, verifyPreparePr } from './prepare-pr.mjs';
 
 /** The single home. Resolved from THIS file's location, never cwd — the lane being opened is not this repo. */
@@ -64,12 +65,21 @@ export const OPEN_PR_TIMEOUT_MS = 30 * 60 * 1000;
  * The runner the declaration is injected with. ONE spawn; `spawn` is injected so every branch of
  * `classifySubmit` is reachable with no `gh`, no network and no PR.
  */
-export function createPrLandRunner({ spawn = spawnSync, cwd = process.cwd(), env = resolveGhCredentialEnv(),
+export function createPrLandRunner({ prePrReview = checkPrePrReview, spawn = spawnSync, cwd = process.cwd(), env = resolveGhCredentialEnv(),
   git = (args) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }),
 } = {}) {
-  return ({ argv }) => {
+  return ({ argv, skipPrePrReview = '' }) => {
     let r;
     const arg = (name) => argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
+    // Pre-PR review gate (card 2): ADDED before the home's own gates, never instead of them (the post-PR review
+    // gate and the verify finish-guard still run inside pr-land). A rehearsal opens nothing, so it is not gated.
+    if (!argv.includes('--dry-run')) {
+      let gate;
+      try { gate = prePrReview({ cwd, base: arg('base') || 'main', sha: arg('sha') || 'HEAD', env, skip: skipPrePrReview }); }
+      catch (e) { gate = { action: 'pass', why: `check-error: ${e.message}` }; }
+      if (gate.action === 'refuse') return { outcome: 'refused', reason: 'pre-pr-review-missing', detail: gate.message };
+      if (gate.action === 'advise') process.stderr.write(`open-pr: advisory — ${gate.message}\n`);
+    }
     const item = prepareItemFromRef(arg('ref'));
     if (item) {
       try {
@@ -99,7 +109,7 @@ export function createPrLandRunner({ spawn = spawnSync, cwd = process.cwd(), env
 export function createOpenPrSinks({ run = createPrLandRunner() } = {}) {
   return {
     ['open-pr.submit']: async (payload) => {
-      const out = run({ argv: payload.argv });
+      const out = run({ argv: payload.argv, skipPrePrReview: payload.skipPrePrReview });
       // A REQUESTED `--dry-run` classifies as `unrun` too (it opens nothing, by design), but it is not the
       // "environment could not complete" case this throw exists for — the caller asked for a rehearsal and
       // got one. Throwing here misreports a working preview as a failure (found dogfooding this operation's
