@@ -29,6 +29,7 @@
  *
  * IMPURE by construction (`git`, `fs`), which is why every one of those is a parameter.
  */
+import { retryTransientGit } from './git-fetch-retry.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -110,7 +111,7 @@ export function stageOnTransportBranch({
     // below then dies on `fatal: invalid reference`. This helper was extracted from `record-verdict`'s sink as
     // it stood BEFORE that fix landed, so the bare form came with it; naming the destination here is what keeps
     // the extraction from regressing it — and now for EVERY transport that shares this code, not just one.
-    run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board });
+    retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board }));
     // `--force` on the worktree add is about the DIRECTORY, not the branch: a leftover registration from a
     // killed run must not stop this one. The branch itself is taken from the freshly fetched remote tip.
     run(['worktree', 'add', '--force', '--detach', wt, `origin/${branch}`], { cwd: board });
@@ -166,7 +167,7 @@ function readExisting(abs) {
  */
 export function readFromTransportBranch({ board, branch, paths = [], run = defaultGit } = {}) {
   if (!board || !branch) throw new TypeError('git-transport-branch: `board` and `branch` are both required');
-  run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board });
+  retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board }));
   const out = {};
   for (const path of paths) {
     const listed = run(['ls-tree', '--name-only', `origin/${branch}`, '--', path], { cwd: board }).trim();

@@ -22,6 +22,7 @@
  *   node scripts/operations/build-dispatch-hold-route-land.mjs --num=<n> --route=<already-done|out-of-scope>
  *     [--commit=<sha>] [--reason=<text>] [--json]
  */
+import { retryTransientGit } from '../lib/git-fetch-retry.mjs';
 import { machinePrTitle } from './machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -280,7 +281,7 @@ export function landOne({ num, route, commit = null, reason = null }, {
       //      commit never does.
       // A failure on ANY check refuses the auto-resolve entirely — no partial edit, no PR — rather than
       // closing an unbuilt card as done on an unverified claim.
-      runFn('git', ['fetch', 'origin', 'main'], lane);
+      retryTransientGit(() => runFn('git', ['fetch', 'origin', 'main'], lane));
       try {
         runFn('git', ['merge-base', '--is-ancestor', commit, 'origin/main'], lane);
       } catch {

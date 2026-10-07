@@ -85,7 +85,8 @@ export function isReservedLease(lease) {
  * retry ONLY this exact signature; every other fetch failure still throws unretried, exactly as before.
  */
 export function isTransientRefLockError(message) {
-  return /cannot lock ref/i.test(String(message ?? ''));
+  const m = String(message ?? '');
+  return /cannot lock ref/i.test(m) || /unable to create '[^']*\.lock': file exists/i.test(m);
 }
 
 /**
