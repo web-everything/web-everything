@@ -1,12 +1,13 @@
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync, utimesSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync, utimesSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
+import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import {
   classifyAwaitVerdict, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession,
-  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, pushShaFromScratch,
+  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, pushShaFromScratch, claimBindingRefusal,
 } from '../await-verify-pass.mjs';
 
 const SHA = '65a382e81413952ab11e5448e36f01bb7ce4c332';
@@ -173,9 +174,19 @@ describe('runAwaitVerifyPass', () => {
     expect(h.calls.resume).toHaveLength(AWAIT_VERIFY_LIMITS.maxResumeFailures);
     expect(h.store.size).toBe(0);
   });
-  it('a vanished session after a green push drops the record (the push already happened)', async () => {
+  it('a record whose session is not live is dropped WITHOUT a push (the session id is what the claim binding compares)', async () => {
     const h = harness({ session: null });
     h.state.marker = marker('green');
+    const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
+    expect(rows[0].result).toBe('session-gone; not pushed');
+    expect(h.calls.push).toEqual([]);
+    expect(h.store.size).toBe(0);
+  });
+  it('a session that vanishes AFTER the push still drops the record (the push already happened)', async () => {
+    const h = harness();
+    h.state.marker = marker('green');
+    const sessions = [[{ sessionId: rec().sessionId, name: 'fix-4115', cwd: '/s', state: 'done' }], []];
+    h.io.listSessions = () => sessions.length > 1 ? sessions.shift() : sessions[0];
     const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
     expect(rows[0].result).toBe('pushed; session-gone');
     expect(h.store.size).toBe(0);
@@ -264,7 +275,7 @@ describe('defaultAwaitVerifyIo — the real push and resume ports (#5137 review)
   };
   const pushArg = (over = {}) => ({ lane: '/lanes/lane-5', sha: SHA, ref: PR_HEAD, repo: 'web-everything/web-everything', pr: 4115, who: 'fix-4115', sessionId: 'S', ...over });
   const build = async (exec, over = {}) => (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({
-    weRoot: '/we', exec, env: {}, pushRefusalFn: () => null, ...over,
+    weRoot: '/we', exec, env: {}, poolRoot: '/lanes', realpath: (p) => p, pushRefusalFn: () => null, readClaimFn: () => ({ meta: { sessionId: 'S', branch: PR_HEAD } }), ...over,
   });
   const gitPushes = (calls) => calls.filter((c) => c[0] === 'git' && c.includes('push'));
 
@@ -339,7 +350,8 @@ describe('defaultAwaitVerifyIo — the real push and resume ports (#5137 review)
   it('refuses a recorded ref that is not the PR\'s head (ref/PR mismatch table), without pushing', async () => {
     for (const ref of ['lane/other-item', 'lane/item-68b-alt', 'lane/ITEM-68B']) {
       const { exec, calls } = fakeExec();
-      const result = (await build(exec)).push(pushArg({ ref }));
+      // the claim names whatever branch the record typed, so it is the PR-head binding (not the claim binding) that refuses here
+      const result = (await build(exec, { readClaimFn: () => ({ meta: { sessionId: 'S', branch: ref } }) })).push(pushArg({ ref }));
       expect(result.ok).toBe(false);
       expect(result.transient).toBeUndefined();
       expect(result.reason).toMatch(/not PR #4115's head/);
@@ -474,7 +486,7 @@ describe('real git: the daemon\'s lane tree hash equals the one verify-lane reco
     const expected = computeWorkingTreeHash({ runGit: verifyLaneRunner, fileMode: (f) => lstatSync(join(L.lane, f)).mode });
     expect(expected).toMatch(/^[0-9a-f]{64}$/);
     // (the lane is dirty because of new.txt; commit it so laneState computes a hash)
-    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
     expect(io.laneState(L.lane)).toMatchObject({ dirty: true, treeHash: null });
     git(L.lane, ['add', 'new.txt']); git(L.lane, [...identity, 'commit', '-m', 'three']);
     const committed = computeWorkingTreeHash({ runGit: verifyLaneRunner, fileMode: (f) => lstatSync(join(L.lane, f)).mode });
@@ -485,7 +497,7 @@ describe('real git: the daemon\'s lane tree hash equals the one verify-lane reco
 
   it('no lane-config driver (diff.external, filter clean/smudge, textconv, via an in-repo .gitattributes) ever runs in the daemon, clean OR dirty lane, and the hash is unchanged', async () => {
     const L = mkLane(); dirs.push(L.root);
-    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
     writeFileSync(join(L.lane, '.gitattributes'), 'a.txt filter=ev diff=ev\n');
     git(L.lane, ['add', '.gitattributes']); git(L.lane, [...identity, 'commit', '-m', 'attrs']);
     const before = io.laneState(L.lane).treeHash;
@@ -509,7 +521,7 @@ describe('real git: the daemon\'s lane tree hash equals the one verify-lane reco
     writeFileSync(join(L.lane, '.git', 'info', 'exclude'), '*.tmp\n');
     const verifyLaneRunner = (a) => git(L.lane, a).trim();
     const expected = computeWorkingTreeHash({ runGit: verifyLaneRunner, fileMode: (f) => lstatSync(join(L.lane, f)).mode });
-    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
     expect(io.laneState(L.lane)).toMatchObject({ dirty: false, treeHash: expected });
   });
 
@@ -537,5 +549,186 @@ describe('real git: the daemon\'s lane tree hash equals the one verify-lane reco
     const other = git(L.lane, ['rev-parse', 'HEAD']).trim();
     expect(() => pushShaFromScratch({ laneGitDir, url: L.origin, sha: other, ref: 'lane/item-2', env })).toThrow();
     expect(git(L.origin, ['rev-parse', 'refs/heads/lane/item-2']).trim()).toBe(L.sha);
+  });
+
+  it('rerequest never executes a lane-config command (core.fsmonitor / diff.external) in the daemon — the verify-lane child runs git in the lane', async () => {
+    const L = mkLane(); dirs.push(L.root);
+    writeFileSync(join(L.lane, 'a.txt'), 'one\ntwo\nthree\n'); // a dirty worktree makes git consult the index/fsmonitor and diff
+    const ran = join(L.root, 'ran');
+    const driver = join(L.root, 'driver.sh');
+    writeFileSync(driver, `#!/bin/sh\ntouch ${ran}-$$\ncat\n`, { mode: 0o755 });
+    for (const k of ['core.fsmonitor', 'diff.external']) git(L.lane, ['config', k, driver]);
+    const weRoot = process.cwd(); // vitest runs from the repo root; the child is the checkout's own verify-lane.mjs
+    expect(existsSync(join(weRoot, 'scripts', 'verify-lane.mjs'))).toBe(true);
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot, poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    const result = io.rerequest(L.lane);
+    expect(result.status, JSON.stringify(result)).toBeTruthy(); // verify-lane really ran against the lane (requested, refused or blocked — all after its git reads)
+    expect(readdirSync(L.root).filter((f) => f.startsWith('ran-'))).toEqual([]);
+  });
+
+  it('rerequest refuses a lane whose own config defines a clean filter — nothing runs, and verify-lane is never spawned', async () => {
+    const L = mkLane(); dirs.push(L.root);
+    const ran = join(L.root, 'ran');
+    const driver = join(L.root, 'driver.sh');
+    writeFileSync(driver, `#!/bin/sh\ntouch ${ran}-$$\ncat\n`, { mode: 0o755 });
+    git(L.lane, ['config', 'filter.x.clean', driver]);
+    writeFileSync(join(L.lane, '.git', 'info', 'attributes'), '* filter=x\n'); // not switchable from the environment
+    writeFileSync(join(L.lane, 'a.txt'), 'one\ntwo\nthree\n');
+    const spawned = [];
+    const exec = (cmd, args, opts) => { spawned.push(args.join(' ')); return execFileSync(cmd, args, opts); };
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: process.cwd(), exec, poolRoot: tmpdir(), env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    expect(io.rerequest(L.lane)).toMatchObject({ ok: false, status: 'lane-refused', reason: expect.stringMatching(/filter\.x\.clean/) });
+    expect(spawned.some((a) => a.includes('verify-lane.mjs'))).toBe(false);
+    expect(readdirSync(L.root).filter((f) => f.startsWith('ran-'))).toEqual([]);
+  });
+
+  it('every port refuses a lane path outside the lane pool (a record\'s lane is agent-typed)', async () => {
+    const L = mkLane(); dirs.push(L.root);
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({
+      weRoot: process.cwd(), poolRoot: join(L.root, 'somewhere-else'), pushRefusalFn: () => null, readClaimFn: () => ({ meta: { sessionId: 'S', branch: 'lane/x' } }),
+      env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' },
+    });
+    expect(io.laneState(L.lane)).toBeNull();
+    expect(io.readMarker(L.lane)).toBeNull();
+    expect(io.rerequest(L.lane)).toMatchObject({ ok: false, status: 'lane-refused' });
+    expect(io.push({ lane: L.lane, sha: L.sha, ref: 'lane/x', repo: 'web-everything/web-everything', pr: 1, who: 'w', sessionId: 'S' }))
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/not inside the lane pool/) });
+  });
+});
+
+describe('laneFilterDrivers (#5137 review)', () => {
+  const entry = (scope, key, value = 'v') => `${scope}\0${key}\n${value}\0`;
+  it('names local/worktree filter drivers (any name, any case of the subsection, dotted names) and ignores global ones', () => {
+    const out = entry('system', 'filter.lfs.clean') + entry('global', 'filter.lfs.smudge') + entry('local', 'core.bare', 'false')
+      + entry('local', 'filter.x.clean') + entry('local', 'filter.Y.process') + entry('worktree', 'filter.a.b.smudge') + entry('local', 'filter.x.required', 'true');
+    expect(laneFilterDrivers(out)).toEqual(['filter.x.clean', 'filter.Y.process', 'filter.a.b.smudge']);
+    expect(laneFilterDrivers('')).toEqual([]);
+  });
+  it('sees a driver defined in a file the lane config includes (real git)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'await-verify-incl-'));
+    try {
+      const git = (...a) => execFileSync('git', a, { cwd: root, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+      git('init', '-q');
+      writeFileSync(join(root, 'extra.cfg'), '[filter "z"]\n\tclean = evil\n');
+      git('config', 'include.path', join(root, 'extra.cfg'));
+      expect(laneFilterDrivers(git(...LANE_CONFIG_LIST_ARGS))).toEqual(['filter.z.clean']);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('lane-git-hardening (#5137 review)', () => {
+  it('pins every code-executing lane-config key through git\'s environment, after any existing GIT_CONFIG_COUNT entries', () => {
+    const env = laneGitHardeningEnv({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'x', GIT_EXTERNAL_DIFF: '/evil' });
+    expect(env.GIT_CONFIG_COUNT).toBe(String(1 + LANE_GIT_CONFIG_PINS.length));
+    expect([env.GIT_CONFIG_KEY_0, env.GIT_CONFIG_VALUE_0]).toEqual(['user.name', 'x']);
+    const pins = LANE_GIT_CONFIG_PINS.map((_, i) => [env[`GIT_CONFIG_KEY_${1 + i}`], env[`GIT_CONFIG_VALUE_${1 + i}`]]);
+    expect(pins).toEqual(LANE_GIT_CONFIG_PINS.map(([k, v]) => [k, v]));
+    expect(LANE_GIT_CONFIG_PINS.map(([k]) => k)).toEqual(expect.arrayContaining(['core.fsmonitor', 'core.hooksPath', 'core.attributesFile', 'core.sshCommand']));
+    expect(env.GIT_EXTERNAL_DIFF).toBeUndefined();
+    expect(laneGitHardeningEnv({}).GIT_CONFIG_COUNT).toBe(String(LANE_GIT_CONFIG_PINS.length));
+  });
+  it('rewrites a diff to never run diff.external / textconv and a hash-object to never run a clean filter', () => {
+    expect(hardenLaneGitArgs(['diff', '--name-only', 'HEAD'])).toEqual(['diff', '--no-ext-diff', '--no-textconv', '--name-only', 'HEAD']);
+    expect(hardenLaneGitArgs(['diff', '--no-ext-diff', '--name-only'])).toEqual(['diff', '--no-textconv', '--no-ext-diff', '--name-only']);
+    expect(hardenLaneGitArgs(['hash-object', 'f'])).toEqual(['hash-object', '--no-filters', 'f']);
+    expect(hardenLaneGitArgs(['hash-object', '--no-filters', 'f'])).toEqual(['hash-object', '--no-filters', 'f']);
+    expect(hardenLaneGitArgs(['rev-parse', 'HEAD'])).toEqual(['rev-parse', 'HEAD']);
+  });
+});
+
+describe('push binds the record to a constellation repo and a fix claim this session holds (#5137 review)', () => {
+  const claim = (over = {}) => ({ meta: { sessionId: 'S', branch: 'lane/item-68b', ...over } });
+  const read = (c) => () => c;
+  const base = { repo: 'web-everything/web-everything', pr: 4115, ref: 'lane/item-68b', sessionId: 'S' };
+  it.each([
+    ['a repo outside the constellation', { repo: 'attacker/other-repo' }, claim(), /not a constellation repo/],
+    ['no repo at all', { repo: undefined }, claim(), /not a constellation repo/],
+    ['a record with no session id', { sessionId: null }, claim(), /no session id/],
+    ['no fix claim for that PR', {}, null, /no fix claim/],
+    ['a claim held by another session', {}, claim({ sessionId: 'someone-else' }), /not held by this session/],
+    ['a claim with no session binding', {}, claim({ sessionId: null }), /not held by this session/],
+    ['a claim for another branch', {}, claim({ branch: 'lane/other-pr' }), /is for branch lane\/other-pr/],
+  ])('refuses %s', (_name, over, held, message) => {
+    expect(claimBindingRefusal({ ...base, ...over, readClaim: read(held) })).toMatch(message);
+  });
+  it('accepts the claim bound to this session and branch, including a lapsed one nobody re-claimed', () => {
+    expect(claimBindingRefusal({ ...base, readClaim: read(claim()) })).toBeNull();
+  });
+  it('a throwing claim store refuses (fail closed)', () => {
+    expect(claimBindingRefusal({ ...base, readClaim: () => { throw new Error('io'); } })).toMatch(/no fix claim/);
+  });
+  it('the push port refuses an unclaimed other-PR record before any gh or git call, whatever the PR head says', async () => {
+    const calls = [];
+    const exec = (cmd, args) => { calls.push([cmd, ...args]); return ''; };
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', exec, env: {}, pushRefusalFn: () => null, readClaimFn: () => null, poolRoot: '/lanes', realpath: (p) => p });
+    const result = io.push({ lane: '/lanes/lane-5', sha: SHA, ref: 'lane/someone-elses-pr', repo: 'web-everything/web-everything', pr: 9999, who: 'fix-4115', sessionId: 'S' });
+    expect(result).toMatchObject({ ok: false, reason: expect.stringMatching(/no fix claim/) });
+    expect(result.transient).toBeUndefined();
+    expect(result.moved).toBeUndefined();
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('a failed store write or delete never repeats an effect (#5137 review)', () => {
+  const failingWrites = (h) => { h.io.writeRecord = () => ({ ok: false, reason: 'write-failed' }); };
+  it('verify re-request: a failed counter write skips the request, so a dead store cannot re-request every tick', async () => {
+    const h = harness();
+    failingWrites(h);
+    h.state.marker = null; // no verdict → re-request
+    for (let i = 0; i < 5; i += 1) await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000 + i * 120_000, ttlMs: TTL });
+    expect(h.calls.rerequest).toEqual([]);
+  });
+  it('re-request: with a working store the retry budget still bounds it (≤ maxRetries, then the infra resume)', async () => {
+    const h = harness();
+    h.io.rerequest = (l) => { h.calls.rerequest.push(l); return { ok: true, status: 'requested' }; };
+    h.state.marker = null;
+    for (let i = 0; i < 6; i += 1) await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000 + i * 120_000, ttlMs: TTL });
+    expect(h.calls.rerequest).toHaveLength(AWAIT_VERIFY_LIMITS.maxRetries);
+    expect(h.calls.resume).toHaveLength(1);
+  });
+  it('green push: the attempt is persisted first; if it cannot be, nothing is pushed or resumed', async () => {
+    const h = harness();
+    failingWrites(h);
+    h.state.marker = marker('green');
+    const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
+    expect(h.calls.push).toEqual([]);
+    expect(h.calls.resume).toEqual([]);
+    expect(rows[0].result).toMatch(/persist-failed/);
+  });
+  it('transient push failures are bounded even though each attempt is counted before the push', async () => {
+    const h = harness({ pushResult: { ok: false, transient: true, reason: 'Could not resolve host' } });
+    h.state.marker = marker('green');
+    for (let i = 0; i < 6; i += 1) await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000 + i * 120_000, ttlMs: TTL });
+    expect(h.calls.push).toHaveLength(AWAIT_VERIFY_LIMITS.maxRetries + 1);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toMatch(/did NOT push/);
+  });
+  it('a pending resume that cannot be saved is not delivered; the unsaved red re-decides next tick', async () => {
+    const h = harness();
+    failingWrites(h);
+    h.state.marker = marker('red');
+    const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
+    expect(h.calls.resume).toEqual([]);
+    expect(rows[0].result).toMatch(/persist-failed/);
+  });
+  it('resume attempts are counted before the resume, so an unwritable store cannot retry a failing resume forever', async () => {
+    const h = harness({ resumeResult: { resumed: false, reason: 'unconfirmed' } });
+    h.state.marker = marker('red');
+    let writes = 0;
+    const write = h.io.writeRecord;
+    h.io.writeRecord = (r) => (++writes <= 1 ? write(r) : { ok: false }); // only the pending-resume write succeeds
+    for (let i = 0; i < 5; i += 1) await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000 + i * 120_000, ttlMs: TTL });
+    expect(h.calls.resume).toEqual([]);
+  });
+  it('a record that cannot be deleted after a resume is never resumed or pushed again', async () => {
+    const h = harness();
+    h.io.clearRecord = () => ({ cleared: false });
+    h.state.marker = marker('green');
+    const unclearable = new Set();
+    for (let i = 0; i < 4; i += 1) await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000 + i * 120_000, ttlMs: TTL, resumedUnclearable: unclearable });
+    expect(h.calls.push).toHaveLength(1);
+    expect(h.calls.resume).toHaveLength(1);
+    const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 900_000, ttlMs: TTL, resumedUnclearable: unclearable });
+    expect(rows[0].result).toMatch(/record-clear-failed/);
   });
 });

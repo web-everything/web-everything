@@ -22,9 +22,9 @@
  * names the verdict's own sha. Pure core + injectable IO, like we:scripts/conveyor/load-flake-reverify.mjs.
  */
 import { execFileSync } from 'node:child_process';
-import { lstatSync, mkdtempSync, rmSync, existsSync, mkdirSync, copyFileSync } from 'node:fs';
+import { lstatSync, mkdtempSync, rmSync, existsSync, mkdirSync, copyFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve, dirname } from 'node:path';
+import { join, resolve, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearAwaitVerifyRecord,
@@ -33,6 +33,9 @@ import {
 import { readVerifyMarker, verifyGateDecision } from '../lib/lane-verify.mjs';
 import { computeWorkingTreeHash } from '../lib/verify-lane-gate.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { laneGitConfigArgs, laneGitHardeningEnv, laneFilterDrivers, LANE_CONFIG_LIST_ARGS } from '../lib/lane-git-hardening.mjs';
+import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
+import { readFixDispatchClaim } from './fix-claim-store.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -155,7 +158,27 @@ export function findAwaitSession(record, rows) {
   return list.filter((r) => r?.name === record.who).sort((a, b) => (b?.startedAt ?? 0) - (a?.startedAt ?? 0))[0] ?? null;
 }
 
+/**
+ * Why the daemon must NOT push for this record, or null. The fixer typed `repo`/`pr`/`ref`, so they bind to nothing until
+ * proven: `repo` must be a constellation repo, and the fix claim for (repo, pr) must be bound to THIS session's id and name
+ * this very branch. A claim whose TTL lapsed during a long verify still counts while no one else has re-claimed the PR (a
+ * re-claim replaces the entry, so it then names another session); a missing session id or claim never does. Pure.
+ */
+export function claimBindingRefusal({ repo, pr, ref, sessionId, readClaim }) {
+  const repoKey = repoKeyOrNull(repo);
+  if (!repoKey) return `refusing to push ${ref}: ${repo} is not a constellation repo`;
+  if (!sessionId) return `refusing to push ${ref}: the record names no session id to match against the PR #${pr} fix claim`;
+  let claim = null;
+  try { claim = readClaim(repoKey, pr); } catch { claim = null; }
+  if (!claim) return `refusing to push ${ref}: no fix claim exists for ${repo} PR #${pr}`;
+  if (claim.meta?.sessionId !== sessionId) return `refusing to push ${ref}: the fix claim on ${repo} PR #${pr} is not held by this session`;
+  if (claim.meta?.branch !== ref) return `refusing to push ${ref}: the fix claim on ${repo} PR #${pr} is for branch ${claim.meta?.branch ?? '(none)'}`;
+  return null;
+}
+
 const BUSY = new Set(['working', 'running', 'busy', 'starting']);
+/** Records already acted on to completion whose store entry could not be deleted (see `clearOrNote`). */
+const UNCLEARABLE_DONE = new Set();
 
 /**
  * Apply the policy to every stored record once. Every effect is an injected port, so the whole pass replays
@@ -164,8 +187,16 @@ const BUSY = new Set(['working', 'running', 'busy', 'starting']);
  */
 export async function runAwaitVerifyPass({
   io, nowMs = Date.now(), ttlMs = resolveAwaitVerifyTtlMs(), limits = AWAIT_VERIFY_LIMITS, allowResume = true,
+  resumedUnclearable = UNCLEARABLE_DONE,
 } = {}) {
   const rows = [];
+  /** Clear a finished record. One that cannot be removed would stay actionable (another push / resume next tick), so it is
+   *  remembered for this daemon's lifetime and never acted on again. Returns whether the record is really gone. */
+  const clearOrNote = (key, record) => {
+    const cleared = io.clearRecord(key, record)?.cleared !== false;
+    if (!cleared) resumedUnclearable.add(`${key}|${record.requestedAt}`);
+    return cleared;
+  };
   for (const { key, record: stored } of io.listRecords()) {
     let record = stored;
     const row = { key, pr: record?.pr ?? null, repo: record?.repo ?? null, sha: record?.sha ?? null };
@@ -175,19 +206,33 @@ export async function runAwaitVerifyPass({
       const d = classifyAwaitVerdict({ record, marker, lane: record.pendingResume ? { head: record.sha } : lane, nowMs, ttlMs, limits });
       Object.assign(row, { action: d.action, reason: d.reason });
       if (d.action === 'skip' || d.action === 'wait') { rows.push(row); continue; }
+      // Every counter that bounds an effect is persisted BEFORE the effect, and a failed write skips the effect: a store that
+      // went unwritable would otherwise reload the old counters every tick and repeat the request / push / resume forever.
+      const persist = (next) => {
+        if (io.writeRecord(next)?.ok === true) { record = next; return true; }
+        row.result = `${row.result ? `${row.result}; ` : ''}persist-failed`;
+        return false;
+      };
       if (d.action === 'rerequest') {
+        if (!persist({ ...record, retries: (record.retries ?? 0) + 1, requestedAt: new Date(nowMs).toISOString(), lastRetry: d.reason })) { rows.push(row); continue; }
         const r = io.rerequest(record.lane);
-        record = { ...record, retries: (record.retries ?? 0) + 1, requestedAt: new Date(nowMs).toISOString(), lastRetry: d.reason };
-        io.writeRecord(record);
         row.result = r?.status ?? (r?.ok ? 'requested' : 'request-failed');
         rows.push(row); continue;
       }
+      if (resumedUnclearable.has(`${key}|${record.requestedAt}`)) { row.result = 'resumed; record-clear-failed'; rows.push(row); continue; }
       let pending = record.pendingResume ?? null;
       if (d.action === 'push') {
+        // A record whose session is not live is never pushed for: the session id is the one thing the claim binding compares.
+        if (!findAwaitSession(record, io.listSessions())) {
+          clearOrNote(key, record);
+          row.result = 'session-gone; not pushed';
+          rows.push(row); continue;
+        }
+        const attempt = record.pushRetries ?? 0;
+        if (!persist({ ...record, pushRetries: attempt + 1 })) { rows.push(row); continue; }
         const pushed = io.push({ lane: record.lane, sha: record.sha, ref: record.ref, repo: record.repo, pr: record.pr, who: record.who, sessionId: record.sessionId });
-        if (!pushed?.ok && pushed?.transient && (record.pushRetries ?? 0) < limits.maxRetries) {
-          // A network/auth hiccup is not a moved branch: retry the same push next tick.
-          io.writeRecord({ ...record, pushRetries: (record.pushRetries ?? 0) + 1, lastRetry: `push: ${pushed.reason}` });
+        if (!pushed?.ok && pushed?.transient && attempt < limits.maxRetries) {
+          // A network/auth hiccup is not a moved branch: retry the same push next tick (the attempt is already counted).
           row.result = `push-retry (${pushed.reason})`;
           rows.push(row); continue;
         }
@@ -200,13 +245,13 @@ export async function runAwaitVerifyPass({
       }
       if (!record.pendingResume) {
         // Keep the marker's failure detail on the record: the next tick may need to re-send this message.
-        record = { ...record, pendingResume: { ...pending, ...(marker ? { marker: { failureDetails: marker.failureDetails ?? null } } : {}) } };
-        io.writeRecord(record);
+        // A pending resume that cannot be saved is not acted on: the next tick re-decides from the verdict.
+        if (!persist({ ...record, pendingResume: { ...pending, ...(marker ? { marker: { failureDetails: marker.failureDetails ?? null } } : {}) } })) { rows.push(row); continue; }
       }
       if (!allowResume) { row.result = row.result ?? 'resume-paused'; rows.push(row); continue; }
       const session = findAwaitSession(record, io.listSessions());
       if (!session) {
-        io.clearRecord(key, record);
+        clearOrNote(key, record);
         row.result = `${row.result ? `${row.result}; ` : ''}session-gone`;
         rows.push(row); continue;
       }
@@ -214,19 +259,17 @@ export async function runAwaitVerifyPass({
       const prompt = buildAwaitVerifyResumePrompt({
         kind: record.pendingResume.kind, record, marker: record.pendingResume.marker ?? marker, detail: record.pendingResume.detail,
       });
+      const failures = (record.resumeFailures ?? 0) + 1;
+      if (!persist({ ...record, resumeFailures: failures })) { rows.push(row); continue; }
       const resumed = io.resume({ session, prompt });
       if (resumed?.resumed) {
-        io.clearRecord(key, record);
-        row.result = `${row.result ? `${row.result}; ` : ''}resumed:${record.pendingResume.kind}`;
+        const cleared = clearOrNote(key, record);
+        row.result = `${row.result ? `${row.result}; ` : ''}resumed:${record.pendingResume.kind}${cleared ? '' : '; record-clear-failed'}`;
+      } else if (failures >= limits.maxResumeFailures) {
+        clearOrNote(key, record);
+        row.result = `${row.result ? `${row.result}; ` : ''}resume-exhausted`;
       } else {
-        const failures = (record.resumeFailures ?? 0) + 1;
-        if (failures >= limits.maxResumeFailures) {
-          io.clearRecord(key, record);
-          row.result = `${row.result ? `${row.result}; ` : ''}resume-exhausted`;
-        } else {
-          io.writeRecord({ ...record, resumeFailures: failures });
-          row.result = `${row.result ? `${row.result}; ` : ''}resume-failed (${resumed?.reason ?? 'unconfirmed'})`;
-        }
+        row.result = `${row.result ? `${row.result}; ` : ''}resume-failed (${resumed?.reason ?? 'unconfirmed'})`;
       }
     } catch (error) {
       row.action = row.action ?? 'error';
@@ -301,13 +344,24 @@ export function pushShaFromScratch({ laneGitDir, url, sha, ref, exec = execFileS
  */
 export async function defaultAwaitVerifyIo({
   weRoot = ROOT, exec = execFileSync, env = process.env, sleep = sleepSync,
-  dispatchIo = null, stopSessionFn = null, pushRefusalFn = null,
+  dispatchIo = null, stopSessionFn = null, pushRefusalFn = null, readClaimFn = null, poolRoot = null, realpath = realpathSync,
 } = {}) {
+  /** The lane pool the daemon acts in. A record's `lane` is agent-typed, so a path outside the pool is never touched. */
+  const lanePoolRoot = poolRoot ?? defaultPoolRoot(weRoot, env);
+  const outsidePool = (lane) => {
+    try {
+      const real = realpath(lane);
+      const root = realpath(lanePoolRoot);
+      return real === root || !real.startsWith(`${root}${sep}`) ? `${lane} is not inside the lane pool` : null;
+    } catch { return `${lane} is not inside the lane pool`; }
+  };
   const io = dispatchIo ?? await import('../operations/dispatch-lane-io.mjs');
   const stopSession = stopSessionFn ?? (await import('../operations/dispatch-abort.mjs')).stopSession;
-  const pushRefusal = pushRefusalFn ?? (await import('./fix-procedure.mjs')).pushRefusal;
-  const hardening = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
-    '-c', 'core.attributesFile=/dev/null', '-c', 'core.sshCommand=ssh'];
+  const fixProcedure = pushRefusalFn && readClaimFn ? null : await import('./fix-procedure.mjs');
+  const pushRefusal = pushRefusalFn ?? fixProcedure.pushRefusal;
+  /** The raw (live or not) fix-claim entry for (repo key, pr), or null. */
+  const readClaim = readClaimFn ?? ((repoKey, pr) => readFixDispatchClaim({ repo: repoKey, pr, kind: fixProcedure.FIXING_KIND }));
+  const hardening = laneGitConfigArgs();
   const git = (lane, args, opts = {}) => String(exec('git', ['-C', lane, ...hardening, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, ...opts }));
   /**
    * The head branch of the PR, whether it is OPEN, and the git URL of the repo the PR lives in — all read from GitHub
@@ -325,12 +379,14 @@ export async function defaultAwaitVerifyIo({
     listRecords: () => listStoredAwaitVerify(),
     writeRecord: (record) => writeStoredAwaitVerify(record),
     clearRecord: (key, record) => {
-      clearStoredAwaitVerify(key);
-      if (record?.lane) clearAwaitVerifyRecord(record.lane);
+      const store = clearStoredAwaitVerify(key);
+      if (record?.lane && !outsidePool(record.lane)) clearAwaitVerifyRecord(record.lane);
+      return { cleared: store.cleared };
     },
     laneState: (lane) => {
       let scratch = null;
       try {
+        if (outsidePool(lane)) return null;
         // Refs and the git dir are read through the lane's config (no worktree content is touched, so no filter/textconv runs).
         const head = git(lane, ['rev-parse', 'HEAD']).trim();
         const laneGitDir = git(lane, ['rev-parse', '--absolute-git-dir']).trim();
@@ -357,12 +413,21 @@ export async function defaultAwaitVerifyIo({
       } catch { return null; } finally { if (scratch) rmSync(scratch, { recursive: true, force: true }); }
     },
     readMarker: (lane) => {
-      try { return readVerifyMarker(git(lane, ['rev-parse', '--absolute-git-dir']).trim()); } catch { return null; }
+      try { return outsidePool(lane) ? null : readVerifyMarker(git(lane, ['rev-parse', '--absolute-git-dir']).trim()); } catch { return null; }
     },
     rerequest: (lane) => {
+      const outside = outsidePool(lane);
+      if (outside) return { ok: false, status: 'lane-refused', reason: outside };
+      // A clean filter runs on worktree content during the child's `git diff`, and the env cannot switch it off (an in-repo
+      // `.gitattributes` or `.git/info/attributes` chooses where it applies): refuse a lane that defines one. Fail closed.
+      try {
+        const drivers = laneFilterDrivers(git(lane, LANE_CONFIG_LIST_ARGS));
+        if (drivers.length) return { ok: false, status: 'lane-refused', reason: `the lane's git config defines filter driver(s) ${drivers.join(', ')}` };
+      } catch { return { ok: false, status: 'lane-refused', reason: 'the lane\'s git config could not be read' }; }
       try {
         const out = String(exec(process.execPath, [join(weRoot, 'scripts', 'verify-lane.mjs'), 'request', '--json', `--repo=${lane}`],
-          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 120_000 }));
+          // The child runs git in the agent-writable lane itself, so its git config is pinned through the environment.
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: laneGitHardeningEnv(env), timeout: 120_000 }));
         return { ok: true, ...JSON.parse(out.trim().split('\n').pop() || '{}') };
       } catch (e) {
         try { return { ok: false, ...JSON.parse(String(e?.stdout ?? '').trim().split('\n').pop()) }; } catch { return { ok: false, status: 'request-failed' }; }
@@ -371,6 +436,13 @@ export async function defaultAwaitVerifyIo({
     push: ({ lane, sha, ref, repo, pr, who, sessionId }) => {
       // Never reached for `main` (or any non-`lane/*` ref), whatever hook is or is not installed: a guarantee of this port.
       if (!AWAIT_VERIFY_REF_RE.test(String(ref ?? '')) || String(ref).includes('..')) return { ok: false, reason: `refusing to push ${ref}: not a lane/* ref` };
+      // `repo` and `pr` were typed by the fixer: the push goes only to a constellation repo, and only for a PR whose fix claim
+      // THIS session holds, on this very branch. Without it a session could mark another repo/PR and have the daemon push
+      // (with host credentials, outside the guard-git-push hook) onto a branch it was never dispatched for.
+      const outside = outsidePool(lane);
+      if (outside) return { ok: false, reason: `refusing to push ${ref}: ${outside}` };
+      const binding = claimBindingRefusal({ repo, pr, ref, sessionId, readClaim });
+      if (binding) return { ok: false, reason: binding };
       const refusal = pushRefusal({ repo, branch: ref, sessionId, who });
       if (refusal?.refused) return { ok: false, reason: refusal.message };
       // The record's ref was typed by the fixer: bind it to the PR it claims to be repairing before pushing.
