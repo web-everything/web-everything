@@ -177,6 +177,16 @@ export function claimBindingRefusal({ repo, pr, ref, sessionId, readClaim }) {
 }
 
 const BUSY = new Set(['working', 'running', 'busy', 'starting']);
+/**
+ * Is the session mid-turn? A live background session whose turn ENDED lists as `state:'working', status:'idle'`
+ * (found live 2026-10-07 on fix-4151: the pass pushed its green, then deferred the resume forever as "busy").
+ * `status` is the turn signal when present; `state` only for rows without one. Pure.
+ */
+export function isSessionBusy(session) {
+  const status = String(session?.status ?? '').toLowerCase();
+  if (status) return status !== 'idle';
+  return BUSY.has(String(session?.state ?? '').toLowerCase());
+}
 /** Records already acted on to completion whose store entry could not be deleted (see `clearOrNote`). */
 const UNCLEARABLE_DONE = new Set();
 
@@ -255,7 +265,7 @@ export async function runAwaitVerifyPass({
         row.result = `${row.result ? `${row.result}; ` : ''}session-gone`;
         rows.push(row); continue;
       }
-      if (BUSY.has(String(session.state ?? '').toLowerCase())) { row.result = row.result ?? 'session-busy'; rows.push(row); continue; }
+      if (isSessionBusy(session)) { row.result = row.result ?? 'session-busy'; rows.push(row); continue; }
       const prompt = buildAwaitVerifyResumePrompt({
         kind: record.pendingResume.kind, record, marker: record.pendingResume.marker ?? marker, detail: record.pendingResume.detail,
       });
@@ -291,6 +301,7 @@ export function formatAwaitVerifyLines(result) {
 }
 
 // ── IO shell ───────────────────────────────────────────────────────────────────────────────────────────────
+const pidAlive = (pid) => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } };
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 /** `https://github.com/<owner>/<repo>/pull/<n>` → `https://github.com/<owner>/<repo>.git`; null for anything else. */
@@ -471,6 +482,18 @@ export async function defaultAwaitVerifyIo({
     },
     listSessions: () => io.defaultListAgents({ all: true, env }),
     resume: ({ session, prompt }) => {
+      // A background session whose turn ended is still a live process, and `--bg --resume` on a live session
+      // "starts a copy" instead of continuing it (found live 2026-10-07: two forked copies, no resume). Stop the
+      // idle process first; `--resume` then wakes the SAME id. The pass never gets here for a busy session.
+      if (String(session.state ?? '').toLowerCase() !== 'stopped') {
+        // `claude stop` takes the SHORT job id; a full session uuid answers "No job matching" (read as already
+        // gone) and leaves the process running, so the resume forked again (found live 2026-10-07, fix-4151).
+        const handle = session.id || String(session.sessionId).slice(0, 8);
+        try { stopSession({ handle }); } catch (e) { return { resumed: false, reason: `stop-before-resume: ${String(e?.message ?? e).split('\n')[0]}` }; }
+        for (let i = 0; i < 20 && pidAlive(session.pid); i += 1) sleep(500);
+        if (pidAlive(session.pid)) return { resumed: false, reason: 'stop-before-resume: process still alive' };
+        sleep(1_000);
+      }
       const argv = io.buildAgentArgv({ payload: { prompt }, resumeSessionId: session.sessionId });
       let stdout = '';
       try { stdout = String(io.defaultSpawnAgent(argv, { cwd: session.cwd }) ?? ''); } catch (e) { return { resumed: false, reason: String(e?.message ?? e).split('\n')[0] }; }

@@ -7,7 +7,7 @@ import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import {
   classifyAwaitVerdict, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession,
-  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, pushShaFromScratch, claimBindingRefusal,
+  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo,
 } from '../await-verify-pass.mjs';
 
 const SHA = '65a382e81413952ab11e5448e36f01bb7ce4c332';
@@ -399,7 +399,7 @@ describe('defaultAwaitVerifyIo — the real push and resume ports (#5137 review)
   });
 
   describe('resume cleanup', () => {
-    const session = { sessionId: 'S-target', cwd: '/scratch' };
+    const session = { sessionId: 'S-target', cwd: '/scratch', state: 'stopped' }; // already stopped: no pre-resume stop
     const dispatchIo = (printed, resumed) => ({
       buildAgentArgv: () => ['--resume'], defaultSpawnAgent: () => `backgrounded ${printed}`,
       parseBackgroundedId: () => printed, defaultListAgents: () => [], resumeSucceeded: () => ({ resumed }),
@@ -731,4 +731,31 @@ describe('a failed store write or delete never repeats an effect (#5137 review)'
     const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 900_000, ttlMs: TTL, resumedUnclearable: unclearable });
     expect(rows[0].result).toMatch(/record-clear-failed/);
   });
+});
+
+it('isSessionBusy reads the live turn signal: a turn-ended bg session is state working + status idle (live 2026-10-07)', () => {
+  expect(isSessionBusy({ state: 'working', status: 'idle' })).toBe(false);
+  expect(isSessionBusy({ state: 'working', status: 'busy' })).toBe(true);
+  expect(isSessionBusy({ state: 'stopped' })).toBe(false);
+  expect(isSessionBusy({ state: 'working' })).toBe(true);
+});
+
+it('resume stops the idle live process by its SHORT job id first, then resumes the same session id (live 2026-10-07)', async () => {
+  const calls = [];
+  const sid = 'a287c608-48e3-4d38-99f1-10496475407f';
+  const io = await defaultAwaitVerifyIo({
+    sleep: () => {},
+    stopSessionFn: ({ handle }) => { calls.push(['stop', handle]); return { stopped: true }; },
+    dispatchIo: {
+      buildAgentArgv: ({ resumeSessionId }) => ['--bg', '--resume', resumeSessionId],
+      parseBackgroundedId: () => sid,
+      resumeSucceeded: () => ({ resumed: true }),
+      defaultSpawnAgent: (argv, opts) => { calls.push(['spawn', argv.slice(0, 3), opts.cwd]); return 'backgrounded'; },
+      defaultListAgents: () => [],
+    },
+  });
+  const r = io.resume({ session: { id: 'a287c608', sessionId: sid, cwd: '/scratch', state: 'working', status: 'idle', pid: 0 }, prompt: 'x' });
+  expect(calls[0]).toEqual(['stop', 'a287c608']); // never the full uuid: `claude stop <uuid>` is "No job matching"
+  expect(calls[1]).toEqual(['spawn', ['--bg', '--resume', sid], '/scratch']);
+  expect(r).toMatchObject({ resumed: true });
 });
