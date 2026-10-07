@@ -52,6 +52,7 @@ import { SCAFFOLD_OP } from '../scaffold.mjs';
 import { FILE_ITEM_OP } from '../file-item.mjs';
 import { CLEAR_STUCK_SESSION_OP } from '../clear-stuck-session.mjs';
 import { DOCKET_REFRESH_OP } from '../docket-refresh.mjs';
+import { PERF_SNAPSHOT_OP } from '../perf-snapshot.mjs';
 import { RESTART_RUNNER_OP } from '../restart-runner.mjs';
 import { PRIORITY_SYNC_OP } from '../priority-sync.mjs';
 import { EXPLORE_OP } from '../explore.mjs';
@@ -443,6 +444,9 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // lives in `docket-refresh-io.mjs`, behind the injected `readFacts` reader and the sink `../run.mjs`
     // wires through.
     [DOCKET_REFRESH_OP]: 'docket-refresh.mjs',
+    // Held card 119 — `perf-snapshot`'s `apply` step is an `effect` (it appends a row to the metrics store), so it is
+    // NOT read-only; listed for map coverage. Every fs/git/gh call lives in `perf-snapshot-io.mjs`.
+    [PERF_SNAPSHOT_OP]: 'perf-snapshot.mjs',
     // #3383 (graduated under #3892) — the SAFE conveyor restart. Three of its six steps are effects, so it is
     // emphatically NOT read-only; listed here for map coverage. The declaring module reaching nothing that can
     // act matters MORE here than anywhere else on this list: this operation's verbs are SIGNAL A PROCESS and
