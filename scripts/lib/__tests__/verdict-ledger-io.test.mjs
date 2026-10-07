@@ -1,0 +1,157 @@
+/**
+ * @file verdict-ledger-io.test.mjs - ledger plan slice C1 (#3255 part 1): the git io-shell of the verdict ledger.
+ *   Unit tests with an injected `git`, plus REAL-git tests against a bare origin (the contention test the plan
+ *   names as a hard gate: one rejected push, a retry, and a third clone that sees both rows).
+ */
+import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { join } from 'node:path';
+import {
+  appendLedgerRows, readLedgerFromGit, ledgerGitPath, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
+} from '../verdict-ledger-io.mjs';
+import { buildVerdictRecord } from '../verdict-ledger.mjs';
+import { withBareOrigin, git, writeLocalIdentity } from '../../operations/__tests__/helpers/real-repo.mjs';
+
+const REPO = 'web-everything/web-everything';
+const row = (pr, extra = {}) => buildVerdictRecord({
+  repo: REPO, pr, verdict: 'accepted', at: '2026-10-07T12:00:00.000Z', source: 'test', ...extra,
+});
+const noSleep = () => {};
+
+describe('readLedgerFromGit: unreadable is never empty', () => {
+  it('returns unreadable when the git call throws (transport unreachable)', () => {
+    const run = () => { throw new Error('fatal: unable to access remote'); };
+    const r = readLedgerFromGit({ board: '/board', repo: REPO, run });
+    expect(r.status).toBe('unreadable');
+    expect(r.records).toBeUndefined();
+    expect(r.error).toMatch(/unable to access/);
+  });
+
+  it('returns ok with zero records only when the tip was read and the file is absent', () => {
+    const run = () => ''; // fetch ok, ls-tree lists nothing
+    expect(readLedgerFromGit({ board: '/board', repo: REPO, run })).toMatchObject({ status: 'ok', records: [] });
+  });
+
+  it('parses the rows of a file that exists', () => {
+    const text = `${JSON.stringify(row(7))}\n`;
+    const run = (args) => (args[0] === 'ls-tree' ? 'verdict-ledger/x\n' : args[0] === 'show' ? text : '');
+    const r = readLedgerFromGit({ board: '/board', repo: REPO, run });
+    expect(r.status).toBe('ok');
+    expect(r.records).toHaveLength(1);
+  });
+});
+
+describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
+  const failing = (n) => {
+    let pushes = 0;
+    const run = (args) => {
+      if (args[0] === 'push') { pushes += 1; if (pushes <= n) throw new Error('! [rejected] non-fast-forward'); }
+      return args[0] === 'diff' ? 'verdict-ledger/x.jsonl' : '';
+    };
+    return { run, pushes: () => pushes };
+  };
+  const base = (over) => ({
+    board: '/board', repo: REPO, records: [row(1)], sleep: noSleep,
+    mkdir: () => {}, write: () => {}, rm: () => {}, read: () => null, now: () => 1, ...over,
+  });
+
+  it('retries a rejected push and then succeeds', () => {
+    const f = failing(2);
+    const retries = [];
+    const r = appendLedgerRows(base({ run: f.run, onRetry: (x) => retries.push(x.attempt) }));
+    expect(r).toMatchObject({ status: 'appended', attempts: 3 });
+    expect(retries).toEqual([1, 2]);
+  });
+
+  it('THROWS LedgerAppendExhaustedError when every attempt fails (never a quiet value)', () => {
+    const f = failing(99);
+    expect(() => appendLedgerRows(base({ run: f.run, attempts: 3 }))).toThrow(LedgerAppendExhaustedError);
+    expect(f.pushes()).toBe(3);
+  });
+
+  it('refuses an invalid record before touching git', () => {
+    const run = () => { throw new Error('git must not be called'); };
+    expect(() => appendLedgerRows(base({ run, records: [{ nope: true }] }))).toThrow(/invalid record/);
+  });
+});
+
+/** A second working clone of the same bare origin. */
+const cloneOf = (ctx, name) => {
+  const dir = join(ctx.tmp, name);
+  git(['clone', '--quiet', ctx.origin, dir], { cwd: ctx.tmp });
+  writeLocalIdentity(dir);
+  return dir;
+};
+
+describe('real git', () => {
+  it('appends, and reads back through a different clone', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1), row(2)] });
+      const other = cloneOf(ctx, 'other');
+      const r = readLedgerFromGit({ board: other, repo: REPO });
+      expect(r.status).toBe('ok');
+      expect(r.records.map((x) => x.pr)).toEqual([1, 2]);
+    });
+  });
+
+  it('TWO WRITERS: one rejected push, a retry, and a third clone sees both rows', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const clientA = ctx.clone;
+      const clientB = cloneOf(ctx, 'writer-b');
+      const third = cloneOf(ctx, 'third');
+
+      // Writer B reads the tip, then - just before its first push - writer A lands a row. B's push is rejected.
+      let rivalDone = false;
+      let rejected = 0;
+      const run = (args, opts) => {
+        if (args[0] === 'push' && !rivalDone) {
+          rivalDone = true;
+          appendLedgerRows({ board: clientA, repo: REPO, records: [row(100)] });
+        }
+        try {
+          return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+        } catch (e) {
+          if (args[0] === 'push') rejected += 1;
+          throw e;
+        }
+      };
+      const retries = [];
+      const r = appendLedgerRows({ board: clientB, repo: REPO, records: [row(200)], run, sleep: noSleep, onRetry: (x) => retries.push(x.attempt) });
+
+      expect(rejected).toBe(1);
+      expect(retries).toEqual([1]);
+      expect(r.attempts).toBe(2);
+      const seen = readLedgerFromGit({ board: third, repo: REPO });
+      expect(seen.status).toBe('ok');
+      expect(seen.records.map((x) => x.pr).sort()).toEqual([100, 200]);
+      // The origin's file holds exactly two rows: no row was overwritten, none duplicated.
+      expect(ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n')).toHaveLength(2);
+    });
+  });
+
+  it('an unreachable transport reads as unreadable, never empty', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      git(['remote', 'set-url', 'origin', join(ctx.tmp, 'does-not-exist.git')], { cwd: ctx.clone });
+      const r = readLedgerFromGit({ board: ctx.clone, repo: REPO });
+      expect(r.status).toBe('unreadable');
+      expect(r.records).toBeUndefined();
+    });
+  });
+
+  it('an absent transport branch is unreadable, not an empty ledger', async () => {
+    await withBareOrigin(async (ctx) => {
+      expect(readLedgerFromGit({ board: ctx.clone, repo: REPO }).status).toBe('unreadable');
+    });
+  });
+
+  it('an unreachable transport makes append throw loudly', async () => {
+    await withBareOrigin(async (ctx) => {
+      git(['remote', 'set-url', 'origin', join(ctx.tmp, 'does-not-exist.git')], { cwd: ctx.clone });
+      expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], attempts: 2, sleep: noSleep }))
+        .toThrow(LedgerAppendExhaustedError);
+    });
+  });
+});
