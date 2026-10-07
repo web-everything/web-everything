@@ -176,7 +176,12 @@ jobs:
         if: ${{ matrix.shard != 5 }}
         working-directory: web-everything
         run: |
-          mapfile -t files < <(node scripts/ci/shard-assign.mjs --suite=unit --group=covered --shard=${{ matrix.shard }}/4)
+          # Capture first, then split: reading the list through a process substitution drops the producer's exit status, so a failing
+          # assignment would leave `files` empty and run the WHOLE suite. (scripts/ci/__tests__/ci-shard-steps.test.mjs)
+          list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=covered --shard=${{ matrix.shard }}/4) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
+          [ -n "$list" ] || { echo "::error::shard-assign returned an empty file list"; exit 1; }
+          files=()
+          while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
           echo "unit shard ${{ matrix.shard }}/4: ${#files[@]} files"
           npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}"
 
@@ -184,7 +189,11 @@ jobs:
         if: ${{ matrix.shard == 5 }}
         working-directory: web-everything
         run: |
-          mapfile -t files < <(node scripts/ci/shard-assign.mjs --suite=unit --group=nocov --shard=1/1)
+          # Same capture-then-split shape as the coverage shard step above (see its comment).
+          list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=nocov --shard=1/1) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
+          [ -n "$list" ] || { echo "::error::shard-assign returned an empty file list"; exit 1; }
+          files=()
+          while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
           echo "unit no-coverage group: ${#files[@]} files"
           npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}"
 

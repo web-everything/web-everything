@@ -30,9 +30,28 @@ export const REPO_ROOT = resolve(HERE, '..', '..');
 
 // A load whose target is computed at runtime (`import(expr)`, `require(expr)`, `createRequire`, `import.meta.glob`)
 // is invisible to the literal graph, so any file that has one counts as "may reach a covered file".
-const OPAQUE_LOAD = /\bimport\(\s*(?!['"`][^'"`$]*['"`]\s*\))|\brequire\(\s*(?!['"`][^'"`$]*['"`]\s*\))|import\.meta\.glob|\bcreateRequire\b/;
+// JS allows whitespace and comments between the keyword and its `(` (`import (p)`, `require /* c */ (p)`), so GAP
+// swallows them. Comment bodies are length-bounded so a pathological file (thousands of unclosed `import /*`) stays
+// linear; a comment directly after the keyword that GAP cannot close is treated as opaque (fail open) instead.
+// A literal argument that is not the WHOLE argument (`import('./x' + p)`) is still opaque, and the lookahead sits
+// right after `(` so spaces inside the parens (`import( './x' )`) do not backtrack into a false "opaque".
+const NL = String.raw`\n\r  `;
+const GAP = String.raw`(?:\s|\/\*[\s\S]{0,200}?\*\/|\/\/[^${NL}]{0,200}(?:[${NL}]|$))*`;
+const CALL = String.raw`\((?!\s*['"\`][^'"\`$]*['"\`]\s*\))`;
+const OPAQUE_LOAD = new RegExp([
+  String.raw`\b(?:import|require)${GAP}(?:\?\.${GAP})?${CALL}`, // import(p) require (p) require?.(p)
+  String.raw`\b(?:importActual|requireActual)${GAP}${CALL}`, // vi.importActual(p) with a computed path
+  String.raw`\b(?:import|require)\s*\/[*\/]`, // a comment right after the keyword GAP could not close
+  String.raw`import\s*\.\s*meta\s*\.\s*glob`,
+  String.raw`\bcreateRequire\b`,
+  String.raw`[=,(]\s*require\s*[;,)\n]`, // `(0, require)(p)` / `const r = require` — require used as a value
+].join('|'));
 const EXTS = ['', '.mjs', '.js', '.ts', '.tsx', '.cjs', '.json'];
-const PATH_LITERAL = /['"`]((?:\.{1,2}\/|[A-Za-z0-9_@-][\w@./-]*\/)[\w@./-]*[\w-])['"`]/g;
+// TS-ESM style specifiers name the emitted extension (`./x.js`) while the file on disk is the source (`x.ts`).
+const SOURCE_EXT = { '.js': ['.ts', '.tsx'], '.mjs': ['.mts'], '.cjs': ['.cts'] };
+// Includes bare `.` / `..` and trailing-slash directory specifiers (their index file is an edge) and tolerates a
+// `?raw` / `?worker` / `#hash` suffix, which is stripped before resolving.
+const PATH_LITERAL = /['"`]((?:\.{1,2}(?:\/[\w@./-]*)?|[A-Za-z0-9_@-][\w@./-]*\/[\w@./-]*)(?:[?#][^'"`\s]*)?)['"`]/g;
 
 /** Plane directories named by `coverage.include` entries shaped `<dir>/**\/*.ts`. */
 export function planeDirsFromInclude(include) {
@@ -47,6 +66,11 @@ export function makeIsCovered(planeDirs, tierFiles = TRUST_CHAIN_TIER_FILES) {
 function resolveFile(base) {
   for (const ext of EXTS) {
     const p = base + ext;
+    if (existsSync(p) && statSync(p).isFile()) return p;
+  }
+  const emitted = /\.(m?js|cjs)$/.exec(base)?.[0];
+  for (const ext of SOURCE_EXT[emitted] ?? []) {
+    const p = base.slice(0, -emitted.length) + ext;
     if (existsSync(p) && statSync(p).isFile()) return p;
   }
   for (const ext of EXTS.slice(1)) {
@@ -69,15 +93,18 @@ export function createReach({ repoRoot = REPO_ROOT, isCovered }) {
     if (edges.has(rel)) return edges.get(rel);
     const info = { deps: [], opaque: false };
     edges.set(rel, info);
-    if (!/\.(m?js|cjs|tsx?)$/.test(rel)) return info;
+    if (!/\.(m?js|cjs|[mc]?tsx?)$/.test(rel)) return info;
     let text;
-    try { text = readFileSync(join(repoRoot, rel), 'utf8'); } catch { return info; }
+    // An unreadable file's imports are unknown, so fail open: it may reach a covered file.
+    try { text = readFileSync(join(repoRoot, rel), 'utf8'); } catch { info.opaque = true; return info; }
     info.opaque = OPAQUE_LOAD.test(text);
     const dir = dirname(join(repoRoot, rel));
     const seen = new Set();
     for (const m of text.matchAll(PATH_LITERAL)) {
-      const lit = m[1];
-      if (lit.startsWith('@')) continue; // package / alias specifier, not a WE file
+      const lit = m[1].replace(/[?#].*$/, '');
+      // package / alias specifier, not a WE file. Safe only while no vitest `resolve.alias` points into a coverage
+      // plane; coverage-reach.test.mjs pins that against the real config, so a new alias reddens there.
+      if (lit.startsWith('@')) continue;
       const abs = lit.startsWith('.') ? resolveFile(resolve(dir, lit)) : resolveFile(resolve(repoRoot, lit));
       if (!abs) continue;
       const dep = toRel(repoRoot, abs);
