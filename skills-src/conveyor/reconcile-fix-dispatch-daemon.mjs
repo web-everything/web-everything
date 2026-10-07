@@ -947,7 +947,7 @@ export function withFixDispatchClaimRefresh(effects, { log = console, refresh = 
         log.error(`reconcile-fix-dispatch-daemon: refreshed live claim ${r.kind}-${r.pr} (${r.repo}) — still owned by ${r.owner}`);
       }
       for (const r of result?.released ?? []) {
-        log.error(`reconcile-fix-dispatch-daemon: released settled claim ${r.kind}-${r.pr} (${r.repo}) — overlap slot free`);
+        log.error(`reconcile-fix-dispatch-daemon: released ${r.reason ? 'dead borrowed' : 'settled'} claim ${r.kind}-${r.pr} (${r.repo}) — ${r.reason ?? 'overlap slot free'}`);
       }
       return tick(...args);
     },

@@ -8,7 +8,7 @@ import { createFixBorrowGate } from '../../lib/fix-slot-borrow.mjs';
 import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT } from '../dispatch-providers/fix.mjs';
-import { parseFixRunArgv, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig } from '../fix-run.mjs';
+import { parseFixRunArgv, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig } from '../fix-run.mjs';
 
 const MIN = 60_000;
 let clock = 1_000_000;
@@ -81,6 +81,7 @@ describe('runFixCli', () => {
     const run = vi.fn((cmd, args, opts) => {
       calls.push([cmd, ...args]);
       envs.push(opts?.env);
+      if (cmd === 'gh') return JSON.stringify({ title: 'T', body: 'B' });
       if (args.includes('acquire')) return 'noise\n/lanes/lane-5\n';
       if (args[0] === 'rev-parse') return heads.shift();
       return '';
@@ -92,14 +93,14 @@ describe('runFixCli', () => {
       write: vi.fn((_r, _p, sha) => { owed.sha = sha; }),
       clear: vi.fn(() => { owed.sha = null; }),
     };
-    return { calls, envs, run, spawn, owed, pendingRearm, io: { run, pendingRearm, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
+    return { calls, envs, run, spawn, owed, pendingRearm, io: { run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
   it('runs codex in the acquired lane with the brief, pushes (no force), re-arms, releases', async () => {
     const m = mk(['aaa', 'bbb']);
     const { code, result } = await runFixCli(argv, m.io);
     expect(code).toBe(0);
     expect(result).toMatch(/re-armed/);
-    expect(m.spawn.mock.calls[0][0].prompt).toBe(SANDBOX_PREAMBLE + 'BRIEF');
+    expect(m.spawn.mock.calls[0][0].prompt).toBe(SANDBOX_PREAMBLE + renderPrContext(JSON.stringify({ title: 'T', body: 'B', comments: [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }] })) + 'BRIEF');
     expect(m.spawn.mock.calls[0][1].resolveLane()).toBe('/lanes/lane-5');
     const flat = m.calls.map((c) => c.join(' '));
     expect(flat.some((c) => c.includes(`git ${HARDENED_GIT_ARGS.join(' ')} push --no-verify origin HEAD:refs/heads/lane/7-x`) && !c.includes('force'))).toBe(true);
@@ -173,6 +174,7 @@ describe('runFixCli', () => {
     let cfg = 0;
     const run = vi.fn((cmd, args) => {
       calls.push([cmd, ...args]);
+      if (cmd === 'gh') return '{}';
       if (args.includes('acquire')) return '/lanes/lane-5';
       if (args[0] === 'rev-parse') return cfg++ ? 'bbb' : 'aaa';
       if (args[0] === 'config') return calls.filter((c) => c[1] === 'config').length === 1 ? 'remote.origin.url=https://x/r' : 'remote.origin.url=https://evil/r';
