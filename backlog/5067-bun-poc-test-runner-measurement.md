@@ -117,3 +117,42 @@ once to confirm the 97% holds beyond the sample.
    we:scripts/__tests__/gemini-direct-task.test.mjs, reports 147 pass, 0 fail (0 pass, 147 fail without the
    shim).
 2. The operator rules on the recommendation above, and the owed follow-ups are filed or declined.
+
+## Native trial (item 112, 2026-10-07): tests rewritten for bun:test, no shim
+
+Code: we:bun-trial/setup.ts (native `--preload` replacing we:vitest.setup.ts), we:bun-trial/env-stub.ts, we:bun-trial/tools/port.mjs
+(codemod), we:bun-trial/tools/measure.sh, 47 test copies mirrored under we:bun-trial/scripts/. vitest, package scripts and CI are
+untouched. Run: `bun test --parallel=4 --preload we:bun-trial/setup.ts <files in we:bun-trial/slice.txt, prefixed bun-trial/>`.
+
+Slice: 17 slowest by recent vitest timing, 22 mock-module files, 8 plain. 2126 vitest tests; bun passes all but 13
+(gh-app-shim 7, docket-refresh 5, judge-spawn firmlink 1).
+
+Host was NEVER quiet (1-min load 16 to 44 on 12 cores, 1.3 to 3.7 per core; load checked, then measured with load
+recorded). Peak RSS = `/usr/bin/time -l` largest process; the bun small-run RSS (about 70 MB) only saw the parent: unusable.
+
+| run | runner | wall s (3 runs) | CPU s user+sys | peak RSS MB | load at start |
+|---|---|---|---|---|---|
+| (a) 4 files, 284 tests | vitest | 60.8 / 56.8 / 54.2 | 50.7 / 49.9 / 47.8 | 1012-1028 | 16 / 27 / 28 |
+| (a) | bun | 42.7 / 35.0 / 37.1 | 27.7 / 25.6 / 27.3 | n/a | 26 / 23 / 33 |
+| (b) 47 files, 2126 tests | vitest | 156.5 / 142.8 / 140.0 | 450 / 422 / 418 | 1677 / 1437 / 1449 | 35 / 37 / 30 |
+| (b) | bun (13 tests fail) | 123.6 / 155.7 / 117.3 | 385 / 390 / 373 | 1130 / 1139 / 1140 | 22 / 44 / 40 |
+
+(a) bun is about 35% faster wall and 45% less CPU. (b) bun median wall is 13% better but one run was slower than every
+vitest run (load 44), CPU only 8% lower, and 13 tests do not pass. Not a clear win on both.
+
+Per-file outliers (sequential, one process each; bun wall vs vitest duration under load): bun wins big on
+lane-drain-numbering 27 vs 56 s, ci-heal-mark 38 vs 59, health-watch 28 vs 46, probation-build-run 25 vs 38,
+card-batch-io 21 vs 30. Ties (child-process bound): queue-prune, principle-surface, queue, daemon-rebuild-ready
+(51 vs 54). Small files lose to ~0.3 s bun process start. Hang outlier: an async `mock.module` factory that awaits
+`import()` of another mocked module (duplicate-pr-watch, parked-pr-progress-watch) spins at 100% CPU forever and the
+test timeout never fires.
+
+No clean bun equivalent: `importOriginal` factory argument (snapshot the module before mocking instead); `vi.resetModules`
+/`vi.doMock` (ESM registry cannot be cleared, cache-bust with a `?n` query); `vi.stubEnv`/`unstubAllEnvs` (own helper);
+`vi.hoisted` and mock hoisting (order by hand); `vi.setConfig` (only global `setDefaultTimeout`); `ctx.skip()` test
+context (none; a test taking an arg waits for a done callback and times out); async fake timers. Also: `--isolate`/
+`--parallel` is opt-in, the `VITEST` guard env must be set by the preload, child `node` becomes bun (gh-app-shim,
+docket-refresh differ; `realpathSync.native` resolves firmlinks differently), no per-path pool or happy-dom config.
+
+Verdict: NO-GO to adopt. (a) is a clear win, (b) is not (noisy 13% wall, 8% CPU, 13 non-portable tests, hand rewrite
+per mock-heavy file). Re-measure on a quiet host only if the 13 gaps are closed.
