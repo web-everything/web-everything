@@ -43,7 +43,7 @@ describe('createDispatchThrottle', () => {
   it('refuses fix-cap at the cap, counting launches admitted in the same pass', () => {
     const t = createDispatchThrottle({ ...idle, env: {}, listClaims: () => [claim('fix', 1)] });
     expect(t.tryAdmit('fix').admit).toBe(true);
-    expect(t.tryAdmit('ci-heal')).toMatchObject({ admit: false, kind: 'fix-cap' });
+    expect(t.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'fix-cap' });
   });
   it('refuses host-load when the machine is hot, with free slots', () => {
     const t = createDispatchThrottle({ loadavg: () => 36, cpuCount: () => 12, env: {}, listClaims: () => [] });
