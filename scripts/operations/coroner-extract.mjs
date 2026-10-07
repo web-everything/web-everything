@@ -3,14 +3,19 @@
  * not necessarily the requested window. Admission ledgers are also bounded (8 MiB each).
  * Percentiles use nearest rank: sorted[ceil(p * n) - 1]; empty populations report zero.
  * Missing gate results have no inferred duration. Overlapping gates are summed; share is capped at 1.
+ * errorRates is the first output key. WE_CORONER_COORD (build-dispatch log), WE_CORONER_BUILD_TAIL (tick-row tail bytes) and
+ * WE_CORONER_NO_CI (skip gh) are the extra knobs; the gh read is bounded to 5 run pages and 40 job lookups.
  */
 import fs from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
-import { expandRepeatedLines, stripLogTimestamp } from '../lib/log-timestamp.mjs';
+import { classifyCardOnly } from '../ci-card-only.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { LOG_TIMESTAMP_RE, expandRepeatedLines, stripLogTimestamp } from '../lib/log-timestamp.mjs';
 
 const MiB = 1024 * 1024;
 const MAX_LINE = 256 * 1024;
@@ -128,7 +133,7 @@ export const normalizeCommand = (command) => command.replace(/\s+/g, ' ').trim()
 /** IO: positional chunk reads, strictly <= cap bytes, with bounded line buffering.
  * Head/tail windows never splice partial records together. Oversized lines are discarded.
  */
-export function readBounded(file, { cap = 8 * MiB, tailOnly = false, io = fs } = {}) {
+export function readBounded(file, { cap = 8 * MiB, tailOnly = false, io = fs, maxLine = MAX_LINE } = {}) {
   let fd, bytesRead = 0;
   const lines = [];
   let truncated = false;
@@ -153,7 +158,7 @@ export function readBounded(file, { cap = 8 * MiB, tailOnly = false, io = fs } =
           if (i !== n && buffer[i] !== 10) continue;
           if (!skip) {
             lineBytes += i - from;
-            if (lineBytes > MAX_LINE) { skip = true; parts = []; }
+            if (lineBytes > maxLine) { skip = true; parts = []; }
             else parts.push(Buffer.from(buffer.subarray(from, i)));
           }
           if (i < n) emit();
@@ -195,7 +200,7 @@ export function parseTranscript(entries) {
     const ms = result && Number.isFinite(stamp(result.timestamp)) && Number.isFinite(stamp(use.timestamp)) ? elapsed(result.timestamp, use.timestamp) : null;
     // lane-verify.mjs emits { status: 'timeout', reason: 'wait-timeout' };
     // match the reason token as well as older textual timeout reports.
-    gates.push({ ms, kinds: [...kinds], waitTimeout: /wait-timeout|timed out waiting|wait ceiling/i.test(result?.text ?? '') });
+    gates.push({ ms, at: use.timestamp, kinds: [...kinds], waitTimeout: /wait-timeout|timed out waiting|wait ceiling/i.test(result?.text ?? '') });
   }
   const counts = new Map();
   for (const command of commands) add(counts, command);
@@ -218,12 +223,306 @@ export function sessionOutcome(state) {
   return typeof state.state === 'string' && state.state ? state.state : 'unknown';
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// Error rates (reported first). Every metric is { count, total, pct, basis, causes: { cause: { count, pct, minutes?,
+// examples: [{ ref, at }] } } } with at most two examples per cause. Pure: all inputs are already-read data.
+// ---------------------------------------------------------------------------------------------------------------
+const pct = (count, total) => total ? round(100 * count / total, 1) : 0;
+const refCompare = (a, b) => compare(a.at ?? '', b.at ?? '') || compare(a.ref ?? '', b.ref ?? '');
+/** items: [{ cause, ref, at, ms? }] -> metric. Examples are the two most recent per cause (stable order). */
+export function rateMetric(items, total, basis, extra = {}) {
+  const by = new Map();
+  for (const item of items) { const g = by.get(item.cause) ?? []; g.push(item); by.set(item.cause, g); }
+  const causes = {};
+  for (const [cause, group] of [...by].sort(([a, x], [b, y]) => y.length - x.length || compare(a, b))) {
+    const ms = sum(group.map((g) => Number.isFinite(g.ms) ? g.ms : 0));
+    causes[cause] = { count: group.length, pct: pct(group.length, items.length), ...(ms > 0 ? { minutes: minutes(ms) } : {}), examples: group.filter((g) => g.ref).sort((a, b) => refCompare(b, a)).slice(0, 2).map(({ ref, at }) => ({ ref, at })) };
+  }
+  return { count: items.length, total, pct: pct(items.length, total), basis, causes, ...extra };
+}
+
+/** Marker (one `.lane-verify` record) -> gate-run cause. Timeouts and isolated-retry verdicts are recorded by verify-lane. */
+export function gateCause(marker) {
+  if (marker.status === 'timeout' || marker.reason === 'wait-timeout') return 'verify-wait-timeout';
+  if (marker.isolatedRetry === 'flaky-outside-diff') return 'flaky-outside-diff';
+  if (marker.isolatedRetry === 'still-red') return 'still-red-after-isolated-retry';
+  const failures = Array.isArray(marker.retriedFailures) ? marker.retriedFailures : [];
+  if ((Array.isArray(marker.retriedTimeouts) && marker.retriedTimeouts.length) || (failures.length && failures.every((f) => f?.kind === 'timeout'))) return 'vitest-timeout';
+  return 'in-diff-real-failure';
+}
+
+const SOAK = /soak/i;
+export function ciCheckName(jobName, runName = '') {
+  const name = String(jobName || '');
+  if (/codeql/i.test(name) || /codeql/i.test(runName)) return 'CodeQL';
+  if (/daemon-soak/i.test(name)) return 'daemon-soak';
+  if (SOAK.test(name) || SOAK.test(runName)) return 'soak-shard';
+  if (/smoke/i.test(name)) return 'smoke';
+  if (/review.?gate/i.test(name) || /review.?gate/i.test(runName)) return 'review-gate';
+  if (/^test|shard|vitest|unit/i.test(name)) return 'test-shard';
+  return name ? name.replace(/\s*\([^)]*\)\s*$/, '') || 'unknown' : 'ci-unspecified';
+}
+
+/** CI runs per PR head. `ciRuns`: [{ id, name, conclusion, headSha, pr, runAttempt, createdAt, updatedAt, jobs? }]. */
+export function ciMetrics(ciRuns, window) {
+  const all = ciRuns.filter((r) => r.conclusion && inWindow(r.createdAt, window));
+  // Review gate is red by design while a PR awaits review: reported apart, never an error.
+  const isReview = (r) => /review.?gate/i.test(r.name);
+  const awaitingReview = all.filter((r) => isReview(r) && r.conclusion !== 'success' && r.conclusion !== 'cancelled');
+  // One verdict per (PR head, workflow): the latest run. An earlier red that a later run cleared is a recovered flake.
+  const latest = new Map(), earlierRed = new Set();
+  for (const r of all.filter((x) => !isReview(x)).sort((x, y) => compare(x.createdAt, y.createdAt) || (x.runAttempt ?? 0) - (y.runAttempt ?? 0))) {
+    const key = `${r.headSha}|${r.name}`, prev = latest.get(key);
+    if (prev && ['failure', 'timed_out', 'startup_failure'].includes(prev.conclusion) && r.conclusion === 'success') earlierRed.add(key);
+    latest.set(key, r);
+  }
+  const runs = [...latest.values()];
+  const refOf = (r) => r.pr ? `PR #${r.pr}` : `sha ${String(r.headSha).slice(0, 7)}`;
+  const superseded = runs.filter((r) => r.conclusion === 'cancelled');
+  const red = runs.filter((r) => ['failure', 'timed_out', 'startup_failure'].includes(r.conclusion));
+  const byCheck = [], byCause = [];
+  for (const r of red) {
+    const ref = refOf(r), ms = elapsed(r.updatedAt, r.createdAt);
+    const failedJobs = (r.jobs ?? []).filter((j) => ['failure', 'timed_out'].includes(j.conclusion));
+    const checks = new Set(failedJobs.length ? failedJobs.map((j) => ciCheckName(j.name, r.name)) : [ciCheckName('', r.name)]);
+    for (const check of checks) byCheck.push({ cause: check, ref, at: r.createdAt, ms });
+    const soak = [...checks].some((c) => c === 'soak-shard' || c === 'daemon-soak');
+    byCause.push({ cause: r.conclusion !== 'failure' ? 'infra' : soak ? 'soak-scenario' : 'real-code-defect', ref, at: r.createdAt, ms });
+  }
+  return {
+    runs: rateMetric(byCause, runs.length, 'latest completed run per PR head and workflow (review-gate excluded)', {
+      heads: new Set(runs.map((r) => r.headSha)).size, redHeads: new Set(red.map((r) => r.headSha)).size,
+      superseded: rateMetric(superseded.map((r) => ({ cause: 'cancelled-superseded', ref: refOf(r), at: r.createdAt })), runs.length, 'same basis'),
+      flakyRecovered: earlierRed.size,
+      awaitingReview: { count: awaitingReview.length, note: 'review-gate not green while a PR awaits review: by design, not an error' },
+      byCheck: rateMetric(byCheck, runs.length, 'same basis (a run can fail several checks)').causes,
+    }),
+  };
+}
+
+const FIX_KINDS = new Set(['fix', 'ci-heal']);
+/** Outcome of a fix/ci-heal session from its state and its final one-line outcome text. First match wins. */
+export function fixOutcome(state, text = '') {
+  const value = `${typeof state.detail === 'string' ? state.detail : ''} ${text}`;
+  if (state.state === 'stopped' || /^\s*stopped\s*$/i.test(state.detail ?? '')) return 'stopped-without-outcome';
+  if (/load.?flake|quiet.?host/i.test(value)) return 'load-flake-hold';
+  if (/gate.?red|verify.?red|gate red/i.test(value)) return 'gate-red-not-pushed';
+  if (/escalat/i.test(value)) return 'escalated';
+  if (/no (?:ci )?break|no red checks|no-op|not-applicable|stood down|no heal|heal no-op|cancelled leftovers|nothing to/i.test(value)) return 'no-op';
+  if (/blocked|refus|denied/i.test(value) || /refus|blocked/i.test(sessionOutcome(state))) return 'blocked';
+  if (/push|re-?armed|fixed|repaired|green|verified|hardened|merged main/i.test(value)) return 'pushed';
+  return 'other';
+}
+
+/** Builder launches from build-dispatch-daemon tick rows ({ at, dispatched[], failures[] }). */
+export const cardKindOf = (num, cardNames = []) => cardNames.some((n) => n.startsWith(`${num}-`) && /-prevention-/.test(n)) ? 'prevention-card' : 'build';
+function summarizeLaunches(items, ticks) {
+  const seen = new Map();
+  for (const i of items) { const g = seen.get(i.num) ?? []; g.push(i.at); seen.set(i.num, g); }
+  // A card attempted in more than one tick was re-dispatched: every attempt after its first is a repeat.
+  const repeats = [];
+  for (const [num, ats] of seen) for (const at of ats.slice(1)) repeats.push({ cause: 'repeated-same-card', ref: `card ${num}`, at });
+  const attempts = items.length;
+  const base = rateMetric(items.filter((i) => i.cause !== 'launched'), attempts, 'launch attempts', { launched: items.filter((i) => i.cause === 'launched').length, ticks });
+  const repeated = rateMetric(repeats, attempts, 'launch attempts');
+  base.causes = { ...base.causes, ...Object.fromEntries(Object.entries(repeated.causes).map(([k, v]) => [k, { ...v, pct: pct(v.count, attempts) }])) };
+  base.repeatedSameCard = repeated.count;
+  return base;
+}
+/** Launch attempts: build/prevention-card from `dispatched`/`failures`; prepare from `prepare.launched`/`prepare.failures`. */
+export function builderMetrics(ticks, window, cardNames = []) {
+  const inTick = ticks.filter((t) => inWindow(t.at, window));
+  const items = [], prepSeen = new Set();
+  const list = (v) => Array.isArray(v) ? v : [];
+  const failCause = (f) => /not confirmed/i.test(String(f.reason ?? f.evidence?.reason ?? '')) ? 'launch-not-confirmed' : 'failed';
+  for (const t of inTick) {
+    for (const d of list(t.dispatched)) items.push({ cause: 'launched', ref: `card ${d.num}`, at: t.at, num: d.num, kind: cardKindOf(d.num, cardNames) });
+    for (const f of list(t.failures)) if (f?.stage === 'dispatch') items.push({ cause: failCause(f), ref: `card ${f.num}`, at: t.at, num: f.num, kind: cardKindOf(f.num, cardNames) });
+    // prepare lists are cumulative across ticks: one event per (card, attempt stamp), at the stamp's own time.
+    for (const d of list(t.prepare?.launched)) if (!prepSeen.has(`l|${d.num ?? d}|${d.attempt ?? d.at ?? ''}`) && prepSeen.add(`l|${d.num ?? d}|${d.attempt ?? d.at ?? ''}`)) items.push({ cause: 'launched', ref: `card ${d.num ?? d}`, at: t.at, num: `prepare:${d.num ?? d}`, kind: 'prepare' });
+    for (const f of list(t.prepare?.failures)) if (!prepSeen.has(`f|${f.num}|${f.attempt ?? ''}`) && prepSeen.add(`f|${f.num}|${f.attempt ?? ''}`)) items.push({ cause: failCause(f), ref: `card ${f.num}`, at: f.attempt ?? t.at, num: `prepare:${f.num}`, kind: 'prepare' });
+  }
+  const main = summarizeLaunches(items.filter((i) => i.kind !== 'prepare'), inTick.length);
+  main.byKind = Object.fromEntries(['build', 'prevention-card', 'prepare'].map((k) => [k, summarizeLaunches(items.filter((i) => i.kind === k), inTick.length)]));
+  return main;
+}
+
+const DAEMON_PATTERNS = [
+  ['smokeFailures', /\bsmoke-fail(?:ed|ure)?\b/, /daemon-rebuild: smoke|\bsmoke-fail/, 'smoke events'],
+  ['concurrentMover', /concurrent-mover/, null, 'log lines'],
+  ['tickInProgress', /tick-in-progress/, null, 'log lines'],
+  ['rateLimit', /rate limit (?:exceeded|hit)|secondary rate limit|gh-throttle[^\n]*(?:backoff|rate limit)/i, null, 'log lines'],
+  ['ghReadFailures', /Command failed: gh |gh read fail|gh: [^\n]*\(HTTP 5\d\d\)/, null, 'log lines'],
+];
+/** `entries`: [{ source, at, line }] already expanded (repeat markers replayed) and windowed. */
+export function daemonMetrics(entries) {
+  const out = {};
+  for (const [key, pattern, basisPattern, basis] of DAEMON_PATTERNS) {
+    const hits = entries.filter((e) => pattern.test(e.line) && !(key === 'ghReadFailures' && DAEMON_PATTERNS[3][1].test(e.line)));
+    const total = basisPattern ? entries.filter((e) => basisPattern.test(e.line)).length : entries.length;
+    out[key] = rateMetric(hits.map((e) => ({ cause: key === 'ghReadFailures' ? (e.line.match(/--repo (\S+)/)?.[1] ?? 'other') : e.source, ref: e.source, at: e.at })), total, basis);
+  }
+  return out;
+}
+
+/** Attribute each log line to the nearest preceding timestamp (many daemon lines carry none); drop what has no anchor. */
+export function stampedEntries(lines, source, window) {
+  let at = null, unattributed = 0;
+  const entries = [], unanchored = [];
+  for (const raw of lines) {
+    const m = LOG_TIMESTAMP_RE.exec(raw);
+    if (m) at = m[0].trim();
+    if (!at) { unattributed++; unanchored.push(raw); continue; }
+    if (inWindow(at, window)) entries.push({ source, at, line: stripLogTimestamp(raw) });
+  }
+  return { entries, unattributed, unanchored };
+}
+
+/** Parse build-dispatch tick rows (`{"at":..,"timings":..,"dispatched":[..],"failures":[..]}`), tolerating a stamp prefix. */
+export function parseBuildTicks(lines) {
+  const out = [];
+  for (const line of lines) {
+    const i = line.indexOf('{"at"');
+    if (i < 0) continue;
+    const row = json(line.slice(i));
+    if (row && typeof row.at === 'string') out.push({ at: row.at, dispatched: row.dispatched, failures: row.failures, prepare: row.prepare && { launched: row.prepare.launched, failures: row.prepare.failures } });
+  }
+  return out;
+}
+
+export function buildErrorRates({ window, notes = {}, prsOpened = [], prKinds = {}, cardNames = [], cutoff, gateRuns, killed, waitTimeouts, fixSessions, ciRuns, buildTicks, daemonEntries }) {
+  const gateItems = [
+    ...gateRuns.filter((g) => g.red).map((g) => ({ cause: g.cause, ref: g.ref, at: g.at, ms: g.ms })),
+    ...killed.map((k) => ({ cause: 'killed-superseded', ref: k.ref, at: k.at })),
+    ...waitTimeouts,
+  ];
+  const gateTotal = gateRuns.length + killed.length + waitTimeouts.length;
+  const fixOutcomes = rateMetric(fixSessions.map((s) => ({ cause: s.outcome, ref: s.pr ? `PR #${s.pr}` : `session ${s.session}`, at: s.at, ms: s.ms })), fixSessions.length, 'fix/ci-heal sessions');
+  const rounds = new Map();
+  for (const s of fixSessions) if (s.pr) rounds.set(s.pr, (rounds.get(s.pr) ?? 0) + 1);
+  const roundList = [...rounds].map(([pr, n]) => ({ pr, rounds: n })).sort((a, b) => b.rounds - a.rounds || a.pr - b.pr);
+  return {
+    gateRuns: { ...rateMetric(gateItems, gateTotal, 'local gate attempts (lane markers + verify-daemon kills + wait-timeouts)', { flakyRescuedGreen: gateRuns.filter((g) => !g.red && g.cause === 'flaky-outside-diff').length, markerSample: 'each lane keeps only its last two markers' }) },
+    ci: ciMetrics(ciRuns, window).runs,
+    fixSessions: { ...fixOutcomes, rounds: { prs: roundList.length, multiRoundPrs: roundList.filter((r) => r.rounds > 1).length, max: roundList[0]?.rounds ?? 0, top: roundList.slice(0, 5) } },
+    builderLaunches: builderMetrics(buildTicks, window, cardNames),
+    daemonErrors: daemonMetrics(daemonEntries),
+    mergeConflicts: conflictMetrics(conflictEvents(daemonEntries, fixSessions), prsOpened, window, cutoff),
+    byKind: Object.fromEntries(['code', 'card-only'].map((kind) => {
+      const mine = (pr) => (prKinds[pr] ?? 'code') === kind;
+      const fix = fixSessions.filter((s) => mine(s.pr)), opened = prsOpened.filter((p) => mine(p.number));
+      const r = new Map(); for (const s of fix) if (s.pr) r.set(s.pr, (r.get(s.pr) ?? 0) + 1);
+      const rl = [...r].map(([pr, n]) => ({ pr, rounds: n })).sort((a, b) => b.rounds - a.rounds || a.pr - b.pr);
+      const ttm = opened.filter((p) => p.mergedAt && inWindow(p.mergedAt, window)).map((p) => elapsed(p.mergedAt, p.createdAt));
+      return [kind, {
+        prsOpened: opened.length,
+        timeToMerge: { merged: ttm.length, medianMin: minutes(percentile(ttm, 0.5)), p90Min: minutes(percentile(ttm, 0.9)) },
+        ci: ciMetrics(ciRuns.filter((x) => mine(x.pr)), window).runs,
+        fixSessions: { ...rateMetric(fix.map((s) => ({ cause: s.outcome, ref: s.pr ? `PR #${s.pr}` : `session ${s.session}`, at: s.at, ms: s.ms })), fix.length, 'fix/ci-heal sessions'), rounds: { prs: rl.length, multiRoundPrs: rl.filter((x) => x.rounds > 1).length, max: rl[0]?.rounds ?? 0, top: rl.slice(0, 5) } },
+        mergeConflicts: conflictMetrics(conflictEvents(daemonEntries, fixSessions).filter((i) => mine(i.pr)), opened, window, cutoff),
+      }];
+    })),
+    notes: { classifiedPrs: Object.keys(prKinds).length, note_kind: 'card-only = every changed path under backlog/ (scripts/ci-card-only.mjs); unclassified PRs count as code', ciRunsTruncated: Boolean(notes.ciRunsTruncated), verifyLogUnstampedLines: notes.verifyUnstamped ?? 0, verifyLogUnstampedSuperseded: notes.verifyUnstampedSuperseded ?? 0, note: 'lines with no preceding timestamp (before #4076) cannot be placed in the window and are excluded' },
+  };
+}
+
+/** Operator-reported date scoping was tightened (2026-10-06 ~15:00 ET); conflicts are reported before/after it. */
+export const SCOPING_CUTOFF = '2026-10-06T19:00:00.000Z';
+const CONFLICT_EVENTS = [
+  ['mechanical-rebase', /unowned-mechanical-rebase|stacked-rebase|rebase-onto-main|rebase-cap-exhausted/],
+  ['conflict-fix-round', /dispatch-conflict-fix|fixing-conflict|escalated-conflict|conflictFixRoundsSpent|conflict-resolution/],
+  ['drain-overlap-yield', /overlap-yield/],
+  ['scope-overlap-wait', /scope-overlap/],
+];
+/** Merge-conflict events from stamped daemon lines, conflict-fix sessions, and newly CONFLICTING PRs. */
+export function conflictEvents(daemonEntries, fixSessions) {
+  const items = [];
+  for (const e of daemonEntries) {
+    for (const m of e.line.matchAll(/"num":(\d+),"isConflicting":true[^}]*?"newlyDetected":true/g)) items.push({ cause: 'newly-conflicting-pr', ref: `PR #${m[1]}`, pr: Number(m[1]), at: e.at });
+    const hit = CONFLICT_EVENTS.find(([, pattern]) => pattern.test(e.line));
+    if (hit) { const n = e.line.match(/PR #(\d+)|#(\d{3,})|fix-(\d+)/)?.slice(1).find(Boolean); items.push({ cause: hit[0], ref: n ? `PR #${n}` : e.source, pr: n ? Number(n) : null, at: e.at }); }
+  }
+  for (const f of fixSessions) if (f.conflict) items.push({ cause: 'conflict-fix-session', ref: f.pr ? `PR #${f.pr}` : `session ${f.session}`, pr: f.pr, at: f.at, ms: f.ms });
+  return items;
+}
+export function conflictMetrics(items, prsOpened, window, cutoff = SCOPING_CUTOFF) {
+  const part = (from, to) => {
+    const w = { since: from, until: to };
+    const opened = prsOpened.filter((p) => inWindow(p.createdAt, w)).length;
+    const mine = items.filter((i) => inWindow(i.at, w));
+    const hours = round((stamp(to) - stamp(from)) / 3600000, 1);
+    return { window: w, hours, ...rateMetric(mine, opened, 'PRs opened in the period (events can exceed PRs)', { prsOpened: opened, eventsPerPr: opened ? round(mine.length / opened, 2) : 0, minutes: minutes(sum(mine.map((i) => Number.isFinite(i.ms) ? i.ms : 0))) }) };
+  };
+  const cut = new Date(cutoff).toISOString();
+  const beforeEnd = stamp(window.until) < stamp(cut) ? window.until : cut, afterStart = stamp(window.since) > stamp(cut) ? window.since : cut;
+  return {
+    ...part(window.since, window.until),
+    beforeAfter: { cutoff: cut, before: stamp(window.since) < stamp(beforeEnd) ? part(window.since, beforeEnd) : null, after: stamp(afterStart) < stamp(window.until) ? part(afterStart, window.until) : null },
+  };
+}
+
+/** Bounded gh read of PRs opened in the window (<= 5 pages, newest first). */
+export function fetchOpenedPrs(window, gh, { repo = CONSTELLATION_REPOS.we.slug, maxPages = 5 } = {}) {
+  const out = [];
+  if (typeof gh !== 'function') return { prs: out, found: false };
+  let found = false;
+  for (let page = 1; page <= maxPages; page++) {
+    const data = gh(['api', `repos/${repo}/pulls?state=all&sort=created&direction=desc&per_page=100&page=${page}`]);
+    if (!Array.isArray(data)) break;
+    found = true;
+    for (const p of data) if (p?.created_at) out.push({ number: p.number, createdAt: p.created_at, mergedAt: p.merged_at ?? null });
+    if (data.length < 100 || stamp(data.at(-1)?.created_at) < stamp(window.since)) break;
+  }
+  return { prs: out.filter((p) => inWindow(p.createdAt, window)), found };
+}
+
+/** Classify PRs card-only vs code from their changed paths (bounded: `cap` REST lookups, fail-closed to code). */
+export function fetchPrKinds(numbers, gh, { repo = CONSTELLATION_REPOS.we.slug, cap = 250 } = {}) {
+  const kinds = {};
+  if (typeof gh !== 'function') return kinds;
+  for (const n of [...new Set(numbers.filter(Boolean))].slice(0, cap)) {
+    const files = gh(['api', `repos/${repo}/pulls/${n}/files?per_page=100`]);
+    if (!Array.isArray(files)) continue;
+    // 100+ files cannot be proven card-only from one page: fail closed.
+    kinds[n] = files.length < 100 && classifyCardOnly({ event: 'pull_request', files: files.map((f) => f.filename) }).light ? 'card-only' : 'code';
+  }
+  return kinds;
+}
+
+/** gh runner: JSON or null on any failure. Stderr is dropped so no credential text can leak into a report. */
+export function makeGh({ home = homedir(), env = process.env, exec = execFileSync } = {}) {
+  const shim = join(home, '.claude/github-app-token/gh-shim');
+  const PATH = fs.existsSync(shim) ? `${shim}:${env.PATH ?? ''}` : env.PATH;
+  return (args) => { try { return JSON.parse(exec('gh', args, { env: { ...env, PATH }, encoding: 'utf8', timeout: 45000, maxBuffer: 32 * MiB, stdio: ['ignore', 'pipe', 'ignore'] })); } catch { return null; } };
+}
+
+/** Bounded gh read: <= maxPages run pages and <= maxJobCalls job lookups (only non-green runs, newest first). */
+export function fetchCiRuns(window, gh, { repo = CONSTELLATION_REPOS.we.slug, maxPages = 8, maxJobCalls = 40 } = {}) {
+  if (typeof gh !== 'function') return { runs: [], found: false, calls: 0, truncated: false };
+  const created = encodeURIComponent(`${window.since}..${window.until}`);
+  const raw = []; let calls = 0, found = false, truncated = false;
+  for (let page = 1; page <= maxPages; page++) {
+    calls++;
+    const data = gh(['api', `repos/${repo}/actions/runs?event=pull_request&created=${created}&per_page=100&page=${page}`]);
+    if (!data || !Array.isArray(data.workflow_runs)) break;
+    found = true; raw.push(...data.workflow_runs);
+    if (data.workflow_runs.length < 100) break;
+    if (page === maxPages) truncated = true;
+  }
+  const runs = raw.map((r) => ({ id: r.id, name: r.name, conclusion: r.conclusion, headSha: r.head_sha, pr: r.pull_requests?.[0]?.number ?? null, runAttempt: r.run_attempt, createdAt: r.created_at, updatedAt: r.updated_at }));
+  const red = runs.filter((r) => !/review.?gate/i.test(r.name) && ['failure', 'timed_out', 'startup_failure'].includes(r.conclusion)).sort((a, b) => compare(b.createdAt, a.createdAt)).slice(0, maxJobCalls);
+  for (const r of red) { calls++; const data = gh(['api', `repos/${repo}/actions/runs/${r.id}/jobs?per_page=100`]); if (data && Array.isArray(data.jobs)) r.jobs = data.jobs.map((j) => ({ name: j.name, conclusion: j.conclusion })); }
+  return { runs, found, calls, truncated };
+}
+
 /** Pure metrics core. Input arrays may be unordered; sources and all maps are sorted. */
-export function extractMetrics({ window, sessions = [], durations = [], reaped = [], markers = [], verifyLines = [], refusalLines = [], sources = {} }) {
+export function extractMetrics({ window, sessions = [], durations = [], reaped = [], markers = [], verifyLines = [], refusalLines = [], ciRuns = [], prsOpened = [], prKinds = {}, cardNames = [], buildTicks = [], buildLines = [], daemonLogs = {}, sources = {} }) {
   const selected = sessions.filter(({ state }) => inWindow(state.createdAt || state.updatedAt, window))
     .sort((a, b) => compare(a.state.sessionId ?? a.state.name ?? '', b.state.sessionId ?? b.state.name ?? '') || compare(JSON.stringify(a), JSON.stringify(b)));
   const byKind = new Map(), outcomes = new Map(), prs = new Map(), denials = new Map(), holds = new Map(), reasons = new Map(), refusals = new Map(), refusalPrs = new Map();
-  const times = [], gates = [], loops = [], waits = [], reapedWaits = [], records = [];
+  const times = [], gates = [], loops = [], waits = [], reapedWaits = [], records = [], fixSessions = [], gateRuns = [];
+  const waitTimeoutItems = [];
   let waitTimeoutSessions = 0, transcriptsTruncated = 0, bytesRead = 0, waiterMs = 0;
   for (const { state, transcript = {} } of selected) {
     const ms = elapsed(state.lastTerminalAt || state.updatedAt, state.createdAt || state.updatedAt);
@@ -237,6 +536,8 @@ export function extractMetrics({ window, sessions = [], durations = [], reaped =
     const group = byKind.get(kind) ?? []; group.push(ms); byKind.set(kind, group);
     if (pr !== null) { const group = prs.get(pr) ?? []; group.push(ms); prs.set(pr, group); }
     gates.push(...parsed.gates);
+    if (FIX_KINDS.has(kind)) fixSessions.push({ session, pr, conflict: /conflict|rebase|merged? main/i.test(`${state.detail ?? ''} ${parsed.outcomeLine}`), outcome: fixOutcome(state, parsed.outcomeLine), at: state.lastTerminalAt || state.updatedAt || state.createdAt, ms });
+    for (const g of parsed.gates) if (g.waitTimeout) waitTimeoutItems.push({ cause: 'verify-wait-timeout', ref: `session ${session}`, at: g.at, ms: g.ms ?? 0 });
     if (parsed.gates.some((g) => g.waitTimeout)) waitTimeoutSessions++;
     for (const [type, count] of Object.entries(parsed.denials)) add(denials, type, count);
     loops.push(...parsed.loops.map((loop) => ({ session, ...loop })));
@@ -261,6 +562,8 @@ export function extractMetrics({ window, sessions = [], durations = [], reaped =
     const key = JSON.stringify([row.sha, row.startedAt]);
     if (markerSeen.has(key)) continue;
     markerSeen.add(key); markerCount++;
+    const cause = gateCause(row);
+    gateRuns.push({ red: row.status === 'red' || row.status === 'timeout', cause, ref: `sha ${String(row.sha ?? '').slice(0, 7)}`, at: row.finishedAt, ms: elapsed(row.finishedAt, row.startedAt) });
     const phases = row.phases ?? {};
     add(markerModes, phases.admissionMode ?? 'unknown');
     for (const [field, xs] of [['admissionWaitMs', waits], ['gateMs', markerGate], ['vitestMs', markerVitest], ['standardsMs', markerStandards]]) {
@@ -286,8 +589,13 @@ export function extractMetrics({ window, sessions = [], durations = [], reaped =
   const directVitest = gates.filter((g) => g.kinds.includes('directVitest'));
   const seconds = (xs, p = 0.5) => round(percentile(xs, p) / 1000);
   records.sort((a, b) => b.minutes - a.minutes || compare(a.session, b.session));
+  const stampedVerify = stampedEntries(verifyLines, 'verify-daemon', window);
+  const killed = stampedVerify.entries.filter((e) => /superseded by a newer request/.test(e.line)).map((e) => ({ ref: e.line.match(/web-everything\/lane-\d+/)?.[0] ?? 'verify-daemon', at: e.at }));
+  const daemonEntries = [stampedVerify.entries, ...Object.entries({ 'build-dispatch': buildLines, ...daemonLogs }).sort(([a], [b]) => compare(a, b)).map(([source, lines]) => stampedEntries(lines, source, window).entries)].flat();
+  const errorRates = buildErrorRates({ window, prsOpened, prKinds, cardNames, cutoff: sources.scopingCutoff, notes: { ciRunsTruncated: sources.ci?.truncated, verifyUnstamped: stampedVerify.unattributed, verifyUnstampedSuperseded: stampedVerify.unanchored.filter((l) => /superseded by a newer request/.test(l)).length }, gateRuns, killed, waitTimeouts: waitTimeoutItems.filter((w) => inWindow(w.at, window)), fixSessions, ciRuns, buildTicks, daemonEntries });
   return {
     window: { since: window.since, until: window.until },
+    errorRates,
     sessions: { ...stats(times), byKind: ordered(new Map([...byKind].map(([key, xs]) => [key, { count: xs.length, minutes: minutes(sum(xs)) }]))), outcomes: ordered(outcomes), records: records.slice(0, 60) },
     gate: { minutesInGate: minutes(gateMs), shareInGate: total ? round(Math.min(1, gateMs / total), 3) : 0, commands: gates.length, medianMin: minutes(percentile(verifyTimes, 0.5)), p90Min: minutes(percentile(verifyTimes, 0.9)), allCommands: stats(gateTimes), verifyLane: { calls: verifyGates.length, medianMin: minutes(percentile(verifyTimes, 0.5)), p90Min: minutes(percentile(verifyTimes, 0.9)), waitTimeouts: verifyGates.filter((g) => g.waitTimeout).length }, directVitest: { runs: directVitest.length, minutes: minutes(sum(directVitest.map((g) => g.ms ?? 0))) }, waitTimeouts: gates.filter((g) => g.waitTimeout).length, waitTimeoutSessions, waitTimeoutMinutes: minutes(sum(gates.filter((g) => g.waitTimeout).map((g) => g.ms ?? 0))) },
     admission: { waitMedianSec: round(percentile(waits, 0.5) / 1000), waitP90Sec: round(percentile(waits, 0.9) / 1000), holdsByKind: ordered(new Map([...holds].map(([key, xs]) => [key, stats(xs)]))), markers: { count: markerCount, byMode: ordered(markerModes), gateMedianSec: seconds(markerGate), gateP90Sec: seconds(markerGate, 0.9), vitestMedianSec: seconds(markerVitest), standardsMedianSec: seconds(markerStandards) }, reaped: { waiterMedianSec: seconds(reapedWaits), waiterP90Sec: seconds(reapedWaits, 0.9), byReason: ordered(reasons), waiterMinutes: minutes(waiterMs) } },
@@ -305,7 +613,7 @@ export function extractMetrics({ window, sessions = [], durations = [], reaped =
 function children(path, io) { try { return io.readdirSync(path, { withFileTypes: true }).sort((a, b) => compare(a.name, b.name)); } catch { return []; } }
 function exists(path, io) { try { return io.statSync(path).isFile(); } catch { return false; } }
 function directory(path, io) { try { return io.statSync(path).isDirectory(); } catch { return false; } }
-export function collectInputs(window, { env = process.env, home = homedir(), io = fs } = {}) {
+export function collectInputs(window, { env = process.env, home = homedir(), io = fs, gh = null } = {}) {
   const paths = {
     jobs: env.WE_CORONER_JOBS || join(home, '.claude/jobs'),
     archive: env.WE_CORONER_JOBS_ARCHIVE || join(home, '.claude/jobs-archive'),
@@ -313,6 +621,7 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
     daemon: env.WE_CORONER_DAEMON_DIR || '/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor',
     verify: env.WE_CORONER_VERIFY_LOG || join(home, 'workspace/.operations/coordination/verify-daemon.log'),
     admission: env.WE_CORONER_ADMISSION || join(home, 'workspace/.lanes/.admission/heavy'),
+    coord: env.WE_CORONER_COORD || join(home, 'workspace/.operations/coordination'),
     lanes: env.WE_CORONER_LANES || join(home, 'workspace/.lanes/web-everything'),
   };
   const sources = {}, sessions = [], seen = new Set();
@@ -350,10 +659,9 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
   }
   // 68b: a size-rotated log keeps its older half in `<log>.1`, and collapsed repeats are replayed, so the counts
   // are the same as if the log had never been rotated or de-duplicated.
-  const log = (key, file) => {
-    const cap = positive(env.WE_CORONER_LOG_TAIL, 2 * MiB);
-    const data = read(file, { cap, tailOnly: true });
-    const older = read(`${file}.1`, { cap, tailOnly: true });
+  const log = (key, file, { cap = positive(env.WE_CORONER_LOG_TAIL, 2 * MiB), maxLine, olderToo = true } = {}) => {
+    const data = read(file, { cap, tailOnly: true, maxLine });
+    const older = olderToo && data.bytesRead < cap ? read(`${file}.1`, { cap, tailOnly: true, maxLine }) : { lines: [], found: false };
     // One pass over the joined lines, so back-to-back markers interleave and the expansion budget is shared.
     const joined = expandRepeatedLines([...(older.found ? older.lines : []), ...data.lines].join('\n'));
     const all = joined === '' ? [] : joined.split('\n');
@@ -361,7 +669,21 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
     return all;
   };
   const verifyLines = log('verifyDaemon', paths.verify);
-  const refusalLines = ['fix-dispatch-daemon.log', 'review-daemon.log'].flatMap((name) => log(name, join(paths.daemon, name)));
+  const logNames = ['fix-dispatch-daemon.log', 'review-daemon.log'];
+  const extra = children(paths.daemon, io).filter((x) => x.isFile?.() !== false && /^(?:pass-daemon\..+|parked-pr-conflict-watch-.+|lease-reaper)\.log$/.test(x.name)).map((x) => x.name);
+  const daemonLogs = Object.fromEntries([...logNames, ...extra].map((name) => [name.replace(/\.log$/, ''), log(name, join(paths.daemon, name))]));
+  const refusalLines = [...daemonLogs['fix-dispatch-daemon'], ...daemonLogs['review-daemon']];
+  // Tick rows are ~300 KB of JSON each: read a larger tail with a larger line cap, keep only the compact fields.
+  const buildAll = log('build-dispatch-daemon.log', join(paths.coord, 'build-dispatch-daemon.log'), { cap: positive(env.WE_CORONER_BUILD_TAIL, 48 * MiB), maxLine: 2 * MiB, olderToo: true });
+  const buildTicks = parseBuildTicks(buildAll), buildLines = buildAll.filter((l) => l.indexOf('{"at"') < 0);
+  const ci = fetchCiRuns(window, gh);
+  sources.scopingCutoff = env.WE_CORONER_SCOPING_CUTOFF || undefined;
+  const opened = fetchOpenedPrs(window, gh);
+  const fixPrs = sessions.map(({ state }) => /^(?:fix|ci-heal)-(\d+)/.exec(String(state.name ?? ''))?.[1]).filter(Boolean).map(Number);
+  const prKinds = fetchPrKinds([...opened.prs.map((p) => p.number), ...ci.runs.map((r) => r.pr), ...fixPrs], gh);
+  const cardNames = children(env.WE_CORONER_BACKLOG || join(dirname(fileURLToPath(import.meta.url)), '../../backlog'), io).map((x) => x.name);
+  sources.openedPrs = { found: opened.found, count: opened.prs.length };
+  sources.ci = { found: ci.found, count: ci.runs.length, ghCalls: ci.calls, truncated: ci.truncated };
   const ledger = (name) => { const data = read(join(paths.admission, `${name}.jsonl`)); const entries = rows(data.lines); sources[name] = { found: data.found, count: entries.length }; return entries; };
   const durations = ledger('durations'), reaped = ledger('reaped'), markers = [];
   sources.lanes = { found: directory(paths.lanes, io), count: 0 };
@@ -372,7 +694,7 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
       if (!data.truncated) markers.push(...parseMarkers(data.lines));
     }
   }
-  return { window, sessions, durations, reaped, markers, verifyLines, refusalLines, sources };
+  return { window, sessions, durations, reaped, markers, verifyLines, refusalLines, ciRuns: ci.runs, prsOpened: opened.prs, prKinds, cardNames, buildTicks, buildLines, daemonLogs, sources };
 }
 
 /** Flatten the same metrics into a compact two-column human table. */
@@ -386,7 +708,7 @@ export function formatHuman(metrics) {
   return lines.join('\n');
 }
 
-export function runCoroner(argv, { env = process.env, home = homedir(), now = new Date().toISOString(), io = fs } = {}) {
+export function runCoroner(argv, { env = process.env, home = homedir(), now = new Date().toISOString(), io = fs, gh = null } = {}) {
   const { values } = parseArgs({ args: argv, options: { since: { type: 'string' }, until: { type: 'string' }, json: { type: 'boolean' }, state: { type: 'string' }, 'no-save': { type: 'boolean' } } });
   const statePath = values.state || env.WE_CORONER_STATE || join(home, 'workspace/.operations/state/coroner-last.json');
   let since = values.since;
@@ -398,7 +720,7 @@ export function runCoroner(argv, { env = process.env, home = homedir(), now = ne
   const validISO = (value) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(stamp(value));
   if (!validISO(since) || !validISO(until) || stamp(since) > stamp(until)) throw new Error('pass valid ISO --since and --until with since <= until');
   const window = { since: new Date(since).toISOString(), until: new Date(until).toISOString() };
-  const metrics = extractMetrics(collectInputs(window, { env, home, io }));
+  const metrics = extractMetrics(collectInputs(window, { env, home, io, gh }));
   const output = values.json ? JSON.stringify(metrics) : formatHuman(metrics);
   if (!values['no-save']) {
     io.mkdirSync(dirname(statePath), { recursive: true });
@@ -412,6 +734,6 @@ const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(imp
 if (isMain) {
   // A consumer such as head may close the pipe after its requested prefix.
   process.stdout.on('error', (error) => { if (error.code !== 'EPIPE') { process.stderr.write(`${error.message}\n`); process.exitCode = 1; } });
-  try { process.stdout.write(runCoroner(process.argv.slice(2)).output + '\n'); }
+  try { process.stdout.write(runCoroner(process.argv.slice(2), { gh: process.env.WE_CORONER_NO_CI ? null : makeGh() }).output + '\n'); }
   catch (error) { process.stderr.write(`${error.message}\n`); process.exitCode = 1; }
 }
