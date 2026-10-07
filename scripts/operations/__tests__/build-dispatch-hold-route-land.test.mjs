@@ -184,6 +184,14 @@ describe('commitCreditsItem - the prepare path keeps "a mention is not a deliver
     ['a bare number that is not a card reference', 'WE #4554: fixes the wait to 4560 ms'],
     ['a related card named after the delivered one', 'WE #4554: fixes #4561, relates to #4560'],
     ['a negated verb', 'WE #4554: does not fix #4560 yet'],
+    ['a contracted negation: doesn\'t', 'WE #4554: doesn\'t fix #4560 yet'],
+    ['a contracted negation: won\'t', 'WE #4554: won\'t fix #4560'],
+    ['a contracted negation: didn\'t', 'WE #4554: didn\'t fix #4560'],
+    ['a contracted negation: isn\'t / shouldn\'t / couldn\'t', 'WE #4554: shouldn\'t fix #4560; isn\'t ready; couldn\'t fix #4560'],
+    ['a contracted negation after an unrelated delivery', 'WE #4554: fixes retry handling but doesn\'t fix #4560'],
+    ['a contracted negation with a typographic apostrophe', 'WE #4554: doesn’t fix #4560 yet'],
+    ['a contracted negation with no apostrophe', 'WE #4554: doesnt fix #4560 yet'],
+    ['a contracted negation in front of a birth id on a body line', 'WE #4554: runner fix\n\nWe didn\'t close xak56ki\nbut doesn\'t resolve xak56ki\n'],
     ['the birth id mentioned without a verb attached', 'WE #4554: unrelated change, see xak56ki'],
     ['a partial subject', 'WE #4560: part 1 - delivers the scaffold'],
     ['a numeric "Closes #N" in the body (numbers overlap PR/issue numbers)', 'WE #4554: runner fix\n\nCloses #4560\n'],
@@ -538,6 +546,8 @@ describe('landOne - already-done with citation "prepare" (a prepare worker\'s cl
     ['a bookkeeping-only commit', { files: 'backlog/4554-x.md\n' }, /only backlog/],
     ['a body-only mention beside an unrelated delivery verb', { message: 'WE #4554: fix flaky timer\n\nsee #4560 for context\n' }, /does not credit/],
     ['a follow-up reference beside an unrelated delivery verb', { message: 'WE #4561: fixes retry loop (see #4560, follow-up)\n' }, /does not credit/],
+    ['a contracted negation (doesn\'t) beside a passing test', { message: 'WE #4554: fixes retry handling but doesn\'t fix #4560\n' }, /does not credit/],
+    ['a contracted negation (won\'t) on the birth id', { message: 'WE #4554: runner fix (won\'t deliver xak56ki)\n' }, /does not credit/],
     ['a commit that only modified a test file that never names the card', { added: 'scripts/operations/probation-build-run.mjs\n', testBody: 'it("unrelated", () => {});\n' }, /touches no test file/],
   ])('refuses %s and opens no PR', (_name, opts, error) => {
     const { result, calls } = run(opts);

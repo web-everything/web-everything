@@ -108,7 +108,10 @@ export function commitDeliversItem(message, ids) {
 
 // A delivery verb, and the words that turn it around ("does not fix #N", "unable to fix #N", "will fix #N later").
 const CREDIT_VERB = String.raw`(?:deliver(?:s|ed)?|closes?|closed|fix(?:es|ed)?|resolves?|resolved|implements?|implemented|lands?|landed)`;
-const NEGATING_WORD_RE = /\b(?:not|never|without|cannot|can't|n't|unable|fail(?:s|ed|ure)?|attempt(?:s|ed|ing)?|try|tries|tried|to|will|would|should|may|might|could|revert(?:s|ed)?|no longer)\b/i;
+// A contracted negation is `<word>n't` ("doesn't", "won't", "can't"), with a straight or typographic apostrophe, or
+// the same with no apostrophe at all ("doesnt"). The standalone "n't" this once held could never match: its leading
+// \b has no boundary inside a word (PR #4323 review: "doesn't fix #N" was credited).
+const NEGATING_WORD_RE = /\b(?:not|never|without|cannot|\w+n['’ʼ`]t|(?:do|does|did|is|are|was|were|has|have|had|wo|ca|sha|could|would|should|must|need)nt|unable|fail(?:s|ed|ure)?|attempt(?:s|ed|ing)?|try|tries|tried|to|will|would|should|may|might|could|revert(?:s|ed)?|no longer)\b/i;
 // Words right after the id that make it a partial delivery ("fixes #N, part of ...").
 const PARTIAL_AFTER_RE = /^[\s,;:()-]*(?:in part\b|part\b|partial|partly|first step|step \d|slice\b|phase\b|groundwork|scaffold)/i;
 // A bare (no "#") id form is only trusted for something shaped like a birth hash: card text is untrusted, and a
