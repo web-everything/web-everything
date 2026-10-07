@@ -23,7 +23,10 @@ import {
   NON_BEARING, verdictBears,
   appendVerdict, readVerdictLedger, foldRepo, verdictLedgerPath, verdictLedgerDir, defaultVerdictLedgerDir,
   listLedgerRepos,
+  EVENT_TYPES, EVENT_TYPE_VALUES, LEDGER_EVENT_VERSION, eventBears,
+  buildLedgerEvent, validateLedgerEvent, serializeLedgerEvent, parseLedgerEvents,
 } from '../verdict-ledger.mjs';
+import { createHash } from 'node:crypto';
 import { REVIEW_LABELS, normalizeContributionFingerprint, decideReviewGate } from '../review-escalation.mjs';
 import { REVIEW_LABEL_TARGETS } from '../../review-set-label.mjs';
 import { lockDirFor, makeLockEntry } from '../../readiness/file-locks.mjs';
@@ -856,5 +859,102 @@ describe('#3329 a MALFORMED observed row is caught by the ledger check', () => {
     const parsed = parseVerdictLog(text);
     expect(parsed.map((r) => r.verdict)).toEqual([VERDICTS.ACCEPTED, VERDICTS.OBSERVED]);
     expect(foldVerdictLedger(parsed).get(501).clears).toBe(true);
+  });
+});
+
+describe('plan slice B: v2 event types round-trip, and the v1 fold is byte-identical', () => {
+  const SHA = 'b'.repeat(40);
+  const base = { repo: REPO, pr: 7, at: AT, source: 'test', writer: 'h:1:w', declaredActor: 'op', session: 's1', channel: 'c' };
+  const payloads = {
+    referral: { headSha: SHA, findingKeys: ['f1', 'f2'] },
+    ruling: { findingKey: 'f1', ruling: 'block' },
+    'review-run': { headSha: SHA, phase: 'completed', posted: false },
+    hold: { reasonCode: 'load-flake', holdSource: 'drain' },
+    release: { reasonCode: 'load-flake', holdSource: 'drain' },
+    approval: { approval: 'judge', delegation: { by: 'op', scope: 'pr:7', expires: '2026-12-01T00:00:00.000Z' } },
+    'send-back': { cause: 'block-ruling' },
+    author: { author: 'agent-1' },
+    'label-input': { label: 'review:human', sender: 'op', change: 'added' },
+  };
+
+  it('covers every non-verdict type in the closed set', () => {
+    expect(Object.keys(payloads).sort()).toEqual(EVENT_TYPE_VALUES.filter((t) => t !== 'verdict').sort());
+    expect(LEDGER_EVENT_VERSION).toBe(2);
+  });
+
+  it.each(Object.keys(payloads))('round-trips a %s event through serialize and parse', (type) => {
+    const ev = buildLedgerEvent({ ...base, type, ...payloads[type] });
+    expect(ev).toMatchObject({ v: 2, type, repo: REPO, pr: 7 });
+    expect(ev).not.toHaveProperty('clears');
+    const { ok, line } = serializeLedgerEvent(ev);
+    expect(ok).toBe(true);
+    expect(parseLedgerEvents(`${line}\n`)).toEqual([ev]);
+    expect(serializeLedgerEvent(parseLedgerEvents(line)[0]).line).toBe(line);
+  });
+
+  it('defaults optional payload fields so they round-trip', () => {
+    expect(buildLedgerEvent({ ...base, type: 'review-run', headSha: SHA, phase: 'started' }).posted).toBeNull();
+    expect(buildLedgerEvent({ ...base, type: 'approval', approval: 'clear-human' }).delegation).toBeNull();
+  });
+
+  it.each([
+    ['unknown type', { type: 'nope' }],
+    ['verdict via the event builder', { type: 'verdict' }],
+    ['bad ruling value', { type: 'ruling', findingKey: 'f', ruling: 'maybe' }],
+    ['empty finding keys', { type: 'referral', headSha: SHA, findingKeys: [] }],
+    ['bad head sha', { type: 'review-run', headSha: 'zz', phase: 'started' }],
+    ['bad delegation', { type: 'approval', approval: 'judge', delegation: { by: 'x' } }],
+    ['bad label change', { type: 'label-input', label: 'l', sender: 's', change: 'moved' }],
+  ])('refuses %s', (_n, over) => {
+    expect(() => buildLedgerEvent({ ...base, ...over })).toThrow(TypeError);
+  });
+
+  it('never throws on a bad raw line, and skips it', () => {
+    expect(validateLedgerEvent(null).valid).toBe(false);
+    expect(validateLedgerEvent({ v: 2, kind: VERDICT_LEDGER_KIND, type: 'ruling' }).valid).toBe(false);
+    expect(parseLedgerEvents('not json\n{"type":"ruling"}\n\n')).toEqual([]);
+  });
+
+  it('reads a v1 row as type verdict without changing the row', () => {
+    const v1 = rec();
+    const [ev] = parseLedgerEvents(JSON.stringify(v1));
+    expect(ev).toEqual({ type: 'verdict', ...v1 });
+    expect(serializeLedgerEvent(v1).line).toBe(serializeVerdictRecord(v1).line);
+    expect(validateVerdictRecord({ ...v1, type: 'verdict' }).valid).toBe(true);
+  });
+
+  it('bears: verdicts, referrals, rulings, holds, releases, approvals, send-backs; not review-run, author, label-input', () => {
+    const bearing = EVENT_TYPE_VALUES.filter((t) => eventBears(t));
+    expect(bearing).toEqual(['verdict', 'referral', 'ruling', 'hold', 'release', 'approval', 'send-back']);
+    expect(EVENT_TYPES.REVIEW_RUN).toBe('review-run');
+  });
+
+  describe('the v1 readers never see a v2 event', () => {
+    const D = 'a'.repeat(64);
+    const mk = (pr, verdict, n, o = {}) => buildVerdictRecord({
+      repo: 'o/r', pr, verdict, at: `2026-08-10T12:00:0${n}.000Z`, source: 't', writer: 'h:1:w', reason: 'r',
+      headSha: SHA, reviewedDiff: D, declaredActor: 'x', session: 's', channel: 'c', ...o,
+    });
+    const v1 = [mk(1, 'pending', 1), mk(1, 'accepted', 2), mk(1, 'observed', 3, { mode: 'shadow', wouldClear: true }),
+      mk(2, 'changes', 4, { findingCount: 2 }), mk(2, 'human', 5), mk(2, 'clear-human', 6), mk(3, 'observed', 7),
+      mk(3, 'restamped', 8)];
+    const v1Text = v1.map((r) => serializeVerdictRecord(r).line).join('\n');
+    // Captured from the fold BEFORE the v2 types existed (main 803e314e2).
+    const GOLDEN_SHA256 = '2841dea2f03f42e30baeccae09cfd9f83728446203f313dd71fa8d68fb46475a';
+    const foldHash = (text) => createHash('sha256')
+      .update(JSON.stringify([...foldVerdictLedger(parseVerdictLog(text)).values()])).digest('hex');
+
+    it('v1 fold output matches the golden captured before v2', () => {
+      expect(foldHash(v1Text)).toBe(GOLDEN_SHA256);
+    });
+
+    it('interleaving every v2 type leaves the v1 fold byte-identical', () => {
+      const v2Lines = Object.keys(payloads)
+        .map((type) => serializeLedgerEvent(buildLedgerEvent({ ...base, pr: 1, type, ...payloads[type] })).line);
+      const mixed = [...v2Lines, ...v1Text.split('\n').flatMap((l, i) => [l, v2Lines[i % v2Lines.length]])].join('\n');
+      expect(foldHash(mixed)).toBe(GOLDEN_SHA256);
+      expect(parseVerdictLog(mixed)).toEqual(parseVerdictLog(v1Text));
+      expect(parseLedgerEvents(mixed).filter((e) => e.type === 'verdict')).toHaveLength(v1.length);
+    });
   });
 });
