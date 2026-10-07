@@ -68,7 +68,7 @@ export default {
   id: 'fixer-holds-turn-on-verify-wait',
   title: 'fixers held their turn on 9-minute verify-lane waits (54 timeouts / ~486 min in a day) and pushed shas no verdict named',
   card: 'we:backlog/5137 (slices 2+3)',
-  fixedBy: { sha: '6b21b40a8,262ee8d7d', where: 'lane/5137-s2-s3', paths: [PASS, 'scripts/conveyor/await-verify.mjs', 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs'] },
+  fixedBy: { sha: '34e05d1bc,3cfea6083,50cdb665b,c72c440b0,6b21b40a8,262ee8d7d', where: 'lane/5137-s2-s3', paths: [PASS, 'scripts/conveyor/await-verify.mjs', 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs'] },
   fixPresent(root) { return existsSync(join(root, PASS)); },
   async run({ log } = {}) {
     try {

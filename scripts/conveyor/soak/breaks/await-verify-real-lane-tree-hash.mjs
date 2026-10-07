@@ -45,7 +45,7 @@ export async function replay(root = REPO_ROOT) {
     // exactly how scripts/verify-lane.mjs records `marker.treeHash`
     const treeHash = computeWorkingTreeHash({ runGit: (a) => git(lane, a).trim(), fileMode: (f) => lstatSync(join(lane, f)).mode });
 
-    const real = await defaultAwaitVerifyIo({ weRoot: root, env });
+    const real = await defaultAwaitVerifyIo({ weRoot: root, poolRoot: tmp, env });
     const store = new Map([['s', { v: 1, sessionId: 's', who: 'fix-1', repo: CONSTELLATION_REPOS.we.slug, pr: 1, sha, requestedAt: new Date(0).toISOString(),
       attempt: 1, lane, ref: 'lane/item-1', kind: 'fix' }]]);
     const pushes = []; let rerequests = 0;
@@ -72,7 +72,7 @@ export default {
   id: 'await-verify-real-lane-tree-hash',
   title: 'the harness verdict pass never pushed a real green: its lane tree hash (untrimmed / diff.external= pin) never equalled the gate\'s',
   card: 'we:backlog/5137 (slices 2+3) — PR 4151 review',
-  fixedBy: { sha: '3cfea6083,50cdb665b', where: 'lane/5137-s2-s3', paths: [PASS] },
+  fixedBy: { sha: '34e05d1bc,3cfea6083,50cdb665b', where: 'lane/5137-s2-s3', paths: [PASS] },
   fixPresent(root) { return existsSync(join(root, PASS)); },
   async run({ log } = {}) {
     try {
