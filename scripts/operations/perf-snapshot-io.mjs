@@ -62,7 +62,9 @@ export function readTicks({ env = process.env, home = homedir() } = {}) {
 export function fetchCiWallRuns(window, gh, { maxRuns = 40 } = {}) {
   if (typeof gh !== 'function') return null;
   const created = encodeURIComponent(`${window.since}..${window.until}`);
-  const data = gh(['api', `repos/${REPO}/actions/workflows/ci.yml/runs?event=pull_request&status=success&created=${created}&per_page=100`]);
+  const listArgs = ['api', `repos/${REPO}/actions/workflows/ci.yml/runs?event=pull_request&status=success&created=${created}&per_page=100`];
+  // One retry: the first gh call of a run is the one that meets a cold connection (a 45 s timeout reads as null).
+  const data = gh(listArgs) ?? gh(listArgs);
   if (!data || !Array.isArray(data.workflow_runs)) return null;
   const runs = [];
   for (const r of data.workflow_runs.slice(0, maxRuns)) {
@@ -127,6 +129,8 @@ export function backfillBaseline({ archive, gh, env = process.env, home = homedi
   for (const [key, v] of Object.entries(REPORT_SOURCED)) metrics[key] = metric(v.v, v.unit, OPUS_REPORT);
   notes.push(`source "opus-report": ${Object.keys(REPORT_SOURCED).join(', ')} (lane markers keep only each lane's last two runs, so the scoped/unscoped standards split cannot be recomputed)`);
   Object.assign(metrics, extras({ window: j24.window, markers: null, gh, env, home, notes }));
+  // A baseline with a silent gap would make every later CI diff read "no baseline": refuse instead (re-run, or --no-ci).
+  if (gh && !metrics['ci.sampleRuns']) throw new Error('perf-snapshot: the CI wall read failed (gh); not writing a baseline with a gap. Re-run, or pass --no-ci to accept one.');
   return buildSnapshot({ kind: 'baseline', date: BASELINE_DATE, takenAt: BASELINE_TAKEN_AT, window: j24.window, metrics, notes, head: headSha() });
 }
 
