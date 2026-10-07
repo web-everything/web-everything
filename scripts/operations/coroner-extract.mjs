@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { classifyCardOnly } from '../ci-card-only.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { collectExecutorLogs, executorTable } from './coroner-executors.mjs';
 import { LOG_TIMESTAMP_RE, expandRepeatedLines, stripLogTimestamp } from '../lib/log-timestamp.mjs';
 import { collectChangeRequests } from './coroner-rounds.mjs';
 
@@ -521,7 +522,7 @@ export function fetchCiRuns(window, gh, { repo = CONSTELLATION_REPOS.we.slug, ma
 }
 
 /** Pure metrics core. Input arrays may be unordered; sources and all maps are sorted. */
-export function extractMetrics({ window, changeRequests = null, sessions = [], durations = [], reaped = [], markers = [], verifyLines = [], refusalLines = [], ciRuns = [], prsOpened = [], prKinds = {}, cardNames = [], buildTicks = [], buildLines = [], daemonLogs = {}, sources = {} }) {
+export function extractMetrics({ window, changeRequests = null, sessions = [], durations = [], reaped = [], markers = [], verifyLines = [], refusalLines = [], ciRuns = [], prsOpened = [], prKinds = {}, cardNames = [], buildTicks = [], buildLines = [], daemonLogs = {}, executorRuns = null, sources = {} }) {
   const selected = sessions.filter(({ state }) => inWindow(state.createdAt || state.updatedAt, window))
     .sort((a, b) => compare(a.state.sessionId ?? a.state.name ?? '', b.state.sessionId ?? b.state.name ?? '') || compare(JSON.stringify(a), JSON.stringify(b)));
   const byKind = new Map(), outcomes = new Map(), prs = new Map(), denials = new Map(), holds = new Map(), reasons = new Map(), refusals = new Map(), refusalPrs = new Map();
@@ -601,6 +602,7 @@ export function extractMetrics({ window, changeRequests = null, sessions = [], d
     window: { since: window.since, until: window.until },
     errorRates,
     ...(changeRequests ? { changeRequests } : {}),
+    ...(executorRuns ? { executors: executorTable({ claude: records.map((r) => ({ task: r.pr ? `pr-${r.pr}` : r.name || r.session, ms: r.minutes * 60000, failed: ['failed', 'timed-out', 'cancelled'].includes(r.outcome), role: r.kind })), ...executorRuns }) } : {}),
     sessions: { ...stats(times), byKind: ordered(new Map([...byKind].map(([key, xs]) => [key, { count: xs.length, minutes: minutes(sum(xs)) }]))), outcomes: ordered(outcomes), records: records.slice(0, 60) },
     gate: { minutesInGate: minutes(gateMs), shareInGate: total ? round(Math.min(1, gateMs / total), 3) : 0, commands: gates.length, medianMin: minutes(percentile(verifyTimes, 0.5)), p90Min: minutes(percentile(verifyTimes, 0.9)), allCommands: stats(gateTimes), verifyLane: { calls: verifyGates.length, medianMin: minutes(percentile(verifyTimes, 0.5)), p90Min: minutes(percentile(verifyTimes, 0.9)), waitTimeouts: verifyGates.filter((g) => g.waitTimeout).length }, directVitest: { runs: directVitest.length, minutes: minutes(sum(directVitest.map((g) => g.ms ?? 0))) }, waitTimeouts: gates.filter((g) => g.waitTimeout).length, waitTimeoutSessions, waitTimeoutMinutes: minutes(sum(gates.filter((g) => g.waitTimeout).map((g) => g.ms ?? 0))) },
     admission: { waitMedianSec: round(percentile(waits, 0.5) / 1000), waitP90Sec: round(percentile(waits, 0.9) / 1000), holdsByKind: ordered(new Map([...holds].map(([key, xs]) => [key, stats(xs)]))), markers: { count: markerCount, byMode: ordered(markerModes), gateMedianSec: seconds(markerGate), gateP90Sec: seconds(markerGate, 0.9), vitestMedianSec: seconds(markerVitest), standardsMedianSec: seconds(markerStandards) }, reaped: { waiterMedianSec: seconds(reapedWaits), waiterP90Sec: seconds(reapedWaits, 0.9), byReason: ordered(reasons), waiterMinutes: minutes(waiterMs) } },
@@ -710,7 +712,9 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
       if (!data.truncated) markers.push(...parseMarkers(data.lines));
     }
   }
-  return { window, changeRequests, sessions, durations, reaped, markers, verifyLines, refusalLines, ciRuns: ci.runs, prsOpened: opened.prs, prKinds, cardNames, buildTicks, buildLines, daemonLogs, sources };
+  const exec = env.WE_CORONER_NO_EXECUTORS ? null : collectExecutorLogs(window, { env, home, io });
+  if (exec) Object.assign(sources, { codexSessions: exec.sources.codex, agySessions: exec.sources.agy, codexPilot: exec.sources.pilot });
+  return { window, changeRequests, executorRuns: exec?.runs ?? null, sessions, durations, reaped, markers, verifyLines, refusalLines, ciRuns: ci.runs, prsOpened: opened.prs, prKinds, cardNames, buildTicks, buildLines, daemonLogs, sources };
 }
 
 /** Flatten the same metrics into a compact two-column human table. */
