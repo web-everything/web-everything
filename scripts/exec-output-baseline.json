@@ -6,7 +6,6 @@
   "scripts/ci-card-only.mjs": 1,
   "scripts/codex-direct-task.mjs": 1,
   "scripts/collect-review-requests.mjs": 1,
-  "scripts/converge-cli.mjs": 1,
   "scripts/converge-daemon-pass.mjs": 1,
   "scripts/conveyor/ci-heal-salvage.mjs": 1,
   "scripts/conveyor/learnings-drop.mjs": 1,
