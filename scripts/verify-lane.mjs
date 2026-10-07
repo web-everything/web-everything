@@ -66,6 +66,7 @@ import { readLockEntry } from './readiness/file-locks.mjs';
 import { spawn } from 'node:child_process';
 import { createFailureCollector, mergeFailureDetails } from './lib/verify-failures.mjs';
 import { isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
+import * as nodeFs from 'node:fs';
 import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlinkSync, lstatSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
@@ -76,6 +77,7 @@ import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening.mjs';
 import { classifyRedCause, reachesChanged } from './lib/red-cause.mjs';
+import { baseRerunCandidate, measureBaseFailures, classifyPreExisting, runVitestOnBase } from './lib/verify-base-rerun.mjs';
 import { alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 
@@ -146,7 +148,7 @@ function markerPhases(record) {
 // Only for a marker that belongs to THIS head: a red cause for another commit would describe the wrong code.
 function markerRedCause(record) {
   return record && typeof record === 'object' && !record.corrupt && record.sha === headSha && typeof record.redCause === 'string'
-    ? { redCause: record.redCause, redCauseFiles: Array.isArray(record.redCauseFiles) ? record.redCauseFiles : [], ...(record.redCauseUncertain === true ? { redCauseUncertain: true } : {}) } : {};
+    ? { redCause: record.redCause, redCauseFiles: Array.isArray(record.redCauseFiles) ? record.redCauseFiles : [], ...(record.redCauseUncertain === true ? { redCauseUncertain: true } : {}), ...(record.redCauseEvidence ? { redCauseEvidence: record.redCauseEvidence } : {}) } : {};
 }
 
 function writeMarker(record) {
@@ -511,6 +513,9 @@ let failureDetails;
 let retriedFailures = [];
 let isolatedRetry = null;
 let editedDuringRun = [];
+let baseCandidate = null;
+let baseFailures = null;
+const infrastructureNow = (exitCode, signal) => verificationInfrastructureFailure({ exitCode, signal });
 async function runGate(command, args) {
   const collector = createFailureCollector({ cwd: REPO });
   const output = { stdout: '', stderr: '' };
@@ -665,6 +670,16 @@ try {
   failureDetails = red.length > 1
     ? mergeFailureDetails(red.map(p => ({ phase: p.phase, details: p.result.failureDetails })))
     : (red[0] ?? phaseResults.at(-1)).result.failureDetails;
+  // Perf 42 — an out-of-diff red is compared with origin/main's tip while this run still holds its heavy slot.
+  // Measured once per main sha (cached); any error leaves `baseFailures` null, i.e. the red stays a real red.
+  baseCandidate = baseRerunCandidate({ exitCode, signal, phaseResults, failureDetails,
+    changedFiles: Array.isArray(resolvedGate?.decision?.changedFiles) ? [...resolvedGate.decision.changedFiles, ...editedDuringRun] : null });
+  const baseSha = baseCandidate && !infrastructureNow(exitCode, signal) ? tryGit(['rev-parse', 'origin/main']) : null;
+  if (baseSha) {
+    process.stderr.write(`Comparing ${baseCandidate.files.length} failing file(s) outside the diff with origin/main @ ${baseSha.slice(0, 8)}\n`);
+    baseFailures = await measureBaseFailures({ baseSha, files: baseCandidate.files, cacheDir: join(tmpdir(), 'we-verify-base-failures'),
+      runBase: (files) => runVitestOnBase({ git, repo: REPO, baseSha, files, tmp: tmpdir(), spawnFn: spawn, collectorFactory: createFailureCollector, fs: nodeFs }) });
+  }
 } catch (e) {
   signal = e?.signal || null;
   exitCode = Number.isFinite(e && e.status) ? e.status : 2;
@@ -688,6 +703,8 @@ const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new 
 // An UNEDITED failing test that imports the edited source is the change's own regression (`testReachesChanged`).
 const redCauseFields = classifyRedCause({ exitCode, signal, infrastructure, phaseResults, isolatedRetry, retriedFailures, changedFiles: diffFiles,
   touchesDiff: (file) => { const r = reachesChanged({ testFile: file, changedFiles: diffFiles, readFile: readRepoFile }); return r === 'unknown' ? 'unknown' : r === 'reaches'; } }) ?? {};
+// Perf 42 — `out-of-diff-still-red` where every failing (file, name) also fails on main's tip becomes `pre-existing-on-main`.
+Object.assign(redCauseFields, classifyPreExisting({ cause: redCauseFields, candidate: baseCandidate, base: baseFailures }) ?? {});
 
 if (MODE === 'run') process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
 if (MODE === 'run' && infrastructure) emit({ sha: headSha, status: 'infrastructure-failure', reason: infrastructure.reason, exitCode, infrastructure, ...redCauseFields, phases, detail: infrastructure.detail }, 3);

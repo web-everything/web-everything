@@ -32,6 +32,7 @@ export default {
   evaluate({ laneVerifyMarkers }, { now }) {
     const out = [];
     for (const m of laneVerifyMarkers || []) {
+      if (m.status && m.status !== 'running') continue;
       if (!m.sha || !m.head || m.sha !== m.head) continue;
       const started = Date.parse(m.startedAt || '');
       if (!Number.isFinite(started)) continue;
