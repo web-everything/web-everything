@@ -288,6 +288,8 @@ export const REFUSAL_KINDS = Object.freeze([
   // `waiting-on-system-fix` — the red is the tooling/gate's own fault and a system-level fix is already open
   // for it; this PR owes nothing further until that fix lands or its own head changes.
   'ci-heal-escalated', 'waiting-on-system-fix',
+  // A CI re-run this system requested whose result is not observed yet: held, not escalated, until the window.
+  'ci-timeout-rerun-in-flight',
   // `draft` (draft-first PRs, operator-approved 2026-09-27) — the PR is still a GitHub draft: no review is
   // dispatched, whatever `review:*` label it carries, until the `promote-draft` DISPATCH_KIND (above) has
   // un-drafted it. See {@link dispatchReviewRow}'s own gate.
@@ -382,6 +384,9 @@ const OWED_ELSEWHERE = Object.freeze({
  * own copy's value so a drift between them fails loud in CI rather than silently diverging.
  */
 export const CI_HEAL_ROUND_CAP = 3;
+
+/** How long a requested-but-unobserved CI re-run may be held quietly before it becomes an operator escalation. */
+export const TIMEOUT_RETRY_PENDING_ESCALATE_MS = 30 * 60 * 1000;
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#CONFLICT_FIX_ROUND_CAP — the durable cap a MECHANICAL
@@ -2128,6 +2133,17 @@ export function planReconcile({
       }
       const retryBudget = pr.timeoutRetryBudget;
       if (retryBudget?.pending) {
+        // A re-run this system itself just requested, whose result is not observed yet, is IN FLIGHT, not a
+        // decision for the operator (live, PR #4235 2026-10-07: a re-run reserved at 19:35 escalated at 19:37 as
+        // "needs your decision"). Hold quietly while it is younger than the window; escalate only when it stays
+        // unresolved past it, or when the state itself is unreadable (`reason` set) or carries no timestamp.
+        const sinceMs = Date.parse(retryBudget.pendingSince);
+        const windowMs = Number(process.env.WE_TIMEOUT_RETRY_PENDING_ESCALATE_MS) || TIMEOUT_RETRY_PENDING_ESCALATE_MS;
+        if (!retryBudget.reason && Number.isFinite(sinceMs) && Number.isFinite(now) && now - sinceMs < windowMs) {
+          refuse('ci-timeout-rerun-in-flight', { ...withPhase,
+            why: `PR #${prNumber}: a CI re-run was requested ${Math.round((now - sinceMs) / 1000)}s ago and its result is not observed yet — waiting (escalates to the operator after ${Math.round(windowMs / 60000)} min)` });
+          continue;
+        }
         const why = `PR #${prNumber}: timeout retry needs your decision — ${retryBudget.reason ?? 'request outcome remains unresolved'}; no further rerun or heal is safe`;
         refuse('ci-heal-escalated', { ...withPhase, why });
         notes.push({ kind: 'timeout-retry-needs-human', prNumber, text: why });

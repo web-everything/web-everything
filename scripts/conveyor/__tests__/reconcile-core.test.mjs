@@ -3429,6 +3429,21 @@ describe('xng7q1p mechanical timeout precedence', () => {
     expect(result.refusals[0].kind).toBe('ci-heal-escalated');
     expect(result.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-needs-human', text: expect.stringContaining('needs your decision') }));
   });
+  it('a re-run requested moments ago is held in flight, not escalated to the operator (live #4235)', () => {
+    const since = new Date(NOW - 90 * 1000).toISOString();
+    const result = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 1, pending: true, pendingSince: since } })], now: NOW });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals[0].kind).toBe('ci-timeout-rerun-in-flight');
+    expect(result.notes.some((n) => n.kind === 'timeout-retry-needs-human')).toBe(false);
+  });
+  it('a re-run unresolved past the window still escalates; unreadable state escalates at once', () => {
+    const old = new Date(NOW - 2 * 60 * 60 * 1000).toISOString();
+    const stale = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 1, pending: true, pendingSince: old } })], now: NOW });
+    expect(stale.refusals[0].kind).toBe('ci-heal-escalated');
+    const fresh = new Date(NOW - 1000).toISOString();
+    const unreadable = planReconcile({ prs: [pr({ timeoutRetryBudget: { pending: true, pendingSince: fresh, reason: 'timeout-state-unreadable:x' } })], now: NOW });
+    expect(unreadable.refusals[0].kind).toBe('ci-heal-escalated');
+  });
   it('keeps live fix ownership ahead of retries', () => {
     const result = planReconcile({ prs: [pr({ fixClaim: { who: 'fixer' } })], now: NOW });
     expect(result.dispatch).toEqual([]);
