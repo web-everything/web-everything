@@ -49,7 +49,7 @@ export default {
     }, {
       root: '/h/d/versions/v1', env: {}, onRestart: () => 'restarted', log: { error() {} }, tickContext,
       versions: { name: 'd', clone: '/ws/d', home: '/h', dir: '/h/d', settings: {} },
-      versionApi: { currentVersion: () => cur, pin: async ({ id }) => pins.push(id), unpin: async ({ id }) => pins.splice(pins.indexOf(id), 1) },
+      versionApi: { currentVersion: () => cur, pin: async ({ id }) => { pins.push(id); return { status: 'pinned' }; }, unpin: async ({ id }) => pins.splice(pins.indexOf(id), 1) },
       rebuild: async () => ({ moved: false, reason: 'up-to-date' }), readHead: () => 'a',
       acquireRead: () => { reads += 1; return { ok: true }; }, releaseRead() {}, readState: () => ({}),
       importClosure: () => new Set(), diffFiles: () => [], entries: ['/h/d/versions/v1/x.mjs'],
