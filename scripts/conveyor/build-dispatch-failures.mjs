@@ -8,7 +8,7 @@
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { readBackoffSettings, backoffVerdict, evidenceReasonCode, isCloneWideReasonCode } from './retry-backoff.mjs';
+import { readBackoffSettings, backoffVerdict, buildEvidenceReasonCode, isCloneWideReasonCode, CARD_REFUSAL_CODE } from './retry-backoff.mjs';
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 
 export const buildFailurePath = () => join(resolveCoordinationRoot(), 'build-dispatch-failures.json');
@@ -37,7 +37,7 @@ export function recordBuildFailure({ num, reason, output }, { path = buildFailur
   // unredactable. The reason code is read off the raw text — redaction never changes what a code pattern matches.
   const rawText = String(output ?? reason ?? '').trim();
   const text = redactSpawnText(rawText);
-  const reasonCode = evidenceReasonCode({ reason: reason ?? rawText }) ?? (rawText ? 'dispatch-failed' : 'empty-failure-output');
+  const reasonCode = buildEvidenceReasonCode({ reason: reason ?? rawText }) ?? (rawText ? 'dispatch-failed' : 'empty-failure-output');
   // builder-starved — a clone-wide refusal (the daemon's own clone is behind origin/main) is not the card's
   // failure: nothing is persisted, no attempt is charged, and the card is not withheld.
   if (isCloneWideReasonCode(reasonCode)) {
@@ -50,7 +50,8 @@ export function recordBuildFailure({ num, reason, output }, { path = buildFailur
     reason: redactSpawnText(reason ?? '').slice(0, 400),
     output: text.slice(0, OUTPUT_CAP),
     recordedAt: new Date(now).toISOString(),
-    ...backoffVerdict({ attempts, now, settings }),
+    // A card-level refusal is permanent: it is withheld at once (exhausted), not re-tried on a cooldown.
+    ...(reasonCode === CARD_REFUSAL_CODE ? { retryAfter: null, exhausted: true } : backoffVerdict({ attempts, now, settings })),
   };
   state.items[key] = record;
   save(state, path);

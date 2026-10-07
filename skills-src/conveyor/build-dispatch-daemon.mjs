@@ -79,6 +79,7 @@ import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
 import { MAX_CONCURRENT_LANES_ENV } from '../../scripts/lib/lane-concurrency.mjs';
 
 import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
+import { CARD_REFUSAL_CODE } from '../../scripts/conveyor/retry-backoff.mjs';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures } from '../../scripts/conveyor/build-dispatch-failures.mjs';
 import { redactSpawnText } from '../../scripts/lib/describe-spawn-failure.mjs';
 
@@ -177,7 +178,15 @@ export function readDispatchOutcome(text) {
   try { parsed = JSON.parse(String(text ?? '')); } catch { return { dispatching: false, reason: 'unparseable dispatch-lane output' }; }
   const run = parsed?.run ?? parsed;
   const verdict = run?.verdict;
-  if (!verdict || typeof verdict.dispatching !== 'boolean') return { dispatching: false, reason: 'no verdict in dispatch-lane output' };
+  if (!verdict || typeof verdict.dispatching !== 'boolean') {
+    // A step that REFUSED leaves no verdict by design — name the step and its reason, never just "no verdict".
+    if (parsed?.stopped === 'step-refused' || (parsed?.stopped && parsed?.error)) {
+      const step = String(parsed.step ?? 'unknown');
+      const why = redactSpawnText(String(parsed.error ?? parsed.stopped)).replace(/\s+/g, ' ').slice(0, 400);
+      return { dispatching: false, reason: `${parsed.stopped === 'step-refused' ? 'step-refused' : `stopped (${parsed.stopped})`} at \`${step}\`: ${why}`, stepRefused: { step, error: why } };
+    }
+    return { dispatching: false, reason: 'no verdict in dispatch-lane output' };
+  }
   const result = { dispatching: false, reason: verdict.reason ?? verdict.why ?? null,
     lane: verdict.lane ?? null, sessionSlug: verdict.sessionSlug ?? null };
   // A planner declining to launch (lane cap, plan re-read race, freeze) is a typed refusal, not a failed
@@ -571,6 +580,22 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
 
   const dispatched = [];
   const failures = [];
+  // A CARD-LEVEL PERMANENT REFUSAL (a dispatch-lane step refused because of what the card says) is never retried on
+  // a cooldown: the failure ledger withholds it at once, the card is HELD with the step and reason (the hold
+  // router records it in the findings ledger), and it is listed under `needsYou` on the tick line for the operator.
+  const needsYou = [];
+  const surfaceCardRefusal = (num, rec, outcome) => {
+    if (!rec || rec.reasonCode !== CARD_REFUSAL_CODE) return;
+    const step = outcome?.stepRefused?.step ?? null;
+    const reason = outcome?.reason ?? rec.reason;
+    needsYou.push({ num: normNum(num), step, reason });
+    heldNums.add(normNum(num));
+    // The hold reason carries NO card-authored text: the hold router (`classifyHoldReason`) scans it unanchored for
+    // `spec already done on main: commit …` / `spec superseded`, which are routes that spawn lane work. The refusal
+    // text quotes the card's own scope value, so quoting it here would let a card steer that router. The full reason
+    // stays in the failure ledger and `needsYou`.
+    try { effects.placePrepareHold?.({ num: normNum(num), reason: `card-refused: dispatch-lane step ${step ?? 'unknown'} refused the card` }); } catch { /* best-effort: the ledger already withholds it */ }
+  };
   // #4139 host-load gate on NEW launches only: refuse with a logged `host-load` reason, never touch running work, and
   // take no claim (so nothing needs releasing). Re-read per launch: a detached launch raises the load immediately.
   const loadHolds = [];
@@ -601,7 +626,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       else {
         effects.releaseClaim({ num: pick.num });
         const rec = effects.recordBuildFailure?.({ num: pick.num, reason: res?.reason ?? 'not dispatched', output: res?.output ?? res?.reason });
-        failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched', ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
+        if (live) surfaceCardRefusal(pick.num, rec, res);
+        failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched', ...(res?.stepRefused ? { step: res.stepRefused.step } : {}), ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
       }
     }
   }
@@ -657,7 +683,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     if (f.isPrepare) await failPrepare(f.num, f.outcome?.refused ? 'dispatch-refused' : 'dispatch', f.outcome?.reason ?? 'not dispatched', f.outcome?.evidence ?? {}, f.attempt ?? new Date().toISOString());
     else {
       const rec = live ? effects.recordBuildFailure?.({ num: f.num, reason: f.outcome?.reason ?? 'not dispatched', output: f.outcome?.output ?? f.outcome?.reason }) : null;
-      failures.push({ num: f.num, stage: 'dispatch', reason: f.outcome?.reason ?? 'not dispatched', ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
+      if (live) surfaceCardRefusal(f.num, rec, f.outcome);
+      failures.push({ num: f.num, stage: 'dispatch', reason: f.outcome?.reason ?? 'not dispatched', ...(f.outcome?.stepRefused ? { step: f.outcome.stepRefused.step } : {}), ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
     }
   }
   for (const num of inspectNums) {
@@ -865,6 +892,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     }),
     prepare,
     failures,
+    needsYou,
     // #4348-open-pr-retry — `{retried, resumed, surfaced, waiting}` from `infra-blocked.mjs retry` (or an
     // `{error}` on a best-effort failure), `null` on a dry-run tick or an older effects stub with no such call.
     infraRetry,
@@ -2054,7 +2082,7 @@ async function live(flags) {
       // or for an older record with none) so the operator's tick line names WHO is running each build without
       // reading scorecards. Additive over the previous bare-num array — nothing on `main` parses this stdout
       // JSON as a strict array-of-strings today (grepped 2026-09-29).
-      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult, loadHolds: r.loadHolds, launchSettlement: r.launchSettlement, capacity: tickCapacity(r) })}\n`);
+      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, needsYou: r.needsYou, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult, loadHolds: r.loadHolds, launchSettlement: r.launchSettlement, capacity: tickCapacity(r) })}\n`);
     },
     onTickError: (e, _tick, loop) => {
       // Keep the health watcher's existing failure-line contract; timings are an additive JSON line.
