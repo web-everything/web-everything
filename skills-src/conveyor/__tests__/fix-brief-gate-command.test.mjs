@@ -61,6 +61,24 @@ for (const [file, kind] of [['fix-agent-brief.md', 'fix'], ['fix-agent-ci-brief.
   });
 }
 
+// #34 — a description-only ci-heal re-runs the check instead of queuing a full local verify.
+describe('fix-agent-ci-brief.md — metadata-only heal skips the local verify (#34)', () => {
+  const brief = readFileSync(join(HERE, '..', 'fix-agent-ci-brief.md'), 'utf8');
+  it('skips the gate only when the tree is byte-identical to the examined head, and re-runs the failed check', () => {
+    const rule = brief.split('**Metadata-only skip (#34).**')[1];
+    expect(rule, 'metadata-only skip rule present').toBeTruthy();
+    const para = rule.split('\n\n')[0];
+    expect(para).toContain('git diff --quiet "$EXAMINED_HEAD" HEAD');
+    expect(para).toMatch(/skip steps 4-6/);
+    expect(para).toContain('gh run rerun');
+    expect(para).toContain('--outcome=healed');
+    expect(para).toMatch(/clean merge[^.]*NOT metadata-only/);
+  });
+  it('does not add the skip to the code-fix brief', () => {
+    expect(readFileSync(join(HERE, '..', 'fix-agent-brief.md'), 'utf8')).not.toContain('Metadata-only skip');
+  });
+});
+
 // #5137 — the fix and ci-heal briefs hand the wait to the harness (asserted above); only the delivery brief still
 // waits in bounded chunks itself.
 for (const file of ['delivery-agent-brief.md']) {
