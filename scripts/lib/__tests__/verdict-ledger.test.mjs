@@ -1202,3 +1202,69 @@ describe('#3255 C2 review fix: the production default path, home-fails-too spill
   });
 
 });
+
+describe('ledger plan follow-up: the git store accepts every v2 event type (dual writes events to both stores)', () => {
+  let dir;
+  const prevDir = process.env.WE_VERDICT_LEDGER_DIR;
+  const SHA = 'c'.repeat(40);
+  const ev = (type, extra) => buildLedgerEvent({ repo: REPO, pr: 9, at: AT, source: 'test', declaredActor: 'op', channel: 'c', type, ...extra });
+  const payloads = {
+    referral: { headSha: SHA, findingKeys: ['f1'] },
+    ruling: { findingKey: 'f1', ruling: 'card' },
+    'review-run': { headSha: SHA, phase: 'completed', posted: false },
+    hold: { reasonCode: 'load-flake', holdSource: 'drain' },
+    release: { reasonCode: 'load-flake', holdSource: 'drain' },
+    approval: { approval: 'clear-human' },
+    'send-back': { cause: 'block-ruling' },
+    author: { author: 'agent-1' },
+    'label-input': { label: 'review:human', sender: 'op', change: 'added' },
+  };
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'we-verdict-ledger-v2git-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+  });
+  afterEach(() => {
+    if (prevDir === undefined) delete process.env.WE_VERDICT_LEDGER_DIR;
+    else process.env.WE_VERDICT_LEDGER_DIR = prevDir;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(`${dir}-locks`, { recursive: true, force: true });
+  });
+
+  it('a ruling row reaches the git store in dual mode (and the home ledger)', () => {
+    const calls = [];
+    const r = appendVerdict(ev('ruling', payloads.ruling), {
+      store: 'dual', board: '/board', gitAppend: (a) => { calls.push(a); return { status: 'appended' }; }, warn: () => {},
+    });
+    expect(r.ok).toBe(true);
+    expect(r.git).toEqual({ status: 'appended' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].records[0]).toMatchObject({ type: 'ruling', findingKey: 'f1', ruling: 'card' });
+    expect(parseLedgerEvents(readFileSync(verdictLedgerPath(REPO), 'utf8'))).toHaveLength(1);
+  });
+
+  it.each(Object.keys(payloads))('dual writes a %s event to both stores', (type) => {
+    const calls = [];
+    const r = appendVerdict(ev(type, payloads[type]), {
+      store: 'dual', board: '/board', gitAppend: (a) => { calls.push(a); return { status: 'appended' }; }, warn: () => {},
+    });
+    expect(r.ok).toBe(true);
+    expect(calls[0].records[0].type).toBe(type);
+    expect(parseLedgerEvents(readFileSync(verdictLedgerPath(REPO), 'utf8')).map((e) => e.type)).toEqual([type]);
+  });
+
+  it('an invalid event is refused and written nowhere', () => {
+    const calls = [];
+    const r = appendVerdict({ v: 2, kind: VERDICT_LEDGER_KIND, type: 'ruling', repo: REPO, pr: 9, at: AT, ruling: 'maybe' },
+      { store: 'dual', board: '/board', gitAppend: (a) => { calls.push(a); }, warn: () => {} });
+    expect(r.ok).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a clearing ruling that misses git does not clear (F4); a block ruling still applies', () => {
+    const miss = () => { throw new Error('push rejected'); };
+    const clear = appendVerdict(ev('ruling', payloads.ruling), { store: 'dual', board: '/board', gitAppend: miss, warn: () => {} });
+    expect(clear).toMatchObject({ ok: false, ledgerWriteMiss: true });
+    const block = appendVerdict(ev('ruling', { findingKey: 'f2', ruling: 'block' }), { store: 'dual', board: '/board', gitAppend: miss, warn: () => {} });
+    expect(block).toMatchObject({ ok: true, ledgerWriteMiss: true });
+  });
+});
