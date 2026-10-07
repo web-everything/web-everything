@@ -1073,7 +1073,7 @@ import { appendFileSync, writeFileSync } from 'node:fs';
 import { admissionLockRoot, heldSlots } from ${JSON.stringify(admissionModule)};
 const args = process.argv.slice(2);
 const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fastSlots: 1 });
-appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD }) + '\\n');
+appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null }) + '\\n');
 if (${live} && args[0] === 'vitest') {
   const { spawnSync } = await import('node:child_process');
   const result = spawnSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(args[1] === 'related' ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit' });
@@ -1147,6 +1147,27 @@ process.exit(${standardsExit});
       });
       expect(phases.admissionWaitMs).toBe(phases.admissionPhases.vitest.waitedMs + phases.admissionPhases.standards.waitedMs);
     }
+  });
+
+  // #5189 — dispatcher's per-run nonce: echoed on the later queue/started markers, never visible to a gate command.
+  it('echoes WE_VERIFY_MARKER_NONCE on later markers and hides it from gate commands', () => {
+    const nonce = 'abcdef0123456789abcdef0123456789';
+    const f = fixture();
+    const result = f.invoke([], { WE_VERIFY_MARKER_NONCE: nonce });
+    expect(result.code).toBe(0);
+    const lines = result.stderr.split('\n');
+    const later = lines.filter(line => line.startsWith(`⏳ ${GATE_QUEUED_MARKER}`) || line.startsWith(`⏱ ${GATE_STARTED_MARKER} (phase:`));
+    expect(later).toHaveLength(4);
+    for (const line of later) expect(line.endsWith(` [nonce=${nonce}]`)).toBe(true);
+    expect(lines.filter(line => line.includes(nonce)).length).toBe(later.length);
+    for (const call of f.calls()) expect(call.nonce).toBeNull();
+  });
+
+  it('emits unsuffixed markers when no nonce is set (verify-lane run directly)', () => {
+    const f = fixture();
+    const result = f.invoke();
+    expect(result.stderr).not.toContain('[nonce=');
+    for (const call of f.calls()) expect(call.nonce).toBeNull();
   });
 
   it('retries only failed files once with one worker, then runs standards and records why', () => {

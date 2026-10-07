@@ -71,7 +71,7 @@ import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlin
 import { execFileSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs } from './lib/lane-verify.mjs';
+import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix } from './lib/lane-verify.mjs';
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
@@ -115,6 +115,10 @@ const AS_JSON = !!flags.json;
 // `--require-verified` OR `WE_REQUIRE_VERIFIED=1`, and the `WE_LAND_UNVERIFIED=1` break-glass. Previously `check`
 // read only `flags['require-verified']`, so the same env produced two different verdicts at the two call sites.
 const { requireVerified: REQUIRE_VERIFIED, breakGlass: VERIFY_BREAK_GLASS } = resolveVerifyOptions({ flags, env: process.env });
+// #5189 — the dispatcher's per-run marker nonce: read once, then removed from this process's env so neither the gate
+// commands nor any other child we spawn can read it. Later in-band queue markers echo it (see `timedRunGate`).
+const MARKER_NONCE_SUFFIX = markerNonceSuffix(process.env[VERIFY_MARKER_NONCE_ENV]);
+delete process.env[VERIFY_MARKER_NONCE_ENV];
 const MODE = positionals[0] === 'check' ? 'check' : positionals[0] === 'reset' ? 'reset'
   : positionals[0] === 'request' ? 'request' : positionals[0] === 'run' ? 'run' : 'verify';
 
@@ -572,9 +576,9 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
     // Tell it we are queueing again, and that real gate work resumes once the slot is held. Keep both lines in
     // step with `GATE_QUEUED_MARKER` / `GATE_STARTED_MARKER` in `verify-dispatch.mjs`.
     // The leading newline keeps the marker at a line start even when the previous phase's output stopped mid-line.
-    process.stderr.write(`\n⏳ gate queueing for admission (phase: ${kind})\n`);
+    process.stderr.write(`\n⏳ gate queueing for admission (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
     acquired = await acquireAdmission(kind);
-    process.stderr.write(`⏱ gate execution starting (phase: ${kind})\n`);
+    process.stderr.write(`⏱ gate execution starting (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
   }
   firstPhaseAdmission = null;
   const started = performance.now();

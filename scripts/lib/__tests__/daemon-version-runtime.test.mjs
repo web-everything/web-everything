@@ -55,6 +55,45 @@ describe('card 89 S5 — versioned in-tick path', () => {
     expect(rt.resolveVersionedContext({ root: clone, settings: { enabled: { daemon: false } } })).toBeNull();
   });
 
+  it('is dormant with settings omitted entirely (built-in defaults enable no clone)', () => {
+    const empty = join(fixture, 'no-settings.json');
+    expect(rt.resolveVersionedContext({ root: clone, env: {}, settings: undefined, settingsPath: empty })).toBeNull();
+  });
+
+  it('holds a rolled-back sha even after gc pruned the held version record (sha persisted in the hold)', async () => {
+    const first = await rebuild();
+    land('second.txt');
+    const second = await rebuild();
+    const { rollback } = await import('../daemon-version-switch.mjs');
+    const rolled = await rollback({ clone: ctx.clone, home: ctx.home, settings, by: 'test', reason: 'bad' });
+    expect(rolled.status).toBe('switched');
+    const state = JSON.parse(readFileSync(join(ctx.dir, 'state.json'), 'utf8'));
+    expect(state.hold).toMatchObject({ version: second.versionId, sha: git(origin, 'rev-parse', 'main') });
+    rmSync(join(ctx.dir, 'versions', second.versionId), { recursive: true, force: true });
+    expect(first.versionId).not.toBe(second.versionId);
+    expect(await rebuild()).toMatchObject({ moved: false, reason: 'held-after-rollback' });
+  });
+
+  it('a hold with a traversal version id is ignored, never path-joined', async () => {
+    await rebuild();
+    land('third.txt');
+    writeFileSync(join(ctx.dir, 'state.json'), JSON.stringify({ hold: { version: '../../etc', until: 'main-moves' } }));
+    expect(await rebuild()).toMatchObject({ moved: true, adopted: true });
+  });
+
+  it.each(['transient', 'auth-broken', 'env-timeout'])('a %s smoke is retried with backoff, not recorded permanent', async (verdict) => {
+    let clock = 1_000_000;
+    const attempt = () => rt.versionedRebuild({ ctx, log, deps: { buildDeps, now: () => clock } });
+    buildDeps.runSmoke = vi.fn(async () => ({ verdict, attempts: 1 }));
+    expect(await attempt()).toMatchObject({ moved: false, reason: 'smoke-retry' });
+    expect(await attempt()).toMatchObject({ moved: false, reason: 'smoke-backoff' });
+    expect(buildDeps.runSmoke).toHaveBeenCalledTimes(1);
+    clock += 61 * 60_000;
+    buildDeps.runSmoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1 }));
+    expect(await attempt()).toMatchObject({ moved: true, adopted: true });
+    expect(buildDeps.runSmoke).toHaveBeenCalledTimes(1);
+  });
+
   it('rebuildClone on a versioned clone takes the versioned path and never takes a clone lock', async () => {
     const r = await rebuildClone({ root: clone, versions: { ...ctx, clone: join(fixture, 'not-a-repo') }, log });
     expect(r).toMatchObject({ moved: false, reason: 'fetch-failed' });
@@ -98,7 +137,7 @@ describe('card 89 S5 — versioned in-tick path', () => {
       let cur = { id: 'v1', dir: '/h/daemon/versions/v1', sha: 'aaa' };
       const versionApi = {
         currentVersion: () => cur,
-        pin: vi.fn(async ({ id }) => { pins.push(`pin:${id}`); }),
+        pin: over.pin ?? vi.fn(async ({ id }) => { pins.push(`pin:${id}`); return { status: 'pinned' }; }),
         unpin: vi.fn(async ({ id }) => { pins.push(`unpin:${id}`); }),
       };
       const w = withSelfSync({ tickOnce: over.tick ?? (async () => { seen.push(tickContext.tickRoot); return 'ticked'; }) }, {
@@ -119,6 +158,13 @@ describe('card 89 S5 — versioned in-tick path', () => {
       expect(t.pins).toEqual(['pin:v1', 'unpin:v1']);
       expect(t.tickContext.tickRoot).toBeUndefined();
       expect(lock.acquireRead).not.toHaveBeenCalled();
+    });
+
+    it.each(['busy', 'disabled'])('a %s pin skips the tick instead of running unpinned', async (status) => {
+      const t = mk({ pin: vi.fn(async () => ({ status })) });
+      await expect(t.w.tickOnce()).resolves.toMatchObject({ skipped: true, reason: `pin-${status}` });
+      expect(t.seen).toEqual([]);
+      expect(t.versionApi.unpin).not.toHaveBeenCalled();
     });
 
     it('a switch triggers the restart gate: imported change -> restart instead of tick', async () => {
@@ -168,7 +214,7 @@ describe('card 89 S5 — versioned in-tick path', () => {
       const t = withSelfSync({ tickOnce: () => spawnPassOnce({ script: 'scripts/conveyor/p.mjs' }, { root: tickContext.tickRoot ?? '/fallback', spawnFn, log }) }, {
         root: '/h/daemon/versions/v1', onRestart: vi.fn(), env: {}, tickContext,
         versions: { name: 'daemon', clone: '/ws/daemon', home: '/h', dir: '/h/daemon', settings: {} },
-        versionApi: { currentVersion: () => ({ id: 'v9', dir: '/h/daemon/versions/v9', sha: 'aaa' }), pin: async () => {}, unpin: async () => {} },
+        versionApi: { currentVersion: () => ({ id: 'v9', dir: '/h/daemon/versions/v9', sha: 'aaa' }), pin: async () => ({ status: 'pinned' }), unpin: async () => {} },
         rebuild: async () => ({ moved: false, reason: 'up-to-date' }), readHead: () => 'aaa', log,
       });
       await t.tickOnce();

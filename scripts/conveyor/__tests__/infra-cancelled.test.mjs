@@ -3,13 +3,29 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
   isInfraCancelledJob, isAggregateGateFailure, classifyInfraCancelled, isInfraCancelledOnlyRun, resolveInfraCancelledMode,
-  DEFAULT_INFRA_CANCELLED_MODE, DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
+  isHungJob, DEFAULT_INFRA_CANCELLED_MODE, DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
 } from '../infra-cancelled.mjs';
 import { computeMainRedWindows } from '../main-red-recovery.mjs';
 import { enrichPrsWithTimeoutEvidence, readTimeoutEvidence, defaultReadMainRuns } from '../reconcile-pass.mjs';
 
 const cancelledJob = { name: 'daemon-soak', status: 'completed', conclusion: 'cancelled', runner_name: '', steps: [] };
 const realFail = { name: 'test-shard (1)', status: 'completed', conclusion: 'failure', runner_name: 'GitHub Actions 1', steps: [{}] };
+
+describe('hung job (ran to its own timeout) is not infra', () => {
+  const ran = (mins, extra = {}) => ({ name: 'soak-shard (1)', status: 'completed', conclusion: 'cancelled', runner_name: 'GitHub Actions 7',
+    started_at: '2026-10-07T20:32:52Z', completed_at: new Date(Date.parse('2026-10-07T20:32:52Z') + mins * 60_000).toISOString(),
+    steps: [{ name: 'Soak shard 1/4', conclusion: 'cancelled' }], ...extra });
+  it('a cancelled job that held a runner for 15 min is hung, so a re-run is not owed (ci-heal is)', () => {
+    expect(isInfraCancelledJob(ran(15))).toBe(false);
+    expect(isHungJob(ran(15))).toBe(true);
+  });
+  it('a short cancel, a no-runner cancel and a disabled knob stay infra', () => {
+    expect(isInfraCancelledJob(ran(2))).toBe(true);
+    expect(isInfraCancelledJob(ran(15, { runner_name: '' }))).toBe(true);
+    expect(isInfraCancelledJob(ran(15), { hungMinutes: 0 })).toBe(true);
+    expect(isInfraCancelledJob(ran(15), { hungMinutes: 30 })).toBe(true);
+  });
+});
 
 describe('infra-cancelled classifier', () => {
   it('classifies cancelled / startup_failure / no-runner jobs as infra, real failures as not', () => {

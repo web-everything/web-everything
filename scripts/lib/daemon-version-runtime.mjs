@@ -25,11 +25,14 @@ import { switchCurrent } from './daemon-version-switch.mjs';
 import { gitRun } from './main-staleness.mjs';
 
 const ID = /^[0-9A-Za-z][0-9A-Za-z._-]*$/;
+const RETRYABLE_SMOKE = new Set(['transient', 'auth-broken', 'env-timeout']);
+const SMOKE_BACKOFF_BASE_MS = 5 * 60_000;
+const SMOKE_BACKOFF_MAX_MS = 60 * 60_000;
 
 /** The versioned context of `root`, or null when that clone is not enabled (the default for every clone). */
-export function resolveVersionedContext({ root, env = process.env, settings } = {}) {
+export function resolveVersionedContext({ root, env = process.env, settings, settingsPath } = {}) {
   if (!root) return null;
-  const values = settings ?? resolveDaemonVersionsSettings({ fileConfig: loadDaemonVersionsSettingsFile(), env }).values;
+  const values = settings ?? resolveDaemonVersionsSettings({ fileConfig: loadDaemonVersionsSettingsFile(settingsPath), env }).values;
   const clone = logicalCloneRoot(root);
   const name = basename(clone);
   if (!isVersionedClone(name, values)) return null;
@@ -111,6 +114,7 @@ export async function versionedRebuild({ ctx, log = console, deps = {} }) {
   const run = deps.run ?? gitRun;
   const build = deps.buildVersion ?? buildVersion;
   const swap = deps.switchCurrent ?? switchCurrent;
+  const now = deps.now ?? Date.now;
   const pending = takeRequests(ctx, fs);
   const finish = (result) => {
     if (pending.length) answer(ctx, pending, { overlaysApplied: false, ...result }, fs);
@@ -127,9 +131,20 @@ export async function versionedRebuild({ ctx, log = console, deps = {} }) {
     if (cur?.sha === sha) return finish({ moved: false, reason: 'up-to-date', head: sha });
     // A rollback holds the rejected sha until main moves: never rebuild it into a loop.
     const state = readJson(fs, join(ctx.dir, 'state.json'));
-    if (state?.hold?.version) {
-      const held = readJson(fs, join(ctx.dir, 'versions', state.hold.version, '.version.json'));
-      if (held?.sha === sha) return finish({ moved: false, reason: 'held-after-rollback', head: sha });
+    if (state?.hold) {
+      // The hold carries the rejected sha itself (gc may have pruned the version's record). Older holds
+      // without one fall back to the record, and only after the version id passes the id gate.
+      let heldSha = typeof state.hold.sha === 'string' ? state.hold.sha : null;
+      if (!heldSha && typeof state.hold.version === 'string' && ID.test(state.hold.version)) {
+        heldSha = readJson(fs, join(ctx.dir, 'versions', state.hold.version, '.version.json'))?.sha ?? null;
+      }
+      if (heldSha === sha) return finish({ moved: false, reason: 'held-after-rollback', head: sha });
+    }
+    // A transient / auth-broken / env-timeout smoke is retried with backoff, not recorded as permanent.
+    const retryFile = join(ctx.dir, 'smoke-retry.json');
+    const retry = readJson(fs, retryFile);
+    if (retry?.sha === sha && Number.isFinite(retry.retryAt) && now() < retry.retryAt) {
+      return finish({ moved: false, reason: 'smoke-backoff', head: sha, retryAt: retry.retryAt });
     }
 
     const built = await build({ clone: ctx.clone, home: ctx.home, sha, settings: ctx.settings, deps: deps.buildDeps });
@@ -137,9 +152,19 @@ export async function versionedRebuild({ ctx, log = console, deps = {} }) {
     const id = built.id;
     const record = readJson(fs, join(ctx.dir, 'versions', id, '.version.json'));
     if (record?.status !== 'built') {
+      if (RETRYABLE_SMOKE.has(record?.smoke?.verdict)) {
+        const failures = (retry?.sha === sha ? retry.failures : 0) + 1;
+        const delay = Math.min(SMOKE_BACKOFF_BASE_MS * 2 ** (failures - 1), SMOKE_BACKOFF_MAX_MS);
+        // Drop the failed folder (never switched to) so the next build is fresh, not a reuse of the failure.
+        fs.rmSync(join(ctx.dir, 'versions', id), { recursive: true, force: true });
+        writeAtomic(fs, retryFile, { sha, failures, verdict: record.smoke.verdict, retryAt: now() + delay });
+        log.error?.(`daemon-version: smoke of ${sha} was ${record.smoke.verdict} — retrying in ${Math.round(delay / 1000)}s (failure ${failures})`);
+        return finish({ moved: false, reason: 'smoke-retry', verdict: record.smoke.verdict, head: sha });
+      }
       log.error?.(`daemon-version: version ${id} of ${sha} did not pass its smoke (${record?.status ?? 'unknown'}) — current stays put`);
       return finish({ moved: false, reason: 'smoke-failed', versionId: id, head: sha });
     }
+    fs.rmSync(retryFile, { force: true });
     const switched = await swap({
       clone: ctx.clone, home: ctx.home, id, expectCurrent: cur?.id ?? null, settings: ctx.settings,
       by: 'in-tick', reason: `origin/main ${sha.slice(0, 12)}`,

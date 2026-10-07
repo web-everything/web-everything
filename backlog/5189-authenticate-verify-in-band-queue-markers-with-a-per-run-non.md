@@ -3,9 +3,11 @@ bornAs: xhtuli0
 kind: story
 size: 2
 tier: pinned
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/verify-dispatch.mjs", "we:scripts/verify-lane.mjs", "we:scripts/conveyor/__tests__/verify-dispatch.test.mjs", "we:scripts/__tests__/verify-lane.test.mjs", "we:scripts/lib/lane-verify.mjs", "we:scripts/__tests__/lane-verify.test.mjs"]
 dateOpened: "2026-10-06"
+dateStarted: "2026-10-07"
+dateResolved: "2026-10-07"
 preparedDate: "2026-10-07"
 preparedAgainstSha: "f0dc3af2af5539764d8fc5708ee5988b4a897265"
 tags: []
