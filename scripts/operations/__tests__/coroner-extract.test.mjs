@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { collectInputs, extractMetrics, parseMarkers, parseTranscript, percentile, readBounded, runCoroner } from '../coroner-extract.mjs';
+import { ciCheckName, collectInputs, extractMetrics, fetchCiRuns, fixOutcome, gateCause, parseMarkers, parseTranscript, percentile, rateMetric, readBounded, runCoroner } from '../coroner-extract.mjs';
 
 const since = '2026-10-05T17:00:00.000Z', until = '2026-10-05T18:00:00.000Z';
 const at = (minutes) => new Date(Date.parse(since) + minutes * 60000).toISOString();
@@ -23,7 +23,7 @@ const run = (args = []) => runCoroner([`--since=${since}`, '--json', '--no-save'
 
 beforeEach(() => {
   root = fs.mkdtempSync(join(tmpdir(), 'coroner-'));
-  env = Object.fromEntries(['JOBS', 'JOBS_ARCHIVE', 'PROJECTS', 'DAEMON_DIR', 'VERIFY_LOG', 'ADMISSION', 'LANES', 'STATE'].map((key) => [`WE_CORONER_${key}`, join(root, key.toLowerCase())]));
+  env = Object.fromEntries(['JOBS', 'JOBS_ARCHIVE', 'PROJECTS', 'DAEMON_DIR', 'VERIFY_LOG', 'ADMISSION', 'LANES', 'STATE', 'COORD'].map((key) => [`WE_CORONER_${key}`, join(root, key.toLowerCase())]));
 });
 afterEach(() => { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); });
 
@@ -215,3 +215,161 @@ describe('coroner metrics', () => {
     expect(readBounded(file, { cap: 28 }).lines).toEqual(['head', 'tail']);
   });
 });
+
+describe('coroner error rates (reported first)', () => {
+  const marker = (sha, startMin, endMin, extra = {}) => ({ sha, status: 'red', startedAt: at(startMin), finishedAt: at(endMin), suites: 'x', exitCode: 1, ...extra });
+  const writeMarkers = (rowsByLane) => Object.entries(rowsByLane).forEach(([lane, row]) => write(join(env.WE_CORONER_LANES, lane, '.git', '.lane-verify'), row));
+
+  it('leads the output with errorRates', () => {
+    expect(Object.keys(run().metrics)).toEqual(['window', 'errorRates', ...Object.keys(run().metrics).slice(2)]);
+    expect(run().output.startsWith('{"window"')).toBe(true);
+    expect(run().output.indexOf('"errorRates"')).toBeLessThan(run().output.indexOf('"sessions"'));
+  });
+
+  it('gate runs: splits red into in-diff, flaky-outside-diff, still-red, vitest timeout, killed-superseded and wait-timeout', () => {
+    writeMarkers({
+      'lane-1': marker('a'.repeat(40), 0, 10),
+      'lane-2': marker('b'.repeat(40), 0, 20, { isolatedRetry: 'flaky-outside-diff', retriedFailures: [{ file: 'x', kind: 'assertion' }] }),
+      'lane-3': marker('c'.repeat(40), 0, 30, { isolatedRetry: 'still-red' }),
+      'lane-4': marker('d'.repeat(40), 1, 11, { retriedTimeouts: ['t.test.mjs'] }),
+      'lane-5': marker('e'.repeat(40), 2, 12, { status: 'green' }),
+      'lane-6': marker('f'.repeat(40), 3, 13, { status: 'green', isolatedRetry: 'flaky-outside-diff' }),
+    });
+    write(env.WE_CORONER_VERIFY_LOG, `${at(5)} verify-daemon: tick — dispatched 0\n  ✂ web-everything/lane-3: in-flight run 1 superseded by a newer request — killed\n  ✂ web-everything/lane-3: in-flight run 2 superseded by a newer request — killed\n${at(70)} verify-daemon: tick\n  ✂ web-everything/lane-9: in-flight run 3 superseded by a newer request — killed\n`);
+    job('a');
+    transcript('a', [use('1', 'node scripts/verify-lane.mjs check --wait', 0), result('1', '{"status":"timeout","reason":"wait-timeout"}', 7)]);
+    const g = run().metrics.errorRates.gateRuns;
+    expect(g.total).toBe(6 + 2 + 1);
+    expect(g.count).toBe(4 + 2 + 1);
+    expect(Object.fromEntries(Object.entries(g.causes).map(([k, v]) => [k, v.count]))).toEqual({ 'flaky-outside-diff': 1, 'in-diff-real-failure': 1, 'killed-superseded': 2, 'still-red-after-isolated-retry': 1, 'verify-wait-timeout': 1, 'vitest-timeout': 1 });
+    expect(g.flakyRescuedGreen).toBe(1);
+    expect(run().metrics.errorRates.notes).toMatchObject({ verifyLogUnstampedLines: 0, ciRunsTruncated: false });
+    expect(g.pct).toBe(77.8);
+    expect(g.causes['killed-superseded'].examples).toEqual([{ ref: 'web-everything/lane-3', at: at(5) }, { ref: 'web-everything/lane-3', at: at(5) }]);
+    expect(g.causes['verify-wait-timeout'].minutes).toBe(7);
+    expect(g.causes['still-red-after-isolated-retry'].minutes).toBe(30);
+    expect(gateCause({ status: 'red', retriedFailures: [{ kind: 'timeout' }] })).toBe('vitest-timeout');
+  });
+
+  it('CI: red by check and by cause class (cancelled, flaky rerun, soak, real), at most two examples, bounded gh calls', () => {
+    const wf = (id, name, conclusion, sha, pr, min) => ({ id, name, conclusion, head_sha: sha, pull_requests: pr ? [{ number: pr }] : [], run_attempt: 1, created_at: at(min), updated_at: at(min + 3) });
+    const pages = [{ workflow_runs: [
+      wf(1, 'CI', 'failure', 'aaa1111', 10, 1), wf(2, 'CI', 'success', 'aaa1111', 10, 9),
+      wf(3, 'CI', 'failure', 'bbb2222', 11, 2), wf(4, 'Review gate', 'cancelled', 'ccc3333', 12, 3),
+      wf(5, 'Soak replay gate', 'failure', 'ddd4444', 13, 4), wf(6, 'CI', 'success', 'eee5555', 14, 5),
+      wf(7, 'Review gate', 'cancelled', 'fff6666', 15, 6), wf(8, 'Review gate', 'cancelled', 'ggg7777', 16, 7),
+      wf(9, 'CI', 'failure', 'hhh8888', 17, 80), wf(10, 'Review gate', 'failure', 'iii9999', 18, 8),
+    ] }];
+    const jobs = { 1: ['test (2/4)'], 3: ['test (1/4)', 'smoke'], 5: ['soak shard 2'] };
+    const calls = [];
+    const gh = (args) => {
+      if (args[1].includes('/pulls?')) return [];
+      calls.push(args[1]);
+      const m = args[1].match(/runs\/(\d+)\/jobs/);
+      if (m) return { jobs: (jobs[m[1]] ?? []).map((name) => ({ name, conclusion: 'failure' })) };
+      return pages.shift() ?? null;
+    };
+    const ci = run0(gh).metrics.errorRates.ci;
+    expect(ci.total).toBe(9);
+    expect(ci.count).toBe(7);
+    expect(Object.fromEntries(Object.entries(ci.causes).map(([k, v]) => [k, v.count]))).toEqual({ 'infra-cancelled': 3, flaky: 1, 'real-code-defect': 1, 'review-gate-hold': 1, 'soak-scenario': 1 });
+    expect(ci.causes['infra-cancelled'].examples).toHaveLength(2);
+    expect(ci.causes.flaky.examples).toEqual([{ ref: 'PR #10', at: at(1) }]);
+    expect(Object.fromEntries(Object.entries(ci.byCheck).map(([k, v]) => [k, v.count]))).toEqual({ 'review-gate': 4, 'test-shard': 2, 'soak-shard': 1, smoke: 1 });
+    expect(ci.redHeads).toBe(7);
+    expect(calls.length).toBeLessThanOrEqual(1 + 5);
+    expect(fetchCiRuns({ since, until }, null)).toEqual({ runs: [], found: false, calls: 0, truncated: false });
+    let n = 0;
+    expect(fetchCiRuns({ since, until }, () => (++n, { workflow_runs: Array.from({ length: 100 }, (_, i) => ({ id: i, conclusion: 'success' })) }), { maxPages: 2 })).toMatchObject({ calls: 2, truncated: true });
+    expect(ciCheckName('CodeQL / Analyze')).toBe('CodeQL');
+    expect(ciCheckName('daemon-soak (1/2)')).toBe('daemon-soak');
+  });
+
+  it('fix/ci-heal sessions: outcomes with causes and rounds per PR', () => {
+    job('a', 'fix-42', 10, { detail: 'PR 42 fix pushed, re-armed review:pending' });
+    job('b', 'fix-42', 20, { detail: 'PR 42: inode fix in tests, gate-red (unrelated timeout)' });
+    job('c', 'ci-heal-43', 5, { detail: 'PR 43: no CI break found, heal stood down' });
+    job('d', 'ci-heal-44', 8, { detail: 'PR 44 ci-heal: no CI break found; escalated review-gate hold' });
+    job('e', 'fix-45', 30, { detail: 'lock race fixed; hold posted for quiet-host reverify' });
+    job('f', 'fix-46', 2, { state: 'stopped', detail: 'stopped' });
+    job('g', 'fix-47', 2, { state: 'blocked', detail: 'permission denied' });
+    job('h', 'build-48', 9, { detail: 'built and pushed' });
+    const f = run().metrics.errorRates.fixSessions;
+    expect(f.total).toBe(7);
+    expect(Object.fromEntries(Object.entries(f.causes).map(([k, v]) => [k, v.count]))).toEqual({ blocked: 1, escalated: 1, 'gate-red-not-pushed': 1, 'load-flake-hold': 1, 'no-op': 1, pushed: 1, 'stopped-without-outcome': 1 });
+    expect(f.causes['load-flake-hold'].minutes).toBe(30);
+    expect(f.rounds).toEqual({ prs: 6, multiRoundPrs: 1, max: 2, top: [{ pr: 42, rounds: 2 }, { pr: 43, rounds: 1 }, { pr: 44, rounds: 1 }, { pr: 45, rounds: 1 }, { pr: 46, rounds: 1 }] });
+    expect(fixOutcome({ state: 'done', detail: 'weird' })).toBe('other');
+  });
+
+  it('builder launches: launched / not confirmed / failed / repeated same card, from rows above the normal line cap', () => {
+    const row = (min, dispatched, failures, pad = 0) => JSON.stringify({ at: at(min), timings: { totalMs: 1 }, dispatched, failures, pad: 'x'.repeat(pad) });
+    write(join(env.WE_CORONER_COORD, 'build-dispatch-daemon.log'), [
+      `${at(0)} build-dispatch-daemon: live`,
+      row(1, [{ num: '1' }, { num: '2' }], [], 300 * 1024),
+      row(3, [], [{ num: '1', stage: 'dispatch', reason: 'dispatch launch not confirmed (missing effect; no running session)' }, { num: '3', stage: 'dispatch', reason: 'Command failed: node run.mjs' }, { num: '9', stage: 'plan', reason: 'x' }]),
+      row(5, [], [{ num: '1', stage: 'dispatch', reason: 'dispatch launch not confirmed (x)' }]),
+      row(90, [{ num: '4' }], []),
+    ].join('\n') + '\n');
+    const b = run().metrics.errorRates.builderLaunches;
+    expect(b.launched).toBe(2);
+    expect(b.total).toBe(5);
+    expect(Object.fromEntries(Object.entries(b.causes).map(([k, v]) => [k, v.count]))).toEqual({ 'launch-not-confirmed': 2, failed: 1, 'repeated-same-card': 2 });
+    expect(b.repeatedSameCard).toBe(2);
+    expect(b.causes['launch-not-confirmed'].examples).toEqual([{ ref: 'card 1', at: at(5) }, { ref: 'card 1', at: at(3) }]);
+  });
+
+  it('daemon errors: expands "(repeated N times)" lines, windows by the nearest stamp, counts per source', () => {
+    write(join(env.WE_CORONER_DAEMON_DIR, 'review-daemon.log'), [
+      `${at(1)} daemon-self-sync: rebuild did not move the clone (concurrent-mover) — ticking on the current code`,
+      `${at(9)} (repeated 3 times since ${at(2)}) daemon-self-sync: rebuild did not move the clone (concurrent-mover) — ticking on the current code`,
+      `${at(10)} daemon-rebuild: smoke-failed {"x":1}`,
+      '  continuation line without a stamp: tick-in-progress',
+      `${at(11)} GitHub core API rate limit exceeded for this identity`,
+      `${at(12)} error: Command failed: gh pr list --repo chalbert/web-everything`,
+      `${at(12)} gh-throttle: GitHub core API rate limit exceeded`,
+      `${at(-30)} daemon-self-sync: rebuild did not move the clone (concurrent-mover)`,
+      `${at(80)} daemon-self-sync: rebuild did not move the clone (concurrent-mover)`,
+    ].join('\n') + '\n');
+    write(join(env.WE_CORONER_COORD, 'build-dispatch-daemon.log'), `${at(20)} daemon-rebuild: smoke-slow {"ms":1}\n${at(21)} daemon-rebuild: smoke-fail {"ms":1}\n${at(22)} build: concurrent-mover\n`);
+    const d = run().metrics.errorRates.daemonErrors;
+    expect(d.concurrentMover.count).toBe(1 + 3 + 1);
+    expect(d.concurrentMover.causes['review-daemon'].count).toBe(4);
+    expect(d.concurrentMover.causes['build-dispatch'].count).toBe(1);
+    expect(d.smokeFailures.count).toBe(2);
+    expect(d.smokeFailures.total).toBe(3);
+    expect(d.tickInProgress.count).toBe(1);
+    expect(d.tickInProgress.causes['review-daemon'].examples).toEqual([{ ref: 'review-daemon', at: at(10) }]);
+    expect(d.rateLimit.count).toBe(2);
+    expect(d.ghReadFailures.count).toBe(1);
+    expect(d.ghReadFailures.causes).toHaveProperty('chalbert/web-everything');
+  });
+
+  it('merge conflicts: events per PR opened with minutes, before/after the scoping cutoff', () => {
+    env.WE_CORONER_SCOPING_CUTOFF = at(30);
+    write(join(env.WE_CORONER_DAEMON_DIR, 'fix-dispatch-daemon.log'), [
+      `${at(5)} {"checked":true,"results":[{"num":77,"isConflicting":true,"add":"merge-status:conflicting","remove":[],"newlyDetected":true},{"num":78,"isConflicting":true,"remove":[],"newlyDetected":false}]}`,
+      `${at(6)} reconcile: unowned-mechanical-rebase PR #77`,
+      `${at(7)} reconcile: scope-overlap with PR #12 — waiting`,
+      `${at(40)} fix-dispatch: dispatch-conflict-fix PR #90`,
+      `${at(41)} drain: overlap-yield-ready-at later`,
+    ].join('\n') + '\n');
+    job('a', 'fix-77', 12, { detail: 'PR 77 rebased onto main, conflict resolved', createdAt: at(10) });
+    const pulls = [{ number: 1, created_at: at(3) }, { number: 2, created_at: at(20) }, { number: 3, created_at: at(45) }, { number: 4, created_at: at(-60) }];
+    const c = run0((args) => args[1].includes('/pulls?') ? pulls : null).metrics.errorRates.mergeConflicts;
+    expect(c).toMatchObject({ count: 6, total: 3, prsOpened: 3, eventsPerPr: 2, minutes: 2 });
+    expect(Object.fromEntries(Object.entries(c.causes).map(([k, v]) => [k, v.count]))).toEqual({ 'conflict-fix-round': 1, 'conflict-fix-session': 1, 'drain-overlap-yield': 1, 'mechanical-rebase': 1, 'newly-conflicting-pr': 1, 'scope-overlap-wait': 1 });
+    expect(c.causes['newly-conflicting-pr'].examples).toEqual([{ ref: 'PR #77', at: at(5) }]);
+    expect(c.beforeAfter.cutoff).toBe(at(30));
+    expect(c.beforeAfter.before).toMatchObject({ count: 4, prsOpened: 2, hours: 0.5 });
+    expect(c.beforeAfter.after).toMatchObject({ count: 2, prsOpened: 1 });
+  });
+
+  it('rateMetric reports count, total, percent and two examples at most', () => {
+    const m = rateMetric([1, 2, 3].map((i) => ({ cause: 'a', ref: `r${i}`, at: at(i) })), 12, 'x');
+    expect(m).toMatchObject({ count: 3, total: 12, pct: 25 });
+    expect(m.causes.a.examples).toEqual([{ ref: 'r3', at: at(3) }, { ref: 'r2', at: at(2) }]);
+  });
+});
+
+function run0(gh) { return runCoroner([`--since=${since}`, '--json', '--no-save'], { env, home: root, now: until, gh }); }
