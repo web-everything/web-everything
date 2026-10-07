@@ -5,10 +5,11 @@
  * failure is persisted with its reason code and the child output, and the card is withheld until `retryAfter`.
  * After `maxAttempts` the card stays withheld (`exhausted`) until re-armed. A dispatched build clears its record.
  */
-import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { readBackoffSettings, backoffVerdict, reasonCodeOf } from './retry-backoff.mjs';
+import { readBackoffSettings, backoffVerdict, evidenceReasonCode } from './retry-backoff.mjs';
+import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 
 export const buildFailurePath = () => join(resolveCoordinationRoot(), 'build-dispatch-failures.json');
 const OUTPUT_CAP = 2000;
@@ -21,7 +22,9 @@ function read(path) {
 function save(state, path) {
   mkdirSync(dirname(path), { recursive: true });
   const temp = `${path}.${process.pid}.tmp`;
-  writeFileSync(temp, JSON.stringify(state, null, 2) + '\n');
+  // Child output can echo credentials: owner-only, like any other file that may hold one.
+  writeFileSync(temp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
+  chmodSync(temp, 0o600);
   renameSync(temp, path);
 }
 
@@ -30,11 +33,14 @@ export function recordBuildFailure({ num, reason, output }, { path = buildFailur
   const state = read(path);
   const key = String(num);
   const attempts = (state.items[key]?.attempts ?? 0) + 1;
-  const text = String(output ?? reason ?? '').trim();
+  // Redact BEFORE cutting: a cut taken first can slice a credential's recognisable prefix off and leave its tail
+  // unredactable. The reason code is read off the raw text — redaction never changes what a code pattern matches.
+  const rawText = String(output ?? reason ?? '').trim();
+  const text = redactSpawnText(rawText);
   const record = {
     num: key, attempts,
-    reasonCode: reasonCodeOf(reason ?? text) ?? (text ? 'dispatch-failed' : 'empty-failure-output'),
-    reason: String(reason ?? '').slice(0, 400),
+    reasonCode: evidenceReasonCode({ reason: reason ?? rawText }) ?? (rawText ? 'dispatch-failed' : 'empty-failure-output'),
+    reason: redactSpawnText(reason ?? '').slice(0, 400),
     output: text.slice(0, OUTPUT_CAP),
     recordedAt: new Date(now).toISOString(),
     ...backoffVerdict({ attempts, now, settings }),

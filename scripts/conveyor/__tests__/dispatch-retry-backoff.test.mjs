@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { backoffDelayMs, backoffVerdict, readBackoffSettings, reasonCodeOf } from '../retry-backoff.mjs';
-import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, rearmFalseHolds, completePrepareFailures } from '../prepare-failure-policy.mjs';
+import { backoffDelayMs, backoffVerdict, readBackoffSettings, reasonCodeOf, evidenceReasonCode } from '../retry-backoff.mjs';
+import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, rearmFalseHolds, completePrepareFailures, classifyPrepareFailure } from '../prepare-failure-policy.mjs';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures } from '../build-dispatch-failures.mjs';
-import { runBuildDispatchTick } from '../../../skills-src/conveyor/build-dispatch-daemon.mjs';
+import { runBuildDispatchTick, releaseOwnPrepareHolds } from '../../../skills-src/conveyor/build-dispatch-daemon.mjs';
 import { listBuildDispatchClaims, acquireBuildDispatchClaim, releaseBuildDispatchClaim } from '../build-dispatch-claim.mjs';
 
 const S = { baseMs: 1000, maxMs: 5000, maxAttempts: 3 };
@@ -122,5 +122,172 @@ describe('build dispatch failures back off and keep their output (item 96)', () 
       await runBuildDispatchTick({ live: true, effects: effects(dispatch) });
       expect(dispatch).toHaveBeenCalledTimes(2);
     } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+  });
+});
+
+describe('review round 1 — release, re-arm and ledger hardening', () => {
+  let dir, path, fileCard;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'retry-r1-')); path = join(dir, 'f.json'); fileCard = vi.fn(); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  const rec = (attempt, now, over = {}) => recordPrepareFailure({ num: '5188', attempt, stage: 'dispatch', evidence: { reason: NOT_CONFIRMED } }, { path, fileCard, now, settings: S, ...over });
+  const seed = (failures) => writeFileSync(path, JSON.stringify({ failures, cards: {} }));
+
+  it('release paths only lift a prepare hold, never an operator/supervisor/#4465 hold on the same card', () => {
+    const release = vi.fn();
+    const holds = [{ num: '1', reason: 'prepare-unstamped' }, { num: '2', reason: 'operator' }, { num: '3', reason: 'gate-red' }, { num: '4', reason: null }];
+    // (the helper's own contract is exercised again below for ordering and `prepare-stamp-pending`)
+    const out = releaseOwnPrepareHolds({ nums: ['1', '2', '3', '4', '5'], holds, release });
+    expect(release.mock.calls.map(([o]) => o.num)).toEqual(['1']);
+    expect(out).toEqual({ released: ['1'], kept: ['2', '3', '4'] });
+  });
+
+  it('the tick leaves a foreign hold alone when a transient backoff elapses', async () => {
+    const lockRoot = mkdtempSync(join(tmpdir(), 'bdd-foreign-'));
+    const releasePrepareHold = vi.fn();
+    const effects = {
+      planTick: () => ({ decisions: { statusLine: 't', counts: { building: 0 }, spawnBuilds: [],
+        admission: { queue: [], cleared: [] } }, nextState: { tick: 1, buildGuards: [], launchedNums: [] } }),
+      fetchOpenPrs: () => [], listClaims: () => [], releaseClaim: () => {}, listRunStoreInFlight: () => [], listSettledBuilds: () => [],
+      killSwitch: () => ({ engaged: false }),
+      releaseDuePrepareRetries: () => ['4688', '4701'],
+      listHolds: () => [{ num: '4688', reason: 'operator' }, { num: '4701', reason: 'prepare-unstamped' }],
+      releasePrepareHold,
+    };
+    try {
+      await runBuildDispatchTick({ live: true, effects });
+      expect(releasePrepareHold.mock.calls.map(([o]) => o.num)).toEqual(['4701']);
+    } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+  });
+
+  it('re-arm keeps the hold while another unresolved held failure remains on the card', () => {
+    seed({
+      a: { num: '7', attempt: '2026-10-06T17:56:00.000Z', cause: 'unknown', evidence: { reason: NOT_CONFIRMED }, held: true },
+      b: { num: '7', attempt: '2026-10-06T17:57:00.000Z', cause: 'unknown', evidence: { reason: 'wrapper-failed' }, held: true },
+      c: { num: '8', attempt: '2026-10-06T17:56:00.000Z', cause: 'unknown', evidence: { reason: NOT_CONFIRMED }, held: true },
+    });
+    expect(rearmFalseHolds({ path, dryRun: true })).toEqual({ count: 2, nums: ['8'] });
+    expect(rearmFalseHolds({ path })).toEqual({ count: 2, nums: ['8'] });
+    const after = readFailureState(path).failures;
+    expect([after.a.held, after.b.held, after.c.held]).toEqual([false, true, false]);
+  });
+
+  it('re-arm refuses an unparseable --before instead of widening to every held failure', () => {
+    seed({ a: { num: '1', attempt: 'x', recordedAt: '2026-10-07T01:00:00.000Z', cause: 'dispatch-transient', evidence: { reason: NOT_CONFIRMED }, held: true } });
+    for (const before of ['2026-10-0', 'yesterday', '', null]) expect(() => rearmFalseHolds({ path, before })).toThrow(/--before/);
+    expect(readFailureState(path).failures.a.held).toBe(true);
+  });
+
+  it('re-arming an exhausted failure restarts its backoff budget, and the default re-arm reaches it', async () => {
+    await rec('a', 0); releaseDuePrepareRetries({ path, now: 1000 });
+    await rec('b', 1000); releaseDuePrepareRetries({ path, now: 3000 });
+    expect(await rec('c', 3000)).toMatchObject({ attempts: 3, exhausted: true });
+    // `recordedAt` is long after the #4148 cutoff: the default re-arm must still clear an EXHAUSTED hold.
+    const r = rearmFalseHolds({ path, now: 4000 });
+    expect(r.nums).toEqual(['5188']);
+    expect(Object.values(readFailureState(path).failures).filter(f => f.held)).toEqual([]);
+    expect(await rec('d', 5000)).toMatchObject({ attempts: 1, exhausted: false, retryAfter: new Date(6000).toISOString() });
+  });
+
+  it('a non-exhausted post-fix hold is still skipped by the default re-arm', async () => {
+    await rec('a', Date.parse('2026-10-07T02:00:00Z'));
+    expect(rearmFalseHolds({ path }).count).toBe(0);
+  });
+
+  it('only a dispatch-stage failure is a transient; a stamp-stage "Command failed" stays unknown with a diagnose card', async () => {
+    const e = { reason: 'Command failed: git commit -m x' };
+    expect(classifyPrepareFailure(e, 'dispatch')).toBe('dispatch-transient');
+    for (const stage of ['stamp', 'stamp-read', 'result', 'retirement', 'claim', 'dispatch-refused']) {
+      expect(classifyPrepareFailure(e, stage)).toBe('unknown');
+    }
+    fileCard.mockResolvedValue({ ok: true });
+    const f = await recordPrepareFailure({ num: '9', attempt: 'a', stage: 'stamp', evidence: e }, { path, fileCard, now: 0, settings: S });
+    expect(f).toMatchObject({ cause: 'unknown', held: true });
+    expect(fileCard).toHaveBeenCalledTimes(1);
+  });
+
+  it('one helper names the reason code: `reason` first, `error` only when there is no reason', async () => {
+    expect(evidenceReasonCode({ error: 'wrapper-failed', reason: NOT_CONFIRMED })).toBe('launch-not-confirmed');
+    expect(evidenceReasonCode({ error: NOT_CONFIRMED })).toBe('launch-not-confirmed');
+    expect(evidenceReasonCode({ error: 'launch-died: x', reason: 'wrapper-failed' })).toBeNull();
+    expect(evidenceReasonCode({})).toBeNull();
+    // classification, the stored reason code and the re-arm all agree, for both a coded and an un-coded `reason`.
+    const coded = { error: 'raw child output', reason: NOT_CONFIRMED };
+    expect(classifyPrepareFailure(coded, 'dispatch')).toBe('dispatch-transient');
+    const f = await recordPrepareFailure({ num: '5188', attempt: 'a', stage: 'dispatch', evidence: coded }, { path, fileCard, now: 0, settings: S });
+    expect(f.reasonCode).toBe('launch-not-confirmed');
+    expect(rearmFalseHolds({ path, before: '1969-12-31', dryRun: true }).count).toBe(0); // recorded at epoch 0, after that cutoff: spared
+    const uncoded = { error: NOT_CONFIRMED, reason: 'dispatch wrapper said no' };
+    expect(classifyPrepareFailure(uncoded, 'dispatch')).toBe('unknown');
+  });
+
+  it('re-arm does not match a result-stage hold whose agent output merely QUOTES a known failure', () => {
+    seed({
+      q: { num: '95', attempt: '2026-10-06T17:56:00.000Z', stage: 'result', cause: 'unknown', evidence: { reason: 'prepare-unstamped', error: `quoting: ${NOT_CONFIRMED}` }, held: true },
+      s: { num: '96', attempt: '2026-10-06T17:56:00.000Z', stage: 'stamp', cause: 'unknown', evidence: { reason: 'Command failed: git commit' }, held: true },
+    });
+    expect(rearmFalseHolds({ path, codes: ['launch-not-confirmed', 'dispatch-command-failed'] })).toEqual({ count: 0, nums: [] });
+  });
+
+  it('re-arm refuses a future, non-ISO or unknown-code scope', () => {
+    seed({ a: { num: '1', attempt: 'x', recordedAt: '2026-10-07T01:00:00.000Z', cause: 'dispatch-transient', evidence: { reason: NOT_CONFIRMED }, held: true } });
+    for (const before of ['1', 'Oct 7', '2999-01-01', '2999-10-07T00:00:00Z']) expect(() => rearmFalseHolds({ path, before })).toThrow(/--before/);
+    for (const codes of [['typo'], [], ['launch-not-confirmed', 'nope']]) expect(() => rearmFalseHolds({ path, codes })).toThrow(/--codes/);
+    expect(readFailureState(path).failures.a.held).toBe(true);
+  });
+
+  it('a budget reset does not relabel a still-held sibling as re-armed', () => {
+    seed({
+      a: { num: '7', attempt: '2026-10-06T17:56:00.000Z', stage: 'dispatch', cause: 'dispatch-transient', evidence: { reason: NOT_CONFIRMED }, held: true },
+      b: { num: '7', attempt: 'b', stage: 'dispatch', cause: 'dispatch-transient', evidence: { reason: 'launch-died: x' }, held: true, recordedAt: '2026-10-07T01:00:00.000Z' },
+    });
+    rearmFalseHolds({ path });
+    const f = readFailureState(path).failures;
+    expect(f.a.rearmedAt).toBeTruthy();
+    expect(f.b.rearmedAt).toBeUndefined();
+    expect(f.b.budgetResetAt).toBeTruthy();
+    expect(f.b.held).toBe(true);
+  });
+
+  it('a re-arm written while recordPrepareFailure awaits its diagnose card is not overwritten', async () => {
+    seed({ old: { num: '7', attempt: '2026-10-06T17:56:00.000Z', stage: 'dispatch', cause: 'dispatch-transient', evidence: { reason: NOT_CONFIRMED }, held: true } });
+    const slowCard = vi.fn(async () => { rearmFalseHolds({ path }); return { ok: true }; });
+    await recordPrepareFailure({ num: '9', attempt: 'a', stage: 'stamp', evidence: { reason: 'weird' } }, { path, fileCard: slowCard, now: 0, settings: S });
+    const f = readFailureState(path).failures;
+    expect(f.old.held).toBe(false);
+    expect(Object.values(f).find(x => x.num === '9')).toMatchObject({ cause: 'unknown', held: true });
+  });
+
+  it('the prepare ledger stores redacted evidence and signature, owner-only', async () => {
+    const tok = 'ghp_' + 'b'.repeat(30);
+    await recordPrepareFailure({ num: '9', attempt: 'a', stage: 'stamp', evidence: { reason: `Command failed: claude --settings {"env":{"GH_TOKEN":"${tok}"}}`, sessionAbsent: false } },
+      { path, fileCard: vi.fn().mockResolvedValue({ ok: true }), now: 0, settings: S });
+    const raw = readFileSync(path, 'utf8');
+    expect(raw).not.toContain(tok);
+    expect(JSON.parse(raw).failures['9:a:stamp'].evidence.sessionAbsent).toBe(false);
+    expect(statSync(path).mode & 0o077).toBe(0);
+  });
+
+  it('the release helper keeps a card that has ANY non-prepare hold, in either order, and never lifts stamp-pending', () => {
+    const release = vi.fn();
+    const holds = [
+      { num: '1', reason: 'operator' }, { num: '1', reason: 'prepare-unstamped' },
+      { num: '2', reason: 'prepare-unstamped' }, { num: '2', reason: 'operator' },
+      { num: '3', reason: 'prepare-stamp-pending' }, { num: '4', reason: 'prepare-unstamped' },
+    ];
+    const out = releaseOwnPrepareHolds({ nums: ['1', '2', '3', '4'], holds, release });
+    expect(out).toEqual({ released: ['4'], kept: ['1', '2', '3'] });
+    expect(release.mock.calls.map(([o]) => o.num)).toEqual(['4']);
+  });
+
+  it('the build ledger redacts secrets before it cuts, and writes owner-only', () => {
+    const p = join(dir, 'b.json');
+    const tok = 'ghp_' + 'a'.repeat(30);
+    const r = recordBuildFailure({ num: '4688', reason: `launch-died: GH_TOKEN=${tok}`,
+      output: `${'x'.repeat(1990)} token=${tok} Bearer abcdefghijkl1234` }, { path: p, now: 0, settings: S });
+    expect(readFileSync(p, 'utf8')).not.toContain(tok);
+    expect(JSON.stringify(r)).not.toContain(tok);
+    expect(r.output).not.toMatch(/abcdefghijkl1234/);
+    expect(statSync(p).mode & 0o077).toBe(0);
+    expect(r.reasonCode).toBe('launch-died');
   });
 });

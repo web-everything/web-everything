@@ -38,8 +38,17 @@ const RULES = [
   ['launch-died', /launch-died/i],
   ['dispatch-command-failed', /^Command failed\b/i],
 ];
+export const BACKOFF_REASON_CODES = Object.freeze(RULES.map(([code]) => code));
 export function reasonCodeOf(text) {
   const s = String(text ?? '');
   for (const [code, re] of RULES) if (re.test(s)) return code;
   return null;
+}
+
+/** The one place that reads a reason code off failure evidence. Classification, the persisted `reasonCode` and the
+ * re-arm all call this, so they can never disagree when evidence carries both `reason` and `error` text. */
+export function evidenceReasonCode(evidence) {
+  // `reason` is the daemon's own account of the failure; `error` is raw agent/child output that may merely QUOTE a
+  // known failure's text. `error` is only consulted when there is no `reason` at all.
+  return reasonCodeOf(evidence?.reason ?? evidence?.error);
 }

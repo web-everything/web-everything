@@ -79,6 +79,7 @@ import { MAX_CONCURRENT_LANES_ENV } from '../../scripts/lib/lane-concurrency.mjs
 
 import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures } from '../../scripts/conveyor/build-dispatch-failures.mjs';
+import { redactSpawnText } from '../../scripts/lib/describe-spawn-failure.mjs';
 
 import { resolveScorecardStorePath } from '../../scripts/conveyor/run-scorecard-store.mjs';
 
@@ -266,13 +267,43 @@ export async function runBuildDispatchTick(options) {
   catch (error) { error.timings = timer.snapshot(); throw error; }
 }
 
+/**
+ * Release the hold of each card in `nums` ONLY when it is a prepare hold (the one the failure ledger places). A hold
+ * file is keyed by card number alone, so an operator / supervisor / #4465-routed / `gate-red` hold sharing the card
+ * would otherwise be silently lifted by a backoff release or a re-arm. Returns what was released and what was kept.
+ */
+export function releaseOwnPrepareHolds({ nums, holds, release }) {
+  // A card with ANY non-prepare entry keeps its hold, whatever order the entries come in (`listHolds` can append a
+  // synthetic prepare entry for a held ledger failure after the real hold files).
+  const own = new Map();
+  for (const h of holds) {
+    const num = normNum(h.num);
+    own.set(num, (own.get(num) ?? true) && h.reason === LEDGER_HOLD_REASON);
+  }
+  const released = [];
+  const kept = [];
+  for (const raw of nums) {
+    const num = normNum(raw);
+    if (!own.has(num)) continue; // no live hold at all — nothing to release
+    if (!own.get(num)) { kept.push(num); continue; }
+    release?.({ num });
+    released.push(num);
+  }
+  return { released, kept };
+}
+// The one hold the prepare failure ledger places (`failPrepare`); `prepare-stamp-pending` belongs to stamp recovery.
+const LEDGER_HOLD_REASON = 'prepare-unstamped';
+
 async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, policy = BUILD_DISPATCH_POLICY, prepareEnabled = true, routingPolicy, effects, timer = createPhaseTimer() }) {
   effects = timer.wrap(effects);
   // Item 95 — held transient prepare failures whose backoff elapsed become dispatchable again BEFORE holds are read.
   // Live only: a dry-run must not mutate the ledger.
   if (live && typeof effects.releaseDuePrepareRetries === 'function') {
-    try { for (const num of effects.releaseDuePrepareRetries() ?? []) effects.releasePrepareHold?.({ num: normNum(num) }); }
-    catch (e) { console.error(`build-dispatch-daemon: prepare retry release failed: ${String(e?.message || e).split('\n')[0]}`); }
+    try {
+      const due = effects.releaseDuePrepareRetries() ?? [];
+      // Holds are keyed by card: only lift the PREPARE hold this ledger placed, never another hold on the card.
+      if (due.length) releaseOwnPrepareHolds({ nums: due, holds: effects.listHolds?.() ?? [], release: effects.releasePrepareHold });
+    } catch (e) { console.error(`build-dispatch-daemon: prepare retry release failed: ${String(e?.message || e).split('\n')[0]}`); }
   }
   let holds = effects.listHolds?.() ?? [];
   const prepareRows = effects.listPrepareInFlight?.() ?? [];
@@ -599,7 +630,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     const input = { num, stage, attempt: attempt ?? `${stage}:${num}:${reason}`, evidence };
     const failure = live && effects.recordPrepareFailure
       ? await effects.recordPrepareFailure(input)
-      : { ...input, cause: classifyPrepareFailure(evidence), retry: false, held: true };
+      : { ...input, cause: classifyPrepareFailure(evidence, stage), retry: false, held: true };
     prepare.failures.push({ num, stage, reason, cause: failure.cause, retry: failure.retry, prevention: failure.prevention });
     if (live && failure.held) effects.placePrepareHold({ num, reason: 'prepare-unstamped', ...holdStamp(num) });
     if (failure.held) heldNums.add(num);
@@ -1063,7 +1094,9 @@ export function cliDispatch(args, { exec = execFileSync } = {}) {
       const outcome = readDispatchOutcome(e.stdout);
       if (!outcome.dispatching && outcome.reason && !['unparseable dispatch-lane output', 'no verdict in dispatch-lane output'].includes(outcome.reason)) return outcome;
     }
-    return { dispatching: false, reason: String(e?.stderr || e?.message || e).replace(/\s+/g, ' ').slice(0, 400) };
+    // Redact BEFORE cutting (a cut inside `--settings {"env":{"GH_TOKEN":"…` leaves a credential no pattern can match):
+    // this reason is persisted in the failure ledgers and printed in the tick result.
+    return { dispatching: false, reason: redactSpawnText(String(e?.stderr || e?.message || e)).replace(/\s+/g, ' ').slice(0, 400) };
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
   }
@@ -1084,7 +1117,7 @@ export function cliDispatchDetached(args, { spawn, root = pendingLaunchesRoot() 
     return { dispatching: true, pending: true, lane: null, sessionSlug: null, attempt: record.attempt };
   } catch (e) {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    return { dispatching: false, reason: `launch-spawn-failed: ${String(e?.message || e).replace(/\s+/g, ' ').slice(0, 300)}` };
+    return { dispatching: false, reason: `launch-spawn-failed: ${redactSpawnText(String(e?.message || e)).replace(/\s+/g, ' ').slice(0, 300)}` };
   }
 }
 
@@ -1963,12 +1996,17 @@ async function live(flags) {
  */
 function rearm(flags) {
   const dryRun = Boolean(flags['dry-run']);
-  const before = typeof flags.before === 'string' ? flags.before : NOT_CONFIRMED_FIX_LANDED_AT;
+  // An explicit `--before` that is not a usable timestamp (a typo, a bare `--before`) is an error, never the default:
+  // silently widening a one-shot re-arm to "everything" is worse than refusing.
+  const before = flags.before === undefined ? NOT_CONFIRMED_FIX_LANDED_AT : flags.before;
   const codes = typeof flags.codes === 'string' ? flags.codes.split(',').filter(Boolean) : undefined;
-  const res = rearmFalseHolds({ before, dryRun, ...(codes ? { codes } : {}) });
-  if (!dryRun) for (const num of res.nums) { try { releaseBuildDispatchHold({ num: normNum(num) }); } catch { /* hold already gone */ } }
+  let res;
+  try { res = rearmFalseHolds({ before, dryRun, ...(codes ? { codes } : {}) }); }
+  catch (e) { console.error(`build-dispatch-daemon: ${String(e?.message || e).split('\n')[0]}`); process.exitCode = 2; return; }
+  // `res.nums` already omits a card that still has another held failure; of those, lift only the prepare hold.
+  const holds = dryRun ? { released: [], kept: [] } : releaseOwnPrepareHolds({ nums: res.nums, holds: cliListHolds(), release: o => { try { releaseBuildDispatchHold(o); } catch { /* hold already gone */ } } });
   const build = flags['build-failures'] ? rearmBuildFailures({ dryRun }) : null;
-  console.log(JSON.stringify({ rearmed: res.count, nums: res.nums, before, dryRun, ...(build ? { buildFailures: build } : {}) }));
+  console.log(JSON.stringify({ rearmed: res.count, nums: res.nums, before, dryRun, holdsReleased: holds.released, holdsKept: holds.kept, ...(build ? { buildFailures: build } : {}) }));
 }
 
 async function main(argv) {
@@ -1979,7 +2017,7 @@ async function main(argv) {
   if (flags.live) return live(flags);
   console.error('usage: build-dispatch-daemon.mjs --dry-run [--json] [--focus=N,M]   (read-only: what it would dispatch now)\n'
     + '       build-dispatch-daemon.mjs --live [--once] [--self-sync] [--no-prepare] [--max-concurrent=1] [--max-concurrent-external=4] [--max-open-prs=12] [--max-open-items=7] [--prepare-ahead-window=4|off] [--prepared-max-age-days=3|off] [--interval-ms=120000]\n'
-    + '       build-dispatch-daemon.mjs --rearm-false-holds [--dry-run] [--before=ISO] [--codes=launch-not-confirmed] [--build-failures]   (one-shot: clear false "launch not confirmed" holds)\n'
+    + '       build-dispatch-daemon.mjs --rearm-false-holds [--dry-run] [--before=ISO] [--codes=launch-not-confirmed] [--build-failures]   (one-shot: clear false "launch not confirmed" holds recorded before ISO, plus any EXHAUSTED backoff hold of those codes; --before must be a valid ISO timestamp)\n'
     + 'retry backoff env: WE_DISPATCH_RETRY_BASE_MS (300000), WE_DISPATCH_RETRY_MAX_MS (3600000), WE_DISPATCH_RETRY_MAX_ATTEMPTS (6)\n'
     + 'red draft age env: WE_BUILD_DAEMON_RED_DRAFT_MINUTES (default 60)\n'
     + 'caps env: WE_BUILD_DAEMON_MAX_CONCURRENT (Claude), WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL (Codex/agy); flags win\n'
