@@ -232,6 +232,9 @@ export async function extractCard(input, opts = {}) {
         const { cardPath, ...rest } = member;
         survivors.push({ ...rest, commitSha: parent });
       }
+      // The findings that rejected the extracted card are pinned with it. A resumed plan keeps the findings it was made
+      // from; only a fresh attribution (no pinned card, or it vanished from the batch) takes this invocation's.
+      if (!planned || !journal.findings) journal.findings = input.findings;
       journal.plan = {
         baseSha, standalone: { ref: standaloneRef, sha: standaloneSha, member: attribution.member.cardId },
         remainder: survivors.length ? { ref: remainderRef, sha: parent, generation, members: survivors } : null,
@@ -283,7 +286,7 @@ export async function extractCard(input, opts = {}) {
     }
     if (!journal.standaloneLabelled) {
       await exec('node', [join(repoDir, 'scripts/conveyor/reconcile-finding.mjs'), String(journal.standalonePr),
-        `--body-file=${bodyFile(renderFindingsBody({ findings: input.findings, source }))}`, `--repo=${repo}`,
+        `--body-file=${bodyFile(renderFindingsBody({ findings: journal.findings ?? input.findings, source }))}`, `--repo=${repo}`,
         '--agent=card-batch-extract'], { cwd: repoDir, timeout: 3 * 60_000 });
       journal.standaloneLabelled = true;
       save();

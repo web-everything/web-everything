@@ -74,8 +74,13 @@ function doubles({ existing = {} } = {}) {
   const calls = [];
   let nextPr = 101;
   const prs = { ...existing };
+  const postedBodies = [];
   const exec = (cmd, args) => {
     calls.push([cmd, ...args]);
+    // The body file is removed when the run ends, so read what was posted at call time.
+    if (cmd === 'node' && args[0].endsWith('reconcile-finding.mjs')) {
+      postedBodies.push(readFileSync(args.find(arg => arg.startsWith('--body-file=')).slice(12), 'utf8'));
+    }
     if (cmd === 'node' && args[0].endsWith('open-pr') === false && args[1] === 'open-pr') {
       const ref = args.find(arg => arg.startsWith('--ref=')).slice(6);
       prs[ref] ??= nextPr++;
@@ -88,7 +93,7 @@ function doubles({ existing = {} } = {}) {
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(prs[args[args.indexOf('--head') + 1]] ? [{ number: prs[args[args.indexOf('--head') + 1]] }] : []);
     return '';
   };
-  return { calls, exec, gh, prs };
+  return { calls, exec, gh, prs, postedBodies };
 }
 
 const lsRemote = (ctx, ref) => ctx.git(['ls-remote', '--refs', 'origin', ref]).trim().split(/\s+/)[0];
@@ -220,13 +225,18 @@ describe('extractCard (real git)', () => {
       try {
         await sealedBatch(ctx, stateDir);
         const d = doubles();
-        const first = { pr: 50, findings: [finding('backlog/5202-card.md')], laneDir: ctx.clone };
+        const first = { pr: 50, findings: [finding('backlog/5202-card.md', { summary: 'original card finding' })], laneDir: ctx.clone };
         await expect(extractCard(first, { stateDir, exec: d.exec, gh: d.gh, crashAt: 'push-0' })).rejects.toThrow('crash');
         const planned = JSON.parse(readFileSync(join(stateDir, 'extractions/org-repo-50.json'), 'utf8')).plan;
-        const result = await extractCard({ ...first, findings: [finding('backlog/5203-card.md')] }, { stateDir, exec: d.exec, gh: d.gh });
+        const result = await extractCard({ ...first, findings: [finding('backlog/5203-card.md', { summary: 'retry finding on another card' })] }, { stateDir, exec: d.exec, gh: d.gh });
         expect(result.action).toBe('extracted');
         expect(result.journal.plan.standalone).toEqual(planned.standalone);
         expect(result.journal.plan.remainder.sha).toBe(planned.remainder.sha);
+        // The standalone PR gets the findings that rejected ITS card, not the retry's.
+        expect(d.postedBodies).toHaveLength(1);
+        expect(d.postedBodies[0]).toContain('original card finding');
+        expect(d.postedBodies[0]).not.toContain('retry finding on another card');
+        expect(result.journal.findings).toEqual(first.findings);
       } finally { rmSync(stateDir, { recursive: true, force: true }); }
     });
   }, 30000);
