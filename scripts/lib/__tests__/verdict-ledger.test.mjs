@@ -21,7 +21,7 @@ import {
   verdictClears, verdictLabel, verdictForLabelTarget, labelVerdictOf, foldVerdictLedger, ledgerCoversHead,
   compareLedgerToLabels, summarizeAgreement, summarizeShadowAgreement,
   NON_BEARING, verdictBears,
-  appendVerdict, readVerdictLedger, foldRepo, verdictLedgerPath, verdictLedgerDir, defaultVerdictLedgerDir,
+  appendVerdict, resolveLedgerStore, DEFAULT_VERDICT_LEDGER_STORE, readVerdictLedger, foldRepo, verdictLedgerPath, verdictLedgerDir, defaultVerdictLedgerDir,
   listLedgerRepos,
   EVENT_TYPES, EVENT_TYPE_VALUES, LEDGER_EVENT_VERSION, eventBears,
   buildLedgerEvent, validateLedgerEvent, serializeLedgerEvent, parseLedgerEvents,
@@ -956,5 +956,96 @@ describe('plan slice B: v2 event types round-trip, and the v1 fold is byte-ident
       expect(parseVerdictLog(mixed)).toEqual(parseVerdictLog(v1Text));
       expect(parseLedgerEvents(mixed).filter((e) => e.type === 'verdict')).toHaveLength(v1.length);
     });
+  });
+});
+
+describe('#3255 C2 dual-write: appendVerdict behind verdictLedger.store', () => {
+  let dir;
+  const prevDir = process.env.WE_VERDICT_LEDGER_DIR;
+  const mk = (verdict, pr = 11) => buildVerdictRecord({
+    repo: 'web-everything/web-everything', pr, verdict, at: '2026-10-07T12:00:00.000Z', source: 'test',
+  });
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'we-verdict-ledger-c2-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+  });
+  afterEach(() => {
+    if (prevDir === undefined) delete process.env.WE_VERDICT_LEDGER_DIR;
+    else process.env.WE_VERDICT_LEDGER_DIR = prevDir;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(`${dir}-locks`, { recursive: true, force: true });
+  });
+  const seam = () => {
+    const calls = [];
+    return { calls, gitAppend: (a) => { calls.push(a); return { status: 'appended' }; }, warn: () => {} };
+  };
+
+  it('store=dual finds the row in BOTH stores', () => {
+    const s = seam();
+    const r = appendVerdict(mk('accepted'), { store: 'dual', board: '/board', ...s });
+    expect(r.ok).toBe(true);
+    expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(1);
+    expect(s.calls).toHaveLength(1);
+    expect(s.calls[0]).toMatchObject({ board: '/board', repo: 'web-everything/web-everything' });
+    expect(s.calls[0].records[0].verdict).toBe('accepted');
+  });
+
+  it('store=home leaves git untouched', () => {
+    const s = seam();
+    const r = appendVerdict(mk('accepted'), { store: 'home', board: '/board', ...s });
+    expect(r.ok).toBe(true);
+    expect(s.calls).toHaveLength(0);
+    expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(1);
+  });
+
+  it('default store is dual outside tests, and unrecognised values fall back to it', () => {
+    expect(resolveLedgerStore('git')).toBe('git');
+    expect(resolveLedgerStore('nonsense')).toBe(process.env.VITEST ? 'home' : 'dual');
+    expect(DEFAULT_VERDICT_LEDGER_STORE).toBe('dual');
+  });
+
+  it('store=git writes git only', () => {
+    const s = seam();
+    const r = appendVerdict(mk('accepted'), { store: 'git', board: '/board', ...s });
+    expect(r.ok).toBe(true);
+    expect(s.calls).toHaveLength(1);
+    expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(0);
+  });
+
+  it('F4: a CLEARING row that misses git does not clear, is loud, and is not dropped', () => {
+    const warns = [];
+    const r = appendVerdict(mk('accepted'), {
+      store: 'dual', board: '/board', gitAppend: () => { throw new Error('push exhausted'); }, warn: (m) => warns.push(m),
+    });
+    expect(r.ok).toBe(false);
+    expect(r.ledgerWriteMiss).toBe(true);
+    expect(r.errors.join()).toMatch(/ledger-write-miss: push exhausted/);
+    expect(warns.join()).toMatch(/GIT WRITE MISS/);
+    expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(1);
+  });
+
+  it('F4: a HOLDING row that misses git still holds (ok) but flags ledgerWriteMiss', () => {
+    const warns = [];
+    const r = appendVerdict(mk('human'), {
+      store: 'dual', board: '/board', gitAppend: () => { throw new Error('unreachable'); }, warn: (m) => warns.push(m),
+    });
+    expect(r.ok).toBe(true);
+    expect(r.ledgerWriteMiss).toBe(true);
+    expect(warns).toHaveLength(1);
+  });
+
+  it('a missing board is a loud miss, not a silent skip; store=git spills the row to home', () => {
+    const warns = [];
+    const r = appendVerdict(mk('human'), { store: 'git', warn: (m) => warns.push(m) });
+    expect(r.ledgerWriteMiss).toBe(true);
+    expect(warns.join()).toMatch(/no git board/);
+    expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(1);
+  });
+
+  it('an invalid record is refused and written nowhere', () => {
+    const s = seam();
+    const r = appendVerdict({ nope: true }, { store: 'dual', board: '/board', ...s });
+    expect(r.ok).toBe(false);
+    expect(s.calls).toHaveLength(0);
   });
 });

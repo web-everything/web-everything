@@ -66,3 +66,14 @@ export const PLATFORM_CI_HEAL_DEFAULTS = {
 
 /** Default `waitTimeoutMs` for `wait-then-park` (xb1e9nj): 24 hours, the bound the decision named as the example. */
 export const PLATFORM_CROSS_PROVIDER_FALLBACK_WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Verdict-ledger settings (statute `#verdict-ledger-pr-state-store`; plan slice C2 = #3255 part 2). Mirrored in
+ * `scripts/lib/verdict-ledger.mjs` (env `WE_VERDICT_LEDGER_STORE`), because .mjs cannot import this file.
+ * `store`: `dual` writes the machine-local file AND the `ops/review-requests` git transport (default); `home` is
+ * the one-setting rollback (git untouched); `git` writes the transport only. A git write miss never drops a row
+ * and is loud: a clearing verdict does not clear, a holding verdict still holds (ratified F4).
+ */
+export const PLATFORM_VERDICT_LEDGER_DEFAULTS = {
+  store: 'dual' as 'home' | 'dual' | 'git',
+} as const;

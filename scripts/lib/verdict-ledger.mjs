@@ -105,6 +105,7 @@ import { homedir, hostname, tmpdir } from 'node:os';
 import { REVIEW_LABELS, hasReviewLabel, acceptanceCoversHead } from './review-escalation.mjs';
 import { reserve, releaseLockDir } from '../readiness/file-locks.mjs';
 import { writeAllSync } from './write-all-sync.mjs';
+import { appendLedgerRows } from './verdict-ledger-io.mjs';
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 // SCHEMA
@@ -1070,10 +1071,74 @@ export function verdictLedgerPath(repo) {
  *
  * Validates before writing — an invalid record is REFUSED and nothing is written.
  *
+ * STORE (`verdictLedger.store`): `home` writes only the machine-local file; `dual` (default) writes home AND the git
+ * transport via `verdict-ledger-io.mjs`; `git` writes git only. A git write miss follows the ratified F4 posture
+ * (see `finishGitMiss`): never silent, never dropped. Reads are unchanged (home).
+ *
  * @param {VerdictRecord} record - from {@link buildVerdictRecord}.
+ * @param {{store?: string, board?: string, gitAppend?: Function, warn?: Function}} [opts] - test seams.
  * @returns {{ok: boolean, path: string|null, record: VerdictRecord|null, locked: boolean, errors: string[]}}
  */
-export function appendVerdict(record) {
+export function appendVerdict(record, opts = {}) {
+  const store = resolveLedgerStore(opts.store);
+  const board = opts.board ?? process.env.WE_VERDICT_LEDGER_BOARD ?? null;
+  const gitAppend = opts.gitAppend ?? appendLedgerRows;
+  const loud = opts.warn ?? ((m) => process.stderr.write(`${m}\n`));
+  const writeGit = (normalized) => {
+    if (!board) return { status: 'miss', error: 'no git board configured (set WE_VERDICT_LEDGER_BOARD or pass opts.board)' };
+    try {
+      gitAppend({ board, repo: normalized.repo, records: [normalized] });
+      return { status: 'appended' };
+    } catch (e) { return { status: 'miss', error: String(e?.message ?? e) }; }
+  };
+  if (store === 'git') {
+    // Validate first: an invalid record is refused and nothing is written anywhere.
+    const v = serializeVerdictRecord(record);
+    if (!v.ok) return { ok: false, path: null, record: null, locked: false, errors: v.errors, store };
+    const g = writeGit(v.record);
+    if (g.status === 'appended') return { ok: true, path: null, record: v.record, locked: false, errors: [], store, git: g };
+    // Write miss: the row must never be silently dropped, so it spills to the home ledger.
+    const home = appendVerdictHome(record);
+    return finishGitMiss({ home, g, store, loud, record: v.record });
+  }
+  const home = appendVerdictHome(record);
+  if (store === 'home' || !home.ok) return { ...home, store };
+  const g = writeGit(home.record);
+  if (g.status === 'appended') return { ...home, store, git: g };
+  return finishGitMiss({ home, g, store, loud, record: home.record });
+}
+
+/** The ratified F4 write-miss posture (`#verdict-ledger-pr-state-store` rule 4). The home row already exists, so
+ *  nothing is lost. A CLEARING verdict that missed git does NOT clear (`ok: false`, so the caller must not swap
+ *  the label); a HOLDING verdict still applies (`ok: true`) but carries `ledgerWriteMiss: true` for the smell.
+ *  Both are loud on stderr. */
+function finishGitMiss({ home, g, store, loud, record }) {
+  const clears = verdictClears(record.verdict);
+  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} verdict=${record.verdict}: ${g.error}`
+    + (clears ? ' — clearing event does NOT clear (F4); retry once the ledger transport is reachable' : ' — hold still applies; ledger-write-miss'));
+  return {
+    ...home,
+    ok: home.ok && !clears,
+    store,
+    git: g,
+    ledgerWriteMiss: true,
+    errors: clears ? [`ledger-write-miss: ${g.error}`] : [],
+  };
+}
+
+/** The `verdictLedger.store` setting (declared in `config/platformDefaults.ts`, mirrored here because .mjs cannot
+ *  import the .ts). Env `WE_VERDICT_LEDGER_STORE`; anything unrecognised falls back to the default `dual`. */
+export const VERDICT_LEDGER_STORES = Object.freeze(['home', 'dual', 'git']);
+export const DEFAULT_VERDICT_LEDGER_STORE = 'dual';
+export function resolveLedgerStore(explicit) {
+  const v = String(explicit ?? process.env.WE_VERDICT_LEDGER_STORE ?? '').trim().toLowerCase();
+  if (VERDICT_LEDGER_STORES.includes(v)) return v;
+  // Under a test run an unconfigured store is `home`, so an unrelated suite never pushes to a real remote.
+  // Production (and any test that names the store) gets the `dual` default.
+  return isUnderTest() ? 'home' : DEFAULT_VERDICT_LEDGER_STORE;
+}
+
+function appendVerdictHome(record) {
   const lockRoot = verdictLedgerLockRoot();
   const owner = processWriterId();
   let locked = false;
