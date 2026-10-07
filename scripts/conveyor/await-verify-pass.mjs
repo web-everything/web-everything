@@ -37,6 +37,7 @@ import { laneGitConfigArgs, laneGitHardeningEnv, laneFilterDrivers, LANE_CONFIG_
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { readFixDispatchClaim } from './fix-claim-store.mjs';
 import { AGENT_GONE_STATES } from './lease-reaper.mjs';
+import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -159,6 +160,8 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
       return isCiHeal(record)
         ? `${head}\n\nVerify is GREEN, but the harness could NOT push ${record.sha} to ${record.ref}: ${detail}. The remote moved: follow your ${brief(record)}'s non-fast-forward path — reconcile with the current PR head, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Never force-push, and do not exit yet.`
         : `${head}\n\nVerify is GREEN, but the harness could NOT push ${record.sha} to ${record.ref}: ${detail}. Follow your ${brief(record)}'s "push rejected because the branch moved" path (save to the alt branch, record the pause, fix-end). Never force-push.`;
+    case 'push-transient':
+      return `${head}\n\nVerify is GREEN, but GitHub kept failing the harness push of ${record.sha} to ${record.ref} even after retries: ${detail}. This is a temporary GitHub outage, not a moved branch, and the harness has kept the verified commit and keeps retrying the push itself. Do not push ${record.ref} yourself and do not use the alt branch. Take your ${brief(record)}'s blocked-on-infra exit with \`--cause=transient\` on the completion report (so the retry cool-off is short), then fix-end.`;
     case 'push-refused':
       return `${head}\n\nVerify is GREEN, but the harness did NOT push ${record.sha} to ${record.ref}: ${detail}. This is not a moved branch, so rebasing or re-marking cannot help and you must not retry or push ${record.ref} yourself. Take your ${brief(record)}'s blocked-on-infra exit with that reason as the evidence, then fix-end.`;
     case 'red':
@@ -275,10 +278,16 @@ export async function runAwaitVerifyPass({
           row.result = `push-retry (${pushed.reason})`;
           rows.push(row); continue;
         }
+        // GitHub kept failing: the verified sha is not lost. It is copied into a daemon-owned store and the pass retries
+        // the push on later ticks (see verified-push-salvage.mjs); the session is told this is a transient outage.
+        const transientGone = !pushed?.ok && pushed?.transient;
+        const salvaged = transientGone ? io.saveSalvage?.({ record, nowMs, reason: pushed.reason }) : null;
         pending = pushed?.ok
           ? { kind: 'green', detail: `pushed at ${new Date(nowMs).toISOString()}` }
-          : { kind: pushed?.moved ? 'push-rejected' : 'push-refused', detail: pushed?.reason ?? 'push failed' };
-        row.result = pushed?.ok ? 'pushed' : (pushed?.moved ? 'push-rejected' : 'push-refused');
+          : transientGone
+            ? { kind: 'push-transient', detail: `${pushed.reason}${salvaged?.ok ? ' (the verified commit is saved; the harness keeps retrying the push)' : ''}` }
+            : { kind: pushed?.moved ? 'push-rejected' : 'push-refused', detail: pushed?.reason ?? 'push failed' };
+        row.result = pushed?.ok ? 'pushed' : (transientGone ? `push-transient${salvaged?.ok ? '; salvaged' : ''}` : (pushed?.moved ? 'push-rejected' : 'push-refused'));
       } else if (!pending) {
         pending = { kind: d.resume, detail: d.reason };
       }
@@ -316,7 +325,33 @@ export async function runAwaitVerifyPass({
     }
     rows.push(row);
   }
+  if (io.listSalvage) rows.push(...runSalvagePhase({ io, nowMs }));
   return { rows };
+}
+
+/** Re-try every saved green-verified sha whose push GitHub failed. Every outcome is a row (and so a log line). */
+export function runSalvagePhase({ io, nowMs, tuning = resolveSalvageTuning() }) {
+  const rows = [];
+  for (const { key, record } of io.listSalvage()) {
+    const row = { key, pr: record.pr, repo: record.repo, sha: record.sha, action: 'salvage' };
+    try {
+      const plan = planSalvage(record, { nowMs, tuning });
+      row.reason = plan.reason;
+      if (plan.action === 'drop') { io.clearSalvage(key); row.result = `dropped: ${plan.reason}; ${record.sha.slice(0, 8)} was never pushed to ${record.ref}`; rows.push(row); continue; }
+      if (plan.action === 'wait') { row.action = 'skip'; rows.push(row); continue; }
+      const attempts = (record.attempts ?? 0) + 1;
+      const next = { ...record, attempts, nextAttemptAt: new Date(nowMs + tuning.retryMs * attempts).toISOString() };
+      if (io.writeSalvage(next)?.ok !== true) { row.result = 'persist-failed'; rows.push(row); continue; }
+      const r = io.salvagePush(next);
+      if (r?.ok) { io.clearSalvage(key); row.result = `pushed (attempt ${attempts})`; }
+      else if (r?.terminal) { io.clearSalvage(key); row.result = `dropped: ${r.reason}`; }
+      else row.result = `retry later (attempt ${attempts}): ${r?.reason ?? 'push failed'}`;
+    } catch (error) {
+      row.result = `error: ${String(error?.message ?? error).split('\n')[0]}`;
+    }
+    rows.push(row);
+  }
+  return rows;
 }
 
 /** One log line per acted-on record (waits are summarized, not listed). */
@@ -340,14 +375,56 @@ export function repoUrlFromPrUrl(prUrl) {
 }
 
 /**
+ * How the harness push retries a transient GitHub failure (a 500 mid-push lost a verified fix on 2026-10-07).
+ * `WE_AWAIT_VERIFY_PUSH_ATTEMPTS` (default 4, 1..10), `WE_AWAIT_VERIFY_PUSH_BACKOFF_MS` (base, default 2000),
+ * `WE_AWAIT_VERIFY_PUSH_BACKOFF_CAP_MS` (default 30000). The wait doubles per attempt up to the cap. Pure.
+ */
+export function resolvePushRetryTuning(env = process.env) {
+  const num = (key, dflt, min, max) => {
+    const raw = env?.[key];
+    const n = Number(raw);
+    return raw === undefined || raw === '' || !Number.isFinite(n) || n < min ? dflt : Math.min(max, Math.floor(n));
+  };
+  return {
+    attempts: num('WE_AWAIT_VERIFY_PUSH_ATTEMPTS', 4, 1, 10),
+    baseMs: num('WE_AWAIT_VERIFY_PUSH_BACKOFF_MS', 2_000, 0, 600_000),
+    capMs: num('WE_AWAIT_VERIFY_PUSH_BACKOFF_CAP_MS', 30_000, 0, 600_000),
+  };
+}
+
+const PUSH_MOVED_RE = /non-fast-forward|fetch first|stale info/i;
+const PUSH_TRANSIENT_RE = /Internal Server Error|Bad Gateway|Service Unavailable|Gateway Time-?out|HTTP (?:code )?5\d\d|returned error: 5\d\d|error: 5\d\d\b|time[sd]? ?out|Connection (?:reset|refused|closed)|Could not resolve host|unable to access|RPC failed|hung up unexpectedly|early EOF|SSL_ERROR|GnuTLS|Empty reply|cannot lock ref|temporarily unavailable|ECONNRESET|ETIMEDOUT|EAI_AGAIN/i;
+
+/**
+ * Classify git's whole stderr for a failed push. A real "moved" rejection wins; then a transient infrastructure
+ * failure (a `[remote rejected] ... (Internal Server Error)` line contains the word "rejected" but is NOT a moved
+ * branch, which is how the verified fix for PR #4244 was reported as moved and thrown away); anything else that
+ * says rejected/declined/protected stays a rejection; an empty stderr from a killed child is a timeout. Pure.
+ * @returns {'moved'|'transient'|'rejected'|'unknown'}
+ */
+export function classifyPushFailure(stderr, { killed = false } = {}) {
+  const text = String(stderr ?? '');
+  if (PUSH_MOVED_RE.test(text)) return 'moved';
+  if (PUSH_TRANSIENT_RE.test(text) || (killed && !text.trim())) return 'transient';
+  if (/rejected|hook declined|protected/i.test(text)) return 'rejected';
+  return 'unknown';
+}
+
+/**
  * Push `sha` to `refs/heads/<ref>` at `url` WITHOUT reading the lane's git config. The lane is agent-writable, so its
  * `remote.*`, `url.*.insteadOf`, `credential.helper` and filter-driver keys are untrusted input to the daemon. The
  * push therefore runs in a throwaway bare repo the daemon owns (its config is empty; the host's global config —
  * the user's credential helper — still applies), reading the lane's commits through
  * `GIT_ALTERNATE_OBJECT_DIRECTORIES` (git follows the lane's own alternates chain). Never `--force`: a moved branch is
- * rejected, not overwritten. Returns the remote's sha after the push; throws git's error on a rejection.
+ * rejected, not overwritten. Returns the remote's sha after the push; on failure throws git's error carrying
+ * `pushKind` ('transient' once the bounded backoff is spent, 'moved' | 'rejected' | 'unknown') and, for a moved
+ * branch, `remoteHead` and `diverged`.
+ *
+ * Transient failures (5xx, timeouts, resets) are retried with bounded exponential backoff ({@link resolvePushRetryTuning}).
+ * A "moved" rejection is re-checked against the remote: when the remote head is an ancestor of `sha` (or equals it)
+ * the push is repeated / already satisfied; only a remote head that is NOT an ancestor is reported as moved by someone else.
  */
-export function pushShaFromScratch({ laneGitDir, url, sha, ref, exec = execFileSync, env = process.env, tmpRoot = tmpdir(), timeout = 180_000 }) {
+export function pushShaFromScratch({ laneGitDir, url, sha, ref, exec = execFileSync, env = process.env, tmpRoot = tmpdir(), timeout = 180_000, sleep = sleepSync, tuning = resolvePushRetryTuning(env) }) {
   const scratch = mkdtempSync(join(tmpRoot, 'await-verify-push-'));
   try {
     const clean = { ...env };
@@ -357,7 +434,45 @@ export function pushShaFromScratch({ laneGitDir, url, sha, ref, exec = execFileS
     // `core.hooksPath=/dev/null`: the host's global hooks (guard-git-push) are not this call's gate — the ref/PR checks in
     // `defaultAwaitVerifyIo.push` are — and a hook path is the one way git would run a script from a repo directory.
     const run = (args) => String(exec('git', ['--git-dir', scratch, '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], opts));
-    run(['push', url, `${sha}:refs/heads/${ref}`]);
+    const tagged = (error, pushKind, extra = {}) => Object.assign(error instanceof Error ? error : new Error(String(error)), { pushKind, ...extra });
+    /** Where the remote head stands relative to `sha`: 'equal' | 'ancestor' (push again) | 'contains' (already there) | 'diverged' | 'unknown'. */
+    const reconcile = () => {
+      let head;
+      try {
+        run(['fetch', '--no-tags', '--quiet', url, `refs/heads/${ref}`]);
+        head = run(['rev-parse', 'FETCH_HEAD']).trim();
+      } catch { return { state: 'unknown' }; }
+      if (head.toLowerCase() === sha.toLowerCase()) return { state: 'equal', head };
+      const isAncestor = (a, b) => { try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; } };
+      if (isAncestor(head, sha)) return { state: 'ancestor', head };
+      if (isAncestor(sha, head)) return { state: 'contains', head };
+      return { state: 'diverged', head };
+    };
+    let reconciled = false;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        run(['push', url, `${sha}:refs/heads/${ref}`]);
+        break;
+      } catch (e) {
+        const kind = classifyPushFailure(String(e?.stderr ?? e?.message ?? e), { killed: !!(e?.killed || e?.code === 'ETIMEDOUT') });
+        const last = attempt >= tuning.attempts;
+        if (kind === 'transient') {
+          if (last) throw tagged(e, 'transient', { attempts: attempt });
+          sleep(Math.min(tuning.capMs, tuning.baseMs * 2 ** (attempt - 1)));
+          continue;
+        }
+        if (kind === 'moved' || kind === 'unknown') {
+          // A response lost after the remote applied the push, or a branch that only advanced to our own ancestor line.
+          const r = reconcile();
+          if (r.state === 'equal' || r.state === 'contains') return { remote: r.head, alreadyThere: true };
+          if (r.state === 'ancestor' && !reconciled && !last) { reconciled = true; continue; }
+          if (r.state === 'diverged') throw tagged(e, 'moved', { diverged: true, remoteHead: r.head });
+          if (r.state === 'unknown' && kind === 'unknown' && !last) { sleep(Math.min(tuning.capMs, tuning.baseMs * 2 ** (attempt - 1))); continue; }
+          throw tagged(e, kind === 'moved' ? 'moved' : 'unknown', { remoteHead: r.head ?? null });
+        }
+        throw tagged(e, kind);
+      }
+    }
     let remote = '';
     try { remote = run(['ls-remote', url, `refs/heads/${ref}`]).split(/\s/)[0]; } catch { /* the push itself succeeded; a failed read-back is not a rejection */ }
     return { remote };
@@ -498,17 +613,53 @@ export async function defaultAwaitVerifyIo({
       try { laneGitDir = git(lane, ['rev-parse', '--absolute-git-dir']).trim(); } catch { return { ok: false, transient: true, reason: `could not read the git dir of ${lane}` }; }
       try {
         // Never --force, so a moved branch is rejected, not overwritten; never the lane's own `origin` (see pushShaFromScratch).
-        const { remote } = pushShaFromScratch({ laneGitDir, url: head.remoteUrl, sha, ref, exec, env, timeout: 180_000 });
+        const { remote, alreadyThere } = pushShaFromScratch({ laneGitDir, url: head.remoteUrl, sha, ref, exec, env, timeout: 180_000, sleep });
         // An empty read-back (ls-remote failed after a push that succeeded) is not a rejection; only a DIFFERENT sha is.
-        if (remote && lower(remote) !== lower(sha)) return { ok: false, moved: true, reason: `remote ${ref} is ${remote.slice(0, 8)} after push` };
+        if (!alreadyThere && remote && lower(remote) !== lower(sha)) return { ok: false, moved: true, reason: `remote ${ref} is ${remote.slice(0, 8)} after push` };
       } catch (e) {
-        // Classify on git's WHOLE stderr: a real rejection ends in several `hint:` lines that carry none of the keywords.
         const stderr = String(e?.stderr ?? e?.message ?? e);
-        const reason = stderr.trim().split('\n').filter((l) => l.trim() && !/^hint:/i.test(l)).slice(-3).join(' ').slice(0, 300);
-        const rejected = /rejected|non-fast-forward|fetch first|stale info|hook declined|protected/i.test(stderr);
-        return { ok: false, reason, transient: !rejected, moved: rejected };
+        const detail = stderr.trim().split('\n').filter((l) => l.trim() && !/^hint:/i.test(l)).slice(-3).join(' ').slice(0, 300);
+        const kind = e?.pushKind ?? classifyPushFailure(stderr);
+        if (kind === 'transient') return { ok: false, transient: true, moved: false, reason: `GitHub was unavailable for ${e?.attempts ?? 1} push attempt(s): ${detail}` };
+        if (e?.diverged) return { ok: false, moved: true, diverged: true, reason: `${ref} was moved by someone else: remote head ${String(e.remoteHead ?? '').slice(0, 8)} is not an ancestor of the verified ${sha.slice(0, 8)}. ${detail}` };
+        const rejected = kind === 'moved' || kind === 'rejected';
+        return { ok: false, reason: detail, transient: kind === 'unknown', moved: rejected };
       }
       return { ok: true };
+    },
+    // ── salvage of a green-verified sha GitHub kept refusing (see verified-push-salvage.mjs) ──
+    listSalvage: () => listSalvage(),
+    writeSalvage: (record) => writeSalvage(record),
+    clearSalvage: (key) => clearSalvage(key),
+    saveSalvage: ({ record, nowMs, reason }) => {
+      if (isNoPushRecord(record) || outsidePool(record.lane)) return { ok: false };
+      const key = salvageKey(record);
+      let laneGitDir;
+      try { laneGitDir = git(record.lane, ['rev-parse', '--absolute-git-dir']).trim(); } catch { return { ok: false }; }
+      const stashed = stashCommit({ exec, laneGitDir, sha: record.sha, key, env });
+      if (!stashed.ok) return { ok: false };
+      const retryMs = resolveSalvageTuning(env).retryMs;
+      return writeSalvage({ v: 1, repo: record.repo, pr: record.pr, ref: record.ref, sha: record.sha, who: record.who ?? null,
+        savedAt: new Date(nowMs).toISOString(), nextAttemptAt: new Date(nowMs + retryMs).toISOString(), attempts: 0, lastReason: String(reason ?? '').slice(0, 300) });
+    },
+    salvagePush: (record) => {
+      const key = salvageKey(record);
+      // The same PR/ref bindings as a live push; there is no session left to hold the claim, so any OTHER live claim defers it.
+      const refusal = pushRefusal({ repo: record.repo, branch: record.ref });
+      if (refusal?.refused) return { ok: false, reason: `deferred: ${refusal.message}` };
+      const head = prHead(record.repo, record.pr);
+      if (!head) return { ok: false, reason: `could not resolve the head ref of ${record.repo} PR #${record.pr}` };
+      if (head.ref !== record.ref) return { ok: false, terminal: true, reason: `${record.ref} is no longer PR #${record.pr}'s head (${head.ref})` };
+      if (!head.open) return { ok: false, terminal: true, reason: `PR #${record.pr} is no longer open` };
+      if (head.crossRepo || !head.remoteUrl) return { ok: false, terminal: true, reason: `PR #${record.pr} is not a same-repo github.com PR` };
+      try {
+        pushShaFromScratch({ laneGitDir: join(salvageStoreDir(env), `${key}.git`), url: head.remoteUrl, sha: record.sha, ref: record.ref, exec, env, timeout: 180_000, sleep });
+        return { ok: true };
+      } catch (e) {
+        if (e?.diverged) return { ok: false, terminal: true, reason: `${record.ref} was moved by someone else (remote head ${String(e.remoteHead ?? '').slice(0, 8)} is not an ancestor of ${record.sha.slice(0, 8)}); the verified commit was not pushed` };
+        if (e?.pushKind === 'transient' || e?.pushKind === 'unknown') return { ok: false, reason: `GitHub still failing: ${String(e?.stderr ?? e?.message ?? e).trim().split('\n').slice(-1)[0].slice(0, 200)}` };
+        return { ok: false, terminal: true, reason: `GitHub refused the push: ${String(e?.stderr ?? e?.message ?? e).trim().split('\n').slice(-1)[0].slice(0, 200)}` };
+      }
     },
     listSessions: () => io.defaultListAgents({ all: true, env }),
     resume: ({ session, prompt }) => {

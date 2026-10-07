@@ -152,6 +152,13 @@ export function sanitizeDeniedCommand(value) {
   return s;
 }
 
+/** The only `cause` a `blocked-on-infra` report may carry: a temporary GitHub failure (5xx, timeout, reset). */
+export const INFRA_CAUSE_TRANSIENT = 'transient';
+/** `cause` is agent-supplied: only the known value survives, anything else becomes null. Pure. */
+export function normalizeInfraCause(value) {
+  return value === INFRA_CAUSE_TRANSIENT ? INFRA_CAUSE_TRANSIENT : null;
+}
+
 /**
  * PURE merge of a `patch` onto an existing record — bumps `updatedAt`, never touches `session`/`kind`/`pr`/
  * `item`/`startedAt`/`v`. Used by the io shell's "report done" path so a caller need only name what changed.
@@ -162,8 +169,10 @@ export function sanitizeDeniedCommand(value) {
  */
 export function applyCompletionUpdate(record, patch = {}, now = () => new Date().toISOString()) {
   const next = { ...record, updatedAt: now() };
-  for (const key of ['status', 'outcome', 'verdict', 'label', 'runId', 'sessionId', 'denied']) {
-    if (Object.hasOwn(patch, key)) next[key] = key === 'denied' && patch[key] != null ? sanitizeDeniedCommand(patch[key]) : patch[key];
+  for (const key of ['status', 'outcome', 'verdict', 'label', 'runId', 'sessionId', 'denied', 'cause']) {
+    if (!Object.hasOwn(patch, key)) continue;
+    if (key === 'cause') next.cause = normalizeInfraCause(patch.cause);
+    else next[key] = key === 'denied' && patch[key] != null ? sanitizeDeniedCommand(patch[key]) : patch[key];
   }
   return next;
 }
@@ -183,7 +192,7 @@ export function validateCompletionRecord(record) {
   if (!isOptionalString(record.pr)) errors.push('`pr` must be a string or null');
   if (!isOptionalString(record.item)) errors.push('`item` must be a string or null');
   if (!COMPLETION_STATUSES.includes(record.status)) errors.push(`\`status\` must be one of ${COMPLETION_STATUSES.join('/')}`);
-  for (const key of ['outcome', 'verdict', 'label', 'runId', 'sessionId', 'denied']) {
+  for (const key of ['outcome', 'verdict', 'label', 'runId', 'sessionId', 'denied', 'cause']) {
     if (!isOptionalString(record[key])) errors.push(`\`${key}\` must be a string or null`);
   }
   if (typeof record.startedAt !== 'string' || Number.isNaN(Date.parse(record.startedAt))) errors.push('missing or unparseable `startedAt`');
