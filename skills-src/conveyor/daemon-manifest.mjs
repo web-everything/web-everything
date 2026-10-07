@@ -190,6 +190,11 @@ export const DAEMON_MANIFEST = {
   // last-tick-completed stamp. Runs from its OWN dedicated clone (4065 Fork 1) with self-sync set explicitly in
   // its plist — see we:skills-src/conveyor/launchd/com.we.health-watch.plist.example.
   'health-watch': { script: 'scripts/conveyor/health-watch.mjs', args: ['tick'], intervalMs: HEALTH_WATCH_INTERVAL_MS },
+  // Card 106 — durable schedules (we:scripts/operations/scheduled-sweep.mjs). Opt-in: `defaultLaunch:false` keeps
+  // them out of the supervisor's default set; the operator installs them with install-scheduled-sweeps.mjs.
+  'pr-movement-sweep': { script: 'scripts/operations/scheduled-sweep.mjs', args: ['run', 'pr-movement'], intervalMs: 30 * 60_000, defaultLaunch: false },
+  'coroner-sweep': { script: 'scripts/operations/scheduled-sweep.mjs', args: ['run', 'coroner'], intervalMs: 6 * 60 * 60_000, defaultLaunch: false },
+  'opus-sweep': { script: 'scripts/operations/scheduled-sweep.mjs', args: ['run', 'opus'], intervalMs: 24 * 60 * 60_000, defaultLaunch: false },
 };
 
 /** A script path may be `undefined` is never intended; it must be a plain repo-relative path with no `..`
