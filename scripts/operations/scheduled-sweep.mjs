@@ -71,7 +71,10 @@ export function assessBuilderStarvation(rows, { now = Date.now(), thresholdMin =
   if (!last) return { starved: false, noData: true, summary: 'no build-dispatch tick rows found' };
   const tickAgeMin = Math.round((now - Date.parse(last.at)) / MIN);
   const queued = Number(/(\d+)\s+queued/.exec(last.status)?.[1] ?? 0);
-  const inFlight = last.inFlight?.length ?? 0;
+  // The tick's own status line is the truth about running builds: a real row carries `2 building` with an empty
+  // `inFlight` list, so counting only `inFlight` reported a busy builder as starved.
+  const building = Number(/(\d+)\s+building/.exec(last.status)?.[1] ?? 0);
+  const inFlight = Math.max(last.inFlight?.length ?? 0, building);
   const itemRoom = last.openItems ? Math.max(0, (last.openItems.cap ?? Infinity) - (last.openItems.count ?? 0)) : Infinity;
   const freeSlots = Math.max(0, Math.min(buildCap - inFlight, itemRoom));
   const lastLaunch = [...sorted].reverse().find(launched);
@@ -80,7 +83,8 @@ export function assessBuilderStarvation(rows, { now = Date.now(), thresholdMin =
   const coverageMin = Math.round((now - Date.parse(sorted[0].at)) / MIN);
   const quiet = sinceMs >= thresholdMin * MIN;
   const daemonStale = tickAgeMin > staleTickMin;
-  const starved = !daemonStale && queued > 0 && freeSlots > 0 && quiet;
+  const frozen = Boolean(last.freeze?.frozen);
+  const starved = !daemonStale && !frozen && queued > 0 && freeSlots > 0 && quiet;
   const since = minutesSinceLaunch != null ? `${minutesSinceLaunch} min` : `at least ${coverageMin} min (none in the log)`;
   return {
     starved, daemonStale, queued, freeSlots, inFlight, minutesSinceLaunch, coverageMin, tickAgeMin, thresholdMin,
@@ -93,13 +97,17 @@ export function assessBuilderStarvation(rows, { now = Date.now(), thresholdMin =
 // ── PR movement (pure) ────────────────────────────────────────────────────────────────────────────────────────
 
 const labelNames = (pr) => (pr.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name));
+// A rollup entry is a CheckRun (`conclusion`) or a legacy commit-status StatusContext (`state`); red in either shape.
+const RED_CONCLUSIONS = new Set(['FAILURE', 'TIMED_OUT', 'STARTUP_FAILURE']);
+const RED_STATES = new Set(['FAILURE', 'ERROR']);
+const isRedCheck = (c) => RED_CONCLUSIONS.has(String(c?.conclusion ?? '').toUpperCase()) || RED_STATES.has(String(c?.state ?? '').toUpperCase());
 export function classifyPrMovement(prs, { now = Date.now(), stalledMin = 90 } = {}) {
   const out = { moving: [], stalled: [], conflicting: [], red: [], changesRequested: [] };
   for (const pr of prs) {
     const ageMin = (now - Date.parse(pr.updatedAt)) / MIN;
     const flagged = [];
     if (pr.mergeable === 'CONFLICTING') { out.conflicting.push(pr); flagged.push(1); }
-    if ((pr.statusCheckRollup ?? []).some((c) => ['FAILURE', 'TIMED_OUT'].includes(String(c.conclusion).toUpperCase()))) { out.red.push(pr); flagged.push(1); }
+    if ((pr.statusCheckRollup ?? []).some(isRedCheck)) { out.red.push(pr); flagged.push(1); }
     if (labelNames(pr).includes('review:changes')) { out.changesRequested.push(pr); flagged.push(1); }
     if (ageMin >= stalledMin && !pr.isDraft) { out.stalled.push(pr); flagged.push(1); }
     if (!flagged.length) out.moving.push(pr);
@@ -160,6 +168,44 @@ export function installPlan({ repoRoot, nodePath, home, apply = false }) {
   };
 }
 
+/**
+ * Performs a plan's writes through an injectable `fs`. Never overwrites an existing file and never executes
+ * anything (no launchctl): the operator loads the plists themselves. The installer script is a thin caller.
+ */
+export function applyInstallPlan({ plan, fs, home }) {
+  const wrote = [];
+  const skipped = [];
+  for (const f of plan.writes) {
+    if (fs.existsSync(f.path)) { skipped.push(f.path); continue; }
+    fs.mkdirSync(dirname(f.path), { recursive: true });
+    fs.mkdirSync(`${home}/workspace/.operations/logs`, { recursive: true });
+    // `wx` is exclusive-create: it refuses an existing file AND a dangling symlink (existsSync follows links and
+    // would call that path free, then write through it to the link's target).
+    try { fs.writeFileSync(f.path, f.xml, { flag: 'wx' }); } catch (e) { if (e?.code === 'EEXIST') { skipped.push(f.path); continue; } throw e; }
+    wrote.push(f.path);
+  }
+  return { wrote, skipped };
+}
+
+// ── notification de-dup (pure) ────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Signature of an attention list for "notify only when it changed": digits are masked so a persisting condition
+ * keeps one signature. A condition appearing or clearing still changes it.
+ */
+export function attentionSignature(attention) {
+  // Every count drifts run to run (minutes, queue depth, free slots, PRs ageing past a threshold): sign the SHAPE of
+  // the list (which conditions hold), not the numbers, so a persisting condition notifies once.
+  const stable = attention.map((a) => String(a).replace(/\d+/g, 'N'));
+  return createHash('sha1').update(stable.join('\n')).digest('hex');
+}
+
+/** @returns {{ notify: boolean, sig: string }} notify only for a non-empty list whose signature differs from `prevSig`. */
+export function decideNotify({ attention, prevSig = '' }) {
+  const sig = attentionSignature(attention);
+  return { notify: attention.length > 0 && sig !== prevSig, sig };
+}
+
 // ── IO shell ──────────────────────────────────────────────────────────────────────────────────────────────────
 
 function readTickRows(coordRoot) {
@@ -175,7 +221,7 @@ function runPrMovement({ now, env }) {
   const star = assessBuilderStarvation(readTickRows(resolveCoordinationRoot()), {
     now, thresholdMin: posInt(env.WE_SWEEP_STARVE_MIN, 60), buildCap: posInt(env.WE_SWEEP_BUILD_CAP, 1),
   });
-  if (star.starved || star.daemonStale) attention.push(star.summary);
+  if (star.starved || star.daemonStale || star.noData) attention.push(star.summary);
   sections.push({ title: 'Builder starvation', lines: [star.summary] });
   let prs = [];
   try {
@@ -191,29 +237,58 @@ function runPrMovement({ now, env }) {
   return { attention, sections, data: { starvation: star, counts: Object.fromEntries(Object.entries(c).map(([k, v]) => [k, v.length])) } };
 }
 
-function runCoroner({ env, dryRun }) {
-  const args = [join(HERE, 'coroner-extract.mjs'), '--since=last', '--json', ...(dryRun ? ['--no-save'] : [])];
-  const r = spawnSync(process.execPath, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 20 * MIN, env });
+const isRate = (m) => m && typeof m === 'object' && Number.isFinite(m.count) && Number.isFinite(m.total) && Number.isFinite(m.pct);
+
+/** One line per metric that carries count/total/pct, walking nested groups (`byKind.code.ci`); other shapes are skipped. */
+export function formatErrorRates(errorRates, prefix = '') {
+  const lines = [];
+  for (const [k, m] of Object.entries(errorRates ?? {})) {
+    const path = prefix ? `${prefix}.${k}` : k;
+    if (isRate(m)) lines.push(`${path}: ${m.count}/${m.total} (${m.pct}%)`);
+    else if (m && typeof m === 'object' && !Array.isArray(m)) lines.push(...formatErrorRates(m, path));
+  }
+  return lines;
+}
+
+const CORONER_FALLBACK_WINDOW_MS = 24 * 60 * MIN;
+
+/** `--since=last` needs a state file; on a fresh machine fall back once to a bounded window (a non-dry run then saves the state). */
+export function runCoronerJob({ env, dryRun, now = Date.now(), spawn = spawnSync }) {
+  const run = (since) => spawn(process.execPath, [join(HERE, 'coroner-extract.mjs'), `--since=${since}`, '--json', ...(dryRun ? ['--no-save'] : [])],
+    { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 20 * MIN, env });
+  let r = run('last');
+  // No state, or a state file the extractor rejects (invalid / future `lastEnd`): either way bound the window and let a non-dry run rewrite it.
+  if (r.status !== 0 && /no previous run|valid ISO --since/.test(String(r.stderr))) r = run(new Date(now - CORONER_FALLBACK_WINDOW_MS).toISOString());
   if (r.status !== 0) return { attention: [`coroner extract failed (exit ${r.status}): ${String(r.stderr).split('\n')[0]}`], sections: [] };
   let j; try { j = JSON.parse(r.stdout); } catch { return { attention: ['coroner extract returned non-JSON'], sections: [] }; }
-  const lines = Object.entries(j.errorRates ?? {}).map(([k, m]) => `${k}: ${m.count}/${m.total} (${m.pct}%)`);
+  const lines = formatErrorRates(j.errorRates);
   return { attention: [], sections: [{ title: 'Error rates', lines: lines.length ? lines : ['none reported'] }], data: { keys: Object.keys(j) } };
 }
 
-function opusCommand() {
-  return { cmd: 'claude', args: ['-p', '--model', 'opus', '--allowedTools', 'Read,Grep,Glob', '--add-dir', REPO_ROOT],
-    briefPath: join(REPO_ROOT, 'skills-src/conveyor/opus-sweep-brief.md') };
+/**
+ * The unattended Opus sweep's tool surface. `--allowedTools` only PRE-APPROVES tools and removes nothing, so the
+ * built-in set is restricted with `--restricted --tools`, the mutating/networked tools are denied by name as a
+ * second wall, user/project settings are ignored (`--restricted`) and the permission mode is pinned to default.
+ */
+export function opusCommand() {
+  return {
+    cmd: 'claude',
+    args: ['-p', '--model', 'opus', '--restricted', '--tools', 'Read,Grep,Glob',
+      '--allowedTools', 'Read,Grep,Glob', '--disallowedTools', 'Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch',
+      '--permission-mode', 'default', '--strict-mcp-config', '--no-session-persistence', '--max-budget-usd', '5', '--add-dir', REPO_ROOT],
+    briefPath: join(REPO_ROOT, 'skills-src/conveyor/opus-sweep-brief.md'),
+  };
 }
 function runOpus({ dryRun }) {
   const { cmd, args, briefPath } = opusCommand();
   if (dryRun) return { attention: [], sections: [{ title: 'Would run', lines: [`${cmd} ${args.join(' ')} < ${briefPath}`] }] };
   const r = spawnSync(cmd, args, { input: readFileSync(briefPath, 'utf8'), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 30 * MIN, cwd: REPO_ROOT });
-  if (r.status !== 0) return { attention: [`opus sweep failed (exit ${r.status})`], sections: [] };
+  if (r.status !== 0) return { attention: [`opus sweep failed (exit ${r.status}): ${r.error?.message ?? String(r.stderr ?? '').split('\n')[0]}`], sections: [] };
   return { attention: [], sections: [{ title: 'Opus findings', lines: String(r.stdout).split('\n').filter(Boolean).slice(0, 80) }] };
 }
 
 export function runJob(job, { dryRun = false, now = Date.now(), env = process.env } = {}) {
-  const fn = { 'pr-movement': runPrMovement, coroner: runCoroner, opus: runOpus }[job];
+  const fn = { 'pr-movement': runPrMovement, coroner: runCoronerJob, opus: runOpus }[job];
   if (!fn) throw new Error(`unknown sweep job "${job}" (known: ${Object.keys(SWEEP_JOBS).join(', ')})`);
   const result = fn({ now, env, dryRun });
   const at = new Date(now).toISOString();
@@ -226,12 +301,13 @@ function post(report, { env = process.env } = {}) {
   const dated = join(dir, `${report.at.replace(/[:.]/g, '-')}.md`);
   writeFileSync(dated, report.markdown);
   copyFileSync(dated, join(dir, 'latest.md'));
-  const sig = createHash('sha1').update(report.attention.join('\n')).digest('hex');
   const sigFile = join(dir, 'last-attention.sha');
   let prev = ''; try { prev = readFileSync(sigFile, 'utf8'); } catch { /* first run */ }
+  const { notify, sig } = decideNotify({ attention: report.attention, prevSig: prev });
   let notified = false;
-  if (report.attention.length && sig !== prev) notified = notifyDesktopChecked({ title: `${report.job} sweep`, body: report.attention.slice(0, 3).join(' | ') }).ok;
-  writeFileSync(sigFile, sig);
+  if (notify) notified = notifyDesktopChecked({ title: `${report.job} sweep`, body: report.attention.slice(0, 3).join(' | ') }).ok;
+  // A failed notification keeps the OLD signature so the next run tries again; an empty list always records itself.
+  if (!notify || notified) writeFileSync(sigFile, sig);
   return { dated, notified };
 }
 
