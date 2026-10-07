@@ -111,13 +111,14 @@ jobs:
       # cancelling would hide which other shards also failed.
       fail-fast: false
       matrix:
-        # N shards. Keep this list's LENGTH in lockstep with the `--expect=N` in the `test` job below
-        # (the shard divisor itself is derived from the matrix via `strategy.job-total`, so only the
-        # --expect guard is hand-synced). More shards = more fixed per-runner setup (~25s each) for less
-        # marginal wall-clock; 4 balances parallelism against that setup tax.
-        # NOTE: `strategy.job-total` (used as the shard divisor below) counts ALL matrix combinations, so
-        # this matrix must stay SINGLE-DIMENSION — adding a second axis would break the `i/N` divisor.
-        shard: [1, 2, 3, 4]
+        # More shards = more fixed per-runner setup (~25s each) for less marginal wall-clock; 4 coverage shards
+        # balance parallelism against that setup tax.
+        # NOTE: `strategy.job-total` counts ALL matrix combinations, so this matrix must stay SINGLE-DIMENSION.
+        # Card 12: shards 1-4 are the COVERAGE shards (the tests that can reach a coverage-counted file, balanced by
+        # time over 4); shard 5 is the NO-COVERAGE group (scripts/** tests that never load one) and runs without
+        # --coverage in parallel. Keep the number of coverage shards (4) in lockstep with `--expect=4` below and
+        # with the `/4` divisors in the two unit-suite steps.
+        shard: [1, 2, 3, 4, 5]
     steps:
       # Sibling layout under $GITHUB_WORKSPACE so WE's `../frontierui` resolves — both the vitest/vite
       # `@frontierui/*` alias (dev/test-time; `we:vitest.config.ts` → `../frontierui/plugs`) AND the pinned
@@ -167,32 +168,40 @@ jobs:
         working-directory: web-everything
         run: npm ci
 
-      # `strategy.job-total` = the matrix length, so the divisor stays correct if the shard list changes.
-      - name: Unit suite shard ${{ matrix.shard }}/${{ strategy.job-total }} (coverage, no per-shard bar)
+      # Card 11: files are assigned to a shard by MEASURED time (scripts/ci/shard-assign.mjs +
+      # scripts/ci/test-timings.json), not vitest's blind `--shard=i/N`. Every file is in exactly one shard.
+      # Card 12: `--group=covered` is the tests that can reach a coverage-counted file (scripts/ci/coverage-reach.mjs);
+      # only those run under --coverage, so the covered files' numbers are unchanged.
+      - name: Unit suite shard ${{ matrix.shard }}/4 (coverage, no per-shard bar)
+        if: ${{ matrix.shard != 5 }}
         working-directory: web-everything
-        # Card 11: files are assigned to this shard by MEASURED time (scripts/ci/shard-assign.mjs +
-        # scripts/ci/test-timings.json), not vitest's blind `--shard=i/N`. Every file is in exactly one shard.
-        # The assignment is captured with `out=$(…)` (not `mapfile < <(…)`): bash drops a process substitution's
-        # exit status, so a rejected assignment used to leave `files` empty and run the WHOLE suite in this shard.
-        # Under the default `bash -e`, a failing `out=$(…)` fails the step; an empty list is refused too, because
-        # no filters means every test. (A `while read` loop keeps this portable to bash 3.2, which the test runs on.)
         run: |
-          out=$(node scripts/ci/shard-assign.mjs --suite=unit --shard=${{ matrix.shard }}/${{ strategy.job-total }})
+          # Capture first, then split: reading the list through a process substitution drops the producer's exit status, so a failing
+          # assignment would leave `files` empty and run the WHOLE suite. (scripts/ci/__tests__/ci-shard-steps.test.mjs)
+          list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=covered --shard=${{ matrix.shard }}/4) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
+          [ -n "$list" ] || { echo "::error::shard-assign returned an empty file list"; exit 1; }
           files=()
-          while IFS= read -r f; do
-            if [ -n "$f" ]; then files+=("$f"); fi
-          done <<<"$out"
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "::error::shard-assign returned no test files for unit shard ${{ matrix.shard }}/${{ strategy.job-total }}; refusing to run vitest with no filters (that is the whole suite)"
-            exit 1
-          fi
-          echo "unit shard ${{ matrix.shard }}/${{ strategy.job-total }}: ${#files[@]} files"
+          while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
+          echo "unit shard ${{ matrix.shard }}/4: ${#files[@]} files"
           npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}"
+
+      - name: Unit suite no-coverage group (scripts tests that cannot reach a covered file)
+        if: ${{ matrix.shard == 5 }}
+        working-directory: web-everything
+        run: |
+          # Same capture-then-split shape as the coverage shard step above (see its comment).
+          list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=nocov --shard=1/1) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
+          [ -n "$list" ] || { echo "::error::shard-assign returned an empty file list"; exit 1; }
+          files=()
+          while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
+          echo "unit no-coverage group: ${#files[@]} files"
+          npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}"
 
       # Upload this shard's partial coverage for the `test` job to merge. `if-no-files-found: error`
       # turns a missing report into a red shard (not a silent under-count) — the merge's --expect guard
-      # is the second line of defence.
+      # is the second line of defence. The no-coverage group (shard 5) produces none.
       - name: Upload shard coverage
+        if: ${{ matrix.shard != 5 }}
         uses: actions/upload-artifact@v4
         with:
           name: coverage-shard-${{ matrix.shard }}
