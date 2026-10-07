@@ -1,5 +1,6 @@
 /** @file Tests for the generated standard worker rules and injectable CLI. */
 import { describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
 import { main, renderWorkerBrief } from '../worker-brief.mjs';
 
 const params = { purpose: 'fix-widget', files: ['scripts/x.mjs', 'plateau-app:src/y.ts'], owner: 'tok12345' };
@@ -134,5 +135,24 @@ describe('bare paths take the --repo prefix', () => {
   it('qualifies a bare path with plateau-app: when repo is plateau-app', () => {
     const brief = renderWorkerBrief({ purpose: 'ui-fix', files: ['src/a.ts'], repo: 'plateau-app' });
     expect(brief).toContain('--files=plateau-app:src/a.ts');
+  });
+});
+
+describe('worker-brief hardening (items 90, 92)', () => {
+  it('rejects hostile --files and --edge-clone before they reach shell commands', () => {
+    for (const bad of ['a.mjs;rm -rf ~', 'a$(id).mjs', 'a`id`', 'a b.mjs', 'a"b']) {
+      expect(() => renderWorkerBrief({ ...params, files: ['ok.mjs', bad] }), bad).toThrow(/unsafe/);
+      expect(() => renderWorkerBrief({ ...params, files: `ok.mjs,${bad}` }), bad).toThrow(/unsafe/);
+    }
+    expect(() => renderWorkerBrief({ ...params, edgeClone: '/tmp/x; id' })).toThrow(/unsafe/);
+    expect(renderWorkerBrief({ ...params, edgeClone: '/tmp/clone-1' })).toContain('--clone=/tmp/clone-1');
+  });
+
+  it('step 2 and the SKILL both say to stop when register exits non-zero', () => {
+    const brief = renderWorkerBrief(params);
+    const step2 = brief.slice(brief.indexOf('2. **Register'), brief.indexOf('3. **Lane'));
+    expect(step2).toMatch(/register exits non-zero[\s\S]*stop and report/);
+    const skill = fs.readFileSync('skills-src/worker-brief/SKILL.md', 'utf8');
+    expect(skill).toMatch(/register` exits non-zero[\s\S]*stop and report/);
   });
 });

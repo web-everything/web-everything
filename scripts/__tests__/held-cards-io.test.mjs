@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { main } from '../held-cards-io.mjs';
+import { main, atomicWriteText } from '../held-cards-io.mjs';
 import { lockDirFor, readLockEntry } from '../readiness/file-locks.mjs';
 import { lockRootFor } from '../readiness/with-lock.mjs';
 
@@ -253,5 +253,39 @@ process.exitCode = await main(['file', '--blocking'], { exec });
     expect(await h.run(['file'])).toBe(0);
     expect(h.calls).toHaveLength(0);
     expect(h.out.join('')).toContain('nothing to file');
+  });
+});
+
+describe('held cards durability and quiet check (items 91, 93)', () => {
+  it('atomicWriteText renames a temp file and leaves no temp behind; default writer is not bare writeFileSync', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'held-atomic-'));
+    dirs.push(dir);
+    const file = path.join(dir, 'state.json');
+    atomicWriteText(file, 'one'); atomicWriteText(file, 'two');
+    expect(fs.readFileSync(file, 'utf8')).toBe('two');
+    expect(fs.readdirSync(dir)).toEqual(['state.json']);
+    const source = fs.readFileSync('scripts/held-cards-io.mjs', 'utf8');
+    expect(source).not.toMatch(/writeFile = fs\.writeFileSync/);
+  });
+
+  it('no script writes operator state under .operations with a bare writeFileSync', () => {
+    const scripts = path.resolve('scripts');
+    const offenders = fs.readdirSync(scripts).filter(f => f.endsWith('.mjs')).filter(f => {
+      const text = fs.readFileSync(path.join(scripts, f), 'utf8');
+      return /writeFileSync\([^)]*\.operations/.test(text);
+    });
+    expect(offenders).toEqual([]);
+  });
+
+  it('a truncated PR list is never QUIET even when the count is flat', async () => {
+    const h = harness({ count: 300 });
+    fs.writeFileSync(h.state, JSON.stringify({ openPrs: 600 }));
+    expect(await h.run(['status'])).toBe(1);
+    expect(h.out.join('')).toMatch(/truncated/);
+  });
+
+  it('refreshes the lease after a subprocess as well as before', () => {
+    const source = fs.readFileSync('scripts/held-cards-io.mjs', 'utf8');
+    expect(source).toMatch(/finally \{ if \(alive\) beat\(\)/);
   });
 });

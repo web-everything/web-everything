@@ -27,3 +27,5 @@ node scripts/worker-brief.mjs --purpose=<slug> --files=we:scripts/a.mjs,we:scrip
 
 Run the free-scope check on the same `--files` yourself first (skill `free-scope`). Do not dispatch a worker
 onto occupied files.
+
+If `free-scope-cli register` exits non-zero (scope occupied), the worker must stop and report; it must not edit anything.

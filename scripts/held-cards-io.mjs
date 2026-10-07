@@ -65,10 +65,21 @@ function etTime(date) {
   return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
 }
 
+/** Write operator state atomically: temp file in the same directory, then rename, so a reader never sees a torn file. */
+export function atomicWriteText(file, data, encoding = 'utf8') {
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try { fs.writeFileSync(tmp, data, encoding); fs.renameSync(tmp, file); } catch (error) {
+    try { fs.unlinkSync(tmp); } catch { /* nothing to clean */ }
+    throw error;
+  }
+}
+
+const PR_LIST_LIMIT = 300;
+
 export async function main(argv, deps = {}) {
   const { env = process.env, stdout = process.stdout, stderr = process.stderr,
     exec = (bin, args, options) => execFileSync(bin, args, { ...options, encoding: 'utf8' }),
-    readFile = fs.readFileSync, writeFile = fs.writeFileSync, loadavg = os.loadavg,
+    readFile = fs.readFileSync, writeFile = atomicWriteText, loadavg = os.loadavg,
     now = () => new Date() } = deps;
   const flags = Object.fromEntries(argv.slice(1).map(arg => {
     const equal = arg.indexOf('=');
@@ -87,13 +98,18 @@ export async function main(argv, deps = {}) {
   // Every subprocess first refreshes the filing lock (a no-op outside a filing run), so a long run is never "stale".
   let beat = () => {}, holdsFiling = false;
   // A run whose lock was lost stops before its next step; the lane release passes `alive = false` so it still runs.
-  const command = (bin, args, cwd = root, alive = true) => { if (alive) beat(); return exec(bin, args, { cwd, encoding: 'utf8' }); };
+  const command = (bin, args, cwd = root, alive = true) => {
+    if (alive) beat();
+    try { return exec(bin, args, { cwd, encoding: 'utf8' }); } finally { if (alive) beat(); } // refresh after a long run too
+  };
   const verdict = () => {
     const previous = JSON.parse(read(state, 'null'));
+    let truncated = false;
     const openPrs = DEFAULT_REPOS.reduce((count, repo) => {
       const prs = JSON.parse(command(env.WE_HELD_CARDS_GH_BIN || 'gh',
-        ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '300', '--json', 'number']));
+        ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', 'number']));
       if (!Array.isArray(prs)) throw new Error('gh returned an invalid PR list');
+      if (prs.length >= PR_LIST_LIMIT) truncated = true;
       return count + prs.length;
     }, 0);
     const thresholds = {};
@@ -105,7 +121,10 @@ export async function main(argv, deps = {}) {
         thresholds[key] = Number(value);
       }
     }
-    return quietVerdict({ load1: loadavg()[0], openPrs, previous, ...thresholds });
+    const result = quietVerdict({ load1: loadavg()[0], openPrs, previous, ...thresholds });
+    // A cut-off PR list is a lower bound: a flat count then does not prove the queue stopped growing.
+    if (truncated) { result.quiet = false; result.reasons.unshift(`PR list truncated at ${PR_LIST_LIMIT}; count unreliable`); }
+    return result;
   };
   try {
     const md = read(list, '');
