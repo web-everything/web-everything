@@ -93,6 +93,7 @@ import {
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
 import { referralCardReadable } from './lib/referral-card-readable.mjs';
+import { assertOperatorCliFresh } from './lib/main-staleness.mjs';
 import { referralLiveContext } from './lib/referral-live-context.mjs';
 // #2844 — WHO cleared this verdict, and the refusal when that is the PR's own author. See that module's header
 // for what the id rests on (the harness session identity, NOT the free-text `--actor`) and for the residual.
@@ -1900,6 +1901,10 @@ export function projectVerdictCommentLength({ body = '', actor = '', reason = ''
 // (the test file and rearm-review.mjs import this module). The standard main check used in review-detail.mjs.
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
 if (IS_CLI) {
+  // Item 113 — judge only with current code: a checkout far behind origin/main refuses (nothing changed) rather
+  // than return a verdict from a bug main already fixed (#4222, bornAs card resolution).
+  try { assertOperatorCliFresh(resolve(dirname(new URL(import.meta.url).pathname), '..'), { label: 'review-set-label' }); }
+  catch (e) { fail(String((e && e.message) || e)); }
   // #2882 — the OPTIONAL `--body-file=<path>` carries the caller's write-up (see `buildVerdictComment`). Every
   // check happens HERE, before any gh mutation, because this flag used to fail in the worst direction: the label
   // was applied first and the comment posted second, so a body problem discovered late left an ACCEPTED PR with
