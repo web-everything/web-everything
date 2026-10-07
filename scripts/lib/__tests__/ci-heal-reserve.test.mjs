@@ -7,7 +7,7 @@ import { createDispatchThrottle } from '../dispatch-throttle.mjs';
 import { runReconcileCiHealDispatch } from '../../operations/ci-heal-pr-dispatch.mjs';
 
 const claim = (kind, pr) => ({ meta: { kind, pr, repo: 'we' } });
-const idle = { loadavg: () => 1, cpuCount: () => 12 };
+const idle = { sample: () => ({ ok: false }), loadavg: () => 1, cpuCount: () => 12 };
 
 // Live incident 2026-10-07: PR #4235 failed its own required check, but two review-fix sessions held the whole
 // fixer cap, so its ci-heal was deferred pass after pass and no one owned it.
@@ -27,7 +27,7 @@ describe('ci-heal reserve slot', () => {
   });
   it('reserve 0 is off; host load still refuses', () => {
     expect(createCiHealReserve({ ...idle, env: { WE_CI_HEAL_RESERVE: '0' } }).tryAdmit().admit).toBe(false);
-    expect(createCiHealReserve({ loadavg: () => 36, cpuCount: () => 12, env: {} }).tryAdmit()).toMatchObject({ admit: false, kind: 'host-load' });
+    expect(createCiHealReserve({ sample: () => ({ ok: false }), loadavg: () => 36, cpuCount: () => 12, env: {} }).tryAdmit()).toMatchObject({ admit: false, kind: 'host-load' });
   });
   it('ci-heal dispatch for a PR runs when review fixes hold the whole fixer cap', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ci-heal-reserve-'));

@@ -11,6 +11,7 @@
   "isolatedRetry": "untouched",
   "relatedMaxTests": 40,
   "relatedDepth": 2,
+  "skipLocalForCardOnly": true,
   "alwaysRunTests": [
     "skills-src/conveyor/__tests__/runner-pass-coverage.test.mjs",
     "skills-src/conveyor/__tests__/launchd-templates.test.mjs",
