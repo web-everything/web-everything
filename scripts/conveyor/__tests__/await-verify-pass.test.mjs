@@ -1,7 +1,12 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterAll } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
 import {
   classifyAwaitVerdict, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession,
-  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS,
+  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, pushShaFromScratch,
 } from '../await-verify-pass.mjs';
 
 const SHA = '65a382e81413952ab11e5448e36f01bb7ce4c332';
@@ -234,14 +239,18 @@ describe('findAwaitSession — an explicit session id never falls back by name (
 
 describe('defaultAwaitVerifyIo — the real push and resume ports (#5137 review)', () => {
   const PR_HEAD = 'lane/item-68b';
+  const PR_URL = 'https://github.com/chalbert/web-everything/pull/4115';
+  const REMOTE_URL = 'https://github.com/chalbert/web-everything.git';
+  const LANE_GIT_DIR = '/lanes/lane-5/.git';
   /** An exec double that records every call and answers git/gh like a healthy host. */
   const fakeExec = ({ head = PR_HEAD, state = 'OPEN', remote = SHA, failPush = null } = {}) => {
     const calls = [];
     const exec = (cmd, args) => {
       calls.push([cmd, ...args]);
-      if (cmd === 'gh') { if (head === null) throw new Error('gh down'); return `${state} ${head}\n`; }
+      if (cmd === 'gh') { if (head === null) throw new Error('gh down'); return `${state} ${PR_URL} ${head}\n`; }
       if (args.includes('push')) { if (failPush) throw Object.assign(new Error(failPush), { stderr: failPush }); return ''; }
       if (args.includes('ls-remote')) return `${remote}\trefs/heads/${PR_HEAD}\n`;
+      if (args.includes('--absolute-git-dir')) return `${LANE_GIT_DIR}\n`;
       return '';
     };
     return { exec, calls };
@@ -257,15 +266,42 @@ describe('defaultAwaitVerifyIo — the real push and resume ports (#5137 review)
     const result = (await build(exec)).push(pushArg());
     expect(result).toEqual({ ok: true });
     const [push] = gitPushes(calls);
-    expect(push).toEqual(expect.arrayContaining(['push', 'origin', `${SHA}:refs/heads/${PR_HEAD}`]));
+    // the push target is the URL GitHub reports for the PR's repo — never the lane's own `origin` (agent-writable config)
+    expect(push).toEqual(expect.arrayContaining(['push', REMOTE_URL, `${SHA}:refs/heads/${PR_HEAD}`]));
+    expect(push).not.toContain('origin');
     for (const arg of push) {
       expect(arg).not.toMatch(/^--force|^-f$|--no-verify|--force-with-lease/);
       expect(arg).not.toMatch(/^\+/);
     }
-    // every git call neutralizes the lane-config keys that execute code (a hooks path would still run lane-relative scripts)
-    for (const c of calls.filter((x) => x[0] === 'git')) {
-      expect(c).toEqual(expect.arrayContaining(['core.fsmonitor=false', 'core.hooksPath=/dev/null', 'diff.external=', 'core.sshCommand=ssh']));
+    // it runs from a daemon-owned scratch repo (lane objects via alternates), so no lane config is ever read by the push
+    expect(push).not.toContain('-C');
+    const gitDir = push[push.indexOf('--git-dir') + 1];
+    expect(gitDir).toBeTruthy();
+    expect(gitDir).not.toBe(LANE_GIT_DIR);
+    expect(push).toEqual(expect.arrayContaining(['core.hooksPath=/dev/null']));
+    // every lane-side git call neutralizes the lane-config keys that execute code (a hooks path would still run lane-relative scripts)
+    for (const c of calls.filter((x) => x[0] === 'git' && x.includes('-C'))) {
+      expect(c).toEqual(expect.arrayContaining(['core.fsmonitor=false', 'core.hooksPath=/dev/null', 'core.attributesFile=/dev/null', 'core.sshCommand=ssh']));
+      expect(c).not.toContain('diff.external='); // `-c diff.external=` makes every `git diff` die ("cannot run ''"): the tree hash would always be null
     }
+  });
+
+  it('refuses any ref outside lane/* at the push port — a push to main never depends on a hook', async () => {
+    for (const ref of ['main', 'refs/heads/main', 'lane/../main', '--force', 'master']) {
+      const { exec, calls } = fakeExec({ head: ref });
+      const result = (await build(exec)).push(pushArg({ ref }));
+      expect(result, ref).toMatchObject({ ok: false });
+      expect(result.transient).toBeUndefined();
+      expect(gitPushes(calls)).toEqual([]);
+    }
+  });
+
+  it('refuses a PR URL that is not a github.com pull URL, without pushing', async () => {
+    const calls = [];
+    const exec = (cmd, args) => { calls.push([cmd, ...args]); return cmd === 'gh' ? `OPEN https://evil.example/o/r/pull/4115 ${PR_HEAD}\n` : ''; };
+    const result = (await build(exec)).push(pushArg());
+    expect(result).toMatchObject({ ok: false });
+    expect(gitPushes(calls)).toEqual([]);
   });
 
   it('a live fix claim held by another session short-circuits before any git or gh call', async () => {
@@ -306,6 +342,25 @@ describe('defaultAwaitVerifyIo — the real push and resume ports (#5137 review)
     expect((await build(stale.exec)).push(pushArg())).toMatchObject({ ok: false, reason: expect.stringMatching(/after push/) });
   });
 
+  it('classifies a REAL multi-line git rejection (advice hints last) as terminal, and a network failure as transient', async () => {
+    const real = [
+      'To github.com:chalbert/web-everything.git',
+      ' ! [rejected]            65a382e8 -> lane/item-68b (fetch first)',
+      'error: failed to push some refs to \'github.com:chalbert/web-everything.git\'',
+      'hint: Updates were rejected because the remote contains work that you do',
+      'hint: not have locally. This is usually caused by another repository pushing',
+      'hint: to the same ref. You may want to first integrate the remote changes',
+      'hint: (e.g., \'git pull ...\') before pushing again.',
+      'hint: See the \'Note about fast-forwards\' in \'git push --help\' for details.',
+    ].join('\n');
+    const rejected = await (await build(fakeExec({ failPush: real }).exec)).push(pushArg());
+    expect(rejected).toMatchObject({ ok: false, transient: false });
+    expect(rejected.reason).toMatch(/rejected/); // the reason a human reads is the rejection, not the trailing hint
+    expect(rejected.reason).not.toMatch(/^hint:/);
+    const net = await (await build(fakeExec({ failPush: 'fatal: unable to access \'https://github.com/x.git/\': Could not resolve host: github.com' }).exec)).push(pushArg());
+    expect(net).toMatchObject({ ok: false, transient: true });
+  });
+
   describe('resume cleanup', () => {
     const session = { sessionId: 'S-target', cwd: '/scratch' };
     const dispatchIo = (printed, resumed) => ({
@@ -333,5 +388,111 @@ describe('defaultAwaitVerifyIo — the real push and resume ports (#5137 review)
       expect(stopped).toEqual([]);
       expect(result.resumed).toBe(true);
     });
+  });
+});
+
+describe('resume prompts follow the session\'s OWN brief, for both kinds (#5137 review)', () => {
+  const FIX_ONLY = /before\/after|hand-back|"push rejected because the branch moved"|alt branch|record the pause/i;
+  it('a CI-heal green resume points at the durable CI-heal tally comment, never the fix brief\'s evidence/hand-back', () => {
+    const p = buildAwaitVerifyResumePrompt({ kind: 'green', record: rec({ kind: 'ci-heal' }) });
+    expect(p).toMatch(/CI-heal brief/);
+    expect(p).toMatch(/ci-heal-mark\.mjs|CI-heal comment/);
+    expect(p).not.toMatch(FIX_ONLY);
+  });
+  it('a CI-heal push-rejected resume says reconcile with the current head, commit, request + mark again — no alt branch or pause', () => {
+    const p = buildAwaitVerifyResumePrompt({ kind: 'push-rejected', record: rec({ kind: 'ci-heal' }), detail: '! [rejected] (fetch first)' });
+    expect(p).toMatch(/reconcile with the current PR head/i);
+    expect(p).toMatch(/--attempt=2/);
+    expect(p).not.toMatch(FIX_ONLY);
+    expect(p).not.toMatch(/fix-end/);
+  });
+  it('the fix kind keeps its own evidence/hand-back and alt-branch paths', () => {
+    expect(buildAwaitVerifyResumePrompt({ kind: 'green', record: rec() })).toMatch(/before\/after evidence/);
+    expect(buildAwaitVerifyResumePrompt({ kind: 'push-rejected', record: rec(), detail: 'x' })).toMatch(/alt branch/);
+  });
+  it('every resume kind for both kinds names its own brief and the sha, and never tells the session to push the ref itself', () => {
+    for (const kind of ['green', 'push-rejected', 'red', 'load-flake', 'escalate', 'infra', 'void', 'other']) {
+      for (const k of ['fix', 'ci-heal']) {
+        const p = buildAwaitVerifyResumePrompt({ kind, record: rec({ kind: k, attempt: 2 }), detail: 'd', marker: marker('red') });
+        expect(p, `${kind}/${k}`).toContain(SHA);
+        if (kind === 'green' || kind === 'push-rejected') expect(p, `${kind}/${k}`).toContain(k === 'ci-heal' ? 'CI-heal brief' : 'fix brief');
+      }
+    }
+  });
+});
+
+describe('real git: the daemon\'s lane tree hash equals the one verify-lane records, and the push never reads lane config (#5137 review)', () => {
+  const git = (cwd, args, env = {}) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', ...env } });
+  const identity = ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false'];
+  /** origin (bare) ← base clone with main pushed ← a lane clone (`--shared`: its objects chain to the base via alternates) with one local commit. */
+  const mkLane = () => {
+    const root = mkdtempSync(join(tmpdir(), 'await-verify-real-'));
+    const origin = join(root, 'origin.git');
+    const base = join(root, 'base');
+    git(root, ['init', '--bare', '-b', 'main', origin]);
+    git(root, ['clone', origin, base]);
+    writeFileSync(join(base, 'a.txt'), 'one\n');
+    git(base, ['add', 'a.txt']); git(base, [...identity, 'commit', '-m', 'one']); git(base, ['push', 'origin', 'HEAD:main']);
+    const lane = join(root, 'lane');
+    git(root, ['clone', '--shared', origin, lane]);
+    writeFileSync(join(lane, 'a.txt'), 'one\ntwo\n');
+    git(lane, ['add', 'a.txt']); git(lane, [...identity, 'commit', '-m', 'two']);
+    return { root, origin, lane, sha: git(lane, ['rev-parse', 'HEAD']).trim() };
+  };
+  const dirs = [];
+  afterAll(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });
+
+  it('laneState().treeHash equals computeWorkingTreeHash with verify-lane\'s TRIMMING git runner, for a lane with a real diff', async () => {
+    const L = mkLane(); dirs.push(L.root);
+    writeFileSync(join(L.lane, 'new.txt'), 'untracked\n'); // untracked content is part of the hash too
+    const verifyLaneRunner = (a) => git(L.lane, a).trim(); // scripts/verify-lane.mjs: `git(...).trim()`
+    const expected = computeWorkingTreeHash({ runGit: verifyLaneRunner, fileMode: (f) => lstatSync(join(L.lane, f)).mode });
+    expect(expected).toMatch(/^[0-9a-f]{64}$/);
+    // (the lane is dirty because of new.txt; commit it so laneState computes a hash)
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    expect(io.laneState(L.lane)).toMatchObject({ dirty: true, treeHash: null });
+    git(L.lane, ['add', 'new.txt']); git(L.lane, [...identity, 'commit', '-m', 'three']);
+    const committed = computeWorkingTreeHash({ runGit: verifyLaneRunner, fileMode: (f) => lstatSync(join(L.lane, f)).mode });
+    const state = io.laneState(L.lane);
+    expect(state.dirty).toBe(false);
+    expect(state.treeHash).toBe(committed);
+  });
+
+  it('a lane-config diff.external driver is never run by the daemon, and does not change the hash', async () => {
+    const L = mkLane(); dirs.push(L.root);
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    const before = io.laneState(L.lane).treeHash;
+    const ran = join(L.root, 'driver-ran');
+    const driver = join(L.root, 'driver.sh');
+    writeFileSync(driver, `#!/bin/sh\ntouch ${ran}\n`, { mode: 0o755 });
+    git(L.lane, ['config', 'diff.external', driver]);
+    expect(io.laneState(L.lane).treeHash).toBe(before);
+    expect(existsSync(ran)).toBe(false);
+  });
+
+  it('pushShaFromScratch pushes the lane commit (objects via alternates) to the GIVEN url, ignoring a lane config that points origin and insteadOf elsewhere', () => {
+    const L = mkLane(); dirs.push(L.root);
+    const decoy = join(L.root, 'decoy.git');
+    git(L.root, ['init', '--bare', decoy]);
+    git(L.lane, ['config', 'remote.origin.url', decoy]);
+    git(L.lane, ['config', 'remote.origin.pushurl', decoy]);
+    git(L.lane, ['config', `url.${decoy}.insteadOf`, L.origin]);
+    const laneGitDir = git(L.lane, ['rev-parse', '--absolute-git-dir']).trim();
+    const out = pushShaFromScratch({ laneGitDir, url: L.origin, sha: L.sha, ref: 'lane/item-1', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    expect(out.remote).toBe(L.sha);
+    expect(git(L.origin, ['rev-parse', 'refs/heads/lane/item-1']).trim()).toBe(L.sha);
+    expect(git(decoy, ['for-each-ref']).trim()).toBe(''); // the lane's own origin / insteadOf was never consulted
+  });
+
+  it('pushShaFromScratch never overwrites a moved branch (no force): a non-fast-forward is rejected', () => {
+    const L = mkLane(); dirs.push(L.root);
+    const laneGitDir = git(L.lane, ['rev-parse', '--absolute-git-dir']).trim();
+    const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' };
+    pushShaFromScratch({ laneGitDir, url: L.origin, sha: L.sha, ref: 'lane/item-2', env });
+    git(L.lane, ['checkout', '-b', 'other', 'HEAD~1']); writeFileSync(join(L.lane, 'a.txt'), 'other\n');
+    git(L.lane, ['add', 'a.txt']); git(L.lane, [...identity, 'commit', '-m', 'other']);
+    const other = git(L.lane, ['rev-parse', 'HEAD']).trim();
+    expect(() => pushShaFromScratch({ laneGitDir, url: L.origin, sha: other, ref: 'lane/item-2', env })).toThrow();
+    expect(git(L.origin, ['rev-parse', 'refs/heads/lane/item-2']).trim()).toBe(L.sha);
   });
 });

@@ -22,7 +22,8 @@
  * names the verdict's own sha. Pure core + injectable IO, like we:scripts/conveyor/load-flake-reverify.mjs.
  */
 import { execFileSync } from 'node:child_process';
-import { lstatSync } from 'node:fs';
+import { lstatSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -98,7 +99,8 @@ export function classifyAwaitVerdict({ record, marker, lane, nowMs, ttlMs, limit
   return rerequest(v.status || 'no-verdict'); // absent / corrupt / infrastructure-failure
 }
 
-const brief = (record) => (record.kind === 'ci-heal' ? 'CI-heal brief' : 'fix brief');
+const isCiHeal = (record) => record.kind === 'ci-heal';
+const brief = (record) => (isCiHeal(record) ? 'CI-heal brief' : 'fix brief');
 const failureLines = (marker) => {
   const tests = Array.isArray(marker?.failureDetails?.tests) ? marker.failureDetails.tests.slice(0, 15) : [];
   const lines = tests.map((t) => `- ${t.file} > ${t.name}`);
@@ -114,10 +116,17 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
   const head = `[harness verify verdict — #5137] PR #${record.pr} (${record.repo}), sha ${record.sha}, attempt ${record.attempt ?? 1}.`;
   const next = `Re-mark with --attempt=${(record.attempt ?? 1) + 1} after committing and re-requesting, then end your turn again.`;
   switch (kind) {
-    case 'green':
-      return `${head}\n\nVerify is GREEN for exactly this sha and the harness has PUSHED it to ${record.ref}${detail ? ` (${detail})` : ''}. Do not push ${record.ref} again. Continue your ${brief(record)} from the step after the push: post the before/after evidence comment (cite this green verdict), then the hand-back and the closing completion report + fix-end.`;
+    case 'green': {
+      const pushed = `Verify is GREEN for exactly this sha and the harness has PUSHED it to ${record.ref}${detail ? ` (${detail})` : ''}. Do not push ${record.ref} again.`;
+      // The two briefs end differently: a CI-heal's only PR write is the restart-surviving tally comment (no evidence comment, no hand-back).
+      return isCiHeal(record)
+        ? `${head}\n\n${pushed} Continue your ${brief(record)} at step 7: post the durable CI-heal comment (\`ci-heal-mark.mjs\` — the attempt tally that survives restarts), then its completion report (\`--outcome=no-change|healed\`) and fix-end. Touch no label.`
+        : `${head}\n\n${pushed} Continue your ${brief(record)} from the step after the push: post the before/after evidence comment (cite this green verdict), then the hand-back and the closing completion report + fix-end.`;
+    }
     case 'push-rejected':
-      return `${head}\n\nVerify is GREEN, but the harness could NOT push ${record.sha} to ${record.ref}: ${detail}. Follow your ${brief(record)}'s "push rejected because the branch moved" path (save to the alt branch, record the pause, fix-end). Never force-push.`;
+      return isCiHeal(record)
+        ? `${head}\n\nVerify is GREEN, but the harness could NOT push ${record.sha} to ${record.ref}: ${detail}. The remote moved: follow your ${brief(record)}'s non-fast-forward path — reconcile with the current PR head, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Never force-push, and do not exit yet.`
+        : `${head}\n\nVerify is GREEN, but the harness could NOT push ${record.sha} to ${record.ref}: ${detail}. Follow your ${brief(record)}'s "push rejected because the branch moved" path (save to the alt branch, record the pause, fix-end). Never force-push.`;
     case 'red':
       return `${head}\n\nVerify is RED for this sha. Failing tests:\n${failureLines(marker)}\n\nRepair the failure in your lane (same scope rules), commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} If the red is only timeouts that pass alone under host load, take the brief's load-flake exit instead.`;
     case 'load-flake':
@@ -239,16 +248,52 @@ export function formatAwaitVerifyLines(result) {
 // ── IO shell ───────────────────────────────────────────────────────────────────────────────────────────────
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
+/** `https://github.com/<owner>/<repo>/pull/<n>` → `https://github.com/<owner>/<repo>.git`; null for anything else. */
+export function repoUrlFromPrUrl(prUrl) {
+  const m = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/\d+$/.exec(String(prUrl ?? ''));
+  return m ? `https://github.com/${m[1]}.git` : null;
+}
+
+/**
+ * Push `sha` to `refs/heads/<ref>` at `url` WITHOUT reading the lane's git config. The lane is agent-writable, so its
+ * `remote.*`, `url.*.insteadOf`, `credential.helper` and filter-driver keys are untrusted input to the daemon. The
+ * push therefore runs in a throwaway bare repo the daemon owns (its config is empty; the host's global config —
+ * the user's credential helper — still applies), reading the lane's commits through
+ * `GIT_ALTERNATE_OBJECT_DIRECTORIES` (git follows the lane's own alternates chain). Never `--force`: a moved branch is
+ * rejected, not overwritten. Returns the remote's sha after the push; throws git's error on a rejection.
+ */
+export function pushShaFromScratch({ laneGitDir, url, sha, ref, exec = execFileSync, env = process.env, tmpRoot = tmpdir(), timeout = 180_000 }) {
+  const scratch = mkdtempSync(join(tmpRoot, 'await-verify-push-'));
+  try {
+    const clean = { ...env };
+    for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY']) delete clean[k];
+    const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...clean, GIT_ALTERNATE_OBJECT_DIRECTORIES: join(laneGitDir, 'objects') }, timeout };
+    exec('git', ['init', '--bare', '--quiet', scratch], opts);
+    // `core.hooksPath=/dev/null`: the host's global hooks (guard-git-push) are not this call's gate — the ref/PR checks in
+    // `defaultAwaitVerifyIo.push` are — and a hook path is the one way git would run a script from a repo directory.
+    const run = (args) => String(exec('git', ['--git-dir', scratch, '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], opts));
+    run(['push', url, `${sha}:refs/heads/${ref}`]);
+    let remote = '';
+    try { remote = run(['ls-remote', url, `refs/heads/${ref}`]).split(/\s/)[0]; } catch { /* the push itself succeeded; a failed read-back is not a rejection */ }
+    return { remote };
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
 /**
  * Real ports; every seam is injectable so the push/resume guarantees below are testable without git or claude.
  *
  * The lane is agent-writable, so its own `.git/config` is untrusted input to the daemon: every git call turns off
  * `core.fsmonitor`, lane hooks (`core.hooksPath=/dev/null` — a hook runs lane-relative scripts, so ANY hooks path
- * would still execute lane code), `diff.external` and `core.attributesFile`, and pins `core.sshCommand`. The
- * `guard-git-push` hook is replaced by two checks the daemon makes itself: the ref must match `lane/*`
- * (`AWAIT_VERIFY_REF_RE`, so `main` is unreachable) and equal the head ref of the OPEN PR. Filter drivers, `url.*.insteadOf`
- * and credential helpers in the lane config are NOT neutralized here; the structural fix (push from a
- * daemon-owned clone / explicit slug URL) is carded.
+ * would still execute lane code) and `core.attributesFile`, and pins `core.sshCommand`; the one `git diff` (the tree
+ * hash) adds `--no-ext-diff` — NOT `-c diff.external=`, which makes every `git diff` die with "cannot run ''".
+ * The `guard-git-push` hook does not run (hooks are off, by design): its job is done by checks the daemon makes
+ * itself, in {@link defaultAwaitVerifyIo}'s `push` — the ref must match `lane/*` (`AWAIT_VERIFY_REF_RE`, so `main` is
+ * unreachable) and equal the head ref of the OPEN PR. The push itself never reads the lane's config at all:
+ * {@link pushShaFromScratch} pushes to the URL GitHub reports for the PR's repo from a daemon-owned scratch repo, so
+ * the PR check, the fix claim and the push target are bound to one slug (a lane `remote.origin.url`, `insteadOf`,
+ * credential helper or filter driver is never consulted).
  */
 export async function defaultAwaitVerifyIo({
   weRoot = ROOT, exec = execFileSync, env = process.env, sleep = sleepSync,
@@ -257,16 +302,19 @@ export async function defaultAwaitVerifyIo({
   const io = dispatchIo ?? await import('../operations/dispatch-lane-io.mjs');
   const stopSession = stopSessionFn ?? (await import('../operations/dispatch-abort.mjs')).stopSession;
   const pushRefusal = pushRefusalFn ?? (await import('./fix-procedure.mjs')).pushRefusal;
-  const hardening = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=',
+  const hardening = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
     '-c', 'core.attributesFile=/dev/null', '-c', 'core.sshCommand=ssh'];
   const git = (lane, args, opts = {}) => String(exec('git', ['-C', lane, ...hardening, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, ...opts }));
-  /** The head branch of the PR and whether it is OPEN, read from GitHub (never from the lane or the record). Null when unresolved. */
+  /**
+   * The head branch of the PR, whether it is OPEN, and the git URL of the repo the PR lives in — all read from GitHub
+   * (never from the lane or the record). Null when unresolved.
+   */
   const prHead = (repo, pr) => {
     try {
-      const out = String(exec('gh', ['pr', 'view', String(pr), '--repo', String(repo), '--json', 'headRefName,state', '--jq', '.state + " " + .headRefName'],
+      const out = String(exec('gh', ['pr', 'view', String(pr), '--repo', String(repo), '--json', 'headRefName,state,url', '--jq', '.state + " " + .url + " " + .headRefName'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 60_000 })).trim();
-      const [state, ...rest] = out.split(' ');
-      return state && rest.length ? { open: state === 'OPEN', ref: rest.join(' ') } : null;
+      const [state, url, ...rest] = out.split(' ');
+      return state && url && rest.length ? { open: state === 'OPEN', ref: rest.join(' '), remoteUrl: repoUrlFromPrUrl(url) } : null;
     } catch { return null; }
   };
   return {
@@ -280,7 +328,10 @@ export async function defaultAwaitVerifyIo({
       try {
         const head = git(lane, ['rev-parse', 'HEAD']).trim();
         const dirty = git(lane, ['status', '--porcelain', '--untracked-files=all']).trim().length > 0;
-        const treeHash = dirty ? null : computeWorkingTreeHash({ runGit: (a) => git(lane, a), fileMode: (f) => lstatSync(join(lane, f)).mode });
+        // Same runner shape as verify-lane.mjs (`git(...).trim()`): an untrimmed `git diff` ends in "\n", so the hashes would never match.
+        // `--no-ext-diff` keeps a lane-config diff driver from running in the daemon (it does not change output without one).
+        const runGit = (a) => git(lane, a[0] === 'diff' ? ['diff', '--no-ext-diff', ...a.slice(1)] : a).trim();
+        const treeHash = dirty ? null : computeWorkingTreeHash({ runGit, fileMode: (f) => lstatSync(join(lane, f)).mode });
         return { head, dirty, treeHash };
       } catch { return null; }
     },
@@ -297,6 +348,8 @@ export async function defaultAwaitVerifyIo({
       }
     },
     push: ({ lane, sha, ref, repo, pr, who, sessionId }) => {
+      // Never reached for `main` (or any non-`lane/*` ref), whatever hook is or is not installed: a guarantee of this port.
+      if (!AWAIT_VERIFY_REF_RE.test(String(ref ?? '')) || String(ref).includes('..')) return { ok: false, reason: `refusing to push ${ref}: not a lane/* ref` };
       const refusal = pushRefusal({ repo, branch: ref, sessionId, who });
       if (refusal?.refused) return { ok: false, reason: refusal.message };
       // The record's ref was typed by the fixer: bind it to the PR it claims to be repairing before pushing.
@@ -304,17 +357,20 @@ export async function defaultAwaitVerifyIo({
       if (!head) return { ok: false, transient: true, reason: `could not resolve the head ref of ${repo} PR #${pr}` };
       if (head.ref !== ref) return { ok: false, reason: `recorded ref ${ref} is not PR #${pr}'s head (${head.ref}); refusing to push` };
       if (!head.open) return { ok: false, reason: `PR #${pr} is not open; refusing to push ${ref}` };
+      if (!head.remoteUrl) return { ok: false, reason: `PR #${pr}'s URL is not a github.com pull URL; refusing to push ${ref}` };
+      let laneGitDir;
+      try { laneGitDir = git(lane, ['rev-parse', '--absolute-git-dir']).trim(); } catch { return { ok: false, transient: true, reason: `could not read the git dir of ${lane}` }; }
       try {
-        // Hooks stay on (guard-git-push refuses main); never --force, so a moved branch is rejected, not overwritten.
-        git(lane, ['push', 'origin', `${sha}:refs/heads/${ref}`], { timeout: 180_000 });
+        // Never --force, so a moved branch is rejected, not overwritten; never the lane's own `origin` (see pushShaFromScratch).
+        const { remote } = pushShaFromScratch({ laneGitDir, url: head.remoteUrl, sha, ref, exec, env, timeout: 180_000 });
+        if (remote && lower(remote) !== lower(sha)) return { ok: false, reason: `remote ${ref} is ${remote.slice(0, 8)} after push` };
+        if (!remote) return { ok: false, reason: `remote ${ref} is missing after push` };
       } catch (e) {
-        const reason = String(e?.stderr ?? e?.message ?? e).trim().split('\n').slice(-2).join(' ').slice(0, 300);
-        return { ok: false, reason, transient: !/rejected|non-fast-forward|fetch first|stale info|hook declined|protected/i.test(reason) };
+        // Classify on git's WHOLE stderr: a real rejection ends in several `hint:` lines that carry none of the keywords.
+        const stderr = String(e?.stderr ?? e?.message ?? e);
+        const reason = stderr.trim().split('\n').filter((l) => l.trim() && !/^hint:/i.test(l)).slice(-3).join(' ').slice(0, 300);
+        return { ok: false, reason, transient: !/rejected|non-fast-forward|fetch first|stale info|hook declined|protected/i.test(stderr) };
       }
-      try {
-        const remote = git(lane, ['ls-remote', 'origin', `refs/heads/${ref}`]).split(/\s/)[0];
-        if (lower(remote) !== lower(sha)) return { ok: false, reason: `remote ${ref} is ${remote.slice(0, 8) || 'missing'} after push` };
-      } catch { /* the push itself succeeded; a failed read-back is not a rejection */ }
       return { ok: true };
     },
     listSessions: () => io.defaultListAgents({ all: true, env }),
