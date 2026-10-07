@@ -17,6 +17,10 @@
  *
  * CLI:
  *   node scripts/ci/shard-assign.mjs --suite=unit|soak --shard=<i>/<N>    one file per line, repo-relative
+ *   node scripts/ci/shard-assign.mjs --suite=unit --group=covered|nocov --shard=<i>/<N>
+ *                                    card 12: `covered` = tests that can reach a coverage-counted file, balanced over
+ *                                    N shards; `nocov` = the rest (scripts/** tests that never load one), which CI
+ *                                    runs WITHOUT --coverage (see coverage-reach.mjs). Use --shard=1/1 for nocov.
  *   node scripts/ci/shard-assign.mjs --suite=unit|soak --update=<vitest-json>[,<vitest-json>...]
  *                                    rewrite that suite's timings from vitest `--reporter=json` reports
  *                                    (the CI shards upload theirs as `timing-<suite>-<shard>` artifacts)
@@ -130,9 +134,18 @@ async function main(argv) {
     const { listAllSoakFiles } = await import('../conveyor/soak/shard-files.mjs');
     files = listAllSoakFiles();
   }
+  const group = (argv.find((a) => a.startsWith('--group=')) ?? '').slice('--group='.length);
+  if (group && suite !== 'unit') throw new Error('shard-assign: --group only applies to --suite=unit');
+  if (group && group !== 'covered' && group !== 'nocov') throw new Error('shard-assign: --group must be covered or nocov');
+  const universe = files;
+  if (group) {
+    const { classifyTests } = await import('./coverage-reach.mjs');
+    const split = await classifyTests(files);
+    files = split[group];
+  }
   const mine = assignByTime(files, loadTimings()[suite], total)[shard - 1];
   if (suite === 'unit') {
-    const bad = ambiguousFilters(mine, files);
+    const bad = ambiguousFilters(mine, universe);
     if (bad.length) throw new Error(`shard-assign: filter is a substring of another test path: ${bad.map(([a, b]) => `${a} in ${b}`).join('; ')}`);
   }
   if (mine.some((f) => /\s/.test(f))) throw new Error('shard-assign: a test path contains whitespace; the workflow cannot pass it as a filter');
