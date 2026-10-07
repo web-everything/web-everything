@@ -30,6 +30,17 @@ the last status. Otherwise `BUSY` (exit 1) with the reasons. Thresholds: `--max-
 `--max-pr-growth=` / `WE_HELD_CARDS_MAX_PR_GROWTH`. Each status saves the current PR count, so the next one can
 see growth.
 
+## Check before dispatching a held item
+
+```bash
+node scripts/held-cards-io.mjs check [--item=63,76] [--all] [--json] [--no-fetch]
+```
+
+Read-only and HEURISTIC. Per held item it reads the named paths, symbols and #PRs, looks at `origin/main` and the
+merged PR list, and prints `likely-done`, `partly-done` or `not-started` with its evidence. Run it BEFORE you
+dispatch a held item: a list goes stale (3 of 5 recent dispatches were already on main). Confirm a `likely-done`
+before skipping the item. It never edits the list.
+
 ## File
 
 ```bash
