@@ -12,6 +12,7 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, exists
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { defaultIsPidAlive, detachedHandlePid } from './detached-dispatch.mjs';
+import { stripTerminal } from '../lib/pr-state-io.mjs';
 
 export const JOBS_DIR_ENV = 'WE_START_BUILD_JOBS_DIR';
 
@@ -48,14 +49,22 @@ export function listJobs(dir = jobsDir()) {
   return names.filter((n) => n.endsWith('.json')).map((n) => readJob(n.slice(0, -5), dir)).filter(Boolean);
 }
 
-/** The last `bytes` of a log, or '' when unreadable. Bounded: never reads a whole log. */
-export function tailLog(path, bytes = 4096) {
+/** How much of one run's log {@link describeJob} scans for the wrapper's verdict line. */
+export const LOG_SCAN_BYTES = 1024 * 1024;
+
+/**
+ * The last `bytes` of a log, never reading before `fromOffset` (where THIS run's output starts in a log the
+ * item's runs share), or '' when unreadable. Bounded: never reads a whole log. An offset past the end means the
+ * log was replaced since, so the whole (new) file is this run's.
+ */
+export function tailLog(path, bytes = 4096, fromOffset = 0) {
   try {
     if (!path || !existsSync(path)) return '';
     const size = statSync(path).size;
+    const floor = Number.isInteger(fromOffset) && fromOffset > 0 && fromOffset <= size ? fromOffset : 0;
     const fd = openSync(path, 'r');
     try {
-      const len = Math.min(size, bytes);
+      const len = Math.min(size - floor, bytes);
       const buf = Buffer.alloc(len);
       readSync(fd, buf, 0, len, size - len);
       return buf.toString('utf8');
@@ -71,16 +80,18 @@ export function describeJob(job, { isPidAlive = defaultIsPidAlive, readLog = tai
   if (!job) return null;
   const pid = detachedHandlePid(job.handle);
   if (pid && isPidAlive(pid)) return { ...job, status: 'running', detail: `pid ${pid}` };
-  const tail = readLog(job.logPath);
+  const tail = readLog(job.logPath, LOG_SCAN_BYTES, job.logOffset);
   const lines = String(tail).split('\n').map((l) => l.trim()).filter(Boolean);
-  const verdict = [...lines].reverse().find((l) => /deliver-item-run: .*(finished|FAILED)/.test(l));
+  // Anchored to this item: agent output echoing some other "deliver-item-run: … finished" text is not the wrapper's verdict.
+  const mine = new RegExp(`^deliver-item-run: #${String(job.id).replace(/[^A-Za-z0-9]/g, '')} (finished|FAILED)`);
+  const verdict = [...lines].reverse().find((l) => mine.test(l));
   if (verdict) return { ...job, status: /FAILED/.test(verdict) ? 'failed' : 'finished', detail: verdict };
   return { ...job, status: 'ended', detail: 'process gone, no verdict line in log' };
 }
 
-/** One-line human rendering, shared by `/state` and the CLI. */
+/** One-line human rendering, shared by `/state` and the CLI. Every field passes the terminal sanitiser: `detail` is read from the log. */
 export function renderJob(described) {
   if (!described) return 'no durable build job';
-  return `durable build ${described.status} — #${described.id}, ${described.provider || 'policy-routed'} in lane ${described.lane} `
-    + `(${described.handle}, started ${described.startedAt}); ${described.detail}; log ${described.logPath}`;
+  return stripTerminal(`durable build ${described.status} — #${described.id}, ${described.provider || 'policy-routed'} in lane ${described.lane} `
+    + `(${described.handle}, started ${described.startedAt}); ${described.detail}; log ${described.logPath}`);
 }

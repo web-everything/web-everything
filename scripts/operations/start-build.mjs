@@ -21,15 +21,17 @@
  *   3. the build-dispatch claim (so the conveyor tick cannot double-dispatch the same item),
  *   4. a free lane number,
  *   5. a durable job record the chat and `/state` read ({@link ./start-build-jobs.mjs}).
- * Any refusal happens BEFORE anything is claimed or spawned. A failure after the claim releases it again.
+ * Any refusal happens BEFORE anything is claimed or spawned. A failure to spawn releases the claim again; once
+ * the wrapper is running the claim is kept, even if its job record cannot be written.
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normNum } from '../conveyor/queue-store.mjs';
 import { mintSessionSlug } from '../conveyor/session-slug.mjs';
-import { acquireBuildDispatchClaim, releaseBuildDispatchClaim } from '../conveyor/build-dispatch-claim.mjs';
+import { acquireBuildDispatchClaim, listBuildDispatchClaims, releaseBuildDispatchClaim } from '../conveyor/build-dispatch-claim.mjs';
+import { stripTerminal } from '../lib/pr-state-io.mjs';
 import { assessFreeScope } from './free-scope.mjs';
 import { collectFreeScope, findCardFile, readCardScope } from './free-scope-io.mjs';
 import { REPO_ROOT, defaultSpawnDetached, DETACHED_HANDLE_PREFIX } from './detached-dispatch.mjs';
@@ -94,8 +96,16 @@ const defaultIo = () => ({
     };
     return pickFreeLane(JSON.parse(out), { isSafe });
   },
-  acquireClaim: (num, scope) => acquireBuildDispatchClaim({ num, scope }),
+  // `claimedAt` is the claim's own token: the job record keeps it so a later settle can tell this launch's claim from a newer one.
+  acquireClaim: (num, scope, claimedAt) => acquireBuildDispatchClaim({ num, scope, nowIso: claimedAt }),
+  readClaim(num) {
+    const n = normNum(num);
+    const live = listBuildDispatchClaims({ ignoreExpiry: true }).find((c) => c.meta.repo === 'we' && c.meta.num === n);
+    return live ? { claimedAt: live.meta.claimedAt } : null;
+  },
   releaseClaim: (num) => releaseBuildDispatchClaim({ num }),
+  // Size of the item's log BEFORE a launch appends to it: where this run's output starts (the log name is per item, reused).
+  logSize: (path) => { try { return statSync(path).size; } catch { return 0; } },
   spawnDetached: defaultSpawnDetached,
   // Under the durable jobs dir, NOT the checkout's `.operations/`: the log must survive this checkout (a lane)
   // being released and reset while the build still runs.
@@ -109,12 +119,25 @@ const defaultIo = () => ({
  * launcher took (the wrapper dies before it owns the claim when e.g. lane acquire is refused). Release it, once,
  * and record that, so a dead job never keeps the item locked for the claim's 4h lease. A `finished` job is left
  * alone: the wrapper itself released (non-PR) or deliberately kept (PR) the claim.
+ *
+ * Release is by item number, so it is gated on OWNERSHIP: only the claim carrying this job's own `claimedAt`
+ * token is released. A claim that is absent or was re-taken since (the daemon, another start) is not ours, and is
+ * left alone; the record is marked settled either way. A record with no token (an older launch) is never released
+ * — its claim lapses on its own lease. The check-then-release gap is the one `build-dispatch-claim.mjs` documents.
  */
 export function settleDeadJob(described, io) {
   if (!described || !['failed', 'ended'].includes(described.status) || described.claimReleased) return false;
-  try { io.releaseClaim(described.id); } catch { return false; }
-  try { io.writeJob({ ...stripView(described), claimReleased: true }); } catch { /* record is advisory */ }
-  return true;
+  if (!described.claimedAt) return false;
+  let live;
+  try { live = io.readClaim(described.id); } catch { return false; }
+  const own = live?.claimedAt === described.claimedAt;
+  if (own) { try { io.releaseClaim(described.id); } catch { return false; } }
+  // Never overwrite a NEWER run's record with this stale snapshot: write only while the stored record is still this run's.
+  try {
+    const stored = io.readJob?.(described.id);
+    if (!stored || (stored.handle === described.handle && stored.startedAt === described.startedAt)) io.writeJob({ ...stripView(described), claimReleased: true });
+  } catch { /* record is advisory */ }
+  return own;
 }
 const stripView = ({ status, detail, ...job }) => job;
 
@@ -142,24 +165,32 @@ export function startBuild({ num: rawNum, provider = '', dryRun = false } = {}, 
   if (!plan.ok) return plan;
   if (dryRun) return { ok: true, dryRun: true, job: { id: num, lane, scope, provider: provider || null } };
 
-  const claim = io.acquireClaim(num, scope);
+  const claimedAt = io.now().toISOString();
+  const claim = io.acquireClaim(num, scope, claimedAt);
   if (claim?.ok === false) return planStartBuild({ num, card, scope, provider, free, lane, claim });
+  let job;
   try {
     const sessionSlug = mintSessionSlug({ kind: 'conveyor', id: num });
     const argv = [DELIVER_ITEM_RUN_SCRIPT, `--num=${num}`, `--lane=${lane}`, `--session=${sessionSlug}`, `--scope=${scope.join(',')}`, '--attempt='];
     if (provider) argv.push(`--provider=${provider}`);
     const logPath = io.logPathFor(sessionSlug);
+    const logOffset = io.logSize(logPath);
+    const startedAt = io.now().toISOString();
     const child = io.spawnDetached(argv, { cwd: io.root, logPath });
     const pid = Number(child?.pid);
     if (!Number.isInteger(pid) || pid <= 0) throw new Error('node reported no pid for the build wrapper');
-    const job = { id: num, kind: 'build', session: sessionSlug, lane, scope, provider: provider || null,
-      handle: `${DETACHED_HANDLE_PREFIX}${pid}`, logPath, startedAt: io.now().toISOString() };
-    io.writeJob(job);
-    return { ok: true, job };
+    job = { id: num, kind: 'build', session: sessionSlug, lane, scope, provider: provider || null,
+      handle: `${DETACHED_HANDLE_PREFIX}${pid}`, logPath, logOffset, claimedAt, startedAt };
   } catch (e) {
     try { io.releaseClaim(num); } catch { /* best effort: the claim lease expires on its own */ }
     return { ok: false, refusal: 'spawn-failed', detail: String(e?.message ?? e) };
   }
+  // The wrapper is RUNNING from here on: releasing the claim now would let the tick dispatch a duplicate build.
+  try { io.writeJob(job); } catch (e) {
+    return { ok: false, refusal: 'job-record-failed', running: true, job,
+      detail: `the build wrapper is running (${job.handle}, log ${job.logPath}) but its job record could not be written: ${String(e?.message ?? e)}; the build claim is kept` };
+  }
+  return { ok: true, job };
 }
 
 function parse(argv) {
@@ -185,8 +216,8 @@ export function main(argv, { out = (s) => process.stdout.write(`${s}\n`), err = 
   if (cmd !== 'start') { err('Usage: start-build.mjs start --num=<card> [--provider=<name>] [--dry-run] [--json] | status [--num=<card>] [--json]'); return 2; }
   const result = startBuild({ num: flags.num, provider: flags.provider || '', dryRun: flags['dry-run'] === 'true' }, io);
   if (flags.json) out(JSON.stringify(result, null, 2));
-  else if (result.ok) out(result.dryRun ? `start-build: #${result.job.id} would start in lane ${result.job.lane} (dry run, nothing claimed)` : `start-build: #${result.job.id} started — ${result.job.handle}, lane ${result.job.lane}, log ${result.job.logPath}`);
-  else err(`start-build: refused (${result.refusal}) — ${result.detail}`);
+  else if (result.ok) out(stripTerminal(result.dryRun ? `start-build: #${result.job.id} would start in lane ${result.job.lane} (dry run, nothing claimed)` : `start-build: #${result.job.id} started — ${result.job.handle}, lane ${result.job.lane}, log ${result.job.logPath}`));
+  else err(stripTerminal(`start-build: ${result.running ? 'started but unrecorded' : 'refused'} (${result.refusal}) — ${result.detail}`));
   return result.ok ? 0 : 1;
 }
 
