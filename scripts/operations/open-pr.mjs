@@ -170,6 +170,8 @@ export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = ''
     sha: typeof sha === 'string' ? sha.trim() : '',
     requireVerified: requireVerified === true,
     dryRun: dryRun === true,
+    // Consumed by the IO shell's pre-PR review check; never forwarded to pr-land.
+    skipPrePrReview: typeof skipPrePrReview === 'string' ? skipPrePrReview.trim() : '',
     // The exact argv for the home. Exported in the verdict so a caller that must submit through another
     // channel submits what the operation decided rather than something it composed itself.
     argv,

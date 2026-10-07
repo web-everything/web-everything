@@ -133,6 +133,14 @@ describe('lane sandbox: checkPrePrReview + open-pr runner', () => {
   });
 });
 
+describe('open-pr plan', () => {
+  it('carries the bypass reason in the plan and keeps it out of the pr-land argv', () => {
+    const p = planOpen({ ref: 'lane/x', base: 'main', bodyFile: '/b.md', mode: 'label-on-green', skipPrePrReview: '  why  ' });
+    expect(p.skipPrePrReview).toBe('why');
+    expect(p.argv.join(' ')).not.toMatch(/skip/i);
+  });
+});
+
 describe('converge-cli receipt', () => {
   let dir; let state;
   const git = (...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8' });
