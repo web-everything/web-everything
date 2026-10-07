@@ -16,6 +16,7 @@ import { readReadyCandidate, readRebuildState, writeRebuildState } from './state
 import { verifyRev, makeGit } from './shared.mjs';
 import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
+import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
@@ -33,8 +34,12 @@ import { smokeAndAdopt } from './smoke.mjs';
 export async function rebuildClone({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
-  now = () => Date.now(), sleep,
+  now = () => Date.now(), sleep, versions,
 } = {}) {
+  // Card 89 S5: a versioned clone never moves in place — it builds a version and flips `current`, taking no
+  // clone lock at all. `versions: null` forces the legacy path; unset resolves from the settings (default off).
+  const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
+  if (vctx) return versionedRebuild({ ctx: vctx, log });
   const lockRootFromEnv = env && env.WE_DAEMON_CLONE_LOCK_ROOT;
   // #4044 (live 2026-09-25 10:28-10:40 ET): the fix daemon's tick-start rebuild waited SILENTLY up to the lock's
   // 600s default for the review daemon's 10-minute tick to release its read slot — no ticks, no log line. A

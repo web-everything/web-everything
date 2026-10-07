@@ -321,9 +321,12 @@ async function main(argv) {
   // entry (see `spawnPassOnce`'s own docblock above for why a per-repo pass needs this and argv[1] alone can't
   // give it).
   const passEnv = { ...process.env, GH_CALLER: passName };
+  // Card 89 S5: on a versioned clone withSelfSync sets `tickContext.tickRoot` to the version folder this tick is
+  // pinned to, and the pass child spawns from THERE (a switch mid-tick never moves a running child's tree).
+  const tickContext = {};
   const runPassSelfSynced = passDaemonSelfSyncEnabled()
-    ? withSelfSync({ tickOnce: () => spawnPassOnce(entry, { env: passEnv }) }, {
-      root: REPO_ROOT, onRestart: restartOntoNewCode, mainOnly, env: selfSyncEnv,
+    ? withSelfSync({ tickOnce: () => spawnPassOnce(entry, { env: passEnv, root: tickContext.tickRoot ?? REPO_ROOT }) }, {
+      root: REPO_ROOT, onRestart: restartOntoNewCode, mainOnly, env: selfSyncEnv, tickContext,
     }).tickOnce
     : () => spawnPassOnce(entry, { env: passEnv });
 
