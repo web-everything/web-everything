@@ -411,6 +411,29 @@ export function latestRequiredCheck(pr, requiredCheck = 'test') {
   return collapsed.find((c) => (c?.name || c?.context) === requiredCheck) || null;
 }
 
+/**
+ * CodeQL gate knob. `scripts/drain-gate-settings.json` `{drainBlocksOnCodeQL}` (default ON): when on, the drain
+ * refuses to land a PR whose `CodeQL` check concluded FAILURE (new code-scanning alerts in the changed code),
+ * parking it with a clear reason like a red required check. CodeQL is not a branch-protection required check, so
+ * PR #4236 landed red with a high-severity alert; this closes that gap in the drain. It only ADDS a refusal.
+ * A missing/malformed file falls back to ON (fail closed).
+ */
+export const CODEQL_CHECK_NAME = 'CodeQL';
+export function loadDrainGateSettings(path = join(dirname(fileURLToPath(import.meta.url)), 'drain-gate-settings.json')) {
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8'));
+    return { drainBlocksOnCodeQL: raw?.drainBlocksOnCodeQL !== false };
+  } catch { return { drainBlocksOnCodeQL: true }; }
+}
+const DRAIN_GATE_SETTINGS = loadDrainGateSettings();
+
+/** Did the latest `CodeQL` check on this PR conclude FAILURE (new alerts)? Pure; an absent/pending/passing CodeQL is false. */
+export function isCodeQLFailed(pr) {
+  const check = latestRequiredCheck(pr, CODEQL_CHECK_NAME);
+  if (!check) return false;
+  return String(check.conclusion || check.state || '').toUpperCase() === 'FAILURE';
+}
+
 /** Resolve capped/missing rollup evidence against the listed head, never a moving branch.
  * gh's PR listing caps contexts at 100 (#3432); even a visible check may have a newer run
  * beyond that cap. Read all REST pages before replacing the required name's evidence.
@@ -699,7 +722,7 @@ export function reconcileDrainReviewPending({ currentLabels, dryRun = false, ...
  * `checking` forever with no reason. `defaultBranch` is the caller's per-repo resolution (never a literal
  * `'main'`); when it or `baseRefName` is unknown the arm is inert and the chain behaves exactly as before.
  */
-export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-merge', allowPendingReview = false, defaultBranch = null } = {}) {
+export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-merge', allowPendingReview = false, defaultBranch = null, blockOnCodeQL = DRAIN_GATE_SETTINGS.drainBlocksOnCodeQL } = {}) {
   const num = pr?.number;
   const title = pr?.title || '';
   const aiGenerated = isAiGeneratedPr(pr);
@@ -735,6 +758,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // PR into the downstream passes gated on it (the escalation pass, the id-collision heal): those must only ever
   // see a PR the hold ALONE is holding, never one already unlandable for a different reason (finding 3 / 4).
   let reviewHeld = false;
+  let codeqlBlocked = false;
   let reason = certifyLabel
     ? `producer-certified (label "${trustLabel}"), required check green, cleanly mergeable`
     : humanCleared
@@ -746,6 +770,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // is green) instead of waiting on a check that never runs there.
   else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch} (${base})`; }
   else if (!testGreen) { decision = 'skip'; reason = `required check "${requiredCheck}" is not green`; }
+  else if (blockOnCodeQL && isCodeQLFailed(pr)) { decision = 'skip'; codeqlBlocked = true; reason = `CodeQL check failed (new code-scanning alerts in the changed code) — refusing to land; fix the alert and re-push (drainBlocksOnCodeQL)`; }
   else if (mergeable !== 'MERGEABLE') { decision = 'skip'; reason = `not mergeable (mergeable=${mergeable || 'UNKNOWN'})`; }
   else if (!landableState) { decision = 'skip'; reason = `merge state ${state || 'UNKNOWN'} (BEHIND⇒needs rebase, DIRTY/BLOCKED/DRAFT⇒not landable) — left for its author`; }
   // #2324 — refuse to land a PR with an empty/whitespace description, same rule pr-land.mjs enforces before
@@ -758,7 +783,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // blocker does it flag `reviewHeld`, so the downstream passes see the hold in isolation. No review label ⇒ never
   // held ⇒ a no-op for the common case (#2820-review-fix finding 3 — "checked LAST so earlier reasons win").
   else if (reviewUncleared) { decision = 'skip'; reviewHeld = true; reason = `unsatisfied review hold ("${heldLabel}") present without review:accepted — refusing to merge regardless of "${trustLabel}" (#2820)`; }
-  return { num, title, decision, reason, aiGenerated, certifyLabel, humanCleared, reviewHeld, testGreen, state, mergeable, offDefaultBase,
+  return { num, title, decision, reason, aiGenerated, certifyLabel, humanCleared, reviewHeld, codeqlBlocked, testGreen, state, mergeable, offDefaultBase,
     ...(pr?.requiredCheckReadError ? { requiredCheckReadError: pr.requiredCheckReadError } : {}) };
 }
 
