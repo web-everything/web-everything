@@ -86,11 +86,14 @@ import { redactSpawnText } from '../../scripts/lib/describe-spawn-failure.mjs';
 
 import { resolveScorecardStorePath } from '../../scripts/conveyor/run-scorecard-store.mjs';
 
+/** Prepare outcomes the runner already handled (a verified already-done resolve PR; a needs-you hold): never failures. */
+const PREPARE_HANDLED_OUTCOMES = ['prepare-already-done', 'prepare-needs-you'];
+
 /** Durable attempt history: repeated ticks and Claude runs cannot reset or double-count failures. */
 export function prepareRouteFallback(records = [], releases = []) {
   const attempts = records.filter(r => r.dispatchKind === 'probation-launch' && r.taskType === 'prepare' && r.repo === CONSTELLATION_REPOS.we.slug)
     .sort((a, b) => String(a.scoredAt).localeCompare(String(b.scoredAt)));
-  const failures = attempts.filter(r => !r.pr && r.launchOutcome !== 'opened-pr');
+  const failures = attempts.filter(r => !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome));
   return failures.length >= 2 && failures.some(r => !releasedAttempt(releases, 'route:prepare', `${r.handle}:${r.scoredAt}`));
 }
 
@@ -651,8 +654,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   }));
   const configuredPrepare = resolveOperationRoute({ operation: 'prepare-item', taskType: 'prepare', policy: routingPolicy });
   const fallback = configuredPrepare ? configuredPrepare.provider === 'claude' : prepareRouteFallback(probationRecords, releases);
-  const prepare = { policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, planned: [], launched: [], inFlight: [], failures: [], retired: [], held: [], stamping: [] };
-  prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr')
+  const prepare = { policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, planned: [], launched: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
     .map(r => ({ item: r.item, attempt: `${r.handle}:${r.scoredAt}`, cause: classifyPrepareFailure(r.evidence), evidence: r.evidence ?? { reason: r.launchOutcome } }));
   const finishedPrepares = new Set(completedPrepares);
   const itemPrepareAttempts = { ...out?.nextState?.itemPrepareAttempts };
@@ -775,6 +778,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         if (live) { effects.releasePrepareHold({ num }); effects.completePrepareFailures?.(num); }
         heldNums.delete(num);
       }
+      let handledOutcome = null;
       if (unstamped) {
         // Hold BEFORE releasing, like build orphan adoption. Re-observed settled evidence renews the hold
         // after restart/expiry, so an unchanged card cannot enter a periodic prepare loop.
@@ -785,10 +789,22 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         const evidence = probation?.evidence ?? (currentSettled ? settled.evidence : null)
           ?? (workerRow ? await effects.readPrepareEvidence?.(workerRow.entry) : null) ?? {};
         const attempt = currentSettled ? settled.source : workerRow ? `run ${workerRow.runId}` : claim?.meta?.claimedAt;
-        const failure = priorFailure ?? await failPrepare(num, 'result', 'prepare-unstamped', evidence, attempt);
-        if (priorFailure) prepare.failures.push({ ...priorFailure, reason: priorFailure.evidence?.reason ?? 'prepare-unstamped' });
-        if (failure.held) prepare.held.push({ num, reason: 'prepare-unstamped' });
-        why ??= 'prepare-unstamped';
+        // A prepare the runner HANDLED is an outcome, not a failure: the card was routed (an already-done card has a
+        // verified resolve PR out) or held with a needs-you reason. Recording it as `prepare-unstamped` filed a
+        // diagnose card and left a silent hold (live #4560, #4328). The runner already placed the hold that keeps it
+        // from re-preparing; here it is only surfaced.
+        handledOutcome = currentSettled && PREPARE_HANDLED_OUTCOMES.includes(settled.outcome) && !priorFailure ? settled.outcome : null;
+        if (handledOutcome) {
+          if (handledOutcome === 'prepare-needs-you') needsYou.push({ num, step: 'prepare', reason: String(settled.evidence?.error ?? 'prepare needs you').slice(0, 300) });
+          prepare.handled.push({ num, outcome: handledOutcome });
+          heldNums.add(num);
+          why ??= handledOutcome;
+        } else {
+          const failure = priorFailure ?? await failPrepare(num, 'result', 'prepare-unstamped', evidence, attempt);
+          if (priorFailure) prepare.failures.push({ ...priorFailure, reason: priorFailure.evidence?.reason ?? 'prepare-unstamped' });
+          if (failure.held) prepare.held.push({ num, reason: 'prepare-unstamped' });
+          why ??= 'prepare-unstamped';
+        }
       }
       if (why === 'prepare-session-dead') {
         prepare.failures.push({ num, stage: 'retirement', reason: why });
@@ -798,7 +814,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       }
       if (why) {
         if (live && worker && !completedPrepares.has(num)) effects.settlePrepareRow?.({ runId: worker.runId, key: worker.entry.key,
-          outcome: why === 'prepare-session-dead' ? why : unstamped ? 'prepare-unstamped' : 'prepare-retired' });
+          outcome: why === 'prepare-session-dead' ? why : handledOutcome ?? (unstamped ? 'prepare-unstamped' : 'prepare-retired') });
         if (claim || worker) {
           if (live && claim) effects.releasePrepareClaim({ num });
           prepare.retired.push({ num, why, released: live });

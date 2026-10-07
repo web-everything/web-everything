@@ -6,7 +6,7 @@ import { join } from 'node:path';
 const {
   refFor, findCardFileName, clearScopeAndAppendFinding, landOne, landRoute,
   commitReferencesItem, extractBornAs, commitTouchesNonBacklogFile,
-  commitDeliversItem, sanitizeHoldReason, MAX_REASON_CHARS,
+  commitDeliversItem, commitCreditsItem, sanitizeHoldReason, MAX_REASON_CHARS,
 } = await import('../build-dispatch-hold-route-land.mjs');
 
 // The REAL `open-pr` `--json` shape (see we:scripts/operations/health-file-request-land.mjs's own note on
@@ -164,6 +164,54 @@ describe('commitDeliversItem', () => {
     expect(commitDeliversItem('WE #4465: x', ['.*'])).toBe(false);
     expect(() => commitDeliversItem('WE #(: x', ['('])).not.toThrow();
     expect(commitDeliversItem(null, ['4465'])).toBe(false);
+  });
+});
+
+describe('commitCreditsItem - the prepare path keeps "a mention is not a delivery" (PR #4323 review)', () => {
+  const IDS = ['4560', 'xak56ki'];
+  it.each([
+    ['the lead tag naming the card', 'WE #4560: build the retry loop\n\nbody'],
+    ['a multi-id lead tag', 'WE #4131/#4560: build-orphan-adopt'],
+    ['a trailing birth-id reference', 'fix(review-pr): quota holds (#xak56ki)'],
+    ['a prose credit in the subject (live #4560)', 'WE #4554: standalone runner finds the lane pool (also delivers xak56ki)\n\nbody'],
+    ['a prose credit with a #', 'WE #4554: runner fix (also resolves #4560)'],
+    ['a birth-id closing trailer in the body', 'WE #4554: runner fix\n\nCloses xak56ki\n'],
+  ])('credits %s', (_n, message) => expect(commitCreditsItem(message, IDS)).toBe(true));
+  it.each([
+    ['a body-only "see #N" beside an unrelated verb', 'WE #4554: fix flaky timer\n\nsee #4560 for context'],
+    ['a follow-up reference in the subject', 'WE #4561: fixes retry loop (see #4560, follow-up)'],
+    ['an unrelated delivery verb and a follow-up reference', 'fixes unrelated bug\n\nfollow-up to #4560'],
+    ['a bare number that is not a card reference', 'WE #4554: fixes the wait to 4560 ms'],
+    ['a related card named after the delivered one', 'WE #4554: fixes #4561, relates to #4560'],
+    ['a negated verb', 'WE #4554: does not fix #4560 yet'],
+    ['a contracted negation: doesn\'t', 'WE #4554: doesn\'t fix #4560 yet'],
+    ['a contracted negation: won\'t', 'WE #4554: won\'t fix #4560'],
+    ['a contracted negation: didn\'t', 'WE #4554: didn\'t fix #4560'],
+    ['a contracted negation: isn\'t / shouldn\'t / couldn\'t', 'WE #4554: shouldn\'t fix #4560; isn\'t ready; couldn\'t fix #4560'],
+    ['a contracted negation after an unrelated delivery', 'WE #4554: fixes retry handling but doesn\'t fix #4560'],
+    ['a contracted negation with a typographic apostrophe', 'WE #4554: doesn’t fix #4560 yet'],
+    ['a contracted negation with no apostrophe', 'WE #4554: doesnt fix #4560 yet'],
+    ['a contracted negation in front of a birth id on a body line', 'WE #4554: runner fix\n\nWe didn\'t close xak56ki\nbut doesn\'t resolve xak56ki\n'],
+    ['the birth id mentioned without a verb attached', 'WE #4554: unrelated change, see xak56ki'],
+    ['a partial subject', 'WE #4560: part 1 - delivers the scaffold'],
+    ['a numeric "Closes #N" in the body (numbers overlap PR/issue numbers)', 'WE #4554: runner fix\n\nCloses #4560\n'],
+    ['a word between the negation and the verb', 'WE #4554: does not, however, fix #4560'],
+    ['an infinitive / modal / failed attempt', 'WE #4554: refactor to fix #4560'],
+    ['unable to fix', 'WE #4554: unable to fix #4560'],
+    ['a future promise', 'WE #4554: Will fix #4560 later'],
+    ['a revert', 'Revert "WE #4554: fixes #4560"'],
+    ['partial wording after the id', 'WE #4554: fixes #4560, part of the rollout'],
+    ['a body line saying part N beside a birth-id credit', 'WE #4554: runner fix\n\npart 1: also delivers xak56ki\n'],
+  ])('refuses %s', (_n, message) => expect(commitCreditsItem(message, IDS)).toBe(false));
+  it('never lets an odd or short card-supplied birth id match ordinary words', () => {
+    expect(commitCreditsItem('x: fixes the bug', ['the'])).toBe(false);
+    expect(commitCreditsItem('x: fixes a bug', ['a'])).toBe(false);
+    expect(commitCreditsItem('x: also fixes #the bug', ['the'])).toBe(true);
+  });
+  it('treats a metacharacter-laden id literally and never throws', () => {
+    expect(commitCreditsItem('WE #4465: fixes x', ['.*'])).toBe(false);
+    expect(() => commitCreditsItem('fixes (', ['('])).not.toThrow();
+    expect(commitCreditsItem(null, ['4560'])).toBe(false);
   });
 });
 
@@ -447,5 +495,64 @@ describe('commitTouchesNonBacklogFile', () => {
     expect(commitTouchesNonBacklogFile(['backlog/4380-x.md'])).toBe(false);
     expect(commitTouchesNonBacklogFile([])).toBe(false);
     expect(commitTouchesNonBacklogFile('')).toBe(false);
+  });
+});
+
+describe('landOne - already-done with citation "prepare" (a prepare worker\'s claim, checked independently)', () => {
+  const MSG = 'WE #4554: standalone runner finds the lane pool from any cwd (also delivers xak56ki)\n\nbody\n';
+  function run({ message = MSG, files = 'backlog/4554-x.md\nscripts/operations/probation-build-run.mjs\nscripts/operations/__tests__/probation-run.test.mjs\n', added = files, testsPass = true, card = '---\nbornAs: xak56ki\nstatus: open\n---\n# T\n', testFile = true, testBody = null } = {}) {
+    mkdirSync(join(LANE_PATH, 'backlog'), { recursive: true });
+    writeFileSync(join(LANE_PATH, 'backlog', '4560-card.md'), card);
+    if (testBody != null) {
+      mkdirSync(join(LANE_PATH, 'scripts/operations/__tests__'), { recursive: true });
+      writeFileSync(join(LANE_PATH, 'scripts/operations/__tests__/probation-run.test.mjs'), testBody);
+    }
+    const { runFn, calls } = fakeRunner(({ cmd, args }) => {
+      if (args.includes('vitest')) { if (!testsPass) throw Object.assign(new Error('1 failed'), { stderr: 'FAIL probation-run.test.mjs' }); return ''; }
+      if (cmd === 'git' && args[0] === 'log') return message;
+      if (cmd === 'git' && args[0] === 'show' && args.includes('-U0')) return String(testBody ?? '').split('\n').map((l) => `+${l}`).join('\n');
+      if (cmd === 'git' && args[0] === 'show') return args.includes('--diff-filter=A') ? added : files;
+      if (args.includes('open-pr')) return fakeOpenPrResult(5001, 'https://github.com/x/y/pull/5001');
+      return '';
+    });
+    const result = landOne({ num: '4560', route: 'already-done', commit: '10fedba67afc', citation: 'prepare' }, {
+      runFn, acquireFn: () => ({ path: LANE_PATH, lane: 37, holder: 's' }), releaseFn: () => {}, existsFile: () => testFile,
+    });
+    return { result, calls };
+  }
+  it('resolves when the commit credits the card by its birth id (no "#") and the tests it added pass on main', () => {
+    const { result, calls } = run();
+    expect(result).toMatchObject({ status: 'landed', pr: 5001 });
+    expect(calls.find((c) => c.args.includes('vitest')).args).toContain('scripts/operations/__tests__/probation-run.test.mjs');
+    expect(calls.find((c) => c.args.includes('resolve')).args).toContain('--graduated-to=10fedba67afc');
+  });
+  it('also accepts a test file the commit only modified when that file names the card', () => {
+    const { result, calls } = run({ added: 'scripts/operations/probation-build-run.mjs\n', testBody: 'it("xak56ki: prepare already-done", () => {});\n' });
+    expect(result).toMatchObject({ status: 'landed', pr: 5001 });
+    expect(calls.find((c) => c.args.includes('vitest')).args).toContain('scripts/operations/__tests__/probation-run.test.mjs');
+  });
+  it('the strict citation still refuses that same commit (its subject has no "#<birth id>")', () => {
+    mkdirSync(join(LANE_PATH, 'backlog'), { recursive: true });
+    writeFileSync(join(LANE_PATH, 'backlog', '4560-card.md'), '---\nbornAs: xak56ki\nstatus: open\n---\n');
+    const { runFn } = fakeRunner(({ cmd, args }) => (cmd === 'git' && args[0] === 'log' ? MSG : cmd === 'git' && args[0] === 'show' ? 'scripts/a.mjs\n' : ''));
+    const result = landOne({ num: '4560', route: 'already-done', commit: '10fedba67afc' }, { runFn, acquireFn: () => ({ path: LANE_PATH, lane: 1, holder: 's' }), releaseFn: () => {} });
+    expect(result.status).toBe('failed');
+  });
+  it.each([
+    ['tests that fail on main', { testsPass: false }, /tests cited commit .* fail on current main/],
+    ['a commit that touched no surviving test file', { testFile: false }, /touches no test file/],
+    ['a commit that never names the card', { message: 'WE #9999: unrelated change\n' }, /does not credit/],
+    ['a partial delivery', { message: 'WE #4554: part 1 of xak56ki, delivers the scaffold\n' }, /does not credit/],
+    ['a bookkeeping-only commit', { files: 'backlog/4554-x.md\n' }, /only backlog/],
+    ['a body-only mention beside an unrelated delivery verb', { message: 'WE #4554: fix flaky timer\n\nsee #4560 for context\n' }, /does not credit/],
+    ['a follow-up reference beside an unrelated delivery verb', { message: 'WE #4561: fixes retry loop (see #4560, follow-up)\n' }, /does not credit/],
+    ['a contracted negation (doesn\'t) beside a passing test', { message: 'WE #4554: fixes retry handling but doesn\'t fix #4560\n' }, /does not credit/],
+    ['a contracted negation (won\'t) on the birth id', { message: 'WE #4554: runner fix (won\'t deliver xak56ki)\n' }, /does not credit/],
+    ['a commit that only modified a test file that never names the card', { added: 'scripts/operations/probation-build-run.mjs\n', testBody: 'it("unrelated", () => {});\n' }, /touches no test file/],
+  ])('refuses %s and opens no PR', (_name, opts, error) => {
+    const { result, calls } = run(opts);
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(error);
+    expect(calls.some((c) => c.args.includes('resolve') || c.args.includes('open-pr'))).toBe(false);
   });
 });

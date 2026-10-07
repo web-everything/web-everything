@@ -25,7 +25,7 @@
 import { retryTransientGit } from '../lib/git-fetch-retry.mjs';
 import { machinePrTitle } from './machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -105,6 +105,73 @@ export function commitDeliversItem(message, ids) {
     if (new RegExp(`^(?:[A-Za-z][\\w-]*\\s+)?(?:#[\\w]+/)*#${e}(?:/#[\\w]+)*:`).test(subject)) return true;
     return !/^\d+$/.test(id) && new RegExp(`\\(#${e}\\)\\s*$`).test(subject);
   });
+}
+
+// A delivery verb, and the words that turn it around ("does not fix #N", "unable to fix #N", "will fix #N later").
+const CREDIT_VERB = String.raw`(?:deliver(?:s|ed)?|closes?|closed|fix(?:es|ed)?|resolves?|resolved|implements?|implemented|lands?|landed)`;
+// A contracted negation is `<word>n't` ("doesn't", "won't", "can't"), with a straight or typographic apostrophe, or
+// the same with no apostrophe at all ("doesnt"). The standalone "n't" this once held could never match: its leading
+// \b has no boundary inside a word (PR #4323 review: "doesn't fix #N" was credited).
+const NEGATING_WORD_RE = /\b(?:not|never|without|cannot|\w+n['’ʼ`]t|(?:do|does|did|is|are|was|were|has|have|had|wo|ca|sha|could|would|should|must|need)nt|unable|fail(?:s|ed|ure)?|attempt(?:s|ed|ing)?|try|tries|tried|to|will|would|should|may|might|could|revert(?:s|ed)?|no longer)\b/i;
+// Words right after the id that make it a partial delivery ("fixes #N, part of ...").
+const PARTIAL_AFTER_RE = /^[\s,;:()-]*(?:in part\b|part\b|partial|partly|first step|step \d|slice\b|phase\b|groundwork|scaffold)/i;
+// A bare (no "#") id form is only trusted for something shaped like a birth hash: card text is untrusted, and a
+// bornAs of "the" must not let any "fixes the ..." credit it.
+const BARE_ID_RE = /^[a-z0-9]{6,}$/i;
+const idForm = (id) => (/^\d+$/.test(id) || !BARE_ID_RE.test(id) ? `#${escapeRegExp(id)}` : `#?${escapeRegExp(id)}`);
+
+/** PURE. Does `text` name one of `ids` as a card reference? A numeric id counts only in its `#<id>` shape (a bare
+ *  "4560" is as likely "4560 ms"); a birth hash counts as a whole word, with or without the `#`; any other
+ *  untrusted-shaped id needs the `#`. Every id is regex-escaped. */
+export function textNamesItem(text, ids) {
+  const body = String(text ?? '');
+  const list = (Array.isArray(ids) ? ids : [ids]).map((id) => String(id ?? '').trim()).filter(Boolean);
+  return list.some((id) => new RegExp(`(?<![\\w/])${idForm(id)}(?![\\w])`).test(body));
+}
+
+/** PURE. Prepare-mode credit (2026-10-07, #4560): a commit that delivers a card often says so in prose, not in
+ *  the strict `WE #<id>:` lead shape - "WE #4554: ... (also delivers xak56ki)" delivered card xak56ki and names
+ *  it without a `#`. PR #4323 review (security + correctness): the first cut of this bar (an id ANYWHERE plus a
+ *  delivery verb ANYWHERE) reopened the hole PR #2967 closed - "fixes retry loop (see #4560, follow-up)" credited
+ *  #4560 - because the verb and the id were two unrelated tokens. The verb and the id must now be ONE phrase:
+ *   - the strict subject shapes {@link commitDeliversItem} accepts (lead tag `WE #<id>:`, trailing `(#<hash>)`), or
+ *   - a delivery verb IMMEDIATELY followed by the id ("also delivers xak56ki", "resolves card #4560"), with no
+ *     negating/modal/infinitive/revert word earlier in the same clause ("does not fix", "unable to fix", "will
+ *     fix", "Revert fixes") and no partial wording right after it ("fixes #N, part of ..."). A NUMERIC id is
+ *     accepted this way on the subject line only (numbers overlap PR and issue numbers: "Fixes #4560" in a body
+ *     usually names a PR); a birth hash may also appear in a body line.
+ *  A partial-delivery marker on the subject, or on the line holding the phrase, refuses it. The other checks (real
+ *  ancestor of origin/main, non-backlog files touched, tests the commit added or that name the card) and the test
+ *  run still apply. */
+export function commitCreditsItem(message, ids) {
+  const text = String(message ?? '');
+  const lines = text.split(/\r?\n/);
+  const subject = (lines[0] ?? '').trim();
+  if (!subject || PARTIAL_DELIVERY_RE.test(subject) || /^revert\b/i.test(subject)) return false;
+  if (commitDeliversItem(text, ids)) return true;
+  const list = (Array.isArray(ids) ? ids : [ids]).map((id) => String(id ?? '').trim()).filter(Boolean);
+  return list.some((id) => {
+    const numeric = /^\d+$/.test(id);
+    const re = new RegExp(`(?<![\\w/])${CREDIT_VERB}\\s+(?:(?:card|item)\\s+)?(${idForm(id)})(?![\\w])`, 'gi');
+    return lines.some((line, i) => {
+      if (numeric && i > 0) return false;
+      if (PARTIAL_DELIVERY_RE.test(line)) return false;
+      for (const m of line.matchAll(re)) {
+        const clause = line.slice(0, m.index).split(/[;.:()]/).pop().slice(-80);
+        if (NEGATING_WORD_RE.test(clause)) continue;
+        if (PARTIAL_AFTER_RE.test(line.slice(m.index + m[0].length))) continue;
+        return true;
+      }
+      return false;
+    });
+  });
+}
+
+/** PURE. The test files a commit touched, from `git show --name-only` text (deleted files cannot be told apart
+ *  here, so the caller keeps only those that still exist in the lane). */
+export function commitTestFiles(files) {
+  const list = Array.isArray(files) ? files : String(files ?? '').split('\n');
+  return list.map((f) => f.trim()).filter((f) => /\.(?:test|spec)\.(?:m?[jt]sx?|cjs)$/.test(f));
 }
 
 /** PURE. Extract a card's `bornAs:` hash from its frontmatter text, or `null` if absent/unparseable. */
@@ -243,9 +310,10 @@ function renderPrBody({ num, route, commit, reason }) {
  * acquiring/releasing a lane is the pool's own bookkeeping, not "editing the daemon clone").
  * @returns {{status:'landed'|'failed', pr?, prUrl?, error?}}
  */
-export function landOne({ num, route, commit = null, reason = null }, {
+export function landOne({ num, route, commit = null, reason = null, citation = 'strict' }, {
   runFn = runCmd, acquireFn = acquireLane, releaseFn = releaseLane,
   readFile = readFileSync, writeFile = writeFileSync, listCardNames = (lane) => readdirSync(join(lane, 'backlog')),
+  existsFile = (p) => existsSync(p),
 } = {}) {
   if (route !== 'already-done' && route !== 'out-of-scope') {
     return { status: 'failed', error: `landOne: unroutable route '${route}' — only 'already-done'/'out-of-scope' land here` };
@@ -300,7 +368,8 @@ export function landOne({ num, route, commit = null, reason = null }, {
           deliveredCard = { title: /^#\s+(.+)$/m.exec(raw)?.[1], raw };
         }
       } catch { /* best-effort — fall through with bornAs: null */ }
-      if (!commitReferencesItem(commitMessage, [num, bornAs])) {
+      const prepareCitation = citation === 'prepare';
+      if (!prepareCitation && !commitReferencesItem(commitMessage, [num, bornAs])) {
         throw new Error(`landOne: cited commit ${commit} is on main but its own message never references #${num}${bornAs ? ` or #${bornAs}` : ''} — refusing to auto-resolve on an unrelated-but-real citation`);
       }
       const commitFiles = runFn('git', ['show', '--name-only', '--format=', commit], lane);
@@ -310,7 +379,37 @@ export function landOne({ num, route, commit = null, reason = null }, {
       //  (4) PR #2967 review (security finding) — a mention is not a delivery: the SUBJECT must name this card
       //      as what the commit delivers, with no partial-delivery marker (`commitDeliversItem`, above), or a
       //      "see #N" / "follow-up to #N" / "WE #N: part 1" commit would close a card whose spec is unbuilt.
-      if (!commitDeliversItem(commitMessage, [num, bornAs])) {
+      if (prepareCitation) {
+        // A prepare worker's "already done" is checked independently, never taken on its word: the message must
+        // credit THIS card (either id), and the tests the commit touched must pass on current main.
+        if (!commitCreditsItem(commitMessage, [num, bornAs])) {
+          throw new Error(`landOne: cited commit ${commit} does not credit #${num}${bornAs ? ` or ${bornAs}` : ''} as delivered (no id with a delivery verb, or a partial subject) — refusing to auto-resolve`);
+        }
+        // The tests that prove the delivery are the ones the commit ADDED (`--diff-filter=A`), or a test file it
+        // only modified that itself names this card: a commit that merely touched some unrelated passing test
+        // proves nothing about THIS card (PR #4323 review).
+        const addedFiles = runFn('git', ['show', '--diff-filter=A', '--name-only', '--format=', commit], lane);
+        // "Names the card" is judged on the lines THIS commit added to the file (not the file's current text, where
+        // any old "#NNNN" comment would satisfy it).
+        const addedLinesNameCard = (f) => {
+          try {
+            const diff = runFn('git', ['show', '--format=', '-U0', commit, '--', f], lane);
+            const added = String(diff).split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++')).join('\n');
+            return textNamesItem(added, [num, bornAs]);
+          } catch { return false; }
+        };
+        // A path that could be read as an option is never handed to vitest.
+        const testFiles = [...new Set([...commitTestFiles(addedFiles), ...commitTestFiles(commitFiles).filter(addedLinesNameCard)])]
+          .filter((f) => !f.startsWith('-') && existsFile(join(lane, f)));
+        if (!testFiles.length) {
+          throw new Error(`landOne: cited commit ${commit} touches no test file that still exists and was added by it or names the card - nothing to prove the delivery - refusing to auto-resolve`);
+        }
+        try {
+          runFn('node', [join(lane, 'scripts', 'readiness', 'heavy-admission.mjs'), 'run', '--', 'npx', 'vitest', 'run', ...testFiles], lane, { timeoutMs: VERIFY_TIMEOUT_MS });
+        } catch (e) {
+          throw new Error(`landOne: the tests cited commit ${commit} added fail on current main (${testFiles.length} file(s)) - refusing to auto-resolve: ${String(e?.stderr || e?.stdout || e?.message || e).trim().split('\n')[0].slice(0, 160)}`);
+        }
+      } else if (!commitDeliversItem(commitMessage, [num, bornAs])) {
         throw new Error(`landOne: cited commit ${commit} mentions #${num} but its subject does not deliver it (a related, follow-up or partial commit) — refusing to auto-resolve`);
       }
       runFn('node', [join(lane, 'scripts', 'backlog.mjs'), 'resolve', String(num), `--graduated-to=${commit}`], lane);
