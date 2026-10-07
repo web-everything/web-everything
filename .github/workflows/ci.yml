@@ -329,7 +329,7 @@ jobs:
           fetch-depth: 0
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
-        if: ${{ steps.gate.outputs.run == 'true' && vars.WE_APP_ID != '' }}
+        if: vars.WE_APP_ID != ''
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ vars.WE_APP_ID }}
