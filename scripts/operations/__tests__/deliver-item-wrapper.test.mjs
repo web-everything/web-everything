@@ -776,6 +776,24 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
     expect(opts.env).toMatchObject({ LANE: L7, IMPL_LANE: P2 });
   });
 
+  it('CODEX_PROVIDER: the ONLY writable grant added for the heavy queue is the admission lock folder (operator ruling 2026-10-07)', async () => {
+    for (const request of [{ ...REQ }, { ...REQ, lanePathOverride: P2 }, { ...REQ, lanePathOverride: P2, resumeSessionId: REQ.sessionId }]) {
+      const o = codexIo();
+      await DELIVERY_AGENT_PROVIDERS.codex.spawn(request, o);
+      const argv = o.spawnAgent.mock.calls[0][0];
+      const perms = permissionsOf(argv);
+      const writes = [...perms.matchAll(/"([^"]+)"="write"/g)].map((m) => m[1]);
+      const lock = writes.filter((w) => w.endsWith('/.lanes/.admission/heavy'));
+      expect(lock).toHaveLength(1);
+      // nothing broader: no HOME, no workspace root, no .lanes root, no wildcard; the only other write grant is the WE lane.
+      for (const w of writes) {
+        expect([lock[0], ...(request.lanePathOverride ? [L7] : [])]).toContain(w);
+      }
+      expect(argv).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+      expect(argv.join(' ')).not.toMatch(/danger-full-access/);
+    }
+  });
+
   it('CLAUDE_RESTRICTED_PROVIDER: LANE=WE lane, IMPL_LANE=impl lane, cwd=impl lane, and --add-dir <WE lane>', async () => {
     const o = claudeIo();
     await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQ, lanePathOverride: P2 }, o);
@@ -811,7 +829,9 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
     expect(xOpts.cwd).toBe(L7);
     expect(xOpts.env.LANE).toBe(L7);
     expect(Object.hasOwn(xOpts.env, 'IMPL_LANE')).toBe(false);
-    expect(permissionsOf(xArgv)).not.toContain('"write"');
+    // the heavy-admission lock folder is the one write grant a we-locus spawn carries (operator ruling 2026-10-07).
+    expect([...permissionsOf(xArgv).matchAll(/"([^"]+)"="write"/g)].map((m) => m[1]))
+      .toEqual([expect.stringMatching(/\/\.lanes\/\.admission\/heavy$/)]);
     expect(permissionsOf(xArgv)).not.toContain(`${HOME}/workspace/plateau-app`);
   });
 });
@@ -3137,6 +3157,7 @@ describe('acquireImplLane (build-path-codex-isolation-locus)', () => {
     ]));
     expect(args.some((a) => a.startsWith('--repo=') && a.endsWith('/workspace/plateau-app'))).toBe(true);
     expect(args.some((a) => a.startsWith('--lane='))).toBe(false);
+    expect(args).toContain('--wait-ms=60000');
   });
 
   it('reports pool saturation as an empty string, never a throw — the caller (deliverItem) decides what that means', () => {

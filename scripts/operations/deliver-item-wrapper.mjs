@@ -95,6 +95,7 @@
  */
 import { machinePrTitle, readMainCard } from './machine-pr-title.mjs';
 import { randomUUID } from 'node:crypto';
+import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, basename, join, resolve as resolvePath } from 'node:path';
 
@@ -753,6 +754,9 @@ export function resolveDeliveryLocus(scope) {
   return { profile: repoProfile(keys[0]), multiRepo: false };
 }
 
+/** Bounded wait for the cross-repo impl-lane acquire (was zero-wait). */
+export const IMPL_LANE_ACQUIRE_WAIT_MS = 60_000;
+
 /**
  * REAL — acquires a single-locus item's implementation lane via `acquireLane`'s UNNUMBERED shape (no tick has
  * ever assigned this item a lane NUMBER in `profile`'s own pool — only WE's tick-planner does that, for the
@@ -772,6 +776,9 @@ export function resolveDeliveryLocus(scope) {
 export function acquireImplLane({ sessionSlug, claudeSessionId, item, profile }, { run: runFn = run } = {}) {
   return acquireLane({
     sessionSlug, claudeSessionId, item, purpose: 'conveyor-delivery-impl', repo: profile.checkoutPath,
+    // A zero-wait acquire failed outright whenever another acquire's shared scan held the lock (2 Codex builds
+    // died as wrapper-threw, 2026-10-07); a bounded wait rides out that contention.
+    waitMs: IMPL_LANE_ACQUIRE_WAIT_MS,
   }, { run: runFn });
 }
 
@@ -1272,7 +1279,7 @@ const CODEX_PROVIDER = {
       );
     }
     const argv = buildCodexDeliveryArgv({
-      prompt, cwd: lanePath, denyPaths: deny, resumeThreadId, writableRoots: extraLanes, model, effort,
+      prompt, cwd: lanePath, denyPaths: deny, resumeThreadId, writableRoots: [...extraLanes, admissionLockRoot(lanePath)], model, effort,
     });
     let stdout;
     try {
