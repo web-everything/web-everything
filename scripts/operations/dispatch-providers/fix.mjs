@@ -54,11 +54,18 @@ import {
 // mechanical-dispatcher (epic #3383) Part 2 — see `build.mjs`'s own note; identical use here, keyed on the
 // repair's OPTIONAL `num` (the item, when known — see the "ITEM is optional" note below).
 import { readItemDeliveryAgentMarker } from '../delivery-agent-marker.mjs';
+import { FIX_RUN_EXECUTORS } from '../fix-run.mjs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 /** The per-dispatch process {@link fixDetachedProvider} starts. Resolved by SCRIPT LOCATION, never cwd — same
  *  reason {@link REPO_ROOT} is. */
 export const FIX_RUN_SCRIPT = join(REPO_ROOT, 'scripts', 'operations', 'fix-run.mjs');
+
+/** Card 87 follow-up — can a borrowed fix launch on `executor` from this checkout? Claude never needs the run script. */
+export function fixLauncherAvailable(executor, { exists = existsSync, runScript = FIX_RUN_SCRIPT } = {}) {
+  return executor === 'claude' || (FIX_RUN_EXECUTORS.includes(executor) && exists(runScript));
+}
 
 /**
  * THE `fix` PROVIDER (#3640). Spawns {@link FIX_RUN_SCRIPT} detached and unref'd, and returns its `pid:<n>`
@@ -101,6 +108,12 @@ export function fixDetachedProvider(request, {
   if (deliveryAgent) argv.push(`--provider=${deliveryAgent === 'claude' ? 'claude-restricted' : deliveryAgent}`);
   if (request.policyRoute?.effort) argv.push(`--effort=${request.policyRoute.effort}`);
   if (request.policyRoute?.model) argv.push(`--model=${request.policyRoute.model}`);
+  // Card 87 follow-up — a BORROWED fix hands its already-filled brief and lane facts to the launcher (see `fix-run.mjs`).
+  if (request.promptFile) argv.push(`--prompt-file=${request.promptFile}`);
+  if (request.ref) argv.push(`--ref=${request.ref}`);
+  if (request.repo) argv.push(`--repo=${request.repo}`);
+  if (request.laneRepo) argv.push(`--lane-repo=${request.laneRepo}`);
+  if (request.scope) argv.push(`--scope=${request.scope}`);
   // build-path-codex-isolation — the run record's ONE executor field comes from here: the vendor this wrapper
   // is actually told to run, never the router's recommendation (see dispatch-lane-io.mjs#dispatchExecutorFor).
   request?.reportExecutor?.(wrapperExecutorFor(deliveryAgent));

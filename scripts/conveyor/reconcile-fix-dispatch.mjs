@@ -79,7 +79,8 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
 import { describeDispatchFailure, describeSpawnFailure } from '../lib/describe-spawn-failure.mjs';
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import matter from 'gray-matter';
@@ -1017,6 +1018,14 @@ export function dispatchFix(planned, {
   // non-Claude executor launches through the fix run script instead of `claude --bg` (same brief, same review).
   borrowed = null,
   spawnBorrowed = (request) => fixDetachedProvider(request),
+  // The filled brief is handed to the non-Claude launcher as a file (it cannot ride argv); a test stubs the write.
+  writeBorrowedPrompt = (slug, text) => {
+    const dir = join(tmpdir(), 'we-fix-borrow-prompts');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, `${slug}-${Date.now()}.md`);
+    writeFileSync(file, text, { mode: 0o600 });
+    return file;
+  },
   // #x8mpubm — same never-throwing, opt-in-gated resolver `we:scripts/operations/dispatch-lane-io.mjs`'s own
   // `createDispatchSinks` uses for a fresh build dispatch; a fix dispatch is a SEPARATE fresh-dispatch call
   // site (see the `buildAgentArgv` call below) so it needs its own seam, but reuses the SAME wrapper rather
@@ -1121,6 +1130,8 @@ export function dispatchFix(planned, {
       // Card 87 — the borrowed slot belongs to a non-Claude executor: same claim and brief, other launcher.
       const handle = spawnBorrowed({
         pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
+        ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
+        promptFile: writeBorrowedPrompt(sessionSlug, withAltBranchHint(withSalvageHint(withOperatorSendBack(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch)),
         policyRoute: { provider: borrowed.executor === 'codex' ? 'codex' : 'antigravity-claude' },
       });
       return {
