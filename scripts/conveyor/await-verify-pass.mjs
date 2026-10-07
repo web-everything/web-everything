@@ -22,7 +22,7 @@
  * names the verdict's own sha. Pure core + injectable IO, like we:scripts/conveyor/load-flake-reverify.mjs.
  */
 import { execFileSync } from 'node:child_process';
-import { lstatSync, mkdtempSync, rmSync } from 'node:fs';
+import { lstatSync, mkdtempSync, rmSync, existsSync, mkdirSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -127,6 +127,8 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
       return isCiHeal(record)
         ? `${head}\n\nVerify is GREEN, but the harness could NOT push ${record.sha} to ${record.ref}: ${detail}. The remote moved: follow your ${brief(record)}'s non-fast-forward path — reconcile with the current PR head, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Never force-push, and do not exit yet.`
         : `${head}\n\nVerify is GREEN, but the harness could NOT push ${record.sha} to ${record.ref}: ${detail}. Follow your ${brief(record)}'s "push rejected because the branch moved" path (save to the alt branch, record the pause, fix-end). Never force-push.`;
+    case 'push-refused':
+      return `${head}\n\nVerify is GREEN, but the harness did NOT push ${record.sha} to ${record.ref}: ${detail}. This is not a moved branch, so rebasing or re-marking cannot help and you must not retry or push ${record.ref} yourself. Take your ${brief(record)}'s blocked-on-infra exit with that reason as the evidence, then fix-end.`;
     case 'red':
       return `${head}\n\nVerify is RED for this sha. Failing tests:\n${failureLines(marker)}\n\nRepair the failure in your lane (same scope rules), commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} If the red is only timeouts that pass alone under host load, take the brief's load-flake exit instead.`;
     case 'load-flake':
@@ -183,16 +185,16 @@ export async function runAwaitVerifyPass({
       let pending = record.pendingResume ?? null;
       if (d.action === 'push') {
         const pushed = io.push({ lane: record.lane, sha: record.sha, ref: record.ref, repo: record.repo, pr: record.pr, who: record.who, sessionId: record.sessionId });
-        if (!pushed?.ok && pushed?.transient && (record.retries ?? 0) < limits.maxRetries) {
+        if (!pushed?.ok && pushed?.transient && (record.pushRetries ?? 0) < limits.maxRetries) {
           // A network/auth hiccup is not a moved branch: retry the same push next tick.
-          io.writeRecord({ ...record, retries: (record.retries ?? 0) + 1, lastRetry: `push: ${pushed.reason}` });
+          io.writeRecord({ ...record, pushRetries: (record.pushRetries ?? 0) + 1, lastRetry: `push: ${pushed.reason}` });
           row.result = `push-retry (${pushed.reason})`;
           rows.push(row); continue;
         }
         pending = pushed?.ok
           ? { kind: 'green', detail: `pushed at ${new Date(nowMs).toISOString()}` }
-          : { kind: 'push-rejected', detail: pushed?.reason ?? 'push failed' };
-        row.result = pushed?.ok ? 'pushed' : 'push-rejected';
+          : { kind: pushed?.moved ? 'push-rejected' : 'push-refused', detail: pushed?.reason ?? 'push failed' };
+        row.result = pushed?.ok ? 'pushed' : (pushed?.moved ? 'push-rejected' : 'push-refused');
       } else if (!pending) {
         pending = { kind: d.resume, detail: d.reason };
       }
@@ -267,7 +269,7 @@ export function pushShaFromScratch({ laneGitDir, url, sha, ref, exec = execFileS
   try {
     const clean = { ...env };
     for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY']) delete clean[k];
-    const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...clean, GIT_ALTERNATE_OBJECT_DIRECTORIES: join(laneGitDir, 'objects') }, timeout };
+    const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...clean, GIT_TERMINAL_PROMPT: '0', GIT_ALTERNATE_OBJECT_DIRECTORIES: join(laneGitDir, 'objects') }, timeout };
     exec('git', ['init', '--bare', '--quiet', scratch], opts);
     // `core.hooksPath=/dev/null`: the host's global hooks (guard-git-push) are not this call's gate — the ref/PR checks in
     // `defaultAwaitVerifyIo.push` are — and a hook path is the one way git would run a script from a repo directory.
@@ -290,7 +292,9 @@ export function pushShaFromScratch({ laneGitDir, url, sha, ref, exec = execFileS
  * hash) adds `--no-ext-diff` — NOT `-c diff.external=`, which makes every `git diff` die with "cannot run ''".
  * The `guard-git-push` hook does not run (hooks are off, by design): its job is done by checks the daemon makes
  * itself, in {@link defaultAwaitVerifyIo}'s `push` — the ref must match `lane/*` (`AWAIT_VERIFY_REF_RE`, so `main` is
- * unreachable) and equal the head ref of the OPEN PR. The push itself never reads the lane's config at all:
+ * unreachable) and equal the head ref of the OPEN PR. Neither the push nor the worktree reads (`laneState`) use the
+ * lane's config at all — a daemon-owned scratch git dir with the lane's index/objects stands in for it, so a lane
+ * `filter.*` / textconv / diff driver is undefined and never runs. The push in particular:
  * {@link pushShaFromScratch} pushes to the URL GitHub reports for the PR's repo from a daemon-owned scratch repo, so
  * the PR check, the fix claim and the push target are bound to one slug (a lane `remote.origin.url`, `insteadOf`,
  * credential helper or filter driver is never consulted).
@@ -311,10 +315,10 @@ export async function defaultAwaitVerifyIo({
    */
   const prHead = (repo, pr) => {
     try {
-      const out = String(exec('gh', ['pr', 'view', String(pr), '--repo', String(repo), '--json', 'headRefName,state,url', '--jq', '.state + " " + .url + " " + .headRefName'],
+      const out = String(exec('gh', ['pr', 'view', String(pr), '--repo', String(repo), '--json', 'headRefName,state,url,isCrossRepository', '--jq', '.state + " " + .url + " " + (.isCrossRepository|tostring) + " " + .headRefName'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 60_000 })).trim();
-      const [state, url, ...rest] = out.split(' ');
-      return state && url && rest.length ? { open: state === 'OPEN', ref: rest.join(' '), remoteUrl: repoUrlFromPrUrl(url) } : null;
+      const [state, url, cross, ...rest] = out.split(' ');
+      return state && url && cross && rest.length ? { open: state === 'OPEN', ref: rest.join(' '), remoteUrl: repoUrlFromPrUrl(url), crossRepo: cross !== 'false' } : null;
     } catch { return null; }
   };
   return {
@@ -325,15 +329,32 @@ export async function defaultAwaitVerifyIo({
       if (record?.lane) clearAwaitVerifyRecord(record.lane);
     },
     laneState: (lane) => {
+      let scratch = null;
       try {
+        // Refs and the git dir are read through the lane's config (no worktree content is touched, so no filter/textconv runs).
         const head = git(lane, ['rev-parse', 'HEAD']).trim();
-        const dirty = git(lane, ['status', '--porcelain', '--untracked-files=all']).trim().length > 0;
+        const laneGitDir = git(lane, ['rev-parse', '--absolute-git-dir']).trim();
+        // Everything that reads WORKTREE CONTENT (status/diff/untracked/hash) runs against a daemon-owned scratch git dir whose
+        // config is empty, with the lane's index + objects: a lane-config `filter.*` / `diff.*.textconv` driver (selected by an
+        // in-repo .gitattributes) is then undefined, so it can never execute in the daemon (#5137 review).
+        scratch = mkdtempSync(join(tmpdir(), 'await-verify-state-'));
+        exec('git', ['init', '--bare', '--quiet', scratch], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env });
+        const exclude = join(laneGitDir, 'info', 'exclude'); // gitignore syntax only; keeps untracked-file selection equal to verify-lane's
+        if (existsSync(exclude)) { mkdirSync(join(scratch, 'info'), { recursive: true }); copyFileSync(exclude, join(scratch, 'info', 'exclude')); }
+        const owned = (args) => String(exec('git', ['--git-dir', scratch, '--work-tree', lane, ...hardening, ...args],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd: lane, env: { ...env, GIT_INDEX_FILE: join(laneGitDir, 'index'), GIT_ALTERNATE_OBJECT_DIRECTORIES: join(laneGitDir, 'objects') } })).trim();
+        const dirty = owned(['diff', '--no-ext-diff', '--no-textconv', '--name-only', head, '--']).length > 0
+          || owned(['ls-files', '--others', '--exclude-standard']).length > 0;
         // Same runner shape as verify-lane.mjs (`git(...).trim()`): an untrimmed `git diff` ends in "\n", so the hashes would never match.
-        // `--no-ext-diff` keeps a lane-config diff driver from running in the daemon (it does not change output without one).
-        const runGit = (a) => git(lane, a[0] === 'diff' ? ['diff', '--no-ext-diff', ...a.slice(1)] : a).trim();
+        const runGit = (a) => {
+          if (a[0] === 'merge-base') return git(lane, a).trim();
+          if (a[0] === 'diff') return owned(['diff', '--no-ext-diff', '--no-textconv', ...a.slice(1)]);
+          if (a[0] === 'hash-object') return owned(['hash-object', '--no-filters', ...a.slice(1)]);
+          return owned(a);
+        };
         const treeHash = dirty ? null : computeWorkingTreeHash({ runGit, fileMode: (f) => lstatSync(join(lane, f)).mode });
         return { head, dirty, treeHash };
-      } catch { return null; }
+      } catch { return null; } finally { if (scratch) rmSync(scratch, { recursive: true, force: true }); }
     },
     readMarker: (lane) => {
       try { return readVerifyMarker(git(lane, ['rev-parse', '--absolute-git-dir']).trim()); } catch { return null; }
@@ -357,19 +378,22 @@ export async function defaultAwaitVerifyIo({
       if (!head) return { ok: false, transient: true, reason: `could not resolve the head ref of ${repo} PR #${pr}` };
       if (head.ref !== ref) return { ok: false, reason: `recorded ref ${ref} is not PR #${pr}'s head (${head.ref}); refusing to push` };
       if (!head.open) return { ok: false, reason: `PR #${pr} is not open; refusing to push ${ref}` };
+      // A fork PR's head branch lives in the FORK; pushing `lane/x` to the base repo would create a stray branch and report it pushed.
+      if (head.crossRepo) return { ok: false, reason: `PR #${pr} is from a fork; refusing to push ${ref} to the base repo` };
       if (!head.remoteUrl) return { ok: false, reason: `PR #${pr}'s URL is not a github.com pull URL; refusing to push ${ref}` };
       let laneGitDir;
       try { laneGitDir = git(lane, ['rev-parse', '--absolute-git-dir']).trim(); } catch { return { ok: false, transient: true, reason: `could not read the git dir of ${lane}` }; }
       try {
         // Never --force, so a moved branch is rejected, not overwritten; never the lane's own `origin` (see pushShaFromScratch).
         const { remote } = pushShaFromScratch({ laneGitDir, url: head.remoteUrl, sha, ref, exec, env, timeout: 180_000 });
-        if (remote && lower(remote) !== lower(sha)) return { ok: false, reason: `remote ${ref} is ${remote.slice(0, 8)} after push` };
-        if (!remote) return { ok: false, reason: `remote ${ref} is missing after push` };
+        // An empty read-back (ls-remote failed after a push that succeeded) is not a rejection; only a DIFFERENT sha is.
+        if (remote && lower(remote) !== lower(sha)) return { ok: false, moved: true, reason: `remote ${ref} is ${remote.slice(0, 8)} after push` };
       } catch (e) {
         // Classify on git's WHOLE stderr: a real rejection ends in several `hint:` lines that carry none of the keywords.
         const stderr = String(e?.stderr ?? e?.message ?? e);
         const reason = stderr.trim().split('\n').filter((l) => l.trim() && !/^hint:/i.test(l)).slice(-3).join(' ').slice(0, 300);
-        return { ok: false, reason, transient: !/rejected|non-fast-forward|fetch first|stale info|hook declined|protected/i.test(stderr) };
+        const rejected = /rejected|non-fast-forward|fetch first|stale info|hook declined|protected/i.test(stderr);
+        return { ok: false, reason, transient: !rejected, moved: rejected };
       }
       return { ok: true };
     },

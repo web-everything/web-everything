@@ -1,6 +1,6 @@
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
@@ -134,16 +134,23 @@ describe('runAwaitVerifyPass', () => {
     expect(h.calls.resume[0].prompt).toContain('--attempt=2');
   });
   it('a rejected push resumes with push-rejected; a transient one retries the push next tick', async () => {
-    const h = harness({ pushResult: { ok: false, reason: '! [rejected] (non-fast-forward)' } });
+    const h = harness({ pushResult: { ok: false, moved: true, reason: '! [rejected] (non-fast-forward)' } });
     h.state.marker = marker('green');
     await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
     expect(h.calls.resume[0].prompt).toMatch(/could NOT push/);
+    // a refusal that is NOT a moved branch (claim held, PR closed, fork…) never tells the session to rebase and re-mark
+    const refused = harness({ pushResult: { ok: false, reason: 'PR #4115 is not open' } });
+    refused.state.marker = marker('green');
+    await runAwaitVerifyPass({ io: refused.io, nowMs: T0 + 60_000, ttlMs: TTL });
+    expect(refused.calls.resume[0].prompt).toMatch(/did NOT push[\s\S]*not a moved branch[\s\S]*blocked-on-infra/);
+    expect(refused.calls.resume[0].prompt).not.toMatch(/reconcile|alt branch/i);
     const t = harness({ pushResult: { ok: false, transient: true, reason: 'Could not resolve host' } });
     t.state.marker = marker('green');
     const { rows } = await runAwaitVerifyPass({ io: t.io, nowMs: T0 + 60_000, ttlMs: TTL });
     expect(rows[0].result).toMatch(/^push-retry/);
     expect(t.calls.resume).toEqual([]);
-    expect([...t.store.values()][0].retries).toBe(1);
+    expect([...t.store.values()][0].pushRetries).toBe(1); // its own budget: verify re-requests do not eat the push retries
+    expect([...t.store.values()][0].retries).toBeUndefined();
   });
   it('a busy session or a paused login keeps the pending resume; the next tick delivers it without re-pushing', async () => {
     const h = harness({ session: { sessionId: rec().sessionId, name: 'fix-4115', cwd: '/s', state: 'working' } });
@@ -243,13 +250,13 @@ describe('defaultAwaitVerifyIo — the real push and resume ports (#5137 review)
   const REMOTE_URL = 'https://github.com/chalbert/web-everything.git';
   const LANE_GIT_DIR = '/lanes/lane-5/.git';
   /** An exec double that records every call and answers git/gh like a healthy host. */
-  const fakeExec = ({ head = PR_HEAD, state = 'OPEN', remote = SHA, failPush = null } = {}) => {
+  const fakeExec = ({ head = PR_HEAD, state = 'OPEN', remote = SHA, failPush = null, cross = 'false', failLsRemote = false } = {}) => {
     const calls = [];
     const exec = (cmd, args) => {
       calls.push([cmd, ...args]);
-      if (cmd === 'gh') { if (head === null) throw new Error('gh down'); return `${state} ${PR_URL} ${head}\n`; }
+      if (cmd === 'gh') { if (head === null) throw new Error('gh down'); return `${state} ${PR_URL} ${cross} ${head}\n`; }
       if (args.includes('push')) { if (failPush) throw Object.assign(new Error(failPush), { stderr: failPush }); return ''; }
-      if (args.includes('ls-remote')) return `${remote}\trefs/heads/${PR_HEAD}\n`;
+      if (args.includes('ls-remote')) { if (failLsRemote) throw new Error('network blip'); return `${remote}\trefs/heads/${PR_HEAD}\n`; }
       if (args.includes('--absolute-git-dir')) return `${LANE_GIT_DIR}\n`;
       return '';
     };
@@ -296,9 +303,27 @@ describe('defaultAwaitVerifyIo — the real push and resume ports (#5137 review)
     }
   });
 
+  it('refuses a fork PR (its head branch is not in the base repo), without pushing', async () => {
+    const { exec, calls } = fakeExec({ cross: 'true' });
+    expect((await build(exec)).push(pushArg())).toMatchObject({ ok: false, reason: expect.stringMatching(/fork/) });
+    expect(gitPushes(calls)).toEqual([]);
+  });
+
+  it('a push that succeeded but whose ls-remote read-back failed is ok (not reported to the agent as a rejection)', async () => {
+    const { exec } = fakeExec({ failLsRemote: true });
+    expect((await build(exec)).push(pushArg())).toEqual({ ok: true });
+  });
+
+  it('only a git rejection (or a remote at another sha) is `moved`; refusals and network errors are not', async () => {
+    expect(await (await build(fakeExec({ failPush: '! [rejected] (fetch first)' }).exec)).push(pushArg())).toMatchObject({ moved: true });
+    expect((await build(fakeExec({ remote: OTHER }).exec)).push(pushArg())).toMatchObject({ ok: false, moved: true });
+    expect((await build(fakeExec({ state: 'MERGED' }).exec)).push(pushArg()).moved).toBeUndefined();
+    expect(await (await build(fakeExec({ failPush: 'fatal: Could not resolve host' }).exec)).push(pushArg())).toMatchObject({ transient: true, moved: false });
+  });
+
   it('refuses a PR URL that is not a github.com pull URL, without pushing', async () => {
     const calls = [];
-    const exec = (cmd, args) => { calls.push([cmd, ...args]); return cmd === 'gh' ? `OPEN https://evil.example/o/r/pull/4115 ${PR_HEAD}\n` : ''; };
+    const exec = (cmd, args) => { calls.push([cmd, ...args]); return cmd === 'gh' ? `OPEN https://evil.example/o/r/pull/4115 false ${PR_HEAD}\n` : ''; };
     const result = (await build(exec)).push(pushArg());
     expect(result).toMatchObject({ ok: false });
     expect(gitPushes(calls)).toEqual([]);
@@ -458,16 +483,34 @@ describe('real git: the daemon\'s lane tree hash equals the one verify-lane reco
     expect(state.treeHash).toBe(committed);
   });
 
-  it('a lane-config diff.external driver is never run by the daemon, and does not change the hash', async () => {
+  it('no lane-config driver (diff.external, filter clean/smudge, textconv, via an in-repo .gitattributes) ever runs in the daemon, clean OR dirty lane, and the hash is unchanged', async () => {
     const L = mkLane(); dirs.push(L.root);
     const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    writeFileSync(join(L.lane, '.gitattributes'), 'a.txt filter=ev diff=ev\n');
+    git(L.lane, ['add', '.gitattributes']); git(L.lane, [...identity, 'commit', '-m', 'attrs']);
     const before = io.laneState(L.lane).treeHash;
+    expect(before).toMatch(/^[0-9a-f]{64}$/);
     const ran = join(L.root, 'driver-ran');
     const driver = join(L.root, 'driver.sh');
-    writeFileSync(driver, `#!/bin/sh\ntouch ${ran}\n`, { mode: 0o755 });
-    git(L.lane, ['config', 'diff.external', driver]);
+    writeFileSync(driver, `#!/bin/sh\ntouch ${ran}\ncat\n`, { mode: 0o755 });
+    for (const [k, v] of [['diff.external', driver], ['filter.ev.clean', driver], ['filter.ev.smudge', driver], ['diff.ev.textconv', driver]]) git(L.lane, ['config', k, v]);
+    // stat-dirty the tracked file (same content, new mtime) so git has to re-read it through any clean filter
+    const future = new Date(Date.now() + 60_000);
+    utimesSync(join(L.lane, 'a.txt'), future, future);
     expect(io.laneState(L.lane).treeHash).toBe(before);
+    writeFileSync(join(L.lane, 'a.txt'), 'edited\n'); // dirty lane
+    expect(io.laneState(L.lane)).toMatchObject({ dirty: true, treeHash: null });
     expect(existsSync(ran)).toBe(false);
+  });
+
+  it('the lane\'s info/exclude keeps untracked-file selection equal to verify-lane\'s, so the hash still matches', async () => {
+    const L = mkLane(); dirs.push(L.root);
+    writeFileSync(join(L.lane, 'litter.tmp'), 'x\n');
+    writeFileSync(join(L.lane, '.git', 'info', 'exclude'), '*.tmp\n');
+    const verifyLaneRunner = (a) => git(L.lane, a).trim();
+    const expected = computeWorkingTreeHash({ runGit: verifyLaneRunner, fileMode: (f) => lstatSync(join(L.lane, f)).mode });
+    const io = await (await import('../await-verify-pass.mjs')).defaultAwaitVerifyIo({ weRoot: '/we', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+    expect(io.laneState(L.lane)).toMatchObject({ dirty: false, treeHash: expected });
   });
 
   it('pushShaFromScratch pushes the lane commit (objects via alternates) to the GIVEN url, ignoring a lane config that points origin and insteadOf elsewhere', () => {
