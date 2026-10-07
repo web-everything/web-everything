@@ -34,6 +34,10 @@ node scripts/operations/coroner-extract.mjs --since=<ISO|last> --json > "$SCRATC
   - `mergeConflicts`: conflict events per PR opened (newly CONFLICTING PRs, conflict-fix sessions and rounds, mechanical
     rebases, drain overlap-yield and scope-overlap waits), with minutes and `beforeAfter` the scoping cutoff
     (2026-10-06 19:00Z, override `WE_CORONER_SCOPING_CUTOFF`). Always state the before/after verdict.
+  - `byKind`: the per-PR metrics (`ci`, `fixSessions` + rounds, `mergeConflicts`, `timeToMerge`, `prsOpened`) split into
+    `card-only` (every changed path under `backlog/`, the `scripts/ci-card-only.mjs` rule) and `code` PRs, and
+    `builderLaunches.byKind` (`build`, `prevention-card`, `prepare`). Card-only work is a different difficulty:
+    always show both columns and never blend them in a ranking or a conclusion.
   - `daemonErrors`: `smokeFailures`, `concurrentMover`, `tickInProgress`, `rateLimit`, `ghReadFailures`, by daemon.
     Log lines are attributed to the nearest preceding timestamp, and "(repeated N times ...)" lines are expanded.
   Where it exists, `minutes` is time lost (marker or session duration), which is what step 2 ranks on.

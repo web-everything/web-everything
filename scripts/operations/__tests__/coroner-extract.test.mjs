@@ -23,7 +23,7 @@ const run = (args = []) => runCoroner([`--since=${since}`, '--json', '--no-save'
 
 beforeEach(() => {
   root = fs.mkdtempSync(join(tmpdir(), 'coroner-'));
-  env = Object.fromEntries(['JOBS', 'JOBS_ARCHIVE', 'PROJECTS', 'DAEMON_DIR', 'VERIFY_LOG', 'ADMISSION', 'LANES', 'STATE', 'COORD'].map((key) => [`WE_CORONER_${key}`, join(root, key.toLowerCase())]));
+  env = Object.fromEntries(['JOBS', 'JOBS_ARCHIVE', 'PROJECTS', 'DAEMON_DIR', 'VERIFY_LOG', 'ADMISSION', 'LANES', 'STATE', 'COORD', 'BACKLOG'].map((key) => [`WE_CORONER_${key}`, join(root, key.toLowerCase())]));
 });
 afterEach(() => { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); });
 
@@ -263,7 +263,7 @@ describe('coroner error rates (reported first)', () => {
     const jobs = { 1: ['test (2/4)'], 3: ['test (1/4)', 'smoke'], 5: ['soak shard 2'] };
     const calls = [];
     const gh = (args) => {
-      if (args[1].includes('/pulls?')) return [];
+      if (args[1].includes('/pulls')) return [];
       calls.push(args[1]);
       const m = args[1].match(/runs\/(\d+)\/jobs/);
       if (m) return { jobs: (jobs[m[1]] ?? []).map((name) => ({ name, conclusion: 'failure' })) };
@@ -364,6 +364,39 @@ describe('coroner error rates (reported first)', () => {
     expect(c.beforeAfter.cutoff).toBe(at(30));
     expect(c.beforeAfter.before).toMatchObject({ count: 4, prsOpened: 2, hours: 0.5 });
     expect(c.beforeAfter.after).toMatchObject({ count: 2, prsOpened: 1 });
+  });
+
+  it('splits every per-PR metric into card-only vs code PRs (and builder launches by kind)', () => {
+    const wf = (id, conclusion, sha, pr, min) => ({ id, name: 'CI', conclusion, head_sha: sha, pull_requests: [{ number: pr }], run_attempt: 1, created_at: at(min), updated_at: at(min + 2) });
+    job('a', 'fix-101', 10, { detail: 'PR 101 fix pushed' });
+    job('b', 'fix-101', 20, { detail: 'PR 101 fix pushed' });
+    job('c', 'fix-202', 5, { detail: 'PR 202 rebased onto main, conflict resolved' });
+    write(join(env.WE_CORONER_BACKLOG, '55-prevention-add-a-guard.md'), 'x');
+    write(join(env.WE_CORONER_BACKLOG, '66-real-feature.md'), 'x');
+    write(join(env.WE_CORONER_DAEMON_DIR, 'fix-dispatch-daemon.log'), `${at(5)} {"results":[{"num":101,"isConflicting":true,"remove":[],"newlyDetected":true},{"num":202,"isConflicting":true,"remove":[],"newlyDetected":true}]}\n`);
+    const row = (min, dispatched, prepare) => JSON.stringify({ at: at(min), dispatched, failures: [], prepare });
+    write(join(env.WE_CORONER_COORD, 'build-dispatch-daemon.log'), [row(1, [{ num: '55' }, { num: '66' }], { launched: [{ num: '77' }], failures: [{ num: '78', stage: 'dispatch', reason: 'x' }] })].join('\n') + '\n');
+    const gh = (args) => {
+      const f = args[1].match(/pulls\/(\d+)\/files/);
+      if (f) return f[1] === '101' ? [{ filename: 'backlog/1-a.md' }, { filename: 'backlog/2-b.md' }] : [{ filename: 'backlog/1-a.md' }, { filename: 'scripts/x.mjs' }];
+      if (args[1].includes('/pulls?')) return [{ number: 101, created_at: at(1), merged_at: at(31) }, { number: 202, created_at: at(2), merged_at: at(12) }];
+      if (args[1].includes('/actions/runs?')) return { workflow_runs: [wf(1, 'failure', 'aaa', 101, 3), wf(2, 'failure', 'bbb', 202, 4), wf(3, 'success', 'ccc', 202, 5)] };
+      return { jobs: [] };
+    };
+    env.WE_CORONER_BACKLOG = join(root, 'backlog');
+    write(join(env.WE_CORONER_BACKLOG, '55-prevention-add-a-guard.md'), 'x');
+    write(join(env.WE_CORONER_BACKLOG, '66-real-feature.md'), 'x');
+    const e = run0(gh).metrics.errorRates;
+    expect(e.byKind['card-only']).toMatchObject({ prsOpened: 1, timeToMerge: { merged: 1, medianMin: 30 } });
+    expect(e.byKind.code).toMatchObject({ prsOpened: 1, timeToMerge: { merged: 1, medianMin: 10 } });
+    expect(e.byKind['card-only'].ci).toMatchObject({ count: 1, total: 1 });
+    expect(e.byKind.code.ci).toMatchObject({ count: 1, total: 2 });
+    expect(e.byKind['card-only'].fixSessions.rounds).toMatchObject({ prs: 1, max: 2 });
+    expect(e.byKind.code.fixSessions).toMatchObject({ total: 1 });
+    expect(e.byKind['card-only'].mergeConflicts).toMatchObject({ count: 1, prsOpened: 1 });
+    expect(e.byKind.code.mergeConflicts.causes).toHaveProperty('conflict-fix-session');
+    const b = e.builderLaunches.byKind;
+    expect([b.build.launched, b['prevention-card'].launched, b.prepare.launched, b.prepare.count]).toEqual([1, 1, 1, 1]);
   });
 
   it('rateMetric reports count, total, percent and two examples at most', () => {
