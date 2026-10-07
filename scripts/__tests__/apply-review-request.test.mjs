@@ -25,9 +25,12 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import yaml from 'js-yaml';
+import { LEDGER_DIR, LEDGER_TRANSPORT_BRANCH, appendLedgerRows, ledgerGitPath } from '../lib/verdict-ledger-io.mjs';
+import { buildVerdictRecord } from '../lib/verdict-ledger.mjs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve as resolvePath, sep } from 'node:path';
 import {
   APPLIABLE_TARGETS, REPO_ROOT, REPO_ROOT_FLAG, buildEnv, buildLabelArgv, main, resolveVerdictedRoot,
   validateRequest,
@@ -288,5 +291,240 @@ describe('the checkout the child is pinned to', () => {
       expect(main([path, '--check'], { spawn, originRepo: originExplodes, cwd: REPO_ROOT })).toBe(0);
     } finally { cleanup(); }
     expect(calls).toHaveLength(0);
+  });
+});
+
+/**
+ * Ledger plan slice C3 (#3255 part 3): the applier workflow may push ledger rows, and a ledger-only push must
+ * not re-trigger it. The workflow's permissions and trigger filter are the contract, so they are asserted
+ * on the parsed YAML, not by grepping text.
+ */
+describe('the applier workflow can push ledger rows without re-triggering itself (C3)', () => {
+  const wf = yaml.load(readFileSync(join(REPO_ROOT, '.github', 'workflows', 'apply-review-request.yml'), 'utf8'));
+  const push = wf.on.push;
+
+  it('has contents: write and keeps the other grants exactly as narrow as before', () => {
+    expect(wf.permissions).toEqual({ 'pull-requests': 'write', issues: 'write', contents: 'write' });
+  });
+
+  it('triggers only on the transport branch', () => {
+    expect(push.branches).toEqual([LEDGER_TRANSPORT_BRANCH]);
+  });
+
+  it('has a path filter that leaves the ledger directory out', () => {
+    expect(push.paths).toEqual([`${LEDGER_TRANSPORT_BRANCH}/*.json`]);
+    const ledgerFile = ledgerGitPath('web-everything/web-everything');
+    expect(ledgerFile.startsWith(`${LEDGER_DIR}/`)).toBe(true);
+    // GitHub's `*` does not cross `/`: a pattern matches a file only at the same directory depth.
+    const matches = (pattern, file) => new RegExp(`^${pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*')}$`).test(file);
+    for (const pattern of push.paths) expect(matches(pattern, ledgerFile)).toBe(false);
+    expect(matches(push.paths[0], `${LEDGER_TRANSPORT_BRANCH}/request-1.json`)).toBe(true);
+  });
+
+  it('checks out main and sets a git identity before applying', () => {
+    const steps = wf.jobs.apply.steps;
+    const checkout = steps.find((s) => String(s.uses ?? '').startsWith('actions/checkout'));
+    expect(checkout.with.ref).toBe('main');
+    const identity = steps.findIndex((s) => /user\.email/.test(s.run ?? ''));
+    const apply = steps.findIndex((s) => /apply-review-request\.mjs/.test(s.run ?? ''));
+    expect(identity).toBeGreaterThan(-1);
+    expect(identity).toBeLessThan(apply);
+  });
+});
+
+/**
+ * THE WRITE TOKEN'S REACH (PR #4318 review, security/least-privilege). `contents: write` makes GITHUB_TOKEN a
+ * push credential. Left in `.git/config` by the checkout it would be readable by every later step, including
+ * `npm ci` and every `node` process that loads node_modules. So the checkout must not persist it, and the
+ * token may be handed only to the steps that need it, each by name. A new step that mentions the token, or a
+ * checkout that persists it again, reddens here.
+ */
+describe('the write token is not left lying around for the whole job (C3)', () => {
+  const wf = yaml.load(readFileSync(join(REPO_ROOT, '.github', 'workflows', 'apply-review-request.yml'), 'utf8'));
+  const steps = wf.jobs.apply.steps;
+  const mentionsToken = (s) => /secrets\.GITHUB_TOKEN|github\.token|GH_TOKEN|GITHUB_TOKEN/.test(JSON.stringify(s));
+  const checkout = steps.find((s) => String(s.uses ?? '').startsWith('actions/checkout'));
+  const collect = steps.find((s) => s.id === 'collect');
+  const apply = steps.find((s) => /apply-review-request\.mjs/.test(s.run ?? ''));
+
+  it('does not persist the checkout credential into .git/config', () => {
+    expect(checkout.with['persist-credentials']).toBe(false);
+    // Neither may a custom token be smuggled in through the checkout itself, which would persist nothing but
+    // would also bypass the by-name list below.
+    expect(checkout.with.token).toBeUndefined();
+  });
+
+  it('hands the token to exactly the collect and apply steps, and to no other step', () => {
+    expect(steps.filter(mentionsToken)).toEqual([collect, apply]);
+  });
+
+  it('cannot reach the other steps through a job- or workflow-level env, a second checkout, or a job container', () => {
+    expect(wf.env).toBeUndefined();
+    expect(wf.jobs.apply.env).toBeUndefined();
+    expect(wf.jobs.apply.container).toBeUndefined();
+    expect(steps.filter((s) => String(s.uses ?? '').startsWith('actions/checkout'))).toEqual([checkout]);
+    expect(Object.keys(wf.jobs)).toEqual(['apply']);
+  });
+
+  it('guards against an empty credential before exporting the header', () => {
+    expect(apply.run).toMatch(/\[ -n "\$basic" \]/);
+    expect(apply.run.search(/\[ -n "\$basic" \]/)).toBeLessThan(apply.run.indexOf('GIT_CONFIG_KEY_0'));
+  });
+
+  it('keeps the token away from the install step', () => {
+    const install = steps.find((s) => /npm ci/.test(s.run ?? ''));
+    expect(install).toBeDefined();
+    expect(mentionsToken(install)).toBe(false);
+    expect(install.env).toBeUndefined();
+  });
+
+  it('gives the apply step a git credential so the ledger push still authenticates', () => {
+    const header = /GIT_CONFIG_KEY_0=http\.https:\/\/github\.com\/\.extraheader/;
+    expect(apply.run).toMatch(header);
+    expect(apply.run).toMatch(/GIT_CONFIG_COUNT=1/);
+    // Exported BEFORE the loop that runs the applier, and masked so a log line cannot print it.
+    expect(apply.run.search(header)).toBeLessThan(apply.run.indexOf('node scripts/apply-review-request.mjs'));
+    expect(apply.run).toMatch(/::add-mask::/);
+  });
+
+  it('gives the collect step the credential for `git fetch` only, never for its node process', () => {
+    const lines = collect.run.split('\n');
+    const nodeLine = lines.find((l) => /node scripts\/collect-review-requests\.mjs/.test(l));
+    expect(nodeLine).toMatch(/env -u \S+ node scripts\/collect-review-requests\.mjs/);
+    // Every fetch goes through the helper that attaches the header to that one command.
+    const fetches = lines.filter((x) => !/^\s*#/.test(x) && /\bfetch\b/.test(x));
+    expect(fetches.length).toBeGreaterThanOrEqual(2);
+    for (const l of fetches) expect(l).toMatch(/authed_git fetch/);
+  });
+});
+
+/**
+ * THE PUSH'S CONTAINMENT (PR #4318 review, security/test-coverage). `contents: write` cannot be scoped to one
+ * branch, so the narrowing is the push itself: one explicit refspec to the transport branch, never forced.
+ * Prose in the workflow said so and nothing tested it. These drive the REAL io-shell with a recording `git`
+ * and pin the argv, so a later `--force`, a `+` refspec, or a push to another ref reddens here.
+ */
+describe('the ledger push can only fast-forward the transport branch (C3)', () => {
+  const REPO = 'web-everything/web-everything';
+  const record = buildVerdictRecord({
+    repo: REPO, pr: 4318, verdict: 'accepted', at: '2026-10-07T12:00:00.000Z', source: 'test',
+  });
+
+  function pushArgvFor(records) {
+    const calls = [];
+    const run = (args, opts) => { calls.push(Object.assign([...args], { cwd: opts?.cwd })); return args[0] === 'diff' ? 'verdict-ledger/x.jsonl\n' : ''; };
+    appendLedgerRows({
+      board: '/board', repo: REPO, records, run, sleep: () => {}, now: () => 1,
+      mkdir: () => {}, write: () => {}, read: () => null, rm: () => {},
+    });
+    return calls;
+  }
+
+  // The ledger-row shape is owned by verdict-ledger.mjs; when it refuses this fixture, fail loudly rather than
+  // silently pinning nothing.
+  const calls = (() => { try { return pushArgvFor([record]); } catch (e) { return e; } })();
+
+  it('builds a valid fixture row (guards the cases below from pinning nothing)', () => {
+    expect(calls).toBeInstanceOf(Array);
+  });
+
+  it('pushes exactly HEAD to the transport branch: no force, no plus-refspec, no other ref', () => {
+    const pushes = calls.filter((a) => a[0] === 'push');
+    expect(pushes.map((a) => [...a])).toEqual([['push', '--quiet', 'origin', `HEAD:${LEDGER_TRANSPORT_BRANCH}`]]);
+  });
+
+  it('pushes from the dedicated transport worktree, never from the board checkout it was called with', () => {
+    const [push] = calls.filter((a) => a[0] === 'push');
+    expect(push.cwd).toMatch(/^\/board\/\.operations\/transport\/wt-/);
+    // Every git call that touches refs or the index runs in the worktree too, so the caller's lane is untouched.
+    for (const a of calls.filter((x) => ['checkout', 'add', 'commit', 'push'].includes(x[0]))) {
+      expect(a.cwd).toMatch(/\/\.operations\/transport\/wt-/);
+    }
+  });
+
+  it('never invokes a git subcommand that writes a ref other than the transport branch', () => {
+    const refWriters = calls.filter((a) => ['push', 'update-ref', 'tag', 'branch', 'symbolic-ref'].includes(a[0]));
+    expect(refWriters.map((a) => a[0])).toEqual(['push']);
+  });
+
+  it('keeps the transport branch name pinned to the one the workflow listens on', () => {
+    expect(LEDGER_TRANSPORT_BRANCH).toBe('ops/review-requests');
+  });
+});
+
+/**
+ * The same containment, from the other side: no OTHER code on the ledger path may push. Scans the static import
+ * closure of the ledger io-shell (and the applier's own two scripts) for a git push and pins the per-file count
+ * of every push site found. Comments are skipped; a new push anywhere in this closure changes the map.
+ */
+describe('no other code on the ledger path pushes (C3)', () => {
+  const SCRIPTS = join(REPO_ROOT, 'scripts');
+  const TRANSPORT = 'scripts/lib/git-transport-branch.mjs';
+  // The ledger append's push is the transport's. The other files are in the STATIC import closure only because
+  // the verdict-ledger / review-escalation modules import them; they push lane refs, not the transport branch,
+  // and are not on the ledger-append call path. They are pinned by count rather than ignored: a NEW push in any
+  // file here, or in a file newly pulled into the closure, changes this map and must be reviewed on purpose.
+  // (`fix-procedure.mjs` counts three because one hit is the `cmd === 'push'` CLI verb, not a git call.)
+  const KNOWN_PUSH_SITES = {
+    [TRANSPORT]: 1,
+    'scripts/lib/rebase-drop-manifest.mjs': 1,
+    'scripts/lib/nnn-collision-heal.mjs': 1,
+    'scripts/conveyor/fix-procedure.mjs': 3,
+  };
+  const rel = (f) => f.slice(REPO_ROOT.length + 1).split(sep).join('/');
+
+  function closure(roots) {
+    const seen = new Set();
+    const queue = [...roots];
+    while (queue.length) {
+      const f = queue.pop();
+      if (seen.has(f) || !existsSync(f)) continue;
+      seen.add(f);
+      const text = readFileSync(f, 'utf8');
+      for (const m of text.matchAll(/(?:from\s+|import\(\s*)['"](\.{1,2}\/[^'"]+)['"]/g)) queue.push(resolvePath(dirname(f), m[1]));
+    }
+    return seen;
+  }
+
+  const files = closure([join(SCRIPTS, 'lib', 'verdict-ledger-io.mjs')]);
+  files.add(join(SCRIPTS, 'apply-review-request.mjs'));
+  files.add(join(SCRIPTS, 'collect-review-requests.mjs'));
+
+  const pushSites = [];
+  for (const f of files) {
+    readFileSync(f, 'utf8').split('\n').forEach((line, i) => {
+      if (/^\s*(\/\/|\*|\/\*)/.test(line)) return;
+      if (/['"`]push['"`]|\bgit\s+push\b|\bpush\s+(--|origin)/.test(line)) pushSites.push(`${rel(f)}:${i + 1}`);
+    });
+  }
+
+  it('scans the ledger io-shell and its transport', () => {
+    expect([...files].map(rel)).toEqual(expect.arrayContaining([
+      'scripts/lib/verdict-ledger-io.mjs', 'scripts/lib/git-transport-branch.mjs',
+      'scripts/apply-review-request.mjs', 'scripts/collect-review-requests.mjs',
+    ]));
+  });
+
+  it('finds exactly the known push sites per file, so a new one cannot appear unnoticed', () => {
+    const perFile = {};
+    for (const s of pushSites) { const f = s.slice(0, s.lastIndexOf(':')); perFile[f] = (perFile[f] ?? 0) + 1; }
+    expect(perFile).toEqual(KNOWN_PUSH_SITES);
+  });
+
+  // The spawned child holds the same token as the applier but is reached by `spawnSync`, not an import, so the
+  // closure above would never see it. Its OWN source is scanned directly (its static closure is ~190 files of
+  // unrelated daemon code, which this test deliberately does not own): it may not push, merge, or write refs or
+  // file contents through the GitHub API. Same for the applier, the collector, and the io-shell.
+  it('the applier, its spawned child, the collector and the io-shell contain no GitHub write path of their own', () => {
+    const writeShape = /\bgit\s+push\b|['"`]push['"`]|['"`]merge['"`]|pr\s+merge\b|\/git\/refs|\/contents\/|\brelease\s+(create|upload)\b|-X\s+(PUT|DELETE|PATCH)\b|--method\s+(PUT|DELETE|PATCH)\b/;
+    const direct = ['apply-review-request.mjs', 'review-set-label.mjs', 'collect-review-requests.mjs', join('lib', 'verdict-ledger-io.mjs')];
+    const hits = [];
+    for (const name of direct) {
+      readFileSync(join(SCRIPTS, name), 'utf8').split('\n').forEach((line, i) => {
+        if (/^\s*(\/\/|\*|\/\*)/.test(line)) return;
+        if (writeShape.test(line)) hits.push(`scripts/${name.split(sep).join('/')}:${i + 1}`);
+      });
+    }
+    expect(hits).toEqual([]);
   });
 });
