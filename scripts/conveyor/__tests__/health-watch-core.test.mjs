@@ -1149,3 +1149,15 @@ describe('xyx5mea stuck PR duration', () => {
     expect(notify(r)).toEqual([]);
   });
 });
+
+import { recordPrRefusal } from '../health-watch-core.mjs';
+describe('recordPrRefusal keeps the owner-state reason', () => {
+  it('timeout-retry-ineligible never masks the same tick\'s real refusal (PR #4141)', () => {
+    const m = {};
+    recordPrRefusal(m, { pr: 'w#1', reason: 'refused fix-loop-hold: 3 sessions' }, 5);
+    recordPrRefusal(m, { pr: 'w#1', reason: 'reconcile-refused timeout-retry-ineligible' }, 5);
+    expect(m['w#1'].reason).toMatch(/fix-loop-hold/);
+    recordPrRefusal(m, { pr: 'w#1', reason: 'reconcile-refused timeout-retry-ineligible' }, 6);
+    expect(m['w#1'].at).toBe(6);
+  });
+});
