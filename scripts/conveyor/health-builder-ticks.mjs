@@ -29,7 +29,14 @@ export function parseBuilderTick(line) {
   const frozen = cap ? cap.frozen === true : r.freeze?.frozen === true;
   const capacityFree = cap ? cap.free === true
     : !frozen && (Array.isArray(r.prepare.inFlight) ? r.prepare.inFlight.length : 0) < 2;
-  return { at, launched, queued, capacityFree, frozen };
+  // builder-starved-2 — prepares are watched on their own: one lone build launch must not hide a prepare pipeline
+  // that has planned nothing for hours (live 16:59Z–18:49Z 2026-10-07: 1 build, 0 prepares, 280 needs-prepare).
+  const prepareLaunched = (Array.isArray(r.prepare.launched) ? r.prepare.launched : []).map((x) => String(x?.num ?? '')).filter(Boolean);
+  const holds = Array.isArray(r.buildHolds) ? r.buildHolds : [];
+  const needsPrepare = holds.filter((h) => h?.reason === 'needs-prepare' || h?.reason === 'prepare-stale').length;
+  const prepareSlotsFree = cap && Number.isFinite(Number(cap.prepareSlots)) ? Number(cap.prepareSlots) > 0
+    : (Array.isArray(r.prepare.inFlight) ? r.prepare.inFlight.length : 0) < 2;
+  return { at, launched, queued, capacityFree, frozen, prepareLaunched, needsPrepare, prepareSlotsFree, prepareEnabled: r.prepare.enabled !== false };
 }
 
 /** Fold a log sample's text into the builder memory. Records older than the memory's last tick are skipped. */
@@ -41,6 +48,11 @@ export function foldBuilderTicks(prev, text) {
     if (!t) continue;
     if (out && Number.isFinite(out.lastTickAt) && t.at <= out.lastTickAt) continue;
     out = out ?? { firstSeenAt: t.at, lastLaunchAt: null, lastLaunch: null, lastTickAt: null, ticksSeen: 0 };
+    if (!Number.isFinite(out.prepareFirstSeenAt)) out.prepareFirstSeenAt = t.at;
+    out.needsPrepare = t.needsPrepare;
+    out.prepareSlotsFree = t.prepareSlotsFree;
+    out.prepareEnabled = t.prepareEnabled;
+    if (t.prepareLaunched.length) { out.lastPrepareLaunchAt = t.at; out.lastPrepareLaunch = t.prepareLaunched.slice(0, 8); }
     out.ticksSeen = (out.ticksSeen ?? 0) + 1;
     out.lastTickAt = t.at;
     out.queued = t.queued;

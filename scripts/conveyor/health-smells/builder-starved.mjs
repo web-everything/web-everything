@@ -19,8 +19,15 @@ export function builderStarvedVerdict(builder, { now, limitMinutes }) {
   const queued = Number(builder.queued) || 0;
   // A builder that stopped ticking is `daemon-silent`'s case, not this one: only judge a fresh last tick.
   const fresh = now - builder.lastTickAt <= Math.max(15 * MINUTE, limitMinutes * MINUTE);
-  const breach = fresh && queued > 0 && builder.capacityFree === true && builder.frozen !== true && idleMs >= limitMinutes * MINUTE;
-  return { breach, idleMs, queued, since, knownSince: Number.isFinite(builder.lastLaunchAt) };
+  const allIdle = fresh && queued > 0 && builder.capacityFree === true && builder.frozen !== true && idleMs >= limitMinutes * MINUTE;
+  // builder-starved-2 — the prepare pipeline on its own: cards wait for a prepare, a prepare slot is free, and no
+  // prepare launched for the limit, even if a lone build launched meanwhile (that build reset `idleMs` live).
+  const prepareSince = Number.isFinite(builder.lastPrepareLaunchAt) ? builder.lastPrepareLaunchAt : builder.prepareFirstSeenAt;
+  const prepareIdleMs = Number.isFinite(prepareSince) ? Math.max(0, now - prepareSince) : 0;
+  const prepareStarved = fresh && builder.prepareEnabled !== false && (Number(builder.needsPrepare) || 0) > 0
+    && builder.prepareSlotsFree === true && builder.frozen !== true && prepareIdleMs >= limitMinutes * MINUTE;
+  return { breach: allIdle || prepareStarved, idleMs: allIdle ? idleMs : prepareStarved ? prepareIdleMs : idleMs, queued, since,
+    knownSince: Number.isFinite(builder.lastLaunchAt), prepareStarved: prepareStarved && !allIdle, prepareIdleMs };
 }
 
 export default {
@@ -42,8 +49,11 @@ export default {
       subject: 'build-dispatch-daemon',
       breach: v.breach,
       measure: { idleMinutes: Math.round(v.idleMs / MINUTE), limitMinutes, queued: v.queued, capacityFree: builder.capacityFree === true,
-        lastLaunchAt: v.knownSince ? new Date(builder.lastLaunchAt).toISOString() : null, lastLaunch: builder.lastLaunch ?? null },
-      summary: `build-dispatch-daemon: ${v.queued} queued and free capacity, but no build or prepare launched for ${idle}${v.knownSince ? '' : ' (no launch seen since the watch started reading)'} (limit ${limitMinutes}m).`,
+        lastLaunchAt: v.knownSince ? new Date(builder.lastLaunchAt).toISOString() : null, lastLaunch: builder.lastLaunch ?? null,
+        prepareStarved: v.prepareStarved, needsPrepare: Number(builder.needsPrepare) || 0, prepareIdleMinutes: Math.round(v.prepareIdleMs / MINUTE) },
+      summary: v.prepareStarved
+        ? `build-dispatch-daemon: ${builder.needsPrepare} cards need a prepare and a prepare slot is free, but no prepare launched for ${idle} (limit ${limitMinutes}m).`
+        : `build-dispatch-daemon: ${v.queued} queued and free capacity, but no build or prepare launched for ${idle}${v.knownSince ? '' : ' (no launch seen since the watch started reading)'} (limit ${limitMinutes}m).`,
       recommendation: 'Run `node skills-src/conveyor/build-dispatch-daemon.mjs --dry-run --json` in a lane: if prepare.planned is empty, read the tick core notes (queue-cap, prepare-ahead-window, prepare-no-lane) and buildHolds, and fix the gate that holds every card.',
     }];
   },

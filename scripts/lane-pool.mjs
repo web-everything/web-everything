@@ -72,6 +72,7 @@
  */
 import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir, hostname } from 'node:os';
 import { join, basename, resolve, dirname, sep } from 'node:path';
@@ -90,7 +91,7 @@ import { ghRestGetPaged } from './lib/gh-rest-read.mjs';
 // this repo's own isolation boundary (#2123/#104), so the CLI's guard is redundant for ANY session working in
 // one — dispatched or a human-driven single session alike — without ever touching the primary checkout.
 import { ensureWorktreeIsolationOff } from './lib/dispatch-bg-isolation.mjs';
-import { guardedPoolRoot, referenceArgs } from './lib/lane-pool-paths.mjs';
+import { guardedPoolRoot, referenceArgs, checkoutRootFor } from './lib/lane-pool-paths.mjs';
 import {
   LEASE_FILENAME,
   DEFAULT_LEASE_TTL_MINUTES,
@@ -296,7 +297,13 @@ const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) 
 // every other call in this file (and a test wanting a fast bounded-hang proof) also tunes this one, while a
 // production run with no override still gets the tighter 15s ceiling, not the generic 5-minute default.
 const LOCAL_GIT_TIMEOUT_MS = Math.min(resolveChildTimeoutMs(), 15_000);
-const CHECKOUT_ROOT = tryGit(['rev-parse', '--show-toplevel'], process.cwd(), { timeout: LOCAL_GIT_TIMEOUT_MS }) || process.cwd();
+// builder-starved-2 (2026-10-07) — a dispatched agent starts in a fresh scratch cwd that is NOT a git repo (#4174)
+// and runs `node "<WE_ROOT>/scripts/lane-pool.mjs" acquire …` with no `--repo`. The cwd fallback then found no origin
+// and every prepare failed with `could not determine an origin URL`. Outside any git work tree, the checkout this
+// script lives in is the honest answer (it IS `<WE_ROOT>`), for both the pool root and the repo to acquire from.
+const CWD_TOP_LEVEL = tryGit(['rev-parse', '--show-toplevel'], process.cwd(), { timeout: LOCAL_GIT_TIMEOUT_MS });
+const SCRIPT_CHECKOUT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const CHECKOUT_ROOT = checkoutRootFor({ cwdTopLevel: CWD_TOP_LEVEL, scriptCheckout: SCRIPT_CHECKOUT, cwd: process.cwd() });
 // #3383 — `guardedPoolRoot` (not the bare `defaultPoolRoot`) so a vitest run that spawns this CLI for real with
 // no pool-root override fails LOUDLY and immediately, instead of quietly hammering the shared real pool (see
 // that function's own header for the incident this closes). `fail` is a hoisted function declaration further
@@ -314,7 +321,7 @@ try {
 
 // ── repo descriptor resolution ──────────────────────────────────────────────────────────────────────
 function resolveRepo() {
-  const repoPath = resolve(expandHome(flags.repo) || process.cwd());
+  const repoPath = resolve(expandHome(flags.repo) || (CWD_TOP_LEVEL ? process.cwd() : CHECKOUT_ROOT));
   const referencePath = resolve(expandHome(flags.reference) || repoPath);
   const topLevel = tryGit(['rev-parse', '--show-toplevel'], referencePath, { timeout: LOCAL_GIT_TIMEOUT_MS }) || referencePath;
   const originUrl = flags.origin || tryGit(['remote', 'get-url', 'origin'], topLevel, { timeout: LOCAL_GIT_TIMEOUT_MS });

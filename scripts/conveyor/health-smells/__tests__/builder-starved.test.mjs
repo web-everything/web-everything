@@ -51,7 +51,7 @@ it('rejects non-tick lines and parses queue size and build plus prepare launches
   expect(parseBuilderTick(line(now, {
     dispatched: [{ num: '4752' }],
     prepare: { planned: [], launched: [{ num: 4753 }], inFlight: [] },
-  }))).toEqual({ at: now, queued: 400, launched: ['4752', '4753'], capacityFree: true, frozen: false });
+  }))).toMatchObject({ at: now, queued: 400, launched: ['4752', '4753'], capacityFree: true, frozen: false, prepareLaunched: ['4753'] });
 });
 
 it('infers old-record capacity from prepare slots and respects a freeze', () => {
@@ -142,4 +142,25 @@ it('opens a builder-starved episode through runHealthTick using the builder log 
   expect(result.state.episodes['builder-starved::build-dispatch-daemon']).toMatchObject({
     smell: 'builder-starved', subject: 'build-dispatch-daemon', status: 'open', openedAt: now,
   });
+});
+
+it('builder-starved-2: breaches when prepares starve even though one lone build launched (live 16:59Z–18:49Z)', () => {
+  const t0 = Date.parse('2026-10-07T16:59:00Z');
+  const end = Date.parse('2026-10-07T18:49:00Z');
+  const holds = [{ num: '4648', reason: 'prepare-stale' }, { num: '4560', reason: 'needs-prepare' }];
+  const capacity = { buildSlots: { claude: 1, external: 3 }, prepareSlots: 2, frozen: false, free: true };
+  const lines = [];
+  for (let at = t0; at <= end; at += 3 * minute) {
+    lines.push(line(at, { capacity, buildHolds: holds, dispatched: at === t0 + 78 * minute ? [{ num: '4688' }] : [] }));
+  }
+  const builder = foldBuilderTicks(null, lines.join('\n'));
+  const v = builderStarvedVerdict(builder, { now: end + minute, limitMinutes: 60 });
+  expect(v).toMatchObject({ breach: true, prepareStarved: true });
+  const [obs] = smell.evaluate({}, { now: end + minute, builder, env: {} });
+  expect(obs.summary).toMatch(/2 cards need a prepare/);
+});
+
+it('builder-starved-2: builder-starved notifies even in shadow mode', async () => {
+  const { NOTIFY_EVEN_IN_SHADOW } = await import('../../health-smells-notify-list.mjs');
+  expect(NOTIFY_EVEN_IN_SHADOW.has('builder-starved')).toBe(true);
 });

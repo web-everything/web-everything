@@ -49,4 +49,7 @@ export const NOTIFY_EVEN_IN_SHADOW = new Set([
   'build-session-looping',
   'external-run-stalled',
   'ruling-needed-waiting', // Operator order, 2026-10-04 ~08:15 ET: a parked review waited ~8 h on a ruling with no alert (PR #3794).
+  // Operator order, 2026-10-07 (builder-starved-2): the builder starved twice in one day while this smell sat
+  // record-only in shadow mode (opened 18:16Z, nobody told) — a starving builder must reach the operator.
+  'builder-starved',
 ]);

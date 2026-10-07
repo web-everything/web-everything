@@ -84,3 +84,22 @@ describe('prepare failure evidence and durable decisions', () => {
     expect(releasedAttempt(releases, 'route:prepare', 'run:a')).toBe(false);
   });
 });
+
+describe('builder-starved-2 — a prepare that never got a lane is infrastructure, not the card', () => {
+  let dir;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'prepare-lane-infra-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  const terminal = "I couldn't acquire lane 57, so no prepare pass was done on #4560.\n- `lane-pool.mjs acquire` failed with `could not determine an origin URL`.";
+  it('classifies the lane-acquire origin failure as infra-transient', () => {
+    expect(classifyPrepareFailure({ error: 'build-dispatch-orphan-adopt: dispatch retired (prepare-unstamped)', terminal, reason: 'prepare-unstamped' }, 'result')).toBe('infra-transient');
+  });
+  it('releases an old held `unknown` record of that failure (the live #4560 hold)', async () => {
+    const path = join(dir, 'prepare-failures.json');
+    writeFileSync(path, JSON.stringify({ failures: { '4560:run x:result': { num: '4560', attempt: 'run x', stage: 'result', cause: 'unknown',
+      evidence: { error: 'build-dispatch-orphan-adopt: dispatch retired (prepare-unstamped)', terminal, reason: 'prepare-unstamped' },
+      retry: false, held: true, recordedAt: '2026-10-07T12:00:00.000Z' } }, cards: {} }));
+    const { releaseDuePrepareRetries } = await import('../prepare-failure-policy.mjs');
+    expect(releaseDuePrepareRetries({ path, now: Date.parse('2026-10-07T19:00:00Z') })).toEqual(['4560']);
+    expect(readFailureState(path).failures['4560:run x:result']).toMatchObject({ held: false, retry: true, cause: 'infra-transient', healedFrom: 'unknown' });
+  });
+});
