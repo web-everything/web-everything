@@ -65,6 +65,22 @@ describe('classifyClaimLiveness — pure', () => {
     expect(classifyClaimLiveness({ row: settled, resumeMarker: null, isPidAlive: () => true })).toMatchObject({ status: 'dead' });
   });
 
+  // Live 2026-10-06 (#4688): an OLDER attempt's settled row must never answer for a NEWER claim.
+  it('a settled row that STARTED BEFORE the claim is an older attempt -> ignored; dead owner pid => dead', () => {
+    const older = row(null, { status: 'failed', startedAt: '2026-10-06T18:10:00.000Z', result: { outcome: 'gate-red' } });
+    const claimedAt = '2026-10-06T18:59:29.394Z';
+    const live = classifyClaimLiveness({ row: older, resumeMarker: null, ownerPid: 60537, isPidAlive: () => false, claimedAt });
+    expect(live).toMatchObject({ status: 'dead', row: null });
+    expect(classifyClaimLiveness({ row: older, resumeMarker: null, ownerPid: 60537, isPidAlive: () => true, claimedAt }))
+      .toMatchObject({ status: 'no-record', row: null });
+  });
+
+  it('a settled row that started AT/AFTER the claim still reads settled-elsewhere', () => {
+    const own = row(null, { status: 'failed', startedAt: '2026-10-06T19:00:00.000Z', result: { outcome: 'gate-red' } });
+    expect(classifyClaimLiveness({ row: own, resumeMarker: null, ownerPid: 1, isPidAlive: () => false, claimedAt: '2026-10-06T18:59:29.394Z' }))
+      .toMatchObject({ status: 'settled-elsewhere' });
+  });
+
   it('settled `pr-opened` WITH a real pr number → settled-elsewhere (doneWhy\'s own PR-observed path owns it)', () => {
     const settled = row(null, { status: 'applied', result: { outcome: 'pr-opened', pr: 2921 } });
     expect(classifyClaimLiveness({ row: settled, resumeMarker: null, isPidAlive: () => true })).toMatchObject({ status: 'settled-elsewhere' });
@@ -487,6 +503,25 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
       releaseClaim: () => { throw new Error('must not release — doneWhy owns this'); },
     });
     expect(results).toEqual([{ num: '4295', action: 'leave', reason: 'settled-elsewhere' }]);
+  });
+
+  it('RELEASES a dead-owner claim whose only run row is an OLDER settled attempt (live #4688: slot pinned for hours)', async () => {
+    acquireBuildDispatchClaim({ num: '4688', scope: [], lockRoot, pid: 60537 });
+    let released = null;
+    const older = buildRow({ num: '4688', handle: null, status: 'failed', result: { outcome: 'gate-red' } });
+    older.entry.startedAt = '2000-01-01T00:00:00.000Z';
+    const results = await adoptOrphanedBuildClaims({
+      listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
+      isPidAlive: () => false,
+      findRow: () => older,
+      readResumeMarker: () => null,
+      resolveResumability: () => ({ resumable: false, reason: 'no-lane-or-session' }),
+      releaseClaim: ({ num }) => { released = num; },
+      releaseResumeMarker: () => {},
+      settleRow: ({ runId }) => { expect(runId).toBeUndefined(); },
+    });
+    expect(released).toBe('4688');
+    expect(results[0]).toMatchObject({ num: '4688', action: 'release' });
   });
 
   // ── PR #2921 review findings ────────────────────────────────────────────────────────────────────────────

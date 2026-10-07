@@ -7,7 +7,7 @@
  * settles one, and it never ran). The claim sat "in flight" forever, occupying a builder slot, while the
  * agent's own finished work — a real commit, already pushed into the lane — was silently abandoned.
  *
- * FIVE real shapes, all reproduced in one run:
+ * SIX real shapes, all reproduced in one run (the sixth, #4688, is listed after the five below):
  *   - #4131-A: an in-flight row, dead pid, report says done, lane still has the commit → RESUME.
  *   - #4382: an in-flight row, dead pid, nothing resumable at all → RELEASE, no hold.
  *   - #4400 (PR #2921 review): a LIVE re-dispatch (its own pid alive) whose item still carries a STALE resume
@@ -18,6 +18,10 @@
  *     (never resumed off a lane that belongs to someone else now).
  *   - #4469 (the ACTUAL live #4382 shape): NO run-store row was ever found at all (killed before it ever
  *     reached `in-flight`) — only the claim's own dead OWNER pid says anything → RELEASE.
+ *   - #4688 (live 2026-10-06): dead owner pid, and the only run row is an OLDER attempt's settled row (it
+ *     started BEFORE this claim) → the older row is ignored, the owner pid decides → RELEASE.
+ *   Fixture ordering matters: every row a claim legitimately owns starts AFTER that claim (a row that predates
+ *   its claim is, by definition, an older attempt's — `classifyClaimLiveness`'s `claimedAt` guard).
  *
  * Fix: `scripts/conveyor/build-dispatch-orphan-adopt.mjs#adoptOrphanedBuildClaims`, wired into
  * `skills-src/conveyor/build-dispatch-daemon.mjs`'s own live tick (`effects.adoptOrphans`, called before the
@@ -111,7 +115,7 @@ export default {
       const record = newRunRecord({ id: runId, op: 'dispatch-lane', input: {} });
       record.effects.push({
         key: 'step:1:0', type: DISPATCH_EFFECT, stepIndex: 1, index: 0, status: 'in-flight',
-        handle: `pid:${deadPid}`, startedAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+        handle: `pid:${deadPid}`, startedAt: new Date().toISOString(), // written AFTER its claim, as in production (see ROW_OLDER_THAN_CLAIM)
         payload: { num, launchKind: 'build', lane, sessionSlug, scope: [] },
       });
       store.write(record);
@@ -126,8 +130,25 @@ export default {
       const record = newRunRecord({ id: runId, op: 'dispatch-lane', input: {} });
       record.effects.push({
         key: 'step:1:0', type: DISPATCH_EFFECT, stepIndex: 1, index: 0, status: 'applied',
-        handle: null, startedAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+        handle: null, startedAt: new Date().toISOString(), // written AFTER its claim (see ROW_OLDER_THAN_CLAIM)
         result: { outcome: 'pr-opened', pr: null, park: 'review:pending' },
+        payload: { num, launchKind: 'build', lane, sessionSlug, scope: [] },
+      });
+      store.write(record);
+      return runId;
+    }
+
+    /** ROW_OLDER_THAN_CLAIM — the #4688 live shape: a SETTLED row from an OLDER attempt (started an hour BEFORE
+     *  the current claim was taken). A claim only ever answers for rows its own dispatch wrote, so such a row
+     *  is ignored and the claim's own dead owner pid decides. (The fixtures above deliberately start their rows
+     *  AFTER their claim — a row predating its own claim is an older attempt's, not that claim's.) */
+    function writeOlderSettledRow(num, { lane, sessionSlug }) {
+      const runId = newRunId('dispatch-lane');
+      const record = newRunRecord({ id: runId, op: 'dispatch-lane', input: {} });
+      record.effects.push({
+        key: 'step:1:0', type: DISPATCH_EFFECT, stepIndex: 1, index: 0, status: 'failed',
+        handle: null, startedAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+        result: { outcome: 'gate-red' },
         payload: { num, launchKind: 'build', lane, sessionSlug, scope: [] },
       });
       store.write(record);
@@ -146,14 +167,16 @@ export default {
 
     // ── #4131-A shape: an IN-FLIGHT row, dead pid, report says done, lane still has the commit → RESUME ──────
     const resumableLane = makeLane({ ahead: true, num: '4131' });
+    acquireBuildDispatchClaim({ num: '4131', scope: [], lockRoot: claimRoot });
+    const rowA = writeInFlightRow('4131', { lane: 9, sessionSlug: 'conveyor-4131', deadPid });
+    // The agent's report is written AFTER its dispatch row started (production order; `checkResumable` refuses a
+    // report that predates the dispatch as a prior attempt's — `report-predates-dispatch`).
     writeDeliveryReport(
       applyDeliveryUpdate(newDeliveryReport({ session: 'conveyor-4131', item: '4131' }), {
         status: 'done', outcome: 'done', filesTouched: ['agent-work.txt'],
       }),
       resolveDeliveryReportsDir(resumableLane),
     );
-    acquireBuildDispatchClaim({ num: '4131', scope: [], lockRoot: claimRoot });
-    const rowA = writeInFlightRow('4131', { lane: 9, sessionSlug: 'conveyor-4131', deadPid });
     let spawnedResumeWith = null;
 
     // ── #4382 shape: an IN-FLIGHT row, dead pid, nothing resumable at all → RELEASE, no hold ─────────────────
@@ -180,6 +203,12 @@ export default {
     // reached `in-flight`) — only the claim's own OWNER pid (dead) says anything at all → RELEASE. ─────────
     acquireBuildDispatchClaim({ num: '4469', scope: [], lockRoot: claimRoot, pid: deadPid });
 
+    // ── #4688 shape (live 2026-10-06): the claim's owner pid is dead and the ONLY run row is an OLDER attempt's
+    // settled row (started an hour before this claim) → that row must NOT answer for the new claim → RELEASE
+    // (was `settled-elsewhere` → held for the full 240-min TTL, pinning the builder slot). ─────────────────────
+    acquireBuildDispatchClaim({ num: '4688', scope: [], lockRoot: claimRoot, pid: deadPid });
+    const rowE = writeOlderSettledRow('4688', { lane: 11, sessionSlug: 'conveyor-4688' });
+
     const laneByLaneNum = { 9: resumableLane, 11: emptyLane, 30: recycledLane };
     // The lane-lease-currency check ({@link checkResumable}'s own safety fix) needs to see #4131's lane (9) as
     // STILL leased under its own matching session — this soak sandbox has no real lane-pool state, so the
@@ -187,7 +216,7 @@ export default {
     // currently leased to a DIFFERENT session (`conveyor-9999`) — a later item that recycled it, exactly as
     // #4131's own real lane (8) was recycled twice before this fix landed.
     const sessionByLaneNum = { 9: 'conveyor-4131', 11: 'conveyor-4382', 30: 'conveyor-9999' };
-    const rowByNum = { 4131: rowA, 4382: rowB, 4400: rowC, 4468: rowD };
+    const rowByNum = { 4131: rowA, 4382: rowB, 4400: rowC, 4468: rowD, 4688: rowE };
 
     let results;
     try {
@@ -268,6 +297,14 @@ export default {
     }
     if (claimsAfter.includes('4469')) {
       violations.push({ invariant: 'no-record-dead-owner-claim-stuck', detail: '#4469\'s claim is STILL held — this is the exact #4382 live shape' });
+    }
+
+    // #4688 (live 2026-10-06) — an OLDER attempt's settled row must never keep a dead-owner claim alive.
+    if (byNum['4688']?.action !== 'release') {
+      violations.push({ invariant: 'older-row-pinned-claim', detail: `#4688 (dead owner pid, only an OLDER settled row) got action ${JSON.stringify(byNum['4688'])}, expected 'release'` });
+    }
+    if (claimsAfter.includes('4688')) {
+      violations.push({ invariant: 'older-row-claim-stuck', detail: '#4688\'s claim is STILL held — the exact live shape: an older attempt\'s settled row pinned a dead daemon\'s claim for the full TTL' });
     }
 
     // cleanup — best-effort, never masks a violation already recorded.
