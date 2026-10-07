@@ -46,6 +46,9 @@ export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_P
   }
   if (!['we', 'plateau-app'].includes(repo)) throw new Error('--repo must be we or plateau-app.');
   if (!Number.isSafeInteger(reportLines) || reportLines < 1) throw new Error('--report-lines must be a positive integer.');
+  const SAFE = /^[A-Za-z0-9_./:@+-]+$/;
+  for (const path of paths) if (!SAFE.test(path.trim())) throw new Error(`--files entry has unsafe characters: ${JSON.stringify(path.trim())}`);
+  if (edgeClone !== undefined && (typeof edgeClone !== 'string' || !SAFE.test(edgeClone))) throw new Error('--edge-clone has unsafe characters.');
   const qualified = paths.map(path => path.trim()).map(path => path.includes(':') ? path : `${repo}:${path}`);
   const commaList = qualified.join(',');
   const laneRepo = repo === 'plateau-app' ? ' --repo=<plateau-app checkout>' : '';
@@ -68,6 +71,7 @@ Anything else is out of scope: stop and report.
    If any file is OCCUPIED (an open PR or a running agent holds it), stop and report who holds it. Do not start.
    If the verdict is UNKNOWN (exit 2: a PR list was cut off or unreadable), the scope is NOT proven free: stop and report it. Do not start.
 2. **Register your scope.** \`node scripts/operations/free-scope-cli.mjs register --agent=${purpose} --owner=${owner} --purpose="${purpose}" --files=${commaList}\`.
+   If register exits non-zero (the scope is occupied or the registry refused), stop and report; do not edit anything.
    The \`--owner\` token is yours alone: if register refuses because the name is held by a different owner, another live worker
    shares your slug. Stop and report; never release or overwrite their entry.
    Release it when you finish, succeed or fail: \`node scripts/operations/free-scope-cli.mjs release --agent=${purpose} --owner=${owner}\`.
