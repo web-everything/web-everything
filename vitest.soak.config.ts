@@ -36,7 +36,10 @@ export default defineConfig({
         minForks: 1,
       },
     },
-    testTimeout: 15 * 60_000,
+    // Must FAIL LOUDLY before the CI job's own `timeout-minutes` (15) cancels it: a test timeout equal to the job
+    // timeout meant a hung scenario never produced a failure, only a cancelled job (PR #4235). Longest scenario ~5 min.
+    // Knob: WE_SOAK_TEST_TIMEOUT_MS.
+    testTimeout: Number(process.env.WE_SOAK_TEST_TIMEOUT_MS) || 10 * 60_000,
     hookTimeout: 5 * 60_000,
   },
 });
