@@ -7,6 +7,7 @@
  *   FILED in the list, and always releases the lane. All parsing/planning is pure in `we:scripts/held-cards.mjs`.
  *   Skill: `we:skills-src/held-cards/SKILL.md`.
  */
+import { retryTransientGit } from './lib/git-fetch-retry.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -163,7 +164,7 @@ export async function main(argv, deps = {}) {
       const ref = flags.ref || 'origin/main';
       const git = (...args) => command('git', ['-C', root, ...args]);
       const tryGit = (...args) => { try { return git(...args); } catch { return null; } };
-      if (!flags['no-fetch']) tryGit('fetch', '-q', 'origin', 'main');
+      if (!flags['no-fetch']) { try { retryTransientGit(() => git('fetch', '-q', 'origin', 'main')); } catch { /* best-effort */ } }
       const wanted = flags.item ? new Set(String(flags.item).split(',').map(Number)) : null;
       const selected = items.filter(item => wanted ? wanted.has(item.num) : flags.all || !item.done);
       const gh = env.WE_HELD_CARDS_GH_BIN || 'gh';

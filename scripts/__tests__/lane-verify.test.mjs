@@ -7,7 +7,7 @@
  *   whose synchronous run finished green PASSES. The suite runner + marker IO are the impure boundary
  *   (`scripts/verify-lane.mjs`) and pr-land's finish-guard calls `verifyGateDecision` here.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
@@ -871,9 +871,10 @@ describe('keepMarkerAfterReset — an acquire drops the previous holder\'s verif
 
 /**
  * waitForVerifySettle (#4358) — the bounded, internally-pollable wait `verify-lane.mjs check --wait=<ms>` is
- * built on. Everything here uses a FAKE clock/sleep (a shared counter `t`, advanced only by `sleep`, never a
- * real timer) so the whole suite runs instantly regardless of the simulated ceilings/intervals it exercises —
- * exactly the "fake clock, fake marker reads" shape the card's own test plan (item 1) asks for.
+ * built on. Almost everything here uses an INJECTED fake clock/sleep (a shared counter `t`, advanced only by
+ * `sleep`, never a real timer) so the suite runs instantly regardless of the simulated ceilings/intervals it
+ * exercises. The one exception is the "default clock, sleep and poll interval" case (#4412), which omits `now`, `sleep` and
+ * `pollIntervalMs` on purpose and drives the function's OWN defaults through vitest's global fake timers.
  */
 describe('waitForVerifySettle — bounded wait for the marker to settle (#4358)', () => {
   const gateFor = (sha) => ({
@@ -887,6 +888,36 @@ describe('waitForVerifySettle — bounded wait for the marker to settle (#4358)'
     let t = 0;
     return { now: () => t, sleep: async (ms) => { t += ms; } };
   }
+
+  it('default clock, sleep and poll interval: a running marker that turns green settles on the second poll, 2000ms later (#4412)', async () => {
+    // Omits `now`, `sleep` and `pollIntervalMs` so the function's own default expressions run. Vitest fake timers
+    // control the GLOBAL Date/setTimeout those defaults close over; the interval literal is pinned here on
+    // purpose so a drift in the default cadence fails this test instead of passing silently.
+    vi.useFakeTimers();
+    try {
+      const running = verifyStartBody({ sha: SHA, suites: 'gate', startedAt: new Date().toISOString() });
+      const green = verifyFinishBody(running, { finishedAt: new Date().toISOString(), exitCode: 0 });
+      let reads = 0;
+      const readRecord = () => { reads += 1; return reads === 1 ? running : green; };
+      let done = false;
+      const pending = waitForVerifySettle({ readRecord, readHead: () => SHA, headSha: SHA, ceilingMs: 60_000 })
+        .finally(() => { done = true; });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reads).toBe(1); // first poll saw `running`
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(reads).toBe(1); // default sleep has not elapsed — no second poll yet
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await pending;
+
+      expect(reads).toBe(2);
+      expect(result).toMatchObject({ status: 'green', ok: true, settled: true });
+      expect(result.waited).toEqual({ ms: 2_000, polls: 2 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it('settles as soon as the marker goes green — returns on the poll it settles, not the full ceiling', async () => {
     const { running, green } = gateFor(SHA);
@@ -1214,4 +1245,14 @@ it('75c: the isolated-retry audit (flaky-outside-diff) survives finish, check an
   const red = verifyFinishBody({ sha: 'ours' }, { exitCode: 1, retriedFailures, isolatedRetry: 'still-red' });
   expect(verifyGateDecision({ record: red, headSha: 'ours' })).toMatchObject({ ok: false, isolatedRetry: 'still-red' });
   expect(verifyFinishBody(record, { exitCode: 0 }).retriedFailures).toBeUndefined();
+});
+
+// #5189 — the marker-nonce suffix is the one format both verify-lane (writer) and verify-dispatch (checker) share.
+it('markerNonceSuffix formats a hex nonce and fails closed to empty on anything else', async () => {
+  const { markerNonceSuffix, VERIFY_MARKER_NONCE_ENV } = await import('../lib/lane-verify.mjs');
+  expect(VERIFY_MARKER_NONCE_ENV).toBe('WE_VERIFY_MARKER_NONCE');
+  expect(markerNonceSuffix('abcdef0123456789')).toBe(' [nonce=abcdef0123456789]');
+  for (const bad of [undefined, null, '', 'short', 'zz'.repeat(8), 'ab\ncd'.repeat(4), 42, 'abcdef0123456789 trailing']) {
+    expect(markerNonceSuffix(bad)).toBe('');
+  }
 });

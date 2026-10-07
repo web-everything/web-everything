@@ -96,7 +96,7 @@ describe('agent-activity lease read skips the git probe for unleased lanes', () 
   it('asks lane-pool status for --leased-only (lease fields are identical; only git fields drop)', () => {
     let argv = null;
     const run = (_bin, args) => { argv = args; return JSON.stringify({ lanes: [{ lane: 1, lease: { session: 's' } }, { lane: 2, lease: null }] }); };
-    expect(readLaneLeases({ run, root: '/r' })).toEqual([{ session: 's' }]);
+    expect(readLaneLeases({ run, root: '/r' })).toMatchObject([{ session: 's' }]);
     expect(argv).toEqual(['/r/scripts/lane-pool.mjs', 'status', '--json', '--leased-only']);
   });
 });

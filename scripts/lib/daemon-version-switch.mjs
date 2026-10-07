@@ -189,6 +189,8 @@ function switchInside(c, { id, expectCurrent, rollback = false, reason, by, reje
   const intent = { id, actual, rollback, since: new Date(c.now()).toISOString(),
     probation: !rollback && c.config.autoRollback, reason: reason ?? 'rollback', by: by ?? 'operator',
     oldPrevious: c.linkId('previous'),
+    // The rejected sha rides in the hold itself: gc may prune the held version's record later.
+    holdSha: rollback && actual ? (c.record(actual)?.sha ?? null) : null,
     reject: reject ? { id: validVersionId(reject), record: { ...c.record(reject), id: reject, status: 'rejected' } } : null };
   // Intent first: a crash after the pointer rename can then be completed by settle().
   state.pending = intent; c.atomic('state.json', state);
@@ -208,7 +210,7 @@ function switchInside(c, { id, expectCurrent, rollback = false, reason, by, reje
   return { status: 'switched', id, previous: actual };
 }
 /** Every effect of a switch beyond the pointers; idempotent so a crashed one can be replayed. */
-function commit(c, state, { id, actual, rollback, since, probation, reason, by, reject }, probationSince = since) {
+function commit(c, state, { id, actual, rollback, since, probation, reason, by, reject, holdSha }, probationSince = since) {
   // Best effort once the pointers have moved: a vanished or corrupt record must not wedge recovery.
   if (reject && c.stat(c.safe(`versions/${validVersionId(reject.id)}`, true))) {
     try { c.atomic(`versions/${reject.id}/.version.json`, reject.record); }
@@ -216,7 +218,7 @@ function commit(c, state, { id, actual, rollback, since, probation, reason, by, 
   }
   if (actual) state.retired = { ...state.retired, [actual]: since };
   state.probation = probation ? { id, since: probationSince, prev: actual } : null;
-  if (rollback) state.hold = { version: actual, reason, by, until: 'main-moves' };
+  if (rollback) state.hold = { version: actual, ...(holdSha ? { sha: holdSha } : {}), reason, by, until: 'main-moves' };
   state.adopted = id;
   delete state.pending;
 }

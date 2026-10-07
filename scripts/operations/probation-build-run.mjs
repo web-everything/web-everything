@@ -75,7 +75,7 @@ import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { summarizeAgyEvents } from '../gemini-direct-task.mjs';
-import { basename, dirname, extname, join, resolve } from 'node:path';
+import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import matter from 'gray-matter';
 import { readField, removeFrontmatterField } from '../backlog/frontmatter.mjs';
@@ -95,6 +95,7 @@ import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-reg
 import { placeBuildDispatchHold } from '../conveyor/build-dispatch-claim.mjs';
 import { planHoldRouting, reserveHoldRoute } from '../conveyor/build-dispatch-hold-router.mjs';
 import { clearScopeAndAppendFinding, sanitizeHoldReason, landRoute } from './build-dispatch-hold-route-land.mjs';
+import { classifyPrepareReport, deriveScopeFromCard, isSafeRepoRelativePath, needsYouReason, replaceCardScope, scopeIsDefective } from '../conveyor/prepare-outcome.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 
@@ -195,6 +196,17 @@ function parseYamlFrontmatter(text) {
   return matter(text, { language: 'yaml', engines: NO_EXEC_ENGINES }).data;
 }
 
+/** The real path of `rel` under `dir`, or `null` when `rel` is not a safe repo-relative path, does not exist, or
+ *  resolves (through a symlink) outside the lane. Card-text paths reach the filesystem only through this. */
+function laneContainedPath(dir, rel) {
+  if (!isSafeRepoRelativePath(rel)) return null;
+  try {
+    const root = realpathSync(dir);
+    const real = realpathSync(join(dir, rel));
+    return real === root || real.startsWith(root + sep) ? real : null;
+  } catch { return null; }
+}
+
 /** Parse `--k=v` flags, resolving roster workers and minting an omitted session. */
 export function parseArgs(argv) {
   const flags = {};
@@ -265,7 +277,7 @@ export async function runProbationBuild(args, io) {
   let couldNotPrepare = false;
   let proposedEdges = [];
   const finish = (outcome, executor, detail, row = {}) => {
-    const evidence = preparing && !['opened-pr', 'could-not-prepare'].includes(outcome) ? {
+    const evidence = preparing && !['opened-pr', 'could-not-prepare', 'prepare-already-done', 'prepare-needs-you'].includes(outcome) ? {
       error: detail, sessionAbsent: !workerRan,
       resultAuthored: Boolean(row.diff?.files), resultDiscarded: Boolean(row.resultDiscarded),
     } : null;
@@ -282,7 +294,7 @@ export async function runProbationBuild(args, io) {
     const result = { outcome, executor, pr: row.pr ?? null, detail, ...failure };
     if (preparing) {
       try { io.settlePrepare?.({ runId: args.runId, key: args.effectKey,
-        status: outcome === 'opened-pr' ? 'applied' : 'failed', result }); }
+        status: ['opened-pr', 'prepare-already-done'].includes(outcome) ? 'applied' : 'failed', result }); }
       catch (e) { log(`prepare settlement failed: ${e?.message ?? e}`); }
     }
     return result;
@@ -323,7 +335,7 @@ export async function runProbationBuild(args, io) {
       return finish('escalated-needs-human', 'none', 'refused: could not establish a clean git-hook baseline in the lane');
     }
 
-    const item = io.findItem(num, lanePath);
+    let item = io.findItem(num, lanePath);
     if (!item) return finish('not-applicable', 'none', `no backlog/${num}-*.md file in this checkout`);
     if (preparing && parseYamlFrontmatter(item.raw).status !== 'open') {
       return finish('not-applicable', 'none', 'prepare requires an open card');
@@ -408,6 +420,7 @@ export async function runProbationBuild(args, io) {
     const preHookSurface = hookReset.snapshot;
     // A guarded stamp validates authored prose too (e.g. locus prefixes). Let the
     // same worker repair that concrete diagnostic before discarding its result.
+    let rescoped = null;
     for (let attempt = 0; attempt < (preparing ? 2 : 1); attempt++) {
       log(`running ${worker.launcher} --model=${worker.model}`);
       const run = io.runWorker(buildWorkerArgv({ worker, weRoot: lanePath, dir: lanePath, taskFile }), lanePath);
@@ -445,7 +458,66 @@ export async function runProbationBuild(args, io) {
       if (preparing ? frontmatterTamperedBeyondClaim(item.raw, postWorkerItem?.raw, PREPARE_OWNED_FRONTMATTER_KEYS) : (postWorkerItem?.spec !== item.spec || postWorkerItem?.raw !== afterClaim?.raw)) {
         return abandon('escalated-needs-human', "not built: the worker edited the item's own backlog card — refusing", { diff: diffRow });
       }
-      if (preparing && !summary.files && /\bcould-not-prepare\s*:/i.test(run.lastMessage ?? '')) {
+      // The prepare worker's final line, read into the outcome words of the planned worker-result contract
+      // (we:scripts/conveyor/prepare-outcome.mjs). A colon-less or dashed report ("already-done - delivered by ...",
+      // "could-not-prepare - scope is wrong") used to fall through to "prepare requires a card-only diff" and be
+      // recorded as a failure (live #4560, #4328).
+      // After a re-scope the runner's OWN card edit is in the diff, so `summary.files` is no longer zero for a worker
+      // that changed nothing: it counts as "no worker diff" only while the card is still byte-for-byte what the
+      // runner wrote and nothing else changed - otherwise a second decline would skip this branch and the
+      // runner-authored edit would read as a prepared card (PR #4323 review).
+      const workerMadeNoChange = !summary.files
+        || (rescoped !== null && postWorkerItem?.raw === item.raw && summary.paths.every((p) => p === item.path));
+      const report = preparing && workerMadeNoChange ? classifyPrepareReport(run.lastMessage) : null;
+      if (report?.outcome === 'no-change' || (report?.outcome === 'blocked' && report.blocker.kind === 'spec-defect')) {
+        if (io.headSha(lanePath) !== baseSha) return abandon('escalated-needs-human', `refused: worker moved HEAD before ${report.outcome} routing`, { diff: diffRow });
+      }
+      if (rescoped !== null && summary.files && workerMadeNoChange && report?.outcome === 'done') {
+        // The only change in the lane is the runner's own scope edit and the worker declined nothing: nothing was prepared.
+        return abandon('gate-red', `prepare requires a card-only diff from the worker; only the runner's re-scope was present. worker report: ${sanitizeHoldReason(run.lastMessage, { max: 1200 }) || 'no final message'}`, { diff: diffRow });
+      }
+      const needsYou = (kind, detail) => {
+        const reason = needsYouReason(kind, detail);
+        const [route] = planHoldRouting([{ num, reason }]);
+        io.holdWorkerDecline(route);
+        return abandon('prepare-needs-you', reason, { diff: diffRow });
+      };
+      if (report?.outcome === 'no-change') {
+        // Never resolve on the worker's word: the landing pass re-checks that the commit is on origin/main,
+        // credits this card, touches real source, and that the tests it added pass on current main.
+        if (!report.commit) return needsYou('already-done', 'the worker said the card is already done but cited no delivering commit');
+        const [done] = planHoldRouting([{ num, reason: `spec already done on main: commit ${report.commit}` }]);
+        io.holdWorkerDecline(done);
+        io.discardChanges(lanePath, baseSha, preexisting);
+        const landed = io.landAlreadyDone(done, lanePath, { citation: 'prepare' });
+        if (landed.status === 'landed') return finish('prepare-already-done', worker.executor, `already-done: ${done.commit}; verified independently; opened resolve PR #${landed.pr}`, { diff: diffRow, pr: landed.pr });
+        // Replace the already-done hold installed above: left in place it would keep describing an automatically
+        // routable claim the landing pass just refused (PR #4323 review). The needs-you hold overwrites it.
+        const reason = needsYouReason('already-done', `claimed commit ${report.commit} was not verified: ${landed.error}`);
+        const [route] = planHoldRouting([{ num, reason }]);
+        io.holdWorkerDecline(route);
+        return finish('prepare-needs-you', worker.executor, reason, { diff: diffRow });
+      }
+      if (report?.outcome === 'blocked' && report.blocker.kind === 'spec-defect') {
+        // A bad scope is re-derived from the code the card cites (one hop through a cited backlog card's own
+        // scope); one re-scoped retry per run. When nothing can be derived, hold with a needs-you reason: it must
+        // never stay a silent prepare-unstamped, and clearing the scope would only loop it back into prepare.
+        const exists = (rel) => io.pathExists?.(lanePath, rel) === true;
+        const derived = rescoped ? [] : deriveScopeFromCard(item.raw, { exists, readScope: (rel) => io.readCardScope?.(lanePath, rel) ?? [] });
+        const current = declaredScopePaths(item.scope).map((e) => e.replace(/^we:/, ''));
+        const changed = derived.length > 0 && derived.map((e) => e.replace(/^we:/, '')).join('\n') !== current.join('\n');
+        if (attempt === 0 && changed && scopeIsDefective(item.scope, { exists })) {
+          rescoped = derived;
+          const newRaw = replaceCardScope(item.raw, derived);
+          io.writeCard(lanePath, item.path, newRaw);
+          item = { ...item, raw: newRaw, scope: derived };
+          log(`worker reported a spec defect; re-derived scope ${derived.join(', ')} and retrying once`);
+          taskFile = io.writeTaskFile(lanePath, 'probation-build-task.md', `${task}\n\nThe runner re-derived this card's scope from the code it cites and wrote it into the card: ${derived.join(', ')}. Prepare against that scope; list the matching test files too. Do not report the scope as wrong again unless these files are also wrong.\n`);
+          continue;
+        }
+        return needsYou('spec-defect', report.summary);
+      }
+      if (report?.outcome === 'blocked') {
         if (io.headSha(lanePath) !== baseSha) return abandon('escalated-needs-human', 'refused: worker moved HEAD before prepare finding', { diff: diffRow });
         couldNotPrepare = true;
         declinedReason = sanitizeHoldReason(run.lastMessage, { max: 1200 });
@@ -783,7 +855,19 @@ export function realIo({ session, env = process.env, repoRoot = WE_ROOT } = {}) 
       if (!held.ok) throw new Error('could not place worker-declined dispatch hold');
     },
     writeCard: (dir, path, text) => writeFileSync(join(dir, path), text),
-    landAlreadyDone: (entry, dir) => landRoute(entry, {
+    // Both re-scope probes read card-text-supplied paths (untrusted): a path that is not repo-relative, or whose real
+    // location (symlinks resolved) is outside the lane, is treated as absent and never opened (PR #4323 review).
+    pathExists: (dir, rel) => laneContainedPath(dir, rel) !== null,
+    // A cited backlog card's own `scope:` (one hop of the re-scope probe); unreadable reads as none.
+    readCardScope: (dir, rel) => {
+      try {
+        const abs = laneContainedPath(dir, rel);
+        if (abs === null) return [];
+        const s = parseYamlFrontmatter(readFileSync(abs, 'utf8'))?.scope;
+        return Array.isArray(s) ? s.filter((x) => typeof x === 'string') : [];
+      } catch { return []; }
+    },
+    landAlreadyDone: (entry, dir, { citation = 'strict' } = {}) => landRoute({ ...entry, citation }, {
       // Reuse the runner's acquired lane; keep every mutation in it and hooks disabled.
       acquireFn: () => ({ path: dir }), releaseFn: () => {},
       runFn: (bin, argv, cwd, { timeoutMs = resolveChildTimeoutMs() } = {}) => sh(bin, argv, {

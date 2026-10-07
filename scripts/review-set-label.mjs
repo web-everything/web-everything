@@ -106,7 +106,7 @@ import {
 // sink, the loop console, the conveyor's rearm) reaches the ledger by reaching THIS, and none of them needs
 // its own writer. NOTHING MERGES ON IT YET — the drain still reads labels; `we:scripts/review-ledger-check.mjs`
 // reports any ledger/label disagreement, and that evidence is what decides whether Phase 2 is safe.
-import { buildVerdictRecord, appendVerdict, verdictForLabelTarget } from './lib/verdict-ledger.mjs';
+import { buildVerdictRecord, appendVerdict, verdictForLabelTarget, verdictClears } from './lib/verdict-ledger.mjs';
 // #2979 — the NET diff vs current main, NOT `gh pr diff`'s three-dot output (see the fingerprint block in
 // `runReviewLabelCli` for why that distinction is the whole point). Imported from the CLI that owns it, the same
 // way `we:scripts/fetch-parked.mjs` already does — it is the single home of the #2450 net-diff basis.
@@ -1305,7 +1305,8 @@ export function runReviewLabelCli({
   // are the same rule ("never write the row while a refusal is still reachable") applied at two seams; the
   // operation's own sink is therefore a RECONCILER, not a second writer (see review-pr-io.mjs).
   //
-  // FAIL-SOFT ON THE LEDGER, DELIBERATELY: a ledger write failure does NOT abort the verdict. In Phase 1 the
+  // FAIL-SOFT ON THE LEDGER, DELIBERATELY — EXCEPT a CLEARING verdict whose git write missed (F4, below): a ledger
+  // write failure does NOT abort the verdict. In Phase 1 the
   // ledger is shadow — nothing merges on it — so refusing an operator's verdict because a shadow file could
   // not be written would trade a real capability for an imaginary one. The miss goes to stderr (so it is
   // visible in a run log) and the checker reports the PR as `unledgered`. This posture MUST be revisited at
@@ -1334,6 +1335,7 @@ export function runReviewLabelCli({
   }
 
   const ledgerVerdict = verdictForLabelTarget(to);
+  let clearingLedgerMiss = false;
   try {
     const appended = appendVerdict(buildVerdictRecord({
       repo,
@@ -1357,9 +1359,17 @@ export function runReviewLabelCli({
     }));
     if (!appended.ok) {
       process.stderr.write(`review-set-label: verdict-ledger append REFUSED (#3007 shadow) — ${appended.errors.join('; ')}\n`);
+      // F4 (`#verdict-ledger-pr-state-store` rule 4): a CLEARING verdict whose git write missed does NOT clear.
+      // Any refused append of a CLEARING verdict is fatal (the git miss, or the home write failing after git landed);
+      // a holding target still swaps (the hold must apply even when the ledger is down).
+      clearingLedgerMiss = verdictClears(ledgerVerdict);
     }
   } catch (e) {
     process.stderr.write(`review-set-label: verdict-ledger append failed (#3007 shadow, non-fatal) — ${String((e && e.message) || e).split('\n')[0]}\n`);
+  }
+  // Outside the try on purpose: a stubbed or real `process.exit` must never be swallowed by the non-fatal catch above.
+  if (clearingLedgerMiss) {
+    fail('verdict-ledger write refused for a clearing verdict (F4): the label is NOT swapped; retry once the ledger transport is reachable', 1);
   }
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SWAP: add the verdict label, remove the stale ones

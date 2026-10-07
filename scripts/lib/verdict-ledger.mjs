@@ -98,11 +98,13 @@
 
 import { isUnderTest } from './under-test.mjs';
 import { appendFileSync, readFileSync, mkdirSync, readdirSync, existsSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
-import { dirname, join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
 import { homedir, hostname, tmpdir } from 'node:os';
 
 import { REVIEW_LABELS, hasReviewLabel, acceptanceCoversHead } from './review-escalation.mjs';
+import { canonicalizeSlug, CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { reserve, releaseLockDir } from '../readiness/file-locks.mjs';
 import { writeAllSync } from './write-all-sync.mjs';
 import { appendLedgerRows } from './verdict-ledger-io.mjs';
@@ -1060,6 +1062,20 @@ export function verdictLedgerPath(repo) {
   return join(verdictLedgerDir(), `${slug}.jsonl`);
 }
 
+/** Whether a normalized ledger event CLEARS a hold (so a git miss must not leave a home row, F4). A verdict follows
+ *  {@link verdictClears}; a v2 event has no `verdict`, and a ruling that is not `block` clears its finding's hold. */
+function eventClears(row) {
+  if (row?.type === EVENT_TYPES.RULING) return row.ruling !== 'block';
+  return verdictClears(row?.verdict);
+}
+
+/** `type=value` for loud messages: `verdict=<v>` for a v1 verdict row, `ruling=<r>` / `<type>=` for a v2 event. */
+function eventLabel(row) {
+  if (row?.type === EVENT_TYPES.RULING) return `ruling=${row.ruling}`;
+  if (row?.type && row.type !== EVENT_TYPES.VERDICT) return `type=${row.type}`;
+  return `verdict=${row?.verdict}`;
+}
+
 /**
  * APPEND one verdict record. The only write path.
  *
@@ -1074,28 +1090,40 @@ export function verdictLedgerPath(repo) {
  *
  * STORE (`verdictLedger.store`): `home` writes only the machine-local file; `dual` (default) writes home AND the git
  * transport via `verdict-ledger-io.mjs`; `git` writes git only. A git write miss follows the ratified F4 posture
- * (see `finishGitMiss`): never silent, never dropped. Reads are unchanged (home).
+ * (see `finishGitMiss` / `refuseClearingOnGitMiss`): never silent. Reads are unchanged (home).
  *
- * The UNCONFIGURED default is `dual` only once a git board resolves (`opts.board` or env
- * `WE_VERDICT_LEDGER_BOARD`); with no board it is `home`, so a deployment that has not provisioned the board keeps
- * the pre-C2 contract (a successful home append is `ok: true`) instead of failing every clearing verdict. A store
- * NAMED by the operator (`opts.store` / env `WE_VERDICT_LEDGER_STORE`) is honoured as written: `dual`/`git` with no
- * board is a loud miss, never a silent downgrade. `git` is for the read-slice cut-over only: every reader still
- * reads home, so a git-only row is invisible to the fold until readers move (each `git` write says so on stderr).
+ * THE BOARD (the checkout whose `origin` owns the `ops/review-requests` transport branch) resolves, in order, from
+ * `opts.board`, env `WE_VERDICT_LEDGER_BOARD`, then {@link resolveLedgerBoard}: a checkout (this one, then the
+ * constellation's sibling checkouts) whose `origin` is the record's own repo (each repo owns its own notes, `#3261`). No production caller passes `opts` or sets the env,
+ * so that last step is what makes the default `dual` actually write git. A record for a repo this checkout is not
+ * the board of (a sibling repo) has NO board; the UNCONFIGURED default then stays `home` (one loud notice per
+ * process) rather than miss on every call. A store NAMED by the operator (`opts.store` / env
+ * `WE_VERDICT_LEDGER_STORE`) is honoured as written: `dual`/`git` with no board is a loud miss, never a silent
+ * downgrade. `git` is for the read-slice cut-over only: every reader still reads home, so a git-only row is
+ * invisible to the fold until readers move (each `git` write says so on stderr).
+ *
+ * ORDER OF WRITES FOLLOWS WHAT THE ROW CAN DO (F4, `#verdict-ledger-pr-state-store` rule 4). Home is the row every
+ * reader folds, so a home row IS authoritative the moment it exists:
+ *   - a CLEARING verdict is written to git FIRST and to home only after git succeeded. If git misses, NO home row is
+ *     written, the result is `ok: false` + `ledgerWriteMiss`, and the caller's retry is a clean re-append. A home row
+ *     written first would let `review-pr-io`'s fold see "already decided" and skip the git retry forever.
+ *   - a HOLDING verdict is written home-first (fail safe: the hold must exist even when git is down) and a git miss
+ *     only flags `ledgerWriteMiss`.
  *
  * `opts.env` governs store, board and test-mode only; the home directory still reads `process.env`.
  *
  * @param {VerdictRecord} record - from {@link buildVerdictRecord}.
- * @param {{store?: string, board?: string, env?: object, gitAppend?: Function, homeAppend?: Function, warn?: Function}} [opts] - test seams.
+ * @param {{store?: string, board?: string, boardRoot?: string, originRepo?: Function, env?: object, gitAppend?: Function, homeAppend?: Function, warn?: Function}} [opts] - test seams.
  * @returns {{ok: boolean, path: string|null, record: VerdictRecord|null, locked: boolean, errors: string[]}}
  */
 export function appendVerdict(record, opts = {}) {
   const env = opts.env ?? process.env;
-  const board = opts.board ?? env.WE_VERDICT_LEDGER_BOARD ?? null;
   const loud = opts.warn ?? ((m) => process.stderr.write(`${m}\n`));
   // One derivation of the store AND whether the operator named it, so the two can never disagree.
   const choice = resolveLedgerStoreChoice(opts.store, env);
   let store = choice.store;
+  // A blank board (empty or whitespace-only) is NO board; so is a derived one that does not match the record's repo.
+  const board = store === 'home' ? null : resolveLedgerBoard(record?.repo, opts, env);
   // Unconfigured default + no board to write to: stay on home rather than miss on every call (see header).
   if (!choice.named && store === DEFAULT_VERDICT_LEDGER_STORE && !board) {
     store = 'home';
@@ -1117,45 +1145,119 @@ export function appendVerdict(record, opts = {}) {
       return { status: 'appended' };
     } catch (e) { return { status: 'miss', error: errFirstLine(e) }; }
   };
+  if (store === 'home') return { ...homeAppend(record), store };
+  // Validate first: an invalid record is refused and nothing is written anywhere.
+  const v = serializeLedgerEvent(record);
+  if (!v.ok) return { ok: false, path: null, record: null, locked: false, errors: v.errors, store };
+  const clears = eventClears(v.record);
   if (store === 'git') {
-    // Validate first: an invalid record is refused and nothing is written anywhere.
-    const v = serializeLedgerEvent(record);
-    if (!v.ok) return { ok: false, path: null, record: null, locked: false, errors: v.errors, store };
     const g = writeGit(v.record);
     if (g.status === 'appended') {
-      loud(`verdict-ledger: store=git wrote ${v.record.repo}#${v.record.pr} verdict=${v.record.verdict} to the git transport ONLY — readers still read home, so the fold does not see this row until the read slice lands (use store=dual)`);
+      loud(`verdict-ledger: store=git wrote ${v.record.repo}#${v.record.pr} ${eventLabel(v.record)} to the git transport ONLY — readers still read home, so the fold does not see this row until the read slice lands (use store=dual)`);
       return { ok: true, path: null, record: v.record, locked: false, errors: [], store, git: g };
     }
-    // Write miss: the row must never be silently dropped, so it spills to the home ledger. A failed spill is
-    // reported with its reason alongside the git miss.
+    // A clearing verdict that missed git writes NO home row (see the header). A holding one spills to home so the
+    // hold is never dropped; a failed spill is reported with its reason alongside the git miss.
+    if (clears) return refuseClearingOnGitMiss({ g, store, loud, record: v.record });
     return finishGitMiss({ home: homeAppend(record), g, store, loud, record: v.record });
   }
+  if (clears) {
+    // CLEARING, dual: git first, home only once git succeeded.
+    const g = writeGit(v.record);
+    if (g.status !== 'appended') return refuseClearingOnGitMiss({ g, store, loud, record: v.record });
+    return { ...homeAppend(record), store, git: g };
+  }
+  // HOLDING, dual: home first (fail safe), then git.
   const home = homeAppend(record);
-  if (store === 'home' || !home.ok) return { ...home, store };
+  if (!home.ok) return { ...home, store };
   const g = writeGit(home.record);
   if (g.status === 'appended') return { ...home, store, git: g };
   return finishGitMiss({ home, g, store, loud, record: home.record });
 }
 
-/** The ratified F4 write-miss posture (`#verdict-ledger-pr-state-store` rule 4). The home row already exists, so
- *  nothing is lost. A CLEARING verdict that missed git does NOT clear: the result is `ok: false`. That signal only
- *  holds for a caller that honours `ok` before it swaps the label (`review-pr-io`, `merge-ai-prs` do;
- *  `review-set-label` still swaps — its append is a non-fatal shadow today). A HOLDING verdict still applies
- *  (`ok: true`) but carries `ledgerWriteMiss: true` for the smell. Both are loud on stderr. When the home spill
- *  ALSO failed, its errors come first, so the cause is never hidden behind the git miss. */
+/** The ratified F4 write-miss posture (`#verdict-ledger-pr-state-store` rule 4), HOLDING half. The home row already
+ *  exists (written first), so the hold stands: `ok` follows the home write, and `ledgerWriteMiss: true` carries the
+ *  smell. Loud on stderr. When the home spill ALSO failed, its errors come first, so the cause is never hidden. */
 function finishGitMiss({ home, g, store, loud, record }) {
-  // A v2 event row has no `verdict`: a ruling that is not `block` clears its finding's hold, so it follows F4 too.
-  const clears = verdictClears(record.verdict) || (record.type === EVENT_TYPES.RULING && record.ruling !== 'block');
-  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} ${record.type ?? 'verdict'}=${record.verdict ?? record.ruling ?? ''}: ${g.error}`
-    + (clears ? ' — clearing event does NOT clear (F4); retry once the ledger transport is reachable' : ' — hold still applies; ledger-write-miss'));
+  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} ${eventLabel(record)}: ${g.error} — hold still applies; ledger-write-miss`);
+  return { ...home, ok: home.ok, store, git: g, ledgerWriteMiss: true, errors: [...(home.errors ?? [])] };
+}
+
+/** The F4 write-miss posture, CLEARING half. A clearing verdict that missed git does NOT clear, and it leaves NO
+ *  home row behind: home is what every fold reads, so a row there would stand in for the missing git row (the fold
+ *  says "already decided", the retry never reaches git). Nothing is lost: the caller keeps the operation resumable
+ *  (`ok: false`, `ledgerWriteMiss: true`) and a retry is a clean re-append. Every caller must honour `ok` before it
+ *  swaps a label (`review-pr-io`, `merge-ai-prs` and `review-set-label` do). */
+function refuseClearingOnGitMiss({ g, store, loud, record }) {
+  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} ${eventLabel(record)}: ${g.error} — clearing event does NOT clear (F4) and NO home row was written; retry once the ledger transport is reachable`);
   return {
-    ...home,
-    ok: home.ok && !clears,
-    store,
-    git: g,
-    ledgerWriteMiss: true,
-    errors: [...(home.errors ?? []), ...(clears ? [`ledger-write-miss: ${g.error}`] : [])],
+    ok: false, path: null, record: null, locked: false, store, git: g, ledgerWriteMiss: true,
+    errors: [`ledger-write-miss: ${g.error}`],
   };
+}
+
+/** `owner/name` of a checkout's `origin` (canonical current slug), or '' when unreadable. Never throws. */
+function originRepoOf(cwd) {
+  try {
+    const url = String(execFileSync('git', ['remote', 'get-url', 'origin'], {
+      encoding: 'utf8', cwd, stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, maxBuffer: 64 * 1024,
+    })).trim();
+    const m = url.match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?$/);
+    return m ? canonicalizeSlug(m[1]) : '';
+  } catch { return ''; }
+}
+
+/** The checkout this module lives in (`scripts/lib/..` → repo root), or null where `import.meta.url` is not a file URL. */
+const MODULE_CHECKOUT = (() => {
+  try { return resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'); } catch { return null; }
+})();
+
+/** Origin per root, memoised ONLY when it was read: a failed probe (timeout, missing dir) is retried next call, never
+ *  pinned for the life of a long-running process. */
+const originMemo = new Map();
+
+/** Candidate board roots: this checkout first, then the constellation's sibling checkouts (`$HOME/workspace/...`). */
+function candidateBoardRoots() {
+  const roots = [MODULE_CHECKOUT];
+  for (const meta of Object.values(CONSTELLATION_REPOS)) {
+    if (meta.path) roots.push(String(meta.path).replace(/^\$HOME(?=\/|$)/, homedir()));
+  }
+  return roots.filter(Boolean);
+}
+
+/**
+ * The git board for a record's repo. Pure apart from the `git remote get-url` probe, which is injectable.
+ *
+ * 1. `opts.board`, then env `WE_VERDICT_LEDGER_BOARD`, trimmed; blank is none.
+ * 2. else the first checkout (this one, then the sibling checkouts) whose `origin` is `repo` (each repo owns its own
+ *    transport branch, `#3261`; a checkout of another repo is never the board, it would put the row where the right
+ *    applier cannot see it).
+ * 3. else null.
+ *
+ * Step 2 is OFF (a) in a test run and (b) on a GitHub Actions runner, unless the caller names `opts.boardRoot`.
+ * (a) a suite must never reach the real remote. (b) the applier workflow (`apply-review-request.yml`) runs this
+ * code with `contents: read`: it cannot push, so resolving its own checkout as the board would fail every clearing
+ * verdict it applies. A runner that does hold a write token names its board explicitly.
+ * @param {string} repo @param {{board?: string, boardRoot?: string, originRepo?: Function}} opts @param {object} env
+ * @returns {string|null}
+ */
+export function resolveLedgerBoard(repo, opts = {}, env = process.env) {
+  const named = String(opts.board ?? env.WE_VERDICT_LEDGER_BOARD ?? '').trim();
+  if (named) return named;
+  if (opts.boardRoot === undefined && (isUnderTest(env) || String(env.GITHUB_ACTIONS ?? '').toLowerCase() === 'true')) return null;
+  const want = canonicalizeSlug(String(repo ?? '').trim()).toLowerCase();
+  if (!want) return null;
+  const roots = opts.boardRoot !== undefined ? [opts.boardRoot].filter(Boolean) : candidateBoardRoots();
+  for (const root of roots) {
+    let have = '';
+    if (opts.originRepo) have = opts.originRepo(root);
+    else {
+      have = originMemo.get(root) ?? '';
+      if (!have) { have = originRepoOf(root); if (have) originMemo.set(root, have); }
+    }
+    if (have && String(have).toLowerCase() === want) return root;
+  }
+  return null;
 }
 
 /** The `verdictLedger.store` setting (declared in `config/platformDefaults.ts`, mirrored here because .mjs cannot

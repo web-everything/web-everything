@@ -15,7 +15,7 @@ export const DISPATCH_TRANSIENT_STAGE = 'dispatch';
 export function classifyPrepareFailure(evidence = {}, stage = undefined) {
   // Match observed error output, never the prompt (which can mention hypothetical failures).
   const error = String(evidence.error ?? evidence.reason ?? '');
-  if (/\bHTTP\s+429\b|\b429 Too Many Requests\b|rate.limit(?: exceeded| reached)|ECONNRESET|ENETUNREACH|EAI_AGAIN|network (?:error|unavailable)/i.test(error)) return 'infra-transient';
+  if (/\bHTTP\s+429\b|\b429 Too Many Requests\b|rate.limit(?: exceeded| reached)|ECONNRESET|ENETUNREACH|EAI_AGAIN|network (?:error|unavailable)|git-ref-lock-transient/i.test(error)) return 'infra-transient';
   // builder-starved-2 (2026-10-07) — the agent never got a lane: `lane-pool.mjs acquire` could not resolve an origin
   // from its scratch cwd (#4174). That is the launcher's fault, not the card's, so it is retried, never held for good.
   if (LANE_ACQUIRE_INFRA_RE.test(`${error}\n${String(evidence.terminal ?? '')}`)) return 'infra-transient';
@@ -99,7 +99,7 @@ export async function recordPrepareFailure({ num, attempt, stage, evidence = {} 
     // count every unfinished, not-yet-re-armed transient failure of this card; at the cap it stays held
     // (`exhausted`) until a re-arm, which starts a fresh budget (a re-armed record no longer counts).
     const attempts = Object.values(state.failures).filter(f => f.num === num && f.cause === 'dispatch-transient' && !f.completed && !f.rearmedAt && !f.budgetResetAt).length + 1;
-    Object.assign(failure, { reasonCode: evidenceReasonCode(evidence), attempts, ...backoffVerdict({ attempts, now, settings }) });
+    Object.assign(failure, { reasonCode: evidenceReasonCode(evidence), attempts, ...backoffVerdict({ attempts, now, settings, code: evidenceReasonCode(evidence) }) });
   }
   state.failures[key] = failure;
   if (cause === 'unknown') {
@@ -156,7 +156,7 @@ export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date
       const at = Date.parse(f.recordedAt ?? f.attempt);
       const attempts = Object.values(state.failures).filter(o => o.num === f.num && o.cause === 'dispatch-transient' && !o.completed && !o.rearmedAt && !o.budgetResetAt).length + 1;
       Object.assign(f, { cause: 'dispatch-transient', healedFrom: 'unknown', reasonCode: code, attempts,
-        ...backoffVerdict({ attempts, now: Number.isFinite(at) ? at : now, settings }) });
+        ...backoffVerdict({ attempts, now: Number.isFinite(at) ? at : now, settings, code }) });
       healed = true;
     }
   }

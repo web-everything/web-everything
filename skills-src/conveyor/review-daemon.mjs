@@ -173,8 +173,12 @@ export async function runDaemonLoop({
 }
 
 /** The labels whose PRs get a per-tick "why not dispatched" line: `review:pending` (the drain parked it for an
- *  independent review, `review-escalation.mjs`) and `ci:failed` (a required check is red — owed a ci-heal). */
-export const EXPLAINED_HOLD_LABELS = ['review:pending', 'ci:failed'];
+ *  independent review, `review-escalation.mjs`), `ci:failed` (a required check is red — owed a ci-heal) and
+ *  `review:human` (a human gate; its refusal reason is the only trace of why no advisory is coming). */
+export const EXPLAINED_HOLD_LABELS = ['review:pending', 'ci:failed', 'review:human'];
+/** `review:human` PRs are explained EVERY tick, including a referral hold (live #4271, 2026-10-07: a ruled PR went
+ *  unlogged for hours because its refusal was dropped here and the notice that excuses the silence is posted once). */
+const ALWAYS_EXPLAINED_LABEL = 'review:human';
 
 /**
  * Live-caught 2026-09-26 (WE PRs #2746–#2758 sat `review:pending` for ~an hour while every tick logged only
@@ -199,7 +203,10 @@ export function explainPendingNotDispatched({ prs, plan, dispatchable = [], defe
     // Referral holds have one durable notice/log, never one explanation per tick.
     // EXCEPT the same-head pause: it has no notice comment and no other log line, so skipping it left a
     // `review:pending` PR (#4288, 2026-10-07) with no logged reason at all.
-    if (plan?.refusals?.some(r => r.prNumber === n
+    const names = (pr?.labels ?? []).map(labelName);
+    // A `review:pending` PR already has its once-per-episode notice; a `review:human` PR without one has nothing.
+    const alwaysExplained = names.includes(ALWAYS_EXPLAINED_LABEL) && !names.includes('review:pending');
+    if (!alwaysExplained && plan?.refusals?.some(r => r.prNumber === n
       && (r.kind === 'review-referrals-pending' || r.reviewRefusal?.kind === 'review-referrals-pending')
       && (r.referralHold ?? r.reviewRefusal?.referralHold)?.kind !== 'same-head')) continue;
     const held = (pr?.labels ?? []).map(labelName).filter((l) => EXPLAINED_HOLD_LABELS.includes(l));

@@ -4,78 +4,64 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs"]
+scope: ["we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper*.test.mjs"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-09-30"
-preparedAgainstSha: "791a95f338b860408ea254f16d51be92d05246a3"
+preparedDate: "2026-10-07"
+preparedAgainstSha: "75bf1ba119e1f94d53c53fcb4d4b8904c5077d85"
 tags: []
 ---
 
 # File the prevention guard(s) owed by chalbert/web-everything#2855's independent review
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-
-1. `we:scripts/operations/deliver-item-wrapper.mjs:353` — When a comment justifies an ordering or atomicity choice, require one test that spies on both calls and asserts their order. A review-lens checklist item is the cheapest route, since a lint rule cannot decide this.
-2. `we:scripts/operations/deliver-item-wrapper.mjs:330` — Give release primitives an owner-token parameter that is required by default, so a release by resource key alone has to be an explicit opt-out. A lint or write-gate could flag calls to releaseBuildDispatchClaim that pass no owner. Until then, file a follow-up card for the ownership token.
-3. `we:scripts/operations/deliver-item-wrapper.mjs:339` — Persist the non-PR hold before publishing settlement, and add a deterministic fault-injection test that stops after each persistence step and runs a daemon tick to assert that redispatch remains excluded.
+Filed mechanically on approval: the independent review owed three prevention guards — an order-test review checklist, ownership-aware claim release, and durable non-PR hold persistence before settlement. This item implements the ordering guard and files the other two debts after deduplication.
 
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2855@a538d451018986910658228b551e5b2825fd4b3c
 
-## Done when
+## Progress
 
-1. **Executable** — `npx vitest run we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs` passes with new
-   cases (the hold is durable when the run-store settle fires; claim released last) that fail on today's code,
-   where `settleDispatchEffect` runs first.
-2. **Filed** — the review-lens checklist item (guard 1) and the owner-token card (guard 2) exist as backlog items.
+- Premise rechecked at WE `75bf1ba119e1f94d53c53fcb4d4b8904c5077d85`. This is source inspection, not a running-system verification. The goal is not already delivered: `settleTerminal` still settles first, then places the hold, then releases the claim (we:scripts/operations/deliver-item-wrapper.mjs:346-365).
+- **Old premise:** the original wrapper citations were lines 330/339/353; the previous preparation cited daemon lines 314/349-367, treated an order spy as a substitute for interruption testing, and expected a PR outcome to release its claim. **Corrected premise:** the current ordering is at we:scripts/operations/deliver-item-wrapper.mjs:346-365; daemon hold collection is at we:skills-src/conveyor/build-dispatch-daemon.mjs:480 and settled-claim retirement plus candidate exclusion at we:skills-src/conveyor/build-dispatch-daemon.mjs:518-557. PR success intentionally retains its claim (we:scripts/operations/deliver-item-wrapper.mjs:630; existing test we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs:3820). Restore deterministic persistence-boundary fault injection with a real tick; final-state or order assertions alone do not satisfy guard 3.
+- **Old scope:** wrapper plus we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs. **Corrected scope:** same production file, with the permitted we:scripts/operations/__tests__/deliver-item-wrapper*.test.mjs pattern to include a separate ordering/persistence suite. Existing terminal fixtures start at we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs:3428; its non-PR test checks only final state at lines 3565-3573. The separate suite avoids changing that file's real-store mock assumptions. No daemon or claim implementation change is needed; both are imported as existing dependencies. Filing the two named follow-ups remains an implementation deliverable, not an edit performed during this preparation.
+- Size remains **3**: one local reorder plus isolated order/persisted-prefix tests, using the existing terminal fixture and daemon tick seam. No ownership protocol redesign is included. Preparation stamps are left to the runner.
 
 ## Design
 
-Premise check (current `main`, `791a95f33`): still valid, not done. The cited lines have drifted — the code is
-now `settleTerminal` in `deliverItem` (`we:scripts/operations/deliver-item-wrapper.mjs` ~L330-365).
+For terminal exits requesting a hold, execute **hold → settle → release** in `settleTerminal` (we:scripts/operations/deliver-item-wrapper.mjs:346). Keep the at-most-once latch, outcome merging, optional run identity, and per-operation best-effort handling. Move the existing hold block ahead of settlement and update its comment to explain both settlement and release ordering. Do not change which terminal outcomes request a hold or release.
 
-- **Guard 3 is a real, open gap.** `settleTerminal` calls `settleDispatchEffect(...)` FIRST, then
-  `placeBuildDispatchHold`, then `releaseBuildDispatchClaim`. Its comment argues "hold BEFORE release" but
-  settlement publishes the outcome before the hold is durable. Harm path: the daemon's `doneWhy` (`we:skills-src/conveyor/build-dispatch-daemon.mjs` ~L349-367) retires a claim on a settled non-PR row, so a crash between settle and hold leaves a settled row + no hold + a retirable claim, and `heldNums` (~L314) no longer excludes the item — it can redispatch.
-  Fix: reorder to hold → settle → release (hold only when `hold` is set). Hold-before-release is already in place.
-- **Guard 1 (comment-justified ordering needs an order test)** has no test today: no case in
-  `we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs` (describe at ~L3393) asserts the order of hold,
-  settle and release. Add spy-based cases. The review-lens checklist wording lives outside this item's scope.
-- **Guard 2 (owner token on release)** is already documented as a KNOWN GAP in
-  `we:scripts/conveyor/build-dispatch-claim.mjs#releaseBuildDispatchClaim`, which says closing it touches four
-  files (daemon tick, `dispatch-lane` boundary, wrapper launch payload, claim module). That is far outside this
-  item's `scope:`; the guard itself says to file a follow-up card. So the Must here is only filing that card.
+Why settlement matters: the daemon can retire a still-present claim from a matching settled non-PR row (we:skills-src/conveyor/build-dispatch-daemon.mjs:525-541). A crash after today's settlement but before the hold therefore leaves neither an in-flight exclusion nor a durable hold after retirement. The candidate filter only excludes held items when the hold is actually present (we:skills-src/conveyor/build-dispatch-daemon.mjs:557).
 
-Scope check: the two scoped files (wrapper + its test) fit the Musts below; unchanged.
+The guarantee is bounded: after a **successful hold write**, every subsequent completed persistence boundary preserves exclusion while that hold remains unexpired. Hold replacement itself deletes then reserves (we:scripts/conveyor/build-dispatch-claim.mjs:151-156); this item does not promise atomic replacement, recovery from failed storage, protection after TTL expiry, or owner-safe release. Preserve best-effort outcome reporting and explicitly test its exceptions without claiming they provide durable exclusion.
+
+Use a dedicated proposed suite, we:scripts/operations/__tests__/deliver-item-wrapper-ordering.test.mjs. Partial mocks wrap the real hold, settlement, and release functions, record their call order, and copy the temporary coordination/run-store directories immediately after each completed operation. These immutable disk snapshots model interruption after that persistence boundary: subsequent wrapper writes must never reach the snapshot. For each snapshot, invoke the real `runBuildDispatchTick` from we:skills-src/conveyor/build-dispatch-daemon.mjs with disk-backed claim/hold reads and run rows derived from that snapshot; stub external queue/PR/provider effects. This tests the persisted prefixes without pretending that a swallowed throwing spy stops execution. No production fault-injection hook or host daemon is required.
 
 ## MVP
 
-Musts only:
-1. Reorder `settleTerminal` so the hold is placed before `settleDispatchEffect`, and the claim release stays last.
-2. Order-spy tests for that sequence (see Test plan).
-3. File the owner-token card and the review-lens checklist card listed under Follow-ups (filing only).
-
-OUT of scope (see Follow-ups): implementing the owner-token change, the review-lens checklist edit, a write-gate/lint rule.
+1. Reorder hold persistence before settlement and keep claim release last in we:scripts/operations/deliver-item-wrapper.mjs. Preserve no-hold and once-only behavior.
+2. Add order spies and the deterministic persisted-prefix/tick cases in we:scripts/operations/__tests__/deliver-item-wrapper-ordering.test.mjs. Use real temporary stores, not fabricated postconditions.
+3. Deduplicate and file or link the two owed backlog items: ordering-comment review checklist and per-attempt owner-token release. Record their assigned identifiers here during implementation. Implementing those two mechanisms is outside this story.
 
 ## Test plan
 
-Added to the `deliverItem (#4349 …)` describe in `we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs`. The claim/hold functions are the real ones under `WE_COORDINATION_ROOT`; order is recorded by a `vi.mock` of `we:scripts/operations/deliver-item-settle.mjs` (wrapping the original `settleDispatchEffect`) whose spy reads `listBuildDispatchHolds()` at the moment settle fires.
-- **hold durable when settle fires** — for a `not-ready` finish, the settle spy sees item 9001 already in `listBuildDispatchHolds()`. RED today: settle is called before the hold is placed.
-- **claim still present when settle fires, absent after** — pins hold → settle → release (green today for release-last; guards the reorder).
-- **no hold → settle and release still happen** (PR outcome / `hold` null) — regression guard.
-- A true crash-between-steps test is deliberately NOT included: each step sits in its own best-effort `try/catch`, so a throwing spy is swallowed and proves nothing; a real kill needs a child-process harness (Follow-up). "Hold durable at settle time" is the deterministic stand-in: if the hold exists whenever settle runs, a crash at any later point leaves the item excluded.
+- Reuse the non-PR delivery setup at we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs:3536 in the new ordering suite. Spy on all three operations while delegating to their real implementations. Assert exact hold → settle → release order, the actual hold on disk when settlement starts, and the claim present during settlement but absent after release. Cover both `not-ready` and `gate-red`.
+- Capture isolated persisted-prefix snapshots after hold, after settle, and after release. Freeze time inside the hold lease, keep the item in the cleared queue and spawn proposal, provide no PR, and make the settled row match the claim's attempt timestamp. Run the real tick against each snapshot with dispatch calls recorded; assert zero redispatch. Include a positive control with an eligible unheld, unclaimed item and spare budget that actually dispatches, so unrelated admission gates cannot make the test vacuous. Use the effects-injection patterns in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
+- Run the same capture harness against the old settlement-first sequence: the after-settle snapshot must have no hold, allow claim retirement, and permit redispatch. This is the regression's red evidence, not a synthetic hand-authored state standing in for wrapper execution.
+- Verify `pr-opened` settles without hold or release; missing run identity still permits hold/release; a later telemetry throw cannot perform terminal side effects twice. Existing regression coverage includes we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs:3820 and we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs:3930.
+- Inject individual persistence exceptions to pin best-effort reporting and at-most-once behavior. Do not assert crash safety when the hold write fails. Reset mocks/environment and delete all temporary snapshots after each case.
 
 ## Proof plan
 
-1. Before: run the new tests on `origin/main` code — show the hold-durable-at-settle case failing.
-2. After: same command green; also the full wrapper test file and `we:scripts/operations/__tests__/deliver-item-settle.test.mjs`.
-3. Probe: a small node script with a temp `WE_COORDINATION_ROOT` driving a `not-ready` finish with a settle stub that prints whether the hold exists when it fires — `false` before the change, `true` after.
+1. During implementation, run the new suite with the original ordering and save the failing order assertion and after-settle redispatch observation; then apply the reorder and obtain green results from the identical suite. No reset of unrelated lane work is necessary.
+2. Run tests only through we:scripts/readiness/heavy-admission.mjs: queue Vitest for we:scripts/operations/__tests__/deliver-item-wrapper-ordering.test.mjs, we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs, we:scripts/operations/__tests__/deliver-item-settle.test.mjs, and we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs. The invocation is Node on that admission script with `run -- npx vitest run` followed by checkout-relative paths (strip the documentation-only `we:` prefix).
+3. Queue `npm run check:standards` through the same admission script. Record command results, persisted snapshot contents, and tick dispatch counts. The snapshots plus real tick are the local behavioral proof; do not claim a production daemon soak or a real process-kill test.
+4. Confirm both owed follow-up identifiers are linked and represent the specific guards, not merely neighboring ownership/checklist work. No implementation, tests, or new cards are executed as part of this preparation; runner owns preparation validation and stamping.
 
 ## Follow-ups
 
-- File: owner-token parameter for `releaseBuildDispatchClaim`/claim release (required by default; opt-out
-  explicit) threaded through daemon tick → dispatch-lane → wrapper launch payload; add a lint/write-gate flag for
-  owner-less release calls. (Guard 2.)
-- File: add "comment justifies an ordering/atomicity choice → needs an order-spy test" to the review-lens
-  checklist (converge/jury lens config). (Guard 1, checklist half.)
-- File: CAS semantics for `applyPendingEffects`'s post-sink write (already named in `we:scripts/operations/deliver-item-settle.mjs`).
-- File: child-process kill-point harness for `settleTerminal` (true crash-between-steps test with a real daemon tick).
+- **Required filing — guard 1:** a review-lens checklist item requiring an order-spy test whenever a comment justifies an ordering/atomicity choice. Include the terminal ordering comment and new test as its motivating example (we:scripts/operations/deliver-item-wrapper.mjs:354). Deduplicate before filing; implementing the checklist change belongs to that follow-up.
+- **Required filing — guard 2:** require a per-attempt owner token by default for `releaseBuildDispatchClaim`, with resource-only release an explicit opt-out. The current unchecked deletion and threading gap are documented at we:scripts/conveyor/build-dispatch-claim.mjs:73-89. The follow-up must trace acquisition through daemon dispatch, CLI boundary and wrapper launch, test stale-attempt release against a newer claim, and consider an owner-less-call lint/write gate. Do not implement or choose its full ownership protocol here.
+- The remaining run-store read/write CAS race is separate debt, already described at we:scripts/operations/deliver-item-settle.mjs:24-27. Do not conflate that race with this ordering fix or require its implementation here.
+- Real process-kill testing and failed-hold/atomic-replacement recovery remain separate hardening; the deterministic completed-persistence-prefix tests above are required here, not deferred.
+
+## Done when
+
+The ordering suite fails against settlement-first code and passes after hold-first ordering; each successful persistence-prefix snapshot excludes redispatch through the real tick; existing terminal semantics remain green; and the two required follow-up cards are linked. Claims are limited to successful hold persistence within its lease.

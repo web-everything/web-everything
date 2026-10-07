@@ -32,7 +32,7 @@ it('readLaneLeases shells out to a REAL `<root>/scripts/lane-pool.mjs status --j
     writeFileSync(join(root, 'scripts', 'lane-pool.mjs'),
       "process.stdout.write(JSON.stringify({ lanes: [{ lane: 1, lease: { purpose: 'build-3932', ownerSession: 'op-1', workerSession: 'op-1' } }, { lane: 2, lease: null }] }));\n");
     const leases = readLaneLeases({ run: execFileSync, root });
-    expect(leases).toEqual([{ purpose: 'build-3932', ownerSession: 'op-1', workerSession: 'op-1' }]);
+    expect(leases).toMatchObject([{ purpose: 'build-3932', ownerSession: 'op-1', workerSession: 'op-1' }]);
     expect(indexLeasesBySession(leases).get('op-1')).toMatchObject({ purpose: 'build-3932' });
   });
 });

@@ -12,13 +12,14 @@
  *   sibling run B would claim the marker.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync } from 'node:fs';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync, renameSync } from 'node:fs';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { acquireRunnerLease, makeOwner, heartbeatRunnerLease, RUNNER_LEASE_MINUTES } from '../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../../skills-src/conveyor/verify-daemon.mjs';
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
+import { verifyFinishBody } from '../lib/lane-verify.mjs';
 import { GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../conveyor/verify-dispatch.mjs';
 
 const VERIFY_LANE = resolve(process.cwd(), 'scripts/verify-lane.mjs');
@@ -435,6 +436,64 @@ describe('verify-lane check --wait= (#4358) — a bounded internal wait, one CLI
     expect(json.status).toBe('running');
     expect(json.waited).toBeUndefined(); // the non-wait path never adds wait bookkeeping
   });
+
+  /**
+   * #4412 — a polling tool must be integration-tested while its target changes AFTER the loop starts. Runs the real
+   * CLI with real timers and real marker reads. The writer is synchronized to the wait's first 2000ms sleep (a
+   * child-only preload wraps setTimeout, delegates to the real one, and reports over IPC) — never a guessed delay,
+   * so a too-early marker update cannot turn this into a first-poll pass (asserted via `polls > 1` too).
+   */
+  it.each([
+    ['green', 0, 0],
+    ['red', 1, 2],
+  ])('a running marker that turns %s AFTER the CLI wait began settles it (real timers, real marker reads)', async (terminal, gateExit, cliExit) => {
+    runRequestOnly();
+    const sha = headSha();
+    const preloadDir = mkdtempSync(join(tmpdir(), 'verify-wait-preload-'));
+    const preload = join(preloadDir, 'first-sleep.cjs');
+    writeFileSync(preload, [
+      'const real = global.setTimeout; let sent = false;',
+      'global.setTimeout = function (fn, ms, ...a) {',
+      "  if (!sent && ms === 2000 && process.send) { sent = true; process.send({ firstSleep: true }); }",
+      '  return real.call(this, fn, ms, ...a);',
+      '};',
+    ].join('\n'));
+    // The child must see the strict defaults: no opt-out and no break-glass.
+    const env = { ...process.env };
+    delete env.WE_REQUIRE_VERIFIED;
+    delete env.WE_LAND_UNVERIFIED;
+    const child = spawn('node', ['--require', preload, VERIFY_LANE, 'check', '--wait=60000', '--json'], {
+      cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    // 'close', not 'exit': it fires only after the piped stdout/stderr are fully drained, so the JSON verdict is never truncated.
+    const exited = new Promise((res) => child.once('close', (code) => res(code)));
+    const timeout = (ms, what) => new Promise((_, rej) => setTimeout(() => rej(new Error(`${what} timed out after ${ms}ms; stdout=${stdout} stderr=${stderr}`)), ms).unref());
+    try {
+      await Promise.race([
+        new Promise((res) => child.once('message', (m) => { if (m?.firstSleep) res(); })),
+        exited.then((code) => { throw new Error(`CLI exited (${code}) before its first sleep; stdout=${stdout} stderr=${stderr}`); }),
+        timeout(20_000, 'first-sleep handshake'),
+      ]);
+      const running = JSON.parse(readFileSync(marker(), 'utf8'));
+      expect(running.status).toBe('running');
+      const tmp = `${marker()}.writer.tmp`;
+      writeFileSync(tmp, JSON.stringify(verifyFinishBody(running, { finishedAt: new Date().toISOString(), exitCode: gateExit })) + '\n');
+      renameSync(tmp, marker()); // atomic — never a torn read that parses as a spurious corrupt verdict
+      const code = await Promise.race([exited, timeout(30_000, 'CLI completion')]);
+      const json = JSON.parse(stdout.trim().split('\n').pop());
+      expect(code).toBe(cliExit);
+      expect(json).toMatchObject({ status: terminal, settled: true, ok: terminal === 'green', sha });
+      expect(json.waited.polls).toBeGreaterThan(1);
+    } finally {
+      if (child.exitCode === null) child.kill('SIGKILL');
+      await exited; // reap before fixture cleanup
+      rmSync(preloadDir, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   /** `request` with a gate that would never actually run (a plain no-op if it did) — a plain in-flight
    *  `running` marker for HEAD that nothing here ever finishes. */
@@ -1073,7 +1132,7 @@ import { appendFileSync, writeFileSync } from 'node:fs';
 import { admissionLockRoot, heldSlots } from ${JSON.stringify(admissionModule)};
 const args = process.argv.slice(2);
 const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fastSlots: 1 });
-appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD }) + '\\n');
+appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null }) + '\\n');
 if (${live} && args[0] === 'vitest') {
   const { spawnSync } = await import('node:child_process');
   const result = spawnSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(args[1] === 'related' ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit' });
@@ -1147,6 +1206,27 @@ process.exit(${standardsExit});
       });
       expect(phases.admissionWaitMs).toBe(phases.admissionPhases.vitest.waitedMs + phases.admissionPhases.standards.waitedMs);
     }
+  });
+
+  // #5189 — dispatcher's per-run nonce: echoed on the later queue/started markers, never visible to a gate command.
+  it('echoes WE_VERIFY_MARKER_NONCE on later markers and hides it from gate commands', () => {
+    const nonce = 'abcdef0123456789abcdef0123456789';
+    const f = fixture();
+    const result = f.invoke([], { WE_VERIFY_MARKER_NONCE: nonce });
+    expect(result.code).toBe(0);
+    const lines = result.stderr.split('\n');
+    const later = lines.filter(line => line.startsWith(`⏳ ${GATE_QUEUED_MARKER}`) || line.startsWith(`⏱ ${GATE_STARTED_MARKER} (phase:`));
+    expect(later).toHaveLength(4);
+    for (const line of later) expect(line.endsWith(` [nonce=${nonce}]`)).toBe(true);
+    expect(lines.filter(line => line.includes(nonce)).length).toBe(later.length);
+    for (const call of f.calls()) expect(call.nonce).toBeNull();
+  });
+
+  it('emits unsuffixed markers when no nonce is set (verify-lane run directly)', () => {
+    const f = fixture();
+    const result = f.invoke();
+    expect(result.stderr).not.toContain('[nonce=');
+    for (const call of f.calls()) expect(call.nonce).toBeNull();
   });
 
   it('retries only failed files once with one worker, then runs standards and records why', () => {

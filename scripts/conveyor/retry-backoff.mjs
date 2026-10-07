@@ -24,14 +24,53 @@ export function backoffDelayMs(attempt, settings = BACKOFF_DEFAULTS) {
   return Math.min(settings.maxMs, settings.baseMs * 2 ** Math.min(n - 1, 30));
 }
 
-/** `{retryAfter, exhausted}` for a card that has now failed `attempts` times. */
-export function backoffVerdict({ attempts, now = Date.now(), settings = BACKOFF_DEFAULTS }) {
-  if (attempts >= settings.maxAttempts) return { retryAfter: null, exhausted: true };
-  return { retryAfter: new Date(now + backoffDelayMs(attempts, settings)).toISOString(), exhausted: false };
+/**
+ * Reason codes that mean "the launch is merely LATE", not "the launch failed": the dispatch run reported
+ * `effect-in-flight` (the detached dispatch has not finished) so no session was seen yet. Nothing about the card
+ * or the host is wrong, so the retry is quick (30 s doubling to 2 min) instead of the 5-60 min failure path that a
+ * real failure gets. (Live #4647: it waited on the long path.)
+ *
+ * Bounded, but by TOTAL WINDOW, not by the same attempt count (PR #4323 review): keeping `maxAttempts` at 6 with
+ * waits of 30s..2min gave up after ~7.5 minutes instead of the failure path's ~135, an earlier permanent hold
+ * for a launch that is merely slow under host load. The quick schedule therefore gets as many attempts as it
+ * needs to cover at least the window the failure path would have given the same settings (hard-capped).
+ */
+export const QUICK_RETRY_REASON_CODES = Object.freeze(['launch-in-flight']);
+export const QUICK_RETRY = Object.freeze({ baseMs: 30_000, maxMs: 2 * 60_000, maxAttemptsCeiling: 500 });
+
+/** Total time the retries wait before a card is exhausted: the sum of the delays after attempts 1..maxAttempts-1. */
+export function retryWindowMs(settings = BACKOFF_DEFAULTS) {
+  let total = 0;
+  for (let n = 1; n < settings.maxAttempts; n++) total += backoffDelayMs(n, settings);
+  return total;
+}
+
+export function settingsForReason(code, settings = BACKOFF_DEFAULTS) {
+  if (!QUICK_RETRY_REASON_CODES.includes(code)) return settings;
+  const quick = { ...settings, baseMs: Math.min(settings.baseMs, QUICK_RETRY.baseMs), maxMs: Math.min(settings.maxMs, QUICK_RETRY.maxMs) };
+  // An operator-set attempt count at or past the ceiling already gives more attempts than the quick schedule ever
+  // needs; do not walk it (the setting is an unbounded number).
+  if (!(settings.maxAttempts < QUICK_RETRY.maxAttemptsCeiling)) return { ...quick, maxAttempts: settings.maxAttempts };
+  const target = retryWindowMs(settings);
+  let window = retryWindowMs(quick);
+  let attempts = quick.maxAttempts;
+  while (window < target && attempts < QUICK_RETRY.maxAttemptsCeiling) {
+    window += backoffDelayMs(attempts, quick);
+    attempts += 1;
+  }
+  return { ...quick, maxAttempts: attempts };
+}
+
+/** `{retryAfter, exhausted}` for a card that has now failed `attempts` times. `code` picks the quick schedule for a late launch. */
+export function backoffVerdict({ attempts, now = Date.now(), settings = BACKOFF_DEFAULTS, code = null }) {
+  const effective = settingsForReason(code, settings);
+  if (attempts >= effective.maxAttempts) return { retryAfter: null, exhausted: true };
+  return { retryAfter: new Date(now + backoffDelayMs(attempts, effective)).toISOString(), exhausted: false };
 }
 
 /** Reason codes: why a dispatch failed, in a form a card/status page can group on. `null` = not a known transient. */
 const RULES = [
+  ['launch-in-flight', /effect-in-flight/i],
   ['launch-not-confirmed', /dispatch launch not confirmed|launch not confirmed/i],
   ['checkout-behind-origin', /dispatching checkout is \d+ commit|managed clone is \d+ commit|checkout-behind-origin/i],
   ['launch-spawn-failed', /launch-spawn-failed/i],

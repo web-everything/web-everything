@@ -339,7 +339,7 @@ describe('the two readers that decide "is a review running" see job rows (x26lw6
 
   it('reconcile-pass#defaultReadAgents merges the live jobs into the claude agents listing', () => {
     const exec = () => JSON.stringify([{ name: 'fix-3', state: 'working', pid: 5, startedAt: Date.now() }]);
-    const rows = defaultReadAgents({ exec, env: {}, completionFor: () => null, hungInfoFor: () => null, listJobs: () => [jobRow] });
+    const rows = defaultReadAgents({ exec, env: { WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' }, completionFor: () => null, hungInfoFor: () => null, listJobs: () => [jobRow] });
     expect(rows.map((r) => r.name)).toEqual(['fix-3', 'review-10']);
   });
 

@@ -18,6 +18,28 @@ export const DEFAULT_INFRA_CANCELLED_MODE = 'rerun';
 /** Max confirmed re-run requests per PR head before falling back to ci-heal. */
 export const DEFAULT_INFRA_CANCELLED_MAX_RERUNS = 6;
 
+/**
+ * Knob: a job that held a runner and RAN for at least this many minutes before it was cancelled is a HUNG job (it hit
+ * its own `timeout-minutes`), not an infra casualty. An outage cancels a job early or never gives it a runner; a
+ * deterministic hang cancels it at the full timeout every time, so a mechanical re-run only repeats it (PR #4235:
+ * `soak-shard (1)` hung on one scenario for six 15-minute attempts while the required `daemon-soak` read "pending").
+ * Env `WE_CI_HUNG_JOB_MINUTES`; `0` disables (every cancelled job stays infra).
+ */
+export const DEFAULT_HUNG_JOB_MINUTES = 10;
+export function resolveHungJobMinutes(env = process.env) {
+  const raw = env.WE_CI_HUNG_JOB_MINUTES;
+  const n = Number(raw);
+  return raw !== undefined && raw !== '' && Number.isFinite(n) && n >= 0 ? n : DEFAULT_HUNG_JOB_MINUTES;
+}
+
+/** Did this cancelled job run on a runner for >= the hung-job threshold? */
+export function isHungJob(job, { hungMinutes = resolveHungJobMinutes() } = {}) {
+  if (!job || !hungMinutes || String(job.conclusion ?? '').toLowerCase() !== 'cancelled') return false;
+  if (!job.runner_name && !job.runner_id) return false;
+  const start = Date.parse(job.started_at ?? ''); const end = Date.parse(job.completed_at ?? '');
+  return Number.isFinite(start) && Number.isFinite(end) && end - start >= hungMinutes * 60_000;
+}
+
 const INFRA_CONCLUSIONS = Object.freeze(['cancelled', 'startup_failure']);
 
 /**
@@ -25,8 +47,10 @@ const INFRA_CONCLUSIONS = Object.freeze(['cancelled', 'startup_failure']);
  * True for conclusion cancelled / startup_failure, or a completed non-success job that never got a runner and
  * ran no step (no logs can exist for it).
  */
-export function isInfraCancelledJob(job) {
+export function isInfraCancelledJob(job, opts) {
   if (!job || String(job.status ?? 'completed').toLowerCase() !== 'completed') return false;
+  // A job that ran to its own timeout is a hang (a real failure with a log), not infra: it goes to ci-heal.
+  if (isHungJob(job, opts)) return false;
   const conclusion = String(job.conclusion ?? '').toLowerCase();
   if (INFRA_CONCLUSIONS.includes(conclusion)) return true;
   if (['success', 'skipped', 'neutral'].includes(conclusion)) return false;

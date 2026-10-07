@@ -438,3 +438,85 @@ describe('builder-starved — clone-wide refusals and stale holds self-heal (202
     expect(st.c).toMatchObject({ held: true, cause: 'unknown' }); // a result-stage failure keeps its diagnose hold
   });
 });
+
+describe('a late launch (effect-in-flight) retries quickly, not on the failure path (live #4647)', () => {
+  const IN_FLIGHT = `${NOT_CONFIRMED} [stdout: { "op": "dispatch-lane", "stopped": "effect-in-flight" }]`;
+  const DEFAULTS = readBackoffSettings({});
+  it('has its own reason code, ahead of launch-not-confirmed; a plain not-confirmed keeps its code', () => {
+    expect(reasonCodeOf(IN_FLIGHT)).toBe('launch-in-flight');
+    expect(reasonCodeOf(NOT_CONFIRMED)).toBe('launch-not-confirmed');
+  });
+  it('waits 30s doubling to 2min with the default settings, and a real failure still waits 5min', () => {
+    const now = Date.parse('2026-10-07T20:00:00Z');
+    const at = (code, attempts) => Date.parse(backoffVerdict({ attempts, now, settings: DEFAULTS, code }).retryAfter) - now;
+    expect([1, 2, 3, 4].map((n) => at('launch-in-flight', n))).toEqual([30_000, 60_000, 120_000, 120_000]);
+    expect(at('launch-not-confirmed', 1)).toBe(5 * 60_000);
+  });
+  it('stays bounded, and never gives up sooner than the failure path would (PR #4323 review)', () => {
+    const now = 0;
+    const waits = (code) => { let total = 0; let n = 1; for (; ; n++) { const v = backoffVerdict({ attempts: n, now, settings: DEFAULTS, code }); if (v.exhausted) return { total, n }; total += Date.parse(v.retryAfter) - now; } };
+    const slow = waits('launch-not-confirmed');
+    const quick = waits('launch-in-flight');
+    expect(slow.total).toBe(135 * 60_000);
+    expect(quick.total).toBeGreaterThanOrEqual(slow.total);
+    expect(quick.n).toBeLessThan(500);
+    expect(backoffVerdict({ attempts: quick.n, settings: DEFAULTS, code: 'launch-in-flight' })).toEqual({ retryAfter: null, exhausted: true });
+    expect(backoffVerdict({ attempts: DEFAULTS.maxAttempts, settings: DEFAULTS, code: 'launch-in-flight' }).exhausted).toBe(false);
+  });
+  it('does not walk an absurdly large operator attempt cap (it is an unbounded number)', () => {
+    const huge = readBackoffSettings({ WE_DISPATCH_RETRY_MAX_ATTEMPTS: '300000000' });
+    const t0 = Date.now();
+    const v = backoffVerdict({ attempts: 1, now: 0, settings: huge, code: 'launch-in-flight' });
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(v.exhausted).toBe(false);
+  });
+  it('honours an operator-tightened budget: a smaller base or attempt cap still bounds the quick window by the failure path\'s own', () => {
+    const tight = readBackoffSettings({ WE_DISPATCH_RETRY_BASE_MS: '1000', WE_DISPATCH_RETRY_MAX_MS: '4000', WE_DISPATCH_RETRY_MAX_ATTEMPTS: '3' });
+    let total = 0; let n = 1;
+    for (; n < 100; n++) { const v = backoffVerdict({ attempts: n, now: 0, settings: tight, code: 'launch-in-flight' }); if (v.exhausted) break; total += Date.parse(v.retryAfter); }
+    expect(total).toBeGreaterThanOrEqual(1000 + 2000);
+    expect(n).toBeGreaterThanOrEqual(3);
+  });
+  // One assertion per call site that threads `code` into backoffVerdict (PR #4323 review): dropping it at any of them
+  // silently sends a late launch back to the 5-60 min failure path.
+  it('a BUILD dispatch failure with that evidence also waits 30s (recordBuildFailure threads the reason code)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'quick-retry-build-'));
+    try {
+      const path = join(dir, 'b.json');
+      const now = Date.parse('2026-10-07T20:00:00Z');
+      const r = recordBuildFailure({ num: '4647', reason: IN_FLIGHT }, { path, now, settings: DEFAULTS });
+      expect(r).toMatchObject({ reasonCode: 'launch-in-flight', attempts: 1, exhausted: false });
+      expect(Date.parse(r.retryAfter) - now).toBe(30_000);
+      expect(Date.parse(recordBuildFailure({ num: '4647', reason: IN_FLIGHT }, { path, now, settings: DEFAULTS }).retryAfter) - now).toBe(60_000);
+      // the same record under the slow path still waits 5 min, so the assertion above can only pass via the code
+      expect(Date.parse(recordBuildFailure({ num: '4648', reason: NOT_CONFIRMED }, { path, now, settings: DEFAULTS }).retryAfter) - now).toBe(5 * 60_000);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('a healed (unknown -> transient) prepare record with that evidence is released on the quick window (releaseDuePrepareRetries threads the reason code)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'quick-retry-healed-'));
+    try {
+      const path = join(dir, 'f.json');
+      const at = Date.parse('2026-10-07T20:00:00Z');
+      writeFileSync(path, JSON.stringify({ cards: {}, failures: {
+        a: { num: '4647', attempt: 'a', stage: 'dispatch', cause: 'unknown', held: true, retry: false, evidence: { reason: IN_FLIGHT }, recordedAt: new Date(at).toISOString() },
+      } }));
+      expect(releaseDuePrepareRetries({ path, now: at + 29_000, settings: DEFAULTS })).toEqual([]);
+      const healed = readFailureState(path).failures.a;
+      expect(healed).toMatchObject({ cause: 'dispatch-transient', healedFrom: 'unknown', reasonCode: 'launch-in-flight' });
+      expect(Date.parse(healed.retryAfter) - at).toBe(30_000);
+      expect(releaseDuePrepareRetries({ path, now: at + 31_000, settings: DEFAULTS })).toEqual(['4647']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('a prepare failure with that evidence is held for a short retry and released on the next tick after it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'quick-retry-'));
+    try {
+      const path = join(dir, 'failures.json');
+      const now = Date.parse('2026-10-07T20:00:00Z');
+      const f = await recordPrepareFailure({ num: '4647', attempt: 'a1', stage: 'dispatch', evidence: { reason: IN_FLIGHT } }, { path, fileCard: vi.fn(), now, settings: DEFAULTS });
+      expect(f).toMatchObject({ cause: 'dispatch-transient', reasonCode: 'launch-in-flight', held: true });
+      expect(Date.parse(f.retryAfter) - now).toBe(30_000);
+      expect(releaseDuePrepareRetries({ path, now: now + 29_000, settings: DEFAULTS })).toEqual([]);
+      expect(releaseDuePrepareRetries({ path, now: now + 31_000, settings: DEFAULTS })).toEqual(['4647']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
