@@ -3,9 +3,10 @@ bornAs: x1ufaw9
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/lib/daemon-rebuild/prepare.mjs", "we:scripts/lib/daemon-rebuild/__tests__/prepare*.test.mjs", "we:scripts/lib/__tests__/daemon-rebuild.test.mjs"]
 dateOpened: "2026-10-01"
+dateResolved: "2026-10-07"
 preparedDate: "2026-10-06"
 preparedAgainstSha: "6bdc91ca614745e7caf4fdc9a47d7e90cc0924c3"
 tags: []
