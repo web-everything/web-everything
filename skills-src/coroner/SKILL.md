@@ -25,7 +25,7 @@ node scripts/operations/coroner-extract.mjs --since=<ISO|last> --json > "$SCRATC
     `still-red-after-isolated-retry` (isolated-retry verdicts), `vitest-timeout`, `verify-wait-timeout`,
     `killed-superseded` (verify-daemon). Lane markers keep only each lane's last two runs, so this is a sample.
   - `ci`: PR workflow runs from `gh` (bounded: 5 run pages, 40 job lookups). Red by cause class
-    (`real-code-defect`, `flaky` = same head went green later, `infra-cancelled`, `soak-scenario`) and `byCheck`
+    (`real-code-defect`, `soak-scenario`, `infra`), only the latest run per PR head and workflow, with `superseded` (cancelled), `flakyRecovered` and `awaitingReview` (review-gate, by design) reported apart and `byCheck`
     (test-shard, soak-shard, daemon-soak, smoke, review-gate, CodeQL). `WE_CORONER_NO_CI=1` skips gh.
   - `fixSessions`: fix and ci-heal sessions by outcome (`pushed`, `gate-red-not-pushed`, `load-flake-hold`, `blocked`,
     `escalated`, `no-op`, `stopped-without-outcome`, `other`) plus `rounds` per PR.

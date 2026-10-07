@@ -258,7 +258,7 @@ describe('coroner error rates (reported first)', () => {
       wf(3, 'CI', 'failure', 'bbb2222', 11, 2), wf(4, 'Review gate', 'cancelled', 'ccc3333', 12, 3),
       wf(5, 'Soak replay gate', 'failure', 'ddd4444', 13, 4), wf(6, 'CI', 'success', 'eee5555', 14, 5),
       wf(7, 'Review gate', 'cancelled', 'fff6666', 15, 6), wf(8, 'Review gate', 'cancelled', 'ggg7777', 16, 7),
-      wf(9, 'CI', 'failure', 'hhh8888', 17, 80), wf(10, 'Review gate', 'failure', 'iii9999', 18, 8),
+      wf(9, 'CI', 'failure', 'hhh8888', 17, 80), wf(10, 'Review gate', 'failure', 'iii9999', 18, 8), wf(11, 'CI', 'cancelled', 'jjj1010', 19, 9),
     ] }];
     const jobs = { 1: ['test (2/4)'], 3: ['test (1/4)', 'smoke'], 5: ['soak shard 2'] };
     const calls = [];
@@ -270,13 +270,14 @@ describe('coroner error rates (reported first)', () => {
       return pages.shift() ?? null;
     };
     const ci = run0(gh).metrics.errorRates.ci;
-    expect(ci.total).toBe(9);
-    expect(ci.count).toBe(7);
-    expect(Object.fromEntries(Object.entries(ci.causes).map(([k, v]) => [k, v.count]))).toEqual({ 'infra-cancelled': 3, flaky: 1, 'real-code-defect': 1, 'review-gate-hold': 1, 'soak-scenario': 1 });
-    expect(ci.causes['infra-cancelled'].examples).toHaveLength(2);
-    expect(ci.causes.flaky.examples).toEqual([{ ref: 'PR #10', at: at(1) }]);
-    expect(Object.fromEntries(Object.entries(ci.byCheck).map(([k, v]) => [k, v.count]))).toEqual({ 'review-gate': 4, 'test-shard': 2, 'soak-shard': 1, smoke: 1 });
-    expect(ci.redHeads).toBe(7);
+    expect(ci.total).toBe(5);
+    expect(ci.count).toBe(2);
+    expect(Object.fromEntries(Object.entries(ci.causes).map(([k, v]) => [k, v.count]))).toEqual({ 'real-code-defect': 1, 'soak-scenario': 1 });
+    expect(ci.superseded.count).toBe(1);
+    expect(ci.flakyRecovered).toBe(1);
+    expect(ci.awaitingReview.count).toBe(1);
+    expect(Object.fromEntries(Object.entries(ci.byCheck).map(([k, v]) => [k, v.count]))).toEqual({ 'test-shard': 1, 'soak-shard': 1, smoke: 1 });
+    expect(ci.redHeads).toBe(2);
     expect(calls.length).toBeLessThanOrEqual(1 + 5);
     expect(fetchCiRuns({ since, until }, null)).toEqual({ runs: [], found: false, calls: 0, truncated: false });
     let n = 0;

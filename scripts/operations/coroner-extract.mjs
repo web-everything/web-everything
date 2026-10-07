@@ -265,24 +265,38 @@ export function ciCheckName(jobName, runName = '') {
 
 /** CI runs per PR head. `ciRuns`: [{ id, name, conclusion, headSha, pr, runAttempt, createdAt, updatedAt, jobs? }]. */
 export function ciMetrics(ciRuns, window) {
-  const runs = ciRuns.filter((r) => r.conclusion && inWindow(r.createdAt, window));
-  const green = new Set(runs.filter((r) => r.conclusion === 'success').map((r) => `${r.headSha}|${r.name}`));
-  const red = runs.filter((r) => ['failure', 'timed_out', 'cancelled', 'startup_failure'].includes(r.conclusion));
+  const all = ciRuns.filter((r) => r.conclusion && inWindow(r.createdAt, window));
+  // Review gate is red by design while a PR awaits review: reported apart, never an error.
+  const isReview = (r) => /review.?gate/i.test(r.name);
+  const awaitingReview = all.filter((r) => isReview(r) && r.conclusion !== 'success' && r.conclusion !== 'cancelled');
+  // One verdict per (PR head, workflow): the latest run. An earlier red that a later run cleared is a recovered flake.
+  const latest = new Map(), earlierRed = new Set();
+  for (const r of all.filter((x) => !isReview(x)).sort((x, y) => compare(x.createdAt, y.createdAt) || (x.runAttempt ?? 0) - (y.runAttempt ?? 0))) {
+    const key = `${r.headSha}|${r.name}`, prev = latest.get(key);
+    if (prev && ['failure', 'timed_out', 'startup_failure'].includes(prev.conclusion) && r.conclusion === 'success') earlierRed.add(key);
+    latest.set(key, r);
+  }
+  const runs = [...latest.values()];
+  const refOf = (r) => r.pr ? `PR #${r.pr}` : `sha ${String(r.headSha).slice(0, 7)}`;
+  const superseded = runs.filter((r) => r.conclusion === 'cancelled');
+  const red = runs.filter((r) => ['failure', 'timed_out', 'startup_failure'].includes(r.conclusion));
   const byCheck = [], byCause = [];
   for (const r of red) {
-    const ref = r.pr ? `PR #${r.pr}` : `sha ${String(r.headSha).slice(0, 7)}`;
-    const ms = elapsed(r.updatedAt, r.createdAt);
-    const failedJobs = (r.jobs ?? []).filter((j) => ['failure', 'timed_out', 'cancelled'].includes(j.conclusion));
-    const checks = new Set((failedJobs.length ? failedJobs.map((j) => ciCheckName(j.name, r.name)) : [ciCheckName('', r.name)]));
+    const ref = refOf(r), ms = elapsed(r.updatedAt, r.createdAt);
+    const failedJobs = (r.jobs ?? []).filter((j) => ['failure', 'timed_out'].includes(j.conclusion));
+    const checks = new Set(failedJobs.length ? failedJobs.map((j) => ciCheckName(j.name, r.name)) : [ciCheckName('', r.name)]);
     for (const check of checks) byCheck.push({ cause: check, ref, at: r.createdAt, ms });
     const soak = [...checks].some((c) => c === 'soak-shard' || c === 'daemon-soak');
-    const reviewOnly = [...checks].every((c) => c === 'review-gate');
-    const cause = r.conclusion === 'cancelled' ? 'infra-cancelled' : reviewOnly ? 'review-gate-hold' : green.has(`${r.headSha}|${r.name}`) ? 'flaky' : soak ? 'soak-scenario' : 'real-code-defect';
-    byCause.push({ cause, ref, at: r.createdAt, ms });
+    byCause.push({ cause: r.conclusion !== 'failure' ? 'infra' : soak ? 'soak-scenario' : 'real-code-defect', ref, at: r.createdAt, ms });
   }
-  const heads = new Set(runs.map((r) => r.headSha)), redHeads = new Set(red.map((r) => r.headSha));
   return {
-    runs: rateMetric(byCause, runs.length, 'completed PR workflow runs', { heads: heads.size, redHeads: redHeads.size, byCheck: rateMetric(byCheck, runs.length, 'completed PR workflow runs (a run can fail several checks)').causes }),
+    runs: rateMetric(byCause, runs.length, 'latest completed run per PR head and workflow (review-gate excluded)', {
+      heads: new Set(runs.map((r) => r.headSha)).size, redHeads: new Set(red.map((r) => r.headSha)).size,
+      superseded: rateMetric(superseded.map((r) => ({ cause: 'cancelled-superseded', ref: refOf(r), at: r.createdAt })), runs.length, 'same basis'),
+      flakyRecovered: earlierRed.size,
+      awaitingReview: { count: awaitingReview.length, note: 'review-gate not green while a PR awaits review: by design, not an error' },
+      byCheck: rateMetric(byCheck, runs.length, 'same basis (a run can fail several checks)').causes,
+    }),
   };
 }
 
@@ -460,7 +474,7 @@ export function fetchCiRuns(window, gh, { repo = CONSTELLATION_REPOS.we.slug, ma
     if (page === maxPages) truncated = true;
   }
   const runs = raw.map((r) => ({ id: r.id, name: r.name, conclusion: r.conclusion, headSha: r.head_sha, pr: r.pull_requests?.[0]?.number ?? null, runAttempt: r.run_attempt, createdAt: r.created_at, updatedAt: r.updated_at }));
-  const red = runs.filter((r) => ['failure', 'timed_out', 'startup_failure'].includes(r.conclusion)).sort((a, b) => compare(b.createdAt, a.createdAt)).slice(0, maxJobCalls);
+  const red = runs.filter((r) => !/review.?gate/i.test(r.name) && ['failure', 'timed_out', 'startup_failure'].includes(r.conclusion)).sort((a, b) => compare(b.createdAt, a.createdAt)).slice(0, maxJobCalls);
   for (const r of red) { calls++; const data = gh(['api', `repos/${repo}/actions/runs/${r.id}/jobs?per_page=100`]); if (data && Array.isArray(data.jobs)) r.jobs = data.jobs.map((j) => ({ name: j.name, conclusion: j.conclusion })); }
   return { runs, found, calls, truncated };
 }
