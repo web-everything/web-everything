@@ -143,9 +143,28 @@ The Codex probation route already delegates stamping and committed-stamp verific
 
 ### 4. Run the gate GREEN
 
+Commit the card FIRST (the one commit — see step 6 for why it is explicit-path, on the lane's current branch),
+then request the gate: the marker is keyed to HEAD, so a request made against the uncommitted tree is stale the
+moment the commit moves HEAD and `open-pr`'s finish-guard refuses it.
+
 ```bash
-npm run check:standards
+printf '%s\n' "WE #{{ITEM_NUM}}: prepare — <short card title>" "" \
+  "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>" > <msgfile>
+git commit -F <msgfile> {{ITEM_SPEC_PATH}}
+
+node scripts/verify-lane.mjs request --repo=.
+node scripts/verify-lane.mjs check --wait=540000 --repo=.   # re-run on `timeout`
 ```
+
+This is the ONLY gate run for a card-only prepare. On a `backlog/`-only diff the gate takes its light path
+(no Vitest, but an UNSCOPED `check:standards` — a `backlog/` path always keeps the whole-repo run, so expect it
+to take longer than a scoped one) and stamps the marker `open-pr` requires. Do NOT also run
+`npm run check:standards`, and do NOT run `verify-lane` again after `open-pr` (CI runs the light card-only
+suite itself). Never pass `--help`/`-h` expecting a dry run: it prints usage only.
+
+If step 5's review makes you change the card, fold the change into that same commit
+(`git commit --amend --no-edit {{ITEM_SPEC_PATH}}`) and `request` once more: the amended commit is a new HEAD,
+so that is the gate for the HEAD you will open, not a second run of the same one.
 
 The gate checks item shape; it does not replace the explicit `preparedDate` check above. A red gate is a
 hard stop — fix the authoring until it is green.
@@ -170,16 +189,12 @@ AI-reviewer convergence pass first.** Spawn **one adversarial review subagent** 
 
 ### 6. Commit on the lane's current branch + publish HEAD to the `lane/...` ref + open the PR
 
-Commit **only** this item's file (explicit path, never `git add -A`; one commit) on the lane's **current branch**
-(its local `main`) — do **NOT** `git checkout -b lane/...`. `pr-land` **publishes HEAD** to the `lane/...` ref
-for you via `--ref=... --sha=HEAD`. Open the PR through the canonical producer — **never a hand-rolled
-`gh pr create`**:
+The commit is already made (step 4 — only this item's file, explicit path, never `git add -A`, one commit, on the
+lane's **current branch**, its local `main`; do **NOT** `git checkout -b lane/...`). `pr-land` **publishes HEAD**
+to the `lane/...` ref for you via `--ref=... --sha=HEAD`. Open the PR through the canonical producer — **never a
+hand-rolled `gh pr create`**:
 
 ```bash
-printf '%s\n' "WE #{{ITEM_NUM}}: prepare — <short card title>" "" \
-  "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>" > <msgfile>
-git commit -F <msgfile> {{ITEM_SPEC_PATH}}
-
 node scripts/operations/run.mjs open-pr --ref=lane/{{ITEM_NUM}}-prepare-item-<slug> --sha=HEAD --base=main \
   --title="WE #{{ITEM_NUM}}: prepare — <short card title>" \
   --bodyFile=<pr-body> --mode=label-on-green --json

@@ -174,3 +174,34 @@ describe('lane-pool acquire --purpose=conveyor-prepare-item', () => {
     expect(g(['rev-parse', 'HEAD'], JSON.parse(r.out).path)).toBe(originMain);
   }));
 });
+
+describe('item 98 — prepare-item brief runs the gate once, via the marker-writing light path', () => {
+  it('step 4 uses verify-lane request/check and forbids a second gate run', async () => {
+    const brief = readFileSync(join(process.cwd(), 'skills-src/conveyor/prepare-item-agent-brief.md'), 'utf8');
+    const step4 = brief.slice(brief.indexOf('### 4. Run the gate GREEN'), brief.indexOf('### 5'));
+    expect(step4).toMatch(/verify-lane\.mjs request/);
+    expect(step4).toMatch(/check --wait=/);
+    expect(step4).not.toMatch(/^npm run check:standards$/m);
+    expect(step4).toMatch(/ONLY gate run/);
+  });
+
+  // The marker is keyed to HEAD, so the card must be committed BEFORE the gate is requested: a request made against
+  // the uncommitted tree is stale the moment the commit moves HEAD, and open-pr's finish-guard then refuses it.
+  it('commits the card before the verify-lane request, never after it', async () => {
+    const brief = readFileSync(join(process.cwd(), 'skills-src/conveyor/prepare-item-agent-brief.md'), 'utf8');
+    const commit = brief.search(/^git commit -F /m);
+    const requests = [...brief.matchAll(/^node scripts\/verify-lane\.mjs request/gm)].map((m) => m.index);
+    expect(commit).toBeGreaterThan(-1);
+    expect(requests.length).toBeGreaterThan(0);
+    for (const at of requests) expect(at).toBeGreaterThan(commit);
+    expect(brief.match(/^git commit -F /gm)).toHaveLength(1);
+  });
+
+  // canScopeCheckStandards is false for any backlog/ path, so a card-only diff runs the UNSCOPED check:standards.
+  it('does not tell the agent a backlog-only diff gets a scoped check:standards', async () => {
+    const brief = readFileSync(join(process.cwd(), 'skills-src/conveyor/prepare-item-agent-brief.md'), 'utf8');
+    const step4 = brief.slice(brief.indexOf('### 4. Run the gate GREEN'), brief.indexOf('### 5'));
+    expect(step4).not.toMatch(/(?<!un)scoped\s+`?check:standards/i);
+    expect(step4).toMatch(/unscoped\s+`?check:standards/i);
+  });
+});
