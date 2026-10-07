@@ -434,6 +434,7 @@ export function validateVerdictRecord(raw) {
   if (raw.kind !== VERDICT_LEDGER_KIND) errors.push(`bad \`kind\`: ${JSON.stringify(raw.kind)}`);
   if (typeof raw.repo !== 'string' || !REPO_RE.test(raw.repo)) errors.push(`bad \`repo\`: ${JSON.stringify(raw.repo)}`);
   if (!Number.isInteger(raw.pr) || raw.pr <= 0) errors.push(`bad \`pr\`: ${JSON.stringify(raw.pr)}`);
+  if (raw.type !== undefined && raw.type !== 'verdict') errors.push(`not a verdict row: type ${JSON.stringify(raw.type)}`);
   if (!VERDICT_VALUES.includes(raw.verdict)) errors.push(`bad \`verdict\`: ${JSON.stringify(raw.verdict)}`);
   if (typeof raw.at !== 'string' || !ISO_RE.test(raw.at)) errors.push(`bad \`at\`: ${JSON.stringify(raw.at)}`);
   const shadow = raw.mode !== undefined || raw.wouldClear !== undefined;
@@ -505,6 +506,210 @@ export function parseVerdictLog(text) {
     let parsed;
     try { parsed = JSON.parse(trimmed); } catch { continue; }
     const { valid, record } = validateVerdictRecord(parsed);
+    if (valid) out.push(record);
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+// V2 EVENT TYPES (#verdict-ledger-pr-state-store, plan slice B) — SCHEMA ONLY. PURE.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/** The schema version a non-verdict event carries. A verdict row keeps `VERDICT_LEDGER_VERSION` so v1 bytes
+ *  never change; a v1 row reads as `type: verdict`. */
+export const LEDGER_EVENT_VERSION = 2;
+
+/** THE CLOSED SET OF EVENT TYPES (plan section 3.1). One append-only stream per repo; identity stays
+ *  repo + PR + append order. Transitions are NOT a type: they are derived from these events plus GitHub facts. */
+export const EVENT_TYPES = Object.freeze({
+  VERDICT: 'verdict',       // the v1 row, unchanged
+  REFERRAL: 'referral',     // findings opened on a head, with finding keys
+  RULING: 'ruling',         // a ruling on one finding key
+  REVIEW_RUN: 'review-run', // a review run on a head (counts visits; bears on nothing else)
+  HOLD: 'hold',             // a hold with a reason code
+  RELEASE: 'release',       // a release of a hold
+  APPROVAL: 'approval',     // a clearing ceremony or judge, optionally delegated
+  SEND_BACK: 'send-back',   // the PR goes back to its author
+  AUTHOR: 'author',         // who opened the PR
+  LABEL_INPUT: 'label-input', // a hand-applied label seen by the mirror
+});
+
+/** Every event type, as an array. */
+export const EVENT_TYPE_VALUES = Object.freeze(Object.values(EVENT_TYPES));
+
+export const RULING_VALUES = Object.freeze(['block', 'card', 'not-real']);
+export const REVIEW_RUN_PHASES = Object.freeze(['started', 'completed']);
+export const APPROVAL_KINDS = Object.freeze(['clear-human', 'clear-operator', 'judge']);
+export const SEND_BACK_CAUSES = Object.freeze(['block-ruling', 'changes']);
+export const LABEL_INPUT_CHANGES = Object.freeze(['added', 'removed']);
+
+const isStr = (v) => typeof v === 'string' && v.trim() !== '';
+const oneOf = (list) => (v) => list.includes(v);
+
+/** Per-type payload fields: `[name, check, normalize]`. A required field that fails its check invalidates the
+ *  event; an optional one (`opt`) is dropped when absent and invalidates when present and wrong. */
+function delegationOrNull(v) {
+  if (v == null) return null;
+  if (typeof v !== 'object' || Array.isArray(v) || !isStr(v.by) || !isStr(v.scope)
+    || typeof v.expires !== 'string' || !ISO_RE.test(v.expires)) return undefined;
+  return { by: oneLine(v.by, 200), scope: oneLine(v.scope, 200), expires: v.expires };
+}
+
+const EVENT_PAYLOAD = Object.freeze({
+  [EVENT_TYPES.REFERRAL]: [
+    ['headSha', (v) => shaOrNull(v) !== null, shaOrNull],
+    ['findingKeys', (v) => Array.isArray(v) && v.length > 0 && v.every(isStr), (v) => v.map((k) => oneLine(k, 200))],
+  ],
+  [EVENT_TYPES.RULING]: [
+    ['findingKey', isStr, (v) => oneLine(v, 200)],
+    ['ruling', oneOf(RULING_VALUES), (v) => v],
+  ],
+  [EVENT_TYPES.REVIEW_RUN]: [
+    ['headSha', (v) => shaOrNull(v) !== null, shaOrNull],
+    ['phase', oneOf(REVIEW_RUN_PHASES), (v) => v],
+    ['posted', (v) => v === null || typeof v === 'boolean', (v) => v],
+  ],
+  [EVENT_TYPES.HOLD]: [
+    ['reasonCode', isStr, (v) => oneLine(v, 128)],
+    ['holdSource', isStr, (v) => oneLine(v, 64)],
+  ],
+  [EVENT_TYPES.RELEASE]: [
+    ['reasonCode', isStr, (v) => oneLine(v, 128)],
+    ['holdSource', isStr, (v) => oneLine(v, 64)],
+  ],
+  [EVENT_TYPES.APPROVAL]: [
+    ['approval', oneOf(APPROVAL_KINDS), (v) => v],
+    ['delegation', (v) => delegationOrNull(v) !== undefined, delegationOrNull],
+  ],
+  [EVENT_TYPES.SEND_BACK]: [
+    ['cause', oneOf(SEND_BACK_CAUSES), (v) => v],
+  ],
+  [EVENT_TYPES.AUTHOR]: [
+    ['author', isStr, (v) => oneLine(v, 200)],
+  ],
+  [EVENT_TYPES.LABEL_INPUT]: [
+    ['label', isStr, (v) => oneLine(v, 128)],
+    ['sender', isStr, (v) => oneLine(v, 200)],
+    ['change', oneOf(LABEL_INPUT_CHANGES), (v) => v],
+  ],
+});
+
+/** Missing optional payload fields take these defaults on build, so a field written as absent still round-trips. */
+const EVENT_DEFAULTS = Object.freeze({ posted: null, delegation: null });
+
+/** Which event types BEAR on whether a PR may land (plan 3.1). `review-run` bears on caps only; the others that
+ *  bear do so through the derive function, which is a later slice. Pure. */
+export function eventBears(type) {
+  return [EVENT_TYPES.VERDICT, EVENT_TYPES.REFERRAL, EVENT_TYPES.RULING, EVENT_TYPES.HOLD, EVENT_TYPES.RELEASE,
+    EVENT_TYPES.APPROVAL, EVENT_TYPES.SEND_BACK].includes(String(type ?? ''));
+}
+
+/**
+ * Build a schema-valid NON-VERDICT event. PURE (`at` injected). THROWS on a programming error, like
+ * {@link buildVerdictRecord}. A verdict is built with `buildVerdictRecord`, never here.
+ * @param {{type: string, repo: string, pr: number|string, at: string, source: string, writer?: string,
+ *   declaredActor?: string, session?: string, channel?: string, headSha?: string|null}} o plus the type's payload.
+ */
+export function buildLedgerEvent({
+  type, repo, pr, at, source, writer = '', declaredActor = '', session = '', channel = '', ...payload
+} = {}) {
+  if (type === EVENT_TYPES.VERDICT) {
+    throw new TypeError('verdict-ledger: build a verdict row with buildVerdictRecord, not buildLedgerEvent');
+  }
+  const spec = EVENT_PAYLOAD[type];
+  if (!spec) {
+    throw new TypeError(`verdict-ledger: unknown event type ${JSON.stringify(type)} — expected one of ${EVENT_TYPE_VALUES.join(', ')}`);
+  }
+  const candidate = {
+    v: LEDGER_EVENT_VERSION,
+    kind: VERDICT_LEDGER_KIND,
+    type,
+    at,
+    repo,
+    pr: Number(pr),
+    ...Object.fromEntries(spec.map(([name]) => [name, payload[name] === undefined ? EVENT_DEFAULTS[name] : payload[name]])),
+    actor: { declared: declaredActor, session, channel, independence: null },
+    source,
+    writer: writer || processWriterId(),
+  };
+  const { valid, errors, record } = validateLedgerEvent(candidate);
+  if (!valid) throw new TypeError(`verdict-ledger: invalid ${type} event — ${errors.join('; ')}`);
+  return record;
+}
+
+/**
+ * Validate + normalize a raw parsed line of ANY type. NEVER throws. A row with no `type`, or `type: verdict`,
+ * is a verdict row and goes through {@link validateVerdictRecord} untouched (returned with `type: 'verdict'`
+ * added to a COPY). Every other type is checked against its payload; `clears` is never stored on a non-verdict
+ * event, because only a verdict row clears.
+ * @param {*} raw
+ * @returns {{valid: boolean, errors: string[], record: object|null}}
+ */
+export function validateLedgerEvent(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { valid: false, errors: ['not an object'], record: null };
+  }
+  if (raw.type === undefined || raw.type === EVENT_TYPES.VERDICT) {
+    const { valid, errors, record } = validateVerdictRecord(raw);
+    return valid ? { valid, errors, record: { type: EVENT_TYPES.VERDICT, ...record } } : { valid, errors, record: null };
+  }
+  const spec = EVENT_PAYLOAD[raw.type];
+  if (!spec) return { valid: false, errors: [`bad \`type\`: ${JSON.stringify(raw.type)}`], record: null };
+  const errors = [];
+  if (!Number.isInteger(raw.v) || raw.v < LEDGER_EVENT_VERSION) errors.push(`bad \`v\`: ${JSON.stringify(raw.v)}`);
+  if (raw.kind !== VERDICT_LEDGER_KIND) errors.push(`bad \`kind\`: ${JSON.stringify(raw.kind)}`);
+  if (typeof raw.repo !== 'string' || !REPO_RE.test(raw.repo)) errors.push(`bad \`repo\`: ${JSON.stringify(raw.repo)}`);
+  if (!Number.isInteger(raw.pr) || raw.pr <= 0) errors.push(`bad \`pr\`: ${JSON.stringify(raw.pr)}`);
+  if (typeof raw.at !== 'string' || !ISO_RE.test(raw.at)) errors.push(`bad \`at\`: ${JSON.stringify(raw.at)}`);
+  if (!isStr(raw.source)) errors.push('bad `source`: a row must name its writer');
+  for (const [name, check] of spec) {
+    if (!check(raw[name])) errors.push(`bad \`${name}\`: ${JSON.stringify(raw[name])}`);
+  }
+  if (errors.length) return { valid: false, errors, record: null };
+  const actor = raw.actor && typeof raw.actor === 'object' ? raw.actor : {};
+  const record = {
+    v: raw.v,
+    kind: VERDICT_LEDGER_KIND,
+    type: raw.type,
+    at: raw.at,
+    repo: raw.repo,
+    pr: raw.pr,
+    ...Object.fromEntries(spec.map(([name, , normalize]) => [name, normalize(raw[name])])),
+    actor: {
+      declared: typeof actor.declared === 'string' ? oneLine(actor.declared, 200) : '',
+      session: typeof actor.session === 'string' ? oneLine(actor.session, 200) : '',
+      channel: typeof actor.channel === 'string' ? oneLine(actor.channel, 200) : '',
+      independence: null,
+      proves: ACTOR_PROVES,
+    },
+    source: oneLine(raw.source, 64),
+    writer: typeof raw.writer === 'string' ? raw.writer : '',
+  };
+  return { valid: true, errors: [], record };
+}
+
+/** Serialize ONE event of any type to a JSONL line. PURE. A verdict row delegates to
+ *  {@link serializeVerdictRecord} so its bytes are unchanged; other types serialize the normalized record. */
+export function serializeLedgerEvent(raw) {
+  if (raw && typeof raw === 'object' && (raw.type === undefined || raw.type === EVENT_TYPES.VERDICT)) {
+    return serializeVerdictRecord(raw);
+  }
+  const { valid, errors, record } = validateLedgerEvent(raw);
+  if (!valid) return { ok: false, line: null, record: null, errors };
+  return { ok: true, line: JSON.stringify(record), record, errors: [] };
+}
+
+/** Parse a ledger's TEXT into normalized events of every type, in append order. Tolerant, never throws.
+ *  A v1 row comes back as `type: verdict`. The v1 readers ({@link parseVerdictLog}, the fold) skip the new
+ *  types, so they keep seeing exactly the rows they always saw. */
+export function parseLedgerEvents(text) {
+  const out = [];
+  for (const line of String(text ?? '').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed;
+    try { parsed = JSON.parse(trimmed); } catch { continue; }
+    const { valid, record } = validateLedgerEvent(parsed);
     if (valid) out.push(record);
   }
   return out;
