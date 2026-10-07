@@ -251,10 +251,19 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
     ];
     const summary = summarizeShadowAgreement(rows);
     expect(summary).toEqual([
-      { lens: 'correctness', runs: 3, compared: 2, voided: 1, failed: 0, verdictAgreement: 0.5, meanFindingOverlap: 0.75, prs: 2 },
-      { lens: 'security', runs: 1, compared: 0, voided: 0, failed: 1, verdictAgreement: null, meanFindingOverlap: null, prs: 1 },
+      { lens: 'correctness', runs: 3, compared: 2, voided: 1, failed: 0, held: 0, verdictAgreement: 0.5, meanFindingOverlap: 0.75, prs: 2 },
+      { lens: 'security', runs: 1, compared: 0, voided: 0, failed: 1, held: 0, verdictAgreement: null, meanFindingOverlap: null, prs: 1 },
     ]);
     expect(renderShadowReport(summary).join('\n')).toContain('correctness: 3 run(s) on 2 PR(s) — 2 compared, 1 voided');
+  });
+
+  it('counts an agy quota hold or exhaustion as held, not failed; other failures and voids stay as they are', () => {
+    const hold = { status: 'failed', reasons: ['antigravity: skip-quota-hold; requested m; reported unknown; quota reset X'] };
+    const spent = { status: 'failed', reasons: ['antigravity: skip-quota-exhausted; requested m; reported m; quota reset X'] };
+    const [s] = summarizeShadowAgreement([hold, spent, { status: 'failed', reasons: ['tool use'] }, { status: 'voided', reasons: ['antigravity: skip-quota-hold'] }]
+      .map((r) => ({ lens: 'security', pr: 1, repo: 'o/r', ...r })));
+    expect(s).toMatchObject({ runs: 4, held: 2, failed: 1, voided: 1, compared: 0 });
+    expect(renderShadowReport([s]).join('\n')).toContain('1 failed, 2 held (agy quota)');
   });
 
   it('appends to and reads back a JSONL store outside the tree', () => {
