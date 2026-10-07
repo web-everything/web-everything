@@ -75,7 +75,7 @@ import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { summarizeAgyEvents } from '../gemini-direct-task.mjs';
-import { basename, dirname, extname, join, resolve } from 'node:path';
+import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import matter from 'gray-matter';
 import { readField, removeFrontmatterField } from '../backlog/frontmatter.mjs';
@@ -95,7 +95,7 @@ import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-reg
 import { placeBuildDispatchHold } from '../conveyor/build-dispatch-claim.mjs';
 import { planHoldRouting, reserveHoldRoute } from '../conveyor/build-dispatch-hold-router.mjs';
 import { clearScopeAndAppendFinding, sanitizeHoldReason, landRoute } from './build-dispatch-hold-route-land.mjs';
-import { classifyPrepareReport, deriveScopeFromCard, needsYouReason, replaceCardScope, scopeIsDefective } from '../conveyor/prepare-outcome.mjs';
+import { classifyPrepareReport, deriveScopeFromCard, isSafeRepoRelativePath, needsYouReason, replaceCardScope, scopeIsDefective } from '../conveyor/prepare-outcome.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 
@@ -194,6 +194,17 @@ const NO_EXEC_ENGINES = Object.freeze({ js: REFUSE_ENGINE, javascript: REFUSE_EN
 function parseYamlFrontmatter(text) {
   if (!/^---\r?\n/.test(text)) throw new Error('not a plain YAML frontmatter block');
   return matter(text, { language: 'yaml', engines: NO_EXEC_ENGINES }).data;
+}
+
+/** The real path of `rel` under `dir`, or `null` when `rel` is not a safe repo-relative path, does not exist, or
+ *  resolves (through a symlink) outside the lane. Card-text paths reach the filesystem only through this. */
+function laneContainedPath(dir, rel) {
+  if (!isSafeRepoRelativePath(rel)) return null;
+  try {
+    const root = realpathSync(dir);
+    const real = realpathSync(join(dir, rel));
+    return real === root || real.startsWith(root + sep) ? real : null;
+  } catch { return null; }
 }
 
 /** Parse `--k=v` flags, resolving roster workers and minting an omitted session. */
@@ -451,9 +462,19 @@ export async function runProbationBuild(args, io) {
       // (we:scripts/conveyor/prepare-outcome.mjs). A colon-less or dashed report ("already-done - delivered by ...",
       // "could-not-prepare - scope is wrong") used to fall through to "prepare requires a card-only diff" and be
       // recorded as a failure (live #4560, #4328).
-      const report = preparing && !summary.files ? classifyPrepareReport(run.lastMessage) : null;
+      // After a re-scope the runner's OWN card edit is in the diff, so `summary.files` is no longer zero for a worker
+      // that changed nothing: it counts as "no worker diff" only while the card is still byte-for-byte what the
+      // runner wrote and nothing else changed - otherwise a second decline would skip this branch and the
+      // runner-authored edit would read as a prepared card (PR #4323 review).
+      const workerMadeNoChange = !summary.files
+        || (rescoped !== null && postWorkerItem?.raw === item.raw && summary.paths.every((p) => p === item.path));
+      const report = preparing && workerMadeNoChange ? classifyPrepareReport(run.lastMessage) : null;
       if (report?.outcome === 'no-change' || (report?.outcome === 'blocked' && report.blocker.kind === 'spec-defect')) {
         if (io.headSha(lanePath) !== baseSha) return abandon('escalated-needs-human', `refused: worker moved HEAD before ${report.outcome} routing`, { diff: diffRow });
+      }
+      if (rescoped !== null && summary.files && workerMadeNoChange && report?.outcome === 'done') {
+        // The only change in the lane is the runner's own scope edit and the worker declined nothing: nothing was prepared.
+        return abandon('gate-red', `prepare requires a card-only diff from the worker; only the runner's re-scope was present. worker report: ${sanitizeHoldReason(run.lastMessage, { max: 1200 }) || 'no final message'}`, { diff: diffRow });
       }
       const needsYou = (kind, detail) => {
         const reason = needsYouReason(kind, detail);
@@ -829,10 +850,17 @@ export function realIo({ session, env = process.env, repoRoot = WE_ROOT } = {}) 
       if (!held.ok) throw new Error('could not place worker-declined dispatch hold');
     },
     writeCard: (dir, path, text) => writeFileSync(join(dir, path), text),
-    pathExists: (dir, rel) => existsSync(join(dir, rel)),
+    // Both re-scope probes read card-text-supplied paths (untrusted): a path that is not repo-relative, or whose real
+    // location (symlinks resolved) is outside the lane, is treated as absent and never opened (PR #4323 review).
+    pathExists: (dir, rel) => laneContainedPath(dir, rel) !== null,
     // A cited backlog card's own `scope:` (one hop of the re-scope probe); unreadable reads as none.
     readCardScope: (dir, rel) => {
-      try { const s = parseYamlFrontmatter(readFileSync(join(dir, rel), 'utf8'))?.scope; return Array.isArray(s) ? s.filter((x) => typeof x === 'string') : []; } catch { return []; }
+      try {
+        const abs = laneContainedPath(dir, rel);
+        if (abs === null) return [];
+        const s = parseYamlFrontmatter(readFileSync(abs, 'utf8'))?.scope;
+        return Array.isArray(s) ? s.filter((x) => typeof x === 'string') : [];
+      } catch { return []; }
     },
     landAlreadyDone: (entry, dir, { citation = 'strict' } = {}) => landRoute({ ...entry, citation }, {
       // Reuse the runner's acquired lane; keep every mutation in it and hooks disabled.

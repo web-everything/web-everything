@@ -106,19 +106,61 @@ export function commitDeliversItem(message, ids) {
   });
 }
 
+// A delivery verb, and the words that turn it around ("does not fix #N", "unable to fix #N", "will fix #N later").
+const CREDIT_VERB = String.raw`(?:deliver(?:s|ed)?|closes?|closed|fix(?:es|ed)?|resolves?|resolved|implements?|implemented|lands?|landed)`;
+const NEGATING_WORD_RE = /\b(?:not|never|without|cannot|can't|n't|unable|fail(?:s|ed|ure)?|attempt(?:s|ed|ing)?|try|tries|tried|to|will|would|should|may|might|could|revert(?:s|ed)?|no longer)\b/i;
+// Words right after the id that make it a partial delivery ("fixes #N, part of ...").
+const PARTIAL_AFTER_RE = /^[\s,;:()-]*(?:in part\b|part\b|partial|partly|first step|step \d|slice\b|phase\b|groundwork|scaffold)/i;
+// A bare (no "#") id form is only trusted for something shaped like a birth hash: card text is untrusted, and a
+// bornAs of "the" must not let any "fixes the ..." credit it.
+const BARE_ID_RE = /^[a-z0-9]{6,}$/i;
+const idForm = (id) => (/^\d+$/.test(id) || !BARE_ID_RE.test(id) ? `#${escapeRegExp(id)}` : `#?${escapeRegExp(id)}`);
+
+/** PURE. Does `text` name one of `ids` as a card reference? A numeric id counts only in its `#<id>` shape (a bare
+ *  "4560" is as likely "4560 ms"); a birth hash counts as a whole word, with or without the `#`; any other
+ *  untrusted-shaped id needs the `#`. Every id is regex-escaped. */
+export function textNamesItem(text, ids) {
+  const body = String(text ?? '');
+  const list = (Array.isArray(ids) ? ids : [ids]).map((id) => String(id ?? '').trim()).filter(Boolean);
+  return list.some((id) => new RegExp(`(?<![\\w/])${idForm(id)}(?![\\w])`).test(body));
+}
+
 /** PURE. Prepare-mode credit (2026-10-07, #4560): a commit that delivers a card often says so in prose, not in
  *  the strict `WE #<id>:` lead shape - "WE #4554: ... (also delivers xak56ki)" delivered card xak56ki and names
- *  it without a `#`. For the PREPARE already-done path the bar is: some id appears anywhere in the message as a
- *  whole word (a `#` is optional), the message carries a delivery verb, and the SUBJECT has no partial-delivery
- *  marker. The other checks (real ancestor of origin/main, non-backlog files touched) and the test run still
- *  apply, so this is looser on wording only, never on evidence. */
+ *  it without a `#`. PR #4323 review (security + correctness): the first cut of this bar (an id ANYWHERE plus a
+ *  delivery verb ANYWHERE) reopened the hole PR #2967 closed - "fixes retry loop (see #4560, follow-up)" credited
+ *  #4560 - because the verb and the id were two unrelated tokens. The verb and the id must now be ONE phrase:
+ *   - the strict subject shapes {@link commitDeliversItem} accepts (lead tag `WE #<id>:`, trailing `(#<hash>)`), or
+ *   - a delivery verb IMMEDIATELY followed by the id ("also delivers xak56ki", "resolves card #4560"), with no
+ *     negating/modal/infinitive/revert word earlier in the same clause ("does not fix", "unable to fix", "will
+ *     fix", "Revert fixes") and no partial wording right after it ("fixes #N, part of ..."). A NUMERIC id is
+ *     accepted this way on the subject line only (numbers overlap PR and issue numbers: "Fixes #4560" in a body
+ *     usually names a PR); a birth hash may also appear in a body line.
+ *  A partial-delivery marker on the subject, or on the line holding the phrase, refuses it. The other checks (real
+ *  ancestor of origin/main, non-backlog files touched, tests the commit added or that name the card) and the test
+ *  run still apply. */
 export function commitCreditsItem(message, ids) {
   const text = String(message ?? '');
-  const subject = text.split(/\r?\n/)[0].trim();
-  if (!subject || PARTIAL_DELIVERY_RE.test(subject)) return false;
-  if (!/\b(?:deliver(?:s|ed)?|closes?|closed|fix(?:es|ed)?|resolves?|resolved|implements?|implemented|lands?|landed)\b/i.test(text)) return false;
+  const lines = text.split(/\r?\n/);
+  const subject = (lines[0] ?? '').trim();
+  if (!subject || PARTIAL_DELIVERY_RE.test(subject) || /^revert\b/i.test(subject)) return false;
+  if (commitDeliversItem(text, ids)) return true;
   const list = (Array.isArray(ids) ? ids : [ids]).map((id) => String(id ?? '').trim()).filter(Boolean);
-  return list.some((id) => new RegExp(`(?<![\\w/])#?${escapeRegExp(id)}(?![\\w])`).test(text));
+  return list.some((id) => {
+    const numeric = /^\d+$/.test(id);
+    const re = new RegExp(`(?<![\\w/])${CREDIT_VERB}\\s+(?:(?:card|item)\\s+)?(${idForm(id)})(?![\\w])`, 'gi');
+    return lines.some((line, i) => {
+      if (numeric && i > 0) return false;
+      if (PARTIAL_DELIVERY_RE.test(line)) return false;
+      for (const m of line.matchAll(re)) {
+        const clause = line.slice(0, m.index).split(/[;.:()]/).pop().slice(-80);
+        if (NEGATING_WORD_RE.test(clause)) continue;
+        if (PARTIAL_AFTER_RE.test(line.slice(m.index + m[0].length))) continue;
+        return true;
+      }
+      return false;
+    });
+  });
 }
 
 /** PURE. The test files a commit touched, from `git show --name-only` text (deleted files cannot be told apart
@@ -339,9 +381,24 @@ export function landOne({ num, route, commit = null, reason = null, citation = '
         if (!commitCreditsItem(commitMessage, [num, bornAs])) {
           throw new Error(`landOne: cited commit ${commit} does not credit #${num}${bornAs ? ` or ${bornAs}` : ''} as delivered (no id with a delivery verb, or a partial subject) — refusing to auto-resolve`);
         }
-        const testFiles = commitTestFiles(commitFiles).filter((f) => existsFile(join(lane, f)));
+        // The tests that prove the delivery are the ones the commit ADDED (`--diff-filter=A`), or a test file it
+        // only modified that itself names this card: a commit that merely touched some unrelated passing test
+        // proves nothing about THIS card (PR #4323 review).
+        const addedFiles = runFn('git', ['show', '--diff-filter=A', '--name-only', '--format=', commit], lane);
+        // "Names the card" is judged on the lines THIS commit added to the file (not the file's current text, where
+        // any old "#NNNN" comment would satisfy it).
+        const addedLinesNameCard = (f) => {
+          try {
+            const diff = runFn('git', ['show', '--format=', '-U0', commit, '--', f], lane);
+            const added = String(diff).split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++')).join('\n');
+            return textNamesItem(added, [num, bornAs]);
+          } catch { return false; }
+        };
+        // A path that could be read as an option is never handed to vitest.
+        const testFiles = [...new Set([...commitTestFiles(addedFiles), ...commitTestFiles(commitFiles).filter(addedLinesNameCard)])]
+          .filter((f) => !f.startsWith('-') && existsFile(join(lane, f)));
         if (!testFiles.length) {
-          throw new Error(`landOne: cited commit ${commit} touches no test file that still exists - nothing to prove the delivery - refusing to auto-resolve`);
+          throw new Error(`landOne: cited commit ${commit} touches no test file that still exists and was added by it or names the card - nothing to prove the delivery - refusing to auto-resolve`);
         }
         try {
           runFn('node', [join(lane, 'scripts', 'readiness', 'heavy-admission.mjs'), 'run', '--', 'npx', 'vitest', 'run', ...testFiles], lane, { timeoutMs: VERIFY_TIMEOUT_MS });

@@ -452,8 +452,30 @@ describe('a late launch (effect-in-flight) retries quickly, not on the failure p
     expect([1, 2, 3, 4].map((n) => at('launch-in-flight', n))).toEqual([30_000, 60_000, 120_000, 120_000]);
     expect(at('launch-not-confirmed', 1)).toBe(5 * 60_000);
   });
-  it('stays bounded by the same attempt cap', () => {
-    expect(backoffVerdict({ attempts: DEFAULTS.maxAttempts, settings: DEFAULTS, code: 'launch-in-flight' })).toEqual({ retryAfter: null, exhausted: true });
+  it('stays bounded, and never gives up sooner than the failure path would (PR #4323 review)', () => {
+    const now = 0;
+    const waits = (code) => { let total = 0; let n = 1; for (; ; n++) { const v = backoffVerdict({ attempts: n, now, settings: DEFAULTS, code }); if (v.exhausted) return { total, n }; total += Date.parse(v.retryAfter) - now; } };
+    const slow = waits('launch-not-confirmed');
+    const quick = waits('launch-in-flight');
+    expect(slow.total).toBe(135 * 60_000);
+    expect(quick.total).toBeGreaterThanOrEqual(slow.total);
+    expect(quick.n).toBeLessThan(500);
+    expect(backoffVerdict({ attempts: quick.n, settings: DEFAULTS, code: 'launch-in-flight' })).toEqual({ retryAfter: null, exhausted: true });
+    expect(backoffVerdict({ attempts: DEFAULTS.maxAttempts, settings: DEFAULTS, code: 'launch-in-flight' }).exhausted).toBe(false);
+  });
+  it('does not walk an absurdly large operator attempt cap (it is an unbounded number)', () => {
+    const huge = readBackoffSettings({ WE_DISPATCH_RETRY_MAX_ATTEMPTS: '300000000' });
+    const t0 = Date.now();
+    const v = backoffVerdict({ attempts: 1, now: 0, settings: huge, code: 'launch-in-flight' });
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(v.exhausted).toBe(false);
+  });
+  it('honours an operator-tightened budget: a smaller base or attempt cap still bounds the quick window by the failure path\'s own', () => {
+    const tight = readBackoffSettings({ WE_DISPATCH_RETRY_BASE_MS: '1000', WE_DISPATCH_RETRY_MAX_MS: '4000', WE_DISPATCH_RETRY_MAX_ATTEMPTS: '3' });
+    let total = 0; let n = 1;
+    for (; n < 100; n++) { const v = backoffVerdict({ attempts: n, now: 0, settings: tight, code: 'launch-in-flight' }); if (v.exhausted) break; total += Date.parse(v.retryAfter); }
+    expect(total).toBeGreaterThanOrEqual(1000 + 2000);
+    expect(n).toBeGreaterThanOrEqual(3);
   });
   it('a prepare failure with that evidence is held for a short retry and released on the next tick after it', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'quick-retry-'));

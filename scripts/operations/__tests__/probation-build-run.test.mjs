@@ -993,6 +993,39 @@ describe('standalone prepare', () => {
       expect(result.outcome).toBe('prepare-needs-you');
       expect(calls.filter(c => c[0] === 'worker')).toHaveLength(2);
     });
+    it('a second spec-defect report is still a needs-you hold when the runner\'s own scope edit is in the diff (PR #4323 review)', async () => {
+      // The diff comes from the runner's writeCard, not a fixed empty numstat: the worker declined again and left
+      // the runner-authored scope edit in place, so the lane diff is exactly that one card.
+      const { io, calls } = prepareIo({ item: badItem, numstat: '', postWorkerRaw: badItem.raw, lastMessage });
+      io.pathExists = (_d, rel) => rel === 'scripts/queue.mjs';
+      io.readCardScope = () => ['we:scripts/queue.mjs'];
+      let written = null;
+      const writeCard = io.writeCard;
+      io.writeCard = (d, p, text) => { written = text; writeCard(d, p, text); };
+      io.diffNumstat = (_d, _base, exclude) => { calls.push(['numstat', exclude]); return written ? `1\t1\t${badItem.path}` : ''; };
+      io.findItem = (() => { let n = 0; return () => { n += 1; return n <= 2 || !written ? badItem : { ...badItem, raw: written }; }; })();
+      const result = await runProbationBuild(prepareArgs(), io);
+      expect(calls.filter(c => c[0] === 'worker')).toHaveLength(2);
+      expect(result).toMatchObject({ outcome: 'prepare-needs-you' });
+      expect(calls.some(c => ['stamp', 'resolve', 'openPr', 'commit'].includes(c[0]))).toBe(false);
+    });
+    it('a second run that changes nothing and declines nothing is not read as a prepared card', async () => {
+      const { io, calls } = prepareIo({ item: badItem, numstat: '', postWorkerRaw: badItem.raw, lastMessage });
+      io.pathExists = (_d, rel) => rel === 'scripts/queue.mjs';
+      io.readCardScope = () => ['we:scripts/queue.mjs'];
+      let written = null;
+      const writeCard = io.writeCard;
+      io.writeCard = (d, p, text) => { written = text; writeCard(d, p, text); };
+      io.diffNumstat = () => (written ? `1\t1\t${badItem.path}` : '');
+      io.findItem = (() => { let n = 0; return () => { n += 1; return n <= 2 || !written ? badItem : { ...badItem, raw: written }; }; })();
+      let run = 0;
+      const runWorker = io.runWorker;
+      io.runWorker = (...a) => { run += 1; const r = runWorker(...a); return run === 1 ? r : { ...r, lastMessage: 'Done.' }; };
+      const result = await runProbationBuild(prepareArgs(), io);
+      expect(calls.filter(c => c[0] === 'worker')).toHaveLength(2);
+      expect(result.outcome).toBe('gate-red');
+      expect(calls.some(c => ['stamp', 'resolve', 'openPr', 'commit'].includes(c[0]))).toBe(false);
+    });
   });
   it('persists both terminal outcomes against the original dispatch identity', async () => {
     for (const succeeds of [true, false]) {

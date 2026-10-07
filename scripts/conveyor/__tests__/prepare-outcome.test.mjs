@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  classifyPrepareReport, deriveScopeFromCard, needsYouReason, replaceCardScope, scopeIsDefective,
+  classifyPrepareReport, deriveScopeFromCard, needsYouReason, replaceCardScope, scopeIsDefective, bareScopePath,
 } from '../prepare-outcome.mjs';
 import { classifyHoldReason } from '../build-dispatch-hold-router.mjs';
 
@@ -24,6 +24,23 @@ describe('classifyPrepareReport - the prepare worker line, in worker-result outc
   it('a genuine judgment call stays blocked / needs-ruling', () => {
     expect(classifyPrepareReport('could-not-prepare: the card must choose between A and B; that is a policy call'))
       .toMatchObject({ outcome: 'blocked', blocker: { kind: 'needs-ruling' } });
+  });
+  it.each([
+    'could-not-prepare: must choose between A and B; scope mentions A; policy missing',
+    'could-not-prepare: the card needs a ruling on scope vs. size; the rollout plan is empty',
+    'could-not-prepare: out of scope for this card, the owner policy is missing',
+    'could-not-prepare: two designs fit the scope; picking one is a bad call without the operator',
+  ])('a needs-ruling decline that merely mentions scope near a defect word stays needs-ruling: %s', (msg) => {
+    expect(classifyPrepareReport(msg)).toMatchObject({ outcome: 'blocked', blocker: { kind: 'needs-ruling' } });
+  });
+  it.each([
+    'could-not-prepare: the scope is wrong',
+    'could-not-prepare - wrong scope: names the 4309 card',
+    'could-not-prepare: scope is stale, the file was renamed',
+    'could-not-prepare: `scope:` is empty',
+    'could-not-prepare: scope is missing',
+  ])('still reads a plain bad-scope decline as spec-defect: %s', (msg) => {
+    expect(classifyPrepareReport(msg)).toMatchObject({ outcome: 'blocked', blocker: { kind: 'spec-defect' } });
   });
   it('a decline that merely mentions "already done" in its reason stays a decline', () => {
     expect(classifyPrepareReport('could-not-prepare: premise stale; part of it is already done on main')).toMatchObject({ outcome: 'blocked' });
@@ -50,6 +67,37 @@ describe('re-scope probe', () => {
   it('follows a cited backlog card one hop and keeps only existing source files', () => {
     expect(deriveScopeFromCard(card, { exists, readScope })).toEqual(['we:scripts/a.mjs', 'we:scripts/b.mjs', 'we:scripts/__tests__/a.test.mjs']);
   });
+  it.each([
+    'see backlog/../../../.ssh/x.md and we:../../other-repo/src/a.mjs',
+    'cites ../../other-repo/src/a.mjs',
+    'cites scripts/../../other-repo/src/a.mjs',
+    'cites scripts/./a.mjs',
+    'cites scripts\\..\\a.mjs',
+  ])('never probes or keeps a path that escapes the lane (%s)', (line) => {
+    const probed = [];
+    const probe = (p) => { probed.push(p); return true; };
+    const out = deriveScopeFromCard(`---\nstatus: open\n---\n${line}\n`, { exists: probe, readScope: (p) => { probed.push(p); return ['we:../../x.mjs', 'we:/etc/x.mjs', 'we:scripts/a.mjs']; } });
+    expect(out.every((e) => !/(^|[/:\\])\.{1,2}([/\\]|$)/.test(e) && !e.startsWith('we:/'))).toBe(true);
+    expect(probed.filter((p) => /(^|\/)\.{1,2}(\/|$)/.test(p) || p.startsWith('/'))).toEqual([]);
+  });
+  it('drops an escaping entry a cited backlog card carries in its own scope', () => {
+    const out = deriveScopeFromCard('---\nstatus: open\n---\nsee backlog/4309-queue.md\n', {
+      exists: () => true, readScope: () => ['we:../../x.mjs', 'we:/etc/x.mjs', 'we:scripts/a.mjs'],
+    });
+    expect(out).toEqual(['we:scripts/a.mjs']);
+  });
+  it('keeps a directory scope entry safe, and refuses .git and padded segments', () => {
+    expect(scopeIsDefective(['we:scripts/conveyor/'], { exists: () => true })).toBe(false);
+    expect(bareScopePath('we:reports/')).toBe('reports/');
+    expect(bareScopePath('we:.github/workflows/')).toBe('.github/workflows/');
+    for (const bad of ['we:.git/hooks/x.mjs', 'we:a//b.mjs', 'we:a/b /c.mjs', 'we:../', 'we:/']) expect(bareScopePath(bad)).toBeNull();
+  });
+  it('bareScopePath refuses an escaping or absolute entry', () => {
+    expect(bareScopePath('we:../x.mjs')).toBeNull();
+    expect(bareScopePath('we:scripts/../../x.mjs')).toBeNull();
+    expect(bareScopePath('we:/etc/x.mjs')).toBeNull();
+    expect(bareScopePath('we:scripts/a.mjs')).toBe('scripts/a.mjs');
+  });
   it('returns nothing when the card cites no real code', () => {
     expect(deriveScopeFromCard('---\nstatus: open\n---\nno paths here', { exists, readScope })).toEqual([]);
   });
@@ -66,5 +114,11 @@ describe('needsYouReason', () => {
     expect(r).toMatch(/^needs-you: prepare blocked \(spec-defect\)/);
     expect(classifyHoldReason(r)).toEqual({ route: 'other', commit: null });
     expect(r).not.toMatch(/[`<>]/);
+  });
+});
+
+describe('classifyPrepareReport - adverb before the defect word (PR #4323 review)', () => {
+  it('reads "the scope is entirely wrong" as spec-defect', () => {
+    expect(classifyPrepareReport('could-not-prepare: the scope is entirely wrong')).toMatchObject({ blocker: { kind: 'spec-defect' } });
   });
 });

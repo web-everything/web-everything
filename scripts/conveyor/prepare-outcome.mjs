@@ -27,7 +27,7 @@ const COULD_NOT_RE = new RegExp(String.raw`(?:^|\n|\b)could[- ]not[- ]prepare\b$
 const COMMIT_RE = /\bcommit\s+`?([0-9a-f]{7,40})\b/i;
 const BARE_SHA_RE = /\b([0-9a-f]{7,40})\b/;
 // "scope is wrong", "wrong scope", "scope: points at the 4309 card itself", "the scope is stale / names the wrong file".
-const SCOPE_DEFECT_RE = /\bwrong scope\b|\bincorrect scope\b|\bscope\b[^.\n]{0,80}\b(?:is |are )?(?:wrong|incorrect|stale|invalid|bad|missing|empty|mismatch\w*)\b|\bscope\b[^.\n]{0,60}\b(?:points? (?:at|to)|names?|targets?|lists?)\b[^.\n]{0,80}\b(?:itself|wrong|nothing to build|backlog card)/i;
+const SCOPE_DEFECT_RE = /\b(?:wrong|incorrect|stale|bad|invalid)\s+scope\b|\bscope:?`?\s*(?:(?:is|are|was|looks|seems)\s+(?:also\s+|clearly\s+|just\s+|[a-z]+ly\s+)?)?(?:wrong|incorrect|stale|invalid|bad|missing|empty|mismatch\w*)\b|\bscope:?`?\s+(?:points? (?:at|to)|names?|targets?|lists?)\b[^.;\n]{0,80}\b(?:itself|wrong|nothing to build|backlog card)/i;
 
 /**
  * Read a prepare worker's final message.
@@ -59,11 +59,26 @@ const PATH_TOKEN_RE = /(?:we:)?((?:[\w.-]+\/)+[\w.-]+\.(?:mjs|cjs|js|ts|tsx|json
 const SCOPE_KEY_RE = /^scope:[^\n]*(?:\n[ \t]+[^\n]*)*/m;
 export const MAX_DERIVED_SCOPE = 8;
 
-/** Bare repo path of a scope entry (`we:scripts/a.mjs` -> `scripts/a.mjs`), or null for another repo. */
+/**
+ * A repo-relative path that provably stays inside the repo: non-empty, no NUL/backslash, not absolute, and no `.`, `..`
+ * or `.git` segment (one trailing `/` is allowed for a directory scope entry). Card text is untrusted (externally sourced or LLM-authored), and every path read out of it reaches
+ * `existsSync`/`readFileSync` of `join(lanePath, rel)` and is written back into the card as a scope entry - so a
+ * `backlog/../../../.ssh/x.md` or `../../other-repo/a.mjs` must be refused here, at the one boundary
+ * (PR #4323 review). The real fs probes in the runner re-check containment against the lane's real path as well.
+ */
+export const isSafeRepoRelativePath = (p) => {
+  if (typeof p !== 'string' || !p || /[\0\\]/.test(p) || p.startsWith('/') || /^[a-z]:/i.test(p)) return false;
+  // One trailing "/" is a directory scope entry ("we:reports/"); every other empty segment is refused.
+  const trimmed = p.endsWith('/') ? p.slice(0, -1) : p;
+  return trimmed.split('/').every((seg) => seg && seg === seg.trim() && seg !== '.' && seg !== '..' && seg !== '.git');
+};
+
+/** Bare repo path of a scope entry (`we:scripts/a.mjs` -> `scripts/a.mjs`), or null for another repo or an unsafe path. */
 export const bareScopePath = (entry) => {
   const s = String(entry ?? '').trim();
   if (/^[a-z][\w-]*:/i.test(s) && !s.startsWith('we:')) return null;
-  return s.replace(/^we:/, '');
+  const bare = s.replace(/^we:/, '');
+  return isSafeRepoRelativePath(bare) ? bare : null;
 };
 
 /** A scope is defective when it has no entry, or every entry is a backlog card or a file that does not exist. */
@@ -86,6 +101,7 @@ export function deriveScopeFromCard(raw, { exists, readScope }) {
   const add = (p) => { if (!found.includes(p)) found.push(p); };
   for (const m of body.matchAll(PATH_TOKEN_RE)) {
     const p = m[1];
+    if (!isSafeRepoRelativePath(p)) continue;
     if (p.startsWith('backlog/')) {
       for (const entry of readScope(p) ?? []) {
         const bare = bareScopePath(entry);
