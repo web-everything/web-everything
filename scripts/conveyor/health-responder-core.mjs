@@ -21,6 +21,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "bg-isolation-stall": "Permission/isolation grants change authority; owning dispatcher/operator must repair them.",
   "claude-auth-expired": "Interactive login is owed; never synthesize credentials or resume another owner\u2019s worker.",
   "clone-stale": "Existing gated self-sync owns clone repair; never clean/reset/rebase a daemon clone.",
+  "clone-behind-main": "A clone that trails main is repaired by its owning daemon refresh path; never clean/reset/rebase a daemon clone.",
   "credential-inventory-stale": "Secret age is a review heuristic, not expiry proof; no automatic rotation.",
   "daemon-held-on-last-good": "Last-good is an intentional safety hold; no forced adoption or smoke bypass.",
   "daemon-owed-no-dispatch": "Aggregate refusal is not a uniquely actionable PR; use linked specific episodes only.",
