@@ -26,6 +26,9 @@ import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs'
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
 
+// Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
+process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
+
 // ── fixture helpers — copied from daemon-rebuild.test.mjs (never imported from it) ──────────────────────────
 
 const tempDirs = [];
