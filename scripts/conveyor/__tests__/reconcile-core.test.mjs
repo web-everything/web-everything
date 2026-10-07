@@ -3360,6 +3360,40 @@ describe('operator send-back renews a bounded durable fix budget', () => {
   });
 });
 
+describe('#101 operator send-back re-arms a red-CI PR once as a fix', () => {
+  const head = 'b'.repeat(40);
+  const sendBack = (over = {}) => ({
+    id: 'op-send-back', createdAt: '2026-10-07T00:24:00Z', author: { login: 'chalbert' },
+    body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nMUST FIX: rename the export.',
+    ...over,
+  });
+  const plan = (comments) => planReconcile({
+    prs: [pr1563({ number: 4141, headRefOid: head, statusCheckRollup: redRollup, labels: lbl('review:changes', 'review:human'), comments })], now: NOW,
+  });
+  it('dispatches a fix carrying the body, recorded as an operator re-arm', () => {
+    const r = plan([sendBack()]);
+    expect(r.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'operator-send-back',
+      operatorSendBack: expect.objectContaining({ login: 'chalbert', body: 'MUST FIX: rename the export.' }) })]);
+  });
+  it('is one-shot: a recorded repair round afterwards returns the PR to ci-heal', () => {
+    const r = plan([sendBack(), { body: REARM_COMMENT_MARKER, author: AUTOMATION }]);
+    expect(r.dispatch.map((d) => d.mode)).not.toContain('operator-send-back');
+  });
+  it('a loop-held ci-red head (no review:changes label) is still re-armed as a fix by the operator send-back', () => {
+    const r = planReconcile({ prs: [pr1563({ number: 4141, headRefOid: head, statusCheckRollup: redRollup,
+      labels: lbl('ci:failed'), comments: [sendBack()] })], now: NOW });
+    expect(r.dispatch.map((d) => [d.kind, d.mode])).toEqual([['fix', 'operator-send-back']]);
+  });
+  it('an automation-authored send-back does not re-arm', () => {
+    const r = plan([sendBack({ author: AUTOMATION })]);
+    expect(r.dispatch.map((d) => d.mode)).not.toContain('operator-send-back');
+  });
+  it('a bodiless send-back does not re-arm', () => {
+    const r = plan([sendBack({ body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.' })]);
+    expect(r.dispatch.map((d) => d.mode)).not.toContain('operator-send-back');
+  });
+});
+
 describe('xng7q1p mechanical timeout precedence', () => {
   const head = 'a'.repeat(40);
   const pr = (extra = {}) => pr1563({ number: 3415, headRefOid: head, labels: [], comments: [], statusCheckRollup: redRollup,

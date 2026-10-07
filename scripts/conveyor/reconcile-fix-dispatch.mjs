@@ -293,6 +293,8 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
         ...(entry.operatorAnswer ? { operatorAnswer: entry.operatorAnswer } : {}),
         ...(entry.rulingNotAddressed ? { rulingNotAddressed: entry.rulingNotAddressed } : {}),
         ...(entry.blockRuledReferrals?.length ? { blockRuledReferrals: entry.blockRuledReferrals } : {}),
+      ...(entry.operatorSendBack ? { operatorSendBack: entry.operatorSendBack } : {}),
+        ...(entry.operatorSendBack ? { operatorSendBack: entry.operatorSendBack } : {}),
         ...(entry.altBranch ? { altBranch: entry.altBranch } : {}), // fix procedure — a saved repair to recover first.
       });
       continue;
@@ -916,6 +918,15 @@ export function withRulingNotAddressed(prompt, ruling) {
   return ruling?.matches?.length ? `${fixerRulingBrief(ruling)}${prompt}` : prompt;
 }
 
+/** #101 — put the operator's send-back body in front of the fixer's prompt as its must-fix items, or leave it alone. */
+export function withOperatorSendBack(prompt, sendBack) {
+  if (!sendBack?.body) return prompt;
+  return '# Operator send-back — must-fix items, read this first\n\n'
+    + `@${sendBack.login} sent this PR back (operator re-arm). The items below are the whole ask: fix them, `
+    + 'push, and leave CI green. Do not touch any review label.\n\n'
+    + `${sendBack.body}\n\n${prompt}`;
+}
+
 /** Put the block-ruled referral findings in front of the fixer's prompt, or leave the prompt alone. */
 export function withBlockRuledReferrals(prompt, list) {
   if (!Array.isArray(list) || !list.length) return prompt;
@@ -1109,7 +1120,7 @@ export function dispatchFix(planned, {
       sessionId,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
       ...(ladderTable ? { table: ladderTable } : {}),
-      payload: { prompt: withAltBranchHint(withSalvageHint(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), sessionSlug, launchKind: 'fix' },
+      payload: { prompt: withAltBranchHint(withSalvageHint(withOperatorSendBack(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), sessionSlug, launchKind: 'fix' },
       // #3606 — see this function's own docblock: without this the fix agent reads a correctly-filled brief as an
       // unfilled template and self-aborts (3/3 live).
       systemPromptFile: DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
