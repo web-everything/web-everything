@@ -4,7 +4,9 @@
  * All mutations share a short synchronous mkdir mutex; health runs outside it and
  * must revalidate probation before acting. Readers never traverse metadata symlinks.
  * Remote pins cannot be probed: retain them until retainMinAgeMs has elapsed.
- * deps: fs, now, pidAlive, hostname, alert, health; failAfterRename is a crash seam.
+ * A switch records its intent in state.json before moving pointers; reconcile (and the next
+ * switch or probation check) completes it if current moved, or drops it if not.
+ * deps: fs, now, pidAlive, hostname, alert, health; failBeforeRename/failAfterRename are crash seams.
  */
 import * as filesystem from 'node:fs';
 import { hostname } from 'node:os';
@@ -80,26 +82,58 @@ function context({ clone, home, settings, deps = {} }) {
     host: () => typeof deps.hostname === 'string' ? deps.hostname : (deps.hostname ?? hostname)(),
   };
 }
+/**
+ * The lock is a numbered generation of directories, switch.lock.<n>; the highest n is the
+ * lock. A contender takes n+1 by mkdir, which exactly one process wins, and only after it
+ * saw n released or untouched for 30s. Nothing a live holder owns is renamed or removed to
+ * break a lock, so there is no stat-then-remove window. Holders mark their generation
+ * released rather than deleting it (generations must never repeat); the winner of a higher
+ * generation removes the lower ones. Long actions call renew() so they never look stale.
+ */
+const LOCK = 'switch.lock.';
+function lockGenerations(c) {
+  // Only canonical generation directories count; anything else in the home is not ours.
+  return c.fs.readdirSync(c.safe('', true), { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && /^switch\.lock\.(0|[1-9]\d{0,14})$/.test(entry.name))
+    .map(entry => Number(entry.name.slice(LOCK.length))).sort((a, b) => a - b);
+}
 function locked(c, action) {
   const { fs, root } = c;
   fs.mkdirSync(c.safe('', true), { recursive: true });
-  const path = c.safe('switch.lock', true);
-  const existing = c.stat(path);
-  if (existing) {
-    if (c.now() - existing.mtimeMs <= 30000) return { status: 'busy' };
-    try { fs.rmdirSync(path); }
-    catch (error) { if (error.code !== 'ENOENT') return { status: 'busy' }; }
+  const generations = lockGenerations(c);
+  const top = generations.at(-1);
+  if (top !== undefined) {
+    const holder = c.stat(c.safe(`${LOCK}${top}`, true));
+    if (!holder) return { status: 'busy' }; // taken over since we listed
+    // A skewed future mtime is as untrustworthy as an old one: only a near-now mtime means held.
+    if (!c.stat(join(root, `${LOCK}${top}`, 'released')) && Math.abs(c.now() - holder.mtimeMs) <= 30000) return { status: 'busy' };
   }
+  const gen = (top ?? -1) + 1, path = c.safe(`${LOCK}${gen}`, true);
   try { fs.mkdirSync(path); }
   catch (error) { if (error.code === 'EEXIST') return { status: 'busy' }; throw error; }
-  const owner = c.stat(path);
+  // We may have stalled long enough for generations to be removed and numbers reused: win only if still the top.
+  if (lockGenerations(c).at(-1) !== gen) {
+    fs.rmSync(path, { recursive: true, force: true });
+    return { status: 'busy' };
+  }
+  c.held = { gen, path };
   try {
     const time = new Date(c.now()); fs.utimesSync(path, time, time);
+    for (const old of generations) fs.rmSync(join(root, `${LOCK}${old}`), { recursive: true, force: true });
     return action();
   } finally {
-    const present = c.stat(join(root, 'switch.lock'));
-    if (present?.ino === owner.ino && present?.dev === owner.dev) fs.rmdirSync(path);
+    c.held = null;
+    // If this fails the generation simply expires; a superseded holder's directory is already gone.
+    try { fs.writeFileSync(join(path, 'released'), ''); } catch { /* expires on its own */ }
   }
+}
+/** Refresh the held lock; false means a newer generation took over and the action must stop. */
+function renew(c) {
+  if (!c.held) return true;
+  if (lockGenerations(c).at(-1) !== c.held.gen) return false;
+  try { const time = new Date(c.now()); c.fs.utimesSync(c.held.path, time, time); }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; } // taken over just now
+  return true;
 }
 function replaceLink(c, name, id) {
   c.linkId(name); // Refuse unsafe existing pointers, even though rename would replace them.
@@ -110,7 +144,7 @@ function replaceLink(c, name, id) {
     c.fs.renameSync(temp, join(c.root, name));
   } finally { if (created) c.fs.rmSync(temp, { force: true }); }
 }
-function switchInside(c, { id, expectCurrent, rollback = false, reason, by, dryRun = false }) {
+function switchInside(c, { id, expectCurrent, rollback = false, reason, by, reject = null, dryRun = false }) {
   validId(id);
   if (expectCurrent !== null) validId(expectCurrent);
   const actual = c.linkId('current');
@@ -124,19 +158,58 @@ function switchInside(c, { id, expectCurrent, rollback = false, reason, by, dryR
   if (actual === id) return { status: 'noop' };
   if (dryRun) return { status: 'dry-run', current: actual, target: id };
   const state = c.state();
-  const since = new Date(c.now()).toISOString();
+  // A crashed earlier switch is finished or discarded before this one builds on its state.
+  settle(c, state);
+  // Everything that can fail on bad metadata is read here, before any pointer moves.
+  const intent = { id, actual, rollback, since: new Date(c.now()).toISOString(),
+    probation: !rollback && c.config.autoRollback, reason: reason ?? 'rollback', by: by ?? 'operator',
+    oldPrevious: c.linkId('previous'),
+    reject: reject ? { id: validId(reject), record: { ...c.record(reject), id: reject, status: 'rejected' } } : null };
+  // Intent first: a crash after the pointer rename can then be completed by settle().
+  state.pending = intent; c.atomic('state.json', state);
+  c.deps.failBeforeRename?.();
   if (actual) replaceLink(c, 'previous', actual);
   else {
     c.linkId('previous'); c.fs.rmSync(join(c.root, 'previous'), { force: true });
   }
   replaceLink(c, 'current', id);
   c.deps.failAfterRename?.();
-  if (actual) state.retired = { ...state.retired, [actual]: since };
-  state.probation = !rollback && c.config.autoRollback ? { id, since, prev: actual } : null;
-  if (rollback) state.hold = { version: actual, reason: reason ?? 'rollback', by: by ?? 'operator', until: 'main-moves' };
-  state.adopted = id;
-  c.atomic('state.json', state);
+  commit(c, state, intent); c.atomic('state.json', state);
   return { status: 'switched', id, previous: actual };
+}
+/** Every effect of a switch beyond the pointers; idempotent so a crashed one can be replayed. */
+function commit(c, state, { id, actual, rollback, since, probation, reason, by, reject }, probationSince = since) {
+  // Best effort once the pointers have moved: a vanished or corrupt record must not wedge recovery.
+  if (reject && c.stat(c.safe(`versions/${validId(reject.id)}`, true))) {
+    try { c.atomic(`versions/${reject.id}/.version.json`, reject.record); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  if (actual) state.retired = { ...state.retired, [actual]: since };
+  state.probation = probation ? { id, since: probationSince, prev: actual } : null;
+  if (rollback) state.hold = { version: actual, reason, by, until: 'main-moves' };
+  state.adopted = id;
+  delete state.pending;
+}
+/**
+ * Complete a recorded switch if its pointer rename landed; otherwise drop the intent. A
+ * recovered probation window starts now: the version was not observed while we were down.
+ */
+function settle(c, state) {
+  const intent = state.pending;
+  if (!intent) return false;
+  const current = c.linkId('current');
+  if (current === intent.id) commit(c, state, intent, new Date(c.now()).toISOString());
+  else {
+    // The pointer rename never landed. If `previous` was already replaced, put it back: otherwise
+    // it equals `current` and the way back (and its gc protection) is lost.
+    if (current === intent.actual && intent.actual && c.linkId('previous') !== intent.oldPrevious) {
+      if (intent.oldPrevious && c.stat(c.safe(`versions/${intent.oldPrevious}`, true))) replaceLink(c, 'previous', intent.oldPrevious);
+      else c.fs.rmSync(join(c.root, 'previous'), { force: true });
+    }
+    delete state.pending;
+  }
+  c.atomic('state.json', state);
+  return true;
 }
 
 /** Explicit expectation is mandatory, including null for the first adoption. */
@@ -154,7 +227,8 @@ export async function reconcile(options) {
     const truth = id ? c.record(id) : null;
     if (id && truth?.id !== id) throw new Error('Current version record is missing or mismatched');
     const state = c.state();
-    if (state.adopted === (truth?.id ?? null)) return { status: 'ok' };
+    const settled = settle(c, state);
+    if (state.adopted === (truth?.id ?? null)) return { status: settled ? 'reconciled' : 'ok' };
     state.adopted = truth?.id ?? null; c.atomic('state.json', state);
     return { status: 'reconciled' };
   });
@@ -225,8 +299,10 @@ function livePins(c, prune = false) {
 export async function gc(options) {
   const c = context(options); if (!c) return disabled;
   return locked(c, () => {
+    const state = c.state();
+    settle(c, state); // a half-done switch must not have its previous/current judged unprotected
     const current = c.linkId('current'), previous = c.linkId('previous');
-    const state = c.state(), pins = livePins(c, true), entries = versions(c);
+    const pins = livePins(c, true), entries = versions(c);
     const built = e => e.record?.id === e.id && e.record.status === 'built';
     const failed = e => e.record?.id === e.id && ['rejected', 'smoke-failed'].includes(e.record.status);
     const newest = (a, b) => (Date.parse(b.record?.builtAt) || 0) - (Date.parse(a.record?.builtAt) || 0) || b.id.localeCompare(a.id);
@@ -241,7 +317,11 @@ export async function gc(options) {
         : young ? 'young' : !built(entry) && !failed(entry) ? 'unknown'
           : recent.has(id) ? 'newest' : id === inspection ? 'inspection' : null;
       if (why) kept.push({ id, why });
-      else { c.fs.rmSync(c.safe(`versions/${id}`, true), { recursive: true }); removed.push(id); }
+      else {
+        // A takeover means another process may now be mutating versions; stop rather than race it.
+        if (!renew(c)) return { status: 'busy' };
+        c.fs.rmSync(c.safe(`versions/${id}`, true), { recursive: true }); removed.push(id);
+      }
     }
     return { removed, kept };
   });
@@ -259,6 +339,7 @@ export async function checkProbation(options) {
   const c = context(options); if (!c) return disabled;
   const initial = locked(c, () => {
     const state = c.state();
+    settle(c, state); // A crash can have left probation unrecorded; recover it before judging.
     if (!state.probation) return { status: 'none' };
     if (c.now() - Date.parse(state.probation.since) > c.config.probationMs) {
       state.probation = null; c.atomic('state.json', state); return { status: 'out-of-probation' };
@@ -277,10 +358,9 @@ export async function checkProbation(options) {
     if (health.ok !== false) return { status: 'probation-ok' };
     if (!c.config.autoRollback) return { status: 'probation-failed', reason: health.reason };
     if (!p.prev) return { status: 'no-previous' };
-    const record = c.record(p.id);
-    const result = switchInside(c, { id: p.prev, expectCurrent: p.id, rollback: true, by: 'probation', reason: health.reason });
+    // The rejection is part of the switch intent, so a crash cannot leave a rolled-back version marked built.
+    const result = switchInside(c, { id: p.prev, expectCurrent: p.id, rollback: true, by: 'probation', reason: health.reason, reject: p.id });
     if (result.status === 'switched') {
-      c.atomic(`versions/${p.id}/.version.json`, { ...record, id: p.id, status: 'rejected' });
       (c.deps.alert ?? (() => {}))('probation-rollback', { id: p.id, to: p.prev, reason: health.reason });
     }
     return result;

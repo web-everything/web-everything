@@ -7,7 +7,9 @@ import { join, resolve } from 'node:path';
 import * as api from '../daemon-version-switch.mjs';
 
 describe('daemon version switching', () => {
-  let fixture, clone, home, root, settings, deps, now;
+  let fixture, clone, home, root, settings, deps, deps2, now;
+  const lockDirs = () => fs.readdirSync(root).filter(name => name.startsWith('switch.lock.')).sort();
+  const files = () => fs.readdirSync(root).filter(name => !name.startsWith('switch.lock.')).sort();
   const call = (name, extra = {}) => api[name]({ clone, home, settings, deps, ...extra });
   const json = path => JSON.parse(fs.readFileSync(path, 'utf8'));
   const state = () => json(join(root, 'state.json'));
@@ -26,6 +28,7 @@ describe('daemon version switching', () => {
     settings = { enabled: { daemon: true }, keep: 2, retainMinAgeMs: 10000, probationMs: 1000, autoRollback: true };
     deps = { now: () => now, hostname: () => 'local', pidAlive: pid => pid === 123, alert: vi.fn(), health: vi.fn(async () => ({ ok: true })) };
     version('a', 'built', 100000); version('b', 'built', 50000); version('c');
+    deps2 = { ...deps };
     link('current', 'a'); writeState({ adopted: 'a', retired: {}, hold: null, probation: null });
   });
   afterEach(() => fs.rmSync(fixture, { recursive: true, force: true }));
@@ -41,7 +44,7 @@ describe('daemon version switching', () => {
     const before = state(); link('current', 'c');
     expect(await call('switchCurrent', { id: 'b', expectCurrent: 'a' })).toEqual({ status: 'aborted', reason: 'current-moved', actual: 'c' });
     expect(current()).toBe('versions/c'); expect(state()).toEqual(before);
-    expect(fs.readdirSync(root).sort()).toEqual(['current', 'state.json', 'versions']);
+    expect(files()).toEqual(['current', 'state.json', 'versions']);
   });
   it('allows exactly one concurrent switch with the same expectation', async () => {
     const results = await Promise.all(['b', 'c'].map(id => call('switchCurrent', { id, expectCurrent: 'a' })));
@@ -57,15 +60,170 @@ describe('daemon version switching', () => {
     deps.failAfterRename = () => { throw new Error('crash'); };
     await expect(call('switchCurrent', { id: 'b', expectCurrent: 'a' })).rejects.toThrow('crash');
     expect(current()).toBe('versions/b'); expect(state().adopted).toBe('a');
-    expect(fs.existsSync(join(root, 'switch.lock'))).toBe(false);
+    expect(lockDirs()).toEqual(['switch.lock.0']); expect(fs.existsSync(join(root, 'switch.lock.0/released'))).toBe(true);
     expect(await call('reconcile')).toEqual({ status: 'reconciled' });
     expect(state().adopted).toBe('b'); expect(await call('reconcile')).toEqual({ status: 'ok' });
   });
+  it('restores probation, retirement and rollback after a crash past the pointer rename', async () => {
+    deps.failAfterRename = () => { throw new Error('crash'); };
+    await expect(call('switchCurrent', { id: 'b', expectCurrent: 'a' })).rejects.toThrow('crash');
+    delete deps.failAfterRename;
+    expect(await call('reconcile')).toEqual({ status: 'reconciled' });
+    expect(state()).toMatchObject({ adopted: 'b', retired: { a: new Date(now).toISOString() }, probation: { id: 'b', prev: 'a', since: new Date(now).toISOString() } });
+    expect(state().pending).toBeUndefined();
+    deps.health.mockResolvedValue({ ok: false, reason: 'unhealthy' });
+    expect(await call('checkProbation')).toMatchObject({ status: 'switched' });
+    expect(current()).toBe('versions/a'); expect(json(join(root, 'versions/b/.version.json')).status).toBe('rejected');
+  });
+  it('rolls back an unhealthy version after a crash even when reconcile has not run yet', async () => {
+    deps.failAfterRename = () => { throw new Error('crash'); };
+    await expect(call('switchCurrent', { id: 'b', expectCurrent: 'a' })).rejects.toThrow('crash');
+    delete deps.failAfterRename;
+    deps.health.mockResolvedValue({ ok: false, reason: 'unhealthy' });
+    expect(await call('checkProbation')).toMatchObject({ status: 'switched' });
+    expect(current()).toBe('versions/a');
+  });
+  it('restores the hold after a crashed rollback and discards an intent whose rename never happened', async () => {
+    await call('switchCurrent', { id: 'b', expectCurrent: 'a' });
+    deps.failAfterRename = () => { throw new Error('crash'); };
+    await expect(call('rollback', { reason: 'broken', by: 'operator' })).rejects.toThrow('crash');
+    expect(await call('reconcile')).toEqual({ status: 'reconciled' });
+    expect(state()).toMatchObject({ adopted: 'a', probation: null, hold: { version: 'b', reason: 'broken', by: 'operator' } });
+    delete deps.failAfterRename;
+    deps.failBeforeRename = () => { throw new Error('early crash'); };
+    await expect(call('switchCurrent', { id: 'c', expectCurrent: 'a' })).rejects.toThrow('early crash');
+    delete deps.failBeforeRename;
+    expect(current()).toBe('versions/a'); expect(state().pending).toBeTruthy();
+    expect(await call('reconcile')).toEqual({ status: 'reconciled' });
+    expect(state().pending).toBeUndefined(); expect(state().adopted).toBe('a');
+    expect(await call('switchCurrent', { id: 'c', expectCurrent: 'a' })).toMatchObject({ status: 'switched' });
+  });
   it('fails fast on a live lock and clears a lock older than 30 seconds', async () => {
-    const lock = join(root, 'switch.lock'); fs.mkdirSync(lock); fs.utimesSync(lock, now / 1000, now / 1000);
+    const lock = join(root, 'switch.lock.5'); fs.mkdirSync(lock); fs.utimesSync(lock, now / 1000, now / 1000);
     expect(await call('switchCurrent', { id: 'b', expectCurrent: 'a' })).toEqual({ status: 'busy' });
     fs.utimesSync(lock, (now - 30001) / 1000, (now - 30001) / 1000);
     expect(await call('switchCurrent', { id: 'b', expectCurrent: 'a' })).toMatchObject({ status: 'switched' });
+    expect(lockDirs()).toEqual(['switch.lock.6']); // generations only ever grow; the old one is gone
+  });
+  it('lets the next caller in as soon as a holder releases, without waiting for expiry', async () => {
+    expect(await call('switchCurrent', { id: 'b', expectCurrent: 'a' })).toMatchObject({ status: 'switched' });
+    fs.utimesSync(join(root, 'switch.lock.0'), now / 1000, now / 1000); // fresh by the clock, so only `released` can admit us
+    expect(fs.existsSync(join(root, 'switch.lock.0/released'))).toBe(true);
+    expect(await call('rollback')).toMatchObject({ status: 'switched' });
+    expect(lockDirs()).toEqual(['switch.lock.1']);
+  });
+  it('backs out when a stalled contender wakes after its generation number was removed and reused', async () => {
+    fs.mkdirSync(join(root, 'switch.lock.0')); fs.writeFileSync(join(root, 'switch.lock.0/released'), '');
+    deps2.fs = { ...fs, mkdirSync: (...args) => {
+      // While we were stalled, generations 0 and 1 came and went and a holder is running as generation 2.
+      if (args[0] === join(root, 'switch.lock.1')) {
+        fs.rmSync(join(root, 'switch.lock.0'), { recursive: true }); fs.mkdirSync(join(root, 'switch.lock.2')); fs.utimesSync(join(root, 'switch.lock.2'), now / 1000, now / 1000);
+      }
+      return fs.mkdirSync(...args);
+    } };
+    expect(await api.switchCurrent({ clone, home, settings, deps: deps2, id: 'b', expectCurrent: 'a' })).toEqual({ status: 'busy' });
+    expect(lockDirs()).toEqual(['switch.lock.2']); expect(current()).toBe('versions/a');
+  });
+  it('treats a vanished top generation as taken over, and ignores entries that are not canonical generation directories', async () => {
+    fs.mkdirSync(join(root, 'switch.lock.0')); fs.writeFileSync(join(root, 'switch.lock.0/released'), '');
+    deps2.fs = { ...fs, lstatSync: (...args) => {
+      if (args[0] === join(root, 'switch.lock.0') && fs.existsSync(args[0])) { fs.rmSync(args[0], { recursive: true }); fs.mkdirSync(join(root, 'switch.lock.1')); fs.utimesSync(join(root, 'switch.lock.1'), now / 1000, now / 1000); }
+      return fs.lstatSync(...args);
+    } };
+    expect(await api.switchCurrent({ clone, home, settings, deps: deps2, id: 'b', expectCurrent: 'a' })).toEqual({ status: 'busy' });
+    fs.rmSync(join(root, 'switch.lock.1'), { recursive: true });
+    for (const junk of ['switch.lock.junk', 'switch.lock.007', 'switch.lock.1.bak']) fs.writeFileSync(join(root, junk), '');
+    fs.symlinkSync(fixture, join(root, 'switch.lock.9'));
+    expect(await call('switchCurrent', { id: 'b', expectCurrent: 'a' })).toMatchObject({ status: 'switched' });
+    expect(lockDirs().filter(name => !['switch.lock.junk', 'switch.lock.007', 'switch.lock.1.bak', 'switch.lock.9'].includes(name))).toEqual(['switch.lock.0']);
+  });
+  it('a corrupt record cannot wedge recovery, and a corrupt one is refused before any pointer moves', async () => {
+    await call('switchCurrent', { id: 'b', expectCurrent: 'a' });
+    fs.writeFileSync(join(root, 'versions/b/.version.json'), '{ not json');
+    deps.health.mockResolvedValue({ ok: false });
+    await expect(call('checkProbation')).rejects.toThrow(SyntaxError);
+    expect(current()).toBe('versions/b'); expect(state().pending).toBeUndefined();
+  });
+  it('restores previous when a crash lands between the previous and current pointer renames', async () => {
+    link('previous', 'c');
+    const real = fs.renameSync; let renames = 0;
+    deps.fs = { ...fs, renameSync: (...args) => { if (String(args[1]).endsWith('/current') && !renames++) throw new Error('crash'); return real(...args); } };
+    await expect(call('switchCurrent', { id: 'b', expectCurrent: 'a' })).rejects.toThrow('crash');
+    expect(fs.readlinkSync(join(root, 'previous'))).toBe('versions/a'); // already replaced; the old previous would be lost
+    delete deps.fs;
+    expect(await call('reconcile')).toEqual({ status: 'reconciled' });
+    expect(current()).toBe('versions/a'); expect(fs.readlinkSync(join(root, 'previous'))).toBe('versions/c');
+    expect(state().pending).toBeUndefined();
+  });
+  it('rejects the failed version in the same recoverable step as the probation rollback', async () => {
+    await call('switchCurrent', { id: 'b', expectCurrent: 'a' });
+    deps.health.mockResolvedValue({ ok: false, reason: 'unhealthy' });
+    deps.failAfterRename = () => { throw new Error('crash'); };
+    await expect(call('checkProbation')).rejects.toThrow('crash');
+    delete deps.failAfterRename;
+    expect(json(join(root, 'versions/b/.version.json')).status).toBe('built');
+    expect(await call('reconcile')).toEqual({ status: 'reconciled' });
+    expect(current()).toBe('versions/a');
+    expect(json(join(root, 'versions/b/.version.json')).status).toBe('rejected');
+    expect(state()).toMatchObject({ adopted: 'a', probation: null, hold: { version: 'b', by: 'probation', reason: 'unhealthy' } });
+  });
+  it('starts a recovered probation window at recovery time so a late recovery still gets a health check', async () => {
+    deps.failAfterRename = () => { throw new Error('crash'); };
+    await expect(call('switchCurrent', { id: 'b', expectCurrent: 'a' })).rejects.toThrow('crash');
+    delete deps.failAfterRename;
+    now += 5000; // longer than probationMs
+    await call('reconcile');
+    expect(state().probation).toMatchObject({ id: 'b', since: new Date(now).toISOString() });
+    expect(await call('checkProbation')).toEqual({ status: 'probation-ok' });
+    expect(deps.health).toHaveBeenCalledTimes(1);
+  });
+  const staleLock = (gen = 0) => {
+    const lock = join(root, `switch.lock.${gen}`); fs.mkdirSync(lock);
+    fs.utimesSync(lock, (now - 30001) / 1000, (now - 30001) / 1000); return lock;
+  };
+  it('lets exactly one of two contenders that both saw a stale lock take it over', async () => {
+    const lock = staleLock();
+    let rival;
+    // The rival sees the same stale lock and completes a whole switch between our listing and our mkdir.
+    deps2.fs = { ...fs, mkdirSync: (...args) => {
+      if (!rival && args[0] === join(root, 'switch.lock.1')) rival = api.switchCurrent({ clone, home, settings, deps, id: 'c', expectCurrent: 'a' });
+      return fs.mkdirSync(...args);
+    } };
+    expect(await api.switchCurrent({ clone, home, settings, deps: deps2, id: 'b', expectCurrent: 'a' })).toEqual({ status: 'busy' });
+    expect(await rival).toMatchObject({ status: 'switched', id: 'c' });
+    expect(current()).toBe('versions/c'); expect(state().adopted).toBe('c');
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(lockDirs()).toEqual(['switch.lock.1']);
+  });
+  it('never removes or replaces a lock another process holds while we try to take over', async () => {
+    const lock = staleLock();
+    deps2.fs = { ...fs, mkdirSync: (...args) => {
+      // Another process wins generation 1 first and holds it, fresh.
+      if (args[0] === join(root, 'switch.lock.1')) { fs.mkdirSync(args[0]); fs.utimesSync(args[0], now / 1000, now / 1000); }
+      return fs.mkdirSync(...args);
+    } };
+    expect(await api.switchCurrent({ clone, home, settings, deps: deps2, id: 'b', expectCurrent: 'a' })).toEqual({ status: 'busy' });
+    expect(fs.statSync(join(root, 'switch.lock.1')).mtimeMs).toBe(now);
+    expect(fs.existsSync(lock)).toBe(true); expect(current()).toBe('versions/a');
+    expect(await call('switchCurrent', { id: 'b', expectCurrent: 'a' })).toEqual({ status: 'busy' });
+  });
+  it('keeps a long action fresh and makes a superseded holder stop', async () => {
+    for (const id of ['x1', 'x2', 'x3', 'x4']) version(id, 'built', 500000);
+    let removals = 0, rival;
+    deps2.fs = { ...fs, rmSync: (...args) => {
+      if (String(args[0]).includes('/versions/x')) {
+        now += 20000; removals++;
+        // 40s after acquisition but only 20s since the last renewal: still held.
+        if (removals === 2) rival = api.switchCurrent({ clone, home, settings, deps, id: 'b', expectCurrent: 'a' });
+        // Another process takes generation 1 over while we are mid-removal (e.g. we looked stale to it).
+        if (removals === 3) { fs.rmSync(join(root, 'switch.lock.0'), { recursive: true }); fs.mkdirSync(join(root, 'switch.lock.1')); }
+      }
+      return fs.rmSync(...args);
+    } };
+    const result = await api.gc({ clone, home, settings, deps: deps2 });
+    expect(await rival).toEqual({ status: 'busy' });
+    expect(result).toEqual({ status: 'busy' }); // noticed the takeover before the fourth removal
+    expect(['x1', 'x2', 'x3', 'x4'].filter(id => fs.existsSync(join(root, 'versions', id)))).toHaveLength(1);
   });
   it('GC respects protected versions, cleans stale pins and retains one failed build', async () => {
     link('previous', 'b');
