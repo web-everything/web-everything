@@ -7,7 +7,7 @@
  *   The post fails unless the gate's own reader sees the ruling it just wrote.
  */
 
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -17,6 +17,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOperatorRulings } from '../lib/jury-core.mjs';
 import { currentActorId } from '../lib/review-independence.mjs';
 import { referralCardReadable } from '../review-set-label.mjs';
+import { EVENT_TYPES, buildLedgerEvent, serializeLedgerEvent, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { idFromName, normalizeId } from '../backlog/id.mjs';
 import { openReferralFindings, OPERATOR_RULING_POST_EFFECT, OPERATOR_RULING_FOLLOW_UP_EFFECT, RULING_NEEDED_LABEL } from './record-referral-ruling.mjs';
@@ -85,7 +86,28 @@ export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = 
   };
 }
 
+/** Ruling results that CLEAR a finding's hold (`card`, `not-real`); `block` holds (statute F4, #verdict-ledger-pr-state-store). */
+const clearsHold = (result) => result !== 'block';
+
+/**
+ * Default ledger writer for ruling / send-back events: appends to the machine-local ledger (same file and lock-free
+ * line append as `appendVerdict`'s home store). Throws on an invalid event or a write error so the caller can apply
+ * the F4 write-miss posture. The git-transport leg awaits an event-capable `appendLedgerRows`.
+ */
+export function appendLedgerEventsHome(events) {
+  for (const e of events) {
+    const s = serializeLedgerEvent(e);
+    if (!s.ok) throw new Error(`invalid ledger event refused: ${s.errors.join('; ')}`);
+    const path = verdictLedgerPath(e.repo);
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${s.line}\n`, 'utf8');
+  }
+}
+
 export function createRecordReferralRulingSinks({ readJson = ghJson,
+  appendEvents = appendLedgerEventsHome,
+  warn = (m) => process.stderr.write(`${m}\n`),
+  now = () => new Date().toISOString(),
   readPr = (repo, pr) => readJson(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,labels']),
   runSetLabel = execFileSync,
   setLabels = (...args) => execFileSyncThrottled('gh', args,
@@ -121,11 +143,32 @@ export function createRecordReferralRulingSinks({ readJson = ghJson,
       }
       const labelCleared = labels.includes(RULING_NEEDED_LABEL);
       if (labelCleared) await setLabels('pr', 'edit', String(pr), '--repo', repo, '--remove-label', RULING_NEEDED_LABEL);
-      return { action, sentBack, labelCleared };
+      let ledgerWriteMiss = false;
+      if (sentBack) {
+        // A send-back is a HOLDING event: its label hold already applied, so a miss only raises the smell.
+        try {
+          appendEvents([buildLedgerEvent({ type: EVENT_TYPES.SEND_BACK, repo, pr, at: now(),
+            source: 'record-referral-ruling', declaredActor: actor, channel, cause: 'block-ruling' })]);
+        } catch (e) {
+          ledgerWriteMiss = true;
+          warn(`ledger-write-miss: send-back of ${repo}#${pr} was applied but not recorded in the verdict ledger: ${String(e?.message ?? e)}`);
+        }
+      }
+      return { action, sentBack, labelCleared, ...(ledgerWriteMiss ? { ledgerWriteMiss } : {}) };
     },
-    [OPERATOR_RULING_POST_EFFECT]: async ({ repo, pr, head, body }) => {
+    [OPERATOR_RULING_POST_EFFECT]: async ({ repo, pr, head, body, rulings = [], actor = '', channel = '' }) => {
       const before = readPrThread(repo, pr, { readJson });
       if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing posted — re-run against the new head`);
+      const events = rulings.map((r) => buildLedgerEvent({ type: EVENT_TYPES.RULING, repo, pr, at: now(),
+        source: 'record-referral-ruling', declaredActor: actor, channel, findingKey: r.key, ruling: r.result }));
+      const tryAppend = (list) => { try { appendEvents(list); return null; } catch (e) { return String(e?.message ?? e); } };
+      // F4: a CLEARING ruling (card / not-real) that cannot be recorded does not clear: nothing is posted, the
+      // operation stays resumable. A HOLDING ruling (block) is still posted and raises ledger-write-miss.
+      const clearing = events.filter((e) => clearsHold(e.ruling));
+      if (clearing.length) {
+        const miss = tryAppend(clearing);
+        if (miss) throw new Error(`ledger-write-miss: the ruling was not recorded in the verdict ledger, so it does not clear and nothing was posted (${miss}); retry once the ledger is writable`);
+      }
       const already = before.comments.some((c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body);
       if (!already) post(repo, pr, body);
       const after = readPrThread(repo, pr, { readJson });
@@ -133,7 +176,10 @@ export function createRecordReferralRulingSinks({ readJson = ghJson,
       if (!seen.length || !readOperatorRulings(seen, { head }).rulings.length) {
         throw new Error('the ruling comment is not readable by the gate after posting (untrusted author or altered body); the hold remains — inspect the thread before retrying');
       }
-      return { posted: !already, head, url: seen.at(-1)?.url ?? null };
+      const holding = events.filter((e) => !clearsHold(e.ruling));
+      const holdMiss = holding.length ? tryAppend(holding) : null;
+      if (holdMiss) warn(`ledger-write-miss: block ruling on ${repo}#${pr} was posted but not recorded in the verdict ledger: ${holdMiss}`);
+      return { posted: !already, head, url: seen.at(-1)?.url ?? null, ...(holdMiss ? { ledgerWriteMiss: true } : {}) };
     },
   };
 }
