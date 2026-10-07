@@ -47,7 +47,7 @@ import {
   applyJurorInvite,
   buildEscalationPacket,
 } from './lib/converge-core.mjs';
-import { gitDirOf, treeOf, workingTreeOf, buildReceipt, RECEIPT_FILE } from './lib/pre-pr-review.mjs';
+import { gitDirOf, treeOf, workingTreeOf, buildReceipt, RECEIPT_FILE, isScratchPath } from './lib/pre-pr-review.mjs';
 import { resolveTransport, validateLaneTarget } from './lib/converge-transports.mjs';
 import { MANDATORY_LENSES, PANEL_LENSES, panelRigorForCareLevel } from './lib/jury-core.mjs';
 import { CARE_LEVELS } from './lib/review-escalation.mjs';
@@ -161,7 +161,7 @@ function laneChangedFiles(root, baseRef) {
   const mergeBase = (gitAt(root, ['merge-base', 'HEAD', baseRef]) || '').trim();
   const tracked = mergeBase ? (gitAt(root, ['diff', '--name-only', mergeBase]) || '') : '';
   const untracked = gitAt(root, ['ls-files', '--others', '--exclude-standard']) || '';
-  return [...new Set(`${tracked}\n${untracked}`.split('\n').map((s) => s.trim()).filter(Boolean))];
+  return [...new Set(`${tracked}\n${untracked}`.split('\n').map((s) => s.trim()).filter(Boolean))].filter((p) => !isScratchPath(p) || tracked.split('\n').includes(p));
 }
 
 /**
@@ -493,8 +493,9 @@ function receipt(flags) {
   if (dirty === null) return fail(`not a git checkout: ${lane}`);
   if (dirty.trim()) return fail('no receipt: the lane has uncommitted tracked changes. Commit first, so the receipt covers the head that will be pushed.');
   // The panel read untracked files too, so any left uncommitted are content the receipt would not cover.
-  const untracked = (gitAt(lane, ['ls-files', '--others', '--exclude-standard']) || '').trim();
-  if (untracked) return fail(`no receipt: the lane has untracked files the panel read but the head does not contain (${untracked.split('\n').slice(0, 3).join(', ')}${untracked.split('\n').length > 3 ? ', …' : ''}). Commit or delete them, then re-run /converge if the content changed.`);
+  // Untracked brief-sanctioned scratch (`.converge-*` state, `.commit-msg.txt`, …) is not reviewed content — see workingTreeOf.
+  const leftover = (gitAt(lane, ['ls-files', '--others', '--exclude-standard']) || '').split('\n').map((s) => s.trim()).filter((p) => p && !isScratchPath(p));
+  if (leftover.length) return fail(`no receipt: the lane has untracked files the panel read but the head does not contain (${leftover.slice(0, 3).join(', ')}${leftover.length > 3 ? ', …' : ''}). Commit or delete them, then re-run /converge if the content changed.`);
   const tree = treeOf(lane);
   // Bind the receipt to the reviewed run: same lane, same content. (Defence against honest mistakes — reusing an
   // old landed state file for another lane, or committing more work after the review. It is NOT tamper-proof

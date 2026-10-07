@@ -43,6 +43,15 @@ describe('risk rule', () => {
   it('264 lines exactly is NOT over the line threshold', () => {
     expect(classifyPrRisk({ files: [f('scripts/a.mjs', 264)], hasPreparedCard: true, operatorAgent: false }).gated).toBe(false);
   });
+  it('isPreparedCard rejects a preparedDate outside the leading frontmatter block', () => {
+    const unprepared = '---\nstatus: open\n---\n\n# Title\n\n```yaml\npreparedDate: 2026-10-01\n```\n';
+    expect(isPreparedCard(unprepared)).toBe(false);
+    expect(isPreparedCard('# No frontmatter\npreparedDate: 2026-10-01\n')).toBe(false);
+    expect(isPreparedCard('preparedDate: 2026-10-01\n---\nstatus: open\n---\n')).toBe(false); // the block must OPEN the file
+    expect(isPreparedCard('---\nstatus: open\npreparedDate: 2026-10-01\n---\nbody\n')).toBe(true);
+    expect(isPreparedCard('---\r\nstatus: open\r\npreparedDate: 2026-10-01\r\n---\r\nbody\r\n')).toBe(true);
+    expect(isPreparedCard('---\nstatus: open\n')).toBe(false); // an unterminated block is not frontmatter
+  });
   it('isPreparedCard reads preparedDate', () => {
     expect(isPreparedCard('---\npreparedDate: "2026-06-12"\n---')).toBe(true);
     expect(isPreparedCard('---\nstatus: open\n---')).toBe(false);
@@ -250,6 +259,27 @@ describe('gate hardening (PR #4271 review)', () => {
     });
   });
 
+  it('refuses when the daily bypass audit cannot be written, even though the per-checkout log can', () => {
+    commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
+    const blocker = join(dir, 'not-a-dir'); writeFileSync(blocker, 'a file where the audit directory should go\n');
+    process.env.WE_PRE_PR_BYPASS_DIR = join(blocker, 'records'); // mkdir -> ENOTDIR
+    const spawned = [];
+    const run = createPrLandRunner({ loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+    const body = join(dir, 'b.md'); writeFileSync(body, 'body\n');
+    expect(run({ argv: ['--ref=lane/x', '--base=main', `--body-file=${body}`], skipPrePrReview: 'hotfix', actor: 'nic', operatorInstruction: 'ship it' }))
+      .toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
+    expect(spawned).toHaveLength(0);
+  });
+
+  it('a --dry-run is never gated: a refusing or throwing check is not consulted and pr-land is still spawned', () => {
+    for (const prePrReview of [() => { throw new Error('must not run'); }, () => ({ action: 'refuse', reason: 'pre-pr-review-missing', message: 'no' })]) {
+      const spawned = [];
+      const run = createPrLandRunner({ prePrReview, loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+      expect(run({ argv: ['--ref=lane/x', '--dry-run'] })).toMatchObject({ outcome: 'opened' });
+      expect(spawned).toHaveLength(1);
+    }
+  });
+
   describe('gate and push are bound to one commit', () => {
     it('judges --sha, not the checkout HEAD: an explicit risky sha is refused while HEAD is on main', () => {
       commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
@@ -417,6 +447,35 @@ describe('converge-cli receipt', () => {
     expect(git('status', '--porcelain')).toBe(before); // nothing staged by the hash
     git('add', '-A'); git('-c', 'user.email=a@b', '-c', 'user.name=t', 'commit', '-qm', 'reviewed');
     expect(treeOf(dir)).toBe(reviewed);
+  });
+  it('converge scratch files (.converge-*) inside the lane are not reviewed content: the hash and the receipt ignore them', () => {
+    const clean = workingTreeOf(dir);
+    writeFileSync(join(dir, '.converge-state.json'), '{"n":1}');
+    writeFileSync(join(dir, '.converge-obs-1.json'), '{}');
+    expect(workingTreeOf(dir)).toBe(clean);
+    writeFileSync(join(dir, '.converge-state.json'), '{"n":2}'); // `step` rewrites it after hashing
+    expect(workingTreeOf(dir)).toBe(clean);
+    writeFileSync(join(dir, 'real.txt'), 'real work\n');         // a non-scratch untracked file still counts
+    expect(workingTreeOf(dir)).not.toBe(clean);
+  });
+  it('the brief\'s other sanctioned in-lane scratch (.commit-msg.txt, .pr-body.md) is skipped too, but a TRACKED file of that name counts', () => {
+    const clean = workingTreeOf(dir);
+    writeFileSync(join(dir, '.commit-msg.txt'), 'msg\n'); writeFileSync(join(dir, '.pr-body.md'), 'body\n');
+    expect(workingTreeOf(dir)).toBe(clean);
+    writeFileSync(join(dir, '.commit-msg.txt'), 'msg\n');
+    git('add', '-f', '.commit-msg.txt'); git('-c', 'user.email=a@b', '-c', 'user.name=t', 'commit', '-qm', 'tracked scratch');
+    const tracked = workingTreeOf(dir);
+    writeFileSync(join(dir, '.commit-msg.txt'), 'edited\n');
+    expect(workingTreeOf(dir)).not.toBe(tracked); // tracked content is never hidden
+  });
+  it('the brief\'s literal flow works: state file INSIDE the lane (plus obs/material scratch) still yields a receipt', () => {
+    const inLane = join(dir, '.converge-state.json');
+    writeFileSync(join(dir, '.converge-obs-1.json'), '{}'); writeFileSync(join(dir, '.converge-material-1.txt'), 'diff');
+    writeFileSync(inLane, JSON.stringify(landed()));
+    writeFileSync(inLane, JSON.stringify({ ...landed(), rewrittenAfterHash: true })); // step rewrites state after computing reviewed.tree
+    const ok = cli('receipt', `--state=${inLane}`, `--lane=${dir}`);
+    expect(ok.status, ok.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(join(dir, '.git', RECEIPT_FILE), 'utf8'))).toMatchObject({ tree: treeOf(dir), verdict: 'land' });
   });
   it('refuses when tracked files are dirty', () => {
     writeFileSync(state, JSON.stringify(landed()));

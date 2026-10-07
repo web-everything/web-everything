@@ -20,6 +20,7 @@ import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isCardPath } from '../ci-card-only.mjs';
+import { isAllowlistedLitterPath } from './lane-litter.mjs';
 import { classifySession } from '../operations/session-role.mjs';
 
 export const PRE_PR_MODES = Object.freeze(['off', 'advise', 'enforce']);
@@ -104,8 +105,19 @@ export function classifyPrRisk({ files = [], hasPreparedCard = false, operatorAg
   return { gated: reasons.length > 0, cardOnly: false, reasons, ...base };
 }
 
-/** A card is prepared when its frontmatter carries a non-empty `preparedDate`. */
-export const isPreparedCard = (text) => /^preparedDate:\s*["']?\d{4}-\d{2}-\d{2}/m.test(String(text ?? ''));
+/** A card is prepared when its LEADING frontmatter block (opened on line 1, closed by a later `---`) carries a dated
+ *  `preparedDate`. Body text, fenced examples and an unterminated block never count. */
+export const isPreparedCard = (text) => {
+  const m = /^---[ \t]*\r?\n([\s\S]*?\r?\n)?---[ \t]*(?:\r?\n|$)/.exec(String(text ?? ''));
+  return !!m && /^preparedDate:[ \t]*["']?\d{4}-\d{2}-\d{2}/m.test(m[1] ?? '');
+};
+
+/** `/converge` scratch at the lane root (`.converge-state.json`, `-obs-*`, `-material-*`) plus the brief's other
+ *  sanctioned in-lane scratch (`.commit-msg.txt`, `.pr-body*.md`, … — the one `lane-litter` allowlist): the brief
+ *  tells agents to keep these inside the lane, so an UNTRACKED one is neither reviewed content nor a leftover —
+ *  the tree hash and `receipt` skip it. A TRACKED file of the same name is real content and still counts. */
+export const CONVERGE_SCRATCH_RE = /^\.converge-[^/]*$/;
+export const isScratchPath = (p) => CONVERGE_SCRATCH_RE.test(p) || isAllowlistedLitterPath(p);
 
 /**
  * The gate decision. `skip` is a recorded bypass reason. Never throws.
@@ -123,7 +135,7 @@ export function decidePrePrReview({ settings, risk, receipt, headTree, skip = ''
     : 'no pre-PR review receipt exists for this head';
   const msg = `pre-PR review required — this PR is risky (${risk.reasons.join('; ')}) and ${detail}. `
     + 'Run `/converge` against this lane (brief step 6), then `node scripts/converge-cli.mjs receipt --lane=<lane> --state=<file>` '
-    + 'on the committed head, and open the PR again. Bypass only with `--skipPrePrReview=<reason>` (the reason is recorded). A bypass also needs `--actor=<name>` and `--operatorInstruction="<quoted operator instruction>"`; a dispatched worker can never bypass.';
+    + 'on the committed head, and open the PR again. Bypass only with `--skipPrePrReview=<reason>` (the reason is recorded). A bypass also needs `--actor=<name>` and `--operatorInstruction="<quoted operator instruction>"`; a dispatched worker is refused a bypass.';
   if (settings.mode === 'advise') return { action: 'advise', why, message: msg };
   if (typeof skip === 'string' && skip.trim()) return { action: 'pass', why: 'bypass', message: '' };
   return { action: 'refuse', why, message: msg };
@@ -172,7 +184,10 @@ export function recordBypass(cwd, { reason, head, risk, actor = '', operatorInst
   appendFileSync(join(gitDirOf(cwd), BYPASS_LOG_FILE), `${JSON.stringify(row)}\n`);
   // Durable + countable: the coroner hook is not built yet, so every bypass is ALSO one JSONL line under
   // `.operations/pre-pr-bypass/` (gitignored with the rest of `.operations/`), which a coroner pass can count.
-  try { mkdirSync(recordDir, { recursive: true }); appendFileSync(join(recordDir, `${row.at.slice(0, 10)}.jsonl`), `${JSON.stringify(row)}\n`); } catch { /* the per-checkout log above still holds the row */ }
+  // Not best-effort: a bypass that cannot be counted is refused (open-pr turns this throw into a refusal), so the
+  // audit can never silently undercount.
+  mkdirSync(recordDir, { recursive: true });
+  appendFileSync(join(recordDir, `${row.at.slice(0, 10)}.jsonl`), `${JSON.stringify(row)}\n`);
 }
 
 /** `<repo root>/.operations/pre-pr-bypass`, resolved from this file's location. */
@@ -199,7 +214,7 @@ export function renderBypassNote({ actor = '', reason = '', operatorInstruction 
  * as review-set-label's clear-human). @returns {{ok:boolean, refusal:string}}
  */
 export function authoriseBypass({ role, actor = '', operatorInstruction = '' }) {
-  if (role === 'worker') return { ok: false, refusal: 'a dispatched worker (WE_CONVEYOR_WORKER=1) can never bypass the pre-PR review — run /converge and stamp the receipt instead' };
+  if (role === 'worker') return { ok: false, refusal: 'a dispatched worker (WE_CONVEYOR_WORKER=1) is refused a bypass of the pre-PR review — run /converge and stamp the receipt instead' };
   if (role !== 'orchestrator') return { ok: false, refusal: 'the session role is unknown (unrecognised WE_CONVEYOR_WORKER marker), so the bypass is refused' };
   if (!String(actor).trim() || !String(operatorInstruction).trim()) {
     return { ok: false, refusal: '--skipPrePrReview needs an operator-approved instruction: pass --actor=<name> and --operatorInstruction="<the operator instruction authorising it, quoted>"' };
@@ -245,7 +260,13 @@ export function workingTreeOf(cwd) {
   const tmp = mkdtempSync(join(tmpdir(), 'pre-pr-idx-'));
   const env = { ...process.env, GIT_INDEX_FILE: join(tmp, 'index') };
   const run = (args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
-  try { run(['read-tree', 'HEAD']); run(['add', '-A']); return run(['write-tree']).trim(); } finally { rmSync(tmp, { recursive: true, force: true }); }
+  try {
+    run(['read-tree', 'HEAD']);
+    // Against the temp index (= HEAD), `--others` is exactly the untracked set; skip the scratch among it by literal path.
+    const scratch = run(['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter((p) => p && isScratchPath(p));
+    run(['add', '-A', '--', '.', ...scratch.map((p) => `:(exclude,literal)${p}`)]);
+    return run(['write-tree']).trim();
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
 }
 
 const sessionRole = (env) => classifySession(env).role;
