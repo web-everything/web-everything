@@ -1185,7 +1185,7 @@ function refuseClearingOnGitMiss({ g, store, loud, record }) {
 function originRepoOf(cwd) {
   try {
     const url = String(execFileSync('git', ['remote', 'get-url', 'origin'], {
-      encoding: 'utf8', cwd, stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
+      encoding: 'utf8', cwd, stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, maxBuffer: 64 * 1024,
     })).trim();
     const m = url.match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?$/);
     return m ? canonicalizeSlug(m[1]) : '';
