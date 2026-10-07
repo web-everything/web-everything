@@ -13,13 +13,13 @@
  *            operation THROWS and everything stays paused; only a pass lifts the pause.
  *
  * A pause or kill file the operator set BEFORE `start` is recorded in the marker and left in place by `end`.
- * All side effects go through the injected `io` (real one: `maintenance-io.mjs`), so tests use fakes. The effects
- * live in one compute step because the whole operation is a single ordered state change, not a replayable pipeline.
+ * All side effects go through an injected `io` (real one: `maintenance-io.mjs`, bound as the effect sink), so tests use fakes.
  */
 import { op } from './registry.mjs';
-import { compute } from './step-kinds.mjs';
+import { compute, effect } from './step-kinds.mjs';
 
 export const MAINTENANCE_OP = 'maintenance';
+export const MAINTENANCE_EFFECT = 'maintenance';
 export const MAINTENANCE_ACTIONS = Object.freeze(['start', 'status', 'end']);
 
 /** A listed session → `{kind, pr, lane}` read off its name and cwd. */
@@ -71,15 +71,30 @@ export function runMaintenance({ action, reason = '', by = 'operator' } = {}, io
   return { ...snapshot(io), loginTest: test };
 }
 
-export function maintenanceOperation({ io } = {}) {
-  if (!io) throw new TypeError('maintenance needs an io');
+export function maintenanceOperation() {
   return op(MAINTENANCE_OP, {
     input: {
-      action: { type: 'string', required: true },
+      action: { type: 'string', required: true, enum: [...MAINTENANCE_ACTIONS] },
       reason: { type: 'string', required: false, default: '' },
       by: { type: 'string', required: false, default: 'operator' },
     },
-    verdictFrom: 'act',
-    act: compute({ reads: ['input.action', 'input.reason', 'input.by'], fn: ({ input }) => runMaintenance(input, io) }),
+    verdictFrom: 'assess',
+    // An `effect`, not a `compute`: this changes host state (pause files, kill file), so it must NOT read as
+    // read-only to the HTTP adapter or the runner-freshness policy. The sink (`maintenance-io.mjs`) throws on a
+    // failed login test, which halts the run loudly with everything still paused.
+    act: effect({
+      reads: ['input.action', 'input.reason', 'input.by'],
+      effects: ({ input }) => [{ type: MAINTENANCE_EFFECT, payload: { action: input.action, reason: input.reason, by: input.by }, idempotent: true }],
+    }),
+    assess: compute({
+      reads: ['findings.act'],
+      fn: ({ findings }) => {
+        const entry = (findings.act?.effects ?? [])[0];
+        if (!entry || entry.status !== 'applied' || !entry.result) {
+          throw new Error(`maintenance: the act effect did not complete. status=${entry?.status ?? 'missing'}${entry?.error ? ` error=${entry.error}` : ''}`);
+        }
+        return entry.result;
+      },
+    }),
   });
 }

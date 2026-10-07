@@ -92,7 +92,7 @@ describe('maintenance', () => {
 
   it('is a declared operation', () => {
     expect(MAINTENANCE_OP).toBe('maintenance');
-    expect(typeof maintenanceOperation({ io: fakeIo() })).toBe('object');
+    expect(maintenanceOperation().name).toBe('maintenance');
   });
 
   it('the review/fix daemons gate pauses while the marker exists', () => {

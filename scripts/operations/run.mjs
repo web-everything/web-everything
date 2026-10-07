@@ -66,7 +66,7 @@ import { collectDaemonStatus } from './daemon-status-io.mjs';
 import { heavyQueueOperation, HEAVY_QUEUE_OP } from './heavy-queue.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
-import { createMaintenanceIo } from './maintenance-io.mjs';
+import { createMaintenanceSinks } from './maintenance-io.mjs';
 import { freeScopeOperation, FREE_SCOPE_OP } from './free-scope.mjs';
 import { collectFreeScope } from './free-scope-io.mjs';
 import { reviewSeatCapsOperation, REVIEW_SEAT_CAPS_OP } from './review-seat-caps.mjs';
@@ -322,10 +322,10 @@ export const OPERATIONS = Object.freeze({
     declaration: heavyQueueOperation({ collect: collectHeavyQueue }),
     sinks: {},
   }),
-  // Card 105 — the maintenance pause (start|status|end). All effects go through `createMaintenanceIo`, bound ONLY here.
+  // Card 105 — the maintenance pause (start|status|end). Effects go through `createMaintenanceSinks`, sink bound ONLY here.
   [MAINTENANCE_OP]: () => ({
-    declaration: maintenanceOperation({ io: createMaintenanceIo() }),
-    sinks: {},
+    declaration: maintenanceOperation(),
+    sinks: createMaintenanceSinks(),
   }),
   // free-scope — rules 21/26 of the operator handoff: are these files free of every open PR and every running
   // agent's declared scope? Read-only (no sinks). Register/release live in free-scope-cli.mjs.

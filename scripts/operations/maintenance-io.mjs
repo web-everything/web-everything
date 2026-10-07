@@ -11,6 +11,7 @@ import { readPauseState, writePauseState, setPause, clearPause } from '../readin
 import { fixDispatchKillFile } from '../conveyor/fix-loop-ledger.mjs';
 import { readMaintenanceMarker, writeMaintenanceMarker, clearMaintenanceMarker } from '../conveyor/maintenance-marker.mjs';
 import { defaultListAgents } from './dispatch-lane-io.mjs';
+import { MAINTENANCE_EFFECT, runMaintenance } from './maintenance.mjs';
 
 const POLICY_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'maintenance-policy.json');
 const DEFAULT_TEST = { prompt: 'Reply with exactly the single word: OK', expect: 'OK', timeoutSeconds: 120, model: 'haiku' };
@@ -49,4 +50,9 @@ export function createMaintenanceIo({ env = process.env } = {}) {
     testSession: () => runTestSession(),
     now: () => new Date().toISOString(),
   };
+}
+
+/** The effect sink `run.mjs` binds. Throws (halting the run, everything still paused) when `end`'s login test fails. */
+export function createMaintenanceSinks({ io = createMaintenanceIo() } = {}) {
+  return { [MAINTENANCE_EFFECT]: async (payload) => runMaintenance(payload, io) };
 }
