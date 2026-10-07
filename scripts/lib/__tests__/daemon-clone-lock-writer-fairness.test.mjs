@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   acquireRead, releaseRead, acquireWrite, releaseWrite, inspectCloneLock,
+  resolveWriterPriorityMaxSkips, DEFAULT_WRITER_PRIORITY_MAX_SKIPS,
   resolveWriterPriorityAfter, DEFAULT_WRITER_PRIORITY_AFTER, resolveWriterClaimTtlMs, DEFAULT_WRITER_CLAIM_TTL_MS,
 } from '../daemon-clone-lock.mjs';
 import {
@@ -44,7 +45,7 @@ async function simulateWriter({ cycles, writerPriorityAfter }) {
   const clone = mkTmp('dcwf-clone-');
   let t = 0;
   const common = {
-    lockRoot, probe: alive, leaseMinutes: LEASE, writerPriorityAfter, writerClaimTtlMs: TTL, readerPriorityAfter: 3,
+    lockRoot, probe: alive, leaseMinutes: LEASE, writerPriorityAfter, writerClaimTtlMs: TTL, readerPriorityAfter: 3, writerPriorityMaxSkips: 1e9,
   };
   let fUntil = null; // F's in-flight tick end
   const fRefusals = [];
@@ -212,5 +213,40 @@ describe('settings + withSelfSync wiring', () => {
     const lines = log.error.mock.calls.map((c) => c[0]);
     expect(lines.some((l) => l.includes('yielding this tick — writer Mac:74387 gave up 2'))).toBe(true);
     expect(lines.filter((l) => l.includes('SMELL clone-stuck — the clone has not moved for 360 min'))).toHaveLength(1);
+  });
+});
+
+describe('bounded writer-priority skips (live 2026-10-07: review ticks skipped back-to-back)', () => {
+  it('a reader loses at most N consecutive ticks to a standing writer claim, then reads again (writer-active still refuses)', async () => {
+    expect(DEFAULT_WRITER_PRIORITY_MAX_SKIPS).toBe(2);
+    expect(resolveWriterPriorityMaxSkips({ WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_MAX_SKIPS: '5' })).toBe(5);
+    const lockRoot = mkTmp('dcwf-root-');
+    const clone = mkTmp('dcwf-clone-');
+    let t = 0;
+    const base = { lockRoot, leaseMinutes: LEASE, probe: alive, writerPriorityAfter: 1, writerClaimTtlMs: TTL, readerKey: 'reader:review' };
+    acquireRead(clone, { ...base, owner: 'F', readerKey: 'reader:fix', nowMs: t });
+    await acquireWrite(clone, { ...base, owner: 'W', waitMs: 5, pollMs: 1, now: () => t, sleep: async (ms) => { t += ms; } });
+    releaseRead(clone, { lockRoot, owner: 'F' });
+    const tick = () => acquireRead(clone, { ...base, owner: 'R', nowMs: t });
+    expect(tick()).toMatchObject({ ok: false, reason: 'writer-priority' });
+    expect(tick()).toMatchObject({ ok: false, reason: 'writer-priority' });
+    const third = tick();
+    expect(third.ok).toBe(true); // the cap: never a third skipped tick in a row
+    // never mid-move: a live writer still refuses the reader outright
+    releaseRead(clone, { lockRoot, owner: 'R' });
+    const w = await acquireWrite(clone, { ...base, owner: 'W', waitMs: 5, pollMs: 1, now: () => t, sleep: async (ms) => { t += ms; } });
+    expect(w.ok).toBe(true);
+    expect(acquireRead(clone, { ...base, owner: 'R', nowMs: t })).toMatchObject({ ok: false, reason: 'writer-active' });
+  });
+
+  it('0 skips allowed means a standing claim never skips a tick', async () => {
+    const lockRoot = mkTmp('dcwf-root-');
+    const clone = mkTmp('dcwf-clone-');
+    let t = 0;
+    const base = { lockRoot, leaseMinutes: LEASE, probe: alive, writerPriorityAfter: 1, writerClaimTtlMs: TTL, writerPriorityMaxSkips: 0 };
+    acquireRead(clone, { ...base, owner: 'F', nowMs: t });
+    await acquireWrite(clone, { ...base, owner: 'W', waitMs: 5, pollMs: 1, now: () => t, sleep: async (ms) => { t += ms; } });
+    releaseRead(clone, { lockRoot, owner: 'F' });
+    expect(acquireRead(clone, { ...base, owner: 'R', nowMs: t }).ok).toBe(true);
   });
 });

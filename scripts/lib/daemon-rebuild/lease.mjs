@@ -18,7 +18,7 @@ import { removeCandidate, candidateWorktreePath } from './candidate.mjs';
 export const STARVE_ESCALATE_AFTER_ENV = 'WE_DAEMON_REBUILD_STARVE_ESCALATE_AFTER';
 export const DEFAULT_STARVE_ESCALATE_AFTER = 2;
 export const STARVED_LOCK_WAIT_ENV = 'WE_DAEMON_REBUILD_STARVED_WAIT_MS';
-export const DEFAULT_STARVED_LOCK_WAIT_MS = 15 * 60_000;
+export const DEFAULT_STARVED_LOCK_WAIT_MS = 3 * 60_000;
 
 function starvePath(root, env = process.env) {
   return join(stateDir(env), `${cloneKey(root)}.starve.json`);
