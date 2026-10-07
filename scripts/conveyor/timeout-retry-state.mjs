@@ -29,6 +29,11 @@ export function readTimeoutBudget({ dir, ...evidence }) {
     // stale head: nothing was ever sent) is transient and is NOT counted.
     return { confirmed: requests.filter((r) => r.status === 'confirmed').length,
       rejected: requests.filter((r) => r.status === 'rejected' && !r.released).length,
-      pending: requests.some((r) => r.status === 'pending') };
+      pending: requests.some((r) => r.status === 'pending'),
+      // When the oldest still-pending request was reserved: lets the planner tell a rerun that is simply in
+      // flight (hold, no human) from one that has been unresolved too long (escalate).
+      ...(requests.some((r) => r.status === 'pending')
+        ? { pendingSince: requests.filter((r) => r.status === 'pending' && r.reservedAt).map((r) => r.reservedAt).sort()[0] }
+        : {}) };
   } catch (error) { return { pending: true, reason: `timeout-state-unreadable:${error.message}` }; }
 }
