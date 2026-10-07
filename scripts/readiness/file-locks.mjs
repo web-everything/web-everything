@@ -37,9 +37,9 @@
  * own the `mkdir`/`O_EXCL` boundary and are deliberately tiny so the testable logic stays pure.
  */
 
-import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 /** Default lease before a held lock is considered stale and reclaimable. Short enough that a crashed
  *  owner frees a path within a working block; long enough to outlast a normal reserve→edit→commit→push
@@ -202,11 +202,19 @@ export function lockDirFor(lockRoot, path) {
  * dir already existed (someone else holds it — the caller then reads the entry + applies
  * {@link reclaimDecision}). The entry file is written only AFTER the atomic mkdir wins, so the dir's
  * existence is the lock and the entry is its metadata.
+ *
+ * The entry is written EXCLUSIVELY (`wx`). An acquirer stalled between its `mkdir` and that write can have its
+ * entry-less dir reclaimed (see {@link reserve}) and re-taken by another owner who writes THEIR entry first;
+ * when the stalled acquirer wakes, its exclusive write fails and it reports the lock LOST (`false`) without
+ * touching the dir — never overwriting, and never removing, the replacement owner's live lock.
  * @param {string} lockRoot
  * @param {string} path
  * @param {object} entry  from {@link makeLockEntry}
+ * @param {{afterMkdir?: (() => void)|null}} [opts]  TEST-ONLY seam (no-op by default; precedent:
+ *   `atomic-json-file.mjs#withFileLock`'s `onBeforeStaleTakeover`): runs between the `mkdir` win and the entry
+ *   write, so a test can stall the acquirer in exactly that gap.
  */
-export function acquireLockDir(lockRoot, path, entry) {
+export function acquireLockDir(lockRoot, path, entry, { afterMkdir = null } = {}) {
   const dir = lockDirFor(lockRoot, path);
   try {
     mkdirSync(dir, { recursive: false });           // ← the atomic gate: EEXIST for losers
@@ -217,15 +225,51 @@ export function acquireLockDir(lockRoot, path, entry) {
       try { mkdirSync(dir, { recursive: false }); } catch (e2) { if (e2 && e2.code === 'EEXIST') return false; throw e2; }
     } else { throw e; }
   }
-  writeFileSync(join(dir, 'lock.json'), JSON.stringify(entry, null, 2) + '\n', 'utf8');
+  if (typeof afterMkdir === 'function') afterMkdir();
+  try {
+    writeFileSync(join(dir, 'lock.json'), JSON.stringify(entry, null, 2) + '\n', { encoding: 'utf8', flag: 'wx' });
+  } catch (e) {
+    // EEXIST: a replacement owner already wrote its entry. ENOENT/ENOTDIR: the dir was reclaimed away under us.
+    if (e && (e.code === 'EEXIST' || e.code === 'ENOENT' || e.code === 'ENOTDIR')) return false;
+    throw e;
+  }
   return true;
 }
 
-/** Read the lock entry for `path` (or `null` if the dir/entry is absent or corrupt). Impure read. */
-export function readLockEntry(lockRoot, path) {
-  const file = join(lockDirFor(lockRoot, path), 'lock.json');
+/** Name of the owner's own heartbeat file inside its lock dir (see {@link heartbeatOwn}). */
+const heartbeatFileFor = (owner) => `hb.${createHash('sha256').update(String(owner)).digest('hex').slice(0, 16)}`;
+
+/** Read the lock entry for `path` (or `null` if the dir/entry is absent or corrupt). Impure read. When the owner
+ *  has refreshed through {@link heartbeatOwn}, `heartbeatAt` is the later of the entry's and that file's. */
+export function readLockEntry(lockRoot, path) { return readEntryInDir(lockDirFor(lockRoot, path)); }
+
+function readEntryInDir(dir) {
+  const file = join(dir, 'lock.json');
   if (!existsSync(file)) return null;
-  try { return parseLockEntry(readFileSync(file, 'utf8')); } catch { return null; }
+  let entry;
+  try { entry = parseLockEntry(readFileSync(file, 'utf8')); } catch { return null; }
+  if (!entry) return null;
+  try {
+    const beat = readFileSync(join(dir, heartbeatFileFor(entry.owner)), 'utf8').trim();
+    if (Date.parse(beat) > Date.parse(entry.heartbeatAt)) entry.heartbeatAt = beat;
+  } catch { /* never refreshed through heartbeatOwn */ }
+  return entry;
+}
+
+/**
+ * Refresh the lease of a lock `owner` holds, WITHOUT rewriting `lock.json` (immutable after its exclusive write).
+ * {@link heartbeat} rewrites that file in place, unconditionally: a holder that passed an owner check, then stalled
+ * past its lease, would wake and overwrite the entry of the owner that reclaimed the lock, leaving both believing
+ * they hold it (and a torn read mid-rewrite makes any older lock look entry-less, hence reclaimable). Here each
+ * owner writes only ITS OWN heartbeat file, which {@link readLockEntry} honours only for the entry's own owner — so
+ * a stalled former owner's write into a reclaimed dir is inert. Returns `false` when the lock is no longer `owner`'s.
+ */
+export function heartbeatOwn(lockRoot, path, owner, nowIso) {
+  const dir = lockDirFor(lockRoot, path);
+  if (readLockEntry(lockRoot, path)?.owner !== owner) return false;
+  try { writeFileSync(join(dir, heartbeatFileFor(owner)), `${nowIso}\n`, 'utf8'); }
+  catch (e) { if (e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) return false; throw e; }
+  return readLockEntry(lockRoot, path)?.owner === owner; // reclaimed while we wrote ⇒ lost
 }
 
 /** Refresh `path`'s heartbeat (a live owner extends its lease). Overwrites the entry's `heartbeatAt`
@@ -241,6 +285,38 @@ export function heartbeat(lockRoot, path, owner, nowIso, pid = null, meta = null
  *  {@link readLockEntry} first if reclaiming another's). Idempotent (gone ⇒ no-op). */
 export function releaseLockDir(lockRoot, path) {
   rmSync(lockDirFor(lockRoot, path), { recursive: true, force: true });
+}
+
+/**
+ * Remove `path`'s lock dir ONLY if it still holds the entry the caller judged — never a lock another owner has
+ * taken since. A bare {@link releaseLockDir} after a stale read lets two reclaimers (or a holder stalled past its
+ * lease, waking to release) each remove a dir: the second removes the live lock the first just took, and both then
+ * believe they hold it. The removal is a rename to a unique tombstone (atomic: the lock path is either still held
+ * or gone, never half-removed); the entry is then re-read INSIDE the tombstone, and a dir that changed hands
+ * between the caller's read and the rename is put back instead of destroyed.
+ * @param {string} lockRoot
+ * @param {string} path
+ * @param {{owner:string, heartbeatAt?:string}|null} expected  the entry the caller read (`null` ⇒ an entry-less dir)
+ * @returns {boolean} whether the expected lock was removed (`false` ⇒ gone already, or someone else's — left standing)
+ */
+export function releaseLockDirIf(lockRoot, path, expected) {
+  const dir = lockDirFor(lockRoot, path);
+  const matchesExpected = (found) => (expected
+    ? !!found && found.owner === expected.owner && (expected.heartbeatAt == null || found.heartbeatAt === expected.heartbeatAt)
+    : found === null);
+  // Cheap pre-check: a lock that is plainly not the one judged is never moved at all, so the rename window below
+  // opens only when the lock looks like the expected one.
+  if (!existsSync(dir)) return false;
+  if (!matchesExpected(readLockEntry(lockRoot, path))) return false;
+  // The tombstone is a SIBLING of the lock root, never inside it: readers that enumerate `lockRoot` must not count it.
+  const tomb = `${lockRoot}.gone-${randomBytes(6).toString('hex')}`;
+  try { renameSync(dir, tomb); } catch (e) { if (e && (e.code === 'ENOENT')) return false; throw e; }
+  if (matchesExpected(readEntryInDir(tomb))) { rmSync(tomb, { recursive: true, force: true }); return true; }
+  // The lock changed hands between the pre-check and the rename: restore it. If someone already re-took the path in
+  // that gap, theirs stands and the displaced tombstone is dropped. This is the one window left (a read-to-rename
+  // gap, not a lease): a rename cannot be made conditional on content, only re-verified after the fact.
+  try { renameSync(tomb, dir); } catch { rmSync(tomb, { recursive: true, force: true }); }
+  return false;
 }
 
 /** How long a lock dir may exist without its `lock.json` before it counts as a crashed half-acquire (xaipsbs).
@@ -291,9 +367,10 @@ export function reserve(lockRoot, path, owner, nowMs, nowIso, pid = null, pidLiv
   const d = reclaimDecision(current, nowMs, owner, liveness, leaseMinutes, requireOwnProcess ? pid : null);
   if (!d.acquirable) return { ok: false, reason: d.reason, heldBy: d.heldBy };
   if (d.reason === 'own') { heartbeat(lockRoot, path, owner, nowIso, pid, meta); return { ok: true, reason: 'own', heldBy: owner }; }
-  // reclaim a stale/dead owner: drop its dir then re-win atomically (another reclaimer may race — EEXIST
-  // ⇒ we lost the reclaim, report blocked so the caller re-probes rather than stomping the winner).
-  releaseLockDir(lockRoot, path);
+  // reclaim a stale/dead owner: drop ITS dir (only if it is still the entry we judged — a reclaimer that read the
+  // same stale entry must not delete the lock a faster reclaimer just took) then re-win atomically (EEXIST ⇒ we
+  // lost the reclaim, report blocked so the caller re-probes rather than stomping the winner).
+  releaseLockDirIf(lockRoot, path, current); // false ⇒ already gone (the acquire below wins) or re-taken (it loses)
   if (acquireLockDir(lockRoot, path, entry)) return { ok: true, reason: d.reason, heldBy: owner };
   return { ok: false, reason: 'held', heldBy: (readLockEntry(lockRoot, path) || {}).owner || null };
 }

@@ -65,6 +65,8 @@ import { daemonStatusOperation, DAEMON_STATUS_OP } from './daemon-status.mjs';
 import { collectDaemonStatus } from './daemon-status-io.mjs';
 import { heavyQueueOperation, HEAVY_QUEUE_OP } from './heavy-queue.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
+import { freeScopeOperation, FREE_SCOPE_OP } from './free-scope.mjs';
+import { collectFreeScope } from './free-scope-io.mjs';
 import { reviewSeatCapsOperation, REVIEW_SEAT_CAPS_OP } from './review-seat-caps.mjs';
 import { readSeatCapUsage } from './review-extra-seats.mjs';
 import { liveStateOperation, LIVE_STATE_OP } from './live-state.mjs';
@@ -316,6 +318,12 @@ export const OPERATIONS = Object.freeze({
   // `ps`/`git` reads are bound here, and ONLY here.
   [HEAVY_QUEUE_OP]: () => ({
     declaration: heavyQueueOperation({ collect: collectHeavyQueue }),
+    sinks: {},
+  }),
+  // free-scope — rules 21/26 of the operator handoff: are these files free of every open PR and every running
+  // agent's declared scope? Read-only (no sinks). Register/release live in free-scope-cli.mjs.
+  [FREE_SCOPE_OP]: () => ({
+    declaration: freeScopeOperation({ collect: collectFreeScope }),
     sinks: {},
   }),
   // Card xn2wf9t (#3383 follow-up) — the operator's "how close is each non-Claude review seat provider to its
