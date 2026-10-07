@@ -27,47 +27,63 @@ const filesOf = (details) => [...new Set((details?.tests ?? []).map(t => t.file)
 // `import('./x')`, `require('./x')`, `vi.mock('./x')`, `vi.importActual('./x')`. Each `\s*` is preceded by a distinct
 // literal, so matching is linear (no adjacent quantifiers); the text is also capped per file.
 const RELATIVE_SPECIFIER = /(?:\bfrom|\bimport|\()\s*(['"])(\.{1,2}\/[^'"\n]*)\1/g;
-const MAX_SOURCE_CHARS = 200_000;
+const MAX_SOURCE_CHARS = 2_000_000;
 const RESOLVE_SUFFIXES = ['', '.mjs', '.js', '.ts', '.cjs', '.mts', '.jsx', '.tsx', '/index.mjs', '/index.js', '/index.ts'];
 // `./foo.js` is often written for a `foo.ts` on disk (TS ESM convention).
 const TS_TWINS = { '.js': ['.ts', '.tsx'], '.mjs': ['.mts'], '.jsx': ['.tsx'] };
+
+// Calibrated against this repo's own ~460 test files with a disjoint change: caps of 4 hops / 300 reads cut the walk
+// short for 43% of them (196) and so mislabelled unrelated failures `in-diff-failure`; 12 hops / 2000 reads leave 8.
+export const REACH_MAX_DEPTH = 12;
+export const REACH_MAX_FILES = 2000;
 
 /**
  * Does `testFile` import (directly or through other repo files, up to `maxDepth` hops) one of the `changedFiles`?
  * That is what makes a failure in an UNEDITED test the change's own regression: a source-only edit breaks the test
  * that imports it, and the test file itself is not in the diff. Pure over the injected `readFile` (repo-relative path →
- * text, throws when absent); a cycle or an unreadable file ends that branch. False when the diff is unknown. When the
- * walk is cut short by `maxDepth` / `maxFiles` the answer is TRUE: the test is deep in the diff's import graph, and
- * "unknown" must not be read as "outside the diff".
+ * text, throws when absent); a cycle or an unreadable file ends that branch.
+ * Three answers: `'reaches'`, `'outside'` (the whole reachable graph was walked and none of it is changed — also the
+ * answer when the diff is unknown), and `'unknown'` when the walk was cut short by `maxDepth` / `maxFiles`: an unknown
+ * must not be read as "outside the diff", and the caller records it as uncertain instead of passing it off as proven.
  * @param {{testFile: string, changedFiles: string[]|null|undefined, readFile: (path: string) => string, maxDepth?: number, maxFiles?: number}} a
+ * @returns {'reaches'|'outside'|'unknown'}
  */
-export function testReachesChanged({ testFile, changedFiles, readFile, maxDepth = 4, maxFiles = 300 }) {
-  if (!Array.isArray(changedFiles) || !changedFiles.length || typeof readFile !== 'function') return false;
+export function reachesChanged({ testFile, changedFiles, readFile, maxDepth = REACH_MAX_DEPTH, maxFiles = REACH_MAX_FILES }) {
+  if (!Array.isArray(changedFiles) || !changedFiles.length || typeof readFile !== 'function') return 'outside';
   const changed = new Set(changedFiles.map(f => posix.normalize(f)));
-  if (changed.has(posix.normalize(testFile))) return true;
+  if (changed.has(posix.normalize(testFile))) return 'reaches';
   const seen = new Set([posix.normalize(testFile)]);
   let frontier = [posix.normalize(testFile)];
   let reads = 0;
+  let truncatedRead = false;
   for (let depth = 0; depth < maxDepth && frontier.length; depth++) {
     const next = [];
     for (const file of frontier) {
       let text;
-      try { text = String(readFile(file)).slice(0, MAX_SOURCE_CHARS); } catch { continue; }
-      if (++reads > maxFiles) return true;
+      try { text = String(readFile(file)); } catch { continue; }
+      // Imports past the cap are unseen: the walk of this file is incomplete, so no "outside" can be proven.
+      if (text.length > MAX_SOURCE_CHARS) { text = text.slice(0, MAX_SOURCE_CHARS); truncatedRead = true; }
+      if (++reads > maxFiles) return 'unknown';
       for (const [, , specifier] of text.matchAll(RELATIVE_SPECIFIER)) {
         const base = posix.normalize(posix.join(posix.dirname(file), specifier));
         const ext = Object.keys(TS_TWINS).find(e => base.endsWith(e));
         const candidates = [...RESOLVE_SUFFIXES.map(s => base + s), ...(ext ? TS_TWINS[ext].map(t => base.slice(0, -ext.length) + t) : [])];
         for (const candidate of candidates) {
-          if (changed.has(candidate)) return true;
+          if (changed.has(candidate)) return 'reaches';
           if (!seen.has(candidate)) { seen.add(candidate); next.push(candidate); }
         }
       }
     }
     frontier = next;
   }
-  // Frontier files still unread when the depth cap hit (only those that exist count): unknown → treat as reaching.
-  return frontier.some((file) => { try { readFile(file); return true; } catch { return false; } });
+  // Frontier files still unread when the depth cap hit (only those that exist count): the walk is incomplete.
+  if (truncatedRead) return 'unknown';
+  return frontier.some((file) => { try { readFile(file); return true; } catch { return false; } }) ? 'unknown' : 'outside';
+}
+
+/** Boolean form of `reachesChanged`: true for `'reaches'` and for `'unknown'` (never read an unknown as "outside"). */
+export function testReachesChanged(a) {
+  return reachesChanged(a) !== 'outside';
 }
 
 /**
@@ -88,7 +104,10 @@ export function classifyRedCause({ exitCode, signal, infrastructure, phaseResult
   const red = phaseResults.filter(p => p.result?.exitCode !== 0 || p.result?.signal);
   if (!red.length) {
     // The gate is green. A red test phase that passed alone is still worth recording: that is the flaky split.
-    return exitCode === 0 && isolatedRetry === FLAKY_OUTSIDE_DIFF ? { redCause: 'out-of-diff-flaky', redCauseFiles: retried } : null;
+    if (exitCode === 0 || exitCode == null) return exitCode === 0 && isolatedRetry === FLAKY_OUTSIDE_DIFF ? { redCause: 'out-of-diff-flaky', redCauseFiles: retried } : null;
+    // TOTAL: a non-zero verdict with no red phase to name — the gate threw before or between phases (a spawn error, a
+    // rejected runner) — still carries a cause, so no red marker is ever written without one.
+    return { redCause: signal ? 'killed-superseded' : 'infra', redCauseFiles: [] };
   }
   if (exitCode === 0) return null;
   if (signal || red.some(p => p.result.signal)) return { redCause: 'killed-superseded', redCauseFiles: [] };
@@ -98,14 +117,31 @@ export function classifyRedCause({ exitCode, signal, infrastructure, phaseResult
   if (first.phase === 'scan') return { redCause: 'scan', redCauseFiles: files };
   const vitestFiles = filesOf(first.result.failureDetails);
   const changed = new Set(changedFiles ?? []);
-  // In the diff: the failing file was edited, or it (transitively) imports an edited file.
-  const inDiff = (f) => changed.has(f) || (typeof touchesDiff === 'function' && touchesDiff(f) === true);
+  // In the diff: the failing file was edited, or it (transitively) imports an edited file. `touchesDiff` answers
+  // true / false, or `'unknown'` when the import walk was cut short; an unknown counts as in the diff (it is never
+  // read as "outside") but is flagged `redCauseUncertain` when nothing proves it.
+  // Memoised per file: each answer is a bounded import walk, and a file is asked about more than once below.
+  const reachMemo = new Map();
+  const reach = (f) => {
+    if (changed.has(f)) return 'reaches';
+    if (!reachMemo.has(f)) {
+      const r = typeof touchesDiff === 'function' ? touchesDiff(f) : false;
+      reachMemo.set(f, r === true || r === 'reaches' ? 'reaches' : r === 'unknown' ? 'unknown' : 'outside');
+    }
+    return reachMemo.get(f);
+  };
+  const inDiff = (f) => reach(f) !== 'outside';
   if (isolatedRetry === STILL_RED_IN_ISOLATION) {
     const failing = retried.length ? retried : vitestFiles;
-    return { redCause: failing.some(inDiff) ? 'in-diff-failure' : 'out-of-diff-still-red', redCauseFiles: failing };
+    const isIn = failing.some(inDiff);
+    return { redCause: isIn ? 'in-diff-failure' : 'out-of-diff-still-red', redCauseFiles: failing, ...(isIn && !failing.some(f => reach(f) === 'reaches') ? { redCauseUncertain: true } : {}) };
   }
   if (TIMEOUT.test(first.result.failureDetails?.summary ?? '')) return { redCause: 'test-timeout', redCauseFiles: vitestFiles };
   // A truncated failure list cannot prove every failing file is outside the diff, so it never yields "outside".
-  const outside = vitestFiles.length > 0 && Array.isArray(changedFiles) && !first.result.failureDetails?.truncated && vitestFiles.every(f => !inDiff(f));
-  return { redCause: outside ? 'out-of-diff-still-red' : 'in-diff-failure', redCauseFiles: vitestFiles };
+  const unprovable = vitestFiles.length === 0 || !Array.isArray(changedFiles) || first.result.failureDetails?.truncated === true;
+  const outside = !unprovable && vitestFiles.every(f => !inDiff(f));
+  // `in-diff-failure` is only PROVEN when a failing file is in the diff or reaches it; anything else that lands here
+  // (an unknown walk, a truncated or empty failure list, an unknown diff) is the conservative default, flagged as such.
+  const proven = vitestFiles.some(f => reach(f) === 'reaches');
+  return { redCause: outside ? 'out-of-diff-still-red' : 'in-diff-failure', redCauseFiles: vitestFiles, ...(!outside && !proven ? { redCauseUncertain: true } : {}) };
 }
