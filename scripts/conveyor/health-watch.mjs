@@ -369,6 +369,29 @@ export function probeSelfSync(dir) {
 }
 
 /**
+ * `clone-behind-main` probe: for every daemon clone, how far HEAD trails origin/main and since when. Objects are read
+ * from this checkout after a best-effort fetch; a clone whose HEAD is not an ancestor of main (overlay) or whose
+ * HEAD this checkout cannot see is skipped, never guessed.
+ */
+export function probeCloneLag({ roots = daemonCloneRoots(workspaceOf(REPO_ROOT)), exec = run, fetch = true, timeoutMs = 20_000, repo = REPO_ROOT } = {}) {
+  const git = (args, cwd = repo) => String(exec('git', ['-C', cwd, ...args], { timeoutMs }) || '').trim();
+  if (fetch) { try { git(['fetch', '--quiet', 'origin', 'main']); } catch { /* use the ref we have */ } }
+  const tip = git(['rev-parse', 'origin/main']);
+  const out = [];
+  for (const cloneRoot of roots) {
+    let head;
+    try { head = git(['rev-parse', 'HEAD'], cloneRoot); } catch { continue; }
+    if (head === tip) { out.push({ cloneRoot, head: head.slice(0, 9), behind: 0, behindSinceMs: null }); continue; }
+    try {
+      git(['merge-base', '--is-ancestor', head, tip]);
+      const times = git(['log', '--reverse', '--format=%ct', `${head}..${tip}`]).split('\n').filter(Boolean);
+      out.push({ cloneRoot, head: head.slice(0, 9), behind: times.length, behindSinceMs: times.length ? Number(times[0]) * 1000 : null });
+    } catch { /* not an ancestor of main / head unknown here — skip */ }
+  }
+  return out;
+}
+
+/**
  * #4200-ish (gh-shim-lane-path) — every generated `gh` shim under `~/.claude/github-app-token/` (the legacy
  * shared `gh-shim/gh` plus each per-checkout `gh-shim.d/<hash>/gh` — see `scripts/lib/gh-app-shim.mjs`), scanned
  * for a baked `GH_THROTTLE_CLI`/`REAL_GH` path pointing INTO a lane clone (`.lanes/`). The lane pool resets,
@@ -926,6 +949,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.leases = flags['lock-root'] ? attempt('leases', leaseScan)
     : (attempt('daemonStatus', () => probeDaemonStatus()) ?? attempt('leases', leaseScan));
   probes.selfSync = attempt('selfSync', () => probeSelfSync(flags['self-sync-dir'] || defaultSelfSyncDir()));
+  probes.cloneLag = (flags['logs-dir'] || flags['lock-root'] || flags['state-root']) ? undefined : attempt('cloneLag', () => probeCloneLag());
   probes.lanePools = attempt('lanePools', () => probeLanePools(logsDir));
   // #4370 — fs-only, every tick. A fixture tick (any of the fixture-dir flags) reads only an explicit
   // `--lane-pool-root`, never the host's real pool.
