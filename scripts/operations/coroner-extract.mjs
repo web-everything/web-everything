@@ -5,6 +5,8 @@
  * Missing gate results have no inferred duration. Overlapping gates are summed; share is capped at 1.
  * errorRates is the first output key. WE_CORONER_COORD (build-dispatch log), WE_CORONER_BUILD_TAIL (tick-row tail bytes) and
  * WE_CORONER_NO_CI (skip gh) are the extra knobs; the gh read is bounded to 5 run pages and 40 job lookups.
+ * changeRequests (card 102, coroner-rounds.mjs): per-PR change-request rounds + attributes; WE_CORONER_NO_ROUNDS skips it,
+ * WE_CORONER_RECEIPTS overrides the builder-receipt dir. Bounded: 300 PRs x (comments + commits + files) and 150 compares.
  */
 import fs from 'node:fs';
 import { homedir } from 'node:os';
@@ -16,6 +18,7 @@ import { parseArgs } from 'node:util';
 import { classifyCardOnly } from '../ci-card-only.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { LOG_TIMESTAMP_RE, expandRepeatedLines, stripLogTimestamp } from '../lib/log-timestamp.mjs';
+import { collectChangeRequests } from './coroner-rounds.mjs';
 
 const MiB = 1024 * 1024;
 const MAX_LINE = 256 * 1024;
@@ -471,19 +474,20 @@ export function fetchOpenedPrs(window, gh, { repo = CONSTELLATION_REPOS.we.slug,
     const data = gh(['api', `repos/${repo}/pulls?state=all&sort=created&direction=desc&per_page=100&page=${page}`]);
     if (!Array.isArray(data)) break;
     found = true;
-    for (const p of data) if (p?.created_at) out.push({ number: p.number, createdAt: p.created_at, mergedAt: p.merged_at ?? null });
+    for (const p of data) if (p?.created_at) out.push({ number: p.number, createdAt: p.created_at, mergedAt: p.merged_at ?? null, headRef: p.head?.ref ?? null, author: p.user?.login ?? null });
     if (data.length < 100 || stamp(data.at(-1)?.created_at) < stamp(window.since)) break;
   }
   return { prs: out.filter((p) => inWindow(p.createdAt, window)), found };
 }
 
 /** Classify PRs card-only vs code from their changed paths (bounded: `cap` REST lookups, fail-closed to code). */
-export function fetchPrKinds(numbers, gh, { repo = CONSTELLATION_REPOS.we.slug, cap = 250 } = {}) {
+export function fetchPrKinds(numbers, gh, { repo = CONSTELLATION_REPOS.we.slug, cap = 250, filesOut = null } = {}) {
   const kinds = {};
   if (typeof gh !== 'function') return kinds;
   for (const n of [...new Set(numbers.filter(Boolean))].slice(0, cap)) {
     const files = gh(['api', `repos/${repo}/pulls/${n}/files?per_page=100`]);
     if (!Array.isArray(files)) continue;
+    if (filesOut) filesOut[n] = files;
     // 100+ files cannot be proven card-only from one page: fail closed.
     kinds[n] = files.length < 100 && classifyCardOnly({ event: 'pull_request', files: files.map((f) => f.filename) }).light ? 'card-only' : 'code';
   }
@@ -517,7 +521,7 @@ export function fetchCiRuns(window, gh, { repo = CONSTELLATION_REPOS.we.slug, ma
 }
 
 /** Pure metrics core. Input arrays may be unordered; sources and all maps are sorted. */
-export function extractMetrics({ window, sessions = [], durations = [], reaped = [], markers = [], verifyLines = [], refusalLines = [], ciRuns = [], prsOpened = [], prKinds = {}, cardNames = [], buildTicks = [], buildLines = [], daemonLogs = {}, sources = {} }) {
+export function extractMetrics({ window, changeRequests = null, sessions = [], durations = [], reaped = [], markers = [], verifyLines = [], refusalLines = [], ciRuns = [], prsOpened = [], prKinds = {}, cardNames = [], buildTicks = [], buildLines = [], daemonLogs = {}, sources = {} }) {
   const selected = sessions.filter(({ state }) => inWindow(state.createdAt || state.updatedAt, window))
     .sort((a, b) => compare(a.state.sessionId ?? a.state.name ?? '', b.state.sessionId ?? b.state.name ?? '') || compare(JSON.stringify(a), JSON.stringify(b)));
   const byKind = new Map(), outcomes = new Map(), prs = new Map(), denials = new Map(), holds = new Map(), reasons = new Map(), refusals = new Map(), refusalPrs = new Map();
@@ -596,6 +600,7 @@ export function extractMetrics({ window, sessions = [], durations = [], reaped =
   return {
     window: { since: window.since, until: window.until },
     errorRates,
+    ...(changeRequests ? { changeRequests } : {}),
     sessions: { ...stats(times), byKind: ordered(new Map([...byKind].map(([key, xs]) => [key, { count: xs.length, minutes: minutes(sum(xs)) }]))), outcomes: ordered(outcomes), records: records.slice(0, 60) },
     gate: { minutesInGate: minutes(gateMs), shareInGate: total ? round(Math.min(1, gateMs / total), 3) : 0, commands: gates.length, medianMin: minutes(percentile(verifyTimes, 0.5)), p90Min: minutes(percentile(verifyTimes, 0.9)), allCommands: stats(gateTimes), verifyLane: { calls: verifyGates.length, medianMin: minutes(percentile(verifyTimes, 0.5)), p90Min: minutes(percentile(verifyTimes, 0.9)), waitTimeouts: verifyGates.filter((g) => g.waitTimeout).length }, directVitest: { runs: directVitest.length, minutes: minutes(sum(directVitest.map((g) => g.ms ?? 0))) }, waitTimeouts: gates.filter((g) => g.waitTimeout).length, waitTimeoutSessions, waitTimeoutMinutes: minutes(sum(gates.filter((g) => g.waitTimeout).map((g) => g.ms ?? 0))) },
     admission: { waitMedianSec: round(percentile(waits, 0.5) / 1000), waitP90Sec: round(percentile(waits, 0.9) / 1000), holdsByKind: ordered(new Map([...holds].map(([key, xs]) => [key, stats(xs)]))), markers: { count: markerCount, byMode: ordered(markerModes), gateMedianSec: seconds(markerGate), gateP90Sec: seconds(markerGate, 0.9), vitestMedianSec: seconds(markerVitest), standardsMedianSec: seconds(markerStandards) }, reaped: { waiterMedianSec: seconds(reapedWaits), waiterP90Sec: seconds(reapedWaits, 0.9), byReason: ordered(reasons), waiterMinutes: minutes(waiterMs) } },
@@ -680,8 +685,19 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
   sources.scopingCutoff = env.WE_CORONER_SCOPING_CUTOFF || undefined;
   const opened = fetchOpenedPrs(window, gh);
   const fixPrs = sessions.map(({ state }) => /^(?:fix|ci-heal)-(\d+)/.exec(String(state.name ?? ''))?.[1]).filter(Boolean).map(Number);
-  const prKinds = fetchPrKinds([...opened.prs.map((p) => p.number), ...ci.runs.map((r) => r.pr), ...fixPrs], gh);
-  const cardNames = children(env.WE_CORONER_BACKLOG || join(dirname(fileURLToPath(import.meta.url)), '../../backlog'), io).map((x) => x.name);
+  const prFiles = {};
+  const prKinds = fetchPrKinds([...opened.prs.map((p) => p.number), ...ci.runs.map((r) => r.pr), ...fixPrs], gh, { filesOut: prFiles });
+  const backlogDir = env.WE_CORONER_BACKLOG || join(dirname(fileURLToPath(import.meta.url)), '../../backlog');
+  const cardNames = children(backlogDir, io).map((x) => x.name);
+  // Card 102: change-request rounds + per-PR attributes for the PRs opened in the window.
+  let changeRequests = null;
+  if (gh && !env.WE_CORONER_NO_ROUNDS) {
+    const repoDir = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+    const git = (args) => { try { return execFileSync('git', ['-C', repoDir, ...args], { encoding: 'utf8', timeout: 10000, maxBuffer: MiB, stdio: ['ignore', 'pipe', 'ignore'] }); } catch { return null; } };
+    const cr = collectChangeRequests({ prs: opened.prs, prKinds, prFiles, ciRuns: ci.runs, gh, git, backlogDir, receiptsDir: env.WE_CORONER_RECEIPTS || join(paths.coord, 'build-pr-authorship'), repo: CONSTELLATION_REPOS.we.slug, io });
+    changeRequests = { ...cr.report, reads: cr.notes };
+    sources.changeRequests = { found: cr.notes.prs > 0, count: cr.notes.prs, compares: cr.notes.compares };
+  }
   sources.openedPrs = { found: opened.found, count: opened.prs.length };
   sources.ci = { found: ci.found, count: ci.runs.length, ghCalls: ci.calls, truncated: ci.truncated };
   const ledger = (name) => { const data = read(join(paths.admission, `${name}.jsonl`)); const entries = rows(data.lines); sources[name] = { found: data.found, count: entries.length }; return entries; };
@@ -694,7 +710,7 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
       if (!data.truncated) markers.push(...parseMarkers(data.lines));
     }
   }
-  return { window, sessions, durations, reaped, markers, verifyLines, refusalLines, ciRuns: ci.runs, prsOpened: opened.prs, prKinds, cardNames, buildTicks, buildLines, daemonLogs, sources };
+  return { window, changeRequests, sessions, durations, reaped, markers, verifyLines, refusalLines, ciRuns: ci.runs, prsOpened: opened.prs, prKinds, cardNames, buildTicks, buildLines, daemonLogs, sources };
 }
 
 /** Flatten the same metrics into a compact two-column human table. */

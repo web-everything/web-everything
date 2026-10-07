@@ -57,6 +57,38 @@ Then rank the **top 5 error causes by time lost** (`minutes`, then count). Where
 Then the wider friction list (top ~12). Rank by minutes lost, then by frequency. Each row: friction, frequency/cost, evidence (a PR, session id, lane or
 log line from the JSON), likely cause. Cross-check suspicious numbers against one bounded sample before ranking.
 
+## 2b. Change-request root causes (`changeRequests`)
+
+`changeRequests.byKind.{code,card-only}` (from `scripts/operations/coroner-rounds.mjs`) lists, per PR opened in the window,
+every **round**: one PR head that got a changes request (`review-changes`, `advisory-changes`, `referral-block`,
+`operator-send-back`, or `ci-red` on a head a later head replaced). Each round has its findings (`file`, `line`, `lens`,
+`claim`, `ruling`, `prevention`), its fix sessions and `minutes`, and `nextPush` (what the next push changed: files,
+lines, paths; `includesMainMerge` when a main merge inflates it). Each PR has `attributes` (files/lines, subsystems,
+test-to-code ratio, card size/kind, `prep` (prepared, preparedDate age, checklist, executable done-when, scope declared vs
+outside/untouched), `builder` (who, executor, model), `care`, `seated` lenses, `laneBaseAgeHours`) and `correlation` is
+the ranked attribute → extra-rounds table (median split for numbers, `rho` = Spearman).
+
+Findings carry a deterministic `hint` only: `fix-introduced` (line inside the previous fix push), `re-raised` (same file
+within 15 lines of an earlier finding), `later-round-find` (file in the original diff, first raised after round 1),
+`flaky-infra` / `gate-missed-catching-test` (CI rounds). Round-1 findings have no hint. **Your judgment step:** give every
+finding one root cause, confirming or overriding the hint:
+
+| cause | when |
+|---|---|
+| `checklist-lacked-requirement` | the card/prepare never asked for it (read the card's Done-when and scope) |
+| `reinvented-existing-primitive` | the PR re-wrote something a shared helper already does (grep for the helper) |
+| `gate-missed-catching-test` | an existing test or scan catches it, but the local gate did not run it |
+| `fix-introduced` | a fix push created it |
+| `later-round-find` | it was on the original code and findable in round 1 |
+| `flaky-infra` | CI/host noise, not the code |
+| `other` | say what (e.g. ruling churn: the same known finding re-ruled block every round) |
+
+For each cause name the **prevention** that would have caught it before the PR (a card checklist line, a gate change,
+a lint, a brief rule). Then report, with **card-only and code PRs as separate tables** (never blended):
+1. counts + minutes per cause (minutes = the round's fix minutes split evenly over its findings);
+2. the `correlation` table (attribute, buckets with mean extra rounds, effect, rho, n, 2 example PRs), top rows first,
+   and say plainly when n is too small to trust.
+
 ## 3. Mark NEW vs COVERED
 
 Compare each friction against, in this order:
@@ -83,7 +115,7 @@ Fixes go into the product (daemon/tooling), never a manual step for one instance
 
 ## 5. Report
 
-The error-rate section first, then the top-5 causes table (cause, minutes, count, NEW/COVERED-BY), then one short table of the ranked frictions with the status column, the headline numbers, and the item numbers appended.
+The error-rate section first, then the top-5 causes table (cause, minutes, count, NEW/COVERED-BY), then the change-request root-cause tables and the attribute correlation table (step 2b, code and card-only apart), then one short table of the ranked frictions with the status column, the headline numbers, and the item numbers appended.
 End with a list of what needs the operator's review.
 
 Repo-only: this skill uses nothing from user-level CLAUDE.md, memory or skills. Runtime state under `~/.claude/jobs`
