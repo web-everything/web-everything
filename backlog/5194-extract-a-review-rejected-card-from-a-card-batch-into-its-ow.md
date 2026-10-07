@@ -3,10 +3,11 @@ bornAs: xuz8m83
 kind: story
 size: 5
 parent: "4703"
-status: open
+status: resolved
 blockedBy: ["5193"]
 scope: ["we:scripts/operations/card-batch-extract.mjs", "we:scripts/operations/__tests__/card-batch-extract.test.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs"]
 dateOpened: "2026-10-06"
+dateResolved: "2026-10-07"
 tags: []
 ---
 
