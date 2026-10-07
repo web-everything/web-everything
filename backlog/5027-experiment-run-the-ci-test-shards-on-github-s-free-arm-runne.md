@@ -3,9 +3,10 @@ bornAs: xx5u6zt
 kind: story
 size: 2
 parent: "3383"
-status: open
-scope: ["we:.github/workflows/ci.yml", "we:scripts/ci/shard-runner-compare.mjs", "we:scripts/ci/shard-runner-compare.test.mjs"]
+status: active
+scope: ["we:.github/workflows/ci.yml", "we:scripts/ci/shard-runner-compare.mjs", "we:scripts/ci/__tests__/shard-runner-compare.test.mjs", "we:scripts/ci/__tests__/ci-shard-runner-switch.test.mjs"]
 dateOpened: "2026-10-03"
+dateStarted: "2026-10-06"
 preparedDate: "2026-10-06"
 preparedAgainstSha: "75c39659a06fefd7ee76fb1af223d53880109a25"
 tags: []
@@ -43,6 +44,12 @@ Out of scope: moving other jobs (`soak-shard`, `smoke`) to Arm; paid larger runn
 ## Proof plan
 
 Confound note: `vars.*` is repo-wide, so the trial is two sequential periods, not a parallel A/B. Record run dates and queue-wait alongside shard minutes, and compare shard run time (not queue) as the primary number. Live, on a real PR run: (1) before: baseline shard times pulled with `we:scripts/ci/shard-runner-compare.mjs` from the last ~30 x86 runs (run ids listed on this card); (2) set `WE_SHARD_RUNNER=ubuntu-24.04-arm`, push a PR and show `test-shard (1..4)` landing on an Arm runner (runner name in the job log) and green; (3) after ~30 runs each side, paste the comparison table onto this card. Abort path is proven by unsetting the variable and seeing the next run go back to x86.
+
+## Progress
+
+- **2026-10-06 — switch + helper built (this PR).** `test-shard` now runs on `${{ vars.WE_SHARD_RUNNER || 'ubuntu-latest' }}` (unset = x86, so merging changes nothing). `we:scripts/ci/shard-runner-compare.mjs` tabulates shard jobs per runner type from `gh`. Tests live under `we:scripts/ci/__tests__/` (the only place vitest's include globs pick up) — `we:scripts/ci/__tests__/ci-shard-runner-switch.test.mjs` (red on the old literal `ubuntu-latest`, green now) and `we:scripts/ci/__tests__/shard-runner-compare.test.mjs`.
+- **Baseline probe (x86, `--limit=12`, live `gh`):** 2 runs with shards / 8 shard jobs — median 5.4 min, p90 7.7 min, 0 failures, 0 flakes. Too small to be the real baseline.
+- **Still to do (not yet delivered — the card stays active):** set the repo variable `WE_SHARD_RUNNER=ubuntu-24.04-arm` (`gh variable set WE_SHARD_RUNNER --body ubuntu-24.04-arm`), let ~30 PR runs accumulate, run the helper `we:scripts/ci/shard-runner-compare.mjs` with `node` and `--per-runner=30` (path without the `we:` prefix), paste the table here, then set/unset the variable to the winner. Abort at once (`gh variable delete WE_SHARD_RUNNER`) if `npm ci` or the unit suite fails on Arm or results differ from x86.
 
 ## Follow-ups
 
