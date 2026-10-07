@@ -8,6 +8,8 @@
  * agent only fills the digest + body. PURE — the CLI does the globbing and the write.
  */
 
+import { renderEdgeCasesSkeleton } from './edge-case-classes.mjs';
+
 /**
  * Authoring hint emitted in the `## Done when` skeleton (#4409). Pinned verbatim by a test; the
  * guard-relaxation lint (`findGuardRelaxationGaps`) strips this exact line before scanning so a
@@ -113,5 +115,5 @@ export function renderItem(spec) {
   const doneWhen = '## Done when\n\n1. **Executable** — TODO: a command that fails before this item lands and passes after.\n\n'
     + `${GUARD_RELAXATION_HINT}\n\n`
     + 'Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.\n';
-  return `${fm.join('\n')}\n# ${title}\n\n${lead}\n\n${doneWhen}`;
+  return `${fm.join('\n')}\n# ${title}\n\n${lead}\n\n${doneWhen}\n${renderEdgeCasesSkeleton()}`;
 }
