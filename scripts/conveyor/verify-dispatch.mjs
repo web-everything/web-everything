@@ -132,8 +132,8 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { randomUUID } from 'node:crypto';
-import { readVerifyMarker, VERIFY_FILENAME, verifyFinishBody, verificationInfrastructureFailure } from '../lib/lane-verify.mjs';
+import { randomUUID, randomBytes } from 'node:crypto';
+import { readVerifyMarker, VERIFY_FILENAME, verifyFinishBody, verificationInfrastructureFailure, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix } from '../lib/lane-verify.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { resolveCeilingMs as resolveAdmissionCeilingMs } from '../readiness/heavy-admission.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -158,7 +158,7 @@ export const GATE_STARTED_MARKER = 'gate execution starting';
 /** Per-phase admission (#verify-phase-admission) makes the child queue AGAIN after {@link GATE_STARTED_MARKER}
  *  (scan / standards / retry phases). It writes this line before each such wait and re-writes the started line
  *  once the slot is held, so the dispatcher can pause the gate budget while the child is merely queued instead of
- *  counting the wait as hung gate time. Only line-anchored occurrences count after the first started marker, so
+ *  counting the wait as hung gate time. Only line-anchored occurrences ending with the per-run nonce suffix (#5189) count after the first started marker, so
  *  gate output that merely mentions the text can never move a timer. */
 export const GATE_QUEUED_MARKER = 'gate queueing for admission';
 
@@ -402,7 +402,11 @@ export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateSt
     if (logPath) {
       try { logFd = openSync(logPath, 'w'); } catch { logFd = null; }
     }
-    const child = spawn('node', args, { stdio: logFd != null ? ['ignore', 'ignore', logFd] : ['ignore', 'pipe', 'pipe'], detached: true });
+    // #5189 — fresh per run: only a later marker line ending with this run's suffix may move a timer.
+    const nonce = randomBytes(16).toString('hex');
+    const nonceSuffix = markerNonceSuffix(nonce);
+    const child = spawn('node', args, { stdio: logFd != null ? ['ignore', 'ignore', logFd] : ['ignore', 'pipe', 'pipe'], detached: true,
+      env: { ...process.env, [VERIFY_MARKER_NONCE_ENV]: nonce } });
     if (logFd != null) { try { closeSync(logFd); } catch {} }
     // Observer hooks cannot interfere with process supervision.
     try { onSpawn?.(child.pid); } catch {}
@@ -449,6 +453,7 @@ export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateSt
       const lines = (lineCarry + text).split('\n');
       lineCarry = lines.pop().slice(-4096);
       for (const line of lines) {
+        if (!line.endsWith(nonceSuffix)) continue; // unauthenticated (spoofed / stale-nonce) line: ignored
         if (line.startsWith(`⏳ ${GATE_QUEUED_MARKER}`)) onRequeue();
         else if (line.startsWith(`⏱ ${GATE_STARTED_MARKER}`)) onResume();
       }

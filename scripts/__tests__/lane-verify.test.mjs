@@ -1215,3 +1215,13 @@ it('75c: the isolated-retry audit (flaky-outside-diff) survives finish, check an
   expect(verifyGateDecision({ record: red, headSha: 'ours' })).toMatchObject({ ok: false, isolatedRetry: 'still-red' });
   expect(verifyFinishBody(record, { exitCode: 0 }).retriedFailures).toBeUndefined();
 });
+
+// #5189 — the marker-nonce suffix is the one format both verify-lane (writer) and verify-dispatch (checker) share.
+it('markerNonceSuffix formats a hex nonce and fails closed to empty on anything else', async () => {
+  const { markerNonceSuffix, VERIFY_MARKER_NONCE_ENV } = await import('../lib/lane-verify.mjs');
+  expect(VERIFY_MARKER_NONCE_ENV).toBe('WE_VERIFY_MARKER_NONCE');
+  expect(markerNonceSuffix('abcdef0123456789')).toBe(' [nonce=abcdef0123456789]');
+  for (const bad of [undefined, null, '', 'short', 'zz'.repeat(8), 'ab\ncd'.repeat(4), 42, 'abcdef0123456789 trailing']) {
+    expect(markerNonceSuffix(bad)).toBe('');
+  }
+});
