@@ -13,6 +13,7 @@
  *   Fail-closed: an empty backlog load plans nothing (a loader failure must not read as "every card missing").
  *   Operator-approved bulk removal is separate: {@link bulkRemovePlan} (dry-run receipt required to apply).
  */
+import { retryTransientGit } from '../lib/git-fetch-retry.mjs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -138,7 +139,7 @@ export function makeConfirmMissingOnMain({ exec = execFileSync, cwd = resolve(di
     if (unavailable) return false;
     try {
       if (!names) {
-        exec('git', ['fetch', '-q', 'origin', 'main'], opts);
+        retryTransientGit(() => exec('git', ['fetch', '-q', 'origin', 'main'], opts));
         // `-z` + quotePath off: a non-ASCII filename must not be quoted into an unparseable token.
         names = new Set(exec('git', ['-c', 'core.quotePath=false', 'ls-tree', '-r', '-z', '--name-only', 'origin/main', '--', 'backlog/'], opts)
           .split('\0').map((f) => normNum(idFromName(f.replace(/^backlog\//, '')) || '')).filter(Boolean));

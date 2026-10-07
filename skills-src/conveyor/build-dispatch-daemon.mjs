@@ -31,6 +31,7 @@
  *   and are unit-tested in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
  */
 
+import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
 import { PLANNING_SNAPSHOT_ENV } from '../../scripts/lib/planning-snapshot.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
 import { readShaCache, writeShaCache } from '../../scripts/lib/pr-snapshot.mjs';
@@ -1357,7 +1358,7 @@ export function createPrepareStatusReader({ exec = execFileSync, execAsync = nul
   let tree, treeError, listing, prError, minClaimedAt;
   const itemListings = new Map();
   function readTree() {
-    exec('git', ['fetch', '-q', 'origin', 'main'], opts);
+    retryTransientGit(() => exec('git', ['fetch', '-q', 'origin', 'main'], opts));
     const output = exec('git', ['ls-tree', '-r', 'origin/main', '--', 'backlog/'], opts);
     const cards = new Map();
     for (const line of output.trim().split('\n')) {

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 /** Daemon-owned prepare completion. All mutations run in an acquired lane through the normal PR producer. */
+import { retryTransientGit } from '../lib/git-fetch-retry.mjs';
 import { machinePrTitle } from './machine-pr-title.mjs';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -27,8 +28,8 @@ export async function landPrepareStamp({ num }, {
     // Preserve the original PR's entire tree when repairing its head; otherwise start from fresh main.
     const path = status.path;
     if (!new RegExp(`^backlog/${num}-[^/]+\\.md$`).test(path ?? '')) throw new Error('invalid prepare card path');
-    run('git', ['fetch', 'origin', 'main'], cwd);
-    run('git', ['fetch', 'origin', source ? source.headRefName : 'main'], cwd);
+    retryTransientGit(() => run('git', ['fetch', 'origin', 'main'], cwd));
+    retryTransientGit(() => run('git', ['fetch', 'origin', source ? source.headRefName : 'main'], cwd));
     if (source && run('git', ['rev-parse', 'FETCH_HEAD'], cwd).trim() !== source.headRefOid) {
       throw new Error('prepare PR changed during recovery; retry observation');
     }

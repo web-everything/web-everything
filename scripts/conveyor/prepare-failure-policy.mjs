@@ -15,7 +15,7 @@ export const DISPATCH_TRANSIENT_STAGE = 'dispatch';
 export function classifyPrepareFailure(evidence = {}, stage = undefined) {
   // Match observed error output, never the prompt (which can mention hypothetical failures).
   const error = String(evidence.error ?? evidence.reason ?? '');
-  if (/\bHTTP\s+429\b|\b429 Too Many Requests\b|rate.limit(?: exceeded| reached)|ECONNRESET|ENETUNREACH|EAI_AGAIN|network (?:error|unavailable)/i.test(error)) return 'infra-transient';
+  if (/\bHTTP\s+429\b|\b429 Too Many Requests\b|rate.limit(?: exceeded| reached)|ECONNRESET|ENETUNREACH|EAI_AGAIN|network (?:error|unavailable)|git-ref-lock-transient/i.test(error)) return 'infra-transient';
   // builder-starved-2 (2026-10-07) — the agent never got a lane: `lane-pool.mjs acquire` could not resolve an origin
   // from its scratch cwd (#4174). That is the launcher's fault, not the card's, so it is retried, never held for good.
   if (LANE_ACQUIRE_INFRA_RE.test(`${error}\n${String(evidence.terminal ?? '')}`)) return 'infra-transient';

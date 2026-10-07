@@ -108,10 +108,10 @@ import {
   laneHolderSlug,
   laneWorkerSession,
   isContestedLease,
-  isTransientRefLockError,
   isDeliveredLease,
   laneAuthoredSince,
 } from './lib/lane-lease.mjs';
+import { retryTransientGit } from './lib/git-fetch-retry.mjs';
 // #4122 — the free-lane list `acquire`'s auto-pick reads as a fast pre-filter before paying for its own scan
 // (see that module's own header for the full incident/design writeup).
 import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } from './lib/free-lane-list.mjs';
@@ -267,19 +267,8 @@ const tryGit = (args, cwd, opts = {}) => {
 // throws immediately, unretried, exactly as before.
 const FETCH_LOCK_RETRY_ATTEMPTS = 4;
 const FETCH_LOCK_RETRY_BASE_MS = 250;
-function blockingSleep(ms) {
-  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, ms)); } catch { /* env without SAB — skip the wait */ }
-}
 function fetchOriginPruneWithRetry(dir) {
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      return git(['fetch', 'origin', '--prune', '--quiet'], dir, { timeout: NETWORK_GIT_TIMEOUT_MS });
-    } catch (e) {
-      const msg = String(e?.stderr || e?.message || e);
-      if (!isTransientRefLockError(msg) || attempt >= FETCH_LOCK_RETRY_ATTEMPTS) throw e;
-      blockingSleep(FETCH_LOCK_RETRY_BASE_MS * attempt);
-    }
-  }
+  return retryTransientGit(() => git(['fetch', 'origin', '--prune', '--quiet'], dir, { timeout: NETWORK_GIT_TIMEOUT_MS }), { attempts: FETCH_LOCK_RETRY_ATTEMPTS, baseMs: FETCH_LOCK_RETRY_BASE_MS });
 }
 
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
