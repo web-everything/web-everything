@@ -755,7 +755,7 @@ it('resume stops the idle live process by its SHORT job id first, then resumes t
       defaultListAgents: () => [],
     },
   });
-  const r = io.resume({ session: { id: 'a287c608', sessionId: sid, cwd: '/scratch', state: 'working', status: 'idle', pid: 4242 }, prompt: 'x' });
+  const r = io.resume({ session: { id: 'a287c608', sessionId: sid, kind: 'background', cwd: '/scratch', state: 'working', status: 'idle', pid: 4242 }, prompt: 'x' });
   expect(calls[0]).toEqual(['stop', 'a287c608']); // never the full uuid: `claude stop <uuid>` is "No job matching"
   expect(calls[1]).toEqual(['spawn', ['--bg', '--resume', sid], '/scratch']);
   expect(r).toMatchObject({ resumed: true });
@@ -782,8 +782,51 @@ describe('resume port: stop-before-resume guards', () => {
       }),
     };
   };
-  const idle = { id: 'a287c608', sessionId: sid, cwd: '/scratch', state: 'working', status: 'idle', pid: 4242 };
+  const idle = { id: 'a287c608', sessionId: sid, kind: 'background', cwd: '/scratch', state: 'working', status: 'idle', pid: 4242 };
   const spawned = (calls) => calls.some((c) => c[0] === 'spawn');
+  const stopped = (calls) => calls.some((c) => c[0] === 'stop');
+
+  // The terminal states are the reaper's own AGENT_GONE_STATES: a gone session has no process to stop or wait on, so
+  // a row without a usable pid resumes at once instead of being refused forever for not literally reading 'stopped'.
+  it.each(['stopped', 'done', 'failed'])('a %s session with no usable pid resumes without a stop or an exit wait', async (state) => {
+    const h = mk({ pidAliveFn: () => { throw new Error('pid must not be consulted'); } });
+    const { pid: _omit, ...noPid } = idle;
+    const r = (await h.ioPromise).resume({ session: { ...noPid, state, status: undefined }, prompt: 'x' });
+    expect(r).toMatchObject({ resumed: true });
+    expect(stopped(h.calls)).toBe(false);
+    expect(h.calls.some((c) => c[0] === 'sleep' && c[1] === 500)).toBe(false);
+  });
+  it.each(['done', 'failed', 'stopped'])('with an unknown pid, a row that lists %s after the stop counts as exited', async (state) => {
+    let listed = 0;
+    const live = { ...idle, pid: 0 };
+    const h = mk({ rows: () => [{ ...live, state: ++listed <= 1 ? 'working' : state }] });
+    const r = (await h.ioPromise).resume({ session: live, prompt: 'x' });
+    expect(r).toMatchObject({ resumed: true });
+    expect(stopped(h.calls)).toBe(true);
+  });
+  it('a live (working + idle) background session is stopped before the resume', async () => {
+    const h = mk({ pidAliveFn: () => false });
+    (await h.ioPromise).resume({ session: idle, prompt: 'x' });
+    expect(stopped(h.calls)).toBe(true);
+  });
+  // Only a row that positively says `kind:'background'` is ever stopped: a missing kind fails closed, on the
+  // supplied row AND on the freshly-read one (same strict guard as the session reaper).
+  it.each([undefined, '', 'interactive', 'remote'])('never stops a session whose supplied kind is %j', async (kind) => {
+    const h = mk({ pidAliveFn: () => false });
+    const r = (await h.ioPromise).resume({ session: { ...idle, kind }, prompt: 'x' });
+    expect(r.resumed).toBe(false);
+    expect(r.reason).toMatch(/not a background dispatch/);
+    expect(stopped(h.calls)).toBe(false);
+    expect(spawned(h.calls)).toBe(false);
+  });
+  it.each([undefined, '', 'interactive'])('never stops a background-looking session whose refreshed row has kind %j', async (kind) => {
+    const h = mk({ pidAliveFn: () => false, rows: [{ ...idle, kind }] });
+    const r = (await h.ioPromise).resume({ session: idle, prompt: 'x' });
+    expect(r.resumed).toBe(false);
+    expect(r.reason).toMatch(/not a background dispatch/);
+    expect(stopped(h.calls)).toBe(false);
+    expect(spawned(h.calls)).toBe(false);
+  });
 
   it('waits until the stopped process exits, and spawns only after it has', async () => {
     let alive = 3;

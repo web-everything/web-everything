@@ -36,6 +36,7 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { laneGitConfigArgs, laneGitHardeningEnv, laneFilterDrivers, LANE_CONFIG_LIST_ARGS } from '../lib/lane-git-hardening.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { readFixDispatchClaim } from './fix-claim-store.mjs';
+import { AGENT_GONE_STATES } from './lease-reaper.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -489,13 +490,17 @@ export async function defaultAwaitVerifyIo({
       // A background session whose turn ended is still a live process, and `--bg --resume` on a live session
       // "starts a copy" instead of continuing it (found live 2026-10-07: two forked copies, no resume). Stop the
       // idle process first; `--resume` then wakes the SAME id. The pass never gets here for a busy session.
-      if (String(session.state ?? '').toLowerCase() !== 'stopped') {
+      // A gone session (the reaper's own AGENT_GONE_STATES: done/failed/stopped) has no process to stop or wait on.
+      const isGone = (row) => AGENT_GONE_STATES.has(String(row?.state ?? '').toLowerCase());
+      if (!isGone(session)) {
         // `claude stop` takes the SHORT job id; a full session uuid answers "No job matching" (read as already
         // gone) and leaves the process running, so the resume forked again (found live 2026-10-07, fix-4151).
         const handle = session.id || String(session.sessionId).slice(0, 8);
         // Only a background dispatch is ever stopped: an operator's own terminal session (`kind:'interactive'`) is
-        // never ours to kill (same absolute guard as the session reaper).
-        if (session.kind && session.kind !== 'background') return { resumed: false, reason: `stop-before-resume: ${session.kind} session is not a background dispatch` };
+        // never ours to kill. STRICT, like the session reaper's guard: a row must positively say `kind:'background'`,
+        // so a missing or empty kind fails closed, and the freshly-read row is held to the same rule below.
+        const notBackground = (row) => ({ resumed: false, reason: `stop-before-resume: ${row?.kind || 'unknown-kind'} session is not a background dispatch` });
+        if (session.kind !== 'background') return notBackground(session);
         // This session's row right now, read UNCACHED (the 20s agents cache would hand back the very row the pass
         // already judged): the row, null when it is not listed, or undefined when the list cannot be read.
         const liveRow = () => { try { return io.defaultListAgents({ all: true, env: liveEnv }).find((s) => s?.sessionId === session.sessionId) ?? null; } catch { return undefined; } };
@@ -503,13 +508,14 @@ export async function defaultAwaitVerifyIo({
         // cannot show that, so it refuses too (the next tick retries).
         const before = liveRow();
         if (before === undefined) return { resumed: false, reason: 'stop-before-resume: session list unreadable' };
+        if (before && before.kind !== 'background') return notBackground(before);
         if (before && isSessionBusy(before)) return { resumed: false, reason: 'stop-before-resume: session started a new turn' };
         try { stopSession({ handle }); } catch (e) { return { resumed: false, reason: `stop-before-resume: ${String(e?.message ?? e).split('\n')[0]}` }; }
         // With a known pid, the process itself is the exit signal. Without one (a swallowed "No job matching"
-        // looks the same), only a row that EXPLICITLY lists `state:'stopped'` counts: an unreadable list or a
-        // missing row is "unknown", never "exited".
+        // looks the same), only a row that EXPLICITLY lists a gone state (done/failed/stopped) counts: an unreadable
+        // list or a missing row is "unknown", never "exited".
         const knownPid = Number.isInteger(session.pid) && session.pid > 0;
-        const exited = () => (knownPid ? !pidAliveFn(session.pid) : String(liveRow()?.state ?? '').toLowerCase() === 'stopped');
+        const exited = () => (knownPid ? !pidAliveFn(session.pid) : isGone(liveRow()));
         for (let i = 0; i < 20 && !exited(); i += 1) sleep(500);
         if (!exited()) return { resumed: false, reason: 'stop-before-resume: process still alive' };
         sleep(1_000);
