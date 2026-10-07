@@ -299,6 +299,14 @@ export async function defaultAwaitVerifyIo({ weRoot = ROOT, exec = execFileSync,
     },
     listSessions: () => io.defaultListAgents({ all: true, env }),
     resume: ({ session, prompt }) => {
+      // A background session whose turn ended is still a live process, and `--bg --resume` on a live session
+      // "starts a copy" instead of continuing it (found live 2026-10-07: two forked copies, no resume). Stop the
+      // idle process first; `--resume` then wakes the SAME id with its saved options (-n, --model, permissions).
+      // The pass never gets here for a busy session (BUSY above), so this never interrupts a working turn.
+      if (String(session.state ?? '').toLowerCase() !== 'stopped') {
+        try { stopSession({ handle: session.sessionId }); } catch (e) { return { resumed: false, reason: `stop-before-resume: ${String(e?.message ?? e).split('\n')[0]}` }; }
+        sleepSync(2_000);
+      }
       const argv = io.buildAgentArgv({ payload: { prompt }, resumeSessionId: session.sessionId });
       let stdout = '';
       try { stdout = String(io.defaultSpawnAgent(argv, { cwd: session.cwd }) ?? ''); } catch (e) { return { resumed: false, reason: String(e?.message ?? e).split('\n')[0] }; }
