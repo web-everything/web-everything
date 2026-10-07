@@ -35,6 +35,14 @@ describe('sweepAdvisoryLabels', () => {
     expect(p.calls.set).toEqual([{ repo: 'o/n', number: 1, spec: { remove: ['advisory:accepted'] } }]);
   });
 
+  it('bounce-then-sweep: a sent-back PR (review:changes) does not get advisory:accepted re-added while the head is unchanged', () => {
+    const p = provider();
+    expect(sweepAdvisoryLabels({
+      repo: 'o/n', provider: p, listPrs: () => [pr(9, ['review:changes', 'review:human'], HEAD)],
+    })).toEqual([]);
+    expect(p.calls.set).toEqual([]);
+  });
+
   it('drops advisory:changes as well', () => {
     const p = provider();
     sweepAdvisoryLabels({ repo: 'o/n', provider: p, listPrs: () => [pr(2, ['review:human', 'advisory:changes'], NEW_HEAD)] });

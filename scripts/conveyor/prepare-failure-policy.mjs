@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { readBackoffSettings, backoffVerdict, evidenceReasonCode, BACKOFF_REASON_CODES } from './retry-backoff.mjs';
+import { readBackoffSettings, backoffVerdict, evidenceReasonCode, BACKOFF_REASON_CODES, isCloneWideReasonCode } from './retry-backoff.mjs';
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 
 export const INFRA_RETRY_BUDGET = 2;
@@ -77,6 +77,11 @@ const redactEvidence = evidence => Object.fromEntries(Object.entries(evidence ??
 export async function recordPrepareFailure({ num, attempt, stage, evidence = {} }, {
   path = failureStatePath(), fileCard, now = Date.now(), settings = readBackoffSettings(),
 } = {}) {
+  // builder-starved — a clone-wide dispatch refusal (the daemon's clone is behind origin/main) is not this card's
+  // failure: never persisted, never held, never charged. The next tick after the clone's self-sync retries it.
+  if (stage === DISPATCH_TRANSIENT_STAGE && isCloneWideReasonCode(evidenceReasonCode(evidence))) {
+    return { num, attempt, stage, cause: 'clone-wide', reasonCode: evidenceReasonCode(evidence), evidence: redactEvidence(evidence), retry: true, held: false };
+  }
   const state = readFailureState(path);
   const key = `${num}:${attempt}:${stage}`;
   if (state.failures[key]) return state.failures[key];
@@ -126,16 +131,37 @@ export function completePrepareFailures(num, path = failureStatePath()) {
 
 /** Held transient failures whose backoff has elapsed become retryable again. Returns the card numbers that now have
  * NO remaining held failure (their hold files can be released). Exhausted failures are never released here. */
-export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date.now() } = {}) {
+export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date.now(), settings = readBackoffSettings() } = {}) {
   const state = readFailureState(path);
   const touched = new Set();
+  // builder-starved (2026-10-07) — SELF-HEAL held dispatch failures the CURRENT policy would never have held:
+  //  (a) a clone-wide refusal (any cause, even exhausted) is released outright — it was never the card's failure;
+  //  (b) a dispatch failure recorded as `unknown` by code that predates the transient classification (items 95/96)
+  //      but whose evidence now classifies `dispatch-transient` gets the backoff it would get today, so it is
+  //      released when that backoff is due instead of being held forever. Live: 62 cards sat `prepare-unstamped`
+  //      on such records, two of them at the head of the pinned tier, and nothing ever released them.
+  let healed = false;
+  for (const f of Object.values(state.failures)) {
+    if (!f.held || f.completed || f.stage !== DISPATCH_TRANSIENT_STAGE) continue;
+    const code = evidenceReasonCode(f.evidence);
+    if (isCloneWideReasonCode(code)) {
+      Object.assign(f, { held: false, retry: true, exhausted: false, healedAt: new Date(now).toISOString(), healedFrom: f.cause, cause: 'clone-wide', reasonCode: code });
+      touched.add(f.num); healed = true;
+    } else if (f.cause === 'unknown' && classifyPrepareFailure(f.evidence, f.stage) === 'dispatch-transient') {
+      const at = Date.parse(f.recordedAt ?? f.attempt);
+      const attempts = Object.values(state.failures).filter(o => o.num === f.num && o.cause === 'dispatch-transient' && !o.completed && !o.rearmedAt && !o.budgetResetAt).length + 1;
+      Object.assign(f, { cause: 'dispatch-transient', healedFrom: 'unknown', reasonCode: code, attempts,
+        ...backoffVerdict({ attempts, now: Number.isFinite(at) ? at : now, settings }) });
+      healed = true;
+    }
+  }
   for (const f of Object.values(state.failures)) {
     if (f.held && !f.completed && !f.exhausted && f.retryAfter && Date.parse(f.retryAfter) <= now) {
       Object.assign(f, { held: false, retry: true, retriedAt: new Date(now).toISOString() });
       touched.add(f.num);
     }
   }
-  if (!touched.size) return [];
+  if (!touched.size) { if (healed) save(state, path); return []; }
   save(state, path);
   return [...touched].filter(num => !Object.values(state.failures).some(f => f.num === num && f.held && !f.completed));
 }

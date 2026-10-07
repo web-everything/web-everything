@@ -1197,7 +1197,15 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // caller that still passes only the boolean — both keep holding everything, unchanged), or exactly the
   // declared subset. Every spawn gate below asks `kindPaused('<kind>')` instead of the old blanket boolean.
   const pausedKinds = resolvePausedKinds({ paused: dispatchPaused === true, pausedKinds: dispatchPausedKinds });
-  const kindPaused = (kind) => pausedKinds.includes(kind);
+  // builder-starved (2026-10-07) — `config.launchKinds` names the spawn kinds THIS caller actually launches (the
+  // build daemon: `['prepare-item']`; builds are always planned). A kind it never launches is never PLANNED either:
+  // no spawn, no guard, no lane and no queue-time budget. Before, the build daemon's call planned ~24 prepare-scope
+  // spawns it then discarded; their guards read as "26 preparing" and they spent the whole queue-time budget ahead
+  // of the two item prepares it does launch (`queue-cap`), so no prepare ever launched. Absent = every kind (the
+  // interactive conveyor launches all of them). Unlike a pause this writes no note: nothing is being withheld.
+  const unlaunchedKinds = Array.isArray(config.launchKinds) ? TICK_SPAWN_KINDS.filter((k) => !config.launchKinds.includes(k)) : [];
+  const planPausedKinds = [...new Set([...pausedKinds, ...unlaunchedKinds])];
+  const kindPaused = (kind) => planPausedKinds.includes(kind);
   const cfg = {
     buildTtlTicks: config.buildTtlTicks ?? DEFAULT_BUILD_TTL_TICKS,
     prepareTtlTicks: config.prepareTtlTicks ?? DEFAULT_PREPARE_TTL_TICKS,
@@ -1261,9 +1269,11 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // Card 80 — a `prepare-stale` card (old stamp, or scope drift since `preparedAgainstSha`) is re-prepared the
   // same way. And with `config.prepareAheadWindow` set (the build daemon passes 4), only the cards within the next
   // N to build (pinned first) are prepared now; the rest wait, noted `prepare-ahead-window`.
+  // builder-starved — a card the caller holds (`bookkeeping.prepareHeldNums`) never takes a window slot.
   const prepareWindow = prepareAheadNums({
     queue, launch: plan.launch, held: plan.held,
     window: Number.isFinite(config.prepareAheadWindow) ? config.prepareAheadWindow : Infinity,
+    skip: bookkeeping.prepareHeldNums ?? [],
   });
   const prepareCandidates = (Array.isArray(plan.held) ? plan.held : [])
     .filter((h) => h && (h.reason === 'needs-prepare' || h.reason === 'prepare-stale') && h.num != null);
@@ -1297,8 +1307,10 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     lanes, queue, tick, now, ttlTicks: cfg.buildTtlTicks, returnedBuildNums: signals.returnedBuildNums,
   });
   const prepareHeld = new Set((bookkeeping.prepareHeldNums ?? []).map(normNum));
+  // builder-starved — a guard of a kind this caller never launches is a phantom (nothing runs behind it): drop it,
+  // so bookkeeping carried over from older code self-heals on the first tick.
   const prepare = retirePrepareGuards((bookkeeping.prepareGuards ?? []).filter(
-    (g) => g.kind !== 'prepare-item' || !prepareHeld.has(normNum(g.num))), {
+    (g) => (g.kind !== 'prepare-item' || !prepareHeld.has(normNum(g.num))) && !unlaunchedKinds.includes(g.kind || 'prepare')), {
     unshaped: scopeOrSizeNeeded, decisions, investigations: heldGuardPending, needsPrepare: heldGuardPending, prs, tick, now, ttlTicks: cfg.prepareTtlTicks,
     lanes, itemPrepareTtlTicks: cfg.prepareItemTtlTicks,
   });
@@ -1496,7 +1508,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     tick,
     now,
     trace: true,
-    pausedKinds,
+    pausedKinds: planPausedKinds,
   });
   const prepareQueue = applyQueueCapToPrepareSpawns(prep, queueBudget);
   prep = prepareQueue.prep;
@@ -1562,7 +1574,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // what it actually holds, so the note can never say "no new fix spawns" while fix is demonstrably running.
   if (pausedKinds.length > 0) {
     const why = dispatchPausedReason ? ` (${dispatchPausedReason})` : '';
-    const heldHere = TICK_SPAWN_KINDS.filter(kindPaused);
+    const heldHere = TICK_SPAWN_KINDS.filter((k) => pausedKinds.includes(k));
     let text;
     if (!isScopedPause({ paused: true, pausedKinds: dispatchPausedKinds })) {
       text = `⏸ dispatch paused — no new prepare/fix/ci-heal spawns this tick${why}`;

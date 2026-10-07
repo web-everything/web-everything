@@ -70,9 +70,24 @@ export function hostLoadGate({ load, cores, maxLoadPerCore = DISPATCH_SETTINGS_B
   };
 }
 
-/** Count live fix/ci-heal claims (the dispatcher's own heartbeat-refreshed liveness; `fixing` is not a session). */
-export function countLiveFixSessions(claims = []) {
-  return claims.filter((c) => c?.meta?.kind === 'fix' || c?.meta?.kind === 'ci-heal').length;
+/** Is `pid` a running process? EPERM means it exists (owned by someone else); ESRCH / bad input means it does not. */
+export function isPidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try { process.kill(n, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
+}
+
+/** A BORROWED fix claim whose runner process (`meta.runnerPid`, stamped at launch) is gone. A claim with no runner pid
+ *  yet (just taken, not stamped) is NOT dead: only the plain TTL can end it. Pure given `alive`. */
+export function isBorrowedRunnerDead(claim, alive = isPidAlive) {
+  const pid = claim?.meta?.runnerPid;
+  return Boolean(claim?.meta?.borrowed) && Number.isInteger(pid) && pid > 0 && !alive(pid);
+}
+
+/** Count LIVE fix/ci-heal claims (`fixing` is not a session). A borrowed claim whose runner pid is dead is not live:
+ *  it must not hold a cap slot while it waits out its TTL. */
+export function countLiveFixSessions(claims = [], { alive = isPidAlive } = {}) {
+  return claims.filter((c) => (c?.meta?.kind === 'fix' || c?.meta?.kind === 'ci-heal') && !isBorrowedRunnerDead(c, alive)).length;
 }
 
 /**
@@ -81,12 +96,13 @@ export function countLiveFixSessions(claims = []) {
  */
 export function createDispatchThrottle({
   listClaims = () => [], env = process.env, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length,
+  alive = isPidAlive,
 } = {}) {
   let live = null;
   return {
     tryAdmit(kind = 'fix') {
       const cap = resolveFixDispatchMaxConcurrent({ env });
-      if (live === null) { try { live = countLiveFixSessions(listClaims()); } catch { live = 0; } }
+      if (live === null) { try { live = countLiveFixSessions(listClaims(), { alive }); } catch { live = 0; } }
       if (live >= cap) {
         return { admit: false, kind: 'fix-cap', why: `${live} live fix/ci-heal session(s) >= cap ${cap} (WE_FIX_DISPATCH_MAX_CONCURRENT); ${kind} deferred, no claim taken` };
       }

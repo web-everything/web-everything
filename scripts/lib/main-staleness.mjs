@@ -347,6 +347,49 @@ export function assertMainNotStale(root, checkStaleness, {
   return st;
 }
 
+/** The refusal marker of {@link assertOperatorCliFresh}: operator CLIs run from a stale checkout. */
+export const OPERATOR_CLI_STALE_MARKER = 'run from an up-to-date lane';
+
+/**
+ * Item 113 — an OPERATOR CLI (`review-set-label.mjs`, `record-referral-ruling`) judges a PR with the code of
+ * the checkout it runs from. Run from a checkout far behind `origin/main` it can refuse on a bug main already
+ * fixed (live 2026-10-07, #4222: the primary checkout at 025a05a93 did not know `bornAs` card resolution) and
+ * give a misleading verdict. Unlike a dispatcher it never moves the checkout (it may be someone's primary
+ * clone): it refuses, via the shared {@link assertMainNotStale} chokepoint, whenever the commits it is missing
+ * from `origin/<base>` touch a file this code can load ({@link isCodePath}). Backlog-only lag is tolerated.
+ * Offline (fetch fails) or a root that is not a git checkout stays fail-soft, like the rest of this file.
+ * @param {string} root the checkout the CLI's own code was loaded from
+ * @param {{label?: string, base?: string, run?: typeof gitRun, listBehindFiles?: (root: string) => (string[]|null)}} [o]
+ */
+export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'main', run = gitRun,
+  listBehindFiles = (r) => behindFiles(r, base, run), env = process.env,
+  skipUnderVitest = !!process.env.VITEST } = {}) {
+  // A daemon-managed clone is kept current by its own gated rebuild (#4044); a unit test run drives the CLI from
+  // whatever checkout CI built and injects its own seams. Neither is an operator running from a stale clone.
+  if (env?.WE_DAEMON_MANAGED_CLONE === '1' || skipUnderVitest) return { skipped: true };
+  let last = null;
+  const check = (r) => {
+    const cwd = { cwd: r, timeout: 60_000, killSignal: 'SIGKILL' };
+    if (run(['fetch', 'origin', base, '--quiet'], cwd).status !== 0) return (last = { offline: true });
+    const count = run(['rev-list', '--count', `HEAD..origin/${base}`], cwd);
+    const behind = count.status === 0 ? Number(count.stdout.trim()) || 0 : 0;
+    if (!behind) return (last = { fresh: true, behind: 0 });
+    const files = listBehindFiles(r);
+    // Unknown diff fails closed; a diff with no code file is not stale for this CLI.
+    if (Array.isArray(files) && !files.some(isCodePath)) return (last = { fresh: true, behind, behindNonCodeOnly: true });
+    return (last = { action: 'warn', reason: 'not-auto-syncing', behind, ahead: 0, dirty: false });
+  };
+  try {
+    return assertMainNotStale(root, check, { base, label });
+  } catch (e) {
+    if (!isStaleMainRefusalMessage(e?.message)) throw e;
+    throw new Error(`${label}: this checkout is ${last?.behind ?? 'several'} commit(s) behind origin/${base} in code it `
+      + `runs (${STALE_MAIN_REFUSAL_MARKER}) — its verdict could be wrong on a bug main already fixed, so it refuses: `
+      + `${OPERATOR_CLI_STALE_MARKER} (a fresh lane on origin/${base}: \`node scripts/lane-pool.mjs acquire\`). `
+      + 'Nothing was changed.');
+  }
+}
+
 // ── xgqz204 — A DISPATCHER THAT FAST-FORWARDS ITS OWN CHECKOUT MUST NOT KEEP RUNNING ITS OLD CODE ─────────────
 // `assertMainNotStale` fast-forwards the checkout the dispatch runs from (#3474). When that checkout is the one
 // this very process loaded its modules from, the FF changes the files on disk but not the code in memory: node

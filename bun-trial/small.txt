@@ -1,0 +1,4 @@
+scripts/__tests__/operator-queue.test.mjs
+scripts/conveyor/__tests__/ci-heal-mark.test.mjs
+scripts/lib/__tests__/git-hook-surface.test.mjs
+scripts/operations/__tests__/route-pr-outcome.test.mjs

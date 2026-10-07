@@ -224,11 +224,21 @@ const LOAD_FLAKE_FENCE_REQUIRED = [
 
 describe('ci-heal load-flake exit', () => {
   for (const [file, required] of Object.entries(LOAD_FLAKE_REQUIRED)) {
+    // Command tokens (flags and the outcome) live in the fence; every other literal is a condition in the paragraph.
+    const tokens = required.filter((l) => /^(--|blocked-on)/.test(l));
+    const conditions = required.filter((l) => !tokens.includes(l));
+
     it(`${file} states every load-flake eligibility condition, each guarded against removal`, () => {
-      const text = readBrief(file);
-      const paragraph = loadFlakeParagraph(text);
-      // Conditions live in the paragraph; the command tokens live in the fence that follows it.
-      expectEachGuarded(paragraph, required.filter((l) => !/^(--|blocked-on)/.test(l)));
+      // The split must lose nothing: every required literal is checked in exactly one place.
+      expect([...tokens, ...conditions].sort()).toEqual([...required].sort());
+      expectEachGuarded(loadFlakeParagraph(readBrief(file)), conditions);
+    });
+
+    it(`${file} carries every required load-flake token inside its bash fence`, () => {
+      const fence = loadFlakeFence(readBrief(file));
+      // `--reason=load-flake` and `--alt-sha=` are asserted here, not filtered away; the outcome token is a prefix of the fence's.
+      expect(tokens.filter((t) => t.startsWith('--')).length).toBeGreaterThanOrEqual(2);
+      for (const token of tokens) expect(fence, token).toContain(token.startsWith('blocked-on') ? `--outcome=${token}` : token);
     });
 
     it(`${file} carries every load-flake command token inside its bash fence, each guarded against removal`, () => {
@@ -252,10 +262,14 @@ describe('ci-heal load-flake exit', () => {
       'push the heal to `{{LANE_REF}}-heal-{{PR_NUM}}-alt`',
       REVERIFY_WORKER,
     ]);
-    // Order against the fence's own command, not the first stray mention of the flag elsewhere in the brief.
-    const fenceAt = text.indexOf(loadFlakeFence(text));
-    expect(text.indexOf(paragraph)).toBeLessThan(fenceAt);
-    expect(fenceAt).toBeLessThan(text.indexOf('Otherwise a red gate is a hard stop'));
+    // Order the exit's fence against the gate-red exit's own command, not a stray mention of either elsewhere.
+    const fence = loadFlakeFence(text);
+    const fenceAt = text.indexOf(fence);
+    const gateRedAt = text.indexOf('--outcome=gate-red', fenceAt + fence.length);
+    expect(gateRedAt, 'a gate-red exit follows the load-flake fence').toBeGreaterThan(fenceAt);
+    expect(text.indexOf('Otherwise a red gate is a hard stop', fenceAt)).toBeGreaterThan(fenceAt);
+    // Nothing earlier in the brief may already take the gate-red exit before the load-flake exit is offered.
+    expect(text.slice(0, fenceAt)).not.toContain('--outcome=gate-red');
   });
 });
 
@@ -264,6 +278,7 @@ describe('ci-heal load-flake exit', () => {
 const FIX_THE_CLASS_REQUIRED = [
   'Fix the class, not the instance',
   'Fix every variant inside `{{SCOPE}}`',
+  'never silently left',
   'does the repair meet the reviewer\'s finding',
   'next variant',
   'is must-fix before re-push',
@@ -271,6 +286,7 @@ const FIX_THE_CLASS_REQUIRED = [
   'filed through `file-item`',
   'does the repair itself introduce a new problem',
   'A defect the repair itself introduces is must-fix regardless of class',
+  '"not the same class" never dismisses it',
   'Deferring ("later", "follow-up") is not a dismissal.',
   'Variants considered:',
 ];

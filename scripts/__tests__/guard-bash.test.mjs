@@ -3427,7 +3427,7 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
   mkdirSync(overlayDir, { recursive: true });
   mkdirSync(fakeClone, { recursive: true });
   mkdirSync(lane, { recursive: true });
-  writeFileSync(join(overlayDir, 'def456.json'), JSON.stringify({ clone: fakeClone, overlays: [] }));
+  writeFileSync(join(overlayDir, 'def456.json'), JSON.stringify({ clone: fakeClone, overlays: [{ ref: 'lane/x', pr: null }] }));
 
   // The house idiom (see the #3311 CLI-boundary block above): vitest rewrites `import.meta.url` to a
   // non-file base, so `new URL(…, import.meta.url)` + `fileURLToPath` is NOT used here.

@@ -14,6 +14,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DEFAULT_REPOS } from './operations/free-scope.mjs';
 import { withPathLock } from './readiness/with-lock.mjs';
+import { assessItem, extractRefs, mergedSlices, overlap, prMentionsItem, wordStems, OVERLAP_MIN, OVERLAP_STRONG, HEURISTIC_NOTE } from './held-cards-check.mjs';
 import { appendHeldCard, parseHeldCards, planFiling, quietVerdict, markFiled } from './held-cards.mjs';
 
 /** A filing run holds its lock for minutes (verify + open-pr); a crashed one is reclaimed after this long untouched. */
@@ -157,7 +158,50 @@ export async function main(argv, deps = {}) {
       writeFile(state, JSON.stringify({ at: now().toISOString(), openPrs: result.openPrs }), 'utf8');
       return result.quiet ? 0 : 1;
     }
-    if (argv[0] !== 'file') throw new Error('usage: held-cards-io.mjs add|list|status|file');
+    if (argv[0] === 'check') {
+      // Read-only staleness guess: is a held item already on origin/main? Run before dispatching it.
+      const ref = flags.ref || 'origin/main';
+      const git = (...args) => command('git', ['-C', root, ...args]);
+      const tryGit = (...args) => { try { return git(...args); } catch { return null; } };
+      if (!flags['no-fetch']) tryGit('fetch', '-q', 'origin', 'main');
+      const wanted = flags.item ? new Set(String(flags.item).split(',').map(Number)) : null;
+      const selected = items.filter(item => wanted ? wanted.has(item.num) : flags.all || !item.done);
+      const gh = env.WE_HELD_CARDS_GH_BIN || 'gh';
+      const repo = DEFAULT_REPOS[0];
+      const mergedPrs = JSON.parse(command(gh, ['pr', 'list', '--repo', repo, '--state', 'merged', '--limit', '500', '--json', 'number,title,body']));
+      const tracked = String(git('ls-tree', '-r', '--name-only', ref)).split('\n').filter(Boolean);
+      const results = selected.map(item => {
+        const refs = extractRefs(item.text);
+        const itemStems = wordStems(item.text);
+        const paths = [...refs.paths, ...refs.bareFiles.flatMap(f => tracked.filter(t => t.endsWith(`/${f}`)).slice(0, 2))]
+          .map(file => ({ path: file, exists: tracked.some(t => t === file || (/[*<>]/.test(file) && t.startsWith(file.split(/[*<>]/)[0]))) }));
+        const symbols = refs.symbols.map(name => ({ name, found: tryGit('grep', '-qF', '-e', name, ref) !== null }));
+        const prs = refs.prs.map(number => {
+          const hit = mergedPrs.find(pr => pr.number === number);
+          if (hit) return { number, state: 'MERGED' };
+          try { return { number, state: JSON.parse(command(gh, ['pr', 'view', String(number), '--repo', repo, '--json', 'state'])).state }; } catch { return { number, state: 'UNKNOWN' }; }
+        });
+        const mentions = mergedPrs.filter(pr => pr.number !== item.num).map(pr => ({ number: pr.number, title: pr.title, why: prMentionsItem(item.num, pr) })).filter(m => m.why);
+        // A PR the item merely waits on ("starts after #4016") is a dependency, not the PR that fixed it.
+        const followUps = refs.prs.filter(n => !new RegExp(`(?:after|needs|depends on|blocked by|once|before)[^.#]{0,25}#${n}`, 'i').test(item.text));
+        const commits = [];
+        for (const { path: file, exists } of paths.filter(p => p.exists && !/[*<>]/.test(p.path)).slice(0, 6)) {
+          for (const subject of String(tryGit('log', '-n', '40', '--no-merges', '--format=%s', ref, '--', file) ?? '').split('\n').filter(Boolean)) {
+            const shared = overlap(itemStems, subject);
+            if (exists && shared.length >= OVERLAP_MIN) commits.push({ path: file, subject, shared,
+              strong: shared.length >= OVERLAP_STRONG || followUps.some(n => subject.includes(`#${n}`)) });
+          }
+        }
+        return assessItem(item, refs, { paths, symbols, prs, mentions, slicesDone: mergedSlices(item.num, mergedPrs), commits });
+      });
+      if (flags.json) { say(JSON.stringify({ note: HEURISTIC_NOTE, ref, results })); return 0; }
+      say(`${HEURISTIC_NOTE}\nchecked against ${ref} @ ${String(tryGit('rev-parse', '--short', ref) ?? '?').trim()}`);
+      for (const r of results) say(`\n${r.num}. ${r.verdict.toUpperCase()} — ${r.title.length > 90 ? `${r.title.slice(0, 87)}...` : r.title}\n${r.evidence.map(e => `     ${e}`).join('\n')}`);
+      const count = v => results.filter(r => r.verdict === v).length;
+      say(`\n${count('likely-done')} likely-done, ${count('partly-done')} partly-done, ${count('not-started')} not-started`);
+      return 0;
+    }
+    if (argv[0] !== 'file') throw new Error('usage: held-cards-io.mjs add|list|status|check|file');
     const plan = planFiling(items);
     if (!plan.length) { say('nothing to file'); return 0; }
     if (flags['dry-run']) {

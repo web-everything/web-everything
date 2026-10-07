@@ -40,6 +40,7 @@
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
 import { readFixLoopRows } from './fix-loop-ledger.mjs';
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
@@ -110,6 +111,10 @@ export const CHILD_TIMEOUT_MS = 30_000;
 export function defaultLogsDir(env = process.env) {
   return env.HEALTH_WATCH_LOGS_DIR || join(homedir(), 'workspace', 'wev-review-daemon', '.conveyor');
 }
+/** builder-starved — where the build-dispatch daemon writes `build-dispatch-daemon.log` (the coordination root). */
+export function defaultBuilderLogDir(env = process.env) {
+  return env.HEALTH_WATCH_BUILDER_LOG_DIR || resolveCoordinationRoot();
+}
 export function defaultSelfSyncDir(env = process.env) {
   return env.HEALTH_WATCH_SELF_SYNC_DIR || join(homedir(), '.claude', 'daemon-self-sync-state');
 }
@@ -163,11 +168,12 @@ export function readRotationCount(logPath) {
 const ROTATION_IN_FLIGHT_MS = 5000;
 
 /** Incrementally read every `*.log` in the daemon logs dir from its cursor (bootstrap: the last 512 KB). */
-export function probeDaemonLogs(logsDir, cursors = {}) {
+export function probeDaemonLogs(logsDir, cursors = {}, { only = null } = {}) {
   const out = [];
   const nextCursors = {};
   if (!existsSync(logsDir)) return { samples: out, cursors: nextCursors };
-  for (const f of readdirSync(logsDir).filter((n) => n.endsWith('.log')).sort()) {
+  // builder-starved — `only` reads just the named logs (the build-dispatch daemon logs to the coordination root).
+  for (const f of readdirSync(logsDir).filter((n) => n.endsWith('.log') && (!only || only.includes(n.replace(/\.log$/, '')))).sort()) {
     const path = join(logsDir, f);
     const name = f.replace(/\.log$/, '');
     const st = statSync(path);
@@ -950,6 +956,9 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
 
   const logs = attempt('daemonLogs', () => probeDaemonLogs(logsDir, prev.cursors || {}));
   if (logs) probes.daemonLogs = logs.samples;
+  // builder-starved — the build-dispatch daemon's JSON tick log lives in the coordination root, not `logsDir`.
+  const builderLogs = attempt('builderLog', () => probeDaemonLogs(flags['builder-log-dir'] || defaultBuilderLogDir(), prev.builderCursors || {}, { only: ['build-dispatch-daemon'] }));
+  if (builderLogs) probes.builderLog = builderLogs.samples[0] ?? { name: 'build-dispatch-daemon', text: '' };
   // Daemon inventory: the declared daemon-status read (#4067) on a real host; the raw lease-dir scan only when a
   // test/fixture points --lock-root somewhere, or daemon-status itself fails (then that failure is a probe error).
   const leaseScan = () => probeLeases(flags['lock-root'] || RUNNER_LOCK_ROOT, new Set((logs?.samples || []).map((s) => s.name)));
@@ -1118,6 +1127,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   state.notifiedSilences = (result.state.silences || []).filter((x) => x.expiredNotified).map(silenceSig);
   delete state.silences;
   state.cursors = logs ? { ...(prev.cursors || {}), ...logs.cursors } : prev.cursors;
+  state.builderCursors = builderLogs ? { ...(prev.builderCursors || {}), ...builderLogs.cursors } : prev.builderCursors;
   state.ghCache = { at: ghCache.at ?? null };
   if (probes.credentialInventory) {
     state.credentialInventoryAt = now;

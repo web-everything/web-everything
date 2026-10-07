@@ -2314,6 +2314,40 @@ describe('card 80 — prepare just in time', () => {
     expect(waits).toEqual(['3', '4']);
   });
 
+  it('builder-starved: a card the caller holds never takes a prepare-ahead window slot', () => {
+    // Live 2026-10-07: two failure-held cards at the head of the pinned tier filled the window every tick, so the
+    // cards behind them were never prepared. #5 (pinned) and #2 are held by the daemon → the window moves on.
+    const r = planTick({
+      state: { queue: [{ num: '1' }, { num: '2' }, { num: '3' }, { num: '4' }, { num: '5', tier: 'pinned' }], lanes: [], prs: [] },
+      plan: { launch: [], held: [held('1', 'overlaps lane-19'), held('2', 'needs-prepare'), held('3', 'needs-prepare'), held('4', 'prepare-stale'), held('5', 'needs-prepare')] },
+      freeLanes: [7, 8, 9, 10], bookkeeping: { tick: 1, prepareHeldNums: ['5', '2'] },
+      config: { maxConcurrentLanes: 10, maxConcurrentItemPrepares: 5, prepareAheadWindow: 3 },
+    });
+    // window over the non-held cards in build order: #1, #3, #4
+    expect(r.decisions.spawnPrepareItems.map((s) => s.num)).toEqual(['3', '4']);
+  });
+
+  it('builder-starved: kinds outside config.launchKinds are never planned — no guard, lane, or queue budget', () => {
+    const base = {
+      state: { queue: [{ num: '2' }, { num: '3' }], lanes: [], prs: [], unshaped: [{ num: '20' }, { num: '21' }, { num: '22' }] },
+      plan: { launch: [], held: [held('2', 'needs-prepare'), held('3', 'needs-prepare')] },
+      freeLanes: [7, 8, 9, 10, 11, 12], bookkeeping: { tick: 1, prepareGuards: [{ num: '30', kind: 'prepare', lane: 13, spawnedTick: 1, sawPr: false }] },
+      config: { maxConcurrentLanes: 100, maxConcurrentItemPrepares: 2 },
+      // A tight queue-time budget: two prepare spawns' worth. Before, the scope spawns spent it all first.
+      queueAdmission: { maxWaitMinutes: 2.5, slots: 1, backlogMinutes: 0, dispatchMinutes: { prepare: 1 } },
+    };
+    const all = planTick(base);
+    expect(all.decisions.spawnPrepareScope.length).toBeGreaterThan(0);
+    expect(all.decisions.spawnPrepareItems).toEqual([]); // the starvation: scope spawns took the whole budget
+    const r = planTick({ ...base, config: { ...base.config, launchKinds: ['prepare-item'] } });
+    expect(r.decisions.spawnPrepareScope).toEqual([]);
+    expect(r.decisions.spawnPrepareItems.map((s) => s.num)).toEqual(['2', '3']);
+    // the phantom scope guard carried in bookkeeping self-heals, and nothing reads as "preparing" but the two items
+    expect(r.nextState.prepareGuards.map((g) => `${g.kind}:${g.num}`)).toEqual(['prepare-item:2', 'prepare-item:3']);
+    expect(r.decisions.counts.preparing).toBe(2);
+    expect(r.decisions.notes.filter((n) => n.kind === 'dispatch-paused')).toEqual([]);
+  });
+
   it('a prepare-stale card is a re-prepare candidate like needs-prepare', () => {
     const r = tick({});
     expect(r.decisions.spawnPrepareItems.map((s) => s.num)).toEqual(['2', '3', '4', '5']);
