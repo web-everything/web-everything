@@ -76,6 +76,22 @@ export function parseGhApiIncludeOutput(text) {
   return { status, headers, body };
 }
 
+/**
+ * Put the HTTP status `gh` reported on stderr (`gh: HTTP 500`) on the error as `.httpStatus` AND in the first line of
+ * its message. `execFileSync` puts only the command in the first line, so a log that keeps that line alone (the fix
+ * daemon's refusal reasons) showed `Command failed: gh api -i -H If-None-Match: ...` and read as a 304 failure.
+ */
+export function annotateHttpStatus(e) {
+  const status = Number(/\bHTTP (\d{3})\b/.exec(String(e && e.stderr ? e.stderr : ''))?.[1]);
+  if (!e || !Number.isInteger(status)) return e;
+  e.httpStatus = status;
+  if (typeof e.message === 'string' && !/\bHTTP \d{3}\b/.test(e.message.split('\n')[0])) {
+    const [first, ...rest] = e.message.split('\n');
+    e.message = [`${first} (HTTP ${status})`, ...rest].join('\n');
+  }
+  return e;
+}
+
 function parseJsonBody(body) {
   return JSON.parse(body || 'null');
 }
@@ -133,12 +149,21 @@ export function ghRestGetJson(path, {
     } catch (e) {
       const parsed = parseGhApiIncludeOutput(e && e.stdout);
       if (etag && parsed.status === 304) return parsed;
-      throw e;
+      throw annotateHttpStatus(e);
     }
   };
 
   const cached = file ? readCache(file) : null;
-  let res = run(cached ? cached.etag : null);
+  let res;
+  try {
+    res = run(cached ? cached.etag : null);
+  } catch (e) {
+    // A 5xx on a CONDITIONAL read says nothing about the resource: GitHub failed to evaluate our If-None-Match (live
+    // 2026-10-07, #4235: `gh: HTTP 500` on a cached check-runs ETag, every pass, read as "timeout evidence unreadable").
+    // Retry ONCE unconditionally; a 200 replaces the cached ETag below. Any other failure is rethrown unchanged.
+    if (cached && e && e.httpStatus >= 500) res = run(null);
+    else throw e;
+  }
   if (res.status === 304) {
     logNotModified(env, { op: opLabel, caller: caller || deriveGhCaller({}, env), id: identity });
     return { status: 304, json: parseJsonBody(cached.body), etag: cached.etag, notModified: true };
