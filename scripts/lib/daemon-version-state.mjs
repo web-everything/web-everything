@@ -29,10 +29,51 @@ function mergeMissing(source, target) {
   }
 }
 
+/**
+ * A state path must be a plain relative path: it is written into the shared info/exclude as `/<path>` and
+ * used for recursive removal, so control characters, gitignore glob metacharacters (`* ? [ ] \`), a trailing
+ * space (gitignore drops it), and empty/`.`/`..` segments (absolute, doubled or traversing paths) are refused.
+ */
+const UNSAFE_PATH_CHARS = /[\u0000-\u001f\u007f*?[\]\\]/;
+function plainRelativePath(path) {
+  return typeof path === 'string' && path !== '' && !UNSAFE_PATH_CHARS.test(path) && !path.endsWith(' ')
+    && path.split('/').every(segment => segment !== '' && segment !== '.' && segment !== '..'
+      && segment.toLowerCase() !== '.git');
+}
+
+/** One state path nested under another would link-then-merge its own symlink into a loop; refuse both. */
+const overlaps = (path, others) => others.some(other => other !== path
+  && (other.startsWith(`${path}/`) || path.startsWith(`${other}/`)));
+
+/** Only directories, regular files and symlinks can be merged; a fifo would hang the copy, a socket throws. */
+function mergeable(source) {
+  const entry = lstatSync(source);
+  if (entry.isDirectory()) return readdirSync(source).every(name => mergeable(join(source, name)));
+  return entry.isFile() || entry.isSymbolicLink();
+}
+
+/** Every existing ancestor inside versionDir must be a real directory, never a symlink or a file. */
+function realParents(versionDir, path) {
+  const segments = path.split('/').slice(0, -1);
+  let current = versionDir;
+  for (const segment of segments) {
+    current = join(current, segment);
+    const entry = stat(current);
+    if (!entry) return true;
+    if (!entry.isDirectory()) return false;
+  }
+  return true;
+}
+
 /** Link persistent state; merged paths are reported separately from ordinary links. */
 export function linkVersionState({ versionDir, stateDir, statePaths, alert }) {
   const result = { linked: [], merged: [], refused: [] };
   for (const path of statePaths) {
+    if (!plainRelativePath(path) || overlaps(path, statePaths) || !realParents(versionDir, path)) {
+      result.refused.push(path);
+      alert('state-link-invalid', { path });
+      continue;
+    }
     const source = join(versionDir, path);
     const target = resolve(stateDir, path);
     mkdirSync(dirname(target), { recursive: true });
@@ -44,6 +85,11 @@ export function linkVersionState({ versionDir, stateDir, statePaths, alert }) {
       continue;
     }
     if (entry && !entry.isSymbolicLink()) {
+      if (!mergeable(source)) {
+        result.refused.push(path);
+        alert('state-link-invalid', { path });
+        continue;
+      }
       mergeMissing(source, target);
       rmSync(source, { recursive: true });
       symlinkSync(target, source);
@@ -83,14 +129,28 @@ export function carryUntrackedSidecars({ git, fromRoot, toRoot, mainSha, alert, 
       result.skipped.push(path);
       continue;
     }
+    // lstat, never follow: git lists symlinks (preserved as links, never dereferenced) and nested repos as `dir/`.
+    const source = join(fromRoot, path);
+    const sourceStat = stat(source);
+    if (!sourceStat || !(sourceStat.isSymbolicLink() || sourceStat.isFile())) {
+      result.refused.push(path);
+      alert('untracked-unsupported', { path });
+      continue;
+    }
     const target = join(toRoot, path);
+    if (!realParents(toRoot, path)) {
+      result.refused.push(path);
+      alert('untracked-unsupported', { path });
+      continue;
+    }
     if (stat(target) || tracked(toRoot, path)) {
       result.refused.push(path);
       alert('untracked-collision', { path });
       continue;
     }
     mkdirSync(dirname(target), { recursive: true });
-    copyFileSync(join(fromRoot, path), target, constants.COPYFILE_EXCL);
+    if (sourceStat.isSymbolicLink()) symlinkSync(readlinkSync(source), target);
+    else copyFileSync(source, target, constants.COPYFILE_EXCL);
     result.carried.push(path);
   }
   return result;
