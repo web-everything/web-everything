@@ -4,10 +4,9 @@
 // vitest APIs Bun 1.4's `vi` lacks that scripts/__tests__ actually use: vi.stubEnv / vi.unstubAllEnvs.
 import { vi } from 'bun:test';
 
-// SAFETY: 7 production scripts (lane-pool-paths, gh-rest-read, ...) key their "never touch the real
-// lane pool / real gh under test" guards off `env.VITEST`. Bun does not set it, so without this line a
-// bun test run can reach the operator's real state. Set it before anything else loads.
-process.env.VITEST ??= 'true';
+// Production isolation guards key on the runner-neutral marker before other modules load.
+// vitest.setup.ts restores it after stripping ambient WE_* keys.
+process.env.WE_UNDER_TEST = '1';
 await import('./vitest.setup.ts');
 
 const v = vi as any;

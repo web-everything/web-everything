@@ -99,6 +99,8 @@ if (process.env.WE_TEST_SANDBOX !== '0') {
   }
 }
 
+process.env.WE_UNDER_TEST = '1';
+
 // #3383: isolate tests from home AND from each other's durable action holds.
 const ownsCoordinationRoot = process.env.WE_COORDINATION_ROOT === undefined;
 let testCoordinationRoot: string | undefined;

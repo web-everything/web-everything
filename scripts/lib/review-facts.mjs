@@ -18,6 +18,7 @@
  * DECLARED SETTING: `WE_REVIEW_FACTS=0` turns the review daemon's facts-first reads off (every read → `gh`).
  * `WE_PR_FACTS=0` (the shared reader's own switch) and `WE_PR_FACTS_TTL_MS` (staleness bound) apply too.
  */
+import { isUnderTest } from './under-test.mjs';
 import { statSync } from 'node:fs';
 import { loadMirror, lookupInMirror, mirrorPath, readMirrorFile, resolvePrFactsConfig } from './pr-facts.mjs';
 import { recordGhCallLogEntry, ghThrottleLogPath, ghThrottleLockRoot } from './gh-throttle.mjs';
@@ -39,7 +40,7 @@ function mirrorFor(path) {
 }
 
 function logHit(env, repo, caller, op) {
-  if ((env.VITEST || env.FAKE_GH_FIXTURE) && !env.WE_GH_THROTTLE_LOCK_ROOT && !env.LANE_POOL_ROOT) return;
+  if ((isUnderTest(env) || env.FAKE_GH_FIXTURE) && !env.WE_GH_THROTTLE_LOCK_ROOT && !env.LANE_POOL_ROOT) return;
   try { recordGhCallLogEntry(ghThrottleLogPath(ghThrottleLockRoot(undefined, env)), { op: 'pr facts', outcome: 'facts_hit', repo, caller, n: 1, via: op }); } catch { /* best-effort */ }
 }
 

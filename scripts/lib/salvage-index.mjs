@@ -13,6 +13,7 @@
  * The index is `<salvageRoot>/index.jsonl`; every rewrite runs under `withFileLock` so a concurrent salvage's
  * append is never lost.
  */
+import { isUnderTest } from './under-test.mjs';
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, rmSync, lstatSync, realpathSync, writeFileSync, renameSync } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
@@ -71,7 +72,7 @@ export function salvageHintLine(matches) {
 /** IO: the hint for a dispatch, never throwing (a dispatch must not fail over a hint). */
 export function salvageHintFor({ cards = [], prs = [], root = null, env = process.env } = {}) {
   // Under vitest, never read the operator's REAL salvage store unless a test points at one explicitly.
-  if (!root && env.VITEST && !env[SALVAGE_DIR_ENV]) return null;
+  if (!root && isUnderTest(env) && !env[SALVAGE_DIR_ENV]) return null;
   root = root || resolveSalvageRoot(env);
   try { return salvageHintLine(salvageEntriesFor(readSalvageIndex(root), { cards, prs })); } catch { return null; }
 }

@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
-  salvageEntriesFor, salvageHintLine, withSalvageHint, refreshSalvageIndex, readSalvageIndex, parseSalvageStamp,
+  salvageHintFor, salvageEntriesFor, salvageHintLine, withSalvageHint, refreshSalvageIndex, readSalvageIndex, parseSalvageStamp,
   backfillSalvageDir, isUnderSalvageRoot,
 } from '../salvage-index.mjs';
 import { salvageLane, appendSalvageIndex } from '../lane-salvage.mjs';
@@ -345,4 +345,8 @@ describe('health-watch salvage cores', () => {
     expect(lowPoolAlert({ acquirable: 0, total: 90, leased: 16, dirtyUnleased: 74 })).toMatch(/^ALERT: lane pool low — 0 acquirable \(< 5\) of 90: 16 leased, 74 dirty unleased/);
     expect(lowPoolAlert({ acquirable: 5, total: 90, leased: 0, dirtyUnleased: 0 })).toBeNull();
   });
+});
+
+it('suppresses real state with WE_UNDER_TEST alone', () => {
+  expect(salvageHintFor({ cards: ['4229'], env: { WE_UNDER_TEST: '1' } })).toBe(null);
 });

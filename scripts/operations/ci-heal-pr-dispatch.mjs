@@ -34,6 +34,7 @@
  * match) could never recognize a real non-WE heal session as live, so a genuinely in-flight sibling-repo heal
  * would have been re-planned every tick. Threading `repo` through here is what makes the two sides agree.
  */
+import { isUnderTest } from '../lib/under-test.mjs';
 import { pollHealAttempts } from './probation-heal-run.mjs';
 import { readAgyHold } from '../lib/antigravity-run-evidence.mjs';
 import { providerQuotaHold } from '../lib/provider-quota-hold.mjs';
@@ -76,13 +77,13 @@ import { readFixLoopRows, appendFixLoopRow, fixLoopConfig, fixLoopState, fixDisp
   fixDispatchKillFile, hasFixHoldLabel } from '../conveyor/fix-loop-ledger.mjs';
 
 const defaultFixLoop = {
-  readRows: () => process.env.VITEST && !process.env.WE_FIX_LOOP_LEDGER ? [] : readFixLoopRows(),
-  append: row => { if (!process.env.VITEST || process.env.WE_FIX_LOOP_LEDGER) appendFixLoopRow(row); },
-  killed: () => process.env.VITEST && !process.env.WE_FIX_DISPATCH_KILL_FILE ? false : fixDispatchKilled(),
+  readRows: () => isUnderTest() && !process.env.WE_FIX_LOOP_LEDGER ? [] : readFixLoopRows(),
+  append: row => { if (!isUnderTest() || process.env.WE_FIX_LOOP_LEDGER) appendFixLoopRow(row); },
+  killed: () => isUnderTest() && !process.env.WE_FIX_DISPATCH_KILL_FILE ? false : fixDispatchKilled(),
 };
 
 function defaultSalvage({ entry, root, repoKey }) {
-  if (process.env.VITEST && !process.env.LANE_POOL_ROOT) return null;
+  if (isUnderTest() && !process.env.LANE_POOL_ROOT) return null;
   const laneDirs = laneDirsForRepo({ poolRoot: defaultPoolRoot(root),
     poolName: CONSTELLATION_REPOS[repoKey].slug.split('/')[1] });
   const candidate = findSalvageCommit({ pr: entry.prNumber, headRefOid: entry.headRefOid, laneDirs });

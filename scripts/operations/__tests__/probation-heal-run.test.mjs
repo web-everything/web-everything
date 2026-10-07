@@ -772,3 +772,7 @@ describe('PR #3577 round 2 review: CI-heal attempt bookkeeping stays bounded, is
     expect(readHealAttempt(attemptId, { dir: h.dir }).terminal.detail).not.toMatch(/Q{4}/);
   });
 });
+
+it('suppresses real state with WE_UNDER_TEST alone', () => {
+  expect(probationLaunchFromEnv({ WE_UNDER_TEST: '1' })).toBe('off');
+});

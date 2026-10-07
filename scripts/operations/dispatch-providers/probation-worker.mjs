@@ -25,6 +25,7 @@
  * or `codex` — the vendor the run script will actually spawn, never a guess.
  */
 
+import { isUnderTest } from '../../lib/under-test.mjs';
 import { beginHealAttempt, bindHealAttempt, failHealAttempt } from '../probation-heal-run.mjs';
 import { join } from 'node:path';
 import { normNum } from '../../conveyor/queue-store.mjs';
@@ -66,7 +67,7 @@ export const PROBATION_LAUNCH_ENV = 'WE_PROBATION_LAUNCH';
  */
 export function probationLaunchFromEnv(env = process.env) {
   const raw = String(env?.[PROBATION_LAUNCH_ENV] ?? '').trim().toLowerCase();
-  if (!raw) return env?.VITEST ? 'off' : 'on';
+  if (!raw) return isUnderTest(env) ? 'off' : 'on';
   if (raw !== 'on' && raw !== 'off') {
     throw new TypeError(`operations: ${PROBATION_LAUNCH_ENV} must be \`on\` or \`off\`, got ${JSON.stringify(raw)}`);
   }

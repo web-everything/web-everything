@@ -71,3 +71,7 @@ it('scopes the cache file to PATH/HOME/CLAUDE_CONFIG_DIR so a faked `claude` nev
   expect(cachedClaudeAgents({ ...o, fetch: fake, env: { ...o.env, PATH: '/fake/bin' } })).toBe('[2]');
   expect(fake).toHaveBeenCalledTimes(1);
 });
+
+it('suppresses real state with WE_UNDER_TEST alone', () => {
+  expect(claudeAgentsCacheTtlMs({ WE_UNDER_TEST: '1' })).toBe(0);
+});

@@ -28,6 +28,7 @@
  * `parseVerdictLog`'s never-throw-on-read contract.
  */
 
+import { isUnderTest } from './under-test.mjs';
 import {
   appendFileSync, readFileSync, mkdirSync, existsSync,
 } from 'node:fs';
@@ -601,7 +602,7 @@ export function targetRegistryPath(root) {
 function defaultRegistryRoot() {
   const env = process.env.WE_TARGET_REGISTRY_ROOT;
   if (env && env.trim()) return env;
-  if (process.env.VITEST) return join(tmpdir(), 'we-target-registry-vitest');
+  if (isUnderTest()) return join(tmpdir(), 'we-target-registry-vitest');
   return join(__dirname, '..', '..'); // scripts/lib/.. -> scripts/.. -> repo root
 }
 
