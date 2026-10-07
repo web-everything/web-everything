@@ -1,9 +1,10 @@
 ---
+bornAs: xg28dxx
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xitghab-prevention-add-a-check-standards-rule-that-fails-on-any-prod.md"]
+scope: ["we:backlog/5229-prevention-add-a-check-standards-rule-that-fails-on-any-prod.md"]
 dateOpened: "2026-10-06"
 tags: []
 ---
@@ -12,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xitghab-prevention-add-a-check-standards-rule-that-fails-on-any-prod.md:6` — Add a check:standards rule that fails when a backlog card's `scope` entries do not resolve to tracked files. Entries marked as new files would be exempt.
+1. `we:backlog/5229-prevention-add-a-check-standards-rule-that-fails-on-any-prod.md:6` — Add a check:standards rule that fails when a backlog card's `scope` entries do not resolve to tracked files. Entries marked as new files would be exempt.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4168@2cd73cb066d5d98b26bf0ffaace40de602b89233
 
