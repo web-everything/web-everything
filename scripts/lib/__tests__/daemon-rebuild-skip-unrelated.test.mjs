@@ -9,9 +9,13 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { hostname } from 'node:os';
 import { rebuildClone, readRebuildState } from '../daemon-rebuild.mjs';
+import { writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
+import { DAEMON_ENTRY_MODULES } from '../daemon-boot-smoke.mjs';
 import { collectImportClosure } from '../import-closure.mjs';
-import { decideSkipRebuild, resolveSkipUnrelated } from '../daemon-rebuild/skip-unrelated.mjs';
+import { decideSkipRebuild, resolveSkipUnrelated, smokeSurfaceEntries } from '../daemon-rebuild/skip-unrelated.mjs';
 
 const LOCK_OPTS = { waitMs: 0 };
 
@@ -208,5 +212,212 @@ describe('decideSkipRebuild / resolveSkipUnrelated', () => {
     expect(resolveSkipUnrelated({}, { path: '/nonexistent' })).toBe(true);
     expect(resolveSkipUnrelated({ WE_DAEMON_REBUILD_SKIP_UNRELATED: '0' })).toBe(false);
     expect(resolveSkipUnrelated({})).toBe(true);
+  });
+});
+
+// ── review round 1 (#4272): the skip must consider the WHOLE smoke surface, not the caller's closure alone ──────
+describe('the skip decision covers everything the shared candidate smoke exercises', () => {
+  const surface = smokeSurfaceEntries({});
+
+  it('the surface is derived from the smoke definitions (daemon entries, every check codeEntries, the smoke modules)', () => {
+    for (const e of DAEMON_ENTRY_MODULES) expect(surface).toContain(e);
+    for (const c of SMOKE_CHECKS) for (const e of c.codeEntries || []) expect(surface).toContain(e);
+    expect(surface).toContain('scripts/lane-pool.mjs');
+    expect(surface).toContain('scripts/conveyor/reconcile-pass.mjs');
+    expect(surface).toContain('scripts/lib/daemon-live-smoke.mjs');
+    expect(smokeSurfaceEntries({ WE_SMOKE_DAEMON_ENTRIES: 'x/extra-daemon.mjs' })).toContain('x/extra-daemon.mjs');
+  });
+
+  it.each([
+    ['a sibling daemon entry', 'skills-src/conveyor/review-daemon.mjs'],
+    ['lane-pool.mjs (lane-pool-list / lane-acquire-release)', 'scripts/lane-pool.mjs'],
+    ['reconcile-pass.mjs (reconcile-dry-run)', 'scripts/conveyor/reconcile-pass.mjs'],
+    ['a dispatch module (dispatch-dry-run)', 'scripts/operations/review-dispatch.mjs'],
+  ])('a move that changes only %s smokes, whether the file exists before the move or is added by it', async (_label, file) => {
+    for (const existsBefore of [true, false]) {
+      const f = makeFixture();
+      advanceMain(f.originDir, (dir) => {
+        writeFile(dir, entry, "import './lib/a.mjs';\n");
+        writeFile(dir, 'scripts/lib/a.mjs', 'export const a = 1;\n');
+        writeFile(dir, 'package.json', '{}\n');
+        if (existsBefore) writeFile(dir, file, 'export const v = 1;\n');
+      });
+      const baseline = await rebuildClone({ root: f.cloneDir, env: f.env, runSmoke: passSmoke(), prState: async () => null, lockOpts: LOCK_OPTS });
+      expect(baseline.adopted).toBe(true);
+      advanceMain(f.originDir, (dir) => writeFile(dir, file, 'export const v = 2;\n'));
+      const runSmoke = passSmoke();
+      const r = await rebuildClone({
+        root: f.cloneDir, env: { ...f.env, WE_DAEMON_REBUILD_SKIP_UNRELATED: '1' }, entries: [entry], runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+      });
+      expect(runSmoke).toHaveBeenCalledTimes(1);
+      expect(r.reason).not.toBe('skipped-unrelated');
+    }
+  });
+
+  it('the same sibling-only change is still unrelated to a docs-only neighbour: docs still skip', async () => {
+    const f = makeFixture();
+    await adoptBaseline(f);
+    advanceMain(f.originDir, (dir) => writeFile(dir, 'docs/ok.md', 'ok\n'));
+    const runSmoke = passSmoke();
+    const r = await rebuildClone({
+      root: f.cloneDir, env: { ...f.env, WE_DAEMON_REBUILD_SKIP_UNRELATED: '1' }, entries: [entry], runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+    expect(runSmoke).not.toHaveBeenCalled();
+    expect(r.reason).toBe('skipped-unrelated');
+  });
+});
+
+describe('a file the daemon can run or read without importing it is never "unrelated"', () => {
+  const closure = { complete: true, files: new Set(['scripts/d.mjs']), bareDeps: false, jsonNames: new Set() };
+  it.each([
+    'scripts/helper.sh', 'scripts/tool.py', '.github/workflows/ci.yml', 'config/x.yaml', 'x/y.toml',
+    'skills-src/conveyor/prompt.md', '.claude/settings.md',
+  ])('%s takes the smoke', (file) => {
+    const d = decideSkipRebuild({ changedFiles: [file], closure });
+    expect(d.skip).toBe(false);
+    expect(d.reason).toBe('executable-or-runtime-file-change');
+  });
+  it('plain docs/backlog markdown still skips', () => {
+    expect(decideSkipRebuild({ changedFiles: ['docs/a.md', 'backlog/1-x.md'], closure }).skip).toBe(true);
+  });
+});
+
+describe('a rename out of the closure is not hidden', () => {
+  it('renaming an imported module away (importer untouched) still smokes', async () => {
+    const f = makeFixture();
+    await adoptBaseline(f);
+    // Rename detection on explicitly (not left to the host's git config) — the diff must list BOTH endpoints.
+    gitOk(f.cloneDir, ['config', 'diff.renames', 'true']);
+    const author = makeAuthorClone(f.originDir);
+    gitOk(author, ['fetch', '-q', 'origin']);
+    gitOk(author, ['checkout', '-q', '-B', 'main', 'origin/main']);
+    gitOk(author, ['config', 'diff.renames', 'true']);
+    mkdirSync(join(author, 'docs'), { recursive: true });
+    gitOk(author, ['mv', 'scripts/lib/a.mjs', 'docs/a.md']);
+    gitOk(author, ['commit', '-q', '-m', 'rename imported module away']);
+    gitOk(author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+    const runSmoke = passSmoke();
+    const r = await rebuildClone({
+      root: f.cloneDir, env: { ...f.env, WE_DAEMON_REBUILD_SKIP_UNRELATED: '1' }, entries: [entry], runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+    expect(r.reason).not.toBe('skipped-unrelated');
+  });
+});
+
+// ── the shortcut's own preconditions: each guard, removed alone, must redden a test here ────────────────────────
+describe('unverified, mismatched, held, quarantined and mid-build clones never take the shortcut', () => {
+  /** Run one unrelated (docs-only) move through a spy `skipCheck` that ALWAYS says skip: if a guard fails to stop
+   *  the shortcut, the result is `skipped-unrelated` and the spy has been consulted. */
+  async function unrelatedMove(f, { env = f.env } = {}) {
+    advanceMain(f.originDir, (dir) => writeFile(dir, 'docs/guard.md', 'g\n'));
+    const skipCheck = vi.fn(() => ({ skip: true, reason: 'spy' }));
+    const runSmoke = passSmoke();
+    const r = await rebuildClone({
+      root: f.cloneDir, env, runSmoke, skipCheck, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+    return { r, skipCheck, runSmoke };
+  }
+  const patchState = (f, patch) => writeRebuildState(f.cloneDir, { ...readRebuildState(f.cloneDir, f.env), ...patch }, f.env);
+
+  it('control: with every precondition met the spy check IS consulted and the shortcut IS taken', async () => {
+    const f = makeFixture();
+    await adoptBaseline(f);
+    const { r, skipCheck, runSmoke } = await unrelatedMove(f);
+    expect(skipCheck).toHaveBeenCalledTimes(1);
+    expect(runSmoke).not.toHaveBeenCalled();
+    expect(r.reason).toBe('skipped-unrelated');
+  });
+
+  it('never adopted (no verified baseline): the check is not consulted and the smoke runs', async () => {
+    const f = makeFixture();
+    expect(readRebuildState(f.cloneDir, f.env).adopted?.head ?? null).toBeNull();
+    const { r, skipCheck, runSmoke } = await unrelatedMove(f);
+    expect(skipCheck).not.toHaveBeenCalled();
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+    expect(r.reason).not.toBe('skipped-unrelated');
+  });
+
+  it('adopted head is not the clone HEAD (a tree that was never the verified build): no shortcut', async () => {
+    const f = makeFixture();
+    await adoptBaseline(f);
+    patchState(f, { adopted: { ...readRebuildState(f.cloneDir, f.env).adopted, head: '0'.repeat(40) } });
+    const { r, skipCheck } = await unrelatedMove(f);
+    expect(skipCheck).not.toHaveBeenCalled();
+    expect(r.reason).not.toBe('skipped-unrelated');
+  });
+
+  it('held clone: no shortcut', async () => {
+    const f = makeFixture();
+    await adoptBaseline(f);
+    patchState(f, { held: { reason: 'smoke-rejected', lastGood: 'x', at: new Date().toISOString() } });
+    const { r, skipCheck } = await unrelatedMove(f);
+    expect(skipCheck).not.toHaveBeenCalled();
+    expect(r.reason).not.toBe('skipped-unrelated');
+  });
+
+  it('quarantined clone: no shortcut', async () => {
+    const f = makeFixture();
+    await adoptBaseline(f);
+    patchState(f, { quarantine: { prevHead: '0'.repeat(40), reason: 'rebuild-threw' } });
+    const { r, skipCheck } = await unrelatedMove(f);
+    expect(skipCheck).not.toHaveBeenCalled();
+    expect(r.reason).not.toBe('skipped-unrelated');
+  });
+
+  it('a sibling daemon mid-smoke (live build lease): the clone is not moved under it', async () => {
+    const f = makeFixture();
+    await adoptBaseline(f);
+    const headBefore = gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim();
+    patchState(f, {
+      building: {
+        token: 'sibling-token', pid: process.ppid, host: hostname(), startedAt: new Date().toISOString(),
+        target: 'deadbeef', inputsKey: 'k', path: join(f.base, 'sibling-candidate'),
+      },
+    });
+    const { r, skipCheck, runSmoke } = await unrelatedMove(f);
+    expect(skipCheck).not.toHaveBeenCalled();
+    expect(runSmoke).not.toHaveBeenCalled();
+    expect(r.reason).toBe('rebuild-in-progress');
+    expect(gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(headBefore);
+  });
+
+  it('a build adopted with a busy-skipped probe is not carried forward unsmoked', async () => {
+    const f = makeFixture();
+    await adoptBaseline(f);
+    patchState(f, { busySkippedTrees: [gitOk(f.cloneDir, ['rev-parse', 'HEAD^{tree}']).trim()] });
+    const { r, skipCheck, runSmoke } = await unrelatedMove(f);
+    expect(skipCheck).not.toHaveBeenCalled();
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+    expect(r.reason).not.toBe('skipped-unrelated');
+  });
+
+  it('a busy-skipped record for some OTHER tree does not block the shortcut', async () => {
+    const f = makeFixture();
+    await adoptBaseline(f);
+    patchState(f, { busySkippedTrees: ['0'.repeat(40)] });
+    const { r, skipCheck } = await unrelatedMove(f);
+    expect(skipCheck).toHaveBeenCalledTimes(1);
+    expect(r.reason).toBe('skipped-unrelated');
+  });
+});
+
+describe('a non-ASCII changed path is matched, not C-quoted past the closure', () => {
+  it('changing an imported module with a non-ASCII name still smokes', async () => {
+    const f = makeFixture();
+    advanceMain(f.originDir, (dir) => {
+      writeFile(dir, entry, "import './lib/ü.mjs';\n");
+      writeFile(dir, 'scripts/lib/ü.mjs', 'export const u = 1;\n');
+      writeFile(dir, 'package.json', '{}\n');
+    });
+    const base = await rebuildClone({ root: f.cloneDir, env: f.env, runSmoke: passSmoke(), prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(base.adopted).toBe(true);
+    advanceMain(f.originDir, (dir) => writeFile(dir, 'scripts/lib/ü.mjs', 'export const u = 2;\n'));
+    const runSmoke = passSmoke();
+    const r = await rebuildClone({
+      root: f.cloneDir, env: { ...f.env, WE_DAEMON_REBUILD_SKIP_UNRELATED: '1' }, entries: [entry], runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+    expect(r.reason).not.toBe('skipped-unrelated');
   });
 });

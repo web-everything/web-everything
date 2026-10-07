@@ -8,7 +8,9 @@ import {
 } from './state.mjs';
 import { mkdirSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { READY_MAX_AGE_ENV, DEFAULT_READY_MAX_AGE_MS, claimBuildLease } from './lease.mjs';
+import {
+  READY_MAX_AGE_ENV, DEFAULT_READY_MAX_AGE_MS, claimBuildLease, buildLeaseIsLive,
+} from './lease.mjs';
 import {
   staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
 } from './adopt.mjs';
@@ -385,9 +387,19 @@ export async function prepareRebuild({
   // daemonRebuild.skipUnrelated — the move changes nothing this daemon runs (see skip-unrelated.mjs): adopt the
   // target without the candidate build + live smoke. Only from a clone that is itself on its smoke-verified
   // build (adopted === HEAD, not held), so an unverified tree is never carried forward unsmoked.
-  if (typeof skipCheck === 'function' && state.adopted?.head === prevHead && !state.held && !state.quarantine) {
-    const diff = git(['diff', '--name-only', prevHead, plan.finalSha]);
-    const changedFiles = diff.status === 0 ? String(diff.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean) : null;
+  // A sibling daemon's LIVE build lease also blocks it: it is mid-smoke on a candidate, and moving the clone
+  // under it would leave its finalize running against a prevHead that no longer matches HEAD.
+  // A build adopted while a lane-pool probe was SKIPPED for a busy pool (`busySkippedTrees`) was never fully
+  // live-verified, so it must not be carried forward unsmoked either (same rule as smoke.mjs `changedSince`).
+  const busyTrees = Array.isArray(state.busySkippedTrees) ? state.busySkippedTrees : [];
+  const headTree = busyTrees.length ? verifyRev(git, `${prevHead}^{tree}`) : null;
+  const busyUnverified = busyTrees.length > 0 && (!headTree || busyTrees.includes(headTree));
+  if (typeof skipCheck === 'function' && state.adopted?.head === prevHead && !state.held && !state.quarantine
+    && !busyUnverified && !buildLeaseIsLive(state.building, { env: stEnv, nowMs: nowMs() })) {
+    // --no-renames: a renamed file must list BOTH endpoints, or a renamed-away imported module hides from the closure.
+    // -z: NUL-separated, so a non-ASCII path is not C-quoted into a string that never matches a closure member.
+    const diff = git(['diff', '--name-only', '-z', '--no-renames', prevHead, plan.finalSha]);
+    const changedFiles = diff.status === 0 ? String(diff.stdout ?? '').split('\0').filter(Boolean) : null;
     const d = skipCheck(changedFiles);
     if (d?.skip) {
       log?.error?.(`daemon-rebuild: skipped rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — ${d.reason} (daemonRebuild.skipUnrelated)`);

@@ -889,7 +889,7 @@ describe('changedFilesBetween — injected git', () => {
   it('lists the diff, or null on failure / missing sha', () => {
     const run = vi.fn(() => ({ status: 0, stdout: 'a.md\nscripts/x.mjs\n' }));
     expect(changedFilesBetween({ root: '/x', from: 'a', to: 'b', run })).toEqual(['a.md', 'scripts/x.mjs']);
-    expect(run).toHaveBeenCalledWith(['diff', '--name-only', 'a', 'b'], expect.objectContaining({ cwd: '/x', killSignal: 'SIGKILL' }));
+    expect(run).toHaveBeenCalledWith(['diff', '--name-only', '--no-renames', 'a', 'b'], expect.objectContaining({ cwd: '/x', killSignal: 'SIGKILL' }));
     expect(changedFilesBetween({ root: '/x', from: 'a', to: 'b', run: () => ({ status: 128, stdout: '' }) })).toBeNull();
     expect(changedFilesBetween({ root: '/x', from: null, to: 'b', run })).toBeNull();
   });

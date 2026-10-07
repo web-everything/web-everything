@@ -413,7 +413,7 @@ export function resolveRestartMinIntervalMs(env = process.env) {
 /** Files changed between two commits (`git diff --name-only from to`), or `null` on any git failure. */
 export function changedFilesBetween({ root, from, to, run = gitRun, timeoutMs = 60_000 }) {
   if (!from || !to) return null;
-  const r = run(['diff', '--name-only', from, to], { cwd: root, timeout: timeoutMs, killSignal: 'SIGKILL' });
+  const r = run(['diff', '--name-only', '--no-renames', from, to], { cwd: root, timeout: timeoutMs, killSignal: 'SIGKILL' });
   if (r.status !== 0) return null;
   return String(r.stdout ?? '').split('\n').map((s) => s.trim()).filter(Boolean);
 }
