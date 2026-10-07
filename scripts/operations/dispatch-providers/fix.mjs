@@ -54,9 +54,14 @@ import {
 // mechanical-dispatcher (epic #3383) Part 2 — see `build.mjs`'s own note; identical use here, keyed on the
 // repair's OPTIONAL `num` (the item, when known — see the "ITEM is optional" note below).
 import { readItemDeliveryAgentMarker } from '../delivery-agent-marker.mjs';
-import { FIX_RUN_EXECUTORS } from '../fix-run.mjs';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+
+/** Executors `fix-run.mjs` can launch today (each needs a write-capable delivery provider). Defined HERE, in the
+ *  leaf, and imported by `fix-run.mjs` — never the reverse: `fix-run.mjs` is a CLI entry with a top-level `await`
+ *  that lazily imports the wrapper chain reaching this file, so a `fix.mjs -> fix-run.mjs` import deadlocks it
+ *  (exit 13, "unsettled top-level await"). */
+export const FIX_RUN_EXECUTORS = Object.freeze(['codex']);
 
 /** The per-dispatch process {@link fixDetachedProvider} starts. Resolved by SCRIPT LOCATION, never cwd — same
  *  reason {@link REPO_ROOT} is. */

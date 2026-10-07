@@ -79,7 +79,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
 import { describeDispatchFailure, describeSpawnFailure } from '../lib/describe-spawn-failure.mjs';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -110,6 +110,7 @@ import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
 import { BORROW_REASON } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
+import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
 import { runReconcilePass, resolveLaneHead } from './reconcile-pass.mjs';
 import { readUnsupported, recordUnsupported } from './unsupported-repo.mjs';
@@ -966,6 +967,19 @@ export function postRulingNotice({ repo, pr, ruling, exec = execFileSyncThrottle
 }
 
 /**
+ * The filled brief handed to a non-Claude launcher as a file (it cannot ride argv). It holds untrusted reviewer text
+ * the launcher then feeds an agent, so it goes in a FRESH private directory (`mkdtemp`, 0700 — never a guessable,
+ * pre-creatable path) and is created exclusively (`wx`, so a planted file or symlink is an error, not a write-through).
+ * `fix-run.mjs` deletes it (and the directory) as soon as it has read it.
+ */
+export function writePrivateBorrowedPrompt(slug, text, base = tmpdir()) {
+  const dir = mkdtempSync(join(base, 'we-fix-borrow-'));
+  const file = join(dir, `${String(slug).replace(/[^\w.-]/g, '_')}.md`);
+  writeFileSync(file, text, { mode: 0o600, flag: 'wx' });
+  return file;
+}
+
+/**
  * we:scripts/conveyor/reconcile-fix-dispatch.mjs#dispatchFix — DISPATCH ONE FRESH FIX AGENT for one planned
  * entry that either isn't a conflict-caused resume candidate, or whose {@link tryResumeFix} attempt did not
  * resume. Mirrors `we:scripts/operations/review-dispatch.mjs#dispatchReview`'s own composition (plan → fill →
@@ -1019,13 +1033,7 @@ export function dispatchFix(planned, {
   borrowed = null,
   spawnBorrowed = (request) => fixDetachedProvider(request),
   // The filled brief is handed to the non-Claude launcher as a file (it cannot ride argv); a test stubs the write.
-  writeBorrowedPrompt = (slug, text) => {
-    const dir = join(tmpdir(), 'we-fix-borrow-prompts');
-    mkdirSync(dir, { recursive: true });
-    const file = join(dir, `${slug}-${Date.now()}.md`);
-    writeFileSync(file, text, { mode: 0o600 });
-    return file;
-  },
+  writeBorrowedPrompt = writePrivateBorrowedPrompt,
   // #x8mpubm — same never-throwing, opt-in-gated resolver `we:scripts/operations/dispatch-lane-io.mjs`'s own
   // `createDispatchSinks` uses for a fresh build dispatch; a fix dispatch is a SEPARATE fresh-dispatch call
   // site (see the `buildAgentArgv` call below) so it needs its own seam, but reuses the SAME wrapper rather
@@ -1128,12 +1136,19 @@ export function dispatchFix(planned, {
     }
     if (borrowed && borrowed.executor !== 'claude') {
       // Card 87 — the borrowed slot belongs to a non-Claude executor: same claim and brief, other launcher.
-      const handle = spawnBorrowed({
-        pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
-        ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
-        promptFile: writeBorrowedPrompt(sessionSlug, withAltBranchHint(withSalvageHint(withOperatorSendBack(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch)),
-        policyRoute: { provider: borrowed.executor === 'codex' ? 'codex' : 'antigravity-claude' },
-      });
+      const promptFile = writeBorrowedPrompt(sessionSlug, withAltBranchHint(withSalvageHint(withOperatorSendBack(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch));
+      let handle;
+      try {
+        handle = spawnBorrowed({
+          pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
+          ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
+          promptFile,
+          policyRoute: { provider: borrowed.executor === 'codex' ? 'codex' : 'antigravity-claude' },
+        });
+      } catch (e) {
+        removePromptFile(promptFile); // the launcher never started, so nothing else will delete the brief
+        throw e;
+      }
       return {
         sessionId: null, agentId: String(handle), sessionSlug, pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane,
         unknownTokens, resumed: false, ...(resumeAttempt ? { resumeAttempt } : {}),
