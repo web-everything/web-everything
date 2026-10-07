@@ -29,6 +29,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { notifyDesktopChecked } from '../conveyor/branch-sync.mjs';
 
 const MIN = 60_000;
@@ -168,7 +169,7 @@ function readTickRows(coordRoot) {
 }
 
 function runPrMovement({ now, env }) {
-  const repo = env.WE_SWEEP_REPO || 'web-everything/web-everything';
+  const repo = env.WE_SWEEP_REPO || CONSTELLATION_REPOS.we.slug;
   const attention = [];
   const sections = [];
   const star = assessBuilderStarvation(readTickRows(resolveCoordinationRoot()), {
@@ -245,4 +246,4 @@ export function main(argv = process.argv.slice(2)) {
   return 0;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) process.exit(main());
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) process.exitCode = main();
