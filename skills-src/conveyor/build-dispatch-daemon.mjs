@@ -41,7 +41,7 @@ import { execFileSync, execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync } from 'node:fs';
 import os, { tmpdir, hostname, homedir } from 'node:os';
-import { hostLoadGate, resolveMaxLoadPerCore } from '../../scripts/lib/dispatch-throttle.mjs';
+import { gateHost } from '../../scripts/lib/dispatch-throttle.mjs';
 import { builderExecutorFor } from '../../scripts/lib/fix-slot-borrow.mjs';
 import { startDetachedLaunch, settleLaunches, PENDING_LAUNCHES_DIRNAME } from '../../scripts/conveyor/pending-launches.mjs';
 import { dirname, join, resolve } from 'node:path';
@@ -580,11 +580,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const launchSlotBusy = () => typeof effects.settleLaunches === 'function'
     && (pendingLaunch.build.size + pendingLaunch.prepare.size + startedThisTick) > 0;
   const loadGateFor = (kind, num) => {
-    const gate = effects.hostLoadGate?.() ?? { admit: true };
+    const gate = effects.hostLoadGate?.(kind) ?? { admit: true };
     if (!gate.admit) {
       loadHolds.push({ num: normNum(num), kind, reason: 'host-load', why: gate.why });
       console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} deferred (host-load): ${gate.why}`);
-    }
+    } else if (gate.note) console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} admitted: ${gate.note}`);
     return gate;
   };
   if (live) {
@@ -1156,8 +1156,10 @@ export async function cliLaunchConfirmed({ num, kind }) {
 }
 
 /** Host-load gate for NEW launches (#4139's shared helper). Fails open on an unreadable load. */
-export function cliHostLoadGate({ env = process.env, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length } = {}) {
-  try { return hostLoadGate({ load: loadavg(), cores: cpuCount(), maxLoadPerCore: resolveMaxLoadPerCore({ env }) }); }
+export function cliHostLoadGate(kind = 'build', opts = {}) {
+  if (kind && typeof kind === 'object') { opts = kind; kind = 'build'; }
+  const { env = process.env, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length, sample } = opts;
+  try { return gateHost({ kind, env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); }
   catch { return { admit: true }; }
 }
 

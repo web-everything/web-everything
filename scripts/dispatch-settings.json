@@ -2,6 +2,8 @@
   "heavyAdmissionCap": 2,
   "fixDispatchMaxConcurrent": 2,
   "maxLoadPerCore": 2.0,
+  "memFreeMinPct": 15,
+  "cpuIdleMinPct": { "fix": 8, "ci-heal": 8, "build": 15, "prepare": 20, "review": 10 },
   "fixDispatch": {
     "borrowBuildSlots": "on",
     "borrowAfterMinutes": 15,

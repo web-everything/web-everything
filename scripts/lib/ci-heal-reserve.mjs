@@ -7,7 +7,7 @@
  *   interrupts running work. Env WE_CI_HEAL_RESERVE (default 1, 0 = off).
  */
 import os from 'node:os';
-import { hostLoadGate, resolveMaxLoadPerCore } from './dispatch-throttle.mjs';
+import { gateHost } from './dispatch-throttle.mjs';
 
 export function resolveCiHealReserve({ env = process.env } = {}) {
   const e = env?.WE_CI_HEAL_RESERVE;
@@ -17,7 +17,7 @@ export function resolveCiHealReserve({ env = process.env } = {}) {
 
 /** ONE per pass. `tryAdmit()` -> `{admit:true, reserved:true}` | `{admit:false, kind, why}`. */
 export function createCiHealReserve({
-  listClaims = () => [], env = process.env, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length,
+  listClaims = () => [], env = process.env, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length, sample,
 } = {}) {
   let liveHeal = null;
   return {
@@ -28,7 +28,7 @@ export function createCiHealReserve({
         return { admit: false, kind: 'fix-cap', why: `fixer cap full and the ${reserve} reserved ci-heal slot(s) (WE_CI_HEAL_RESERVE) are in use (${liveHeal} live ci-heal)` };
       }
       let gate = { admit: true };
-      try { gate = hostLoadGate({ load: loadavg(), cores: cpuCount(), maxLoadPerCore: resolveMaxLoadPerCore({ env }) }); } catch { /* fail open */ }
+      try { gate = gateHost({ kind: 'ci-heal', env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); } catch { /* fail open */ }
       if (!gate.admit) return gate;
       liveHeal += 1;
       return { admit: true, reserved: true };
