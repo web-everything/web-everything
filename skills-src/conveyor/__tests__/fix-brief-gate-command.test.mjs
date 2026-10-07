@@ -5,7 +5,9 @@
  *   output. Fails if a brief names a command `dispatchedAgentVerificationReason` denies.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { dispatchedAgentVerificationReason } from '../../../scripts/guard-bash.mjs';
@@ -64,15 +66,63 @@ for (const [file, kind] of [['fix-agent-brief.md', 'fix'], ['fix-agent-ci-brief.
 // #34 — a description-only ci-heal re-runs the check instead of queuing a full local verify.
 describe('fix-agent-ci-brief.md — metadata-only heal skips the local verify (#34)', () => {
   const brief = readFileSync(join(HERE, '..', 'fix-agent-ci-brief.md'), 'utf8');
-  it('skips the gate only when the tree is byte-identical to the examined head, and re-runs the failed check', () => {
-    const rule = brief.split('**Metadata-only skip (#34).**')[1];
+  const rule = brief.split('**Metadata-only skip (#34).**')[1];
+  it('skips the gate only when HEAD is the examined commit with a clean tree, and re-runs the failed check', () => {
     expect(rule, 'metadata-only skip rule present').toBeTruthy();
     const para = rule.split('\n\n')[0];
-    expect(para).toContain('git diff --quiet "$EXAMINED_HEAD" HEAD');
     expect(para).toMatch(/skip steps 4-6/);
     expect(para).toContain('gh run rerun');
     expect(para).toContain('--outcome=healed');
-    expect(para).toMatch(/clean merge[^.]*NOT metadata-only/);
+    expect(para).toMatch(/merge[^.]*NOT metadata-only/);
+  });
+
+  // Behavioural: run the brief's own predicate against real repos in each state a step-3 repair can leave.
+  const predicate = rule && /```bash\n\s*([^\n]+)\n\s*```/.exec(rule)?.[1];
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+  const skips = (cwd, examined) => spawnSync('bash', ['-c', predicate], { cwd, env: { ...process.env, EXAMINED_HEAD: examined } }).status === 0;
+  const withRepo = (fn) => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-heal-skip-'));
+    try {
+      git(dir, 'init', '-q', '-b', 'main');
+      git(dir, 'config', 'user.email', 't@example.com');
+      git(dir, 'config', 'user.name', 't');
+      git(dir, 'config', 'commit.gpgsign', 'false');
+      writeFileSync(join(dir, 'a.txt'), 'a\n');
+      git(dir, 'add', 'a.txt');
+      git(dir, 'commit', '-qm', 'base');
+      fn(dir, git(dir, 'rev-parse', 'HEAD'));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  it('predicate: skips when nothing changed since the examined head', () => {
+    expect(predicate, 'predicate fence present').toBeTruthy();
+    withRepo((dir, head) => expect(skips(dir, head)).toBe(true));
+  });
+  it('predicate: does not skip on an uncommitted edit, staged edit, or untracked file', () => {
+    withRepo((dir, head) => {
+      writeFileSync(join(dir, 'a.txt'), 'changed\n');
+      expect(skips(dir, head), 'unstaged edit').toBe(false);
+      git(dir, 'add', 'a.txt');
+      expect(skips(dir, head), 'staged edit').toBe(false);
+      git(dir, 'checkout', '-q', 'HEAD', '--', 'a.txt');
+      expect(skips(dir, head), 'clean again').toBe(true);
+      writeFileSync(join(dir, 'new.txt'), 'x\n');
+      expect(skips(dir, head), 'untracked file').toBe(false);
+    });
+  });
+  it('predicate: does not skip on a new commit, even one with the same tree (a same-tree merge)', () => {
+    withRepo((dir, head) => {
+      git(dir, 'checkout', '-q', '-b', 'side');
+      writeFileSync(join(dir, 'b.txt'), 'b\n');
+      git(dir, 'add', 'b.txt');
+      git(dir, 'commit', '-qm', 'side');
+      git(dir, 'revert', '--no-edit', 'HEAD');
+      git(dir, 'checkout', '-q', 'main');
+      git(dir, 'merge', '--no-ff', '--no-edit', 'side');
+      expect(git(dir, 'rev-parse', 'HEAD^{tree}')).toBe(git(dir, 'rev-parse', `${head}^{tree}`));
+      expect(skips(dir, head)).toBe(false);
+    });
   });
   it('does not add the skip to the code-fix brief', () => {
     expect(readFileSync(join(HERE, '..', 'fix-agent-brief.md'), 'utf8')).not.toContain('Metadata-only skip');

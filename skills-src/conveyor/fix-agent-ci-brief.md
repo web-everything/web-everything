@@ -246,11 +246,15 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
   node "{{WE_ROOT}}/scripts/pr-body-edit.mjs" --pr={{PR_NUM}} --repo={{REPO}} --body-file=<bodyfile>
   ```
   (never a raw `gh pr edit --body` — it drops the PR's own authorship stamp; see that script's own header.)
-  **Metadata-only skip (#34).** When `git diff --quiet "$EXAMINED_HEAD" HEAD` exits 0 (the tree is byte-identical
-  to the examined head — no commit and no merge), skip steps 4-6 entirely: no `verify-lane.mjs request`. Re-run the
+  **Metadata-only skip (#34).** When this predicate exits 0 (HEAD is still the examined commit — no commit and no
+  merge, not even a same-tree merge — and the working tree has no edit, staged, unstaged or untracked):
+  ```bash
+  [ "$(git rev-parse HEAD)" = "$EXAMINED_HEAD" ] && git diff --quiet "$EXAMINED_HEAD" && [ -z "$(git status --porcelain)" ]
+  ```
+  skip steps 4-6 entirely: no `verify-lane.mjs request`. Re-run the
   failed check on the same commit (`gh run rerun <failed-run-id> --failed`), then go straight to step 7 with
-  `--outcome=healed`. A clean merge of main or any code edit changes the tree, so it is NOT metadata-only and
-  still takes the gate in step 4.
+  `--outcome=healed`. A merge of main (even one whose tree equals the examined head) or any code edit, committed or
+  not, is NOT metadata-only and still takes the gate in step 4.
 - If the required check is red for a reason that is NOT a CI/merge break and NOT a metadata fix — do **NOT**
   guess which of the three outcomes below applies without checking; picking the wrong one either hides a real
   defect from the operator, wastes their attention on tooling that already has a fix in flight, or (we:backlog/
