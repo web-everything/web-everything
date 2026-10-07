@@ -10,7 +10,7 @@ import { verifyRelatedMode, verifyTestTimeoutFactor, verifyStandardsPolicy, veri
 
 const allSources = source => Object.fromEntries(Object.keys(BUILT_IN_VERIFY_SETTINGS).map(key => [key, source]));
 const custom = { relatedMode: 'import-only', testTimeoutFactor: 4, standards: 'ci-only', phaseAdmission: false, fastTargets: 2,
-  matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off', relatedMaxTests: 12, relatedDepth: 3, alwaysRunTests: ['a/b.test.mjs'] };
+  matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off', relatedMaxTests: 12, relatedDepth: 3, alwaysRunTests: ['a/b.test.mjs'], skipLocalForCardOnly: false };
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function file(contents) {
@@ -29,8 +29,15 @@ describe('verify settings', () => {
     for (const f of shippedAlwaysRun) expect(existsSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../..', f)), f).toBe(true);
     expect(defaultVerifySettingsPath()).toBe(resolve(dirname(fileURLToPath(import.meta.url)), '../../verify-settings.json'));
     expect(resolveVerifySettings({ fileConfig: loadVerifySettingsFile(defaultVerifySettingsPath()), env: {} }))
-      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only', standards: 'auto', relatedMaxTests: 40, relatedDepth: 2, alwaysRunTests: shippedAlwaysRun }, sources: allSources('file') });
+      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only', standards: 'auto', relatedMaxTests: 40, relatedDepth: 2, alwaysRunTests: shippedAlwaysRun, skipLocalForCardOnly: true }, sources: allSources('file') });
     expect(verifyRelatedMode({})).toBe('import-only');
+  });
+
+  it('card-only skipping defaults to disabled without file or environment configuration', () => {
+    expect(BUILT_IN_VERIFY_SETTINGS.skipLocalForCardOnly).toBe(false);
+    const resolved = resolveVerifySettings({ fileConfig: {}, env: {} });
+    expect(resolved.values.skipLocalForCardOnly).toBe(false);
+    expect(resolved.sources.skipLocalForCardOnly).toBe('default');
   });
 
   it('defaults the shipped standards policy to auto with no env, and env always still forces it', () => {
@@ -47,9 +54,9 @@ describe('verify settings', () => {
     const env = { WE_VERIFY_RELATED: 'all', WE_VERIFY_TEST_TIMEOUT_FACTOR: '2.5', WE_VERIFY_STANDARDS: 'auto',
       WE_VERIFY_PHASE_ADMISSION: '1', WE_VERIFY_FAST_TARGETS: '0', WE_VERIFY_MATCH_REQUEST_VARIANTS: '1',
       WE_VERIFY_SUPERSEDE: 'any', WE_VERIFY_RESTART_IN_FLIGHT: 'adopt', WE_VERIFY_RUN_ALL_PHASES: '1',
-      WE_VERIFY_ISOLATED_RETRY: 'timeouts', WE_VERIFY_RELATED_MAX_TESTS: '5', WE_VERIFY_RELATED_DEPTH: '1', WE_VERIFY_ALWAYS_RUN_TESTS: 'x/y.test.mjs, z.test.mjs' };
+      WE_VERIFY_ISOLATED_RETRY: 'timeouts', WE_VERIFY_RELATED_MAX_TESTS: '5', WE_VERIFY_RELATED_DEPTH: '1', WE_VERIFY_ALWAYS_RUN_TESTS: 'x/y.test.mjs, z.test.mjs', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1' };
     const values = { relatedMode: 'all', testTimeoutFactor: 2.5, standards: 'auto', phaseAdmission: true, fastTargets: 0,
-      matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts', relatedMaxTests: 5, relatedDepth: 1, alwaysRunTests: ['x/y.test.mjs', 'z.test.mjs'] };
+      matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts', relatedMaxTests: 5, relatedDepth: 1, alwaysRunTests: ['x/y.test.mjs', 'z.test.mjs'], skipLocalForCardOnly: true };
     expect(resolveVerifySettings({ fileConfig: custom, env })).toEqual({ values, sources: allSources('env') });
     expect(resolveVerifySettings({ fileConfig: custom, env: { WE_VERIFY_RELATED: 'all' } }))
       .toEqual({ values: { ...custom, relatedMode: 'all' }, sources: { ...allSources('file'), relatedMode: 'env' } });

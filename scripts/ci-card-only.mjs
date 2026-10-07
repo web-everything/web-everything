@@ -35,6 +35,15 @@ export function classifyCardOnly({ event, files } = {}) {
   return { light: true, reason: `card-only: ${files.length} file(s), all under ${CARD_ONLY_PREFIXES.join(', ')}` };
 }
 
+/**
+ * THE one definition of "card-only", shared by CI (`main` below) and the local verify gate
+ * (`resolveDefaultGate`, skipLocalForCardOnly). Takes the `--no-renames` changed-file list of a PR.
+ * @param {string[]|null|undefined} files
+ */
+export function isCardOnlyDiff(files) {
+  return classifyCardOnly({ event: 'pull_request', files: files ?? undefined }).light;
+}
+
 function main() {
   const flags = Object.fromEntries(process.argv.slice(2).filter((a) => a.startsWith('--')).map((a) => {
     const i = a.indexOf('=');
