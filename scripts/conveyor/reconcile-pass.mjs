@@ -1475,13 +1475,13 @@ export function resolveCheckOrigin(c, { repo, api }) {
 }
 
 /** A failed check that is not primary evidence: `review-gate` (red by design under a review hold) and the
- *  aggregate `test` job when at least one `test-shard (N)` job also failed (it only mirrors its shards). */
+ *  aggregate `test` job when at least one `test-shard (N)` or `integration` job also failed (it only mirrors its shards). */
 export function isDerivedTimeoutCheck(check, checks = []) {
   if (check?.name === 'review-gate') return true;
   // LIVE INCIDENT 2026-10-06, PR #4141: `daemon-soak` is the aggregator over `soak-shard (N)` exactly as `test` is over
   // `test-shard (N)`. Its own ~4 s log has no vitest summary, so counting it as evidence made every real soak failure an
   // `incomplete-failure-inventory` refusal that masked the PR's real owner state. The failed shard carries the evidence.
-  const aggregateOf = { test: /^test-shard \(\d+\)$/, 'daemon-soak': /^soak-shard \(\d+\)$/ }[check?.name];
+  const aggregateOf = { test: /^(?:test-shard \(\d+\)|integration)$/, 'daemon-soak': /^soak-shard \(\d+\)$/ }[check?.name];
   return !!aggregateOf
     && checks.some((c) => aggregateOf.test(c?.name ?? '') && !['success', 'skipped', 'neutral'].includes(c.conclusion));
 }
