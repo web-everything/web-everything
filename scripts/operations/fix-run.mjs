@@ -31,7 +31,7 @@ import { resolveDeliveryAgentProvider } from './deliver-item-wrapper.mjs';
 /** Executors this launcher can run today (each needs a write-capable delivery provider). */
 export const FIX_RUN_EXECUTORS = Object.freeze(['codex']);
 
-const REQUIRED_FLAGS = Object.freeze(['pr', 'session', 'ref', 'prompt-file']);
+const REQUIRED_FLAGS = Object.freeze(['session', 'pr', 'ref', 'prompt-file']);
 
 /** PURE. `--k=v` argv -> launch shape; refuses a missing required flag by name. */
 export function parseFixRunArgv(argv = []) {
