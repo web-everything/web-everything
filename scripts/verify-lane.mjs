@@ -74,7 +74,8 @@ import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyS
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
-import { matchRequestedDefaultGate, verifySetting, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { classifyRedCause } from './lib/red-cause.mjs';
+import { alwaysRunPlan, matchRequestedDefaultGate, verifySetting, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
@@ -283,8 +284,8 @@ if (typeof flags.gate === 'string') {
       // A dispatched child must leave a TERMINAL record (red, exit 3) — leaving the `running` request as it was would
       // make the dispatcher re-spawn this same refusal on every sweep. A plain `request` records nothing.
       if (dispatchedChild) {
-        writeMarker(verifyFinishBody(verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: null }),
-          { finishedAt: new Date().toISOString(), exitCode: 3, sha: headSha, suites: GATE, treeHash: null }));
+        writeMarker({ ...verifyFinishBody(verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: null }),
+          { finishedAt: new Date().toISOString(), exitCode: 3, sha: headSha, suites: GATE, treeHash: null }), redCause: 'refused', redCauseFiles: [] });
       }
       emit({ sha: headSha, status: 'gate-refused', reason: 'explicit-gate-not-affected-test', ok: false, detail: `${refusal}. The default selection is blocked for this diff, so supply an affected-test gate such as \`--gate="npx vitest related <files> --run"\`; ${dispatchedChild ? 'recorded a red marker so it is not re-dispatched' : 'no marker was recorded'}.` }, 3);
     }
@@ -541,6 +542,10 @@ let gateMs;
 const runAllPhases = verifySetting('runAllPhases', process.env) === true;
 const isolatedRetryMode = verifySetting('isolatedRetry', process.env);
 const phaseResults = [];
+const alwaysRun = retryableGate
+  ? alwaysRunPlan({ declared: verifySetting('alwaysRunTests', process.env), fileExists: (p) => existsSync(join(REPO, p)),
+    scanCommands: resolvedGate.scanCommands ?? [], testTimeoutFactor: resolvedGate.decision?.testTimeoutFactor ?? 1 })
+  : { command: null, declared: [], files: [], skipped: [] };
 const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
   let result = await timedRunGate(retryableGate ? 'vitestMs' : null,
@@ -577,6 +582,16 @@ try {
       if (!continueAfter(scan)) break;
     }
   }
+  // #99 — the always-run guard set, independent of how many tests the related selection picked. Same phase kind as
+  // the scanners ('scan'): admission, timing and outcome telemetry are shared; a red here is a `scan` redCause.
+  if (retryableGate && alwaysRun.command && continueAfter(phaseResults.at(-1).result)) {
+    process.stderr.write(`⏱ always-run guard tests (#99): ${alwaysRun.files.length} file(s)\n`);
+    const started = performance.now();
+    const guard = await timedRunGate('scanMs', alwaysRun.command);
+    alwaysRun.ms = performance.now() - started;
+    alwaysRun.result = guard.exitCode === 0 && !guard.signal ? 'passed' : 'failed';
+    phaseResults.push({ phase: 'scan', guard: true, result: guard });
+  }
   if (retryableGate && resolvedGate.standardsCommand && phaseResults.every(p => continueAfter(p.result))) {
     phaseResults.push({ phase: 'standards', result: await timedRunGate('standardsMs', resolvedGate.standardsCommand) });
   }
@@ -595,18 +610,23 @@ try {
   if ((!phaseAdmission && admission.ok) || firstPhaseAdmission?.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
 }
 
-const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'phase' : 'gate', phases: admissionPhases }, admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes });
+const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'phase' : 'gate', phases: admissionPhases }, admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes,
+  alwaysRun: alwaysRun.declared.length ? alwaysRun : null });
 const phases = admissionFallback ? { ...builtPhases, admissionFallback } : builtPhases;
 
 const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
 const retryDetail = describeIsolatedRetry(retryAudit);
+// Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
+const cause = classifyRedCause({ exitCode, signal, infrastructure: verificationInfrastructureFailure({ exitCode, signal }), phaseResults,
+  isolatedRetry, retriedFailures, changedFiles: resolvedGate?.decision?.changedFiles });
+const redCauseFields = cause ? cause : {};
 
 const infrastructure = verificationInfrastructureFailure({ exitCode, signal });
 if (MODE === 'run') process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
 if (MODE === 'run' && infrastructure) emit({ sha: headSha, status: 'infrastructure-failure', reason: infrastructure.reason, exitCode, infrastructure, phases, detail: infrastructure.detail }, 3);
 if (MODE === 'run') {
-  emit({ sha: headSha, status: exitCode === 0 ? 'green' : 'red', reason: 'run', exitCode, ...diagnostic, phases, detail: exitCode === 0 ? 'gate passed (run mode — no marker recorded).' + retryDetail : `gate FAILED (exit ${exitCode}) — run mode, no marker recorded.${retryDetail}` }, exitCode === 0 ? 0 : 2);
+  emit({ sha: headSha, status: exitCode === 0 ? 'green' : 'red', reason: 'run', exitCode, ...diagnostic, ...redCauseFields, phases, detail: exitCode === 0 ? 'gate passed (run mode — no marker recorded).' + retryDetail : `gate FAILED (exit ${exitCode}) — run mode, no marker recorded.${retryDetail}` }, exitCode === 0 ? 0 : 2);
 }
 
 // 4. Rewrite the marker to its terminal green/red form — for the sha THIS run actually verified.
@@ -642,11 +662,11 @@ const finished = verifyFinishBody(startBody, {
   suites: GATE,
   treeHash: stableTreeHash(currentTreeHash, preGateTreeHash, treeHashNow()),
 });
-writeMarker({ ...finished, phases });
+writeMarker({ ...finished, ...redCauseFields, phases });
 process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
 if (infrastructure) emit({ sha: headSha, status: finished.status, reason: infrastructure.reason, exitCode, infrastructure, phases, detail: infrastructure.detail }, 3);
 
 emit(
-  { sha: headSha, status: finished.status, reason: finished.status, exitCode, ...diagnostic, phases, detail: (finished.status === 'green' ? `suites passed — recorded green for ${headSha.slice(0, 8)} (delivery may proceed).` : `suites FAILED (exit ${exitCode}) — recorded red for ${headSha.slice(0, 8)}; the finish-guard will refuse to land until this is green.`) + retryDetail },
+  { sha: headSha, status: finished.status, reason: finished.status, exitCode, ...diagnostic, ...redCauseFields, phases, detail: (finished.status === 'green' ? `suites passed — recorded green for ${headSha.slice(0, 8)} (delivery may proceed).` : `suites FAILED (exit ${exitCode}) — recorded red for ${headSha.slice(0, 8)}; the finish-guard will refuse to land until this is green.`) + retryDetail },
   finished.status === 'green' ? 0 : 2,
 );

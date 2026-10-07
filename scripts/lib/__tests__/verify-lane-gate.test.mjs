@@ -15,7 +15,7 @@ import { execSync } from 'node:child_process';
 import { LANE_RELEASE_LITTER_ALLOWLIST } from '../lane-litter.mjs';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
+import { alwaysRunPlan, verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -1025,5 +1025,25 @@ describe('#5128 — bounded related-test selection', () => {
     for (const mode of ['related', 'run']) expect(selectedTestCommand.test(`npx vitest ${mode} 'x.test.mjs'`)).toBe(true);
     expect(selectedTestCommand.test('npm run test:unit')).toBe(false);
     expect(source).toMatch(/const retryableGate = SELECTED_TEST_COMMAND\.test\(resolvedGate\?\.testCommand \?\? ''\)/);
+  });
+});
+
+describe('alwaysRunPlan (item 99)', () => {
+  const declared = ['a/guard.test.mjs', 'b/contract.test.mjs', 'c/missing.test.mjs'];
+  it('runs every declared file that exists in ONE vitest command, independent of any selection', () => {
+    const plan = alwaysRunPlan({ declared, fileExists: (f) => !f.startsWith('c/'), testTimeoutFactor: 3 });
+    expect(plan.files).toEqual(['a/guard.test.mjs', 'b/contract.test.mjs']);
+    expect(plan.skipped).toEqual(['c/missing.test.mjs']);
+    expect(plan.command).toMatch(/^npx vitest run 'a\/guard\.test\.mjs' 'b\/contract\.test\.mjs' --passWithNoTests --testTimeout=/);
+  });
+  it('skips files a scan command already runs, and yields no command for an empty set', () => {
+    const plan = alwaysRunPlan({ declared, fileExists: () => true, scanCommands: ["npx vitest run 'a/guard.test.mjs'"] });
+    expect(plan.files).toEqual(['b/contract.test.mjs', 'c/missing.test.mjs']);
+    expect(alwaysRunPlan({ declared: [], fileExists: () => true }).command).toBeNull();
+  });
+  it('is recorded in the phase telemetry', () => {
+    const phases = buildVerifyPhases({ decision: {}, alwaysRun: { files: ['a'], skipped: ['b'], ms: 1234.4, result: 'passed' } });
+    expect(phases.alwaysRun).toEqual({ ran: ['a'], skipped: ['b'], ms: 1234, result: 'passed' });
+    expect(buildVerifyPhases({ decision: {} }).alwaysRun).toBeUndefined();
   });
 });

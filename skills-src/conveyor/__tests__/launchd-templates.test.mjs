@@ -36,12 +36,12 @@ describe('launchd templates', () => {
       standards: 'WE_VERIFY_STANDARDS', phaseAdmission: 'WE_VERIFY_PHASE_ADMISSION', fastTargets: 'WE_VERIFY_FAST_TARGETS',
       matchRequestVariants: 'WE_VERIFY_MATCH_REQUEST_VARIANTS', supersede: 'WE_VERIFY_SUPERSEDE', restartInFlight: 'WE_VERIFY_RESTART_IN_FLIGHT',
       runAllPhases: 'WE_VERIFY_RUN_ALL_PHASES', isolatedRetry: 'WE_VERIFY_ISOLATED_RETRY',
-      relatedMaxTests: 'WE_VERIFY_RELATED_MAX_TESTS', relatedDepth: 'WE_VERIFY_RELATED_DEPTH' };
+      relatedMaxTests: 'WE_VERIFY_RELATED_MAX_TESTS', relatedDepth: 'WE_VERIFY_RELATED_DEPTH', alwaysRunTests: 'WE_VERIFY_ALWAYS_RUN_TESTS' };
     const overrides = Object.fromEntries([...env.matchAll(/<key>([^<]+)<\/key>\s*<string>([^<]*)<\/string>/g)]
       .map(([, key, value]) => [key, value]));
     for (const [key, value] of Object.entries(settings)) {
       expect(keys[key], `unmapped setting ${key}`).toBeDefined();
-      const serialized = typeof value === 'boolean' ? (value ? '1' : '0') : String(value);
+      const serialized = typeof value === 'boolean' ? (value ? '1' : '0') : Array.isArray(value) ? value.join(',') : String(value);
       expect(overrides[keys[key]], key).not.toBe(serialized);
     }
   });
