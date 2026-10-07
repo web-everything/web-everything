@@ -2656,4 +2656,86 @@ describe('#76c reviewer rulings stand across heads', () => {
       expect(new Set(state.blockedFindings.map((x) => x.findingId)).size).toBe(1);
     }
   });
+
+  it('a clearance on a head that also held a block on the identity is never carried onto a later head, in either record order', () => {
+    for (const order of [['block', 'not-real'], ['not-real', 'block']]) {
+      const a = rec(H('1'), 'a', [race[0]], [[0, order[0]]]);
+      const b = rec(H('1'), 'b', [race[1]], [[0, order[1]]]);
+      const r2 = rec(H('2'), 'r2', [race[2]]);
+      expect(findCarriedReviewerRuling(r2.referrals[0], ctx([a, b, r2], H('2')))).toBeNull();
+      // A hand-built carry from the clearing record is refused at read time too: the head's block still stands.
+      const clearing = order[0] === 'not-real' ? a : b;
+      const forged = { ...r2, carried: [{ key: r2.referrals[0].key, reason: REFERRAL_CARRY_REASON, result: 'not-real',
+        from: { head: H('1'), runId: clearing.runId, key: clearing.referrals[0].key, rulingId: `${clearing.runId}:0` } }] };
+      expect(reviewerCarryBacking(forged.carried[0], { ...ctx([a, b, forged], H('2')), target: forged.referrals[0] })).toBeNull();
+      expect(stateOf([a, b, forged], H('2')).pending).toEqual([r2.referrals[0].key]);
+    }
+  });
+
+  it('two findings in ONE record sharing an identity: a block on one keeps the other\'s not-real from carrying', () => {
+    const r1 = rec(H('1'), 'r1', [race[0], race[1]], [[0, 'block'], [1, 'not-real']]);
+    const r2 = rec(H('2'), 'r2', [race[2]]);
+    expect(findCarriedReviewerRuling(r2.referrals[0], ctx([r1, r2], H('2')))).toBeNull();
+  });
+
+  it('a carry whose destination is not the source finding (other identity or severity) stays pending at read time', () => {
+    const unrelated = f(40, 'Locks are never released on error.', { file: 'scripts/other.mjs', quote: 'unlock()' });
+    const r1 = rec(H('1'), 'r1', [race[0]], [[0, 'not-real']]);
+    const from = { head: H('1'), runId: 'r1', key: r1.referrals[0].key, rulingId: 'r1:0' };
+    const dest = (finding) => {
+      const r2 = rec(H('2'), 'r2', [finding]);
+      return { ...r2, carried: [{ key: r2.referrals[0].key, reason: REFERRAL_CARRY_REASON, result: 'not-real', from }] };
+    };
+    // Control: the same wording-family destination with the same severity is honored.
+    const ok = dest(race[1]);
+    expect(stateOf([r1, ok], H('2')).pending).toEqual([]);
+    for (const wrong of [unrelated, f(133, race[1].summary, { impactIfUnfixed: 'unrecoverable' })]) {
+      const r2c = dest(wrong);
+      expect(validateReferralRecord(r2c)).toBe(true);
+      expect(reviewerCarryBacking(r2c.carried[0], { ...ctx([r1, r2c], H('2')), target: r2c.referrals[0] })).toBeNull();
+      expect(stateOf([r1, r2c], H('2')).pending).toEqual([r2c.referrals[0].key]);
+    }
+  });
+
+  it('an OPERATOR carry entry naming a different finding than its source stays pending at read time too', () => {
+    const unrelated = f(40, 'Locks are never released on error.', { file: 'scripts/other.mjs', quote: 'unlock()' });
+    const r1 = rec(H('1'), 'r1', [race[0]]);
+    const operatorRulings = [{ operator: true, repo: REPO, pr: 4017, head: H('1'), runId: 'r1', key: r1.referrals[0].key, result: 'not-real' }];
+    const dest = (finding) => {
+      const r2 = rec(H('2'), 'r2', [finding]);
+      return { ...r2, carried: [{ key: r2.referrals[0].key, reason: REFERRAL_CARRY_REASON, result: 'not-real',
+        from: { head: H('1'), runId: 'r1', key: r1.referrals[0].key } }] };
+    };
+    const pendingOf = (r2c) => referralRecordState(r2c, { ...ctx([r1, r2c], H('2')), operatorRulings }).pending;
+    const ok = dest(race[0]);
+    expect(pendingOf(ok)).toEqual([]);
+    const bad = dest(unrelated);
+    expect(validateReferralRecord(bad)).toBe(true);
+    expect(pendingOf(bad)).toEqual([bad.referrals[0].key]);
+  });
+
+  it('a declared sameAs wording never inherits a reviewer ruling (a link only ever tightens)', () => {
+    const r1 = rec(H('1'), 'r1', [race[0]], [[0, 'not-real']]);
+    const id = findingIdentityTable([r1])[0].findingId;
+    const linked = f(133, 'Held cards can be filed twice by overlapping runs.', { quote: undefined });
+    const r2 = rec(H('2'), 'r2', [linked]);
+    r2.referrals[0].sameAs = id;
+    expect(findingIdentityTable([r1, r2])).toHaveLength(1);                   // the link binds them for blocks…
+    expect(findCarriedReviewerRuling(r2.referrals[0], ctx([r1, r2], H('2')))).toBeNull(); // …never for a clearance
+  });
+
+  it('a carry loses its backing when the source ruling is superseded or its card differs', () => {
+    const card = 'we:backlog/5000-race.md';
+    const r1 = rec(H('1'), 'r1', [race[0]], [[0, 'card', card]]);
+    const r2 = rec(H('2'), 'r2', [race[1]]);
+    const m = findCarriedReviewerRuling(r2.referrals[0], ctx([r1, r2], H('2')));
+    const entry = carriedEntry(m, r2.referrals[0].key);
+    const t = { target: r2.referrals[0] };
+    expect(reviewerCarryBacking(entry, { ...ctx([r1, r2], H('2')), ...t })).not.toBeNull();
+    expect(reviewerCarryBacking(entry, ctx([r1, r2], H('2')))).toBeNull();            // no destination: fails closed
+    expect(reviewerCarryBacking({ ...entry, card: 'we:backlog/5001-other.md' }, { ...ctx([r1, r2], H('2')), ...t })).toBeNull();
+    const superseding = { ...r1, rulings: [...r1.rulings, { ...r1.rulings[0], id: 'r1:1', result: 'not-real', card: undefined, supersedes: ['r1:0'] }] };
+    expect(validateReferralRecord(superseding)).toBe(true);
+    expect(reviewerCarryBacking(entry, { ...ctx([superseding, r2], H('2')), ...t })).toBeNull();
+  });
 });

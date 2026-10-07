@@ -2682,6 +2682,21 @@ export function carriedBackingHolds(carried, { repo, pr, operatorRulings = [] })
   return backing && backing.result === carried.result && backing.card === carried.card ? backing : null;
 }
 
+/**
+ * The gate's read-time check of an operator `carried` entry: the backing ruling still holds ({@link carriedBackingHolds})
+ * AND, when the source record is readable, the destination is the same finding the sink matched on
+ * ({@link sameFindingForClearing}) — a carry entry cannot name an unrelated finding. Without the source record there
+ * is nothing to compare, so only the backing is checked (the sink proved the match when it wrote the entry).
+ */
+function operatorCarryBacking(carried, target, { repo, pr, operatorRulings, records }) {
+  const backing = carriedBackingHolds(carried, { repo, pr, operatorRulings });
+  if (!backing) return null;
+  const source = (Array.isArray(records) ? records : []).find(r => r.head === carried.from.head
+    && r.runId === carried.from.runId && r.repo === repo && r.pr === pr);
+  const from = source?.referrals.find(x => x.key === carried.from.key);
+  return source && (!from || !sameFindingForClearing(from.finding, target.finding)) ? null : backing;
+}
+
 /** Latest matching operator decision on an earlier head; the IO caller must prove unchanged cited lines. */
 export function findCarriedOperatorRuling(referral, { records = [], operatorRulings = [], head, repo, pr }) {
   const target = referral.finding;
@@ -2713,7 +2728,7 @@ export function findCarriedOperatorRuling(referral, { records = [], operatorRuli
  * it; and no `block` has been ruled on the finding's id since — in a later record or by the operator. ONE definition
  * for the gate (`referralRecordState`) and the sink (`findCarriedReviewerRuling`), so they cannot disagree. PURE.
  */
-export function reviewerCarryBacking(carried, { records = [], operatorRulings = [], repo, pr, identityTable = null, ...options } = {}) {
+export function reviewerCarryBacking(carried, { records = [], operatorRulings = [], repo, pr, identityTable = null, target, ...options } = {}) {
   const from = carried?.from;
   if (!from || typeof from.rulingId !== 'string' || !['not-real', 'card'].includes(carried.result)) return null;
   const list = Array.isArray(records) ? records : [];
@@ -2721,6 +2736,15 @@ export function reviewerCarryBacking(carried, { records = [], operatorRulings = 
   const source = list[index];
   const ruling = source?.rulings.find(x => x.id === from.rulingId && x.key === from.key);
   if (!ruling || ruling.result !== carried.result || (ruling.result === 'card' && ruling.card !== carried.card)) return null;
+  // The carry must be for the SAME finding it stands on: the destination (`target`, the referral the carry is on —
+  // required, so a caller that forgets it fails closed) shares the source finding's deterministic identity and
+  // severity. The sink only ever writes such a carry; this holds a hand-built or buggy one to the same rule.
+  const sourceFinding = source.referrals.find(f => f.key === from.key);
+  const destIdentity = target ? normalizeFindingIdentity(target.original ?? target.finding) : null;
+  const sourceIdentity = sourceFinding ? normalizeFindingIdentity(sourceFinding.original ?? sourceFinding.finding) : null;
+  if (!destIdentity || !sourceIdentity || (carried.key !== undefined && target.key !== carried.key)
+    || !sameFindingIdentity(sourceIdentity, destIdentity)
+    || !CARRY_SEVERITY_FIELDS.every(k => sourceFinding.finding[k] === target.finding[k])) return null;
   if (source.rulings.some(x => supersededRulings(x).includes(ruling.id))) return null;
   // Counted on ITS OWN head, without recursing into the source's own carries or links.
   const own = referralRecordState({ ...source, carried: undefined }, { ...options, head: source.head, records: [],
@@ -2730,10 +2754,13 @@ export function reviewerCarryBacking(carried, { records = [], operatorRulings = 
   const id = findingIdOf(table, { head: source.head, runId: source.runId, key: from.key });
   if (!id) return null;
   const sameId = (head, runId, key) => findingIdOf(table, { head, runId, key }) === id;
-  for (const later of list.slice(index + 1)) {
-    if (later.repo !== repo || later.pr !== pr) continue;
-    if (later.referrals.some(f => sameId(later.head, later.runId, f.key)
-      && later.rulings.some(x => x.key === f.key && x.result === 'block'))) return null;
+  // A block anywhere on the SOURCE head (an earlier record, the source record itself, another key sharing the id) or
+  // in any later record holds the finding: two counted rulings that disagree on one head resolve to the block, so
+  // the clearance never stood on that head and cannot be carried off it.
+  for (const [at, other] of list.entries()) {
+    if (other.repo !== repo || other.pr !== pr || (at < index && other.head !== source.head)) continue;
+    if (other.referrals.some(f => sameId(other.head, other.runId, f.key)
+      && other.rulings.some(x => x.key === f.key && x.result === 'block'))) return null;
   }
   if ((Array.isArray(operatorRulings) ? operatorRulings : []).some(o => o.repo === repo && o.pr === pr
     && o.result === 'block' && sameId(o.head, o.runId, o.key))) return null;
@@ -2761,7 +2788,7 @@ export function findCarriedReviewerRuling(referral, { records = [], operatorRuli
         || !CARRY_SEVERITY_FIELDS.every(k => g.finding[k] === referral.finding[k])) return null;
       const entry = { result: ruling.result, ...(ruling.card ? { card: ruling.card } : {}),
         from: { head: r.head, runId: r.runId, key: ruling.key, rulingId: ruling.id } };
-      return reviewerCarryBacking(entry, { ...options, records: list, operatorRulings, repo, pr, identityTable })
+      return reviewerCarryBacking(entry, { ...options, records: list, operatorRulings, repo, pr, identityTable, target: referral })
         ? { ...entry, finding: g.finding } : null;
     }
   }
@@ -2888,8 +2915,8 @@ export function referralRecordState(record, options = {}) {
     if (carried) {
       const backing = carried.from.rulingId !== undefined
         ? reviewerCarryBacking(carried, { repo: record.repo, pr: record.pr, operatorRulings, records, identityTable,
-          body, createdAt, cardReadable, stampPolicy, seatDisabled })
-        : carriedBackingHolds(carried, { repo: record.repo, pr: record.pr, operatorRulings });
+          target: f, body, createdAt, cardReadable, stampPolicy, seatDisabled })
+        : operatorCarryBacking(carried, f, { repo: record.repo, pr: record.pr, operatorRulings, records });
       if (head !== record.head || !backing
         || (carried.result === 'card' && !cardReadable(carried.card))) pending.push(f.key);
       else { rulings.push(backing); if (carried.result === 'block') blocked.push(f.key); }
