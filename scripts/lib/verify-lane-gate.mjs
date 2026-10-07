@@ -36,7 +36,8 @@
  * does not need the vitest half's SHRINK_ALLOW_LIST/sensitive-surface gauntlet. It only needs to stay unscoped
  * for the two surfaces that gauntlet can't help with anyway:
  *   - `backlog/` — the stranded-hash false-red symptom (#3368's landing) reads `origin/main` directly, independent
- *     of the lane's own diff; a lane that itself touches `backlog/` keeps the unscoped run as an extra margin.
+ *     of the lane's own diff; a lane that touches `backlog/` keeps the unscoped run as an extra margin, EXCEPT a code
+ *     PR whose only backlog file is its own card (one added/edited `backlog/<name>.md` plus code; perf card 5).
  *   - a gate-self/policy-core path (`isGateSelfPath`/`isPolicyCorePath`, `gate-config.mjs`) — the gate's own
  *     trust chain must always see the unscoped whole-repo signal on a change to itself.
  * See {@link canScopeCheckStandards}.
@@ -148,9 +149,28 @@ function isBacklogPath(path) {
  * @param {string[]|null} changedFiles
  * @returns {boolean}
  */
-export function canScopeCheckStandards(changedFiles) {
+export function canScopeCheckStandards(changedFiles, deletedFiles = []) {
   if (!Array.isArray(changedFiles) || changedFiles.length === 0) return false;
-  return !changedFiles.some((f) => isBacklogPath(f) || isPolicyCorePath(f));
+  if (changedFiles.some(isPolicyCorePath)) return false;
+  const backlogFiles = changedFiles.filter(isBacklogPath);
+  if (backlogFiles.length === 0) return true;
+  return isOwnCardOnly(changedFiles, backlogFiles, deletedFiles);
+}
+
+/**
+ * A code PR whose ONLY `backlog/` file is its own card keeps the scoped run (perf card 5). "Own card" = exactly one
+ * changed `backlog/<name>.md`, added or edited (never deleted or in a subdirectory), next to at least one non-backlog
+ * file. That card is in `--files`, so its file-attributed checks (and the scoped backlog load) still run on it; the
+ * path-less backlog checks that read `origin/main` (stranded hashes, duplicate NNN, hand-numbered items) are demoted to
+ * notes under `--local` whether or not a card changed, and CI runs them unscoped. A card-only diff (no non-backlog
+ * file) and any diff with two or more backlog files keep the unscoped run, exactly as before.
+ */
+function isOwnCardOnly(changedFiles, backlogFiles, deletedFiles) {
+  if (backlogFiles.length !== 1) return false;
+  const [card] = backlogFiles;
+  if (!/^backlog\/[^/]+\.md$/.test(card)) return false;
+  if ((deletedFiles || []).includes(card)) return false;
+  return changedFiles.some((f) => !isBacklogPath(f) && !isAllowlistedLitterPath(f));
 }
 
 // #verify-standards-auto — local policy; unknown settings preserve the existing gate.
@@ -223,8 +243,8 @@ export function standardsRelevantPath(path) {
     || isPolicyCorePath(path);
 }
 
-export function decideStandardsHalf({ policy, changedFiles }) {
-  const scoped = canScopeCheckStandards(changedFiles);
+export function decideStandardsHalf({ policy, changedFiles, deletedFiles = [] }) {
+  const scoped = canScopeCheckStandards(changedFiles, deletedFiles);
   if (changedFiles?.some(isPolicyCorePath)) {
     return { policy, run: true, scoped: false, reason: 'gate-self/policy-core path — unscoped run kept' };
   }
@@ -280,7 +300,7 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
   const timeoutFlags = scaledTimeoutFlags(testTimeoutFactor);
   const diff = localChangedSet({ base, runGit });
   const changedFiles = diff ? diff.changedFiles : null;
-  const standards = decideStandardsHalf({ policy: settings.standards, changedFiles });
+  const standards = decideStandardsHalf({ policy: settings.standards, changedFiles, deletedFiles: diff?.deletedFiles ?? [] });
   const optOut = String(env?.[SELECTION_FLAG] ?? '') === '0';
   // #4540: only untracked allowlist matches are scratch; tracked names remain real inputs.
   // Keep the original diff for standards scoping and diagnostics.

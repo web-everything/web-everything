@@ -195,6 +195,17 @@ describe('resolveDefaultGate (xpnhz4o) — the LOCAL gate runs only the diff-sel
     for (const spec of ['*.test.ts', '*.test.tsx', '*.test.jsx', '*.test.mjs', '*.test.cjs', '*.test.cts']) expect(seen).toContain(spec);
   });
 
+  it('perf card 5: a code PR plus ONLY its own card keeps check:standards SCOPED (card included in --files)', () => {
+    const { command, decision } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['scripts/tool.mjs', 'backlog/100-example.md']), env: TODAY });
+    expect(decision.standards.scoped).toBe(true);
+    expect(command).toContain("npm run check:standards -- --local --files='backlog/100-example.md,scripts/tool.mjs'");
+  });
+
+  it('perf card 5: a code PR touching two cards keeps check:standards UNSCOPED', () => {
+    const { command } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['scripts/tool.mjs', 'backlog/100-a.md', 'backlog/101-b.md']), env: TODAY });
+    expect(command).toMatch(/npm run check:standards$/);
+  });
+
   it('a backlog/ card selects for vitest but keeps check:standards UNSCOPED (the #1937/#3395 margin), and never greps ~140 fixture tests for `backlog`', () => {
     const { command, decision } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['backlog/100-example.md'], { grepHits: { backlog: ['x.test.mjs'] } }), env: TODAY });
     expect(decision.mode).toBe('shrink');
@@ -318,12 +329,27 @@ describe('canScopeCheckStandards (#3395) — the check:standards-scoping predica
     expect(canScopeCheckStandards([])).toBe(false);
   });
 
-  it('is false when any changed file is under backlog/', () => {
-    expect(canScopeCheckStandards(['docs/readme.md', 'backlog/100-example.md'])).toBe(false);
+  it('is false when the changed files include backlog/ beyond one own card', () => {
+    expect(canScopeCheckStandards(['docs/readme.md', 'backlog/100-example.md', 'backlog/101-other.md'])).toBe(false);
+    expect(canScopeCheckStandards(['backlog/100-example.md'])).toBe(false);
   });
 
   it('is false when any changed file is a gate-self/policy-core path', () => {
     expect(canScopeCheckStandards(['scripts/lib/review-escalation.mjs'])).toBe(false);
+  });
+
+  it('perf card 5: a code PR whose ONLY backlog file is its own card may scope', () => {
+    expect(canScopeCheckStandards(['scripts/lib/x.mjs', 'backlog/100-own-card.md'])).toBe(true);
+    expect(canScopeCheckStandards(['scripts/lib/__tests__/x.test.mjs', 'scripts/lib/x.mjs', 'backlog/zz9-own-card.md'])).toBe(true);
+  });
+
+  it('perf card 5: every other backlog shape keeps the unscoped run', () => {
+    expect(canScopeCheckStandards(['backlog/100-a.md'])).toBe(false); // card-only: no code file
+    expect(canScopeCheckStandards(['scripts/x.mjs', 'backlog/100-a.md', 'backlog/101-b.md'])).toBe(false); // two cards
+    expect(canScopeCheckStandards(['scripts/x.mjs', 'backlog/100-a.md'], ['backlog/100-a.md'])).toBe(false); // card deleted
+    expect(canScopeCheckStandards(['scripts/x.mjs', 'backlog/sub/100-a.md'])).toBe(false); // not a top-level card
+    expect(canScopeCheckStandards(['scripts/x.mjs', 'backlog/notes.txt'])).toBe(false); // not a card file
+    expect(canScopeCheckStandards(['scripts/lib/review-escalation.mjs', 'backlog/100-a.md'])).toBe(false); // policy-core still wins
   });
 
   it('is true for a non-empty changed set touching neither surface, even a blast-radius `scripts/` path outside the policy-core roster', () => {
