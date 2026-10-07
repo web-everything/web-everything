@@ -267,6 +267,13 @@ describe('planStatusLabelChange', () => {
   });
 });
 
+describe('describeReviewState — preserved draft-withdrawn', () => {
+  it('reports draft-withdrawn instead of null when only that label is present', () => {
+    expect(describeReviewState({ labels: ['review-status:draft-withdrawn'], status: null }))
+      .toEqual({ code: 'draft-withdrawn', text: 'draft withdrawn' });
+  });
+});
+
 describe('describeReviewState — one plain state instead of contradictory raw labels (#4967)', () => {
   const both = ['review:changes', 'review:human'];
 
