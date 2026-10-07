@@ -36,6 +36,7 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { laneGitConfigArgs, laneGitHardeningEnv, laneFilterDrivers, LANE_CONFIG_LIST_ARGS } from '../lib/lane-git-hardening.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { readFixDispatchClaim } from './fix-claim-store.mjs';
+import { AGENT_GONE_STATES } from './lease-reaper.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -177,6 +178,16 @@ export function claimBindingRefusal({ repo, pr, ref, sessionId, readClaim }) {
 }
 
 const BUSY = new Set(['working', 'running', 'busy', 'starting']);
+/**
+ * Is the session mid-turn? A live background session whose turn ENDED lists as `state:'working', status:'idle'`
+ * (found live 2026-10-07 on fix-4151: the pass pushed its green, then deferred the resume forever as "busy").
+ * `status` is the turn signal when present; `state` only for rows without one. Pure.
+ */
+export function isSessionBusy(session) {
+  const status = String(session?.status ?? '').toLowerCase();
+  if (status) return status !== 'idle';
+  return BUSY.has(String(session?.state ?? '').toLowerCase());
+}
 /** Records already acted on to completion whose store entry could not be deleted (see `clearOrNote`). */
 const UNCLEARABLE_DONE = new Set();
 
@@ -255,7 +266,7 @@ export async function runAwaitVerifyPass({
         row.result = `${row.result ? `${row.result}; ` : ''}session-gone`;
         rows.push(row); continue;
       }
-      if (BUSY.has(String(session.state ?? '').toLowerCase())) { row.result = row.result ?? 'session-busy'; rows.push(row); continue; }
+      if (isSessionBusy(session)) { row.result = row.result ?? 'session-busy'; rows.push(row); continue; }
       const prompt = buildAwaitVerifyResumePrompt({
         kind: record.pendingResume.kind, record, marker: record.pendingResume.marker ?? marker, detail: record.pendingResume.detail,
       });
@@ -291,6 +302,7 @@ export function formatAwaitVerifyLines(result) {
 }
 
 // ── IO shell ───────────────────────────────────────────────────────────────────────────────────────────────
+const pidAlive = (pid) => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } };
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 /** `https://github.com/<owner>/<repo>/pull/<n>` → `https://github.com/<owner>/<repo>.git`; null for anything else. */
@@ -345,6 +357,7 @@ export function pushShaFromScratch({ laneGitDir, url, sha, ref, exec = execFileS
 export async function defaultAwaitVerifyIo({
   weRoot = ROOT, exec = execFileSync, env = process.env, sleep = sleepSync,
   dispatchIo = null, stopSessionFn = null, pushRefusalFn = null, readClaimFn = null, poolRoot = null, realpath = realpathSync,
+  pidAliveFn = pidAlive,
 } = {}) {
   /** The lane pool the daemon acts in. A record's `lane` is agent-typed, so a path outside the pool is never touched. */
   const lanePoolRoot = poolRoot ?? defaultPoolRoot(weRoot, env);
@@ -471,13 +484,49 @@ export async function defaultAwaitVerifyIo({
     },
     listSessions: () => io.defaultListAgents({ all: true, env }),
     resume: ({ session, prompt }) => {
+      // Every read this port makes of the session list is UNCACHED: the 20s agents cache would otherwise show a
+      // pre-stop / pre-spawn row and misjudge both the exit wait and the resume confirmation.
+      const liveEnv = { ...env, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' };
+      // A background session whose turn ended is still a live process, and `--bg --resume` on a live session
+      // "starts a copy" instead of continuing it (found live 2026-10-07: two forked copies, no resume). Stop the
+      // idle process first; `--resume` then wakes the SAME id. The pass never gets here for a busy session.
+      // A gone session (the reaper's own AGENT_GONE_STATES: done/failed/stopped) has no process to stop or wait on.
+      const isGone = (row) => AGENT_GONE_STATES.has(String(row?.state ?? '').toLowerCase());
+      if (!isGone(session)) {
+        // `claude stop` takes the SHORT job id; a full session uuid answers "No job matching" (read as already
+        // gone) and leaves the process running, so the resume forked again (found live 2026-10-07, fix-4151).
+        const handle = session.id || String(session.sessionId).slice(0, 8);
+        // Only a background dispatch is ever stopped: an operator's own terminal session (`kind:'interactive'`) is
+        // never ours to kill. STRICT, like the session reaper's guard: a row must positively say `kind:'background'`,
+        // so a missing or empty kind fails closed, and the freshly-read row is held to the same rule below.
+        const notBackground = (row) => ({ resumed: false, reason: `stop-before-resume: ${row?.kind || 'unknown-kind'} session is not a background dispatch` });
+        if (session.kind !== 'background') return notBackground(session);
+        // This session's row right now, read UNCACHED (the 20s agents cache would hand back the very row the pass
+        // already judged): the row, null when it is not listed, or undefined when the list cannot be read.
+        const liveRow = () => { try { return io.defaultListAgents({ all: true, env: liveEnv }).find((s) => s?.sessionId === session.sessionId) ?? null; } catch { return undefined; } };
+        // The pass saw it idle a moment ago; a new turn since then must not be killed mid-flight. An unreadable list
+        // cannot show that, so it refuses too (the next tick retries).
+        const before = liveRow();
+        if (before === undefined) return { resumed: false, reason: 'stop-before-resume: session list unreadable' };
+        if (before && before.kind !== 'background') return notBackground(before);
+        if (before && isSessionBusy(before)) return { resumed: false, reason: 'stop-before-resume: session started a new turn' };
+        try { stopSession({ handle }); } catch (e) { return { resumed: false, reason: `stop-before-resume: ${String(e?.message ?? e).split('\n')[0]}` }; }
+        // With a known pid, the process itself is the exit signal. Without one (a swallowed "No job matching"
+        // looks the same), only a row that EXPLICITLY lists a gone state (done/failed/stopped) counts: an unreadable
+        // list or a missing row is "unknown", never "exited".
+        const knownPid = Number.isInteger(session.pid) && session.pid > 0;
+        const exited = () => (knownPid ? !pidAliveFn(session.pid) : isGone(liveRow()));
+        for (let i = 0; i < 20 && !exited(); i += 1) sleep(500);
+        if (!exited()) return { resumed: false, reason: 'stop-before-resume: process still alive' };
+        sleep(1_000);
+      }
       const argv = io.buildAgentArgv({ payload: { prompt }, resumeSessionId: session.sessionId });
       let stdout = '';
       try { stdout = String(io.defaultSpawnAgent(argv, { cwd: session.cwd }) ?? ''); } catch (e) { return { resumed: false, reason: String(e?.message ?? e).split('\n')[0] }; }
       const printedId = io.parseBackgroundedId(stdout);
       let outcome = { resumed: false };
       for (let attempt = 1; attempt <= 3; attempt += 1) {
-        outcome = io.resumeSucceeded({ printedId, requestedSessionId: session.sessionId, agentsAfter: io.defaultListAgents({ all: true, env }) });
+        outcome = io.resumeSucceeded({ printedId, requestedSessionId: session.sessionId, agentsAfter: io.defaultListAgents({ all: true, env: liveEnv }) });
         if (outcome.resumed || attempt === 3) break;
         sleep(2_000);
       }
