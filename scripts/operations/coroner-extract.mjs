@@ -366,7 +366,7 @@ export function parseBuildTicks(lines) {
   return out;
 }
 
-export function buildErrorRates({ window, notes = {}, gateRuns, killed, waitTimeouts, fixSessions, ciRuns, buildTicks, daemonEntries }) {
+export function buildErrorRates({ window, notes = {}, prsOpened = [], cutoff, gateRuns, killed, waitTimeouts, fixSessions, ciRuns, buildTicks, daemonEntries }) {
   const gateItems = [
     ...gateRuns.filter((g) => g.red).map((g) => ({ cause: g.cause, ref: g.ref, at: g.at, ms: g.ms })),
     ...killed.map((k) => ({ cause: 'killed-superseded', ref: k.ref, at: k.at })),
@@ -383,8 +383,59 @@ export function buildErrorRates({ window, notes = {}, gateRuns, killed, waitTime
     fixSessions: { ...fixOutcomes, rounds: { prs: roundList.length, multiRoundPrs: roundList.filter((r) => r.rounds > 1).length, max: roundList[0]?.rounds ?? 0, top: roundList.slice(0, 5) } },
     builderLaunches: builderMetrics(buildTicks, window),
     daemonErrors: daemonMetrics(daemonEntries),
+    mergeConflicts: conflictMetrics(conflictEvents(daemonEntries, fixSessions), prsOpened, window, cutoff),
     notes: { ciRunsTruncated: Boolean(notes.ciRunsTruncated), verifyLogUnstampedLines: notes.verifyUnstamped ?? 0, verifyLogUnstampedSuperseded: notes.verifyUnstampedSuperseded ?? 0, note: 'lines with no preceding timestamp (before #4076) cannot be placed in the window and are excluded' },
   };
+}
+
+/** Operator-reported date scoping was tightened (2026-10-06 ~15:00 ET); conflicts are reported before/after it. */
+export const SCOPING_CUTOFF = '2026-10-06T19:00:00.000Z';
+const CONFLICT_EVENTS = [
+  ['mechanical-rebase', /unowned-mechanical-rebase|stacked-rebase|rebase-onto-main|rebase-cap-exhausted/],
+  ['conflict-fix-round', /dispatch-conflict-fix|fixing-conflict|escalated-conflict|conflictFixRoundsSpent|conflict-resolution/],
+  ['drain-overlap-yield', /overlap-yield/],
+  ['scope-overlap-wait', /scope-overlap/],
+];
+/** Merge-conflict events from stamped daemon lines, conflict-fix sessions, and newly CONFLICTING PRs. */
+export function conflictEvents(daemonEntries, fixSessions) {
+  const items = [];
+  for (const e of daemonEntries) {
+    for (const m of e.line.matchAll(/"num":(\d+),"isConflicting":true[^}]*?"newlyDetected":true/g)) items.push({ cause: 'newly-conflicting-pr', ref: `PR #${m[1]}`, at: e.at });
+    const hit = CONFLICT_EVENTS.find(([, pattern]) => pattern.test(e.line));
+    if (hit) items.push({ cause: hit[0], ref: e.line.match(/PR #(\d+)|#(\d{3,})|fix-(\d+)/)?.slice(1).find(Boolean)?.replace(/^/, 'PR #') ?? e.source, at: e.at });
+  }
+  for (const f of fixSessions) if (f.conflict) items.push({ cause: 'conflict-fix-session', ref: f.pr ? `PR #${f.pr}` : `session ${f.session}`, at: f.at, ms: f.ms });
+  return items;
+}
+export function conflictMetrics(items, prsOpened, window, cutoff = SCOPING_CUTOFF) {
+  const part = (from, to) => {
+    const w = { since: from, until: to };
+    const opened = prsOpened.filter((p) => inWindow(p.createdAt, w)).length;
+    const mine = items.filter((i) => inWindow(i.at, w));
+    const hours = round((stamp(to) - stamp(from)) / 3600000, 1);
+    return { window: w, hours, ...rateMetric(mine, opened, 'PRs opened in the period (events can exceed PRs)', { prsOpened: opened, eventsPerPr: opened ? round(mine.length / opened, 2) : 0, minutes: minutes(sum(mine.map((i) => Number.isFinite(i.ms) ? i.ms : 0))) }) };
+  };
+  const cut = new Date(cutoff).toISOString();
+  const beforeEnd = stamp(window.until) < stamp(cut) ? window.until : cut, afterStart = stamp(window.since) > stamp(cut) ? window.since : cut;
+  return {
+    ...part(window.since, window.until),
+    beforeAfter: { cutoff: cut, before: stamp(window.since) < stamp(beforeEnd) ? part(window.since, beforeEnd) : null, after: stamp(afterStart) < stamp(window.until) ? part(afterStart, window.until) : null },
+  };
+}
+
+/** Bounded gh read of PRs opened in the window (<= 5 pages, newest first). */
+export function fetchOpenedPrs(window, gh, { repo = 'web-everything/web-everything', maxPages = 5 } = {}) {
+  const out = [];
+  if (typeof gh !== 'function') return { prs: out, found: false };
+  let found = false;
+  for (let page = 1; page <= maxPages; page++) {
+    const data = gh(['api', `repos/${repo}/pulls?state=all&sort=created&direction=desc&per_page=100&page=${page}`]);
+    if (!Array.isArray(data)) break;
+    found = true;
+    for (const p of data) if (p?.created_at) out.push({ number: p.number, createdAt: p.created_at });
+    if (data.length < 100 || stamp(data.at(-1)?.created_at) < stamp(window.since)) break;
+  }
+  return { prs: out.filter((p) => inWindow(p.createdAt, window)), found };
 }
 
 /** gh runner: JSON or null on any failure. Stderr is dropped so no credential text can leak into a report. */
@@ -414,7 +465,7 @@ export function fetchCiRuns(window, gh, { repo = 'web-everything/web-everything'
 }
 
 /** Pure metrics core. Input arrays may be unordered; sources and all maps are sorted. */
-export function extractMetrics({ window, sessions = [], durations = [], reaped = [], markers = [], verifyLines = [], refusalLines = [], ciRuns = [], buildTicks = [], buildLines = [], daemonLogs = {}, sources = {} }) {
+export function extractMetrics({ window, sessions = [], durations = [], reaped = [], markers = [], verifyLines = [], refusalLines = [], ciRuns = [], prsOpened = [], buildTicks = [], buildLines = [], daemonLogs = {}, sources = {} }) {
   const selected = sessions.filter(({ state }) => inWindow(state.createdAt || state.updatedAt, window))
     .sort((a, b) => compare(a.state.sessionId ?? a.state.name ?? '', b.state.sessionId ?? b.state.name ?? '') || compare(JSON.stringify(a), JSON.stringify(b)));
   const byKind = new Map(), outcomes = new Map(), prs = new Map(), denials = new Map(), holds = new Map(), reasons = new Map(), refusals = new Map(), refusalPrs = new Map();
@@ -433,7 +484,7 @@ export function extractMetrics({ window, sessions = [], durations = [], reaped =
     const group = byKind.get(kind) ?? []; group.push(ms); byKind.set(kind, group);
     if (pr !== null) { const group = prs.get(pr) ?? []; group.push(ms); prs.set(pr, group); }
     gates.push(...parsed.gates);
-    if (FIX_KINDS.has(kind)) fixSessions.push({ session, pr, outcome: fixOutcome(state, parsed.outcomeLine), at: state.lastTerminalAt || state.updatedAt || state.createdAt, ms });
+    if (FIX_KINDS.has(kind)) fixSessions.push({ session, pr, conflict: /conflict|rebase|merged? main/i.test(`${state.detail ?? ''} ${parsed.outcomeLine}`), outcome: fixOutcome(state, parsed.outcomeLine), at: state.lastTerminalAt || state.updatedAt || state.createdAt, ms });
     for (const g of parsed.gates) if (g.waitTimeout) waitTimeoutItems.push({ cause: 'verify-wait-timeout', ref: `session ${session}`, at: g.at, ms: g.ms ?? 0 });
     if (parsed.gates.some((g) => g.waitTimeout)) waitTimeoutSessions++;
     for (const [type, count] of Object.entries(parsed.denials)) add(denials, type, count);
@@ -489,7 +540,7 @@ export function extractMetrics({ window, sessions = [], durations = [], reaped =
   const stampedVerify = stampedEntries(verifyLines, 'verify-daemon', window);
   const killed = stampedVerify.entries.filter((e) => /superseded by a newer request/.test(e.line)).map((e) => ({ ref: e.line.match(/web-everything\/lane-\d+/)?.[0] ?? 'verify-daemon', at: e.at }));
   const daemonEntries = [stampedVerify.entries, ...Object.entries({ 'build-dispatch': buildLines, ...daemonLogs }).sort(([a], [b]) => compare(a, b)).map(([source, lines]) => stampedEntries(lines, source, window).entries)].flat();
-  const errorRates = buildErrorRates({ window, notes: { ciRunsTruncated: sources.ci?.truncated, verifyUnstamped: stampedVerify.unattributed, verifyUnstampedSuperseded: stampedVerify.unanchored.filter((l) => /superseded by a newer request/.test(l)).length }, gateRuns, killed, waitTimeouts: waitTimeoutItems.filter((w) => inWindow(w.at, window)), fixSessions, ciRuns, buildTicks, daemonEntries });
+  const errorRates = buildErrorRates({ window, prsOpened, cutoff: sources.scopingCutoff, notes: { ciRunsTruncated: sources.ci?.truncated, verifyUnstamped: stampedVerify.unattributed, verifyUnstampedSuperseded: stampedVerify.unanchored.filter((l) => /superseded by a newer request/.test(l)).length }, gateRuns, killed, waitTimeouts: waitTimeoutItems.filter((w) => inWindow(w.at, window)), fixSessions, ciRuns, buildTicks, daemonEntries });
   return {
     window: { since: window.since, until: window.until },
     errorRates,
@@ -574,6 +625,9 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
   const buildAll = log('build-dispatch-daemon.log', join(paths.coord, 'build-dispatch-daemon.log'), { cap: positive(env.WE_CORONER_BUILD_TAIL, 48 * MiB), maxLine: 2 * MiB, olderToo: true });
   const buildTicks = parseBuildTicks(buildAll), buildLines = buildAll.filter((l) => l.indexOf('{"at"') < 0);
   const ci = fetchCiRuns(window, gh);
+  sources.scopingCutoff = env.WE_CORONER_SCOPING_CUTOFF || undefined;
+  const opened = fetchOpenedPrs(window, gh);
+  sources.openedPrs = { found: opened.found, count: opened.prs.length };
   sources.ci = { found: ci.found, count: ci.runs.length, ghCalls: ci.calls, truncated: ci.truncated };
   const ledger = (name) => { const data = read(join(paths.admission, `${name}.jsonl`)); const entries = rows(data.lines); sources[name] = { found: data.found, count: entries.length }; return entries; };
   const durations = ledger('durations'), reaped = ledger('reaped'), markers = [];
@@ -585,7 +639,7 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
       if (!data.truncated) markers.push(...parseMarkers(data.lines));
     }
   }
-  return { window, sessions, durations, reaped, markers, verifyLines, refusalLines, ciRuns: ci.runs, buildTicks, buildLines, daemonLogs, sources };
+  return { window, sessions, durations, reaped, markers, verifyLines, refusalLines, ciRuns: ci.runs, prsOpened: opened.prs, buildTicks, buildLines, daemonLogs, sources };
 }
 
 /** Flatten the same metrics into a compact two-column human table. */

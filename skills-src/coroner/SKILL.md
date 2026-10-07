@@ -31,6 +31,9 @@ node scripts/operations/coroner-extract.mjs --since=<ISO|last> --json > "$SCRATC
     `escalated`, `no-op`, `stopped-without-outcome`, `other`) plus `rounds` per PR.
   - `builderLaunches`: from the build-dispatch tick rows: `launched`, `launch-not-confirmed`, `failed`,
     `repeated-same-card`.
+  - `mergeConflicts`: conflict events per PR opened (newly CONFLICTING PRs, conflict-fix sessions and rounds, mechanical
+    rebases, drain overlap-yield and scope-overlap waits), with minutes and `beforeAfter` the scoping cutoff
+    (2026-10-06 19:00Z, override `WE_CORONER_SCOPING_CUTOFF`). Always state the before/after verdict.
   - `daemonErrors`: `smokeFailures`, `concurrentMover`, `tickInProgress`, `rateLimit`, `ghReadFailures`, by daemon.
     Log lines are attributed to the nearest preceding timestamp, and "(repeated N times ...)" lines are expanded.
   Where it exists, `minutes` is time lost (marker or session duration), which is what step 2 ranks on.

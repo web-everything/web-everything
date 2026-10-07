@@ -263,6 +263,7 @@ describe('coroner error rates (reported first)', () => {
     const jobs = { 1: ['test (2/4)'], 3: ['test (1/4)', 'smoke'], 5: ['soak shard 2'] };
     const calls = [];
     const gh = (args) => {
+      if (args[1].includes('/pulls?')) return [];
       calls.push(args[1]);
       const m = args[1].match(/runs\/(\d+)\/jobs/);
       if (m) return { jobs: (jobs[m[1]] ?? []).map((name) => ({ name, conclusion: 'failure' })) };
@@ -342,6 +343,26 @@ describe('coroner error rates (reported first)', () => {
     expect(d.rateLimit.count).toBe(2);
     expect(d.ghReadFailures.count).toBe(1);
     expect(d.ghReadFailures.causes).toHaveProperty('chalbert/web-everything');
+  });
+
+  it('merge conflicts: events per PR opened with minutes, before/after the scoping cutoff', () => {
+    env.WE_CORONER_SCOPING_CUTOFF = at(30);
+    write(join(env.WE_CORONER_DAEMON_DIR, 'fix-dispatch-daemon.log'), [
+      `${at(5)} {"checked":true,"results":[{"num":77,"isConflicting":true,"add":"merge-status:conflicting","remove":[],"newlyDetected":true},{"num":78,"isConflicting":true,"remove":[],"newlyDetected":false}]}`,
+      `${at(6)} reconcile: unowned-mechanical-rebase PR #77`,
+      `${at(7)} reconcile: scope-overlap with PR #12 — waiting`,
+      `${at(40)} fix-dispatch: dispatch-conflict-fix PR #90`,
+      `${at(41)} drain: overlap-yield-ready-at later`,
+    ].join('\n') + '\n');
+    job('a', 'fix-77', 12, { detail: 'PR 77 rebased onto main, conflict resolved', createdAt: at(10) });
+    const pulls = [{ number: 1, created_at: at(3) }, { number: 2, created_at: at(20) }, { number: 3, created_at: at(45) }, { number: 4, created_at: at(-60) }];
+    const c = run0((args) => args[1].includes('/pulls?') ? pulls : null).metrics.errorRates.mergeConflicts;
+    expect(c).toMatchObject({ count: 6, total: 3, prsOpened: 3, eventsPerPr: 2, minutes: 2 });
+    expect(Object.fromEntries(Object.entries(c.causes).map(([k, v]) => [k, v.count]))).toEqual({ 'conflict-fix-round': 1, 'conflict-fix-session': 1, 'drain-overlap-yield': 1, 'mechanical-rebase': 1, 'newly-conflicting-pr': 1, 'scope-overlap-wait': 1 });
+    expect(c.causes['newly-conflicting-pr'].examples).toEqual([{ ref: 'PR #77', at: at(5) }]);
+    expect(c.beforeAfter.cutoff).toBe(at(30));
+    expect(c.beforeAfter.before).toMatchObject({ count: 4, prsOpened: 2, hours: 0.5 });
+    expect(c.beforeAfter.after).toMatchObject({ count: 2, prsOpened: 1 });
   });
 
   it('rateMetric reports count, total, percent and two examples at most', () => {
