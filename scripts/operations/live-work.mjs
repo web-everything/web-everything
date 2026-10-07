@@ -94,6 +94,11 @@ export function sortRunning(rows) {
   });
 }
 
+/** `{repo, n}` of the lane a row's lease names, or null (no lease / lease without a lane number). */
+export function laneOf(lease) {
+  return Number.isInteger(lease?.lane) ? { repo: lease.repo ?? null, n: lease.lane } : null;
+}
+
 /** The work-item label a row's resolved card/PR reduces to — a card wins (it is the more specific target); a
  *  bare PR (no card mapped yet) still names the PR rather than falling back to nothing. */
 function workItemFor(card, pr) {
@@ -139,6 +144,7 @@ export function assessLiveWork(read) {
       lastActivityAt: typeof row.lastActivityAt === 'number'
         ? new Date(row.lastActivityAt).toISOString() : null,
       state, reason, transcriptPath: row.transcriptPath ?? null, joinVia, weak,
+      executor: row.runtime || 'claude', model: row.model ?? null, name: row.name ?? null, lane: laneOf(row.lease),
     });
   };
 
