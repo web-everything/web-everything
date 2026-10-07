@@ -230,7 +230,7 @@ export function createKeyContext({
     return vitestV;
   };
   let gitV;
-  const gitVersion = () => (gitV ??= (() => { try { return execFileSync('git', ['--version'], { encoding: 'utf8' }).trim(); } catch { return 'unknown'; } })());
+  const gitVersion = () => (gitV ??= (() => { try { return execFileSync('git', ['--version'], { encoding: 'utf8', maxBuffer: 1 << 20 }).trim(); } catch { return 'unknown'; } })());
 
   const toolchain = (tier) => [
     `node=${nodeVersion}`, `vitest=${vitestVer()}`, `platform=${platformName}/${archName}`,
