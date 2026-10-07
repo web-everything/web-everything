@@ -3,7 +3,7 @@
  * when a model is needed at all, the trailers, and the launch scorecard row.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -11,7 +11,7 @@ import {
   buildCheckerArgv, buildCiHealTask, buildDocFixCommitMessage, buildDocFixTask, buildHealCommitMessage,
   buildWorkerArgv, coAuthorTrailerForWorker, frontmatterTamperedBeyondClaim, healDiffPathsAllowed, healDiffWithinEnvelope,
   launchScorecardRow, newUntrackedPaths, parseCheckerVerdict, summarizeNumstat, workerNeeded,
-  PREPARE_OWNED_FRONTMATTER_KEYS, parseProposedBlockedBy, validateProposedBlockedBy,
+  BACKLOG_ID_SOURCE, PREPARE_OWNED_FRONTMATTER_KEYS, parseProposedBlockedBy, validateProposedBlockedBy,
 } from '../probation-launcher.mjs';
 import { PROVEN_TASK_ENVELOPES } from '../provider-routing.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
@@ -260,6 +260,43 @@ describe('prepare-owned keys and proposed blockedBy edges (ruling #4670)', () =>
     const raw = card('status: open') + '## Proposed blockedBy changes\n\n- add 12 — needs X (we:a.mjs:3)\n- remove #7 — stale (we:b.mjs:9)\nprose\n\n## Other\n- add 99 — ignored\n';
     expect(parseProposedBlockedBy(raw).map((e) => [e.op, e.target])).toEqual([['add', '12'], ['remove', '7']]);
     expect(parseProposedBlockedBy(card('status: open'))).toEqual([]);
+  });
+  it('parses alphanumeric ids', () => {
+    const lines = ['- add x2c7uas — needs X (we:a.mjs:3)', '* remove #xabc123 — stale (we:b.mjs:9)'];
+    expect(parseProposedBlockedBy(`## Proposed blockedBy changes\n${lines.join('\n')}\n`)).toEqual([
+      { op: 'add', target: 'x2c7uas', line: lines[0] },
+      { op: 'remove', target: 'xabc123', line: lines[1] },
+    ]);
+  });
+  it('validates and walks a graph with hash ids', () => {
+    const edges = parseProposedBlockedBy('## Proposed blockedBy changes\n- add x2c7uas — dependency (we:a:1)\n');
+    const graph = new Map([
+      ['4705', { status: 'open', blockedBy: [] }],
+      ['x2c7uas', { status: 'open', blockedBy: ['xabc123'] }],
+      ['xabc123', { status: 'open', blockedBy: ['4705'] }],
+    ]);
+    expect(validateProposedBlockedBy('4705', edges, graph)).toEqual([
+      'blockedBy cycle: #4705 → #x2c7uas → #xabc123 → #4705',
+    ]);
+    graph.get('xabc123').blockedBy = [];
+    expect(validateProposedBlockedBy('4705', edges, graph)).toEqual([]);
+    expect(validateProposedBlockedBy('x2c7uas', edges, graph)).toEqual(['#x2c7uas: an item cannot block itself']);
+  });
+  it('ignores ids outside the proposal section', () => {
+    const raw = card('status: open\nexample: "- add x2c7uas"')
+      + '## Design\n- add 4705 — prose example\n- add x2c7uas — example\nx2c7uas in prose\n'
+      + '## Proposed blockedBy changes\nNo changes; x2c7uas is only prose.\n'
+      + '## Data\n- remove 4705\n- add x2c7uas\n';
+    expect(parseProposedBlockedBy(raw)).toEqual([]);
+  });
+  it('id constant matches ITEM_REF_RX', () => {
+    const source = readFileSync('scripts/check-standards-rules.mjs', 'utf8');
+    const literal = /const ITEM_REF_RX = \/([^\n]+)\/;/.exec(source)?.[1];
+    expect(literal).toBe(`#(?:${BACKLOG_ID_SOURCE})\\b`);
+    const id = new RegExp(`^(?:${BACKLOG_ID_SOURCE})$`);
+    for (const valid of ['1', '4705', '99999', 'x2c7uas']) expect(id.test(valid)).toBe(true);
+    for (const invalid of ['123456', 'x2c7ua', 'x2c7uasq', 'abc123', 'x2C7uas']) expect(id.test(invalid)).toBe(false);
+    expect(parseProposedBlockedBy('## Proposed blockedBy changes\n- add x2c7uasq\n- add 123456\n')).toEqual([]);
   });
   const graph = new Map([
     ['1', { status: 'open', blockedBy: ['2'] }], ['2', { status: 'open', blockedBy: [] }],

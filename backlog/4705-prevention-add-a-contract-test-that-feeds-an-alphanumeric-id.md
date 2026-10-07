@@ -3,9 +3,10 @@ bornAs: x2c7uas
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: active
 scope: ["we:scripts/lib/probation-launcher.mjs", "we:scripts/operations/probation-build-run.mjs", "we:scripts/lib/__tests__/probation-launcher.test.mjs", "we:scripts/operations/__tests__/probation-build-run.test.mjs"]
 dateOpened: "2026-10-03"
+dateStarted: "2026-10-06"
 preparedDate: "2026-10-06"
 preparedAgainstSha: "75c39659a06fefd7ee76fb1af223d53880109a25"
 tags: []
@@ -64,6 +65,14 @@ In `we:scripts/operations/__tests__/probation-build-run.test.mjs` (build on `pre
 - A check:standards rule: every `abandon(` reason string in `we:scripts/operations/probation-build-run.mjs` must appear in a test file (card item 3).
 - Export `ITEM_REF_RX` from `we:scripts/check-standards-rules.mjs` so the contract test can import it instead of reading source text.
 - Derive `ITEM_REF_RX`, `we:scripts/lib/citation-check.mjs` and the launcher regexes all from one shared id module.
+
+## Progress
+
+- Sanity read confirmed the numeric-only parser and graph loader still need the specified change. Using `x2c7uas` for the hash examples whose text now says `4705`; the intended six-character hash contract is explicit in Design.
+- Added parser/validator/real graph-loader contracts and prepare-runner refusal/publication tests. Confirmed the four pre-change failures (hash parsing, hash cycle, hash graph entry, and absent id constant); fixed a test-environment URL issue before confirming the constant failure.
+- Implemented `BACKLOG_ID_SOURCE` in both consumers. Contracts cover unknown/resolved/self/cyclic targets in both id forms and valid numeric/hash publication; the live parser probe changed from `[]` to one hash edge.
+- Mutation checks each failed as intended when removing invalid-proposal validation, omitting `proposedEdges` from PR-body arguments, or scanning outside the proposal section. Restored all three mutations.
+- Final validation: 209 tests passed across the launcher, build runner, and isolation suites using `npx vitest run probation-launcher probation-build-run -t '^(?!.*(?:sanitises absolute paths and bare file:line|observes NEW tests through real Git|replays incident #)).*$'`. Four existing checkout-cloning tests were excluded after the unfiltered run stalled and was interrupted; the full unfiltered suite is not verified. All item-specific tests pass.
 
 ## Done when
 

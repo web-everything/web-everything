@@ -21,6 +21,25 @@ import { scanRepoLocusPrefixes } from '../../check-standards-rules.mjs';
 import { withInfraLock } from '../../conveyor/infra-blocked.mjs';
 import { gateFailureDetail, captureWorkerMessage, openPrArgv, parseArgs, realIo, runProbationBuild } from '../probation-build-run.mjs';
 
+describe('realIo().blockedByGraph', () => {
+  it('includes hash-named cards and validates their parsed proposals against the loaded graph', async () => {
+    const { parseProposedBlockedBy, validateProposedBlockedBy } = await import('../../lib/probation-launcher.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'probation-build-graph-'));
+    try {
+      mkdirSync(join(dir, 'backlog'));
+      writeFileSync(join(dir, 'backlog', '4705-self.md'), '---\nstatus: open\nblockedBy: []\n---\n');
+      writeFileSync(join(dir, 'backlog', 'x2c7uas-target.md'), '---\nstatus: open\nblockedBy: [4705]\n---\n');
+      writeFileSync(join(dir, 'backlog', 'x2c7uasq-invalid.md'), '---\nstatus: open\n---\n');
+      writeFileSync(join(dir, 'backlog', '123456-invalid.md'), '---\nstatus: open\n---\n');
+      const graph = realIo().blockedByGraph(dir);
+      expect(graph.get('x2c7uas')).toEqual({ status: 'open', blockedBy: ['4705'] });
+      expect([...graph.keys()].sort()).toEqual(['4705', 'x2c7uas']);
+      const edges = parseProposedBlockedBy('## Proposed blockedBy changes\n- add x2c7uas — prerequisite (we:a:1)\n');
+      expect(validateProposedBlockedBy('4705', edges, graph)).toEqual(['blockedBy cycle: #4705 → #x2c7uas → #4705']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe('realIo().findItem — the card\'s own scope is what the arc allowlists (#4291 advisory finding)', () => {
   const withCard = (text, fn) => {
     const dir = mkdtempSync(join(tmpdir(), 'probation-build-find-'));
@@ -811,6 +830,37 @@ describe('standalone prepare', () => {
     return fake;
   }
   const prepareArgs = () => args(codex, { taskType: 'prepare', scope: `we:${path}` });
+  it.each([
+    ['cyclic', '12', 'open', ['4291'], 'blockedBy cycle'],
+    ['unknown', '99', null, [], 'does not resolve'],
+    ['resolved', '12', 'resolved', [], 'is resolved'],
+    ['self', '4291', 'open', [], 'cannot block itself'],
+    ['cyclic hash', 'x2c7uas', 'open', ['4291'], 'blockedBy cycle'],
+    ['unknown hash', 'x2c7uas', null, [], 'does not resolve'],
+    ['resolved hash', 'x2c7uas', 'resolved', [], 'is resolved'],
+    ['self hash', 'x2c7uas', 'open', [], 'cannot block itself', 'x2c7uas'],
+  ])('abandons gate-red on a %s proposal with no PR creation', async (_kind, target, status, blockedBy, detail, self = '4291') => {
+    const { io, calls } = prepareIo({ postWorkerRaw: `${prepared}\n## Proposed blockedBy changes\n- add ${target} — dependency (we:a:1)\n` });
+    io.blockedByGraph = () => new Map([
+      [self, { status: 'open', blockedBy: [] }],
+      ...(status ? [[target, { status, blockedBy }]] : []),
+    ]);
+    expect(await runProbationBuild({ ...prepareArgs(), num: self }, io)).toMatchObject({ outcome: 'gate-red', detail: expect.stringContaining(detail) });
+    expect(calls).toContainEqual(['discard', 'base-sha']);
+    expect(calls.some(c => ['commit', 'prBody', 'openPr'].includes(c[0]))).toBe(false);
+  });
+  it.each(['12', 'x2c7uas'])('passes a valid proposal to writePrBody: %s', async (target) => {
+    const line = `- add ${target} — prerequisite (we:a:1)`;
+    const { io, calls } = prepareIo({ postWorkerRaw: `${prepared}\n## Proposed blockedBy changes\n${line}\n` });
+    io.blockedByGraph = () => new Map([
+      ['4291', { status: 'open', blockedBy: [] }],
+      [target, { status: 'open', blockedBy: [] }],
+    ]);
+    io.writePrBody = (_dir, options) => { calls.push(['prBody', options]); return '/lanes/22/.pr-body.md'; };
+    expect(await runProbationBuild(prepareArgs(), io)).toMatchObject({ outcome: 'opened-pr', pr: 9001 });
+    expect(calls.find(c => c[0] === 'prBody')?.[1].proposedEdges).toEqual([{ op: 'add', target, line }]);
+    expect(calls.some(c => c[0] === 'openPr')).toBe(true);
+  });
   it('replays #4397: records could-not-prepare without stamping or resolving', async () => {
     const lastMessage = 'could-not-prepare: premise is stale; we:scripts/lib/lane-salvage.mjs uses copyLitterTreeSync/copyFileSync; FIFO timed out.';
     const { io, calls } = prepareIo({ numstat: '', postWorkerRaw: ITEM_RAW, lastMessage });
