@@ -289,11 +289,24 @@ const FIX_THE_CLASS_REQUIRED = [
   '"not the same class" never dismisses it',
   'Deferring ("later", "follow-up") is not a dismissal.',
   'Variants considered:',
+  // Card 7 (opus perf sweep 2026-10-07): the per-class variant matrix the fixer fills in.
+  '**The variant matrix.**',
+  'fixed at <file:line, every site>',
+  'which row did this fix not cover?',
+  'which row of the variant matrix did this fix not cover?',
+  ...['untrusted text', 'truncated read', 'shared state', 'rollback / switch', 'normalization', 'resource bounds', 'trust boundary'].map((c) => `| ${c} |`),
 ];
 
 describe('fix the class', () => {
   it('requires variant discovery, adversarial review, and evidence without deferral', () => {
     expectEachGuarded(readBrief('fix-agent-brief.md'), FIX_THE_CLASS_REQUIRED);
+  });
+
+  it('carries all seven matrix rows with their variants, and the evidence comment asks for each touched row', () => {
+    const text = readBrief('fix-agent-brief.md');
+    for (const variant of ['CR/U+2028', 'leading `--`', '`--limit` hit', 'crash between write and rename', 'dot names',
+      'trim, case, NFKC, line endings', 'quadratic regex', 'author check']) expect(text).toContain(variant);
+    expect(text.replace(/\s+/g, ' ')).toMatch(/every touched row marked `fixed at <sites>` or `n\/a: <why>`/);
   });
 
   it('does not restore the old "fix it, or dismiss it with a one-line reason" loophole', () => {
