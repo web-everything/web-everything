@@ -1,8 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import {
   classifyAwaitVerdict, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession,
-  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS,
+  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, laneTreeHash,
 } from '../await-verify-pass.mjs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
 
 const SHA = '65a382e81413952ab11e5448e36f01bb7ce4c332';
 const OTHER = 'b96574995e22b8d8087d4a28b7ba7615d4ec8c73';
@@ -223,4 +228,20 @@ describe('replay: fix-4115 through the harness-owned wait', () => {
     expect(h.calls.push.map((p) => p.sha)).toEqual([SHA, OTHER]); // never the red sha
     expect(h.store.size).toBe(0);
   });
+});
+
+it('laneTreeHash matches verify-lane\'s own (trimmed) tree hash on a real repo — an untrimmed read never would', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'await-tree-'));
+  try {
+    const g = (...a) => execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@e.invalid', '-c', 'commit.gpgsign=false', ...a], { encoding: 'utf8', stdio: 'pipe' });
+    g('init', '-q'); writeFileSync(join(dir, 'a.txt'), 'one\n'); g('add', 'a.txt'); g('commit', '-qm', 'base');
+    g('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    writeFileSync(join(dir, 'a.txt'), 'one\ntwo\n'); g('commit', '-qam', 'change');
+    // verify-lane.mjs's `git` helper: execFileSync(...).trim() in the lane (scripts/verify-lane.mjs).
+    const verifyLaneStyle = computeWorkingTreeHash({ runGit: (a) => execFileSync('git', a, { cwd: dir, encoding: 'utf8' }).trim(), fileMode: () => 0 });
+    const untrimmed = computeWorkingTreeHash({ runGit: (a) => execFileSync('git', a, { cwd: dir, encoding: 'utf8' }), fileMode: () => 0 });
+    expect(verifyLaneStyle).toMatch(/^[a-f\d]{64}$/);
+    expect(laneTreeHash(dir)).toBe(verifyLaneStyle);
+    expect(untrimmed).not.toBe(verifyLaneStyle);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -235,6 +235,16 @@ export function formatAwaitVerifyLines(result) {
   return lines;
 }
 
+/**
+ * The lane's tree hash exactly as `verify-lane.mjs` records it: its `git` helper TRIMS every output, and the hash
+ * covers the raw diff text, so an untrimmed read never matches (found live 2026-10-07 on the first edge record:
+ * every green came back `tree-unproven`).
+ */
+export function laneTreeHash(lane, { exec = execFileSync, env = process.env } = {}) {
+  const runGit = (args) => String(exec('git', args, { cwd: lane, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env })).trim();
+  return computeWorkingTreeHash({ runGit, fileMode: (f) => lstatSync(join(lane, f)).mode });
+}
+
 // ── IO shell ───────────────────────────────────────────────────────────────────────────────────────────────
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
@@ -255,7 +265,7 @@ export async function defaultAwaitVerifyIo({ weRoot = ROOT, exec = execFileSync,
       try {
         const head = git(lane, ['rev-parse', 'HEAD']).trim();
         const dirty = git(lane, ['status', '--porcelain', '--untracked-files=all']).trim().length > 0;
-        const treeHash = dirty ? null : computeWorkingTreeHash({ runGit: (a) => git(lane, a), fileMode: (f) => lstatSync(join(lane, f)).mode });
+        const treeHash = dirty ? null : laneTreeHash(lane, { exec, env });
         return { head, dirty, treeHash };
       } catch { return null; }
     },
