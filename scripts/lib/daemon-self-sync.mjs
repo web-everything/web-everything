@@ -585,7 +585,12 @@ export function withSelfSync(effects, {
       let tickResult;
       try {
         if (cur) {
-          await versionApi.pin({ clone: vctx.clone, home: vctx.home, id: cur.id, settings: vctx.settings });
+          const pinResult = await versionApi.pin({ clone: vctx.clone, home: vctx.home, id: cur.id, settings: vctx.settings });
+          if (pinResult?.status !== 'pinned') {
+            // busy / disabled: gc could delete the folder under a running tick — never run unpinned.
+            log.error?.(`daemon-self-sync: could not pin version ${cur.id} (${pinResult?.status ?? 'no-result'}) — skipping this tick, retrying next tick (card 89)`);
+            return { skipped: true, reason: `pin-${pinResult?.status ?? 'failed'}` };
+          }
           pinned = true;
         }
         tickContext.tickRoot = cur ? cur.dir : root;
