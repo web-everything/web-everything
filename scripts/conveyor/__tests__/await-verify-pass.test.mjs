@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   classifyAwaitVerdict, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession,
-  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, laneTreeHash, isSessionBusy,
+  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, laneTreeHash, isSessionBusy, defaultAwaitVerifyIo,
 } from '../await-verify-pass.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
@@ -252,4 +252,20 @@ it('isSessionBusy reads the live turn signal: a turn-ended bg session is state w
   expect(isSessionBusy({ state: 'done' })).toBe(false);
   expect(isSessionBusy({ state: 'stopped' })).toBe(false);
   expect(isSessionBusy({ state: 'working' })).toBe(true);
+});
+
+it('resume stops the idle live process by its SHORT job id first, then resumes the same session id (live 2026-10-07)', async () => {
+  const calls = [];
+  const sid = 'a287c608-48e3-4d38-99f1-10496475407f';
+  const io = await defaultAwaitVerifyIo({ ports: {
+    stopSession: ({ handle }) => { calls.push(['stop', handle]); return { stopped: true }; },
+    io: {
+      defaultSpawnAgent: (argv, opts) => { calls.push(['spawn', argv.slice(0, 3), opts.cwd]); return 'backgrounded · a287c608'; },
+      defaultListAgents: () => [{ id: 'a287c608', sessionId: sid, state: 'working', status: 'busy' }],
+    },
+  } });
+  const r = io.resume({ session: { id: 'a287c608', sessionId: sid, cwd: '/scratch', state: 'working', status: 'idle', pid: 0 }, prompt: '[harness verify verdict — #5137] x' });
+  expect(calls[0]).toEqual(['stop', 'a287c608']); // never the full uuid: `claude stop <uuid>` is "No job matching"
+  expect(calls[1]).toEqual(['spawn', ['--bg', '--resume', sid], '/scratch']);
+  expect(r).toMatchObject({ resumed: true });
 });

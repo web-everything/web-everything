@@ -256,12 +256,13 @@ export function laneTreeHash(lane, { exec = execFileSync, env = process.env } = 
 }
 
 // ── IO shell ───────────────────────────────────────────────────────────────────────────────────────────────
+const pidAlive = (pid) => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } };
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 /** Real ports. `deps` lets the daemon reuse its own `claude` spawn/list/stop seams. */
-export async function defaultAwaitVerifyIo({ weRoot = ROOT, exec = execFileSync, env = process.env } = {}) {
-  const io = await import('../operations/dispatch-lane-io.mjs');
-  const { stopSession } = await import('../operations/dispatch-abort.mjs');
+export async function defaultAwaitVerifyIo({ weRoot = ROOT, exec = execFileSync, env = process.env, ports = {} } = {}) {
+  const io = { ...(await import('../operations/dispatch-lane-io.mjs')), ...(ports.io ?? {}) };
+  const stopSession = ports.stopSession ?? (await import('../operations/dispatch-abort.mjs')).stopSession;
   const { pushRefusal } = await import('./fix-procedure.mjs');
   const git = (lane, args, opts = {}) => String(exec('git', ['-C', lane, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, ...opts }));
   return {
@@ -314,8 +315,13 @@ export async function defaultAwaitVerifyIo({ weRoot = ROOT, exec = execFileSync,
       // idle process first; `--resume` then wakes the SAME id with its saved options (-n, --model, permissions).
       // The pass never gets here for a busy session (BUSY above), so this never interrupts a working turn.
       if (String(session.state ?? '').toLowerCase() !== 'stopped') {
-        try { stopSession({ handle: session.sessionId }); } catch (e) { return { resumed: false, reason: `stop-before-resume: ${String(e?.message ?? e).split('\n')[0]}` }; }
-        sleepSync(2_000);
+        // `claude stop` takes the SHORT job id; a full session uuid answers "No job matching" (read as already
+        // gone) and leaves the process running, so the resume forked again (found live 2026-10-07, fix-4151).
+        const handle = session.id || String(session.sessionId).slice(0, 8);
+        try { stopSession({ handle }); } catch (e) { return { resumed: false, reason: `stop-before-resume: ${String(e?.message ?? e).split('\n')[0]}` }; }
+        for (let i = 0; i < 20 && pidAlive(session.pid); i += 1) sleepSync(500);
+        if (pidAlive(session.pid)) return { resumed: false, reason: 'stop-before-resume: process still alive' };
+        sleepSync(1_000);
       }
       const argv = io.buildAgentArgv({ payload: { prompt }, resumeSessionId: session.sessionId });
       let stdout = '';
