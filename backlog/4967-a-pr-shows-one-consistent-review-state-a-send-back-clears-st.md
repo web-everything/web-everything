@@ -2,9 +2,11 @@
 bornAs: xyufys9
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/review-set-label.mjs", "we:scripts/__tests__/review-set-label.test.mjs", "we:scripts/conveyor/review-status-tag.mjs", "we:scripts/conveyor/__tests__/review-status-tag.test.mjs"]
 dateOpened: "2026-10-02"
+dateStarted: "2026-10-06"
+dateResolved: "2026-10-06"
 preparedDate: "2026-10-06"
 preparedAgainstSha: "936580aaf242cea3bea3221d58c9bf83947e35c9"
 tags: []

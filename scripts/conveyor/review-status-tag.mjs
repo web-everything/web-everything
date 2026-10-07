@@ -173,6 +173,34 @@ export function planStatusLabelChange({ status, currentLabels = [] } = {}) {
 }
 
 /**
+ * PURE (#4967): ONE plain review state for a PR, so a viewer never has to reconcile raw labels that read as
+ * contradictory — live case PR #3490 carried `review:changes` + `review:human` + `review-status:fixing` at once.
+ * `review:human` there does NOT mean "waiting on the operator now"; it means a human approval is still owed AFTER
+ * the send-back fix. When BOTH `review:changes` and `review:human` are present this names that sequence; a
+ * fixer claim is made only for a LIVE fixer state. Otherwise it falls back to the single existing state (the
+ * status label's own state, or the lone review label). DERIVED, never a new `review-status:*` label, so
+ * {@link STATUS_LABEL_RE} / {@link planStatusLabelChange} and every other label consumer are untouched.
+ * @param {{labels?:Array<{name?:string}|string>, status?:{state:string}|null}} o
+ * @returns {{code:string, text:string}|null} `null` when there is no review state to show at all
+ */
+export function describeReviewState({ labels = [], status = null } = {}) {
+  const names = (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
+  const state = status?.state ?? null;
+  if (names.includes('review:changes') && names.includes('review:human')) {
+    if (state === 'fixing' || state === 'fixing-conflict') {
+      return { code: 'fixing-then-human', text: 'fixing the send-back, then needs operator approval' };
+    }
+    if (state === 'fix-stalled' || state === 'fixing-conflict-stalled') {
+      return { code: 'fix-stalled-then-human', text: 'send-back fix stalled, then needs operator approval' };
+    }
+    return { code: 'changes-waiting-then-human', text: 'send-back waiting for a fix, then needs operator approval' };
+  }
+  if (state) return { code: state, text: state.replaceAll('-', ' ') };
+  const lone = names.find((n) => /^review:(changes|human|pending|accepted)$/.test(n));
+  return lone ? { code: lone, text: lone.replace(':', ' ') } : null;
+}
+
+/**
  * THE IO SHELL. Reads live agents + the PR's current labels, derives the status, applies the change only if
  * one is needed. Both reads are injectable so a test asserts behavior with no `claude`/`gh` process.
  *
@@ -185,7 +213,7 @@ export function planStatusLabelChange({ status, currentLabels = [] } = {}) {
  * Omitting either (the default, and every pre-existing caller/test) reads fresh, byte-identical to before
  * these options existed.
  * @param {{pr:number|string, repo:string, listAgents?:Function, provider?:object, agents?:Array<object>, currentLabels?:Array<{name?:string}|string>, isDraft?:boolean, baseRefName?:string, defaultBranch?:string, mergeConflicted?:boolean, readFixClaim?:Function}} o
- * @returns {{changed:boolean, label:string|null, removed:string[]}}
+ * @returns {{changed:boolean, label:string|null, removed:string[], reviewState:{code:string, text:string}|null}}
  */
 // x26lw6u — the default listing includes live review JOBS (`we:scripts/operations/review-job.mjs`): a review no
 // longer runs as a `claude --bg` session, so without them every job-run review would read as "nothing live" and
@@ -214,9 +242,12 @@ export function tagReviewStatus({
     baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation });
   const currentLabels = suppliedLabels ?? provider.readLabels(repo, pr);
   const plan = planStatusLabelChange({ status, currentLabels });
+  // #4967 — the single plain state, returned for a viewer to show instead of the raw, possibly contradictory
+  // labels. The labels themselves are untouched; rendering it is Plateau's follow-up.
+  const reviewState = describeReviewState({ labels: currentLabels, status });
   if (!plan.add && plan.remove.length === 0) {
     return { changed: false, label: currentLabels.some(l => (typeof l === 'string' ? l : l?.name) === 'review-status:draft-withdrawn')
-      ? 'review-status:draft-withdrawn' : status ? `review-status:${status.state}` : null, removed: [] };
+      ? 'review-status:draft-withdrawn' : status ? `review-status:${status.state}` : null, removed: [], reviewState };
   }
   // `review-status:*` is a small fixed enum, but a repo that has never carried one yet still needs it created
   // before `gh pr edit --add-label` will accept it — same reasoning as `review-round-tag.mjs`'s own ensure.
@@ -226,7 +257,7 @@ export function tagReviewStatus({
   // `add` is optional on the shared port (#2026-09-01 extension) precisely for this remove-only case: nothing
   // is live, so there is no replacement label — only the stale one comes off.
   provider.setLabels(repo, pr, { add: plan.add ?? undefined, remove: plan.remove });
-  return { changed: true, label: plan.add, removed: plan.remove };
+  return { changed: true, label: plan.add, removed: plan.remove, reviewState };
 }
 
 /**

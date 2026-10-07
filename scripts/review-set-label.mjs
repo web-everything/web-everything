@@ -532,7 +532,13 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
     // tell a `redteam:accepted` that covers THIS diff from one left over from before a bounce sent it back for
     // changes. A bounce is the one unambiguous "this diff is not good as-is" signal available today; leaving the
     // old sign-off in place would let a re-accept after the fix ride on a validator verdict that never saw it.
-    removeLabels: [REVIEW_LABELS.pending, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL],
+    // #4967 — ALSO strips both `advisory:*` labels (ACCEPTED and CHANGES — the whole `ADVISORY_LABELS` enum): it described the review BEFORE this send-back, so leaving it
+    // makes the PR contradict itself (live case PR #3490: `review:changes` + `review:human` +
+    // `advisory:accepted` at once). `review:human` stays — a human approval is still owed after the fix.
+    removeLabels: [
+      REVIEW_LABELS.pending, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL,
+      ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES,
+    ],
     keepsHuman: isHuman,
     reason: 'changes — author lane fixes hot-context and re-pushes',
   };

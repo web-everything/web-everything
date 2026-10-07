@@ -211,6 +211,31 @@ describe('decideSetLabel — changes (a bounce lands nothing)', () => {
     expect(d.allowed).toBe(true);
     expect(d.removeLabels).toContain(REVIEW_LABELS.redteamAccepted);
   });
+
+  // #4967 — live case PR #3490: after a send-back the PR still carried advisory:accepted from the review BEFORE
+  // the bounce next to review:changes + review:human. The advisory is stale by construction; review:human stays.
+  for (const advisory of [ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES]) {
+    it(`strips a stale ${advisory} on a bounce while keeping review:human`, () => {
+      const carries = [{ name: REVIEW_LABELS.human }, { name: REVIEW_LABELS.pending }, { name: advisory }];
+      const d = decideSetLabel({ to: 'changes', currentLabels: carries, reason: 'send-back' });
+      expect(d.allowed).toBe(true);
+      expect(d.removeLabels).toContain(advisory);
+      expect(d.removeLabels).not.toContain(REVIEW_LABELS.human);
+      expect(d.keepsHuman).toBe(true);
+      expect(presentRemoveLabels(d.removeLabels, carries)).toEqual([REVIEW_LABELS.pending, advisory]);
+    });
+  }
+
+  it('a bounce strips EVERY ADVISORY_LABELS value (a new advisory label cannot silently survive a send-back)', () => {
+    const d = decideSetLabel({ to: 'changes', currentLabels: human, reason: 'send-back' });
+    for (const advisory of Object.values(ADVISORY_LABELS)) expect(d.removeLabels).toContain(advisory);
+  });
+
+  it('a bounce on a PR with no advisory label is unchanged (nothing extra is handed to gh)', () => {
+    const d = decideSetLabel({ to: 'changes', currentLabels: pending, reason: 'send-back' });
+    expect(d.allowed).toBe(true);
+    expect(presentRemoveLabels(d.removeLabels, pending)).toEqual([REVIEW_LABELS.pending, READY_TO_MERGE_LABEL]);
+  });
 });
 
 describe('decideSetLabel — rearm (#2644, folded in from the conveyor decideRearm)', () => {
@@ -3128,7 +3153,10 @@ describe('#3334 — the pure core refuses a reasonless bounce, and NOTHING else'
     const d = decide({ findingCount: 1, reason: '' });
     expect(d.allowed).toBe(true);
     expect(d.addLabel).toBe(REVIEW_LABELS.changes);
-    expect(d.removeLabels).toEqual([REVIEW_LABELS.pending, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL]);
+    expect(d.removeLabels).toEqual([
+      REVIEW_LABELS.pending, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL,
+      ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES,
+    ]);
   });
 
   it('ALLOWS a bounce carrying a stated reason over zero findings — the operator override the guard is FOR', () => {

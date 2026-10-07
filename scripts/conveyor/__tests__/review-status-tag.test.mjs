@@ -5,7 +5,7 @@
  */
 import { describe, it, expect } from 'vitest';
 
-import { deriveReviewStatus, planStatusLabelChange, tagReviewStatus, applyReviewStatus, STATUS_LABEL_RE } from '../review-status-tag.mjs';
+import { deriveReviewStatus, describeReviewState, planStatusLabelChange, tagReviewStatus, applyReviewStatus, STATUS_LABEL_RE } from '../review-status-tag.mjs';
 
 describe('deriveReviewStatus', () => {
   it('null when no agent is bound to this PR by name', () => {
@@ -267,7 +267,59 @@ describe('planStatusLabelChange', () => {
   });
 });
 
+describe('describeReviewState — one plain state instead of contradictory raw labels (#4967)', () => {
+  const both = ['review:changes', 'review:human'];
+
+  it('changes + human with a live fixer reads "fixing the send-back, then needs operator approval"', () => {
+    for (const state of ['fixing', 'fixing-conflict']) {
+      expect(describeReviewState({ labels: both, status: { role: 'fix', state } }))
+        .toEqual({ code: 'fixing-then-human', text: 'fixing the send-back, then needs operator approval' });
+    }
+  });
+
+  it('changes + human with a stalled fixer says the fix stalled', () => {
+    for (const state of ['fix-stalled', 'fixing-conflict-stalled']) {
+      expect(describeReviewState({ labels: both, status: { role: 'fix', state } }).text)
+        .toBe('send-back fix stalled, then needs operator approval');
+    }
+  });
+
+  it('changes + human with no fixer, or a non-fixer state, makes no fixer claim', () => {
+    for (const status of [null, { role: 'review', state: 'reviewing' }, { role: 'ci-heal', state: 'healing-ci' }]) {
+      expect(describeReviewState({ labels: both, status }).text)
+        .toBe('send-back waiting for a fix, then needs operator approval');
+    }
+  });
+
+  it('accepts {name} label objects, like planStatusLabelChange', () => {
+    expect(describeReviewState({ labels: both.map((name) => ({ name })), status: { state: 'fixing' } }).code).toBe('fixing-then-human');
+  });
+
+  it('human only, or changes only, falls back to the single existing state (no false combination)', () => {
+    expect(describeReviewState({ labels: ['review:human'], status: null })).toEqual({ code: 'review:human', text: 'review human' });
+    expect(describeReviewState({ labels: ['review:changes'], status: null })).toEqual({ code: 'review:changes', text: 'review changes' });
+    expect(describeReviewState({ labels: ['review:human'], status: { state: 'reviewing' } }))
+      .toEqual({ code: 'reviewing', text: 'reviewing' });
+    expect(describeReviewState({ labels: ['review:changes'], status: { state: 'fixing' } }).code).toBe('fixing');
+  });
+
+  it('no review state at all is null', () => {
+    expect(describeReviewState({ labels: ['bug'], status: null })).toBeNull();
+    expect(describeReviewState()).toBeNull();
+  });
+});
+
 describe('tagReviewStatus — IO shell over injected fakes (no claude/gh process)', () => {
+  it('publishes the combined state as reviewState — the #3490 replay (changes + human + fixing + advisory)', () => {
+    const labels = ['review:changes', 'review:human', 'review-status:fixing', 'advisory:accepted'];
+    const provider = { readLabels: () => labels, setLabels: () => {}, ensureLabel: () => {} };
+    const result = tagReviewStatus({
+      pr: 3490, repo: 'web-everything/web-everything', provider, currentLabels: labels,
+      agents: [{ name: 'fix-3490', state: 'working' }], readFixClaim: () => null, prState: {},
+    });
+    expect(result.reviewState).toEqual({ code: 'fixing-then-human', text: 'fixing the send-back, then needs operator approval' });
+  });
+
   const fakeProvider = (labels) => {
     const calls = [];
     return {
@@ -282,7 +334,7 @@ describe('tagReviewStatus — IO shell over injected fakes (no claude/gh process
     const provider = fakeProvider([]);
     const listAgents = () => [{ name: 'review-42', state: 'working' }];
     const result = tagReviewStatus({ pr: 42, repo: 'web-everything/web-everything', listAgents, provider });
-    expect(result).toEqual({ changed: true, label: 'review-status:reviewing', removed: [] });
+    expect(result).toEqual({ changed: true, label: 'review-status:reviewing', removed: [], reviewState: { code: 'reviewing', text: 'reviewing' } });
     expect(provider.calls).toEqual([
       ['readLabels', 'web-everything/web-everything', 42],
       ['ensureLabel', 'web-everything/web-everything', 'review-status:reviewing'],
@@ -294,7 +346,7 @@ describe('tagReviewStatus — IO shell over injected fakes (no claude/gh process
     const provider = fakeProvider([{ name: 'review-status:reviewing' }]);
     const listAgents = () => [];
     const result = tagReviewStatus({ pr: 42, repo: 'web-everything/web-everything', listAgents, provider });
-    expect(result).toEqual({ changed: true, label: null, removed: ['review-status:reviewing'] });
+    expect(result).toEqual({ changed: true, label: null, removed: ['review-status:reviewing'], reviewState: null });
     expect(provider.calls).toEqual([
       ['readLabels', 'web-everything/web-everything', 42],
       ['setLabels', 'web-everything/web-everything', 42, { add: undefined, remove: ['review-status:reviewing'] }],
@@ -305,7 +357,7 @@ describe('tagReviewStatus — IO shell over injected fakes (no claude/gh process
     const provider = fakeProvider([{ name: 'review-status:fixing' }]);
     const listAgents = () => [{ name: 'fix-42', state: 'working' }];
     const result = tagReviewStatus({ pr: 42, repo: 'web-everything/web-everything', listAgents, provider });
-    expect(result).toEqual({ changed: false, label: 'review-status:fixing', removed: [] });
+    expect(result).toEqual({ changed: false, label: 'review-status:fixing', removed: [], reviewState: { code: 'fixing', text: 'fixing' } });
     expect(provider.calls).toEqual([['readLabels', 'web-everything/web-everything', 42]]);
   });
 
@@ -314,7 +366,7 @@ describe('tagReviewStatus — IO shell over injected fakes (no claude/gh process
     const provider = fakeProvider([]);
     const listAgents = () => [{ name: 'review-42', state: 'done' }];
     const result = tagReviewStatus({ pr: 42, repo: 'web-everything/web-everything', listAgents, provider, isDraft: true });
-    expect(result).toEqual({ changed: true, label: 'review-status:awaiting-ci', removed: [] });
+    expect(result).toEqual({ changed: true, label: 'review-status:awaiting-ci', removed: [], reviewState: { code: 'awaiting-ci', text: 'awaiting ci' } });
     expect(provider.calls).toEqual([
       ['readLabels', 'web-everything/web-everything', 42],
       ['ensureLabel', 'web-everything/web-everything', 'review-status:awaiting-ci'],
@@ -325,7 +377,7 @@ describe('tagReviewStatus — IO shell over injected fakes (no claude/gh process
   it('isDraft defaults to false — an omitted flag is byte-identical to before this option existed', () => {
     const provider = fakeProvider([]);
     const result = tagReviewStatus({ pr: 42, repo: 'web-everything/web-everything', listAgents: () => [], provider });
-    expect(result).toEqual({ changed: false, label: null, removed: [] });
+    expect(result).toEqual({ changed: false, label: null, removed: [], reviewState: null });
   });
 
   // #4133 (epic #3383/#4075) — a caller with the tick's own already-fetched `claude agents --json` listing and
@@ -339,7 +391,7 @@ describe('tagReviewStatus — IO shell over injected fakes (no claude/gh process
         pr: 42, repo: 'web-everything/web-everything', listAgents, provider,
         agents: [{ name: 'review-42', state: 'working' }], currentLabels: [],
       });
-      expect(result).toEqual({ changed: true, label: 'review-status:reviewing', removed: [] });
+      expect(result).toEqual({ changed: true, label: 'review-status:reviewing', removed: [], reviewState: { code: 'reviewing', text: 'reviewing' } });
       expect(listAgentsCalls).toBe(0);
       expect(provider.calls.map((c) => c[0])).toEqual(['ensureLabel', 'setLabels']); // no 'readLabels' call
     });
@@ -350,7 +402,7 @@ describe('tagReviewStatus — IO shell over injected fakes (no claude/gh process
         pr: 42, repo: 'web-everything/web-everything', provider,
         agents: [{ name: 'review-42', state: 'working' }], currentLabels: [{ name: 'review-status:reviewing' }],
       });
-      expect(result).toEqual({ changed: false, label: 'review-status:reviewing', removed: [] });
+      expect(result).toEqual({ changed: false, label: 'review-status:reviewing', removed: [], reviewState: { code: 'reviewing', text: 'reviewing' } });
       expect(provider.calls).toEqual([]);
     });
 
