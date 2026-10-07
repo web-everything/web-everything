@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { LOG_TIMESTAMP_RE, expandRepeatedLines, stripLogTimestamp } from '../lib/log-timestamp.mjs';
 
 const MiB = 1024 * 1024;
@@ -424,7 +425,7 @@ export function conflictMetrics(items, prsOpened, window, cutoff = SCOPING_CUTOF
 }
 
 /** Bounded gh read of PRs opened in the window (<= 5 pages, newest first). */
-export function fetchOpenedPrs(window, gh, { repo = 'web-everything/web-everything', maxPages = 5 } = {}) {
+export function fetchOpenedPrs(window, gh, { repo = CONSTELLATION_REPOS.we.slug, maxPages = 5 } = {}) {
   const out = [];
   if (typeof gh !== 'function') return { prs: out, found: false };
   let found = false;
@@ -446,7 +447,7 @@ export function makeGh({ home = homedir(), env = process.env, exec = execFileSyn
 }
 
 /** Bounded gh read: <= maxPages run pages and <= maxJobCalls job lookups (only non-green runs, newest first). */
-export function fetchCiRuns(window, gh, { repo = 'web-everything/web-everything', maxPages = 8, maxJobCalls = 40 } = {}) {
+export function fetchCiRuns(window, gh, { repo = CONSTELLATION_REPOS.we.slug, maxPages = 8, maxJobCalls = 40 } = {}) {
   if (typeof gh !== 'function') return { runs: [], found: false, calls: 0, truncated: false };
   const created = encodeURIComponent(`${window.since}..${window.until}`);
   const raw = []; let calls = 0, found = false, truncated = false;
