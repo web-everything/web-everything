@@ -51,7 +51,7 @@ export function recordBuildFailure({ num, reason, output }, { path = buildFailur
     output: text.slice(0, OUTPUT_CAP),
     recordedAt: new Date(now).toISOString(),
     // A card-level refusal is permanent: it is withheld at once (exhausted), not re-tried on a cooldown.
-    ...(reasonCode === CARD_REFUSAL_CODE ? { retryAfter: null, exhausted: true } : backoffVerdict({ attempts, now, settings })),
+    ...(reasonCode === CARD_REFUSAL_CODE ? { retryAfter: null, exhausted: true } : backoffVerdict({ attempts, now, settings, code: reasonCode })),
   };
   state.items[key] = record;
   save(state, path);

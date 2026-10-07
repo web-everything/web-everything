@@ -449,3 +449,47 @@ describe('commitTouchesNonBacklogFile', () => {
     expect(commitTouchesNonBacklogFile('')).toBe(false);
   });
 });
+
+describe('landOne - already-done with citation "prepare" (a prepare worker\'s claim, checked independently)', () => {
+  const MSG = 'WE #4554: standalone runner finds the lane pool from any cwd (also delivers xak56ki)\n\nbody\n';
+  function run({ message = MSG, files = 'backlog/4554-x.md\nscripts/operations/probation-build-run.mjs\nscripts/operations/__tests__/probation-run.test.mjs\n', testsPass = true, card = '---\nbornAs: xak56ki\nstatus: open\n---\n# T\n', testFile = true } = {}) {
+    mkdirSync(join(LANE_PATH, 'backlog'), { recursive: true });
+    writeFileSync(join(LANE_PATH, 'backlog', '4560-card.md'), card);
+    const { runFn, calls } = fakeRunner(({ cmd, args }) => {
+      if (args.includes('vitest')) { if (!testsPass) throw Object.assign(new Error('1 failed'), { stderr: 'FAIL probation-run.test.mjs' }); return ''; }
+      if (cmd === 'git' && args[0] === 'log') return message;
+      if (cmd === 'git' && args[0] === 'show') return files;
+      if (args.includes('open-pr')) return fakeOpenPrResult(5001, 'https://github.com/x/y/pull/5001');
+      return '';
+    });
+    const result = landOne({ num: '4560', route: 'already-done', commit: '10fedba67afc', citation: 'prepare' }, {
+      runFn, acquireFn: () => ({ path: LANE_PATH, lane: 37, holder: 's' }), releaseFn: () => {}, existsFile: () => testFile,
+    });
+    return { result, calls };
+  }
+  it('resolves when the commit credits the card by its birth id (no "#") and the tests it added pass on main', () => {
+    const { result, calls } = run();
+    expect(result).toMatchObject({ status: 'landed', pr: 5001 });
+    expect(calls.find((c) => c.args.includes('vitest')).args).toContain('scripts/operations/__tests__/probation-run.test.mjs');
+    expect(calls.find((c) => c.args.includes('resolve')).args).toContain('--graduated-to=10fedba67afc');
+  });
+  it('the strict citation still refuses that same commit (its subject has no "#<birth id>")', () => {
+    mkdirSync(join(LANE_PATH, 'backlog'), { recursive: true });
+    writeFileSync(join(LANE_PATH, 'backlog', '4560-card.md'), '---\nbornAs: xak56ki\nstatus: open\n---\n');
+    const { runFn } = fakeRunner(({ cmd, args }) => (cmd === 'git' && args[0] === 'log' ? MSG : cmd === 'git' && args[0] === 'show' ? 'scripts/a.mjs\n' : ''));
+    const result = landOne({ num: '4560', route: 'already-done', commit: '10fedba67afc' }, { runFn, acquireFn: () => ({ path: LANE_PATH, lane: 1, holder: 's' }), releaseFn: () => {} });
+    expect(result.status).toBe('failed');
+  });
+  it.each([
+    ['tests that fail on main', { testsPass: false }, /tests cited commit .* fail on current main/],
+    ['a commit that touched no surviving test file', { testFile: false }, /touches no test file/],
+    ['a commit that never names the card', { message: 'WE #9999: unrelated change\n' }, /does not credit/],
+    ['a partial delivery', { message: 'WE #4554: part 1 of xak56ki, delivers the scaffold\n' }, /does not credit/],
+    ['a bookkeeping-only commit', { files: 'backlog/4554-x.md\n' }, /only backlog/],
+  ])('refuses %s and opens no PR', (_name, opts, error) => {
+    const { result, calls } = run(opts);
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(error);
+    expect(calls.some((c) => c.args.includes('resolve') || c.args.includes('open-pr'))).toBe(false);
+  });
+});

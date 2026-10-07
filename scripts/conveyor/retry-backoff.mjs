@@ -24,14 +24,30 @@ export function backoffDelayMs(attempt, settings = BACKOFF_DEFAULTS) {
   return Math.min(settings.maxMs, settings.baseMs * 2 ** Math.min(n - 1, 30));
 }
 
-/** `{retryAfter, exhausted}` for a card that has now failed `attempts` times. */
-export function backoffVerdict({ attempts, now = Date.now(), settings = BACKOFF_DEFAULTS }) {
-  if (attempts >= settings.maxAttempts) return { retryAfter: null, exhausted: true };
-  return { retryAfter: new Date(now + backoffDelayMs(attempts, settings)).toISOString(), exhausted: false };
+/**
+ * Reason codes that mean "the launch is merely LATE", not "the launch failed": the dispatch run reported
+ * `effect-in-flight` (the detached dispatch has not finished) so no session was seen yet. Nothing about the card
+ * or the host is wrong, so the retry is quick (30 s doubling to 2 min) instead of the 5-60 min failure path that a
+ * real failure gets. Still bounded by the same attempt cap. (Live #4647: it waited on the long path.)
+ */
+export const QUICK_RETRY_REASON_CODES = Object.freeze(['launch-in-flight']);
+export const QUICK_RETRY = Object.freeze({ baseMs: 30_000, maxMs: 2 * 60_000 });
+export function settingsForReason(code, settings = BACKOFF_DEFAULTS) {
+  return QUICK_RETRY_REASON_CODES.includes(code)
+    ? { ...settings, baseMs: Math.min(settings.baseMs, QUICK_RETRY.baseMs), maxMs: Math.min(settings.maxMs, QUICK_RETRY.maxMs) }
+    : settings;
+}
+
+/** `{retryAfter, exhausted}` for a card that has now failed `attempts` times. `code` picks the quick schedule for a late launch. */
+export function backoffVerdict({ attempts, now = Date.now(), settings = BACKOFF_DEFAULTS, code = null }) {
+  const effective = settingsForReason(code, settings);
+  if (attempts >= effective.maxAttempts) return { retryAfter: null, exhausted: true };
+  return { retryAfter: new Date(now + backoffDelayMs(attempts, effective)).toISOString(), exhausted: false };
 }
 
 /** Reason codes: why a dispatch failed, in a form a card/status page can group on. `null` = not a known transient. */
 const RULES = [
+  ['launch-in-flight', /effect-in-flight/i],
   ['launch-not-confirmed', /dispatch launch not confirmed|launch not confirmed/i],
   ['checkout-behind-origin', /dispatching checkout is \d+ commit|managed clone is \d+ commit|checkout-behind-origin/i],
   ['launch-spawn-failed', /launch-spawn-failed/i],

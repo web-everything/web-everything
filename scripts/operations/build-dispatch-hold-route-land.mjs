@@ -24,7 +24,7 @@
  */
 import { machinePrTitle } from './machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -104,6 +104,28 @@ export function commitDeliversItem(message, ids) {
     if (new RegExp(`^(?:[A-Za-z][\\w-]*\\s+)?(?:#[\\w]+/)*#${e}(?:/#[\\w]+)*:`).test(subject)) return true;
     return !/^\d+$/.test(id) && new RegExp(`\\(#${e}\\)\\s*$`).test(subject);
   });
+}
+
+/** PURE. Prepare-mode credit (2026-10-07, #4560): a commit that delivers a card often says so in prose, not in
+ *  the strict `WE #<id>:` lead shape - "WE #4554: ... (also delivers xak56ki)" delivered card xak56ki and names
+ *  it without a `#`. For the PREPARE already-done path the bar is: some id appears anywhere in the message as a
+ *  whole word (a `#` is optional), the message carries a delivery verb, and the SUBJECT has no partial-delivery
+ *  marker. The other checks (real ancestor of origin/main, non-backlog files touched) and the test run still
+ *  apply, so this is looser on wording only, never on evidence. */
+export function commitCreditsItem(message, ids) {
+  const text = String(message ?? '');
+  const subject = text.split(/\r?\n/)[0].trim();
+  if (!subject || PARTIAL_DELIVERY_RE.test(subject)) return false;
+  if (!/\b(?:deliver(?:s|ed)?|closes?|closed|fix(?:es|ed)?|resolves?|resolved|implements?|implemented|lands?|landed)\b/i.test(text)) return false;
+  const list = (Array.isArray(ids) ? ids : [ids]).map((id) => String(id ?? '').trim()).filter(Boolean);
+  return list.some((id) => new RegExp(`(?<![\\w/])#?${escapeRegExp(id)}(?![\\w])`).test(text));
+}
+
+/** PURE. The test files a commit touched, from `git show --name-only` text (deleted files cannot be told apart
+ *  here, so the caller keeps only those that still exist in the lane). */
+export function commitTestFiles(files) {
+  const list = Array.isArray(files) ? files : String(files ?? '').split('\n');
+  return list.map((f) => f.trim()).filter((f) => /\.(?:test|spec)\.(?:m?[jt]sx?|cjs)$/.test(f));
 }
 
 /** PURE. Extract a card's `bornAs:` hash from its frontmatter text, or `null` if absent/unparseable. */
@@ -242,9 +264,10 @@ function renderPrBody({ num, route, commit, reason }) {
  * acquiring/releasing a lane is the pool's own bookkeeping, not "editing the daemon clone").
  * @returns {{status:'landed'|'failed', pr?, prUrl?, error?}}
  */
-export function landOne({ num, route, commit = null, reason = null }, {
+export function landOne({ num, route, commit = null, reason = null, citation = 'strict' }, {
   runFn = runCmd, acquireFn = acquireLane, releaseFn = releaseLane,
   readFile = readFileSync, writeFile = writeFileSync, listCardNames = (lane) => readdirSync(join(lane, 'backlog')),
+  existsFile = (p) => existsSync(p),
 } = {}) {
   if (route !== 'already-done' && route !== 'out-of-scope') {
     return { status: 'failed', error: `landOne: unroutable route '${route}' — only 'already-done'/'out-of-scope' land here` };
@@ -299,7 +322,8 @@ export function landOne({ num, route, commit = null, reason = null }, {
           deliveredCard = { title: /^#\s+(.+)$/m.exec(raw)?.[1], raw };
         }
       } catch { /* best-effort — fall through with bornAs: null */ }
-      if (!commitReferencesItem(commitMessage, [num, bornAs])) {
+      const prepareCitation = citation === 'prepare';
+      if (!prepareCitation && !commitReferencesItem(commitMessage, [num, bornAs])) {
         throw new Error(`landOne: cited commit ${commit} is on main but its own message never references #${num}${bornAs ? ` or #${bornAs}` : ''} — refusing to auto-resolve on an unrelated-but-real citation`);
       }
       const commitFiles = runFn('git', ['show', '--name-only', '--format=', commit], lane);
@@ -309,7 +333,22 @@ export function landOne({ num, route, commit = null, reason = null }, {
       //  (4) PR #2967 review (security finding) — a mention is not a delivery: the SUBJECT must name this card
       //      as what the commit delivers, with no partial-delivery marker (`commitDeliversItem`, above), or a
       //      "see #N" / "follow-up to #N" / "WE #N: part 1" commit would close a card whose spec is unbuilt.
-      if (!commitDeliversItem(commitMessage, [num, bornAs])) {
+      if (prepareCitation) {
+        // A prepare worker's "already done" is checked independently, never taken on its word: the message must
+        // credit THIS card (either id), and the tests the commit touched must pass on current main.
+        if (!commitCreditsItem(commitMessage, [num, bornAs])) {
+          throw new Error(`landOne: cited commit ${commit} does not credit #${num}${bornAs ? ` or ${bornAs}` : ''} as delivered (no id with a delivery verb, or a partial subject) — refusing to auto-resolve`);
+        }
+        const testFiles = commitTestFiles(commitFiles).filter((f) => existsFile(join(lane, f)));
+        if (!testFiles.length) {
+          throw new Error(`landOne: cited commit ${commit} touches no test file that still exists - nothing to prove the delivery - refusing to auto-resolve`);
+        }
+        try {
+          runFn('node', [join(lane, 'scripts', 'readiness', 'heavy-admission.mjs'), 'run', '--', 'npx', 'vitest', 'run', ...testFiles], lane, { timeoutMs: VERIFY_TIMEOUT_MS });
+        } catch (e) {
+          throw new Error(`landOne: the tests cited commit ${commit} added fail on current main (${testFiles.length} file(s)) - refusing to auto-resolve: ${String(e?.stderr || e?.stdout || e?.message || e).trim().split('\n')[0].slice(0, 160)}`);
+        }
+      } else if (!commitDeliversItem(commitMessage, [num, bornAs])) {
         throw new Error(`landOne: cited commit ${commit} mentions #${num} but its subject does not deliver it (a related, follow-up or partial commit) — refusing to auto-resolve`);
       }
       runFn('node', [join(lane, 'scripts', 'backlog.mjs'), 'resolve', String(num), `--graduated-to=${commit}`], lane);

@@ -935,6 +935,65 @@ describe('standalone prepare', () => {
     const empty = prepareIo({ numstat: '', lastMessage: 'could-not-prepare: scope is wrong' });
     expect((await runProbationBuild(prepareArgs(), empty.io)).detail).toContain('scope is wrong');
   });
+  // Live 2026-10-07 19:35Z: both reports below were recorded as FAILURES ("prepare requires a card-only diff").
+  it('replays #4560: an already-done report is verified through the landing pass and settles as handled, not failed', async () => {
+    const lastMessage = "already-done - delivered by commit 10fedba67afc, which references this card's birth ID xak56ki";
+    const { io, calls } = prepareIo({ numstat: '', postWorkerRaw: ITEM_RAW, lastMessage });
+    const settled = [];
+    io.settlePrepare = entry => settled.push(entry);
+    const result = await runProbationBuild({ ...prepareArgs(), runId: 'builder', effectKey: 'prepare#1' }, io);
+    expect(result).toMatchObject({ outcome: 'prepare-already-done', pr: 9002 });
+    expect(result).not.toHaveProperty('cause');
+    expect(settled[0]).toMatchObject({ status: 'applied' });
+    expect(calls.find(c => c[0] === 'land')[1]).toEqual({ num: '4291', route: 'already-done', commit: '10fedba67afc', reason: 'spec already done on main: commit 10fedba67afc' });
+    expect(calls.some(c => ['stamp', 'resolve', 'openPr'].includes(c[0]))).toBe(false);
+  });
+  it('an already-done the landing pass cannot verify is a needs-you hold, never a resolve and never a failure record', async () => {
+    const { io, calls } = prepareIo({ numstat: '', postWorkerRaw: ITEM_RAW, lastMessage: 'already-done - commit 10fedba67afc' });
+    io.landAlreadyDone = () => ({ status: 'failed', error: 'cited commit does not credit the card' });
+    const result = await runProbationBuild(prepareArgs(), io);
+    expect(result).toMatchObject({ outcome: 'prepare-needs-you', detail: expect.stringContaining('was not verified') });
+    expect(result).not.toHaveProperty('cause');
+    expect(calls.some(c => c[0] === 'resolve')).toBe(false);
+  });
+  it('an already-done with no cited commit is never resolved: needs-you hold', async () => {
+    const { io, calls } = prepareIo({ numstat: '', postWorkerRaw: ITEM_RAW, lastMessage: 'already-done - shipped last week' });
+    const result = await runProbationBuild(prepareArgs(), io);
+    expect(result).toMatchObject({ outcome: 'prepare-needs-you' });
+    expect(calls.some(c => c[0] === 'land')).toBe(false);
+    expect(calls.find(c => c[0] === 'hold')[1].reason).toMatch(/^needs-you: prepare blocked \(already-done\)/);
+  });
+  describe('replays #4328: a bad-scope report routes to a re-scope step', () => {
+    const lastMessage = 'could-not-prepare — scope is wrong: `scope:` points at the 4309 backlog card itself, so a build would have nothing to build';
+    const cardWithRefs = ITEM_RAW.replace('we:docs/probation/probation.md', 'we:backlog/4309-queue.md') + '\n1. `we:backlog/4309-queue.md:67` - a unit test.\n';
+    const badItem = { path: 'backlog/4291-probation-launcher.md', slug: 'probation-launcher', title: 'x', spec: '', raw: cardWithRefs, scope: ['we:backlog/4309-queue.md'] };
+    it('re-derives the scope from the cited card, rewrites it, and re-runs the worker once', async () => {
+      const { io, calls } = prepareIo({ item: badItem, numstat: '', postWorkerRaw: badItem.raw, lastMessage });
+      io.pathExists = (_d, rel) => rel === 'scripts/queue.mjs';
+      io.readCardScope = (_d, rel) => (rel === 'backlog/4309-queue.md' ? ['we:scripts/queue.mjs', 'we:backlog/x.md'] : []);
+      await runProbationBuild(prepareArgs(), io);
+      expect(calls.filter(c => c[0] === 'worker')).toHaveLength(2);
+      expect(calls.find(c => c[0] === 'card')[2]).toContain('scope: ["we:scripts/queue.mjs"]');
+    });
+    it('holds with a needs-you reason when no scope can be derived: not a failure, not a silent unstamped hold', async () => {
+      const { io, calls } = prepareIo({ item: badItem, numstat: '', postWorkerRaw: badItem.raw, lastMessage });
+      const result = await runProbationBuild(prepareArgs(), io);
+      expect(result).toMatchObject({ outcome: 'prepare-needs-you', detail: expect.stringContaining('needs-you: prepare blocked (spec-defect)') });
+      expect(result).not.toHaveProperty('cause');
+      expect(calls.filter(c => c[0] === 'worker')).toHaveLength(1);
+      expect(calls.find(c => c[0] === 'hold')[1].route).toBe('other');
+      expect(calls.some(c => ['stamp', 'resolve', 'openPr'].includes(c[0]))).toBe(false);
+    });
+    it('a second spec-defect report after a re-scope is a needs-you hold, not a loop', async () => {
+      const { io, calls } = prepareIo({ item: badItem, numstat: '', postWorkerRaw: badItem.raw, lastMessage });
+      io.pathExists = (_d, rel) => rel === 'scripts/queue.mjs';
+      io.readCardScope = () => ['we:scripts/queue.mjs'];
+      io.findItem = (() => { let n = 0; return () => { n += 1; return n <= 2 ? badItem : { ...badItem, raw: calls.find(c => c[0] === 'card')?.[2] ?? badItem.raw }; }; })();
+      const result = await runProbationBuild(prepareArgs(), io);
+      expect(result.outcome).toBe('prepare-needs-you');
+      expect(calls.filter(c => c[0] === 'worker')).toHaveLength(2);
+    });
+  });
   it('persists both terminal outcomes against the original dispatch identity', async () => {
     for (const succeeds of [true, false]) {
       const { io } = prepareIo();

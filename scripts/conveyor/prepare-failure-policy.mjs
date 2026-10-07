@@ -99,7 +99,7 @@ export async function recordPrepareFailure({ num, attempt, stage, evidence = {} 
     // count every unfinished, not-yet-re-armed transient failure of this card; at the cap it stays held
     // (`exhausted`) until a re-arm, which starts a fresh budget (a re-armed record no longer counts).
     const attempts = Object.values(state.failures).filter(f => f.num === num && f.cause === 'dispatch-transient' && !f.completed && !f.rearmedAt && !f.budgetResetAt).length + 1;
-    Object.assign(failure, { reasonCode: evidenceReasonCode(evidence), attempts, ...backoffVerdict({ attempts, now, settings }) });
+    Object.assign(failure, { reasonCode: evidenceReasonCode(evidence), attempts, ...backoffVerdict({ attempts, now, settings, code: evidenceReasonCode(evidence) }) });
   }
   state.failures[key] = failure;
   if (cause === 'unknown') {
@@ -156,7 +156,7 @@ export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date
       const at = Date.parse(f.recordedAt ?? f.attempt);
       const attempts = Object.values(state.failures).filter(o => o.num === f.num && o.cause === 'dispatch-transient' && !o.completed && !o.rearmedAt && !o.budgetResetAt).length + 1;
       Object.assign(f, { cause: 'dispatch-transient', healedFrom: 'unknown', reasonCode: code, attempts,
-        ...backoffVerdict({ attempts, now: Number.isFinite(at) ? at : now, settings }) });
+        ...backoffVerdict({ attempts, now: Number.isFinite(at) ? at : now, settings, code }) });
       healed = true;
     }
   }

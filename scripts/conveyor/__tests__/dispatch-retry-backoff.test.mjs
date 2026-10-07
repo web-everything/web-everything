@@ -438,3 +438,33 @@ describe('builder-starved — clone-wide refusals and stale holds self-heal (202
     expect(st.c).toMatchObject({ held: true, cause: 'unknown' }); // a result-stage failure keeps its diagnose hold
   });
 });
+
+describe('a late launch (effect-in-flight) retries quickly, not on the failure path (live #4647)', () => {
+  const IN_FLIGHT = `${NOT_CONFIRMED} [stdout: { "op": "dispatch-lane", "stopped": "effect-in-flight" }]`;
+  const DEFAULTS = readBackoffSettings({});
+  it('has its own reason code, ahead of launch-not-confirmed; a plain not-confirmed keeps its code', () => {
+    expect(reasonCodeOf(IN_FLIGHT)).toBe('launch-in-flight');
+    expect(reasonCodeOf(NOT_CONFIRMED)).toBe('launch-not-confirmed');
+  });
+  it('waits 30s doubling to 2min with the default settings, and a real failure still waits 5min', () => {
+    const now = Date.parse('2026-10-07T20:00:00Z');
+    const at = (code, attempts) => Date.parse(backoffVerdict({ attempts, now, settings: DEFAULTS, code }).retryAfter) - now;
+    expect([1, 2, 3, 4].map((n) => at('launch-in-flight', n))).toEqual([30_000, 60_000, 120_000, 120_000]);
+    expect(at('launch-not-confirmed', 1)).toBe(5 * 60_000);
+  });
+  it('stays bounded by the same attempt cap', () => {
+    expect(backoffVerdict({ attempts: DEFAULTS.maxAttempts, settings: DEFAULTS, code: 'launch-in-flight' })).toEqual({ retryAfter: null, exhausted: true });
+  });
+  it('a prepare failure with that evidence is held for a short retry and released on the next tick after it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'quick-retry-'));
+    try {
+      const path = join(dir, 'failures.json');
+      const now = Date.parse('2026-10-07T20:00:00Z');
+      const f = await recordPrepareFailure({ num: '4647', attempt: 'a1', stage: 'dispatch', evidence: { reason: IN_FLIGHT } }, { path, fileCard: vi.fn(), now, settings: DEFAULTS });
+      expect(f).toMatchObject({ cause: 'dispatch-transient', reasonCode: 'launch-in-flight', held: true });
+      expect(Date.parse(f.retryAfter) - now).toBe(30_000);
+      expect(releaseDuePrepareRetries({ path, now: now + 29_000, settings: DEFAULTS })).toEqual([]);
+      expect(releaseDuePrepareRetries({ path, now: now + 31_000, settings: DEFAULTS })).toEqual(['4647']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});

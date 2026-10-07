@@ -2175,6 +2175,23 @@ describe('automatic item preparation', () => {
     expect(next.prepare.launched.map(r => r.num)).toContain('4501');
     expect(effects.placePrepareHold).not.toHaveBeenCalled();
   });
+  it.each(['prepare-already-done', 'prepare-needs-you'])('a handled %s outcome is surfaced, never recorded as a prepare failure or unstamped hold', async (outcome) => {
+    const effects = fixture();
+    const path = join(lockRoot, 'failures.json');
+    effects.recordPrepareFailure = vi.fn(input => recordPrepareFailure(input, { path, fileCard: vi.fn() }));
+    effects.listPrepareFailures = () => Object.values(readFailureState(path).failures);
+    effects.listSettledPrepares = () => [{ num: '4501', source: 'run:handled', startedAt: '2026-09-29', outcome, evidence: { error: 'needs-you: prepare blocked (spec-defect) - scope is wrong' } }];
+    effects.readPrepareStatus = () => ({ preparedDate: null });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(effects.recordPrepareFailure).not.toHaveBeenCalled();
+    expect(effects.placePrepareHold).not.toHaveBeenCalled();
+    expect(tick.prepare.failures).toEqual([]);
+    expect(tick.prepare.held).toEqual([]);
+    expect(tick.prepare.handled).toEqual([{ num: '4501', outcome }]);
+    expect(tick.prepare.launched.map(r => r.num)).not.toContain('4501');
+    if (outcome === 'prepare-needs-you') expect(tick.needsYou).toContainEqual(expect.objectContaining({ num: '4501', step: 'prepare', reason: expect.stringContaining('scope is wrong') }));
+    else expect(tick.needsYou).toEqual([]);
+  });
   it('prepare kill switch and global freeze each prevent launches', async () => {
     const effects = fixture();
     expect((await runBuildDispatchTick({ live: true, prepareEnabled: false, effects })).prepare.planned).toEqual([]);
@@ -2460,6 +2477,8 @@ describe('probation prepare route circuit breaker', () => {
     const failed = [row('22'), row('25', 'escalated-needs-human')];
     expect(prepareRouteFallback(failed.slice(0, 1))).toBe(false);
     expect(prepareRouteFallback(failed)).toBe(true);
+    // A handled prepare (a needs-you hold, a verified already-done) is an outcome, never a probation failure.
+    expect(prepareRouteFallback([row('27', 'prepare-needs-you'), row('28', 'prepare-needs-you'), row('29', 'prepare-already-done')])).toBe(false);
     const releases = failed.map(r => ({ target: 'route:prepare', attempt: `${r.handle}:${r.scoredAt}` }));
     expect(prepareRouteFallback(failed, releases.slice(0, 1))).toBe(true);
     expect(prepareRouteFallback(failed, releases)).toBe(false);
