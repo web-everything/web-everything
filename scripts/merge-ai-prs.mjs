@@ -661,6 +661,15 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
   return evidence;
 }
 
+/** The skip reason for a PR whose merge state is not landable, naming the ACTUAL state (see the call site). */
+export function unlandableStateReason(state) {
+  const st = String(state || 'UNKNOWN').toUpperCase();
+  if (st === 'BLOCKED') {
+    return 'merge state BLOCKED (branch protection unsatisfied: required checks pending or red, or an uncleared review) — owned by the ci-heal / review daemons, nothing for the drain to rebase';
+  }
+  return `merge state ${st} (BEHIND⇒needs rebase, DIRTY/BLOCKED/DRAFT⇒not landable) — left for its author`;
+}
+
 /** Unreadable verification defers this pass before any review-label writer runs. */
 export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
   let evidence = {};
@@ -773,7 +782,10 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   else if (!testGreen) { decision = 'skip'; reason = `required check "${requiredCheck}" is not green`; }
   else if (blockOnCodeQL && isCodeQLFailed(pr)) { decision = 'skip'; codeqlBlocked = true; reason = `CodeQL check failed (new code-scanning alerts in the changed code) — refusing to land; fix the alert and re-push (drainBlocksOnCodeQL)`; }
   else if (mergeable !== 'MERGEABLE') { decision = 'skip'; reason = `not mergeable (mergeable=${mergeable || 'UNKNOWN'})`; }
-  else if (!landableState) { decision = 'skip'; reason = `merge state ${state || 'UNKNOWN'} (BEHIND⇒needs rebase, DIRTY/BLOCKED/DRAFT⇒not landable) — left for its author`; }
+  // The reason names the ACTUAL state: the old one-size text always said "BEHIND⇒needs rebase", so a PR that was
+  // only BLOCKED (checks red/pending, ci-heal already running: #4235, 2026-10-07) was classified `behind` in the
+  // skip-reasons log and read as an unowned rebase.
+  else if (!landableState) { decision = 'skip'; reason = unlandableStateReason(state); }
   // #2324 — refuse to land a PR with an empty/whitespace description, same rule pr-land.mjs enforces before
   // labelling (PR #206 landed bodyless). Checked before the review hold so the more actionable reasons win.
   else if (!hasNonEmptyBody(pr?.body)) { decision = 'skip'; reason = 'empty/whitespace description — refusing to land it (add a real summary of what changed and why; #2324)'; }

@@ -460,16 +460,17 @@ describe('latestRequiredCheck — a superseded run must not outvote the one that
     expect(isRequiredCheckFailed(staleGreenPlusQueued)).toBe(false); // and not red either
   });
 
-  it('ignores timestamps entirely — creation order alone decides (no clock is read)', () => {
-    // A rollup whose stamps CONTRADICT its order still resolves by order. This pins the trust-GitHub's-order
-    // rule: the earlier cut ranked by a timestamp and, on this shape, returned the FAILURE instead.
+  it('ranks by completedAt when every run has one; creation order decides only when stamps are unusable', () => {
+    // 2026-10-07 (PR #4290): GitHub's rollup order is NOT creation order (a FAILURE@17:27 was listed before its
+    // superseded SUCCESS@17:13), so positional "last wins" read stale green. A run with a real completedAt now
+    // ranks by it (in-flight runs, which have none, are newest); no usable stamp keeps the positional rule.
     const stampsContradictOrder = {
       statusCheckRollup: [
         { name: 'test', conclusion: 'FAILURE', startedAt: '2026-08-05T18:40:00Z', completedAt: '2026-08-05T18:50:00Z' },
         { name: 'test', conclusion: 'SUCCESS', startedAt: '2026-08-05T18:30:00Z', completedAt: '2026-08-05T18:31:00Z' },
       ],
     };
-    expect(isRequiredCheckGreen(stampsContradictOrder)).toBe(true);
+    expect(isRequiredCheckGreen(stampsContradictOrder)).toBe(false);
     const noTimes = { statusCheckRollup: [{ name: 'test', conclusion: 'CANCELLED' }, { name: 'test', conclusion: 'SUCCESS' }] };
     expect(isRequiredCheckGreen(noTimes)).toBe(true);
     const badTimes = {

@@ -1,5 +1,5 @@
 {
-  "heavyAdmissionCap": 2,
+  "heavyAdmissionCap": 3,
   "fixDispatchMaxConcurrent": 2,
   "maxLoadPerCore": 2.0,
   "memFreeMinPct": 15,

@@ -8,12 +8,17 @@ import { readBackoffSettings, backoffVerdict, evidenceReasonCode, BACKOFF_REASON
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 
 export const INFRA_RETRY_BUDGET = 2;
+/** builder-starved-2 — the lane-acquire infrastructure failure a prepare agent reports when it never got a lane. */
+export const LANE_ACQUIRE_INFRA_RE = /could not determine an origin URL/i;
 /** Only a failure of the dispatch launch itself is a known-transient candidate. */
 export const DISPATCH_TRANSIENT_STAGE = 'dispatch';
 export function classifyPrepareFailure(evidence = {}, stage = undefined) {
   // Match observed error output, never the prompt (which can mention hypothetical failures).
   const error = String(evidence.error ?? evidence.reason ?? '');
   if (/\bHTTP\s+429\b|\b429 Too Many Requests\b|rate.limit(?: exceeded| reached)|ECONNRESET|ENETUNREACH|EAI_AGAIN|network (?:error|unavailable)/i.test(error)) return 'infra-transient';
+  // builder-starved-2 (2026-10-07) — the agent never got a lane: `lane-pool.mjs acquire` could not resolve an origin
+  // from its scratch cwd (#4174). That is the launcher's fault, not the card's, so it is retried, never held for good.
+  if (LANE_ACQUIRE_INFRA_RE.test(`${error}\n${String(evidence.terminal ?? '')}`)) return 'infra-transient';
   if (evidence.sessionAbsent === true) return 'no-session';
   if (evidence.resultDiscarded === true && evidence.resultAuthored === true) return 'result-lost';
   if (evidence.stoppedBeforeCompletion === true) return 'agent-stopped-early';
@@ -154,6 +159,16 @@ export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date
         ...backoffVerdict({ attempts, now: Number.isFinite(at) ? at : now, settings }) });
       healed = true;
     }
+  }
+  // builder-starved-2 (2026-10-07) — (c) a held `unknown` failure of ANY stage whose evidence now classifies
+  // `infra-transient` (the agent never acquired a lane) is released, within the same per-card infra retry budget a
+  // fresh one gets. Live: #4560 sat `prepare-unstamped` on exactly this, waiting on a prevention card nobody built.
+  for (const f of Object.values(state.failures)) {
+    if (!f.held || f.completed || f.cause !== 'unknown' || classifyPrepareFailure(f.evidence, f.stage) !== 'infra-transient') continue;
+    const used = Object.values(state.failures).filter(o => o.num === f.num && o !== f && o.cause === 'infra-transient').length;
+    if (used >= INFRA_RETRY_BUDGET) continue;
+    Object.assign(f, { cause: 'infra-transient', healedFrom: 'unknown', held: false, retry: true, healedAt: new Date(now).toISOString() });
+    touched.add(f.num); healed = true;
   }
   for (const f of Object.values(state.failures)) {
     if (f.held && !f.completed && !f.exhausted && f.retryAfter && Date.parse(f.retryAfter) <= now) {

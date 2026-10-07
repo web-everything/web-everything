@@ -1935,6 +1935,19 @@ describe('automatic item preparation', () => {
     expect(tick.prepare.retired).toHaveLength(alive ? 0 : 1);
     if (!alive) expect(effects.settlePrepareRow).toHaveBeenCalledWith({ runId: 'run', key: 'dispatch:0:0', outcome: 'prepare-unstamped' });
   });
+  it('builder-starved-2: re-prepares a stale card whose only history is an older settled attempt that stamped it', async () => {
+    // Live 2026-10-07 16:59Z–18:49Z: the window held three prepare-stale cards, each with a settled run row from
+    // the attempt that wrote its (now stale) stamp. That stamp read as "prepared on main", so the daemon marked
+    // them finished and planned nothing, every tick.
+    const effects = fixture();
+    effects.listSettledPrepares = () => ['4501', '4502'].map((num) => ({ num, source: `run:${num}`, startedAt: '2026-10-07T08:00:00Z', outcome: 'prepare-completed' }));
+    effects.readPrepareStatus = () => ({ preparedDate: '2026-10-07', preparedAgainstSha: 'aaaa1111', pr: null });
+    effects.readPreparedStamp = () => ({ preparedDate: '2026-10-07', preparedAgainstSha: 'aaaa1111' });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.planned.map((p) => p.num)).toEqual(['4501', '4502']);
+    expect(effects.dispatch.mock.calls.map(([r]) => r.num)).toEqual(['4501', '4502']);
+    expect(effects.placePrepareHold).not.toHaveBeenCalled();
+  });
   it('clears an unstamped hold only after main has the stamp', async () => {
     const effects = fixture();
     effects.listHolds = () => [{ num: '4501', reason: 'prepare-unstamped' }];

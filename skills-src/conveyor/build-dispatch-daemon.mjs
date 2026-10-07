@@ -707,6 +707,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const status = prepareStatus.has(num) ? prepareStatus.get(num)
         : await effects.readPrepareStatus?.({ num, claimedAt: claim?.meta?.claimedAt ?? settled?.startedAt, replacesStamp: claimReplacesStamp(num) });
       if (prepareRows.some(r => normNum(r.num) === num && prepareIsLive(r))) continue;
+      // builder-starved-2 (2026-10-07) — a BARE spawn candidate (no claim, no hold, no guard: only an older settled
+      // run row) whose card carries a stamp on main is a `prepare-stale` card the tick core asks to RE-prepare. That
+      // stamp is the result of the earlier attempt the settled row records, not of a new one, so it must never mark
+      // the card finished: that skipped it every tick while it kept its prepare-ahead window slot, and nothing was
+      // ever prepared again (live 16:59Z–18:49Z: 0 prepares in 38 ticks, window = 4648/4647/5189, all re-prepares).
+      if (!tracked && !wasHeld && status?.preparedDate && !status?.pr
+        && !(bookkeeping.prepareGuards ?? []).some((g) => g.kind === 'prepare-item' && normNum(g.num) === num)
+        && prepareSpawns.some((s) => normNum(s.num) === num)) continue;
       const prDone = ['MERGED', 'CLOSED'].includes(status?.pr?.state);
       const awaitingPr = status?.pr?.state === 'OPEN';
       let why = status?.preparedDate ? 'prepared on main' : prDone ? `prepare PR ${status.pr.state.toLowerCase()}` : null;

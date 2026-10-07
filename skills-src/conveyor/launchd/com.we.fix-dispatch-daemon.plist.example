@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	The fix-dispatch daemon runs from its OWN dedicated clone, not the review daemon's. Sharing one clone made
+	the two daemons' self-sync rebuilds starve each other on the per-clone lock (2026-10-07 stalls).
+
+	BEFORE INSTALLING:
+	  1. git clone https://github.com/web-everything/web-everything.git ~/workspace/wev-fix-daemon
+	     cd ~/workspace/wev-fix-daemon && npm ci
+	  2. Add the GitHub App secrets the live plist carries (the app private key and the PR-events token):
+	     never commit them here.
+	INSTALL:  cp to ~/Library/LaunchAgents/com.we.fix-dispatch-daemon.plist (drop `.example`), then
+	          launchctl bootstrap gui/$(id -u) it.
+	-->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/you/.nvm/versions/node/v22.1.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key>
+		<string>120000</string>
+		<key>WE_FIX_BORROW_BUILD_SLOTS</key>
+		<string>off</string>
+		<key>WE_FIX_DISPATCH_MAX_CONCURRENT</key>
+		<string>3</string>
+		<key>WE_GH_THROTTLE_PERSONAL_ROUTE</key>
+		<string>1</string>
+		<key>WE_GITHUB_APP_ID</key>
+		<string>&lt;app-id&gt;</string>
+		<key>WE_GITHUB_APP_INSTALLATION_ID</key>
+		<string>&lt;installation-id&gt;</string>
+		<key>WE_HEAVY_ADMISSION_CAP</key>
+		<string>2</string>
+		<key>WE_HEAVY_ADMISSION_FAST_SLOTS</key>
+		<string>2</string>
+		<key>WE_PROBATION_LAUNCH</key>
+		<string>off</string>
+		<key>WE_PR_EVENTS</key>
+		<string>1</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.we.fix-dispatch-daemon</string>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/you/.nvm/versions/node/v22.1.0/bin/node</string>
+		<string>/Users/you/workspace/wev-fix-daemon/skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/you/workspace/wev-fix-daemon/.conveyor/fix-dispatch-daemon.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/you/workspace/wev-fix-daemon/.conveyor/fix-dispatch-daemon.log</string>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/you/workspace/wev-fix-daemon</string>
+</dict>
+</plist>

@@ -3,9 +3,11 @@ bornAs: x8x0ris
 kind: story
 size: 5
 tier: pinned
-status: open
+status: resolved
 scope: ["plateau:.github/workflows/ci.yml", "plateau:.github/workflows/deploy.yml", "plateau:.github/workflows/deploy-alpha.yml", "plateau:scripts/check-sibling-credential.mjs", "plateau:scripts/lib/sibling-credential.mjs", "plateau:scripts/check-sibling-credential.test.mjs"]
 dateOpened: "2026-09-28"
+dateStarted: "2026-10-07"
+dateResolved: "2026-10-07"
 preparedDate: "2026-10-07"
 preparedAgainstSha: "8efa93ed7d2a942f9ec1c6b0896c0986241e87bd"
 tags: []
@@ -40,7 +42,7 @@ MVP = in plateau-app's workflow(s) under `plateau:.github/workflows/`, mint an i
   - **Premise holds, not delivered.** `plateau:.github/workflows/ci.yml:61-65` (`test`) and `:116-120` (`e2e`), `plateau:.github/workflows/deploy.yml:154-159` and `plateau:.github/workflows/deploy-alpha.yml:83-87` still check out the FUI sibling with `secrets.FUI_READ_TOKEN`; no `create-github-app-token` step exists in plateau-app. `git log origin/main --grep=4382` in plateau-app finds nothing. An earlier unlanded build attempt (salvage `lane-1.bundle`, commits e0ab6e6/2cda68f) sits on a stale base (`f1a83271`, 164 files / 17k lines behind `main`); it is not reusable as-is.
   - **Drift corrected.** (1) The private repo is `frontier-ui/frontierui`, not `chalbert/frontierui` (`plateau:.github/workflows/ci.yml:64`); the salvaged attempt scoped the mint to the wrong owner. (2) web-everything already shipped this exact pattern for its own CI (`we:.github/workflows/ci.yml:133-147`, test `we:scripts/__tests__/ci-fui-checkout-app-token.test.mjs`): `actions/create-github-app-token@v2`, `app-id: ${{ vars.WE_APP_ID }}` (a repo VARIABLE, not a secret), `private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}`, `owner: frontier-ui`, `repositories: frontierui`, `permission-contents: read`, guarded by `if: vars.WE_APP_ID != ''`. The card's "secrets `WE_APP_ID`" is corrected to follow that precedent so one App serves both repos. (3) `size:` 5 unchanged. `scope:` gains the new preflight script + its test (still led by the CI workflow).
   - Done-when #1 was a TODO; now concrete (above).
-- [ ] Build: the `## MVP` below.
+- [x] Build: the `## MVP` below — delivered 2026-10-07 in plateau-app (mint + preflight in `test`/`e2e`; deploy workflows left as follow-ups). Done-when #2 (set `WE_APP_ID` / `WE_APP_PRIVATE_KEY` on plateau-app) remains the operator's step.
 
 ## Design
 

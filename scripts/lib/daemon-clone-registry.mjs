@@ -44,7 +44,10 @@ const SEP = path.sep;
  * Daemon-clone directory names, siblings of the constellation workspace root (the same parent
  * `guard-lane.mjs#workspaceRootOf` derives `PRIMARY_REPOS` against) — except the drain's own clone, which is
  * nested under `.lanes/` (see this file's header). Discovered 2026-09-26 from the live launchd registration:
- *   - `wev-review-daemon`    — com.we.review-daemon, fix-dispatch-daemon, lease-reaper,
+ *   - `wev-fix-daemon`       — com.we.fix-dispatch-daemon (its OWN clone since 2026-10-07: sharing
+ *                              `wev-review-daemon` made the two daemons' self-sync rebuilds starve each other
+ *                              on the one clone lock; see skills-src/conveyor/launchd/com.we.fix-dispatch-daemon.plist.example)
+ *   - `wev-review-daemon`    — com.we.review-daemon, lease-reaper,
  *                              lane-pool-health-watch-{we,frontierui,plateau-app}, parked-pr-conflict-watch-*
  *   - `wev-merge-daemon`     — com.we.conveyor-pass-daemon.merge-orphan-sweep
  *   - `wev-health-watch`     — com.we.health-watch
@@ -56,6 +59,7 @@ const SEP = path.sep;
  */
 export const DAEMON_CLONE_SEED = [
   'wev-review-daemon',
+  'wev-fix-daemon',
   'wev-merge-daemon',
   'wev-health-watch',
   'wev-health-responder',
