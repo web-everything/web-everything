@@ -6,6 +6,7 @@ priority: high
 parent: "4075"
 status: open
 scope: ["we:scripts/lib/daemon-clone-registry.mjs", "we:scripts/backlog/guarded-write.mjs", "we:scripts/backlog/__tests__/primary-write-guard.test.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/health-smells/control-clone-dirty.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:scripts/__tests__/guard-lane.test.mjs", "we:scripts/__tests__/guard-bash.test.mjs"]
+scopeRationale: "we:scripts/backlog.mjs is named in the MVP only as the CALLER whose verbs (unqueue, release --force, resolve) route through the guarded writeBacklogMd sink and are exercised by the drain-clone regression test; it is not edited — the guard change lives in we:scripts/backlog/guarded-write.mjs."
 dateOpened: "2026-09-28"
 preparedDate: "2026-10-07"
 preparedAgainstSha: "45d426ce98ca541f7a2ed18ef1b9bdfac26fa506"
