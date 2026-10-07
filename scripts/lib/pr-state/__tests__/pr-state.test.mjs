@@ -255,38 +255,129 @@ describe('fail closed: every hold rule defaults to deny (review of PR #4326)', (
     it('a new SHA with a committedAt older than the send-back (clock skew) is released', () => {
       expect(state(events, facts({ head: { sha: H2, committedAt: at(2) } })).holds.map(h => h.code)).not.toContain('send-back');
     });
-    it('no recorded head before the send-back, or no current head: stays sent back until a later event witnesses the current head', () => {
+    it('no recorded head before the send-back, or no current head: stays sent back (a later event on the same head proves nothing)', () => {
       const bare = [ev('send-back', 10, { cause: 'changes' })];
       const f = facts({ head: { sha: H2, committedAt: at(20) } });
-      expect(state(bare, f).holds.map(h => h.code)).toContain('send-back');
-      expect(state([...bare, ev('review-run', 15, { headSha: H2, phase: 'started', posted: null })], f).holds.map(h => h.code)).not.toContain('send-back');
+      const codes = evs => state(evs, f).holds.map(h => h.code);
+      expect(codes(bare)).toContain('send-back');
+      // A later observation establishes the CURRENT sha, not that it differs from the sent-back one (review of PR #4326, round 3).
+      for (const later of [ev('review-run', 15, { headSha: H2, phase: 'started', posted: null }), ev('review-run', 15, { headSha: H2, phase: 'completed', posted: false }), verdict(VERDICTS.CHANGES, 15, H2), referral(15, H2, 'k1')]) {
+        expect(codes([...bare, later])).toContain('send-back');
+      }
       expect(state(events, facts({ head: undefined })).holds.map(h => h.code)).toContain('send-back');
     });
   });
 
-  describe('same-class variants found in self-review', () => {
-    it('a hand-added hold is not lifted by an accept when the current head is unknown', () => {
-      const added = ev('label-input', 4, { label: 'review:human', sender: 'someone', change: 'added' });
-      expect(state([added, verdict(VERDICTS.ACCEPTED, 9, H1)], facts({ head: undefined })).holds.map(h => h.code)).toContain('label-input:review:human');
+  describe('review of PR #4326, round 3: every ledger row is untrusted input', () => {
+    const codes = out => out.holds.map(h => h.code);
+    const rawVerdict = (o = {}) => ({ type: 'verdict', repo, pr: PR, verdict: 'accepted', clears: true, at: at(1), headSha: H1, ...o });
+
+    describe('an invalid row for this PR holds as ledger-unreadable instead of throwing or being skipped', () => {
+      const lbl = ev('label-input', 3, { label: 'review:human', sender: 'someone', change: 'added' });
+      it.each([
+        ['referral without findingKeys', { ...referral(2, H1, 'k'), findingKeys: undefined }],
+        ['referral with a string findingKeys (would iterate characters)', { ...referral(2, H1, 'k'), findingKeys: 'abc' }],
+        ['referral with a non-string key inside findingKeys', { ...referral(2, H1, 'k'), findingKeys: [{}] }],
+        ['referral with an empty findingKeys', { ...referral(2, H1, 'k'), findingKeys: [] }],
+        ['referral with a garbage headSha', { ...referral(2, H1, 'k'), headSha: 'garbage-xx' }],
+        ['ruling without findingKey', { ...ruling(2, 'k', 'block'), findingKey: undefined }],
+        ['ruling with a non-string findingKey', { ...ruling(2, 'k', 'block'), findingKey: { toString: 1 } }],
+        ['review-run with a numeric headSha', { ...ev('review-run', 2, { headSha: H1, phase: 'started', posted: null }), headSha: 5 }],
+        ['a string pr that the fold would skip', { ...verdict(VERDICTS.CHANGES, 2), pr: String(PR) }],
+        ['an array pr', { ...verdict(VERDICTS.CHANGES, 2), pr: [PR] }],
+        ['a mis-cased verdict type', { ...verdict(VERDICTS.CHANGES, 2), type: 'Verdict' }],
+        ['a hold with a trailing-space type', { ...ev('hold', 2, { reasonCode: 'x', holdSource: 'y' }), type: 'hold ' }],
+        ['an unknown event type', { ...ev('hold', 2, { reasonCode: 'x', holdSource: 'y' }), type: 'freeze' }],
+        ['a label-input with a mis-cased change', { ...lbl, change: 'Added' }],
+        ['an approval with no kind', { ...ev('approval', 5, { approval: 'judge', delegation: null }), approval: undefined }],
+        ['an approval with an unknown kind', { ...ev('approval', 5, { approval: 'judge', delegation: null }), approval: 'lol' }],
+      ])('%s', (_n, row) => {
+        const out = state([verdict(VERDICTS.ACCEPTED, 1), row], facts());
+        expect(codes(out)).toEqual(['ledger-unreadable']);
+        expect(out).toMatchObject({ lifecycleState: 'NEEDS-OPERATOR', clears: false });
+      });
+      it('a row that cannot be attributed to a PR and repo holds every PR; another PR\'s invalid payload is not ours', () => {
+        expect(codes(state([verdict(VERDICTS.ACCEPTED, 1), { ...verdict(VERDICTS.CHANGES, 2), pr: 'x' }], facts()))).toEqual(['ledger-unreadable']);
+        const elsewhere = { ...referral(2, H1, 'k'), pr: 999, findingKeys: 'abc' };
+        expect(state([verdict(VERDICTS.ACCEPTED, 1), elsewhere], facts()).clears).toBe(true);
+      });
+      it('a forged clears field never clears: it is derived from the verdict word', () => {
+        for (const v of [VERDICTS.CHANGES, VERDICTS.HUMAN, VERDICTS.PENDING]) {
+          const out = state([verdict(VERDICTS.ACCEPTED, 1), { ...verdict(v, 2), clears: true }], facts());
+          expect(out.clears).toBe(false);
+          expect(out.lifecycleState).not.toBe('READY-TO-MERGE');
+        }
+      });
+      it('a hostile row (a throwing getter, a Proxy) holds; it never throws', () => {
+        const trap = new Proxy({}, { get() { throw new Error('boom'); } });
+        expect(codes(state([trap], facts()))).toEqual(['derive-crashed']);
+        expect(codes(state([{ get pr() { throw new Error('boom'); } }], facts()))).toEqual(['derive-crashed']);
+      });
+      it.each([[null], ['junk'], [42]])('settings=%j never throws and the built-ins still hold', settings => {
+        const out = state([verdict(VERDICTS.HUMAN, 1)], facts(), settings);
+        expect(out.lifecycleState).toBe('NEEDS-OPERATOR');
+        expect(labelsToLedgerState(facts({ labels: ['review:accepted'] }), settings).lifecycleState).toBe('READY-TO-MERGE');
+      });
+      it('a crash anywhere in the fold or the core holds as derive-crashed; it never throws', () => {
+        const hostile = facts({ requiredChecks: { get some() { throw new Error('boom'); } } });
+        expect(codes(state([verdict(VERDICTS.ACCEPTED, 1)], hostile))).toEqual(['derive-crashed']);
+      });
     });
-    it('head SHAs compare case-insensitively, trimmed, and a short prefix never matches', () => {
-      const out = state([verdict(VERDICTS.ACCEPTED, 1, H1)], facts({ head: { sha: ` ${H1.toUpperCase()} `, committedAt: at(0) } }));
-      expect(out.holds).toEqual([]);
-      expect(state([verdict(VERDICTS.ACCEPTED, 1, H1)], facts({ head: { sha: 'a', committedAt: at(0) } })).holds.map(h => h.code)).toContain('stale-acceptance');
+
+    describe('an unknown current head never lets an acceptance clear', () => {
+      it.each([[undefined], [{}], [{ sha: null }], [{ sha: '' }], [{ sha: 'abc' }]])('facts.head=%j', head => {
+        const out = state([verdict(VERDICTS.ACCEPTED, 1, H1)], facts({ head }));
+        expect(codes(out)).toContain('stale-acceptance');
+        expect(out).toMatchObject({ clears: false });
+        expect(out.lifecycleState).not.toBe('READY-TO-MERGE');
+      });
+      it('also for an approval-lifted human verdict', () => {
+        const out = state([verdict(VERDICTS.HUMAN, 1), ev('approval', 5, { approval: 'judge', delegation: null })], facts({ head: undefined }));
+        expect(out.clears).toBe(false);
+      });
     });
-    it('an unknown or mis-cased ruling value closes nothing', () => {
-      const forged = { ...ruling(2, 'k1', 'block'), ruling: 'Block' };
-      expect(deriveReferrals([referral(1, H1, 'k1'), forged]).get('k1').state).toBe('open');
-    });
-    it('hold keys that join to the same string do not collide', () => {
-      const h = (m, src, code) => ev('hold', m, { holdSource: src, reasonCode: code });
-      const r = (m, src, code) => ev('release', m, { holdSource: src, reasonCode: code });
-      const out = state([verdict(VERDICTS.ACCEPTED, 1), h(2, 'a:b', 'c'), r(3, 'a', 'b:c')], facts());
-      expect(out.holds.map(x => x.code)).toEqual(['hold:a:b:c']);
-    });
-    it('a non-array or junk-entry ledger holds instead of throwing', () => {
-      expect(state({}, facts()).holds.map(h => h.code)).toEqual(['ledger-unreadable']);
-      expect(state([null], facts()).holds.map(h => h.code)).toEqual(['ledger-unreadable']);
+
+    describe('defense in depth: the rules themselves default to deny on a raw view (they are public extension-point inputs)', () => {
+      const rawVerdict = (o = {}) => ({ type: 'verdict', repo, pr: PR, verdict: 'accepted', clears: true, at: at(1), headSha: H1, ...o });
+      const run = (events, f, current = null) => evaluateHolds({ view: { events, folded: current ? { current } : null, clears: !!current, referrals: deriveReferrals(events) }, facts: f, settings: {} }).map(h => h.code);
+      const headed = sha => facts({ head: { sha, committedAt: at(3) } });
+      it('a clearing row with a top-level headSha and no coverage object covers only that exact head', () => {
+        const row = rawVerdict();
+        expect(run([row], headed(H2), row)).toContain('stale-acceptance');
+        expect(run([row], headed(H1), row)).not.toContain('stale-acceptance');
+      });
+      it('label-input: the coverage-less accept for another head leaves a hand-added hold', () => {
+        const added = ev('label-input', 0, { label: 'review:human', sender: 'someone', change: 'added' });
+        expect(run([added, rawVerdict()], headed(H2))).toContain('label-input:review:human');
+        expect(run([added, rawVerdict({ headSha: H2 })], headed(H2))).not.toContain('label-input:review:human');
+      });
+      it('a coverage object that names no head is not rescued by a top-level headSha', () => {
+        const row = rawVerdict({ coverage: { headSha: null } });
+        expect(run([row], headed(H1), row)).toContain('stale-acceptance');
+      });
+      it.each([['abc'], ['zzzzzzzz'], [null], ['']])('send-back: a current head of %j is unknown, so it never releases', head => {
+        const events = [verdict(VERDICTS.ACCEPTED, 1, H1), ev('send-back', 10, { cause: 'changes' })];
+        expect(state(events, facts({ head: { sha: head, committedAt: at(20) } })).holds.map(h => h.code)).toContain('send-back');
+      });
+      it('a non-string current head never clears (it holds, whichever rule or the core trips first)', () => {
+        const out = state([verdict(VERDICTS.ACCEPTED, 1, H1), ev('send-back', 10, { cause: 'changes' })], facts({ head: { sha: 5, committedAt: at(20) } }));
+        expect(out.clears).toBe(false);
+        expect(out.lifecycleState).not.toBe('READY-TO-MERGE');
+      });
+      it('send-back: a garbage baseline head is not a baseline', () => {
+        const events = [{ type: 'review-run', repo, pr: PR, headSha: 'garbage-zz', phase: 'started' }, ev('send-back', 10, { cause: 'changes' })];
+        expect(run(events, headed(H1))).toContain('send-back');
+      });
+      it('referrals: a garbage head on the referral or on the clearing verdict resolves nothing', () => {
+        const garbage = { type: 'referral', repo, pr: PR, headSha: 'garbage-xx', findingKeys: ['k1'] };
+        expect(deriveReferrals([garbage, rawVerdict()]).get('k1').state).toBe('open');
+        expect(deriveReferrals([referral(1, H1, 'k1'), rawVerdict({ headSha: 'garbage-xx' })]).get('k1').state).toBe('open');
+      });
+      it.each(['toString', 'constructor', 'valueOf', 'hasOwnProperty', '__proto__', 'isPrototypeOf'])('ruling=%s closes nothing, and an end-to-end derive rejects the row', name => {
+        const forged = { ...ruling(2, 'k1', 'block'), ruling: name };
+        expect(deriveReferrals([referral(1, H1, 'k1'), forged]).get('k1').state).toBe('open');
+        expect(codes(state([verdict(VERDICTS.ACCEPTED, 1), referral(1, H1, 'k1'), forged], facts()))).toEqual(['ledger-unreadable']);
+      });
     });
   });
 });

@@ -10,15 +10,17 @@
  */
 import { EVENT_TYPES, verdictClears } from '../verdict-ledger.mjs';
 
-const RULING_STATE = Object.freeze({ block: 'blocking', 'not-real': 'ruled', card: 'ruled' });
-const normSha = v => String(v ?? '').trim().toLowerCase();
-/** Two head SHAs name the same commit (either may abbreviate the other, 7+ chars each, case and padding ignored). False when either is absent or too short to identify a commit. */
+const RULING_STATE = new Map([['block', 'blocking'], ['not-real', 'ruled'], ['card', 'ruled']]); // a Map: a raw name like 'toString' or '__proto__' must never resolve through the prototype chain
+const normSha = v => (typeof v === 'string' ? v.trim().toLowerCase() : '');
+/** A head SHA a rule may act on: 7 to 64 hex characters. Anything else (garbage, a number, 'abc') is an UNKNOWN head, never "a different head". */
+export const isSha = v => /^[0-9a-f]{7,64}$/.test(normSha(v));
+/** Two head SHAs name the same commit (either may abbreviate the other, 7+ chars each, case and padding ignored). False when either is absent, too short, or not a SHA. */
 export const sameHead = (a, b) => {
   const x = normSha(a), y = normSha(b);
-  return x.length >= 7 && y.length >= 7 && (x.startsWith(y) || y.startsWith(x));
+  return isSha(x) && isSha(y) && (x.startsWith(y) || y.startsWith(x));
 };
 /** The head a verdict row was witnessed at (v1 rows keep it under `coverage`). */
-export const verdictHead = row => row?.coverage?.headSha ?? row?.headSha ?? null;
+export const verdictHead = row => (row?.coverage ? row.coverage.headSha : row?.headSha) ?? null; // a coverage object that names no head is not rescued by a top-level headSha
 
 /**
  * @param {object[]} events One PR's ledger events in append order.
@@ -37,12 +39,12 @@ export function deriveReferrals(events) {
     } else if (e.type === EVENT_TYPES.RULING) {
       const k = keys.get(e.findingKey);
       // Only the closed set of rulings moves a key; an unknown value (a forged or mis-cased row) changes nothing.
-      const state = RULING_STATE[e.ruling];
+      const state = RULING_STATE.get(e.ruling);
       if (k && state) keys.set(e.findingKey, { ...k, state, ruling: e.ruling });
     } else if ((e.type === EVENT_TYPES.VERDICT || e.type === undefined) && verdictClears(e.verdict)) {
       const head = verdictHead(e);
       for (const [key, k] of keys) {
-        if ((k.state === 'open' || k.state === 'blocking') && head && k.head && !sameHead(head, k.head)) keys.set(key, { ...k, state: 'resolved-by-fix', resolvedAtHead: head });
+        if ((k.state === 'open' || k.state === 'blocking') && isSha(head) && isSha(k.head) && !sameHead(head, k.head)) keys.set(key, { ...k, state: 'resolved-by-fix', resolvedAtHead: head });
       }
     }
   }
