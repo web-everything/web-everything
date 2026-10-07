@@ -118,12 +118,12 @@ describe('(2) the fixer cap counts only live sessions', () => {
   });
   it('the throttle admits when the only claims at the cap are dead borrows', () => {
     const dead = claim('fix', { borrowed: { executor: 'codex' }, runnerPid: 1 });
-    const t = createDispatchThrottle({ listClaims: () => [dead, dead, dead], env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '2' }, loadavg: () => 0, cpuCount: () => 8, alive: () => false });
+    const t = createDispatchThrottle({ listClaims: () => [dead, dead, dead], env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '2' }, sample: () => ({ ok: false }), loadavg: () => 0, cpuCount: () => 8, alive: () => false });
     expect(t.tryAdmit('fix')).toEqual({ admit: true });
   });
   it('dead borrows do not occupy builder slots in the borrow gate', () => {
     const dead = claim('fix', { borrowed: { executor: 'codex' }, runnerPid: 1 });
-    const g = createFixBorrowGate({
+    const g = createFixBorrowGate({ sample: () => ({ ok: false }),
       env: {}, settings: { enabled: true, afterMinutes: 0, executor: 'codex' }, ledger: { read: () => ({}), write: () => {} },
       outcomes: { read: () => ({}), write: () => {} }, loadavg: () => 0, cpuCount: () => 8, caps: { claude: 1, external: 1 },
       listFixClaims: () => [dead], alive: () => false, launcherAvailable: () => true,
@@ -134,7 +134,7 @@ describe('(2) the fixer cap counts only live sessions', () => {
 
 describe('(3) repeated unproductive borrowed launches fall back to the normal fixer queue', () => {
   const mkStore = () => { let v = {}; return { read: () => v, write: (x) => { v = x; } }; };
-  const gate = (outcomes, now) => createFixBorrowGate({
+  const gate = (outcomes, now) => createFixBorrowGate({ sample: () => ({ ok: false }),
     env: {}, settings: { enabled: true, afterMinutes: 0, executor: 'codex' }, ledger: mkStore(), outcomes, now: () => now,
     loadavg: () => 0, cpuCount: () => 8, caps: { claude: 1, external: 4 }, launcherAvailable: () => true,
   });

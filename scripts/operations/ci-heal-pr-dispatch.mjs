@@ -401,6 +401,7 @@ export async function runReconcileCiHealDispatch({
     let t = dispatchThrottle ? dispatchThrottle.tryAdmit('ci-heal') : { admit: true };
     if (!t.admit && t.kind === 'fix-cap' && ciHealReserve) t = ciHealReserve.tryAdmit();
     if (!t.admit) { refusals.push({ pr: entry.prNumber, kind: t.kind, why: t.why }); continue; }
+    if (t.note) console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} ci-heal launch admitted: ${t.note}`);
     const q = queueBudget.tryAdmit('ci-heal', { id: entry.prNumber });
     if (!q.admit) {
       refusals.push({ pr: entry.prNumber, kind: 'queue-cap', why: queueCapWhy(q) });

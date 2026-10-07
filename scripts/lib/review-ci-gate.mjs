@@ -1,5 +1,6 @@
 /** Strict review prerequisite; independent of the general merge/CI reducer. */
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
+import { withoutImpliedRequiredChecks } from './required-check-implication.mjs';
 
 /**
  * A legacy commit status / rollup `StatusContext` (`{context, state}`, no check-run `status`/`conclusion`) read as
@@ -21,7 +22,7 @@ export function reviewCiGate({ headSha, requiredChecks, checks } = {}) {
   if (!Array.isArray(requiredChecks) || !requiredChecks.length
       || requiredChecks.some(name => typeof name !== 'string' || !name.trim())) return refuse('unknown-required-set');
   const latest = new Map(collapseRollupToLatestPerName(checks).map(row => [row?.name ?? row?.context, statusAsCheckRow(row)]));
-  const affected = [...new Set(requiredChecks)].flatMap(name => {
+  const affected = [...new Set(withoutImpliedRequiredChecks(requiredChecks, [...latest.values()]))].flatMap(name => {
     const row = latest.get(name);
     let reason;
     if (!row) reason = 'missing';

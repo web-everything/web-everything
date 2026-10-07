@@ -69,7 +69,10 @@ export default {
   fixPresent(root) {
     const has = (rel, re) => { try { return re.test(readFileSync(join(root, rel), 'utf8')); } catch { return false; } };
     return has('scripts/progress-board.mjs', /collapseRollupToLatestPerName\(rollup\)\.some/)
-      && has('scripts/operations/pr-status.mjs', /collapseRollupToLatestPerName\(runs\)\.filter/);
+      // Either spelling: filtering the collapse inline, or filtering a `collapsed` const bound to it first
+      // (reduceCheckState binds it so the implied-required-check reducer reads the same collapsed rollup).
+      && has('scripts/operations/pr-status.mjs',
+        /collapseRollupToLatestPerName\(runs\)\.filter|const collapsed = collapseRollupToLatestPerName\(runs\);[\s\S]*?collapsed\.filter/);
   },
   run({ log } = {}) {
     return runSoak({

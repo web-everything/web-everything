@@ -118,6 +118,8 @@ import { createRecordReferralRulingReader, createRecordReferralRulingSinks } fro
 import { createClearStuckSessionReader, createClearStuckSessionSinks } from './clear-stuck-session-io.mjs';
 import { docketRefreshOperation, DOCKET_REFRESH_OP, finishDocketOutcome } from './docket-refresh.mjs';
 import { createDocketRefreshReader, createDocketRefreshSinks } from './docket-refresh-io.mjs';
+import { perfSnapshotOperation, PERF_SNAPSHOT_OP, finishPerfSnapshot } from './perf-snapshot.mjs';
+import { createPerfSnapshotReader, createPerfSnapshotSinks } from './perf-snapshot-io.mjs';
 // #3892 (epic #3443 graduation slice) — the SAFE conveyor restart, ported from `origin/lane/mechanical-dispatcher`.
 import { restartRunnerOperation, RESTART_RUNNER_OP, classifyLease } from './restart-runner.mjs';
 import { createRestartReader, createRestartRunnerSinks } from './restart-runner-io.mjs';
@@ -451,6 +453,16 @@ export const OPERATIONS = Object.freeze({
     declaration: docketRefreshOperation({ readFacts: createDocketRefreshReader() }),
     sinks: createDocketRefreshSinks(),
     finish: finishDocketOutcome,
+  }),
+  // Held card 119 — the repeatable, no-LLM perf snapshot: recomputes the Opus perf sweep's numbers (verify markers,
+  // heavy-admission records, build-dispatch tick log, CI via gh, coroner changeRequests, fix outcomes, executor
+  // receipts), appends ONE schema-versioned row to `.operations/metrics/perf/snapshots.jsonl` (knob `--store`), keeps
+  // the day's raw coroner JSON beside it, and prints the diff vs the 2026-10-07 baseline and vs the last snapshot, each
+  // change tagged with the PRs merged in between. `--backfill --apply` writes the baseline row from the archive.
+  [PERF_SNAPSHOT_OP]: () => ({
+    declaration: perfSnapshotOperation({ readFacts: createPerfSnapshotReader() }),
+    sinks: createPerfSnapshotSinks(),
+    finish: finishPerfSnapshot,
   }),
   // #3383 (graduated under #3892) — the SAFE conveyor restart: refuse under a just-spawned build agent,
   // SIGTERM the process that actually owns the loop, confirm it went down by EVIDENCE, sweep a leaked lease,

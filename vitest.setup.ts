@@ -1,24 +1,41 @@
 import { beforeEach, afterEach, afterAll } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { FAKE_GH_DIR_ENV, lazyTmpPath, writeFakeGhShim } from './scripts/lib/test-tmp-root.mjs';
 
-// tmp-leak fix (2026-10-04): this file runs once per test FILE, and every `mkdtempSync` below used to be
-// left behind — ~1.15M dirs in the operator's `$TMPDIR` (2m39s to list). Each dir this file creates is
-// recorded here and removed in `afterAll`, with the env var it backed reset so a later file in the same
-// worker makes its own fresh one instead of reusing a deleted path. `vitest.globalSetup.mjs` is the
-// run-wide backstop for leaks in test files themselves.
-const ownedTmpDirs: Array<{ dir: string; envKey?: string }> = [];
-function ownedTmpDir(prefix: string, envKey?: string): string {
-  const dir = mkdtempSync(join(tmpdir(), prefix));
-  ownedTmpDirs.push({ dir, envKey });
-  return dir;
+// tmp-leak fix (2026-10-04): this file runs once per test FILE, and every temp dir it makes used to be left
+// behind — ~1.15M dirs in the operator's `$TMPDIR` (2m39s to list). Each dir this file creates is removed in
+// `afterAll`, with the env var it backed reset so a later file in the same worker makes its own fresh one
+// instead of reusing a deleted path. `vitest.globalSetup.mjs` is the run-wide backstop for leaks in test files
+// themselves.
+//
+// test-churn cut (2026-10-07): that cleanup was itself the churn (76k file events/min in `$TMPDIR`; per test one
+// mkdtemp + rm for the coordination root, per file 4 mkdtemps + a fake `gh` write). Now:
+//   - the three env-backed roots (coordination, gh-throttle, daemon-state) are LAZY PATHS under one per-file base
+//     dir. Nothing is created here; the code under test creates a root with `mkdir -p` when it first writes
+//     (every real writer does), and a test that needs the dir to exist up front calls
+//     `ensureTestTmpDir()` from scripts/lib/test-tmp-root.mjs.
+//     A file that never touches them costs ZERO filesystem operations.
+//   - the per-test coordination reset (#3901) is "remove the dir if a test made it", not mkdtemp + rm each time.
+//   - the fake `gh` shim is written ONCE PER RUN by `vitest.globalSetup.mjs` and shared by every file; the
+//     per-file write below is only the fallback for a runner that has no such globalSetup.
+let fileTmpBase: string | undefined;
+function lazyRoot(name: string): string {
+  fileTmpBase ??= lazyTmpPath('we-test-', tmpdir());
+  return join(fileTmpBase, name);
 }
+const ownedTmpDirs: string[] = [];
+let addedPathPrefix: string | undefined;
 afterAll(() => {
-  for (const { dir, envKey } of ownedTmpDirs.splice(0)) {
-    rmSync(dir, { recursive: true, force: true });
-    if (envKey && process.env[envKey] === dir) delete process.env[envKey];
-    if (process.env.PATH?.startsWith(`${dir}:`)) process.env.PATH = process.env.PATH.slice(dir.length + 1);
+  if (fileTmpBase && existsSync(fileTmpBase)) rmSync(fileTmpBase, { recursive: true, force: true });
+  for (const key of ['WE_COORDINATION_ROOT', 'WE_GH_THROTTLE_LOCK_ROOT', 'WE_DAEMON_STATE_DIR']) {
+    const v = process.env[key];
+    if (fileTmpBase && v && v.startsWith(`${fileTmpBase}/`)) delete process.env[key];
+  }
+  for (const dir of ownedTmpDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  if (addedPathPrefix && process.env.PATH?.startsWith(`${addedPathPrefix}:`)) {
+    process.env.PATH = process.env.PATH.slice(addedPathPrefix.length + 1);
   }
 });
 
@@ -73,16 +90,13 @@ afterAll(() => {
 // own test body — that always wins over this file, since it runs after.
 if (process.env.WE_TEST_SANDBOX !== '0') {
   try {
-    const fakeGhDir = ownedTmpDir('we-fake-gh-');
-    const fakeGhPath = join(fakeGhDir, 'gh');
-    writeFileSync(
-      fakeGhPath,
-      '#!/bin/sh\n'
-      + 'echo "To get started with GitHub CLI, please run:  gh auth login" >&2\n'
-      + 'echo "Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token." >&2\n'
-      + 'exit 1\n',
-    );
-    chmodSync(fakeGhPath, 0o755);
+    let fakeGhDir = process.env[FAKE_GH_DIR_ENV];
+    if (!fakeGhDir || !existsSync(join(fakeGhDir, 'gh'))) {
+      fakeGhDir = mkdtempSync(join(tmpdir(), 'we-fake-gh-'));
+      ownedTmpDirs.push(fakeGhDir);
+      writeFakeGhShim(fakeGhDir);
+    }
+    addedPathPrefix = fakeGhDir;
     process.env.PATH = `${fakeGhDir}:${process.env.PATH || ''}`;
   } catch {
     // Best-effort — a host where this fails (e.g. no writable temp dir) is no worse off than before this
@@ -103,16 +117,16 @@ process.env.WE_UNDER_TEST = '1';
 
 // #3383: isolate tests from home AND from each other's durable action holds.
 const ownsCoordinationRoot = process.env.WE_COORDINATION_ROOT === undefined;
-let testCoordinationRoot: string | undefined;
-if (ownsCoordinationRoot) process.env.WE_COORDINATION_ROOT = ownedTmpDir('we-coord-test-', 'WE_COORDINATION_ROOT');
+if (ownsCoordinationRoot) process.env.WE_COORDINATION_ROOT = lazyRoot('coord');
 beforeEach(() => {
-  if (ownsCoordinationRoot) {
-    testCoordinationRoot = mkdtempSync(join(tmpdir(), 'we-coord-test-'));
-    process.env.WE_COORDINATION_ROOT = testCoordinationRoot;
-  }
+  // Each test starts with the coordination root absent (= clean); the env restore below may have changed it.
+  if (ownsCoordinationRoot) process.env.WE_COORDINATION_ROOT = lazyRoot('coord');
 });
 afterEach(() => {
-  if (testCoordinationRoot) rmSync(testCoordinationRoot, { recursive: true, force: true });
+  if (ownsCoordinationRoot) {
+    const dir = lazyRoot('coord');
+    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ci-heal PR #2794: keep every test off the host's REAL `gh`-throttle semaphore. `ghThrottleLockRoot` is
@@ -123,7 +137,7 @@ afterEach(() => {
 // (outside the sandbox block): the integration tier proves real `gh`, never the host's real throttle state.
 // Tests of the resolution itself pass an explicit `env`, so this default never reaches them.
 if (process.env.WE_GH_THROTTLE_LOCK_ROOT === undefined) {
-  process.env.WE_GH_THROTTLE_LOCK_ROOT = ownedTmpDir('we-gh-throttle-test-', 'WE_GH_THROTTLE_LOCK_ROOT');
+  process.env.WE_GH_THROTTLE_LOCK_ROOT = lazyRoot('gh-throttle');
 }
 
 // decouple-primary-checkout (epic #4075): the conveyor build queue's DEFAULT path is now the machine-wide
@@ -132,7 +146,7 @@ if (process.env.WE_GH_THROTTLE_LOCK_ROOT === undefined) {
 // host's REAL queue (the one the live build-dispatch daemon reads). Same both-tiers default as the throttle root
 // above; tests of the resolution itself pass an explicit `env`, so this never reaches them.
 if (process.env.WE_DAEMON_STATE_DIR === undefined) {
-  process.env.WE_DAEMON_STATE_DIR = ownedTmpDir('we-daemon-state-test-', 'WE_DAEMON_STATE_DIR');
+  process.env.WE_DAEMON_STATE_DIR = lazyRoot('daemon-state');
 }
 // ...and its one-release fallback read of the OLD in-checkout queue (which, on the operator's laptop, is the
 // primary checkout's real `.conveyor/queue.json`) is switched off for the same reason.
@@ -179,11 +193,15 @@ beforeEach(() => {
 });
 afterEach(() => {
   if (!envSnapshot) return;
-  for (const key of Object.keys(process.env)) {
-    if (!(key in envSnapshot)) delete process.env[key];
-  }
-  for (const [key, value] of Object.entries(envSnapshot)) {
-    if (process.env[key] !== value) process.env[key] = value;
-  }
+  const snap = envSnapshot;
   envSnapshot = undefined;
+  // One pass over the live env (drop added keys, restore changed ones), one over the snapshot (restore deleted
+  // ones) — no `Object.entries` copy.
+  for (const key of Object.keys(process.env)) {
+    if (!(key in snap)) delete process.env[key];
+    else if (process.env[key] !== snap[key]) process.env[key] = snap[key];
+  }
+  for (const key in snap) {
+    if (!(key in process.env)) process.env[key] = snap[key];
+  }
 });
