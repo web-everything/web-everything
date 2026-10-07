@@ -368,7 +368,8 @@ export function diffSnapshots(ref, cur, { minPct = 5, minAbs = 0.05 } = {}) {
     const a = midpoint(was.v), b = midpoint(now.v);
     if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
     const delta = b - a, pct = a === 0 ? null : (delta / Math.abs(a)) * 100;
-    if (Math.abs(delta) < minAbs || (pct !== null && Math.abs(pct) < minPct)) continue;
+    // Predictor buckets are means over a handful of PRs: a move under a quarter of a round is sampling noise.
+    if (Math.abs(delta) < (/^pred\d*\./.test(key) ? 0.25 : minAbs) || (pct !== null && Math.abs(pct) < minPct)) continue;
     changes.push({ key, from: was.v, to: now.v, delta: r1(delta * 100) / 100, pct: pct === null ? null : r1(pct), verdict: judge(key, a, b), approx: was.source === OPUS_REPORT || now.source === OPUS_REPORT, unit: now.unit ?? was.unit ?? '' });
   }
   return changes.sort((x, y) => (x.key < y.key ? -1 : 1));
