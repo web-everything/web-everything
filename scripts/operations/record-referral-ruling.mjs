@@ -111,7 +111,11 @@ const findingLocation = ({ file, line }) => `${file ?? ''}${line == null ? '' : 
 export function planRulingFollowUp({ open, selected, ruling, reason, enabled, head }) {
   if (!enabled) return null;
   const isSelected = (o) => selected.some((s) => s.runId === o.runId && s.key === o.key);
-  if (open.some((o) => o.state === 'pending' && !isSelected(o))) return null;
+  // Findings still waiting on a ruling after this one. The ruling comment itself wakes the paused review (the hold
+  // reads it as a wake), so the review re-runs on this head and posts a fresh advisory; it just cannot clear the
+  // label or send anything back yet. Say so, with the exact remaining set, instead of returning nothing.
+  const remaining = open.filter((o) => o.state === 'pending' && !isSelected(o));
+  if (remaining.length) return { action: 'rearm', remaining: remaining.map((o) => ({ seat: o.seat, file: o.file, line: o.line, summary: o.summary })) };
   const blocked = open.filter((o) => isSelected(o) ? ruling === 'block' : o.state === 'blocked')
     .map((o) => ({ seat: o.seat, file: o.file, line: o.line, summary: o.summary,
       rationale: isSelected(o) ? reason : o.rationale }));
@@ -191,6 +195,7 @@ export function recordReferralRulingOperation({ readRulingContext } = {}) {
         type: OPERATOR_RULING_FOLLOW_UP_EFFECT, idempotent: true,
         payload: { repo: view.verdict.record.repo, pr: view.verdict.record.pr, head: view.verdict.record.head,
           action: view.verdict.followUp.action, body: view.verdict.followUp.body,
+          remaining: view.verdict.followUp.remaining ?? [],
           actor: view.verdict.record.actor, channel: view.verdict.record.channel },
       }] : [])]),
     }),

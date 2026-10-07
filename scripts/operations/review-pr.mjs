@@ -1923,6 +1923,18 @@ export function advisoryLabelOutcome({ read, verdict } = {}) {
  * @param {{read: object, verdict: object}} o
  * @returns {string} the comment body.
  */
+/**
+ * The findings the count above it is made of, one line each (file, line, claim). The header count IS this list's
+ * length, so a reader can tick them off. Hold tokens that name no finding follow, never counted. PURE.
+ */
+export function renderAwaitingRulingSection(verdict) {
+  const found = Array.isArray(verdict?.pendingFindings) ? verdict.pendingFindings : [];
+  if (!found.length) return [];
+  const where = (f) => `${f.file ?? 'no file'}${Number.isInteger(f.line) ? `:${f.line}` : ''}`;
+  return ['### Awaiting a ruling', '',
+    ...found.map((f, i) => `${i + 1}. \`${foldUntrusted(where(f))}\` (${foldUntrusted(f.seat)}) — ${foldUntrusted(f.summary).slice(0, 240)}`), ''];
+}
+
 export function renderAdvisoryNote({ read, verdict } = {}) {
   const v = verdict && typeof verdict === 'object' ? verdict : {};
   const outcome = advisoryLabelOutcome({ read, verdict });
@@ -1932,7 +1944,7 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
   const reasonLine = explainPanelOutcome({
     outcome, lensVerdicts, findings: v.admittedFindings ?? v.findings ?? [],
     mandatoryLenses: MANDATORY_LENSES.filter(l => lenses.includes(l)),
-    blockedReferrals: v.blockedReferrals, pendingReferrals: v.pendingReferrals,
+    blockedReferrals: v.blockedReferrals, pendingReferrals: v.pendingReferrals, pendingFindings: v.pendingFindings,
     deferredCount: v.deferredAdvisory?.length ?? 0, scopeFellBack: v.advisoryScope?.fellBack ?? null,
   });
   const body = renderPanelComment({
@@ -1956,6 +1968,7 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
     'AI review below ran automatically, before the required human review ceremony — it has neither accepted nor',
     'bounced this PR. No `review:*` label was changed and no decision was recorded.',
     '',
+    ...renderAwaitingRulingSection(v),
     body,
     ...renderDeferredAdvisorySection({ read, verdict: v }),
     // THE MACHINE-READABLE OUTCOME, the line `we:scripts/lib/advisory-labels.mjs#parseAdvisories` reads back.
@@ -2689,7 +2702,9 @@ export function reviewPrOperation({
           findings: [...(basis.findings ?? []), ...lifted],
           admittedFindings: [...(basis.admittedFindings ?? []), ...lifted],
         } : {};
-        return { ...basis, ...liftedFields, deferredAdvisory, pendingReferrals, blockedReferrals,
+        // The NAMED findings behind that count: the one list the advisory counts and prints (jury-core).
+        const pendingFindings = Array.isArray(state.pendingFindings) ? state.pendingFindings : [];
+        return { ...basis, ...liftedFields, deferredAdvisory, pendingReferrals, pendingFindings, blockedReferrals,
           verdict: pendingReferrals.length ? 'needs-human'
             : blockedReferrals.length && basis.verdict !== 'needs-human' ? 'changes' : basis.verdict,
           humanRequired: basis.humanRequired || pendingReferrals.length > 0 };
