@@ -3,9 +3,11 @@ bornAs: x52sjqd
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/lib/lane-verify.mjs", "we:scripts/lib/__tests__/lane-verify*.test.mjs", "we:scripts/__tests__/verify-lane.test.mjs", "we:scripts/__tests__/lane-verify.test.mjs", "we:scripts/verify-lane.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-28"
+dateStarted: "2026-10-07"
+dateResolved: "2026-10-07"
 preparedDate: "2026-10-07"
 preparedAgainstSha: "52e617c26f2fc902a3a4babc0f566a5c3862c20a"
 tags: []
