@@ -11,6 +11,11 @@ import {
   sweepStaleRunRoots,
   summarizeLeftovers,
   finishRunTmpRoot,
+  lazyTmpPath,
+  createSharedFakeGh,
+  removeSharedDir,
+  ensureTestTmpDir,
+  SHARED_DIR_NAME,
 } from '../lib/test-tmp-root.mjs';
 
 const repoRoot = resolve(import.meta.dirname, '../..');
@@ -95,10 +100,37 @@ describe('tmp-leak guard', () => {
   it('vitest.setup.ts creates no un-owned module-level temp dirs', () => {
     const src = readFileSync(join(repoRoot, 'vitest.setup.ts'), 'utf8');
     const raw = src.split('\n').filter((l) => /mkdtempSync\(/.test(l) && !/^\s*\/\//.test(l));
-    // Allowed: the one inside ownedTmpDir itself, and the per-test coord root that afterEach removes.
+    // Allowed: only the fallback fake-`gh` dir (used when no globalSetup shared one), which is pushed onto
+    // `ownedTmpDirs` on the next line and removed in afterAll. Every other root is a lazy, un-created path.
     expect(raw.map((l) => l.trim())).toEqual([
-      'const dir = mkdtempSync(join(tmpdir(), prefix));',
-      "testCoordinationRoot = mkdtempSync(join(tmpdir(), 'we-coord-test-'));",
+      "fakeGhDir = mkdtempSync(join(tmpdir(), 'we-fake-gh-'));",
     ]);
+    expect(src).toMatch(/fakeGhDir = mkdtempSync[^\n]*\n\s*ownedTmpDirs\.push\(fakeGhDir\)/);
+  });
+});
+
+describe('lazy and shared temp state (test-churn cut)', () => {
+  it('lazyTmpPath returns a unique path without creating it', () => {
+    const a = lazyTmpPath('we-test-', base);
+    expect(a).not.toBe(lazyTmpPath('we-test-', base));
+    expect(existsSync(a)).toBe(false);
+  });
+  it('ensureTestTmpDir creates the env root on demand and fails loudly when unset', () => {
+    const dir = join(base, 'x', 'y');
+    expect(ensureTestTmpDir('K', { K: dir })).toBe(dir);
+    expect(existsSync(dir)).toBe(true);
+    expect(() => ensureTestTmpDir('K', {})).toThrow(/not set/);
+  });
+  it('the shared fake gh fails like an unauthenticated gh, and is not counted as a leftover', () => {
+    const dir = createSharedFakeGh(base);
+    expect(readFileSync(join(dir, 'gh'), 'utf8')).toContain('exit 1');
+    expect(summarizeLeftovers(base).count).toBe(1); // only the shared dir itself
+    removeSharedDir(base);
+    expect(existsSync(join(base, SHARED_DIR_NAME))).toBe(false);
+    expect(summarizeLeftovers(base).count).toBe(0);
+  });
+  it('vitest.setup.ts takes the shared fake gh from globalSetup (one write per run)', () => {
+    expect(readFileSync(join(repoRoot, 'vitest.globalSetup.mjs'), 'utf8')).toContain('createSharedFakeGh(root)');
+    expect(readFileSync(join(repoRoot, 'vitest.setup.ts'), 'utf8')).not.toMatch(/^\s*[^/\s][^\n]*writeFileSync\(/m);
   });
 });

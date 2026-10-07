@@ -55,6 +55,11 @@ declared-operation step kinds (`compute`/`judge`/`effect`/`confirm`) performs op
 changes is what happens AFTER you have the text: it goes through `file-item`, never through a bespoke prompt
 handed to a subagent, and never through a raw `backlog.mjs scaffold` call you type yourself.
 
+**The scaffolded card carries a `## Edge cases this change must handle` section** (seven classes: untrusted
+text, truncated reads, shared state files, fail closed, identity scoping, state over time, who wrote it; the single
+source is `we:scripts/backlog/edge-case-classes.mjs`). Replace each `TODO` line with the handling, or
+`n/a: <why>`, before you land the card. A card that still carries the `TODO` lines is not filled.
+
 **Every bare code path in `--digest` and `--scope` needs a `we:` locus prefix (#883)** — the guarded writer
 this operation writes through (`we:scripts/backlog/guarded-write.mjs`) refuses the whole write otherwise, and
 it is a REAL refusal you will hit, not a hypothetical: write `we:scripts/operations/file-item.mjs`, never

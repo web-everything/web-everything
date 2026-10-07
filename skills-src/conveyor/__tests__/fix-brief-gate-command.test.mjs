@@ -129,22 +129,13 @@ describe('fix-agent-ci-brief.md — metadata-only heal skips the local verify (#
   });
 });
 
-// #5137 — the fix and ci-heal briefs hand the wait to the harness (asserted above); only the delivery brief still
-// waits in bounded chunks itself.
-for (const file of ['delivery-agent-brief.md']) {
-  it(`${file} instructs bounded waits that are feasible inside the Bash tool's foreground timeout`, () => {
+// #5137 — every brief that waits on the gate hands the wait to the harness (the fix and ci-heal briefs are asserted
+// above; the delivery brief and prepare brief are asserted in await-verify-briefs.test.mjs, card 4). No brief tells an
+// agent to loop on `check --wait=` any more.
+for (const file of ['fix-agent-brief.md', 'fix-agent-ci-brief.md', 'delivery-agent-brief.md', 'prepare-item-agent-brief.md']) {
+  it(`${file} has no check --wait command to loop on`, () => {
     const text = readFileSync(join(HERE, '..', file), 'utf8');
-    const waits = [...text.matchAll(/check --wait=(\d+)/g)].map((m) => Number(m[1]));
-    const toolTimeouts = [...text.matchAll(/`timeout: (\d+)`/g)].map((m) => Number(m[1]));
-    expect(waits.length).toBeGreaterThan(0);
-    expect(toolTimeouts.length).toBeGreaterThan(0);
-    // A wait longer than the tool's own timeout is killed before it can settle: every instructed wait must fit.
-    for (const wait of waits) expect(wait).toBeLessThan(Math.min(...toolTimeouts));
-    // …and the chunks must cover the dispatcher's admission + execution budget (~160 minutes), stated in the brief.
-    expect(text).toMatch(/18 consecutive `timeout`s/);
-    expect(Math.max(...waits) * 18).toBeGreaterThanOrEqual(150 * 60_000);
-    expect(text).not.toMatch(/--wait=9600000|--wait=60000|completion\s+notification/);
-    expect(text).toContain('infrastructure-failure');
+    expect(fencedCommands(text).filter((c) => /check\b.*--wait/.test(c))).toEqual([]);
   });
 }
 
@@ -289,11 +280,24 @@ const FIX_THE_CLASS_REQUIRED = [
   '"not the same class" never dismisses it',
   'Deferring ("later", "follow-up") is not a dismissal.',
   'Variants considered:',
+  // Card 7 (opus perf sweep 2026-10-07): the per-class variant matrix the fixer fills in.
+  '**The variant matrix.**',
+  'fixed at <file:line, every site>',
+  'which row did this fix not cover?',
+  'which row of the variant matrix did this fix not cover?',
+  ...['untrusted text', 'truncated read', 'shared state', 'rollback / switch', 'normalization', 'resource bounds', 'trust boundary'].map((c) => `| ${c} |`),
 ];
 
 describe('fix the class', () => {
   it('requires variant discovery, adversarial review, and evidence without deferral', () => {
     expectEachGuarded(readBrief('fix-agent-brief.md'), FIX_THE_CLASS_REQUIRED);
+  });
+
+  it('carries all seven matrix rows with their variants, and the evidence comment asks for each touched row', () => {
+    const text = readBrief('fix-agent-brief.md');
+    for (const variant of ['CR/U+2028', 'leading `--`', '`--limit` hit', 'crash between write and rename', 'dot names',
+      'trim, case, NFKC, line endings', 'quadratic regex', 'author check']) expect(text).toContain(variant);
+    expect(text.replace(/\s+/g, ' ')).toMatch(/every touched row marked `fixed at <sites>` or `n\/a: <why>`/);
   });
 
   it('does not restore the old "fix it, or dismiss it with a one-line reason" loophole', () => {

@@ -99,9 +99,9 @@ describe('builder host-load gate (#4139)', () => {
   });
 
   it('cliHostLoadGate uses the shared helper and the maxLoadPerCore setting', () => {
-    expect(cliHostLoadGate({ env: {}, loadavg: () => 36, cpuCount: () => 12 })).toMatchObject({ admit: false, kind: 'host-load' });
-    expect(cliHostLoadGate({ env: {}, loadavg: () => 10, cpuCount: () => 12 }).admit).toBe(true);
-    expect(cliHostLoadGate({ env: { WE_MAX_LOAD_PER_CORE: '4' }, loadavg: () => 36, cpuCount: () => 12 }).admit).toBe(true);
+    expect(cliHostLoadGate({ sample: () => ({ ok: false }), env: {}, loadavg: () => 36, cpuCount: () => 12 })).toMatchObject({ admit: false, kind: 'host-load' });
+    expect(cliHostLoadGate({ sample: () => ({ ok: false }), env: {}, loadavg: () => 10, cpuCount: () => 12 }).admit).toBe(true);
+    expect(cliHostLoadGate({ sample: () => ({ ok: false }), env: { WE_MAX_LOAD_PER_CORE: '4' }, loadavg: () => 36, cpuCount: () => 12 }).admit).toBe(true);
   });
 });
 

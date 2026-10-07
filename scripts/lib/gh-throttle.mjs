@@ -468,6 +468,20 @@ export function classifyGhRead(argvRaw) {
 }
 
 /**
+ * Is this `gh` call answered from local state alone (no GitHub request)? `gh auth token` reads the stored login
+ * from the local keyring/hosts file. Such a call spends no budget, so the shared budget-block gate must never
+ * fail it: live 2026-10-07 17:09Z a primary-budget block on the `default` identity made `gh auth token` throw
+ * instantly, so missing-run recovery failed "during credential" for PR #4244 and the PR stayed without checks.
+ * Deliberately NOT `auth status` (it calls the API). PURE.
+ * @param {string[]} argvRaw
+ * @returns {boolean}
+ */
+export function isGhLocalOnly(argvRaw) {
+  const args = stripLeadingGhGlobalFlags(Array.isArray(argvRaw) ? argvRaw.map(String) : []);
+  return (args[0] === 'auth' && args[1] === 'token') || args[0] === 'version' || args[0] === '--version';
+}
+
+/**
  * Best-effort caller attribution for a `gh` call, recorded on every `calls.jsonl` line (see {@link
  * recordGhCallLogEntry}) so the NEXT burst is traceable in one grep instead of the forensic, multi-log,
  * multi-transcript correlation the 2026-09-27 incident needed. Precedence, most to least specific:
@@ -1425,6 +1439,19 @@ function resolveBudgetBlockUntil({ headers, resource, probe }) {
  * @param {string} logPath
  * @param {{op:string, attempt:number, points:number, outcome:('call'|'retry_exhausted'|'fail_open'), ok?:boolean, caller?:string, w?:boolean}} entry
  */
+/**
+ * A concurrency-slot acquire that TIMED OUT used to proceed ungated with no trace at all — the 2026-10-07 stall
+ * cost every gh call on the host 2 minutes and nothing said so. Now it is a `slot_timeout` line in `calls.jsonl`
+ * (with how long it waited) plus a stderr warning, so a starved pool is visible the first time it happens.
+ */
+export function noteSlotTimeout(logPath, acq, entry, warn) {
+  if (!acq || !acq.timedOut) return false;
+  recordGhCallLogEntry(logPath, { ...entry, points: 0, outcome: 'slot_timeout', waitedMs: acq.waitedMs ?? null });
+  const msg = `gh-throttle: waited ${Math.round((acq.waitedMs ?? 0) / 1000)}s for a gh concurrency slot (pool full) — running this call ungated`;
+  try { (warn || ((m) => process.stderr.write(m + '\n')))(msg); } catch { /* best-effort */ }
+  return true;
+}
+
 export function recordGhCallLogEntry(logPath, entry) {
   try {
     appendFileSync(logPath, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n', 'utf8');
@@ -1471,6 +1498,8 @@ export function recordGhCallLogEntry(logPath, entry) {
  */
 export function runGhSync(args, opts = {}) {
   const { throttle = {}, ...execOpts } = opts;
+  // Local-only calls (see isGhLocalOnly) bypass every gate: no GitHub budget, slot or block applies to them.
+  if (isGhLocalOnly(args)) return throttle.exec ? throttle.exec(args, execOpts) : execFileSync(throttle.bin || 'gh', args, execOpts);
   const env = throttle.env || process.env;
   const repo = throttle.repo || process.cwd();
   const lockRoot = throttle.lockRoot || ghThrottleLockRoot(repo, env);
@@ -1564,6 +1593,7 @@ export function runGhSync(args, opts = {}) {
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       return acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: acquireTimeoutMs, now, sleep });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
+    noteSlotTimeout(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, throttle.warn);
     // Fail OPEN on an acquire timeout too — proceeding unslotted rather than stranding this `gh` call forever
     // (the residual-risk policy heavy-admission.mjs itself names: a fixed cap bounds concurrency and makes the
     // wait observable, it does not claim to eliminate contention).
@@ -1767,11 +1797,19 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
       : (callEnv === env
         ? { stdio: ['inherit', 'pipe', 'pipe'], maxBuffer }
         : { stdio: ['inherit', 'pipe', 'pipe'], maxBuffer, env: callEnv });
-    const acq = gated ? failOpenGate('acquire', () => {
+    // NESTED (live 2026-10-07 13:39-14:06Z conveyor stall): an `outer` invocation is a {@link runGhSync} in some
+    // parent process that ALREADY passed every gate and HOLDS a concurrency slot for THIS exact call — its real
+    // `gh` resolved to the App shim, which landed here. Acquiring a second slot was hold-and-wait: five daemon
+    // ticks/smokes each held one slot while their nested child waited for another, the cap (6) was exhausted by
+    // holders that could never release, and EVERY gh call on the host paid the full 2-minute acquire timeout.
+    // The fix daemon's tick ran 25+ min with its log silent, the drain's live smoke took 25 min and was rejected.
+    // A nested call rides the outer's slot (and its already-charged points/write budget) — one call, one slot.
+    const acq = gated && !outer ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
       return acquireGhSlotSync({ lockRoot, cap, owner, pid, pollMs, timeoutMs: acquireTimeoutMs, now, sleep });
     }, { ...gateOpts, fallback: { ok: false } }) : { ok: false };
+    noteSlotTimeout(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, throttle.warn);
     let r;
     try {
       const deferred = deferGhCall({ lockRoot, identity, resource, caller, args: argv, nowMs: now(), logPath, op: opLabel }, () => {});

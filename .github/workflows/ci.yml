@@ -111,13 +111,14 @@ jobs:
       # cancelling would hide which other shards also failed.
       fail-fast: false
       matrix:
-        # N shards. Keep this list's LENGTH in lockstep with the `--expect=N` in the `test` job below
-        # (the shard divisor itself is derived from the matrix via `strategy.job-total`, so only the
-        # --expect guard is hand-synced). More shards = more fixed per-runner setup (~25s each) for less
-        # marginal wall-clock; 4 balances parallelism against that setup tax.
-        # NOTE: `strategy.job-total` (used as the shard divisor below) counts ALL matrix combinations, so
-        # this matrix must stay SINGLE-DIMENSION — adding a second axis would break the `i/N` divisor.
-        shard: [1, 2, 3, 4]
+        # More shards = more fixed per-runner setup (~25s each) for less marginal wall-clock; 4 coverage shards
+        # balance parallelism against that setup tax.
+        # NOTE: `strategy.job-total` counts ALL matrix combinations, so this matrix must stay SINGLE-DIMENSION.
+        # Card 12: shards 1-4 are the COVERAGE shards (the tests that can reach a coverage-counted file, balanced by
+        # time over 4); shard 5 is the NO-COVERAGE group (scripts/** tests that never load one) and runs without
+        # --coverage in parallel. Keep the number of coverage shards (4) in lockstep with `--expect=4` below and
+        # with the `/4` divisors in the two unit-suite steps.
+        shard: [1, 2, 3, 4, 5]
     steps:
       # Sibling layout under $GITHUB_WORKSPACE so WE's `../frontierui` resolves — both the vitest/vite
       # `@frontierui/*` alias (dev/test-time; `we:vitest.config.ts` → `../frontierui/plugs`) AND the pinned
@@ -167,20 +168,55 @@ jobs:
         working-directory: web-everything
         run: npm ci
 
-      # `strategy.job-total` = the matrix length, so the divisor stays correct if the shard list changes.
-      - name: Unit suite shard ${{ matrix.shard }}/${{ strategy.job-total }} (coverage, no per-shard bar)
+      # Card 11: files are assigned to a shard by MEASURED time (scripts/ci/shard-assign.mjs +
+      # scripts/ci/test-timings.json), not vitest's blind `--shard=i/N`. Every file is in exactly one shard.
+      # Card 12: `--group=covered` is the tests that can reach a coverage-counted file (scripts/ci/coverage-reach.mjs);
+      # only those run under --coverage, so the covered files' numbers are unchanged.
+      - name: Unit suite shard ${{ matrix.shard }}/4 (coverage, no per-shard bar)
+        if: ${{ matrix.shard != 5 }}
         working-directory: web-everything
-        run: npm run test:coverage:shard -- --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+        run: |
+          # Capture first, then split: reading the list through a process substitution drops the producer's exit status, so a failing
+          # assignment would leave `files` empty and run the WHOLE suite. (scripts/ci/__tests__/ci-shard-steps.test.mjs)
+          list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=covered --shard=${{ matrix.shard }}/4) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
+          [ -n "$list" ] || { echo "::error::shard-assign returned an empty file list"; exit 1; }
+          files=()
+          while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
+          echo "unit shard ${{ matrix.shard }}/4: ${#files[@]} files"
+          npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}"
+
+      - name: Unit suite no-coverage group (scripts tests that cannot reach a covered file)
+        if: ${{ matrix.shard == 5 }}
+        working-directory: web-everything
+        run: |
+          # Same capture-then-split shape as the coverage shard step above (see its comment).
+          list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=nocov --shard=1/1) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
+          [ -n "$list" ] || { echo "::error::shard-assign returned an empty file list"; exit 1; }
+          files=()
+          while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
+          echo "unit no-coverage group: ${#files[@]} files"
+          npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}"
 
       # Upload this shard's partial coverage for the `test` job to merge. `if-no-files-found: error`
       # turns a missing report into a red shard (not a silent under-count) — the merge's --expect guard
-      # is the second line of defence.
+      # is the second line of defence. The no-coverage group (shard 5) produces none.
       - name: Upload shard coverage
+        if: ${{ matrix.shard != 5 }}
         uses: actions/upload-artifact@v4
         with:
           name: coverage-shard-${{ matrix.shard }}
           path: web-everything/coverage/coverage-final.json
           if-no-files-found: error
+
+      # Per-file durations for refreshing scripts/ci/test-timings.json (`node scripts/ci/shard-assign.mjs
+      # --suite=unit --update=<these>`). Evidence only; never gates.
+      - name: Upload shard timings
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: timing-unit-${{ matrix.shard }}
+          path: web-everything/coverage/timing-unit-${{ matrix.shard }}.json
+          if-no-files-found: ignore
 
   # Aggregating gate (#2682) — THE required `test` status check. Branch protection still requires `test`
   # (this job) + `smoke`, so the required-check contract is UNCHANGED by the shard split. It fans in every
@@ -192,11 +228,11 @@ jobs:
   # mis-read by branch protection as satisfied, which would let a broken shard merge green. Failing
   # explicitly makes `test` a real red instead.
   test:
-    needs: [changes, test-shard]
+    needs: [changes, test-shard, integration]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     # xd1sfms (#4075/#3383) — same measurement pass as `test-shard` above: 15 successful runs sampled
-    # 2026-09-25 gave this job (merge coverage + check:standards + the real-git integration suite)
+    # 2026-09-25 gave this job (merge coverage + check:standards; the integration suite moved to its own job)
     # min=243s max=380s p50=343s p95=380s — 3x380s≈19min, rounded up.
     timeout-minutes: 20
     steps:
@@ -212,6 +248,12 @@ jobs:
           fi
           if [ "${{ needs.test-shard.result }}" != "success" ]; then
             echo "One or more test shards did not succeed (test-shard result: ${{ needs.test-shard.result }})."
+            exit 1
+          fi
+          # The real-git integration suite is its own parallel job now; `test` still goes red when it does, so the
+          # required `test` check means exactly what it did when the suite ran inside this job.
+          if [ "${{ needs.integration.result }}" != "success" ]; then
+            echo "The integration job did not succeed (result: ${{ needs.integration.result }})."
             exit 1
           fi
 
@@ -277,12 +319,91 @@ jobs:
         working-directory: web-everything
         run: npm run check:standards
 
-      # The real-git/real-subprocess tier `vitest.config.ts` excludes (see its `test.exclude` comment) —
-      # split out so `npm run test:unit` (and everything that shells it locally: `verify-lane.mjs`'s gate,
-      # `npm test`) no longer pays real git/subprocess cost per lane. Runs here so the required `test` gate
-      # still verifies these on every push before merge — only the LOCAL per-lane cost dropped.
+  # Real-git integration suite as its OWN job, parallel with the shards (card 6, perf sweep 2026-10-07). It used
+  # to be the last step of `test`, which `needs: test-shard`, so its 5.8-8.4 min started only after every shard
+  # finished. It never used the shards' output (only the coverage merge does), so it now needs just `changes` and
+  # runs beside them: the critical path drops from shards + (merge + standards + integration) to
+  # max(shards + merge + standards, integration).
+  #
+  # The real-git/real-subprocess tier `vitest.config.ts` excludes (see its `test.exclude` comment) is split out
+  # so `npm run test:unit` (and everything that shells it locally) no longer pays real git/subprocess cost per lane.
+  #
+  # Check names: `integration` is its own check and is meant to be REQUIRED in branch protection alongside `test`,
+  # `smoke` and `daemon-soak`. `test` ALSO still fails when this job fails (see its "Gate on shard results" step),
+  # so nothing that is required today became skippable.
+  #
+  # Card-only PRs: like `test`/`smoke`, it stays a REAL running job (not job-level skipped) that passes in
+  # seconds, because a SKIPPED required check is not read as success by the drain's `reviewCiGate`. Fail closed:
+  # if `changes` did not succeed, the first step fails the job.
+  integration:
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    # Measured 5.8-8.4 min (perf sweep 2026-10-07); ~2.5x the worst case.
+    timeout-minutes: 20
+    steps:
+      - name: Gate on changes
+        id: gate
+        run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "changes (card-only detection) did not succeed (result: ${{ needs.changes.result }}) - failing closed."
+            exit 1
+          fi
+          if [ "${{ needs.changes.outputs.light }}" = "true" ]; then
+            echo "Card-only PR: integration suite intentionally not run."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Same sibling layout as the shards.
+      - name: Checkout WE
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          path: web-everything
+          fetch-depth: 0
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
+      - name: Checkout FUI (sibling)
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
+          path: frontierui
+
+      - uses: actions/setup-node@v4
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web-everything/package-lock.json
+            frontierui/package-lock.json
+
+      - name: Install + build FUI tools
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        working-directory: frontierui
+        run: |
+          npm ci
+          npm run build:tools
+
+      - name: Install
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        working-directory: web-everything
+        run: npm ci
+
       - name: Real-git integration suite (lane-pool, operations transport)
-        if: ${{ needs.changes.outputs.light != 'true' }}
+        if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
         run: npm run test:integration:vitest
 

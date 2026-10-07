@@ -401,6 +401,15 @@ export function canonicalPlaceholder(name) {
 export const BRIEF_VALUE_RE = /^[A-Za-z0-9_.,:/@#-]+$/;
 
 /**
+ * What `{{SCOPE}}` may contain: {@link BRIEF_VALUE_RE} PLUS `*`. A card's `scope:` legitimately names a test
+ * glob (`we:scripts/lib/x/__tests__/prepare*.test.mjs`) — the card linter even REQUIRES one — and the narrow
+ * default refused every such card at the `read` step, forever (#4701: refused ~20 times overnight, recorded
+ * only as "no verdict"). `*` is safe because every brief single-quotes `--scope='{{SCOPE}}'`, so the shell
+ * never expands it, and `'` itself stays outside the allow-list so the quote cannot be closed early.
+ */
+export const BRIEF_SCOPE_VALUE_RE = /^[A-Za-z0-9_.,:/@#*-]+$/;
+
+/**
  * What `{{GATE_COMMAND}}`/`{{ATTRIBUTION}}` (#3960) may contain — WIDER than {@link BRIEF_VALUE_RE} on
  * purpose, and for a different reason than that regex's own id/path/lane-number shape.
  *
@@ -426,6 +435,7 @@ export const BRIEF_FREE_TEXT_VALUE_RE = /^[^`$"\\\n]+$/;
  * neither reimplements the exception.
  */
 export const REPO_AWARE_VALUE_PATTERNS = Object.freeze({
+  SCOPE: BRIEF_SCOPE_VALUE_RE,
   GATE_COMMAND: BRIEF_FREE_TEXT_VALUE_RE,
   ATTRIBUTION: BRIEF_FREE_TEXT_VALUE_RE,
 });
@@ -1117,7 +1127,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes } = {}) {
     values,
     BRIEF_REQUIRED_BY_KIND[launchKind],
     undefined,
-    repairsExistingPr ? REPO_AWARE_VALUE_PATTERNS : undefined,
+    repairsExistingPr ? REPO_AWARE_VALUE_PATTERNS : { SCOPE: BRIEF_SCOPE_VALUE_RE },
   );
 
   // #3717 — THE ROUTE THIS DISPATCH TAKES, in two halves on opposite sides of this file's purity line.

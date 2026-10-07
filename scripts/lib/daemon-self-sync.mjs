@@ -413,7 +413,7 @@ export function resolveRestartMinIntervalMs(env = process.env) {
 /** Files changed between two commits (`git diff --name-only from to`), or `null` on any git failure. */
 export function changedFilesBetween({ root, from, to, run = gitRun, timeoutMs = 60_000 }) {
   if (!from || !to) return null;
-  const r = run(['diff', '--name-only', from, to], { cwd: root, timeout: timeoutMs, killSignal: 'SIGKILL' });
+  const r = run(['diff', '--name-only', '--no-renames', from, to], { cwd: root, timeout: timeoutMs, killSignal: 'SIGKILL' });
   if (r.status !== 0) return null;
   return String(r.stdout ?? '').split('\n').map((s) => s.trim()).filter(Boolean);
 }
@@ -504,7 +504,7 @@ export function withSelfSync(effects, {
   root, onRestart, sync = selfSyncCheckout, syncPoc = selfSyncCheckoutPoc, base = 'main', pocBranch, env = process.env,
   log = console, timeoutMs, readHead = readHeadSha, readOriginRef = readOriginRefSha, hasStaleRefusal, gate = gateMergedCommit,
   mainOnly = false, rebuild = (o = {}) => rebuildClone({
-    root, env, log, mainOnly, ...o,
+    root, env, log, mainOnly, entries, ...o,
   }), acquireRead = acquireReadLock, releaseRead = releaseReadLock, readState = readRebuildState,
   entries = [process.argv[1]], diffFiles = changedFilesBetween, importClosure = collectImportClosure,
   minRestartIntervalMs = resolveRestartMinIntervalMs(env), now = Date.now,

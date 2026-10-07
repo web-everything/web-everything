@@ -19,6 +19,7 @@ import { normalizeRelatedReport } from './lib/related-report.cjs';
 import { validateFidelityContract } from './lib/fidelity-contract.mjs';
 import { coversFile, isSubtreeEntry } from './readiness/scope-lease.mjs';
 import { GUARD_RELAXATION_HINT } from './backlog/scaffold.mjs';
+import { EDGE_CASES_HEADING } from './backlog/edge-case-classes.mjs';
 import { scrubPublish } from './lib/secret-scrub.mjs';
 // #3637 — the POC-branch registry's own `deliveryTarget:` predicate, so the gate and the scoped per-item
 // lint validate that field with the ONE function the dispatcher also uses (never a second copy of the rule).
@@ -976,6 +977,8 @@ export function findGuardRelaxationGaps(body) {
     if (/^\s*```/.test(line)) { inFence = !inFence; continue; }
     if (inFence) continue;
     if (/^##\s+(?:design|test plan|progress)\b/i.test(line)) break;
+    // The edge-cases section answers a different question (seven classes) and its "Fail closed" line would satisfy this lint.
+    if (line.trim() === EDGE_CASES_HEADING) break;
     if (line.trim() === GUARD_RELAXATION_HINT) continue;
     kept.push(line);
   }

@@ -30,7 +30,7 @@
  * IMPURE by construction (`git`, `fs`), which is why every one of those is a parameter.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 /**
@@ -67,6 +67,7 @@ export function stageOnTransportBranch({
   run = defaultGit,
   mkdir = mkdirSync,
   write = writeFileSync,
+  read = readExisting,
   rm = rmSync,
   now = () => Date.now(),
   // A caller-specific check run INSIDE the worktree, after `checkout -B` and BEFORE anything is written.
@@ -101,7 +102,7 @@ export function stageOnTransportBranch({
       run(['worktree', 'add', '--force', '--no-checkout', '--detach', wt, 'HEAD'], { cwd: board });
       run(['symbolic-ref', 'HEAD', `refs/heads/${branch}`], { cwd: wt });
       run(['read-tree', '--empty'], { cwd: wt });
-      return writeCommitPush({ run, mkdir, write, wt, files, message, branch, created, assertReady, board });
+      return writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, created, assertReady, board });
     }
     // AN EXPLICIT REFSPEC, never a bare `fetch origin <branch>` (#3264). The bare form writes `FETCH_HEAD` and
     // creates `refs/remotes/origin/<branch>` only when the CLONE'S CONFIGURED refspec covers it — true of a full
@@ -115,7 +116,7 @@ export function stageOnTransportBranch({
     run(['worktree', 'add', '--force', '--detach', wt, `origin/${branch}`], { cwd: board });
     run(['checkout', '-B', branch, `origin/${branch}`], { cwd: wt });
 
-    return writeCommitPush({ run, mkdir, write, wt, files, message, branch, created, assertReady, board });
+    return writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, created, assertReady, board });
   } finally {
     // ALWAYS, and in this order: remove the directory, then prune the registration. Dropping either one leaves
     // the next run on this branch wedged.
@@ -127,13 +128,16 @@ export function stageOnTransportBranch({
 }
 
 /** The tail both starts share: the caller's check, the writes, and the commit + push (never a force). */
-function writeCommitPush({ run, mkdir, write, wt, files, message, branch, created, assertReady, board }) {
+function writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, created, assertReady, board }) {
   if (assertReady) assertReady({ run, wt, board, branch, created });
 
   for (const file of files) {
     const abs = join(wt, file.path);
     mkdir(dirname(abs), { recursive: true });
-    write(abs, file.content);
+    // `content` may be a function of the file's CURRENT bytes on the freshly fetched tip (`null` when absent):
+    // an APPEND is only correct if it is computed against the tip the push will race, so it must be computed
+    // here, inside the worktree, and again on every retry (#3255).
+    write(abs, typeof file.content === 'function' ? file.content({ existing: read(abs) }) : file.content);
     run(['add', '--', file.path], { cwd: wt });
   }
 
@@ -144,6 +148,31 @@ function writeCommitPush({ run, mkdir, write, wt, files, message, branch, create
   // A FULL refname: on a created branch the remote has no `<branch>` for a short name to resolve against.
   run(['push', '--quiet', 'origin', created ? `HEAD:refs/heads/${branch}` : `HEAD:${branch}`], { cwd: wt });
   return { paths: files.map((f) => f.path), pushed: true, ...(created ? { created: true } : {}) };
+}
+
+/** The file's current text, or `null` when it does not exist. Any other read error is real and propagates. */
+function readExisting(abs) {
+  try { return readFileSync(abs, 'utf8'); } catch (e) { if (e?.code === 'ENOENT') return null; throw e; }
+}
+
+/**
+ * READ files off a transport branch's remote tip, touching nothing local but the remote-tracking ref.
+ *
+ * THROWS on any failure to learn the tip (unreachable remote, absent branch): the caller must turn that into
+ * "unreadable", never into "empty". A path that is absent on a tip we DID read is `null` - a true answer.
+ *
+ * @param {{board: string, branch: string, paths: string[], run?: Function}} o
+ * @returns {Record<string, string|null>} path -> text, or null when the path is not on the branch.
+ */
+export function readFromTransportBranch({ board, branch, paths = [], run = defaultGit } = {}) {
+  if (!board || !branch) throw new TypeError('git-transport-branch: `board` and `branch` are both required');
+  run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board });
+  const out = {};
+  for (const path of paths) {
+    const listed = run(['ls-tree', '--name-only', `origin/${branch}`, '--', path], { cwd: board }).trim();
+    out[path] = listed ? run(['show', `origin/${branch}:${path}`], { cwd: board }) : null;
+  }
+  return out;
 }
 
 function defaultGit(args, opts) {

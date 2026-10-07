@@ -32,6 +32,9 @@ import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { readOverlayConflictWakes, markOverlayConflictWake } from '../overlay-conflict-wake.mjs';
 
+// Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
+process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
+
 const tempDirs = [];
 
 function mktemp(prefix) {
@@ -576,14 +579,14 @@ describe('rebuildClone', () => {
       expect(t - s).toBeLessThanOrEqual(61_000);
     }
     expect(readRebuildStarvation(cloneDir, env)).toBe(2);
-    // third attempt: the reader finishes its tick after 5 min — within the 15 min starved wait, so it adopts
+    // third attempt: the reader finishes its tick after 2 min — within the (3 min default) starved wait, so it adopts
     const s = t;
     const r = await attempt(async (ms) => {
       t += ms;
-      if (t - s >= 5 * 60_000) releaseRead(cloneDir, { owner: 'review-daemon-sim', lockRoot: lockDir });
+      if (t - s >= 2 * 60_000) releaseRead(cloneDir, { owner: 'review-daemon-sim', lockRoot: lockDir });
     });
     expect(r.reason).not.toBe('tick-in-progress');
-    expect(t - s).toBeGreaterThanOrEqual(5 * 60_000);
+    expect(t - s).toBeGreaterThanOrEqual(2 * 60_000);
     expect(readRebuildStarvation(cloneDir, env)).toBe(0);
   });
 
@@ -2583,4 +2586,12 @@ describe('landed backlog sidecar cleanup (#4458)', () => {
     expect(existsSync(join(cloneDir, 'backlog/xabc123-copy.md'))).toBe(false);
   });
 
+});
+
+describe('starved rebuild wait is bounded (live 2026-10-07: 900s waits starved the sibling daemon)', () => {
+  it('defaults the starved wait to at most 3 minutes', async () => {
+    const { starvationLockWaitMs, DEFAULT_STARVED_LOCK_WAIT_MS } = await import('../daemon-rebuild/lease.mjs');
+    expect(DEFAULT_STARVED_LOCK_WAIT_MS).toBeLessThanOrEqual(180_000);
+    expect(starvationLockWaitMs(60_000, 5, {})).toBeLessThanOrEqual(180_000);
+  });
 });

@@ -8,6 +8,7 @@
 import fs from 'node:fs';
 import { join } from 'node:path';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from '../lib/marker-authorship.mjs';
+import { countEdgeCaseClasses } from '../backlog/edge-case-classes.mjs';
 
 const stamp = (v) => typeof v === 'string' ? Date.parse(v) : NaN;
 const round1 = (n, d = 1) => Number(n.toFixed(d));
@@ -223,7 +224,7 @@ export function parseCard(text) {
     kind: fm.kind ?? null, size: Number.isFinite(Number(fm.size)) && fm.size !== '' ? Number(fm.size) : null, tier: fm.tier ?? null,
     preparedDate: /^\d{4}-\d{2}-\d{2}/.test(fm.preparedDate ?? '') ? fm.preparedDate : null, bornAs: fm.bornAs ?? null,
     scope: Array.isArray(scope) ? scope.filter((s) => typeof s === 'string') : [],
-    checklist: /^\s*- \[[ xX]\]/m.test(body),
+    checklist: /^\s*- \[[ xX]\]/m.test(body), checklistClasses: countEdgeCaseClasses(body),
     doneWhen: Boolean(doneWhen.trim()), doneWhenExecutable: /`[^`]*\b(?:node|npx|npm|vitest|bun)\b[^`]*`/.test(doneWhen),
   };
 }
@@ -250,7 +251,7 @@ export function prAttributes({ pr, files = [], kind = 'code', card = null, recei
     prep: card ? {
       prepared: Boolean(card.preparedDate),
       preparedAgeDays: card.preparedDate ? round1((stamp(pr.createdAt) - stamp(`${card.preparedDate}T00:00:00Z`)) / 86400000) : null,
-      checklist: card.checklist, doneWhenExecutable: card.doneWhenExecutable,
+      checklist: card.checklist, checklistClasses: card.checklistClasses, doneWhenExecutable: card.doneWhenExecutable,
       scopeDeclared: declared.length, scopeOutside: outside.length, scopeUntouched: untouched.length,
     } : null,
     builder: receipt ? { who: 'conveyor-builder', executor: routing.executed ?? routing.routed ?? null, model: routing.model ?? null, tier: routing.tier ?? null }
@@ -281,7 +282,7 @@ export const ATTRIBUTES = Object.freeze({
   filesChanged: (a) => a.filesChanged, linesChanged: (a) => a.additions + a.deletions, subsystems: (a) => a.subsystems,
   testToCode: (a) => a.testToCode, cardSize: (a) => a.card?.size ?? null, cardKind: (a) => a.card?.kind ?? (a.card ? null : 'no-card'),
   care: (a) => a.care, seatedLenses: (a) => a.seated, prepared: (a) => a.prep ? String(a.prep.prepared) : null,
-  preparedAgeDays: (a) => a.prep?.preparedAgeDays ?? null, checklist: (a) => a.prep ? String(a.prep.checklist) : null,
+  preparedAgeDays: (a) => a.prep?.preparedAgeDays ?? null, checklist: (a) => a.prep ? String(a.prep.checklist) : null, checklistClasses: (a) => a.prep?.checklistClasses ?? null,
   doneWhenExecutable: (a) => a.prep ? String(a.prep.doneWhenExecutable) : null, scopeOutside: (a) => a.prep?.scopeOutside ?? null,
   builder: (a) => a.builder.who, executor: (a) => a.builder.executor ?? (a.builder.who === 'conveyor-builder' ? 'unrecorded' : null),
   laneBaseAgeHours: (a) => a.laneBaseAgeHours,

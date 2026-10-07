@@ -1,5 +1,5 @@
 import { buildOperatorRulingComment, referralFindingKey, mandatoryReferralReviewer, normalizeFinding, renderReferralRecord,
-  readReferralRecords, validateReferralRecord, mandatoryReferralState, activeReferrals } from '../../lib/jury-core.mjs';
+  readReferralRecords, validateReferralRecord, mandatoryReferralState, activeReferrals, REFERRAL_CARRY_REASON } from '../../lib/jury-core.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
 /**
  * @file review-pr-io.test.mjs — the `review-pr` io shell (#3035): the four sinks, with no `gh` and no network.
@@ -1187,6 +1187,120 @@ describe('#4315 durable referral effects', () => {
     const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
     expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
     expect(result.pending).toContain(current.referrals[0].key);
+  });
+
+  // #76c — the mandatory reviewer's OWN earlier counted ruling carries onto the same finding (moved line, same
+  // identity) on the new head, with no operator involved, and never a block, never over changed cited lines.
+  const reviewerCarryHarness = (h, result, { curLine = 12, card, summary, ruled = [] } = {}) => {
+    h.payload.referrals[0].original.line = 12;
+    h.payload.referrals[0].original.quote = 'await withListLock(() => writeHeld(list));';
+    const old = seedReferrals(h, ['judgeCorrectnessAdvisory'], 'c'.repeat(40), (r) => [{
+      id: 'earlier-run:0', key: r.referrals[0].key, reviewerId: r.reviewer.id, lens: r.reviewer.lens, result,
+      rationale: 'Checked the diff', evidence: ['diff:x'], ...(card ? { card } : {}) }]);
+    // Same claim, the line moved: only a punctuation-level re-wording carries (a different claim is re-ruled).
+    const original = { ...old.referrals[0].original, line: curLine, summary: summary ?? `${old.referrals[0].original.summary}.` };
+    // `ruled`: other findings already ruled `not-real` by the reviewer on this record (ids `current:0`…).
+    const others = ruled.map(o => ({ seat: 'judgeCorrectnessAdvisory', original: o, finding: normalizeFinding(o),
+      key: referralFindingKey('judgeCorrectnessAdvisory', o) }));
+    const current = { ...old, head: h.state.headRefOid, runId: 'current', rulings: [],
+      referrals: [{ seat: 'judgeCorrectnessAdvisory', original, finding: normalizeFinding(original),
+        key: referralFindingKey('judgeCorrectnessAdvisory', original) }, ...others],
+      reviewer: mandatoryReferralReviewer('current'), attempted: false };
+    current.rulings = others.map((x, n) => ({ id: `current:${n}`, key: x.key, reviewerId: current.reviewer.id,
+      lens: current.reviewer.lens, result: 'not-real', rationale: 'Checked the diff', evidence: ['diff:x'] }));
+    h.state.comments.push({ body: renderReferralRecord(current), author: { login: 'web-everything' } });
+    return { old, current };
+  };
+
+  it.each(['not-real', 'card'])('carries the reviewer\'s own earlier %s ruling onto a re-worded finding with unchanged lines', async (result) => {
+    const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    const { current } = reviewerCarryHarness(h, result, { card: result === 'card' ? 'we:backlog/7-filed.md' : undefined });
+    const out = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    const latest = readReferralRecords(h.state.comments).records.find(r => r.runId === 'current');
+    expect(latest.carried).toHaveLength(1);
+    expect(latest.carried[0]).toMatchObject({ result, from: { rulingId: 'earlier-run:0', runId: 'earlier-run' } });
+    expect(h.judge).not.toHaveBeenCalled();           // one ruling stands: the reviewer is not asked again
+    expect(out.pending).toEqual([]);
+    expect(h.lines.join('\n')).toContain('reviewer ' + result);
+    expect(current.referrals[0].key).toBe(latest.referrals[0].key);
+  });
+
+  it('never carries a reviewer BLOCK, and not a not-real over changed cited lines', async () => {
+    const blocked = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    const b = reviewerCarryHarness(blocked, 'block');
+    await blocked.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](blocked.payload, CTX);
+    expect(readReferralRecords(blocked.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
+    const changed = harness({ failure: 'omitted', readChangedLines: () => new Set([12]) });
+    const c = reviewerCarryHarness(changed, 'not-real');
+    const out = await changed.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](changed.payload, CTX);
+    expect(readReferralRecords(changed.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
+    expect(out.pending).toContain(c.current.referrals[0].key);
+    expect(b.current.referrals[0].key).toBeTruthy();
+  });
+
+  it('does not carry a reviewer ruling onto another claim quoting the same code, nor onto the same claim far away', async () => {
+    for (const opts of [{ summary: 'writeHeld swallows errors, so a failed write is reported as filed.' }, { curLine: 400 }]) {
+      const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+      const { current } = reviewerCarryHarness(h, 'not-real', opts);
+      const out = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+      expect(readReferralRecords(h.state.comments).records.find(r => r.runId === 'current').carried).toBeUndefined();
+      expect(out.pending).toContain(current.referrals[0].key);
+    }
+  });
+
+  // A reviewer carry stands only while its backing does. When the SOURCE ruling is later superseded the carry is
+  // withdrawn and the gate holds the finding pending (no block anywhere, so nothing links it); the dispatcher must
+  // then ask the reviewer afresh (once) — `liveReferrals` used to drop every carried key, leaving a hold with no
+  // owner and no automatic way out.
+  const withdrawnCarry = (h, extra = {}, harnessOptions = {}) => {
+    const { old, current } = reviewerCarryHarness(h, 'not-real', harnessOptions);
+    const key = current.referrals[0].key;
+    const carried = [{ key, reason: REFERRAL_CARRY_REASON, result: 'not-real',
+      from: { head: old.head, runId: old.runId, key: old.referrals[0].key, rulingId: 'earlier-run:0' } }];
+    h.state.comments.push({ body: renderReferralRecord({ ...current, carried, ...extra }), author: { login: 'web-everything' } });
+    const reRuled = { ...old, rulings: [...old.rulings, { ...old.rulings[0], id: 'earlier-run:1', supersedes: ['earlier-run:0'] }] };
+    h.state.comments.push({ body: renderReferralRecord(reRuled), author: { login: 'web-everything' } });
+    return { key };
+  };
+  const askedKeys = (h) => h.judge.mock.calls.flatMap(([req]) => JSON.parse(req.input.split('\nUntrusted reported findings:\n')[1]).map(f => f.key));
+  const currentOf = (h) => readReferralRecords(h.state.comments).records.find(r => r.runId === 'current');
+
+  it.each([[false, 'not yet attempted'], [true, 'already attempted']])('asks the reviewer about a carry whose backing was withdrawn (%s: %s)', async (attempted) => {
+    const h = harness({ readChangedLines: () => new Set() });
+    const { key } = withdrawnCarry(h, { attempted });
+    // The hold, read with the PR's own author stamp (without it every ruling is uncounted and this proves nothing).
+    expect(mandatoryReferralState(h.state.comments, { head: h.state.headRefOid, body: h.state.body, cardReadable: () => true }).pending).toContain(key);
+    const out = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(askedKeys(h)).toEqual([key]);                      // the reviewer is asked, exactly once
+    expect(currentOf(h).rulings.map(r => r.key)).toEqual([key]);
+    expect(currentOf(h).failure).toBeUndefined();             // an answered re-ask leaves nothing parked
+    expect(out.pending).not.toContain(key);
+  });
+
+  it('a re-ask on a record that already holds rulings numbers its answer past them, so the record stays valid', async () => {
+    const h = harness({ readChangedLines: () => new Set() });
+    const other = { summary: 'unrelated defect', file: 'y.mjs', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    const { key } = withdrawnCarry(h, { attempted: true }, { ruled: [other] });
+    const out = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(askedKeys(h)).toEqual([key]);
+    expect(currentOf(h).rulings.map(r => r.id)).toEqual(['current:0', 'current:1']);
+    expect(currentOf(h).failure).toBeUndefined();
+    expect(out.pending).not.toContain(key);
+  });
+
+  it('asks about a withdrawn carry only once: an omitted ruling parks it, and a record parked on a failure is never re-asked', async () => {
+    const h = harness({ failure: 'omitted', readChangedLines: () => new Set() });
+    const { key } = withdrawnCarry(h, { attempted: true });
+    await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(askedKeys(h)).toEqual([key]);
+    expect(currentOf(h).failure).toMatch(/withdrawn carry/);
+    const second = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(askedKeys(h)).toEqual([key]);                      // still one ask
+    expect(second.pending).toContain(key);                    // held for a person, as before
+    const parked = harness({ readChangedLines: () => new Set() });
+    withdrawnCarry(parked, { attempted: true, failure: 'budget exhausted' });
+    await parked.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](parked.payload, CTX);
+    expect(parked.judge).not.toHaveBeenCalled();
   });
 
   // A real top-level `a/` directory is a real path: the compare lookup must use the cited path as written, never
