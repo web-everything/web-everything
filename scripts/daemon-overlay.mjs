@@ -87,6 +87,8 @@ import {
   addOverlay, removeOverlay, readOverlayState, appendOverlayEvent, overlayFilePath, recordEdgeResolution,
 } from './lib/daemon-overlays.mjs';
 import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
+import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
+import { workspaceFor } from './lib/lane-pool-paths.mjs';
 import { edgeEnabled, registerPr } from './lib/daemon-edge.mjs';
 
 function parseFlags(argv) {
@@ -257,6 +259,9 @@ async function main() {
     return;
   }
 
+  try {
+    pruneStaleOverlayRecords(workspaceFor(dirname(fileURLToPath(import.meta.url))));
+  } catch { /* self-heal is best-effort */ }
   const flags = parseFlags(rest);
   const clone = typeof flags.clone === 'string' ? flags.clone : null;
   if (!clone) return fail('--clone=<path> is required');
