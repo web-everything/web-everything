@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { readBackoffSettings, backoffVerdict, reasonCodeOf } from './retry-backoff.mjs';
 
 export const INFRA_RETRY_BUDGET = 2;
 export function classifyPrepareFailure(evidence = {}) {
@@ -13,6 +14,9 @@ export function classifyPrepareFailure(evidence = {}) {
   if (evidence.sessionAbsent === true) return 'no-session';
   if (evidence.resultDiscarded === true && evidence.resultAuthored === true) return 'result-lost';
   if (evidence.stoppedBeforeCompletion === true) return 'agent-stopped-early';
+  // Items 95/96: a known-transient dispatch failure (launch not confirmed, checkout behind origin, ...) is retried
+  // with bounded backoff instead of held forever. Unrecognised text stays `unknown` (held + a diagnose card).
+  if (reasonCodeOf(error)) return 'dispatch-transient';
   return 'unknown';
 }
 export function validatePrepareRelease(entry, verifyCommit) {
@@ -61,7 +65,7 @@ function save(state, path) {
 }
 /** Singleton daemon owns this ledger. Persist intent before spawning so a crash cannot double-file. */
 export async function recordPrepareFailure({ num, attempt, stage, evidence = {} }, {
-  path = failureStatePath(), fileCard,
+  path = failureStatePath(), fileCard, now = Date.now(), settings = readBackoffSettings(),
 } = {}) {
   const state = readFailureState(path);
   const key = `${num}:${attempt}:${stage}`;
@@ -69,7 +73,13 @@ export async function recordPrepareFailure({ num, attempt, stage, evidence = {} 
   const cause = classifyPrepareFailure(evidence);
   const previous = Object.values(state.failures).filter(f => f.num === num && f.cause === 'infra-transient').length;
   const retry = cause === 'infra-transient' && previous < INFRA_RETRY_BUDGET;
-  const failure = { num, attempt, stage, cause, evidence, retry, held: !retry };
+  const failure = { num, attempt, stage, cause, evidence, retry, held: !retry, recordedAt: new Date(now).toISOString() };
+  if (cause === 'dispatch-transient') {
+    // Backoff: held until `retryAfter`, then `releaseDuePrepareRetries` lets it be dispatched again. Attempts
+    // count every unfinished transient failure of this card; at the cap it stays held (`exhausted`) for a re-arm.
+    const attempts = Object.values(state.failures).filter(f => f.num === num && f.cause === 'dispatch-transient' && !f.completed).length + 1;
+    Object.assign(failure, { reasonCode: reasonCodeOf(evidence.reason ?? evidence.error), attempts, ...backoffVerdict({ attempts, now, settings }) });
+  }
   state.failures[key] = failure;
   if (cause === 'unknown') {
     const signature = evidence.causeKey || `${stage}:${String(evidence.terminal ?? evidence.error ?? evidence.reason ?? 'missing terminal evidence').replace(/#?\d+/g, 'N')}`;
@@ -96,4 +106,43 @@ export function completePrepareFailures(num, path = failureStatePath()) {
   const state = readFailureState(path);
   for (const failure of Object.values(state.failures)) if (failure.num === num) failure.completed = true;
   save(state, path);
+}
+
+/** Held transient failures whose backoff has elapsed become retryable again. Returns the card numbers that now have
+ * NO remaining held failure (their hold files can be released). Exhausted failures are never released here. */
+export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date.now() } = {}) {
+  const state = readFailureState(path);
+  const touched = new Set();
+  for (const f of Object.values(state.failures)) {
+    if (f.held && !f.completed && !f.exhausted && f.retryAfter && Date.parse(f.retryAfter) <= now) {
+      Object.assign(f, { held: false, retry: true, retriedAt: new Date(now).toISOString() });
+      touched.add(f.num);
+    }
+  }
+  if (!touched.size) return [];
+  save(state, path);
+  return [...touched].filter(num => !Object.values(state.failures).some(f => f.num === num && f.held && !f.completed));
+}
+
+/** The pre-#4148 launch-confirmation bug recorded healthy launches as "not confirmed" and held the card for good. */
+export const NOT_CONFIRMED_FIX_LANDED_AT = '2026-10-07T00:25:38Z'; // merge of #4148 (2026-10-06 20:25 ET)
+
+/** One-shot re-arm: clear held failures whose reason code is in `codes` and which were recorded before `before`
+ * (`recordedAt`, else an ISO `attempt`, else unknown = written by older code = before). Returns the re-armed numbers. */
+export function rearmFalseHolds({ path = failureStatePath(), before = NOT_CONFIRMED_FIX_LANDED_AT, codes = ['launch-not-confirmed'], now = Date.now(), dryRun = false } = {}) {
+  const state = readFailureState(path);
+  const cutoff = Date.parse(before);
+  const rearmed = [];
+  for (const f of Object.values(state.failures)) {
+    if (!f.held || f.completed) continue;
+    if (!codes.includes(reasonCodeOf(f.evidence?.reason ?? f.evidence?.error))) continue;
+    const at = Date.parse(f.recordedAt ?? f.attempt);
+    if (Number.isFinite(at) && at >= cutoff) continue;
+    rearmed.push(f);
+  }
+  if (!dryRun && rearmed.length) {
+    for (const f of rearmed) Object.assign(f, { held: false, retry: true, rearmedAt: new Date(now).toISOString(), rearmedBefore: before });
+    save(state, path);
+  }
+  return { count: rearmed.length, nums: [...new Set(rearmed.map(f => f.num))] };
 }

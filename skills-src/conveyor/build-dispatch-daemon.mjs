@@ -77,7 +77,8 @@ import { readField } from '../../scripts/backlog/frontmatter.mjs';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
 import { MAX_CONCURRENT_LANES_ENV } from '../../scripts/lib/lane-concurrency.mjs';
 
-import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures } from '../../scripts/conveyor/prepare-failure-policy.mjs';
+import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
+import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures } from '../../scripts/conveyor/build-dispatch-failures.mjs';
 
 import { resolveScorecardStorePath } from '../../scripts/conveyor/run-scorecard-store.mjs';
 
@@ -267,6 +268,12 @@ export async function runBuildDispatchTick(options) {
 
 async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, policy = BUILD_DISPATCH_POLICY, prepareEnabled = true, routingPolicy, effects, timer = createPhaseTimer() }) {
   effects = timer.wrap(effects);
+  // Item 95 — held transient prepare failures whose backoff elapsed become dispatchable again BEFORE holds are read.
+  // Live only: a dry-run must not mutate the ledger.
+  if (live && typeof effects.releaseDuePrepareRetries === 'function') {
+    try { for (const num of effects.releaseDuePrepareRetries() ?? []) effects.releasePrepareHold?.({ num: normNum(num) }); }
+    catch (e) { console.error(`build-dispatch-daemon: prepare retry release failed: ${String(e?.message || e).split('\n')[0]}`); }
+  }
   let holds = effects.listHolds?.() ?? [];
   const prepareRows = effects.listPrepareInFlight?.() ?? [];
   const prepareClaims = effects.listPrepareClaims?.() ?? [];
@@ -347,7 +354,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         const num = normNum(st.num);
         const isPrepare = st.kind === 'prepare-item';
         launchSettlement.settled.push({ num, kind: st.kind, launched: Boolean(st.outcome?.dispatching), reason: st.outcome?.reason ?? null });
-        if (st.outcome?.dispatching) continue;
+        if (st.outcome?.dispatching) { if (!isPrepare && live) effects.clearBuildFailure?.({ num }); continue; }
         // The claim goes NOW (so this tick's own claim read already sees it freed); the failure record waits for
         // `failPrepare`/`failures`, declared further down.
         if (isPrepare) effects.releasePrepareClaim({ num }); else effects.releaseClaim({ num });
@@ -420,6 +427,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     if (!prev || (typeof r.startedAt === 'string' && r.startedAt > (prev.startedAt || ''))) settledByNum.set(n, r);
   }
   const heldNums = new Set(holds.map((h) => normNum(h.num)));
+  // Item 96 — a build card inside its failure backoff window (or exhausted) is withheld like a cooldown hold.
+  const buildBackoffs = effects.listBuildBackoffs?.() ?? [];
+  for (const b of buildBackoffs) heldNums.add(normNum(b.num));
   // #4465 — classify every LIVE hold (pure, cheap, every tick — never gated on `live`, so it is visible on a
   // `--dry-run` tick too) and, LIVE only, act on it (best-effort — a routing hiccup must never fail this
   // tick's own build-dispatch plan). Optional-chained so an older test stub that predates this field behaves
@@ -543,8 +553,12 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       let res;
       try { res = await effects.dispatch({ num: pick.num, bookkeeping, tick: out, tickBookkeeping, tickAt }); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
       if (res?.pending) startedThisTick += 1;
-      if (res?.dispatching) dispatched.push({ num: pick.num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null });
-      else { effects.releaseClaim({ num: pick.num }); failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched' }); }
+      if (res?.dispatching) { dispatched.push({ num: pick.num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null }); if (!res.pending) effects.clearBuildFailure?.({ num: pick.num }); }
+      else {
+        effects.releaseClaim({ num: pick.num });
+        const rec = effects.recordBuildFailure?.({ num: pick.num, reason: res?.reason ?? 'not dispatched', output: res?.output ?? res?.reason });
+        failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched', ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
+      }
     }
   }
   // Separate durable claims use the existing lease primitive, without occupying build slots.
@@ -597,7 +611,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     ...holds.filter((h) => ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason)).map((h) => normNum(h.num))]);
   for (const f of deferredLaunchFailures) {
     if (f.isPrepare) await failPrepare(f.num, f.outcome?.refused ? 'dispatch-refused' : 'dispatch', f.outcome?.reason ?? 'not dispatched', f.outcome?.evidence ?? {}, f.attempt ?? new Date().toISOString());
-    else failures.push({ num: f.num, stage: 'dispatch', reason: f.outcome?.reason ?? 'not dispatched' });
+    else {
+      const rec = live ? effects.recordBuildFailure?.({ num: f.num, reason: f.outcome?.reason ?? 'not dispatched', output: f.outcome?.output ?? f.outcome?.reason }) : null;
+      failures.push({ num: f.num, stage: 'dispatch', reason: f.outcome?.reason ?? 'not dispatched', ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
+    }
   }
   for (const num of inspectNums) {
     if (pendingLaunch.prepare.has(num)) { prepareBusy.add(num); continue; } // 78b — launch still starting; the claim stays
@@ -790,6 +807,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     // core's own `tickCore.held`, a different, capacity/supervision-driven concept) — visible so a `--dry-run`
     // or the live status line can say WHY an otherwise-cleared item was not offered.
     dispatchHolds: held,
+    buildBackoffs,
     dispatched,
     // 78b/#4139 — launches deferred by the host-load gate, and the detached-launch settlement this tick did.
     loadHolds,
@@ -1606,6 +1624,10 @@ function cliEffects() {
   let prepareReader;
   return {
     completePrepareFailures,
+    releaseDuePrepareRetries: () => releaseDuePrepareRetries(),
+    recordBuildFailure: (o) => recordBuildFailure(o),
+    clearBuildFailure: ({ num }) => clearBuildFailure(num),
+    listBuildBackoffs: () => listBuildBackoffs(),
     listPrepareFailures: () => Object.values(readFailureState().failures),
     listPrepareReleases: () => readPrepareReleases(join(SCRIPTS, 'conveyor', 'prepare-failure-releases.json'), REPO_ROOT),
     recordPrepareFailure: async input => recordPrepareFailure(input, { fileCard: async card => {
@@ -1934,13 +1956,31 @@ async function live(flags) {
   release();
 }
 
+/**
+ * Item 95 — the one-shot re-arm, through the product: clear held prepare failures whose reason code is
+ * `launch-not-confirmed` (default) recorded before #4148's fix landed, and release their hold files.
+ * `--before=<ISO>` `--codes=a,b` `--build-failures` (also drop exhausted build backoffs) `--dry-run`.
+ */
+function rearm(flags) {
+  const dryRun = Boolean(flags['dry-run']);
+  const before = typeof flags.before === 'string' ? flags.before : NOT_CONFIRMED_FIX_LANDED_AT;
+  const codes = typeof flags.codes === 'string' ? flags.codes.split(',').filter(Boolean) : undefined;
+  const res = rearmFalseHolds({ before, dryRun, ...(codes ? { codes } : {}) });
+  if (!dryRun) for (const num of res.nums) { try { releaseBuildDispatchHold({ num: normNum(num) }); } catch { /* hold already gone */ } }
+  const build = flags['build-failures'] ? rearmBuildFailures({ dryRun }) : null;
+  console.log(JSON.stringify({ rearmed: res.count, nums: res.nums, before, dryRun, ...(build ? { buildFailures: build } : {}) }));
+}
+
 async function main(argv) {
   installDaemonLog(); // item 68a/68b: ISO stamp, collapse identical repeats, size-rotate (see daemon-log.mjs)
   const flags = parseFlags(argv);
+  if (flags['rearm-false-holds']) return rearm(flags);
   if (flags['dry-run']) return dryRun(flags);
   if (flags.live) return live(flags);
   console.error('usage: build-dispatch-daemon.mjs --dry-run [--json] [--focus=N,M]   (read-only: what it would dispatch now)\n'
     + '       build-dispatch-daemon.mjs --live [--once] [--self-sync] [--no-prepare] [--max-concurrent=1] [--max-concurrent-external=4] [--max-open-prs=12] [--max-open-items=7] [--prepare-ahead-window=4|off] [--prepared-max-age-days=3|off] [--interval-ms=120000]\n'
+    + '       build-dispatch-daemon.mjs --rearm-false-holds [--dry-run] [--before=ISO] [--codes=launch-not-confirmed] [--build-failures]   (one-shot: clear false "launch not confirmed" holds)\n'
+    + 'retry backoff env: WE_DISPATCH_RETRY_BASE_MS (300000), WE_DISPATCH_RETRY_MAX_MS (3600000), WE_DISPATCH_RETRY_MAX_ATTEMPTS (6)\n'
     + 'red draft age env: WE_BUILD_DAEMON_RED_DRAFT_MINUTES (default 60)\n'
     + 'caps env: WE_BUILD_DAEMON_MAX_CONCURRENT (Claude), WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL (Codex/agy); flags win\n'
     + `paused ticks: ${PAUSED_PREP_ENV}=1 restores full preparation; ${PAUSED_SYNC_MS_ENV} sets clone sync interval (default ${DEFAULT_PAUSED_SYNC_MS}ms)\n`
