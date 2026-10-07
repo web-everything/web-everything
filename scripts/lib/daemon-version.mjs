@@ -30,7 +30,7 @@ export async function buildVersion({ clone, home, sha = 'HEAD', settings, force 
   const config = validateDaemonVersionsSettings(settings);
   const fs = deps.fs ?? filesystem;
   const env = { ...(deps.env ?? process.env), GIT_OPTIONAL_LOCKS: '0' };
-  const run = deps.run ?? ((args, options) => spawnSync('git', args, { encoding: 'utf8', ...options }));
+  const run = deps.run ?? ((args, options) => spawnSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...options }));
   const gitAt = cwd => makeGit({ run, cwd, env });
   const git = gitAt(source);
   const checked = (runner, args) => {
