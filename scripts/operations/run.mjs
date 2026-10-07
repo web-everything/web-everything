@@ -95,7 +95,7 @@ import { createScaffoldReader, createScaffoldSinks } from './scaffold-io.mjs';
 import { fileItemOperation, FILE_ITEM_OP } from './file-item.mjs';
 import { createFileItemReader, createFileItemSinks } from './file-item-io.mjs';
 import { openPrOperation, OPEN_PR_OP } from './open-pr.mjs';
-import { createOpenPrSinks } from './open-pr-io.mjs';
+import { createOpenPrSinks, deriveLaneRef } from './open-pr-io.mjs';
 import { PARK_LABELS } from '../pr-land.mjs';
 import { recordVerdictOperation, RECORD_VERDICT_OP } from './record-verdict.mjs';
 import { createRunReader, createRecordVerdictSinks } from './record-verdict-io.mjs';
@@ -409,7 +409,7 @@ export const OPERATIONS = Object.freeze({
   // PARK_LABELS is the home's own, injected rather than restated: a second list here could ask for a park the
   // home refuses.
   [OPEN_PR_OP]: () => ({
-    declaration: openPrOperation({ parkLabels: PARK_LABELS }),
+    declaration: openPrOperation({ parkLabels: PARK_LABELS, deriveRef: () => deriveLaneRef() }),
     sinks: createOpenPrSinks(),
   }),
   [EXPLORE_OP]: () => ({

@@ -16,9 +16,9 @@ import { fileURLToPath } from 'node:url';
 import { importGraph } from './import-graph.mjs';
 import {
   openPrOperation, planOpen, classifySubmit, defaultParkLabel, extractSubmitResult, describeSubmit,
-  OPEN_PR_OP, SUBMIT_PR_EFFECT, OPEN_MODES, SUBMIT_OUTCOMES, HOME_REASONS,
+  resolveRef, OPEN_PR_OP, SUBMIT_PR_EFFECT, OPEN_MODES, SUBMIT_OUTCOMES, HOME_REASONS,
 } from '../open-pr.mjs';
-import { createPrLandRunner, createOpenPrSinks, PR_LAND_CLI } from '../open-pr-io.mjs';
+import { createPrLandRunner, createOpenPrSinks, PR_LAND_CLI, resolveGhCredentialEnv, deriveLaneRef } from '../open-pr-io.mjs';
 import { PARK_LABELS } from '../../pr-land.mjs';
 
 const good = (over = {}) => ({
@@ -345,7 +345,7 @@ describe('classifySubmit — refused and could-not-run are different facts', () 
       expect({ reason, outcome: outcomeFor(reason) }).toEqual({ reason, outcome: 'refused' });
     }
     // The environment could not complete — the request is not what is wrong.
-    for (const reason of ['gh-error', 'push-failed', 'check-timeout', 'blocked-on-infra', 'fallback-failed']) {
+    for (const reason of ['gh-error', 'push-failed', 'blocked-on-infra', 'fallback-failed']) {
       expect({ reason, outcome: outcomeFor(reason) }).toEqual({ reason, outcome: 'unrun' });
     }
     for (const reason of ['opened', 'parked', 'merged-git-fallback', 'enqueued', 'labelled-on-green']) {
@@ -371,7 +371,7 @@ describe('classifySubmit — refused and could-not-run are different facts', () 
     { reason: 'conflict', pr: 1501, detail: 'PR #1501 has merge conflicts with main', want: 'refused' },
     { reason: 'check-red', pr: 1501, detail: 'PR #1501 required check RED', want: 'refused' },
     { reason: 'behind', pr: 1501, detail: 'PR #1501 is behind main (strict up-to-date)', want: 'refused' },
-    { reason: 'check-timeout', pr: 1501, detail: 'PR #1501 not ready past timeout', want: 'unrun' },
+    { reason: 'check-timeout', pr: 1501, detail: 'PR #1501 not ready past timeout', want: 'opened' },
     { reason: 'empty-body', pr: 1501, detail: 'PR #1501 has an empty/whitespace description', want: 'refused' },
   ];
 
@@ -598,5 +598,40 @@ describe('#4386 submit summaries', () => {
     [{ outcome: 'refused', reason: 'check-red', pr: 9, detail: 'checks failed' }, true, /REFUSED.*check-red.*#9.*checks failed/],
   ])('describes %j', (result, failed, line) => {
     expect(describeSubmit(result)).toEqual({ failed, line: expect.stringMatching(line) });
+  });
+});
+
+describe('items 79/81 — truthful label-on-green outcome, credential env, --branch', () => {
+  it('check-timeout WITH a pr reports the PR as opened and the label step as deferred (#79)', () => {
+    const r = classifySubmit({ status: 3, stdout: JSON.stringify({ reason: 'check-timeout', pr: 4056, url: 'https://x/4056' }) });
+    expect(r).toMatchObject({ outcome: 'opened', pr: 4056, labelStep: 'deferred' });
+    expect(describeSubmit(r)).toMatchObject({ failed: false });
+    expect(describeSubmit(r).line).toMatch(/#4056.*label step deferred to the drain's ci-lifecycle reconcile/);
+  });
+
+  it('check-timeout with NO pr stays unrun (#79)', () => {
+    expect(classifySubmit({ status: 3, stdout: JSON.stringify({ reason: 'check-timeout' }) }).outcome).toBe('unrun');
+  });
+
+  it('the sink never says "NOT opened" when the home named a PR (#79)', async () => {
+    const sinks = createOpenPrSinks({ run: () => ({ outcome: 'unrun', reason: 'gh-error', pr: 4051 }) });
+    const err = await sinks[SUBMIT_PR_EFFECT]({ argv: ['--ref=lane/x'] }).catch((e) => e);
+    expect(String(err.message)).toMatch(/PR #4051 is open/);
+    expect(String(err.message)).not.toMatch(/NOT opened/);
+  });
+
+  it('the runner spawns pr-land with the app-token shim on PATH (#79)', () => {
+    const env = resolveGhCredentialEnv({ env: { PATH: '/usr/bin' }, build: () => null, exists: () => true });
+    expect(env.PATH).toMatch(/gh-shim:\/usr\/bin$/);
+    let seen;
+    createPrLandRunner({ env, spawn: (_n, _a, o) => { seen = o.env; return { status: 0, stdout: '{"pr":1}' }; } })({ argv: ['--ref=lane/x'] });
+    expect(seen.PATH).toBe(env.PATH);
+  });
+
+  it('--branch is the ref; ref wins; with neither it derives from the lease purpose (#81)', () => {
+    expect(resolveRef({ branch: 'lane/a' })).toBe('lane/a');
+    expect(resolveRef({ ref: 'lane/r', branch: 'lane/a' })).toBe('lane/r');
+    expect(resolveRef({ derive: () => deriveLaneRef({ read: () => '{"purpose":"items 79/81"}' }) })).toBe('lane/items-79-81');
+    expect(deriveLaneRef({ read: () => { throw new Error('none'); } })).toBe('');
   });
 });
