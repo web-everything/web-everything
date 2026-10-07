@@ -76,3 +76,11 @@ The deterministic tests prove retry classification, boundedness, forwarding, and
 - Old scope was the entire `we:scripts/operations/__tests__/` directory. Corrected scope names the helper, existing session integration suite, and planned unit regression file explicitly. The production injection seams already exist at `we:scripts/operations/dispatch-lane-io.mjs:1839`, `we:scripts/operations/dispatch-lane-io.mjs:3273`, and `we:scripts/operations/dispatch-abort.mjs:72`, so no production edits are required. The old spawn citation at `we:scripts/operations/dispatch-lane-io.mjs:1752` is replaced above.
 - Corrected test placement: pure retry coverage belongs in the planned unit file; real-process routing coverage belongs in the existing integration suite, as established by `we:vitest.config.ts:273` and `we:vitest.integration.config.ts:120`. The earlier plan put both in the unit tier and supplied commands with an unusable repository prefix as a literal CLI path.
 - Size remains 2: one helper, one existing consumer suite, one focused new test file; no new production API or configuration work. Preparation leaves the existing stamps untouched for the runner and proposes no blockedBy changes.
+
+## Findings (standalone worker, 2026-10-07)
+
+The build-dispatch daemon held #4388 with:
+
+> worker-declined: scope exceeds the test-fix envelope — route to the builder: the heal changed 237 lines (limit 150)
+
+Implementation changes were discarded. The card is held for the builder; its declared scope is preserved.
