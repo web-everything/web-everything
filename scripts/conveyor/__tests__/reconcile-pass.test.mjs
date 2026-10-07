@@ -1209,6 +1209,10 @@ describe('timeout re-run eligibility — card-only diff + derived red checks (PR
     const checks = [{ name: 'review-gate', conclusion: 'failure' }, { name: 'test-shard (2)', conclusion: 'failure' }, { name: 'test', conclusion: 'failure' }];
     expect(checks.filter((c) => !isDerivedTimeoutCheck(c, checks)).map((c) => c.name)).toEqual(['test-shard (2)']);
     expect(isDerivedTimeoutCheck({ name: 'test', conclusion: 'failure' }, [{ name: 'test-shard (1)', conclusion: 'success' }])).toBe(false);
+    // PR #4141: the daemon-soak aggregator is derived once a soak shard failed; alone it is real evidence.
+    const soak = [{ name: 'soak-shard (3)', conclusion: 'failure' }, { name: 'daemon-soak', conclusion: 'failure' }];
+    expect(soak.filter((c) => !isDerivedTimeoutCheck(c, soak)).map((c) => c.name)).toEqual(['soak-shard (3)']);
+    expect(isDerivedTimeoutCheck({ name: 'daemon-soak', conclusion: 'failure' }, [{ name: 'soak-shard (1)', conclusion: 'success' }])).toBe(false);
   });
   it('the re-run is on by default and WE_CI_TIMEOUT_RERUN_ENABLED=0 is only a kill switch', () => {
     const pr = { number: 1, headRefOid: 'h', statusCheckRollup: [{ name: 'test-shard (2)', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/2' }] };

@@ -243,6 +243,15 @@ export function isStaleRefusal(reason) { return /stale-checkout/.test(String(rea
  *   defaultIntervalMs?:number, hasTickLines?:boolean }} sample
  * @param {number} now
  */
+/** A PR's remembered refusal is its OWNER-STATE reason. `timeout-retry-ineligible` is only the re-run path saying
+ *  "not me" and is logged AFTER the real verdict in the same tick (PR #4141: `fix-loop-hold` was masked by it), so it
+ *  never overwrites a different reason recorded for the same tick. */
+export function recordPrRefusal(refusals, r, at) {
+  const prev = refusals[r.pr];
+  if (prev && prev.at === at && /^reconcile-refused timeout-retry-ineligible\b/.test(r.reason) && prev.reason !== r.reason) return;
+  refusals[r.pr] = { reason: r.reason, at };
+}
+
 export function foldDaemonMemory(prev, sample, now) {
   const parsed = parseDaemonLog(sample.text);
   const mem = prev ? { ...prev, unproductiveReasons: { ...(prev.unproductiveReasons || {}) } } : {
@@ -266,7 +275,7 @@ export function foldDaemonMemory(prev, sample, now) {
     const wasUnproductive = mem.lastTick.unproductive;
     mem.lastTick = { ...mem.lastTick, blocking: [...mem.lastTick.blocking, ...lead.blocking].slice(0, 5), noLane: [...(mem.lastTick.noLane || []), ...lead.noLane.map((x) => x.repo)] };
     for (const nl of lead.noLane) mem.noLaneTimes.push({ at, repo: nl.repo });
-    for (const r of lead.prs) mem.prRefusals[r.pr] = { reason: r.reason, at };
+    for (const r of lead.prs) recordPrRefusal(mem.prRefusals, r, at);
     // xpinskip — a stale-clone refusal that arrived as a late detail still marks its tick (`s`).
     if (lead.blocking.some(isStaleRefusal)) {
       const last = mem.recentTicks.at(-1);
@@ -296,7 +305,7 @@ export function foldDaemonMemory(prev, sample, now) {
     mem.lastTickEstimated = !!sample.bootstrap;
     mem.lastTick = { at, dispatched: t.dispatched, owed: t.owed, refused: t.refused, wholeFailed: t.wholeFailed, blocking: t.blocking.slice(0, 5), noLane: t.noLane.map((x) => x.repo), unproductive: tickIsUnproductive(t) };
     for (const nl of t.noLane) mem.noLaneTimes.push({ at, repo: nl.repo });
-    for (const r of t.prs || []) mem.prRefusals[r.pr] = { reason: r.reason, at };
+    for (const r of t.prs || []) recordPrRefusal(mem.prRefusals, r, at);
     mem.recentTicks.push({
       at, u: tickIsUnproductive(t) ? 1 : 0, f: t.wholeFailed ? 1 : 0, why: t.blocking[0] ?? null,
       ...(t.blocking.some(isStaleRefusal) ? { s: 1 } : {}),
