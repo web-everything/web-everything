@@ -745,6 +745,7 @@ it('resume stops the idle live process by its SHORT job id first, then resumes t
   const sid = 'a287c608-48e3-4d38-99f1-10496475407f';
   const io = await defaultAwaitVerifyIo({
     sleep: () => {},
+    pidAliveFn: () => false,
     stopSessionFn: ({ handle }) => { calls.push(['stop', handle]); return { stopped: true }; },
     dispatchIo: {
       buildAgentArgv: ({ resumeSessionId }) => ['--bg', '--resume', resumeSessionId],
@@ -754,8 +755,132 @@ it('resume stops the idle live process by its SHORT job id first, then resumes t
       defaultListAgents: () => [],
     },
   });
-  const r = io.resume({ session: { id: 'a287c608', sessionId: sid, cwd: '/scratch', state: 'working', status: 'idle', pid: 0 }, prompt: 'x' });
+  const r = io.resume({ session: { id: 'a287c608', sessionId: sid, cwd: '/scratch', state: 'working', status: 'idle', pid: 4242 }, prompt: 'x' });
   expect(calls[0]).toEqual(['stop', 'a287c608']); // never the full uuid: `claude stop <uuid>` is "No job matching"
   expect(calls[1]).toEqual(['spawn', ['--bg', '--resume', sid], '/scratch']);
   expect(r).toMatchObject({ resumed: true });
+});
+
+// The resume port's fail-closed branches: every refusal must be driven, so dropping a guard line reddens a test.
+describe('resume port: stop-before-resume guards', () => {
+  const sid = 'a287c608-48e3-4d38-99f1-10496475407f';
+  const mk = ({ stop = () => ({ stopped: true }), pidAliveFn, rows = [], onSleep = () => {} } = {}) => {
+    const calls = [];
+    return {
+      calls,
+      ioPromise: defaultAwaitVerifyIo({
+        sleep: (ms) => { calls.push(['sleep', ms]); onSleep(ms); },
+        pidAliveFn,
+        stopSessionFn: ({ handle }) => { calls.push(['stop', handle]); return stop({ handle }); },
+        dispatchIo: {
+          buildAgentArgv: ({ resumeSessionId }) => ['--bg', '--resume', resumeSessionId],
+          parseBackgroundedId: () => sid,
+          resumeSucceeded: () => ({ resumed: true }),
+          defaultSpawnAgent: () => { calls.push(['spawn']); return 'backgrounded'; },
+          defaultListAgents: () => (typeof rows === 'function' ? rows() : rows),
+        },
+      }),
+    };
+  };
+  const idle = { id: 'a287c608', sessionId: sid, cwd: '/scratch', state: 'working', status: 'idle', pid: 4242 };
+  const spawned = (calls) => calls.some((c) => c[0] === 'spawn');
+
+  it('waits until the stopped process exits, and spawns only after it has', async () => {
+    let alive = 3;
+    const h = mk({ pidAliveFn: () => (alive-- > 0) });
+    const r = (await h.ioPromise).resume({ session: idle, prompt: 'x' });
+    expect(r).toMatchObject({ resumed: true });
+    expect(alive).toBeLessThan(0); // liveness was polled until it flipped to dead
+    expect(h.calls.filter((c) => c[0] === 'sleep' && c[1] === 500).length).toBeGreaterThanOrEqual(3);
+    expect(h.calls.findIndex((c) => c[0] === 'spawn')).toBeGreaterThan(h.calls.findIndex((c) => c[0] === 'stop'));
+  });
+  it('refuses, and never spawns, while the process stays alive after the wait', async () => {
+    const h = mk({ pidAliveFn: () => true });
+    const r = (await h.ioPromise).resume({ session: idle, prompt: 'x' });
+    expect(r).toEqual({ resumed: false, reason: 'stop-before-resume: process still alive' });
+    expect(h.calls.filter((c) => c[0] === 'sleep' && c[1] === 500)).toHaveLength(20);
+    expect(spawned(h.calls)).toBe(false);
+  });
+  it('refuses, and never spawns, when the stop itself throws', async () => {
+    const h = mk({ stop: () => { throw new Error('claude stop failed\nsecond line'); }, pidAliveFn: () => false });
+    const r = (await h.ioPromise).resume({ session: idle, prompt: 'x' });
+    expect(r).toEqual({ resumed: false, reason: 'stop-before-resume: claude stop failed' });
+    expect(spawned(h.calls)).toBe(false);
+  });
+  it('falls back to the first 8 chars of the session uuid when the row carries no short id', async () => {
+    const h = mk({ pidAliveFn: () => false });
+    const { id: _omit, ...noShortId } = idle;
+    (await h.ioPromise).resume({ session: noShortId, prompt: 'x' });
+    expect(h.calls.find((c) => c[0] === 'stop')).toEqual(['stop', 'a287c608']);
+  });
+  it('does not kill a session that started a new turn after the pass saw it idle', async () => {
+    const h = mk({ pidAliveFn: () => false, rows: [{ ...idle, status: 'busy' }] });
+    const r = (await h.ioPromise).resume({ session: idle, prompt: 'x' });
+    expect(r).toEqual({ resumed: false, reason: 'stop-before-resume: session started a new turn' });
+    expect(h.calls.some((c) => c[0] === 'stop')).toBe(false);
+    expect(spawned(h.calls)).toBe(false);
+  });
+  it('with an unknown pid, exit is read from the session list, not assumed after a sleep', async () => {
+    let listed = 0;
+    const live = { ...idle, pid: 0 };
+    const h = mk({ pidAliveFn: () => { throw new Error('pid must not be consulted'); },
+      // 1st read is the pre-stop idle check; then two reads still live; then the row is stopped.
+      rows: () => [{ ...live, state: ++listed <= 3 ? 'working' : 'stopped' }] });
+    const r = (await h.ioPromise).resume({ session: live, prompt: 'x' });
+    expect(r).toMatchObject({ resumed: true });
+    expect(listed).toBeGreaterThan(3);
+    expect(h.calls.findIndex((c) => c[0] === 'spawn')).toBeGreaterThan(h.calls.findIndex((c) => c[0] === 'stop'));
+  });
+  it('with an unknown pid, refuses and never spawns while the list still shows the session live', async () => {
+    const live = { ...idle, pid: 0 };
+    const h = mk({ rows: [{ ...live, state: 'working' }] });
+    const r = (await h.ioPromise).resume({ session: live, prompt: 'x' });
+    expect(r).toEqual({ resumed: false, reason: 'stop-before-resume: process still alive' });
+    expect(spawned(h.calls)).toBe(false);
+  });
+  it('with an unknown pid, a row missing from the list is "unknown", never "exited": refuses, no spawn', async () => {
+    const h = mk({ rows: [] });
+    const r = (await h.ioPromise).resume({ session: { ...idle, pid: 0 }, prompt: 'x' });
+    expect(r).toEqual({ resumed: false, reason: 'stop-before-resume: process still alive' });
+    expect(spawned(h.calls)).toBe(false);
+  });
+  it('with an unknown pid, a list that stops being readable after the stop never reads as exited', async () => {
+    let reads = 0;
+    const h = mk({ rows: () => { if (++reads > 1) throw new Error('claude agents timed out'); return []; } });
+    const r = (await h.ioPromise).resume({ session: { ...idle, pid: 0 }, prompt: 'x' });
+    expect(r).toEqual({ resumed: false, reason: 'stop-before-resume: process still alive' });
+    expect(spawned(h.calls)).toBe(false);
+  });
+  it('refuses, without stopping anything, when the session list cannot be read before the stop', async () => {
+    const h = mk({ pidAliveFn: () => false, rows: () => { throw new Error('claude agents timed out'); } });
+    const r = (await h.ioPromise).resume({ session: idle, prompt: 'x' });
+    expect(r).toEqual({ resumed: false, reason: 'stop-before-resume: session list unreadable' });
+    expect(h.calls.some((c) => c[0] === 'stop')).toBe(false);
+    expect(spawned(h.calls)).toBe(false);
+  });
+  it('never stops an operator\'s interactive terminal session', async () => {
+    const h = mk({ pidAliveFn: () => false });
+    const r = (await h.ioPromise).resume({ session: { ...idle, kind: 'interactive' }, prompt: 'x' });
+    expect(r.resumed).toBe(false);
+    expect(r.reason).toMatch(/interactive session is not a background dispatch/);
+    expect(h.calls.some((c) => c[0] === 'stop')).toBe(false);
+    expect(spawned(h.calls)).toBe(false);
+  });
+  it('reads the live row UNCACHED: the 20s agents cache would return the row the pass already judged', async () => {
+    const seen = [];
+    const calls = [];
+    const io = await defaultAwaitVerifyIo({
+      sleep: () => {}, pidAliveFn: () => false, env: { WE_CLAUDE_AGENTS_CACHE_TTL_MS: '20000' },
+      stopSessionFn: () => ({ stopped: true }),
+      dispatchIo: {
+        buildAgentArgv: () => [], parseBackgroundedId: () => sid, resumeSucceeded: () => ({ resumed: true }),
+        defaultSpawnAgent: () => 'x',
+        defaultListAgents: ({ env }) => { seen.push(env.WE_CLAUDE_AGENTS_CACHE_TTL_MS); calls.push(1); return [{ ...idle }]; },
+      },
+    });
+    io.resume({ session: idle, prompt: 'x' });
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((ttl) => ttl === '0')).toBe(true); // the pre-stop read AND the post-spawn confirmation reads
+    expect(seen.length).toBeGreaterThanOrEqual(2);
+  });
 });
