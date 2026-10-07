@@ -31,7 +31,7 @@
  */
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
-import { DEFAULT_STANDARD_MINUTES, createQueueBudget, DEFAULT_BUILD_SIZE } from '../readiness/heavy-queue-projection.mjs';
+import { DEFAULT_STANDARD_MINUTES, createQueueBudget, DEFAULT_BUILD_SIZE, HEAVY_KINDS, classifyCommandKind } from '../readiness/heavy-queue-projection.mjs';
 
 export const HEAVY_QUEUE_OP = 'heavy-queue';
 
@@ -55,7 +55,7 @@ export const STANDARD_MINUTES_BY_KIND = DEFAULT_STANDARD_MINUTES;
 export function classifyHeavyJobKind({ command, isSelectedBase = null, kind = null } = {}) {
   // Card xkyw1x4 — a holder / waiter written by the new admission code RECORDS its kind (slot `meta.kind`, the
   // waiting marker's `kind`); that recorded kind wins over re-deriving it from the command line.
-  if (['selected', 'FULL', 'standards', 'files', 'other'].includes(kind)) return kind;
+  if (HEAVY_KINDS.includes(kind)) return kind;
   const cmd = String(command || '').trim();
   if (!cmd) return 'other';
   if (/verify-lane\.mjs/.test(cmd)) return isSelectedBase ? 'selected' : 'FULL';
@@ -63,7 +63,7 @@ export function classifyHeavyJobKind({ command, isSelectedBase = null, kind = nu
   if (/\bvitest\s+related\b/.test(cmd)) return 'files';
   if (/\bvitest\s+run\b/.test(cmd)) return 'FULL';
   if (/\bnpm\s+(?:run\s+)?test(?::unit)?\b/.test(cmd)) return 'FULL';
-  return 'other';
+  return classifyCommandKind(cmd); // item 100 — soak / coverage / build / agent / verify, else a truly unknown `other`
 }
 
 /** Minutes between two ISO timestamps (or `null` when either is unparseable), rounded to one decimal. */

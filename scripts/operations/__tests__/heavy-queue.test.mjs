@@ -37,8 +37,9 @@ describe('classifyHeavyJobKind — from the LIVE command line, never a stored fi
     expect(classifyHeavyJobKind({ command: 'npm test' })).toBe('FULL');
   });
 
-  it('anything else routed through the pool (build, npm ci, …) is "other"', () => {
-    expect(classifyHeavyJobKind({ command: "sh -c 'npm run build:docs && npm run build:demo'" })).toBe('other');
+  it('item 100 — a build is "build"; only a truly unknown command is "other"', () => {
+    expect(classifyHeavyJobKind({ command: "sh -c 'npm run build:docs && npm run build:demo'" })).toBe('build');
+    expect(classifyHeavyJobKind({ command: 'node scripts/mystery.mjs' })).toBe('other');
   });
 
   it('a null/empty command (the pid already exited) is "other", never a guess', () => {

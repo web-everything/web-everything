@@ -9,6 +9,7 @@ import { describe, it, expect } from 'vitest';
 import {
   classifyCommandKind, queueLaneOf, typicalMinutes, DEFAULT_STANDARD_MINUTES, TYPICAL_MIN_SAMPLES,
   classifyDispatchKind, dispatchDemandMinutes, queueBacklog, projectedWaitMinutes, createQueueBudget,
+  refineKind, holderLabel, holdBreakdown, HEAVY_KINDS, FAST_LANE_KINDS,
   resolvePrepareAdmission, typicalDispatchMinutes, PREPARE_DISPATCH_KINDS, resolveFastSlots, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, laneProjection,
 } from '../heavy-queue-projection.mjs';
 
@@ -19,7 +20,7 @@ describe('classifyCommandKind — the gate / wrapped command line → heavy kind
   it('the unconditional gate and every full vitest run are `FULL`', () => {
     expect(classifyCommandKind('npm run test:unit && npm run check:standards')).toBe('FULL');
     expect(classifyCommandKind('vitest run --reporter=dot')).toBe('FULL');
-    expect(classifyCommandKind('npm run test:coverage')).toBe('FULL');
+    expect(classifyCommandKind('npm run test:coverage')).toBe('coverage');
   });
   it('#5128 — the bounded explicit-list gate (`vitest run <files>`) is `selected`, never `FULL`', () => {
     expect(classifyCommandKind("npx vitest run 'a.test.mjs' 'b/c.test.mjs' --passWithNoTests && npm run check:standards -- --local --files='a.mjs'")).toBe('selected');
@@ -30,7 +31,7 @@ describe('classifyCommandKind — the gate / wrapped command line → heavy kind
     for (const cmd of ['npx vitest run', 'npx vitest run --reporter dot', 'npx vitest run --passWithNoTests && npm run check:standards',
       'npx vitest run --reporter=dot && node x.mjs',
       // A flag value that looks like a script file is not a test target (package.json test:integration:vitest / test:soak).
-      'vitest run --config vitest.integration.config.ts', 'vitest run --config vitest.soak.config.ts', 'npx vitest run -c vitest.config.mjs',
+      'vitest run --config vitest.integration.config.ts', 'npx vitest run -c vitest.config.mjs',
       'npx vitest run --reporter=./r.mjs', 'npx vitest run --setupFiles ./s.js && npm run check:standards',
       // A full suite chained after a bounded list, or split by a newline, is still a full suite.
       'npx vitest run a.test.mjs && npx vitest run', "npx vitest run\nnode scripts/x.mjs"]) expect(classifyCommandKind(cmd), cmd).toBe('FULL');
@@ -46,7 +47,8 @@ describe('classifyCommandKind — the gate / wrapped command line → heavy kind
   it('check:standards alone is `standards`; a bare vitest related is `files`; anything else `other`', () => {
     expect(classifyCommandKind('node scripts/check-standards.mjs')).toBe('standards');
     expect(classifyCommandKind('npx vitest related x.mjs --run')).toBe('files');
-    expect(classifyCommandKind('npm ci')).toBe('other');
+    expect(classifyCommandKind('npm ci')).toBe('build');
+    expect(classifyCommandKind('node scripts/x.mjs')).toBe('other');
     expect(classifyCommandKind(null)).toBe('other');
   });
   it('short kinds ride the fast lane; full suites and unknown jobs the slow lane', () => {
@@ -250,5 +252,46 @@ describe('typicalDispatchMinutes — total heavy time per prepare session', () =
       { repo: '/lane-1', at: '3', ms: 5 * 60_000 },
     ].map((r) => ({ ...r, dispatchKind: 'prepare-decision' }));
     expect(typicalDispatchMinutes(rows)).toEqual({ minutes: { prepare: 4 }, source: { prepare: { from: 'rolling', samples: 3 } } });
+  });
+});
+
+describe('item 100 — `other` is split into real kinds; only a truly unknown command stays `other`', () => {
+  it('classifies the commands that used to fall into `other`', () => {
+    expect(classifyCommandKind('node scripts/verify-lane.mjs run --repo=.')).toBe('verify');
+    expect(classifyCommandKind('npx vitest run --config vitest.soak.config.ts a.test.ts')).toBe('soak');
+    expect(classifyCommandKind('vitest run --config vitest.soak.config.ts')).toBe('soak');
+    expect(classifyCommandKind('node scripts/codex-direct-task.mjs --prompt x')).toBe('agent');
+    expect(classifyCommandKind('npm ci')).toBe('build');
+    expect(classifyCommandKind('npm run test:coverage')).toBe('coverage');
+    expect(classifyCommandKind('node scripts/some-unknown.mjs')).toBe('other');
+  });
+  it('the new kinds are slow-lane and seeded', () => {
+    for (const k of ['verify', 'soak', 'coverage', 'build', 'agent']) {
+      expect(HEAVY_KINDS).toContain(k);
+      expect(FAST_LANE_KINDS).not.toContain(k);
+      expect(DEFAULT_STANDARD_MINUTES[k]).toBeGreaterThan(0);
+    }
+  });
+  it('refineKind re-derives only a missing / other kind, from the command else the holder label', () => {
+    expect(refineKind('other', { holder: 'verify-lane.mjs run' })).toBe('verify');
+    expect(refineKind(null, { command: 'npm ci' })).toBe('build');
+    expect(refineKind('files', { holder: 'verify-lane.mjs run' })).toBe('files');
+    expect(refineKind('other', { command: 'node x.mjs', holder: 'x.mjs run' })).toBe('other');
+  });
+  it('holderLabel is the script plus its subcommand', () => {
+    expect(holderLabel(['node', '/a/b/verify-lane.mjs', 'check', '--wait=60'])).toBe('verify-lane.mjs check');
+    expect(holderLabel(['node', '/a/b/x.mjs', '--flag'])).toBe('x.mjs');
+  });
+  it('holdBreakdown sums minutes per kind and splits `other` by command / holder', () => {
+    const recs = [
+      { kind: 'other', ms: 60_000, at: '2026-10-06T10:00', command: 'node a.mjs' },
+      { kind: 'other', ms: 120_000, at: '2026-10-06T11:00', dispatchKind: 'fix' },
+      { kind: 'verify', ms: 180_000, at: '2026-10-06T12:00' },
+      { kind: 'other', ms: 600_000, at: '2026-10-05T12:00' },
+    ];
+    const b = holdBreakdown(recs, { sinceIso: '2026-10-06' });
+    expect(b.kinds.other).toEqual({ holds: 2, minutes: 3 });
+    expect(b.kinds.verify.minutes).toBe(3);
+    expect(b.other).toEqual({ 'node a.mjs': { holds: 1, minutes: 1 }, fix: { holds: 1, minutes: 2 } });
   });
 });

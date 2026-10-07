@@ -150,7 +150,7 @@ import { execContainerized, containerCliAvailable, containerImageAvailable, reso
 import { resolveHostRoot, readHostToday, extractSamplesByName, utcDayKey } from '../operations/telemetry-summary-io.mjs'; // #4076 — REUSE the host-sampler's own root-resolution + tail-read + metric-extraction primitives (never reimplemented — see loadAdmissionDecision's section header below)
 import { latestValue, median } from '../lib/telemetry-machine.mjs'; // #4076/#4343 — the SAME "latest sample wins" reducer + median telemetry-machine.mjs already uses/exports — never a second implementation
 import {
-  classifyCommandKind, resolveFastRunTimeoutMs, normalizeKind, queueLaneOf, typicalMinutes, typicalDispatchMinutes, resolvePrepareAdmission, classifyDispatchKind, dispatchDemandMinutes,
+  classifyCommandKind, refineKind, holderLabel, holdBreakdown, resolveFastRunTimeoutMs, normalizeKind, queueLaneOf, typicalMinutes, typicalDispatchMinutes, resolvePrepareAdmission, classifyDispatchKind, dispatchDemandMinutes,
   queueBacklog, laneProjection, resolveFastSlots, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
@@ -906,7 +906,7 @@ export function isOldestLiveWaiter({ lockRoot, owner, nowMs, ttlMs = WAITING_TTL
  * @returns {Promise<{ ok:boolean, slot:number|null, timedOut:boolean, waitedMs:number, disabled?:boolean, ceilingHit?:boolean }>}
  */
 export async function acquireSlotBlocking({
-  lockRoot, cap, owner, lane = null, num = null, repo = null, kind = null,
+  lockRoot, cap, owner, lane = null, num = null, repo = null, kind = null, command = null, holder = holderLabel(process.argv),
   pollMs = DEFAULT_POLL_MS, ceilingMs = DEFAULT_ADMISSION_CEILING_MS, leaseMinutes = ADMISSION_LEASE_MINUTES,
   stillWaitingLogMs = STILL_WAITING_LOG_MS,
   pid = process.pid, now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -916,7 +916,9 @@ export async function acquireSlotBlocking({
 
   const startedAt = now();
   // Card xkyw1x4 — the command KIND decides the queue lane and which slots may be taken (fast lane).
-  const jobKind = normalizeKind(kind);
+  // Item 100 — a missing / `other` kind is re-derived from the command or the acquiring script; `other` that
+  // survives is a truly unknown command, and the command / holder are recorded with the hold.
+  const jobKind = refineKind(kind, { command, holder, env });
   const fastSlots = resolveFastSlots(env);
   const slotOrder = slotOrderFor(jobKind, cap, fastSlots);
   // xaipsbs — every admission attempt first clears stale waiters, so debris never outlives the next caller.
@@ -940,7 +942,7 @@ export async function acquireSlotBlocking({
       if (isOldestLiveWaiter({ lockRoot, owner, nowMs: attempt, kind: jobKind, ...seams })) {
         const nowIso = new Date(attempt).toISOString();
         // `meta` carries the kind + acquire time so the release can record the hold duration by kind.
-        const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null };
+        const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null, ...(command ? { command: String(command).slice(0, 200) } : {}), ...(holder ? { holder } : {}) };
         const r = tryAcquireSlot({ lockRoot, cap, owner, nowMs: attempt, nowIso, pid, leaseMinutes, meta, slots: slotOrder });
         if (r.ok) return { ok: true, slot: r.slot, timedOut: false, waitedMs: attempt - startedAt };
       }
@@ -966,7 +968,7 @@ const DURATIONS_LOG = 'durations.jsonl';
 export const DURATIONS_LOG_MAX_LINES = 2000;
 
 /** Append one hold-duration record. Never throws. */
-export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = null, at = new Date().toISOString(), dispatchKind = null, session = null, leaseAcquiredAt = null }) {
+export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = null, at = new Date().toISOString(), dispatchKind = null, session = null, leaseAcquiredAt = null, command = null, holder = null }) {
   if (!Number.isFinite(ms) || ms < 0) return false;
   const file = join(lockRoot, DURATIONS_LOG);
   try {
@@ -976,6 +978,8 @@ export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = nul
       ...(dispatchKind != null ? { dispatchKind } : {}),
       ...(session != null ? { session } : {}),
       ...(leaseAcquiredAt != null ? { leaseAcquiredAt } : {}),
+      ...(command ? { command } : {}),
+      ...(holder ? { holder } : {}),
     }) + '\n', 'utf8');
     const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
     if (lines.length > DURATIONS_LOG_MAX_LINES) writeFileSync(file, lines.slice(-Math.floor(DURATIONS_LOG_MAX_LINES / 2)).join('\n') + '\n', 'utf8');
@@ -996,6 +1000,7 @@ function recordReleasedHold(lockRoot, entry, nowMs = Date.now()) {
   recordHoldDuration({
     lockRoot, kind, ms: nowMs - started, lane: entry.meta.lane ?? null, repo, at: new Date(nowMs).toISOString(),
     dispatchKind: classifyDispatchKind(lease), session: lease?.holder || lease?.session || null, leaseAcquiredAt: lease?.acquiredAt || null,
+    command: entry.meta.command ?? null, holder: entry.meta.holder ?? null,
   });
 }
 
@@ -1243,7 +1248,7 @@ export async function runUnderAdmission({
   // `WE_HEAVY_ADMISSION=off` check apply to the `run` wrapper's wait too, not just this function's own messages.
   // Card xkyw1x4 — the kind is read off the wrapped command itself unless the caller names it.
   const runKind = kind ?? classifyCommandKind(command, env);
-  const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, ceilingMs, leaseMinutes, now, sleep, log, env });
+  const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, command, ceilingMs, leaseMinutes, now, sleep, log, env });
   if (admission.timedOut) {
     log(`⚠ heavy-command admission: timed out after ${admission.waitedMs}ms waiting for capacity (cap=${cap}) — proceeding unslotted.\n`);
   } else if (admission.waitedMs > 0) {
