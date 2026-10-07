@@ -59,17 +59,6 @@ export const resolveFixDispatchMaxConcurrent = (o) => resolveDispatchSetting('fi
 export const resolveMaxLoadPerCore = (o) => resolveDispatchSetting('maxLoadPerCore', o);
 export const resolveHeavyAdmissionCap = (o) => resolveDispatchSetting('heavyAdmissionCap', o);
 
-/**
- * How many ci-heal sessions may run PAST the fixer cap (env WE_CI_HEAL_RESERVE, default 1, 0 = none). A PR that failed
- * its OWN required check is owed a ci-heal owner; review fixes that fill the cap must not starve it forever (live
- * incident 2026-10-07: #4235 sat red for hours, logged `refused fix-cap ... ci-heal deferred` every pass).
- */
-export function resolveCiHealReserve({ env = process.env } = {}) {
-  const e = env?.WE_CI_HEAL_RESERVE;
-  const n = Number(e);
-  return e !== undefined && e !== '' && Number.isInteger(n) && n >= 0 ? n : 1;
-}
-
 /** Pure: is the host too loaded to START new work? Unreadable load/cores fails OPEN (admit). */
 export function hostLoadGate({ load, cores, maxLoadPerCore = DISPATCH_SETTINGS_BUILT_IN.maxLoadPerCore } = {}) {
   if (!Number.isFinite(load) || !Number.isFinite(cores) || cores < 1) return { admit: true };
@@ -94,25 +83,17 @@ export function createDispatchThrottle({
   listClaims = () => [], env = process.env, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length,
 } = {}) {
   let live = null;
-  let liveHeal = 0;
   return {
     tryAdmit(kind = 'fix') {
       const cap = resolveFixDispatchMaxConcurrent({ env });
-      if (live === null) {
-        try { const claims = listClaims(); live = countLiveFixSessions(claims); liveHeal = claims.filter((c) => c?.meta?.kind === 'ci-heal').length; } catch { live = 0; liveHeal = 0; }
-      }
-      const reserve = resolveCiHealReserve({ env });
-      // A ci-heal may take the reserved slot past the cap; a fix never can.
-      const reserved = kind === 'ci-heal' && live >= cap && liveHeal < reserve;
-      if (live >= cap && !reserved) {
-        const note = kind === 'ci-heal' ? `; the ${reserve} reserved ci-heal slot(s) (WE_CI_HEAL_RESERVE) are in use` : '';
-        return { admit: false, kind: 'fix-cap', why: `${live} live fix/ci-heal session(s) >= cap ${cap} (WE_FIX_DISPATCH_MAX_CONCURRENT)${note}; ${kind} deferred, no claim taken` };
+      if (live === null) { try { live = countLiveFixSessions(listClaims()); } catch { live = 0; } }
+      if (live >= cap) {
+        return { admit: false, kind: 'fix-cap', why: `${live} live fix/ci-heal session(s) >= cap ${cap} (WE_FIX_DISPATCH_MAX_CONCURRENT); ${kind} deferred, no claim taken` };
       }
       let gate = { admit: true };
       try { gate = hostLoadGate({ load: loadavg(), cores: cpuCount(), maxLoadPerCore: resolveMaxLoadPerCore({ env }) }); } catch { /* fail open */ }
       if (!gate.admit) return gate;
       live += 1;
-      if (kind === 'ci-heal') liveHeal += 1;
       return { admit: true };
     },
   };
