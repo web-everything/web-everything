@@ -63,8 +63,11 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          # Kept explicit: the ledger append pushes to `origin` with this credential. Needs `contents: write`.
-          persist-credentials: true
+          # NOT persisted. With `contents: write` the token is a push credential, and a persisted one sits in
+          # `.git/config` for the whole job: `npm ci` and every `node` process that loads node_modules could
+          # read it. The two steps that need git network access (collect, apply) attach it themselves, to the
+          # one command that uses it. Pinned by `we:scripts/__tests__/apply-review-request.test.mjs`.
+          persist-credentials: false
 
       # The ledger append commits to the transport branch, and git refuses a commit with no identity.
       - name: Set the bot's git identity
@@ -93,15 +96,23 @@ jobs:
         env:
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
+          # For the two fetches below ONLY. The checkout no longer persists a credential, so a fetch of a
+          # private repo needs one; it is attached to that single command and stripped before `node` runs.
+          FETCH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          git fetch --quiet origin "$AFTER"
+          authed_git() {
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 -w0)" \
+              git "$@"
+          }
+          authed_git fetch --quiet origin "$AFTER"
           # Harmless and expected to fail on the push that CREATES the branch, where `before` is all zeros.
-          git fetch --quiet origin "$BEFORE" || true
+          authed_git fetch --quiet origin "$BEFORE" || true
           # WHICH FILES the push added is decided in a TESTED script, not here. Shell in a workflow cannot be
           # unit-tested, and the genesis-push case got it wrong when it was: see the header of
           # `we:scripts/collect-review-requests.mjs` for what was dropped, silently, and why.
-          node scripts/collect-review-requests.mjs --before="$BEFORE" --after="$AFTER" > /tmp/requests.txt
+          env -u FETCH_TOKEN node scripts/collect-review-requests.mjs --before="$BEFORE" --after="$AFTER" > /tmp/requests.txt
           echo "count=$(wc -l < /tmp/requests.txt)" >> "$GITHUB_OUTPUT"
           cat /tmp/requests.txt
 
@@ -117,6 +128,12 @@ jobs:
           AFTER: ${{ github.sha }}
         run: |
           set -uo pipefail
+          # The git credential for the ledger push, held in THIS step's environment only (the checkout does not
+          # persist one). Masked so no log line can print it. Needs `contents: write`.
+          basic=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          [ -n "$basic" ] || { echo "::error::no GitHub token available for the ledger push"; exit 1; }
+          echo "::add-mask::$basic"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic"
           failed=0
           while read -r req; do
             [ -n "$req" ] || continue
