@@ -309,7 +309,7 @@ describe('gate hardening (PR #4271 review)', () => {
       expect((note.match(/`/g) || []).length).toBe(12);
       expect(codeSpan('a`b')).toBe("`` a'b ``");
       // invisible/format characters (bidi override, zero-width) and a lone surrogate left by the length cut
-      expect(codeSpan('x‮y​z')).toBe('`` x y z ``');
+      expect(codeSpan('x\u202Ey\u200Bz')).toBe('`` x y z ``');
       expect(codeSpan('ab\u{1F600}', 3)).toBe('`` ab ``');
       expect(codeSpan('x'.repeat(5000), 10)).toBe(`\`\` ${'x'.repeat(10)} \`\``);
     });
