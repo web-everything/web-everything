@@ -6090,6 +6090,70 @@ delivery-policy loader (`5008`) and the decider core with shadow mode (`5009`).
 `we:reports/2026-10-03-delivery-strategy-survey-and-decider.md`. Full reasoning and the rejected options:
 [#4998](/backlog/4998-decision-a-delivery-strategy-decider-picks-per-decision-poin/).
 
+### The verdict ledger is the PR state store, the lifecycle is derived from it, and labels are one rendering of it {#verdict-ledger-pr-state-store}
+
+**Ratified 2026-10-05 by the operator (Nicolas Gilbert), in conversation, forks F1 to F7 of the #3007 plan
+all at their bold defaults.** The operator's words: *"all ratified, with configuration where it makes sense"*.
+Direction: one append-only ledger holds every judgment-bearing event about a PR. A pure function derives the
+lifecycle state from those events plus GitHub facts. Labels become a mirror of that derived state. This
+extends [state-lives-where-its-nature-dictates](#state-lives-where-its-nature-dictates) (the git transport is the
+ledger's home) and builds on [delivery-decider-under-fixed-settings](#delivery-decider-under-fixed-settings)
+(safety fields are tighten-only).
+
+**The rule:**
+1. **F1: what the ledger holds.** Every judgment-bearing event: `verdict`, `referral`, `ruling`, `review-run`,
+   `hold` / `release`, `approval`, `send-back`, `author` and `label-input`. A v1 row reads as `type: verdict`.
+   Lifecycle transitions are **not** stored one by one. They are a pure function of the events plus facts, so a
+   git push means "something was decided", never "a tick happened". Identity is repo + PR + append order; the
+   content witnesses (`headSha`, `reviewedDiff`, `reviewedContribution`) stay attributes, never keys.
+2. **F2: two stores, joined at read time.** Judgments live on the git ledger. GitHub facts (heads, checks,
+   draft, merged) stay in the per-PR facts Durable Object (#4281) and are never copied into the ledger. One pure
+   `derivePrState(events, facts, settings)` joins them; every reader (the drain gate, the review daemon,
+   operator queue, health watch, `pr-status`, the checker) calls it.
+3. **F3: authority rolls out labels, then both, then ledger.** `mergeGate.reviewAuthority`. `both` merges only
+   when labels and ledger both clear, so it is tighter and a normal setting change. `ledger` drops the label
+   input, so it is a loosening of a safety field: a human-ratified statute PR, gated on
+   `summarizeAgreement().phase2Safe` over about 7 days of #3930 records. The drain stays the sole main writer and
+   re-reads the ledger itself before each merge
+   ([event-driven-land-is-wake-only](#event-driven-land-is-wake-only)).
+4. **F4: write-miss posture (#3216).**
+   - A **clearing** event that fails to append **does not clear**: no label swap, a loud error, and the
+     operation stays resumable.
+   - A **holding** event that fails to append **still applies its label hold** and raises a
+     `ledger-write-miss` smell.
+   - An **unreadable** ledger at merge time **defers with a reason**. A fetch failure is `unreadable`, never
+     "empty"; every gate treats it as a hold.
+5. **F5: hand-applied labels are tighten-only.** The mirror honors a hand-added hold and reverts a hand move
+   that removes a hold or adds an accept, commenting with the sanctioned command. Each is recorded as a
+   `label-input` event with the sender.
+6. **F6: comments are a projection of the ledger row.** Old comment parsing stays as a read fallback for a
+   family until that family's reader flips to the ledger.
+7. **F7: backlog shape.** #3007 stays the authority-flip story. The build slices are siblings under #2405 and
+   #4075. #5052, #5053 and #5054 are cross-linked, not re-parented.
+8. **Exactly one label writer: the mirror** (`pr-label-mirror`, generalizing the ruling-needed sweep), one
+   label family at a time, removing the old writer in the same PR.
+9. **Hold rules are a registry extension point** (`pr-state.hold`): the strictest wins, and a rule that crashes
+   holds the PR with `rule-crashed:<id>`; it never merges.
+
+**Settings (all configurable; declared here, wired into `we:config/platformDefaults.ts` by the build slices).**
+A looser value is a statute PR; a tighter value is a normal setting change. Shape follows
+[config-extends-platform-default](#config-extends-platform-default).
+
+| Setting | Default | Other values |
+|---|---|---|
+| `verdictLedger.store` | `dual`, moving to `git` once the real-git contention test passes | `home` (rollback) |
+| `mergeGate.reviewAuthority` | `labels`, moving to `both` | `ledger` (statute PR plus 7 clean days) |
+| `verdictLedger.writeMiss` | `tiered` (rule 4) | `fail-closed` (tighter, always allowed) |
+| `labelMirror.handInput` | `tighten-only` | `revert-all` (tighter); `trust-operator` (looser, statute PR) |
+| `verdictLedger.readSource.<family>` | `comments` until that family's reader switches | `ledger` |
+
+**What this ruling does not do.** It builds nothing and adds no code. The build slices (event types v2, git
+io-shell, dual write, `derivePrState`, mirror, ledger gate) are filed separately. The write-miss posture is
+documented at the append site and tested by the build that moves the ledger onto the git transport (#3255).
+
+**Lineage:** ratified via the #3007 plan (2026-10-05); F4 resolves #3216. Unifies #3007, #5052, #5053, #5054
+and #4284. Full reasoning: [#3216](/backlog/3216-revisit-the-ledger-write-miss-posture-before-the-authority-m/).
+
 ---
 
 ## Standing process & method rules (codified in the topical docs — pointers)

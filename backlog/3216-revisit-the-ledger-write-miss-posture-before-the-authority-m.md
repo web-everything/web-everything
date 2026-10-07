@@ -3,8 +3,10 @@ bornAs: xksotz7
 kind: decision
 parent: "2405"
 blockedBy: ["3255"]
-status: open
+status: resolved
 dateOpened: "2026-08-20"
+dateResolved: "2026-10-07"
+codifiedIn: "docs/agent/platform-decisions.md#verdict-ledger-pr-state-store"
 tags: []
 scope:
   - we:scripts/lib/verdict-ledger.mjs
