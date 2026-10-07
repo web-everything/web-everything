@@ -64,6 +64,7 @@ import { stripVTControlCharacters } from 'node:util';
 import { SELECTION_FLAG, pinnedMergeBase, decideLocalSelection, referencedTestNeedles, LOCAL_FULL_SUITE_TRIGGERS } from '../readiness/test-selection.mjs';
 import { isPolicyCorePath } from './gate-config.mjs';
 import { isAllowlistedLitterPath } from './lane-litter.mjs';
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { queueLaneOf } from '../readiness/heavy-queue-projection.mjs';
 import { scanCommands } from './repo-scan-tests.mjs';
 import { buildReverseImportGraph, selectRelatedTests } from './related-test-selection.mjs';
@@ -212,6 +213,25 @@ export function matchRequestedDefaultGate({ gate, env, resolved, resolveUnder, v
   return null;
 }
 
+/** The no-op gate recorded for a card-only diff (skipLocalForCardOnly); verify-lane writes the green marker without running it. */
+export const CARD_ONLY_SKIP_GATE = "echo 'verify-lane: card-only diff - local gate skipped; CI runs the full check:standards'";
+
+/**
+ * Is the working-tree diff against the pinned merge-base card-only by CI's own definition (`isCardOnlyDiff`)? Pure
+ * over `runGit`. Lists with `--no-renames` exactly as CI does (both sides of a rename), plus untracked files except
+ * allowlisted lane litter (which never reaches a commit). Unknown/empty diff is never card-only (fail closed).
+ */
+export function localDiffIsCardOnly({ base = 'origin/main', runGit }) {
+  try {
+    const mergeBase = pinnedMergeBase({ base, runGit });
+    if (!mergeBase) return false;
+    const lines = (out) => String(out).split('\n').map((s) => s.trim()).filter(Boolean);
+    const tracked = lines(runGit(['diff', '--name-only', '--no-renames', mergeBase]));
+    const untracked = lines(runGit(['ls-files', '--others', '--exclude-standard'])).filter((f) => !isAllowlistedLitterPath(f));
+    return isCardOnlyDiff([...new Set([...tracked, ...untracked])]);
+  } catch { return false; }
+}
+
 export const STANDARDS_AUTO_PREFIXES =Object.freeze([
   'backlog/', 'docs/', 'config/', 'agent-memory-src/', 'skills-src/', '.claude/',
   '.github/', 'src/', 'blocks/', 'research/', 'site/',
@@ -280,6 +300,11 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
   const timeoutFlags = scaledTimeoutFlags(testTimeoutFactor);
   const diff = localChangedSet({ base, runGit });
   const changedFiles = diff ? diff.changedFiles : null;
+  if (settings.skipLocalForCardOnly && localDiffIsCardOnly({ base, runGit })) {
+    return { command: CARD_ONLY_SKIP_GATE, gateReasons: ['card-only diff (CI\'s definition) - local gate skipped; CI runs the full check:standards and stays the merge authority'],
+      decision: { mode: 'card-only-skip', reasons: ['card-only diff'], changedFiles, standards: { policy: settings.standards, run: false, scoped: false, reason: 'skipped (card-only: CI runs check:standards)' },
+        settingsSource, relatedMode, referencedTests: [], targets: [], relatedFiles: [], triggerFiles: [], deletedSourceFiles: [] } };
+  }
   const standards = decideStandardsHalf({ policy: settings.standards, changedFiles });
   const optOut = String(env?.[SELECTION_FLAG] ?? '') === '0';
   // #4540: only untracked allowlist matches are scratch; tracked names remain real inputs.
@@ -646,6 +671,7 @@ export function explicitGateRefusal(gate) {
  * @returns {string}
  */
 export function describeGate({ command, decision, scanCommands = [] }) {
+  if (decision.mode === 'card-only-skip') return `verify-lane gate: SKIPPED — card-only diff (CI's definition, scripts/ci-card-only.mjs); CI runs the full check:standards and stays the merge authority.`;
   if (decision.mode === 'blocked') return `verify-lane gate: BLOCKED selection — ${decision.reasons.join('; ')}`;
   const out = [];
   if (decision.mode === 'shrink') {

@@ -15,7 +15,7 @@ import { execSync } from 'node:child_process';
 import { LANE_RELEASE_LITTER_ALLOWLIST } from '../lane-litter.mjs';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { alwaysRunPlan, alwaysRunInventory, verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS } from '../verify-lane-gate.mjs';
+import { alwaysRunPlan, alwaysRunInventory, verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS, CARD_ONLY_SKIP_GATE, localDiffIsCardOnly } from '../verify-lane-gate.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -1106,5 +1106,47 @@ describe('alwaysRunInventory (item 99): a guard counts as run only if vitest exe
   });
   it('a report entry for a differently-located file does not count for a similarly named guard', () => {
     expect(alwaysRunInventory({ reportText: report('/repo/x/a.test.mjs'), files: ['a.test.mjs'], cwd }).missing).toEqual(['a.test.mjs']);
+  });
+});
+
+describe('skipLocalForCardOnly — card-only diffs skip the local gate (CI keeps its full check:standards)', () => {
+  const on = { skipLocalForCardOnly: true };
+  /** git fake that, unlike fakeGit, also accepts CI's `--no-renames` listing. */
+  const gitFor = (files, { untracked = [] } = {}) => (args) => {
+    if (args[0] === 'merge-base') return 'deadbeef';
+    if (args[0] === 'diff' && args.includes('--diff-filter=D')) return '';
+    if (args[0] === 'diff') return files.join('\n');
+    if (args[0] === 'ls-files') return untracked.join('\n');
+    throw new Error(`unexpected git invocation: ${args.join(' ')}`);
+  };
+  it('a card-only diff resolves to the skip gate when the knob is on', () => {
+    const r = resolveDefaultGate({ runGit: gitFor(['backlog/a.md', 'backlog/b.md']), env: {}, fileConfig: on });
+    expect(r.command).toBe(CARD_ONLY_SKIP_GATE);
+    expect(r.decision.mode).toBe('card-only-skip');
+    expect(describeGate(r)).toContain('card-only');
+  });
+  it('the knob off keeps the normal gate for the same diff', () => {
+    const r = resolveDefaultGate({ runGit: gitFor(['backlog/a.md']), env: {}, fileConfig: { skipLocalForCardOnly: false } });
+    expect(r.decision.mode).not.toBe('card-only-skip');
+    expect(r.command).toContain('check:standards');
+  });
+  it('the env override WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY=0 turns it off', () => {
+    const r = resolveDefaultGate({ runGit: gitFor(['backlog/a.md']), env: { WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '0' }, fileConfig: on });
+    expect(r.decision.mode).not.toBe('card-only-skip');
+  });
+  it('any non-card path, an empty diff or an unreadable diff is never skipped (fail closed)', () => {
+    for (const files of [['backlog/a.md', 'scripts/x.mjs'], ['backlog/a.md', 'docs/x.md'], []]) {
+      expect(localDiffIsCardOnly({ runGit: gitFor(files) })).toBe(false);
+    }
+    expect(localDiffIsCardOnly({ runGit: () => { throw new Error('no git'); } })).toBe(false);
+  });
+  it('lists with --no-renames exactly as CI does, so a rename out of backlog/ is never hidden', () => {
+    const seen = [];
+    localDiffIsCardOnly({ runGit: (a) => { seen.push(a); return a[0] === 'merge-base' ? 'deadbeef' : ''; } });
+    expect(seen).toContainEqual(['diff', '--name-only', '--no-renames', 'deadbeef']);
+  });
+  it('an untracked non-litter file breaks card-only; lane litter does not', () => {
+    expect(localDiffIsCardOnly({ runGit: gitFor(['backlog/a.md'], { untracked: ['scripts/new.mjs'] }) })).toBe(false);
+    expect(localDiffIsCardOnly({ runGit: gitFor(['backlog/a.md'], { untracked: [LANE_RELEASE_LITTER_ALLOWLIST[0]] }) })).toBe(true);
   });
 });

@@ -423,6 +423,18 @@ if (cacheHit) {
   emit({ sha: headSha, status: 'green', reason: 'cached', exitCode: preStart.exitCode ?? null, ...cachedRetry, ...cachedPhases, detail: cachedDetail }, 0);
 }
 
+// Card-only diff (skipLocalForCardOnly): nothing local to run. Record a green marker for HEAD saying the gate was
+// skipped, so every existing reader (check, pr-land finish-guard, open-pr) sees an ordinary green. Handled before the
+// daemon-lease check and admission: no server, no heavy slot. CI runs its full check:standards on the PR regardless.
+if (resolvedGate?.decision?.mode === 'card-only-skip') {
+  const now = new Date().toISOString();
+  const detail = `card-only diff (CI's definition) - local gate skipped for ${headSha.slice(0, 8)}; CI's check:standards stays the merge authority.`;
+  if (MODE === 'run') emit({ sha: headSha, status: 'green', reason: 'card-only-skip', exitCode: 0, detail: `${detail} (run mode - no marker recorded).` }, 0);
+  writeMarker({ ...verifyFinishBody(verifyStartBody({ sha: headSha, suites: GATE, startedAt: now, treeHash: currentTreeHash }),
+    { finishedAt: now, exitCode: 0, sha: headSha, suites: GATE, treeHash: currentTreeHash }), skipped: 'card-only' });
+  emit({ sha: headSha, status: 'green', reason: 'card-only-skip', exitCode: 0, detail }, 0);
+}
+
 // #4161 — cached results need no server; only new requests require the daemon's live lease.
 if (MODE === 'request') {
   const lockRoot = process.env.CONVEYOR_RUNNER_LOCK_ROOT || RUNNER_LOCK_ROOT;
