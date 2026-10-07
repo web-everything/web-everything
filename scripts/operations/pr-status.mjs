@@ -78,6 +78,7 @@ import { compute } from './step-kinds.mjs';
 // act, and `merge-ai-prs.mjs` imports `node:child_process`/`node:fs` writes/etc. throughout. See that lib
 // module's own header for the full reasoning.
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
+import { withoutImpliedRequiredChecks } from '../lib/required-status-checks.mjs';
 
 export const PR_STATUS_OP = 'pr-status';
 
@@ -169,8 +170,11 @@ export const FAILING_CONCLUSIONS = Object.freeze([
  * @returns {{state: string, why: string, counts: {total: number, succeeded: number, failed: number, running: number, nonBlocking: number, unreadable: number}}}
  */
 export function reduceCheckState(runs = [], requiredChecks) {
-  const required = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null;
-  const list = collapseRollupToLatestPerName(runs).filter((r) => {
+  const collapsed = collapseRollupToLatestPerName(runs);
+  const requiredRaw = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null;
+  // A required name implied by a green aggregate (`integration` by `test`) is not "missing" on a head that predates it.
+  const required = requiredRaw ? withoutImpliedRequiredChecks(requiredRaw, collapsed) : null;
+  const list = collapsed.filter((r) => {
     const name = String(r?.name ?? '');
     return required ? required.includes(name) : !CI_TRUTH_EXCLUDED_CHECKS.includes(name);
   });

@@ -200,6 +200,43 @@ export function resolveWriterPriorityAfter(env = process.env) {
   return Number.isInteger(n) && n >= 0 ? n : DEFAULT_WRITER_PRIORITY_AFTER;
 }
 
+/** Setting: the most CONSECUTIVE ticks one reader may lose to a writer claim (`writer-priority`) before it ignores
+ *  the claim and takes a normal read slot (live 2026-10-07: the review daemon skipped whole ticks, back-to-back,
+ *  while the fix daemon's claim stood). The ordinary `writer-active` refusal is untouched, so a reader still never
+ *  starts inside a move (#4044). Default 2; `0` = never skip for writer priority at all. */
+export const WRITER_PRIORITY_MAX_SKIPS_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_PRIORITY_MAX_SKIPS';
+export const DEFAULT_WRITER_PRIORITY_MAX_SKIPS = 2;
+
+/** PURE: the consecutive writer-priority skip cap from env (a non-negative integer, else the default). */
+export function resolveWriterPriorityMaxSkips(env = process.env) {
+  const raw = env?.[WRITER_PRIORITY_MAX_SKIPS_ENV];
+  const n = raw == null || String(raw).trim() === '' ? NaN : Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : DEFAULT_WRITER_PRIORITY_MAX_SKIPS;
+}
+
+function writerSkipsFile(starvedRoot) { return join(starvedRoot, '..', 'writer-priority-skips.json'); }
+
+function readWriterSkips(starvedRoot) {
+  try {
+    const m = JSON.parse(readFileSync(writerSkipsFile(starvedRoot), 'utf8'));
+    return m && typeof m === 'object' && !Array.isArray(m) ? m : {};
+  } catch { return {}; }
+}
+
+/** Best-effort: set one reader's consecutive writer-priority skip count (0 removes it). Returns the new count. */
+function setWriterSkips(starvedRoot, readerKey, count) {
+  const m = readWriterSkips(starvedRoot);
+  if (count > 0) m[readerKey] = count; else if (!(readerKey in m)) return 0; else delete m[readerKey];
+  try {
+    const file = writerSkipsFile(starvedRoot);
+    mkdirSync(join(file, '..'), { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}`;
+    writeFileSync(tmp, `${JSON.stringify(m)}\n`, 'utf8');
+    renameSync(tmp, file);
+  } catch { /* best-effort: a lost count only delays the bypass */ }
+  return count;
+}
+
 /** PURE: the writer-claim TTL from env (a positive number, else the default). */
 export function resolveWriterClaimTtlMs(env = process.env) {
   const n = Number(env?.[WRITER_CLAIM_TTL_ENV]);
@@ -351,6 +388,7 @@ export function acquireRead(root, opts = {}) {
     trackStarvation = true,
     writerPriorityAfter = resolveWriterPriorityAfter(),
     writerClaimTtlMs = resolveWriterClaimTtlMs(),
+    writerPriorityMaxSkips = resolveWriterPriorityMaxSkips(),
   } = opts;
   const { writerRoot, readersRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
   const nowIso = new Date(nowMs).toISOString();
@@ -362,7 +400,9 @@ export function acquireRead(root, opts = {}) {
   });
   if (claim) {
     const mine = readStarvedRecords(starvedRoot).find((r) => r.readerKey === readerKey);
-    if (!(mine && isoMs(mine.firstRefusedAt) < isoMs(claim.since))) {
+    const skips = readWriterSkips(starvedRoot)[readerKey] ?? 0;
+    if (!(mine && isoMs(mine.firstRefusedAt) < isoMs(claim.since)) && skips < writerPriorityMaxSkips) {
+      if (trackStarvation) setWriterSkips(starvedRoot, readerKey, skips + 1);
       return { ok: false, reason: 'writer-priority', heldBy: claim.owner, writerStarved: claim.count, claimSince: claim.since };
     }
   }
@@ -392,6 +432,7 @@ export function acquireRead(root, opts = {}) {
   }
   // In: our reader slot now holds any writer off by itself, so the priority claim has done its job.
   clearReaderStarved(starvedRoot, readerKey);
+  setWriterSkips(starvedRoot, readerKey, 0);
   return { ok: true };
 }
 
