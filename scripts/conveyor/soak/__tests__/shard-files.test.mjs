@@ -3,62 +3,60 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { shardFiles, parseShardArg, listBreakTestFiles, BASELINE_FILE } from '../shard-files.mjs';
+import { loadTimings } from '../../../ci/shard-assign.mjs';
 
-describe('soak shard-files — deterministic baseline-alone + round-robin break split', () => {
-  it('shard 1 of N>1 is the baseline alone', () => {
-    const files = shardFiles({ shard: 1, total: 4 });
-    expect(files).toEqual(['scripts/conveyor/soak/daemon-soak.soak.test.mjs']);
-  });
-
-  it('shards 2..N split every break file, none dropped, none duplicated', () => {
+describe('soak shard-files — time-balanced split (card 11)', () => {
+  it('every file (baseline + breaks) is assigned to exactly one shard', () => {
     const total = 4;
-    const breakFiles = listBreakTestFiles();
     const seen = [];
-    for (let shard = 2; shard <= total; shard += 1) {
-      const files = shardFiles({ shard, total });
-      // every non-baseline file assigned actually lives in breaks/
-      for (const f of files) expect(f).toMatch(/^scripts\/conveyor\/soak\/breaks\/.*\.soak\.test\.mjs$/);
-      seen.push(...files);
-    }
-    expect(seen.length).toBe(breakFiles.length);
-    expect(new Set(seen).size).toBe(breakFiles.length); // no duplicates
+    for (let shard = 1; shard <= total; shard += 1) seen.push(...shardFiles({ shard, total }));
+    const expected = [BASELINE_FILE, ...listBreakTestFiles()].length;
+    expect(seen.length).toBe(expected);
+    expect(new Set(seen).size).toBe(expected); // none dropped, none duplicated
   });
 
   it('total=1 runs everything in the single shard (baseline + every break)', () => {
     const files = shardFiles({ shard: 1, total: 1 });
-    const breakFiles = listBreakTestFiles();
-    expect(files.length).toBe(1 + breakFiles.length);
+    expect(files.length).toBe(1 + listBreakTestFiles().length);
     expect(files[0]).toBe('scripts/conveyor/soak/daemon-soak.soak.test.mjs');
   });
 
-  // Real append/insert fixtures (a temp `breaks/` dir via the `breaksDir` override), not two calls on one list.
-  function assignments(names, total = 4) {
+  // Real fixtures (a temp `breaks/` dir via the `breaksDir` override), not two calls on one list.
+  function withBreaks(names, fn) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-shard-'));
     try {
       for (const n of names) writeFileSync(join(dir, n), '');
-      const out = {};
-      for (let shard = 2; shard <= total; shard += 1) {
-        for (const f of shardFiles({ shard, total, breaksDir: dir, repoRoot: dir })) out[f.split('/').pop()] = shard;
-      }
-      return out;
+      return fn(dir);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   }
-  const BASE = ['b.soak.test.mjs', 'd.soak.test.mjs', 'f.soak.test.mjs', 'h.soak.test.mjs', 'j.soak.test.mjs', 'l.soak.test.mjs'];
 
-  it('appending a break (sorts last) keeps every existing file in its shard', () => {
-    const before = assignments(BASE);
-    const after = assignments([...BASE, 'z.soak.test.mjs']);
-    for (const f of BASE) expect(after[f], f).toBe(before[f]);
-    expect(after['z.soak.test.mjs']).toBeDefined();
+  it('balances by the stored timings: the heavy file sits alone, light files fill the rest', () => {
+    const names = ['a.soak.test.mjs', 'b.soak.test.mjs', 'c.soak.test.mjs', 'd.soak.test.mjs'];
+    withBreaks(names, (dir) => {
+      const opts = { total: 2, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir };
+      const timings = { 'base.soak.test.mjs': 40, 'a.soak.test.mjs': 10, 'b.soak.test.mjs': 10, 'c.soak.test.mjs': 10, 'd.soak.test.mjs': 10 };
+      const s1 = shardFiles({ ...opts, shard: 1, timings });
+      const s2 = shardFiles({ ...opts, shard: 2, timings });
+      expect(s1).toEqual(['base.soak.test.mjs']); // 40 vs 4x10 = 40: perfectly balanced
+      expect(s2.length).toBe(4);
+    });
   });
 
-  it('inserting a break mid-list keeps every file that sorts before it in its shard', () => {
-    const before = assignments(BASE);
-    const after = assignments([...BASE, 'g.soak.test.mjs']); // sorts between f and h
-    for (const f of BASE.filter((n) => n < 'g.soak.test.mjs')) expect(after[f], f).toBe(before[f]);
-    // Files sorting AFTER the insert may shift a bucket under index round-robin — allowed, not required.
+  it('a new break with no stored timing is assigned (median fallback), none lost', () => {
+    withBreaks(['a.soak.test.mjs', 'new.soak.test.mjs'], (dir) => {
+      const opts = { total: 3, breaksDir: dir, baselineFile: join(dir, 'base.soak.test.mjs'), repoRoot: dir, timings: { 'a.soak.test.mjs': 5, 'base.soak.test.mjs': 50 } };
+      const all = [1, 2, 3].flatMap((shard) => shardFiles({ ...opts, shard }));
+      expect(all.sort()).toEqual(['a.soak.test.mjs', 'base.soak.test.mjs', 'new.soak.test.mjs']);
+    });
+  });
+
+  it('the stored timings cover most break files (a stale table would only cost balance)', () => {
+    const timings = loadTimings().soak;
+    const all = [BASELINE_FILE, ...listBreakTestFiles()];
+    const known = all.filter((f) => Number.isFinite(timings[f.slice(f.indexOf('scripts/conveyor'))]));
+    expect(known.length / all.length).toBeGreaterThan(0.8);
   });
 
   it('more shards than break files leaves the extra shards empty, not erroring', () => {

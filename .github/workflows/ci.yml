@@ -170,7 +170,12 @@ jobs:
       # `strategy.job-total` = the matrix length, so the divisor stays correct if the shard list changes.
       - name: Unit suite shard ${{ matrix.shard }}/${{ strategy.job-total }} (coverage, no per-shard bar)
         working-directory: web-everything
-        run: npm run test:coverage:shard -- --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+        # Card 11: files are assigned to this shard by MEASURED time (scripts/ci/shard-assign.mjs +
+        # scripts/ci/test-timings.json), not vitest's blind `--shard=i/N`. Every file is in exactly one shard.
+        run: |
+          mapfile -t files < <(node scripts/ci/shard-assign.mjs --suite=unit --shard=${{ matrix.shard }}/${{ strategy.job-total }})
+          echo "unit shard ${{ matrix.shard }}/${{ strategy.job-total }}: ${#files[@]} files"
+          npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}"
 
       # Upload this shard's partial coverage for the `test` job to merge. `if-no-files-found: error`
       # turns a missing report into a red shard (not a silent under-count) — the merge's --expect guard
@@ -181,6 +186,16 @@ jobs:
           name: coverage-shard-${{ matrix.shard }}
           path: web-everything/coverage/coverage-final.json
           if-no-files-found: error
+
+      # Per-file durations for refreshing scripts/ci/test-timings.json (`node scripts/ci/shard-assign.mjs
+      # --suite=unit --update=<these>`). Evidence only; never gates.
+      - name: Upload shard timings
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: timing-unit-${{ matrix.shard }}
+          path: web-everything/coverage/timing-unit-${{ matrix.shard }}.json
+          if-no-files-found: ignore
 
   # Aggregating gate (#2682) — THE required `test` status check. Branch protection still requires `test`
   # (this job) + `smoke`, so the required-check contract is UNCHANGED by the shard split. It fans in every
