@@ -116,7 +116,28 @@ export async function buildVersion({ clone, home, sha = 'HEAD', settings, force 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [command, ...args] = process.argv.slice(2);
   const value = key => args.find(arg => arg.startsWith(`--${key}=`))?.slice(key.length + 3);
-  if (command !== 'build' || !value('clone') || !value('home')
+  if (command !== 'build') {
+    try {
+      if (!['switch', 'rollback', 'gc', 'status'].includes(command) || !value('clone') || !value('home')
+        || args.some(arg => !/^--(?:clone|home|id|expect-current|to|reason|by)=.+$/.test(arg)
+          && !['--json', '--force', '--dry-run'].includes(arg))
+        || (args.includes('--dry-run') && !['switch', 'status'].includes(command))) {
+        throw new Error('Usage: daemon-version.mjs switch|rollback|gc|status --clone=<path> --home=<dir> [--id=<id> --expect-current=<id|null>] [--to=<id>] [--reason=<text>] [--by=<actor>] [--force] [--dry-run] [--json]');
+      }
+      const api = await import('./daemon-version-switch.mjs');
+      const name = basename(logicalCloneRoot(value('clone')));
+      const result = await api[command === 'switch' ? 'switchCurrent' : command]({
+        clone: value('clone'), home: value('home'), id: value('id'),
+        expectCurrent: value('expect-current') === 'null' ? null : value('expect-current'),
+        to: value('to'), reason: value('reason'), by: value('by'), dryRun: args.includes('--dry-run'),
+        settings: args.includes('--force') ? { enabled: { [name]: true } } : undefined,
+      });
+      console.log(JSON.stringify(result));
+    } catch (error) {
+      console.error(error.message);
+      process.exitCode = 1;
+    }
+  } else if (!value('clone') || !value('home')
     || args.some(arg => !/^--(?:clone|home|sha)=.+$/.test(arg) && !['--json', '--force'].includes(arg))) {
     console.error('Usage: daemon-version.mjs build --clone=<path> --home=<dir> [--sha=<rev>] [--force] [--json]');
     process.exitCode = 1;
