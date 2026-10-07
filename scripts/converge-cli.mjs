@@ -142,13 +142,45 @@ function readTreeOf(laneRoot) {
   try { return workingTreeOf(laneRoot); } catch { return null; }
 }
 
-/** What a landed run reviewed: the lane's real path + the tree the panel last READ — recorded only if the lane is
- *  still exactly that content now (an edit between the last read and the land is not reviewed content). Null when
- *  anything cannot be proven — `receipt` then refuses to stamp this run. */
-function reviewedContent(laneRoot, readTree) {
+/** The BASE a READ is issued against: the resolved merge-base SHA of HEAD with the run's `baseRef`, taken at the same
+ *  moment as the tree. A symbolic ref (`origin/main`) can move afterwards, so the receipt binds to this pinned SHA and
+ *  never to one recomputed at issuance. Null when it cannot be computed (the receipt then refuses). */
+function readBaseOf(laneRoot, baseRef) {
+  try { return baseRef ? mergeBaseWithRef({ cwd: laneRoot, ref: baseRef, sha: 'HEAD' }) : null; } catch { return null; }
+}
+
+/** Everything a READ pins about what the panel is shown — the tree AND the base — so every site that issues a READ
+ *  records both together and a later `land` can bind to them. `prevBase` is the base the run already pinned: a later
+ *  READ may only move it FORWARD (the previous base is an ancestor of the new one, so the diff only narrows). A base
+ *  that rolled back, or moved sideways, would widen the diff after round 1 with the later rounds told to judge only
+ *  the last fix — so the earlier pin is kept, the panel keeps reading against it, and `receipt` then refuses the
+ *  moved ref. A READ that cannot compute a base keeps the previous pin too (the receipt's recompute then fails). */
+function readSnapshotOf(ctx, prevBase = null) {
+  const fresh = readBaseOf(ctx?.laneRoot, ctx?.baseRef);
+  let readBase = fresh;
+  if (prevBase && prevBase !== fresh) {
+    let forward = false;
+    // `merge-base <fresh> <prev>` equals `prev` exactly when `prev` is an ancestor of `fresh`.
+    try { forward = !!fresh && mergeBaseWithRef({ cwd: ctx?.laneRoot, ref: fresh, sha: prevBase }) === prevBase; } catch { forward = false; }
+    if (!forward) readBase = prevBase;
+  }
+  return { readTree: readTreeOf(ctx?.laneRoot), readBase };
+}
+
+/** The ctx a READ's material is rendered from: `baseRef` replaced by the SHA that READ pinned, so the panel diffs
+ *  against exactly the base the receipt binds to — never a symbolic ref that can move before the command runs. */
+function pinnedCtx(ctx, readBase) {
+  return readBase ? { ...ctx, baseRef: readBase } : ctx;
+}
+
+/** What a landed run reviewed: the lane's real path + the tree and base the panel last READ — recorded only if the
+ *  lane is still exactly that content now (an edit between the last read and the land is not reviewed content). Null
+ *  when the content cannot be proven — `receipt` then refuses to stamp this run. `base` is `''` when the READ could
+ *  not pin one; `receipt` refuses that with its own message. */
+function reviewedContent(laneRoot, readTree, readBase) {
   try {
     const now = workingTreeOf(laneRoot);
-    return readTree && now === readTree ? { lane: realpathSync(laneRoot), tree: readTree } : null;
+    return readTree && now === readTree ? { lane: realpathSync(laneRoot), tree: readTree, base: readBase || '' } : null;
   } catch { return null; }
 }
 
@@ -310,7 +342,7 @@ function init(flags) {
     roster: plan.lenses,
     dialOverrides: dial.overrides,
     state,
-    readTree: readTreeOf(target.laneRoot), // what the first READ will show; `step` refreshes it on every later READ
+    ...readSnapshotOf(ctx), // the tree + base the first READ will show; `step` refreshes both on every later READ
   };
   writeState(outPath, envelope);
 
@@ -326,7 +358,7 @@ function init(flags) {
     mandatoryLenses: state.mandatoryLenses,
     dialOverrides: dial.overrides,
     changedFiles,
-    read: resolved.transport.readMaterial(ctx),
+    read: resolved.transport.readMaterial(pinnedCtx(ctx, envelope.readBase)),
   }, null, 2)}\n`);
 }
 
@@ -373,9 +405,10 @@ function step(flags) {
   if (Object.prototype.hasOwnProperty.call(input, 'inviteEcho') && input.invite) {
     const applied = applyJurorInvite(state, input.inviteEcho, input.invite);
     // Every READ records the tree it shows — this one too — so a later `land` binds to what the panel re-read.
+    const snap = applied.action === CONVERGE_ACTIONS.READ ? readSnapshotOf(envelope.ctx, envelope.readBase) : null;
     writeState(path, {
       ...envelope, state: applied.state, carry: carryFor(applied.state.round, carriedFindings),
-      ...(applied.action === CONVERGE_ACTIONS.READ ? { readTree: readTreeOf(envelope.ctx?.laneRoot) } : {}),
+      ...(snap ?? {}),
     });
 
     // A REJECTED invite falls through to an editor round on the SAME round — so this call must hand back the
@@ -383,7 +416,7 @@ function step(flags) {
     // is why the caller carries them into an invite step alongside the echo.
     const instruction = {};
     if (applied.action === CONVERGE_ACTIONS.READ) {
-      instruction.read = resolved.transport.readMaterial(envelope.ctx);
+      instruction.read = resolved.transport.readMaterial(pinnedCtx(envelope.ctx, snap.readBase));
     } else if (applied.action === CONVERGE_ACTIONS.EDIT) {
       instruction.edit = resolved.transport.applyRevision({
         findings: carriedFindings,
@@ -425,17 +458,18 @@ function step(flags) {
   // `final` records HOW the loop ended (land | escalate) so `receipt` can refuse anything but a landed run.
   // A landed run also records WHAT it reviewed (the lane's real path and its working-tree hash — the exact content
   // the panel read), so `receipt` can refuse a different lane or content committed after the review.
+  const snap = result.action === CONVERGE_ACTIONS.READ ? readSnapshotOf(envelope.ctx, envelope.readBase) : null;
   writeState(path, {
     ...envelope, state: result.state, carry: carryFor(result.state.round, result.findings),
-    ...(result.action === CONVERGE_ACTIONS.READ ? { readTree: readTreeOf(envelope.ctx?.laneRoot) } : {}),
+    ...(snap ?? {}),
     ...(result.state.done ? { final: result.action } : {}),
-    ...(result.state.done && result.action === CONVERGE_ACTIONS.LAND ? { reviewed: reviewedContent(envelope.ctx?.laneRoot, envelope.readTree) } : {}),
+    ...(result.state.done && result.action === CONVERGE_ACTIONS.LAND ? { reviewed: reviewedContent(envelope.ctx?.laneRoot, envelope.readTree, envelope.readBase) } : {}),
   });
 
   /** Build the caller's next instruction — the ONE place an action becomes something to run. */
   const instruction = {};
   if (result.action === CONVERGE_ACTIONS.READ) {
-    instruction.read = resolved.transport.readMaterial(envelope.ctx);
+    instruction.read = resolved.transport.readMaterial(pinnedCtx(envelope.ctx, snap.readBase));
   } else if (result.action === CONVERGE_ACTIONS.PANEL) {
     instruction.panel = panelInstruction(result.state, envelope, material);
   } else if (result.action === CONVERGE_ACTIONS.RED_TEAM) {
@@ -520,13 +554,22 @@ function receipt(flags) {
   if (realLane !== reviewed.lane) return fail(`no receipt: this state file's review was of lane ${reviewed.lane}, not ${realLane}.`);
   if (tree !== reviewed.tree) return fail(`no receipt: the lane's head tree ${tree.slice(0, 12)} is not the content the panel reviewed (${String(reviewed.tree).slice(0, 12)}) — it changed after the review. Re-run /converge over the committed head.`);
   const head = gitAt(lane, ['rev-parse', 'HEAD']).trim();
-  // Bind the receipt to the BASE the panel diffed against (its merge-base with `ctx.baseRef`), so the same head
-  // opened against another base — or a run that reviewed only the tail via `init --base-ref=<lane commit>` — never
-  // admits. `open-pr` compares this with the PR's own merge-base. No computable base, no receipt.
+  // Bind the receipt to the BASE the panel READ against — the merge-base SHA pinned at that READ (`reviewed.base`),
+  // never one recomputed now. A symbolic `ctx.baseRef` (`origin/main`) can move between the READ and this issuance
+  // with the head tree unchanged; recomputing would then stamp the NEW base and admit a wider diff than the panel
+  // saw. So the pinned SHA is the receipt's base, and a ref that no longer resolves to it is refused. This also
+  // keeps the same head opened against another base — or a run that reviewed only the tail via
+  // `init --base-ref=<lane commit>` — from admitting: `open-pr` compares this with the PR's own merge-base.
   const baseRef = envelope.ctx?.baseRef;
-  let base = '';
-  try { base = baseRef ? mergeBaseWithRef({ cwd: lane, ref: baseRef, sha: head }) : ''; } catch { base = ''; }
-  if (!base) return fail(`no receipt: cannot compute the merge-base of HEAD with the base the panel diffed against (${baseRef ?? 'none recorded'}), so the receipt could not be bound to a base. Re-run /converge with a valid --base-ref.`);
+  const base = reviewed.base;
+  if (!base) {
+    return fail('no receipt: the state file records no base for the panel\'s READ (it predates this check, or the base could not be resolved then), so the receipt could not be bound to a base. Re-run /converge with a valid --base-ref.');
+  }
+  let nowBase = '';
+  try { nowBase = baseRef ? mergeBaseWithRef({ cwd: lane, ref: baseRef, sha: head }) : ''; } catch { nowBase = ''; }
+  if (nowBase !== base) {
+    return fail(`no receipt: the base ref ${baseRef ?? '(none recorded)'} moved after the panel read — it diffed against ${String(base).slice(0, 12)}, but the merge-base now resolves to ${nowBase ? nowBase.slice(0, 12) : '(nothing)'}, so the PR diff is no longer the one reviewed. Re-run /converge over the current base.`);
+  }
   const out = resolve(gitDirOf(lane), RECEIPT_FILE);
   writeFileSync(out, `${JSON.stringify(buildReceipt({ tree, head, base, envelope }), null, 2)}\n`, 'utf8');
   process.stdout.write(`${JSON.stringify({ receipt: out, tree, head, base }, null, 2)}\n`);

@@ -539,7 +539,7 @@ describe('converge-cli receipt', () => {
   const cli = (...a) => spawnSync(process.execPath, [CLI, ...a], { encoding: 'utf8' });
 
   const st = { round: 2, careLevel: 'elevated', activeLenses: ['correctness'], dismissed: [] };
-  const landed = (extra = {}) => ({ ctx: { laneRoot: dir, baseRef: 'main' }, state: st, final: 'land', reviewed: { lane: dir, tree: workingTreeOf(dir) }, ...extra });
+  const landed = (extra = {}) => ({ ctx: { laneRoot: dir, baseRef: 'main' }, state: st, final: 'land', reviewed: { lane: dir, tree: workingTreeOf(dir), base: git('merge-base', 'main', 'HEAD').trim() }, ...extra });
   const commitAll = (name, body) => { writeFileSync(join(dir, name), body); git('add', '-A'); git('-c', 'user.email=a@b', '-c', 'user.name=t', 'commit', '-qm', name); };
 
   it('refuses a run that did not land, and stamps the head tree for one that did', () => {
@@ -579,7 +579,7 @@ describe('converge-cli receipt', () => {
     try {
       execFileSync('git', ['-C', other, 'init', '-q', '-b', 'main']); writeFileSync(join(other, 'a'), 'x');
       execFileSync('git', ['-C', other, 'add', '-A']); execFileSync('git', ['-C', other, '-c', 'user.email=a@b', '-c', 'user.name=t', 'commit', '-qm', 'x']);
-      writeFileSync(state, JSON.stringify(landed({ reviewed: { lane: other, tree: workingTreeOf(dir) } })));
+      writeFileSync(state, JSON.stringify(landed({ reviewed: { lane: other, tree: workingTreeOf(dir), base: git('merge-base', 'main', 'HEAD').trim() } })));
       const r = cli('receipt', `--state=${state}`, `--lane=${dir}`);
       expect(r.status).not.toBe(0);
       expect(r.stderr).toMatch(/review was of lane/);

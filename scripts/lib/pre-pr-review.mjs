@@ -283,6 +283,9 @@ export function checkPrePrReview({ cwd, base = 'main', sha = 'HEAD', env = proce
   // Pin the commit ONCE: the diff, the card reads, the tree and (via the returned `sha`) the commit pr-land
   // publishes are all this one object, never a `HEAD` that can move between the gate and the push.
   sha = gitIn(cwd, ['rev-parse', '--verify', `${sha}^{commit}`]).trim();
+  // Pin the BASE once too: the risk diff and the receipt-binding merge-base below both read this one commit, never
+  // `origin/<base>` resolved twice with a window for the ref to move between the two reads.
+  base = gitIn(cwd, ['rev-parse', '--verify', `${resolveBaseRef((a) => gitIn(cwd, a), base)}^{commit}`]).trim();
   const { files } = readDiffFiles({ cwd, base, sha });
   const cards = files.filter((f) => isCardPath(f.path)).map((f) => f.path);
   const hasPreparedCard = cards.some((p) => { try { return isPreparedCard(gitIn(cwd, ['show', `${sha}:${p}`])); } catch { return false; } });
