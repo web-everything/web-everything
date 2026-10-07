@@ -61,7 +61,7 @@ describe('knob and decision', () => {
   it('enforce refuses a risky head with no receipt, with a clear message', () => {
     const d = decidePrePrReview({ settings: { ...S, mode: 'enforce' }, risk: risky, receipt: null, headTree: 't1' });
     expect(d.action).toBe('refuse');
-    expect(d.message).toMatch(/pre-PR review required.*converge-cli\.mjs receipt.*--skip-pre-pr-review/s);
+    expect(d.message).toMatch(/pre-PR review required.*converge-cli\.mjs receipt.*--skipPrePrReview/s);
   });
   it('a receipt for another tree is stale and refused', () => {
     const d = decidePrePrReview({ settings: { ...S, mode: 'enforce' }, risk: risky, receipt: { tree: 't0', verdict: 'land' }, headTree: 't1' });
@@ -128,7 +128,7 @@ describe('lane sandbox: checkPrePrReview + open-pr runner', () => {
     const ok = run({ argv, skipPrePrReview: 'emergency hotfix' });
     expect(ok.outcome).toBe('opened');
     expect(spawned).toHaveLength(1);
-    expect(spawned[0][1].join(' ')).not.toMatch(/skip-pre-pr/);
+    expect(spawned[0][1].join(' ')).not.toMatch(/skipPrePrReview/);
     expect(readFileSync(join(gitDirOf(dir), 'pre-pr-review-bypass.log'), 'utf8')).toMatch(/emergency hotfix/);
   });
 });

@@ -306,7 +306,7 @@ node scripts/converge-cli.mjs init --lane="$LANE" --state="$STATE" --care=elevat
   commit, then on the final committed head stamp the receipt:
   `node scripts/converge-cli.mjs receipt --lane="$LANE" --state="$STATE"` (it only stamps a run that ended in `land`
   and a clean tracked tree; any later edit changes the tree and voids it). This ADDS to the post-PR review gate; it
-  never replaces it. A bypass is `--skip-pre-pr-review=<reason>` on `open-pr` and the reason is recorded.
+  never replaces it. A bypass is `--skipPrePrReview=<reason>` on `open-pr` and the reason is recorded.
 - **Outside that gate this step stays ADVISORY — an `escalate` never blocks PR-open.** Blocking would gate every drain lane,
   doc-only lane, and the lane shipping this very change (the reason #2971 dropped its `pr-land` refusal).
   `escalate` is **terminal for this run** — the core already spent its round budget resolving what it could

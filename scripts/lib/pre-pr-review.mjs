@@ -92,7 +92,7 @@ export function decidePrePrReview({ settings, risk, receipt, headTree, skip = ''
     : 'no pre-PR review receipt exists for this head';
   const msg = `pre-PR review required — this PR is risky (${risk.reasons.join('; ')}) and ${detail}. `
     + 'Run `/converge` against this lane (brief step 6), then `node scripts/converge-cli.mjs receipt --lane=<lane> --state=<file>` '
-    + 'on the committed head, and open the PR again. Bypass only with `--skip-pre-pr-review=<reason>` (the reason is recorded).';
+    + 'on the committed head, and open the PR again. Bypass only with `--skipPrePrReview=<reason>` (the reason is recorded).';
   if (settings.mode === 'advise') return { action: 'advise', why, message: msg };
   if (typeof skip === 'string' && skip.trim()) return { action: 'pass', why: 'bypass', message: '' };
   return { action: 'refuse', why, message: msg };
