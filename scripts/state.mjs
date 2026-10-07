@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { readPrFacts, readCardFacts, stripTerminal } from './lib/pr-state-io.mjs';
 import { derivePrState, settingsFromEnv } from './lib/pr-state-core.mjs';
+import { describeJob, readJob, renderJob } from './operations/start-build-jobs.mjs';
 /** Every printed line passes the sanitizer, so no field (named or not) can carry a terminal escape or a CR. */
 const line = text => stripTerminal(text);
 export function renderPrState(state, subject) {
@@ -16,6 +17,7 @@ export function renderCard(card) {
   return [
     line(`CARD ${card.id} — ${card.status}${card.found ? '' : ' (not found or unreadable)'}`),
     line(`Claim: ${card.claim.held ? 'held' : 'none observed'}${card.claim.owner ? ` by ${card.claim.owner}` : ''}; active sessions: ${sessions}`),
+    ...(card.buildJob ? [line(renderJob(card.buildJob))] : []),
     ...card.prs.map(p => renderPrState(p, `PR #${p.pr}`)), ...card.evidence.map(line),
   ].join('\n');
 }
@@ -33,6 +35,7 @@ export function main(argv = process.argv.slice(2)) {
       console.log(argv.includes('--json') ? JSON.stringify({ ...state, facts }, null, 2) : renderPrState(state, `PR #${facts.pr}`));
     } else {
       const card = readCardFacts(arg);
+      try { card.buildJob = describeJob(readJob(String(card.id ?? arg).replace(/^card[-:]/, ''))); } catch { /* job record is optional context */ }
       console.log(argv.includes('--json') ? JSON.stringify(card, null, 2) : renderCard(card));
     }
   } catch {
