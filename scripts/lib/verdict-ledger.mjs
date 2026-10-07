@@ -1075,7 +1075,7 @@ export function verdictLedgerPath(repo) {
  * transport via `verdict-ledger-io.mjs`; `git` writes git only. A git write miss follows the ratified F4 posture
  * (see `finishGitMiss`): never silent, never dropped. Reads are unchanged (home).
  *
- * The UNCONFIGURED default is `dual` only once a git board resolves (`opts.board` or env
+ * The UNCONFIGURED default is `dual` only once a non-blank git board resolves (`opts.board` or env
  * `WE_VERDICT_LEDGER_BOARD`); with no board it is `home`, so a deployment that has not provisioned the board keeps
  * the pre-C2 contract (a successful home append is `ok: true`) instead of failing every clearing verdict. A store
  * NAMED by the operator (`opts.store` / env `WE_VERDICT_LEDGER_STORE`) is honoured as written: `dual`/`git` with no
@@ -1090,7 +1090,9 @@ export function verdictLedgerPath(repo) {
  */
 export function appendVerdict(record, opts = {}) {
   const env = opts.env ?? process.env;
-  const board = opts.board ?? env.WE_VERDICT_LEDGER_BOARD ?? null;
+  // A blank board (empty or whitespace-only) is NO board: it must take the no-board fallback below, never reach the
+  // transport (where `'   '` resolves to a cwd-relative checkout and every clearing verdict would miss).
+  const board = String(opts.board ?? env.WE_VERDICT_LEDGER_BOARD ?? '').trim() || null;
   const loud = opts.warn ?? ((m) => process.stderr.write(`${m}\n`));
   // One derivation of the store AND whether the operator named it, so the two can never disagree.
   const choice = resolveLedgerStoreChoice(opts.store, env);

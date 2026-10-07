@@ -1194,6 +1194,46 @@ describe('#3255 C2 review fix: the production default path, home-fails-too spill
     expect(named).toHaveLength(0);
   });
 
+  it('ruling (PR 4311): a real production process, NO opts at all and no ledger env, clears with ok:true on home', () => {
+    // A child process, so nothing of the test runner leaks in: no VITEST, no WE_UNDER_TEST, no store or board knob.
+    const env = { ...process.env, WE_VERDICT_LEDGER_DIR: dir };
+    for (const k of FLAGS) delete env[k];
+    // Repo-root cwd, like the shadow-agreement CLI test above (import.meta.url is not a file: URL under this runner).
+    const src = `const m = await import('./scripts/lib/verdict-ledger.mjs');
+      const r = m.appendVerdict(m.buildVerdictRecord({ repo: ${JSON.stringify(REPO)}, pr: 41, verdict: 'accepted', at: '2026-10-07T12:00:00.000Z', source: 'test' }));
+      process.stdout.write(JSON.stringify({ ok: r.ok, store: r.store, miss: r.ledgerWriteMiss ?? null, errors: r.errors }));`;
+    const out = execFileSync(process.execPath, ['--input-type=module', '-e', src], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    expect(JSON.parse(out)).toEqual({ ok: true, store: 'home', miss: null, errors: [] });
+    expect(readVerdictLedger(REPO)).toHaveLength(1);
+  });
+
+  it('a BLANK board (empty or whitespace-only, env or opts) is no board: the production default clears on home and never calls the transport', () => {
+    for (const [i, place] of [['env', '   '], ['env', ''], ['env', '\t\n'], ['opts', '  '], ['opts', '']].entries()) {
+      const calls = [];
+      const r = asProduction(() => {
+        const o = { gitAppend: (a) => { calls.push(a); throw new Error(`git spawned with cwd ${JSON.stringify(a.board)}`); }, warn: () => {} };
+        if (place[0] === 'env') process.env.WE_VERDICT_LEDGER_BOARD = place[1]; else o.board = place[1];
+        return appendVerdict(mk('accepted', 50 + i), o);
+      });
+      const label = `${place[0]}=${JSON.stringify(place[1])}`;
+      expect(r.ok, label).toBe(true);
+      expect(r.store, label).toBe('home');
+      expect(r.ledgerWriteMiss, label).toBeUndefined();
+      expect(calls, label).toHaveLength(0);
+    }
+  });
+
+  it('a board padded with whitespace is trimmed before it reaches the transport', () => {
+    const calls = [];
+    const r = asProduction(() => {
+      process.env.WE_VERDICT_LEDGER_BOARD = '  /env-board \n';
+      return appendVerdict(mk('accepted'), { gitAppend: (a) => { calls.push(a); return { status: 'appended' }; }, warn: () => {} });
+    });
+    expect(r.ok).toBe(true);
+    expect(r.store).toBe('dual');
+    expect(calls[0].board).toBe('/env-board');
+  });
+
   it('resolveLedgerStoreChoice derives store and named-ness together', () => {
     expect(resolveLedgerStoreChoice(undefined, {})).toEqual({ store: 'dual', named: false });
     expect(resolveLedgerStoreChoice('bogus', { WE_VERDICT_LEDGER_STORE: 'git' })).toEqual({ store: 'dual', named: false });
