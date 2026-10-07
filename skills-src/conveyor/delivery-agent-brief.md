@@ -317,7 +317,7 @@ node scripts/converge-cli.mjs init --lane="$LANE" --state="$STATE" --care=elevat
   commit, then on the final committed head stamp the receipt:
   `node scripts/converge-cli.mjs receipt --lane="$LANE" --state="$STATE"` (it only stamps a run that ended in `land`,
   for the SAME lane and the exact content that run reviewed, on a clean tracked tree; untracked `.converge-*` scratch at the lane root (the state file) and the scratch files this brief names (`.commit-msg.txt`, `.pr-body*.md`) are ignored — never `git add` them: commit what the panel read —
-  anything committed after it, or a state file from another lane, is refused; re-run `/converge`). The gate fails
+  anything committed after it, or a state file from another lane, is refused; re-run `/converge`). The receipt also records the merge-base the panel diffed against (`init --base-ref`, default `origin/main`), and `open-pr` refuses the same head opened against a different base. An empty or unparseable diff counts as risky, never as card-only, and the lane's own `.gitattributes` cannot change the line count (this needs git 2.40 or newer; an older git makes the check error, which `open-pr` refuses). A code file git calls binary (a planted NUL byte) is gated; image, font and PDF assets are not. The gate fails
   closed: if its own check errors (or returns no usable decision) in `enforce` mode, `open-pr` refuses rather
   than admits, and a missing or broken settings file counts as `enforce`. It stops honest mistakes, not a hostile worker who writes the state or receipt file
   by hand. This ADDS to the post-PR review gate; it

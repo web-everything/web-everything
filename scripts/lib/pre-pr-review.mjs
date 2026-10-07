@@ -84,6 +84,8 @@ export function loadPrePrSettings({ path = defaultPrePrSettingsPath(), read = re
 /** Subsystem = up to two leading directories (`backlog` alone); a root file is `.` (same rule as the coroner). */
 export const subsystemOf = (p) => p.split('/').slice(0, -1).slice(0, p.startsWith('backlog/') ? 1 : 2).join('/') || '.';
 
+export const BINARY_ASSET_RE = /\.(png|jpe?g|gif|webp|avif|ico|bmp|woff2?|ttf|otf|eot|pdf|mp4|webm|mp3|zip|gz)$/i;
+
 /**
  * @param {{files: {path: string, additions?: number, deletions?: number}[], hasPreparedCard: boolean,
  *   operatorAgent: boolean, settings?: object}} input
@@ -96,8 +98,15 @@ export function classifyPrRisk({ files = [], hasPreparedCard = false, operatorAg
   const paths = files.flatMap((f) => [f.path, f.from].filter(Boolean));
   const subsystems = new Set(paths.map(subsystemOf)).size;
   const base = { lines, subsystems, files: files.length };
-  if (files.length === 0 || paths.every((p) => isCardPath(p))) return { gated: false, cardOnly: true, reasons: [], ...base };
+  // FAIL CLOSED: an empty list is an unreadable diff (a ref that resolves to nothing, an output shape the parser
+  // dropped), never "a card-only PR" — only a diff that LISTS files, all under backlog/, is card-only.
+  if (files.length === 0) return { gated: true, cardOnly: false, reasons: ['no readable diff (an empty or unparseable diff is never treated as card-only)'], ...base };
+  if (paths.every((p) => isCardPath(p))) return { gated: false, cardOnly: true, reasons: [], ...base };
   const reasons = [];
+  // `-\t-` is git's "binary": real assets (images, fonts, PDFs) carry no reviewable lines and do not gate a PR on
+  // their own, but a CODE path git calls binary (a NUL byte planted in a .mjs hides its size) is gated.
+  const unmeasured = files.filter((f) => f.unmeasured && !BINARY_ASSET_RE.test(f.path)).length;
+  if (unmeasured) reasons.push(`${unmeasured} unmeasured file(s) (git could not count their lines; unknown, never zero)`);
   if (lines > settings.maxLines) reasons.push(`${lines} lines changed (> ${settings.maxLines})`);
   if (subsystems > settings.maxSubsystems) reasons.push(`${subsystems} subsystems (> ${settings.maxSubsystems})`);
   if (files.length > settings.maxFiles) reasons.push(`${files.length} files (> ${settings.maxFiles})`);
@@ -124,16 +133,20 @@ export const isScratchPath = (p) => CONVERGE_SCRATCH_RE.test(p) || isAllowlisted
  * The gate decision. `skip` is a recorded bypass reason. Never throws.
  * @returns {{action: 'pass'|'advise'|'refuse', why: string, message: string}}
  */
-export function decidePrePrReview({ settings, risk, receipt, headTree, skip = '' }) {
+export function decidePrePrReview({ settings, risk, receipt, headTree, baseSha = '', skip = '' }) {
   if (settings.mode === 'off') return { action: 'pass', why: 'mode-off', message: '' };
   if (!risk.gated) return { action: 'pass', why: risk.cardOnly ? 'card-only' : 'low-risk', message: '' };
-  if (receipt && receipt.tree && receipt.tree === headTree && receipt.verdict === 'land') {
-    return { action: 'pass', why: 'receipt', message: '' };
-  }
-  const why = receipt && receipt.tree && receipt.tree !== headTree ? 'receipt-stale' : 'receipt-missing';
-  const detail = why === 'receipt-stale'
-    ? `the receipt is for tree ${String(receipt.tree).slice(0, 12)}, but HEAD is tree ${String(headTree).slice(0, 12)} (edited since the review)`
-    : 'no pre-PR review receipt exists for this head';
+  // The receipt binds the head TREE and the BASE (merge-base) the panel diffed against: the same tree opened against
+  // another base is a different diff. A receipt that records no base, or a missing `baseSha`, never matches.
+  const treeOk = !!(receipt && receipt.tree && receipt.tree === headTree && receipt.verdict === 'land');
+  const baseOk = !!(receipt && receipt.base && baseSha && receipt.base === baseSha);
+  if (treeOk && baseOk) return { action: 'pass', why: 'receipt', message: '' };
+  const why = treeOk ? 'receipt-base-mismatch' : receipt && receipt.tree && receipt.tree !== headTree ? 'receipt-stale' : 'receipt-missing';
+  const detail = why === 'receipt-base-mismatch'
+    ? `the receipt was stamped against base ${receipt.base ? String(receipt.base).slice(0, 12) : '(none recorded)'}, but this PR's merge-base is ${String(baseSha || '(unresolved)').slice(0, 12)} (a different diff than the one reviewed)`
+    : why === 'receipt-stale'
+      ? `the receipt is for tree ${String(receipt.tree).slice(0, 12)}, but HEAD is tree ${String(headTree).slice(0, 12)} (edited since the review)`
+      : 'no pre-PR review receipt exists for this head';
   const msg = `pre-PR review required — this PR is risky (${risk.reasons.join('; ')}) and ${detail}. `
     + 'Run `/converge` against this lane (brief step 6), then `node scripts/converge-cli.mjs receipt --lane=<lane> --state=<file>` '
     + 'on the committed head, and open the PR again. Bypass only with `--skipPrePrReview=<reason>` (the reason is recorded). A bypass also needs `--actor=<name>` and `--operatorInstruction="<quoted operator instruction>"`; a dispatched worker is refused a bypass.';
@@ -149,21 +162,57 @@ const gitIn = (cwd, args) => execFileSync('git', ['-C', cwd, ...args], { encodin
 export function gitDirOf(cwd) { return resolve(cwd, gitIn(cwd, ['rev-parse', '--git-dir']).trim()); }
 export function treeOf(cwd, sha = 'HEAD') { return gitIn(cwd, ['rev-parse', `${sha}^{tree}`]).trim(); }
 
-/** Changed files (numstat) of `sha` against the merge base with `base`. */
+/** The ref a PR's base resolves to: `origin/<base>` when it exists, else `<base>` itself. One rule for the diff and the receipt binding. */
+function resolveBaseRef(git, base) {
+  // A base or sha starting with `-` would be read by git as an option (`--output=<file>...`): refuse it outright.
+  if (typeof base !== 'string' || !base || base.startsWith('-')) throw new Error(`refusing base ${JSON.stringify(base)} (empty, or looks like a git option)`);
+  const ref = `origin/${base}`;
+  try { git(['rev-parse', '--verify', '--quiet', ref]); return ref; } catch { return base; }
+}
+
+/** The merge-base of `sha` and the PR's base: the point the reviewed diff starts from. Throws if there is none. */
+export function mergeBaseOf({ cwd, base = 'main', sha = 'HEAD', git = (a) => gitIn(cwd, a) }) {
+  return mergeBaseWithRef({ cwd, ref: resolveBaseRef(git, base), sha, git });
+}
+
+/** The same merge-base for an already-resolved ref (the one `/converge` diffed against, e.g. `origin/main`). */
+export function mergeBaseWithRef({ cwd, ref, sha = 'HEAD', git = (a) => gitIn(cwd, a) }) {
+  if ([ref, sha].some((v) => typeof v !== 'string' || !v || v.startsWith('-'))) throw new Error('refusing a ref or sha that is empty or looks like a git option');
+  const mb = String(git(['merge-base', ref, sha]) || '').trim();
+  if (!mb) throw new Error(`no merge-base between ${ref} and ${sha}`);
+  return mb;
+}
+
+/**
+ * Changed files (numstat) of `sha` against the merge base with `base`.
+ * The lane's OWN attributes must not shape the count: a committed `-diff` / `binary` makes numstat print `-\t-` (and
+ * `--text` does NOT override it), so the size rule would read 0 lines. `--attr-source=<empty tree>` reads attributes
+ * from nothing instead of the lane's worktree/index, a null `core.attributesFile` drops the user-level file, and
+ * `--no-ext-diff`/`--no-textconv` ignore drivers. (An untracked `.git/info/attributes` is local to the checkout,
+ * not part of the PR, and is the same trust boundary as the receipt file beside it.) A git too old for
+ * `--attr-source` (< 2.40) errors, which is a refusal, not a pass. FAIL CLOSED on output the parser does not fully
+ * understand: a partial parse would silently shrink the diff, so any unrecognised part throws.
+ */
+export const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 export function readDiffFiles({ cwd, base = 'main', sha = 'HEAD', git = (a) => gitIn(cwd, a) }) {
-  let ref = `origin/${base}`;
-  try { git(['rev-parse', '--verify', '--quiet', ref]); } catch { ref = base; }
-  const out = git(['diff', '--numstat', '-z', `${ref}...${sha}`]);
+  const ref = resolveBaseRef(git, base);
+  if (typeof sha !== 'string' || !sha || sha.startsWith('-')) throw new Error(`refusing sha ${JSON.stringify(sha)} (empty, or looks like a git option)`);
+  // The repo's own empty tree (sha1 or sha256); the sha1 constant only if git cannot say.
+  const emptyTree = String(git(['hash-object', '-t', 'tree', '/dev/null']) || '').trim() || EMPTY_TREE;
+  const out = git(['-c', 'core.attributesFile=/dev/null', `--attr-source=${emptyTree}`, 'diff', '--numstat', '-z', '--no-ext-diff', '--no-textconv', `${ref}...${sha}`]);
   // -z numstat: "<add>\t<del>\t<path>\0" (renames carry two extra NUL parts; the destination is the last)
   const files = [];
   const parts = out.split('\0');
+  if (parts[parts.length - 1] === '') parts.pop(); // the trailing NUL
   for (let i = 0; i < parts.length; i++) {
     const m = /^(\d+|-)\t(\d+|-)\t(.*)$/s.exec(parts[i]);
-    if (!m) continue;
+    if (!m) throw new Error(`unparseable git numstat output (${JSON.stringify(parts[i].slice(0, 80))}) — refusing to guess the diff`);
     let path = m[3];
     let from = '';
     if (path === '') { from = parts[i + 1] ?? ''; path = parts[i + 2] ?? ''; i += 2; }
-    if (path) files.push({ path, ...(from ? { from } : {}), additions: m[1] === '-' ? 0 : Number(m[1]), deletions: m[2] === '-' ? 0 : Number(m[2]) });
+    if (!path) throw new Error('unparseable git numstat output (a row with no path) — refusing to guess the diff');
+    const unmeasured = m[1] === '-' || m[2] === '-';
+    files.push({ path, ...(from ? { from } : {}), additions: m[1] === '-' ? 0 : Number(m[1]), deletions: m[2] === '-' ? 0 : Number(m[2]), ...(unmeasured ? { unmeasured: true } : {}) });
   }
   return { files, ref };
 }
@@ -172,9 +221,9 @@ export function readReceipt(cwd) {
   try { return JSON.parse(readFileSync(join(gitDirOf(cwd), RECEIPT_FILE), 'utf8')); } catch { return null; }
 }
 
-export function buildReceipt({ tree, head, envelope, now = new Date() }) {
+export function buildReceipt({ tree, head, base = '', envelope, now = new Date() }) {
   return {
-    schema: 1, tree, head, verdict: 'land', issuedAt: now.toISOString(),
+    schema: 2, tree, head, base, verdict: 'land', issuedAt: now.toISOString(),
     rounds: envelope?.state?.round ?? null, careLevel: envelope?.state?.careLevel ?? null,
     lenses: envelope?.state?.activeLenses ?? [], dismissed: (envelope?.state?.dismissed ?? []).length,
   };
@@ -241,15 +290,16 @@ export function checkPrePrReview({ cwd, base = 'main', sha = 'HEAD', env = proce
   const operatorAgent = sessRole !== 'worker';
   const risk = classifyPrRisk({ files, hasPreparedCard, operatorAgent, settings: s });
   const headTree = treeOf(cwd, sha);
+  const baseSha = mergeBaseOf({ cwd, base, sha });
   const wantsSkip = typeof skip === 'string' && skip.trim() !== '';
   const auth = wantsSkip ? authoriseBypass({ role: sessRole, actor, operatorInstruction }) : { ok: true, refusal: '' };
-  const decision = decidePrePrReview({ settings: s, risk, receipt: readReceipt(cwd), headTree, skip: auth.ok ? skip : '' });
+  const decision = decidePrePrReview({ settings: s, risk, receipt: readReceipt(cwd), headTree, baseSha, skip: auth.ok ? skip : '' });
   if (wantsSkip && !auth.ok && decision.action === 'refuse') decision.message = `bypass refused — ${auth.refusal}. ${decision.message}`;
   if (decision.why === 'bypass') {
     recordBypass(cwd, { reason: skip, head: sha, risk, actor, operatorInstruction, ...(recordDir ? { recordDir } : {}) });
     decision.bypass = { reason: skip.trim(), actor: actor.trim(), operatorInstruction: operatorInstruction.trim() };
   }
-  return { ...decision, risk, headTree, sha, settings: s, ...(settingsError ? { settingsError } : {}) };
+  return { ...decision, risk, headTree, baseSha, sha, settings: s, ...(settingsError ? { settingsError } : {}) };
 }
 
 /**

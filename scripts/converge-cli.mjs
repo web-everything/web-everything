@@ -47,7 +47,7 @@ import {
   applyJurorInvite,
   buildEscalationPacket,
 } from './lib/converge-core.mjs';
-import { gitDirOf, treeOf, workingTreeOf, buildReceipt, RECEIPT_FILE, isScratchPath, GIT_TIMEOUT_MS } from './lib/pre-pr-review.mjs';
+import { gitDirOf, treeOf, workingTreeOf, mergeBaseWithRef, buildReceipt, RECEIPT_FILE, isScratchPath, GIT_TIMEOUT_MS } from './lib/pre-pr-review.mjs';
 import { resolveTransport, validateLaneTarget } from './lib/converge-transports.mjs';
 import { MANDATORY_LENSES, PANEL_LENSES, panelRigorForCareLevel } from './lib/jury-core.mjs';
 import { CARE_LEVELS } from './lib/review-escalation.mjs';
@@ -499,7 +499,9 @@ function receipt(flags) {
   // The panel read untracked files too, so any left uncommitted are content the receipt would not cover.
   // Untracked brief-sanctioned scratch (`.converge-*` state, `.commit-msg.txt`, …) is not reviewed content — see workingTreeOf.
   // `-z`: the same raw paths `workingTreeOf` matches, so a non-ASCII scratch name is not C-quoted past `isScratchPath`.
-  const leftover = (gitAt(lane, ['ls-files', '--others', '--exclude-standard', '-z']) || '').split('\0').filter((p) => p && !isScratchPath(p));
+  const others = gitAt(lane, ['ls-files', '--others', '--exclude-standard', '-z']);
+  if (others === null) return fail('no receipt: could not list the lane\'s untracked files (git failed or timed out), so unreviewed content cannot be ruled out.');
+  const leftover = others.split('\0').filter((p) => p && !isScratchPath(p));
   if (leftover.length) return fail(`no receipt: the lane has untracked files the panel read but the head does not contain (${leftover.slice(0, 3).join(', ')}${leftover.length > 3 ? ', …' : ''}). Commit or delete them, then re-run /converge if the content changed.`);
   const tree = treeOf(lane);
   // Bind the receipt to the reviewed run: same lane, same content. (Defence against honest mistakes — reusing an
@@ -518,9 +520,16 @@ function receipt(flags) {
   if (realLane !== reviewed.lane) return fail(`no receipt: this state file's review was of lane ${reviewed.lane}, not ${realLane}.`);
   if (tree !== reviewed.tree) return fail(`no receipt: the lane's head tree ${tree.slice(0, 12)} is not the content the panel reviewed (${String(reviewed.tree).slice(0, 12)}) — it changed after the review. Re-run /converge over the committed head.`);
   const head = gitAt(lane, ['rev-parse', 'HEAD']).trim();
+  // Bind the receipt to the BASE the panel diffed against (its merge-base with `ctx.baseRef`), so the same head
+  // opened against another base — or a run that reviewed only the tail via `init --base-ref=<lane commit>` — never
+  // admits. `open-pr` compares this with the PR's own merge-base. No computable base, no receipt.
+  const baseRef = envelope.ctx?.baseRef;
+  let base = '';
+  try { base = baseRef ? mergeBaseWithRef({ cwd: lane, ref: baseRef, sha: head }) : ''; } catch { base = ''; }
+  if (!base) return fail(`no receipt: cannot compute the merge-base of HEAD with the base the panel diffed against (${baseRef ?? 'none recorded'}), so the receipt could not be bound to a base. Re-run /converge with a valid --base-ref.`);
   const out = resolve(gitDirOf(lane), RECEIPT_FILE);
-  writeFileSync(out, `${JSON.stringify(buildReceipt({ tree, head, envelope }), null, 2)}\n`, 'utf8');
-  process.stdout.write(`${JSON.stringify({ receipt: out, tree, head }, null, 2)}\n`);
+  writeFileSync(out, `${JSON.stringify(buildReceipt({ tree, head, base, envelope }), null, 2)}\n`, 'utf8');
+  process.stdout.write(`${JSON.stringify({ receipt: out, tree, head, base }, null, 2)}\n`);
 }
 
 function main(argv) {

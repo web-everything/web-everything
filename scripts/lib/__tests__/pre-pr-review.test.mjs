@@ -99,7 +99,7 @@ describe('knob and decision', () => {
   });
   it('a receipt for the head tree admits; advise warns; off ignores; bypass needs a reason', () => {
     const e = { ...S, mode: 'enforce' };
-    expect(decidePrePrReview({ settings: e, risk: risky, receipt: { tree: 't1', verdict: 'land' }, headTree: 't1' }).action).toBe('pass');
+    expect(decidePrePrReview({ settings: e, risk: risky, receipt: { tree: 't1', base: 'b1', verdict: 'land' }, headTree: 't1', baseSha: 'b1' }).action).toBe('pass');
     expect(decidePrePrReview({ settings: { ...S, mode: 'advise' }, risk: risky, receipt: null, headTree: 't1' }).action).toBe('advise');
     expect(decidePrePrReview({ settings: { ...S, mode: 'off' }, risk: risky, receipt: null, headTree: 't1' }).action).toBe('pass');
     expect(decidePrePrReview({ settings: e, risk: risky, receipt: null, headTree: 't1', skip: '   ' }).action).toBe('refuse');
@@ -143,7 +143,7 @@ describe('lane sandbox: checkPrePrReview + open-pr runner', () => {
     commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
     const no = checkPrePrReview({ cwd: dir, env: OPERATOR, settings: enforce });
     expect(no.action).toBe('refuse');
-    writeFileSync(join(gitDirOf(dir), RECEIPT_FILE), JSON.stringify(buildReceipt({ tree: treeOf(dir), head: 'h', envelope: {} })));
+    writeFileSync(join(gitDirOf(dir), RECEIPT_FILE), JSON.stringify(buildReceipt({ tree: treeOf(dir), head: 'h', envelope: {}, base: git('merge-base', 'main', 'HEAD').trim() })));
     expect(checkPrePrReview({ cwd: dir, env: OPERATOR, settings: enforce })).toMatchObject({ action: 'pass', why: 'receipt' });
     commit({ 'scripts/more.mjs': 'y\n' }); // a new head tree invalidates the receipt
     expect(checkPrePrReview({ cwd: dir, env: OPERATOR, settings: enforce }).why).toBe('receipt-stale');
@@ -318,7 +318,7 @@ describe('gate hardening (PR #4271 review)', () => {
     it('pins --sha to the judged commit in the argv pr-land receives (HEAD is resolved once)', () => {
       commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
       const head = git('rev-parse', 'HEAD');
-      writeFileSync(join(gitDirOf(dir), RECEIPT_FILE), JSON.stringify(buildReceipt({ tree: treeOf(dir), head, envelope: {} })));
+      writeFileSync(join(gitDirOf(dir), RECEIPT_FILE), JSON.stringify(buildReceipt({ tree: treeOf(dir), head, envelope: {}, base: git('merge-base', 'main', 'HEAD') })));
       const spawned = [];
       const run = createPrLandRunner({ loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
       expect(run({ argv: ['--ref=lane/x', '--base=main'] }).outcome).toBe('opened');
@@ -404,6 +404,128 @@ describe('open-pr plan', () => {
   });
 });
 
+describe('gate cannot be evaded (PR #4271 review round 4)', () => {
+  let dir;
+  const git = (...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8' }).trim();
+  const commit = (files) => {
+    for (const [p, c] of Object.entries(files)) { mkdirSync(dirname(join(dir, p)), { recursive: true }); writeFileSync(join(dir, p), c); }
+    git('add', '-A'); git('-c', 'user.email=a@b', '-c', 'user.name=t', 'commit', '-qm', 'x');
+  };
+  beforeEach(() => {
+    dir = realpathSync(mkdtempSync(join(tmpdir(), 'pre-pr-r4-')));
+    git('init', '-q', '-b', 'main'); commit({ 'README.md': 'x\n' });
+    git('checkout', '-q', '-b', 'lane/x');
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  const enforce = { ...S, mode: 'enforce' };
+  const OPERATOR = { PATH: process.env.PATH };
+
+  describe('1. an empty or unparseable diff fails closed, never reads as card-only', () => {
+    it('classifyPrRisk gates an empty file list, with a reason that names it', () => {
+      const r = classifyPrRisk({ files: [], hasPreparedCard: true, operatorAgent: false });
+      expect(r).toMatchObject({ gated: true, cardOnly: false });
+      expect(r.reasons.join(' ')).toMatch(/no readable diff/);
+    });
+    it('readDiffFiles throws when numstat output is non-empty but yields no files', () => {
+      expect(() => readDiffFiles({ cwd: dir, git: (a) => (a.includes('diff') ? 'garbage that is not numstat\0' : '') })).toThrow(/unparseable/);
+    });
+    it('readDiffFiles throws on ANY unparseable part, even beside parseable ones (a partial parse is not a parse)', () => {
+      expect(() => readDiffFiles({ cwd: dir, git: (a) => (a.includes('diff') ? '1\t0\tok.mjs\0not numstat\0' : '') })).toThrow(/unparseable/);
+    });
+    it('a lane with an empty diff against its base is refused under enforce, not admitted as card-only', () => {
+      const r = checkPrePrReview({ cwd: dir, env: OPERATOR, settings: enforce });
+      expect(r).toMatchObject({ action: 'refuse' });
+      expect(r.why).not.toBe('card-only');
+    });
+    it('a numstat shape the parser does not know refuses the whole check under enforce (a throw, never a pass)', () => {
+      commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
+      expect(() => readDiffFiles({ cwd: dir, base: 'main', git: (a) => (a.includes('diff') ? '12 34 file.mjs\0' : '') })).toThrow(/unparseable/);
+    });
+  });
+
+  describe('2. the lane\'s own .gitattributes cannot zero the line count', () => {
+    for (const attrs of ['* -diff\n', '*.mjs -diff\n', '* binary\n', '* diff=nope\n']) {
+      it(`counts real lines with ${JSON.stringify(attrs.trim())} committed`, () => {
+        commit({ '.gitattributes': attrs, 'scripts/big.mjs': 'x\n'.repeat(400) });
+        const { files } = readDiffFiles({ cwd: dir, base: 'main' });
+        expect(files.find((x) => x.path === 'scripts/big.mjs')).toMatchObject({ additions: 400 });
+        const r = checkPrePrReview({ cwd: dir, env: { WE_CONVEYOR_WORKER: '1' }, settings: enforce });
+        expect(r.risk.lines).toBeGreaterThan(400);
+        expect(r.risk.reasons.join(' ')).toMatch(/lines changed/);
+        expect(r.action).toBe('refuse');
+      });
+    }
+    it('a user-level attributes file cannot zero it either', () => {
+      const attrs = join(dir, '..', `user-attrs-${Date.now()}`);
+      writeFileSync(attrs, '* -diff\n');
+      git('config', 'core.attributesFile', attrs);
+      commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
+      try { expect(readDiffFiles({ cwd: dir, base: 'main' }).files[0]).toMatchObject({ additions: 400 }); } finally { rmSync(attrs, { force: true }); }
+    });
+    it('an image-only PR is not gated for being binary, but a NUL byte planted in a code file (hiding its size) is', () => {
+      commit({ 'docs/img/a.png': '\u0000\n'.repeat(30) });
+      const png = readDiffFiles({ cwd: dir, base: 'main' }).files;
+      expect(png[0]).toMatchObject({ path: 'docs/img/a.png', unmeasured: true });
+      expect(classifyPrRisk({ files: png, hasPreparedCard: true, operatorAgent: false }).gated).toBe(false);
+      commit({ 'scripts/hidden.mjs': `\u0000${'x\n'.repeat(400)}` });
+      const code = readDiffFiles({ cwd: dir, base: 'main' }).files;
+      const risk = classifyPrRisk({ files: code, hasPreparedCard: true, operatorAgent: false });
+      expect(risk.gated).toBe(true);
+      expect(risk.reasons.join(' ')).toMatch(/unmeasured/);
+    });
+    it('a base or sha that looks like a git option is refused, never passed to git (no --output=<file> injection)', () => {
+      commit({ 'scripts/a.mjs': 'x\n' });
+      const target = join(dir, 'pwned');
+      expect(() => readDiffFiles({ cwd: dir, base: `--output=${target}` })).toThrow(/looks like a git option/);
+      expect(() => readDiffFiles({ cwd: dir, base: 'main', sha: '--output=x' })).toThrow(/looks like a git option/);
+      expect(() => checkPrePrReview({ cwd: dir, base: `--output=${target}`, env: OPERATOR, settings: enforce })).toThrow();
+      expect(existsSync(target)).toBe(false);
+    });
+    it('a row whose count git could not measure (`-\\t-`) is gated, never counted as zero', () => {
+      const r = readDiffFiles({ cwd: dir, git: (a) => (a.includes('diff') ? '-\t-\tscripts/blob.bin\0' : '') });
+      expect(r.files[0]).toMatchObject({ path: 'scripts/blob.bin', unmeasured: true });
+      const risk = classifyPrRisk({ files: r.files, hasPreparedCard: true, operatorAgent: false });
+      expect(risk.gated).toBe(true);
+      expect(risk.reasons.join(' ')).toMatch(/unmeasur/);
+    });
+  });
+
+  describe('3. the receipt is bound to the reviewed base', () => {
+    const setup = () => {
+      git('branch', 'old'); // the older base, at the first commit
+      git('checkout', '-q', 'main'); commit({ 'scripts/small.mjs': 'a\n' });
+      git('checkout', '-q', 'lane/x'); git('merge', '-q', '--ff-only', 'main');
+      commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
+    };
+    const stamp = (extra = {}) => writeFileSync(join(gitDirOf(dir), RECEIPT_FILE), JSON.stringify(buildReceipt({ tree: treeOf(dir), head: 'h', envelope: {}, base: git('merge-base', 'main', 'HEAD'), ...extra })));
+    it('the receipt records the merge-base it was stamped against', () => {
+      setup();
+      expect(buildReceipt({ tree: 't', head: 'h', envelope: {}, base: 'abc' })).toMatchObject({ base: 'abc' });
+    });
+    it('a receipt stamped against main admits against main', () => {
+      setup(); stamp();
+      expect(checkPrePrReview({ cwd: dir, base: 'main', env: OPERATOR, settings: enforce })).toMatchObject({ action: 'pass', why: 'receipt' });
+    });
+    it('the SAME head tree opened against an older base is refused: the receipt reviewed a different diff', () => {
+      setup(); stamp();
+      const r = checkPrePrReview({ cwd: dir, base: 'old', env: OPERATOR, settings: enforce });
+      expect(r).toMatchObject({ action: 'refuse', why: 'receipt-base-mismatch' });
+      expect(r.message).toMatch(/base/);
+    });
+    it('a receipt that records no base (stamped before this check) is refused, not trusted', () => {
+      setup(); writeFileSync(join(gitDirOf(dir), RECEIPT_FILE), JSON.stringify({ tree: treeOf(dir), head: 'h', verdict: 'land' }));
+      expect(checkPrePrReview({ cwd: dir, base: 'main', env: OPERATOR, settings: enforce })).toMatchObject({ action: 'refuse', why: 'receipt-base-mismatch' });
+    });
+    it('decidePrePrReview needs the base to match as well as the tree', () => {
+      const risky = { gated: true, cardOnly: false, reasons: ['x'] };
+      const e = { ...S, mode: 'enforce' };
+      expect(decidePrePrReview({ settings: e, risk: risky, receipt: { tree: 't', base: 'b1', verdict: 'land' }, headTree: 't', baseSha: 'b1' }).action).toBe('pass');
+      expect(decidePrePrReview({ settings: e, risk: risky, receipt: { tree: 't', base: 'b1', verdict: 'land' }, headTree: 't', baseSha: 'b2' }).why).toBe('receipt-base-mismatch');
+      expect(decidePrePrReview({ settings: e, risk: risky, receipt: { tree: 't', base: 'b1', verdict: 'land' }, headTree: 't' }).why).toBe('receipt-base-mismatch');
+    });
+  });
+});
+
 describe('converge-cli receipt', () => {
   let dir; let state;
   const git = (...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8' });
@@ -417,7 +539,7 @@ describe('converge-cli receipt', () => {
   const cli = (...a) => spawnSync(process.execPath, [CLI, ...a], { encoding: 'utf8' });
 
   const st = { round: 2, careLevel: 'elevated', activeLenses: ['correctness'], dismissed: [] };
-  const landed = (extra = {}) => ({ ctx: { laneRoot: dir }, state: st, final: 'land', reviewed: { lane: dir, tree: workingTreeOf(dir) }, ...extra });
+  const landed = (extra = {}) => ({ ctx: { laneRoot: dir, baseRef: 'main' }, state: st, final: 'land', reviewed: { lane: dir, tree: workingTreeOf(dir) }, ...extra });
   const commitAll = (name, body) => { writeFileSync(join(dir, name), body); git('add', '-A'); git('-c', 'user.email=a@b', '-c', 'user.name=t', 'commit', '-qm', name); };
 
   it('refuses a run that did not land, and stamps the head tree for one that did', () => {
@@ -430,6 +552,19 @@ describe('converge-cli receipt', () => {
     expect(ok.status).toBe(0);
     const rec = JSON.parse(readFileSync(join(dir, '.git', RECEIPT_FILE), 'utf8'));
     expect(rec).toMatchObject({ tree: treeOf(dir), verdict: 'land', rounds: 2 });
+  });
+  it('stamps the merge-base of the base the panel diffed against, and refuses when it cannot be computed', () => {
+    git('checkout', '-q', '-b', 'lane/y'); commitAll('b.txt', 'b\n');
+    writeFileSync(state, JSON.stringify(landed()));
+    expect(cli('receipt', `--state=${state}`, `--lane=${dir}`).status).toBe(0);
+    const rec = JSON.parse(readFileSync(join(dir, '.git', RECEIPT_FILE), 'utf8'));
+    expect(rec.base).toBe(git('merge-base', 'main', 'HEAD').trim());
+    rmSync(join(dir, '.git', RECEIPT_FILE));
+    writeFileSync(state, JSON.stringify(landed({ ctx: { laneRoot: dir, baseRef: 'no-such-ref' } })));
+    const bad = cli('receipt', `--state=${state}`, `--lane=${dir}`);
+    expect(bad.status).not.toBe(0);
+    expect(bad.stderr).toMatch(/base/);
+    expect(existsSync(join(dir, '.git', RECEIPT_FILE))).toBe(false);
   });
   it('refuses receipt issuance for a tree different from the landed review (work committed after the review)', () => {
     writeFileSync(state, JSON.stringify(landed()));
