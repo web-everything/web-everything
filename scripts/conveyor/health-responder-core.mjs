@@ -57,6 +57,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "open-prs-over-limit": "Preserve existing backpressure; never raise/disable the PR limit.",
   "pr-events-stale": "Existing polling fallback owns availability; no webhook/token/deployment edits.",
   "pr-stage-stall": "Cluster is not a per-PR action authorization; reuse inspections and specific episodes.",
+  "pre-existing-red-on-main": "A failing test on main is fixed on main via the filed card; the responder never edits tests or the gate.",
   "review-label-missing": "A missing label is reported only; restoring review goes through the guarded re-arm command, never a responder label write.",
   "review-same-head-unposted": "Alert only; inspect failed posting effects and the review caps, never re-arm or post a review from the responder.",
   "review-seat-cap-near-limit":"Low severity; report only, no provider/cap changes and no operator ping.",
