@@ -6,7 +6,7 @@
  * `gh` reader is injected throughout, so every branch is reachable with no network and no credential.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 vi.mock('node:child_process', async (importOriginal) => {
@@ -115,17 +115,100 @@ describe('getRequiredStatusChecks', () => {
     expect(readChecks).toHaveBeenCalledTimes(2);
   });
 
-  it.each([
+  const failing = message => vi.fn(() => {
+    throw Object.assign(new Error('gh api failed'), { stderr: Buffer.from(message) });
+  });
+  const LIVE = ['test', 'smoke', 'daemon-soak', 'live-only-check'];
+  const WE = 'web-everything/web-everything';
+  const seedLive = () => getRequiredStatusChecks({
+    repo: WE, cachePath, now: 1000, ttlMs: 1000, readChecks: () => LIVE,
+  });
+  const entryOnDisk = () => JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${WE}@main`];
+
+  const DENIALS = [
     'Resource not accessible by integration (HTTP 403)',
     'Not Found (HTTP 404)',
+    'gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)',
+  ];
+  const RATE_LIMITS = [
     'HTTP 403: API rate limit exceeded',
-  ])('uses declared policy on protection denial: %s', message => {
-    const readChecks = vi.fn(() => { throw Object.assign(new Error('gh api failed'), { stderr: Buffer.from(message) }); });
+    'HTTP 403: You have exceeded a secondary rate limit',
+    'HTTP 403: You have triggered an abuse detection mechanism',
+  ];
+
+  it.each(DENIALS)('uses declared policy on protection denial: %s', message => {
+    const readChecks = failing(message);
     expect(getRequiredStatusChecks({ repo: 'plateauapp/plateau-app', cachePath, now: 1000, readChecks }))
       .toEqual({ checks: ['test', 'e2e'], source: 'declared' });
     expect(getRequiredStatusChecks({ repo: 'plateauapp/plateau-app', cachePath, now: 1001, readChecks }))
       .toEqual({ checks: ['test', 'e2e'], source: 'declared' });
     expect(readChecks).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(RATE_LIMITS)('a rate-limit 403 is not a protection denial — no declared selection, no cache write: %s', message => {
+    const readChecks = failing(message);
+    expect(getRequiredStatusChecks({ repo: 'plateauapp/plateau-app', cachePath, now: 1000, readChecks }))
+      .toEqual({ checks: ['test', 'e2e'], source: 'fallback' });
+    expect(existsSync(cachePath)).toBe(false);
+    // Nothing was cached, so the next call re-reads rather than serving a stuck `declared`.
+    getRequiredStatusChecks({ repo: 'plateauapp/plateau-app', cachePath, now: 1001, readChecks });
+    expect(readChecks).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(RATE_LIMITS)('an undeclared repo hit by a rate-limit 403 is unavailable, not fallback: %s', message => {
+    expect(getRequiredStatusChecks({ repo: 'chalbert/unknown', cachePath, now: 1000, readChecks: failing(message) }))
+      .toEqual({ checks: [], source: 'unavailable' });
+  });
+
+  it.each(RATE_LIMITS)('a rate-limit 403 keeps a live cache past TTL (stale-cache, file still live): %s', message => {
+    seedLive();
+    expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 3000, ttlMs: 1000, readChecks: failing(message) }))
+      .toEqual({ checks: LIVE, source: 'stale-cache', cacheAgeMs: 2000 });
+    expect(entryOnDisk()).toEqual({ checks: LIVE, source: 'live', fetchedAtMs: 1000 });
+  });
+
+  it.each(DENIALS)('a genuine denial never overwrites an existing live entry; each call re-reads once: %s', message => {
+    seedLive();
+    const readChecks = failing(message);
+    const expected = { checks: LIVE, source: 'stale-cache' };
+    expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 3000, ttlMs: 1000, readChecks }))
+      .toEqual({ ...expected, cacheAgeMs: 2000 });
+    expect(entryOnDisk()).toEqual({ checks: LIVE, source: 'live', fetchedAtMs: 1000 });
+    expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 3001, ttlMs: 1000, readChecks }))
+      .toEqual({ ...expected, cacheAgeMs: 2001 });
+    expect(readChecks).toHaveBeenCalledTimes(2);
+    expect(entryOnDisk().source).toBe('live');
+  });
+
+  it('a legacy (source-less) cache entry is live data and is protected from a denial too', () => {
+    writeFileSync(cachePath, JSON.stringify({ key: `${WE}@main`, checks: ['legacy-required'], fetchedAtMs: 0 }));
+    expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 5000, ttlMs: 1000, readChecks: failing(DENIALS[1]) }))
+      .toEqual({ checks: ['legacy-required'], source: 'stale-cache', cacheAgeMs: 5000 });
+  });
+
+  it('a stale `unavailable` entry is not live data: a denial still selects the declared policy', () => {
+    writeFileSync(cachePath, JSON.stringify({
+      entries: { [`${WE}@main`]: { checks: [], source: 'unavailable', fetchedAtMs: 0 } },
+    }));
+    expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 5000, ttlMs: 1000, readChecks: failing(DENIALS[1]) }))
+      .toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS], source: 'declared' });
+    expect(entryOnDisk().source).toBe('declared');
+  });
+
+  it('a stale declared entry is still refreshed (re-saved as declared) on a repeat denial', () => {
+    const readChecks = failing(DENIALS[0]);
+    getRequiredStatusChecks({ repo: WE, cachePath, now: 1000, ttlMs: 1000, readChecks });
+    expect(getRequiredStatusChecks({ repo: WE, cachePath, now: 3000, ttlMs: 1000, readChecks }))
+      .toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS], source: 'declared' });
+    expect(entryOnDisk()).toMatchObject({ source: 'declared', fetchedAtMs: 3000 });
+  });
+
+  it('a bare 403/404 without gh\'s `HTTP` prefix is a transient failure, not a denial', () => {
+    for (const message of ['403', 'error 404 from proxy']) {
+      expect(getRequiredStatusChecks({ repo: 'plateauapp/plateau-app', cachePath, now: 1000, readChecks: failing(message) }))
+        .toEqual({ checks: ['test', 'e2e'], source: 'fallback' });
+    }
+    expect(existsSync(cachePath)).toBe(false);
   });
 
   it.each(['chalbert/unknown', undefined])('never gives undeclared repo %s WE defaults', repo => {
