@@ -1,7 +1,9 @@
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-const yml = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+const yml = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', '.github', 'workflows', 'ci.yml'), 'utf8');
 const job = (name) => {
   const m = new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  [a-z][\\w-]*:\\n|^# |$(?![\\s\\S]))`, 'm').exec(yml);
   if (!m) throw new Error(`no job ${name}`);
