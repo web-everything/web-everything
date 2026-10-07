@@ -2793,22 +2793,50 @@ function readVerdictMemo(repo) {
   return { lanes, updates: new Map() };
 }
 
-/** A lane's memoized "not acquirable" verdict, if its fingerprint still matches and it is young enough. */
-function verdictMemoHit(memo, repo, n, nowMs) {
+/**
+ * A lane's memoized verdict, if its fingerprint still matches and it is young enough:
+ *   'held'  — a NEGATIVE verdict ("work lives here, not acquirable"; always on),
+ *   'clean' — a POSITIVE verdict ("unleased, clean, nothing ahead"; opt-in, see below),
+ *   null    — no usable entry, probe the lane.
+ */
+function verdictMemoState(memo, repo, n, nowMs) {
   const e = memo?.lanes?.[n];
-  if (!e || typeof e.at !== 'number' || !e.fp) return false;
-  const maxAge = verdictMemoMaxAgeMs() * (0.5 + ((n * 37) % 50) / 100); // staggered: 50%–99% of the max age
-  if (nowMs - e.at >= maxAge || e.at > nowMs + 1000) return false;
-  if (e.fp !== laneVerdictFingerprint(laneDir(repo, n), repo.branch)) return false;
+  if (!e || typeof e.at !== 'number' || !e.fp) return null;
+  const clean = e.clean === true;
+  const maxAgeMs = clean ? cleanVerdictMemoMaxAgeMs() : verdictMemoMaxAgeMs();
+  if (maxAgeMs <= 0) return null;
+  const maxAge = maxAgeMs * (0.5 + ((n * 37) % 50) / 100); // staggered: 50%–99% of the max age
+  if (nowMs - e.at >= maxAge || e.at > nowMs + 1000) return null;
+  if (e.fp !== laneVerdictFingerprint(laneDir(repo, n), repo.branch)) return null;
+  if (clean) return 'clean';
   // soak-main-red — a dirty verdict also needs its dirty paths untouched (see `dirtSignature`).
-  if (e.dirty) return typeof e.dirt === 'string' && Array.isArray(e.paths) && e.dirt === dirtSignature(laneDir(repo, n), e.paths);
-  return true;
+  if (e.dirty) return typeof e.dirt === 'string' && Array.isArray(e.paths) && e.dirt === dirtSignature(laneDir(repo, n), e.paths) ? 'held' : null;
+  return 'held';
 }
+
+/**
+ * Card xwn53th (build-daemon tick overrun) — OPT-IN reuse of a CLEAN lane's acquirable verdict. Off by default
+ * (env LANE_POOL_CLEAN_VERDICT_MEMO_MAX_AGE_MS / --clean-verdict-memo-max-age-ms unset or 0), so every existing
+ * caller keeps today's behaviour exactly. The build daemon turns it on for its planning read: with ~60 clean
+ * lanes, re-running `git status` + `rev-list` in each of them every 120 s tick was ~50 s of the tick.
+ * SOUNDNESS. The stat-only fingerprint covers HEAD, the branch tip, origin/<branch>, packed-refs, `.git/index` and
+ * the lease marker, so a lease taken, a commit, a stage or a reset all miss. What it cannot see is a file edited
+ * in an UNLEASED lane with no index change; that staleness is bounded by the max age (staggered per lane) and is
+ * the same one the negative memo documents. A wrong "acquirable" is also caught downstream: `acquire`
+ * re-verifies the lane before any reset (#2924). Only fully clean lanes are recorded (no lease, no uncommitted
+ * path, nothing ahead, and not an "ahead but provably pushed" lane whose answer depends on the live remote).
+ */
+const cleanVerdictMemoMaxAgeMs = () => numFlagOrEnv('clean-verdict-memo-max-age-ms', 'LANE_POOL_CLEAN_VERDICT_MEMO_MAX_AGE_MS', 0);
 
 function noteVerdict(memo, n, fp, info, remoteShasBox, dir = null, probeStartMs = null) {
   if (!memo) return;
   const doa = info?.dirtyOrAhead;
   const holdsWork = !!doa && (doa.dirty || doa.ahead > 0);
+  if (!holdsWork && cleanVerdictMemoMaxAgeMs() > 0) {
+    const fullyClean = !!doa && fp && info.exists && !info.lease && doa.uncommitted === 0 && doa.ahead === 0 && !doa.aheadPushed;
+    memo.updates.set(n, fullyClean ? { fp, at: Date.now(), clean: true } : null);
+    return;
+  }
   let provable = holdsWork && fp && !(doa.ahead > 0 && !doa.dirty && remoteShasBox?.failed);
   let dirt = null;
   if (provable && doa.dirty) {
@@ -2968,7 +2996,9 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs }) {
     memo = readVerdictMemo(repo);
     for (const n of existingLanes(repo)) {
       let ok = false;
-      if (!verdictMemoHit(memo, repo, n, Date.now())) {
+      const memoState = verdictMemoState(memo, repo, n, Date.now());
+      if (memoState === 'clean') ok = true;
+      else if (memoState === null) {
         const fp = memo ? laneVerdictFingerprint(laneDir(repo, n), repo.branch) : null;
         const probeStartMs = Date.now();
         const info = laneAcquirableInfo(repo, n, remoteShasBox, nowMs, ttlMs);
@@ -4026,7 +4056,7 @@ const KNOWN_FLAGS = new Set([
   // #xn432dz — list --acquirable's single-flight cache / early-stop / bounded-scan knobs.
   'limit', 'no-cache', 'cache-ttl-ms', 'scan-timeout-ms',
   // list --acquirable's per-lane "holds un-pushed work" memo (see VERDICT_MEMO_FILE).
-  'no-verdict-memo', 'verdict-memo-max-age-ms',
+  'no-verdict-memo', 'verdict-memo-max-age-ms', 'clean-verdict-memo-max-age-ms',
   // #4025 — provision --acquirable's per-call new-lane cap, and trim's own cap/dry-run knobs.
   'max-new', 'max', 'dry-run',
   // #3383 — acquire's own growth-on-empty knobs: hard ceiling and per-call new-lane cap.

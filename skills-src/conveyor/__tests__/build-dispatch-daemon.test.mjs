@@ -1,7 +1,7 @@
 import { recordPrepareFailure, readFailureState } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
 import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync, existsSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, statSync, existsSync, renameSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -44,6 +44,8 @@ import {
   deriveDispatchedByBuilder,
   // card 80 + hold visibility
   planConfigFrom, holdText,
+  // card xwn53th — tick-overrun speedups
+  CLEAN_VERDICT_MEMO_ENV, BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS, clearPrepareEvidenceCache,
 } from '../build-dispatch-daemon.mjs';
 import { listHoldFindings } from '../../../scripts/conveyor/build-dispatch-hold-router.mjs';
 import { MAX_CONCURRENT_LANES_ENV } from '../../../scripts/lib/lane-concurrency.mjs';
@@ -2727,5 +2729,56 @@ describe('build-hold visibility', () => {
   it('the live tick line carries buildHolds', () => {
     const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', 'build-dispatch-daemon.mjs'), 'utf8');
     expect(src).toMatch(/buildHolds: r\.buildHolds/);
+  });
+});
+
+describe('tick-overrun speedups (card xwn53th) change timing only, never the answer', () => {
+  it('cliPlanTick turns on the clean-lane verdict reuse for its own child only', () => {
+    const before = process.env[CLEAN_VERDICT_MEMO_ENV];
+    let seen;
+    cliPlanTick({}, { exec: (cmd, args, opts) => { seen = opts.env[CLEAN_VERDICT_MEMO_ENV]; return JSON.stringify({ decisions: {}, nextState: {} }); } });
+    expect(seen).toBe(String(BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS));
+    expect(BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS).toBeGreaterThan(0);
+    expect(process.env[CLEAN_VERDICT_MEMO_ENV]).toBe(before);
+  });
+
+  describe('cliPrepareFailureEvidence reuses a settled transcript but matches a fresh read', () => {
+    let projects;
+    const HANDLE = 'abcdef123456';
+    const line = (text) => `${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }] } })}\n`;
+    beforeEach(() => { projects = mkdtempSync(join(tmpdir(), 'evidence-')); mkdirSync(join(projects, 'p1')); clearPrepareEvidenceCache(); });
+    afterEach(() => { rmSync(projects, { recursive: true, force: true }); clearPrepareEvidenceCache(); });
+    const read = () => cliPrepareFailureEvidence({ handle: HANDLE, error: 'boom' }, { projects });
+    const fresh = () => { clearPrepareEvidenceCache(); return read(); };
+
+    it('same evidence on every repeat; a rewritten transcript is re-read', () => {
+      const file = join(projects, 'p1', `${HANDLE}.jsonl`);
+      writeFileSync(file, line('first') + line('the runner owns the stamp; I did not stamp it'));
+      const a = read();
+      expect(a).toEqual(fresh());
+      expect(read()).toEqual(a);
+      expect(a.terminal).toMatch(/runner owns/);
+      expect(a.stoppedBeforeCompletion).toBe(true);
+      appendFileSync(file, line('done, committed'));
+      const b = read();
+      expect(b).toEqual(fresh());
+      expect(b.terminal).toBe('done, committed');
+    });
+
+    it('a miss is reused only while no project directory changes; a new transcript is then found', () => {
+      expect(read()).toEqual({ error: 'boom' });
+      expect(read()).toEqual({ error: 'boom' });
+      writeFileSync(join(projects, 'p1', `${HANDLE}.jsonl`), line('late'));
+      expect(read()).toEqual(fresh());
+      expect(read().terminal).toBe('late');
+    });
+
+    it('a deleted transcript falls back to a fresh scan', () => {
+      const file = join(projects, 'p1', `${HANDLE}.jsonl`);
+      writeFileSync(file, line('x'));
+      expect(read().terminal).toBe('x');
+      rmSync(file);
+      expect(read()).toEqual({ error: 'boom' });
+    });
   });
 });
