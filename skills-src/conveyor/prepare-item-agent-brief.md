@@ -153,8 +153,15 @@ printf '%s\n' "WE #{{ITEM_NUM}}: prepare — <short card title>" "" \
 git commit -F <msgfile> {{ITEM_SPEC_PATH}}
 
 node scripts/verify-lane.mjs request --repo=.
-node scripts/verify-lane.mjs check --wait=540000 --repo=.   # re-run on `timeout`
+node {{WE_ROOT}}/scripts/conveyor/await-verify.mjs mark --who={{SESSION_SLUG}} --item={{ITEM_NUM}} --ref=lane/{{ITEM_NUM}}-prepare-item-<slug> --kind=prepare --attempt=1
 ```
+
+**The harness owns the wait, not you (#5137).** After `mark`, **end your turn**: reply with one line
+(`awaiting verify for <sha>`) and stop. Never `check --wait`, never `sleep`, never `run_in_background`, never
+`reset` or re-`request` yourself. The fix daemon resumes THIS session with a message that starts
+`[harness verify verdict — #5137]`: `green` → continue at step 5; `red` → repair the card, commit (or amend), `request`,
+`mark` again with `--attempt=<n+1>` and end your turn (the third red is a hard stop); no verdict → the harness
+re-requests on its own and then tells you to report blocked-on-infra. Nothing is pushed for you.
 
 This is the ONLY gate run for a card-only prepare. On a `backlog/`-only diff the gate takes its light path
 (no Vitest, but an UNSCOPED `check:standards` — a `backlog/` path always keeps the whole-repo run, so expect it
@@ -163,7 +170,7 @@ to take longer than a scoped one) and stamps the marker `open-pr` requires. Do N
 suite itself). Never pass `--help`/`-h` expecting a dry run: it prints usage only.
 
 If step 5's review makes you change the card, fold the change into that same commit
-(`git commit --amend --no-edit {{ITEM_SPEC_PATH}}`) and `request` once more: the amended commit is a new HEAD,
+(`git commit --amend --no-edit {{ITEM_SPEC_PATH}}`), `request` and `mark` once more (and end your turn again): the amended commit is a new HEAD,
 so that is the gate for the HEAD you will open, not a second run of the same one.
 
 The gate checks item shape; it does not replace the explicit `preparedDate` check above. A red gate is a

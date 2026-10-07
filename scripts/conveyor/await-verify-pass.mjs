@@ -28,7 +28,7 @@ import { join, resolve, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearAwaitVerifyRecord,
-  resolveAwaitVerifyTtlMs, AWAIT_VERIFY_REF_RE, AWAIT_VERIFY_KINDS,
+  resolveAwaitVerifyTtlMs, AWAIT_VERIFY_REF_RE, AWAIT_VERIFY_KINDS, AWAIT_VERIFY_NO_PUSH_KINDS,
 } from './await-verify.mjs';
 import { readVerifyMarker, verifyGateDecision } from '../lib/lane-verify.mjs';
 import { computeWorkingTreeHash } from '../lib/verify-lane-gate.mjs';
@@ -49,9 +49,13 @@ const repoKeyOrNull = (slug) => { try { return repoKeyForSlug(slug) ?? null; } c
 const SHA_RE = /^[a-f\d]{40}$/i;
 const lower = (s) => String(s ?? '').toLowerCase();
 
+/** A delivery or prepare wait: no PR yet, nothing for the harness to push (the session's own `open-pr` does). */
+export const isNoPushRecord = (record) => AWAIT_VERIFY_NO_PUSH_KINDS.includes(record?.kind);
+
 /** Is this a record the pass owns (written by `mark --ref`)? */
 export function isHarnessRecord(record) {
-  return !!record && record.v === 1 && Number.isInteger(record.pr) && record.pr > 0
+  return !!record && record.v === 1
+    && ((Number.isInteger(record.pr) && record.pr > 0) || (isNoPushRecord(record) && Number.isInteger(record.item) && record.item > 0))
     && SHA_RE.test(String(record.sha ?? '')) && typeof record.lane === 'string' && record.lane.startsWith('/')
     && AWAIT_VERIFY_REF_RE.test(String(record.ref ?? '')) && !String(record.ref).includes('..')
     && AWAIT_VERIFY_KINDS.includes(record.kind) && Number.isFinite(Date.parse(record.requestedAt));
@@ -80,7 +84,9 @@ export function classifyAwaitVerdict({ record, marker, lane, nowMs, ttlMs, limit
   if (record.pendingResume?.kind) return { action: 'resume', reason: 'pending-resume', resume: record.pendingResume.kind };
   if (!lane || !lane.head) return { action: 'resume', reason: 'lane-unreadable', resume: 'void' };
   if (lower(lane.head) !== lower(record.sha)) return { action: 'resume', reason: 'lane-moved', resume: 'void' };
-  if (lane.dirty) return { action: 'resume', reason: 'lane-dirty', resume: 'void' };
+  // A fix pushes its committed sha, so a dirty lane voids the wait. A delivery/prepare wait pushes nothing: its tree hash
+  // (which covers uncommitted work) is proven against the marker below instead.
+  if (lane.dirty && !isNoPushRecord(record)) return { action: 'resume', reason: 'lane-dirty', resume: 'void' };
   const rerequest = (reason) => ((record.retries ?? 0) >= limits.maxRetries
     ? { action: 'resume', reason: `${reason}; retries exhausted`, resume: 'infra' }
     : { action: 'rerequest', reason });
@@ -89,14 +95,14 @@ export function classifyAwaitVerdict({ record, marker, lane, nowMs, ttlMs, limit
   if (v.status === 'green') {
     if (lower(marker?.sha) !== lower(record.sha)) return rerequest('green-for-other-sha');
     if (!marker?.treeHash || !lane.treeHash || marker.treeHash !== lane.treeHash) return rerequest('tree-unproven');
-    return { action: 'push', reason: 'green' };
+    return isNoPushRecord(record) ? { action: 'resume', reason: 'green', resume: 'green' } : { action: 'push', reason: 'green' };
   }
   if (v.status === 'running') {
     const age = nowMs - Date.parse(record.requestedAt);
     return age > ttlMs ? rerequest('verify-overdue') : { action: 'wait', reason: 'running' };
   }
   if (v.status === 'red') {
-    if (AWAIT_LOAD_FLAKE_REPO_KEYS.includes(repoKeyOrNull(record.repo)) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake' };
+    if (!isNoPushRecord(record) && AWAIT_LOAD_FLAKE_REPO_KEYS.includes(repoKeyOrNull(record.repo)) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake' };
     if ((record.attempt ?? 1) >= limits.maxReds) return { action: 'resume', reason: `red on attempt ${record.attempt}`, resume: 'escalate' };
     return { action: 'resume', reason: 'red', resume: 'red' };
   }
@@ -104,7 +110,7 @@ export function classifyAwaitVerdict({ record, marker, lane, nowMs, ttlMs, limit
 }
 
 const isCiHeal = (record) => record.kind === 'ci-heal';
-const brief = (record) => (isCiHeal(record) ? 'CI-heal brief' : 'fix brief');
+const brief = (record) => (isCiHeal(record) ? 'CI-heal brief' : record.kind === 'delivery' ? 'delivery brief' : record.kind === 'prepare' ? 'prepare brief' : 'fix brief');
 const failureLines = (marker) => {
   const tests = Array.isArray(marker?.failureDetails?.tests) ? marker.failureDetails.tests.slice(0, 15) : [];
   const lines = tests.map((t) => `- ${t.file} > ${t.name}`);
@@ -112,13 +118,35 @@ const failureLines = (marker) => {
   return `${lines.join('\n') || '- (no per-test detail recorded)'}${summary ? `\n\nSummary:\n${summary}` : ''}`;
 };
 
+/** The resume message for a delivery or prepare wait (no PR, no push): every branch names the brief's own next step. Pure. */
+function buildNoPushResumePrompt({ kind, record, marker, detail, head, next }) {
+  const where = brief(record);
+  const resumeAt = record.kind === 'prepare'
+    ? "step 5 (the adversarial review of your prepare pass), or `open-pr` if you already ran it"
+    : "the step right after the gate you handed off (step 6, `/converge`, after the step-5 gate; `open-pr` after the final-HEAD gate)";
+  switch (kind) {
+    case 'green':
+      return `${head}\n\nVerify is GREEN for exactly this sha. The harness pushed NOTHING: your own \`open-pr\` publishes the ref. Continue your ${where} at ${resumeAt}. If you changed any file since marking, \`request\` and mark again first.`;
+    case 'red':
+      return `${head}\n\nVerify is RED for this sha. Failing tests:\n${failureLines(marker)}\n\nRepair the failure in this lane (same scope rules), then \`verify-lane.mjs request\`, ${next.charAt(0).toLowerCase()}${next.slice(1)}`;
+    case 'escalate':
+      return `${head}\n\nVerify is RED again (attempt ${record.attempt}; limit ${AWAIT_VERIFY_LIMITS.maxReds}). Do not attempt another repair. Take your ${where}'s gate-red hard stop under *Escalations* with the failing check below.\n\n${failureLines(marker)}`;
+    case 'infra':
+      return `${head}\n\nThe verify gate produced no verdict after ${record.retries ?? 0} harness re-requests (${detail || 'no verdict'}). Do not re-request. Take your ${where}'s blocked-on-infra exit with that evidence.`;
+    default:
+      return `${head}\n\nYour lane ${record.lane} no longer matches the recorded wait (${detail || 'HEAD moved'}). \`request\` again for the current HEAD, mark again, and end your turn.`;
+  }
+}
+
 /**
  * The message the resumed session receives. Pure. Every variant names the sha, the attempt, and the exact next
  * step in the session's own brief, and repeats the one invariant: the session never pushes `{{LANE_REF}}` itself.
  */
 export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, detail = '' }) {
-  const head = `[harness verify verdict — #5137] PR #${record.pr} (${record.repo}), sha ${record.sha}, attempt ${record.attempt ?? 1}.`;
+  const subject = isNoPushRecord(record) ? `item #${record.item} (${record.repo})` : `PR #${record.pr} (${record.repo})`;
+  const head = `[harness verify verdict — #5137] ${subject}, sha ${record.sha}, attempt ${record.attempt ?? 1}.`;
   const next = `Re-mark with --attempt=${(record.attempt ?? 1) + 1} after committing and re-requesting, then end your turn again.`;
+  if (isNoPushRecord(record) && ['green', 'red', 'escalate', 'infra', 'void'].includes(kind)) return buildNoPushResumePrompt({ kind, record, marker, detail, head, next });
   switch (kind) {
     case 'green': {
       const pushed = `Verify is GREEN for exactly this sha and the harness has PUSHED it to ${record.ref}${detail ? ` (${detail})` : ''}. Do not push ${record.ref} again.`;
@@ -212,7 +240,7 @@ export async function runAwaitVerifyPass({
     let record = stored;
     const row = { key, pr: record?.pr ?? null, repo: record?.repo ?? null, sha: record?.sha ?? null };
     try {
-      const lane = isHarnessRecord(record) && !record.pendingResume ? io.laneState(record.lane) : null;
+      const lane = isHarnessRecord(record) && !record.pendingResume ? io.laneState(record.lane, { hashDirty: isNoPushRecord(record) }) : null;
       const marker = lane ? io.readMarker(record.lane) : null;
       const d = classifyAwaitVerdict({ record, marker, lane: record.pendingResume ? { head: record.sha } : lane, nowMs, ttlMs, limits });
       Object.assign(row, { action: d.action, reason: d.reason });
@@ -396,7 +424,7 @@ export async function defaultAwaitVerifyIo({
       if (record?.lane && !outsidePool(record.lane)) clearAwaitVerifyRecord(record.lane);
       return { cleared: store.cleared };
     },
-    laneState: (lane) => {
+    laneState: (lane, { hashDirty = false } = {}) => {
       let scratch = null;
       try {
         if (outsidePool(lane)) return null;
@@ -421,7 +449,7 @@ export async function defaultAwaitVerifyIo({
           if (a[0] === 'hash-object') return owned(['hash-object', '--no-filters', ...a.slice(1)]);
           return owned(a);
         };
-        const treeHash = dirty ? null : computeWorkingTreeHash({ runGit, fileMode: (f) => lstatSync(join(lane, f)).mode });
+        const treeHash = dirty && !hashDirty ? null : computeWorkingTreeHash({ runGit, fileMode: (f) => lstatSync(join(lane, f)).mode });
         return { head, dirty, treeHash };
       } catch { return null; } finally { if (scratch) rmSync(scratch, { recursive: true, force: true }); }
     },
