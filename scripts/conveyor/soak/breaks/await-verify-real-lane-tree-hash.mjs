@@ -19,6 +19,7 @@ import { existsSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..', '..');
 const PASS = 'scripts/conveyor/await-verify-pass.mjs';
@@ -31,7 +32,7 @@ export async function replay(root = REPO_ROOT) {
   const tmp = mkdtempSync(join(tmpdir(), 'soak-await-hash-'));
   try {
     const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' };
-    const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env });
+    const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, maxBuffer: 64 * 1024 * 1024 });
     const id = ['-c', 'user.name=s', '-c', 'user.email=s@s', '-c', 'commit.gpgsign=false'];
     const origin = join(tmp, 'origin.git'); const lane = join(tmp, 'lane');
     git(tmp, ['init', '--bare', '-b', 'main', origin]);
@@ -45,7 +46,7 @@ export async function replay(root = REPO_ROOT) {
     const treeHash = computeWorkingTreeHash({ runGit: (a) => git(lane, a).trim(), fileMode: (f) => lstatSync(join(lane, f)).mode });
 
     const real = await defaultAwaitVerifyIo({ weRoot: root, env });
-    const store = new Map([['s', { v: 1, sessionId: 's', who: 'fix-1', repo: 'web-everything/web-everything', pr: 1, sha, requestedAt: new Date(0).toISOString(),
+    const store = new Map([['s', { v: 1, sessionId: 's', who: 'fix-1', repo: CONSTELLATION_REPOS.we.slug, pr: 1, sha, requestedAt: new Date(0).toISOString(),
       attempt: 1, lane, ref: 'lane/item-1', kind: 'fix' }]]);
     const pushes = []; let rerequests = 0;
     const io = {
