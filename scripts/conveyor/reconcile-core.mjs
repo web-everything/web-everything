@@ -2139,7 +2139,7 @@ export function planReconcile({
         // unresolved past it, or when the state itself is unreadable (`reason` set) or carries no timestamp.
         const sinceMs = Date.parse(retryBudget.pendingSince);
         const windowMs = Number(process.env.WE_TIMEOUT_RETRY_PENDING_ESCALATE_MS) || TIMEOUT_RETRY_PENDING_ESCALATE_MS;
-        if (!retryBudget.reason && Number.isFinite(sinceMs) && Number.isFinite(now) && now - sinceMs < windowMs) {
+        if (!retryBudget.reason && Number.isFinite(sinceMs) && now > 0 && now - sinceMs < windowMs) {
           refuse('ci-timeout-rerun-in-flight', { ...withPhase,
             why: `PR #${prNumber}: a CI re-run was requested ${Math.round((now - sinceMs) / 1000)}s ago and its result is not observed yet — waiting (escalates to the operator after ${Math.round(windowMs / 60000)} min)` });
           continue;
