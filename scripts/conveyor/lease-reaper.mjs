@@ -112,6 +112,9 @@ import { CONSTELLATION_REPOS, repoKeyForDir } from '../lib/constellation-repos.m
 import { isCherryOutputAllPatchEquivalent } from '../lib/git-patch-equivalence.mjs';
 import { LANE_JOURNAL_ACTOR_ENV } from '../lib/lane-history.mjs';
 import { timestampLines } from '../lib/log-timestamp.mjs';
+// xbdixjc — the lane hold rule: a lane whose fixer is parked awaiting verify, whose verify is running, or that holds
+// a verified unpushed commit is never reaped (the pure rule is `laneHoldVerdict`, we:scripts/lib/lane-lease.mjs).
+import { checkLaneHold } from '../lib/lane-hold-io.mjs';
 // #3383 (this incident, 2026-09-14) — REUSE, never reimplement, the real PID-liveness probe `driver-watchdog.mjs`
 // just built for the IDENTICAL gap in a different place: a `claude agents --json` row can be a PHANTOM — still
 // LISTED (present, in some non-terminal state like `working`/`blocked`), with NO backing OS process at all (that
@@ -1136,6 +1139,26 @@ export function reapPlan(candidates, { nowMs, ttlMs = DEFAULT_LEASE_TTL_MINUTES 
   return { reap, keep };
 }
 
+/**
+ * xbdixjc — move every reap candidate the lane hold rule protects into `keep` (reason `held:<hold>`). `check` is
+ * injectable; the default reads the lane's await-verify records, verify record and work state. The same rule
+ * also refuses inside `lane-pool.mjs release`, so a caller that skips this still cannot drop a held lane.
+ * @param {{reap:Array, keep:Array}} plan @param {{nowMs:number, check?:Function}} opts
+ */
+export function applyLaneHold({ reap, keep }, { nowMs, check = checkLaneHold } = {}) {
+  const stillReap = [];
+  const kept = [...keep];
+  for (const c of reap) {
+    const verdict = check(c.dir, { action: 'release', byHolder: false, nowMs });
+    if (verdict?.allowed === true) stillReap.push(c);
+    else {
+      kept.push({ ...c, reason: `held:${verdict?.hold ?? 'work-state-unknown'}`, wouldHaveBeen: c.reason });
+      log(`  kept ${c.pool}/lane-${c.lane} (${c.reason} but ${verdict?.reason ?? 'lane-hold: unknown'}; session ${c.lease?.session ?? 'unknown'})`);
+    }
+  }
+  return { reap: stillReap, keep: kept };
+}
+
 // ── IO SHELL (runs only as a CLI — owns POOL_ROOT walk / marker reads / gh / the release delegation) ──────────
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -1437,7 +1460,8 @@ function main(argv) {
   const prStatesByRepo = new Map(distinctRepoKeys.map((repoKey) => [repoKey, fetchPrStatesForRepo(repoKey, flags)]));
 
   const signalsFor = buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, nowMs });
-  const { reap, keep } = reapPlan(candidates, { nowMs, ttlMs, signalsFor });
+  const plan = reapPlan(candidates, { nowMs, ttlMs, signalsFor });
+  const { reap, keep } = applyLaneHold(plan, { nowMs });
 
   // Reclaim (unless dry-run). A single failed release is logged and skipped — the reaper is best-effort and one
   // stuck lane must not abort the whole sweep — but a failure count surfaces via a non-zero exit (below) so a
