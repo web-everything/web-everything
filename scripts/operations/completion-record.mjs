@@ -127,10 +127,10 @@ const SECRET_VALUE = `(?:"(?:\\\\.|[^"\\\\])*"?|'(?:\\\\.|[^'\\\\])*'?|\\\\.|[^\
  * @param {*} value
  * @returns {string|null}
  */
-export function sanitizeDeniedCommand(value) {
+export function sanitizeDeniedCommand(value, maxLength = DENIED_MAX_LENGTH) {
   if (typeof value !== 'string') return null;
   // Bound the input BEFORE any regex: the redaction patterns are quadratic on pathological runs of `-`.
-  let s = value.slice(0, DENIED_SCAN_LIMIT).replace(/\s+/g, ' ').trim();
+  let s = value.slice(0, Math.max(DENIED_SCAN_LIMIT, maxLength)).replace(/\s+/g, ' ').trim();
   s = s
     .replace(/\/\/[^\s/@:"']+:[^\s/@"']+@/g, '//[redacted]@')
     .replace(new RegExp(`\\b(password|passwd|secret|token)\\s*:\\s*${SECRET_VALUE}`, 'gi'), '$1: [redacted]')
@@ -148,7 +148,7 @@ export function sanitizeDeniedCommand(value) {
   // Replace (never delete) the delimiters: deleting can splice a NEW `<!--` together (`<!<!----` → `<!--`).
   s = s.replace(/<!--|--!?>|`/g, ' ').replace(/@(?=[\w-])/g, '@\u200b').replace(/\s+/g, ' ').trim();
   if (/<!--|--!?>/.test(s)) s = s.replace(/[<>]/g, ' ').replace(/\s+/g, ' ').trim();
-  if (s.length > DENIED_MAX_LENGTH) s = `${s.slice(0, DENIED_MAX_LENGTH - 1)}…`;
+  if (s.length > maxLength) s = `${s.slice(0, maxLength - 1)}…`;
   return s;
 }
 
@@ -177,6 +177,119 @@ export function applyCompletionUpdate(record, patch = {}, now = () => new Date()
   return next;
 }
 
+// ── Completion record v2: the ONE launcher-written envelope (item 117 S2, decision D2) ───────────────────────────
+
+/** Version of the launcher-written envelope. A v1 record is never rewritten as v2; readers accept both. */
+export const COMPLETION_RECORD_V2 = 2;
+/** Every version a reader accepts. An unknown version is refused. */
+export const COMPLETION_READ_VERSIONS = Object.freeze([COMPLETION_RECORD_VERSION, COMPLETION_RECORD_V2]);
+/** v2 `role` (= `kind`). Kept equal to `worker-result.mjs#ROLES` by a test (this file may not import it: cycle). */
+export const ENVELOPE_ROLES = Object.freeze(['review', 'fix', 'ci-heal', 'inspect', 'build', 'prepare', 'investigate']);
+/** v2 `launcher`: which run-to-completion pattern produced the result (D7 FINAL: all of them go through the detached wrapper). */
+export const ENVELOPE_LAUNCHERS = Object.freeze(['claude-bg', 'claude-p', 'codex-exec', 'agy']);
+/** v2 `source`: where `result` came from. The three legacy sources are the folded stores (D2). */
+export const ENVELOPE_SOURCES = Object.freeze(['worker-result', 'legacy-completion', 'legacy-delivery-report', 'legacy-fix-report', 'none']);
+
+const isIso = (v) => typeof v === 'string' && !Number.isNaN(Date.parse(v));
+const isOptIso = (v) => v === null || v === undefined || isIso(v);
+const isOptPosInt = (v) => v === null || v === undefined || (Number.isInteger(v) && v > 0);
+
+/** The v2-only field checks. Returns problems; shape only, the worker-result reader checks `result` itself. */
+function validateEnvelopeFields(r) {
+  const errors = [];
+  if (r.role !== r.kind) errors.push('`role` must equal `kind`');
+  if (!ENVELOPE_LAUNCHERS.includes(r.launcher)) errors.push(`\`launcher\` must be one of ${ENVELOPE_LAUNCHERS.join('/')}`);
+  if (!isOptionalString(r.model)) errors.push('`model` must be a string or null');
+  if (!isOptionalString(r.headBefore) || !isOptionalString(r.headAfter)) errors.push('`headBefore`/`headAfter` must be strings or null');
+  if (!isOptPosInt(r.pid)) errors.push('`pid` must be a positive integer or null');
+  if (!isOptPosInt(r.timeoutMs)) errors.push('`timeoutMs` must be a positive integer or null');
+  if (!isOptIso(r.deadlineAt) || !isOptIso(r.endedAt)) errors.push('`deadlineAt`/`endedAt` must be ISO timestamps or null');
+  if (!(r.parse === null || r.parse === undefined || (isPlainObject(r.parse) && typeof r.parse.ok === 'boolean' && isOptionalString(r.parse.reason)))) {
+    errors.push('`parse` must be null or {ok:boolean, reason:string|null}');
+  }
+  if (!(r.result === null || r.result === undefined || isPlainObject(r.result))) errors.push('`result` must be an object or null');
+  if (!(r.action === null || r.action === undefined || (isPlainObject(r.action) && typeof r.action.type === 'string' && r.action.type))) {
+    errors.push('`action` must be null or an object with a `type`');
+  }
+  if (r.source !== undefined && !ENVELOPE_SOURCES.includes(r.source)) errors.push(`\`source\` must be one of ${ENVELOPE_SOURCES.join('/')}`);
+  if (r.status === 'done' && r.result == null && r.source !== 'none') errors.push('a done v2 record needs a `result` (use source "none" only for a legacy record that never reported)');
+  return errors;
+}
+
+/**
+ * A fresh v2 `status:'started'` record, written by the LAUNCHER at spawn (D5: the agent no longer reports
+ * `started`). Carries the wrapper's own job facts (`pid`, `timeoutMs`, `deadlineAt`) so a dead wrapper reads as
+ * stale. Keeps every v1 field (`outcome`, `verdict`, `label`, `runId`) so existing readers still work on it.
+ * @param {object} spec
+ * @param {string} spec.session
+ * @param {string} spec.role one of {@link ENVELOPE_ROLES}
+ * @param {string} spec.launcher one of {@link ENVELOPE_LAUNCHERS}
+ * @param {() => string} [spec.now]
+ */
+export function newEnvelopeRecord({
+  session, role, launcher, model = null, pr = null, item = null, sessionId = null, headBefore = null,
+  pid = null, timeoutMs = null, now = () => new Date().toISOString(),
+} = {}) {
+  if (!isValidSessionSlug(session)) throw new TypeError(`operations: invalid completion session slug ${JSON.stringify(session)}`);
+  if (!ENVELOPE_ROLES.includes(role)) throw new TypeError(`operations: envelope role must be one of ${ENVELOPE_ROLES.join('/')}, got ${JSON.stringify(role)}`);
+  if (!ENVELOPE_LAUNCHERS.includes(launcher)) throw new TypeError(`operations: envelope launcher must be one of ${ENVELOPE_LAUNCHERS.join('/')}, got ${JSON.stringify(launcher)}`);
+  const ts = now();
+  const str = (v) => (v === null || v === undefined ? null : String(v));
+  return {
+    v: COMPLETION_RECORD_V2,
+    session,
+    kind: role,
+    role,
+    launcher,
+    model: str(model),
+    pr: str(pr),
+    item: str(item),
+    status: 'started',
+    outcome: null,
+    verdict: null,
+    label: null,
+    runId: null,
+    sessionId: sessionId === undefined ? null : sessionId,
+    headBefore: str(headBefore),
+    headAfter: null,
+    pid: pid ?? null,
+    timeoutMs: timeoutMs ?? null,
+    deadlineAt: pid != null && timeoutMs != null ? new Date(Date.parse(ts) + timeoutMs).toISOString() : null,
+    parse: null,
+    result: null,
+    action: null,
+    reroute: null,
+    source: 'worker-result',
+    startedAt: ts,
+    endedAt: null,
+    updatedAt: ts,
+  };
+}
+
+/**
+ * PURE: close a v2 record. `outcome` is the legacy word existing readers (`markSelfReportedDone`, the reaper)
+ * still branch on; the caller derives it with `worker-result-router.mjs#legacyOutcomeWord`.
+ * @param {object} record a v2 record
+ * @param {{result: object, parse: {ok:boolean, reason:string|null}, action: object, outcome: string, reroute?: object|null, headAfter?: string|null, source?: string, sessionId?: string|null}} fin
+ */
+export function finishEnvelopeRecord(record, fin, now = () => new Date().toISOString()) {
+  const ts = now();
+  return {
+    ...record,
+    status: 'done',
+    outcome: fin.outcome,
+    result: fin.result,
+    parse: fin.parse,
+    action: fin.action,
+    reroute: fin.reroute ?? null,
+    headAfter: fin.headAfter ?? record.headAfter ?? null,
+    source: fin.source ?? record.source,
+    sessionId: fin.sessionId === undefined ? record.sessionId : fin.sessionId,
+    endedAt: ts,
+    updatedAt: ts,
+  };
+}
+
 /**
  * Validate a completion record's SHAPE. Returns every problem found, not just the first (mirrors
  * `we:scripts/operations/run-record.mjs#validateRunRecord`).
@@ -186,9 +299,12 @@ export function applyCompletionUpdate(record, patch = {}, now = () => new Date()
 export function validateCompletionRecord(record) {
   const errors = [];
   if (!isPlainObject(record)) return { ok: false, errors: ['completion record must be an object'] };
-  if (record.v !== COMPLETION_RECORD_VERSION) errors.push(`unsupported completion record version ${JSON.stringify(record.v)}`);
+  if (!COMPLETION_READ_VERSIONS.includes(record.v)) errors.push(`unsupported completion record version ${JSON.stringify(record.v)}`);
   if (!isValidSessionSlug(record.session)) errors.push('missing or invalid `session`');
-  if (!COMPLETION_KINDS.includes(record.kind)) errors.push(`\`kind\` must be one of ${COMPLETION_KINDS.join('/')}`);
+  if (record.v === COMPLETION_RECORD_V2) {
+    if (!ENVELOPE_ROLES.includes(record.kind)) errors.push(`\`kind\` must be one of ${ENVELOPE_ROLES.join('/')}`);
+    errors.push(...validateEnvelopeFields(record));
+  } else if (!COMPLETION_KINDS.includes(record.kind)) errors.push(`\`kind\` must be one of ${COMPLETION_KINDS.join('/')}`);
   if (!isOptionalString(record.pr)) errors.push('`pr` must be a string or null');
   if (!isOptionalString(record.item)) errors.push('`item` must be a string or null');
   if (!COMPLETION_STATUSES.includes(record.status)) errors.push(`\`status\` must be one of ${COMPLETION_STATUSES.join('/')}`);

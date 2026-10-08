@@ -20,12 +20,22 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
 import { assertCompletionRecord, isValidSessionSlug, parseCompletionRecord, serializeCompletionRecord } from './completion-record.mjs';
+import { envelopeFromLegacy } from './worker-result-router.mjs';
+import { tryReadDeliveryReport } from './delivery-report-store.mjs';
+import { tryReadFixReport } from './fix-report-store.mjs';
 import { reserve, releaseLockDir } from '../readiness/file-locks.mjs';
 import { sleepSyncMs } from '../readiness/drain-lock.mjs';
 
 export {
   COMPLETION_KINDS,
   COMPLETION_RECORD_VERSION,
+  COMPLETION_RECORD_V2,
+  COMPLETION_READ_VERSIONS,
+  ENVELOPE_ROLES,
+  ENVELOPE_LAUNCHERS,
+  ENVELOPE_SOURCES,
+  newEnvelopeRecord,
+  finishEnvelopeRecord,
   COMPLETION_STATUSES,
   applyCompletionUpdate,
   assertCompletionRecord,
@@ -284,3 +294,23 @@ export function createFileCompletionStore(dir = resolveCompletionsDir()) {
     list: () => listCompletionSessions(dir),
   };
 }
+
+/**
+ * Item 117 S2 (D2) — THE ONE READER. Looks a session up in the completion store first (v1 or v2), then in the two
+ * folded stores (delivery-report, fix-report), and returns it AS A v2 ENVELOPE (`{found, ...envelope}` shape is the
+ * CLI's job). A v1 record is mapped, never rewritten on disk. `null` when no store has the session.
+ * `dirs` overrides each store's directory (tests, and the build wrapper's lane-scoped delivery-reports dir).
+ * @param {string} session
+ * @param {{completions?: string, deliveryReports?: string, fixReports?: string}} [dirs]
+ * @returns {object|null}
+ */
+export function readEnvelope(session, dirs = {}) {
+  const rec = tryReadCompletion(session, dirs.completions ?? resolveCompletionsDir());
+  if (rec) return rec.v === COMPLETION_RECORD_V2_VALUE ? rec : envelopeFromLegacy(rec, 'legacy-completion');
+  const delivery = dirs.deliveryReports === null ? null : tryReadDeliveryReport(session, dirs.deliveryReports);
+  if (delivery) return envelopeFromLegacy(delivery, 'legacy-delivery-report');
+  const fix = dirs.fixReports === null ? null : tryReadFixReport(session, dirs.fixReports);
+  if (fix) return envelopeFromLegacy(fix, 'legacy-fix-report');
+  return null;
+}
+const COMPLETION_RECORD_V2_VALUE = 2;
