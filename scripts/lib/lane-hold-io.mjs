@@ -1,6 +1,6 @@
 /**
  * @file lane-hold-io.mjs — the IO half of the lane hold rule (`laneHoldVerdict`, we:scripts/lib/lane-lease.mjs;
- * card we:backlog/xbdixjc-lane-hold-rule-protect-unpushed.md). Reads one lane's plain facts — the await-verify
+ * card #xbdixjc). Reads one lane's plain facts — the await-verify
  * records that name it, its verify record, its current commit and (only when the rule needs it) whether it holds
  * unpushed work — and asks the pure rule. Every path that releases, resets, removes or reclaims a lane calls
  * {@link checkLaneHold}: `we:scripts/lane-pool.mjs` (release, acquire, trim, reclaim, refresh, the acquire-time

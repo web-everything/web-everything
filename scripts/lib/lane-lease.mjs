@@ -538,7 +538,7 @@ export function isDeliveredLease({ porcelain, headIsAncestorOfUpstream, headComm
     && headCommitMs >= acquiredAtMs;
 }
 
-// ── The lane hold rule (we:backlog/xbdixjc-lane-hold-rule-protect-unpushed.md) ─────────────────────────────────
+// ── The lane hold rule (#xbdixjc) ─────────────────────────────────
 // "May this lane be released, reset, removed or reclaimed right now?" A fixer that ends its turn to await verify
 // looks gone to the lease reaper; on 2026-10-08 17:00–21:00Z the reaper released 24 lanes holding unpushed work
 // and acquire reset 10 over it, stranding verified commits (#4446, #4461, #4433, #4453). This is ONE rule, pure,
