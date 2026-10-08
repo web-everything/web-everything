@@ -1102,7 +1102,7 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
     let operatorRulings = [];
     try { operatorRulings = readOperatorRulings(raw.comments ?? []).rulings; } catch { operatorRulings = []; }
     findingIdentity = findingIdentityTable(readReferralRecords(raw.comments ?? []).records)
-      .map(({ findingId, path, lens, normSummary, anchor, forms, heads, activeHeads, rulings, keys }) => ({ findingId, path, lens, normSummary, anchor, forms, heads, activeHeads,
+      .map(({ findingId, path, lens, normSummary, anchor, forms, heads, activeHeads, activeInstances, rulings, keys }) => ({ findingId, path, lens, normSummary, anchor, forms, heads, activeHeads, activeInstances,
         rulings: (rulings ?? []).map(({ head, result }) => ({ head, result })),
         operatorRulings: operatorRulings
           .filter((o) => (keys ?? []).some((k) => k.head === o.head && k.runId === o.runId && k.key === o.key))

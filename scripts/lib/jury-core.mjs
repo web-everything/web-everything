@@ -665,7 +665,7 @@ export function findingIdentityTable(records = []) {
             normSummary: `${identity.normSummary}#${n}` });
         }
         entry = { findingId, ...identity, summary: normalizeFinding(f.original ?? f.finding).summary,
-          firstSeenHead: record.head, heads: [], activeHeads: [], lines: [], keys: [], rulings: [] };
+          firstSeenHead: record.head, heads: [], activeHeads: [], activeInstances: [], lines: [], keys: [], rulings: [] };
         table.push(entry);
         byId.set(findingId, entry);
       }
@@ -679,6 +679,14 @@ export function findingIdentityTable(records = []) {
       // The heads on which an ACTIVE referral (not one retired as dropped) holds the finding: what "already referred" means.
       if (activeReferrals(record).some((a) => a.key === f.key) && !entry.activeHeads.includes(record.head)) {
         entry.activeHeads.push(record.head);
+      }
+      // The exact claim each ACTIVE referral holds, per head: the one thing "already referred" may rest on
+      // ({@link classifyReferralsByRound}). The entry's heads and forms say only that SOME wording of the finding is on
+      // some head.
+      const claim = exactClaimKey(f.original ?? f.finding);
+      if (claim && activeReferrals(record).some((a) => a.key === f.key)
+        && !entry.activeInstances.some((x) => x.head === record.head && x.claim === claim)) {
+        entry.activeInstances.push({ head: record.head, claim });
       }
       entry.keys.push({ head: record.head, runId: record.runId, key: f.key });
       for (const r of (record.rulings ?? []).filter((x) => x.key === f.key)) {
@@ -1507,6 +1515,23 @@ export const REFERRAL_DEMOTED_REASONS = Object.freeze({
   FIXER_ADDRESSED_RERAISE: 'fixer-addressed-reraise',
 });
 
+/** A finding's claim for the "already referred" test: {@link normalizeFindingIdentity}'s `normSummary` folds `:line`
+ *  references to `:N` (so a moved line is one claim), which also makes "…at a.mjs:10" and "…at a.mjs:200" — two defects
+ *  in one file sharing a templated summary — one claim. Here the line references are KEPT: they are the discriminator.
+ *  Case, quoting, whitespace and trailing punctuation still fold. PURE. */
+export function exactClaimKey(finding) {
+  const f = normalizeFinding(finding);
+  if (!f) return '';
+  return f.summary.normalize('NFKC').toLowerCase().replace(/[`'"‘’“”]/g, '').replace(/\s+/g, ' ').trim().replace(/[\s.,;:!?]+$/, '');
+}
+
+/** Does an ACTIVE referral on `head` hold exactly `finding`'s claim ({@link exactClaimKey})? An entry that does not say
+ *  (a table without `activeInstances`) answers no: the finding stays a referral, the safe direction. PURE. */
+function coveredByActiveClaim(entry, head, finding) {
+  const claim = exactClaimKey(finding);
+  return Boolean(claim) && (entry.activeInstances ?? []).some((x) => x.head === head && x.claim === claim);
+}
+
 /**
  * Card xq1xbsl — WHICH OF A ROUND'S MANDATORY-REFERRAL CANDIDATES MAY STILL BE MANDATORY. PURE.
  *
@@ -1516,8 +1541,11 @@ export const REFERRAL_DEMOTED_REASONS = Object.freeze({
  * panel raising referrals the first never did (and, on #4388, one the fixer had already fixed), so the PR went back to
  * "ruling needed" and never reached the operator. Against the PR's finding-identity table (#76a, `identity`: one row
  * per known finding with the heads it was referred on and its rulings) each candidate is exactly one of:
- *   - `covered`  — the same finding (identity, never wording or line) is already referred on THIS head. It is already
- *                  awaiting or holding its ruling; referring it again is the duplicate that re-parked the PR.
+ *   - `covered`  — the same finding is already referred on THIS head: it binds by identity AND an active referral on this
+ *                  head holds the identical claim ({@link exactClaimKey}; a different claim sharing a quote anchor is a
+ *                  different defect, and a drifted line number of the same claim is not). It is already awaiting or
+ *                  holding its ruling; referring it again is the duplicate that re-parked the PR. A re-wording of a
+ *                  claim is deliberately NOT covered: it is referred again (the safe direction, an extra ruling).
  *   - `demoted`  — to a card suggestion, never a ruling owed: (a) it is new on a head whose referral round has FINISHED
  *                  (`openHeads` does not name it) and came from an ADVISORY lens: it was first raised in a later round
  *                  of an unchanged head. A gate lens (`mandatoryLenses`: correctness, security) is never silenced
@@ -1553,12 +1581,26 @@ export function classifyReferralsByRound(candidates, { identity = [], head = nul
     ? latestFix.files : null;
   const out = { kept: [], covered: [], demoted: [] };
   for (const candidate of list) {
-    const id = bindFindingIds([candidate.original], table, { sameHead: headHasReferrals, ignoreLens: true })[0];
-    const entry = id ? table.find((e) => e.findingId === id) : null;
-    // Covered means an ACTIVE referral on this head holds the finding: one the sink retired as dropped (its seat was
-    // disabled) awaits no ruling, so a re-raise of it must not vanish into "covered".
-    if (entry && head && (entry.activeHeads ?? entry.heads ?? []).includes(head)) { out.covered.push(candidate); continue; }
-    if (entry) {
+    // EVERY entry the identity binds (the table keeps same-path, same-anchor findings of different lenses apart, so
+    // the first bound entry may hold another claim while a later one holds this exact claim): prefer one an active
+    // referral on this head holds.
+    const candidateIdentity = normalizeFindingIdentity(candidate.original);
+    const bound = candidateIdentity ? table.filter((e) => (e.forms ?? [e]).some((form) => sameFindingIdentity({ ...e, ...form }, candidateIdentity,
+      { sameHead: headHasReferrals, ignoreLens: true }))) : [];
+    const activeHere = (e) => Boolean(head) && (e.activeHeads ?? e.heads ?? []).includes(head);
+    const isBlocked = (e) => [...(e.rulings ?? []), ...(e.operatorRulings ?? [])].some((r) => r.result === 'block');
+    const entry = bound.find(activeHere) ?? bound.find(isBlocked) ?? bound[0] ?? null;
+    // Covered means an ACTIVE referral on this head holds THIS finding: one the sink retired as dropped (its seat was
+    // disabled) awaits no ruling, so a re-raise of it must not vanish into "covered". And "this finding" is the same
+    // CLAIM, not merely the same #76a identity: that identity also binds on a shared quote anchor (and here ignores the
+    // lens), which cannot tell a re-wording from a different defect quoting the same line — the reason the carry code
+    // adds `sameInstanceForCarry`. `covered` takes the candidate out of the referrals AND the verdict basis, so a wrong
+    // match silently skips a gate finding; a missed match only refers the finding once more. Within one unchanged head
+    // the code is identical, so a same claim at a drifted line is still the same defect: no line test, unlike the carry.
+    if (head && bound.some((e) => coveredByActiveClaim(e, head, candidate.original))) { out.covered.push(candidate); continue; }
+    // An entry an active referral on THIS head holds under a DIFFERENT claim (the shared-anchor look-alike) is not a
+    // re-raise of that finding: it is a new finding on this head and takes the round rule below like any other.
+    if (entry && !activeHere(entry)) {
       // A block ruling is either a reviewer's (carried on the referral record) or the operator's (#4979, a separate
       // comment the caller folds in as `operatorRulings`).
       const blocked = [...(entry.rulings ?? []), ...(entry.operatorRulings ?? [])].some((r) => r.result === 'block');

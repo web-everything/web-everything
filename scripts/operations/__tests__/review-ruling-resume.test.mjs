@@ -35,8 +35,8 @@ const recordFor = (head, original, rulings = []) => {
     referrals: [{ key, seat: 'judge', original, finding: normalizeFinding(original) }],
     rulings: rulings.map((result, i) => ({ id: `r${i}`, key, reviewerId: reviewer.id, lens: reviewer.lens, result, rationale: 'x', evidence: ['e'] })) };
 };
-const identityOf = (...records) => findingIdentityTable(records).map(({ findingId, path, lens, normSummary, anchor, forms, heads, rulings }) => ({
-  findingId, path, lens, normSummary, anchor, forms, heads, rulings: rulings.map(({ head, result }) => ({ head, result })) }));
+const identityOf = (...records) => findingIdentityTable(records).map(({ findingId, path, lens, normSummary, anchor, forms, heads, activeInstances, rulings }) => ({
+  findingId, path, lens, normSummary, anchor, forms, heads, activeInstances, rulings: rulings.map(({ head, result }) => ({ head, result })) }));
 const candidate = (original) => ({ seat: 'judge', original });
 
 describe('classifyReferralsByRound — referrals follow the later-round scoping rule (#3999)', () => {
@@ -472,6 +472,19 @@ describe('classifyReferralsByRound — a block-ruled re-raise is demoted only on
       { identity: identityOf(recordFor(HEAD_1, finding(SRC), ['block'])), head: HEAD_2, latestFix: fix({ [SRC]: [100] }) });
     expect(out.kept).toHaveLength(1);
   });
+  // PR #4441 review round 3 (codex-correctness, CONFIRMED): the test above names no lens, so the gate-lens default keeps the
+  // finding whatever the missing-line guard does. An ADVISORY seat is the only path that reaches the guard, and a changed
+  // line of 1 sits inside the window if a missing line were ever coerced to 0 — so this reddens on removing the guard.
+  it.each([undefined, null, 0, '', 'x'])('an advisory seat re-raising with no usable cited line (%j) stays mandatory, with a cited-line positive control', (line) => {
+    const identity = identityOf(recordFor(HEAD_1, finding(SRC), ['block']));
+    const noLine = classifyReferralsByRound([candidate({ ...finding(SRC), line })],
+      { identity, head: HEAD_2, lens: 'simplicity', latestFix: fix({ [SRC]: [1] }) });
+    expect(noLine.demoted).toEqual([]);
+    expect(noLine.kept).toHaveLength(1);
+    const cited = classifyReferralsByRound([candidate({ ...finding(SRC), line: 2 })],
+      { identity, head: HEAD_2, lens: 'simplicity', latestFix: fix({ [SRC]: [1] }) });
+    expect(demoted(cited)).toEqual([REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE]);
+  });
   it('resolves an aliased citation (basename / repo prefix) to the touched path like #3999 does', () => {
     const out = classifyReferralsByRound([candidate({ ...finding('thing.mjs') })],
       { identity: identityOf(recordFor(HEAD_1, finding('thing.mjs'), ['block'])), head: HEAD_2, latestFix: fix({ [SRC]: [101] }), lens: 'simplicity' });
@@ -526,6 +539,53 @@ describe('classifyReferralsByRound — "covered" means an ACTIVE referral holds 
   it('the same finding with a live referral is covered', () => {
     const out = classifyReferralsByRound([candidate(finding)], { identity: findingIdentityTable([record(false)]), head: HEAD_1, lens: 'correctness' });
     expect(out.covered).toHaveLength(1);
+  });
+});
+
+// PR #4441 review round 3 (security, PLAUSIBLE): `covered` takes a finding out of the referrals AND the verdict basis, so
+// it must hold only for the SAME defect already referred on this head. The #76a identity also binds on a shared quote
+// anchor, which cannot tell a re-wording from a different defect quoting the same line (the carry code says so).
+describe('classifyReferralsByRound — "covered" needs the same claim, not just a shared quote anchor (PR #4441 review round 3)', () => {
+  const quote = 'if (items.length === 0) return null;';
+  const first = { file: 'scripts/lib/thing.mjs', line: 11, category: 'security/security', summary: 'The guard on an empty list is missing',
+    quote, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+  const other = { ...first, line: 12, category: 'correctness/logic', summary: 'The null return is dereferenced by the caller and crashes',
+    failure_scenario: 'a caller passes []' };
+  const identity = identityOf(recordFor(HEAD_1, first));
+  it.each(['correctness', 'security', 'simplicity', undefined])('a DIFFERENT defect on the same path and quote anchor is not covered (%j lens)', (lens) => {
+    const out = classifyReferralsByRound([candidate(other)], { identity, head: HEAD_1, lens });
+    expect(out.covered).toEqual([]);
+    // the fix target: it is never silently dropped — a gate lens keeps it as a referral
+    if (lens !== 'simplicity') expect(out.kept).toEqual([candidate(other)]);
+    // an advisory seat's look-alike is a new finding in a later round: a card suggestion, like any other
+    else expect(out.demoted.map((d) => d.reason)).toEqual([REFERRAL_DEMOTED_REASONS.LATER_ROUND_SAME_HEAD]);
+  });
+  it('a templated claim differing only in its :line reference is a DIFFERENT defect: not covered', () => {
+    const templated = { ...first, line: 10, summary: 'Unescaped user value reaches exec at a.mjs:10' };
+    const out = classifyReferralsByRound([candidate({ ...templated, line: 200, summary: 'Unescaped user value reaches exec at a.mjs:200' })],
+      { identity: identityOf(recordFor(HEAD_1, templated)), head: HEAD_1, lens: 'security' });
+    expect(out.covered).toEqual([]);
+    expect(out.kept).toHaveLength(1);
+  });
+  it('the SAME claim re-worded only in case, quoting, whitespace or punctuation, at a drifted line, is still covered', () => {
+    for (const summary of ['the guard on an empty list is missing.', 'The guard  on an empty\nlist is `missing`', 'The guard on an empty list is missing']) {
+      const out = classifyReferralsByRound([candidate({ ...first, line: 40, summary })], { identity, head: HEAD_1, lens: 'security' });
+      expect(out.covered).toHaveLength(1);
+      expect(out.kept).toEqual([]);
+    }
+  });
+  it('finds the exact claim on a LATER entry when an earlier same-anchor entry (another lens) holds a different claim', () => {
+    // the table keeps different lenses apart, so both bind through the lens-blind match: the first must not shadow the second
+    const both = identityOf(recordFor(HEAD_1, first), recordFor(HEAD_1, other));
+    expect(both).toHaveLength(2);
+    const out = classifyReferralsByRound([candidate(other)], { identity: both, head: HEAD_1, lens: 'correctness' });
+    expect(out.covered).toEqual([candidate(other)]);
+    expect(out.kept).toEqual([]);
+  });
+  it('an exact-claim match on ANOTHER head does not cover this one', () => {
+    const out = classifyReferralsByRound([candidate(first)], { identity: identityOf(recordFor(HEAD_1, first), recordFor(HEAD_2, { ...other, category: first.category })), head: HEAD_2, lens: 'security' });
+    expect(out.covered).toEqual([]);
+    expect(out.kept).toHaveLength(1);
   });
 });
 
