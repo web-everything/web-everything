@@ -2,11 +2,12 @@
 bornAs: xpd70wx
 kind: story
 size: 3
-status: active
+status: resolved
 scaffoldedBy: "open-pr-org-token"
 dateScaffolded: "2026-10-08"
 scope: ["we:scripts/operations/open-pr-io.mjs", "we:scripts/lib/gh-app-shim.mjs", "we:scripts/operations/__tests__/open-pr-io-org-shim.test.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-08"
 tags: []
 ---
 
