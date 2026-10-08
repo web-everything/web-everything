@@ -119,7 +119,7 @@ describe('planOpen — the home\'s rules as a pre-flight, and nothing more', () 
   it('does NOT re-decide the lane-verification gate — that has one home', () => {
     const plan = planOpen(good());
     expect(Object.keys(plan).sort())
-      .toEqual(['argv', 'base', 'bodyFile', 'dryRun', 'mode', 'parkLabel', 'ref', 'requireVerified', 'sha', 'title']);
+      .toEqual(['actor', 'argv', 'base', 'bodyFile', 'dryRun', 'mode', 'operatorInstruction', 'parkLabel', 'ref', 'requireVerified', 'sha', 'skipPrePrReview', 'title']);
     // No marker, no verdict, no gate decision — only the caller's own request, echoed back.
     expect(plan.requireVerified).toBe(false);
     expect(JSON.stringify(plan)).not.toMatch(/marker|break-glass|verifyGate/i);
@@ -459,6 +459,7 @@ describe('the io shell — one spawn of the home, and no second route', () => {
   it('spawns pr-land.mjs with the planned argv and --json', () => {
     const calls = [];
     const run = createPrLandRunner({
+      prePrReview: () => ({ action: 'pass' }),
       spawn: (cmd, argv) => { calls.push(argv); return { status: 0, stdout: JSON.stringify({ pr: 7, url: 'u' }) }; },
     });
     expect(run({ argv: ['--ref=lane/x'] })).toMatchObject({ outcome: 'opened', pr: 7 });
@@ -624,7 +625,7 @@ describe('items 79/81 — truthful label-on-green outcome, credential env, --bra
     const env = resolveGhCredentialEnv({ env: { PATH: '/usr/bin' }, build: () => null, exists: () => true });
     expect(env.PATH).toMatch(/gh-shim:\/usr\/bin$/);
     let seen;
-    createPrLandRunner({ env, spawn: (_n, _a, o) => { seen = o.env; return { status: 0, stdout: '{"pr":1}' }; } })({ argv: ['--ref=lane/x'] });
+    createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), env, spawn: (_n, _a, o) => { seen = o.env; return { status: 0, stdout: '{"pr":1}' }; } })({ argv: ['--ref=lane/x'] });
     expect(seen.PATH).toBe(env.PATH);
   });
 

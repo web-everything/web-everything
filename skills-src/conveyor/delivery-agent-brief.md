@@ -295,7 +295,7 @@ Invoke `/converge` (or drive `we:scripts/converge-cli.mjs` directly, per its `SK
 absolute root** — never the primary checkout:
 
 ```bash
-STATE=<somewhere inside $LANE, e.g. $LANE/.converge-state.json>   # keep this path for the whole run
+STATE=$LANE/.converge-state.json   # keep this path for the whole run; a `.converge-*` name at the lane root, never committed
 node scripts/converge-cli.mjs init --lane="$LANE" --state="$STATE" --care=elevated \
   --goal="<one sentence from #2969's lead paragraph — what this lane's work is trying to do>"
 ```
@@ -309,7 +309,20 @@ node scripts/converge-cli.mjs init --lane="$LANE" --state="$STATE" --care=elevat
   panel size, or a ledger yourself — that is exactly the un-bounded prose loop this step replaces.
 - **`land`** — a non-author panel accepted the final diff and an independent red-team failed to break it;
   proceed to the PR.
-- **This step stays ADVISORY — an `escalate` never blocks PR-open.** Blocking would gate every drain lane,
+- **RISKY code PRs MUST have a receipt — `open-pr` refuses without one** (`prePrReview.mode` in
+  `we:scripts/pre-pr-review-settings.json`: `off`|`advise`|`enforce`; this repo is `advise` until the hardening card lands, then `enforce`). A PR is risky when
+  ANY of: more than 264 lines, more than 2 subsystems, more than 5 files, no prepared card in the diff, or an
+  operator-agent builder. A card-only PR, or a small prepared conveyor PR, is unaffected. **Run `/converge`
+  WHILE the step-5 verify is running** (the verify wait is 4-9 minutes anyway), fix its findings in this session,
+  commit, then on the final committed head stamp the receipt:
+  `node scripts/converge-cli.mjs receipt --lane="$LANE" --state="$STATE"` (it only stamps a run that ended in `land`,
+  for the SAME lane and the exact content that run reviewed, on a clean tracked tree; untracked `.converge-*` scratch at the lane root (the state file) and the scratch files this brief names (`.commit-msg.txt`, `.pr-body*.md`) are ignored — never `git add` them: commit what the panel read —
+  anything committed after it, or a state file from another lane, is refused; re-run `/converge`). The receipt also records the merge-base the panel diffed against (`init --base-ref`, default `origin/main`), and `open-pr` refuses the same head opened against a different base. An empty or unparseable diff counts as risky, never as card-only, and the lane's own `.gitattributes` cannot change the line count (this needs git 2.40 or newer; an older git makes the check error, which `open-pr` refuses). A code file git calls binary (a planted NUL byte) is gated; image, font and PDF assets are not. The gate fails
+  closed: if its own check errors (or returns no usable decision) in `enforce` mode, `open-pr` refuses rather
+  than admits, and a missing or broken settings file counts as `enforce`. It stops honest mistakes, not a hostile worker who writes the state or receipt file
+  by hand. This ADDS to the post-PR review gate; it
+  never replaces it. A bypass is `--skipPrePrReview=<reason> --actor=<name> --operatorInstruction="<quoted operator instruction>"` on `open-pr`, interactive sessions only (a dispatched worker is refused, which stops an honest mistake — the check trusts the `WE_CONVEYOR_WORKER` marker and the supplied `--actor`, so it does not stop a worker who unsets the marker on purpose); it is recorded in the PR body and `.operations/pre-pr-bypass/<day>.jsonl`.
+- **Outside that gate this step stays ADVISORY — an `escalate` never blocks PR-open.** Blocking would gate every drain lane,
   doc-only lane, and the lane shipping this very change (the reason #2971 dropped its `pr-land` refusal).
   `escalate` is **terminal for this run** — the core already spent its round budget resolving what it could
   before landing on it, so do not hand-invoke another `init`/`step` cycle hoping for a different answer. On

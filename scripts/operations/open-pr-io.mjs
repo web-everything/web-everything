@@ -19,7 +19,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { classifySubmit } from './open-pr.mjs';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir, homedir } from 'node:os';
 import { buildGhShimSettingsEnv, defaultShimDir, ghShimPathOverride, shimGhPath } from '../lib/gh-app-shim.mjs';
 
 /**
@@ -52,6 +53,7 @@ export function resolveGhCredentialEnv({ env = process.env, exists = existsSync,
   }
   return env;
 }
+import { checkPrePrReview, loadPrePrSettings, renderBypassNote, codeSpan } from '../lib/pre-pr-review.mjs';
 import { prepareItemFromRef, preparePrTitle, verifyPreparePr } from './prepare-pr.mjs';
 
 /** The single home. Resolved from THIS file's location, never cwd — the lane being opened is not this repo. */
@@ -61,22 +63,81 @@ export const PR_LAND_CLI = join(dirname(fileURLToPath(import.meta.url)), '..', '
 export const OPEN_PR_TIMEOUT_MS = 30 * 60 * 1000;
 
 /**
+ * Appends the recorded bypass (reason, actor, quoted operator instruction — each rendered as a single-line code
+ * span) to a COPY of the PR body file. FAILS CLOSED: a bypass whose PR-body note cannot be written throws, so the
+ * caller refuses it rather than opening a PR whose body does not record the bypass. `cleanup` removes the copy.
+ */
+function withBypassInBody(argv, b) {
+  const i = argv.findIndex((a) => a.startsWith('--body-file='));
+  if (i < 0) throw new Error('the request has no --body-file, so the bypass cannot be recorded in the PR body');
+  const dir = mkdtempSync(join(tmpdir(), 'open-pr-bypass-'));
+  const cleanup = () => rmSync(dir, { recursive: true, force: true });
+  try {
+    const out = join(dir, 'body.md');
+    // pr-land expands a leading `~` in --body-file; read the same file it will.
+    writeFileSync(out, readFileSync(argv[i].slice('--body-file='.length).replace(/^~/, homedir()), 'utf8') + renderBypassNote(b));
+    return { argv: argv.map((a, j) => (j === i ? `--body-file=${out}` : a)), cleanup };
+  } catch (e) { cleanup(); throw e; }
+}
+
+/** The decisions a gate may return; anything else (null, `{}`, a typo'd action) is a check error, never a pass. */
+const GATE_ACTIONS = Object.freeze(['pass', 'advise', 'refuse']);
+
+/** The gate when its own check threw (or returned no usable decision): enforce fails CLOSED (refuse); advise/off
+ *  proceed, loudly. If even the mode cannot be read here, that too is a refusal — this path never throws. */
+function failedGate(e, loadSettings) {
+  // the error text can embed agent-supplied argv (`--sha=…`), so it is rendered as an inert one-line span
+  const cause = codeSpan(e && e.message ? e.message : e, 300);
+  let mode;
+  try { mode = loadSettings()?.settings?.mode; } catch (se) {
+    return { action: 'refuse', why: 'check-error', reason: 'pre-pr-review-error', message: `the pre-PR review check itself failed (${cause}) and its mode could not be read (${codeSpan(se && se.message ? se.message : se, 300)}) — refusing (fail closed).` };
+  }
+  const message = `the pre-PR review check itself failed (${cause}); prePrReview.mode is ${codeSpan(mode, 40)}`;
+  // Only an explicit advise/off proceeds; enforce, a missing mode or an unknown one refuses.
+  return mode === 'advise' || mode === 'off'
+    ? { action: 'advise', why: 'check-error', message }
+    : { action: 'refuse', why: 'check-error', reason: 'pre-pr-review-error', message: `${message} — refusing (fail closed). Fix the cause and open the PR again.` };
+}
+
+/**
  * The runner the declaration is injected with. ONE spawn; `spawn` is injected so every branch of
  * `classifySubmit` is reachable with no `gh`, no network and no PR.
  */
-export function createPrLandRunner({ spawn = spawnSync, cwd = process.cwd(), env = resolveGhCredentialEnv(),
+export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(), env = resolveGhCredentialEnv(),
   git = (args) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }),
 } = {}) {
-  return ({ argv }) => {
+  return ({ argv, skipPrePrReview = '', actor = '', operatorInstruction = '' }) => {
     let r;
+    let cleanupBody = () => {}; // removes the temp PR-body copy a bypass writes; called on every path out
     const arg = (name) => argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
-    const item = prepareItemFromRef(arg('ref'));
+    // Pre-PR review gate (card 2): ADDED before the home's own gates, never instead of them (the post-PR review
+    // gate and the verify finish-guard still run inside pr-land). A rehearsal opens nothing, so it is not gated.
+    // Any failure of the check is mode-aware (`failedGate`): enforce refuses, it never silently admits.
+    if (!argv.includes('--dry-run')) {
+      let gate;
+      try {
+        gate = prePrReview({ cwd, base: arg('base') || 'main', sha: arg('sha') || 'HEAD', env, skip: skipPrePrReview, actor, operatorInstruction });
+        if (!gate || !GATE_ACTIONS.includes(gate.action)) throw new Error(`the check returned no usable decision (action: ${JSON.stringify(gate?.action)})`);
+      } catch (e) { gate = failedGate(e, loadSettings); }
+      if (gate.settingsError) process.stderr.write(`open-pr: WARNING — ${gate.settingsError}\n`);
+      if (gate.action === 'refuse') return { outcome: 'refused', reason: gate.reason || 'pre-pr-review-missing', detail: gate.message };
+      // Gate and push are bound to the SAME commit: pr-land publishes exactly the sha the gate judged.
+      if (gate.sha) argv = [...argv.filter((a) => !a.startsWith('--sha=')), `--sha=${gate.sha}`];
+      if (gate.bypass) {
+        try { ({ argv, cleanup: cleanupBody } = withBypassInBody(argv, gate.bypass)); }
+        catch (e) { return { outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: `bypass refused — ${e.message}` }; }
+      }
+      if (gate.action === 'advise') process.stderr.write(`open-pr: advisory — ${gate.message}\n`);
+    }
+    let item;
+    try { item = prepareItemFromRef(arg('ref')); } catch (e) { cleanupBody(); throw e; }
     if (item) {
       try {
         const sha = verifyPreparePr({ item, source: arg('sha') || 'HEAD', base: arg('base') || 'main', git });
         argv = argv.filter((a) => !a.startsWith('--title=') && !a.startsWith('--sha='));
         argv.push(`--title=${assertMachineTitle(preparePrTitle(item, readMainCard(item, git)))}`, `--sha=${sha}`);
       } catch (e) {
+        cleanupBody();
         return { outcome: 'refused', reason: String(e.message || e) };
       }
     }
@@ -86,6 +147,8 @@ export function createPrLandRunner({ spawn = spawnSync, cwd = process.cwd(), env
       });
     } catch (e) {
       r = { error: e };
+    } finally {
+      cleanupBody();
     }
     return classifySubmit(r ?? {});
   };
@@ -99,7 +162,7 @@ export function createPrLandRunner({ spawn = spawnSync, cwd = process.cwd(), env
 export function createOpenPrSinks({ run = createPrLandRunner() } = {}) {
   return {
     ['open-pr.submit']: async (payload) => {
-      const out = run({ argv: payload.argv });
+      const out = run({ argv: payload.argv, skipPrePrReview: payload.skipPrePrReview, actor: payload.actor, operatorInstruction: payload.operatorInstruction });
       // A REQUESTED `--dry-run` classifies as `unrun` too (it opens nothing, by design), but it is not the
       // "environment could not complete" case this throw exists for — the caller asked for a rehearsal and
       // got one. Throwing here misreports a working preview as a failure (found dogfooding this operation's

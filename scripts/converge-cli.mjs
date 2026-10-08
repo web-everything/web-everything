@@ -47,6 +47,7 @@ import {
   applyJurorInvite,
   buildEscalationPacket,
 } from './lib/converge-core.mjs';
+import { gitDirOf, treeOf, workingTreeOf, mergeBaseWithRef, buildReceipt, RECEIPT_FILE, isScratchPath, GIT_TIMEOUT_MS } from './lib/pre-pr-review.mjs';
 import { resolveTransport, validateLaneTarget } from './lib/converge-transports.mjs';
 import { MANDATORY_LENSES, PANEL_LENSES, panelRigorForCareLevel } from './lib/jury-core.mjs';
 import { CARE_LEVELS } from './lib/review-escalation.mjs';
@@ -130,10 +131,57 @@ function readObservations(flags) {
 /** Read-only git at an explicit root. Returns null rather than throwing — the caller decides what absence means. */
 function gitAt(root, args) {
   try {
-    return execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: GIT_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 });
   } catch {
     return null;
   }
+}
+
+/** The working-tree hash at the moment a READ is issued (the content `readMaterial` shows the panel); null on error. */
+function readTreeOf(laneRoot) {
+  try { return workingTreeOf(laneRoot); } catch { return null; }
+}
+
+/** The BASE a READ is issued against: the resolved merge-base SHA of HEAD with the run's `baseRef`, taken at the same
+ *  moment as the tree. A symbolic ref (`origin/main`) can move afterwards, so the receipt binds to this pinned SHA and
+ *  never to one recomputed at issuance. Null when it cannot be computed (the receipt then refuses). */
+function readBaseOf(laneRoot, baseRef) {
+  try { return baseRef ? mergeBaseWithRef({ cwd: laneRoot, ref: baseRef, sha: 'HEAD' }) : null; } catch { return null; }
+}
+
+/** Everything a READ pins about what the panel is shown — the tree AND the base — so every site that issues a READ
+ *  records both together and a later `land` can bind to them. `prevBase` is the base the run already pinned: a later
+ *  READ may only move it FORWARD (the previous base is an ancestor of the new one, so the diff only narrows). A base
+ *  that rolled back, or moved sideways, would widen the diff after round 1 with the later rounds told to judge only
+ *  the last fix — so the earlier pin is kept, the panel keeps reading against it, and `receipt` then refuses the
+ *  moved ref. A READ that cannot compute a base keeps the previous pin too (the receipt's recompute then fails). */
+function readSnapshotOf(ctx, prevBase = null) {
+  const fresh = readBaseOf(ctx?.laneRoot, ctx?.baseRef);
+  let readBase = fresh;
+  if (prevBase && prevBase !== fresh) {
+    let forward = false;
+    // `merge-base <fresh> <prev>` equals `prev` exactly when `prev` is an ancestor of `fresh`.
+    try { forward = !!fresh && mergeBaseWithRef({ cwd: ctx?.laneRoot, ref: fresh, sha: prevBase }) === prevBase; } catch { forward = false; }
+    if (!forward) readBase = prevBase;
+  }
+  return { readTree: readTreeOf(ctx?.laneRoot), readBase };
+}
+
+/** The ctx a READ's material is rendered from: `baseRef` replaced by the SHA that READ pinned, so the panel diffs
+ *  against exactly the base the receipt binds to — never a symbolic ref that can move before the command runs. */
+function pinnedCtx(ctx, readBase) {
+  return readBase ? { ...ctx, baseRef: readBase } : ctx;
+}
+
+/** What a landed run reviewed: the lane's real path + the tree and base the panel last READ — recorded only if the
+ *  lane is still exactly that content now (an edit between the last read and the land is not reviewed content). Null
+ *  when the content cannot be proven — `receipt` then refuses to stamp this run. `base` is `''` when the READ could
+ *  not pin one; `receipt` refuses that with its own message. */
+function reviewedContent(laneRoot, readTree, readBase) {
+  try {
+    const now = workingTreeOf(laneRoot);
+    return readTree && now === readTree ? { lane: realpathSync(laneRoot), tree: readTree, base: readBase || '' } : null;
+  } catch { return null; }
 }
 
 /**
@@ -145,7 +193,7 @@ function laneChangedFiles(root, baseRef) {
   const mergeBase = (gitAt(root, ['merge-base', 'HEAD', baseRef]) || '').trim();
   const tracked = mergeBase ? (gitAt(root, ['diff', '--name-only', mergeBase]) || '') : '';
   const untracked = gitAt(root, ['ls-files', '--others', '--exclude-standard']) || '';
-  return [...new Set(`${tracked}\n${untracked}`.split('\n').map((s) => s.trim()).filter(Boolean))];
+  return [...new Set(`${tracked}\n${untracked}`.split('\n').map((s) => s.trim()).filter(Boolean))].filter((p) => !isScratchPath(p) || tracked.split('\n').includes(p));
 }
 
 /**
@@ -294,6 +342,7 @@ function init(flags) {
     roster: plan.lenses,
     dialOverrides: dial.overrides,
     state,
+    ...readSnapshotOf(ctx), // the tree + base the first READ will show; `step` refreshes both on every later READ
   };
   writeState(outPath, envelope);
 
@@ -309,7 +358,7 @@ function init(flags) {
     mandatoryLenses: state.mandatoryLenses,
     dialOverrides: dial.overrides,
     changedFiles,
-    read: resolved.transport.readMaterial(ctx),
+    read: resolved.transport.readMaterial(pinnedCtx(ctx, envelope.readBase)),
   }, null, 2)}\n`);
 }
 
@@ -355,14 +404,19 @@ function step(flags) {
   // confidence, because the only shipped caller could not reach it.
   if (Object.prototype.hasOwnProperty.call(input, 'inviteEcho') && input.invite) {
     const applied = applyJurorInvite(state, input.inviteEcho, input.invite);
-    writeState(path, { ...envelope, state: applied.state, carry: carryFor(applied.state.round, carriedFindings) });
+    // Every READ records the tree it shows — this one too — so a later `land` binds to what the panel re-read.
+    const snap = applied.action === CONVERGE_ACTIONS.READ ? readSnapshotOf(envelope.ctx, envelope.readBase) : null;
+    writeState(path, {
+      ...envelope, state: applied.state, carry: carryFor(applied.state.round, carriedFindings),
+      ...(snap ?? {}),
+    });
 
     // A REJECTED invite falls through to an editor round on the SAME round — so this call must hand back the
     // editor prompt, or the caller is told to `edit` with nothing to run. That needs the round's findings, which
     // is why the caller carries them into an invite step alongside the echo.
     const instruction = {};
     if (applied.action === CONVERGE_ACTIONS.READ) {
-      instruction.read = resolved.transport.readMaterial(envelope.ctx);
+      instruction.read = resolved.transport.readMaterial(pinnedCtx(envelope.ctx, snap.readBase));
     } else if (applied.action === CONVERGE_ACTIONS.EDIT) {
       instruction.edit = resolved.transport.applyRevision({
         findings: carriedFindings,
@@ -401,12 +455,21 @@ function step(flags) {
   });
 
   const result = convergeStep(state, obs);
-  writeState(path, { ...envelope, state: result.state, carry: carryFor(result.state.round, result.findings) });
+  // `final` records HOW the loop ended (land | escalate) so `receipt` can refuse anything but a landed run.
+  // A landed run also records WHAT it reviewed (the lane's real path and its working-tree hash — the exact content
+  // the panel read), so `receipt` can refuse a different lane or content committed after the review.
+  const snap = result.action === CONVERGE_ACTIONS.READ ? readSnapshotOf(envelope.ctx, envelope.readBase) : null;
+  writeState(path, {
+    ...envelope, state: result.state, carry: carryFor(result.state.round, result.findings),
+    ...(snap ?? {}),
+    ...(result.state.done ? { final: result.action } : {}),
+    ...(result.state.done && result.action === CONVERGE_ACTIONS.LAND ? { reviewed: reviewedContent(envelope.ctx?.laneRoot, envelope.readTree, envelope.readBase) } : {}),
+  });
 
   /** Build the caller's next instruction — the ONE place an action becomes something to run. */
   const instruction = {};
   if (result.action === CONVERGE_ACTIONS.READ) {
-    instruction.read = resolved.transport.readMaterial(envelope.ctx);
+    instruction.read = resolved.transport.readMaterial(pinnedCtx(envelope.ctx, snap.readBase));
   } else if (result.action === CONVERGE_ACTIONS.PANEL) {
     instruction.panel = panelInstruction(result.state, envelope, material);
   } else if (result.action === CONVERGE_ACTIONS.RED_TEAM) {
@@ -451,12 +514,74 @@ function step(flags) {
   }, null, 2)}\n`);
 }
 
+/**
+ * `receipt` — after a converge run ended in `land`, stamp the lane's COMMITTED head tree so `open-pr` can see the
+ * pre-PR review ran on exactly this content (we:scripts/lib/pre-pr-review.mjs). Refuses an unfinished or escalated
+ * run, and a dirty tracked tree (the receipt would not describe what gets pushed).
+ */
+function receipt(flags) {
+  const path = statePath(flags, { mustExist: true });
+  const envelope = readState(path);
+  if (envelope.final !== CONVERGE_ACTIONS.LAND) {
+    return fail(`no receipt: the converge run did not end in \`land\` (final: ${envelope.final ?? 'unfinished'}). Finish the loop first.`);
+  }
+  const lane = typeof flags.lane === 'string' && flags.lane.trim() ? resolve(flags.lane) : envelope.ctx?.laneRoot;
+  if (!lane || !existsSync(lane)) return fail('--lane=<path> is required (or a state file that recorded it)');
+  const dirty = gitAt(lane, ['status', '--porcelain', '--untracked-files=no']);
+  if (dirty === null) return fail(`not a git checkout: ${lane}`);
+  if (dirty.trim()) return fail('no receipt: the lane has uncommitted tracked changes. Commit first, so the receipt covers the head that will be pushed.');
+  // The panel read untracked files too, so any left uncommitted are content the receipt would not cover.
+  // Untracked brief-sanctioned scratch (`.converge-*` state, `.commit-msg.txt`, …) is not reviewed content — see workingTreeOf.
+  // `-z`: the same raw paths `workingTreeOf` matches, so a non-ASCII scratch name is not C-quoted past `isScratchPath`.
+  const others = gitAt(lane, ['ls-files', '--others', '--exclude-standard', '-z']);
+  if (others === null) return fail('no receipt: could not list the lane\'s untracked files (git failed or timed out), so unreviewed content cannot be ruled out.');
+  const leftover = others.split('\0').filter((p) => p && !isScratchPath(p));
+  if (leftover.length) return fail(`no receipt: the lane has untracked files the panel read but the head does not contain (${leftover.slice(0, 3).join(', ')}${leftover.length > 3 ? ', …' : ''}). Commit or delete them, then re-run /converge if the content changed.`);
+  const tree = treeOf(lane);
+  // Bind the receipt to the reviewed run: same lane, same content. (Defence against honest mistakes — reusing an
+  // old landed state file for another lane, or committing more work after the review. It is NOT tamper-proof
+  // against a hostile worker, who can write the state file or the receipt directly.)
+  const reviewed = envelope.reviewed;
+  // `step` writes `reviewed: null` when the lane at land was not the content the panel last read.
+  if (reviewed === null) {
+    return fail('no receipt: the lane\'s content changed between the panel\'s last read and the land (an edit, or a new untracked non-`.converge-*` file, after the READ), so the land reviewed nothing that can be bound. Re-run /converge to a fresh `land`, keeping scratch files named `.converge-*` at the lane root.');
+  }
+  if (!reviewed || !reviewed.lane || !reviewed.tree) {
+    return fail('no receipt: the state file records no reviewed lane/content for its `land` (it predates this check or was not produced by `step`). Re-run /converge to a fresh `land`.');
+  }
+  let realLane = lane;
+  try { realLane = realpathSync(lane); } catch { /* keep the resolved path */ }
+  if (realLane !== reviewed.lane) return fail(`no receipt: this state file's review was of lane ${reviewed.lane}, not ${realLane}.`);
+  if (tree !== reviewed.tree) return fail(`no receipt: the lane's head tree ${tree.slice(0, 12)} is not the content the panel reviewed (${String(reviewed.tree).slice(0, 12)}) — it changed after the review. Re-run /converge over the committed head.`);
+  const head = gitAt(lane, ['rev-parse', 'HEAD']).trim();
+  // Bind the receipt to the BASE the panel READ against — the merge-base SHA pinned at that READ (`reviewed.base`),
+  // never one recomputed now. A symbolic `ctx.baseRef` (`origin/main`) can move between the READ and this issuance
+  // with the head tree unchanged; recomputing would then stamp the NEW base and admit a wider diff than the panel
+  // saw. So the pinned SHA is the receipt's base, and a ref that no longer resolves to it is refused. This also
+  // keeps the same head opened against another base — or a run that reviewed only the tail via
+  // `init --base-ref=<lane commit>` — from admitting: `open-pr` compares this with the PR's own merge-base.
+  const baseRef = envelope.ctx?.baseRef;
+  const base = reviewed.base;
+  if (!base) {
+    return fail('no receipt: the state file records no base for the panel\'s READ (it predates this check, or the base could not be resolved then), so the receipt could not be bound to a base. Re-run /converge with a valid --base-ref.');
+  }
+  let nowBase = '';
+  try { nowBase = baseRef ? mergeBaseWithRef({ cwd: lane, ref: baseRef, sha: head }) : ''; } catch { nowBase = ''; }
+  if (nowBase !== base) {
+    return fail(`no receipt: the base ref ${baseRef ?? '(none recorded)'} moved after the panel read — it diffed against ${String(base).slice(0, 12)}, but the merge-base now resolves to ${nowBase ? nowBase.slice(0, 12) : '(nothing)'}, so the PR diff is no longer the one reviewed. Re-run /converge over the current base.`);
+  }
+  const out = resolve(gitDirOf(lane), RECEIPT_FILE);
+  writeFileSync(out, `${JSON.stringify(buildReceipt({ tree, head, base, envelope }), null, 2)}\n`, 'utf8');
+  process.stdout.write(`${JSON.stringify({ receipt: out, tree, head, base }, null, 2)}\n`);
+}
+
 function main(argv) {
   const subcommand = argv[0];
   const flags = parseFlags(argv.slice(1));
   if (subcommand === 'init') return init(flags);
   if (subcommand === 'step') return step(flags);
-  return fail(`unknown subcommand "${subcommand || ''}" — expected init | step`);
+  if (subcommand === 'receipt') return receipt(flags);
+  return fail(`unknown subcommand "${subcommand || ''}" — expected init | step | receipt`);
 }
 
 try {

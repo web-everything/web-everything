@@ -81,7 +81,7 @@ export function resolveRef({ ref, branch, derive = () => '' } = {}) {
   return derive();
 }
 
-export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = '', requireVerified = false, dryRun = false } = {}) {
+export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = '', requireVerified = false, dryRun = false, skipPrePrReview = '', actor = '', operatorInstruction = '' } = {}) {
   const prepareItem = prepareItemFromRef(ref);
   if (prepareItem) title = preparePrTitle(prepareItem);
   const problems = [];
@@ -170,6 +170,10 @@ export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = ''
     sha: typeof sha === 'string' ? sha.trim() : '',
     requireVerified: requireVerified === true,
     dryRun: dryRun === true,
+    // Consumed by the IO shell's pre-PR review check; never forwarded to pr-land.
+    skipPrePrReview: typeof skipPrePrReview === 'string' ? skipPrePrReview.trim() : '',
+    actor: typeof actor === 'string' ? actor.trim() : '',
+    operatorInstruction: typeof operatorInstruction === 'string' ? operatorInstruction.trim() : '',
     // The exact argv for the home. Exported in the verdict so a caller that must submit through another
     // channel submits what the operation decided rather than something it composed itself.
     argv,
@@ -237,6 +241,10 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
       requireVerified: { type: 'boolean', required: false, default: false },
       // Rehearsal: the home prints the exact gh sequence and executes nothing.
       dryRun: { type: 'boolean', required: false, default: false },
+      skipPrePrReview: { type: 'string', required: false, default: '' },
+      // The bypass is operator-authority only: it needs both of these (see `authoriseBypass`).
+      actor: { type: 'string', required: false, default: '' },
+      operatorInstruction: { type: 'string', required: false, default: '' },
     },
     verdictFrom: 'plan',
 
@@ -246,7 +254,7 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
       // PR #1516's round-1 juror found in `verify`, where the io layer was tested and this layer was not.
       reads: [
         'input.ref', 'input.branch', 'input.base', 'input.title', 'input.bodyFile', 'input.mode', 'input.parkLabel',
-        'input.sha', 'input.requireVerified', 'input.dryRun',
+        'input.sha', 'input.requireVerified', 'input.dryRun', 'input.skipPrePrReview', 'input.actor', 'input.operatorInstruction',
       ],
       fn: (view) => planOpen({
         ref: resolveRef({ ref: view.input.ref, branch: view.input.branch, derive: deriveRef }),
@@ -258,6 +266,9 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
         sha: view.input.sha,
         requireVerified: view.input.requireVerified,
         dryRun: view.input.dryRun,
+        skipPrePrReview: view.input.skipPrePrReview,
+        actor: view.input.actor,
+        operatorInstruction: view.input.operatorInstruction,
       }),
     }),
 
@@ -269,7 +280,7 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
       effects: (view) => [{
         type: SUBMIT_PR_EFFECT,
         idempotent: false,
-        payload: { argv: view.verdict.argv, ref: view.verdict.ref, mode: view.verdict.mode },
+        payload: { argv: view.verdict.argv, ref: view.verdict.ref, mode: view.verdict.mode, skipPrePrReview: view.verdict.skipPrePrReview, actor: view.verdict.actor, operatorInstruction: view.verdict.operatorInstruction },
       }],
     }),
   });
