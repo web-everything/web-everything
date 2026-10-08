@@ -512,7 +512,7 @@ export function isPrCiFailureOwedRerun({
  */
 export function planMainRedRebases({
   candidates = [], mainRedWindows = [], mainLatestCheckRuns = [], maxRebaseRetriesPerSha = DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
-  prScopedChecks = resolvePrScopedChecks(),
+  prScopedChecks = resolvePrScopedChecks(), mainDefectRebaseCap = resolveMainDefectRebaseCap(),
 } = {}) {
   const dispatch = [];
   const refusals = [];
@@ -579,7 +579,7 @@ export function planMainRedRebases({
     const rebaseAttempts = Number.isFinite(c?.rebaseAttemptsForSha) ? c.rebaseAttemptsForSha : 0;
     // xo7mr6l: a main-defect-escalated PR gets ONE refresh per main recovery (knob WE_MAIN_DEFECT_REBASES_PER_SHA).
     const capForPr = mainGreenForCheck && mainDefectEscalationForHead(c?.comments, base.headSha)
-      ? resolveMainDefectRebaseCap() : maxRebaseRetriesPerSha;
+      ? mainDefectRebaseCap : maxRebaseRetriesPerSha;
     if (rebaseAttempts >= capForPr) {
       refusals.push({
         ...base, kind: 'rebase-cap-exhausted', attempts: rebaseAttempts,

@@ -13,20 +13,16 @@ PRs #4368/#4369 sat needs-human after main was repaired: their red fell outside 
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+1. **Executable** — the vitest file `we:scripts/conveyor/__tests__/main-defect-escalation-recovery.test.mjs` fails before this item lands and passes after.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — Escalation comments are read only from trusted marker authors (`isTrustedMarkerAuthor`); a forged comment never matches.
+2. **Truncated reads** — n/a: only comment text and check-run timestamps are read; a missing timestamp compares as not-recovered (refuses).
+3. **Shared state files** — n/a: no shared state file; the only record is the head-scoped PR comment and the rebase-attempt comment.
+4. **Fail closed** — A missing or unparsable timestamp, unread comments, or a PR that already has main's green commit refuses the refresh; the PR falls back to ci-heal.
+5. **Identity scoping** — Escalation is scoped to one head sha; the refresh moves the head so the old escalation stops matching.
+6. **State over time** — One refresh per head by default (`WE_MAIN_DEFECT_REBASES_PER_SHA`, 0 turns it off); a new red on the new head needs a new escalation.
+7. **Who wrote it** — n/a: the escalation author is checked by the shared trusted-author rule.

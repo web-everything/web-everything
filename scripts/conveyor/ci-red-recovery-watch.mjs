@@ -144,7 +144,7 @@ export function buildCandidates(prs, {
       // `isMainLatestCheckGreen` about THIS SAME check on main's own latest completed run. See that function's
       // own docblock.
       failingCheckName: check?.name ?? null,
-      // xo7mr6l — a PR parked `needs-human` may carry a main-defect escalation; only those get a comment read.
+      // xo7mr6l — a PR parked `needs-human` may carry a main-defect escalation; also read comments for these (besides the merge-base-not-green case).
       needsHuman: (pr?.labels ?? []).some((l) => (typeof l === 'string' ? l : l?.name) === 'review-status:needs-human'),
     });
   }

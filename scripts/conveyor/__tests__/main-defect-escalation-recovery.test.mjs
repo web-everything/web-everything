@@ -2,7 +2,7 @@
 // nothing re-ran the PRs. Their red fell OUTSIDE every red-main window (main's run was cancelled) and the merge
 // base was green, so every older recovery path said "own failure". Pins the new, bounded path.
 import { describe, it, expect, vi } from 'vitest';
-import { buildCiHealEscalationComment, mainDefectEscalationForHead } from '../ci-heal-escalation-mark.mjs';
+import { buildCiHealEscalationComment, mainDefectEscalationForHead, latestCiHealEscalationForHead } from '../ci-heal-escalation-mark.mjs';
 import { isMainGreenFixOwed, resolveMainDefectRebaseCap } from '../main-red-recovery.mjs';
 import { sweepCiRedRecovery } from '../ci-red-recovery-watch.mjs';
 
@@ -58,6 +58,8 @@ describe('main-defect escalation recovery', () => {
     const a = run([legacy]);
     expect(a.result.dispatch).toEqual([expect.objectContaining({ prNumber: 4368, kind: 'rebase-onto-main' })]);
     expect(a.refresh).toHaveBeenCalledOnce();
+    // the new head matches no escalation, so the derived review-status:needs-human label drops on the next tag.
+    expect(latestCiHealEscalationForHead([legacy], a.result.applied[0].newCommit)).toBeNull();
     const b = run([own]);
     expect(b.refresh).not.toHaveBeenCalled();
     expect(b.result.refusals[0].kind).toBe('own-failure');
@@ -68,7 +70,10 @@ describe('main-defect escalation recovery', () => {
     expect(resolveMainDefectRebaseCap({})).toBe(1);
     expect(resolveMainDefectRebaseCap({ WE_MAIN_DEFECT_REBASES_PER_SHA: '0' })).toBe(0);
     const r = run([legacy, attempt]);
-    if (r.refresh.mock.calls.length) throw new Error('attempt marker not counted; check marker text');
+    expect(r.refresh).not.toHaveBeenCalled();
     expect(r.result.refusals[0].kind).toBe('rebase-cap-exhausted');
+    // knob 0 = off: refused with no prior attempt; knob 2 allows a second refresh on the same head.
+    expect(run([legacy], { cap: '0' }).refresh).not.toHaveBeenCalled();
+    expect(run([legacy, attempt], { cap: '2' }).refresh).toHaveBeenCalledOnce();
   });
 });
