@@ -3,7 +3,9 @@
  * @description `review.referralDefault=auto-block` (operator ruling 2026-10-08, "keep as setting"). A CONFIRMED
  *   mandatory referral no longer waits for the operator: this pass records a `block` ruling as actor `auto-policy`
  *   (NEVER the operator; the comment says so) through the sanctioned `record-referral-ruling` operation, which
- *   then sends the PR back to the fixer and clears `advisory:ruling-needed`.
+ *   then sends the PR back to the fixer. This pass does not clear `advisory:ruling-needed` itself: the caller
+ *   (`review-hold-reconcile.mjs`) leaves a fully auto-blocked PR out of the label sweep, so the label is never added;
+ *   a stale one from an earlier operator-mode pass is left to that sweep's next run (it is recomputed from live state).
  *
  * What it never does: clear, accept or card anything (`auto-policy` can only rule `block`); touch `review:human`
  * (operator-only); rule a finding the reviewer marked a judgment call (taste or policy); or rule a DISPUTE (a
@@ -29,7 +31,9 @@ export const isJudgmentCall = (finding) => finding?.judgmentCall === true;
 
 /**
  * PURE: which findings of this PR the policy rules, and which stay for the operator.
- * @returns {{block: object[], operator: object[], mode: 'all-open'|'per-finding'}|null} null = nothing to do.
+ * @returns {{block: object[], operator: object[]}|null} null = nothing to do. The ruling names each finding by its exact
+ *   key (never `all-open`, which would also sweep disputes, judgment calls and unattempted findings, or anything that
+ *   arrived after the listing was read).
  */
 export function planAutoBlock(pr, { mode = 'operator', cardReadable = (ref) => referralCardReadable(ref, REPO_ROOT),
   isJudgment = isJudgmentCall, humanAt } = {}) {
@@ -46,7 +50,7 @@ export function planAutoBlock(pr, { mode = 'operator', cardReadable = (ref) => r
   const operator = [...need.findings.filter((f) => f.reason !== 'pending' || disputed.has(f.key)), ...pending.filter(isJudgment)];
   const block = pending.filter((f) => !isJudgment(f));
   if (!block.length) return null;
-  return { head: need.head, block, operator, mode: block.length === pending.length ? 'all-open' : 'per-finding' };
+  return { head: need.head, block, operator };
 }
 
 const defaultRunRuling = (args) => execFileSync(process.execPath, [resolve(REPO_ROOT, 'scripts/operations/run.mjs'), 'record-referral-ruling', ...args],
@@ -60,10 +64,10 @@ export function autoBlockArgs({ repo, pr, finding }) {
 
 /**
  * Auto-block every open PR whose confirmed referrals await a ruling. Returns one entry per PR touched; the caller
- * skips those PRs in the `advisory:ruling-needed` sweep (their label would be stale until the next listing).
+ * skips those PRs in the `advisory:ruling-needed` sweep ONLY when `operatorKept` is 0 (nothing left for the operator).
  * @returns {Array<{num:number, action:'auto-blocked'|'failed', findings:number, operatorKept:number, error?:string}>}
  */
-export function sweepAutoBlock({ repo, resolveRepo = () => repo, listPrs, settings = resolveReviewSettings(), runRuling = defaultRunRuling,
+export function sweepAutoBlock({ repo, resolveRepo, listPrs, settings = resolveReviewSettings(), runRuling = defaultRunRuling,
   dryRun = false, ...planOpts } = {}) {
   if (settings.referralDefault !== 'auto-block') return [];
   const results = [];
@@ -74,8 +78,7 @@ export function sweepAutoBlock({ repo, resolveRepo = () => repo, listPrs, settin
     const entry = { num: pr.number, action: 'auto-blocked', findings: plan.block.length, operatorKept: plan.operator.length };
     if (!dryRun) {
       try {
-        const selections = plan.mode === 'all-open' ? ['all-open'] : plan.block.map((f) => f.key);
-        for (const finding of selections) runRuling(autoBlockArgs({ repo: repo ?? resolveRepo(), pr: pr.number, finding }));
+        for (const f of plan.block) runRuling(autoBlockArgs({ repo: repo ?? resolveRepo?.(), pr: pr.number, finding: f.key }));
       } catch (e) { entry.action = 'failed'; entry.error = String(e?.stderr || e?.message || e).split('\n')[0]; }
     }
     results.push(entry);

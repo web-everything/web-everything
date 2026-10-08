@@ -201,7 +201,8 @@ export function sweepReviewHoldLabels({
   try {
     for (const r of sweepAutoBlock({ repo, resolveRepo: () => repoOf(), listPrs: () => prs, dryRun, ...(settings ? { settings } : {}), ...(runRuling ? { runRuling } : {}) })) {
       results.push({ num: r.num, autoBlock: r.action, findings: r.findings, operatorKept: r.operatorKept, ...(r.error ? { error: r.error } : {}) });
-      if (r.action === 'auto-blocked') autoBlocked.add(r.num);
+      // Only a PR with nothing left for the operator skips the label sweep; judgment calls and disputes keep the signal.
+      if (r.action === 'auto-blocked' && !r.operatorKept) autoBlocked.add(r.num);
     }
   } catch (e) {
     results.push({ num: 0, autoBlock: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] });

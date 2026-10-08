@@ -2,7 +2,7 @@
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/conveyor/referral-auto-block.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/lib/review-settings.mjs", "we:scripts/lib/jury-core.mjs", "we:scripts/lib/ruling-ledger.mjs", "we:scripts/operations/record-referral-ruling.mjs"]
+scope: ["we:scripts/conveyor/referral-auto-block.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/lib/review-settings.mjs", "we:scripts/lib/jury-core.mjs", "we:scripts/lib/ruling-ledger.mjs", "we:scripts/operations/record-referral-ruling.mjs", "we:scripts/operations/coroner-rounds.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
@@ -13,7 +13,7 @@ Operator 2026-10-08: confirmed mandatory referrals are ruled block automatically
 
 ## Done when
 
-1. **Executable** — `npx vitest run we:scripts/conveyor/__tests__/referral-auto-block.test.mjs` passes: in auto-block mode a confirmed referral is ruled `block` by actor `auto-policy`, sent back, and `advisory:ruling-needed` is not added; in operator mode nothing changes; a finding the fixer keeps missing past the miss limit is a dispute and stays with the operator. Fails before this item lands (no auto-policy actor, no sweep).
+1. **Executable** — `npx vitest run referral-auto-block` passes: in auto-block mode a confirmed referral is ruled `block` by actor `auto-policy`, sent back, and `advisory:ruling-needed` is not added; in operator mode nothing changes; a finding the fixer keeps missing past the miss limit is a dispute and stays with the operator. Fails before this item lands (no auto-policy actor, no sweep).
 2. **Must refuse** — `auto-policy` can only rule `block`: a card or not-real ruling by it, or a hand-built clearing record, is invalid. It never touches `review:human`. A failed ruling is reported and the PR stays parked for the operator.
 3. **Setting** — `review.referralDefault` is `operator` (product default) or `auto-block` (`we:scripts/review-settings.json`, ours); env `WE_REVIEW_REFERRAL_DEFAULT` overrides; junk keeps `operator`.
 
