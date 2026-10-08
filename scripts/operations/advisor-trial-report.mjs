@@ -131,7 +131,11 @@ const mean = (xs) => { const v = xs.filter((x) => typeof x === 'number' && Numbe
  *   `transcripts[runId]` = {@link transcriptAdvisorFacts}; `reviews["<repo>#<pr>"]` = {@link parseReviewVerdicts}.
  */
 export function summarizeAdvisorTrial({ rows, transcripts = {}, reviews = {} }) {
-  const fixRows = rows.filter((r) => r.kind === 'fix' && r.pr != null).sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  const allFix = rows.filter((r) => r.kind === 'fix' && r.pr != null).sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  // A row whose run left no transcript did no work (a launch that failed after the arm was recorded, or a dry run):
+  // it is counted, but kept out of every comparison so it cannot pose as a cheap, rework-free run.
+  const fixRows = allFix.filter((r) => transcripts[r.runId]?.found);
+  const noTranscript = allFix.length - fixRows.length;
   const prKey = (r) => `${r.repo ?? 'we'}#${r.pr}`;
   const runs = fixRows.map((r) => {
     const key = prKey(r);
@@ -174,7 +178,7 @@ export function summarizeAdvisorTrial({ rows, transcripts = {}, reviews = {} }) 
       tokensPerRun: mean(rs.map((r) => (r.workerTokens === null ? null : r.workerTokens + (r.advisorTokens ?? 0)))),
     };
   };
-  return { on: arm(true), off: arm(false), mixedPrs: prs.filter((p) => p.arm === 'mixed').length, runs };
+  return { on: arm(true), off: arm(false), mixedPrs: prs.filter((p) => p.arm === 'mixed').length, noTranscript, runs };
 }
 
 const fmt = (v, d = 2, unit = '') => (v === null || v === undefined ? 'n/a' : `${Number(v).toFixed(d)}${unit}`);
@@ -202,7 +206,7 @@ export function renderAdvisorTrial(summary, { generatedAt, since = null }) {
     row('Advisor cost per run', fmt(on.advisorCostUsd, 3, ' $'), fmt(off.advisorCostUsd, 3, ' $')),
     row('Total cost per run', fmt(on.totalCostUsd, 3, ' $'), fmt(off.totalCostUsd, 3, ' $')),
     '',
-    `PRs with runs in both arms (left out of the per-PR rows): ${summary.mixedPrs}.`,
+    `PRs with runs in both arms (left out of the per-PR rows): ${summary.mixedPrs}. Launches with no transcript (left out): ${summary.noTranscript}.`,
     '',
     'Pays for itself when the on arm\'s extra total cost per run is smaller than the off arm\'s later-fix-runs-per-run gap times the cost of one fix run.',
   ];

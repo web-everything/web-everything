@@ -150,10 +150,15 @@ describe('advisor trial — report', () => {
     ];
     const s = summarizeAdvisorTrial({
       rows,
-      transcripts: { a: { found: true, workerCostUsd: 1, advisorCostUsd: 0.5, workerTokens: 100, advisorTokens: 10, advisorCalls: 2 } },
+      transcripts: {
+        a: { found: true, workerCostUsd: 1, advisorCostUsd: 0.5, workerTokens: 100, advisorTokens: 10, advisorCalls: 2 },
+        b: { found: true, workerCostUsd: null, advisorCostUsd: 0, workerTokens: 50, advisorTokens: 0, advisorCalls: 0 },
+        c: { found: true, workerCostUsd: null, advisorCostUsd: 0, workerTokens: 50, advisorTokens: 0, advisorCalls: 0 },
+      },
       reviews: { 'we#1': [{ at: '2026-10-08T01:00:00Z', verdict: 'accepted', findings: 1 }], 'we#2': [{ at: '2026-10-08T01:00:00Z', verdict: 'changes', findings: 4 }] },
     });
     expect(s.on).toMatchObject({ runs: 1, prs: 1, fixRoundsPerPr: 1, laterFixRunsPerRun: 0, acceptedNextReviewPct: 100, findingsAfterFix: 1, totalCostUsd: 1.5, advisorCallsPerRun: 2 });
+    expect(summarizeAdvisorTrial({ rows, transcripts: {} })).toMatchObject({ noTranscript: 3, on: { runs: 0 }, off: { runs: 0 } });
     const partial = summarizeAdvisorTrial({ rows: rows.slice(0, 1), transcripts: { a: { found: true, workerCostUsd: null, advisorCostUsd: 0.5, workerTokens: 9 } } });
     expect(partial.on).toMatchObject({ totalCostUsd: null, withTranscript: 1 });
     expect(s.off).toMatchObject({ runs: 2, prs: 1, fixRoundsPerPr: 2, laterFixRunsPerRun: 0.5, acceptedNextReviewPct: 0, findingsAfterFix: 4, totalCostUsd: null });
