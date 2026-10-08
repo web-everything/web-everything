@@ -64,6 +64,14 @@ describe('classifyReferralsByRound — referrals follow the later-round scoping 
     expect(out.demoted).toEqual([{ candidate: candidate(reRaised), reason: REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE }]);
   });
 
+  it('a block-ruled finding re-raised on the SAME head is covered only: its gate lives in the thread record, not in a new referral', () => {
+    const identity = identityOf(recordFor(HEAD_1, raised, ['block']));
+    const out = classifyReferralsByRound([candidate({ ...raised, line: 43 })], { identity, head: HEAD_1 });
+    expect(out.covered).toHaveLength(1);
+    expect(out.kept).toEqual([]);
+    expect(out.demoted).toEqual([]);
+  });
+
   it('a block-ruled finding re-raised when the fixer did NOT touch its file stays mandatory (the ignored-ruling path needs it)', () => {
     const identity = identityOf(recordFor(HEAD_1, raised, ['block']));
     const latestFix = { priorHead: HEAD_1, head: HEAD_2, files: { 'src/other.mjs': [1] } };
@@ -192,6 +200,46 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
     const out = await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinksWith({ seen: [], ruled: { value: false } }),
       makeJudge: () => async () => judgeOutcome(REFERRAL_ANSWER, {}), mintRunId: () => 'r-fresh', findResumableRun: () => 'gone' });
     expect(out.run.id).toBe('r-fresh');
+  });
+
+  it('a store read that throws falls back to a fresh review', async () => {
+    const { declaration, registry } = setup();
+    const store = createMemoryRunStore();
+    const broken = { ...store, read: (id) => { if (id === 'r-1') throw new Error('corrupt'); return store.read(id); } };
+    const out = await runReviewLoopOnce({ declaration, registry, argv, store: broken, sinks: sinksWith({ seen: [], ruled: { value: false } }),
+      makeJudge: () => async () => judgeOutcome(REFERRAL_ANSWER, {}), mintRunId: () => 'r-fresh', findResumableRun: () => 'r-1' });
+    expect(out.run.id).toBe('r-fresh');
+  });
+
+  it('WE_REVIEW_RESUME_PARKED=0 starts a fresh review even when a parked run is resumable', async () => {
+    const { declaration, registry } = setup();
+    const store = createMemoryRunStore();
+    const sinks = () => sinksWith({ seen: [], ruled: { value: false } });
+    const makeJudge = () => async () => judgeOutcome(REFERRAL_ANSWER, {});
+    await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinks(), makeJudge, mintRunId: () => 'r-1' });
+    const prior = process.env.WE_REVIEW_RESUME_PARKED;
+    process.env.WE_REVIEW_RESUME_PARKED = '0';
+    try {
+      const out = await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinks(), makeJudge, mintRunId: () => 'r-2', findResumableRun: () => 'r-1' });
+      expect(out.run.id).toBe('r-2');
+    } finally {
+      if (prior === undefined) delete process.env.WE_REVIEW_RESUME_PARKED; else process.env.WE_REVIEW_RESUME_PARKED = prior;
+    }
+  });
+
+  it('only a run parked on a confirm step of THIS operation is resumed', async () => {
+    const { declaration, registry } = setup();
+    const store = createMemoryRunStore();
+    const sinks = () => sinksWith({ seen: [], ruled: { value: false } });
+    const makeJudge = () => async () => judgeOutcome(REFERRAL_ANSWER, {});
+    await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinks(), makeJudge, mintRunId: () => 'r-1' });
+    const parked = store.read('r-1');
+    store.write({ ...parked, id: 'r-other-op', op: 'some-other-op' });
+    store.write({ ...parked, id: 'r-not-confirm', pending: { ...parked.pending, kind: 'judge' } });
+    for (const [id, fresh] of [['r-other-op', 'f-1'], ['r-not-confirm', 'f-2']]) {
+      const out = await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinks(), makeJudge, mintRunId: () => fresh, findResumableRun: () => id });
+      expect(out.run.id).toBe(fresh);
+    }
   });
 });
 

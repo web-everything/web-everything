@@ -391,9 +391,16 @@ export async function runReviewLoopOnce({
     if (parsed.input.repo && parsed.input.pr != null && process.env.WE_REVIEW_RESUME_PARKED !== '0') {
       try { resumedId = findResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr }); } catch { resumedId = null; }
     }
-    const parked = resumedId ? store.read(resumedId) : null;
-    if (parked && parked.op === declaration.name && parked.pending?.kind === 'confirm') {
-      run = rewindRunToStep(parked, { registry, step: RESUME_STEP, at: now() });
+    // Any doubt (an unreadable record, a run that cannot be rewound) falls back to a fresh review, never aborts the round.
+    let rewound = null;
+    try {
+      const parked = resumedId ? store.read(resumedId) : null;
+      if (parked && parked.op === declaration.name && parked.pending?.kind === 'confirm') {
+        rewound = rewindRunToStep(parked, { registry, step: RESUME_STEP, at: now() });
+      }
+    } catch { rewound = null; }
+    if (rewound) {
+      run = rewound;
       store.write(run);
     } else {
       run = startRun({
