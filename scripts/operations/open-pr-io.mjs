@@ -19,6 +19,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { classifySubmit } from './open-pr.mjs';
+import { checkDuplicateBornAs } from '../lib/duplicate-bornas-added.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { buildGhShimSettingsEnv, defaultShimDir, ghShimPathOverride, shimGhPath } from '../lib/gh-app-shim.mjs';
@@ -105,6 +106,8 @@ function failedGate(e, loadSettings) {
  */
 export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(), env = resolveGhCredentialEnv(),
   git = (args) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }),
+  // Real git/gh only when the real spawn is in use: a caller that injected `spawn` is a rehearsal/test and must stay hermetic.
+  dupBornAs = spawn !== spawnSync ? () => [] : (opts) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),
 } = {}) {
   return ({ argv, skipPrePrReview = '', actor = '', operatorInstruction = '' }) => {
     let r;
@@ -128,6 +131,12 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
         catch (e) { return { outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: `bypass refused — ${e.message}` }; }
       }
       if (gate.action === 'advise') process.stderr.write(`open-pr: advisory — ${gate.message}\n`);
+    }
+    // xsjn0uf-incident — advisory: a card this PR adds whose bornAs is already on main / in another open PR.
+    if (!argv.includes('--dry-run')) {
+      let dups = [];
+      try { dups = dupBornAs({ base: arg('base') || 'main', sha: arg('sha') || 'HEAD', branch: arg('branch') || '' }) || []; } catch { dups = []; }
+      for (const w of dups) process.stderr.write(`open-pr: WARNING — duplicate card: ${w}\n`);
     }
     let item;
     try { item = prepareItemFromRef(arg('ref')); } catch (e) { cleanupBody(); throw e; }
