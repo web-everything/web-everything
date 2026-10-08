@@ -5,6 +5,7 @@
  */
 import { findUnmarkedLocusRefs } from './check-standards-rules.mjs';
 import { prefixOwnPathMentions } from './operations/deliver-item-wrapper.mjs';
+import { UNSIZED_KINDS } from './backlog/scaffold.mjs';
 
 export const DEFAULT_MAX_LOAD = 15;
 export const DEFAULT_MAX_PR_GROWTH = 0;
@@ -104,10 +105,11 @@ export function planFiling(items, { defaults = { kind: 'story', size: 3 } } = {}
       .replace(/^[ \t]*<!-- held-card:.*?-->[ \t]*(?:\n|$)/gm, '')
       .replace(/^[ \t]*\(held .*? ET\)[ \t]*(?:\n|$)/gm, '').trim();
     const digest = prefixOwnPathMentions(raw, findUnmarkedLocusRefs(raw));
-    return { num: item.num, title: item.title,
-      kind: meta.kind ?? (/^Epic\b|^Umbrella \(epic\)|\(epic\)/i.test(item.title) ? 'epic'
-        : /^(RATIFIED|Decision)\b/i.test(item.title) ? 'decision' : defaults.kind),
-      size: meta.size ?? defaults.size, digest: `${digest} (Held-card #${item.num} from the operator handoff list.)`,
+    const kind = meta.kind ?? (/^Epic\b|^Umbrella \(epic\)|\(epic\)/i.test(item.title) ? 'epic'
+      : /^(RATIFIED|Decision)\b/i.test(item.title) ? 'decision' : defaults.kind);
+    return { num: item.num, title: item.title, kind,
+      // A task/feature is never sized and `file-item` refuses one that is (#x0h3pe4): file it with no size.
+      size: UNSIZED_KINDS.has(kind) ? null : (meta.size ?? defaults.size), digest: `${digest} (Held-card #${item.num} from the operator handoff list.)`,
       scope: meta.scope ?? [], parent: meta.parent ?? null };
   });
 }

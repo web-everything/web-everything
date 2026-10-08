@@ -20,7 +20,7 @@ import {
 
 // The real pass reads GitHub and the harness job records by default; these tests inject everything else, so the
 // two new evidence reads default to "nothing found" and each xykwe0h test overrides them explicitly.
-const adoptOrphanedBuildClaims = (o = {}) => adoptOrphanedBuildClaimsReal({ readDelivery: () => null, sessionLivenessFor: () => null, ...o });
+const adoptOrphanedBuildClaims = (o = {}) => adoptOrphanedBuildClaimsReal({ readDelivery: () => null, sessionLivenessFor: () => null, recordFailure: () => {}, releaseLaneLease: () => {}, ...o });
 import {
   acquireBuildDispatchClaim, listBuildDispatchClaims, releaseBuildDispatchClaim,
   markBuildDispatchResume, readBuildDispatchResume, releaseBuildDispatchResume,
@@ -890,5 +890,40 @@ describe('settleDeliveredRow', () => {
     const e = written.effects.find((x) => x.key === 'dispatch-lane-t#2#0');
     expect(e.status).toBe('applied');
     expect(e.result).toEqual({ outcome: 'pr-opened', pr: 4339 });
+  });
+});
+
+// x87v3ed — a build that ended with no delivery is a FAILED START: it backs the card off, and the lane the
+// dispatch reserved for it is handed back. A build that delivered is neither.
+describe('x87v3ed — orphan release charges the card a backoff failure and returns the reserved lane', () => {
+  const buildRow = ({ num, handle }) => ({
+    runId: 'dispatch-lane-x',
+    entry: { key: 'step:1:0', status: 'in-flight', handle, result: null, payload: { num, launchKind: 'build', lane: 3, sessionSlug: `conveyor-${num}`, scope: [] } },
+  });
+  const dead = (num, extra = {}) => ({
+    listClaims: () => [{ pid: 98761, meta: { kind: 'build', num } }],
+    isPidAlive: () => false,
+    findRow: () => buildRow({ num, handle: 'pid:98761' }),
+    readResumeMarker: () => null,
+    resolveResumability: () => ({ resumable: false, reason: 'no-done-report' }),
+    releaseClaim: () => {}, releaseResumeMarker: () => {}, settleRow: () => {},
+    spawnResume: () => { throw new Error('no resume'); }, markResume: () => { throw new Error('no mark'); },
+    ...extra,
+  });
+  it('records a build failure for the card and releases the lane lease by session slug', async () => {
+    const failures = []; const leases = [];
+    await adoptOrphanedBuildClaims(dead('5189', { recordFailure: (o) => failures.push(o), releaseLaneLease: (o) => leases.push(o) }));
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({ num: '5189', reason: expect.stringContaining('build-not-started') });
+    expect(leases).toHaveLength(1);
+    expect(leases[0].sessionSlug).toBeTruthy();
+  });
+  it('records nothing when the dead dispatch had in fact delivered a PR', async () => {
+    const failures = [];
+    await adoptOrphanedBuildClaims(dead('4388', {
+      readDelivery: () => ({ outcome: 'pr-opened', reason: 'PR #4339' }), settleDelivered: () => {},
+      recordFailure: (o) => failures.push(o),
+    }));
+    expect(failures).toEqual([]);
   });
 });
