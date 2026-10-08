@@ -111,7 +111,9 @@ export async function recordPrepareFailure({ num, attempt, stage, evidence = {} 
       save(state, path);
       try {
         const result = await fileCard({ title: `Diagnose unknown prepare ${stage} failure (${fingerprint})`,
-          kind: 'task', size: '2', queue: 'false', scope: 'we:skills-src/conveyor/build-dispatch-daemon.mjs',
+          // A `story`, not a `task`: this card carries a size, and a sized task is refused (#x0h3pe4) — it would
+          // silently never be filed.
+          kind: 'story', size: '2', queue: 'false', scope: 'we:skills-src/conveyor/build-dispatch-daemon.mjs',
           digest: `Prepare #${num} is held. Cause is unknown. Evidence is retained in the coordination-root prepare failure ledger under cause key ${fingerprint} and item ${num}; inspect the recorded terminal output before making a diagnosis. Recover the terminal evidence, fix the cause and add a regression. Release requires a reviewed fix commit. Cause key: ${fingerprint}.` });
         state.cards[fingerprint] = { ...state.cards[fingerprint], status: result?.ok ? 'queued' : 'failed', result };
       } catch (error) { state.cards[fingerprint].status = 'failed'; state.cards[fingerprint].error = String(error); }

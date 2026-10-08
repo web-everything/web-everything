@@ -20,6 +20,7 @@ import {
 } from '../open-pr.mjs';
 import { createPrLandRunner, createOpenPrSinks, PR_LAND_CLI, resolveGhCredentialEnv, deriveLaneRef } from '../open-pr-io.mjs';
 import { PARK_LABELS } from '../../pr-land.mjs';
+import { checkDuplicateBornAs } from '../../lib/duplicate-bornas-added.mjs';
 
 const good = (over = {}) => ({
   ref: 'lane/open-pr-operation', base: 'main', title: 'a title', bodyFile: '/tmp/body.md',
@@ -627,6 +628,36 @@ describe('items 79/81 — truthful label-on-green outcome, credential env, --bra
     let seen;
     createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), env, spawn: (_n, _a, o) => { seen = o.env; return { status: 0, stdout: '{"pr":1}' }; } })({ argv: ['--ref=lane/x'] });
     expect(seen.PATH).toBe(env.PATH);
+  });
+
+  // xbdzt01 — open-pr passes `--ref=` (never `--branch=`), so the duplicate-card scan must exclude the PR at
+  // that head ref. Before the fix it read `--branch`, excluded nothing, and updating PR #4478 warned that every
+  // card it adds is "also in #4478" — the PR compared against itself.
+  it('the duplicate-card scan excludes the PR being opened/updated, but still flags a different open PR (xbdzt01)', () => {
+    const exec = (cmd, args) => {
+      if (cmd === 'git' && args[0] === 'diff') return 'backlog/xdeqs8k-a.md\nbacklog/xbb6fgj-b.md\n';
+      if (cmd === 'git' && args[0] === 'show') return 'bornAs: ' + args[1].split(':backlog/')[1].slice(0, 7) + '\n';
+      if (cmd === 'git' && args[0] === 'grep') throw new Error('no match');
+      if (cmd === 'gh') return JSON.stringify([
+        { number: 4478, headRefName: 'lane/x', files: [{ path: 'backlog/xdeqs8k-a.md' }, { path: 'backlog/xbb6fgj-b.md' }] },
+        { number: 99, headRefName: 'lane/other', files: [{ path: 'backlog/xbb6fgj-b.md' }] },
+      ]);
+      throw new Error('unexpected ' + cmd);
+    };
+    const warned = [];
+    const orig = process.stderr.write;
+    process.stderr.write = (s) => { warned.push(String(s)); return true; };
+    try {
+      createPrLandRunner({
+        prePrReview: () => ({ action: 'pass' }),
+        dupBornAs: (opts) => checkDuplicateBornAs({ ...opts, exec }),
+        spawn: () => ({ status: 0, stdout: '{"pr":4478}' }),
+      })({ argv: ['--ref=lane/x', '--base=main'] });
+    } finally { process.stderr.write = orig; }
+    const dups = warned.filter((w) => /duplicate card/.test(w));
+    expect(dups.some((w) => /#4478/.test(w))).toBe(false);
+    expect(dups).toHaveLength(1);
+    expect(dups[0]).toMatch(/xbb6fgj.*#99/);
   });
 
   it('--branch is the ref; ref wins; with neither it derives from the lease purpose (#81)', () => {
