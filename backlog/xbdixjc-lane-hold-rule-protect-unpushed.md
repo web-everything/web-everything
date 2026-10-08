@@ -22,6 +22,9 @@ A3 of the fixer-throughput proposal (2026-10-08). The lease reaper released 24 l
   `holdMinutes` 150 (`WE_LANE_HOLD_MINUTES`), `aheadEquivalence` every|any (`WE_LANE_AHEAD_EQUIVALENCE`).
 - **IO** — `checkLaneHold` in we:scripts/lib/lane-hold-io.mjs, called by we:scripts/lane-pool.mjs release, acquire reset,
   stale take-over, acquire-time reaper, trim, reclaim/salvage, refresh, and by the lease reaper's plan.
+- **Holder liveness** — the reaper's `sessionPidAliveByName` kept whichever duplicate-name row sorted last, so a
+  round-1 `done` row read a live round-N fixer as gone (lane-5 fix-4461 21:17Z, lane-20 fix-4433 21:25Z, both
+  mid-edit, after the first edge load). It now keeps the most-alive reading (true > unknown > false).
 
 ## Done when
 

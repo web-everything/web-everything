@@ -906,10 +906,17 @@ export function sessionStatesForReap(sessions) {
  *   neither probe could say).
  */
 export function sessionPidAliveByName(sessions, { psOutput = null, isPidAlive = defaultIsPidAlive } = {}) {
+  // xbdixjc — duplicate names (a fix-<PR> round N next to round N-1's stale `done` rows): the reading kept per name
+  // is the most-alive one, true > null > false, never "whichever row sorted last". Same asymmetry as
+  // {@link sessionStateByName}'s #x2psfwz guard; a bare `.set()` here let a dead round-1 row read a live fixer as
+  // gone (lane-5 fix-4461 at 21:17Z, lane-20 fix-4433 at 21:25Z on 2026-10-08, both mid-edit).
+  const rank = (v) => (v === true ? 2 : v === null ? 1 : 0);
   const byName = new Map();
   for (const s of Array.isArray(sessions) ? sessions : []) {
     if (!s || typeof s !== 'object' || s.kind !== 'background') continue;
-    if (typeof s.name === 'string' && s.name) byName.set(s.name, resolvePidAlive(s, { psOutput, isPidAlive }));
+    if (typeof s.name !== 'string' || !s.name) continue;
+    const alive = resolvePidAlive(s, { psOutput, isPidAlive });
+    if (!byName.has(s.name) || rank(alive) > rank(byName.get(s.name))) byName.set(s.name, alive);
   }
   return byName;
 }
