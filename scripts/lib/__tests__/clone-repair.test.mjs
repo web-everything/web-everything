@@ -6,11 +6,11 @@
  *   objects absent from the shared store ("invalid sha1 pointer"), and a drain overlay fetch was rejected.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync, statSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync, statSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { repairCloneRefs, recloneInPlace } from '../lane-repair.mjs';
+import { repairCloneRefs, recloneInPlace, resolveLocalPath } from '../lane-repair.mjs';
 import { withWriteLock, withReadLock } from '../daemon-clone-lock.mjs';
 import { selfSyncCheckout, selfSyncCheckoutPoc } from '../daemon-self-sync.mjs';
 import { mergeOverlayRef } from '../daemon-load-overlay.mjs';
@@ -384,6 +384,75 @@ describe('re-clone safety (review round 2)', () => {
     expect(attempts).toBe(2); // the window passes, it may try again
   });
 
+  // A relative origin resolves against the clone's own directory, but the re-clone runs from its parent: a decoy repo
+  // one level up (tmp/origin.git, the suite's `origin`) must never be what the replacement is cloned from.
+  const relativeOriginClone = (url, { branch = 'main' } = {}) => {
+    const work = join(tmp, 'work'); mkdirSync(work, { recursive: true });
+    const real = join(work, 'origin.git');
+    g(work, 'init', '-q', '--bare', '-b', branch, real);
+    const seed = join(work, 'seed'); g(work, 'clone', '-q', real, seed);
+    g(seed, 'config', 'user.email', 't@t'); g(seed, 'config', 'user.name', 't');
+    writeFileSync(join(seed, 'real.txt'), 'real'); g(seed, 'add', '.'); g(seed, 'commit', '-qm', 'real'); g(seed, 'push', '-q', 'origin', `HEAD:${branch}`);
+    const rel = join(work, 'rclone'); g(work, 'clone', '-q', real, rel);
+    g(rel, 'config', 'remote.origin.url', url);
+    const head = g(rel, 'rev-parse', 'HEAD');
+    rmSync(join(rel, '.git/objects', head.slice(0, 2)), { recursive: true, force: true });
+    return { rel, head };
+  };
+
+  it('re-clones a RELATIVE origin against the original checkout, never against the clone\'s parent', () => {
+    const { rel, head } = relativeOriginClone('../origin.git'); // work/origin.git is real; tmp/origin.git is the decoy
+    const r = recloneInPlace(rel, join(tmp, '.quarantine'));
+    expect(r.ok).toBe(true);
+    expect(g(rel, 'rev-parse', 'HEAD')).toBe(head);
+    expect(existsSync(join(rel, 'real.txt'))).toBe(true);
+    expect(existsSync(join(rel, 'a.txt'))).toBe(false); // the decoy's file
+    expect(g(rel, 'config', '--get', 'remote.origin.url')).toBe('../origin.git'); // config carried over untouched
+  });
+
+  it('resolves the other relative-path spellings too (./ prefix, nested .., trailing slash)', () => {
+    for (const url of ['./../origin.git', '../../work/origin.git', '../origin.git/']) {
+      rmSync(join(tmp, 'work'), { recursive: true, force: true });
+      const { rel, head } = relativeOriginClone(url);
+      const r = recloneInPlace(rel, join(tmp, `.quarantine-${url.replace(/\W/g, '_')}`));
+      expect(r.ok, url).toBe(true);
+      expect(g(rel, 'rev-parse', 'HEAD'), url).toBe(head);
+    }
+  });
+
+  it('resolveLocalPath only rewrites genuinely local relative paths', () => {
+    const d = '/x/y/clone';
+    expect(resolveLocalPath('../origin.git', d)).toBe('/x/y/origin.git');
+    expect(resolveLocalPath('./o.git', d)).toBe('/x/y/clone/o.git');
+    expect(resolveLocalPath('sub/o.git', d)).toBe('/x/y/clone/sub/o.git');
+    expect(resolveLocalPath('o.git', d)).toBe('/x/y/clone/o.git');
+    for (const same of ['/abs/o.git', 'git@host:org/repo.git', 'host:repo.git', 'https://h/r.git', 'ssh://h/r.git', 'file:///abs/o.git', 'ext::cmd']) {
+      expect(resolveLocalPath(same, d), same).toBe(same);
+    }
+    expect(resolveLocalPath('~/o.git', d)).toBe('/x/y/clone/~/o.git'); // git does not expand ~ for a local path
+  });
+
+  it('resolveLocalPath climbs `..` from the PHYSICAL directory, as git does, when the checkout path is a symlink', () => {
+    const realParent = join(tmp, 'realparent'); mkdirSync(join(realParent, 'c'), { recursive: true });
+    const linkParent = join(tmp, 'linkparent'); mkdirSync(linkParent);
+    symlinkSync(join(realParent, 'c'), join(linkParent, 'c'));
+    expect(resolveLocalPath('../o.git', join(linkParent, 'c'))).toBe(join(realpathSync(realParent), 'o.git')); // not linkparent/o.git
+  });
+
+  it('an absolute origin is re-cloned exactly as before', () => {
+    const { rel, head } = relativeOriginClone(join(tmp, 'work', 'origin.git'));
+    expect(recloneInPlace(rel, join(tmp, '.quarantine')).ok).toBe(true);
+    expect(g(rel, 'rev-parse', 'HEAD')).toBe(head);
+  });
+
+  it('resolves a relative alternates (reference) path against the object store, not the parent', () => {
+    const { rel } = relativeOriginClone('../origin.git');
+    writeFileSync(join(rel, '.git/objects/info/alternates'), '../../../origin.git/objects\n');
+    const r = recloneInPlace(rel, join(tmp, '.quarantine'));
+    expect(r.ok).toBe(true);
+    expect(readFileSync(join(rel, '.git/objects/info/alternates'), 'utf8')).toMatch(/origin\.git\/objects/);
+  });
+
   it('a clone URL that starts with "-" is never handed to git clone as an option', () => {
     g(clone, 'config', 'remote.origin.url', '-ouploadpack');
     loseHead();
@@ -460,6 +529,68 @@ describe('repairCloneRefs cost and noise', () => {
     withGitShim(() => repairCloneRefs(clone));
     expect(calls().length).toBeLessThanOrEqual(3); // for-each-ref, cat-file, symbolic-ref
     expect(calls().some((c) => /commit-graph|ls-files|rev-list/.test(c))).toBe(false);
+  });
+
+  describe('a persistently damaged clone that cannot be re-cloned is throttled too', () => {
+    const lose = () => { const head = g(clone, 'rev-parse', 'HEAD'); rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true }); };
+    const deep = /commit-graph|ls-files|rev-list|rev-parse|fsck/; // the cheap ref probe legitimately uses cat-file
+
+    it('prune-only caller: the second sync makes only the ref probes and does not repeat the warning', () => {
+      lose();
+      const t0 = Date.now(); const lines = [];
+      const first = repairCloneRefs(clone, { log: (m) => lines.push(m), now: t0 });
+      expect(first.ok).toBe(false);
+      expect(lines.filter((l) => /needs attention/.test(l))).toHaveLength(1);
+      const second = withGitShim(() => repairCloneRefs(clone, { log: (m) => lines.push(m), now: t0 + 60_000 }));
+      expect(calls().length).toBeLessThanOrEqual(3);
+      expect(calls().some((c) => deep.test(c))).toBe(false);
+      expect(lines.filter((l) => /needs attention/.test(l))).toHaveLength(1);
+      expect(second.ok).toBe(false); // still damaged: the throttled call replays the recorded problems, it never reports healthy
+      expect(second.problems.length).toBeGreaterThan(0);
+    });
+
+    it('dirty tree with re-clone allowed: throttled the same way, then re-checked after the interval', () => {
+      lose(); writeFileSync(join(clone, 'a.txt'), 'edited');
+      const t0 = Date.now(); const lines = [];
+      repairCloneRefs(clone, { ...RECLONE, log: (m) => lines.push(m), now: t0 });
+      withGitShim(() => repairCloneRefs(clone, { ...RECLONE, log: (m) => lines.push(m), now: t0 + 60_000 }));
+      expect(calls().some((c) => deep.test(c))).toBe(false);
+      expect(lines.filter((l) => /needs attention/.test(l))).toHaveLength(1);
+      repairCloneRefs(clone, { ...RECLONE, log: (m) => lines.push(m), now: t0 + 11 * 60_000 });
+      expect(lines.filter((l) => /needs attention/.test(l))).toHaveLength(2);
+    });
+
+    it('a fresh but EMPTY / truncated / garbage damaged stamp fails closed: the checks re-run, the clone is never reported healthy', () => {
+      lose();
+      const t0 = Date.now();
+      repairCloneRefs(clone, { now: t0 });
+      const stamp = join(clone, '.git/.clone-repair-damaged-prune');
+      for (const body of ['', '[', 'not json', '[]', '[1]', '{"a":1}']) {
+        writeFileSync(stamp, body);
+        const r = repairCloneRefs(clone, { now: t0 + 60_000 });
+        expect(r.ok, JSON.stringify(body)).toBe(false);
+        expect(r.problems.length, JSON.stringify(body)).toBeGreaterThan(0);
+      }
+      expect(readdirSync(join(clone, '.git')).filter((n) => n.endsWith('.tmp'))).toEqual([]); // atomic write leaves no temp file
+    });
+
+    it('a prune-only caller\'s throttle never delays a caller that may re-clone', () => {
+      lose();
+      const t0 = Date.now();
+      repairCloneRefs(clone, { now: t0 }); // prune-only: damaged, left alone, stamped
+      const r = repairCloneRefs(clone, { ...RECLONE, now: t0 + 1_000 });
+      expect(r.ok).toBe(true);
+      expect(r.quarantinedTo).toBeTruthy();
+    });
+
+    it('the damaged stamp is dropped once the clone is healthy again', () => {
+      lose();
+      const t0 = Date.now();
+      repairCloneRefs(clone, { now: t0 });
+      repairCloneRefs(clone, { ...RECLONE, now: t0 + 1_000 }); // re-cloned: healthy now
+      repairCloneRefs(clone, { now: t0 + 20 * 60_000 });
+      expect(readdirSync(join(clone, '.git')).filter((n) => n.startsWith('.clone-repair-damaged'))).toEqual([]);
+    });
   });
 
   it('a failed ref probe is "unverified", not healthy: ok:false and no throttle stamp', () => {

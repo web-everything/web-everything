@@ -21,8 +21,8 @@
  * Callers only ever run this on a lane they hold the lease for (or one with no live lease).
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, renameSync, rmSync, readFileSync, writeFileSync, statSync, lstatSync, copyFileSync, cpSync } from 'node:fs';
-import { join, basename, dirname } from 'node:path';
+import { existsSync, mkdirSync, renameSync, rmSync, readFileSync, writeFileSync, statSync, lstatSync, copyFileSync, cpSync, realpathSync } from 'node:fs';
+import { join, basename, dirname, resolve } from 'node:path';
 import { inspectCloneLock, defaultOwner } from './daemon-clone-lock.mjs';
 
 const GIT_TIMEOUT_MS = 60_000;
@@ -296,19 +296,34 @@ function carryOverLocalState(oldDir, newDir, ignored, log) {
   }
 }
 
+/** Resolve a LOCAL relative path (a remote URL git reads against the checkout) to an absolute one against `base`.
+ *  Everything else is returned unchanged: absolute paths, `~`, `scheme://`, scp-style `host:path` and `ext::`. A leading
+ *  `./` or `../` is always a path (git's own rule), even when a later segment contains a colon. */
+export function resolveLocalPath(url, base) {
+  // git runs with the PHYSICAL cwd, so `..` after a symlinked component climbs the real tree: resolve from the real path.
+  const from = (() => { try { return realpathSync(base); } catch { return base; } })();
+  if (url.startsWith('./') || url.startsWith('../') || url === '.' || url === '..') return resolve(from, url);
+  if (url.startsWith('/') || /^[^/]*:/.test(url)) return url;
+  return resolve(from, url); // includes `~...`: git does not expand it for a local path, it is a directory literally named `~`
+}
+
 /** Re-provision a broken daemon clone in place: move it to `quarantineRoot`, clone fresh from the same origin
  *  (reusing the old shared-reference alternate), check the same branch out, VERIFY the fresh clone is healthy, then
  *  carry over the old clone's local config/hooks/ignored files. Restores the old clone if the clone fails or is
  *  itself still broken. `verify` is injectable for tests. */
 export function recloneInPlace(dir, quarantineRoot, { log = () => {}, reason = '', verify = (d) => ({ problems: cloneProblems(d) }) } = {}) {
-  const url = runGit(['config', '--get', 'remote.origin.url'], dir).out.trim();
-  if (!url) return { ok: false, error: 'no remote.origin.url to re-clone from' };
-  if (url.startsWith('-')) return { ok: false, error: `remote.origin.url starts with "-" (${url.slice(0, 40)}); refusing to hand it to git clone` };
+  const rawUrl = runGit(['config', '--get', 'remote.origin.url'], dir).out.trim();
+  if (!rawUrl) return { ok: false, error: 'no remote.origin.url to re-clone from' };
+  if (rawUrl.startsWith('-')) return { ok: false, error: `remote.origin.url starts with "-" (${rawUrl.slice(0, 40)}); refusing to hand it to git clone` };
+  // The clone runs from dirname(dir) after `dir` has moved, but git resolves a relative origin against the checkout itself:
+  // resolve it here, before anything moves, so a repo that happens to sit at the wrong path is never cloned instead.
+  const url = resolveLocalPath(rawUrl, dir);
   const branch = runGit(['symbolic-ref', '--short', '-q', 'HEAD'], dir).out.trim() || 'main';
   let reference = null;
   try {
+    // A relative alternates entry is relative to the object store (.git/objects), not to the clone's parent either.
     const first = readFileSync(join(dir, '.git', 'objects', 'info', 'alternates'), 'utf8').split('\n').map((l) => l.trim()).find(Boolean);
-    if (first) reference = first.replace(/\/objects\/?$/, '');
+    if (first) reference = resolve(join(dir, '.git', 'objects'), first).replace(/\/objects\/?$/, '');
   } catch { /* no alternates */ }
   const ignored = ignoredTopLevelPaths(dir); // before the move: the old index is still in place
   let moved;
@@ -445,8 +460,31 @@ function recloneBackoffLeft(quarantineRoot, dir, now, backoffMs) {
 // card does not pay for `ls-files --stage` / `commit-graph verify` on a large clone each time.
 const DEEP_CHECK_INTERVAL_MS = 10 * 60_000;
 const deepStamp = (dir) => join(dir, '.git', '.clone-repair-deep-checked');
-function deepCheckDue(dir, intervalMs, now) {
-  try { return now - statSync(deepStamp(dir)).mtimeMs >= intervalMs; } catch { return true; }
+// A clone found damaged but not re-clonable is throttled too (else every sync re-pays the deep checks and re-logs
+// "needs attention"). The stamp is per caller kind: a prune-only caller finding the clone damaged says nothing about
+// whether a caller that MAY re-clone could fix it, so it must never delay that caller. Its body holds the problems, so a
+// throttled call still reports the clone as damaged.
+const damagedStamp = (dir, mode) => join(dir, '.git', `.clone-repair-damaged-${mode}`);
+const stampAge = (file, now) => { try { return now - statSync(file).mtimeMs; } catch { return Infinity; } };
+// The recorded problems are JSON, written via temp file + rename. A fresh stamp whose body cannot be read back as a
+// non-empty list (truncated, empty, garbage) is NOT trusted: it must never turn "damaged" into "healthy", so the check re-runs.
+// The throttle can hold a caller that has since become able to re-clone (lock freed, tree cleaned) off for up to one
+// interval, and replays "damaged" for that long if the clone is fixed outside this code; both are accepted for the quiet.
+function recordedProblems(dir, mode) {
+  try {
+    const list = JSON.parse(readFileSync(damagedStamp(dir, mode), 'utf8'));
+    return Array.isArray(list) && list.length && list.every((p) => typeof p === 'string') ? list : [];
+  } catch { return []; }
+}
+function writeDamagedStamp(dir, mode, problems) {
+  const file = damagedStamp(dir, mode);
+  const tmp = `${file}.${process.pid}.tmp`;
+  try { writeFileSync(tmp, JSON.stringify(problems)); renameSync(tmp, file); }
+  catch { try { rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ } } // the stamp only throttles
+}
+function deepCheckDue(dir, intervalMs, now, mode) {
+  if (stampAge(deepStamp(dir), now) < intervalMs) return false;
+  return !(stampAge(damagedStamp(dir, mode), now) < intervalMs && recordedProblems(dir, mode).length);
 }
 // A dangling non-remote ref stays dangling until a person looks; warn about each once per process, not every sync.
 const warnedDangling = new Set();
@@ -503,7 +541,13 @@ function repairCloneRefsUnguarded(dir, { log = () => {}, allowReclone = false, h
   // Nothing pruned, the ref probe worked, and the deep check is not due: done after the two ref calls above. (A
   // dangling NON-remote ref stays put and is reported once; it must not force the deep checks on every sync.)
   const pruneFailedEarly = out.reported.some((r) => r.includes('prune failed'));
-  if (!probeFailed && !out.pruned.length && !pruneFailedEarly && !deepCheckDue(dir, deepIntervalMs, now)) return out;
+  const mode = allowReclone ? 'reclone' : 'prune';
+  if (!probeFailed && !out.pruned.length && !pruneFailedEarly && !deepCheckDue(dir, deepIntervalMs, now, mode)) {
+    // Throttled because an earlier check found it damaged (not because it was healthy): replay that, never report healthy.
+    const known = stampAge(deepStamp(dir), now) < deepIntervalMs ? [] : recordedProblems(dir, mode);
+    if (known.length) { out.ok = false; out.problems = known; }
+    return out;
+  }
   const standalone = isStandaloneClone(dir);
 
   // A stale commit-graph cache (naming commits that left the object store) breaks `fsck` and history walks even with
@@ -522,6 +566,7 @@ function repairCloneRefsUnguarded(dir, { log = () => {}, allowReclone = false, h
   if (!problems.length && !pruneFailed) {
     if (probeFailed) return out; // never stamp a clone whose ref probe failed
     try { writeFileSync(deepStamp(dir), String(now)); } catch { /* the stamp only throttles; a failed write re-runs the check */ }
+    for (const m of ['reclone', 'prune']) { try { rmSync(damagedStamp(dir, m), { force: true }); } catch { /* the fresh healthy stamp outranks it */ } } // healthy again: no stale "damaged" replay
     return out;
   }
   out.problems = problems;
@@ -540,6 +585,9 @@ function repairCloneRefsUnguarded(dir, { log = () => {}, allowReclone = false, h
             : !tree.safe ? tree.why
               : `a re-clone was already tried and did not fix it; backing off for ${Math.ceil(backoffLeft / 60_000)} more minute(s)`;
       log(`  ⚠ clone-repair ${name}: clone is damaged (${problems.join('; ')}) but ${why} — needs attention`);
+      // Throttle the failure outcome too, so the next syncs skip the deep checks and the repeated warning until the interval
+      // passes. Not when the ref probe or a prune failed: those are retryable now, and the clone is not fully examined.
+      if (!probeFailed && !pruneFailed) writeDamagedStamp(dir, mode, problems);
     }
     return out;
   }
