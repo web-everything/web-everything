@@ -3,9 +3,10 @@ bornAs: x1m4guv
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: active
 scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/__tests__/heavy-admission.test.mjs"]
 dateOpened: "2026-09-28"
+dateStarted: "2026-10-08"
 preparedDate: "2026-10-07"
 preparedAgainstSha: "8aadcd16e1ff57477289ba42e0d9dbc6fd8ebd1a"
 tags: []
@@ -31,6 +32,10 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 
 ## Progress
 
+- Implementation sanity read (2026-10-08): the three unguarded idle conversions and missing pressure display branch remain present; latest-pressure selection is already correct. The spec is coherent and still applicable. Adding missing/zero/string reading cases and CLI precedence regressions before changing production code.
+- Regression proof (2026-10-08): targeted tests through the host heavy-run queue failed against the old source in 11 cases (11 passed). Examples: mixed nullish idle entries returned 20 instead of 40; null idle with busy 63 returned 0 instead of 37; absent idle with null busy returned 100 instead of no reading; admitted pressure-only text said `admitted — no sample`, and pressure plus backstop selected backstop. The strengthened [2, 2, 1] fixture passed latest selection. A temporary median-selection mutation failed with `expected 2 to be 1`; production latest selection was restored in a `finally` block.
+- Implementation: guarded all three idle conversions, added the pressure display branch after idle, covered reader-to-decision and CLI text/JSON paths, and fixed the existing empty-root fixture cleanup.
+- Verification (2026-10-08): `node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/readiness/__tests__/heavy-admission.test.mjs` passed all 148 tests. Fixture-driven subprocess assertions verified `admitted — mem pressure 1 (threshold 2)`, `HELD — mem pressure 2 (>=2)`, idle-first admitted text, pressure-before-backstop admitted text, and preservation of held backstop reasons. JSON retained pressure 1 with null idle/per-core for pressure-only input. Before/failure, mutation, and after/pass logs are at `/tmp/conveyor-4408-before.log`, `/tmp/conveyor-4408-median.log`, and `/tmp/conveyor-4408-after.log`. The delivery wrapper owns the standards gate and commit under this session's brief; neither was run by this agent.
 - Preparation inspection: the original premise listed four review debts against `we:scripts/readiness/heavy-admission.mjs` and `we:scripts/readiness/__tests__/heavy-admission.test.mjs`, but left the numeric guard's exact target and executable acceptance unspecified. The corrected scope remains those same two files: null handling at the idle-array and telemetry conversion seams, a discriminating pressure fixture, and admitted-pressure text reporting. No code relocation or additional source/test file is required.
 - Source evidence: `we:scripts/readiness/heavy-admission.mjs:403` still uses `.map(Number)` on idle entries; `we:scripts/readiness/heavy-admission.mjs:474-477` converts both the idle attribute and fallback busy value without a null guard. Conversely, pressure/load/core inputs already have null guards at `we:scripts/readiness/heavy-admission.mjs:408-410`; do not redo those. The fallback busy guard is part of the same missing-reading correction: guarding only the attribute would let a null busy value fabricate 100% idle.
 - Latest pressure selection already exists at `we:scripts/readiness/heavy-admission.mjs:485`. The fixture at `we:scripts/readiness/__tests__/heavy-admission.test.mjs:1030-1037` is [1, 2, 1], whose median and latest are both 1; this debt is a regression-strengthening change, not a new selection algorithm.
@@ -68,8 +73,8 @@ During implementation, run the new null and pressure-text regressions against th
 Run the affected suite and standards gate through the host queue. Commands below are executed from the WE root; their path arguments refer to `we:scripts/readiness/heavy-admission.mjs` and `we:scripts/readiness/__tests__/heavy-admission.test.mjs`:
 
 ```sh
-node scripts/readiness/heavy-admission.mjs run -- npx vitest run scripts/readiness/__tests__/heavy-admission.test.mjs
-node scripts/readiness/heavy-admission.mjs run -- npm run check:standards
+node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/readiness/__tests__/heavy-admission.test.mjs
+node we:scripts/readiness/heavy-admission.mjs run -- npm run check:standards
 ```
 
 Capture the failing/passing assertions and CLI output from those fixture-driven subprocess tests. They exercise the actual reader and command without depending on the live host's pressure or changing admission policy. The preparation runner owns preparation checks and stamping; no implementation test pass is claimed here.
