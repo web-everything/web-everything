@@ -1,4 +1,5 @@
 ---
+bornAs: xgm0cd1
 kind: story
 size: 3
 status: open
