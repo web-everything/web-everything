@@ -341,20 +341,20 @@ describe('restPullToPrStateShape — REST list-item → the GraphQL-shaped field
   it('a REST pull item (head.ref, merged_at, merge_commit_sha) maps to headRefName/mergedAt/mergeCommit.oid', () => {
     const rest = { number: 900, state: 'closed', merged_at: '2026-09-22T00:00:00Z', merge_commit_sha: 'deadbeef', head: { ref: 'lane/181-x' } };
     expect(restPullToPrStateShape(rest)).toEqual({
-      number: 900, state: 'closed', headRefName: 'lane/181-x', mergedAt: '2026-09-22T00:00:00Z', mergeCommit: { oid: 'deadbeef' },
+      number: 900, state: 'closed', headRefName: 'lane/181-x', mergedAt: '2026-09-22T00:00:00Z', closedAt: null, mergeCommit: { oid: 'deadbeef' },
     });
   });
   it('a REST open pull (no merged_at/merge_commit_sha) maps mergeCommit to null, never a bogus {oid: undefined}', () => {
     const rest = { number: 42, state: 'open', merged_at: null, merge_commit_sha: null, head: { ref: 'lane/42-y' } };
-    expect(restPullToPrStateShape(rest)).toEqual({ number: 42, state: 'open', headRefName: 'lane/42-y', mergedAt: null, mergeCommit: null });
+    expect(restPullToPrStateShape(rest)).toEqual({ number: 42, state: 'open', headRefName: 'lane/42-y', mergedAt: null, closedAt: null, mergeCommit: null });
   });
   it('tolerant of the pre-existing GraphQL-shaped fixture (headRefName/mergeCommit.oid top-level, no head/merge_commit_sha) — unchanged pass-through', () => {
     const graphqlShaped = { number: 500, state: 'MERGED', headRefName: 'lane/2825-x', mergedAt: '2026-09-01T00:00:00Z', mergeCommit: { oid: 'cafef00d' } };
-    expect(restPullToPrStateShape(graphqlShaped)).toEqual(graphqlShaped);
+    expect(restPullToPrStateShape(graphqlShaped)).toEqual({ ...graphqlShaped, closedAt: null });
   });
   it('a malformed/empty item degrades to a safe empty shape, never throws', () => {
-    expect(restPullToPrStateShape({})).toEqual({ number: undefined, state: undefined, headRefName: '', mergedAt: null, mergeCommit: null });
-    expect(restPullToPrStateShape(null)).toEqual({ number: undefined, state: undefined, headRefName: '', mergedAt: null, mergeCommit: null });
+    expect(restPullToPrStateShape({})).toEqual({ number: undefined, state: undefined, headRefName: '', mergedAt: null, closedAt: null, mergeCommit: null });
+    expect(restPullToPrStateShape(null)).toEqual({ number: undefined, state: undefined, headRefName: '', mergedAt: null, closedAt: null, mergeCommit: null });
   });
 });
 
