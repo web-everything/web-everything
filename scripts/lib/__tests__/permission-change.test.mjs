@@ -5,10 +5,10 @@
  *   diff scored only the agent-clearable blast-radius.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { permissionChangeKind } from '../permission-change.mjs';
+import { permissionChangeKind, SANDBOX_BEARING_FILES, SANDBOX_NULL_HUNKS_FREE, SANDBOX_TOKEN_RE } from '../permission-change.mjs';
 import { scoreEscalation, decideReviewGate, REVIEW_LABELS } from '../review-escalation.mjs';
 import { deriveReviewDisposition } from '../review-core.mjs';
 
@@ -151,5 +151,198 @@ describe('permissionChangeKind - entries added inside an existing multi-line san
   it('tests and docs are still exempt', () => {
     expect(permissionChangeKind('scripts/lib/__tests__/x.test.mjs', h('   writableRoots: [\n+    b,'))).toBeNull();
     expect(permissionChangeKind('docs/x.md', h('   writableRoots: [\n+    b,'))).toBeNull();
+  });
+});
+
+describe('permissionChangeKind - workflow grants in spellings the first matcher did not know (PR #4446 advisory)', () => {
+  const hunk = (body) => `diff --git a/${WF} b/${WF}\n--- a/${WF}\n+++ b/${WF}\n@@ -1,3 +1,4 @@\n${body}\n`;
+  it.each([
+    ['scope outside the known list', '+  copilot-requests: write'],
+    ['another unlisted scope', '+  artifact-metadata: write'],
+    ['unlisted scope read', '+  some-new-scope: read'],
+    ['value on the next line, both lines added', '+  contents:\n+    write'],
+    ['value on the next line, key is context', '   contents:\n+    write'],
+    ['value on the next line, key under an unchanged permissions block', ' permissions:\n+  contents:\n+    write'],
+    ['key changed, value is unchanged context on the next line', '+  contents:\n     write'],
+    ['anchored value', '+  contents: &w write'],
+    ['tagged value', '+  contents: !!str write'],
+    ['tagged and quoted value', '+  contents: !!str "write"'],
+    ['alias value on a known scope', '+  contents: *w'],
+    ['unlisted key with a non-grant value under an unchanged permissions block', ' permissions:\n+  some-new-scope: ${{ inputs.level }}'],
+    ['any added line under an unchanged permissions block', ' permissions:\n+  anything-at-all: true'],
+    ['job-level permissions block, nested deeper', '   build:\n     permissions:\n+      new-scope: write'],
+    ['flow mapping with an unlisted scope', '+  { copilot-requests: write }'],
+  ])('%s holds', (_n, b) => expect(permissionChangeKind(WF, hunk(b))).toBe('workflow-permissions'));
+
+  it('lines that only look like a grant do not hold', () => {
+    expect(permissionChangeKind(WF, hunk('+  TOKEN: ${{ secrets.X }}'))).toBeNull();
+    expect(permissionChangeKind(WF, hunk(' env:\n+  FOO: bar'))).toBeNull();
+    expect(permissionChangeKind(WF, hunk('+  timeout-minutes: 5'))).toBeNull();
+    expect(permissionChangeKind(WF, hunk(' permissions:\n   contents: read\n+on:\n+  push:'))).toBeNull();
+    expect(permissionChangeKind(WF, hunk('   name:\n+    write'))).toBeNull();
+  });
+
+  it.each([
+    ['a 100% rename into the workflows dir', `diff --git a/x.yml b/${WF}\nsimilarity index 100%\nrename from x.yml\nrename to ${WF}\n`],
+    ['an empty new file', `diff --git a/${WF} b/${WF}\nnew file mode 100644\nindex 0000000..e69de29\n`],
+    ['an empty section', ''],
+  ])('a workflow section with no hunk (%s) fails closed', (_n, section) => {
+    expect(permissionChangeKind(WF, section)).toBe('workflow-permissions');
+  });
+  it('a rename into the workflows dir scores humanRequired end to end', () => {
+    const diff = `diff --git a/x.yml b/${WF}\nsimilarity index 100%\nrename from x.yml\nrename to ${WF}\n`;
+    const s = scoreEscalation({ changedFiles: [WF], diffLines: 0, diffHunks: diff });
+    expect(s.humanRequired).toBe(true);
+    expect(s.signals.permissionChange).toEqual([WF]);
+  });
+});
+
+describe('permissionChangeKind - sandbox grants the first matcher skipped (PR #4446 advisory)', () => {
+  const h = (l) => `diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n${l}\n`;
+  const CODE = 'scripts/lib/isolation-provider.mjs';
+
+  it.each([
+    ['a leading block comment before a grant', CODE, '+/* note */ writableRoots: [a, "/"],'],
+    ['two leading block comments', CODE, '+/* a */ /* b */ writableRoots: [a],'],
+    ['a grant in a .ts file', 'scripts/lib/provider.ts', '+  writableRoots: [a],'],
+    ['a grant in a .js file', 'scripts/lib/provider.js', '+  sandbox_mode: "danger-full-access",'],
+    ['a grant in a .cjs file', 'scripts/lib/provider.cjs', '+  approval_policy: "never",'],
+    ['a grant in a .mts file', 'scripts/lib/provider.mts', '+  network_access: true,'],
+    ['an --add-dir flag in a shell script', 'scripts/run-agent.sh', '+codex exec --add-dir "$HOME" "$@"'],
+    ['a grant in .claude/settings.json', '.claude/settings.json', '+  "sandbox_mode": "danger-full-access",'],
+  ])('%s holds', (_n, file, body) => expect(permissionChangeKind(file, h(body))).toBe('sandbox-widening'));
+
+  it('comment-only lines, tests and specs of the widened file types do not hold', () => {
+    expect(permissionChangeKind(CODE, h('+/* writableRoots is documented here */'))).toBeNull();
+    expect(permissionChangeKind(CODE, h('+/* a */ // writableRoots'))).toBeNull();
+    expect(permissionChangeKind(CODE, h('+ * writableRoots'))).toBeNull();
+    expect(permissionChangeKind('scripts/lib/provider.test.ts', h('+  writableRoots: [a],'))).toBeNull();
+    expect(permissionChangeKind('scripts/lib/provider.spec.js', h('+  writableRoots: [a],'))).toBeNull();
+    expect(permissionChangeKind('scripts/lib/__tests__/provider.ts', h('+  writableRoots: [a],'))).toBeNull();
+  });
+
+  it('a block comment between an opener and a changed entry does not hide the owner', () => {
+    expect(permissionChangeKind(CODE, h('   /* roots */ writableRoots: [\n+    b,\n   ],'))).toBe('sandbox-widening');
+  });
+
+  describe('unreadable hunks (the net diff was not scored, or the repo had no clone)', () => {
+    const unreadable = [null, undefined, '', 'diff --git a/x b/y\nsimilarity index 100%\nrename from x\nrename to y\n'];
+    const failClosed = SANDBOX_BEARING_FILES.filter((f) => !SANDBOX_NULL_HUNKS_FREE.includes(f));
+    it.each(failClosed.flatMap((f) => unreadable.map((u) => [f, u])))('%s fails closed (%j)', (f, u) => {
+      expect(permissionChangeKind(f, u)).toBe('sandbox-widening');
+    });
+    it('an engine-tier file stays agent-reviewable on unreadable hunks, but a token on a readable line holds', () => {
+      for (const f of SANDBOX_NULL_HUNKS_FREE) {
+        expect(SANDBOX_BEARING_FILES).toContain(f);
+        expect(permissionChangeKind(f, null)).toBeNull();
+        expect(permissionChangeKind(f, h('+  argv.push("--dangerously-skip-permissions");'))).toBe('sandbox-widening');
+      }
+    });
+    it('.codex config and .claude settings fail closed', () => {
+      for (const f of ['.codex/config.toml', '.codex/sandbox.yaml', '.claude/settings.json', '.claude/settings.local.json']) {
+        expect(permissionChangeKind(f, null)).toBe('sandbox-widening');
+      }
+    });
+    it('an unrelated script or a test with unreadable hunks stays free', () => {
+      expect(permissionChangeKind('scripts/lib/ordinary.mjs', null)).toBeNull();
+      expect(permissionChangeKind('scripts/lib/__tests__/isolation-provider.test.mjs', null)).toBeNull();
+      expect(permissionChangeKind('docs/isolation-provider.md', null)).toBeNull();
+    });
+    it('a sandbox-bearing file whose hunks ARE readable is judged by its lines, not its path', () => {
+      expect(permissionChangeKind('scripts/lib/isolation-provider.mjs', h('+  const x = 1;'))).toBeNull();
+    });
+  });
+
+  it('SANDBOX_BEARING_FILES names every non-test script that spells a sandbox token (a new one forces a list update)', () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+    const SKIP_DIR = new Set(['node_modules', '__tests__', '__fixtures__', 'fixtures', '.git']);
+    const SCRIPT_EXT = /\.(mjs|cjs|js|mts|ts|sh|bash|py)$/;
+    const found = [];
+    const walk = (dir) => {
+      for (const e of readdirSync(join(root, dir), { withFileTypes: true })) {
+        const rel = `${dir}/${e.name}`;
+        if (e.isDirectory()) { if (!SKIP_DIR.has(e.name)) walk(rel); continue; }
+        if (!SCRIPT_EXT.test(e.name) || /\.(test|spec)\.[a-z]+$/.test(e.name)) continue;
+        if (SANDBOX_TOKEN_RE.test(readFileSync(join(root, rel), 'utf8'))) found.push(rel);
+      }
+    };
+    walk('scripts');
+    expect(found.sort()).toEqual([...SANDBOX_BEARING_FILES].sort());
+    for (const f of SANDBOX_BEARING_FILES) expect(existsSync(join(root, f))).toBe(true);
+  });
+});
+
+describe('permissionChangeKind - second advisory round: spellings, case and resource bounds (PR #4446)', () => {
+  const wfHunk = (body) => `diff --git a/${WF} b/${WF}\n--- a/${WF}\n+++ b/${WF}\n@@ -1,3 +1,4 @@\n${body}\n`;
+  const sbHunk = (l) => `diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n${l}\n`;
+
+  it.each([
+    ['alias on an unlisted scope', '+  copilot-requests: *w'],
+    ['grant word, upper case', '+  contents: WRITE'],
+    ['grant word, capitalised', '+  contents: Write'],
+    ['agent action sandbox input', '+        sandbox: danger-full-access'],
+    ['agent action permission-skip flag', '+          claude_args: --dangerously-skip-permissions'],
+    ['agent action codex sandbox', '+        codex_args: --sandbox workspace-write'],
+  ])('workflow: %s holds', (_n, b) => expect(permissionChangeKind(WF, wfHunk(b))).toBe('workflow-permissions'));
+
+  it('workflow: an env value from an expression is still free', () => {
+    expect(permissionChangeKind(WF, wfHunk('+  TOKEN: ${{ secrets.X }}'))).toBeNull();
+    expect(permissionChangeKind(WF, wfHunk(' env:\n+  OTHER: ${{ inputs.level }}'))).toBeNull();
+  });
+
+  it.each([
+    ['-s workspace-write argv pair', 'scripts/codex-direct-task.mjs', '-  "-s", "read-only",\n+  "-s", "workspace-write",'],
+    ['--sandbox flag', 'scripts/lib/provider.mjs', '+  args.push("--sandbox", mode);'],
+    ['--full-auto', 'scripts/lib/provider.mjs', '+  args.push("--full-auto");'],
+    ['--yolo', 'scripts/lib/provider.mjs', '+  args.push("--yolo");'],
+    ['bypass flag', 'scripts/lib/provider.mjs', '+  args.push("--dangerously-bypass-approvals-and-sandbox");'],
+    ['skip-permissions flag', 'scripts/gemini-direct-task.mjs', '+  argv.push("--dangerously-skip-permissions");'],
+    ['ask-for-approval', 'scripts/lib/provider.mjs', '+  args.push("--ask-for-approval", "never");'],
+    ['camelCase sandboxMode', 'scripts/lib/provider.mjs', '+  sandboxMode: "workspace-write",'],
+    ['camelCase approvalPolicy', 'scripts/lib/provider.mjs', '+  approvalPolicy: "never",'],
+    ['networkAccessEnabled', 'scripts/lib/provider.mjs', '+  networkAccessEnabled: true,'],
+    ['kebab writable-roots', 'scripts/lib/provider.mjs', '+  "writable-roots": ["/"],'],
+    ['PascalCase WritableRoots', 'scripts/lib/provider.mjs', '+  WritableRoots: ["/"],'],
+    ['toml sandbox_workspace_write table', '.codex/config.toml', '+[sandbox_workspace_write]'],
+    ['bypassPermissions in claude settings', '.claude/settings.json', '+  "defaultMode": "bypassPermissions",'],
+    ['additionalDirectories in claude settings', '.claude/settings.json', '+  "additionalDirectories": ["/"],'],
+    ['a python script', 'scripts/operator/run.py', '+    args += ["--add-dir", d]'],
+    ['a bash script', 'scripts/run.bash', '+codex exec --add-dir "$HOME"'],
+  ])('sandbox: %s holds', (_n, file, body) => expect(permissionChangeKind(file, sbHunk(body))).toBe('sandbox-widening'));
+
+  describe('resource bounds', () => {
+    const timed = (fn) => { const t = Date.now(); const r = fn(); return [r, Date.now() - t]; };
+    it('a run of YAML decorations on an empty key does not backtrack exponentially', () => {
+      for (const deco of ['&a', '!', '&', '!!str']) {
+        const [, ms] = timed(() => permissionChangeKind(WF, wfHunk(`+k: ${deco.repeat(60)} z`)));
+        expect(ms).toBeLessThan(500);
+      }
+    });
+    it('a huge workflow hunk is bounded: it holds instead of scanning quadratically', () => {
+      const body = Array.from({ length: 30000 }, () => '+    foo: bar').join('\n');
+      const [r, ms] = timed(() => permissionChangeKind(WF, wfHunk(body)));
+      expect(r).toBe('workflow-permissions');
+      expect(ms).toBeLessThan(3000);
+    });
+    it('a long workflow line holds without a regex scan', () => {
+      const [r, ms] = timed(() => permissionChangeKind(WF, wfHunk(`+  note: ${'x'.repeat(100000)}`)));
+      expect(r).toBe('workflow-permissions');
+      expect(ms).toBeLessThan(500);
+    });
+    it('a huge script hunk is read in bounded time and still catches a grant', () => {
+      const filler = Array.from({ length: 25000 }, () => '+const a = 1;').join('\n');
+      const [r, ms] = timed(() => permissionChangeKind('scripts/lib/big.mjs', sbHunk(`${filler}\n+  writableRoots: ["/"],`)));
+      expect(r).toBe('sandbox-widening');
+      expect(ms).toBeLessThan(3000);
+      const [free, ms2] = timed(() => permissionChangeKind('scripts/lib/big.mjs', sbHunk(filler)));
+      expect(free).toBeNull();
+      expect(ms2).toBeLessThan(3000);
+    });
+    it('a mid-size script hunk (5k lines) stays fast', () => {
+      const filler = Array.from({ length: 5000 }, () => '+const a = 1;').join('\n');
+      const [r, ms] = timed(() => permissionChangeKind('scripts/lib/big.mjs', sbHunk(filler)));
+      expect(r).toBeNull();
+      expect(ms).toBeLessThan(2000);
+    });
   });
 });
