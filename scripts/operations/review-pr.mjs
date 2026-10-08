@@ -224,6 +224,9 @@ import {
   MUTATION_PROBE_RULE,
 } from '../lib/review-core.mjs';
 import { CITATION_SCOPES, DISPOSITIONS, VERDICTS, scopeFindingsToCitedFiles } from '../lib/jury-core.mjs';
+import { normalizeFinding as normalizeOneFinding } from '../lib/jury-core.mjs';
+// Card 5469 — the scoped re-review rule's "did this finding hold the live verdict" test (pure).
+import { findingHeldVerdict } from '../lib/review-round-rules.mjs';
 import { renderPanelComment } from '../lib/review-render.mjs';
 // #xwp8ioh — the SAME predicate `we:scripts/review-set-label.mjs` enforces at the write side (#2953), imported
 // rather than restated, so the read side and the write side cannot drift into two answers (#2644).
@@ -1120,6 +1123,9 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
     hasReferralRecord: JSON.stringify(raw.comments ?? []).includes('mandatory-referrals-v1'),
     priorRounds: Number(raw?.priorRounds) || 0,
     latestFix: raw?.latestFix && typeof raw.latestFix === 'object' ? raw.latestFix : undefined,
+    // Card 5469 — the scoped re-review shadow mode, resolved by the io shell from the declared setting. Absent when
+    // `off` (the built-in), so an off run's record is byte-identical to before.
+    ...(raw?.scopedRereview === 'shadow' ? { scopedRereview: 'shadow' } : {}),
     pr: Number(detail.pr) || Number(pr) || 0,
     repo: String(detail.repo || repo || ''),
     title: String(detail.title || ''),
@@ -2695,6 +2701,9 @@ export function reviewPrOperation({
           summary: summaries.join(' | '),
           skippedSeats,
           ...(shadowSeats.length ? { shadowSeats } : {}),
+          // Card 5469 — the lenses whose seats reduce into the verdict (advisory seats excluded), so the scoped
+          // re-review shadow can tell which findings held the live verdict. Recorded only when the shadow is on.
+          ...(read.scopedRereview === 'shadow' ? { basisLenses: Object.keys(verdictAdmitted) } : {}),
         };
       },
     }),
@@ -2987,7 +2996,7 @@ export function reviewPrOperation({
     // `posted` = a comment actually landed in this run: the advisory note, or the verdict write-up swap.
     // IDEMPOTENT: TRUE. Both events are non-clearing, so a replay can at worst add one visit to a counter.
     ledgerEvents: effectStep({
-      reads: ['input.pr', 'input.repo', 'findings.read', 'findings.reduce', 'findings.advise', 'findings.record'],
+      reads: ['input.pr', 'input.repo', 'findings.read', 'findings.reduce', 'findings.advise', 'findings.record', 'findings.referralVerdict'],
       effects: (view) => {
         const read = view.findings.read;
         const landed = (finding, type) => (finding?.effects ?? []).some((e) => e.type === type && e.status === 'applied');
@@ -2999,7 +3008,8 @@ export function reviewPrOperation({
         }
         return [{
           type: REVIEW_EFFECTS.LEDGER_EVENTS,
-          payload: { pr: view.input.pr, repo: view.input.repo, headSha: read?.netBasis?.rev ?? null, posted, referralKeys },
+          payload: { pr: view.input.pr, repo: view.input.repo, headSha: read?.netBasis?.rev ?? null, posted, referralKeys,
+            ...(read?.scopedRereview === 'shadow' ? { roundFacts: scopedRereviewFacts(read, view.findings.reduce, view.findings.referralVerdict) } : {}) },
           idempotent: true,
         }];
       },
@@ -3028,6 +3038,41 @@ export function reviewPrOperation({
   }
 
   return declaration;
+}
+
+/**
+ * Card 5469 — THE PLAIN FACTS the scoped re-review shadow needs from one run, for the `review.ledger-events` sink (which
+ * adds the git and ledger reads and calls the pure rules in we:scripts/lib/review-round-rules.mjs). PURE. Every reported
+ * finding (admitted ones, and the ones set aside as card suggestions), whether it held the live verdict, the latest fix
+ * range, and the live verdict. Never a decision: the live verdict was settled by the steps above.
+ * @param {object} read - `findings.read`.
+ * @param {object} reduce - `findings.reduce`.
+ * @param {object} [final] - `findings.referralVerdict` (the verdict after referrals), when present.
+ * @returns {object}
+ */
+export function scopedRereviewFacts(read, reduce, final) {
+  const basisLenses = Array.isArray(reduce?.basisLenses) ? reduce.basisLenses : MANDATORY_LENSES;
+  const pick = (f) => {
+    const n = normalizeOneFinding(f);
+    return n ? { file: n.file, line: n.line, category: n.category, summary: n.summary.slice(0, 300), verdict: n.verdict,
+      impactIfUnfixed: n.impactIfUnfixed, disposition: n.disposition, outcome: n.outcome } : null;
+  };
+  const admitted = (Array.isArray(reduce?.admittedFindings) ? reduce.admittedFindings : []).map(pick).filter(Boolean);
+  const deferred = (Array.isArray(reduce?.deferredAdvisory) ? reduce.deferredAdvisory : []).map(pick).filter(Boolean);
+  const verdictOf = (v) => (typeof v?.verdict === 'string' ? v.verdict : typeof v === 'string' ? v : '');
+  const cardPaths = [...new Set(String(read?.body ?? '').match(/backlog\/[\w.-]+\.md/g) ?? [])].slice(0, 3);
+  return {
+    head: read?.netBasis?.rev ?? null,
+    basisLenses,
+    findings: [
+      ...admitted.map((finding) => ({ finding, heldVerdict: findingHeldVerdict(finding, { basisLenses }), deferred: false })),
+      ...deferred.map((finding) => ({ finding, heldVerdict: false, deferred: true })),
+    ],
+    latestFix: read?.latestFix ?? null,
+    liveVerdict: verdictOf(final?.verdict ?? final) || verdictOf(reduce?.verdict),
+    humanRequired: read?.humanRequired === true,
+    cardPaths,
+  };
 }
 
 /** The lens set a caller may pass. Re-exported so an adapter can list it in `--help` without a second copy. */

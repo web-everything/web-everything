@@ -540,6 +540,7 @@ export const EVENT_TYPES = Object.freeze({
   SEND_BACK: 'send-back',   // the PR goes back to its author
   AUTHOR: 'author',         // who opened the PR
   LABEL_INPUT: 'label-input', // a hand-applied label seen by the mirror
+  FINDING: 'finding',       // card 5469: one finding's stable identity + its status on a reviewed head (non-bearing)
 });
 
 /** Every event type, as an array. */
@@ -550,6 +551,13 @@ export const REVIEW_RUN_PHASES = Object.freeze(['started', 'completed']);
 export const APPROVAL_KINDS = Object.freeze(['clear-human', 'clear-operator', 'judge']);
 export const SEND_BACK_CAUSES = Object.freeze(['block-ruling', 'changes']);
 export const LABEL_INPUT_CHANGES = Object.freeze(['added', 'removed']);
+/** Card 5469 — a finding's status on one reviewed head: `raised` (it held the verdict), `tolerated` (reported, did
+ *  not hold it), `fixed` (raised on an earlier head, not reported now, and the fix range changed code at it),
+ *  `carded` (set aside as a card suggestion). Written only by the review role (`source: review-pr`). */
+export const FINDING_STATUS_VALUES = Object.freeze(['raised', 'tolerated', 'fixed', 'carded']);
+/** Card 5469 — a stable finding id: `fi-` + 12 hex of sha256(repo, pr, path, symbol, defect class). Distinct from the
+ *  #76a referral `f-` id, which also hashes the claim text and the first-seen head. */
+export const STABLE_FINDING_ID_PATTERN = /^fi-[0-9a-f]{12}$/;
 
 const isStr = (v) => typeof v === 'string' && v.trim() !== '';
 const oneOf = (list) => (v) => list.includes(v);
@@ -599,6 +607,17 @@ const EVENT_PAYLOAD = Object.freeze({
     ['label', isStr, (v) => oneLine(v, 128)],
     ['sender', isStr, (v) => oneLine(v, 200)],
     ['change', oneOf(LABEL_INPUT_CHANGES), (v) => v],
+  ],
+  // Card 5469 — identity = path + symbol + defect class (never free text). `path`/`symbol` may be empty (a finding
+  // citing no file, or a line outside any named declaration); `round` is the review round on this head (>= 1).
+  [EVENT_TYPES.FINDING]: [
+    ['headSha', (v) => shaOrNull(v) !== null, shaOrNull],
+    ['findingId', (v) => typeof v === 'string' && STABLE_FINDING_ID_PATTERN.test(v), (v) => v],
+    ['path', (v) => typeof v === 'string', (v) => oneLine(v, 300)],
+    ['symbol', (v) => typeof v === 'string', (v) => oneLine(v, 200)],
+    ['defectClass', isStr, (v) => oneLine(v, 100)],
+    ['status', oneOf(FINDING_STATUS_VALUES), (v) => v],
+    ['round', (v) => Number.isInteger(v) && v >= 1, (v) => v],
   ],
 });
 
