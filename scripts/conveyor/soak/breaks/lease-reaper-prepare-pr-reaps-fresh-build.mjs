@@ -49,7 +49,7 @@ function fakeBin(root, prs) {
 export default {
   id: 'lease-reaper-prepare-pr-reaps-fresh-build',
   title: "the resident lease-reaper reaps a FRESH conveyor-<N> build lease as pr-merged seconds after acquire, off item N's earlier-merged prepare PR",
-  card: 'we:backlog/xp4r23a-lease-reaper-reaps-a-fresh-build-lane-as-pr-merged-off-the-i.md',
+  card: '#xp4r23a',
   fixedBy: { sha: 'a3c11833cf101d86c4db067436385b678ebb52e5', where: 'lane/xp4r23a-reaper-fresh-lane', paths: ['scripts/conveyor/lease-reaper.mjs'] },
   fixPresent(root) {
     try {
