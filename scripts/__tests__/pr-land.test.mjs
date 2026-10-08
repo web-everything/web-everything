@@ -499,7 +499,7 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
   // durable guard is structural rather than a spelling grep — pr-land does not IMPORT the raw `{text, scored}`
   // producer at all, so the mis-mapping the review caught is not expressible here.
   it('#2890: derives the net-diff signals from the ONE shared function, and cannot hand-roll them', () => {
-    expect(src).toMatch(/import \{ computeNetDiffSignals \} from '\.\/merge-ai-prs\.mjs'/);
+    expect(src).toMatch(/import \{ computeNetDiffSignals, recordParkVerdict \} from '\.\/merge-ai-prs\.mjs'/);
     expect(src).toMatch(/computeNetDiffSignals\(\{ exec, remote: REMOTE, base: BASE, baseRev, rev: refSha \}\)/);
     // The raw producers are deliberately OUT of scope in this file.
     expect(src).not.toMatch(/\bcomputeNetDiffText\b\s*[,}]/);
@@ -853,5 +853,34 @@ describe('unlabelledHandOffLabel — label-on-green exits must not strand the PR
     expect(unlabelledHandOffLabel({ mode: 'land', reason: 'check-red', prNum: 1 })).toBeNull();
     expect(unlabelledHandOffLabel({ mode: 'label-on-green', reason: 'conflict', prNum: 1 })).toBeNull();
     expect(unlabelledHandOffLabel({ mode: 'label-on-green', reason: 'labelled-on-green', prNum: 1 })).toBeNull();
+  });
+});
+
+// ── E3 (#3929) — producer holds are ledgered alongside the label, never instead of it ────────────────────────────
+describe('E3 #3929 — pr-land records its holds in the verdict ledger (additive, fail-soft)', () => {
+  const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
+
+  it('the explicit --park entrance records BEFORE the label call', () => {
+    const rec = src.indexOf('ledgerProducerHold(parkLabel,');
+    const label = src.indexOf('forge.addLabel(prNum, parkLabel)');
+    expect(rec).toBeGreaterThan(-1);
+    expect(label).toBeGreaterThan(rec);
+  });
+
+  it('the scored escalation entrance records BEFORE the label call, inside the apply guard', () => {
+    const guard = src.indexOf('if (verdict.label && verdict.apply) {');
+    const rec = src.indexOf('ledgerProducerHold(verdict.label,', guard);
+    const label = src.indexOf('forge.addLabel(prNum, verdict.label)', guard);
+    expect(rec).toBeGreaterThan(guard);
+    expect(label).toBeGreaterThan(rec);
+  });
+
+  it('the recorder is fail-soft: wrapped in try/catch, producer provenance, no effect on the hold', () => {
+    const at = src.indexOf('const ledgerProducerHold');
+    const body = src.slice(at, at + 900);
+    expect(body).toContain('try {');
+    expect(body).toContain("declaredActor: 'producer', source: 'pr-land'");
+    expect(body).toContain('catch');
+    expect(body).not.toMatch(/throw |process\.exit|return false/);
   });
 });
