@@ -1215,6 +1215,9 @@ function missingRunBodyHasExactLine(body, line) {
   return body.split('\n').some((l) => l === line);
 }
 
+/** Leading text of the "stacked" refusal `missing-run-push.mjs` writes: `…(base <ref>, head repo <repo>); …`. */
+const MISSING_RUN_STACKED_REFUSAL_PREFIX = 'PR is stacked or from a fork (base ';
+
 /**
  * we:scripts/conveyor/main-red-recovery.mjs#countMissingRunComments — the DURABLE, restart-surviving
  * missing-run trigger-attempt count for ONE head sha, mirroring {@link countRebaseOntoMainComments}/
@@ -1222,9 +1225,10 @@ function missingRunBodyHasExactLine(body, line) {
  * EVERY attempt marker regardless of outcome — a permanently-failing trigger must still trip the cap. PURE.
  * @param {Array<{body?:string}|string>|null|undefined} comments
  * @param {string|null} [headSha]
+ * @param {{baseRefName?:(string|null)}} [o] - the PR's CURRENT base; stacked-refusal markers from another base are stale
  * @returns {number}
  */
-export function countMissingRunComments(comments, headSha = null) {
+export function countMissingRunComments(comments, headSha = null, { baseRefName = null } = {}) {
   if (!Array.isArray(comments)) return 0;
   let n = 0;
   for (const c of comments) {
@@ -1236,6 +1240,16 @@ export function countMissingRunComments(comments, headSha = null) {
     if (/via workflow-dispatch|trigger CI \(workflow-dispatch/.test(body)) continue;
     // xgq539z — legacy wrong-owner credential refusals (see MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL) are not counted.
     if (body.includes(MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL)) continue;
+    // A "stacked" refusal is bound to the base it was posted under. Once the drain retargets the PR (base changed,
+    // head sha unchanged), that refusal is stale: it said nothing about whether a push can start CI on the NEW
+    // base. Counting it burned the cap before the PR could ever be recovered (plateau-app #217, 2026-10-08).
+    // Compare the base EXACTLY — never parse it back out of prose: git ref names may hold `,` and `)`, so a parsed
+    // base is truncated and a still-stacked refusal would read as stale (cap bypass). `, head repo ` terminates the
+    // writer's base (`missing-run-push.mjs`) unambiguously because a ref name cannot contain a space. A refusal that
+    // recorded no base (`base ?`) cannot be proven stale, so it still counts.
+    if (baseRefName && body.includes(MISSING_RUN_STACKED_REFUSAL_PREFIX)
+      && !body.includes(`${MISSING_RUN_STACKED_REFUSAL_PREFIX}?, head repo `)
+      && !body.includes(`${MISSING_RUN_STACKED_REFUSAL_PREFIX}${baseRefName}, head repo `)) continue;
     if (headSha && !missingRunBodyHasExactLine(body, `sha: ${headSha}`)) continue;
     n += 1;
   }
