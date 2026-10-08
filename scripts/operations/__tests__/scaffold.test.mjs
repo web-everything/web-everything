@@ -14,6 +14,10 @@
  * Nothing here touches `fs` — the reader is a plain function returning a fixture.
  */
 import { describe, it, expect } from 'vitest';
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { sizeRefusal, parseSize } from '../../backlog/scaffold.mjs';
 
 import { advanceWhileRunning, startRun } from '../engine.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
@@ -91,6 +95,53 @@ describe('refusals', () => {
 
   it('a non-numeric size REFUSES instead of dropping it', () => {
     expect(reasonOf(() => planScaffold(read(), { kind: 'decision', title: 'x', size: 'big' }))).toBe('bad-size');
+  });
+
+  // The ONE rule both entry points share (`backlog.mjs scaffold` and `scaffold`/`file-item`), table-driven so a
+  // regression in either wiring has a named test to redden.
+  it.each([
+    ['decision', undefined, null],
+    ['decision', '', null],
+    ['decision', '3', null],
+    ['decision', 'big', 'bad-size'],
+    ['epic', '5', null],
+    ['investigation', '2', null],
+    ['task', undefined, null],
+    ['task', '', null],
+    ['task', '2', 'size-not-allowed'],
+    ['feature', '2', 'size-not-allowed'],
+    ['story', undefined, 'story-needs-size'],
+    ['story', '', 'story-needs-size'],
+    ['story', '3', null],
+  ])('sizeRefusal(%s, %j) → %s', (kind, raw, reason) => {
+    expect(sizeRefusal(kind, raw)?.reason ?? null).toBe(reason);
+  });
+
+  it('an empty size is ABSENT for a decision — no `size:` line, never `size: 0`', () => {
+    expect(parseSize('')).toBeUndefined();
+    expect(parseSize(undefined)).toBeUndefined();
+    expect(parseSize('0')).toBe(0);
+    expect(planScaffold(read(), { kind: 'decision', title: 'x', size: '' }).content).not.toMatch(/^size:/m);
+  });
+
+  // Every non-test caller of `file-item`/`fileCard` that hands in `kind: 'task'|'feature'` must NOT also hand in a
+  // `size` — `planScaffold` now refuses it, and a detached filing child fails only in its own log (the
+  // auto-filed prepare-failure card silently stopped being filed). Source-level, because the callers mock the filer.
+  it('no non-test caller pairs a never-sized kind with a size', () => {
+    const scriptsDir = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+    const offenders = [];
+    const walk = (dir) => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const p = join(dir, e.name);
+        if (e.isDirectory()) { if (e.name !== '__tests__' && e.name !== 'node_modules') walk(p); continue; }
+        if (!/\.(mjs|cjs|js)$/.test(e.name) || /\.test\./.test(e.name)) continue;
+        const src = readFileSync(p, 'utf8');
+        if (/kind:\s*['"](task|feature)['"][^}]{0,300}?\bsize\s*:/.test(src)) offenders.push(p);
+        if (/\bsize\s*:[^}]{0,300}?kind:\s*['"](task|feature)['"]/.test(src)) offenders.push(p);
+      }
+    };
+    walk(scriptsDir);
+    expect(offenders).toEqual([]);
   });
 
   it('every refusal reason is in the declared set', () => {

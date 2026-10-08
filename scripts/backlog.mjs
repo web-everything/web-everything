@@ -40,7 +40,7 @@ import { createRequire } from 'node:module';
 import { applyTransition, applySettle, readField, setFrontmatterField, removeFrontmatterField, accrueCost } from './backlog/frontmatter.mjs';
 import { planEpicResolveOnLand, hasBlockedBy } from './backlog/epic-resolve.mjs';
 import { parseCostTokens, formatCostTokens } from './backlog/cost-rates.mjs';
-import { nextNum, slugify, renderItem, sizeRefusal } from './backlog/scaffold.mjs';
+import { nextNum, slugify, renderItem, sizeRefusal, parseSize } from './backlog/scaffold.mjs';
 import { nextHash, normalizeId, idFromName, isHash, slugFromName } from './backlog/id.mjs';
 import { parseReservations, emptyState, addHolds, removeBySession, removeNums, pruneExpired, serialize, sessionForNum } from './readiness/reservations.mjs';
 // #2803 resolve-time scope reconciliation. Every one of these graphs is light and adds no measurable startup
@@ -692,7 +692,7 @@ function scaffold() {
     else kind = 'story';
   }
   if (!BACKLOG_KINDS.has(kind)) die(`--kind must be one of ${[...BACKLOG_KINDS].join('|')} (got "${kind}")`);
-  const size = flag('size') !== undefined ? Number(flag('size')) : undefined;
+  const size = parseSize(flag('size'));
   const title = flag('title');
   if (!title) die('scaffold needs --title="…"');
   // Shared with the `scaffold`/`file-item` operations (#x0h3pe4): never silently drop a passed --size.

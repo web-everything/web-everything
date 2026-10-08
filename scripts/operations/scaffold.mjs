@@ -36,7 +36,7 @@ import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { BACKLOG_KINDS } from '../check-standards-rules.mjs';
 import { nextHash } from '../backlog/id.mjs';
-import { renderItem, sizeRefusal } from '../backlog/scaffold.mjs';
+import { renderItem, sizeRefusal, parseSize } from '../backlog/scaffold.mjs';
 
 export const SCAFFOLD_OP = 'scaffold';
 
@@ -123,7 +123,7 @@ export function planScaffold(read, input = {}, { alloc = nextHash } = {}) {
   const title = String(input.title || '').trim();
   if (!title) refuse('no-title', 'a new item needs a --title');
 
-  const size = input.size === undefined || input.size === '' ? undefined : Number(input.size);
+  const size = parseSize(input.size);
   // A story without a size enters the board unsized, which the readiness ranker cannot place — so the CLI
   // refuses it and so does this. A size passed for a kind that is never sized, or a non-numeric one, is
   // refused too (#x0h3pe4) — never silently dropped. One shared rule with the CLI: `sizeRefusal`.

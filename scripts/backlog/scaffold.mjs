@@ -30,6 +30,16 @@ export const pad3 = (n) => String(n).padStart(3, '0');
 export const UNSIZED_KINDS = new Set(['task', 'feature']);
 
 /**
+ * The one shared reading of a raw `--size` flag: `undefined`/`''` mean "not passed" (→ `undefined`), anything
+ * else is `Number(raw)`. Both entry points (`backlog.mjs scaffold`, the `scaffold`/`file-item` operations)
+ * use it so an empty `--size=` is "absent" in both — `Number('')` is `0`, which would write `size: 0`.
+ * @returns {number|undefined}
+ */
+export function parseSize(rawSize) {
+  return rawSize === undefined || rawSize === '' ? undefined : Number(rawSize);
+}
+
+/**
  * The one shared answer to "is this `--size` acceptable for this kind?" (#x0h3pe4), used by both the
  * `scaffold`/`file-item` operations and the `backlog.mjs scaffold` CLI so neither ever silently drops a
  * passed size. PURE. `rawSize` is the flag as given (`undefined`/`''` = not passed).

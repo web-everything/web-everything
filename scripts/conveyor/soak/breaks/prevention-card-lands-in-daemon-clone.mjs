@@ -116,7 +116,7 @@ export default {
         const modulePath = join(w.simCloneRoot, 'scripts', 'review-set-label.mjs');
         const input = {
           title: 'Soak-break reproduction: prevention card filing probe',
-          kind: 'task',
+          kind: 'story', // sized, so not a `task` (a sized task is refused — #x0h3pe4)
           size: '1',
           digest: 'Soak-harness reproduction of the #4317 daemon-clone-dirt incident — safe to delete.',
           scope: 'we:scripts/conveyor/soak/breaks/prevention-card-lands-in-daemon-clone.mjs',
