@@ -112,6 +112,7 @@ import {
   laneAuthoredSince,
 } from './lib/lane-lease.mjs';
 import { retryTransientGit } from './lib/git-fetch-retry.mjs';
+import { healLaneRefs, diagnoseLane, quarantineLane, looksLikeCorruption } from './lib/lane-repair.mjs';
 // #4122 — the free-lane list `acquire`'s auto-pick reads as a fast pre-filter before paying for its own scan
 // (see that module's own header for the full incident/design writeup).
 import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } from './lib/free-lane-list.mjs';
@@ -839,6 +840,47 @@ function cloneLane(repo, n) {
   tryGit(['checkout', '--quiet', '-B', repo.branch, `origin/${repo.branch}`], dest);
 }
 
+// xj1vryw — SELF-HEALING FETCH. A lane whose clone is corrupt (a ref pointing at an object the shared --reference
+// store no longer has, e.g. `refs/heads/pr-1686`; a commit-graph naming an absent object; a broken index) used to
+// fail `fetch origin --prune` and with it every acquire/refresh of that lane (live 2026-10-08: lane-2 + lane-3
+// blocked the #4368/#4370 ci-heals). Now: (1) a corruption-shaped failure heals what cannot lose work (stale
+// commit-graph, dangling refs, a leftover refs/pull/* refspec) and retries; (2) if the clone is STILL unhealthy
+// and `allowReclone` (the caller HOLDS this lane's lease, or it has none), the clone is QUARANTINED (moved aside,
+// never deleted) and re-provisioned, carrying the lease across. A network/auth failure matches neither signature
+// nor fails the probe, so it still throws unchanged and never costs a good lane its clone.
+function msgOf(e) { return `${e && e.message ? e.message : e}\n${e && e.stderr ? e.stderr : ''}`; }
+function fetchOriginHealing(repo, n, { allowReclone = false } = {}) {
+  const dir = laneDir(repo, n);
+  try {
+    return fetchOriginPruneWithRetry(dir);
+  } catch (e) {
+    const probe = diagnoseLane(dir);
+    if (!looksLikeCorruption(msgOf(e)) && probe.ok) throw e;
+    log(`  ⚠ lane-${n}: fetch failed on a corrupt-looking clone (${msgOf(e).trim().split('\n').filter(Boolean).slice(-1)[0]}) — healing refs/commit-graph and retrying`);
+    healLaneRefs(dir, { log });
+    try {
+      return fetchOriginPruneWithRetry(dir);
+    } catch (e2) {
+      const after = diagnoseLane(dir);
+      if (!allowReclone || (after.ok && !looksLikeCorruption(msgOf(e2)))) throw e2;
+      recloneLane(repo, n, after.problems.join('; ') || msgOf(e2).trim().split('\n')[0]);
+      return fetchOriginPruneWithRetry(dir);
+    }
+  }
+}
+
+// xj1vryw — quarantine + re-provision lane-N in place, carrying its lease marker across. Only callers that hold
+// the lane's lease (or know it has none) may use this; the old clone is MOVED to `<poolDir>/.quarantine/`, never deleted.
+function recloneLane(repo, n, reason) {
+  const dir = laneDir(repo, n);
+  let lease = null;
+  try { lease = readFileSync(LEASE_MARKER(dir), 'utf8'); } catch { /* no lease to carry */ }
+  quarantineLane(dir, join(repo.poolDir, '.quarantine'), { log, reason });
+  cloneLane(repo, n);
+  if (lease) writeFileSync(LEASE_MARKER(dir), lease);
+  journalLaneEvent(dir, { action: 'quarantine-reclone', before: null, headAfter: laneHead(dir), reason: `corrupt clone quarantined + re-provisioned: ${reason}`, loud: true });
+}
+
 // Dirty-or-ahead guard (#2267 — data-loss guard): a lane's ONLY durable state is what has already been
 // PUSHED to origin (i.e. landed via pr-land); anything else (uncommitted edits, or commits made locally
 // but not yet pushed to its `lane/*` ref) lives nowhere else and is destroyed by `reset --hard` + `clean
@@ -1113,7 +1155,8 @@ function localRemoteShas(dir) {
 // (safe to unmap its stale item mapping, #2139) from a skipped one (still serving its in-flight item).
 function refreshLane(repo, n, { force = false } = {}) {
   const dir = laneDir(repo, n);
-  fetchOriginPruneWithRetry(dir);
+  // xj1vryw — self-healing fetch; may quarantine + re-clone a corrupt lane ONLY when no live lease holds it.
+  fetchOriginHealing(repo, n, { allowReclone: !liveLease(dir, Date.now(), ttlMsFromFlags()) });
   // #2337(b) — a LIVE lease is an ownership hold (a process is presumed alive within TTL), distinct from the
   // dirty/ahead STALENESS guard below. `--force` exists to recycle stale residue, not to stomp an active
   // consumer, so the lease check runs REGARDLESS of `--force`: a leased lane is always skipped (loud), never
@@ -1774,7 +1817,16 @@ const acquireResetSnapshots = new Map();
 function provisionClaimedLane(repo, chosen, targetWasReserved) {
   const dir = laneDir(repo, chosen);
   if (!flags['no-reset'] && !targetWasReserved) {
-    fetchOriginPruneWithRetry(dir);
+    // xj1vryw — this process just WON the lane's lease, so it may repair it: a corrupt clone (broken index, missing
+    // object, dangling ref) is healed or quarantined + re-provisioned here, so acquire hands out a healthy lane.
+    let health = diagnoseLane(dir);
+    if (!health.ok) {
+      log(`  ⚠ lane-${chosen}: unhealthy clone (${health.problems.join('; ')}) — healing`);
+      healLaneRefs(dir, { log });
+      health = diagnoseLane(dir);
+      if (!health.ok) recloneLane(repo, chosen, health.problems.join('; '));
+    }
+    fetchOriginHealing(repo, chosen, { allowReclone: true });
     // #2924 — re-verify containment on FRESH post-fetch remote-tracking refs, immediately before the
     // destructive reset below. Whatever proved this lane safe to reset — auto-pick's cached-scan candidate
     // check, or nothing at all before #3390's own explicit-lane guard — is up to ~30s stale by the time this line runs
