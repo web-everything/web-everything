@@ -38,7 +38,9 @@ import {
   defaultDraftsDir, defaultOperationsDir, envelopeFromLegacy, legacyOutcomeWord, resolvePostmortemMode, routeWorkerResult, settleWorkerResult,
   writeProductFixDraft,
 } from './worker-result-router.mjs';
+import { sanitizeSpawnEnv } from '../lib/gh-app-shim.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
+import { markWorkerEnv } from './session-role.mjs';
 
 /** The knob. `WE_WORKER_WRAPPER=on` routes a migrated launcher through this wrapper; anything else is the old path, byte for byte. */
 export const WORKER_WRAPPER_ENV = 'WE_WORKER_WRAPPER';
@@ -131,13 +133,16 @@ export function extractAgyResult(stdout) {
  * @property {string} [postmortemMode]   off | draft | file (else resolved from env)
  */
 
-const OPERATOR_STOP_SIGNALS = Object.freeze(['SIGTERM', 'SIGINT', 'SIGHUP']);
-/** A child that TRAPS one of those signals and exits normally reports 128+n (129 HUP, 130 INT, 143 TERM). */
-const TRAPPED_STOP_STATUS = Object.freeze([129, 130, 143]);
+/** An operator stop is the WRAPPER being told to stop (TERM/INT/HUP delivered to this process while the child runs). It is NOT inferred
+ *  from how the child ended, so a worker that signals ITSELF or `exit 143`s can no longer pick `aborted` (no draft). RESIDUAL: Node cannot
+ *  tell who sent a signal, so a worker that deliberately signals its PARENT (`kill -TERM $PPID`, or the process group) is still read as a
+ *  stop; closing that needs a stop sentinel the stopper writes, which no stop tooling does yet. The operator's stop must also target the
+ *  wrapper pid, not the worker pid in the started record (a worker killed directly is a contract violation). */
+export const OPERATOR_STOP_SIGNALS = Object.freeze(['SIGTERM', 'SIGINT', 'SIGHUP']);
+/** After a forwarded stop signal, a child that ignores it is SIGKILLed after this long, so the wrapper still writes its record. */
+const STOP_GRACE_MS = 5_000;
 /** `spawnToCompletion` kills the child itself on a stream overflow and says so in the message (it sets `killed` too). */
 const isOverflow = (failure) => /maxBuffer exceeded/.test(String(failure?.message ?? ''));
-/** A signal that did not come from OUR timeout or buffer guard (`killed` false): someone outside stopped the worker. */
-const isExternalStop = (failure) => !!failure && !failure.killed && (OPERATOR_STOP_SIGNALS.includes(failure.signal) || TRAPPED_STOP_STATUS.includes(failure.status));
 
 /**
  * Run ONE worker to completion and leave its v2 record behind. Resolves (never rejects on a worker failure): the
@@ -151,17 +156,45 @@ const isExternalStop = (failure) => !!failure && !failure.killed && (OPERATOR_ST
  * @param {(f: string) => string} [io.readFile]
  * @param {() => string|null} [io.head]               HEAD probe for headBefore / headAfter
  * @param {() => (object|null)} [io.legacyRead]       the old report for a launcher still migrating
- * @param {(failure: Error) => boolean} [io.isOperatorStop]  true when the operator stopped the worker (D6: aborted, no job); default: an EXTERNAL TERM/INT/HUP
+ * @param {(failure: Error) => boolean} [io.isOperatorStop]  true when the operator stopped the worker (D6: aborted, no job); default: this wrapper was sent TERM/INT/HUP during the run
+ * @param {{on: Function, off: Function}} [io.stopSource]  where the stop signals arrive (default `process`); a test passes an EventEmitter
  * @param {(record: object, dir: string) => *} [io.writeRecord]
  * @param {(action: object, o: {dir: string}) => *} [io.writeDraft]
- * @returns {Promise<{envelope: object, result: object, action: object, legacyRecord: object|null, stdout: string, stderr: string}>}
+ * @returns {Promise<{envelope: object, result: object, action: object, legacyRecord: object|null, stdout: string, stderr: string, failure: Error|null, resourceUsage: object|null}>}
  */
 export async function runWorker(spec, io = {}) {
+  const { stopSource = process } = io;
+  // `live` is false once the child has ended: a stop that lands after that (e.g. during the record write) cannot have aborted the worker,
+  // so it must not relabel a genuine crash `aborted`; it is still remembered in `signal` so it can be re-raised below.
+  const stop = { requested: false, signal: null, live: true, forward: null };
+  // Listen for the stop for the WHOLE run, record write included: with a handler installed Node no longer dies on TERM before the envelope is written.
+  const onStop = (sig) => {
+    stop.signal ??= sig;
+    if (!stop.live) return;
+    stop.requested = true;
+    stop.forward?.(sig);
+  };
+  for (const sig of OPERATOR_STOP_SIGNALS) stopSource.on(sig, onStop);
+  try {
+    return await runWorkerOnce(spec, io, stop);
+  } finally {
+    for (const sig of OPERATOR_STOP_SIGNALS) stopSource.off(sig, onStop);
+    // Our handler swallowed the signal, and runWorker can run in a long-lived process (the in-process build path): once the envelope is
+    // written, hand the stop back to the default action so the operator's stop still ends that process (codex-direct-task.mjs does the same).
+    const reraise = io.reraise ?? (stopSource === process ? (sig) => process.kill(process.pid, sig) : null);
+    if (stop.signal && reraise) reraise(stop.signal);
+  }
+}
+
+async function runWorkerOnce(spec, io, stop) {
   const {
     spawnToCompletionFn = spawnToCompletion, spawnFn = spawn, now = () => new Date().toISOString(), readFile = (f) => readFileSync(f, 'utf8'),
-    head = () => null, legacyRead = null, isOperatorStop = isExternalStop, writeRecord = writeCompletion, writeDraft = writeProductFixDraft,
+    head = () => null, legacyRead = null, isOperatorStop = () => stop.requested, writeRecord = writeCompletion, writeDraft = writeProductFixDraft,
   } = io;
   for (const k of ['role', 'launcher', 'session', 'command']) if (!spec?.[k]) throw new TypeError(`operations: runWorker needs spec.${k}`);
+  // The codex `-o` file is written by the CHILD, so a relative path means relative to the child's cwd — resolve it once and use it for
+  // the pre-run cleanup AND the read. (completionsDir / draftsDir / operationsDir are the WRAPPER's own and stay wrapper-relative.)
+  const resultFile = spec.resultFile ? resolve(spec.cwd ?? process.cwd(), spec.resultFile) : null;
   const timeoutMs = Number.isInteger(spec.timeoutMs) && spec.timeoutMs > 0 ? spec.timeoutMs : DEFAULT_TIMEOUT_MS;
   const dir = spec.completionsDir ?? resolveCompletionsDir();
   const base = { session: spec.session, role: spec.role, launcher: spec.launcher, model: spec.model ?? null, pr: spec.pr ?? null, item: spec.item ?? null, sessionId: spec.sessionId ?? null };
@@ -170,8 +203,16 @@ export async function runWorker(spec, io = {}) {
   let started = newEnvelopeRecord({ ...base, headBefore, timeoutMs, now });
   let recordWriteFailure = null; // an infrastructure fault (lock timeout), not a worker failure: runWorker rejects with it
   // The job record: written the moment the child has a pid (the spawn seam below), before it can finish.
+  let graceTimer = null;
   const spawnWithPid = (cmd, argv, opts) => {
     const child = spawnFn(cmd, argv, opts);
+    // An operator stop is forwarded to the child; one that ignores it is SIGKILLed after a grace, so the wrapper still writes its record.
+    stop.forward = (sig) => {
+      try { child.kill(sig); } catch { /* already gone */ }
+      graceTimer ??= setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, STOP_GRACE_MS);
+      graceTimer.unref?.();
+    };
+    if (stop.requested) stop.forward('SIGTERM'); // the stop landed before the child existed
     if (child?.pid) {
       started = newEnvelopeRecord({ ...base, headBefore, pid: child.pid, timeoutMs, now });
       // A failed job-record write must not leave the child running unseen (60-minute budget, still editing the lane).
@@ -185,21 +226,26 @@ export async function runWorker(spec, io = {}) {
   };
 
   // A result file left by an earlier attempt must not read as this run's result (codex: a clean exit + a stale `-o` file).
-  if (spec.launcher === 'codex-exec' && spec.resultFile) { try { rmSync(spec.resultFile, { force: true }); } catch { /* best effort */ } }
+  if (spec.launcher === 'codex-exec' && resultFile) { try { rmSync(resultFile, { force: true }); } catch { /* best effort */ } }
 
   let stdout = '';
   let stderr = '';
   let failure = null;
+  let resourceUsage = null;
   try {
     const out = await spawnToCompletionFn(spec.command, spec.argv ?? [], {
-      cwd: spec.cwd, env: spec.env ?? process.env, timeout: timeoutMs, killSignal: 'SIGKILL',
+      // EVERY launch path gets the same env hygiene (a static GH_TOKEN stripped, the worker marker set), not just the callers that
+      // happen to pass a sanitising spawn: the detached CLI and any future launcher inherit it here.
+      cwd: spec.cwd, env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)), timeout: timeoutMs, killSignal: 'SIGKILL',
       stdio: ['ignore', 'pipe', 'pipe'], // stdin closed: codex hangs on an open pipe (S0)
     }, { spawnFn: spawnWithPid });
-    stdout = out.stdout; stderr = out.stderr;
+    stdout = out.stdout; stderr = out.stderr; resourceUsage = out.resourceUsage ?? null;
   } catch (e) {
     failure = e;
-    stdout = e?.stdout ?? ''; stderr = e?.stderr ?? '';
+    stdout = e?.stdout ?? ''; stderr = e?.stderr ?? ''; resourceUsage = e?.resourceUsage ?? null;
   }
+  stop.live = false;
+  clearTimeout(graceTimer);
   if (recordWriteFailure) throw recordWriteFailure; // the child was killed; the docblock's "cannot be written" rejection
   // If the injected spawn never reported a pid (a fake child), still leave a started record behind.
   if (started.pid == null) withCompletionLock(spec.session, () => writeRecord(started, dir), { dir });
@@ -207,7 +253,7 @@ export async function runWorker(spec, io = {}) {
   // 1. the channel for this launcher
   let extracted;
   if (spec.launcher === 'codex-exec') {
-    try { extracted = { text: readFile(spec.resultFile), prose: tail(stdout) }; } catch { extracted = { reason: 'no-structured-output', prose: tail(stdout) }; }
+    try { extracted = { text: readFile(resultFile), prose: tail(stdout) }; } catch { extracted = { reason: 'no-structured-output', prose: tail(stdout) }; }
   } else if (spec.launcher === 'agy') extracted = extractAgyResult(stdout);
   else extracted = extractClaudeResult(stdout);
 
@@ -241,14 +287,15 @@ export async function runWorker(spec, io = {}) {
   const action = routeWorkerResult(settled.result, { role: spec.role, launcher: spec.launcher, session: spec.session, pr: spec.pr == null ? null : String(spec.pr), item: spec.item == null ? null : String(spec.item), postmortemMode: mode });
   const finished = finishEnvelopeRecord(started, {
     result: settled.result, parse: settled.parse, action, outcome: legacyOutcomeWord(settled.result), reroute: settled.reroute,
-    headAfter: head(), source: settled.source ?? (gotResult ? 'worker-result' : 'none'),
+    // The wrapper wrote this result itself even when it is a fail-closed or aborted one: `none` is only for a legacy record that never reported.
+    headAfter: head(), source: settled.source ?? 'worker-result',
   }, now);
   withCompletionLock(spec.session, () => writeRecord(finished, dir), { dir });
   if (action.type === 'product-fix-draft') {
     // the shared 114 drafts store unless the spec names another; mode `off` writes nothing (the router put the mode on the action)
     try { writeDraft(action, { dir: spec.draftsDir ?? defaultDraftsDir(), now }); } catch { /* the envelope is the record of truth; a draft failure must not lose it */ }
   }
-  return { envelope: finished, result: settled.result, action, legacyRecord, stdout, stderr };
+  return { envelope: finished, result: settled.result, action, legacyRecord, stdout, stderr, failure, resourceUsage };
 }
 
 // ── detached launch + CLI ───────────────────────────────────────────────────────────────────────────────────────
@@ -265,10 +312,11 @@ export function launchDetached(spec, { specDir, spawnFn = spawn, nodePath = proc
   mkdirSync(specDir, { recursive: true, mode: 0o700 });
   const specFile = join(specDir, `${spec.session}.spec.json`);
   // The spec file never carries `env` (it can hold tokens): the detached child inherits the launcher's environment
-  // instead. Owner-only permissions; the child deletes it once read.
+  // instead, with a static GH_TOKEN stripped and the worker marker set (the worker it spawns is sanitised again in runWorker).
+  // Owner-only permissions; the child deletes it once read.
   const { env: _env, ...safe } = spec;
   writeFileSync(specFile, `${JSON.stringify(safe)}\n`, { mode: 0o600 });
-  const child = spawnFn(nodePath, [entry, `--spec=${specFile}`], { detached: true, stdio: 'ignore', env: spec.env ?? process.env });
+  const child = spawnFn(nodePath, [entry, `--spec=${specFile}`], { detached: true, stdio: 'ignore', env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)) });
   child.unref?.();
   return { wrapperPid: child.pid, specFile };
 }

@@ -2,13 +2,16 @@
  * @file worker-wrapper.test.mjs — item 117 slice S3a: the unified detached worker wrapper (D7 FINAL).
  * These run the wrapper against REAL child processes (node -e), so pid, stdin and timeout are proven, not mocked.
  */
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { validateCompletionRecord } from '../completion-record.mjs';
 import { tryReadCompletion, writeCompletion } from '../completion-store.mjs';
+import { WORKER_MARKER_ENV, WORKER_MARKER_VALUE } from '../session-role.mjs';
 import { listDraftKeys } from '../worker-result-router.mjs';
 import {
   STRUCTURED_OUTPUT_SUFFIX, extractAgyResult, extractClaudeResult, launchDetached, runWorker, withStructuredOutput, workerWrapperEnabled,
@@ -123,6 +126,61 @@ describe('runWorker: the job record and the result channels', () => {
     expect(envelope.outcome).not.toBe('done');
   });
 
+  it('codex: relative resultFile resolves against spec.cwd', async () => {
+    const dir = tmp();
+    const childDir = join(dir, 'child');
+    mkdirSync(childDir);
+    // vitest threads cannot chdir, so the wrapper's own cwd is process.cwd(): park an UNRELATED same-named file there
+    const name = `wr-last-${process.pid}-${Date.now()}.json`;
+    const sentinel = join(process.cwd(), name);
+    writeFileSync(sentinel, 'unrelated');
+    try {
+      const script = `require('fs').writeFileSync(${JSON.stringify(name)}, ${JSON.stringify(JSON.stringify(DONE))})`;
+      const { envelope } = await runWorker(spec({ launcher: 'codex-exec', resultFile: name, cwd: childDir, argv: ['-e', script], session: 'build-4011' }, dir));
+      expect(envelope).toMatchObject({ status: 'done', outcome: 'done', parse: { ok: true } });
+      expect(readFileSync(sentinel, 'utf8')).toBe('unrelated'); // the pre-run cleanup must not touch the wrapper-cwd file
+      // and the stale-file cleanup hits the CHILD's file: a leftover under spec.cwd is not this run's result
+      writeFileSync(join(childDir, name), JSON.stringify(DONE));
+      const stale = await runWorker(spec({ launcher: 'codex-exec', resultFile: name, cwd: childDir, argv: ['-e', '0'], session: 'build-4012' }, dir));
+      expect(stale.envelope.parse).toEqual({ ok: false, reason: 'no-structured-output' });
+    } finally {
+      rmSync(sentinel, { force: true });
+    }
+  });
+
+  it('every fail-closed or aborted envelope is a VALID record and never claims source "none" (that is for a legacy record that never reported)', async () => {
+    const dir = tmp();
+    const stopSource = new EventEmitter();
+    const cases = {
+      timeout: [spec({ argv: ['-e', 'setInterval(()=>{},1000)'], timeoutMs: 300, session: 'build-4040' }, dir), {}],
+      'nonzero exit': [spec({ argv: ['-e', 'process.exitCode=3'], session: 'build-4041' }, dir), {}],
+      'no output': [spec({ argv: printing(claudeStdout(undefined)), session: 'build-4042' }, dir), {}],
+      aborted: [spec({ argv: ['-e', 'setInterval(()=>{},1000)'], session: 'build-4043' }, dir), { isOperatorStop: () => true, stopSource }],
+    };
+    for (const [name, [s, io]] of Object.entries(cases)) {
+      const { envelope } = await runWorker(s, io);
+      expect(envelope.source, name).toBe('worker-result');
+      expect(validateCompletionRecord(envelope), name).toEqual({ ok: true, errors: [] });
+    }
+  }, 60_000);
+
+  it('the child never sees GH_TOKEN/GITHUB_TOKEN and is marked a worker, whether the spec carries env or inherits the wrapper\'s', async () => {
+    const dir = tmp();
+    const out = join(dir, 'env.txt');
+    const script = `require('fs').writeFileSync(${JSON.stringify(out)}, [process.env.GH_TOKEN, process.env.GITHUB_TOKEN, process.env.${WORKER_MARKER_ENV}].map(String).join('|'))`;
+    await runWorker(spec({ argv: ['-e', script], env: { ...process.env, GH_TOKEN: 'ghp_aaaaaaaaaaaaaaaa1', GITHUB_TOKEN: 'ghp_bbbbbbbbbbbbbbbb2' }, session: 'build-4050' }, dir));
+    expect(readFileSync(out, 'utf8')).toBe(`undefined|undefined|${WORKER_MARKER_VALUE}`);
+    rmSync(out);
+    const prev = process.env.GH_TOKEN;
+    process.env.GH_TOKEN = 'ghp_cccccccccccccccc3';
+    try {
+      await runWorker(spec({ argv: ['-e', script], session: 'build-4051' }, dir)); // no spec.env: inherits process.env
+    } finally {
+      if (prev === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prev;
+    }
+    expect(readFileSync(out, 'utf8')).toBe(`undefined|undefined|${WORKER_MARKER_VALUE}`);
+  }, 60_000);
+
   it('codex: a STALE -o file from an earlier attempt is not this run\'s result (clean exit, nothing written)', async () => {
     const dir = tmp();
     const resultFile = join(dir, 'last.json');
@@ -132,18 +190,83 @@ describe('runWorker: the job record and the result channels', () => {
     expect(envelope.outcome).not.toBe('done');
   });
 
-  it('classification (real wiring, no injected hook): an external SIGTERM is aborted with no draft; an overflow is not blamed on a timeout', async () => {
+  it('a worker cannot pick its own failure class: a self-sent SIGTERM and a bare exit 143 are contract violations, never an operator stop', async () => {
     const dir = tmp();
     const term = spec({ argv: ['-e', `process.kill(process.pid,'SIGTERM');setInterval(()=>{},1000)`], session: 'build-4006' }, dir);
-    expect((await runWorker(term)).envelope).toMatchObject({ outcome: 'aborted', action: { type: 'aborted' } });
-    expect(listDraftKeys(term.draftsDir)).toEqual([]);
-    const trapped = spec({ argv: ['-e', 'process.exitCode=143'], session: 'build-4009' }, dir);
-    expect((await runWorker(trapped)).envelope).toMatchObject({ outcome: 'aborted' }); // a child that traps TERM and exits 128+15
+    expect((await runWorker(term)).envelope).toMatchObject({ outcome: 'blocked', parse: { ok: false, reason: 'ended-without-result' }, action: { type: 'product-fix-draft' }, result: { blocker: { kind: 'contract-violation' } } });
+    expect(listDraftKeys(term.draftsDir)).toHaveLength(1);
+    const exit143 = spec({ argv: ['-e', 'process.exitCode=143'], session: 'build-4009' }, dir);
+    const out = (await runWorker(exit143)).envelope;
+    expect(out.outcome).not.toBe('aborted');
+    expect(out.action.type).toBe('product-fix-draft');
+  }, 60_000);
+
+  it('an operator stop is the WRAPPER being told to stop: the signal reaches the child, the envelope is aborted, no draft, and the listeners are gone', async () => {
+    const stopSource = new EventEmitter();
+    const dir = tmp();
+    for (const [i, argv] of [['-e', 'setInterval(()=>{},1000)'], ['-e', `process.on('SIGTERM',()=>process.exit(143));setInterval(()=>{},1000)`]].entries()) {
+      const s = spec({ argv, session: `build-402${i}` }, dir);
+      const run = runWorker(s, { stopSource });
+      for (let n = 0; n < 200 && !Number.isInteger(read(s)?.pid); n++) await new Promise((r) => setTimeout(r, 25)); // wait for the started record
+      expect(stopSource.listenerCount('SIGTERM')).toBe(1);
+      stopSource.emit('SIGTERM', 'SIGTERM');
+      const { envelope } = await run;
+      expect(envelope).toMatchObject({ outcome: 'aborted', action: { type: 'aborted' } });
+      expect(listDraftKeys(s.draftsDir)).toEqual([]);
+      expect(stopSource.listenerCount('SIGTERM')).toBe(0);
+    }
+  }, 60_000);
+
+  it('the stop is not swallowed: once the envelope is written it is re-raised, and a stop that lands AFTER the child ended does not relabel a crash `aborted`', async () => {
+    const dir = tmp();
+    const reraise = [];
+    const stopSource = new EventEmitter();
+    const hung = spec({ argv: ['-e', 'setInterval(()=>{},1000)'], session: 'build-4060' }, dir);
+    const run = runWorker(hung, { stopSource, reraise: (sig) => reraise.push(sig) });
+    for (let n = 0; n < 200 && !Number.isInteger(read(hung)?.pid); n++) await new Promise((r) => setTimeout(r, 25));
+    stopSource.emit('SIGINT', 'SIGINT');
+    expect((await run).envelope.outcome).toBe('aborted');
+    expect(reraise).toEqual(['SIGINT']);
+    expect(read(hung)).toMatchObject({ status: 'done', outcome: 'aborted' }); // the record is written BEFORE the stop is handed back
+
+    const late = spec({ argv: ['-e', 'process.exitCode=3'], session: 'build-4061' }, dir);
+    const writeRecord = (rec, d) => { if (rec.status === 'done') stopSource.emit('SIGTERM', 'SIGTERM'); return writeCompletion(rec, d); };
+    const out = await runWorker(late, { stopSource, reraise: (sig) => reraise.push(sig), writeRecord });
+    expect(out.envelope.outcome).not.toBe('aborted'); // a genuine crash keeps its contract-violation draft
+    expect(reraise).toEqual(['SIGINT', 'SIGTERM']);
+  }, 60_000);
+
+  it('REAL signal to a REAL detached wrapper process: the stop reaches the worker, the aborted record is written, then the wrapper dies of the signal', async () => {
+    const dir = tmp();
+    const s = spec({ argv: ['-e', 'setInterval(()=>{},1000)'], session: 'build-4062' }, dir);
+    const specFile = join(dir, 'spec.json');
+    writeFileSync(specFile, JSON.stringify(s));
+    const wrapper = spawn(process.execPath, [join(process.cwd(), 'scripts/operations/worker-wrapper.mjs'), `--spec=${specFile}`], { stdio: 'ignore' });
+    const exited = new Promise((r) => wrapper.once('exit', (code, signal) => r({ code, signal })));
+    let childPid = null;
+    for (let n = 0; n < 400 && !Number.isInteger(childPid); n++) { await new Promise((r) => setTimeout(r, 25)); childPid = read(s)?.pid ?? null; }
+    expect(Number.isInteger(childPid)).toBe(true);
+    wrapper.kill('SIGTERM');
+    expect((await exited).signal).toBe('SIGTERM');
+    expect(read(s)).toMatchObject({ v: 2, status: 'done', outcome: 'aborted', action: { type: 'aborted' } });
+    expect(listDraftKeys(s.draftsDir)).toEqual([]);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(() => process.kill(childPid, 0)).toThrow(); // the worker did not outlive the stop
+  }, 60_000);
+
+  it('by default runWorker leaves no signal listener behind on the real process', async () => {
+    const before = ['SIGTERM', 'SIGINT', 'SIGHUP'].map((sig) => process.listenerCount(sig));
+    await runWorker(spec({ session: 'build-4030' }));
+    expect(['SIGTERM', 'SIGINT', 'SIGHUP'].map((sig) => process.listenerCount(sig))).toEqual(before);
+  });
+
+  it('classification: an overflow is not blamed on a timeout', async () => {
+    const dir = tmp();
     const flood = spec({ argv: ['-e', `const c='x'.repeat(1<<20);for(let i=0;i<10;i++)process.stdout.write(c);setInterval(()=>{},1000)`], session: 'build-4007', timeoutMs: 20_000 }, dir);
     const { envelope } = await runWorker(flood);
     expect(envelope.parse).toEqual({ ok: false, reason: 'ended-without-result' });
     expect(envelope.result.signature).not.toContain('timeout');
-  });
+  }, 60_000);
 
   it('a throwing started-record write kills the already-spawned child instead of orphaning it', async () => {
     let pid = null;
@@ -272,7 +395,9 @@ describe('detached launch', () => {
     expect(text).not.toContain('ghp_');
     expect(JSON.parse(text).env).toBeUndefined();
     expect(statSync(r.specFile).mode & 0o777).toBe(0o600);
-    expect(calls[0].env.GH_TOKEN).toBe('ghp_abcdefghijklmnop12345'); // the child inherits it through its environment, not a file
+    // the detached wrapper inherits the launcher's environment (not a file) with the token STRIPPED and the worker marker set
+    expect(calls[0].env.GH_TOKEN).toBeUndefined();
+    expect(calls[0].env[WORKER_MARKER_ENV]).toBe(WORKER_MARKER_VALUE);
     expect(() => launchDetached(spec({ session: '../escape' }), { specDir })).toThrow(/invalid session slug/);
   });
 

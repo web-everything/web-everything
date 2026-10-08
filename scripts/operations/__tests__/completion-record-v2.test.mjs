@@ -62,6 +62,11 @@ describe('completion record v2 (the launcher-written envelope)', () => {
     expect(validateCompletionRecord({ ...base, v: 3 }).errors.join()).toContain('unsupported completion record version');
     expect(parseCompletionRecord(serializeCompletionRecord({ ...base, v: 3 })).ok).toBe(false);
   });
+  it('source "none" is only for a record that never reported: a done record that CARRIES a result may not claim it', () => {
+    const base = finished({ v: 1, outcome: 'done', summary: 'ok', blocker: null, findingsAddressed: [{ ref: 'F1', disposition: 'fixed', note: '' }], filesTouched: [], learning: null });
+    expect(validateCompletionRecord({ ...base, source: 'none' }).errors.join()).toContain('source "none"');
+    expect(validateCompletionRecord({ ...base, result: null, source: 'none' }).ok).toBe(true);
+  });
   it('a v1 record still reads and validates, and is not rewritten', () => {
     const dir = tmp();
     const v1 = { ...newCompletionRecord({ session: 'fix-9', kind: 'fix', pr: 9, now: T0 }), status: 'done', outcome: 'healed' };
