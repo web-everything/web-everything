@@ -163,7 +163,10 @@ export function notifyDesktopChecked(notification, { spawnSyncFn = spawnSync, pl
   // quietHours (card xmvc6oc): real deliveries go through the shared gate; an injected `spawnSyncFn` (a test)
   // skips it unless the caller passes `quietGate` explicitly.
   const gate = quietGate === undefined ? (spawnSyncFn === spawnSync ? gateAlert : null) : quietGate;
-  if (gate) return gate(notification, { send: (n) => notifyDesktopChecked(n, { spawnSyncFn, platform, quietGate: null }) });
+  if (gate) {
+    const send = (n) => notifyDesktopChecked(n, { spawnSyncFn, platform, quietGate: null });
+    return gate(notification, { send, sendDigest: send });
+  }
   if (platform !== 'darwin') return { ok: false, error: `Desktop notifications unsupported on ${platform}` };
   try {
     const result = spawnSyncFn('osascript', osascriptNotifyArgs(notification), { encoding: 'utf8', timeout: 10_000 });
@@ -176,13 +179,16 @@ export function notifyDesktopChecked(notification, { spawnSyncFn = spawnSync, pl
 
 /** Best-effort desktop notification (mirrors `supervisor.mjs`'s own `notifyDesktop`, #3398). macOS-only; a
  *  no-op elsewhere, and a spawn failure must never break the sync loop. */
-export function notifyDesktop(notification, { quietGate = gateAlert } = {}) {
+export function notifyDesktop(notification, { quietGate = gateAlert, spawnSyncFn = spawnSync, platform = process.platform } = {}) {
   const send = ({ title, body }) => {
     if (process.platform !== 'darwin') return { ok: false };
     try { spawn('osascript', osascriptNotifyArgs({ title, body }), { stdio: 'ignore', detached: true }).unref(); return { ok: true }; }
     catch { return { ok: false }; /* best-effort */ }
   };
-  try { quietGate ? quietGate(notification, { send }) : send(notification); } catch { /* best-effort */ }
+  // This `send` acknowledges before osascript has run, so it must never confirm a held-alerts DIGEST (the queue is
+  // emptied on that confirmation): the digest goes through the checked sender and stays queued if it fails.
+  const sendDigest = (n) => notifyDesktopChecked(n, { spawnSyncFn, platform, quietGate: null });
+  try { quietGate ? quietGate(notification, { send, sendDigest }) : send(notification); } catch { /* best-effort */ }
 }
 
 /** Best-effort refresh of the `branch-drift.mjs` git-notes report the moment a real conflict is found here —

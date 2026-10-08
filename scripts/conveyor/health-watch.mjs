@@ -91,7 +91,8 @@ import { defaultDrainHistoryPath } from '../operations/live-state-io.mjs';
 import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 import { stuckOnPermissionPrompt } from './health-smells/dispatch-permission-stall.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
-import { flushDigest } from '../lib/quiet-hours-io.mjs';
+import { flushDigest, loadQuietSettings } from '../lib/quiet-hours-io.mjs';
+import { breaksThrough } from '../lib/quiet-hours.mjs';
 import { DAEMON_MANIFEST } from '../../skills-src/conveyor/daemon-manifest.mjs';
 import { RUNNER_LOCK_ROOT } from '../../skills-src/conveyor/runner-lock.mjs';
 import { collectDaemonStatus } from '../operations/daemon-status-io.mjs';
@@ -106,6 +107,20 @@ export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
 export const MAX_READ_BYTES = 2 * 1024 * 1024;
 export const GH_CADENCE_MS = 15 * MINUTE;
 export const CHILD_TIMEOUT_MS = 30_000;
+
+/**
+ * quietHours breakthrough tag (card xmvc6oc): a daemon silent long enough is an emergency overnight. The duration
+ * is how long the daemon has been SILENT (the smell's own `silentForMs`, from its last tick), never how old the
+ * episode is — an episode opens only once the silence already exceeds the threshold, and its age is ~0 on the
+ * opening alert, which would hold the very alert the breakthrough exists for. Unknown silence → null (delivered).
+ */
+export function daemonDownEmergency(ep) {
+  if (ep?.smell !== 'daemon-silent') return undefined;
+  const ms = ep.measure?.silentForMs;
+  const min = ep.measure?.silentForMin; // episodes persisted before `silentForMs` existed
+  const downForMs = Number.isFinite(ms) ? Math.max(0, ms) : Number.isFinite(min) ? Math.max(0, min) * MINUTE : null;
+  return { kind: 'daemon-down', downForMs };
+}
 
 // ── paths ────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -1245,10 +1260,30 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     const title = `Health: ${ep.smell} — ${ep.subject}`;
     const body = scrubText(ep.recommendation || ep.summary || 'See the health report.');
     let sent;
-    // quietHours breakthrough (card xmvc6oc): a daemon silent long enough is an emergency overnight.
-    const emergency = ep.smell === 'daemon-silent' ? { kind: 'daemon-down', downForMs: ep.openedAt != null ? Math.max(0, now - ep.openedAt) : null } : undefined;
+    const emergency = daemonDownEmergency(ep);
     try { sent = notifyDesktopChecked({ title, body, emergency }); } catch (e) { sent = { ok: false, error: String(e?.message || e) }; }
+    // Remember that quiet hours held this alert: the breakthrough depends on elapsed time, so it is re-checked below.
+    if (emergency && sent?.suppressed) ep.heldByQuietHours = true;
     notifications.push({ key: p.key, ok: sent?.ok === true, error: sent?.ok === true ? null : scrubText(sent?.error ?? 'unknown') });
+  }
+
+  // quietHours (card xmvc6oc): a daemon that dies at 02:00 is first seen minutes later — below the 30-minute
+  // breakthrough, so its opening alert is held. Nothing else re-alerts for hours, so once the silence crosses
+  // the threshold the held alert is re-sent as the emergency it has become (once: the flag clears on delivery).
+  if (!flags['no-notify'] && !flags['dry-run']) {
+    let quietSettings = null;
+    for (const [key, ep] of Object.entries(state.episodes)) {
+      if (!ep.heldByQuietHours || ep.status === 'pending') continue;
+      const emergency = daemonDownEmergency(ep);
+      if (!emergency) continue;
+      try { quietSettings ??= loadQuietSettings(); } catch { continue; }
+      if (!breaksThrough({ emergency }, quietSettings).breaks) continue;
+      let sent;
+      try { sent = notifyDesktopChecked({ title: `Health: ${ep.smell} — ${ep.subject}`, body: scrubText(ep.recommendation || ep.summary || 'See the health report.'), emergency }); }
+      catch (e) { sent = { ok: false, error: String(e?.message || e) }; }
+      if (sent?.ok === true && !sent.suppressed) delete ep.heldByQuietHours;
+      notifications.push({ key, ok: sent?.ok === true, error: sent?.ok === true ? null : scrubText(sent?.error ?? 'unknown') });
+    }
   }
 
   // quietHours (card xmvc6oc): this tick runs often, so it is the reliable place to send the ONE held-alerts

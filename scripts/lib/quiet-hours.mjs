@@ -126,6 +126,9 @@ export function breaksThrough(alert, settings = DEFAULT_QUIET_SETTINGS) {
 export function decideDelivery(alert, { now, settings = DEFAULT_QUIET_SETTINGS, toggle = null }) {
   const q = isQuiet(now, settings, toggle);
   if (!q.quiet) return { deliver: true, quiet: false, reason: q.reason };
+  // Holding means "send it later in the digest". With the digest off nothing would ever send it, so a held alert
+  // would be lost: deliver instead (the gate may delay an alert, never lose one).
+  if (!mergeSettings(settings).digest.enabled) return { deliver: true, quiet: true, reason: 'digest disabled: nothing would send a held alert' };
   const b = breaksThrough(alert, settings);
   return b.breaks ? { deliver: true, quiet: true, reason: `breakthrough: ${b.why}` } : { deliver: false, quiet: true, reason: `held (${q.reason}): ${b.why}` };
 }

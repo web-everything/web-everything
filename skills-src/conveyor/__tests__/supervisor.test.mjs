@@ -590,3 +590,20 @@ describe('makeJsonlLog — real file IO, best-effort (never throws)', () => {
     expect(DEFAULT_LOG_PATH).toContain('conveyor-runner-locks');
   });
 });
+
+// quietHours (card xmvc6oc): the supervisor's fire-and-forget notifier acknowledges before osascript has run, so the
+// held-alerts digest goes through this CHECKED sender instead (an unconfirmed digest stays queued for the next flush).
+describe('sendDesktopChecked — confirms only a real exit zero', () => {
+  it('ok on status 0; failure, throw and non-macOS are reported, never acknowledged', async () => {
+    const { sendDesktopChecked } = await import('../supervisor.mjs');
+    const n = { title: 'say "hi"', body: 'b' };
+    const calls = [];
+    expect(sendDesktopChecked(n, { platform: 'darwin', spawnSyncFn: (...a) => { calls.push(a); return { status: 0 }; } })).toEqual({ ok: true });
+    expect(calls[0][0]).toBe('osascript');
+    expect(calls[0][1][1]).toContain('with title "say \\"hi\\""');
+    expect(sendDesktopChecked(n, { platform: 'darwin', spawnSyncFn: () => ({ status: 1, stderr: 'denied' }) })).toMatchObject({ ok: false });
+    expect(sendDesktopChecked(n, { platform: 'darwin', spawnSyncFn: () => ({ status: null, error: new Error('ETIMEDOUT') }) })).toMatchObject({ ok: false });
+    expect(sendDesktopChecked(n, { platform: 'darwin', spawnSyncFn: () => { throw new Error('boom'); } })).toMatchObject({ ok: false });
+    expect(sendDesktopChecked(n, { platform: 'linux', spawnSyncFn: () => ({ status: 0 }) })).toMatchObject({ ok: false });
+  });
+});

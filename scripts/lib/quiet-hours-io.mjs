@@ -11,7 +11,7 @@
  */
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isUnderTest } from './under-test.mjs';
 import { decideDelivery, isQuiet, mergeSettings, planDigest, sweepSkip } from './quiet-hours.mjs';
@@ -49,9 +49,18 @@ export function quietContext({ env = process.env, now = Date.now() } = {}) {
   return { settings, toggle, now, state: isQuiet(now, settings, toggle) };
 }
 
-/** A claim (`held.jsonl.flushing-<pid>-<claimedAtMs>`) older than this belongs to a flusher that crashed. */
+/** A claim (`held.jsonl.flushing-<pid>-<claimedAtMs>-<seq>`) older than this MAY belong to a flusher that crashed. */
 export const STALE_CLAIM_MS = 10 * 60_000;
+/** ...but one whose owner process is still alive is only taken after this much longer (hung, or the pid was reused). */
+export const LIVE_OWNER_CLAIM_MS = 2 * 60 * 60_000;
 const CLAIM_PREFIX = 'held.jsonl.flushing-';
+
+/** Claims this process holds right now (a re-entrant flush must not sweep the outer call's claim). */
+const activeClaims = new Set();
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
+}
 
 /**
  * Put a claimed queue file back on the held queue, byte for byte (not re-parsed, so a torn line is kept too),
@@ -80,9 +89,16 @@ function recoverStaleClaims(dir, held, now) {
   try { names = readdirSync(dir); } catch { return; }
   for (const name of names) {
     if (!name.startsWith(CLAIM_PREFIX)) continue;
-    const claimedAt = Number(/^(\d+)-(\d+)/.exec(name.slice(CLAIM_PREFIX.length))?.[2]);
+    const m = /^(\d+)-(\d+)/.exec(name.slice(CLAIM_PREFIX.length));
+    const claimedAt = Number(m?.[2]);
     // A timestamp from the future (clock skew, garbage) is as stale as an old one: it would otherwise never be swept.
     if (!Number.isFinite(claimedAt) || Math.abs(now - claimedAt) <= STALE_CLAIM_MS) continue;
+    if (activeClaims.has(name)) continue;
+    // Taking a claim from a flusher that is still alive would send its entries twice (it sends, we restore and send
+    // again). The owner is the process that last renamed it: the sweeper suffix `.r<pid>`, else the name's pid.
+    // Our own pid is never "another live process": a claim of ours that is not active is a failed restore.
+    const owner = Number(/\.r(\d+)$/.exec(name)?.[1] ?? m[1]);
+    if (owner !== process.pid && Math.abs(now - claimedAt) <= LIVE_OWNER_CLAIM_MS && pidAlive(owner)) continue;
     const mine = join(dir, `${name}.r${process.pid}`); // keeps the original timestamp, so a crash here is stale again
     try { renameSync(join(dir, name), mine); } catch { continue; }
     restoreClaim(mine, held);
@@ -98,6 +114,7 @@ function recoverStaleClaims(dir, held, now) {
 export function flushDigest({ send, env = process.env, now = Date.now(), dryRun = false } = {}) {
   let claimed = null;
   let held = null;
+  let claimId = null;
   let confirmed = false; // the sender reported success — from here the entries must NOT be restored
   try {
     if (bypassed(env)) return { flushed: false, reason: 'bypassed' };
@@ -112,19 +129,23 @@ export function flushDigest({ send, env = process.env, now = Date.now(), dryRun 
     const claim = `${held}.flushing-${process.pid}-${now}-${claimSeq}`; // unique per call: a rename must never overwrite a surviving claim
     try { renameSync(held, claim); } catch { return { flushed: false, reason: 'another flusher claimed it' }; }
     claimed = claim;
+    claimId = basename(claim);
+    activeClaims.add(claimId);
     const entries = [];
     for (const line of readFileSync(claimed, 'utf8').split('\n')) {
       if (!line.trim()) continue;
       try { entries.push(JSON.parse(line)); } catch { /* torn line — skip */ }
     }
-    const plan = planDigest(entries, settings);
-    if (!plan) { unlinkSync(claimed); claimed = null; return { flushed: false, reason: 'digest empty or disabled' }; }
+    // `digest.enabled=false` only stops NEW alerts being held (decideDelivery delivers them). Whatever was already
+    // held is still owed to the operator, so it drains here, once, as a digest: never deleted, never stranded.
+    const plan = planDigest(entries, { ...settings, digest: { ...settings.digest, enabled: true } });
+    if (!plan) { unlinkSync(claimed); claimed = null; return { flushed: false, reason: 'digest empty' }; } // only torn/untitled lines: nothing sendable
     const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
     const mdPath = join(dir, `digest-${stamp}.md`);
     writeFileSync(mdPath, plan.markdown);
     writeFileSync(join(dir, 'latest-digest.md'), plan.markdown);
     const sent = send ? send({ title: plan.title, body: plan.body }) : { ok: false, error: 'no sender' };
-    if (sent?.ok === false) {
+    if (sent?.ok !== true) { // only an explicit success empties the queue: undefined/{}/null from a sloppy sender is NOT a confirmation
       // Delivery failed: put the claim's raw lines back (torn lines included) so the next flush retries.
       const requeued = restoreClaim(claimed, held);
       if (requeued) claimed = null;
@@ -143,18 +164,25 @@ export function flushDigest({ send, env = process.env, now = Date.now(), dryRun 
       } else restoreClaim(claimed, held);
     }
     return { flushed: false, reason: `flush error: ${String(e?.message ?? e)}` };
+  } finally {
+    if (claimId) activeClaims.delete(claimId);
   }
 }
 
 /**
  * The gate every desktop notification goes through. `send(notification)` does the real delivery and returns
  * `{ok}`. Returns the send result, or `{ok:true, suppressed:true, reason}` when held for the digest.
+ *
+ * `sendDigest` is the sender used to flush the held digest on the way through, and MUST report `ok:true` only once
+ * delivery really happened: the queue is emptied on that confirmation. A fire-and-forget `send` (acknowledges
+ * before the OS call has run) is therefore not used for it; without a `sendDigest` this call does not flush (the
+ * periodic `flushDigest` callers do).
  */
-export function gateAlert(notification, { send, env = process.env, now = Date.now() } = {}) {
+export function gateAlert(notification, { send, sendDigest, env = process.env, now = Date.now() } = {}) {
   if (bypassed(env)) return send(notification);
   let decision;
   try {
-    flushDigest({ send, env, now });
+    if (sendDigest) flushDigest({ send: sendDigest, env, now });
     const { settings, toggle } = quietContext({ env, now });
     decision = decideDelivery(notification, { now, settings, toggle });
     if (!decision.deliver) {
