@@ -1167,15 +1167,15 @@ describe('#3255 C2 review fix: the production default path, home-fails-too spill
     expect(hold.errors).toEqual(['home boom']);
   });
 
-  it('store=git success is announced loudly: readers still read home, so a git-only row is invisible to the fold', () => {
+  it('store=git success is announced loudly: the home-only fold (review-pr) does not see a git-only row', () => {
     const warns = [];
     const r = appendVerdict(mk('human'), {
       store: 'git', board: '/board', gitAppend: () => ({ status: 'appended' }), warn: (m) => warns.push(m),
     });
     expect(r.ok).toBe(true);
     expect(warns.join()).toMatch(/store=git/);
-    expect(warns.join()).toMatch(/readers still read home/);
-    // The documented consequence the warning names: the fold does not see the git-only hold.
+    expect(warns.join()).toMatch(/home-only readers \(review-pr's foldRepo\) do not/);
+    // The documented consequence the warning names: the home-only fold does not see the git-only hold.
     expect(foldRepo(REPO).get(21)).toBeUndefined();
   });
   it('a THROWING home write in dual/home mode is an ok:false result with its reason, never an escape (and the reason is one capped line)', () => {
