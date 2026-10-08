@@ -120,6 +120,21 @@ describe('list --acquirable: opt-in reuse of a clean lane verdict', () => {
     expect(gitCallsIn(1).length).toBeGreaterThan(0);
   });
 
+  it('a scan with the feature off leaves the clean entries alone, so the next scan with it on still reuses them (card xzxi69a)', () => {
+    extraEnv = ON;
+    list();
+    const before = JSON.parse(readFileSync(MEMO(), 'utf8')).lanes;
+    for (const n of [1, 2, 3]) expect(before[n]?.clean).toBe(true);
+    extraEnv = {};
+    expect(list()).toEqual([1, 2, 3]);
+    const after = JSON.parse(readFileSync(MEMO(), 'utf8')).lanes;
+    for (const n of [1, 2, 3]) expect(after[n]).toEqual(before[n]);
+    extraEnv = ON;
+    resetTrace();
+    expect(list()).toEqual([1, 2, 3]);
+    for (const n of [1, 2, 3]) expect(gitCallsIn(n).map(([, args]) => args)).toEqual(['ls-files -z']);
+  });
+
   it('a lease taken on a reused lane drops it at once', () => {
     extraEnv = ON;
     expect(list()).toEqual([1, 2, 3]);

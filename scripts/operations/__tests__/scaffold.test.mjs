@@ -14,6 +14,8 @@
  * Nothing here touches `fs` — the reader is a plain function returning a fixture.
  */
 import { describe, it, expect } from 'vitest';
+import { sizeRefusal, parseSize } from '../../backlog/scaffold.mjs';
+import { defaultScaffoldItem } from '../explore-io.mjs';
 
 import { advanceWhileRunning, startRun } from '../engine.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
@@ -80,8 +82,75 @@ describe('refusals', () => {
     expect(planScaffold(read(), { workItem: 'task', title: 'a task' }).kind).toBe('task');
   });
 
+  // #x0h3pe4 — a passed --size is never silently dropped: kept where the kind may carry one, refused otherwise.
+  it.each(['decision', 'epic', 'investigation'])('a sized %s KEEPS its size in the written frontmatter', (kind) => {
+    expect(planScaffold(read(), { kind, title: 'x', size: '2' }).content).toMatch(/^size: 2$/m);
+  });
+
+  it.each(['task', 'feature'])('a sized %s REFUSES loudly instead of dropping the size', (kind) => {
+    expect(reasonOf(() => planScaffold(read(), { kind, title: 'x', size: '2' }))).toBe('size-not-allowed');
+  });
+
+  it('a non-numeric size REFUSES instead of dropping it', () => {
+    expect(reasonOf(() => planScaffold(read(), { kind: 'decision', title: 'x', size: 'big' }))).toBe('bad-size');
+  });
+
+  // The ONE rule both entry points share (`backlog.mjs scaffold` and `scaffold`/`file-item`), table-driven so a
+  // regression in either wiring has a named test to redden.
+  it.each([
+    ['decision', undefined, null],
+    ['decision', '', null],
+    ['decision', '3', null],
+    ['decision', 'big', 'bad-size'],
+    ['epic', '5', null],
+    ['investigation', '2', null],
+    ['task', undefined, null],
+    ['task', '', null],
+    ['task', '2', 'size-not-allowed'],
+    ['feature', '2', 'size-not-allowed'],
+    ['story', undefined, 'story-needs-size'],
+    ['story', '', 'story-needs-size'],
+    ['story', '3', null],
+  ])('sizeRefusal(%s, %j) → %s', (kind, raw, reason) => {
+    expect(sizeRefusal(kind, raw)?.reason ?? null).toBe(reason);
+  });
+
+  it('an empty size is ABSENT for a decision — no `size:` line, never `size: 0`', () => {
+    expect(parseSize('')).toBeUndefined();
+    expect(parseSize(undefined)).toBeUndefined();
+    expect(parseSize('0')).toBe(0);
+    expect(planScaffold(read(), { kind: 'decision', title: 'x', size: '' }).content).not.toMatch(/^size:/m);
+  });
+
+  // explore's `file-stories` hands the CLI a juror-chosen kind: a task/feature (or an absent size) must reach the
+  // CLI with NO `--size` at all — never `--size=2` (refused) and never `--size=undefined` (bad-size).
+  it.each([
+    [{ kind: 'task', size: 2 }, false],
+    [{ kind: 'feature', size: 2 }, false],
+    [{ kind: 'story', size: undefined }, false],
+    [{ kind: 'story', size: 3 }, true],
+    [{ kind: 'decision', size: 2 }, true],
+  ])('explore scaffold argv for %j carries --size: %s', (payload, hasSize) => {
+    let argv;
+    const exec = (_node, args) => { argv = args; return JSON.stringify({ ok: true, num: 'xabc123', rel: 'backlog/x.md' }); };
+    defaultScaffoldItem({ title: 't', digest: 'd', ...payload }, { exec, root: '/tmp/none' });
+    expect(argv.some((a) => a.startsWith('--size='))).toBe(hasSize);
+    expect(argv).not.toContain('--size=undefined');
+  });
+
+  it('a whitespace-only size is ABSENT (Number(" ") is 0) at every entry point', () => {
+    expect(parseSize('  ')).toBeUndefined();
+    expect(sizeRefusal('decision', ' ')).toBeNull();
+    expect(sizeRefusal('task', '  ')).toBeNull();
+    expect(sizeRefusal('story', ' ')?.reason).toBe('story-needs-size');
+    expect(planScaffold(read(), { kind: 'decision', title: 'x', size: ' ' }).content).not.toMatch(/^size:/m);
+  });
+
   it('every refusal reason is in the declared set', () => {
-    const cases = [{ kind: 'chore', title: 'x' }, { title: '' }, { title: 'a story' }];
+    const cases = [
+      { kind: 'chore', title: 'x' }, { title: '' }, { title: 'a story' },
+      { kind: 'task', title: 'x', size: '2' }, { kind: 'decision', title: 'x', size: 'big' },
+    ];
     for (const c of cases) expect(SCAFFOLD_REFUSALS).toContain(reasonOf(() => planScaffold(read(), c)));
   });
 });

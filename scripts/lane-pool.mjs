@@ -2975,6 +2975,11 @@ function noteVerdict(memo, n, fp, info, remoteShasBox, dir = null, probeStartMs 
     memo.updates.set(n, fullyClean ? { fp, tree: treeSig, at: Date.now(), clean: true } : null);
     return;
   }
+  // Card xzxi69a — an env-off scan (every `acquire`, any CLI `list`) finds a lane clean but may not RECORD one; it
+  // must also not DELETE the opt-in clean entry another caller (the build daemon) wrote. Deleting it made the
+  // daemon re-probe the whole pool each tick (83 s cold vs 16 s warm). The entry stays validated on read (env on,
+  // fingerprint, tree signature, max age), so leaving it is sound.
+  if (!holdsWork) return;
   let provable = holdsWork && fp && !(doa.ahead > 0 && !doa.dirty && remoteShasBox?.failed);
   let dirt = null;
   if (provable && doa.dirty) {
