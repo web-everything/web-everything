@@ -319,7 +319,7 @@ describe('rule-list coverage over the real tree', () => {
   });
 
   it('keeps machinery coverage complete — every machinery home is matched by a rule', () => {
-    for (const d of ['scripts', 'backlog', '.claude', 'skills-src', 'agent-memory-src', 'docs', '.github', '.githooks', 'tools']) {
+    for (const d of ['scripts', 'backlog', '.claude', 'skills-src', 'agent-memory-src', 'docs', '.github', '.githooks', 'tools', 'schemas']) {
       expect(classOf(`${d}/probe.ts`), `${d}/ is no longer machinery`).toBe('machinery');
     }
   });

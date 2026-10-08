@@ -59,6 +59,11 @@
       "why": "build and delivery tooling"
     },
     {
+      "match": "schemas/**",
+      "class": "machinery",
+      "why": "JSON schemas for the delivery loop's own contracts (the dispatched-worker result object); read by scripts/operations, not shipped as product"
+    },
+    {
       "match": ".claude/**",
       "class": "machinery",
       "why": "agent harness — hooks, commands and settings that drive the loop"
