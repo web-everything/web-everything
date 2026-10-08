@@ -29,13 +29,15 @@ import { resolveVersionedContext, versionedRebuild } from '../daemon-version-run
  * step is reported, never treated as an error.
  * @param {{root:string, env?:NodeJS.ProcessEnv, log?:Console, run?:typeof gitRun, runSmoke?:typeof runLiveSmokeWithRetry,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), lockOpts?:object, stateOpts?:{env?:NodeJS.ProcessEnv},
- *   mainOnly?:boolean, now?:()=>number, sleep?:(ms:number)=>Promise<void>}} o
+ *   mainOnly?:boolean, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
+ *   dispatchSmoke?:{settings?:object, run?:Function, match?:Function}}} o — `dispatchSmoke` (xhiqxz3): injected
+ *   pieces of the real dispatch smoke the candidate smoke runs for a new dispatch-touching overlay (default: #4481's).
  * @returns {Promise<object>}
  */
 export async function rebuildClone({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
-  now = () => Date.now(), sleep, versions, skipCheck, entries,
+  now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke,
 } = {}) {
   // Card 89 S5: a versioned clone never moves in place — it builds a version and flips `current`, taking no
   // clone lock at all. `versions: null` forces the legacy path; unset resolves from the settings (default off).
@@ -102,7 +104,7 @@ export async function rebuildClone({
   try {
     return await smokeAndAdopt({
       root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-      finalLockOpts, finalizeLockOpts,
+      finalLockOpts, finalizeLockOpts, dispatchSmoke,
     });
   } catch (e) {
     // Best-effort: never leave a thrown build's lease on disk to hold a sibling off until it ages out.

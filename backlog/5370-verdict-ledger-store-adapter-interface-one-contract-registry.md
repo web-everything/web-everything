@@ -2,11 +2,12 @@
 bornAs: xsij7u6
 kind: story
 size: 3
-status: active
+status: resolved
 scaffoldedBy: "ledger-adapter"
 dateScaffolded: "2026-10-08"
 scope: ["we:scripts/lib/verdict-ledger.mjs", "we:scripts/lib/verdict-ledger-io.mjs", "we:scripts/lib/verdict-ledger-store.mjs", "we:scripts/lib/__tests__/verdict-ledger-store.test.mjs", "we:docs/agent/platform-decisions.md"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-08"
 tags: []
 ---
 

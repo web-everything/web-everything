@@ -135,7 +135,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { readJuryLog, foldJuryLedger } from './lib/jury-ledger.mjs';
-import { readVerdictLedger, VERDICTS as LEDGER_VERDICTS } from './lib/verdict-ledger.mjs';
+import { readLedgerEventsFromStore, VERDICTS as LEDGER_VERDICTS } from './lib/verdict-ledger.mjs';
 import { REVIEW_LABELS } from './lib/review-escalation.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { DEFAULT_REPO_KEY, CONSTELLATION_REPOS } from './lib/constellation-repos.mjs';
@@ -848,7 +848,7 @@ function buildRow(pr, { gitRoot, juryRoot, lanes, verdictRecords, noSessions = f
  *   `--no-fetch`              skip the `git fetch`, for a fast offline read of whatever refs are already local.
  *   `--json`                  emit the rows as JSON instead of the table.
  */
-function main(argv) {
+async function main(argv) {
   const flags = parseArgs(argv);
   const juryRoot = typeof flags['jury-root'] === 'string' ? resolve(flags['jury-root']) : REPO_ROOT;
   const lanesRoot = typeof flags['lanes-root'] === 'string' ? resolve(flags['lanes-root']) : defaultPoolRoot(REPO_ROOT);
@@ -859,9 +859,11 @@ function main(argv) {
   if (!flags['no-fetch']) sh('git', ['-C', gitRoot, 'fetch', '--quiet', 'origin']);
 
   const lanes = listLanes(lanesRoot);
-  // One read of the whole repo ledger, shared by every row — it is a single append-only file.
-  let verdictRecords = [];
-  try { verdictRecords = readVerdictLedger(CONSTELLATION_REPOS[SUBJECT_PREFIX].slug); } catch { verdictRecords = []; }
+  // One configured-store read shared by every row. On failure, rounds come from the jury ledger only.
+  const ledger = await readLedgerEventsFromStore(CONSTELLATION_REPOS[SUBJECT_PREFIX].slug);
+  const verdictRecords = ledger.status === 'ok'
+    ? ledger.rows.filter((r) => r.type === 'verdict').map(({ type: _type, ...record }) => record) : [];
+  if (ledger.status !== 'ok') process.stderr.write(`pr-status: ledger store ${ledger.store.name} unreadable (${ledger.reason}): ${String(ledger.error).split('\n')[0]}\n`);
   const rows = listOpenPrs(gitRoot).map((pr) => buildRow(pr, { gitRoot, juryRoot, lanes, verdictRecords, noSessions: flags['no-sessions'] }));
 
   writeAllSync(1, flags.json ? `${JSON.stringify(rows, null, 2)}\n` : renderReport(rows));
@@ -869,5 +871,5 @@ function main(argv) {
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
-  process.exitCode = main(process.argv.slice(2));
+  process.exitCode = await main(process.argv.slice(2));
 }

@@ -19,6 +19,12 @@
  * (which rebuilds fresh from `origin/main` + the REGISTERED overlay list, nothing else) would silently drop it
  * again. Registering it as a real overlay is the only way a manual early load survives past this one CLI run.
  *
+ * DISPATCH SMOKE (xkhtg2a): an overlay that touches a dispatch-path file must also pass ONE real worker launch
+ * before it stays loaded — see the "the DISPATCH SMOKE" section below. A failure removes only this overlay and
+ * rebuilds without it. Settings: `overlaySafety` in daemon-rebuild-settings.json, or WE_OVERLAY_DISPATCH_SMOKE
+ * (on|off), WE_OVERLAY_DISPATCH_PATHS (comma globs), WE_OVERLAY_NO_PR (warn|refuse),
+ * WE_OVERLAY_DISPATCH_SMOKE_TIMEOUT_MS, WE_OVERLAY_DISPATCH_SMOKE_KIND (ci-heal|fix).
+ *
  * USAGE:
  *   node scripts/lib/daemon-load-overlay.mjs --clone=<path to a daemon's dedicated clone> --ref=<branch to overlay> [--pr=N] [--base=<home branch, default main>] [--dry-run] [--wait [--wait-ms=N]] [--json]
  *   (versioned clones, card 89 S5: queues a request file for the in-tick updater; --wait blocks on its result)
@@ -37,13 +43,20 @@
  * adopted or rolled-back state and reports which, exiting non-zero only when a rebuild moved nothing because
  * it was refused/rejected (so a caller scripting this can tell "nothing to do" apart from "rejected").
  */
-import { resolve } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { homedir, tmpdir } from 'node:os';
+import {
+  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
+} from 'node:fs';
 import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
-import { addOverlay } from './daemon-overlays.mjs';
+import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays.mjs';
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
+import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
 import { resolveVersionedContext, submitRequest, waitForResult } from './daemon-version-runtime.mjs';
 
 /** Throw unless `ref` passes {@link isSafeBranchName} — same argv-injection defense
@@ -134,6 +147,284 @@ export function dryRunOverlay({ root, ref, homeBranch = 'main', run = gitRun, ti
   };
 }
 
+// ── xkhtg2a — the DISPATCH SMOKE ──────────────────────────────────────────────────────────────────────────────
+// Incident 2026-10-08: overlay `lane/worker-contract-s3b` went onto the fix/review daemon clones and broke EVERY
+// fix/ci-heal dispatch for ~1 hour. Its detached `claude -p` launch had no `--permission-mode`, so each worker hit
+// "This command requires approval" and died at step 0. The rebuild's live smoke passed, because it only runs
+// dispatch DRY-RUNS; it never launches a real worker. So: when the overlay being loaded touches a dispatch-path
+// file, the gated load launches ONE real worker through the tree's own launch path (`defaultClaudeProvider`, the
+// exact function a ci-heal dispatch calls) against a scratch completion store, and requires its first commands to
+// run with no approval prompt and a completion record to be written. It runs inside the rebuild's candidate smoke
+// (before anything is adopted); a failure throws there, so the rebuild holds the clone on its last-good tree WITHOUT
+// dropping any other overlay, and this load then removes only its own overlay. If the overlay got adopted without
+// that candidate smoke (a cached tree, or the daemon's own tick adopted it first), the live clone is smoked right
+// after and the same rollback runs.
+
+/** The derived dispatch-path set: every file a fix / ci-heal / review worker launch runs through. A setting
+ *  (`overlaySafety.dispatchPaths` in daemon-rebuild-settings.json, or `WE_OVERLAY_DISPATCH_PATHS`). */
+export const DISPATCH_PATH_DEFAULTS = Object.freeze([
+  'scripts/operations/dispatch-lane-io.mjs',
+  'scripts/operations/dispatch-lane.mjs',
+  'scripts/operations/worker-wrapper*.mjs',
+  'scripts/operations/detached-dispatch.mjs',
+  'scripts/operations/review-dispatch.mjs',
+  'scripts/operations/review-job*.mjs',
+  'scripts/operations/ci-heal-pr-dispatch.mjs',
+  'scripts/operations/completion-*.mjs',
+  'scripts/operations/deliver-item-wrapper.mjs',
+  'scripts/operations/session-role.mjs',
+  'scripts/operations/dispatch-providers/*.mjs',
+  'scripts/conveyor/reconcile-fix-dispatch.mjs',
+  'scripts/lib/dispatch-bg-isolation.mjs',
+  'scripts/lib/gh-app-shim.mjs',
+  'scripts/lib/spawn-to-completion.mjs',
+  'scripts/lib/advisor-trial.mjs',
+  'scripts/lib/provider-routing.mjs',
+  'skills-src/conveyor/dispatched-agent-system-prompt.md',
+]);
+
+const SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), 'daemon-rebuild-settings.json');
+const DEFAULT_SMOKE_TIMEOUT_MS = 5 * 60_000;
+
+function readSettingsFile() {
+  try { return JSON.parse(readFileSync(SETTINGS_FILE, 'utf8')); } catch { return null; }
+}
+
+/**
+ * The overlay-safety settings: built-in defaults, then `overlaySafety` in daemon-rebuild-settings.json, then env.
+ * An invalid value falls back to the default (never to "off").
+ * @returns {{dispatchSmoke:'on'|'off', dispatchPaths:string[], noPr:'warn'|'refuse', smokeTimeoutMs:number, smokeKind:'ci-heal'|'fix'}}
+ */
+export function overlaySafetySettings(env = process.env, { readSettings = readSettingsFile } = {}) {
+  const file = (readSettings() || {}).overlaySafety || {};
+  const pick = (envVal, fileVal, allowed, dflt) => {
+    for (const v of [envVal, fileVal]) {
+      const t = typeof v === 'string' ? v.trim() : v;
+      if (t !== undefined && t !== null && t !== '') return allowed.includes(t) ? t : dflt;
+    }
+    return dflt;
+  };
+  const envPaths = typeof env?.WE_OVERLAY_DISPATCH_PATHS === 'string' && env.WE_OVERLAY_DISPATCH_PATHS.trim()
+    ? env.WE_OVERLAY_DISPATCH_PATHS.split(',').map((x) => x.trim()).filter(Boolean) : null;
+  const filePaths = Array.isArray(file.dispatchPaths) && file.dispatchPaths.every((x) => typeof x === 'string') ? file.dispatchPaths : null;
+  const timeout = Number(env?.WE_OVERLAY_DISPATCH_SMOKE_TIMEOUT_MS ?? file.smokeTimeoutMs);
+  return {
+    dispatchSmoke: pick(env?.WE_OVERLAY_DISPATCH_SMOKE, file.dispatchSmoke, ['on', 'off'], 'on'),
+    dispatchPaths: envPaths || filePaths || [...DISPATCH_PATH_DEFAULTS],
+    noPr: pick(env?.WE_OVERLAY_NO_PR, file.noPr, ['warn', 'refuse'], 'warn'),
+    smokeTimeoutMs: Number.isFinite(timeout) && timeout >= 60_000 ? timeout : DEFAULT_SMOKE_TIMEOUT_MS,
+    smokeKind: pick(env?.WE_OVERLAY_DISPATCH_SMOKE_KIND, file.smokeKind, ['ci-heal', 'fix'], 'ci-heal'),
+  };
+}
+
+function globToRegExp(glob) {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*' && glob[i + 1] === '*') { re += '.*'; i += 1; if (glob[i + 1] === '/') i += 1; } else if (c === '*') re += '[^/]*';
+    else if (c === '?') re += '[^/]';
+    else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`^${re}$`);
+}
+
+/** The files (in input order) that match any dispatch-path pattern. PURE. */
+export function matchDispatchPaths(files, patterns) {
+  const res = (patterns || []).map(globToRegExp);
+  return (files || []).filter((f) => res.some((r) => r.test(f)));
+}
+
+/**
+ * Is `origin/<ref>` part of the tree at `tree`, and which dispatch-path files does the overlay change against main?
+ * Fails CLOSED: an in-tree overlay whose diff cannot be read is `required`.
+ * @returns {{inTree:boolean, required:boolean, tip?:string, files?:string[]|null, matched?:string[], reason:string}}
+ */
+export function overlayDispatchFiles({ tree, ref, patterns, run = gitRun }) {
+  assertSafeRef(ref, '--ref');
+  const git = (args) => run(args, { cwd: tree, timeout: 60_000, killSignal: 'SIGKILL' });
+  const tipRes = git(['rev-parse', '--verify', '--quiet', `origin/${ref}^{commit}`]);
+  const tip = tipRes.status === 0 ? String(tipRes.stdout ?? '').trim() : '';
+  if (!tip) return { inTree: false, required: false, reason: 'ref-unresolved' };
+  if (git(['merge-base', '--is-ancestor', tip, 'HEAD']).status !== 0) return { inTree: false, required: false, tip, reason: 'not-in-tree' };
+  const baseRes = git(['merge-base', 'origin/main', tip]);
+  const base = baseRes.status === 0 ? String(baseRes.stdout ?? '').trim() : '';
+  const diff = base ? git(['diff', '--name-only', base, tip]) : null;
+  if (!diff || diff.status !== 0) return { inTree: true, required: true, tip, files: null, matched: [], reason: 'diff-unknown' };
+  const files = String(diff.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean);
+  const matched = matchDispatchPaths(files, patterns);
+  return { inTree: true, required: matched.length > 0, tip, files, matched, reason: matched.length ? 'touches-dispatch-path' : 'off-dispatch-path' };
+}
+
+const PERMISSION_BLOCKER = /permission/i;
+
+/**
+ * The pass/fail rule for one real smoke worker. PURE. `marker` is what the worker's own Bash command wrote (the
+ * proof a command actually ran), `record` its completion record, `denials` the denied-command lines found in its
+ * transcript. `pending:true` = keep waiting (no verdict yet).
+ */
+export function judgeDispatchSmoke({ nonce, marker, record, denials = [], timedOut = false }) {
+  const blocker = record?.result?.blocker ?? null;
+  const blockerKind = typeof blocker === 'string' ? blocker : blocker?.kind;
+  if (denials.length || (blockerKind && PERMISSION_BLOCKER.test(String(blockerKind))) || record?.denied) {
+    return { ok: false, reason: 'commands-denied', detail: denials[0] || blockerKind || String(record?.denied) };
+  }
+  if (record?.status === 'done') {
+    return marker === nonce ? { ok: true, reason: 'passed' } : { ok: false, reason: 'no-commands-ran', detail: 'the worker finished without running its smoke commands' };
+  }
+  if (timedOut) return { ok: false, reason: 'timeout', detail: marker === nonce ? 'commands ran but no completion record' : 'no command ran and no completion record' };
+  return { ok: false, pending: true, reason: 'pending' };
+}
+
+/** The denied-command lines in a Claude transcript (tool results marked as errors that name an approval/permission). */
+function transcriptDenials(file) {
+  let text;
+  try { text = readFileSync(file, 'utf8'); } catch { return []; }
+  const out = [];
+  for (const line of text.split('\n')) {
+    if (!line.includes('tool_result') || !line.includes('is_error')) continue;
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    for (const item of Array.isArray(row?.message?.content) ? row.message.content : []) {
+      if (item?.type !== 'tool_result' || !item.is_error) continue;
+      const body = typeof item.content === 'string' ? item.content : JSON.stringify(item.content ?? '');
+      if (/requires approval|permission/i.test(body)) out.push(body.slice(0, 200));
+    }
+  }
+  return out;
+}
+
+function findTranscript(ids, home = homedir()) {
+  const dir = join(home, '.claude', 'projects');
+  let projects = [];
+  try { projects = readdirSync(dir); } catch { return null; }
+  for (const p of projects) {
+    let names = [];
+    try { names = readdirSync(join(dir, p)); } catch { continue; }
+    const hit = names.find((n) => n.endsWith('.jsonl') && ids.some((id) => id && n.startsWith(id)));
+    if (hit) return join(dir, p, hit);
+  }
+  return null;
+}
+
+function readJson(file) {
+  try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return null; }
+}
+
+function isAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
+}
+
+const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
+
+/** The launch harness runs INSIDE the tree under test (its own modules, its own launch path). It is a separate file
+ *  that is spawned, never imported: its computed `import(...)` must stay out of this module's static closure (it
+ *  would mark the review/promote code-path closure incomplete and put every file on that path). */
+const LAUNCH_HARNESS_FILE = join(dirname(fileURLToPath(import.meta.url)), 'dispatch-smoke-launch.mjs');
+
+/** The smoke worker's task: three commands, the first of the kind the incident's workers were refused. */
+export function dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr }) {
+  const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  return [
+    'Dispatch smoke for a daemon overlay load. This is not PR work: do not acquire a lane, do not edit or create any file yourself, open nothing.',
+    'Run these three Bash commands exactly as written, one at a time, and report the first output line of each:',
+    '1. gh api rate_limit --jq .resources.core.limit',
+    `2. node -e "require('fs').writeFileSync(process.argv[1], process.argv[2])" ${q(marker)} ${q(nonce)}`,
+    `3. OPERATION_COMPLETIONS_DIR=${q(store)} node ${q(join(tree, 'scripts', 'operations', 'completion-cli.mjs'))} report --session=${slug} --kind=${kind} --pr=${pr} --status=done --outcome=not-applicable`,
+    'Then finish with outcome not-applicable.',
+  ].join('\n');
+}
+
+/**
+ * Launch ONE real worker through `tree`'s own dispatch launch path and wait for its verdict (see
+ * {@link judgeDispatchSmoke}). Its completion record and spec go to a scratch store, never the real one.
+ * @returns {Promise<{ok:boolean, reason:string, detail?:string, sessionId:string, handle?:string|null, wrapperPid?:number|null, scratch:string, transcript?:string|null, ms:number}>}
+ */
+export async function runRealDispatchSmoke({
+  tree, env = process.env, settings = overlaySafetySettings(env), spawn = spawnSync, pollMs = 2_000, home = homedir(), log = console,
+}) {
+  const t0 = Date.now();
+  const scratch = mkdtempSync(join(tmpdir(), 'we-overlay-dispatch-smoke-'));
+  const store = join(scratch, 'completions');
+  mkdirSync(store, { recursive: true });
+  const marker = join(scratch, 'marker.txt');
+  const nonce = randomUUID();
+  const kind = settings.smokeKind;
+  const pr = '999998';
+  const slug = `${kind}-${pr}`;
+  const sessionId = randomUUID();
+  const prompt = dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr });
+  const childEnv = { ...env, OPERATION_COMPLETIONS_DIR: store, WE_POSTMORTEM_MODE: 'off' };
+  const base = { sessionId, scratch };
+  log.error?.(`daemon-load-overlay: dispatch smoke — launching one real ${kind} worker from ${tree} (scratch store ${store})`);
+  const launch = spawn(process.execPath, [LAUNCH_HARNESS_FILE, tree, slug, kind, pr, sessionId, prompt], {
+    cwd: tree, env: childEnv, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL',
+  });
+  if (launch.status !== 0) {
+    return { ...base, ok: false, reason: 'launch-failed', detail: String(launch.stderr || launch.error?.message || '').trim().split('\n').slice(-3).join(' | '), ms: Date.now() - t0 };
+  }
+  let launched = {};
+  try { launched = JSON.parse(String(launch.stdout).trim().split('\n').pop()); } catch { /* keep {} */ }
+  const handle = typeof launched.handle === 'string' ? launched.handle : null;
+  const wrapperPid = Number.isInteger(launched.wrapperPid) ? launched.wrapperPid : null;
+  const ids = [sessionId, handle && !handle.startsWith('pid:') ? handle : null];
+  const deadline = t0 + settings.smokeTimeoutMs;
+  let verdict;
+  let transcript = null;
+  const observe = (timedOut) => {
+    transcript = transcript || findTranscript(ids, home);
+    const markerText = existsSync(marker) ? readFileSync(marker, 'utf8').trim() : null;
+    return judgeDispatchSmoke({
+      nonce, marker: markerText, record: readJson(join(store, `${slug}.json`)), denials: transcript ? transcriptDenials(transcript) : [], timedOut,
+    });
+  };
+  for (;;) {
+    verdict = observe(Date.now() >= deadline);
+    if (!verdict.pending) break;
+    await sleep(pollMs);
+  }
+  // A wrapped worker writes its own final record when `claude -p` exits — wait for it (bounded) and judge that too.
+  if (verdict.ok && wrapperPid) {
+    const until = Math.min(deadline, Date.now() + 90_000);
+    while (isAlive(wrapperPid) && Date.now() < until) await sleep(pollMs);
+    verdict = observe(false);
+    if (verdict.pending) verdict = { ok: true, reason: 'passed' };
+  }
+  if (!verdict.ok && verdict.reason === 'timeout' && isAlive(wrapperPid)) {
+    try { process.kill(wrapperPid, 'SIGTERM'); } catch { /* already gone */ }
+  }
+  return {
+    ...base, ...verdict, handle, wrapperPid, transcript, ms: Date.now() - t0,
+  };
+}
+
+/**
+ * Wrap the rebuild's candidate smoke: after the normal live smoke PASSES, if the candidate tree contains `ref` and
+ * the overlay touches the dispatch path, run the dispatch smoke against that candidate. A failure THROWS, so
+ * `smokeAndAdopt` holds the clone on its last-good tree (`smoke-threw`) instead of adopting it — and, unlike a
+ * failed-check verdict, never falls back to "plain main", which would drop every other overlay too.
+ * `ctl` is filled with what happened ({ran, phase, required, matched, result}).
+ */
+export function withDispatchSmoke({
+  baseSmoke = runLiveSmokeWithRetry, ref, settings, dispatchSmoke = runRealDispatchSmoke, inspect = overlayDispatchFiles, ctl = {}, log = console,
+}) {
+  return async (args) => {
+    const result = await baseSmoke(args);
+    if (result?.verdict !== 'pass') return result;
+    const info = inspect({ tree: args.root, ref, patterns: settings.dispatchPaths });
+    if (!info.inTree || !info.required) return result;
+    const smoke = await dispatchSmoke({ tree: args.root, env: args.env, settings, log });
+    Object.assign(ctl, {
+      ran: true, phase: 'candidate', required: true, matched: info.matched, result: smoke,
+    });
+    if (!smoke.ok) {
+      throw new Error(`dispatch-smoke-failed: ${smoke.reason}${smoke.detail ? ` — ${smoke.detail}` : ''}`);
+    }
+    log.error?.(`daemon-load-overlay: dispatch smoke PASSED for ${ref} (${smoke.ms ?? '?'}ms)`);
+    return result;
+  };
+}
+
 /**
  * REGISTER `--ref` as a standing overlay (Module B) and run a gated rebuild (Module C) — the real-run path.
  * `--dry-run` never calls `addOverlay` at all; it previews the plan with `ref` appended VIRTUALLY via
@@ -149,6 +440,8 @@ export async function runDaemonLoadOverlay({
   addedBy, reason = null, now,
   addOverlayFn = addOverlay, rebuild = rebuildClone, dryRunRebuildFn = dryRunRebuild,
   wait = false, waitMs, versions, submit = submitRequest, waitFor = waitForResult,
+  settings, baseSmoke = runLiveSmokeWithRetry, dispatchSmoke = runRealDispatchSmoke, inspect = overlayDispatchFiles,
+  removeOverlayFn = removeOverlay, appendEventFn = appendOverlayEvent,
 }) {
   if (!clone || typeof clone !== 'string') throw new TypeError('daemon-load-overlay: --clone=<path> is required');
   if (!ref || typeof ref !== 'string') throw new TypeError('daemon-load-overlay: --ref=<branch to overlay> is required');
@@ -160,6 +453,18 @@ export async function runDaemonLoadOverlay({
     return { root, ref, homeBranch: base, dryRun: true, ...preview };
   }
 
+  // xkhtg2a — an overlay with no PR has no review behind it (the 2026-10-08 incident's entries showed pr=null).
+  const safety = settings || overlaySafetySettings(env);
+  const warnings = [];
+  if (pr == null) {
+    if (safety.noPr === 'refuse') {
+      log.error?.(`daemon-load-overlay: REFUSED — ${ref} has NO PR (overlaySafety.noPr=refuse). Open a PR and pass --pr=<N>.`);
+      return { root, ref, homeBranch: base, registered: false, refused: true, reason: 'no-pr' };
+    }
+    warnings.push('no-pr');
+    log.error?.(`daemon-load-overlay: WARNING — loading ${ref} with NO PR. Nothing reviewed this code and nothing ties it to a merge; pass --pr=<N>. (overlaySafety.noPr=warn; set refuse to block this.)`);
+  }
+
   addOverlayFn(root, {
     ref, pr, addedBy: by, reason, now,
   }, { env });
@@ -168,20 +473,58 @@ export async function runDaemonLoadOverlay({
   const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
   if (vctx) {
     const requestId = submit(vctx, { ref, pr, by });
-    if (!wait) return { root, ref, homeBranch: base, registered: true, versioned: true, requestId, pending: true };
+    if (!wait) return { root, ref, homeBranch: base, registered: true, versioned: true, requestId, pending: true, warnings };
     const result = await waitFor(vctx, requestId, waitMs != null ? { timeoutMs: waitMs } : {});
     return {
       root, ref, homeBranch: base, registered: true, versioned: true, requestId, request: result,
       mergedAnything: !!result.moved, adopted: !!result.adopted, reason: result.reason ?? result.status, head: result.head,
-      timedOut: result.status === 'timeout',
+      timedOut: result.status === 'timeout', warnings,
     };
   }
-  const rebuildResult = await rebuild({
-    root, env, log, mainOnly: false,
+  const smokeOn = safety.dispatchSmoke === 'on';
+  const ctl = { ran: false, phase: null, required: null, result: null };
+  const runSmoke = smokeOn ? withDispatchSmoke({
+    baseSmoke, ref, settings: safety, dispatchSmoke, inspect, ctl, log,
+  }) : baseSmoke;
+  let rebuildResult = await rebuild({
+    root, env, log, mainOnly: false, runSmoke,
   });
-  return {
+
+  // Adopted without the candidate dispatch smoke (a cached/proven tree skips the smoke; a daemon tick that took the
+  // lock first adopts with its own plain smoke): smoke the LIVE clone now, if the overlay is in it and needs one.
+  if (smokeOn && !ctl.ran) {
+    const info = inspect({ tree: root, ref, patterns: safety.dispatchPaths });
+    if (info.inTree && info.required) {
+      const smoke = await dispatchSmoke({ tree: root, env, settings: safety, log });
+      Object.assign(ctl, {
+        ran: true, phase: 'post-adopt', required: true, matched: info.matched, result: smoke,
+      });
+    }
+  }
+
+  const out = {
     root, ref, homeBranch: base, registered: true, mergedAnything: !!rebuildResult.moved,
     adopted: !!rebuildResult.adopted, reason: rebuildResult.reason, alerts: rebuildResult.alerts, head: rebuildResult.head,
+    warnings, ...(ctl.ran ? { dispatchSmoke: { ...ctl } } : {}),
+  };
+  if (!ctl.ran || ctl.result?.ok) return out;
+
+  // ROLLBACK — remove ONLY this overlay and rebuild through the same gate: main + every other overlay, unchanged.
+  const why = `dispatch-smoke-failed: ${ctl.result.reason}${ctl.result.detail ? ` — ${ctl.result.detail}` : ''}`;
+  log.error?.(`daemon-load-overlay: ${ref} FAILED the dispatch smoke (${ctl.phase}): ${why}. Removing it and rebuilding without it (other overlays untouched). Evidence: ${ctl.result.scratch ?? 'n/a'}${ctl.result.transcript ? `, transcript ${ctl.result.transcript}` : ''}`);
+  removeOverlayFn(root, ref, { env, why });
+  try {
+    appendEventFn(root, {
+      kind: 'removed', ref, pr, by: 'daemon-load-overlay', reason: why,
+    }, { env });
+  } catch { /* the audit line is best-effort; the removal above is what matters */ }
+  rebuildResult = await rebuild({
+    root, env, log, mainOnly: false, runSmoke: baseSmoke,
+  });
+  return {
+    ...out, registered: false, adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed',
+    rollback: { reason: rebuildResult.reason, adopted: !!rebuildResult.adopted }, head: rebuildResult.head ?? out.head,
+    alerts: [...(out.alerts || []), ...(rebuildResult.alerts || [])],
   };
 }
 
@@ -214,6 +557,13 @@ if (IS_CLI) {
     .then((result) => {
       if (flags.json) {
         process.stdout.write(`${JSON.stringify(result)}\n`);
+      } else if (result.refused) {
+        process.stdout.write(`daemon-load-overlay: REFUSED ${ref} (${result.reason}) — nothing registered (${result.root})\n`);
+      } else if (result.rolledBack) {
+        const d = result.dispatchSmoke || {};
+        process.stdout.write(`daemon-load-overlay: ${ref} FAILED the dispatch smoke (${d.phase}: ${d.result?.reason}${d.result?.detail ? ` — ${d.result.detail}` : ''}) — `
+          + `ROLLED BACK: overlay removed, clone rebuilt without it (${result.rollback?.reason}) at ${result.root}, head ${result.head ?? 'unchanged'}\n`
+          + `  evidence: ${d.result?.scratch ?? 'n/a'}${d.result?.transcript ? ` transcript ${d.result.transcript}` : ''}\n`);
       } else if (result.dryRun) {
         process.stdout.write(
           `daemon-load-overlay --dry-run: ${result.root} onMain=${result.onMain} safe=${result.unsafe?.safe} `
@@ -231,7 +581,10 @@ if (IS_CLI) {
         process.stdout.write(`daemon-load-overlay: registered ${ref} but the rebuild was REJECTED (${result.reason}) at ${result.root}\n`);
       }
       for (const a of result.alerts || []) process.stdout.write(`  ! ${a.kind}\n`);
-      process.exitCode = (result.mergedAnything && !result.adopted) || result.timedOut ? 1 : 0;
+      if (!flags.json && result.dispatchSmoke?.result?.ok) {
+        process.stdout.write(`  dispatch smoke PASSED (${result.dispatchSmoke.phase}, ${result.dispatchSmoke.result.ms}ms, session ${result.dispatchSmoke.result.sessionId})\n`);
+      }
+      process.exitCode = (result.mergedAnything && !result.adopted) || result.timedOut || result.refused || result.rolledBack ? 1 : 0;
     })
     .catch((e) => {
       process.stderr.write(`daemon-load-overlay: fatal: ${String((e && e.message) || e)}\n`);

@@ -666,7 +666,7 @@ export function findingIdentityTable(records = []) {
             normSummary: `${identity.normSummary}#${n}` });
         }
         entry = { findingId, ...identity, summary: normalizeFinding(f.original ?? f.finding).summary,
-          firstSeenHead: record.head, heads: [], lines: [], keys: [], rulings: [] };
+          firstSeenHead: record.head, heads: [], activeHeads: [], activeInstances: [], lines: [], keys: [], rulings: [] };
         table.push(entry);
         byId.set(findingId, entry);
       }
@@ -677,6 +677,18 @@ export function findingIdentityTable(records = []) {
         entry.forms.push({ normSummary: identity.normSummary, anchor: identity.anchor });
       }
       if (!entry.heads.includes(record.head)) entry.heads.push(record.head);
+      // The heads on which an ACTIVE referral (not one retired as dropped) holds the finding: what "already referred" means.
+      if (activeReferrals(record).some((a) => a.key === f.key) && !entry.activeHeads.includes(record.head)) {
+        entry.activeHeads.push(record.head);
+      }
+      // The exact claim each ACTIVE referral holds, per head: the one thing "already referred" may rest on
+      // ({@link classifyReferralsByRound}). The entry's heads and forms say only that SOME wording of the finding is on
+      // some head.
+      const claim = exactClaimKey(f.original ?? f.finding);
+      if (claim && activeReferrals(record).some((a) => a.key === f.key)
+        && !entry.activeInstances.some((x) => x.head === record.head && x.claim === claim)) {
+        entry.activeInstances.push({ head: record.head, claim });
+      }
       entry.keys.push({ head: record.head, runId: record.runId, key: f.key });
       for (const r of (record.rulings ?? []).filter((x) => x.key === f.key)) {
         entry.rulings.push({ head: record.head, runId: record.runId, key: f.key, result: r.result });
@@ -1434,6 +1446,48 @@ export function isSourcePath(file) {
   return dot > 0 && SOURCE_EXTENSIONS.has(name.slice(dot + 1).toLowerCase());
 }
 
+/** Is `latestFix` a readable fixer-push range: both heads named and `files` a plain map of path -> changed lines
+ *  (`null` = the line set is unknown)? The ONE shape check both round classifiers apply before trusting it. */
+function isWellFormedLatestFix(latestFix) {
+  const files = latestFix?.files;
+  return !(typeof latestFix?.priorHead !== 'string' || !latestFix.priorHead
+    || typeof latestFix.head !== 'string' || !latestFix.head
+    || !files || typeof files !== 'object' || Array.isArray(files)
+    || ![null, Object.prototype].includes(Object.getPrototypeOf(files))
+    || Object.values(files).some(lines => lines !== null && (!Array.isArray(lines)
+      || lines.some(n => !Number.isSafeInteger(n) || n < 0))));
+}
+
+/**
+ * WHERE A FINDING SITS RELATIVE TO THE FIXER'S LATEST PUSH — the ONE reading of "did the push address this finding"
+ * both round classifiers share (PR #4441 review: the referral classifier had its own, looser one). `files` is a
+ * well-formed {@link isWellFormedLatestFix} map. `state` is:
+ *   - `untouched`    — the push did not touch the cited file (or the finding cites none);
+ *   - `inconclusive` — it touched the file but the change cannot be placed against the citation: the changed-line set
+ *                      is unknown (`null`), the file is not source code, or the finding cites no line;
+ *   - `near`         — a source file, a known line set, and a changed line within {@link LATER_ROUND_CHANGE_WINDOW}
+ *                      of the cited line. The only POSITIVE evidence the cited code was edited;
+ *   - `far`          — a source file, a known line set, and every changed line outside that window.
+ * Cited paths resolve through the SAME lenient matcher the admission step used (basename, absolute path, repo
+ * prefix), so a touched file cited in an alias form is never mistaken for an untouched one. PURE.
+ * @returns {{path: string, state: 'untouched'|'inconclusive'|'near'|'far'}}
+ */
+function fixerChangeNearFinding(finding, files, { strictAlias = false } = {}) {
+  const cited = typeof finding?.file === 'string' ? exactCitedPath(finding.file) : '';
+  let path;
+  if (cited && Object.hasOwn(files, cited)) path = cited;
+  else if (strictAlias && cited) {
+    // Evidence that a fix was made: an alias (a bare basename) that fits two changed files names neither of them.
+    const hits = Object.keys(files).filter((p) => matchCitedPath(finding.file, [p]));
+    if (hits.length > 1) return { path: cited, state: 'inconclusive' };
+    path = hits[0] ?? cited;
+  } else path = cited && matchCitedPath(finding.file, Object.keys(files)) || cited;
+  const line = Number.isInteger(finding?.line) && finding.line > 0 ? finding.line : null;
+  if (!path || !Object.hasOwn(files, path)) return { path, state: 'untouched' };
+  if (files[path] === null || !isSourcePath(path) || line === null) return { path, state: 'inconclusive' };
+  return { path, state: files[path].some(n => Math.abs(n - line) <= LATER_ROUND_CHANGE_WINDOW) ? 'near' : 'far' };
+}
+
 export function classifyLaterRoundAdvisory(findings, options = {}) {
   const { lens, mandatoryLenses = MANDATORY_LENSES, scope, latestFix } = options ?? {};
   const list = Array.isArray(findings) ? findings : [];
@@ -1442,33 +1496,149 @@ export function classifyLaterRoundAdvisory(findings, options = {}) {
   // `all` was asked for: nothing is scoped, so an unreadable range is not a fallback and must not be reported as one.
   if (scope !== 'changed-only') return keepAll();
   if (latestFix.error) return keepAll(`changed-range-unreadable: ${latestFix.error}`);
-  const files = latestFix.files;
-  if (typeof latestFix.priorHead !== 'string' || !latestFix.priorHead
-    || typeof latestFix.head !== 'string' || !latestFix.head
-    || !files || typeof files !== 'object' || Array.isArray(files)
-    || ![null, Object.prototype].includes(Object.getPrototypeOf(files))
-    || Object.values(files).some(lines => lines !== null && (!Array.isArray(lines)
-      || lines.some(n => !Number.isSafeInteger(n) || n < 0)))) {
-    return keepAll('changed-range-unreadable: malformed-latest-fix');
-  }
+  if (!isWellFormedLatestFix(latestFix)) return keepAll('changed-range-unreadable: malformed-latest-fix');
   if ((Array.isArray(mandatoryLenses) ? mandatoryLenses : MANDATORY_LENSES).includes(lens) || scope !== 'changed-only') return keepAll();
   const kept = [];
   const deferred = [];
   for (const finding of list) {
-    const cited = typeof finding?.file === 'string' ? exactCitedPath(finding.file) : '';
-    // Resolve through the SAME lenient matcher the admission step used (basename, absolute path, repo prefix), so a
-    // touched file cited in an alias form is never mistaken for an untouched one and deferred.
-    const path = cited && (Object.hasOwn(files, cited) ? cited : matchCitedPath(finding.file, Object.keys(files))) || cited;
-    const line = Number.isInteger(finding?.line) && finding.line > 0 ? finding.line : null;
-    const touched = Object.hasOwn(files, path);
-    if (!path || (touched && (files[path] === null || !isSourcePath(path) || line === null
-      || files[path].some(n => Math.abs(n - line) <= LATER_ROUND_CHANGE_WINDOW)))) {
+    const { path, state } = fixerChangeNearFinding(finding, latestFix.files);
+    if (!path || state === 'inconclusive' || state === 'near') {
       kept.push(finding);
     } else {
       deferred.push({ ...finding, deferred: DEFERRED_ADVISORY_REASON });
     }
   }
   return { kept, deferred, scope, fellBack: null };
+}
+
+export const REFERRAL_DEMOTED_REASONS = Object.freeze({
+  LATER_ROUND_SAME_HEAD: 'later-round-referral-same-head',
+  FIXER_ADDRESSED_RERAISE: 'fixer-addressed-reraise',
+});
+
+/** A finding's claim for the "already referred" test: {@link normalizeFindingIdentity}'s `normSummary` folds `:line`
+ *  references to `:N` (so a moved line is one claim), which also makes "…at a.mjs:10" and "…at a.mjs:200" — two defects
+ *  in one file sharing a templated summary — one claim. Here the line references are KEPT: they are the discriminator.
+ *  Case, quoting, whitespace and trailing punctuation still fold. PURE. */
+export function exactClaimKey(finding) {
+  const f = normalizeFinding(finding);
+  if (!f) return '';
+  return f.summary.normalize('NFKC').toLowerCase().replace(/[`'"‘’“”]/g, '').replace(/\s+/g, ' ').trim().replace(/[\s.,;:!?]+$/, '');
+}
+
+/** Does an ACTIVE referral on `head` hold exactly `finding`'s claim ({@link exactClaimKey})? An entry that does not say
+ *  (a table without `activeInstances`) answers no: the finding stays a referral, the safe direction. PURE. */
+function coveredByActiveClaim(entry, head, finding) {
+  const claim = exactClaimKey(finding);
+  return Boolean(claim) && (entry.activeInstances ?? []).some((x) => x.head === head && x.claim === claim);
+}
+
+/**
+ * Card xq1xbsl — WHICH OF A ROUND'S MANDATORY-REFERRAL CANDIDATES MAY STILL BE MANDATORY. PURE.
+ *
+ * The later-round scoping rule (#3999, {@link classifyLaterRoundAdvisory}) already keeps a later round from blocking on
+ * code the fixer never touched; a mandatory referral is the same kind of claim and follows the same rule. Live
+ * 2026-10-08: #4361 and #4388 each parked for a ruling, got it, and were then reviewed AGAIN on the same head, the second
+ * panel raising referrals the first never did (and, on #4388, one the fixer had already fixed), so the PR went back to
+ * "ruling needed" and never reached the operator. Against the PR's finding-identity table (#76a, `identity`: one row
+ * per known finding with the heads it was referred on and its rulings) each candidate is exactly one of:
+ *   - `covered`  — the same finding is already referred on THIS head: it binds by identity AND an active referral on this
+ *                  head holds the identical claim ({@link exactClaimKey}; a different claim sharing a quote anchor is a
+ *                  different defect, and a drifted line number of the same claim is not). It is already awaiting or
+ *                  holding its ruling; referring it again is the duplicate that re-parked the PR. A re-wording of a
+ *                  claim is deliberately NOT covered: it is referred again (the safe direction, an extra ruling).
+ *   - `demoted`  — to a card suggestion, never a ruling owed: (a) it is new on a head whose referral round has FINISHED
+ *                  (`openHeads` does not name it) and came from an ADVISORY lens: it was first raised in a later round
+ *                  of an unchanged head. A gate lens (`mandatoryLenses`: correctness, security) is never silenced
+ *                  this way — {@link classifyLaterRoundAdvisory} keeps it in every round too, and a re-arm or
+ *                  send-back that asks for a fresh look must be able to surface a blocker the first panel missed; or
+ *                  (b) it comes from an ADVISORY lens and re-raises a finding that was ruled `block` (by a reviewer or
+ *                  the operator) on an earlier head, and the fixer's latest push changed code NEAR the re-raise's cited
+ *                  line (`fixerChangeNearFinding` state `near`: a source file, a known line set, a changed line within
+ *                  the window). That is evidence the cited code was edited, not proof the defect is gone, which is why
+ *                  a gate lens never takes this path. Touching the cited file is not even that: an unknown line set, a
+ *                  non-source file, a distant edit or a re-raise citing no line proves nothing, so those stay `kept`.
+ *   - `kept`     — anything else: a first sighting on a head with no referrals, a gate-lens finding in any round or
+ *                  after any edit, any finding on a head whose referral round never finished, or a re-raise the fixer
+ *                  did not demonstrably fix (that one stays mandatory so the ignored-ruling path still sees it).
+ * @param {Array<{seat: string, original: object}>} candidates
+ * @param {{identity?: Array<object>, head?: (string|null), latestFix?: (object|null), lens?: string,
+ *   mandatoryLenses?: Array<string>, openHeads?: Array<string>}} o - `lens` is the seat's lens (every candidate in one
+ *   call comes from one seat); `openHeads` is {@link openReferralHeads} of the thread.
+ * @returns {{kept: Array<object>, covered: Array<object>, demoted: Array<{candidate: object, reason: string}>}}
+ */
+export function classifyReferralsByRound(candidates, { identity = [], head = null, latestFix = null, lens,
+  mandatoryLenses = MANDATORY_LENSES, openHeads = [] } = {}) {
+  const table = Array.isArray(identity) ? identity : [];
+  const list = Array.isArray(candidates) ? candidates : [];
+  const headHasReferrals = Boolean(head) && table.some((e) => (e.heads ?? []).includes(head));
+  // A head whose referral round never finished (a partial persistence, a crash before the attempt) has no "earlier
+  // round" to scope against: a finding the retry raises there may be one that never got persisted. A caller that
+  // names no lens is treated as a gate lens: the round rule may only silence a lens it knows to be advisory.
+  const advisoryLens = typeof lens === 'string' && lens !== ''
+    && !(Array.isArray(mandatoryLenses) ? mandatoryLenses : MANDATORY_LENSES).includes(lens);
+  const laterRound = headHasReferrals && !(Array.isArray(openHeads) && openHeads.includes(head)) && advisoryLens;
+  const fixFiles = latestFix && typeof latestFix === 'object' && !latestFix.error && isWellFormedLatestFix(latestFix)
+    ? latestFix.files : null;
+  const out = { kept: [], covered: [], demoted: [] };
+  for (const candidate of list) {
+    // EVERY entry the identity binds (the table keeps same-path, same-anchor findings of different lenses apart, so
+    // the first bound entry may hold another claim while a later one holds this exact claim): prefer one an active
+    // referral on this head holds.
+    const candidateIdentity = normalizeFindingIdentity(candidate.original);
+    const bound = candidateIdentity ? table.filter((e) => (e.forms ?? [e]).some((form) => sameFindingIdentity({ ...e, ...form }, candidateIdentity,
+      { sameHead: headHasReferrals, ignoreLens: true }))) : [];
+    const activeHere = (e) => Boolean(head) && (e.activeHeads ?? e.heads ?? []).includes(head);
+    const isBlocked = (e) => [...(e.rulings ?? []), ...(e.operatorRulings ?? [])].some((r) => r.result === 'block');
+    const entry = bound.find(activeHere) ?? bound.find(isBlocked) ?? bound[0] ?? null;
+    // Covered means an ACTIVE referral on this head holds THIS finding: one the sink retired as dropped (its seat was
+    // disabled) awaits no ruling, so a re-raise of it must not vanish into "covered". And "this finding" is the same
+    // CLAIM, not merely the same #76a identity: that identity also binds on a shared quote anchor (and here ignores the
+    // lens), which cannot tell a re-wording from a different defect quoting the same line — the reason the carry code
+    // adds `sameInstanceForCarry`. `covered` takes the candidate out of the referrals AND the verdict basis, so a wrong
+    // match silently skips a gate finding; a missed match only refers the finding once more. Within one unchanged head
+    // the code is identical, so a same claim at a drifted line is still the same defect: no line test, unlike the carry.
+    if (head && bound.some((e) => coveredByActiveClaim(e, head, candidate.original))) { out.covered.push(candidate); continue; }
+    // An entry an active referral on THIS head holds under a DIFFERENT claim (the shared-anchor look-alike) is not a
+    // re-raise of that finding: it is a new finding on this head and takes the round rule below like any other.
+    if (entry && !activeHere(entry)) {
+      // A block ruling is either a reviewer's (carried on the referral record) or the operator's (#4979, a separate
+      // comment the caller folds in as `operatorRulings`).
+      const blocked = [...(entry.rulings ?? []), ...(entry.operatorRulings ?? [])].some((r) => r.result === 'block');
+      // Only an ADVISORY seat's re-raise may be set aside on a nearby edit: an edit near the cited line shows the code
+      // was touched, not that the defect is gone, so a gate lens (correctness, security) stays mandatory and the
+      // ignored-ruling path still sees it (PR #4441 review, round 2).
+      if (advisoryLens && blocked && fixFiles
+        && fixerChangeNearFinding(candidate.original, fixFiles, { strictAlias: true }).state === 'near') {
+        out.demoted.push({ candidate, reason: REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE });
+        continue;
+      }
+      out.kept.push(candidate);
+      continue;
+    }
+    if (laterRound) { out.demoted.push({ candidate, reason: REFERRAL_DEMOTED_REASONS.LATER_ROUND_SAME_HEAD }); continue; }
+    out.kept.push(candidate);
+  }
+  return out;
+}
+
+/**
+ * HEADS WHOSE REFERRAL ROUND NEVER FINISHED, read off the PR thread. PURE.
+ *
+ * A head is OPEN when it carries a referral record that nobody has attempted (`attempted: false`) and that still holds a
+ * live referral ({@link liveReferrals}: not dropped, superseded, carried or ruled by the reviewer). The sink persists every chunk of a run's referrals BEFORE it records any attempt, so a
+ * run that died part-way through persisting (chunk 1 posted, chunk 2 not) leaves exactly this: the head has a record, but
+ * the findings of the chunks that never posted are nowhere. A retry review on that head must keep referring them rather
+ * than set them aside as "first raised in a later round" ({@link classifyReferralsByRound}). A record whose findings are
+ * all carried, superseded or dropped has no live referral and does not open its head.
+ * @param {Array<object|string>} comments - the PR's complete comment thread.
+ * @returns {string[]} head shas.
+ */
+export function openReferralHeads(comments) {
+  const { records } = readReferralRecords(Array.isArray(comments) ? comments : []);
+  // Unattempted with a live referral, whether or not it is still pending: the operator may have ruled the persisted
+  // chunk while the chunk that never posted is still owed, and the head's round is no more finished for that.
+  return [...new Set(records.filter((r) => !r.attempted && liveReferrals(r).length > 0).map((r) => r.head))];
 }
 
 /**
