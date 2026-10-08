@@ -132,10 +132,12 @@ export function extractAgyResult(stdout) {
  */
 
 const OPERATOR_STOP_SIGNALS = Object.freeze(['SIGTERM', 'SIGINT', 'SIGHUP']);
+/** A child that TRAPS one of those signals and exits normally reports 128+n (129 HUP, 130 INT, 143 TERM). */
+const TRAPPED_STOP_STATUS = Object.freeze([129, 130, 143]);
 /** `spawnToCompletion` kills the child itself on a stream overflow and says so in the message (it sets `killed` too). */
 const isOverflow = (failure) => /maxBuffer exceeded/.test(String(failure?.message ?? ''));
 /** A signal that did not come from OUR timeout or buffer guard (`killed` false): someone outside stopped the worker. */
-const isExternalStop = (failure) => !!failure && !failure.killed && OPERATOR_STOP_SIGNALS.includes(failure.signal);
+const isExternalStop = (failure) => !!failure && !failure.killed && (OPERATOR_STOP_SIGNALS.includes(failure.signal) || TRAPPED_STOP_STATUS.includes(failure.status));
 
 /**
  * Run ONE worker to completion and leave its v2 record behind. Resolves (never rejects on a worker failure): the
@@ -166,6 +168,7 @@ export async function runWorker(spec, io = {}) {
   const headBefore = head();
 
   let started = newEnvelopeRecord({ ...base, headBefore, timeoutMs, now });
+  let recordWriteFailure = null; // an infrastructure fault (lock timeout), not a worker failure: runWorker rejects with it
   // The job record: written the moment the child has a pid (the spawn seam below), before it can finish.
   const spawnWithPid = (cmd, argv, opts) => {
     const child = spawnFn(cmd, argv, opts);
@@ -174,6 +177,7 @@ export async function runWorker(spec, io = {}) {
       // A failed job-record write must not leave the child running unseen (60-minute budget, still editing the lane).
       try { withCompletionLock(spec.session, () => writeRecord(started, dir), { dir }); } catch (e) {
         try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        recordWriteFailure = e;
         throw e;
       }
     }
@@ -196,6 +200,7 @@ export async function runWorker(spec, io = {}) {
     failure = e;
     stdout = e?.stdout ?? ''; stderr = e?.stderr ?? '';
   }
+  if (recordWriteFailure) throw recordWriteFailure; // the child was killed; the docblock's "cannot be written" rejection
   // If the injected spawn never reported a pid (a fake child), still leave a started record behind.
   if (started.pid == null) withCompletionLock(spec.session, () => writeRecord(started, dir), { dir });
 

@@ -78,9 +78,11 @@ describe('redactResultText: identifiers vs prose', () => {
   it('leaves an opaque findingsAddressed ref alone, redacts one that is not, and keeps a null note null', () => {
     const r = redactResultText(done({ findingsAddressed: [
       { ref: 'F1', disposition: 'fixed', note: null }, { ref: `secret ${TOKEN}`, disposition: 'fixed', note: 'n' },
+      { ref: TOKEN, disposition: 'fixed', note: 'n' }, // a token-shaped ref looks like an opaque id; it must still go
     ] }));
     expect(r.findingsAddressed[0]).toEqual({ ref: 'F1', disposition: 'fixed', note: null });
     expect(r.findingsAddressed[1].ref).not.toContain(TOKEN);
+    expect(r.findingsAddressed[2].ref).not.toContain('ghp_');
   });
 });
 

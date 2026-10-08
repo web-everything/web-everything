@@ -137,6 +137,8 @@ describe('runWorker: the job record and the result channels', () => {
     const term = spec({ argv: ['-e', `process.kill(process.pid,'SIGTERM');setInterval(()=>{},1000)`], session: 'build-4006' }, dir);
     expect((await runWorker(term)).envelope).toMatchObject({ outcome: 'aborted', action: { type: 'aborted' } });
     expect(listDraftKeys(term.draftsDir)).toEqual([]);
+    const trapped = spec({ argv: ['-e', 'process.exitCode=143'], session: 'build-4009' }, dir);
+    expect((await runWorker(trapped)).envelope).toMatchObject({ outcome: 'aborted' }); // a child that traps TERM and exits 128+15
     const flood = spec({ argv: ['-e', `const c='x'.repeat(1<<20);for(let i=0;i<10;i++)process.stdout.write(c);setInterval(()=>{},1000)`], session: 'build-4007', timeoutMs: 20_000 }, dir);
     const { envelope } = await runWorker(flood);
     expect(envelope.parse).toEqual({ ok: false, reason: 'ended-without-result' });
@@ -148,9 +150,8 @@ describe('runWorker: the job record and the result channels', () => {
     const s = spec({ argv: ['-e', 'setInterval(()=>{},1000)'], session: 'build-4008' });
     let calls = 0;
     const writeRecord = (rec, d) => { calls += 1; if (calls === 1) { pid = rec.pid; throw new Error('lock timeout'); } return writeCompletion(rec, d); };
-    const { envelope } = await runWorker(s, { writeRecord });
+    await expect(runWorker(s, { writeRecord })).rejects.toThrow(/lock timeout/); // infra fault, not filed as a worker contract violation
     expect(Number.isInteger(pid)).toBe(true);
-    expect(envelope.parse.ok).toBe(false);
     await new Promise((r) => setTimeout(r, 200));
     expect(() => process.kill(pid, 0)).toThrow(); // gone: ESRCH
   });

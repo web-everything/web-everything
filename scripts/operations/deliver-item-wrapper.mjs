@@ -1489,8 +1489,15 @@ export async function runAgentToCompletion(
 
   if (resume) {
     // 117 S3a — a wrapped attempt left a v2 envelope instead of (or beside) the delivery report; read either.
-    // The finished v2 envelope is authoritative: a started or stale legacy report must not shadow it.
-    const existing = envelopeReportOrNull(readEnvelopeRecord(sessionSlug), sessionSlug) ?? readReport(sessionSlug, reportsDir);
+    // A finished v2 envelope is authoritative: a started or stale legacy report must not shadow it. Three guards:
+    //  - a FINISHED envelope with no usable result (timeout / unparseable / aborted) never falls back to a legacy `done`
+    //    (that would turn a failed child into success); only a missing or still-`started` envelope may;
+    //  - a legacy report written AFTER the envelope (a later attempt that ran with the knob off) is the newer truth.
+    const envelope = readEnvelopeRecord(sessionSlug);
+    const legacy = readReport(sessionSlug, reportsDir);
+    const legacyIsNewer = !!legacy && !!envelope && Date.parse(legacy.updatedAt) > Date.parse(envelope.updatedAt);
+    const fromEnvelope = legacyIsNewer ? null : envelopeReportOrNull(envelope, sessionSlug);
+    const existing = fromEnvelope ?? (envelope?.status === 'done' && !legacyIsNewer ? null : legacy);
     if (existing && existing.status === 'done' && isLaneCommitAhead({ lane: lanePath, run: runFn })) {
       return existing;
     }

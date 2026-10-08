@@ -28,8 +28,6 @@ import {
 } from './worker-result.mjs';
 import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 
-/** An opaque finding id: letters, digits and `. _ : # -` only. Anything else is redacted like prose. */
-const SAFE_REF_RE = /^[A-Za-z0-9._:#-]{1,300}$/;
 /**
  * A repo path: redacted like prose (tokens out, one line) but the npm-scope `@` after a `/` is put back, since the
  * prose pass defangs every `@` and a draft naming `node_modules/@​scope/pkg` names a path that does not exist.
@@ -48,10 +46,11 @@ export function redactResultText(result) {
   r.summary = clean(r.summary, 280);
   // `ref` (an opaque finding id), `filesTouched` and `proposedFix.scope` (repo-relative paths) are identifiers, not
   // prose: the redactor would rewrite `@` and whitespace in a real path, so a well-formed one is left exactly as validated.
-  // A `ref` outside the opaque-id shape could carry anything (the schema only caps its length), so THAT goes through the redactor.
+  // A `ref` is worker-supplied and the schema only caps its length, so it ALWAYS goes through the redactor (an opaque id such
+  // as `F1` is unchanged by it; a token-shaped one, which matches any id pattern, is removed).
   r.findingsAddressed = (r.findingsAddressed ?? []).map((f) => ({
     ...f,
-    ref: typeof f.ref === 'string' && !SAFE_REF_RE.test(f.ref) ? clean(f.ref, 300) : f.ref,
+    ref: typeof f.ref === 'string' ? clean(f.ref, 300) : f.ref,
     note: f.note == null ? f.note : clean(f.note, 300),
   }));
   if (r.learning) r.learning = { ...r.learning, summary: clean(r.learning.summary, 600), area: clean(r.learning.area, 200), suggestion: clean(r.learning.suggestion, 600) };

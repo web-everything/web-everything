@@ -4203,7 +4203,16 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
       // a started legacy report must not block the completion fast path
       await expect(resume({ v: 1, session: 'conveyor-1235', status: 'started', outcome: null, filesTouched: [] })).resolves.toMatchObject({ status: 'done', outcome: 'done', filesTouched: ['a.mjs'] });
       // a contradictory stale done legacy report must not win over the authoritative envelope
-      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'done', outcome: 'blocked', reason: 'stale', filesTouched: ['old.mjs'] })).resolves.toMatchObject({ outcome: 'done', filesTouched: ['a.mjs'] });
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'done', outcome: 'blocked', reason: 'stale', filesTouched: ['old.mjs'], updatedAt: '2026-10-08T09:00:00.000Z' })).resolves.toMatchObject({ outcome: 'done', filesTouched: ['a.mjs'] });
+      // ...but a legacy report written AFTER the envelope (a later attempt with the knob off) is the newer truth
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'done', outcome: 'done', filesTouched: ['newer.mjs'], updatedAt: '2026-10-08T12:00:00.000Z' })).resolves.toMatchObject({ filesTouched: ['newer.mjs'] });
+      // a FINISHED envelope with no usable result (the child timed out) never falls back to a legacy `done`
+      const rec = JSON.parse(readFileSync(join(dir, 'conveyor-1235.json'), 'utf8'));
+      writeFileSync(join(dir, 'conveyor-1235.json'), JSON.stringify({ ...rec, outcome: 'blocked', parse: { ok: false, reason: 'timeout' }, result: { v: 1, outcome: 'unparseable', summary: 'x', blocker: null, findingsAddressed: [], filesTouched: [], learning: null } }));
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'done', outcome: 'done', filesTouched: ['a.mjs'], updatedAt: '2026-10-08T09:00:00.000Z' })).rejects.toThrow(/nothing to resume from/);
+      // a still-`started` envelope (wrapper died mid-run) may still fall back to the legacy report
+      writeFileSync(join(dir, 'conveyor-1235.json'), JSON.stringify({ ...rec, status: 'started', result: null, endedAt: null }));
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'done', outcome: 'done', filesTouched: ['a.mjs'], updatedAt: '2026-10-08T09:00:00.000Z' })).resolves.toMatchObject({ filesTouched: ['a.mjs'] });
     } finally {
       if (prevDir === undefined) delete process.env.OPERATION_COMPLETIONS_DIR; else process.env.OPERATION_COMPLETIONS_DIR = prevDir;
       if (prevKnob === undefined) delete process.env.WE_WORKER_WRAPPER; else process.env.WE_WORKER_WRAPPER = prevKnob;
