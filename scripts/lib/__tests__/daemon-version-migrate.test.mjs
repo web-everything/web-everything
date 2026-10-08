@@ -63,7 +63,7 @@ describe('daemon version migrate / unmigrate', () => {
     expect(result.status).toBe('migrated');
     // compat symlink -> current, state is shared, writes through the old path land in state
     expect(fs.lstatSync(clone).isSymbolicLink()).toBe(true);
-    expect(fs.readlinkSync(clone)).toBe('../.daemon-clones/daemon/current'.replace('../', ''));
+    expect(fs.readlinkSync(clone)).toBe('.daemon-clones/daemon/current');
     fs.appendFileSync(join(clone, '.conveyor', 'daemon.log'), 'after\n');
     expect(fs.readFileSync(join(home, 'daemon', 'state', '.conveyor', 'daemon.log'), 'utf8')).toBe('log line\nafter\n');
     expect(cloneKey(clone)).toBe(keyBefore);
@@ -429,7 +429,115 @@ describe('daemon version migrate / unmigrate', () => {
     git(clone, 'remote', 'set-url', '--', 'origin', '-dash/r.git');
     fs.rmSync(join(home, 'daemon'), { recursive: true, force: true }); // a fresh repo.git, which is where the url is set
     expect((await migrate({ clone, home, settings, deps })).status).toBe('migrated');
-    expect(git(join(home, 'daemon', 'repo.git'), 'config', '--get', 'remote.origin.url')).toBe('-dash/r.git');
+    // relative to the clone it was configured in, so absolute (and no longer option-shaped) wherever it is copied
+    expect(git(join(home, 'daemon', 'repo.git'), 'config', '--get', 'remote.origin.url')).toBe(join(clone, '-dash/r.git'));
+  });
+
+  it('a relative origin url is made absolute against the original clone, so fetches still work from repo.git and every version', async () => {
+    fs.renameSync(join(fixture, 'origin.git'), join(ws, 'origin.git'));
+    git(clone, 'remote', 'set-url', 'origin', '../origin.git'); // relative to the clone dir: ws/origin.git
+    expect(await migrate({ clone, home, settings, deps, dryRun: true })).toMatchObject({ originUrl: join(ws, 'origin.git') });
+    expect((await migrate({ clone, home, settings, deps })).status).toBe('migrated');
+    const versions = join(home, 'daemon', 'versions');
+    const dirs = [join(home, 'daemon', 'repo.git'), ...fs.readdirSync(versions).map(id => join(versions, id))];
+    expect(dirs.length).toBeGreaterThan(1);
+    for (const dir of dirs) {
+      expect(git(dir, 'config', '--get', 'remote.origin.url')).toBe(join(ws, 'origin.git'));
+      expect(() => git(dir, 'ls-remote', '--exit-code', 'origin', 'main')).not.toThrow(); // the fetch path a later sync takes
+    }
+    expect(JSON.parse(readFileSync(join(home, 'daemon', 'migration.json'))).originUrl).toBe(join(ws, 'origin.git'));
+  });
+
+  describe('a kill between the two swap renames (clone aside, link in)', () => {
+    // Real death: the first rename lands, then every later filesystem call fails, so no catch/rollback/finally cleanup runs.
+    const killAfterClonePark = () => {
+      let dead = false;
+      const dying = Object.fromEntries(Object.entries(fs).map(([k, f]) => [k, typeof f === 'function' ? (...a) => {
+        if (dead) throw new Error('killed');
+        const result = f(...a);
+        if (k === 'renameSync' && /legacy-/.test(a[1])) { dead = true; throw new Error('killed'); }
+        return result;
+      } : f]));
+      return { ...deps, fs: dying };
+    };
+    let before;
+    beforeEach(async () => {
+      before = snapshot(clone);
+      await expect(migrate({ clone, home, settings, deps: killAfterClonePark() })).rejects.toThrow('killed');
+      expect(fs.existsSync(clone)).toBe(false); // the half-moved state: no clone at the path
+      expect(fs.lstatSync(join(home, 'daemon', 'legacy-20261008T120000Z')).isDirectory()).toBe(true);
+    });
+
+    it('migrate resumes: the link is placed, nothing is rebuilt, and unmigrate then restores everything', async () => {
+      expect(await migrate({ clone, home, settings, deps, dryRun: true })).toMatchObject({ status: 'dry-run', wouldResumeSwap: true });
+      expect(fs.existsSync(clone)).toBe(false);
+      deps.buildVersion = async () => { throw new Error('must not rebuild'); };
+      expect(await migrate({ clone, home, settings, deps })).toMatchObject({ status: 'migrated', resumed: true, moved: ['.conveyor', '.operations'] });
+      expect(fs.readlinkSync(clone)).toBe(join('.daemon-clones', 'daemon', 'current'));
+      expect(fs.existsSync(join(home, 'daemon', 'migrate-intent.json'))).toBe(false);
+      expect(fs.existsSync(join(ws, 'daemon.tmp-link'))).toBe(false);
+      deps.buildVersion = undefined;
+      expect((await unmigrate({ clone, home, settings, deps })).status).toBe('unmigrated');
+      expect(snapshot(clone)).toEqual(before);
+    });
+
+    it('unmigrate restores the clone from the journal, with its state, as it was before migrate', async () => {
+      expect(await unmigrate({ clone, home, settings, deps, dryRun: true })).toMatchObject({ status: 'dry-run', interrupted: true });
+      expect(fs.existsSync(clone)).toBe(false);
+      expect(await unmigrate({ clone, home, settings, deps })).toMatchObject({ status: 'unmigrated', restored: ['.conveyor', '.operations'] });
+      expect(snapshot(clone)).toEqual(before);
+      expect(fs.existsSync(join(ws, 'daemon.tmp-link'))).toBe(false);
+      expect(fs.existsSync(join(home, 'daemon', 'migration.json'))).toBe(false);
+    });
+  });
+
+  it('the plist helper follows the clones root the migration used, from its record', async () => {
+    const elsewhere = join(fixture, 'elsewhere');
+    const configured = { ...settings, clonesRoot: elsewhere };
+    expect((await migrate({ clone, settings: configured, deps })).status).toBe('migrated');
+    expect(JSON.parse(readFileSync(join(elsewhere, 'daemon', 'migration.json'))).home).toBe(elsewhere);
+    const text = `<plist><dict><key>ProgramArguments</key><array><string>/bin/node</string><string>${clone}/a.mjs</string></array>
+<key>WorkingDirectory</key><string>${clone}</string></dict></plist>`;
+    const file = join(fixture, 'custom.plist'); fs.writeFileSync(file, text);
+    // the same settings migrate used find the record; so does an explicit --home
+    for (const args of [{ settings: configured }, { home: elsewhere }]) {
+      fs.writeFileSync(file, text);
+      const r = rewritePlist({ file, name: 'daemon', clone, backupDir: join(fixture, 'bk'), ...args });
+      expect(r.status).toBe('rewritten');
+      const next = readFileSync(file);
+      expect(next).toContain(`<string>${elsewhere}/daemon/current/a.mjs</string>`);
+      expect(next).toContain(`<key>WorkingDirectory</key><string>${elsewhere}/daemon/current</string>`);
+      expect(next).not.toContain('.daemon-clones');
+      expect(rewritePlist({ file, name: 'daemon', clone, backupDir: join(fixture, 'bk'), ...args }).status).toBe('noop');
+    }
+    // settings that drifted after the migration (no clonesRoot any more) do not move the plist off the real root
+    fs.writeFileSync(file, text);
+    expect(rewritePlist({ file, name: 'daemon', clone, settings, backupDir: join(fixture, 'bk3') }).status).toBe('rewritten');
+    expect(readFileSync(file)).toContain(`<key>WorkingDirectory</key><string>${elsewhere}/daemon/current</string>`);
+    // a relative root is refused rather than resolved against whatever directory the helper happens to run in
+    expect(() => rewritePlist({ file, name: 'daemon', clone, home: 'relative/root', backupDir: join(fixture, 'bk3') })).toThrow('absolute');
+    expect(() => rewritePlist({ file, name: 'daemon', clone: join(ws, 'other'), settings: { ...settings, clonesRoot: 'relative/root' }, backupDir: join(fixture, 'bk3') })).toThrow('absolute');
+    // and through the CLI (its settings file is the repo's fixed one, so the record is found with --home)
+    fs.writeFileSync(file, text);
+    const cli = join(process.cwd(), 'scripts', 'lib', 'daemon-version.mjs');
+    const out = spawnSync('node', [cli, 'plist', `--clone=${clone}`, `--home=${elsewhere}`, `--file=${file}`, `--backup-dir=${join(fixture, 'bk2')}`], { encoding: 'utf8', env: { ...process.env, ...deps.env } });
+    expect(JSON.parse(out.stdout).status).toBe('rewritten');
+    expect(readFileSync(file)).toContain(`${elsewhere}/daemon/current`);
+  });
+
+  it('a plist already under another clones root is left alone, never nested as current/current', () => {
+    const moved = '<key>WorkingDirectory</key><string>/w/.daemon-clones/daemon/current/a</string>';
+    expect(versionedPlistText(moved, { name: 'daemon', home: '/elsewhere' })).toBe(moved);
+    expect(versionedPlistText('<key>WorkingDirectory</key><string>/w/daemon/a</string>', { name: 'daemon', home: '/elsewhere' }))
+      .toContain('<string>/elsewhere/daemon/current/a</string>');
+  });
+
+  it('a link-in that was killed after it landed, before the intent was dropped, is cleaned up by the next migrate', async () => {
+    await migrate({ clone, home, settings, deps });
+    const intent = join(home, 'daemon', 'migrate-intent.json');
+    fs.writeFileSync(intent, '{}');
+    expect(await migrate({ clone, home, settings, deps })).toMatchObject({ status: 'refused', reason: 'already-a-symlink' });
+    expect(fs.existsSync(intent)).toBe(false);
   });
 
   it('rewrites only ProgramArguments and WorkingDirectory, with a backup, and reverts', () => {

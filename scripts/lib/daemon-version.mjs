@@ -128,16 +128,16 @@ async function cli() {
     // Card 89 S6. Exit 0 = done, 1 = error, 2 = refused (nothing changed or already undone).
     try {
       const allowed = command === 'plist'
-        ? /^--(?:clone|file|backup-dir|revert-from)=.+$/ : /^--(?:clone|home)=.+$/;
+        ? /^--(?:clone|home|file|backup-dir|revert-from)=.+$/ : /^--(?:clone|home)=.+$/;
       if (!value('clone') || args.some(arg => !allowed.test(arg) && !['--json', '--dry-run', '--force'].includes(arg))
         || (command === 'plist' && !value('file'))) {
-        throw new Error('Usage: daemon-version.mjs migrate|unmigrate --clone=<ws>/<name> [--home=<clones root>] [--dry-run] [--force] [--json]  |  plist --clone=<ws>/<name> --file=<plist> --backup-dir=<dir> | --revert-from=<backup>');
+        throw new Error('Usage: daemon-version.mjs migrate|unmigrate --clone=<ws>/<name> [--home=<clones root>] [--dry-run] [--force] [--json]  |  plist --clone=<ws>/<name> [--home=<clones root>] --file=<plist> --backup-dir=<dir> | --revert-from=<backup>');
       }
       const mod = await import('./daemon-version-migrate.mjs');
       const { loadDaemonVersionsSettingsFile } = await import('./daemon-versions-settings.mjs');
       const common = { clone: value('clone'), home: value('home'), settings: loadDaemonVersionsSettingsFile() };
       const result = command === 'plist'
-        ? mod.rewritePlist({ file: value('file'), name: basename(logicalCloneRoot(value('clone'))), backupDir: value('backup-dir'), revertFrom: value('revert-from'), dryRun: args.includes('--dry-run') })
+        ? mod.rewritePlist({ file: value('file'), name: basename(logicalCloneRoot(value('clone'))), clone: common.clone, home: common.home, settings: common.settings, backupDir: value('backup-dir'), revertFrom: value('revert-from'), dryRun: args.includes('--dry-run') })
         : await mod[command]({ ...common, dryRun: args.includes('--dry-run'), force: args.includes('--force') });
       console.log(JSON.stringify(result));
       if (result.status === 'refused') process.exitCode = 2;

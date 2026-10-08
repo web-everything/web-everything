@@ -57,6 +57,34 @@ const validRecord = (info, p) => info !== null && typeof info === 'object'
   && typeof info.legacy === 'string' && dirname(resolve(info.legacy)) === p.root && basename(info.legacy).startsWith('legacy-');
 /** Credentials in a remote url never reach a record or a log. */
 const redactUrl = url => url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/\s]*@/i, '$1***@').replace(/[?#].*$/s, '');
+/**
+ * A relative local-path remote (`../origin.git`) means "relative to where git runs"; copied into repo.git and every
+ * version it would point somewhere else, so each later fetch fails. Make it absolute against the original clone,
+ * before anything moves. Anything that names a host (`scheme://`, scp-style `host:path`) or is already absolute stays.
+ */
+function absoluteRemote(logical, url) {
+  if (url === '' || isAbsolute(url) || /^[a-z][a-z0-9+.-]*:\/\//i.test(url) || /^[^/\\]+:/.test(url)) return url;
+  return resolve(logical, url);
+}
+const readRecord = (fs, p) => { try { return JSON.parse(fs.readFileSync(p.record, 'utf8')); } catch { return null; } };
+const tmpLinkOf = p => join(dirname(p.logical), `${basename(p.logical)}.tmp-link`);
+/**
+ * The swap is two renames: the clone aside to `legacy`, then a link to `current` in its place. A kill between them
+ * leaves no clone at all. The migration record is written BEFORE the first rename, so it is the journal: with the
+ * clone missing, a valid record, and its `legacy` still a directory, the swap was cut short.
+ */
+function interruptedSwap(fs, p) {
+  if (stat(fs, p.logical)) return null;
+  const info = readRecord(fs, p);
+  return validRecord(info, p) && stat(fs, info.legacy)?.isDirectory() && stat(fs, join(p.root, 'current')) ? info : null;
+}
+/** Place the link at the clone path (second rename); safe to repeat. */
+function linkClone(fs, p) {
+  const tmp = tmpLinkOf(p);
+  fs.rmSync(tmp, { force: true });
+  fs.symlinkSync(relative(dirname(p.logical), join(p.root, 'current')), tmp);
+  fs.renameSync(tmp, p.logical);
+}
 const stampOf = deps => new Date((deps.now ?? Date.now)()).toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
 
 /** Put moved state paths back as real entries (used by a failed migrate and by unmigrate). */
@@ -165,6 +193,7 @@ function recoverFromIntent(fs, p) {
     stripExclude(fs, join(p.logical, '.git', 'info', 'exclude'), intent.exclude);
     restoreHomeFiles(fs, p.root, intent.home);
   } // else unreadable: killed while writing it, before any state was touched
+  fs.rmSync(`${p.record}.tmp`, { force: true });
   fs.rmSync(intentFile(p), { force: true });
 }
 /** One migrate per clone: an exclusive lock file holding the owner's pid; a dead owner's lock is taken over. */
@@ -205,6 +234,10 @@ export async function migrate(args) {
   if (problem) return { status: 'refused', ...problem };
   const p = paths(basename(logical), clone, runtimeHome(logical, settings), stampOf(deps));
   const here = stat(fs, p.logical);
+  if (!here && interruptedSwap(fs, p)) return resumeSwap(fs, p, dryRun);
+  if (here?.isSymbolicLink() && !dryRun && stat(fs, intentFile(p)) && validRecord(readRecord(fs, p), p)) {
+    fs.rmSync(intentFile(p), { force: true }); // killed after the link went in, before the intent was dropped: nothing left to undo
+  }
   if (!here?.isDirectory()) return { status: 'refused', reason: here?.isSymbolicLink() ? 'already-a-symlink' : 'clone-missing' };
   if (dryRun) return migrateInner(args);
   const createdRoot = !stat(fs, p.root);
@@ -221,6 +254,20 @@ export async function migrate(args) {
     lock.release();
     if (createdRoot) try { fs.rmdirSync(p.root); } catch { /* a migration lives here now */ }
   }
+}
+
+/** Finish a swap that was killed after the clone went aside: everything else was already done and recorded. */
+function resumeSwap(fs, p, dryRun) {
+  if (dryRun) return { status: 'dry-run', wouldResumeSwap: true, legacy: interruptedSwap(fs, p).legacy };
+  const lock = acquireLock(fs, p);
+  if (!lock.release) return { status: 'refused', reason: 'migrate-in-progress', pid: lock.held };
+  try {
+    const info = interruptedSwap(fs, p); // re-read under the lock: the other run may have finished it
+    if (!info) return { status: 'refused', reason: 'clone-missing' };
+    linkClone(fs, p);
+    fs.rmSync(intentFile(p), { force: true });
+    return { status: 'migrated', name: basename(p.logical), v0: info.v0, legacy: info.legacy, moved: info.moved, steps: ['swapped'], resumed: true };
+  } finally { lock.release(); }
 }
 
 async function migrateInner({ clone, settings, dryRun = false, force = false, deps = {} }) {
@@ -241,7 +288,7 @@ async function migrateInner({ clone, settings, dryRun = false, force = false, de
     && gitIn(p.logical, ['grep', '-q', 'settings.local.json', sha, '--', 'scripts/lib/daemon-version-runtime.mjs']).status !== 0) {
     return { status: 'refused', reason: 'clone-lacks-host-enable', hint: 'let the clone sync to a main that has card 89 S6' };
   }
-  const originUrl = git(p.logical, ['config', '--get', 'remote.origin.url']);
+  const originUrl = absoluteRemote(p.logical, git(p.logical, ['config', '--get', 'remote.origin.url']));
   const stateNow = config.statePaths.filter(path => stat(fs, join(p.logical, path)));
   // A destination left by an earlier run is state we cannot tell from a stale copy: stop before touching anything.
   const existing = stateNow.filter(path => !stat(fs, join(p.logical, path))?.isSymbolicLink() && stat(fs, join(p.state, path)));
@@ -253,7 +300,7 @@ async function migrateInner({ clone, settings, dryRun = false, force = false, de
   const exclude = join(p.logical, '.git', 'info', 'exclude');
   const added = []; // exclude lines this run appended (never a line the user already had)
   const legacy = join(p.root, `legacy-${stamp}`);
-  const tmp = join(dirname(p.logical), `${name}.tmp-link`);
+  const tmp = tmpLinkOf(p);
   // Everything after the first state move is undone, whether it ends in a refusal or a throw: the clone gets its
   // own state back and no `current`, marker or record is left pointing at a half-migrated home. Home files that
   // existed before this run (an earlier marker, switch state) are not ours to delete; `current` was checked absent.
@@ -263,6 +310,7 @@ async function migrateInner({ clone, settings, dryRun = false, force = false, de
     stripExclude(fs, exclude, added);
     fs.rmSync(tmp, { force: true });
     restoreHomeFiles(fs, p.root, homeBefore); // contents and link targets, not just whether the file existed
+    fs.rmSync(`${p.record}.tmp`, { force: true });
     fs.rmSync(intentFile(p), { force: true });
   };
   const haveLines = (stat(fs, exclude) ? fs.readFileSync(exclude, 'utf8') : '').split('\n');
@@ -323,8 +371,12 @@ async function migrateInner({ clone, settings, dryRun = false, force = false, de
     fs.writeFileSync(p.marker, `${JSON.stringify({ enabled: true })}\n`);
     steps.push('enabled');
 
-    // The record goes down before the swap, so nothing can fail after it: a swapped clone always has its record.
-    fs.writeFileSync(p.record, `${JSON.stringify({ migratedAt: new Date((deps.now ?? Date.now)()).toISOString(), legacy, moved, excluded: added, v0: record.id, sha, originUrl: redactUrl(originUrl) }, null, 2)}\n`, { mode: 0o600 });
+    // The record is the journal of the two-rename swap: it goes down (atomically) before the first rename, so a kill
+    // between them is finished by `migrate` or undone by `unmigrate` from it. `home` is where `current` lives, for
+    // the plist helper. A swapped clone always has its record.
+    const journal = `${p.record}.tmp`;
+    fs.writeFileSync(journal, `${JSON.stringify({ migratedAt: new Date((deps.now ?? Date.now)()).toISOString(), legacy, moved, excluded: added, v0: record.id, sha, originUrl: redactUrl(originUrl), home: dirname(p.root) }, null, 2)}\n`, { mode: 0o600 });
+    fs.renameSync(journal, p.record);
     fs.rmSync(tmp, { force: true });
     fs.symlinkSync(relative(dirname(p.logical), join(p.root, 'current')), tmp);
     fs.renameSync(p.logical, legacy);
@@ -366,12 +418,17 @@ async function unmigrateInner({ clone, home, settings, dryRun = false, deps = {}
   try { info = JSON.parse(fs.readFileSync(p.record, 'utf8')); } catch { /* none or unreadable: judged below */ }
   // A run that died after putting the legacy clone back (the record is deleted last) is finished by running it again.
   const resuming = here?.isDirectory() && info !== null && validRecord(info, p) && !stat(fs, info.legacy);
-  if (!here?.isSymbolicLink() && !resuming) return { status: 'refused', reason: 'not-migrated' };
+  // A migrate killed between its two swap renames: no clone at all, and the record's legacy is the real one.
+  const interrupted = !here && interruptedSwap(fs, p) !== null;
+  if (!here?.isSymbolicLink() && !resuming && !interrupted) return { status: 'refused', reason: 'not-migrated' };
   if (info === null) return { status: 'refused', reason: 'no-migration-record' };
   if (!validRecord(info, p)) return { status: 'refused', reason: 'bad-migration-record' };
   if (!resuming && !stat(fs, info.legacy)?.isDirectory()) return { status: 'refused', reason: 'legacy-missing', legacy: info.legacy };
-  if (dryRun) return { status: 'dry-run', name, legacy: info.legacy, resuming, wouldRestore: info.moved.filter(path => stat(fs, join(p.state, path))) };
-  if (!resuming) {
+  if (dryRun) return { status: 'dry-run', name, legacy: info.legacy, resuming, interrupted, wouldRestore: info.moved.filter(path => stat(fs, join(p.state, path))) };
+  if (interrupted) {
+    fs.rmSync(tmpLinkOf(p), { force: true });
+    fs.renameSync(info.legacy, p.logical); // the second rename never happened: undo the first
+  } else if (!resuming) {
     // Put the legacy directory back first, so a daemon that wakes up sees a real clone as soon as possible.
     fs.unlinkSync(p.logical);
     try { fs.renameSync(info.legacy, p.logical); }
@@ -380,21 +437,51 @@ async function unmigrateInner({ clone, home, settings, dryRun = false, deps = {}
   const restored = restoreState(fs, p, info.moved);
   stripExclude(fs, join(p.logical, '.git', 'info', 'exclude'), info.excluded);
   fs.rmSync(p.marker, { force: true });
+  fs.rmSync(tmpLinkOf(p), { force: true }); // a stale link from a swap that died before its first rename
   for (const f of ['current', 'previous', 'state.json', 'migration.json', 'migrate-intent.json']) fs.rmSync(join(p.root, f), { force: true });
   return { status: 'unmigrated', name, restored, versionsKept: join(p.root, 'versions') };
 }
 
-/** Move only ProgramArguments strings and WorkingDirectory from `<ws>/<name>` onto `<ws>/.daemon-clones/<name>/current`. */
-export function versionedPlistText(text, { name }) {
+/**
+ * Move only ProgramArguments strings and WorkingDirectory from `<ws>/<name>` onto `<home>/<name>/current`. `home` is
+ * the clones root the migration used; without it, the default `<ws>/.daemon-clones`.
+ */
+export function versionedPlistText(text, { name, home }) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const current = home && join(home, name, 'current');
   // Lazy `(.*?)`: the first `/<name>` is the clone itself; a later directory with the same name inside it is not.
-  const swap = value => value.replace(new RegExp(`^(.*?)/${escaped}(?=/|$)`),(all, ws) => (ws.endsWith('/.daemon-clones') ? all : `${ws}/.daemon-clones/${name}/current`));
+  const swap = value => {
+    if (current && (value === current || value.startsWith(`${current}/`))) return value; // already moved
+    // `/<name>/current` right after the match is a version path under some other root: moved already, never nested again.
+    return value.replace(new RegExp(`^(.*?)/${escaped}(?=/|$)(/current(?=/|$))?`), (all, ws, moved) => (moved ? all : current ?? (ws.endsWith('/.daemon-clones') ? all : `${ws}/.daemon-clones/${name}/current`)));
+  };
   let out = text.replace(/(<key>ProgramArguments<\/key>\s*<array>)([\s\S]*?)(<\/array>)/, (m, a, body, z) => a + body.replace(/<string>([^<]*)<\/string>/g, (s, v) => `<string>${swap(v)}</string>`) + z);
   out = out.replace(/(<key>WorkingDirectory<\/key>\s*<string>)([^<]*)(<\/string>)/, (m, a, v, z) => a + swap(v) + z);
   return out;
 }
 
-export function rewritePlist({ file, name, backupDir, revertFrom, dryRun = false, deps = {} }) {
+/**
+ * Where `current` lives for a clone, in order: an explicit `--home`; the migrated clone itself (its link points at
+ * `<home>/<name>/current`, whatever the settings say today); the record under the settings-derived home; the default
+ * migrate would use from those settings. A relative root is refused: launchd's cwd is not ours.
+ */
+function plistHome(fs, { clone, home, settings }) {
+  const logical = logicalCloneRoot(clone);
+  const name = basename(logical);
+  const absolute = root => { if (!isAbsolute(root)) throw new Error(`clones root must be an absolute path, got "${root}"`); return resolve(root); };
+  if (home !== undefined) return absolute(home);
+  if (stat(fs, logical)?.isSymbolicLink()) {
+    const target = resolve(dirname(logical), fs.readlinkSync(logical));
+    if (basename(target) === 'current' && basename(dirname(target)) === name) return dirname(dirname(target));
+  }
+  const configured = validateDaemonVersionsSettings(settings ?? {}).clonesRoot;
+  if (configured) absolute(configured);
+  const wanted = runtimeHome(logical, settings);
+  const info = readRecord(fs, paths(name, clone, wanted, ''));
+  return typeof info?.home === 'string' && isAbsolute(info.home) ? info.home : wanted;
+}
+
+export function rewritePlist({ file, name, clone, home, settings, backupDir, revertFrom, dryRun = false, deps = {} }) {
   const fs = deps.fs ?? filesystem;
   if (revertFrom) {
     if (dryRun) return { status: 'dry-run', wouldRevert: true, file };
@@ -402,7 +489,7 @@ export function rewritePlist({ file, name, backupDir, revertFrom, dryRun = false
     return { status: 'reverted', file };
   }
   const text = fs.readFileSync(file, 'utf8');
-  const next = versionedPlistText(text, { name });
+  const next = versionedPlistText(text, clone ? { name, home: plistHome(fs, { clone, home, settings }) } : { name });
   if (next === text) return { status: 'noop' };
   if (!backupDir) throw new Error('--backup-dir is required');
   if (dryRun) return { status: 'dry-run', wouldRewrite: true, file };
