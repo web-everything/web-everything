@@ -165,7 +165,8 @@ function restoreHomeFiles(fs, root, saved) {
 /**
  * The durable record of a migrate in flight, written BEFORE its first state rename and deleted when it ends. It is
  * what lets a run that was killed (no `catch` ran) be undone exactly: the state paths it may have moved, the
- * exclude lines it appended, and the home files as they were.
+ * exclude lines it appended, and the home files as they were. `stale` lists the paths whose destination already held
+ * an earlier run's copy; `parked` the ones among them whose copy was moved aside (so `state/<path>` is live data again).
  */
 const intentFile = p => join(p.root, 'migrate-intent.json');
 const HOME_FILE_SET = new Set(HOME_FILES);
@@ -176,8 +177,9 @@ function readIntent(fs, p) {
     && Array.isArray(raw.exclude) && raw.exclude.every(l => typeof l === 'string' && l.startsWith('/') && plainRelativePath(l.slice(1)))
     && raw.home !== null && typeof raw.home === 'object'
     && Object.entries(raw.home).every(([f, v]) => HOME_FILE_SET.has(f) && v !== null && typeof v === 'object'
-      && (typeof v.link === 'string' || (typeof v.data === 'string' && Number.isInteger(v.mode))));
-  return ok ? raw : null;
+      && (typeof v.link === 'string' || (typeof v.data === 'string' && Number.isInteger(v.mode))))
+    && [raw.stale ?? [], raw.parked ?? []].every(list => Array.isArray(list) && list.every(plainRelativePath));
+  return ok ? { ...raw, stale: raw.stale ?? [], parked: raw.parked ?? [] } : null;
 }
 function writeIntent(fs, p, intent) {
   const temp = `${intentFile(p)}.tmp`;
@@ -189,7 +191,11 @@ function recoverFromIntent(fs, p) {
   if (!stat(fs, intentFile(p))) return;
   const intent = readIntent(fs, p);
   if (intent) {
-    restoreState(fs, p, intent.paths);
+    // A `stale` path had a destination from an earlier run when the intent was written (a forced migrate). Until the
+    // run parked that destination (`parked`), `state/<path>` is still the stale copy and the clone's entry is the live
+    // one: restoring would swap the stale copy in over live data, so such a path is left exactly as it is.
+    const untouched = new Set(intent.stale.filter(path => !intent.parked.includes(path)));
+    restoreState(fs, p, intent.paths.filter(path => !untouched.has(path)));
     stripExclude(fs, join(p.logical, '.git', 'info', 'exclude'), intent.exclude);
     restoreHomeFiles(fs, p.root, intent.home);
   } // else unreadable: killed while writing it, before any state was touched
@@ -315,7 +321,8 @@ async function migrateInner({ clone, settings, dryRun = false, force = false, de
   };
   const haveLines = (stat(fs, exclude) ? fs.readFileSync(exclude, 'utf8') : '').split('\n');
   // Down before the first rename: a kill from here on is undone by the next run from this file alone.
-  writeIntent(fs, p, { paths: stateNow, exclude: stateNow.map(path => `/${path}`).filter(line => !haveLines.includes(line)), home: homeBefore });
+  const intent = { paths: stateNow, exclude: stateNow.map(path => `/${path}`).filter(line => !haveLines.includes(line)), home: homeBefore, stale: existing, parked: [] };
+  writeIntent(fs, p, intent);
   try {
     fs.mkdirSync(p.root, { recursive: true });
     if (!stat(fs, join(p.repo, 'HEAD'))) {
@@ -336,7 +343,11 @@ async function migrateInner({ clone, settings, dryRun = false, force = false, de
       }
       fs.mkdirSync(dirname(dest), { recursive: true });
       // With --force the clone's entry is the live one: the stale destination is parked, never merged over or deleted.
-      if (stat(fs, dest)) parkAside(fs, p, dest, path);
+      if (stat(fs, dest)) {
+        parkAside(fs, p, dest, path);
+        intent.parked.push(path); // after the park and before the rename: a kill from here on finds `dest` missing or live
+        writeIntent(fs, p, intent);
+      }
       fs.renameSync(src, dest);
       moved.push(path); // before the link, so a crash between the rename and the symlink still rolls back
       const gap = stat(fs, src); // recreated by a writer in the microsecond gap

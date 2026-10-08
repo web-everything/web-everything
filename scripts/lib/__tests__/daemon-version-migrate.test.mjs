@@ -261,6 +261,50 @@ describe('daemon version migrate / unmigrate', () => {
     expect(readFileSync(join(clone, '.conveyor', 'daemon.log'))).toBe('log line\n');
   });
 
+  describe('a forced migrate killed while a stale destination exists (intent recovery must not trust it)', () => {
+    // Real death: the matching rename lands, then every later filesystem call fails, so no catch/rollback runs.
+    const killAfterRename = match => {
+      let dead = false;
+      const dying = Object.fromEntries(Object.entries(fs).map(([k, f]) => [k, typeof f === 'function' ? (...a) => {
+        if (dead) throw new Error('killed');
+        const result = f(...a);
+        if (k === 'renameSync' && match.test(a[1])) { dead = true; throw new Error('killed'); }
+        return result;
+      } : f]));
+      return { ...deps, fs: dying };
+    };
+    beforeEach(() => {
+      fs.mkdirSync(join(home, 'daemon', 'state', '.operations'), { recursive: true });
+      fs.writeFileSync(join(home, 'daemon', 'state', '.operations', 'run.json'), 'stale');
+    });
+
+    it('a path the dead run never moved keeps the clone\'s live entry, not the stale destination', async () => {
+      // .conveyor is moved first, then the run dies before .operations (whose destination is stale) is touched.
+      await expect(migrate({ clone, home, settings, deps: killAfterRename(/state\/\.conveyor$/), force: true })).rejects.toThrow('killed');
+      expect(readFileSync(join(clone, '.operations', 'run.json'))).toBe('1');
+      const result = await migrate({ clone, home, settings, deps, force: true });
+      expect(result.status).toBe('migrated');
+      expect(readFileSync(join(home, 'daemon', 'state', '.operations', 'run.json'))).toBe('1');
+      expect(readFileSync(join(home, 'daemon', 'state', '.conveyor', 'daemon.log'))).toBe('log line\n');
+      expect(files(join(home, 'daemon', 'conflicts'))).toContain('stale');
+      expect((await unmigrate({ clone, home, settings, deps })).status).toBe('unmigrated');
+      expect(readFileSync(join(clone, '.operations', 'run.json'))).toBe('1');
+    });
+
+    it('a path the dead run had already moved over the stale destination is still put back', async () => {
+      // Killed after the live .operations replaced the (parked) stale one, before its link went in.
+      await expect(migrate({ clone, home, settings, deps: killAfterRename(/state\/\.operations$/), force: true })).rejects.toThrow('killed');
+      expect(fs.existsSync(join(clone, '.operations'))).toBe(false);
+      const result = await migrate({ clone, home, settings, deps, force: true });
+      expect(result.status).toBe('migrated');
+      expect(result.moved).toEqual(['.conveyor', '.operations']);
+      expect(readFileSync(join(home, 'daemon', 'state', '.operations', 'run.json'))).toBe('1');
+      expect(files(join(home, 'daemon', 'conflicts'))).toContain('stale');
+      expect((await unmigrate({ clone, home, settings, deps })).status).toBe('unmigrated');
+      expect(readFileSync(join(clone, '.operations', 'run.json'))).toBe('1');
+    });
+  });
+
   it('a migrate killed after current and the marker were written, before the swap, can be re-run', async () => {
     await migrate({ clone, home, settings, deps });
     // put the world back as a kill after the pointer writes would leave it: clone is a real dir, no record
