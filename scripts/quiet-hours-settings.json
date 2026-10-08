@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "start": "22:00",
+  "end": "07:00",
+  "timeZone": "America/New_York",
+  "toggleFile": "~/workspace/.operations/handoff/quiet-mode.json",
+  "digestDir": "~/workspace/.operations/reports/quiet-hours",
+  "breakthrough": {
+    "mainRed": true,
+    "daemonDownMin": 30,
+    "daemonDownUnknownDuration": "deliver",
+    "mainRedTitlePattern": "\\bmain\\b.*\\b(red|failing)\\b"
+  },
+  "sweeps": {
+    "skipDuringQuiet": ["coroner", "opus"]
+  },
+  "digest": {
+    "enabled": true,
+    "maxTitles": 5
+  }
+}

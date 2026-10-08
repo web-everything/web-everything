@@ -91,6 +91,7 @@ import { defaultDrainHistoryPath } from '../operations/live-state-io.mjs';
 import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 import { stuckOnPermissionPrompt } from './health-smells/dispatch-permission-stall.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
+import { flushDigest } from '../lib/quiet-hours-io.mjs';
 import { DAEMON_MANIFEST } from '../../skills-src/conveyor/daemon-manifest.mjs';
 import { RUNNER_LOCK_ROOT } from '../../skills-src/conveyor/runner-lock.mjs';
 import { collectDaemonStatus } from '../operations/daemon-status-io.mjs';
@@ -1244,8 +1245,16 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     const title = `Health: ${ep.smell} — ${ep.subject}`;
     const body = scrubText(ep.recommendation || ep.summary || 'See the health report.');
     let sent;
-    try { sent = notifyDesktopChecked({ title, body }); } catch (e) { sent = { ok: false, error: String(e?.message || e) }; }
+    // quietHours breakthrough (card xmvc6oc): a daemon silent long enough is an emergency overnight.
+    const emergency = ep.smell === 'daemon-silent' ? { kind: 'daemon-down', downForMs: ep.openedAt != null ? Math.max(0, now - ep.openedAt) : null } : undefined;
+    try { sent = notifyDesktopChecked({ title, body, emergency }); } catch (e) { sent = { ok: false, error: String(e?.message || e) }; }
     notifications.push({ key: p.key, ok: sent?.ok === true, error: sent?.ok === true ? null : scrubText(sent?.error ?? 'unknown') });
+  }
+
+  // quietHours (card xmvc6oc): this tick runs often, so it is the reliable place to send the ONE held-alerts
+  // digest soon after quiet hours end (a no-op while quiet or when nothing is held).
+  if (!flags['no-notify'] && !flags['dry-run']) {
+    try { flushDigest({ send: (n) => notifyDesktopChecked(n, { quietGate: null }) }); } catch { /* best-effort */ }
   }
 
   const completedAt = Date.now();

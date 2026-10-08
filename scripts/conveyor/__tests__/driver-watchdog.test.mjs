@@ -1204,6 +1204,8 @@ describe('the watchdog shares NONE of the driver\'s own decision logic', () => {
       'infra-blocked.mjs',          // branch-sync's backoff primitives
       'pr-land-reasons.mjs',        // #4348-open-pr-retry — infra-blocked's refused/unrun split (leaf: no imports)
       'queue-store.mjs',            // the sidecar GRAMMAR — parseQueue / normNum
+      'quiet-hours-io.mjs',         // card xmvc6oc — branch-sync's notify goes through the quietHours gate
+      'quiet-hours.mjs',            // card xmvc6oc — its pure core (leaf: no imports)
       'resolve-runner-checkout.mjs',// lease pid → checkout
       'runner-lock.mjs',            // the singleton lease
       'under-test.mjs',             // #5187 — claude-agents-cache's runner-neutral test-isolation predicate

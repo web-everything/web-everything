@@ -40,6 +40,7 @@ import { createInterface } from 'node:readline';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { RUNNER_LOCK_ROOT } from './runner-lock.mjs';
+import { gateAlert } from '../../scripts/lib/quiet-hours-io.mjs';
 
 // ── PURE CORE (no IO — every effect is injected; unit-tested directly) ─────────────────────────────────────
 
@@ -427,10 +428,14 @@ function q(s) { return `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 
 /** Best-effort desktop notification (#3398, mirrors #2493's drain-daemon precedent). macOS-only (`osascript`);
  *  a no-op elsewhere, and a spawn failure must never break the supervisor loop. */
-function notifyDesktop({ title, body }) {
-  if (process.platform !== 'darwin') return;
-  try { spawn('osascript', ['-e', `display notification ${q(body)} with title ${q(title)}`], { stdio: 'ignore', detached: true }).unref(); }
-  catch { /* best-effort — never let a notification failure break the supervisor */ }
+function notifyDesktop(notification) {
+  // quietHours (card xmvc6oc): held overnight unless it is an emergency; see we:scripts/lib/quiet-hours-io.mjs.
+  const send = ({ title, body }) => {
+    if (process.platform !== 'darwin') return { ok: false };
+    try { spawn('osascript', ['-e', `display notification ${q(body)} with title ${q(title)}`], { stdio: 'ignore', detached: true }).unref(); return { ok: true }; }
+    catch { return { ok: false }; /* best-effort — never let a notification failure break the supervisor */ }
+  };
+  try { gateAlert(notification, { send }); } catch { /* best-effort */ }
 }
 
 /** Build the `maybeAlert` IO-shell glue: re-detect anomalies over the in-memory ring, decide whether to fire
