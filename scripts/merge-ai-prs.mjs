@@ -127,6 +127,7 @@ import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } fro
 // beside `latestRequiredCheck`) for why `collapseRollupToLatestPerName`/`rollupRowKind` now live in their own
 // dependency-free `./lib/rollup-collapse.mjs` rather than here.
 import { collapseRollupToLatestPerName, rollupRowKind } from './lib/rollup-collapse.mjs';
+import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs';
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
 import { execFileSync, execFile, spawnSync } from 'node:child_process';
@@ -419,13 +420,8 @@ export function latestRequiredCheck(pr, requiredCheck = 'test') {
  * PR #4236 landed red with a high-severity alert; this closes that gap in the drain. It only ADDS a refusal.
  * A missing/malformed file falls back to ON (fail closed).
  */
-export const CODEQL_CHECK_NAME = 'CodeQL';
-export function loadDrainGateSettings(path = join(dirname(fileURLToPath(import.meta.url)), 'drain-gate-settings.json')) {
-  try {
-    const raw = JSON.parse(readFileSync(path, 'utf8'));
-    return { drainBlocksOnCodeQL: raw?.drainBlocksOnCodeQL !== false };
-  } catch { return { drainBlocksOnCodeQL: true }; }
-}
+// CODEQL_CHECK_NAME / loadDrainGateSettings live in ./lib/codeql-gate.mjs (card x8cnbii) so the fix daemon reads the SAME gate.
+export { CODEQL_CHECK_NAME, loadDrainGateSettings };
 const DRAIN_GATE_SETTINGS = loadDrainGateSettings();
 
 /** Did the latest `CodeQL` check on this PR conclude FAILURE (new alerts)? Pure; an absent/pending/passing CodeQL is false. */

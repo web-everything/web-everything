@@ -68,6 +68,7 @@ import {
   acquireFixDispatchClaim, releaseFixDispatchClaim, fixDispatchClaimOwner,
 } from '../conveyor/fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from '../conveyor/fix-procedure.mjs';
+import { codeqlBriefSection } from '../lib/codeql-gate.mjs';
 import { createCiHealReserve } from '../lib/ci-heal-reserve.mjs';
 import { listFixDispatchClaims } from '../conveyor/fix-claim-store.mjs';
 import { flushOwedWrites } from '../conveyor/ci-heal-owed.mjs';
@@ -100,6 +101,13 @@ function readHealQuotaScores() {
     if (!Array.isArray(store.records)) throw new Error('quota scorecards have no records array');
     return store.records;
   } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+}
+
+/** Card x8cnbii — a CodeQL-reason heal appends the alert (rule/file/line/message) to the brief; any other heal is unchanged. */
+export function withCodeQLSection(prompt, planned, repo = 'we') {
+  if (planned?.reason !== 'codeql') return prompt;
+  const slug = CONSTELLATION_REPOS[repoKeyForSlug(repo) ?? repo]?.slug ?? repo;
+  return `${prompt}\n\n${codeqlBriefSection(planned.codeql, { repo: slug, pr: planned.pr })}\n`;
 }
 
 /** Read current holds once at the CI-heal boundary. A read error is a visible refusal. */
@@ -208,9 +216,9 @@ export async function dispatchCiHeal(planned, {
     const route = repo === 'we' ? routeHeal({ scope: planned.scope, reason }) : null;
     if (route?.outcome === 'refused') { releaseOurClaim(); return { held: true, reason: route.refusal }; }
     const out = await sinks[DISPATCH_EFFECT]({
-      launchKind: 'ci-heal', prompt: withAltBranchHint(prompt, planned.altBranch), sessionSlug, num: planned.itemNum ?? undefined, lane: planned.lane, scope: planned.scope,
+      launchKind: 'ci-heal', prompt: withCodeQLSection(withAltBranchHint(prompt, planned.altBranch), planned, repo), sessionSlug, num: planned.itemNum ?? undefined, lane: planned.lane, scope: planned.scope,
       headRefOid: planned.headRefOid, claimOwner, claimRoot,
-      pr: planned.pr, reason, repo, probationWorker: route?.probationWorker ?? null, routing: route,
+      pr: planned.pr, reason, repo, probationWorker: reason === 'codeql' ? null : (route?.probationWorker ?? null), // x8cnbii: a CodeQL heal needs the brief's alert, which the probation worker prompt does not carry routing: route,
     });
     if (out?.held) {
       // #x0jphk5 — the SINK's own (separate, unrelated) guard refused it: nothing was spawned under OUR claim
@@ -418,7 +426,8 @@ export async function runReconcileCiHealDispatch({
     } catch { unit = null; }
     const planned = {
       itemNum: unit?.itemNum ?? null, pr: entry.prNumber, laneRef: entry.headRefName,
-      scope: Array.isArray(unit?.scope) ? unit.scope : [], reason: 'red-ci',
+      scope: Array.isArray(unit?.scope) ? unit.scope : [], reason: entry.reason === 'codeql' ? 'codeql' : 'red-ci',
+      ...(entry.reason === 'codeql' && entry.codeql ? { codeql: entry.codeql } : {}), // card x8cnbii — the alert for the brief
       // #x0jphk5 — carried through so `dispatchCiHeal` can key its `(repo, pr, headRefOid)` claim; dropped
       // before this slice, even though `reconcile-core.mjs`'s own `base` object already carries it on every
       // entry (see this function's own docblock — "a CI-heal entry carries neither on `reconcile-core.mjs`'s
