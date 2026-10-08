@@ -1,4 +1,5 @@
 ---
+bornAs: xsa8g0y
 kind: story
 size: 3
 parent: "4075"
