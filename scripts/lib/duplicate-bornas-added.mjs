@@ -57,7 +57,7 @@ export function checkDuplicateBornAs({ exec, base = 'main', sha = 'HEAD', branch
     } catch { /* no match / no ref → nothing on main */ }
     let openPrFiles = [];
     try {
-      const prs = JSON.parse(exec('gh', ['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'open', '--limit', '200', '--json', 'number,headRefName,files']));
+      const prs = JSON.parse(exec('gh', ['pr', 'list', '--state', 'open', '--limit', '200', '--json', 'number,headRefName,files']));
       openPrFiles = prs.filter((p) => !branch || p.headRefName !== branch)
         .flatMap((p) => (p.files || []).map((f) => ({ pr: p.number, path: f.path })));
     } catch { /* gh unavailable → skip the open-PR half */ }
