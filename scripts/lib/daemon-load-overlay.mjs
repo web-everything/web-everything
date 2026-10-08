@@ -58,7 +58,7 @@ import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
 import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
 import { resolveVersionedContext, submitRequest, waitForResult } from './daemon-version-runtime.mjs';
-import { rollback as rollbackVersion } from './daemon-version-switch.mjs';
+import { switchCurrent as switchCurrentVersion, status as versionStatus } from './daemon-version-switch.mjs';
 
 /** Throw unless `ref` passes {@link isSafeBranchName} — same argv-injection defense
  *  `daemon-self-sync.mjs#assertSafeBranchName` applies to a POC branch; `--ref` is operator input here, but
@@ -417,6 +417,46 @@ export async function runRealDispatchSmoke({
 }
 
 /**
+ * `inspect` (is the overlay in this tree, and does it touch the dispatch path) failing CLOSED: a throw — an
+ * unreadable diff, a git failure — counts as "in the tree and required", never as "nothing to smoke".
+ */
+function inspectClosed(inspect, args) {
+  try { return inspect(args); } catch { return { inTree: true, required: true, matched: [], reason: 'inspect-threw' }; }
+}
+
+/** A worker launch that THROWS is a failed smoke (the caller rolls back), never an unhandled rejection. */
+async function runDispatchSmokeSafely(dispatchSmoke, args) {
+  try {
+    const r = await dispatchSmoke(args);
+    // Anything that is not a verdict object is a failed smoke: `.ok` / `.reason` are read unguarded downstream.
+    return r && typeof r === 'object' && typeof r.ok === 'boolean' ? r : { ok: false, reason: 'smoke-bad-result' };
+  } catch (e) {
+    return { ok: false, reason: 'smoke-threw', detail: String((e && e.message) || e).split('\n')[0] };
+  }
+}
+
+/**
+ * Roll the VERSION that failed its dispatch smoke back — and only that one. The daemon's plain `rollback` flips
+ * `current` to `previous` whatever `current` is now, so if the in-tick updater adopted a NEWER version meanwhile it
+ * would undo that one and re-adopt the failed one. Instead: read `current` first, do nothing unless it is still
+ * `versionId`, and switch with `expectCurrent: versionId` (the switch re-checks it under the version lock), rejecting
+ * the failed version the way the daemon's own probation rollback does.
+ * @returns {Promise<{status:string, reason?:string, actual?:string|null}>} the switch's own result, or
+ *   `current-moved` / `no-previous` / `disabled` when nothing was switched.
+ */
+export async function rollbackVersionIfCurrent({
+  clone, home, settings, versionId, by, reason, statusFn = versionStatus, switchFn = switchCurrentVersion,
+}) {
+  const s = await statusFn({ clone, home, settings });
+  if (s?.status === 'disabled') return { status: 'disabled' };
+  if (!s || s.current !== versionId) return { status: 'current-moved', actual: s?.current ?? null };
+  if (!s.previous) return { status: 'no-previous' };
+  return switchFn({
+    clone, home, settings, id: s.previous, expectCurrent: versionId, rollback: true, reject: versionId, by, reason,
+  });
+}
+
+/**
  * Wrap the rebuild's candidate smoke: after the normal live smoke PASSES, if the candidate tree contains `ref` and
  * the overlay touches the dispatch path, run the dispatch smoke against that candidate. A failure THROWS, so
  * `smokeAndAdopt` holds the clone on its last-good tree (`smoke-threw`) instead of adopting it — and, unlike a
@@ -429,9 +469,11 @@ export function withDispatchSmoke({
   return async (args) => {
     const result = await baseSmoke(args);
     if (result?.verdict !== 'pass') return result;
-    const info = inspect({ tree: args.root, ref, patterns: settings.dispatchPaths });
+    const info = inspectClosed(inspect, { tree: args.root, ref, patterns: settings.dispatchPaths });
     if (!info.inTree || !info.required) return result;
-    const smoke = await dispatchSmoke({ tree: args.root, env: args.env, settings, log });
+    // A launch that throws is recorded in `ctl` as a failed smoke too: the throw below makes the rebuild hold on
+    // last-good, and `ctl` is how the caller knows to remove the overlay instead of leaving it registered.
+    const smoke = await runDispatchSmokeSafely(dispatchSmoke, { tree: args.root, env: args.env, settings, log });
     Object.assign(ctl, {
       ran: true, phase: 'candidate', required: true, matched: info.matched, result: smoke,
     });
@@ -457,7 +499,7 @@ export async function runDaemonLoadOverlay({
   clone, ref, pr = null, base = 'main', dryRun = false, env = process.env, log = console,
   addedBy, reason = null, now,
   addOverlayFn = addOverlay, rebuild = rebuildClone, dryRunRebuildFn = dryRunRebuild,
-  wait = false, waitMs, versions, submit = submitRequest, waitFor = waitForResult, rollbackVersionFn = rollbackVersion,
+  wait = false, waitMs, versions, submit = submitRequest, waitFor = waitForResult, rollbackVersionFn = rollbackVersionIfCurrent,
   settings, baseSmoke = runLiveSmokeWithRetry, dispatchSmoke = runRealDispatchSmoke, inspect = overlayDispatchFiles,
   removeOverlayFn = removeOverlay, appendEventFn = appendOverlayEvent,
 }) {
@@ -491,12 +533,7 @@ export async function runDaemonLoadOverlay({
   const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
   const smokeOn = safety.dispatchSmoke === 'on';
 
-  // A worker launch that THROWS is a failed smoke (a rollback), never an unhandled rejection that leaves the overlay registered.
-  const smokeTree = async (tree) => {
-    try { return await dispatchSmoke({ tree, env, settings: safety, log }); } catch (e) {
-      return { ok: false, reason: 'smoke-threw', detail: String((e && e.message) || e).split('\n')[0] };
-    }
-  };
+  const smokeTree = (tree) => runDispatchSmokeSafely(dispatchSmoke, { tree, env, settings: safety, log });
   const notRun = (why) => {
     warnings.push('dispatch-smoke-not-run');
     log.error?.(`daemon-load-overlay: WARNING — NO dispatch smoke ran for ${ref}: ${why}. It stays registered and unsmoked.`);
@@ -506,7 +543,16 @@ export async function runDaemonLoadOverlay({
   const rollBack = async (out, ctl, rebuildWithout) => {
     const why = `dispatch-smoke-failed: ${ctl.result.reason}${ctl.result.detail ? ` — ${ctl.result.detail}` : ''}`;
     log.error?.(`daemon-load-overlay: ${ref} FAILED the dispatch smoke (${ctl.phase}): ${why}. Removing it and recovering without it (other overlays untouched). Evidence: ${ctl.result.scratch ?? 'n/a'}${ctl.result.transcript ? `, transcript ${ctl.result.transcript}` : ''}`);
-    removeOverlayFn(root, ref, { env, why });
+    try { removeOverlayFn(root, ref, { env, why }); } catch (e) {
+      // The list could not be changed (e.g. its lock timed out): rebuilding now would just load the overlay again, and
+      // claiming it was removed would be false. Say so; the operator re-runs the removal.
+      const detail = String((e && e.message) || e).split('\n')[0];
+      log.error?.(`daemon-load-overlay: ${ref} could NOT be removed from the overlay list (${detail}) — it is STILL REGISTERED and failed its dispatch smoke; remove it with daemon-overlay.`);
+      return {
+        ...out, registered: true, removed: false, adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed',
+        rollback: { reason: `remove-failed: ${detail}`, adopted: false },
+      };
+    }
     try {
       appendEventFn(root, {
         kind: 'removed', ref, pr, by: 'daemon-load-overlay', reason: why,
@@ -516,7 +562,7 @@ export async function runDaemonLoadOverlay({
     try { rebuilt = await rebuildWithout(); } catch (e) { rebuilt = { reason: `error: ${String((e && e.message) || e).split('\n')[0]}`, adopted: false }; }
     return {
       ...out, registered: false, adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed',
-      rollback: { reason: rebuilt.reason, adopted: !!rebuilt.adopted }, head: rebuilt.head !== undefined ? rebuilt.head : out.head,
+      rollback: { reason: rebuilt.reason, adopted: !!rebuilt.adopted, ...(rebuilt.superseded ? { superseded: true, actual: rebuilt.actual ?? null } : {}) }, head: rebuilt.head !== undefined ? rebuilt.head : out.head,
       alerts: [...(out.alerts || []), ...(rebuilt.alerts || [])],
     };
   };
@@ -548,9 +594,7 @@ export async function runDaemonLoadOverlay({
     const versionId = typeof result.versionId === 'string' && /^[0-9A-Za-z][0-9A-Za-z._-]*$/.test(result.versionId) ? result.versionId : null;
     const tree = versionId ? join(vctx.dir, 'versions', versionId) : null;
     let info = { inTree: false, required: false };
-    if (tree) {
-      try { info = inspect({ tree, ref, patterns: safety.dispatchPaths }); } catch { info = { inTree: true, required: true, matched: [], reason: 'inspect-threw' }; } // fail CLOSED
-    }
+    if (tree) info = inspectClosed(inspect, { tree, ref, patterns: safety.dispatchPaths });
     if (!info.inTree) {
       notRun(`it is not in the adopted versioned tree${tree ? ` (${tree})` : ' (the result names no version)'}`);
       return { ...out, dispatchSmoke: { ran: false, skipped: 'overlay-not-in-versioned-tree' } };
@@ -561,27 +605,40 @@ export async function runDaemonLoadOverlay({
     };
     if (ctl.result.ok) return { ...out, dispatchSmoke: ctl };
     // The overlay is removed from the list, and the adopted version is rolled back with the daemon's own version
-    // rollback (it flips `current` to `previous` and holds the rejected sha until main moves) — re-requesting a build
-    // would only rebuild origin/main, which already contains this tree.
+    // switch (current → previous, rejected sha held until main moves) — but ONLY if `current` is still the version
+    // that failed: a newer adoption is never undone. Re-requesting a build would only rebuild origin/main, which
+    // already contains this tree.
     return rollBack({ ...out, dispatchSmoke: ctl }, ctl, async () => {
       const rolled = await rollbackVersionFn({
-        clone: vctx.clone, home: vctx.home, settings: vctx.settings, by: 'daemon-load-overlay', reason: `dispatch-smoke-failed: ${ref}`,
+        clone: vctx.clone, home: vctx.home, settings: vctx.settings, versionId, by: 'daemon-load-overlay', reason: `dispatch-smoke-failed: ${ref}`,
       });
-      return { reason: rolled?.status ?? 'unknown', adopted: rolled?.status === 'switched', head: null };
+      const moved = rolled?.status === 'current-moved' || (rolled?.status === 'aborted' && rolled?.reason === 'current-moved');
+      return {
+        reason: rolled?.status === 'aborted' ? `aborted: ${rolled.reason}` : (rolled?.status ?? 'unknown'),
+        adopted: rolled?.status === 'switched', ...(moved ? { superseded: true, actual: rolled.actual ?? null } : {}), head: null,
+      };
     });
   }
   const ctl = { ran: false, phase: null, required: null, result: null };
   const runSmoke = smokeOn ? withDispatchSmoke({
     baseSmoke, ref, settings: safety, dispatchSmoke, inspect, ctl, log,
   }) : baseSmoke;
-  const rebuildResult = await rebuild({
-    root, env, log, mainOnly: false, runSmoke,
-  });
+  let rebuildResult;
+  try {
+    rebuildResult = await rebuild({
+      root, env, log, mainOnly: false, runSmoke,
+    });
+  } catch (e) {
+    // The candidate smoke already failed (`ctl` holds it) and the rebuild then died on something else (a lock, a git
+    // error): the overlay must still come off. With no failed smoke on record the error is not ours to swallow.
+    if (!(ctl.ran && ctl.result && !ctl.result.ok)) throw e;
+    rebuildResult = { moved: false, adopted: false, reason: `rebuild-threw: ${String((e && e.message) || e).split('\n')[0]}` };
+  }
 
   // Adopted without the candidate dispatch smoke (a cached/proven tree skips the smoke; a daemon tick that took the
   // lock first adopts with its own plain smoke): smoke the LIVE clone now, if the overlay is in it and needs one.
   if (smokeOn && !ctl.ran) {
-    const info = inspect({ tree: root, ref, patterns: safety.dispatchPaths });
+    const info = inspectClosed(inspect, { tree: root, ref, patterns: safety.dispatchPaths });
     if (info.inTree && info.required) {
       Object.assign(ctl, {
         ran: true, phase: 'post-adopt', required: true, matched: info.matched, result: await smokeTree(root),
@@ -637,7 +694,7 @@ if (IS_CLI) {
       } else if (result.rolledBack) {
         const d = result.dispatchSmoke || {};
         process.stdout.write(`daemon-load-overlay: ${ref} FAILED the dispatch smoke (${d.phase}: ${d.result?.reason}${d.result?.detail ? ` — ${d.result.detail}` : ''}) — `
-          + `ROLLED BACK: overlay removed, ${result.rollback?.adopted ? 'recovered without it' : 'recovery was NOT done — the bad tree may still be live'} (${result.rollback?.reason}) at ${result.root}, head ${result.head ?? 'n/a'}\n`
+          + `ROLLED BACK: ${result.removed === false ? 'overlay could NOT be removed (STILL REGISTERED)' : 'overlay removed'}, ${result.rollback?.adopted ? 'recovered without it' : result.rollback?.superseded ? `the live version moved on (now ${result.rollback.actual ?? 'unknown'}) and was left untouched — nothing was rolled back; check that it does not carry this overlay` : 'recovery was NOT done — the bad tree may still be live'} (${result.rollback?.reason}) at ${result.root}, head ${result.head ?? 'n/a'}\n`
           + `  evidence: ${d.result?.scratch ?? 'n/a'}${d.result?.transcript ? ` transcript ${d.result.transcript}` : ''}\n`);
       } else if (result.dryRun) {
         process.stdout.write(
