@@ -88,6 +88,10 @@ describe('validateWorkerResult', () => {
     expect(validateWorkerResult(done({ filesTouched: ['a/b.mjs'] }), { role: 'build' }).ok).toBe(true);
     expect(validateWorkerResult(done(), { role: 'review' }).ok).toBe(true);
   });
+  it('fails closed on an unknown or mis-cased role instead of skipping the role rules', () => {
+    expect(validateWorkerResult(done(), { role: 'Fix' }).problems.join()).toMatch(/unknown role/);
+    expect(validateWorkerResult(done(), { role: 'fixer' }).ok).toBe(false);
+  });
   it('enforces length caps and repo-relative file paths', () => {
     expect(validateWorkerResult(done({ summary: 'x'.repeat(281) })).ok).toBe(false);
     expect(validateWorkerResult(done({ filesTouched: ['/etc/passwd'] })).ok).toBe(false);
@@ -146,9 +150,14 @@ describe('fail-closed envelope outcomes (D6)', () => {
     expect(u.outcome).toBe('unparseable');
     expect(u.blocker.kind).toBe('contract-violation');
     expect(u.signature).toBe('fix|claude-p|reaper-kill');
-    expect(u.blocker.evidence.text.endsWith('END')).toBe(true);
+    expect(u.blocker.evidence.text).toMatch(/transcript: \/t\.jsonl/);
     expect(u.blocker.evidence.text.length).toBeLessThanOrEqual(2000);
     expect(unparseableOutcome({ role: 'fix', launcher: 'agy', reason: 'made-up' }).signature).toBe('fix|agy|schema-violation');
+  });
+  it('the prose tail kept as evidence is redacted and single-line (never routed, never a secret)', () => {
+    const u = unparseableOutcome({ role: 'fix', launcher: 'codex-exec', reason: 'timeout', prose: 'env dump\nGITHUB_TOKEN=ghp_abcdefghijklmnop1234\ncurl https://u:pw@host/x' });
+    expect(u.blocker.evidence.text).not.toMatch(/ghp_|u:pw@/);
+    expect(u.blocker.evidence.text).toMatch(/reason: timeout/);
   });
   it('an operator stop is aborted and carries no signature, so no product-fix job', () => {
     expect(abortedOutcome({ role: 'fix', launcher: 'claude-bg' })).toMatchObject({ outcome: 'aborted', blocker: null, signature: null });

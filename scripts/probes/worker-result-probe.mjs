@@ -6,11 +6,13 @@
  * structured result landed: `{launcher, honored, resultLocation, resumeKeepsSchema, failureShape, notes}`.
  * Launchers: `claude -p`, `claude --bg`, `claude --bg --resume`, `codex exec`, `codex exec resume`, `agy`.
  *
- *   node scripts/probes/worker-result-probe.mjs [--json] [--only=claude-p,codex-exec,...]
+ *   node scripts/probes/worker-result-probe.mjs [--json] [--only=claude-p,claude-bg,codex,agy]
  *
+ * SIDE EFFECTS: these are live, paid sessions. They leave Claude/Codex/agy session records behind (claude -p
+ * --session-id, ~/.claude/jobs/<id> for --bg, a Codex thread, an agy conversation); only the temp dir is removed.
  * Spend is small on purpose: haiku for Claude, one-line prompts, a throwaway schema (NOT the real
  * we.worker-result schema, which S1 owns). Every probe is isolated: a missing CLI, an auth failure or a timeout
- * becomes `honored: null` with the reason in `notes`, never a crash, so the script exits 0 whenever it finished.
+ * becomes `honored: null` with the reason in `notes`, never a crash, so the script exits 0 whenever it finished (2 on an unknown --only name).
  * The two `claude --bg` sessions it starts are stopped by their own id at the end (never a blanket kill).
  *
  * Findings recorded in the S0 PR (CLI versions: claude 2.1.293, codex-cli 0.155.1, agy 1.3.1):
@@ -64,6 +66,7 @@ function probeClaudeP(dir) {
   const r = run('claude', [PROMPT, ...base, '--session-id', sid]);
   if (!r.ok) return skip('claude -p', r.reason);
   const j = tryParse(r.stdout);
+  if (!j) return skip('claude -p', `exit ${r.status}, stdout is not JSON (auth or CLI problem?): ${r.stderr.slice(0, 120).replace(/\s+/g, ' ')}`);
   const honored = !!j && j.subtype === 'success' && matchesProbeShape(j.structured_output);
   const r2 = run('claude', [PROMPT2, ...base, '--resume', sid]);
   const j2 = tryParse(r2.stdout);
@@ -133,6 +136,7 @@ function probeCodex(dir) {
   const common = ['--json', '--skip-git-repo-check', '--output-schema', schema];
   const r = run('codex', ['exec', ...common, '-o', out1, '-s', 'read-only', PROMPT], { cwd: dir });
   if (!r.ok) return [skip('codex exec', r.reason), skip('codex exec resume', r.reason)];
+  if (r.status !== 0 && !existsSync(out1)) return [skip('codex exec', `exit ${r.status}, no -o file (auth or CLI problem?): ${r.stdout.slice(-160).replace(/\s+/g, ' ')}`), skip('codex exec resume', 'first call failed')];
   const tid = /"thread_id":"([^"]+)"/.exec(r.stdout)?.[1];
   const v1 = existsSync(out1) ? tryParse(readFileSync(out1, 'utf8')) : null;
   const bad = join(dir, 'codex-bad.json');
@@ -159,6 +163,7 @@ function probeAgy(dir) {
   const r = run('agy', ['--print', PROMPT, ...base], { cwd: dir });
   if (!r.ok) return skip('agy', r.reason);
   const j = tryParse(r.stdout);
+  if (!j) return skip('agy', `exit ${r.status}, stdout is not JSON (auth or CLI problem?): ${r.stderr.slice(0, 120).replace(/\s+/g, ' ')}`);
   const denied = run('agy', ['--print', 'Run the shell command: echo hi > x.txt , then report.', ...base], { cwd: dir });
   const jd = tryParse(denied.stdout);
   const r2 = j?.conversation_id ? run('agy', ['--print', PROMPT2, '--conversation', j.conversation_id, ...base], { cwd: dir }) : null;
@@ -183,6 +188,8 @@ export function main(argv = process.argv.slice(2)) {
   const dir = mkdtempSync(join(tmpdir(), 'worker-result-probe-'));
   const ctx = { dir, cwd: process.cwd() };
   const results = [];
+  const unknown = only.filter((n) => !Object.hasOwn(PROBES, n));
+  if (unknown.length) { console.error(`unknown --only name(s): ${unknown.join(', ')} (known: ${Object.keys(PROBES).join(', ')})`); return 2; }
   try {
     for (const [name, fn] of Object.entries(PROBES)) {
       if (only.length && !only.includes(name)) continue;

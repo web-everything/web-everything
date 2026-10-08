@@ -26,10 +26,10 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — Summary and evidence text are length-capped and only stored as data; no daemon routes on prose.
+1. **Untrusted text** — Summary and evidence text are length-capped and stored as data; only deniedCommand and the unparseable prose tail are redacted here, the envelope writer (S2) redacts the rest; no daemon routes on prose.
 2. **Truncated reads** — Over-long or truncated JSON fails validation and is treated as unparseable.
 3. **Shared state files** — n/a: pure functions, no state files.
-4. **Fail closed** — Any parse, schema or reader-check failure returns unparseable with blocker kind contract-violation, never success.
-5. **Identity scoping** — Finding ids use the #4233 stable identity (file + rule/lens + normalized claim).
+4. **Fail closed** — Any parse, schema or reader-check failure returns ok:false (an unknown role too); the caller builds the unparseable outcome with kind contract-violation from the helper, never success.
+5. **Identity scoping** — Finding refs are opaque non-empty ids capped in length; the stable identity itself (file + lens + normalized claim) is minted by the review renderer, not checked here.
 6. **State over time** — The v field is an enum of [1]; unknown versions are refused.
 7. **Who wrote it** — The launcher writes the envelope; the worker only writes the result object, and the validator rejects extra keys.

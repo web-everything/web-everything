@@ -6,7 +6,11 @@
  * WHAT THIS IS. Every dispatched worker ends with ONE JSON object shaped by `we:schemas/worker-result.v1.json`
  * (one base schema for every role, D4). This module is the READER of that object: it checks the shape, then the
  * checks a JSON schema cannot express, then hands back either the cleaned result or a `contract-violation`
- * (fail closed, section 5). Nothing here routes on prose: `summary` and `evidence.text` are for humans only.
+ * (fail closed, section 5: `ok:false` here, then the caller builds {@link unparseableOutcome}). Nothing here routes on prose: `summary` and `evidence.text` are for humans only.
+ *
+ * FREE TEXT. Only `blocker.deniedCommand` and the `unparseable` prose tail are redacted here (through
+ * `sanitizeDeniedCommand`). `summary`, `evidence.text`, `evidence.refs` and the ruling text are stored as data after
+ * the length caps; the envelope writer (S2) owns redacting them at the single write point, and nothing may route on them.
  *
  * WHAT IT DOES NOT DO. It spawns nothing and reads no launcher output (the launcher slices S3-S5 do), writes no
  * envelope (S2: completion record v2 and the action router) and switches no launcher. PURE: no fs after the
@@ -38,8 +42,6 @@ export const WORKER_RESULT_VERSION = 1;
 export const BLOCKER_KINDS = Object.freeze([...WORKER_RESULT_SCHEMA.properties.blocker.properties.kind.enum]);
 /** The launcher-only kind (section 5). A worker may never claim it. */
 export const CONTRACT_VIOLATION_KIND = 'contract-violation';
-/** Worker outcomes (the envelope adds `unparseable` and `aborted`, which a worker may not emit). */
-export const WORKER_OUTCOMES = Object.freeze([...WORKER_RESULT_SCHEMA.properties.outcome.enum]);
 
 /** Reader-enforced length caps (kept out of the schema: OpenAI strict mode is narrower than draft-07). */
 export const CAPS = Object.freeze({
@@ -111,9 +113,6 @@ function overCount(problems, label, arr, cap) {
   if (Array.isArray(arr) && arr.length > cap) problems.push(`${label}: ${arr.length} items exceeds ${cap}`);
 }
 
-/** Stable-finding-id shape (D8): the id a review renderer prints per finding. Opaque, non-empty, no whitespace runs. */
-export const FINDING_REF_RE = /^\S(?:.*\S)?$/;
-
 /**
  * Validate a parsed worker result. `role` enables the role rules (fix: `done` needs >=1 `fixed` finding;
  * build: `done` needs `filesTouched`). A failed check means the caller must treat the result as UNPARSEABLE
@@ -132,12 +131,14 @@ export function validateWorkerResult(value, { role } = {}) {
   if (problems.length) return { ok: false, result: null, problems };
 
   const r = value;
+  // Fail closed on a role we do not know: the role rules below would otherwise silently not run.
+  if (role !== undefined && !ROLES.includes(role)) problems.push(`role: unknown role ${JSON.stringify(role)} (known: ${ROLES.join(', ')})`);
   overCap(problems, 'summary', r.summary, CAPS.summary);
   overCount(problems, 'findingsAddressed', r.findingsAddressed, CAPS.findings);
   overCount(problems, 'filesTouched', r.filesTouched, CAPS.filesTouched);
   r.findingsAddressed.forEach((f, i) => {
     overCap(problems, `findingsAddressed[${i}].note`, f.note, CAPS.findingNote);
-    if (!f.ref.trim() || f.ref.length > CAPS.ref || !FINDING_REF_RE.test(f.ref)) problems.push(`findingsAddressed[${i}].ref: must be a non-empty finding id (max ${CAPS.ref} chars)`);
+    if (!f.ref.trim() || f.ref.length > CAPS.ref) problems.push(`findingsAddressed[${i}].ref: must be a non-empty finding id (D8: the stable id the review renderer prints; opaque here, max ${CAPS.ref} chars)`);
   });
   r.filesTouched.forEach((p, i) => { if (!p.trim() || p.startsWith('/') || p.split('/').includes('..')) problems.push(`filesTouched[${i}]: must be a repo-relative path`); });
   if (r.learning) {
@@ -296,9 +297,10 @@ export const UNPARSEABLE_REASONS = Object.freeze([
   'ended-without-result', 'timeout', 'reaper-kill', 'agy-key-absent', 'unreported',
 ]);
 
-/** Last <=500 chars of prose, defanged: kept as evidence, never routed. */
+/** Last <=500 chars of prose, then redacted and capped by {@link sanitizeDeniedCommand} (one line, token-like text
+ *  removed, at most DENIED_MAX_LENGTH chars): kept as evidence, never routed. */
 function proseTail(prose) {
-  return typeof prose === 'string' ? prose.slice(-500) : '';
+  return typeof prose === 'string' ? (sanitizeDeniedCommand(prose.slice(-500)) ?? '') : '';
 }
 
 /**
