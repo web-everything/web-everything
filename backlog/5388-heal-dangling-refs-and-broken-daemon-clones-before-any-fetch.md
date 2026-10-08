@@ -2,11 +2,12 @@
 bornAs: x29uxih
 kind: story
 size: 3
-status: active
+status: resolved
 scaffoldedBy: "daemon-clone-health"
 dateScaffolded: "2026-10-08"
 scope: ["we:scripts/lib/lane-repair.mjs", "we:scripts/lib/__tests__/clone-repair.test.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-08"
 tags: []
 ---
 
