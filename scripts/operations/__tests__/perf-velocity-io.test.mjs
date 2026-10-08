@@ -85,4 +85,10 @@ describe('runEstimates: calibrate, estimate once, store beside the snapshots', (
       expect(buildBrief({ title: 'T', body })).not.toContain('<!--');
     }
   });
+
+  it('strips by position, never with a regex replace of the bare opener (CodeQL js/incomplete-multi-character-sanitization)', () => {
+    const src = readFileSync(join(import.meta.dirname, '..', 'perf-velocity-io.mjs'), 'utf8');
+    expect(src).not.toMatch(/\.replace\(\s*\/<!--\/g/);
+    expect(src).not.toMatch(/\.replace\(\s*\/<!--/);
+  });
 });
