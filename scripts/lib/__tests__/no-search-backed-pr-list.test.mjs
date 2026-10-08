@@ -105,6 +105,17 @@ describe('no-search-backed-pr-list (#no-label-search)', () => {
     }
     expect(offenders).toEqual([]);
   });
+
+  // xykwe0h review (security): a branch-prefix `--search` returns FORK PRs too, and an outside party can open a
+  // fork PR on `lane/<num>-…` to suppress a card's dispatch. A file allowlisted for `--search` that DECIDES TRUST
+  // from the rows must therefore request `isCrossRepository` so it can drop them.
+  for (const file of ['scripts/conveyor/build-delivery-evidence.mjs']) {
+    it(`${file} (allowlisted --search that gates dispatch) requests and honours isCrossRepository`, () => {
+      const src = readFileSync(join(ROOT, file), 'utf8');
+      expect(src).toMatch(/--json',\s*'[^']*\bisCrossRepository\b/);
+      expect(src).toMatch(/isCrossRepository\s*===\s*true/);
+    });
+  }
 });
 
 // Review finding (PR #2798, correctness): client-side filtering reused the OLD `--limit` (100/200), which once

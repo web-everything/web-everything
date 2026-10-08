@@ -63,7 +63,7 @@ import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 // these ran SIMULTANEOUSLY in a single `ps aux` snapshot, none logged anywhere, spending the shared `graphql`
 // bucket (8943 points/hour that hour, 6365.2 UNATTRIBUTED — `gh-spend.mjs report --hours=1 --by=caller`).
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { readBuildDelivery, defaultListBuildPrs, defaultReadCardStatus } from '../conveyor/build-delivery-evidence.mjs';
+import { readBuildDelivery, defaultListBuildPrs, defaultReadCardStatus, defaultReadCardOpened } from '../conveyor/build-delivery-evidence.mjs';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createHash, randomUUID } from 'node:crypto';
@@ -293,7 +293,7 @@ export function readTick({
   laneRefForPr = (pr) => defaultLaneRefForPr(pr, { exec }),
   checkAlreadyDone = (n) => defaultCheckAlreadyDone(n, { exec }),
   // xykwe0h — build only: an OPEN or MERGED build PR, or a resolved card, means the build must not run again.
-  checkBuildDelivery = (n) => readBuildDelivery(n, { listPrs: (k) => defaultListBuildPrs(k, { exec, cwd: root }), readCardStatus: (k) => defaultReadCardStatus(k, { cwd: root }) }),
+  checkBuildDelivery = (n) => readBuildDelivery(n, { listPrs: (k) => defaultListBuildPrs(k, { exec, cwd: root }), readCardStatus: (k) => defaultReadCardStatus(k, { cwd: root }), readCardOpened: (k) => defaultReadCardOpened(k, { cwd: root }) }),
   // #3717 — THE ROUTER'S EVIDENCE. `selectProvider`/`selectSupervisionLevel` are pure and read their trial
   // history from their caller, so the scorecards are loaded at this io edge and handed across as data. A
   // missing or unreadable store reads as NO trials, which is the fail-closed direction: with no clean trials

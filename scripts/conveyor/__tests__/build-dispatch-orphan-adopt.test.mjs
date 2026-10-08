@@ -816,12 +816,43 @@ describe('xykwe0h — real outcomes, not orphan-released', () => {
 });
 
 describe('defaultSessionLiveness — reads the harness job record', () => {
-  const jobs = (state) => ({
-    jobsDir: '/jobs', readdir: () => ['14cd6f08-4ed4-4ec4-8745-8020ef0e58cf'],
-    readFile: () => JSON.stringify({ state, sessionId: '14cd6f08-4ed4-4ec4-8745-8020ef0e58cf', name: 'conveyor-5189', cwd: '/x' }),
+  const NOW = Date.parse('2026-10-08T12:00:00Z');
+  const minutesAgo = (m) => new Date(NOW - m * 60_000).toISOString();
+  const jobs = (state, updatedAt = minutesAgo(1)) => ({
+    jobsDir: '/jobs', readdir: () => ['14cd6f08-4ed4-4ec4-8745-8020ef0e58cf'], now: () => NOW,
+    readFile: () => JSON.stringify({ state, updatedAt, sessionId: '14cd6f08-4ed4-4ec4-8745-8020ef0e58cf', name: 'conveyor-5189', cwd: '/x' }),
   });
-  it('a working session is alive', () => {
+  it('a working session that updated recently is alive', () => {
     expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs('working'), awaitingFor: () => null })).toMatchObject({ alive: true });
+  });
+  it('a STALE working record (crashed or killed with the host) is not alive', () => {
+    expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs('working', minutesAgo(120)), awaitingFor: () => null }))
+      .toMatchObject({ alive: false, reason: 'session-stale' });
+  });
+  it('a stale working record whose session is parked on a live await-verify record is still alive', () => {
+    expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs('working', minutesAgo(120)), awaitingFor: () => ({ awaiting: true }) }))
+      .toEqual({ alive: true, reason: 'awaiting-verify' });
+  });
+  it('a fresh blocked session (a documented live state) is alive', () => {
+    expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs('blocked'), awaitingFor: () => null })).toMatchObject({ alive: true });
+  });
+  it('a FUTURE or non-ISO updatedAt (clock skew, corrupt record, "0") is unknown, never alive', () => {
+    for (const at of ['2099-01-01T00:00:00Z', new Date(NOW + 3_600_000).toISOString(), '0', '1', '2026-10-08']) {
+      expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs('working', at), awaitingFor: () => null })).toBeNull();
+    }
+  });
+  it('a small clock wobble ahead of now still reads fresh', () => {
+    expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs('working', new Date(NOW + 60_000).toISOString()), awaitingFor: () => null })).toMatchObject({ alive: true });
+  });
+  it.each(['cancelled', 'killed', 'failed', 'error'])('the terminal state %s is not alive', (state) => {
+    expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs(state), awaitingFor: () => null })).toMatchObject({ alive: false });
+  });
+  it.each([undefined, '', 'frobnicating'])('a missing or unrecognized job state (%j) is unknown (null), never alive', (state) => {
+    expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs(state), awaitingFor: () => null })).toBeNull();
+  });
+  it('an active state with no usable updatedAt is unknown (null): staleness cannot be judged', () => {
+    expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs('working', null), awaitingFor: () => null })).toBeNull();
+    expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs('working', 'not-a-date'), awaitingFor: () => null })).toBeNull();
   });
   it('an ended turn with a live await-verify record is alive (awaiting-verify)', () => {
     expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs('done'), awaitingFor: () => ({ awaiting: true }) })).toEqual({ alive: true, reason: 'awaiting-verify' });

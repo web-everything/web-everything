@@ -369,28 +369,57 @@ export function checkResumable({
   return { resumable: true, lanePath };
 }
 
-/** Job states of a `claude --bg` session that mean it is finished (anything else is still working or paused). */
-const TERMINAL_JOB_STATES = new Set(['done', 'stopped', 'failed', 'error']);
+/** Job states of a `claude --bg` session that mean it is running. ONLY these ever read as alive (and only while fresh). */
+const ACTIVE_JOB_STATES = new Set(['working', 'running', 'idle', 'blocked']); // `blocked`: a live session (session-reaper.mjs documents it)
+/** Job states that mean it is finished. A state in neither set is UNKNOWN, never alive. */
+const TERMINAL_JOB_STATES = new Set(['done', 'stopped', 'failed', 'error', 'cancelled', 'killed']);
+/**
+ * An active job record untouched for this long belongs to a session that crashed or died with the host (its
+ * `state.json` still says `working`). Longer than lane-whois's 10-minute worker window on purpose: a foreground
+ * gate command legitimately runs up to 10 minutes without a record update, and mistaking that for death is the
+ * very relaunch bug this module exists to stop. A session parked on an await-verify record is judged by that
+ * record instead, not by this clock.
+ */
+export const SESSION_ACTIVE_WINDOW_MS = 30 * 60_000;
+/** An `updatedAt` further in the future than this is not a clock wobble but a bad record. */
+const SESSION_CLOCK_SKEW_MS = 5 * 60_000;
 
 /**
  * Is the `claude --bg` session behind `handle` still alive, or paused awaiting its verify verdict? Reads the
- * harness's own job record (`~/.claude/jobs/<id>/state.json`, matched by the handle's id prefix). A session
- * still `working`/`running`/`idle` is alive; one that ended its turn on purpose to wait for a verify verdict
- * (a live await-verify record for its session) is alive too. Unknown = not alive (the caller then falls back
- * to the claim's owner pid). Never throws.
+ * harness's own job record (`~/.claude/jobs/<id>/state.json`, matched by the handle's id prefix).
+ *   - an explicitly active state (`working`/`running`/`idle`) whose record updated within
+ *     {@link SESSION_ACTIVE_WINDOW_MS} is alive;
+ *   - a terminal state, or an active one gone stale, is alive ONLY while a live await-verify record parks that
+ *     session (it ended its turn on purpose to wait for a verdict), else it is not alive;
+ *   - a missing/empty/unrecognized state, or an active state with no readable `updatedAt`, is UNKNOWN (null):
+ *     never proof of life. The caller then falls back to the claim's owner pid.
+ * Never throws.
  * @returns {{alive: boolean, reason?: string}|null}
  */
-export function defaultSessionLiveness({ handle, num = null, jobsDir = join(homedir(), '.claude', 'jobs'), readdir = readdirSync, readFile = readFileSync, awaitingFor = makeAwaitingVerifyResolver() } = {}) {
+export function defaultSessionLiveness({ handle, num = null, jobsDir = join(homedir(), '.claude', 'jobs'), readdir = readdirSync, readFile = readFileSync, awaitingFor = makeAwaitingVerifyResolver(), now = Date.now } = {}) {
   try {
     const id = String(handle ?? '');
     if (!/^[0-9a-f]{6,}/i.test(id)) return null;
     const dir = readdir(jobsDir).find((d) => d.startsWith(id));
     if (!dir) return null;
     const state = JSON.parse(String(readFile(join(jobsDir, dir, 'state.json'), 'utf8')));
-    if (!TERMINAL_JOB_STATES.has(String(state?.state ?? '').toLowerCase())) return { alive: true, reason: `session-${state?.state ?? 'working'}` };
+    const name = String(state?.state ?? '').trim().toLowerCase();
+    const active = ACTIVE_JOB_STATES.has(name);
+    if (!active && !TERMINAL_JOB_STATES.has(name)) return null;
+    let stale = false;
+    if (active) {
+      // Only a full ISO timestamp counts (Date.parse alone reads "0" as the year 2000), and one in the future is
+      // clock skew or a corrupt record, never proof of life: both are UNKNOWN.
+      const raw = String(state?.updatedAt ?? '');
+      const updated = /^\d{4}-\d{2}-\d{2}T/.test(raw) ? Date.parse(raw) : NaN;
+      const age = now() - updated;
+      if (!Number.isFinite(age) || age < -SESSION_CLOCK_SKEW_MS) return null;
+      if (age <= SESSION_ACTIVE_WINDOW_MS) return { alive: true, reason: `session-${name}` };
+      stale = true;
+    }
     const awaiting = awaitingFor({ sessionId: state?.sessionId ?? null, name: state?.name ?? (num != null ? `conveyor-${num}` : null), cwd: state?.cwd });
     if (awaiting?.awaiting === true) return { alive: true, reason: 'awaiting-verify' };
-    return { alive: false, reason: 'session-ended' };
+    return { alive: false, reason: stale ? 'session-stale' : 'session-ended' };
   } catch { return null; }
 }
 
