@@ -519,6 +519,12 @@ works, not just infer it from a green gate: post a comment carrying the trimmed 
 the trimmed green output (step 4) — or, if reproduction was genuinely impossible, the explicit statement of why
 (step 2). The comment must also carry a `Variants considered:` block: the list from step 3, each marked fixed, or out of scope + card, followed by the variant matrix from step 3 with every touched row marked `fixed at <sites>` or `n/a: <why>`.
 
+It must also carry the **revert-red result** (#5466). Your verify ran the tests your fix added or changed with the fix's
+source changes reverted; a test that stayed green there cannot catch the defect coming back. Read it with
+`node {{WE_ROOT}}/scripts/verify-lane.mjs check --repo=. --json` (the `revertRed.line` field) and paste that line
+verbatim. When it lists tests as `NOT discriminating`, say for each one whether it is a deliberate non-regression pin
+(and why) or a weak test; in `warn` mode this never blocks your hand-back, but the reviewer reads it.
+
 ```bash
 gh pr comment {{PR_NUM}} --repo {{REPO}} --body-file <evidence-file>
 ```

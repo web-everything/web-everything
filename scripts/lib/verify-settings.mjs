@@ -30,6 +30,14 @@ export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
   // green marker saying so; CI still runs its full check:standards on it and stays the merge authority. Off by
   // built-in (other checkouts keep the full gate); `verify-settings.json` turns it on for this repo.
   skipLocalForCardOnly: false,
+  // #5466 — the revert-red check on a fix push (ruling P6): revert the fix's source changes, keep its tests, and require
+  // the tests it added or changed to go red. 'off' (today's behaviour) runs nothing; 'warn' records the result on the
+  // marker and the log and never changes the verdict; 'enforce' turns a non-discriminating or unproven result red.
+  revertRed: 'off',
+  // When the current mode started (YYYY-MM-DD): the warn window is 3 days before the enforce switch is argued from the log.
+  revertRedSince: null,
+  // Over this many tests + reverted files, the check records `skipped: too-large` instead of running.
+  revertRedMaxFiles: 40,
 });
 
 /** Use the WE root RUNNING verify-lane, never the target lane REPO or cwd:
@@ -52,6 +60,9 @@ const rules = {
   relatedMaxTests: value => Number.isSafeInteger(value) && value >= 0,
   relatedDepth: value => Number.isSafeInteger(value) && value >= 1,
   skipLocalForCardOnly: value => typeof value === 'boolean',
+  revertRed: value => ['off', 'warn', 'enforce'].includes(value),
+  revertRedSince: value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value)),
+  revertRedMaxFiles: value => Number.isSafeInteger(value) && value >= 1 && value <= 200,
   alwaysRunTests: value => Array.isArray(value) && value.length <= 50
     // Each entry becomes a vitest file argument: it must start with a word character (never `-`, so `-u` / `--bail`
     // cannot become a vitest option), be a test file, and stay inside the repo.
@@ -65,6 +76,7 @@ const envKeys = {
   runAllPhases: 'WE_VERIFY_RUN_ALL_PHASES', isolatedRetry: 'WE_VERIFY_ISOLATED_RETRY',
   relatedMaxTests: 'WE_VERIFY_RELATED_MAX_TESTS', relatedDepth: 'WE_VERIFY_RELATED_DEPTH',
   alwaysRunTests: 'WE_VERIFY_ALWAYS_RUN_TESTS', skipLocalForCardOnly: 'WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY',
+  revertRed: 'WE_VERIFY_REVERT_RED', revertRedSince: 'WE_VERIFY_REVERT_RED_SINCE', revertRedMaxFiles: 'WE_VERIFY_REVERT_RED_MAX_FILES',
 };
 const booleanKeys = new Set(['phaseAdmission', 'matchRequestVariants', 'runAllPhases', 'skipLocalForCardOnly']);
 // Preserve which keys survived validation without adding configuration keys to the file shape.
@@ -100,7 +112,7 @@ export function resolveVerifySettings({ fileConfig, env = {} } = {}) {
     sources[key] = fileKeys.get(validated).has(key) ? 'file' : 'default';
     let value = env?.[envKeys[key]];
     if (booleanKeys.has(key)) value = value === '0' ? false : value === '1' ? true : undefined;
-    else if (['testTimeoutFactor', 'fastTargets', 'relatedMaxTests', 'relatedDepth'].includes(key)) {
+    else if (['testTimeoutFactor', 'fastTargets', 'relatedMaxTests', 'relatedDepth', 'revertRedMaxFiles'].includes(key)) {
       value = value != null && String(value).trim() !== '' ? Number(value) : undefined;
     }
     else if (key === 'alwaysRunTests') {

@@ -26,7 +26,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { MUTATION_PROBE_EFFECT } from './mutation-check.mjs';
+import { MUTATION_PROBE_EFFECT, REVERT_RED_PROBE_EFFECT } from './mutation-check.mjs';
 import { admittedArgv } from '../readiness/heavy-admission.mjs';
 
 /**
@@ -49,12 +49,14 @@ import { admittedArgv } from '../readiness/heavy-admission.mjs';
  */
 const stripAnsi = (s) => s.replace(/\[[0-9;]*[A-Za-z]/g, '');
 
-export function runSuite({ cwd, suite, run }) {
+export function runSuite({ cwd, suite, run, maxFailures = 20 }) {
   let out = '';
   let ok = false;
+  // #5466 — a suite may be several test files (the revert-red check runs exactly the files a fix added or changed).
+  const files = Array.isArray(suite) ? suite : [suite];
   try {
     // xaipsbs — through the host admission pool; the wrapper's stdout/stderr/exit code are vitest's own.
-    const admitted = admittedArgv('npx', ['vitest', 'run', suite, '--reporter=basic']);
+    const admitted = admittedArgv('npx', ['vitest', 'run', ...files, '--reporter=basic']);
     out = String(run(admitted.file, admitted.args, { cwd, encoding: 'utf8' }) ?? '');
     ok = true;
   } catch (e) {
@@ -77,13 +79,16 @@ export function runSuite({ cwd, suite, run }) {
   // RAN means the runner reported on tests. Either summary line is proof it got that far.
   const ran = !noFiles && Boolean(summary || fileSummary);
   const failed = /\bfailed\b/i.test(summary) || /\bfailed\b/i.test(fileSummary);
+  const allFailures = [...new Set([...out.matchAll(/^\s*(?:FAIL|×)\s+(.+?)\s*$/gm)].map((m) => m[1]))];
   return {
     ran,
     green: ran && ok && !failed,
     // The named tests that went red, so a `killed` verdict can say WHICH guard caught the mutant rather than
     // merely that something did.
-    failures: [...out.matchAll(/^\s*(?:FAIL|×)\s+(.+?)\s*$/gm)].map((m) => m[1]).slice(0, 20),
-    detail: noFiles ? `no test files matched ${suite}` : (summary || fileSummary || 'no summary line'),
+    failures: allFailures.slice(0, maxFailures),
+    // Said, never inferred: a reader attributing failures per test must know the list was cut.
+    failuresTruncated: allFailures.length > maxFailures,
+    detail: noFiles ? `no test files matched ${files.join(' ')}` : (summary || fileSummary || 'no summary line'),
   };
 }
 
@@ -154,6 +159,71 @@ export function createMutationProbe({
 }
 
 /**
+ * #5466 — THE REVERT TRANSACTION: the same capture → mutate → run → RESTORE (always) → verify shape as
+ * {@link createMutationProbe}, over SEVERAL files at once, each replaced whole by its pre-fix content. Used by the
+ * revert-red check: put the fix's source changes back out, keep its tests, and see which tests go red.
+ *
+ * Why not N single-file probes: a fix that spans two files is only reverted when both are, and the run must see both
+ * at once. Why whole-file replacement and not `find`: the pre-fix content IS the exact mutant, so `occurrences` is
+ * "the file still holds the fixed content" (1) or "it changed under us" (0 → nothing is touched, `not-applied`).
+ *
+ * Restore is per file, in a `finally`, and VERIFIED by re-reading every one; `restored` is true only when all match.
+ */
+export function createRevertProbe({
+  read = (p) => readFileSync(p, 'utf8'),
+  write = (p, s) => writeFileSync(p, s),
+  run = execFileSync,
+  maxFailures = 200,
+} = {}) {
+  return ({ cwd, targets = [], suite = [] }) => {
+    const list = Array.isArray(targets) ? targets : [];
+    const names = list.map((t) => t.target);
+    const base = {
+      target: names.join(','), suite: (Array.isArray(suite) ? suite : [suite]).join(' '),
+      mutantRan: false, mutantGreen: false, killedBy: [], failuresTruncated: false,
+    };
+    if (list.length === 0) {
+      return { ...base, applied: false, occurrences: 0, baselineRan: false, baselineGreen: false, restored: true, detail: 'no file to revert' };
+    }
+    // Capture every original BEFORE anything is written, and refuse unless each file still holds the fixed content.
+    const originals = list.map((t) => ({ abs: join(cwd, t.target), target: t.target, original: read(join(cwd, t.target)), fixed: t.fixed, revert: t.revert }));
+    const drifted = originals.filter((o) => typeof o.fixed === 'string' && o.original !== o.fixed).map((o) => o.target);
+    if (drifted.length) {
+      return { ...base, applied: false, occurrences: 0, baselineRan: false, baselineGreen: false, restored: true,
+        detail: `the working tree no longer holds the fixed content of ${drifted.join(', ')}` };
+    }
+
+    const baseline = runSuite({ cwd, suite, run, maxFailures });
+    if (!baseline.ran || !baseline.green) {
+      return { ...base, applied: false, occurrences: list.length, baselineRan: baseline.ran, baselineGreen: baseline.green,
+        restored: true, detail: baseline.detail };
+    }
+
+    let restored = false;
+    let mutant = { ran: false, green: false, failures: [], failuresTruncated: false, detail: '' };
+    try {
+      for (const o of originals) write(o.abs, o.revert);
+      mutant = runSuite({ cwd, suite, run, maxFailures });
+    } finally {
+      restored = true;
+      for (const o of originals) {
+        try {
+          write(o.abs, o.original);
+          if (read(o.abs) !== o.original) restored = false;
+        } catch {
+          restored = false;
+        }
+      }
+    }
+    return {
+      ...base, applied: true, occurrences: list.length, baselineRan: true, baselineGreen: true,
+      mutantRan: mutant.ran, mutantGreen: mutant.green, killedBy: mutant.failures,
+      failuresTruncated: mutant.failuresTruncated === true, restored, detail: mutant.detail,
+    };
+  };
+}
+
+/**
  * The sink that applies the `mutation-check.probe` effect.
  *
  * The engine records an effect's return value as the step's finding, so the transaction's result reaches
@@ -163,5 +233,18 @@ export function createMutationCheckSinks(deps = {}) {
   const probe = createMutationProbe(deps);
   return {
     [MUTATION_PROBE_EFFECT]: async (payload) => probe(payload),
+  };
+}
+
+/**
+ * #5466 — the sink for `revert-red-check`: plan the revert from git, run {@link createRevertProbe}, judge it with the
+ * pure rule. The git reads go through the injected `git` runner (a lane is agent-writable: callers pass a hardened one).
+ */
+export function createRevertRedCheckSinks(deps = {}) {
+  return {
+    [REVERT_RED_PROBE_EFFECT]: async (payload) => {
+      const { runRevertRedCheck } = await import('../lib/verify-revert-red.mjs');
+      return runRevertRedCheck({ ...payload, probe: createRevertProbe(deps), git: deps.git });
+    },
   };
 }

@@ -1,0 +1,163 @@
+/**
+ * @file scripts/lib/verify-revert-red.mjs
+ * @description THE REVERT-RED CHECK, wired (#5466). Reads the facts from git, runs the revert transaction
+ *   (`we:scripts/operations/mutation-check-io.mjs#createRevertProbe` — the mutation-check mutate → run → restore shape),
+ *   and asks the pure rule (`./revert-red-rule.mjs`) for the verdict.
+ *
+ * TWO CALLERS, ONE PATH:
+ *   - `we:scripts/verify-lane.mjs` — inside the fixer's own verify, after a GREEN gate and before the marker is written,
+ *     so the harness's exact-sha / clean-tree push check (#5137) never sees the reverted tree. A fix push is decided from
+ *     the fix role's own await record (`.fix-await-verify`, kind `fix`/`ci-heal`, sha == the verified head), never from a
+ *     commit message. The pre-fix base is that record's `lane/*` ref as the lane last fetched it.
+ *   - `node scripts/operations/run.mjs revert-red-check --checkout=<dir> --base=<sha>` — the replay path: the caller
+ *     names the range and asserts it is a fix.
+ *
+ * Every git read goes through a HARDENED runner (`./lane-git-hardening.mjs`): the lane is agent-writable, and its
+ * `.git/config` must not be able to run a command here — the same rule verify-lane follows for its own reads.
+ *
+ * IMPURE (git, fs through the injected probe). The decisions are all in `./revert-red-rule.mjs`.
+ */
+import { execFileSync } from 'node:child_process';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { laneGitHardeningEnv, hardenLaneGitArgs } from './lane-git-hardening.mjs';
+import { planRevert, newTestTitles, revertRedVerdict, revertRedGate, formatRevertRed } from './revert-red-rule.mjs';
+
+const SHA_RE = /^[0-9a-f]{40}$/i;
+const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+
+/** An UNTRIMMED, hardened git runner rooted at `cwd` (file contents must keep their trailing newline). */
+export function hardenedGit(cwd, { exec = execFileSync, env = process.env } = {}) {
+  const gitEnv = laneGitHardeningEnv(env);
+  return (args) => String(exec('git', hardenLaneGitArgs(args), {
+    cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: gitEnv, maxBuffer: GIT_MAX_BUFFER,
+  }));
+}
+
+const tryRun = (fn) => { try { return { ok: true, value: fn() }; } catch (error) { return { ok: false, error }; } };
+
+/** `git diff --name-status -z` output → `[{status, path}]`. Renames are disabled, so every entry has one path. */
+export function parseNameStatusZ(text) {
+  const parts = String(text ?? '').split('\0').filter((s) => s !== '');
+  const changes = [];
+  for (let i = 0; i + 1 < parts.length; i += 2) changes.push({ status: parts[i], path: parts[i + 1] });
+  return changes;
+}
+
+/** The `+` lines of a unified diff, without the marker (file headers excluded). */
+export function addedLines(diffText) {
+  return String(diffText ?? '').split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++')).map((l) => l.slice(1));
+}
+
+/**
+ * Run the check for one range. Never throws: an error becomes an `unproven` verdict with the reason, so warn mode
+ * records it and enforce mode blocks on it (the card's fail-closed rule).
+ *
+ * @param {object} o
+ * @param {string} o.checkout   the lane / checkout root; the revert is applied and restored here.
+ * @param {string} o.base       the pre-fix commit (sha or ref).
+ * @param {string} [o.head]     the fixed commit (default `HEAD`); the working tree must hold it.
+ * @param {string} o.mode       `off` | `warn` | `enforce`.
+ * @param {string} [o.kind]     the fix role's record kind (default `fix` — the replay caller asserts it).
+ * @param {boolean} [o.recordMatchesHead]
+ * @param {number} [o.maxFiles]
+ * @param {Function} o.probe    `createRevertProbe(...)`'s returned function.
+ * @param {Function} [o.git]    an untrimmed git runner; defaults to {@link hardenedGit}.
+ */
+export async function runRevertRedCheck({ checkout, base, head = 'HEAD', mode, kind = 'fix', recordMatchesHead = true, maxFiles = 40, probe, git } = {}) {
+  const facts = { mode, changeKind: kind, recordMatchesHead };
+  // Off / not a fix / wrong head: decided before any git read.
+  if (revertRedGate(facts)) {
+    const v = revertRedVerdict(facts);
+    return { ...v, base: null, head: null, line: formatRevertRed(v) };
+  }
+  const run = git ?? hardenedGit(checkout);
+  const fail = (reason) => {
+    const v = revertRedVerdict({ ...facts, plan: null, skipReason: '' });
+    const out = { ...v, reason, base: null, head: null };
+    return { ...out, line: formatRevertRed(out) };
+  };
+  const headSha = tryRun(() => run(['rev-parse', '--verify', `${head}^{commit}`]).trim());
+  const baseSha = tryRun(() => run(['rev-parse', '--verify', `${base}^{commit}`]).trim());
+  if (!headSha.ok || !SHA_RE.test(headSha.value)) return fail('head-unreadable');
+  if (!baseSha.ok || !SHA_RE.test(baseSha.value)) return fail('base-unreadable');
+  const finish = (verdict) => ({ ...verdict, base: baseSha.value, head: headSha.value, line: formatRevertRed(verdict) });
+  if (baseSha.value === headSha.value) return finish(revertRedVerdict({ ...facts, plan: planRevert({ changes: [] }) }));
+  if (!tryRun(() => run(['merge-base', '--is-ancestor', baseSha.value, headSha.value])).ok) {
+    return finish(revertRedVerdict({ ...facts, plan: null, skipReason: 'base-not-ancestor' }));
+  }
+  // A merge in the range (a fix that merged main to resolve a conflict) brings main's changes into the diff; reverting
+  // those would test main, not the fix. Recorded as skipped, never guessed around.
+  const merges = tryRun(() => run(['rev-list', '--merges', `${baseSha.value}..${headSha.value}`]).trim());
+  if (!merges.ok) return fail('range-unreadable');
+  if (merges.value) return finish(revertRedVerdict({ ...facts, plan: null, skipReason: 'merge-in-range' }));
+
+  const diff = tryRun(() => run(['diff', '--name-status', '--no-renames', '-z', baseSha.value, headSha.value]));
+  if (!diff.ok) return fail('diff-unreadable');
+  const plan = planRevert({ changes: parseNameStatusZ(diff.value), maxFiles });
+  const early = revertRedVerdict({ ...facts, plan, probe: null });
+  if (early.status === 'skipped') return finish(early);
+
+  const titles = {};
+  const targets = [];
+  try {
+    for (const file of plan.tests) {
+      titles[file] = newTestTitles(addedLines(run(['diff', '-U0', baseSha.value, headSha.value, '--', file])));
+    }
+    for (const target of plan.revert) {
+      targets.push({ target, fixed: run(['show', `${headSha.value}:${target}`]), revert: run(['show', `${baseSha.value}:${target}`]) });
+    }
+  } catch {
+    return fail('content-unreadable');
+  }
+  let result;
+  try {
+    result = await probe({ cwd: checkout, targets, suite: plan.tests.map((f) => `./${f}`) });
+  } catch (error) {
+    // The probe restores in its own `finally`; an error escaping it still never reads as a pass.
+    return finish(revertRedVerdict({ ...facts, plan, titles, probe: { applied: true, restored: false, detail: String(error?.message ?? error) } }));
+  }
+  return { ...finish(revertRedVerdict({ ...facts, plan, titles, probe: result })), probeDetail: String(result?.detail ?? '') };
+}
+
+/**
+ * The verify-lane entry: decide from the fix role's own await record whether this verified head is a fix push, then run.
+ * @param {object} o
+ * @param {string} o.repo        the lane root.
+ * @param {string} o.headSha     the sha verify-lane verified.
+ * @param {object|null} o.record the lane's `.fix-await-verify` record (or null).
+ * @param {object} o.settings    `{ mode, maxFiles }` from the declared verify settings.
+ * @param {Function} o.probe
+ * @param {Function} [o.git]
+ */
+export async function revertRedForVerify({ repo, headSha, record, settings = {}, probe, git } = {}) {
+  const kind = typeof record?.kind === 'string' ? record.kind : null;
+  const matches = Boolean(record) && SHA_RE.test(String(record?.sha ?? '')) && String(record.sha).toLowerCase() === String(headSha ?? '').toLowerCase();
+  const ref = typeof record?.ref === 'string' && /^lane\/[A-Za-z0-9._/-]+$/.test(record.ref) && !record.ref.includes('..') ? record.ref : null;
+  const facts = { mode: settings.mode, changeKind: kind, recordMatchesHead: matches };
+  if (revertRedGate(facts)) {
+    const v = revertRedVerdict(facts);
+    return { ...v, base: null, head: headSha ?? null, line: formatRevertRed(v) };
+  }
+  if (!ref) {
+    const v = revertRedVerdict({ ...facts, plan: null, skipReason: 'fix-record-has-no-ref' });
+    return { ...v, base: null, head: headSha, line: formatRevertRed(v) };
+  }
+  return runRevertRedCheck({
+    checkout: repo, base: `refs/remotes/origin/${ref}`, head: headSha, mode: settings.mode, kind,
+    recordMatchesHead: matches, maxFiles: settings.maxFiles, probe, git,
+  });
+}
+
+/** Append one result to the coordination-root log (best effort): the warn window's counts come from here (A5). */
+export function appendRevertRedLog(entry, { root, append = appendFileSync, mkdir = mkdirSync } = {}) {
+  try {
+    const dir = join(root, 'revert-red');
+    mkdir(dir, { recursive: true });
+    append(join(dir, 'log.jsonl'), `${JSON.stringify(entry)}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
