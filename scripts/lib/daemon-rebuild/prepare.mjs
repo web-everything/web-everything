@@ -22,6 +22,7 @@ import {
 import { readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
 import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
 } from '../overlay-conflict-wake.mjs';
@@ -197,6 +198,29 @@ export async function prepareRebuild({
   }
   const overlaysBefore = overlayState.overlays;
   const edgeResolve = env[OVERLAY_EDGE_RESOLVE_ENV] !== '0';
+  // Heal dangling remote-tracking refs (and a clone that is itself broken) BEFORE the fetch: one such ref makes
+  // `fetch --prune` reject the whole batch. Daemon clones are never acquired through lane-pool, so this is their only heal.
+  // prepareRebuild runs under the daemon-clone write lock (rebuild.mjs), the only place a clone may be re-cloned (#4044);
+  // repairCloneRefs re-checks that lock itself and refuses without it.
+  // The write lock was taken under `env`'s lock root (rebuild.mjs), so the proof must be read from that same root.
+  const lockRoot = env?.WE_DAEMON_CLONE_LOCK_ROOT;
+  const cloneRepair = repairCloneRefs(root, {
+    log: (m) => log?.error?.(m), allowReclone: true, holdsWriteLock: (d) => holdsCloneWriteLock(d, lockRoot ? { lockRoot } : {}),
+  });
+  if (cloneRepair.pruned.length || cloneRepair.reportedNew.length || cloneRepair.quarantinedTo || !cloneRepair.ok) {
+    alert('clone-refs-repaired', { pruned: cloneRepair.pruned.length, reported: cloneRepair.reported, quarantinedTo: cloneRepair.quarantinedTo ?? null, problems: cloneRepair.problems });
+  }
+  // A re-clone replaced the whole checkout: `prevHead`, `unsafe` and `state.adopted` above describe the OLD clone (its HEAD is
+  // normally the deterministic overlay merge, which the fresh clone does not contain). End the tick here, before anything plans,
+  // diffs or rolls back against them; the next tick re-reads HEAD and re-plans from the fresh clone.
+  // The persisted state names shas of the old clone too (the adopted overlay merge, a held last-good, a passed-but-unadopted
+  // candidate); none of them exists in the fresh clone, so drop them rather than let a later tick compare against them.
+  if (cloneRepair.quarantinedTo) {
+    for (const k of ['adopted', 'held', 'rejected', 'inProgress', 'unverified', 'quarantine', 'building', 'smokePassed']) state[k] = null;
+    writeState();
+    clearReadyCandidate(root, stEnv);
+    return terminal({ moved: false, reason: 'clone-recloned', quarantinedTo: cloneRepair.quarantinedTo });
+  }
   const fetchResult = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
   if (!fetchResult.ok) {
     if (unsafe.untracked.length > 0) alert('untracked-kept', { paths: unsafe.untracked });

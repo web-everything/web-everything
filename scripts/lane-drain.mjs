@@ -80,6 +80,7 @@ import { HASH_PATH_CITE_SOURCE, findHashPathCitesInGrepLines, findHashPathCiteOu
 // #2603 — the drain's resolve-reachable check reads `status:` FRONTMATTER-strict (see `resolveReachableFromBody`),
 // never loose over the whole body. `readField` parses only the first `---`…`---` block.
 import { readField } from './backlog/frontmatter.mjs';
+import { repairCloneRefs } from './lib/lane-repair.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 // #2779-incident (2026-09-26 03:14Z) — every drain-authored commit message is wrapped in this runtime guard
 // (belt, alongside the unit-test suspenders in commit-message-safety.test.mjs): a template edit that
@@ -1267,7 +1268,8 @@ export function landedNumberFor(hash, CWD = resolveWeRoot()) {
 // Sync local main to the merged origin/main via a LOCAL fast-forward (never a work-merge — the couple's work
 // is landed by pr-land, #2172 contract). `pull --ff-only` fetches + ff's the current branch; a non-ff / dirty
 // collision aborts and we degrade gracefully (best-effort). Never touches a lane/* ref.
-function syncMain(CWD) { quietGit(CWD, ['pull', '--ff-only']); }
+// The drain's data clone is a daemon clone (never acquired through lane-pool), so it is repaired HERE, before the fetch.
+function syncMain(CWD) { repairCloneRefs(CWD, { log: (m) => process.stderr.write(`${m}\n`) }); quietGit(CWD, ['pull', '--ff-only']); }
 
 // Publish local main to origin via the SANCTIONED gated-push helper (#2073) — never a raw git write of the
 // branch (the #2172 contract: lane-drain re-uses the shared transports, never re-implements them). The
@@ -1380,6 +1382,7 @@ export function cardPathInTree(CWD, num, { tree = 'origin/main', exec = null } =
 // checkout's index, so the index probe reported it absent and the caller silently skipped the flip.
 function readResolveReachable(CWD, num) {
   const tg = (a) => { try { return readGit(a, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim(); } catch { return null; } };
+  repairCloneRefs(CWD, { log: (m) => process.stderr.write(`${m}\n`) });
   tg(['fetch', 'origin', '--quiet']);
   const path = cardPathInTree(CWD, num);
   if (!path) return null;
