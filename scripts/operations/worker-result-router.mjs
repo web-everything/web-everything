@@ -30,9 +30,11 @@ import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 
 /**
  * A repo path: redacted like prose (tokens out, one line) but the npm-scope `@` after a `/` is put back, since the
- * prose pass defangs every `@` and a draft naming `node_modules/@​scope/pkg` names a path that does not exist.
+ * prose pass defangs every `@` (appends a zero-width space) and a draft naming `node_modules/@scope/pkg` would then name a
+ * path that does not exist.
  */
-const cleanPath = (x) => redactFreeText(x, 300).replace(/(?<=\/)@​/g, '@');
+const DEFANGED_SCOPE_AT = new RegExp(`(?<=/)@${String.fromCharCode(0x200b)}`, 'g');
+const cleanPath = (x) => redactFreeText(x, 300).replace(DEFANGED_SCOPE_AT, '@');
 
 /**
  * The envelope writer's redaction pass: EVERY free-text field in the schema, but not the identifier fields (S1 stored them as data after the length
