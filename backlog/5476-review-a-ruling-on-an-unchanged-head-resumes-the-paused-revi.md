@@ -2,9 +2,10 @@
 bornAs: xq1xbsl
 kind: story
 size: 5
-status: open
+status: resolved
 scope: ["we:scripts/operations/review-loop-cli.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/operations/engine.mjs", "we:scripts/operations/review-dispatch.mjs", "we:scripts/lib/jury-core.mjs", "we:scripts/conveyor/review-referral-hold.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-08"
 tags: []
 ---
 
