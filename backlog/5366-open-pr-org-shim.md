@@ -1,4 +1,5 @@
 ---
+bornAs: xpd70wx
 kind: story
 size: 3
 status: active
