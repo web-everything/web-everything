@@ -1,5 +1,5 @@
 import { requiresMandatoryReferral, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
-  referralKeyFinding, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable } from '../lib/jury-core.mjs';
+  referralKeyFinding, referralFindingKey, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable } from '../lib/jury-core.mjs';
 // Card 84 — the per-seat provider directive (`review.seatProvider.<lens>`). PURE; the settings are read by the caller.
 import { seatProviderDirective } from '../lib/review-seat-provider.mjs';
 import { isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
@@ -890,6 +890,8 @@ export const REVIEW_EFFECTS = Object.freeze({
   // as `ADVISORY_NOTE` — never `LABEL`, which is the real ceremony's `review:*` swap.
   ADVISORY_LABEL: 'review.advisory-label',
   AWAITING_ADVISORY_CLEAR: 'review.awaiting-advisory-clear',
+  // Ledger plan slice E2: the `referral` and `review-run` ledger events. ADDITIVE ONLY, never a decision.
+  LEDGER_EVENTS: 'review.ledger-events',
 });
 
 /**
@@ -2941,6 +2943,32 @@ export function reviewPrOperation({
             idempotent: true,
           },
         ];
+      },
+    }),
+
+    // ── 9. ledgerEvents (ledger plan slice E2, #verdict-ledger-pr-state-store) ───────────────────────────────
+    // ADDITIVE ONLY. Runs after `record` and writes `referral` and `review-run{posted}` rows to the ledger. It
+    // never changes a comment, a label or a decision: those were all settled by the steps above. It always
+    // declares ONE effect, so a run that posted nothing (abstain, same-head re-run) still leaves its
+    // `review-run{posted:false}` row, which is what the visit cap counts (#3988).
+    // `posted` = a comment actually landed in this run: the advisory note, or the verdict write-up swap.
+    // IDEMPOTENT: TRUE. Both events are non-clearing, so a replay can at worst add one visit to a counter.
+    ledgerEvents: effectStep({
+      reads: ['input.pr', 'input.repo', 'findings.read', 'findings.reduce', 'findings.advise', 'findings.record'],
+      effects: (view) => {
+        const read = view.findings.read;
+        const landed = (finding, type) => (finding?.effects ?? []).some((e) => e.type === type && e.status === 'applied');
+        const posted = landed(view.findings.advise, REVIEW_EFFECTS.ADVISORY_NOTE)
+          || landed(view.findings.record, REVIEW_EFFECTS.LABEL);
+        const referralKeys = [];
+        for (const f of view.findings.reduce?.referrals ?? []) {
+          try { referralKeys.push(referralFindingKey(f.seat, f.original)); } catch { /* an unkeyable referral is skipped, never fatal */ }
+        }
+        return [{
+          type: REVIEW_EFFECTS.LEDGER_EVENTS,
+          payload: { pr: view.input.pr, repo: view.input.repo, headSha: read?.netBasis?.rev ?? null, posted, referralKeys },
+          idempotent: true,
+        }];
       },
     }),
   });

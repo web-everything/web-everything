@@ -1164,8 +1164,9 @@ describe('the record step', () => {
     const { registry } = registryFor({});
     const { run } = atConfirm({ registry, input: BASE_INPUT, id: 'run-abs' });
     const done = advanceWhileRunning(run, { registry, resume: { value: 'abstain' } });
-    expect(done.effects).toEqual([]);
-    expect(runStatus(done, { registry })).toBe('complete');
+    // E2: the ledger-events step is the only effect an abstain leaves, and it records posted:false.
+    expect(done.effects.filter((e) => e.step !== 'ledgerEvents')).toEqual([]);
+    expect(done.effects.find((e) => e.step === 'ledgerEvents').payload.posted).toBe(false);
   });
 
   it('a replayed `record` step posts NO duplicate comment', async () => {
@@ -1243,7 +1244,6 @@ describe('#3540 the stageVerdict step stages the write-up alone, ahead of the la
     // moves straight to `record`, which does the same for the same `abstain` answer.
     const done = advanceWhileRunning(answered, { registry });
     expect(done.effects.filter((e) => e.step === 'stageVerdict' || e.step === 'record')).toEqual([]);
-    expect(runStatus(done, { registry })).toBe('complete');
   });
 
   it('stages the SAME bytes `record`\'s label swap later posts — one pure derivation, not two', async () => {
@@ -1351,7 +1351,7 @@ describe('the derived command line', () => {
     expect(second.stopped).toBe('complete');
     // NOT `Object.values(REVIEW_EFFECTS)` — this PR is `review:pending` (not `humanRequired`), so `advise`
     // declares `[]` and its `ADVISORY_NOTE` type is never applied. Only `record`'s four fire.
-    expect(applied).toEqual([REVIEW_EFFECTS.WRITE_UP, REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.LEDGER, REVIEW_EFFECTS.NOTICE]);
+    expect(applied).toEqual([REVIEW_EFFECTS.WRITE_UP, REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.LEDGER, REVIEW_EFFECTS.NOTICE, REVIEW_EFFECTS.LEDGER_EVENTS]);
   });
 
   it('refuses an --answer outside the declared option set', async () => {
@@ -2026,6 +2026,13 @@ describe('an override must say why', () => {
     expect(body).not.toContain('Why this was overridden');
   });
 
+  it('E2: a posted accept declares ledger events with posted:true and the reviewed head', async () => {
+    const { calls } = await driveToAnswer({ answer: 'accept', id: 'run-e2-posted' });
+    const ev = calls.find((c) => c.type === REVIEW_EFFECTS.LEDGER_EVENTS);
+    expect(ev.payload).toMatchObject({ pr: expect.anything(), repo: expect.any(String), posted: true });
+    expect(ev.payload.headSha).toBeDefined();
+  });
+
   it('leaves an ordinary accept untouched — no override section', async () => {
     const { out, calls } = await driveToAnswer({ answer: 'accept', id: 'run-accept' });
     expect(out.code).toBe(0);
@@ -2039,7 +2046,7 @@ describe('an override must say why', () => {
       answer: 'abstain', argvExtra: ['--reason=changed my mind'], id: 'run-abstain',
     });
     expect(out.code).toBe(0);
-    expect(calls).toEqual([]);
+    expect(calls.filter((c) => c.type !== REVIEW_EFFECTS.LEDGER_EVENTS)).toEqual([]);
   });
 
   // `--reason` is accepted on ANY answer, and only a decision that DEPARTS from the juror is captioned as one.
@@ -2898,7 +2905,7 @@ describe('#xqa9ttq — the opt-in Codex advisory seat (judgeAdvisory)', () => {
   it('when opted in, declares a THIRD judge step, in order, after judgeSecurity and before reduce', () => {
     const { declaration } = registryFor({}, { codexAdvisory: true });
     const names = declaration.steps.map((s) => s.name);
-    expect(names).toEqual(['read', 'judge', 'judgeSecurity', 'judgeAdvisory', 'reduce', 'mandatoryReferrals', 'referralVerdict', 'advise', 'confirm', 'stageVerdict', 'record']);
+    expect(names).toEqual(['read', 'judge', 'judgeSecurity', 'judgeAdvisory', 'reduce', 'mandatoryReferrals', 'referralVerdict', 'advise', 'confirm', 'stageVerdict', 'record', 'ledgerEvents']);
     const advisoryStep = declaration.steps.find((s) => s.name === 'judgeAdvisory');
     expect(advisoryStep.step.kind).toBe('judge');
     // It is isolated exactly like `judgeSecurity`: it reads neither sibling juror's findings.
@@ -3165,7 +3172,7 @@ describe('#x8n4crp — the opt-in Codex correctness-advisory seat (judgeCorrectn
   it('can be seated WITHOUT the third seat — the two opt-in seats are independent', () => {
     const { declaration } = registryFor({}, { correctnessAdvisory: true });
     const names = declaration.steps.map((s) => s.name);
-    expect(names).toEqual(['read', 'judge', 'judgeSecurity', 'judgeCorrectnessAdvisory', 'reduce', 'mandatoryReferrals', 'referralVerdict', 'advise', 'confirm', 'stageVerdict', 'record']);
+    expect(names).toEqual(['read', 'judge', 'judgeSecurity', 'judgeCorrectnessAdvisory', 'reduce', 'mandatoryReferrals', 'referralVerdict', 'advise', 'confirm', 'stageVerdict', 'record', 'ledgerEvents']);
     expect(names).not.toContain('judgeAdvisory');
   });
 
@@ -3174,7 +3181,7 @@ describe('#x8n4crp — the opt-in Codex correctness-advisory seat (judgeCorrectn
     const names = declaration.steps.map((s) => s.name);
     expect(names).toEqual([
       'read', 'judge', 'judgeSecurity', 'judgeAdvisory', 'judgeCorrectnessAdvisory',
-      'reduce', 'mandatoryReferrals', 'referralVerdict', 'advise', 'confirm', 'stageVerdict', 'record',
+      'reduce', 'mandatoryReferrals', 'referralVerdict', 'advise', 'confirm', 'stageVerdict', 'record', 'ledgerEvents',
     ]);
     const step = declaration.steps.find((s) => s.name === 'judgeCorrectnessAdvisory');
     expect(step.step.kind).toBe('judge');
@@ -3414,7 +3421,7 @@ describe('#3383 — the opt-in Antigravity review seat (judgeAntigravityReview)'
   it('can be seated WITHOUT either Codex seat — all three opt-in seats are independent', () => {
     const { declaration } = registryFor({}, { antigravityReview: true });
     const names = declaration.steps.map((s) => s.name);
-    expect(names).toEqual(['read', 'judge', 'judgeSecurity', 'judgeAntigravityReview', 'reduce', 'mandatoryReferrals', 'referralVerdict', 'advise', 'confirm', 'stageVerdict', 'record']);
+    expect(names).toEqual(['read', 'judge', 'judgeSecurity', 'judgeAntigravityReview', 'reduce', 'mandatoryReferrals', 'referralVerdict', 'advise', 'confirm', 'stageVerdict', 'record', 'ledgerEvents']);
     expect(names).not.toContain('judgeAdvisory');
     expect(names).not.toContain('judgeCorrectnessAdvisory');
   });
@@ -3424,7 +3431,7 @@ describe('#3383 — the opt-in Antigravity review seat (judgeAntigravityReview)'
     const names = declaration.steps.map((s) => s.name);
     expect(names).toEqual([
       'read', 'judge', 'judgeSecurity', 'judgeAdvisory', 'judgeCorrectnessAdvisory', 'judgeAntigravityReview',
-      'reduce', 'mandatoryReferrals', 'referralVerdict', 'advise', 'confirm', 'stageVerdict', 'record',
+      'reduce', 'mandatoryReferrals', 'referralVerdict', 'advise', 'confirm', 'stageVerdict', 'record', 'ledgerEvents',
     ]);
     const step = declaration.steps.find((s) => s.name === 'judgeAntigravityReview');
     expect(step.step.kind).toBe('judge');

@@ -32,7 +32,7 @@ import { createRegistry } from '../registry.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { classifyReviewLoopOutcome } from '../review-job.mjs';
-import { VERDICTS, appendVerdict, buildVerdictRecord, readVerdictLedger } from '../../lib/verdict-ledger.mjs';
+import { VERDICTS, appendVerdict, buildVerdictRecord, readVerdictLedger, parseLedgerEvents, verdictLedgerPath } from '../../lib/verdict-ledger.mjs';
 // #xu2pp2m — the `--cwd`-reaches-the-reader wiring, asserted through the REAL operation table rather than a
 // re-created copy of it (the same reason `createCliJudgeFactory` is exported and driven directly, #3151).
 import { cwdFlagValue } from '../cli-adapter.mjs';
@@ -197,6 +197,53 @@ describe('the ledger and notice sinks', () => {
     else process.env.WE_VERDICT_LEDGER_DIR = prevLedgerDir;
     rmSync(ledgerDir, { recursive: true, force: true });
     rmSync(`${ledgerDir}-locks`, { recursive: true, force: true });
+  });
+
+  describe('ledger events (plan slice E2)', () => {
+    const readEvents = () => parseLedgerEvents(readFileSync(verdictLedgerPath('o/n'), 'utf8'));
+    const HEAD = 'a'.repeat(40);
+    let prevStore;
+    beforeEach(() => { prevStore = process.env.WE_VERDICT_LEDGER_STORE; process.env.WE_VERDICT_LEDGER_STORE = 'home'; });
+    afterEach(() => {
+      if (prevStore === undefined) delete process.env.WE_VERDICT_LEDGER_STORE; else process.env.WE_VERDICT_LEDGER_STORE = prevStore;
+    });
+
+    it('a #3988 replay: 3 runs on one head yield 3 review-run rows with posted:false', async () => {
+      const sinks = createReviewPrSinks({ root });
+      for (let i = 0; i < 3; i += 1) {
+        await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: HEAD, posted: false, referralKeys: [] }, CTX);
+      }
+      const rows = readEvents().filter((r) => r.type === 'review-run');
+      expect(rows).toHaveLength(3);
+      for (const r of rows) expect(r).toMatchObject({ pr: 7, headSha: HEAD, phase: 'completed', posted: false, source: 'review-pr' });
+    });
+
+    it('appends a referral row with hashed finding keys when the run opened findings, plus the review-run row', async () => {
+      const sinks = createReviewPrSinks({ root });
+      const result = await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: HEAD, posted: true, referralKeys: ['["correctness","a.js",1,"bug"]'] }, CTX);
+      expect(result.written).toEqual(['referral', 'review-run']);
+      const rows = readEvents();
+      const referral = rows.find((r) => r.type === 'referral');
+      expect(referral.findingKeys).toHaveLength(1);
+      expect(referral.findingKeys[0]).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(rows.find((r) => r.type === 'review-run').posted).toBe(true);
+    });
+
+    it('writes nothing without a pinned head', async () => {
+      const sinks = createReviewPrSinks({ root });
+      const result = await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: null, posted: false, referralKeys: [] }, CTX);
+      expect(result).toEqual({ written: [], missed: [] });
+    });
+
+    it('a ledger write miss never throws: it prints a loud ledger-write-miss line and returns', async () => {
+      const lines = [];
+      process.env.WE_VERDICT_LEDGER_DIR = join(ledgerDir, 'does', 'not', 'exist', '\0bad');
+      const sinks = createReviewPrSinks({ root, out: (l) => lines.push(l) });
+      const result = await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: HEAD, posted: false, referralKeys: [] }, CTX);
+      expect(result.written).toEqual([]);
+      expect(result.missed).toHaveLength(1);
+      expect(lines.join('\n')).toContain('ledger-write-miss');
+    });
   });
 
   it('RECONCILES against the row the single home already wrote — it does not append a second one', async () => {
