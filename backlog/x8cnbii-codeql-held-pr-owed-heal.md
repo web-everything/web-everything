@@ -2,7 +2,7 @@
 kind: story
 size: 5
 status: open
-scope: ["["we:scripts/conveyor/reconcile-core.mjs"", ""we:scripts/conveyor/reconcile-pass.mjs"", ""we:scripts/lib/codeql-gate.mjs"", ""we:scripts/operations/ci-heal-pr-dispatch.mjs"", ""we:scripts/merge-ai-prs.mjs"]"]
+scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/lib/codeql-gate.mjs", "we:scripts/operations/ci-heal-pr-dispatch.mjs", "we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-10-07"
 tags: []
 ---
