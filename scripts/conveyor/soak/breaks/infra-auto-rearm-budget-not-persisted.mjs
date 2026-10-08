@@ -26,7 +26,7 @@ export default {
   id: 'infra-auto-rearm-budget-not-persisted',
   title: 'the infra retry pass re-armed a capped entry whose auto re-arm budget was already spent — '
     + 'parseInfraStore dropped autoRearms on every read, so the bound never took effect (PR #4396 review)',
-  card: 'xg44s2t (PR #4396)',
+  card: '5351 (PR #4396)',
   fixedBy: {
     sha: 'pr-4396-review-fix',
     where: 'lane/xg44s2t-infra-rearm',

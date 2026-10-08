@@ -1,4 +1,5 @@
 ---
+bornAs: xg44s2t
 kind: story
 size: 2
 status: open
@@ -9,7 +10,7 @@ tags: []
 
 # Re-arm infra-blocked items stuck at the attempt cap once the GitHub outage has passed
 
-Coroner 2026-10-07 F5: seven items (#4381, #4537, #4669, xrn1u1x, x2oe5e3, xhmrj66, xabk61q) sit at attempt 6 'GitHub outage (transient)' after the outage ended. The retry pass re-arms them through the rearm path when status is operational or after a cool-off, bounded by a max-auto-rearms knob.
+Coroner 2026-10-07 F5: seven items (#4381, #4537, #4669, 4603, 4605, 4826, 4765) sit at attempt 6 'GitHub outage (transient)' after the outage ended. The retry pass re-arms them through the rearm path when status is operational or after a cool-off, bounded by a max-auto-rearms knob.
 
 ## Done when
 
