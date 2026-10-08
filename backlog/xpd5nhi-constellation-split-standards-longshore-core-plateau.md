@@ -52,7 +52,7 @@ Step numbers follow the plan. Steps 0a, 0b and 1 can start in parallel. Nothing 
 | 3 | #xw75lku daemons read coreRoot | 3 | #xo59v8c |
 | 3 | #xuxad3w move into Longshore packages with shims | 8 | 2a–2d, #xw75lku |
 | S2+ | #xs1r68q package manifests + all-in-one meta package | 2 | #xuxad3w |
-| 4 | #xgqueiz private mirror via filter-repo + secret scan | 5 | #xuxad3w, #xdjrqkz |
+| 4 | #xgqueiz private mirror via filter-repo + secret scan | 5 | #xuxad3w (+ #xdjrqkz once PR #4506 lands) |
 | 5 | #xmoufta dual-run passes, verify, review, fix | 5 | #xgqueiz |
 | 5 | #xh1pxjn dual-run build-dispatch, drain last | 5 | #xmoufta |
 | 6 | #x2cpivn flip: WE consumes pinned @longshore | 5 | #xh1pxjn, #xs1r68q, #xgc6mv8 |
