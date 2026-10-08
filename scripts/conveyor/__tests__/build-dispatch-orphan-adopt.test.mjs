@@ -813,6 +813,22 @@ describe('xykwe0h — real outcomes, not orphan-released', () => {
       .toMatchObject({ status: 'alive', reason: 'awaiting-verify' });
     expect(classifyClaimLiveness({ row, resumeMarker: null, ownerPid: 111, isPidAlive: () => false, sessionLive: null }).status).toBe('dead');
   });
+
+  // Review of PR #4361 (operator ruling): a job record whose state is missing, empty or unrecognized is not proof
+  // of life. Wired through the REAL session reader, with a dead owner pid, the claim must reach release — never
+  // `leave` on every pass.
+  it.each([undefined, '', 'completed', 'exited', 'frobnicating'])('a job record with state %j and a dead owner pid is released, not left as alive', async (state) => {
+    acquireBuildDispatchClaim({ num: '5190', scope: [], lockRoot, pid: 111 });
+    const readFile = () => JSON.stringify({ state, updatedAt: new Date().toISOString(), sessionId: '14cd6f08-4ed4-4ec4-8745-8020ef0e58cf', name: 'conveyor-5190', cwd: '/x' });
+    const results = await adoptOrphanedBuildClaims(common('5190', {
+      findRow: () => claudeRow('5190', '14cd6f08'),
+      sessionLivenessFor: (o) => defaultSessionLiveness({ ...o, jobsDir: '/jobs', readdir: () => ['14cd6f08-4ed4-4ec4-8745-8020ef0e58cf'], readFile, awaitingFor: () => null }),
+      readDelivery: () => null,
+      settleRow: () => {},
+    }));
+    expect(results).toEqual([expect.objectContaining({ num: '5190', action: 'release' })]);
+    expect(listBuildDispatchClaims({ lockRoot, ignoreExpiry: true })).toEqual([]);
+  });
 });
 
 describe('defaultSessionLiveness — reads the harness job record', () => {

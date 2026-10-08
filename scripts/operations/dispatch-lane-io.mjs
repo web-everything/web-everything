@@ -63,7 +63,7 @@ import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 // these ran SIMULTANEOUSLY in a single `ps aux` snapshot, none logged anywhere, spending the shared `graphql`
 // bucket (8943 points/hour that hour, 6365.2 UNATTRIBUTED — `gh-spend.mjs report --hours=1 --by=caller`).
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { readBuildDelivery, defaultListBuildPrs, defaultReadCardStatus, defaultReadCardOpened, NON_IMPLEMENTING_REF_RE } from '../conveyor/build-delivery-evidence.mjs';
+import { readBuildDelivery, defaultListBuildPrs, defaultReadCardStatus, defaultReadCardOpened, NON_IMPLEMENTING_REF_RE, isNonImplementingPr } from '../conveyor/build-delivery-evidence.mjs';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createHash, randomUUID } from 'node:crypto';
@@ -2964,8 +2964,9 @@ export { NON_IMPLEMENTING_REF_RE }; // defined once in build-delivery-evidence.m
  *   2. A WORD-BOUNDARY match on `title` — `in:title` search already scopes to the title field, but a bare
  *      substring test would let item `343` match a PR titled "WE #3435: …"; the boundary keeps `343` from
  *      matching inside `3435`.
- *   3. {@link NON_IMPLEMENTING_REF_RE} — excludes prepare-scope/prepare-decision authoring PRs (see that
- *      constant's own docblock for the live case this closes).
+ *   3. `isNonImplementingPr` — excludes prepare-scope/prepare-decision authoring PRs (see
+ *      {@link NON_IMPLEMENTING_REF_RE}'s docblock for the live case this closes), by title as well as ref, so a
+ *      build of a card whose slug starts with scope-/prepare- is still counted (review of PR #4361).
  *   4. (#3473) ALL-MARKDOWN DIFF — a PR whose entire changed-file set is `.md` is pure backlog housekeeping,
  *      never a real implementation, however its title reads. Live false positive: `#3096`'s dispatch-time
  *      already-done hold was fed by TWO merged PRs that both title-boundary-match "3096" — PR #1599 (ref
@@ -3028,7 +3029,7 @@ export function filterAlreadyDoneCandidates(prs, num) {
     .filter((p) => p && typeof p === 'object')
     .filter((p) => p.state === undefined || p.state === 'MERGED') // undefined: a caller that omitted `state`
     .filter((p) => boundary.test(String(p?.title ?? '')))
-    .filter((p) => !NON_IMPLEMENTING_REF_RE.test(String(p?.headRefName ?? '')))
+    .filter((p) => !isNonImplementingPr(p))
     // #3473 guard 4 — an all-.md changed-file set is pure backlog/doc housekeeping, never a real delivery.
     // A no-op when `files` is absent from the row (existing fixtures that don't set it stay green).
     .filter((p) => !(Array.isArray(p?.files) && p.files.length > 0 && p.files.every((f) => /\.md$/i.test(String(f?.path ?? f)))))

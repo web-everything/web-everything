@@ -18,13 +18,54 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import { normNum } from './queue-store.mjs';
 
+/** A card id as it appears in a lane ref: a number with an optional retry letter, or a hash id (`xykwe0h`). */
+const CARD_ID_IN_REF = String.raw`(?:\d+[a-z]?|x[a-z0-9]{6,7})`;
+
 /**
- * Prepare / scope authoring PRs never implement the build. THE one definition: `dispatch-lane-io` re-exports it
- * (it imports this module, so the shared home is here). The authoring shape is `lane/<num>[a-z]?-(scope|prepare)-<hash>`
- * — anchored to the card number, so a real build whose slug merely CONTAINS "scope"/"prepare"
- * (`lane/4400-narrow-scope-of-x`) is still a build (review of PR #4361).
+ * The ref SHAPE of a prepare / scope authoring PR: `lane/<id>-(scope|prepare)-<slug>`, anchored to the card id, so
+ * a build whose slug merely CONTAINS "scope"/"prepare" (`lane/4400-narrow-scope-of-x`) never matches. The shape
+ * alone is NOT proof of authoring: a card whose own slug STARTS with scope-/prepare- gets a build branch of exactly
+ * this shape (live PRs #700 `lane/2629-scope-review-to-convergence`, #743 `lane/2638-prepare-time-jury-charter`).
+ * Use {@link isNonImplementingPr}, which also reads the title (review of PR #4361).
  */
-export const NON_IMPLEMENTING_REF_RE = /^lane\/\d+[a-z]?-(scope|prepare)-/i;
+export const NON_IMPLEMENTING_REF_RE = new RegExp(String.raw`^lane\/${CARD_ID_IN_REF}-(scope|prepare)-`, 'i');
+/** The legacy hash-suffixed authoring ref (`lane/3435-scope-3dfab284`): never a card's own slug, so the ref decides. */
+const HASHED_AUTHORING_REF_RE = new RegExp(String.raw`^lane\/${CARD_ID_IN_REF}-(?:scope|prepare)-[0-9a-f]{8}$`, 'i');
+/**
+ * The subjects the authoring flows mint, matched right after the id prefix so a card title that merely starts with
+ * the word (`prepare-time jury charter`, `prepare-stamp works on…`) never matches: `prepare — …` (machine-pr-title
+ * kinds `prepare` / `prepare-stamp`), `prepare item — …`, `complete prepare stamp`, `author scope: for #N` and
+ * `author decision forks for #N`.
+ */
+const AUTHORING_SUBJECT_RE = /^(?:prepare(?:[- ](?:item|stamp))?\s*[—–-]\s|complete\s+prepare[- ]stamp\b|author\s+scope:\s*for\s+#|author\s+decision\s+forks\b)/i;
+/** The older free-form authoring titles: `prepare #N: …` and `backlog: #N prepare-stamp (…)`. */
+const LEGACY_AUTHORING_TITLE_RES = [/^prepare\s+#[a-z0-9]+:/i, /^backlog:\s*#[a-z0-9]+\s+prepare[- ]stamp\b/i];
+
+/**
+ * Is this the title of an authoring PR? Checked on the PUBLISHED title: `publicationTitle` (machine-pr-title.mjs)
+ * files any subject it has no kind for under `build`, so the prepare-scope brief's `WE #N: author scope: for #N`
+ * lands on GitHub as `WE #N: build — author scope: for #N`. The subject is read both bare and after that wrapper. PURE.
+ */
+function isAuthoringTitle(raw) {
+  const title = String(raw ?? '').normalize('NFKC').trim();
+  if (LEGACY_AUTHORING_TITLE_RES.some((re) => re.test(title))) return true;
+  const subject = /^(?:[A-Za-z]+\s+)?#?[a-z0-9]+:\s*(.*)$/is.exec(title)?.[1] ?? '';
+  const wrapped = /^build\s+[—–-]\s+(.*)$/is.exec(subject)?.[1] ?? '';
+  return AUTHORING_SUBJECT_RE.test(subject) || AUTHORING_SUBJECT_RE.test(wrapped);
+}
+
+/**
+ * Did this PR only author a card's scope or prepare it (never implement it)? THE one definition: `dispatch-lane-io`
+ * imports it (it imports this module, so the shared home is here). An authoring title decides on any ref; an
+ * authoring-shaped ref decides only when it is the hash-suffixed legacy shape or there is no title to read. PURE.
+ */
+export function isNonImplementingPr(pr) {
+  const title = String(pr?.title ?? '').trim();
+  if (isAuthoringTitle(title)) return true;
+  const ref = String(pr?.headRefName ?? '');
+  if (!NON_IMPLEMENTING_REF_RE.test(ref)) return false;
+  return HASHED_AUTHORING_REF_RE.test(ref) || title === '';
+}
 
 /** Settled outcomes this module can name, in preference order when several PRs match. */
 export const DELIVERY_OUTCOMES = Object.freeze(['pr-merged', 'pr-open', 'card-resolved']);
@@ -39,7 +80,7 @@ export function prBelongsToBuild(pr, num) {
   // dispatch (review of PR #4361). Same-repo branches need write access, so only forks are dropped.
   if (pr.isCrossRepository === true) return false;
   const ref = String(pr.headRefName ?? '');
-  if (NON_IMPLEMENTING_REF_RE.test(ref)) return false;
+  if (isNonImplementingPr(pr)) return false;
   const refRe = new RegExp(`^lane/${escapeRe(key)}[a-z]?(?:-|$)`, 'i');
   const titleRe = new RegExp(`(^|[^0-9])${escapeRe(key)}([^0-9]|$)`);
   return refRe.test(ref) || titleRe.test(String(pr.title ?? ''));

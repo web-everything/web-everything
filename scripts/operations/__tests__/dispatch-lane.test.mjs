@@ -2952,6 +2952,16 @@ describe('filterAlreadyDoneCandidates — PURE: which gh pr list rows are real "
     expect(filterAlreadyDoneCandidates([prepPr], '3457')).toEqual([]);
   });
 
+  it('KEEPS a real build whose card slug starts with scope-/prepare- (live PRs #700, #743); still drops the authoring PR on the same shape', () => {
+    // Review of PR #4361: the ref shape alone dropped these real implementations as "authoring".
+    const build700 = merged('WE #2629: prepare-scope agents run an AI review-to-convergence before any human review', 'lane/2629-scope-review-to-convergence', { number: 700 });
+    const build743 = merged('WE #2638: prepare-time jury charter — pre-register jury + expectations', 'lane/2638-prepare-time-jury-charter', { number: 743 });
+    expect(filterAlreadyDoneCandidates([build700], '2629').map((p) => p.number)).toEqual([700]);
+    expect(filterAlreadyDoneCandidates([build743], '2638').map((p) => p.number)).toEqual([743]);
+    const prep = merged('WE #4648: prepare — reconcile dead build run records even after their…', 'lane/4648-prepare-reconcile-dead-build-run-records-even-after-their-dispatch-c', { number: 4363 });
+    expect(filterAlreadyDoneCandidates([prep], '4648')).toEqual([]);
+  });
+
   it('a WORD-BOUNDARY title match — item "343" must not match a PR title mentioning "3435"', () => {
     const pr = merged('WE #3435: mechanically reap/stop finished sessions', 'lane/3435-session-reaper');
     expect(filterAlreadyDoneCandidates([pr], '343')).toEqual([]);
