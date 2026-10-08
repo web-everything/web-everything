@@ -36,7 +36,7 @@ import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { BACKLOG_KINDS } from '../check-standards-rules.mjs';
 import { nextHash } from '../backlog/id.mjs';
-import { renderItem } from '../backlog/scaffold.mjs';
+import { renderItem, sizeRefusal } from '../backlog/scaffold.mjs';
 
 export const SCAFFOLD_OP = 'scaffold';
 
@@ -44,7 +44,7 @@ export const SCAFFOLD_OP = 'scaffold';
 export const SCAFFOLD_EFFECT = 'scaffold.write';
 
 /** Why a scaffold was refused. A closed set, so a caller branches on a reason rather than prose. */
-export const SCAFFOLD_REFUSALS = Object.freeze(['bad-kind', 'no-title', 'story-needs-size', 'id-exhausted']);
+export const SCAFFOLD_REFUSALS = Object.freeze(['bad-kind', 'no-title', 'story-needs-size', 'bad-size', 'size-not-allowed', 'id-exhausted']);
 
 /**
  * Resolve the `kind` axis from the three flag shapes. PURE.
@@ -125,10 +125,10 @@ export function planScaffold(read, input = {}, { alloc = nextHash } = {}) {
 
   const size = input.size === undefined || input.size === '' ? undefined : Number(input.size);
   // A story without a size enters the board unsized, which the readiness ranker cannot place — so the CLI
-  // refuses it and so does this. Other kinds legitimately carry no size.
-  if (kind === 'story' && !Number.isFinite(size)) {
-    refuse('story-needs-size', 'a story needs --size=<Fibonacci>');
-  }
+  // refuses it and so does this. A size passed for a kind that is never sized, or a non-numeric one, is
+  // refused too (#x0h3pe4) — never silently dropped. One shared rule with the CLI: `sizeRefusal`.
+  const sizeProblem = sizeRefusal(kind, input.size);
+  if (sizeProblem) refuse(sizeProblem.reason, sizeProblem.message);
 
   const slug = String(input.slug || '').trim() || slugFor(title);
 

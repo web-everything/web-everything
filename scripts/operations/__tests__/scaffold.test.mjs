@@ -80,8 +80,24 @@ describe('refusals', () => {
     expect(planScaffold(read(), { workItem: 'task', title: 'a task' }).kind).toBe('task');
   });
 
+  // #x0h3pe4 — a passed --size is never silently dropped: kept where the kind may carry one, refused otherwise.
+  it.each(['decision', 'epic', 'investigation'])('a sized %s KEEPS its size in the written frontmatter', (kind) => {
+    expect(planScaffold(read(), { kind, title: 'x', size: '2' }).content).toMatch(/^size: 2$/m);
+  });
+
+  it.each(['task', 'feature'])('a sized %s REFUSES loudly instead of dropping the size', (kind) => {
+    expect(reasonOf(() => planScaffold(read(), { kind, title: 'x', size: '2' }))).toBe('size-not-allowed');
+  });
+
+  it('a non-numeric size REFUSES instead of dropping it', () => {
+    expect(reasonOf(() => planScaffold(read(), { kind: 'decision', title: 'x', size: 'big' }))).toBe('bad-size');
+  });
+
   it('every refusal reason is in the declared set', () => {
-    const cases = [{ kind: 'chore', title: 'x' }, { title: '' }, { title: 'a story' }];
+    const cases = [
+      { kind: 'chore', title: 'x' }, { title: '' }, { title: 'a story' },
+      { kind: 'task', title: 'x', size: '2' }, { kind: 'decision', title: 'x', size: 'big' },
+    ];
     for (const c of cases) expect(SCAFFOLD_REFUSALS).toContain(reasonOf(() => planScaffold(read(), c)));
   });
 });

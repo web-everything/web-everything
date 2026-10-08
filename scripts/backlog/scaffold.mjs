@@ -22,6 +22,36 @@ export const GUARD_RELAXATION_HINT =
 export const pad3 = (n) => String(n).padStart(3, '0');
 
 /**
+ * Kinds that are NEVER sized. A `task` rolls up to its parent (check:standards errors on a sized task); a
+ * `feature` is a non-buildable grouping root (#2691, "never sized as buildable work"). Every other kind keeps
+ * a passed `--size` — including a `decision` (its analysis effort) and an UNSLICED `epic` (a sized epic only
+ * errors once it gains children, `we:scripts/lib/workflow-invariants.cjs`).
+ */
+export const UNSIZED_KINDS = new Set(['task', 'feature']);
+
+/**
+ * The one shared answer to "is this `--size` acceptable for this kind?" (#x0h3pe4), used by both the
+ * `scaffold`/`file-item` operations and the `backlog.mjs scaffold` CLI so neither ever silently drops a
+ * passed size. PURE. `rawSize` is the flag as given (`undefined`/`''` = not passed).
+ *
+ * @returns {null | {reason: 'bad-size'|'size-not-allowed'|'story-needs-size', message: string}}
+ */
+export function sizeRefusal(kind, rawSize) {
+  const passed = rawSize !== undefined && rawSize !== '';
+  if (passed && !Number.isFinite(Number(rawSize))) {
+    return { reason: 'bad-size', message: `--size must be a number (got ${JSON.stringify(rawSize)})` };
+  }
+  if (passed && UNSIZED_KINDS.has(kind)) {
+    return {
+      reason: 'size-not-allowed',
+      message: `a ${kind} is never sized (got --size=${rawSize}) — drop --size, or file it as a story/epic/decision`,
+    };
+  }
+  if (!passed && kind === 'story') return { reason: 'story-needs-size', message: 'a story needs --size=<Fibonacci>' };
+  return null;
+}
+
+/**
  * A free `NNN` for a NEW item, as a padded string. #2292 (interim, under #2289) — allocate a RANDOM free
  * number within the EXISTING range (a gap below the max) instead of deterministic max+1, so two lanes
  * branching off the same main rarely pick the same NNN (a low-probability birthday collision over the free
@@ -90,7 +120,11 @@ export function renderItem(spec) {
   const { kind, size, title, today, blockedBy = [], parent, digest, scaffoldedBy, scope = [] } = spec;
   const scopeEntries = normalizeScope(scope);
   const fm = ['---', `kind: ${kind}`];
-  if (kind === 'story' || (kind === 'epic' && typeof size === 'number')) fm.push(`size: ${size}`);
+  // A story always carries its size; every other kind carries it exactly when one was passed. Kinds that can
+  // never be sized (`UNSIZED_KINDS`) are refused upstream (`we:scripts/operations/scaffold.mjs#planScaffold`,
+  // `we:scripts/backlog.mjs scaffold`) — never silently dropped here (#x0h3pe4: a sized decision was born
+  // unsized because this line only emitted size for story/epic).
+  if (kind === 'story' || (typeof size === 'number' && !UNSIZED_KINDS.has(kind))) fm.push(`size: ${size}`);
   if (parent) fm.push(`parent: "${parent}"`);
   // Born-active when a creating session owns it (#670): scaffold --session stamps `scaffoldedBy`, marking
   // the item owned-until-settled so a concurrent batch can't claim a half-authored spin-off (born-public
