@@ -3,7 +3,7 @@ kind: task
 status: open
 scope: ["we:scripts/lane-pool.mjs", "we:scripts/__tests__/lane-pool-clean-verdict-memo.test.mjs"]
 dateOpened: "2026-10-08"
-size: 2
+estimatedLoc: 20
 tags: []
 ---
 
