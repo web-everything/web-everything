@@ -80,7 +80,7 @@ import { classifyRedCause, reachesChanged } from './lib/red-cause.mjs';
 import { baseRerunCandidate, measureBaseFailures, classifyPreExisting, runVitestOnBase } from './lib/verify-base-rerun.mjs';
 import { alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
-import { revertRedForVerify, appendRevertRedLog, recoverRevertRed } from './lib/verify-revert-red.mjs';
+import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
@@ -754,16 +754,8 @@ if (exitCode === 0 && !signal && !verificationInfrastructureFailure({ exitCode, 
     if (revertRed.status !== 'skipped' || !['not-a-fix-push', 'mode-off'].includes(revertRed.reason)) {
       appendRevertRedLog({ at: new Date().toISOString(), repo: REPO, sha: headSha, ...revertRed }, { root: resolveCoordinationRoot() });
     }
-    // A restore that did not verify is an infrastructure failure in EVERY mode: the tree is no longer the verified commit.
-    if (revertRed.reason === 'not-restored') {
-      exitCode = 1;
-      failureDetails = { tests: [], summary: `${revertRed.line} — the lane still holds reverted source; the next verify restores it from git`, truncated: false };
-    } else if (revertRed.blocking) {
-      exitCode = 1;
-      const flagged = [...revertRed.nonDiscriminating, ...revertRed.unproven];
-      failureDetails = { tests: flagged.map((t) => ({ file: t.file, name: t.test ? `${t.test} (passes with the fix reverted)` : null })),
-        summary: revertRed.line, truncated: false };
-    }
+    // The verdict effect is decided in ONE pure place: warn never changes it, except a failed restore (red in every mode).
+    ({ exitCode, failureDetails } = applyRevertRedToVerdict({ exitCode, failureDetails, revertRed }));
   }
 }
 

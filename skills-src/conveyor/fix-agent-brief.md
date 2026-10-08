@@ -523,7 +523,8 @@ It must also carry the **revert-red result** (#5466). Your verify ran the tests 
 source changes reverted; a test that stayed green there cannot catch the defect coming back. Read it with
 `node {{WE_ROOT}}/scripts/verify-lane.mjs check --repo=. --json` (the `revertRed.line` field) and paste that line
 verbatim. When it lists tests as `NOT discriminating`, say for each one whether it is a deliberate non-regression pin
-(and why) or a weak test; in `warn` mode this never blocks your hand-back, but the reviewer reads it.
+(and why) or a weak test. In `warn` mode a flagged result does not block your hand-back, but the reviewer reads it
+(a revert whose restore failed is the exception: verify reports it red, and the next verify puts the files back).
 
 ```bash
 gh pr comment {{PR_NUM}} --repo {{REPO}} --body-file <evidence-file>

@@ -14,7 +14,7 @@ import { join } from 'node:path';
 
 import { withRealRepo } from '../../operations/__tests__/helpers/real-repo.mjs';
 import { createRevertProbe, runSuite } from '../../operations/mutation-check-io.mjs';
-import { runRevertRedCheck, revertRedForVerify, appendRevertRedLog, parseNameStatusZ, recoverRevertRed, textOrNull, REVERT_JOURNAL } from '../verify-revert-red.mjs';
+import { runRevertRedCheck, revertRedForVerify, appendRevertRedLog, parseNameStatusZ, recoverRevertRed, textOrNull, REVERT_JOURNAL, applyRevertRedToVerdict } from '../verify-revert-red.mjs';
 
 const SRC = 'scripts/x/guard.mjs';
 const TEST = 'scripts/x/__tests__/guard.test.mjs';
@@ -115,9 +115,9 @@ describe('revert-red check on a real checkout', () => {
       expect(v).toMatchObject({ status: 'unproven', reason: 'not-restored' });
       expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe(BUGGY);
       const journal = join(ctx.root, '.git', REVERT_JOURNAL);
-      expect(JSON.parse(readFileSync(journal, 'utf8'))).toMatchObject({ head: ctx.fix, files: [SRC] });
+      expect(JSON.parse(readFileSync(journal, 'utf8'))).toMatchObject({ head: ctx.fix, files: [{ path: SRC }] });
       failRestore = false;
-      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ pending: true, ok: true, restored: [SRC] });
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ pending: true, ok: true, restored: [SRC], leftAlone: [] });
       expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe(FIXED);
       expect(existsSync(journal)).toBe(false);
       expect(ctx.porcelain()).toBe('');
@@ -125,9 +125,29 @@ describe('revert-red check on a real checkout', () => {
     });
   });
 
+  it('recovery never overwrites work done after the kill: an edited file, or a moved HEAD, is left alone', async () => {
+    const leaveReverted = async (ctx) => {
+      const write = (p, text) => { if (text === FIXED) throw new Error('EIO'); realFs.writeFileSync(p, text); };
+      await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'warn', probe: createRevertProbe({ run: runner(ctx.root, []), write }) });
+      expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe(BUGGY);
+    };
+    await withFix(async (ctx) => {
+      await leaveReverted(ctx);
+      writeFileSync(join(ctx.root, SRC), 'the fixer kept working\n');
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ ok: true, restored: [], leftAlone: [SRC] });
+      expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe('the fixer kept working\n');
+      expect(existsSync(join(ctx.root, '.git', REVERT_JOURNAL))).toBe(false);
+    });
+    await withFix(async (ctx) => {
+      await leaveReverted(ctx);
+      ctx.commit({ 'scripts/x/next.mjs': 'n\n' }, 'the fixer committed again');
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ ok: true, restored: [], leftAlone: [SRC] });
+    });
+  });
+
   it('a journal naming a path outside the checkout is refused, not followed', async () => {
     await withFix(async (ctx) => {
-      writeFileSync(join(ctx.root, '.git', REVERT_JOURNAL), JSON.stringify({ head: ctx.fix, files: ['../outside.mjs'] }));
+      writeFileSync(join(ctx.root, '.git', REVERT_JOURNAL), JSON.stringify({ head: ctx.fix, files: [{ path: '../outside.mjs', reverted: 'x' }] }));
       expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ pending: true, ok: false });
       expect(existsSync(join(ctx.root, '..', 'outside.mjs'))).toBe(false);
     });
@@ -247,5 +267,26 @@ describe('parts', () => {
     const r = runSuite({ cwd: '.', suite: ['./a.test.mjs', './b.test.mjs'], run, maxFailures: 3 });
     expect(r).toMatchObject({ ran: true, green: false, failuresTruncated: true });
     expect(r.failures).toHaveLength(3);
+  });
+});
+
+// The ONE place verify-lane's exit code is decided for a revert-red result (verify-lane assigns exactly this).
+describe('what a revert-red result does to the verify verdict', () => {
+  const flagged = { reason: 'tests-pass-with-fix-reverted', blocking: false, line: 'L', nonDiscriminating: [{ file: 'a.test.mjs', test: 't' }], unproven: [] };
+  it('warn never changes a green verdict', () => {
+    for (const r of [flagged, { reason: 'base-not-ancestor', blocking: false }, { reason: 'mode-off', blocking: false }, null]) {
+      expect(applyRevertRedToVerdict({ exitCode: 0, failureDetails: undefined, revertRed: r })).toEqual({ exitCode: 0, failureDetails: undefined });
+    }
+  });
+  it('enforce turns a blocking result red, naming the tests', () => {
+    const r = applyRevertRedToVerdict({ exitCode: 0, revertRed: { ...flagged, blocking: true } });
+    expect(r.exitCode).toBe(1);
+    expect(r.failureDetails.tests).toEqual([{ file: 'a.test.mjs', name: 't (passes with the fix reverted)' }]);
+  });
+  it('a failed restore is red in every mode (the tree is not the verified commit)', () => {
+    expect(applyRevertRedToVerdict({ exitCode: 0, revertRed: { reason: 'not-restored', blocking: false, line: 'L' } }).exitCode).toBe(1);
+  });
+  it('never turns a red gate green', () => {
+    expect(applyRevertRedToVerdict({ exitCode: 2, failureDetails: { x: 1 }, revertRed: { reason: 'all-new-tests-red-with-fix-reverted', blocking: false } })).toEqual({ exitCode: 2, failureDetails: { x: 1 } });
   });
 });

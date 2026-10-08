@@ -18,6 +18,7 @@
  * IMPURE (git, fs through the injected probe). The decisions are all in `./revert-red-rule.mjs`.
  */
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import * as nodeFs from 'node:fs';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join, sep } from 'node:path';
@@ -70,23 +71,55 @@ export function recoverRevertRed({ checkout, git, fs = nodeFs } = {}) {
     return { pending: true, ok: false, restored: [], detail: 'unreadable revert journal' };
   }
   const head = String(journal?.head ?? '');
-  const files = Array.isArray(journal?.files) ? journal.files.map(String) : [];
+  const files = Array.isArray(journal?.files) ? journal.files : [];
   if (!SHA_RE.test(head)) return { pending: true, ok: false, restored: [], detail: 'revert journal names no head' };
+  // Only a tree that is EXACTLY what the killed run left is put back: HEAD still the journaled head, and each file
+  // still holding the reverted bytes it wrote. Anything else means someone moved on since — their work is never
+  // overwritten; the file is reported and left alone.
+  let currentHead = '';
+  try { currentHead = run(['rev-parse', 'HEAD']).trim(); } catch { /* unreadable → treated as moved */ }
   const restored = [];
+  const leftAlone = [];
   try {
-    for (const file of files) {
+    for (const entry of files) {
+      const file = String(entry?.path ?? '');
       const abs = safeTarget(checkout, file, fs);
       if (!abs) throw new Error(`unsafe journal path ${JSON.stringify(file)}`);
+      let onDisk = null;
+      try { onDisk = fs.readFileSync(abs); } catch { onDisk = null; }
+      if (currentHead !== head || !onDisk || sha256(onDisk) !== String(entry?.reverted ?? '')) { leftAlone.push(file); continue; }
       const bytes = run(['show', `${head}:${file}`], { buffer: true });
       fs.writeFileSync(abs, bytes);
       if (!Buffer.from(fs.readFileSync(abs)).equals(Buffer.from(bytes))) throw new Error(`re-read of ${file} differs`);
       restored.push(file);
     }
     fs.unlinkSync(path);
-    return { pending: true, ok: true, restored };
+    return { pending: true, ok: true, restored, leftAlone };
   } catch (e) {
-    return { pending: true, ok: false, restored, detail: String(e?.message ?? e) };
+    return { pending: true, ok: false, restored, leftAlone, detail: String(e?.message ?? e) };
   }
+}
+
+const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+
+/**
+ * What a revert-red result does to the verify verdict. PURE — the one place verify-lane's exit code is decided for it.
+ *   - not-restored → red in EVERY mode: the tree is no longer the verified commit (an infrastructure failure, not a
+ *     check verdict; the next verify restores it from the journal).
+ *   - blocking (enforce only) → red, naming the tests that did not discriminate.
+ *   - anything else (every warn result) → the gate's own verdict, unchanged.
+ * @returns {{exitCode: number, failureDetails: object|undefined}}
+ */
+export function applyRevertRedToVerdict({ exitCode, failureDetails, revertRed }) {
+  if (!revertRed || exitCode !== 0) return { exitCode, failureDetails };
+  if (revertRed.reason === 'not-restored') {
+    return { exitCode: 1, failureDetails: { tests: [], summary: `${revertRed.line} — the lane still holds reverted source; the next verify restores it from git`, truncated: false } };
+  }
+  if (revertRed.blocking) {
+    const flagged = [...(revertRed.nonDiscriminating ?? []), ...(revertRed.unproven ?? [])];
+    return { exitCode: 1, failureDetails: { tests: flagged.map((t) => ({ file: t.file, name: t.test ? `${t.test} (passes with the fix reverted)` : null })), summary: revertRed.line, truncated: false } };
+  }
+  return { exitCode, failureDetails };
 }
 
 /**
@@ -195,7 +228,8 @@ export async function runRevertRedCheck({ checkout, base, head = 'HEAD', mode, k
   let journal;
   try {
     journal = journalPath(run);
-    fs.writeFileSync(journal, `${JSON.stringify({ head: headSha.value, files: runPlan.revert, at: new Date().toISOString() })}\n`);
+    const files = targets.map((t) => ({ path: t.target, reverted: sha256(Buffer.from(t.revert, 'utf8')) }));
+    fs.writeFileSync(journal, `${JSON.stringify({ head: headSha.value, files, at: new Date().toISOString() })}\n`);
   } catch {
     return fail('journal-unwritable');
   }
