@@ -138,3 +138,11 @@ End with a list of what needs the operator's review.
 
 Repo-only: this skill uses nothing from user-level CLAUDE.md, memory or skills. Runtime state under `~/.claude/jobs`
 and `~/workspace/.operations` is read as data.
+
+## LLM sample (card 130 S3)
+
+`node scripts/operations/coroner-sample.mjs --hours=12` picks the worst N sessions by minutes lost (S1 signals), has a cheap
+tool-free model summarise each into a schema-checked, worker-result-shaped record (outcome, blocker.kind, evidence, proposedFix),
+drops invalid ones with a count, ranks blocker kinds by deterministic minutes lost, and prints the cost per run. Knob
+`coroner.sampleSize` (`--sample-size`, `WE_CORONER_SAMPLE_SIZE`, default 28). Stability rule: top-5 unchanged for 3 runs halves N
+(floor 5); a changed ranking returns to the large N. History: `~/workspace/.operations/metrics/perf/coroner-sample-ranking.jsonl`.
