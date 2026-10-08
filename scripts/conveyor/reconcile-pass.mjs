@@ -104,7 +104,7 @@ import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 import { latestCiHealEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { readLiveFixClaim } from './fix-procedure.mjs';
 import { enrichPrsWithReferralHolds } from './review-referral-hold.mjs';
-import { ledgerHoldStep, renderLedgerShadowSummary } from './review-hold-ledger-shadow.mjs';
+import { ledgerHoldStep, failClosedHolds, ledgerDeciding, renderLedgerShadowSummary } from './review-hold-ledger-shadow.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { enrichPrsWithScopeBloat } from './scope-bloat.mjs';
 import { ignoredRulings, resolveCountInfraStalls } from '../lib/ruling-ledger.mjs';
@@ -1224,19 +1224,24 @@ export function enrichPrsWithCodeQL(prs, { repo = null, exec = (file, args) => e
 /**
  * Ledger plan slice H (card xqh3tkh): run the ledger hold step over the PRs `enrichReferralHolds` just decided.
  * In the default `both` mode it only journals and logs; a family set to `ledger` decides from the ledger. It never
- * throws (the step returns the PRs untouched on any failure). Off under a test run: the step reads a real store.
+ * throws: a failed step leaves `both` decisions untouched and HOLDS a `ledger` family. Off under a test run: the step
+ * reads a real store.
  */
 export function enrichPrsWithLedgerHolds(prs, { repo, now = Date.now(), env = process.env, step = ledgerHoldStep,
   log = (line) => console.error(line) } = {}) {
-  if ((isUnderTest(env) || isUnderTest()) && step === ledgerHoldStep) return prs; // an injected env never re-arms it
+  // An injected env never re-arms the default step under a test run, but a family set to `ledger` is never skipped
+  // (a daemon that inherits a stray VITEST must not fail open).
+  if ((isUnderTest(env) || isUnderTest()) && step === ledgerHoldStep && !ledgerDeciding(env)) return prs;
   try {
     const { prs: out, summary } = step(prs, { repo, now, env });
     const line = renderLedgerShadowSummary(summary);
     if (line) log(line);
     return out;
   } catch (e) {
-    log(`ledger-shadow ${repo}: step failed (decisions unchanged): ${String(e?.message ?? e).split('\n')[0]}`);
-    return prs;
+    // A family on `ledger` is fail-closed: a step that cannot answer holds the review, it never releases it.
+    const out = failClosedHolds(prs, { repo, env });
+    log(`ledger-shadow ${repo}: step failed (${out === prs ? 'decisions unchanged' : 'ledger families held'}): ${String(e?.message ?? e).split('\n')[0]}`);
+    return out;
   }
 }
 

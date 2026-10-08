@@ -20,6 +20,10 @@
  *     other two need data the ledger does not carry yet: the block fix needs finding text, and the label is the
  *     G2 mirror's). For them `ledger` acts as `both` and the summary says so. In `ledger` mode an unreadable
  *     ledger or a crashed derive HOLDS the review (fail closed); it never releases.
+ *   A `ledger` family reads FRESH every tick (no TTL cache; an async store, whose answer is read-behind, cannot decide
+ *   yet and holds), and a release needs ledger evidence: no rows for the PR, no run on this head, or no referral on
+ *   this head keeps today's pause. A referral pause lifted by the ledger asks today's same-head guard when
+ *   `sameHeadHold` is not itself on `ledger`.
  *   A family moving to `ledger` can release holds today's reader keeps, so it is a ratified setting change after
  *   the shadow shows agreement, never a default.
  *
@@ -42,7 +46,7 @@ import { isUnderTest } from '../lib/under-test.mjs';
 import { sharedRunsDir } from '../operations/run-store.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { sameHead } from '../lib/pr-state/referrals.mjs';
-import { resolveSameHeadMaxReviews } from './review-referral-hold.mjs';
+import { resolveSameHeadMaxReviews, decideSameHeadHold, readReviewRunEvidence } from './review-referral-hold.mjs';
 
 export const READ_SOURCES = Object.freeze(['labels', 'both', 'ledger']);
 export const DEFAULT_READ_SOURCE = 'both';
@@ -99,16 +103,17 @@ export function oldDecisions(pr, { needRuling = sweepNeedsRuling } = {}) {
  * on WHICH head: the review pause is per head, because a new push owes a fresh review).
  * @returns {{unreadable:string|null, decisions:object, detail:object}}
  */
-export function ledgerDecisions(events, pr, { repo, sameHeadMaxReviews = 1, now = Date.now() } = {}) {
+export function ledgerDecisions(events, pr, { repo, sameHeadMaxReviews = 1, now = Date.now(), derive = derivePrState } = {}) {
   const head = typeof pr?.headRefOid === 'string' ? pr.headRefOid : null;
   const facts = { pr: Number(pr?.number), repo, head: { sha: head }, state: 'OPEN', now };
   const empty = { referralHold: null, sameHeadHold: null, blockRuled: null, rulingNeeded: null };
   if (!Array.isArray(events)) return { unreadable: 'ledger-unreadable', decisions: empty, detail: {} };
-  const derived = derivePrState(events, facts, { sameHeadMaxReviews });
+  const derived = derive(events, facts, { sameHeadMaxReviews });
   const bad = derived.holds.find(h => UNREADABLE_CODES.has(h.code));
   if (bad) return { unreadable: bad.code, decisions: empty, detail: { reason: bad.reason } };
   const view = ledgerView(events, facts);
-  const openOnHead = [...view.referrals.values()].filter(k => k.state === 'open' && sameHead(k.head, head)).map(k => k.key);
+  const onHead = [...view.referrals.values()].filter(k => sameHead(k.head, head));
+  const openOnHead = onHead.filter(k => k.state === 'open').map(k => k.key);
   const codes = new Set(derived.holds.map(h => h.code));
   const runs = view.events.filter(e => e.type === EVENT_TYPES.REVIEW_RUN && e.phase === 'completed' && sameHead(head, e.headSha)).length;
   return {
@@ -119,7 +124,7 @@ export function ledgerDecisions(events, pr, { repo, sameHeadMaxReviews = 1, now 
       blockRuled: codes.has('referral-blocked'),
       rulingNeeded: openOnHead.length > 0,
     },
-    detail: { rows: view.events.length, runsOnHead: runs, openOnHead, holds: [...codes],
+    detail: { rows: view.events.length, runsOnHead: runs, referralsOnHead: onHead.length, openOnHead, holds: [...codes],
       reason: derived.holds.find(h => h.code === 'same-head-cap')?.reason ?? null },
   };
 }
@@ -148,19 +153,21 @@ export function disagreementCause(family, oldAnswer, ledger, events, pr) {
  * @returns {Array<{pr:number, head:string|null, family:string, mode:string, old:boolean|null, ledger:boolean|null,
  *   agree:boolean|null, cause:string|null, detail:object}>}
  */
-export function compareHolds(prs, events, { repo, sources, sameHeadMaxReviews = 1, now = Date.now(), needRuling } = {}) {
+export function compareHolds(prs, events, { repo, sources, sameHeadMaxReviews = 1, now = Date.now(), needRuling, derive } = {}) {
   const out = [];
   for (const pr of prs ?? []) {
     if (!Number.isInteger(Number(pr?.number))) continue;
     const old = oldDecisions(pr, needRuling ? { needRuling } : {});
-    const led = ledgerDecisions(events, pr, { repo, sameHeadMaxReviews, now });
+    const led = ledgerDecisions(events, pr, { repo, sameHeadMaxReviews, now, ...(derive ? { derive } : {}) });
+    // A readable ledger with no rows for this PR knows nothing about it: that is no evidence, never an agreement.
+    const noRows = !led.unreadable && !led.detail.rows;
     for (const family of READ_SOURCE_FAMILIES) {
       const mode = sources[family].effective;
       if (mode === 'labels') continue;
       const o = old[family]; const l = led.unreadable ? null : led.decisions[family];
-      const agree = o === null || l === null ? null : o === l;
+      const agree = o === null || l === null || noRows ? null : o === l;
       out.push({ pr: Number(pr.number), head: pr.headRefOid ?? null, family, mode, old: o, ledger: l, agree,
-        cause: agree === false || led.unreadable ? disagreementCause(family, o, led, events ?? [], pr) : null,
+        cause: agree === false || led.unreadable || (noRows && o !== null) ? disagreementCause(family, o, led, events ?? [], pr) : null,
         detail: { runsOnHead: led.detail.runsOnHead ?? null, openOnHead: led.detail.openOnHead?.length ?? null, holds: led.detail.holds ?? [] } });
     }
   }
@@ -177,35 +184,76 @@ function ledgerHold({ kind, repo, pr, why, count, cause }) {
  * Apply the `ledger`-mode families to the enriched PRs. Pure. Families in `labels`/`both` keep today's decision
  * exactly. A ledger that cannot answer (unreadable, crashed derive, no read yet) HOLDS: a silent `same-head`
  * class pause (no PR comment, logged every tick by the daemon) whose `why` names the cause.
+ *
+ * A ledger RELEASE needs ledger evidence. Zero rows for the PR, no completed run on this head (same-head pause) or
+ * no referral row on this head (referral pause) is a ledger that does not know, so today's pause stands: the ledger
+ * can add a hold or lift one it has seen the end of, never lift one it has not seen. A PR with no rows and no
+ * pause stays free (it still owes its first review).
+ *
+ * `sameHeadToday(pr)` is today's same-head guard (the run store). A referral pause hides that guard, so when the
+ * ledger lifts a referral pause and `sameHeadHold` is not itself on `ledger`, the guard is asked then. Without it the
+ * pause stays (the guard cannot be asked, so nothing is released).
  */
-export function applyLedgerHolds(prs, events, { repo, sources, sameHeadMaxReviews = 1, now = Date.now(), unreadable = null } = {}) {
+export function applyLedgerHolds(prs, events, { repo, sources, sameHeadMaxReviews = 1, now = Date.now(), unreadable = null,
+  derive, sameHeadToday = null } = {}) {
   const flipRef = sources.referralHold.effective === 'ledger';
   const flipSame = sources.sameHeadHold.effective === 'ledger';
   if (!flipRef && !flipSame) return prs;
-  return prs.map((pr) => {
-    const led = unreadable ? { unreadable, decisions: {}, detail: {} } : ledgerDecisions(events, pr, { repo, sameHeadMaxReviews, now });
+  const heldCrashed = pr => ({ ...pr, referralHold: ledgerHold({ kind: 'same-head', repo, pr, count: 0, cause: 'derive-crashed',
+    why: 'review paused: the verdict ledger cannot answer for this PR (derive-crashed); an unreadable ledger is a hold, never a release' }) });
+  // One PR that crashes the derive holds that PR, not the whole repo.
+  return prs.map(pr => (!pr || typeof pr !== 'object' ? pr : (() => {
+    try { return decideOne(pr); } catch { return heldCrashed(pr); }
+  })()));
+  function decideOne(pr) {
+    const led = unreadable ? { unreadable, decisions: {}, detail: {} }
+      : ledgerDecisions(events, pr, { repo, sameHeadMaxReviews, now, ...(derive ? { derive } : {}) });
     if (led.unreadable) {
       return { ...pr, referralHold: ledgerHold({ kind: 'same-head', repo, pr, count: 0, cause: led.unreadable,
         why: `review paused: the verdict ledger cannot answer for this PR (${led.unreadable}); an unreadable ledger is a hold, never a release` }) };
     }
+    if (!led.detail.rows) return pr; // no rows for this PR: no evidence either way, today's decision stands
     const old = pr.referralHold ?? null;
     let hold = old;
     if (flipRef) {
-      if (old && old.kind !== 'same-head') hold = null;
       if (led.decisions.referralHold) {
         const n = led.detail.openOnHead.length;
         hold = ledgerHold({ kind: 'referral', repo, pr, count: n,
           why: `review paused: ${n} referrals need a ruling; it resumes on a new push, a ruling, or a send-back` });
+      } else if (old && old.kind !== 'same-head' && covers(led.detail.referralsOnHead, old)) {
+        hold = null;
+        if (!flipSame) {
+          // The guard the referral pause hid: ask today's reader for it, and keep the pause if it cannot be asked.
+          try { hold = sameHeadToday ? sameHeadToday(pr) ?? null : old; } catch { hold = old; }
+        }
       }
     }
     if (flipSame && !(hold && hold.kind !== 'same-head')) {
       hold = led.decisions.sameHeadHold
         ? ledgerHold({ kind: 'same-head', repo, pr, count: led.detail.runsOnHead,
           why: `review paused: head ${String(pr.headRefOid).slice(0, 9)} was already reviewed ${led.detail.runsOnHead} time(s) (ledger: ${led.detail.reason}); it resumes on a new push` })
-        : (hold?.kind === 'same-head' ? null : hold);
+        : (hold?.kind === 'same-head' && covers(led.detail.runsOnHead, hold) ? null : hold);
     }
     return { ...pr, referralHold: hold };
-  });
+  }
+}
+
+/** The ledger saw at least as many rows as the pause it would lift counts (and at least one): enough to release on. */
+const covers = (seen, hold) => seen > 0 && (!Number.isFinite(hold?.count) || seen >= hold.count);
+
+/** True when a family's `ledger` setting decides (not just shadows) in this env. */
+export function ledgerDeciding(env = process.env) {
+  try { return FLIPPABLE_FAMILIES.some(f => resolveReadSources(env)[f].effective === 'ledger'); } catch { return false; }
+}
+
+/**
+ * The fail-closed answer for a step that threw: every PR is held when a family is on `ledger`, and the PRs come back
+ * untouched when none is (the default `both` never changes a decision). Never throws.
+ */
+export function failClosedHolds(prs, { repo, env = process.env } = {}) {
+  try {
+    return applyLedgerHolds(prs, null, { repo, sources: resolveReadSources(env), unreadable: 'derive-crashed' });
+  } catch { return prs; }
 }
 
 // ── IO: the read-behind snapshot, and the journal ──────────────────────────────────────────────────────────
@@ -236,10 +284,11 @@ function defaultReadRange(repo, env) {
  * an async one answers with its last completed read and refreshes behind. Never throws.
  * @returns {{status:'ok', rows:object[], at:number} | {status:'unreadable'|'pending', reason:string}}
  */
-export function ledgerSnapshot(repo, { now = Date.now(), env = process.env, read = defaultReadRange } = {}) {
+export function ledgerSnapshot(repo, { now = Date.now(), env = process.env, read = defaultReadRange, fresh = false } = {}) {
   const cur = snapshots.get(repo);
-  const fresh = cur && cur.status !== 'pending' && now - cur.at < SNAPSHOT_TTL_MS;
-  if (!fresh && !cur?.inflight) {
+  if (fresh) return freshSnapshot(repo, cur, { now, env, read });
+  const cached = cur && cur.status !== 'pending' && now - cur.at < SNAPSHOT_TTL_MS;
+  if (!cached && !cur?.inflight) {
     const started = read(repo, env);
     if (started.promise) {
       const entry = { ...(cur ?? { status: 'pending', reason: 'no completed read yet', at: now }), inflight: true };
@@ -252,6 +301,26 @@ export function ledgerSnapshot(repo, { now = Date.now(), env = process.env, read
   const s = snapshots.get(repo);
   if (s.status === 'ok' && now - s.at > SNAPSHOT_MAX_AGE_MS) return { status: 'unreadable', reason: 'snapshot-stale' };
   return s.status === 'ok' ? { status: 'ok', rows: s.rows, at: s.at } : { status: s.status, reason: s.reason };
+}
+/**
+ * A read that DECIDES (`ledger` mode) sees every row written since the last tick: no TTL cache, and a read-behind
+ * answer is by definition older than that, so an async store cannot decide yet (it is unreadable, which holds).
+ * The read still completes in the background, so the shadow's cache stays warm.
+ */
+function freshSnapshot(repo, cur, { now, env, read }) {
+  const behind = { status: 'unreadable', reason: 'async-store-read-behind' };
+  if (cur?.inflight) return behind;
+  const started = read(repo, env);
+  if (started.promise) {
+    snapshots.set(repo, { ...(cur ?? { status: 'pending', reason: 'no completed read yet', at: now }), inflight: true });
+    started.promise.then(
+      r => snapshots.set(repo, settle(r, Date.now())),
+      e => snapshots.set(repo, { status: 'unreadable', reason: `read-rejected: ${oneLine(e)}`, at: Date.now() }));
+    return behind;
+  }
+  const s = settle(started.sync, now);
+  snapshots.set(repo, s);
+  return s.status === 'ok' ? { status: 'ok', rows: s.rows, at: s.at } : { status: 'unreadable', reason: s.reason };
 }
 function settle(r, at) {
   return r?.status === 'ok' && Array.isArray(r.rows) ? { status: 'ok', rows: r.rows, at }
@@ -286,26 +355,29 @@ export function journalChanges(rows, { repo, at = new Date().toISOString(), proc
  * @returns {{prs:object[], summary:object|null}}
  */
 export function ledgerHoldStep(prs, { repo, env = process.env, now = Date.now(), snapshot = ledgerSnapshot,
-  journal = defaultJournalWriter(env), needRuling } = {}) {
+  journal = defaultJournalWriter(env), needRuling, derive, readRuns = readReviewRunEvidence } = {}) {
   const sources = resolveReadSources(env);
   if (READ_SOURCE_FAMILIES.every(f => sources[f].effective === 'labels')) return { prs, summary: null };
   const sameHeadMaxReviews = resolveSameHeadMaxReviews(env);
   let snap;
-  try { snap = snapshot(repo, { now, env }); } catch (e) { snap = { status: 'unreadable', reason: `snapshot-threw: ${oneLine(e)}` }; }
+  const deciding = FLIPPABLE_FAMILIES.some(f => sources[f].effective === 'ledger');
+  try { snap = snapshot(repo, { now, env, ...(deciding ? { fresh: true } : {}) }); } catch (e) { snap = { status: 'unreadable', reason: `snapshot-threw: ${oneLine(e)}` }; }
   const events = snap.status === 'ok' ? snap.rows : null;
   let rows = [];
   let error = null;
   try {
-    if (snap.status !== 'pending') rows = compareHolds(prs, events, { repo, sources, sameHeadMaxReviews, now, ...(needRuling ? { needRuling } : {}) });
+    if (snap.status !== 'pending') rows = compareHolds(prs, events, { repo, sources, sameHeadMaxReviews, now, ...(needRuling ? { needRuling } : {}), ...(derive ? { derive } : {}) });
     if (rows.length) journal(journalChanges(rows, { repo, at: new Date(now).toISOString() }));
   } catch (e) { error = `compare: ${oneLine(e)}`; }
   let out = prs;
   try {
-    out = applyLedgerHolds(prs, events, { repo, sources, sameHeadMaxReviews, now,
+    let runs = null; // today's run store, read once and only when a ledger referral release needs the guard it hid
+    out = applyLedgerHolds(prs, events, { repo, sources, sameHeadMaxReviews, now, ...(derive ? { derive } : {}),
+      sameHeadToday: p => decideSameHeadHold(p, runs ??= readRuns(), { repo, env, now }),
       unreadable: snap.status === 'ok' ? null : (snap.status === 'pending' ? 'ledger-read-pending' : `ledger-unreadable:${snap.reason}`) });
   } catch (e) {
     error = `${error ? `${error}; ` : ''}apply: ${oneLine(e)}`;
-    out = applyLedgerHolds(prs, null, { repo, sources, unreadable: 'derive-crashed' });
+    out = failClosedHolds(prs, { repo, env });
   }
   const counted = rows.filter(r => r.agree !== null);
   const summary = { repo, store: snap.status, ...(snap.reason ? { reason: snap.reason } : {}),

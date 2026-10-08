@@ -4,10 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { buildLedgerEvent, EVENT_TYPES } from '../../lib/verdict-ledger.mjs';
+import { derivePrState } from '../../lib/pr-state.mjs';
 import { runReconcilePass, enrichPrsWithLedgerHolds } from '../reconcile-pass.mjs';
 import {
   resolveReadSource, resolveReadSources, compareHolds, applyLedgerHolds, ledgerHoldStep, ledgerSnapshot,
-  journalChanges, resetLedgerSnapshots, renderLedgerShadowSummary, readStoreName, defaultJournalWriter,
+  journalChanges, resetLedgerSnapshots, renderLedgerShadowSummary, readStoreName, defaultJournalWriter, ledgerDeciding,
 } from '../review-hold-ledger-shadow.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -102,9 +103,9 @@ describe('applyLedgerHolds', () => {
     expect(out.referralHold).toMatchObject({ kind: 'same-head', head, count: 1, source: 'ledger' });
     expect(out.referralHold.why).toMatch(/already reviewed 1 time\(s\) \(ledger: 1 completed review run\(s\) on aaaaaaaa \(cap 1\)\)/);
   });
-  it('ledger mode releases a same-head pause the ledger does not see, and leaves a new head free', () => {
+  it('ledger mode releases a same-head pause the ledger saw end (runs under the cap), and leaves a new head free', () => {
     const s = sources({ WE_VERDICT_LEDGER_READ_SOURCE_SAME_HEAD_HOLD: 'ledger' });
-    const [a] = applyLedgerHolds([pr({ referralHold: { kind: 'same-head', head, why: 'old' } })], [], { repo, sources: s, now: at });
+    const [a] = applyLedgerHolds([pr({ referralHold: { kind: 'same-head', head, why: 'old' } })], [run()], { repo, sources: s, now: at, sameHeadMaxReviews: 2 });
     expect(a.referralHold).toBeNull();
     const [b] = applyLedgerHolds([pr({ headRefOid: newHead })], [run(head)], { repo, sources: s, now: at });
     expect(b.referralHold).toBeNull();
@@ -207,3 +208,131 @@ describe('IO: snapshot and journal', () => {
   });
 });
 
+
+describe('review fixes (PR 4495): ledger mode never fails open', () => {
+  const sameLedger = { WE_VERDICT_LEDGER_READ_SOURCE_SAME_HEAD_HOLD: 'ledger' };
+  const refLedger = { WE_VERDICT_LEDGER_READ_SOURCE_REFERRAL_HOLD: 'ledger' };
+  const oldSame = { kind: 'same-head', head, why: 'old' };
+  const oldRef = { kind: 'referral', head, why: 'old' };
+
+  it('a step that throws holds a ledger-mode review; a thrown derive holds and says why; default mode stays unchanged', () => {
+    const logs = [];
+    const prs = [null, pr()];
+    const out = enrichPrsWithLedgerHolds(prs, { repo, env: sameLedger, log: l => logs.push(l), step: () => { throw new Error('boom'); } });
+    expect(out[0]).toBeNull();
+    expect(out[1].referralHold).toMatchObject({ kind: 'same-head', cause: 'derive-crashed', source: 'ledger' });
+    expect(logs[0]).toMatch(/step failed \(ledger families held\): boom/);
+    const same = [pr()];
+    expect(enrichPrsWithLedgerHolds(same, { repo, env: {}, log: () => {}, step: () => { throw new Error('boom'); } })).toBe(same);
+  });
+  it('a thrown derive holds ledger-mode reviews and preserves shadow decisions', () => {
+    const derive = () => { throw new Error('derive exploded'); };
+    const { prs: out, summary } = ledgerHoldStep([pr()], { repo, env: sameLedger, now: at, derive, needRuling: noRuling,
+      snapshot: () => ({ status: 'ok', rows: [run()], at }), journal: () => {} });
+    expect(out[0].referralHold).toMatchObject({ kind: 'same-head', cause: 'derive-crashed' });
+    expect(out[0].referralHold.why).toMatch(/cannot answer/);
+    expect(summary.error).toMatch(/derive exploded/);
+    const { prs: shadow } = ledgerHoldStep([pr()], { repo, env: {}, now: at, derive, needRuling: noRuling,
+      snapshot: () => ({ status: 'ok', rows: [run()], at }), journal: () => {} });
+    expect(shadow[0].referralHold).toBeNull();
+  });
+
+  it('ledger mode: no rows for the PR never releases the hold today\'s reader keeps (and never invents one)', () => {
+    const s = sources(sameLedger);
+    expect(applyLedgerHolds([pr({ referralHold: oldSame })], [], { repo, sources: s, now: at })[0].referralHold).toBe(oldSame);
+    expect(applyLedgerHolds([pr({ referralHold: oldSame })], [{ ...run(), pr: 1 }], { repo, sources: s, now: at })[0].referralHold).toBe(oldSame);
+    expect(applyLedgerHolds([pr()], [], { repo, sources: s, now: at })[0].referralHold).toBeNull();
+    const r = sources(refLedger);
+    expect(applyLedgerHolds([pr({ referralHold: oldRef })], [], { repo, sources: r, now: at })[0].referralHold).toBe(oldRef);
+  });
+  it('ledger mode: rows with no run (or no referral) on THIS head are missing evidence, not a release', () => {
+    expect(applyLedgerHolds([pr({ referralHold: oldSame })], [run(newHead)], { repo, sources: sources(sameLedger), now: at })[0].referralHold).toBe(oldSame);
+    expect(applyLedgerHolds([pr({ referralHold: oldRef })], [run()], { repo, sources: sources(refLedger), now: at,
+      sameHeadToday: () => null })[0].referralHold).toBe(oldRef);
+  });
+  it('ledger mode releases a pause only on ledger evidence (runs under the cap; a closed referral)', () => {
+    const [a] = applyLedgerHolds([pr({ referralHold: oldSame })], [run()], { repo, sources: sources(sameLedger), now: at, sameHeadMaxReviews: 2 });
+    expect(a.referralHold).toBeNull();
+    const [b] = applyLedgerHolds([pr({ referralHold: oldRef })], [referral(), ruling(hashed)], { repo, sources: sources(refLedger), now: at, sameHeadToday: () => null });
+    expect(b.referralHold).toBeNull();
+  });
+
+  it('releasing a ledger referral preserves the default same-head cap', () => {
+    const today = { kind: 'same-head', head, count: 1, why: 'review paused: already reviewed' };
+    const [held] = applyLedgerHolds([pr({ referralHold: oldRef })], [run(), referral(), ruling(hashed)],
+      { repo, sources: sources(refLedger), now: at, sameHeadToday: () => today });
+    expect(held.referralHold).toBe(today);
+    const [noGuard] = applyLedgerHolds([pr({ referralHold: oldRef })], [run(), referral(), ruling(hashed)], { repo, sources: sources(refLedger), now: at });
+    expect(noGuard.referralHold).toBe(oldRef); // the guard cannot be asked: the pause stays
+    const [free] = applyLedgerHolds([pr({ referralHold: oldRef })], [run(), referral(), ruling(hashed)],
+      { repo, sources: sources(refLedger), now: at, sameHeadToday: () => null });
+    expect(free.referralHold).toBeNull();
+  });
+  it('the step asks today\'s run store for the guard when a ledger referral release leaves sameHeadHold in both', () => {
+    const readRuns = () => [{ repo, pr: 3988, head, startedAt: at - 120_000, completedAt: at - 60_000, persistenceFailed: false, rulings: [] }];
+    const opts = { repo, env: refLedger, now: at, needRuling: noRuling, readRuns, snapshot: () => ({ status: 'ok', rows: [run(), referral(), ruling(hashed)], at }), journal: () => {} };
+    const { prs: out } = ledgerHoldStep([pr({ referralHold: oldRef })], opts);
+    expect(out[0].referralHold).toMatchObject({ kind: 'same-head', head });
+  });
+
+  it('empty PR history is journaled as no-ledger-rows and kept out of the agreement counts', () => {
+    const rows = compareHolds([pr()], [], { repo, sources: sources({}), now: at, needRuling: noRuling });
+    expect(rows.find(r => r.family === 'sameHeadHold')).toMatchObject({ old: false, ledger: false, agree: null, cause: 'no-ledger-rows' });
+    expect(rows.find(r => r.family === 'referralHold')).toMatchObject({ agree: null, cause: 'no-ledger-rows' });
+    const { summary } = ledgerHoldStep([pr()], { repo, env: {}, now: at, snapshot: () => ({ status: 'ok', rows: [], at }), journal: () => {}, needRuling: noRuling });
+    expect(summary).toMatchObject({ agree: 0, disagree: 0 });
+    expect(summary.causes['sameHeadHold:no-ledger-rows']).toBe(1);
+  });
+
+  it('ledger mode reads fresh: a run row written after the last tick is seen on the next one', () => {
+    const rowsNow = [run(newHead)];
+    let reads = 0;
+    const read = () => { reads++; return { sync: { status: 'ok', rows: [...rowsNow] } }; };
+    const opts = { repo, env: sameLedger, needRuling: noRuling, journal: () => {}, snapshot: (r, o) => ledgerSnapshot(r, { ...o, read }) };
+    expect(ledgerHoldStep([pr()], { ...opts, now: at }).prs[0].referralHold).toBeNull();
+    rowsNow.push(run(head, 5)); // the review that tick N dispatched has completed
+    expect(ledgerHoldStep([pr()], { ...opts, now: at + 1000 }).prs[0].referralHold).toMatchObject({ kind: 'same-head', count: 1 });
+    expect(reads).toBe(2);
+    const both = { ...opts, env: {} };
+    ledgerHoldStep([pr()], { ...both, now: at + 2000 });
+    expect(reads).toBe(2); // the shadow keeps the cached read
+  });
+  it('a fresh read from an async store is read-behind, so it cannot decide', async () => {
+    const read = () => ({ promise: Promise.resolve({ status: 'ok', rows: [run()] }) });
+    expect(ledgerSnapshot(repo, { now: at, read, fresh: true })).toEqual({ status: 'unreadable', reason: 'async-store-read-behind' });
+    await new Promise(r => setTimeout(r, 0));
+    expect(ledgerSnapshot(repo, { now: Date.now(), read, fresh: true })).toEqual({ status: 'unreadable', reason: 'async-store-read-behind' });
+    expect(ledgerSnapshot(repo, { now: Date.now(), read })).toMatchObject({ status: 'ok' }); // the shadow still reads behind
+  });
+});
+
+describe('review fixes (PR 4495), self-review variants', () => {
+  const sameLedger = { WE_VERDICT_LEDGER_READ_SOURCE_SAME_HEAD_HOLD: 'ledger' };
+  const refLedger = { WE_VERDICT_LEDGER_READ_SOURCE_REFERRAL_HOLD: 'ledger' };
+  it('a release needs the ledger to have seen at least as many rows as the pause counts', () => {
+    const oldSame = { kind: 'same-head', head, count: 2, why: 'old' };
+    const [a] = applyLedgerHolds([pr({ referralHold: oldSame })], [run()], { repo, sources: sources(sameLedger), now: at, sameHeadMaxReviews: 2 });
+    expect(a.referralHold).toBe(oldSame); // today counts 2 runs, the ledger saw 1
+    const [b] = applyLedgerHolds([pr({ referralHold: { ...oldSame, count: 1 } })], [run()], { repo, sources: sources(sameLedger), now: at, sameHeadMaxReviews: 2 });
+    expect(b.referralHold).toBeNull();
+    const oldRef = { kind: 'referral', head, count: 3, why: 'old' };
+    const [c] = applyLedgerHolds([pr({ referralHold: oldRef })], [referral(), ruling(hashed)], { repo, sources: sources(refLedger), now: at, sameHeadToday: () => null });
+    expect(c.referralHold).toBe(oldRef); // 3 pending referrals today, 1 in the ledger
+  });
+  it('one PR that crashes the derive holds that PR only', () => {
+    const derive = (events, facts, ...rest) => { if (facts.pr === 7) throw new Error('bad pr'); return derivePrState(events, facts, ...rest); };
+    const out = applyLedgerHolds([pr({ number: 7 }), pr()], [run(newHead)], { repo, sources: sources(sameLedger), now: at, derive });
+    expect(out[0].referralHold).toMatchObject({ kind: 'same-head', cause: 'derive-crashed' });
+    expect(out[1].referralHold).toBeNull();
+  });
+  it('a stray VITEST in the environment never switches a deciding ledger family off', () => {
+    const logs = [];
+    const out = enrichPrsWithLedgerHolds([pr()], { repo, env: { ...sameLedger, VITEST: 'true' }, log: l => logs.push(l) });
+    expect(out).toHaveLength(1);
+    expect(logs[0]).toMatch(/^ledger-shadow web-everything\/web-everything: store /); // the default step ran under VITEST
+    expect(ledgerDeciding({})).toBe(false);
+    expect(ledgerDeciding(sameLedger)).toBe(true);
+    const same = [pr()];
+    expect(enrichPrsWithLedgerHolds(same, { repo, env: { VITEST: 'true' } })).toBe(same);
+  });
+});
