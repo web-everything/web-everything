@@ -20,8 +20,10 @@ const sendBack = (payload = {}) => event('send-back', { cause: 'block-ruling', .
 const review = (payload = {}) => event('review-run', { headSha: head, phase: 'completed', at: late, ...payload });
 const referral = (payload = {}) => event('referral', { headSha: head, findingKeys: ['raw key'], at: late, ...payload });
 const verdict = (payload = {}) => parseLedgerEvents(JSON.stringify(buildVerdictRecord({ ...base, headSha: head, verdict: 'accepted', at: late, ...payload })))[0];
-const plan = (over = {}) => planRulingBackfill({ homeRows: [ruling()], gitRows: [], openPrs: new Set([7]), since, threadKeys: new Map(), ...over });
+const plan = (over = {}) => planRulingBackfill({ homeRows: [ruling()], gitRows: [], openPrs: new Set([7]), since, threadRulings: new Map(), ...over });
 const skipped = reason => [{ pr: 7, type: 'ruling', at, reason }];
+// The thread entries a posted ruling comment yields: the raw key and the result the operator ruled.
+const posted = (row, key = 'raw key') => new Map([[row.pr, [{ key, result: row.ruling }]]]);
 
 describe('planRulingBackfill', () => {
   it('hashes raw keys and preserves source, actor, writer, timestamp and ruling', () => {
@@ -34,17 +36,17 @@ describe('planRulingBackfill', () => {
     const original = ruling({ findingKey: key });
     expect(original.findingKey).toHaveLength(200);
     expect(original.findingKey.endsWith('…')).toBe(true);
-    const result = plan({ homeRows: [original], threadKeys: new Map([[7, [key, key]]]) });
+    const result = plan({ homeRows: [original], threadRulings: new Map([[7, [{ key, result: 'block' }, { key, result: 'block' }]]]) });
     expect(result.append[0].findingKey).toBe(ledgerFindingKey(key));
   });
 
   it('recovers full whitespace-bearing keys even without truncation', () => {
     const key = ' raw\n\tkey ';
-    expect(plan({ threadKeys: new Map([[7, [key]]]) }).append[0].findingKey).toBe(ledgerFindingKey(key));
+    expect(plan({ threadRulings: new Map([[7, [{ key, result: 'block' }]]]) }).append[0].findingKey).toBe(ledgerFindingKey(key));
   });
 
   it.each([{ keys: [] }, { keys: ['x'.repeat(210), `${'x'.repeat(209)}y`] }])('skips unresolved or ambiguous truncated keys: $keys', ({ keys }) => {
-    expect(plan({ homeRows: [ruling({ findingKey: 'x'.repeat(210) })], threadKeys: new Map([[7, keys]]) }))
+    expect(plan({ homeRows: [ruling({ findingKey: 'x'.repeat(210) })], threadRulings: new Map([[7, keys.map(key => ({ key, result: 'block' }))]]) }))
       .toEqual({ append: [], skipped: skipped('key-truncated-unresolved') });
   });
 
@@ -74,6 +76,53 @@ describe('planRulingBackfill', () => {
 
   it.each([referral(), referral({ findingKeys: [ledgerFindingKey('raw key')] }), verdict()])('skips a ruling superseded by $type', row => {
     expect(plan({ gitRows: [row] })).toEqual({ append: [], skipped: skipped('out-of-order') });
+  });
+
+  it.each([
+    ['not-real', 'block', 'raw key'], ['block', 'not-real', 'raw key'], ['card', 'block', 'raw key'],
+    ['not-real', 'block', ledgerFindingKey('raw key')], ['block', 'not-real', ledgerFindingKey('raw key')],
+  ])('skips a %s ruling superseded by a later git %s ruling for the same finding (%s)', (homeResult, gitResult, gitKey) => {
+    const row = ruling({ ruling: homeResult });
+    expect(plan({ homeRows: [row], gitRows: [ruling({ ruling: gitResult, findingKey: gitKey, at: late })], threadRulings: posted(row) }))
+      .toEqual({ append: [], skipped: skipped('out-of-order') });
+  });
+
+  it('keeps a ruling when the later git ruling names a different finding or another PR', () => {
+    expect(plan({ gitRows: [ruling({ findingKey: 'other key', at: late })] }).append).toHaveLength(1);
+    expect(plan({ gitRows: [ruling({ pr: 8, at: late })] }).append).toHaveLength(1);
+  });
+
+  it('keeps a ruling that is later than the git ruling for the same finding', () => {
+    expect(plan({ homeRows: [ruling({ at: late })], gitRows: [ruling({ ruling: 'not-real', at: early })], threadRulings: posted(ruling({ at: late })) }).append).toHaveLength(1);
+  });
+
+  it('treats an equal-timestamp git ruling for the same finding as already-in-git, never appended', () => {
+    expect(plan({ gitRows: [ruling({ ruling: 'not-real' })] })).toEqual({ append: [], skipped: skipped('already-in-git') });
+  });
+
+  it.each(['not-real', 'card'])('skips an unposted %s ruling that no thread comment backs', result => {
+    const row = ruling({ ruling: result, findingKey: ledgerFindingKey('raw key') });
+    expect(plan({ homeRows: [row], threadRulings: new Map() })).toEqual({ append: [], skipped: skipped('unposted') });
+    expect(plan({ homeRows: [row], threadRulings: new Map([[7, []]]) })).toEqual({ append: [], skipped: skipped('unposted') });
+  });
+
+  it.each([
+    ['another finding', { key: 'other', result: 'not-real' }],
+    ['a different result for the finding', { key: 'raw key', result: 'block' }],
+    ['another PR', null],
+  ])('does not let a thread entry for %s back a clearing ruling', (_, entry) => {
+    const threadRulings = new Map([[entry ? 7 : 8, [entry ?? { key: 'raw key', result: 'not-real' }]]]);
+    expect(plan({ homeRows: [ruling({ ruling: 'not-real' })], threadRulings })).toEqual({ append: [], skipped: skipped('unposted') });
+  });
+
+  it('keeps a clearing ruling a thread comment backs, raw or hashed in the home row', () => {
+    const threadRulings = new Map([[7, [{ key: 'raw key', result: 'not-real' }]]]);
+    expect(plan({ homeRows: [ruling({ ruling: 'not-real' })], threadRulings }).append).toHaveLength(1);
+    expect(plan({ homeRows: [ruling({ ruling: 'not-real', findingKey: ledgerFindingKey('raw key') })], threadRulings }).append).toHaveLength(1);
+  });
+
+  it('does not require a thread comment for a block ruling', () => {
+    expect(plan({ threadRulings: new Map() }).append).toHaveLength(1);
   });
 
   it.each([review(), referral({ findingKeys: ['unrelated'] }), verdict({ verdict: 'changes' }), verdict({ pr: 8 }), referral({ at })])('allows unrelated or non-later rows: %j', row => {
@@ -110,7 +159,7 @@ function io(over = {}) {
     repos: [repo], since,
     readHome: vi.fn(() => [ruling(), sendBack()]), resolveBoard: vi.fn(() => '/board'),
     readGit: vi.fn(() => ({ status: 'ok', rows: [] })), listOpenPrs: vi.fn(() => [7]),
-    readThreadKeys: vi.fn(() => []), appendGit: vi.fn(rows => ({ ok: true, appended: rows.length })), ...over,
+    readThreadRulings: vi.fn(() => []), appendGit: vi.fn(rows => ({ ok: true, appended: rows.length })), ...over,
   };
 }
 
@@ -120,8 +169,8 @@ describe('main', () => {
     expect(await main(options)).toEqual({ exitCode: 0, results: [{ repo, mode: 'dry-run', candidates: 2, append: 2, skipped: {}, appended: 0 }] });
     expect(options.appendGit).not.toHaveBeenCalled();
     expect(options.readGit).toHaveBeenCalledWith({ board: '/board', repo });
-    expect(options.readThreadKeys).toHaveBeenCalledTimes(1);
-    expect(options.readThreadKeys).toHaveBeenCalledWith(repo, 7);
+    expect(options.readThreadRulings).toHaveBeenCalledTimes(1);
+    expect(options.readThreadRulings).toHaveBeenCalledWith(repo, 7);
   });
 
   it('applies once with all planned rows', async () => {
@@ -136,8 +185,20 @@ describe('main', () => {
   it('fetches thread keys only once per eligible raw-key PR', async () => {
     const options = io({ readHome: () => [ruling(), ruling({ at: late }), ruling({ pr: 8 }), ruling({ at: '2026-10-07T00:00:00Z' }), ruling({ pr: 9, findingKey: ledgerFindingKey('key') }), sendBack({ pr: 10 })], listOpenPrs: () => [7, 9, 10] });
     await main(options);
-    expect(options.readThreadKeys).toHaveBeenCalledTimes(1);
-    expect(options.readThreadKeys).toHaveBeenCalledWith(repo, 7);
+    expect(options.readThreadRulings).toHaveBeenCalledTimes(1);
+    expect(options.readThreadRulings).toHaveBeenCalledWith(repo, 7);
+  });
+
+  it('fetches the thread for a hashed clearing ruling and appends only the one a comment backs', async () => {
+    const hashedKey = ledgerFindingKey('raw key');
+    const options = io({
+      apply: true, listOpenPrs: () => [7, 9],
+      readHome: () => [ruling({ ruling: 'not-real', findingKey: hashedKey }), ruling({ pr: 9, ruling: 'not-real', findingKey: hashedKey })],
+      readThreadRulings: vi.fn((_, pr) => (pr === 7 ? [{ key: 'raw key', result: 'not-real' }] : [])),
+    });
+    const result = await main(options);
+    expect(options.readThreadRulings).toHaveBeenCalledTimes(2);
+    expect(result.results[0]).toMatchObject({ append: 1, appended: 1, skipped: { unposted: 1 } });
   });
 
   it('does not append an empty plan and aggregates skipped reasons', async () => {
@@ -166,7 +227,7 @@ describe('main', () => {
   });
 
   it('fails closed on a thread read error and continues other repos', async () => {
-    const options = io({ apply: true, repos: [repo, 'other/repo'], readThreadKeys: () => { throw new Error('comments unavailable'); } });
+    const options = io({ apply: true, repos: [repo, 'other/repo'], readThreadRulings: () => { throw new Error('comments unavailable'); } });
     const result = await main(options);
     expect(result.exitCode).toBe(1);
     expect(result.results.map(r => r.status)).toEqual(['error', 'error']);

@@ -4,8 +4,10 @@
  *   (`ops/review-requests`). Until card x89y6dn, `record-referral-ruling` wrote those rows to the home file only, and
  *   stored the raw finding key. This copies rows for OPEN PRs since `--since` (default: today, ET), hashing each key
  *   the way referral rows do (a key the row builder truncated is recovered from the PR's ruling comments). The derive
- *   reads in append order, so a row whose meaning would change by landing after later git rows is skipped as
- *   `out-of-order`, never reordered. Dry-run by default; `--apply` appends through the git store contract.
+ *   reads in append order, so a row whose meaning would change by landing after later git rows (a later referral,
+ *   clearing verdict, or ruling for the same finding) is skipped as `out-of-order`, never reordered. A clearing
+ *   ruling (`not-real` / `card`) is copied only when the PR thread carries a ruling comment for the same key and
+ *   result; otherwise it is skipped as `unposted`. Dry-run by default; `--apply` appends through the git store contract.
  */
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -18,6 +20,7 @@ import { readOperatorRulings } from '../lib/jury-core.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 
+const CLEARING_RULINGS = new Set(['not-real', 'card']);
 const hashed = key => /^sha256:[0-9a-f]{64}$/.test(key);
 const oneLine200 = value => {
   const s = String(value ?? '').replace(/\s+/g, ' ').trim();
@@ -35,18 +38,23 @@ function headAt(rows) {
   return head;
 }
 
-export function planRulingBackfill({ homeRows, gitRows, openPrs, since, threadKeys = new Map() }) {
+/**
+ * `threadRulings` maps a PR number to the rulings its public thread comments carry (`{ key, result }`, the raw key as
+ * the comment states it). A clearing ruling is only copied when a comment backs that exact key AND result.
+ */
+export function planRulingBackfill({ homeRows, gitRows, openPrs, since, threadRulings = new Map() }) {
   const append = [], skipped = [];
   const candidates = candidatesFor(homeRows, openPrs, since).sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
   for (const row of candidates) {
     const { pr, type, at } = row;
     const skip = reason => skipped.push({ pr, type, at, reason });
+    const thread = threadRulings.get(pr) ?? [];
     let findingKey;
     if (type === 'ruling') {
       const fk = row.findingKey;
       if (hashed(fk)) findingKey = fk;
       else {
-        const matches = [...new Set((threadKeys.get(pr) ?? []).filter(k => k === fk || oneLine200(k) === fk))];
+        const matches = [...new Set(thread.map(t => t.key).filter(k => k === fk || oneLine200(k) === fk))];
         if (matches.length === 1) findingKey = ledgerFindingKey(matches[0]);
         else if (!fk.endsWith('…')) findingKey = ledgerFindingKey(fk);
         else { skip('key-truncated-unresolved'); continue; }
@@ -56,11 +64,19 @@ export function planRulingBackfill({ homeRows, gitRows, openPrs, since, threadKe
       (type === 'ruling' ? ledgerFindingKey(other.findingKey) === findingKey : other.cause === row.cause))) {
       skip('already-in-git'); continue;
     }
+    // The live path writes the row before it posts the comment, so a clearing row can exist with no public ruling.
+    // `block` is fail-safe (it only holds), so only the closed clearing set needs a comment naming the same key and result.
+    if (type === 'ruling' && CLEARING_RULINGS.has(row.ruling) &&
+      !thread.some(t => t.result === row.ruling && ledgerFindingKey(t.key) === findingKey)) {
+      skip('unposted'); continue;
+    }
     const history = gitRows.filter(other => other.pr === pr);
     let outOfOrder;
     if (type === 'ruling') {
+      // A later row for the same finding replaces its state in the derive's append-order fold, so landing this one after it would undo it.
       outOfOrder = history.some(other => Date.parse(other.at) > Date.parse(at) &&
         ((other.type === 'referral' && other.findingKeys.some(k => ledgerFindingKey(k) === findingKey)) ||
+          (other.type === 'ruling' && ledgerFindingKey(other.findingKey) === findingKey) ||
           (other.type === 'verdict' && verdictClears(other.verdict))));
     } else {
       const before = headAt(history.filter(other => Date.parse(other.at) <= Date.parse(at)));
@@ -100,7 +116,7 @@ export async function main({
   readHome: home = readHome,
   readGit = ctx => getLedgerStore('git').read(ctx),
   listOpenPrs = repo => ghJson(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '500', '--json', 'number']).map(pr => pr.number),
-  readThreadKeys = (repo, pr) => readOperatorRulings(readCompletePrComments(pr, { repo })).rulings.map(r => r.key),
+  readThreadRulings = (repo, pr) => readOperatorRulings(readCompletePrComments(pr, { repo })).rulings.map(r => ({ key: r.key, result: r.result })),
   appendGit = (rows, ctx) => getLedgerStore('git').append(rows, ctx),
   resolveBoard = repo => resolveLedgerBoard(repo, {}, process.env),
 } = {}) {
@@ -124,11 +140,13 @@ export async function main({
       const openPrs = new Set(await listOpenPrs(repo));
       const candidates = candidatesFor(homeRows, openPrs, since);
       result.candidates = candidates.length;
-      const threadKeys = new Map();
-      for (const pr of new Set(candidates.filter(row => row.type === 'ruling' && !hashed(row.findingKey)).map(row => row.pr))) {
-        threadKeys.set(pr, await readThreadKeys(repo, pr));
+      // Raw keys need the thread to recover the full key; clearing rulings need it to prove a comment was posted.
+      const threadRulings = new Map();
+      const needsThread = row => row.type === 'ruling' && (!hashed(row.findingKey) || CLEARING_RULINGS.has(row.ruling));
+      for (const pr of new Set(candidates.filter(needsThread).map(row => row.pr))) {
+        threadRulings.set(pr, await readThreadRulings(repo, pr));
       }
-      const plan = planRulingBackfill({ homeRows, gitRows: git.rows, openPrs, since, threadKeys });
+      const plan = planRulingBackfill({ homeRows, gitRows: git.rows, openPrs, since, threadRulings });
       result.append = plan.append.length;
       for (const { reason } of plan.skipped) result.skipped[reason] = (result.skipped[reason] ?? 0) + 1;
       if (apply && plan.append.length) {
