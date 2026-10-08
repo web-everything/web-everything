@@ -53,6 +53,9 @@ describe('wrappedArgvFromBg', () => {
       expect(argv[argv.indexOf(flag) + 1]).toBe(value);
     }
     expect(argv).toContain('-p');
+    // a --bg session runs in permission mode auto; -p must keep it (live-caught: ci-heal-4453 denied at step 0)
+    expect(argv[argv.indexOf('--permission-mode') + 1]).toBe('auto');
+    expect(wrappedArgvFromBg(['--bg', '--permission-mode', 'acceptEdits', 'P'], { sessionId: SESSION_ID }).filter((a) => a === '--permission-mode')).toHaveLength(1);
     expect(argv).toContain('--json-schema');
     expect(JSON.parse(argv[argv.indexOf('--json-schema') + 1])).toEqual(expect.any(Object));
     expect(argv.at(-1).startsWith('PROMPT')).toBe(true);

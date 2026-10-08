@@ -7,7 +7,8 @@
  * run-to-completion `claude -p` launch and starts it through `launchDetached`, so:
  *
  *  - the argv keeps every flag the old launch had (`-n`, `--settings`, `--append-system-prompt-file`, `--model`,
- *    `--effort`, any extra args) and gains `-p --session-id <minted uuid> --output-format json --json-schema`;
+ *    `--effort`, any extra args) and gains `-p --session-id <minted uuid> --permission-mode auto --output-format json
+ *    --json-schema` (`auto` is the mode a `--bg` session runs in; see {@link wrappedArgvFromBg});
  *    the prompt gains the one-paragraph structured-output suffix. `--session-id` matters: the agent's own
  *    `completion-cli report` stamps `CLAUDE_CODE_SESSION_ID`, which then equals the id on the wrapper's record
  *    (probed live 2026-10-08), so the existing owner rule (#4306) accepts the agent's reports;
@@ -75,8 +76,16 @@ export function wrappedArgvFromBg(bgArgv, { sessionId } = {}) {
   if (typeof sessionId !== 'string' || !/^[0-9a-f-]{36}$/i.test(sessionId)) throw new TypeError('operations: wrappedArgvFromBg needs a uuid sessionId');
   const prompt = String(bgArgv.at(-1));
   const flags = bgArgv.slice(1, -1);
-  return withStructuredOutput(['--session-id', sessionId, ...flags, `${prompt}${STRUCTURED_OUTPUT_SUFFIX}`]);
+  // A `--bg` session runs in permission mode `auto` (its transcript says `"permissionMode":"auto"`); `claude -p` starts
+  // in `default` and DENIES every command not on the allow list. Live-caught on the edge (ci-heal-4453, 2026-10-08):
+  // the first wrapped ci-heal was refused `gh pr view` and `completion-cli report` and stopped at step 0 with a
+  // permission-wall blocker. Keep the mode the `--bg` launch had, unless the caller set one explicitly.
+  const mode = flags.some((f) => f === '--permission-mode' || String(f).startsWith('--permission-mode=')) ? [] : ['--permission-mode', BG_PERMISSION_MODE];
+  return withStructuredOutput(['--session-id', sessionId, ...mode, ...flags, `${prompt}${STRUCTURED_OUTPUT_SUFFIX}`]);
 }
+
+/** The permission mode a `claude --bg` session runs in, which the wrapped `claude -p` launch must keep. */
+export const BG_PERMISSION_MODE = 'auto';
 
 /** Where `launchDetached` writes a spec (owner-only; the wrapper deletes it once read). Beside the completions dir. */
 export function defaultWorkerSpecDir(completionsDir = resolveCompletionsDir()) {
