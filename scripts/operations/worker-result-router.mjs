@@ -18,9 +18,10 @@
  */
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { ENVELOPE_ROLES, ENVELOPE_SOURCES, sanitizeDeniedCommand } from './completion-record.mjs';
+import { COMPLETION_RECORD_V2, ENVELOPE_ROLES, ENVELOPE_SOURCES, redactFreeText, sanitizeDeniedCommand } from './completion-record.mjs';
 import {
   BLOCKER_KINDS, CONTRACT_VIOLATION_KIND, abortedOutcome, guardBlockerKind, mapLegacyOutcome, parseWorkerResult, unparseableOutcome,
   validateWorkerResult,
@@ -28,19 +29,25 @@ import {
 import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 
 /**
- * The envelope writer's redaction pass (S1 stored these fields as data after the length caps; the card says the
- * envelope writer owns redacting them at the single write point). One line each, token-like text removed, HTML
- * comment delimiters and backticks gone, @mentions defanged. Returns a copy; routes on none of it.
+ * The envelope writer's redaction pass: EVERY free-text field in the schema (S1 stored them as data after the length
+ * caps; the card makes the envelope writer own redaction at the single write point). One line each, token-like text
+ * removed, HTML comment delimiters and backticks gone, @mentions defanged. Returns a copy; nothing routes on it.
+ * `deniedCommand` was already redacted by the S1 reader; it goes through the same pass again here.
  */
 export function redactResultText(result) {
   const r = structuredClone(result);
-  const clean = (v, max) => sanitizeDeniedCommand(v, max) ?? '';
+  const clean = redactFreeText;
   r.summary = clean(r.summary, 280);
+  r.findingsAddressed = (r.findingsAddressed ?? []).map((f) => ({ ...f, ref: clean(f.ref, 300), note: clean(f.note, 300) }));
+  r.filesTouched = (r.filesTouched ?? []).map((x) => clean(x, 300));
+  if (r.learning) r.learning = { ...r.learning, summary: clean(r.learning.summary, 600), area: clean(r.learning.area, 200), suggestion: clean(r.learning.suggestion, 600) };
   if (r.blocker) {
     const b = r.blocker;
+    b.component = clean(b.component, 120);
     b.evidence = { text: clean(b.evidence.text, 2000), refs: b.evidence.refs.map((x) => clean(x, 300)) };
-    if (b.proposedFix) b.proposedFix = { ...b.proposedFix, summary: clean(b.proposedFix.summary, 400) };
+    if (b.proposedFix) b.proposedFix = { ...b.proposedFix, summary: clean(b.proposedFix.summary, 400), scope: b.proposedFix.scope.map((x) => clean(x, 300)) };
     if (b.ruling) b.ruling = { question: clean(b.ruling.question, 600), options: b.ruling.options.map((o) => clean(o, 400)), recommendation: clean(b.ruling.recommendation, 600) };
+    if (b.deniedCommand != null) b.deniedCommand = sanitizeDeniedCommand(b.deniedCommand);
   }
   return r;
 }
@@ -76,6 +83,15 @@ export function settleWorkerResult({ role, launcher, value, text, reason, aborte
 }
 
 // ── 2. blocker.kind -> action ───────────────────────────────────────────────────────────────────────────────────
+
+/** The operator's operations directory (114: `~/workspace/.operations`). `WE_OPERATIONS_DIR` overrides it. */
+export function defaultOperationsDir(env = process.env) {
+  return env.WE_OPERATIONS_DIR && env.WE_OPERATIONS_DIR.trim() ? env.WE_OPERATIONS_DIR.trim() : join(homedir(), 'workspace', '.operations');
+}
+/** The shared 114 drafts store: `<operations>/drafts` (one `cards/<signatureKey>.json` per signature; 117 S6 shares it). */
+export function defaultDraftsDir(env = process.env) {
+  return join(defaultOperationsDir(env), 'drafts');
+}
 
 /** Where a product-fix draft goes. D3: a draft in the shared 114 store, under `postmortem.mode`. */
 export const POSTMORTEM_MODES = Object.freeze(['off', 'draft', 'file']);
@@ -176,9 +192,12 @@ function operatorAction(result, ctx) {
 }
 
 /**
- * The old free outcome word for a result, so readers that have not migrated keep working. A blocked result maps
- * back to the word the reconciler special-cases today; success shapes are `done` / `no-change` / `not-applicable`.
- * An unparseable result is `blocked`: never a success word (the reconciler treats unknown words as done).
+ * The old free outcome word for a result, so readers that have not migrated keep working. Every word returned is part of
+ * the briefs' OWN vocabulary (`LEGACY_OUTCOME_MAP`; a test pins that), so an unmigrated reader sees exactly what it saw
+ * when the agent wrote the word itself. Those readers special-case only `blocked-on-infra`, `blocked-on-permission`,
+ * `blocked-on-load-flake` and the ci-heal escalation words and count the rest as done, TODAY, for agent-written words
+ * too: no new hazard, and the v2 `result`/`action` are the fail-closed truth for any reader that has migrated. An
+ * unparseable result is `blocked`; an operator stop is `aborted` (the operator wants it stopped, so "done" is right).
  */
 export function legacyOutcomeWord(result) {
   if (!result) return null;
@@ -229,7 +248,7 @@ function legacyResult({ outcome, kind, retryable }, record, source) {
  */
 export function envelopeFromLegacy(record, source, ctx = {}) {
   if (!ENVELOPE_SOURCES.includes(source) || source === 'worker-result' || source === 'none') throw new TypeError(`operations: not a legacy source ${JSON.stringify(source)}`);
-  if (record?.v === 2) return record;
+  if (record?.v === COMPLETION_RECORD_V2) return record;
   const role = ENVELOPE_ROLES.includes(record.kind) ? record.kind : (ctx.role ?? (source === 'legacy-delivery-report' ? 'build' : 'fix'));
   const launcher = ctx.launcher ?? 'claude-p';
   const env = {

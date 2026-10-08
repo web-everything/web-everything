@@ -1467,7 +1467,8 @@ export async function runAgentToCompletion(
     run: runFn = run,
     loadItems,
     isLaneCommitAhead = laneHasCommitAhead,
-    readEnvelopeRecord = (session) => { try { return tryReadCompletion(session); } catch { return null; } },
+    // off unless the knob is on, so the resume path is unchanged when it is off
+    readEnvelopeRecord = (session) => { if (!workerWrapperEnabled()) return null; try { return tryReadCompletion(session); } catch { return null; } },
   } = {},
 ) {
   // #3383 mechanical-dispatcher fix — read back from the SAME lane-scoped directory the provider itself just

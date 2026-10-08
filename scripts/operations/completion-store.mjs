@@ -19,7 +19,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, w
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
-import { assertCompletionRecord, isValidSessionSlug, parseCompletionRecord, serializeCompletionRecord } from './completion-record.mjs';
+import { COMPLETION_RECORD_V2, assertCompletionRecord, isValidSessionSlug, parseCompletionRecord, serializeCompletionRecord } from './completion-record.mjs';
 import { envelopeFromLegacy } from './worker-result-router.mjs';
 import { tryReadDeliveryReport } from './delivery-report-store.mjs';
 import { tryReadFixReport } from './fix-report-store.mjs';
@@ -306,11 +306,10 @@ export function createFileCompletionStore(dir = resolveCompletionsDir()) {
  */
 export function readEnvelope(session, dirs = {}) {
   const rec = tryReadCompletion(session, dirs.completions ?? resolveCompletionsDir());
-  if (rec) return rec.v === COMPLETION_RECORD_V2_VALUE ? rec : envelopeFromLegacy(rec, 'legacy-completion');
+  if (rec) return rec.v === COMPLETION_RECORD_V2 ? rec : envelopeFromLegacy(rec, 'legacy-completion');
   const delivery = dirs.deliveryReports === null ? null : tryReadDeliveryReport(session, dirs.deliveryReports);
   if (delivery) return envelopeFromLegacy(delivery, 'legacy-delivery-report');
   const fix = dirs.fixReports === null ? null : tryReadFixReport(session, dirs.fixReports);
   if (fix) return envelopeFromLegacy(fix, 'legacy-fix-report');
   return null;
 }
-const COMPLETION_RECORD_V2_VALUE = 2;

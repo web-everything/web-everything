@@ -27,19 +27,18 @@
  * so the tests run it against a fake child. The CLI at the bottom runs a JSON spec detached.
  */
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { sanitizeDeniedCommand, finishEnvelopeRecord, newEnvelopeRecord } from './completion-record.mjs';
+import { finishEnvelopeRecord, isValidSessionSlug, newEnvelopeRecord, redactFreeText } from './completion-record.mjs';
 import { resolveCompletionsDir, withCompletionLock, writeCompletion } from './completion-store.mjs';
 import { WORKER_RESULT_SCHEMA } from './worker-result.mjs';
 import {
-  envelopeFromLegacy, legacyOutcomeWord, resolvePostmortemMode, routeWorkerResult, settleWorkerResult, writeProductFixDraft,
+  defaultDraftsDir, defaultOperationsDir, envelopeFromLegacy, legacyOutcomeWord, resolvePostmortemMode, routeWorkerResult, settleWorkerResult,
+  writeProductFixDraft,
 } from './worker-result-router.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
-
-const HERE = dirname(fileURLToPath(import.meta.url));
 
 /** The knob. `WE_WORKER_WRAPPER=on` routes a migrated launcher through this wrapper; anything else is the old path, byte for byte. */
 export const WORKER_WRAPPER_ENV = 'WE_WORKER_WRAPPER';
@@ -211,27 +210,24 @@ export async function runWorker(spec, io = {}) {
       const killed = failure && (failure.killed || failure.signal);
       const reason = failure ? (killed ? 'timeout' : 'ended-without-result') : extracted.reason;
       settled = settleWorkerResult({
-        role: spec.role, launcher: spec.launcher, reason, prose: [extracted.prose, failure ? sanitizeDeniedCommand(String(failure.message ?? '')) : ''].filter(Boolean).join(' | '),
+        role: spec.role, launcher: spec.launcher, reason, prose: [extracted.prose, failure ? redactFreeText(String(failure.message ?? ''), 300) : ''].filter(Boolean).join(' | '),
       });
     }
   }
 
   // 3. route, write, and make the draft
-  const mode = POSTMORTEM(spec);
+  const mode = spec.postmortemMode ?? resolvePostmortemMode({ env: process.env, operationsDir: spec.operationsDir ?? defaultOperationsDir() });
   const action = routeWorkerResult(settled.result, { role: spec.role, launcher: spec.launcher, session: spec.session, pr: spec.pr == null ? null : String(spec.pr), item: spec.item == null ? null : String(spec.item), postmortemMode: mode });
   const finished = finishEnvelopeRecord(started, {
     result: settled.result, parse: settled.parse, action, outcome: legacyOutcomeWord(settled.result), reroute: settled.reroute,
     headAfter: head(), source: settled.source ?? (gotResult ? 'worker-result' : 'none'),
   }, now);
   withCompletionLock(spec.session, () => writeRecord(finished, dir), { dir });
-  if (action.type === 'product-fix-draft' && spec.draftsDir) {
-    try { writeDraft(action, { dir: spec.draftsDir, now }); } catch { /* the envelope is the record of truth; a draft failure must not lose it */ }
+  if (action.type === 'product-fix-draft') {
+    // the shared 114 drafts store unless the spec names another; mode `off` writes nothing (the router put the mode on the action)
+    try { writeDraft(action, { dir: spec.draftsDir ?? defaultDraftsDir(), now }); } catch { /* the envelope is the record of truth; a draft failure must not lose it */ }
   }
   return { envelope: finished, result: settled.result, action, legacyRecord, stdout, stderr };
-}
-
-function POSTMORTEM(spec) {
-  return spec.postmortemMode ?? resolvePostmortemMode({ env: process.env, operationsDir: spec.operationsDir ?? null });
 }
 
 // ── detached launch + CLI ───────────────────────────────────────────────────────────────────────────────────────
@@ -244,10 +240,14 @@ function POSTMORTEM(spec) {
  */
 export function launchDetached(spec, { specDir, spawnFn = spawn, nodePath = process.execPath, entry = fileURLToPath(import.meta.url) } = {}) {
   if (!specDir) throw new TypeError('operations: launchDetached needs specDir');
-  mkdirSync(specDir, { recursive: true });
+  if (!isValidSessionSlug(spec?.session)) throw new TypeError(`operations: launchDetached: invalid session slug ${JSON.stringify(spec?.session)}`);
+  mkdirSync(specDir, { recursive: true, mode: 0o700 });
   const specFile = join(specDir, `${spec.session}.spec.json`);
-  writeFileSync(specFile, `${JSON.stringify(spec)}\n`);
-  const child = spawnFn(nodePath, [entry, `--spec=${specFile}`], { detached: true, stdio: 'ignore', env: process.env });
+  // The spec file never carries `env` (it can hold tokens): the detached child inherits the launcher's environment
+  // instead. Owner-only permissions; the child deletes it once read.
+  const { env: _env, ...safe } = spec;
+  writeFileSync(specFile, `${JSON.stringify(safe)}\n`, { mode: 0o600 });
+  const child = spawnFn(nodePath, [entry, `--spec=${specFile}`], { detached: true, stdio: 'ignore', env: spec.env ?? process.env });
   child.unref?.();
   return { wrapperPid: child.pid, specFile };
 }
@@ -257,7 +257,9 @@ if (IS_CLI) {
   const arg = process.argv.slice(2).find((a) => a.startsWith('--spec='));
   if (!arg) { process.stderr.write('usage: worker-wrapper.mjs --spec=<file.json>\n'); process.exitCode = 2; } else {
     try {
-      const spec = JSON.parse(readFileSync(arg.slice('--spec='.length), 'utf8'));
+      const specFile = arg.slice('--spec='.length);
+      const spec = JSON.parse(readFileSync(specFile, 'utf8'));
+      if (spec.deleteSpec !== false) { try { rmSync(specFile, { force: true }); } catch { /* best effort */ } }
       const { envelope } = await runWorker(spec);
       process.stdout.write(`${JSON.stringify({ session: envelope.session, outcome: envelope.outcome, action: envelope.action?.type, parse: envelope.parse })}\n`);
     } catch (e) {
@@ -267,4 +269,3 @@ if (IS_CLI) {
   }
 }
 
-export { HERE as WORKER_WRAPPER_DIR };

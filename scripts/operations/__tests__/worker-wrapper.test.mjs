@@ -3,7 +3,7 @@
  * These run the wrapper against REAL child processes (node -e), so pid, stdin and timeout are proven, not mocked.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -186,12 +186,39 @@ describe('detached launch', () => {
     expect(JSON.parse(readFileSync(r.specFile, 'utf8')).session).toBe('build-4001');
   });
 
-  it('the CLI runs a spec file to completion and leaves the v2 record (a real child process)', () => {
+  it('the CLI runs a spec file to completion, leaves the v2 record and deletes the spec (a real child process)', () => {
     const s = spec();
     const specFile = join(s.completionsDir, 'spec.json');
     writeFileSync(specFile, JSON.stringify(s));
     const out = execFileSync(process.execPath, [join(process.cwd(), 'scripts/operations/worker-wrapper.mjs'), `--spec=${specFile}`], { encoding: 'utf8' });
     expect(JSON.parse(out)).toMatchObject({ session: 'build-4001', outcome: 'done', action: 'done' });
     expect(read(s)).toMatchObject({ v: 2, status: 'done' });
+    expect(existsSync(specFile)).toBe(false);
+  });
+
+  it('the spec file never carries env (it can hold tokens), is owner-only, and an invalid session slug is refused', () => {
+    const specDir = tmp();
+    const calls = [];
+    const r = launchDetached(spec({ env: { GH_TOKEN: 'ghp_abcdefghijklmnop12345' } }), { specDir, spawnFn: (c, a, o) => { calls.push(o); return { pid: 1, unref() {} }; } });
+    const text = readFileSync(r.specFile, 'utf8');
+    expect(text).not.toContain('ghp_');
+    expect(JSON.parse(text).env).toBeUndefined();
+    expect(statSync(r.specFile).mode & 0o777).toBe(0o600);
+    expect(calls[0].env.GH_TOKEN).toBe('ghp_abcdefghijklmnop12345'); // the child inherits it through its environment, not a file
+    expect(() => launchDetached(spec({ session: '../escape' }), { specDir })).toThrow(/invalid session slug/);
+  });
+
+  it('with no draftsDir in the spec, a draft goes to the shared 114 store under WE_OPERATIONS_DIR/drafts', async () => {
+    const ops = tmp();
+    const prev = process.env.WE_OPERATIONS_DIR;
+    process.env.WE_OPERATIONS_DIR = ops;
+    try {
+      const s = spec({ argv: printing(claudeStdout(BLOCKED('tooling-defect'))) });
+      delete s.draftsDir;
+      await runWorker(s);
+      expect(listDraftKeys(join(ops, 'drafts'))).toHaveLength(1);
+    } finally {
+      if (prev === undefined) delete process.env.WE_OPERATIONS_DIR; else process.env.WE_OPERATIONS_DIR = prev;
+    }
   });
 });

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { BLOCKER_KINDS, ROLES } from '../worker-result.mjs';
+import { BLOCKER_KINDS, LEGACY_OUTCOME_MAP, ROLES, mapLegacyOutcome } from '../worker-result.mjs';
 import { ENVELOPE_ROLES } from '../completion-record.mjs';
 import {
   ACTION_TYPES, DRAFT_KINDS, blockerSignature, draftKeyFor, legacyOutcomeWord, listDraftKeys, redactResultText, resolvePostmortemMode,
@@ -135,6 +135,38 @@ describe('legacyOutcomeWord (the way back for unmigrated readers)', () => {
     expect(legacyOutcomeWord(done())).toBe('done');
     expect(legacyOutcomeWord(settleWorkerResult({ role: 'fix', launcher: 'agy' }).result)).toBe('blocked');
     expect(legacyOutcomeWord(null)).toBeNull();
+  });
+});
+
+describe('redaction covers every free-text field, not just the ones the card named', () => {
+  const TOKEN = 'ghp_abcdefghijklmnop12345';
+  const leaves = (v, out = []) => { if (typeof v === 'string') out.push(v); else if (v && typeof v === 'object') Object.values(v).forEach((x) => leaves(x, out)); return out; };
+  it('no string leaf of a redacted result keeps a token, wherever the worker put it', () => {
+    const dirty = blocked({
+      kind: 'needs-ruling', component: `registry ${TOKEN}`, evidence: { text: `e ${TOKEN}`, refs: [`log ${TOKEN}`] },
+      proposedFix: { summary: `s ${TOKEN}`, scope: [`we:scripts/x.mjs ${TOKEN}`], size: 1 },
+      ruling: { question: `q ${TOKEN}`, options: [`a ${TOKEN}`, `b ${TOKEN}`], recommendation: `r ${TOKEN}` },
+    });
+    dirty.summary = `sum ${TOKEN}`;
+    dirty.filesTouched = [`a.mjs ${TOKEN}`];
+    dirty.findingsAddressed = [{ ref: `F1 ${TOKEN}`, disposition: 'fixed', note: `n ${TOKEN}` }];
+    dirty.learning = { kind: 'friction', summary: `l ${TOKEN}`, area: `a ${TOKEN}`, suggestion: `g ${TOKEN}` };
+    const clean = redactResultText(dirty);
+    expect(leaves(clean).filter((x) => x.includes(TOKEN))).toEqual([]);
+    expect(clean.blocker.component).toContain('registry');
+  });
+});
+
+describe('legacyOutcomeWord only speaks the briefs own vocabulary', () => {
+  it('every word it can return is a LEGACY_OUTCOME_MAP key, a bare blocked, or a success/stop word', () => {
+    const allowed = new Set([...Object.keys(LEGACY_OUTCOME_MAP), 'blocked', 'aborted']);
+    for (const kind of BLOCKER_KINDS) expect(allowed.has(legacyOutcomeWord(blocked({ kind }))), kind).toBe(true);
+    for (const o of ['done', 'no-change', 'not-applicable', 'aborted', 'unparseable']) expect(allowed.has(legacyOutcomeWord({ outcome: o })), o).toBe(true);
+  });
+  it('a blocked kind maps back to the same kind through mapLegacyOutcome (the word loses nothing the reconciler needs)', () => {
+    for (const kind of BLOCKER_KINDS.filter((k) => k !== 'spec-defect')) {
+      expect(mapLegacyOutcome(legacyOutcomeWord(blocked({ kind })))?.kind, kind).toBe(kind === 'needs-ruling' ? 'needs-ruling' : kind);
+    }
   });
 });
 

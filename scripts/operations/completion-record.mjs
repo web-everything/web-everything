@@ -152,6 +152,14 @@ export function sanitizeDeniedCommand(value, maxLength = DENIED_MAX_LENGTH) {
   return s;
 }
 
+/**
+ * Redact generic free text (a worker's summary, evidence, learning) with the same pass `denied` gets: one line, token-like
+ * text removed, HTML-comment delimiters and backticks gone, @mentions defanged, capped at `maxLength`. Pure.
+ */
+export function redactFreeText(value, maxLength) {
+  return sanitizeDeniedCommand(value, maxLength) ?? '';
+}
+
 /** The only `cause` a `blocked-on-infra` report may carry: a temporary GitHub failure (5xx, timeout, reset). */
 export const INFRA_CAUSE_TRANSIENT = 'transient';
 /** `cause` is agent-supplied: only the known value survives, anything else becomes null. Pure. */

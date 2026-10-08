@@ -4110,6 +4110,51 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
     expect(typeof wio.legacyRead).toBe('function');
   });
 
+  it('knob ON: the child goes through io.spawnAgent (so GH_TOKEN stripping and the worker marker still apply) and gets the pid-capturing spawn hook', async () => {
+    const stdout = JSON.stringify({ type: 'result', structured_output: DONE });
+    const dir = mkdtempSync(join(tmpdir(), 's3a-'));
+    const prev = process.env.OPERATION_COMPLETIONS_DIR;
+    process.env.OPERATION_COMPLETIONS_DIR = dir;
+    try {
+      const io = fakeIo({ workerWrapper: true, spawnAgent: vi.fn(async () => ({ stdout, stderr: '' })) });
+      await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, io);
+      expect(io.spawnAgent).toHaveBeenCalledTimes(1);
+      const [, opts, spawnIo] = io.spawnAgent.mock.calls[0];
+      expect(opts.env.WE_DISPATCH_KIND).toBe('delivery');
+      expect(opts.stdio).toEqual(['ignore', 'pipe', 'pipe']); // stdin closed
+      expect(typeof spawnIo.spawnFn).toBe('function'); // the wrapper's pid hook rides through the adapter
+    } finally {
+      if (prev === undefined) delete process.env.OPERATION_COMPLETIONS_DIR; else process.env.OPERATION_COMPLETIONS_DIR = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('resume reads a finished v2 envelope ONLY when the knob is on (the resume path is unchanged when off)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 's3a-'));
+    const prevDir = process.env.OPERATION_COMPLETIONS_DIR;
+    const prevKnob = process.env.WE_WORKER_WRAPPER;
+    process.env.OPERATION_COMPLETIONS_DIR = dir;
+    try {
+      writeFileSync(join(dir, 'conveyor-1234.json'), JSON.stringify({
+        v: 2, session: 'conveyor-1234', kind: 'build', role: 'build', launcher: 'claude-p', model: null, pr: null, item: '1234', status: 'done', outcome: 'done',
+        verdict: null, label: null, runId: null, sessionId: null, headBefore: null, headAfter: null, pid: 1, timeoutMs: 1000, deadlineAt: null, parse: { ok: true, reason: null },
+        result: DONE, action: { type: 'done' }, reroute: null, source: 'worker-result', startedAt: '2026-10-08T10:00:00.000Z', endedAt: '2026-10-08T10:01:00.000Z', updatedAt: '2026-10-08T10:01:00.000Z',
+      }));
+      const args = [
+        { item: '1234', sessionSlug: 'conveyor-1234', lane: 7, attemptTag: '', provider: { spawn: vi.fn() }, claudeSessionId: 'x', resume: true },
+        { readReport: () => null, resolveLane: () => '/fake/pool/lane-7', isLaneCommitAhead: () => true },
+      ];
+      delete process.env.WE_WORKER_WRAPPER;
+      await expect(runAgentToCompletion(...args)).rejects.toThrow(/nothing to resume from/);
+      process.env.WE_WORKER_WRAPPER = 'on';
+      await expect(runAgentToCompletion(...args)).resolves.toMatchObject({ status: 'done', outcome: 'done', filesTouched: ['a.mjs'] });
+    } finally {
+      if (prevDir === undefined) delete process.env.OPERATION_COMPLETIONS_DIR; else process.env.OPERATION_COMPLETIONS_DIR = prevDir;
+      if (prevKnob === undefined) delete process.env.WE_WORKER_WRAPPER; else process.env.WE_WORKER_WRAPPER = prevKnob;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('knob ON, resumed turn: --resume is kept and the schema is on it too (D7: resume with the schema)', async () => {
     const runWorkerFn = vi.fn(async () => ({ envelope: { v: 2 } }));
     await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, resumeSessionId: 'abc-resume' }, fakeIo({ workerWrapper: true, runWorkerFn }));
