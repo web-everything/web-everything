@@ -156,7 +156,7 @@ import { ADVISORY_LABELS, latestAdvisory, advisoryCoversHead } from '../lib/advi
 // which would "repair" code that was never broken. `isPrCiFailureOwedRerun` is the PURE leaf that decides this
 // (see its own docblock for the full incident and the two facts it needs); this file only calls it.
 import {
-  isPrCiFailureOwedRerun, isMainFixedSignatureOwed, isMainGreenFixOwed, countRebaseOntoMainComments, DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
+  isPrCiFailureOwedRerun, classifyMainDefect, isMainFixedSignatureOwed, isMainGreenFixOwed, countRebaseOntoMainComments, DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
   // landing-freeze fix (2026-09-27) — used only to word the `owed-ci-rerun` refusal's `why` accurately when
   // THIS path (not the red-window one) is what actually granted it; see that function's own docblock.
   classifyCiFailureAttribution,
@@ -2021,12 +2021,15 @@ export function planReconcile({
         mergeBaseRunConclusion: base.mergeBaseRunConclusion,
         mainFixedSignature: base.mainFixedSignature,
       })) {
-        const viaMainGreen = classifyCiFailureAttribution({
-          failureCompletedAt: base.requiredCheckCompletedAt, mainRedWindows,
-        }) !== 'main-red';
-        const viaSignature = viaMainGreen && isMainFixedSignatureOwed(base.mainFixedSignature)
-          && !isMainGreenFixOwed({ ...base, failingCheckName: base.requiredCheckName, mainLatestCheckRuns, failureCompletedAt: base.requiredCheckCompletedAt,
-            comments: pr?.comments, headSha: pr?.headRefOid });
+        // ONE shared classifier — `via` names why (same call the ci-red-recovery-watch makes).
+        const viaClass = classifyMainDefect({
+          comments: pr?.comments, headSha: pr?.headRefOid, requiredCheckCompletedAt: base.requiredCheckCompletedAt,
+          mainRedWindows, failingCheckName: base.requiredCheckName, mainLatestCheckRuns,
+          prContainsMainGreenSha: base.prContainsMainGreenSha, mergeBaseCheckRuns: base.mergeBaseCheckRuns,
+          mergeBaseRunConclusion: base.mergeBaseRunConclusion, mainFixedSignature: base.mainFixedSignature,
+        });
+        const viaMainGreen = viaClass.via !== 'red-window';
+        const viaSignature = viaClass.via === 'signature';
         refuse('owed-ci-rerun', {
           ...withPhase,
           why: viaSignature

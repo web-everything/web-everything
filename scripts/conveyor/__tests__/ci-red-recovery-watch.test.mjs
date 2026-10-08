@@ -109,7 +109,7 @@ describe('ci-red-recovery-watch — a daemon-soak-only red PR with NO red window
   });
 
   // PR #2793 review — the acting pass must not rebase a plain PR-owned failure behind a healthy main.
-  it('refuses own-failure (no rebase, no comment read) when daemon-soak was already green at the PR\'s merge base', () => {
+  it('refuses own-failure (no rebase; comments ARE read so a recorded main-defect escalation could be seen, xh3ghy1) when daemon-soak was already green at the PR\'s merge base', () => {
     const readComments = vi.fn(() => []);
     const result = sweepCiRedRecovery({
       readOpenPrs: () => [stuckPr], readMainRuns: () => [], readAheadBy: () => 5, readComments,
@@ -122,7 +122,7 @@ describe('ci-red-recovery-watch — a daemon-soak-only red PR with NO red window
     });
     expect(result.refusals).toEqual([expect.objectContaining({ prNumber: 2748, kind: 'own-failure' })]);
     expect(result.dispatch).toEqual([]);
-    expect(readComments).not.toHaveBeenCalled();
+    expect(readComments).toHaveBeenCalled();
   });
 
   it('reads main\'s run list ONCE and hands it to readMainLatestCheckRuns (no second gh run list)', () => {

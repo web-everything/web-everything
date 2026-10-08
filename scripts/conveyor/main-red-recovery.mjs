@@ -461,16 +461,54 @@ export function isPrCiFailureOwedRerun({
   prContainsMainGreenSha = null, mergeBaseCheckRuns = null, mergeBaseRunConclusion = null,
   comments = [], headSha = null, prScopedChecks = resolvePrScopedChecks(), mainFixedSignature = null,
 } = {}) {
-  // A PR-scoped check (DEFAULT_PR_SCOPED_CHECKS) fails on the PR's own content — a rebase never clears it.
-  if (failingCheckName && prScopedChecks.includes(failingCheckName)) return false;
   const behind = Number.isFinite(aheadBy) ? aheadBy : null;
   if (behind === 0) return false; // already current — neither path below can still owe a rerun (point 2).
+  return classifyMainDefect({
+    requiredCheckCompletedAt, mainRedWindows, failingCheckName, mainLatestCheckRuns, prContainsMainGreenSha,
+    mergeBaseCheckRuns, mergeBaseRunConclusion, comments, headSha, prScopedChecks, mainFixedSignature,
+  }).mainDefect;
+}
+
+/**
+ * we:scripts/conveyor/main-red-recovery.mjs#classifyMainDefect — THE ONE classifier of "is this PR's red MAIN's
+ * own defect (owed a mechanical refresh onto main) or the PR's own (owed a ci-heal)?". PURE. Both the fix daemon
+ * (`reconcile-core.mjs`, via {@link isPrCiFailureOwedRerun}) and `ci-red-recovery-watch.mjs`
+ * ({@link planMainRedRebases}) call exactly this, so they can never disagree about who owns a PR (LIVE
+ * 2026-10-08, #4368: the daemon said "owed a rebase", the watch said "own failure, owed a ci-heal", each sending
+ * the PR to the other). A red is main's defect when ANY of: (red-window) it failed inside a recorded red-`main`
+ * window; (green-fix) the check now passes on main's latest run with positive evidence — which includes a
+ * head-scoped escalation that recorded "main's own defect" (`escalation: true`); (signature) its error
+ * signatures were fixed on main.
+ * @returns {{mainDefect:boolean, via:('red-window'|'green-fix'|'signature'|null), escalation:boolean,
+ *   attribution:('main-red'|'own-failure'|'unknown'|null)}}
+ */
+export function classifyMainDefect({
+  requiredCheckCompletedAt = null, mainRedWindows = [], failingCheckName = null, mainLatestCheckRuns = null,
+  prContainsMainGreenSha = null, mergeBaseCheckRuns = null, mergeBaseRunConclusion = null,
+  comments = [], headSha = null, prScopedChecks = resolvePrScopedChecks(), mainFixedSignature = null,
+} = {}) {
+  const none = { mainDefect: false, via: null, escalation: false, attribution: null };
+  // A PR-scoped check (DEFAULT_PR_SCOPED_CHECKS) fails on the PR's own content — a rebase never clears it.
+  if (failingCheckName && prScopedChecks.includes(failingCheckName)) return none;
   const attribution = classifyCiFailureAttribution({ failureCompletedAt: requiredCheckCompletedAt, mainRedWindows });
-  if (attribution === 'main-red') return true;
-  return isMainGreenFixOwed({
+  if (attribution === 'main-red') return { mainDefect: true, via: 'red-window', escalation: false, attribution };
+  const escalation = Boolean(mainDefectEscalationForHead(comments, headSha));
+  if (isMainGreenFixOwed({
     failingCheckName, mainLatestCheckRuns, prContainsMainGreenSha, mergeBaseCheckRuns, mergeBaseRunConclusion,
     comments, headSha, failureCompletedAt: requiredCheckCompletedAt,
-  }) || isMainFixedSignatureOwed(mainFixedSignature);
+  })) return { mainDefect: true, via: 'green-fix', escalation, attribution };
+  if (isMainFixedSignatureOwed(mainFixedSignature)) return { mainDefect: true, via: 'signature', escalation, attribution };
+  return { ...none, attribution };
+}
+
+/**
+ * we:scripts/conveyor/main-red-recovery.mjs#classifierNeedsComments — does {@link classifyMainDefect} need the
+ * PR's comment thread (to see a recorded main-defect escalation)? Shared by every IO shell so none of them gates
+ * the comment read on a private signal (the watch gated it on a `needs-human` label it never fetched, so it
+ * never saw #4368's escalation). True whenever main's check is green and the PR lacks that green commit.
+ */
+export function classifierNeedsComments({ failingCheckName = null, mainLatestCheckRuns = null, prContainsMainGreenSha = null } = {}) {
+  return prContainsMainGreenSha === false && isMainLatestCheckGreen({ failingCheckName, mainLatestCheckRuns });
 }
 
 /**
@@ -533,17 +571,17 @@ export function planMainRedRebases({
       refusals.push({ ...base, kind: 'own-failure', why: `PR #${prNumber}'s failing check \`${base.failingCheckName}\` is PR-scoped (judges the PR's own content) — a rebase onto main never clears it; owed a ci-heal` });
       continue;
     }
-    const attribution = classifyCiFailureAttribution({ failureCompletedAt: base.failureCompletedAt, mainRedWindows });
-    // landing-freeze fix — see this function's own docblock and `isMainGreenFixOwed`'s (PR #2793 review: main
-    // green alone is not proof; the candidate must carry the per-PR merge-base / containment evidence too).
-    const mainGreenForCheck = attribution !== 'main-red' && isMainGreenFixOwed({
-      failingCheckName: base.failingCheckName, mainLatestCheckRuns, comments: c?.comments, headSha: base.headSha,
-      prContainsMainGreenSha: c?.prContainsMainGreenSha ?? null, mergeBaseCheckRuns: c?.mergeBaseCheckRuns ?? null,
-      mergeBaseRunConclusion: c?.mergeBaseRunConclusion ?? null, failureCompletedAt: base.failureCompletedAt,
+    // ONE shared classifier (classifyMainDefect) — the same call the fix daemon's isPrCiFailureOwedRerun makes.
+    const cls = classifyMainDefect({
+      requiredCheckCompletedAt: base.failureCompletedAt, mainRedWindows, failingCheckName: base.failingCheckName,
+      mainLatestCheckRuns, prContainsMainGreenSha: c?.prContainsMainGreenSha ?? null,
+      mergeBaseCheckRuns: c?.mergeBaseCheckRuns ?? null, mergeBaseRunConclusion: c?.mergeBaseRunConclusion ?? null,
+      comments: c?.comments, headSha: base.headSha, prScopedChecks, mainFixedSignature: c?.mainFixedSignature,
     });
-
-    const mainFixed = attribution !== 'main-red' && !mainGreenForCheck && isMainFixedSignatureOwed(c.mainFixedSignature);
-    if (attribution !== 'main-red' && !mainGreenForCheck && !mainFixed) {
+    const attribution = cls.attribution;
+    const mainGreenForCheck = cls.via === 'green-fix';
+    const mainFixed = cls.via === 'signature';
+    if (!cls.mainDefect) {
       refusals.push({
         ...base, kind: attribution === 'unknown' ? 'unknown-attribution' : 'own-failure',
         why: attribution === 'unknown'
@@ -578,7 +616,7 @@ export function planMainRedRebases({
     // could retry every tick forever exactly like the pre-fix hung-CI cancel/rerun could.
     const rebaseAttempts = Number.isFinite(c?.rebaseAttemptsForSha) ? c.rebaseAttemptsForSha : 0;
     // xo7mr6l: a main-defect-escalated PR gets ONE refresh per main recovery (knob WE_MAIN_DEFECT_REBASES_PER_SHA).
-    const capForPr = mainGreenForCheck && mainDefectEscalationForHead(c?.comments, base.headSha)
+    const capForPr = mainGreenForCheck && cls.escalation
       ? mainDefectRebaseCap : maxRebaseRetriesPerSha;
     if (rebaseAttempts >= capForPr) {
       refusals.push({
