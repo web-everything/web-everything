@@ -104,6 +104,8 @@ import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 import { latestCiHealEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { readLiveFixClaim } from './fix-procedure.mjs';
 import { enrichPrsWithReferralHolds } from './review-referral-hold.mjs';
+import { ledgerHoldStep, renderLedgerShadowSummary } from './review-hold-ledger-shadow.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
 import { enrichPrsWithScopeBloat } from './scope-bloat.mjs';
 import { ignoredRulings, resolveCountInfraStalls } from '../lib/ruling-ledger.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
@@ -1220,6 +1222,25 @@ export function enrichPrsWithCodeQL(prs, { repo = null, exec = (file, args) => e
 }
 
 /**
+ * Ledger plan slice H (card xqh3tkh): run the ledger hold step over the PRs `enrichReferralHolds` just decided.
+ * In the default `both` mode it only journals and logs; a family set to `ledger` decides from the ledger. It never
+ * throws (the step returns the PRs untouched on any failure). Off under a test run: the step reads a real store.
+ */
+export function enrichPrsWithLedgerHolds(prs, { repo, now = Date.now(), env = process.env, step = ledgerHoldStep,
+  log = (line) => console.error(line) } = {}) {
+  if ((isUnderTest(env) || isUnderTest()) && step === ledgerHoldStep) return prs; // an injected env never re-arms it
+  try {
+    const { prs: out, summary } = step(prs, { repo, now, env });
+    const line = renderLedgerShadowSummary(summary);
+    if (line) log(line);
+    return out;
+  } catch (e) {
+    log(`ledger-shadow ${repo}: step failed (decisions unchanged): ${String(e?.message ?? e).split('\n')[0]}`);
+    return prs;
+  }
+}
+
+/**
  * we:scripts/conveyor/reconcile-pass.mjs#runReconcilePass — read, decide, return. Every reader is injectable, so
  * the whole shell is exercisable with no network and no credential.
  * @param {{readPrs?:Function, readAgents?:Function, enrich?:Function, enrichMainRed?:Function,
@@ -1240,6 +1261,10 @@ export function runReconcilePass({
   enrichFixClaims = enrichPrsWithFixClaims,
   enrichTimeouts = enrichPrsWithTimeoutEvidence,
   enrichReferralHolds = enrichPrsWithReferralHolds,
+  // Ledger plan slice H (card xqh3tkh): the same hold decisions derived from the verdict ledger, per family
+  // (`verdictLedger.readSource.<family>`, default `both` = shadow: today's decision stands and disagreements are
+  // journaled). Injectable like every other enrich step; see {@link enrichPrsWithLedgerHolds}.
+  enrichLedgerHolds = enrichPrsWithLedgerHolds,
   enrichRulings = enrichPrsWithIgnoredRulings,
   enrichScopeBloat = enrichPrsWithScopeBloat, // card x29vm8a
   enrichCodeQL = enrichPrsWithCodeQL, // card x8cnbii — the drain's CodeQL hold is owed a ci-heal
@@ -1292,8 +1317,8 @@ export function runReconcilePass({
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
   const fixerLadder = loadLadder();
   if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
-  const prs = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
-    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
+  const prs = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
+    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
     { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch });
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
