@@ -275,7 +275,7 @@ function resumeSwap(fs, p, dryRun) {
     const info = interruptedSwap(fs, p); // re-read under the lock: the other run may have finished it
     if (!info) return { status: 'refused', reason: 'clone-missing' };
     linkClone(fs, p);
-    fs.rmSync(intentFile(p), { force: true });
+    try { fs.rmSync(intentFile(p), { force: true }); } catch { /* the swap is done; the next run drops it */ }
     return { status: 'migrated', name: basename(p.logical), v0: info.v0, legacy: info.legacy, moved: info.moved, steps: ['swapped'], resumed: true };
   } finally { lock.release(); }
 }
@@ -332,13 +332,16 @@ async function migrateInner({ clone, settings, dryRun = false, force = false, de
   // Down before the first rename: a kill from here on is undone by the next run from this file alone.
   const intent = { paths: stateNow, exclude: stateNow.map(path => `/${path}`).filter(line => !haveLines.includes(line)), home: homeBefore, stale: existing, parked: [] };
   writeIntent(fs, p, intent);
+  let swapped = false;
   try {
     fs.mkdirSync(p.root, { recursive: true });
     if (!stat(fs, join(p.repo, 'HEAD'))) {
       git(dirname(p.logical), ['clone', '--bare', '--quiet', '--', p.logical, p.repo]);
-      git(p.repo, ['remote', 'set-url', '--', 'origin', originUrl]);
       steps.push('repo.git');
     }
+    // Also for a repo.git kept from an earlier migrate: the clone's origin may have changed since, and every later
+    // fetch (and each version built from this repo) follows this url.
+    git(p.repo, ['remote', 'set-url', '--', 'origin', originUrl]);
     git(p.repo, ['fetch', '--quiet', '--no-tags', '--', p.logical, '+HEAD:refs/migrate/base']);
     // State first: rename (atomic, same volume), then link back so the live daemon keeps writing to the same
     // place. Done before the build so the version's state links resolve while its smoke runs.
@@ -382,6 +385,8 @@ async function migrateInner({ clone, settings, dryRun = false, force = false, de
     // Injected by the CLI: daemon-version.mjs is the entry module there, and importing it back would deadlock.
     const buildVersion = deps.buildVersion ?? (await import('./daemon-version.mjs')).buildVersion;
     const built = await buildVersion({ clone: p.logical, home: dirname(p.root), sha, settings: on, force: true, repo: p.repo, deps: deps.buildDeps });
+    // A reused v0 was built under the origin of an earlier migrate: bring it in line with repo.git (a built one copied it).
+    if (built.status === 'reused') git(built.dir, ['remote', 'set-url', '--', 'origin', originUrl]);
     const record = built.status === 'reused' ? JSON.parse(fs.readFileSync(join(built.dir, '.version.json'), 'utf8')) : built;
     if (record.status !== 'built') { rollback(); return { status: 'refused', reason: 'smoke-failed', id: record.id, smoke: record.smoke?.smoke?.results?.filter(r => !r.ok), steps }; }
     steps.push(`v0 ${record.id}`);
@@ -406,11 +411,15 @@ async function migrateInner({ clone, settings, dryRun = false, force = false, de
       try { fs.renameSync(legacy, p.logical); } catch (restoreError) { error.cloneAtLegacy = legacy; error.rollbackError = restoreError; }
       throw error;
     }
+    // From here the clone IS the link to `current`: rolling back would move the state out from under the new version
+    // and leave the link dangling, so nothing below may reach the catch's rollback.
+    swapped = true;
     steps.push('swapped');
-    fs.rmSync(intentFile(p), { force: true }); // done: nothing left to undo
+    // Done: nothing left to undo. A leftover intent is harmless (the next migrate sees a symlink and a valid record and drops it).
+    try { fs.rmSync(intentFile(p), { force: true }); } catch { /* dropped by the next run */ }
     return { status: 'migrated', name, v0: record.id, legacy, moved, steps };
   } catch (error) {
-    if (!error.cloneAtLegacy) try { rollback(); } catch (rollbackError) { error.rollbackError = rollbackError; }
+    if (!error.cloneAtLegacy && !swapped) try { rollback(); } catch (rollbackError) { error.rollbackError = rollbackError; }
     throw error;
   }
 }

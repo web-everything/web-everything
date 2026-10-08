@@ -520,6 +520,62 @@ describe('daemon version migrate / unmigrate', () => {
     expect(JSON.parse(readFileSync(join(home, 'daemon', 'migration.json'))).originUrl).toBe(join(ws, 'origin.git'));
   });
 
+  it('a reused repo.git takes the clone\'s current origin, not the one it was first created with', async () => {
+    expect((await migrate({ clone, home, settings, deps })).status).toBe('migrated');
+    expect((await unmigrate({ clone, home, settings, deps })).status).toBe('unmigrated');
+    const moved = join(ws, 'moved-origin.git');
+    fs.renameSync(join(fixture, 'origin.git'), moved);
+    git(clone, 'remote', 'set-url', 'origin', moved);
+    expect((await migrate({ clone, home, settings, deps })).status).toBe('migrated');
+    const repo = join(home, 'daemon', 'repo.git');
+    expect(git(repo, 'config', '--get', 'remote.origin.url')).toBe(moved);
+    expect(() => git(repo, 'ls-remote', '--exit-code', 'origin', 'main')).not.toThrow();
+    // the reused v0 (same commit) follows too, not only repo.git
+    const versions = join(home, 'daemon', 'versions');
+    expect(fs.readdirSync(versions)).toHaveLength(1);
+    expect(git(join(versions, fs.readdirSync(versions)[0]), 'config', '--get', 'remote.origin.url')).toBe(moved);
+    expect(JSON.parse(readFileSync(join(home, 'daemon', 'migration.json'))).originUrl).toBe(moved);
+  });
+
+  it('an error cleaning up after the clone swap landed never rolls the new version back', async () => {
+    // The clone is already the link to `current`; only dropping the finished intent fails.
+    const failing = { ...deps, fs: { ...fs, rmSync: (path, ...rest) => {
+      if (String(path).endsWith('migrate-intent.json') && fs.lstatSync(clone).isSymbolicLink()) throw Object.assign(new Error('EIO'), { code: 'EIO' });
+      return fs.rmSync(path, ...rest);
+    } } };
+    expect(await migrate({ clone, home, settings, deps: failing })).toMatchObject({ status: 'migrated', moved: ['.conveyor', '.operations'] });
+    expect(fs.readlinkSync(clone)).toBe(join('.daemon-clones', 'daemon', 'current'));
+    expect(fs.existsSync(clone)).toBe(true); // the compatibility link still resolves
+    expect(fs.lstatSync(join(clone, '.conveyor')).isSymbolicLink()).toBe(true); // state still lives in state/
+    expect(readFileSync(join(home, 'daemon', 'state', '.conveyor', 'daemon.log'))).toBe('log line\n');
+    expect(fs.existsSync(join(home, 'daemon', 'current'))).toBe(true);
+    expect(fs.existsSync(join(home, 'daemon', 'migration.json'))).toBe(true);
+    // the leftover intent is dropped by the next run, and unmigrate still restores everything
+    expect(await migrate({ clone, home, settings, deps })).toMatchObject({ status: 'refused', reason: 'already-a-symlink' });
+    expect(fs.existsSync(join(home, 'daemon', 'migrate-intent.json'))).toBe(false);
+    expect((await unmigrate({ clone, home, settings, deps })).status).toBe('unmigrated');
+    expect(fs.lstatSync(join(clone, '.conveyor')).isDirectory()).toBe(true);
+  });
+
+  it('an error dropping the intent while finishing an interrupted swap does not undo the finished swap', async () => {
+    const killed = (() => {
+      let dead = false;
+      return { ...deps, fs: Object.fromEntries(Object.entries(fs).map(([k, f]) => [k, typeof f === 'function' ? (...a) => {
+        if (dead) throw new Error('killed');
+        const result = f(...a);
+        if (k === 'renameSync' && /legacy-/.test(a[1])) { dead = true; throw new Error('killed'); }
+        return result;
+      } : f])) };
+    })();
+    await expect(migrate({ clone, home, settings, deps: killed })).rejects.toThrow('killed');
+    const failing = { ...deps, fs: { ...fs, rmSync: (path, ...rest) => {
+      if (String(path).endsWith('migrate-intent.json')) throw Object.assign(new Error('EIO'), { code: 'EIO' });
+      return fs.rmSync(path, ...rest);
+    } } };
+    expect(await migrate({ clone, home, settings, deps: failing })).toMatchObject({ status: 'migrated', resumed: true });
+    expect(fs.existsSync(clone)).toBe(true);
+  });
+
   describe('a kill between the two swap renames (clone aside, link in)', () => {
     // Real death: the first rename lands, then every later filesystem call fails, so no catch/rollback/finally cleanup runs.
     const killAfterClonePark = () => {
