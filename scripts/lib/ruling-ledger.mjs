@@ -264,7 +264,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
         if (s.record.referrals.some((x) => matchesBlock(findingView(x), b))) heads.add(s.record.head);
       }
       worst = Math.max(worst, heads.size);
-      matches.push({ finding: g, ruledFinding: b.source === 'record' ? b.finding : null, ruling: b.ruling, priorHead: b.priorHead,
+      matches.push({ finding: g, runId: record.runId, blockRulingId: b.rulingId ?? null, ruledFinding: b.source === 'record' ? b.finding : null, ruling: b.ruling, priorHead: b.priorHead,
         ruledAt: b.at ? new Date(b.at).toISOString() : null, source: b.source, misses: heads.size });
     }
   }

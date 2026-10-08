@@ -79,7 +79,7 @@ export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = 
     const open = openReferralFindings({ comments: thread.comments, repo, pr: Number(pr), head: thread.headRefOid,
       body: typeof thread.body === 'string' ? thread.body : '', createdAt: thread.createdAt, cardReadable });
     return {
-      head: thread.headRefOid, open: open.open, ruled: open.ruled, malformed: open.malformed,
+      head: thread.headRefOid, open: open.open, ruled: open.ruled, disputed: open.disputed, malformed: open.malformed,
       card: resolveCardRef(card, { root, readable }),
       followUpEnabled: env.WE_REFERRAL_RULING_FOLLOW_UP !== '0',
       now: now(), clearerId: currentActorId(env),

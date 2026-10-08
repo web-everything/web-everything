@@ -52,6 +52,7 @@ import {
   validateOperatorRuling, OPERATOR_RULING_RESULTS, operatorRulingId, sameFindingForClearing,
 } from '../lib/jury-core.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
+import { ignoredRulings } from '../lib/ruling-ledger.mjs';
 
 export const RECORD_REFERRAL_RULING_OP = 'record-referral-ruling';
 export const OPERATOR_RULING_POST_EFFECT = 'github.operator-referral-ruling';
@@ -89,7 +90,23 @@ export function openReferralFindings({ comments, repo, pr, head, body = '', crea
       }
     }
   }
-  return { open, ruled, malformed: state.malformed, pending: state.pending, blocked: state.blocked };
+  // The ruling-dispute's findings (a `block` carried onto this head): valid targets for a superseding ruling even though
+  // the gate holds nothing "open". Each names the standing ruling that IS the disputed block (`blockIds`).
+  const dispute = ignoredRulings({ number: Number(pr), headRefOid: head, body, createdAt, comments });
+  const disputed = [];
+  for (const m of dispute?.matches ?? []) {
+    const hit = ruled.find((r) => r.key === m.finding.key && (!m.runId || r.runId === m.runId))
+      ?? ruled.find((r) => r.key === m.finding.key);
+    const blockIds = m.blockRulingId ? [m.blockRulingId] : [];
+    const base = hit ?? { runId: m.runId, key: m.finding.key, seat: m.finding.seat, file: m.finding.file ?? '',
+      line: Number.isInteger(m.finding.line) ? m.finding.line : null, summary: m.finding.summary ?? '', state: 'ruled',
+      rulingIds: [], standing: [] };
+    if (!base.runId) continue;
+    const rulingIds = [...new Set([...base.rulingIds, ...blockIds])];
+    const standing = [...base.standing, ...blockIds.filter((id) => !base.rulingIds.includes(id)).map((id) => ({ id, result: 'block', source: 'record' }))];
+    disputed.push({ ...base, state: 'disputed', rulingIds, standing, blockIds });
+  }
+  return { open, ruled, disputed, malformed: state.malformed, pending: state.pending, blocked: state.blocked };
 }
 
 const view = (f) => ({ file: f?.finding?.file, line: f?.finding?.line, summary: f?.finding?.summary,
@@ -115,6 +132,11 @@ export function standingRulings(f, record, state) {
     if (same(referralOf(o.runId, o.head, o.key))) add(operatorRulingId(o), o.result, 'operator');
   }
   return [...out.values()];
+}
+
+/** Would `finding` select something in `list`? PURE. */
+function selectsOpen(list, finding) {
+  try { return selectFindings(list ?? [], finding).length > 0; } catch { return false; }
 }
 
 /** Pick the selected open findings. PURE; throws on a selection that names nothing or something not open. */
@@ -183,10 +205,22 @@ export function planOperatorRuling(read, input) {
   if (ruling !== 'card' && read.card) throw new Error('--card applies only to --ruling=card');
   if (read.malformed) throw new Error('the PR thread carries a malformed referral record or ruling; the gate holds it and a ruling cannot repair it');
   const supersedeIds = [...new Set(String(input.supersedes ?? '').split(',').map((x) => x.trim()).filter(Boolean))];
-  const ruled = read.ruled ?? [];
+  // Disputed findings are ruled targets too: merge them over the ruled list (same finding = same runId + key).
+  const ruled = [...(read.ruled ?? []).filter((r) => !(read.disputed ?? []).some((d) => d.runId === r.runId && d.key === r.key)),
+    ...(read.disputed ?? [])];
+  const disputedOf = (o) => (read.disputed ?? []).find((d) => d.runId === o.runId && d.key === o.key);
+  const describe = (r) => `  ${findingLocation(r)} — ${r.summary}\n    standing: ${r.standing.map((x) => `${x.id} (${x.result})`).join(', ')}`
+    + (r.blockIds?.length ? `\n    DISPUTED BLOCK (supersede this one): ${r.blockIds.join(', ')}` : '');
   let selected;
   let supersedesFor = () => [];
-  if (supersedeIds.length) {
+  const autoSupersede = !supersedeIds.length && !selectsOpen(read.open, finding) && (read.disputed ?? []).length
+    && selectsOpen(read.disputed, finding);
+  if (autoSupersede) {
+    // --finding names a disputed finding and no --supersedes: the block it is disputed over is the one to supersede.
+    selected = selectFindings(read.disputed, finding);
+    supersedesFor = (o) => disputedOf(o)?.blockIds ?? [];
+    if (!selected.some((o) => supersedesFor(o).length)) throw new Error('the disputed finding names no block ruling id; pass --supersedes=<id> from the standing list');
+  } else if (supersedeIds.length) {
     const standing = new Set(ruled.flatMap((r) => r.rulingIds));
     const unknown = supersedeIds.filter((id) => !standing.has(id));
     if (unknown.length) throw new Error(`--supersedes ${unknown.join(', ')} names no standing ruling on a finding of the live head (standing ids: ${[...standing].join(', ') || 'none'})`);
@@ -200,7 +234,7 @@ export function planOperatorRuling(read, input) {
     try { selected = selectFindings(read.open, finding); } catch (error) {
       if (!ruled.length) throw error;
       throw new Error(`${error.message}\nFinding(s) on the live head carry a standing ruling, which --finding cannot select. To record a later ruling over one, pass --supersedes=<id> (operator only):\n`
-        + ruled.map((r) => `  ${findingLocation(r)} — ${r.summary}\n    standing: ${r.standing.map((x) => `${x.id} (${x.result})`).join(', ')}`).join('\n'));
+        + ruled.map(describe).join('\n'));
     }
   }
   const record = {
@@ -213,7 +247,8 @@ export function planOperatorRuling(read, input) {
   if (!validateOperatorRuling(record)) throw new Error('the operator ruling record failed validation; nothing posted');
   const followUp = planRulingFollowUp({ open: [...read.open, ...selected.filter((o) => !read.open.some((p) => p.runId === o.runId && p.key === o.key))], selected, ruling, reason, head: read.head,
     enabled: input.sendBack !== false && read.followUpEnabled !== false });
-  return { record, body: buildOperatorRulingComment(record), selected, open: read.open, followUp };
+  return { record, body: buildOperatorRulingComment(record), selected, open: read.open, disputed: read.disputed ?? [],
+    supersedes: record.rulings.flatMap((r) => r.supersedes ?? []), followUp };
 }
 
 export function recordReferralRulingOperation({ readRulingContext } = {}) {
