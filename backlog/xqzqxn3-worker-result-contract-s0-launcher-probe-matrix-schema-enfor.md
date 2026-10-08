@@ -27,7 +27,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — n/a: the probe only reads CLI output it asked for; it never routes on it.
-2. **Truncated reads** — Output is parsed whole; a cut-off or non-JSON result is reported as honored:false with the reason.
+2. **Truncated reads** — Output is parsed whole; a non-JSON first reply (claude -p, agy) is honored:null with the reason, and a result that parses but does not match the schema shape is honored:false.
 3. **Shared state files** — Writes only a temp dir it removes, but the live runs leave session records behind (claude session, ~/.claude/jobs/<id>, a Codex thread, an agy conversation); the header says so.
 4. **Fail closed** — A missing CLI, an unparseable first reply (auth failure) or a first-call timeout is reported per launcher as honored:null with the reason; an unknown --only name exits 2; never reported as success.
 5. **Identity scoping** — n/a: no per-user or per-session identity is used.

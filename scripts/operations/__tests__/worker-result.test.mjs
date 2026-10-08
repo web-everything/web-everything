@@ -98,6 +98,8 @@ describe('validateWorkerResult', () => {
     expect(validateWorkerResult(done({ filesTouched: ['../x'] })).ok).toBe(false);
     expect(validateWorkerResult(blocked({ evidence: { text: 'x'.repeat(2001), refs: [] } })).ok).toBe(false);
     expect(validateWorkerResult(done({ findingsAddressed: [{ ref: '  ', disposition: 'fixed', note: '' }] })).ok).toBe(false);
+    expect(validateWorkerResult(done({ findingsAddressed: [{ ref: 'x'.repeat(301), disposition: 'fixed', note: '' }] })).ok).toBe(false);
+    expect(validateWorkerResult(done({ findingsAddressed: [{ ref: 'F1', disposition: 'fixed', note: 'n'.repeat(301) }] })).ok).toBe(false);
   });
   it('deniedCommand is permission-wall only and is sanitized on the returned copy', () => {
     expect(validateWorkerResult(blocked({ deniedCommand: 'ls' })).ok).toBe(false);
@@ -157,6 +159,8 @@ describe('fail-closed envelope outcomes (D6)', () => {
   it('the prose tail kept as evidence is redacted and single-line (never routed, never a secret)', () => {
     const u = unparseableOutcome({ role: 'fix', launcher: 'codex-exec', reason: 'timeout', prose: 'env dump\nGITHUB_TOKEN=ghp_abcdefghijklmnop1234\ncurl https://u:pw@host/x' });
     expect(u.blocker.evidence.text).not.toMatch(/ghp_|u:pw@/);
+    expect(u.blocker.evidence.text.split('\n').filter((l) => l.startsWith('last prose:'))[0]).not.toMatch(/env dump\n/);
+    expect(u.blocker.evidence.text).not.toMatch(/last prose:[^\n]*\n/);
     expect(u.blocker.evidence.text).toMatch(/reason: timeout/);
   });
   it('an operator stop is aborted and carries no signature, so no product-fix job', () => {

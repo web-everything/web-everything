@@ -185,11 +185,12 @@ const PROBES = {
 export function main(argv = process.argv.slice(2)) {
   const json = argv.includes('--json');
   const only = (argv.find((a) => a.startsWith('--only=')) ?? '').slice(7).split(',').filter(Boolean);
+
+  const unknown = only.filter((n) => !Object.hasOwn(PROBES, n));
+  if (unknown.length) { console.error(`unknown --only name(s): ${unknown.join(', ')} (known: ${Object.keys(PROBES).join(', ')})`); return 2; }
   const dir = mkdtempSync(join(tmpdir(), 'worker-result-probe-'));
   const ctx = { dir, cwd: process.cwd() };
   const results = [];
-  const unknown = only.filter((n) => !Object.hasOwn(PROBES, n));
-  if (unknown.length) { console.error(`unknown --only name(s): ${unknown.join(', ')} (known: ${Object.keys(PROBES).join(', ')})`); return 2; }
   try {
     for (const [name, fn] of Object.entries(PROBES)) {
       if (only.length && !only.includes(name)) continue;
