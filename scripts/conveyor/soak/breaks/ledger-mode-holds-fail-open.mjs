@@ -8,7 +8,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const repo = 'web-everything/web-everything';
+const repo = 'example/ledger-soak'; // the ledger scope string only; the scenario never touches a real repo
 const head = 'a'.repeat(40);
 const other = 'b'.repeat(40);
 const at = Date.parse('2026-10-08T12:00:00Z');
