@@ -1819,14 +1819,20 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
   if (!flags['no-reset'] && !targetWasReserved) {
     // xj1vryw — this process just WON the lane's lease, so it may repair it: a corrupt clone (broken index, missing
     // object, dangling ref) is healed or quarantined + re-provisioned here, so acquire hands out a healthy lane.
-    let health = diagnoseLane(dir);
-    if (!health.ok) {
-      log(`  ⚠ lane-${chosen}: unhealthy clone (${health.problems.join('; ')}) — healing`);
-      healLaneRefs(dir, { log });
-      health = diagnoseLane(dir);
-      if (!health.ok) recloneLane(repo, chosen, health.problems.join('; '));
-    }
+    // LAZY on purpose: the health probe costs ~6 git spawns, so a healthy lane (the common case) never pays for it —
+    // it runs only once the fetch or the pre-reset checks below actually fail with a corruption-shaped error.
     fetchOriginHealing(repo, chosen, { allowReclone: true });
+    const repairUnhealthyClone = () => {
+      let health = diagnoseLane(dir);
+      if (!health.ok) {
+        log(`  ⚠ lane-${chosen}: unhealthy clone (${health.problems.join('; ')}) — healing`);
+        healLaneRefs(dir, { log });
+        health = diagnoseLane(dir);
+        if (!health.ok) recloneLane(repo, chosen, health.problems.join('; '));
+      }
+      fetchOriginHealing(repo, chosen, { allowReclone: true });
+    };
+    const resetToBase = () => {
     // #2924 — re-verify containment on FRESH post-fetch remote-tracking refs, immediately before the
     // destructive reset below. Whatever proved this lane safe to reset — auto-pick's cached-scan candidate
     // check, or nothing at all before #3390's own explicit-lane guard — is up to ~30s stale by the time this line runs
@@ -1879,6 +1885,17 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     acquireResetSnapshots.set(chosen, before);
     git(['checkout', '-B', repo.branch, baseRef, '--quiet', '--force'], dir);
     git(['clean', '-fd', '--quiet'], dir);
+      return { before, baseRef };
+    };
+    let reset;
+    try {
+      reset = resetToBase();
+    } catch (e) {
+      if (!looksLikeCorruption(msgOf(e))) throw e;
+      repairUnhealthyClone();
+      reset = resetToBase();
+    }
+    const { before, baseRef } = reset;
     // #4370 — the reset gets its own journal line NOW (a later deps/registry failure must not lose it).
     journalLaneEvent(dir, {
       action: 'acquire-reset', before, headAfter: laneHead(dir),
