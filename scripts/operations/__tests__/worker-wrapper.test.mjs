@@ -95,6 +95,34 @@ describe('runWorker: the job record and the result channels', () => {
     expect(envelope.action.type).toBe('product-fix-draft');
   });
 
+  it('rejects successful output when the child subsequently fails (valid output x timeout / nonzero exit / signal)', async () => {
+    const out = JSON.stringify(claudeStdout(DONE));
+    const hang = 'setInterval(()=>{},1000)';
+    const cases = {
+      timeout: { argv: ['-e', `process.stdout.write(${out});${hang}`], timeoutMs: 400 },
+      'nonzero exit': { argv: ['-e', `process.stdout.write(${out});process.exitCode=3`] },
+      'signal termination': { argv: ['-e', `process.stdout.write(${out});process.kill(process.pid,'SIGTERM');${hang}`] },
+    };
+    for (const [name, over] of Object.entries(cases)) {
+      const s = spec({ ...over, session: `build-${name.replace(/\W/g, '')}` });
+      const { envelope, result } = await runWorker(s);
+      expect(envelope.parse.ok, name).toBe(false);
+      expect(envelope.outcome, name).not.toBe('done');
+      expect(envelope.action.type, name).not.toBe('done');
+      expect(result.outcome, name).toBe('unparseable');
+      expect(result.blocker.kind, name).toBe('contract-violation');
+    }
+  });
+
+  it('codex: an existing -o result file does not rescue a run that then failed', async () => {
+    const dir = tmp();
+    const resultFile = join(dir, 'last.json');
+    writeFileSync(resultFile, JSON.stringify(DONE));
+    const { envelope } = await runWorker(spec({ launcher: 'codex-exec', resultFile, argv: ['-e', 'process.exitCode=2'], session: 'build-4003' }, dir));
+    expect(envelope).toMatchObject({ parse: { ok: false }, result: { outcome: 'unparseable' } });
+    expect(envelope.outcome).not.toBe('done');
+  });
+
   it('an operator stop is aborted and makes no draft (D6)', async () => {
     const s = spec({ argv: ['-e', 'setInterval(()=>{},1000)'], timeoutMs: 300 });
     const { envelope } = await runWorker(s, { isOperatorStop: () => true });

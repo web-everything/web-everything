@@ -197,7 +197,9 @@ export async function runWorker(spec, io = {}) {
   const aborted = failure && isOperatorStop();
   let legacyRecord = null;
   let settled;
-  const gotResult = extracted.value !== undefined || (typeof extracted.text === 'string' && extracted.text.trim() !== '');
+  // FAIL CLOSED: a child that timed out, was signalled or exited non-zero never yields a success envelope, even when
+  // it printed (or left, for codex's -o file) a valid-looking result first — the result may be incomplete work.
+  const gotResult = !failure && (extracted.value !== undefined || (typeof extracted.text === 'string' && extracted.text.trim() !== ''));
   if (aborted) settled = settleWorkerResult({ role: spec.role, launcher: spec.launcher, aborted: true });
   else if (gotResult) settled = settleWorkerResult({ role: spec.role, launcher: spec.launcher, value: extracted.value, text: extracted.text, prose: extracted.prose });
   else {
