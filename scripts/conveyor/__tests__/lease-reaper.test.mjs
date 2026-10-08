@@ -41,6 +41,7 @@ import {
   fetchPrStatesForRepo,
   restPullToPrStateShape,
   detachedWrapperPidsBySession,
+  readDetachedWrapperPids,
   laneBranchItemNum,
   laneQuietSincePr,
   DEFAULT_QUIET_MS,
@@ -48,6 +49,7 @@ import {
   defaultGitIsAncestor,
   fetchSessionSignals,
   buildLeaseSignalsFor,
+  prTerminalPredatesLease,
   laneIndicesIn,
 } from '../lease-reaper.mjs';
 import { DEFAULT_LEASE_TTL_MINUTES } from '../../lib/lane-lease.mjs';
@@ -341,20 +343,20 @@ describe('restPullToPrStateShape — REST list-item → the GraphQL-shaped field
   it('a REST pull item (head.ref, merged_at, merge_commit_sha) maps to headRefName/mergedAt/mergeCommit.oid', () => {
     const rest = { number: 900, state: 'closed', merged_at: '2026-09-22T00:00:00Z', merge_commit_sha: 'deadbeef', head: { ref: 'lane/181-x' } };
     expect(restPullToPrStateShape(rest)).toEqual({
-      number: 900, state: 'closed', headRefName: 'lane/181-x', mergedAt: '2026-09-22T00:00:00Z', mergeCommit: { oid: 'deadbeef' },
+      number: 900, state: 'closed', headRefName: 'lane/181-x', mergedAt: '2026-09-22T00:00:00Z', closedAt: null, mergeCommit: { oid: 'deadbeef' },
     });
   });
   it('a REST open pull (no merged_at/merge_commit_sha) maps mergeCommit to null, never a bogus {oid: undefined}', () => {
     const rest = { number: 42, state: 'open', merged_at: null, merge_commit_sha: null, head: { ref: 'lane/42-y' } };
-    expect(restPullToPrStateShape(rest)).toEqual({ number: 42, state: 'open', headRefName: 'lane/42-y', mergedAt: null, mergeCommit: null });
+    expect(restPullToPrStateShape(rest)).toEqual({ number: 42, state: 'open', headRefName: 'lane/42-y', mergedAt: null, closedAt: null, mergeCommit: null });
   });
   it('tolerant of the pre-existing GraphQL-shaped fixture (headRefName/mergeCommit.oid top-level, no head/merge_commit_sha) — unchanged pass-through', () => {
     const graphqlShaped = { number: 500, state: 'MERGED', headRefName: 'lane/2825-x', mergedAt: '2026-09-01T00:00:00Z', mergeCommit: { oid: 'cafef00d' } };
-    expect(restPullToPrStateShape(graphqlShaped)).toEqual(graphqlShaped);
+    expect(restPullToPrStateShape(graphqlShaped)).toEqual({ ...graphqlShaped, closedAt: null });
   });
   it('a malformed/empty item degrades to a safe empty shape, never throws', () => {
-    expect(restPullToPrStateShape({})).toEqual({ number: undefined, state: undefined, headRefName: '', mergedAt: null, mergeCommit: null });
-    expect(restPullToPrStateShape(null)).toEqual({ number: undefined, state: undefined, headRefName: '', mergedAt: null, mergeCommit: null });
+    expect(restPullToPrStateShape({})).toEqual({ number: undefined, state: undefined, headRefName: '', mergedAt: null, closedAt: null, mergeCommit: null });
+    expect(restPullToPrStateShape(null)).toEqual({ number: undefined, state: undefined, headRefName: '', mergedAt: null, closedAt: null, mergeCommit: null });
   });
 });
 
@@ -1735,5 +1737,65 @@ describe('laneIndicesIn — a plain FILE in the pool root is not a pool (2026-10
       expect(laneIndicesIn(join(root, '.metadata_never_index'))).toEqual([]);
       expect(laneIndicesIn(join(root, 'web-everything'))).toEqual([2]);
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+// #xp4r23a — live: lane-12 `conveyor-4420` acquired 2026-10-08T05:27:22Z, reaped "pr-merged" at 05:27:24Z off
+// item 4420's PREPARE PR #4358 (`lane/4420-prepare-*`, merged 00:03:48Z) while the build was still running.
+describe('#xp4r23a — a PR that merged BEFORE the lease was acquired never reaps it (fresh build lane vs. the item\'s prepare PR)', () => {
+  const ACQUIRED = '2026-10-08T05:27:22.823Z';
+  const NOW_MS = Date.parse('2026-10-08T05:27:24.000Z');
+  const lease = { session: 'conveyor-4420', purpose: 'probation-test-fix-build', acquiredAt: ACQUIRED, ttlMinutes: 240 };
+  const signalsWith = (pulls) => {
+    const repoStates = fetchPrStatesForRepo('we', {}, { exec: () => JSON.stringify(pulls) });
+    return buildLeaseSignalsFor({
+      prStatesByRepo: new Map([['we', repoStates]]),
+      sessionStates: null, sessionPidAlive: new Map(), sessionAgents: null, wrapperPids: new Map(), nowMs: NOW_MS,
+    });
+  };
+  const cand = { pool: 'web-everything', lane: 12, dir: join(tmpdir(), 'xp4r23a-no-such-lane'), repoKey: 'we', lease };
+  const preparePr = {
+    number: 4358, state: 'closed', head: { ref: 'lane/4420-prepare-file-the-prevention-guard' },
+    merged_at: '2026-10-08T00:03:48Z', closed_at: '2026-10-08T00:03:48Z', merge_commit_sha: '648d2877dd78429ebbb5a05aafbd21b9705e772c',
+  };
+
+  it('the live shape: the item\'s earlier-merged prepare PR leaves the fresh build lease KEPT', () => {
+    const sig = signalsWith([preparePr])(cand);
+    expect(sig.prState).toBeNull();
+    expect(reapPlan([cand], { nowMs: NOW_MS, signalsFor: () => sig }).reap).toEqual([]);
+  });
+
+  it('twin: the item\'s PR merging AFTER the acquire is this lease\'s own work — still reaped pr-merged', () => {
+    const own = { ...preparePr, number: 4500, head: { ref: 'lane/4420-build' }, merged_at: '2026-10-08T06:00:00Z', closed_at: '2026-10-08T06:00:00Z' };
+    const sig = signalsWith([preparePr, own])(cand);
+    expect(sig.prState).toBe('merged');
+    expect(reapPlan([cand], { nowMs: NOW_MS, signalsFor: () => sig }).reap.map((r) => r.reason)).toEqual(['pr-merged']);
+  });
+
+  it('a closed-unmerged PR that closed before the acquire never reaps it either', () => {
+    const closed = { number: 4357, state: 'closed', head: { ref: 'lane/4420-attempt' }, merged_at: null, closed_at: '2026-10-08T01:00:00Z' };
+    expect(signalsWith([closed])(cand).prState).toBeNull();
+  });
+
+  it('prTerminalPredatesLease: unparseable times keep the pre-existing behaviour (false)', () => {
+    expect(prTerminalPredatesLease({ state: 'merged', terminalAt: '2026-10-08T00:00:00Z' }, { acquiredAt: ACQUIRED })).toBe(true);
+    expect(prTerminalPredatesLease({ state: 'merged', terminalAt: null, mergedAt: null }, { acquiredAt: ACQUIRED })).toBe(false);
+    expect(prTerminalPredatesLease({ state: 'merged', terminalAt: '2026-10-08T00:00:00Z' }, { acquiredAt: 'garbage' })).toBe(false);
+    expect(prTerminalPredatesLease({ state: 'open', terminalAt: null }, { acquiredAt: ACQUIRED })).toBe(false);
+  });
+});
+
+// #xp4r23a — the live reaper died of heap exhaustion every tick from 2026-10-08T08:37Z: it held all ~30k parsed
+// run records (~4.9 GB) in one array. The reader now reduces one record at a time and never retains it.
+describe('#xp4r23a — readDetachedWrapperPids reduces record-by-record (never retains the whole run store)', () => {
+  const rec = (id, session, pid) => ({ id, effects: [{ status: 'in-flight', handle: `pid:${pid}`, payload: { sessionSlug: session } }] });
+  it('returns the same map as the pure reducer over every record (the OOM itself is proven live, see PR body)', () => {
+    const records = { a: rec('a', 'conveyor-1', 101), b: { id: 'b', effects: [] }, c: rec('c', 'conveyor-2', 202) };
+    const store = { list: () => Object.keys(records), read: (id) => structuredClone(records[id]) };
+    expect([...readDetachedWrapperPids(store)]).toEqual([...detachedWrapperPidsBySession(Object.values(records))]);
+  });
+  it('a record that throws on read is skipped, never fatal', () => {
+    const store = { list: () => ['x', 'y'], read: (id) => { if (id === 'x') throw new Error('bad json'); return rec('y', 'conveyor-9', 9); } };
+    expect([...readDetachedWrapperPids(store)]).toEqual([['conveyor-9', 9]]);
   });
 });

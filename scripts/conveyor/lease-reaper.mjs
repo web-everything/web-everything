@@ -662,6 +662,27 @@ export function resolveLeaseItemNum(lease, dir, { repoStates = null, nowMs, quie
 }
 
 /**
+ * #xp4r23a — did this PR reach its terminal state (merged/closed) BEFORE the lease was acquired? Such a PR cannot
+ * be this lease's work: a lease's own PR can only land after the lease exists. The item-number keyspace is
+ * shared by every stage of an item — its `lane/<num>-prepare-*` PR, each build attempt's `lane/<num>[b]-*` PR —
+ * so without this a FRESH `conveyor-<num>` build lease read the item's earlier, already-merged PREPARE PR as
+ * "pr-merged" and was reaped seconds after acquire (live: lane-12 `conveyor-4420`, acquired 05:27:22Z, reaped
+ * 05:27:24Z off PR #4358 merged 00:03:48Z — seven such reaps of that one item in a day).
+ * `true` only when BOTH times parse and the terminal time is strictly earlier; anything unparseable is `false`
+ * (the pre-existing behaviour — this can only ever turn a reap into a keep, never the reverse).
+ * @param {{state?:string, terminalAt?:string|null}|null|undefined} detail - a {@link prDetailsFromList} entry.
+ * @param {object|null|undefined} lease
+ * @returns {boolean}
+ */
+export function prTerminalPredatesLease(detail, lease) {
+  if (!detail || (detail.state !== 'merged' && detail.state !== 'closed')) return false;
+  const terminalMs = Date.parse(detail.terminalAt ?? detail.mergedAt);
+  const acquiredMs = Date.parse(lease?.acquiredAt);
+  if (Number.isNaN(terminalMs) || Number.isNaN(acquiredMs)) return false;
+  return terminalMs < acquiredMs;
+}
+
+/**
  * The DETERMINISTIC reap verdict for ONE lease — pure, same signals → same verdict. A lease is reaped when it
  * is not reserved AND any axis fires; the reason names the axis (PR-terminal wins, then session-gone, then TTL,
  * then pid).
@@ -727,6 +748,8 @@ export function restPullToPrStateShape(p) {
     state: p?.state,
     headRefName: p?.headRefName ?? p?.head?.ref ?? '',
     mergedAt: p?.mergedAt ?? p?.merged_at ?? null,
+    // #xp4r23a — when a closed-unmerged PR closed, so {@link prTerminalPredatesLease} can date it too.
+    closedAt: p?.closedAt ?? p?.closed_at ?? null,
     mergeCommit: p?.mergeCommit ?? (p?.merge_commit_sha ? { oid: p.merge_commit_sha } : null),
   };
 }
@@ -748,9 +771,14 @@ function reduceDetails(prs, keyFor) {
     const s = String(pr?.state || '').toUpperCase();
     const state = pr?.mergedAt || s === 'MERGED' ? 'merged' : s === 'CLOSED' ? 'closed' : 'open';
     const prev = byKey.get(key);
-    if (!prev || PR_STATE_RANK[state] > PR_STATE_RANK[prev.state]) {
+    const terminalAt = state === 'open' ? null : (pr?.mergedAt ?? pr?.closedAt ?? null);
+    // #xp4r23a — at EQUAL rank the LATER terminal PR wins, so an item's newest merge/close is the one a lease is
+    // dated against ({@link prTerminalPredatesLease}); an older one must never mask a merge after the acquire.
+    const laterAtSameRank = prev && PR_STATE_RANK[state] === PR_STATE_RANK[prev.state]
+      && Date.parse(terminalAt) > Date.parse(prev.terminalAt);
+    if (!prev || PR_STATE_RANK[state] > PR_STATE_RANK[prev.state] || laterAtSameRank) {
       // open wins; then merged over closed — same rank table every reduction here shares
-      byKey.set(key, { state, sha: pr?.mergeCommit?.oid ?? null, mergedAt: pr?.mergedAt ?? null });
+      byKey.set(key, { state, sha: pr?.mergeCommit?.oid ?? null, mergedAt: pr?.mergedAt ?? null, terminalAt });
     }
   }
   return byKey;
@@ -1285,15 +1313,20 @@ export function fetchSessionSignals(flags, { exec = execFileSync } = {}) {
   return { states, pidAlive, agents: Array.isArray(sessions) ? sessions : null };
 }
 
-/** #3903 — the io half of {@link detachedWrapperPidsBySession}: read every run record once, never throwing. */
-function readDetachedWrapperPids(store = createFileRunStore()) {
-  const runs = [];
+/** #3903 — the io half of {@link detachedWrapperPidsBySession}: read every run record once, never throwing.
+ *  #xp4r23a — reduces ONE record at a time and drops it: it used to hold every parsed record in one array, and
+ *  with ~30k records (~4.9 GB) in the shared run store every reaper tick died of heap exhaustion from
+ *  2026-10-08T08:37Z on — no lease was reaped on any axis until this changed. Exported for its test. */
+export function readDetachedWrapperPids(store = createFileRunStore()) {
+  const bySession = new Map();
   let ids = [];
-  try { ids = store.list(); } catch { return new Map(); }
+  try { ids = store.list(); } catch { return bySession; }
   for (const id of Array.isArray(ids) ? ids : []) {
-    try { const run = store.read(id); if (run) runs.push(run); } catch { /* one bad record never blocks the sweep */ }
+    let run = null;
+    try { run = store.read(id); } catch { continue; /* one bad record never blocks the sweep */ }
+    if (run) for (const [session, pid] of detachedWrapperPidsBySession([run])) bySession.set(session, pid);
   }
-  return detachedWrapperPidsBySession(runs);
+  return bySession;
 }
 
 /** #4370 — the actor name the reaper stamps on the journal line its `release` child writes. */
@@ -1317,9 +1350,12 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
     // `sessionStates`/`sessionPidAlive` were reduced from — see `ownerSessionAliveForLease`'s own doc.
     const ownerAlive = ownerSessionAliveForLease(c.lease, sessionAgents, c.dir);
     const { itemNum, prNum } = resolveLeaseItemNum(c.lease, c.dir, { repoStates, nowMs, ownerAlive });
-    const prState = repoStates
+    let prState = repoStates
       ? (itemNum != null ? repoStates.byItem.get(itemNum) : prNum != null ? repoStates.byPr.get(prNum) : null) ?? null
       : null;
+    // #xp4r23a — an item's PR that merged/closed BEFORE this lease was acquired is an earlier stage's PR (its
+    // prepare PR, a prior attempt), never this lease's own work — the PR-terminal axis stays dormant for it.
+    if (itemNum != null && prTerminalPredatesLease(repoStates?.detailsByItem?.get(itemNum), c.lease)) prState = null;
     // #3383 — the lease's own session's REAL process-liveness read (`null` when unknown/unlisted), threaded
     // into sessionGoneForLease's phantom-listing widening. Distinct from `pidAliveForLease` below, which
     // remains the dormant future-`agentPid` axis (today's leases carry no durable per-agent pid at all).

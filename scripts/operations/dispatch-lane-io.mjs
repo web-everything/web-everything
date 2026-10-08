@@ -127,6 +127,8 @@ import { supervisionEnforcementFrom, CLAUDE_NATIVE_MODEL_BY_TIER } from '../lib/
 import { readStore as readScorecardStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 // #3840 — the ONE per-item provider override: the card's own `deliveryAgent:` marker and its required reason.
 import { readItemDeliveryAgentOverride } from './delivery-agent-marker.mjs';
+// #x331b7u — the advisor trial's shared helper (sampling, `--advisor` flags, per-run ledger row).
+import { advisorArgv, advisorForLaunch, advisorLedgerRow, advisorLogLine, recordAdvisorRun, withAdvisorBrief } from '../lib/advisor-trial.mjs';
 // #3645/#3906 — WHICH LAUNCH KINDS HAVE A MECHANICAL PROVIDER. Every row lands OFF on main (`agent`), see the
 // registry's own header; {@link routeDispatchProvider} below is its only reader here.
 import { DISPATCH_PROVIDER_REGISTRY, dispatchModesFromEnv, dispatchProviderEntry } from './dispatch-provider-registry.mjs';
@@ -1787,7 +1789,10 @@ export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => de
   }
   // build-path-codex-isolation — this port implementation always runs Claude; say so on the record.
   request.reportExecutor?.('claude');
+  // advisor trial (#x331b7u) — sampled per run id; only kinds the settings list (fix today).
+  const advisor = (request.advisorFor ?? advisorForLaunch)({ runId: request.sessionId, kind: request.launchKind ?? 'build' });
   const argv = buildAgentArgv({
+    advisor,
     sessionId: request.sessionId,
     payload: { prompt: request.prompt, sessionSlug: request.sessionSlug, num: request.num, launchKind: request.launchKind },
     extraArgs: request.extraArgs,
@@ -1803,6 +1808,16 @@ export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => de
     table: request.table ?? null,
     modelReason: request.modelReason ?? null,
   });
+  // advisor trial — recorded once the argv is final, before the launch (same rule as `dispatchFix`). Best-effort.
+  if (advisor.reason !== 'kind-not-in-trial') {
+    try {
+      console.error(advisorLogLine({ decision: advisor, sessionSlug: request.sessionSlug, runId: request.sessionId }));
+      (request.recordAdvisor ?? recordAdvisorRun)(advisorLedgerRow({
+        decision: advisor, runId: request.sessionId, sessionSlug: request.sessionSlug,
+        repo: request.repo ?? 'we', pr: request.pr ?? null, item: request.num ?? null, at: new Date().toISOString(),
+      }));
+    } catch { /* never fails a dispatch */ }
+  }
   const launchedModel = extractModelFlag(argv).value;
   let reportedModel = launchedModel;
   try { if (request.policyRoute) reportedModel = resolvePolicyModel('claude', launchedModel); } catch { /* Explicit reasoned pins may name models outside the policy catalogue. */ }
@@ -2355,6 +2370,10 @@ export function buildAgentArgv({
   // precedence; with no `table`, the launch kind's own tier is used, and a spawn with no resolvable model is
   // refused (operator rule 2026-09-29: every fresh Claude launch passes an explicit --model).
   table = null, modelReason = null,
+  // advisor trial (#x331b7u) — a decision from `../lib/advisor-trial.mjs#advisorForLaunch`. When it is
+  // on, the fresh launch gets `--advisor <model>` and one brief line; `null`/off keeps the argv byte-identical.
+  // Never applied on resume (a resume must stay a bare `--bg --resume`). The worker's `--model` is untouched.
+  advisor = null,
 }) {
   const prompt = String(payload?.prompt || '');
   if (!prompt.trim()) throw notApplied('dispatch-lane: refusing to start an agent with an empty prompt');
@@ -2428,7 +2447,8 @@ export function buildAgentArgv({
     ...(table ? [...effortArgs, ...modelArgs] : []),
     ...args,
     ...(!table ? [...effortArgs, ...modelArgs] : []),
-    prompt,
+    ...advisorArgv(advisor),
+    withAdvisorBrief(prompt, advisor),
   ];
 }
 
