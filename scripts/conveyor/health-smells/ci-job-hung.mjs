@@ -10,9 +10,38 @@ import { repoKeyForSlug, ghRepoSlug } from '../../lib/constellation-repos.mjs';
 
 const MARKER = 'ci-job-hung: ESCALATE ';
 const CHECK_NAME_MAX = 100;
-/** The only recovery reason an ESCALATE payload may carry besides the default "hung again": the cancel landed but
- *  GitHub then refused the re-run, so the check stays cancelled. Any other value is dropped, never echoed. */
-const REFUSED_AFTER_CANCEL = 'rerun-refused-after-cancel';
+/** The only reasons an ESCALATE payload may carry besides the default "hung again" (a second hang on the head after
+ *  the automatic re-run). Each says WHY the check is stuck and what to look at; any other value is dropped, never
+ *  echoed. Kept in step with `ESCALATION_REASONS` in `ci-queue-watch.mjs` (a test pins that they agree). */
+const REASONS = {
+  'cancel-refused': {
+    summary: ({ repo, pr, check, inProgressMin, thresholdMin }) => `${repo}#${pr} check "${check}" hung (${inProgressMin} min in progress, threshold ${thresholdMin} min) and GitHub refused to cancel its run; the check stays hung.`,
+    recommendation: ({ log }) => `GitHub refused to cancel the hung run, so it will wait for GitHub's own timeout: look at the run (${log}) and the App's actions permission, and fix the cause; do not re-run it by hand.`,
+  },
+  'force-cancel-refused': {
+    summary: ({ repo, pr, check, inProgressMin, thresholdMin }) => `${repo}#${pr} check "${check}" was cancelled as hung (${inProgressMin} min since it started, threshold ${thresholdMin} min), the run kept running, and GitHub refused to force-cancel it; the check stays hung.`,
+    recommendation: ({ log }) => `GitHub refused the force-cancel, so the run will wait for GitHub's own timeout: look at the run (${log}) and the App's actions permission, and fix the cause; do not re-run it by hand.`,
+  },
+  'cancel-did-not-take': {
+    summary: ({ repo, pr, check, inProgressMin, thresholdMin }) => `${repo}#${pr} check "${check}" was cancelled and force-cancelled as hung (${inProgressMin} min since it started, threshold ${thresholdMin} min), but its run is still not complete; the check stays hung.`,
+    recommendation: ({ log }) => `Neither the cancel nor the force-cancel ended the run, so only GitHub's own timeout will: look at the run (${log}) and tell GitHub support if it recurs; do not re-run it by hand.`,
+  },
+  'rerun-refused': {
+    summary: ({ repo, pr, check, inProgressMin, thresholdMin }) => `${repo}#${pr} check "${check}" hung (${inProgressMin} min in progress, threshold ${thresholdMin} min) and GitHub refused to re-run it; the check stays hung.`,
+    recommendation: ({ log }) => `GitHub refused to re-run the hung job or its run: look at the run (${log}) and the App's actions permission, and fix the cause; do not re-run it by hand.`,
+  },
+  'run-unreadable': {
+    summary: ({ repo, pr, check, inProgressMin, thresholdMin }) => `${repo}#${pr} check "${check}" was cancelled as hung (${inProgressMin} min since it started, threshold ${thresholdMin} min) but its run could not be read back from GitHub, so the recovery is stuck.`,
+    recommendation: ({ log }) => `GitHub permanently refuses to return the run, so the sweep can neither re-run nor clear it: look at the run (${log}) and the App's actions permission, and fix the cause; do not re-run it by hand.`,
+  },
+  'rerun-refused-after-cancel': {
+    summary: ({ repo, pr, check, inProgressMin, thresholdMin }) => `${repo}#${pr} check "${check}" was cancelled as hung (${inProgressMin} min since it started, threshold ${thresholdMin} min) and its re-run was refused after it was cancelled; the check stays cancelled.`,
+    recommendation: ({ log }) => `GitHub refused to re-run the cancelled run, so the required check stays cancelled and the PR stays blocked: look at the run (${log}) and the App's actions permission, and fix the cause; do not re-run it by hand.`,
+  },
+};
+
+/** The reason ids this smell words — a test pins that they equal `ESCALATION_REASONS` in `ci-queue-watch.mjs`. */
+export const KNOWN_REASONS = Object.freeze(Object.keys(REASONS));
 
 const isId = (v) => Number.isSafeInteger(v) && v > 0;
 const isCount = (v) => Number.isSafeInteger(v) && v >= 0;
@@ -41,7 +70,7 @@ function validateEscalation(p) {
   const { pr, headSha, runId, jobId, inProgressMin, thresholdMin, reruns } = p;
   return {
     repo: ghRepoSlug(p.repo), pr, headSha, check, runId, jobId, inProgressMin, thresholdMin, reruns,
-    ...(p.reason === REFUSED_AFTER_CANCEL ? { reason: p.reason } : {}),
+    ...(typeof p.reason === 'string' && Object.hasOwn(REASONS, p.reason) ? { reason: p.reason } : {}),
   };
 }
 
@@ -79,16 +108,17 @@ export default {
         const { repo, pr, headSha, check, runId, jobId, inProgressMin, thresholdMin, reruns, reason } = payload;
         const subject = `${repo}#${pr}:${check}`;
         const log = `https://github.com/${repo}/actions/runs/${runId}/job/${jobId}`;
-        const refused = reason === REFUSED_AFTER_CANCEL;
+        const text = reason ? REASONS[reason] : null;
+        const view = { repo, pr, check, inProgressMin, thresholdMin, log };
         results.set(subject, {
           subject,
           breach: true,
-          measure: { repo, pr, headSha, check, runId, jobId, inProgressMin, thresholdMin, reruns, ...(refused ? { reason } : {}), daemon: sample.name },
-          summary: refused
-            ? `${repo}#${pr} check "${check}" was cancelled as hung (${inProgressMin} min since it started, threshold ${thresholdMin} min) and its re-run was refused after it was cancelled; the check stays cancelled.`
+          measure: { repo, pr, headSha, check, runId, jobId, inProgressMin, thresholdMin, reruns, ...(reason ? { reason } : {}), daemon: sample.name },
+          summary: text
+            ? text.summary(view)
             : `${repo}#${pr} check "${check}" hung again (${inProgressMin} min in progress, threshold ${thresholdMin} min) after ${reruns} automatic re-run(s).`,
-          recommendation: refused
-            ? `GitHub refused to re-run the cancelled run, so the required check stays cancelled and the PR stays blocked: look at the run (${log}) and the App's actions permission, and fix the cause; do not re-run it by hand.`
+          recommendation: text
+            ? text.recommendation(view)
             : `The automatic re-run did not clear it, so this is not a one-off GitHub glitch: look at the job's own log (${log}) and fix the cause in the workflow or the product; do not re-run it by hand.`,
         });
       }

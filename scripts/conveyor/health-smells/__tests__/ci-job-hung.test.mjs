@@ -95,6 +95,35 @@ describe('parseEscalations — untrusted payload fields', () => {
     expect(unknown.reason).toBeUndefined();
   });
 
+  // One distinct alert per reason: a refused write must never read as "hung again after N re-runs".
+  it.each([
+    ['cancel-refused', /refused to cancel its run/],
+    ['force-cancel-refused', /refused to force-cancel it/],
+    ['cancel-did-not-take', /force-cancelled as hung .* still not complete/],
+    ['rerun-refused', /refused to re-run it/],
+    ['rerun-refused-after-cancel', /re-run was refused after it was cancelled/],
+    ['run-unreadable', /run could not be read back from GitHub/],
+  ])('words the %s reason in its own terms', (reason, summary) => {
+    const [out] = ciJobHung.evaluate({ daemonLogs: [sample(line({ ...payload, reruns: 0, reason }))] });
+    expect(out.summary).toMatch(summary);
+    expect(out.summary).not.toMatch(/hung again/);
+    expect(out.recommendation).not.toMatch(/automatic re-run did not clear it/);
+    expect(out.recommendation).toContain('(https://github.com/web-everything/web-everything/actions/runs/37796107550/job/222)');
+    expect(out.measure.reason).toBe(reason);
+  });
+
+  it('knows exactly the reasons the sweep can log (the two lists cannot drift)', async () => {
+    const { ESCALATION_REASONS } = await import('../../ci-queue-watch.mjs');
+    const { KNOWN_REASONS } = await import('../ci-job-hung.mjs');
+    expect([...KNOWN_REASONS].sort()).toEqual([...ESCALATION_REASONS].sort());
+  });
+
+  it.each(['constructor', '__proto__', 'toString', 'hasOwnProperty', '', 7, null, ['cancel-refused']])('drops the non-reason %j and falls back to the default text', (reason) => {
+    const [out] = ciJobHung.evaluate({ daemonLogs: [sample(line({ ...payload, reason }))] });
+    expect(out.summary).toMatch(/hung again/);
+    expect(out.measure.reason).toBeUndefined();
+  });
+
   it('builds the recommendation link only from a validated constellation repo and integer ids', () => {
     const out = ciJobHung.evaluate({ daemonLogs: [sample(line())] });
     expect(out[0].recommendation).toContain('(https://github.com/web-everything/web-everything/actions/runs/37796107550/job/222)');

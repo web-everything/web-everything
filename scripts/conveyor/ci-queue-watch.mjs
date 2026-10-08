@@ -44,14 +44,15 @@
 
 import { repoKeyForSlug, ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import {
-  existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, openSync, closeSync, statSync, unlinkSync,
+  existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, openSync, closeSync, statSync, unlinkSync, utimesSync,
 } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { join, dirname, resolve } from 'node:path';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { sleepSyncMs } from '../readiness/drain-lock.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
+import { resolveChildTimeoutMs, DEFAULT_CHILD_TIMEOUT_MS } from '../lib/bounded-child.mjs';
 
 // ── TUNING (exported so a caller/test can override) ─────────────────────────────────────────────────────────
 
@@ -209,6 +210,21 @@ export const CANCEL_GRACE_MS = 5 * 60_000;
 export const HUNG_LEDGER_TTL_MS = 7 * 24 * 3600_000;
 /** Kill switch: `WE_CI_HUNG_ACTION=0` makes `sweep` detect and log only, never cancel or re-run. */
 export const HUNG_ACTION_ENV = 'WE_CI_HUNG_ACTION';
+/** The hung sweep holds its ledger lock across blocking `gh` calls, refreshing it before each one, so the lock goes
+ *  stale only if ONE call outlives it (the child timeout plus room for the throttle's backoff — a call retried by
+ *  the throttle can in theory take longer). If that happens the sweep notices at its next `held()` (the lock file
+ *  carries its token) and stops without writing; it never keeps acting on a ledger someone else now owns. */
+export const HUNG_LOCK_STALE_MS = DEFAULT_CHILD_TIMEOUT_MS + 5 * 60_000;
+/** Why an ESCALATE line was logged. Absent = the default "this check hung AGAIN after its automatic re-run".
+ *  The `ci-job-hung` smell keeps the same list (it validates what it reads from a log). */
+export const ESCALATION_REASONS = Object.freeze([
+  'cancel-refused', // GitHub refused to cancel the hung run
+  'force-cancel-refused', // the cancel did not take and GitHub refused the force-cancel
+  'cancel-did-not-take', // the run was force-cancelled and is STILL not complete a grace window later
+  'rerun-refused', // GitHub refused to re-run the hung job (and the whole run)
+  'rerun-refused-after-cancel', // the run was cancelled, then GitHub refused the whole-run re-run
+  'run-unreadable', // GitHub permanently refuses to let the sweep read the run it is recovering
+]);
 
 const WE_SLUG = ghRepoSlug(DEFAULT_REPO_KEY);
 const ACTIONS_JOB_PATH_RE = /^\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)\/job\/(\d+)$/;
@@ -325,6 +341,9 @@ export function planHungActions(hung, ledger, { maxReruns = DEFAULT_HUNG_MAX_RER
     let action = 'recover';
     const stage = String(e?.stage || '');
     const last = (e?.actions || []).at(-1);
+    // The job re-run was refused but the whole-run fallback has not been tried yet (a crash or lost lock between the
+    // two attempts): the recovery is unfinished, never "handled".
+    if (e && stage === 'rerun-job-refused') return { ...h, key, action: 'recover' };
     // A recovery that never reached GitHub (throttle backoff, timeout, 5xx) is retried. One GitHub actually
     // refused (cancel/re-run failed for real) is not retried every sweep — it escalates instead.
     if (e && /-(failed|deferred)$/.test(stage) && last && !last.ok && isTransientGhError(last.error)) action = 'recover';
@@ -409,20 +428,30 @@ const HISTORY_LOCK_POLL_MS = 25;
  * a crashed holder) is stolen; if a fresh lock can't be taken within `timeoutMs`, `fn` still runs UNLOCKED
  * (best-effort — a lock must never wedge a sweep; worst case is the pre-lock last-write-wins). `staleMs` /
  * `timeoutMs` are overridable (tests only need a few ms, not the real multi-second defaults).
+ *
+ * A LONG holder (one that makes slow, blocking calls inside `fn`) must not lose the lock to a stale-steal
+ * mid-flight: `fn` receives `touch()`, which refreshes the lock's mtime and returns whether this caller STILL
+ * owns it (the lock file carries a per-holder token; a stolen lock reads back someone else's). A holder that
+ * called `touch()` between its slow calls is never stale; one that finds it lost the lock must stop writing.
+ * The holder only ever removes a lock it still owns, so a late `finally` cannot delete the new holder's lock.
+ * `required: true` is for a caller whose side effects must never run unserialised: when no lock can be taken
+ * within `timeoutMs` it returns {@link LOCK_UNAVAILABLE} without running `fn`, instead of running it unlocked.
  * @template T
  * @param {string} path
- * @param {() => T} fn
- * @param {{staleMs?:number, timeoutMs?:number}} [o]
- * @returns {T}
+ * @param {(touch: () => boolean) => T} fn
+ * @param {{staleMs?:number, timeoutMs?:number, required?:boolean}} [o]
+ * @returns {T | typeof LOCK_UNAVAILABLE}
  */
-export function withHistoryLock(path, fn, { staleMs = DEFAULT_HISTORY_LOCK_STALE_MS, timeoutMs = DEFAULT_HISTORY_LOCK_TIMEOUT_MS } = {}) {
+export function withHistoryLock(path, fn, { staleMs = DEFAULT_HISTORY_LOCK_STALE_MS, timeoutMs = DEFAULT_HISTORY_LOCK_TIMEOUT_MS, required = false } = {}) {
   const lockPath = `${path}.lock`;
   mkdirSync(dirname(path), { recursive: true });
   const start = Date.now();
+  const token = `${process.pid}.${randomUUID()}`;
   let held = false;
   while (Date.now() - start < timeoutMs) {
     try {
-      closeSync(openSync(lockPath, 'wx')); // atomic exclusive create — fails if a holder exists
+      const fd = openSync(lockPath, 'wx'); // atomic exclusive create — fails if a holder exists
+      try { writeFileSync(fd, token); } finally { closeSync(fd); }
       held = true;
       break;
     } catch {
@@ -432,12 +461,23 @@ export function withHistoryLock(path, fn, { staleMs = DEFAULT_HISTORY_LOCK_STALE
       sleepSyncMs(Math.min(HISTORY_LOCK_POLL_MS, Math.max(0, timeoutMs - (Date.now() - start))));
     }
   }
+  if (!held && required) return LOCK_UNAVAILABLE;
+  const owned = () => { try { return readFileSync(lockPath, 'utf8') === token; } catch { return false; } };
+  // Unlocked (best-effort) callers have nothing to lose: `touch` is then always "still fine".
+  const touch = () => {
+    if (!held) return true;
+    if (!owned()) return false;
+    try { const t = new Date(); utimesSync(lockPath, t, t); } catch { return false; }
+    return true;
+  };
   try {
-    return fn();
+    return fn(touch);
   } finally {
-    if (held) { try { unlinkSync(lockPath); } catch { /* best-effort cleanup */ } }
+    if (held && owned()) { try { unlinkSync(lockPath); } catch { /* best-effort cleanup */ } }
   }
 }
+/** Returned by {@link withHistoryLock} with `required: true` when the lock could not be taken. */
+export const LOCK_UNAVAILABLE = Symbol('history-lock-unavailable');
 
 /**
  * THE IO SHELL. Samples `gh run list`, summarizes + classifies it, appends the result to the persisted
@@ -538,23 +578,54 @@ export function sweepHungJobs({
   k = DEFAULT_HUNG_K, floorSec = DEFAULT_HUNG_FLOOR_SEC, maxReruns = DEFAULT_HUNG_MAX_RERUNS, apply = true,
   listPrs = defaultListPrs, getRun = defaultGetRun, getJob = defaultGetJob, cancelRun = defaultCancelRun, forceCancelRun = defaultForceCancelRun,
   rerunJob = defaultRerunJob, rerunRun = defaultRerunRun, log = (l) => writeLineSync(2, l),
+  lock = {}, // `{staleMs, timeoutMs}` overrides for the ledger lock (tests only)
 } = {}) {
   const slug = repo ? ghRepoSlug(repo) : WE_SLUG; // the details-URL anchor and every API path use the canonical slug
   const nowMs = now();
   const at = new Date(nowMs).toISOString();
   const prs = listPrs({ repo: slug });
-  return withHistoryLock(statePath, () => {
+  // The sweep's writes are once-per-(PR, head, check): two overlapping sweeps would both cancel / re-run. So the
+  // lock is REQUIRED (no lock → no sweep, the next tick retries), is refreshed before every gh call, and a sweep
+  // that finds its lock stolen stops at once instead of acting on a ledger someone else now owns.
+  const out = withHistoryLock(statePath, (touch) => {
+    const held = () => { if (!touch()) throw new LockLost(); };
+    try {
+      return runHungSweep(held, touch);
+    } catch (e) {
+      if (!(e instanceof LockLost)) throw e;
+      log(`ci-job-hung: ABORTED ${JSON.stringify({ repo: slug, reason: 'the ledger lock was taken over mid-sweep; stopped without writing' })}`);
+      return { checkedAt: at, prs: prs.length, hung: [], actions: [], escalations: [], skipped: 'lock-lost' };
+    }
+  }, { staleMs: HUNG_LOCK_STALE_MS, ...lock, required: true });
+  if (out === LOCK_UNAVAILABLE) {
+    log(`ci-job-hung: SKIPPED ${JSON.stringify({ repo: slug, reason: 'another hung-job sweep holds the ledger lock; retried next tick' })}`);
+    return { checkedAt: at, prs: prs.length, hung: [], actions: [], escalations: [], skipped: 'lock-held' };
+  }
+  return out;
+
+  function runHungSweep(held, touch) {
+    // A ledger that exists but cannot be parsed would read as EMPTY, and the next write would overwrite the real
+    // history (every hang a "first hang" again → repeat cancels and re-runs). Set it aside, loudly, instead.
+    if (existsSync(statePath)) {
+      try { JSON.parse(readFileSync(statePath, 'utf8')); } catch {
+        const aside = `${statePath}.corrupt-${nowMs}`;
+        try { renameSync(statePath, aside); log(`ci-job-hung: LEDGER-RESET ${JSON.stringify({ repo: slug, reason: 'the hung-job ledger could not be parsed; set aside, starting empty', aside })}`); } catch { /* unreadable AND unmovable: carry on as before */ }
+      }
+    }
     const state = readHungState(statePath);
     state.durations = learnDurations(state.durations, prs, { repo: slug });
     for (const [key, e] of Object.entries(state.hung)) {
       if (!(nowMs - Date.parse(e?.updatedAt || 0) < HUNG_LEDGER_TTL_MS)) delete state.hung[key];
     }
     const actions = [];
+    // Every gh WRITE is persisted the moment it is recorded (callers set the entry's stage BEFORE `record`): a crash
+    // or a lost lock after a cancel must not leave the write un-ledgered, or the next sweep repeats it.
     const record = (entry, action, h, ok, error = null) => {
       const a = { at, action, pr: h.pr, name: h.name, runId: h.runId, jobId: h.jobId, ok, ...(error ? { error } : {}) };
       entry.actions = [...(entry.actions || []), a].slice(-20);
       entry.updatedAt = at;
       actions.push(a);
+      if (touch()) { try { writeHungState(state, statePath); } catch { /* best-effort — the final write below retries */ } }
       log(`ci-job-hung: ${ok ? 'RECOVER' : isTransientGhError(error) ? 'DEFERRED' : 'FAILED'} ${JSON.stringify({ repo: slug, ...a })}`);
     };
     // A transient failure (the call never reached GitHub, or GitHub 5xx'd) is DEFERRED — retried next sweep, and
@@ -567,25 +638,31 @@ export function sweepHungJobs({
         ? [['rerun-run', () => rerunRun({ repo: slug, runId: h.runId })]]
         : [['rerun-job', () => rerunJob({ repo: slug, runId: h.runId, jobId: h.jobId })], ['rerun-run', () => rerunRun({ repo: slug, runId: h.runId })]];
       for (const [i, [action, send]] of attempts.entries()) {
+        held();
         try { send(); entry.reruns = (entry.reruns ?? 0) + 1; entry.stage = 'rerun-requested'; record(entry, action, h, true); return; }
         catch (e) {
           const msg = errText(e);
+          const transient = isTransientGhError(msg);
+          // Persisted by record(): between two attempts the entry must read as UNFINISHED, never as handled.
+          if (transient) entry.stage = 'rerun-deferred';
+          else entry.stage = i === attempts.length - 1 ? 'rerun-failed' : 'rerun-job-refused';
           record(entry, action, h, false, msg);
-          if (isTransientGhError(msg)) { entry.stage = 'rerun-deferred'; return; }
-          if (i === attempts.length - 1) entry.stage = 'rerun-failed';
+          if (transient) return;
         }
       }
     };
     // `{error}` = unreadable (never guessed: acting blind on an unknown run state re-ran a job whose status read
     // had been refused, live 2026-10-08). `headSha` is the commit the run actually ran for.
     const readRun = (h) => {
+      held();
       try {
         const run = getRun({ repo: slug, runId: h.runId });
         const status = String(run?.status || '');
-        return status ? { status, headSha: String(run?.head_sha || '') } : { error: 'empty' };
+        return status ? { status, headSha: String(run?.head_sha || ''), conclusion: String(run?.conclusion || '').toLowerCase() } : { error: 'empty' };
       } catch (e) { return { error: errText(e) }; }
     };
     const readJob = (h) => {
+      held();
       try {
         const job = getJob({ repo: slug, jobId: h.jobId });
         return { runId: Number(job?.run_id), name: String(job?.name || '') };
@@ -604,66 +681,99 @@ export function sweepHungJobs({
       if (p.headRefOid !== entry.headSha) return null;
       return (p.statusCheckRollup || []).find((c) => c?.name === entry.name && jobRefOf(c, slug)?.runId === entry.runId) || null;
     };
-    const isCompleted = (c, wantSuccess) => String(c?.status || '').toUpperCase() === 'COMPLETED' && (String(c?.conclusion || '').toUpperCase() === 'SUCCESS') === wantSuccess;
     const escalationView = (entry, h) => ({
       repo: slug, pr: entry.pr, headSha: entry.headSha, check: entry.name, runId: entry.runId, jobId: h.jobId,
       inProgressMin: Math.max(0, Math.round((nowMs - Date.parse(entry.startedAt || entry.detectedAt || at)) / 60_000)),
       thresholdMin: Math.round((entry.thresholdSec ?? 0) / 60),
     });
     const escalations = [];
+    // One ESCALATE per entry per sweep, with the reason the check is stuck (the smell words each reason).
+    const escalateEntry = (entry, h, reason) => {
+      entry.escalatedAt = entry.escalatedAt || at;
+      entry.updatedAt = at;
+      escalations.push({ pr: entry.pr, headSha: entry.headSha, name: entry.name, runId: entry.runId, jobId: h.jobId, action: 'escalate', key: hungKey({ pr: entry.pr, headSha: entry.headSha, name: entry.name }), ...(reason ? { reason } : {}) });
+      // Logged EVERY sweep while the check stays stuck, with a minute count that grows each time (so log de-dup never
+      // folds it away) — the health smell's episode stays open exactly as long as this keeps appearing.
+      log(`ci-job-hung: ESCALATE ${JSON.stringify({ ...escalationView(entry, h), reruns: entry.reruns ?? 0, ...(reason ? { reason } : {}) })}`);
+    };
+    // Entries step 1 owned this sweep: step 2 must not act on, or escalate, the same entry a second time.
+    const owned = new Set();
+    // A run the ledger cannot read is never silent: a transient failure is logged and retried next sweep; a permanent
+    // one (404 / 403 / 410 …) can never clear by waiting, so it escalates every sweep like any other stuck recovery.
+    const unreadable = (entry, h, error) => {
+      if (isTransientGhError(error) || error === 'empty') {
+        log(`ci-job-hung: DEFERRED ${JSON.stringify({ repo: slug, pr: entry.pr, check: entry.name, runId: entry.runId, reason: `run status unreadable: ${error}` })}`);
+      } else escalateEntry(entry, h, 'run-unreadable');
+    };
 
     // 1. The ledger's own work for a recovery that began with a cancel. The cancelled check leaves `in_progress`,
-    //    so step 2 never sees it again: only the ledger can finish, retry or escalate it.
-    for (const entry of Object.values(state.hung)) {
+    //    so step 2 never sees it again: only the ledger can finish, retry or escalate it. Decisions here are read
+    //    from the RUN (a cancel kills the whole run, siblings included), never from the watched check alone.
+    for (const [key, entry] of Object.entries(state.hung)) {
       const h = { pr: entry.pr, name: entry.name, runId: entry.runId, jobId: entry.jobIds?.at(-1) };
       const check = liveCheck(entry);
       if (!check) continue;
       if (entry.stage === 'cancel-requested') {
         if (!apply) continue;
+        owned.add(key);
         const run = readRun(h);
-        if (run.error) continue;
+        if (run.error) { unreadable(entry, h, run.error); continue; }
         if (run.status === 'completed') {
-          // The cancel may have lost the race to the job (it finished green first): re-running a healthy run would
-          // reset its passed checks for nothing.
-          if (check !== UNKNOWN && isCompleted(check, true)) { entry.stage = 'cancel-outran'; entry.updatedAt = at; log(`ci-job-hung: RESOLVED ${JSON.stringify({ repo: slug, pr: entry.pr, check: entry.name, runId: entry.runId, reason: 'the job finished green before the cancel landed' })}`); }
+          // Only a run that finished SUCCESSFULLY has nothing to restore (the job outran the cancel). The watched job
+          // being green proves nothing about its siblings: if the cancel landed on them, the whole run is re-run.
+          if (run.conclusion === 'success') { entry.stage = 'cancel-outran'; entry.updatedAt = at; log(`ci-job-hung: RESOLVED ${JSON.stringify({ repo: slug, pr: entry.pr, check: entry.name, runId: entry.runId, reason: 'the run finished successfully before the cancel landed' })}`); }
           else rerun(entry, h, { viaCancel: true });
-        } else if (nowMs - Date.parse(entry.cancelRequestedAt || 0) >= CANCEL_GRACE_MS && !entry.forceCancelledAt) {
-          try { forceCancelRun({ repo: slug, runId: h.runId }); entry.forceCancelledAt = at; record(entry, 'force-cancel', h, true); }
-          catch (e) { record(entry, 'force-cancel', h, false, errText(e)); }
+        } else if (entry.forceCancelRefusedAt) {
+          // GitHub refused the force-cancel for real: never re-sent, escalated every sweep instead.
+          escalateEntry(entry, h, 'force-cancel-refused');
+        } else if (!entry.forceCancelledAt) {
+          if (nowMs - Date.parse(entry.cancelRequestedAt || 0) >= CANCEL_GRACE_MS) {
+            held();
+            try { forceCancelRun({ repo: slug, runId: h.runId }); entry.forceCancelledAt = at; record(entry, 'force-cancel', h, true); }
+            catch (e) {
+              const msg = errText(e);
+              // Latch a refusal only when it is real: not transient, and the run is verifiably STILL running (a
+              // force-cancel that lost the race to the run finishing is refused with a 409 and is no refusal at all).
+              if (!isTransientGhError(msg)) { const again = readRun(h); if (!again.error && again.status !== 'completed') entry.forceCancelRefusedAt = at; }
+              record(entry, 'force-cancel', h, false, msg);
+              if (entry.forceCancelRefusedAt) escalateEntry(entry, h, 'force-cancel-refused');
+            }
+          }
+        } else if (nowMs - Date.parse(entry.forceCancelledAt) >= CANCEL_GRACE_MS) {
+          // Cancelled AND force-cancelled, still not complete a grace window later: nothing else to try.
+          escalateEntry(entry, h, 'cancel-did-not-take');
         }
         continue;
       }
-      // A cancel-origin recovery whose re-run did not land and whose check is still cancelled (not passed, not
-      // re-running — an in_progress check is step 2's, via planHungActions).
-      const stranded = entry.cancelRequestedAt && /^rerun-(deferred|failed)$/.test(entry.stage || '')
-        && check !== UNKNOWN && isCompleted(check, false);
-      if (!stranded) continue;
+      // A cancel-origin recovery whose re-run did not land while the cancelled run stays un-restored (a run that
+      // is running again is not stranded — if its check shows in_progress that is step 2's, via planHungActions).
+      if (!(entry.cancelRequestedAt && /^rerun-(deferred|failed)$/.test(entry.stage || '')) || !apply) continue;
+      owned.add(key);
+      const run = readRun(h);
+      if (run.error) { unreadable(entry, h, run.error); continue; }
+      if (run.status !== 'completed') owned.delete(key); // running again (someone re-ran it): a new hang is step 2's
+      if (run.status !== 'completed' || run.conclusion === 'success') continue;
       const last = (entry.actions || []).at(-1);
-      if (entry.stage === 'rerun-deferred' || (last && !last.ok && isTransientGhError(last.error))) {
-        if (apply) rerun(entry, h, { viaCancel: true });
-      } else {
-        entry.escalatedAt = entry.escalatedAt || at;
-        entry.updatedAt = at;
-        escalations.push({ pr: entry.pr, headSha: entry.headSha, name: entry.name, runId: entry.runId, jobId: h.jobId, action: 'escalate', key: hungKey({ pr: entry.pr, headSha: entry.headSha, name: entry.name }) });
-        // Logged EVERY sweep while the check stays cancelled, with a minute count that grows each time (so log
-        // de-dup never folds it away) — the same contract as the step-2 escalation below.
-        log(`ci-job-hung: ESCALATE ${JSON.stringify({ ...escalationView(entry, h), reruns: entry.reruns ?? 0, reason: 'rerun-refused-after-cancel' })}`);
-      }
+      if (entry.stage === 'rerun-deferred' || (last && !last.ok && isTransientGhError(last.error))) rerun(entry, h, { viaCancel: true });
+      else escalateEntry(entry, h, 'rerun-refused-after-cancel');
     }
 
     // 2. Newly detected hangs.
     const hung = planHungActions(findHungChecks(prs, state.durations, { now: nowMs, k, floorSec, repo: slug }), state.hung, { maxReruns });
     for (const h of hung) {
       const view = { repo: slug, pr: h.pr, headSha: h.headSha, check: h.name, runId: h.runId, jobId: h.jobId, inProgressMin: Math.round(h.inProgressSec / 60), thresholdMin: Math.round(h.thresholdSec / 60) };
-      if (h.action === 'handled') continue;
+      if (h.action === 'handled' || owned.has(h.key)) continue;
       if (h.action === 'escalate') {
         const entry = state.hung[h.key];
+        // A refused write says so; only a genuine second hang reads "hung again after N re-runs".
+        const reason = entry.stage === 'cancel-failed' ? 'cancel-refused'
+          : entry.stage === 'rerun-failed' ? (entry.cancelRequestedAt ? 'rerun-refused-after-cancel' : 'rerun-refused') : undefined;
         entry.escalatedAt = entry.escalatedAt || at;
         entry.updatedAt = at;
-        escalations.push({ ...h });
+        escalations.push({ ...h, ...(reason ? { reason } : {}) });
         // Logged EVERY sweep while the hang lasts (inProgressMin changes, so log de-dup never folds it away):
         // the health smell's episode stays open exactly as long as this keeps appearing.
-        log(`ci-job-hung: ESCALATE ${JSON.stringify({ ...view, reruns: entry.reruns ?? 0 })}`);
+        log(`ci-job-hung: ESCALATE ${JSON.stringify({ ...view, reruns: entry.reruns ?? 0, ...(reason ? { reason } : {}) })}`);
         continue;
       }
       log(`ci-job-hung: DETECTED ${JSON.stringify(view)}`);
@@ -697,6 +807,7 @@ export function sweepHungJobs({
       entry.startedAt = h.startedAt;
       entry.thresholdSec = h.thresholdSec;
       if (status !== 'completed') {
+        held();
         try { cancelRun({ repo: slug, runId: h.runId }); entry.stage = 'cancel-requested'; entry.cancelRequestedAt = at; record(entry, 'cancel', h, true); }
         catch (e) { const msg = errText(e); entry.stage = isTransientGhError(msg) ? 'cancel-deferred' : 'cancel-failed'; record(entry, 'cancel', h, false, msg); }
       } else {
@@ -705,10 +816,14 @@ export function sweepHungJobs({
         rerun(entry, h, { viaCancel: !!entry.cancelRequestedAt });
       }
     }
+    held();
     try { writeHungState(state, statePath); } catch { /* best-effort — the actions above already happened and were logged */ }
     return { checkedAt: at, prs: prs.length, hung, actions, escalations };
-  });
+  }
 }
+
+/** Thrown inside the hung sweep when its ledger lock was taken over: the sweep stops without writing. */
+class LockLost extends Error {}
 
 // ── CLI ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
