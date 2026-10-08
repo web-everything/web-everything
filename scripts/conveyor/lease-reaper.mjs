@@ -1313,15 +1313,20 @@ export function fetchSessionSignals(flags, { exec = execFileSync } = {}) {
   return { states, pidAlive, agents: Array.isArray(sessions) ? sessions : null };
 }
 
-/** #3903 — the io half of {@link detachedWrapperPidsBySession}: read every run record once, never throwing. */
-function readDetachedWrapperPids(store = createFileRunStore()) {
-  const runs = [];
+/** #3903 — the io half of {@link detachedWrapperPidsBySession}: read every run record once, never throwing.
+ *  #xp4r23a — reduces ONE record at a time and drops it: it used to hold every parsed record in one array, and
+ *  with ~30k records (~4.9 GB) in the shared run store every reaper tick died of heap exhaustion from
+ *  2026-10-08T08:37Z on — no lease was reaped on any axis until this changed. Exported for its test. */
+export function readDetachedWrapperPids(store = createFileRunStore()) {
+  const bySession = new Map();
   let ids = [];
-  try { ids = store.list(); } catch { return new Map(); }
+  try { ids = store.list(); } catch { return bySession; }
   for (const id of Array.isArray(ids) ? ids : []) {
-    try { const run = store.read(id); if (run) runs.push(run); } catch { /* one bad record never blocks the sweep */ }
+    let run = null;
+    try { run = store.read(id); } catch { continue; /* one bad record never blocks the sweep */ }
+    if (run) for (const [session, pid] of detachedWrapperPidsBySession([run])) bySession.set(session, pid);
   }
-  return detachedWrapperPidsBySession(runs);
+  return bySession;
 }
 
 /** #4370 — the actor name the reaper stamps on the journal line its `release` child writes. */

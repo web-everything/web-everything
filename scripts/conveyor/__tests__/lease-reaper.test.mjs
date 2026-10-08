@@ -41,6 +41,7 @@ import {
   fetchPrStatesForRepo,
   restPullToPrStateShape,
   detachedWrapperPidsBySession,
+  readDetachedWrapperPids,
   laneBranchItemNum,
   laneQuietSincePr,
   DEFAULT_QUIET_MS,
@@ -1781,5 +1782,20 @@ describe('#xp4r23a — a PR that merged BEFORE the lease was acquired never reap
     expect(prTerminalPredatesLease({ state: 'merged', terminalAt: null, mergedAt: null }, { acquiredAt: ACQUIRED })).toBe(false);
     expect(prTerminalPredatesLease({ state: 'merged', terminalAt: '2026-10-08T00:00:00Z' }, { acquiredAt: 'garbage' })).toBe(false);
     expect(prTerminalPredatesLease({ state: 'open', terminalAt: null }, { acquiredAt: ACQUIRED })).toBe(false);
+  });
+});
+
+// #xp4r23a — the live reaper died of heap exhaustion every tick from 2026-10-08T08:37Z: it held all ~30k parsed
+// run records (~4.9 GB) in one array. The reader now reduces one record at a time and never retains it.
+describe('#xp4r23a — readDetachedWrapperPids reduces record-by-record (never retains the whole run store)', () => {
+  const rec = (id, session, pid) => ({ id, effects: [{ status: 'in-flight', handle: `pid:${pid}`, payload: { sessionSlug: session } }] });
+  it('returns the same map as the pure reducer over every record (the OOM itself is proven live, see PR body)', () => {
+    const records = { a: rec('a', 'conveyor-1', 101), b: { id: 'b', effects: [] }, c: rec('c', 'conveyor-2', 202) };
+    const store = { list: () => Object.keys(records), read: (id) => structuredClone(records[id]) };
+    expect([...readDetachedWrapperPids(store)]).toEqual([...detachedWrapperPidsBySession(Object.values(records))]);
+  });
+  it('a record that throws on read is skipped, never fatal', () => {
+    const store = { list: () => ['x', 'y'], read: (id) => { if (id === 'x') throw new Error('bad json'); return rec('y', 'conveyor-9', 9); } };
+    expect([...readDetachedWrapperPids(store)]).toEqual([['conveyor-9', 9]]);
   });
 });
