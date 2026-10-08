@@ -1,9 +1,7 @@
 ---
 bornAs: xx2620y
-kind: story
-size: 21
+kind: epic
 status: open
-scope: ["we:scripts/operations/file-item.mjs", "we:scripts/backlog.mjs", "we:scripts/backlog/", "we:scripts/readiness/", "we:scripts/lib/review-core.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/lib/citation-check.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/operations/codex-worker.mjs"]
 dateOpened: "2026-10-08"
 preparedDate: "2026-10-08"
 preparedAgainstSha: "8c38bb29412dab7ff4a15e7a8dda21e1542c7f47"
@@ -12,7 +10,9 @@ tags: []
 
 # Task agreement on every card: required Acceptance and Non-goals, and reviewers judge the diff against them
 
-Operator 2026-10-08 (from the Harness Engineering article review): every buildable card should say what "done" means and what is deliberately out of scope, and reviewers should judge the diff against that list, so a build that solves an easier task and calls it done is caught. **Prepared and ruled 2026-10-08: see `## Ruling` below, which supersedes the prepared defaults where they differ (Fork 1 adds a one-off refresh; Fork 3 picks `## Acceptance` with cite-able `[A1]`/`[N1]` items).** Measured on `main` @ `8c38bb294` (script under Context): of 1,448 open stories, 646 (44.6%) have a filled `## Done when`/`## Acceptance`, 679 carry only the scaffold TODO, and 38 (2.6%) have a Non-goals section. Acceptance already has a home (`## Done when`, #2949); Non-goals has none; nothing enforces either; jurors never see either. Five forks below, each with a **bold recommended default**, a `Skeptic:` and a `Screen:` line, kept as the prepared record. The review `humanGate` the preparer set is removed now that the forks are ruled; the card is sized 21 (the slice total) so it splits into the slices below rather than building whole.
+Umbrella for the task-agreement rule; sliced 2026-10-08 into S1 #xdeqs8k, S2 #xbb6fgj, S3 #xk8lm2t, S4 #xphujml, S5 #x6f9vwo, S6 #xdg7er2, S7 #x251p1l (see `## Slices`). Every buildable card carries `## Acceptance` and `## Non-goals` with `[A#]`/`[N#]` items, checked at prepare and judged by the correctness juror as a floor.
+
+Operator 2026-10-08 (from the Harness Engineering article review): every buildable card should say what "done" means and what is deliberately out of scope, and reviewers should judge the diff against that list, so a build that solves an easier task and calls it done is caught. **Prepared and ruled 2026-10-08: see `## Ruling` below, which supersedes the prepared defaults where they differ (Fork 1 adds a one-off refresh; Fork 3 picks `## Acceptance` with cite-able `[A1]`/`[N1]` items).** Measured on `main` @ `8c38bb294` (script under Context): of 1,448 open stories, 646 (44.6%) have a filled `## Done when`/`## Acceptance`, 679 carry only the scaffold TODO, and 38 (2.6%) have a Non-goals section. Acceptance already has a home (`## Done when`, #2949); Non-goals has none; nothing enforces either; jurors never see either. Five forks below, each with a **bold recommended default**, a `Skeptic:` and a `Screen:` line, kept as the prepared record. The review `humanGate` the preparer set is removed now that the forks are ruled; the card was split into the slices below (now an epic with no size; the children carry the points).
 
 ## Ruling (ratified 2026-10-08, operator)
 
@@ -190,6 +190,8 @@ Screen: clear — whether a diff with a regression can land once it meets the li
 - Sonnet writes each card's sections. Haiku 5.5 checks only the shape (headings present, `[A#]`/`[N#]` ids, no `TODO`, `n/a: <why>` used correctly) and sends a failing card back once; a second failure leaves the card untouched and logged.
 - About 50 cards per PR, each PR through `open-pr` and the normal review.
 - S2 waits for S7, so a card that switches to `## Acceptance` does not lose the provenance escape or the Must-cite check.
+
+**Filed 2026-10-08:** S1 #xdeqs8k (3), S2 #xbb6fgj (5, blocked by S1 and S7), S3 #xk8lm2t (2), S4 #xphujml (5), S5 #x6f9vwo (5), S6 #xdg7er2 (3), S7 #x251p1l (3); S3–S7 are each blocked by S1.
 
 S3–S7 have disjoint touch-sets and can run in parallel after S1. The setting flip from `advise` to `enforce` is a one-line config change after S4, on the trigger above.
 
