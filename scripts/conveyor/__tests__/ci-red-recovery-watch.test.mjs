@@ -1029,6 +1029,33 @@ describe('ci-red-recovery-watch — sweepMissingRunRecovery (PR #2729 fixture: z
     expect(result.refusals).toEqual([expect.objectContaining({ prNumber: 217, kind: 'missing-run-cap-exhausted' })]);
     expect(trigger).not.toHaveBeenCalled();
   });
+  // PR #4447 review (security/cap-bypass): the stale-marker test must compare the base EXACTLY, never parse it back out
+  // of prose. Git ref names may hold `,` and `)`, so a parsed base is truncated and a still-stacked refusal reads as
+  // stale (cap bypassed: one trigger attempt + comment per sweep, forever). Also a PREFIX of a longer base must not match.
+  it.each([
+    ['comma in the base, still stacked on it', 'lane/a,b', 'lane/a,b', true],
+    ['close paren in the base, still stacked on it', 'lane/a)b', 'lane/a)b', true],
+    ['current base is a PREFIX of the marker base (lane/a vs lane/a,b)', 'lane/a', 'lane/a,b', false],
+    ['marker base is a PREFIX of the current base (lane/a,b vs lane/a)', 'lane/a,b', 'lane/a', false],
+    ['marker base unknown (`?`) cannot be proven stale', 'main', '?', true],
+    ['current base unknown (null) cannot prove staleness', null, 'lane/old-base', true],
+    ['retargeted to main after the old base landed', 'main', 'lane/old-base', false],
+  ])('stacked-refusal marker: %s', (_name, currentBase, markerBase, counts) => {
+    const marker = (n) => ({
+      body: `🚦 conveyor missing-run-recovery\n\nbranch: ${PR_217.headRefName}\nsha: ${PR_217.headRefOid}\n\nconveyor missing-run-recovery attempted to trigger CI (pull-request-push) and it FAILED: PR is stacked or from a fork (base ${markerBase}, head repo plateauapp/plateau-app); missing-run push recovery only handles same-repo PRs on main (attempt ${n})`,
+      author: { login: 'web-everything' },
+    });
+    const trigger = vi.fn(() => ({ ok: true, action: 'pull-request-push', newHeadSha: 'c'.repeat(40) }));
+    const result = sweepMissingRunRecovery({
+      apply: true, repo: 'plateauapp/plateau-app', readOpenPrs: () => [{ ...PR_217, baseRefName: currentBase }],
+      readRequiredContexts: () => null, readDeclaredContexts: () => ['test', 'e2e'], readHeadCommittedAt: () => '2026-10-08T09:27:50Z',
+      readComments: () => [marker(1), marker(2)], trigger, postComment: vi.fn(), clearLabel: vi.fn(() => true),
+      now: Date.parse('2026-10-08T12:30:00Z'),
+    });
+    const capped = result.refusals.some((r) => r.prNumber === 217 && r.kind === 'missing-run-cap-exhausted');
+    expect(capped).toBe(counts);
+    expect(trigger).toHaveBeenCalledTimes(counts ? 0 : 1);
+  });
 
   // Live incident, web-everything/web-everything#2793 (landing freeze, 2026-09-27) — real `gh pr view` shape: base
   // `main`, `mergeable: CONFLICTING`, `mergeStateStatus: DIRTY`, empty rollup, head sha
