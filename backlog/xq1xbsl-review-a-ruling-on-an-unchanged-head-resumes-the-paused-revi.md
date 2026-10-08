@@ -2,7 +2,7 @@
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/operations/review-loop-cli.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/conveyor/review-referral-hold.mjs", "we:scripts/operations/review-pr-io.mjs"]
+scope: ["we:scripts/operations/review-loop-cli.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/operations/engine.mjs", "we:scripts/operations/review-dispatch.mjs", "we:scripts/lib/jury-core.mjs", "we:scripts/conveyor/review-referral-hold.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
@@ -13,7 +13,7 @@ After an operator ruling on an unchanged head the review daemon (we:scripts/conv
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+1. **Executable** — `npx vitest run` on we:scripts/operations/__tests__/review-ruling-resume.test.mjs and we:scripts/conveyor/__tests__/review-referral-hold.test.mjs fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -23,10 +23,10 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — juror finding text only feeds finding-identity matching (path plus normalized claim); it never builds a command or path.
+2. **Truncated reads** — the resume reads the complete paginated PR thread; an unreadable PR or run store answers null and a fresh review starts.
+3. **Shared state files** — the run record is rewritten in place through the run store; the resume only proceeds for a run parked on a confirm step.
+4. **Fail closed** — any doubt (head moved, re-arm, send-back, operator reply, persistence failure, `WE_REVIEW_RESUME_PARKED=0`) starts a fresh review; the referral step still reads the thread, so a block ruling still gates.
+5. **Identity scoping** — a finding is matched by finding identity (#4233), never by wording or line; covered means already referred on this head.
+6. **State over time** — a push moves the head, so the parked run no longer resumes and new referrals come only from the new review.
+7. **Who wrote it** — only trusted-marker authors and the operator count as ruling events.

@@ -396,15 +396,15 @@ export async function runReviewLoopOnce({
       run = rewindRunToStep(parked, { registry, step: RESUME_STEP, at: now() });
       store.write(run);
     } else {
-    run = startRun({
-      op: declaration.name,
-      id: parsed.control.runId || mintRunId(),
-      // #xu2pp2m — see `applyUnattendedActorDefault`: this driver is the UNATTENDED one, so an unnamed actor
-      // is an agent, never `review-pr`'s own human-terminal `'operator'` default.
-      input: applyUnattendedActorDefault(parsed.input, argv),
-      registry,
-    });
-    store.write(run);
+      run = startRun({
+        op: declaration.name,
+        id: parsed.control.runId || mintRunId(),
+        // #xu2pp2m — see `applyUnattendedActorDefault`: this driver is the UNATTENDED one, so an unnamed actor
+        // is an agent, never `review-pr`'s own human-terminal `'operator'` default.
+        input: applyUnattendedActorDefault(parsed.input, argv),
+        registry,
+      });
+      store.write(run);
     }
   }
 

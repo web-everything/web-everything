@@ -14,7 +14,7 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { judgeOutcome } from '../cli-adapter.mjs';
 import { rewindRunToStep } from '../engine.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
-import { runReviewLoopOnce } from '../review-loop-cli.mjs';
+import { runReviewLoopOnce, defaultFindResumableRun } from '../review-loop-cli.mjs';
 import {
   classifyReferralsByRound, findingIdentityTable, REFERRAL_DEMOTED_REASONS, referralFindingKey, normalizeFinding,
   mandatoryReferralReviewer, renderReferralRecord,
@@ -133,6 +133,12 @@ describe('rewindRunToStep', () => {
     expect(back.findings.mandatoryReferrals).toBeUndefined();
     expect(back.findings.referralVerdict).toBeUndefined();
     expect(back.effects.every((e) => e.step !== 'mandatoryReferrals')).toBe(true);
+    const stepAt = declaration.steps.find((x) => x.name === 'mandatoryReferrals').index;
+    // The earlier steps' records survive the rewind (a drop-everything filter would also pass the lines above).
+    expect(back.effects).toEqual(run.effects.filter((e) => e.step !== 'mandatoryReferrals' && e.stepIndex < stepAt));
+    expect(back.stepTimings.some((t) => t.step === 'read')).toBe(true);
+    expect(back.stepTimings.every((t) => t.stepIndex < stepAt)).toBe(true);
+    expect(() => rewindRunToStep({ ...run, cursor: 0, pending: null }, { registry, step: 'mandatoryReferrals' })).toThrow(/has not reached/);
     expect(back.resumedAt).toBe('2026-10-08T12:10:00.000Z');
     expect(() => rewindRunToStep(run, { registry, step: 'nope' })).toThrow(/no step/);
   });
@@ -216,5 +222,17 @@ describe('review-pr reduce — a later panel on an unchanged head adds no mandat
     const reduce = await reduceWith([{ ...newFinding, disposition: 'blocker' }]);
     expect(reduce.referrals).toEqual([]);
     expect(reduce.deferredAdvisory.some((f) => f.deferred === REFERRAL_DEMOTED_REASONS.LATER_ROUND_SAME_HEAD && f.summary === newFinding.summary)).toBe(true);
+  });
+});
+
+describe('defaultFindResumableRun — never throws; an unreadable PR or store means a fresh review', () => {
+  const target = { repo: 'o/n', pr: 4361 };
+  it('answers null when the PR read throws, has no head, or the run store read throws', () => {
+    expect(defaultFindResumableRun(target, { readPr: () => { throw new Error('gh down'); }, readRuns: () => [] })).toBeNull();
+    expect(defaultFindResumableRun(target, { readPr: () => ({}), readRuns: () => [] })).toBeNull();
+    expect(defaultFindResumableRun(target, { readPr: () => ({ headRefOid: HEAD_1, comments: [] }), readRuns: () => { throw new Error('disk'); } })).toBeNull();
+  });
+  it('answers null when there is no run for the PR', () => {
+    expect(defaultFindResumableRun(target, { readPr: () => ({ headRefOid: HEAD_1, comments: [] }), readRuns: () => [] })).toBeNull();
   });
 });
