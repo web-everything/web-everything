@@ -537,3 +537,120 @@ export function isDeliveredLease({ porcelain, headIsAncestorOfUpstream, headComm
     && Number.isFinite(headCommitMs) && Number.isFinite(acquiredAtMs)
     && headCommitMs >= acquiredAtMs;
 }
+
+// ── The lane hold rule (#xbdixjc) ─────────────────────────────────
+// "May this lane be released, reset, removed or reclaimed right now?" A fixer that ends its turn to await verify
+// looks gone to the lease reaper; on 2026-10-08 17:00–21:00Z the reaper released 24 lanes holding unpushed work
+// and acquire reset 10 over it, stranding verified commits (#4446, #4461, #4433, #4453). This is ONE rule, pure,
+// over plain facts — no git, GitHub, label or file-name strings — so the reaper, release, acquire, trim, reclaim
+// and refresh paths all ask the same question and a second implementation can pass the same replay fixtures.
+// Every threshold and mode is a DECLARED SETTING below; the `off` values reproduce the behaviour before this rule.
+
+/** The rule's name, as it appears in journal lines, logs and the settings env prefix. */
+export const LANE_HOLD_RULE = 'lane-hold';
+
+/** Built-in settings. Off values (the pre-rule behaviour): `mode: 'off'`, `aheadEquivalence: 'any'`. */
+export const BUILT_IN_LANE_HOLD_SETTINGS = Object.freeze({
+  // 'enforce' — a held lane is refused by every path; 'off' — the rule always allows (the pre-rule behaviour).
+  mode: 'enforce',
+  // How long a hold signal (an await-verify record, a running or passed verify, an unreadable verify record) stays
+  // live, measured from its own timestamp. Equals the await-verify TTL (150 min); past it the salvage path takes
+  // the work, so a lane is never held forever.
+  holdMinutes: 150,
+  // How much of a lane's unpushed history must be patch-equivalent to work already on the remote before a
+  // reset may treat it as pushed: 'every' unpushed change, or 'any' one of them (the pre-rule behaviour, which
+  // let one already-pushed commit vouch for a newer unpushed fix — lane-5, 4b254297, 2026-10-08 17:56Z).
+  aheadEquivalence: 'every',
+});
+
+const LANE_HOLD_SETTING_RULES = {
+  mode: (v) => v === 'enforce' || v === 'off',
+  holdMinutes: (v) => Number.isFinite(v) && v >= 1 && v <= 24 * 60,
+  aheadEquivalence: (v) => v === 'every' || v === 'any',
+};
+/** Env overrides, one per setting. */
+export const LANE_HOLD_SETTING_ENV = Object.freeze({
+  mode: 'WE_LANE_HOLD', holdMinutes: 'WE_LANE_HOLD_MINUTES', aheadEquivalence: 'WE_LANE_AHEAD_EQUIVALENCE',
+});
+
+/**
+ * Resolve the settings: built-ins, then a plain object (a settings file's contents), then env. Each key is
+ * validated on its own; a malformed value keeps the built-in (never a looser one). Pure.
+ * @param {{env?:object, raw?:object}} [p]
+ */
+export function resolveLaneHoldSettings({ env = {}, raw = null } = {}) {
+  const out = { ...BUILT_IN_LANE_HOLD_SETTINGS };
+  const take = (key, value) => { if (LANE_HOLD_SETTING_RULES[key](value)) out[key] = value; };
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const key of Object.keys(LANE_HOLD_SETTING_RULES)) if (Object.hasOwn(raw, key)) take(key, raw[key]);
+  }
+  for (const [key, name] of Object.entries(LANE_HOLD_SETTING_ENV)) {
+    const value = env?.[name];
+    if (value === undefined || value === '') continue;
+    take(key, key === 'holdMinutes' ? Number(value) : String(value).trim());
+  }
+  return out;
+}
+
+/** The actions the rule judges. `take-over` = a new holder claiming a lane whose lease went stale. */
+export const LANE_HOLD_ACTIONS = Object.freeze(['release', 'reset', 'remove', 'reclaim', 'take-over']);
+
+const holdLive = (atMs, nowMs, holdMs) => Number.isFinite(atMs) && nowMs - atMs <= holdMs;
+
+/**
+ * Does the decision for these facts depend on `unpushed`? Lets an IO shell skip the (costly) work-state read
+ * when the answer cannot change. Pure; same fact shape as {@link laneHoldVerdict}.
+ */
+export function laneHoldNeedsWorkState(facts, settings = BUILT_IN_LANE_HOLD_SETTINGS) {
+  if (!facts || settings.mode === 'off') return false;
+  if (facts.byHolder === true && facts.action === 'release') return false;
+  const holdMs = settings.holdMinutes * 60_000;
+  if ((facts.awaits ?? []).some((a) => holdLive(a?.requestedAtMs, facts.nowMs, holdMs))) return false;
+  const v = facts.verify;
+  if (!v || !holdLive(v.atMs, facts.nowMs, holdMs)) return false;
+  if (v.state === 'running') return false;
+  if (v.state === 'unreadable') return true;
+  return v.state === 'passed' && !!v.revision && v.revision === facts.revision;
+}
+
+/**
+ * THE LANE HOLD RULE. Pure.
+ * @param {{
+ *   action: 'release'|'reset'|'remove'|'reclaim'|'take-over',
+ *   byHolder?: boolean,            // the caller holds this lane's lease (its own release is always allowed)
+ *   nowMs: number,
+ *   awaits?: Array<{requestedAtMs:number}>, // await-verify records that name this lane (a parked fixer)
+ *   verify?: null|{state:'running'|'passed'|'failed'|'unreadable', revision?:string|null, atMs:number},
+ *   revision?: string|null,        // the lane's current commit id
+ *   unpushed?: boolean|null,       // the lane holds work on no remote; null/undefined = unknown
+ * }} facts
+ * @param {typeof BUILT_IN_LANE_HOLD_SETTINGS} [settings]
+ * @returns {{allowed:boolean, hold:(null|'awaiting-verify'|'verifying'|'verified-unpushed'|'verify-unreadable'|'work-state-unknown'), reason:string}}
+ */
+export function laneHoldVerdict(facts, settings = BUILT_IN_LANE_HOLD_SETTINGS) {
+  const allow = (reason) => ({ allowed: true, hold: null, reason });
+  const hold = (h, reason) => ({ allowed: false, hold: h, reason: `${LANE_HOLD_RULE}: ${reason}` });
+  if (settings?.mode === 'off') return allow(`${LANE_HOLD_RULE} off`);
+  if (!facts || typeof facts !== 'object' || !LANE_HOLD_ACTIONS.includes(facts.action) || !Number.isFinite(facts.nowMs)) {
+    return hold('work-state-unknown', 'facts missing or malformed — never act blind');
+  }
+  if (facts.byHolder === true && facts.action === 'release') return allow('the holder releases its own lane');
+  const holdMs = (settings?.holdMinutes ?? BUILT_IN_LANE_HOLD_SETTINGS.holdMinutes) * 60_000;
+  const { nowMs } = facts;
+  if ((facts.awaits ?? []).some((a) => holdLive(a?.requestedAtMs, nowMs, holdMs))) {
+    return hold('awaiting-verify', 'a fixer is parked awaiting verify for this lane and will resume in it');
+  }
+  const v = facts.verify;
+  if (v && holdLive(v.atMs, nowMs, holdMs)) {
+    if (v.state === 'running') return hold('verifying', 'a verify gate is running or queued for this lane');
+    const atHead = v.state === 'passed' && !!v.revision && v.revision === facts.revision;
+    if (atHead || v.state === 'unreadable') {
+      if (facts.unpushed === false) return allow('verified work is already pushed');
+      if (facts.unpushed !== true) return hold('work-state-unknown', 'cannot tell whether the verified work is pushed');
+      return atHead
+        ? hold('verified-unpushed', 'the lane holds a verified commit that is not pushed yet')
+        : hold('verify-unreadable', 'the verify record is unreadable and the lane holds unpushed work');
+    }
+  }
+  return allow('no hold signal');
+}
