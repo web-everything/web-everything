@@ -709,6 +709,9 @@ ${note}
 `;
     try {
       execFileSync('git', ['clone', '--quiet', '--shared', ROOT, repo], { stdio: 'pipe' });
+      // The backlog guards need a base ref. A CI checkout is detached, so the shared clone has no
+      // origin/main of its own: pin one to HEAD instead of relying on the developer's local branches.
+      execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo, stdio: 'pipe' });
       symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
       // The shared clone has only committed state: overlay the files under test.
       for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs']) copyFileSync(join(ROOT, f), join(repo, f));
@@ -717,6 +720,7 @@ ${note}
           cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 180_000,
         });
         expect(r.error, r.stderr).toBeUndefined();
+        expect(r.stdout, `check:standards exit ${r.status}: ${r.stderr}`).not.toBe('');
         return JSON.stringify(JSON.parse(r.stdout).warnings);
       };
       writeFileSync(join(repo, card), content('No note here.'));
