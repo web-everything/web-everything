@@ -12,7 +12,7 @@
  */
 import * as filesystem from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { basename, dirname, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { logicalCloneRoot } from './daemon-clone-layout.mjs';
 import { validateDaemonVersionsSettings } from './daemon-versions-settings.mjs';
 import { switchCurrent } from './daemon-version-switch.mjs';
@@ -84,20 +84,151 @@ function stripExclude(fs, file, lines) {
   const drop = new Set(lines);
   fs.writeFileSync(file, fs.readFileSync(file, 'utf8').split('\n').filter(l => !drop.has(l)).join('\n'));
 }
+/**
+ * The clones root the runtime will look in, from the settings FILE alone. The daemon runs under launchd with its
+ * own environment, so neither the operator's shell nor its cwd can be assumed to match: an env override or a
+ * relative clonesRoot is refused by `homeProblem` instead of being guessed at.
+ */
+function runtimeHome(logical, settings) {
+  const { clonesRoot } = validateDaemonVersionsSettings(settings ?? {});
+  return clonesRoot ? resolve(clonesRoot) : join(dirname(logical), '.daemon-clones');
+}
+function homeProblem(logical, settings, home, env) {
+  const config = validateDaemonVersionsSettings(settings ?? {});
+  const wanted = runtimeHome(logical, settings);
+  const hint = 'omit --home, or set an absolute clonesRoot in the daemon-versions settings file and nowhere else';
+  if (env?.WE_DAEMON_VERSIONS_CLONES_ROOT !== undefined) return { reason: 'clones-root-env', hint: 'the daemon cannot be shown to share this environment variable; unset it' };
+  if (config.clonesRoot && !isAbsolute(config.clonesRoot)) return { reason: 'clones-root-relative', hint };
+  if (home !== undefined && resolve(home) !== wanted) return { reason: 'home-not-discoverable', home: resolve(home), runtimeHome: wanted, hint };
+  return null;
+}
+/** Files in `<home>/<name>` that migrate may overwrite: remembered exactly (bytes or link text) so a rollback restores them. */
+const HOME_FILES = ['current', 'previous', 'state.json', 'migration.json', 'settings.local.json'];
+const MAX_HOME_FILE_BYTES = 1024 * 1024;
+/** JSON-safe, so the same snapshot can sit in the on-disk intent and survive a killed process. */
+function snapshotHomeFiles(fs, root) {
+  const saved = {};
+  for (const f of HOME_FILES) {
+    const s = stat(fs, join(root, f));
+    if (!s) continue;
+    if (s.isSymbolicLink()) saved[f] = { link: fs.readlinkSync(join(root, f)) };
+    else if (s.isFile() && s.size <= MAX_HOME_FILE_BYTES) saved[f] = { data: fs.readFileSync(join(root, f)).toString('base64'), mode: s.mode & 0o777 };
+    else throw new Error(`${join(root, f)} is not a plain file of at most ${MAX_HOME_FILE_BYTES} bytes: refusing to migrate over it`);
+  }
+  return saved;
+}
+/** Each file is replaced by rename, so a kill mid-restore never leaves a file missing; one failure does not skip the rest. */
+function restoreHomeFiles(fs, root, saved) {
+  const failures = [];
+  for (const f of HOME_FILES) {
+    const file = join(root, f);
+    const before = saved[f];
+    try {
+      if (!before) { fs.rmSync(file, { force: true }); continue; }
+      const temp = `${file}.restore-${process.pid}`;
+      fs.rmSync(temp, { force: true });
+      if (before.link !== undefined) fs.symlinkSync(before.link, temp);
+      else { fs.writeFileSync(temp, Buffer.from(before.data, 'base64')); fs.chmodSync(temp, before.mode); }
+      fs.renameSync(temp, file);
+    } catch (error) { failures.push(`${f}: ${error.message}`); }
+  }
+  if (failures.length) throw new Error(`could not restore home files: ${failures.join('; ')}`);
+}
+/**
+ * The durable record of a migrate in flight, written BEFORE its first state rename and deleted when it ends. It is
+ * what lets a run that was killed (no `catch` ran) be undone exactly: the state paths it may have moved, the
+ * exclude lines it appended, and the home files as they were.
+ */
+const intentFile = p => join(p.root, 'migrate-intent.json');
+const HOME_FILE_SET = new Set(HOME_FILES);
+function readIntent(fs, p) {
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(intentFile(p), 'utf8')); } catch { return null; }
+  const ok = raw !== null && typeof raw === 'object' && Array.isArray(raw.paths) && raw.paths.every(plainRelativePath)
+    && Array.isArray(raw.exclude) && raw.exclude.every(l => typeof l === 'string' && l.startsWith('/') && plainRelativePath(l.slice(1)))
+    && raw.home !== null && typeof raw.home === 'object'
+    && Object.entries(raw.home).every(([f, v]) => HOME_FILE_SET.has(f) && v !== null && typeof v === 'object'
+      && (typeof v.link === 'string' || (typeof v.data === 'string' && Number.isInteger(v.mode))));
+  return ok ? raw : null;
+}
+function writeIntent(fs, p, intent) {
+  const temp = `${intentFile(p)}.tmp`;
+  fs.writeFileSync(temp, `${JSON.stringify(intent)}\n`, { mode: 0o600 });
+  fs.renameSync(temp, intentFile(p));
+}
+/** A migrate that was killed midway: put the state, exclude lines and home files back; the caller then starts fresh. */
+function recoverFromIntent(fs, p) {
+  if (!stat(fs, intentFile(p))) return;
+  const intent = readIntent(fs, p);
+  if (intent) {
+    restoreState(fs, p, intent.paths);
+    stripExclude(fs, join(p.logical, '.git', 'info', 'exclude'), intent.exclude);
+    restoreHomeFiles(fs, p.root, intent.home);
+  } // else unreadable: killed while writing it, before any state was touched
+  fs.rmSync(intentFile(p), { force: true });
+}
+/** One migrate per clone: an exclusive lock file holding the owner's pid; a dead owner's lock is taken over. */
+function acquireLock(fs, p) {
+  const file = join(p.root, 'migrate.lock');
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      fs.writeFileSync(file, String(process.pid), { flag: 'wx' });
+      return { release: () => fs.rmSync(file, { force: true }) };
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const pid = Number.parseInt(String(fs.readFileSync(file, 'utf8')), 10);
+      let alive = pid !== process.pid && Number.isInteger(pid) && pid > 0;
+      if (alive) try { process.kill(pid, 0); } catch (e) { alive = e.code === 'EPERM'; }
+      if (alive) return { held: pid };
+      fs.rmSync(file, { force: true });
+    }
+  }
+  return { held: 0 };
+}
 const paths = (name, clone, home, stamp) => {
   const logical = logicalCloneRoot(clone);
-  const root = join(resolve(home ?? join(dirname(logical), '.daemon-clones')), name);
+  const root = join(resolve(home), name);
   return { logical, root, state: join(root, 'state'), repo: join(root, 'repo.git'), marker: join(root, 'settings.local.json'), record: join(root, 'migration.json'), conflicts: join(root, 'conflicts', stamp) };
 };
 
-export async function migrate({ clone, home, settings, dryRun = false, force = false, deps = {} }) {
+/**
+ * One migrate per clone, and a migrate that was killed midway is undone from its on-disk intent before this one
+ * starts, so a re-run never has to guess whether a half-moved path is ours.
+ */
+export async function migrate(args) {
+  const { clone, home, settings, dryRun = false, deps = {} } = args;
+  const fs = deps.fs ?? filesystem;
+  const logical = logicalCloneRoot(clone);
+  // The runtime finds a clone's home from the settings file alone. A home it will not look in would migrate into a
+  // folder nothing reads (the daemon would go dark), so refuse rather than build there.
+  const problem = homeProblem(logical, settings, home, deps.env ?? process.env);
+  if (problem) return { status: 'refused', ...problem };
+  const p = paths(basename(logical), clone, runtimeHome(logical, settings), stampOf(deps));
+  const here = stat(fs, p.logical);
+  if (!here?.isDirectory()) return { status: 'refused', reason: here?.isSymbolicLink() ? 'already-a-symlink' : 'clone-missing' };
+  if (dryRun) return migrateInner(args);
+  const createdRoot = !stat(fs, p.root);
+  fs.mkdirSync(p.root, { recursive: true });
+  const lock = acquireLock(fs, p);
+  if (!lock.release) {
+    if (createdRoot) try { fs.rmdirSync(p.root); } catch { /* not empty: not ours */ }
+    return { status: 'refused', reason: 'migrate-in-progress', pid: lock.held };
+  }
+  try {
+    recoverFromIntent(fs, p);
+    return await migrateInner(args);
+  } finally {
+    lock.release();
+    if (createdRoot) try { fs.rmdirSync(p.root); } catch { /* a migration lives here now */ }
+  }
+}
+
+async function migrateInner({ clone, settings, dryRun = false, force = false, deps = {} }) {
   const fs = deps.fs ?? filesystem;
   const name = basename(logicalCloneRoot(clone));
   const stamp = stampOf(deps);
-  const p = paths(name, clone, home, stamp);
   const config = validateDaemonVersionsSettings(settings ?? { });
-  const here = stat(fs, p.logical);
-  if (!here?.isDirectory()) return { status: 'refused', reason: here?.isSymbolicLink() ? 'already-a-symlink' : 'clone-missing' };
+  const p = paths(name, clone, runtimeHome(logicalCloneRoot(clone), settings), stamp);
   if (stat(fs, join(p.root, 'current'))) return { status: 'refused', reason: 'already-migrated' };
   const overlays = readOverlays(p.logical, { env: deps.env ?? process.env });
   if (overlays.length) return { status: 'refused', reason: 'overlays', overlays: overlays.map(o => o.ref) };
@@ -120,19 +251,23 @@ export async function migrate({ clone, home, settings, dryRun = false, force = f
   const steps = [];
   const moved = [];
   const exclude = join(p.logical, '.git', 'info', 'exclude');
-  const added = [];
+  const added = []; // exclude lines this run appended (never a line the user already had)
   const legacy = join(p.root, `legacy-${stamp}`);
   const tmp = join(dirname(p.logical), `${name}.tmp-link`);
   // Everything after the first state move is undone, whether it ends in a refusal or a throw: the clone gets its
   // own state back and no `current`, marker or record is left pointing at a half-migrated home. Home files that
   // existed before this run (an earlier marker, switch state) are not ours to delete; `current` was checked absent.
-  const kept = new Set(['previous', 'state.json', 'migration.json', 'settings.local.json'].filter(f => stat(fs, join(p.root, f))));
+  const homeBefore = snapshotHomeFiles(fs, p.root);
   const rollback = () => {
     restoreState(fs, p, moved);
     stripExclude(fs, exclude, added);
     fs.rmSync(tmp, { force: true });
-    for (const f of ['current', 'previous', 'state.json', 'migration.json', 'settings.local.json']) if (!kept.has(f)) fs.rmSync(join(p.root, f), { force: true });
+    restoreHomeFiles(fs, p.root, homeBefore); // contents and link targets, not just whether the file existed
+    fs.rmSync(intentFile(p), { force: true });
   };
+  const haveLines = (stat(fs, exclude) ? fs.readFileSync(exclude, 'utf8') : '').split('\n');
+  // Down before the first rename: a kill from here on is undone by the next run from this file alone.
+  writeIntent(fs, p, { paths: stateNow, exclude: stateNow.map(path => `/${path}`).filter(line => !haveLines.includes(line)), home: homeBefore });
   try {
     fs.mkdirSync(p.root, { recursive: true });
     if (!stat(fs, join(p.repo, 'HEAD'))) {
@@ -162,8 +297,9 @@ export async function migrate({ clone, home, settings, dryRun = false, force = f
     }
     // A symlink is not matched by a `dir/` ignore pattern, so keep the legacy tree looking clean to git.
     const have = stat(fs, exclude) ? fs.readFileSync(exclude, 'utf8') : '';
-    for (const path of moved) if (!have.split('\n').includes(`/${path}`)) added.push(`/${path}`);
-    if (added.length) fs.appendFileSync(exclude, `${have && !have.endsWith('\n') ? '\n' : ''}${added.join('\n')}\n`);
+    const fresh = moved.map(path => `/${path}`).filter(line => !haveLines.includes(line));
+    if (fresh.length) fs.appendFileSync(exclude, `${have && !have.endsWith('\n') ? '\n' : ''}${fresh.join('\n')}\n`);
+    added.push(...fresh);
     steps.push(`state ${moved.length}`);
 
     const on = { ...config, enabled: { [name]: true } };
@@ -199,6 +335,7 @@ export async function migrate({ clone, home, settings, dryRun = false, force = f
       throw error;
     }
     steps.push('swapped');
+    fs.rmSync(intentFile(p), { force: true }); // done: nothing left to undo
     return { status: 'migrated', name, v0: record.id, legacy, moved, steps };
   } catch (error) {
     if (!error.cloneAtLegacy) try { rollback(); } catch (rollbackError) { error.rollbackError = rollbackError; }
@@ -207,10 +344,23 @@ export async function migrate({ clone, home, settings, dryRun = false, force = f
 }
 
 /** Reverse a migration from what the record says was moved, never from today's settings. */
-export async function unmigrate({ clone, home, dryRun = false, deps = {} }) {
+export async function unmigrate(args) {
+  const { clone, home, settings, dryRun = false, deps = {} } = args;
+  if (dryRun) return unmigrateInner(args);
+  const fs = deps.fs ?? filesystem;
+  const logical = logicalCloneRoot(clone);
+  const p = paths(basename(logical), clone, home ?? runtimeHome(logical, settings), stampOf(deps));
+  if (!stat(fs, p.root)) return unmigrateInner(args); // nothing to lock; it will report not-migrated
+  const lock = acquireLock(fs, p);
+  if (!lock.release) return { status: 'refused', reason: 'migrate-in-progress', pid: lock.held };
+  try { return await unmigrateInner(args); } finally { lock.release(); }
+}
+
+async function unmigrateInner({ clone, home, settings, dryRun = false, deps = {} }) {
   const fs = deps.fs ?? filesystem;
   const name = basename(logicalCloneRoot(clone));
-  const p = paths(name, clone, home, stampOf(deps));
+  // Same default as migrate, so a clone migrated under a configured clonesRoot is found again without --home.
+  const p = paths(name, clone, home ?? runtimeHome(logicalCloneRoot(clone), settings), stampOf(deps));
   const here = stat(fs, p.logical);
   let info = null;
   try { info = JSON.parse(fs.readFileSync(p.record, 'utf8')); } catch { /* none or unreadable: judged below */ }
@@ -230,7 +380,7 @@ export async function unmigrate({ clone, home, dryRun = false, deps = {} }) {
   const restored = restoreState(fs, p, info.moved);
   stripExclude(fs, join(p.logical, '.git', 'info', 'exclude'), info.excluded);
   fs.rmSync(p.marker, { force: true });
-  for (const f of ['current', 'previous', 'state.json', 'migration.json']) fs.rmSync(join(p.root, f), { force: true });
+  for (const f of ['current', 'previous', 'state.json', 'migration.json', 'migrate-intent.json']) fs.rmSync(join(p.root, f), { force: true });
   return { status: 'unmigrated', name, restored, versionsKept: join(p.root, 'versions') };
 }
 

@@ -207,6 +207,101 @@ describe('daemon version migrate / unmigrate', () => {
     expect(readFileSync(join(home, 'daemon', 'state.json'))).toBe('{"keep":1}');
   });
 
+  it('a late rollback restores the contents of home files that existed before, not just their presence', async () => {
+    fs.mkdirSync(join(home, 'daemon'), { recursive: true });
+    fs.writeFileSync(join(home, 'daemon', 'settings.local.json'), '{"enabled":false,"note":"mine"}');
+    fs.writeFileSync(join(home, 'daemon', 'state.json'), '{"keep":1}');
+    fs.writeFileSync(join(home, 'daemon', 'migration.json'), 'older record');
+    fs.mkdirSync(join(home, 'daemon', 'versions', 'old'), { recursive: true });
+    fs.symlinkSync('versions/old', join(home, 'daemon', 'previous'));
+    const before = snapshot(join(home, 'daemon'));
+    // The swap is the last step: current, previous, state.json, the marker and the record were all rewritten by then.
+    await expect(migrate({ clone, home, settings, deps: { ...deps, fs: throwOnRename(/legacy-/) } })).rejects.toThrow('EXDEV');
+    const after = snapshot(join(home, 'daemon'));
+    for (const f of ['settings.local.json', 'state.json', 'migration.json', 'previous']) expect(after[f]).toBe(before[f]);
+    expect(fs.existsSync(join(home, 'daemon', 'current'))).toBe(false);
+  });
+
+  it('refuses a home the runtime would not look in, and honours a configured clonesRoot', async () => {
+    const elsewhere = join(fixture, 'elsewhere');
+    const before = snapshot(clone);
+    expect(await migrate({ clone, home: elsewhere, settings, deps })).toMatchObject({ status: 'refused', reason: 'home-not-discoverable', runtimeHome: home });
+    expect(fs.existsSync(elsewhere)).toBe(false);
+    expect(snapshot(clone)).toEqual(before);
+    // the daemon (launchd) cannot be shown to share an env override, nor a relative path's cwd: both are refused
+    const withEnv = { ...deps, env: { ...deps.env, WE_DAEMON_VERSIONS_CLONES_ROOT: elsewhere } };
+    expect(await migrate({ clone, settings, deps: withEnv })).toMatchObject({ status: 'refused', reason: 'clones-root-env' });
+    expect(await migrate({ clone, settings: { ...settings, clonesRoot: 'relative/root' }, deps })).toMatchObject({ status: 'refused', reason: 'clones-root-relative' });
+    expect(fs.existsSync(join(ws, '.daemon-clones'))).toBe(false); // refusals leave no empty home behind
+    // a configured clonesRoot is the default home, and the runtime resolves the same folder
+    const configured = { ...settings, clonesRoot: elsewhere };
+    expect((await migrate({ clone, settings: configured, deps })).status).toBe('migrated');
+    expect(fs.existsSync(join(elsewhere, 'daemon', 'current'))).toBe(true);
+    expect(resolveVersionedContext({ root: clone, settings: { ...configured, enabled: { daemon: true } } }).home).toBe(elsewhere);
+    expect((await unmigrate({ clone, settings: configured, deps })).status).toBe('unmigrated');
+  });
+
+  const writeIntentFile = intent => {
+    fs.mkdirSync(join(home, 'daemon'), { recursive: true });
+    fs.writeFileSync(join(home, 'daemon', 'migrate-intent.json'), JSON.stringify(intent));
+  };
+
+  it('a migrate killed between a state rename and its link is undone from its intent, then redone, and still unmigrates', async () => {
+    const dest = join(home, 'daemon', 'state', '.conveyor');
+    fs.mkdirSync(join(home, 'daemon', 'state'), { recursive: true });
+    fs.renameSync(join(clone, '.conveyor'), dest); // killed here: gone from the clone, no link yet, no catch ran
+    writeIntentFile({ paths: ['.conveyor', '.operations'], exclude: ['/.conveyor', '/.operations'], home: {} });
+    const result = await migrate({ clone, home, settings, deps });
+    expect(result.status).toBe('migrated');
+    expect(result.moved).toEqual(['.conveyor', '.operations']);
+    expect(JSON.parse(readFileSync(join(home, 'daemon', 'migration.json'))).moved).toEqual(['.conveyor', '.operations']);
+    expect(fs.lstatSync(join(home, 'daemon', 'legacy-20261008T120000Z', '.conveyor')).isSymbolicLink()).toBe(true);
+    expect(fs.existsSync(join(home, 'daemon', 'migrate-intent.json'))).toBe(false);
+    expect((await unmigrate({ clone, home, settings, deps })).restored).toEqual(['.conveyor', '.operations']);
+    expect(readFileSync(join(clone, '.conveyor', 'daemon.log'))).toBe('log line\n');
+  });
+
+  it('a migrate killed after current and the marker were written, before the swap, can be re-run', async () => {
+    await migrate({ clone, home, settings, deps });
+    // put the world back as a kill after the pointer writes would leave it: clone is a real dir, no record
+    fs.rmSync(clone); fs.renameSync(join(home, 'daemon', 'legacy-20261008T120000Z'), clone);
+    fs.rmSync(join(home, 'daemon', 'migration.json'));
+    writeIntentFile({ paths: ['.conveyor', '.operations'], exclude: ['/.conveyor', '/.operations'], home: {} });
+    expect(await migrate({ clone, home, settings, deps })).toMatchObject({ status: 'migrated', moved: ['.conveyor', '.operations'] });
+    expect((await unmigrate({ clone, home, settings, deps })).status).toBe('unmigrated');
+    expect(readFileSync(join(clone, '.operations', 'run.json'))).toBe('1');
+    expect(readFileSync(join(clone, '.git', 'info', 'exclude')).split('\n')).not.toContain('/.conveyor');
+  });
+
+  it('a state/ entry with no clone side and no intent is stale, not an interrupted move', async () => {
+    fs.rmSync(join(clone, '.operations'), { recursive: true });
+    fs.mkdirSync(join(home, 'daemon', 'state'), { recursive: true });
+    fs.writeFileSync(join(home, 'daemon', 'state', '.operations'), 'stale');
+    const result = await migrate({ clone, home, settings, deps });
+    expect(result.moved).toEqual(['.conveyor']);
+    expect(fs.lstatSync(join(home, 'daemon', 'legacy-20261008T120000Z')).isDirectory()).toBe(true);
+    expect(fs.existsSync(join(home, 'daemon', 'legacy-20261008T120000Z', '.operations'))).toBe(false);
+  });
+
+  it('a rolled-back migrate keeps an exclude line the user wrote themselves', async () => {
+    fs.appendFileSync(join(clone, '.git', 'info', 'exclude'), '/.operations\n');
+    deps.buildVersion = async () => { throw new Error('boom'); };
+    await expect(migrate({ clone, home, settings, deps })).rejects.toThrow('boom');
+    const lines = readFileSync(join(clone, '.git', 'info', 'exclude')).split('\n');
+    expect(lines).toContain('/.operations');
+    expect(lines).not.toContain('/.conveyor');
+  });
+
+  it('one migrate at a time: a live owner holds the lock, a dead owner\'s lock is taken over', async () => {
+    fs.mkdirSync(join(home, 'daemon'), { recursive: true });
+    fs.writeFileSync(join(home, 'daemon', 'migrate.lock'), String(process.ppid)); // the test runner's parent is alive
+    expect(await migrate({ clone, home, settings, deps })).toMatchObject({ status: 'refused', reason: 'migrate-in-progress', pid: process.ppid });
+    expect(await unmigrate({ clone, home, settings, deps })).toMatchObject({ status: 'refused', reason: 'migrate-in-progress' });
+    fs.writeFileSync(join(home, 'daemon', 'migrate.lock'), '2147483646'); // no such process
+    expect((await migrate({ clone, home, settings, deps })).status).toBe('migrated');
+    expect(fs.existsSync(join(home, 'daemon', 'migrate.lock'))).toBe(false);
+  });
+
   it('when the swap fails and the way back fails too, the real clone is not replaced by an empty directory', async () => {
     const failing = { ...deps, fs: { ...fs, renameSync: (from, to) => {
       if (to === clone) throw Object.assign(new Error('EIO'), { code: 'EIO' }); // the link in, and the way back
