@@ -1155,3 +1155,41 @@ it('sweeps a main-fixed signature and posts durable refund evidence', () => {
   sweepCiRedRecovery({ ...options, readAheadBy: () => 0 });
   expect(readMainFixedSignatureFacts).not.toHaveBeenCalled();
 });
+
+// xd3dkzx — live replay 2026-10-08: main's CI workflow red on `daemon-soak` only; PRs failed `test` in that window.
+describe('ci-red-recovery-watch — check-scoped recovery (xd3dkzx live replay)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const fixture = JSON.parse(readFileSync(`${process.cwd()}/scripts/conveyor/__tests__/fixtures/owed-ci-rerun-check-scoped.json`, 'utf8'));
+  const prs = fixture.candidates.map((c) => ({
+    number: c.prNumber, headRefName: c.headRefName, headRefOid: c.headSha,
+    statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: c.failureCompletedAt }],
+  }));
+  const commonReaders = {
+    readOpenPrs: () => prs, readMainRuns: () => fixture.mainRuns, readAheadBy: () => 7,
+    readRequiredContexts: () => ['test', 'smoke', 'daemon-soak'], readMainLatestCheckRuns: () => [],
+  };
+
+  it('applies one refresh per head and records it (the marker comment), instead of main-still-red forever', () => {
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased', newCommit: 'n' }));
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      ...commonReaders, apply: true, readComments: () => [], refresh, postComment, reconcileAcceptance: () => ({}),
+    });
+    expect(result.refusals).toEqual([]);
+    expect(refresh.mock.calls.map((c) => c[0])).toEqual(fixture.candidates.map((c) => c.headRefName));
+    expect(postComment.mock.calls.map((c) => [c[0], c[1].headSha])).toEqual(fixture.candidates.map((c) => [c.prNumber, c.headSha]));
+  });
+
+  it('a head that already used its recorded attempts (marker comments for that sha) is not refreshed again', async () => {
+    const { buildRebaseOntoMainComment, DEFAULT_MAX_REBASE_RETRIES_PER_SHA } = await import('../main-red-recovery.mjs');
+    const readComments = (n) => {
+      const c = fixture.candidates.find((x) => x.prNumber === n);
+      const body = buildRebaseOntoMainComment({ headRefName: c.headRefName, headSha: c.headSha, ok: false, action: 'error', error: 'push failed' });
+      return Array.from({ length: DEFAULT_MAX_REBASE_RETRIES_PER_SHA }, () => ({ body, viewerDidAuthor: true }));
+    };
+    const refresh = vi.fn();
+    const result = sweepCiRedRecovery({ ...commonReaders, apply: true, readComments, refresh, postComment: vi.fn() });
+    expect(refresh).not.toHaveBeenCalled();
+    expect(result.refusals.map((r) => r.kind)).toEqual(['rebase-cap-exhausted', 'rebase-cap-exhausted', 'rebase-cap-exhausted']);
+  });
+});

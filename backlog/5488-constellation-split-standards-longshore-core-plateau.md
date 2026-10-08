@@ -40,8 +40,8 @@ Step numbers follow the plan. Steps 0a, 0b and 1 can start in parallel. Nothing 
 
 | Step | Card | Size | Blocked by |
 |---|---|---|---|
-| 0a | #xdjrqkz repo identity registry + guard (reused, in PR #4506) | 5 | — |
-| 0a | #x8d6s6j migrate slug call sites (reused, in PR #4506) | 8 | #xdjrqkz |
+| 0a | #5502 repo identity registry + guard (reused, in PR #4506) | 5 | — |
+| 0a | #5503 migrate slug call sites (reused, in PR #4506) | 8 | #5502 |
 | 0b | #3533 locus on every id (reused) | 5 | — |
 | 1 | #5481 ownership map, re-classified under S4 | 3 | — |
 | 1 | #5482 boundary guard (ratchet) | 3 | #5481 |
@@ -53,7 +53,7 @@ Step numbers follow the plan. Steps 0a, 0b and 1 can start in parallel. Nothing 
 | 3 | #5491 daemons read coreRoot | 3 | #5487 |
 | 3 | #5492 move into Longshore packages with shims | 8 | 2a–2d, #5491 |
 | S2+ | #5496 package manifests + all-in-one meta package | 2 | #5492 |
-| 4 | #5493 private mirror via filter-repo + secret scan | 5 | #5492 (+ #xdjrqkz once PR #4506 lands) |
+| 4 | #5493 private mirror via filter-repo + secret scan | 5 | #5492 (+ #5502 once PR #4506 lands) |
 | 5 | #5494 dual-run passes, verify, review, fix | 5 | #5493 |
 | 5 | #5495 dual-run build-dispatch, drain last | 5 | #5494 |
 | 6 | #5497 flip: WE consumes pinned @longshore | 5 | #5495, #5496, #5490 |
@@ -62,7 +62,7 @@ Step numbers follow the plan. Steps 0a, 0b and 1 can start in parallel. Nothing 
 | 8 | #5486 formerly alias + redirect stubs | 3 | #3533 |
 | 8 | #5500 move cards by topic | 5 | #5497, #5484, #5486 |
 | 8 | #5498 split skills, agent docs, memory | 5 | #5497 |
-| 9 | #xmkjis9 org rename runbook (reused, in PR #4506, held) | 3 | #x8d6s6j |
+| 9 | #5504 org rename runbook (reused, in PR #4506, held) | 3 | #5503 |
 
 Related, not re-filed: #5407 (Delivery standard: the protocol content Longshore implements), #2472 (multi-repo registry), #3963 (real multi-repo conveyor), #2158 (FUI checkout in the WE site build), #186 (legal review).
 
@@ -73,5 +73,5 @@ Related, not re-filed: #5407 (Delivery standard: the protocol content Longshore 
 
 ## Non-goals
 
-- [N1] Choosing the org move date (#xmkjis9 stays held for the operator).
+- [N1] Choosing the org move date (#5504 stays held for the operator).
 - [N2] Ruling #5405 names or #5409 governance.

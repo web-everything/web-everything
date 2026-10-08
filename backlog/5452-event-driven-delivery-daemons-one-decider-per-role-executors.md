@@ -23,8 +23,8 @@ Operator rulings E1-E7 of 2026-10-08 on the event-driven daemon design (feeds #3
 
 ## Slices (blockedBy DAG)
 
-1. xlta0x5 Event runtime foundation: persisted cursor + dirty-PR marking (3). Filed and being built by the `event-foundation-drain` lane, not re-filed here (it sits under #4075 there; re-parent it here and add it to #4283's `blockedBy` once it lands — it is not on main yet, so no `blockedBy` edge can name it today).
-2. #4283 Drain consumes the PR-events feed (2) ← foundation xlta0x5 (prose edge until it lands).
+1. 5501 Event runtime foundation: persisted cursor + dirty-PR marking (3). Filed and being built by the `event-foundation-drain` lane, not re-filed here (it sits under #4075 there; re-parent it here and add it to #4283's `blockedBy` once it lands — it is not on main yet, so no `blockedBy` edge can name it today).
+2. #4283 Drain consumes the PR-events feed (2) ← foundation 5501 (prose edge until it lands).
 3. 5453 Log accepts runtime events (action-requested, worker started/finished) (3) ← #4283 (step 1 done, E6).
 4. 5454 Decider process in shadow (5) ← #4283, 5453.
 5. 5459 Review executor + review sweep cut-over (3) ← 5454.

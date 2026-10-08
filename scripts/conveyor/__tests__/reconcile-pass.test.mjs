@@ -1403,3 +1403,20 @@ describe('item 69 resolveCheckOrigin', () => {
     await expect(get(mk('mystery', null))).rejects.toThrow('unknown-check-origin:mystery:github-actions:null');
   });
 });
+
+// xd3dkzx — check-scoped recovery needs each red main run's per-check verdict. Annotated only from a COMPLETE job
+// inventory (absence then means "did not run"); an unreadable/truncated one leaves no map (never a guess).
+it('defaultReadMainRuns annotates a failure run with checkConclusions from a complete jobs page (xd3dkzx)', async () => {
+  const { defaultReadMainRuns } = await import('../reconcile-pass.mjs');
+  const list = JSON.stringify([{ databaseId: 37851000000, conclusion: 'failure', status: 'completed', workflowName: 'CI', updatedAt: '2026-10-08T22:05:45Z' }]);
+  const job = (name, conclusion) => ({ name, status: 'completed', conclusion, runner_name: 'r', steps: [] });
+  const jobs = [job('test', 'success'), job('smoke', 'success'), job('soak-shard (2)', 'failure'), job('daemon-soak', 'failure')];
+  const complete = JSON.stringify({ total_count: jobs.length, jobs });
+  const out = defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? complete : list) });
+  expect(out[0].checkConclusions).toEqual({ test: 'success', smoke: 'success', 'soak-shard (2)': 'failure', 'daemon-soak': 'failure' });
+  const dup = [job('test', 'failure'), job('test', 'success')];
+  const dupPage = JSON.stringify({ total_count: dup.length, jobs: dup });
+  expect(defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? dupPage : list) })[0].checkConclusions).toEqual({ test: 'failure' });
+  const truncated = JSON.stringify({ total_count: 150, jobs });
+  expect(defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? truncated : list) })[0].checkConclusions).toBeUndefined();
+});

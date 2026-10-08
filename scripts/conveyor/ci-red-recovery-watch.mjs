@@ -271,7 +271,8 @@ export function sweepCiRedRecovery({
     comments ??= readComments(c.prNumber, { repo });
     return { ...withFacts, rebaseAttemptsForSha: countRebaseOntoMainComments(comments, c.headSha) };
   });
-  const plan = planMainRedRebases({ candidates, mainRedWindows, mainLatestCheckRuns, maxRebaseRetriesPerSha });
+  // xd3dkzx — mainRuns (with per-check verdicts) so recovery is judged on the PR's own failing check.
+  const plan = planMainRedRebases({ candidates, mainRedWindows, mainLatestCheckRuns, maxRebaseRetriesPerSha, mainRuns });
 
   // x5uqim1 follow-up (#4075/#3383) part (c) — "check the owed-ci-rerun path for frontierui/plateau-app too":
   // `rebaseDropManifest` needs a REAL LOCAL checkout of the repo it rebases (this file's own header). Left at
