@@ -17,6 +17,7 @@ Slice S1 of #5399 (ruled 2026-10-08, Fork 3): one pure reader, readTaskAgreement
 - [A1] **Executable** — `node --test we:scripts/backlog/__tests__/task-agreement.test.mjs` passes: `readTaskAgreement` reads `## Acceptance` and its legacy alias `## Done when`, reads `## Non-goals`, returns each `[A#]`/`[N#]` id with its line, drops TODO lines, treats `n/a: <why>` as answered, and reports a draft marker (fails before: the module does not exist).
 - [A2] **Executable** — a scaffold test shows a new story body carries `## Acceptance` with an `[A1]` TODO line and `## Non-goals` with an `[N1]` TODO line, and no `## Done when`.
 - [A3] **Observable** — `we:scripts/lib/task-agreement-policy.json` holds `taskAgreementPolicy: "advise"`, and its validator rejects any value outside `off | advise | enforce`.
+- [A4] **Executable** — the same test file shows an unparseable section (a malformed id, an unclosed fence, a heading with no body) reads as empty and not agreed, never as agreed.
 
 ## Non-goals
 

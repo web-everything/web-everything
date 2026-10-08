@@ -18,6 +18,7 @@ Slice S4 of #5399 (ruled 2026-10-08, Forks 1 and 2): prepareCardStatus requires 
 - [A1] **Executable** — a `dispatch-plan` test holds a stamped story with no `## Non-goals`, or with a draft-marked section, as `needs-task-agreement` under `enforce`, and dispatches it under `advise`.
 - [A2] **Executable** — a `prepare-result` test shows `prepareCardStatus` refuses a stamp without both sections under `enforce` and only reports it under `advise`.
 - [A3] **Observable** — the new hold reason appears in the dispatch-eligibility output and routes the card to the prepare agent; the prepare brief writes both sections and moves its out-of-scope sentence to `## Non-goals`.
+- [A4] **Executable** — a `dispatch-plan` test shows that under `enforce` a story whose section cannot be parsed is held as `needs-task-agreement`, and that a story stamped before the flip with no `## Non-goals` is held at dispatch even though its stamp is still current.
 
 ## Non-goals
 

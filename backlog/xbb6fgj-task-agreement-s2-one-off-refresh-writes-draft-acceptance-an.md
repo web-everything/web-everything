@@ -19,6 +19,7 @@ Slice S2 of #5399 (ruled 2026-10-08, Fork 1 = both): a refresh runner writes `##
 - [A1] **Executable** — a refresh-runner test shows: a card with `## Done when` gets it renamed to `## Acceptance` with `[A#]` ids and unchanged meaning; an `active`, PR-held or already-agreed card is skipped; a resolved card is never read for writing.
 - [A2] **Executable** — the shape check refuses a section with a TODO line, a missing id, or a bare `none`, sends it back once, and leaves the card untouched and logged on a second failure.
 - [A3] **Observable** — every open story the refresh processed has both sections with ids and a draft marker the S1 reader reports, landed in PRs of about 50 cards each through `open-pr`, nearest-to-build first.
+- [A4] **Executable** — a refresh-runner test with an injected free-scope check shows the ownership check runs again immediately before each card is written, not only when the batch is planned: a card that was free at plan time but is claimed by an open PR, or falls under a registered scope, before its write is skipped, left byte-identical and logged with the reason; a card whose ownership did not change is still written; a check that errors or times out skips the card (fail closed), never writes it.
 
 ## Non-goals
 
@@ -32,7 +33,7 @@ One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
 2. **Truncated reads** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
-3. **Shared state files** — skip any card held by an open PR or a registered scope (the free-scope check) at write time, not only at plan time.
+3. **Shared state files** — skip any card held by an open PR or a registered scope (the free-scope check) at write time, not only at plan time (tested by [A4]: ownership changes between plan and write, a registered scope, and a failing check).
 4. **Fail closed** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
 5. **Identity scoping** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
 6. **State over time** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
