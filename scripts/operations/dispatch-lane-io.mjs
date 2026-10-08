@@ -63,7 +63,7 @@ import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 // these ran SIMULTANEOUSLY in a single `ps aux` snapshot, none logged anywhere, spending the shared `graphql`
 // bucket (8943 points/hour that hour, 6365.2 UNATTRIBUTED — `gh-spend.mjs report --hours=1 --by=caller`).
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { readBuildDelivery, defaultListBuildPrs, defaultReadCardStatus, defaultReadCardOpened } from '../conveyor/build-delivery-evidence.mjs';
+import { readBuildDelivery, defaultListBuildPrs, defaultReadCardStatus, defaultReadCardOpened, NON_IMPLEMENTING_REF_RE } from '../conveyor/build-delivery-evidence.mjs';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createHash, randomUUID } from 'node:crypto';
@@ -2948,7 +2948,7 @@ export const ALREADY_DONE_JSON_FIELDS = 'number,title,url,mergedAt,headRefName,b
  * before the build has even started. Excluding the two authoring ref shapes is what keeps the check aimed at
  * "was the ITEM implemented", not "was the item's card ever touched".
  */
-export const NON_IMPLEMENTING_REF_RE = /^lane\/\d+[a-z]?-(scope|prepare)-/i;
+export { NON_IMPLEMENTING_REF_RE }; // defined once in build-delivery-evidence.mjs (xykwe0h); re-exported for existing importers
 
 /**
  * PURE — which of a `gh pr list --search` page's rows are real evidence that `num` is ALREADY DONE, most

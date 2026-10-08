@@ -18,8 +18,13 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import { normNum } from './queue-store.mjs';
 
-/** Prepare / scope authoring PRs never implement the build (mirrors dispatch-lane-io NON_IMPLEMENTING_REF_RE). */
-const AUTHORING_REF_RE = /^lane\/[^/]*?-(scope|prepare)-/i;
+/**
+ * Prepare / scope authoring PRs never implement the build. THE one definition: `dispatch-lane-io` re-exports it
+ * (it imports this module, so the shared home is here). The authoring shape is `lane/<num>[a-z]?-(scope|prepare)-<hash>`
+ * — anchored to the card number, so a real build whose slug merely CONTAINS "scope"/"prepare"
+ * (`lane/4400-narrow-scope-of-x`) is still a build (review of PR #4361).
+ */
+export const NON_IMPLEMENTING_REF_RE = /^lane\/\d+[a-z]?-(scope|prepare)-/i;
 
 /** Settled outcomes this module can name, in preference order when several PRs match. */
 export const DELIVERY_OUTCOMES = Object.freeze(['pr-merged', 'pr-open', 'card-resolved']);
@@ -34,7 +39,7 @@ export function prBelongsToBuild(pr, num) {
   // dispatch (review of PR #4361). Same-repo branches need write access, so only forks are dropped.
   if (pr.isCrossRepository === true) return false;
   const ref = String(pr.headRefName ?? '');
-  if (AUTHORING_REF_RE.test(ref)) return false;
+  if (NON_IMPLEMENTING_REF_RE.test(ref)) return false;
   const refRe = new RegExp(`^lane/${escapeRe(key)}[a-z]?(?:-|$)`, 'i');
   const titleRe = new RegExp(`(^|[^0-9])${escapeRe(key)}([^0-9]|$)`);
   return refRe.test(ref) || titleRe.test(String(pr.title ?? ''));

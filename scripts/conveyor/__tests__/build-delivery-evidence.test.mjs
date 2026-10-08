@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   classifyBuildDelivery, prBelongsToBuild, cardStatusFromText, cardOpenedFromText, readBuildDelivery, defaultListBuildPrs,
-  defaultReadCardStatus, defaultReadCardOpened,
+  defaultReadCardStatus, defaultReadCardOpened, NON_IMPLEMENTING_REF_RE,
 } from '../build-delivery-evidence.mjs';
+import { NON_IMPLEMENTING_REF_RE as IO_NON_IMPLEMENTING_REF_RE } from '../../operations/dispatch-lane-io.mjs';
 
 const pr = (over) => ({ number: 1, state: 'OPEN', title: 'WE #4388: build', headRefName: 'lane/4388-fix', mergedAt: null, url: 'u', ...over });
 
@@ -13,6 +14,16 @@ describe('prBelongsToBuild', () => {
     expect(prBelongsToBuild(pr({ headRefName: 'lane/4388-scope-abc' }), '4388')).toBe(false);
     expect(prBelongsToBuild(pr({ headRefName: 'lane/4388-prepare-abc' }), '4388')).toBe(false);
     expect(prBelongsToBuild(pr({ title: 'WE #43880: x', headRefName: 'lane/other' }), '4388')).toBe(false);
+  });
+  it('a real build whose slug merely CONTAINS scope/prepare is still a build; only the authoring shape is dropped', () => {
+    expect(prBelongsToBuild(pr({ title: 'x', headRefName: 'lane/4400-narrow-scope-of-x' }), '4400')).toBe(true);
+    expect(prBelongsToBuild(pr({ title: 'x', headRefName: 'lane/4400-fix-prepare-step' }), '4400')).toBe(true);
+    expect(prBelongsToBuild(pr({ title: 'x', headRefName: 'lane/4400b-narrow-scope-of-x' }), '4400')).toBe(true);
+    expect(prBelongsToBuild(pr({ title: 'x', headRefName: 'lane/4400-scope-3dfab284' }), '4400')).toBe(false);
+    expect(prBelongsToBuild(pr({ title: 'x', headRefName: 'lane/4400b-prepare-3dfab284' }), '4400')).toBe(false);
+  });
+  it('the authoring-ref predicate is the ONE shared with dispatch-lane-io, not a re-derived copy', () => {
+    expect(NON_IMPLEMENTING_REF_RE).toBe(IO_NON_IMPLEMENTING_REF_RE);
   });
   it('a cross-repository (fork) PR is never delivery evidence, by branch OR by title', () => {
     expect(prBelongsToBuild(pr({ isCrossRepository: true }), '4388')).toBe(false);
