@@ -63,6 +63,7 @@ import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 // these ran SIMULTANEOUSLY in a single `ps aux` snapshot, none logged anywhere, spending the shared `graphql`
 // bucket (8943 points/hour that hour, 6365.2 UNATTRIBUTED — `gh-spend.mjs report --hours=1 --by=caller`).
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { readBuildDelivery, defaultListBuildPrs, defaultReadCardStatus, defaultReadCardOpened, NON_IMPLEMENTING_REF_RE, isNonImplementingPr, isDocsOnlyPr } from '../conveyor/build-delivery-evidence.mjs';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createHash, randomUUID } from 'node:crypto';
@@ -293,6 +294,8 @@ export function readTick({
   recordLiveness = (stamped) => { persistLastSeenLive(stamped, { now }); return stamped; },
   laneRefForPr = (pr) => defaultLaneRefForPr(pr, { exec }),
   checkAlreadyDone = (n) => defaultCheckAlreadyDone(n, { exec }),
+  // xykwe0h — build only: an OPEN or MERGED build PR, or a resolved card, means the build must not run again.
+  checkBuildDelivery = (n) => readBuildDelivery(n, { listPrs: (k) => defaultListBuildPrs(k, { exec, cwd: root }), readCardStatus: (k) => defaultReadCardStatus(k, { cwd: root }), readCardOpened: (k) => defaultReadCardOpened(k, { cwd: root }) }),
   // #3717 — THE ROUTER'S EVIDENCE. `selectProvider`/`selectSupervisionLevel` are pure and read their trial
   // history from their caller, so the scorecards are loaded at this io edge and handed across as data. A
   // missing or unreadable store reads as NO trials, which is the fail-closed direction: with no clean trials
@@ -411,7 +414,7 @@ export function readTick({
     return keys.map((id) => readTick({
       num: id, root, exec, bookkeepingFile,
       runNode: () => tickJson, readText: cachedText, loadItems: () => items,
-      listInFlightDispatches, listAgents: cachedAgents, isPidAlive, recordLiveness, laneRefForPr, checkAlreadyDone,
+      listInFlightDispatches, listAgents: cachedAgents, isPidAlive, recordLiveness, laneRefForPr, checkAlreadyDone, checkBuildDelivery,
       readScorecards: scorecardsOnce, readSizePolicy: sizePolicyOnce, readPromotions: promotionsOnce,
       enforceSupervision, readDeliveryAgentOverride, dispatchModes: modesOnce,
       now: () => observedAt,
@@ -509,6 +512,9 @@ export function readTick({
   // `#3434` incident was a WASTED `prepare-decision` dispatch, not a build, so every launch kind needs the
   // check, not build/fix/ci-heal only.
   const alreadyDone = launch ? checkAlreadyDone(key) : { done: false, pr: null, checked: false };
+  // xykwe0h — fail-soft: an unreadable delivery check never blocks a launch.
+  let buildDelivery = null;
+  if (launch && launchKind === 'build') { try { buildDelivery = checkBuildDelivery(key) ?? null; } catch { buildDelivery = null; } }
 
   // #3717/#3906 — THE ROUTING DECISION, computed only when something was cleared for launch (a read that will
   // not dispatch has nothing to route). Computed HERE rather than in the pure declaration: `decideDispatchRoute`
@@ -581,6 +587,7 @@ export function readTick({
     repoTokens,
     // #3457/#3460 — the ground-truth verdict, or the not-checked default when nothing was cleared for launch.
     alreadyDone,
+    buildDelivery,
     // #3717/#3906 — the routing record (`decideDispatchRoute`'s answer), or `null` when nothing was cleared.
     routing,
     locus: launchKind === 'build' ? deliveryLocusForScope(item?.scope) : null,
@@ -2961,7 +2968,7 @@ export const ALREADY_DONE_JSON_FIELDS = 'number,title,url,mergedAt,headRefName,b
  * before the build has even started. Excluding the two authoring ref shapes is what keeps the check aimed at
  * "was the ITEM implemented", not "was the item's card ever touched".
  */
-export const NON_IMPLEMENTING_REF_RE = /^lane\/\d+[a-z]?-(scope|prepare)-/i;
+export { NON_IMPLEMENTING_REF_RE }; // defined once in build-delivery-evidence.mjs (xykwe0h); re-exported for existing importers
 
 /**
  * PURE — which of a `gh pr list --search` page's rows are real evidence that `num` is ALREADY DONE, most
@@ -2977,8 +2984,9 @@ export const NON_IMPLEMENTING_REF_RE = /^lane\/\d+[a-z]?-(scope|prepare)-/i;
  *   2. A WORD-BOUNDARY match on `title` — `in:title` search already scopes to the title field, but a bare
  *      substring test would let item `343` match a PR titled "WE #3435: …"; the boundary keeps `343` from
  *      matching inside `3435`.
- *   3. {@link NON_IMPLEMENTING_REF_RE} — excludes prepare-scope/prepare-decision authoring PRs (see that
- *      constant's own docblock for the live case this closes).
+ *   3. `isNonImplementingPr` — excludes prepare-scope/prepare-decision authoring PRs (see
+ *      {@link NON_IMPLEMENTING_REF_RE}'s docblock for the live case this closes), by title as well as ref, so a
+ *      build of a card whose slug starts with scope-/prepare- is still counted (review of PR #4361).
  *   4. (#3473) ALL-MARKDOWN DIFF — a PR whose entire changed-file set is `.md` is pure backlog housekeeping,
  *      never a real implementation, however its title reads. Live false positive: `#3096`'s dispatch-time
  *      already-done hold was fed by TWO merged PRs that both title-boundary-match "3096" — PR #1599 (ref
@@ -3041,10 +3049,10 @@ export function filterAlreadyDoneCandidates(prs, num) {
     .filter((p) => p && typeof p === 'object')
     .filter((p) => p.state === undefined || p.state === 'MERGED') // undefined: a caller that omitted `state`
     .filter((p) => boundary.test(String(p?.title ?? '')))
-    .filter((p) => !NON_IMPLEMENTING_REF_RE.test(String(p?.headRefName ?? '')))
+    .filter((p) => !isNonImplementingPr(p))
     // #3473 guard 4 — an all-.md changed-file set is pure backlog/doc housekeeping, never a real delivery.
     // A no-op when `files` is absent from the row (existing fixtures that don't set it stay green).
-    .filter((p) => !(Array.isArray(p?.files) && p.files.length > 0 && p.files.every((f) => /\.md$/i.test(String(f?.path ?? f)))))
+    .filter((p) => !isDocsOnlyPr(p))
     // #3473 guard 5 — the PR's own body explicitly disclaims resolving THIS id. A no-op when `body` is absent.
     .filter((p) => !disclaimerRe.test(String(p?.body ?? '')))
     // #3473 guard 6 — a blanket "no code changes" disclaimer excludes the PR outright (backstop for guard 4

@@ -41,6 +41,7 @@ function fixture(options = {}, tickOptions = {}) {
     loadItems: () => inputs.queue,
     readText: () => 'Build #{{ITEM_NUM}} on {{LANE}} with {{SCOPE}}',
     checkAlreadyDone: () => ({ done: false, pr: null, checked: true }),
+    checkBuildDelivery: () => null,
     listInFlightDispatches: (num) => ({
       runs: num === '9003' ? [{ runId: 'prior', handle: 'live-agent', startedAt: now.toISOString() }] : [],
       unreadable: 0,
@@ -82,7 +83,7 @@ describe('dispatch-eligibility agrees with the live admission path', () => {
     expect(report.map((row) => row.eligible)).toEqual([true, false, false, true]);
     expect(report.map((row) => row.firstBlockingGate)).toEqual([null, 'blockedBy', 'in-flight-dispatch', null]);
     expect(report[0].gates.map((gate) => gate.name)).toEqual([
-      'in-flight-dispatch', 'already-done', 'blockedBy', 'tick-launch', 'assigned-lane', 'item-spec', 'scope',
+      'in-flight-dispatch', 'already-done', 'build-delivered', 'blockedBy', 'tick-launch', 'assigned-lane', 'item-spec', 'scope',
       // #3906 — the routing gates, after the brief is filled: a derivable taskType, a computed route, no
       // supervision hold.
       'task-type', 'route', 'supervision',

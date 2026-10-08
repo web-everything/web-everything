@@ -29,6 +29,7 @@ describe('the tick reader handoff', () => {
       listInFlightDispatches: () => ({ runs: [], unreadable: 0 }),
       recordLiveness: (value) => value, listAgents: () => [],
       checkAlreadyDone: () => ({ done: false, checked: true, pr: null }),
+      checkBuildDelivery: () => null,
       readScorecards: () => [], readSizePolicy: () => ({}), readPromotions: () => [],
       readDeliveryAgentOverride: () => null,
       ...overrides,
@@ -77,6 +78,29 @@ describe('the tick reader handoff', () => {
     const { read, runNode } = fixture(envelope, { now: () => Date.parse(at) });
     expect(read().launch).toEqual(tick.decisions.spawnBuilds[0]);
     expect(runNode).not.toHaveBeenCalled();
+  });
+
+  // xykwe0h — the build-delivered gate only fires if readTick carries checkBuildDelivery's answer through as `buildDelivery`.
+  it('wires checkBuildDelivery into the read as buildDelivery for a build launch', () => {
+    const delivered = { outcome: 'pr-merged', pr: 4288, reason: 'PR #4288 merged' };
+    const checkBuildDelivery = vi.fn(() => delivered);
+    const { read } = fixture(envelope, { checkBuildDelivery });
+    expect(read().buildDelivery).toEqual(delivered);
+    expect(checkBuildDelivery).toHaveBeenCalledWith('3037');
+  });
+
+  it('a throwing checkBuildDelivery fails soft to buildDelivery null and still launches', () => {
+    const { read } = fixture(envelope, { checkBuildDelivery: () => { throw new Error('gh down'); } });
+    const out = read();
+    expect(out.buildDelivery).toBeNull();
+    expect(out.launch).toEqual(tick.decisions.spawnBuilds[0]);
+  });
+
+  it('does not call checkBuildDelivery when nothing is cleared for launch', () => {
+    const checkBuildDelivery = vi.fn(() => ({ outcome: 'pr-open', pr: 1, reason: 'x' }));
+    const { read } = fixture({ ...envelope, tick: { ...tick, decisions: { spawnBuilds: [], statusLine: 'idle' } } }, { checkBuildDelivery });
+    expect(read().buildDelivery).toBeNull();
+    expect(checkBuildDelivery).not.toHaveBeenCalled();
   });
 
   it('ignores the tick file for whole-queue reads', () => {
