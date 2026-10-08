@@ -229,10 +229,19 @@ describe('the ledger and notice sinks', () => {
       expect(rows.find((r) => r.type === 'review-run').posted).toBe(true);
     });
 
-    it('writes nothing without a pinned head', async () => {
-      const sinks = createReviewPrSinks({ root });
-      const result = await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: null, posted: false, referralKeys: [] }, CTX);
+    it('writes nothing without a pinned head, and says so loudly instead of skipping silently', async () => {
+      const lines = [];
+      const sinks = createReviewPrSinks({ root, out: (l) => lines.push(l) });
+      const result = await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: null, posted: false, referralKeys: ['["correctness","a.js",1,"bug"]'] }, CTX);
       expect(result).toEqual({ written: [], missed: [] });
+      expect(lines.join('\n')).toContain('ledger-write-skip: o/n#7 no pinned head');
+    });
+
+    it('prints no skip line when the head is pinned', async () => {
+      const lines = [];
+      const sinks = createReviewPrSinks({ root, out: (l) => lines.push(l) });
+      await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: HEAD, posted: false, referralKeys: [] }, CTX);
+      expect(lines.join('\n')).not.toContain('ledger-write-skip');
     });
 
     it('a ledger write miss never throws: it prints a loud ledger-write-miss line and returns', async () => {

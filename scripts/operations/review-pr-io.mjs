@@ -1163,6 +1163,9 @@ export function createReviewPrSinks({
         rows.push({ type: EVENT_TYPES.REFERRAL, headSha: payload.headSha, findingKeys: keys.map((k) => `sha256:${referralHash(String(k))}`) });
       }
       if (payload.headSha) rows.push({ type: EVENT_TYPES.REVIEW_RUN, headSha: payload.headSha, phase: 'completed', posted: payload.posted === true });
+      // An unpinned or degraded read names no head, so there is nothing to key a row on. That is a skipped write,
+      // not a quiet success: say so loudly, the same way a write miss does, so the undercount is never silent.
+      if (!payload.headSha) out(`ledger-write-skip: ${payload.repo}#${payload.pr} no pinned head, so no review-run row was recorded for this run (it will not count toward the visit cap); comments, labels and decisions are unaffected`);
       const written = []; const missed = [];
       for (const row of rows) {
         try {

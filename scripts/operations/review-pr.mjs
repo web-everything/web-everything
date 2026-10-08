@@ -2950,7 +2950,9 @@ export function reviewPrOperation({
     // ADDITIVE ONLY. Runs after `record` and writes `referral` and `review-run{posted}` rows to the ledger. It
     // never changes a comment, a label or a decision: those were all settled by the steps above. It always
     // declares ONE effect, so a run that posted nothing (abstain, same-head re-run) still leaves its
-    // `review-run{posted:false}` row, which is what the visit cap counts (#3988).
+    // `review-run{posted:false}` row, which is what the visit cap counts (#3988) — WHEN THE HEAD IS PINNED.
+    // An unpinned or degraded read (`netBasis.rev` null) has no head to key a row on: the sink then writes
+    // nothing and prints a loud `ledger-write-skip` line instead.
     // `posted` = a comment actually landed in this run: the advisory note, or the verdict write-up swap.
     // IDEMPOTENT: TRUE. Both events are non-clearing, so a replay can at worst add one visit to a counter.
     ledgerEvents: effectStep({

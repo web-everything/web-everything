@@ -1955,8 +1955,8 @@ describe('an override must say why', () => {
    * Drive a run through the ACTUAL command line to its confirm, then answer it — through the actual command
    * line again. `argvExtra` is whatever rides the resume, which is the seam under test.
    */
-  async function driveToAnswer({ answer, argvExtra = [], judge = cleanJudge, labels = ['review:pending'], id }) {
-    const { declaration, registry } = registryFor({ labels });
+  async function driveToAnswer({ answer, argvExtra = [], judge = cleanJudge, labels = ['review:pending'], id, ...readerOpts }) {
+    const { declaration, registry } = registryFor({ labels, ...readerOpts });
     const store = createMemoryRunStore();
     const { sinks, calls } = recordingSinks();
     const started = await runOperationCli({
@@ -2027,10 +2027,33 @@ describe('an override must say why', () => {
   });
 
   it('E2: a posted accept declares ledger events with posted:true and the reviewed head', async () => {
-    const { calls } = await driveToAnswer({ answer: 'accept', id: 'run-e2-posted' });
+    const { calls } = await driveToAnswer({ answer: 'accept', id: 'run-e2-posted', netRev: PINNED_HEAD });
     const ev = calls.find((c) => c.type === REVIEW_EFFECTS.LEDGER_EVENTS);
     expect(ev.payload).toMatchObject({ pr: expect.anything(), repo: expect.any(String), posted: true });
-    expect(ev.payload.headSha).toBeDefined();
+    // The EXACT head the stub reader pinned, not merely "not undefined": `null` is defined, and a null head
+    // makes the sink write no ledger rows at all. (The stub's DEFAULT `netRev` is a short, unpinned value, so
+    // this test must pass a full 40-hex sha, which `pinnedSha` accepts.)
+    expect(ev.payload.headSha).toBe(PINNED_HEAD);
+  });
+
+  it('E2: an unpinned read (short sha) declares headSha:null, which the sink then skips loudly', async () => {
+    const { calls } = await driveToAnswer({ answer: 'accept', id: 'run-e2-unpinned', netRev: 'def456' });
+    expect(calls.find((c) => c.type === REVIEW_EFFECTS.LEDGER_EVENTS).payload.headSha).toBeNull();
+  });
+
+  // `posted` is `landed(advise, ADVISORY_NOTE) || landed(record, LABEL)`. An abstain on a `review:human` PR leaves
+  // the advisory note as the ONLY comment that can land, so these two pin each arm of that expression.
+  it('E2: an abstain on a review:human PR still records posted:true when the advisory note landed', async () => {
+    const { calls } = await driveToAnswer({ answer: 'abstain', labels: ['review:human'], id: 'run-e2-advisory', netRev: PINNED_HEAD });
+    expect(calls.some((c) => c.type === REVIEW_EFFECTS.ADVISORY_NOTE)).toBe(true);
+    const ev = calls.find((c) => c.type === REVIEW_EFFECTS.LEDGER_EVENTS);
+    expect(ev.payload).toMatchObject({ posted: true, headSha: PINNED_HEAD });
+  });
+
+  it('E2: an abstain on a review:pending PR (no advisory note, no label) records posted:false', async () => {
+    const { calls } = await driveToAnswer({ answer: 'abstain', id: 'run-e2-quiet' });
+    expect(calls.some((c) => c.type === REVIEW_EFFECTS.ADVISORY_NOTE)).toBe(false);
+    expect(calls.find((c) => c.type === REVIEW_EFFECTS.LEDGER_EVENTS).payload.posted).toBe(false);
   });
 
   it('leaves an ordinary accept untouched — no override section', async () => {
