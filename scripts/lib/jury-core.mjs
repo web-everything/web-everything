@@ -38,6 +38,7 @@
  * Pure, unit-tested through `review-core.mjs`'s re-exports in `we:scripts/lib/__tests__/review-core.test.mjs`.
  */
 import { createHash } from 'node:crypto';
+import { CARD_REF_RE } from './referral-card-readable.mjs';
 import { deriveSessionId, sessionSeed } from './judge-spawn.mjs';
 import { decideClearerIndependence, INDEPENDENCE, parseAuthorActorId } from './review-independence.mjs';
 import { CARE_LEVELS } from './review-escalation.mjs';
@@ -2871,7 +2872,7 @@ export function validateReferralRecord(r) {
         // #76c — a reviewer-backed carry names the ruling it stands on, and is never a block.
         || (c.from.rulingId !== undefined && (typeof c.from.rulingId !== 'string' || !c.from.rulingId.trim() || c.result === 'block'))
         || !['block', 'card', 'not-real'].includes(c.result)
-        || (c.result === 'card' ? !/^we:backlog\/[^/]+\.md$/.test(c.card ?? '') : c.card !== undefined)))) return false;
+        || (c.result === 'card' ? !CARD_REF_RE.test(c.card ?? '') : c.card !== undefined)))) return false;
     const ids = new Set();
     for (const rli of r.rulings) {
       if (!rli || typeof rli.id !== 'string' || !rli.id || ids.has(rli.id)
@@ -2882,7 +2883,7 @@ export function validateReferralRecord(r) {
         || typeof rli.rationale !== 'string' || !rli.rationale.trim()
         || !Array.isArray(rli.evidence) || !rli.evidence.length
         || rli.evidence.some(e => typeof e !== 'string' || !e.trim())
-        || (rli.result === 'card' && !/^we:backlog\/[^/]+\.md$/.test(rli.card ?? ''))
+        || (rli.result === 'card' && !CARD_REF_RE.test(rli.card ?? ''))
         || supersededRulings(rli).some(id => !ids.has(id)
           || r.rulings.find(x => x.id === id)?.key !== rli.key)) return false;
       ids.add(rli.id);
@@ -3145,7 +3146,7 @@ export function validateOperatorRuling(r) {
     for (const x of r.rulings) {
       if (!x || typeof x.runId !== 'string' || !x.runId.trim() || typeof x.key !== 'string' || !x.key.trim()
         || !OPERATOR_RULING_RESULTS.includes(x.result)) return false;
-      if (x.result === 'card' ? !/^we:backlog\/[^/]+\.md$/.test(x.card ?? '') : x.card !== undefined) return false;
+      if (x.result === 'card' ? !CARD_REF_RE.test(x.card ?? '') : x.card !== undefined) return false;
       const id = JSON.stringify([x.runId, x.key]);
       if (seen.has(id)) return false;
       seen.add(id);

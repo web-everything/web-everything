@@ -17,6 +17,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOperatorRulings } from '../lib/jury-core.mjs';
 import { currentActorId } from '../lib/review-independence.mjs';
 import { referralCardReadable } from '../review-set-label.mjs';
+import { CARD_REF_RE } from '../lib/referral-card-readable.mjs';
 import { EVENT_TYPES, buildLedgerEvent, serializeLedgerEvent, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { idFromName, normalizeId } from '../backlog/id.mjs';
@@ -45,7 +46,7 @@ export function resolveCardRef(requested, { root = REPO_ROOT, listFiles = (d) =>
   if (requested === undefined || requested === null || requested === '') return null;
   const ask = String(requested).trim();
   let ref = null;
-  if (/^we:backlog\/[^/]+\.md$/.test(ask)) ref = ask;
+  if (CARD_REF_RE.test(ask)) ref = ask;
   else {
     const id = idFromName(ask);
     const files = (() => { try { return listFiles(join(root, 'backlog')).filter((f) => f.endsWith('.md')); } catch { return []; } })();
@@ -62,9 +63,9 @@ export function resolveCardRef(requested, { root = REPO_ROOT, listFiles = (d) =>
       else return { requested: ask, ref: null, readable: false, reason: hits.length ? 'ambiguous id' : 'no backlog card with that id (has it landed on main? fetch and retry)' };
     }
   }
-  if (!ref) return { requested: ask, ref: null, readable: false, reason: 'not a card id or we:backlog/<file>.md reference' };
+  if (!ref) return { requested: ask, ref: null, readable: false, reason: 'not a card id or we:backlog/<file>.md[@pr<N>] reference' };
   const ok = readable(ref, root);
-  return { requested: ask, ref, readable: ok, reason: ok ? 'readable' : 'card file is missing or has no frontmatter' };
+  return { requested: ask, ref, readable: ok, reason: ok ? 'readable' : 'card file is missing or has no frontmatter (a card only on an open PR: cite it as we:backlog/<file>.md@pr<N>)' };
 }
 
 export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = ghJson, now = () => new Date().toISOString(),
