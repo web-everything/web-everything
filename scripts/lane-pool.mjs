@@ -112,7 +112,7 @@ import {
   laneAuthoredSince,
 } from './lib/lane-lease.mjs';
 import { retryTransientGit } from './lib/git-fetch-retry.mjs';
-import { healLaneRefs, diagnoseLane, quarantineLane, looksLikeCorruption } from './lib/lane-repair.mjs';
+import { healLaneRefs, diagnoseLane, quarantineLane, looksLikeCorruption, looksLikeCommitGraphError, healSharedCommitGraph } from './lib/lane-repair.mjs';
 // #4122 — the free-lane list `acquire`'s auto-pick reads as a fast pre-filter before paying for its own scan
 // (see that module's own header for the full incident/design writeup).
 import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } from './lib/free-lane-list.mjs';
@@ -849,11 +849,26 @@ function cloneLane(repo, n) {
 // never deleted) and re-provisioned, carrying the lease across. A network/auth failure matches neither signature
 // nor fails the probe, so it still throws unchanged and never costs a good lane its clone.
 function msgOf(e) { return `${e && e.message ? e.message : e}\n${e && e.stderr ? e.stderr : ''}`; }
+// xsxu243 — heal the shared reference store's commit-graph if `err` names one. Returns true when it regenerated.
+function healSharedStoreFor(repo, err) {
+  if (!looksLikeCommitGraphError(msgOf(err))) return false;
+  try {
+    return healSharedCommitGraph(repo.referencePath, { lockDir: join(repo.poolDir, '.shared-commit-graph.lock'), log }).healed;
+  } catch (e) {
+    log(`  ⚠ shared commit-graph heal failed: ${msgOf(e).trim().split('\n')[0]}`);
+    return false;
+  }
+}
 function fetchOriginHealing(repo, n, { allowReclone = false } = {}) {
   const dir = laneDir(repo, n);
   try {
     return fetchOriginPruneWithRetry(dir);
   } catch (e) {
+    // xsxu243 — a commit-graph error may live in the SHARED reference store (read through objects/info/alternates), where
+    // no per-lane repair can reach it: regenerate that derived cache once (locked, logged), then retry before any lane-level heal.
+    if (healSharedStoreFor(repo, e)) {
+      try { return fetchOriginPruneWithRetry(dir); } catch (eShared) { e = eShared; }
+    }
     const probe = diagnoseLane(dir);
     if (!looksLikeCorruption(msgOf(e)) && probe.ok) throw e;
     log(`  ⚠ lane-${n}: fetch failed on a corrupt-looking clone (${msgOf(e).trim().split('\n').filter(Boolean).slice(-1)[0]}) — healing refs/commit-graph and retrying`);
@@ -1892,6 +1907,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
       reset = resetToBase();
     } catch (e) {
       if (!looksLikeCorruption(msgOf(e))) throw e;
+      healSharedStoreFor(repo, e);
       repairUnhealthyClone();
       reset = resetToBase();
     }

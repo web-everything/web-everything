@@ -21,7 +21,7 @@
  * Callers only ever run this on a lane they hold the lease for (or one with no live lease).
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, renameSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, renameSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { join, basename } from 'node:path';
 
 const GIT_TIMEOUT_MS = 60_000;
@@ -122,3 +122,96 @@ export function quarantineLane(dir, quarantineRoot, { log = () => {}, reason = '
   log(`  ⚑ lane-repair ${basename(dir)}: QUARANTINED → ${dest}${reason ? ` (${reason})` : ''}`);
   return dest;
 }
+
+// ── Shared reference store: commit-graph self-heal (card xsxu243) ─────────────────────────────────────────
+//
+// LIVE INCIDENT (2026-10-08 ~05:08Z, ci-heal #4368 blocked again after #4382's per-lane repair): the PRIMARY
+// checkout's `.git/objects/info/commit-graph` (dated Oct 3) named commits that a later gc had pruned from the
+// object store. Every lane clones `--reference` the primary, so every lane git op that walks history reads that
+// graph through `objects/info/alternates` and dies with
+//   `fatal: You are attempting to fetch <sha>, which is in the commit graph file but not in the object database`
+// or `failed to parse commit <sha> from object database for commit-graph`. A lane's own repair cannot reach it.
+//
+// WHY THIS IS SAFE: a commit-graph is a DERIVED CACHE (git rebuilds it from the objects and works without it).
+// `git fsck` with the graph disabled was clean — the "missing" commits were unreachable garbage, so nothing
+// reachable is lost. The heal therefore touches ONLY `objects/info/commit-graph` and `objects/info/commit-graphs/`
+// of the store: no refs, no objects, no tracked files, no config. The bad file is moved ASIDE (kept, one copy),
+// then `git commit-graph write --reachable` regenerates it (git writes a temp file and renames, so a concurrent
+// reader sees either the old or the new graph, never a half-written one; a missing graph is also valid).
+
+/** Does a git failure message name a commit-graph problem? (Narrower than {@link looksLikeCorruption}.) */
+export function looksLikeCommitGraphError(message) {
+  return /commit[ -]graph/i.test(String(message || ''));
+}
+
+/** Is the store's commit-graph unreadable / naming absent objects? Read-only. `null` = no graph / cannot tell. */
+export function verifyCommitGraph(storeDir) {
+  const r = runGit(['commit-graph', 'verify'], storeDir);
+  return { ok: r.code === 0, detail: (r.err || r.out).trim().split('\n').filter(Boolean).slice(0, 2).join(' | ') };
+}
+
+/** Tiny mkdir lock with owner record + dead-owner/orphan reclaim, so two healers never run the move+write at once. */
+function takeLock(lockDir, { now = Date.now(), orphanGraceMs = 10_000, isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } } } = {}) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      mkdirSync(lockDir);
+      writeFileSync(join(lockDir, 'owner'), JSON.stringify({ pid: process.pid, at: now }));
+      return true;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let stale = false;
+      try {
+        const o = JSON.parse(readFileSync(join(lockDir, 'owner'), 'utf8'));
+        stale = !isAlive(o.pid);
+      } catch {
+        try { stale = now - statSync(lockDir).mtimeMs > orphanGraceMs; } catch { stale = true; }
+      }
+      if (!stale) return false;
+      rmSync(lockDir, { recursive: true, force: true });
+    }
+  }
+  return false;
+}
+
+/**
+ * Regenerate a shared reference store's commit-graph when (and only when) it fails `commit-graph verify`.
+ * Idempotent and re-checked UNDER the lock, so a second healer that lost the race sees a clean graph and does nothing.
+ * @param {string} storeDir   the primary checkout (worktree root or bare dir) whose object store lanes share
+ * @param {{lockDir:string, log?:Function, waitMs?:number, now?:number}} opts
+ * @returns {{ healed:boolean, reason:string, movedTo?:string }}
+ */
+export function healSharedCommitGraph(storeDir, { lockDir, log = () => {}, waitMs = 30_000, now = Date.now() } = {}) {
+  const before = verifyCommitGraph(storeDir);
+  if (before.ok) return { healed: false, reason: 'commit-graph verifies clean' };
+  const deadline = Date.now() + waitMs;
+  let locked = takeLock(lockDir, { now: Date.now() });
+  while (!locked && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250); // sleep 250ms without a busy loop
+    locked = takeLock(lockDir, { now: Date.now() });
+  }
+  if (!locked) return { healed: false, reason: 'another process holds the shared commit-graph lock' };
+  try {
+    const again = verifyCommitGraph(storeDir); // a concurrent healer may have just fixed it
+    if (again.ok) return { healed: false, reason: 'healed by a concurrent process' };
+    const gitDir = runGit(['rev-parse', '--git-common-dir'], storeDir).out.trim();
+    const infoDir = join(resolveFrom(storeDir, gitDir), 'objects', 'info');
+    const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
+    let movedTo;
+    for (const name of ['commit-graph', 'commit-graphs']) {
+      const p = join(infoDir, name);
+      if (!existsSync(p)) continue;
+      const dest = join(infoDir, `${name}.corrupt-${stamp}`);
+      renameSync(p, dest); // moved aside, never deleted; ONLY the derived cache
+      movedTo ??= dest;
+    }
+    const w = runGit(['commit-graph', 'write', '--reachable', '--no-progress'], storeDir);
+    const after = verifyCommitGraph(storeDir);
+    const ok = w.code === 0 && after.ok;
+    log(`  ⚑ lane-repair shared-store: commit-graph was corrupt (${before.detail}) — moved aside${movedTo ? ` → ${basename(movedTo)}` : ''} and ${ok ? 'regenerated with `git commit-graph write --reachable`' : `regeneration failed (${w.err.trim().split('\n')[0] || after.detail}); store runs without a graph, which git treats as valid`}`);
+    return { healed: true, reason: before.detail, movedTo };
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
+}
+
+const resolveFrom = (base, p) => (p.startsWith('/') ? p : join(base, p));
