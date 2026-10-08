@@ -1,9 +1,10 @@
 ---
+bornAs: x0ymykb
 kind: story
 size: 5
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["xfneuba", "x6qkpev"]
+blockedBy: ["5481", "5483"]
 scope: ["we:conveyor/pr-events-worker/**", "we:scripts/docket/**", "we:scripts/progress-board/**", "we:scripts/usage-report/**"]
 dateOpened: "2026-10-08"
 tags: []

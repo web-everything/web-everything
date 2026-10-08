@@ -1,9 +1,10 @@
 ---
+bornAs: xh1pxjn
 kind: story
 size: 5
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["xmoufta"]
+blockedBy: ["5494"]
 scope: ["we:scripts/daemons/shadow-compare.mjs"]
 dateOpened: "2026-10-08"
 tags: []

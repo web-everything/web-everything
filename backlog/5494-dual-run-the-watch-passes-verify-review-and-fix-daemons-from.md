@@ -1,9 +1,10 @@
 ---
+bornAs: xmoufta
 kind: story
 size: 5
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["xgqueiz"]
+blockedBy: ["5493"]
 scope: ["we:scripts/daemons/shadow-compare.mjs", "we:scripts/daemons/__tests__/shadow-compare.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []

@@ -1,9 +1,10 @@
 ---
+bornAs: x3xrhfl
 kind: story
 size: 3
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["xfneuba"]
+blockedBy: ["5481"]
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/check-standards.mjs", "we:scripts/lib/constellation-boundary.mjs", "we:scripts/lib/__tests__/constellation-boundary.test.mjs", "we:config/constellation-boundary-allowlist.json"]
 dateOpened: "2026-10-08"
 tags: []

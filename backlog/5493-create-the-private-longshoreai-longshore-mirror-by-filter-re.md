@@ -1,9 +1,10 @@
 ---
+bornAs: xgqueiz
 kind: story
 size: 5
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["xuxad3w"]
+blockedBy: ["5492"]
 scope: ["we:scripts/longshore-mirror/**", "we:docs/agent/longshore-mirror.md"]
 dateOpened: "2026-10-08"
 tags: []

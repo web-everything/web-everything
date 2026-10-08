@@ -1,9 +1,10 @@
 ---
+bornAs: xdfzp4b
 kind: story
 size: 5
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["x2cpivn"]
+blockedBy: ["5497"]
 scope: ["we:skills-src/**", "we:docs/agent/**", "we:agent-memory-src/**"]
 dateOpened: "2026-10-08"
 tags: []

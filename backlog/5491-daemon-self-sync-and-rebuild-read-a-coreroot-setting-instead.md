@@ -1,9 +1,10 @@
 ---
+bornAs: xw75lku
 kind: story
 size: 3
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["xo59v8c"]
+blockedBy: ["5487"]
 scope: ["we:scripts/lib/daemon-self-sync.mjs", "we:scripts/lib/daemon-rebuild.mjs", "we:scripts/lib/daemon-overlays.mjs", "we:scripts/lib/__tests__/daemon-core-root.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []

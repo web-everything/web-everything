@@ -1,9 +1,10 @@
 ---
+bornAs: xo59v8c
 kind: story
 size: 5
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["x3xrhfl"]
+blockedBy: ["5482"]
 scope: ["we:skills-src/conveyor/**", "we:scripts/daemons/**"]
 dateOpened: "2026-10-08"
 tags: []

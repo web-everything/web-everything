@@ -1,9 +1,10 @@
 ---
+bornAs: xt5yoze
 kind: story
 size: 5
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["x2cpivn", "x0ymykb", "xizfs72"]
+blockedBy: ["5497", "5484", "5486"]
 scope: ["we:backlog/**", "we:scripts/backlog/move-by-topic.mjs"]
 dateOpened: "2026-10-08"
 tags: []

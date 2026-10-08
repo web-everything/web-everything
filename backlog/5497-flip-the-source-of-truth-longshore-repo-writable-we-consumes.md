@@ -1,9 +1,10 @@
 ---
+bornAs: x2cpivn
 kind: story
 size: 5
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["xh1pxjn", "xs1r68q", "xgc6mv8"]
+blockedBy: ["5495", "5496", "5490"]
 scope: ["we:package.json", "we:package-lock.json", "we:packages/longshore/**", "we:.github/workflows/ci.yml"]
 dateOpened: "2026-10-08"
 tags: []

@@ -1,9 +1,10 @@
 ---
+bornAs: xgwmxd4
 kind: story
 size: 5
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["x3xrhfl"]
+blockedBy: ["5482"]
 scope: ["we:scripts/kit/**", "we:scripts/lib/write-all-sync.mjs", "we:scripts/lib/local-date.mjs", "we:scripts/lib/secret-scrub.mjs", "we:scripts/lib/under-test.mjs"]
 dateOpened: "2026-10-08"
 tags: []

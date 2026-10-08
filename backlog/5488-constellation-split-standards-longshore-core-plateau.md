@@ -1,4 +1,5 @@
 ---
+bornAs: xpd5nhi
 kind: epic
 parent: "2445"
 status: open
@@ -42,25 +43,25 @@ Step numbers follow the plan. Steps 0a, 0b and 1 can start in parallel. Nothing 
 | 0a | #xdjrqkz repo identity registry + guard (reused, in PR #4506) | 5 | — |
 | 0a | #x8d6s6j migrate slug call sites (reused, in PR #4506) | 8 | #xdjrqkz |
 | 0b | #3533 locus on every id (reused) | 5 | — |
-| 1 | #xfneuba ownership map, re-classified under S4 | 3 | — |
-| 1 | #x3xrhfl boundary guard (ratchet) | 3 | #xfneuba |
-| 2a | #xqpz3zp split rules into web / backlog / delivery packs | 8 | #x3xrhfl |
-| 2b | #xgwmxd4 shared helper kit | 5 | #x3xrhfl |
-| 2c | #xo59v8c daemon entry points out of skill folders | 5 | #x3xrhfl |
-| 2d | #x6qkpev declared entry module for plateau-app | 3 | #x3xrhfl |
-| S3 | #xgc6mv8 standalone conformance runner + web pack | 5 | #xqpz3zp, #xgwmxd4 |
-| 3 | #xw75lku daemons read coreRoot | 3 | #xo59v8c |
-| 3 | #xuxad3w move into Longshore packages with shims | 8 | 2a–2d, #xw75lku |
-| S2+ | #xs1r68q package manifests + all-in-one meta package | 2 | #xuxad3w |
-| 4 | #xgqueiz private mirror via filter-repo + secret scan | 5 | #xuxad3w (+ #xdjrqkz once PR #4506 lands) |
-| 5 | #xmoufta dual-run passes, verify, review, fix | 5 | #xgqueiz |
-| 5 | #xh1pxjn dual-run build-dispatch, drain last | 5 | #xmoufta |
-| 6 | #x2cpivn flip: WE consumes pinned @longshore | 5 | #xh1pxjn, #xs1r68q, #xgc6mv8 |
-| S6 | #xnfbsxx Apache-2.0 + public | 2 | #x2cpivn |
-| 7 | #x0ymykb Plateau-bound code to plateau-app | 5 | #xfneuba, #x6qkpev |
-| 8 | #xizfs72 formerly alias + redirect stubs | 3 | #3533 |
-| 8 | #xt5yoze move cards by topic | 5 | #x2cpivn, #x0ymykb, #xizfs72 |
-| 8 | #xdfzp4b split skills, agent docs, memory | 5 | #x2cpivn |
+| 1 | #5481 ownership map, re-classified under S4 | 3 | — |
+| 1 | #5482 boundary guard (ratchet) | 3 | #5481 |
+| 2a | #5489 split rules into web / backlog / delivery packs | 8 | #5482 |
+| 2b | #5485 shared helper kit | 5 | #5482 |
+| 2c | #5487 daemon entry points out of skill folders | 5 | #5482 |
+| 2d | #5483 declared entry module for plateau-app | 3 | #5482 |
+| S3 | #5490 standalone conformance runner + web pack | 5 | #5489, #5485 |
+| 3 | #5491 daemons read coreRoot | 3 | #5487 |
+| 3 | #5492 move into Longshore packages with shims | 8 | 2a–2d, #5491 |
+| S2+ | #5496 package manifests + all-in-one meta package | 2 | #5492 |
+| 4 | #5493 private mirror via filter-repo + secret scan | 5 | #5492 (+ #xdjrqkz once PR #4506 lands) |
+| 5 | #5494 dual-run passes, verify, review, fix | 5 | #5493 |
+| 5 | #5495 dual-run build-dispatch, drain last | 5 | #5494 |
+| 6 | #5497 flip: WE consumes pinned @longshore | 5 | #5495, #5496, #5490 |
+| S6 | #5499 Apache-2.0 + public | 2 | #5497 |
+| 7 | #5484 Plateau-bound code to plateau-app | 5 | #5481, #5483 |
+| 8 | #5486 formerly alias + redirect stubs | 3 | #3533 |
+| 8 | #5500 move cards by topic | 5 | #5497, #5484, #5486 |
+| 8 | #5498 split skills, agent docs, memory | 5 | #5497 |
 | 9 | #xmkjis9 org rename runbook (reused, in PR #4506, held) | 3 | #x8d6s6j |
 
 Related, not re-filed: #5407 (Delivery standard: the protocol content Longshore implements), #2472 (multi-repo registry), #3963 (real multi-repo conveyor), #2158 (FUI checkout in the WE site build), #186 (legal review).

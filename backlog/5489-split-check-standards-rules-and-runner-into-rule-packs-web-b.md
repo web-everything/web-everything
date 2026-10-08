@@ -1,9 +1,10 @@
 ---
+bornAs: xqpz3zp
 kind: story
 size: 8
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["x3xrhfl"]
+blockedBy: ["5482"]
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/check-standards.mjs", "we:scripts/conformance/**", "we:scripts/__tests__/check-standards*.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []

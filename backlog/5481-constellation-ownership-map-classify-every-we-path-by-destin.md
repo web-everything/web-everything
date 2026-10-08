@@ -1,7 +1,8 @@
 ---
+bornAs: xfneuba
 kind: story
 size: 3
-parent: "xpd5nhi"
+parent: "5488"
 status: open
 scope: ["we:config/constellation-ownership.json", "we:scripts/lib/constellation-ownership.mjs", "we:scripts/lib/__tests__/constellation-ownership.test.mjs"]
 dateOpened: "2026-10-08"
@@ -22,4 +23,4 @@ Re-classify the split map under ruling S4: WE keeps zero implementation (definit
 ## Non-goals
 
 - [N1] No file moves and no import changes; this only classifies.
-- [N2] No gate rule; the boundary guard is its own slice (#x3xrhfl).
+- [N2] No gate rule; the boundary guard is its own slice (#5482).

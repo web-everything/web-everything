@@ -1,9 +1,10 @@
 ---
+bornAs: xuxad3w
 kind: story
 size: 8
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["xqpz3zp", "xgwmxd4", "xo59v8c", "x6qkpev", "xw75lku"]
+blockedBy: ["5489", "5485", "5487", "5483", "5491"]
 scope: ["we:packages/longshore/**", "we:scripts/conveyor/**", "we:scripts/operations/**", "we:scripts/readiness/**", "we:scripts/backlog/**", "we:scripts/backlog.mjs"]
 dateOpened: "2026-10-08"
 tags: []

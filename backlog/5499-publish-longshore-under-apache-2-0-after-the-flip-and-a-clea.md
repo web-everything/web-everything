@@ -1,9 +1,10 @@
 ---
+bornAs: xnfbsxx
 kind: story
 size: 2
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["x2cpivn"]
+blockedBy: ["5497"]
 scope: ["we:packages/longshore/LICENSE", "we:packages/longshore/NOTICE"]
 dateOpened: "2026-10-08"
 tags: []

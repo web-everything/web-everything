@@ -1,9 +1,10 @@
 ---
+bornAs: xs1r68q
 kind: story
 size: 2
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["xuxad3w"]
+blockedBy: ["5492"]
 scope: ["we:packages/longshore/*/package.json", "we:packages/longshore/package.json"]
 dateOpened: "2026-10-08"
 tags: []

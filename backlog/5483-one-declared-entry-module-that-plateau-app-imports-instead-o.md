@@ -1,9 +1,10 @@
 ---
+bornAs: x6qkpev
 kind: story
 size: 3
-parent: "xpd5nhi"
+parent: "5488"
 status: open
-blockedBy: ["x3xrhfl"]
+blockedBy: ["5482"]
 scope: ["we:scripts/longshore-entry.mjs", "we:scripts/__tests__/longshore-entry.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
