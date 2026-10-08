@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { CONSTELLATION_REPOS } from '../constellation-repos.mjs';
 import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../referral-card-readable.mjs';
 
 const CARD = '---\nstatus: open\n---\n# card\n';
@@ -23,7 +24,7 @@ const fakeGh = (cmd, args) => {
     throw new Error('no such PR');
   }
   const url = args[args.length - 1];
-  if (url === `repos/web-everything/web-everything/contents/backlog/xsjn0uf-gate.md?ref=${SHA}`) return CARD;
+  if (url === `repos/${CONSTELLATION_REPOS.we.slug}/contents/backlog/xsjn0uf-gate.md?ref=${SHA}`) return CARD;
   if (url.includes('empty.md')) return 'no frontmatter';
   throw new Error('404');
 };
