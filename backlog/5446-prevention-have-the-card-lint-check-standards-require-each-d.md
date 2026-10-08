@@ -1,9 +1,10 @@
 ---
+bornAs: xcf0twe
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/x2pw8uz-permission-change-compare-workflow-permissions-trees-structu.md", "we:backlog/x7u0mjd-permission-change-detect-sandbox-list-edits-whose-owning-key.md"]
+scope: ["we:backlog/5441-permission-change-compare-workflow-permissions-trees-structu.md", "we:backlog/5442-permission-change-detect-sandbox-list-edits-whose-owning-key.md"]
 dateOpened: "2026-10-08"
 tags: []
 ---
@@ -12,11 +13,11 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/x2pw8uz-permission-change-compare-workflow-permissions-trees-structu.md:19` — Have the card-lint (`check:standards`) require each "Done when" Must line to state its outcome as an explicit observable (reports `X` / returns null) rather than a bare verb like "holds" or "stays".
-2. `we:backlog/x2pw8uz-permission-change-compare-workflow-permissions-trees-structu.md:20` — Add a card-template lint that requires every 'Must (other input kinds)' line to use an explicit verb (reports/stays free). Add a 'removed or narrowed-to-default' row to the permission-change card checklist.
-3. `we:backlog/x7u0mjd-permission-change-detect-sandbox-list-edits-whose-owning-key.md:30` — Add a check:standards rule for backlog cards: each 'Edge cases' line that states a cap or hold must cite a Done-when item or a named test. Otherwise require `n/a:`.
-4. `we:backlog/x2pw8uz-permission-change-compare-workflow-permissions-trees-structu.md:28` — Add a deterministic backlog-card gate requiring each behavioral constraint to reference a planned test file, case name, and observable assertion, including read-range assertions for bounded reads.
-5. `we:backlog/x7u0mjd-permission-change-detect-sandbox-list-edits-whose-owning-key.md:28` — Use the same deterministic constraint-to-test backlog gate, requiring named cases and observable limit and refusal assertions for each safety requirement.
+1. `we:backlog/5441-permission-change-compare-workflow-permissions-trees-structu.md:19` — Have the card-lint (`check:standards`) require each "Done when" Must line to state its outcome as an explicit observable (reports `X` / returns null) rather than a bare verb like "holds" or "stays".
+2. `we:backlog/5441-permission-change-compare-workflow-permissions-trees-structu.md:20` — Add a card-template lint that requires every 'Must (other input kinds)' line to use an explicit verb (reports/stays free). Add a 'removed or narrowed-to-default' row to the permission-change card checklist.
+3. `we:backlog/5442-permission-change-detect-sandbox-list-edits-whose-owning-key.md:30` — Add a check:standards rule for backlog cards: each 'Edge cases' line that states a cap or hold must cite a Done-when item or a named test. Otherwise require `n/a:`.
+4. `we:backlog/5441-permission-change-compare-workflow-permissions-trees-structu.md:28` — Add a deterministic backlog-card gate requiring each behavioral constraint to reference a planned test file, case name, and observable assertion, including read-range assertions for bounded reads.
+5. `we:backlog/5442-permission-change-detect-sandbox-list-edits-whose-owning-key.md:28` — Use the same deterministic constraint-to-test backlog gate, requiring named cases and observable limit and refusal assertions for each safety requirement.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4492@3d61e34b1c2c14d8e834fc5f927e9d2365b52411
 

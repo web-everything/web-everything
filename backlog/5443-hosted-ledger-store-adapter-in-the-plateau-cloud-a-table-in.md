@@ -1,8 +1,9 @@
 ---
+bornAs: x2ddqp8
 kind: story
 size: 5
 parent: "2445"
-relatedTo: ["2742", "x3x7182"]
+relatedTo: ["2742", "5445"]
 status: open
 scope: ["we:scripts/conveyor/pr-events-worker/worker.mjs", "we:scripts/conveyor/pr-events-worker/core.mjs", "we:scripts/lib/verdict-ledger-store.mjs"]
 dateOpened: "2026-10-08"
