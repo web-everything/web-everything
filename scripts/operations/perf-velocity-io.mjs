@@ -19,6 +19,7 @@ import { dirname, join } from 'node:path';
 
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { readGit } from '../lib/proc-read.mjs';
+import { modelSetting } from '../lib/model-settings.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import {
   BACKFILL_FROM, ESTIMATED_SOURCE, FIBONACCI, buildCardIndex, calibrationStats, classifyMerges, parseNameLog, parsePatchLog, prActualPoints,
@@ -27,7 +28,9 @@ import {
 
 const REPO = CONSTELLATION_REPOS.we.slug;
 const SEP = '%x01%H%x09%cI%x09%s';
+/** The product default. The model actually used is `estimateModel()`: the `velocity.estimateModel` setting, else this. */
 export const ESTIMATE_MODEL = 'haiku';
+export const estimateModel = (settings) => modelSetting('velocity', 'estimateModel', ESTIMATE_MODEL, settings);
 export const ESTIMATE_BUDGET_USD = 0.05;
 /** Bump when the mandate changes: rows of another version are ignored by the loader (and re-computed), never mixed. */
 export const ESTIMATE_PROMPT_VERSION = 2;
@@ -151,7 +154,7 @@ export function heldItemText(title, body, heldFileText) {
 }
 
 /** One size from a brief via the cheap model; `{size, reason, costUsd}`, or throws. */
-export async function estimateOne(brief, { spawn = judgeSpawn, model = ESTIMATE_MODEL, runId = 'perf-estimate', lens = 'size' } = {}) {
+export async function estimateOne(brief, { spawn = judgeSpawn, model = estimateModel(), runId = 'perf-estimate', lens = 'size' } = {}) {
   const r = await spawn({ mandate: ESTIMATE_MANDATE, input: brief, shape: ESTIMATE_SHAPE, model, effort: 'low', budget: ESTIMATE_BUDGET_USD, runId, lens });
   const size = snapFibonacci(Number(r.value?.size));
   if (!size) throw new Error('the estimator returned no usable size');
@@ -168,7 +171,7 @@ async function pool(items, n, fn) {
  * are skipped, so a re-run costs nothing). `cap` bounds new ESTIMATE calls; `calibrationN` bounds calibration calls.
  * @returns {{calibration:{n:number,mae:(number|null),bias:(number|null)}, newCalibration:number, newEstimates:number, failures:number, costUsd:number, remaining:number}}
  */
-export async function runEstimates({ collected, calibrationCollected = collected, storePath, gh, cap = DEFAULT_ESTIMATE_CAP, calibrationN = DEFAULT_CALIBRATION_N, heldText = '', spawn = judgeSpawn, now = () => new Date().toISOString(), concurrency = 5, model = ESTIMATE_MODEL }) {
+export async function runEstimates({ collected, calibrationCollected = collected, storePath, gh, cap = DEFAULT_ESTIMATE_CAP, calibrationN = DEFAULT_CALIBRATION_N, heldText = '', spawn = judgeSpawn, now = () => new Date().toISOString(), concurrency = 5, model = estimateModel() }) {
   const file = estimatesPath(storePath);
   const have = loadEstimateRows(file);
   let costUsd = 0, failures = 0, newCalibration = 0, newEstimates = 0;
