@@ -100,6 +100,28 @@ describe('release (the reaper path: `release --force`)', () => {
     expect(journal().find((e) => e.action === 'hold-refused')).toMatchObject({ hold: 'verified-unpushed' });
   });
 
+  // Live 2026-10-08 21:25–21:40Z: lanes 8, 11, 18 were held as verified-unpushed for every reaper pass although
+  // their verified heads were on origin (pushed by the fix daemon to a URL / PR ref, so the lane's own
+  // remote-tracking refs never learned of it). The hold must ask the live remote before calling it unpushed.
+  it.each([
+    ['a branch', 'refs/heads/lane/fix-4453'],
+    ['a PR head ref (branch deleted after merge)', 'refs/pull/4453/head'],
+  ])('a verified head already on origin as %s is NOT held, even with stale tracking refs', (_label, ref) => {
+    const { dir } = parkedFixerLane({ awaitRecord: false, verified: true });
+    git(['push', '--quiet', originDir, `HEAD:${ref}`], dir);
+    const r = runPool(['release', '--lane=1', '--force', ...poolArgs(), '--json'], { CLAUDE_CODE_SESSION_ID: 'reaper' });
+    expect(JSON.parse(r.out).released).toBe(1);
+    expect(journal().some((e) => e.action === 'hold-refused')).toBe(false);
+  });
+
+  it('a verified head on origin still holds when the lane has real uncommitted edits on top', () => {
+    const { dir } = parkedFixerLane({ awaitRecord: false, verified: true });
+    git(['push', '--quiet', originDir, 'HEAD:refs/heads/lane/fix-4453'], dir);
+    writeFileSync(join(dir, 'file.txt'), 'more work\n');
+    const r = runPool(['release', '--lane=1', '--force', ...poolArgs(), '--json'], { CLAUDE_CODE_SESSION_ID: 'reaper' });
+    expect(JSON.parse(r.out).released).toBe(0);
+  });
+
   it('a shared-store await record bound to the lane holds it too', () => {
     const { dir, sha } = parkedFixerLane({ awaitRecord: false });
     writeFileSync(join(storeDir, 'sess-fixer.json'), JSON.stringify({ v: 1, sessionId: 'sess-fixer', who: 'fix-4453', pr: 4453, sha, lane: dir, ref: 'lane/x', kind: 'fix', requestedAt: new Date().toISOString(), attempt: 1 }));
