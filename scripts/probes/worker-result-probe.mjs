@@ -194,4 +194,4 @@ export function main(argv = process.argv.slice(2)) {
   return 0;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) process.exit(main());
+if (import.meta.url === `file://${process.argv[1]}`) process.exitCode = main();
