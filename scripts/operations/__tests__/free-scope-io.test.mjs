@@ -202,3 +202,10 @@ it('reports unknown, refuses bad usage and keeps help side effect free', () => {
   const out = execFileSync(process.execPath, ['scripts/operations/run.mjs', 'free-scope', '--help'], { encoding: 'utf8', env: { ...process.env, ...env, WE_FREE_SCOPE_GH_BIN: '/nonexistent-gh' } });
   expect(out).toContain('read(compute) → assess(compute)');
 });
+it('keeps which PR files are newly ADDED, so a new backlog card is never read as holding the folder', () => {
+  const exec = () => JSON.stringify([{ number: 5, title: 'Card', url: 'u', files: [
+    { path: 'backlog/x1-new.md', changeType: 'ADDED' }, { path: 'backlog/x2-old.md', changeType: 'MODIFIED' }] }]);
+  const [p] = readOpenPrs({ repos: ['fixture/repo'], exec }).prs;
+  expect(p.files).toEqual(['backlog/x1-new.md', 'backlog/x2-old.md']);
+  expect(p.added).toEqual(['backlog/x1-new.md']);
+});
