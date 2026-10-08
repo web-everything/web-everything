@@ -1,4 +1,5 @@
 ---
+bornAs: xwtnr2y
 kind: story
 size: 3
 parent: "5332"
@@ -12,7 +13,7 @@ tags: []
 
 # Plateau /sessions page: one row per session with kind, executor, PR and card links, state, filters, ended hidden by default, live refresh (P2 of 128)
 
-Slice P2 of cards-to-file 128. The /sessions route in plateau-app renders the sessions topic from P1 (xlsblsu) as plain HTML and CSS: one row per session (kind, executor and model, PR and card links, state, last activity, lane, transcript link plus copy button, subagent count), kind and state filters in the URL, ended rows hidden unless the Ended (last 24 h) filter is on, live refresh over the relay. Card links go to /wip?card=N (P3 adds the anchor). Plateau has no card system, so this card is filed in web-everything with a plateau: scope.
+Slice P2 of cards-to-file 128. The /sessions route in plateau-app renders the sessions topic from P1 (5352) as plain HTML and CSS: one row per session (kind, executor and model, PR and card links, state, last activity, lane, transcript link plus copy button, subagent count), kind and state filters in the URL, ended rows hidden unless the Ended (last 24 h) filter is on, live refresh over the relay. Card links go to /wip?card=N (P3 adds the anchor). Plateau has no card system, so this card is filed in web-everything with a plateau: scope.
 
 ## Done when
 
