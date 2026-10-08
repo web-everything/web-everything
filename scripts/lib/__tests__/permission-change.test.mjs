@@ -3,6 +3,8 @@
  *   diffs of PR #4318 (workflow token widened to contents: write) and PR #4359 (extra Codex writable root) and
  *   proves each now scores humanRequired and cannot merge on a bare accept. RED on the old code, where #4318's
  *   diff scored only the agent-clearable blast-radius.
+ *
+ *   @repo-scanning-test scope=full - one case walks `scripts/` to pin SANDBOX_BEARING_FILES (registered in repo-scan-tests.mjs).
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';

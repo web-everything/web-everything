@@ -83,6 +83,13 @@ export const REPO_SCAN_TESTS = Object.freeze([
     inputs: ['scripts/lib/__tests__/review-policy.conformance.test.mjs'],
   },
   {
+    test: 'scripts/lib/__tests__/permission-change.test.mjs',
+    scope: 'full',
+    why: 'pins SANDBOX_BEARING_FILES to every non-test script that spells a sandbox token (a whole-tree fact: a new sandbox-bearing script anywhere under scripts/ must update the fail-closed list)',
+    matches: (f) => /\.(mjs|cjs|js|mts|ts|sh|bash|py)$/.test(f) && !skipped(f) && inTree(f, ['scripts']),
+    inputs: ['scripts/lib/permission-change.mjs', 'scripts/lib/__tests__/permission-change.test.mjs'],
+  },
+  {
     test: 'scripts/operations/__tests__/worker-result.test.mjs',
     scope: 'full',
     why: 'asserts the legacy outcome mapping is total over every `--outcome=` word in skills-src/**/*-brief*.md (item 117 S1); reads the briefs, so a brief change must re-run it',
