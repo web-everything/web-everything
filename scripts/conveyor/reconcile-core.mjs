@@ -2025,7 +2025,7 @@ export function planReconcile({
           failureCompletedAt: base.requiredCheckCompletedAt, mainRedWindows,
         }) !== 'main-red';
         const viaSignature = viaMainGreen && isMainFixedSignatureOwed(base.mainFixedSignature)
-          && !isMainGreenFixOwed({ ...base, failingCheckName: base.requiredCheckName, mainLatestCheckRuns,
+          && !isMainGreenFixOwed({ ...base, failingCheckName: base.requiredCheckName, mainLatestCheckRuns, failureCompletedAt: base.requiredCheckCompletedAt,
             comments: pr?.comments, headSha: pr?.headRefOid });
         refuse('owed-ci-rerun', {
           ...withPhase,

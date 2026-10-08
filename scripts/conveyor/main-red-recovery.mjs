@@ -47,7 +47,7 @@
  * actually let finish and CONCLUDE failed, never one merely superseded by the next push.
  * @see we:docs/agent/platform-decisions.md#deterministic-core-thin-judgment
  */
-import { mainBreakEscalationForHead } from './ci-heal-escalation-mark.mjs';
+import { mainBreakEscalationForHead, mainDefectEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { latestRequiredCheck, isRequiredCheckFailed } from '../merge-ai-prs.mjs';
 import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../lib/required-status-checks.mjs';
@@ -351,10 +351,17 @@ export function mainLatestGreenShaForCheck({ failingCheckName = null, mainLatest
  */
 export function isMainGreenFixOwed({
   failingCheckName = null, mainLatestCheckRuns = null, prContainsMainGreenSha = null, mergeBaseCheckRuns = null,
-  mergeBaseRunConclusion = null, comments = [], headSha = null,
+  mergeBaseRunConclusion = null, comments = [], headSha = null, failureCompletedAt = null,
 } = {}) {
   if (!isMainLatestCheckGreen({ failingCheckName, mainLatestCheckRuns })) return false;
   if (prContainsMainGreenSha !== false) return false;
+  // xo7mr6l — LIVE 2026-10-08, #4368/#4369: main's bad commit came AFTER the PRs branched and its own CI run was
+  // cancelled, so no red window and no red merge base exist, yet ci-heal correctly escalated "main's own defect".
+  // Once main's check is green on a run that finished AFTER this PR's failure and this head lacks that commit, one
+  // refresh is owed. Bounded: head-scoped escalation (the refresh moves the head), plus the per-sha rebase cap.
+  const defect = mainDefectEscalationForHead(comments, headSha);
+  const greenAt = Date.parse(collapseMainCheckRunsToLatestPerName(mainLatestCheckRuns).get(failingCheckName)?.completed_at);
+  if (defect && greenAt > Date.parse(failureCompletedAt)) return true;
   if (isMainLatestCheckGreen({ failingCheckName, mainLatestCheckRuns: mergeBaseCheckRuns })) return false;
   // #3239: cancelled main runs can leave no historical red check to read. A
   // trusted, head/check-specific diagnosis supplies attribution, but recovery must
@@ -462,7 +469,7 @@ export function isPrCiFailureOwedRerun({
   if (attribution === 'main-red') return true;
   return isMainGreenFixOwed({
     failingCheckName, mainLatestCheckRuns, prContainsMainGreenSha, mergeBaseCheckRuns, mergeBaseRunConclusion,
-    comments, headSha,
+    comments, headSha, failureCompletedAt: requiredCheckCompletedAt,
   }) || isMainFixedSignatureOwed(mainFixedSignature);
 }
 
@@ -532,7 +539,7 @@ export function planMainRedRebases({
     const mainGreenForCheck = attribution !== 'main-red' && isMainGreenFixOwed({
       failingCheckName: base.failingCheckName, mainLatestCheckRuns, comments: c?.comments, headSha: base.headSha,
       prContainsMainGreenSha: c?.prContainsMainGreenSha ?? null, mergeBaseCheckRuns: c?.mergeBaseCheckRuns ?? null,
-      mergeBaseRunConclusion: c?.mergeBaseRunConclusion ?? null,
+      mergeBaseRunConclusion: c?.mergeBaseRunConclusion ?? null, failureCompletedAt: base.failureCompletedAt,
     });
 
     const mainFixed = attribution !== 'main-red' && !mainGreenForCheck && isMainFixedSignatureOwed(c.mainFixedSignature);
@@ -570,10 +577,13 @@ export function planMainRedRebases({
     // own docblock for the full incident this closes: nothing ever bounded a non-conflict rebase failure, so it
     // could retry every tick forever exactly like the pre-fix hung-CI cancel/rerun could.
     const rebaseAttempts = Number.isFinite(c?.rebaseAttemptsForSha) ? c.rebaseAttemptsForSha : 0;
-    if (rebaseAttempts >= maxRebaseRetriesPerSha) {
+    // xo7mr6l: a main-defect-escalated PR gets ONE refresh per main recovery (knob WE_MAIN_DEFECT_REBASES_PER_SHA).
+    const capForPr = mainGreenForCheck && mainDefectEscalationForHead(c?.comments, base.headSha)
+      ? resolveMainDefectRebaseCap() : maxRebaseRetriesPerSha;
+    if (rebaseAttempts >= capForPr) {
       refusals.push({
         ...base, kind: 'rebase-cap-exhausted', attempts: rebaseAttempts,
-        why: `PR #${prNumber}'s head sha ${base.headSha ?? '?'} already had ${rebaseAttempts} rebase-onto-main attempt(s) that did not clear it (cap ${maxRebaseRetriesPerSha}) — no longer a clean mechanical refresh; this is owed a ci-heal instead of another retry`,
+        why: `PR #${prNumber}'s head sha ${base.headSha ?? '?'} already had ${rebaseAttempts} rebase-onto-main attempt(s) that did not clear it (cap ${capForPr}) — no longer a clean mechanical refresh; this is owed a ci-heal instead of another retry`,
       });
       continue;
     }
@@ -609,6 +619,12 @@ export function planMainRedRebases({
  *  failing against the identical head sha is no longer "bad luck", it is a real signal this pass should stop
  *  absorbing and hand to a `ci-heal` agent instead. */
 export const DEFAULT_MAX_REBASE_RETRIES_PER_SHA = 2;
+
+/** xo7mr6l — refreshes per head for a PR whose escalation blamed main's own defect; env knob, default 1. */
+export function resolveMainDefectRebaseCap(env = process.env) {
+  const n = Number.parseInt(env.WE_MAIN_DEFECT_REBASES_PER_SHA, 10);
+  return Number.isInteger(n) && n >= 0 ? n : 1;
+}
 
 /** we:scripts/conveyor/main-red-recovery.mjs#REBASE_ONTO_MAIN_COMMENT_MARKER — the stable FIRST LINE of the
  *  durable rebase-onto-main comment, mirroring `we:scripts/conveyor/ci-red-recovery-watch.mjs
