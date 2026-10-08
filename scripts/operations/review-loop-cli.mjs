@@ -301,6 +301,8 @@ export function parseFiledPayload(lines = []) {
 
 /** The step a ruled, parked review is rewound to: the one that reads the rulings off the thread and re-reduces. */
 export const RESUME_STEP = 'mandatoryReferrals';
+/** How many times one parked run is driven again after its resume failed part-way, before a fresh review is allowed. */
+export const RESUME_MAX_ATTEMPTS = 3;
 
 /**
  * Card xq1xbsl — THE PARKED RUN AN OPERATOR'S RULING RESUMES, if there is one. Reads the PR's live head and thread and
@@ -395,8 +397,22 @@ export async function runReviewLoopOnce({
     let rewound = null;
     try {
       const parked = resumedId ? store.read(resumedId) : null;
-      if (parked && parked.op === declaration.name && parked.pending?.kind === 'confirm') {
+      // A run parked on a confirm, or one an earlier resume rewound and never finished (it died or threw part-way).
+      // "Unfinished" = the earlier resume never got through `advise` (the same test `reviewRunEvidence` applies).
+      const unfinishedResume = Boolean(parked?.resumeOf) && !parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt;
+      const attempts = unfinishedResume ? Number(parked.resumeOf.attempts) || 1 : 0;
+      // A resume that keeps failing is bounded: after RESUME_MAX_ATTEMPTS the round falls back to a fresh review.
+      if (parked && parked.op === declaration.name && attempts < RESUME_MAX_ATTEMPTS
+        && (parked.pending?.kind === 'confirm' || unfinishedResume)) {
         rewound = rewindRunToStep(parked, { registry, step: RESUME_STEP, at: now() });
+        // The rewind drops the parked verdict and the referral step, and the record is saved before the resumed pass
+        // finishes. Keep what it set aside (`resumeOf`) so a resume that fails part-way still reads as the parked run
+        // it was (`reviewRunEvidence`) and is resumed again, never replaced by a fresh panel. An unfinished earlier
+        // resume keeps ITS `resumeOf` (the last parked pass); a finished, re-parked one captures its new parked pass.
+        rewound = { ...rewound, resumeOf: unfinishedResume ? { ...parked.resumeOf, attempts: attempts + 1 }
+          : { verdict: parked.findings?.referralVerdict ?? parked.verdict ?? null,
+            mandatoryReferrals: parked.findings?.mandatoryReferrals ?? null,
+            adviseFinishedAt: parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt ?? null, attempts: 1 } };
       }
     } catch { rewound = null; }
     if (rewound) {

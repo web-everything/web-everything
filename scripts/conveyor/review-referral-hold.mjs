@@ -28,13 +28,23 @@ export function reviewRunEvidence(run) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
   const head = read?.netBasis?.rev;
-  const verdict = run.findings?.referralVerdict ?? run.verdict;
-  const finish = run.stepTimings?.find(t => t.step === 'advise')?.finishedAt;
-  // A resumed run (rewound to the step that reads rulings) starts again at the resume: the rulings that woke it are answered.
-  const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t.step === 'read')?.startedAt), Date.parse(run.resumedAt ?? '') || 0);
+  // A run rewound to resume (card xq1xbsl) has dropped its verdict and its referral step. Until the resumed pass has
+  // run `advise` (the last step before it parks again), `resumeOf` (what the rewind set aside) stands in for them, so a
+  // resume that dies or throws anywhere part-way still reads as the parked run it was and the next tick resumes it
+  // again instead of starting a fresh panel that would raise the new referrals this card exists to stop.
+  const ownAdvise = run.stepTimings?.find(t => t.step === 'advise')?.finishedAt;
+  const resuming = Boolean(run.resumeOf) && !ownAdvise;
+  const ownVerdict = resuming ? undefined : run.findings?.referralVerdict ?? run.verdict;
+  const verdict = resuming ? run.resumeOf.verdict : ownVerdict;
+  // `advise` runs AFTER the referral step, so the rewind drops its timing too; the parked pass's finish time stands in.
+  const finish = ownAdvise ?? run.resumeOf?.adviseFinishedAt;
+  // A resumed run starts again at the resume: the rulings that woke it are answered. Only once the pass is finished,
+  // though: an unfinished resume has answered nothing yet, and must stay wakeable by the ruling that started it.
+  const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t.step === 'read')?.startedAt),
+    resuming ? 0 : Date.parse(run.resumedAt ?? '') || 0);
   const completedAt = Date.parse(finish);
   if (!sha(head) || !Number.isFinite(completedAt) || !Number.isFinite(startedAt)) return null;
-  const state = run.findings?.mandatoryReferrals?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
+  const state = (resuming ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
   const pending = verdict?.pendingReferrals ?? [];
   const findingKeys = pending.filter(key => !PENDING_REASON_TOKENS.has(key));
   const attempted = new Set((state?.records ?? [])

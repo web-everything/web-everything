@@ -1,5 +1,5 @@
 import { requiresMandatoryReferral, classifyReferralsByRound, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
-  referralKeyFinding, referralFindingKey, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable, openReferralHeads } from '../lib/jury-core.mjs';
+  referralKeyFinding, referralFindingKey, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable, openReferralHeads, readOperatorRulings } from '../lib/jury-core.mjs';
 // Card 84 — the per-seat provider directive (`review.seatProvider.<lens>`). PURE; the settings are read by the caller.
 import { seatProviderDirective } from '../lib/review-seat-provider.mjs';
 import { isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
@@ -1095,9 +1095,18 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
   // exist, so a run without any is byte-identical to before.
   let findingIdentity = [];
   try {
+    // Card xq1xbsl — an operator's ruling (#4979) lives in its own comment, not on the referral record, so it reaches the
+    // table only here, keyed by the same (head, run, key) the record's referral carries. Kept apart from `rulings` so
+    // the referral reviewer's prompt rows (latest ruling) read exactly as before. An unreadable one adds nothing: the
+    // finding then stays a referral, the safe direction.
+    let operatorRulings = [];
+    try { operatorRulings = readOperatorRulings(raw.comments ?? []).rulings; } catch { operatorRulings = []; }
     findingIdentity = findingIdentityTable(readReferralRecords(raw.comments ?? []).records)
-      .map(({ findingId, path, lens, normSummary, anchor, forms, heads, activeHeads, rulings }) => ({ findingId, path, lens, normSummary, anchor, forms, heads, activeHeads,
-        rulings: (rulings ?? []).map(({ head, result }) => ({ head, result })) }));
+      .map(({ findingId, path, lens, normSummary, anchor, forms, heads, activeHeads, rulings, keys }) => ({ findingId, path, lens, normSummary, anchor, forms, heads, activeHeads,
+        rulings: (rulings ?? []).map(({ head, result }) => ({ head, result })),
+        operatorRulings: operatorRulings
+          .filter((o) => (keys ?? []).some((k) => k.head === o.head && k.runId === o.runId && k.key === o.key))
+          .map(({ head, result }) => ({ head, result })) }));
   } catch { findingIdentity = []; }
   // Card xq1xbsl — the heads whose referral round never finished (a partial persistence, a crash before the attempt):
   // the later-round rule must not set a retry's findings aside on one of those. Any doubt names every head, which

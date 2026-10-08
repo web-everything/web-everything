@@ -14,12 +14,13 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { judgeOutcome } from '../cli-adapter.mjs';
 import { rewindRunToStep } from '../engine.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
-import { runReviewLoopOnce, defaultFindResumableRun } from '../review-loop-cli.mjs';
+import { runReviewLoopOnce, defaultFindResumableRun, RESUME_MAX_ATTEMPTS } from '../review-loop-cli.mjs';
 import {
   classifyReferralsByRound, findingIdentityTable, REFERRAL_DEMOTED_REASONS, referralFindingKey, normalizeFinding,
-  mandatoryReferralReviewer, renderReferralRecord, openReferralHeads,
+  mandatoryReferralReviewer, renderReferralRecord, openReferralHeads, buildOperatorRulingComment,
 } from '../../lib/jury-core.mjs';
 import { advanceWhileRunning, startRun } from '../engine.mjs';
+import { reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 
 const HEAD_1 = 'a'.repeat(40);
 const HEAD_2 = 'b'.repeat(40);
@@ -62,9 +63,35 @@ describe('classifyReferralsByRound — referrals follow the later-round scoping 
     const identity = identityOf(recordFor(HEAD_1, cited, ['block']));
     const reRaised = { ...cited, line: 43 };
     const latestFix = { priorHead: HEAD_1, head: HEAD_2, files: { [cited.file]: [43] } };
-    const out = classifyReferralsByRound([candidate(reRaised)], { identity, head: HEAD_2, latestFix });
+    const out = classifyReferralsByRound([candidate(reRaised)], { identity, head: HEAD_2, latestFix, lens: 'simplicity' });
     expect(out.kept).toEqual([]);
     expect(out.demoted).toEqual([{ candidate: candidate(reRaised), reason: REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE }]);
+  });
+
+  // PR #4441 review round 2 (security, CONFIRMED + codex-correctness, CONFIRMED): an edit near the cited line shows the code
+  // was touched, not that the defect is gone. A gate lens's block-ruled re-raise therefore stays mandatory after a nearby edit.
+  it.each(['correctness', 'security', undefined, ''])('a %j-lens block-ruled re-raise stays mandatory after a nearby (even exact-line) edit', (lens) => {
+    const cited = { ...raised, file: 'scripts/lib/pre-pr-review.mjs' };
+    const identity = identityOf(recordFor(HEAD_1, cited, ['block']));
+    const latestFix = { priorHead: HEAD_1, head: HEAD_2, files: { [cited.file]: [29] } };
+    for (const line of [29, 31]) {
+      const out = classifyReferralsByRound([candidate({ ...cited, line })], { identity, head: HEAD_2, latestFix, lens });
+      expect(out.kept).toEqual([candidate({ ...cited, line })]);
+      expect(out.demoted).toEqual([]);
+    }
+  });
+
+  // PR #4441 review round 2 (correctness): the operator's block ruling (#4979) is a separate comment, folded in by the reader.
+  it('an OPERATOR block ruling counts as blocked for an advisory-lens re-raise, like a reviewer block', () => {
+    const cited = { ...raised, file: 'scripts/lib/pre-pr-review.mjs' };
+    const unruled = identityOf(recordFor(HEAD_1, cited, ['not-real']));
+    const latestFix = { priorHead: HEAD_1, head: HEAD_2, files: { [cited.file]: [29] } };
+    const run = (identity) => classifyReferralsByRound([candidate(cited)], { identity, head: HEAD_2, latestFix, lens: 'simplicity' });
+    expect(run(unruled).kept).toHaveLength(1);                       // not block-ruled: not demoted
+    const operatorBlocked = unruled.map((e) => ({ ...e, operatorRulings: [{ head: HEAD_1, result: 'block' }] }));
+    expect(run(operatorBlocked).demoted.map((d) => d.reason)).toEqual([REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE]);
+    const operatorCard = unruled.map((e) => ({ ...e, operatorRulings: [{ head: HEAD_1, result: 'card' }] }));
+    expect(run(operatorCard).kept).toHaveLength(1);
   });
 
   it('a block-ruled finding re-raised on the SAME head is covered only: its gate lives in the thread record, not in a new referral', () => {
@@ -181,6 +208,77 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
     expect(second.run.resumedAt).toBe('2026-10-08T12:15:00.000Z');
     expect(second.run.verdict.pendingReferrals).toEqual([]);  // the ruling is reflected: nothing is owed any more
     expect(seen.filter((e) => e.type === REVIEW_EFFECTS.MANDATORY_REFERRALS)).toHaveLength(2);
+  });
+
+  // PR #4441 review round 2 (correctness): the rewound record replaces the parked one before the resumed pass finishes. If
+  // that pass fails, the run must still read as the parked run it was, so the next tick resumes it instead of starting the
+  // fresh panel (and the new referrals) this card exists to stop.
+  it('a resume whose referral step fails part-way leaves a run that is still parked and resumable, and the next pass finishes it', async () => {
+    const { declaration, registry } = setup();
+    const store = createMemoryRunStore();
+    const seen = [];
+    const ruled = { value: false };
+    let judged = 0;
+    const makeJudge = () => async () => { judged += 1; return judgeOutcome(REFERRAL_ANSWER, {}); };
+    await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinksWith({ seen, ruled }), makeJudge, mintRunId: () => 'r-1' });
+    const judgedByFirstReview = judged;
+    const before = reviewRunEvidence(store.read('r-1'));
+    expect(before).toMatchObject({ parked: true, attempted: false });
+
+    // The ruling arrives; the resumed pass dies in the referral sink (a gh failure, a crash).
+    const failing = sinksWith({ seen, ruled });
+    failing[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => { throw new Error('gh: 502'); };
+    const failed = await runReviewLoopOnce({ declaration, registry, argv, store, sinks: failing, makeJudge,
+      mintRunId: () => 'must-not-be-minted', findResumableRun: () => 'r-1', now: () => '2026-10-08T12:15:00.000Z' });
+    expect(failed.run.id).toBe('r-1');
+    expect(failed.run.verdict).toBeFalsy();                        // the resumed pass produced no verdict of its own
+    const after = reviewRunEvidence(store.read('r-1'));
+    expect(after).toMatchObject({ id: 'r-1', parked: true, pending: before.pending, attempted: before.attempted });
+    expect(after.startedAt).toBe(before.startedAt);                // still wakeable by the ruling that started the resume
+
+    // The next tick resumes the same run again, and this time it completes on the ruled thread.
+    ruled.value = true;
+    const again = await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinksWith({ seen, ruled }), makeJudge,
+      mintRunId: () => 'must-not-be-minted', findResumableRun: () => 'r-1', now: () => '2026-10-08T12:30:00.000Z' });
+    expect(again.run.id).toBe('r-1');
+    expect(judged).toBe(judgedByFirstReview);                      // never a fresh panel
+    expect(again.run.verdict.pendingReferrals).toEqual([]);
+    expect(reviewRunEvidence(store.read('r-1'))).toMatchObject({ parked: false });
+  });
+
+  // Review of the round-2 repair: a resume that keeps failing is bounded, and a re-parked resume is captured afresh.
+  it('a resume that keeps failing is retried RESUME_MAX_ATTEMPTS times in all, then the round falls back to a fresh review', async () => {
+    const { declaration, registry } = setup();
+    const store = createMemoryRunStore();
+    const makeJudge = () => async () => judgeOutcome(REFERRAL_ANSWER, {});
+    await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinksWith({ seen: [], ruled: { value: false } }), makeJudge, mintRunId: () => 'r-1' });
+    const failing = sinksWith({ seen: [], ruled: { value: false } });
+    failing[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => { throw new Error('gh: 502'); };
+    for (let n = 1; n <= RESUME_MAX_ATTEMPTS; n++) {
+      const out = await runReviewLoopOnce({ declaration, registry, argv, store, sinks: failing, makeJudge, mintRunId: () => 'must-not-be-minted', findResumableRun: () => 'r-1' });
+      expect(out.run.id).toBe('r-1');
+      expect(store.read('r-1').resumeOf.attempts).toBe(n);
+    }
+    const fresh = await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinksWith({ seen: [], ruled: { value: false } }), makeJudge, mintRunId: () => 'r-fresh', findResumableRun: () => 'r-1' });
+    expect(fresh.run.id).toBe('r-fresh');
+  });
+
+  it('a resume that finished and re-parked, then failed on the NEXT ruling, keeps the LATEST parked pass (not the first)', async () => {
+    const { declaration, registry } = setup();
+    const store = createMemoryRunStore();
+    const makeJudge = () => async () => judgeOutcome(REFERRAL_ANSWER, {});
+    await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinksWith({ seen: [], ruled: { value: false } }), makeJudge, mintRunId: () => 'r-1' });
+    // Resume 1 finishes and parks again (the referral is still owed).
+    await runReviewLoopOnce({ declaration, registry, argv, store, sinks: sinksWith({ seen: [], ruled: { value: false } }), makeJudge,
+      mintRunId: () => 'x', findResumableRun: () => 'r-1', now: () => '2026-10-08T12:15:00.000Z' });
+    const reparked = store.read('r-1');
+    const secondAdvise = reparked.stepTimings.find((t) => t.step === 'advise').finishedAt;
+    expect(reparked.pending?.kind).toBe('confirm');
+    // Resume 2 fails: its `resumeOf` must describe the pass that was just parked, not the first one.
+    const failing = sinksWith({ seen: [], ruled: { value: false } });
+    failing[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => { throw new Error('gh: 502'); };
+    await runReviewLoopOnce({ declaration, registry, argv, store, sinks: failing, makeJudge, mintRunId: () => 'x', findResumableRun: () => 'r-1' });
+    expect(store.read('r-1').resumeOf).toMatchObject({ adviseFinishedAt: secondAdvise, attempts: 1 });
   });
 
   it('without a resumable run it starts a fresh review exactly as before (new push, re-arm, send-back)', async () => {
@@ -301,10 +399,32 @@ describe('review-pr reduce — a later panel on an unchanged head adds no mandat
       expect(reduce.referrals).toHaveLength(2);
       expect(reduce.deferredAdvisory.filter((f) => f.deferred === REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE)).toEqual([]);
     });
-    it('is set aside as a card suggestion only when the push changed lines at the cited line', async () => {
+    // PR #4441 review round 2: only an ADVISORY seat's re-raise is set aside on a nearby edit; the gate seats keep theirs.
+    it('after a nearby edit the gate seats stay mandatory and only the advisory seat is set aside as a card suggestion', async () => {
+      const reduce = await reduceWith(reRaised, { comments: blocked, rev: HEAD_2, latestFix: latestFix([3]), correctnessAdvisory: true });
+      expect(reduce.referrals.map((r) => r.seat).sort()).toEqual(['judge', 'judgeSecurity']);
+      const setAside = reduce.deferredAdvisory.filter((f) => f.deferred === REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE);
+      expect(setAside.map((f) => f.category.split('/')[0])).toEqual(['codex-correctness']);
+    });
+    it('with no advisory seat seated, a nearby edit sets nothing aside', async () => {
       const reduce = await reduceWith(reRaised, { comments: blocked, rev: HEAD_2, latestFix: latestFix([3]) });
-      expect(reduce.referrals).toEqual([]);
-      expect(reduce.deferredAdvisory.filter((f) => f.deferred === REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE)).toHaveLength(2);
+      expect(reduce.referrals).toHaveLength(2);
+      expect(reduce.deferredAdvisory.filter((f) => f.deferred === REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE)).toEqual([]);
+    });
+    // PR #4441 review round 2 (correctness): a block ruled by the OPERATOR lives in its own comment, not on the record.
+    it('an operator block ruling in the thread is read: the advisory seat is set aside, the gate seats stay mandatory', async () => {
+      const record = recordFor(HEAD_1, firstFinding, []);
+      const operatorBlock = buildOperatorRulingComment({ version: 1, repo: 'o/n', pr: 4361, head: HEAD_1,
+        rulings: [{ runId: record.runId, key: record.referrals[0].key, result: 'block' }],
+        actor: 'chalbert', channel: 'claude-code-chat', reason: 'Fix it', at: '2026-10-08T12:09:00Z', clearerId: 'session-1' });
+      const comments = [{ ...thread[0], body: renderReferralRecord(record) },
+        { body: operatorBlock, createdAt: '2026-10-08T12:09:00Z', author: { login: 'chalbert' } }];
+      const reduce = await reduceWith(reRaised, { comments, rev: HEAD_2, latestFix: latestFix([3]), correctnessAdvisory: true });
+      expect(reduce.referrals.map((r) => r.seat).sort()).toEqual(['judge', 'judgeSecurity']);
+      expect(reduce.deferredAdvisory.filter((f) => f.deferred === REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE)).toHaveLength(1);
+      // ...and with no operator comment the same re-raise is not block-ruled, so nothing is set aside.
+      const without = await reduceWith(reRaised, { comments: [comments[0]], rev: HEAD_2, latestFix: latestFix([3]), correctnessAdvisory: true });
+      expect(without.deferredAdvisory.filter((f) => f.deferred === REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE)).toEqual([]);
     });
   });
 });
@@ -313,14 +433,25 @@ describe('review-pr reduce — a later panel on an unchanged head adds no mandat
 describe('classifyReferralsByRound — a block-ruled re-raise is demoted only on positive evidence the cited lines were fixed', () => {
   const SRC = 'scripts/lib/thing.mjs';
   const finding = (file, line = 100) => ({ file, line, summary: 'The guard on an empty list is missing', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' });
-  const run = (file, latestFix, line = 100) => classifyReferralsByRound([candidate(finding(file, line))],
-    { identity: identityOf(recordFor(HEAD_1, finding(file), ['block'])), head: HEAD_2, latestFix });
+  const run = (file, latestFix, line = 100, lens = 'simplicity') => classifyReferralsByRound([candidate(finding(file, line))],
+    { identity: identityOf(recordFor(HEAD_1, finding(file), ['block'])), head: HEAD_2, latestFix, lens });
   const fix = (files, extra = {}) => ({ priorHead: HEAD_1, head: HEAD_2, files, ...extra });
   const demoted = (out) => out.demoted.map((d) => d.reason);
 
-  it('demotes when a source file changed within LATER_ROUND_CHANGE_WINDOW of the cited line (edges included)', () => {
+  it('demotes an advisory seat when a source file changed within LATER_ROUND_CHANGE_WINDOW of the cited line (edges included)', () => {
     for (const changed of [100, 97, 103]) expect(demoted(run(SRC, fix({ [SRC]: [changed] })))).toEqual([REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE]);
     for (const changed of [96, 104]) expect(run(SRC, fix({ [SRC]: [changed] })).kept).toHaveLength(1);
+  });
+  // Every mandatory lens, at every position of the window, with the exact shapes that demote an advisory seat.
+  it.each(['correctness', 'security'])('never demotes a %s-lens re-raise, whatever the edit near the cited line', (lens) => {
+    for (const changed of [100, 97, 103]) {
+      const out = run(SRC, fix({ [SRC]: [changed] }), 100, lens);
+      expect(out.demoted).toEqual([]);
+      expect(out.kept).toHaveLength(1);
+    }
+    const alias = classifyReferralsByRound([candidate(finding('thing.mjs'))],
+      { identity: identityOf(recordFor(HEAD_1, finding('thing.mjs'), ['block'])), head: HEAD_2, latestFix: fix({ [SRC]: [101] }), lens });
+    expect(alias.demoted).toEqual([]);
   });
   it.each([
     ['an edit far from the cited line', SRC, fix({ [SRC]: [5] })],
@@ -343,7 +474,7 @@ describe('classifyReferralsByRound — a block-ruled re-raise is demoted only on
   });
   it('resolves an aliased citation (basename / repo prefix) to the touched path like #3999 does', () => {
     const out = classifyReferralsByRound([candidate({ ...finding('thing.mjs') })],
-      { identity: identityOf(recordFor(HEAD_1, finding('thing.mjs'), ['block'])), head: HEAD_2, latestFix: fix({ [SRC]: [101] }) });
+      { identity: identityOf(recordFor(HEAD_1, finding('thing.mjs'), ['block'])), head: HEAD_2, latestFix: fix({ [SRC]: [101] }), lens: 'simplicity' });
     expect(demoted(out)).toEqual([REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE]);
   });
 });
@@ -401,7 +532,7 @@ describe('classifyReferralsByRound — "covered" means an ACTIVE referral holds 
 describe('classifyReferralsByRound — an alias that fits two changed files is no evidence of a fix (PR #4441 self-review)', () => {
   const cited = { file: 'index.mjs', line: 900, summary: 'The guard on an empty list is missing', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
   const identity = identityOf(recordFor(HEAD_1, cited, ['block']));
-  const run = (files) => classifyReferralsByRound([candidate(cited)], { identity, head: HEAD_2, latestFix: { priorHead: HEAD_1, head: HEAD_2, files } });
+  const run = (files) => classifyReferralsByRound([candidate(cited)], { identity, head: HEAD_2, lens: 'simplicity', latestFix: { priorHead: HEAD_1, head: HEAD_2, files } });
   it('keeps the referral when a basename citation matches two changed files', () => {
     expect(run({ 'a/index.mjs': [900], 'b/index.mjs': [5] }).kept).toHaveLength(1);
   });

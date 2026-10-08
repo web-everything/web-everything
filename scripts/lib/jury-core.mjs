@@ -1523,14 +1523,15 @@ export const REFERRAL_DEMOTED_REASONS = Object.freeze({
  *                  of an unchanged head. A gate lens (`mandatoryLenses`: correctness, security) is never silenced
  *                  this way — {@link classifyLaterRoundAdvisory} keeps it in every round too, and a re-arm or
  *                  send-back that asks for a fresh look must be able to surface a blocker the first panel missed; or
- *                  (b) it re-raises a finding that was ruled `block` on an earlier head and the fixer's latest push
- *                  changed code NEAR the re-raise's cited line (`fixerChangeNearFinding` state `near`: a source file, a
- *                  known line set, a changed line within the window) — the only positive evidence the fix was made.
- *                  Touching the cited file is not that: an unknown line set, a non-source file, a distant edit or a
- *                  re-raise citing no line proves nothing, so those stay `kept`.
- *   - `kept`     — anything else: a first sighting on a head with no referrals, a gate-lens finding in a later round,
- *                  any finding on a head whose referral round never finished, or a re-raise the fixer did not
- *                  demonstrably fix (that one stays mandatory so the ignored-ruling path still sees it).
+ *                  (b) it comes from an ADVISORY lens and re-raises a finding that was ruled `block` (by a reviewer or
+ *                  the operator) on an earlier head, and the fixer's latest push changed code NEAR the re-raise's cited
+ *                  line (`fixerChangeNearFinding` state `near`: a source file, a known line set, a changed line within
+ *                  the window). That is evidence the cited code was edited, not proof the defect is gone, which is why
+ *                  a gate lens never takes this path. Touching the cited file is not even that: an unknown line set, a
+ *                  non-source file, a distant edit or a re-raise citing no line proves nothing, so those stay `kept`.
+ *   - `kept`     — anything else: a first sighting on a head with no referrals, a gate-lens finding in any round or
+ *                  after any edit, any finding on a head whose referral round never finished, or a re-raise the fixer
+ *                  did not demonstrably fix (that one stays mandatory so the ignored-ruling path still sees it).
  * @param {Array<{seat: string, original: object}>} candidates
  * @param {{identity?: Array<object>, head?: (string|null), latestFix?: (object|null), lens?: string,
  *   mandatoryLenses?: Array<string>, openHeads?: Array<string>}} o - `lens` is the seat's lens (every candidate in one
@@ -1558,8 +1559,14 @@ export function classifyReferralsByRound(candidates, { identity = [], head = nul
     // disabled) awaits no ruling, so a re-raise of it must not vanish into "covered".
     if (entry && head && (entry.activeHeads ?? entry.heads ?? []).includes(head)) { out.covered.push(candidate); continue; }
     if (entry) {
-      const blocked = (entry.rulings ?? []).some((r) => r.result === 'block');
-      if (blocked && fixFiles && fixerChangeNearFinding(candidate.original, fixFiles, { strictAlias: true }).state === 'near') {
+      // A block ruling is either a reviewer's (carried on the referral record) or the operator's (#4979, a separate
+      // comment the caller folds in as `operatorRulings`).
+      const blocked = [...(entry.rulings ?? []), ...(entry.operatorRulings ?? [])].some((r) => r.result === 'block');
+      // Only an ADVISORY seat's re-raise may be set aside on a nearby edit: an edit near the cited line shows the code
+      // was touched, not that the defect is gone, so a gate lens (correctness, security) stays mandatory and the
+      // ignored-ruling path still sees it (PR #4441 review, round 2).
+      if (advisoryLens && blocked && fixFiles
+        && fixerChangeNearFinding(candidate.original, fixFiles, { strictAlias: true }).state === 'near') {
         out.demoted.push({ candidate, reason: REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE });
         continue;
       }
