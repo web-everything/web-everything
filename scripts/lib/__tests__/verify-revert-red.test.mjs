@@ -145,6 +145,31 @@ describe('revert-red check on a real checkout', () => {
     });
   });
 
+  it('a half-written or headless journal is dropped (no revert ever happened under it), never wedges the lane', async () => {
+    await withFix(async (ctx) => {
+      const journal = join(ctx.root, '.git', REVERT_JOURNAL);
+      writeFileSync(journal, '{"head":"ab');
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ pending: true, ok: true, restored: [] });
+      expect(existsSync(journal)).toBe(false);
+      writeFileSync(journal, JSON.stringify({ files: [{ path: SRC }] }));
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ ok: true });
+      expect(existsSync(journal)).toBe(false);
+    });
+  });
+
+  it('a journaled file deleted after the kill is left alone; a live revert in progress is never restored under', async () => {
+    await withFix(async (ctx) => {
+      const journal = join(ctx.root, '.git', REVERT_JOURNAL);
+      writeFileSync(journal, JSON.stringify({ head: ctx.fix, files: [{ path: 'scripts/x/gone.mjs', reverted: 'x' }] }));
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ ok: true, leftAlone: ['scripts/x/gone.mjs'] });
+      const { hostname } = await import('node:os');
+      writeFileSync(journal, JSON.stringify({ head: ctx.fix, files: [{ path: SRC, reverted: 'x' }], pid: process.ppid, host: hostname() }));
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ pending: true, ok: false });
+      expect(existsSync(journal)).toBe(true);
+      expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe(FIXED);
+    });
+  });
+
   it('a journal naming a path outside the checkout is refused, not followed', async () => {
     await withFix(async (ctx) => {
       writeFileSync(join(ctx.root, '.git', REVERT_JOURNAL), JSON.stringify({ head: ctx.fix, files: [{ path: '../outside.mjs', reverted: 'x' }] }));
@@ -256,6 +281,14 @@ describe('parts', () => {
       expect(readFileSync(join(root, 'revert-red', 'log.jsonl'), 'utf8')).toBe('{"status":"clean"}\n');
       expect(appendRevertRedLog({}, { root, append: () => { throw new Error('EROFS'); } })).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('the reverted run carries its ceiling to the runner, and a run killed by it is unproven', () => {
+    const seen = [];
+    const run = (_f, _a, opts) => { seen.push(opts.timeout); throw Object.assign(new Error('ETIMEDOUT'), { signal: 'SIGTERM', stdout: ' RUN v1\n', stderr: '' }); };
+    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run, timeoutMs: 1234 })).toMatchObject({ ran: false, green: false });
+    expect(seen).toEqual([1234]);
+    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: (_f, _a, opts) => { expect(opts.timeout).toBeUndefined(); return 'Test Files  1 passed (1)\n'; } }).ran).toBe(true);
   });
 
   it('runSuite runs several files in one call and says when the failure list was cut', () => {

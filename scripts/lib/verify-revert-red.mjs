@@ -19,6 +19,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { hostname } from 'node:os';
 import * as nodeFs from 'node:fs';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join, sep } from 'node:path';
@@ -68,11 +69,21 @@ export function recoverRevertRed({ checkout, git, fs = nodeFs } = {}) {
   let journal;
   try { journal = JSON.parse(fs.readFileSync(path, 'utf8')); } catch (e) {
     if (e?.code === 'ENOENT') return { pending: false, ok: true, restored: [] };
-    return { pending: true, ok: false, restored: [], detail: 'unreadable revert journal' };
+    // The journal is complete (atomic rename) BEFORE any file is reverted, so an unreadable one means no revert ever
+    // happened under it: drop it rather than wedge every later verify of the lane.
+    try { fs.unlinkSync(path); } catch { /* gone */ }
+    return { pending: true, ok: true, restored: [], leftAlone: [], detail: 'dropped an unreadable revert journal' };
   }
   const head = String(journal?.head ?? '');
   const files = Array.isArray(journal?.files) ? journal.files : [];
-  if (!SHA_RE.test(head)) return { pending: true, ok: false, restored: [], detail: 'revert journal names no head' };
+  if (!SHA_RE.test(head)) {
+    try { fs.unlinkSync(path); } catch { /* gone */ }
+    return { pending: true, ok: true, restored: [], leftAlone: [], detail: 'dropped a revert journal that names no head' };
+  }
+  // A revert still IN PROGRESS (another verify of this lane, alive) is not a killed run: never restore under it.
+  if (Number.isSafeInteger(journal?.pid) && journal.pid > 0 && journal.pid !== process.pid && journal.host === hostname() && pidAlive(journal.pid)) {
+    return { pending: true, ok: false, restored: [], detail: `another verify (pid ${journal.pid}) is mid-revert in this lane` };
+  }
   // Only a tree that is EXACTLY what the killed run left is put back: HEAD still the journaled head, and each file
   // still holding the reverted bytes it wrote. Anything else means someone moved on since — their work is never
   // overwritten; the file is reported and left alone.
@@ -83,6 +94,8 @@ export function recoverRevertRed({ checkout, git, fs = nodeFs } = {}) {
   try {
     for (const entry of files) {
       const file = String(entry?.path ?? '');
+      // A journaled file that is gone was deleted after the kill: someone moved on, so it is left alone.
+      if (file && !file.startsWith('/') && !file.split('/').includes('..') && !fs.existsSync(join(checkout, file))) { leftAlone.push(file); continue; }
       const abs = safeTarget(checkout, file, fs);
       if (!abs) throw new Error(`unsafe journal path ${JSON.stringify(file)}`);
       let onDisk = null;
@@ -101,6 +114,7 @@ export function recoverRevertRed({ checkout, git, fs = nodeFs } = {}) {
 }
 
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } };
 
 /**
  * What a revert-red result does to the verify verdict. PURE — the one place verify-lane's exit code is decided for it.
@@ -229,7 +243,10 @@ export async function runRevertRedCheck({ checkout, base, head = 'HEAD', mode, k
   try {
     journal = journalPath(run);
     const files = targets.map((t) => ({ path: t.target, reverted: sha256(Buffer.from(t.revert, 'utf8')) }));
-    fs.writeFileSync(journal, `${JSON.stringify({ head: headSha.value, files, at: new Date().toISOString() })}\n`);
+    // Atomic: a kill mid-write leaves a stray tmp file, never a half-written journal.
+    const tmp = `${journal}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify({ head: headSha.value, files, pid: process.pid, host: hostname(), at: new Date().toISOString() })}\n`);
+    fs.renameSync(tmp, journal);
   } catch {
     return fail('journal-unwritable');
   }

@@ -180,6 +180,11 @@ export function revertRedVerdict({ mode, changeKind = null, recordMatchesHead = 
       else nonDiscriminating.push({ file, test });
     }
   }
+  // A PARTIAL revert (some changed sources could not be reverted: binary, symlinked) cannot prove a green test weak —
+  // it may guard exactly the file that stayed fixed. Such a test is unproven, never flagged.
+  if (Array.isArray(plan.unrevertable) && plan.unrevertable.length) {
+    unproven.push(...nonDiscriminating.splice(0).map((t) => ({ ...t, why: 'partial-revert' })));
+  }
   const lists = { discriminating, nonDiscriminating, unproven };
   if (nonDiscriminating.length) return result('flagged', 'tests-pass-with-fix-reverted', lists);
   if (unproven.length) return result('unproven', unproven[0].why, lists);

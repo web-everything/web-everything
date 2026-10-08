@@ -28,8 +28,8 @@ describe('revert-red rule — replay fixtures', () => {
     const named = (name) => replay(revertRedVerdict, FIXTURES.find((f) => f.name === name).facts).nonDiscriminating.map((t) => t.test);
     // 4481: "a new test that always passes" — the scratch-store pin.
     expect(named('replay-4481-warn')).toContain('pins OPERATION_COMPLETIONS_DIR to a fresh scratch dir in the child env AND in the prompt\'s own report command, and leaves a real store untouched');
-    // 4441: "its new test cannot catch removal of the guard".
-    expect(named('replay-4441-warn').length).toBeGreaterThan(0);
+    // 4441: "its new test cannot catch removal of the guard" — the demotion guard's new edge test.
+    expect(named('replay-4441-warn')).toContain('demotes an advisory seat when a source file changed within LATER_ROUND_CHANGE_WINDOW of the cited line (edges included)');
   });
 
   it('the fixtures discriminate: a broken rule that trusts any red run fails them', () => {
@@ -82,6 +82,14 @@ describe('revert-red rule — parts', () => {
   it('splits runner failure lines; a bare file is a load error', () => {
     expect(parseFailureLine('a.test.mjs > grp > t')).toMatchObject({ file: 'a.test.mjs', path: ['grp', 't'], loadError: false });
     expect(parseFailureLine('a.test.mjs [ a.test.mjs ]')).toMatchObject({ file: 'a.test.mjs', loadError: true });
+  });
+
+  it('a partial revert never flags: a green test may guard the file that stayed fixed', () => {
+    const fixture = FIXTURES.find((f) => f.name === 'replay-4441-warn').facts;
+    const plan = { ...planRevert({ changes: fixture.changes }), unrevertable: ['assets/logo.bin'] };
+    const v = revertRedVerdict({ ...fixture, plan });
+    expect(v).toMatchObject({ status: 'unproven', reason: 'partial-revert', nonDiscriminating: [] });
+    expect(v.unproven).toHaveLength(2);
   });
 
   it('the gate is asked before anything else and off costs nothing', () => {
