@@ -61,7 +61,7 @@ import { OPEN_PR_OP } from '../open-pr.mjs';
 import { RECORD_VERDICT_OP } from '../record-verdict.mjs';
 import { RECORD_REFERRAL_RULING_OP } from '../record-referral-ruling.mjs';
 import { VERIFY_OP } from '../verify.mjs';
-import { MUTATION_CHECK_OP } from '../mutation-check.mjs';
+import { MUTATION_CHECK_OP, REVERT_RED_CHECK_OP } from '../mutation-check.mjs';
 import { PR_STATUS_OP } from '../pr-status.mjs';
 import { LAND_ADVANCE_OP } from '../land-advance.mjs';
 import { PR_RECONCILE_OP } from '../pr-reconcile.mjs';
@@ -415,6 +415,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // READ-ONLY and genuinely so: both steps are `compute`; the declaring module imports only `registry.mjs`/`step-kinds.mjs`, and all pid/lease/claim/run-store reads live in `stale-state-io.mjs` behind the injected `readState` reader.
     [STALE_STATE_OP]: 'stale-state.mjs',
     [MUTATION_CHECK_OP]: 'mutation-check.mjs',
+    // #5466 — NOT read-only: its `probe` is an effect that reverts source files (same reason as `mutation-check`).
+    [REVERT_RED_CHECK_OP]: 'mutation-check.mjs',
     // #xrrpfo7 — `claim`'s sibling at the close of the lifecycle, and NOT read-only for the same reason
     // `claim` is not: its `write` step splices the card. Listed here for map coverage; its own suite pins
     // the property this list cannot express for a writing operation — the DECLARING module reaches nothing
