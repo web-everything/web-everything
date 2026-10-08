@@ -1,10 +1,9 @@
 ---
 bornAs: xx2620y
 kind: story
-size: 8
+size: 21
 status: open
-scope: ["we:scripts/operations/file-item.mjs", "we:scripts/backlog.mjs", "we:scripts/readiness/", "we:scripts/lib/review-core.mjs"]
-humanGate: { kind: review, what: "Ratify Forks 1–5 (prepared 2026-10-08, one at a time with the operator) before any slice below is filed or built. The forks are prepared, not decided." }
+scope: ["we:scripts/operations/file-item.mjs", "we:scripts/backlog.mjs", "we:scripts/backlog/", "we:scripts/readiness/", "we:scripts/lib/review-core.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/lib/citation-check.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/operations/codex-worker.mjs"]
 dateOpened: "2026-10-08"
 preparedDate: "2026-10-08"
 preparedAgainstSha: "8c38bb29412dab7ff4a15e7a8dda21e1542c7f47"
@@ -13,9 +12,23 @@ tags: []
 
 # Task agreement on every card: required Acceptance and Non-goals, and reviewers judge the diff against them
 
-Operator 2026-10-08 (from the Harness Engineering article review): every buildable card should say what "done" means and what is deliberately out of scope, and reviewers should judge the diff against that list, so a build that solves an easier task and calls it done is caught. **Prepared 2026-10-08, forks not decided.** Measured on `main` @ `8c38bb294` (script under Context): of 1,448 open stories, 646 (44.6%) have a filled `## Done when`/`## Acceptance`, 679 carry only the scaffold TODO, and 38 (2.6%) have a Non-goals section. Acceptance already has a home (`## Done when`, #2949); Non-goals has none; nothing enforces either; jurors never see either. Five forks below, each with a **bold recommended default**, a `Skeptic:` and a `Screen:` line. The `humanGate` holds the build until the operator rules.
+Operator 2026-10-08 (from the Harness Engineering article review): every buildable card should say what "done" means and what is deliberately out of scope, and reviewers should judge the diff against that list, so a build that solves an easier task and calls it done is caught. **Prepared and ruled 2026-10-08: see `## Ruling` below, which supersedes the prepared defaults where they differ (Fork 1 adds a one-off refresh; Fork 3 picks `## Acceptance` with cite-able `[A1]`/`[N1]` items).** Measured on `main` @ `8c38bb294` (script under Context): of 1,448 open stories, 646 (44.6%) have a filled `## Done when`/`## Acceptance`, 679 carry only the scaffold TODO, and 38 (2.6%) have a Non-goals section. Acceptance already has a home (`## Done when`, #2949); Non-goals has none; nothing enforces either; jurors never see either. Five forks below, each with a **bold recommended default**, a `Skeptic:` and a `Screen:` line, kept as the prepared record. The review `humanGate` the preparer set is removed now that the forks are ruled; the card is sized 21 (the slice total) so it splits into the slices below rather than building whole.
 
-## Recommended path at a glance
+## Ruling (ratified 2026-10-08, operator)
+
+Each fork was discussed with the operator in chat on 2026-10-08 before the call. Where a ruling differs from the prepared default below, the ruling wins.
+
+- **Fork 1 — ruled BOTH ("ok").** The rule is (c): the task agreement is checked when a card is prepared for build. On top of that, a **one-off refresh** of the open stories runs now, on spare token capacity: it writes `## Acceptance` and `## Non-goals` into open stories, **nearest-to-build first**, in batches of **about 50 cards per PR**. Every refreshed section is marked **draft**; a draft does not count as agreed until the preparer confirms it at prepare time, so the prepare check stays the rule and the refresh only saves it work. Model routing for the refresh: **Sonnet writes, Haiku 5.5 checks the shape.** Resolved cards are still never touched. This is new slice S2.
+- **Fork 2 — ruled BOTH, asymmetric ("ok"), = default (c).** Filing only warns and never refuses. The prepare/dispatch gate is the one that enforces. The `advise → enforce` setting lives at that gate.
+- **Fork 3 — ruled body sections named `## Acceptance` and `## Non-goals`, with numbered, cite-able items ("do that").** The operator asked what is best on merit, then agreed to this. It is not the prepared default (a): it is not frontmatter, and the new heading is `## Acceptance`, not `## Done when`. Each item is one line with a stable id: `- [A1] …`, `- [A2] …` under `## Acceptance`, and `- [N1] …` under `## Non-goals`, so reviewers and the gate can cite an item by id. The shared reader also accepts the legacy `## Done when` as an alias for `## Acceptance` during migration; new cards are written with `## Acceptance`. This re-opens #2949's choice of heading on purpose. #2949's reason for `## Done when` (it is a provenance-lint escape zone for not-yet-built paths) is kept by giving `## Acceptance` the same escape, so every code path that hard-codes `## Done when` today moves to the shared reader (new slice S7).
+- **Fork 4 — ruled (b) ("ok").** The correctness juror gets the list and cites `A#`/`N#` in its findings. No new dedicated lens. A new step in the review read looks up the PR's card (PR → card ids → `## Acceptance`/`## Non-goals` on `main`).
+- **Fork 5 — ruled FLOOR, (b) ("ok").** The list is the minimum. Reviewers may still block on a real defect the list does not name. A build PR that weakens its own card's criteria is flagged; the juror judges against the `main` copy.
+
+**Codification.** The card is a `kind: story` and stays open until its slices land, so `codifiedIn` (set when a `kind: decision` resolves) does not apply yet. The reusable rule (every buildable card carries `## Acceptance` and `## Non-goals` with `[A#]`/`[N#]` items; checked at prepare; reviewed as a floor) is written into `we:docs/agent/backlog-workflow.md` by slice S6.
+
+**Slice numbers.** The slice table below is renumbered for the ruling (new S2 refresh, new S7 reader migration). The fork text keeps the prepared numbers: its S2 is now S3, S3 is S4, S4 is S5, and S5 is S6.
+
+## Recommended path at a glance (prepared defaults — see Ruling above for what was decided)
 
 | fork | recommended default | main alternative | confidence |
 |---|---|---|---|
@@ -99,7 +112,7 @@ Crux: `## Done when` is already the ruled heading (#2949, `we:docs/agent/backlog
 - **(b) Frontmatter fields** (`acceptance: [...]`, `nonGoals: [...]`). Strictly structured. *Rejected:* criteria are prose with backticks, colons and commands, which is fragile as YAML; the rendered page would not show them; and the 2,392 existing `## Done when` sections would need moving or a second reader.
 - **(c) Body sections, but rename to `## Acceptance`.** Matches the card's own wording. *Rejected:* #2949 chose `## Done when` because it is a provenance-lint escape zone for not-yet-built paths; renaming re-opens a ruled call for no gain.
 
-**Default: (a).**
+**Default: (a).** *Superseded by the Ruling: `## Acceptance` + `## Non-goals` with `[A#]`/`[N#]` items; `## Done when` read as a legacy alias.*
 
 ```markdown
 <!-- Fork 3 (a) — the card layout an author writes -->
@@ -157,32 +170,47 @@ Crux: every finding already routes through three questions (introduced? worse th
 Skeptic: SURVIVES-WITH-AMENDMENT → the floor held; the "PR may not edit its own card" clause collided with prepare and resolve lanes that legitimately edit cards, so it is now scoped to build PRs, and the edit is flagged rather than refused.
 Screen: clear — whether a diff with a regression can land once it meets the list is visible policy.
 
-## Slices (file after the forks are ratified; total ~18 points, so this card splits)
+## Slices (forks ratified 2026-10-08; total ~26 points, so this card splits)
 
 | slice | size | touch-set | blocked by |
 |---|---|---|---|
-| S1 — reader module + skeleton + knob | 3 | `we:scripts/backlog/task-agreement.mjs`, `we:scripts/backlog/scaffold.mjs`, `we:scripts/lib/task-agreement-policy.json`, `we:scripts/backlog/__tests__/` | — |
-| S2 — file-item advises | 2 | `we:scripts/operations/file-item.mjs`, `we:scripts/operations/scaffold.mjs`, `we:skills-src/file-item/SKILL.md`, `we:scripts/operations/__tests__/` | S1 |
-| S3 — prepare + dispatch gate | 5 | `we:scripts/conveyor/prepare-result.mjs`, `we:scripts/readiness/dispatch-plan.mjs`, `we:scripts/backlog.mjs`, `we:skills-src/conveyor/prepare-item-agent-brief.md`, `we:scripts/readiness/__tests__/` | S1 |
-| S4 — jurors read the list | 5 | `we:scripts/lib/review-core.mjs`, `we:scripts/operations/review-pr.mjs`, `we:scripts/operations/review-pr-io.mjs`, `we:scripts/converge-cli.mjs`, `we:scripts/operations/review-prep.mjs`, `we:skills-src/converge/SKILL.md` | S1 |
-| S5 — docs + health audit (incl. the #2949 composition sentence, Fork 1) | 3 | `we:docs/agent/backlog-workflow.md`, `we:scripts/audit-backlog-health.mjs` | S1 |
+| S1 — reader module + skeleton + setting (in build 2026-10-08) | 3 | `we:scripts/backlog/task-agreement.mjs`, `we:scripts/backlog/scaffold.mjs`, `we:scripts/lib/task-agreement-policy.json`, `we:scripts/backlog/__tests__/` | — |
+| S2 — one-off refresh of open stories (Fork 1 ruling) | 5 | a new refresh runner under `we:scripts/backlog/` with its test, then the open `backlog/*.md` stories it rewrites, about 50 cards per PR | S1, S7 |
+| S3 — file-item warns | 2 | `we:scripts/operations/file-item.mjs`, `we:scripts/operations/scaffold.mjs`, `we:skills-src/file-item/SKILL.md`, `we:scripts/operations/__tests__/` | S1 |
+| S4 — prepare + dispatch gate | 5 | `we:scripts/conveyor/prepare-result.mjs`, `we:scripts/readiness/dispatch-plan.mjs`, `we:scripts/backlog.mjs`, `we:skills-src/conveyor/prepare-item-agent-brief.md`, `we:scripts/readiness/__tests__/` | S1 |
+| S5 — correctness juror reads the list | 5 | `we:scripts/lib/review-core.mjs`, `we:scripts/operations/review-pr.mjs`, `we:scripts/operations/review-pr-io.mjs`, `we:scripts/converge-cli.mjs`, `we:scripts/operations/review-prep.mjs`, `we:skills-src/converge/SKILL.md` | S1 |
+| S6 — docs + health audit (the rule, the #2949 composition sentence, the heading change) | 3 | `we:docs/agent/backlog-workflow.md`, `we:scripts/audit-backlog-health.mjs` | S1 |
+| S7 — move hard-coded `## Done when` readers to the shared reader (Fork 3 ruling) | 3 | `we:scripts/lib/citation-check.mjs` (`PROVENANCE_ESCAPE_HEADINGS`), `we:scripts/check-standards-rules.mjs` (Must-cite, TODO-placeholder and scope guards), `we:scripts/check-standards.mjs`, `we:scripts/operations/codex-worker.mjs`, `we:scripts/lib/probation-launcher.mjs`, their tests | S1 |
 
-S2–S5 have disjoint touch-sets and can run in parallel after S1. The knob flip from `advise` to `enforce` is a one-line config change after S3, on the trigger above.
+**S2, the refresh (Fork 1 ruling).**
 
-## Done when
+- Order: nearest-to-build first, by the dispatch/readiness rank (prepared stories first, then the rest by rank).
+- Skip any card that is `active`, held by an open PR or a registered scope (the free-scope check), or that already has a filled, non-draft `## Acceptance` and `## Non-goals`. An existing `## Done when` is renamed to `## Acceptance` and its lines get `[A#]` ids; its meaning is not changed.
+- Every section the refresh writes carries a draft marker that the S1 reader exposes (for example `<!-- task-agreement: draft -->` under the heading). Under `enforce`, S4 treats a draft section as not agreed, and the prepare agent confirms it by removing the marker after checking it against the code.
+- Sonnet writes each card's sections. Haiku 5.5 checks only the shape (headings present, `[A#]`/`[N#]` ids, no `TODO`, `n/a: <why>` used correctly) and sends a failing card back once; a second failure leaves the card untouched and logged.
+- About 50 cards per PR, each PR through `open-pr` and the normal review.
+- S2 waits for S7, so a card that switches to `## Acceptance` does not lose the provenance escape or the Must-cite check.
 
-1. **Executable** — `node --test we:scripts/backlog/__tests__/task-agreement.test.mjs` passes: `readTaskAgreement` reads `## Done when`, the `## Acceptance` alias and `## Non-goals`, drops TODO lines, and treats `n/a: <why>` as answered (fails before S1: the module does not exist).
-2. **Executable** — a `dispatch-plan` test holds a stamped story with no `## Non-goals` as `needs-task-agreement` under `enforce` and dispatches it under `advise`.
-3. **Executable** — a `review-pr` mandate test shows a PR whose card has Done-when lines carries those lines inside the correctness juror's fenced goal block and not in any other lens's; a PR with no resolvable card keeps the title-only goal.
-4. **Observable** — re-running the measurement script under Context after S3 shows every story stamped after the flip has both sections.
+S3–S7 have disjoint touch-sets and can run in parallel after S1. The setting flip from `advise` to `enforce` is a one-line config change after S4, on the trigger above.
+
+## Acceptance
+
+- [A1] **Executable** — `node --test we:scripts/backlog/__tests__/task-agreement.test.mjs` passes: `readTaskAgreement` reads `## Acceptance` and its legacy alias `## Done when`, reads `## Non-goals`, returns each `[A#]`/`[N#]` id with its line, drops TODO lines, treats `n/a: <why>` as answered, and reports a draft marker (fails before S1: the module does not exist).
+- [A2] **Executable** — a `dispatch-plan` test holds a stamped story with no `## Non-goals`, or with a draft-marked section, as `needs-task-agreement` under `enforce`, and dispatches it under `advise`.
+- [A3] **Executable** — a `review-pr` mandate test shows a PR whose card has `[A#]` lines carries those lines, with their ids, inside the correctness juror's fenced goal block and not in any other lens's; a PR with no resolvable card keeps the title-only goal.
+- [A4] **Executable** — a `citation-check` test shows an unresolved path under `## Acceptance` gets the same provenance escape as one under `## Done when` (S7).
+- [A5] **Observable** — after S2, every open story it processed has `## Acceptance` and `## Non-goals` with ids, marked draft, in PRs of about 50 cards each, nearest-to-build first.
+- [A6] **Observable** — re-running the measurement script under Context after S4 shows every story stamped after the flip has both sections, not draft.
 
 ## Non-goals
 
-1. Backfilling the 1,730 open stories and tasks in one sweep (Fork 1 (b), rejected).
-2. Touching resolved cards.
-3. A new review lens (Fork 4 (a)); revisit only on review-corpus evidence.
-4. Running tier-1 criteria automatically at review (a follow-up).
-5. Changing the edge-case section or the `## MVP` Musts cut beyond moving the out-of-scope list.
+- [N1] Touching resolved cards.
+- [N2] Treating the S2 refresh as agreement: refreshed sections stay draft until the preparer confirms them.
+- [N3] A new review lens (Fork 4 (a)); revisit only on review-corpus evidence.
+- [N4] Refusing a card at filing time (Fork 2 (a)).
+- [N5] Treating the list as a ceiling (Fork 5 (a)): meeting it does not wave through a real defect.
+- [N6] Running tier-1 criteria automatically at review (a follow-up).
+- [N7] Changing the edge-case section or the `## MVP` Musts cut beyond moving the out-of-scope list.
 
 ## Edge cases this change must handle
 
