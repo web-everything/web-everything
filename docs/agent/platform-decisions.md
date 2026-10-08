@@ -6147,6 +6147,22 @@ A looser value is a statute PR; a tighter value is a normal setting change. Shap
 | `labelMirror.handInput` | `tighten-only` | `revert-all` (tighter); `trust-operator` (looser, statute PR) |
 | `verdictLedger.readSource.<family>` | `comments` until that family's reader switches | `ledger` |
 
+**Store contract (definition; the delivery protocol's seam).** `verdictLedger.store` selects a store BY NAME from
+a registry (`we:scripts/lib/verdict-ledger-store.mjs`). `home`, `git` and `dual` (home plus git, the F4 write
+order) are built in; a product store (Plateau) registers under its own name and no caller changes. A store is:
+
+- `capabilities`: `{durable, shared, ordering}`. `durable` survives the writing process. `shared` is visible to
+  other machines. `ordering` is `none`, `append` (one writer's order) or `total` (one order across all writers).
+  `home` is `{true, false, append}`; `git` is `{true, true, total}`.
+- `append(rows, {repo, ...})` returns `{ok, appended, error?}` and never throws. An invalid row refuses the whole
+  call, and a row is never repaired: a row whose own `repo` is missing, malformed or different from `repo` is
+  invalid. On an I/O failure `appended` is the count really written.
+- `read({repo, from?})` returns `{status: 'ok', rows}` or `{status: 'unreadable', reason, error}` and never
+  throws. A failed read is `unreadable`, never an empty `ok`; every gate treats `unreadable` as a hold.
+
+Every adapter must pass the conformance suite (`we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs`).
+The event schema and the fold stay the standard; the contract does not change either.
+
 **What this ruling does not do.** It builds nothing and adds no code. The build slices (event types v2, git
 io-shell, dual write, `derivePrState`, mirror, ledger gate) are filed separately. The write-miss posture is
 documented at the append site and tested by the build that moves the ledger onto the git transport (#3255).
