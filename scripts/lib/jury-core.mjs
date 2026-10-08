@@ -405,7 +405,8 @@ export function normalizeFinding(raw) {
   // #2950 — THE THREE DIRECTION TESTS, carried so the routing is auditable after the fact (a reader can see WHY a
   // finding was carved out, not just that it was). Strict booleans only; anything else adds no key, which leaves
   // the routing undecided and the finding blocking.
-  for (const k of ['introduced', 'worseThanBase', 'parallelizable']) {
+  // `judgmentCall`: the reviewer marks a finding a taste or policy decision; review.referralDefault=auto-block never rules it.
+  for (const k of ['introduced', 'worseThanBase', 'parallelizable', 'judgmentCall']) {
     if (typeof raw[k] === 'boolean') out[k] = raw[k];
   }
   // #2950 — DISPOSITION, the round key. Validated against the enum by `Object.hasOwn` on the null-prototype table
@@ -3128,6 +3129,8 @@ export function readReferralRecords(comments, { head } = {}) {
  */
 export const OPERATOR_RULING_MARKER = 'mandatory-referral-operator-ruling-v1';
 export const OPERATOR_RULING_RESULTS = Object.freeze(['block', 'card', 'not-real']);
+/** The actor of a ruling recorded by policy, never by the operator. It can only rule `block`. */
+export const AUTO_POLICY_ACTOR = 'auto-policy';
 const OPERATOR_RULING_OPENER = /^[ \t]*<!-- mandatory-referral-operator-ruling-v1:/m;
 const inertProse = s => String(s).replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;');
 
@@ -3136,7 +3139,10 @@ export function validateOperatorRuling(r) {
   try {
     if (!r || r.version !== 1 || !/^[^/\s]+\/[^/\s]+$/.test(r.repo) || !Number.isInteger(r.pr) || r.pr < 1
       || !/^[a-f0-9]{40}$/.test(r.head)) return false;
-    if (typeof r.actor !== 'string' || !/^[\w-]+$/.test(r.actor) || !OPERATOR_LOGINS.includes(r.actor.toLowerCase())) return false;
+    if (typeof r.actor !== 'string' || !/^[\w-]+$/.test(r.actor)) return false;
+    // `auto-policy` (review.referralDefault=auto-block) is NOT an operator. It may only HOLD: every ruling is `block`.
+    if (r.actor.toLowerCase() === AUTO_POLICY_ACTOR) { if (!Array.isArray(r.rulings) || r.rulings.some(x => x?.result !== 'block')) return false; }
+    else if (!OPERATOR_LOGINS.includes(r.actor.toLowerCase())) return false;
     if (typeof r.channel !== 'string' || !r.channel.trim() || /[\r\n]/.test(r.channel) || r.channel.length > 200) return false;
     if (typeof r.reason !== 'string' || !r.reason.trim() || r.reason.length > 4000) return false;
     if (typeof r.at !== 'string' || !Number.isFinite(Date.parse(r.at))) return false;
@@ -3168,8 +3174,10 @@ export function buildOperatorRulingComment(r) {
     try { summary = String(JSON.parse(x.key).at(-1) ?? ''); } catch { /* opaque key */ }
     return `${i + 1}. **${x.result}**${x.card ? ` → \`${inertProse(x.card)}\`` : ''} — ${inertProse(summary.replace(/\s+/g, ' ').slice(0, 300))} (run \`${inertProse(x.runId)}\`)`;
   });
-  return `## Operator ruling on mandatory referrals\n\n`
-    + `Recorded on the operator's explicit instruction: @${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`.\n`
+  const auto = r.actor.toLowerCase() === AUTO_POLICY_ACTOR;
+  return `## ${auto ? 'Automatic policy ruling' : 'Operator ruling'} on mandatory referrals\n\n`
+    + (auto ? `Recorded by policy, not by the operator: ${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`. The operator can override it with a card or not-real ruling.\n`
+      : `Recorded on the operator's explicit instruction: @${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`.\n`)
     + `This rules only on the findings listed; it applies to this head only and does not change review labels.\n\n`
     + `${quote}\n\n${lines.join('\n')}\n\n`
     + `<!-- ${OPERATOR_RULING_MARKER}: ${Buffer.from(JSON.stringify(r)).toString('base64')} -->`;
@@ -3261,7 +3269,7 @@ export function mandatoryReferralState(comments, context = {}) {
       if (pendingFindings.some((x) => x.runId === r.runId && x.key === f.key)) continue;
       pendingFindings.push({ runId: r.runId, key: f.key, seat: f.seat, attempted: r.attempted === true,
         file: f.finding?.file ?? null, line: Number.isInteger(f.finding?.line) ? f.finding.line : null,
-        summary: String(f.finding?.summary ?? '').replace(/\s+/g, ' ').trim() });
+        summary: String(f.finding?.summary ?? '').replace(/\s+/g, ' ').trim(), judgmentCall: f.finding?.judgmentCall === true });
     }
   }
   const pendingAll = [...new Set(pending)];

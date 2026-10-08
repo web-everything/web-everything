@@ -86,10 +86,10 @@ export function classifyEvent(c) {
     const blocks = rulings.filter((r) => r.result === 'block');
     return blocks.length ? { type: 'round', trigger: 'referral-block', at: c.at, head: refHead, findings: blocks.map((r) => ({ ...r, ruling: 'block' })), rulings } : rulings.length ? { type: 'rulings', at: c.at, head: refHead, rulings } : null;
   }
-  if (/^## Operator ruling on mandatory referrals/.test(first)) {
+  if (/^## (?:Operator|Automatic policy) ruling on mandatory referrals/.test(first)) {
     const blocks = [...b.matchAll(/^\d+\. \*\*(\w[\w-]*)\*\* — (.*?)(?: \(run `[^`]+`\))?$/gm)].map((m) => ({ file: null, line: null, lens: 'referral', claim: clip(m[2], 220), ruling: m[1] }));
     const hit = blocks.filter((x) => x.ruling === 'block');
-    return hit.length ? { type: 'round', trigger: 'operator-send-back', at: c.at, head, findings: hit } : null;
+    return hit.length ? { type: 'round', trigger: /^## Automatic policy/.test(first) ? 'policy-send-back' : 'operator-send-back', at: c.at, head, findings: hit } : null;
   }
   const who = b.match(/\*\*Who:\*\* `([^`]+)`/)?.[1] ?? b.match(/<!-- fix-claim who=(\S+) -->/)?.[1];
   if (/^🔒 conveyor fix-begin/.test(first)) return { type: 'fix-begin', at: c.at, who: who ?? 'fixer', head: b.match(/\*\*Branch:\*\* `[^`]+` at `([0-9a-f]{7,40})`/)?.[1] ?? null };

@@ -63,6 +63,7 @@ import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { defaultListPrs } from './advisory-label-sweep.mjs';
 import { sweepRulingNeededLabels } from './ruling-needed-sweep.mjs';
+import { sweepAutoBlock } from './referral-auto-block.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 
 /** Plain label names off a `gh --json labels` array (`[{name}]`) or a bare-string array. Pure. */
@@ -132,7 +133,7 @@ export function needsReviewHoldCleanup(pr) {
  *   needed (or would need) a change, was healed, or carries a contradiction this sweep could not resolve.
  */
 export function sweepReviewHoldLabels({
-  repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false,
+  repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling,
 } = {}) {
   const prs = listPrs({ repo });
   const results = [];
@@ -194,8 +195,20 @@ export function sweepReviewHoldLabels({
   // `advisory:ruling-needed` — a derived label (a parked review whose confirmed findings await the operator's
   // ruling on the current head), added and removed from the SAME listing this sweep already read. Its own entry
   // shape (`ruling`), so the three existing fields above keep their meaning. A failure here never costs the sweep.
+  // `review.referralDefault=auto-block`: rule the confirmed referrals `block` as `auto-policy` and send the PR back BEFORE
+  // the label sweep, which then skips them (the listing above is stale for those PRs). Off by default (`operator`).
+  const autoBlocked = new Set();
   try {
-    for (const r of sweepRulingNeededLabels({ repo, listPrs: () => prs, provider, dryRun })) {
+    for (const r of sweepAutoBlock({ repo, resolveRepo: () => repoOf(), listPrs: () => prs, dryRun, ...(settings ? { settings } : {}), ...(runRuling ? { runRuling } : {}) })) {
+      results.push({ num: r.num, autoBlock: r.action, findings: r.findings, operatorKept: r.operatorKept, ...(r.error ? { error: r.error } : {}) });
+      // Only a PR with nothing left for the operator skips the label sweep; judgment calls and disputes keep the signal.
+      if (r.action === 'auto-blocked' && !r.operatorKept) autoBlocked.add(r.num);
+    }
+  } catch (e) {
+    results.push({ num: 0, autoBlock: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] });
+  }
+  try {
+    for (const r of sweepRulingNeededLabels({ repo, listPrs: () => prs.filter((p) => !autoBlocked.has(p.number)), provider, dryRun })) {
       results.push({ num: r.num, ruling: r.action, ...(r.error ? { error: r.error } : {}) });
     }
   } catch (e) {
@@ -229,6 +242,7 @@ if (IS_CLI) {
           const did = dryRun ? 'would heal' : 'healed';
           writeLineSync(2, `  🩹 PR #${r.num}: ${did} — removed ${r.healed.join(',')} (no genuine human clearance found for the live head)${r.commentPosted ? ', comment posted' : ''}${r.error ? ` (${r.error})` : ''}`);
         }
+        if (r.autoBlock) writeLineSync(2, `  PR #${r.num}: ${dryRun ? 'would ' : ''}${r.autoBlock} ${r.findings ?? 0} confirmed referral(s) as auto-policy${r.operatorKept ? ` (${r.operatorKept} left for the operator)` : ''}${r.error ? ` (FAILED: ${r.error})` : ''}`);
         if (r.ruling) writeLineSync(2, `  PR #${r.num}: ${dryRun ? 'would ' : ''}${r.ruling} advisory:ruling-needed${r.error ? ` (FAILED: ${r.error})` : ''}`);
         if (r.flagged?.length) {
           writeLineSync(2, `  🚩 PR #${r.num}: carries contradictory review:* verdict labels (${r.flagged.join(',')}) — #2766/#2767 shape; not auto-resolved (${r.flagReason || 'unresolved'}${r.fetchError ? `, fetch error: ${r.fetchError}` : ''}). Resolve via review-set-label.mjs --to=clear-human or --to=changes.`);
