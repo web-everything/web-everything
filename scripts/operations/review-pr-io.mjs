@@ -347,7 +347,9 @@ export function recordScopedRereviewShadow({ payload, exec, readLedgerRows, appe
     let rows = [];
     let ledger = 'ok';
     try { rows = (readLedgerRows(repo) ?? []).filter((r) => Number(r?.pr) === Number(pr)); } catch { rows = []; ledger = 'unreadable'; }
-    const reviewRuns = rows.filter((r) => r.type === EVENT_TYPES.REVIEW_RUN);
+    // Reviewed heads, in append order: a completed run's review-run row, and the shadow's own finding rows (written at
+    // review time, so a round parked for a ruling is counted too).
+    const reviewRuns = rows.filter((r) => r.type === EVENT_TYPES.REVIEW_RUN || r.type === EVENT_TYPES.FINDING);
     const fromLedger = ledger === 'ok' ? lastReviewedHead(reviewRuns, head) : null;
     // The ledger names the last reviewed head (edge 6). A PR whose earlier rounds predate the review-run rows falls
     // back to the trusted `Net basis:` marker the latest-fix read already used; anything else is a full review.
@@ -1301,11 +1303,14 @@ export function createReviewPrSinks({
         } catch (e) { missed.push(`${row.type}: ${String(e?.message ?? e).split('\n')[0]}`); }
       }
       if (missed.length) out(`ledger-write-miss: ${payload.repo}#${payload.pr} review events not fully recorded (${missed.join(' | ')}); comments, labels and decisions are unaffected`);
-      // Card 5469 — SHADOW ONLY: finding-identity rows + the would-block / would-card journal. Never a decision.
-      const shadow = payload.roundFacts
-        ? recordScopedRereviewShadow({ payload, exec: shadowGitExec, readLedgerRows, appendLedgerRow, appendJournal: appendShadowJournal, out })
-        : null;
-      return { written, missed, ...(shadow ? { scopedRereview: shadow } : {}) };
+      return { written, missed };
+    },
+
+    // ── Card 5469 — THE SCOPED RE-REVIEW SHADOW: finding-identity ledger rows + the would-block / would-card journal.
+    // SHADOW ONLY: it changes no comment, label or verdict, and it never throws (a miss is one loud line).
+    [REVIEW_EFFECTS.SCOPED_REREVIEW_SHADOW]: async (payload) => {
+      const summary = recordScopedRereviewShadow({ payload, exec: shadowGitExec, readLedgerRows, appendLedgerRow, appendJournal: appendShadowJournal, out });
+      return { recorded: summary !== null, ...(summary ? { summary } : {}) };
     },
 
     // ── 3. THE EVENT: the operator notice, rendered by `renderReviewNotice` in the declaration. ──────────────

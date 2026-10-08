@@ -2306,3 +2306,21 @@ describe('card 5469: recordScopedRereviewShadow (shadow only, never a decision)'
     expect(out.findings[0]).toMatchObject({ heldVerdict: true, deferred: false });
   });
 });
+
+describe('card 5469: the advise step declares the shadow effect only when the setting is shadow', async () => {
+  const { reviewPrOperation, REVIEW_EFFECTS: E } = await import('../review-pr.mjs');
+  const advise = reviewPrOperation({ readPr: () => ({}) }).steps.find((s) => s.name === 'advise').step;
+  const view = (read) => ({ input: { pr: 7, repo: 'o/r' }, findings: { read: { netBasis: { rev: 'b'.repeat(40) }, labels: [], ...read } },
+    verdict: { verdict: 'changes', admittedFindings: [], deferredAdvisory: [], findings: [] } });
+
+  it('off (no setting on the read): exactly today — no effect for a non-human PR', () => {
+    expect(advise.effects(view({}))).toEqual([]);
+  });
+
+  it('shadow: one idempotent shadow effect, after any advisory effects', () => {
+    const effects = advise.effects(view({ scopedRereview: 'shadow' }));
+    expect(effects).toHaveLength(1);
+    expect(effects[0]).toMatchObject({ type: E.SCOPED_REREVIEW_SHADOW, idempotent: true, payload: { pr: 7, repo: 'o/r' } });
+    expect(effects[0].payload.roundFacts).toMatchObject({ head: 'b'.repeat(40), liveVerdict: 'changes' });
+  });
+});

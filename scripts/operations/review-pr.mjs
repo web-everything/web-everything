@@ -895,6 +895,8 @@ export const REVIEW_EFFECTS = Object.freeze({
   AWAITING_ADVISORY_CLEAR: 'review.awaiting-advisory-clear',
   // Ledger plan slice E2: the `referral` and `review-run` ledger events. ADDITIVE ONLY, never a decision.
   LEDGER_EVENTS: 'review.ledger-events',
+  // Card 5469: the scoped re-review shadow (finding-identity ledger rows + would-block/would-card journal). SHADOW ONLY.
+  SCOPED_REREVIEW_SHADOW: 'review.scoped-rereview-shadow',
 });
 
 /**
@@ -2766,8 +2768,17 @@ export function reviewPrOperation({
       reads: ['input.pr', 'input.repo', 'findings.read', 'verdict'],
       effects: (view) => {
         const read = view.findings.read;
-        if (read.humanRequired !== true) return [];
-        if (view.verdict.pendingReferrals?.length && process.env.WE_REVIEW_ADVISE_ON_PENDING_REFERRALS === '0') return [];
+        // Card 5469 — THE SCOPED RE-REVIEW SHADOW rides the LAST effect of this step, so it runs on EVERY reviewed round
+        // (a run parked at `confirm` never reaches `ledgerEvents`) and only after any advisory note/labels landed. It
+        // records finding identities and journals would-block / would-card; it never touches a comment, label or verdict,
+        // and its sink never throws. Absent when the setting is `off` (the built-in), so `off` is exactly today.
+        const shadow = read.scopedRereview === 'shadow' ? [{
+          type: REVIEW_EFFECTS.SCOPED_REREVIEW_SHADOW,
+          payload: { pr: view.input.pr, repo: view.input.repo, roundFacts: scopedRereviewFacts(read, view.verdict) },
+          idempotent: true,
+        }] : [];
+        if (read.humanRequired !== true) return shadow;
+        if (view.verdict.pendingReferrals?.length && process.env.WE_REVIEW_ADVISE_ON_PENDING_REFERRALS === '0') return shadow;
         const effects = [{
           type: REVIEW_EFFECTS.ADVISORY_NOTE,
           payload: {
@@ -2817,7 +2828,7 @@ export function reviewPrOperation({
             idempotent: false,
           });
         }
-        return effects;
+        return [...effects, ...shadow];
       },
     }),
 
@@ -2996,7 +3007,7 @@ export function reviewPrOperation({
     // `posted` = a comment actually landed in this run: the advisory note, or the verdict write-up swap.
     // IDEMPOTENT: TRUE. Both events are non-clearing, so a replay can at worst add one visit to a counter.
     ledgerEvents: effectStep({
-      reads: ['input.pr', 'input.repo', 'findings.read', 'findings.reduce', 'findings.advise', 'findings.record', 'findings.referralVerdict'],
+      reads: ['input.pr', 'input.repo', 'findings.read', 'findings.reduce', 'findings.advise', 'findings.record'],
       effects: (view) => {
         const read = view.findings.read;
         const landed = (finding, type) => (finding?.effects ?? []).some((e) => e.type === type && e.status === 'applied');
@@ -3008,8 +3019,7 @@ export function reviewPrOperation({
         }
         return [{
           type: REVIEW_EFFECTS.LEDGER_EVENTS,
-          payload: { pr: view.input.pr, repo: view.input.repo, headSha: read?.netBasis?.rev ?? null, posted, referralKeys,
-            ...(read?.scopedRereview === 'shadow' ? { roundFacts: scopedRereviewFacts(read, view.findings.reduce, view.findings.referralVerdict) } : {}) },
+          payload: { pr: view.input.pr, repo: view.input.repo, headSha: read?.netBasis?.rev ?? null, posted, referralKeys },
           idempotent: true,
         }];
       },
@@ -3046,11 +3056,11 @@ export function reviewPrOperation({
  * finding (admitted ones, and the ones set aside as card suggestions), whether it held the live verdict, the latest fix
  * range, and the live verdict. Never a decision: the live verdict was settled by the steps above.
  * @param {object} read - `findings.read`.
- * @param {object} reduce - `findings.reduce`.
- * @param {object} [final] - `findings.referralVerdict` (the verdict after referrals), when present.
+ * @param {object} reduce - `findings.reduce`, or the step view's `verdict` (the reduce output after referrals).
+ * @param {object} [final] - the verdict after referrals, when it is a separate object (defaults to `reduce`).
  * @returns {object}
  */
-export function scopedRereviewFacts(read, reduce, final) {
+export function scopedRereviewFacts(read, reduce, final = reduce) {
   const basisLenses = Array.isArray(reduce?.basisLenses) ? reduce.basisLenses : MANDATORY_LENSES;
   const pick = (f) => {
     const n = normalizeOneFinding(f);
