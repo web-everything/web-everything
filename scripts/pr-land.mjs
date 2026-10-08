@@ -118,6 +118,7 @@ import { pushRefusal, callerIdentity, repoKeyForCheckout } from './conveyor/fix-
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — the heal's check:standards waits for a heavy-command slot
 import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
+import { MAIN_CI_RED_DEFAULTS } from './conveyor/main-ci-red-core.mjs'; // card xu1nixv — a red-main fix PR never opens as a draft
 import { laneRelevantChangeSinceForRecord } from './lib/verify-lane-gate.mjs'; // #4296 — keys the finish-guard's marker match to what LANE-RELEVANT files changed since the marker's recorded sha, not the exact commit (a no-op merge of BASE that conflicts only outside the lane's own touch-set must not force a fresh full re-verify).
 
 // ── flag parsing (mirrors push-if-green.mjs) ──────────────────────────────────────────────────────────
@@ -343,8 +344,19 @@ export const PARK_LABELS = Object.freeze([REVIEW_LABELS.human, REVIEW_LABELS.pen
  * @param {{mode:string, optOut:boolean}} o
  * @returns {boolean}
  */
-export function resolveDraft({ mode, optOut }) {
+export function resolveDraft({ mode, optOut, ref = '', title = '' }) {
+  // Card xu1nixv (incident 2026-10-08: #4522, the fix for red main, opened as a draft and sat refused "still a
+  // draft" while main stayed red) — a PR that fixes red main opens READY: it is the one PR that cannot wait.
+  if (isMainFixPr({ ref, title })) return false;
   return mode === 'park' && !optOut;
+}
+
+/** A red-main fix PR: from the main-fix owner branch, or titled as a fix of red main (`main-ci-red-core.mjs`'s
+ *  declared pattern — the same rule that recognises the owner). Pure. */
+export function isMainFixPr({ ref = '', title = '' } = {}) {
+  const d = MAIN_CI_RED_DEFAULTS;
+  if (String(ref).replace(/^refs\/heads\//, '').startsWith(d.mainCiRedOwnerBranchPrefix)) return true;
+  try { return new RegExp(d.mainCiRedOwnerTitlePattern, 'i').test(String(title)); } catch { return false; }
 }
 
 /**
@@ -815,7 +827,7 @@ function runCli() {
   // these same semantic params so the two never drift apart.
   // draft-first PRs — scoped to `park` only; see `DRAFT_OPT_OUT`'s own comment for why `land`/`label-on-green`
   // are excluded (their poll loop has no `'DRAFT'` branch and would spin to timeout).
-  const DRAFT = resolveDraft({ mode: PLAN.mode, optOut: DRAFT_OPT_OUT });
+  const DRAFT = resolveDraft({ mode: PLAN.mode, optOut: DRAFT_OPT_OUT, ref: REF, title: sourceTitle ?? '' });
   // Existing PRs keep their title even when their latest commit is a merge/repair. Only CREATE (or its
   // dry-run preview) reads this getter, so absent title metadata cannot block landing an existing PR.
   const createParams = { base: BASE, head: REF, body: CREATE_BODY, draft: DRAFT,

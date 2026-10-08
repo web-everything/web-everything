@@ -19,7 +19,7 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 export function mainRedPriorityPath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'main-red-priority.json'); }
 
 /** The live priority record, or null (absent, unreadable, malformed or expired). */
-export function readMainRedPriority({ path = mainRedPriorityPath(), now = Date.now() } = {}) {
+export function readMainRedPriority({ env = process.env, path = mainRedPriorityPath(env), now = Date.now() } = {}) {
   try {
     const r = JSON.parse(readFileSync(path, 'utf8'));
     return r && Number.isInteger(r.pr) && Number.isFinite(r.expiresAt) && now < r.expiresAt ? r : null;

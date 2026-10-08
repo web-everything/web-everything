@@ -331,3 +331,20 @@ describe('red streaks', () => {
     expect(dispatched).toEqual(['main-fix-bbb000000', 'main-fix-ddd000000']);
   });
 });
+
+describe('several red causes on one red commit (2026-10-08: soak + flaky review-pr-io)', () => {
+  it('one owner for the whole red window, briefed on every failing job', async () => {
+    const dispatched = [];
+    const t = T('2026-10-08T23:40:00Z');
+    const two = { jobs: ['soak-shard (2)', 'daemon-soak', 'test-shard (2)'], tests: ['build-dispatch-orphan-adopt.soak.test.mjs > …', 'review-pr-io.test.mjs > 3 runs on one head yield 3 rows'] };
+    for (const at of [t, t + 5 * MIN]) {
+      await probeAndOwnMainCi({ dir, now: at, weRoot: '/we', publishPriority: () => {}, readRuns: () => ({ runs: runsAsOf(FIXTURE, T('2026-10-08T22:45:00Z')), failing: two }),
+        readPrs: () => [], listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }),
+        dispatch: async (r) => { dispatched.push(r); return { handle: 'h' }; } });
+    }
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0].prompt).toContain('test-shard (2)');
+    expect(dispatched[0].prompt).toContain('review-pr-io.test.mjs');
+    expect(dispatched[0].prompt).toContain('fix every failing job');
+  });
+});
