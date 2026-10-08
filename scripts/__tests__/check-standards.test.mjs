@@ -642,9 +642,9 @@ Run \`npx vitest run\` with \`${test}\` (strip the locus prefix).
       copyFileSync(join(ROOT, 'scripts/check-standards.mjs'), join(repo, 'scripts/check-standards.mjs'));
       const runGate = (args) => {
         const result = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', ...args], {
-          cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 180_000,
+          cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 360_000,
         });
-        expect(result.error, result.stderr).toBeUndefined();
+        expect(result.error, `${result.error?.code} ${result.stderr}`).toBeUndefined();
         const report = JSON.parse(result.stdout);
         return { ...report, status: result.status };
       };
@@ -682,14 +682,14 @@ Run \`npx vitest run\` with \`${test}\` (strip the locus prefix).
 
       git(['update-ref', '-d', 'refs/remotes/origin/main']);
       const noBase = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', ...local], {
-        cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 180_000,
+        cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 360_000,
       });
       expect(noBase.status).toBe(1);
       expect(noBase.stderr).toContain('Cannot enforce backlog scope guards');
     } finally {
       rmSync(temp, { recursive: true, force: true });
     }
-  }, 480_000); // ~150s alone across the several full-gate spawns; a loaded machine needs headroom
+  }, 1_200_000); // ~150-320s alone across the several full-gate spawns; the verify runner's load doubled it and tripped the old 180s/480s caps
 
   it('sibling smell warning through check:standards, quiet once the note is added', () => {
     const temp = mkdtempSync(join(tmpdir(), 'we-sibling-smell-'));
@@ -716,7 +716,7 @@ ${note}
       execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo });
       const warnings = () => {
         const r = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', '--local', `--files=${card}`], {
-          cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 180_000,
+          cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 360_000,
         });
         expect(r.error, r.stderr).toBeUndefined();
         expect(r.stdout, `gate exited ${r.status} with no JSON: ${r.stderr}`).not.toBe('');
