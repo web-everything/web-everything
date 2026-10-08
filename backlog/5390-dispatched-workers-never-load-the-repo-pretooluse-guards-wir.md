@@ -1,10 +1,11 @@
 ---
 bornAs: xl5reby
 kind: task
-status: active
+status: resolved
 scaffoldedBy: "dispatch-guards"
 dateScaffolded: "2026-10-08"
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-08"
 tags: []
 ---
 
