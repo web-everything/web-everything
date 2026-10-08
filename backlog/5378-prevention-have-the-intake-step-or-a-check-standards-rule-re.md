@@ -1,9 +1,10 @@
 ---
+bornAs: xnfu2u1
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xx69xw6-add-mobile-friendly-navigation-menu-to-wip-and-related-pages.md"]
+scope: ["we:backlog/5377-add-mobile-friendly-navigation-menu-to-wip-and-related-pages.md"]
 dateOpened: "2026-10-08"
 tags: []
 ---
@@ -12,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xx69xw6-add-mobile-friendly-navigation-menu-to-wip-and-related-pages.md:4` — Have the intake step, or a check:standards rule, require each page route named in a card body to map to a path in scope. File this as a backlog item.
+1. `we:backlog/5377-add-mobile-friendly-navigation-menu-to-wip-and-related-pages.md:4` — Have the intake step, or a check:standards rule, require each page route named in a card body to map to a path in scope. File this as a backlog item.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4435@97e55b3d01ba75fc04134016eebf6f57d2e36ef8
 
