@@ -1814,12 +1814,15 @@ export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => de
   request.reportEffort?.(argv.find(arg => arg.startsWith('--effort='))?.slice(9) ?? argv[argv.indexOf('--effort') + 1]);
   const stdout = String(spawnAgent(argv, { cwd: request.cwd }) ?? '');
   const agentId = parseBackgroundedId(stdout) || request.sessionId;
+  // Best-effort: the session already started, so nothing here may throw into the dispatch result.
   if (advisor.kind && advisor.reason !== 'kind-not-in-trial') {
-    console.error(advisorLogLine({ decision: advisor, sessionSlug: request.sessionSlug, runId: request.sessionId, agentId }));
-    (request.recordAdvisor ?? recordAdvisorRun)(advisorLedgerRow({
-      decision: advisor, runId: request.sessionId, agentId, sessionSlug: request.sessionSlug,
-      repo: request.repo ?? 'we', pr: request.pr ?? null, item: request.num ?? null, at: new Date().toISOString(),
-    }));
+    try {
+      console.error(advisorLogLine({ decision: advisor, sessionSlug: request.sessionSlug, runId: request.sessionId, agentId }));
+      (request.recordAdvisor ?? recordAdvisorRun)(advisorLedgerRow({
+        decision: advisor, runId: request.sessionId, agentId, sessionSlug: request.sessionSlug,
+        repo: request.repo ?? 'we', pr: request.pr ?? null, item: request.num ?? null, at: new Date().toISOString(),
+      }));
+    } catch { /* see above */ }
   }
   return agentId;
 }

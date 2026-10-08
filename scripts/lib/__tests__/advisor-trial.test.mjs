@@ -59,6 +59,11 @@ describe('advisor trial — settings fail off', () => {
     expect(r.error).toBeNull();
     expect(r.settings).toEqual({ mode: 'sample', model: 'opus', sampleRate: 0.5, kinds: ['fix'] });
   });
+  it('a __proto__ key never throws; a throwing loader means off', () => {
+    const r = load('{"advisor":{"mode":"on","__proto__":{}}}');
+    expect(r.settings.mode).toBe('off');
+    expect(advisorForLaunch({ runId: 'r', kind: 'fix', load: () => { throw new Error('io'); } })).toMatchObject({ on: false, reason: 'mode-off' });
+  });
   it('advisorForLaunch carries a settings error and stays off', () => {
     const d = advisorForLaunch({ runId: 'r', kind: 'fix', load: () => ({ ...resolveAdvisorSettings({}), settings: { ...resolveAdvisorSettings({}).settings, mode: 'off' }, error: 'boom' }) });
     expect(d).toMatchObject({ on: false, reason: 'mode-off', settingsError: 'boom' });
@@ -130,7 +135,7 @@ describe('advisor trial — report', () => {
       { createdAt: '2026-10-08T01:00:00Z', body: '🔁 review — changes requested\n\nRecorded by parked-pr-conflict-watch' },
       { createdAt: '2026-10-08T01:30:00Z', body: '🔁 review — changes requested\n**Verdict:** changes\n### Panel verdicts\n' },
     ]);
-    expect(v).toEqual([{ at: '2026-10-08T01:30:00Z', verdict: 'changes', findings: 0 }, { at: '2026-10-08T02:00:00Z', verdict: 'accepted', findings: 3 }]);
+    expect(v).toEqual([{ at: '2026-10-08T01:30:00Z', verdict: 'changes', findings: null }, { at: '2026-10-08T02:00:00Z', verdict: 'accepted', findings: 3 }]);
   });
   it('compares arms: later fix runs, next verdict and cost', () => {
     const rows = [
@@ -144,6 +149,8 @@ describe('advisor trial — report', () => {
       reviews: { 'we#1': [{ at: '2026-10-08T01:00:00Z', verdict: 'accepted', findings: 1 }], 'we#2': [{ at: '2026-10-08T01:00:00Z', verdict: 'changes', findings: 4 }] },
     });
     expect(s.on).toMatchObject({ runs: 1, prs: 1, fixRoundsPerPr: 1, laterFixRunsPerRun: 0, acceptedNextReviewPct: 100, findingsAfterFix: 1, totalCostUsd: 1.5, advisorCallsPerRun: 2 });
+    const partial = summarizeAdvisorTrial({ rows: rows.slice(0, 1), transcripts: { a: { found: true, workerCostUsd: null, advisorCostUsd: 0.5, workerTokens: 9 } } });
+    expect(partial.on).toMatchObject({ totalCostUsd: null, withTranscript: 1 });
     expect(s.off).toMatchObject({ runs: 2, prs: 1, fixRoundsPerPr: 2, laterFixRunsPerRun: 0.5, acceptedNextReviewPct: 0, findingsAfterFix: 4, totalCostUsd: null });
   });
 });

@@ -1197,11 +1197,15 @@ export function dispatchFix(planned, {
     // `claude agents`/`logs`/`stop` take. `sessionId` stays on the result for callers that already read it.
     const stdout = String(spawnAgent(argv, { cwd: sessionCwd }) ?? '');
     const agentId = parseBackgroundedId(stdout);
-    console.error(advisorLogLine({ decision: advisor, sessionSlug, runId: sessionId, agentId }));
-    recordAdvisor(advisorLedgerRow({
-      decision: advisor, runId: sessionId, agentId, sessionSlug, repo, pr: planned.pr, item: planned.itemNum ?? null,
-      at: new Date().toISOString(),
-    }));
+    // Best-effort: the session is live, so a log/ledger fault must never reach the catch below (which would
+    // release the live worker's claim and allow a duplicate dispatch).
+    try {
+      console.error(advisorLogLine({ decision: advisor, sessionSlug, runId: sessionId, agentId }));
+      recordAdvisor(advisorLedgerRow({
+        decision: advisor, runId: sessionId, agentId, sessionSlug, repo, pr: planned.pr, item: planned.itemNum ?? null,
+        at: new Date().toISOString(),
+      }));
+    } catch { /* see above */ }
     // #x0jphk5 — the claim is DELIBERATELY NOT released here on success: see this function's own docblock for
     // why it must outlive this call (the 26+s listing-lag window a fresh spawn is exposed to).
     return {

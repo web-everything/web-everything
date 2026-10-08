@@ -52,7 +52,7 @@ export function resolveAdvisorSettings(raw = {}) {
   const settings = { ...BUILT_IN_ADVISOR_SETTINGS, kinds: [...BUILT_IN_ADVISOR_SETTINGS.kinds] };
   const ignored = [];
   for (const [k, v] of Object.entries(block)) {
-    if (rules[k] && rules[k](v)) settings[k] = k === 'kinds' ? v.map((x) => x.trim()) : v;
+    if (Object.hasOwn(rules, k) && rules[k](v)) settings[k] = k === 'kinds' ? v.map((x) => x.trim()) : v;
     else ignored.push(k);
   }
   return { settings, ignored };
@@ -118,8 +118,13 @@ export function withAdvisorBrief(prompt, decision) {
 
 /** Load the settings and decide for one launch. Never throws (a settings fault means off). */
 export function advisorForLaunch({ runId, kind, load = loadAdvisorSettings } = {}) {
-  const { settings, error } = load();
-  return { ...decideAdvisor({ runId, kind, settings }), ...(error ? { settingsError: error } : {}) };
+  try {
+    const { settings, error } = load();
+    return { ...decideAdvisor({ runId, kind, settings }), ...(error ? { settingsError: error } : {}) };
+  } catch (e) {
+    const settings = { ...BUILT_IN_ADVISOR_SETTINGS, kinds: [...BUILT_IN_ADVISOR_SETTINGS.kinds], mode: 'off' };
+    return { ...decideAdvisor({ runId, kind, settings }), settingsError: `advisor decision failed (${e?.message || e}) — advisor off` };
+  }
 }
 
 /** One-line log text for a launch decision (the daemon log's evidence line). PURE. */

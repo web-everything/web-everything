@@ -96,6 +96,7 @@ export function transcriptAdvisorFacts(lines) {
     found: turns.length > 0,
     workerTokens: sums.in + sums.out + sums.cacheRead + sums.cacheWrite5m + sums.cacheWrite1h,
     workerCostUsd: worker.costUsd,
+    workerCostPartial: worker.costUsdPartial,
     advisorCalls: seenCall.size,
     advisorModel,
     advisorTokens: advisorIn + advisorOut,
@@ -116,7 +117,8 @@ export function parseReviewVerdicts(comments) {
     const m = /^(✅|🔁) review — (accepted|changes requested)/u.exec(body);
     if (!m || !/### Panel verdicts|\*\*Verdict:\*\*/.test(body)) continue;
     const f = /### Findings \((\d+)\)/.exec(body);
-    out.push({ at: c.createdAt, verdict: m[2] === 'accepted' ? 'accepted' : 'changes', findings: f ? Number(f[1]) : 0 });
+    // No `### Findings (N)` header: the count is unknown (null), never assumed to be zero.
+    out.push({ at: c.createdAt, verdict: m[2] === 'accepted' ? 'accepted' : 'changes', findings: f ? Number(f[1]) : null });
   }
   return out.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
 }
@@ -136,7 +138,9 @@ export function summarizeAdvisorTrial({ rows, transcripts = {}, reviews = {} }) 
     const t = transcripts[r.runId] ?? null;
     const next = (reviews[key] ?? []).find((v) => Date.parse(v.at) > Date.parse(r.at)) ?? null;
     const later = fixRows.filter((o) => prKey(o) === key && Date.parse(o.at) > Date.parse(r.at)).length;
-    const total = t?.found ? (t.workerCostUsd ?? 0) + (t.advisorCostUsd ?? 0) : null;
+    // A run whose worker or advisor usage could not be fully priced has no total (never a misleading low sum).
+    const total = t?.found && t.workerCostUsd !== null && !t.workerCostPartial && !t.advisorCostPartial
+      ? t.workerCostUsd + (t.advisorCostUsd ?? 0) : null;
     return {
       runId: r.runId, at: r.at, pr: key, advisor: r.advisor, laterFixRuns: later,
       nextVerdict: next?.verdict ?? null, findingsAfter: next ? next.findings : null,
@@ -162,7 +166,7 @@ export function summarizeAdvisorTrial({ rows, transcripts = {}, reviews = {} }) 
       reviewedAfter: reviewed.length,
       acceptedNextReviewPct: reviewed.length ? (100 * reviewed.filter((r) => r.nextVerdict === 'accepted').length) / reviewed.length : null,
       findingsAfterFix: mean(reviewed.map((r) => r.findingsAfter)),
-      withTranscript: rs.filter((r) => r.totalCostUsd !== null).length,
+      withTranscript: rs.filter((r) => r.workerTokens !== null).length,
       workerCostUsd: mean(rs.map((r) => r.workerCostUsd)),
       advisorCostUsd: mean(rs.map((r) => r.advisorCostUsd)),
       totalCostUsd: mean(rs.map((r) => r.totalCostUsd)),
