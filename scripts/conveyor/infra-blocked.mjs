@@ -72,6 +72,11 @@ export const DEFAULT_REFUSAL_INTERVAL_MS = 5 * 60_000;
 /** Refusal cap: after this many consecutive refusals (~1h at the interval above), SURFACE to the operator. Its
  *  own budget, separate from {@link DEFAULT_MAX_ATTEMPTS} — see {@link markRefusedAttempt}. */
 export const DEFAULT_MAX_REFUSALS = 12;
+/** Auto re-arm knob: how many times the product may itself lift an entry off the attempt cap once the outage that
+ *  burned it has passed (0 disables). Override per pass with `--max-auto-rearms=` or env INFRA_MAX_AUTO_REARMS. */
+export const DEFAULT_MAX_AUTO_REARMS = 2;
+/** Cool-off before an entry labelled a live "GitHub outage" (status not yet seen operational) is re-armed anyway. */
+export const DEFAULT_REARM_COOLOFF_MS = 60 * 60_000;
 
 // ── PURE CORE (no fs / clock / gh / network — every input is injected) ────────────────────────────────────────
 
@@ -175,6 +180,15 @@ export function backoffMs(attempt, { baseMs = DEFAULT_BASE_MS, factor = DEFAULT_
   return Math.min(capMs, Math.max(0, raw));
 }
 
+/** `{ autoRearms }` to spread onto a parsed entry — absent/null/0 = unspent; a corrupt counter fails CLOSED as spent. */
+function parseAutoRearms(raw) {
+  if (raw == null) return {};
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return { autoRearms: Number.MAX_SAFE_INTEGER };
+  const spent = Math.floor(n);
+  return spent > 0 ? { autoRearms: spent } : {};
+}
+
 /**
  * Tolerant parse of the `.conveyor/infra-blocked.json` text → a normalized entry array. NEVER throws: empty /
  * whitespace / bad JSON / a `{ blocked:[...] }` wrapper all degrade to `[]` (a corrupt sidecar must never wedge
@@ -208,6 +222,10 @@ export function parseInfraStore(text) {
       ...(typeof e.builderContext === 'string' ? { builderContext: e.builderContext } : {}),
       attempt: Number.isFinite(Number(e.attempt)) ? Math.max(1, Math.floor(Number(e.attempt))) : 1,
       refusals: Number.isFinite(Number(e.refusals)) ? Math.max(0, Math.floor(Number(e.refusals))) : 0,
+      // The auto re-arm budget spent so far (see `autoRearmDecision`). MUST survive a read: every retry pass and every
+      // locked mutation re-reads through here, so a dropped counter is a budget that is forever unspent (#4396 review).
+      // Absent / null / 0 = unspent. A corrupt counter (non-finite, negative, non-numeric) FAILS CLOSED as spent.
+      ...parseAutoRearms(e.autoRearms),
       firstFailedAt: e.firstFailedAt != null ? String(e.firstFailedAt) : null,
       lastAttemptAt: e.lastAttemptAt != null ? String(e.lastAttemptAt) : null,
       nextRetryAt: e.nextRetryAt != null ? String(e.nextRetryAt) : null,
@@ -342,12 +360,65 @@ export function removeInfraBlock(store, num) {
  * reference) if `num` is absent, matching {@link removeInfraBlock}'s own convention. `now` injected.
  * @returns {Array<object>}
  */
-export function rearmInfraBlock(store, num, now = Date.now()) {
+export function rearmInfraBlock(store, num, now = Date.now(), { auto = false } = {}) {
   const key = normNum(num);
   const s = Array.isArray(store) ? store : [];
   if (key === '' || !infraHas(s, key)) return s;
   const nowMs = toMs(now) || Number(now) || Date.now();
-  return s.map((e) => (normNum(e?.num) === key ? { ...e, attempt: 1, refusals: 0, lastAttemptAt: iso(nowMs), nextRetryAt: iso(nowMs) } : e));
+  return s.map((e) => (normNum(e?.num) === key ? { ...e, attempt: 1, refusals: 0, lastAttemptAt: iso(nowMs), nextRetryAt: iso(nowMs),
+    ...(auto ? { autoRearms: Math.max(0, Math.floor(Number(e.autoRearms) || 0)) + 1 } : {}) } : e));
+}
+
+/**
+ * Should the product itself lift this entry off the ATTEMPT cap? Only an entry that is capped (`attempt-cap`,
+ * never the refusal cap — a guard answering is not an outage) whose recorded cause is a GitHub outage, and only
+ * while its auto re-arm budget (`maxAutoRearms`, a knob) is unspent. Eligible when GitHub status has been seen
+ * operational again (the cause was refined to "GitHub outage (transient)") or, failing that, once `cooloffMs` has
+ * passed since the last attempt. Pure.
+ * @returns {{rearm:boolean, why?:string}}
+ */
+export function autoRearmDecision(entry, { now = Date.now(), maxAttempts = DEFAULT_MAX_ATTEMPTS, maxAutoRearms = DEFAULT_MAX_AUTO_REARMS, cooloffMs = DEFAULT_REARM_COOLOFF_MS } = {}) {
+  const attempt = Math.max(1, Math.floor(Number(entry?.attempt) || 1));
+  if (attempt < maxAttempts) return { rearm: false };
+  if (Math.floor(Number(entry?.refusals) || 0) > 0) return { rearm: false };
+  if (Math.floor(Number(entry?.autoRearms) || 0) >= maxAutoRearms) return { rearm: false };
+  const cause = String(entry?.cause ?? '');
+  if (!/^GitHub outage/.test(cause)) return { rearm: false };
+  if (/\(transient\)/.test(cause)) return { rearm: true, why: 'github-operational' };
+  const nowMs = toMs(now) || Number(now) || Date.now();
+  const last = toMs(entry?.lastAttemptAt);
+  if (last && nowMs - last >= cooloffMs) return { rearm: true, why: 'cool-off' };
+  return { rearm: false };
+}
+
+/**
+ * Decide AND apply an auto re-arm for `num` in one critical section: re-read the LIVE store under the lock, re-run
+ * {@link autoRearmDecision} against the live entry (with the already-correlated `cause`), and re-arm only if it still
+ * qualifies. The retry pass decides on an unlocked snapshot taken before slow work (a GitHub status probe, other
+ * entries' resumes), so by the time it mutates, a concurrent pass may have spent the budget, a guard may have
+ * refused the entry, or the entry may be gone — none of which a stale snapshot can see (#4396 review).
+ * Returns `{ rearm:true, why }` only when the live entry was actually reset. Otherwise `{ rearm:false, reason, live? }`
+ * with the store left untouched (never resurrects a removed entry): `gone` (removed concurrently), `ineligible`
+ * (`live` is the entry as found — already re-armed, refused, or budget spent), or `lock-unavailable` (the lock could
+ * not be taken: this write FAILS CLOSED rather than degrading to an unserialized last-write-wins that could lose
+ * the spent-budget count).
+ * @returns {{rearm:boolean, why?:string, reason?:'gone'|'ineligible'|'lock-unavailable', live?:object}}
+ */
+export function autoRearmUnderLock(num, cause, { now = Date.now(), maxAttempts = DEFAULT_MAX_ATTEMPTS, maxAutoRearms = DEFAULT_MAX_AUTO_REARMS, cooloffMs = DEFAULT_REARM_COOLOFF_MS, path = resolveInfraStorePath() } = {}) {
+  const key = normNum(num);
+  try {
+    return withInfraLock(path, () => {
+      const s = readInfraStore(path);
+      const live = s.find((e) => normNum(e?.num) === key);
+      if (!live) return { rearm: false, reason: 'gone' };
+      const d = autoRearmDecision({ ...live, cause: cause != null ? cause : live.cause }, { now, maxAttempts, maxAutoRearms, cooloffMs });
+      if (!d.rearm) return { rearm: false, reason: 'ineligible', live };
+      writeInfraStore(rearmInfraBlock(s, live.num, now, { auto: true }), path);
+      return d;
+    }, { requireLock: true });
+  } catch {
+    return { rearm: false, reason: 'lock-unavailable' };
+  }
 }
 
 /** Serialize the store back to `.conveyor/infra-blocked.json` text (a bare JSON array, newline-terminated). */
@@ -713,6 +784,8 @@ async function main(argv) {
   const asJson = !!flags.json;
   const maxAttempts = Number.isFinite(Number(flags['max-attempts'])) ? Number(flags['max-attempts']) : DEFAULT_MAX_ATTEMPTS;
   const nowMs = Date.now();
+  const maxAutoRearms = Number.isFinite(Number(flags['max-auto-rearms'])) ? Number(flags['max-auto-rearms'])
+    : Number.isFinite(Number(process.env.INFRA_MAX_AUTO_REARMS)) && process.env.INFRA_MAX_AUTO_REARMS !== '' ? Number(process.env.INFRA_MAX_AUTO_REARMS) : DEFAULT_MAX_AUTO_REARMS;
 
   if (sub === 'record') {
     const rec = recordInfraBlockIO(
@@ -724,10 +797,11 @@ async function main(argv) {
   }
 
   if (sub === 'resolve' || sub === 'clear' || sub === 'remove') {
-    const store = readInfraStore(path);
-    const next = removeInfraBlock(store, flags.num);
-    if (next !== store) writeInfraStore(next, path);
-    process.stdout.write(JSON.stringify({ removed: next.length !== store.length, num: String(flags.num ?? '') }) + '\n');
+    // Under the store lock like every other writer: an unlocked read-modify-write here could overwrite a concurrent
+    // locked re-arm with a stale copy and silently revert its spent-budget count.
+    let removed = false;
+    mutateInfraStore((s) => { const next = removeInfraBlock(s, flags.num); removed = next.length !== s.length; return next; }, { path });
+    process.stdout.write(JSON.stringify({ removed, num: String(flags.num ?? '') }) + '\n');
     return 0;
   }
 
@@ -763,7 +837,7 @@ async function main(argv) {
     // UNLOCKED resume never clobbers a record a concurrent agent added meanwhile (#2659 review, finding 1).
     const snapshot = readInfraStore(path);
     if (snapshot.length === 0) {
-      process.stdout.write(JSON.stringify({ retried: [], resumed: [], surfaced: [], waiting: [], failed: [] }) + '\n');
+      process.stdout.write(JSON.stringify({ retried: [], resumed: [], surfaced: [], waiting: [], failed: [], rearmed: [] }) + '\n');
       return 0;
     }
     const status = await fetchGithubStatus();
@@ -773,14 +847,35 @@ async function main(argv) {
     // own `detail` reached only `log()` on stderr, never the JSON a caller (the build-dispatch daemon's own
     // tick, `infraRetry` in its report) actually reads — which is exactly how #4348 sat surfaced for hours with
     // its true cause (`unverified`) invisible to anything but a human tailing this process's own stderr.
-    const retried = [], resumed = [], surfaced = [], waiting = [], failed = [];
+    const retried = [], resumed = [], surfaced = [], waiting = [], failed = [], rearmed = [];
     for (const entry of snapshot) {
       const key = normNum(entry.num);
       if (only && key !== only) continue;
       // Refine the cause (real outage vs one-off) — persist it under the lock so the board/operator sees it.
       const refined = correlateCause(entry.cause, status);
       if (refined !== entry.cause) mutateInfraStore((s) => updateCause(s, entry.num, refined), { path });
-      const decision = retryDecision({ ...entry, cause: refined }, { now: Date.now(), maxAttempts });
+      let decision = retryDecision({ ...entry, cause: refined }, { now: Date.now(), maxAttempts });
+      // Capped by an outage that has since passed: re-arm through the same pure transform + lock as the `rearm`
+      // verb (never a hand-edit), bounded by the maxAutoRearms knob. It is retried on the NEXT pass.
+      if (decision.action === 'surface' && decision.reason === 'attempt-cap') {
+        // The snapshot only nominates; eligibility is re-decided against the LIVE entry under the lock, and the
+        // entry is reported as re-armed only if that locked re-arm actually happened.
+        if (autoRearmDecision({ ...entry, cause: refined }, { now: Date.now(), maxAttempts, maxAutoRearms }).rearm) {
+          const ar = autoRearmUnderLock(entry.num, refined, { now: Date.now(), maxAttempts, maxAutoRearms, path });
+          if (ar.rearm) {
+            rearmed.push({ num: entry.num, why: ar.why });
+            continue;
+          }
+          // Refused under the lock: report what is LIVE, not the stale snapshot. Gone (resumed/removed meanwhile) →
+          // nothing to surface; no longer capped (another pass re-armed it) or lock unavailable → try next pass.
+          if (ar.reason === 'gone') continue;
+          if (ar.reason === 'lock-unavailable') { waiting.push({ num: entry.num, waitSec: 0 }); continue; }
+          if (ar.live && retryDecision({ ...ar.live, cause: refined }, { now: Date.now(), maxAttempts }).action !== 'surface') {
+            waiting.push({ num: entry.num, waitSec: 0 });
+            continue;
+          }
+        }
+      }
       if (decision.action === 'surface') { surfaced.push({ num: entry.num, cause: refined, attempt: entry.attempt, reason: decision.reason }); continue; }
       if (decision.action === 'wait') { waiting.push({ num: entry.num, waitSec: Math.round((decision.waitMs || 0) / 1000) }); continue; }
       // action === 'retry' → attempt a resume-open (never a local merge). The resume itself is UNLOCKED (it can
@@ -801,7 +896,7 @@ async function main(argv) {
       failed.push({ num: entry.num, detail: r.detail });
       log(`  ⊘ #${entry.num} resume still failing (${r.detail}) — backing off`);
     }
-    writeAllSync(1, JSON.stringify({ retried, resumed, surfaced, waiting, failed }) + '\n');
+    writeAllSync(1, JSON.stringify({ retried, resumed, surfaced, waiting, failed, rearmed }) + '\n');
     return 0;
   }
 
