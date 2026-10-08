@@ -961,7 +961,9 @@ for (const item of backlog) {
   const p = join(ROOT, 'backlog', `${item.id}.md`);
   if (!existsSync(p)) continue;
   const body = readFileSync(p, 'utf8').replace(/^---\n[\s\S]*?\n---\n/, '');
-  const { errors: itemErr, warnings: itemWarn } = lintBacklogItemRendering({ item, body, pocRegistry, knownBacklogIds });
+  const { errors: itemErr, warnings: itemWarn } = lintBacklogItemRendering({
+    item, body, pocRegistry, knownBacklogIds, fileExists: (rel) => existsSync(join(ROOT, rel)),
+  });
   for (const m of itemErr) err(m);
   for (const m of itemWarn) warn(m);
 }

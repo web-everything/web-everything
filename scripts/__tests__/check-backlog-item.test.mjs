@@ -132,3 +132,31 @@ describe('check-backlog-item reads a temp backlog, never the real one (4968)', (
     expect(backlogStatus()).toBe(initialStatus);
   });
 });
+
+describe('check-backlog-item warns on a new health smell with no sibling note (#4419)', () => {
+  const smell = 'we:scripts/conveyor/health-smells/proof-only-4419.mjs';
+  const smellCard = (extra) => `---
+kind: task
+status: open
+dateOpened: "2026-10-07"
+scope: ["${smell}"]
+tags: []
+---
+
+# per-item checker health-smell fixture
+
+A digest with no code paths in it at all.
+
+${extra}
+`;
+  const writeSmell = (extra) => writeFileSync(join(tmp, `${ID}-per-item-checker-wiring-fixture.md`), smellCard(extra));
+
+  it('sibling smell warning through check:item, quiet once the note is added', () => {
+    writeSmell('Nothing to see here.');
+    const flagged = run();
+    expect(flagged.out).toMatch(/new health smell/);
+    expect(flagged.out).toContain('proof-only-4419.mjs');
+    writeSmell('Sibling smells grepped: none overlap.');
+    expect(run().out).not.toMatch(/new health smell/);
+  });
+});
