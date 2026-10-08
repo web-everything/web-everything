@@ -57,7 +57,11 @@ export function readOpenPrs({ repos = DEFAULT_REPOS, exec }) {
   for (const repo of repos) {
     try {
       const rows = JSON.parse(exec(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,url,files']));
-      prs.push(...rows.map(({ number, title, url, files }) => ({ repo, number, title, url, files: files.map((f) => f.path) })));
+      // `added` (only when non-empty): the files this PR creates. The assessor lets a brand-new backlog card through.
+      prs.push(...rows.map(({ number, title, url, files }) => {
+        const added = files.filter((f) => f.changeType === 'ADDED').map((f) => f.path);
+        return { repo, number, title, url, files: files.map((f) => f.path), ...(added.length ? { added } : {}) };
+      }));
       // The rows read still count as holders, but the snapshot is incomplete: never let it answer "free".
       const why = [];
       if (rows.length >= OPEN_PR_LIMIT) why.push(`open PR list hit the ${OPEN_PR_LIMIT}-row limit and may be truncated`);

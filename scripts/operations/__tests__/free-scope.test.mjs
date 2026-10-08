@@ -137,3 +137,34 @@ describe('free-scope core', () => {
     expect(declaration.steps[1].step.fn({ findings: { read }, input: { excludeAgent: '', excludePr: 0 } }).status).toBe('free');
   });
 });
+
+describe('new backlog cards never collide (live 2026-10-08)', () => {
+  // The live case: a worker's scope listed `we:backlog/` to file its one card, and 20 open PRs that each only
+  // ADDED their own new card made the whole folder read OCCUPIED. A brand-new card file cannot collide.
+  const cardPr = (n, extra = {}) => ({ repo: 'web-everything/web-everything', number: 4400 + n, title: `PR ${n}`, url: 'u',
+    files: [`backlog/x${n}-card.md`], added: [`backlog/x${n}-card.md`], ...extra });
+  const twenty = Array.from({ length: 20 }, (_, i) => cardPr(i));
+  it('a backlog/ folder scope is FREE when open PRs only add their own new cards', () => {
+    const verdict = assess({ files: ['we:backlog/', 'we:scripts/lib/x.mjs'], prs: twenty });
+    expect(verdict.status).toBe('free');
+  });
+  it('a PR editing an EXISTING card still holds that card and the folder', () => {
+    const edit = { ...cardPr(99), files: ['backlog/x100-existing.md'], added: [] };
+    expect(assess({ files: ['we:backlog/x100-existing.md'], prs: [...twenty, edit] }).status).toBe('occupied');
+    expect(assess({ files: ['we:backlog/'], prs: [...twenty, edit] }).status).toBe('occupied');
+  });
+  it('a new card still collides with a scope naming that exact file', () => {
+    expect(assess({ files: ['we:backlog/x3-card.md'], prs: twenty }).status).toBe('occupied');
+  });
+  it('only cards are exempt: a newly added code file still holds its folder; a PR without change types is unchanged', () => {
+    const code = { ...pr, files: ['scripts/lib/new.mjs'], added: ['scripts/lib/new.mjs'] };
+    expect(assess({ files: ['we:scripts/lib/'], prs: [code] }).status).toBe('occupied');
+    const legacy = { ...cardPr(1), added: undefined };
+    expect(assess({ files: ['we:backlog/'], prs: [legacy] }).status).toBe('occupied');
+  });
+  it('two card-filing folder claims (registered backlog/) do not block each other; an existing card still does', () => {
+    const filer = { agent: 'filer', purpose: 'card', files: ['we:backlog/'], startedAt };
+    expect(assess({ files: ['we:backlog/'], agents: [filer] }).status).toBe('free');
+    expect(assess({ files: ['we:backlog/x100-existing.md'], agents: [filer] }).status).toBe('occupied');
+  });
+});
