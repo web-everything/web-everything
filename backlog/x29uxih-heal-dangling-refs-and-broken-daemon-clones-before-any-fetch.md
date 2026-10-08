@@ -28,7 +28,7 @@ One line per class: either the handling, or `n/a: <why>`.
 1. **Untrusted text** — n/a: ref repair works on local git state only; no external text is parsed.
 2. **Truncated reads** — a failing git call reads as no broken refs, never as a prune target.
 3. **Shared state files** — the shared `--reference` store is never written; only this clone's own remote-tracking refs are deleted.
-4. **Fail closed** — only `refs/remotes/*` is ever pruned; any other dangling ref is reported and left; re-clone is refused when the tree has local edits.
+4. **Fail closed** — only `refs/remotes/*` is ever pruned; any other dangling ref is reported and left; re-clone is opt-in per caller (`allowReclone`, default off; the rebuild, self-sync and overlay paths opt in, the drain's own clone is prune-only), needs a standalone clone (`.git` a directory, no linked worktrees), and needs affirmative evidence of a clean tree: a failed `ls-files` probe, local edits, or staged edits (checked against HEAD) all refuse. With HEAD itself gone, staged-only edits cannot be seen, so that case is logged and the whole clone is kept in quarantine.
 5. **Identity scoping** — n/a: acts only on the clone path passed in.
-6. **State over time** — idempotent; a healthy clone costs two git calls per fetch.
+6. **State over time** — idempotent; a healthy clone costs two git calls per fetch (the deep checks, commit-graph verify and the HEAD/index/history probe, run when a ref is broken or once per 10 minutes, stamped in `.git`). A dangling non-remote ref is announced once per process. The repair never throws: any failure returns `ok:false` and the caller's own fetch proceeds as before.
 7. **Who wrote it** — n/a: no authored content is consumed.

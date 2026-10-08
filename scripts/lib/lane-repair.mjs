@@ -28,7 +28,7 @@ const GIT_TIMEOUT_MS = 60_000;
 
 function runGit(args, cwd, input) {
   const r = spawnSync('git', args, { cwd, encoding: 'utf8', input, timeout: GIT_TIMEOUT_MS, stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
-  return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
+  return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || ''), failed: Boolean(r.error) };
 }
 
 /** Does a git failure message look like repository corruption (as opposed to network/auth/lock trouble)? */
@@ -38,17 +38,25 @@ export function looksLikeCorruption(message) {
 
 /** Refs whose target object is missing from the (possibly alternates-backed) object store. */
 export function findBrokenRefs(dir) {
+  return probeBrokenRefs(dir).broken;
+}
+
+/** Like {@link findBrokenRefs} but says when the probe itself FAILED (`probeFailed`), so a caller that is about to
+ *  call a clone healthy can tell "no broken refs" from "could not look". */
+export function probeBrokenRefs(dir) {
   const refs = runGit(['for-each-ref', '--format=%(objectname) %(refname)'], dir);
+  if (refs.code !== 0) return { broken: [], probeFailed: true };
   const rows = refs.out.split('\n').map((l) => l.trim()).filter(Boolean).map((l) => {
     const i = l.indexOf(' ');
     return { sha: l.slice(0, i), ref: l.slice(i + 1) };
   });
-  if (!rows.length) return [];
+  if (!rows.length) return { broken: [], probeFailed: false };
   const check = runGit(['cat-file', '--batch-check'], dir, rows.map((r) => r.sha).join('\n') + '\n');
+  if (check.code !== 0 && check.out.split('\n').filter(Boolean).length < rows.length) return { broken: [], probeFailed: true };
   const lines = check.out.split('\n');
   const broken = [];
   rows.forEach((r, i) => { if (/\bmissing\b/.test(lines[i] || '')) broken.push(r); });
-  return broken;
+  return { broken, probeFailed: false };
 }
 
 /**
@@ -248,29 +256,90 @@ export function recloneInPlace(dir, quarantineRoot, { log = () => {}, reason = '
     const first = readFileSync(join(dir, '.git', 'objects', 'info', 'alternates'), 'utf8').split('\n').map((l) => l.trim()).find(Boolean);
     if (first) reference = first.replace(/\/objects\/?$/, '');
   } catch { /* no alternates */ }
-  const moved = quarantineLane(dir, quarantineRoot, { log, reason });
+  let moved;
+  try { moved = quarantineLane(dir, quarantineRoot, { log, reason }); }
+  catch (e) { return { ok: false, error: `could not quarantine the clone (${String(e && e.message || e).split('\n')[0]}); left in place` }; }
   const args = ['clone', '--quiet', ...(reference ? ['--reference', reference] : []), '--branch', branch, url, dir];
   const c = runGit(args, dirname(dir));
   if (c.code !== 0) {
-    rmSync(dir, { recursive: true, force: true }); // only the half-made new clone
-    renameSync(moved, dir); // put the old one back: nothing is lost
+    try {
+      rmSync(dir, { recursive: true, force: true }); // only the half-made new clone
+      renameSync(moved, dir); // put the old one back: nothing is lost
+    } catch (e) {
+      return { ok: false, error: `re-clone failed (${c.err.trim().split('\n')[0]}) and the old clone could not be restored (${String(e && e.message || e).split('\n')[0]}); it is at ${moved}` };
+    }
     return { ok: false, error: `re-clone failed (${c.err.trim().split('\n')[0]}); old clone restored` };
   }
   return { ok: true, quarantinedTo: moved };
 }
 
+/** Is `dir` a standalone clone (its `.git` is a directory)? A linked worktree has a `.git` FILE and shares its
+ *  common dir with other checkouts, so it is never re-cloned, nor has its shared commit-graph rewritten, from here. */
+function isStandaloneClone(dir) {
+  try { return statSync(join(dir, '.git')).isDirectory() && !existsSync(join(dir, '.git', 'worktrees')); } catch { return false; }
+}
+
 /**
- * Make a daemon clone safe to `git fetch` in. Idempotent and cheap on a healthy clone (two git calls).
- * @param {string} dir  the clone's worktree root
- * @param {{log?:Function, allowReclone?:boolean, quarantineRoot?:string, reclone?:Function}} [opts]
- * @returns {{ok:boolean, skipped?:string, pruned:string[], reported:string[], quarantinedTo?:string, problems:string[]}}
+ * Is it SAFE to move this clone aside? Fails CLOSED: only affirmative evidence of a clean tree returns `safe:true`.
+ * A failed probe (corrupt index, unreadable tree) is never read as clean. Checks unstaged/untracked edits straight
+ * from the index (no HEAD needed) AND staged edits against HEAD when HEAD resolves. When HEAD itself is gone no
+ * baseline exists to compare the index to, so staged-only edits cannot be seen; that residual is reported
+ * (`unprovenIndex`) and the quarantine keeps every byte, so nothing is lost.
+ * @returns {{safe:boolean, why?:string, unprovenIndex?:boolean}}
  */
-export function repairCloneRefs(dir, { log = () => {}, allowReclone = true, quarantineRoot = join(dirname(dir), '.quarantine'), reclone = recloneInPlace } = {}) {
-  const out = { ok: true, pruned: [], reported: [], problems: [] };
+function provenCleanTree(dir) {
+  const edits = runGit(['ls-files', '--modified', '--deleted', '--others', '--exclude-standard'], dir);
+  if (edits.code !== 0) return { safe: false, why: `could not read the working tree state (${edits.err.trim().split('\n')[0] || `exit ${edits.code}`})` };
+  if (edits.out.trim() !== '') return { safe: false, why: 'its working tree has local edits' };
+  // Only a clean "HEAD does not resolve" (git exited, did not time out or fail to spawn) means HEAD is gone.
+  const headCommit = runGit(['rev-parse', '--verify', '-q', 'HEAD^{commit}'], dir);
+  if (headCommit.failed) return { safe: false, why: 'could not probe HEAD' };
+  if (headCommit.code !== 0) return { safe: true, unprovenIndex: true };
+  if (runGit(['rev-parse', '--verify', '-q', 'HEAD^{tree}'], dir).code !== 0) return { safe: false, why: 'HEAD resolves but its tree is unreadable' };
+  const staged = runGit(['diff', '--cached', '--quiet', 'HEAD', '--'], dir);
+  if (staged.code === 0) return { safe: true };
+  return { safe: false, why: staged.code === 1 ? 'its index has staged edits' : `could not compare the index to HEAD (${staged.err.trim().split('\n')[0] || `exit ${staged.code}`})` };
+}
+
+// A healthy clone is probed with the two cheap ref calls on every fetch; the heavier checks (commit-graph verify,
+// the HEAD/index/history probe) run when a ref is broken or at most once per interval, so a drain that syncs per
+// card does not pay for `ls-files --stage` / `commit-graph verify` on a large clone each time.
+const DEEP_CHECK_INTERVAL_MS = 10 * 60_000;
+const deepStamp = (dir) => join(dir, '.git', '.clone-repair-deep-checked');
+function deepCheckDue(dir, intervalMs, now) {
+  try { return now - statSync(deepStamp(dir)).mtimeMs >= intervalMs; } catch { return true; }
+}
+// A dangling non-remote ref stays dangling until a person looks; warn about each once per process, not every sync.
+const warnedDangling = new Set();
+
+/**
+ * Make a daemon clone safe to `git fetch` in. Idempotent; a healthy clone costs two git calls per fetch (the deep
+ * checks run when a ref is broken or once per `deepIntervalMs`). Never throws. A re-clone happens ONLY when the caller
+ * passes `allowReclone:true` (default false: callers that cannot prove `dir` is a daemon-owned clone get prune-only).
+ * @param {string} dir  the clone's worktree root
+ * @param {{log?:Function, allowReclone?:boolean, quarantineRoot?:string, reclone?:Function, deepIntervalMs?:number, now?:number}} [opts]
+ * @returns {{ok:boolean, skipped?:string, pruned:string[], reported:string[], reportedNew:string[], quarantinedTo?:string, problems:string[]}}
+ */
+export function repairCloneRefs(dir, opts = {}) {
+  // A best-effort pre-fetch step must never abort the caller's sync or tick: any throw (rename EXDEV/EACCES, a
+  // throwing reclone) becomes `{ok:false}` and the caller proceeds to its own fetch exactly as it did before.
+  try {
+    return repairCloneRefsUnguarded(dir, opts);
+  } catch (e) {
+    const msg = String(e && e.message || e).split('\n')[0];
+    (opts.log || (() => {}))(`  ⚠ clone-repair ${dir ? basename(dir) : '?'}: repair threw (${msg}) — skipped`);
+    return { ok: false, pruned: [], reported: [], reportedNew: [], problems: [`repair threw: ${msg}`] };
+  }
+}
+
+function repairCloneRefsUnguarded(dir, { log = () => {}, allowReclone = false, quarantineRoot = join(dirname(dir), '.quarantine'), reclone = recloneInPlace, deepIntervalMs = DEEP_CHECK_INTERVAL_MS, now = Date.now() } = {}) {
+  const out = { ok: true, pruned: [], reported: [], reportedNew: [], problems: [] };
   if (!dir || !existsSync(join(dir, '.git'))) return { ...out, skipped: 'not-a-clone' };
   const name = basename(dir);
-  const head = runGit(['symbolic-ref', '-q', 'HEAD'], dir).out.trim();
-  for (const { ref, sha } of findBrokenRefs(dir)) {
+  const { broken, probeFailed } = probeBrokenRefs(dir);
+  if (probeFailed) { out.ok = false; log(`  ⚠ clone-repair ${name}: could not list refs (git failed) — treating the clone as unverified`); }
+  const head = broken.length ? runGit(['symbolic-ref', '-q', 'HEAD'], dir).out.trim() : '';
+  for (const { ref, sha } of broken) {
     if (ref.startsWith('refs/remotes/') && ref !== head) {
       const r = runGit(['update-ref', '-d', ref], dir);
       if (r.code === 0) out.pruned.push(ref);
@@ -280,29 +349,53 @@ export function repairCloneRefs(dir, { log = () => {}, allowReclone = true, quar
     }
   }
   if (out.pruned.length) log(`  ⚑ clone-repair ${name}: pruned ${out.pruned.length} dangling remote-tracking ref(s): ${out.pruned.slice(0, 5).join(', ')}${out.pruned.length > 5 ? ', …' : ''}`);
-  for (const r of out.reported) log(`  ⚠ clone-repair ${name}: dangling ref NOT deleted — ${r}`);
+  for (const r of out.reported) {
+    const key = `${dir}\0${r}`;
+    if (warnedDangling.has(key)) continue;
+    warnedDangling.add(key);
+    out.reportedNew.push(r);
+    log(`  ⚠ clone-repair ${name}: dangling ref NOT deleted — ${r}`);
+  }
+
+  // Nothing pruned, the ref probe worked, and the deep check is not due: done after the two ref calls above. (A
+  // dangling NON-remote ref stays put and is reported once; it must not force the deep checks on every sync.)
+  const pruneFailedEarly = out.reported.some((r) => r.includes('prune failed'));
+  if (!probeFailed && !out.pruned.length && !pruneFailedEarly && !deepCheckDue(dir, deepIntervalMs, now)) return out;
+  const standalone = isStandaloneClone(dir);
 
   // A stale commit-graph cache (naming commits that left the object store) breaks `fsck` and history walks even with
   // every ref healthy (live: the drain data clone still failed fsck after its refs were pruned). It is a derived cache:
   // move it aside and regenerate (shared helper from xsxu243; touches only this clone's objects/info/commit-graph*).
-  try {
-    const cg = healSharedCommitGraph(dir, { lockDir: join(dir, '.git', '.commit-graph-heal.lock'), log, waitMs: 5_000 });
-    if (cg.healed) out.commitGraphHealed = true;
-  } catch (e) { log(`  ⚠ clone-repair ${name}: commit-graph heal failed: ${String(e && e.message || e).split('\n')[0]}`); }
+  // Standalone clones only: for a linked worktree `--git-common-dir` is SHARED with other checkouts.
+  if (standalone) {
+    try {
+      const cg = healSharedCommitGraph(dir, { lockDir: join(dir, '.git', '.commit-graph-heal.lock'), log, waitMs: 5_000 });
+      if (cg.healed) out.commitGraphHealed = true;
+    } catch (e) { log(`  ⚠ clone-repair ${name}: commit-graph heal failed: ${String(e && e.message || e).split('\n')[0]}`); }
+  }
 
   const problems = diagnoseLane(dir).problems.filter((p) => !/ref\(s\) point at missing objects/.test(p));
-  if (!problems.length && !out.reported.some((r) => r.includes('prune failed'))) return out;
-  out.problems = problems;
-  // `git status` itself fails when HEAD's object is gone, so read local edits straight from the index (no HEAD needed).
-  const edits = runGit(['ls-files', '--modified', '--deleted', '--others', '--exclude-standard'], dir);
-  const dirty = edits.code === 0 && edits.out.trim() !== '';
-  if (!allowReclone || dirty || !problems.length) {
-    out.ok = !problems.length && !out.reported.some((r) => r.includes('prune failed'));
-    if (problems.length) log(`  ⚠ clone-repair ${name}: clone is damaged (${problems.join('; ')}) but ${dirty ? 'its working tree has local edits' : 're-clone is disabled'} — needs attention`);
+  const pruneFailed = out.reported.some((r) => r.includes('prune failed'));
+  if (!problems.length && !pruneFailed) {
+    if (probeFailed) return out; // never stamp a clone whose ref probe failed
+    try { writeFileSync(deepStamp(dir), String(now)); } catch { /* the stamp only throttles; a failed write re-runs the check */ }
     return out;
   }
+  out.problems = problems;
+  // Fail closed (card edge cases 2 + 4): a re-clone needs the caller's opt-in, a standalone clone, AND affirmative
+  // evidence of a clean tree. Anything else reports "needs attention" and leaves the clone exactly where it is.
+  const tree = problems.length && allowReclone && standalone ? provenCleanTree(dir) : null;
+  if (!problems.length || !allowReclone || !standalone || !tree.safe) {
+    out.ok = !problems.length && !pruneFailed && !probeFailed;
+    if (problems.length) {
+      const why = !allowReclone ? 're-clone is disabled for this caller' : !standalone ? 'it is not a standalone clone (linked worktree or shared store)' : tree.why;
+      log(`  ⚠ clone-repair ${name}: clone is damaged (${problems.join('; ')}) but ${why} — needs attention`);
+    }
+    return out;
+  }
+  if (tree.unprovenIndex) log(`  ⚠ clone-repair ${name}: HEAD is gone, so staged-only edits cannot be ruled out; the whole clone is kept in quarantine`);
   const r = reclone(dir, quarantineRoot, { log, reason: problems.join('; ') });
-  if (r.ok) { out.quarantinedTo = r.quarantinedTo; out.problems = []; return out; }
+  if (r.ok) { out.ok = true; out.quarantinedTo = r.quarantinedTo; out.problems = []; return out; }
   out.ok = false;
   log(`  ⚠ clone-repair ${name}: ${r.error}`);
   return out;

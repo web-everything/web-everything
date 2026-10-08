@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { repairCloneRefs } from '../lane-repair.mjs';
-import { selfSyncCheckout } from '../daemon-self-sync.mjs';
+import { selfSyncCheckout, selfSyncCheckoutPoc } from '../daemon-self-sync.mjs';
 import { mergeOverlayRef } from '../daemon-load-overlay.mjs';
 
 const g = (cwd, ...a) => execFileSync('git', a, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -75,7 +75,7 @@ describe('repairCloneRefs', () => {
   it('quarantines (never deletes) and re-clones a clone whose HEAD object is gone', () => {
     const head = g(clone, 'rev-parse', 'HEAD');
     rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true });
-    const r = repairCloneRefs(clone);
+    const r = repairCloneRefs(clone, { allowReclone: true });
     expect(r.ok).toBe(true);
     expect(r.quarantinedTo).toBeTruthy();
     expect(existsSync(r.quarantinedTo)).toBe(true);
@@ -83,14 +83,135 @@ describe('repairCloneRefs', () => {
     expect(readdirSync(join(tmp, '.quarantine')).length).toBe(1);
   });
 
-  it('refuses to re-clone a damaged clone with local edits', () => {
-    writeFileSync(join(clone, 'a.txt'), 'edited');
+  it('never re-clones unless the caller opts in (default is prune-only)', () => {
     const head = g(clone, 'rev-parse', 'HEAD');
     rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true });
     const r = repairCloneRefs(clone);
     expect(r.ok).toBe(false);
     expect(r.quarantinedTo).toBeUndefined();
+    expect(existsSync(join(clone, 'a.txt'))).toBe(true);
+    expect(existsSync(join(tmp, '.quarantine'))).toBe(false);
+  });
+
+  it('refuses to re-clone a damaged clone with local edits', () => {
+    writeFileSync(join(clone, 'a.txt'), 'edited');
+    const head = g(clone, 'rev-parse', 'HEAD');
+    rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true });
+    const r = repairCloneRefs(clone, { allowReclone: true });
+    expect(r.ok).toBe(false);
+    expect(r.quarantinedTo).toBeUndefined();
     expect(readFileSync(join(clone, 'a.txt'), 'utf8')).toBe('edited');
+  });
+
+  it('fails CLOSED on a corrupt index with local edits (a failed probe is not "clean")', () => {
+    writeFileSync(join(clone, 'a.txt'), 'edited');
+    writeFileSync(join(clone, '.git/index'), 'not an index');
+    expect(() => g(clone, 'ls-files', '--stage')).toThrow();
+    const r = repairCloneRefs(clone, { allowReclone: true });
+    expect(r.ok).toBe(false);
+    expect(r.quarantinedTo).toBeUndefined();
+    expect(readFileSync(join(clone, 'a.txt'), 'utf8')).toBe('edited');
+    expect(existsSync(join(tmp, '.quarantine'))).toBe(false);
+  });
+
+  it('refuses to re-clone when edits are STAGED only (working files match the index)', () => {
+    writeFileSync(join(clone, 'b.txt'), 'b'); g(clone, 'add', 'b.txt'); g(clone, 'commit', '-qm', 'two');
+    const parent = g(clone, 'rev-parse', 'HEAD~1');
+    writeFileSync(join(clone, 'c.txt'), 'staged'); g(clone, 'add', 'c.txt');
+    expect(g(clone, 'ls-files', '--modified', '--deleted', '--others', '--exclude-standard')).toBe('');
+    rmSync(join(clone, '.git/objects', parent.slice(0, 2), parent.slice(2)), { force: true }); // history walk now fails
+    const r = repairCloneRefs(clone, { allowReclone: true });
+    expect(r.problems.some((p) => /history walk failed/.test(p))).toBe(true);
+    expect(r.ok).toBe(false);
+    expect(r.quarantinedTo).toBeUndefined();
+    expect(existsSync(join(clone, 'c.txt'))).toBe(true);
+  });
+
+  it('never throws: a throwing reclone becomes {ok:false} and the clone stays put', () => {
+    const head = g(clone, 'rev-parse', 'HEAD');
+    rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true });
+    const r = repairCloneRefs(clone, { allowReclone: true, reclone: () => { throw new Error('EXDEV: cross-device link'); } });
+    expect(r.ok).toBe(false);
+    expect(r.problems.join(' ')).toMatch(/EXDEV/);
+    expect(existsSync(join(clone, 'a.txt'))).toBe(true);
+  });
+
+  it('restores the original clone when the replacement clone fails', () => {
+    const head = g(clone, 'rev-parse', 'HEAD');
+    g(clone, 'remote', 'set-url', 'origin', join(tmp, 'no-such-origin.git'));
+    rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true });
+    const r = repairCloneRefs(clone, { allowReclone: true });
+    expect(r.ok).toBe(false);
+    expect(r.quarantinedTo).toBeUndefined();
+    expect(existsSync(join(clone, 'a.txt'))).toBe(true);
+    expect(g(clone, 'config', '--get', 'remote.origin.url')).toMatch(/no-such-origin/);
+    expect(readdirSync(tmp).filter((n) => n === 'clone')).toEqual(['clone']);
+  });
+
+  it('refuses to re-clone (or rewrite the shared commit-graph of) a linked worktree', () => {
+    const wt = join(tmp, 'wt');
+    g(clone, 'worktree', 'add', '-q', '--detach', wt);
+    const head = g(wt, 'rev-parse', 'HEAD');
+    rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true });
+    const r = repairCloneRefs(wt, { allowReclone: true });
+    expect(r.ok).toBe(false);
+    expect(r.quarantinedTo).toBeUndefined();
+    expect(existsSync(join(wt, 'a.txt'))).toBe(true);
+  });
+});
+
+describe('repairCloneRefs cost and noise', () => {
+  const gitLog = () => join(tmp, 'git-calls.log');
+  const withGitShim = (fn) => {
+    const bin = join(tmp, 'bin'); mkdirSync(bin, { recursive: true });
+    const real = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    writeFileSync(join(bin, 'git'), `#!/bin/sh\necho "$@" >> "${gitLog()}"\nexec "${real}" "$@"\n`, { mode: 0o755 });
+    const old = process.env.PATH; process.env.PATH = `${bin}:${old}`;
+    try { return fn(); } finally { process.env.PATH = old; }
+  };
+  const calls = () => (existsSync(gitLog()) ? readFileSync(gitLog(), 'utf8').split('\n').filter(Boolean) : []);
+
+  it('a healthy clone costs two git calls once the deep check has run', () => {
+    repairCloneRefs(clone); // first call runs (and stamps) the deep check
+    withGitShim(() => repairCloneRefs(clone));
+    expect(calls()).toHaveLength(2);
+    expect(calls().some((c) => /commit-graph|ls-files|rev-list/.test(c))).toBe(false);
+  });
+
+  it('a persistent dangling LOCAL ref does not force the deep checks on every sync', () => {
+    plant('refs/heads/precious-cost');
+    repairCloneRefs(clone);
+    withGitShim(() => repairCloneRefs(clone));
+    expect(calls().length).toBeLessThanOrEqual(3); // for-each-ref, cat-file, symbolic-ref
+    expect(calls().some((c) => /commit-graph|ls-files|rev-list/.test(c))).toBe(false);
+  });
+
+  it('a failed ref probe is "unverified", not healthy: ok:false and no throttle stamp', () => {
+    const bin = join(tmp, 'bin-fail'); mkdirSync(bin, { recursive: true });
+    const real = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    writeFileSync(join(bin, 'git'), `#!/bin/sh\nif [ "$1" = for-each-ref ]; then exit 128; fi\nexec "${real}" "$@"\n`, { mode: 0o755 });
+    const old = process.env.PATH; process.env.PATH = `${bin}:${old}`;
+    let r;
+    try { r = repairCloneRefs(clone); } finally { process.env.PATH = old; }
+    expect(r.ok).toBe(false);
+    expect(existsSync(join(clone, '.git/.clone-repair-deep-checked'))).toBe(false);
+  });
+
+  it('re-runs the deep check once its interval has passed', () => {
+    repairCloneRefs(clone);
+    withGitShim(() => repairCloneRefs(clone, { now: Date.now() + 11 * 60_000 }));
+    expect(calls().some((c) => /commit-graph verify/.test(c))).toBe(true);
+  });
+
+  it('warns about a dangling local branch once per process, not on every sync', () => {
+    plant('refs/heads/precious-warn-once');
+    const lines = [];
+    const first = repairCloneRefs(clone, { log: (m) => lines.push(m) });
+    const second = repairCloneRefs(clone, { log: (m) => lines.push(m) });
+    expect(first.reportedNew).toHaveLength(1);
+    expect(second.reportedNew).toHaveLength(0);
+    expect(second.reported).toHaveLength(1); // still reported as state, just not re-announced
+    expect(lines.filter((l) => /precious-warn-once/.test(l))).toHaveLength(1);
   });
 });
 
@@ -104,5 +225,36 @@ describe('fetch paths call the repair first', () => {
     plant('refs/remotes/origin/lane/gone');
     mergeOverlayRef({ root: clone, ref: 'main' });
     expect(existsSync(join(clone, '.git/refs/remotes/origin/lane/gone'))).toBe(false);
+  });
+  it('selfSyncCheckoutPoc prunes a dangling remote-tracking ref', () => {
+    plant('refs/remotes/origin/lane/gone');
+    selfSyncCheckoutPoc({ root: clone, pocBranch: 'main' });
+    expect(existsSync(join(clone, '.git/refs/remotes/origin/lane/gone'))).toBe(false);
+  });
+});
+
+// The rebuild prepare step and the drain's own clone sync are too heavy to drive end to end here, so pin the ORDER
+// instead: in each, `repairCloneRefs` runs before the first fetch/pull. Deleting the call (or moving it after the
+// fetch) reddens this. (The drain data clone is the incident's actual clone.)
+describe('every daemon fetch site repairs first', () => {
+  const root = join(import.meta.dirname, '..', '..', '..');
+  const body = (file, startRe) => {
+    const src = readFileSync(join(root, file), 'utf8');
+    const at = src.search(startRe);
+    expect(at, `${file} ${startRe}`).toBeGreaterThanOrEqual(0);
+    return src.slice(at, at + 4000);
+  };
+  const repairsBeforeFetch = (text) => {
+    const repair = text.indexOf('repairCloneRefs(');
+    const fetch = text.search(/'(fetch|pull)'|fetchMainAndOverlays\(/);
+    return repair >= 0 && fetch >= 0 && repair < fetch;
+  };
+  it.each([
+    ['scripts/lib/daemon-rebuild/prepare.mjs', /Step 2: fetch/],
+    ['scripts/lane-drain.mjs', /function syncMain\(/],
+    ['scripts/lane-drain.mjs', /function readResolveReachable\(/],
+    ['scripts/lib/daemon-self-sync.mjs', /export function selfSyncCheckoutPoc\(/],
+  ])('%s %s', (file, re) => {
+    expect(repairsBeforeFetch(body(file, re))).toBe(true);
   });
 });
