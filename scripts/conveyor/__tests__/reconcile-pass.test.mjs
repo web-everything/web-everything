@@ -1414,6 +1414,9 @@ it('defaultReadMainRuns annotates a failure run with checkConclusions from a com
   const complete = JSON.stringify({ total_count: jobs.length, jobs });
   const out = defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? complete : list) });
   expect(out[0].checkConclusions).toEqual({ test: 'success', smoke: 'success', 'soak-shard (2)': 'failure', 'daemon-soak': 'failure' });
+  const dup = [job('test', 'failure'), job('test', 'success')];
+  const dupPage = JSON.stringify({ total_count: dup.length, jobs: dup });
+  expect(defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? dupPage : list) })[0].checkConclusions).toEqual({ test: 'failure' });
   const truncated = JSON.stringify({ total_count: 150, jobs });
   expect(defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? truncated : list) })[0].checkConclusions).toBeUndefined();
 });

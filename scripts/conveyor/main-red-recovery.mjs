@@ -158,6 +158,14 @@ export function isMainCurrentlyRed(windows) {
  * it and is skipped. `null` (never a guess) when: no check name; the newest decisive run has the check red; a red
  * run has NO map (jobs unread) before any green-for-check run; or no red-for-check run exists in the history at all
  * (nothing shows main's own copy of the check was ever red, so nothing proves a recovery).
+ * `mainRuns` must ALREADY be narrowed to one workflow (same contract as {@link computeMainRedWindows}; the IO
+ * shell's `defaultReadMainRuns` does it).
+ *
+ * KNOWN TRADEOFF: the PR's failure is still attributed to main by the WORKFLOW-level red window
+ * ({@link classifyCiFailureAttribution}), not by a red window of main's own copy of this check. So a PR whose own
+ * code broke the check inside a long red-on-another-check window gets ONE refresh (it then fails after the green
+ * streak began, and this path never admits it again). One bounded extra CI run beats the old outcome: waiting
+ * forever. The merge gate is untouched.
  * @param {{checkName?:(string|null), mainRuns?:Array<object>}} [o]
  * @returns {string|null}
  */

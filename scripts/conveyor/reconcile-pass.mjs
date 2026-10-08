@@ -386,7 +386,13 @@ export function defaultReadMainRuns({
       // xd3dkzx — each job's own verdict (job name = check name), so recovery can be judged per failing check
       // (`main-red-recovery.mjs#isMainRecoveredForCheck`). Only from a COMPLETE inventory: absence then means
       // "did not run"; a truncated/unread page leaves no map, which that predicate reads as "not recovered".
-      const checkConclusions = Object.fromEntries(jobs.filter((j) => j?.name).map((j) => [j.name, String(j.conclusion ?? '')]));
+      // Duplicate job names (matrix / reusable workflows): any non-success wins, so a later green never hides a red.
+      const checkConclusions = {};
+      for (const j of jobs) {
+        if (!j?.name) continue;
+        const c = String(j.conclusion ?? '');
+        if (!(j.name in checkConclusions) || checkConclusions[j.name] === 'success') checkConclusions[j.name] = c;
+      }
       return isInfraCancelledOnlyRun(jobs) ? { ...r, infraCancelledOnly: true, checkConclusions } : { ...r, checkConclusions };
     } catch { return r; }
   });
