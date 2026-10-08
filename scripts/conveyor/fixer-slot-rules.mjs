@@ -152,8 +152,9 @@ export function awaitPassRunner({ loopSeconds, loopHeartbeatAtMs, nowMs }) {
  * R5 release-on-completion. Facts: the claim (when taken, which session if known), the session's completion record, and
  * whether the session still has a recorded verify wait, and when the harness last woke it.
  * Released only when ALL hold: the setting is on; the record says `done`; it was written at or after the claim was
- * taken (an older round's record never releases a new claim) AND at or after the session's last wake-up (a session
- * woken to repair a red is working again, whatever it reported before); the session ids agree when both are known;
+ * taken (an older round's record never releases a new claim) AND strictly after the session's last wake-up (a session
+ * woken to repair a red is working again, whatever it reported before; a record in the very same millisecond as the stamp
+ * cannot be ordered against it, so it is held); the session ids agree when both are known;
  * and no verify wait is still recorded (the session may yet be woken).
  * @param {{enabled:boolean, claim:{claimedAtMs:number, sessionId:string|null},
  *   completion:null|{status:string, updatedAtMs:number, sessionId:string|null}, awaitingVerify:boolean,
@@ -166,7 +167,7 @@ export function releaseOnCompletion({ enabled, claim, completion, awaitingVerify
   if (completion.status !== 'done') return { release: false, reason: `completion-${completion.status ?? 'unknown'}` };
   if (!Number.isFinite(claim?.claimedAtMs) || !Number.isFinite(completion.updatedAtMs)) return { release: false, reason: 'unknown-times' };
   if (completion.updatedAtMs < claim.claimedAtMs) return { release: false, reason: 'record-older-than-claim' };
-  if (Number.isFinite(lastWokenAtMs) && completion.updatedAtMs < lastWokenAtMs) return { release: false, reason: 'record-older-than-last-wake' };
+  if (Number.isFinite(lastWokenAtMs) && completion.updatedAtMs <= lastWokenAtMs) return { release: false, reason: 'record-older-than-last-wake' };
   if (claim.sessionId && completion.sessionId && claim.sessionId !== completion.sessionId) return { release: false, reason: 'other-session' };
   if (awaitingVerify) return { release: false, reason: 'still-awaiting-verify' };
   return { release: true, reason: 'completion-done' };

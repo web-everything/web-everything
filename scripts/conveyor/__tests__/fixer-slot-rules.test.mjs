@@ -110,6 +110,7 @@ describe('R5 release-on-completion — the audit\'s finished-but-holding session
     ['claim time unknown', { claim: { claimedAtMs: NaN, sessionId: null } }, 'unknown-times'],
     ['record time unknown', { completion: { ...done('2026-10-08T19:43:00Z'), updatedAtMs: NaN } }, 'unknown-times'],
     ['woken (e.g. to repair a red) after it reported done', { lastWokenAtMs: Date.parse('2026-10-08T19:50:00Z') }, 'record-older-than-last-wake'],
+    ['stamped in the very same millisecond as the record (cannot be ordered, so held)', { lastWokenAtMs: Date.parse('2026-10-08T19:43:00Z') }, 'record-older-than-last-wake'],
   ])('%s → keep (%s)', (_n, over, reason) => {
     const facts = { enabled: true, claim, completion: done('2026-10-08T19:43:00Z'), awaitingVerify: false, ...over };
     expect(releaseOnCompletion(facts)).toEqual({ release: false, reason });

@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import {
   waitRecordForClaim, slotCountedFixClaims, runSlotAwareAwaitPass, runCompletionReleaseSweep, runTickAwaitVerify,
   withCycleLock, cycleLockRoot, CYCLE_LOCK_RESOURCE, nextWokenJournal, defaultSlotCountedFixClaims, cycleFailed,
-  superviseAwaitVerifyLoop, runAwaitVerifyCycleDefault, sessionSpeaksFor, runLoopCycle, LOOP_APP_AUTH_OPTS, readJournal,
+  superviseAwaitVerifyLoop, runAwaitVerifyCycleDefault, sessionSpeaksFor, runLoopCycle, runLoopIteration, LOOP_APP_AUTH_OPTS, readJournal,
 } from '../await-verify-loop.mjs';
 import { reserve, readLockEntry } from '../../readiness/file-locks.mjs';
 import { acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, listFixDispatchClaims } from '../fix-dispatch-claim.mjs';
@@ -286,11 +286,33 @@ describe('superviseAwaitVerifyLoop (the daemon\'s child lifecycle)', () => {
     children[2].h.exit(null); // killed by us: no restart
     expect(timers).toHaveLength(1);
   });
-  it('a spawn that throws is logged and leaves no child', () => {
+  it('a spawn that throws is logged, leaves no child, and is retried no sooner than once a minute until it works or the daemon stops it', () => {
     const log = { error: vi.fn() };
-    const sup = superviseAwaitVerifyLoop({ spawnLoop: () => { throw new Error('EMFILE'); }, log });
+    const timers = [];
+    let n = 0;
+    const child = fakeChild();
+    const sup = superviseAwaitVerifyLoop({
+      spawnLoop: () => { n += 1; if (n < 3) throw new Error('EMFILE'); return child; },
+      log, setTimer: (fn, ms) => { timers.push({ fn, ms }); return { unref() {} }; }, now: () => 0, minGapMs: 60_000,
+    });
     expect(sup.start()).toBeNull();
     expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/spawn failed: EMFILE/));
+    expect(timers.map((t) => t.ms)).toEqual([60_000]);
+    timers[0].fn(); // second attempt throws again → another retry is armed
+    expect(timers.map((t) => t.ms)).toEqual([60_000, 60_000]);
+    timers[1].fn(); // third attempt works
+    expect(sup.current()).toBe(child);
+    expect(timers).toHaveLength(2);
+    sup.stop();
+  });
+  it('a retry that fires after stop() starts nothing', () => {
+    const timers = [];
+    const spawnLoop = vi.fn(() => { throw new Error('EAGAIN'); });
+    const sup = superviseAwaitVerifyLoop({ spawnLoop, log: { error: vi.fn() }, setTimer: (fn) => { timers.push(fn); return { unref() {} }; } });
+    sup.start();
+    sup.stop();
+    timers[0]();
+    expect(spawnLoop).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -309,7 +331,17 @@ describe('runAwaitVerifyCycleDefault against real stores (R5 fail-closed on the 
     const passModule = { defaultAwaitVerifyIo: async () => ({ listRecords: () => [], readMarker: () => null }), runAwaitVerifyPass: async () => ({ rows: [] }) };
     return { root, env, restore, passModule };
   };
-  it('a corrupt wake journal skips the release; a readable one releases the done session\'s claim', async () => {
+  it('an unreadable wake journal skips the release sweep outright (the journalOk gate): a fresh done with no wait record still holds the claim', async () => {
+    const { root, env, restore, passModule } = await setup();
+    try {
+      mkdirSync(join(root, 'await-verify-woken.json')); // a directory where the file should be: the read itself fails
+      const out = await runAwaitVerifyCycleDefault({ allowResume: true, env, settings: ON, passModule });
+      expect(out.released).toEqual([]);
+      expect(readFixDispatchClaim({ repo: 'we', pr: 21, kind: 'fix' })).not.toBeNull();
+      expect(readJournal(join(root, 'await-verify-woken.json')).state).toBe('unreadable');
+    } finally { restore(); }
+  });
+  it('a corrupt wake journal is replaced with a floor (that cycle releases nothing); a readable one releases the done session\'s claim', async () => {
     const { root, env, restore, passModule } = await setup();
     try {
       writeFileSync(join(root, 'await-verify-woken.json'), '{not json');
@@ -325,16 +357,17 @@ describe('runAwaitVerifyCycleDefault against real stores (R5 fail-closed on the 
   it('the loop path (no allowResume given): an auth gate that throws defers wake-ups', async () => {
     const { env, restore } = await setup();
     try {
-      const { writeStoredAwaitVerify } = await import('../await-verify.mjs');
-      writeStoredAwaitVerify(rec(21));
+      const { writeStoredAwaitVerify, listStoredAwaitVerify } = await import('../await-verify.mjs');
+      // a wake IS owed (a decided verdict is on the record), so phase B would run if the gate let it
+      writeStoredAwaitVerify(rec(21, { requestedAt: new Date(Date.now() - 60_000).toISOString(), pendingResume: { kind: 'red', detail: 'x' } }));
       const runAwaitVerifyPass = vi.fn(async () => ({ rows: [] }));
-      const passModule = { defaultAwaitVerifyIo: async () => ({ listRecords: () => [], readMarker: () => null }), runAwaitVerifyPass };
+      const passModule = { defaultAwaitVerifyIo: async () => ({ listRecords: () => listStoredAwaitVerify(), readMarker: () => null }), runAwaitVerifyPass };
       await runAwaitVerifyCycleDefault({ env, settings: ON, passModule, authGate: () => { throw new Error('probe failed'); } });
-      expect(runAwaitVerifyPass).toHaveBeenCalledWith(expect.objectContaining({ allowResume: false }));
+      expect(runAwaitVerifyPass.mock.calls.length).toBeGreaterThan(0);
+      expect(runAwaitVerifyPass.mock.calls.every(([a]) => a.allowResume === false)).toBe(true); // the gate could not answer → no wake
       runAwaitVerifyPass.mockClear();
       await runAwaitVerifyCycleDefault({ env, settings: ON, passModule, authGate: () => ({ paused: false }) });
-      expect(runAwaitVerifyPass).toHaveBeenCalledWith(expect.objectContaining({ allowResume: false })); // phase A
-      expect(runAwaitVerifyPass.mock.calls.every(([a]) => a.allowResume === false)).toBe(true); // nothing owed → no phase B
+      expect(runAwaitVerifyPass.mock.calls.map(([a]) => a.allowResume)).toEqual([false, true]); // phase A pushes, phase B wakes
     } finally { restore(); }
   });
   it('setting off: the cycle never releases', async () => {
@@ -491,6 +524,51 @@ describe('the loop refreshes its GitHub App auth before every cycle', () => {
       expect(out).toEqual({ rows: [] });
       expect(cycle).toHaveBeenCalledTimes(3);
     } finally { if (saved === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = saved; }
+  });
+  describe('runLoopIteration (one pass of the child\'s forever-loop, every effect injected)', () => {
+    const base = (over = {}) => {
+      const log = [];
+      const order = [];
+      return { log, order, args: {
+        parentPid: 4242, lastDeferred: '', formatLines: (r) => r.lines ?? [], write: (l) => log.push(l),
+        resolveSettings: () => ON, parentAlive: () => true,
+        ensureAuth: async () => { order.push('auth'); },
+        cycle: async () => { order.push('cycle'); return { rows: [] }; },
+        writeHeartbeat: (hb) => order.push(`heartbeat:${hb.parentPid}:${hb.seconds}`),
+        ...over,
+      } };
+    };
+    it('refreshes the auth BEFORE the cycle and writes the heartbeat after a healthy one', async () => {
+      const { order, args } = base();
+      const out = await runLoopIteration(args);
+      expect(order).toEqual(['auth', 'cycle', 'heartbeat:4242:15']);
+      expect(out).toMatchObject({ exit: null, seconds: 15 });
+    });
+    it('an unhealthy cycle (lock busy, or every push transient) writes no heartbeat, so the tick takes over', async () => {
+      const busy = base({ cycle: async () => ({ rows: [], busy: true }) });
+      await runLoopIteration(busy.args);
+      expect(busy.order).toEqual(['auth']);
+      const stalled = base({ cycle: async () => ({ rows: [{ key: 'a', action: 'push', result: 'push-retry (could not resolve the head ref)' }] }) });
+      await runLoopIteration(stalled.args);
+      expect(stalled.order).toEqual(['auth']);
+    });
+    it('exits without running anything when the setting is off or the parent is gone', async () => {
+      const off = base({ resolveSettings: () => OFF });
+      expect(await runLoopIteration(off.args)).toMatchObject({ exit: 'setting-off' });
+      expect(off.order).toEqual([]);
+      const orphan = base({ parentAlive: () => false });
+      expect(await runLoopIteration(orphan.args)).toMatchObject({ exit: 'parent-gone' });
+      expect(orphan.order).toEqual([]);
+      expect(orphan.log).toEqual([expect.stringMatching(/parent gone — exiting/)]);
+    });
+    it('logs each pass line once, and repeats a deferred line only when it changes', async () => {
+      const { log, args } = base({ cycle: async () => ({ rows: [], lines: ['a pushed', 'b resume-deferred (fix slot full)'], released: [] }) });
+      const first = await runLoopIteration(args);
+      expect(log).toHaveLength(2);
+      log.length = 0;
+      await runLoopIteration({ ...args, lastDeferred: first.lastDeferred });
+      expect(log).toEqual([expect.stringMatching(/^a pushed \[loop \d+ms\]$/)]);
+    });
   });
   it('the default refresh is the fleet one (per-owner tokens), never a single pinned org', async () => {
     const { FLEET_APP_AUTH_OPTS } = await import('../../lib/github-app-auth-env.mjs');

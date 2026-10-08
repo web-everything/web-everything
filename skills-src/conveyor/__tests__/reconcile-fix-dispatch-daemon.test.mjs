@@ -1237,6 +1237,20 @@ describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonEx
     expect(calls).toEqual(['stop', 'release', 'exit:0']);
     expect(b.isStopping()).toBe(true);
   });
+  it('buildDaemonExits.loopEnded: the third exit (runDaemonLoop returned on its own) also stops the loop child, then releases the lease; after a signal it only stops', () => {
+    const calls = [];
+    const make = () => buildDaemonExits({
+      awaitLoop: { stop: () => calls.push('stop') }, releaseLease: () => calls.push('release'), exit: (c) => calls.push(`exit:${c}`), log: { error: (l) => calls.push(l.includes('loop stopped (crashed)') ? 'log:loop-stopped' : 'log:other') },
+    });
+    make().loopEnded('crashed');
+    expect(calls).toEqual(['stop', 'log:loop-stopped', 'release']);
+    calls.length = 0;
+    const b = make();
+    b.shutdown('SIGTERM');
+    calls.length = 0;
+    b.loopEnded('signal');
+    expect(calls).toEqual(['stop']); // shutdown already released and exited
+  });
   it('the tick and main() call the factories (thin call-site checks; the behaviour is above)', () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'reconcile-fix-dispatch-daemon.mjs'), 'utf8');
     expect(src).toMatch(/buildAwaitVerifyStep\(\)\(\{ allowResume: !authGate\.paused \}\)/);

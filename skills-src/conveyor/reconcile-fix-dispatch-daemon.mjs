@@ -632,7 +632,7 @@ export async function runTickAllRepos({
   // #5137 — FIRST, before any fresh dispatch: a fixer that ended its turn awaiting a verdict is pushed (green,
   // exact sha) or resumed (red) here, so the model never holds a turn open on `check --wait`. Pushing needs no
   // Claude login; resuming does, so a paused login only defers the resume (the record keeps it pending).
-  // xn025gx (R4 push-wake-cadence): with the three on/off fixDispatch push-on-green settings off this is exactly the pass above; with the fast loop
+  // xn025gx (R4 push-wake-cadence): with all three fixDispatch push-on-green settings off (loop seconds 0, the two switches off) this is exactly the pass above; with the fast loop
   // alive the loop owns the pass and this tick skips it; otherwise the tick runs the same R3/R5 cycle under the cycle lock.
   const awaitVerify = awaitVerifyTick ? await awaitVerifyTick({ allowResume: !authGate.paused })
     : (realTick ? await buildAwaitVerifyStep()({ allowResume: !authGate.paused }) : { rows: [] });
@@ -875,6 +875,14 @@ export function buildDaemonExits({ awaitLoop, releaseLease, exit = (code) => pro
       releaseLease();
       exit(0);
     },
+    // The third exit: `runDaemonLoop` returned on its own. The loop child is a ref'd handle that only ends when its parent
+    // PID dies, so leaving it running would keep this process alive with no lease and nobody supervising the child.
+    loopEnded: (reason) => {
+      awaitLoop.stop();
+      if (stopping) return;
+      log.error(`reconcile-fix-dispatch-daemon: loop stopped (${reason}) — releasing the lease and exiting.`);
+      releaseLease();
+    },
   };
 }
 
@@ -1035,10 +1043,7 @@ async function main() {
       root: selfRoot, onRestart: exits.restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
     }), { role: 'fix', repos: FIX_DISPATCH_DAEMON_REPOS }),
   );
-  if (!exits.isStopping()) {
-    console.error(`reconcile-fix-dispatch-daemon: loop stopped (${stoppedReason}) — releasing the lease and exiting.`);
-    releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY });
-  }
+  exits.loopEnded(stoppedReason);
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));

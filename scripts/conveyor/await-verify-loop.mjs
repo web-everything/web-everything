@@ -221,7 +221,13 @@ export function superviseAwaitVerifyLoop({ spawnLoop = () => spawnAwaitVerifyLoo
   const start = () => {
     if (stopped) return null;
     lastStart = now();
-    try { child = spawnLoop(); } catch (e) { child = null; log.error(`reconcile-fix-dispatch-daemon: await-verify loop spawn failed: ${String(e?.message ?? e)}`); }
+    try { child = spawnLoop(); } catch (e) {
+      child = null;
+      // A spawn that throws (EMFILE/EAGAIN) has no 'exit' to arm the restart, so arm the same rate-limited retry here.
+      log.error(`reconcile-fix-dispatch-daemon: await-verify loop spawn failed: ${String(e?.message ?? e)}; retrying in ${Math.round(minGapMs / 1000)}s`);
+      const retry = setTimer(start, minGapMs);
+      retry?.unref?.();
+    }
     const mine = child;
     mine?.on?.('error', (e) => log.error(`reconcile-fix-dispatch-daemon: await-verify loop error: ${String(e?.message ?? e)}`));
     mine?.on?.('exit', (code) => {
@@ -444,25 +450,41 @@ async function main(argv = process.argv.slice(2)) {
   write(`await-verify-loop: started pid ${process.pid} (parent ${parentPid || 'none'}), every ${seconds}s`);
   let lastDeferred = '';
   for (;;) {
-    const settings = resolveFixerSlotSettings();
-    seconds = settings.awaitVerifyLoopSeconds;
-    if (!(seconds > 0)) { write('await-verify-loop: setting off — exiting'); return; }
-    if (Number.isInteger(parentPid) && parentPid > 0 && !isPidAlive(parentPid)) { write('await-verify-loop: parent gone — exiting'); return; }
-    const t0 = Date.now();
-    const result = await runLoopCycle({ settings });
-    // The heartbeat says "a cycle completed", not just "the process is up": a cycle that fails, or cannot get the cycle
-    // lock, every time lets it go stale, and the tick then runs the pass itself (R4 fallback).
-    if (!cycleFailed(result)) {
-      try { writeJsonAtomic(loopHeartbeatPath(), { pid: process.pid, parentPid, at: new Date().toISOString(), seconds }); } catch { /* stale → tick fallback */ }
-    }
-    const lines = formatAwaitVerifyLines(result).filter((l) => !/awaiting a verdict$/.test(l));
-    const deferredLines = lines.filter((l) => l.includes('resume-deferred'));
-    const key = deferredLines.join('\n');
-    for (const l of lines) if (!deferredLines.includes(l) || key !== lastDeferred) write(`${l} [loop ${Date.now() - t0}ms]`);
-    lastDeferred = key;
-    for (const l of formatReleaseLines(result)) write(l);
+    const it = await runLoopIteration({ parentPid, lastDeferred, formatLines: formatAwaitVerifyLines, write });
+    if (it.exit) return;
+    lastDeferred = it.lastDeferred;
+    seconds = it.seconds;
     await sleep(seconds * 1000);
   }
+}
+
+/**
+ * One pass of the child's forever-loop, with every effect injectable so a test drives the real order: decide whether to
+ * exit (setting off, parent gone), run the cycle through {@link runLoopCycle} (the auth refresh), write the heartbeat only
+ * for a healthy cycle, log. `main()` is only the sleep around it. Returns `{exit, seconds, lastDeferred}`.
+ */
+export async function runLoopIteration({
+  parentPid, lastDeferred = '', formatLines, write,
+  resolveSettings = () => resolveFixerSlotSettings(), parentAlive = isPidAlive, ensureAuth = undefined, cycle = undefined,
+  writeHeartbeat = (hb) => writeJsonAtomic(loopHeartbeatPath(), hb), now = Date.now, pid = process.pid,
+}) {
+  const settings = resolveSettings();
+  const seconds = settings.awaitVerifyLoopSeconds;
+  if (!(seconds > 0)) { write('await-verify-loop: setting off — exiting'); return { exit: 'setting-off', seconds, lastDeferred }; }
+  if (Number.isInteger(parentPid) && parentPid > 0 && !parentAlive(parentPid)) { write('await-verify-loop: parent gone — exiting'); return { exit: 'parent-gone', seconds, lastDeferred }; }
+  const t0 = now();
+  const result = await runLoopCycle({ settings, ensureAuth, cycle }); // the auth refresh is part of the iteration, not an option of it
+  // The heartbeat says "a cycle completed", not just "the process is up": a cycle that fails, or cannot get the cycle
+  // lock, every time lets it go stale, and the tick then runs the pass itself (R4 fallback).
+  if (!cycleFailed(result)) {
+    try { writeHeartbeat({ pid, parentPid, at: new Date(now()).toISOString(), seconds }); } catch { /* stale → tick fallback */ }
+  }
+  const lines = formatLines(result).filter((l) => !/awaiting a verdict$/.test(l));
+  const deferredLines = lines.filter((l) => l.includes('resume-deferred'));
+  const key = deferredLines.join('\n');
+  for (const l of lines) if (!deferredLines.includes(l) || key !== lastDeferred) write(`${l} [loop ${now() - t0}ms]`);
+  for (const l of formatReleaseLines(result)) write(l);
+  return { exit: null, seconds, lastDeferred: key };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
