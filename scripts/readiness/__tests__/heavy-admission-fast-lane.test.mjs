@@ -158,6 +158,30 @@ describe('hold durations — recorded by kind on release, rolled into the standa
     expect(last.holder).toBe('mystery.mjs');
   });
 
+  it('card xmh9mtr — identity at acquire: a dispatcher env identity is recorded though the lane has no lease at release', async () => {
+    const lockRoot = tempRoot();
+    const lane = join(tempRoot(), 'lane-12'); // no `.git/.lane-lease` at all — the reaped probation lane
+    const env = { WE_HEAVY_SESSION: 'conveyor-4420', WE_HEAVY_DISPATCH_KIND: 'build', WE_HEAVY_RUN_ID: 'run-abc' };
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: `${lane}#1`, kind: 'selected', env, log: () => {}, now: () => Date.now() - 60_000, sleep: async () => {} });
+    expect(r.ok).toBe(true);
+    releaseOwnedSlot({ lockRoot, cap: 1, owner: `${lane}#1` });
+    expect(readHoldDurations(lockRoot).at(-1)).toMatchObject({ session: 'conveyor-4420', dispatchKind: 'build', runId: 'run-abc', repo: lane });
+  });
+
+  it('card xmh9mtr — identity at acquire: the lease held at ACQUIRE wins over the one (or none) left at release', async () => {
+    const lockRoot = tempRoot();
+    const lane = join(tempRoot(), 'lane-7');
+    mkdirSync(join(lane, '.git'), { recursive: true });
+    const lease = (o) => writeFileSync(join(lane, '.git', '.lane-lease'), JSON.stringify(o));
+    lease({ session: 'conveyor-77', purpose: 'probation-doc-fix-build', holder: 'probation-doc-fix-build-lane-7-aa', acquiredAt: iso(T0) });
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: lane, kind: 'standards', env: {}, log: () => {}, now: () => Date.now() - 60_000, sleep: async () => {} });
+    expect(r.ok).toBe(true);
+    // The lane is reaped and handed to someone else while the hold is still running.
+    lease({ session: 'ci-heal-9', purpose: 'conveyor-ci-heal', holder: 'conveyor-ci-heal-lane-7-bb', acquiredAt: iso(T0 + 1) });
+    releaseOwnedSlot({ lockRoot, cap: 1, owner: lane });
+    expect(readHoldDurations(lockRoot).at(-1)).toMatchObject({ session: 'probation-doc-fix-build-lane-7-aa', dispatchKind: 'build', leaseAcquiredAt: iso(T0) });
+  });
+
   it('a slot acquired by older code (no kind recorded) is released without writing a guessed duration', () => {
     const lockRoot = tempRoot();
     tryAcquireSlot({ lockRoot, cap: 1, owner: 'legacy', pid: process.pid, nowMs: T0, nowIso: iso(T0) });

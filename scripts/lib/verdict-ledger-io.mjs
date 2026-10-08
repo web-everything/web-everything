@@ -18,6 +18,7 @@
  * Reuses `we:scripts/lib/git-transport-branch.mjs` (worktree dance, explicit refspec); does not duplicate it.
  */
 import {
+  assertPushRef,
   readFromTransportBranch,
   stageOnTransportBranch,
 } from './git-transport-branch.mjs';
@@ -27,6 +28,8 @@ import { registerLedgerStore } from './verdict-ledger-store.mjs';
 export const LEDGER_TRANSPORT_BRANCH = 'ops/review-requests';
 export const LEDGER_DIR = 'verdict-ledger';
 export const DEFAULT_APPEND_ATTEMPTS = 5;
+/** The ONLY ref the ledger push path may write (operator decision 2026-10-08): never main, never a lane, never a force. */
+export const LEDGER_PUSH_REF = `refs/heads/${LEDGER_TRANSPORT_BRANCH}`;
 
 /** Repo-relative path of one repo's ledger on the transport branch. Same slug rule as `verdictLedgerPath`. */
 export function ledgerGitPath(repo) {
@@ -81,6 +84,7 @@ export function appendLedgerRows({
   ...seams // run / mkdir / write / read / rm / now, passed through to the transport
 } = {}) {
   if (!Array.isArray(records) || !records.length) throw new TypeError('verdict-ledger-io: `records` must be a non-empty array');
+  assertPushRef(branch, LEDGER_PUSH_REF); // before any record is serialized or any git call: a wrong ref writes nothing
   const lines = records.map((r) => {
     const s = serializeLedgerEvent(r); // every v2 event type; a verdict row delegates to the v1 serializer, bytes unchanged
     if (!s.ok) throw new TypeError(`verdict-ledger-io: invalid record refused, nothing written: ${s.errors.join('; ')}`);
@@ -102,6 +106,7 @@ export function appendLedgerRows({
           },
         }],
         ...seams,
+        allowRef: LEDGER_PUSH_REF, // after the seams: a caller cannot loosen it
       });
       return { status: 'appended', attempts: attempt, rows: lines.length };
     } catch (e) {

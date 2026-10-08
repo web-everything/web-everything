@@ -1,0 +1,6 @@
+{
+  "_comment": "Per-use model SETTINGS for cheap, advisory sampling jobs (card xb0ld4v). This is OUR layer: the product defaults stay in code (coroner-sample.mjs DEFAULTS.model, perf-velocity-io.mjs ESTIMATE_MODEL, review-prep.mjs JUDGE_MODEL) and are used when a key is absent here. Measured 2026-10-08 on identical inputs (.operations/metrics/perf/2026-10-08/haiku55-trial.md): Haiku 5.5 matched the current model on all three. NEVER set these for builds, fixes, ci-heals or mandatory review seats. Haiku 5.5 takes no `temperature`; judge-spawn never passes one.",
+  "coroner": { "sampleModel": "claude-haiku-5-5" },
+  "velocity": { "estimateModel": "claude-haiku-5-5" },
+  "prepReview": { "model": "claude-haiku-5-5" }
+}
