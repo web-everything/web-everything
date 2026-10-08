@@ -42,8 +42,9 @@ export default {
         latestRedSha: state.latestRed.sha, redForMin: Math.round(redFor / MINUTE), windowTruncated: state.windowTruncated,
         failingJobs: (failing.jobs || []).slice(0, 10), failingTests: (failing.tests || []).slice(0, 5),
         owner, ownerDecision: decision?.reason ?? null, dispatched: mainCiRuns?.dispatched ?? null,
+        priorityPr: mainCiRuns?.priority?.pr ?? null,
       },
-      summary: `main CI red for ${fmtMin(redFor)} since ${sha9} (last green ${state.lastGreen?.sha.slice(0, 9) ?? 'unknown'}); failing: ${(failing.jobs || []).join(', ') || 'unknown'}; ${ownerText}.`,
+      summary: `main CI red for ${fmtMin(redFor)} since ${sha9} (last green ${state.lastGreen?.sha.slice(0, 9) ?? 'unknown'}); failing: ${(failing.jobs || []).join(', ') || 'unknown'}; ${ownerText}${mainCiRuns?.priority ? `; PR #${mainCiRuns.priority.pr} has queue priority` : ''}.`,
       recommendation: owner
         ? `Main is red since ${sha9}; ${owner.kind} ${owner.ref} owns the fix. Watch it land; do not fix main by hand.`
         : `Main is red since ${sha9} and has no owner (${decision?.reason ?? 'not decided'}). The main-red owner dispatch (main-ci-red-io.mjs) should send one; check why it did not.`,

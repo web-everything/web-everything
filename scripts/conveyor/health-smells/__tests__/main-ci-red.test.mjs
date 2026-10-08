@@ -11,8 +11,9 @@ import { fileURLToPath } from 'node:url';
 
 import {
   MAIN_CI_RED_DEFAULTS, mainCiRedSettings, classifyRun, mainRedState, isRedLongEnough, runsAsOf, findOwner,
-  decideOwner, buildOwnerBrief, ownerSessionSlug,
+  decideOwner, buildOwnerBrief, ownerSessionSlug, findOwnerPr, planPriority, isPriorityActive, mainRedPriorityRank,
 } from '../../main-ci-red-core.mjs';
+import { readMainRedPriority, writeMainRedPriority } from '../../../lib/main-red-priority.mjs';
 import { probeAndOwnMainCi, ledgerPathIn, probeMainCiRuns } from '../../main-ci-red-io.mjs';
 import smell from '../main-ci-red.mjs';
 import { emptyHealthState, runHealthTick } from '../../health-watch-core.mjs';
@@ -30,16 +31,17 @@ const PR_4523 = { number: 4523, title: 'backlog: file xu1nixv — a red main get
 const run = (o) => ({ status: 'completed', databaseId: 1, headSha: 'a'.repeat(40), createdAt: '2026-10-08T10:00:00Z', updatedAt: '2026-10-08T10:10:00Z', ...o });
 
 let dir;
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'main-ci-red-')); });
+beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'main-ci-red-')); published = []; });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 /** One tick of the IO pass at `t` over the fixture as it looked then. */
+let published = [];
 function tickAt(t, { prs = [], dispatched, config = {}, gates } = {}) {
   return probeAndOwnMainCi({
     dir, now: t, config, weRoot: '/we',
     readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: { jobs: ['soak-shard (3)', 'daemon-soak'], tests: [] } }),
     readPrs: () => prs.filter((p) => T(p.createdAt) <= t),
-    listAgents: async () => [],
+    listAgents: async () => [], publishPriority: (r) => published.push(r),
     gates: gates ?? (async () => ({ killed: false, fixGate: { admit: true } })),
     dispatch: async (req) => { dispatched.push({ at: new Date(t).toISOString(), ...req }); return { handle: `h-${dispatched.length}` }; },
   });
@@ -177,7 +179,7 @@ describe('replay: 2026-10-08, main red from 17:04Z', () => {
     // ONE owner for the whole 17:04Z → 22:45Z window, for the first red commit, sent at the same tick.
     expect(dispatched).toHaveLength(1);
     expect(dispatched[0]).toMatchObject({ at: '2026-10-08T17:20:00.000Z', sessionSlug: `main-fix-${FIRST_RED}` });
-    expect(Object.keys(JSON.parse(readFileSync(ledgerPathIn(dir), 'utf8')))).toEqual([expect.stringMatching(new RegExp(`^${FIRST_RED}`))]);
+    expect(Object.keys(JSON.parse(readFileSync(ledgerPathIn(dir), 'utf8'))).filter((k) => !k.startsWith('_'))).toEqual([expect.stringMatching(new RegExp(`^${FIRST_RED}`))]);
     // The episode stays one episode for the whole window and shows the owner.
     expect(Object.values(state.episodes).filter((e) => e.smell === 'main-ci-red')).toHaveLength(1);
     expect(Object.values(state.episodes)[0].measure.owner).toMatchObject({ kind: 'dispatched', ref: `main-fix-${FIRST_RED}` });
@@ -205,7 +207,7 @@ describe('replay: 2026-10-08, main red from 17:04Z', () => {
   it('a launch that provably started nothing is retried next tick; an unreadable PR list never dispatches', async () => {
     const t = T('2026-10-08T18:00:00Z');
     const held = await probeAndOwnMainCi({
-      dir, now: t, weRoot: '/we', readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: {} }), readPrs: () => [],
+      dir, now: t, weRoot: '/we', publishPriority: (r) => published.push(r), readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: {} }), readPrs: () => [],
       listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }),
       dispatch: async () => { const e = new Error('no claude'); e.notApplied = true; throw e; },
     });
@@ -213,7 +215,7 @@ describe('replay: 2026-10-08, main red from 17:04Z', () => {
     expect(JSON.parse(readFileSync(ledgerPathIn(dir), 'utf8'))).toEqual({});
     const dispatched = [];
     const blind = await probeAndOwnMainCi({
-      dir, now: t, weRoot: '/we', readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: {} }), readPrs: () => null,
+      dir, now: t, weRoot: '/we', publishPriority: (r) => published.push(r), readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: {} }), readPrs: () => null,
       listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }), dispatch: async (r) => { dispatched.push(r); return {}; },
     });
     expect(blind.decision.reason).toBe('owner-unknown');
@@ -225,10 +227,107 @@ describe('replay: 2026-10-08, main red from 17:04Z', () => {
   it('dry-run decides but neither dispatches nor writes', async () => {
     const t = T('2026-10-08T18:00:00Z');
     const out = await probeAndOwnMainCi({
-      dir, now: t, dryRun: true, readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: {} }), readPrs: () => [],
+      dir, now: t, dryRun: true, publishPriority: () => { throw new Error('must not publish'); }, readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: {} }), readPrs: () => [],
       listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }), dispatch: async () => { throw new Error('must not dispatch'); },
     });
     expect(out.decision.owed).toBe(true);
     expect(existsSync(ledgerPathIn(dir))).toBe(false);
+  });
+});
+
+describe('red-main owner PR priority (operator context 2026-10-08: red main blocks every other PR)', () => {
+  const state = { status: 'red', firstRed: { sha: `${FIRST_RED}aaaa`, createdAt: '2026-10-08T17:04:20Z' }, redSinceMs: T('2026-10-08T17:04:20Z') };
+  const now = T('2026-10-08T22:47:00Z');
+
+  it('the PR that owns the fix for the current red commit gets priority; nothing else does', () => {
+    const ownerPr = findOwnerPr({ firstRed: state.firstRed, prs: [PR_4523, PR_4522] });
+    expect(ownerPr.number).toBe(4522);
+    const rec = planPriority({ state, ownerPr, now });
+    expect(rec).toMatchObject({ repo: 'we', pr: 4522, firstRedSha: state.firstRed.sha });
+    expect(mainRedPriorityRank(4522, rec, { now })).toBe(0);
+    expect(mainRedPriorityRank(4523, rec, { now })).toBe(1);
+    expect(mainRedPriorityRank(4522, rec, { now, repo: 'frontierui' })).toBe(1);
+    // As the FIRST sort term it moves only the owner to the front and keeps every other order intact.
+    const queue = [4527, 4523, 4522, 4516].sort((a, b) => mainRedPriorityRank(a, rec, { now }) - mainRedPriorityRank(b, rec, { now }));
+    expect(queue).toEqual([4522, 4527, 4523, 4516]);
+  });
+
+  it('off (before this card), main green, or no owner PR → no priority; it expires without a refresh', () => {
+    const ownerPr = { number: 4522 };
+    expect(planPriority({ state, ownerPr, now, settings: { ...MAIN_CI_RED_DEFAULTS, mainCiRedOwnerPrPriority: false } })).toBeNull();
+    expect(planPriority({ state: { status: 'green' }, ownerPr, now })).toBeNull();
+    expect(planPriority({ state, ownerPr: null, now })).toBeNull();
+    const rec = planPriority({ state, ownerPr, now });
+    expect(isPriorityActive(rec, { now: now + 29 * MIN })).toBe(true);
+    expect(isPriorityActive(rec, { now: now + 30 * MIN })).toBe(false);
+  });
+
+  it('the tick publishes the owner PR while red and clears it once main is green', async () => {
+    await tickAt(now, { dispatched: [], prs: [PR_4522, PR_4523] });
+    expect(published.at(-1)).toMatchObject({ pr: 4522 });
+    // The real fixture never goes green, so feed one green run after the window.
+    await probeAndOwnMainCi({ dir, now, publishPriority: (r) => published.push(r),
+      readRuns: () => ({ runs: [...runsAsOf(FIXTURE, now), { databaseId: 9, headSha: 'f'.repeat(40), status: 'completed', conclusion: 'success', createdAt: '2026-10-08T22:48:00Z', updatedAt: '2026-10-08T23:00:00Z' }], failing: {} }),
+      readPrs: () => { throw new Error('no PR read while green'); } });
+    expect(published.at(-1)).toBeNull();
+  });
+
+  it('an unreadable PR list publishes nothing (the old record just expires)', async () => {
+    await probeAndOwnMainCi({ dir, now, publishPriority: (r) => published.push(r), readRuns: () => ({ runs: runsAsOf(FIXTURE, now), failing: {} }),
+      readPrs: () => null, listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }), dispatch: async () => ({}) });
+    expect(published).toHaveLength(0);
+  });
+
+  it('the shared file round-trips and an expired record reads as none', () => {
+    const path = join(dir, 'p.json');
+    const rec = planPriority({ state, ownerPr: { number: 4522 }, now });
+    writeMainRedPriority(rec, { path });
+    expect(readMainRedPriority({ path, now })).toMatchObject({ pr: 4522 });
+    expect(readMainRedPriority({ path, now: rec.expiresAt })).toBeNull();
+    writeMainRedPriority(null, { path });
+    expect(readMainRedPriority({ path, now })).toBeNull();
+  });
+});
+
+describe('a truncated read window (live 2026-10-08: 60 runs did not reach the last green run)', () => {
+  it('the probe reads deeper when a full first page holds no green run', () => {
+    const limits = [];
+    const page = (n) => Array.from({ length: n }, (_, i) => ({ databaseId: 1000 + i, headSha: `${i}`.padStart(40, 'b'), status: 'completed', conclusion: i === n - 1 && n > 3 ? 'success' : 'failure', createdAt: new Date(T('2026-10-08T20:00:00Z') - i * MIN).toISOString(), updatedAt: '2026-10-08T21:00:00Z' }));
+    const exec = (cmd, argv) => {
+      if (argv[0] === 'run') { const n = Number(argv[argv.indexOf('--limit') + 1]); limits.push(n); return JSON.stringify(page(n === 3 ? 3 : 5)); }
+      return JSON.stringify({ total_count: 1, jobs: [{ id: 1, name: 'test', conclusion: 'failure' }] });
+    };
+    const out = probeMainCiRuns({ exec, settings: mainCiRedSettings({ mainCiRedRunLimit: 3, mainCiRedRunLimitMax: 5 }) });
+    expect(limits).toEqual([3, 5]);
+    expect(mainRedState(out.runs).lastGreen).not.toBeNull();
+  });
+
+  it('a sliding window whose oldest red run keeps changing still sends ONE owner', async () => {
+    const dispatched = [];
+    for (let t = T('2026-10-08T18:00:00Z'); t <= T('2026-10-08T22:45:00Z'); t += 5 * MIN) {
+      const window = runsAsOf(FIXTURE, t).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).slice(0, 25); // no green inside
+      await probeAndOwnMainCi({ dir, now: t, weRoot: '/we', publishPriority: () => {}, readRuns: () => ({ runs: window, failing: {} }),
+        readPrs: () => [], listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }),
+        dispatch: async (r) => { dispatched.push(r.sessionSlug); return { handle: 'h' }; } });
+    }
+    expect(dispatched).toHaveLength(1);
+  });
+});
+
+describe('red streaks', () => {
+  it('a NEW red window after main went green gets its own owner', async () => {
+    const dispatched = [];
+    const gate = { listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }), publishPriority: () => {}, readPrs: () => [] };
+    const r = (sha, conclusion, at) => ({ databaseId: at, headSha: sha.padEnd(40, '0'), status: 'completed', conclusion, createdAt: new Date(at).toISOString(), updatedAt: new Date(at + 5 * MIN).toISOString() });
+    const base = T('2026-10-09T01:00:00Z');
+    const w1 = [r('aaa', 'success', base), r('bbb', 'failure', base + MIN)];
+    const w2 = [...w1, r('ccc', 'success', base + 60 * MIN)];
+    const w3 = [...w2, r('ddd', 'failure', base + 90 * MIN)];
+    const go = (runs, now) => probeAndOwnMainCi({ dir, now, weRoot: '/we', readRuns: () => ({ runs, failing: {} }), dispatch: async (x) => { dispatched.push(x.sessionSlug); return { handle: 'h' }; }, ...gate });
+    await go(w1, base + 30 * MIN);
+    await go(w1, base + 40 * MIN);
+    await go(w2, base + 70 * MIN);
+    await go(w3, base + 120 * MIN);
+    expect(dispatched).toEqual(['main-fix-bbb000000', 'main-fix-ddd000000']);
   });
 });

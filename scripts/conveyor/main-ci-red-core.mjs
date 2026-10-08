@@ -30,7 +30,9 @@ export const MAIN_CI_RED_DEFAULTS = Object.freeze({
   /** The workflow file whose runs ARE main's CI (read by workflow, never across all workflows — card xfrjlsi). */
   mainCiRedWorkflow: 'ci.yml',
   mainCiRedBranch: 'main',
-  mainCiRedRunLimit: 60,
+  /** First read size; when it holds no green run the probe reads once more at `mainCiRedRunLimitMax`. */
+  mainCiRedRunLimit: 100,
+  mainCiRedRunLimitMax: 400,
   /** Off = before this card: nobody is dispatched for a red main. */
   mainCiRedOwnerDispatch: true,
   /** A full fixer cap does not hold back the main-red owner (the kill switch and host load still do). */
@@ -39,6 +41,11 @@ export const MAIN_CI_RED_DEFAULTS = Object.freeze({
   mainCiRedOwnerTitlePattern: '\\b(?:fix(?:es|ing)?|heal(?:s|ing)?)\\b[^\\n]{0,24}\\b(?:red[- ]main|main[- ](?:red|ci))\\b',
   /** The branch prefix the dispatched owner opens its PR from. */
   mainCiRedOwnerBranchPrefix: 'lane/main-fix-',
+  /** Off = before this card: the PR that owns the red-main fix queues like any other PR. On = it goes first (draft
+   *  promotion, review queue, drain) while main stays red — red main blocks every other PR. */
+  mainCiRedOwnerPrPriority: true,
+  /** The published priority expires unless a health tick refreshes it, so a dead watch never pins a PR first. */
+  mainCiRedPriorityTtlMs: 30 * MINUTE,
 });
 
 /** Merge the health config over the defaults, keeping only well-typed values. PURE. */
@@ -87,12 +94,15 @@ export function mainRedState(runs) {
   const firstRed = considered[g + 1];
   return {
     status: 'red',
-    firstRed: pick(firstRed),
+    firstRed: { ...pick(firstRed), lastGreenAt: g >= 0 ? considered[g].updatedAt ?? considered[g].createdAt : null },
     lastGreen: g >= 0 ? pick(considered[g]) : null,
     latestRed: pick(latest),
     redSinceMs: ts(firstRed.createdAt),
     // No green run in the read window: the real first red commit may be older than the window shows.
     windowTruncated: g < 0,
+    // Every red commit of this red window: an owner recorded for ANY of them owns the window (dedupe survives a
+    // window that slides when the read is truncated).
+    redShas: considered.slice(g + 1).filter((r) => classifyRun(r) === 'red').map((r) => String(r.headSha ?? '')),
   };
 }
 
@@ -116,21 +126,14 @@ export function runsAsOf(runs, t) {
 export function ownerSessionSlug(sha) { return `main-fix-${String(sha).slice(0, 9)}`; }
 
 /**
- * Who already owns this broken commit, if anyone? PURE. In order:
- *   - the owner ledger has a dispatch for this first red commit (the one we sent);
- *   - a live session is named for it (`main-fix-<sha9>`);
- *   - an OPEN PR, created at or after the first red run, that names the first red commit (7+ chars) in its title or
- *     body, comes from the owner branch prefix, or has a fix-main title (e.g. PR #4522 "fix red main").
- * @returns {{kind:'dispatched'|'session'|'pr', ref:string, detail?:string}|null}
+ * The OPEN PR that owns the fix for this broken commit, if any: created at or after the first red run, and naming the
+ * first red commit (7+ chars) in its title or body, coming from the owner branch prefix, or carrying a fix-main title
+ * (e.g. PR #4522 "fix red main"; the card PR #4523 "a red main gets an owner" is not one). PURE.
+ * @returns {{number:number, title:string}|null}
  */
-export function findOwner({ firstRed, prs = [], agents = [], ledger = {}, settings = MAIN_CI_RED_DEFAULTS }) {
+export function findOwnerPr({ firstRed, prs = [], settings = MAIN_CI_RED_DEFAULTS }) {
   const sha = String(firstRed?.sha ?? '');
   if (!sha) return null;
-  const rec = ledger?.[sha];
-  if (rec) return { kind: 'dispatched', ref: rec.sessionSlug ?? ownerSessionSlug(sha), detail: rec.at ? `dispatched ${new Date(rec.at).toISOString()}` : undefined };
-  const slug = ownerSessionSlug(sha);
-  const live = (agents || []).find((a) => a && !['done', 'stopped', 'failed'].includes(a.state) && String(a.name ?? '').startsWith(slug));
-  if (live) return { kind: 'session', ref: live.name };
   let re = null;
   try { re = settings.mainCiRedOwnerTitlePattern ? new RegExp(settings.mainCiRedOwnerTitlePattern, 'i') : null; } catch { re = null; }
   const since = ts(firstRed.createdAt);
@@ -143,10 +146,59 @@ export function findOwner({ firstRed, prs = [], agents = [], ledger = {}, settin
     const text = `${title}\n${pr.body ?? ''}`;
     const branch = String(pr.headRefName ?? '');
     if ((short.length === 7 && text.includes(short)) || branch.startsWith(settings.mainCiRedOwnerBranchPrefix) || (re && re.test(title))) {
-      return { kind: 'pr', ref: `#${pr.number}`, detail: title.slice(0, 100) };
+      return { number: Number(pr.number), title: title.slice(0, 100) };
     }
   }
   return null;
+}
+
+/**
+ * The priority record to publish: while main is red and an open PR owns the fix for the CURRENT red window's first
+ * red commit, that PR goes first in draft promotion, the review queue and the drain. `null` = publish nothing (clear).
+ * Main green or unknown, the setting off, or no owner PR → null. PURE.
+ */
+export function planPriority({ state, ownerPr, now, settings = MAIN_CI_RED_DEFAULTS, repo = 'we' }) {
+  if (!settings.mainCiRedOwnerPrPriority || !settings.mainCiRedEnabled) return null;
+  if (state?.status !== 'red' || !ownerPr || !Number.isInteger(ownerPr.number)) return null;
+  return { repo, pr: ownerPr.number, firstRedSha: state.firstRed.sha, reason: 'owns the red-main fix', setAt: now, expiresAt: now + settings.mainCiRedPriorityTtlMs };
+}
+
+/** Is this published priority record live at `now` (unexpired, well-formed)? PURE. */
+export function isPriorityActive(record, { now }) {
+  return !!record && Number.isInteger(record.pr) && Number.isFinite(record.expiresAt) && now < record.expiresAt;
+}
+
+/**
+ * Comparator helper for any queue (review, drain, promotion): 0 for the red-main owner PR, 1 for every other PR, so
+ * `rank(a) - rank(b)` as the FIRST sort term puts the owner first and leaves the existing order otherwise. PURE.
+ */
+export function mainRedPriorityRank(prNumber, record, { now, repo = 'we' } = {}) {
+  return isPriorityActive(record, { now }) && record.repo === repo && Number(prNumber) === record.pr ? 0 : 1;
+}
+
+/**
+ * Who already owns this broken commit, if anyone? PURE. In order:
+ *   - the owner ledger has a dispatch for this first red commit (the one we sent);
+ *   - a live session is named for it (`main-fix-<sha9>`);
+ *   - an OPEN PR, created at or after the first red run, that names the first red commit (7+ chars) in its title or
+ *     body, comes from the owner branch prefix, or has a fix-main title (e.g. PR #4522 "fix red main").
+ * @returns {{kind:'dispatched'|'session'|'pr', ref:string, detail?:string}|null}
+ */
+export function findOwner({ firstRed, prs = [], agents = [], ledger = {}, settings = MAIN_CI_RED_DEFAULTS, redShas = [] }) {
+  const sha = String(firstRed?.sha ?? '');
+  if (!sha) return null;
+  const key = [sha, ...redShas].find((k) => k && ledger?.[k]);
+  // Same red STREAK: an owner dispatched after the last time main was seen green owns this window too, even when a
+  // truncated read slid the recorded commit out of view (`_greenSeenAt` is written by the IO whenever main is green).
+  const streakStart = Math.max(Number(ledger?._greenSeenAt) || 0, ts(firstRed.lastGreenAt) ?? 0);
+  const streakKey = key ? null : Object.keys(ledger || {}).find((k) => !k.startsWith('_') && Number(ledger[k]?.at) > streakStart);
+  const rec = key ? ledger[key] : streakKey ? ledger[streakKey] : null;
+  if (rec) return { kind: 'dispatched', ref: rec.sessionSlug ?? ownerSessionSlug(sha), detail: rec.at ? `dispatched ${new Date(rec.at).toISOString()}` : undefined };
+  const slug = ownerSessionSlug(sha);
+  const live = (agents || []).find((a) => a && !['done', 'stopped', 'failed'].includes(a.state) && String(a.name ?? '').startsWith(slug));
+  if (live) return { kind: 'session', ref: live.name };
+  const pr = findOwnerPr({ firstRed, prs, settings });
+  return pr ? { kind: 'pr', ref: `#${pr.number}`, detail: pr.title } : null;
 }
 
 /**

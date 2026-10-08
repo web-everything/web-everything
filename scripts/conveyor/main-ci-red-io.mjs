@@ -24,8 +24,10 @@ import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import {
-  mainCiRedSettings, mainRedState, findOwner, decideOwner, buildOwnerBrief, ownerSessionSlug, classifyRun,
+  mainCiRedSettings, mainRedState, findOwner, findOwnerPr, decideOwner, buildOwnerBrief, ownerSessionSlug, classifyRun,
+  planPriority,
 } from './main-ci-red-core.mjs';
+import { writeMainRedPriority } from '../lib/main-red-priority.mjs';
 
 /** Main's repo: the WE entry of the constellation registry (never a hand-typed slug). */
 export const DEFAULT_REPO_SLUG = CONSTELLATION_REPOS.we.slug;
@@ -63,9 +65,15 @@ export function readFailingTests(jobId, { exec = execFileSyncThrottled, repoSlug
  * red run. Throws on an unreadable runs read (= unknown).
  */
 export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG, settings = mainCiRedSettings() } = {}) {
-  const runs = ghJson(exec, ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow, '--branch', settings.mainCiRedBranch,
-    '--limit', String(settings.mainCiRedRunLimit), '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha,event,workflowName']);
+  const list = (limit) => ghJson(exec, ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow, '--branch', settings.mainCiRedBranch,
+    '--limit', String(limit), '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha,event,workflowName']);
+  let runs = list(settings.mainCiRedRunLimit);
   if (!Array.isArray(runs)) throw new Error('main CI runs read returned no list');
+  // No green run in a full first page: read deeper once, so the FIRST red commit (the dedupe key) is the real one.
+  if (runs.length >= settings.mainCiRedRunLimit && !runs.some((r) => classifyRun(r) === 'green') && settings.mainCiRedRunLimitMax > settings.mainCiRedRunLimit) {
+    const deeper = list(settings.mainCiRedRunLimitMax);
+    if (Array.isArray(deeper)) runs = deeper;
+  }
   const sorted = [...runs].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
   const failing = { jobs: [], tests: [] };
   let reads = 0;
@@ -134,24 +142,41 @@ export async function defaultDispatchOwner({ prompt, sessionSlug }) {
 
 /**
  * ONE PASS per health tick: read main's CI, decide ownership, dispatch at most one owner, and return the
- * `mainCiRuns` probe value `{runs, failing, owner, decision, dispatched}`. `dryRun` decides but never dispatches or
+ * `mainCiRuns` probe value `{runs, failing, owner, decision, dispatched, priority}`. `dryRun` decides but never dispatches or
  * writes. Every seam is injectable for the replay tests.
  */
 export async function probeAndOwnMainCi({
   dir, now = Date.now(), config = {}, dryRun = false, repoSlug = DEFAULT_REPO_SLUG, weRoot,
   readRuns = (o) => probeMainCiRuns(o), readPrs = () => readOpenPrsForOwner({ repoSlug }),
   listAgents = async () => (await import('../operations/dispatch-lane-io.mjs')).defaultListAgents(),
-  gates = defaultGates, dispatch = defaultDispatchOwner,
+  gates = defaultGates, dispatch = defaultDispatchOwner, publishPriority = writeMainRedPriority,
 } = {}) {
   const settings = mainCiRedSettings(config);
   const probe = readRuns({ repoSlug, settings });
   const state = mainRedState(probe.runs);
-  const base = { ...probe, owner: null, decision: null, dispatched: null };
-  if (state.status !== 'red') return { ...base, decision: { owed: false, reason: state.status === 'green' ? 'main-green' : 'main-state-unknown' } };
-  // Cheap verdicts first: no PR/agent read while main is not red long enough or dispatch is off.
-  const pre = decideOwner({ state, now, settings, owner: null, prs: [] });
-  if (!pre.owed) return { ...base, decision: pre };
+  const base = { ...probe, owner: null, decision: null, dispatched: null, priority: null };
+  // Main green: clear the owner-PR priority. Unknown: leave it to expire on its own TTL (never act on a blind read).
+  if (state.status !== 'red') {
+    if (state.status === 'green' && !dryRun) {
+      publishPriority(null);
+      // Mark the end of any red streak, so a later red window never inherits this window's owner.
+      const path = ledgerPathIn(dir);
+      mkdirSync(dirname(path), { recursive: true });
+      withFileLock(`${path}.lock`, () => { const l = readOwnerLedger(path); l._greenSeenAt = now; writeJsonAtomic(path, l); }, { timeoutMs: 30_000 });
+    }
+    return { ...base, decision: { owed: false, reason: state.status === 'green' ? 'main-green' : 'main-state-unknown' } };
+  }
+  // Main red: the PR that owns the fix (if any) goes first in every queue, from the moment main is red.
   const prs = readPrs();
+  const priority = prs === null ? null : planPriority({ state, ownerPr: findOwnerPr({ firstRed: state.firstRed, prs, settings }), now, settings });
+  if (prs !== null && !dryRun) publishPriority(priority);
+  base.priority = priority;
+  // Cheap verdicts first: no agent/gate read while main is not red long enough or dispatch is off.
+  const pre = decideOwner({ state, now, settings, owner: null, prs: [] });
+  if (!pre.owed) {
+    const owner = prs === null ? null : findOwner({ firstRed: state.firstRed, prs, ledger: readOwnerLedger(ledgerPathIn(dir)), settings, redShas: state.redShas });
+    return { ...base, owner, decision: pre };
+  }
   let agents = [];
   try { agents = await listAgents(); } catch { agents = []; }
   const { killed, fixGate } = await gates();
@@ -165,7 +190,7 @@ export async function probeAndOwnMainCi({
   let result = base;
   lock(() => {
     const ledger = readOwnerLedger(path);
-    const owner = findOwner({ firstRed: state.firstRed, prs: prs ?? [], agents, ledger, settings });
+    const owner = findOwner({ firstRed: state.firstRed, prs: prs ?? [], agents, ledger, settings, redShas: state.redShas });
     const decision = decideOwner({ state, now, settings, owner, prs, killed, fixGate });
     result = { ...base, owner, decision };
     if (!decision.owed || dryRun) return;
