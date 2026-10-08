@@ -42,7 +42,7 @@
  *   smell. See {@link sweepHungJobs}. `WE_CI_HUNG_ACTION=0` / `--dry-run` turn the writes off.
  */
 
-import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { repoKeyForSlug, ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import {
   existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, openSync, closeSync, statSync, unlinkSync,
 } from 'node:fs';
@@ -437,7 +437,7 @@ export function sweepCiQueue({
 
 // ── HUNG CI JOBS: IO shell ────────────────────────────────────────────────────────────────────────────────
 
-const WE_SLUG = 'web-everything/web-everything';
+const WE_SLUG = ghRepoSlug(DEFAULT_REPO_KEY);
 
 /** Every gh call below goes through `execFileSyncThrottled` (the shared gh-throttle semaphore + backoff), the
  *  same sanctioned path `defaultListRuns` uses. */
