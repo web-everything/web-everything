@@ -1,6 +1,7 @@
 /**
  * @file worker-result.test.mjs — item 117 slice S1: schema, validator, legacy mapping, D1 guard.
  */
+/** @repo-scanning-test scope=full — see scripts/lib/repo-scan-tests.mjs (reads every skills-src brief; verify runs it when a brief changes, #3887). */
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
