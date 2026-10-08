@@ -13,8 +13,9 @@ import {
   probeDaemonLogs, probeLeases, probeSelfSync, probeLanePools, tick, healthSectionLines, healthDir,
   probeDaemonStatus, daemonNameForLabel, runTickWithWatchdog, probeAuthExpiredSessions, probeAgents,
   probePrs, probeStaleState, probeMergedPrs, probeProcesses, probeMachineLoad, probeGhShimLanes,
-  probeBgIsolationStalls, probeUntrackedBacklogCards, persistGhSpend,
+  probeBgIsolationStalls, probeUntrackedBacklogCards, persistGhSpend, breakthroughEmergency,
 } from '../health-watch.mjs';
+import { decideDelivery, DEFAULT_QUIET_SETTINGS } from '../../lib/quiet-hours.mjs';
 
 
 // Keep the shell, persistence and real detector registry intact; supply deterministic probe results
@@ -1235,4 +1236,94 @@ it('records a cardBatchSeal launch error as a probe error', async () => {
     expect(out.probeErrors.cardBatchSeal).toBe('seal launch failed');
     expect(cardBatchSeal).toHaveBeenCalledWith({ now: expect.any(Number) });
   } finally { sealTestRoot.path = null; }
+});
+
+// quietHours (card xmvc6oc): the breakthrough rule is "a daemon DOWN >= 30 min", so the alert must carry how long the
+// daemon has been silent — not how old the episode is (which is ~0 on the opening alert, i.e. always held overnight).
+describe('quietHours: a daemon-silent alert carries the silence duration, not the episode age', () => {
+  const start = 1790882705935;
+  const minute = 60_000;
+  afterEach(() => { episodeReplay.probes = null; episodeReplay.send.mockClear(); });
+
+  it('opening alert after 65 silent minutes says downForMs ~65 min, so it breaks through overnight', async () => {
+    const flags = { 'state-root': join(dir, 'state'), 'logs-dir': join(dir, 'logs'),
+      'lock-root': join(dir, 'locks'), 'self-sync-dir': join(dir, 'sync'), 'no-gh': true, 'no-diagnose': true };
+    for (const name of ['logs-dir', 'lock-root', 'self-sync-dir']) mkdirSync(flags[name], { recursive: true });
+    const probes = (now, text, over) => ({
+      prs: [], agents: [], operationRuns: [],
+      leases: [{ log: 'fix-dispatch-daemon', role: 'reconcile-fix-dispatch-daemon', pid: 4242, pidAlive: true, heartbeatAt: now }],
+      daemonLogs: [{ name: 'fix-dispatch-daemon', mtimeMs: start, sizeBytes: text.length || 100, text, bootstrap: false, defaultIntervalMs: 120_000, ...over }],
+    });
+    episodeReplay.probes = probes(start, 'fix-dispatch-daemon: tick (1) — dispatched 1, refused 0');
+    await tick({ ...flags, now: new Date(start).toISOString() });
+    episodeReplay.send.mockClear();
+    const later = start + 65 * minute;
+    episodeReplay.probes = probes(later, '');
+    const r = await tick({ ...flags, now: new Date(later).toISOString() });
+    expect(r.transitions).toContainEqual({ type: 'opened', key: 'daemon-silent::fix-dispatch-daemon' });
+    const call = episodeReplay.send.mock.calls.map(([n]) => n).find((n) => /daemon-silent/.test(n.title));
+    expect(call.emergency.kind).toBe('daemon-down');
+    expect(call.emergency.downForMs).toBeGreaterThanOrEqual(60 * minute);
+    expect(call.emergency.downForMs).toBeLessThan(70 * minute);
+  });
+});
+
+// A daemon that dies is first seen minutes after the fact — below the 30-minute breakthrough — so its opening alert
+// is held overnight. The breakthrough depends on elapsed time, so the held alert must be re-sent once the silence
+// crosses the threshold (nothing else re-alerts for hours).
+describe('quietHours: a held daemon-silent alert is re-sent as an emergency once the silence crosses the threshold', () => {
+  const start = 1790882705935;
+  const minute = 60_000;
+  afterEach(() => { episodeReplay.probes = null; episodeReplay.send.mockReset(); episodeReplay.send.mockImplementation(() => ({ ok: true })); });
+
+  it('dead daemon: opening alert held at ~3 min, re-sent once at >= 30 min, then not again', async () => {
+    const flags = { 'state-root': join(dir, 'state'), 'logs-dir': join(dir, 'logs'),
+      'lock-root': join(dir, 'locks'), 'self-sync-dir': join(dir, 'sync'), 'no-gh': true, 'no-diagnose': true };
+    for (const name of ['logs-dir', 'lock-root', 'self-sync-dir']) mkdirSync(flags[name], { recursive: true });
+    const probes = (now, text, pidAlive) => ({
+      prs: [], agents: [], operationRuns: [],
+      leases: [{ log: 'fix-dispatch-daemon', role: 'reconcile-fix-dispatch-daemon', pid: 4242, pidAlive, heartbeatAt: start }],
+      daemonLogs: [{ name: 'fix-dispatch-daemon', mtimeMs: start, sizeBytes: text.length || 100, text, bootstrap: false, defaultIntervalMs: 120_000 }],
+    });
+    const run = async (offsetMin, text, pidAlive) => {
+      const now = start + offsetMin * minute;
+      episodeReplay.probes = probes(now, text, pidAlive);
+      return tick({ ...flags, now: new Date(now).toISOString() });
+    };
+    const silentCalls = () => episodeReplay.send.mock.calls.map(([n]) => n).filter((n) => /daemon-silent/.test(n.title));
+    await run(0, 'fix-dispatch-daemon: tick (1) — dispatched 1, refused 0', true);
+    episodeReplay.send.mockReset();
+    episodeReplay.send.mockImplementation(() => ({ ok: true, suppressed: true })); // quiet hours hold everything below the threshold
+    await run(3, '', false);
+    expect(silentCalls()).toHaveLength(1);
+    expect(silentCalls()[0].emergency.downForMs).toBeLessThan(30 * minute);
+    await run(20, '', false);
+    expect(silentCalls()).toHaveLength(1); // still below the threshold: no re-send
+    episodeReplay.send.mockImplementation(() => ({ ok: true })); // delivered this time
+    await run(35, '', false);
+    expect(silentCalls()).toHaveLength(2);
+    expect(silentCalls()[1].emergency.downForMs).toBeGreaterThanOrEqual(30 * minute);
+    await run(40, '', false);
+    expect(silentCalls()).toHaveLength(2); // delivered once: not nagged every tick
+  });
+});
+
+// quietHours (card xmvc6oc): the main-red breakthrough must be wired to the health alert a red main really produces
+// (`pre-existing-red-on-main`, titled `Health: pre-existing-red-on-main — main:<sha>`), not just to a title guess.
+describe('quietHours: the main-red health smell is tagged as a main-red emergency', () => {
+  const at2am = Date.parse('2026-10-09T02:00:00-04:00');
+  const redMain = { smell: 'pre-existing-red-on-main', subject: 'main:efd88abcc', measure: { baseSha: 'efd88abcc00' } };
+
+  it('breakthroughEmergency tags the red-main smell {kind:main-red} and a silent daemon {kind:daemon-down}', () => {
+    expect(breakthroughEmergency(redMain)).toEqual({ kind: 'main-red' });
+    expect(breakthroughEmergency({ smell: 'daemon-silent', measure: { silentForMs: 45 * 60_000 } })).toEqual({ kind: 'daemon-down', downForMs: 45 * 60_000 });
+    expect(breakthroughEmergency({ smell: 'red-pr-unattended', subject: 'PR #1' })).toBeUndefined();
+  });
+
+  it('the tagged red-main alert is delivered at 02:00 ET, an untagged routine smell is held', () => {
+    const title = `Health: ${redMain.smell} — ${redMain.subject}`;
+    const tagged = { title, emergency: breakthroughEmergency(redMain) };
+    expect(decideDelivery(tagged, { now: at2am, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(true);
+    expect(decideDelivery({ title: 'Health: red-pr-unattended — PR #1' }, { now: at2am, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(false);
+  });
 });

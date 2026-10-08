@@ -60,7 +60,7 @@ export default {
       out.push({
         subject: lease.log,
         breach,
-        measure: { daemonState: lease.daemonState ?? null, hung, observedGapMin: Math.round(observedGap / MINUTE), silentForMin: silentFor == null ? null : Math.round(silentFor / MINUTE), thresholdMin: Math.round(threshold / MINUTE), pid: lease.pid, pidAlive: lease.pidAlive, heartbeatAgeMin: hbAge == null ? null : Math.round(hbAge / MINUTE), judgedOn: mem.ticksSeen > 0 ? 'last tick line' : 'last log growth', estimated: !!mem.lastTickEstimated },
+        measure: { daemonState: lease.daemonState ?? null, hung, observedGapMin: Math.round(observedGap / MINUTE), silentForMin: silentFor == null ? null : Math.round(silentFor / MINUTE), silentForMs: silentFor == null ? null : Math.max(0, silentFor), thresholdMin: Math.round(threshold / MINUTE), pid: lease.pid, pidAlive: lease.pidAlive, heartbeatAgeMin: hbAge == null ? null : Math.round(hbAge / MINUTE), judgedOn: mem.ticksSeen > 0 ? 'last tick line' : 'last log growth', estimated: !!mem.lastTickEstimated },
         summary: `${lease.log}: no ${mem.ticksSeen > 0 ? 'tick' : 'log output'} for ${fmtAge(silentFor)} (threshold ${fmtAge(threshold)}); ${state}.`,
         recommendation: !lease.pidAlive
           ? `${lease.log} is dead but its lease is still on disk — check its launchd job (\`launchctl list | grep ${lease.log}\`); the crash reason is in the last lines of its log.`
