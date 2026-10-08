@@ -85,3 +85,71 @@ describe('permissionChangeKind', () => {
     expect(permissionChangeKind('src/index.ts', '')).toBeNull();
   });
 });
+
+describe('permissionChangeKind - quoted scope values and flow mappings (PR #4446 review)', () => {
+  const hunk = (body) => `diff --git a/${WF} b/${WF}\n--- a/${WF}\n+++ b/${WF}\n@@ -1,3 +1,3 @@\n${body}\n`;
+  it.each([
+    ['double-quoted value', '+  contents: "write"'],
+    ['single-quoted value', "+  contents: 'write'"],
+    ['quoted key and value', '+  "contents": "write"'],
+    ['quoted none', "-  contents: 'read'\n+  contents: 'none'"],
+    ['one-line flow mapping', '+permissions: { contents: write }'],
+    ['quoted flow mapping', '+permissions: {"contents": "write", "issues": "read"}'],
+    ['flow mapping nested in a job line', '+  build: { permissions: { contents: write }, runs-on: x }'],
+    ['continuation line of a multi-line flow mapping', '+  { contents: write, issues: read }'],
+    ['flow entry after a comma', '+  issues: read, contents: write }'],
+    ['quoted key before a flow value', '+  "permissions": {contents: read}'],
+    ['quoted write-all', '+permissions: "write-all"'],
+    ['quoted read-all', "+permissions: 'read-all'"],
+    ['expression-valued grant', '+  contents: ${{ inputs.level }}'],  ])('%s holds', (_n, b) => expect(permissionChangeKind(WF, hunk(b))).toBe('workflow-permissions'));
+
+  it('a quoted value that is not a grant, or a quoted comment, does not hold', () => {
+    expect(permissionChangeKind(WF, hunk('+  name: "write"'))).toBeNull();
+    expect(permissionChangeKind(WF, hunk('+      - run: echo "contents: write"'))).toBeNull();
+    expect(permissionChangeKind(WF, hunk('+  # "contents": "write"'))).toBeNull();
+  });
+});
+
+describe('permissionChangeKind - entries added inside an existing multi-line sandbox list (PR #4446 review)', () => {
+  const CODE = 'scripts/lib/isolation-provider.mjs';
+  const CODEX = '.codex/config.toml';
+  const h = (body) => `diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -10,5 +10,6 @@\n${body}\n`;
+  it.each([
+    ['js array, key line is unchanged context', CODE, '   writableRoots: [\n     rootA,\n+    rootB,\n   ],'],
+    ['js array, snake_case key', CODE, '   writable_roots: [\n     "/a",\n+    "/b",\n   ],'],
+    ['js array, key then a removed entry', CODE, '   writableRoots: [\n-    rootA,\n     rootB,\n   ],'],
+    ['argv list with --add-dir as the preceding sibling', CODE, "   args: [\n     '--add-dir',\n+    dir,\n   ],"],
+    ['argv list with a changed value after --add-dir', CODE, "     '--add-dir',\n+    extraDir,"],
+    ['yaml list under an unchanged key', '.codex/sandbox.yaml', '   writable_roots:\n     - /a\n+    - /b'],
+    ['toml array under an unchanged key', CODEX, '   writable_roots = [\n     "/a",\n+    "/b",\n   ]'],
+    ['a removed bare --add-dir line is not mistaken for a "---" file header', '.codex/sandbox.yaml', '---add-dir'],
+    ['key two context lines above the change', CODE, '   writableRoots: [\n     a,\n     b,\n+    c,\n   ],'],
+  ])('%s holds', (_n, file, body) => expect(permissionChangeKind(file, h(body))).toBe('sandbox-widening'));
+
+  it('a list-entry change in a codex config whose key is outside the hunk fails closed', () => {
+    expect(permissionChangeKind(CODEX, h('     "/a",\n+    "/b",\n     "/c",'))).toBe('sandbox-widening');
+    expect(permissionChangeKind('.codex/sandbox.yaml', h('   - /a\n+  - /b'))).toBe('sandbox-widening');
+  });
+
+  it('an owner lookup never reads across a hunk boundary', () => {
+    const two = (a, b) => `diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n${a}\n@@ -40,2 +40,3 @@\n${b}\n`;
+    // hunk 1's unrelated key must not hide the out-of-reach list entry in hunk 2 (codex fails closed)
+    expect(permissionChangeKind('.codex/sandbox.yaml', two('-effort: low\n+effort: high', '   - /a\n+  - /b'))).toBe('sandbox-widening');
+    // a dangling opener at the end of hunk 1 must not adopt an unrelated edit in hunk 2
+    expect(permissionChangeKind(CODE, two('   writableRoots: [\n     a,', '   names: [\n+    b,\n   ],'))).toBeNull();
+    expect(permissionChangeKind(CODE, two('   writableRoots: [\n     a,', '+    b,'))).toBeNull();
+    // while each hunk on its own still holds
+    expect(permissionChangeKind(CODE, two('-x', '   writableRoots: [\n+    b,'))).toBe('sandbox-widening');
+  });
+
+  it('list edits that are not under a sandbox key do not hold', () => {
+    expect(permissionChangeKind(CODE, h('   names: [\n     a,\n+    b,\n   ],'))).toBeNull();
+    expect(permissionChangeKind(CODE, h('   writableRoots: [a],\n+  names: [\n+    b,\n+  ],'))).toBeNull();
+    expect(permissionChangeKind(CODE, h('   writableRoots: [\n     a,\n   ],\n+  names: [\n+    b,\n+  ],'))).toBeNull();
+    expect(permissionChangeKind(CODE, h('   // writableRoots: [\n+    b,'))).toBeNull();
+  });
+  it('tests and docs are still exempt', () => {
+    expect(permissionChangeKind('scripts/lib/__tests__/x.test.mjs', h('   writableRoots: [\n+    b,'))).toBeNull();
+    expect(permissionChangeKind('docs/x.md', h('   writableRoots: [\n+    b,'))).toBeNull();
+  });
+});
