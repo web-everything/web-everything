@@ -1,5 +1,5 @@
-import { requiresMandatoryReferral, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
-  referralKeyFinding, referralFindingKey, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable } from '../lib/jury-core.mjs';
+import { requiresMandatoryReferral, classifyReferralsByRound, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
+  referralKeyFinding, referralFindingKey, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable, openReferralHeads, readOperatorRulings } from '../lib/jury-core.mjs';
 // Card 84 — the per-seat provider directive (`review.seatProvider.<lens>`). PURE; the settings are read by the caller.
 import { seatProviderDirective } from '../lib/review-seat-provider.mjs';
 import { isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
@@ -1095,11 +1095,28 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
   // exist, so a run without any is byte-identical to before.
   let findingIdentity = [];
   try {
+    // Card xq1xbsl — an operator's ruling (#4979) lives in its own comment, not on the referral record, so it reaches the
+    // table only here, keyed by the same (head, run, key) the record's referral carries. Kept apart from `rulings` so
+    // the referral reviewer's prompt rows (latest ruling) read exactly as before. An unreadable one adds nothing: the
+    // finding then stays a referral, the safe direction.
+    let operatorRulings = [];
+    try { operatorRulings = readOperatorRulings(raw.comments ?? []).rulings; } catch { operatorRulings = []; }
     findingIdentity = findingIdentityTable(readReferralRecords(raw.comments ?? []).records)
-      .map(({ findingId, path, lens, normSummary, anchor, forms, heads }) => ({ findingId, path, lens, normSummary, anchor, forms, heads }));
+      .map(({ findingId, path, lens, normSummary, anchor, forms, heads, activeHeads, activeInstances, rulings, keys }) => ({ findingId, path, lens, normSummary, anchor, forms, heads, activeHeads, activeInstances,
+        rulings: (rulings ?? []).map(({ head, result }) => ({ head, result })),
+        operatorRulings: operatorRulings
+          .filter((o) => (keys ?? []).some((k) => k.head === o.head && k.runId === o.runId && k.key === o.key))
+          .map(({ head, result }) => ({ head, result })) }));
   } catch { findingIdentity = []; }
+  // Card xq1xbsl — the heads whose referral round never finished (a partial persistence, a crash before the attempt):
+  // the later-round rule must not set a retry's findings aside on one of those. Any doubt names every head, which
+  // turns the rule off there (the safe direction: a finding stays a referral).
+  let referralOpenHeads = [];
+  try { referralOpenHeads = openReferralHeads(raw.comments ?? []); }
+  catch { referralOpenHeads = [...new Set(findingIdentity.flatMap((e) => e.heads ?? []))]; }
   return {
     ...(findingIdentity.length ? { findingIdentity } : {}),
+    ...(referralOpenHeads.length ? { referralOpenHeads } : {}),
     hasReferralRecord: JSON.stringify(raw.comments ?? []).includes('mandatory-referrals-v1'),
     priorRounds: Number(raw?.priorRounds) || 0,
     latestFix: raw?.latestFix && typeof raw.latestFix === 'object' ? raw.latestFix : undefined,
@@ -1604,7 +1621,7 @@ export function renderDeferredAdvisorySection({ read, verdict } = {}) {
   return [
     '',
     `### Card suggestions (filed later) (${deferred.length})`,
-    `Later-round advisory findings on code the latest fix (\`${foldUntrusted(fix?.priorHead?.slice(0, 8))}..${foldUntrusted(fix?.head?.slice(0, 8))}\`) did not touch. They do not count toward \`changes\`; file them as cards instead of fixing them in this PR (#5135).`,
+    `Later-round advisory findings on code the latest fix (\`${foldUntrusted(fix?.priorHead?.slice(0, 8))}..${foldUntrusted(fix?.head?.slice(0, 8))}\`) did not touch, and advisory findings the referral round rule set aside (a later round of a head already referred, or a re-raise whose cited lines the fix changed). They do not count toward \`changes\`; file them as cards instead of fixing them in this PR (#5135).`,
     ...deferred.map(f => {
       const lens = foldUntrusted(String(f.category ?? '').split('/')[0]);
       const cite = foldUntrusted(f.file ? `${f.file}${f.line ? `:${f.line}` : ''}` : String(f.summary ?? '').slice(0, 60));
@@ -2536,10 +2553,24 @@ export function reviewPrOperation({
               + 'juror that may have reported blockers. Re-run the review; do not record a verdict on this run.',
             );
           }
-          for (const original of answer.findings ?? []) {
-            if (requiresMandatoryReferral(original)) referrals.push({ seat: seat.step, original });
-          }
-          const scoped = scopeFindingsToCitedFiles(answer.findings, { scope: citationScope });
+          // Card xq1xbsl — the later-round rule (#3999) applies to referrals too: a finding already referred on this head
+          // (matched by finding identity, #4233) is not referred twice; an ADVISORY seat's finding first raised in a later
+          // round of an unchanged head (whose referral round finished), or re-raised after the fixer changed code at the
+          // cited line, is a card suggestion. A gate lens is never set aside by the round rule (PR #4441 review), and a
+          // block-ruled re-raise stays a referral unless the fix is demonstrated. What is set aside leaves the verdict
+          // basis, or the PR would bounce on a finding it already holds a ruling for.
+          const roundScoped = classifyReferralsByRound(
+            (answer.findings ?? []).filter(requiresMandatoryReferral).map((original) => ({ seat: seat.step, original })),
+            { identity: read.findingIdentity, head: read.netBasis?.rev ?? null, latestFix: read.latestFix,
+              lens: seat.lens, openHeads: read.referralOpenHeads },
+          );
+          referrals.push(...roundScoped.kept);
+          const setAside = new Set([...roundScoped.covered.map((c) => c.original), ...roundScoped.demoted.map((d) => d.candidate.original)]);
+          deferredAdvisory.push(...roundScoped.demoted.map(({ candidate, reason }) => ({
+            ...candidate.original, deferred: reason, category: candidate.original.category ? `${seat.lens}/${candidate.original.category}` : seat.lens,
+          })));
+          const seatFindings = setAside.size ? (answer.findings ?? []).filter((f) => !setAside.has(f)) : answer.findings;
+          const scoped = scopeFindingsToCitedFiles(seatFindings, { scope: citationScope });
           const raw = scoped.findings;
           const classified = classifyLaterRoundAdvisory(scoped.admitted, {
             lens: seat.lens, scope: advisoryScope.scope, latestFix: read.latestFix,

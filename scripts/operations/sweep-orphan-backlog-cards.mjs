@@ -89,7 +89,7 @@ import { fileURLToPath } from 'node:url';
 import { extractSubmitResult } from './open-pr.mjs';
 import { parseRunJsonTail } from './land-prevention-card.mjs';
 import { readField } from '../backlog/frontmatter.mjs';
-import { ACCEPTANCE_HEADING_RE } from '../backlog/task-agreement.mjs';
+import { ACCEPTANCE_HEADING_RE, findLevel2Headings } from '../backlog/task-agreement.mjs';
 import { NON_DISPATCHABLE_KINDS } from './file-item.mjs';
 import {
   readQueueFile, writeQueueFile, addToQueue, queueHas, resolveQueuePath,
@@ -147,10 +147,11 @@ export function parseOrphanCard(rel, content) {
   const kind = readField(content, 'kind') ?? '';
   const titleRef = TITLE_SOURCE_RE.exec(content)?.[1] ?? null;
   const sourceRef = IDEMPOTENCY_KEY_RE.exec(content)?.[1] ?? titleRef;
-  const stripped = String(content).replace(/^---\n[\s\S]*?\n---\n/, '');
-  // Cut at the acceptance section, found by the shared task-agreement reader's heading rule (#5399 S7).
-  const cut = [...stripped.matchAll(/\n##[ \t]+(.*)/g)].find((m) => ACCEPTANCE_HEADING_RE.test(m[1].trim()));
-  const body = cut ? stripped.slice(0, cut.index) : stripped;
+  const unframed = String(content).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
+  // Cut at the first acceptance heading outside fences and comments, in every spelling the reader accepts (any case,
+  // `Acceptance criteria`, `Done when:`), with LF or CRLF line endings.
+  const acceptanceAt = findLevel2Headings(unframed).find((h) => ACCEPTANCE_HEADING_RE.test(h.title));
+  const body = acceptanceAt ? unframed.slice(0, acceptanceAt.index) : unframed;
   const guards = body.match(GUARD_LINE_RE) ?? [];
   const digestBody = guards.length ? guards.map((g) => g.trim()).join('\n') : body.trim();
   const digestHash = createHash('sha256').update(digestBody).digest('hex');

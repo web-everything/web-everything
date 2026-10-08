@@ -258,3 +258,287 @@ describe('mergeOverlayRef / dryRunOverlay — REAL git (temp repos), proving the
     expect(git(d, 'ls-files')).not.toContain('overlay.txt'); // not merged
   });
 });
+
+// ── xkhtg2a — the dispatch smoke (incident 2026-10-08: lane/worker-contract-s3b's detached `claude -p` launch had no
+// `--permission-mode`, every fix/ci-heal worker died at step 0 on an approval prompt, and the load's smoke passed
+// because it never launched a real worker). These tests pin the gate's decisions; the real-worker launch itself is
+// proven live (see the PR), never from a unit test.
+import {
+  overlaySafetySettings, matchDispatchPaths, overlayDispatchFiles, judgeDispatchSmoke, withDispatchSmoke,
+  DISPATCH_PATH_DEFAULTS,
+} from '../daemon-load-overlay.mjs';
+
+const quietLog = { error: () => {}, log: () => {} };
+
+describe('overlaySafetySettings — defaults < settings file < env', () => {
+  it('defaults: smoke on, the derived dispatch-path set, no-PR warns', () => {
+    const s = overlaySafetySettings({}, { readSettings: () => null });
+    expect(s.dispatchSmoke).toBe('on');
+    expect(s.noPr).toBe('warn');
+    expect(s.dispatchPaths).toEqual(DISPATCH_PATH_DEFAULTS);
+    expect(s.smokeKind).toBe('ci-heal');
+    expect(s.smokeTimeoutMs).toBeGreaterThanOrEqual(60_000);
+  });
+
+  it('the settings file overrides the defaults, env overrides the file', () => {
+    const readSettings = () => ({ overlaySafety: { noPr: 'refuse', dispatchSmoke: 'off', dispatchPaths: ['a/**'] } });
+    expect(overlaySafetySettings({}, { readSettings })).toMatchObject({ noPr: 'refuse', dispatchSmoke: 'off', dispatchPaths: ['a/**'] });
+    const env = { WE_OVERLAY_NO_PR: 'warn', WE_OVERLAY_DISPATCH_SMOKE: 'on', WE_OVERLAY_DISPATCH_PATHS: 'x/*.mjs, y/**' };
+    expect(overlaySafetySettings(env, { readSettings })).toMatchObject({ noPr: 'warn', dispatchSmoke: 'on', dispatchPaths: ['x/*.mjs', 'y/**'] });
+  });
+
+  it('an invalid value falls back to the default, never to "off"', () => {
+    const s = overlaySafetySettings({ WE_OVERLAY_DISPATCH_SMOKE: 'maybe', WE_OVERLAY_NO_PR: 'ignore' }, { readSettings: () => null });
+    expect(s.dispatchSmoke).toBe('on');
+    expect(s.noPr).toBe('warn');
+  });
+});
+
+describe('matchDispatchPaths — which overlay files are on the dispatch path', () => {
+  it('the defaults catch the incident file and the worker launch files, not their tests or unrelated files', () => {
+    const files = [
+      'scripts/operations/worker-wrapper-launch.mjs',
+      'scripts/operations/dispatch-lane-io.mjs',
+      'scripts/conveyor/reconcile-fix-dispatch.mjs',
+      'scripts/operations/__tests__/worker-wrapper-launch.test.mjs',
+      'docs/agent/backlog-workflow.md',
+      'scripts/lib/daemon-overlays.mjs',
+    ];
+    expect(matchDispatchPaths(files, DISPATCH_PATH_DEFAULTS)).toEqual([
+      'scripts/operations/worker-wrapper-launch.mjs',
+      'scripts/operations/dispatch-lane-io.mjs',
+      'scripts/conveyor/reconcile-fix-dispatch.mjs',
+    ]);
+  });
+
+  it('`*` stops at a slash, `**` does not', () => {
+    expect(matchDispatchPaths(['a/b.mjs', 'a/c/d.mjs'], ['a/*.mjs'])).toEqual(['a/b.mjs']);
+    expect(matchDispatchPaths(['a/b.mjs', 'a/c/d.mjs'], ['a/**'])).toEqual(['a/b.mjs', 'a/c/d.mjs']);
+  });
+});
+
+describe('overlayDispatchFiles — is the overlay in this tree, and does it touch the dispatch path (injected git)', () => {
+  const fakeGit = (map) => vi.fn((args) => {
+    const key = args.join(' ');
+    for (const [k, v] of Object.entries(map)) if (key.startsWith(k)) return v;
+    return { status: 1, stdout: '', stderr: 'unexpected' };
+  });
+
+  it('an overlay in the tree that touches a dispatch file is required', () => {
+    const run = fakeGit({
+      'rev-parse --verify --quiet origin/lane/x^{commit}': { status: 0, stdout: 'tip\n' },
+      'merge-base --is-ancestor tip HEAD': { status: 0, stdout: '' },
+      'merge-base origin/main tip': { status: 0, stdout: 'base\n' },
+      'diff --name-only base tip': { status: 0, stdout: 'scripts/operations/worker-wrapper-launch.mjs\nREADME.md\n' },
+    });
+    const r = overlayDispatchFiles({ tree: '/t', ref: 'lane/x', patterns: DISPATCH_PATH_DEFAULTS, run });
+    expect(r).toMatchObject({ inTree: true, required: true, matched: ['scripts/operations/worker-wrapper-launch.mjs'], tip: 'tip' });
+  });
+
+  it('an overlay that touches no dispatch file is not required', () => {
+    const run = fakeGit({
+      'rev-parse --verify --quiet origin/lane/x^{commit}': { status: 0, stdout: 'tip\n' },
+      'merge-base --is-ancestor tip HEAD': { status: 0, stdout: '' },
+      'merge-base origin/main tip': { status: 0, stdout: 'base\n' },
+      'diff --name-only base tip': { status: 0, stdout: 'README.md\n' },
+    });
+    expect(overlayDispatchFiles({ tree: '/t', ref: 'lane/x', patterns: DISPATCH_PATH_DEFAULTS, run })).toMatchObject({ inTree: true, required: false });
+  });
+
+  it('an overlay NOT in this tree (a fallback build without it) is never smoked here', () => {
+    const run = fakeGit({
+      'rev-parse --verify --quiet origin/lane/x^{commit}': { status: 0, stdout: 'tip\n' },
+      'merge-base --is-ancestor tip HEAD': { status: 1, stdout: '' },
+    });
+    expect(overlayDispatchFiles({ tree: '/t', ref: 'lane/x', patterns: DISPATCH_PATH_DEFAULTS, run })).toMatchObject({ inTree: false, required: false });
+  });
+
+  it('fails CLOSED: an unreadable diff of an in-tree overlay is required', () => {
+    const run = fakeGit({
+      'rev-parse --verify --quiet origin/lane/x^{commit}': { status: 0, stdout: 'tip\n' },
+      'merge-base --is-ancestor tip HEAD': { status: 0, stdout: '' },
+      'merge-base origin/main tip': { status: 1, stdout: '' },
+    });
+    expect(overlayDispatchFiles({ tree: '/t', ref: 'lane/x', patterns: DISPATCH_PATH_DEFAULTS, run })).toMatchObject({ inTree: true, required: true, files: null, reason: 'diff-unknown' });
+  });
+});
+
+describe('judgeDispatchSmoke — the pass/fail rule for one real worker', () => {
+  const done = { status: 'done', outcome: 'not-applicable', result: { blocker: null } };
+
+  it('passes when the marker carries the nonce, the completion record is done, and nothing was denied', () => {
+    expect(judgeDispatchSmoke({ nonce: 'n1', marker: 'n1', record: done, denials: [] })).toMatchObject({ ok: true, reason: 'passed' });
+  });
+
+  it('THE INCIDENT: the worker ended at step 0 on an approval prompt — record done, no marker, a denial in the transcript', () => {
+    const record = { status: 'done', result: { outcome: 'blocked', blocker: { kind: 'permission-wall', detail: 'gh pr view' } } };
+    const r = judgeDispatchSmoke({ nonce: 'n1', marker: null, record, denials: ['This command requires approval'] });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('commands-denied');
+  });
+
+  it('a done record without the marker fails even with no transcript to read', () => {
+    expect(judgeDispatchSmoke({ nonce: 'n1', marker: null, record: done, denials: [] })).toMatchObject({ ok: false, reason: 'no-commands-ran' });
+  });
+
+  it('a permission-wall blocker on the record fails even when the marker exists', () => {
+    const record = { status: 'done', result: { blocker: { kind: 'permission-wall' } } };
+    expect(judgeDispatchSmoke({ nonce: 'n1', marker: 'n1', record, denials: [] })).toMatchObject({ ok: false, reason: 'commands-denied' });
+  });
+
+  it('no completion record (yet) is not a pass; at the deadline it is a timeout', () => {
+    expect(judgeDispatchSmoke({ nonce: 'n1', marker: 'n1', record: null, denials: [] })).toMatchObject({ ok: false, pending: true });
+    expect(judgeDispatchSmoke({ nonce: 'n1', marker: 'n1', record: null, denials: [], timedOut: true })).toMatchObject({ ok: false, reason: 'timeout' });
+  });
+
+  it('a wrong nonce (a stale marker from another run) is not a pass', () => {
+    expect(judgeDispatchSmoke({ nonce: 'n1', marker: 'n0', record: done, denials: [] })).toMatchObject({ ok: false, reason: 'no-commands-ran' });
+  });
+});
+
+describe('withDispatchSmoke — the candidate smoke runs ONE real worker when the overlay touches the dispatch path', () => {
+  const settings = overlaySafetySettings({}, { readSettings: () => null });
+  const pass = { verdict: 'pass', smoke: { results: [] } };
+
+  it('base smoke passes + overlay on the dispatch path → the dispatch smoke runs against the CANDIDATE tree', async () => {
+    const ctl = {};
+    const dispatchSmoke = vi.fn(async () => ({ ok: true, reason: 'passed' }));
+    const runSmoke = withDispatchSmoke({
+      baseSmoke: async () => pass, ref: 'lane/x', settings, dispatchSmoke, ctl, log: quietLog,
+      inspect: () => ({ inTree: true, required: true, matched: ['scripts/operations/worker-wrapper-launch.mjs'] }),
+    });
+    const r = await runSmoke({ root: '/cand', env: { A: '1' }, changedFiles: null });
+    expect(r.verdict).toBe('pass');
+    expect(dispatchSmoke).toHaveBeenCalledWith(expect.objectContaining({ tree: '/cand', env: { A: '1' } }));
+    expect(ctl).toMatchObject({ ran: true, phase: 'candidate', result: { ok: true } });
+  });
+
+  it('a FAILED dispatch smoke throws, so the rebuild holds on the last-good tree and never adopts — or drops other overlays', async () => {
+    const ctl = {};
+    const runSmoke = withDispatchSmoke({
+      baseSmoke: async () => pass, ref: 'lane/x', settings, ctl, log: quietLog,
+      dispatchSmoke: async () => ({ ok: false, reason: 'commands-denied', detail: 'requires approval' }),
+      inspect: () => ({ inTree: true, required: true, matched: ['x'] }),
+    });
+    await expect(runSmoke({ root: '/cand', env: {} })).rejects.toThrow(/dispatch-smoke-failed/);
+    expect(ctl).toMatchObject({ ran: true, result: { ok: false, reason: 'commands-denied' } });
+  });
+
+  it('a failing BASE smoke is returned untouched and no worker is launched', async () => {
+    const dispatchSmoke = vi.fn();
+    const fail = { verdict: 'code', smoke: { results: [{ name: 'x', ok: false }] } };
+    const runSmoke = withDispatchSmoke({
+      baseSmoke: async () => fail, ref: 'lane/x', settings, dispatchSmoke, ctl: {}, log: quietLog,
+      inspect: () => ({ inTree: true, required: true, matched: ['x'] }),
+    });
+    expect(await runSmoke({ root: '/cand', env: {} })).toBe(fail);
+    expect(dispatchSmoke).not.toHaveBeenCalled();
+  });
+
+  it('an overlay off the dispatch path (or not in this candidate) launches nothing', async () => {
+    const dispatchSmoke = vi.fn();
+    const runSmoke = withDispatchSmoke({
+      baseSmoke: async () => pass, ref: 'lane/x', settings, dispatchSmoke, ctl: {}, log: quietLog,
+      inspect: () => ({ inTree: true, required: false, matched: [] }),
+    });
+    expect((await runSmoke({ root: '/cand', env: {} })).verdict).toBe('pass');
+    expect(dispatchSmoke).not.toHaveBeenCalled();
+  });
+});
+
+describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this overlay, the no-PR policy', () => {
+  const settingsOn = overlaySafetySettings({}, { readSettings: () => null });
+
+  it('passes a dispatch-smoke-wrapped runSmoke into the gated rebuild', async () => {
+    const rebuild = vi.fn(async () => ({ moved: false, reason: 'up-to-date' }));
+    await runDaemonLoadOverlay({
+      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild, settings: settingsOn, log: quietLog,
+      inspect: () => ({ inTree: false, required: false }),
+    });
+    expect(typeof rebuild.mock.calls[0][0].runSmoke).toBe('function');
+  });
+
+  it('a candidate dispatch-smoke failure removes ONLY this overlay, rebuilds, and reports why (exit-worthy)', async () => {
+    const removeOverlayFn = vi.fn(() => ({ removed: true, list: [{ ref: 'lane/other' }] }));
+    const appendEventFn = vi.fn();
+    let calls = 0;
+    const rebuild = vi.fn(async ({ runSmoke }) => {
+      calls += 1;
+      if (calls === 1) {
+        try { await runSmoke({ root: '/cand', env: {} }); } catch (e) { return { moved: false, reason: 'smoke-threw', alerts: [{ kind: 'smoke-threw', detail: String(e.message) }] }; }
+      }
+      return { moved: false, reason: 'up-to-date' };
+    });
+    const r = await runDaemonLoadOverlay({
+      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn, settings: settingsOn, log: quietLog,
+      baseSmoke: async () => ({ verdict: 'pass' }),
+      inspect: () => ({ inTree: true, required: true, matched: ['scripts/operations/worker-wrapper-launch.mjs'] }),
+      dispatchSmoke: async () => ({ ok: false, reason: 'commands-denied', detail: 'This command requires approval' }),
+    });
+    expect(removeOverlayFn).toHaveBeenCalledWith('/c', 'lane/x', expect.objectContaining({ why: expect.stringMatching(/dispatch-smoke-failed/) }));
+    expect(removeOverlayFn).toHaveBeenCalledTimes(1);
+    expect(appendEventFn).toHaveBeenCalledWith('/c', expect.objectContaining({ kind: 'removed', ref: 'lane/x' }), expect.anything());
+    expect(rebuild).toHaveBeenCalledTimes(2);
+    expect(r).toMatchObject({ adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed', dispatchSmoke: { phase: 'candidate', result: { reason: 'commands-denied' } } });
+  });
+
+  it('adopted WITHOUT the candidate dispatch smoke (a cached tree, or a daemon tick adopted it first) → smoke the live clone, roll back on failure', async () => {
+    const removeOverlayFn = vi.fn(() => ({ removed: true, list: [] }));
+    const rebuild = vi.fn()
+      .mockResolvedValueOnce({ moved: true, adopted: true, head: 'h1' })
+      .mockResolvedValueOnce({ moved: true, adopted: true, head: 'h0' });
+    const dispatchSmoke = vi.fn(async () => ({ ok: false, reason: 'no-commands-ran' }));
+    const r = await runDaemonLoadOverlay({
+      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn: vi.fn(), settings: settingsOn, log: quietLog,
+      inspect: () => ({ inTree: true, required: true, matched: ['x'] }), dispatchSmoke,
+    });
+    expect(dispatchSmoke).toHaveBeenCalledWith(expect.objectContaining({ tree: '/c' }));
+    expect(removeOverlayFn).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ rolledBack: true, reason: 'dispatch-smoke-failed', head: 'h0', dispatchSmoke: { phase: 'post-adopt' } });
+  });
+
+  it('a passing dispatch smoke keeps the overlay and reports the pass', async () => {
+    const removeOverlayFn = vi.fn();
+    const rebuild = vi.fn(async ({ runSmoke }) => { await runSmoke({ root: '/cand', env: {} }); return { moved: true, adopted: true, head: 'h1' }; });
+    const r = await runDaemonLoadOverlay({
+      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, settings: settingsOn, log: quietLog,
+      baseSmoke: async () => ({ verdict: 'pass' }),
+      inspect: () => ({ inTree: true, required: true, matched: ['x'] }),
+      dispatchSmoke: async () => ({ ok: true, reason: 'passed' }),
+    });
+    expect(removeOverlayFn).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ adopted: true, dispatchSmoke: { ran: true, phase: 'candidate', result: { ok: true } } });
+  });
+
+  it('no PR + noPr=warn → warns loudly and still loads', async () => {
+    const errors = [];
+    const addOverlayFn = vi.fn();
+    const r = await runDaemonLoadOverlay({
+      clone: '/c', ref: 'lane/x', pr: null, addOverlayFn, rebuild: async () => ({ moved: false, reason: 'up-to-date' }),
+      settings: settingsOn, log: { error: (m) => errors.push(m) }, inspect: () => ({ inTree: false, required: false }),
+    });
+    expect(addOverlayFn).toHaveBeenCalled();
+    expect(errors.join('\n')).toMatch(/NO PR/);
+    expect(r.warnings).toContain('no-pr');
+  });
+
+  it('no PR + noPr=refuse → refuses before registering anything', async () => {
+    const addOverlayFn = vi.fn();
+    const rebuild = vi.fn();
+    const r = await runDaemonLoadOverlay({
+      clone: '/c', ref: 'lane/x', pr: null, addOverlayFn, rebuild, settings: { ...settingsOn, noPr: 'refuse' }, log: quietLog,
+    });
+    expect(addOverlayFn).not.toHaveBeenCalled();
+    expect(rebuild).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ registered: false, refused: true, reason: 'no-pr' });
+  });
+
+  it('dispatchSmoke=off → the plain rebuild smoke, no wrapper', async () => {
+    const rebuild = vi.fn(async () => ({ moved: false, reason: 'up-to-date' }));
+    await runDaemonLoadOverlay({
+      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild, settings: { ...settingsOn, dispatchSmoke: 'off' }, log: quietLog,
+      baseSmoke: 'BASE',
+    });
+    expect(rebuild.mock.calls[0][0].runSmoke).toBe('BASE');
+  });
+});

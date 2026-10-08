@@ -57,20 +57,68 @@ export function renderTaskAgreementSkeleton() {
   return `${ACCEPTANCE_HEADING}\n\n- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.\n\n${NON_GOALS_HEADING}\n\n- [N1] TODO: what this item deliberately does not do — or \`n/a: <why>\` when nothing is excluded.\n`;
 }
 
-/** Read sections outside fences, then normalize only the first selected section of each kind. */
+/** Whether an HTML comment is still open at the END of `line`, given whether one was open at its start. Scanned by
+ *  state, not by regex (a comment may span lines — CodeQL js/bad-tag-filter), and shared by both passes so a
+ *  heading hidden in a comment can never be read as a section in one pass and skipped in the other.
+ *  A comment OPENS only where a line starts with `<!--` (a CommonMark HTML block), so a `<!--` quoted in prose or
+ *  in backticks never swallows the rest of the card; once open it closes at the first `-->`. `<!-->` is an empty
+ *  comment, already closed. */
+function commentOpenAfter(line, open) {
+  if (open) return !line.includes('-->');
+  const start = line.trimStart();
+  return start.startsWith('<!--') && !start.includes('-->', 2);
+}
+
+/** Every level-2 heading OUTSIDE code fences and HTML comments, in order, as `{ title, index, end }` — `index` is
+ *  the offset of the heading line and `end` the offset just past it (before its newline). One scan for the gates
+ *  that cut a card at its acceptance section (codex-worker, the orphan sweep), so a `## Acceptance` quoted in a
+ *  fenced example or a commented-out draft is not mistaken for the real one. Line endings may be LF or CRLF. */
+export function findLevel2Headings(text) {
+  const found = [];
+  let fence = null, inComment = false, at = 0;
+  const source = typeof text === 'string' ? text : '';
+  while (at <= source.length) {
+    const nl = source.indexOf('\n', at);
+    const lineEnd = nl === -1 ? source.length : nl;
+    const line = source.slice(at, lineEnd).replace(/\r$/, '');
+    if (inComment) inComment = commentOpenAfter(line, true);
+    else {
+      const fm = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
+      if (fence) {
+        if (fm && fm[1][0] === fence[0] && fm[1].length >= fence.length && !fm[2].trim()) fence = null;
+      } else if (fm) fence = fm[1];
+      else {
+        inComment = commentOpenAfter(line, false);
+        const heading = /^##[ \t]+(.*)$/.exec(line);
+        if (heading) found.push({ title: heading[1].trim(), index: at, end: at + line.length });
+      }
+    }
+    if (nl === -1) break;
+    at = nl + 1;
+  }
+  return found;
+}
+
+/** Leading whitespace width of a line, a tab counting as four columns. */
+const indentOf = (line) => /^[ \t]*/.exec(line)[0].replace(/\t/g, '    ').length;
+
+/** Read sections outside fences and comments, then normalize only the first selected section of each kind. */
 export function readTaskAgreement(body) {
   const result = { acceptance: [], nonGoals: [], legacy: false, draft: false, problems: [] };
   const problem = (code, section, detail) => result.problems.push({ code, section, detail });
   const text = (typeof body === 'string' ? body : '').replace(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, '');
   const sections = { canonical: [], legacy: [], nonGoals: [] };
-  let current = null, fence = null;
+  let current = null, fence = null, inComment = false;
   for (const line of text.split(/\r?\n/)) {
+    // A line inside a comment is never a fence or a heading; the section keeps it so pass 2 skips it too.
+    if (inComment) { inComment = commentOpenAfter(line, true); current?.push(line); continue; }
     const fm = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
     if (fence) {
       if (fm && fm[1][0] === fence[0] && fm[1].length >= fence.length && !fm[2].trim()) fence = null;
       continue;
     }
     if (fm) { fence = fm[1]; current?.push(''); continue; }
+    inComment = commentOpenAfter(line, false);
     const heading = /^(#{1,2})[ \t]+(.*)$/.exec(line);
     if (heading) {
       current = null;
@@ -86,6 +134,7 @@ export function readTaskAgreement(body) {
     if (current && line.trim() === AGREEMENT_DRAFT_MARKER) result.draft = true;
     current?.push(line);
   }
+  if (inComment) problem('unterminated-comment', 'agreement', 'An HTML comment is never closed, so everything after it was skipped.');
   result.legacy = !sections.canonical.length && !!sections.legacy.length;
   for (const [section, groups, output, prefix] of [
     ['acceptance', [...sections.canonical, ...sections.legacy], 'acceptance', 'A'],
@@ -101,21 +150,26 @@ export function readTaskAgreement(body) {
     };
     for (const line of groups[0]) {
       const trimmed = line.trim();
-      // HTML comments are skipped by state, not by regex: a comment may span lines (CodeQL js/bad-tag-filter).
-      if (inComment) { if (trimmed.includes('-->')) inComment = false; continue; }
-      if (trimmed.startsWith('<!--')) {
-        if (!trimmed.includes('-->', 4)) inComment = true;
-        if (inComment || trimmed.endsWith('-->')) continue;
-      }
+      // HTML comments are skipped by state (see commentOpenAfter): pass 1 already kept their headings out of sections.
+      if (inComment) { inComment = commentOpenAfter(line, true); continue; }
+      const open = commentOpenAfter(line, false);
+      if (trimmed.startsWith('<!--') && (open || trimmed.endsWith('-->'))) { inComment = open; continue; }
+      inComment = open;
       if (/^Hint:/.test(trimmed)) continue;
-      if (!trimmed || /^#{3,6}[ \t]+/.test(line)) { active = null; flushParagraph(); continue; }
-      const item = /^ {0,3}(?:[-*+]|\d+[.)])[ \t]+(?:\[([AN]\d+)\][ \t]*)?(.*)$/i.exec(line);
+      // A blank line keeps the item open: a loose list continues under it. A sub-heading closes it.
+      if (!trimmed) { flushParagraph(); continue; }
+      if (/^#{3,6}[ \t]+/.test(line)) { active = null; flushParagraph(); continue; }
+      const indent = indentOf(line);
+      // Anything indented two or more columns past the open item's marker belongs to that item — a wrapped line or
+      // a nested bullet alike, at any depth — never a new item of its own.
+      // A nested bullet that carries its own `[A2]` / `[N2]` id stays a separate, citable item.
+      const numbered = /^[ \t]*(?:[-*+]|\d+[.)])[ \t]+\[[AN]\d+\]/i.test(line);
+      if (active && indent >= active.indent + 2 && !numbered) { active.text += ` ${trimmed}`; continue; }
+      const item = (indent <= 3 || numbered) && /^[ \t]*(?:[-*+]|\d+[.)])[ \t]+(?:\[([AN]\d+)\][ \t]*)?(.*)$/i.exec(line);
       if (item) {
         flushParagraph();
-        active = { id: item[1]?.toUpperCase() ?? null, text: item[2].trim() };
+        active = { id: item[1]?.toUpperCase() ?? null, text: item[2].trim(), indent };
         items.push(active);
-      } else if (active && /^ {2,}/.test(line) && !/^\s*(?:[-*+]|\d+[.)])[ \t]+/.test(line)) {
-        active.text += ` ${trimmed}`;
       } else {
         active = null;
         paragraph.push(trimmed);

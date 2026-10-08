@@ -43,7 +43,7 @@
  *
  * USAGE:
  *   node scripts/daemon-overlay.mjs add    --clone=<path> --ref=<branch> [--pr=N] [--pinned|--unpinned] [--reason=..] [--by=..] [--json]
- *                                          [--check] [--allow-conflict --reason=..]
+ *                                          [--check] [--allow-conflict --reason=..] [--allow-no-pr --reason=..]
  *   node scripts/daemon-overlay.mjs remove --clone=<path> --ref=<branch> [--reason=..] [--by=..] [--json]
  *   node scripts/daemon-overlay.mjs list   --clone=<path> [--json]
  *   node scripts/daemon-overlay.mjs approve-edge --clone=<path> --ref=<branch> --sha=<40-hex> [--by=..] [--reason=..] [--json]
@@ -59,6 +59,10 @@
  * missing `--ref`, non-integer `--pr`); 1 on a fatal error (e.g. a corrupt overlay state file — `addOverlay`/
  * `removeOverlay` refuse to overwrite one, or the conflict guard below could not itself determine safety); 0
  * otherwise — including a `remove` of a ref that was never present, which is not a usage error.
+ *
+ * THE NO-PR WARNING (xkhtg2a, incident 2026-10-08 — overlays without review or a merge link).
+ * Adding without --pr warns loudly; overlaySafety.noPr=refuse (or WE_OVERLAY_NO_PR=refuse) refuses with exit 3
+ * before the conflict guard or its lock. Override with --allow-no-pr --reason=<why>; --check warns too.
  *
  * THE OVERLAY-CONFLICT GUARD (epic #3383/#4075, live incident 2026-09-27: `lane/promote-stale-green`/#2826 was
  * registered while KNOWINGLY conflicting with `lane/fix-procedure`/#2821 in `review-status-tag.mjs` — nothing
@@ -87,6 +91,7 @@ import {
   addOverlay, removeOverlay, readOverlayState, appendOverlayEvent, overlayFilePath, recordEdgeResolution,
 } from './lib/daemon-overlays.mjs';
 import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
+import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
 import { workspaceFor } from './lib/lane-pool-paths.mjs';
 import { edgeEnabled, registerPr } from './lib/daemon-edge.mjs';
@@ -298,6 +303,26 @@ async function main() {
       process.exitCode = 1;
     }
   } else if (cmd === 'add') {
+    const allowNoPr = !!flags['allow-no-pr'];
+    if (allowNoPr && !reason?.trim()) {
+      return fail('--allow-no-pr requires --reason=<why>');
+    }
+    const { noPr } = overlaySafetySettings(process.env);
+    if (pr == null) {
+      const refused = noPr === 'refuse' && !allowNoPr;
+      if (!refused || flags.check) {
+        process.stderr.write(`daemon-overlay: WARNING — ${flags.ref} is being added with NO PR. Nothing reviewed this code and nothing ties it to a merge.\n`
+          + `  Pass --pr=<N>. (overlaySafety.noPr=${noPr}; set WE_OVERLAY_NO_PR=refuse or overlaySafety.noPr=refuse to block this.)\n`);
+      }
+      if (refused) {
+        process.stderr.write(`daemon-overlay: REFUSED — ${flags.ref} has NO PR. Pass --pr=<N> or --allow-no-pr --reason=<why>.\n`);
+        if (flags.check && asJson) {
+          process.stdout.write(`${JSON.stringify({ check: { ok: false, reason: 'no-pr' }, wouldRegister: false })}\n`);
+        }
+        process.exitCode = 3;
+        return;
+      }
+    }
     // THE CONFLICT GUARD (epic #3383/#4075 — live incident: `lane/promote-stale-green`/#2826 was registered
     // while KNOWINGLY conflicting with `lane/fix-procedure`/#2821 in `review-status-tag.mjs`; nothing refused
     // it, so the next rebuild silently DROPPED #2826 and its fix never went live). Read-only (see
@@ -381,6 +406,7 @@ async function main() {
       }, { env });
       appendOverlayEvent(root, {
         kind: 'added', ref: flags.ref, pr, by, reason, ...(pinned !== undefined ? { pinned } : {}),
+        ...(pr == null ? { noPr: true } : {}),
         ...(!check.clean ? { conflictOverride: { files: check.files, conflicting: check.conflicting } } : {}),
       }, { env });
       return { list, check };

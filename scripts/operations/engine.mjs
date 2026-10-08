@@ -472,6 +472,43 @@ export function advance(run, { registry = defaultRegistry, resume = null } = {})
 }
 
 /**
+ * REWIND A RUN TO A NAMED STEP, KEEPING EVERYTHING BEFORE IT. PURE.
+ *
+ * The one operation a "resume the paused review" needs (card xq1xbsl): a review that parked on mandatory referrals
+ * has already paid for its panel; when the operator rules, the run goes back to the step that reads the rulings,
+ * not to the start. Findings, effects, timings and the verdict of that step and every later step are dropped, so they
+ * are produced again from the (unchanged) earlier findings. `resumedAt` is stamped so a reader of the run can tell
+ * the resume from the original pass.
+ *
+ * Refuses a step the declaration does not have, or a run whose cursor has not reached it (nothing to rewind).
+ * @param {object} run
+ * @param {{registry?: object, step: string, at?: string}} o
+ * @returns {object} a new run record at `step`, not suspended.
+ */
+export function rewindRunToStep(run, { registry = defaultRegistry, step, at = null } = {}) {
+  assertRunRecord(run, 'run record passed to rewindRunToStep');
+  const declaration = declarationFor(run, registry);
+  const target = declaration.steps.find((s) => s.name === step);
+  if (!target) throw new Error(`operations: \`${declaration.name}\` has no step \`${step}\` to rewind run ${run.id} to.`);
+  const index = target.index;
+  const drop = new Set(declaration.steps.filter((s) => s.index >= index).map((s) => s.name));
+  if (run.cursor < index && !(run.pending && run.pending.stepIndex >= index)) {
+    throw new Error(`operations: run ${run.id} has not reached \`${step}\` (cursor ${run.cursor}); nothing to rewind.`);
+  }
+  const findings = Object.fromEntries(Object.entries(run.findings ?? {}).filter(([name]) => !drop.has(name)));
+  return {
+    ...run,
+    cursor: index,
+    pending: null,
+    findings,
+    verdict: null,
+    effects: (run.effects ?? []).filter((e) => e.stepIndex < index),
+    stepTimings: (run.stepTimings ?? []).filter((t) => t.stepIndex < index),
+    ...(at ? { resumedAt: at } : {}),
+  };
+}
+
+/**
  * Convenience for the deterministic stretch of a run: keep calling {@link advance} while it keeps making
  * progress, and stop the moment it suspends or completes. Still performs no io — it just saves an adapter
  * from writing the same three-line loop.

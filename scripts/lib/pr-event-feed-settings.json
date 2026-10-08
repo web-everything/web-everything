@@ -1,0 +1,1 @@
+{ "prEventFeed": { "drain": { "mode": "shadow", "pollEveryMs": 5000, "healthyIntervalSec": 300 } } }
