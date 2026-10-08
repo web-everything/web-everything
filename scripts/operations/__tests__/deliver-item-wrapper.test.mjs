@@ -1678,6 +1678,10 @@ describe('runGateWithOneRetry commits the build turn itself (#3565 — before th
     const result = await runGateWithOneRetry({ lane: 3, item: '3371', sessionSlug: 'conveyor-3371', provider }, { run, commitTurn, readReport: () => staleFirstTurn });
     expect(result.status).toBe('gate-blocked');
     expect(result.reason).toMatch(/gate itself is broken/);
+    // an envelope that holds no usable result (unparseable) never falls back to that stale legacy report
+    const unusable = { name: 'claude-restricted', spawn: vi.fn(async () => ({ envelope: { v: 2, status: 'done', result: { outcome: 'unparseable' } } })) };
+    const again = await runGateWithOneRetry({ lane: 3, item: '3371', sessionSlug: 'conveyor-3371', provider: unusable }, { run, commitTurn, readReport: () => staleFirstTurn });
+    expect(again).toMatchObject({ status: 'red', retryReport: null });
   });
 });
 
@@ -4205,6 +4209,23 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
       if (prevKnob === undefined) delete process.env.WE_WORKER_WRAPPER; else process.env.WE_WORKER_WRAPPER = prevKnob;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('knob ON, resumed turn: only a legacy report written since the turn started counts (a stale first-turn one is not read)', async () => {
+    const runWorkerFn = vi.fn(async () => ({ envelope: { v: 2 } }));
+    const stale = { v: 1, session: 'conveyor-4001', status: 'done', outcome: 'done', updatedAt: '2020-01-01T00:00:00.000Z', filesTouched: ['a.mjs'] };
+    vi.mocked(tryReadDeliveryReport).mockReturnValue(stale);
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, resumeSessionId: 'abc-resume' }, fakeIo({ workerWrapper: true, runWorkerFn }));
+    const [, io] = runWorkerFn.mock.calls[0];
+    expect(io.legacyRead()).toBeNull();
+    const fresh = { ...stale, updatedAt: new Date(Date.now() + 60_000).toISOString() };
+    vi.mocked(tryReadDeliveryReport).mockReturnValue(fresh);
+    expect(io.legacyRead()).toBe(fresh);
+    // a FRESH (non-resume) spawn keeps reading whatever report is there, as before
+    vi.mocked(tryReadDeliveryReport).mockReturnValue(stale);
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, fakeIo({ workerWrapper: true, runWorkerFn }));
+    expect(runWorkerFn.mock.calls[1][1].legacyRead()).toBe(stale);
+    vi.mocked(tryReadDeliveryReport).mockReset();
   });
 
   it('knob ON, resumed turn: --resume is kept and the schema is on it too (D7: resume with the schema)', async () => {

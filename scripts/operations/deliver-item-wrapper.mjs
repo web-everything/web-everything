@@ -1148,6 +1148,7 @@ const CLAUDE_RESTRICTED_PROVIDER = {
       sessionSlug, item, lanePath: weLanePath, attemptTag, reportsDir, implLane: lanePathOverride,
     });
     if (workerWrapper) {
+      const turnStartedAt = Date.now();
       // The wrapper owns the process, the timeout and the record; it never rejects on a worker failure (the v2
       // envelope IS the failure report) and returns the envelope for `runAgentToCompletion` to read the build
       // report from. `legacyRead` keeps the old delivery report working while the brief still asks for it.
@@ -1157,7 +1158,12 @@ const CLAUDE_RESTRICTED_PROVIDER = {
       }, {
         // keep the SAME env hygiene as the old path (GH_TOKEN stripped, worker marker) via the existing spawn primitive
         spawnToCompletionFn: (_cmd, a, opts, spawnIo) => spawnAgent(a, opts, spawnIo),
-        legacyRead: () => tryReadDeliveryReport(sessionSlug, reportsDir),
+        // On a RESUMED turn the report on disk is the first turn's unless the agent rewrote it: only one written since
+        // this turn started counts, or a resume that ended with no result would read as the stale `done`.
+        legacyRead: () => {
+          const report = tryReadDeliveryReport(sessionSlug, reportsDir);
+          return resumeSessionId && !(Date.parse(report?.updatedAt) >= turnStartedAt) ? null : report;
+        },
       });
     }
     try {
@@ -1623,7 +1629,10 @@ export async function runGateWithOneRetry(
   // (see `runAgentToCompletion`'s own comment for the full root-cause account), never the wrapper's own
   // script-location default.
   // 117 S3a — a wrapped resumed turn's own v2 envelope outranks the legacy report, which on that path is the stale first-turn one.
-  const retryReport = envelopeReportOrNull(resumed?.envelope, sessionSlug) ?? readReport(sessionSlug, resolveReportsDir(lanePath)); // agent's fresh report after the resume — 'done' (fixed) or 'blocked' (couldn't)
+  // With an envelope present but unusable (unparseable / aborted) there is NO retry report: never fall back to that stale one.
+  const retryReport = resumed?.envelope
+    ? (resumed.legacyRecord?.status === 'done' ? resumed.legacyRecord : envelopeReportOrNull(resumed.envelope, sessionSlug))
+    : readReport(sessionSlug, resolveReportsDir(lanePath)); // agent's fresh report after the resume — 'done' (fixed) or 'blocked' (couldn't)
   // #3565 — commit whatever the resumed turn changed, same wrapper-owned reasoning as the build commit above,
   // BEFORE the second verify reads the lane. A `blocked` retry that touched nothing no-ops harmlessly here.
   commitTurn({ lane: lanePath, item, provider, phase: 'gate-fix' }, { run: runFn });
