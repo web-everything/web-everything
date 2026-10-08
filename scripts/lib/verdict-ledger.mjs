@@ -703,6 +703,33 @@ export function serializeLedgerEvent(raw) {
   return { ok: true, line: JSON.stringify(record), record, errors: [] };
 }
 
+/**
+ * The store contract's pre-write check, shared by every adapter (card xsij7u6): `rows` is a non-empty array, every
+ * row is valid AS GIVEN (a row's own identity is never repaired from `ctx.repo`), and every row belongs to the ONE
+ * repo the call names. `ctxRepo` names it; with none, the first row does. A missing, malformed or different repo
+ * refuses the whole call, so no store ever files a row under a repo it does not carry.
+ * @returns {{ok: true, repo: string, lines: string[], records: object[]} | {ok: false, error: string}}
+ */
+export function checkLedgerAppendRows(rows, ctxRepo) {
+  if (!Array.isArray(rows) || !rows.length) return { ok: false, error: '`rows` must be a non-empty array' };
+  const refuse = (why) => ({ ok: false, error: `invalid record refused, nothing written: ${why}` });
+  if (ctxRepo !== undefined && ctxRepo !== null && (typeof ctxRepo !== 'string' || !REPO_RE.test(ctxRepo))) {
+    return refuse(`bad \`ctx.repo\`: ${JSON.stringify(ctxRepo)}`);
+  }
+  const lines = [];
+  const records = [];
+  for (const r of rows) {
+    const s = serializeLedgerEvent(r);
+    if (!s.ok) return refuse(s.errors.join('; '));
+    lines.push(s.line);
+    records.push(s.record);
+  }
+  const repo = ctxRepo ?? records[0].repo;
+  const stray = records.find((r) => r.repo !== repo);
+  if (stray) return refuse(`row repo ${JSON.stringify(stray.repo)} does not match the call's repo ${JSON.stringify(repo)}`);
+  return { ok: true, repo, lines, records };
+}
+
 /** Parse a ledger's TEXT into normalized events of every type, in append order. Tolerant, never throws.
  *  A v1 row comes back as `type: verdict`. The v1 readers ({@link parseVerdictLog}, the fold) skip the new
  *  types, so they keep seeing exactly the rows they always saw. */
@@ -1302,7 +1329,7 @@ function warnDowngradeOnce(loud) {
 /** Test seam: re-arm the once-per-process downgrade notice. */
 export function resetLedgerDowngradeWarning() { downgradeWarned = false; }
 
-function appendVerdictHome(record) {
+function appendVerdictHome(record, { appendFile = appendFileSync } = {}) {
   const lockRoot = verdictLedgerLockRoot();
   const owner = processWriterId();
   let locked = false;
@@ -1320,7 +1347,7 @@ function appendVerdictHome(record) {
     if (!ok) return { ok: false, path: null, record: null, locked, errors };
     const path = verdictLedgerPath(record.repo);
     mkdirSync(dirname(path), { recursive: true });
-    appendFileSync(path, `${line}\n`, 'utf8');
+    appendFile(path, `${line}\n`, 'utf8');
     return { ok: true, path, record: normalized, locked, errors: [] };
   } finally {
     if (locked) { try { releaseLockDir(lockRoot, VERDICT_LEDGER_LOCK_PATH); } catch { /* TTL reclaims it */ } }
@@ -1331,20 +1358,18 @@ function appendVerdictHome(record) {
  * The home-file store as a contract adapter (card xsij7u6). `append` wraps {@link appendVerdictHome} (locked, one
  * line per row); `read` answers `unreadable` for any failure except a file that is simply absent. The legacy
  * {@link readVerdictLedger} is unchanged, so every existing reader and the v1 fold are byte-identical.
+ * `ctx.appendFile` is a test seam (default `appendFileSync`) so the conformance suite can fail a write mid-batch.
  */
 export const homeLedgerStore = registerLedgerStore({
   name: 'home',
   capabilities: { durable: true, shared: false, ordering: 'append' },
   append(rows, ctx = {}) {
-    if (!Array.isArray(rows) || !rows.length) return { ok: false, appended: 0, error: '`rows` must be a non-empty array' };
-    for (const r of rows) {
-      const s = serializeLedgerEvent({ ...r, repo: ctx.repo ?? r?.repo });
-      if (!s.ok) return { ok: false, appended: 0, error: `invalid record refused, nothing written: ${s.errors.join('; ')}` };
-    }
+    const check = checkLedgerAppendRows(rows, ctx?.repo);
+    if (!check.ok) return { ok: false, appended: 0, error: check.error };
     let appended = 0;
-    for (const r of rows) {
+    for (const r of check.records) {
       let res;
-      try { res = appendVerdictHome({ ...r, repo: ctx.repo ?? r.repo }); } catch (e) { res = { ok: false, errors: [errFirstLine(e)] }; }
+      try { res = appendVerdictHome(r, ctx?.appendFile ? { appendFile: ctx.appendFile } : undefined); } catch (e) { res = { ok: false, errors: [errFirstLine(e)] }; }
       if (!res.ok) return { ok: false, appended, error: (res.errors ?? []).join('; ') || 'home append failed' };
       appended += 1;
     }
@@ -1356,7 +1381,8 @@ export const homeLedgerStore = registerLedgerStore({
       if (e?.code === 'ENOENT') return { status: 'ok', rows: [] };
       return { status: 'unreadable', reason: 'home-read-failed', error: errFirstLine(e) };
     }
-    return { status: 'ok', rows: parseLedgerEvents(text).slice(from) };
+    // Placement is not identity: two repo names can slug to one file, so a row answers only for the repo it carries.
+    return { status: 'ok', rows: parseLedgerEvents(text).filter((r) => r.repo === repo).slice(from) };
   },
 });
 

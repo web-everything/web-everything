@@ -9,7 +9,8 @@
  *   - `capabilities`  `{durable, shared, ordering}` (see {@link validateLedgerStore}).
  *   - `append(rows, ctx)` -> `{ok: true, appended: n}` | `{ok: false, appended: k, error}`. NEVER throws.
  *        `rows` are a non-empty array of ledger events of ONE repo; `ctx.repo` names it. An invalid row refuses
- *        the whole call (`appended: 0`, nothing written). On an I/O failure `appended` is the count really
+ *        the whole call (`appended: 0`, nothing written), and a row is never repaired: one whose own `repo` is
+ *        missing, malformed or different from `ctx.repo` is invalid. On an I/O failure `appended` is the count really
  *        written, so a caller never has to guess.
  *   - `read(range)`   -> `{status: 'ok', rows}` | `{status: 'unreadable', reason, error}`. NEVER throws.
  *        `range` is `{repo, from?}`; `from` skips that many leading rows (default 0).

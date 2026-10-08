@@ -3,7 +3,7 @@
  *   run against both built-in adapters (home file, git branch).
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runLedgerStoreConformance } from './verdict-ledger-store-conformance.mjs';
@@ -19,17 +19,35 @@ import { withBareOrigin, git } from '../../operations/__tests__/helpers/real-rep
 const REPO = 'web-everything/web-everything';
 const noSleep = () => {};
 
+// A real mid-batch I/O failure for the home store, through its `ctx.appendFile` seam: the write throws once `failAfter`
+// rows have gone through. Disarmed (null) it is the real `appendFileSync`.
+const fsFault = { failAfter: null };
+const faultyAppendFile = (...args) => {
+  if (fsFault.failAfter !== null) {
+    if (fsFault.failAfter === 0) {
+      fsFault.failAfter = null;
+      throw Object.assign(new Error('EIO: injected mid-batch write failure'), { code: 'EIO' });
+    }
+    fsFault.failAfter -= 1;
+  }
+  return appendFileSync(...args);
+};
+
 const homeHarness = async (use) => {
   const dir = mkdtempSync(join(tmpdir(), 'we-ledger-store-home-'));
   const prev = process.env.WE_VERDICT_LEDGER_DIR;
   process.env.WE_VERDICT_LEDGER_DIR = dir;
   try {
     await use({
-      store: getLedgerStore('home'), appendCtx: {}, readCtx: {}, repo: REPO,
+      store: getLedgerStore('home'), appendCtx: { appendFile: faultyAppendFile }, readCtx: {}, repo: REPO,
+      atomicBatch: false, // one line per row: a failed batch keeps the rows already written
       // A directory where the ledger file should be: reads and appends both fail with EISDIR.
       breakStore: () => { rmSync(verdictLedgerPath(REPO), { force: true }); mkdirSync(verdictLedgerPath(REPO), { recursive: true }); },
+      failMidBatch: (n) => { fsFault.failAfter = n; },
+      healStore: () => { fsFault.failAfter = null; },
     });
   } finally {
+    fsFault.failAfter = null;
     if (prev === undefined) delete process.env.WE_VERDICT_LEDGER_DIR; else process.env.WE_VERDICT_LEDGER_DIR = prev;
     rmSync(dir, { recursive: true, force: true });
   }
@@ -43,7 +61,11 @@ const gitHarness = async (use) => {
       appendCtx: { board: ctx.clone, attempts: 2, sleep: noSleep },
       readCtx: { board: ctx.clone },
       repo: REPO,
+      atomicBatch: true, // one commit, one push: a failed batch persists nothing
       breakStore: () => git(['remote', 'set-url', 'origin', join(ctx.tmp, 'does-not-exist.git')], { cwd: ctx.clone }),
+      // The push is the only write, so a mid-batch failure and an unreachable origin are the same event.
+      failMidBatch: () => git(['remote', 'set-url', 'origin', join(ctx.tmp, 'does-not-exist.git')], { cwd: ctx.clone }),
+      healStore: () => git(['remote', 'set-url', 'origin', ctx.origin], { cwd: ctx.clone }),
     });
   });
 };

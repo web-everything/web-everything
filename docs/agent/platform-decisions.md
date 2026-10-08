@@ -6155,7 +6155,8 @@ order) are built in; a product store (Plateau) registers under its own name and 
   other machines. `ordering` is `none`, `append` (one writer's order) or `total` (one order across all writers).
   `home` is `{true, false, append}`; `git` is `{true, true, total}`.
 - `append(rows, {repo, ...})` returns `{ok, appended, error?}` and never throws. An invalid row refuses the whole
-  call. On an I/O failure `appended` is the count really written.
+  call, and a row is never repaired: a row whose own `repo` is missing, malformed or different from `repo` is
+  invalid. On an I/O failure `appended` is the count really written.
 - `read({repo, from?})` returns `{status: 'ok', rows}` or `{status: 'unreadable', reason, error}` and never
   throws. A failed read is `unreadable`, never an empty `ok`; every gate treats `unreadable` as a hold.
 

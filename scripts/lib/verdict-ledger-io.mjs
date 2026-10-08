@@ -21,7 +21,7 @@ import {
   readFromTransportBranch,
   stageOnTransportBranch,
 } from './git-transport-branch.mjs';
-import { parseVerdictLog, parseLedgerEvents, serializeLedgerEvent } from './verdict-ledger.mjs';
+import { parseVerdictLog, parseLedgerEvents, serializeLedgerEvent, checkLedgerAppendRows } from './verdict-ledger.mjs';
 import { registerLedgerStore } from './verdict-ledger-store.mjs';
 
 export const LEDGER_TRANSPORT_BRANCH = 'ops/review-requests';
@@ -126,14 +126,11 @@ export function createGitLedgerStore({ appendRows = appendLedgerRows, readRows =
     name: 'git',
     capabilities: { durable: true, shared: true, ordering: 'total' },
     append(rows, ctx = {}) {
-      if (!Array.isArray(rows) || !rows.length) return { ok: false, appended: 0, error: '`rows` must be a non-empty array' };
-      for (const r of rows) {
-        const s = serializeLedgerEvent(r);
-        if (!s.ok) return { ok: false, appended: 0, error: `invalid record refused, nothing written: ${s.errors.join('; ')}` };
-      }
+      const check = checkLedgerAppendRows(rows, ctx?.repo);
+      if (!check.ok) return { ok: false, appended: 0, error: check.error };
       try {
-        const { repo, ...rest } = ctx;
-        appendRows({ ...rest, repo, records: rows });
+        const { repo: _ctxRepo, ...rest } = ctx ?? {};
+        appendRows({ ...rest, repo: check.repo, records: check.records });
         return { ok: true, appended: rows.length };
       } catch (e) {
         return { ok: false, appended: 0, error: String(e?.message ?? e).split('\n')[0].slice(0, 300) };
@@ -143,7 +140,7 @@ export function createGitLedgerStore({ appendRows = appendLedgerRows, readRows =
       const { repo, from = 0, ...rest } = range;
       const r = readRows({ ...rest, repo });
       if (r.status !== 'ok') return { status: 'unreadable', reason: r.reason, error: r.error };
-      return { status: 'ok', rows: parseLedgerEvents(r.text).slice(from) }; // every event type, not only v1 verdicts
+      return { status: 'ok', rows: parseLedgerEvents(r.text).filter((x) => x.repo === repo).slice(from) }; // every event type, not only v1 verdicts; only this repo's rows
     },
   };
 }
