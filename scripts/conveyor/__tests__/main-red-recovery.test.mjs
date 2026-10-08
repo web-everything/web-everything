@@ -973,3 +973,73 @@ describe('main-fixed signature attribution', () => {
     ]) expect(planMainRedRebases({ candidates: [{ ...candidate, ...over }], ...options }).refusals[0].kind).toBe(kind);
   });
 });
+
+// xd3dkzx — check-scoped recovery. Live 2026-10-08: main's CI workflow stayed red on `daemon-soak` alone for
+// hours while its `test` job was green; PRs #4494/#4446/#4511 failed `test` inside that window and the watch
+// refused `main-still-red` every tick, so the owed refresh (the product's CI re-run) never happened.
+describe('main-red-recovery — check-scoped recovery (xd3dkzx, live replay 2026-10-08)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { isMainRecoveredForCheck, resolveMainRecoveryScope } = await import('../main-red-recovery.mjs');
+  const fixture = JSON.parse(readFileSync(`${process.cwd()}/scripts/conveyor/__tests__/fixtures/owed-ci-rerun-check-scoped.json`, 'utf8'));
+  const windows = computeMainRedWindows(fixture.mainRuns);
+
+  it('the fixture really is the incident: main red right now, at the workflow level', () => {
+    expect(isMainCurrentlyRed(windows)).toBe(true);
+  });
+
+  it('isMainRecoveredForCheck: `test` green on main\'s newest decisive run, `daemon-soak` still red', () => {
+    expect(isMainRecoveredForCheck({ checkName: 'test', mainRuns: fixture.mainRuns })).toBe(true);
+    expect(isMainRecoveredForCheck({ checkName: 'daemon-soak', mainRuns: fixture.mainRuns })).toBe(false);
+  });
+
+  it('isMainRecoveredForCheck never guesses: a red run with no per-check facts, or no check name, is not recovery', () => {
+    const unread = [{ status: 'completed', conclusion: 'failure', updatedAt: '2026-10-08T22:00:00Z' }];
+    expect(isMainRecoveredForCheck({ checkName: 'test', mainRuns: unread })).toBe(false);
+    expect(isMainRecoveredForCheck({ checkName: null, mainRuns: fixture.mainRuns })).toBe(false);
+    expect(isMainRecoveredForCheck({ checkName: 'test', mainRuns: [] })).toBe(false);
+  });
+
+  it('isMainRecoveredForCheck skips cancelled / in-flight / infra-only runs and reads the newest decisive one', () => {
+    const runs = [
+      { status: 'completed', conclusion: 'failure', updatedAt: '2026-10-08T20:00:00Z', checkConclusions: { test: 'success' } },
+      { status: 'completed', conclusion: 'failure', updatedAt: '2026-10-08T21:00:00Z', checkConclusions: { test: 'failure' } },
+      { status: 'completed', conclusion: 'cancelled', updatedAt: '2026-10-08T22:00:00Z' },
+      { status: 'completed', conclusion: 'failure', updatedAt: '2026-10-08T22:10:00Z', infraCancelledOnly: true },
+      { status: 'in_progress', conclusion: '', updatedAt: '2026-10-08T22:20:00Z' },
+    ];
+    expect(isMainRecoveredForCheck({ checkName: 'test', mainRuns: runs })).toBe(false);
+    const greenLater = [...runs, { status: 'completed', conclusion: 'success', updatedAt: '2026-10-08T22:30:00Z' }];
+    expect(isMainRecoveredForCheck({ checkName: 'test', mainRuns: greenLater })).toBe(true);
+  });
+
+  it('dispatches the owed refresh once per head for #4494/#4446/#4511 (before: main-still-red for all three)', () => {
+    const before = planMainRedRebases({ candidates: fixture.candidates, mainRedWindows: windows });
+    expect(before.refusals.map((r) => [r.prNumber, r.kind])).toEqual([[4494, 'main-still-red'], [4446, 'main-still-red'], [4511, 'main-still-red']]);
+    const after = planMainRedRebases({ candidates: fixture.candidates, mainRedWindows: windows, mainRuns: fixture.mainRuns });
+    expect(after.refusals).toEqual([]);
+    expect(after.dispatch.map((d) => [d.prNumber, d.kind, d.recoveredCheck])).toEqual([
+      [4494, 'rebase-onto-main', 'test'], [4446, 'rebase-onto-main', 'test'], [4511, 'rebase-onto-main', 'test'],
+    ]);
+  });
+
+  it('still refuses main-still-red when the PR\'s OWN failing check is still red on main', () => {
+    const c = { ...fixture.candidates[0], failingCheckName: 'daemon-soak' };
+    const plan = planMainRedRebases({ candidates: [c], mainRedWindows: windows, mainRuns: fixture.mainRuns });
+    expect(plan.refusals).toEqual([expect.objectContaining({ prNumber: 4494, kind: 'main-still-red' })]);
+  });
+
+  it('keeps the per-head cap: a head already refreshed once is not refreshed again', () => {
+    const c = { ...fixture.candidates[0], rebaseAttemptsForSha: DEFAULT_MAX_REBASE_RETRIES_PER_SHA };
+    const plan = planMainRedRebases({ candidates: [c], mainRedWindows: windows, mainRuns: fixture.mainRuns });
+    expect(plan.refusals).toEqual([expect.objectContaining({ prNumber: 4494, kind: 'rebase-cap-exhausted' })]);
+  });
+
+  it('declared setting WE_MAIN_RECOVERY_SCOPE=workflow restores the old whole-workflow gate', () => {
+    expect(resolveMainRecoveryScope({})).toBe('check');
+    expect(resolveMainRecoveryScope({ WE_MAIN_RECOVERY_SCOPE: 'workflow' })).toBe('workflow');
+    expect(resolveMainRecoveryScope({ WE_MAIN_RECOVERY_SCOPE: 'bogus' })).toBe('check');
+    const plan = planMainRedRebases({ candidates: fixture.candidates, mainRedWindows: windows, mainRuns: fixture.mainRuns, recoveryScope: 'workflow' });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals.every((r) => r.kind === 'main-still-red')).toBe(true);
+  });
+});

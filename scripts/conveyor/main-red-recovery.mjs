@@ -145,6 +145,43 @@ export function isMainCurrentlyRed(windows) {
 }
 
 /**
+ * we:scripts/conveyor/main-red-recovery.mjs#isMainRecoveredForCheck — xd3dkzx (live 2026-10-08): has `main`
+ * recovered for ONE check, even while its workflow as a whole is still red? PURE. `main`'s CI stayed red for hours
+ * on `daemon-soak` alone while its `test` job passed; PRs #4494/#4446/#4511 had failed `test` inside that window,
+ * and the whole-workflow gate ({@link isMainCurrentlyRed}) refused their owed refresh every tick — forever.
+ *
+ * Reads `mainRuns` newest-first, skipping runs that prove nothing (in flight, `cancelled`/`skipped`/`neutral`,
+ * `infraCancelledOnly`). The first decisive run answers: `success` → recovered; a red run → recovered only when its
+ * `checkConclusions` (annotated by `reconcile-pass.mjs#defaultReadMainRuns` off a complete job inventory) says
+ * `checkName` passed. A red run whose map lacks `checkName` did not run that check, so the next older run answers.
+ * A red run with NO map (jobs unread) is `false` — never a guess. No check name or no runs → `false`.
+ * @param {{checkName?:(string|null), mainRuns?:Array<object>}} [o]
+ * @returns {boolean}
+ */
+export function isMainRecoveredForCheck({ checkName = null, mainRuns = [] } = {}) {
+  if (!checkName) return false;
+  const decisive = (Array.isArray(mainRuns) ? mainRuns : [])
+    .filter((r) => r && String(r.status).toLowerCase() === 'completed' && r.updatedAt && r.infraCancelledOnly !== true)
+    .filter((r) => { const c = String(r.conclusion || '').toLowerCase(); return c === 'success' || MAIN_RED_CONCLUSIONS.includes(c); })
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  for (const run of decisive) {
+    if (String(run.conclusion).toLowerCase() === 'success') return true;
+    const map = run.checkConclusions;
+    if (!map || typeof map !== 'object') return false;
+    if (!Object.hasOwn(map, checkName)) continue;
+    return String(map[checkName]).toLowerCase() === 'success';
+  }
+  return false;
+}
+
+/** xd3dkzx — declared setting `WE_MAIN_RECOVERY_SCOPE`: `check` (default — main counts as recovered for a PR once
+ *  the PR's own failing check is green on main, see {@link isMainRecoveredForCheck}) or `workflow` (the old gate:
+ *  wait until main's whole CI workflow is green). Anything else reads as the default. PURE over `env`. */
+export function resolveMainRecoveryScope(env = process.env) {
+  return env?.WE_MAIN_RECOVERY_SCOPE === 'workflow' ? 'workflow' : 'check';
+}
+
+/**
  * we:scripts/conveyor/main-red-recovery.mjs#classifyCiFailureAttribution — is a PR's own required-check
  * failure explained by `main` having been red at the moment it concluded? PURE.
  * @param {{failureCompletedAt?:(string|null), mainRedWindows?:Array<object>}} o
@@ -551,6 +588,9 @@ export function classifierNeedsComments({ failingCheckName = null, mainLatestChe
 export function planMainRedRebases({
   candidates = [], mainRedWindows = [], mainLatestCheckRuns = [], maxRebaseRetriesPerSha = DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
   prScopedChecks = resolvePrScopedChecks(), mainDefectRebaseCap = resolveMainDefectRebaseCap(),
+  // xd3dkzx — `mainRuns` (main's own run list, annotated with `checkConclusions`) lets the "is main recovered?"
+  // gate be judged per failing check. Omitted → `[]` → byte-identical to the old whole-workflow gate.
+  mainRuns = [], recoveryScope = resolveMainRecoveryScope(),
 } = {}) {
   const dispatch = [];
   const refusals = [];
@@ -590,7 +630,12 @@ export function planMainRedRebases({
       });
       continue;
     }
-    if (mainStillRed) {
+    // xd3dkzx — main's WORKFLOW may stay red on a different check (live 2026-10-08: `daemon-soak` only) while the
+    // PR's own failing check is green on main again. Then the refresh is owed now: the merge gate still demands
+    // every required check green on the PR itself, and the per-head cap below still bounds the attempts.
+    const recoveredCheck = mainStillRed && recoveryScope === 'check'
+      && isMainRecoveredForCheck({ checkName: base.failingCheckName, mainRuns }) ? base.failingCheckName : null;
+    if (mainStillRed && !recoveredCheck) {
       refusals.push({
         ...base, kind: 'main-still-red',
         why: `main's own CI is still red right now — refreshing PR #${prNumber} against it would not prove anything; wait for main to recover`,
@@ -627,6 +672,7 @@ export function planMainRedRebases({
     }
     dispatch.push({
       ...base, attempts: rebaseAttempts, kind: 'rebase-onto-main',
+      ...(recoveredCheck ? { recoveredCheck } : {}),
       ...(mainFixed ? { attribution: 'main-fixed-signature', attributedWindow: {
         from: c.mainFixedSignature.bugIntroducedAt, to: c.mainFixedSignature.fixedAt,
       } } : {}),
@@ -634,6 +680,8 @@ export function planMainRedRebases({
         ? `PR #${prNumber}'s error signatures were fixed on main by ${[...new Set(c.mainFixedSignature.signatures.flatMap((s) => s.fixCommits))].map((sha) => sha.slice(0, 9)).join(', ')} — refreshing onto main`
         : mainGreenForCheck
         ? `PR #${prNumber}'s \`${base.failingCheckName}\` check failed at ${base.failureCompletedAt}, but is passing on main's own latest completed run and this head is ${base.aheadBy} commit(s) behind it — main has since fixed this, refreshing onto it`
+        : recoveredCheck
+        ? `PR #${prNumber}'s \`${recoveredCheck}\` check failed at ${base.failureCompletedAt}, inside a window where main's own CI was red; main's CI is still red on another check, but \`${recoveredCheck}\` is green on main again and this head is ${base.aheadBy} commit(s) behind it — refreshing onto main`
         : `PR #${prNumber}'s required check failed at ${base.failureCompletedAt}, inside a window where main's own CI was red; main has recovered and this head is ${base.aheadBy} commit(s) behind it — refreshing onto main`,
     });
   }

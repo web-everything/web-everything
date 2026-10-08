@@ -382,7 +382,12 @@ export function defaultReadMainRuns({
       // Only the first page is read, so the inventory must be provably COMPLETE: a real failure on a later page would
       // otherwise be invisible and the run wrongly judged infra-only. An unverifiable or truncated inventory stays red.
       const complete = Array.isArray(jobs) && Number.isInteger(page.total_count) && page.total_count === jobs.length;
-      return complete && isInfraCancelledOnlyRun(jobs) ? { ...r, infraCancelledOnly: true } : r;
+      if (!complete) return r;
+      // xd3dkzx — each job's own verdict (job name = check name), so recovery can be judged per failing check
+      // (`main-red-recovery.mjs#isMainRecoveredForCheck`). Only from a COMPLETE inventory: absence then means
+      // "did not run"; a truncated/unread page leaves no map, which that predicate reads as "not recovered".
+      const checkConclusions = Object.fromEntries(jobs.filter((j) => j?.name).map((j) => [j.name, String(j.conclusion ?? '')]));
+      return isInfraCancelledOnlyRun(jobs) ? { ...r, infraCancelledOnly: true, checkConclusions } : { ...r, checkConclusions };
     } catch { return r; }
   });
 }
