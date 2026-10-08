@@ -1,15 +1,17 @@
 ---
+bornAs: xyloz19
 kind: story
-size: 3
+size: 5
+parent: "128"
 status: open
-scope: ["we:scripts/lib/referral-card-readable.mjs"]
-dateOpened: "2026-10-07"
+scope: ["we:scripts/operations/run-store.mjs", "we:scripts/operations/runner-activity-io.mjs", "we:scripts/operations/land-advance-cli.mjs", "we:scripts/operations/__tests__/run-store.test.mjs"]
+dateOpened: "2026-10-08"
 tags: []
 ---
 
-# A card ruling can cite a card that lives only on an open PR
+# Run records move to one shared folder (D6 of 128)
 
-cardReadable accepts we:backlog/<file>@pr<N> verified at the PR head via gh, so the operator's ruling stops waiting a CI cycle on a card-only PR (item 110)
+Each daemon clone keeps its own .operations/runs so no reader sees another daemon's run history; /sessions flags review-history:per-clone-store-d6-pending. Move the run store to one shared root (~/workspace/.operations/runs, OPERATION_RUNS_DIR still wins), atomic writes, one-time move of old per-clone records at first use. Test: a record written from the review daemon's clone is readable from the fix daemon's clone.
 
 ## Done when
 

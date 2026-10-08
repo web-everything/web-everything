@@ -1,15 +1,22 @@
 ---
+bornAs: xm40qa2
 kind: story
-size: 1
+size: 3
+parent: "4075"
 status: open
 scope: ["we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/lib/__tests__/drain-skip-reasons.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Drain skip-reasons log: give every skip a named bucket, retire the 'other' bucket
+# Prevention — Use the couple carrier data (coupleCarrier) or require different repos and Number.isFinite(item).… (from web-everything/web-everything#4397 review)
 
-Coroner 2026-10-07 F7: plateau-app #212 sat 86 passes as 'other' (no bucket recorded) because its couple partner WE #4288 was checks-pending. Name partner-pending, ready-not-reached, not-certified, off-base, codeql-failed, empty-body, stale-read, escalated, unrecognized-reason. Logging only, no merge-decision change.
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+
+1. `we:scripts/lib/drain-skip-reasons.mjs:86` — Use the couple carrier data (`coupleCarrier`) or require different repos and `Number.isFinite(item)`. Add a test for same-item, same-repo PRs.
+2. `we:scripts/lib/__tests__/drain-skip-reasons.test.mjs:46` — Add a table-driven test mapping each representative reason to its exact expected kind, enforced by the normal test gate; include reason-based escalation separately from the escalated flag.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4397@8a554840648464b10e7db03feedd9c41e6da986d
 
 ## Done when
 

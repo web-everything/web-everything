@@ -1,22 +1,22 @@
 ---
+bornAs: xao7z31
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/ci-heal-pr-dispatch.mjs", "we:scripts/lib/codeql-gate.mjs", "we:scripts/operations/__tests__/ci-heal-pr-dispatch.test.mjs", "we:scripts/lib/__tests__/codeql-gate.test.mjs"]
+scope: ["we:backlog/4408-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Prevention — Add an end-to-end test through runReconcileCiHealDispatch. Longer term, a standards rule that eve… (from web-everything/web-everything#4378 review)
+# Prevention — Add a check:standards rule that fails on fenced sh blocks in backlog cards containing a we: prefi… (from web-everything/web-everything#4391 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/ci-heal-pr-dispatch.mjs:431` — Add an end-to-end test through `runReconcileCiHealDispatch`. Longer term, a standards rule that every new `reason` value needs a test that goes from plan row to sink.
-2. `we:scripts/lib/codeql-gate.mjs:39` — Make `isCodeQLFailed` call `failedCodeQLCheck`, or add a parity test over a fixture matrix of rollup shapes.
-3. `we:scripts/lib/codeql-gate.mjs:125` — Test the empty-alerts, no-error case and word the brief accordingly ("no failure annotations found; check the run log").
+1. `we:backlog/4408-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md:76` — Add a check:standards rule that fails on fenced `sh` blocks in backlog cards containing a `we:` prefix.
+2. `we:backlog/4408-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md:76` — Add a documentation check that validates local Node script targets in shell fences against the documented working directory and rejects repository-reference prefixes.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4378@6bb6bafdafb3a3f71e5545900a127311a18572b4
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4391@004616b37a97efa32394ad9f86687656732168b1
 
 ## Done when
 

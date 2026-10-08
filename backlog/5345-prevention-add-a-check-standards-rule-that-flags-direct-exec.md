@@ -1,15 +1,21 @@
 ---
+bornAs: xren5xl
 kind: story
 size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/main-red-recovery.mjs"]
-dateOpened: "2026-10-07"
+scope: ["we:scripts/lib/referral-card-readable.mjs", "we:scripts/lib/__tests__/referral-card-readable.test.mjs"]
+dateOpened: "2026-10-08"
 tags: []
 ---
 
-# One shared main-defect classifier: fix daemon and ci-red-recovery-watch must agree on who owns a main-caused red PR
+# Prevention — Add a check:standards rule that flags direct execFileSync('gh', ...) in scripts/lib and scripts/c… (from web-everything/web-everything#4368 review)
 
-PR #4368 ping-pong: fix daemon says owed a rebase, ci-red-recovery-watch says own-failure and owed a ci-heal. The watch never read the PR comments (no labels fetched, merge base green), so it missed the recorded main-defect escalation.
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+
+1. `we:scripts/lib/referral-card-readable.mjs:23` — Add a `check:standards` rule that flags direct `execFileSync('gh', ...)` in `scripts/lib` and `scripts/conveyor` modules unless they go through `we:gh-throttle.mjs`.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4368@27992e66f9b14e7bb72f75d1363c06aa71bc2b99
 
 ## Done when
 

@@ -1,16 +1,16 @@
 ---
+bornAs: xe61qoo
 kind: story
-size: 5
-parent: "128"
+size: 1
 status: open
-scope: ["we:scripts/operations/run-store.mjs", "we:scripts/operations/runner-activity-io.mjs", "we:scripts/operations/land-advance-cli.mjs", "we:scripts/operations/__tests__/run-store.test.mjs"]
+scope: ["we:scripts/operations/machine-pr-title.mjs", "we:scripts/operations/__tests__/machine-pr-title.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Run records move to one shared folder (D6 of 128)
+# Prepare PR titles never say subject unavailable: derive from the card title
 
-Each daemon clone keeps its own .operations/runs so no reader sees another daemon's run history; /sessions flags review-history:per-clone-store-d6-pending. Move the run store to one shared root (~/workspace/.operations/runs, OPERATION_RUNS_DIR still wins), atomic writes, one-time move of old per-clone records at first use. Test: a record written from the review daemon's clone is readable from the fix daemon's clone.
+Coroner 2026-10-07 F8: prepare PRs #4412/#4410/#4408 landed titled '[subject unavailable for N]' because guard-card titles with no numbered finding fell to the placeholder. Derive the subject from the card title instead.
 
 ## Done when
 
