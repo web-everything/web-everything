@@ -218,7 +218,9 @@ export async function dispatchCiHeal(planned, {
     const out = await sinks[DISPATCH_EFFECT]({
       launchKind: 'ci-heal', prompt: withCodeQLSection(withAltBranchHint(prompt, planned.altBranch), planned, repo), sessionSlug, num: planned.itemNum ?? undefined, lane: planned.lane, scope: planned.scope,
       headRefOid: planned.headRefOid, claimOwner, claimRoot,
-      pr: planned.pr, reason, repo, probationWorker: reason === 'codeql' ? null : (route?.probationWorker ?? null), // x8cnbii: a CodeQL heal needs the brief's alert, which the probation worker prompt does not carry routing: route,
+      // x8cnbii: a CodeQL heal needs the brief's alert, which the probation worker prompt does not carry.
+      pr: planned.pr, reason, repo, probationWorker: reason === 'codeql' ? null : (route?.probationWorker ?? null),
+      routing: route,
     });
     if (out?.held) {
       // #x0jphk5 — the SINK's own (separate, unrelated) guard refused it: nothing was spawned under OUR claim
