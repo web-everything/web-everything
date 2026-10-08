@@ -1075,14 +1075,26 @@ export async function cliListSettledBuilds({ launchKind = 'build' } = {}) {
 // of a settled attempt does not change, so the parsed answer is reused while the file's size + mtime are the
 // same, and a "no transcript found" answer is reused while no project directory has changed (a new transcript
 // file bumps its directory's mtime). Any change re-reads exactly as before; the returned evidence is identical.
+// Both maps are BOUNDED (insertion-ordered, least-recently-used evicted past the cap; a hit re-inserts): the daemon is a long-lived process and
+// every distinct settled-prepare handle would otherwise add an entry for its whole life. Eviction only costs a
+// re-read, never a wrong answer.
+export const EVIDENCE_CACHE_MAX_ENTRIES = 256;
 const evidenceTranscripts = new Map(); // `${projects}\0${handle}` -> { file, size, mtimeMs, terminal }
-const evidenceMisses = new Map(); // `${projects}\0${handle}` -> directory signature at the time of the miss
+const evidenceMisses = new Map(); // `${projects}\0${handle}` -> digest of the directory signature at the time of the miss
+function setBounded(map, key, value) {
+  map.delete(key); // re-insert at the newest end
+  map.set(key, value);
+  while (map.size > EVIDENCE_CACHE_MAX_ENTRIES) map.delete(map.keys().next().value);
+}
 const projectsSignature = (projects, dirs) => {
   const stamp = (p) => { try { return statSync(p).mtimeMs; } catch { return -1; } };
-  return `${stamp(projects)}|${dirs.map((d) => `${d}:${stamp(join(projects, d))}`).join(',')}`;
+  const raw = `${stamp(projects)}|${dirs.map((d) => `${d}:${stamp(join(projects, d))}`).join(',')}`;
+  return createHash('sha1').update(raw).digest('hex'); // a digest, not the string that grows with the dir count
 };
 /** Test seam: forget every cached transcript answer. */
 export function clearPrepareEvidenceCache() { evidenceTranscripts.clear(); evidenceMisses.clear(); }
+/** Test seam: how many answers the two evidence caches hold right now. */
+export function prepareEvidenceCacheSizes() { return { transcripts: evidenceTranscripts.size, misses: evidenceMisses.size }; }
 
 /** Read terminal observations only. Prompts are instructions, not evidence that a failure occurred. */
 export function cliPrepareFailureEvidence(entry, { projects = join(homedir(), '.claude', 'projects') } = {}) {
@@ -1102,7 +1114,10 @@ export function cliPrepareFailureEvidence(entry, { projects = join(homedir(), '.
   if (cached) {
     try {
       const st = statSync(cached.file);
-      if (st.size === cached.size && st.mtimeMs === cached.mtimeMs) return finish(cached.file, cached.terminal);
+      if (st.size === cached.size && st.mtimeMs === cached.mtimeMs) {
+        setBounded(evidenceTranscripts, cacheKey, cached); // a hit refreshes recency: LRU, so a hot set under the cap never thrashes
+        return finish(cached.file, cached.terminal);
+      }
     } catch { /* gone or unreadable: re-scan below */ }
     evidenceTranscripts.delete(cacheKey);
   }
@@ -1112,11 +1127,13 @@ export function cliPrepareFailureEvidence(entry, { projects = join(homedir(), '.
     if (!existsSync(projects)) return evidence;
     const projectDirs = readdirSync(projects, { withFileTypes: true }).filter((d) => d.isDirectory());
     const signature = projectsSignature(projects, projectDirs.map((d) => d.name));
-    if (evidenceMisses.get(cacheKey) === signature) return evidence;
+    if (evidenceMisses.get(cacheKey) === signature) { setBounded(evidenceMisses, cacheKey, signature); return evidence; }
+    let scanComplete = true;
     for (const project of projectDirs) {
       const dir = join(projects, project.name);
       let file;
-      try { file = readdirSync(dir).find(name => name.startsWith(handle) && name.endsWith('.jsonl')); } catch { continue; }
+      // A directory that cannot be read this tick may hold the transcript: skip it, but never cache the miss.
+      try { file = readdirSync(dir).find(name => name.startsWith(handle) && name.endsWith('.jsonl')); } catch { scanComplete = false; continue; }
       if (!file) continue;
       let terminal = '';
       const path = join(dir, file);
@@ -1131,10 +1148,10 @@ export function cliPrepareFailureEvidence(entry, { projects = join(homedir(), '.
         const text = Array.isArray(content) ? content.filter(c => c.type === 'text').map(c => c.text).join('\n') : '';
         if (text) terminal = text;
       }
-      evidenceTranscripts.set(cacheKey, { file: path, size: before.size, mtimeMs: before.mtimeMs, terminal });
+      setBounded(evidenceTranscripts, cacheKey, { file: path, size: before.size, mtimeMs: before.mtimeMs, terminal });
       return finish(path, terminal);
     }
-    evidenceMisses.set(cacheKey, signature);
+    if (scanComplete) setBounded(evidenceMisses, cacheKey, signature);
   } catch { /* fall through to the base evidence */ }
   return evidence;
 }

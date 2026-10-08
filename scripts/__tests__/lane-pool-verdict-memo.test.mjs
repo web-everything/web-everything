@@ -139,7 +139,7 @@ describe('list --acquirable: an unleased lane holding work is proven once, not o
     dirty(1);
     list();
     const m = JSON.parse(readFileSync(MEMO(), 'utf8'));
-    expect(m.v).toBe(2);
+    expect(m.v).toBe(3); // bumped from 2 when the clean-verdict entry shape joined the file (card xwn53th)
     expect(m.lanes['1'].paths).toEqual(['file.txt']);
     writeFileSync(MEMO(), JSON.stringify({ v: 1, branch: 'main', lanes: { 1: { ...m.lanes['1'], paths: undefined, dirt: undefined } } }));
     writeFileSync(join(lanePath(1), 'file.txt'), 'v1\n');
