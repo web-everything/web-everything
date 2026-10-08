@@ -1,0 +1,8 @@
+{
+  "advisor": {
+    "mode": "sample",
+    "model": "opus",
+    "sampleRate": 0.5,
+    "kinds": ["fix"]
+  }
+}
