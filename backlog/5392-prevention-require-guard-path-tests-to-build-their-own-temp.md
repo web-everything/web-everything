@@ -1,9 +1,10 @@
 ---
+bornAs: xenbaih
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/__tests__/dispatch-bg-isolation.test.mjs", "we:backlog/xl5reby-dispatched-workers-never-load-the-repo-pretooluse-guards-wir.md", "we:scripts/lib/dispatch-bg-isolation.mjs"]
+scope: ["we:scripts/lib/__tests__/dispatch-bg-isolation.test.mjs", "we:backlog/5390-dispatched-workers-never-load-the-repo-pretooluse-guards-wir.md", "we:scripts/lib/dispatch-bg-isolation.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
@@ -13,7 +14,7 @@ tags: []
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
 1. `we:scripts/lib/__tests__/dispatch-bg-isolation.test.mjs:176` — Require guard-path tests to build their own temp workspace fixture, with no environment-conditional assertions. A lint rule could flag `expect` calls inside `if (existsSync(...))` in test files.
-2. `we:backlog/xl5reby-dispatched-workers-never-load-the-repo-pretooluse-guards-wir.md:16` — A check:standards rule that fails when a card landing as done still contains `TODO:` placeholders.
+2. `we:backlog/5390-dispatched-workers-never-load-the-repo-pretooluse-guards-wir.md:16` — A check:standards rule that fails when a card landing as done still contains `TODO:` placeholders.
 3. `we:scripts/lib/dispatch-bg-isolation.mjs:186` — Add a check:standards rule or a test that every consumer of isolateDispatchSession either reads `.hooks.ok` or logs through a named sink. Alternatively, have isolateDispatchSession emit a warning event on `!hooks.ok`.
 4. `we:scripts/lib/__tests__/dispatch-bg-isolation.test.mjs:175` — Build a temp fake workspace (`<tmp>we:/webeverything/scripts/guard-bash.mjs` copied or symlinked) so the deny assertion always runs. Add a lint rule against `if (existsSync(...)) expect(...)` conditional assertions in tests.
 5. `we:scripts/lib/dispatch-bg-isolation.mjs:106` — Add a required parameterized unit test using the existing fileUrl and exists injection points to cover both primary names, lane selection, and the documented fallback; assert exact resolved roots and hook commands.
