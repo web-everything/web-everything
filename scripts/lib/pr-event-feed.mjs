@@ -50,7 +50,12 @@ export const FEED_DEFAULTS = Object.freeze({
   maxPages: 5,              // pages read per poll before yielding (the rest is read on the next poll)
   shaMapMax: 1_000,         // learned head-commit → PR entries kept (oldest dropped first)
   maxCauses: 3,             // causes remembered per dirty PR (for the log line)
+  maxPrsPerSha: 20,         // PRs remembered for one head commit (a handful in practice; bounds the union)
 });
+
+/** Keep only positive safe integers, de-duplicated and bounded: what is written is always what the loader accepts. */
+export const cleanPrs = (list) => (Array.isArray(list)
+  ? [...new Set(list.filter((n) => Number.isSafeInteger(n) && n > 0))].slice(-FEED_DEFAULTS.maxPrsPerSha) : []);
 
 // ── settings ────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -110,11 +115,14 @@ export function markDirty(state, { key, repo = null, number = null, cause, at })
 /** Remember head commit → PR numbers from an event that carries both. Bounded; oldest entries drop first. */
 export function learnSha(state, event, { max = FEED_DEFAULTS.shaMapMax } = {}) {
   if (!event?.sha || !event.repo || !Array.isArray(event.prs) || !event.prs.length) return state;
-  if (event.type !== 'pull_request') return state; // a PR event's `prs` is authoritative for its head; a check's may be partial
+  if (event.type !== 'pull_request') return state; // a PR event names a PR on its head; a check's list may be partial
+  const prs = cleanPrs(event.prs);
+  if (!prs.length) return state;
   const k = shaKey(event.repo, event.sha);
   const shaPrs = { ...state.shaPrs };
+  const known = shaPrs[k] || []; // two PRs can share one head commit: keep every PR learned for it, never replace
   delete shaPrs[k]; // re-insert at the end: insertion order is the age order
-  shaPrs[k] = [...new Set(event.prs)];
+  shaPrs[k] = cleanPrs([...known, ...prs]);
   const keys = Object.keys(shaPrs);
   for (const old of keys.slice(0, Math.max(0, keys.length - max))) delete shaPrs[old];
   return { ...state, shaPrs };
@@ -139,8 +147,10 @@ export function foldEvents(state, events, { relevant, resolved = {}, at }) {
     let cause = describeEvent(e);
     if (!prs.length && e.sha) {
       const k = shaKey(e.repo, e.sha);
-      const hit = s.shaPrs[k] || resolved[k] || null;
-      if (hit && hit.length) { prs = hit; cause += ' via head commit'; s.stats.resolvedBySha += 1; }
+      // Union of what this consumer learned and what the Durable Object knows: a PR sharing the head commit that
+      // this consumer never saw (older than its cursor, evicted from the map) is still marked.
+      const hit = cleanPrs([...(s.shaPrs[k] || []), ...(Array.isArray(resolved[k]) ? resolved[k] : [])]);
+      if (hit.length) { prs = hit; cause += ' via head commit'; s.stats.resolvedBySha += 1; }
     }
     if (!prs.length) {
       s.stats.unresolved += 1;
@@ -193,12 +203,62 @@ export function feedStatePath(stateDir, role) {
   return join(stateDir, 'feeds', `${role}.json`);
 }
 
-/** Read a role's state; a missing or unreadable file is a first start (empty state, cursor null). */
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const isCount = (v) => Number.isSafeInteger(v) && v >= 0;
+const isNumOrNull = (v) => v == null || Number.isFinite(v);
+
+/**
+ * Validate a parsed state file against the shape `markDirty` / `takeSnapshot` / `foldEvents` rely on. PURE.
+ * Anything off (a null or array where an object belongs, a non-integer cursor, a mark that cannot be acked, a
+ * `markSeq` behind a stored mark, a `__proto__` key) is rejected as a whole: the caller treats the file as a
+ * first start rather than crash-looping on it. Optional fields may be absent (the empty state fills them).
+ * @returns {string|null} null when valid, else the reason
+ */
+export function validateFeedState(s, role) {
+  if (!isPlainObject(s)) return 'not an object';
+  if (s.v !== FEED_STATE_VERSION) return 'version';
+  if (s.role !== role) return 'role';
+  if (s.cursor != null && !isCount(s.cursor)) return 'cursor';
+  if (s.markSeq != null && !isCount(s.markSeq)) return 'markSeq';
+  if (!isNumOrNull(s.updatedAt)) return 'updatedAt';
+  if (!isPlainObject(s.dirty)) return 'dirty';
+  let maxMark = 0;
+  for (const [k, m] of Object.entries(s.dirty)) {
+    if (k === '__proto__' || !isPlainObject(m) || !isCount(m.mark)) return 'dirty entry';
+    if (m.repo != null && typeof m.repo !== 'string') return 'dirty entry repo';
+    if (m.number != null && !(Number.isSafeInteger(m.number) && m.number > 0)) return 'dirty entry number';
+    if (!Number.isFinite(m.firstAt) || !Number.isFinite(m.lastAt)) return 'dirty entry time'; // describeDirty needs a real first-mark time
+    if (m.causes != null && m.causes.length > FEED_DEFAULTS.maxCauses) return 'dirty entry causes (bound)';
+    if (m.causes != null && !(Array.isArray(m.causes) && m.causes.every((c) => typeof c === 'string'))) return 'dirty entry causes';
+    maxMark = Math.max(maxMark, m.mark);
+  }
+  if ((s.markSeq ?? 0) < maxMark) return 'markSeq behind a stored mark'; // a new mark would look already acked
+  if (!isPlainObject(s.shaPrs)) return 'shaPrs';
+  const shaKeys = Object.entries(s.shaPrs);
+  if (shaKeys.length > FEED_DEFAULTS.shaMapMax) return 'shaPrs (bound)';
+  for (const [k, v] of shaKeys) {
+    if (k === '__proto__' || !Array.isArray(v) || v.length > FEED_DEFAULTS.maxPrsPerSha || !v.every((n) => Number.isSafeInteger(n) && n > 0)) return 'shaPrs entry';
+  }
+  if (s.stats != null) {
+    if (!isPlainObject(s.stats) || !Object.values(s.stats).every((n) => Number.isFinite(n))) return 'stats';
+  }
+  return null;
+}
+
+/** Read a role's state; a missing, unreadable or malformed file is a first start (empty state, cursor null). */
 export function loadFeedState(path, role, { readFile = readFileSync } = {}) {
   try {
     const s = JSON.parse(String(readFile(path, 'utf8')));
-    if (s?.v !== FEED_STATE_VERSION || s.role !== role || typeof s.dirty !== 'object') return { state: emptyFeedState(role), loaded: false };
-    return { state: { ...emptyFeedState(role), ...s, stats: { ...emptyFeedState(role).stats, ...(s.stats || {}) } }, loaded: true };
+    const invalid = validateFeedState(s, role);
+    if (invalid) return { state: emptyFeedState(role), loaded: false, invalid };
+    const empty = emptyFeedState(role);
+    return {
+      state: {
+        ...empty, cursor: s.cursor ?? null, markSeq: s.markSeq ?? 0, dirty: s.dirty, shaPrs: s.shaPrs,
+        stats: { ...empty.stats, ...(s.stats || {}) }, updatedAt: s.updatedAt ?? null,
+      },
+      loaded: true,
+    };
   } catch { return { state: emptyFeedState(role), loaded: false }; }
 }
 
@@ -241,6 +301,7 @@ export function createFeedConsumer(o) {
   const relevant = o.relevant ?? ((e) => isRelevantEvent(e, role, { repos }));
   const writeStatus = o.writeStatus !== undefined ? o.writeStatus : (s) => writeStatusFile(stateDir, role, s);
   const loaded = load(statePath, role);
+  if (loaded.invalid) log.error(`pr-event-feed(${role}): stored state rejected (${loaded.invalid}); treating as a first start`);
   let state = loaded.state;
   const health = { lastOkAt: null, lastFailAt: null, lastDeliveryAt: null, lastEventAt: null, lastError: null };
   const resumedFrom = loaded.loaded ? state.cursor : null;
@@ -283,7 +344,7 @@ export function createFeedConsumer(o) {
       for (const e of r.events || []) {
         if (!e?.sha || (Array.isArray(e.prs) && e.prs.length) || !relevant(e)) continue;
         const k = shaKey(e.repo, e.sha);
-        if (k in resolved || state.shaPrs[k]) continue;
+        if (k in resolved) continue; // once per head commit per page; the local map is unioned with it, not a substitute
         try { resolved[k] = await resolveSha(e.repo, e.sha); } catch { resolved[k] = null; }
       }
       const folded = foldEvents(state, r.events || [], { relevant, resolved, at });
