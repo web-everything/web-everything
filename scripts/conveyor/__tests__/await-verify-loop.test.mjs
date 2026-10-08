@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import {
   waitRecordForClaim, slotCountedFixClaims, runSlotAwareAwaitPass, runCompletionReleaseSweep, runTickAwaitVerify,
   withCycleLock, cycleLockRoot, CYCLE_LOCK_RESOURCE, nextWokenJournal, defaultSlotCountedFixClaims, cycleFailed,
-  superviseAwaitVerifyLoop, runAwaitVerifyCycleDefault, sessionSpeaksFor, runLoopCycle, runLoopIteration, LOOP_APP_AUTH_OPTS, readJournal,
+  superviseAwaitVerifyLoop, runAwaitVerifyCycleDefault, sessionSpeaksFor, withWakeIntent, runLoopCycle, runLoopIteration, LOOP_APP_AUTH_OPTS, readJournal,
 } from '../await-verify-loop.mjs';
 import { reserve, readLockEntry } from '../../readiness/file-locks.mjs';
 import { acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, listFixDispatchClaims } from '../fix-dispatch-claim.mjs';
@@ -496,6 +496,20 @@ describe('runAwaitVerifyCycleDefault against real stores (R5 fail-closed on the 
         expect(resume).not.toHaveBeenCalled();
         expect(readJournal(path).state).toBe('unreadable'); // still the directory: never replaced
       } finally { restore(); }
+    });
+    it('withWakeIntent (the second layer, for a record first seen mid-cycle): stamps every record the woken session speaks for BEFORE the wake, and refuses the wake when the stamp fails', () => {
+      const order = [];
+      const records = [{ key: 'a', record: rec(1) }, { key: 'b', record: rec(2) }, { key: 'c', record: rec(3, { sessionId: undefined, who: 'fix-1' }) }];
+      const io = { listRecords: () => records, resume: vi.fn(() => { order.push('resume'); return { resumed: true }; }) };
+      const stamp = vi.fn((whos) => { order.push(`stamp:${whos.join(',')}`); return true; });
+      const wrapped = withWakeIntent(io, { stamp });
+      expect(wrapped.resume({ session: { sessionId: 'sid-1', name: 'fix-1' }, prompt: 'p' })).toEqual({ resumed: true });
+      expect(order).toEqual(['stamp:fix-1,fix-1', 'resume']); // record 1 binds by session id, record 3 (no id) by the name; record 2 is another session
+      order.length = 0;
+      io.resume.mockClear();
+      const failing = withWakeIntent(io, { stamp: () => false });
+      expect(failing.resume({ session: { sessionId: 'sid-2' }, prompt: 'p' })).toEqual({ resumed: false, reason: 'wake-intent-not-persisted' });
+      expect(io.resume).not.toHaveBeenCalled();
     });
     it('sessionSpeaksFor: a record naming a session id binds to that session only; otherwise to its name', () => {
       expect(sessionSpeaksFor(rec(1), { sessionId: 'sid-1' })).toBe(true);

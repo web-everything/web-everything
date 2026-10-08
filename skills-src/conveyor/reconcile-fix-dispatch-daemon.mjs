@@ -854,8 +854,9 @@ export function buildFixThrottle({ slotClaims = defaultSlotCountedFixClaims, ...
   return createDispatchThrottle({ ...rest, listClaims: () => slotClaims() });
 }
 /**
- * main()'s two exits (SIGTERM/SIGINT and restart-onto-new-code). Each stops the await-verify loop child FIRST, then
- * releases the lease, then exits — a child outliving its daemon would keep pushing and waking with no one supervising it.
+ * main()'s three exits: SIGTERM/SIGINT (`shutdown`), restart-onto-new-code (`restartOntoNewCode`) and `runDaemonLoop`
+ * returning on its own (`loopEnded`). Each stops the await-verify loop child FIRST, then releases the lease (the first two
+ * then exit) — a child outliving its daemon would keep pushing and waking with no one supervising it.
  */
 export function buildDaemonExits({ awaitLoop, releaseLease, exit = (code) => process.exit(code), log = console } = {}) {
   let stopping = false;
