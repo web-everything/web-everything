@@ -2,7 +2,7 @@
 kind: story
 size: 3
 status: open
-scope: ["we"]
+scope: ["we:scripts/lib/referral-card-readable.mjs"]
 dateOpened: "2026-10-07"
 tags: []
 ---
