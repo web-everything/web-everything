@@ -19,6 +19,11 @@
 	  4. HEALTH_WATCH_LOGS_DIR is where the other daemons' launchd logs live (their StandardErrorPath dir).
 	  5. PASS_DAEMON_SELF_SYNC=1 turns self-sync ON explicitly for this pass-daemon (it is opt-in on that runner).
 
+	VERSIONED (card 89 S6): ProgramArguments and WorkingDirectory below point at the clone's `current` version, which
+	exists only AFTER `node scripts/lib/daemon-version.mjs migrate --clone=~/workspace/wev-health-watch`. Logs stay on
+	the compatibility path ~/workspace/wev-health-watch/.conveyor (a link into the shared state). Before migrating, use
+	~/workspace/wev-health-watch in those two places. `daemon-version.mjs plist` rewrites an installed plist for you.
+
 	INSTALL:  cp this file to ~/Library/LaunchAgents/com.we.health-watch.plist (drop `.example`), then
 	          launchctl load ~/Library/LaunchAgents/com.we.health-watch.plist
 	CHECK:    node ~/workspace/webeverything/scripts/operations/operator-queue.mjs --with-health   (first line = last-tick age)
@@ -49,7 +54,7 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin/node</string>
-		<string>/Users/nicolasgilbert/workspace/wev-health-watch/skills-src/conveyor/pass-daemon.mjs</string>
+		<string>/Users/nicolasgilbert/workspace/.daemon-clones/wev-health-watch/current/skills-src/conveyor/pass-daemon.mjs</string>
 		<string>--pass=health-watch</string>
 	</array>
 	<key>RunAtLoad</key>
@@ -61,6 +66,6 @@
 	<key>ThrottleInterval</key>
 	<integer>60</integer>
 	<key>WorkingDirectory</key>
-	<string>/Users/nicolasgilbert/workspace/wev-health-watch</string>
+	<string>/Users/nicolasgilbert/workspace/.daemon-clones/wev-health-watch/current</string>
 </dict>
 </plist>

@@ -29,14 +29,25 @@ const RETRYABLE_SMOKE = new Set(['transient', 'auth-broken', 'env-timeout']);
 const SMOKE_BACKOFF_BASE_MS = 5 * 60_000;
 const SMOKE_BACKOFF_MAX_MS = 60 * 60_000;
 
+/** True when `<clone home>/settings.local.json` holds `{"enabled": true}` (written by migrate). */
+function hostEnabled(dir) {
+  try { return JSON.parse(filesystem.readFileSync(join(dir, 'settings.local.json'), 'utf8'))?.enabled === true; }
+  catch { return false; }
+}
+
 /** The versioned context of `root`, or null when that clone is not enabled (the default for every clone). */
 export function resolveVersionedContext({ root, env = process.env, settings, settingsPath } = {}) {
   if (!root) return null;
-  const values = settings ?? resolveDaemonVersionsSettings({ fileConfig: loadDaemonVersionsSettingsFile(settingsPath), env }).values;
+  let values = settings ?? resolveDaemonVersionsSettings({ fileConfig: loadDaemonVersionsSettingsFile(settingsPath), env }).values;
   const clone = logicalCloneRoot(root);
   const name = basename(clone);
-  if (!isVersionedClone(name, values)) return null;
   const clonesRoot = values.clonesRoot ? resolve(values.clonesRoot) : join(dirname(clone), '.daemon-clones');
+  if (!isVersionedClone(name, values) && settings === undefined && hostEnabled(join(clonesRoot, name))) {
+    // Card 89 S6: `migrate` enables a clone on THIS host with a local file, so the flip needs no repo change
+    // (a repo flip would have to be in the version before it is built). `unmigrate` removes the file.
+    values = Object.freeze({ ...values, enabled: Object.freeze({ ...values.enabled, [name]: true }) });
+  }
+  if (!isVersionedClone(name, values)) return null;
   return { name, clone, home: clonesRoot, dir: join(clonesRoot, name), settings: values };
 }
 
@@ -121,9 +132,15 @@ export async function versionedRebuild({ ctx, log = console, deps = {} }) {
     return result;
   };
   try {
-    const fetched = run(['fetch', '--quiet', '--', 'origin', 'main'], { cwd: ctx.clone, timeout: 60_000 });
+    // A migrated clone has a stable bare repo (S6): fetch there and let versions borrow its objects, so no
+    // version depends on another version's (or the retired legacy clone's) object store.
+    const repoDir = join(ctx.dir, 'repo.git');
+    const hasRepo = fs.existsSync(join(repoDir, 'HEAD'));
+    const fetched = hasRepo
+      ? run(['fetch', '--quiet', '--', 'origin', '+refs/heads/main:refs/remotes/origin/main'], { cwd: repoDir, timeout: 60_000 })
+      : run(['fetch', '--quiet', '--', 'origin', 'main'], { cwd: ctx.clone, timeout: 60_000 });
     if (fetched.status !== 0) return finish({ moved: false, reason: 'fetch-failed' });
-    const rev = run(['rev-parse', '--verify', '--end-of-options', 'origin/main^{commit}'], { cwd: ctx.clone, timeout: 60_000 });
+    const rev = run(['rev-parse', '--verify', '--end-of-options', 'origin/main^{commit}'], { cwd: hasRepo ? repoDir : ctx.clone, timeout: 60_000 });
     const sha = String(rev.stdout ?? '').trim();
     if (rev.status !== 0 || !/^[0-9a-f]{40,64}$/.test(sha)) return finish({ moved: false, reason: 'rev-parse-failed' });
 
@@ -147,7 +164,7 @@ export async function versionedRebuild({ ctx, log = console, deps = {} }) {
       return finish({ moved: false, reason: 'smoke-backoff', head: sha, retryAt: retry.retryAt });
     }
 
-    const built = await build({ clone: ctx.clone, home: ctx.home, sha, settings: ctx.settings, deps: deps.buildDeps });
+    const built = await build({ clone: ctx.clone, home: ctx.home, sha, settings: ctx.settings, repo: hasRepo ? repoDir : undefined, deps: deps.buildDeps });
     if (built.status === 'disabled') return finish({ moved: false, reason: 'disabled' });
     const id = built.id;
     const record = readJson(fs, join(ctx.dir, 'versions', id, '.version.json'));

@@ -22,7 +22,7 @@ import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
  * alert, ensureNodeModulesStore, linkNodeModules, linkVersionState, carryUntrackedSidecars.
  * The store helper owns lockfileKey calculation and its build-once marker.
  */
-export async function buildVersion({ clone, home, sha = 'HEAD', settings, force = false, deps = {} }) {
+export async function buildVersion({ clone, home, sha = 'HEAD', settings, force = false, repo, deps = {} }) {
   const source = resolve(clone);
   const logical = logicalCloneRoot(source);
   const name = basename(logical);
@@ -38,7 +38,8 @@ export async function buildVersion({ clone, home, sha = 'HEAD', settings, force 
     if (result.status !== 0) throw new Error(`git ${args[0]} failed: ${result.stderr || result.error || ''}`);
     return String(result.stdout ?? '').trim();
   };
-  const fullSha = checked(git, ['rev-parse', '--verify', '--end-of-options', `${sha}^{commit}`]);
+  const objects = repo ? resolve(repo) : source; // where commits are read and borrowed from (S6: repo.git)
+  const fullSha = checked(gitAt(objects), ['rev-parse', '--verify', '--end-of-options', `${sha}^{commit}`]);
   if (!/^[0-9a-f]{40,64}$/.test(fullSha)) throw new Error('Invalid resolved commit SHA');
   const root = join(resolve(home), name);
   const versionsRoot = join(root, 'versions');
@@ -64,7 +65,7 @@ export async function buildVersion({ clone, home, sha = 'HEAD', settings, force 
   fs.mkdirSync(temp);
   const alert = deps.alert ?? (() => {});
   try {
-    checked(git, ['clone', '--shared', '--no-checkout', '--quiet', '--', source, temp]);
+    checked(git, ['clone', '--shared', '--no-checkout', '--quiet', '--', objects, temp]);
     const versionGit = gitAt(temp);
     checked(versionGit, ['checkout', '--detach', '--quiet', fullSha]);
     const store = (deps.ensureNodeModulesStore ?? ensureNodeModulesStore)({
@@ -116,7 +117,28 @@ export async function buildVersion({ clone, home, sha = 'HEAD', settings, force 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [command, ...args] = process.argv.slice(2);
   const value = key => args.find(arg => arg.startsWith(`--${key}=`))?.slice(key.length + 3);
-  if (command !== 'build') {
+  if (['migrate', 'unmigrate', 'plist'].includes(command)) {
+    // Card 89 S6. Exit 0 = done, 1 = error, 2 = refused (nothing changed or already undone).
+    try {
+      const allowed = command === 'plist'
+        ? /^--(?:clone|file|backup-dir|revert-from)=.+$/ : /^--(?:clone|home)=.+$/;
+      if (!value('clone') || args.some(arg => !allowed.test(arg) && !['--json', '--dry-run', '--force'].includes(arg))
+        || (command === 'plist' && !value('file'))) {
+        throw new Error('Usage: daemon-version.mjs migrate|unmigrate --clone=<ws>/<name> [--home=<clones root>] [--dry-run] [--force] [--json]  |  plist --clone=<ws>/<name> --file=<plist> --backup-dir=<dir> | --revert-from=<backup>');
+      }
+      const mod = await import('./daemon-version-migrate.mjs');
+      const { loadDaemonVersionsSettingsFile } = await import('./daemon-versions-settings.mjs');
+      const common = { clone: value('clone'), home: value('home'), settings: loadDaemonVersionsSettingsFile() };
+      const result = command === 'plist'
+        ? mod.rewritePlist({ file: value('file'), name: basename(logicalCloneRoot(value('clone'))), backupDir: value('backup-dir'), revertFrom: value('revert-from') })
+        : await mod[command]({ ...common, dryRun: args.includes('--dry-run'), force: args.includes('--force') });
+      console.log(JSON.stringify(result));
+      if (result.status === 'refused') process.exitCode = 2;
+    } catch (error) {
+      console.error(error.message);
+      process.exitCode = 1;
+    }
+  } else if (command !== 'build') {
     try {
       if (!['switch', 'rollback', 'gc', 'status'].includes(command) || !value('clone') || !value('home')
         || args.some(arg => !/^--(?:clone|home|id|expect-current|to|reason|by)=.+$/.test(arg)
