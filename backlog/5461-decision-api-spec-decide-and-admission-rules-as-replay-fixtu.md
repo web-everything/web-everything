@@ -1,9 +1,10 @@
 ---
+bornAs: xzlrqss
 kind: story
 size: 3
 parent: "5407"
 status: open
-blockedBy: ["xfla18q"]
+blockedBy: ["5456"]
 scope: ["we:scripts/conveyor/decide.mjs", "we:scripts/conveyor/__tests__/decide-replay.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
@@ -11,7 +12,7 @@ tags: []
 
 # Decision API spec: decide and admission rules as replay fixtures (events in, actions out)
 
-Ruling E4. The delivery standard specifies the Decision API (decide plus admission) as replay fixtures: a recorded event stream in, the exact action-requested set out, so two kernels must agree on what is owed. Limits and thresholds stay settings, not spec. Part of the event-driven daemons epic (xf7ax93).
+Ruling E4. The delivery standard specifies the Decision API (decide plus admission) as replay fixtures: a recorded event stream in, the exact action-requested set out, so two kernels must agree on what is owed. Limits and thresholds stay settings, not spec. Part of the event-driven daemons epic (5452).
 
 ## Acceptance
 

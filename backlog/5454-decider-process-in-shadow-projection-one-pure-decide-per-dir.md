@@ -1,9 +1,10 @@
 ---
+bornAs: xu8wvf7
 kind: story
 size: 5
-parent: "xf7ax93"
+parent: "5452"
 status: open
-blockedBy: ["4283", "xwgwm0b"]
+blockedBy: ["4283", "5453"]
 scope: ["we:scripts/conveyor/decider-daemon.mjs", "we:scripts/conveyor/decide.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/lib/dispatch-throttle.mjs"]
 dateOpened: "2026-10-08"
 tags: []
@@ -20,7 +21,7 @@ Rulings E1 and E2, step 2 (E6). One decider process reads the projection, runs o
 - [A3] At most one decide in flight per PR; an event that arrives meanwhile re-marks the PR so it runs again right after.
 - [A4] Decide returns `recheckAt` for time rules (lease expiry, cool-off, max time in state), and the decider honours it.
 - [A5] Every decide writes a decision record: PR, `seq` seen, decide version, actions, reasons.
-- [A6] SHADOW: the decider journals the action-requested events it would append next to what the live sweeps did, and acts on nothing. The diff report is the cut-over evidence for xs2vum1, xi921y1 and x33k4z1.
+- [A6] SHADOW: the decider journals the action-requested events it would append next to what the live sweeps did, and acts on nothing. The diff report is the cut-over evidence for 5459, 5457 and 5455.
 - [A7] Measured with the 2026-10-08 event-latency script: event-to-decide lag p50 reported.
 
 ## Non-goals

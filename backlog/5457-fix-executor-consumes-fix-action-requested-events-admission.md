@@ -1,9 +1,10 @@
 ---
+bornAs: xi921y1
 kind: story
 size: 3
-parent: "xf7ax93"
+parent: "5452"
 status: open
-blockedBy: ["xu8wvf7"]
+blockedBy: ["5454"]
 scope: ["we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs"]
 dateOpened: "2026-10-08"
 tags: []

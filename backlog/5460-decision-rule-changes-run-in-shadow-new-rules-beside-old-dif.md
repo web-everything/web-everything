@@ -1,9 +1,10 @@
 ---
+bornAs: xsq8d6q
 kind: story
 size: 3
-parent: "xf7ax93"
+parent: "5452"
 status: open
-blockedBy: ["xu8wvf7"]
+blockedBy: ["5454"]
 scope: ["we:scripts/conveyor/decider-daemon.mjs", "we:scripts/conveyor/decide.mjs"]
 dateOpened: "2026-10-08"
 tags: []

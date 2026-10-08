@@ -1,9 +1,10 @@
 ---
+bornAs: xlhivy1
 kind: story
 size: 3
-parent: "xf7ax93"
+parent: "5452"
 status: open
-blockedBy: ["xu8wvf7"]
+blockedBy: ["5454"]
 scope: ["we:scripts/conveyor/decider-daemon.mjs", "we:scripts/lib/pr-facts.mjs"]
 dateOpened: "2026-10-08"
 tags: []

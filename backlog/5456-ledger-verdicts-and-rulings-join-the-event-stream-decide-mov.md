@@ -1,9 +1,10 @@
 ---
+bornAs: xfla18q
 kind: story
 size: 5
-parent: "xf7ax93"
+parent: "5452"
 status: open
-blockedBy: ["xwgwm0b", "xu8wvf7"]
+blockedBy: ["5453", "5454"]
 scope: ["we:scripts/lib/verdict-ledger.mjs", "we:scripts/lib/pr-state.mjs", "we:scripts/conveyor/decide.mjs"]
 dateOpened: "2026-10-08"
 tags: []

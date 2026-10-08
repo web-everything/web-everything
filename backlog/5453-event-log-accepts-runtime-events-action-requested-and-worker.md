@@ -1,7 +1,8 @@
 ---
+bornAs: xwgwm0b
 kind: story
 size: 3
-parent: "xf7ax93"
+parent: "5452"
 status: open
 blockedBy: ["4283"]
 scope: ["we:scripts/conveyor/pr-events-worker/core.mjs", "we:scripts/conveyor/pr-events-worker/worker.mjs", "we:scripts/lib/pr-events.mjs"]
@@ -23,7 +24,7 @@ Ruling E3: one log, one order. Besides GitHub facts, the log takes action-reques
 
 ## Non-goals
 
-- [N1] Ledger verdicts and rulings joining the stream is xfla18q.
+- [N1] Ledger verdicts and rulings joining the stream is 5456.
 - [N2] No consumer changes; the decider and executors come later.
 
 ## Edge cases this change must handle

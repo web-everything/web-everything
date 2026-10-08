@@ -1,9 +1,10 @@
 ---
+bornAs: xs2vum1
 kind: story
 size: 3
-parent: "xf7ax93"
+parent: "5452"
 status: open
-blockedBy: ["xu8wvf7"]
+blockedBy: ["5454"]
 scope: ["we:skills-src/conveyor/review-daemon.mjs", "we:scripts/lib/pr-events.mjs"]
 dateOpened: "2026-10-08"
 tags: []
@@ -25,7 +26,7 @@ Ruling E2: the review role becomes an executor. It reads only review action-requ
 ## Non-goals
 
 - [N1] No change to how reviews are judged; only how the work is started.
-- [N2] Fix and ci-heal stay on their current loops (xi921y1, x33k4z1).
+- [N2] Fix and ci-heal stay on their current loops (5457, 5455).
 
 ## Edge cases this change must handle
 

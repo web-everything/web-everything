@@ -1,4 +1,5 @@
 ---
+bornAs: xf7ax93
 kind: epic
 parent: "3383"
 status: open
@@ -24,15 +25,15 @@ Operator rulings E1-E7 of 2026-10-08 on the event-driven daemon design (feeds #3
 
 1. xlta0x5 Event runtime foundation: persisted cursor + dirty-PR marking (3). Filed and being built by the `event-foundation-drain` lane, not re-filed here (it sits under #4075 there; re-parent it here and add it to #4283's `blockedBy` once it lands — it is not on main yet, so no `blockedBy` edge can name it today).
 2. #4283 Drain consumes the PR-events feed (2) ← foundation xlta0x5 (prose edge until it lands).
-3. xwgwm0b Log accepts runtime events (action-requested, worker started/finished) (3) ← #4283 (step 1 done, E6).
-4. xu8wvf7 Decider process in shadow (5) ← #4283, xwgwm0b.
-5. xs2vum1 Review executor + review sweep cut-over (3) ← xu8wvf7.
-6. xi921y1 Fix executor + admission on worker-finished (3) ← xu8wvf7.
-7. x33k4z1 ci-heal executor (2) ← xu8wvf7.
-8. xsq8d6q Decision-rule changes in shadow, flip per role (3) ← xu8wvf7.
-9. xlhivy1 Safety pass + batched re-sync + call budget alert (3) ← xu8wvf7.
-10. xfla18q Ledger joins the stream; decide on derivePrState (5) ← xwgwm0b, xu8wvf7.
-11. xzlrqss Decision API replay-fixture spec, filed under #5407 (3) ← xfla18q.
+3. 5453 Log accepts runtime events (action-requested, worker started/finished) (3) ← #4283 (step 1 done, E6).
+4. 5454 Decider process in shadow (5) ← #4283, 5453.
+5. 5459 Review executor + review sweep cut-over (3) ← 5454.
+6. 5457 Fix executor + admission on worker-finished (3) ← 5454.
+7. 5455 ci-heal executor (2) ← 5454.
+8. 5460 Decision-rule changes in shadow, flip per role (3) ← 5454.
+9. 5458 Safety pass + batched re-sync + call budget alert (3) ← 5454.
+10. 5456 Ledger joins the stream; decide on derivePrState (5) ← 5453, 5454.
+11. 5461 Decision API replay-fixture spec, filed under #5407 (3) ← 5456.
 
 ## Covered elsewhere (not re-filed)
 

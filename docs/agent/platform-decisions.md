@@ -3770,7 +3770,7 @@ merits** (clause 1). WAKE ships now (clause 2) = #2605 (drain-daemon `/nudge` se
 trigger, resolved) + the WAKE-remainder story `#2743`. Deferred merge-queue build (clause 3) = slice #2683's
 successor, gated behind tripwire **#2740** reading #2680's `land-serialization` saturation metric, **routed** by
 **#2704** (clause 4). Program #2606 / epic #2612. Clause 1 clarified 2026-10-08 by operator ruling E7 on the
-event-driven daemon design (#3886; epic xf7ax93, slice #4283). Extends [#pr-flow-rollout-mechanism](#pr-flow-rollout-mechanism)
+event-driven daemon design (#3886; epic 5452, slice #4283). Extends [#pr-flow-rollout-mechanism](#pr-flow-rollout-mechanism)
 (sole-writer-to-`main`) and composes with
 [#deterministic-core-thin-judgment](#deterministic-core-thin-judgment) (the wake/land mechanics are script-decidable;
 the high-stakes un-gate stays a routed judgment call).
