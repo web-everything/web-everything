@@ -1173,6 +1173,17 @@ export function dispatchFix(planned, {
     // advisor trial — sampled on THIS run's minted id (the same id the session's scratch cwd, and so its
     // transcript directory, is named by), so the report can join the arm to the run's own tokens.
     const advisor = advisorFor({ runId: sessionId, kind: 'fix' });
+    // advisor trial — the run's arm is recorded BEFORE the launch, so every launch mode
+    // (`claude --bg` today, the detached worker wrapper after #4439) records it the same way. The report joins on
+    // the run id; a launch that then fails leaves a row with no transcript, which the report shows as such.
+    // Best-effort: a log/ledger fault must never fail (or un-claim) the dispatch.
+    try {
+      console.error(advisorLogLine({ decision: advisor, sessionSlug, runId: sessionId }));
+      recordAdvisor(advisorLedgerRow({
+        decision: advisor, runId: sessionId, sessionSlug, repo, pr: planned.pr, item: planned.itemNum ?? null,
+        at: new Date().toISOString(),
+      }));
+    } catch { /* see above */ }
     const argv = buildAgentArgv({
       sessionId,
       advisor,
@@ -1192,17 +1203,6 @@ export function dispatchFix(planned, {
       settingsEnv: resolveSettingsEnv(sessionCwd),
       worktreeSettings: isolateSession(sessionCwd).worktreeSettings,
     });
-    // advisor trial — the run's arm is recorded once the argv is final and BEFORE the launch, so every launch mode
-    // (`claude --bg` today, the detached worker wrapper after #4439) records it the same way. The report joins on
-    // the run id; a launch that then fails leaves a row with no transcript, which the report shows as such.
-    // Best-effort: a log/ledger fault must never fail (or un-claim) the dispatch.
-    try {
-      console.error(advisorLogLine({ decision: advisor, sessionSlug, runId: sessionId }));
-      recordAdvisor(advisorLedgerRow({
-        decision: advisor, runId: sessionId, sessionSlug, repo, pr: planned.pr, item: planned.itemNum ?? null,
-        at: new Date().toISOString(),
-      }));
-    } catch { /* see above */ }
     // #3331 — READ THE REAL ID BACK OFF STDOUT, exactly as the resume branch above already does. `claude --bg`
     // discards `--session-id` and assigns its own, so the minted uuid addresses nothing; `agentId` is what
     // `claude agents`/`logs`/`stop` take. `sessionId` stays on the result for callers that already read it.

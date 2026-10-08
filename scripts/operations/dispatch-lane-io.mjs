@@ -127,6 +127,8 @@ import { supervisionEnforcementFrom, CLAUDE_NATIVE_MODEL_BY_TIER } from '../lib/
 import { readStore as readScorecardStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 // #3840 — the ONE per-item provider override: the card's own `deliveryAgent:` marker and its required reason.
 import { readItemDeliveryAgentOverride } from './delivery-agent-marker.mjs';
+// #x331b7u — the advisor trial's shared helper (sampling, `--advisor` flags, per-run ledger row).
+import { advisorArgv, advisorForLaunch, advisorLedgerRow, advisorLogLine, recordAdvisorRun, withAdvisorBrief } from '../lib/advisor-trial.mjs';
 // #3645/#3906 — WHICH LAUNCH KINDS HAVE A MECHANICAL PROVIDER. Every row lands OFF on main (`agent`), see the
 // registry's own header; {@link routeDispatchProvider} below is its only reader here.
 import { DISPATCH_PROVIDER_REGISTRY, dispatchModesFromEnv, dispatchProviderEntry } from './dispatch-provider-registry.mjs';
@@ -141,7 +143,6 @@ import {
 // narration went for the observer's `unresolved` message. See {@link isDispatchHandleLive}.
 import { DETACHED_HANDLE_PREFIX, defaultIsPidAlive, deliveryDispatchLogPath, detachedHandlePid } from './detached-dispatch.mjs';
 import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
-import { advisorArgv, advisorForLaunch, advisorLedgerRow, advisorLogLine, recordAdvisorRun, withAdvisorBrief } from '../lib/advisor-trial.mjs';
 
 /**
  * The three native Claude model ids {@link ../lib/dispatch-contracts.mjs#CLAUDE_NATIVE_MODEL_BY_TIER} maps to
