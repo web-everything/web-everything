@@ -26,7 +26,7 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { applyCompletionUpdate, newCompletionRecord, tryReadCompletion, withCompletionLock, writeCompletion } from './completion-store.mjs';
+import { applyCompletionUpdate, newCompletionRecord, readEnvelope, tryReadCompletion, withCompletionLock, writeCompletion } from './completion-store.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 
 /** The SAME two grammars `dispatch-lane.mjs#sessionSlugFor` (fix) and `review-dispatch.mjs` (review) mint. */
@@ -152,7 +152,10 @@ export function runReport(flags) {
 export function runShow(flags) {
   const session = flags.session || (flags.kind && flags.pr ? sessionSlugForCompletion({ kind: flags.kind, pr: flags.pr, repo: flags.repo }) : undefined);
   if (!session) throw new Error('usage: completion-cli.mjs show --session=<slug>|--kind=review|fix --pr=<n>');
-  const record = tryReadCompletion(session);
+  // 117 S2 (D2): `--envelope` reads through the ONE reader over the completion store and the two folded stores, so a
+  // v1 / delivery-report / fix-report record gains the v2 fields (`result`, `action`, `source`) as a read-time
+  // mapping. Without it `show` prints the raw completion record exactly as before (a v2 record already carries them).
+  const record = flags.envelope ? readEnvelope(session) : tryReadCompletion(session);
   return record ? { found: true, ...record } : { found: false, session };
 }
 
@@ -174,7 +177,7 @@ if (IS_CLI) {
     } else if (sub === 'show') {
       writeAllSync(1, `${JSON.stringify(runShow(flags))}\n`);
     } else {
-      writeLineSync(2, 'usage: completion-cli.mjs report|show [--session=<slug>] [--kind=review|fix] [--pr=<n>] ...');
+      writeLineSync(2, 'usage: completion-cli.mjs report|show [--session=<slug>] [--kind=review|fix] [--pr=<n>] [--envelope (show: read through the v2 envelope)] ...');
       process.exitCode = 2;
     }
   } catch (e) {

@@ -254,10 +254,10 @@ describe('applyCompletionUpdate', () => {
 
 describe('validateCompletionRecord', () => {
   it('reports EVERY problem, not just the first', () => {
-    const { ok, errors } = validateCompletionRecord({ v: 2, session: '', kind: 'nope', status: 'huh', pr: 5, startedAt: 'later', updatedAt: 'later' });
+    const { ok, errors } = validateCompletionRecord({ v: 3, session: '', kind: 'nope', status: 'huh', pr: 5, startedAt: 'later', updatedAt: 'later' });
     expect(ok).toBe(false);
     expect(errors).toEqual(expect.arrayContaining([
-      'unsupported completion record version 2', 'missing or invalid `session`',
+      'unsupported completion record version 3', 'missing or invalid `session`',
       '`kind` must be one of review/fix/inspect/ci-heal', '`pr` must be a string or null',
       '`status` must be one of started/done', 'missing or unparseable `startedAt`', 'missing or unparseable `updatedAt`',
     ]));
