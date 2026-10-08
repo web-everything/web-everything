@@ -1,0 +1,160 @@
+/**
+ * @file scripts/lib/__tests__/pr-comment-policy.test.mjs
+ * @description xadixye — daemons post a PR comment only when state changes or someone must act. Proves the
+ *   setting (`prComments.mode`), the status-only note kinds, the repeat check, and the drain's no-action reasons.
+ */
+import { describe, it, expect } from 'vitest';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  DEFAULT_PR_COMMENT_MODE, loadPrCommentSettings, isStatusOnlyNote, repeatsLatestComment,
+  isRepeatSuppressibleNote, isNoActionDrainReason, drainReasonCommentSuppressed, visibleCommentText,
+} from '../pr-comment-policy.mjs';
+
+const bot = (body) => ({ body, author: { login: 'web-everything' } });
+const stranger = (body) => ({ body, author: { login: 'random-person' } });
+
+function settingsFile(content) {
+  const dir = mkdtempSync(join(tmpdir(), 'pr-comment-policy-'));
+  const path = join(dir, 'pr-comments-settings.json');
+  writeFileSync(path, content);
+  return path;
+}
+
+describe('loadPrCommentSettings', () => {
+  it('defaults to on-change-or-action', () => {
+    expect(DEFAULT_PR_COMMENT_MODE).toBe('on-change-or-action');
+    expect(loadPrCommentSettings({ path: '/nonexistent/x.json', env: {} }).mode).toBe('on-change-or-action');
+  });
+  it('reads prComments.mode from the settings file', () => {
+    const path = settingsFile(JSON.stringify({ prComments: { mode: 'all' } }));
+    expect(loadPrCommentSettings({ path, env: {} }).mode).toBe('all');
+  });
+  it('the env override wins over the file', () => {
+    const path = settingsFile(JSON.stringify({ prComments: { mode: 'all' } }));
+    expect(loadPrCommentSettings({ path, env: { WE_PR_COMMENTS_MODE: 'on-change-or-action' } }).mode).toBe('on-change-or-action');
+  });
+  it('a malformed file or an unknown mode falls back to the default', () => {
+    expect(loadPrCommentSettings({ path: settingsFile('{not json'), env: {} }).mode).toBe('on-change-or-action');
+    expect(loadPrCommentSettings({ path: settingsFile('{"prComments":{"mode":"loud"}}'), env: {} }).mode).toBe('on-change-or-action');
+    expect(loadPrCommentSettings({ path: '/nonexistent/x.json', env: { WE_PR_COMMENTS_MODE: 'loud' } }).mode).toBe('on-change-or-action');
+  });
+  // PR #4494 review: an unknown env value must fall back to the default, not through to the file's `all`.
+  it('an invalid env override falls back to the default, whatever the file says', () => {
+    const all = settingsFile(JSON.stringify({ prComments: { mode: 'all' } }));
+    const onChange = settingsFile(JSON.stringify({ prComments: { mode: 'on-change-or-action' } }));
+    for (const bad of ['loud', 'on-change', 'al l', '0', 'all,on-change-or-action']) {
+      expect(loadPrCommentSettings({ path: all, env: { WE_PR_COMMENTS_MODE: bad } }).mode, bad).toBe('on-change-or-action');
+      expect(loadPrCommentSettings({ path: onChange, env: { WE_PR_COMMENTS_MODE: bad } }).mode, bad).toBe('on-change-or-action');
+    }
+  });
+  it('case and surrounding whitespace in env or file are forgiven (ALL, " all", "all\\r")', () => {
+    const onChange = settingsFile(JSON.stringify({ prComments: { mode: 'on-change-or-action' } }));
+    for (const v of ['ALL', ' all', 'all ', 'all\r', 'All\n']) {
+      expect(loadPrCommentSettings({ path: onChange, env: { WE_PR_COMMENTS_MODE: v } }).mode, JSON.stringify(v)).toBe('all');
+    }
+    const upper = settingsFile(JSON.stringify({ prComments: { mode: ' ALL ' } }));
+    expect(loadPrCommentSettings({ path: upper, env: {} }).mode).toBe('all');
+  });
+  it('an unset, empty or whitespace-only env override defers to the file', () => {
+    const allFile = settingsFile(JSON.stringify({ prComments: { mode: 'all' } }));
+    expect(loadPrCommentSettings({ path: allFile, env: { WE_PR_COMMENTS_MODE: '  ' } }).mode).toBe('all');
+    const all = settingsFile(JSON.stringify({ prComments: { mode: 'all' } }));
+    expect(loadPrCommentSettings({ path: all, env: {} }).mode).toBe('all');
+    expect(loadPrCommentSettings({ path: all, env: { WE_PR_COMMENTS_MODE: '' } }).mode).toBe('all');
+    expect(loadPrCommentSettings({ path: all, env: { WE_PR_COMMENTS_MODE: undefined } }).mode).toBe('all');
+  });
+  it('precedence matrix: env (valid) > file (valid) > default', () => {
+    for (const [fileMode, envMode] of [['all', 'all'], ['all', 'on-change-or-action'], ['on-change-or-action', 'all'], ['on-change-or-action', 'on-change-or-action']]) {
+      const path = settingsFile(JSON.stringify({ prComments: { mode: fileMode } }));
+      expect(loadPrCommentSettings({ path, env: { WE_PR_COMMENTS_MODE: envMode } }).mode).toBe(envMode);
+    }
+  });
+  it('the checked-in settings file is the default mode', () => {
+    expect(loadPrCommentSettings({ env: {} }).mode).toBe('on-change-or-action');
+  });
+});
+
+describe('isStatusOnlyNote', () => {
+  it('waiting/status notes need no one to act', () => {
+    expect(isStatusOnlyNote({ kind: 'review-label-missing' })).toBe(true);
+    expect(isStatusOnlyNote({ kind: 'stacked-awaiting-base' })).toBe(true);
+  });
+  it('escalations that need a person stay', () => {
+    for (const kind of ['ci-heal-exhausted', 'awaiting-permission', 'round-cap-exhausted', 'ruling-dispute',
+      'stacked-base-orphaned', 'something-new', undefined]) {
+      expect(isStatusOnlyNote({ kind })).toBe(false);
+    }
+  });
+});
+
+describe('isRepeatSuppressibleNote', () => {
+  it('no escalation kind is on the allowlist (an unknown kind never is either)', () => {
+    for (const kind of ['ci-heal-exhausted', 'awaiting-permission', 'round-cap-exhausted', 'permission-blocked',
+      'infra-retry-exhausted', 'session-overrun', 'liveness-wait-exhausted', 'ruling-dispute', 'stacked-base-orphaned',
+      'something-new', undefined]) {
+      expect(isRepeatSuppressibleNote({ kind }), String(kind)).toBe(false);
+    }
+    expect(isRepeatSuppressibleNote(null)).toBe(false);
+  });
+});
+
+describe('repeatsLatestComment', () => {
+  const isNote = (b) => b.startsWith('🔔');
+  it('true when the latest trusted comment of the same kind says the same thing (hidden markers ignored)', () => {
+    const comments = [bot('🔔 x\n\nsame text\n\n<!-- key: a -->')];
+    expect(repeatsLatestComment(comments, '🔔 x\n\nsame text\n\n<!-- key: b -->', isNote)).toBe(true);
+  });
+  it('false when the latest one differs, even if an older one matches', () => {
+    const comments = [bot('🔔 x\n\nsame text'), bot('🔔 x\n\nnewer text')];
+    expect(repeatsLatestComment(comments, '🔔 x\n\nsame text', isNote)).toBe(false);
+  });
+  it('ignores comments of other kinds and untrusted authors', () => {
+    expect(repeatsLatestComment([bot('other\n\nsame text')], '🔔 x\n\nsame text', isNote)).toBe(false);
+    expect(repeatsLatestComment([stranger('🔔 x\n\nsame text')], '🔔 x\n\nsame text', isNote)).toBe(false);
+  });
+  it('a marker spliced together by removing another is still hidden (CodeQL incomplete sanitization)', () => {
+    expect(visibleCommentText('a<!<!-- x -->-- y -->b')).toBe('ab');
+    expect(visibleCommentText('a <!-- never closed')).toBe('a');
+    expect(visibleCommentText('a <!-- k --> b')).toBe('a b');
+  });
+  it('tolerates a missing or odd comment list', () => {
+    expect(repeatsLatestComment(null, '🔔 x', isNote)).toBe(false);
+    expect(repeatsLatestComment([null, 5, {}], '🔔 x', isNote)).toBe(false);
+  });
+});
+
+describe('isNoActionDrainReason / drainReasonCommentSuppressed', () => {
+  const noAction = [
+    'not mergeable (mergeable=UNKNOWN)',
+    'required check "test" is not green',
+    'merge state BLOCKED (branch protection unsatisfied: required checks pending or red, or an uncleared review) — owned by the ci-heal / review daemons, nothing for the drain to rebase',
+    'base is not main (lane/worker-contract-s1)',
+    'held — a review hold (review:pending) stands, so the "ready-to-merge" go-ahead is withheld even though the required check is green (#2832). Specifically: blast-radius (a.mjs). Clear the review to release it.',
+  ];
+  const needsAction = [
+    'CodeQL check failed (new code-scanning alerts in the changed code) — refusing to land; fix the alert and re-push (drainBlocksOnCodeQL)',
+    'held — a review hold (review:human) stands, so the "ready-to-merge" go-ahead is withheld even though the required check is green (#2832). Clear the review to release it.',
+    'held — a review hold (review:changes, review:pending) stands, so the go-ahead is withheld. Clear the review to release it.',
+    'review:accepted is STALE — head advanced past the reviewed commit',
+    'merge conflict with main',
+    '',
+  ];
+  it('the waiting reasons are no-action', () => {
+    for (const r of noAction) expect(isNoActionDrainReason(r), r).toBe(true);
+  });
+  it('failures, human holds and send-backs still need action', () => {
+    for (const r of needsAction) expect(isNoActionDrainReason(r), r).toBe(false);
+  });
+  it('suppresses only skip/park kinds, only in on-change-or-action mode', () => {
+    expect(drainReasonCommentSuppressed('skip', noAction[0], { mode: 'on-change-or-action' })).toBe(true);
+    expect(drainReasonCommentSuppressed('park', noAction[4], { mode: 'on-change-or-action' })).toBe(true);
+    expect(drainReasonCommentSuppressed('skip', noAction[0], { mode: 'all' })).toBe(false);
+    expect(drainReasonCommentSuppressed('skip', needsAction[0], { mode: 'on-change-or-action' })).toBe(false);
+    // merges, merge traces and review-coverage records always post
+    for (const kind of ['land', 'merge-trace', 'review-coverage', 'stacked-base-close']) {
+      expect(drainReasonCommentSuppressed(kind, noAction[0], { mode: 'on-change-or-action' })).toBe(false);
+    }
+  });
+});
