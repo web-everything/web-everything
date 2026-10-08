@@ -3,9 +3,11 @@ bornAs: xe52oqu
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/check-standards.mjs", "we:scripts/check-backlog-item.mjs", "we:scripts/__tests__/check-standards-rules-content-lint.test.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/check-backlog-item.test.mjs"]
 dateOpened: "2026-09-28"
+dateStarted: "2026-10-07"
+dateResolved: "2026-10-07"
 preparedDate: "2026-10-07"
 preparedAgainstSha: "a0b98a3a8a5cb131567cedd58c4105c3b5874a12"
 tags: []
@@ -82,3 +84,4 @@ Run `node we:scripts/check-backlog-item.mjs <n>` (the scoped per-item validator,
 
 - Add one line to the prepare briefs' edge-case checklist for new smells (touches the brief rule ledger, so a separate item).
 - Promote the warning to an error once the existing backlog stays clean for a release.
+- **Delivered (2026-10-07):** guard 1 shipped as `findNewHealthSmellWithoutSiblingCheck` (warning in `lintBacklogItemRendering`, wired through `check:standards` and `check:item`; both entry-point tests shown red when their `fileExists` probe is removed). Guard 2 delivered by #487 `kind` validation (no `workItem` key exists any more).

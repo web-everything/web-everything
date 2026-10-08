@@ -696,6 +696,49 @@ export function findBuriedForkSections(body) {
   return findings;
 }
 
+// ── New health smell without a sibling-smell grep (#4419, owed by #2876's review) ───────────────────────
+// A card that adds a `health-smells/*.mjs` probe should first grep the other smells for the same signal
+// (probe name / threshold), or two smells fire on one condition. The auto-discovered smell dir is
+// `scripts/conveyor/health-smells/`, so a NEW smell is exactly a new scope path there.
+const NEW_SMELL_PATH_RX = /^scripts\/conveyor\/health-smells\/[a-z0-9-]+\.mjs$/;
+const SIBLING_SMELL_NOTE_RX = /sibling smell/i;
+
+/** The card body with fenced code blocks (``` / ~~~) removed, so a note quoted in a fence does not count. */
+function stripFencedCode(body) {
+  let fenceChar = null, fenceLen = 0;
+  return body.split('\n').filter((line) => {
+    const fm = line.match(/^\s*(`{3,}|~{3,})/);
+    if (fenceChar) {
+      if (fm && fm[1][0] === fenceChar && fm[1].length >= fenceLen) { fenceChar = null; fenceLen = 0; }
+      return false;
+    }
+    if (fm) { fenceChar = fm[1][0]; fenceLen = fm[1].length; return false; }
+    return true;
+  }).join('\n');
+}
+
+/**
+ * Scope entries that name a NEW health-smell file while the body carries no "sibling smell" note.
+ *
+ * Pure: `fileExists(repoRelativePath)` is injected. Fail closed toward quiet — a non-array scope, a
+ * non-string body, or a probe that throws yields no hit (a read error never raises a false warning).
+ * Both `we:scripts/…` and bare `scripts/…` spellings match. Returns the repo-relative paths.
+ */
+export function findNewHealthSmellWithoutSiblingCheck({ scope, body, fileExists = () => true } = {}) {
+  if (!Array.isArray(scope) || typeof body !== 'string') return [];
+  if (SIBLING_SMELL_NOTE_RX.test(stripFencedCode(body))) return [];
+  const hits = [];
+  for (const entry of scope) {
+    if (typeof entry !== 'string') continue;
+    const path = entry.replace(/^we:/, '');
+    if (!NEW_SMELL_PATH_RX.test(path) || hits.includes(path)) continue;
+    let exists = true;
+    try { exists = fileExists(path) !== false; } catch { exists = true; }
+    if (!exists) hits.push(path);
+  }
+  return hits;
+}
+
 // ── Polyglot-widening start-gate: an item that widens the forward-generation surface must cite ──────
 // external-adopter evidence (#2089 Fork 2(a), codified at
 // docs/agent/platform-decisions.md#forward-target-start-gate). The ratified rule: "every new
@@ -1172,7 +1215,7 @@ function hasUnfinishedAcceptanceBesideProofClaim(body) {
 // run file-driven (a malformed-YAML item is skipped by the loader, so it isn't in the item array at all),
 // so each caller runs `findUnquotedColonScalars(content)` over the raw file itself. Also excludes the
 // digest-length nudge (validateBacklogItem owns it) and the blockedBy cycle walk (a graph-level check).
-export function lintBacklogItemRendering({ item, body, pocRegistry = null, knownBacklogIds = null }) {
+export function lintBacklogItemRendering({ item, body, pocRegistry = null, knownBacklogIds = null, fileExists = () => true }) {
   const errors = [];
   const warnings = [];
   const id = item.id;
@@ -1222,6 +1265,15 @@ export function lintBacklogItemRendering({ item, body, pocRegistry = null, known
         `body — if it's a live design fork, carve it to a type:decision item that blocks this one; if it's ` +
         `already resolved or deferred elsewhere, reframe the heading or cite the decision (#NNN). ` +
         `See docs/agent/backlog-workflow.md → the carve rule.`);
+    }
+  }
+
+  // New health smell without a sibling-smell grep (#4419) — WARNING, open/active story/task cards only.
+  if ((item.status === 'open' || item.status === 'active') && (item.kind === 'story' || item.kind === 'task')) {
+    for (const path of findNewHealthSmellWithoutSiblingCheck({ scope: item.scope, body, fileExists })) {
+      warnings.push(`Backlog item "${id}" adds a new health smell \`${path}\` but its body has no "sibling smells" note — ` +
+        `grep the other scripts/conveyor/health-smells/*.mjs for the same signal (probe name / threshold) and ` +
+        `record the result on a line containing "sibling smells".`);
     }
   }
 
