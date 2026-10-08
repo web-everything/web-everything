@@ -22,11 +22,13 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import {
   mainCiRedSettings, mainRedState, findOwner, decideOwner, buildOwnerBrief, ownerSessionSlug, classifyRun,
 } from './main-ci-red-core.mjs';
 
-export const DEFAULT_REPO_SLUG = 'web-everything/web-everything';
+/** Main's repo: the WE entry of the constellation registry (never a hand-typed slug). */
+export const DEFAULT_REPO_SLUG = CONSTELLATION_REPOS.we.slug;
 const OPEN_PR_LIMIT = 300;
 const MAX_JOB_READS = 4;
 
