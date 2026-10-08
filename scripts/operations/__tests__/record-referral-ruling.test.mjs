@@ -181,6 +181,18 @@ describe('#4979 the sanctioned writer', () => {
       expect(referralCardReadable('we:backlog/xzz99zz-gone.md', root)).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+
+  it('xc7ctn1: --card we:backlog/<file>.md@pr<N> is taken as a full reference and its readability comes from the injected reader', () => {
+    const asked = [];
+    const readable = (ref, root) => { asked.push(ref); return ref.endsWith('@pr7'); };
+    expect(resolveCardRef('we:backlog/x.md@pr7', { readable })).toEqual({ requested: 'we:backlog/x.md@pr7', ref: 'we:backlog/x.md@pr7', readable: true, reason: 'readable' });
+    expect(resolveCardRef('we:backlog/x.md@pr8', { readable })).toMatchObject({ ref: 'we:backlog/x.md@pr8', readable: false });
+    // A malformed @pr shape is never taken as a reference, so the reader is never asked about it.
+    for (const bad of ['we:backlog/x.md@pr0', 'we:backlog/x.md@pr1234567890', 'we:backlog/x.md?ref=main@pr7']) {
+      expect(resolveCardRef(bad, { readable }), bad).toMatchObject({ ref: null, readable: false });
+    }
+    expect(asked).toEqual(['we:backlog/x.md@pr7', 'we:backlog/x.md@pr8']);
+  });
 });
 
 describe('#4979 acceptance and wake-up read the operator ruling', () => {
