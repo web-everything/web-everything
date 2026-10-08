@@ -665,7 +665,7 @@ export function findingIdentityTable(records = []) {
             normSummary: `${identity.normSummary}#${n}` });
         }
         entry = { findingId, ...identity, summary: normalizeFinding(f.original ?? f.finding).summary,
-          firstSeenHead: record.head, heads: [], lines: [], keys: [], rulings: [] };
+          firstSeenHead: record.head, heads: [], activeHeads: [], lines: [], keys: [], rulings: [] };
         table.push(entry);
         byId.set(findingId, entry);
       }
@@ -676,6 +676,10 @@ export function findingIdentityTable(records = []) {
         entry.forms.push({ normSummary: identity.normSummary, anchor: identity.anchor });
       }
       if (!entry.heads.includes(record.head)) entry.heads.push(record.head);
+      // The heads on which an ACTIVE referral (not one retired as dropped) holds the finding: what "already referred" means.
+      if (activeReferrals(record).some((a) => a.key === f.key) && !entry.activeHeads.includes(record.head)) {
+        entry.activeHeads.push(record.head);
+      }
       entry.keys.push({ head: record.head, runId: record.runId, key: f.key });
       for (const r of (record.rulings ?? []).filter((x) => x.key === f.key)) {
         entry.rulings.push({ head: record.head, runId: record.runId, key: f.key, result: r.result });
@@ -1433,6 +1437,48 @@ export function isSourcePath(file) {
   return dot > 0 && SOURCE_EXTENSIONS.has(name.slice(dot + 1).toLowerCase());
 }
 
+/** Is `latestFix` a readable fixer-push range: both heads named and `files` a plain map of path -> changed lines
+ *  (`null` = the line set is unknown)? The ONE shape check both round classifiers apply before trusting it. */
+function isWellFormedLatestFix(latestFix) {
+  const files = latestFix?.files;
+  return !(typeof latestFix?.priorHead !== 'string' || !latestFix.priorHead
+    || typeof latestFix.head !== 'string' || !latestFix.head
+    || !files || typeof files !== 'object' || Array.isArray(files)
+    || ![null, Object.prototype].includes(Object.getPrototypeOf(files))
+    || Object.values(files).some(lines => lines !== null && (!Array.isArray(lines)
+      || lines.some(n => !Number.isSafeInteger(n) || n < 0))));
+}
+
+/**
+ * WHERE A FINDING SITS RELATIVE TO THE FIXER'S LATEST PUSH — the ONE reading of "did the push address this finding"
+ * both round classifiers share (PR #4441 review: the referral classifier had its own, looser one). `files` is a
+ * well-formed {@link isWellFormedLatestFix} map. `state` is:
+ *   - `untouched`    — the push did not touch the cited file (or the finding cites none);
+ *   - `inconclusive` — it touched the file but the change cannot be placed against the citation: the changed-line set
+ *                      is unknown (`null`), the file is not source code, or the finding cites no line;
+ *   - `near`         — a source file, a known line set, and a changed line within {@link LATER_ROUND_CHANGE_WINDOW}
+ *                      of the cited line. The only POSITIVE evidence the cited code was edited;
+ *   - `far`          — a source file, a known line set, and every changed line outside that window.
+ * Cited paths resolve through the SAME lenient matcher the admission step used (basename, absolute path, repo
+ * prefix), so a touched file cited in an alias form is never mistaken for an untouched one. PURE.
+ * @returns {{path: string, state: 'untouched'|'inconclusive'|'near'|'far'}}
+ */
+function fixerChangeNearFinding(finding, files, { strictAlias = false } = {}) {
+  const cited = typeof finding?.file === 'string' ? exactCitedPath(finding.file) : '';
+  let path;
+  if (cited && Object.hasOwn(files, cited)) path = cited;
+  else if (strictAlias && cited) {
+    // Evidence that a fix was made: an alias (a bare basename) that fits two changed files names neither of them.
+    const hits = Object.keys(files).filter((p) => matchCitedPath(finding.file, [p]));
+    if (hits.length > 1) return { path: cited, state: 'inconclusive' };
+    path = hits[0] ?? cited;
+  } else path = cited && matchCitedPath(finding.file, Object.keys(files)) || cited;
+  const line = Number.isInteger(finding?.line) && finding.line > 0 ? finding.line : null;
+  if (!path || !Object.hasOwn(files, path)) return { path, state: 'untouched' };
+  if (files[path] === null || !isSourcePath(path) || line === null) return { path, state: 'inconclusive' };
+  return { path, state: files[path].some(n => Math.abs(n - line) <= LATER_ROUND_CHANGE_WINDOW) ? 'near' : 'far' };
+}
+
 export function classifyLaterRoundAdvisory(findings, options = {}) {
   const { lens, mandatoryLenses = MANDATORY_LENSES, scope, latestFix } = options ?? {};
   const list = Array.isArray(findings) ? findings : [];
@@ -1441,27 +1487,13 @@ export function classifyLaterRoundAdvisory(findings, options = {}) {
   // `all` was asked for: nothing is scoped, so an unreadable range is not a fallback and must not be reported as one.
   if (scope !== 'changed-only') return keepAll();
   if (latestFix.error) return keepAll(`changed-range-unreadable: ${latestFix.error}`);
-  const files = latestFix.files;
-  if (typeof latestFix.priorHead !== 'string' || !latestFix.priorHead
-    || typeof latestFix.head !== 'string' || !latestFix.head
-    || !files || typeof files !== 'object' || Array.isArray(files)
-    || ![null, Object.prototype].includes(Object.getPrototypeOf(files))
-    || Object.values(files).some(lines => lines !== null && (!Array.isArray(lines)
-      || lines.some(n => !Number.isSafeInteger(n) || n < 0)))) {
-    return keepAll('changed-range-unreadable: malformed-latest-fix');
-  }
+  if (!isWellFormedLatestFix(latestFix)) return keepAll('changed-range-unreadable: malformed-latest-fix');
   if ((Array.isArray(mandatoryLenses) ? mandatoryLenses : MANDATORY_LENSES).includes(lens) || scope !== 'changed-only') return keepAll();
   const kept = [];
   const deferred = [];
   for (const finding of list) {
-    const cited = typeof finding?.file === 'string' ? exactCitedPath(finding.file) : '';
-    // Resolve through the SAME lenient matcher the admission step used (basename, absolute path, repo prefix), so a
-    // touched file cited in an alias form is never mistaken for an untouched one and deferred.
-    const path = cited && (Object.hasOwn(files, cited) ? cited : matchCitedPath(finding.file, Object.keys(files))) || cited;
-    const line = Number.isInteger(finding?.line) && finding.line > 0 ? finding.line : null;
-    const touched = Object.hasOwn(files, path);
-    if (!path || (touched && (files[path] === null || !isSourcePath(path) || line === null
-      || files[path].some(n => Math.abs(n - line) <= LATER_ROUND_CHANGE_WINDOW)))) {
+    const { path, state } = fixerChangeNearFinding(finding, latestFix.files);
+    if (!path || state === 'inconclusive' || state === 'near') {
       kept.push(finding);
     } else {
       deferred.push({ ...finding, deferred: DEFERRED_ADVISORY_REASON });
@@ -1486,39 +1518,77 @@ export const REFERRAL_DEMOTED_REASONS = Object.freeze({
  * per known finding with the heads it was referred on and its rulings) each candidate is exactly one of:
  *   - `covered`  — the same finding (identity, never wording or line) is already referred on THIS head. It is already
  *                  awaiting or holding its ruling; referring it again is the duplicate that re-parked the PR.
- *   - `demoted`  — to a card suggestion, never a ruling owed: (a) it is new on a head that already carries referrals, so
- *                  it was first raised in a later round of an unchanged head; or (b) it re-raises a finding that was
- *                  ruled `block` on an earlier head and the fixer's latest push touched the cited file (the fix it
- *                  asked for was made; `latestFix.files` is the push's changed-file set).
- *   - `kept`     — anything else: a first sighting on a head with no referrals, or a re-raise the fixer did not touch
- *                  (that one stays mandatory so the ignored-ruling path still sees it).
+ *   - `demoted`  — to a card suggestion, never a ruling owed: (a) it is new on a head whose referral round has FINISHED
+ *                  (`openHeads` does not name it) and came from an ADVISORY lens: it was first raised in a later round
+ *                  of an unchanged head. A gate lens (`mandatoryLenses`: correctness, security) is never silenced
+ *                  this way — {@link classifyLaterRoundAdvisory} keeps it in every round too, and a re-arm or
+ *                  send-back that asks for a fresh look must be able to surface a blocker the first panel missed; or
+ *                  (b) it re-raises a finding that was ruled `block` on an earlier head and the fixer's latest push
+ *                  changed code NEAR the re-raise's cited line (`fixerChangeNearFinding` state `near`: a source file, a
+ *                  known line set, a changed line within the window) — the only positive evidence the fix was made.
+ *                  Touching the cited file is not that: an unknown line set, a non-source file, a distant edit or a
+ *                  re-raise citing no line proves nothing, so those stay `kept`.
+ *   - `kept`     — anything else: a first sighting on a head with no referrals, a gate-lens finding in a later round,
+ *                  any finding on a head whose referral round never finished, or a re-raise the fixer did not
+ *                  demonstrably fix (that one stays mandatory so the ignored-ruling path still sees it).
  * @param {Array<{seat: string, original: object}>} candidates
- * @param {{identity?: Array<object>, head?: (string|null), latestFix?: (object|null)}} o
+ * @param {{identity?: Array<object>, head?: (string|null), latestFix?: (object|null), lens?: string,
+ *   mandatoryLenses?: Array<string>, openHeads?: Array<string>}} o - `lens` is the seat's lens (every candidate in one
+ *   call comes from one seat); `openHeads` is {@link openReferralHeads} of the thread.
  * @returns {{kept: Array<object>, covered: Array<object>, demoted: Array<{candidate: object, reason: string}>}}
  */
-export function classifyReferralsByRound(candidates, { identity = [], head = null, latestFix = null } = {}) {
+export function classifyReferralsByRound(candidates, { identity = [], head = null, latestFix = null, lens,
+  mandatoryLenses = MANDATORY_LENSES, openHeads = [] } = {}) {
   const table = Array.isArray(identity) ? identity : [];
   const list = Array.isArray(candidates) ? candidates : [];
   const headHasReferrals = Boolean(head) && table.some((e) => (e.heads ?? []).includes(head));
-  const fixFiles = latestFix && typeof latestFix === 'object' && !latestFix.error && latestFix.files
-    && typeof latestFix.files === 'object' ? Object.keys(latestFix.files) : [];
+  // A head whose referral round never finished (a partial persistence, a crash before the attempt) has no "earlier
+  // round" to scope against: a finding the retry raises there may be one that never got persisted. A caller that
+  // names no lens is treated as a gate lens: the round rule may only silence a lens it knows to be advisory.
+  const advisoryLens = typeof lens === 'string' && lens !== ''
+    && !(Array.isArray(mandatoryLenses) ? mandatoryLenses : MANDATORY_LENSES).includes(lens);
+  const laterRound = headHasReferrals && !(Array.isArray(openHeads) && openHeads.includes(head)) && advisoryLens;
+  const fixFiles = latestFix && typeof latestFix === 'object' && !latestFix.error && isWellFormedLatestFix(latestFix)
+    ? latestFix.files : null;
   const out = { kept: [], covered: [], demoted: [] };
   for (const candidate of list) {
     const id = bindFindingIds([candidate.original], table, { sameHead: headHasReferrals, ignoreLens: true })[0];
     const entry = id ? table.find((e) => e.findingId === id) : null;
-    if (entry && head && (entry.heads ?? []).includes(head)) { out.covered.push(candidate); continue; }
+    // Covered means an ACTIVE referral on this head holds the finding: one the sink retired as dropped (its seat was
+    // disabled) awaits no ruling, so a re-raise of it must not vanish into "covered".
+    if (entry && head && (entry.activeHeads ?? entry.heads ?? []).includes(head)) { out.covered.push(candidate); continue; }
     if (entry) {
       const blocked = (entry.rulings ?? []).some((r) => r.result === 'block');
-      const cited = typeof candidate.original?.file === 'string' ? exactCitedPath(candidate.original.file) : '';
-      const touched = Boolean(cited) && (fixFiles.includes(cited) || Boolean(matchCitedPath(candidate.original.file, fixFiles)));
-      if (blocked && touched) { out.demoted.push({ candidate, reason: REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE }); continue; }
+      if (blocked && fixFiles && fixerChangeNearFinding(candidate.original, fixFiles, { strictAlias: true }).state === 'near') {
+        out.demoted.push({ candidate, reason: REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE });
+        continue;
+      }
       out.kept.push(candidate);
       continue;
     }
-    if (headHasReferrals) { out.demoted.push({ candidate, reason: REFERRAL_DEMOTED_REASONS.LATER_ROUND_SAME_HEAD }); continue; }
+    if (laterRound) { out.demoted.push({ candidate, reason: REFERRAL_DEMOTED_REASONS.LATER_ROUND_SAME_HEAD }); continue; }
     out.kept.push(candidate);
   }
   return out;
+}
+
+/**
+ * HEADS WHOSE REFERRAL ROUND NEVER FINISHED, read off the PR thread. PURE.
+ *
+ * A head is OPEN when it carries a referral record that nobody has attempted (`attempted: false`) and that still holds a
+ * live referral ({@link liveReferrals}: not dropped, superseded, carried or ruled by the reviewer). The sink persists every chunk of a run's referrals BEFORE it records any attempt, so a
+ * run that died part-way through persisting (chunk 1 posted, chunk 2 not) leaves exactly this: the head has a record, but
+ * the findings of the chunks that never posted are nowhere. A retry review on that head must keep referring them rather
+ * than set them aside as "first raised in a later round" ({@link classifyReferralsByRound}). A record whose findings are
+ * all carried, superseded or dropped has no live referral and does not open its head.
+ * @param {Array<object|string>} comments - the PR's complete comment thread.
+ * @returns {string[]} head shas.
+ */
+export function openReferralHeads(comments) {
+  const { records } = readReferralRecords(Array.isArray(comments) ? comments : []);
+  // Unattempted with a live referral, whether or not it is still pending: the operator may have ruled the persisted
+  // chunk while the chunk that never posted is still owed, and the head's round is no more finished for that.
+  return [...new Set(records.filter((r) => !r.attempted && liveReferrals(r).length > 0).map((r) => r.head))];
 }
 
 /**

@@ -9,7 +9,7 @@ tags: []
 
 # Review: a ruling on an unchanged head resumes the paused review; no fresh panel, no new referrals
 
-After an operator ruling on an unchanged head the review daemon (we:scripts/conveyor/review-referral-hold.mjs release then we:scripts/operations/review-loop-cli.mjs fresh start) ran a full new panel that raised NEW mandatory referrals, so the PR flipped back to advisory:ruling-needed and never reached the operator (live 2026-10-08: #4361 ruling 12:09Z then fresh review 12:15Z with 2 new referrals; #4388 round 2 at 12:20Z re-raised a finding the fixer had already fixed). Fix: resume the parked run (rewind to the mandatoryReferrals step) and reuse its verdict and findings; findings first raised in a later round on the same head become card suggestions (rule of #3999), and a re-raised finding matched by finding identity (#4233) is not re-referred. New referrals come only from a new push. Gate change: needs human review.
+After an operator ruling on an unchanged head the review daemon (we:scripts/conveyor/review-referral-hold.mjs release then we:scripts/operations/review-loop-cli.mjs fresh start) ran a full new panel that raised NEW mandatory referrals, so the PR flipped back to advisory:ruling-needed and never reached the operator (live 2026-10-08: #4361 ruling 12:09Z then fresh review 12:15Z with 2 new referrals; #4388 round 2 at 12:20Z re-raised a finding the fixer had already fixed). Fix: resume the parked run (rewind to the mandatoryReferrals step) and reuse its verdict and findings; advisory-lens findings first raised in a later round on the same head become card suggestions (rule of #3999; gate lenses are never set aside), and a re-raised finding matched by finding identity (#4233) is not re-referred. New referrals come only from a new push. Gate change: needs human review.
 
 ## Done when
 
@@ -30,3 +30,6 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — a finding is matched by finding identity (#4233), never by wording or line; covered means already referred on this head.
 6. **State over time** — a push moves the head, so the parked run no longer resumes and new referrals come only from the new review.
 7. **Who wrote it** — only trusted-marker authors and the operator count as ruling events.
+8. **Evidence a fix was made** — a block-ruled re-raise is set aside only when the fixer's push changed a source file within the #3999 line window of the cited line (`fixerChangeNearFinding`, shared with the later-round advisory rule). Touching the file is not enough: an unknown line set, a non-source file (a backlog card, docs, config), a distant edit or a re-raise citing no line all stay mandatory, so the ignored-ruling path still sees them.
+9. **Gate lenses** — correctness and security findings are never set aside by the round rule, in any round; only an advisory seat's later-round finding becomes a card suggestion.
+10. **Partial persistence** — a head with a referral record nobody has attempted (a run died between chunks) is not a finished round; the retry keeps referring on it (`openReferralHeads`).
