@@ -17,7 +17,7 @@ Rulings E1 and E2, step 2 (E6). One decider process reads the projection, runs o
 ## Acceptance
 
 - [A1] **Executable** — a unit test calls the pure decide with one PR state that owes both a review and a fix and asserts it returns exactly one of them; a second test asserts decide makes no network call (fetch and gh are stubbed to throw).
-- [A2] One decider process: reads dirty PRs from the foundation cursor (xlta0x5), folds the projection, runs decide once per dirty PR for all roles, then runs admission over caps and free slots (fix cap, ci-heal reserve, heavy test slots, host load as settings).
+- [A2] One decider process: reads dirty PRs from the foundation cursor (5501), folds the projection, runs decide once per dirty PR for all roles, then runs admission over caps and free slots (fix cap, ci-heal reserve, heavy test slots, host load as settings).
 - [A3] At most one decide in flight per PR; an event that arrives meanwhile re-marks the PR so it runs again right after.
 - [A4] Decide returns `recheckAt` for time rules (lease expiry, cool-off, max time in state), and the decider honours it.
 - [A5] Every decide writes a decision record: PR, `seq` seen, decide version, actions, reasons.
