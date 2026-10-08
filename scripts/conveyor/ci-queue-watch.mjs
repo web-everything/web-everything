@@ -33,9 +33,13 @@
  *   samples fall off the front once the cap is hit, so the file never grows unbounded across months of ticks).
  *   Each sample: `{ checkedAt, sampled, started, maxWaitSeconds, avgWaitSeconds, status, reason }`.
  *
- * THIS PASS IS PURELY INFORMATIVE — no dispatch gate reads it (unlike branch-drift's `blocked` verdict, which
- *   `dispatch-plan.mjs` holds dispatch on). The card asks only to make the trend VISIBLE, not to act on it; a
- *   gate can be layered on top of the persisted history later, once there is an actual trend to gate on.
+ * THE QUEUE-WAIT SAMPLE IS PURELY INFORMATIVE — no dispatch gate reads it (unlike branch-drift's `blocked`
+ *   verdict, which `dispatch-plan.mjs` holds dispatch on). The card asks only to make the trend VISIBLE.
+ *
+ * HUNG JOBS ACT (we:backlog/xncfkf2) — the one part of this pass that writes to GitHub: a check stuck
+ *   `in_progress` past `max(floor, k × p95)` of its own recent successful durations is cancelled (if its run is
+ *   still running) and re-run ONCE per (PR, head, check); a second hang escalates via the `ci-job-hung` health
+ *   smell. See {@link sweepHungJobs}. `WE_CI_HUNG_ACTION=0` / `--dry-run` turn the writes off.
  */
 
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
@@ -176,6 +180,129 @@ export function serializeHistory(history) {
   return `${JSON.stringify(Array.isArray(history) ? history : [], null, 2)}\n`;
 }
 
+// ── HUNG CI JOBS (we:backlog/xncfkf2) ──────────────────────────────────────────────────────────────────────
+//
+// Live 2026-10-08: PR #4450's required `daemon-soak` job sat `in_progress` for 90+ minutes (GitHub kept the job
+// `in_progress` although every step had finished and `completed_at` was set). Nothing noticed, so the PR would
+// have waited for GitHub's 6-hour job timeout. The sweep below reads open PRs' check rollups, learns each
+// check's recent successful durations, and calls a check HUNG when it has been `in_progress` longer than
+// `max(floor, k × p95)`. A hung job is recovered ONCE per (PR, head, check): its run is cancelled if still
+// running, then the job is re-run. A second hang on the same head is not retried — it is logged as an
+// `ci-job-hung: ESCALATE {json}` line, which the `ci-job-hung` health smell raises as [high].
+
+/** k in `max(floor, k × p95)`. Env/flag: `WE_CI_HUNG_K` / `--hung-k=`. */
+export const DEFAULT_HUNG_K = 3;
+export const HUNG_K_ENV = 'WE_CI_HUNG_K';
+/** The floor (seconds) under which no check is ever called hung, whatever its history. Env/flag:
+ *  `WE_CI_HUNG_FLOOR_SEC` / `--hung-floor-sec=`. 30 min: every real job here finishes well inside it. */
+export const DEFAULT_HUNG_FLOOR_SEC = 30 * 60;
+export const HUNG_FLOOR_ENV = 'WE_CI_HUNG_FLOOR_SEC';
+/** How many automatic re-runs one (PR, head, check) gets before a further hang escalates instead. */
+export const DEFAULT_HUNG_MAX_RERUNS = 1;
+/** Rolling window of successful durations kept per check name. */
+export const DEFAULT_DURATION_WINDOW = 50;
+/** After a cancel, how long to wait for the run to complete before force-cancelling it. */
+export const CANCEL_GRACE_MS = 5 * 60_000;
+/** Ledger entries older than this are dropped (their PR has long since moved on). */
+export const HUNG_LEDGER_TTL_MS = 7 * 24 * 3600_000;
+/** Kill switch: `WE_CI_HUNG_ACTION=0` makes `sweep` detect and log only, never cancel or re-run. */
+export const HUNG_ACTION_ENV = 'WE_CI_HUNG_ACTION';
+
+const ACTIONS_JOB_URL_RE = /\/actions\/runs\/(\d+)\/job\/(\d+)/;
+
+/** `{runId, jobId}` from a rollup entry's Actions `detailsUrl`; null for a check with no Actions job (no rerun
+ *  handle — e.g. a third-party app's check run). PURE. */
+export function jobRefOf(check) {
+  const m = ACTIONS_JOB_URL_RE.exec(String(check?.detailsUrl || ''));
+  return m ? { runId: Number(m[1]), jobId: Number(m[2]) } : null;
+}
+
+/** A successful, completed check's duration in seconds; null for anything else. PURE. */
+export function successDurationSec(check) {
+  if (String(check?.status || '').toUpperCase() !== 'COMPLETED') return null;
+  if (String(check?.conclusion || '').toUpperCase() !== 'SUCCESS') return null;
+  const s = Date.parse(check.startedAt);
+  const e = Date.parse(check.completedAt);
+  if (!Number.isFinite(s) || !Number.isFinite(e) || e < s) return null;
+  return (e - s) / 1000;
+}
+
+/** Nearest-rank percentile; null for an empty list. PURE. */
+export function percentile(values, p) {
+  const v = (Array.isArray(values) ? values : []).filter(Number.isFinite).sort((a, b) => a - b);
+  if (!v.length) return null;
+  const rank = Math.ceil((p / 100) * v.length);
+  return v[Math.min(v.length, Math.max(1, rank)) - 1];
+}
+
+/** Fold the successful durations seen in `prs`' rollups into `durations` (`{name: [{jobId, sec}]}`), dedup by
+ *  job id, newest last, capped to `window` per name. PURE (returns a new map). */
+export function learnDurations(durations, prs, { window = DEFAULT_DURATION_WINDOW } = {}) {
+  const out = {};
+  for (const [name, list] of Object.entries(durations || {})) out[name] = Array.isArray(list) ? [...list] : [];
+  for (const p of Array.isArray(prs) ? prs : []) {
+    for (const c of p?.statusCheckRollup || []) {
+      const sec = successDurationSec(c);
+      const ref = jobRefOf(c);
+      if (sec === null || !ref || !c.name) continue;
+      const list = out[c.name] || (out[c.name] = []);
+      if (list.some((s) => s.jobId === ref.jobId)) continue;
+      list.push({ jobId: ref.jobId, sec });
+    }
+  }
+  const cap = Number.isFinite(window) && window > 0 ? window : DEFAULT_DURATION_WINDOW;
+  for (const name of Object.keys(out)) if (out[name].length > cap) out[name] = out[name].slice(out[name].length - cap);
+  return out;
+}
+
+/** `max(floor, k × p95)` over one check's duration samples. PURE. */
+export function hungThreshold(samples, { k = DEFAULT_HUNG_K, floorSec = DEFAULT_HUNG_FLOOR_SEC } = {}) {
+  const secs = (Array.isArray(samples) ? samples : []).map((s) => s?.sec);
+  const p95Sec = percentile(secs, 95);
+  const thresholdSec = Math.max(floorSec, p95Sec === null ? 0 : k * p95Sec);
+  return { thresholdSec, p95Sec, samples: secs.filter(Number.isFinite).length };
+}
+
+/** Every `in_progress` check (with an Actions job behind it) running longer than its threshold. PURE.
+ *  `now` is epoch ms. */
+export function findHungChecks(prs, durations, { now, k = DEFAULT_HUNG_K, floorSec = DEFAULT_HUNG_FLOOR_SEC } = {}) {
+  const out = [];
+  for (const p of Array.isArray(prs) ? prs : []) {
+    for (const c of p?.statusCheckRollup || []) {
+      if (String(c?.status || '').toUpperCase() !== 'IN_PROGRESS') continue;
+      const ref = jobRefOf(c);
+      const started = Date.parse(c.startedAt);
+      if (!ref || !c.name || !Number.isFinite(started)) continue;
+      const inProgressSec = (now - started) / 1000;
+      const t = hungThreshold(durations?.[c.name], { k, floorSec });
+      if (inProgressSec <= t.thresholdSec) continue;
+      out.push({ pr: p.number, headSha: p.headRefOid, name: c.name, ...ref, startedAt: c.startedAt, inProgressSec, ...t });
+    }
+  }
+  return out;
+}
+
+/** The ledger key: one recovery budget per (PR, head, check). PURE. */
+export function hungKey({ pr, headSha, name }) {
+  return `${pr}@${headSha}:${name}`;
+}
+
+/** Decide per hung check: `recover` (first hang), `handled` (this exact job was already acted on — GitHub can
+ *  keep reporting it in_progress), or `escalate` (a NEW hang on a head whose re-run budget is spent). PURE. */
+export function planHungActions(hung, ledger, { maxReruns = DEFAULT_HUNG_MAX_RERUNS } = {}) {
+  return (Array.isArray(hung) ? hung : []).map((h) => {
+    const key = hungKey(h);
+    const e = ledger?.[key];
+    let action = 'recover';
+    // A recovery GitHub refused (cancel/re-run failed) is not retried every sweep — it escalates instead.
+    if (e && /-failed$/.test(String(e.stage || ''))) action = 'escalate';
+    else if (e && (e.jobIds || []).includes(h.jobId)) action = 'handled';
+    else if (e && (e.reruns ?? 0) >= maxReruns) action = 'escalate';
+    return { ...h, key, action };
+  });
+}
+
+
 // ── IO SHELL (gh / fs only past this point) ─────────────────────────────────────────────────────────────────
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -308,6 +435,143 @@ export function sweepCiQueue({
   return { ...sample, persisted };
 }
 
+// ── HUNG CI JOBS: IO shell ────────────────────────────────────────────────────────────────────────────────
+
+const WE_SLUG = 'web-everything/web-everything';
+
+/** Every gh call below goes through `execFileSyncThrottled` (the shared gh-throttle semaphore + backoff), the
+ *  same sanctioned path `defaultListRuns` uses. */
+function ghJson(exec, argv) {
+  const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+  const text = String(out || '').trim();
+  return text ? JSON.parse(text) : null;
+}
+
+/** Open PRs with their check rollups (one `gh pr list` call). */
+export function defaultListPrs({ exec = execFileSyncThrottled, repo = WE_SLUG } = {}) {
+  const parsed = ghJson(exec, ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '100', '--json', 'number,headRefOid,statusCheckRollup']);
+  return Array.isArray(parsed) ? parsed : [];
+}
+export function defaultGetRun({ exec = execFileSyncThrottled, repo = WE_SLUG, runId }) {
+  return ghJson(exec, ['api', `repos/${repo}/actions/runs/${runId}`]) || {};
+}
+const ghPost = (path) => ({ exec = execFileSyncThrottled, repo = WE_SLUG, runId, jobId }) => {
+  ghJson(exec, ['api', '-X', 'POST', `repos/${repo}/actions/${path({ runId, jobId })}`]);
+};
+export const defaultCancelRun = ghPost(({ runId }) => `runs/${runId}/cancel`);
+export const defaultForceCancelRun = ghPost(({ runId }) => `runs/${runId}/force-cancel`);
+export const defaultRerunJob = ghPost(({ jobId }) => `jobs/${jobId}/rerun`);
+export const defaultRerunRun = ghPost(({ runId }) => `runs/${runId}/rerun`);
+
+/** The hung-job state sidecar, next to the queue history: `<history>.hung-jobs.json`. */
+export function resolveHungStatePath(repo = null) {
+  return resolveCiQueueHistoryPath(repo).replace(/(\.json)?$/, '.hung-jobs.json');
+}
+/** `{durations, hung}`; never throws (a corrupt sidecar reads as empty). */
+export function readHungState(path) {
+  try {
+    const raw = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {};
+    return { durations: raw?.durations && typeof raw.durations === 'object' ? raw.durations : {}, hung: raw?.hung && typeof raw.hung === 'object' ? raw.hung : {} };
+  } catch { return { durations: {}, hung: {} }; }
+}
+function writeHungState(state, path) {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
+  renameSync(tmp, path);
+}
+
+const errText = (e) => String(e?.stderr || e?.message || e).trim().split('\n')[0].slice(0, 200);
+
+/**
+ * THE HUNG-JOB SWEEP. Learns durations, finds hung checks, and (when `apply`) recovers each first hang:
+ * cancel its run if still running (re-run happens on a later sweep, once the run completes; a cancel that has
+ * not taken after {@link CANCEL_GRACE_MS} is force-cancelled), else re-run the job (falling back to re-running
+ * the whole run if GitHub refuses the job re-run). A second hang on the same head escalates (logged, never
+ * retried). Every action is recorded in the ledger and logged as a `ci-job-hung:` line. Never throws on a
+ * single GitHub write failing — it is recorded and the sweep moves on.
+ */
+export function sweepHungJobs({
+  repo = null, statePath = resolveHungStatePath(repo), now = () => Date.now(),
+  k = DEFAULT_HUNG_K, floorSec = DEFAULT_HUNG_FLOOR_SEC, maxReruns = DEFAULT_HUNG_MAX_RERUNS, apply = true,
+  listPrs = defaultListPrs, getRun = defaultGetRun, cancelRun = defaultCancelRun, forceCancelRun = defaultForceCancelRun,
+  rerunJob = defaultRerunJob, rerunRun = defaultRerunRun, log = (l) => writeLineSync(2, l),
+} = {}) {
+  const slug = repo || WE_SLUG;
+  const nowMs = now();
+  const at = new Date(nowMs).toISOString();
+  const prs = listPrs({ repo: slug });
+  return withHistoryLock(statePath, () => {
+    const state = readHungState(statePath);
+    state.durations = learnDurations(state.durations, prs);
+    for (const [key, e] of Object.entries(state.hung)) {
+      if (!(nowMs - Date.parse(e?.updatedAt || 0) < HUNG_LEDGER_TTL_MS)) delete state.hung[key];
+    }
+    const actions = [];
+    const record = (entry, action, h, ok, error = null) => {
+      const a = { at, action, pr: h.pr, name: h.name, runId: h.runId, jobId: h.jobId, ok, ...(error ? { error } : {}) };
+      entry.actions = [...(entry.actions || []), a].slice(-20);
+      entry.updatedAt = at;
+      actions.push(a);
+      log(`ci-job-hung: ${ok ? 'RECOVER' : 'FAILED'} ${JSON.stringify({ repo: slug, ...a })}`);
+    };
+    const rerun = (entry, h) => {
+      try { rerunJob({ repo: slug, runId: h.runId, jobId: h.jobId }); entry.reruns = (entry.reruns ?? 0) + 1; entry.stage = 'rerun-requested'; record(entry, 'rerun-job', h, true); return; }
+      catch (e) { record(entry, 'rerun-job', h, false, errText(e)); }
+      try { rerunRun({ repo: slug, runId: h.runId }); entry.reruns = (entry.reruns ?? 0) + 1; entry.stage = 'rerun-requested'; record(entry, 'rerun-run', h, true); }
+      catch (e) { entry.stage = 'rerun-failed'; record(entry, 'rerun-run', h, false, errText(e)); }
+    };
+    const runStatus = (h) => { try { return String(getRun({ repo: slug, runId: h.runId })?.status || ''); } catch { return ''; } };
+
+    // 1. Pending re-runs the ledger owes (a cancel was issued on an earlier sweep).
+    if (apply) {
+      for (const entry of Object.values(state.hung)) {
+        if (entry.stage !== 'cancel-requested') continue;
+        const h = { pr: entry.pr, name: entry.name, runId: entry.runId, jobId: entry.jobIds?.at(-1) };
+        const status = runStatus(h);
+        if (status === 'completed') rerun(entry, h);
+        else if (nowMs - Date.parse(entry.cancelRequestedAt || 0) >= CANCEL_GRACE_MS && !entry.forceCancelledAt) {
+          try { forceCancelRun({ repo: slug, runId: h.runId }); entry.forceCancelledAt = at; record(entry, 'force-cancel', h, true); }
+          catch (e) { record(entry, 'force-cancel', h, false, errText(e)); }
+        }
+      }
+    }
+
+    // 2. Newly detected hangs.
+    const hung = planHungActions(findHungChecks(prs, state.durations, { now: nowMs, k, floorSec }), state.hung, { maxReruns });
+    const escalations = [];
+    for (const h of hung) {
+      const view = { repo: slug, pr: h.pr, headSha: h.headSha, check: h.name, runId: h.runId, jobId: h.jobId, inProgressMin: Math.round(h.inProgressSec / 60), thresholdMin: Math.round(h.thresholdSec / 60) };
+      if (h.action === 'handled') continue;
+      if (h.action === 'escalate') {
+        const entry = state.hung[h.key];
+        entry.escalatedAt = entry.escalatedAt || at;
+        entry.updatedAt = at;
+        escalations.push({ ...h });
+        // Logged EVERY sweep while the hang lasts (inProgressMin changes, so log de-dup never folds it away):
+        // the health smell's episode stays open exactly as long as this keeps appearing.
+        log(`ci-job-hung: ESCALATE ${JSON.stringify({ ...view, reruns: entry.reruns ?? 0 })}`);
+        continue;
+      }
+      log(`ci-job-hung: DETECTED ${JSON.stringify(view)}`);
+      if (!apply) continue;
+      const entry = state.hung[h.key] || (state.hung[h.key] = { pr: h.pr, headSha: h.headSha, name: h.name, reruns: 0, jobIds: [] });
+      entry.jobIds = [...(entry.jobIds || []), h.jobId];
+      entry.runId = h.runId;
+      entry.detectedAt = at;
+      const status = runStatus(h);
+      if (status && status !== 'completed') {
+        try { cancelRun({ repo: slug, runId: h.runId }); entry.stage = 'cancel-requested'; entry.cancelRequestedAt = at; record(entry, 'cancel', h, true); }
+        catch (e) { entry.stage = 'cancel-failed'; record(entry, 'cancel', h, false, errText(e)); }
+      } else {
+        rerun(entry, h);
+      }
+    }
+    try { writeHungState(state, statePath); } catch { /* best-effort — the actions above already happened and were logged */ }
+    return { checkedAt: at, prs: prs.length, hung, actions, escalations };
+  });
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
 function parseFlags(argv) {
@@ -350,16 +614,40 @@ async function main(argv) {
     return;
   }
 
-  if (verb !== 'sweep') {
-    writeLineSync(2, 'usage: ci-queue-watch.mjs [sweep|check] [--repo=<owner/name>] [--limit=<n>] [--json]');
+  if (verb !== 'sweep' && verb !== 'hung') {
+    writeLineSync(2, 'usage: ci-queue-watch.mjs [sweep|check|hung] [--repo=<owner/name>] [--limit=<n>] [--hung-k=<k>] [--hung-floor-sec=<s>] [--dry-run] [--json]');
     process.exitCode = 2;
+    return;
+  }
+
+  // The hung-job sweep (we:backlog/xncfkf2): part of every `sweep` (so the existing per-repo pass daemon runs
+  // it with no manifest change), or alone via `hung`. `--dry-run` / `WE_CI_HUNG_ACTION=0` → detect + log only.
+  const hungOpts = {
+    repo,
+    statePath: historyPath.replace(/(\.json)?$/, '.hung-jobs.json'),
+    k: numFlag(flags, 'hung-k', HUNG_K_ENV, DEFAULT_HUNG_K),
+    floorSec: numFlag(flags, 'hung-floor-sec', HUNG_FLOOR_ENV, DEFAULT_HUNG_FLOOR_SEC),
+    apply: !flags['dry-run'] && process.env[HUNG_ACTION_ENV] !== '0',
+  };
+  const runHung = () => {
+    try { return sweepHungJobs(hungOpts); }
+    catch (e) { writeLineSync(2, `ci-job-hung: ERROR ${errText(e)}`); return { error: errText(e), hung: [], actions: [], escalations: [] }; }
+  };
+
+  if (verb === 'hung') {
+    const hungResult = runHung();
+    if (asJson) writeAllSync(1, `${JSON.stringify(hungResult)}\n`);
+    else writeLineSync(2, `ci-job-hung: ${hungResult.hung.length} hung check(s), ${hungResult.actions.length} action(s), ${hungResult.escalations.length} escalation(s)`);
+    process.exitCode = hungResult.error ? 1 : 0;
     return;
   }
 
   const limit = numFlag(flags, 'limit', null, DEFAULT_SAMPLE_LIMIT);
   const watchThresholdSec = numFlag(flags, 'watch-sec', WATCH_THRESHOLD_ENV, DEFAULT_WATCH_THRESHOLD_SEC);
   const blockedThresholdSec = numFlag(flags, 'blocked-sec', BLOCKED_THRESHOLD_ENV, DEFAULT_BLOCKED_THRESHOLD_SEC);
-  const result = sweepCiQueue({ repo, limit, historyPath, watchThresholdSec, blockedThresholdSec });
+  const result = { ...sweepCiQueue({ repo, limit, historyPath, watchThresholdSec, blockedThresholdSec }) };
+  const hungResult = runHung();
+  result.hung = { count: hungResult.hung.length, actions: hungResult.actions.length, escalations: hungResult.escalations.length, ...(hungResult.error ? { error: hungResult.error } : {}) };
 
   if (asJson) writeAllSync(1, `${JSON.stringify(result)}\n`);
   else {
