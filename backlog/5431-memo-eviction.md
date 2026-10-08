@@ -1,9 +1,10 @@
 ---
 bornAs: xzxi69a
 kind: task
-status: open
+status: resolved
 scope: ["we:scripts/lane-pool.mjs", "we:scripts/__tests__/lane-pool-clean-verdict-memo.test.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-08"
 estimatedLoc: 20
 tags: []
 ---
