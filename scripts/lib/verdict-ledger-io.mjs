@@ -21,7 +21,8 @@ import {
   readFromTransportBranch,
   stageOnTransportBranch,
 } from './git-transport-branch.mjs';
-import { parseVerdictLog, serializeLedgerEvent } from './verdict-ledger.mjs';
+import { parseVerdictLog, parseLedgerEvents, serializeLedgerEvent, checkLedgerAppendRows } from './verdict-ledger.mjs';
+import { registerLedgerStore } from './verdict-ledger-store.mjs';
 
 export const LEDGER_TRANSPORT_BRANCH = 'ops/review-requests';
 export const LEDGER_DIR = 'verdict-ledger';
@@ -113,6 +114,38 @@ export function appendLedgerRows({
   }
   throw new LedgerAppendExhaustedError({ repo, attempts, errors });
 }
+
+/**
+ * The git-branch store as a contract adapter (card xsij7u6). A thin wrapper: `append` and `read` delegate to
+ * {@link appendLedgerRows} / {@link readLedgerFromGit} unchanged, turning the append's throw into `{ok: false}`.
+ * `ctx` / `range` carry `board` (required) and any transport seams (`run`, `branch`, ...).
+ * @param {{appendRows?: Function, readRows?: Function}} [impl] - test seams.
+ */
+export function createGitLedgerStore({ appendRows = appendLedgerRows, readRows = readLedgerFromGit } = {}) {
+  return {
+    name: 'git',
+    capabilities: { durable: true, shared: true, ordering: 'total' },
+    append(rows, ctx = {}) {
+      const check = checkLedgerAppendRows(rows, ctx?.repo);
+      if (!check.ok) return { ok: false, appended: 0, error: check.error };
+      try {
+        const { repo: _ctxRepo, ...rest } = ctx ?? {};
+        appendRows({ ...rest, repo: check.repo, records: check.records });
+        return { ok: true, appended: rows.length };
+      } catch (e) {
+        return { ok: false, appended: 0, error: String(e?.message ?? e).split('\n')[0].slice(0, 300) };
+      }
+    },
+    read(range = {}) {
+      const { repo, from = 0, ...rest } = range;
+      const r = readRows({ ...rest, repo });
+      if (r.status !== 'ok') return { status: 'unreadable', reason: r.reason, error: r.error };
+      return { status: 'ok', rows: parseLedgerEvents(r.text).filter((x) => x.repo === repo).slice(from) }; // every event type, not only v1 verdicts; only this repo's rows
+    },
+  };
+}
+
+registerLedgerStore(createGitLedgerStore());
 
 function defaultSleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
