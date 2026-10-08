@@ -4,7 +4,7 @@ size: 3
 status: active
 scaffoldedBy: "open-pr-org-token"
 dateScaffolded: "2026-10-08"
-scope: ["we:scripts/operations/open-pr-io.mjs", "we:scripts/lib/gh-app-shim.mjs"]
+scope: ["we:scripts/operations/open-pr-io.mjs", "we:scripts/lib/gh-app-shim.mjs", "we:scripts/operations/__tests__/open-pr-io-org-shim.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
