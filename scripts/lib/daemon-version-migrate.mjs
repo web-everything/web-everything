@@ -15,7 +15,6 @@ import { spawnSync } from 'node:child_process';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { logicalCloneRoot } from './daemon-clone-layout.mjs';
 import { validateDaemonVersionsSettings } from './daemon-versions-settings.mjs';
-import { buildVersion } from './daemon-version.mjs';
 import { switchCurrent } from './daemon-version-switch.mjs';
 import { readOverlays } from './daemon-overlays.mjs';
 
@@ -71,6 +70,8 @@ export async function migrate({ clone, home, settings, dryRun = false, force = f
   }
   git(p.repo, ['fetch', '--quiet', '--no-tags', '--', p.logical, '+HEAD:refs/migrate/base']);
   const on = { ...config, enabled: { [name]: true } };
+  // Injected by the CLI: daemon-version.mjs is the entry module there, and importing it back would deadlock.
+  const buildVersion = deps.buildVersion ?? (await import('./daemon-version.mjs')).buildVersion;
   const built = await buildVersion({ clone: p.logical, home: dirname(p.root), sha, settings: on, force: true, repo: p.repo, deps: deps.buildDeps });
   const record = built.status === 'reused' ? JSON.parse(fs.readFileSync(join(built.dir, '.version.json'), 'utf8')) : built;
   if (record.status !== 'built') return { status: 'refused', reason: 'smoke-failed', id: record.id, steps };

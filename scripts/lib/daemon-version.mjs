@@ -114,7 +114,8 @@ export async function buildVersion({ clone, home, sha = 'HEAD', settings, force 
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Not top-level await: this module is imported back (cycle via self-sync), and a pending entry module would deadlock it.
+async function cli() {
   const [command, ...args] = process.argv.slice(2);
   const value = key => args.find(arg => arg.startsWith(`--${key}=`))?.slice(key.length + 3);
   if (['migrate', 'unmigrate', 'plist'].includes(command)) {
@@ -178,3 +179,5 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     }
   }
 }
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) cli();
