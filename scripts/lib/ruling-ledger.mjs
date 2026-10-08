@@ -21,7 +21,7 @@
  * PURE. A record is only read from a trusted author (`readReferralRecords` enforces that), and a comment that
  * cannot be read as a record contributes nothing here (the hold itself already fails closed on malformed ones).
  */
-import { readReferralRecords, mandatoryReferralState, parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds, sameFindingForClearing } from './jury-core.mjs';
+import { readReferralRecords, mandatoryReferralState, parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds, sameFindingForClearing, operatorRulingId } from './jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { DEFAULT_FIXER_ESCALATION, TEST_FIRST_INSTRUCTION, humanAtMisses } from './fixer-escalation-policy.mjs';
 
@@ -100,7 +100,7 @@ export function rulingNeeded(pr, { humanAt = DEFAULT_HUMAN_AT, cardReadable = ()
     ...(typeof pr?.body === 'string' ? { body: pr.body } : {}), ...(pr?.createdAt ? { createdAt: pr.createdAt } : {}) });
   const live = new Map();
   for (const f of state.pendingFindings) {
-    if (f.attempted && !live.has(f.key)) live.set(f.key, { key: f.key, seat: f.seat, file: f.file, line: f.line, summary: f.summary, reason: 'pending' });
+    if (f.attempted && !live.has(f.key)) live.set(f.key, { key: f.key, seat: f.seat, file: f.file, line: f.line, summary: f.summary, judgmentCall: f.judgmentCall === true, reason: 'pending' });
   }
   const ig = ignoredRulings(pr, { humanAt });
   if (ig?.escalate) for (const m of ig.matches) if (!live.has(m.finding.key)) live.set(m.finding.key, { ...m.finding, reason: 'dispute' });
@@ -214,10 +214,17 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
     for (const x of parsed?.record?.rulings ?? []) {
       const ruled = allRecords.find((r) => r.runId === x.runId && r.head === parsed.record.head)?.referrals.find((f) => f.key === x.key);
       if (ruled) structured.push({ index, result: x.result, clearing: clearingView(ruled), supersedes: x.supersedes ?? [] });
+      // A structured `block` (the operator's, or `auto-policy`'s under review.referralDefault=auto-block) is a standing
+      // block like a reviewer's: the same finding coming back on a later head is an ignored ruling, so a fixer that
+      // keeps missing escalates to the operator instead of being auto-blocked forever.
+      if (ruled && x.result === 'block') {
+        blocks.set(`structured:${index}:${x.runId}:${x.key}`, { source: 'structured', rulingId: operatorRulingId({ head: parsed.record.head, runId: x.runId, key: x.key, at: parsed.record.at }),
+          finding: findingView(ruled), clearing: clearingView(ruled), ruling: x.reason ?? parsed.record.reason, priorHead: parsed.record.head, index, at: sinceOf(c) });
+      }
     }
   });
   const overruled = (b) => {
-    if (b.source !== 'record') return false;
+    if (b.source !== 'record' && b.source !== 'structured') return false;
     // Held item 132: the LATEST operator ruling on the finding decides. It reaches the block either by naming the block's
     // id (`supersedes`, which survives a drifted line) or by being the same finding. A `block` never overrules.
     const latest = structured.filter((o) => o.index > b.index
@@ -225,7 +232,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
     return !!latest && latest.result !== 'block';
   };
 
-  const matchesBlock = (view, b) => b.source === 'record'
+  const matchesBlock = (view, b) => b.source === 'record' || b.source === 'structured'
     ? sameFinding(view, b.finding)
     : hintMatchesFile(b.hints, view.file) && claimSimilarity(view.summary, b.text) >= SIMILARITY_FLOOR;
 
@@ -264,7 +271,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
         if (s.record.referrals.some((x) => matchesBlock(findingView(x), b))) heads.add(s.record.head);
       }
       worst = Math.max(worst, heads.size);
-      matches.push({ finding: g, runId: record.runId, blockRulingId: b.rulingId ?? null, ruledFinding: b.source === 'record' ? b.finding : null, ruling: b.ruling, priorHead: b.priorHead,
+      matches.push({ finding: g, runId: record.runId, blockRulingId: b.rulingId ?? null, ruledFinding: b.source === 'record' || b.source === 'structured' ? b.finding : null, ruling: b.ruling, priorHead: b.priorHead,
         ruledAt: b.at ? new Date(b.at).toISOString() : null, source: b.source, misses: heads.size });
     }
   }
