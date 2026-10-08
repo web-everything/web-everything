@@ -78,6 +78,7 @@
  * state, which auto-retries with backoff and resume-opens the PR once infra recovers (nothing is stranded; the
  * drain stays the sole writer to main). A non-zero exit means `main` was left UNTOUCHED.
  */
+import { defaultShimDir, resolveOrgAwareShimDir, pathWithOrgAwareShim } from './lib/gh-app-shim.mjs';
 import { publicationTitle, readMainCard } from './operations/machine-pr-title.mjs';
 import { producerBuildContext, checkpointBuildPr } from './operations/build-pr-authorship.mjs';
 import { execFileSync } from 'node:child_process';
@@ -138,6 +139,13 @@ function readBodyFile(p) {
 }
 
 const REPO = resolve(expandHome(flags.repo) || process.cwd());
+// xpd70wx — a direct pr-land run whose PATH carries the stale legacy gh shim (no owner map: it cannot see the
+// plateauapp org) swaps it for the daemons' org-aware shim. Only ever replaces the legacy dir; a test's or an
+// operator's own `gh` earlier on PATH is untouched. No token is read or printed.
+if ((process.env.PATH || '').split(':').includes(defaultShimDir())) {
+  const orgPath = pathWithOrgAwareShim({ pathEnv: process.env.PATH || '', orgDir: resolveOrgAwareShimDir() });
+  if (orgPath) process.env.PATH = orgPath;
+}
 const REF = typeof flags.ref === 'string' ? flags.ref : null;
 const SRC = typeof flags.sha === 'string' ? flags.sha : 'HEAD'; // source commit to publish to the lane ref (the lane clone's HEAD)
 const BASE = typeof flags.base === 'string' ? flags.base : 'main';

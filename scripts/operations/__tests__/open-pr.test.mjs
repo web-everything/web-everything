@@ -622,7 +622,7 @@ describe('items 79/81 — truthful label-on-green outcome, credential env, --bra
   });
 
   it('the runner spawns pr-land with the app-token shim on PATH (#79)', () => {
-    const env = resolveGhCredentialEnv({ env: { PATH: '/usr/bin' }, build: () => null, exists: () => true });
+    const env = resolveGhCredentialEnv({ env: { PATH: '/usr/bin' }, build: () => null, exists: () => true, orgShimDir: () => null });
     expect(env.PATH).toMatch(/gh-shim:\/usr\/bin$/);
     let seen;
     createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), env, spawn: (_n, _a, o) => { seen = o.env; return { status: 0, stdout: '{"pr":1}' }; } })({ argv: ['--ref=lane/x'] });

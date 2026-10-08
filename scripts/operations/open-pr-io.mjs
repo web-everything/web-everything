@@ -22,7 +22,7 @@ import { classifySubmit } from './open-pr.mjs';
 import { checkDuplicateBornAs } from '../lib/duplicate-bornas-added.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { buildGhShimSettingsEnv, defaultShimDir, ghShimPathOverride, shimGhPath } from '../lib/gh-app-shim.mjs';
+import { buildGhShimSettingsEnv, defaultShimDir, ghShimPathOverride, shimGhPath, resolveOrgAwareShimDir, pathWithOrgAwareShim } from '../lib/gh-app-shim.mjs';
 
 /**
  * #81 — a lane's ref, when the caller did not name one. `lane/<slug>` from the lane lease's `purpose`
@@ -43,10 +43,16 @@ export function deriveLaneRef({
  * `gh` ran unauthenticated and pr-land reported a false "no credential". Prefer this checkout's shim (App
  * opted in), else the shared shim dir if it exists and is not already first on PATH; else leave env alone.
  */
-export function resolveGhCredentialEnv({ env = process.env, exists = existsSync, build = buildGhShimSettingsEnv } = {}) {
+export function resolveGhCredentialEnv({ env = process.env, exists = existsSync, build = buildGhShimSettingsEnv, orgShimDir = () => resolveOrgAwareShimDir({ exists }) } = {}) {
   try {
     const built = build({ env, pathEnv: env.PATH || '' });
     if (built?.PATH) return { ...env, ...built };
+  } catch { /* fall through */ }
+  // xpd70wx — the target repo may live in ANY constellation org (plateauapp, frontier-ui, web-everything). The
+  // legacy shared shim has no owner map and cannot see plateauapp, so prefer the daemons' org-aware shim.
+  try {
+    const orgPath = pathWithOrgAwareShim({ pathEnv: env.PATH || '', orgDir: orgShimDir() });
+    if (orgPath) return { ...env, PATH: orgPath };
   } catch { /* fall through */ }
   const dir = defaultShimDir();
   if (exists(shimGhPath(dir)) && !(env.PATH || '').split(':').includes(dir)) {

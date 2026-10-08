@@ -1882,7 +1882,13 @@ export function planReconcile({
     // promote-draft pass's sibling half (`promote-draft-pr-dispatch.mjs`), so the ordinary review path owns it.
     // Deliberately NOT gated on AI authorship (the commit list of a drain-rebased lane carries merge commits
     // from other authors, which made `missingReviewLabel` read false on #3830 itself).
-    if (reviewLabelHeal !== 'off' && phase === 'open' && !pr?.isDraft && withPhase.check === 'green'
+    // xpd70wx — plateau-app#217: a lane PR STACKED on another lane's branch (base is not `defaultBranch`) never
+    // gets its required checks run (they run once the base lands and the drain retargets it), so it is never
+    // `green` and the branch below never fired: it sat with no `review:*` label and no owner. A stacked lane PR
+    // whose checks are not red is owed the same neutral `review:pending`; review itself still waits on CI via
+    // {@link reviewChecksAllow}, exactly as for a labelled stacked PR.
+    const stackedLanePr = typeof pr?.baseRefName === 'string' && pr.baseRefName.startsWith('lane/') && pr.baseRefName !== defaultBranch;
+    if (reviewLabelHeal !== 'off' && phase === 'open' && !pr?.isDraft && (withPhase.check === 'green' || (stackedLanePr && withPhase.check !== 'red'))
         && String(pr?.headRefName ?? '').startsWith('lane/')
         && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
         && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
