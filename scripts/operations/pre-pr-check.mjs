@@ -22,7 +22,8 @@ export const PRE_PR_CHECK_OP = 'pre-pr-check';
 export function assessPrePrCheck({ checkout, decision, error = '' }) {
   const commands = prePrReviewCommands(checkout);
   if (error || !decision) {
-    return { checkout, gated: true, needsReview: true, mode: 'unknown', why: 'check-error', reasons: [`the check itself failed: ${error || 'no decision'}`], commands, next: commands.text, headline: `GATED (check failed: ${error || 'no decision'}) — run the review: ${commands.text}` };
+    const summary = `GATED (check failed: ${error || 'no decision'})`;
+    return { checkout, gated: true, needsReview: true, mode: 'unknown', why: 'check-error', reasons: [`the check itself failed: ${error || 'no decision'}`], commands, next: commands.text, summary, headline: `${summary} — run the review: ${commands.text}` };
   }
   const risk = decision.risk || {};
   const mode = decision.settings?.mode ?? 'unknown';
@@ -30,15 +31,16 @@ export function assessPrePrCheck({ checkout, decision, error = '' }) {
   const haveReceipt = decision.why === 'receipt';
   const needsReview = gated && !haveReceipt;
   const reasons = risk.reasons || [];
-  const headline = !gated
+  const summary = !gated
     ? `not gated (${decision.why}) — no pre-PR review needed; open-pr will not ask for a receipt`
     : haveReceipt
       ? 'gated, and a valid receipt exists for this head — open-pr will pass'
-      : `GATED (${reasons.join('; ')}); no valid receipt (${decision.why}) — run the review: ${commands.text}`;
+      : `GATED (${reasons.join('; ')}); no valid receipt (${decision.why})`;
+  const headline = needsReview ? `${summary} — run the review: ${commands.text}` : summary;
   return {
     checkout, gated, needsReview, mode, why: decision.why, reasons,
     lines: risk.lines ?? null, subsystems: risk.subsystems ?? null, files: risk.files ?? null,
-    commands, next: needsReview ? commands.text : '', headline,
+    commands, next: needsReview ? commands.text : '', summary, headline,
   };
 }
 
@@ -71,7 +73,7 @@ export function prePrCheckOperation({ check } = {}) {
 export function finishPrePrCheckOutcome({ run, code, lines, json = false } = {}) {
   const v = run?.verdict;
   if (json || !v || typeof v.gated !== 'boolean') return { code, lines };
-  const head = `pre-pr-check: ${v.gated ? 'gated' : 'not gated'} (mode ${v.mode}) — ${v.headline.split(' — run the review:')[0]}`;
+  const head = `pre-pr-check: ${v.gated ? 'gated' : 'not gated'} (mode ${v.mode}) — ${v.summary}`;
   if (!v.needsReview) return { code, lines: [head] };
   return {
     code,

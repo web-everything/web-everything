@@ -10,8 +10,8 @@ export const shellWord = (s) => (/^[\w@%+=:,./~-]+$/.test(s) ? s : `'${String(s)
 
 /**
  * The exact commands that produce a pre-PR review receipt for `lane` (an absolute lane root; the literal `<lane>`
- * when unknown). ONE source for the helper (`pre-pr-check`), the open-pr advise/refuse message and the briefs'
- * tests. `loop` is the part no script can run for you: drive init/step to `land` via the /converge skill.
+ * when unknown). ONE source for the helper (`pre-pr-check`), the open-pr advise/refuse message
+ * (the briefs spell the same commands in prose; their test pins the key pieces). `loop` is the part no script can run for you: drive init/step to `land` via the /converge skill.
  * @returns {{state: string, init: string, loop: string, commit: string, receipt: string, text: string}}
  */
 export function prePrReviewCommands(lane = '<lane>') {

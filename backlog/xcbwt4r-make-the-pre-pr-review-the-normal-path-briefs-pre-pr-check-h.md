@@ -30,5 +30,5 @@ One line per class: either the handling, or `n/a: <why>`.
 3. **Shared state files** — n/a: read-only; it reads the receipt file and never writes it.
 4. **Fail closed** — a check error prints gated with the error, never 'not gated'.
 5. **Identity scoping** — n/a: the helper takes the lane path explicitly and works per checkout.
-6. **State over time** — the receipt is keyed by tree and base, so the helper reports a stale receipt as missing.
+6. **State over time** — the receipt is keyed by tree and base; a stale or wrong-base receipt is not accepted, so the helper still says a review is needed (with its own reason, receipt-stale or receipt-base-mismatch).
 7. **Who wrote it** — n/a: the helper makes no trust decision beyond the existing open-pr gate.
