@@ -21,8 +21,9 @@
  * Callers only ever run this on a lane they hold the lease for (or one with no live lease).
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, renameSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, renameSync, rmSync, readFileSync, writeFileSync, statSync, lstatSync, copyFileSync, cpSync } from 'node:fs';
 import { join, basename, dirname } from 'node:path';
+import { inspectCloneLock, defaultOwner } from './daemon-clone-lock.mjs';
 
 const GIT_TIMEOUT_MS = 60_000;
 
@@ -243,32 +244,103 @@ export function healSharedCommitGraph(storeDir, { lockDir, log = () => {}, waitM
 //   3. VERIFY with the cheap {@link diagnoseLane} probe (HEAD/index/history). Dangling non-remote refs alone are
 //      reported, not a reason to re-clone.
 //   4. Only if the clone ITSELF is still broken: QUARANTINE (move aside, never delete) and re-clone, and only when
-//      the working tree is clean, so a half-edited tree is never swept aside. Otherwise report `needs-attention`.
+//      the caller holds the daemon-clone write lock, the working tree is clean, and no local commit/stash exists that
+//      a remote-tracking ref does not contain. The fresh clone is verified (else the old one is restored), inherits the
+//      old clone's config/hooks/ignored files, and a failed attempt is not repeated for an hour. Otherwise report
+//      `needs-attention`.
+
+/** Does a freshly made clone still fail the cheap health probe? (Dangling refs are the caller's prune job, not damage.) */
+function cloneProblems(dir) {
+  return diagnoseLane(dir).problems.filter((p) => !/ref\(s\) point at missing objects/.test(p));
+}
+
+/** Top-level IGNORED paths of `dir` (node_modules, build output): derived state a bare `git clone` would not bring
+ *  back. Best-effort: an unreadable index yields none, and they then stay in quarantine with everything else. */
+function ignoredTopLevelPaths(dir) {
+  const r = runGit(['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'], dir);
+  if (r.code !== 0) return [];
+  return r.out.split('\0').map((p) => p.replace(/\/$/, '')).filter((p) => p && p !== '.git' && !p.startsWith('.git/') && !p.split('/').includes('..'));
+}
+
+/** Does any existing ancestor of `rel` inside `root` (or `rel` itself) sit behind a symlink? The fresh clone is at the
+ *  origin tip, so a tracked symlink can stand where the old tree had a real directory; moving through it would write
+ *  outside the clone. */
+function throughSymlink(root, rel) {
+  let p = root;
+  for (const part of rel.split('/')) {
+    p = join(p, part);
+    try { if (lstatSync(p).isSymbolicLink()) return true; } catch { return false; }
+  }
+  return false;
+}
+
+/** Carry the old clone's local state into the replacement: `.git/config` (identity, extra remotes, core.* flags),
+ *  hooks, `info/exclude`, and ignored files. Each step is best-effort and logged; none can fail the re-clone, and
+ *  everything is still in quarantine (ignored paths are moved, the rest copied). */
+function carryOverLocalState(oldDir, newDir, ignored, log) {
+  const note = (what, e) => log(`  ⚠ clone-repair ${basename(newDir)}: could not carry over ${what} (${String(e && e.message || e).split('\n')[0]}); it is still in quarantine`);
+  try { // temp file + rename: a crash mid-copy never leaves a truncated config in the live clone
+    const tmp = join(newDir, '.git', `config.carry-${process.pid}`);
+    copyFileSync(join(oldDir, '.git', 'config'), tmp);
+    renameSync(tmp, join(newDir, '.git', 'config'));
+  } catch (e) { note('.git/config', e); }
+  for (const rel of ['hooks', 'info/exclude']) {
+    try { if (existsSync(join(oldDir, '.git', rel))) cpSync(join(oldDir, '.git', rel), join(newDir, '.git', rel), { recursive: true, force: true }); } catch (e) { note(`.git/${rel}`, e); }
+  }
+  for (const rel of ignored) {
+    try {
+      if (!existsSync(join(oldDir, rel)) || existsSync(join(newDir, rel)) || throughSymlink(newDir, rel)) continue;
+      mkdirSync(dirname(join(newDir, rel)), { recursive: true });
+      renameSync(join(oldDir, rel), join(newDir, rel));
+    } catch (e) { note(rel, e); }
+  }
+}
 
 /** Re-provision a broken daemon clone in place: move it to `quarantineRoot`, clone fresh from the same origin
- *  (reusing the old shared-reference alternate), check the same branch out. Restores the old clone if the clone fails. */
-export function recloneInPlace(dir, quarantineRoot, { log = () => {}, reason = '' } = {}) {
+ *  (reusing the old shared-reference alternate), check the same branch out, VERIFY the fresh clone is healthy, then
+ *  carry over the old clone's local config/hooks/ignored files. Restores the old clone if the clone fails or is
+ *  itself still broken. `verify` is injectable for tests. */
+export function recloneInPlace(dir, quarantineRoot, { log = () => {}, reason = '', verify = (d) => ({ problems: cloneProblems(d) }) } = {}) {
   const url = runGit(['config', '--get', 'remote.origin.url'], dir).out.trim();
   if (!url) return { ok: false, error: 'no remote.origin.url to re-clone from' };
+  if (url.startsWith('-')) return { ok: false, error: `remote.origin.url starts with "-" (${url.slice(0, 40)}); refusing to hand it to git clone` };
   const branch = runGit(['symbolic-ref', '--short', '-q', 'HEAD'], dir).out.trim() || 'main';
   let reference = null;
   try {
     const first = readFileSync(join(dir, '.git', 'objects', 'info', 'alternates'), 'utf8').split('\n').map((l) => l.trim()).find(Boolean);
     if (first) reference = first.replace(/\/objects\/?$/, '');
   } catch { /* no alternates */ }
+  const ignored = ignoredTopLevelPaths(dir); // before the move: the old index is still in place
   let moved;
   try { moved = quarantineLane(dir, quarantineRoot, { log, reason }); }
   catch (e) { return { ok: false, error: `could not quarantine the clone (${String(e && e.message || e).split('\n')[0]}); left in place` }; }
-  const args = ['clone', '--quiet', ...(reference ? ['--reference', reference] : []), '--branch', branch, url, dir];
+  // `--` ends option parsing: a URL is never read as a flag. `--reference=<p>` / `--branch=<b>` bind their values.
+  const args = ['clone', '--quiet', ...(reference ? [`--reference=${reference}`] : []), `--branch=${branch}`, '--', url, dir];
   const c = runGit(args, dirname(dir));
-  if (c.code !== 0) {
+  let failure = c.code !== 0 ? `re-clone failed (${c.err.trim().split('\n')[0]})` : '';
+  if (!failure) {
+    const after = verify(dir);
+    if (after.problems.length) failure = `the fresh clone is still broken (${after.problems.slice(0, 2).join('; ')}), so a re-clone cannot fix this`;
+  }
+  if (failure) {
     try {
-      rmSync(dir, { recursive: true, force: true }); // only the half-made new clone
+      rmSync(dir, { recursive: true, force: true }); // only the half-made / still-broken new clone
       renameSync(moved, dir); // put the old one back: nothing is lost
     } catch (e) {
-      return { ok: false, error: `re-clone failed (${c.err.trim().split('\n')[0]}) and the old clone could not be restored (${String(e && e.message || e).split('\n')[0]}); it is at ${moved}` };
+      return { ok: false, error: `${failure} and the old clone could not be restored (${String(e && e.message || e).split('\n')[0]}); it is at ${moved}` };
     }
-    return { ok: false, error: `re-clone failed (${c.err.trim().split('\n')[0]}); old clone restored` };
+    return { ok: false, error: `${failure}; old clone restored` };
+  }
+  // The old config is carried over AFTER the fresh clone verified healthy, so re-verify: an old setting that breaks git
+  // (extensions.*, core.worktree, include.path, ...) must not turn a good re-clone into a bad one. Fall back to the fresh config.
+  const freshConfig = (() => { try { return readFileSync(join(dir, '.git', 'config')); } catch { return null; } })();
+  carryOverLocalState(moved, dir, ignored, log);
+  if (freshConfig && verify(dir).problems.length) {
+    try {
+      const tmp = join(dir, '.git', `config.restore-${process.pid}`);
+      writeFileSync(tmp, freshConfig); renameSync(tmp, join(dir, '.git', 'config'));
+      log(`  ⚠ clone-repair ${basename(dir)}: the old .git/config broke the fresh clone; kept the fresh config (the old one is in quarantine)`);
+    } catch (e) { return { ok: false, error: `the carried-over config broke the fresh clone and could not be undone (${String(e && e.message || e).split('\n')[0]}); the old clone is at ${moved}` }; }
   }
   return { ok: true, quarantinedTo: moved };
 }
@@ -294,11 +366,71 @@ function provenCleanTree(dir) {
   // Only a clean "HEAD does not resolve" (git exited, did not time out or fail to spawn) means HEAD is gone.
   const headCommit = runGit(['rev-parse', '--verify', '-q', 'HEAD^{commit}'], dir);
   if (headCommit.failed) return { safe: false, why: 'could not probe HEAD' };
-  if (headCommit.code !== 0) return { safe: true, unprovenIndex: true };
-  if (runGit(['rev-parse', '--verify', '-q', 'HEAD^{tree}'], dir).code !== 0) return { safe: false, why: 'HEAD resolves but its tree is unreadable' };
-  const staged = runGit(['diff', '--cached', '--quiet', 'HEAD', '--'], dir);
-  if (staged.code === 0) return { safe: true };
-  return { safe: false, why: staged.code === 1 ? 'its index has staged edits' : `could not compare the index to HEAD (${staged.err.trim().split('\n')[0] || `exit ${staged.code}`})` };
+  let result;
+  if (headCommit.code !== 0) result = { safe: true, unprovenIndex: true };
+  else {
+    if (runGit(['rev-parse', '--verify', '-q', 'HEAD^{tree}'], dir).code !== 0) return { safe: false, why: 'HEAD resolves but its tree is unreadable' };
+    const staged = runGit(['diff', '--cached', '--quiet', 'HEAD', '--'], dir);
+    if (staged.code !== 0) return { safe: false, why: staged.code === 1 ? 'its index has staged edits' : `could not compare the index to HEAD (${staged.err.trim().split('\n')[0] || `exit ${staged.code}`})` };
+    result = { safe: true };
+  }
+  const unpushed = unpushedWork(dir, headCommit.code === 0 ? headCommit.out.trim() : '');
+  return unpushed.safe ? result : unpushed;
+}
+
+/**
+ * Does the clone hold work that exists NOWHERE else? A re-clone checks out the remote branch, so a local commit that no
+ * remote-tracking ref contains would drop out of the active checkout. Fails CLOSED: a stash, a local branch (or a
+ * detached HEAD) with a commit no `refs/remotes/*` ref reaches, or any git failure while proving it, is "not safe".
+ * A ref whose commit object is already gone has nothing left to lose and is skipped. When older history is damaged,
+ * only a ref that equals (or is cleanly reachable from) a remote-tracking ref can be proven pushed.
+ * @returns {{safe:boolean, why?:string}}
+ */
+const DAEMON_REBUILD_EMAIL = 'daemon-rebuild@localhost'; // GIT_AUTHOR_EMAIL in daemon-rebuild/shared.mjs
+function unpushedWork(dir, headSha) {
+  const stash = runGit(['rev-parse', '--verify', '-q', 'refs/stash'], dir);
+  if (stash.failed) return { safe: false, why: 'could not probe for a stash' };
+  if (stash.code === 0) return { safe: false, why: 'it holds a stash (local work not on any remote)' };
+  const heads = runGit(['for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads'], dir);
+  if (heads.code !== 0) return { safe: false, why: `could not list local branches (${heads.err.trim().split('\n')[0] || `exit ${heads.code}`})` };
+  const tips = new Map(); // sha -> label
+  for (const line of heads.out.split('\n').map((l) => l.trim()).filter(Boolean)) {
+    const i = line.indexOf(' ');
+    tips.set(line.slice(0, i), line.slice(i + 1));
+  }
+  if (headSha && !tips.has(headSha)) tips.set(headSha, 'HEAD');
+  for (const [sha, label] of tips) {
+    const here = runGit(['cat-file', '-e', `${sha}^{commit}`], dir);
+    if (here.failed) return { safe: false, why: `could not probe ${label}` };
+    if (here.code !== 0) continue; // its commit is already gone: nothing recoverable to protect
+    const ahead = runGit(['log', '--format=%ae', sha, '--not', '--remotes'], dir);
+    if (ahead.code !== 0) return { safe: false, why: `could not prove ${label} is pushed (${ahead.err.trim().split('\n')[0] || `exit ${ahead.code}`})` };
+    // The rebuild mints its overlay merge commits locally (fixed identity, deterministic from origin + the overlay
+    // list), so they are reproducible rather than someone's unpushed work; any other author's commit is.
+    if (ahead.out.split('\n').some((e) => e.trim() && e.trim() !== DAEMON_REBUILD_EMAIL)) return { safe: false, why: `${label} has local commits no remote-tracking ref contains` };
+  }
+  return { safe: true };
+}
+
+/** Does THIS process hold the daemon-clone WRITE lock on `dir`? Moving a clone's root out from under a sibling reader
+ *  or a child session's cwd is exactly what the #4044 lock exists to prevent, so a re-clone requires this proof. */
+export function holdsCloneWriteLock(dir) {
+  try {
+    const snap = inspectCloneLock(dir);
+    return Boolean(snap.writer && snap.writerLive && snap.writer.owner === defaultOwner());
+  } catch { return false; }
+}
+
+// A re-clone that did not fix the clone must not be retried on every sync: the cause is outside the clone (the shared
+// reference store, an unreachable origin), so each attempt would only move the path away and back. The stamp lives in
+// the quarantine root (a clone's own `.git` is replaced by the re-clone) and records when the last attempt STARTED.
+const RECLONE_BACKOFF_MS = 60 * 60_000;
+const recloneStamp = (quarantineRoot, dir) => join(quarantineRoot, `.reclone-attempt-${basename(dir)}`);
+function recloneBackoffLeft(quarantineRoot, dir, now, backoffMs) {
+  try {
+    const at = Number(readFileSync(recloneStamp(quarantineRoot, dir), 'utf8'));
+    return Number.isFinite(at) && at <= now && now - at < backoffMs ? backoffMs - (now - at) : 0; // a future/garbage stamp (clock skew) never blocks
+  } catch { return 0; }
 }
 
 // A healthy clone is probed with the two cheap ref calls on every fetch; the heavier checks (commit-graph verify,
@@ -317,7 +449,9 @@ const warnedDangling = new Set();
  * checks run when a ref is broken or once per `deepIntervalMs`). Never throws. A re-clone happens ONLY when the caller
  * passes `allowReclone:true` (default false: callers that cannot prove `dir` is a daemon-owned clone get prune-only).
  * @param {string} dir  the clone's worktree root
- * @param {{log?:Function, allowReclone?:boolean, quarantineRoot?:string, reclone?:Function, deepIntervalMs?:number, now?:number}} [opts]
+ * Even then it only re-clones while holding the daemon-clone WRITE lock ({@link holdsCloneWriteLock}; `holdsWriteLock` is
+ * injectable) and at most once per `recloneBackoffMs` for a clone it could not fix.
+ * @param {{log?:Function, allowReclone?:boolean, holdsWriteLock?:Function, quarantineRoot?:string, reclone?:Function, recloneBackoffMs?:number, deepIntervalMs?:number, now?:number}} [opts]
  * @returns {{ok:boolean, skipped?:string, pruned:string[], reported:string[], reportedNew:string[], quarantinedTo?:string, problems:string[]}}
  */
 export function repairCloneRefs(dir, opts = {}) {
@@ -332,7 +466,7 @@ export function repairCloneRefs(dir, opts = {}) {
   }
 }
 
-function repairCloneRefsUnguarded(dir, { log = () => {}, allowReclone = false, quarantineRoot = join(dirname(dir), '.quarantine'), reclone = recloneInPlace, deepIntervalMs = DEEP_CHECK_INTERVAL_MS, now = Date.now() } = {}) {
+function repairCloneRefsUnguarded(dir, { log = () => {}, allowReclone = false, holdsWriteLock = holdsCloneWriteLock, quarantineRoot = join(dirname(dir), '.quarantine'), reclone = recloneInPlace, recloneBackoffMs = RECLONE_BACKOFF_MS, deepIntervalMs = DEEP_CHECK_INTERVAL_MS, now = Date.now() } = {}) {
   const out = { ok: true, pruned: [], reported: [], reportedNew: [], problems: [] };
   if (!dir || !existsSync(join(dir, '.git'))) return { ...out, skipped: 'not-a-clone' };
   const name = basename(dir);
@@ -382,20 +516,31 @@ function repairCloneRefsUnguarded(dir, { log = () => {}, allowReclone = false, q
     return out;
   }
   out.problems = problems;
-  // Fail closed (card edge cases 2 + 4): a re-clone needs the caller's opt-in, a standalone clone, AND affirmative
-  // evidence of a clean tree. Anything else reports "needs attention" and leaves the clone exactly where it is.
-  const tree = problems.length && allowReclone && standalone ? provenCleanTree(dir) : null;
-  if (!problems.length || !allowReclone || !standalone || !tree.safe) {
+  // Fail closed (card edge cases 2 + 4): a re-clone needs the caller's opt-in, a standalone clone, the daemon-clone
+  // write lock (nobody else may be reading the tree we move), AND affirmative evidence of a clean tree with no
+  // unpushed work. Anything else reports "needs attention" and leaves the clone exactly where it is.
+  const locked = problems.length && allowReclone && standalone ? holdsWriteLock(dir) : false;
+  const tree = locked ? provenCleanTree(dir) : null;
+  const backoffLeft = tree?.safe ? recloneBackoffLeft(quarantineRoot, dir, now, recloneBackoffMs) : 0;
+  if (!problems.length || !allowReclone || !standalone || !locked || !tree.safe || backoffLeft > 0) {
     out.ok = !problems.length && !pruneFailed && !probeFailed;
     if (problems.length) {
-      const why = !allowReclone ? 're-clone is disabled for this caller' : !standalone ? 'it is not a standalone clone (linked worktree or shared store)' : tree.why;
+      const why = !allowReclone ? 're-clone is disabled for this caller'
+        : !standalone ? 'it is not a standalone clone (linked worktree or shared store)'
+          : !locked ? 'the daemon-clone write lock is not held, so the clone cannot be moved safely'
+            : !tree.safe ? tree.why
+              : `a re-clone was already tried and did not fix it; backing off for ${Math.ceil(backoffLeft / 60_000)} more minute(s)`;
       log(`  ⚠ clone-repair ${name}: clone is damaged (${problems.join('; ')}) but ${why} — needs attention`);
     }
     return out;
   }
   if (tree.unprovenIndex) log(`  ⚠ clone-repair ${name}: HEAD is gone, so staged-only edits cannot be ruled out; the whole clone is kept in quarantine`);
+  try { mkdirSync(quarantineRoot, { recursive: true }); writeFileSync(recloneStamp(quarantineRoot, dir), String(now)); } catch { /* an unwritable stamp only loses the rate limit */ }
   const r = reclone(dir, quarantineRoot, { log, reason: problems.join('; ') });
-  if (r.ok) { out.ok = true; out.quarantinedTo = r.quarantinedTo; out.problems = []; return out; }
+  if (r.ok) {
+    rmSync(recloneStamp(quarantineRoot, dir), { force: true }); // verified healthy: a later, unrelated failure may re-clone at once
+    out.ok = true; out.quarantinedTo = r.quarantinedTo; out.problems = []; return out;
+  }
   out.ok = false;
   log(`  ⚠ clone-repair ${name}: ${r.error}`);
   return out;

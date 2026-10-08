@@ -6,16 +6,19 @@
  *   objects absent from the shared store ("invalid sha1 pointer"), and a drain overlay fetch was rejected.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { repairCloneRefs } from '../lane-repair.mjs';
+import { repairCloneRefs, recloneInPlace } from '../lane-repair.mjs';
+import { withWriteLock, withReadLock } from '../daemon-clone-lock.mjs';
 import { selfSyncCheckout, selfSyncCheckoutPoc } from '../daemon-self-sync.mjs';
 import { mergeOverlayRef } from '../daemon-load-overlay.mjs';
 
 const g = (cwd, ...a) => execFileSync('git', a, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const GHOST = 'deadbeef'.repeat(5);
+// A re-clone needs the caller's opt-in AND proof the daemon-clone write lock is held (tests stand the proof in).
+const RECLONE = { allowReclone: true, holdsWriteLock: () => true };
 
 let tmp, origin, clone;
 beforeEach(() => {
@@ -75,7 +78,7 @@ describe('repairCloneRefs', () => {
   it('quarantines (never deletes) and re-clones a clone whose HEAD object is gone', () => {
     const head = g(clone, 'rev-parse', 'HEAD');
     rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true });
-    const r = repairCloneRefs(clone, { allowReclone: true });
+    const r = repairCloneRefs(clone, RECLONE);
     expect(r.ok).toBe(true);
     expect(r.quarantinedTo).toBeTruthy();
     expect(existsSync(r.quarantinedTo)).toBe(true);
@@ -97,7 +100,7 @@ describe('repairCloneRefs', () => {
     writeFileSync(join(clone, 'a.txt'), 'edited');
     const head = g(clone, 'rev-parse', 'HEAD');
     rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true });
-    const r = repairCloneRefs(clone, { allowReclone: true });
+    const r = repairCloneRefs(clone, RECLONE);
     expect(r.ok).toBe(false);
     expect(r.quarantinedTo).toBeUndefined();
     expect(readFileSync(join(clone, 'a.txt'), 'utf8')).toBe('edited');
@@ -107,7 +110,7 @@ describe('repairCloneRefs', () => {
     writeFileSync(join(clone, 'a.txt'), 'edited');
     writeFileSync(join(clone, '.git/index'), 'not an index');
     expect(() => g(clone, 'ls-files', '--stage')).toThrow();
-    const r = repairCloneRefs(clone, { allowReclone: true });
+    const r = repairCloneRefs(clone, RECLONE);
     expect(r.ok).toBe(false);
     expect(r.quarantinedTo).toBeUndefined();
     expect(readFileSync(join(clone, 'a.txt'), 'utf8')).toBe('edited');
@@ -120,7 +123,7 @@ describe('repairCloneRefs', () => {
     writeFileSync(join(clone, 'c.txt'), 'staged'); g(clone, 'add', 'c.txt');
     expect(g(clone, 'ls-files', '--modified', '--deleted', '--others', '--exclude-standard')).toBe('');
     rmSync(join(clone, '.git/objects', parent.slice(0, 2), parent.slice(2)), { force: true }); // history walk now fails
-    const r = repairCloneRefs(clone, { allowReclone: true });
+    const r = repairCloneRefs(clone, RECLONE);
     expect(r.problems.some((p) => /history walk failed/.test(p))).toBe(true);
     expect(r.ok).toBe(false);
     expect(r.quarantinedTo).toBeUndefined();
@@ -130,7 +133,7 @@ describe('repairCloneRefs', () => {
   it('never throws: a throwing reclone becomes {ok:false} and the clone stays put', () => {
     const head = g(clone, 'rev-parse', 'HEAD');
     rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true });
-    const r = repairCloneRefs(clone, { allowReclone: true, reclone: () => { throw new Error('EXDEV: cross-device link'); } });
+    const r = repairCloneRefs(clone, { ...RECLONE, reclone: () => { throw new Error('EXDEV: cross-device link'); } });
     expect(r.ok).toBe(false);
     expect(r.problems.join(' ')).toMatch(/EXDEV/);
     expect(existsSync(join(clone, 'a.txt'))).toBe(true);
@@ -140,7 +143,7 @@ describe('repairCloneRefs', () => {
     const head = g(clone, 'rev-parse', 'HEAD');
     g(clone, 'remote', 'set-url', 'origin', join(tmp, 'no-such-origin.git'));
     rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true });
-    const r = repairCloneRefs(clone, { allowReclone: true });
+    const r = repairCloneRefs(clone, RECLONE);
     expect(r.ok).toBe(false);
     expect(r.quarantinedTo).toBeUndefined();
     expect(existsSync(join(clone, 'a.txt'))).toBe(true);
@@ -153,10 +156,196 @@ describe('repairCloneRefs', () => {
     g(clone, 'worktree', 'add', '-q', '--detach', wt);
     const head = g(wt, 'rev-parse', 'HEAD');
     rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true });
-    const r = repairCloneRefs(wt, { allowReclone: true });
+    const r = repairCloneRefs(wt, RECLONE);
     expect(r.ok).toBe(false);
     expect(r.quarantinedTo).toBeUndefined();
     expect(existsSync(join(wt, 'a.txt'))).toBe(true);
+  });
+});
+
+// Review round 2 (#4402): what a re-clone must carry over, when it must refuse, and how often it may try.
+describe('re-clone safety (review round 2)', () => {
+  const loseHead = () => { const head = g(clone, 'rev-parse', 'HEAD'); rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true }); return head; };
+  // commit `two` on top of `one`, then lose `one` so the history walk fails while HEAD itself still resolves.
+  const commitTwo = () => { writeFileSync(join(clone, 'b.txt'), 'b'); g(clone, 'add', 'b.txt'); g(clone, 'commit', '-qm', 'two'); return g(clone, 'rev-parse', 'HEAD~1'); };
+  const loseObject = (sha) => rmSync(join(clone, '.git/objects', sha.slice(0, 2), sha.slice(2)), { force: true });
+
+  it('carries clone-local config, hooks, info/exclude and ignored files into the replacement', () => {
+    g(clone, 'config', 'user.email', 'daemon@example.test'); g(clone, 'config', 'core.commitGraph', 'false');
+    g(clone, 'remote', 'add', 'extra', join(tmp, 'origin.git'));
+    mkdirSync(join(clone, '.git/hooks'), { recursive: true }); writeFileSync(join(clone, '.git/hooks/pre-commit'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    mkdirSync(join(clone, '.git/info'), { recursive: true }); writeFileSync(join(clone, '.git/info/exclude'), 'node_modules/\n');
+    mkdirSync(join(clone, 'node_modules/dep'), { recursive: true }); writeFileSync(join(clone, 'node_modules/dep/index.js'), 'ok');
+    loseHead();
+    const r = repairCloneRefs(clone, RECLONE);
+    expect(r.quarantinedTo).toBeTruthy();
+    expect(g(clone, 'config', '--get', 'user.email')).toBe('daemon@example.test');
+    expect(g(clone, 'config', '--get', 'core.commitGraph')).toBe('false');
+    expect(g(clone, 'remote')).toContain('extra');
+    expect(existsSync(join(clone, '.git/hooks/pre-commit'))).toBe(true);
+    expect(readFileSync(join(clone, '.git/info/exclude'), 'utf8')).toContain('node_modules/');
+    expect(readFileSync(join(clone, 'node_modules/dep/index.js'), 'utf8')).toBe('ok');
+    expect(g(clone, 'status', '--porcelain')).toBe('');
+  });
+
+  it('refuses when HEAD carries unpushed commits and older history is damaged', () => {
+    loseObject(commitTwo());
+    const head = g(clone, 'rev-parse', 'HEAD');
+    const r = repairCloneRefs(clone, RECLONE);
+    expect(r.problems.some((p) => /history walk failed/.test(p))).toBe(true);
+    expect(r.ok).toBe(false);
+    expect(r.quarantinedTo).toBeUndefined();
+    expect(g(clone, 'rev-parse', 'HEAD')).toBe(head);
+    expect(existsSync(join(tmp, '.quarantine'))).toBe(false);
+  });
+
+  it('refuses when a NON-checked-out local branch has unpushed commits', () => {
+    writeFileSync(join(clone, 'b.txt'), 'b'); g(clone, 'add', 'b.txt'); g(clone, 'commit', '-qm', 'two'); g(clone, 'push', '-q', 'origin', 'HEAD:main');
+    const parent = g(clone, 'rev-parse', 'HEAD~1');
+    g(clone, 'checkout', '-q', '-b', 'side'); writeFileSync(join(clone, 'c.txt'), 'c'); g(clone, 'add', 'c.txt'); g(clone, 'commit', '-qm', 'three'); g(clone, 'checkout', '-q', 'main');
+    loseObject(parent);
+    const r = repairCloneRefs(clone, RECLONE);
+    expect(r.quarantinedTo).toBeUndefined();
+    expect(r.ok).toBe(false);
+    expect(g(clone, 'rev-parse', '--verify', 'side')).toBeTruthy();
+  });
+
+  it('refuses when the clone holds a stash', () => {
+    writeFileSync(join(clone, 'b.txt'), 'b'); g(clone, 'add', 'b.txt'); g(clone, 'commit', '-qm', 'two'); g(clone, 'push', '-q', 'origin', 'HEAD:main');
+    const parent = g(clone, 'rev-parse', 'HEAD~1');
+    writeFileSync(join(clone, 'a.txt'), 'stashed'); g(clone, 'stash', 'push', '-q');
+    loseObject(parent);
+    const r = repairCloneRefs(clone, RECLONE);
+    expect(r.quarantinedTo).toBeUndefined();
+    expect(r.ok).toBe(false);
+    expect(g(clone, 'stash', 'list')).toMatch(/stash@\{0\}/);
+  });
+
+  it('still re-clones when HEAD is pushed and only older history is damaged (not over-refusing)', () => {
+    writeFileSync(join(clone, 'b.txt'), 'b'); g(clone, 'add', 'b.txt'); g(clone, 'commit', '-qm', 'two'); g(clone, 'push', '-q', 'origin', 'HEAD:main');
+    loseObject(g(clone, 'rev-parse', 'HEAD~1'));
+    const r = repairCloneRefs(clone, RECLONE);
+    expect(r.ok).toBe(true);
+    expect(r.quarantinedTo).toBeTruthy();
+    expect(() => g(clone, 'rev-list', 'HEAD')).not.toThrow();
+  });
+
+  it('does not read the daemon\'s own reproducible overlay merge commits as unpushed work, but still refuses anyone else\'s', () => {
+    // one (pushed) -> two (pushed = origin/main) -> three (local). Losing `one` damages history below the remote tip.
+    writeFileSync(join(clone, 'b.txt'), 'b'); g(clone, 'add', 'b.txt'); g(clone, 'commit', '-qm', 'two'); g(clone, 'push', '-q', 'origin', 'HEAD:main');
+    const one = g(clone, 'rev-parse', 'HEAD~1');
+    writeFileSync(join(clone, 'c.txt'), 'c'); g(clone, 'add', 'c.txt');
+    g(clone, '-c', 'user.email=daemon-rebuild@localhost', 'commit', '-qm', 'daemon-rebuild: merge overlay x');
+    loseObject(one);
+    const r = repairCloneRefs(clone, RECLONE);
+    expect(r.ok).toBe(true);
+    expect(r.quarantinedTo).toBeTruthy();
+  });
+
+  it('keeps the fresh config when the carried-over one breaks the fresh clone', () => {
+    g(clone, 'config', 'user.email', 'carried@example.test');
+    loseHead();
+    let calls = 0;
+    const verify = () => ({ problems: ++calls === 1 ? [] : ['config broke git'] }); // healthy fresh clone, broken after carry-over
+    const r = recloneInPlace(clone, join(tmp, '.quarantine'), { verify });
+    expect(r.ok).toBe(true);
+    expect(readFileSync(join(clone, '.git/config'), 'utf8')).not.toContain('carried@example.test'); // the poisoned old config was NOT kept
+    expect(readdirSync(join(clone, '.git')).filter((n) => n.startsWith('config.'))).toEqual([]); // no temp files left behind
+  });
+
+  it('never carries an ignored path through a symlink that the fresh clone tracks', () => {
+    const seed = join(tmp, 'seed');
+    mkdirSync(join(tmp, 'outside'), { recursive: true });
+    symlinkSync('../outside', join(seed, 'build')); g(seed, 'add', 'build'); g(seed, 'commit', '-qm', 'link'); g(seed, 'push', '-q', 'origin', 'HEAD:main');
+    mkdirSync(join(clone, '.git/info'), { recursive: true }); writeFileSync(join(clone, '.git/info/exclude'), 'build/\n');
+    mkdirSync(join(clone, 'build/x'), { recursive: true }); writeFileSync(join(clone, 'build/x/f'), 'x');
+    loseHead();
+    const r = recloneInPlace(clone, join(tmp, '.quarantine'));
+    expect(r.ok).toBe(true);
+    expect(readdirSync(join(tmp, 'outside'))).toEqual([]);
+    expect(existsSync(join(r.quarantinedTo, 'build/x/f'))).toBe(true); // stayed in quarantine
+  });
+
+  it('a backoff stamp from the future (clock skew, garbage) does not block the re-clone', () => {
+    loseHead();
+    mkdirSync(join(tmp, '.quarantine'), { recursive: true });
+    writeFileSync(join(tmp, '.quarantine/.reclone-attempt-clone'), '9999999999999999');
+    const r = repairCloneRefs(clone, RECLONE);
+    expect(r.ok).toBe(true);
+    expect(r.quarantinedTo).toBeTruthy();
+  });
+
+  it('a re-clone that leaves the clone still broken is undone: old clone restored, nothing piles up in quarantine', () => {
+    loseHead();
+    const r = recloneInPlace(clone, join(tmp, '.quarantine'), { verify: () => ({ ok: false, problems: ['history walk failed: still bad'] }) });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/still (broken|damaged)/);
+    expect(existsSync(join(clone, 'a.txt'))).toBe(true);
+    expect(readdirSync(join(tmp, '.quarantine'))).toEqual([]);
+  });
+
+  it('an unhealable clone is re-cloned at most once per backoff window, not on every call', () => {
+    loseHead();
+    let attempts = 0;
+    const reclone = () => { attempts++; return { ok: false, error: 'persistent shared-store damage' }; };
+    const t0 = Date.now();
+    repairCloneRefs(clone, { ...RECLONE, reclone, now: t0 });
+    const second = repairCloneRefs(clone, { ...RECLONE, reclone, now: t0 + 60_000 });
+    expect(attempts).toBe(1);
+    expect(second.ok).toBe(false);
+    repairCloneRefs(clone, { ...RECLONE, reclone, now: t0 + 2 * 60 * 60_000 });
+    expect(attempts).toBe(2); // the window passes, it may try again
+  });
+
+  it('a clone URL that starts with "-" is never handed to git clone as an option', () => {
+    g(clone, 'config', 'remote.origin.url', '-ouploadpack');
+    loseHead();
+    const r = recloneInPlace(clone, join(tmp, '.quarantine'));
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/unsafe|starts with/);
+    expect(existsSync(join(clone, 'a.txt'))).toBe(true);
+    expect(existsSync(join(tmp, '.quarantine'))).toBe(false);
+  });
+});
+
+describe('re-clone is gated on the daemon-clone write lock (review round 2)', () => {
+  let lockRoot, oldLockRoot;
+  beforeEach(() => { lockRoot = join(tmp, 'locks'); oldLockRoot = process.env.WE_DAEMON_CLONE_LOCK_ROOT; process.env.WE_DAEMON_CLONE_LOCK_ROOT = lockRoot; });
+  afterEach(() => { if (oldLockRoot === undefined) delete process.env.WE_DAEMON_CLONE_LOCK_ROOT; else process.env.WE_DAEMON_CLONE_LOCK_ROOT = oldLockRoot; });
+  const loseHead = () => { const head = g(clone, 'rev-parse', 'HEAD'); rmSync(join(clone, '.git/objects', head.slice(0, 2)), { recursive: true, force: true }); };
+
+  it('refuses to move the clone when the caller holds no lock at all', () => {
+    loseHead();
+    const r = repairCloneRefs(clone, { allowReclone: true });
+    expect(r.ok).toBe(false);
+    expect(r.quarantinedTo).toBeUndefined();
+    expect(existsSync(join(clone, 'a.txt'))).toBe(true);
+  });
+
+  it('refuses while a sibling reader holds a read lock on the clone', async () => {
+    loseHead();
+    const res = await withReadLock(clone, () => repairCloneRefs(clone, { allowReclone: true }));
+    expect(res.ok).toBe(true);
+    expect(res.value.ok).toBe(false);
+    expect(res.value.quarantinedTo).toBeUndefined();
+    expect(existsSync(join(clone, 'a.txt'))).toBe(true);
+  });
+
+  it('re-clones when this process holds the write lock', async () => {
+    loseHead();
+    const res = await withWriteLock(clone, () => repairCloneRefs(clone, { allowReclone: true }));
+    expect(res.ok).toBe(true);
+    expect(res.value.ok).toBe(true);
+    expect(res.value.quarantinedTo).toBeTruthy();
+  });
+
+  it('only the rebuild prepare step (which runs under withWriteLock) opts in to re-cloning', () => {
+    const root = join(import.meta.dirname, '..', '..', '..');
+    const sites = [['scripts/lib/daemon-self-sync.mjs', false], ['scripts/lib/daemon-load-overlay.mjs', false], ['scripts/lib/daemon-rebuild/prepare.mjs', true]];
+    for (const [file, opts] of sites) {
+      const src = readFileSync(join(root, file), 'utf8');
+      expect(/repairCloneRefs\([^;]*allowReclone: true/.test(src), file).toBe(opts);
+    }
   });
 });
 

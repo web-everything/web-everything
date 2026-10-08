@@ -200,6 +200,8 @@ export async function prepareRebuild({
   const edgeResolve = env[OVERLAY_EDGE_RESOLVE_ENV] !== '0';
   // Heal dangling remote-tracking refs (and a clone that is itself broken) BEFORE the fetch: one such ref makes
   // `fetch --prune` reject the whole batch. Daemon clones are never acquired through lane-pool, so this is their only heal.
+  // prepareRebuild runs under the daemon-clone write lock (rebuild.mjs), the only place a clone may be re-cloned (#4044);
+  // repairCloneRefs re-checks that lock itself and refuses without it.
   const cloneRepair = repairCloneRefs(root, { log: (m) => log?.error?.(m), allowReclone: true });
   if (cloneRepair.pruned.length || cloneRepair.reportedNew.length || cloneRepair.quarantinedTo || !cloneRepair.ok) {
     alert('clone-refs-repaired', { pruned: cloneRepair.pruned.length, reported: cloneRepair.reported, quarantinedTo: cloneRepair.quarantinedTo ?? null, problems: cloneRepair.problems });
