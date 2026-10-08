@@ -17,6 +17,8 @@ import { dirname, join } from 'node:path';
 
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { readGit } from '../lib/proc-read.mjs';
+import { CALIBRATION_FROM, collectVelocity, runEstimates, heldCardsPath, estimatesPath } from './perf-velocity-io.mjs';
+import { calibrationStats, etParts, hourlyLines, realPointEvents } from './perf-velocity.mjs';
 import { collectInputs, extractMetrics, makeGh, readBounded } from './coroner-extract.mjs';
 import {
   BASELINE_DATE, BASELINE_TAKEN_AT, OPUS_REPORT, PERF_SNAPSHOT_EFFECT, REPORT_SOURCED, SCHEMA_VERSION,
@@ -168,6 +170,21 @@ function append(store, row) {
   appendFileSync(store, `${JSON.stringify(row)}\n`, 'utf8');
 }
 
+/** The velocity block of the run output: today and yesterday, real vs estimated, the calibration error, the cost. */
+export function velocityReport({ col, calibration, spent, now, file }) {
+  const m = col.metrics, v = (k) => m[k]?.v ?? 0;
+  const lines = ['velocity (ET days; "real" = sized cards resolved, "estimated" = estimated-from-brief for PRs with no sized card):'];
+  lines.push(`  points/day today     real ${v('velocity.points.today.real')}   estimated ${v('velocity.points.today.estimated')}`);
+  lines.push(`  points/day yesterday real ${v('velocity.points.yesterday.real')}   estimated ${v('velocity.points.yesterday.estimated')}`);
+  lines.push(`  points/hour (window) real ${v('velocity.points.perHour.real')}   estimated ${v('velocity.points.perHour.estimated')}`);
+  lines.push(`  PRs merged/hour (window) code ${v('velocity.prs.code.perHour')} (${v('velocity.prs.code.merged')})   card-only ${v('velocity.prs.cardOnly.perHour')} (${v('velocity.prs.cardOnly.merged')})`);
+  lines.push(`  PRs still without an estimate: ${v('velocity.estimate.missingPrs')}`);
+  lines.push(calibration.n ? `  estimator calibration on ${calibration.n} sized-card PRs: mean absolute error ${calibration.mae} pts, bias ${calibration.bias > 0 ? '+' : ''}${calibration.bias} pts (estimate - actual)` : '  estimator calibration: no calibration rows yet (run with --estimate)');
+  if (spent) lines.push(`  estimates this run: ${spent.newEstimates} new + ${spent.newCalibration} calibration, ${spent.failures} failed, ${spent.remaining} over the cap, model cost $${spent.costUsd} (rows in ${file})`);
+  lines.push(...hourlyLines(realPointEvents(col.events).filter((e) => etParts(e.at)?.date === etParts(now)?.date), 'real points today'));
+  return lines;
+}
+
 /** THE SINK MAP for the one effect. */
 export function createPerfSnapshotSinks({ env = process.env, home = homedir(), gh: ghIn } = {}) {
   return {
@@ -188,6 +205,25 @@ export function createPerfSnapshotSinks({ env = process.env, home = homedir(), g
       const notes = [];
       if (!gh) notes.push('run with --no-ci: gh-backed metrics (CI, change requests, PR kinds) are absent or partial');
       const metrics = { ...deriveFromCoroner(coroner), ...extras({ window, markers: inputs.markers, gh, env, home, notes }) };
+      const velocityLines = [];
+      try {
+        const root = readGit(['rev-parse', '--show-toplevel'], { cwd: process.cwd() }).trim();
+        const col = collectVelocity({ root, window, now: until, storePath: p.store });
+        let calibration = calibrationStats([...col.calibration.values()]), spent = null;
+        if (p.estimate) {
+          if (!gh) notes.push('velocity estimates skipped: --no-ci means no gh to read PR briefs');
+          else {
+            let held = ''; try { held = readFileSync(heldCardsPath(env, home), 'utf8'); } catch { /* none */ }
+            const calCol = collectVelocity({ root, window, now: until, storePath: p.store, ref: col.ref, since: CALIBRATION_FROM });
+            spent = await runEstimates({ collected: col, calibrationCollected: calCol, storePath: p.store, gh, cap: p.estimateCap, heldText: held });
+            calibration = spent.calibration;
+          }
+        }
+        const fresh = spent ? collectVelocity({ root, window, now: until, storePath: p.store, ref: col.ref }) : col;
+        Object.assign(metrics, fresh.metrics);
+        velocityLines.push(...velocityReport({ col: fresh, calibration, spent, now: until, file: estimatesPath(p.store) }));
+        notes.push(`velocity: card history read from ${fresh.ref}; real points are sized cards, estimated points are ${'estimated-from-brief'} rows in ${estimatesPath(p.store)}`);
+      } catch (e) { notes.push(`velocity unavailable: ${String(e.message).split('\n')[0]}`); }
       const date = until.slice(0, 10);
       const rawDir = join(p.dir, date);
       const rawFile = join(rawDir, `coroner-${p.hours}h-${until.slice(11, 16).replace(':', '')}Z.json`);
@@ -207,6 +243,7 @@ export function createPerfSnapshotSinks({ env = process.env, home = homedir(), g
         if (last && last !== baseline) lines.push('', ...formatDiff(`vs last snapshot ${last.date} (${last.takenAt})`, last, row, after(last.takenAt)));
         else lines.push('', 'vs last snapshot: this is the first snapshot after the baseline');
       }
+      if (velocityLines.length) lines.push('', ...velocityLines);
       for (const n of notes) lines.push(`  note: ${n}`);
       return { lines, row };
     },
