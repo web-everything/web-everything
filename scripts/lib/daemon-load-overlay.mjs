@@ -41,6 +41,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
+import { repairCloneRefs } from './lane-repair.mjs';
 import { addOverlay } from './daemon-overlays.mjs';
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
 import { resolveVersionedContext, submitRequest, waitForResult } from './daemon-version-runtime.mjs';
@@ -82,6 +83,7 @@ export function mergeOverlayRef({ root, ref, homeBranch = 'main', run = gitRun, 
 
   // `--` ends option parsing (same defense-in-depth as daemon-self-sync.mjs's POC fetch): even a `ref` that
   // slipped past assertSafeRef somehow is never read as a git OPTION.
+  repairCloneRefs(root, { log: (m) => console.error(m) }); // heal dangling remote-tracking refs before any fetch
   const fetched = git(['fetch', '--quiet', '--', 'origin', ref]).status === 0;
   if (!fetched) return { merged: false, commits: 0, reason: 'fetch-failed' };
 

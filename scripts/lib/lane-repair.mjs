@@ -22,7 +22,7 @@
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, renameSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { join, basename, dirname } from 'node:path';
 
 const GIT_TIMEOUT_MS = 60_000;
 
@@ -218,6 +218,86 @@ export function healSharedCommitGraph(storeDir, { lockDir, log = () => {}, waitM
   } finally {
     rmSync(lockDir, { recursive: true, force: true });
   }
+}
+
+// ── Daemon clones: repair before any fetch (card xdaemoncl) ───────────────────────────────────────────────
+//
+// LIVE INCIDENT (2026-10-08 overnight): the WE drain's data clone (`.lanes/we-drain-daemon/lane-1`, and by the
+// same mechanism every other daemon clone: `wev-*`, `we-drain-daemon/code`) carried `refs/remotes/origin/lane/*`
+// refs whose target objects are gone from the shared `--reference` store (`git fsck`: "invalid sha1 pointer").
+// A drain overlay fetch was rejected because of it. #4382 healed this for POOL lanes on acquire/refresh, but
+// daemon clones are never acquired through lane-pool, so nothing ever healed them.
+//
+// THE POLICY (stricter than {@link healLaneRefs}, because a daemon clone is long-lived and owns real local state):
+//   1. PRUNE only `refs/remotes/*` refs whose object is missing. A remote-tracking ref is a cache of what origin
+//      said; the next fetch re-creates it, so deleting it can never lose work.
+//   2. NEVER delete any other ref (local branch, tag, stash). A broken one is REPORTED loudly, not touched.
+//   3. VERIFY with the cheap {@link diagnoseLane} probe (HEAD/index/history). Dangling non-remote refs alone are
+//      reported, not a reason to re-clone.
+//   4. Only if the clone ITSELF is still broken: QUARANTINE (move aside, never delete) and re-clone, and only when
+//      the working tree is clean, so a half-edited tree is never swept aside. Otherwise report `needs-attention`.
+
+/** Re-provision a broken daemon clone in place: move it to `quarantineRoot`, clone fresh from the same origin
+ *  (reusing the old shared-reference alternate), check the same branch out. Restores the old clone if the clone fails. */
+export function recloneInPlace(dir, quarantineRoot, { log = () => {}, reason = '' } = {}) {
+  const url = runGit(['config', '--get', 'remote.origin.url'], dir).out.trim();
+  if (!url) return { ok: false, error: 'no remote.origin.url to re-clone from' };
+  const branch = runGit(['symbolic-ref', '--short', '-q', 'HEAD'], dir).out.trim() || 'main';
+  let reference = null;
+  try {
+    const first = readFileSync(join(dir, '.git', 'objects', 'info', 'alternates'), 'utf8').split('\n').map((l) => l.trim()).find(Boolean);
+    if (first) reference = first.replace(/\/objects\/?$/, '');
+  } catch { /* no alternates */ }
+  const moved = quarantineLane(dir, quarantineRoot, { log, reason });
+  const args = ['clone', '--quiet', ...(reference ? ['--reference', reference] : []), '--branch', branch, url, dir];
+  const c = runGit(args, dirname(dir));
+  if (c.code !== 0) {
+    rmSync(dir, { recursive: true, force: true }); // only the half-made new clone
+    renameSync(moved, dir); // put the old one back: nothing is lost
+    return { ok: false, error: `re-clone failed (${c.err.trim().split('\n')[0]}); old clone restored` };
+  }
+  return { ok: true, quarantinedTo: moved };
+}
+
+/**
+ * Make a daemon clone safe to `git fetch` in. Idempotent and cheap on a healthy clone (two git calls).
+ * @param {string} dir  the clone's worktree root
+ * @param {{log?:Function, allowReclone?:boolean, quarantineRoot?:string, reclone?:Function}} [opts]
+ * @returns {{ok:boolean, skipped?:string, pruned:string[], reported:string[], quarantinedTo?:string, problems:string[]}}
+ */
+export function repairCloneRefs(dir, { log = () => {}, allowReclone = true, quarantineRoot = join(dirname(dir), '.quarantine'), reclone = recloneInPlace } = {}) {
+  const out = { ok: true, pruned: [], reported: [], problems: [] };
+  if (!dir || !existsSync(join(dir, '.git'))) return { ...out, skipped: 'not-a-clone' };
+  const name = basename(dir);
+  const head = runGit(['symbolic-ref', '-q', 'HEAD'], dir).out.trim();
+  for (const { ref, sha } of findBrokenRefs(dir)) {
+    if (ref.startsWith('refs/remotes/') && ref !== head) {
+      const r = runGit(['update-ref', '-d', ref], dir);
+      if (r.code === 0) out.pruned.push(ref);
+      else out.reported.push(`${ref} (target ${sha.slice(0, 8)} missing; prune failed: ${r.err.trim().split('\n')[0]})`);
+    } else {
+      out.reported.push(`${ref} (target ${sha.slice(0, 8)} missing; not a remote-tracking ref, left in place)`);
+    }
+  }
+  if (out.pruned.length) log(`  ⚑ clone-repair ${name}: pruned ${out.pruned.length} dangling remote-tracking ref(s): ${out.pruned.slice(0, 5).join(', ')}${out.pruned.length > 5 ? ', …' : ''}`);
+  for (const r of out.reported) log(`  ⚠ clone-repair ${name}: dangling ref NOT deleted — ${r}`);
+
+  const problems = diagnoseLane(dir).problems.filter((p) => !/ref\(s\) point at missing objects/.test(p));
+  if (!problems.length && !out.reported.some((r) => r.includes('prune failed'))) return out;
+  out.problems = problems;
+  // `git status` itself fails when HEAD's object is gone, so read local edits straight from the index (no HEAD needed).
+  const edits = runGit(['ls-files', '--modified', '--deleted', '--others', '--exclude-standard'], dir);
+  const dirty = edits.code === 0 && edits.out.trim() !== '';
+  if (!allowReclone || dirty || !problems.length) {
+    out.ok = !problems.length && !out.reported.some((r) => r.includes('prune failed'));
+    if (problems.length) log(`  ⚠ clone-repair ${name}: clone is damaged (${problems.join('; ')}) but ${dirty ? 'its working tree has local edits' : 're-clone is disabled'} — needs attention`);
+    return out;
+  }
+  const r = reclone(dir, quarantineRoot, { log, reason: problems.join('; ') });
+  if (r.ok) { out.quarantinedTo = r.quarantinedTo; out.problems = []; return out; }
+  out.ok = false;
+  log(`  ⚠ clone-repair ${name}: ${r.error}`);
+  return out;
 }
 
 const resolveFrom = (base, p) => (p.startsWith('/') ? p : join(base, p));

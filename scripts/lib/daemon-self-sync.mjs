@@ -115,6 +115,7 @@ import {
   acquireRead as acquireReadLock, releaseRead as releaseReadLock, resolveReaderPriorityAfter,
 } from './daemon-clone-lock.mjs';
 import { basename } from 'node:path';
+import { repairCloneRefs } from './lane-repair.mjs';
 
 /** Setting: how long a STARVED reader (see `daemon-clone-lock.mjs` "reader fairness") waits, within the same
  *  tick, for draining writers to back off before it skips. Default 30s; a writer that already holds the clone
@@ -194,6 +195,7 @@ export function decideSelfSync({ fetched, behind, dirty, onBase }) {
  */
 export function selfSyncCheckout({ root, base = 'main', run = gitRun, timeoutMs = 60_000 }) {
   const git = (args) => run(args, { cwd: root, timeout: timeoutMs, killSignal: 'SIGKILL' });
+  repairCloneRefs(root, { log: (m) => console.error(m) }); // heal dangling remote-tracking refs before any fetch
   const fetched = git(['fetch', 'origin', base, '--quiet']).status === 0;
   const count = (range) => {
     const r = git(['rev-list', '--count', range]);
@@ -345,6 +347,7 @@ export function selfSyncCheckoutPoc({ root, base = 'main', pocBranch, run = gitR
   assertSafeBranchName(pocBranch, 'pocBranch');
   assertSafeBranchName(base, 'base');
   const git = (args) => run(args, { cwd: root, timeout: timeoutMs, killSignal: 'SIGKILL' });
+  repairCloneRefs(root, { log: (m) => console.error(m) }); // heal dangling remote-tracking refs before any fetch
   // `--` ends option parsing: defense in depth on top of the name check, so a ref is never read as a flag.
   const fetchedMain = git(['fetch', '--quiet', '--', 'origin', base]).status === 0;
   const fetchedPoc = git(['fetch', '--quiet', '--', 'origin', pocBranch]).status === 0;

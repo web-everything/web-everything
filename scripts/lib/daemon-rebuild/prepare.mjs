@@ -22,6 +22,7 @@ import {
 import { readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { repairCloneRefs } from '../lane-repair.mjs';
 import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
 } from '../overlay-conflict-wake.mjs';
@@ -197,6 +198,12 @@ export async function prepareRebuild({
   }
   const overlaysBefore = overlayState.overlays;
   const edgeResolve = env[OVERLAY_EDGE_RESOLVE_ENV] !== '0';
+  // Heal dangling remote-tracking refs (and a clone that is itself broken) BEFORE the fetch: one such ref makes
+  // `fetch --prune` reject the whole batch. Daemon clones are never acquired through lane-pool, so this is their only heal.
+  const cloneRepair = repairCloneRefs(root, { log: (m) => log?.error?.(m) });
+  if (cloneRepair.pruned.length || cloneRepair.reported.length || cloneRepair.quarantinedTo || !cloneRepair.ok) {
+    alert('clone-refs-repaired', { pruned: cloneRepair.pruned.length, reported: cloneRepair.reported, quarantinedTo: cloneRepair.quarantinedTo ?? null, problems: cloneRepair.problems });
+  }
   const fetchResult = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
   if (!fetchResult.ok) {
     if (unsafe.untracked.length > 0) alert('untracked-kept', { paths: unsafe.untracked });
