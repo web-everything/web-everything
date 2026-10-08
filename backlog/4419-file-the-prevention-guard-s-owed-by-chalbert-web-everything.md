@@ -22,7 +22,12 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 
 ## Done when
 
-1. **Executable** — `npx vitest run we:scripts/__tests__/check-standards-rules-content-lint.test.mjs -t "sibling smell"` fails before this item lands (the detector does not exist) and passes after.
+1. **Executable** — this command (run from the repo root, paths bare because they are shell arguments) fails before this item lands (the export check exits 1 while the detector is absent) and passes after:
+
+   ```bash
+   node -e "import('./scripts/check-standards-rules.mjs').then(m=>process.exit(typeof m.findNewHealthSmellWithoutSiblingCheck==='function'?0:1))" && npx vitest run scripts/__tests__/check-standards-rules-content-lint.test.mjs scripts/__tests__/check-backlog-item.test.mjs scripts/__tests__/check-standards.test.mjs -t "sibling smell"
+   ```
+   - **Why the export check is in front:** vitest alone is vacuous here. `-t "sibling smell"` matches nothing before the tests exist, so every test is skipped and vitest exits 0 (verified on main `59634161a`: `138 tests | 138 skipped`, exit 0). The `&&` makes the command fail until the symbol exists; the named tests then prove behavior.
 
 ## Progress
 
@@ -47,7 +52,7 @@ Out of scope (Follow-ups): the prepare-brief checklist wording, promoting the wa
 
 ## Test plan
 
-Every test name contains "sibling smell" (the Done-when `-t` filter). The quiet cases below each sit beside the flagged control (case 1), so they cannot pass vacuously from an always-empty detector.
+Every test name contains "sibling smell" (the Done-when `-t` filter, across all three test files). The quiet cases below each sit beside the flagged control (case 1), so they cannot pass vacuously from an always-empty detector.
 
 - *flags a new smell file with no sibling note* — scope `[we:scripts/conveyor/health-smells/new-x.mjs]`, `fileExists` false, body without "sibling smell" → one hit. RED before: the function is not exported.
 - *quiet when the body has a "sibling smells" line* — same scope, body "Sibling smells grepped: none overlap." → no hit.
@@ -55,6 +60,9 @@ Every test name contains "sibling smell" (the Done-when `-t` filter). The quiet 
 - *quiet for unrelated scope paths* — `we:scripts/conveyor/health-watch.mjs` and a `__tests__/` path under health-smells → no hit.
 - *a note inside a code fence does not count* — "sibling smell" only in a fenced block → still flagged.
 - *wired into the lint* — `lintBacklogItemRendering` on an open task with the flagged scope emits the warning; a resolved one does not.
+- *sibling smell warning through check:item* — in `we:scripts/__tests__/check-backlog-item.test.mjs`, drive the real CLI (its existing temp-backlog harness) on an open task whose `scope:` names a nonexistent `we:scripts/conveyor/health-smells/*.mjs` and whose body has no "sibling smell" line → the output carries the warning. Add the quiet control beside it (same card plus a "Sibling smells grepped" line → no warning).
+- *sibling smell warning through check:standards* — in `we:scripts/__tests__/check-standards.test.mjs`, run the real gate in a shared-clone repo (the harness already used for the scope-guard tests) with a throwaway card of the same shape → the gate's warning lines carry the new warning.
+- **Mutation requirement (the production wiring is the thing under test).** The `fileExists` default of `() => true` silently disables the warning, so a caller that drops its real probe would pass every detector and direct-lint test above. The two entry-point tests must therefore be shown to fail when either caller's probe is removed: before opening the PR, delete the `fileExists` argument from `we:scripts/check-backlog-item.mjs:100` and then from `we:scripts/check-standards.mjs:964` in turn, and record that the matching test goes red each time (and green again after restoring).
 
 ## Proof plan
 
