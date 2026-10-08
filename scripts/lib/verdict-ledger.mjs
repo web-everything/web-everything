@@ -107,7 +107,8 @@ import { REVIEW_LABELS, hasReviewLabel, acceptanceCoversHead } from './review-es
 import { canonicalizeSlug, CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { reserve, releaseLockDir } from '../readiness/file-locks.mjs';
 import { writeAllSync } from './write-all-sync.mjs';
-import { appendLedgerRows } from './verdict-ledger-io.mjs';
+import { createGitLedgerStore } from './verdict-ledger-io.mjs';
+import { registerLedgerStore, getLedgerStore } from './verdict-ledger-store.mjs';
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 // SCHEMA
@@ -1129,7 +1130,8 @@ export function appendVerdict(record, opts = {}) {
     store = 'home';
     warnDowngradeOnce(loud);
   }
-  const gitAppend = opts.gitAppend ?? appendLedgerRows;
+  // The git store comes from the registry; a test seam (`opts.gitAppend`) swaps only its append.
+  const gitStore = opts.gitAppend ? createGitLedgerStore({ appendRows: opts.gitAppend }) : getLedgerStore('git');
   // A home write that THROWS (bad ledger dir, full disk) is a failed write with a reason, never an escape: every
   // caller branches on `ok`, and `review-pr-io` has no catch around this call.
   const rawHome = opts.homeAppend ?? appendVerdictHome;
@@ -1140,16 +1142,22 @@ export function appendVerdict(record, opts = {}) {
   };
   const writeGit = (normalized) => {
     if (!board) return { status: 'miss', error: 'no git board configured (set WE_VERDICT_LEDGER_BOARD or pass opts.board)' };
-    try {
-      gitAppend({ board, repo: normalized.repo, records: [normalized] });
-      return { status: 'appended' };
-    } catch (e) { return { status: 'miss', error: errFirstLine(e) }; }
+    const a = gitStore.append([normalized], { board, repo: normalized.repo });
+    return a.ok ? { status: 'appended' } : { status: 'miss', error: a.error };
   };
   if (store === 'home') return { ...homeAppend(record), store };
   // Validate first: an invalid record is refused and nothing is written anywhere.
   const v = serializeLedgerEvent(record);
   if (!v.ok) return { ok: false, path: null, record: null, locked: false, errors: v.errors, store };
   const clears = eventClears(v.record);
+  if (!VERDICT_LEDGER_STORES.includes(store)) {
+    // A store PLUGGED in through the registry (e.g. a product store): one contract append, F4 posture on a miss.
+    const a = getLedgerStore(store).append([v.record], { board, repo: v.record.repo });
+    if (a.ok) return { ok: true, path: null, record: v.record, locked: false, errors: [], store };
+    const g = { status: 'miss', error: a.error };
+    if (clears) return refuseClearingOnGitMiss({ g, store, loud, record: v.record });
+    return finishGitMiss({ home: homeAppend(record), g, store, loud, record: v.record });
+  }
   if (store === 'git') {
     const g = writeGit(v.record);
     if (g.status === 'appended') {
@@ -1269,7 +1277,8 @@ export const DEFAULT_VERDICT_LEDGER_STORE = 'dual';
  *  @returns {{store: string, named: boolean}} */
 export function resolveLedgerStoreChoice(explicit, env = process.env) {
   const v = String(explicit ?? env.WE_VERDICT_LEDGER_STORE ?? '').trim().toLowerCase();
-  if (VERDICT_LEDGER_STORES.includes(v)) return { store: v, named: true };
+  // A built-in name, or any store plugged into the registry (`verdict-ledger-store.mjs`).
+  if (VERDICT_LEDGER_STORES.includes(v) || getLedgerStore(v)) return { store: v, named: true };
   // Under a test run an unconfigured store is `home`, so an unrelated suite never pushes to a real remote.
   // Production (and any test that names the store) gets the `dual` default.
   return { store: isUnderTest(env) ? 'home' : DEFAULT_VERDICT_LEDGER_STORE, named: false };
@@ -1317,6 +1326,39 @@ function appendVerdictHome(record) {
     if (locked) { try { releaseLockDir(lockRoot, VERDICT_LEDGER_LOCK_PATH); } catch { /* TTL reclaims it */ } }
   }
 }
+
+/**
+ * The home-file store as a contract adapter (card xsij7u6). `append` wraps {@link appendVerdictHome} (locked, one
+ * line per row); `read` answers `unreadable` for any failure except a file that is simply absent. The legacy
+ * {@link readVerdictLedger} is unchanged, so every existing reader and the v1 fold are byte-identical.
+ */
+export const homeLedgerStore = registerLedgerStore({
+  name: 'home',
+  capabilities: { durable: true, shared: false, ordering: 'append' },
+  append(rows, ctx = {}) {
+    if (!Array.isArray(rows) || !rows.length) return { ok: false, appended: 0, error: '`rows` must be a non-empty array' };
+    for (const r of rows) {
+      const s = serializeLedgerEvent({ ...r, repo: ctx.repo ?? r?.repo });
+      if (!s.ok) return { ok: false, appended: 0, error: `invalid record refused, nothing written: ${s.errors.join('; ')}` };
+    }
+    let appended = 0;
+    for (const r of rows) {
+      let res;
+      try { res = appendVerdictHome({ ...r, repo: ctx.repo ?? r.repo }); } catch (e) { res = { ok: false, errors: [errFirstLine(e)] }; }
+      if (!res.ok) return { ok: false, appended, error: (res.errors ?? []).join('; ') || 'home append failed' };
+      appended += 1;
+    }
+    return { ok: true, appended };
+  },
+  read({ repo, from = 0 } = {}) {
+    let text;
+    try { text = readFileSync(verdictLedgerPath(repo), 'utf8'); } catch (e) {
+      if (e?.code === 'ENOENT') return { status: 'ok', rows: [] };
+      return { status: 'unreadable', reason: 'home-read-failed', error: errFirstLine(e) };
+    }
+    return { status: 'ok', rows: parseLedgerEvents(text).slice(from) };
+  },
+});
 
 /** Read + normalize one repo's ledger. A missing file → `[]`. Never throws. */
 export function readVerdictLedger(repo) {
