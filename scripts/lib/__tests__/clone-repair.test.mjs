@@ -17,20 +17,20 @@ import { mergeOverlayRef } from '../daemon-load-overlay.mjs';
 const g = (cwd, ...a) => execFileSync('git', a, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const GHOST = 'deadbeef'.repeat(5);
 
-let root, origin, clone;
+let tmp, origin, clone;
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'clone-repair-'));
-  origin = join(root, 'origin.git');
-  g(root, 'init', '-q', '--bare', '-b', 'main', origin);
-  const seed = join(root, 'seed');
-  g(root, 'clone', '-q', origin, seed);
+  tmp = mkdtempSync(join(tmpdir(), 'clone-repair-'));
+  origin = join(tmp, 'origin.git');
+  g(tmp, 'init', '-q', '--bare', '-b', 'main', origin);
+  const seed = join(tmp, 'seed');
+  g(tmp, 'clone', '-q', origin, seed);
   g(seed, 'config', 'user.email', 't@t'); g(seed, 'config', 'user.name', 't');
   writeFileSync(join(seed, 'a.txt'), 'a'); g(seed, 'add', '.'); g(seed, 'commit', '-qm', 'one'); g(seed, 'push', '-q', 'origin', 'HEAD:main');
-  clone = join(root, 'clone');
-  g(root, 'clone', '-q', origin, clone);
+  clone = join(tmp, 'clone');
+  g(tmp, 'clone', '-q', origin, clone);
   g(clone, 'config', 'user.email', 't@t'); g(clone, 'config', 'user.name', 't');
 });
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+afterEach(() => rmSync(tmp, { recursive: true, force: true }));
 
 const plant = (rel) => { const f = join(clone, '.git', rel); mkdirSync(join(f, '..'), { recursive: true }); writeFileSync(f, `${GHOST}\n`); };
 
@@ -57,7 +57,7 @@ describe('repairCloneRefs', () => {
 
   it('is a no-op on a healthy clone and skips a non-clone', () => {
     expect(repairCloneRefs(clone)).toMatchObject({ ok: true, pruned: [], reported: [] });
-    expect(repairCloneRefs(join(root, 'nope')).skipped).toBe('not-a-clone');
+    expect(repairCloneRefs(join(tmp, 'nope')).skipped).toBe('not-a-clone');
   });
 
   it('quarantines (never deletes) and re-clones a clone whose HEAD object is gone', () => {
@@ -68,7 +68,7 @@ describe('repairCloneRefs', () => {
     expect(r.quarantinedTo).toBeTruthy();
     expect(existsSync(r.quarantinedTo)).toBe(true);
     expect(g(clone, 'rev-parse', 'HEAD')).toBe(head);
-    expect(readdirSync(join(root, '.quarantine')).length).toBe(1);
+    expect(readdirSync(join(tmp, '.quarantine')).length).toBe(1);
   });
 
   it('refuses to re-clone a damaged clone with local edits', () => {
