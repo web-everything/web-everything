@@ -712,11 +712,14 @@ ${note}
       symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
       // The shared clone has only committed state: overlay the files under test.
       for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs']) copyFileSync(join(ROOT, f), join(repo, f));
+      // The gate's scope guards need an origin/main base ref; a clone of a CI checkout has none (the empty-stdout failure).
+      execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo });
       const warnings = () => {
         const r = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', '--local', `--files=${card}`], {
           cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 180_000,
         });
         expect(r.error, r.stderr).toBeUndefined();
+        expect(r.stdout, `gate exited ${r.status} with no JSON: ${r.stderr}`).not.toBe('');
         return JSON.stringify(JSON.parse(r.stdout).warnings);
       };
       writeFileSync(join(repo, card), content('No note here.'));
