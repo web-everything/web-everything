@@ -2,7 +2,7 @@
 kind: story
 size: 2
 status: active
-scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/operations/probation-build-run.mjs", "we:scripts/readiness/__tests__/heavy-admission-fast-lane.test.mjs"]
+scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/operations/probation-build-run.mjs", "we:scripts/readiness/__tests__/heavy-admission-fast-lane.test.mjs", "we:scripts/operations/__tests__/probation-build-run.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---

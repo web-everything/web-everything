@@ -91,6 +91,7 @@ import {
   healDiffWithinEnvelope, launchScorecardRow, newUntrackedPaths, summarizeNumstat,
 } from '../lib/probation-launcher.mjs';
 import { defaultPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
+import { HOLD_SESSION_ENV, HOLD_DISPATCH_KIND_ENV, HOLD_RUN_ID_ENV } from '../readiness/heavy-admission.mjs';
 import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-registry.mjs';
 import { placeBuildDispatchHold } from '../conveyor/build-dispatch-claim.mjs';
 import { planHoldRouting, reserveHoldRoute } from '../conveyor/build-dispatch-hold-router.mjs';
@@ -771,8 +772,23 @@ export function captureWorkerMessage(output, readLog = () => '') {
  *  x55dojc — `laneEnv` disables git hooks (see `../lib/git-hook-surface.mjs`) for every subprocess the
  *  LAUNCHER runs in the lane, so a planted hook can never fire with the launcher's own credentials. The worker
  *  gets `workerEnv` instead (#4291 advisory review): it keeps the repo's own `.githooks/pre-push` main-push guard. */
-export function realIo({ session, env = process.env, repoRoot = WE_ROOT } = {}) {
-  const workerEnv = { ...env, LANE_SESSION: session };
+/**
+ * Card xmh9mtr — the heavy-admission identity every heavy hold of this run (the worker's own vitest /
+ * check:standards, and the final verify-lane) is recorded under. Set in env because the lane lease alone is
+ * not durable here: a fresh probation lane can be reaped `pr-merged` seconds after acquire, which left every
+ * external build hold in `durations.jsonl` with no session. Pure.
+ */
+export function probationHoldIdentityEnv({ session, runId = null, taskType = 'doc-fix' }) {
+  if (!session) return {};
+  return {
+    [HOLD_SESSION_ENV]: String(session),
+    [HOLD_DISPATCH_KIND_ENV]: taskType === 'prepare' ? 'prepare' : 'build',
+    ...(runId ? { [HOLD_RUN_ID_ENV]: String(runId) } : {}),
+  };
+}
+
+export function realIo({ session, runId = null, taskType = 'doc-fix', env = process.env, repoRoot = WE_ROOT } = {}) {
+  const workerEnv = { ...env, LANE_SESSION: session, ...probationHoldIdentityEnv({ session, runId, taskType }) };
   const laneEnv = withHooksDisabled(workerEnv);
   // cwd alone is insufficient: backlog/operation tools derive their roots from import.meta.url.
   // Daemon clones are allowed as read-only launch sources; every writer uses the lane's script copy.
@@ -1024,7 +1040,7 @@ if (isMain) {
   try {
     assertRunnable();
     const args = parseArgs(process.argv.slice(2));
-    const result = await runProbationBuild(args, realIo({ session: args.session }));
+    const result = await runProbationBuild(args, realIo({ session: args.session, runId: args.runId, taskType: args.taskType }));
     console.log(JSON.stringify(result));
     process.exitCode = result.outcome === 'opened-pr' || result.outcome === 'not-applicable' ? 0 : 1;
   } catch (e) {
