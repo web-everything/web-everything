@@ -94,14 +94,20 @@ export function readTaskAgreement(body) {
     if (!groups.length) { problem(`${section}-missing`, section, 'Section is absent.'); continue; }
     for (let i = 1; i < groups.length; i++) problem('duplicate-section', section, 'First canonical section wins.');
     const items = [], paragraphs = [];
-    let active = null, paragraph = [];
+    let active = null, paragraph = [], inComment = false;
     const flushParagraph = () => {
       if (paragraph.length) paragraphs.push({ id: null, text: paragraph.join(' ') });
       paragraph = [];
     };
     for (const line of groups[0]) {
       const trimmed = line.trim();
-      if (/^<!--.*-->$/.test(trimmed) || /^Hint:/.test(trimmed)) continue;
+      // HTML comments are skipped by state, not by regex: a comment may span lines (CodeQL js/bad-tag-filter).
+      if (inComment) { if (trimmed.includes('-->')) inComment = false; continue; }
+      if (trimmed.startsWith('<!--')) {
+        if (!trimmed.includes('-->', 4)) inComment = true;
+        if (inComment || trimmed.endsWith('-->')) continue;
+      }
+      if (/^Hint:/.test(trimmed)) continue;
       if (!trimmed || /^#{3,6}[ \t]+/.test(line)) { active = null; flushParagraph(); continue; }
       const item = /^ {0,3}(?:[-*+]|\d+[.)])[ \t]+(?:\[([AN]\d+)\][ \t]*)?(.*)$/i.exec(line);
       if (item) {

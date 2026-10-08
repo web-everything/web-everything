@@ -94,6 +94,19 @@ describe('readTaskAgreement — canonical sections', () => {
     expect(a.problems.map((p) => p.code)).toEqual(expect.arrayContaining(['acceptance-not-a-list', 'acceptance-empty']));
   });
 
+  it('skips an HTML comment that spans several lines, and keeps text after a one-line comment', () => {
+    const card = [
+      '## Acceptance', '',
+      '<!-- authoring note', '- [A9] hidden inside the comment', 'still hidden -->',
+      '- [A1] real item.', '<!-- one-line note -->', '<!-- inline --> - not an item', '',
+      '## Non-goals', '', '- [N1] real non-goal.', '',
+    ].join('\n');
+    const a = readTaskAgreement(card);
+    expect(a.acceptance.map((i) => i.id)).toEqual(['A1']);
+    expect(a.nonGoals.map((i) => i.id)).toEqual(['N1']);
+    expect(a.problems.map((p) => p.code)).not.toContain('acceptance-not-a-list');
+  });
+
   it('accepts `## Acceptance criteria` and `## Non-goal` heading spellings', () => {
     const a = readTaskAgreement('## Acceptance criteria\n\n- [A1] a\n\n## Non-goal\n\n- [N1] b\n');
     expect(a.acceptance).toEqual([{ id: 'A1', text: 'a' }]);
