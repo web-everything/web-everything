@@ -1250,7 +1250,7 @@ function dispatchReviewRow({
       refuse('scope-bloat', {
         ...withPhase, ...extra, scopeBloat: sb,
         why: refreshPending
-          ? `scope-bloat: ${sb.why} — the mechanical refresh onto ${'main'} is tried first`
+          ? `scope-bloat: ${sb.why} — the mechanical refresh onto main is tried first`
           : `scope-bloat: ${sb.why} — the fix rounds for this PR are spent, so a person must take it`,
       });
     }

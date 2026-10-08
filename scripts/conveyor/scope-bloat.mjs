@@ -15,7 +15,8 @@
  *   - FAR OUTSIDE THE CARD'S SCOPE. More than `WE_REVIEW_SCOPE_BLOAT_OUTSIDE_SCOPE` (default 10) files that match no
  *     entry of the card's `scope:`. Backlog cards, tests beside a scoped file and docs are not counted: they are the
  *     normal companions of a change. Only judged when the card declares a scope and the PR is over
- *     `WE_REVIEW_SCOPE_BLOAT_MIN_FILES` (default 12) files, so a small PR never reads a card.
+ *     `WE_REVIEW_SCOPE_BLOAT_MIN_FILES` (default 12) files, so a small PR never reads a card. (The already-on-main read has no
+ *     such gate beyond the PR having at least that many files at all.)
  *
  * PURE except the `enrich*` functions at the bottom, which are the io shell and fail OPEN: an unreadable diff or card
  * is "no claim", never a hold.
@@ -102,6 +103,8 @@ const git = (args, root) => execFileSync('git', args, { cwd: root, encoding: 'ut
 
 /** The files that differ between `origin/<base>` and `head` (a two-dot diff), fetching the head ref once if missing. */
 export function readNetFiles({ headRefName, headRefOid, base = 'main', root = ROOT, run = git } = {}) {
+  // A head ref is author-supplied; a leading `-` would be read by git as an option, so refuse it before any git call.
+  if (typeof headRefName !== 'string' || headRefName.startsWith('-')) throw new Error('unsafe head ref name');
   try { run(['cat-file', '-e', `${headRefOid}^{commit}`], root); }
   catch { run(['fetch', '-q', 'origin', headRefName], root); }
   return run(['diff', '--name-only', `origin/${base}`, headRefOid], root).split('\n').filter(Boolean);
@@ -147,7 +150,9 @@ export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'mai
       const key = `${pr.number}:${pr.headRefOid}`;
       if (!memo.has(key)) {
         const lazy = pr.files.length >= limits.minFiles;
-        const net = lazy ? readNet({ headRefName: pr.headRefName, headRefOid: pr.headRefOid, base: defaultBranch, root }) : null;
+        // Stale-base needs the net diff for any PR big enough to hold that many files; the card scope only for big ones.
+        const needNet = lazy || (limits.alreadyOnMain > 0 && pr.files.length >= limits.alreadyOnMain);
+        const net = needNet ? readNet({ headRefName: pr.headRefName, headRefOid: pr.headRefOid, base: defaultBranch, root }) : null;
         const scope = lazy ? readScope({ title: pr.title ?? '', base: defaultBranch, root }) : null;
         memo.set(key, assessScopeBloat({ prFiles: pr.files, netFiles: net, cardScope: scope, env }));
         if (memo.size > 500) memo.delete(memo.keys().next().value);

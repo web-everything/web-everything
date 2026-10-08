@@ -15,6 +15,7 @@ import {
 import { planReconcile as planReconcileCore } from '../reconcile-core.mjs';
 import { planFixesFromReconcile, withScopeBloat } from '../reconcile-fix-dispatch.mjs';
 import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
+import { readNetFiles } from '../scope-bloat.mjs';
 import { refreshScopeBloatedPr, runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
 
 const OWN = [
@@ -99,6 +100,17 @@ describe('enrichPrsWithScopeBloat — the io shell fails open and remembers the 
     expect(enrichPrsWithScopeBloat([pr({ number: 4 })], { ...readers, repo: 'plateauapp/plateau-app' })[0].scopeBloat).toBeUndefined();
   });
 
+  it('a small stale PR (below the scope-read file count) is still checked for a stale base', () => {
+    const small = ['a.mjs', 'b.mjs', 'c.mjs', 'd.mjs', 'e.mjs'];
+    const [out] = enrichPrsWithScopeBloat([pr({ number: 20, files: small.map((path) => ({ path })) })], { ...readers, readNet: () => ['e.mjs'] });
+    expect(out.scopeBloat).toMatchObject({ stale: true, files: 5 });
+  });
+
+  it('a head ref that looks like a git option is refused before any git call', () => {
+    const run = () => { throw new Error('git must not run'); };
+    expect(() => readNetFiles({ headRefName: '--upload-pack=x', headRefOid: 'a'.repeat(40), run })).toThrow(/unsafe head ref/);
+  });
+
   it('the refresh attempt is read back from this process AND from the durable thread marker (the fix daemon is another process)', () => {
     const head = 'b'.repeat(40);
     const [fresh] = enrichPrsWithScopeBloat([pr({ number: 10, headRefOid: head })], readers);
@@ -136,6 +148,10 @@ describe('planReconcile — a scope-bloated PR is refreshed or held, never revie
     const out = plan({ scopeBloat: bloat({ refresh: { attempted: true, ok: false, action: 'skip' } }) });
     expect(out.dispatch.filter((d) => d.kind === 'review')).toEqual([]);
     expect(out.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'scope-bloat-rebase', prNumber: 4361 })]);
+  });
+
+  it('the held row carries the head ref and sha the daemon\'s refresh needs (planner -> tick join)', () => {
+    expect(plan({ scopeBloat: bloat() }).refusals[0]).toMatchObject({ headRefName: 'lane/build-outcomes', headRefOid: 'a'.repeat(40), scopeBloat: { stale: true } });
   });
 
   it('a bloat that is not a stale base (wide) goes straight to a fixer; a draft is left to the draft rule', () => {

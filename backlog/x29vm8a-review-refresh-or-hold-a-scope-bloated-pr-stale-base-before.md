@@ -2,7 +2,7 @@
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/review-dispatch.mjs"]
+scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/conveyor/scope-bloat.mjs", "we:skills-src/conveyor/review-daemon.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
@@ -13,7 +13,7 @@ PR #4361 reached review with a diff of +3277/-96 across 44 files when its own ch
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+1. **Executable** — `npx vitest run we:scripts/conveyor/__tests__/scope-bloat.test.mjs` (fails before: no detector, no `scope-bloat` refusal; passes after).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -23,10 +23,10 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — PR file paths and head ref are author-controlled: paths are folded to one line and capped before entering the fixer prompt, and a head ref starting with `-` is refused before any git call.
+2. **Truncated reads** — an unreadable or failed diff or card read leaves the PR unannotated (no claim, no hold).
+3. **Shared state files** — n/a: the only shared state is the per-head `rebase-onto-main` thread marker, written through the existing comment helper.
+4. **Fail closed** — n/a: the detector fails OPEN on purpose (an unreadable diff never holds a PR); a held PR never reads as reviewed, and spent fix rounds refuse it for a person.
+5. **Identity scoping** — the refresh attempt is keyed by PR number and head sha, so a new push earns a new attempt.
+6. **State over time** — one mechanical refresh per head, remembered in process and on the thread; a moved head is re-assessed.
+7. **Who wrote it** — the card id comes from the PR title (author-controlled); it can only weaken the scope signal, and the stale-base signal does not read it.

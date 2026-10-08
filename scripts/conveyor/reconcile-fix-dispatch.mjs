@@ -936,7 +936,7 @@ export function withOperatorSendBack(prompt, sendBack) {
 /** Card x29vm8a - tell the fixer the PR was held because its diff is mostly not its own change, and what to do about it. */
 export function withScopeBloat(prompt, bloat) {
   if (!bloat) return prompt;
-  const list = (title, files) => (files?.length ? `${title}\n${files.slice(0, 40).map((f) => `- ${f}`).join('\n')}${files.length > 40 ? `\n- ... and ${files.length - 40} more` : ''}\n\n` : '');
+  const list = (title, files) => (files?.length ? `${title}\n${files.slice(0, 40).map((f) => `- ${String(f).replace(/\s+/g, ' ').slice(0, 200)}`).join('\n')}${files.length > 40 ? `\n- ... and ${files.length - 40} more` : ''}\n\n` : '');
   return '# Scope bloat - read this first\n\n'
     + `This PR was held from review: ${bloat.why}. Its diff is ${bloat.files} files, far more than its card's own change.\n`
     + 'This is the whole ask: rebase the branch onto current `origin/main` so the diff holds only this card\'s own change '
