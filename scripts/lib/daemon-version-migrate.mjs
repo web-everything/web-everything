@@ -195,7 +195,8 @@ function recoverFromIntent(fs, p) {
     // run parked that destination (`parked`), `state/<path>` is still the stale copy and the clone's entry is the live
     // one: restoring would swap the stale copy in over live data, so such a path is left exactly as it is.
     const untouched = new Set(intent.stale.filter(path => !intent.parked.includes(path)));
-    restoreState(fs, p, intent.paths.filter(path => !untouched.has(path)));
+    const foreignLink = path => stat(fs, join(p.logical, path))?.isSymbolicLink() && fs.readlinkSync(join(p.logical, path)) !== join(p.state, path);
+    restoreState(fs, p, intent.paths.filter(path => !untouched.has(path) && !foreignLink(path)));
     stripExclude(fs, join(p.logical, '.git', 'info', 'exclude'), intent.exclude);
     restoreHomeFiles(fs, p.root, intent.home);
   } // else unreadable: killed while writing it, before any state was touched
@@ -203,15 +204,18 @@ function recoverFromIntent(fs, p) {
   fs.rmSync(intentFile(p), { force: true });
 }
 /** One migrate per clone: an exclusive lock file holding the owner's pid; a dead owner's lock is taken over. */
+const LOCK_WRITE_GRACE_MS = 10_000;
 function acquireLock(fs, p) {
   const file = join(p.root, 'migrate.lock');
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       fs.writeFileSync(file, String(process.pid), { flag: 'wx' });
-      return { release: () => fs.rmSync(file, { force: true }) };
+      return { release: () => { try { if (fs.readFileSync(file, 'utf8') === String(process.pid)) fs.rmSync(file, { force: true }); } catch { /* already gone */ } } };
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
       const pid = Number.parseInt(String(fs.readFileSync(file, 'utf8')), 10);
+      // Created with `wx` and written a moment later: an empty file is a lock being taken, not a dead owner's.
+      if (!Number.isInteger(pid) && Date.now() - (stat(fs, file)?.mtimeMs ?? 0) < LOCK_WRITE_GRACE_MS) return { held: 0 };
       let alive = pid !== process.pid && Number.isInteger(pid) && pid > 0;
       if (alive) try { process.kill(pid, 0); } catch (e) { alive = e.code === 'EPERM'; }
       if (alive) return { held: pid };
@@ -295,7 +299,12 @@ async function migrateInner({ clone, settings, dryRun = false, force = false, de
     return { status: 'refused', reason: 'clone-lacks-host-enable', hint: 'let the clone sync to a main that has card 89 S6' };
   }
   const originUrl = absoluteRemote(p.logical, git(p.logical, ['config', '--get', 'remote.origin.url']));
-  const stateNow = config.statePaths.filter(path => stat(fs, join(p.logical, path)));
+  // Only what the loop below will move (or take over): a foreign symlink in the clone is never touched, so the
+  // intent must not list it either, or a killed run's recovery would swap a leftover state/ copy in over it.
+  const stateNow = config.statePaths.filter(path => {
+    const here = stat(fs, join(p.logical, path));
+    return here && (!here.isSymbolicLink() || fs.readlinkSync(join(p.logical, path)) === join(p.state, path));
+  });
   // A destination left by an earlier run is state we cannot tell from a stale copy: stop before touching anything.
   const existing = stateNow.filter(path => !stat(fs, join(p.logical, path))?.isSymbolicLink() && stat(fs, join(p.state, path)));
   if (existing.length && !force) return { status: 'refused', reason: 'state-exists', existing, hint: 'inspect <home>/<name>/state, or pass --force to keep the clone entries that lose under conflicts/' };

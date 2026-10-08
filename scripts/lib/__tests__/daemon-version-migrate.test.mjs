@@ -261,6 +261,15 @@ describe('daemon version migrate / unmigrate', () => {
     expect(readFileSync(join(clone, '.conveyor', 'daemon.log'))).toBe('log line\n');
   });
 
+  it('a lock file that is still empty (its owner is mid-write) is held, not a dead owner to take over', async () => {
+    fs.mkdirSync(join(home, 'daemon'), { recursive: true });
+    fs.writeFileSync(join(home, 'daemon', 'migrate.lock'), '');
+    const before = snapshot(clone);
+    expect(await migrate({ clone, home, settings, deps })).toMatchObject({ status: 'refused', reason: 'migrate-in-progress' });
+    expect(snapshot(clone)).toEqual(before);
+    expect(fs.existsSync(join(home, 'daemon', 'migrate.lock'))).toBe(true); // not ours to remove
+  });
+
   describe('a forced migrate killed while a stale destination exists (intent recovery must not trust it)', () => {
     // Real death: the matching rename lands, then every later filesystem call fails, so no catch/rollback runs.
     const killAfterRename = match => {
@@ -297,6 +306,17 @@ describe('daemon version migrate / unmigrate', () => {
       expect((await migrate({ clone, home, settings, deps, force: true })).status).toBe('migrated');
       expect(readFileSync(join(home, 'daemon', 'state', '.operations', 'run.json'))).toBe('1');
       expect(files(join(home, 'daemon', 'conflicts'))).toContain('stale');
+    });
+
+    it('a clone entry that is a foreign symlink is never replaced by a leftover state/ copy after a kill', async () => {
+      const target = join(fixture, 'elsewhere-ops');
+      fs.mkdirSync(target);
+      fs.rmSync(join(clone, '.operations'), { recursive: true });
+      fs.symlinkSync(target, join(clone, '.operations'));
+      await expect(migrate({ clone, home, settings, deps: killAfterRename(/state\/\.conveyor$/) })).rejects.toThrow('killed');
+      expect((await migrate({ clone, home, settings, deps })).status).toBe('migrated');
+      expect(fs.readlinkSync(join(home, 'daemon', 'legacy-20261008T120000Z', '.operations'))).toBe(target);
+      expect(readFileSync(join(home, 'daemon', 'state', '.operations', 'run.json'))).toBe('stale');
     });
 
     it('a path the dead run had already moved over the stale destination is still put back', async () => {
