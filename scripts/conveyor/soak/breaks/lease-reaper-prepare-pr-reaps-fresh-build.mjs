@@ -31,7 +31,7 @@ const ago = (m) => new Date(Date.now() - m * MIN).toISOString();
 function makeLane(poolDir, name, lease) {
   const dir = join(poolDir, name);
   mkdirSync(dir, { recursive: true });
-  execFileSync('git', ['init', '--quiet', '--initial-branch=main'], { cwd: dir });
+  execFileSync('git', ['init', '--quiet', '--initial-branch=main'], { cwd: dir, stdio: 'ignore' });
   writeFileSync(join(dir, '.git', '.lane-lease'), `${JSON.stringify(lease, null, 2)}\n`);
   return dir;
 }
@@ -85,7 +85,7 @@ export default {
         try {
           const script = join(w.simCloneRoot, 'scripts/conveyor/lease-reaper.mjs');
           const env = { ...process.env, ...w.env, LANE_POOL_ROOT: ctx.poolRoot, PATH: `${ctx.binDir}:${process.env.PATH}` };
-          const r = spawnSync('node', [script, '--dry-run', '--json'], { encoding: 'utf8', env, timeout: 20_000 });
+          const r = spawnSync('node', [script, '--dry-run', '--json'], { encoding: 'utf8', env, timeout: 20_000, maxBuffer: 16 * 1024 * 1024 });
           ctx.checked = true;
           let report = null;
           try { report = JSON.parse(r.stdout); } catch { /* reported below */ }
