@@ -6,7 +6,9 @@
  * `run-record.mjs` and is re-exported here so a caller has one import. This file adds only the boundary:
  * where the record lives on disk, and how it is read, written, listed and deleted.
  *
- * WHERE RUNS LIVE, AND WHY. A **gitignored session-local sidecar** — `we:.operations/runs/<id>.json`. That
+ * WHERE RUNS LIVE, AND WHY. A **gitignored machine-local sidecar** — ONE shared folder,
+ * `<workspace>/.operations/runs/<id>.json` ({@link sharedRunsDir}, D6 of 128 / #xyloz19), no longer one
+ * folder per daemon clone, so every daemon sees every other daemon's history. That
  * is clause 1 of
  * [#state-lives-where-its-nature-dictates](../../docs/agent/platform-decisions.md#state-lives-where-its-nature-dictates)
  * (#2615/#2617): a half-finished run is transient operator/session intent, not durable repo readiness, so it
@@ -20,12 +22,14 @@
  * nothing above the seam changes.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
+import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
+import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { assertRunRecord, isValidRunId, parseRunRecord, serializeRunRecord } from './run-record.mjs';
 
 export {
@@ -52,10 +56,69 @@ export function runsDir(root = RUNS_ROOT) {
   return join(root, '.operations', 'runs');
 }
 
-/** The canonical runs directory every consumer resolves to; `OPERATION_RUNS_DIR` wins when set. */
+/** Env override for the ONE shared runs folder (D6 of 128, #xyloz19). `OPERATION_RUNS_DIR` still wins over it. */
+export const SHARED_RUNS_DIR_ENV = 'WE_SHARED_RUNS_DIR';
+
+/**
+ * THE ONE SHARED RUNS FOLDER (D6 of 128, #xyloz19): `<workspace>/.operations/runs` — the sibling of the
+ * coordination root every checkout already shares (`coordination-root.mjs`), so the review, fix, control and
+ * health-watch daemon clones all read and write the SAME run history instead of one private folder each.
+ * `WE_SHARED_RUNS_DIR` moves it. Record ids carry a UUID (`newRunId`), so two daemons never mint the same name.
+ */
+export function sharedRunsDir(env = process.env) {
+  const v = env?.[SHARED_RUNS_DIR_ENV];
+  if (v && String(v).trim()) return resolve(String(v).trim());
+  return join(dirname(resolveCoordinationRoot({ env })), 'runs');
+}
+
+/**
+ * ONE-TIME MOVE of records written before the shared folder existed. Moves every `*.json` run record in
+ * `legacyDir` (a clone's old `.operations/runs`) into `sharedDir`: copy to a temp name, atomic rename into
+ * place, then remove the source. A record that already exists in the shared folder wins (it is newer by
+ * construction) and the stale source is just removed. Best-effort per file; never throws. No hand migration.
+ * @returns {{moved:string[], skipped:string[]}}
+ */
+export function migrateLegacyRuns(legacyDir, sharedDir) {
+  const moved = [];
+  const skipped = [];
+  if (!legacyDir || !existsSync(legacyDir) || resolve(legacyDir) === resolve(sharedDir)) return { moved, skipped };
+  let names;
+  try { names = readdirSync(legacyDir).filter((f) => f.endsWith('.json') && isValidRunId(f.slice(0, -5))); } catch { return { moved, skipped }; }
+  if (!names.length) return { moved, skipped };
+  try { mkdirSync(sharedDir, { recursive: true }); } catch { return { moved, skipped: names }; }
+  for (const f of names) {
+    const src = join(legacyDir, f);
+    const dest = join(sharedDir, f);
+    try {
+      if (!existsSync(dest)) {
+        const tmp = `${dest}.${process.pid}.${randomUUID()}.tmp`;
+        copyFileSync(src, tmp);
+        renameSync(tmp, dest);
+        moved.push(f.slice(0, -5));
+      }
+      rmSync(src, { force: true });
+    } catch { skipped.push(f.slice(0, -5)); }
+  }
+  return { moved, skipped };
+}
+
+const migrated = new Set();
+
+/**
+ * The canonical runs directory every consumer resolves to. `OPERATION_RUNS_DIR` wins when set (tests, a daemon
+ * job child). Otherwise it is the {@link sharedRunsDir}, and the FIRST resolve in a process moves this clone's
+ * old per-clone `.operations/runs` records in ({@link migrateLegacyRuns}) — so each daemon clone migrates its
+ * own history on boot. Skipped under test (`WE_UNDER_TEST`), where the tests call the migration explicitly.
+ */
 export function resolveRunsDir() {
   const env = process.env.OPERATION_RUNS_DIR;
-  return env && env.trim() ? resolve(env.trim()) : runsDir();
+  if (env && env.trim()) return resolve(env.trim());
+  const dir = sharedRunsDir();
+  if (process.env.WE_UNDER_TEST !== '1' && !migrated.has(dir)) {
+    migrated.add(dir);
+    try { migrateLegacyRuns(runsDir(), dir); } catch { /* best-effort */ }
+  }
+  return dir;
 }
 
 /**
@@ -127,9 +190,7 @@ export function writeRun(record, dir = resolveRunsDir()) {
   assertRunRecord(record, 'run record being written');
   const path = runPath(record.id, dir);
   mkdirSync(dir, { recursive: true });
-  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tmp, serializeRunRecord(record));
-  renameSync(tmp, path);
+  writeJsonAtomic(path, record); // temp file + validate + same-fs rename: safe across daemon processes
   return path;
 }
 

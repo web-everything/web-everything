@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { createFileRunStore, runsDir } from './run-store.mjs';
+import { createFileRunStore, migrateLegacyRuns, runsDir, sharedRunsDir } from './run-store.mjs';
 import { createFileCallLogStore } from './call-log-store.mjs';
 import { DISPATCH_EFFECT, LAUNCH_KINDS, dispatchStillHolds } from './dispatch-lane.mjs';
 import { REPO_ROOT, defaultListAgents, inFlightDispatchesFor, stampLiveness } from './dispatch-lane-io.mjs';
@@ -136,7 +136,14 @@ export function collectRunnerActivity({ limit = 10 } = {}, {
   exec = execFileSync,
   env = process.env,
   now = () => new Date(),
-  storeFor = (root) => createFileRunStore(env.OPERATION_RUNS_DIR || runsDir(root)),
+  // D6 of 128 (#xyloz19): every runner's history is the ONE shared folder; a runner checkout's old per-clone
+  // records are moved in the first time it is read, so nothing written before the move is lost.
+  storeFor = (root) => {
+    if (env.OPERATION_RUNS_DIR) return createFileRunStore(env.OPERATION_RUNS_DIR);
+    const shared = sharedRunsDir(env);
+    if (env.WE_UNDER_TEST !== '1') migrateLegacyRuns(runsDir(root), shared);
+    return createFileRunStore(shared);
+  },
   listAgents = () => defaultListAgents({ exec, env: { ...env, WE_DISPATCH_LIST_TIMEOUT_MS: String(PROCESS_TIMEOUT_MS) } }),
 } = {}) {
   const observedAt = now().toISOString();
@@ -216,7 +223,7 @@ export function collectRunnerActivity({ limit = 10 } = {}, {
       plannedDispatch: tick?.dispatch ?? null },
     inFlightDispatches, dispatchLiveness: stamped.livenessSource,
     completedDispatches: completed.slice(0, limit), completedAvailable: completed.length,
-    historySource: env.OPERATION_RUNS_DIR || runsDir(root), unreadableRunRecords,
+    historySource: env.OPERATION_RUNS_DIR || sharedRunsDir(env), unreadableRunRecords,
   };
 }
 

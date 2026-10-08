@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { createLandAdvanceReader, createLandAdvanceApplier } from './land-advance-io.mjs';
 import { planLandAdvance, renderTable, decideMode, LAND_ADVANCE_OP } from './land-advance.mjs';
 import { canonicalRoot as resolveCanonicalRoot, readGate as readGateDefault, tryAcquireSingleFlight, releaseSingleFlight, LAND_ADVANCE_LOCK_ROOT } from './land-advance-gate.mjs';
-import { createFileRunStore, resolveRunsDir, runsDir, newRunId, newRunRecord } from './run-store.mjs';
+import { createFileRunStore, resolveRunsDir, newRunId, newRunRecord } from './run-store.mjs';
 const FLAG = /^--(?:json|apply|mode=(?:plan|dispatch)|cap=\d+|max-items=\d+|caller=[\w.-]+)$/;
 export async function main({ argv = process.argv.slice(2), deps = {}, stdout = (s) => process.stdout.write(s), stderr = (s) => process.stderr.write(s) } = {}) {
   let lease = null;
@@ -31,7 +31,7 @@ export async function main({ argv = process.argv.slice(2), deps = {}, stdout = (
     const inputs = await (deps.readInputs ?? createLandAdvanceReader({ cap, refreshPrototype: mode.mode === 'dispatch', canonicalRoot: root }))();
     const plan = { ...planLandAdvance({ ...inputs, cap, maxItemsPerCall }), mode, canonicalRoot: root };
     if (mode.mode === 'dispatch' && !plan.errors.length) plan.applied = await (deps.apply ?? createLandAdvanceApplier({ canonicalRoot: root }))(plan, { prs: mode.prs, items: mode.items });
-    const store = deps.store ?? createFileRunStore(process.env.OPERATION_RUNS_DIR ? resolveRunsDir() : runsDir(root));
+    const store = deps.store ?? createFileRunStore(resolveRunsDir());
     const record = newRunRecord({ id: newRunId(LAND_ADVANCE_OP), op: LAND_ADVANCE_OP, input: { mode: requested, caller } });
     record.verdict = { mode: mode.mode, why: mode.why, budget: plan.capacity.budget, proposedPrs: plan.proposed.map((r) => r.subject),
       proposedItems: plan.items?.proposed.map((i) => i.num) ?? [], dispatched: plan.applied?.dispatched?.length ?? 0, queued: plan.applied?.queued?.length ?? 0,
