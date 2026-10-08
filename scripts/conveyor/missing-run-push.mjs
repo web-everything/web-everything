@@ -2,11 +2,14 @@
  * Uses a scratch bare repository: no daemon checkout, index or branch is changed.
  * A marked recovery tip is never nudged again, even if posting its comment failed.
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSyncThrottled, ghAuthIdentity } from '../lib/gh-throttle.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
+import { MISSING_RUN_CREDENTIAL_REFUSAL } from './main-red-recovery.mjs';
+import { isCacheFresh, defaultCachePath } from '../lib/github-app-auth-env.mjs';
+import { installationForOwner, ownerOfSlug, installationCachePath } from '../lib/github-app-installations.mjs';
 
 export const RECOVERY_COMMIT_MARKER = 'Conveyor-Missing-Run-Recovery:';
 
@@ -18,9 +21,24 @@ export function recoveryPushCredential(token, env = {}) {
   return /^(ghp_|github_pat_|gho_)/.test(token);
 }
 
+const defaultReadCache = (path) => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } };
+
+/** The push token for `repo`'s OWNER (xgq539z). One App installation covers ONE account, so the daemon's own
+ *  env token (a web-everything installation) cannot push to a plateauapp PR, and `gh auth token` cannot tell
+ *  which owner is wanted. The per-owner cache the gh shim reads is minted by our own code, so a fresh entry
+ *  bound to the owner's installation is trusted. Returns null when none applies (caller falls back).
+ *  @returns {string|null} */
+export function ownerInstallationToken(repo, { env = process.env, readCache = defaultReadCache, now = Date.now() } = {}) {
+  const id = installationForOwner(ownerOfSlug(repo), env);
+  if (!id) return null;
+  const cached = readCache(installationCachePath(defaultCachePath(), id));
+  if (!isCacheFresh(cached, now) || String(cached.installationId) !== String(id)) return null;
+  return typeof cached.token === 'string' && cached.token.startsWith('ghs_') ? cached.token : null;
+}
+
 export function pushMissingRunCommit(d, {
   repo, defaultBranch = 'main', exec = execFileSyncThrottled, env = process.env,
-  checkClaim = pushRefusal,
+  checkClaim = pushRefusal, readCache = defaultReadCache, now = Date.now(),
 } = {}) {
   const action = 'pull-request-push';
   const defer = (error) => ({ ok: false, action, deferred: true, error });
@@ -47,10 +65,13 @@ export function pushMissingRunCommit(d, {
     const held = claim();
     if (held) return defer(held.message);
     stage = 'credential';
-    const token = String(env.GH_TOKEN || env.GITHUB_TOKEN || exec('gh', ['auth', 'token', '--hostname', 'github.com'], opts)).trim();
+    // Prefer the repo OWNER's own installation token (xgq539z) so a plateauapp/frontier-ui PR is pushed with
+    // an identity that can write to it, even when the daemon's env token belongs to another org.
+    const ownerToken = ownerInstallationToken(repo, { env, readCache, now });
+    const token = String(ownerToken || env.GH_TOKEN || env.GITHUB_TOKEN || exec('gh', ['auth', 'token', '--hostname', 'github.com'], opts)).trim();
     // An ineligible credential is structural (config, not a race): count it so the per-sha cap hands the PR
     // off instead of re-planning it every tick forever.
-    if (!recoveryPushCredential(token, env)) return { ok: false, action, error: 'push requires a PAT, user OAuth token, or verified conveyor App installation token' };
+    if (!ownerToken && !recoveryPushCredential(token, env)) return { ok: false, action, error: MISSING_RUN_CREDENTIAL_REFUSAL };
     scratch = mkdtempSync(join(tmpdir(), 'we-missing-run-'));
     // Pin git to the credential just validated, overriding stored helpers and auth
     // headers. The secret is only in the child environment, never argv or logs.

@@ -1045,6 +1045,7 @@ export const DEFAULT_MAX_MISSING_RUN_RETRIES_PER_SHA = 2;
 /** The stable FIRST LINE of the durable missing-run-recovery comment, mirroring
  *  {@link REBASE_ONTO_MAIN_COMMENT_MARKER}/{@link HUNG_CI_COMMENT_MARKER}'s own shape — a distinct marker text
  *  so this cap never cross-counts with either sibling cap. */
+export const MISSING_RUN_CREDENTIAL_REFUSAL = 'push requires a PAT, user OAuth token, or verified conveyor App installation token';
 export const MISSING_RUN_COMMENT_MARKER = '🚦 conveyor missing-run-recovery';
 
 /**
@@ -1229,6 +1230,9 @@ export function countMissingRunComments(comments, headSha = null) {
     // Old dispatch attempts cannot produce evaluated PR checks; do not let their
     // exhausted budget prevent the corrected recovery method from running.
     if (/via workflow-dispatch|trigger CI \(workflow-dispatch/.test(body)) continue;
+    // xgq539z — a credential refusal happens BEFORE anything is pushed, so it says nothing about whether
+    // GitHub would start a run; it must not use up the budget meant for real push attempts.
+    if (body.includes(MISSING_RUN_CREDENTIAL_REFUSAL)) continue;
     if (headSha && !missingRunBodyHasExactLine(body, `sha: ${headSha}`)) continue;
     n += 1;
   }
