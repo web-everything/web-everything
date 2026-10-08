@@ -11,7 +11,9 @@ tags: [review, ledger]
 
 # Stable finding identity in the ledger + scoped re-review in shadow
 
-Fixer/review proposal, operator 2026-10-08, P3 prerequisite (proposal "First slices" item 3, B1 part 1). Today every round re-reads the full `base..head` diff in we:scripts/operations/review-pr.mjs, and the ledger keeps no finding identity (we:scripts/lib/review-loop-policy.mjs says so). So round N+1 samples new findings on code round N already saw (`later-round-find` 9 → 29). This slice records a stable finding identity and runs the delta-scoped re-review in SHADOW only: the live verdict is unchanged, and a journal records what the scoped review would have decided. Builds on #3363 (reviewer identity per round) and #3024. The scope rule is expressed through the protocol card xdsdeeu's shape.
+Fixer/review proposal, operator 2026-10-08, P3 prerequisite (proposal "First slices" item 3, B1 part 1). Today every round re-reads the full `base..head` diff in we:scripts/operations/review-pr.mjs, and the ledger keeps no finding identity (we:scripts/lib/review-loop-policy.mjs says so). So round N+1 samples new findings on code round N already saw (`later-round-find` 9 → 29). This slice records a stable finding identity and runs the delta-scoped re-review in SHADOW only: the live verdict is unchanged, and a journal records what the scoped review would have decided.
+
+Builds on #3363 (reviewer identity per round) and #3024. The scope rule is expressed through the protocol card xdsdeeu's shape.
 
 ## Acceptance
 

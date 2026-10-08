@@ -11,7 +11,9 @@ tags: [delivery-standard, review, fixer]
 
 # Review & fix policy protocol: pure rules, declared settings, replay fixtures
 
-Fixer/review proposal, operator 2026-10-08, CROSS-CUTTING ruling (covers P1-P6 and lane protection). Every fixer and review policy becomes a standard rule: a pure decision function over plain facts plus declared settings. Today's behaviour is each setting's off value. Each rule has replay-fixture tests and standard-shaped names (no forge or label strings). The core implements behind the rules. This card defines the rule shape, the settings declaration and the fixture format, and collects the rules into the delivery standard (#5407). It relates to the Decision API slice xzlrqss (#5461): those fixtures are "events in, actions out" for decide and admission; these are "facts in, verdict out" for the review/fix policies, in the same fixture style.
+Fixer/review proposal, operator 2026-10-08, CROSS-CUTTING ruling (covers P1-P6 and lane protection). Every fixer and review policy becomes a standard rule: a pure decision function over plain facts plus declared settings. Today's behaviour is each setting's off value. Each rule has replay-fixture tests and standard-shaped names (no forge or label strings). The core implements behind the rules. This card defines the rule shape, the settings declaration and the fixture format, and collects the rules into the delivery standard (#5407).
+
+It relates to the Decision API slice xzlrqss (#5461): those fixtures are "events in, actions out" for decide and admission; these are "facts in, verdict out" for the review/fix policies, in the same fixture style.
 
 The rules (each slice of epic x8mmzuz adds its own rule and fixtures through this shape):
 
