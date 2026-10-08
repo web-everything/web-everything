@@ -11,12 +11,13 @@ import { join } from 'node:path';
 import {
   buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord,
 } from '../../lib/jury-core.mjs';
-import { parseLedgerEvents, verdictLedgerPath } from '../../lib/verdict-ledger.mjs';
+import { buildLedgerEvent, parseLedgerEvents, verdictLedgerPath } from '../../lib/verdict-ledger.mjs';
 import {
   openReferralFindings, planOperatorRuling, recordReferralRulingOperation,
   OPERATOR_RULING_FOLLOW_UP_EFFECT, OPERATOR_RULING_POST_EFFECT, RULING_NEEDED_LABEL,
 } from '../record-referral-ruling.mjs';
-import { createRecordReferralRulingSinks } from '../record-referral-ruling-io.mjs';
+import { appendLedgerEvents, createRecordReferralRulingSinks } from '../record-referral-ruling-io.mjs';
+import { ledgerFindingKey } from '../../lib/pr-state/referrals.mjs';
 
 const repo = 'o/r';
 const head = 'a'.repeat(40);
@@ -67,7 +68,7 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
       expect(results[1]).toMatchObject({ action: 'send-back', sentBack: true });
       const events = parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8'));
       expect(events.map((e) => e.type)).toEqual(['ruling', 'send-back']);
-      expect(events[0]).toMatchObject({ repo, pr: 7, findingKey: key, ruling: 'block', actor: { declared: 'chalbert', channel: 'chat' } });
+      expect(events[0]).toMatchObject({ repo, pr: 7, findingKey: ledgerFindingKey(key), ruling: 'block', actor: { declared: 'chalbert', channel: 'chat' } });
       expect(events[1]).toMatchObject({ cause: 'block-ruling' });
     } finally { delete process.env.WE_VERDICT_LEDGER_DIR; }
   });
@@ -93,5 +94,46 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
     const posts = { push: (b) => order.push('post') };
     await drive({ ruling: 'not-real', appendEvents: (ev) => order.push(`ledger:${ev[0].ruling}`), posts }).catch(() => {});
     expect(order).toEqual(['ledger:not-real', 'post']);
+  });
+
+  it('the ruling row names the finding by the SAME hashed key the referral row uses, never the raw key', async () => {
+    const seen = [];
+    await drive({ ruling: 'block', appendEvents: (ev) => { seen.push(...ev); } });
+    const row = seen.find((e) => e.type === 'ruling');
+    expect(row.findingKey).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(row.findingKey).toBe(ledgerFindingKey(key));
+    expect(row.findingKey).not.toBe(key);
+  });
+});
+
+describe('the default writer reaches the shared git store (slice H shadow: no ruling rows on ops/review-requests)', () => {
+  let dir;
+  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); dir = null; });
+  const rows = () => [
+    buildLedgerEvent({ type: 'ruling', repo, pr: 7, at: '2026-10-04T14:31:00Z', source: 'record-referral-ruling', declaredActor: 'chalbert', channel: 'chat', findingKey: ledgerFindingKey(key), ruling: 'not-real' }),
+    buildLedgerEvent({ type: 'send-back', repo, pr: 7, at: '2026-10-04T14:31:01Z', source: 'record-referral-ruling', declaredActor: 'chalbert', channel: 'chat', cause: 'block-ruling' }),
+  ];
+
+  it('every ruling and send-back event is appended to the git store AND the home file', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'e1-git-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+    try {
+      const git = [];
+      await appendLedgerEvents(rows(), { store: 'dual', board: dir, gitAppend: ({ records }) => { git.push(...records); } });
+      expect(git.map((r) => r.type)).toEqual(['ruling', 'send-back']);
+      expect(git[0]).toMatchObject({ findingKey: ledgerFindingKey(key), ruling: 'not-real' });
+      expect(parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8')).map((e) => e.type)).toEqual(['ruling', 'send-back']);
+    } finally { delete process.env.WE_VERDICT_LEDGER_DIR; }
+  });
+
+  it('a git miss throws, so the caller applies F4 (a clearing ruling then does not clear)', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'e1-git-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+    try {
+      await expect(appendLedgerEvents(rows().slice(0, 1), { store: 'dual', board: dir, warn: () => {},
+        gitAppend: () => { throw new Error('push rejected'); } })).rejects.toThrow(/push rejected|refused/);
+      await expect(appendLedgerEvents(rows().slice(1), { store: 'dual', board: dir, warn: () => {},
+        gitAppend: () => { throw new Error('push rejected'); } })).rejects.toThrow(/git store write missed/);
+    } finally { delete process.env.WE_VERDICT_LEDGER_DIR; }
   });
 });
