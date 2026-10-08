@@ -943,7 +943,10 @@ export async function acquireSlotBlocking({
       if (isOldestLiveWaiter({ lockRoot, owner, nowMs: attempt, kind: jobKind, ...seams })) {
         const nowIso = new Date(attempt).toISOString();
         // `meta` carries the kind + acquire time so the release can record the hold duration by kind.
-        const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null, ...(command ? { command: String(command).slice(0, 200) } : {}), ...(holder ? { holder } : {}) };
+        // Card xmh9mtr — WHO holds it is fixed here, at acquire (env first, then the lane lease as it is NOW);
+        // reading it at release mis-attributes a lane whose lease was reaped or re-leased meanwhile.
+        const identity = resolveHoldIdentity({ env, repo: repo ?? repoOfOwner(owner), readLease: seams.readLease });
+        const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null, ...(command ? { command: String(command).slice(0, 200) } : {}), ...(holder ? { holder } : {}), ...identity };
         const r = tryAcquireSlot({ lockRoot, cap, owner, nowMs: attempt, nowIso, pid, leaseMinutes, meta, slots: slotOrder });
         if (r.ok) return { ok: true, slot: r.slot, timedOut: false, waitedMs: attempt - startedAt };
       }
@@ -969,7 +972,7 @@ const DURATIONS_LOG = 'durations.jsonl';
 export const DURATIONS_LOG_MAX_LINES = 2000;
 
 /** Append one hold-duration record. Never throws. */
-export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = null, at = new Date().toISOString(), dispatchKind = null, session = null, leaseAcquiredAt = null, command = null, holder = null }) {
+export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = null, at = new Date().toISOString(), dispatchKind = null, session = null, leaseAcquiredAt = null, command = null, holder = null, runId = null }) {
   if (!Number.isFinite(ms) || ms < 0) return false;
   const file = join(lockRoot, DURATIONS_LOG);
   try {
@@ -979,6 +982,7 @@ export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = nul
       ...(dispatchKind != null ? { dispatchKind } : {}),
       ...(session != null ? { session } : {}),
       ...(leaseAcquiredAt != null ? { leaseAcquiredAt } : {}),
+      ...(runId != null ? { runId } : {}),
       ...(command ? { command } : {}),
       ...(holder ? { holder } : {}),
     }) + '\n', 'utf8');
@@ -996,13 +1000,57 @@ function recordReleasedHold(lockRoot, entry, nowMs = Date.now()) {
   const started = Date.parse(entry.meta.acquiredAt || entry.heartbeatAt);
   if (Number.isNaN(started)) return;
   const repo = repoOfOwner(entry.owner);
+  const m = entry.meta;
+  // Card xmh9mtr — the identity captured at acquire wins; the release-time lease is only the fallback for an
+  // entry written before that capture existed (or one acquired with neither env nor a lease).
   let lease = null;
-  try { if (repo) lease = readLaneLease(repo); } catch { /* lease metadata is best-effort */ }
+  if (!m.session) { try { if (repo) lease = readLaneLease(repo); } catch { /* lease metadata is best-effort */ } }
+  const fromLease = holdIdentityFromLease(lease);
   recordHoldDuration({
-    lockRoot, kind, ms: nowMs - started, lane: entry.meta.lane ?? null, repo, at: new Date(nowMs).toISOString(),
-    dispatchKind: classifyDispatchKind(lease), session: lease?.holder || lease?.session || null, leaseAcquiredAt: lease?.acquiredAt || null,
-    command: entry.meta.command ?? null, holder: entry.meta.holder ?? null,
+    lockRoot, kind, ms: nowMs - started, lane: m.lane ?? null, repo, at: new Date(nowMs).toISOString(),
+    dispatchKind: m.dispatchKind ?? (m.session ? null : fromLease.dispatchKind ?? null),
+    session: m.session ?? fromLease.session ?? null,
+    leaseAcquiredAt: m.leaseAcquiredAt ?? (m.session ? null : fromLease.leaseAcquiredAt ?? null),
+    runId: m.runId ?? null,
+    command: m.command ?? null, holder: m.holder ?? null,
   });
+}
+
+/** Env a dispatcher sets so its worker's heavy holds carry a stable identity even with no live lane lease. */
+export const HOLD_SESSION_ENV = 'WE_HEAVY_SESSION';
+export const HOLD_DISPATCH_KIND_ENV = 'WE_HEAVY_DISPATCH_KIND';
+export const HOLD_RUN_ID_ENV = 'WE_HEAVY_RUN_ID';
+
+const clipIdentity = (v) => { const s = String(v ?? '').trim(); return s ? s.slice(0, 200) : null; };
+
+/** `{session, dispatchKind, leaseAcquiredAt}` from a lane lease, each omitted when absent. Pure. */
+function holdIdentityFromLease(lease) {
+  if (!lease) return {};
+  const session = clipIdentity(lease.holder || lease.session);
+  const dispatchKind = classifyDispatchKind(lease);
+  return {
+    ...(session ? { session } : {}),
+    ...(dispatchKind ? { dispatchKind } : {}),
+    ...(lease.acquiredAt ? { leaseAcquiredAt: String(lease.acquiredAt) } : {}),
+  };
+}
+
+/**
+ * Card xmh9mtr — the identity a hold is recorded under, resolved at ACQUIRE. An explicit dispatcher identity
+ * ({@link HOLD_SESSION_ENV} + {@link HOLD_DISPATCH_KIND_ENV} + {@link HOLD_RUN_ID_ENV}) wins: an external
+ * (Codex/agy) probation build's lane lease can be reaped seconds after acquire, so the lease alone is not
+ * enough. Otherwise the lane's lease as it stands now. Never throws; an unknown identity is `{}`.
+ */
+export function resolveHoldIdentity({ env = process.env, repo = null, readLease = readLaneLease } = {}) {
+  const session = clipIdentity(env?.[HOLD_SESSION_ENV]);
+  if (session) {
+    const dispatchKind = clipIdentity(env?.[HOLD_DISPATCH_KIND_ENV]) || classifyDispatchKind({ session });
+    const runId = clipIdentity(env?.[HOLD_RUN_ID_ENV]);
+    return { session, ...(dispatchKind ? { dispatchKind } : {}), ...(runId ? { runId } : {}) };
+  }
+  let lease = null;
+  try { if (repo) lease = (readLease || readLaneLease)(repo); } catch { /* best-effort */ }
+  return holdIdentityFromLease(lease);
 }
 
 /** Parsed duration records, oldest first. Corrupt lines are skipped. */
