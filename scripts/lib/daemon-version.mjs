@@ -71,7 +71,7 @@ export async function buildVersion({ clone, home, sha = 'HEAD', settings, force 
       // The version borrows objects from repo.git but must look like the real clone: tools derive the repo name
       // (lane pool, gh) from `origin`, and a path ending in repo.git would name it "repo".
       const url = checked(gitAt(objects), ['config', '--get', 'remote.origin.url']);
-      if (url) checked(versionGit, ['remote', 'set-url', 'origin', url]);
+      if (url) checked(versionGit, ['remote', 'set-url', '--', 'origin', url]);
     }
     checked(versionGit, ['checkout', '--detach', '--quiet', fullSha]);
     const store = (deps.ensureNodeModulesStore ?? ensureNodeModulesStore)({
@@ -137,7 +137,7 @@ async function cli() {
       const { loadDaemonVersionsSettingsFile } = await import('./daemon-versions-settings.mjs');
       const common = { clone: value('clone'), home: value('home'), settings: loadDaemonVersionsSettingsFile() };
       const result = command === 'plist'
-        ? mod.rewritePlist({ file: value('file'), name: basename(logicalCloneRoot(value('clone'))), backupDir: value('backup-dir'), revertFrom: value('revert-from') })
+        ? mod.rewritePlist({ file: value('file'), name: basename(logicalCloneRoot(value('clone'))), backupDir: value('backup-dir'), revertFrom: value('revert-from'), dryRun: args.includes('--dry-run') })
         : await mod[command]({ ...common, dryRun: args.includes('--dry-run'), force: args.includes('--force') });
       console.log(JSON.stringify(result));
       if (result.status === 'refused') process.exitCode = 2;

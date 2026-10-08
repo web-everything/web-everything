@@ -38,6 +38,27 @@ function mergeMissing(fs, source, target) {
     else fs.copyFileSync(source, target);
   }
 }
+/** Move a real entry that would otherwise be overwritten or deleted into `<root>/conflicts/<stamp>/`; nothing is ever removed. */
+function parkAside(fs, p, src, path) {
+  fs.mkdirSync(p.conflicts, { recursive: true });
+  const base = join(p.conflicts, path.replaceAll('/', '__'));
+  let target = base;
+  for (let n = 1; stat(fs, target); n += 1) target = `${base}.${n}`;
+  fs.renameSync(src, target);
+  return target;
+}
+/** A plain relative path, as the state-linking code requires: no control or glob characters, no `.`/`..`/`.git` segments. */
+const plainRelativePath = path => typeof path === 'string' && path !== '' && !/[\u0000-\u001f\u007f*?[\]\\]/.test(path)
+  && !path.endsWith(' ') && path.split('/').every(part => part !== '' && part !== '.' && part !== '..' && part.toLowerCase() !== '.git');
+/** `migration.json` is read back by unmigrate, so its paths are untrusted until they pass the same rules as the settings. */
+const validRecord = (info, p) => info !== null && typeof info === 'object'
+  && Array.isArray(info.moved) && info.moved.every(plainRelativePath)
+  && Array.isArray(info.excluded ?? []) && (info.excluded ?? []).every(line => typeof line === 'string' && line.startsWith('/') && plainRelativePath(line.slice(1)))
+  && typeof info.legacy === 'string' && dirname(resolve(info.legacy)) === p.root && basename(info.legacy).startsWith('legacy-');
+/** Credentials in a remote url never reach a record or a log. */
+const redactUrl = url => url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/\s]*@/i, '$1***@').replace(/[?#].*$/s, '');
+const stampOf = deps => new Date((deps.now ?? Date.now)()).toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+
 /** Put moved state paths back as real entries (used by a failed migrate and by unmigrate). */
 function restoreState(fs, p, list) {
   const restored = [];
@@ -46,9 +67,11 @@ function restoreState(fs, p, list) {
     const dest = join(p.state, path);
     if (!stat(fs, dest)) continue;
     const here = stat(fs, src);
-    if (here) {
+    if (here?.isSymbolicLink()) fs.rmSync(src, { force: true });
+    else if (here) {
+      // A writer put a real entry where the link was: keep it (merged into the state, and whole in conflicts/).
       if (here.isDirectory()) mergeMissing(fs, src, dest);
-      fs.rmSync(src, { recursive: true, force: true });
+      parkAside(fs, p, src, path);
     }
     fs.mkdirSync(dirname(src), { recursive: true });
     fs.renameSync(dest, src);
@@ -61,16 +84,17 @@ function stripExclude(fs, file, lines) {
   const drop = new Set(lines);
   fs.writeFileSync(file, fs.readFileSync(file, 'utf8').split('\n').filter(l => !drop.has(l)).join('\n'));
 }
-const paths = (name, clone, home) => {
+const paths = (name, clone, home, stamp) => {
   const logical = logicalCloneRoot(clone);
   const root = join(resolve(home ?? join(dirname(logical), '.daemon-clones')), name);
-  return { logical, root, state: join(root, 'state'), repo: join(root, 'repo.git'), marker: join(root, 'settings.local.json'), record: join(root, 'migration.json') };
+  return { logical, root, state: join(root, 'state'), repo: join(root, 'repo.git'), marker: join(root, 'settings.local.json'), record: join(root, 'migration.json'), conflicts: join(root, 'conflicts', stamp) };
 };
 
 export async function migrate({ clone, home, settings, dryRun = false, force = false, deps = {} }) {
   const fs = deps.fs ?? filesystem;
   const name = basename(logicalCloneRoot(clone));
-  const p = paths(name, clone, home);
+  const stamp = stampOf(deps);
+  const p = paths(name, clone, home, stamp);
   const config = validateDaemonVersionsSettings(settings ?? { });
   const here = stat(fs, p.logical);
   if (!here?.isDirectory()) return { status: 'refused', reason: here?.isSymbolicLink() ? 'already-a-symlink' : 'clone-missing' };
@@ -88,88 +112,122 @@ export async function migrate({ clone, home, settings, dryRun = false, force = f
   }
   const originUrl = git(p.logical, ['config', '--get', 'remote.origin.url']);
   const stateNow = config.statePaths.filter(path => stat(fs, join(p.logical, path)));
-  if (dryRun) return { status: 'dry-run', name, sha, originUrl, root: p.root, wouldMove: stateNow };
+  // A destination left by an earlier run is state we cannot tell from a stale copy: stop before touching anything.
+  const existing = stateNow.filter(path => !stat(fs, join(p.logical, path))?.isSymbolicLink() && stat(fs, join(p.state, path)));
+  if (existing.length && !force) return { status: 'refused', reason: 'state-exists', existing, hint: 'inspect <home>/<name>/state, or pass --force to keep the clone entries that lose under conflicts/' };
+  if (dryRun) return { status: 'dry-run', name, sha, originUrl: redactUrl(originUrl), root: p.root, wouldMove: stateNow };
 
   const steps = [];
-  fs.mkdirSync(p.root, { recursive: true });
-  if (!stat(fs, join(p.repo, 'HEAD'))) {
-    git(dirname(p.logical), ['clone', '--bare', '--quiet', '--', p.logical, p.repo]);
-    git(p.repo, ['remote', 'set-url', 'origin', originUrl]);
-    steps.push('repo.git');
-  }
-  git(p.repo, ['fetch', '--quiet', '--no-tags', '--', p.logical, '+HEAD:refs/migrate/base']);
-  // State first: rename (atomic, same volume), then link back so the live daemon keeps writing to the same
-  // place. Done before the build so the version's state links resolve while its smoke runs.
   const moved = [];
   const exclude = join(p.logical, '.git', 'info', 'exclude');
   const added = [];
-  const undo = () => { restoreState(fs, p, moved); stripExclude(fs, exclude, added); };
-  for (const path of stateNow) {
-    const src = join(p.logical, path);
-    const dest = join(p.state, path);
-    if (stat(fs, src)?.isSymbolicLink()) continue;
-    fs.mkdirSync(dirname(dest), { recursive: true });
-    if (stat(fs, dest)) { mergeMissing(fs, src, dest); fs.rmSync(src, { recursive: true, force: true }); }
-    else fs.renameSync(src, dest);
-    const gap = stat(fs, src); // recreated by a writer in the microsecond gap
-    if (gap) { if (gap.isDirectory()) mergeMissing(fs, src, dest); fs.rmSync(src, { recursive: true, force: true }); }
-    fs.symlinkSync(dest, src);
-    moved.push(path);
-  }
-  // A symlink is not matched by a `dir/` ignore pattern, so keep the legacy tree looking clean to git.
-  const have = stat(fs, exclude) ? fs.readFileSync(exclude, 'utf8') : '';
-  for (const path of moved) if (!have.split('\n').includes(`/${path}`)) added.push(`/${path}`);
-  if (added.length) fs.appendFileSync(exclude, `${have && !have.endsWith('\n') ? '\n' : ''}${added.join('\n')}\n`);
-  steps.push(`state ${moved.length}`);
-
-  const on = { ...config, enabled: { [name]: true } };
-  // A smoke-failed version of this commit is reusable by the builder; a retry must build afresh.
-  const versionsDir = join(p.root, 'versions');
-  if (stat(fs, versionsDir)) for (const entry of fs.readdirSync(versionsDir)) {
-    try {
-      const r = JSON.parse(fs.readFileSync(join(versionsDir, entry, '.version.json'), 'utf8'));
-      if (r.sha === sha && r.status !== 'built') fs.rmSync(join(versionsDir, entry), { recursive: true, force: true });
-    } catch { /* staging or unreadable: not ours */ }
-  }
-  // Injected by the CLI: daemon-version.mjs is the entry module there, and importing it back would deadlock.
-  const buildVersion = deps.buildVersion ?? (await import('./daemon-version.mjs')).buildVersion;
-  const built = await buildVersion({ clone: p.logical, home: dirname(p.root), sha, settings: on, force: true, repo: p.repo, deps: deps.buildDeps });
-  const record = built.status === 'reused' ? JSON.parse(fs.readFileSync(join(built.dir, '.version.json'), 'utf8')) : built;
-  if (record.status !== 'built') { undo(); return { status: 'refused', reason: 'smoke-failed', id: record.id, smoke: record.smoke?.smoke?.results?.filter(r => !r.ok), steps }; }
-  steps.push(`v0 ${record.id}`);
-  const switched = await switchCurrent({ clone: p.logical, home: dirname(p.root), id: record.id, expectCurrent: null, settings: on, by: 'migrate', reason: 'migrate v0' });
-  if (switched.status !== 'switched') { undo(); return { status: 'refused', reason: `switch-${switched.status}`, switched, steps }; }
-  steps.push('current');
-  fs.writeFileSync(p.marker, `${JSON.stringify({ enabled: true })}\n`);
-  steps.push('enabled');
-
-  const stamp = new Date((deps.now ?? Date.now)()).toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
   const legacy = join(p.root, `legacy-${stamp}`);
   const tmp = join(dirname(p.logical), `${name}.tmp-link`);
-  fs.rmSync(tmp, { force: true });
-  fs.symlinkSync(relative(dirname(p.logical), join(p.root, 'current')), tmp);
-  fs.renameSync(p.logical, legacy);
-  try { fs.renameSync(tmp, p.logical); }
-  catch (error) { fs.renameSync(legacy, p.logical); throw error; }
-  steps.push('swapped');
-  fs.writeFileSync(p.record, `${JSON.stringify({ migratedAt: new Date((deps.now ?? Date.now)()).toISOString(), legacy, moved, excluded: added, v0: record.id, sha, originUrl }, null, 2)}\n`);
-  return { status: 'migrated', name, v0: record.id, legacy, moved, steps };
+  // Everything after the first state move is undone, whether it ends in a refusal or a throw: the clone gets its
+  // own state back and no `current`, marker or record is left pointing at a half-migrated home. Home files that
+  // existed before this run (an earlier marker, switch state) are not ours to delete; `current` was checked absent.
+  const kept = new Set(['previous', 'state.json', 'migration.json', 'settings.local.json'].filter(f => stat(fs, join(p.root, f))));
+  const rollback = () => {
+    restoreState(fs, p, moved);
+    stripExclude(fs, exclude, added);
+    fs.rmSync(tmp, { force: true });
+    for (const f of ['current', 'previous', 'state.json', 'migration.json', 'settings.local.json']) if (!kept.has(f)) fs.rmSync(join(p.root, f), { force: true });
+  };
+  try {
+    fs.mkdirSync(p.root, { recursive: true });
+    if (!stat(fs, join(p.repo, 'HEAD'))) {
+      git(dirname(p.logical), ['clone', '--bare', '--quiet', '--', p.logical, p.repo]);
+      git(p.repo, ['remote', 'set-url', '--', 'origin', originUrl]);
+      steps.push('repo.git');
+    }
+    git(p.repo, ['fetch', '--quiet', '--no-tags', '--', p.logical, '+HEAD:refs/migrate/base']);
+    // State first: rename (atomic, same volume), then link back so the live daemon keeps writing to the same
+    // place. Done before the build so the version's state links resolve while its smoke runs.
+    for (const path of stateNow) {
+      const src = join(p.logical, path);
+      const dest = join(p.state, path);
+      if (stat(fs, src)?.isSymbolicLink()) {
+        // Our own link from a run that died after moving this path: take it over so the record and undo cover it.
+        if (fs.readlinkSync(src) === dest) moved.push(path);
+        continue;
+      }
+      fs.mkdirSync(dirname(dest), { recursive: true });
+      // With --force the clone's entry is the live one: the stale destination is parked, never merged over or deleted.
+      if (stat(fs, dest)) parkAside(fs, p, dest, path);
+      fs.renameSync(src, dest);
+      moved.push(path); // before the link, so a crash between the rename and the symlink still rolls back
+      const gap = stat(fs, src); // recreated by a writer in the microsecond gap
+      if (gap) { if (gap.isDirectory()) mergeMissing(fs, src, dest); parkAside(fs, p, src, path); }
+      fs.symlinkSync(dest, src);
+    }
+    // A symlink is not matched by a `dir/` ignore pattern, so keep the legacy tree looking clean to git.
+    const have = stat(fs, exclude) ? fs.readFileSync(exclude, 'utf8') : '';
+    for (const path of moved) if (!have.split('\n').includes(`/${path}`)) added.push(`/${path}`);
+    if (added.length) fs.appendFileSync(exclude, `${have && !have.endsWith('\n') ? '\n' : ''}${added.join('\n')}\n`);
+    steps.push(`state ${moved.length}`);
+
+    const on = { ...config, enabled: { [name]: true } };
+    // A smoke-failed version of this commit is reusable by the builder; a retry must build afresh.
+    const versionsDir = join(p.root, 'versions');
+    if (stat(fs, versionsDir)) for (const entry of fs.readdirSync(versionsDir)) {
+      try {
+        const r = JSON.parse(fs.readFileSync(join(versionsDir, entry, '.version.json'), 'utf8'));
+        if (r.sha === sha && r.status !== 'built') fs.rmSync(join(versionsDir, entry), { recursive: true, force: true });
+      } catch { /* staging or unreadable: not ours */ }
+    }
+    // Injected by the CLI: daemon-version.mjs is the entry module there, and importing it back would deadlock.
+    const buildVersion = deps.buildVersion ?? (await import('./daemon-version.mjs')).buildVersion;
+    const built = await buildVersion({ clone: p.logical, home: dirname(p.root), sha, settings: on, force: true, repo: p.repo, deps: deps.buildDeps });
+    const record = built.status === 'reused' ? JSON.parse(fs.readFileSync(join(built.dir, '.version.json'), 'utf8')) : built;
+    if (record.status !== 'built') { rollback(); return { status: 'refused', reason: 'smoke-failed', id: record.id, smoke: record.smoke?.smoke?.results?.filter(r => !r.ok), steps }; }
+    steps.push(`v0 ${record.id}`);
+    const switched = await switchCurrent({ clone: p.logical, home: dirname(p.root), id: record.id, expectCurrent: null, settings: on, by: 'migrate', reason: 'migrate v0' });
+    if (switched.status !== 'switched') { rollback(); return { status: 'refused', reason: `switch-${switched.status}`, switched, steps }; }
+    steps.push('current');
+    fs.writeFileSync(p.marker, `${JSON.stringify({ enabled: true })}\n`);
+    steps.push('enabled');
+
+    // The record goes down before the swap, so nothing can fail after it: a swapped clone always has its record.
+    fs.writeFileSync(p.record, `${JSON.stringify({ migratedAt: new Date((deps.now ?? Date.now)()).toISOString(), legacy, moved, excluded: added, v0: record.id, sha, originUrl: redactUrl(originUrl) }, null, 2)}\n`, { mode: 0o600 });
+    fs.rmSync(tmp, { force: true });
+    fs.symlinkSync(relative(dirname(p.logical), join(p.root, 'current')), tmp);
+    fs.renameSync(p.logical, legacy);
+    try { fs.renameSync(tmp, p.logical); }
+    catch (error) {
+      // If even the way back fails the real clone sits at `legacy`: rolling back now would recreate an empty clone dir.
+      try { fs.renameSync(legacy, p.logical); } catch (restoreError) { error.cloneAtLegacy = legacy; error.rollbackError = restoreError; }
+      throw error;
+    }
+    steps.push('swapped');
+    return { status: 'migrated', name, v0: record.id, legacy, moved, steps };
+  } catch (error) {
+    if (!error.cloneAtLegacy) try { rollback(); } catch (rollbackError) { error.rollbackError = rollbackError; }
+    throw error;
+  }
 }
 
-export async function unmigrate({ clone, home, settings, deps = {} }) {
+/** Reverse a migration from what the record says was moved, never from today's settings. */
+export async function unmigrate({ clone, home, dryRun = false, deps = {} }) {
   const fs = deps.fs ?? filesystem;
   const name = basename(logicalCloneRoot(clone));
-  const p = paths(name, clone, home);
-  const config = validateDaemonVersionsSettings(settings ?? { });
-  if (!stat(fs, p.logical)?.isSymbolicLink()) return { status: 'refused', reason: 'not-migrated' };
-  let info;
-  try { info = JSON.parse(fs.readFileSync(p.record, 'utf8')); } catch { return { status: 'refused', reason: 'no-migration-record' }; }
-  if (!stat(fs, info.legacy)?.isDirectory()) return { status: 'refused', reason: 'legacy-missing', legacy: info.legacy };
-  // Put the legacy directory back first, so a daemon that wakes up sees a real clone as soon as possible.
-  fs.unlinkSync(p.logical);
-  try { fs.renameSync(info.legacy, p.logical); }
-  catch (error) { fs.symlinkSync(relative(dirname(p.logical), join(p.root, 'current')), p.logical); throw error; }
-  const restored = restoreState(fs, p, config.statePaths);
+  const p = paths(name, clone, home, stampOf(deps));
+  const here = stat(fs, p.logical);
+  let info = null;
+  try { info = JSON.parse(fs.readFileSync(p.record, 'utf8')); } catch { /* none or unreadable: judged below */ }
+  // A run that died after putting the legacy clone back (the record is deleted last) is finished by running it again.
+  const resuming = here?.isDirectory() && info !== null && validRecord(info, p) && !stat(fs, info.legacy);
+  if (!here?.isSymbolicLink() && !resuming) return { status: 'refused', reason: 'not-migrated' };
+  if (info === null) return { status: 'refused', reason: 'no-migration-record' };
+  if (!validRecord(info, p)) return { status: 'refused', reason: 'bad-migration-record' };
+  if (!resuming && !stat(fs, info.legacy)?.isDirectory()) return { status: 'refused', reason: 'legacy-missing', legacy: info.legacy };
+  if (dryRun) return { status: 'dry-run', name, legacy: info.legacy, resuming, wouldRestore: info.moved.filter(path => stat(fs, join(p.state, path))) };
+  if (!resuming) {
+    // Put the legacy directory back first, so a daemon that wakes up sees a real clone as soon as possible.
+    fs.unlinkSync(p.logical);
+    try { fs.renameSync(info.legacy, p.logical); }
+    catch (error) { fs.symlinkSync(relative(dirname(p.logical), join(p.root, 'current')), p.logical); throw error; }
+  }
+  const restored = restoreState(fs, p, info.moved);
   stripExclude(fs, join(p.logical, '.git', 'info', 'exclude'), info.excluded);
   fs.rmSync(p.marker, { force: true });
   for (const f of ['current', 'previous', 'state.json', 'migration.json']) fs.rmSync(join(p.root, f), { force: true });
@@ -178,22 +236,35 @@ export async function unmigrate({ clone, home, settings, deps = {} }) {
 
 /** Move only ProgramArguments strings and WorkingDirectory from `<ws>/<name>` onto `<ws>/.daemon-clones/<name>/current`. */
 export function versionedPlistText(text, { name }) {
-  const swap = value => value.replace(new RegExp(`^(.*)/${name}(?=/|$)`), (all, ws) => (ws.endsWith('/.daemon-clones') ? all : `${ws}/.daemon-clones/${name}/current`));
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Lazy `(.*?)`: the first `/<name>` is the clone itself; a later directory with the same name inside it is not.
+  const swap = value => value.replace(new RegExp(`^(.*?)/${escaped}(?=/|$)`),(all, ws) => (ws.endsWith('/.daemon-clones') ? all : `${ws}/.daemon-clones/${name}/current`));
   let out = text.replace(/(<key>ProgramArguments<\/key>\s*<array>)([\s\S]*?)(<\/array>)/, (m, a, body, z) => a + body.replace(/<string>([^<]*)<\/string>/g, (s, v) => `<string>${swap(v)}</string>`) + z);
   out = out.replace(/(<key>WorkingDirectory<\/key>\s*<string>)([^<]*)(<\/string>)/, (m, a, v, z) => a + swap(v) + z);
   return out;
 }
 
-export function rewritePlist({ file, name, backupDir, revertFrom, deps = {} }) {
+export function rewritePlist({ file, name, backupDir, revertFrom, dryRun = false, deps = {} }) {
   const fs = deps.fs ?? filesystem;
-  if (revertFrom) { fs.copyFileSync(revertFrom, file); return { status: 'reverted', file }; }
+  if (revertFrom) {
+    if (dryRun) return { status: 'dry-run', wouldRevert: true, file };
+    writeAtomic(fs, file, fs.readFileSync(revertFrom));
+    return { status: 'reverted', file };
+  }
   const text = fs.readFileSync(file, 'utf8');
   const next = versionedPlistText(text, { name });
   if (next === text) return { status: 'noop' };
   if (!backupDir) throw new Error('--backup-dir is required');
+  if (dryRun) return { status: 'dry-run', wouldRewrite: true, file };
   fs.mkdirSync(backupDir, { recursive: true });
   const backup = join(backupDir, `${basename(file)}.pre-versions`);
   fs.copyFileSync(file, backup);
-  fs.writeFileSync(file, next);
+  writeAtomic(fs, file, next);
   return { status: 'rewritten', backup };
+}
+/** A launchd plist is read by a live service: write beside it and rename, so a crash never leaves half a file. */
+function writeAtomic(fs, file, data) {
+  const temp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(temp, data);
+  fs.renameSync(temp, file);
 }
