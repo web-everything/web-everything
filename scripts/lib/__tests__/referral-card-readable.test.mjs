@@ -51,6 +51,37 @@ describe('referralCardReadable @pr<N> (xc7ctn1)', () => {
     }
     expect(spy).not.toHaveBeenCalled();
   });
+  it('rejects hostile file names (URL query/fragment/escape/traversal shapes) without calling gh or reading disk', () => {
+    const spy = vi.fn();
+    const hostile = [
+      'x.md?ref=other-branch&unused=.md', 'x.md?ref=main&p=.md', 'x.md#frag.md', 'x%2f..%2fREADME.md', '..%2f..%2fREADME.md',
+      'x%2e%2e.md', '%2e%2e.md', 'x{branch}.md', 'x y.md', 'x\n.md', 'x\r.md', 'x\t.md', 'x\\y.md', 'x:y.md', 'x;y.md',
+      'x=y.md', 'x&y.md', 'x+y.md', '.md', '-x.md', '.x.md', 'x∕y.md', 'x\u0000.md', 'ｘ.md', 'x.md.md?a=1.md',
+    ];
+    for (const name of hostile) {
+      for (const bad of [`we:backlog/${name}`, `we:backlog/${name}@pr7`]) {
+        expect(CARD_REF_RE.test(bad), JSON.stringify(bad)).toBe(false);
+        expect(referralCardReadable(bad, root, { readOnPr: spy }), JSON.stringify(bad)).toBe(false);
+      }
+    }
+    expect(spy).not.toHaveBeenCalled();
+  });
+  it('asks gh for exactly the verified sha: filename is one encoded path segment, ref is the sole query parameter', () => {
+    const urls = [];
+    const run = (cmd, args) => { if (args[0] !== 'api') return fakeGh(cmd, args); urls.push(args[args.length - 1]); return CARD; };
+    // The reader itself is the last line of defense: hand it a name the regex would never admit.
+    readCardAtPrHead('x.md?ref=other&p=.md', 7, { run });
+    readCardAtPrHead('x/../../README.md#f', 7, { run });
+    expect(urls).toHaveLength(2);
+    for (const raw of urls) {
+      const u = new URL(raw, 'https://api.github.com/');
+      expect([...u.searchParams.keys()]).toEqual(['ref']);
+      expect(u.searchParams.get('ref')).toBe(SHA);
+      expect(u.hash).toBe('');
+      expect(u.pathname.startsWith(`/repos/${CONSTELLATION_REPOS.we.slug}/contents/backlog/`)).toBe(true);
+      expect(u.pathname.slice(u.pathname.indexOf('/backlog/') + 9)).not.toMatch(/\/|\.\.\//); // one segment, no traversal
+    }
+  });
   it('keeps main-side resolution, including bornAs renumbering, working', () => {
     writeFileSync(join(root, 'backlog', '5100-landed.md'), '---\nbornAs: xvm9vbu\n---\n# c\n');
     expect(ok('we:backlog/5100-landed.md')).toBe(true);

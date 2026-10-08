@@ -4,8 +4,11 @@ import { execFileSync } from 'node:child_process';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
 /** A card reference: `we:backlog/<file>.md`, optionally `@pr<N>` = "the card as it stands on PR N's head" (xc7ctn1). */
-export const CARD_REF_RE = /^we:backlog\/[^/@]+\.md(?:@pr[1-9]\d*)?$/;
-const PR_REF_RE = /^we:backlog\/([^/@]+\.md)@pr([1-9]\d*)$/;
+// The file name is a strict alphabet (every backlog file already fits it): it is spliced into a local path AND a GitHub
+// API URL, so `?`, `#`, `%`, `&`, `=`, `{}`, whitespace, newlines and `\` must never reach either one.
+const CARD_FILE = '[A-Za-z0-9][A-Za-z0-9._-]*\\.md';
+export const CARD_REF_RE = new RegExp(`^we:backlog/${CARD_FILE}(?:@pr[1-9]\\d*)?$`);
+const PR_REF_RE = new RegExp(`^we:backlog/(${CARD_FILE})@pr([1-9]\\d*)$`);
 const CARD_REPO = CONSTELLATION_REPOS.we.slug;
 const hasFrontmatter = text => /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(text);
 
@@ -18,7 +21,8 @@ export function readCardAtPrHead(file, pr, { repo = CARD_REPO, run = execFileSyn
   const meta = JSON.parse(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid']));
   if (meta.state !== 'OPEN' && meta.state !== 'MERGED') return null; // a CLOSED-unmerged PR's card will never land
   if (!/^[0-9a-f]{40}$/.test(meta.headRefOid ?? '')) return null;
-  return gh(['api', '-H', 'Accept: application/vnd.github.raw', `repos/${repo}/contents/backlog/${file}?ref=${meta.headRefOid}`]);
+  // Encoded as one path segment (defense in depth behind CARD_REF_RE): the verified sha stays the sole `ref` parameter.
+  return gh(['api', '-H', 'Accept: application/vnd.github.raw', `repos/${repo}/contents/backlog/${encodeURIComponent(file)}?ref=${meta.headRefOid}`]);
 }
 
 /** A deferral is discharged only by an existing readable backlog card, never an intention to file. */
