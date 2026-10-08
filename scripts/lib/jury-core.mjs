@@ -3147,6 +3147,10 @@ export function validateOperatorRuling(r) {
       if (!x || typeof x.runId !== 'string' || !x.runId.trim() || typeof x.key !== 'string' || !x.key.trim()
         || !OPERATOR_RULING_RESULTS.includes(x.result)) return false;
       if (x.result === 'card' ? !CARD_REF_RE.test(x.card ?? '') : x.card !== undefined) return false;
+      // Held item 132: an operator ruling may name the earlier rulings it SUPERSEDES (their ids), so a block carried
+      // onto a new head can be re-ruled. Optional; a malformed list voids the whole record (a hold, never a clearance).
+      if (x.supersedes !== undefined && !(Array.isArray(x.supersedes) && x.supersedes.length > 0 && x.supersedes.length <= 20
+        && x.supersedes.every(i => typeof i === 'string' && i.trim() && i.length <= 300 && !/[\r\n]/.test(i)))) return false;
       const id = JSON.stringify([x.runId, x.key]);
       if (seen.has(id)) return false;
       seen.add(id);
@@ -3191,6 +3195,15 @@ export function parseOperatorRulingComment(comment) {
   return { record };
 }
 
+/**
+ * The id other rulings cite to supersede one operator ruling (reviewer rulings carry their own `id`). Derived from
+ * what the record already pins (head, run, finding, time), so it needs no stored field. Held item 132.
+ */
+export function operatorRulingId(o) {
+  const h = createHash('sha256').update(JSON.stringify([o.head, o.runId, o.key, o.at])).digest('hex').slice(0, 12);
+  return `operator:${String(o.head).slice(0, 9)}:${h}`;
+}
+
 /** Every valid operator ruling in thread order, flattened to one entry per (run, finding). */
 export function readOperatorRulings(comments, { head } = {}) {
   const rulings = [];
@@ -3204,7 +3217,7 @@ export function readOperatorRulings(comments, { head } = {}) {
     const r = parsed.record;
     for (const x of r.rulings) {
       rulings.push(Object.freeze({ operator: true, repo: r.repo, pr: r.pr, head: r.head, runId: x.runId, key: x.key,
-        result: x.result, ...(x.card ? { card: x.card } : {}), actor: r.actor, channel: r.channel, reason: r.reason,
+        result: x.result, ...(x.card ? { card: x.card } : {}), ...(x.supersedes ? { supersedes: [...x.supersedes] } : {}), actor: r.actor, channel: r.channel, reason: r.reason,
         at: r.at, clearerId: r.clearerId }));
     }
   }
