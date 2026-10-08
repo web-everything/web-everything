@@ -77,6 +77,10 @@ import { fileURLToPath } from 'node:url';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents } from '../../scripts/conveyor/reconcile-pass.mjs';
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
+// card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
+// recovery watch uses, once per head, before any review reads its diff.
+import { refreshOntoMain, defaultPostRebaseComment } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
+import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scripts/conveyor/scope-bloat.mjs';
 // x26lw6u — the review is dispatched as a deterministic JOB (`review-job.mjs`: acquire → review-loop-cli →
 // report → release, no Claude wrapper session); `WE_REVIEW_DISPATCH_MODE=session` keeps the old `claude --bg`
 // path reachable. The jurors review-loop-cli spawns are the fresh, independent reviewers either way.
@@ -256,6 +260,10 @@ export function runReviewTick({
   statusCandidates = selectStatusCandidates,
   holdReconcile = sweepReviewHoldLabels,
   notifyReferral = notifyReferralHold,
+  // card x29vm8a - `({repo, prNumber, headRefName, headRefOid, defaultBranch}) => {ok, action, error?}`; `null` (the default) never
+  // refreshes, so every existing caller of this function is unchanged. The real daemon passes {@link refreshScopeBloatedPr}.
+  refreshScopeBloat = null,
+  postRefreshMarker = null,
   acquirableLanes = () => Infinity,
   // Pool-exhaustion reporting: `{exhausted({repo, deferred}), recovered(repo)}` (see
   // `we:scripts/conveyor/pool-exhaustion.mjs`). `null` (the default) keeps every existing test byte-identical;
@@ -398,6 +406,36 @@ export function runReviewTick({
       failed.push({ prNumber: row.prNumber, error: `pause notice: ${String(e.message ?? e).split('\n')[0]}` });
     }
   }
+  // card x29vm8a - a PR held `scope-bloat` because of a stale base gets ONE mechanical refresh onto main per head. The
+  // answer is remembered, so the next tick's plan either sees a clean (smaller) head, or sees the refresh did not help
+  // and routes the PR to a fixer to rebase. No review is dispatched for it meanwhile (the plan refused it).
+  const scopeBloatRefreshed = [];
+  if (typeof refreshScopeBloat === 'function') {
+    for (const row of plan.refusals ?? []) {
+      if (row.kind !== 'scope-bloat' || !row.scopeBloat?.stale || row.scopeBloat.refresh || !row.headRefName || !row.headRefOid) continue;
+      // A refresh that THROWS is normalized into a failed result and goes down the same path as one that returns: it is
+      // remembered in this process AND gets the durable per-head marker, because the fix daemon (another process) reads
+      // only the thread and would otherwise wait forever on a refresh it cannot see was tried.
+      const oneLine = (e) => String((e && e.message) || e).split('\n')[0];
+      let result;
+      try {
+        result = refreshScopeBloat({ repo, prNumber: row.prNumber, headRefName: row.headRefName, headRefOid: row.headRefOid, defaultBranch });
+      } catch (e) {
+        result = { ok: false, action: 'error', error: oneLine(e) };
+        failed.push({ prNumber: row.prNumber, error: `scope-bloat refresh: ${result.error}` });
+      }
+      recordScopeBloatRefresh(row.prNumber, row.headRefOid, result);
+      if (typeof postRefreshMarker === 'function') {
+        try { postRefreshMarker(row.prNumber, { repo, headRefName: row.headRefName, headSha: row.headRefOid, ok: result?.ok === true, action: result?.action ?? 'error', error: result?.error ?? null }); }
+        catch (e) {
+          failed.push({ prNumber: row.prNumber, error: `scope-bloat marker: ${oneLine(e)}` });
+          // The thread never saw the attempt: owe the refresh + marker again next tick (bounded per head).
+          noteScopeBloatMarkerFailure(row.prNumber, row.headRefOid);
+        }
+      }
+      scopeBloatRefreshed.push({ prNumber: row.prNumber, ok: result?.ok === true, action: result?.action ?? null });
+    }
+  }
   // x26lw6u — NOT named `skipped`: `withSelfSync` already returns `{skipped: true}` for a whole skipped tick,
   // and `onTick` reads both shapes.
   const notStarted = [];
@@ -448,6 +486,7 @@ export function runReviewTick({
     reconcileError: null, deferredForLanes, deferredForAuth,
     authPaused: paused, authPauseReason: paused ? pauseReason : null,
     holdReconcile: holdReconcileResults, holdReconcileError,
+    ...(scopeBloatRefreshed.length ? { scopeBloatRefreshed } : {}),
     // #3383 follow-up (live-caught 2026-09-26) — the PR numbers THIS tick's own reconcile refused
     // `live-process` (`we:scripts/conveyor/reconcile-core.mjs#assessLiveness`: "a bound session has a LIVE
     // pid — something is already working this PR, however stale its transcript looks"). Fed into the NEXT
@@ -457,6 +496,11 @@ export function runReviewTick({
     // behind an unrelated backlog of hundreds of already-finished, lower-stakes sessions.
     liveProcessPrs: (plan.refusals ?? []).filter((r) => r?.kind === 'live-process').map((r) => r.prNumber),
   };
+}
+
+/** card x29vm8a - the real refresh: the shared mechanical rebase onto `origin/<default>`, run in this daemon's own clone. */
+export function refreshScopeBloatedPr({ headRefName, defaultBranch = 'main', refresh = refreshOntoMain } = {}) {
+  return refresh(headRefName, { base: `origin/${defaultBranch}` });
 }
 
 /** The repos this daemon watches each tick. Today: the three constellation repos (WE-only was the ratified
@@ -837,6 +881,8 @@ export function buildCliDaemonEffects({
     return runReviewTickAllRepos({
       acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
       poolExhaustion: DAEMON_POOL_EXHAUSTION,
+      refreshScopeBloat: refreshScopeBloatedPr,
+      postRefreshMarker: defaultPostRebaseComment,
       dispatch: (o) => dispatchReviewByMode({ ...o, ciGate: readReviewCiGateFactsFirst }),
       tagRound: (o) => tagReviewRound({ ...o, provider: factsProvider }),
       tagStatus: (o) => tagReviewStatus({ ...o, provider: factsProvider }),

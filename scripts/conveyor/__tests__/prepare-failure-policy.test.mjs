@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyPrepareFailure, recordPrepareFailure, readFailureState, validatePrepareRelease, releasedAttempt, readPrepareReleases } from '../prepare-failure-policy.mjs';
+import { planScaffold, shapeScaffoldRead } from '../../operations/scaffold.mjs';
 import { writeFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
@@ -65,6 +66,15 @@ describe('prepare failure evidence and durable decisions', () => {
     writeFileSync(path, '{"failures": {');
     expect(readFailureState(path)).toEqual({ failures: {}, cards: {} });
     expect(readdirSync(dir).some(n => n.includes('.corrupt-'))).toBe(true);
+  });
+  // #x0h3pe4 wiring: `file-item` now refuses a sized task/feature, so the card this filer hands to
+  // `fileCard` must survive the REAL `planScaffold` — the mocked `fileCard` above would never notice.
+  it('the prevention card it files is accepted by the real planScaffold (not refused as a sized task)', async () => {
+    await recordPrepareFailure({ num: '1', attempt: 'a', stage: 'result', evidence: { causeKey: 'missing-worker-result' } }, { path, fileCard });
+    const [card] = fileCard.mock.calls[0];
+    const read = shapeScaffoldRead({ existingIds: ['001'], today: '2026-10-08', dir: '/repo/backlog' });
+    const verdict = planScaffold(read, { ...card });
+    expect(verdict.content).toMatch(/^size: 2$/m);
   });
   it('records filing failure without claiming success or blind respawning', async () => {
     fileCard.mockImplementation(() => { throw new Error('spawn refused'); });

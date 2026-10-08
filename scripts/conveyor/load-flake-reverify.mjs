@@ -10,7 +10,7 @@ import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.
 import { runBounded } from '../lib/bounded-child.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
 import { loadFlakeResults, buildLoadFlakeResolvedComment } from './stand-down.mjs';
-import { loadFlakeHoldState } from './load-flake-hold.mjs';
+import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
 import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
 import { redactSecrets } from './ci-heal-mark.mjs';
 import { RUNNER_LOCK_ROOT } from '../../skills-src/conveyor/runner-lock.mjs';
@@ -81,7 +81,9 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
   if (!key) throw new Error(`unknown repo: ${repo}`);
   const slug = CONSTELLATION_REPOS[key].slug;
   const prs = await io.listPrs(slug);
-  const plan = planLoadFlakeReverify({ prs, load, cores, now, config });
+  // A pushed fix is a finished fix round: re-arm it before anything else (needs no verify, so host load cannot defer it).
+  const rearmed = dryRun ? [] : await rearmPushedFixes({ prs, slug }, io);
+  const plan = { ...planLoadFlakeReverify({ prs, load, cores, now, config }), ...(rearmed.length ? { rearmed } : {}) };
   // Holding is the common case: name every PR it holds and the load it saw, so the log proves the pass is
   // evaluating them (a bare "host-load" line cannot be told apart from a pass that sees no holds). Read-only.
   if (plan.deferred === 'host-load') {
@@ -100,18 +102,41 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
   for (const candidate of plan.candidates) {
     try {
       const out = await reverifyCandidate({ candidate, key, slug, config }, io);
-      if (!NON_PROGRESS.has(out.deferred)) return out;
+      if (!NON_PROGRESS.has(out.deferred)) return rearmed.length ? { ...out, rearmed } : out;
       lastDeferral = out;
     } catch (e) {
       firstError ??= e;
     }
   }
-  if (lastDeferral) return lastDeferral;
+  if (lastDeferral) return rearmed.length ? { ...lastDeferral, rearmed } : lastDeferral;
   throw firstError;
 }
 
 /** Deferrals that leave the hold live and unchanged: the next candidate is tried instead of stopping here. */
 const NON_PROGRESS = new Set(['fix-claimed', 'hold-ended', 'hold-changed']);
+
+/**
+ * Re-arm every bounced PR whose head is a fix this pass pushed (live #4361). The fixer that wrote the fix stood down on
+ * the load-flake hold, so it never ran the re-arm a normal fix round ends with; without it the PR keeps
+ * `review:changes` on a head that already is the fix, and reconcile reads it as "owed a fix" forever. Re-reads the PR
+ * right before acting, and a failure on one PR never stops the others.
+ */
+export async function rearmPushedFixes({ prs = [], slug }, io) {
+  const out = [];
+  for (const pr of prs) {
+    if (!pushedLoadFlakeFixOwedRearm(pr)) continue;
+    try {
+      const live = await io.readPr(slug, pr.number);
+      const owed = live.state === 'OPEN' && live.headRefOid === pr.headRefOid && pushedLoadFlakeFixOwedRearm(live);
+      if (!owed) continue;
+      await io.rearm(slug, pr.number);
+      out.push({ pr: pr.number, sha: owed.sha, result: 'rearmed' });
+    } catch (e) {
+      out.push({ pr: pr.number, result: 'rearm-failed', error: String(e?.message ?? e).split('\n')[0].slice(0, 300) });
+    }
+  }
+  return out;
+}
 
 async function reverifyCandidate({ candidate, key, slug, config }, io) {
   const { pr, hold, attempts } = candidate;
@@ -173,7 +198,16 @@ async function reverifyCandidate({ candidate, key, slug, config }, io) {
     await io.push(lane.path, hold.alt.sha, pr.headRefName);
     await post('pushed', config.mode === 'ci'
       ? "Pushed without a local re-verify (WE_LOAD_FLAKE_REVERIFY_MODE=ci); the PR's CI judges it." : '');
-    return { result: 'pushed', pr: pr.number };
+    // The push ends the fixer's round, so it owes the round's re-arm (live #4361). A failure here is retried by the
+    // catch-up at the top of the next sweep.
+    let rearm = [];
+    const bounced = (pr.labels ?? []).some((l) => (typeof l === 'string' ? l : l?.name) === 'review:changes');
+    if (bounced) try {
+      rearm = await rearmPushedFixes({ prs: [{ ...(await io.readPr(slug, pr.number)), number: pr.number }], slug }, io);
+    } catch (e) {
+      rearm = [{ pr: pr.number, result: 'rearm-failed', error: String(e?.message ?? e).slice(0, 300) }];
+    }
+    return { result: 'pushed', pr: pr.number, ...(rearm.length ? { rearm: rearm[0].result } : {}) };
   } finally {
     await io.release(lane, key);
   }
@@ -204,9 +238,16 @@ export function defaultReverifyIo({ run = execFileSync, runVerification = runBou
     // `gh pr list --json comments` stops at 100: a hold past that was invisible here while fix-dispatch (which reads the
     // complete thread) kept refusing the PR as `load-flake-hold` (live #4017, 286 comments). Same complete reader as fix-dispatch.
     listPrs: (slug) => enrichPrsWithCompleteComments(
-      gh(['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid,baseRefName,comments']),
+      gh(['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid,baseRefName,labels,comments']),
       { repo: slug, ...(readComments ? { readComments } : {}) }),
-    readPr: (slug, pr) => gh(['pr', 'view', String(pr), '--repo', slug, '--json', 'state,headRefName,headRefOid,comments']),
+    // Complete thread, same as listPrs: a capped read could miss a later re-arm or verdict and re-arm twice.
+    readPr: (slug, pr) => {
+      const view = { number: pr, ...gh(['pr', 'view', String(pr), '--repo', slug, '--json', 'state,headRefName,headRefOid,labels,comments']) };
+      const [complete] = enrichPrsWithCompleteComments([view], { repo: slug, ...(readComments ? { readComments } : {}), onError: (_pr, e) => { throw e; } });
+      return complete;
+    },
+    // The one sanctioned label swap for a finished fix round: review:changes → re-armed (never accepted, never drops review:human).
+    rearm: (slug, pr) => command(process.execPath, [resolve(root, 'scripts/conveyor/rearm-review.mjs'), String(pr), `--repo=${slug}`, '--actor=load-flake reverify pass']),
     pushRefusal,
     isAncestor: (head, sha) => {
       try { command('git', ['merge-base', '--is-ancestor', head, sha]); return true; }

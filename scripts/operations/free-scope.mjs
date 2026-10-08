@@ -74,6 +74,18 @@ export function releaseScope(entries, agent, owner) {
   const remaining = entries.filter((e) => !mine(e));
   return { entries: remaining, released: entries.length - remaining.length };
 }
+// Live 2026-10-08: a worker listed `we:backlog/` to file its one card, and 20 open PRs that each only ADDED their own
+// new card made the whole folder read OCCUPIED. A brand-new card file cannot collide with anything but itself, so:
+//   - a card a PR ADDS (`<repo>:backlog/<card>.md`, change type from the reader) holds only that exact path;
+//   - two card-filing claims (a bare `<repo>:backlog/` folder entry on both sides) do not block each other.
+// An EXISTING card a PR edits, or one a scope names exactly, still collides as before.
+const CARD_PATH = /^[^:]+:backlog\/[^/]+\.md$/;
+const CARD_FOLDER = /^[^:]+:backlog\/?$/;
+function overlaps(file, h) {
+  if (h.newCard) return file === h.file;
+  if (CARD_FOLDER.test(file) && CARD_FOLDER.test(h.file)) return false;
+  return scopeEntriesOverlap(file, h.file);
+}
 const holderName = (h) => h.type === 'pr' ? `PR #${h.number} (${h.repo})` : `agent ${h.agent}`;
 /** `excludeOwner` narrows `excludeAgent` to the caller's own entry; left undefined, every entry of that name is excluded. */
 export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAgent = '', excludeOwner, excludePr = 0, excludeRepo = DEFAULT_REPOS[0], unreadable = [] }) {
@@ -84,8 +96,12 @@ export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAg
   const candidates = [];
   for (const pr of prs) {
     if (excludePr > 0 && pr.number === excludePr && pr.repo === excludeRepo) continue;
-    for (const path of pr.files) candidates.push({ type: 'pr', repo: pr.repo, number: pr.number,
-      title: pr.title, url: pr.url, file: qualifyFile(path, repoKeyFor(pr.repo)) });
+    const added = new Set(pr.added || []);
+    for (const path of pr.files) {
+      const file = qualifyFile(path, repoKeyFor(pr.repo));
+      candidates.push({ type: 'pr', repo: pr.repo, number: pr.number, title: pr.title, url: pr.url, file,
+        ...(added.has(path) && CARD_PATH.test(file) ? { newCard: true } : {}) });
+    }
   }
   for (const entry of live) for (const file of qualified(entry.files || [])) candidates.push({ type: 'agent',
     agent: entry.agent, purpose: entry.purpose, startedAt: entry.startedAt,
@@ -93,7 +109,7 @@ export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAg
   // A file is only FREE when the snapshot is complete AND nothing holds it; with an incomplete snapshot an
   // unheld file is `unknown` in every output (row, list and text), never free.
   const rows = scope.map((file) => {
-    const holders = candidates.filter((h) => scopeEntriesOverlap(file, h.file));
+    const holders = candidates.filter((h) => overlaps(file, h));
     const state = holders.length ? 'occupied' : unreadable.length ? 'unknown' : 'free';
     return { file, state, free: state === 'free', holders };
   });

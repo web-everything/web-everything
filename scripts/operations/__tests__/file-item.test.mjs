@@ -145,6 +145,24 @@ describe('the declaration end to end', () => {
     expect(queued).toHaveLength(0); // never cleared — the conveyor can't build this kind
   });
 
+  // #x0h3pe4 — the exact bug: `file-item --kind=decision --size=2` wrote a card with no `size:` line.
+  it('a sized decision is WRITTEN with its size (never silently dropped)', async () => {
+    const registry = buildRegistry();
+    const written = [];
+    const sinks = {
+      [SCAFFOLD_EFFECT]: async (p) => { written.push(p); return { rel: p.rel, written: true }; },
+      [FILE_ITEM_QUEUE_EFFECT]: async (p) => ({ num: p.num, queued: true }),
+    };
+    let run = advanceWhileRunning(startRun({
+      op: FILE_ITEM_OP, id: 'run-fi-size',
+      input: { title: 'Sized decision', kind: 'decision', size: '2', digest: 'x', queue: 'false' },
+      registry,
+    }), { registry });
+    run = await runToCompletion(run, { registry, sinks, store: createMemoryRunStore() });
+    expect(written).toHaveLength(1);
+    expect(written[0].content).toMatch(/^size: 2$/m);
+  });
+
   it('respects `--queue=false`: writes the card, never calls the queue sink at all', async () => {
     const registry = buildRegistry();
     const written = [];
