@@ -144,6 +144,8 @@ export function buildCandidates(prs, {
       // `isMainLatestCheckGreen` about THIS SAME check on main's own latest completed run. See that function's
       // own docblock.
       failingCheckName: check?.name ?? null,
+      // xo7mr6l — a PR parked `needs-human` may carry a main-defect escalation; also read comments for these (besides the merge-base-not-green case).
+      needsHuman: (pr?.labels ?? []).some((l) => (typeof l === 'string' ? l : l?.name) === 'review-status:needs-human'),
     });
   }
   return out;
@@ -252,9 +254,10 @@ export function sweepCiRedRecovery({
       const greenSha = mainLatestGreenShaForCheck({ failingCheckName: c.failingCheckName, mainLatestCheckRuns });
       if (greenSha) {
         withFacts = { ...c, ...readMainGreenFixFacts(c.headSha, { repo, greenSha, checkName: c.failingCheckName }) };
-        if (withFacts.prContainsMainGreenSha === false && !isMainLatestCheckGreen({
+        // xo7mr6l: comments are also needed when merge base is green — a main-defect escalation bypasses that veto.
+        if (withFacts.prContainsMainGreenSha === false && (c.needsHuman || !isMainLatestCheckGreen({
           failingCheckName: c.failingCheckName, mainLatestCheckRuns: withFacts.mergeBaseCheckRuns,
-        })) {
+        }))) {
           comments = readComments(c.prNumber, { repo });
           withFacts.comments = comments;
         }

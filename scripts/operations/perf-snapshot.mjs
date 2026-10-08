@@ -127,7 +127,7 @@ export function predictorMetrics(correlation, prefix = 'pred') {
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 // The coroner JSON → metrics.
 
-const FIX_OUTCOMES = ['pushed', 'stopped-without-outcome', 'no-op', 'load-flake-hold', 'blocked', 'escalated', 'gate-red-not-pushed', 'other', 'handed-to-harness'];
+const FIX_OUTCOMES = ['pushed', 'stopped-without-outcome', 'pushed-by-harness', 'no-op', 'load-flake-hold', 'blocked', 'escalated', 'gate-red-not-pushed', 'other', 'handed-to-harness'];
 
 /**
  * Derive every metric the coroner JSON holds. `crPrefix` is `rc` for the snapshot window and `rc48` for a 48 h

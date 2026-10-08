@@ -915,10 +915,46 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   // A held card must not be renamed by a STALE ledger entry either (the ledger is append-only and applyLedger
   // swaps the whole of it), so drop any old mapping for it before anything reads the ledger.
   for (const hash of heldHashes) delete ledger[hash];
+  // xsjn0uf-incident — NEVER MINT A SECOND NUMBER FOR A `bornAs` ALREADY ON MAIN. The `bornAs` hash is the
+  // card's identity across its rename; a hash-named copy that re-lands after the card was already numbered
+  // (the same card file carried by two PRs, e.g. a card-only PR plus the feature PR that also carried it)
+  // would otherwise get a fresh NNN, leaving two cards with one `bornAs` and main's health gate red for every
+  // PR (#5319/#5321). If origin/main already holds a numbered card with this bornAs AND the pending copy's
+  // body is identical, the add is a no-op: drop the copy and point its references at the existing number. If
+  // the bodies DIFFER, dropping would lose content, so HOLD it (stays pending, loudly) for a human/fixer.
+  const dupDropped = [];
+  const bornAsOnMain = new Map(); // hash → repo-relative path of the numbered card on origin/main
+  try {
+    const out = execFileSync('git', ['grep', '-E', '^bornAs: x[0-9a-z]{6}$', 'origin/main', '--', 'backlog/'],
+      { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 });
+    for (const line of out.split('\n')) {
+      const m = line.match(/^origin\/main:(backlog\/.*):bornAs: (x[0-9a-z]{6})$/);
+      if (m && !bornAsOnMain.has(m[2])) bornAsOnMain.set(m[2], m[1]); // first path wins, as landedNumbers did
+    }
+  } catch { /* best-effort — no origin/main means no landed mappings */ }
+  const bodyOf = (text) => String(text).replace(/\r\n/g, '\n').replace(/^---\n[\s\S]*?\n---\n/, '').trim();
+  for (const stem of pending) {
+    const hash = idFromName(stem);
+    const onMain = /^backlog\/\d{1,5}-.*\.md$/.test(bornAsOnMain.get(hash) ?? '') ? bornAsOnMain.get(hash) : null;
+    if (!onMain || heldHashes.has(hash)) continue;
+    let mainBody = null;
+    try { mainBody = bodyOf(execFileSync('git', ['show', `origin/main:${onMain}`], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 })); } catch { /* unreadable → treat as differing */ }
+    if (mainBody !== null && mainBody === bodyOf(contentByName.get(stem) ?? '')) {
+      dupDropped.push({ hash, stem, existing: onMain });
+      ledger[hash] = idFromName(onMain.replace(/^backlog\//, '').replace(/\.md$/, ''));
+      console.warn(`[numberPendingHashes] dropping duplicate ${stem} — bornAs ${hash} already numbered as ${onMain} on origin/main with an identical body; no second number minted.`);
+    } else {
+      heldHashes.add(hash);
+      held.push({ hash, citedBy: [], reason: `bornAs ${hash} already numbered as ${onMain} on origin/main but this copy's body differs — not minting a second number` });
+      delete ledger[hash];
+      console.warn(`[numberPendingHashes] holding ${stem} — bornAs ${hash} is already ${onMain} on origin/main and the body differs; refusing to mint a second number.`);
+    }
+  }
+  const dupHashes = new Set(dupDropped.map((d) => d.hash));
   // Assign contiguous max+1 only to eligible cards, retaining their topological order.
   let maxNum = stems.map(idFromName).filter(isNum).reduce((m, n) => Math.max(m, Number(n)), 0);
   const assigned = [];
-  for (const stem of ordered.filter((name) => !heldHashes.has(idFromName(name)))) {
+  for (const stem of ordered.filter((name) => !heldHashes.has(idFromName(name)) && !dupHashes.has(idFromName(name)))) {
     const hash = idFromName(stem);
     maxNum += 1;
     const nnn = String(maxNum).padStart(3, '0');
@@ -934,19 +970,11 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   let bornAsNumbers = null;
   const landedNumbers = () => {
     if (bornAsNumbers) return bornAsNumbers;
-    bornAsNumbers = new Map();
-    try {
-      const out = execFileSync('git', ['grep', '-E', '^bornAs: x[0-9a-z]{6}$', 'origin/main', '--', 'backlog/'],
-        { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 });
-      const seen = new Set();
-      for (const line of out.split('\n')) {
-        const match = line.match(/^origin\/main:(backlog\/.*):bornAs: (x[0-9a-z]{6})$/);
-        if (!match || seen.has(match[2])) continue;
-        seen.add(match[2]); // First path wins, even when its non-numeric stem yields no number.
-        const number = match[1].match(/backlog\/(\d{1,5})-.*\.md$/);
-        if (number) bornAsNumbers.set(match[2], number[1]);
-      }
-    } catch { /* best-effort — no origin/main or git failure means no landed mappings */ }
+    bornAsNumbers = new Map(); // derived from the single bornAs scan above (one git grep per pass)
+    for (const [hash, path] of bornAsOnMain) {
+      const number = path.match(/backlog\/(\d{1,5})-.*\.md$/);
+      if (number) bornAsNumbers.set(hash, number[1]);
+    }
     return bornAsNumbers;
   };
   // #3383 perf — this used to answer "is `hash` visible on ANY ref" by building `visibleHashItems`
@@ -1046,7 +1074,8 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     }
     return hash;
   };
-  const resolvedFiles = files.map(({ name, content }) => ({ name,
+  const dupStems = new Set(dupDropped.map((d) => d.stem));
+  const resolvedFiles = files.filter(({ name }) => !dupStems.has(name)).map(({ name, content }) => ({ name,
     content: mapHashReferences(content, (hash) => resolveReference(hash, name)),
   }));
   nextPhase('apply');
@@ -1085,7 +1114,7 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
     inRepo(from) && inRepo(to) && existsSync(join(CWD, from)));
   // #2319 — `number-stranded --dry-run`: report the planned mapping + renames without touching the tree/index.
   if (dryRun) return finish({
-    assigned, held, committed: false, dryRun: true, unresolvedReferences,
+    assigned, held, committed: false, dryRun: true, unresolvedReferences, droppedDuplicates: dupDropped,
     renamed: renames.map((r) => r.to),
     wouldRename: [...renames, ...livePathRenames].map((r) => ({ from: r.from, to: r.to })),
   });
@@ -1099,6 +1128,12 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   // the deleted old paths so the pathspec commit records the deletion (already staged by `git rm`).
   const toAdd = [];
   const commitPaths = [];
+  // xsjn0uf-incident — remove each duplicate hash-named copy (its content already lives at its numbered card).
+  for (const { stem } of dupDropped) {
+    if (quietGit(CWD, ['rm', '--quiet', `backlog/${stem}.md`]) == null)
+      return finish({ assigned, held, committed: false, error: `git rm duplicate ${stem} failed` });
+    commitPaths.push(`backlog/${stem}.md`);
+  }
   for (const { name, content } of rewrites) {
     if (renameFroms.has(name)) continue; // a renamed file's content is written to its NEW path below
     const { absPath, relPath } = pathFor(name); // backlog stem → backlog/<name>.md; docs entry → its own full path (#2428)
@@ -1152,9 +1187,9 @@ export function numberPendingHashes(CWD, { dryRun = false } = {}) {
   //      the rewrite for good).
   quietGit(CWD, ['add', '--', ...new Set(toAdd)]); // stage rewrites + new renamed files (deletions already staged by git rm; ledger stays untracked)
   const paths = [...new Set(commitPaths)];
-  const summary = assigned.map((a) => `${a.hash}→#${a.nnn}`).join(', ');
+  const summary = [...assigned.map((a) => `${a.hash}→#${a.nnn}`), ...dupDropped.map((d) => `${d.hash} duplicate dropped (already ${d.existing.replace(/^backlog\//, '')})`)].join(', ');
   const committed = quietGit(CWD, ['commit', '-m', assertNoClosingKeywordRef(`drain: JIT-number ${summary} at land (#2288)`, 'JIT-number commit message'), '--', ...paths]) != null;
-  return finish({ assigned, held, committed, unresolvedReferences, renamed: [...renames, ...livePathRenames].map((r) => r.to), changedPaths: paths });
+  return finish({ assigned, held, committed, unresolvedReferences, droppedDuplicates: dupDropped, renamed: [...renames, ...livePathRenames].map((r) => r.to), changedPaths: paths });
 }
 
 /**

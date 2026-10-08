@@ -284,6 +284,10 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
     node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} \
       --head="$EXAMINED_HEAD" --outcome=needs-human "${CI_AUTH_ARGS[@]}" --reason="<name the actual finding>"
     ```
+    When the red is `main`'s own defect (it reproduces on a merge with main and the PR's diff is not implicated),
+    add `--cause=main-defect` to that command. The conveyor then refreshes the PR onto main ONCE after main's
+    required check is green on a newer main (knob `WE_MAIN_DEFECT_REBASES_PER_SHA`), and the new head clears the
+    `needs-human` label. Never add it when the diff itself is implicated.
     Then report `#{{ITEM_NUM}} → ci-heal escalated (needs human)`. The review gate (if any) still
     owes a human verdict; a human handles it via `/finish`.
   - **`waiting-on-system-fix` — narrow, and ONLY when BOTH hold:** (1) the red is caused by the CI TOOLING/GATE

@@ -3,9 +3,11 @@ bornAs: xcom9j2
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/lib/review-core.mjs", "we:scripts/lib/__tests__/review-core.test.mjs"]
 dateOpened: "2026-09-28"
+dateStarted: "2026-10-07"
+dateResolved: "2026-10-07"
 preparedDate: "2026-10-07"
 preparedAgainstSha: "3a6d151dba45e0eaad8fdf70d3d590c203fd5a3a"
 tags: []
