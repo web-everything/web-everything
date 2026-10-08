@@ -1,0 +1,82 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "we.worker-result/v1",
+  "title": "we.worker-result v1",
+  "description": "The JSON object every dispatched worker ends with (item 117). Written to OpenAI strict rules so one file works on claude --json-schema, codex --output-schema and agy --json-schema: every object has additionalProperties:false and lists ALL its keys in required (nullable = a type array). Length caps and the cross-field checks (blocked <=> blocker, needs-ruling <=> ruling, role rules) are the READER's job: see scripts/operations/worker-result.mjs. The launcher-written envelope (completion record v2) is not part of this schema, and neither are the envelope-only outcomes unparseable and aborted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "outcome", "summary", "blocker", "findingsAddressed", "filesTouched", "learning"],
+  "properties": {
+    "v": { "type": "integer", "enum": [1] },
+    "outcome": { "type": "string", "enum": ["done", "no-change", "blocked", "not-applicable"] },
+    "summary": { "type": "string" },
+    "blocker": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["kind", "component", "evidence", "proposedFix", "ruling", "deniedCommand", "retryable"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["infra-transient", "host-load", "permission-wall", "tooling-defect", "spec-defect", "dependency", "conflict", "gate-red", "needs-ruling"]
+        },
+        "component": { "type": "string" },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["text", "refs"],
+          "properties": {
+            "text": { "type": "string" },
+            "refs": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "proposedFix": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["summary", "scope", "size"],
+          "properties": {
+            "summary": { "type": "string" },
+            "scope": { "type": "array", "items": { "type": "string" } },
+            "size": { "type": ["integer", "null"], "enum": [1, 2, 3, 5, 8, null] }
+          }
+        },
+        "ruling": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["question", "options", "recommendation"],
+          "properties": {
+            "question": { "type": "string" },
+            "options": { "type": "array", "items": { "type": "string" } },
+            "recommendation": { "type": "string" }
+          }
+        },
+        "deniedCommand": { "type": ["string", "null"] },
+        "retryable": { "type": "boolean" }
+      }
+    },
+    "findingsAddressed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ref", "disposition", "note"],
+        "properties": {
+          "ref": { "type": "string" },
+          "disposition": { "type": "string", "enum": ["fixed", "dismissed", "not-applicable", "deferred"] },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "filesTouched": { "type": "array", "items": { "type": "string" } },
+    "learning": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["kind", "summary", "area", "suggestion"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["friction", "missing-convention", "doc-gap", "skill-gap", "improvement"] },
+        "summary": { "type": "string" },
+        "area": { "type": "string" },
+        "suggestion": { "type": "string" }
+      }
+    }
+  }
+}
