@@ -45,6 +45,17 @@ function harness({ load = 1, fail = '', count = 1 } = {}) {
 }
 
 describe('held cards CLI with isolated files and fake subprocesses', () => {
+  // #x0h3pe4: `add --size=` was stored as 0 (Number('')) and `--size=big` as NaN→null→the default 3.
+  it('add: an empty --size= stores no size, and a non-numeric --size is refused (not silently defaulted)', async () => {
+    const h = harness();
+    expect(await h.run(['add', '--title=Blank.', '--size='])).toBe(0);
+    expect(h.text()).not.toMatch(/"size":/);
+    const before = h.text();
+    expect(await h.run(['add', '--title=Bad.', '--size=big'])).toBe(1);
+    expect(h.errors.join('')).toContain('--size must be a number');
+    expect(h.text()).toBe(before);
+  });
+
   it('adds with numbering and structured metadata, lists pending and all', async () => {
     const h = harness();
     expect(await h.run(['add', '--title=Third.', '--body=hello', '--size=5', '--scope=we:x.mjs', '--parent=3383'])).toBe(0);
