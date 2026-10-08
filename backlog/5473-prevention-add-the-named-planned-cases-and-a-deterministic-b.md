@@ -1,9 +1,10 @@
 ---
+bornAs: xpisb03
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/x5d9nso-revert-red-check-a-fix-push-s-new-tests-must-fail-with-the-f.md", "we:backlog/xm1mi56-stable-finding-identity-in-the-ledger-scoped-re-review-in-sh.md"]
+scope: ["we:backlog/5466-revert-red-check-a-fix-push-s-new-tests-must-fail-with-the-f.md", "we:backlog/5469-stable-finding-identity-in-the-ledger-scoped-re-review-in-sh.md"]
 dateOpened: "2026-10-08"
 tags: []
 ---
@@ -12,8 +13,8 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/x5d9nso-revert-red-check-a-fix-push-s-new-tests-must-fail-with-the-f.md:37` — Add the named planned cases and a deterministic backlog check requiring behavioral guarantees to reference a repository-qualified test file, named case, and observable assertion.
-2. `we:backlog/xm1mi56-stable-finding-identity-in-the-ledger-scoped-re-review-in-sh.md:24` — Require explicit divergent-result fixtures for shadow policies, and enforce test-reference completeness through a deterministic backlog check.
+1. `we:backlog/5466-revert-red-check-a-fix-push-s-new-tests-must-fail-with-the-f.md:37` — Add the named planned cases and a deterministic backlog check requiring behavioral guarantees to reference a repository-qualified test file, named case, and observable assertion.
+2. `we:backlog/5469-stable-finding-identity-in-the-ledger-scoped-re-review-in-sh.md:24` — Require explicit divergent-result fixtures for shadow policies, and enforce test-reference completeness through a deterministic backlog check.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4505@8e9f38aafb352031eb90f919b9a08b518d347c0a
 
