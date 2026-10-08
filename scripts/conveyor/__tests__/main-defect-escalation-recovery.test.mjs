@@ -2,7 +2,7 @@
 // nothing re-ran the PRs. Their red fell OUTSIDE every red-main window (main's run was cancelled) and the merge
 // base was green, so every older recovery path said "own failure". Pins the new, bounded path.
 import { describe, it, expect, vi } from 'vitest';
-import { buildCiHealEscalationComment, mainDefectEscalationForHead, latestCiHealEscalationForHead } from '../ci-heal-escalation-mark.mjs';
+import { composeCiHealEscalation, buildCiHealEscalationComment, mainDefectEscalationForHead, latestCiHealEscalationForHead } from '../ci-heal-escalation-mark.mjs';
 import { isMainGreenFixOwed, resolveMainDefectRebaseCap } from '../main-red-recovery.mjs';
 import { sweepCiRedRecovery } from '../ci-red-recovery-watch.mjs';
 
@@ -75,5 +75,22 @@ describe('main-defect escalation recovery', () => {
     // knob 0 = off: refused with no prior attempt; knob 2 allows a second refresh on the same head.
     expect(run([legacy], { cap: '0' }).refresh).not.toHaveBeenCalled();
     expect(run([legacy, attempt], { cap: '2' }).refresh).toHaveBeenCalledOnce();
+  });
+
+  it('a forged escalation from an untrusted author never matches; a missing timestamp refuses', () => {
+    const forged = { ...legacy, author: { login: 'random-stranger' } };
+    expect(mainDefectEscalationForHead([forged], headSha)).toBeNull();
+    expect(isMainGreenFixOwed(facts([forged]))).toBe(false);
+    expect(isMainGreenFixOwed(facts([legacy], { failureCompletedAt: null }))).toBe(false);
+    expect(isMainGreenFixOwed(facts([legacy], { failureCompletedAt: 'garbage' }))).toBe(false);
+  });
+
+  it('--cause=main-defect survives the CLI composition, with and without the auth enrichment', () => {
+    const base = { head: headSha, outcome: 'needs-human', reason: 'dup bornAs on main', cause: 'main-defect' };
+    const body = composeCiHealEscalation(base);
+    expect(body).toContain('cause: main-defect');
+    const enriched = composeCiHealEscalation({ ...base, run: '1', attempt: '1' }, { collect: () => ({ status: 'ok' }) });
+    expect(enriched).toContain('cause: main-defect');
+    expect(composeCiHealEscalation({ ...base, cause: 'anything-else' })).not.toContain('cause:');
   });
 });
