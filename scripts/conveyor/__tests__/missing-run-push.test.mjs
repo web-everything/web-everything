@@ -216,17 +216,18 @@ describe('xgq539z - plateau-app (per-owner credential) missing-run recovery', ()
   const prP = { state: 'open', mergeable: true, head: { sha: sha2, ref: dP.headRefName, repo: { full_name: plateau } }, base: { ref: 'main' } };
   const NOW = Date.parse('2026-10-08T12:00:00Z');
   const cache = (installationId, token) => ({ v: 2, installationId, token, expiresAt: '2026-10-08T13:00:00Z' });
-  function run(readCache, env) {
+  function run(readCache, env, slug = plateau) {
     const calls = [];
+    const prFor = { ...prP, head: { ...prP.head, repo: { full_name: slug } } };
     const exec = vi.fn((cmd, args, opts) => {
       calls.push({ cmd, args, opts });
-      if (cmd === 'gh') return args[0] === 'auth' ? 'ghs_unbound-token' : JSON.stringify(prP);
+      if (cmd === 'gh') return args[0] === 'auth' ? 'ghs_unbound-token' : JSON.stringify(prFor);
       if (args.includes('FETCH_HEAD')) return sha2;
       if (args.includes('show')) return 'fix';
       if (args.includes('commit-tree')) return next;
       return args.includes(`${sha2}^{tree}`) ? 'b'.repeat(40) : '';
     });
-    const result = pushMissingRunCommit(dP, { repo: plateau, exec, env, readCache, now: NOW, checkClaim: () => null });
+    const result = pushMissingRunCommit(dP, { repo: slug, exec, env, readCache, now: NOW, checkClaim: () => null });
     return { result, calls };
   }
   it('pushes a plateauapp PR with the plateauapp installation token, not the daemon env token', () => {
@@ -237,6 +238,41 @@ describe('xgq539z - plateau-app (per-owner credential) missing-run recovery', ()
   it('still refuses an unverifiable ghs_ token when the owner has no fresh installation cache', () => {
     const { result } = run(() => null, { GH_TOKEN: 'ghs_we-token' });
     expect(result).toMatchObject({ ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL });
+  });
+  // One negative test per guard on the owner-token bypass (ownerInstallationToken). The bypass skips
+  // recoveryPushCredential for ANY non-null owner token, so each guard must be pinned on its own: dropping it
+  // would hand an expired / wrong-owner / non-installation token to git as the trusted credential.
+  describe('rejects an untrustworthy owner-installation cache (never reaches git)', () => {
+    const rejected = [
+      ['an expired cache', { ...cache(167639975, 'ghs_plateau-owner-token'), expiresAt: '2026-10-08T11:00:00Z' }],
+      ['a cache inside the refresh buffer (expires in 5 minutes)', { ...cache(167639975, 'ghs_plateau-owner-token'), expiresAt: '2026-10-08T12:05:00Z' }],
+      ['a cache without an expiry', { v: 2, installationId: 167639975, token: 'ghs_plateau-owner-token' }],
+      ['a cache of another cache version', { ...cache(167639975, 'ghs_plateau-owner-token'), v: 1 }],
+      ['a cache bound to another installation', cache(999, 'ghs_wrong-owner-token')],
+      ['a cache with no installationId', cache(undefined, 'ghs_plateau-owner-token')],
+      ['a non-ghs_ cached token', cache(167639975, 'ghp_not-an-installation-token')],
+      ['a cached token that is not a string', cache(167639975, 12345)],
+      ['an empty cached token', cache(167639975, '')],
+    ];
+    for (const [name, entry] of rejected) {
+      it(`refuses with an ineligible fallback credential: ${name}`, () => {
+        const { result, calls } = run(() => entry, { GH_TOKEN: 'ghs_we-token' });
+        expect(result).toMatchObject({ ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL });
+        expect(calls.some(c => c.cmd === 'git')).toBe(false);
+      });
+      it(`falls back to the eligible env credential, never the cached token: ${name}`, () => {
+        const { result, calls } = run(() => entry, { GH_TOKEN: 'ghp_eligible-fallback' });
+        expect(result).toMatchObject({ ok: true });
+        const tokens = calls.filter(c => c.cmd === 'git').map(c => c.opts.env.WE_CI_PUSH_TOKEN);
+        expect(tokens.length).toBeGreaterThan(0);
+        expect(new Set(tokens)).toEqual(new Set(['ghp_eligible-fallback']));
+      });
+    }
+    it('does not trust a cache for an owner with no configured installation', () => {
+      const { result, calls } = run(() => cache(167639975, 'ghs_plateau-owner-token'), { GH_TOKEN: 'ghs_we-token' }, 'unknownorg/some-repo');
+      expect(result).toMatchObject({ ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL });
+      expect(calls.some(c => c.cmd === 'git')).toBe(false);
+    });
   });
   it('does not count legacy wrong-owner credential refusals, but still counts a current one (structural refusals stay capped)', () => {
     const mk = (error) => ({ author: { login: 'web-everything' }, body: buildMissingRunComment({ headSha: sha2, ok: false, error }) });
