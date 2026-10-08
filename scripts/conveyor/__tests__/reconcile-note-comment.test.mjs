@@ -162,14 +162,36 @@ describe('planNoteComment — the whole pure decision, no network', () => {
     expect(plan.suppressed).toBe(null);
   });
 
-  it('a new episode whose comment would read exactly like the previous note is suppressed as a repeat', () => {
-    const first = { kind: 'permission-blocked', prNumber: 7, since: '2026-10-08T01:00:00Z', text: 'fixer denied `rm`' };
-    const second = { ...first, since: '2026-10-08T05:00:00Z' };
-    const comments = [{ body: buildNoteComment(first), author: { login: 'web-everything' } }];
-    expect(noteEpisodeKey(first)).not.toBe(noteEpisodeKey(second));
-    const plan = planNoteComment(second, comments, { mode: 'on-change-or-action' });
-    expect(plan).toMatchObject({ alreadyPosted: true, suppressed: 'repeat' });
-    expect(planNoteComment(second, comments, { mode: 'all' }).alreadyPosted).toBe(false);
+  // PR #4494 review: repeat suppression silenced a recurring escalation (same words, new episode). A note that
+  // asks a person to act must post again for every new episode, whatever its visible text.
+  it('a recurring escalation (new episode, identical visible text) still posts — never repeat-suppressed', () => {
+    const escalations = [
+      { kind: 'permission-blocked', prNumber: 7, since: '2026-10-08T01:00:00Z', text: 'fixer denied `rm`' },
+      { kind: 'infra-retry-exhausted', prNumber: 7, since: '2026-10-08T01:00:00Z', text: 'infra retry streak capped' },
+      { kind: 'liveness-wait-exhausted', prNumber: 7, since: '2026-10-08T01:00:00Z', text: 'liveness wait ran long' },
+    ];
+    for (const first of escalations) {
+      const second = { ...first, since: '2026-10-08T05:00:00Z' };
+      const comments = [{ body: buildNoteComment(first), author: { login: 'web-everything' } }];
+      expect(noteEpisodeKey(first), first.kind).not.toBe(noteEpisodeKey(second));
+      expect(planNoteComment(second, comments, { mode: 'on-change-or-action' }), first.kind)
+        .toMatchObject({ alreadyPosted: false, suppressed: null });
+    }
+  });
+
+  it('every kind whose headline says "needs your decision" is never repeat-suppressed', () => {
+    const kinds = ['ci-heal-exhausted', 'awaiting-permission', 'round-cap-exhausted', 'permission-blocked',
+      'infra-retry-exhausted', 'session-overrun', 'liveness-wait-exhausted', 'ruling-dispute', 'brand-new-kind'];
+    for (const kind of kinds) {
+      // An unknown kind is keyed on its own text (same words = same episode, the existing dedup), so its second
+      // episode must carry different words; every known kind differs by its key fields alone.
+      const first = { kind, prNumber: 3, sessionId: 'a', since: '1', head: 'h1', attempts: 1, cap: 3, text: 'same words' };
+      const second = { ...first, sessionId: 'b', since: '2', head: 'h2', attempts: 2, ...(kind === 'brand-new-kind' ? { text: 'same words ' } : {}) };
+      expect(noteEpisodeKey(first), kind).not.toBe(noteEpisodeKey(second));
+      const comments = [{ body: buildNoteComment(first), author: { login: 'web-everything' } }];
+      expect(noteHeadline(first), kind).toMatch(/^needs your decision/);
+      expect(planNoteComment(second, comments, { mode: 'on-change-or-action' }).alreadyPosted, kind).toBe(false);
+    }
   });
 
   it('an escalation that needs a person still posts', () => {

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   DEFAULT_PR_COMMENT_MODE, loadPrCommentSettings, isStatusOnlyNote, repeatsLatestComment,
-  isNoActionDrainReason, drainReasonCommentSuppressed,
+  isRepeatSuppressibleNote, isNoActionDrainReason, drainReasonCommentSuppressed,
 } from '../pr-comment-policy.mjs';
 
 const bot = (body) => ({ body, author: { login: 'web-everything' } });
@@ -40,6 +40,27 @@ describe('loadPrCommentSettings', () => {
     expect(loadPrCommentSettings({ path: settingsFile('{"prComments":{"mode":"loud"}}'), env: {} }).mode).toBe('on-change-or-action');
     expect(loadPrCommentSettings({ path: '/nonexistent/x.json', env: { WE_PR_COMMENTS_MODE: 'loud' } }).mode).toBe('on-change-or-action');
   });
+  // PR #4494 review: an unknown env value must fall back to the default, not through to the file's `all`.
+  it('an invalid env override falls back to the default, whatever the file says', () => {
+    const all = settingsFile(JSON.stringify({ prComments: { mode: 'all' } }));
+    const onChange = settingsFile(JSON.stringify({ prComments: { mode: 'on-change-or-action' } }));
+    for (const bad of ['loud', 'ALL', ' all', 'all ', 'on-change', '0']) {
+      expect(loadPrCommentSettings({ path: all, env: { WE_PR_COMMENTS_MODE: bad } }).mode, bad).toBe('on-change-or-action');
+      expect(loadPrCommentSettings({ path: onChange, env: { WE_PR_COMMENTS_MODE: bad } }).mode, bad).toBe('on-change-or-action');
+    }
+  });
+  it('an unset or empty env override defers to the file', () => {
+    const all = settingsFile(JSON.stringify({ prComments: { mode: 'all' } }));
+    expect(loadPrCommentSettings({ path: all, env: {} }).mode).toBe('all');
+    expect(loadPrCommentSettings({ path: all, env: { WE_PR_COMMENTS_MODE: '' } }).mode).toBe('all');
+    expect(loadPrCommentSettings({ path: all, env: { WE_PR_COMMENTS_MODE: undefined } }).mode).toBe('all');
+  });
+  it('precedence matrix: env (valid) > file (valid) > default', () => {
+    for (const [fileMode, envMode] of [['all', 'all'], ['all', 'on-change-or-action'], ['on-change-or-action', 'all'], ['on-change-or-action', 'on-change-or-action']]) {
+      const path = settingsFile(JSON.stringify({ prComments: { mode: fileMode } }));
+      expect(loadPrCommentSettings({ path, env: { WE_PR_COMMENTS_MODE: envMode } }).mode).toBe(envMode);
+    }
+  });
   it('the checked-in settings file is the default mode', () => {
     expect(loadPrCommentSettings({ env: {} }).mode).toBe('on-change-or-action');
   });
@@ -55,6 +76,17 @@ describe('isStatusOnlyNote', () => {
       'stacked-base-orphaned', 'something-new', undefined]) {
       expect(isStatusOnlyNote({ kind })).toBe(false);
     }
+  });
+});
+
+describe('isRepeatSuppressibleNote', () => {
+  it('no escalation kind is on the allowlist (an unknown kind never is either)', () => {
+    for (const kind of ['ci-heal-exhausted', 'awaiting-permission', 'round-cap-exhausted', 'permission-blocked',
+      'infra-retry-exhausted', 'session-overrun', 'liveness-wait-exhausted', 'ruling-dispute', 'stacked-base-orphaned',
+      'something-new', undefined]) {
+      expect(isRepeatSuppressibleNote({ kind }), String(kind)).toBe(false);
+    }
+    expect(isRepeatSuppressibleNote(null)).toBe(false);
   });
 });
 

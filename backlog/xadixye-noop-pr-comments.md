@@ -24,5 +24,5 @@ Operator 2026-10-08: daemon PR comments that say nothing changed are noise. Add 
 3. **Shared state files** — the setting file is read-only for daemons; no writes.
 4. **Fail closed** — a missing or malformed setting, or an unknown mode, falls back to the default; only the listed status-only kinds are ever suppressed.
 5. **Identity scoping** — the repeat check compares only the same PR's latest note comment.
-6. **State over time** — only the latest note counts, so a state that changes and comes back posts again; mode is re-read each tick.
+6. **State over time** — a note that asks a person to act (every note kind today) is never dropped as a repeat: a state that resolves and comes back posts again, even when its words are identical. Repeat suppression is an explicit per-kind allowlist (`REPEAT_SUPPRESSIBLE_NOTE_KINDS`, empty today). Mode is re-read each tick; an unknown `WE_PR_COMMENTS_MODE` value means the default, not the file.
 7. **Who wrote it** — machine-read markers (fix claims, retry-cap counters) are never routed through this policy.

@@ -37,8 +37,10 @@ const validMode = (m) => (PR_COMMENT_MODES.includes(m) ? m : null);
  * @returns {{mode:string}}
  */
 export function loadPrCommentSettings({ path = DEFAULT_SETTINGS_PATH, env = globalThis.process?.env ?? {} } = {}) {
-  const fromEnv = validMode(env?.WE_PR_COMMENTS_MODE);
-  if (fromEnv) return { mode: fromEnv };
+  // A SET env value is the operator's explicit choice: if it is not a known mode the answer is the default, never
+  // the file (a typo must not silently resurrect the file's `all`). Only an unset or empty value defers to the file.
+  const rawEnv = env?.WE_PR_COMMENTS_MODE;
+  if (typeof rawEnv === 'string' && rawEnv !== '') return { mode: validMode(rawEnv) ?? DEFAULT_PR_COMMENT_MODE };
   try {
     const raw = JSON.parse(readFileSync(path, 'utf8'));
     return { mode: validMode(raw?.prComments?.mode) ?? DEFAULT_PR_COMMENT_MODE };
@@ -59,6 +61,20 @@ export const STATUS_ONLY_NOTE_KINDS = Object.freeze(['review-label-missing', 'st
 /** @param {{kind?:string}} note @returns {boolean} */
 export function isStatusOnlyNote(note) {
   return STATUS_ONLY_NOTE_KINDS.includes(note?.kind);
+}
+
+/**
+ * Reconcile note kinds that MAY be dropped when a new episode reads exactly like the PR's latest note. An explicit
+ * allowlist, deliberately empty: every note kind that exists today asks a person to act ("needs your decision"),
+ * and an identical recurrence of one is a new problem that must still reach them (a permission wall that clears
+ * and returns with the same denied command reads word for word the same). An unknown kind is never listed here —
+ * adding a kind is a deliberate edit, so a new escalation cannot be silenced by default.
+ */
+export const REPEAT_SUPPRESSIBLE_NOTE_KINDS = Object.freeze([]);
+
+/** @param {{kind?:string}} note @returns {boolean} */
+export function isRepeatSuppressibleNote(note) {
+  return REPEAT_SUPPRESSIBLE_NOTE_KINDS.includes(note?.kind);
 }
 
 /** Visible text only: hidden HTML-comment markers (episode keys, hashes) and whitespace runs never count. */
