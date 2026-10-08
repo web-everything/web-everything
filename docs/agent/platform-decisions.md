@@ -3740,6 +3740,9 @@ Four clauses:
    token-fenced main-write) **and** dominated by simply supervising one live writer. A wake signal is never a
    trusted land order — the daemon's own pre-land gate is still re-derived server-side
    (`we:scripts/lib/pr-merge-gate.mjs`); authority does not move earlier just because the trigger does.
+   **Clarified 2026-10-08 (operator ruling E7, event-driven daemons):** a per-PR "ready to land" event from the
+   decider is a wake/hint for that one PR, never an order — the drain re-checks every gate live and keeps the
+   `blockedBy` ordering.
 
 2. **The cheap WAKE ships now, independent of everything below.** Shorten the drain poll default (60s → ~5–10s,
    one constant) and fire the daemon's `/nudge` on a PR-reaching-ready event. One constant plus one event wire —
@@ -3766,7 +3769,8 @@ Four clauses:
 merits** (clause 1). WAKE ships now (clause 2) = #2605 (drain-daemon `/nudge` seam) + #2683 (conveyor fast-drain
 trigger, resolved) + the WAKE-remainder story `#2743`. Deferred merge-queue build (clause 3) = slice #2683's
 successor, gated behind tripwire **#2740** reading #2680's `land-serialization` saturation metric, **routed** by
-**#2704** (clause 4). Program #2606 / epic #2612. Extends [#pr-flow-rollout-mechanism](#pr-flow-rollout-mechanism)
+**#2704** (clause 4). Program #2606 / epic #2612. Clause 1 clarified 2026-10-08 by operator ruling E7 on the
+event-driven daemon design (#3886; epic xf7ax93, slice #4283). Extends [#pr-flow-rollout-mechanism](#pr-flow-rollout-mechanism)
 (sole-writer-to-`main`) and composes with
 [#deterministic-core-thin-judgment](#deterministic-core-thin-judgment) (the wake/land mechanics are script-decidable;
 the high-stakes un-gate stays a routed judgment call).
