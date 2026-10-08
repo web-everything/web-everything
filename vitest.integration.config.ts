@@ -1,5 +1,10 @@
 import { defineConfig } from 'vitest/config';
 import { hermeticGitEnv, maxTestWorkers, weAlias } from './vitest.shared';
+import { liveSuiteFiles, loadHermeticSettings } from './scripts/lib/hermetic-tests.mjs';
+
+// Card xcu4cqf: this tier is BLOCKING (CI's `integration` check), so it is hermetic too and never runs a file of the
+// scheduled live suite (scripts/hermetic-tests.settings.json → liveSuite.tests; run by vitest.live.config.ts).
+const LIVE_SUITE = new Set(liveSuiteFiles(loadHermeticSettings(new URL('.', import.meta.url).pathname)));
 
 /**
  * The REAL-git / real-subprocess tier `vitest.config.ts` excludes (see that file's `test.exclude` comment
@@ -51,7 +56,9 @@ export default defineConfig({
     // stripped WE_*/CONVEYOR_*/GH_*/CLAUDE_* env) — the exact opposite of what this tier is FOR.
     // `hermeticGitEnv` — see vitest.shared.ts: isolates git from host config and skips inert sample-hook
     // copies on every throwaway clone, cutting this tier's file-system event churn.
-    env: { WE_TEST_SANDBOX: '0', ...hermeticGitEnv() },
+    // Real env (no sandbox strip) but hermetic (card xcu4cqf): real git and real subprocesses, never live GitHub,
+    // remote refs of the real checkout, or real host state.
+    env: { WE_TEST_SANDBOX: '0', WE_TEST_HERMETIC: '1', ...hermeticGitEnv() },
     include: [
       'scripts/__tests__/stdout-flush.test.mjs',
       'scripts/__tests__/rust-scan-stdout-flush-parity.test.mjs',
@@ -124,7 +131,6 @@ export default defineConfig({
       // moved here from the default suite because its whole point is a real, unauthenticated `gh` failure,
       // which `vitest.setup.ts`'s sandbox-by-default (a fake `gh` on PATH) would otherwise mask — this tier
       // opts out of that sandbox (`WE_TEST_SANDBOX: '0'` above), exactly what this file needs.
-      'scripts/operations/__tests__/route-pr-outcome-io-live.test.mjs',
       // #3383 — the tracer scenario: a forked daemon host dynamically importing the sim clone's own module
       // graph, many real `node`/`git` child spawns per tick. Pinned to `forks` below for the same reason as
       // this config's other many-child-process members.
@@ -135,7 +141,7 @@ export default defineConfig({
       'scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs',
       'scripts/conveyor/__tests__/sim-scenario-approved-conflict-grace.test.mjs',
       'scripts/conveyor/__tests__/sim-scenario-lane-starvation.test.mjs',
-    ],
+    ].filter((f) => !LIVE_SUITE.has(f)),
     poolMatchGlobs: [
       ['scripts/__tests__/stdout-flush.test.mjs', 'forks'],
       ['scripts/__tests__/gate-entrypoint-integration.test.mjs', 'forks'],

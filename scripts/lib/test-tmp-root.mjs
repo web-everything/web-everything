@@ -15,9 +15,10 @@
 //   WE_TMP_LEAK_MODE  'warn' (default) | 'fail' | 'off'
 //   WE_TMP_LEAK_MAX   leftover entries allowed before warn/fail fires (default 50)
 //   WE_TMP_LEAK_KEEP  '1' keeps the root on disk for debugging instead of removing it
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
+import { fakeGhScript, gitShimScript } from './hermetic-tests.mjs';
 
 export const RUN_ROOT_PARENT = 'we-vitest';
 export const DEFAULT_LEAK_MAX = 50;
@@ -117,16 +118,31 @@ export function lazyTmpPath(prefix, baseTmp) {
 // The fake `gh` every sandboxed test file puts first on PATH: fails like an unauthenticated `gh`. Written ONCE
 // PER RUN by `vitest.globalSetup.mjs` (dir passed to workers via FAKE_GH_DIR_ENV), not once per test file.
 export const FAKE_GH_DIR_ENV = 'VITEST_SHARED_FAKE_GH_DIR';
+/** The first real `git` on PATH — never a hermetic shim already ahead of it (that would loop). */
+export function resolveRealGit(path = process.env.PATH || '') {
+  for (const dir of path.split(delimiter).filter(Boolean)) {
+    const candidate = join(dir, 'git');
+    if (!existsSync(candidate)) continue;
+    try {
+      if (statSync(candidate).size < 8192 && readFileSync(candidate, 'utf8').includes('hermetic-tests.mjs#gitShimScript')) continue;
+    } catch { continue; }
+    return candidate;
+  }
+  return '/usr/bin/git';
+}
+
+/**
+ * The hermetic shims for a run (card xcu4cqf, we:scripts/lib/hermetic-tests.mjs): a fake `gh` that never reaches
+ * GitHub and records the call against the running test, and a `git` pass-through that refuses remote reads inside
+ * the real checkout. `dir` goes first on PATH for every hermetic run.
+ */
 export function writeFakeGhShim(dir) {
   const path = join(dir, 'gh');
-  writeFileSync(
-    path,
-    '#!/bin/sh\n'
-    + 'echo "To get started with GitHub CLI, please run:  gh auth login" >&2\n'
-    + 'echo "Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token." >&2\n'
-    + 'exit 1\n',
-  );
+  writeFileSync(path, fakeGhScript());
   chmodSync(path, 0o755);
+  const git = join(dir, 'git');
+  writeFileSync(git, gitShimScript({ realGit: resolveRealGit() }));
+  chmodSync(git, 0o755);
   return path;
 }
 

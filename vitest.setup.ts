@@ -1,8 +1,18 @@
-import { beforeEach, afterEach, afterAll } from 'vitest';
+import { beforeEach, afterEach, afterAll, expect } from 'vitest';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { FAKE_GH_DIR_ENV, lazyTmpPath, writeFakeGhShim } from './scripts/lib/test-tmp-root.mjs';
+import { HERMETIC_ENV, isHermetic } from './scripts/lib/hermetic-tests.mjs';
+import { setupHermeticTestFile } from './scripts/lib/hermetic-tests-vitest.mjs';
+
+const REPO_ROOT = dirname(fileURLToPath(import.meta.url));
+// Captured BEFORE the sandbox strip below, so the hermetic guard also covers a state root the LAUNCHING shell
+// pinned (an operator's CONVEYOR_STATE_ROOT, a daemon's WE_DAEMON_STATE_DIR).
+const ambientEnv = { ...process.env };
+// Decided by the CONFIG (`test.env.WE_TEST_HERMETIC`), read before the strip removes every WE_* key.
+const hermetic = isHermetic(process.env);
 
 // tmp-leak fix (2026-10-04): this file runs once per test FILE, and every temp dir it makes used to be left
 // behind — ~1.15M dirs in the operator's `$TMPDIR` (2m39s to list). Each dir this file creates is removed in
@@ -89,20 +99,6 @@ afterAll(() => {
 // A test that means to exercise the CONFIGURED path (a real env var, a real `gh`) sets it itself, inside its
 // own test body — that always wins over this file, since it runs after.
 if (process.env.WE_TEST_SANDBOX !== '0') {
-  try {
-    let fakeGhDir = process.env[FAKE_GH_DIR_ENV];
-    if (!fakeGhDir || !existsSync(join(fakeGhDir, 'gh'))) {
-      fakeGhDir = mkdtempSync(join(tmpdir(), 'we-fake-gh-'));
-      ownedTmpDirs.push(fakeGhDir);
-      writeFakeGhShim(fakeGhDir);
-    }
-    addedPathPrefix = fakeGhDir;
-    process.env.PATH = `${fakeGhDir}:${process.env.PATH || ''}`;
-  } catch {
-    // Best-effort — a host where this fails (e.g. no writable temp dir) is no worse off than before this
-    // existed; a test that genuinely needs `gh` unavailable still sees whatever the real PATH gives it.
-  }
-
   const ENV_STRIP_PREFIXES = ['WE_', 'CONVEYOR_', 'GH_', 'CLAUDE_'];
   const ENV_STRIP_ALLOWLIST = new Set([
     'WE_TELEMETRY', // an operator's own explicit local opt-in, handled below — never ambient daemon state.
@@ -111,6 +107,30 @@ if (process.env.WE_TEST_SANDBOX !== '0') {
     if (ENV_STRIP_ALLOWLIST.has(key)) continue;
     if (ENV_STRIP_PREFIXES.some((p) => key.startsWith(p))) delete process.env[key];
   }
+}
+
+// HERMETIC BY DEFAULT (card xcu4cqf — main was red ~5.5 h on 2026-10-08 because a soak scenario read live GitHub
+// and the live origin/main backlog). Independent of the sandbox above: the integration and soak tiers keep their
+// real env but are hermetic too. Only `vitest.live.config.ts` (the scheduled, non-blocking live suite) turns it off.
+//   1. the hermetic shims first on PATH: a fake `gh` that never reaches GitHub, a `git` that refuses remote reads in
+//      the real checkout — both RECORD the access against the running test (we:scripts/lib/hermetic-tests.mjs);
+//   2. an in-process fs + fetch guard over the declared live roots (conveyor state, jobs, lane pool, primary
+//      backlog — we:scripts/hermetic-tests.settings.json). This CORRECTS the old note above: patching `node:fs`
+//      does reach `import { readFileSync } from 'node:fs'` named imports once `syncBuiltinESMExports()` runs;
+//   3. `afterEach` fails a test that made any live access with `live GitHub/backlog access in test`, even when the
+//      code under test swallowed the error.
+// Not wrapped in a try: a guard that silently failed to install would be a gate that fails open.
+if (hermetic) {
+  process.env[HERMETIC_ENV] = '1';
+  let fakeGhDir = process.env[FAKE_GH_DIR_ENV];
+  if (!fakeGhDir || !existsSync(join(fakeGhDir, 'gh')) || !existsSync(join(fakeGhDir, 'git'))) {
+    fakeGhDir = mkdtempSync(join(tmpdir(), 'we-fake-gh-'));
+    ownedTmpDirs.push(fakeGhDir);
+    writeFakeGhShim(fakeGhDir);
+  }
+  addedPathPrefix = fakeGhDir;
+  process.env.PATH = `${fakeGhDir}:${process.env.PATH || ''}`;
+  setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect, repoRoot: REPO_ROOT, ambient: ambientEnv, violationsDir: lazyRoot('hermetic') });
 }
 
 process.env.WE_UNDER_TEST = '1';

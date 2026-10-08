@@ -25,7 +25,10 @@ export default defineConfig({
     // header above) need the real PATH/env this tier is built to exercise, so it opts OUT of
     // `vitest.setup.ts`'s sandbox-by-default (a fake `gh` on PATH, stripped WE_*/CONVEYOR_*/GH_*/CLAUDE_*
     // env) — the exact opposite of what this harness is FOR.
-    env: { WE_TEST_SANDBOX: '0' },
+    // ...but it IS hermetic (card xcu4cqf): the 2026-10-08 main-red incident was a soak scenario reading live
+    // GitHub + the live origin/main backlog. Scenario worlds bring their own fake GitHub and state roots; a reach
+    // past them into the real ones fails the scenario with `live GitHub/backlog access in test`.
+    env: { WE_TEST_SANDBOX: '0', WE_TEST_HERMETIC: '1' },
     include: ['scripts/conveyor/soak/**/*.soak.test.mjs'],
     pool: 'forks',
     // heavy-enforce: the same per-run worker ceiling every other vitest config reads (vitest.shared.ts#maxTestWorkers,

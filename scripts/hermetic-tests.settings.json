@@ -1,0 +1,39 @@
+{
+  "$comment": "Hermetic tests by default (card xcu4cqf). Read by we:scripts/lib/hermetic-tests.mjs (the guard), we:scripts/lib/hermetic-test-scan.mjs (the ratchet), every vitest config (blocking configs exclude liveSuite.tests; vitest.live.config.ts runs only them) and pinned against we:.github/workflows/live-tests.yml (the cron must equal liveSuite.schedule.cron).",
+  "liveSuite": {
+    "$comment": "The ONLY tests allowed to reach live GitHub / remote refs / host state. They never run in a blocking suite (unit, integration, soak). They run on a schedule and a failure is reported as a health-smell issue, never as a PR or main gate. Each entry needs a reason; moving a test here is the opt-out marker.",
+    "schedule": { "cron": "23 */6 * * *", "intervalHours": 6 },
+    "issueLabel": "health-smell",
+    "tests": [
+      {
+        "file": "scripts/operations/__tests__/route-pr-outcome-io-live.test.mjs",
+        "reason": "the #2949 fidelity qualifier against the REAL gh binary: its whole claim is how a real, unauthenticated gh subprocess fails, which no fake can observe (moved out of the blocking integration tier)"
+      }
+    ]
+  },
+  "guardedRoots": [
+    { "id": "conveyor-state", "path": "~/.claude/daemon-self-sync-state", "why": "the machine-wide automation state home: the build queue, run scorecards, daemon last-good" },
+    { "id": "conveyor-home", "path": "~/.claude/conveyor", "why": "the conveyor runner's own state" },
+    { "id": "jobs", "path": "~/.claude/jobs", "why": "live agent session registry" },
+    { "id": "github-app-token", "path": "~/.claude/github-app-token", "why": "real GitHub credentials and the gh shim" },
+    { "id": "operations", "path": "~/workspace/.operations", "why": "coordination root, telemetry, daemon clones" },
+    { "id": "lane-pool", "path": "~/workspace/.lanes", "why": "other lanes and the pool's lease/cache files (the checkout under test and its sibling repos are exempt)" },
+    { "id": "primary-backlog", "path": "~/workspace/webeverything/backlog", "why": "the primary checkout's live backlog (exempt when the primary IS the checkout under test)" },
+    { "id": "primary-queue", "path": "~/workspace/webeverything/.conveyor", "why": "the primary checkout's legacy queue" }
+  ],
+  "ambientRootEnv": ["CONVEYOR_STATE_ROOT", "WE_DAEMON_STATE_DIR", "LANE_POOL_ROOT", "WE_COORDINATION_ROOT", "WE_GH_THROTTLE_LOCK_ROOT"],
+  "siblingRepos": ["frontierui", "plateau-app"],
+  "primaryCheckout": "~/workspace/webeverything",
+  "liveReaders": [
+    {
+      "call": "adoptOrphanedBuildClaims",
+      "requires": ["readDelivery", "recordFailure", "releaseLaneLease", "sessionLivenessFor", "listClaims", "spawnResume"],
+      "why": "its defaults read gh + origin/main backlog (readDelivery), the jobs registry, the real backoff store and lane pool — the 2026-10-08 main-red incident"
+    },
+    {
+      "call": "readBuildDelivery",
+      "requires": ["listPrs", "readCardStatus", "readCardOpened"],
+      "why": "defaults to gh pr list + git show origin/main:backlog"
+    }
+  ]
+}
