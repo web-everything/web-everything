@@ -53,7 +53,7 @@ import { createGhProvider } from '../lib/review-label-provider.mjs';
 // (`planAdvisoryLabels`) lives in the leaf, the writes go through the same provider port as the note above.
 import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
-import { appendVerdict, buildVerdictRecord, foldRepo, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
+import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 import { notApplied } from './effect-executor.mjs';
 // #xgmzd0y — the DERIVED sibling table, so the subject checkout is computed rather than typed
 // (`we:docs/agent/vm-sessions.md`: derivable by the repo's own tooling → in the tooling). Importing
@@ -1149,6 +1149,32 @@ export function createReviewPrSinks({
       }));
       if (!appended.ok) throw notApplied(`verdict-ledger append refused: ${appended.errors.join('; ')}`);
       return { reconciled: false, path: appended.path, verdict: appended.record.verdict, source: 'operation-reconcile' };
+    },
+
+    // ── LEDGER EVENTS (plan slice E2): `referral` (when this run opened findings) and `review-run{posted}`. ──
+    // ADDITIVE: it changes no comment, label or decision. Both events are NON-CLEARING (holding), so the
+    // statute write-miss posture (#verdict-ledger-pr-state-store rule 4) is: a failed append never blocks or
+    // throws; it prints a loud `ledger-write-miss` line and the run goes on with its label hold unchanged.
+    [REVIEW_EFFECTS.LEDGER_EVENTS]: async (payload) => {
+      const base = { repo: payload.repo, pr: payload.pr, source: 'review-pr', session: currentActorId(), channel: 'review-pr' };
+      const rows = [];
+      const keys = Array.isArray(payload.referralKeys) ? payload.referralKeys : [];
+      if (payload.headSha && keys.length) {
+        rows.push({ type: EVENT_TYPES.REFERRAL, headSha: payload.headSha, findingKeys: keys.map((k) => `sha256:${referralHash(String(k))}`) });
+      }
+      if (payload.headSha) rows.push({ type: EVENT_TYPES.REVIEW_RUN, headSha: payload.headSha, phase: 'completed', posted: payload.posted === true });
+      // An unpinned or degraded read names no head, so there is nothing to key a row on. That is a skipped write,
+      // not a quiet success: say so loudly, the same way a write miss does, so the undercount is never silent.
+      if (!payload.headSha) out(`ledger-write-skip: ${payload.repo}#${payload.pr} no pinned head, so no review-run row was recorded for this run (it will not count toward the visit cap); comments, labels and decisions are unaffected`);
+      const written = []; const missed = [];
+      for (const row of rows) {
+        try {
+          const res = appendVerdict(buildLedgerEvent({ ...base, ...row, at: new Date().toISOString() }));
+          if (res.ok && !res.ledgerWriteMiss) written.push(row.type); else missed.push(`${row.type}: ${(res.errors ?? []).join('; ') || 'git write miss'}`);
+        } catch (e) { missed.push(`${row.type}: ${String(e?.message ?? e).split('\n')[0]}`); }
+      }
+      if (missed.length) out(`ledger-write-miss: ${payload.repo}#${payload.pr} review events not fully recorded (${missed.join(' | ')}); comments, labels and decisions are unaffected`);
+      return { written, missed };
     },
 
     // ── 3. THE EVENT: the operator notice, rendered by `renderReviewNotice` in the declaration. ──────────────
