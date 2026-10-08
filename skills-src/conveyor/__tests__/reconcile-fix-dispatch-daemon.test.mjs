@@ -1189,3 +1189,16 @@ describe('runTickAllRepos — the await-verify verdict pass wiring (#5137)', () 
     expect(out.awaitVerify).toEqual({ rows: [] });
   });
 });
+
+// xn025gx — the push-on-green loop and the active-only fix slot are wired into the real tick and main().
+it('the tick runs the verdict pass through runTickAwaitVerify (legacy pass when every setting is off) and counts the fix cap with defaultSlotCountedFixClaims', () => {
+  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'reconcile-fix-dispatch-daemon.mjs'), 'utf8');
+  expect(src).toMatch(/runTickAwaitVerify\(\{ allowResume: !authGate\.paused, legacyPass: runAwaitVerifyPassDefault \}\)/);
+  expect(src).toMatch(/createDispatchThrottle\(\{ listClaims: \(\) => defaultSlotCountedFixClaims\(\) \}\)/);
+  // The lifecycle itself is tested behaviourally (superviseAwaitVerifyLoop, await-verify-loop.test.mjs); here only
+  // that main() starts it and that BOTH exits stop it, each at the top of its own function body.
+  expect(src).toMatch(/const awaitLoop = superviseAwaitVerifyLoop\(\);/);
+  expect(src).toMatch(/\n  awaitLoop\.start\(\);\n/);
+  expect(src).toMatch(/const shutdown = \(signal\) => \{\n    if \(stopping\) return;\n    stopping = true;\n    awaitLoop\.stop\(\);/);
+  expect(src).toMatch(/const restartOntoNewCode = \(\) => \{\n    stopping = true;\n    awaitLoop\.stop\(\);/);
+});

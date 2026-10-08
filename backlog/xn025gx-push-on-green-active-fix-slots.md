@@ -18,7 +18,7 @@ Fixer audit 2026-10-08: ~70% of fixer time idles until a fix-daemon tick (7-30 m
 - **R2 fix-slot-count** — parked sessions do not count; owed resumes do (resumes first); live total ≤ `parkedCapFactor` × cap.
 - **R3 resume-admission** — owed resumes wake oldest-first while working + woken < cap.
 - **R4 push-wake-cadence** — the fast loop runs the verdict pass every `awaitVerifyLoopSeconds`; the tick runs it only when the loop is off or not alive. The push decision stays `classifyAwaitVerdict` (exact verified sha).
-- **R5 release-on-completion** — a fix/ci-heal claim is released once its session's completion record says `done`, written after the claim, same session, no verify wait left.
+- **R5 release-on-completion** — a fix/ci-heal claim is released once its session's completion record says `done`, written after the claim and after the session's last wake-up, same session, no verify wait left.
 
 ## Settings (we:scripts/dispatch-settings.json `fixDispatch`; built-in = today = off)
 
@@ -27,7 +27,7 @@ Fixer audit 2026-10-08: ~70% of fixer time idles until a fix-daemon tick (7-30 m
 
 ## Done when
 
-1. **Executable** — `npm run test:unit -- we:scripts/conveyor/__tests__/fixer-slot-rules.test.mjs we:scripts/conveyor/__tests__/await-verify-loop.test.mjs` passes (replay fixtures from the 2026-10-08 audit).
+1. **Executable** — `npm run test:unit -- fixer-slot-rules await-verify-loop` passes (replay fixtures from the 2026-10-08 audit).
 2. **Live** — on the fix daemon, pushed rows log "pushed Ns after verify finished" under 2 min; finished sessions log "released completed claim" within one loop period; fewer `refused fix-cap` per tick.
 
 ## Edge cases this change must handle
@@ -35,7 +35,7 @@ Fixer audit 2026-10-08: ~70% of fixer time idles until a fix-daemon tick (7-30 m
 1. **Untrusted text** — the pass's own guards are unchanged (exact sha, `lane/*` ref, claim binding, open PR); the loop adds no push path.
 2. **Truncated reads** — an unreadable await store or claim list makes R2 fall back to the raw claim list (today's count); a missing heartbeat makes the tick run the cycle (R4 fallback).
 3. **Shared state files** — one cross-process cycle lock (dead holder reclaimed by pid) keeps the loop and the tick from acting on the same record at once.
-4. **Fail closed** — a wait older than its TTL counts as active (R1); R5 keeps the claim on any missing fact.
+4. **Fail closed** — a wait older than its TTL counts as active (R1); R5 keeps the claim when the status, the claim time or the record time is missing, and the R5 sweep is skipped when the wake journal cannot be read or updated.
 5. **Identity scoping** — wait records bind to claims by repo key + PR + kind + session name (or session id); R5 refuses a record from another session id.
 6. **State over time** — R5 ignores a completion record written before the claim (a previous round).
 7. **Who wrote it** — completion records keep their #4306 ownership rules; R5 only reads them.

@@ -49,7 +49,7 @@ describe('R2 fix-slot-count', () => {
     const states = ['active', 'active', 'parked', 'parked', 'parked', 'active', 'active'];
     expect(fixSlotCount({ states, cap: 6, parkedReleasesSlot: false })).toBe(7);
   });
-  it('on: parked sessions give their slot back, so the same tick admits 3 new fixes (4484, 4478, 4433 were refused)', () => {
+  it('on: parked sessions give their slot back, so the same tick admits 2 of the 3 refused fixes (4484, 4478, 4433); R5 frees the third', () => {
     const states = ['active', 'active', 'parked', 'parked', 'parked', 'active', 'active'];
     const n = fixSlotCount({ states, cap: 6, parkedReleasesSlot: true, parkedCapFactor: 2 });
     expect(n).toBe(4);
@@ -107,6 +107,9 @@ describe('R5 release-on-completion — the audit\'s finished-but-holding session
     ['a previous round\'s record', { completion: done('2026-10-08T19:10:00Z') }, 'record-older-than-claim'],
     ['another session wrote it', { claim: { ...claim, sessionId: 's-other' }, completion: done('2026-10-08T19:43:00Z') }, 'other-session'],
     ['still parked on verify', { completion: done('2026-10-08T19:43:00Z'), awaitingVerify: true }, 'still-awaiting-verify'],
+    ['claim time unknown', { claim: { claimedAtMs: NaN, sessionId: null } }, 'unknown-times'],
+    ['record time unknown', { completion: { ...done('2026-10-08T19:43:00Z'), updatedAtMs: NaN } }, 'unknown-times'],
+    ['woken (e.g. to repair a red) after it reported done', { lastWokenAtMs: Date.parse('2026-10-08T19:50:00Z') }, 'record-older-than-last-wake'],
   ])('%s → keep (%s)', (_n, over, reason) => {
     const facts = { enabled: true, claim, completion: done('2026-10-08T19:43:00Z'), awaitingVerify: false, ...over };
     expect(releaseOnCompletion(facts)).toEqual({ release: false, reason });

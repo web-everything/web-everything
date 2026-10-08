@@ -30,6 +30,8 @@ import { resolveFixDispatchMaxConcurrent, isPidAlive } from '../lib/dispatch-thr
 import { reserve, releaseLockDirIf, readLockEntry } from '../readiness/file-locks.mjs';
 import { listStoredAwaitVerify, resolveAwaitVerifyTtlMs } from './await-verify.mjs';
 import { listFixDispatchClaims, fixDispatchSessionName, fixDispatchResource, fixDispatchClaimRoot } from './fix-claim-store.mjs';
+import { releaseFixDispatchClaim } from './fix-dispatch-claim.mjs';
+import { tryReadCompletion } from '../operations/completion-store.mjs';
 import {
   resolveFixerSlotSettings, fixSlotState, slotCountedItems, admitResumes, awaitPassRunner, releaseOnCompletion,
 } from './fixer-slot-rules.mjs';
@@ -74,13 +76,15 @@ export function slotCountedFixClaims(claims, { records, settings, cap, nowMs, tt
 }
 
 /** The real reader for the daemon's throttle: live claims + the await store, counted by R2. Fails open to the raw list. */
-export function defaultSlotCountedFixClaims({ env = process.env, nowMs = Date.now() } = {}) {
-  const claims = listFixDispatchClaims(undefined, { liveOnly: true });
+export function defaultSlotCountedFixClaims({
+  env = process.env, nowMs = Date.now(), listClaims = () => listFixDispatchClaims(undefined, { liveOnly: true }), readRecords = () => listStoredAwaitVerify(),
+} = {}) {
+  const claims = listClaims();
   try {
     const settings = resolveFixerSlotSettings({ env });
     if (!settings.parkedReleasesSlot) return claims;
     return slotCountedFixClaims(claims, {
-      records: listStoredAwaitVerify(), settings, cap: resolveFixDispatchMaxConcurrent({ env }), nowMs, ttlMs: resolveAwaitVerifyTtlMs(env),
+      records: readRecords(), settings, cap: resolveFixDispatchMaxConcurrent({ env }), nowMs, ttlMs: resolveAwaitVerifyTtlMs(env),
     });
   } catch { return claims; }
 }
@@ -107,15 +111,16 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   const b = wake.length
     ? await runPass({ io: { ...io, listRecords: () => io.listRecords().filter((e) => wakeKeys.has(e.key)), listSalvage: undefined }, allowResume: true, nowMs, ttlMs })
     : { rows: [] };
+  // Phase A answers `resume-paused` (allowResume:false) for every record it would have woken; that word is not shown.
+  // A record pushed in phase A keeps its push row, with the phase-B wake (or the deferral) appended to its result.
+  const pushedA = (r) => (r.result && r.result !== 'resume-paused' ? `${r.result}; ` : '');
   const rows = (a.rows ?? []).filter((r) => !wakeKeys.has(r.key) && !deferred.has(r.key));
   for (const r of a.rows ?? []) {
-    if (!deferred.has(r.key)) continue;
-    rows.push({ ...r, action: 'resume', reason: 'fix-slot-full', result: `${r.result && r.result !== 'resume-paused' ? `${r.result}; ` : ''}resume-deferred (fix slot full, ${activeCount} working ≥ cap ${cap})` });
+    if (deferred.has(r.key)) rows.push({ ...r, action: 'resume', reason: 'fix-slot-full', result: `${pushedA(r)}resume-deferred (fix slot full, ${activeCount} working ≥ cap ${cap})` });
   }
-  // A record pushed in phase A and woken in phase B: one row, both results.
   for (const r of b.rows ?? []) {
-    const before = (a.rows ?? []).find((x) => x.key === r.key && x.result && x.result !== 'resume-paused');
-    rows.push(before ? { ...r, action: before.action, reason: before.reason, result: `${before.result.replace(/; ?resume-paused$/, '')}; ${r.result}` } : r);
+    const before = (a.rows ?? []).find((x) => x.key === r.key && pushedA(x));
+    rows.push(before ? { ...r, action: before.action, reason: before.reason, result: `${pushedA(before)}${r.result}` } : r);
   }
   return { rows, admitted: admit, deferred: defer };
 }
@@ -124,7 +129,7 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
  * R5 sweep: release every fix/ci-heal claim whose session's completion record says done. Owner- and claimedAt-checked
  * against a fresh read, so a claim re-taken meanwhile is never released.
  */
-export function runCompletionReleaseSweep({ claims, records, readCompletion, release, readClaim, enabled = true }) {
+export function runCompletionReleaseSweep({ claims, records, readCompletion, release, readClaim, woken = {}, enabled = true }) {
   const rows = [];
   for (const c of Array.isArray(claims) ? claims : []) {
     const m = c?.meta ?? {};
@@ -138,6 +143,7 @@ export function runCompletionReleaseSweep({ claims, records, readCompletion, rel
       claim: { claimedAtMs: ms(m.claimedAt), sessionId: m.sessionId ?? null },
       completion: rec ? { status: rec.status, updatedAtMs: ms(rec.updatedAt), sessionId: rec.sessionId ?? null } : null,
       awaitingVerify: Boolean(waitRecordForClaim(c, records)),
+      lastWokenAtMs: Number.isFinite(ms(woken?.[session])) ? ms(woken[session]) : null,
     });
     if (!d.release) continue;
     const cur = readClaim(m);
@@ -147,6 +153,67 @@ export function runCompletionReleaseSweep({ claims, records, readCompletion, rel
   }
   return rows;
 }
+
+/**
+ * The wake journal R5 reads: session name → the latest time the session was parked or woken. A woken record is cleared
+ * from the await store, so without this a `done` written before a red wake would look final.
+ * Two stamps, so a crash between the wake and the journal write loses nothing: BEFORE the pass, every parked session
+ * is stamped with its wait's `requestedAt` (any wake comes after it, and a done from before parking is then too old);
+ * AFTER the pass, every woken session is stamped with the wake time. Entries older than a day drop. Pure.
+ * @param {object} prev  the journal now
+ * @param {{rows?:object[]|null, recordsByKey:Map<string,object>, nowMs:number}} o  `rows` absent = the pre-pass stamp
+ */
+export function nextWokenJournal(prev, { rows = null, recordsByKey, nowMs }) {
+  const out = {};
+  const later = (who, iso) => { if (who && Number.isFinite(ms(iso)) && !(ms(out[who]) >= ms(iso))) out[who] = iso; };
+  for (const [who, at] of Object.entries(prev && typeof prev === 'object' ? prev : {})) if (nowMs - ms(at) < 24 * 3_600_000) out[who] = at;
+  if (!rows) {
+    for (const record of recordsByKey?.values() ?? []) later(record?.who, record?.requestedAt);
+    return out;
+  }
+  for (const r of rows) {
+    if (/(^|; )resumed:/.test(String(r.result ?? ''))) later(recordsByKey?.get(r.key)?.who, new Date(nowMs).toISOString());
+  }
+  return out;
+}
+
+/**
+ * Keep the loop child running for the daemon (R4): start it, restart it at most once per `minGapMs` if it dies, never
+ * restart one that exited 0 on purpose (setting turned off), and stop it by its own PID. Spawn errors are logged,
+ * never thrown (an unhandled child 'error' event would crash the daemon).
+ */
+export function superviseAwaitVerifyLoop({ spawnLoop = () => spawnAwaitVerifyLoop(), log = console, setTimer = setTimeout, now = Date.now, minGapMs = 60_000 } = {}) {
+  let child = null;
+  let stopped = false;
+  let lastStart = 0;
+  const start = () => {
+    if (stopped) return null;
+    lastStart = now();
+    try { child = spawnLoop(); } catch (e) { child = null; log.error(`reconcile-fix-dispatch-daemon: await-verify loop spawn failed: ${String(e?.message ?? e)}`); }
+    const mine = child;
+    mine?.on?.('error', (e) => log.error(`reconcile-fix-dispatch-daemon: await-verify loop error: ${String(e?.message ?? e)}`));
+    mine?.on?.('exit', (code) => {
+      if (child === mine) child = null;
+      if (stopped || code === 0) return;
+      log.error(`reconcile-fix-dispatch-daemon: await-verify loop exited (${code}); the tick runs the pass until it is back`);
+      const t = setTimer(start, Math.max(0, minGapMs - (now() - lastStart)));
+      t?.unref?.();
+    });
+    return mine;
+  };
+  const stop = () => { stopped = true; try { child?.kill?.('SIGTERM'); } catch { /* already gone */ } };
+  return { start, stop, current: () => child };
+}
+export const wokenJournalPath = (env = process.env) => join(resolveCoordinationRoot({ env }), 'await-verify-woken.json');
+/** `{}` when the file does not exist yet, null when it exists but cannot be read or parsed. */
+const readJson = (path) => {
+  try { const v = JSON.parse(readFileSync(path, 'utf8')); return v && typeof v === 'object' ? v : null; } catch (e) { return e?.code === 'ENOENT' ? {} : null; }
+};
+const writeJsonAtomic = (path, value) => {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(`${path}.${process.pid}.tmp`, `${JSON.stringify(value)}\n`);
+  renameSync(`${path}.${process.pid}.tmp`, path);
+};
 
 /** How recent a claim's heartbeat must be to count as a working session in the loop (> the longest tick gap seen, 30 min). */
 export const WORKING_CLAIM_WINDOW_MINUTES = 60;
@@ -169,10 +236,12 @@ export async function withCycleLock(fn, { env = process.env, pid = process.pid, 
 }
 
 /** The real cycle: verdict pass (R3-gated) + completion release (R5), under the lock. Never throws. */
-export async function runAwaitVerifyCycleDefault({ allowResume, env = process.env, settings = resolveFixerSlotSettings({ env }) } = {}) {
+export async function runAwaitVerifyCycleDefault({
+  allowResume, env = process.env, settings = resolveFixerSlotSettings({ env }), passModule = null,
+} = {}) {
   try {
     const out = await withCycleLock(async () => {
-      const pass = await import('./await-verify-pass.mjs');
+      const pass = passModule ?? await import('./await-verify-pass.mjs');
       const nowMs = Date.now();
       const ttlMs = resolveAwaitVerifyTtlMs(env);
       // The claim TTL (10 min) is refreshed only once per fix tick, and ticks run 7–30 min apart, so between ticks a working
@@ -188,24 +257,32 @@ export async function runAwaitVerifyCycleDefault({ allowResume, env = process.en
         }
       }
       const io = await pass.defaultAwaitVerifyIo();
-      const lanesByKey = new Map(io.listRecords().map(({ key, record }) => [key, record?.lane]));
+      const recordsByKey = new Map(io.listRecords().map(({ key, record }) => [key, record]));
+      // R5 needs the wake times: an unreadable journal, or one this cycle could not update, skips the release sweep
+      // (fail closed — the claim then waits for the tick's own settled-claim sweep, as today).
+      const journalPath = wokenJournalPath(env);
+      const prevWoken = readJson(journalPath);
+      let journalOk = prevWoken !== null;
+      const stamped = nextWokenJournal(prevWoken ?? {}, { recordsByKey, nowMs });
+      if (journalOk && JSON.stringify(stamped) !== JSON.stringify(prevWoken)) { try { writeJsonAtomic(journalPath, stamped); } catch { journalOk = false; } }
       const verdicts = await runSlotAwareAwaitPass({
         io, runPass: pass.runAwaitVerifyPass, allowResume: resumeOk, settings, claims, nowMs, ttlMs, cap: resolveFixDispatchMaxConcurrent({ env }),
       });
+      const woken = nextWokenJournal(stamped, { rows: verdicts.rows, recordsByKey, nowMs: Date.now() });
+      if (journalOk && JSON.stringify(woken) !== JSON.stringify(stamped)) { try { writeJsonAtomic(journalPath, woken); } catch { journalOk = false; } }
       let released = [];
-      if (settings.releaseOnCompletion) {
-        const [{ tryReadCompletion }, { releaseFixDispatchClaim }, { readLockEntry: readEntry }] = await Promise.all([
-          import('../operations/completion-store.mjs'), import('./fix-dispatch-claim.mjs'), import('../readiness/file-locks.mjs'),
-        ]);
+      if (settings.releaseOnCompletion && journalOk) {
         released = runCompletionReleaseSweep({
           claims: listFixDispatchClaims(undefined, { liveOnly: true, leaseMinutes: 24 * 60 }), records: listStoredAwaitVerify(), readCompletion: tryReadCompletion,
-          release: releaseFixDispatchClaim, readClaim: (m) => readEntry(fixDispatchClaimRoot(), fixDispatchResource({ repo: m.repo, pr: m.pr, kind: m.kind })),
+          release: releaseFixDispatchClaim, woken,
+          readClaim: (m) => readLockEntry(fixDispatchClaimRoot(), fixDispatchResource({ repo: m.repo, pr: m.pr, kind: m.kind })),
         });
       }
       const finished = new Map();
       for (const r of verdicts.rows ?? []) {
-        if (!/pushed/.test(String(r.result ?? '')) || !lanesByKey.get(r.key)) continue;
-        try { finished.set(r.key, io.readMarker(lanesByKey.get(r.key))?.finishedAt ?? null); } catch { /* lag is diagnostics only */ }
+        const lane = recordsByKey.get(r.key)?.lane;
+        if (!/pushed/.test(String(r.result ?? '')) || !lane) continue;
+        try { finished.set(r.key, io.readMarker(lane)?.finishedAt ?? null); } catch { /* lag is diagnostics only */ }
       }
       return { ...verdicts, rows: annotatePushLag(verdicts.rows, finished, Date.now()), released };
     }, { env });
@@ -263,6 +340,9 @@ export function spawnAwaitVerifyLoop({ env = process.env, spawnFn = nodeSpawn, p
   return spawnFn(process.execPath, [SELF, `--parent-pid=${parentPid}`], { stdio: ['ignore', 'inherit', 'inherit'], env });
 }
 
+/** A cycle that threw before doing anything (the one top-level error row). Pure. */
+export const cycleFailed = (result) => Boolean(result?.busy) || (result?.rows ?? []).some((r) => r?.action === 'error' && r.key === undefined);
+
 const stamp = (line) => `${new Date().toISOString()} reconcile-fix-dispatch-daemon: ${line}\n`;
 
 async function main(argv = process.argv.slice(2)) {
@@ -278,14 +358,13 @@ async function main(argv = process.argv.slice(2)) {
     seconds = settings.awaitVerifyLoopSeconds;
     if (!(seconds > 0)) { write('await-verify-loop: setting off — exiting'); return; }
     if (Number.isInteger(parentPid) && parentPid > 0 && !isPidAlive(parentPid)) { write('await-verify-loop: parent gone — exiting'); return; }
-    try {
-      const path = loopHeartbeatPath();
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(`${path}.tmp`, `${JSON.stringify({ pid: process.pid, parentPid, at: new Date().toISOString(), seconds })}\n`);
-      renameSync(`${path}.tmp`, path);
-    } catch { /* a missing heartbeat only makes the tick run the cycle too (R4 fallback), under the same lock */ }
     const t0 = Date.now();
     const result = await runAwaitVerifyCycleDefault({ settings });
+    // The heartbeat says "a cycle completed", not just "the process is up": a cycle that fails, or cannot get the cycle
+    // lock, every time lets it go stale, and the tick then runs the pass itself (R4 fallback).
+    if (!cycleFailed(result)) {
+      try { writeJsonAtomic(loopHeartbeatPath(), { pid: process.pid, parentPid, at: new Date().toISOString(), seconds }); } catch { /* stale → tick fallback */ }
+    }
     const lines = formatAwaitVerifyLines(result).filter((l) => !/awaiting a verdict$/.test(l));
     const deferredLines = lines.filter((l) => l.includes('resume-deferred'));
     const key = deferredLines.join('\n');

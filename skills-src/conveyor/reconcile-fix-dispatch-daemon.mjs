@@ -56,7 +56,7 @@ import {
 import { runReconcileFixDispatch } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
 import { runAwaitVerifyPassDefault, formatAwaitVerifyLines } from '../../scripts/conveyor/await-verify-pass.mjs';
 // xn025gx (fixer proposal A1 + A2 part 1, rulings P1/P2) — the fast push-on-green loop and the active-only fix slot.
-import { runTickAwaitVerify, defaultSlotCountedFixClaims, spawnAwaitVerifyLoop, formatReleaseLines } from '../../scripts/conveyor/await-verify-loop.mjs';
+import { runTickAwaitVerify, defaultSlotCountedFixClaims, superviseAwaitVerifyLoop, formatReleaseLines } from '../../scripts/conveyor/await-verify-loop.mjs';
 import { runFixerStuckReclaimPass, formatFixerStuckReclaimLines } from '../../scripts/conveyor/fixer-stuck-reclaim.mjs'; // card xccgzu5
 import { runReconcileCiHealDispatch } from '../../scripts/operations/ci-heal-pr-dispatch.mjs';
 import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
@@ -632,7 +632,7 @@ export async function runTickAllRepos({
   // #5137 — FIRST, before any fresh dispatch: a fixer that ended its turn awaiting a verdict is pushed (green,
   // exact sha) or resumed (red) here, so the model never holds a turn open on `check --wait`. Pushing needs no
   // Claude login; resuming does, so a paused login only defers the resume (the record keeps it pending).
-  // xn025gx (R4 push-wake-cadence): with every fixerSlot setting off this is exactly the pass above; with the fast loop
+  // xn025gx (R4 push-wake-cadence): with all four fixDispatch push-on-green settings off this is exactly the pass above; with the fast loop
   // alive the loop owns the pass and this tick skips it; otherwise the tick runs the same R3/R5 cycle under the cycle lock.
   const awaitVerify = awaitVerifyTick ? await awaitVerifyTick({ allowResume: !authGate.paused })
     : (realTick ? await runTickAwaitVerify({ allowResume: !authGate.paused, legacyPass: runAwaitVerifyPassDefault }) : { rows: [] });
@@ -984,26 +984,13 @@ async function main() {
   }
   let stopping = false;
   // xn025gx (R4) — the fast push-on-green loop runs as this daemon's own child (the tick blocks the event loop for
-  // minutes, so a timer here would starve). It exits on its own when this process is gone; it is respawned (at most
-  // once a minute) if it dies; it is stopped by PID — ours — on shutdown/restart. Setting off → never spawned.
-  let awaitLoop = null;
-  let lastLoopSpawn = 0;
-  const startAwaitLoop = () => {
-    if (stopping) return;
-    lastLoopSpawn = Date.now();
-    try { awaitLoop = spawnAwaitVerifyLoop(); } catch (e) { awaitLoop = null; console.error(`reconcile-fix-dispatch-daemon: await-verify loop spawn failed: ${String(e?.message ?? e)}`); }
-    awaitLoop?.on('exit', (code) => {
-      awaitLoop = null;
-      if (stopping) return;
-      console.error(`reconcile-fix-dispatch-daemon: await-verify loop exited (${code}); the tick runs the pass until it is back`);
-      setTimeout(startAwaitLoop, Math.max(0, 60_000 - (Date.now() - lastLoopSpawn))).unref();
-    });
-  };
-  const stopAwaitLoop = () => { try { awaitLoop?.kill('SIGTERM'); } catch { /* already gone */ } };
+  // minutes, so a timer here would starve). It exits on its own when this process is gone; the supervisor restarts it
+  // (at most once a minute) if it dies, and stops it by PID — ours — on shutdown/restart. Setting off → never spawned.
+  const awaitLoop = superviseAwaitVerifyLoop();
   const shutdown = (signal) => {
     if (stopping) return;
     stopping = true;
-    stopAwaitLoop();
+    awaitLoop.stop();
     console.error(`reconcile-fix-dispatch-daemon: ${signal} — releasing the lease and exiting.`);
     releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY });
     process.exit(0);
@@ -1016,11 +1003,11 @@ async function main() {
   const selfRoot = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
   const restartOntoNewCode = () => {
     stopping = true;
-    stopAwaitLoop();
+    awaitLoop.stop();
     releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY });
     process.exit(0);
   };
-  startAwaitLoop();
+  awaitLoop.start();
   // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged) — see we:scripts/lib/pr-events.mjs.
   const { stoppedReason } = await runDaemonLoop(
     withPrEvents(withSelfSync(withGithubAppAuth(withFixDispatchClaimRefresh(buildCliDaemonEffects({ owner })), FIX_DISPATCH_APP_AUTH_OPTS), {

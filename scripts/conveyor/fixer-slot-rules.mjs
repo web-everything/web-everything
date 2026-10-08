@@ -1,9 +1,9 @@
 /**
  * @file scripts/conveyor/fixer-slot-rules.mjs
  * @description The fixer slot and push-on-green RULES, as pure decisions over plain facts (we:backlog/xn025gx, slice 2 of the
- *   approved fixer proposal, operator rulings P1/P2 of 2026-10-08). Written to move into the delivery standard as-is: no
- *   GitHub, label, process or file detail appears here. The loop and every read/write live in the core implementation
- *   around them (we:scripts/conveyor/await-verify-loop.mjs, we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs).
+ *   approved fixer proposal, operator rulings P1/P2 of 2026-10-08). Written to move into the delivery standard as-is: the
+ *   rule functions take plain facts and hold no GitHub, label, process or file detail. Only the settings resolver reads
+ *   the declared settings file. The loop and every other read/write live in the core implementation around them (we:scripts/conveyor/await-verify-loop.mjs, we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs).
  *
  * THE RULES
  *   R1 fix-slot-state      — what one fix session is, for the slot count: `active` | `parked` | `resume-owed`.
@@ -150,20 +150,23 @@ export function awaitPassRunner({ loopSeconds, loopHeartbeatAtMs, nowMs }) {
 
 /**
  * R5 release-on-completion. Facts: the claim (when taken, which session if known), the session's completion record, and
- * whether the session still has a recorded verify wait.
+ * whether the session still has a recorded verify wait, and when the harness last woke it.
  * Released only when ALL hold: the setting is on; the record says `done`; it was written at or after the claim was
- * taken (an older round's record never releases a new claim); the session ids agree when both are known; and no
- * verify wait is still recorded (the session may yet be woken).
+ * taken (an older round's record never releases a new claim) AND at or after the session's last wake-up (a session
+ * woken to repair a red is working again, whatever it reported before); the session ids agree when both are known;
+ * and no verify wait is still recorded (the session may yet be woken).
  * @param {{enabled:boolean, claim:{claimedAtMs:number, sessionId:string|null},
- *   completion:null|{status:string, updatedAtMs:number, sessionId:string|null}, awaitingVerify:boolean}} facts
+ *   completion:null|{status:string, updatedAtMs:number, sessionId:string|null}, awaitingVerify:boolean,
+ *   lastWokenAtMs?:number|null}} facts
  * @returns {{release:boolean, reason:string}}
  */
-export function releaseOnCompletion({ enabled, claim, completion, awaitingVerify }) {
+export function releaseOnCompletion({ enabled, claim, completion, awaitingVerify, lastWokenAtMs = null }) {
   if (!enabled) return { release: false, reason: 'off' };
   if (!completion) return { release: false, reason: 'no-completion-record' };
   if (completion.status !== 'done') return { release: false, reason: `completion-${completion.status ?? 'unknown'}` };
   if (!Number.isFinite(claim?.claimedAtMs) || !Number.isFinite(completion.updatedAtMs)) return { release: false, reason: 'unknown-times' };
   if (completion.updatedAtMs < claim.claimedAtMs) return { release: false, reason: 'record-older-than-claim' };
+  if (Number.isFinite(lastWokenAtMs) && completion.updatedAtMs < lastWokenAtMs) return { release: false, reason: 'record-older-than-last-wake' };
   if (claim.sessionId && completion.sessionId && claim.sessionId !== completion.sessionId) return { release: false, reason: 'other-session' };
   if (awaitingVerify) return { release: false, reason: 'still-awaiting-verify' };
   return { release: true, reason: 'completion-done' };
