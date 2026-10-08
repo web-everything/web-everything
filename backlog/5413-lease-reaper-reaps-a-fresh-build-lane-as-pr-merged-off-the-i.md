@@ -2,9 +2,10 @@
 bornAs: xp4r23a
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/lease-reaper.mjs", "we:scripts/lane-pool.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-08"
 tags: []
 ---
 
