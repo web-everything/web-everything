@@ -47,7 +47,7 @@ import { newRunRecord } from './operations/run-record.mjs';
 import { newRunId, writeRun } from './operations/run-store.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 
-const DEFAULT_REPO = 'web-everything/web-everything';
+export const DEFAULT_REPO = 'web-everything/web-everything';
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
 
 /**

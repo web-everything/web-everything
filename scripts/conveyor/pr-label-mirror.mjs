@@ -12,10 +12,9 @@
  * Usage: node scripts/conveyor/pr-label-mirror.mjs [--repo=<owner/name>] [--limit=<n>] [--json]
  */
 import { pathToFileURL } from 'node:url';
-import { readOpenPrs, readRepoEvents, buildDerivedRows } from '../review-ledger-check.mjs';
+import { DEFAULT_REPO, readOpenPrs, readRepoEvents, buildDerivedRows } from '../review-ledger-check.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 
-const DEFAULT_REPO = 'web-everything/web-everything';
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
 
 /**
