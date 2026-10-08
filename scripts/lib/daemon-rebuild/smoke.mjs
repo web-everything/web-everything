@@ -10,6 +10,7 @@ import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
+import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -88,6 +89,65 @@ export function failsSameChecks(candidateFailed, controlFailed) {
   return Array.isArray(candidateFailed) && candidateFailed.length > 0 && candidateFailed.every((r) => c.has(r.name));
 }
 
+// ── xhiqxz3 — the real DISPATCH SMOKE inside the rebuild ─────────────────────────────────────────────────────
+// #4481 (xkhtg2a) made `daemon-load-overlay` launch ONE real worker when an overlay touches a dispatch-path file.
+// But the daemon's own tick rebuild could adopt that overlay first and run it for minutes before any load smoked
+// it (incident 2026-10-08, `lane/worker-contract-s3b`: every worker hit an approval prompt and died at step 0,
+// while the live smoke — dispatch DRY-RUNS only — passed). So the candidate smoke here runs that same real worker
+// launch (`runRealDispatchSmoke`, same `overlaySafety` settings) whenever the candidate carries an overlay that is
+// NEW or MOVED since the adopted build and changes a dispatch-path file. A failure is never adopted: the clone
+// stays on its last-good build. A definite failure (commands denied, no command ran, launch threw) also drops just
+// the offending overlay(s), so the next tick builds main + every other overlay; a timeout keeps them and retries
+// with backoff (it may be the environment, not the code).
+
+/** Dispatch-smoke failures that prove the overlay's launch path is broken (vs a timeout, which may be env). */
+const DISPATCH_SMOKE_DEFINITE = new Set(['commands-denied', 'no-commands-ran', 'launch-failed']);
+
+/**
+ * PURE given `git`: the overlays in `applied` that need the real dispatch smoke — every one NOT already in the
+ * adopted build at the same sha (`adoptedApplied: null` = unknown ⇒ every overlay counts) whose own diff against
+ * main touches `patterns`. Fails CLOSED: an overlay whose diff cannot be read is a suspect (`diff-unknown`).
+ * @returns {Array<{ref:string, pr:number|null, sha:string, matched:string[], reason:string}>}
+ */
+export function dispatchSmokeSuspects({
+  git, applied, adoptedApplied, patterns, match,
+}) {
+  const known = Array.isArray(adoptedApplied) ? new Map(adoptedApplied.map((a) => [a?.ref, a?.sha])) : null;
+  const out = [];
+  for (const ap of applied || []) {
+    if (!ap?.ref || (known && ap.sha && known.get(ap.ref) === ap.sha)) continue;
+    const suspect = { ref: ap.ref, pr: ap.pr ?? null, sha: ap.sha };
+    const baseRes = ap.sha ? git(['merge-base', 'origin/main', ap.sha]) : { status: 1 };
+    const base = baseRes.status === 0 ? String(baseRes.stdout ?? '').trim() : '';
+    const diff = base ? git(['diff', '--name-only', base, ap.sha]) : null;
+    if (!diff || diff.status !== 0) {
+      out.push({ ...suspect, matched: [], reason: 'diff-unknown' });
+      continue;
+    }
+    const files = String(diff.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean);
+    const matched = match(files, patterns);
+    if (matched.length) out.push({ ...suspect, matched, reason: 'touches-dispatch-path' });
+  }
+  return out;
+}
+
+/** Resolve the dispatch-smoke wiring: injected pieces win; the rest come from #4481's module (loaded lazily —
+ *  it imports the rebuild, so a static import here would be a cycle). */
+async function resolveDispatchSmoke(opt, env) {
+  let mod = null;
+  let loadError = null;
+  if (!opt?.settings || !opt?.run || !opt?.match) {
+    try { mod = await import('../daemon-load-overlay.mjs'); } catch (e) { loadError = e; }
+  }
+  const settings = opt?.settings ?? mod?.overlaySafetySettings?.(env) ?? null;
+  const run = opt?.run ?? mod?.runRealDispatchSmoke ?? null;
+  const match = opt?.match ?? mod?.matchDispatchPaths ?? null;
+  return {
+    on: !!(settings && run && match) && settings.dispatchSmoke === 'on',
+    settings, run, match, unavailable: !(settings && run && match) ? String(loadError?.message || 'dispatch smoke module incomplete') : null,
+  };
+}
+
 /**
  * Phase 2 body (x5wbsbc — the operator's fallback ruling, 2026-09-26: "fallback on last working version rather
  * than block delivery"). Smokes candidate A = `plan` (main + overlays). On a pass: adopt (phase 3), as before.
@@ -110,7 +170,7 @@ export function failsSameChecks(candidateFailed, controlFailed) {
  */
 export async function smokeAndAdopt({
   root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-  finalLockOpts, finalizeLockOpts = finalLockOpts,
+  finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke,
 }) {
   /** Every state write here happens UNDER the write lock (PR #2731 review: an unlocked write could clobber a
    *  sibling's locked one). `release` also drops our build lease — done by the outcome that ENDS this build,
@@ -140,7 +200,42 @@ export async function smokeAndAdopt({
   };
   const git = makeGit({ run, cwd: root, env });
   const smokeEnv = candidateSmokeEnv({ root, env });
-  const adoptedHead = readRebuildState(root, stEnv).adopted?.head ?? null;
+  const adoptedState = readRebuildState(root, stEnv).adopted ?? null;
+  const adoptedHead = adoptedState?.head ?? null;
+
+  // xhiqxz3 — which overlays of a build need the real dispatch smoke (none when the setting is off).
+  const dsm = await resolveDispatchSmoke(dispatchSmoke, env);
+  if (dsm.unavailable) alert('dispatch-smoke-unavailable', { error: dsm.unavailable });
+  const adoptedApplied = adoptedHead && adoptedHead === prevHead && Array.isArray(adoptedState?.applied) ? adoptedState.applied : null;
+  const suspectsFor = (applied) => (dsm.on ? dispatchSmokeSuspects({
+    git, applied, adoptedApplied, patterns: dsm.settings.dispatchPaths, match: dsm.match,
+  }) : []);
+  /** Launch the one real worker from the candidate worktree at `path`. Never throws. */
+  const runDispatch = async (path, suspects) => {
+    let result;
+    try {
+      result = await dsm.run({
+        tree: path, env: smokeEnv, settings: dsm.settings, log,
+      });
+    } catch (e) {
+      result = { ok: false, reason: 'launch-failed', detail: String(e?.message || e) };
+    }
+    return { suspects, result: result || { ok: false, reason: 'launch-failed', detail: 'no result' } };
+  };
+  /** The dispatch smoke on its own (a proven tree, or the adopt-as-no-worse path): materialize, launch, tear down. */
+  const dispatchOnly = async (sha, suspects) => {
+    const candidate = materializeCandidate({
+      root, sha, run, env, path: lease.path,
+    });
+    if (!candidate.ok) return { suspects, result: { ok: false, reason: 'candidate-worktree-failed', detail: candidate.reason } };
+    try {
+      return await runDispatch(candidate.path, suspects);
+    } finally {
+      removeCandidate({
+        root, path: candidate.path, run, env,
+      });
+    }
+  };
 
   // #4044: the files changed since the LAST LIVE-VERIFIED build (HEAD before this move, when it is the adopted
   // one) — lets the smoke skip a tree-code check whose code none of them touch (see daemon-live-smoke.mjs
@@ -160,7 +255,7 @@ export async function smokeAndAdopt({
   };
 
   /** Materialize `sha` as the candidate worktree, smoke it, tear it down. */
-  const smokeSha = async (sha, changedFiles, label) => {
+  const smokeSha = async (sha, changedFiles, label, suspects = []) => {
     // Every smoke of this build (A, then B / C) reuses the lease's own unique path, one after another.
     const candidate = materializeCandidate({
       root, sha, run, env, path: lease.path,
@@ -168,12 +263,15 @@ export async function smokeAndAdopt({
     if (!candidate.ok) return { worktreeFailed: candidate.reason };
     let smokeResult = null;
     let threw = null;
+    let dispatch = null;
     const t0 = now();
     try {
       smokeResult = await runSmoke({ root: candidate.path, env: smokeEnv, changedFiles });
     } catch (e) {
       threw = e;
     }
+    // xhiqxz3 — only after the ordinary smoke passed (a failing build is not adopted anyway).
+    if (!threw && smokeResult?.verdict === 'pass' && suspects.length) dispatch = await runDispatch(candidate.path, suspects);
     const ms = now() - t0;
     removeCandidate({
       root, path: candidate.path, run, env,
@@ -185,7 +283,7 @@ export async function smokeAndAdopt({
         checks: (smokeResult?.smoke?.results || []).map((r) => `${r.name}:${r.skipped ? 'skipped' : `${r.ms}ms`}`).join(' '),
       });
     }
-    if (!threw && smokeResult?.verdict === 'pass' && changedFiles === null
+    if (!threw && smokeResult?.verdict === 'pass' && changedFiles === null && (!dispatch || dispatch.result.ok)
       && !smokeResult.cached && !busyPoolSkippedChecks(smokeResult).length && label !== 'confirm') {
       const identity = smokePassIdentity(git, sha);
       if (identity) await locked((st) => {
@@ -193,7 +291,56 @@ export async function smokeAndAdopt({
         st.smokePassed = [{ ...identity, passedAt: nowIso() }, ...prior.filter((entry) => entry?.key !== identity.key)].slice(0, 5);
       });
     }
-    return { smokeResult, threw, ms };
+    return {
+      smokeResult, threw, ms, dispatch,
+    };
+  };
+
+  /** xhiqxz3 — a passed dispatch smoke: say so (the proof line the live daemon's log carries). */
+  const dispatchPassedAlert = (d) => alert('dispatch-smoke-passed', {
+    suspects: d.suspects.map((s) => ({ ref: s.ref, pr: s.pr, matched: s.matched })),
+    ms: d.result.ms ?? null, sessionId: d.result.sessionId ?? null,
+  });
+  /** xhiqxz3 — a FAILED dispatch smoke: never adopt; hold on last-good. A definite failure drops just the suspect
+   *  overlay(s) (the next tick builds main + every other overlay); a timeout/unknown keeps them and backs off. */
+  const dispatchFailed = async (d) => {
+    const { result, suspects } = d;
+    const definite = DISPATCH_SMOKE_DEFINITE.has(result.reason);
+    const why = `dispatch-smoke-failed: ${result.reason}${result.detail ? ` — ${result.detail}` : ''}`;
+    alert('dispatch-smoke-failed', {
+      reason: result.reason, detail: redactDetail(result.detail ?? ''),
+      suspects: suspects.map((s) => ({ ref: s.ref, pr: s.pr, matched: s.matched })),
+      evidence: result.scratch ?? null, transcript: result.transcript ?? null,
+      action: definite ? 'dropped-suspects' : 'retry-with-backoff',
+      message: 'the candidate failed the REAL dispatch smoke — not adopting it; staying on the last working build (xhiqxz3)',
+    });
+    await hold('dispatch-smoke-failed', [{ name: 'dispatch-smoke', detail: why }], {}, (st) => {
+      const prev = st.rejected?.dispatchSmoke && st.rejected?.inputsKey === plan.inputsKey ? st.rejected : null;
+      st.rejected = {
+        inputsKey: plan.inputsKey, reason: 'dispatch-smoke', at: nowIso(), dispatchSmoke: true,
+      };
+      if (!definite) {
+        const attempts = (prev?.attempts || 0) + 1;
+        Object.assign(st.rejected, { attempts, retryAt: new Date(now() + rejectRetryDelayMs(env, attempts)).toISOString() });
+      }
+    });
+    if (definite && !mainOnly) {
+      for (const s of suspects) {
+        try {
+          removeOverlay(root, s.ref, { env, why });
+          appendOverlayEvent(root, {
+            kind: 'dropped-dispatch-smoke-failed', ref: s.ref, pr: s.pr, reason: why,
+          }, { env });
+          alert('overlay-dropped-dispatch-smoke-failed', {
+            ref: s.ref, pr: s.pr, matched: s.matched, suspects: suspects.length,
+            message: 'this overlay broke the real worker launch — fix it, then re-add it',
+          });
+        } catch (e) {
+          alert('overlay-drop-failed', { ref: s.ref, error: String(e?.message || e) });
+        }
+      }
+    }
+    return { moved: false, reason: 'dispatch-smoke-failed', plan, alerts: [...prepAlerts, ...alertsList] };
   };
 
   /** Adopt `p`, whose smoke just PASSED. fix-rebuild-finalize: the pass is recorded as the clone's ready candidate
@@ -263,6 +410,7 @@ export async function smokeAndAdopt({
   };
 
   // ── Candidate A: main + every overlay ──────────────────────────────────────────────────────────────────
+  const aSuspects = suspectsFor(plan.applied);
   const identity = smokePassIdentity(git, plan.finalSha);
   const passes = readRebuildState(root, stEnv).smokePassed;
   const proven = identity && Array.isArray(passes) && passes.find((entry) => {
@@ -274,9 +422,15 @@ export async function smokeAndAdopt({
       tree: identity.tree, provenAt: proven.passedAt,
       reason: 'tree already passed a full smoke (same lock, node, harness)',
     });
+    // xhiqxz3 — a proven tree still owes the dispatch smoke for an overlay the adopted build does not carry.
+    if (aSuspects.length) {
+      const d = await dispatchOnly(plan.finalSha, aSuspects);
+      if (!d.result.ok) return dispatchFailed(d);
+      dispatchPassedAlert(d);
+    }
     return finalize(plan, undefined, undefined, { verdict: 'pass', cached: true, smoke: { results: [] } });
   }
-  const a = await smokeSha(plan.finalSha, changedSince(plan.finalSha), null);
+  const a = await smokeSha(plan.finalSha, changedSince(plan.finalSha), null, aSuspects);
   if (a.worktreeFailed) {
     await locked(null, { release: true });
     log.error?.(`daemon-rebuild: candidate-worktree-failed (${a.worktreeFailed}) — not adopting ${plan.finalSha}, retrying next tick`);
@@ -291,7 +445,11 @@ export async function smokeAndAdopt({
     await hold('smoke-threw', []);
     return { moved: false, reason: 'smoke-threw', plan, alerts: [...prepAlerts, ...alertsList] };
   }
-  if (a.smokeResult.verdict === 'pass') return finalize(plan, undefined, undefined, a.smokeResult);
+  if (a.smokeResult.verdict === 'pass') {
+    if (a.dispatch && !a.dispatch.result.ok) return dispatchFailed(a.dispatch);
+    if (a.dispatch) dispatchPassedAlert(a.dispatch);
+    return finalize(plan, undefined, undefined, a.smokeResult);
+  }
 
   const failedA = failedRows(a.smokeResult);
   for (const verdict of SMOKE_ENVIRONMENT_VERDICTS) {
@@ -382,12 +540,17 @@ export async function smokeAndAdopt({
         const fin = await finalize(planB, dropSuspects, fallbackReady);
         return { ...fin, reason: 'fallback-plain-main', fallback: { from: plan.finalSha, to: planB.finalSha, dropped: suspectInfo } };
       }
-      const b = await smokeSha(planB.finalSha, loadOnly ? null : changedSince(planB.finalSha), 'plain-main');
-      const bPassed = !b.worktreeFailed && !b.threw && b.smokeResult?.verdict === 'pass';
+      const b = await smokeSha(planB.finalSha, loadOnly ? null : changedSince(planB.finalSha), 'plain-main', suspectsFor(planB.applied));
+      if (b.dispatch && !b.dispatch.result.ok) {
+        alert('fallback-plain-main-dispatch-smoke-failed', { reason: b.dispatch.result.reason, suspects: b.dispatch.suspects.map((s) => s.ref) });
+      }
+      const bPassed = !b.worktreeFailed && !b.threw && b.smokeResult?.verdict === 'pass' && (!b.dispatch || b.dispatch.result.ok);
       if (bPassed && loadOnly) {
         // Same-run differential, second half: re-smoke A now that plain main passed.
-        const a2 = await smokeSha(plan.finalSha, null, 'confirm');
+        const a2 = await smokeSha(plan.finalSha, null, 'confirm', aSuspects);
+        if (a2.dispatch && !a2.dispatch.result.ok) return dispatchFailed(a2.dispatch);
         if (!a2.worktreeFailed && !a2.threw && a2.smokeResult?.verdict === 'pass') {
+          if (a2.dispatch) dispatchPassedAlert(a2.dispatch);
           alert('smoke-load-confirm-passed', {
             failed: failedNames, suspects: suspectInfo,
             message: 'A failed under load, plain main passed, A re-smoked passed — load, not the overlay; adopting A with every overlay kept',
@@ -437,6 +600,12 @@ export async function smokeAndAdopt({
   const harnessBroken = !!(cFailed && failsSameChecks(failedA, cFailed));
   if (harnessBroken) {
     if (env[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV] !== '0') {
+      // xhiqxz3 — "no worse" on the ordinary smoke says nothing about the worker launch: prove that first.
+      if (aSuspects.length) {
+        const d = await dispatchOnly(plan.finalSha, aSuspects);
+        if (!d.result.ok) return dispatchFailed(d);
+        dispatchPassedAlert(d);
+      }
       alert('smoke-harness-broken-adopted-not-worse', {
         failed: failedA.map((r) => r.name).join(','),
         alsoFailedOn: bFailed ? ['plain-main', 'last-good'] : ['last-good'],
