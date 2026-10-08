@@ -66,6 +66,7 @@
  * infra-blocked recovery / the lease-reaper / the session-reaper / the hiccup sink — best-effort, never gating
  * the tick.
  */
+import { advisorForLaunch, advisorLedgerRow, advisorLogLine, recordAdvisorRun } from '../lib/advisor-trial.mjs';
 import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
 import { ensureSettingsFilePermissions } from '../lib/gh-app-shim.mjs';
 
@@ -1070,6 +1071,9 @@ export function dispatchFix(planned, {
   readFixClaim = ({ repo: r, pr }) => readLiveFixClaim({ repo: r, pr, ...(claimRoot ? { lockRoot: claimRoot } : {}) }),
   // The ruling-not-addressed send-back's durable notice (once per head). Injectable so a test posts nothing.
   postNotice = postRulingNotice,
+  // advisor trial (we:backlog/x331b7u) — the per-run sampling decision and its ledger row; a test stubs both.
+  advisorFor = advisorForLaunch,
+  recordAdvisor = recordAdvisorRun,
 } = {}) {
   // #x33jgwt multi-repo slice 5 — no repo gate HERE any more (see {@link tryResumeFix}'s own docblock for why):
   // `runReconcileFixDispatch` already refused a repo whose profile lacks the `fix` capability before this ever
@@ -1166,8 +1170,12 @@ export function dispatchFix(planned, {
     const sessionCwd = ensureSessionCwd(sessionCwdFor(sessionId));
     try { grantConflictHelper(sessionCwd); } catch { /* Permission preparation must never abort dispatch. */ }
     spawnCwd = sessionCwd;
+    // advisor trial — sampled on THIS run's minted id (the same id the session's scratch cwd, and so its
+    // transcript directory, is named by), so the report can join the arm to the run's own tokens.
+    const advisor = advisorFor({ runId: sessionId, kind: 'fix' });
     const argv = buildAgentArgv({
       sessionId,
+      advisor,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
       ...(ladderTable ? { table: ladderTable } : {}),
       payload: { prompt: withAltBranchHint(withSalvageHint(withOperatorSendBack(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), sessionSlug, launchKind: 'fix' },
@@ -1188,10 +1196,16 @@ export function dispatchFix(planned, {
     // discards `--session-id` and assigns its own, so the minted uuid addresses nothing; `agentId` is what
     // `claude agents`/`logs`/`stop` take. `sessionId` stays on the result for callers that already read it.
     const stdout = String(spawnAgent(argv, { cwd: sessionCwd }) ?? '');
+    const agentId = parseBackgroundedId(stdout);
+    console.error(advisorLogLine({ decision: advisor, sessionSlug, runId: sessionId, agentId }));
+    recordAdvisor(advisorLedgerRow({
+      decision: advisor, runId: sessionId, agentId, sessionSlug, repo, pr: planned.pr, item: planned.itemNum ?? null,
+      at: new Date().toISOString(),
+    }));
     // #x0jphk5 — the claim is DELIBERATELY NOT released here on success: see this function's own docblock for
     // why it must outlive this call (the 26+s listing-lag window a fresh spawn is exposed to).
     return {
-      sessionId, agentId: parseBackgroundedId(stdout),
+      sessionId, agentId, advisor: advisor.on,
       sessionSlug, pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane, unknownTokens,
       resumed: false, ...(resumeAttempt ? { resumeAttempt } : {}),
     };

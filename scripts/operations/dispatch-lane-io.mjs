@@ -141,6 +141,7 @@ import {
 // narration went for the observer's `unresolved` message. See {@link isDispatchHandleLive}.
 import { DETACHED_HANDLE_PREFIX, defaultIsPidAlive, deliveryDispatchLogPath, detachedHandlePid } from './detached-dispatch.mjs';
 import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
+import { advisorArgv, advisorForLaunch, advisorLedgerRow, advisorLogLine, recordAdvisorRun, withAdvisorBrief } from '../lib/advisor-trial.mjs';
 
 /**
  * The three native Claude model ids {@link ../lib/dispatch-contracts.mjs#CLAUDE_NATIVE_MODEL_BY_TIER} maps to
@@ -1787,7 +1788,10 @@ export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => de
   }
   // build-path-codex-isolation — this port implementation always runs Claude; say so on the record.
   request.reportExecutor?.('claude');
+  // advisor trial (we:backlog/x331b7u) — sampled per run id; only kinds the settings list (fix today).
+  const advisor = (request.advisorFor ?? advisorForLaunch)({ runId: request.sessionId, kind: request.launchKind ?? 'build' });
   const argv = buildAgentArgv({
+    advisor,
     sessionId: request.sessionId,
     payload: { prompt: request.prompt, sessionSlug: request.sessionSlug, num: request.num, launchKind: request.launchKind },
     extraArgs: request.extraArgs,
@@ -1809,7 +1813,15 @@ export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => de
   request.reportModel?.(reportedModel);
   request.reportEffort?.(argv.find(arg => arg.startsWith('--effort='))?.slice(9) ?? argv[argv.indexOf('--effort') + 1]);
   const stdout = String(spawnAgent(argv, { cwd: request.cwd }) ?? '');
-  return parseBackgroundedId(stdout) || request.sessionId;
+  const agentId = parseBackgroundedId(stdout) || request.sessionId;
+  if (advisor.kind && advisor.reason !== 'kind-not-in-trial') {
+    console.error(advisorLogLine({ decision: advisor, sessionSlug: request.sessionSlug, runId: request.sessionId, agentId }));
+    (request.recordAdvisor ?? recordAdvisorRun)(advisorLedgerRow({
+      decision: advisor, runId: request.sessionId, agentId, sessionSlug: request.sessionSlug,
+      repo: request.repo ?? 'we', pr: request.pr ?? null, item: request.num ?? null, at: new Date().toISOString(),
+    }));
+  }
+  return agentId;
 }
 
 /**
@@ -2355,6 +2367,10 @@ export function buildAgentArgv({
   // precedence; with no `table`, the launch kind's own tier is used, and a spawn with no resolvable model is
   // refused (operator rule 2026-09-29: every fresh Claude launch passes an explicit --model).
   table = null, modelReason = null,
+  // advisor trial (we:backlog/x331b7u) — a decision from `../lib/advisor-trial.mjs#advisorForLaunch`. When it is
+  // on, the fresh launch gets `--advisor <model>` and one brief line; `null`/off keeps the argv byte-identical.
+  // Never applied on resume (a resume must stay a bare `--bg --resume`). The worker's `--model` is untouched.
+  advisor = null,
 }) {
   const prompt = String(payload?.prompt || '');
   if (!prompt.trim()) throw notApplied('dispatch-lane: refusing to start an agent with an empty prompt');
@@ -2428,7 +2444,8 @@ export function buildAgentArgv({
     ...(table ? [...effortArgs, ...modelArgs] : []),
     ...args,
     ...(!table ? [...effortArgs, ...modelArgs] : []),
-    prompt,
+    ...advisorArgv(advisor),
+    withAdvisorBrief(prompt, advisor),
   ];
 }
 

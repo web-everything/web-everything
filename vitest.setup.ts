@@ -148,6 +148,14 @@ if (process.env.WE_GH_THROTTLE_LOCK_ROOT === undefined) {
 if (process.env.WE_DAEMON_STATE_DIR === undefined) {
   process.env.WE_DAEMON_STATE_DIR = lazyRoot('daemon-state');
 }
+// advisor trial (we:backlog/x331b7u): dispatch tests never sample a real advisor arm (a missing settings file
+// means OFF) and never append to the host's real per-run ledger. Tests of the trial itself pass explicit seams.
+if (process.env.WE_ADVISOR_TRIAL_SETTINGS === undefined) {
+  process.env.WE_ADVISOR_TRIAL_SETTINGS = `${lazyRoot('advisor-trial')}/absent-settings.json`;
+}
+if (process.env.WE_ADVISOR_TRIAL_LEDGER === undefined) {
+  process.env.WE_ADVISOR_TRIAL_LEDGER = `${lazyRoot('advisor-trial')}/advisor-trial.jsonl`;
+}
 // ...and its one-release fallback read of the OLD in-checkout queue (which, on the operator's laptop, is the
 // primary checkout's real `.conveyor/queue.json`) is switched off for the same reason.
 if (process.env.CONVEYOR_NO_LEGACY_QUEUE === undefined) process.env.CONVEYOR_NO_LEGACY_QUEUE = '1';
