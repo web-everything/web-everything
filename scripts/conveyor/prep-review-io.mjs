@@ -15,6 +15,8 @@ import {
 } from './prep-review.mjs';
 
 const GH_TIMEOUT_MS = 30_000;
+/** A card read over this fails (`ENOBUFS`) instead of returning part of a card. */
+export const PREP_REVIEW_CARD_READ_MAX_BYTES = 16 * 1024 * 1024;
 
 /** Who opened a PR and from where never changes, so one read serves every later tick (bounded; cleared when full). */
 const AUTHOR_CACHE_MAX = 500;
@@ -33,7 +35,15 @@ export function makePrepReviewDeps({ root, env = process.env, exec = execFileSyn
     readCard: (sha, path, repo) => {
       if (!/^[0-9a-f]{7,40}$/.test(sha) || !isSafeRepoRelativePath(path) || !/^\w[\w.-]*\/\w[\w.-]*$/.test(String(repo))) throw new Error('prep-review: refusing an unsafe card ref');
       return String(exec('gh', ['api', '-H', 'Accept: application/vnd.github.raw', `repos/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${sha}`],
-        { encoding: 'utf8', timeout: GH_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+        { encoding: 'utf8', timeout: GH_TIMEOUT_MS, maxBuffer: PREP_REVIEW_CARD_READ_MAX_BYTES, stdio: ['ignore', 'pipe', 'pipe'] }));
+    },
+    // The PR's own changed-file paths, for the stale-label strip when the listing carried none. Throws on any failure.
+    readPrFiles: (pr, repo) => {
+      const n = pr?.number;
+      if (!Number.isSafeInteger(n) || n <= 0 || !/^\w[\w.-]*\/\w[\w.-]*$/.test(String(repo))) throw new Error('prep-review: refusing an unsafe PR ref');
+      const row = JSON.parse(String(exec('gh', ['pr', 'view', String(n), '--repo', repo, '--json', 'files'],
+        { encoding: 'utf8', timeout: GH_TIMEOUT_MS, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })));
+      return (Array.isArray(row?.files) ? row.files : []).map((f) => f?.path).filter((p) => typeof p === 'string');
     },
     readPrAuthor: (pr, repo) => {
       const n = pr?.number;

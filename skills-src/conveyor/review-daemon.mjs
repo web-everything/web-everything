@@ -730,7 +730,7 @@ export async function runConvertAdvisoryTickAllRepos({
  * card x5f2daz — the light PREP REVIEW stage: a single-reviewer pass on card-only prepare PRs (see
  * `we:scripts/conveyor/prep-review.mjs`). A SEPARATE, ADDITIVE stage like {@link runConvertAdvisoryTick}: it needs no
  * lane and no session, and `runReviewTick`'s return shape stays pinned. WE only (prepare PRs carry WE backlog cards).
- * `prepReview.mode` is `off | advise | block` (env `WE_PREP_REVIEW_MODE`, default `advise`); `off` does nothing.
+ * `prepReview.mode` is `off | advise | block` (env `WE_PREP_REVIEW_MODE`, default `advise`); `off` reviews nothing (it only removes a stale `review:prep`).
  * Never throws: a failure here is reported and never costs the tick's real job.
  * @param {{repo?:string, readPrs?:Function, tick?:Function, makeDeps?:Function, env?:object, root?:string}} [o]
  */
@@ -739,7 +739,8 @@ export async function runPrepReviewStage({
   root = resolve(fileURLToPath(import.meta.url), '..', '..', '..'), makeDeps = makePrepReviewDeps,
 } = {}) {
   const mode = resolvePrepReviewMode(env);
-  if (mode === 'off') return { mode, reviewed: [], skipped: [], failed: [], readError: null, off: true };
+  // `off` still runs the tick: it reviews nothing, but it removes a stale `review:prep` from a PR that has grown past its
+  // card, which would otherwise hide the normal review from every `review:*` consumer.
   try {
     return await tick({ repo, readPrs, deps: makeDeps({ root, env }) });
   } catch (e) {
@@ -1000,7 +1001,7 @@ export function buildCliDaemonEffects({
         log.error(`review-daemon: session-reap — ${sr.scanned} scanned, ${sr.stopped} stopped${sr.alreadyGone ? `, ${sr.alreadyGone} already gone` : ''}${sr.failures ? `, ${sr.failures} failed` : ''}${sr.anomalies ? `, ${sr.anomalies} anomalies` : ''}${sr.previouslyReaped ? `, ${sr.previouslyReaped} already reaped earlier (skipped)` : ''}, ${sr.kept} kept${sr.deferred ? `, ${sr.deferred} deferred to next tick (reap budget: ${sr.reapBudget?.maxStops} stops / ${sr.reapBudget?.maxDurationMs}ms, #3383)` : ''}`);
       }
       const pr = result.prepReview;
-      if (pr && !pr.off) {
+      if (pr) {
         for (const r of (pr.reviewed ?? [])) log.error(`review-daemon: ${WE_SLUG}#${r.prNumber} prep-review (${pr.mode}) ${r.outcome}${r.findings?.length ? `: ${r.findings.join(',')}` : ''}${r.addLabels?.length ? `; labelled ${r.addLabels.join(',')}` : ''}`);
         for (const f of (pr.failed ?? [])) log.error(`review-daemon: ${WE_SLUG}#${f.prNumber ?? '?'} prep-review failed (non-fatal): ${f.error}`);
         for (const x of (pr.stripped ?? [])) log.error(`review-daemon: ${WE_SLUG}#${x.prNumber} prep-review: removed a stale review:prep (the PR now carries more than the card)`);

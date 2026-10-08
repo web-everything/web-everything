@@ -244,8 +244,10 @@ describe('the tick', () => {
     expect(out.skipped).toEqual([{ prNumber: 5, reason: 'tick-cap' }]);
   });
   it('off does nothing, and a failed listing is reported not thrown', async () => {
-    const off = await runPrepReviewTick({ repo: 'o/r', readPrs: () => { throw new Error('x'); }, deps: { mode: 'off' } });
+    const review = vi.fn();
+    const off = await runPrepReviewTick({ repo: 'o/r', readPrs: () => [prepPr()], deps: { mode: 'off' }, review });
     expect(off.reviewed).toEqual([]);
+    expect(review).not.toHaveBeenCalled();
     const err = await runPrepReviewTick({ repo: 'o/r', readPrs: () => { throw new Error('gh down'); }, deps: { mode: 'advise' } });
     expect(err.readError).toBe('gh down');
   });
@@ -284,12 +286,8 @@ describe('replay of PR 4280: the two noises stop for a prepare PR and ONLY for a
 });
 
 describe('the review daemon stage', () => {
-  it('off runs nothing; a throwing stage is reported, never raised', async () => {
+  it('a throwing stage is reported, never raised', async () => {
     const { runPrepReviewStage } = await import('../../../skills-src/conveyor/review-daemon.mjs');
-    const tick = vi.fn();
-    const off = await runPrepReviewStage({ env: { WE_PREP_REVIEW_MODE: 'off' }, tick, makeDeps: vi.fn() });
-    expect(off.off).toBe(true);
-    expect(tick).not.toHaveBeenCalled();
     const broke = await runPrepReviewStage({ env: {}, tick: async () => { throw new Error('kaput'); }, makeDeps: () => ({}) });
     expect(broke.readError).toBe('kaput');
     const ok = await runPrepReviewStage({ env: {}, tick: async (a) => ({ mode: a.deps.mode, reviewed: [], skipped: [], failed: [], readError: null }), makeDeps: () => ({ mode: 'advise' }) });
@@ -571,5 +569,203 @@ describe('readCard only ever builds an argv-only gh api call for a safe ref', ()
     const t0 = Date.now();
     executableCommands('<!--'.repeat(200_000));
     expect(Date.now() - t0).toBeLessThan(2000);
+  });
+});
+
+// ---- review round 2 on PR 4453: each finding reproduced red, then fixed --------------------------------------------------
+describe('a first-round hold that failed to land is retried (finding: already-reviewed shortcut)', () => {
+  const bad = () => card({ scope: '["we:scripts/nope.mjs"]' });
+  const head = 'd'.repeat(40);
+  it('retries a failed first-round hold after review:prep succeeds, with no second note and no model call', async () => {
+    const calls = { comments: [], labels: [] };
+    const failing = mkDeps({
+      mode: 'block', readCard: bad,
+      provider: {
+        postComment: (r, n, b) => calls.comments.push(b), ensureLabel: () => {},
+        setLabels: (r, n, s) => { calls.labels.push(s.add); if (s.add === 'review:changes') throw new Error('gh 502'); },
+      },
+    });
+    await expect(reviewPreparePr(prepPr({ headRefOid: head }), failing.deps)).rejects.toThrow(/502/);
+    expect(calls.comments[0]).toMatch(/blocked=1/);
+    // next tick: the note and review:prep are on the PR, review:changes is not
+    const note = { ...bot, body: calls.comments[0] };
+    const judge = vi.fn();
+    const retry = mkDeps({ mode: 'block', readCard: bad, judge });
+    const out = await reviewPreparePr(prepPr({ headRefOid: head, labels: [{ name: 'review:prep' }], comments: [note] }), retry.deps);
+    expect(out.addLabels).toEqual(['review:changes']);
+    expect(retry.calls.labels.map((l) => l.add)).toEqual(['review:changes']);
+    expect(retry.calls.comments).toEqual([]);
+    expect(judge).not.toHaveBeenCalled();
+    // once the hold is back, the head is simply reviewed
+    const done = mkDeps({ mode: 'block', readCard: bad });
+    expect(await reviewPreparePr(prepPr({ headRefOid: head, labels: [{ name: 'review:prep' }, { name: 'review:changes' }], comments: [note] }), done.deps)).toEqual({ skipped: 'already-reviewed' });
+  });
+  it('does not invent a hold: an advise-mode note, or a human review:human, is left alone', async () => {
+    const adv = mkDeps({ mode: 'advise', readCard: bad });
+    await reviewPreparePr(prepPr({ headRefOid: head }), adv.deps);
+    const note = { ...bot, body: adv.calls.comments[0].b };
+    const again = mkDeps({ mode: 'block', readCard: bad });
+    expect(await reviewPreparePr(prepPr({ headRefOid: head, labels: [{ name: 'review:prep' }], comments: [note] }), again.deps)).toEqual({ skipped: 'already-reviewed' });
+    const blockNote = (() => { const b = mkDeps({ mode: 'block', readCard: bad }); return reviewPreparePr(prepPr({ headRefOid: head }), b.deps).then(() => ({ ...bot, body: b.calls.comments[0].b })); })();
+    const human = mkDeps({ mode: 'block', readCard: bad });
+    expect(await reviewPreparePr(prepPr({ headRefOid: head, labels: [{ name: 'review:human' }], comments: [await blockNote] }), human.deps)).toEqual({ skipped: 'has-review-label' });
+  });
+});
+
+describe('Done-when and edge-case sections end at a real heading, never at a comment inside a fence (finding: readDoneWhen)', () => {
+  const cmd = 'npx vitest run x.test.mjs';
+  const doneCard = (block) => `---\nscope: ["we:scripts/real.mjs"]\n---\n\n# T\n\n## Done when\n\n${block}\n\n## Next\n\ntext\n`;
+  it.each([
+    ['backtick fence', '```sh\n# fails before, passes after\n' + cmd + '\n```'],
+    ['tilde fence', '~~~sh\n# fails before, passes after\n' + cmd + '\n~~~'],
+    ['longer fence', '````sh\n# a\n## b\n' + cmd + '\n````'],
+    ['indented fence', '   ```sh\n# a\n' + cmd + '\n   ```'],
+    ['CRLF card', '```sh\r\n# a\r\n' + cmd + '\r\n```'],
+  ])('keeps the command after a "# comment" line in a %s', (_n, block) => {
+    expect(executableCommands(readDoneWhen(doneCard(block))).some((c) => c.includes(cmd))).toBe(true);
+    expect(deterministicChecks({ raw: doneCard(block), exists, alreadyDone: { done: false, pr: null, checked: true } }).findings.some((f) => f.ref === 'done-when-not-executable')).toBe(false);
+  });
+  it('still ends at a real heading, an unterminated fence runs to the end, and a fenced "## Done when" is not the heading', () => {
+    expect(readDoneWhen(doneCard('`' + cmd + '`'))).not.toMatch(/text/);
+    expect(readDoneWhen(doneCard('```sh\n' + cmd + '\n'))).toMatch(/vitest/); // unterminated fence: the rest of the card
+    const fencedFirst = '---\nscope: ["we:a.mjs"]\n---\n\n```md\n## Done when\n`node nope.mjs`\n```\n\n## Done when\n\n`' + cmd + '`\n';
+    expect(readDoneWhen(fencedFirst)).toMatch(/vitest/);
+    expect(readDoneWhen(fencedFirst)).not.toMatch(/nope/);
+  });
+  it('the edge-case section reader (same split) is fence-aware too', () => {
+    const half = Math.ceil(EDGE_CASE_CLASSES.length / 2);
+    const lines = EDGE_CASE_CLASSES.map((c, i) => `${i + 1}. **${c.label}** — handled by a fixed string.`);
+    const body = `## Edge cases this change must handle\n\n${lines.slice(0, half).join('\n')}\n\n\`\`\`sh\n# a comment in a fence\n\`\`\`\n\n${lines.slice(half).join('\n')}\n`;
+    expect(unansweredEdgeCaseClasses(body)).toEqual([]);
+  });
+});
+
+describe('a stale review:prep is stripped whatever the mode and however the listing reads (finding: strip only ran in non-off mode)', () => {
+  const stale = (over = {}) => prepPr({ number: 11, files: [{ path: 'backlog/4382-some-card.md' }, { path: 'scripts/evil.mjs' }], labels: [{ name: 'review:prep' }], ...over });
+  it('mode off still removes the stale label, and reviews nothing', async () => {
+    const { deps, calls } = mkDeps({ mode: 'off' });
+    const review = vi.fn();
+    const out = await runPrepReviewTick({ repo: 'o/r', readPrs: () => [stale(), prepPr({ number: 12 })], deps, review });
+    expect(review).not.toHaveBeenCalled();
+    expect(out.stripped).toEqual([{ prNumber: 11 }]);
+    expect(calls.labels).toEqual([{ r: 'o/r', n: 11, add: undefined, remove: [PREP_REVIEW_LABEL] }]);
+  });
+  it('the daemon stage runs the strip in off mode', async () => {
+    const { runPrepReviewStage } = await import('../../../skills-src/conveyor/review-daemon.mjs');
+    const tick = vi.fn(async () => ({ mode: 'off', reviewed: [], skipped: [], failed: [], stripped: [{ prNumber: 11 }], readError: null }));
+    const out = await runPrepReviewStage({ env: { WE_PREP_REVIEW_MODE: 'off' }, tick, makeDeps: () => ({ mode: 'off' }) });
+    expect(tick).toHaveBeenCalled();
+    expect(out.stripped).toEqual([{ prNumber: 11 }]);
+  });
+  it.each([['no files key', undefined], ['an empty list', []]])('with %s, the PR\'s own file list is read once and decides', async (_n, files) => {
+    const { deps, calls } = mkDeps();
+    const readPrFiles = vi.fn(() => ['backlog/4382-some-card.md', 'scripts/evil.mjs']);
+    const out = await runPrepReviewTick({ repo: 'o/r', readPrs: () => [stale({ files })], deps: { ...deps, readPrFiles }, review: vi.fn() });
+    expect(readPrFiles).toHaveBeenCalledTimes(1);
+    expect(out.stripped).toEqual([{ prNumber: 11 }]);
+    expect(calls.labels).toHaveLength(1);
+  });
+  it('an unreadable, empty or card-only answer never strips', async () => {
+    for (const readPrFiles of [() => { throw new Error('gh down'); }, () => [], () => ['backlog/4382-some-card.md'], () => undefined, undefined]) {
+      const { deps, calls } = mkDeps();
+      const out = await runPrepReviewTick({ repo: 'o/r', readPrs: () => [stale({ files: undefined })], deps: { ...deps, readPrFiles }, review: vi.fn() });
+      expect(out.stripped).toEqual([]);
+      expect(calls.labels).toEqual([]);
+    }
+  });
+  it('the IO adapter reads the file list with an argv-only gh call and refuses an unsafe ref', async () => {
+    const { makePrepReviewDeps } = await import('../prep-review-io.mjs');
+    const exec = vi.fn(() => JSON.stringify({ files: [{ path: 'a.md' }, { path: 'b.mjs' }] }));
+    const io = makePrepReviewDeps({ root: '.', env: {}, exec, judge: vi.fn(), provider: {}, checkAlreadyDone: async () => ({}) });
+    expect(io.readPrFiles({ number: 7 }, 'o/r')).toEqual(['a.md', 'b.mjs']);
+    expect(exec.mock.calls[0][1]).toEqual(['pr', 'view', '7', '--repo', 'o/r', '--json', 'files']);
+    expect(() => io.readPrFiles({ number: -1 }, 'o/r')).toThrow(/unsafe PR ref/);
+    expect(() => io.readPrFiles({ number: 7 }, '--web/x')).toThrow(/unsafe PR ref/);
+  });
+});
+
+describe('the drain passes the PR head into the coverage check (finding: call site had no test)', () => {
+  const ref = 'lane/4382-prepare-item-ci-app-token';
+  const head = 'e'.repeat(40);
+  it('a trusted prep note for the landing head on a prepare-item ref yields no coverage gap, through the real argument builder', async () => {
+    const { reviewCoverageGapArgs } = await import('../../merge-ai-prs.mjs');
+    const { deps, calls } = mkDeps();
+    await reviewPreparePr(prepPr({ headRefName: ref, headRefOid: head }), deps);
+    const comments = [{ ...bot, body: calls.comments[0].b }];
+    const args = reviewCoverageGapArgs({ headRef: ref, listedHeadSha: head, headSha: 'f'.repeat(40), reliefWaived: false, reliefPassWide: false }, comments);
+    expect(args).toMatchObject({ headRef: ref, headSha: head });
+    expect(reviewCoverageGaps(args)).toEqual([]);
+    // the listed head wins; with none listed the verdict head is used; with neither, fail closed
+    expect(reviewCoverageGapArgs({ headRef: ref, headSha: head }, comments).headSha).toBe(head);
+    expect(reviewCoverageGaps(reviewCoverageGapArgs({ headRef: ref }, comments)).map((g) => g.code)).toEqual(['no-recorded-review']);
+  });
+  it('runCli builds its coverage arguments through that helper', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { resolve } = await import('node:path');
+    const src = readFileSync(resolve(process.cwd(), 'scripts/merge-ai-prs.mjs'), 'utf8');
+    expect(src).toMatch(/reviewCoverageGaps\(reviewCoverageGapArgs\(c, preread\.comments\)\)/);
+  });
+});
+
+describe('the card read is bounded and an oversized read fails rather than returning part of a card (finding: maxBuffer untested)', () => {
+  it('bounds card-read output to 16 MiB and times out', async () => {
+    const { makePrepReviewDeps, PREP_REVIEW_CARD_READ_MAX_BYTES } = await import('../prep-review-io.mjs');
+    expect(PREP_REVIEW_CARD_READ_MAX_BYTES).toBe(16 * 1024 * 1024);
+    const exec = vi.fn(() => 'card');
+    const io = makePrepReviewDeps({ root: '.', env: {}, exec, judge: vi.fn(), provider: {}, checkAlreadyDone: async () => ({}) });
+    io.readCard('a'.repeat(40), 'backlog/1-x.md', 'o/r');
+    expect(exec.mock.calls[0][2]).toMatchObject({ maxBuffer: PREP_REVIEW_CARD_READ_MAX_BYTES, timeout: 30_000 });
+  });
+  it('an over-limit read (ENOBUFS) propagates as a failure, never a partial card', async () => {
+    const { makePrepReviewDeps } = await import('../prep-review-io.mjs');
+    const exec = vi.fn(() => { throw Object.assign(new Error('spawnSync gh ENOBUFS'), { code: 'ENOBUFS', stdout: 'half a card' }); });
+    const io = makePrepReviewDeps({ root: '.', env: {}, exec, judge: vi.fn(), provider: {}, checkAlreadyDone: async () => ({}) });
+    expect(() => io.readCard('a'.repeat(40), 'backlog/1-x.md', 'o/r')).toThrow(/ENOBUFS/);
+  });
+});
+
+describe('review of the repair itself: the next variants of each defect', () => {
+  const lines = EDGE_CASE_CLASSES.map((c, i) => `${i + 1}. **${c.label}** — handled by a fixed string.`).join('\n');
+  it.each([['##'], ['###'], ['   ##']])('an edge-case heading written as "%s" is still found (indent, deeper #)', (h) => {
+    expect(unansweredEdgeCaseClasses(`${h} Edge cases this change must handle\n\n${lines}\n`)).toEqual([]);
+  });
+  it('the same words quoted in a fence are not the section', () => {
+    expect(unansweredEdgeCaseClasses('```md\n## Edge cases this change must handle\n' + lines + '\n```\n')).toHaveLength(EDGE_CASE_CLASSES.length);
+  });
+  it('a heading-looking line inside a multi-line HTML comment does not end Done when', () => {
+    const raw = '---\nscope: ["we:a.mjs"]\n---\n\n## Done when\n\n<!--\n# old\n-->\n`npx vitest run x.test.mjs`\n';
+    expect(executableCommands(readDoneWhen(raw))).toEqual(['npx vitest run x.test.mjs']);
+  });
+  it('a runaway card is cut before the line scans, so it cannot stall the daemon', () => {
+    const t0 = Date.now();
+    deterministicChecks({ raw: '---\nscope: ["we:scripts/real.mjs"]\n---\n\n## Done when\n\n' + '\n'.repeat(16 * 1024 * 1024), exists });
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+  it('with two notes for one head, the one that recorded the hold decides, in the shortcut and the plan alike', async () => {
+    const bad = () => card({ scope: '["we:scripts/nope.mjs"]' });
+    const head = 'd'.repeat(40);
+    const b = mkDeps({ mode: 'block', readCard: bad });
+    await reviewPreparePr(prepPr({ headRefOid: head }), b.deps);
+    const held = { ...bot, body: b.calls.comments[0].b };
+    const plain = { ...bot, body: `<!-- prep-review: head=${head} round=1 -->\nan earlier unblocked note` };
+    const r = mkDeps({ mode: 'block', readCard: bad });
+    const out = await reviewPreparePr(prepPr({ headRefOid: head, labels: [{ name: 'review:prep' }], comments: [plain, held] }), r.deps);
+    expect(out.addLabels).toEqual(['review:changes']);
+  });
+  it('the strip also lifts the hold this stage applied, in any mode, and leaves a reviewer\'s own hold', async () => {
+    const bad = () => card({ scope: '["we:scripts/nope.mjs"]' });
+    const b = mkDeps({ mode: 'block', readCard: bad });
+    await reviewPreparePr(prepPr({ headRefOid: 'd'.repeat(40) }), b.deps);
+    const note = { ...bot, body: b.calls.comments[0].b };
+    const grown = (over) => prepPr({ number: 21, files: [{ path: 'backlog/4382-some-card.md' }, { path: 'scripts/x.mjs' }], ...over });
+    for (const mode of ['off', 'advise', 'block']) {
+      const { deps, calls } = mkDeps({ mode });
+      const out = await runPrepReviewTick({ repo: 'o/r', readPrs: () => [grown({ labels: [{ name: 'review:prep' }, { name: 'review:changes' }], comments: [note] })], deps, review: vi.fn() });
+      expect(out.stripped).toEqual([{ prNumber: 21, liftedHold: true }]);
+      expect(calls.labels).toEqual([{ r: 'o/r', n: 21, add: undefined, remove: ['review:prep', 'review:changes'] }]);
+    }
+    const { deps, calls } = mkDeps({ mode: 'block' });
+    await runPrepReviewTick({ repo: 'o/r', readPrs: () => [grown({ labels: [{ name: 'review:prep' }, { name: 'review:changes' }], comments: [] })], deps, review: vi.fn() });
+    expect(calls.labels).toEqual([{ r: 'o/r', n: 21, add: undefined, remove: ['review:prep'] }]);
   });
 });

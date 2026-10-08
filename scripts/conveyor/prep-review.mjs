@@ -22,7 +22,7 @@
  */
 import { prepareItemFromRef } from '../operations/prepare-pr.mjs';
 import { scopeIsDefective, bareScopePath } from './prepare-outcome.mjs';
-import { EDGE_CASE_CLASSES, unansweredEdgeCaseClasses } from '../backlog/edge-case-classes.mjs';
+import { EDGE_CASE_CLASSES, unansweredEdgeCaseClasses, untilNextHeading, indexOfUnfencedLine } from '../backlog/edge-case-classes.mjs';
 import { WORKER_RESULT_SCHEMA, validateWorkerResult } from '../operations/worker-result.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import yaml from 'js-yaml';
@@ -41,6 +41,8 @@ export const PREP_REVIEW_EFFORT = 'low';
 export const PREP_REVIEW_BUDGET_USD = 0.25;
 /** How much card text the model sees; the rest is cut and the cut is stated. */
 export const PREP_REVIEW_CARD_MAX_CHARS = 60_000;
+/** The code checks read at most this much of a card (a runaway card is cut, never scanned whole). */
+export const PREP_REVIEW_SCAN_MAX_CHARS = 256_000;
 
 /** `prepReview.mode`: env `WE_PREP_REVIEW_MODE`. An unknown value falls back to the default (never to `block`). */
 export function resolvePrepReviewMode(env = {}) {
@@ -98,10 +100,12 @@ export function readScopeEntries(raw) {
 
 /** The text of the `## Done when` section, or `''`. */
 export function readDoneWhen(raw) {
+  // Fence-aware both ways: a quoted `## Done when` in a code block is not the heading, and a `# comment` line in a fenced
+  // shell block does not end the section.
   const body = bodyOf(raw);
-  const at = body.search(/^##\s+Done when\s*$/im);
+  const at = indexOfUnfencedLine(body, /^##\s+Done when\s*$/i);
   if (at < 0) return '';
-  return body.slice(at).replace(/^##[^\n]*\n/, '').split(/^#{1,2}\s/m)[0];
+  return untilNextHeading(body.split(/\r?\n/).slice(at + 1).join('\n'));
 }
 
 // A backticked span that starts with a command a shell can run.
@@ -122,8 +126,10 @@ export function executableCommands(section) {
     }
     text = text.replace(/<!--|-->/g, '');
   }
-  const spans = [...text.matchAll(/```[a-z]*\n([\s\S]*?)```/g)].flatMap((m) => m[1].split('\n'));
-  for (const m of text.replace(/```[\s\S]*?```/g, ' ').matchAll(/`([^`\n]+)`/g)) spans.push(m[1]);
+  // Backtick and tilde fences alike (`readDoneWhen` treats both as fences); `\r\n` reads as `\n`.
+  text = text.replace(/\r\n?/g, '\n');
+  const spans = [...text.matchAll(/(```|~~~)[^\n]*\n([\s\S]*?)\1/g)].flatMap((m) => m[2].split('\n'));
+  for (const m of text.replace(/(```|~~~)[\s\S]*?\1/g, ' ').matchAll(/`([^`\n]+)`/g)) spans.push(m[1]);
   return spans.map((s) => s.trim().replace(/^\$\s+/, '')).filter((s) => COMMAND_RE.test(s));
 }
 
@@ -135,7 +141,9 @@ export function executableCommands(section) {
  * @param {{raw:string, exists:(p:string)=>boolean, alreadyDone?: {done:boolean, pr:object|null, checked:boolean}|null}} o
  * @returns {{findings:Array<{ref:string,note:string}>, notChecked:string[]}}
  */
-export function deterministicChecks({ raw, exists, alreadyDone = null } = {}) {
+export function deterministicChecks({ raw: fullRaw, exists, alreadyDone = null } = {}) {
+  // Bounded: the line scans below are linear in the card, and a card read can be up to 16 MiB. A real card is a few KB.
+  const raw = String(fullRaw ?? '').slice(0, PREP_REVIEW_SCAN_MAX_CHARS);
   const findings = [];
   const notChecked = [];
   // 1. scope. Only `we:`/bare entries can be probed from here; another repo's entries are named, not judged.
@@ -281,6 +289,15 @@ export function staleBlockHold({ names, prior, head }) {
 }
 
 /**
+ * Did this head's trusted note record a hold (`blocked=1`) that is not on the PR now? The note is posted first and the
+ * label second, so a label write that failed leaves exactly this. Block mode only: advise never holds, and a PR a human
+ * already took (`review:human`) is theirs.
+ */
+export function lostBlockHold({ mode, names, prior, head }) {
+  return mode === 'block' && prior.some((p) => p.head === head && p.blocked) && !names.includes('review:changes') && !names.includes('review:human');
+}
+
+/**
  * Decide what to write. Pure. `null` when this head is already reviewed, carries its label and holds nothing stale.
  * @returns {null | {round:number, body:string|null, addLabels:string[], removeLabels:string[]}}
  */
@@ -288,7 +305,8 @@ export function planPrepReview({ mode, head, result, notChecked = [], modelNote 
   if (!PREP_REVIEW_MODES.includes(mode) || mode === 'off') return null;
   const names = labelNames(labels);
   const prior = priorPrepReviews(comments);
-  const priorSame = prior.find((p) => p.head === head);
+  // With more than one note for this head, a note that recorded the hold wins: `lostBlockHold` reads "any note", so must this.
+  const priorSame = prior.find((p) => p.head === head && p.blocked) ?? prior.find((p) => p.head === head);
   const sameHead = priorSame !== undefined;
   const round = sameHead ? priorSame.round : (prior.reduce((n, p) => Math.max(n, p.round), 0) + 1);
   const hasReviewLabel = names.some((n) => n.startsWith('review:'));
@@ -344,7 +362,9 @@ export async function reviewPreparePr(pr, deps) {
   const names = labelNames(pr.labels);
   if (names.includes('review:human') || names.includes('review:pending') || names.includes('review:accepted')) return { skipped: 'has-review-label' };
   const prior = priorPrepReviews(pr.comments);
-  if (prior.some((p) => p.head === head) && names.some((n) => n.startsWith('review:')) && !staleBlockHold({ names, prior, head })) return { skipped: 'already-reviewed' };
+  // Any review label means "labelled", but not "finished": a stale hold to lift, or a recorded hold (`blocked=1`) whose
+  // `review:changes` never landed, still owes a label write. Those fall through to the planner, which owns that repair.
+  if (prior.some((p) => p.head === head) && names.some((n) => n.startsWith('review:')) && !staleBlockHold({ names, prior, head }) && !lostBlockHold({ mode, names, prior, head })) return { skipped: 'already-reviewed' };
   // Only a PR the repo's own automation or operator opened, from this repo's own branch, earns a model call and a trusted note.
   if (!(await trustedPrAuthor(pr, deps.readPrAuthor, repo))) return { skipped: 'untrusted-author' };
   const raw = readCard(head, shape.cardPath, repo);
@@ -401,10 +421,21 @@ async function trustedPrAuthor(pr, readPrAuthor, repo) {
 
 // ---- one daemon tick ----------------------------------------------------------------------------------------------
 
-/** A prepare-named PR that carries `review:prep` but whose (known) file list is no longer the one card. */
-function shouldStripPrepLabel(pr) {
-  // An empty list is "not known yet" (a fresh push can read empty for a moment), never "grew past the card".
-  return prepareItemFromRef(pr?.headRefName) !== null && Array.isArray(pr?.files) && pr.files.length > 0 && labelNames(pr.labels).includes(PREP_REVIEW_LABEL);
+/**
+ * A prepare-named PR that carries `review:prep` but whose (known) file list is no longer the one card.
+ * An absent or empty listing is "not known yet" (a fresh push can read empty for a moment), never "grew past the card":
+ * then the PR's own file list is read once through `readPrFiles`, and only a non-empty answer that is not card-only strips.
+ * No reader, a failing reader and an empty answer all leave the label alone.
+ */
+async function shouldStripPrepLabel(pr, repo, readPrFiles) {
+  if (prepareItemFromRef(pr?.headRefName) === null || !labelNames(pr?.labels).includes(PREP_REVIEW_LABEL)) return false;
+  let files = pr?.files;
+  if (!Array.isArray(files) || files.length === 0) {
+    if (typeof readPrFiles !== 'function') return false;
+    try { files = await readPrFiles(pr, repo); } catch { return false; }
+    if (!Array.isArray(files) || files.length === 0) return false;
+  }
+  return prepareCardOnly({ ...pr, files }) === null;
 }
 
 /** At most this many model passes per tick, so a burst of prepare PRs cannot run up a bill in one go. */
@@ -419,7 +450,9 @@ const tickFailures = new Map();
  */
 export async function runPrepReviewTick({ repo, readPrs, deps, review = reviewPreparePr, max = PREP_REVIEW_MAX_PER_TICK } = {}) {
   const out = { mode: deps?.mode ?? DEFAULT_PREP_REVIEW_MODE, reviewed: [], skipped: [], failed: [], stripped: [], readError: null };
-  if (out.mode === 'off') return out;
+  // `off` stops the REVIEWS, not the clean-up: a `review:prep` already on a PR that has since grown past its card hides the
+  // normal review whatever the mode is now, so the strip below runs in every mode.
+  const off = out.mode === 'off';
   let prs;
   try { prs = readPrs({ repo }); } catch (e) { out.readError = String(e?.message ?? e).split('\n')[0]; return out; }
   if (!Array.isArray(prs)) { out.readError = 'open PR listing was not a list'; return out; }
@@ -431,12 +464,16 @@ export async function runPrepReviewTick({ repo, readPrs, deps, review = reviewPr
     if (!prepareCardOnly(pr)) {
       // A prepare-named PR that has since grown past the one card is a code PR: the label (a record that a prep review
       // looked) must not outlive that, or it would hide the normal review. An unknown file list never strips.
-      if (shouldStripPrepLabel(pr)) {
-        try { deps.provider.setLabels(repo, pr.number, { add: undefined, remove: [PREP_REVIEW_LABEL] }); out.stripped.push({ prNumber: pr.number }); }
+      if (await shouldStripPrepLabel(pr, repo, deps.readPrFiles)) {
+        // The hold this stage applied (a trusted `blocked=1` note) goes with it: left behind, it would park the code PR
+        // out of the normal review, in any mode. A `review:changes` the stage never applied is a reviewer's and stays.
+        const stageHold = labelNames(pr.labels).includes('review:changes') && priorPrepReviews(pr.comments).some((p) => p.blocked);
+        try { deps.provider.setLabels(repo, pr.number, { add: undefined, remove: stageHold ? [PREP_REVIEW_LABEL, 'review:changes'] : [PREP_REVIEW_LABEL] }); out.stripped.push({ prNumber: pr.number, ...(stageHold ? { liftedHold: true } : {}) }); }
         catch (e) { out.failed.push({ prNumber: pr.number, error: foldOneLine(String(e?.message ?? e).split('\n')[0], 300) }); }
       }
       continue;
     }
+    if (off) continue;
     if (spent >= max) { out.skipped.push({ prNumber: pr.number, reason: 'tick-cap' }); continue; }
     let judged = false; // the cap bounds MODEL calls: a failure before the model ran spends nothing
     const judge = deps.judge ? (a) => { judged = true; return deps.judge(a); } : deps.judge;

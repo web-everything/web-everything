@@ -45,14 +45,63 @@ export function renderEdgeCasesSkeleton() {
 }
 
 /**
+ * Markdown lines with the fence state of each: `[{line, fenced}]`. A fence opens on a line of 3+ backticks or tildes (up to
+ * three spaces of indent, any info string) and closes on a line of the same character, at least as long, with nothing
+ * after it. An unterminated fence runs to the end of the text. `\r\n` and `\n` both split.
+ */
+function fencedLines(text) {
+  const out = [];
+  let open = null; // { ch, len }
+  let inComment = false; // inside a multi-line `<!-- ... -->`: a `# old` line there is no heading either
+  for (const line of String(text ?? '').split(/\r?\n/)) {
+    if (inComment) {
+      out.push({ line, fenced: true });
+      if (line.includes('-->')) inComment = false;
+      continue;
+    }
+    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (open === null) {
+      out.push({ line, fenced: false });
+      if (m && !(m[1][0] === '`' && m[2].includes('`'))) open = { ch: m[1][0], len: m[1].length };
+      else if (line.lastIndexOf('<!--') > line.lastIndexOf('-->')) inComment = true;
+    } else {
+      out.push({ line, fenced: true });
+      if (m && m[1][0] === open.ch && m[1].length >= open.len && m[2].trim() === '') open = null;
+    }
+  }
+  return out;
+}
+
+/**
+ * The text of `text` up to the next level-1 or level-2 heading that is NOT inside a code fence. A `# comment` line in a
+ * fenced shell block is a comment, not a heading. Joined with `\n`.
+ */
+export function untilNextHeading(text) {
+  const kept = [];
+  for (const { line, fenced } of fencedLines(text)) {
+    if (!fenced && /^#{1,2}(?:\s|$)/.test(line)) break;
+    kept.push(line);
+  }
+  return kept.join('\n');
+}
+
+/** Index (in lines) of the first line outside a fence that matches `re`, or `-1`. Same fence rules as {@link untilNextHeading}. */
+export function indexOfUnfencedLine(text, re) {
+  const lines = fencedLines(text);
+  return lines.findIndex(({ line, fenced }) => !fenced && re.test(line));
+}
+
+/**
  * The classes a card body has NOT answered: the class label is absent from the edge-cases section, or only on an
  * unfilled `TODO` line. Pure; every class when the section is absent.
  */
 export function unansweredEdgeCaseClasses(body) {
   const text = String(body ?? '');
-  const at = text.indexOf(EDGE_CASES_HEADING);
+  // The heading is a line outside any fence: the same words quoted in a code block are not the section. Up to three spaces
+  // of indent and any depth of `#` from two up still read as the heading (as `indexOf` did before it was fence-aware).
+  const at = indexOfUnfencedLine(text, new RegExp(`^ {0,3}#{2,}[ \\t]+${EDGE_CASES_HEADING.replace(/^#+\s+/, '')}`));
   if (at < 0) return [...EDGE_CASE_CLASSES];
-  const section = text.slice(at + EDGE_CASES_HEADING.length).split(/^#{1,2}\s/m)[0];
+  const section = untilNextHeading(text.split(/\r?\n/).slice(at + 1).join('\n'));
   const lines = section.split('\n');
   return EDGE_CASE_CLASSES.filter((c) => !lines.some((l) => l.toLowerCase().includes(c.label.toLowerCase()) && !/\bTODO\b/.test(l)));
 }

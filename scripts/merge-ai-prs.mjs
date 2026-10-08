@@ -2909,6 +2909,19 @@ export const REVIEW_COVERAGE_GAP_META = {
 };
 
 /**
+ * card x5f2daz — the arguments `runCli` hands {@link reviewCoverageGaps} for one landing candidate `c`. The head ref and the
+ * head being landed (the listed head wins over the verdict's) MUST travel with the comments, or every prep note reads as
+ * "not covering the head" and the drain posts `no-recorded-review` on prepare PRs again. Extracted so a test can drive the
+ * real assembly instead of passing those two fields by hand.
+ */
+export function reviewCoverageGapArgs(c, comments) {
+  return {
+    comments, reliefWaived: c?.reliefWaived === true, reliefPassWide: c?.reliefPassWide === true,
+    headRef: c?.headRef ?? null, headSha: c?.listedHeadSha || c?.headSha || null,
+  };
+}
+
+/**
  * Which review-coverage gaps does this landing PR carry? Pure — the caller supplies the PR's own comments.
  * Returns `[{code, line}]`, EMPTY for a normally-reviewed PR, which is what keeps the announcement off every
  * PR.
@@ -5619,7 +5632,7 @@ async function runCli() {
           // `--watch` loop that re-lands nothing re-posts nothing. It cannot affect the merge either — the post
           // swallows every `gh` error internally and returns a bool.
           if (preread.read) {
-            const gaps = reviewCoverageGaps({ comments: preread.comments, reliefWaived: c.reliefWaived === true, reliefPassWide: c.reliefPassWide === true, headRef: c.headRef, headSha: c.listedHeadSha || c.headSha || null });
+            const gaps = reviewCoverageGaps(reviewCoverageGapArgs(c, preread.comments));
             if (gaps.length) {
               const reason = buildReviewCoverageReason(gaps);
               const posted = postDrainReasonComment(c.repo, c.num, REVIEW_COVERAGE_KIND, reason, null, preread.comments);
