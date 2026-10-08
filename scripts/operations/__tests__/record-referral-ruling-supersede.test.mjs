@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { mandatoryReferralState, operatorRulingId, parseOperatorRulingComment, readOperatorRulings } from '../../lib/jury-core.mjs';
+import { mandatoryReferralState, operatorRulingId, parseOperatorRulingComment, readOperatorRulings, readReferralRecords, renderReferralRecord } from '../../lib/jury-core.mjs';
 import { ignoredRulings, rulingNeeded } from '../../lib/ruling-ledger.mjs';
 import { planRulingNeededLabel } from '../../conveyor/ruling-needed-sweep.mjs';
 import { openReferralFindings, planOperatorRuling } from '../record-referral-ruling.mjs';
@@ -20,9 +20,23 @@ const load = (name) => JSON.parse(readFileSync(join(dir, name), 'utf8'));
 const CARD = { requested: 'xidoch3', ref: 'we:backlog/xidoch3-build-delivered-evidence-hardening-follow-up-to-4361.md@pr4427', readable: true };
 const NOW = '2026-10-08T11:30:00.000Z';
 
+// Held item 141: the recorded threads below are no longer disputes. A later head's reviewer ruled each blocked finding
+// not-real (fixed) with evidence, and that ruling was carried onto the live head; that satisfies the older block. To
+// keep testing the supersede path on a GENUINE dispute, `asGenuineDispute` turns those reviewer clearances into `card`
+// deferrals: a reviewer who defers a blocked finding to a card disagrees with the block, so the dispute stands while
+// nothing is open on the head (the shape held item 132 fixed).
+const DEFERRAL_CARD = 'we:backlog/xidoch3-build-delivered-evidence-hardening-follow-up-to-4361.md';
+const asGenuineDispute = (fx) => ({ ...fx, comments: fx.comments.map((c) => {
+  if (!/^[ \t]*<!-- mandatory-referrals-v1:/m.test(c.body ?? '')) return c;
+  const [rec] = readReferralRecords([c]).records;
+  if (!rec) return c;
+  const toCard = (x) => (x.result === 'not-real' ? { ...x, result: 'card', card: DEFERRAL_CARD } : x);
+  return { ...c, body: renderReferralRecord({ ...rec, rulings: rec.rulings.map(toCard), ...(rec.carried ? { carried: rec.carried.map(toCard) } : {}) }) };
+}) });
+
 const cases = [
-  { name: '#4271', fx: () => load('pr-4271-carried-block-dispute.json') },
-  { name: '#4361', fx: () => load('pr-4361-carried-block-dispute.json') },
+  { name: '#4271', file: 'pr-4271-carried-block-dispute.json', fx: () => asGenuineDispute(load('pr-4271-carried-block-dispute.json')) },
+  { name: '#4361', file: 'pr-4361-carried-block-dispute.json', fx: () => asGenuineDispute(load('pr-4361-carried-block-dispute.json')) },
 ];
 
 const ctxOf = (fx) => ({ repo: fx.repo, pr: fx.pr, head: fx.headRefOid, body: fx.body, createdAt: fx.createdAt, cardReadable: () => true });
@@ -38,8 +52,14 @@ const input = (fx, extra = {}) => ({ repo: fx.repo, pr: fx.pr, finding: 'all-ope
 const blockIds = (read) => [...new Set(read.ruled.flatMap((r) => r.standing.filter((s) => s.result === 'block').map((s) => s.id)))];
 const post = (fx, plan, login = 'chalbert') => [...fx.comments, { author: { login }, createdAt: NOW, body: plan.body }];
 
-describe.each(cases)('replay $name: a carried block can be superseded', ({ fx: loadFx }) => {
+describe.each(cases)('replay $name: a carried block can be superseded', ({ fx: loadFx, file }) => {
   const fx = loadFx();
+
+  it('held item 141: the recorded thread itself raises no dispute (the later reviewer not-real satisfied the block)', () => {
+    const recorded = load(file);
+    expect(ignoredRulings(pr(recorded))).toBeNull();
+    expect(rulingNeeded(pr(recorded))).toBeNull();
+  });
 
   it('the sequence reproduces the bug: a dispute is up, and nothing is open to rule on', () => {
     expect(readOf(fx).open).toEqual([]);
@@ -125,7 +145,7 @@ describe('operator ruling ids', () => {
 });
 
 describe('advisory:ruling-needed is dropped when the PR is accepted', () => {
-  const fx = load('pr-4271-carried-block-dispute.json');
+  const fx = asGenuineDispute(load('pr-4271-carried-block-dispute.json'));
   it('a disputed PR that carries review:accepted needs no ruling, and the stale label is removed', () => {
     expect(rulingNeeded(pr(fx))).not.toBeNull();
     const accepted = pr(fx, fx.comments, ['review:accepted', 'advisory:ruling-needed']);
