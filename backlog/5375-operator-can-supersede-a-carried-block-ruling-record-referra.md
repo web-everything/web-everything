@@ -1,15 +1,16 @@
 ---
+bornAs: x5obpr2
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/conveyor/build-delivery-evidence.mjs", "we:scripts/conveyor/build-dispatch-orphan-adopt.mjs"]
+scope: ["we:scripts/operations/record-referral-ruling.mjs", "we:scripts/operations/record-referral-ruling-io.mjs", "we:scripts/lib/ruling-ledger.mjs", "we:scripts/lib/jury-core.mjs", "we:scripts/conveyor/ruling-needed-sweep.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Build-delivered evidence hardening (follow-up to #4361)
+# Operator can supersede a carried block ruling: record-referral-ruling --supersedes, dispute and ruling-needed clear (held item 132)
 
-Harden build-delivery evidence after PR #4361: (1) we:scripts/conveyor/build-delivery-evidence.mjs:52 a prep or scope PR with an unknown title shape is read as a real build; (2) we:scripts/conveyor/build-delivery-evidence.mjs:96 an unresolved card stays blocked by its old merged PR unless dateOpened is hand-reset; (3) we:scripts/conveyor/build-delivery-evidence.mjs:164 the PR lookup omits retry-branch shapes (suffixed lane branches); (4) the review daemon ruling-dispute finding on #4361: we:scripts/conveyor/build-dispatch-orphan-adopt.mjs:393 (missing or unrecognized job states treated as proof a session is alive), ruled block earlier, reported again after 3 misses on the new head; re-verify against current head and close with before/after proof.
+Held item 132, hit on #4271 and #4361. A block ruling carried to a new head cannot be re-ruled: we:scripts/operations/record-referral-ruling.mjs says no open findings, while we:scripts/lib/ruling-ledger.mjs keeps reporting a ruling-dispute and advisory:ruling-needed stays stale. Fix: an explicit supersedes id, operator authority only; the dispute reads the latest ruling per finding; ruling-needed clears when nothing is pending or disputed and is dropped on accept.
 
 ## Done when
 

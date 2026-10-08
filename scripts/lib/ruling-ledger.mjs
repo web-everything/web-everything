@@ -81,6 +81,8 @@ function currentRecords(snaps, head) {
 export function rulingNeeded(pr, { humanAt = DEFAULT_HUMAN_AT, cardReadable = () => true } = {}) {
   const head = String(pr?.headRefOid ?? '').toLowerCase();
   if (!SHA.test(head)) return null;
+  // Held item 132 (live #4271): an ACCEPTED PR has nothing left to rule on. Its label must not outlive the acceptance.
+  if ((Array.isArray(pr?.labels) ? pr.labels : []).some((l) => (typeof l === 'string' ? l : l?.name) === 'review:accepted')) return null;
   const snaps = recordSnapshots(pr?.comments, head);
   let since = null;
   let firstIndex = Infinity;
@@ -192,7 +194,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
         if (r.result !== 'block') continue;
         const firstSeen = snaps.find((s) => s.record.head === record.head && s.record.runId === record.runId
           && s.record.rulings.some((x) => x.key === f.key && x.id === r.id));
-        blocks.set(`${record.head}:${record.runId}:${r.id}`, { source: 'record', finding: findingView(f), clearing: clearingView(f), ruling: rulingText(r), priorHead: record.head, index: firstSeen?.index ?? latestIndex });
+        blocks.set(`${record.head}:${record.runId}:${r.id}`, { source: 'record', rulingId: r.id, finding: findingView(f), clearing: clearingView(f), ruling: rulingText(r), priorHead: record.head, index: firstSeen?.index ?? latestIndex });
       }
     }
   }
@@ -211,12 +213,15 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
     const parsed = parseOperatorRulingComment(c);
     for (const x of parsed?.record?.rulings ?? []) {
       const ruled = allRecords.find((r) => r.runId === x.runId && r.head === parsed.record.head)?.referrals.find((f) => f.key === x.key);
-      if (ruled) structured.push({ index, result: x.result, clearing: clearingView(ruled) });
+      if (ruled) structured.push({ index, result: x.result, clearing: clearingView(ruled), supersedes: x.supersedes ?? [] });
     }
   });
   const overruled = (b) => {
     if (b.source !== 'record') return false;
-    const latest = structured.filter((o) => o.index > b.index && sameFindingForClearing(o.clearing, b.clearing)).at(-1);
+    // Held item 132: the LATEST operator ruling on the finding decides. It reaches the block either by naming the block's
+    // id (`supersedes`, which survives a drifted line) or by being the same finding. A `block` never overrules.
+    const latest = structured.filter((o) => o.index > b.index
+      && ((b.rulingId && o.supersedes.includes(b.rulingId)) || sameFindingForClearing(o.clearing, b.clearing))).at(-1);
     return !!latest && latest.result !== 'block';
   };
 
@@ -259,7 +264,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
         if (s.record.referrals.some((x) => matchesBlock(findingView(x), b))) heads.add(s.record.head);
       }
       worst = Math.max(worst, heads.size);
-      matches.push({ finding: g, ruledFinding: b.source === 'record' ? b.finding : null, ruling: b.ruling, priorHead: b.priorHead,
+      matches.push({ finding: g, runId: record.runId, blockRulingId: b.rulingId ?? null, ruledFinding: b.source === 'record' ? b.finding : null, ruling: b.ruling, priorHead: b.priorHead,
         ruledAt: b.at ? new Date(b.at).toISOString() : null, source: b.source, misses: heads.size });
     }
   }
