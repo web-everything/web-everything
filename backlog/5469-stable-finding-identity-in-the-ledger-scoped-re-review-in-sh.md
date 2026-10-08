@@ -1,9 +1,10 @@
 ---
+bornAs: xm1mi56
 kind: story
 size: 5
-parent: "x8mmzuz"
+parent: "5467"
 status: open
-relatedTo: ["xdsdeeu", "3363", "3024"]
+relatedTo: ["5468", "3363", "3024"]
 scope: ["we:scripts/lib/verdict-ledger.mjs", "we:scripts/lib/review-loop-policy.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/lib/jury-core.mjs"]
 dateOpened: "2026-10-08"
 tags: [review, ledger]
@@ -13,7 +14,7 @@ tags: [review, ledger]
 
 Fixer/review proposal, operator 2026-10-08, P3 prerequisite (proposal "First slices" item 3, B1 part 1). Today every round re-reads the full `base..head` diff in we:scripts/operations/review-pr.mjs, and the ledger keeps no finding identity (we:scripts/lib/review-loop-policy.mjs says so). So round N+1 samples new findings on code round N already saw (`later-round-find` 9 → 29). This slice records a stable finding identity and runs the delta-scoped re-review in SHADOW only: the live verdict is unchanged, and a journal records what the scoped review would have decided.
 
-Builds on #3363 (reviewer identity per round) and #3024. The scope rule is expressed through the protocol card xdsdeeu's shape.
+Builds on #3363 (reviewer identity per round) and #3024. The scope rule is expressed through the protocol card 5468's shape.
 
 ## Acceptance
 
@@ -26,7 +27,7 @@ Builds on #3363 (reviewer identity per round) and #3024. The scope rule is expre
 
 ## Non-goals
 
-- [N1] No live change to any verdict: binding the prior round is xtzqoyq (P3).
+- [N1] No live change to any verdict: binding the prior round is 5470 (P3).
 - [N2] No Plateau cross-round findings view (later, in Plateau).
 - [N3] No change to round 1: it stays a full review.
 

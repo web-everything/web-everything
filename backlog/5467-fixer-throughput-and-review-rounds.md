@@ -1,4 +1,5 @@
 ---
+bornAs: x8mmzuz
 kind: epic
 parent: "3383"
 status: open
@@ -15,21 +16,21 @@ Parent is #3383 (the mechanical conveyor), not the event-driven daemons epic #54
 
 ## Cross-cutting rule (operator 2026-10-08)
 
-Every policy here is a protocol/standard-shaped PURE rule over plain facts plus declared settings. Today's behaviour is the setting's off value. Each rule ships with replay-fixture tests and standard-shaped names (no forge or label strings in the rule). The core implementation sits behind the rule. The rules are collected into the delivery standard by the "Review & fix policy protocol" card xdsdeeu (under #5407, related to the Decision API slice #5461).
+Every policy here is a protocol/standard-shaped PURE rule over plain facts plus declared settings. Today's behaviour is the setting's off value. Each rule ships with replay-fixture tests and standard-shaped names (no forge or label strings in the rule). The core implementation sits behind the rule. The rules are collected into the delivery standard by the "Review & fix policy protocol" card 5468 (under #5407, related to the Decision API slice #5461).
 
 ## Slices (blockedBy DAG)
 
-1. xdsdeeu Review & fix policy protocol: pure rules, declared settings, replay fixtures (5), under #5407. Collects every rule below.
-2. xm1mi56 Stable finding identity in the ledger + scoped re-review in shadow (5). B1 part 1; proposal "First slices" item 3.
-3. xtzqoyq Binding prior round (3), P3 ← xm1mi56.
-4. xu7kxtt Heal on an accepted PR keeps the accept; heal commit gets a delta review (3), P4 ← xm1mi56.
-5. xlsepow Round budget K=3: accept with cards (2), P5 ← xm1mi56, xtzqoyq (set once B1 is live).
-6. x5d9nso Revert-red check on fix pushes (5), P6. Runs inside verify, so it should land after A1 (below) makes verify-to-push fast; prose edge until A1's card exists.
+1. 5468 Review & fix policy protocol: pure rules, declared settings, replay fixtures (5), under #5407. Collects every rule below.
+2. 5469 Stable finding identity in the ledger + scoped re-review in shadow (5). B1 part 1; proposal "First slices" item 3.
+3. 5470 Binding prior round (3), P3 ← 5469.
+4. 5472 Heal on an accepted PR keeps the accept; heal commit gets a delta review (3), P4 ← 5469.
+5. 5471 Round budget K=3: accept with cards (2), P5 ← 5469, 5470 (set once B1 is live).
+6. 5466 Revert-red check on fix pushes (5), P6. Runs inside verify, so it should land after A1 (below) makes verify-to-push fast; prose edge until A1's card exists.
 
 ## Filed by other lanes (not re-filed here)
 
 - **A3 lane protection** (never reap, reset or acquire a lane holding verified, unpushed work): being built and filed by the `lane-protect-unpushed` lane. No card or PR existed when this epic was filed; re-parent it here when it lands.
-- **A1 push-on-green + A2 slot semantics** (P1: a fixer parked on verify releases its slot and its resume goes first; P2: fast local await-verify push loop now, `verify-finished` event later): being built and filed by the `push-on-green` lane. No card or PR existed when this epic was filed; re-parent it here when it lands and add it to x5d9nso's `blockedBy`.
+- **A1 push-on-green + A2 slot semantics** (P1: a fixer parked on verify releases its slot and its resume goes first; P2: fast local await-verify push loop now, `verify-finished` event later): being built and filed by the `push-on-green` lane. No card or PR existed when this epic was filed; re-parent it here when it lands and add it to 5466's `blockedBy`.
 
 ## Not in scope (from the proposal, unruled)
 

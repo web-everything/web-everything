@@ -1,10 +1,11 @@
 ---
+bornAs: xu7kxtt
 kind: story
 size: 3
-parent: "x8mmzuz"
+parent: "5467"
 status: open
-blockedBy: ["xm1mi56"]
-relatedTo: ["xdsdeeu", "2979", "3024"]
+blockedBy: ["5469"]
+relatedTo: ["5468", "2979", "3024"]
 scope: ["we:scripts/lib/git-patch-equivalence.mjs", "we:scripts/lib/review-need.mjs", "we:scripts/operations/review-pr.mjs"]
 dateOpened: "2026-10-08"
 tags: [review]
@@ -12,7 +13,7 @@ tags: [review]
 
 # Heal on an accepted PR keeps the accept; heal commit gets a delta review
 
-Fixer/review proposal, operator 2026-10-08, P4. A merge of main that leaves the PR's own change identical (empty range-diff, via we:scripts/lib/git-patch-equivalence.mjs) keeps the earned accept. A heal commit gets a review of its own delta only: a delta finding blocks; old tolerated findings stay tolerated. Today a heal re-arms a full review: PRs 4484 and 4453 each lost a full round after acceptance. Builds on #2979 (content equivalence) and #3024. The "old tolerated stay tolerated" part needs xm1mi56's finding identity; the merge-main part may land first inside this card. The rule is a pure function in the protocol card xdsdeeu's shape.
+Fixer/review proposal, operator 2026-10-08, P4. A merge of main that leaves the PR's own change identical (empty range-diff, via we:scripts/lib/git-patch-equivalence.mjs) keeps the earned accept. A heal commit gets a review of its own delta only: a delta finding blocks; old tolerated findings stay tolerated. Today a heal re-arms a full review: PRs 4484 and 4453 each lost a full round after acceptance. Builds on #2979 (content equivalence) and #3024. The "old tolerated stay tolerated" part needs 5469's finding identity; the merge-main part may land first inside this card. The rule is a pure function in the protocol card 5468's shape.
 
 ## Acceptance
 

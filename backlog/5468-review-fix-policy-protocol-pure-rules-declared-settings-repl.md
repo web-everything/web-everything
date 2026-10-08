@@ -1,9 +1,10 @@
 ---
+bornAs: xdsdeeu
 kind: story
 size: 5
 parent: "5407"
 status: open
-relatedTo: ["5461", "x8mmzuz"]
+relatedTo: ["5461", "5467"]
 scope: ["we:scripts/lib/review-fix-policy.mjs", "we:scripts/lib/review-fix-policy-settings.json", "we:scripts/lib/__tests__/review-fix-policy.replay.test.mjs"]
 dateOpened: "2026-10-08"
 tags: [delivery-standard, review, fixer]
@@ -13,19 +14,19 @@ tags: [delivery-standard, review, fixer]
 
 Fixer/review proposal, operator 2026-10-08, CROSS-CUTTING ruling (covers P1-P6 and lane protection). Every fixer and review policy becomes a standard rule: a pure decision function over plain facts plus declared settings. Today's behaviour is each setting's off value. Each rule has replay-fixture tests and standard-shaped names (no forge or label strings). The core implements behind the rules. This card defines the rule shape, the settings declaration and the fixture format, and collects the rules into the delivery standard (#5407).
 
-It relates to the Decision API slice xzlrqss (#5461): those fixtures are "events in, actions out" for decide and admission; these are "facts in, verdict out" for the review/fix policies, in the same fixture style.
+It relates to the Decision API slice 5461 (#5461): those fixtures are "events in, actions out" for decide and admission; these are "facts in, verdict out" for the review/fix policies, in the same fixture style.
 
-The rules (each slice of epic x8mmzuz adds its own rule and fixtures through this shape):
+The rules (each slice of epic 5467 adds its own rule and fixtures through this shape):
 
 | Rule | Ruling | Off value (today) | Slice |
 |---|---|---|---|
 | fix slot = active sessions only; a parked resume goes first | P1 | parked session holds its slot | push-on-green lane (A2) |
 | push on green | P2 | push waits for the next tick | push-on-green lane (A1) |
 | lane protection: verified unpushed work is not reapable or acquirable | (A3) | reap/reset with a loud warning | lane-protect-unpushed lane |
-| binding prior round | P3 | every round re-judges everything | xtzqoyq |
-| heal delta review | P4 | full re-review after a heal | xu7kxtt |
-| round budget K | P5 | none (cap 5 escalates) | xlsepow |
-| revert-red check | P6 | off | x5d9nso |
+| binding prior round | P3 | every round re-judges everything | 5470 |
+| heal delta review | P4 | full re-review after a heal | 5472 |
+| round budget K | P5 | none (cap 5 escalates) | 5471 |
+| revert-red check | P6 | off | 5466 |
 
 ## Acceptance
 

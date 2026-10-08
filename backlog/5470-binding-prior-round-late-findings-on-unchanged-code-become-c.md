@@ -1,10 +1,11 @@
 ---
+bornAs: xtzqoyq
 kind: story
 size: 3
-parent: "x8mmzuz"
+parent: "5467"
 status: open
-blockedBy: ["xm1mi56"]
-relatedTo: ["xdsdeeu", "5399"]
+blockedBy: ["5469"]
+relatedTo: ["5468", "5399"]
 scope: ["we:scripts/lib/review-loop-policy.mjs", "we:scripts/lib/review-settings.mjs", "we:scripts/operations/review-pr.mjs"]
 dateOpened: "2026-10-08"
 tags: [review]
@@ -12,7 +13,7 @@ tags: [review]
 
 # Binding prior round: late findings on unchanged code become cards
 
-Fixer/review proposal, operator 2026-10-08, P3. On code unchanged since round N, a finding that was tolerated or not raised in round N is filed as a card, not a blocker. The one exception is `broken` + `CONFIRMED`: a reviewer may still block a real defect (the #5399 floor rule). A re-raise of a finding marked "fixed" must say why the fix fails; without that it is advisory. Ruled: 3 days in shadow with a "would have blocked" journal first, then on. Needs the finding identity from xm1mi56. The rule is a pure function in the protocol card xdsdeeu's shape.
+Fixer/review proposal, operator 2026-10-08, P3. On code unchanged since round N, a finding that was tolerated or not raised in round N is filed as a card, not a blocker. The one exception is `broken` + `CONFIRMED`: a reviewer may still block a real defect (the #5399 floor rule). A re-raise of a finding marked "fixed" must say why the fix fails; without that it is advisory. Ruled: 3 days in shadow with a "would have blocked" journal first, then on. Needs the finding identity from 5469. The rule is a pure function in the protocol card 5468's shape.
 
 ## Acceptance
 
@@ -25,7 +26,7 @@ Fixer/review proposal, operator 2026-10-08, P3. On code unchanged since round N,
 ## Non-goals
 
 - [N1] No change to round 1, CI, or the drain's live gate.
-- [N2] No round budget: that is xlsepow (P5).
+- [N2] No round budget: that is 5471 (P5).
 
 ## Edge cases this change must handle
 
