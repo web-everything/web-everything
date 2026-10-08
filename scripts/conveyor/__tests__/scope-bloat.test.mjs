@@ -106,6 +106,13 @@ describe('enrichPrsWithScopeBloat — the io shell fails open and remembers the 
     expect(out.scopeBloat).toMatchObject({ stale: true, files: 5 });
   });
 
+  it('an unreadable diff is remembered: a PR whose head cannot be read costs one failed read, not one per pass', () => {
+    let reads = 0;
+    const readNet = () => { reads += 1; throw new Error('no such ref'); };
+    for (let i = 0; i < 3; i += 1) expect(enrichPrsWithScopeBloat([pr({ number: 30, headRefOid: 'f'.repeat(40) })], { ...readers, readNet })[0].scopeBloat).toBeUndefined();
+    expect(reads).toBe(1);
+  });
+
   it('a head ref that looks like a git option is refused before any git call', () => {
     const run = () => { throw new Error('git must not run'); };
     expect(() => readNetFiles({ headRefName: '--upload-pack=x', headRefOid: 'a'.repeat(40), run })).toThrow(/unsafe head ref/);
