@@ -65,6 +65,8 @@ import { daemonStatusOperation, DAEMON_STATUS_OP } from './daemon-status.mjs';
 import { collectDaemonStatus } from './daemon-status-io.mjs';
 import { heavyQueueOperation, HEAVY_QUEUE_OP } from './heavy-queue.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
+import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from './pre-pr-check.mjs';
+import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
 import { createMaintenanceSinks } from './maintenance-io.mjs';
 import { freeScopeOperation, FREE_SCOPE_OP } from './free-scope.mjs';
@@ -325,6 +327,13 @@ export const OPERATIONS = Object.freeze({
   [HEAVY_QUEUE_OP]: () => ({
     declaration: heavyQueueOperation({ collect: collectHeavyQueue }),
     sinks: {},
+  }),
+  // xcbwt4r — "is this lane's head gated by the pre-PR review, and what do I run?". Read-only (every step is
+  // `compute`, so no sinks); the real `checkPrePrReview` read is bound here, and ONLY here.
+  [PRE_PR_CHECK_OP]: () => ({
+    declaration: prePrCheckOperation({ check: createPrePrCheckReader() }),
+    sinks: {},
+    finish: finishPrePrCheckOutcome,
   }),
   // Card 105 — the maintenance pause (start|status|end). Effects go through `createMaintenanceSinks`, sink bound ONLY here.
   [MAINTENANCE_OP]: () => ({

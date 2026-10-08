@@ -309,6 +309,19 @@ node scripts/converge-cli.mjs init --lane="$LANE" --state="$STATE" --care=elevat
   panel size, or a ledger yourself — that is exactly the un-bounded prose loop this step replaces.
 - **`land`** — a non-author panel accepted the final diff and an independent red-team failed to break it;
   proceed to the PR.
+- **Ask the risk check, then run the review — every delivery, before `open-pr`.** Once the work is committed (and
+  while the step-5 verify is running), run the one-command check that applies the SAME `classifyPrRisk` rule
+  `open-pr` will apply:
+
+  ```bash
+  node scripts/operations/run.mjs pre-pr-check --checkout="$LANE"
+  ```
+
+  It prints `pre-pr-check: gated` or `pre-pr-check: not gated`. **Not gated** — go on to `open-pr`. **Gated** — it
+  prints the exact four commands: `converge-cli.mjs init` (as above), drive `step` to `land`, commit the fixes, then
+  `node scripts/converge-cli.mjs receipt --lane="$LANE" --state="$STATE"`. Run them BEFORE `open-pr`, then re-run
+  `pre-pr-check` (it must now say a valid receipt exists). Skipping this opens a risky PR that `open-pr` warns about
+  today and refuses once the gate is `enforce`.
 - **RISKY code PRs MUST have a receipt — `open-pr` refuses without one** (`prePrReview.mode` in
   `we:scripts/pre-pr-review-settings.json`: `off`|`advise`|`enforce`; this repo is `advise` until the hardening card lands, then `enforce`). A PR is risky when
   ANY of: more than 264 lines, more than 2 subsystems, more than 5 files, no prepared card in the diff, or an

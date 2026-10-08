@@ -22,6 +22,9 @@ import { fileURLToPath } from 'node:url';
 import { isCardPath } from '../ci-card-only.mjs';
 import { isAllowlistedLitterPath } from './lane-litter.mjs';
 import { classifySession } from '../operations/session-role.mjs';
+import { prePrReviewCommands, shellWord } from './pre-pr-commands.mjs';
+
+export { prePrReviewCommands };
 
 export const PRE_PR_MODES = Object.freeze(['off', 'advise', 'enforce']);
 export const BUILT_IN_PRE_PR_SETTINGS = Object.freeze({ mode: 'advise', maxLines: 264, maxSubsystems: 2, maxFiles: 5 });
@@ -133,7 +136,7 @@ export const isScratchPath = (p) => CONVERGE_SCRATCH_RE.test(p) || isAllowlisted
  * The gate decision. `skip` is a recorded bypass reason. Never throws.
  * @returns {{action: 'pass'|'advise'|'refuse', why: string, message: string}}
  */
-export function decidePrePrReview({ settings, risk, receipt, headTree, baseSha = '', skip = '' }) {
+export function decidePrePrReview({ settings, risk, receipt, headTree, baseSha = '', skip = '', lane = '<lane>' }) {
   if (settings.mode === 'off') return { action: 'pass', why: 'mode-off', message: '' };
   if (!risk.gated) return { action: 'pass', why: risk.cardOnly ? 'card-only' : 'low-risk', message: '' };
   // The receipt binds the head TREE and the BASE (merge-base) the panel diffed against: the same tree opened against
@@ -148,8 +151,8 @@ export function decidePrePrReview({ settings, risk, receipt, headTree, baseSha =
       ? `the receipt is for tree ${String(receipt.tree).slice(0, 12)}, but HEAD is tree ${String(headTree).slice(0, 12)} (edited since the review)`
       : 'no pre-PR review receipt exists for this head';
   const msg = `pre-PR review required — this PR is risky (${risk.reasons.join('; ')}) and ${detail}. `
-    + 'Run `/converge` against this lane (brief step 6), then `node scripts/converge-cli.mjs receipt --lane=<lane> --state=<file>` '
-    + 'on the committed head, and open the PR again. Bypass only with `--skipPrePrReview=<reason>` (the reason is recorded). A bypass also needs `--actor=<name>` and `--operatorInstruction="<quoted operator instruction>"`; a dispatched worker is refused a bypass.';
+    + `Run the review before open-pr (or run \`node scripts/operations/run.mjs pre-pr-check --checkout=${lane === '<lane>' ? lane : shellWord(lane)}\` to see it): ${prePrReviewCommands(lane).text}. `
+    + 'Then open the PR again. Bypass only with `--skipPrePrReview=<reason>` (the reason is recorded). A bypass also needs `--actor=<name>` and `--operatorInstruction="<quoted operator instruction>"`; a dispatched worker is refused a bypass.';
   if (settings.mode === 'advise') return { action: 'advise', why, message: msg };
   if (typeof skip === 'string' && skip.trim()) return { action: 'pass', why: 'bypass', message: '' };
   return { action: 'refuse', why, message: msg };
@@ -296,7 +299,7 @@ export function checkPrePrReview({ cwd, base = 'main', sha = 'HEAD', env = proce
   const baseSha = mergeBaseOf({ cwd, base, sha });
   const wantsSkip = typeof skip === 'string' && skip.trim() !== '';
   const auth = wantsSkip ? authoriseBypass({ role: sessRole, actor, operatorInstruction }) : { ok: true, refusal: '' };
-  const decision = decidePrePrReview({ settings: s, risk, receipt: readReceipt(cwd), headTree, baseSha, skip: auth.ok ? skip : '' });
+  const decision = decidePrePrReview({ settings: s, risk, receipt: readReceipt(cwd), headTree, baseSha, skip: auth.ok ? skip : '', lane: resolve(cwd) });
   if (wantsSkip && !auth.ok && decision.action === 'refuse') decision.message = `bypass refused — ${auth.refusal}. ${decision.message}`;
   if (decision.why === 'bypass') {
     recordBypass(cwd, { reason: skip, head: sha, risk, actor, operatorInstruction, ...(recordDir ? { recordDir } : {}) });

@@ -407,6 +407,18 @@ uses ([delivery-agent-brief.md](delivery-agent-brief.md) step 6). Confirm the re
 and introduces no new problem. Address every finding to convergence (fix it, or dismiss it with a one-line reason).
 A trivial, obviously-correct heal (a clean merge with no code change) may skip the subagent.
 
+**Pre-PR review, when a heal is itself risky (same rule `open-pr` applies).** After you commit and BEFORE step 4's `request`
+(or while its verify runs), ask the risk check on your lane:
+
+```bash
+node "{{WE_ROOT}}/scripts/operations/run.mjs" pre-pr-check --checkout="$LANE"
+```
+
+`pre-pr-check: not gated` — nothing more to do. `pre-pr-check: gated` — it prints the exact commands: run the
+`/converge` flow (`node "{{WE_ROOT}}/scripts/converge-cli.mjs" init …`, drive `step` to `land`, commit the fixes) and stamp
+`node "{{WE_ROOT}}/scripts/converge-cli.mjs" receipt --lane="$LANE" --state="$LANE/.converge-state.json"`, as the delivery brief's step 6 does
+([delivery-agent-brief.md](delivery-agent-brief.md)). `$LANE` is your lane clone's absolute root (`pwd` at its top level).
+
 ### 6. Commit (before step 4's request) — the harness re-pushes it to the SAME lane ref
 
 Commit only the heal's files (explicit paths, never `git add -A`; one commit) on the lane's current branch, BEFORE

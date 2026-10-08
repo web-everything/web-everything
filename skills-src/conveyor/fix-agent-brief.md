@@ -468,6 +468,18 @@ For anything beyond a trivial one-liner, spawn **one adversarial code-review sub
 uses ([we:skills-src/conveyor/delivery-agent-brief.md](delivery-agent-brief.md) step 6). Ask the subagent four things: does the repair meet the reviewer's finding, does the repair itself introduce a new problem, **what is the next variant of the same defect class that still gets through?**, and **which row of the variant matrix did this fix not cover?** A same-class variant it names inside `{{SCOPE}}` is must-fix before re-push. A defect the repair itself introduces is must-fix regardless of class — "not the same class" never dismisses it. You may dismiss any other self-review finding only as "not the same class" or "outside `{{SCOPE}}` (filed as <card>)". Deferring ("later", "follow-up") is not a dismissal. Only then commit and request verify (step 4). A trivial, obviously-correct fix (a typo, a
 pinned-count bump) may skip the subagent — but never skip re-reading the reviewer's finding to confirm you met it.
 
+**Pre-PR review, when a repair is itself risky (same rule `open-pr` applies).** After you commit and BEFORE step 4's `request`
+(or while its verify runs), ask the risk check on your lane:
+
+```bash
+node "{{WE_ROOT}}/scripts/operations/run.mjs" pre-pr-check --checkout="$LANE"
+```
+
+`pre-pr-check: not gated` — nothing more to do. `pre-pr-check: gated` — it prints the exact commands: run the
+`/converge` flow (`node "{{WE_ROOT}}/scripts/converge-cli.mjs" init …`, drive `step` to `land`, commit the fixes) and stamp
+`node "{{WE_ROOT}}/scripts/converge-cli.mjs" receipt --lane="$LANE" --state="$LANE/.converge-state.json"`, as the delivery brief's step 6 does
+([delivery-agent-brief.md](delivery-agent-brief.md)). `$LANE` is your lane clone's absolute root (`pwd` at its top level).
+
 ### 6. Commit (before step 4's request) — the harness re-pushes it to the SAME lane ref
 
 Commit only the repair's files (explicit paths, never `git add -A`; one commit) on the lane's current branch,
