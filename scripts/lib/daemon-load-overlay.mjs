@@ -58,6 +58,7 @@ import { addOverlay, removeOverlay, appendOverlayEvent } from './daemon-overlays
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild.mjs';
 import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
 import { resolveVersionedContext, submitRequest, waitForResult } from './daemon-version-runtime.mjs';
+import { rollback as rollbackVersion } from './daemon-version-switch.mjs';
 
 /** Throw unless `ref` passes {@link isSafeBranchName} — same argv-injection defense
  *  `daemon-self-sync.mjs#assertSafeBranchName` applies to a POC branch; `--ref` is operator input here, but
@@ -456,7 +457,7 @@ export async function runDaemonLoadOverlay({
   clone, ref, pr = null, base = 'main', dryRun = false, env = process.env, log = console,
   addedBy, reason = null, now,
   addOverlayFn = addOverlay, rebuild = rebuildClone, dryRunRebuildFn = dryRunRebuild,
-  wait = false, waitMs, versions, submit = submitRequest, waitFor = waitForResult,
+  wait = false, waitMs, versions, submit = submitRequest, waitFor = waitForResult, rollbackVersionFn = rollbackVersion,
   settings, baseSmoke = runLiveSmokeWithRetry, dispatchSmoke = runRealDispatchSmoke, inspect = overlayDispatchFiles,
   removeOverlayFn = removeOverlay, appendEventFn = appendOverlayEvent,
 }) {
@@ -488,22 +489,92 @@ export async function runDaemonLoadOverlay({
   // Card 89 S5: a versioned clone has no lock to take and is never rebuilt from this CLI. The request file is
   // the daemon's in-tick updater's input; `--wait` blocks on its result file instead of on a clone lock.
   const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
+  const smokeOn = safety.dispatchSmoke === 'on';
+
+  // A worker launch that THROWS is a failed smoke (a rollback), never an unhandled rejection that leaves the overlay registered.
+  const smokeTree = async (tree) => {
+    try { return await dispatchSmoke({ tree, env, settings: safety, log }); } catch (e) {
+      return { ok: false, reason: 'smoke-threw', detail: String((e && e.message) || e).split('\n')[0] };
+    }
+  };
+  const notRun = (why) => {
+    warnings.push('dispatch-smoke-not-run');
+    log.error?.(`daemon-load-overlay: WARNING — NO dispatch smoke ran for ${ref}: ${why}. It stays registered and unsmoked.`);
+  };
+
+  // ROLLBACK — remove ONLY this overlay, then recover through `rebuildWithout`: main + every other overlay, unchanged.
+  const rollBack = async (out, ctl, rebuildWithout) => {
+    const why = `dispatch-smoke-failed: ${ctl.result.reason}${ctl.result.detail ? ` — ${ctl.result.detail}` : ''}`;
+    log.error?.(`daemon-load-overlay: ${ref} FAILED the dispatch smoke (${ctl.phase}): ${why}. Removing it and recovering without it (other overlays untouched). Evidence: ${ctl.result.scratch ?? 'n/a'}${ctl.result.transcript ? `, transcript ${ctl.result.transcript}` : ''}`);
+    removeOverlayFn(root, ref, { env, why });
+    try {
+      appendEventFn(root, {
+        kind: 'removed', ref, pr, by: 'daemon-load-overlay', reason: why,
+      }, { env });
+    } catch { /* the audit line is best-effort; the removal above is what matters */ }
+    let rebuilt;
+    try { rebuilt = await rebuildWithout(); } catch (e) { rebuilt = { reason: `error: ${String((e && e.message) || e).split('\n')[0]}`, adopted: false }; }
+    return {
+      ...out, registered: false, adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed',
+      rollback: { reason: rebuilt.reason, adopted: !!rebuilt.adopted }, head: rebuilt.head !== undefined ? rebuilt.head : out.head,
+      alerts: [...(out.alerts || []), ...(rebuilt.alerts || [])],
+    };
+  };
+
   if (vctx) {
     const requestId = submit(vctx, { ref, pr, by });
-    if (!wait) return { root, ref, homeBranch: base, registered: true, versioned: true, requestId, pending: true, warnings };
+    // The in-tick updater is the one that builds and adopts, so this CLI can only smoke what a --wait result reports
+    // adopted. Without --wait nothing has been built yet: say so loudly rather than let "registered" read as "smoked".
+    if (!wait) {
+      if (smokeOn) notRun("it is queued for the versioned clone's in-tick updater and nothing here will smoke it; re-run with --wait to smoke the adopted version");
+      return {
+        root, ref, homeBranch: base, registered: true, versioned: true, requestId, pending: true, warnings,
+        ...(smokeOn ? { dispatchSmoke: { ran: false, skipped: 'versioned-no-wait' } } : {}),
+      };
+    }
     const result = await waitFor(vctx, requestId, waitMs != null ? { timeoutMs: waitMs } : {});
-    return {
+    const out = {
       root, ref, homeBranch: base, registered: true, versioned: true, requestId, request: result,
       mergedAnything: !!result.moved, adopted: !!result.adopted, reason: result.reason ?? result.status, head: result.head,
       timedOut: result.status === 'timeout', warnings,
     };
+    if (!smokeOn) return out;
+    if (!result.adopted) {
+      notRun(`the updater did not adopt a version (${out.reason}); a later tick may adopt it without a smoke`);
+      return { ...out, dispatchSmoke: { ran: false, skipped: 'not-adopted' } };
+    }
+    // Smoke the version THIS request adopted (the result names it) — `current` may have moved on since. Today the
+    // updater builds origin/main only (`overlaysApplied: false`), so the overlay is usually not in it: then say so.
+    const versionId = typeof result.versionId === 'string' && /^[0-9A-Za-z][0-9A-Za-z._-]*$/.test(result.versionId) ? result.versionId : null;
+    const tree = versionId ? join(vctx.dir, 'versions', versionId) : null;
+    let info = { inTree: false, required: false };
+    if (tree) {
+      try { info = inspect({ tree, ref, patterns: safety.dispatchPaths }); } catch { info = { inTree: true, required: true, matched: [], reason: 'inspect-threw' }; } // fail CLOSED
+    }
+    if (!info.inTree) {
+      notRun(`it is not in the adopted versioned tree${tree ? ` (${tree})` : ' (the result names no version)'}`);
+      return { ...out, dispatchSmoke: { ran: false, skipped: 'overlay-not-in-versioned-tree' } };
+    }
+    if (!info.required) return { ...out, dispatchSmoke: { ran: false, skipped: 'not-dispatch-path' } };
+    const ctl = {
+      ran: true, phase: 'post-adopt', required: true, matched: info.matched, result: await smokeTree(tree),
+    };
+    if (ctl.result.ok) return { ...out, dispatchSmoke: ctl };
+    // The overlay is removed from the list, and the adopted version is rolled back with the daemon's own version
+    // rollback (it flips `current` to `previous` and holds the rejected sha until main moves) — re-requesting a build
+    // would only rebuild origin/main, which already contains this tree.
+    return rollBack({ ...out, dispatchSmoke: ctl }, ctl, async () => {
+      const rolled = await rollbackVersionFn({
+        clone: vctx.clone, home: vctx.home, settings: vctx.settings, by: 'daemon-load-overlay', reason: `dispatch-smoke-failed: ${ref}`,
+      });
+      return { reason: rolled?.status ?? 'unknown', adopted: rolled?.status === 'switched', head: null };
+    });
   }
-  const smokeOn = safety.dispatchSmoke === 'on';
   const ctl = { ran: false, phase: null, required: null, result: null };
   const runSmoke = smokeOn ? withDispatchSmoke({
     baseSmoke, ref, settings: safety, dispatchSmoke, inspect, ctl, log,
   }) : baseSmoke;
-  let rebuildResult = await rebuild({
+  const rebuildResult = await rebuild({
     root, env, log, mainOnly: false, runSmoke,
   });
 
@@ -512,10 +583,11 @@ export async function runDaemonLoadOverlay({
   if (smokeOn && !ctl.ran) {
     const info = inspect({ tree: root, ref, patterns: safety.dispatchPaths });
     if (info.inTree && info.required) {
-      const smoke = await dispatchSmoke({ tree: root, env, settings: safety, log });
       Object.assign(ctl, {
-        ran: true, phase: 'post-adopt', required: true, matched: info.matched, result: smoke,
+        ran: true, phase: 'post-adopt', required: true, matched: info.matched, result: await smokeTree(root),
       });
+    } else if (!info.inTree) {
+      notRun(`it is not in the live tree (${rebuildResult.reason ?? 'rebuild not adopted'})`);
     }
   }
 
@@ -526,23 +598,9 @@ export async function runDaemonLoadOverlay({
   };
   if (!ctl.ran || ctl.result?.ok) return out;
 
-  // ROLLBACK — remove ONLY this overlay and rebuild through the same gate: main + every other overlay, unchanged.
-  const why = `dispatch-smoke-failed: ${ctl.result.reason}${ctl.result.detail ? ` — ${ctl.result.detail}` : ''}`;
-  log.error?.(`daemon-load-overlay: ${ref} FAILED the dispatch smoke (${ctl.phase}): ${why}. Removing it and rebuilding without it (other overlays untouched). Evidence: ${ctl.result.scratch ?? 'n/a'}${ctl.result.transcript ? `, transcript ${ctl.result.transcript}` : ''}`);
-  removeOverlayFn(root, ref, { env, why });
-  try {
-    appendEventFn(root, {
-      kind: 'removed', ref, pr, by: 'daemon-load-overlay', reason: why,
-    }, { env });
-  } catch { /* the audit line is best-effort; the removal above is what matters */ }
-  rebuildResult = await rebuild({
+  return rollBack(out, ctl, () => rebuild({
     root, env, log, mainOnly: false, runSmoke: baseSmoke,
-  });
-  return {
-    ...out, registered: false, adopted: false, rolledBack: true, reason: 'dispatch-smoke-failed',
-    rollback: { reason: rebuildResult.reason, adopted: !!rebuildResult.adopted }, head: rebuildResult.head ?? out.head,
-    alerts: [...(out.alerts || []), ...(rebuildResult.alerts || [])],
-  };
+  }));
 }
 
 function parseFlags(argv) {
@@ -579,7 +637,7 @@ if (IS_CLI) {
       } else if (result.rolledBack) {
         const d = result.dispatchSmoke || {};
         process.stdout.write(`daemon-load-overlay: ${ref} FAILED the dispatch smoke (${d.phase}: ${d.result?.reason}${d.result?.detail ? ` — ${d.result.detail}` : ''}) — `
-          + `ROLLED BACK: overlay removed, clone rebuilt without it (${result.rollback?.reason}) at ${result.root}, head ${result.head ?? 'unchanged'}\n`
+          + `ROLLED BACK: overlay removed, ${result.rollback?.adopted ? 'recovered without it' : 'recovery was NOT done — the bad tree may still be live'} (${result.rollback?.reason}) at ${result.root}, head ${result.head ?? 'n/a'}\n`
           + `  evidence: ${d.result?.scratch ?? 'n/a'}${d.result?.transcript ? ` transcript ${d.result.transcript}` : ''}\n`);
       } else if (result.dryRun) {
         process.stdout.write(
