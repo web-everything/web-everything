@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pushMissingRunCommit, recoveryPushCredential, RECOVERY_COMMIT_MARKER } from '../missing-run-push.mjs';
-import { countMissingRunComments, buildMissingRunComment } from '../main-red-recovery.mjs';
+import { countMissingRunComments, buildMissingRunComment, MISSING_RUN_CREDENTIAL_REFUSAL, MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL } from '../main-red-recovery.mjs';
 
 const sha = '1f7481b9bccf75ae1c37ed5705ec2ab57d77a9c7';
 const next = 'a'.repeat(40);
@@ -28,7 +28,7 @@ function fixture({ live = pr, fetched = sha, message = 'fix', failPush = false, 
     if (args.includes('push') && failPush) throw new Error('secret credential in error');
     return '';
   });
-  const result = pushMissingRunCommit(d, { repo, exec, env, checkClaim });
+  const result = pushMissingRunCommit(d, { repo, exec, env, checkClaim, readCache: () => null });
   return { result, calls, exec };
 }
 describe('missing-run PR-event recovery', () => {
@@ -43,7 +43,7 @@ describe('missing-run PR-event recovery', () => {
       seedGit('update-ref', `refs/heads/${d.headRefName}`, head);
       let observedPush = false;
       const result = pushMissingRunCommit({ ...d, headSha: head }, {
-        repo, env: { PATH: process.env.PATH, GH_TOKEN: 'ghp_test-secret' }, checkClaim: () => null,
+        repo, env: { PATH: process.env.PATH, GH_TOKEN: 'ghp_test-secret' }, checkClaim: () => null, readCache: () => null,
         exec(cmd, args, opts) {
           if (cmd === 'gh') return JSON.stringify({ ...pr, head: { ...pr.head, sha: head } });
           if (args.includes('push')) {
@@ -124,7 +124,7 @@ describe('missing-run PR-event recovery', () => {
       return '';
     });
     let result;
-    expect(() => { result = pushMissingRunCommit(d, { repo, exec, env: { GH_TOKEN: 'ghp_test-secret' }, checkClaim: () => null }); }).not.toThrow();
+    expect(() => { result = pushMissingRunCommit(d, { repo, exec, env: { GH_TOKEN: 'ghp_test-secret' }, checkClaim: () => null, readCache: () => null }); }).not.toThrow();
     expect(result).toEqual({ ok: false, action: 'pull-request-push', error: 'missing-run recovery failed during fetch' });
     expect(JSON.stringify(result)).not.toContain('ghp_test-secret');
   });
@@ -150,7 +150,7 @@ describe('missing-run PR-event recovery', () => {
   it('never invokes git with an unverified installation credential', () => {
     const { result, calls } = fixture({ env: { GH_TOKEN: 'ghs_actions' } });
     // Structural, not transient: a counted failure so the per-sha cap hands the PR off (no free deferral).
-    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('push requires a PAT') });
+    expect(result).toMatchObject({ ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL });
     expect(result.deferred).toBeUndefined();
     expect(calls).toHaveLength(1);
   });
@@ -167,11 +167,11 @@ describe('missing-run PR-event recovery', () => {
         if (args.includes('show')) return 'fix';
         return '';
       });
-      return { result: pushMissingRunCommit(d, { repo, exec, env: {}, checkClaim: () => null }), calls };
+      return { result: pushMissingRunCommit(d, { repo, exec, env: {}, checkClaim: () => null, readCache: () => null }), calls };
     };
     const bad = run('ghs_unbound');
     expect(bad.calls).toContain('gh auth token --hostname github.com');
-    expect(bad.result).toMatchObject({ ok: false, error: expect.stringContaining('push requires a PAT') });
+    expect(bad.result).toMatchObject({ ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL });
     expect(bad.result.deferred).toBeUndefined();
     const good = run('ghp_from_gh_cli');
     expect(good.calls).toContain('gh auth token --hostname github.com');
@@ -179,7 +179,7 @@ describe('missing-run PR-event recovery', () => {
   });
   it('honours a non-default defaultBranch when judging stacked PRs', () => {
     const onDev = { ...pr, base: { ref: 'develop' } };
-    const run = (defaultBranch) => pushMissingRunCommit(d, { repo, defaultBranch, env: { GH_TOKEN: 'ghp_test-secret' }, checkClaim: () => null,
+    const run = (defaultBranch) => pushMissingRunCommit(d, { repo, defaultBranch, env: { GH_TOKEN: 'ghp_test-secret' }, checkClaim: () => null, readCache: () => null,
       exec: (cmd, args) => (cmd === 'gh' ? JSON.stringify(onDev)
         : args.includes('FETCH_HEAD') ? sha : args.includes('commit-tree') ? next : args.includes('show') ? 'fix' : args.includes(`${sha}^{tree}`) ? 'b'.repeat(40) : '') });
     expect(run('main')).toMatchObject({ ok: false, error: expect.stringContaining('stacked or from a fork') });
@@ -206,5 +206,78 @@ describe('missing-run PR-event recovery', () => {
     expect(body).toContain(`sha: ${sha}\nrecovery-sha: ${next}`);
     expect(body).toContain('requested CI via pull-request-push; PR checks must still be observed');
     expect(body).not.toContain('triggered CI');
+  });
+});
+
+describe('xgq539z - plateau-app (per-owner credential) missing-run recovery', () => {
+  const plateau = 'plateauapp/plateau-app';
+  const sha2 = '2f7481b9bccf75ae1c37ed5705ec2ab57d77a9c7';
+  const dP = { prNumber: 216, headRefName: 'lane/xwtnr2y-sessions-page', headSha: sha2 };
+  const prP = { state: 'open', mergeable: true, head: { sha: sha2, ref: dP.headRefName, repo: { full_name: plateau } }, base: { ref: 'main' } };
+  const NOW = Date.parse('2026-10-08T12:00:00Z');
+  const cache = (installationId, token) => ({ v: 2, installationId, token, expiresAt: '2026-10-08T13:00:00Z' });
+  function run(readCache, env, slug = plateau) {
+    const calls = [];
+    const prFor = { ...prP, head: { ...prP.head, repo: { full_name: slug } } };
+    const exec = vi.fn((cmd, args, opts) => {
+      calls.push({ cmd, args, opts });
+      if (cmd === 'gh') return args[0] === 'auth' ? 'ghs_unbound-token' : JSON.stringify(prFor);
+      if (args.includes('FETCH_HEAD')) return sha2;
+      if (args.includes('show')) return 'fix';
+      if (args.includes('commit-tree')) return next;
+      return args.includes(`${sha2}^{tree}`) ? 'b'.repeat(40) : '';
+    });
+    const result = pushMissingRunCommit(dP, { repo: slug, exec, env, readCache, now: NOW, checkClaim: () => null });
+    return { result, calls };
+  }
+  it('pushes a plateauapp PR with the plateauapp installation token, not the daemon env token', () => {
+    const { result, calls } = run(() => cache(167639975, 'ghs_plateau-owner-token'), { GH_TOKEN: 'ghs_we-token' });
+    expect(result).toMatchObject({ ok: true, action: 'pull-request-push' });
+    expect(calls.find(c => c.args.includes('push')).opts.env.WE_CI_PUSH_TOKEN).toBe('ghs_plateau-owner-token');
+  });
+  it('still refuses an unverifiable ghs_ token when the owner has no fresh installation cache', () => {
+    const { result } = run(() => null, { GH_TOKEN: 'ghs_we-token' });
+    expect(result).toMatchObject({ ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL });
+  });
+  // One negative test per guard on the owner-token bypass (ownerInstallationToken). The bypass skips
+  // recoveryPushCredential for ANY non-null owner token, so each guard must be pinned on its own: dropping it
+  // would hand an expired / wrong-owner / non-installation token to git as the trusted credential.
+  describe('rejects an untrustworthy owner-installation cache (never reaches git)', () => {
+    const rejected = [
+      ['an expired cache', { ...cache(167639975, 'ghs_plateau-owner-token'), expiresAt: '2026-10-08T11:00:00Z' }],
+      ['a cache inside the refresh buffer (expires in 5 minutes)', { ...cache(167639975, 'ghs_plateau-owner-token'), expiresAt: '2026-10-08T12:05:00Z' }],
+      ['a cache without an expiry', { v: 2, installationId: 167639975, token: 'ghs_plateau-owner-token' }],
+      ['a cache of another cache version', { ...cache(167639975, 'ghs_plateau-owner-token'), v: 1 }],
+      ['a cache bound to another installation', cache(999, 'ghs_wrong-owner-token')],
+      ['a cache with no installationId', cache(undefined, 'ghs_plateau-owner-token')],
+      ['a non-ghs_ cached token', cache(167639975, 'ghp_not-an-installation-token')],
+      ['a cached token that is not a string', cache(167639975, 12345)],
+      ['an empty cached token', cache(167639975, '')],
+    ];
+    for (const [name, entry] of rejected) {
+      it(`refuses with an ineligible fallback credential: ${name}`, () => {
+        const { result, calls } = run(() => entry, { GH_TOKEN: 'ghs_we-token' });
+        expect(result).toMatchObject({ ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL });
+        expect(calls.some(c => c.cmd === 'git')).toBe(false);
+      });
+      it(`falls back to the eligible env credential, never the cached token: ${name}`, () => {
+        const { result, calls } = run(() => entry, { GH_TOKEN: 'ghp_eligible-fallback' });
+        expect(result).toMatchObject({ ok: true });
+        const tokens = calls.filter(c => c.cmd === 'git').map(c => c.opts.env.WE_CI_PUSH_TOKEN);
+        expect(tokens.length).toBeGreaterThan(0);
+        expect(new Set(tokens)).toEqual(new Set(['ghp_eligible-fallback']));
+      });
+    }
+    it('does not trust a cache for an owner with no configured installation', () => {
+      const { result, calls } = run(() => cache(167639975, 'ghs_plateau-owner-token'), { GH_TOKEN: 'ghs_we-token' }, 'unknownorg/some-repo');
+      expect(result).toMatchObject({ ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL });
+      expect(calls.some(c => c.cmd === 'git')).toBe(false);
+    });
+  });
+  it('does not count legacy wrong-owner credential refusals, but still counts a current one (structural refusals stay capped)', () => {
+    const mk = (error) => ({ author: { login: 'web-everything' }, body: buildMissingRunComment({ headSha: sha2, ok: false, error }) });
+    const legacy = mk(MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL);
+    expect(countMissingRunComments([legacy, legacy], sha2)).toBe(0);
+    expect(countMissingRunComments([legacy, mk(MISSING_RUN_CREDENTIAL_REFUSAL), mk('missing-run recovery failed during push')], sha2)).toBe(2);
   });
 });
