@@ -1251,6 +1251,15 @@ describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonEx
     b.loopEnded('signal');
     expect(calls).toEqual(['stop']); // shutdown already released and exited
   });
+  it('onTick logs one line per claim the tick released on completion (R5), and none when nothing was released', () => {
+    const log = { error: vi.fn() };
+    const effects = buildCliDaemonEffects({ owner: 'x', log });
+    effects.onTick({ repos: [], awaitVerify: { rows: [], released: [{ repo: 'we', pr: 21, kind: 'fix', session: 'fix-21', doneAt: '2026-10-08T20:00:00.000Z' }] } });
+    expect(log.error).toHaveBeenCalledWith('reconcile-fix-dispatch-daemon: released completed claim fix-21 (we) — completion record done at 2026-10-08T20:00:00.000Z');
+    log.error.mockClear();
+    effects.onTick({ repos: [], awaitVerify: { rows: [], released: [] } });
+    expect(log.error.mock.calls.filter(([l]) => /released completed claim/.test(l))).toEqual([]);
+  });
   it('the tick and main() call the factories (thin call-site checks; the behaviour is above)', () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'reconcile-fix-dispatch-daemon.mjs'), 'utf8');
     expect(src).toMatch(/buildAwaitVerifyStep\(\)\(\{ allowResume: !authGate\.paused \}\)/);
