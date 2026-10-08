@@ -145,36 +145,54 @@ export function isMainCurrentlyRed(windows) {
 }
 
 /**
- * we:scripts/conveyor/main-red-recovery.mjs#isMainRecoveredForCheck — xd3dkzx (live 2026-10-08): has `main`
- * recovered for ONE check, even while its workflow as a whole is still red? PURE. `main`'s CI stayed red for hours
- * on `daemon-soak` alone while its `test` job passed; PRs #4494/#4446/#4511 had failed `test` inside that window,
- * and the whole-workflow gate ({@link isMainCurrentlyRed}) refused their owed refresh every tick — forever.
+ * we:scripts/conveyor/main-red-recovery.mjs#mainCheckGreenSince — xd3dkzx (live 2026-10-08): since when has `main`
+ * been green again for ONE check, even while its workflow as a whole is still red? PURE. `main`'s CI stayed red for
+ * hours on `daemon-soak` alone while its `test` job passed; PRs #4494/#4446/#4511 had failed `test` inside that
+ * window, and the whole-workflow gate ({@link isMainCurrentlyRed}) refused their owed refresh every tick, forever.
  *
- * Reads `mainRuns` newest-first, skipping runs that prove nothing (in flight, `cancelled`/`skipped`/`neutral`,
- * `infraCancelledOnly`). The first decisive run answers: `success` → recovered; a red run → recovered only when its
- * `checkConclusions` (annotated by `reconcile-pass.mjs#defaultReadMainRuns` off a complete job inventory) says
- * `checkName` passed. A red run whose map lacks `checkName` did not run that check, so the next older run answers.
- * A red run with NO map (jobs unread) is `false` — never a guess. No check name or no runs → `false`.
+ * Returns the `updatedAt` of the OLDEST run in main's current green streak for `checkName` — the moment main proved
+ * that check healthy again — or `null` when there is no such proof. Runs that prove nothing are skipped (in flight,
+ * `cancelled`/`skipped`/`neutral`, `infraCancelledOnly`). A decisive run is green for the check when it concluded
+ * `success`, or concluded red with `checkConclusions[checkName] === 'success'` (annotated by
+ * `reconcile-pass.mjs#defaultReadMainRuns` off a COMPLETE job list). A red run whose map lacks the check did not run
+ * it and is skipped. `null` (never a guess) when: no check name; the newest decisive run has the check red; a red
+ * run has NO map (jobs unread) before any green-for-check run; or no red-for-check run exists in the history at all
+ * (nothing shows main's own copy of the check was ever red, so nothing proves a recovery).
  * @param {{checkName?:(string|null), mainRuns?:Array<object>}} [o]
- * @returns {boolean}
+ * @returns {string|null}
  */
-export function isMainRecoveredForCheck({ checkName = null, mainRuns = [] } = {}) {
-  if (!checkName) return false;
+export function mainCheckGreenSince({ checkName = null, mainRuns = [] } = {}) {
+  if (!checkName) return null;
   const decisive = (Array.isArray(mainRuns) ? mainRuns : [])
     .filter((r) => r && String(r.status).toLowerCase() === 'completed' && r.updatedAt && r.infraCancelledOnly !== true)
     .filter((r) => { const c = String(r.conclusion || '').toLowerCase(); return c === 'success' || MAIN_RED_CONCLUSIONS.includes(c); })
     .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  let since = null;
   for (const run of decisive) {
-    if (String(run.conclusion).toLowerCase() === 'success') return true;
-    const map = run.checkConclusions;
-    if (!map || typeof map !== 'object') return false;
-    if (!Object.hasOwn(map, checkName)) continue;
-    return String(map[checkName]).toLowerCase() === 'success';
+    let verdict; // 'green' | 'red' | 'unknown' | 'not-run'
+    if (String(run.conclusion).toLowerCase() === 'success') verdict = 'green';
+    else if (!run.checkConclusions || typeof run.checkConclusions !== 'object') verdict = 'unknown';
+    else if (!Object.hasOwn(run.checkConclusions, checkName)) verdict = 'not-run';
+    else verdict = String(run.checkConclusions[checkName]).toLowerCase() === 'success' ? 'green' : 'red';
+    if (verdict === 'not-run') continue;
+    if (verdict === 'green') { since = run.updatedAt; continue; }
+    // A red (or unreadable) run ends the streak: only a streak that began after a real red-for-check run counts.
+    return verdict === 'red' ? since : null;
   }
-  return false;
+  return null;
 }
 
-/** xd3dkzx — declared setting `WE_MAIN_RECOVERY_SCOPE`: `check` (default — main counts as recovered for a PR once
+/** xd3dkzx — is a PR's failure of `checkName` (completed at `failureCompletedAt`) one main has since recovered from?
+ *  True only when the failure completed BEFORE main's current green streak for that check began
+ *  ({@link mainCheckGreenSince}). A failure after that moment is not main's (main's check was already green), so a
+ *  refreshed PR that fails again is never refreshed again by this path — it waits, as before. PURE. */
+export function isMainRecoveredForCheck({ checkName = null, mainRuns = [], failureCompletedAt = null } = {}) {
+  const since = mainCheckGreenSince({ checkName, mainRuns });
+  const failedAt = Date.parse(failureCompletedAt);
+  return since != null && Number.isFinite(failedAt) && failedAt < Date.parse(since);
+}
+
+/** xd3dkzx — env setting `WE_MAIN_RECOVERY_SCOPE` (same in-module pattern as `WE_MAIN_DEFECT_REBASES_PER_SHA` / `WE_PR_SCOPED_CHECKS`; this repo has no central env registry): `check` (default — main counts as recovered for a PR once
  *  the PR's own failing check is green on main, see {@link isMainRecoveredForCheck}) or `workflow` (the old gate:
  *  wait until main's whole CI workflow is green). Anything else reads as the default. PURE over `env`. */
 export function resolveMainRecoveryScope(env = process.env) {
@@ -634,7 +652,7 @@ export function planMainRedRebases({
     // PR's own failing check is green on main again. Then the refresh is owed now: the merge gate still demands
     // every required check green on the PR itself, and the per-head cap below still bounds the attempts.
     const recoveredCheck = mainStillRed && recoveryScope === 'check'
-      && isMainRecoveredForCheck({ checkName: base.failingCheckName, mainRuns }) ? base.failingCheckName : null;
+      && isMainRecoveredForCheck({ checkName: base.failingCheckName, mainRuns, failureCompletedAt: base.failureCompletedAt }) ? base.failingCheckName : null;
     if (mainStillRed && !recoveredCheck) {
       refusals.push({
         ...base, kind: 'main-still-red',
