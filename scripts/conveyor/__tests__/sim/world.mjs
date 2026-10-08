@@ -100,6 +100,10 @@ function buildWeTemplate() {
       // npm packages (`gray-matter`, `markdown-it`) already resolved via the symlinked `node_modules` below —
       // no other local repo-relative file is needed.
       'src/_data/backlog.js',
+      // `we:scripts/operations/worker-result.mjs` reads this schema BY PATH at import time, relative to the
+      // clone's own `scripts/operations/` — and `completion-store.mjs` (so `lane-pool.mjs provision`, every
+      // daemon) imports it transitively. Without it every sim-world `lane-pool.mjs` call dies on import ENOENT.
+      'schemas/worker-result.v1.json',
     ],
     { cwd: INVOKING_ROOT, encoding: 'utf8' },
   ).split('\n').filter(Boolean);

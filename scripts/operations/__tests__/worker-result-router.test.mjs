@@ -68,6 +68,24 @@ describe('settleWorkerResult (launcher output -> envelope result)', () => {
   });
 });
 
+describe('redactResultText: identifiers vs prose', () => {
+  const TOKEN = 'ghp_abcdefghijklmnop12345';
+  it('keeps a proposedFix.scope path (npm scope `@`) intact but still removes a token', () => {
+    const r = redactResultText(blocked({ proposedFix: { summary: 's', scope: ['we:node_modules/@scope/pkg/x.mjs', `we:scripts/y.mjs ${TOKEN}`], size: 1 } }));
+    expect(r.blocker.proposedFix.scope[0]).toBe('we:node_modules/@scope/pkg/x.mjs');
+    expect(r.blocker.proposedFix.scope[1]).not.toContain(TOKEN);
+  });
+  it('leaves an opaque findingsAddressed ref alone, redacts one that is not, and keeps a null note null', () => {
+    const r = redactResultText(done({ findingsAddressed: [
+      { ref: 'F1', disposition: 'fixed', note: null }, { ref: `secret ${TOKEN}`, disposition: 'fixed', note: 'n' },
+      { ref: TOKEN, disposition: 'fixed', note: 'n' }, // a token-shaped ref looks like an opaque id; it must still go
+    ] }));
+    expect(r.findingsAddressed[0]).toEqual({ ref: 'F1', disposition: 'fixed', note: null });
+    expect(r.findingsAddressed[1].ref).not.toContain(TOKEN);
+    expect(r.findingsAddressed[2].ref).not.toContain('ghp_');
+  });
+});
+
 describe('routeWorkerResult (section 4 as code)', () => {
   const kindRoutes = {
     'infra-transient': 'retry-after-cooloff', 'host-load': 'quiet-host-reverify', 'permission-wall': 'product-fix-draft',
@@ -189,6 +207,15 @@ describe('draft sink (shared 114 store, one file per signature)', () => {
     writeProductFixDraft(route(result, { session: 'fix-4300', pr: '4300' }), { dir });
     expect(listDraftKeys(dir)).toHaveLength(1);
     expect(JSON.parse(readFileSync(join(dir, 'cards', `${listDraftKeys(dir)[0]}.json`), 'utf8')).count).toBe(2);
+  });
+  it('worker-controlled signatures cannot grow the store without bound: a NEW draft past the cap is refused, an existing one still grows', () => {
+    const dir = tmp();
+    const mk = (component) => route(settleWorkerResult({ role: 'fix', launcher: 'claude-p', value: blocked({ kind: 'tooling-defect', component }) }).result);
+    const opts = { dir, maxDrafts: 3 };
+    for (const c of ['a', 'b', 'c']) expect(writeProductFixDraft(mk(c), opts).written).toBe(true);
+    expect(writeProductFixDraft(mk('d'), opts)).toMatchObject({ written: false, reason: 'draft-store-cap', cap: 3 });
+    expect(listDraftKeys(dir)).toHaveLength(3);
+    expect(writeProductFixDraft(mk('a'), opts)).toMatchObject({ written: true, grew: true });
   });
   it('a contract-violation flood dedupes on role|launcher|reason', () => {
     const dir = tmp();

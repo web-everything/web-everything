@@ -153,6 +153,14 @@ export function extractAgyResult(stdout) {
  * @property {string} [postmortemMode]   off | draft | file (else resolved from env)
  */
 
+const OPERATOR_STOP_SIGNALS = Object.freeze(['SIGTERM', 'SIGINT', 'SIGHUP']);
+/** A child that TRAPS one of those signals and exits normally reports 128+n (129 HUP, 130 INT, 143 TERM). */
+const TRAPPED_STOP_STATUS = Object.freeze([129, 130, 143]);
+/** `spawnToCompletion` kills the child itself on a stream overflow and says so in the message (it sets `killed` too). */
+const isOverflow = (failure) => /maxBuffer exceeded/.test(String(failure?.message ?? ''));
+/** A signal that did not come from OUR timeout or buffer guard (`killed` false): someone outside stopped the worker. */
+const isExternalStop = (failure) => !!failure && !failure.killed && (OPERATOR_STOP_SIGNALS.includes(failure.signal) || TRAPPED_STOP_STATUS.includes(failure.status));
+
 /**
  * Run ONE worker to completion and leave its v2 record behind. Resolves (never rejects on a worker failure): the
  * envelope IS the failure report. It rejects only on a bad spec or a record that cannot be written.
@@ -170,7 +178,7 @@ export function extractAgyResult(stdout) {
  * @param {(f: string) => string} [io.readFile]
  * @param {() => string|null} [io.head]               HEAD probe for headBefore / headAfter
  * @param {() => (object|null)} [io.legacyRead]       the old report for a launcher still migrating
- * @param {() => boolean} [io.isOperatorStop]         true when the operator stopped the worker (D6: aborted, no job)
+ * @param {(failure: Error) => boolean} [io.isOperatorStop]  true when the operator stopped the worker (D6: aborted, no job); default: an EXTERNAL TERM/INT/HUP
  * @param {(record: object, dir: string) => *} [io.writeRecord]
  * @param {(action: object, o: {dir: string}) => *} [io.writeDraft]
  * @returns {Promise<{envelope: object, result: object, action: object, legacyRecord: object|null, stdout: string, stderr: string}>}
@@ -184,7 +192,7 @@ export async function runWorker(spec, io = {}) {
   const completionLegacyRead = spec.legacyFromCompletion ? () => { try { return tryReadCompletion(spec.session, dir); } catch { return null; } } : null;
   const {
     spawnToCompletionFn = spawnToCompletion, spawnFn = spawn, now = () => new Date().toISOString(), readFile = (f) => readFileSync(f, 'utf8'),
-    head = () => null, legacyRead = completionLegacyRead, isOperatorStop = () => false, writeRecord = writeCompletion, writeDraft = writeProductFixDraft,
+    head = () => null, legacyRead = completionLegacyRead, isOperatorStop = isExternalStop, writeRecord = writeCompletion, writeDraft = writeProductFixDraft,
     selfPid = process.pid, pollMs = 15_000, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   } = io;
   const clock = io.nowMs ?? (() => Date.parse(now()));
@@ -202,15 +210,24 @@ export async function runWorker(spec, io = {}) {
   let started = newEnvelopeRecord({ ...base, headBefore, timeoutMs, now });
   const deadlineMs = Date.parse(started.startedAt) + timeoutMs;
   started.deadlineAt = new Date(deadlineMs).toISOString();
+  let recordWriteFailure = null; // an infrastructure fault (lock timeout), not a worker failure: runWorker rejects with it
   // The job record: written the moment the child has a pid (the spawn seam below), before it can finish.
   const spawnWithPid = (cmd, argv, opts) => {
     const child = spawnFn(cmd, argv, opts);
     if (child?.pid) {
       started = { ...started, pid: child.pid, updatedAt: now() };
-      withCompletionLock(spec.session, () => writeRecord(started, dir), { dir });
+      // A failed job-record write must not leave the child running unseen (60-minute budget, still editing the lane).
+      try { withCompletionLock(spec.session, () => writeRecord(started, dir), { dir }); } catch (e) {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        recordWriteFailure = e;
+        throw e;
+      }
     }
     return child;
   };
+
+  // A result file left by an earlier attempt must not read as this run's result (codex: a clean exit + a stale `-o` file).
+  if (spec.launcher === 'codex-exec' && spec.resultFile) { try { rmSync(spec.resultFile, { force: true }); } catch { /* best effort */ } }
 
   let stdout = '';
   let stderr = '';
@@ -260,6 +277,7 @@ export async function runWorker(spec, io = {}) {
       await run(resumeArgvFrom(spec.argv, { sessionId: spec.sessionId, prompt: request.prompt }));
     }
   }
+  if (recordWriteFailure) throw recordWriteFailure; // the child was killed; the docblock's "cannot be written" rejection
 
   // 1. the channel for this launcher
   let extracted;
@@ -269,10 +287,12 @@ export async function runWorker(spec, io = {}) {
   else extracted = extractClaudeResult(stdout);
 
   // 2. settle: the worker's result, else the legacy record (migration only), else fail closed
-  const aborted = failure && isOperatorStop();
+  const aborted = failure && isOperatorStop(failure);
   let legacyRecord = null;
   let settled;
-  const gotResult = extracted.value !== undefined || (typeof extracted.text === 'string' && extracted.text.trim() !== '');
+  // FAIL CLOSED: a child that timed out, was signalled or exited non-zero never yields a success envelope, even when
+  // it printed (or left, for codex's -o file) a valid-looking result first — the result may be incomplete work.
+  const gotResult = !failure && (extracted.value !== undefined || (typeof extracted.text === 'string' && extracted.text.trim() !== ''));
   if (aborted) settled = settleWorkerResult({ role: spec.role, launcher: spec.launcher, aborted: true });
   else if (gotResult) settled = settleWorkerResult({ role: spec.role, launcher: spec.launcher, value: extracted.value, text: extracted.text, prose: extracted.prose });
   else {
@@ -282,8 +302,9 @@ export async function runWorker(spec, io = {}) {
       settled = { result: legacy.result, parse: legacy.parse, reroute: null, source: legacy.source };
     } else {
       legacyRecord = null;
-      const killed = failure && (failure.killed || failure.signal);
-      const reason = failure ? (killed ? 'timeout' : 'ended-without-result') : extracted.reason;
+      // `timeout` only when OUR timeout killed it; an overflow or any other signal is `ended-without-result` (the failure
+      // message, kept in the prose below, says which), so the draft signature does not blame a timeout for them.
+      const reason = failure ? (failure.killed && !isOverflow(failure) ? 'timeout' : 'ended-without-result') : extracted.reason;
       settled = settleWorkerResult({
         role: spec.role, launcher: spec.launcher, reason, prose: [extracted.prose, failure ? redactFreeText(String(failure.message ?? ''), 300) : ''].filter(Boolean).join(' | '),
       });

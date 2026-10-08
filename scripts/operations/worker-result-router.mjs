@@ -29,6 +29,14 @@ import {
 import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 
 /**
+ * A repo path: redacted like prose (tokens out, one line) but the npm-scope `@` after a `/` is put back, since the
+ * prose pass defangs every `@` (appends a zero-width space) and a draft naming `node_modules/@scope/pkg` would then name a
+ * path that does not exist.
+ */
+const DEFANGED_SCOPE_AT = new RegExp(`(?<=/)@${String.fromCharCode(0x200b)}`, 'g');
+const cleanPath = (x) => redactFreeText(x, 300).replace(DEFANGED_SCOPE_AT, '@');
+
+/**
  * The envelope writer's redaction pass: EVERY free-text field in the schema, but not the identifier fields (S1 stored them as data after the length
  * caps; the card makes the envelope writer own redaction at the single write point). One line each, token-like text
  * removed, HTML comment delimiters and backticks gone, @mentions defanged. Returns a copy; nothing routes on it.
@@ -38,15 +46,21 @@ export function redactResultText(result) {
   const r = structuredClone(result);
   const clean = redactFreeText;
   r.summary = clean(r.summary, 280);
-  // `ref` (an opaque finding id) and `filesTouched` (repo-relative paths, checked by the S1 reader) are identifiers, not
-  // prose: the redactor would rewrite `@` and whitespace in a real path, so they are left exactly as validated.
-  r.findingsAddressed = (r.findingsAddressed ?? []).map((f) => ({ ...f, note: clean(f.note, 300) }));
+  // `ref` (an opaque finding id), `filesTouched` and `proposedFix.scope` (repo-relative paths) are identifiers, not
+  // prose: the redactor would rewrite `@` and whitespace in a real path, so a well-formed one is left exactly as validated.
+  // A `ref` is worker-supplied and the schema only caps its length, so it ALWAYS goes through the redactor (an opaque id such
+  // as `F1` is unchanged by it; a token-shaped one, which matches any id pattern, is removed).
+  r.findingsAddressed = (r.findingsAddressed ?? []).map((f) => ({
+    ...f,
+    ref: typeof f.ref === 'string' ? clean(f.ref, 300) : f.ref,
+    note: f.note == null ? f.note : clean(f.note, 300),
+  }));
   if (r.learning) r.learning = { ...r.learning, summary: clean(r.learning.summary, 600), area: clean(r.learning.area, 200), suggestion: clean(r.learning.suggestion, 600) };
   if (r.blocker) {
     const b = r.blocker;
     b.component = clean(b.component, 120);
     b.evidence = { text: clean(b.evidence.text, 2000), refs: b.evidence.refs.map((x) => clean(x, 300)) };
-    if (b.proposedFix) b.proposedFix = { ...b.proposedFix, summary: clean(b.proposedFix.summary, 400), scope: b.proposedFix.scope.map((x) => clean(x, 300)) };
+    if (b.proposedFix) b.proposedFix = { ...b.proposedFix, summary: clean(b.proposedFix.summary, 400), scope: b.proposedFix.scope.map(cleanPath) };
     if (b.ruling) b.ruling = { question: clean(b.ruling.question, 600), options: b.ruling.options.map((o) => clean(o, 400)), recommendation: clean(b.ruling.recommendation, 600) };
     if (b.deniedCommand != null) b.deniedCommand = sanitizeDeniedCommand(b.deniedCommand);
   }
@@ -304,12 +318,15 @@ export function mergeDraft(existing, action, now) {
   };
 }
 
+/** Most distinct draft files the shared store takes from the wrapper; past it a flood of new signatures stops (see `writeProductFixDraft`). */
+export const MAX_DRAFT_FILES = 1000;
+
 /**
  * Write (or grow) the draft for a `product-fix-draft` action. `mode: off` writes nothing. `draft` and `file` both
  * write the draft; FILING it as a card is 114's job and stays the operator's call under `draft` (D3). Returns
  * `{written, key, path, reason}`. The same file per signature is the shared dedupe key with 114: a flood is one draft.
  */
-export function writeProductFixDraft(action, { dir, now = () => new Date().toISOString() } = {}) {
+export function writeProductFixDraft(action, { dir, now = () => new Date().toISOString(), maxDrafts = MAX_DRAFT_FILES } = {}) {
   if (!action || action.type !== 'product-fix-draft') return { written: false, reason: 'not-a-draft-action' };
   if (action.mode === 'off') return { written: false, reason: 'postmortem-off', key: action.draft.key };
   if (!dir) throw new TypeError('operations: writeProductFixDraft needs a drafts directory');
@@ -319,6 +336,9 @@ export function writeProductFixDraft(action, { dir, now = () => new Date().toISO
   return withFileLock(`${path}.lock`, () => {
     let existing = null;
     try { existing = JSON.parse(readFileSync(path, 'utf8')); } catch { existing = null; }
+    // The signature is worker-controlled, so the number of distinct drafts must be bounded: growing an existing draft
+    // is always allowed (it is capped at `sightings`), a NEW one past the cap is refused and the envelope stays the record.
+    if (!existing && listDraftKeys(dir).length >= maxDrafts) return { written: false, reason: 'draft-store-cap', key: action.draft.key, cap: maxDrafts };
     writeJsonAtomic(path, mergeDraft(existing, action, now()));
     return { written: true, key: action.draft.key, path, grew: !!existing };
   });

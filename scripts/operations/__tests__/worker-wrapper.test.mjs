@@ -96,6 +96,67 @@ describe('runWorker: the job record and the result channels', () => {
     expect(envelope.action.type).toBe('product-fix-draft');
   });
 
+  it('rejects successful output when the child subsequently fails (valid output x timeout / nonzero exit / signal)', async () => {
+    const out = JSON.stringify(claudeStdout(DONE));
+    const hang = 'setInterval(()=>{},1000)';
+    const cases = {
+      timeout: { argv: ['-e', `process.stdout.write(${out});${hang}`], timeoutMs: 400 },
+      'nonzero exit': { argv: ['-e', `process.stdout.write(${out});process.exitCode=3`] },
+      'signal termination': { argv: ['-e', `process.stdout.write(${out});process.kill(process.pid,'SIGKILL');${hang}`] },
+    };
+    for (const [name, over] of Object.entries(cases)) {
+      const s = spec({ ...over, session: `build-${name.replace(/\W/g, '')}` });
+      const { envelope, result } = await runWorker(s);
+      expect(envelope.parse.ok, name).toBe(false);
+      expect(envelope.outcome, name).not.toBe('done');
+      expect(envelope.action.type, name).not.toBe('done');
+      expect(result.outcome, name).toBe('unparseable');
+      expect(result.blocker.kind, name).toBe('contract-violation');
+    }
+  });
+
+  it('codex: a -o file the child wrote does not rescue a run that then failed', async () => {
+    const dir = tmp();
+    const resultFile = join(dir, 'last.json');
+    const script = `require('fs').writeFileSync(${JSON.stringify(resultFile)}, ${JSON.stringify(JSON.stringify(DONE))});process.exitCode=2`;
+    const { envelope } = await runWorker(spec({ launcher: 'codex-exec', resultFile, argv: ['-e', script], session: 'build-4003' }, dir));
+    expect(envelope).toMatchObject({ parse: { ok: false }, result: { outcome: 'unparseable' } });
+    expect(envelope.outcome).not.toBe('done');
+  });
+
+  it('codex: a STALE -o file from an earlier attempt is not this run\'s result (clean exit, nothing written)', async () => {
+    const dir = tmp();
+    const resultFile = join(dir, 'last.json');
+    writeFileSync(resultFile, JSON.stringify(DONE));
+    const { envelope } = await runWorker(spec({ launcher: 'codex-exec', resultFile, argv: ['-e', '0'], session: 'build-4005' }, dir));
+    expect(envelope.parse).toEqual({ ok: false, reason: 'no-structured-output' });
+    expect(envelope.outcome).not.toBe('done');
+  });
+
+  it('classification (real wiring, no injected hook): an external SIGTERM is aborted with no draft; an overflow is not blamed on a timeout', async () => {
+    const dir = tmp();
+    const term = spec({ argv: ['-e', `process.kill(process.pid,'SIGTERM');setInterval(()=>{},1000)`], session: 'build-4006' }, dir);
+    expect((await runWorker(term)).envelope).toMatchObject({ outcome: 'aborted', action: { type: 'aborted' } });
+    expect(listDraftKeys(term.draftsDir)).toEqual([]);
+    const trapped = spec({ argv: ['-e', 'process.exitCode=143'], session: 'build-4009' }, dir);
+    expect((await runWorker(trapped)).envelope).toMatchObject({ outcome: 'aborted' }); // a child that traps TERM and exits 128+15
+    const flood = spec({ argv: ['-e', `const c='x'.repeat(1<<20);for(let i=0;i<10;i++)process.stdout.write(c);setInterval(()=>{},1000)`], session: 'build-4007', timeoutMs: 20_000 }, dir);
+    const { envelope } = await runWorker(flood);
+    expect(envelope.parse).toEqual({ ok: false, reason: 'ended-without-result' });
+    expect(envelope.result.signature).not.toContain('timeout');
+  });
+
+  it('a throwing started-record write kills the already-spawned child instead of orphaning it', async () => {
+    let pid = null;
+    const s = spec({ argv: ['-e', 'setInterval(()=>{},1000)'], session: 'build-4008' });
+    let calls = 0;
+    const writeRecord = (rec, d) => { calls += 1; if (calls === 1) { pid = rec.pid; throw new Error('lock timeout'); } return writeCompletion(rec, d); };
+    await expect(runWorker(s, { writeRecord })).rejects.toThrow(/lock timeout/); // infra fault, not filed as a worker contract violation
+    expect(Number.isInteger(pid)).toBe(true);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(() => process.kill(pid, 0)).toThrow(); // gone: ESRCH
+  });
+
   it('an operator stop is aborted and makes no draft (D6)', async () => {
     const s = spec({ argv: ['-e', 'setInterval(()=>{},1000)'], timeoutMs: 300 });
     const { envelope } = await runWorker(s, { isOperatorStop: () => true });

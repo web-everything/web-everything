@@ -65,6 +65,8 @@ export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_P
 ${qualified.map(path => `- ${path}`).join('\n')}
 
 Anything else is out of scope: stop and report.
+The ONE new backlog card you file with \`file-item\` is always in scope and need not be listed: a brand-new card file
+cannot collide, and free-scope never counts other PRs' new cards against \`backlog/\`. List an existing card only if you edit it.
 
 1. **Free-scope pre-check.** Before editing, run
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList}\`.

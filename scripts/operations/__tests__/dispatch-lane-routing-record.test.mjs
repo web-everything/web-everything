@@ -87,6 +87,7 @@ function runReadTick(launchKind, { item = ITEM, scorecards = [], deliveryAgentOv
     recordLiveness: (s) => s,
     laneRefForPr: () => 'lane/9001',
     checkAlreadyDone: () => ({ done: false, pr: null, checked: false }),
+    checkBuildDelivery: () => null,
     // #3906 — hermetic routing evidence: never the host's shared scorecard store.
     readScorecards: () => scorecards,
     readDeliveryAgentOverride: () => deliveryAgentOverride,
@@ -378,6 +379,7 @@ describe('(d) end to end: readTick → dispatch-lane → createDispatchSinks', (
         listInFlightDispatches: () => ({ runs: [], unreadable: 0 }),
         listAgents: () => [],
         checkAlreadyDone: () => ({ done: false, pr: null, checked: false }),
+        checkBuildDelivery: () => null,
         // #3906 — hermetic routing evidence, never the host's shared scorecard store.
         readScorecards: () => [],
         readDeliveryAgentOverride: () => null,

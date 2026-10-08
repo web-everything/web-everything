@@ -19,7 +19,7 @@ import { describe, expect, it } from 'vitest';
 import { clearScopeAndAppendFinding, sanitizeHoldReason } from '../build-dispatch-hold-route-land.mjs';
 import { scanRepoLocusPrefixes } from '../../check-standards-rules.mjs';
 import { withInfraLock } from '../../conveyor/infra-blocked.mjs';
-import { gateFailureDetail, captureWorkerMessage, openPrArgv, parseArgs, realIo, runProbationBuild } from '../probation-build-run.mjs';
+import { gateFailureDetail, captureWorkerMessage, openPrArgv, parseArgs, realIo, runProbationBuild, probationHoldIdentityEnv } from '../probation-build-run.mjs';
 
 describe('realIo().blockedByGraph', () => {
   it('includes hash-named cards and validates their parsed proposals against the loaded graph', async () => {
@@ -137,6 +137,16 @@ function fakeIo({
 // own "no declared scope" refusal), so every test defaults one matching the happy-path numstat below; a test
 // that needs a DIFFERENT scope (or none) overrides it via `extra.scope` (including `''`, which parses to `[]`).
 const args = (worker = codex, extra = {}) => parseArgs(['--num=4291', '--session=probation-4291', `--worker=${JSON.stringify(worker)}`, '--lane=22', '--scope=we:docs/probation/probation.md', ...Object.entries(extra).map(([k, v]) => `--${k}=${v}`)]);
+
+describe('probationHoldIdentityEnv — card xmh9mtr: every heavy hold of an external build carries its dispatch identity', () => {
+  it('names the dispatch session, the kind, and the run id', () => {
+    expect(probationHoldIdentityEnv({ session: 'conveyor-4420', runId: 'r1', taskType: 'test-fix' }))
+      .toEqual({ WE_HEAVY_SESSION: 'conveyor-4420', WE_HEAVY_DISPATCH_KIND: 'build', WE_HEAVY_RUN_ID: 'r1' });
+    expect(probationHoldIdentityEnv({ session: 'prepare-item-4422', taskType: 'prepare' }))
+      .toEqual({ WE_HEAVY_SESSION: 'prepare-item-4422', WE_HEAVY_DISPATCH_KIND: 'prepare' });
+    expect(probationHoldIdentityEnv({ session: undefined })).toEqual({});
+  });
+});
 
 describe('parseArgs', () => {
   it('parses the build-specific flags (num, attempt) and the shared ones', () => {

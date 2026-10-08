@@ -1148,6 +1148,7 @@ const CLAUDE_RESTRICTED_PROVIDER = {
       sessionSlug, item, lanePath: weLanePath, attemptTag, reportsDir, implLane: lanePathOverride,
     });
     if (workerWrapper) {
+      const turnStartedAt = Date.now();
       // The wrapper owns the process, the timeout and the record; it never rejects on a worker failure (the v2
       // envelope IS the failure report) and returns the envelope for `runAgentToCompletion` to read the build
       // report from. `legacyRead` keeps the old delivery report working while the brief still asks for it.
@@ -1157,7 +1158,12 @@ const CLAUDE_RESTRICTED_PROVIDER = {
       }, {
         // keep the SAME env hygiene as the old path (GH_TOKEN stripped, worker marker) via the existing spawn primitive
         spawnToCompletionFn: (_cmd, a, opts, spawnIo) => spawnAgent(a, opts, spawnIo),
-        legacyRead: () => tryReadDeliveryReport(sessionSlug, reportsDir),
+        // On a RESUMED turn the report on disk is the first turn's unless the agent rewrote it: only one written since
+        // this turn started counts, or a resume that ended with no result would read as the stale `done`.
+        legacyRead: () => {
+          const report = tryReadDeliveryReport(sessionSlug, reportsDir);
+          return resumeSessionId && !(Date.parse(report?.updatedAt) >= turnStartedAt) ? null : report;
+        },
       });
     }
     try {
@@ -1483,7 +1489,15 @@ export async function runAgentToCompletion(
 
   if (resume) {
     // 117 S3a — a wrapped attempt left a v2 envelope instead of (or beside) the delivery report; read either.
-    const existing = readReport(sessionSlug, reportsDir) ?? envelopeReportOrNull(readEnvelopeRecord(sessionSlug), sessionSlug);
+    // A finished v2 envelope is authoritative: a started or stale legacy report must not shadow it. Three guards:
+    //  - a FINISHED envelope with no usable result (timeout / unparseable / aborted) never falls back to a legacy `done`
+    //    (that would turn a failed child into success); only a missing or still-`started` envelope may;
+    //  - a legacy report written AFTER the envelope (a later attempt that ran with the knob off) is the newer truth.
+    const envelope = readEnvelopeRecord(sessionSlug);
+    const legacy = readReport(sessionSlug, reportsDir);
+    const legacyIsNewer = !!legacy && !!envelope && Date.parse(legacy.updatedAt) > Date.parse(envelope.updatedAt);
+    const fromEnvelope = legacyIsNewer ? null : envelopeReportOrNull(envelope, sessionSlug);
+    const existing = fromEnvelope ?? (envelope?.status === 'done' && !legacyIsNewer ? null : legacy);
     if (existing && existing.status === 'done' && isLaneCommitAhead({ lane: lanePath, run: runFn })) {
       return existing;
     }
@@ -1614,14 +1628,18 @@ export async function runGateWithOneRetry(
   // #3627 attempt-5 finding — `gateOutcome` threaded through so the resume prompt itself can stop telling an
   // agent "your gate failed, fix it" when the true outcome is `unrun` (nothing in its diff to fix) — see
   // `resumeAgentWithGateFailure` below.
-  await resumeAgentWithGateFailure({
+  const resumed = await resumeAgentWithGateFailure({
     sessionSlug, lane, item, attemptTag, failureOutput: first.detail, gateOutcome: first.outcome, provider,
     claudeSessionId, lanePathOverride,
   }); // SKETCH — see below
   // #3383 mechanical-dispatcher fix — read back from the SAME lane-scoped directory the resume just used
   // (see `runAgentToCompletion`'s own comment for the full root-cause account), never the wrapper's own
   // script-location default.
-  const retryReport = readReport(sessionSlug, resolveReportsDir(lanePath)); // agent's fresh report after the resume — 'done' (fixed) or 'blocked' (couldn't)
+  // 117 S3a — a wrapped resumed turn's own v2 envelope outranks the legacy report, which on that path is the stale first-turn one.
+  // With an envelope present but unusable (unparseable / aborted) there is NO retry report: never fall back to that stale one.
+  const retryReport = resumed?.envelope
+    ? (resumed.legacyRecord?.status === 'done' ? resumed.legacyRecord : envelopeReportOrNull(resumed.envelope, sessionSlug))
+    : readReport(sessionSlug, resolveReportsDir(lanePath)); // agent's fresh report after the resume — 'done' (fixed) or 'blocked' (couldn't)
   // #3565 — commit whatever the resumed turn changed, same wrapper-owned reasoning as the build commit above,
   // BEFORE the second verify reads the lane. A `blocked` retry that touched nothing no-ops harmlessly here.
   commitTurn({ lane: lanePath, item, provider, phase: 'gate-fix' }, { run: runFn });
@@ -1676,10 +1694,10 @@ async function resumeAgentWithGateFailure({
   // #3627 bug 7 — this prompt says `$LANE` above, same as the fresh brief, so this resume needs the SAME real
   // cwd/env treatment (`lane`/`sessionSlug`/`item`/`attemptTag` threaded through to the provider) or a resumed
   // agent hits the identical "no real $LANE to cd into" failure the fresh spawn did.
-  await provider.spawn({
+  return provider.spawn({
     sessionId: claudeSessionId, prompt, resumeSessionId: claudeSessionId, lane, sessionSlug, item, attemptTag,
     lanePathOverride,
-  }); // AWAITS.
+  }); // AWAITS. Returned (not dropped): a wrapped provider hands back its v2 envelope for the resumed turn.
 }
 
 // #xu2pp2m — `resolveLanePath` EXTRACTED to `./minimal-context-provider.mjs` (imported above), unchanged: the

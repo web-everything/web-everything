@@ -1654,6 +1654,35 @@ describe('runGateWithOneRetry commits the build turn itself (#3565 — before th
     expect(commitTurn.mock.calls[0][0].phase).toBe('build');
     expect(commitTurn.mock.calls[1][0].phase).toBe('gate-fix');
   });
+
+  it('a wrapped resumed turn\'s own v2 envelope outranks the stale first-turn legacy report (blocked -> gate-blocked)', async () => {
+    const run = vi.fn((cmd, args) => {
+      if (args[0] === 'scripts/lane-pool.mjs') return JSON.stringify({ lanes: [{ lane: 3, path: '/real/pool/lane-3', exists: true }] });
+      if (args[0] === 'scripts/operations/run.mjs') {
+        return JSON.stringify({
+          verdict: {
+            ok: false, cwd: '/real/pool/lane-3', suite: 'run', passed: 1, failed: 1, unrun: 0,
+            checks: [{ name: 'test:unit', outcome: 'fail' }], blocking: [{ check: 'test:unit', why: 'failed', detail: 'x' }],
+          },
+        });
+      }
+      throw new Error(`unexpected: ${cmd} ${JSON.stringify(args)}`);
+    });
+    const commitTurn = vi.fn(() => ({ committed: true, paths: [] }));
+    const envelope = {
+      v: 2, status: 'done', item: '3371', startedAt: '2026-10-08T10:00:00.000Z', updatedAt: '2026-10-08T10:01:00.000Z',
+      result: { v: 1, outcome: 'blocked', findingsAddressed: [], filesTouched: [], learning: null, summary: 'cannot fix', blocker: { kind: 'tooling-defect', evidence: { text: 'the gate itself is broken' } } },
+    };
+    const provider = { name: 'claude-restricted', spawn: vi.fn(async () => ({ envelope })) };
+    const staleFirstTurn = { v: 1, session: 'conveyor-3371', item: '3371', status: 'done', outcome: 'done', reason: null, filesTouched: ['a.mjs'] };
+    const result = await runGateWithOneRetry({ lane: 3, item: '3371', sessionSlug: 'conveyor-3371', provider }, { run, commitTurn, readReport: () => staleFirstTurn });
+    expect(result.status).toBe('gate-blocked');
+    expect(result.reason).toMatch(/gate itself is broken/);
+    // an envelope that holds no usable result (unparseable) never falls back to that stale legacy report
+    const unusable = { name: 'claude-restricted', spawn: vi.fn(async () => ({ envelope: { v: 2, status: 'done', result: { outcome: 'unparseable' } } })) };
+    const again = await runGateWithOneRetry({ lane: 3, item: '3371', sessionSlug: 'conveyor-3371', provider: unusable }, { run, commitTurn, readReport: () => staleFirstTurn });
+    expect(again).toMatchObject({ status: 'red', retryReport: null });
+  });
 });
 
 describe('resumeAgentWithGateFailure prompt (#3565 — never asks the agent to commit any more)', () => {
@@ -4153,6 +4182,59 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
       if (prevKnob === undefined) delete process.env.WE_WORKER_WRAPPER; else process.env.WE_WORKER_WRAPPER = prevKnob;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('resume prefers the finished v2 envelope over started or stale legacy reports (knob on)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 's3a-'));
+    const prevDir = process.env.OPERATION_COMPLETIONS_DIR;
+    const prevKnob = process.env.WE_WORKER_WRAPPER;
+    process.env.OPERATION_COMPLETIONS_DIR = dir;
+    process.env.WE_WORKER_WRAPPER = 'on';
+    try {
+      writeFileSync(join(dir, 'conveyor-1235.json'), JSON.stringify({
+        v: 2, session: 'conveyor-1235', kind: 'build', role: 'build', launcher: 'claude-p', model: null, pr: null, item: '1235', status: 'done', outcome: 'done',
+        verdict: null, label: null, runId: null, sessionId: null, headBefore: null, headAfter: null, pid: 1, timeoutMs: 1000, deadlineAt: null, parse: { ok: true, reason: null },
+        result: DONE, action: { type: 'done' }, reroute: null, source: 'worker-result', startedAt: '2026-10-08T10:00:00.000Z', endedAt: '2026-10-08T10:01:00.000Z', updatedAt: '2026-10-08T10:01:00.000Z',
+      }));
+      const resume = (legacy) => runAgentToCompletion(
+        { item: '1235', sessionSlug: 'conveyor-1235', lane: 7, attemptTag: '', provider: { spawn: vi.fn() }, claudeSessionId: 'x', resume: true },
+        { readReport: () => legacy, resolveLane: () => '/fake/pool/lane-7', isLaneCommitAhead: () => true },
+      );
+      // a started legacy report must not block the completion fast path
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'started', outcome: null, filesTouched: [] })).resolves.toMatchObject({ status: 'done', outcome: 'done', filesTouched: ['a.mjs'] });
+      // a contradictory stale done legacy report must not win over the authoritative envelope
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'done', outcome: 'blocked', reason: 'stale', filesTouched: ['old.mjs'], updatedAt: '2026-10-08T09:00:00.000Z' })).resolves.toMatchObject({ outcome: 'done', filesTouched: ['a.mjs'] });
+      // ...but a legacy report written AFTER the envelope (a later attempt with the knob off) is the newer truth
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'done', outcome: 'done', filesTouched: ['newer.mjs'], updatedAt: '2026-10-08T12:00:00.000Z' })).resolves.toMatchObject({ filesTouched: ['newer.mjs'] });
+      // a FINISHED envelope with no usable result (the child timed out) never falls back to a legacy `done`
+      const rec = JSON.parse(readFileSync(join(dir, 'conveyor-1235.json'), 'utf8'));
+      writeFileSync(join(dir, 'conveyor-1235.json'), JSON.stringify({ ...rec, outcome: 'blocked', parse: { ok: false, reason: 'timeout' }, result: { v: 1, outcome: 'unparseable', summary: 'x', blocker: null, findingsAddressed: [], filesTouched: [], learning: null } }));
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'done', outcome: 'done', filesTouched: ['a.mjs'], updatedAt: '2026-10-08T09:00:00.000Z' })).rejects.toThrow(/nothing to resume from/);
+      // a still-`started` envelope (wrapper died mid-run) may still fall back to the legacy report
+      writeFileSync(join(dir, 'conveyor-1235.json'), JSON.stringify({ ...rec, status: 'started', result: null, endedAt: null }));
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'done', outcome: 'done', filesTouched: ['a.mjs'], updatedAt: '2026-10-08T09:00:00.000Z' })).resolves.toMatchObject({ filesTouched: ['a.mjs'] });
+    } finally {
+      if (prevDir === undefined) delete process.env.OPERATION_COMPLETIONS_DIR; else process.env.OPERATION_COMPLETIONS_DIR = prevDir;
+      if (prevKnob === undefined) delete process.env.WE_WORKER_WRAPPER; else process.env.WE_WORKER_WRAPPER = prevKnob;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('knob ON, resumed turn: only a legacy report written since the turn started counts (a stale first-turn one is not read)', async () => {
+    const runWorkerFn = vi.fn(async () => ({ envelope: { v: 2 } }));
+    const stale = { v: 1, session: 'conveyor-4001', status: 'done', outcome: 'done', updatedAt: '2020-01-01T00:00:00.000Z', filesTouched: ['a.mjs'] };
+    vi.mocked(tryReadDeliveryReport).mockReturnValue(stale);
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, resumeSessionId: 'abc-resume' }, fakeIo({ workerWrapper: true, runWorkerFn }));
+    const [, io] = runWorkerFn.mock.calls[0];
+    expect(io.legacyRead()).toBeNull();
+    const fresh = { ...stale, updatedAt: new Date(Date.now() + 60_000).toISOString() };
+    vi.mocked(tryReadDeliveryReport).mockReturnValue(fresh);
+    expect(io.legacyRead()).toBe(fresh);
+    // a FRESH (non-resume) spawn keeps reading whatever report is there, as before
+    vi.mocked(tryReadDeliveryReport).mockReturnValue(stale);
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, fakeIo({ workerWrapper: true, runWorkerFn }));
+    expect(runWorkerFn.mock.calls[1][1].legacyRead()).toBe(stale);
+    vi.mocked(tryReadDeliveryReport).mockReset();
   });
 
   it('knob ON, resumed turn: --resume is kept and the schema is on it too (D7: resume with the schema)', async () => {
