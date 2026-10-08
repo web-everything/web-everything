@@ -143,6 +143,39 @@ describe('planNoteComment — the whole pure decision, no network', () => {
     const comments = [{ body: `${NOTE_COMMENT_MARKER}\n<!-- conveyor-note-key: ${key} -->`, author: { login: 'web-everything' } }];
     expect(planNoteComment(note, comments).alreadyPosted).toBe(true);
   });
+
+  // xadixye — comment only when state changes or someone must act (`prComments.mode`).
+  it('a status-only note (nobody needs to act) is suppressed: treated as already handled, never posted', () => {
+    for (const note of [
+      { kind: 'review-label-missing', prNumber: 4381, text: 'open agent PR has no review:* label' },
+      { kind: 'stacked-awaiting-base', prNumber: 4462, text: 'PR #4462: stacked on lane/x (PR #4439)' },
+    ]) {
+      const plan = planNoteComment(note, [], { mode: 'on-change-or-action' });
+      expect(plan.alreadyPosted).toBe(true);
+      expect(plan.suppressed).toBe('status-only');
+    }
+  });
+
+  it('mode=all restores the old behaviour for status-only notes', () => {
+    const plan = planNoteComment({ kind: 'review-label-missing', prNumber: 4381, text: 'x' }, [], { mode: 'all' });
+    expect(plan.alreadyPosted).toBe(false);
+    expect(plan.suppressed).toBe(null);
+  });
+
+  it('a new episode whose comment would read exactly like the previous note is suppressed as a repeat', () => {
+    const first = { kind: 'permission-blocked', prNumber: 7, since: '2026-10-08T01:00:00Z', text: 'fixer denied `rm`' };
+    const second = { ...first, since: '2026-10-08T05:00:00Z' };
+    const comments = [{ body: buildNoteComment(first), author: { login: 'web-everything' } }];
+    expect(noteEpisodeKey(first)).not.toBe(noteEpisodeKey(second));
+    const plan = planNoteComment(second, comments, { mode: 'on-change-or-action' });
+    expect(plan).toMatchObject({ alreadyPosted: true, suppressed: 'repeat' });
+    expect(planNoteComment(second, comments, { mode: 'all' }).alreadyPosted).toBe(false);
+  });
+
+  it('an escalation that needs a person still posts', () => {
+    const note = { kind: 'ci-heal-exhausted', prNumber: 9, attempts: 3, cap: 3, text: 'exhausted' };
+    expect(planNoteComment(note, [], { mode: 'on-change-or-action' })).toMatchObject({ alreadyPosted: false, suppressed: null });
+  });
 });
 
 describe('postNoteComment — the IO shell', () => {

@@ -36,6 +36,7 @@
 import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { isStatusOnlyNote, loadPrCommentSettings, repeatsLatestComment } from '../lib/pr-comment-policy.mjs';
 
 /**
  * we:scripts/conveyor/reconcile-note-comment.mjs#NOTE_COMMENT_MARKER — the stable FIRST LINE of every durable
@@ -168,15 +169,26 @@ export function hasPostedNoteComment(comments, note) {
  * already been posted, and if not, what body would post it. No network, no fs — every field a caller (the
  * daemon, a test, the live proof) needs to either skip, post for real, or print a dry-run line. Pure.
  * @param {object} note
+ *
+ * xadixye — comment only when state changes or someone must act (`prComments.mode`, see
+ * `we:scripts/lib/pr-comment-policy.mjs`). In the default `on-change-or-action` mode a status-only note
+ * (`suppressed: 'status-only'`) or a new episode whose visible text repeats the PR's latest note
+ * (`suppressed: 'repeat'`) reports `alreadyPosted: true`, so every caller's existing "post unless already
+ * posted" branch skips it with no caller change. Only the comment is skipped: a caller's park/label work runs
+ * independently of this flag.
  * @param {Array<object>|null|undefined} comments - the SAME PR's own `comments`, exactly as `gh` returns them.
- * @returns {{key:string, body:string, alreadyPosted:boolean}}
+ * @param {{mode?:string}} [o] - the `prComments.mode`; defaults to the live setting.
+ * @returns {{key:string, body:string, alreadyPosted:boolean, suppressed:(null|'status-only'|'repeat')}}
  */
-export function planNoteComment(note, comments) {
-  return {
-    key: noteEpisodeKey(note),
-    body: buildNoteComment(note),
-    alreadyPosted: hasPostedNoteComment(comments, note),
-  };
+export function planNoteComment(note, comments, { mode = loadPrCommentSettings().mode } = {}) {
+  const body = buildNoteComment(note);
+  const posted = hasPostedNoteComment(comments, note);
+  let suppressed = null;
+  if (!posted && mode !== 'all') {
+    if (isStatusOnlyNote(note)) suppressed = 'status-only';
+    else if (repeatsLatestComment(comments, body, (b) => b.trimStart().startsWith(NOTE_COMMENT_MARKER))) suppressed = 'repeat';
+  }
+  return { key: noteEpisodeKey(note), body, alreadyPosted: posted || suppressed !== null, suppressed };
 }
 
 /**
