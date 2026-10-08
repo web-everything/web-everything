@@ -42,6 +42,9 @@ const ALLOWLIST = {
   // prepare prefix and excludes forks. Missing claim dates omit the date filter (limit 1000 vs 500). A saturated
   // or too-recently-dated shared listing falls back to a per-item `head:lane/<n>-prepare-` search (fails closed at 100).
   'skills-src/conveyor/build-dispatch-daemon.mjs': ['--search'],
+  // `defaultListBuildPrs` (xykwe0h): `--search 'head:lane/<item>-' --state all`, the same branch-PREFIX lookup, run only for
+  // a build about to launch (once per dispatch attempt) and for a claim already confirmed dead -- never a polling loop.
+  'scripts/conveyor/build-delivery-evidence.mjs': ['--search'],
 };
 
 function trackedSourceFiles() {

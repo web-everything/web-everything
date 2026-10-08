@@ -12,10 +12,15 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { newRunRecord } from '../../operations/run-record.mjs';
 import {
   defaultCurrentLaneSession, classifyClaimLiveness, decideOrphanAction, findLatestBuildRow, findLatestInFlightBuildRow,
-  adoptOrphanedBuildClaims, checkResumable, spawnResumeDelivery, MAX_RESUME_ATTEMPTS,
+  adoptOrphanedBuildClaims as adoptOrphanedBuildClaimsReal, checkResumable, defaultSessionLiveness, settleDeliveredRow, spawnResumeDelivery, MAX_RESUME_ATTEMPTS,
 } from '../build-dispatch-orphan-adopt.mjs';
+
+// The real pass reads GitHub and the harness job records by default; these tests inject everything else, so the
+// two new evidence reads default to "nothing found" and each xykwe0h test overrides them explicitly.
+const adoptOrphanedBuildClaims = (o = {}) => adoptOrphanedBuildClaimsReal({ readDelivery: () => null, sessionLivenessFor: () => null, ...o });
 import {
   acquireBuildDispatchClaim, listBuildDispatchClaims, releaseBuildDispatchClaim,
   markBuildDispatchResume, readBuildDispatchResume, releaseBuildDispatchResume,
@@ -721,5 +726,122 @@ describe('defaultCurrentLaneSession', () => {
     };
     expect(defaultCurrentLaneSession(3, { run })).toBe('holder');
     expect(defaultCurrentLaneSession(3, { run: () => '{"lanes":[]}' })).toBeNull();
+  });
+});
+
+
+// xykwe0h — a build is settled by what it really did, and a paused session is not a dead one.
+describe('xykwe0h — real outcomes, not orphan-released', () => {
+  let lockRoot;
+  beforeEach(() => { lockRoot = mkdtempSync(join(tmpdir(), 'bdd-orphan-real-')); });
+  afterEach(() => { rmSync(lockRoot, { recursive: true, force: true }); });
+  const claudeRow = (num, handle) => ({
+    runId: 'dispatch-lane-x',
+    entry: { key: 'k', status: 'in-flight', handle, startedAt: '2099-01-01T00:00:00.000Z', payload: { num, launchKind: 'build', lane: 3, sessionSlug: `conveyor-${num}`, scope: [] } },
+  });
+  const common = (num, extra) => ({
+    listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }),
+    isPidAlive: () => false, // the dispatching process is long gone, as in production
+    readResumeMarker: () => null,
+    releaseClaim: ({ num: n }) => releaseBuildDispatchClaim({ num: n, lockRoot }),
+    releaseResumeMarker: () => {},
+    resolveResumability: () => ({ resumable: false, reason: 'no-done-report' }),
+    spawnResume: () => { throw new Error('must not spawn'); },
+    markResume: () => { throw new Error('must not mark'); },
+    ...extra,
+  });
+
+  it('replay #4388 -> PR #4339: a dead agy dispatch whose session opened a PR settles as pr-opened with that PR', async () => {
+    acquireBuildDispatchClaim({ num: '4388', scope: [], lockRoot, pid: 111 });
+    let settled = 'not-called'; let released = 'not-called';
+    const results = await adoptOrphanedBuildClaims(common('4388', {
+      findRow: () => claudeRow('4388', 'pid:10940'),
+      readDelivery: () => ({ outcome: 'pr-open', pr: 4339, reason: 'PR #4339 is open' }),
+      settleDelivered: (o) => { settled = o; },
+      settleRow: (o) => { released = o; },
+    }));
+    expect(results).toEqual([{ num: '4388', action: 'settled', reason: expect.stringContaining('PR #4339') }]);
+    expect(settled).toMatchObject({ runId: 'dispatch-lane-x', key: 'k', delivery: { outcome: 'pr-open', pr: 4339 } });
+    expect(released).toBe('not-called'); // never settled as orphan-released
+    expect(listBuildDispatchClaims({ lockRoot, ignoreExpiry: true })).toEqual([]);
+  });
+
+  it('replay #4382: a dead build whose PR already merged settles as pr-merged', async () => {
+    acquireBuildDispatchClaim({ num: '4382', scope: [], lockRoot, pid: 111 });
+    let settled = null;
+    const results = await adoptOrphanedBuildClaims(common('4382', {
+      findRow: () => claudeRow('4382', 'c7a15fe4'),
+      readDelivery: () => ({ outcome: 'pr-merged', pr: 4288, reason: 'PR #4288 merged' }),
+      settleDelivered: (o) => { settled = o; },
+      settleRow: () => { throw new Error('must not settle as orphan'); },
+    }));
+    expect(results[0]).toMatchObject({ num: '4382', action: 'settled' });
+    expect(settled.delivery.outcome).toBe('pr-merged');
+  });
+
+  it('a resolved card settles as card-resolved', async () => {
+    acquireBuildDispatchClaim({ num: '4382', scope: [], lockRoot, pid: 111 });
+    const results = await adoptOrphanedBuildClaims(common('4382', {
+      findRow: () => claudeRow('4382', 'c7a15fe4'),
+      readDelivery: () => ({ outcome: 'card-resolved', pr: null, reason: 'card #4382 is resolved' }),
+      settleDelivered: () => {},
+    }));
+    expect(results[0]).toMatchObject({ action: 'settled', reason: expect.stringContaining('card-resolved') });
+  });
+
+  it('no delivery evidence still releases as orphan-released (unchanged)', async () => {
+    acquireBuildDispatchClaim({ num: '4400', scope: [], lockRoot, pid: 111 });
+    const results = await adoptOrphanedBuildClaims(common('4400', { findRow: () => claudeRow('4400', 'pid:9'), settleRow: () => {} }));
+    expect(results[0]).toMatchObject({ action: 'release' });
+  });
+
+  it('#5189: a claude-bg session paused awaiting verify is ALIVE, not orphaned, even with a dead owner pid', async () => {
+    acquireBuildDispatchClaim({ num: '5189', scope: [], lockRoot, pid: 111 });
+    const results = await adoptOrphanedBuildClaims(common('5189', {
+      findRow: () => claudeRow('5189', '14cd6f08'),
+      sessionLivenessFor: ({ handle }) => (handle === '14cd6f08' ? { alive: true, reason: 'awaiting-verify' } : null),
+      readDelivery: () => { throw new Error('a live session is never checked for delivery'); },
+      settleRow: () => { throw new Error('must not retire a live session'); },
+    }));
+    expect(results).toEqual([{ num: '5189', action: 'leave', reason: 'alive (awaiting-verify)' }]);
+    expect(listBuildDispatchClaims({ lockRoot, ignoreExpiry: true })).toHaveLength(1);
+  });
+
+  it('classifyClaimLiveness: a non-pid handle with a live session reads alive; without it, falls back to the owner pid', () => {
+    const row = claudeRow('5189', '14cd6f08');
+    expect(classifyClaimLiveness({ row, resumeMarker: null, ownerPid: 111, isPidAlive: () => false, sessionLive: { alive: true, reason: 'awaiting-verify' } }))
+      .toMatchObject({ status: 'alive', reason: 'awaiting-verify' });
+    expect(classifyClaimLiveness({ row, resumeMarker: null, ownerPid: 111, isPidAlive: () => false, sessionLive: null }).status).toBe('dead');
+  });
+});
+
+describe('defaultSessionLiveness — reads the harness job record', () => {
+  const jobs = (state) => ({
+    jobsDir: '/jobs', readdir: () => ['14cd6f08-4ed4-4ec4-8745-8020ef0e58cf'],
+    readFile: () => JSON.stringify({ state, sessionId: '14cd6f08-4ed4-4ec4-8745-8020ef0e58cf', name: 'conveyor-5189', cwd: '/x' }),
+  });
+  it('a working session is alive', () => {
+    expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs('working'), awaitingFor: () => null })).toMatchObject({ alive: true });
+  });
+  it('an ended turn with a live await-verify record is alive (awaiting-verify)', () => {
+    expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs('done'), awaitingFor: () => ({ awaiting: true }) })).toEqual({ alive: true, reason: 'awaiting-verify' });
+  });
+  it('an ended session with no record is not alive', () => {
+    expect(defaultSessionLiveness({ handle: '14cd6f08', ...jobs('stopped'), awaitingFor: () => ({ awaiting: false }) })).toMatchObject({ alive: false });
+  });
+  it('an unreadable job record is unknown (null), never alive', () => {
+    expect(defaultSessionLiveness({ handle: '14cd6f08', jobsDir: '/jobs', readdir: () => { throw new Error('x'); } })).toBeNull();
+  });
+});
+
+describe('settleDeliveredRow', () => {
+  it('settles an in-flight row as applied with the real outcome and pr', () => {
+    let written = null;
+    const run = newRunRecord({ id: 'dispatch-lane-t', op: 'dispatch-lane' });
+    run.effects = [{ key: 'dispatch-lane-t#2#0', stepIndex: 2, step: 'dispatch', index: 0, type: 'conveyor.dispatch-delivery-agent', payload: {}, status: 'in-flight', handle: 'abc12345', startedAt: '2026-10-07T21:18:11.409Z' }];
+    settleDeliveredRow({ runId: run.id, key: 'dispatch-lane-t#2#0', delivery: { outcome: 'pr-open', pr: 4339 } }, { read: () => run, write: (r) => { written = r; } });
+    const e = written.effects.find((x) => x.key === 'dispatch-lane-t#2#0');
+    expect(e.status).toBe('applied');
+    expect(e.result).toEqual({ outcome: 'pr-opened', pr: 4339 });
   });
 });

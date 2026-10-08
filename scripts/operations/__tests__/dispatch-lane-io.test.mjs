@@ -29,6 +29,7 @@ describe('the tick reader handoff', () => {
       listInFlightDispatches: () => ({ runs: [], unreadable: 0 }),
       recordLiveness: (value) => value, listAgents: () => [],
       checkAlreadyDone: () => ({ done: false, checked: true, pr: null }),
+      checkBuildDelivery: () => null,
       readScorecards: () => [], readSizePolicy: () => ({}), readPromotions: () => [],
       readDeliveryAgentOverride: () => null,
       ...overrides,
