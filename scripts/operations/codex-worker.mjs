@@ -30,6 +30,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { ACCEPTANCE_HEADING, ACCEPTANCE_HEADING_RE } from '../backlog/task-agreement.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const RECORD_FILE = join(homedir(), 'workspace/.operations/coordination/codex-pilot.jsonl');
@@ -69,7 +70,8 @@ export function parseCard(markdown) {
     .trim().replace(/^(['"])(.*)\1$/, '$2');
   const heading = /^# (.+)$/m.exec(body);
   const rest = heading ? body.slice(heading.index + heading[0].length) : body;
-  const doneHeading = /^## (?:Done when|Acceptance)[ \t]*$/m.exec(rest);
+  // The acceptance section, by the shared task-agreement reader's heading rule (canonical or legacy alias, #5399 S7).
+  const doneHeading = [...rest.matchAll(/^## (.+?)[ \t]*$/gm)].find((m) => ACCEPTANCE_HEADING_RE.test(m[1]));
   const acceptance = doneHeading ? rest.slice(doneHeading.index + doneHeading[0].length) : '';
   return {
     title: heading?.[1].trim() ?? '',
@@ -239,11 +241,11 @@ export const REPO_RULES_PREAMBLE = `1. You are in a lane clone of the repo. Only
 3. Run tests only via npm run test:unit -- <test files> (never the whole suite).
 4. No network except what git/gh need; never npm install. Do not commit, push, or open a PR — the wrapper does that.
 5. Keep the diff minimal and in the existing style; read AGENTS.md for repo conventions.
-6. If the Done-when is a TODO placeholder, replace it in the card file with a concrete executable line naming the test file(s) that prove the change.
+6. If the acceptance section is a TODO placeholder, replace it in the card file with a concrete executable line naming the test file(s) that prove the change.
 7. End with a short final message: what changed and which tests prove it.`;
 
 export function composeTask({ cardId, title, digest, doneWhen, allowed, briefText }) {
-  return `${REPO_RULES_PREAMBLE}\n\n# Card #${cardId ?? 'brief'}: ${title}\n\n## Problem\n${briefText ?? digest ?? ''}\n\n## Done when\n${doneWhen ?? ''}\n\n## Allowed files\n${allowed.join('\n')}\n`;
+  return `${REPO_RULES_PREAMBLE}\n\n# Card #${cardId ?? 'brief'}: ${title}\n\n## Problem\n${briefText ?? digest ?? ''}\n\n${ACCEPTANCE_HEADING}\n${doneWhen ?? ''}\n\n## Allowed files\n${allowed.join('\n')}\n`;
 }
 
 export function planBranch(cardId, title) {
@@ -266,7 +268,7 @@ ${title}
 
 ${cardId != null ? `Card: #${cardId}` : 'Card: brief'}
 
-## Done when
+${ACCEPTANCE_HEADING}
 ${doneWhen ?? ''}
 
 ## Allowed files

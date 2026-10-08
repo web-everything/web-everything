@@ -9,9 +9,10 @@
  */
 
 import { renderEdgeCasesSkeleton } from './edge-case-classes.mjs';
+import { NON_GOALS_HEADING, renderTaskAgreementSkeleton } from './task-agreement.mjs';
 
 /**
- * Authoring hint emitted in the `## Done when` skeleton (#4409). Pinned verbatim by a test; the
+ * Authoring hint emitted in the `## Acceptance` skeleton (#4409). Pinned verbatim by a test; the
  * guard-relaxation lint (`findGuardRelaxationGaps`) strips this exact line before scanning so a
  * hint left in place can never trigger or satisfy it.
  */
@@ -155,12 +156,15 @@ export function renderItem(spec) {
   if (scopeEntries.length) fm.push(`scope: [${scopeEntries.map((p) => `"${p}"`).join(', ')}]`);
   fm.push(`dateOpened: "${today}"`, 'tags: []', '---', '');
   const lead = digest || 'TODO digest — one ≤100-word paragraph: what this item does and why (replace this line).';
-  // `## Done when` skeleton (#2949) — acceptance criteria are authored at file time, not left to the
-  // implementing lane to invent at review time (docs/agent/backlog-workflow.md → the determinism
-  // ladder). Emits one `**Executable**` TODO line; the author fills in a real tier-1 command, or drops
-  // to tier-2/3 (or an explicit "why not" line) when no command applies.
-  const doneWhen = '## Done when\n\n1. **Executable** — TODO: a command that fails before this item lands and passes after.\n\n'
-    + `${GUARD_RELAXATION_HINT}\n\n`
-    + 'Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.\n';
-  return `${fm.join('\n')}\n# ${title}\n\n${lead}\n\n${doneWhen}\n${renderEdgeCasesSkeleton()}`;
+  // Task-agreement skeleton (#2949, #5399 S7) — acceptance criteria and non-goals are authored at file time,
+  // not left to the implementing lane to invent at review time (docs/agent/backlog-workflow.md → the
+  // determinism ladder). The shared reader renders `## Acceptance` with an `[A1]` **Executable** TODO line and
+  // `## Non-goals` with an `[N1]` TODO line; the authoring hints sit at the end of the acceptance section
+  // (the reader skips `Hint:` lines), so the hints stay beside the criteria they are about.
+  const skeleton = renderTaskAgreementSkeleton();
+  const split = skeleton.indexOf(`${NON_GOALS_HEADING}\n`);
+  const agreement = `${skeleton.slice(0, split)}${GUARD_RELAXATION_HINT}\n\n`
+    + 'Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.\n\n'
+    + skeleton.slice(split);
+  return `${fm.join('\n')}\n# ${title}\n\n${lead}\n\n${agreement}\n${renderEdgeCasesSkeleton()}`;
 }

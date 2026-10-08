@@ -56,6 +56,12 @@ describe('coroner change-request parsing', () => {
   it('reads card facts and card ids', () => {
     const card = parseCard('---\nkind: story\nsize: 3\npreparedDate: "2026-10-04"\nscope: ["we:scripts/a.mjs", "we:scripts/__tests__/a*.test.mjs"]\n---\n\n## Done when\n\n- [ ] `npx vitest run scripts/__tests__/a.test.mjs` green\n');
     expect(card).toMatchObject({ kind: 'story', size: 3, preparedDate: '2026-10-04', checklist: true, doneWhen: true, doneWhenExecutable: true, scope: ['we:scripts/a.mjs', 'we:scripts/__tests__/a*.test.mjs'] });
+    // #5399 S7 — the acceptance heading comes from the shared reader: `## Acceptance` reads as `## Done when`.
+    for (const h of ['Acceptance', 'Done when', 'Done-when', 'Definition of done']) {
+      const c = parseCard(`---\nkind: story\n---\n\n## ${h}\n\n- [A1] \`npx vitest run a.test.mjs\` green\n\n## Non-goals\n\n- [N1] x\n`);
+      expect(c).toMatchObject({ doneWhen: true, doneWhenExecutable: true });
+    }
+    expect(parseCard('---\nkind: story\n---\n\n## Notes\n\n`npx vitest run a.test.mjs`\n')).toMatchObject({ doneWhen: false, doneWhenExecutable: false });
     expect([cardIdOf('lane/5187-runner'), cardIdOf('lane/x4ol7l8-prevention-card'), cardIdOf('lane/item-100')]).toEqual(['5187', 'x4ol7l8', null]);
     expect(hunkRanges('@@ -1,2 +10,5 @@\n@@ -40 +44 @@')).toEqual([[10, 14], [44, 44]]);
   });

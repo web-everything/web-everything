@@ -47,6 +47,12 @@ describe('card and scope planning', () => {
       doneWhen: 'TODO', scope: ['we:scripts/', 'we:README.md'], status: 'open',
     });
     expect(parseCard('# Brief\nBody\n## Done when\nRun tests\n## Later\nNo').doneWhen).toBe('Run tests');
+    // #5399 S7 — the acceptance heading comes from the shared reader: `## Acceptance` reads exactly as `## Done when`.
+    for (const h of ['Done when', 'Acceptance', 'Acceptance criteria']) {
+      expect(parseCard(`# Brief\nBody\n## ${h}\nRun tests\nHint: x\n## Non-goals\n- [N1] No`))
+        .toEqual({ title: 'Brief', digest: 'Body', doneWhen: 'Run tests', scope: [], status: '' });
+    }
+    expect(parseCard(markdown.replace('## Done when', '## Acceptance'))).toEqual(parseCard(markdown));
     expect(parseCard('# Brief\nBody')).toEqual({ title: 'Brief', digest: 'Body', doneWhen: '', scope: [], status: '' });
   });
 
@@ -108,7 +114,8 @@ describe('task, branch and reporting', () => {
     }
     expect(text).toContain('Card #123: Repair the worker');
     expect(text).toContain('## Problem\nNeeds a guard.');
-    expect(text).toContain('## Done when\nTODO');
+    expect(text).toContain('## Acceptance\nTODO');
+    expect(text).not.toContain('Done when');
     expect(text).toContain('## Allowed files\nscripts/\nbacklog/123-worker.md');
     expect(composeTask({ ...task, briefText: 'Use this brief.' })).toContain('## Problem\nUse this brief.');
     expect(composeTask({ ...task, briefText: 'Use this brief.' })).not.toContain(task.digest);
@@ -127,6 +134,7 @@ describe('task, branch and reporting', () => {
     });
     for (const phrase of ['codex-direct pilot', 'Card: #123', 'TODO', 'scripts/', '1 file changed', '12', '9', '4%', '| verify |']) expect(body).toContain(phrase);
     expect(body).not.toContain('Closes');
+    expect(body).toContain('## Acceptance\nTODO');
     expect(body.trimEnd().endsWith('🤖 Generated with [Claude Code](https://claude.com/claude-code)')).toBe(true);
   });
 

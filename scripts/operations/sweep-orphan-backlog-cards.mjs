@@ -89,6 +89,7 @@ import { fileURLToPath } from 'node:url';
 import { extractSubmitResult } from './open-pr.mjs';
 import { parseRunJsonTail } from './land-prevention-card.mjs';
 import { readField } from '../backlog/frontmatter.mjs';
+import { ACCEPTANCE_HEADING_RE } from '../backlog/task-agreement.mjs';
 import { NON_DISPATCHABLE_KINDS } from './file-item.mjs';
 import {
   readQueueFile, writeQueueFile, addToQueue, queueHas, resolveQueuePath,
@@ -133,7 +134,7 @@ const GUARD_LINE_RE = /^\d+\.\s+\S.*$/gm;
  * `digestHash` covers the numbered GUARD LINES only — never the frontmatter (`dateOpened`, `scope`, a landed
  * card's `bornAs`), the intro paragraph (the #2749 loop shape names its `reviewed head` sha there) or the
  * idempotency key (which pins a head) — so the same guard for the same PR hashes identically whatever day or
- * head it was filed at. The `## Acceptance` (or legacy `## Done when`) boilerplate is cut before the guard lines are read. A card with no
+ * head it was filed at. The acceptance-section boilerplate is cut before the guard lines are read. A card with no
  * numbered guard line at all falls back to its whole body minus frontmatter.
  * @param {string} rel - `backlog/x......-*.md`, as `git status` reported it.
  * @param {string} content
@@ -146,9 +147,10 @@ export function parseOrphanCard(rel, content) {
   const kind = readField(content, 'kind') ?? '';
   const titleRef = TITLE_SOURCE_RE.exec(content)?.[1] ?? null;
   const sourceRef = IDEMPOTENCY_KEY_RE.exec(content)?.[1] ?? titleRef;
-  const body = String(content)
-    .replace(/^---\n[\s\S]*?\n---\n/, '')
-    .split(/\n##\s+(?:Done when|Acceptance)\b[\s\S]*$/)[0];
+  const stripped = String(content).replace(/^---\n[\s\S]*?\n---\n/, '');
+  // Cut at the acceptance section, found by the shared task-agreement reader's heading rule (#5399 S7).
+  const cut = [...stripped.matchAll(/\n##[ \t]+(.*)/g)].find((m) => ACCEPTANCE_HEADING_RE.test(m[1].trim()));
+  const body = cut ? stripped.slice(0, cut.index) : stripped;
   const guards = body.match(GUARD_LINE_RE) ?? [];
   const digestBody = guards.length ? guards.map((g) => g.trim()).join('\n') : body.trim();
   const digestHash = createHash('sha256').update(digestBody).digest('hex');

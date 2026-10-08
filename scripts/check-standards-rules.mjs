@@ -19,7 +19,7 @@ import { normalizeRelatedReport } from './lib/related-report.cjs';
 import { validateFidelityContract } from './lib/fidelity-contract.mjs';
 import { coversFile, isSubtreeEntry } from './readiness/scope-lease.mjs';
 import { GUARD_RELAXATION_HINT } from './backlog/scaffold.mjs';
-import { ACCEPTANCE_HEADING_RE } from './backlog/task-agreement.mjs';
+import { ACCEPTANCE_HEADING, ACCEPTANCE_HEADING_RE } from './backlog/task-agreement.mjs';
 import { EDGE_CASES_HEADING } from './backlog/edge-case-classes.mjs';
 import { scrubPublish } from './lib/secret-scrub.mjs';
 // #3637 — the POC-branch registry's own `deliveryTarget:` predicate, so the gate and the scoped per-item
@@ -1131,7 +1131,8 @@ function findNegativeClaimGaps(design, planText) {
   return gaps;
 }
 
-// Must-without-Done-when (#4438) — every numbered MVP Must must be cited BY NUMBER in a `## Acceptance` (or legacy `## Done when`) clause
+// Must-without-Done-when (#4438) — every numbered MVP Must must be cited BY NUMBER in an acceptance-section clause
+// (the section the shared task-agreement reader's `ACCEPTANCE_HEADING_RE` names — #5399 S7)
 // (`Must 2`, `Musts 1, 3`, `Musts 1-4`). Prose-only coverage is deliberately NOT a citation: substance matching is
 // unreliable, and adding the number is the cheap fix. Returns one `{ must, text }` per uncited Must.
 const MUST_CITE_RE = /\bMusts?\s+(\d+(?:\s*[-\u2013]\s*\d+)?(?:\s*(?:,|and|&)\s*\d+(?:\s*[-\u2013]\s*\d+)?)*)/gi;
@@ -1175,10 +1176,10 @@ export function findDanglingBacklogRefs(body, knownIds) {
 }
 
 // ── Unfinished executable acceptance beside a mutation-proof claim (#4738) ───────────────────────────
-// The scaffold emits `TODO: a command` as the `## Acceptance` (or legacy `## Done when`) placeholder. An OPEN card that still carries it
+// The scaffold emits `TODO: a command` as the acceptance-section placeholder. An OPEN card that still carries it
 // while its prose claims "mutation proof" dresses an unfinished acceptance up as a proven one → hard error.
 // Scan is one fence-aware pass (backtick AND tilde fences; inline code stripped): the placeholder counts only
-// inside `## Acceptance` (or legacy `## Done when`) (to the next level-two heading, subordinate headings included); the claim counts on any
+// inside the acceptance section (`ACCEPTANCE_HEADING_RE`, to the next level-two heading, subordinate headings included); the claim counts on any
 // non-heading prose line. Literal match only — no attempt to judge whether other commands are executable.
 const UNFINISHED_ACCEPTANCE_RE = /TODO:\s*a command/i;
 const MUTATION_PROOF_CLAIM_RE = /mutation[- ]proof/i;
@@ -1280,7 +1281,7 @@ export function lintBacklogItemRendering({ item, body, pocRegistry = null, known
 
   // Unfinished executable acceptance beside a mutation-proof claim (#4738) — ERROR, exactly-open cards only.
   if (item.status === 'open' && hasUnfinishedAcceptanceBesideProofClaim(body)) {
-    errors.push(`Backlog item "${id}" has unfinished executable acceptance beside a mutation-proof claim — its ## Acceptance (or legacy ## Done when) ` +
+    errors.push(`Backlog item "${id}" has unfinished executable acceptance beside a mutation-proof claim — its ${ACCEPTANCE_HEADING} section ` +
       `still carries the scaffold placeholder, and a proof narrative must not disguise it. ` +
       `Replace "TODO: a command" with a concrete command/test that fails before the item lands and passes after.`);
   }
@@ -1301,12 +1302,12 @@ export function lintBacklogItemRendering({ item, body, pocRegistry = null, known
     }
   }
 
-  // Must-without-Done-when + dangling backlog refs (#4438) — WARNING only, open/active cards.
+  // Must-without-acceptance-cite + dangling backlog refs (#4438) — WARNING only, open/active cards.
   if (item.status !== 'resolved') {
     const uncited = findMustWithoutDoneWhen(body);
     if (uncited.length) {
-      warnings.push(`Backlog item "${id}" has MVP Must(s) no Done-when clause cites by number — ` +
-        `${uncited.map((g) => `Must ${g.must} ("${g.text}")`).join('; ')}. Cite each as \`Must N\`, \`Musts A, B\` or \`Musts A-B\` in ## Done when.`);
+      warnings.push(`Backlog item "${id}" has MVP Must(s) no acceptance clause cites by number — ` +
+        `${uncited.map((g) => `Must ${g.must} ("${g.text}")`).join('; ')}. Cite each as \`Must N\`, \`Musts A, B\` or \`Musts A-B\` in ${ACCEPTANCE_HEADING}.`);
     }
     if (knownBacklogIds) {
       const dangling = findDanglingBacklogRefs(body, knownBacklogIds);
@@ -3953,19 +3954,20 @@ export function scopeMissingTestFile(item, index, body) {
   return findings;
 }
 
-/** The body text of the `## MVP` / `## Acceptance` (or legacy `## Done when`) sections only (the sections that commit to deliverables). */
+/** The body text of the `## MVP` and acceptance sections only (the sections that commit to deliverables; the acceptance
+ *  heading is the shared task-agreement reader's rule, #5399 S7). */
 function deliverableSections(body) {
   const out = [];
   let on = false;
   for (const line of String(body || '').split('\n')) {
     const h = /^##\s+(.*?)\s*$/.exec(line);
-    if (h) { on = /^(MVP|Done when|Acceptance)\b/i.test(h[1]); continue; }
+    if (h) { on = /^MVP\b/i.test(h[1]) || ACCEPTANCE_HEADING_RE.test(h[1]); continue; }
     if (on) out.push(line);
   }
   return out.join('\n');
 }
 
-/** Guard 5. Backtick-quoted `we:<file>` tokens under `## MVP` / `## Acceptance` (or legacy `## Done when`) that `scope:` does not cover.
+/** Guard 5. Backtick-quoted `we:<file>` tokens under `## MVP` / the acceptance section that `scope:` does not cover.
  * File-shaped tokens only (must carry an extension). @returns {string[]} */
 export function bodyDeliverablesMissingFromScope(item, body) {
   const scope = item?.scope;
