@@ -2,7 +2,7 @@
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/main-red-recovery.mjs", "we:scripts/conveyor/ci-heal-escalation-mark.mjs", "we:scripts/conveyor/ci-red-recovery-watch.mjs"]
+scope: ["we:scripts/conveyor/main-red-recovery.mjs", "we:scripts/conveyor/ci-heal-escalation-mark.mjs", "we:scripts/conveyor/ci-red-recovery-watch.mjs", "we:scripts/conveyor/__tests__/main-defect-escalation-recovery.test.mjs"]
 dateOpened: "2026-10-07"
 tags: []
 ---
