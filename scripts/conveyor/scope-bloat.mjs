@@ -26,6 +26,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { countRebaseOntoMainComments } from './main-red-recovery.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { coversFile } from '../readiness/scope-lease.mjs';
 
 export const SCOPE_BLOAT_REASON = 'scope-bloat';
 export const SCOPE_BLOAT_DEFAULTS = Object.freeze({ alreadyOnMain: 3, outsideScope: 10, minFiles: 12 });
@@ -33,11 +34,13 @@ export const SCOPE_BLOAT_DEFAULTS = Object.freeze({ alreadyOnMain: 3, outsideSco
 const knob = (env, name, fallback) => {
   const raw = env?.[name];
   if (raw == null || raw === '') return fallback;
+  // An operator's "turn it off" must not silently leave the signal on at its default.
+  if (/^(off|false|no|disabled?)$/i.test(String(raw).trim())) return 0;
   const n = Number(raw);
   return Number.isSafeInteger(n) && n >= 0 ? n : fallback;
 };
 
-/** The thresholds in force. `0` for a knob turns that signal off. */
+/** The thresholds in force. `0` for a knob turns that signal off (`minFiles` gates the scope signal only). */
 export function scopeBloatLimits(env = process.env) {
   return {
     alreadyOnMain: knob(env, 'WE_REVIEW_SCOPE_BLOAT_ALREADY_ON_MAIN', SCOPE_BLOAT_DEFAULTS.alreadyOnMain),
@@ -46,17 +49,40 @@ export function scopeBloatLimits(env = process.env) {
   };
 }
 
-const unprefix = (entry) => String(entry ?? '').trim().replace(/^[a-z][a-z0-9-]*:/i, '');
 const isCompanion = (path) => /^backlog\//.test(path) || /(^|\/)__tests__\//.test(path) || /\.test\.[cm]?[jt]s$/.test(path)
   || /\.md$/.test(path);
 
-/** Does `path` fall under one `scope:` entry? A trailing `/` is a directory prefix; anything else is an exact file. */
+/** A card's `scope:` entry as a WE-qualified pattern: an unqualified entry is this repo's, and a `./` lead is dropped. */
+const qualify = (raw) => {
+  const entry = String(raw ?? '').trim();
+  if (!entry) return '';
+  const qualified = /^[a-z][a-z0-9-]*:/i.test(entry) ? entry : `we:${entry}`;
+  return qualified.replace(/^([a-z][a-z0-9-]*:)(?:\.\/)+/i, '$1').replace(/^[a-z][a-z0-9-]*:/i, (p) => p.toLowerCase());
+};
+
+/**
+ * Does the Web Everything file `path` fall under one `scope:` entry? Uses the same matcher the scope lease does
+ * (`scope-lease.mjs#coversFile`), because cards write scope in four shapes: an exact file, `dir/`, a bare directory
+ * with no trailing slash (`we:scripts/conveyor`), and a glob. A file entry matches only itself; a directory entry
+ * matches everything beneath it, not a sibling that merely shares its name as a prefix. An entry for another repo
+ * (`frontierui:...`) never matches a Web Everything path.
+ */
 export function inScope(path, scope) {
+  const file = `we:${String(path ?? '')}`;
   return (Array.isArray(scope) ? scope : []).some((raw) => {
-    const entry = unprefix(raw);
-    return entry && (entry.endsWith('/') ? path.startsWith(entry) : path === entry);
+    const entry = qualify(raw);
+    if (entry === '') return false;
+    if (coversFile(entry, file)) return true;
+    // `coversFile` reads a last segment with an extension as a FILE, so a dotted directory written without a trailing
+    // slash (`we:.github`, `we:docs/v1.2`) would match only itself and every child would count as outside scope. Also
+    // read a non-glob entry as a directory prefix: no real path sits beneath a file, so this cannot over-match.
+    const body = entry.slice(entry.indexOf(':') + 1).replace(/\/$/, '');
+    return body !== '' && !/[*?]/.test(body) && entry.slice(0, entry.indexOf(':')) === 'we' && file.slice(3).startsWith(`${body}/`);
   });
 }
+
+/** The far-outside-scope signal is on only when BOTH its knobs are positive: `0` on either is the documented off switch. */
+const scopeSignalOn = (limits) => limits.outsideScope > 0 && limits.minFiles > 0;
 
 /**
  * The verdict for one PR. PURE.
@@ -70,7 +96,7 @@ export function assessScopeBloat({ prFiles, netFiles = null, cardScope = null, e
   const net = netFiles ? new Set(netFiles) : null;
   const alreadyOnMain = net ? files.filter((p) => !net.has(p)) : [];
   const scope = Array.isArray(cardScope) && cardScope.length ? cardScope : null;
-  const outsideScope = scope && files.length >= limits.minFiles
+  const outsideScope = scope && scopeSignalOn(limits) && files.length >= limits.minFiles
     ? files.filter((p) => !isCompanion(p) && !inScope(p, scope) && (!net || net.has(p))) : [];
   const stale = limits.alreadyOnMain > 0 && alreadyOnMain.length >= limits.alreadyOnMain;
   const wide = limits.outsideScope > 0 && outsideScope.length > limits.outsideScope;
@@ -123,6 +149,7 @@ export function readCardScope({ title, base = 'main', root = ROOT, run = git } =
 }
 
 const memo = new Map();
+const unreadable = new Set();
 const refreshes = new Map();
 const refreshKey = (pr, head) => `${pr}:${head}`;
 
@@ -135,27 +162,63 @@ export function recordScopeBloatRefresh(pr, head, result) {
 /** The recorded refresh attempt for this head, or `null` (none yet). */
 export const scopeBloatRefreshFor = (pr, head) => refreshes.get(refreshKey(pr, head)) ?? null;
 
+export const MARKER_RETRIES_PER_HEAD = 3;
+const markerFailures = new Map();
+
+/**
+ * The durable per-head marker could not be posted, so the fix daemon (another process, reading only the thread) cannot
+ * see the attempt and would wait on a refresh that never shows. Forget the in-process record so the next tick tries the
+ * refresh (idempotent: an up-to-date branch answers `current`) and the marker again, at most {@link MARKER_RETRIES_PER_HEAD}
+ * times per head; after that the record stays, so a marker that can never be posted does not refresh every tick forever.
+ * @returns {boolean} true when the record was forgotten (a retry is owed)
+ */
+export function noteScopeBloatMarkerFailure(pr, head) {
+  const key = refreshKey(pr, head);
+  const n = (markerFailures.get(key) ?? 0) + 1;
+  markerFailures.set(key, n);
+  if (markerFailures.size > 500) markerFailures.delete(markerFailures.keys().next().value);
+  if (n > MARKER_RETRIES_PER_HEAD) return false;
+  refreshes.delete(key);
+  return true;
+}
+
+/** The base branch tip the assessment was made against, or `'unknown'` (unreadable: still assessed, keyed apart from any real sha). */
+export function readBaseSha({ base = 'main', root = ROOT, run = git } = {}) {
+  return run(['rev-parse', '--verify', `origin/${base}^{commit}`], root).trim() || 'unknown';
+}
+
 /**
  * Attach `pr.scopeBloat` to each open, non-draft PR whose diff is bloated. FAILS OPEN per PR: any read error leaves the
- * PR unannotated. Memoized per (PR, head), so a PR that stays bloated costs one git read, not one per tick.
+ * PR unannotated. Memoized per (PR, head, base tip), so a PR that stays bloated on an unmoved `main` costs one git read,
+ * not one per tick, while a `main` that advances (another lane's commits landing turn files of this diff into
+ * already-on-main files) reassesses the same head. This reads the local `origin/<base>`; it does not fetch it.
  * Only the Web Everything repo is read (the git root is this clone); other repos pass through.
  */
 export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'main', env = process.env, root = ROOT,
-  readNet = readNetFiles, readScope = readCardScope } = {}) {
+  readNet = readNetFiles, readScope = readCardScope, readBaseSha: readBase = readBaseSha } = {}) {
   if (!Array.isArray(prs) || (repo && repoKeyForSlug(repo) !== 'we')) return prs;
   const limits = scopeBloatLimits(env);
+  let baseSha = null; // read once per call, lazily: a pass over PRs that all fail the cheap checks never shells out
+  const baseTip = () => {
+    if (baseSha == null) { try { baseSha = readBase({ base: defaultBranch, root }) || 'unknown'; } catch { baseSha = 'unknown'; } }
+    return baseSha;
+  };
   return prs.map((pr) => {
     try {
       if (pr?.isDraft || !pr?.headRefOid || !Array.isArray(pr.files)) return pr;
-      const key = `${pr.number}:${pr.headRefOid}`;
+      // A head that cannot be read stays unreadable whatever `main` does: remember that per head, not per main tip, so it
+      // costs one failed read (cat-file, fetch, diff; 30 s each) rather than one per main advance.
+      const headKey = `${pr.number}:${pr.headRefOid}`;
+      if (unreadable.has(headKey)) return pr;
+      const key = `${headKey}:${baseTip()}`;
       if (!memo.has(key)) {
-        const lazy = pr.files.length >= limits.minFiles;
+        const lazy = scopeSignalOn(limits) && pr.files.length >= limits.minFiles;
         // Stale-base needs the net diff for any PR big enough to hold that many files; the card scope only for big ones.
         const needNet = lazy || (limits.alreadyOnMain > 0 && pr.files.length >= limits.alreadyOnMain);
         // An unreadable diff is remembered as "no claim" too, so a PR whose head cannot be fetched costs one failed read, not one per tick.
         let net = null;
         try { net = needNet ? readNet({ headRefName: pr.headRefName, headRefOid: pr.headRefOid, base: defaultBranch, root }) : null; }
-        catch { memo.set(key, null); return pr; }
+        catch { unreadable.add(headKey); if (unreadable.size > 500) unreadable.delete(unreadable.values().next().value); return pr; }
         const scope = lazy ? readScope({ title: pr.title ?? '', base: defaultBranch, root }) : null;
         memo.set(key, assessScopeBloat({ prFiles: pr.files, netFiles: net, cardScope: scope, env }));
         if (memo.size > 500) memo.delete(memo.keys().next().value);

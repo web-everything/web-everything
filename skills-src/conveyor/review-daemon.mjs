@@ -80,7 +80,7 @@ import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
 // recovery watch uses, once per head, before any review reads its diff.
 import { refreshOntoMain, defaultPostRebaseComment } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
-import { recordScopeBloatRefresh } from '../../scripts/conveyor/scope-bloat.mjs';
+import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scripts/conveyor/scope-bloat.mjs';
 // x26lw6u — the review is dispatched as a deterministic JOB (`review-job.mjs`: acquire → review-loop-cli →
 // report → release, no Claude wrapper session); `WE_REVIEW_DISPATCH_MODE=session` keeps the old `claude --bg`
 // path reachable. The jurors review-loop-cli spawns are the fresh, independent reviewers either way.
@@ -411,19 +411,27 @@ export function runReviewTick({
   if (typeof refreshScopeBloat === 'function') {
     for (const row of plan.refusals ?? []) {
       if (row.kind !== 'scope-bloat' || !row.scopeBloat?.stale || row.scopeBloat.refresh || !row.headRefName || !row.headRefOid) continue;
+      // A refresh that THROWS is normalized into a failed result and goes down the same path as one that returns: it is
+      // remembered in this process AND gets the durable per-head marker, because the fix daemon (another process) reads
+      // only the thread and would otherwise wait forever on a refresh it cannot see was tried.
+      const oneLine = (e) => String((e && e.message) || e).split('\n')[0];
+      let result;
       try {
-        const result = refreshScopeBloat({ repo, prNumber: row.prNumber, headRefName: row.headRefName, headRefOid: row.headRefOid, defaultBranch });
-        recordScopeBloatRefresh(row.prNumber, row.headRefOid, result);
-        // The durable per-head marker the fix daemon (another process) reads to know the refresh was tried.
-        if (typeof postRefreshMarker === 'function') {
-          try { postRefreshMarker(row.prNumber, { repo, headRefName: row.headRefName, headSha: row.headRefOid, ok: result?.ok === true, action: result?.action ?? 'error', error: result?.error ?? null }); }
-          catch (e) { failed.push({ prNumber: row.prNumber, error: `scope-bloat marker: ${String((e && e.message) || e).split('\n')[0]}` }); }
-        }
-        scopeBloatRefreshed.push({ prNumber: row.prNumber, ok: result?.ok === true, action: result?.action ?? null });
+        result = refreshScopeBloat({ repo, prNumber: row.prNumber, headRefName: row.headRefName, headRefOid: row.headRefOid, defaultBranch });
       } catch (e) {
-        recordScopeBloatRefresh(row.prNumber, row.headRefOid, { ok: false, action: 'error', error: String((e && e.message) || e).split('\n')[0] });
-        failed.push({ prNumber: row.prNumber, error: `scope-bloat refresh: ${String((e && e.message) || e).split('\n')[0]}` });
+        result = { ok: false, action: 'error', error: oneLine(e) };
+        failed.push({ prNumber: row.prNumber, error: `scope-bloat refresh: ${result.error}` });
       }
+      recordScopeBloatRefresh(row.prNumber, row.headRefOid, result);
+      if (typeof postRefreshMarker === 'function') {
+        try { postRefreshMarker(row.prNumber, { repo, headRefName: row.headRefName, headSha: row.headRefOid, ok: result?.ok === true, action: result?.action ?? 'error', error: result?.error ?? null }); }
+        catch (e) {
+          failed.push({ prNumber: row.prNumber, error: `scope-bloat marker: ${oneLine(e)}` });
+          // The thread never saw the attempt: owe the refresh + marker again next tick (bounded per head).
+          noteScopeBloatMarkerFailure(row.prNumber, row.headRefOid);
+        }
+      }
+      scopeBloatRefreshed.push({ prNumber: row.prNumber, ok: result?.ok === true, action: result?.action ?? null });
     }
   }
   // x26lw6u — NOT named `skipped`: `withSelfSync` already returns `{skipped: true}` for a whole skipped tick,

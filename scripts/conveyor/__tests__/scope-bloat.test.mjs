@@ -10,7 +10,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   assessScopeBloat, scopeBloatLimits, cardIdFromTitle, parseCardScope, inScope, enrichPrsWithScopeBloat,
-  recordScopeBloatRefresh, SCOPE_BLOAT_REASON,
+  recordScopeBloatRefresh, scopeBloatRefreshFor, MARKER_RETRIES_PER_HEAD, SCOPE_BLOAT_REASON,
 } from '../scope-bloat.mjs';
 import { planReconcile as planReconcileCore } from '../reconcile-core.mjs';
 import { planFixesFromReconcile, withScopeBloat } from '../reconcile-fix-dispatch.mjs';
@@ -33,6 +33,7 @@ const OTHER_LANES = [
   ...Array.from({ length: 33 }, (_, i) => `scripts/conveyor/lane-${i}-work.mjs`),
 ];
 const FILES_4361 = [...OWN, ...OTHER_LANES]; // 44 files
+const SPRAWL_FILES = [...OWN, ...Array.from({ length: 14 }, (_, i) => `scripts/lib/unrelated-${i}.mjs`)]; // all differ from main, 14 outside scope
 const CARD_SCOPE = ['we:skills-src/conveyor/build-dispatch-daemon.mjs', 'we:scripts/operations/dispatch-lane-io.mjs'];
 
 describe('assessScopeBloat — replay of #4361', () => {
@@ -64,6 +65,26 @@ describe('assessScopeBloat — replay of #4361', () => {
     expect(assessScopeBloat({ prFiles: [...OWN, ...sprawl], netFiles: [...OWN, ...sprawl], cardScope: CARD_SCOPE, env: { WE_REVIEW_SCOPE_BLOAT_OUTSIDE_SCOPE: '20' } })).toBeNull();
   });
 
+  it('a PR whose card scope is a bare directory is not wide: every file under it is in scope', () => {
+    const files = Array.from({ length: 14 }, (_, i) => `scripts/conveyor/work-${i}.mjs`);
+    expect(assessScopeBloat({ prFiles: files, netFiles: files, cardScope: ['we:scripts/conveyor'], env: {} })).toBeNull();
+    expect(assessScopeBloat({ prFiles: files, netFiles: files, cardScope: ['we:scripts/conveyor/'], env: {} })).toBeNull();
+    expect(assessScopeBloat({ prFiles: files, netFiles: files, cardScope: ['we:scripts/other'], env: {} })).toMatchObject({ wide: true });
+  });
+
+  it.each([
+    ['WE_REVIEW_SCOPE_BLOAT_ALREADY_ON_MAIN', 'stale', () => assessScopeBloat({ prFiles: FILES_4361, netFiles: OWN, cardScope: CARD_SCOPE, env: { WE_REVIEW_SCOPE_BLOAT_ALREADY_ON_MAIN: '0' } })],
+    ['WE_REVIEW_SCOPE_BLOAT_OUTSIDE_SCOPE', 'wide', () => assessScopeBloat({ prFiles: SPRAWL_FILES, netFiles: SPRAWL_FILES, cardScope: CARD_SCOPE, env: { WE_REVIEW_SCOPE_BLOAT_OUTSIDE_SCOPE: '0' } })],
+    ['WE_REVIEW_SCOPE_BLOAT_MIN_FILES', 'wide', () => assessScopeBloat({ prFiles: SPRAWL_FILES, netFiles: SPRAWL_FILES, cardScope: CARD_SCOPE, env: { WE_REVIEW_SCOPE_BLOAT_MIN_FILES: '0' } })],
+  ])('%s=0 turns its signal off (%s)', (_knob, _signal, run) => {
+    expect(run()).toBeNull();
+  });
+
+  it('MIN_FILES=0 switches off only the scope signal: the stale-base signal still fires', () => {
+    expect(assessScopeBloat({ prFiles: FILES_4361, netFiles: OWN, cardScope: CARD_SCOPE, env: { WE_REVIEW_SCOPE_BLOAT_MIN_FILES: '0' } }))
+      .toMatchObject({ stale: true, wide: false });
+  });
+
   it('without a card scope or an unreadable main diff there is no claim (fail open)', () => {
     expect(assessScopeBloat({ prFiles: FILES_4361, netFiles: null, cardScope: null, env: {} })).toBeNull();
     expect(scopeBloatLimits({ WE_REVIEW_SCOPE_BLOAT_MIN_FILES: 'x' }).minFiles).toBe(12);
@@ -79,6 +100,43 @@ describe('card scope helpers', () => {
     expect(parseCardScope('no frontmatter')).toEqual([]);
     expect(inScope('b/x.mjs', ['we:b/'])).toBe(true);
     expect(inScope('c/x.mjs', ['we:b/', 'we:a.mjs'])).toBe(false);
+  });
+
+  // Review of PR 4443: ~71 of 1916 inline `scope:` lines carry a bare directory (no trailing slash), a glob or a `./` path.
+  it('matches every scope-entry shape the backlog actually uses: bare dir, dir/, glob, ./ path, exact file', () => {
+    expect(inScope('scripts/conveyor/x.mjs', ['we:scripts/conveyor'])).toBe(true);
+    expect(inScope('scripts/conveyor/deep/x.mjs', ['we:scripts/conveyor'])).toBe(true);
+    expect(inScope('scripts/lib/x.mjs', ['we:scripts'])).toBe(true);
+    expect(inScope('scripts/conveyor/x.mjs', ['we:scripts/conveyor/'])).toBe(true);
+    expect(inScope('scripts/conveyor/__tests__/a.test.mjs', ['we:scripts/conveyor/__tests__/health-watch*.test.mjs'])).toBe(false);
+    expect(inScope('scripts/conveyor/__tests__/health-watch-core.test.mjs', ['we:scripts/conveyor/__tests__/health-watch*.test.mjs'])).toBe(true);
+    expect(inScope('scripts/conveyor/x.mjs', ['we:./scripts/conveyor/x.mjs'])).toBe(true);
+    expect(inScope('scripts/conveyor/x.mjs', ['scripts/conveyor'])).toBe(true); // unqualified = this repo
+  });
+
+  it('reads a dotted directory written without a trailing slash as a directory, and a repo prefix in any case', () => {
+    expect(inScope('.github/workflows/ci.yml', ['we:.github'])).toBe(true);
+    expect(inScope('docs/v1.2/a.md', ['we:docs/v1.2'])).toBe(true);
+    expect(inScope('src/foo.v2/a.ts', ['we:src/foo.v2'])).toBe(true);
+    expect(inScope('src/foo.v2x/a.ts', ['we:src/foo.v2'])).toBe(false);
+    expect(inScope('scripts/conveyor/x.mjs', ['WE:scripts/conveyor'])).toBe(true);
+    expect(inScope('.github/x', ['frontierui:.github'])).toBe(false);
+  });
+
+  it('an operator\'s off-style knob value turns the signal off instead of silently keeping the default', () => {
+    for (const v of ['off', 'false', 'No', 'disabled']) {
+      expect(scopeBloatLimits({ WE_REVIEW_SCOPE_BLOAT_OUTSIDE_SCOPE: v }).outsideScope).toBe(0);
+      expect(scopeBloatLimits({ WE_REVIEW_SCOPE_BLOAT_MIN_FILES: v }).minFiles).toBe(0);
+      expect(scopeBloatLimits({ WE_REVIEW_SCOPE_BLOAT_ALREADY_ON_MAIN: v }).alreadyOnMain).toBe(0);
+    }
+    expect(scopeBloatLimits({ WE_REVIEW_SCOPE_BLOAT_MIN_FILES: 'x' }).minFiles).toBe(12);
+  });
+
+  it('does not over-match: a sibling name, a file entry used as a name prefix, or another repo\'s entry', () => {
+    expect(inScope('scripts/conveyor-extra/x.mjs', ['we:scripts/conveyor'])).toBe(false);
+    expect(inScope('scripts/conveyor/x.mjs2', ['we:scripts/conveyor/x.mjs'])).toBe(false); // a file entry is not a name prefix
+    expect(inScope('scripts/conveyor/x.mjs', ['frontierui:scripts/conveyor'])).toBe(false);
+    expect(inScope('scripts/conveyor/x.mjs', ['', null, undefined])).toBe(false);
   });
 });
 
@@ -111,6 +169,42 @@ describe('enrichPrsWithScopeBloat — the io shell fails open and remembers the 
     const readNet = () => { reads += 1; throw new Error('no such ref'); };
     for (let i = 0; i < 3; i += 1) expect(enrichPrsWithScopeBloat([pr({ number: 30, headRefOid: 'f'.repeat(40) })], { ...readers, readNet })[0].scopeBloat).toBeUndefined();
     expect(reads).toBe(1);
+  });
+
+  it('an unreadable head is not re-read when main advances', () => {
+    let reads = 0;
+    const readNet = () => { reads += 1; throw new Error('no such ref'); };
+    for (const sha of ['m1', 'm2', 'm3']) enrichPrsWithScopeBloat([pr({ number: 70, headRefOid: '7'.repeat(40) })], { ...readers, readNet, readBaseSha: () => sha });
+    expect(reads).toBe(1);
+  });
+
+  it('MIN_FILES=0 never reads a card or flags a wide PR', () => {
+    let scopeReads = 0;
+    const files = SPRAWL_FILES.map((path) => ({ path }));
+    const [out] = enrichPrsWithScopeBloat([pr({ number: 40, headRefOid: '4'.repeat(40), files })], { ...readers,
+      readNet: () => SPRAWL_FILES, readScope: () => { scopeReads += 1; return CARD_SCOPE; }, env: { WE_REVIEW_SCOPE_BLOAT_MIN_FILES: '0' } });
+    expect(out.scopeBloat).toBeUndefined();
+    expect(scopeReads).toBe(0);
+  });
+
+  it('reassesses an unchanged head when main advances; the same head on the same main is still read once', () => {
+    const head = '5'.repeat(40);
+    let reads = 0;
+    let netNow = FILES_4361.slice(); // first sight: every file differs from main -> not stale
+    const readNet = () => { reads += 1; return netNow; };
+    const run = (sha) => enrichPrsWithScopeBloat([pr({ number: 50, headRefOid: head })], { ...readers, readNet, readScope: () => null, readBaseSha: () => sha })[0];
+    expect(run('a1').scopeBloat).toBeUndefined();
+    expect(run('a1').scopeBloat).toBeUndefined();
+    expect(reads).toBe(1);
+    netNow = OWN; // another lane landed the other 39 files: they are now identical to main
+    expect(run('b2').scopeBloat).toMatchObject({ stale: true });
+    expect(reads).toBe(2);
+  });
+
+  it('an unreadable main sha still assesses (fail open) and is keyed as unknown, not shared with a known sha', () => {
+    const head = '6'.repeat(40);
+    const [out] = enrichPrsWithScopeBloat([pr({ number: 60, headRefOid: head })], { ...readers, readBaseSha: () => { throw new Error('no git'); } });
+    expect(out.scopeBloat).toMatchObject({ stale: true });
   });
 
   it('a head ref that looks like a git option is refused before any git call', () => {
@@ -242,5 +336,32 @@ describe('runReviewTick — one mechanical refresh per bloated head, with a dura
   it('a refresh that throws is reported, remembered, and never fails the tick', () => {
     const { out } = tick({ ...row({ stale: true }), prNumber: 4362 }, { refreshScopeBloat: () => { throw new Error('push refused'); } });
     expect(out.failed).toEqual([expect.objectContaining({ prNumber: 4362, error: expect.stringContaining('push refused') })]);
+  });
+
+  it('a refresh that throws still posts the durable per-head marker, as a failure (the fix daemon only reads the thread)', () => {
+    const { out, markers } = tick({ ...row({ stale: true }), prNumber: 4363 }, { refreshScopeBloat: () => { throw new Error('push refused\nsecond line'); } });
+    expect(markers).toHaveLength(1);
+    expect(markers[0][0]).toBe(4363);
+    expect(markers[0][1]).toMatchObject({ headSha: 'd'.repeat(40), ok: false, action: 'error', error: 'push refused' });
+    expect(out.scopeBloatRefreshed).toEqual([{ prNumber: 4363, ok: false, action: 'error' }]);
+    expect(out.failed).toEqual([expect.objectContaining({ prNumber: 4363, error: expect.stringContaining('push refused') })]);
+  });
+
+  it('a marker post that fails is reported, the tick goes on, and the attempt is owed again next tick (bounded per head)', () => {
+    const head = 'd'.repeat(40);
+    const down = { postRefreshMarker: () => { throw new Error('gh down'); } };
+    const first = tick({ ...row({ stale: true }), prNumber: 4364 }, down);
+    expect(first.refreshed).toHaveLength(1);
+    expect(first.out.failed).toEqual([expect.objectContaining({ prNumber: 4364, error: expect.stringContaining('gh down') })]);
+    // The thread never saw the attempt, so the process must not claim it was made: next tick refreshes and posts again.
+    expect(scopeBloatRefreshFor(4364, head)).toBeNull();
+    for (let i = 0; i < MARKER_RETRIES_PER_HEAD; i += 1) tick({ ...row({ stale: true }), prNumber: 4364 }, down);
+    // A marker that can never be posted must not refresh on every tick forever: after the bound the record stays.
+    expect(scopeBloatRefreshFor(4364, head)).toMatchObject({ attempted: true, ok: true });
+  });
+
+  it('a refresh that throws AND a marker that throws report both, never throw out of the tick', () => {
+    const { out } = tick({ ...row({ stale: true }), prNumber: 4365 }, { refreshScopeBloat: () => { throw new Error('push refused'); }, postRefreshMarker: () => { throw new Error('gh down'); } });
+    expect(out.failed.map((f) => f.error).join('|')).toMatch(/push refused[\s\S]*gh down|gh down[\s\S]*push refused/);
   });
 });
