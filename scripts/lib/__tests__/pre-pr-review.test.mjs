@@ -18,6 +18,7 @@ import { planOpen } from '../../operations/open-pr.mjs';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const CLI = join(ROOT, 'scripts', 'converge-cli.mjs');
 const S = BUILT_IN_PRE_PR_SETTINGS;
+const enforcedCheck = (o) => checkPrePrReview({ ...o, settings: { ...S, mode: 'enforce' } }); // the repo ships advise; these tests pin the enforce path
 const f = (path, n = 10) => ({ path, additions: n, deletions: 0 });
 
 describe('risk rule', () => {
@@ -60,9 +61,9 @@ describe('risk rule', () => {
 
 describe('knob and decision', () => {
   const risky = { gated: true, cardOnly: false, reasons: ['300 lines changed (> 264)'] };
-  it('product default is advise; this repo ships enforce; bad values are ignored', () => {
+  it('product default is advise; this repo ships advise (enforce after the hardening card); bad values are ignored', () => {
     expect(BUILT_IN_PRE_PR_SETTINGS.mode).toBe('advise');
-    expect(loadPrePrSettings().settings.mode).toBe('enforce');
+    expect(loadPrePrSettings().settings.mode).toBe('advise'); // landed in advise; enforce follows the hardening card
     expect(loadPrePrSettings({ path: '/nonexistent' }).settings.mode).toBe('enforce'); // a missing file fails closed
     const r = resolvePrePrSettings({ mode: 'sometimes', maxLines: -1 });
     expect(r.settings.mode).toBe('advise');
@@ -168,13 +169,13 @@ describe('lane sandbox: checkPrePrReview + open-pr runner', () => {
       if (bf) sentBody = readFileSync(bf.slice(12), 'utf8');
       return { status: 0, stdout: '{"pr":1,"url":"u"}\n', stderr: '' };
     };
-    const run = createPrLandRunner({ spawn, cwd: dir, env: OPERATOR });
+    const run = createPrLandRunner({ prePrReview: enforcedCheck, loadSettings: () => ({ settings: { ...S, mode: "enforce" }, error: "" }), spawn, cwd: dir, env: OPERATOR });
     const argv = ['--ref=lane/x', '--base=main', '--body-file=/tmp/b.md', '--label-on-green'];
     const out = run({ argv });
     expect(out).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-missing' });
     expect(spawned).toHaveLength(0);
     // worker bypass is refused, even with an actor and an instruction
-    const w = createPrLandRunner({ spawn, cwd: dir, env: { WE_CONVEYOR_WORKER: '1' } });
+    const w = createPrLandRunner({ prePrReview: enforcedCheck, spawn, cwd: dir, env: { WE_CONVEYOR_WORKER: '1' } });
     expect(w({ argv, skipPrePrReview: 'x', actor: 'nic', operatorInstruction: 'ok it' })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-missing' });
     // an interactive bypass with no operator instruction is refused
     expect(run({ argv, skipPrePrReview: 'emergency hotfix' })).toMatchObject({ outcome: 'refused' });
@@ -261,7 +262,7 @@ describe('gate hardening (PR #4271 review)', () => {
     it('a REAL check error (unresolvable --base) refuses under the repo\'s enforce setting', () => {
       commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
       const spawned = [];
-      const run = createPrLandRunner({ spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+      const run = createPrLandRunner({ prePrReview: enforcedCheck, loadSettings: () => ({ settings: { ...S, mode: "enforce" }, error: "" }), spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
       expect(run({ argv: ['--ref=lane/x', '--base=no-such-base'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
       expect(spawned).toHaveLength(0);
     });
@@ -277,7 +278,7 @@ describe('gate hardening (PR #4271 review)', () => {
       commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
       mkdirSync(join(gitDirOf(dir), 'pre-pr-review-bypass.log')); // appendFileSync -> EISDIR
       const spawned = [];
-      const run = createPrLandRunner({ loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+      const run = createPrLandRunner({ prePrReview: enforcedCheck, loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
       const body = join(dir, 'b.md'); writeFileSync(body, 'body\n');
       expect(run({ argv: ['--ref=lane/x', '--base=main', `--body-file=${body}`], skipPrePrReview: 'hotfix', actor: 'nic', operatorInstruction: 'ship it' }))
         .toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
@@ -290,7 +291,7 @@ describe('gate hardening (PR #4271 review)', () => {
     const blocker = join(dir, 'not-a-dir'); writeFileSync(blocker, 'a file where the audit directory should go\n');
     process.env.WE_PRE_PR_BYPASS_DIR = join(blocker, 'records'); // mkdir -> ENOTDIR
     const spawned = [];
-    const run = createPrLandRunner({ loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+    const run = createPrLandRunner({ prePrReview: enforcedCheck, loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
     const body = join(dir, 'b.md'); writeFileSync(body, 'body\n');
     expect(run({ argv: ['--ref=lane/x', '--base=main', `--body-file=${body}`], skipPrePrReview: 'hotfix', actor: 'nic', operatorInstruction: 'ship it' }))
       .toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
@@ -315,12 +316,23 @@ describe('gate hardening (PR #4271 review)', () => {
       expect(r).toMatchObject({ action: 'refuse', sha: risky });
       expect(r.risk.lines).toBeGreaterThan(264);
     });
+    it('advise mode: a risky head with no receipt only warns and still opens (never refuses)', () => {
+      commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
+      const adviseSettings = () => ({ settings: { ...S, mode: 'advise' }, error: '' });
+      const r = checkPrePrReview({ cwd: dir, sha: git('rev-parse', 'HEAD'), env: OPERATOR, settings: { ...S, mode: 'advise' } });
+      expect(r).toMatchObject({ action: 'advise' });
+      expect(r.message).toBeTruthy();
+      const spawned = [];
+      const run = createPrLandRunner({ prePrReview: (o) => checkPrePrReview({ ...o, settings: { ...S, mode: 'advise' } }), loadSettings: adviseSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+      expect(run({ argv: ['--ref=lane/x', '--base=main'] }).outcome).toBe('opened');
+      expect(spawned).toHaveLength(1);
+    });
     it('pins --sha to the judged commit in the argv pr-land receives (HEAD is resolved once)', () => {
       commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
       const head = git('rev-parse', 'HEAD');
       writeFileSync(join(gitDirOf(dir), RECEIPT_FILE), JSON.stringify(buildReceipt({ tree: treeOf(dir), head, envelope: {}, base: git('merge-base', 'main', 'HEAD') })));
       const spawned = [];
-      const run = createPrLandRunner({ loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+      const run = createPrLandRunner({ prePrReview: enforcedCheck, loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
       expect(run({ argv: ['--ref=lane/x', '--base=main'] }).outcome).toBe('opened');
       expect(spawned[0][1].filter((a) => a.startsWith('--sha='))).toEqual([`--sha=${head}`]);
       // an explicit short/symbolic --sha is replaced by the full judged commit, never passed twice
@@ -329,7 +341,7 @@ describe('gate hardening (PR #4271 review)', () => {
       expect(spawned[0][1].filter((a) => a.startsWith('--sha='))).toEqual([`--sha=${head}`]);
     });
     it('an unresolvable --sha is a check error and refuses under enforce', () => {
-      const run = createPrLandRunner({ loadSettings: enforceSettings, spawn: okSpawn([]), cwd: dir, env: OPERATOR });
+      const run = createPrLandRunner({ prePrReview: enforcedCheck, loadSettings: enforceSettings, spawn: okSpawn([]), cwd: dir, env: OPERATOR });
       expect(run({ argv: ['--ref=lane/x', '--base=main', '--sha=deadbeef'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
     });
   });
@@ -375,7 +387,7 @@ describe('gate hardening (PR #4271 review)', () => {
       const body = join(dir, 'b.md'); writeFileSync(body, 'body\n');
       const spawned = []; let sentBody = '';
       const spawn = (...a) => { spawned.push(a); sentBody = readFileSync(a[1].find((x) => x.startsWith('--body-file=')).slice(12), 'utf8'); return { status: 0, stdout: '{"pr":1}\n' }; };
-      const run = createPrLandRunner({ loadSettings: enforceSettings, spawn, cwd: dir, env: OPERATOR });
+      const run = createPrLandRunner({ prePrReview: enforcedCheck, loadSettings: enforceSettings, spawn, cwd: dir, env: OPERATOR });
       const out = run({ argv: ['--ref=lane/x', '--base=main', `--body-file=${body}`], skipPrePrReview: 'hotfix', actor: 'nic', operatorInstruction: 'ship it\n# forged' });
       expect(out.outcome).toBe('opened');
       expect(sentBody).toMatch(/^body\n\n\n\*\*Pre-PR review bypassed\*\* by `` nic `` — reason: `` hotfix ``\. Operator instruction: `` ship it # forged ``\n$/);
@@ -386,7 +398,7 @@ describe('gate hardening (PR #4271 review)', () => {
       commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
       process.env.WE_PRE_PR_BYPASS_DIR = join(dir, 'records');
       const spawned = [];
-      const run = createPrLandRunner({ loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
+      const run = createPrLandRunner({ prePrReview: enforcedCheck, loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
       const bypass = { skipPrePrReview: 'hotfix', actor: 'nic', operatorInstruction: 'ship it' };
       expect(run({ argv: ['--ref=lane/x', '--base=main', `--body-file=${join(dir, 'missing.md')}`], ...bypass })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded' });
       expect(run({ argv: ['--ref=lane/x', '--base=main'], ...bypass })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: expect.stringMatching(/no --body-file/) });

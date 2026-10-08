@@ -310,7 +310,7 @@ node scripts/converge-cli.mjs init --lane="$LANE" --state="$STATE" --care=elevat
 - **`land`** — a non-author panel accepted the final diff and an independent red-team failed to break it;
   proceed to the PR.
 - **RISKY code PRs MUST have a receipt — `open-pr` refuses without one** (`prePrReview.mode` in
-  `we:scripts/pre-pr-review-settings.json`: `off`|`advise`|`enforce`; this repo is `enforce`). A PR is risky when
+  `we:scripts/pre-pr-review-settings.json`: `off`|`advise`|`enforce`; this repo is `advise` until the hardening card lands, then `enforce`). A PR is risky when
   ANY of: more than 264 lines, more than 2 subsystems, more than 5 files, no prepared card in the diff, or an
   operator-agent builder. A card-only PR, or a small prepared conveyor PR, is unaffected. **Run `/converge`
   WHILE the step-5 verify is running** (the verify wait is 4-9 minutes anyway), fix its findings in this session,
