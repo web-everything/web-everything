@@ -2,7 +2,7 @@
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/conveyor/referral-auto-block.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/lib/review-settings.mjs", "we:scripts/lib/jury-core.mjs", "we:scripts/lib/ruling-ledger.mjs", "we:scripts/operations/record-referral-ruling.mjs", "we:scripts/operations/coroner-rounds.mjs"]
+scope: ["we:scripts/conveyor/referral-auto-block.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/lib/review-settings.mjs", "we:scripts/lib/jury-core.mjs", "we:scripts/lib/ruling-ledger.mjs", "we:scripts/operations/record-referral-ruling.mjs", "we:scripts/operations/coroner-rounds.mjs", "we:scripts/review-settings.json", "we:scripts/conveyor/__tests__/referral-auto-block.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
