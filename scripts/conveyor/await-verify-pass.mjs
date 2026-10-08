@@ -36,6 +36,7 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { laneGitConfigArgs, laneGitHardeningEnv, laneFilterDrivers, LANE_CONFIG_LIST_ARGS } from '../lib/lane-git-hardening.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { readFixDispatchClaim } from './fix-claim-store.mjs';
+import { listWrappedWorkerAgents, requestWrappedResume } from '../operations/worker-wrapper-launch.mjs';
 import { AGENT_GONE_STATES } from './lease-reaper.mjs';
 import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
 
@@ -501,6 +502,7 @@ export async function defaultAwaitVerifyIo({
   weRoot = ROOT, exec = execFileSync, env = process.env, sleep = sleepSync,
   dispatchIo = null, stopSessionFn = null, pushRefusalFn = null, readClaimFn = null, poolRoot = null, realpath = realpathSync,
   pidAliveFn = pidAlive,
+  listWrappedWorkers = listWrappedWorkerAgents, requestWrappedResumeFn = requestWrappedResume,
 } = {}) {
   /** The lane pool the daemon acts in. A record's `lane` is agent-typed, so a path outside the pool is never touched. */
   const lanePoolRoot = poolRoot ?? defaultPoolRoot(weRoot, env);
@@ -661,8 +663,14 @@ export async function defaultAwaitVerifyIo({
         return { ok: false, terminal: true, reason: `GitHub refused the push: ${String(e?.stderr ?? e?.message ?? e).trim().split('\n').slice(-1)[0].slice(0, 200)}` };
       }
     },
-    listSessions: () => io.defaultListAgents({ all: true, env }),
+    listSessions: () => {
+      const rows = [];
+      try { rows.push(...io.defaultListAgents({ all: true, env })); } catch { /* keep the wrapped listing */ }
+      try { rows.push(...listWrappedWorkers()); } catch { /* keep the Claude listing */ }
+      return rows;
+    },
     resume: ({ session, prompt }) => {
+      if (session?.kind === 'wrapped-worker') return requestWrappedResumeFn({ session, prompt });
       // Every read this port makes of the session list is UNCACHED: the 20s agents cache would otherwise show a
       // pre-stop / pre-spawn row and misjudge both the exit wait and the resume confirmation.
       const liveEnv = { ...env, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' };

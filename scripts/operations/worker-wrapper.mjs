@@ -28,12 +28,12 @@
  */
 import { spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { finishEnvelopeRecord, isValidSessionSlug, newEnvelopeRecord, redactFreeText } from './completion-record.mjs';
 import { resolveCompletionsDir, tryReadCompletion, withCompletionLock, writeCompletion } from './completion-store.mjs';
-import { WORKER_RESULT_SCHEMA } from './worker-result.mjs';
+import { claudeWorkerResultSchema } from './worker-result.mjs';
 import {
   defaultDraftsDir, defaultOperationsDir, envelopeFromLegacy, legacyOutcomeWord, resolvePostmortemMode, routeWorkerResult, settleWorkerResult,
   writeProductFixDraft,
@@ -48,12 +48,13 @@ export function workerWrapperEnabled(env = process.env) {
 
 /** Default budget when a spec names none (the build path passes its own 60-minute budget). */
 export const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
+export const MAX_AWAIT_RESUMES = 6;
 
 // ── argv + prompt helpers (pure) ────────────────────────────────────────────────────────────────────────────────
 
 /** The schema as the one-line JSON the `--json-schema` flag takes. */
 export function workerResultSchemaJson() {
-  return JSON.stringify(WORKER_RESULT_SCHEMA);
+  return JSON.stringify(claudeWorkerResultSchema());
 }
 
 /**
@@ -76,10 +77,30 @@ export function withStructuredOutput(argv, schemaJson = workerResultSchemaJson()
 export const STRUCTURED_OUTPUT_SUFFIX = [
   '',
   '---',
-  'Final step: end by calling the StructuredOutput tool once with the we.worker-result object (outcome, summary, blocker, findingsAddressed, filesTouched, learning).',
+  'End each turn with the StructuredOutput tool and the we.worker-result object (outcome, summary, blocker, findingsAddressed, filesTouched, learning).',
+  'Summary: at most 280 characters, one or two sentences. Do not move summary details elsewhere in the object; PR comments and brief reports carry detail.',
+  'Each finding note: at most 300 characters.',
+  'This is a non-interactive run. Launch every subagent and every command in the FOREGROUND; never use run_in_background.',
+  'StructuredOutput must be the very last action of a turn.',
+  'When the brief says to end the turn awaiting harness verify, still end that turn with StructuredOutput (outcome "done", short summary).',
+  'The harness resumes this same session after the verdict. The last StructuredOutput is the one that counts.',
   'Use outcome "blocked" with a blocker (kind, component, evidence, retryable) when you cannot finish; put a product or tooling bug in blocker.kind "tooling-defect" or "permission-wall", and use "needs-ruling" only for a real taste or policy call with 2 or more options.',
   'Everything else in the brief above (including its report commands) still applies.',
 ].join('\n');
+
+/** 117 S3b regression 2026-10-08: resume the same print-mode session with all launch flags intact. */
+export function resumeArgvFrom(argv, { sessionId, prompt }) {
+  const out = argv.slice(0, -1);
+  const index = out.indexOf('--session-id');
+  if (index < 0) throw new TypeError('operations: resumeArgvFrom needs --session-id');
+  out.splice(index, 2, '--resume', sessionId);
+  return [...out, `${prompt}${STRUCTURED_OUTPUT_SUFFIX}`];
+}
+
+export function resumeRequestPath(specDir, session) {
+  if (!isValidSessionSlug(session)) throw new TypeError('operations: invalid resume session slug');
+  return join(specDir, `${session}.resume.json`);
+}
 
 // ── result extraction per launcher (pure) ───────────────────────────────────────────────────────────────────────
 
@@ -125,6 +146,7 @@ export function extractAgyResult(stdout) {
  * @property {string|number} [pr]
  * @property {string|number} [item]
  * @property {string} [sessionId]
+ * @property {string} [specDir]          directory for harness resume requests
  * @property {string} [resultFile]       codex: the `-o` file the result is read from
  * @property {string} [completionsDir]
  * @property {string} [draftsDir]
@@ -140,6 +162,11 @@ export function extractAgyResult(stdout) {
  * @param {typeof spawnToCompletion} [io.spawnToCompletionFn]
  * @param {typeof spawn} [io.spawnFn]
  * @param {() => string} [io.now]
+ * @param {() => number} [io.nowMs]                   wall clock (defaults to parsing io.now)
+ * @param {(sessionId: string) => *} [io.awaitingVerify]
+ * @param {(ms: number) => Promise<void>} [io.sleep]
+ * @param {number} [io.pollMs]
+ * @param {number} [io.selfPid]
  * @param {(f: string) => string} [io.readFile]
  * @param {() => string|null} [io.head]               HEAD probe for headBefore / headAfter
  * @param {() => (object|null)} [io.legacyRead]       the old report for a launcher still migrating
@@ -158,17 +185,28 @@ export async function runWorker(spec, io = {}) {
   const {
     spawnToCompletionFn = spawnToCompletion, spawnFn = spawn, now = () => new Date().toISOString(), readFile = (f) => readFileSync(f, 'utf8'),
     head = () => null, legacyRead = completionLegacyRead, isOperatorStop = () => false, writeRecord = writeCompletion, writeDraft = writeProductFixDraft,
+    selfPid = process.pid, pollMs = 15_000, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   } = io;
+  const clock = io.nowMs ?? (() => Date.parse(now()));
+  const awaitingVerify = io.awaitingVerify ?? (async (sessionId) => {
+    if (!sessionId) return null;
+    const { readStoredAwaitVerify, awaitVerifyStoreKey, classifyAwaitVerify, resolveAwaitVerifyTtlMs } = await import('../conveyor/await-verify.mjs');
+    const record = readStoredAwaitVerify(awaitVerifyStoreKey({ sessionId }));
+    const verdict = classifyAwaitVerify({ record, session: { sessionId, name: spec.session }, nowMs: clock(), ttlMs: resolveAwaitVerifyTtlMs() });
+    return verdict.awaiting ? { awaiting: true, record } : null;
+  });
   const timeoutMs = Number.isInteger(spec.timeoutMs) && spec.timeoutMs > 0 ? spec.timeoutMs : DEFAULT_TIMEOUT_MS;
-  const base = { session: spec.session, role: spec.role, launcher: spec.launcher, model: spec.model ?? null, pr: spec.pr ?? null, item: spec.item ?? null, sessionId: spec.sessionId ?? null };
+  const base = { session: spec.session, role: spec.role, launcher: spec.launcher, model: spec.model ?? null, pr: spec.pr ?? null, item: spec.item ?? null, sessionId: spec.sessionId ?? null, cwd: spec.cwd ?? null };
   const headBefore = head();
 
   let started = newEnvelopeRecord({ ...base, headBefore, timeoutMs, now });
+  const deadlineMs = Date.parse(started.startedAt) + timeoutMs;
+  started.deadlineAt = new Date(deadlineMs).toISOString();
   // The job record: written the moment the child has a pid (the spawn seam below), before it can finish.
   const spawnWithPid = (cmd, argv, opts) => {
     const child = spawnFn(cmd, argv, opts);
     if (child?.pid) {
-      started = newEnvelopeRecord({ ...base, headBefore, pid: child.pid, timeoutMs, now });
+      started = { ...started, pid: child.pid, updatedAt: now() };
       withCompletionLock(spec.session, () => writeRecord(started, dir), { dir });
     }
     return child;
@@ -177,18 +215,51 @@ export async function runWorker(spec, io = {}) {
   let stdout = '';
   let stderr = '';
   let failure = null;
-  try {
-    const out = await spawnToCompletionFn(spec.command, spec.argv ?? [], {
-      cwd: spec.cwd, env: spec.env ?? process.env, timeout: timeoutMs, killSignal: 'SIGKILL',
-      stdio: ['ignore', 'pipe', 'pipe'], // stdin closed: codex hangs on an open pipe (S0)
-    }, { spawnFn: spawnWithPid });
-    stdout = out.stdout; stderr = out.stderr;
-  } catch (e) {
-    failure = e;
-    stdout = e?.stdout ?? ''; stderr = e?.stderr ?? '';
+  const run = async (argv) => {
+    try {
+      const out = await spawnToCompletionFn(spec.command, argv, {
+        cwd: spec.cwd, env: spec.env ?? process.env, timeout: Math.max(1, deadlineMs - clock()), killSignal: 'SIGKILL',
+        stdio: ['ignore', 'pipe', 'pipe'], // stdin closed: codex hangs on an open pipe (S0)
+      }, { spawnFn: spawnWithPid });
+      stdout = out.stdout; stderr = out.stderr;
+    } catch (e) {
+      failure = e;
+      stdout = e?.stdout ?? ''; stderr = e?.stderr ?? '';
+    }
+    if (started.pid == null) withCompletionLock(spec.session, () => writeRecord(started, dir), { dir });
+  };
+  await run(spec.argv ?? []);
+
+  // 117 S3b regression 2026-10-08: an ended print-mode turn leaves the wrapper alive for harness verification.
+  if (spec.launcher === 'claude-p') {
+    const requestPath = resumeRequestPath(spec.specDir ?? join(dirname(dir), 'worker-wrapper-specs'), spec.session);
+    let resumes = 0;
+    while (!failure && !isOperatorStop() && clock() < deadlineMs && resumes < MAX_AWAIT_RESUMES) {
+      let awaiting = await awaitingVerify(spec.sessionId);
+      if (!awaiting?.awaiting) break;
+      const { sha, pr, ref, requestedAt } = awaiting.record;
+      withCompletionLock(spec.session, () => writeRecord({
+        ...started, pid: selfPid, updatedAt: now(), awaitingVerify: { sha, pr, ref, requestedAt },
+      }, dir), { dir });
+      let request = null;
+      while (!failure && !isOperatorStop() && clock() < deadlineMs) {
+        awaiting = await awaitingVerify(spec.sessionId);
+        try {
+          request = JSON.parse(readFile(requestPath));
+          rmSync(requestPath, { force: true });
+          if (request?.v !== 1 || request.sessionId !== spec.sessionId || typeof request.prompt !== 'string') request = null;
+        } catch (e) {
+          if (e instanceof SyntaxError) rmSync(requestPath, { force: true });
+          request = null;
+        }
+        if (request || !awaiting?.awaiting) break;
+        await sleep(Math.min(pollMs, Math.max(0, deadlineMs - clock())));
+      }
+      if (!request || isOperatorStop() || clock() >= deadlineMs) break;
+      resumes += 1;
+      await run(resumeArgvFrom(spec.argv, { sessionId: spec.sessionId, prompt: request.prompt }));
+    }
   }
-  // If the injected spawn never reported a pid (a fake child), still leave a started record behind.
-  if (started.pid == null) withCompletionLock(spec.session, () => writeRecord(started, dir), { dir });
 
   // 1. the channel for this launcher
   let extracted;
@@ -270,7 +341,7 @@ export function launchDetached(spec, { specDir, spawnFn = spawn, nodePath = proc
   // The spec file never carries `env` (it can hold tokens): the detached child inherits the launcher's environment
   // instead. Owner-only permissions; the child deletes it once read.
   const { env: _env, ...safe } = spec;
-  writeFileSync(specFile, `${JSON.stringify(safe)}\n`, { mode: 0o600 });
+  writeFileSync(specFile, `${JSON.stringify({ ...safe, specDir })}\n`, { mode: 0o600 });
   const child = spawnFn(nodePath, [entry, `--spec=${specFile}`], { detached: true, stdio: 'ignore', env: spec.env ?? process.env });
   child.unref?.();
   return { wrapperPid: child.pid, specFile };
@@ -292,4 +363,3 @@ if (IS_CLI) {
     }
   }
 }
-

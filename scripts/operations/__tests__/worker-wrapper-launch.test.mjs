@@ -1,12 +1,12 @@
 /** @file worker-wrapper-launch.test.mjs — wrapped launch, liveness and legacy completion compatibility. */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, statSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 
 import {
   workerWrapperEnabledFor, wrappedArgvFromBg, wrappedTimeoutMs, launchWrappedClaudeWorker,
-  wrappedRecordToAgentRow, listWrappedWorkerAgents,
+  wrappedRecordToAgentRow, listWrappedWorkerAgents, requestWrappedResume,
 } from '../worker-wrapper-launch.mjs';
 import { newEnvelopeRecord, finishEnvelopeRecord, validateCompletionRecord } from '../completion-record.mjs';
 import { tryReadCompletion, writeCompletion } from '../completion-store.mjs';
@@ -189,5 +189,34 @@ describe('completion-store same-generation streak', () => {
     expect(first.infraStreak).toBe(1);
     writeCompletion({ ...rec, source: 'worker-result' }, dir);
     expect(tryReadCompletion('fix-7', dir)).toMatchObject({ infraStreak: 1, source: 'worker-result', startedAt: rec.startedAt, pid: 5 });
+  });
+});
+
+// 117 S3b regression 2026-10-08: only waiting wrapped rows are idle and eligible for a resume file.
+describe('wrapped await rows and resume requests', () => {
+  const wait = { sha: 'a'.repeat(40), pr: 7, ref: 'lane/fix-7', requestedAt: T0() };
+  const row = () => wrappedRecordToAgentRow(started({ cwd: '/lane', awaitingVerify: wait }), { isAlive: () => true });
+  it('publishes idle status and cwd for live or stopped awaits, leaving other row status absent', () => {
+    expect(row()).toMatchObject({ state: 'working', status: 'idle', cwd: '/lane' });
+    const rec = started({ cwd: '/lane', awaitingVerify: wait });
+    expect(validateCompletionRecord(rec)).toEqual({ ok: true, errors: [] });
+    expect(wrappedRecordToAgentRow(rec, { isAlive: () => false })).toMatchObject({ state: 'stopped', status: 'idle', cwd: '/lane' });
+    expect(wrappedRecordToAgentRow(started({ cwd: '/lane' }), { isAlive: () => true })).not.toHaveProperty('status');
+    const finished = finishEnvelopeRecord(rec, { result: DONE, parse: { ok: true }, action: { type: 'done' }, outcome: 'done' }, T1);
+    expect(finished).not.toHaveProperty('awaitingVerify');
+    expect(wrappedRecordToAgentRow(finished, { isAlive: () => false, nowMs: Date.parse(T1()) })).toMatchObject({ cwd: '/lane' });
+  });
+  it('writes an owner-only request atomically, with the same session identity', () => {
+    const specDir = tmp();
+    expect(requestWrappedResume({ session: row(), prompt: 'verified', specDir, now: T1 })).toEqual({ resumed: true });
+    const path = join(specDir, 'fix-7.resume.json');
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ v: 1, sessionId: SESSION_ID, prompt: 'verified', at: T1() });
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(readdirSync(specDir)).toEqual(['fix-7.resume.json']);
+  });
+  it.each([{ kind: 'background' }, { status: 'busy' }, { state: 'stopped' }, { sessionId: 'not-uuid' }, { sessionId: '-'.repeat(36) }, { name: '../escape' }])('refuses %j without writing a file', (over) => {
+    const specDir = tmp();
+    expect(requestWrappedResume({ session: { ...row(), ...over }, prompt: 'x', specDir })).toMatchObject({ resumed: false, reason: expect.any(String) });
+    expect(readdirSync(specDir)).toEqual([]);
   });
 });

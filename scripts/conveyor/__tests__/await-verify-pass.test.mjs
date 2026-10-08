@@ -966,3 +966,26 @@ describe('delivery and prepare waits (card 4): no PR, no push, the session\'s ow
     expect(buildAwaitVerifyResumePrompt({ kind: 'green', record: del({ kind: 'prepare' }) })).toMatch(/prepare brief/);
   });
 });
+
+// 117 S3b regression 2026-10-08: print-mode workers resume through their waiting wrapper.
+describe('default IO includes and resumes wrapped workers', () => {
+  it('delegates wrapped resumes before any Claude stop or background spawn', async () => {
+    const calls = [];
+    const session = { kind: 'wrapped-worker', state: 'working', status: 'idle', name: 'fix-4115', sessionId: rec().sessionId };
+    const io = await defaultAwaitVerifyIo({
+      dispatchIo: {}, stopSessionFn: () => { throw new Error('must not stop'); },
+      requestWrappedResumeFn: (args) => { calls.push(args); return { resumed: true }; },
+    });
+    expect(io.resume({ session, prompt: 'verified' })).toEqual({ resumed: true });
+    expect(calls).toEqual([{ session, prompt: 'verified' }]);
+  });
+  it.each(['neither', 'claude', 'wrapped'])('preserves the other listing when %s fails', async (failure) => {
+    const claude = { kind: 'background', name: 'fix-1' };
+    const wrapped = { kind: 'wrapped-worker', name: 'fix-2' };
+    const io = await defaultAwaitVerifyIo({
+      dispatchIo: { defaultListAgents: () => { if (failure === 'claude') throw new Error('unreadable'); return [claude]; } },
+      listWrappedWorkers: () => { if (failure === 'wrapped') throw new Error('unreadable'); return [wrapped]; },
+    });
+    expect(io.listSessions()).toEqual(failure === 'claude' ? [wrapped] : failure === 'wrapped' ? [claude] : [claude, wrapped]);
+  });
+});

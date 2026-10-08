@@ -26,11 +26,13 @@
  * name binding, `markSelfReportedDone` and the cool-offs work unchanged.
  */
 import { randomUUID } from 'node:crypto';
+import { mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { isUnderTest } from '../lib/under-test.mjs';
 import { COMPLETION_RECORD_V2, listCompletionSessions, resolveCompletionsDir, tryReadCompletion } from './completion-store.mjs';
-import { STRUCTURED_OUTPUT_SUFFIX, WORKER_WRAPPER_ENV, launchDetached, withStructuredOutput } from './worker-wrapper.mjs';
+import { STRUCTURED_OUTPUT_SUFFIX, WORKER_WRAPPER_ENV, launchDetached, withStructuredOutput, resumeRequestPath } from './worker-wrapper.mjs';
+import { isValidSessionSlug } from './completion-record.mjs';
 
 /** The roles whose launch is wrapped when the knob is unset (D7 FINAL, operator 2026-10-08). */
 export const WRAPPED_ROLES_DEFAULT_ON = Object.freeze(['fix', 'ci-heal', 'review']);
@@ -90,6 +92,27 @@ export const BG_PERMISSION_MODE = 'auto';
 /** Where `launchDetached` writes a spec (owner-only; the wrapper deletes it once read). Beside the completions dir. */
 export function defaultWorkerSpecDir(completionsDir = resolveCompletionsDir()) {
   return join(dirname(completionsDir), 'worker-wrapper-specs');
+}
+
+/** 117 S3b regression 2026-10-08: hand the next turn to the live wrapper, never start a background copy. */
+export function requestWrappedResume({ session, prompt, specDir = defaultWorkerSpecDir(), now = () => new Date().toISOString() }) {
+  if (session?.kind !== 'wrapped-worker') return { resumed: false, reason: 'not a wrapped worker' };
+  if (session.state !== 'working' || session.status !== 'idle') return { resumed: false, reason: 'wrapped worker is not live and idle' };
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(session.sessionId ?? '')) return { resumed: false, reason: 'invalid session uuid' };
+  if (!isValidSessionSlug(session.name)) return { resumed: false, reason: 'invalid session slug' };
+  if (typeof prompt !== 'string') return { resumed: false, reason: 'invalid resume prompt' };
+  const path = resumeRequestPath(specDir, session.name);
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  try {
+    mkdirSync(specDir, { recursive: true, mode: 0o700 });
+    writeFileSync(tmp, `${JSON.stringify({ v: 1, sessionId: session.sessionId, prompt, at: now() })}\n`, { mode: 0o600 });
+    renameSync(tmp, path);
+    return { resumed: true };
+  } catch (e) {
+    return { resumed: false, reason: `resume request failed: ${String(e?.message ?? e).split('\n')[0]}` };
+  } finally {
+    try { rmSync(tmp, { force: true }); } catch { /* preserve the request result */ }
+  }
 }
 
 /**
@@ -152,7 +175,8 @@ export function wrappedRecordToAgentRow(rec, { isAlive = defaultIsAlive, nowMs =
   } else return null;
   return {
     id: `wrapped-${rec.pid}`, name: String(rec.session), kind: 'wrapped-worker', state, pid: rec.pid,
-    cwd: '', startedAt, sessionId: rec.sessionId ?? null, pr: rec.pr ?? null, launcher: rec.launcher, role: rec.role,
+    cwd: rec.cwd ?? '', startedAt, sessionId: rec.sessionId ?? null, pr: rec.pr ?? null, launcher: rec.launcher, role: rec.role,
+    ...(rec.status === 'started' && rec.awaitingVerify ? { status: 'idle' } : {}),
   };
 }
 

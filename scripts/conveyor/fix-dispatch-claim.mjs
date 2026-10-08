@@ -83,6 +83,7 @@ import {
   fixDispatchSessionName, listFixDispatchClaims,
 } from './fix-claim-store.mjs';
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
+import { listWrappedWorkerAgents } from '../operations/worker-wrapper-launch.mjs';
 import { startedAtMs } from './reconcile-core.mjs';
 import { readHungInfo, resolveHungThresholdMs } from './hung-session.mjs';
 import { isClaimRunnerDead, isPidAlive } from '../lib/dispatch-throttle.mjs';
@@ -254,7 +255,7 @@ export const MAX_FIX_DISPATCH_CLAIM_REFRESH_MS = 4 * 60 * 60 * 1000;
  */
 export function refreshLiveFixDispatchClaims({
   lockRoot = fixDispatchClaimRoot(),
-  listAgentsAll = () => defaultListAgents({ all: true }),
+  listAgentsAll = () => [...defaultListAgents({ all: true }), ...listWrappedWorkerAgents()],
   hungInfoFor = readHungInfo,
   awaitingVerifyFor = makeAwaitingVerifyResolver(),
   hungThresholdMs = resolveHungThresholdMs(),

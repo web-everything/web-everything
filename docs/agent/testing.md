@@ -6,6 +6,15 @@ Injected Gemini subprocess tests must set `ANTIGRAVITY_QUOTA_DIR` to a per-test 
 real backend holds otherwise prevent even the fake child from starting. Real POC branch-sync fixtures
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
 
+## Wrapped worker verification waits
+
+For the 117 S3b regression (2026-10-08), replay the saved StructuredOutput fixtures against both
+reader caps and the Claude launch schema. Keep the checked-in Codex schema unchanged. A wrapped
+Claude turn may end while verification runs: the wrapper publishes its own live pid and idle status,
+then consumes a resume request for the same session. Use temporary await/spec/completion stores,
+a fake child, and an injected clock to cover expiry, the overall deadline, foreign requests, and the
+six-resume limit. Only the last turn supplies the final result, including when it omits StructuredOutput.
+
 ## GitHub priority admission
 
 The throttle returns a JSON `deferred-low-budget` result without invoking GitHub when a fresh,

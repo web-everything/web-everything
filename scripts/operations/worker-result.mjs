@@ -50,6 +50,31 @@ export const CAPS = Object.freeze({
   filesTouched: 500, learningSummary: 600, learningArea: 200, learningSuggestion: 600,
 });
 
+// 117 S3b regression 2026-10-08: Claude must reject overlong output before the reader sees it.
+export function claudeWorkerResultSchema() {
+  const schema = structuredClone(WORKER_RESULT_SCHEMA);
+  const p = schema.properties;
+  const b = p.blocker.properties;
+  p.summary.maxLength = CAPS.summary;
+  b.component.maxLength = CAPS.component;
+  b.evidence.properties.text.maxLength = CAPS.evidenceText;
+  b.evidence.properties.refs.maxItems = CAPS.evidenceRefs;
+  b.proposedFix.properties.summary.maxLength = CAPS.proposedFixSummary;
+  b.proposedFix.properties.scope.maxItems = CAPS.scope;
+  b.ruling.properties.question.maxLength = CAPS.question;
+  b.ruling.properties.recommendation.maxLength = CAPS.recommendation;
+  b.ruling.properties.options.items.maxLength = CAPS.option;
+  b.deniedCommand.maxLength = CAPS.deniedCommand;
+  p.findingsAddressed.maxItems = CAPS.findings;
+  p.findingsAddressed.items.properties.ref.maxLength = CAPS.ref;
+  p.findingsAddressed.items.properties.note.maxLength = CAPS.findingNote;
+  p.filesTouched.maxItems = CAPS.filesTouched;
+  p.learning.properties.summary.maxLength = CAPS.learningSummary;
+  p.learning.properties.area.maxLength = CAPS.learningArea;
+  p.learning.properties.suggestion.maxLength = CAPS.learningSuggestion;
+  return schema;
+}
+
 /** Roles the role rules apply to. Other roles (review, inspect, prepare, investigate) have no extra rule. */
 export const ROLES = Object.freeze(['review', 'fix', 'ci-heal', 'inspect', 'build', 'prepare', 'investigate']);
 
@@ -64,7 +89,7 @@ function typeOf(v) {
 
 /**
  * A minimal draft-07 interpreter covering exactly the keywords the schema uses (`type` incl. arrays, `enum`,
- * `required`, `properties`, `additionalProperties:false`, `items`). Returns problems as `path: message`.
+ * `required`, `properties`, `additionalProperties:false`, `items`, `maxLength`, `maxItems`). Returns problems as `path: message`.
  * Exported for the strict-mode test and so S3-S5 launchers can pre-check output without a second validator.
  */
 export function validateAgainstSchema(schema, value, path = '$') {
@@ -75,6 +100,8 @@ export function validateAgainstSchema(schema, value, path = '$') {
     return [`${path}: expected ${types.join('|')}, got ${t}`];
   }
   if (schema.enum && !schema.enum.some((e) => e === value)) problems.push(`${path}: not one of ${JSON.stringify(schema.enum)}`);
+  if (t === 'string' && value.length > schema.maxLength) problems.push(`${path}: ${value.length} chars exceeds maxLength ${schema.maxLength}`);
+  if (t === 'array' && value.length > schema.maxItems) problems.push(`${path}: ${value.length} items exceeds maxItems ${schema.maxItems}`);
   if (t === 'object' && isPlain(value)) {
     const props = schema.properties ?? {};
     for (const key of schema.required ?? []) if (!Object.hasOwn(value, key)) problems.push(`${path}.${key}: required`);

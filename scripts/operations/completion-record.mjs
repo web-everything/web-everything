@@ -238,7 +238,7 @@ function validateEnvelopeFields(r) {
  */
 export function newEnvelopeRecord({
   session, role, launcher, model = null, pr = null, item = null, sessionId = null, headBefore = null,
-  pid = null, timeoutMs = null, now = () => new Date().toISOString(),
+  pid = null, timeoutMs = null, cwd = null, awaitingVerify, now = () => new Date().toISOString(),
 } = {}) {
   if (!isValidSessionSlug(session)) throw new TypeError(`operations: invalid completion session slug ${JSON.stringify(session)}`);
   if (!ENVELOPE_ROLES.includes(role)) throw new TypeError(`operations: envelope role must be one of ${ENVELOPE_ROLES.join('/')}, got ${JSON.stringify(role)}`);
@@ -263,6 +263,8 @@ export function newEnvelopeRecord({
     headBefore: str(headBefore),
     headAfter: null,
     pid: pid ?? null,
+    cwd,
+    ...(awaitingVerify === undefined ? {} : { awaitingVerify }),
     timeoutMs: timeoutMs ?? null,
     deadlineAt: pid != null && timeoutMs != null ? new Date(Date.parse(ts) + timeoutMs).toISOString() : null,
     parse: null,
@@ -284,8 +286,9 @@ export function newEnvelopeRecord({
  */
 export function finishEnvelopeRecord(record, fin, now = () => new Date().toISOString()) {
   const ts = now();
+  const { awaitingVerify: _awaitingVerify, ...finished } = record;
   return {
-    ...record,
+    ...finished,
     status: 'done',
     outcome: fin.outcome,
     result: fin.result,
