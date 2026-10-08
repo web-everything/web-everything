@@ -84,6 +84,36 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
     const run = () => { throw new Error('git must not be called'); };
     expect(() => appendLedgerRows(base({ run, records: [{ nope: true }] }))).toThrow(/invalid record/);
   });
+
+  // THE REFSPEC GUARD (operator decision 2026-10-08): the applier workflow holds `contents: write`, so the one
+  // push path may write refs/heads/ops/review-requests and nothing else - no other branch, no force.
+  describe('push-ref guard: only refs/heads/ops/review-requests, never forced', () => {
+    const bad = ['main', 'lane/x', 'refs/heads/main', 'refs/heads/ops/review-requests', '+ops/review-requests',
+      'ops/review-requests:main', 'ops/review-requests main', '--force', 'ops/review-requests-2', 'ops/'];
+    for (const branch of bad) {
+      it(`refuses branch ${JSON.stringify(branch)} before any git call`, () => {
+        const calls = [];
+        const run = (args) => { calls.push(args); return ''; };
+        expect(() => appendLedgerRows(base({ run, branch }))).toThrow(/refusing to push/);
+        expect(calls).toEqual([]);
+      });
+    }
+
+    it('pushes the full ref and never a force', () => {
+      const f = failing(0);
+      const calls = [];
+      const run = (args, o) => { calls.push(args); return f.run(args, o); };
+      appendLedgerRows(base({ run }));
+      const push = calls.find((a) => a[0] === 'push');
+      expect(push).toEqual(['push', '--quiet', 'origin', 'HEAD:refs/heads/ops/review-requests']);
+      for (const a of calls.filter((c) => c[0] === 'push').flat()) expect(a).not.toMatch(/^(-f|--force.*|\+.*)$/);
+    });
+
+    it('a caller cannot loosen the allowed ref through the passed-through seams', () => {
+      const run = () => '';
+      expect(() => appendLedgerRows(base({ run, allowRef: 'refs/heads/main', branch: 'main' }))).toThrow(/refusing to push/);
+    });
+  });
 });
 
 /** A second working clone of the same bare origin. */

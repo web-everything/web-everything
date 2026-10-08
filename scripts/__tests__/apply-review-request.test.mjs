@@ -307,6 +307,14 @@ describe('the applier workflow can push ledger rows without re-triggering itself
     expect(wf.permissions).toEqual({ 'pull-requests': 'write', issues: 'write', contents: 'write' });
   });
 
+  it('has no step that pushes: the only push path is the ledger helper, pinned to its one ref (no force)', () => {
+    const steps = Object.values(wf.jobs).flatMap((j) => j.steps ?? []);
+    for (const step of steps) {
+      const run = String(step.run ?? '');
+      expect(run, `step ${step.name ?? step.uses}`).not.toMatch(/git\s+(?:-\S+\s+)*push|--force|--mirror|\+refs\//);
+    }
+  });
+
   it('triggers only on the transport branch', () => {
     expect(push.branches).toEqual([LEDGER_TRANSPORT_BRANCH]);
   });
@@ -430,7 +438,7 @@ describe('the ledger push can only fast-forward the transport branch (C3)', () =
 
   it('pushes exactly HEAD to the transport branch: no force, no plus-refspec, no other ref', () => {
     const pushes = calls.filter((a) => a[0] === 'push');
-    expect(pushes.map((a) => [...a])).toEqual([['push', '--quiet', 'origin', `HEAD:${LEDGER_TRANSPORT_BRANCH}`]]);
+    expect(pushes.map((a) => [...a])).toEqual([['push', '--quiet', 'origin', `HEAD:refs/heads/${LEDGER_TRANSPORT_BRANCH}`]]);
   });
 
   it('pushes from the dedicated transport worktree, never from the board checkout it was called with', () => {
