@@ -592,6 +592,40 @@ export function ensureGhShim({
   }
 }
 
+/**
+ * xpd70wx — is the generated shim at `dir` ORG-AWARE (it picks the App installation by the target repo's owner)?
+ * The legacy shared `gh-shim/gh` (written before the 2026-10-03 org move) has no owner map, so it mints for one
+ * account only and cannot see the plateauapp org. A marker-substring check on the file; unreadable = not aware.
+ * @param {string} dir @param {{read?:(p:string)=>string}} [o]
+ */
+export function isOrgAwareShimDir(dir, { read = (p) => readFileSync(p, 'utf8') } = {}) {
+  try { return read(shimGhPath(dir)).includes('OWNER_INSTALLATIONS'); } catch { return false; }
+}
+
+/**
+ * xpd70wx — the shim dir `open-pr` / `pr-land` use for ANY target repo's org: the SAME per-checkout dir the
+ * daemons resolve ({@link checkoutShimDir}, keyed by the control clone's throttle CLI), when it exists and is
+ * org-aware; else `null`. Reuses the daemons' resolver and their already-minted tokens: no token is minted,
+ * read into argv, printed or logged here.
+ * @param {{dir?:string, exists?:(p:string)=>boolean, read?:(p:string)=>string}} [o]
+ * @returns {string|null}
+ */
+export function resolveOrgAwareShimDir({ dir = checkoutShimDir(), exists = existsSync, read } = {}) {
+  return exists(shimGhPath(dir)) && isOrgAwareShimDir(dir, read ? { read } : undefined) ? dir : null;
+}
+
+/**
+ * xpd70wx — PURE: `PATH` with the org-aware shim first and the stale legacy shared shim dir (no owner map) dropped.
+ * `null` when there is no org-aware shim, or `PATH` already resolves `gh` to it first (nothing to change).
+ * @param {{pathEnv?:string, orgDir:string|null, legacyDir?:string}} o
+ */
+export function pathWithOrgAwareShim({ pathEnv = process.env.PATH || '', orgDir, legacyDir = defaultShimDir() } = {}) {
+  if (!orgDir) return null;
+  const parts = pathEnv.split(':').filter(Boolean);
+  if (parts[0] === orgDir) return null;
+  return [orgDir, ...parts.filter((d) => d !== orgDir && d !== legacyDir)].join(':');
+}
+
 /** PURE: the new `PATH` value — the shim dir prepended, so a bare `gh` command resolves to it first. */
 export function ghShimPathOverride({ dir = defaultShimDir(), currentPath = process.env.PATH || '' } = {}) {
   return `${dir}:${currentPath}`;
