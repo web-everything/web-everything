@@ -45,13 +45,22 @@ export function renderEdgeCasesSkeleton() {
 }
 
 /**
+ * The classes a card body has NOT answered: the class label is absent from the edge-cases section, or only on an
+ * unfilled `TODO` line. Pure; every class when the section is absent.
+ */
+export function unansweredEdgeCaseClasses(body) {
+  const text = String(body ?? '');
+  const at = text.indexOf(EDGE_CASES_HEADING);
+  if (at < 0) return [...EDGE_CASE_CLASSES];
+  const section = text.slice(at + EDGE_CASES_HEADING.length).split(/^#{1,2}\s/m)[0];
+  const lines = section.split('\n');
+  return EDGE_CASE_CLASSES.filter((c) => !lines.some((l) => l.toLowerCase().includes(c.label.toLowerCase()) && !/\bTODO\b/.test(l)));
+}
+
+/**
  * How many of the seven classes a card body answers: the class label appears on a line of the edge-cases section
  * that is not an unfilled `TODO`. Pure; `0` when the section is absent.
  */
 export function countEdgeCaseClasses(body) {
-  const at = String(body ?? '').indexOf(EDGE_CASES_HEADING);
-  if (at < 0) return 0;
-  const section = body.slice(at + EDGE_CASES_HEADING.length).split(/^#{1,2}\s/m)[0];
-  const lines = section.split('\n');
-  return EDGE_CASE_CLASSES.filter((c) => lines.some((l) => l.toLowerCase().includes(c.label.toLowerCase()) && !/\bTODO\b/.test(l))).length;
+  return EDGE_CASE_CLASSES.length - unansweredEdgeCaseClasses(body).length;
 }

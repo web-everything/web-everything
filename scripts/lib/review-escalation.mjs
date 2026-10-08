@@ -63,6 +63,9 @@ export const REVIEW_LABELS = {
   // effect that does not land, so a failed/errored post leaves this label in place rather than silently
   // dropping it with no comment behind it.
   awaitingAdvisory: 'review:awaiting-advisory',
+  // card x5f2daz — a PREPARE PR (card-only) got the light single-reviewer pass (`we:scripts/conveyor/prep-review.mjs`).
+  // It is a RECORD that a review looked, not a verdict: it never blocks, never unblocks, and is never applied to a code PR.
+  prep: 'review:prep',
 };
 
 /**
@@ -81,6 +84,7 @@ export const REVIEW_LABEL_META = {
   // Description kept ≤100 chars: GitHub's `label create`/`edit` refuses a longer one (measured live, #2156/#2157
   // backfill) — unlike the pre-existing labels above, this one is minted fresh through that same validated path.
   [REVIEW_LABELS.awaitingAdvisory]: { color: 'FEF2C0', description: 'review:human PR awaiting its advisory panel; cleared once it posts (mechanical-dispatcher)' },
+  [REVIEW_LABELS.prep]: { color: 'C5DEF5', description: 'Prepare PR given the light single-reviewer pass (advice only; never a code-PR verdict)' },
 };
 
 /** Default rubric thresholds (tuning knobs — loose to start). The VALUES live in the machine-diffable contract

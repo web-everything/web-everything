@@ -120,6 +120,8 @@ import {
 import { installDaemonLog } from './daemon-log.mjs';
 import { warmReviewFacts, readReviewCiGateFactsFirst, withFactsLabels } from '../../scripts/lib/review-facts.mjs';
 import { createGhProvider } from '../../scripts/lib/review-label-provider.mjs';
+import { runPrepReviewTick, resolvePrepReviewMode } from '../../scripts/conveyor/prep-review.mjs';
+import { makePrepReviewDeps } from '../../scripts/conveyor/prep-review-io.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel, #3870's Fix-dispatch key,
  *  and any future daemon's own key (#3877). */
@@ -681,6 +683,27 @@ export async function runConvertAdvisoryTickAllRepos({
 }
 
 /**
+ * card x5f2daz — the light PREP REVIEW stage: a single-reviewer pass on card-only prepare PRs (see
+ * `we:scripts/conveyor/prep-review.mjs`). A SEPARATE, ADDITIVE stage like {@link runConvertAdvisoryTick}: it needs no
+ * lane and no session, and `runReviewTick`'s return shape stays pinned. WE only (prepare PRs carry WE backlog cards).
+ * `prepReview.mode` is `off | advise | block` (env `WE_PREP_REVIEW_MODE`, default `advise`); `off` does nothing.
+ * Never throws: a failure here is reported and never costs the tick's real job.
+ * @param {{repo?:string, readPrs?:Function, tick?:Function, makeDeps?:Function, env?:object, root?:string}} [o]
+ */
+export async function runPrepReviewStage({
+  repo = WE_SLUG, readPrs = defaultReadPrs, tick = runPrepReviewTick, env = process.env,
+  root = resolve(fileURLToPath(import.meta.url), '..', '..', '..'), makeDeps = makePrepReviewDeps,
+} = {}) {
+  const mode = resolvePrepReviewMode(env);
+  if (mode === 'off') return { mode, reviewed: [], skipped: [], failed: [], readError: null, off: true };
+  try {
+    return await tick({ repo, readPrs, deps: makeDeps({ root, env }) });
+  } catch (e) {
+    return { mode, reviewed: [], skipped: [], failed: [], readError: String((e && e.message) || e).split('\n')[0] };
+  }
+}
+
+/**
  * #3383 bug 1 — did this tick's own result show it hit `assertMainNotStale`'s refusal for at least one PR or
  * repo? Two shapes both carry it: a per-PR `dispatchReview` throw (`runReviewTick`'s own `failed.push({
  * prNumber, error })` loop) and a whole-repo tick failure (`forEachRepo`'s own `{repo, error}` capture, surfaced
@@ -831,6 +854,9 @@ export function buildCliDaemonEffects({
   // operator sets REVIEW_DAEMON_CONVERT_ADVISORY=1 on the daemon — flipped on deliberately once live behavior
   // has been watched (e.g. via `convert-advisory-dispatch.mjs <pr> --dry-run`), never by merely shipping this.
   convertAdvisoryEnabled = process.env.REVIEW_DAEMON_CONVERT_ADVISORY === '1',
+  // card x5f2daz — the light prep review. ON by default in `advise` (it only ever posts a note + `review:prep`);
+  // `WE_PREP_REVIEW_MODE=off` turns it off. Injectable so the daemon tests never spawn a model.
+  runPrepReview = () => runPrepReviewStage(),
 } = {}) {
   // #3383 follow-up (live-caught 2026-09-26) — carries the LAST tick's own `liveProcessPrs` across the
   // `await`/closure boundary into the NEXT tick's `reapSessions()` call, below. A plain closure variable is
@@ -882,7 +908,14 @@ export function buildCliDaemonEffects({
           log.error(`review-daemon: convert-advisory tick failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
         }
       }
-      return { ...result, sessionReap, convertAdvisory };
+      // card x5f2daz — its OWN best-effort stage, same discipline as convert-advisory above.
+      let prepReview = null;
+      try {
+        prepReview = await runPrepReview();
+      } catch (e) {
+        log.error(`review-daemon: prep-review stage failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
+      }
+      return { ...result, sessionReap, convertAdvisory, prepReview };
     },
     sleep: realSleep,
     heartbeat: () => heartbeatRunnerLease(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY }),
@@ -924,6 +957,12 @@ export function buildCliDaemonEffects({
       // stage's own report: `posted` names the targeted check's own verdict, `skipped` is the idempotency
       // no-op (a head already carrying the converted note), `failed`/`reconcileFailed` mirror the review
       // stage's own non-fatal reporting one level up.
+      const pr = result.prepReview;
+      if (pr && !pr.off) {
+        for (const r of (pr.reviewed ?? [])) log.error(`review-daemon: ${WE_SLUG}#${r.prNumber} prep-review (${pr.mode}) ${r.outcome}${r.findings?.length ? `: ${r.findings.join(',')}` : ''}${r.addLabels?.length ? `; labelled ${r.addLabels.join(',')}` : ''}`);
+        for (const f of (pr.failed ?? [])) log.error(`review-daemon: ${WE_SLUG}#${f.prNumber ?? '?'} prep-review failed (non-fatal): ${f.error}`);
+        if (pr.readError) log.error(`review-daemon: prep-review could not list PRs (non-fatal): ${pr.readError}`);
+      }
       const ca = result.convertAdvisory;
       if (ca) {
         for (const p of (ca.posted ?? [])) log.error(`review-daemon: ${p.repo}#${p.prNumber} convert-advisory posted (targeted check: ${p.outcome ?? '?'})`);
