@@ -99,7 +99,18 @@ const COMMAND_RE = /^(?:[A-Z_][A-Z0-9_]*=\S*\s+)*(?:node|npm|npx|pnpm|yarn|bun|v
 
 /** Backticked command lines in a `Done when` section (fenced blocks count too). */
 export function executableCommands(section) {
-  const text = String(section ?? '').replace(/<!--[^]*?-->/g, '');
+  // Strip to a fixpoint: one pass over `<!<!-- x -->-->` leaves a fresh `<!-- … -->` behind (incomplete multi-character
+  // sanitization). A stray unterminated `<!--` / `-->` token is dropped too, so none survives into the command scan.
+  let text = String(section ?? '');
+  for (let prev = null; prev !== text;) {
+    prev = text;
+    // Whole comments first, to a fixpoint — a stray `-->` must not be eaten while a comment it closes is still forming.
+    for (let before = null; before !== text;) {
+      before = text;
+      text = text.replace(/<!--[^]*?-->/g, '');
+    }
+    text = text.replace(/<!--|-->/g, '');
+  }
   const spans = [...text.matchAll(/```[a-z]*\n([\s\S]*?)```/g)].flatMap((m) => m[1].split('\n'));
   for (const m of text.replace(/```[\s\S]*?```/g, ' ').matchAll(/`([^`\n]+)`/g)) spans.push(m[1]);
   return spans.map((s) => s.trim().replace(/^\$\s+/, '')).filter((s) => COMMAND_RE.test(s));
