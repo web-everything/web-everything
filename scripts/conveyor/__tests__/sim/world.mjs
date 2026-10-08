@@ -100,6 +100,11 @@ function buildWeTemplate() {
       // npm packages (`gray-matter`, `markdown-it`) already resolved via the symlinked `node_modules` below —
       // no other local repo-relative file is needed.
       'src/_data/backlog.js',
+      // The review daemon now imports `prep-review.mjs` → `operations/worker-result.mjs`, which reads this schema
+      // BY PATH at module load (`JSON.parse(readFileSync(<root>/schemas/worker-result.v1.json))`). Absent from the
+      // clone, every daemon process that loads the review module crashes with ENOENT — surfaced as a
+      // `lane-pool.mjs provision` crash in every soak/sim scenario.
+      'schemas/worker-result.v1.json',
     ],
     { cwd: INVOKING_ROOT, encoding: 'utf8' },
   ).split('\n').filter(Boolean);
