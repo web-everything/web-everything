@@ -20,7 +20,7 @@ const LEDGER = { WE_VERDICT_LEDGER_READ_SOURCE_SAME_HEAD_HOLD: 'ledger' };
 export default {
   id: 'ledger-mode-holds-fail-open',
   title: 'PR #4495: the review-hold ledger step in `ledger` mode released a review on a thrown step, on a ledger with no rows for the PR, and on a cached read that missed a fresh review run',
-  card: 'xqh3tkh (ledger plan slice H; PR #4495)',
+  card: '5474 (ledger plan slice H; PR #4495)',
   fixedBy: { sha: 'd6fc13fad4e666082673253e65fd1874a49f1cd6', where: 'lane/ledger-slice-h', paths: ['scripts/conveyor/review-hold-ledger-shadow.mjs', 'scripts/conveyor/reconcile-pass.mjs'] },
   fixPresent(root) { return readFileSync(join(root, 'scripts/conveyor/review-hold-ledger-shadow.mjs'), 'utf8').includes('export function failClosedHolds'); },
   async run() {
