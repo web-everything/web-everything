@@ -1,5 +1,7 @@
 import { sameAsLinkAllowed, findCarriedReviewerRuling, reviewerCarryBacking, REFERRAL_CARRY_REASON } from '../jury-core.mjs';
 import { FINDING_ID_PATTERN, findingIdentityTable, bindFindingIds, mintFindingId, normalizeFindingIdentity } from '../jury-core.mjs';
+import { validateOperatorRuling } from '../jury-core.mjs';
+import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, findCarriedOperatorRuling, liveReferrals, carriedBackingHolds } from '../jury-core.mjs';
 import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER, REFERRAL_STAMP_POLICY_ENV, resolveReferralStampPolicy } from '../jury-core.mjs';
 /**
@@ -2818,4 +2820,33 @@ describe('#76c reviewer rulings stand across heads', () => {
     expect(validateReferralRecord(superseding)).toBe(true);
     expect(reviewerCarryBacking(entry, { ...ctx([superseding, r2], H('2')), ...t })).toBeNull();
   });
+});
+
+describe('xc7ctn1 @pr<N> card citations reach every validator that consumes CARD_REF_RE', () => {
+  const finding = { summary: 'merge resolution lost', file: 'scripts/conveyor/lease-reaper.mjs', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+  const seat = 'judgeCorrectnessAdvisory';
+  const baseRecord = () => ({ version: 1, repo: 'o/r', pr: 7, head: 'a'.repeat(40), runId: 'run-referral',
+    authorBody: '<!-- authored-by-actor: author -->', reviewer: mandatoryReferralReviewer('run-referral'), attempted: true,
+    referrals: [{ key: referralFindingKey(seat, finding), seat, original: finding, finding: normalizeFinding(finding) }], rulings: [] });
+  const ruling = (r, card) => ({ id: 'r1', key: r.referrals[0].key, reviewerId: r.reviewer.id, lens: 'correctness', result: 'card',
+    rationale: 'Verified against the pinned diff', evidence: ['diff:lease-reaper'], card });
+  const carried = (r, card) => [{ key: r.referrals[0].key, reason: REFERRAL_CARRY_REASON, result: 'card', card,
+    from: { head: 'b'.repeat(40), runId: 'old', key: r.referrals[0].key } }];
+  const operator = card => ({ version: 1, repo: 'o/r', pr: 7, head: 'a'.repeat(40), actor: OPERATOR_LOGINS[0], channel: 'chat',
+    reason: 'defer to a card', at: '2026-10-08T00:00:00Z', clearerId: 'c1', rulings: [{ runId: 'run-referral', key: 'k1', result: 'card', card }] });
+  // The three validator sites: a reviewer ruling, a carried ruling, and an operator ruling record.
+  const sites = {
+    'validateReferralRecord rulings': card => { const r = baseRecord(); r.rulings = [ruling(r, card)]; return validateReferralRecord(r); },
+    'validateReferralRecord carried': card => { const r = baseRecord(); r.carried = carried(r, card); return validateReferralRecord(r); },
+    'validateOperatorRuling': card => validateOperatorRuling(operator(card)),
+  };
+  const accepted = ['we:backlog/x.md', 'we:backlog/xsjn0uf-gate.md@pr7', 'we:backlog/4315-example.md@pr123456789'];
+  const rejected = ['we:backlog/x.md@pr0', 'we:backlog/x.md@pr01', 'we:backlog/x.md@pr', 'we:backlog/x.md@prx', 'we:backlog/x.md@pr7x',
+    'we:backlog/x.md@pr1234567890', 'we:backlog/x.md?ref=main&p=.md@pr7', 'we:backlog/a/b.md@pr7', 'we:backlog/x.md@pr7@pr8', 'backlog/x.md@pr7'];
+  for (const [name, check] of Object.entries(sites)) {
+    it(`${name}: accepts ${accepted.length} well-formed refs, rejects ${rejected.length} malformed ones`, () => {
+      for (const card of accepted) expect(check(card), card).toBe(true);
+      for (const card of rejected) expect(check(card), card).toBe(false);
+    });
+  }
 });

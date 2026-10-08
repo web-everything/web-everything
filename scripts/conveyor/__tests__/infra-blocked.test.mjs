@@ -481,7 +481,7 @@ describe('infra-blocked source guards — resume never strands work and never me
     expect(src).toMatch(/const retried = \[\], resumed = \[\], surfaced = \[\], waiting = \[\], failed = \[\]/);
     expect(src).toMatch(/failed\.push\(\{ num: entry\.num, detail: r\.detail, refused: true, reason: r\.reason \?\? null \}\)/);
     expect(src).toMatch(/failed\.push\(\{ num: entry\.num, detail: r\.detail \}\)/);
-    expect(src).toMatch(/JSON\.stringify\(\{ retried, resumed, surfaced, waiting, failed \}\)/);
+    expect(src).toMatch(/JSON\.stringify\(\{ retried, resumed, surfaced, waiting, failed, rearmed \}\)/);
   });
   it('the sanctioned `rearm` CLI verb exists, requires --num, and goes through the same lock every other '
     + 'mutation here does — never a hand-edit of the JSON sidecar', () => {

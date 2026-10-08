@@ -3610,6 +3610,16 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
     const settled = open({ statusCheckRollup: greenRollup.map((c) => ({ ...c, completedAt: new Date(NOW - 30 * 60_000).toISOString() })) });
     expect(planReconcile({ prs: [settled], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(true);
   });
+  it('xpd70wx: a lane PR STACKED on another lane branch (checks never run) is owed review:pending (plateau-app#217)', () => {
+    const stackedRollup = [{ name: 'admit', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: new Date(NOW - 30 * 60_000).toISOString() }];
+    const stacked = open({ baseRefName: 'lane/xwtnr2y-sessions-page', statusCheckRollup: stackedRollup });
+    expect(planReconcile({ prs: [stacked], agents: [], durableCounts: {}, now: NOW }).dispatch)
+      .toEqual([expect.objectContaining({ kind: 'restore-review-label', label: 'review:pending' })]);
+    // still never for a labelled or red stacked PR
+    for (const p of [{ ...stacked, labels: lbl('review:pending') }, { ...stacked, statusCheckRollup: redRollup }]) {
+      expect(planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
+    }
+  });
   it('never for a labelled, draft, red/pending, ready-to-merge or non-lane PR', () => {
     for (const p of [
       open({ labels: lbl('review:accepted') }), open({ labels: lbl('review:pending') }), open({ labels: lbl('ready-to-merge') }),

@@ -7,6 +7,8 @@
  * WE_CORONER_NO_CI (skip gh) are the extra knobs; the gh read is bounded to 5 run pages and 40 job lookups.
  * changeRequests (card 102, coroner-rounds.mjs): per-PR change-request rounds + attributes; WE_CORONER_NO_ROUNDS skips it,
  * WE_CORONER_RECEIPTS overrides the builder-receipt dir. Bounded: 300 PRs x (comments + commits + files) and 150 compares.
+ * frictions + buildOutcomes (card 130, coroner-transcripts.mjs): per-session transcript friction signals grouped by kind x executor, and the
+ * real result of each build dispatch run; WE_CORONER_FRICTION_TAIL (bytes of each transcript tail), WE_CORONER_OPS_ROOTS (colon list of .operations dirs).
  */
 import fs from 'node:fs';
 import { homedir } from 'node:os';
@@ -20,6 +22,7 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { collectExecutorLogs, executorTable } from './coroner-executors.mjs';
 import { LOG_TIMESTAMP_RE, expandRepeatedLines, stripLogTimestamp } from '../lib/log-timestamp.mjs';
 import { collectChangeRequests } from './coroner-rounds.mjs';
+import { redact, buildFrictions, claudeFriction, collectAgyFrictions, collectCodexFrictions, collectDispatchRuns, summarizeBuildOutcomes } from './coroner-transcripts.mjs';
 
 const MiB = 1024 * 1024;
 const MAX_LINE = 256 * 1024;
@@ -182,7 +185,7 @@ export function parseTranscript(entries) {
   for (const row of entries) {
     const content = Array.isArray(row.message?.content) ? row.message.content : [];
     for (const block of content) {
-      if (row.type === 'assistant' && block?.type === 'text' && typeof block.text === 'string') outcomeLine = block.text.replace(/\s+/g, ' ').trim().slice(0, 160);
+      if (row.type === 'assistant' && block?.type === 'text' && typeof block.text === 'string') outcomeLine = redact(block.text.replace(/\s+/g, ' ').trim()).slice(0, 160);
       if (row.type === 'assistant' && block?.type === 'tool_use' && block.name === 'Bash' && typeof block.input?.command === 'string' && !uses.has(block.id)) {
         const command = block.input.command;
         uses.set(block.id, { command, timestamp: row.timestamp });
@@ -310,15 +313,22 @@ const FIX_KINDS = new Set(['fix', 'ci-heal']);
 /** Outcome of a fix/ci-heal session from its state and its final one-line outcome text. First match wins. */
 export function fixOutcome(state, text = '') {
   const value = `${typeof state.detail === 'string' ? state.detail : ''} ${text}`;
-  if (state.state === 'stopped' || /^\s*stopped\s*$/i.test(state.detail ?? '')) return 'stopped-without-outcome';
+  const stopped = state.state === 'stopped' || /^\s*stopped\s*$/i.test(state.detail ?? '');
+  // Card 130 S2: the harness pushes the verified fix after the session stops, so a stopped session whose own outcome
+  // line says the harness pushed it is a delivered fix, not a stop. Future tense ("will push") is only a hand-off.
+  if (HARNESS_PUSHED.test(text)) return 'pushed-by-harness';
+  if (stopped && (HARNESS_WILL_PUSH.test(text) || /^\s*awaiting verify\b/i.test(text))) return 'handed-to-harness';
+  if (stopped && !/\S/.test(text.replace(/^\s*stopped\s*$/i, ''))) return 'stopped-without-outcome';
   if (/load.?flake|quiet.?host/i.test(value)) return 'load-flake-hold';
   if (/gate.?red|verify.?red|gate red/i.test(value)) return 'gate-red-not-pushed';
   if (/escalat/i.test(value)) return 'escalated';
   if (/no (?:ci )?break|no red checks|no-op|not-applicable|stood down|no heal|heal no-op|cancelled leftovers|nothing to/i.test(value)) return 'no-op';
   if (/blocked|refus|denied/i.test(value) || /refus|blocked/i.test(sessionOutcome(state))) return 'blocked';
   if (/push|re-?armed|fixed|repaired|green|verified|hardened|merged main/i.test(value)) return 'pushed';
-  return 'other';
+  return stopped ? 'stopped-without-outcome' : 'other';
 }
+const HARNESS_PUSHED = /\bharness\b(?![^.\n]{0,40}\b(?:not|never|didn't|did not)\b)[^.\n]{0,80}\b(?:pushed|has pushed|already pushed)\b|\b(?:pushed|re-?pushed) by the harness\b|harness-pushed/i;
+const HARNESS_WILL_PUSH = /\bharness (?:will|should|then) (?:push|verify and push)|harness will push/i;
 
 /** Builder launches from build-dispatch-daemon tick rows ({ at, dispatched[], failures[] }). */
 export const cardKindOf = (num, cardNames = []) => cardNames.some((n) => n.startsWith(`${num}-`) && /-prevention-/.test(n)) ? 'prevention-card' : 'build';
@@ -335,21 +345,51 @@ function summarizeLaunches(items, ticks) {
   base.repeatedSameCard = repeated.count;
   return base;
 }
+const attemptTime = (row, tickAt) => [row?.recordedAt, row?.at, /\d{4}-\d\d-\d\dT[\d:.]+Z/.exec(String(row?.attempt ?? ''))?.[0], tickAt].find((v) => Number.isFinite(stamp(v)));
 /** Launch attempts: build/prevention-card from `dispatched`/`failures`; prepare from `prepare.launched`/`prepare.failures`. */
 export function builderMetrics(ticks, window, cardNames = []) {
-  const inTick = ticks.filter((t) => inWindow(t.at, window));
-  const items = [], prepSeen = new Set();
+  const ordered = [...ticks].sort((x, y) => compare(x.at, y.at));
+  const items = [], prepSeen = new Set(), headSeenAt = new Map();
   const list = (v) => Array.isArray(v) ? v : [];
   const failCause = (f) => /not confirmed/i.test(String(f.reason ?? f.evidence?.reason ?? '')) ? 'launch-not-confirmed' : 'failed';
-  for (const t of inTick) {
-    for (const d of list(t.dispatched)) items.push({ cause: 'launched', ref: `card ${d.num}`, at: t.at, num: d.num, kind: cardKindOf(d.num, cardNames) });
-    for (const f of list(t.failures)) if (f?.stage === 'dispatch') items.push({ cause: failCause(f), ref: `card ${f.num}`, at: t.at, num: f.num, kind: cardKindOf(f.num, cardNames) });
-    // prepare lists are cumulative across ticks: one event per (card, attempt stamp), at the stamp's own time.
-    for (const d of list(t.prepare?.launched)) if (!prepSeen.has(`l|${d.num ?? d}|${d.attempt ?? d.at ?? ''}`) && prepSeen.add(`l|${d.num ?? d}|${d.attempt ?? d.at ?? ''}`)) items.push({ cause: 'launched', ref: `card ${d.num ?? d}`, at: t.at, num: `prepare:${d.num ?? d}`, kind: 'prepare' });
-    for (const f of list(t.prepare?.failures)) if (!prepSeen.has(`f|${f.num}|${f.attempt ?? ''}`) && prepSeen.add(`f|${f.num}|${f.attempt ?? ''}`)) items.push({ cause: failCause(f), ref: `card ${f.num}`, at: f.attempt ?? t.at, num: `prepare:${f.num}`, kind: 'prepare' });
+  const headOf = (f) => `${f.num}|${f.stage ?? ''}|${String(f.reason ?? f.evidence?.reason ?? '').slice(0, 60)}`;
+  for (const t of ordered) {
+    const live = inWindow(t.at, window);
+    if (live) {
+      for (const d of list(t.dispatched)) items.push({ cause: 'launched', ref: `card ${d.num}`, at: t.at, num: d.num, kind: cardKindOf(d.num, cardNames) });
+      for (const f of list(t.failures)) if (f?.stage === 'dispatch') items.push({ cause: failCause(f), ref: `card ${f.num}`, at: t.at, num: f.num, kind: cardKindOf(f.num, cardNames) });
+    }
+    // Card 130 S2: prepare lists are cumulative across ticks, so one failed attempt shows up in every later tick (and
+    // carried-over ones in the first tick of the window). Count each attempt once: ticks before the window only seed
+    // what is already known; a row with an attempt id counts per attempt; a row without one counts once per card +
+    // stage + reason, and not at all when an attempt-bearing row already told that same story. Its time is
+    // recordedAt, else the stamp inside the attempt id, else the tick; it must fall inside the window.
+    // An undated stored (held) failure first seen in the very first tick of the log is carried over from before the log began: unknown time, not counted.
+    const undated = (row) => t === ordered[0] && row?.held === true && !row?.recordedAt && !row?.at && !/\d{4}-\d\d-\d\dT/.test(String(row?.attempt ?? ''));
+    const emit = (cause, row, id, fresh) => { if (fresh && live && !undated(row)) items.push({ cause, ref: `card ${row.num ?? row}`, at: attemptTime(row, t.at), num: `prepare:${row.num ?? row}`, kind: 'prepare' }); };
+    for (const d of list(t.prepare?.launched)) {
+      const key = `l|${d.num ?? d}|${d.attempt ?? d.at ?? d.sessionSlug ?? ''}`;
+      emit('launched', d, key, !prepSeen.has(key) && prepSeen.add(key));
+    }
+    const failures = list(t.prepare?.failures).filter((f) => f && typeof f === 'object');
+    for (const f of [...failures.filter((x) => x.attempt), ...failures.filter((x) => !x.attempt)]) {
+      const head = `h|${headOf(f)}`, key = f.attempt ? `f|${f.num}|${f.attempt}` : head, when = stamp(attemptTime(f, t.at));
+      let fresh = !prepSeen.has(key) && prepSeen.add(key);
+      // The same failure is often listed first without an attempt id and a tick later with one: that is one attempt.
+      // Only an attempt-less row can be that earlier listing, and it is spent by the first attempt that claims it: two
+      // attempt-bearing rows (different ids) minutes apart are two attempts, however close, and never absorb each other.
+      if (f.attempt && headSeenAt.has(head)) {
+        if (fresh && Math.abs(when - headSeenAt.get(head)) <= 600000) fresh = false;
+        headSeenAt.delete(head);
+      } else if (!f.attempt && fresh && !undated(f)) headSeenAt.set(head, when); // a carried-over row is not an earlier listing of a new attempt
+      prepSeen.add(head);
+      emit(failCause(f), f, key, fresh);
+    }
   }
-  const main = summarizeLaunches(items.filter((i) => i.kind !== 'prepare'), inTick.length);
-  main.byKind = Object.fromEntries(['build', 'prevention-card', 'prepare'].map((k) => [k, summarizeLaunches(items.filter((i) => i.kind === k), inTick.length)]));
+  for (let i = items.length - 1; i >= 0; i--) if (items[i].kind === 'prepare' && !inWindow(items[i].at, window)) items.splice(i, 1);
+  const inTick = ordered.filter((t) => inWindow(t.at, window)).length;
+  const main = summarizeLaunches(items.filter((i) => i.kind !== 'prepare'), inTick);
+  main.byKind = Object.fromEntries(['build', 'prevention-card', 'prepare'].map((k) => [k, summarizeLaunches(items.filter((i) => i.kind === k), inTick)]));
   return main;
 }
 
@@ -523,14 +563,14 @@ export function fetchCiRuns(window, gh, { repo = CONSTELLATION_REPOS.we.slug, ma
 }
 
 /** Pure metrics core. Input arrays may be unordered; sources and all maps are sorted. */
-export function extractMetrics({ window, changeRequests = null, sessions = [], durations = [], reaped = [], markers = [], verifyLines = [], refusalLines = [], ciRuns = [], prsOpened = [], prKinds = {}, cardNames = [], buildTicks = [], buildLines = [], daemonLogs = {}, executorRuns = null, sources = {} }) {
+export function extractMetrics({ window, changeRequests = null, sessions = [], durations = [], reaped = [], markers = [], verifyLines = [], refusalLines = [], ciRuns = [], prsOpened = [], prKinds = {}, cardNames = [], buildTicks = [], buildLines = [], daemonLogs = {}, executorRuns = null, frictionRuns = [], dispatchRuns = [], sources = {} }) {
   const selected = sessions.filter(({ state }) => inWindow(state.createdAt || state.updatedAt, window))
     .sort((a, b) => compare(a.state.sessionId ?? a.state.name ?? '', b.state.sessionId ?? b.state.name ?? '') || compare(JSON.stringify(a), JSON.stringify(b)));
   const byKind = new Map(), outcomes = new Map(), prs = new Map(), denials = new Map(), holds = new Map(), reasons = new Map(), refusals = new Map(), refusalPrs = new Map();
   const times = [], gates = [], loops = [], waits = [], reapedWaits = [], records = [], fixSessions = [], gateRuns = [];
-  const waitTimeoutItems = [];
+  const waitTimeoutItems = [], frictionRecords = [];
   let waitTimeoutSessions = 0, transcriptsTruncated = 0, bytesRead = 0, waiterMs = 0;
-  for (const { state, transcript = {} } of selected) {
+  for (const { state, transcript = {}, friction = null } of selected) {
     const ms = elapsed(state.lastTerminalAt || state.updatedAt, state.createdAt || state.updatedAt);
     times.push(ms);
     const name = String(state.name ?? ''), kind = name.match(/^(.*?)-(?=\d)/)?.[1] || 'other';
@@ -542,11 +582,12 @@ export function extractMetrics({ window, changeRequests = null, sessions = [], d
     const group = byKind.get(kind) ?? []; group.push(ms); byKind.set(kind, group);
     if (pr !== null) { const group = prs.get(pr) ?? []; group.push(ms); prs.set(pr, group); }
     gates.push(...parsed.gates);
+    if (friction) frictionRecords.push(friction);
     if (FIX_KINDS.has(kind)) fixSessions.push({ session, pr, conflict: /conflict|rebase|merged? main/i.test(`${state.detail ?? ''} ${parsed.outcomeLine}`), outcome: fixOutcome(state, parsed.outcomeLine), at: state.lastTerminalAt || state.updatedAt || state.createdAt, ms });
     for (const g of parsed.gates) if (g.waitTimeout) waitTimeoutItems.push({ cause: 'verify-wait-timeout', ref: `session ${session}`, at: g.at, ms: g.ms ?? 0 });
     if (parsed.gates.some((g) => g.waitTimeout)) waitTimeoutSessions++;
     for (const [type, count] of Object.entries(parsed.denials)) add(denials, type, count);
-    loops.push(...parsed.loops.map((loop) => ({ session, ...loop })));
+    loops.push(...parsed.loops.map((loop) => ({ session, ...loop, command: redact(loop.command) })));
     transcriptsTruncated += Number(Boolean(transcript.truncated)); bytesRead += transcript.bytesRead ?? 0;
     records.push({ session, name, kind, pr, outcome, minutes: minutes(ms), outcomeLine: parsed.outcomeLine, truncated: Boolean(transcript.truncated) });
   }
@@ -603,6 +644,8 @@ export function extractMetrics({ window, changeRequests = null, sessions = [], d
     window: { since: window.since, until: window.until },
     errorRates,
     ...(changeRequests ? { changeRequests } : {}),
+    frictions: buildFrictions([...frictionRecords, ...frictionRuns], { prKinds, sources: sources.frictions ?? {} }),
+    buildOutcomes: summarizeBuildOutcomes(dispatchRuns, { prKinds }),
     ...(executorRuns ? { executors: executorTable({ claude: records.map((r) => ({ task: r.pr ? `pr-${r.pr}` : r.name || r.session, ms: r.minutes * 60000, failed: ['failed', 'timed-out', 'cancelled'].includes(r.outcome), role: r.kind })), ...executorRuns }) } : {}),
     sessions: { ...stats(times), byKind: ordered(new Map([...byKind].map(([key, xs]) => [key, { count: xs.length, minutes: minutes(sum(xs)) }]))), outcomes: ordered(outcomes), records: records.slice(0, 60) },
     gate: { minutesInGate: minutes(gateMs), shareInGate: total ? round(Math.min(1, gateMs / total), 3) : 0, commands: gates.length, medianMin: minutes(percentile(verifyTimes, 0.5)), p90Min: minutes(percentile(verifyTimes, 0.9)), allCommands: stats(gateTimes), verifyLane: { calls: verifyGates.length, medianMin: minutes(percentile(verifyTimes, 0.5)), p90Min: minutes(percentile(verifyTimes, 0.9)), waitTimeouts: verifyGates.filter((g) => g.waitTimeout).length }, directVitest: { runs: directVitest.length, minutes: minutes(sum(directVitest.map((g) => g.ms ?? 0))) }, waitTimeouts: gates.filter((g) => g.waitTimeout).length, waitTimeoutSessions, waitTimeoutMinutes: minutes(sum(gates.filter((g) => g.waitTimeout).map((g) => g.ms ?? 0))) },
@@ -655,6 +698,7 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
   const projectDirs = children(paths.projects, io).filter((x) => x.isDirectory()).map((x) => join(paths.projects, x.name));
   sources.projects = { found: directory(paths.projects, io), count: 0 };
   sources.transcripts = { found: false, count: 0 };
+  sources.frictions = { claude: 0 };
   for (const session of sessions) {
     const { state } = session;
     const safeId = typeof state.sessionId === 'string' && /^[\w-]+$/.test(state.sessionId);
@@ -663,6 +707,9 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
     if (!file) continue;
     const data = read(file, { cap: positive(env.WE_CORONER_TRANSCRIPT_CAP, 8 * MiB) });
     session.transcript = { entries: rows(data.lines), truncated: data.truncated, bytesRead: data.bytesRead };
+    // Card 130 S1: friction signals come from a bounded tail read through agent-health's reader (WE_CORONER_FRICTION_TAIL bytes).
+    session.friction = claudeFriction(state, file, { maxBytes: positive(env.WE_CORONER_FRICTION_TAIL, 2 * MiB) });
+    if (session.friction) sources.frictions.claude++;
     if (data.found) { sources.transcripts.found = true; sources.transcripts.count++; if (file === fallback) sources.projects.count++; }
   }
   // 68b: a size-rotated log keeps its older half in `<log>.1`, and collapsed repeats are replayed, so the counts
@@ -684,10 +731,16 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
   // Tick rows are ~300 KB of JSON each: read a larger tail with a larger line cap, keep only the compact fields.
   const buildAll = log('build-dispatch-daemon.log', join(paths.coord, 'build-dispatch-daemon.log'), { cap: positive(env.WE_CORONER_BUILD_TAIL, 48 * MiB), maxLine: 2 * MiB, olderToo: true });
   const buildTicks = parseBuildTicks(buildAll), buildLines = buildAll.filter((l) => l.indexOf('{"at"') < 0);
+  // Card 130: Codex rollouts and agy logs (frictions) and the dispatch run records (real build outcomes).
+  const codexFriction = env.WE_CORONER_NO_EXECUTORS ? { records: [], sources: { found: false, count: 0 } } : collectCodexFrictions(window, { env, home, io, maxBytes: positive(env.WE_CORONER_FRICTION_TAIL, 2 * MiB) });
+  const agyFriction = env.WE_CORONER_NO_EXECUTORS ? { records: [], sources: { found: false, count: 0 } } : collectAgyFrictions(window, { env, home, io, maxBytes: positive(env.WE_CORONER_FRICTION_TAIL, 2 * MiB) });
+  const dispatch = collectDispatchRuns(window, { coord: paths.coord, io });
+  const frictionRuns = [...codexFriction.records, ...agyFriction.records];
+  Object.assign(sources.frictions, { codex: codexFriction.sources, agy: agyFriction.sources, dispatchRuns: dispatch.sources });
   const ci = fetchCiRuns(window, gh);
   sources.scopingCutoff = env.WE_CORONER_SCOPING_CUTOFF || undefined;
   const opened = fetchOpenedPrs(window, gh);
-  const fixPrs = sessions.map(({ state }) => /^(?:fix|ci-heal)-(\d+)/.exec(String(state.name ?? ''))?.[1]).filter(Boolean).map(Number);
+  const fixPrs = [...sessions.map(({ state }) => /^(?:fix|ci-heal)-(\d+)/.exec(String(state.name ?? ''))?.[1]).filter(Boolean).map(Number), ...sessions.map((x) => x.friction?.pr), ...frictionRuns.map((x) => x.pr), ...dispatch.rows.map((x) => x.pr)].filter(Number.isInteger);
   const prFiles = {};
   const prKinds = fetchPrKinds([...opened.prs.map((p) => p.number), ...ci.runs.map((r) => r.pr), ...fixPrs], gh, { filesOut: prFiles });
   const backlogDir = env.WE_CORONER_BACKLOG || join(dirname(fileURLToPath(import.meta.url)), '../../backlog');
@@ -715,7 +768,7 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
   }
   const exec = env.WE_CORONER_NO_EXECUTORS ? null : collectExecutorLogs(window, { env, home, io });
   if (exec) Object.assign(sources, { codexSessions: exec.sources.codex, agySessions: exec.sources.agy, codexPilot: exec.sources.pilot });
-  return { window, changeRequests, executorRuns: exec?.runs ?? null, sessions, durations, reaped, markers, verifyLines, refusalLines, ciRuns: ci.runs, prsOpened: opened.prs, prKinds, cardNames, buildTicks, buildLines, daemonLogs, sources };
+  return { window, changeRequests, executorRuns: exec?.runs ?? null, frictionRuns, dispatchRuns: dispatch.rows, sessions, durations, reaped, markers, verifyLines, refusalLines, ciRuns: ci.runs, prsOpened: opened.prs, prKinds, cardNames, buildTicks, buildLines, daemonLogs, sources };
 }
 
 /** Flatten the same metrics into a compact two-column human table. */

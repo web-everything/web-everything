@@ -7,9 +7,16 @@
  * whether the rendered report actually tells a human what to do. A checker whose output cannot be acted on is
  * the Phase-1 failure mode — the whole slice exists to produce evidence a person reads.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { writeRun } from '../operations/run-store.mjs';
 
-import { buildRows, renderReport, renderRow, readOpenPrs } from '../review-ledger-check.mjs';
+import {
+  buildRows, renderReport, renderRow, readOpenPrs, LABEL_FAMILIES, unfamilied, labelsByFamily, compareDerivedLabels,
+  deriveRow, summarizeDerived, renderDerived, readRepoEvents, buildCheckRunRecord, appendCheckRun, buildDerivedRows,
+} from '../review-ledger-check.mjs';
 import {
   VERDICTS, AGREEMENT, DISAGREE_DIRECTION, buildVerdictRecord, foldVerdictLedger, summarizeAgreement,
 } from '../lib/verdict-ledger.mjs';
@@ -142,5 +149,126 @@ describe('renderReport — output a human can act on', () => {
     expect(safe.direction).toBe(DISAGREE_DIRECTION.LEDGER_CLEARS_LABEL_HOLDS);
     expect(renderRow(safe)).not.toMatch(/BLOCKER/);
     expect(renderRow(safe)).toMatch(/differs/);
+  });
+});
+
+
+// ── Slice F (#3930): derived vs live labels, per mirrored family ─────────────────────────────────────────────
+describe('slice F — derived vs live labels', () => {
+  let savedBoard;
+  beforeEach(() => { savedBoard = process.env.WE_VERDICT_LEDGER_BOARD; delete process.env.WE_VERDICT_LEDGER_BOARD; });
+  afterEach(() => { if (savedBoard === undefined) delete process.env.WE_VERDICT_LEDGER_BOARD; else process.env.WE_VERDICT_LEDGER_BOARD = savedBoard; });
+
+  const facts = (over = {}) => ({ pr: 7, state: 'OPEN', isDraft: false, labels: [], head: { sha: 'a'.repeat(40), committedAt: '2026-08-10T10:00:00.000Z' },
+    requiredChecks: [{ name: 'test', state: 'green' }], sessions: [], referrals: { pending: [], ruled: [] },
+    handoffs: [], refusals: [], probeErrors: [], now: '2026-10-08T12:00:00.000Z', ...over });
+  const accepted = { ...rec({ pr: 7, verdict: VERDICTS.ACCEPTED, headSha: 'a'.repeat(40), reason: 'r' }), type: 'verdict' };
+
+  it('every label a lifecycle state renders belongs to a mirrored family', () => {
+    expect(unfamilied()).toEqual([]);
+    expect(LABEL_FAMILIES.map((f) => f.family)).toEqual(['review', 'ruling-needed', 'ready-to-merge', 'ci-failed']);
+  });
+
+  it('splits labels by family and ignores labels the mirror does not own', () => {
+    expect(labelsByFamily(L('review:human', 'advisory:ruling-needed', 'bug', 'ci:failed')))
+      .toEqual({ review: ['review:human'], 'ruling-needed': ['advisory:ruling-needed'], 'ready-to-merge': [], 'ci-failed': ['ci:failed'] });
+  });
+
+  it('does not score review labels the mirror never renders', () => {
+    expect(labelsByFamily(L('review:awaiting-advisory')).review).toEqual([]);
+  });
+
+  it('reports ruling-needed drift per family: derived holds it, live does not', () => {
+    const rows = compareDerivedLabels({ derived: ['review:human', 'advisory:ruling-needed'], live: ['review:human'] });
+    const ruling = rows.find((r) => r.family === 'ruling-needed');
+    expect(ruling).toMatchObject({ agree: false, missing: ['advisory:ruling-needed'], extra: [] });
+    expect(rows.find((r) => r.family === 'review').agree).toBe(true);
+  });
+
+  it('reports a stale live label the derive would remove', () => {
+    const rows = compareDerivedLabels({ derived: [], live: ['advisory:ruling-needed'] });
+    expect(rows.find((r) => r.family === 'ruling-needed')).toMatchObject({ agree: false, extra: ['advisory:ruling-needed'] });
+  });
+
+  it('a PR whose derived labels equal its live labels agrees', () => {
+    const row = deriveRow({ pr: 7, repo: REPO, events: [accepted], facts: facts(), liveLabels: ['review:accepted', 'ready-to-merge'] });
+    expect(row.status).toBe('agree');
+    expect(row.lifecycleState).toBe('READY-TO-MERGE');
+  });
+
+  it('a live accepted label with no ledger row is a mismatch, in the review and ready-to-merge families', () => {
+    const row = deriveRow({ pr: 7, repo: REPO, events: [], facts: facts(), liveLabels: ['review:accepted', 'ready-to-merge'] });
+    expect(row.status).toBe('mismatch');
+    const bad = summarizeDerived([row]).mismatches.map((m) => m.family).sort();
+    expect(bad).toEqual(['ready-to-merge', 'review']);
+  });
+
+  it('an unreadable ledger or unreadable facts is `unreadable`, never agree and never drift', () => {
+    expect(deriveRow({ pr: 7, repo: REPO, events: null, facts: facts(), liveLabels: [] }).status).toBe('unreadable');
+    expect(deriveRow({ pr: 7, repo: REPO, events: [], facts: null, liveLabels: [] }).status).toBe('unreadable');
+    expect(deriveRow({ pr: 7, repo: REPO, events: [], facts: facts({ probeErrors: ['GitHub PR unavailable'] }), liveLabels: [] }).status).toBe('unreadable');
+    const s = summarizeDerived([deriveRow({ pr: 7, repo: REPO, events: null, facts: facts(), liveLabels: [] })]);
+    expect(s).toMatchObject({ unreadable: 1, agree: 0, mismatch: 0 });
+    expect(s.perFamily.review.compared).toBe(0);
+  });
+
+  it('another PR\'s ledger rows never leak into this PR', () => {
+    const other = { ...accepted, pr: 8 };
+    const withOther = deriveRow({ pr: 7, repo: REPO, events: [other], facts: facts(), liveLabels: [] });
+    const without = deriveRow({ pr: 7, repo: REPO, events: [], facts: facts(), liveLabels: [] });
+    expect(withOther).toEqual(without);
+  });
+
+  it('readRepoEvents: a missing file is empty, any other read failure is unreadable (null)', () => {
+    const enoent = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
+    const eio = () => { throw Object.assign(new Error('x'), { code: 'EIO' }); };
+    expect(readRepoEvents(REPO, { read: enoent, pathOf: () => '/nope' })).toEqual([]);
+    expect(readRepoEvents(REPO, { read: eio, pathOf: () => '/nope' })).toBeNull();
+  });
+
+  it('buildDerivedRows treats a throwing facts reader as unreadable', () => {
+    const rows = buildDerivedRows({ repo: REPO, prs: [{ number: 9, labels: [] }], events: [], readFacts: () => { throw new Error('gh down'); } });
+    expect(rows).toEqual([expect.objectContaining({ pr: 9, status: 'unreadable' })]);
+  });
+
+  it('renders per-family agreement and each mismatch', () => {
+    const row = deriveRow({ pr: 7, repo: REPO, events: [], facts: facts(), liveLabels: ['advisory:ruling-needed'] });
+    const text = renderDerived(summarizeDerived([row]));
+    expect(text).toMatch(/ruling-needed\s+compared 1 · agree 0 · disagree 1/);
+    expect(text).toMatch(/mismatch #7 ruling-needed/);
+  });
+
+  describe('the run record', () => {
+    let dir;
+    beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'rlc-runs-')); });
+    afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+    it('appends exactly one valid run record to the folder it is given', () => {
+      const summary = summarizeDerived([deriveRow({ pr: 7, repo: REPO, events: [], facts: facts(), liveLabels: ['advisory:ruling-needed'] })]);
+      const res = appendCheckRun({ repo: REPO, summary, phase1: { total: 0 }, write: (r) => writeRun(r, dir) });
+      expect(res.ok).toBe(true);
+      const files = readdirSync(dir);
+      expect(files).toHaveLength(1);
+      const saved = JSON.parse(readFileSync(join(dir, files[0]), 'utf8'));
+      expect(saved).toMatchObject({ op: 'review-ledger-check', verdict: 'drift' });
+      expect(saved.findings.derived.mismatches.find((m) => m.family === 'ruling-needed')).toMatchObject({ pr: 7, family: 'ruling-needed' });
+    });
+
+    it('a clean run is verdict clean; a failed write is reported, never thrown', () => {
+      expect(buildCheckRunRecord({ id: 'review-ledger-check-1', repo: REPO, at: AT, summary: summarizeDerived([]), phase1: {} }).verdict).toBe('clean');
+      const res = appendCheckRun({ repo: REPO, summary: summarizeDerived([]), phase1: {}, write: () => { throw new Error('disk full'); } });
+      expect(res).toEqual({ ok: false, error: 'disk full' });
+    });
+
+    it('default write honours OPERATION_RUNS_DIR', () => {
+      const prior = process.env.OPERATION_RUNS_DIR;
+      process.env.OPERATION_RUNS_DIR = dir;
+      try {
+        expect(appendCheckRun({ repo: REPO, summary: summarizeDerived([]), phase1: {} }).ok).toBe(true);
+        expect(readdirSync(dir)).toHaveLength(1);
+      } finally {
+        if (prior === undefined) delete process.env.OPERATION_RUNS_DIR; else process.env.OPERATION_RUNS_DIR = prior;
+      }
+    });
   });
 });

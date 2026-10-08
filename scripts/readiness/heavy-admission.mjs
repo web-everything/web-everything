@@ -400,7 +400,8 @@ export function loadAdmissionDecision({
   minIdlePct = DEFAULT_LOAD_ADMISSION_MIN_IDLE_PCT, minPressureLevel = DEFAULT_LOAD_ADMISSION_MIN_PRESSURE_LEVEL,
   backstopPerCore = DEFAULT_LOAD_ADMISSION_BACKSTOP_PER_CORE,
 } = {}) {
-  const idleNums = (Array.isArray(idlePctSamples) ? idlePctSamples : []).map(Number).filter(Number.isFinite);
+  const idleNums = (Array.isArray(idlePctSamples) ? idlePctSamples : [])
+    .map((value) => value == null ? NaN : Number(value)).filter(Number.isFinite);
   const idlePct = idleNums.length ? median(idleNums) : null;
   // `Number(null)` is `0`, not "absent" — a bare `Number()` coercion would turn a genuinely missing sample into
   // a false reading of zero (mirrors telemetry-machine.mjs#computeMachineNow's own `fallbackCores` guard).
@@ -471,9 +472,9 @@ export function readLatestLoad({ root = resolveHostRoot(), now = new Date(), win
   const recentBusy = lastByWindow((Array.isArray(records) ? records : []).filter((r) => r && r.name === 'host.cpu.busy_pct'));
   const idlePctSamples = recentBusy
     .map((r) => {
-      const fromAttr = Number(r?.attributes?.idle_pct);
+      const fromAttr = r?.attributes?.idle_pct == null ? NaN : Number(r.attributes.idle_pct);
       if (Number.isFinite(fromAttr)) return fromAttr;
-      const busyVal = Number(r?.value);
+      const busyVal = r?.value == null ? NaN : Number(r.value);
       return Number.isFinite(busyVal) ? 100 - busyVal : NaN;
     })
     .filter(Number.isFinite);
@@ -1364,16 +1365,18 @@ async function main(argv) {
     if (asJson) { emit(decision); return; }
     // Plain-text fallback (no `--json`) when `decision.reason` is absent (an ADMITTED tick has none — see
     // `loadAdmissionDecision`'s own doc comment). Report whichever real reading is actually available, in the
-    // SAME idle → backstop → no-sample priority the decision itself checks — reporting a flat "no sample" when
-    // idle-telemetry is merely absent but a real load1/cores reading exists (and was admitted) would misreport
+    // SAME idle → pressure → backstop → no-sample priority the decision itself checks — reporting a flat "no sample" when
+    // idle-telemetry is merely absent but a real pressure or load1/cores reading exists (and was admitted) would misreport
     // an ordinary admit as a sampler outage.
     const reading = decision.reason && decision.reason !== 'no-sample'
       ? decision.reason
       : decision.idlePct != null
         ? `cpu idle ${decision.idlePct.toFixed(1)}% (min ${decision.minIdlePct}%)`
-        : decision.perCore != null
-          ? `load1 ${decision.load1.toFixed(2)}/${decision.cores} cores (${decision.perCore.toFixed(2)}, backstop ${decision.backstopPerCore})`
-          : `no sample${decision.bypassed ? ` (${decision.bypassed})` : ''}`;
+        : decision.pressureLevel != null
+          ? `mem pressure ${decision.pressureLevel} (threshold ${decision.minPressureLevel})`
+          : decision.perCore != null
+            ? `load1 ${decision.load1.toFixed(2)}/${decision.cores} cores (${decision.perCore.toFixed(2)}, backstop ${decision.backstopPerCore})`
+            : `no sample${decision.bypassed ? ` (${decision.bypassed})` : ''}`;
     process.stdout.write(`${decision.held ? 'HELD' : 'admitted'} — ${reading}\n`);
     return;
   }

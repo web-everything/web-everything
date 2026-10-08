@@ -156,7 +156,7 @@ import { ADVISORY_LABELS, latestAdvisory, advisoryCoversHead } from '../lib/advi
 // which would "repair" code that was never broken. `isPrCiFailureOwedRerun` is the PURE leaf that decides this
 // (see its own docblock for the full incident and the two facts it needs); this file only calls it.
 import {
-  isPrCiFailureOwedRerun, isMainFixedSignatureOwed, isMainGreenFixOwed, countRebaseOntoMainComments, DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
+  isPrCiFailureOwedRerun, classifyMainDefect, isMainFixedSignatureOwed, isMainGreenFixOwed, countRebaseOntoMainComments, DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
   // landing-freeze fix (2026-09-27) — used only to word the `owed-ci-rerun` refusal's `why` accurately when
   // THIS path (not the red-window one) is what actually granted it; see that function's own docblock.
   classifyCiFailureAttribution,
@@ -1882,7 +1882,13 @@ export function planReconcile({
     // promote-draft pass's sibling half (`promote-draft-pr-dispatch.mjs`), so the ordinary review path owns it.
     // Deliberately NOT gated on AI authorship (the commit list of a drain-rebased lane carries merge commits
     // from other authors, which made `missingReviewLabel` read false on #3830 itself).
-    if (reviewLabelHeal !== 'off' && phase === 'open' && !pr?.isDraft && withPhase.check === 'green'
+    // xpd70wx — plateau-app#217: a lane PR STACKED on another lane's branch (base is not `defaultBranch`) never
+    // gets its required checks run (they run once the base lands and the drain retargets it), so it is never
+    // `green` and the branch below never fired: it sat with no `review:*` label and no owner. A stacked lane PR
+    // whose checks are not red is owed the same neutral `review:pending`; review itself still waits on CI via
+    // {@link reviewChecksAllow}, exactly as for a labelled stacked PR.
+    const stackedLanePr = typeof pr?.baseRefName === 'string' && pr.baseRefName.startsWith('lane/') && pr.baseRefName !== defaultBranch;
+    if (reviewLabelHeal !== 'off' && phase === 'open' && !pr?.isDraft && (withPhase.check === 'green' || (stackedLanePr && withPhase.check !== 'red'))
         && String(pr?.headRefName ?? '').startsWith('lane/')
         && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
         && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
@@ -1968,6 +1974,40 @@ export function planReconcile({
       continue;
     }
 
+    // ── CODEQL-HELD PR (card x8cnbii) — LIVE 2026-10-08, PR #4370: ready-to-merge + review:accepted (phase `queued`)
+    // with every REQUIRED check green, but the drain refuses to land it because its non-required `CodeQL` check
+    // failed (`drainBlocksOnCodeQL`). Phase `queued` answers `nothing-owed`, so the drain skipped it every pass and
+    // nobody owned the repair. A PR the drain holds for CodeQL is owed a ci-heal (reason `codeql`), with the alert
+    // (rule/file/line/message from the check-run annotations, attached by `reconcile-pass.mjs#enrichPrsWithCodeQL`)
+    // carried on the row for the brief. `pr.codeqlFailure` exists ONLY when the drain gate is on, so turning the
+    // gate off turns this off with it. Bounded by the SAME durable ci-heal cap and head-scoped escalation as a red
+    // required check; every cap/escalation outcome is a logged refusal, never a silent skip.
+    if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
+      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
+      const healAttempts = countChargeableCiHealComments(pr?.comments, { restore: ciHealBudgetRestore });
+      if (escalation) {
+        refuse('ci-heal-escalated', {
+          ...withPhase, headSha: escalation.headSha,
+          why: `the drain holds this PR for a failed CodeQL check, but ci-heal already escalated this exact head (\`${escalation.headSha}\`, ${escalation.outcome}) — nothing further is owed until a new push changes the head`,
+        });
+      } else if (healAttempts >= ciHealCap) {
+        refuse('cap-exhausted', {
+          ...withPhase, attempts: healAttempts, cap: ciHealCap,
+          why: `the drain holds this PR for a failed CodeQL check, and its durable CI-heal count is ${healAttempts} against a cap of ${ciHealCap} — auto-heal is exhausted here and a person must take it`,
+        });
+        notes.push({
+          kind: 'ci-heal-exhausted', prNumber, attempts: healAttempts, cap: ciHealCap, lastFailureReason: 'CodeQL (drain gate)',
+          text: `PR #${prNumber}: ci-heal attempts exhausted (${healAttempts}/${ciHealCap}) — auto-heal cannot clear the CodeQL alert the drain is holding this PR for; a person must take it over. Last failure: CodeQL (drain gate)`,
+        });
+      } else {
+        dispatch.push({
+          ...base, ...withPhase, kind: 'ci-heal', reason: 'codeql', attempts: healAttempts, codeql: pr.codeqlFailure,
+          why: `the drain refuses to land this PR because its CodeQL check failed (${(pr.codeqlFailure.alerts ?? []).length} alert(s)), nothing live is working it, and ${healAttempts} of ${ciHealCap} CI-heal attempts are spent`,
+        });
+      }
+      continue;
+    }
+
     if (ciRepairOwed) {
       // we:backlog/x9wz0ir-*.md (#4075/#3383) — LIVE INCIDENT 2026-09-25: PRs #2635/#2636 are BOTH `owed-ci-
       // rerun` (their required check failed inside one of `main`'s own red windows) AND `mergeStateStatus:
@@ -2021,12 +2061,15 @@ export function planReconcile({
         mergeBaseRunConclusion: base.mergeBaseRunConclusion,
         mainFixedSignature: base.mainFixedSignature,
       })) {
-        const viaMainGreen = classifyCiFailureAttribution({
-          failureCompletedAt: base.requiredCheckCompletedAt, mainRedWindows,
-        }) !== 'main-red';
-        const viaSignature = viaMainGreen && isMainFixedSignatureOwed(base.mainFixedSignature)
-          && !isMainGreenFixOwed({ ...base, failingCheckName: base.requiredCheckName, mainLatestCheckRuns,
-            comments: pr?.comments, headSha: pr?.headRefOid });
+        // ONE shared classifier — `via` names why (same call the ci-red-recovery-watch makes).
+        const viaClass = classifyMainDefect({
+          comments: pr?.comments, headSha: pr?.headRefOid, requiredCheckCompletedAt: base.requiredCheckCompletedAt,
+          mainRedWindows, failingCheckName: base.requiredCheckName, mainLatestCheckRuns,
+          prContainsMainGreenSha: base.prContainsMainGreenSha, mergeBaseCheckRuns: base.mergeBaseCheckRuns,
+          mergeBaseRunConclusion: base.mergeBaseRunConclusion, mainFixedSignature: base.mainFixedSignature,
+        });
+        const viaMainGreen = viaClass.via !== 'red-window';
+        const viaSignature = viaClass.via === 'signature';
         refuse('owed-ci-rerun', {
           ...withPhase,
           why: viaSignature

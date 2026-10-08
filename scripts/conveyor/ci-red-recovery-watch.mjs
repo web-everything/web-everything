@@ -77,7 +77,7 @@ import {
   buildMissingRunCandidates, planMissingRunRecoveries, countMissingRunComments, buildMissingRunComment,
   DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS, failingRequiredCheckForAttribution, isAnyRequiredCheckFailed,
   // landing-freeze fix (2026-09-27) — see `main-red-recovery.mjs`'s own "LANDING-FREEZE FIX" section header.
-  mainLatestGreenShaForCheck, isMainGreenFixOwed, isMainLatestCheckGreen, isMainFixedSignatureOwed,
+  mainLatestGreenShaForCheck, isMainGreenFixOwed, classifyMainDefect, classifierNeedsComments, isMainLatestCheckGreen, isMainFixedSignatureOwed,
 } from './main-red-recovery.mjs';
 import {
   defaultReadMainRuns, defaultReadAheadBy, defaultReadMainLatestCheckRuns, defaultReadMainGreenFixFacts,
@@ -144,6 +144,8 @@ export function buildCandidates(prs, {
       // `isMainLatestCheckGreen` about THIS SAME check on main's own latest completed run. See that function's
       // own docblock.
       failingCheckName: check?.name ?? null,
+      // xo7mr6l — a PR parked `needs-human` may carry a main-defect escalation; also read comments for these (besides the merge-base-not-green case).
+      needsHuman: (pr?.labels ?? []).some((l) => (typeof l === 'string' ? l : l?.name) === 'review-status:needs-human'),
     });
   }
   return out;
@@ -252,14 +254,15 @@ export function sweepCiRedRecovery({
       const greenSha = mainLatestGreenShaForCheck({ failingCheckName: c.failingCheckName, mainLatestCheckRuns });
       if (greenSha) {
         withFacts = { ...c, ...readMainGreenFixFacts(c.headSha, { repo, greenSha, checkName: c.failingCheckName }) };
-        if (withFacts.prContainsMainGreenSha === false && !isMainLatestCheckGreen({
-          failingCheckName: c.failingCheckName, mainLatestCheckRuns: withFacts.mergeBaseCheckRuns,
-        })) {
+        // xo7mr6l: comments are also needed when merge base is green — a main-defect escalation bypasses that veto.
+        // The gate is the shared classifier's own (never a private label signal: this pass does not fetch labels, so
+        // the old `needsHuman` gate never fired and #4368's recorded main-defect escalation went unseen).
+        if (classifierNeedsComments({ failingCheckName: c.failingCheckName, mainLatestCheckRuns, prContainsMainGreenSha: withFacts.prContainsMainGreenSha })) {
           comments = readComments(c.prNumber, { repo });
           withFacts.comments = comments;
         }
       }
-      if (!isMainGreenFixOwed({ mainLatestCheckRuns, ...withFacts })) {
+      if (!classifyMainDefect({ requiredCheckCompletedAt: c.failureCompletedAt, mainRedWindows, mainLatestCheckRuns, ...withFacts }).mainDefect) {
         withFacts.mainFixedSignature = readMainFixedSignatureFacts({ repo, defaultBranch,
           detailsUrl: c.detailsUrl, failureCompletedAt: c.failureCompletedAt });
         if (!isMainFixedSignatureOwed(withFacts.mainFixedSignature)) return withFacts;

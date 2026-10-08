@@ -12,7 +12,10 @@
 
 export const SKIP_KINDS = Object.freeze([
   'unknown-mergeability', 'conflicting', 'behind', 'checks-pending', 'review-hold', 'cap', 'head-moved',
-  'couple-held', 'blocked-by', 'overlap-yield', 'rebuilt-pending-ci', 'merge-failed', 'parked', 'other',
+  'couple-held', 'blocked-by', 'overlap-yield', 'rebuilt-pending-ci', 'merge-failed', 'parked',
+  // Former "other" bucket, now named: every skip says which rule held it.
+  'not-certified', 'off-base', 'codeql-failed', 'empty-body', 'stale-read', 'escalated',
+  'partner-pending', 'ready-not-reached', 'unrecognized-reason',
 ]);
 
 /** Map a drain reason string to a stable kind. Order matters: the most specific signal wins. */
@@ -25,7 +28,14 @@ export function classifySkipReason(reason) {
   if (/required check .* (is not green|direct read failed)|checks? pending|not green/i.test(r)) return 'checks-pending';
   if (/^head moved|head moved since/i.test(r)) return 'head-moved';
   if (/\bcap\b|max-merges|merge limit/i.test(r)) return 'cap';
-  return 'other';
+  if (/^not AI-generated|not human-cleared/.test(r)) return 'not-certified';
+  if (/^base is not /.test(r)) return 'off-base';
+  if (/CodeQL/i.test(r)) return 'codeql-failed';
+  if (/empty\/whitespace description/.test(r)) return 'empty-body';
+  if (/could not re-read the PR fresh|head SHA .*unknown|fresh re-read carried no head/.test(r)) return 'stale-read';
+  if (/tamper|test-gaming|escalat/i.test(r)) return 'escalated';
+  // Still named, never "other": the verbatim reason rides on the row so the next rule is a one-line addition.
+  return 'unrecognized-reason';
 }
 
 const keyOf = (x) => `${x?.repo ?? ''}#${x?.num}`;
@@ -62,11 +72,22 @@ export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = []
   }
   for (const x of parked) put(x, 'parked', (x.reasons || []).join('; '), 'parked');
   for (const v of verdicts) {
-    if (v.decision === 'merge') {
-      // Listed ready at pass start but never landed and never reported by a bucket above: say so explicitly.
-      put(v, 'other', 'ready at pass start but not landed and no bucket recorded why', 'unaccounted');
+    if (v.decision === 'merge') continue;
+    let kind = classifySkipReason(v.reason);
+    if (kind === 'unrecognized-reason' && v.escalated === 'yes') kind = 'escalated';
+    put(v, kind, v.reason, 'skipped');
+  }
+  // Listed ready at pass start but never landed and never reported by a bucket above. Name the cause: a couple
+  // partner (same item) that did not land, else the pass simply ended before reaching it.
+  for (const v of verdicts) {
+    if (v.decision !== 'merge') continue;
+    const partner = v.item == null ? null : verdicts.find((o) => o !== v && o.item != null && String(o.item) === String(v.item)
+      && keyOf(o) !== keyOf(v) && !landed.has(keyOf(o)));
+    if (partner) {
+      const pr = rows.get(keyOf(partner));
+      put(v, 'partner-pending', `couple partner ${keyOf(partner)} did not land (${pr ? pr.kind : 'ready, not reached'}${pr?.reason ? `: ${pr.reason}` : ''})`, 'unaccounted');
     } else {
-      put(v, classifySkipReason(v.reason), v.reason, 'skipped');
+      put(v, 'ready-not-reached', 'ready at pass start; the pass ended before it was reached (cap, budget or dependency order)', 'unaccounted');
     }
   }
   return [...rows.values()];

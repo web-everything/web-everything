@@ -642,9 +642,9 @@ Run \`npx vitest run\` with \`${test}\` (strip the locus prefix).
       copyFileSync(join(ROOT, 'scripts/check-standards.mjs'), join(repo, 'scripts/check-standards.mjs'));
       const runGate = (args) => {
         const result = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', ...args], {
-          cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 180_000,
+          cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 360_000,
         });
-        expect(result.error, result.stderr).toBeUndefined();
+        expect(result.error, `${result.error?.code} ${result.stderr}`).toBeUndefined();
         const report = JSON.parse(result.stdout);
         return { ...report, status: result.status };
       };
@@ -682,14 +682,95 @@ Run \`npx vitest run\` with \`${test}\` (strip the locus prefix).
 
       git(['update-ref', '-d', 'refs/remotes/origin/main']);
       const noBase = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', ...local], {
-        cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 180_000,
+        cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 360_000,
       });
       expect(noBase.status).toBe(1);
       expect(noBase.stderr).toContain('Cannot enforce backlog scope guards');
     } finally {
       rmSync(temp, { recursive: true, force: true });
     }
-  }, 480_000); // ~150s alone across the several full-gate spawns; a loaded machine needs headroom
+  }, 1_200_000); // ~150-320s alone across the several full-gate spawns; the verify runner's load doubled it and tripped the old 180s/480s caps
+
+  it('sibling smell warning through check:standards, quiet once the note is added', () => {
+    const temp = mkdtempSync(join(tmpdir(), 'we-sibling-smell-'));
+    const repo = join(temp, 'repo');
+    const card = 'backlog/xsmell1-sibling-smell-fixture.md';
+    const content = (note) => `---
+kind: task
+status: open
+dateOpened: "2026-10-07"
+scope: ["we:scripts/conveyor/health-smells/proof-only-4419.mjs"]
+---
+# Exercise the new-probe lint
+
+Add a probe.
+
+${note}
+`;
+    try {
+      execFileSync('git', ['clone', '--quiet', '--shared', ROOT, repo], { stdio: 'pipe' });
+      symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
+      // The shared clone has only committed state: overlay the files under test.
+      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs']) copyFileSync(join(ROOT, f), join(repo, f));
+      // The gate's scope guards need an origin/main base ref; a clone of a CI checkout has none (the empty-stdout failure).
+      execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo });
+      const warnings = () => {
+        const r = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', '--local', `--files=${card}`], {
+          cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 360_000,
+        });
+        expect(r.error, r.stderr).toBeUndefined();
+        expect(r.stdout, `gate exited ${r.status} with no JSON: ${r.stderr}`).not.toBe('');
+        return JSON.stringify(JSON.parse(r.stdout).warnings);
+      };
+      writeFileSync(join(repo, card), content('No note here.'));
+      expect(warnings()).toMatch(/new health smell/);
+      writeFileSync(join(repo, card), content('Sibling smells grepped: none overlap.'));
+      expect(warnings()).not.toMatch(/new health smell/);
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  }, 480_000);
+
+  it('sibling smell warning through check:standards, quiet once the note is added', () => {
+    const temp = mkdtempSync(join(tmpdir(), 'we-sibling-smell-'));
+    const repo = join(temp, 'repo');
+    const card = 'backlog/xsmell1-sibling-smell-fixture.md';
+    const content = (note) => `---
+kind: task
+status: open
+dateOpened: "2026-10-07"
+scope: ["we:scripts/conveyor/health-smells/proof-only-4419.mjs"]
+---
+# Exercise the new-probe lint
+
+Add a probe.
+
+${note}
+`;
+    try {
+      execFileSync('git', ['clone', '--quiet', '--shared', ROOT, repo], { stdio: 'pipe' });
+      // The backlog guards need a base ref. A CI checkout is detached, so the shared clone has no
+      // origin/main of its own: pin one to HEAD instead of relying on the developer's local branches.
+      execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo, stdio: 'pipe' });
+      symlinkSync(join(ROOT, 'node_modules'), join(repo, 'node_modules'), 'dir');
+      // The shared clone has only committed state: overlay the files under test.
+      for (const f of ['scripts/check-standards.mjs', 'scripts/check-standards-rules.mjs']) copyFileSync(join(ROOT, f), join(repo, f));
+      const warnings = () => {
+        const r = spawnSync(process.execPath, ['scripts/check-standards.mjs', '--json', '--local', `--files=${card}`], {
+          cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 180_000,
+        });
+        expect(r.error, r.stderr).toBeUndefined();
+        expect(r.stdout, `check:standards exit ${r.status}: ${r.stderr}`).not.toBe('');
+        return JSON.stringify(JSON.parse(r.stdout).warnings);
+      };
+      writeFileSync(join(repo, card), content('No note here.'));
+      expect(warnings()).toMatch(/new health smell/);
+      writeFileSync(join(repo, card), content('Sibling smells grepped: none overlap.'));
+      expect(warnings()).not.toMatch(/new health smell/);
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  }, 480_000);
 
   it('corpus ratchet: guards 4 + 5 over the real backlog stay within the measured ceiling', () => {
     const matter = require('gray-matter');

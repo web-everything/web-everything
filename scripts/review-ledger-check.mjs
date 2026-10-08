@@ -33,15 +33,21 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 import {
-  AGREEMENT, DISAGREE_DIRECTION, compareLedgerToLabels, foldRepo, labelVerdictOf, summarizeAgreement,
-  verdictLedgerPath,
+  AGREEMENT, DISAGREE_DIRECTION, compareLedgerToLabels, foldRepo, labelVerdictOf, parseLedgerEvents,
+  summarizeAgreement, verdictLedgerPath,
 } from './lib/verdict-ledger.mjs';
+import { derivePrState } from './lib/pr-state.mjs';
+import { readPrFacts } from './lib/pr-state-io.mjs';
+import { LIFECYCLE_STATES } from './conveyor/pr-lifecycle.mjs';
+import { newRunRecord } from './operations/run-record.mjs';
+import { newRunId, writeRun } from './operations/run-store.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 
-const DEFAULT_REPO = 'web-everything/web-everything';
+export const DEFAULT_REPO = 'web-everything/web-everything';
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
 
 /**
@@ -154,6 +160,144 @@ export function renderReport({ repo, rows, summary, path, showAll = false }) {
   return lines.join('\n');
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+// SLICE F (#3930) — CHECKER V2: DERIVED LABELS vs LIVE LABELS, ALL MIRRORED FAMILIES. REPORT-ONLY.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+// `derivePrState(...).labels` is what the label mirror WILL write once the ledger is the authority. This compares
+// that to the labels that are live today, one family at a time, and appends ONE run record per run so a week of
+// runs is the evidence slice L waits for. It writes no label and touches no PR.
+
+/** The label families the mirror writes, in report order. A label belongs to the first family whose test it passes. */
+export const LABEL_FAMILIES = Object.freeze([
+  // Only the four labels the mirror renders; other `review:` labels (`review:awaiting-advisory`) are not the mirror's to remove.
+  { family: 'review', owns: (l) => ['review:pending', 'review:changes', 'review:human', 'review:accepted'].includes(l) },
+  { family: 'ruling-needed', owns: (l) => l === 'advisory:ruling-needed' },
+  { family: 'ready-to-merge', owns: (l) => l === 'ready-to-merge' },
+  { family: 'ci-failed', owns: (l) => l === 'ci:failed' },
+]);
+
+/** Every label some lifecycle state renders must land in a family, or a new mirrored label would go unchecked. */
+export function unfamilied(states = LIFECYCLE_STATES) {
+  const all = new Set(states.flatMap((row) => row.renderLabels ?? []));
+  return [...all].filter((l) => !LABEL_FAMILIES.some((f) => f.owns(l))).sort();
+}
+
+const names = (labels) => (Array.isArray(labels) ? labels : [])
+  .map((l) => (typeof l === 'string' ? l : l?.name)).filter((n) => typeof n === 'string');
+
+/** Split label names into the mirrored families. Labels outside every family (`ci:passing`, `bug`) are not ours. Pure. */
+export function labelsByFamily(labels) {
+  const out = Object.fromEntries(LABEL_FAMILIES.map((f) => [f.family, []]));
+  for (const n of new Set(names(labels))) {
+    const fam = LABEL_FAMILIES.find((f) => f.owns(n));
+    if (fam) out[fam.family].push(n);
+  }
+  for (const k of Object.keys(out)) out[k].sort();
+  return out;
+}
+
+/**
+ * Compare derived to live, per family. `missing` = derived but not live (the mirror would ADD it); `extra` = live
+ * but not derived (the mirror would REMOVE it). Pure.
+ * @returns {Array<{family: string, derived: string[], live: string[], missing: string[], extra: string[], agree: boolean}>}
+ */
+export function compareDerivedLabels({ derived = [], live = [] } = {}) {
+  const d = labelsByFamily(derived);
+  const l = labelsByFamily(live);
+  return LABEL_FAMILIES.map(({ family }) => {
+    const missing = d[family].filter((n) => !l[family].includes(n));
+    const extra = l[family].filter((n) => !d[family].includes(n));
+    return { family, derived: d[family], live: l[family], missing, extra, agree: !missing.length && !extra.length };
+  });
+}
+
+/**
+ * One PR's derived-vs-live row. `events` is this PR's ledger rows, or `null` when the ledger (or the facts) could
+ * not be read: that is `unreadable`, which is NEVER scored as agreement or as drift (we do not know).
+ * @returns {{pr: number, status: 'agree'|'mismatch'|'unreadable', lifecycleState: string|null, families: Array, reason?: string}}
+ */
+export function deriveRow({ pr, repo, events, facts, liveLabels, settings = {} }) {
+  if (events == null) return { pr, status: 'unreadable', lifecycleState: null, families: [], reason: 'the verdict ledger could not be read' };
+  if (!facts || (facts.probeErrors ?? []).some((e) => /^GitHub PR/.test(e))) {
+    return { pr, status: 'unreadable', lifecycleState: null, families: [], reason: 'the GitHub facts for this PR could not be read' };
+  }
+  const mine = events.filter((e) => e.pr === pr && String(e.repo).toLowerCase() === repo.toLowerCase());
+  const derived = derivePrState(mine, { ...facts, repo, pr }, settings);
+  const families = compareDerivedLabels({ derived: derived.labels, live: liveLabels });
+  return { pr, status: families.every((f) => f.agree) ? 'agree' : 'mismatch', lifecycleState: derived.lifecycleState, families };
+}
+
+/** Roll the per-PR rows up per family. `unreadable` PRs are counted apart, never inside a family. Pure. */
+export function summarizeDerived(rows = []) {
+  const perFamily = Object.fromEntries(LABEL_FAMILIES.map((f) => [f.family, { compared: 0, agree: 0, disagree: 0 }]));
+  const mismatches = [];
+  let unreadable = 0;
+  for (const r of rows) {
+    if (r.status === 'unreadable') { unreadable += 1; continue; }
+    for (const f of r.families) {
+      perFamily[f.family].compared += 1;
+      perFamily[f.family][f.agree ? 'agree' : 'disagree'] += 1;
+      if (!f.agree) mismatches.push({ pr: r.pr, family: f.family, lifecycleState: r.lifecycleState, live: f.live, derived: f.derived, missing: f.missing, extra: f.extra });
+    }
+  }
+  return { total: rows.length, agree: rows.filter((r) => r.status === 'agree').length,
+    mismatch: rows.filter((r) => r.status === 'mismatch').length, unreadable, perFamily, mismatches };
+}
+
+/** The human lines for the derived comparison. Pure. */
+export function renderDerived(summary) {
+  const lines = ['', 'DERIVED vs LIVE LABELS (report only; nothing is changed)'];
+  for (const [family, c] of Object.entries(summary.perFamily)) {
+    lines.push(`  ${family.padEnd(15)} compared ${c.compared} · agree ${c.agree} · disagree ${c.disagree}`);
+  }
+  for (const m of summary.mismatches) {
+    lines.push(`  mismatch #${m.pr} ${m.family} (${m.lifecycleState}): live=[${m.live.join(',')}] derived=[${m.derived.join(',')}]`);
+  }
+  if (summary.unreadable) lines.push(`  unreadable: ${summary.unreadable} PR(s) (not scored as agree or disagree)`);
+  return lines.join('\n');
+}
+
+/** This PR set's ledger events. Absent file = no rows; any other read failure = `null` (unreadable, never empty). */
+export function readRepoEvents(repo, { read = readFileSync, pathOf = verdictLedgerPath } = {}) {
+  try {
+    return parseLedgerEvents(read(pathOf(repo), 'utf8'));
+  } catch (e) {
+    return e?.code === 'ENOENT' ? [] : null;
+  }
+}
+
+/**
+ * The ONE run record a check appends. It reuses the operations run record shape, so it lands in the shared runs
+ * folder (`OPERATION_RUNS_DIR` wins) next to every other run. Pure given `id` and `at`.
+ */
+export function buildCheckRunRecord({ id, repo, at, summary, phase1 }) {
+  const rec = newRunRecord({ id, op: 'review-ledger-check', input: { repo, at } });
+  rec.findings = { derived: { total: summary.total, agree: summary.agree, mismatch: summary.mismatch, unreadable: summary.unreadable,
+    perFamily: summary.perFamily, mismatches: summary.mismatches }, phase1 };
+  rec.verdict = summary.mismatch || summary.unreadable ? 'drift' : 'clean';
+  return rec;
+}
+
+/** Append the run record. Never throws: a failed record write is reported, not fatal to a report-only checker. */
+export function appendCheckRun({ repo, summary, phase1, at = new Date().toISOString(), write = writeRun, mintId = newRunId }) {
+  try {
+    const record = buildCheckRunRecord({ id: mintId('review-ledger-check'), repo, at, summary, phase1 });
+    return { ok: true, id: record.id, path: write(record) };
+  } catch (e) {
+    return { ok: false, error: String(e?.message ?? e) };
+  }
+}
+
+/** Build the derived rows for the open PRs. `readFacts` is injectable; CLI default is the live reader. */
+export function buildDerivedRows({ repo, prs, events, readFacts = readPrFacts, settings = {} }) {
+  return prs.filter((p) => Number.isInteger(p?.number)).sort((a, b) => a.number - b.number).map((p) => {
+    let facts = null;
+    try { facts = readFacts(p.number); } catch { facts = null; }
+    return deriveRow({ pr: p.number, repo, events, facts, liveLabels: names(p.labels), settings });
+  });
+}
+
 function parseFlags(argv) {
   const flags = {};
   for (const a of argv) {
@@ -187,10 +331,17 @@ function main(argv) {
   const summary = summarizeAgreement(rows);
   const path = verdictLedgerPath(repo);
 
+  // Slice F. The facts reader is bound to the default repo, so another repo's PRs are reported unreadable.
+  const events = readRepoEvents(repo);
+  const derivedRows = buildDerivedRows({ repo, prs, events, readFacts: repo === DEFAULT_REPO ? undefined : () => null });
+  const derived = summarizeDerived(derivedRows);
+  const run = flags['no-record'] === true ? { ok: false, skipped: true } : appendCheckRun({ repo, summary: derived, phase1: { total: summary.total, counts: summary.counts, phase2Safe: summary.phase2Safe } });
+
   if (flags.json) {
-    writeAllSync(1, `${JSON.stringify({ repo, path, rows, summary }, null, 2)}\n`);
+    writeAllSync(1, `${JSON.stringify({ repo, path, rows, summary, derived: { ...derived, rows: derivedRows }, run }, null, 2)}\n`);
   } else {
-    writeAllSync(1, `${renderReport({ repo, rows, summary, path, showAll: flags.all === true })}\n`);
+    writeAllSync(1, `${renderReport({ repo, rows, summary, path, showAll: flags.all === true })}${renderDerived(derived)}\n`);
+    if (!run.ok && !run.skipped) process.stderr.write(`review-ledger-check: run record not written — ${run.error}\n`);
   }
   process.exit(summary.dangerous.length ? 1 : 0);
 }

@@ -778,6 +778,15 @@ describe('stale-waiter reap (xaipsbs)', () => {
 // "Test plan (each fails before the fix)" bullets.
 
 describe('loadAdmissionDecision (pure)', () => {
+  it.each([
+    [[null, undefined, 40], { held: false, idlePct: 40 }],
+    [[null, undefined], { held: false, idlePct: null, reason: 'no-sample' }],
+    [[0], { held: true, idlePct: 0 }],
+    [['40', '60'], { held: false, idlePct: 50 }],
+  ])('omits nullish idle entries but preserves zero and numeric strings: %j', (idlePctSamples, expected) => {
+    expect(loadAdmissionDecision({ idlePctSamples })).toMatchObject(expected);
+  });
+
   it('admits when idle stays comfortably above the floor, pressure is normal, and load1/cores sits under the backstop (#4343 test-plan case 1)', () => {
     const d = loadAdmissionDecision({ idlePctSamples: [29.6, 31, 35, 40], pressureLevel: 1, load1: 27.7, cores: 12 });
     expect(d.held).toBe(false);
@@ -1027,14 +1036,41 @@ describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable roo
     expect(readLatestLoad({ root: telemetryRoot, now: NOW }).idlePctSamples).toEqual([5]);
   });
 
+  it.each([
+    [null, 63, [37]],
+    [null, null, []],
+    [undefined, null, []],
+    [null, undefined, []],
+    [undefined, undefined, []],
+    [0, 63, [0]],
+    [null, 0, [100]],
+    ['40', 63, [40]],
+    [null, '63', [37]],
+    ['invalid', 63, [37]],
+    [null, 'invalid', []],
+  ])('handles nullish idle/busy readings through the reader and admission path: idle=%j busy=%j', (idlePct, busy, expected) => {
+    // Build directly: busyLine's default argument would replace an explicitly missing busy value.
+    writeFileSync(join(telemetryRoot, `${dayKey}.jsonl`), JSON.stringify({
+      event: 'metric', name: 'host.cpu.busy_pct', timestamp: NOW.toISOString(),
+      value: busy, attributes: { idle_pct: idlePct },
+    }) + '\n');
+    expect(readLatestLoad({ root: telemetryRoot, now: NOW }).idlePctSamples).toEqual(expected);
+    const decision = resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW });
+    expect(decision).toMatchObject({ idlePct: expected[0] ?? null, held: expected[0] === 0 });
+    if (!expected.length) expect(decision.reason).toBe('no-sample');
+  });
+
   it('host.mem.pressure_level reads the LATEST sample only, never a median across the window — unlike idle_pct, an earlier "warn" reading must not linger once a later sample says "normal" again', () => {
     const file = join(telemetryRoot, `${dayKey}.jsonl`);
     writeFileSync(file, [
-      metricLine('host.mem.pressure_level', 1, '2026-09-25T12:59:00.000Z'),
-      metricLine('host.mem.pressure_level', 2, '2026-09-25T12:59:30.000Z'), // a transient "warn" blip
+      metricLine('host.mem.pressure_level', 2, '2026-09-25T12:59:00.000Z'),
+      metricLine('host.mem.pressure_level', 2, '2026-09-25T12:59:30.000Z'), // median would still be "warn"
       metricLine('host.mem.pressure_level', 1, '2026-09-25T13:00:00.000Z'), // back to "normal" — this is the latest
     ].join(''));
     expect(readLatestLoad({ root: telemetryRoot, now: NOW }).pressureLevel).toBe(1);
+    expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({
+      pressureLevel: 1, minPressureLevel: 2, held: false,
+    });
   });
 
   it('a missing day file reads as all-null/empty — not a read error', () => {
@@ -1119,6 +1155,37 @@ describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable roo
 });
 
 describe('the `load-status` CLI mode as a real process (#4343)', () => {
+  it.each([
+    [null, 1, null, 'admitted — mem pressure 1 (threshold 2)'],
+    [null, 2, null, 'HELD — mem pressure 2 (>=2)'],
+    [40, 1, null, 'admitted — cpu idle 40.0% (min 15%)'],
+    [null, 1, 4, 'admitted — mem pressure 1 (threshold 2)'],
+    [40, 2, 4, 'HELD — mem pressure 2 (>=2)'],
+    [null, 1, 20, 'HELD — load1 20.00/4 cores (5.00 > backstop 4)'],
+  ])('reports pressure and preserves held/idle/backstop precedence: idle=%j pressure=%j load1=%j', (idle, pressure, load1, text) => {
+    const telemetryRoot = mkdtempSync(join(tmpdir(), 'load-admission-cli-test-'));
+    try {
+      const now = new Date();
+      const timestamp = now.toISOString();
+      const records = [metricLine('host.mem.pressure_level', pressure, timestamp)];
+      if (idle != null) records.push(busyLine(idle, timestamp));
+      if (load1 != null) records.push(metricLine('host.cpu.load1', load1, timestamp), metricLine('host.cpu.count', 4, timestamp));
+      writeFileSync(join(telemetryRoot, `${utcDayKey(now)}.jsonl`), records.join(''));
+      const env = { ...process.env };
+      for (const key of ['CI', LOAD_ADMISSION_SWITCH_ENV, LOAD_ADMISSION_MIN_IDLE_PCT_ENV,
+        LOAD_ADMISSION_MIN_PRESSURE_LEVEL_ENV, LOAD_ADMISSION_BACKSTOP_PER_CORE_ENV, LOAD_ADMISSION_WINDOW_ENV]) delete env[key];
+      const args = [CLI, 'load-status', `--load-root=${telemetryRoot}`];
+      expect(execFileSync(process.execPath, args, { encoding: 'utf8', env })).toBe(`${text}\n`);
+      const decision = JSON.parse(execFileSync(process.execPath, [...args, '--json'], { encoding: 'utf8', env }));
+      expect(decision).toMatchObject({
+        held: text.startsWith('HELD'), pressureLevel: pressure, minPressureLevel: 2,
+        idlePct: idle, perCore: load1 == null ? null : load1 / 4,
+      });
+    } finally {
+      rmSync(telemetryRoot, { recursive: true, force: true });
+    }
+  });
+
   it('prints the admitted/held verdict as JSON, driven by --load-root + --min-idle-pct (the idle% path)', () => {
     const telemetryRoot = mkdtempSync(join(tmpdir(), 'load-admission-cli-test-'));
     try {
@@ -1251,7 +1318,9 @@ describe('the `load-status` CLI mode as a real process (#4343)', () => {
       expect(admittedBackstop).toMatch(/^admitted — load1 4\.00\/4 cores \(1\.00, backstop 4\)/);
 
       // 3. genuinely nothing sampled at all — the true "no sample" case.
-      const noSample = execFileSync(process.execPath, [CLI, 'load-status', `--load-root=${mkdtempSync(join(tmpdir(), 'load-admission-empty-'))}`], { encoding: 'utf8', env });
+      const emptyRoot = join(telemetryRoot, 'empty');
+      mkdirSync(emptyRoot);
+      const noSample = execFileSync(process.execPath, [CLI, 'load-status', `--load-root=${emptyRoot}`], { encoding: 'utf8', env });
       expect(noSample).toMatch(/^admitted — no sample\n$/);
     } finally {
       rmSync(telemetryRoot, { recursive: true, force: true });

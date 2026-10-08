@@ -528,6 +528,17 @@ describe('xp0lsdi quota routing boundary', () => {
     expect(calls).toEqual([]);
     expect(releases).toEqual([expect.objectContaining({ owner: 'own-attempt', kind: 'ci-heal' })]);
   });
+  it('passes the routeHeal decision to the sink as `routing` for red-ci, behind and codeql heals (x8cnbii review)', async () => {
+    const route = { outcome: 'ok', probationWorker: { id: 'codex', supervision: 'full' }, policyRoute: 'p' };
+    for (const reason of ['red-ci', 'behind', 'codeql']) {
+      const { calls, sinks } = recordingSink();
+      await dispatchCiHeal({ ...PLANNED, reason, codeql: { alerts: [] } }, { readBrief: () => TEMPLATE, sinks, routeHeal: () => route });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].routing).toBe(route);
+      // only a codeql heal forces the native worker (the probation prompt does not carry the alert)
+      expect(calls[0].probationWorker).toEqual(reason === 'codeql' ? null : route.probationWorker);
+    }
+  });
   it('blocks direct retry while an earlier attempt has unpublished accounting', async () => {
     const { calls, sinks } = recordingSink();
     expect(await dispatchCiHeal(PLANNED, { sinks, pollAttempts: () => [{ status: 'unresolved', error: 'publication failed' }] })).toEqual({ held: true, reason: 'publication failed' });

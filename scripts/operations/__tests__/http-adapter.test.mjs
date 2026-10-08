@@ -23,6 +23,7 @@
  * file into `node:os`'s tmpdir and removes it in the same test.
  */
 
+import { types } from 'node:util';
 import { describe, it, expect, afterEach } from 'vitest';
 import { createServer } from 'node:http';
 import { get as httpGet, request as httpRequest } from 'node:http';
@@ -68,11 +69,13 @@ import { RUNNER_ACTIVITY_OP } from '../runner-activity.mjs';
 import { PR_OWNERSHIP_OP } from '../pr-ownership.mjs';
 import { DAEMON_STATUS_OP } from '../daemon-status.mjs';
 import { HEAVY_QUEUE_OP } from '../heavy-queue.mjs';
+import { PRE_PR_CHECK_OP } from '../pre-pr-check.mjs';
 import { FREE_SCOPE_OP } from '../free-scope.mjs';
 import { MAINTENANCE_OP } from '../maintenance.mjs';
 import { REVIEW_SEAT_CAPS_OP } from '../review-seat-caps.mjs';
 import { LIVE_STATE_OP } from '../live-state.mjs';
 import { LIVE_WORK_OP } from '../live-work.mjs';
+import { SESSIONS_OP } from '../sessions.mjs';
 import { ROUTE_PR_OUTCOME_OP } from '../route-pr-outcome.mjs';
 import { STALE_STATE_OP } from '../stale-state.mjs';
 import { AGENT_ACTIVITY_OP } from '../agent-activity.mjs';
@@ -138,7 +141,9 @@ function idMinter() {
 }
 
 /** Build the two declarations and a `resolve`/`names` pair over them — the adapter's whole per-repo wiring. */
-function wiring({ readerOptions, sinks = {}, board = BOARD } = {}) {
+function wiring({ readerOptions, sinks: given = {}, board = BOARD } = {}) {
+  // E2: every review-pr run ends at the additive ledger-events step; a no-op sink keeps these runs complete.
+  const sinks = types.isProxy(given) ? given : { [REVIEW_EFFECTS.LEDGER_EVENTS]: async () => ({ written: [], missed: [] }), ...given };
   const table = {
     [REVIEW_PR_OP]: () => ({ declaration: reviewPrOperation({ readPr: stubReader(readerOptions) }), sinks }),
     [SUGGEST_NEXT_OP]: () => ({
@@ -381,6 +386,9 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // declaring module imports only `registry.mjs` and `step-kinds.mjs`, and every `admissionStatus`/`ps`/
     // `git`/lane-lease read lives in `heavy-queue-io.mjs` behind the injected `collect` reader.
     [HEAVY_QUEUE_OP]: 'heavy-queue.mjs',
+    // xcbwt4r — READ-ONLY: both steps are `compute`; the declaring module imports only `registry.mjs`, `step-kinds.mjs` and
+    // the pure `../lib/pre-pr-commands.mjs`. The git/receipt read lives in `pre-pr-check-io.mjs` behind the injected `check` reader.
+    [PRE_PR_CHECK_OP]: 'pre-pr-check.mjs',
     // free-scope (handoff rules 21/26) — READ-ONLY: both steps are `compute`; the declaring module imports only
     // `registry.mjs`, `step-kinds.mjs` and the pure `../readiness/scope-lease.mjs` matcher. The gh/registry/card
     // reads live in `free-scope-io.mjs` behind the injected `collect` reader.
@@ -396,6 +404,9 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // and `session-verdicts.mjs#isPermissionWait`, and every `claude agents`/review-job/lane-lease/transcript-
     // mtime/pid-liveness/heavy-queue read lives in `live-work-io.mjs` behind the injected `collect` reader.
     [LIVE_WORK_OP]: 'live-work.mjs',
+    // Card x4z1vez (Plateau /sessions S2) — READ-ONLY and genuinely so: both steps are `compute`; the declaring
+    // module's reads are injected (`sessions-io.mjs` is bound only in `run.mjs`).
+    [SESSIONS_OP]: 'sessions.mjs',
     // #xrpo1 — READ-ONLY and genuinely so: both steps are `compute`, the declaring module imports only
     // `registry.mjs` and `step-kinds.mjs`, and the `deriveReviewDisposition`/`parseEscalationReason` calls
     // live in `route-pr-outcome-io.mjs` behind the injected reader — see that file's header for why the call
@@ -480,7 +491,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
   it('every operation registered as read-only declares in a module that reaches nothing that can act', () => {
     const readOnly = Object.keys(OPERATIONS).filter((name) => isReadOnlyOperation(resolveOperation(name).declaration));
     // Pinned, not derived: adding a read-only operation must be a deliberate edit here.
-    expect(readOnly.sort()).toEqual(['health-respond', AGENT_ACTIVITY_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, HEAVY_QUEUE_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_STATUS_OP, PR_RECONCILE_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP].sort());
+    expect(readOnly.sort()).toEqual(['health-respond', AGENT_ACTIVITY_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, HEAVY_QUEUE_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_STATUS_OP, PR_RECONCILE_OP, PRE_PR_CHECK_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, SESSIONS_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP].sort());
     for (const name of readOnly) {
       const { external } = importGraph(resolvePath(OPS_DIR, DECLARING_MODULE[name]));
       expect(external, `\`${name}\` declares in ${DECLARING_MODULE[name]}, which must import nothing that can act`)
@@ -543,7 +554,7 @@ describe('describe — one declaration, one description', () => {
   it('the index lists every declared operation and whether it can write', async () => {
     const res = await handleOperationRequest({ method: 'GET', url: '/operations' }, { ...wiring(), newRunId: idMinter() });
     expect(res.body.operations).toEqual([
-      { op: REVIEW_PR_OP, readOnly: false, describe: '/operations/review-pr', steps: ['read(compute)', 'judge(judge)', 'judgeSecurity(judge)', 'reduce(compute)', 'mandatoryReferrals(effect)', 'referralVerdict(compute)', 'advise(effect)', 'confirm(confirm)', 'stageVerdict(effect)', 'record(effect)'] },
+      { op: REVIEW_PR_OP, readOnly: false, describe: '/operations/review-pr', steps: ['read(compute)', 'judge(judge)', 'judgeSecurity(judge)', 'reduce(compute)', 'mandatoryReferrals(effect)', 'referralVerdict(compute)', 'advise(effect)', 'confirm(confirm)', 'stageVerdict(effect)', 'record(effect)', 'ledgerEvents(effect)'] },
       { op: SUGGEST_NEXT_OP, readOnly: true, describe: '/operations/suggest-next', steps: ['board(compute)', 'shortlist(compute)'] },
     ]);
   });
@@ -647,7 +658,8 @@ describe('genericity — the adapter knows nothing about either operation', () =
     );
     expect(done.status).toBe(200);
     expect(done.body.stopped).toBe('complete');
-    expect(applied).toEqual([]);
+    // E2: the only effect an abstain applies is the additive ledger-events write.
+    expect(applied.filter((a) => a.type !== REVIEW_EFFECTS.LEDGER_EVENTS)).toEqual([]);
   });
 
   it('refuses an answer to a question that has not been asked — the CLI stop point, over HTTP', async () => {
@@ -750,7 +762,7 @@ describe('genericity — the adapter knows nothing about either operation', () =
     expect(cli.run.id).toBe('review-pr-reverse');
     expect(store.read('review-pr-reverse').findings.confirm).toBe('abstain');
     // `abstain` declares no effects, so nothing was applied on either surface.
-    expect(store.read('review-pr-reverse').effects).toEqual([]);
+    expect(store.read('review-pr-reverse').effects.filter((e) => e.type !== REVIEW_EFFECTS.LEDGER_EVENTS)).toEqual([]);
   });
 
   it('keeps the repo sanitisation — in the operation\'s io shell, not in the generic adapter', async () => {

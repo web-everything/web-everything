@@ -47,7 +47,9 @@ export function machinePrTitle({ repo = 'WE', item, kind, card, subject: fallbac
   const guarded = /^File the prevention guard\(s\) owed by (\S+)#(\d+)'s/i.exec(subject);
   const descriptive = /^Prevention — (.+) \(from \S+#(\d+) review\)$/i.exec(subject);
   if (guarded || descriptive) {
-    subject = descriptive?.[1] || firstFinding(card?.raw);
+    // A guard card with no numbered finding still has its own title: reword it, never fall to the placeholder.
+    subject = descriptive?.[1] || firstFinding(card?.raw)
+      || (guarded ? 'prevention guards owed' : '');
     suffix = ` (from #${(guarded || descriptive)[2]} review)`;
   }
   // Planning may precede the metadata read. Publication rejects this explicit sentinel.

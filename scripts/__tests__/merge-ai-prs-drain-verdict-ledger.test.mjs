@@ -17,8 +17,8 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { recordDrainVerdict } from '../merge-ai-prs.mjs';
-import { VERDICTS, AGREEMENT, readVerdictLedger, foldRepo, compareLedgerToLabels } from '../lib/verdict-ledger.mjs';
+import { recordDrainVerdict, recordParkVerdict, recordDrainHold, drainHoldReasonCode } from '../merge-ai-prs.mjs';
+import { VERDICTS, AGREEMENT, readVerdictLedger, foldRepo, compareLedgerToLabels, parseLedgerEvents, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 import { REVIEW_LABELS, decideReviewGate } from '../lib/review-escalation.mjs';
 
 describe('merge-ai-prs — #3215 recordDrainVerdict: the drain\'s own holds, ledgered', () => {
@@ -148,8 +148,8 @@ describe('merge-ai-prs — #3215 recordDrainVerdict: the drain\'s own holds, led
 describe('merge-ai-prs — #3215 wiring: the park site writes the ledger BEFORE the `gh` label call', () => {
   const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
 
-  it('recordDrainVerdict is called exactly once, at the drain\'s park site', () => {
-    expect(src.match(/recordDrainVerdict\(\{ repo:/g) || []).toHaveLength(1);
+  it('recordDrainVerdict is called at the ordinary park site plus (E3 #3929) the manifest-tamper and test-gaming re-parks', () => {
+    expect(src.match(/recordDrainVerdict\(\{ repo:/g) || []).toHaveLength(3);
   });
 
   it('the call sits inside the shouldApplyReviewLabel guard, AHEAD of the `gh pr edit --add-label` transport call', () => {
@@ -163,5 +163,92 @@ describe('merge-ai-prs — #3215 wiring: the park site writes the ledger BEFORE 
 
   it('the wired call passes the SAME label the gate decided and the drain\'s own headSha — never a re-derived value', () => {
     expect(src).toContain('recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: gate.applyLabel, reason: v.reason, headSha: v.headSha ?? null })');
+  });
+});
+
+// ── E3 (#3929) — the remaining hold writers, ledgered ALONGSIDE the label (strictly additive) ──────────────────
+describe('E3 #3929 — re-park rows, producer rows and drain-hold events', () => {
+  let dir;
+  const prevDir = process.env.WE_VERDICT_LEDGER_DIR;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'we-e3-ledger-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+  });
+  afterEach(() => {
+    if (prevDir === undefined) delete process.env.WE_VERDICT_LEDGER_DIR;
+    else process.env.WE_VERDICT_LEDGER_DIR = prevDir;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(`${dir}-locks`, { recursive: true, force: true });
+  });
+  const events = (repo) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8')); } catch { return []; } };
+
+  it('a producer park row names the producer, not the drain, and carries the head', () => {
+    const r = recordParkVerdict({ repo: 'o/n', pr: 601, applyLabel: REVIEW_LABELS.human, reason: 'gate-self', headSha: 'abc1234', declaredActor: 'producer', source: 'pr-land' });
+    expect(r.ok).toBe(true);
+    const rows = readVerdictLedger('o/n');
+    expect(rows[0]).toMatchObject({ pr: 601, verdict: VERDICTS.HUMAN, clears: false, source: 'pr-land' });
+    expect(rows[0].actor.declared).toBe('producer');
+    expect(rows[0].coverage.headSha).toBe('abc1234');
+  });
+
+  it('recordParkVerdict fails soft: bad repo and unknown label never throw and never write', () => {
+    expect(() => recordParkVerdict({ repo: 'nope', pr: 1, applyLabel: REVIEW_LABELS.pending, declaredActor: 'producer', source: 'pr-land' })).not.toThrow();
+    expect(recordParkVerdict({ repo: 'nope', pr: 1, applyLabel: REVIEW_LABELS.pending, declaredActor: 'producer', source: 'pr-land' }).ok).toBe(false);
+    expect(recordParkVerdict({ repo: 'o/n', pr: 1, applyLabel: 'x:y', declaredActor: 'producer', source: 'pr-land' }).ok).toBe(false);
+    expect(readVerdictLedger('o/n')).toHaveLength(0);
+  });
+
+  it('a re-park row is a HUMAN drain row, and a ledger append failure still reports ok:false without throwing', () => {
+    expect(recordDrainVerdict({ repo: 'o/n', pr: 602, applyLabel: REVIEW_LABELS.human, reason: 'manifest baseline mismatch', headSha: 'bbb2222' }).ok).toBe(true);
+    expect(readVerdictLedger('o/n')[0]).toMatchObject({ pr: 602, verdict: VERDICTS.HUMAN, source: 'merge-ai-prs' });
+    process.env.WE_VERDICT_LEDGER_DIR = join(dir, 'a-file-not-a-dir', '\0bad');
+    expect(() => recordDrainVerdict({ repo: 'o/n', pr: 603, applyLabel: REVIEW_LABELS.human })).not.toThrow();
+  });
+
+  it('drain-hold: a new reason appends exactly one event; the same reason again appends none; a change appends one more', () => {
+    const a = recordDrainHold({ repo: 'o/n', pr: 700, reason: 'required check "test" is pending (2/5)' });
+    expect(a).toMatchObject({ ok: true, appended: true });
+    const again = recordDrainHold({ repo: 'o/n', pr: 700, reason: 'required check "test" is pending (3/5)' });
+    expect(again).toMatchObject({ ok: true, appended: false });
+    const holds = () => events('o/n').filter((e) => e.type === 'hold');
+    expect(holds()).toHaveLength(1);
+    expect(holds()[0]).toMatchObject({ pr: 700, holdSource: 'drain', source: 'merge-ai-prs' });
+    expect(recordDrainHold({ repo: 'o/n', pr: 700, reason: 'merge conflict with main' }).appended).toBe(true);
+    expect(holds()).toHaveLength(2);
+    expect(recordDrainHold({ repo: 'o/n', pr: 701, reason: 'merge conflict with main' }).appended).toBe(true);
+  });
+
+  it('drain-hold never touches the verdict fold, and never throws on a failing append', () => {
+    recordDrainHold({ repo: 'o/n', pr: 702, reason: 'blocked' });
+    expect(foldRepo('o/n').get(702)).toBeUndefined();
+    const boom = () => { throw new Error('disk full'); };
+    let r;
+    expect(() => { r = recordDrainHold({ repo: 'o/n', pr: 703, reason: 'x', append: boom }); }).not.toThrow();
+    expect(r.ok).toBe(false);
+  });
+
+  it('drainHoldReasonCode masks numbers and shas so a counter change is not a reason change', () => {
+    expect(drainHoldReasonCode('pending (2/5) abcdef1234')).toBe(drainHoldReasonCode('pending (3/5) 0123456789'));
+    expect(drainHoldReasonCode('')).toBe('unspecified');
+    expect(drainHoldReasonCode('x'.repeat(500)).length).toBeLessThanOrEqual(100);
+  });
+
+  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+  it('wiring: both re-park sites ledger BEFORE their label call, only inside the new-label guard', () => {
+    for (const marker of ['manifest baseline mismatch', 'test-gaming suspected']) {
+      const at = src.indexOf(marker);
+      const guard = src.indexOf('if (parkDecision.addLabel && shouldApplyReviewLabel(parkDecision.addLabel, v.prLabels)) {', at);
+      const led = src.indexOf('recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: parkDecision.addLabel', guard);
+      const gh = src.indexOf("'--add-label', parkDecision.addLabel]", guard);
+      expect(guard).toBeGreaterThan(at);
+      expect(led).toBeGreaterThan(guard);
+      expect(gh).toBeGreaterThan(led);
+    }
+  });
+  it('wiring: drain-hold runs only on a live (non-dry-run) pass, for drain-owned skips, before the skip stamping', () => {
+    const dry = src.indexOf('E3 (#3929, plan R8) — a held/skipped PR');
+    expect(dry).toBeGreaterThan(src.lastIndexOf('if (!DRY_RUN) {', dry) - 1);
+    expect(src.slice(dry, dry + 900)).toContain('v.certifyLabel || v.aiGenerated');
+    expect(src.indexOf('recordDrainHold({ repo:', dry)).toBeLessThan(src.indexOf("postDrainReasonComment(v.repo, v.num, 'skip'", dry));
   });
 });

@@ -284,6 +284,10 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
     node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} \
       --head="$EXAMINED_HEAD" --outcome=needs-human "${CI_AUTH_ARGS[@]}" --reason="<name the actual finding>"
     ```
+    When the red is `main`'s own defect (it reproduces on a merge with main and the PR's diff is not implicated),
+    add `--cause=main-defect` to that command. The conveyor then refreshes the PR onto main ONCE after main's
+    required check is green on a newer main (knob `WE_MAIN_DEFECT_REBASES_PER_SHA`), and the new head clears the
+    `needs-human` label. Never add it when the diff itself is implicated.
     Then report `#{{ITEM_NUM}} → ci-heal escalated (needs human)`. The review gate (if any) still
     owes a human verdict; a human handles it via `/finish`.
   - **`waiting-on-system-fix` — narrow, and ONLY when BOTH hold:** (1) the red is caused by the CI TOOLING/GATE
@@ -402,6 +406,18 @@ and **AWAIT its returned report as the verdict** — the same converge-before-ha
 uses ([delivery-agent-brief.md](delivery-agent-brief.md) step 6). Confirm the repair addresses the failing check
 and introduces no new problem. Address every finding to convergence (fix it, or dismiss it with a one-line reason).
 A trivial, obviously-correct heal (a clean merge with no code change) may skip the subagent.
+
+**Pre-PR review, when a heal is itself risky (same rule `open-pr` applies).** After you commit and BEFORE step 4's `request`
+(or while its verify runs), ask the risk check on your lane:
+
+```bash
+node "{{WE_ROOT}}/scripts/operations/run.mjs" pre-pr-check --checkout="$LANE"
+```
+
+`pre-pr-check: not gated` — nothing more to do. `pre-pr-check: gated` — it prints the exact commands: run the
+`/converge` flow (`node "{{WE_ROOT}}/scripts/converge-cli.mjs" init …`, drive `step` to `land`, commit the fixes) and stamp
+`node "{{WE_ROOT}}/scripts/converge-cli.mjs" receipt --lane="$LANE" --state="$LANE/.converge-state.json"`, as the delivery brief's step 6 does
+([delivery-agent-brief.md](delivery-agent-brief.md)). `$LANE` is your lane clone's absolute root (`pwd` at its top level).
 
 ### 6. Commit (before step 4's request) — the harness re-pushes it to the SAME lane ref
 

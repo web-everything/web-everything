@@ -33,6 +33,14 @@ describe('machine PR titles', () => {
     expect(itemNumsFromPr('lane/xjhjcjn-prevention-card', title)).not.toContain('3158');
     expect(deliveredHashFromPr('lane/xjhjcjn-prevention-card', title)).toBeNull();
   });
+  it('derives a guard card title without the placeholder when the card has no numbered finding', () => {
+    const title = machinePrTitle({ item: 4410, kind: 'prepare', card: {
+      title: "File the prevention guard(s) owed by chalbert/web-everything#2855's independent review",
+      raw: '# File the prevention guard(s) owed by chalbert/web-everything#2855\n\nFiled mechanically on approval.',
+    } });
+    expect(title).toBe('WE #4410: prepare — prevention guards owed (from #2855 review)');
+    expect(() => assertMachineTitle(title)).not.toThrow();
+  });
   it('retains duplicate grouping and hash delivery without crediting a cited PR', () => {
     const title = machinePrTitle({ item: 4333, kind: 'build', card });
     const groups = groupPrsByDeliveredItem([{ number: 1, title }, { number: 2, title }]);

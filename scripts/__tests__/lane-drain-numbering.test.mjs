@@ -1267,3 +1267,39 @@ describe('finalizeLand under a contended numbering lock (review #2668)', () => {
     }
   });
 });
+
+describe('xsjn0uf-incident — a bornAs already numbered on origin/main is never minted a second number', () => {
+  const BODY = '# Same card\n\nIdentical body.\n';
+  const seedMain = () => {
+    write(QUEUED_REL, JSON.stringify({ queued: [] }));
+    write('backlog/5319-same-card.md', `---\nbornAs: xdup001\nkind: story\nstatus: open\n---\n${BODY}`);
+    write('backlog/5320-other.md', '---\nkind: story\nstatus: open\nblockedBy: [xdup001]\n---\nOther\n');
+    git('add', '.'); git('commit', '-qm', 'card numbered on main');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+  };
+
+  it('drops an identical re-landed hash copy: no second NNN, one bornAs on the tree, refs point at the original', () => {
+    seedMain();
+    write('backlog/xdup001-same-card.md', `---\nkind: story\nstatus: open\n---\n${BODY}`);
+    write('backlog/xnew002-fresh.md', '---\nkind: story\nstatus: open\nblockedBy: [xdup001]\n---\nFresh\n');
+    git('add', '.'); git('commit', '-qm', 'second PR re-lands the same card + a new one');
+    const r = numberPendingHashes(repo);
+    expect(r.committed).toBe(true);
+    expect(r.droppedDuplicates.map((d) => d.hash)).toEqual(['xdup001']);
+    expect(r.assigned.map((a) => a.hash)).toEqual(['xnew002']); // the genuinely new card still numbers
+    expect(r.assigned[0].nnn).toBe('5321');
+    expect(backlogNames()).toEqual(['5319-same-card.md', '5320-other.md', '5321-fresh.md']);
+    expect(readFileSync(join(repo, 'backlog/5321-fresh.md'), 'utf8')).toContain('blockedBy: [5319]');
+    expect(git('status', '--porcelain').trim()).toBe('');
+  });
+
+  it('holds (does not drop, does not mint) a copy whose body differs from the numbered card', () => {
+    seedMain();
+    write('backlog/xdup001-same-card.md', '---\nkind: story\nstatus: open\n---\n# Same card\n\nDIFFERENT.\n');
+    git('add', '.'); git('commit', '-qm', 'divergent re-land');
+    const r = numberPendingHashes(repo);
+    expect(r.assigned).toEqual([]);
+    expect(r.held.map((h) => h.hash)).toEqual(['xdup001']);
+    expect(backlogNames()).toEqual(['5319-same-card.md', '5320-other.md', 'xdup001-same-card.md']);
+  });
+});

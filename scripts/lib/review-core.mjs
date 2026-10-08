@@ -226,6 +226,17 @@ export const GUARANTEE_NEEDS_A_TEST_RULE = [
   'prose is the only thing in a diff that nothing checks. Watch',
   'DEFAULTS in particular — a default value quietly satisfying a check written for the explicit value is the',
   'single most common shape here.',
+  // #4418 — RISKS-TO-TEST-PLAN TRACEABILITY. The same coverage question, asked of a backlog card's own prose.
+  'When the material you were given contains a backlog card with a Risks section and a Test plan section (each',
+  'under a heading or a bold label), enumerate each explicit behavioral constraint in its Risks and find the',
+  'matching Test plan entry: the repository-qualified test file, the named test case, and the observable assertion',
+  'that pins the constraint. A generic "unit-test the reader" does not satisfy it. For a bounded read the',
+  'assertion must be on the bytes read or the read range, not merely a successful parse; for isolated degradation',
+  'it must show unrelated fields stay available after a failure. An absent mapping is a COVERAGE finding. In a',
+  'preparation review accept a concrete PLANNED test (name it as planned), not one already implemented; in an',
+  'implementation review inspect the actual test when you can. If the Risks or Test plan section is absent from',
+  'the material you were given, report that limitation and do not invent missing coverage. With no tools, label',
+  'the mapping unverified, as above.',
 ].join(' ');
 
 /**

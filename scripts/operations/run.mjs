@@ -65,6 +65,8 @@ import { daemonStatusOperation, DAEMON_STATUS_OP } from './daemon-status.mjs';
 import { collectDaemonStatus } from './daemon-status-io.mjs';
 import { heavyQueueOperation, HEAVY_QUEUE_OP } from './heavy-queue.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
+import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from './pre-pr-check.mjs';
+import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
 import { createMaintenanceSinks } from './maintenance-io.mjs';
 import { freeScopeOperation, FREE_SCOPE_OP } from './free-scope.mjs';
@@ -75,6 +77,8 @@ import { liveStateOperation, LIVE_STATE_OP } from './live-state.mjs';
 import { collectLiveState } from './live-state-io.mjs';
 import { liveWorkOperation, LIVE_WORK_OP } from './live-work.mjs';
 import { collectLiveWork } from './live-work-io.mjs';
+import { sessionsOperation, SESSIONS_OP } from './sessions.mjs';
+import { createSessionHistoryReader, createLiveCollector } from './sessions-io.mjs';
 import { routePrOutcomeOperation, ROUTE_PR_OUTCOME_OP } from './route-pr-outcome.mjs';
 import { createRouteOutcomeReader } from './route-pr-outcome-io.mjs';
 import { createHistoryReader } from './gate-health-io.mjs';
@@ -324,6 +328,13 @@ export const OPERATIONS = Object.freeze({
     declaration: heavyQueueOperation({ collect: collectHeavyQueue }),
     sinks: {},
   }),
+  // xcbwt4r — "is this lane's head gated by the pre-PR review, and what do I run?". Read-only (every step is
+  // `compute`, so no sinks); the real `checkPrePrReview` read is bound here, and ONLY here.
+  [PRE_PR_CHECK_OP]: () => ({
+    declaration: prePrCheckOperation({ check: createPrePrCheckReader() }),
+    sinks: {},
+    finish: finishPrePrCheckOutcome,
+  }),
   // Card 105 — the maintenance pause (start|status|end). Effects go through `createMaintenanceSinks`, sink bound ONLY here.
   [MAINTENANCE_OP]: () => ({
     declaration: maintenanceOperation(),
@@ -505,6 +516,12 @@ export const OPERATIONS = Object.freeze({
   // liveness probe, the heavy-admission pool) are bound here, and ONLY here.
   [LIVE_WORK_OP]: () => ({
     declaration: liveWorkOperation({ collect: collectLiveWork }),
+    sinks: {},
+  }),
+  // Card x4z1vez (Plateau /sessions, S2) — one row per session: live-work rows plus ended Claude jobs inside
+  // `--ended-within`. Read-only, no sinks. Reads bound in `./sessions-io.mjs`.
+  [SESSIONS_OP]: () => ({
+    declaration: sessionsOperation({ collectLive: createLiveCollector(), readHistory: createSessionHistoryReader() }),
     sinks: {},
   }),
 });

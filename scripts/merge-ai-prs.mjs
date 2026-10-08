@@ -127,6 +127,7 @@ import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } fro
 // beside `latestRequiredCheck`) for why `collapseRollupToLatestPerName`/`rollupRowKind` now live in their own
 // dependency-free `./lib/rollup-collapse.mjs` rather than here.
 import { collapseRollupToLatestPerName, rollupRowKind } from './lib/rollup-collapse.mjs';
+import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs';
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
 import { execFileSync, execFile, spawnSync } from 'node:child_process';
@@ -178,7 +179,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
-import { buildVerdictRecord, appendVerdict, labelVerdictOf } from './lib/verdict-ledger.mjs';
+import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
 import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 // x2e120n — per-step pass timing ("why so slow", the resident drain daemon's history.jsonl carried only a
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
@@ -419,13 +420,8 @@ export function latestRequiredCheck(pr, requiredCheck = 'test') {
  * PR #4236 landed red with a high-severity alert; this closes that gap in the drain. It only ADDS a refusal.
  * A missing/malformed file falls back to ON (fail closed).
  */
-export const CODEQL_CHECK_NAME = 'CodeQL';
-export function loadDrainGateSettings(path = join(dirname(fileURLToPath(import.meta.url)), 'drain-gate-settings.json')) {
-  try {
-    const raw = JSON.parse(readFileSync(path, 'utf8'));
-    return { drainBlocksOnCodeQL: raw?.drainBlocksOnCodeQL !== false };
-  } catch { return { drainBlocksOnCodeQL: true }; }
-}
+// CODEQL_CHECK_NAME / loadDrainGateSettings live in ./lib/codeql-gate.mjs (card x8cnbii) so the fix daemon reads the SAME gate.
+export { CODEQL_CHECK_NAME, loadDrainGateSettings };
 const DRAIN_GATE_SETTINGS = loadDrainGateSettings();
 
 /** Did the latest `CodeQL` check on this PR conclude FAILURE (new alerts)? Pure; an absent/pending/passing CodeQL is false. */
@@ -2593,16 +2589,66 @@ const auditLineFor = (x) => x.hasManifest ? manifestAuditLine(x) : undefined;
  * @returns {{ok: boolean, errors: string[]}}
  */
 export function recordDrainVerdict({ repo, pr, applyLabel, reason = '', headSha = null } = {}) {
+  return recordParkVerdict({ repo, pr, applyLabel, reason, headSha, declaredActor: 'drain', source: 'merge-ai-prs' });
+}
+
+/**
+ * E3 (#3929) — the ONE verdict-row writer behind every hold-label writer: the drain's ordinary park
+ * ({@link recordDrainVerdict}), its manifest-tamper and test-gaming re-parks, and `pr-land`'s producer parks.
+ * Only the provenance (`declaredActor`, `source`) differs, so a producer row never claims to be the drain's.
+ * STRICTLY ADDITIVE and FAIL-SOFT: it never throws and its result is advisory, so a ledger miss can never change
+ * whether a PR is held (the label is what holds it). A git write miss on a holding verdict still leaves the home row.
+ * @param {{repo: string, pr: number|string, applyLabel: string, reason?: string, headSha?: string|null, declaredActor: string, source: string}} o
+ * @returns {{ok: boolean, errors: string[]}}
+ */
+export function recordParkVerdict({ repo, pr, applyLabel, reason = '', headSha = null, declaredActor, source } = {}) {
   const verdict = labelVerdictOf([applyLabel]);
   if (!verdict) return { ok: false, errors: [`no VERDICTS member for label ${JSON.stringify(applyLabel)}`] };
   try {
     const appended = appendVerdict(buildVerdictRecord({
       repo, pr, verdict, at: new Date().toISOString(), reason, headSha,
-      declaredActor: 'drain', source: 'merge-ai-prs',
+      declaredActor, source,
     }));
     return appended.ok ? { ok: true, errors: [] } : { ok: false, errors: appended.errors };
   } catch (e) {
     return { ok: false, errors: [String((e && e.message) || e).split('\n')[0]] };
+  }
+}
+
+/**
+ * E3 (#3929, plan R8) — a stable, bounded code for a drain hold/skip reason, so "the reason changed" is a
+ * comparison of codes and not of free text that embeds PR numbers, SHAs or counters. Lowercases, masks hex SHAs
+ * and digit runs, and keeps the lead clause (up to the first `:`, ` — ` or ` [`). Pure.
+ * @param {string} reason
+ * @returns {string}
+ */
+export function drainHoldReasonCode(reason) {
+  const lead = String(reason ?? '').split(/:| — | \[/)[0];
+  const code = lead.toLowerCase().replace(/\b[0-9a-f]{7,40}\b/g, '<sha>').replace(/\d+/g, '#').replace(/\s+/g, ' ').trim();
+  return (code || 'unspecified').slice(0, 100);
+}
+
+/**
+ * E3 (#3929, plan R8) — append ONE `drain-hold` event when the drain's reason for holding a PR changes. Reads the
+ * PR's last drain-hold event from the home ledger; an identical code appends nothing, so a `--watch` loop re-reaching
+ * the same state stays silent. FAIL-SOFT and additive: never throws, never touches a label or a decision.
+ * `read`/`append` are test seams.
+ * @param {{repo: string, pr: number|string, reason: string, read?: Function, append?: Function}} o
+ * @returns {{ok: boolean, appended: boolean, errors: string[]}}
+ */
+export function recordDrainHold({ repo, pr, reason, read, append = appendVerdict } = {}) {
+  try {
+    const reasonCode = drainHoldReasonCode(reason);
+    const readEvents = read ?? ((r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } });
+    const prior = readEvents(repo).filter((e) => e.type === EVENT_TYPES.HOLD && e.holdSource === 'drain' && Number(e.pr) === Number(pr));
+    if (prior.length && prior[prior.length - 1].reasonCode === reasonCode) return { ok: true, appended: false, errors: [] };
+    const written = append(buildLedgerEvent({
+      type: EVENT_TYPES.HOLD, repo, pr, at: new Date().toISOString(), source: 'merge-ai-prs',
+      declaredActor: 'drain', reasonCode, holdSource: 'drain',
+    }));
+    return written.ok ? { ok: true, appended: true, errors: [] } : { ok: false, appended: false, errors: written.errors };
+  } catch (e) {
+    return { ok: false, appended: false, errors: [String((e && e.message) || e).split('\n')[0]] };
   }
 }
 
@@ -4898,6 +4944,10 @@ async function runCli() {
           // have; tracked as a residual rather than guessed at here.
           const parkDecision = decideParkToHuman({ currentLabels: v.prLabels, keepHumanClearance: true });
           if (parkDecision.addLabel && shouldApplyReviewLabel(parkDecision.addLabel, v.prLabels)) {
+            // E3 (#3929) — ledger row FIRST, additive and fail-soft (same posture as the ordinary park): a miss
+            // is reported and never changes the label write below.
+            const ledgered = recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null });
+            if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (E3 #3929, drain re-park, non-fatal) — ${ledgered.errors.join('; ')}\n`);
             try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', parkDecision.addLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
           }
           for (const staleLabel of parkDecision.removeLabels.filter((l) => hasReviewLabel(v.prLabels, l))) {
@@ -4982,6 +5032,10 @@ async function runCli() {
           const keepHumanClearance = hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted) && tamperHeadSha === null;
           const parkDecision = decideParkToHuman({ currentLabels: v.prLabels, keepHumanClearance });
           if (parkDecision.addLabel && shouldApplyReviewLabel(parkDecision.addLabel, v.prLabels)) {
+            // E3 (#3929) — ledger row FIRST, additive and fail-soft (same posture as the ordinary park): a miss
+            // is reported and never changes the label write below.
+            const ledgered = recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null });
+            if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (E3 #3929, drain re-park, non-fatal) — ${ledgered.errors.join('; ')}\n`);
             try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', parkDecision.addLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
           }
           for (const staleLabel of parkDecision.removeLabels.filter((l) => hasReviewLabel(v.prLabels, l))) {
@@ -5296,6 +5350,13 @@ async function runCli() {
   // is re-running on the renumbered tip, nothing for a human to act on yet); an uncertified PR (not a producer
   // PR the drain owns — never comment on an unrelated human PR).
   if (!DRY_RUN) {
+    // E3 (#3929, plan R8) — a held/skipped PR whose drain reason CHANGED gets exactly one `drain-hold` event.
+    // Additive and fail-soft: runs before, and never alters, the stamping below.
+    for (const v of skipped) {
+      if (!v.reason || !(v.certifyLabel || v.aiGenerated)) continue;
+      const held = recordDrainHold({ repo: v.repo || localSlug, pr: v.num, reason: v.reason });
+      if (!held.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger drain-hold append (E3 #3929, non-fatal) — ${held.errors.join('; ')}\n`);
+    }
     for (const v of skipped) {
       if (v.escalated === 'yes' || v.reviewParked || v.collisionHealed) continue;
       if (!(v.certifyLabel || v.aiGenerated)) continue;

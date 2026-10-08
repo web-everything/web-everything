@@ -77,7 +77,7 @@ if (!item) {
   let fm = {};
   try { fm = matter(content).data || {}; } catch { /* unparseable — reported by the frontmatter check below */ }
   const firstPara = body.split('\n').find((l) => l.trim() && !l.startsWith('#')) || '';
-  item = { id, type: fm.type, status: fm.status, batchable: false, summary: firstPara.trim(), blockedBy: fm.blockedBy, deliveryTarget: fm.deliveryTarget };
+  item = { id, type: fm.type, kind: fm.kind, scope: fm.scope, status: fm.status, batchable: false, summary: firstPara.trim(), blockedBy: fm.blockedBy, deliveryTarget: fm.deliveryTarget };
 }
 
 // ── Run the checks ──────────────────────────────────────────────────────────────
@@ -99,6 +99,7 @@ for (const h of colonHits) {
 // Body rendering checks (raw HTML, bad links, buried fork, mis-flagged batchable) — shared with the gate.
 const rendering = lintBacklogItemRendering({
   item, body, pocRegistry: readPocRegistry(), knownBacklogIds: buildBacklogResolvableIds(backlog),
+  fileExists: (rel) => existsSync(join(ROOT, rel)),
 });
 errors.push(...rendering.errors);
 warnings.push(...rendering.warnings);

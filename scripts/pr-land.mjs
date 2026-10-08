@@ -78,6 +78,7 @@
  * state, which auto-retries with backoff and resume-opens the PR once infra recovers (nothing is stranded; the
  * drain stays the sole writer to main). A non-zero exit means `main` was left UNTOUCHED.
  */
+import { defaultShimDir, resolveOrgAwareShimDir, pathWithOrgAwareShim } from './lib/gh-app-shim.mjs';
 import { publicationTitle, readMainCard } from './operations/machine-pr-title.mjs';
 import { producerBuildContext, checkpointBuildPr } from './operations/build-pr-authorship.mjs';
 import { execFileSync } from 'node:child_process';
@@ -98,7 +99,7 @@ import { findDuplicateIds, summarizeDuplicates } from './lib/duplicate-id-tripwi
 // changed-file shape, the diff TEXT and the `diffHunks` contract mapping. Deliberately the ONLY net-diff import
 // here — pr-land does not hold `computeNetDiffText`/`resolveNetDiffBasis`, so it CANNOT hand-roll the mapping
 // the review caught (#2890-review-r2 finding 3); a source guard in pr-land.test.mjs holds that shut.
-import { computeNetDiffSignals } from './merge-ai-prs.mjs';
+import { computeNetDiffSignals, recordParkVerdict } from './merge-ai-prs.mjs';
 import {
   scoreEscalation, parseDeviationDisclosure, producerReviewLabel, shouldApplyReviewLabel, REVIEW_LABEL_META, REVIEW_LABELS,
   reconcileEscalationReasonBlock, reconcileRoster, ROSTER_TIMING,
@@ -138,6 +139,13 @@ function readBodyFile(p) {
 }
 
 const REPO = resolve(expandHome(flags.repo) || process.cwd());
+// xpd70wx — a direct pr-land run whose PATH carries the stale legacy gh shim (no owner map: it cannot see the
+// plateauapp org) swaps it for the daemons' org-aware shim. Only ever replaces the legacy dir; a test's or an
+// operator's own `gh` earlier on PATH is untouched. No token is read or printed.
+if ((process.env.PATH || '').split(':').includes(defaultShimDir())) {
+  const orgPath = pathWithOrgAwareShim({ pathEnv: process.env.PATH || '', orgDir: resolveOrgAwareShimDir() });
+  if (orgPath) process.env.PATH = orgPath;
+}
 const REF = typeof flags.ref === 'string' ? flags.ref : null;
 const SRC = typeof flags.sha === 'string' ? flags.sha : 'HEAD'; // source commit to publish to the lane ref (the lane clone's HEAD)
 const BASE = typeof flags.base === 'string' ? flags.base : 'main';
@@ -783,6 +791,17 @@ function runCli() {
   // 1. Resolve the SOURCE commit to publish (the lane clone's HEAD, or an explicit --sha). No local
   //    branch is created (that's guarded) — the lane model pushes `<source>:lane/<n>` straight to origin.
   const refSha = tryGit(['rev-parse', SRC]);
+  // E3 (#3929) — record the producer's own hold in the verdict ledger, ALONGSIDE the label (strictly additive).
+  // Fail-soft by construction: `recordParkVerdict` never throws, a miss is reported on stderr only, and nothing
+  // here is read by any park / label / land decision. Written BEFORE the label call, like the drain's park.
+  const ledgerProducerHold = (label, reason, prNumber) => {
+    try {
+      const slug = originSlugOf(REPO);
+      if (!slug) return;
+      const r = recordParkVerdict({ repo: slug, pr: prNumber, applyLabel: label, reason, headSha: refSha || null, declaredActor: 'producer', source: 'pr-land' });
+      if (!r.ok && !AS_JSON) process.stderr.write(`pr-land [${REPO}] · verdict-ledger append (E3 #3929, producer hold, non-fatal) for #${prNumber} — ${r.errors.join('; ')}\n`);
+    } catch { /* ledger miss never changes a hold */ }
+  };
   if (!refSha) emit({ repo: REPO, merged: false, reason: 'no-such-src', detail: `source commit "${SRC}" not found — pass --sha=<commit> or run from a checkout whose HEAD carries the lane work` }, 3);
 
   // Derive a title when none was passed: `--fill` can't autofill for a lane/* head (it's remote-only, so
@@ -1109,6 +1128,7 @@ function runCli() {
     if (verdict.label && verdict.apply) {
       const meta = REVIEW_LABEL_META[verdict.label];
       try { forge.ensureLabel(verdict.label, { color: meta.color, description: meta.description }); } catch { /* already exists — fine */ }
+      ledgerProducerHold(verdict.label, verdict.reasons.join('; ') || 'producer review escalation', prNum);
       try { forge.addLabel(prNum, verdict.label); }
       catch (e) { if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not apply review label "${verdict.label}" to #${prNum} (${String(e.message || e).split('\n')[0]}) — land continues\n`); }
       // mechanical-dispatcher — a PR that opens review:human also opens carrying review:awaiting-advisory: the
@@ -1194,6 +1214,7 @@ function runCli() {
     const meta = REVIEW_LABEL_META[parkLabel];
     let parkApplied = false;
     try { forge.ensureLabel(parkLabel, { color: meta.color, description: meta.description }); } catch { /* already exists — fine */ }
+    ledgerProducerHold(parkLabel, `producer --park ${parkLabel}`, prNum);
     try { forge.addLabel(prNum, parkLabel); parkApplied = true; }
     catch (e) { if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not apply park label "${parkLabel}" to #${prNum} (${String(e.message || e).split('\n')[0]}) — the PR IS open; set the label by hand\n`); }
     emit({

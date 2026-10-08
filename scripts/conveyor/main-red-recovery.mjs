@@ -47,7 +47,7 @@
  * actually let finish and CONCLUDE failed, never one merely superseded by the next push.
  * @see we:docs/agent/platform-decisions.md#deterministic-core-thin-judgment
  */
-import { mainBreakEscalationForHead } from './ci-heal-escalation-mark.mjs';
+import { mainBreakEscalationForHead, mainDefectEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { latestRequiredCheck, isRequiredCheckFailed } from '../merge-ai-prs.mjs';
 import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../lib/required-status-checks.mjs';
@@ -351,10 +351,17 @@ export function mainLatestGreenShaForCheck({ failingCheckName = null, mainLatest
  */
 export function isMainGreenFixOwed({
   failingCheckName = null, mainLatestCheckRuns = null, prContainsMainGreenSha = null, mergeBaseCheckRuns = null,
-  mergeBaseRunConclusion = null, comments = [], headSha = null,
+  mergeBaseRunConclusion = null, comments = [], headSha = null, failureCompletedAt = null,
 } = {}) {
   if (!isMainLatestCheckGreen({ failingCheckName, mainLatestCheckRuns })) return false;
   if (prContainsMainGreenSha !== false) return false;
+  // xo7mr6l — LIVE 2026-10-08, #4368/#4369: main's bad commit came AFTER the PRs branched and its own CI run was
+  // cancelled, so no red window and no red merge base exist, yet ci-heal correctly escalated "main's own defect".
+  // Once main's check is green on a run that finished AFTER this PR's failure and this head lacks that commit, one
+  // refresh is owed. Bounded: head-scoped escalation (the refresh moves the head), plus the per-sha rebase cap.
+  const defect = mainDefectEscalationForHead(comments, headSha);
+  const greenAt = Date.parse(collapseMainCheckRunsToLatestPerName(mainLatestCheckRuns).get(failingCheckName)?.completed_at);
+  if (defect && greenAt > Date.parse(failureCompletedAt)) return true;
   if (isMainLatestCheckGreen({ failingCheckName, mainLatestCheckRuns: mergeBaseCheckRuns })) return false;
   // #3239: cancelled main runs can leave no historical red check to read. A
   // trusted, head/check-specific diagnosis supplies attribution, but recovery must
@@ -454,16 +461,54 @@ export function isPrCiFailureOwedRerun({
   prContainsMainGreenSha = null, mergeBaseCheckRuns = null, mergeBaseRunConclusion = null,
   comments = [], headSha = null, prScopedChecks = resolvePrScopedChecks(), mainFixedSignature = null,
 } = {}) {
-  // A PR-scoped check (DEFAULT_PR_SCOPED_CHECKS) fails on the PR's own content — a rebase never clears it.
-  if (failingCheckName && prScopedChecks.includes(failingCheckName)) return false;
   const behind = Number.isFinite(aheadBy) ? aheadBy : null;
   if (behind === 0) return false; // already current — neither path below can still owe a rerun (point 2).
+  return classifyMainDefect({
+    requiredCheckCompletedAt, mainRedWindows, failingCheckName, mainLatestCheckRuns, prContainsMainGreenSha,
+    mergeBaseCheckRuns, mergeBaseRunConclusion, comments, headSha, prScopedChecks, mainFixedSignature,
+  }).mainDefect;
+}
+
+/**
+ * we:scripts/conveyor/main-red-recovery.mjs#classifyMainDefect — THE ONE classifier of "is this PR's red MAIN's
+ * own defect (owed a mechanical refresh onto main) or the PR's own (owed a ci-heal)?". PURE. Both the fix daemon
+ * (`reconcile-core.mjs`, via {@link isPrCiFailureOwedRerun}) and `ci-red-recovery-watch.mjs`
+ * ({@link planMainRedRebases}) call exactly this, so they can never disagree about who owns a PR (LIVE
+ * 2026-10-08, #4368: the daemon said "owed a rebase", the watch said "own failure, owed a ci-heal", each sending
+ * the PR to the other). A red is main's defect when ANY of: (red-window) it failed inside a recorded red-`main`
+ * window; (green-fix) the check now passes on main's latest run with positive evidence — which includes a
+ * head-scoped escalation that recorded "main's own defect" (`escalation: true`); (signature) its error
+ * signatures were fixed on main.
+ * @returns {{mainDefect:boolean, via:('red-window'|'green-fix'|'signature'|null), escalation:boolean,
+ *   attribution:('main-red'|'own-failure'|'unknown'|null)}}
+ */
+export function classifyMainDefect({
+  requiredCheckCompletedAt = null, mainRedWindows = [], failingCheckName = null, mainLatestCheckRuns = null,
+  prContainsMainGreenSha = null, mergeBaseCheckRuns = null, mergeBaseRunConclusion = null,
+  comments = [], headSha = null, prScopedChecks = resolvePrScopedChecks(), mainFixedSignature = null,
+} = {}) {
+  const none = { mainDefect: false, via: null, escalation: false, attribution: null };
+  // A PR-scoped check (DEFAULT_PR_SCOPED_CHECKS) fails on the PR's own content — a rebase never clears it.
+  if (failingCheckName && prScopedChecks.includes(failingCheckName)) return none;
   const attribution = classifyCiFailureAttribution({ failureCompletedAt: requiredCheckCompletedAt, mainRedWindows });
-  if (attribution === 'main-red') return true;
-  return isMainGreenFixOwed({
+  if (attribution === 'main-red') return { mainDefect: true, via: 'red-window', escalation: false, attribution };
+  const escalation = Boolean(mainDefectEscalationForHead(comments, headSha));
+  if (isMainGreenFixOwed({
     failingCheckName, mainLatestCheckRuns, prContainsMainGreenSha, mergeBaseCheckRuns, mergeBaseRunConclusion,
-    comments, headSha,
-  }) || isMainFixedSignatureOwed(mainFixedSignature);
+    comments, headSha, failureCompletedAt: requiredCheckCompletedAt,
+  })) return { mainDefect: true, via: 'green-fix', escalation, attribution };
+  if (isMainFixedSignatureOwed(mainFixedSignature)) return { mainDefect: true, via: 'signature', escalation, attribution };
+  return { ...none, attribution };
+}
+
+/**
+ * we:scripts/conveyor/main-red-recovery.mjs#classifierNeedsComments — does {@link classifyMainDefect} need the
+ * PR's comment thread (to see a recorded main-defect escalation)? Shared by every IO shell so none of them gates
+ * the comment read on a private signal (the watch gated it on a `needs-human` label it never fetched, so it
+ * never saw #4368's escalation). True whenever main's check is green and the PR lacks that green commit.
+ */
+export function classifierNeedsComments({ failingCheckName = null, mainLatestCheckRuns = null, prContainsMainGreenSha = null } = {}) {
+  return prContainsMainGreenSha === false && isMainLatestCheckGreen({ failingCheckName, mainLatestCheckRuns });
 }
 
 /**
@@ -505,7 +550,7 @@ export function isPrCiFailureOwedRerun({
  */
 export function planMainRedRebases({
   candidates = [], mainRedWindows = [], mainLatestCheckRuns = [], maxRebaseRetriesPerSha = DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
-  prScopedChecks = resolvePrScopedChecks(),
+  prScopedChecks = resolvePrScopedChecks(), mainDefectRebaseCap = resolveMainDefectRebaseCap(),
 } = {}) {
   const dispatch = [];
   const refusals = [];
@@ -526,17 +571,17 @@ export function planMainRedRebases({
       refusals.push({ ...base, kind: 'own-failure', why: `PR #${prNumber}'s failing check \`${base.failingCheckName}\` is PR-scoped (judges the PR's own content) — a rebase onto main never clears it; owed a ci-heal` });
       continue;
     }
-    const attribution = classifyCiFailureAttribution({ failureCompletedAt: base.failureCompletedAt, mainRedWindows });
-    // landing-freeze fix — see this function's own docblock and `isMainGreenFixOwed`'s (PR #2793 review: main
-    // green alone is not proof; the candidate must carry the per-PR merge-base / containment evidence too).
-    const mainGreenForCheck = attribution !== 'main-red' && isMainGreenFixOwed({
-      failingCheckName: base.failingCheckName, mainLatestCheckRuns, comments: c?.comments, headSha: base.headSha,
-      prContainsMainGreenSha: c?.prContainsMainGreenSha ?? null, mergeBaseCheckRuns: c?.mergeBaseCheckRuns ?? null,
-      mergeBaseRunConclusion: c?.mergeBaseRunConclusion ?? null,
+    // ONE shared classifier (classifyMainDefect) — the same call the fix daemon's isPrCiFailureOwedRerun makes.
+    const cls = classifyMainDefect({
+      requiredCheckCompletedAt: base.failureCompletedAt, mainRedWindows, failingCheckName: base.failingCheckName,
+      mainLatestCheckRuns, prContainsMainGreenSha: c?.prContainsMainGreenSha ?? null,
+      mergeBaseCheckRuns: c?.mergeBaseCheckRuns ?? null, mergeBaseRunConclusion: c?.mergeBaseRunConclusion ?? null,
+      comments: c?.comments, headSha: base.headSha, prScopedChecks, mainFixedSignature: c?.mainFixedSignature,
     });
-
-    const mainFixed = attribution !== 'main-red' && !mainGreenForCheck && isMainFixedSignatureOwed(c.mainFixedSignature);
-    if (attribution !== 'main-red' && !mainGreenForCheck && !mainFixed) {
+    const attribution = cls.attribution;
+    const mainGreenForCheck = cls.via === 'green-fix';
+    const mainFixed = cls.via === 'signature';
+    if (!cls.mainDefect) {
       refusals.push({
         ...base, kind: attribution === 'unknown' ? 'unknown-attribution' : 'own-failure',
         why: attribution === 'unknown'
@@ -570,10 +615,13 @@ export function planMainRedRebases({
     // own docblock for the full incident this closes: nothing ever bounded a non-conflict rebase failure, so it
     // could retry every tick forever exactly like the pre-fix hung-CI cancel/rerun could.
     const rebaseAttempts = Number.isFinite(c?.rebaseAttemptsForSha) ? c.rebaseAttemptsForSha : 0;
-    if (rebaseAttempts >= maxRebaseRetriesPerSha) {
+    // xo7mr6l: a main-defect-escalated PR gets ONE refresh per main recovery (knob WE_MAIN_DEFECT_REBASES_PER_SHA).
+    const capForPr = mainGreenForCheck && cls.escalation
+      ? mainDefectRebaseCap : maxRebaseRetriesPerSha;
+    if (rebaseAttempts >= capForPr) {
       refusals.push({
         ...base, kind: 'rebase-cap-exhausted', attempts: rebaseAttempts,
-        why: `PR #${prNumber}'s head sha ${base.headSha ?? '?'} already had ${rebaseAttempts} rebase-onto-main attempt(s) that did not clear it (cap ${maxRebaseRetriesPerSha}) — no longer a clean mechanical refresh; this is owed a ci-heal instead of another retry`,
+        why: `PR #${prNumber}'s head sha ${base.headSha ?? '?'} already had ${rebaseAttempts} rebase-onto-main attempt(s) that did not clear it (cap ${capForPr}) — no longer a clean mechanical refresh; this is owed a ci-heal instead of another retry`,
       });
       continue;
     }
@@ -609,6 +657,12 @@ export function planMainRedRebases({
  *  failing against the identical head sha is no longer "bad luck", it is a real signal this pass should stop
  *  absorbing and hand to a `ci-heal` agent instead. */
 export const DEFAULT_MAX_REBASE_RETRIES_PER_SHA = 2;
+
+/** xo7mr6l — refreshes per head for a PR whose escalation blamed main's own defect; env knob, default 1. */
+export function resolveMainDefectRebaseCap(env = process.env) {
+  const n = Number.parseInt(env.WE_MAIN_DEFECT_REBASES_PER_SHA, 10);
+  return Number.isInteger(n) && n >= 0 ? n : 1;
+}
 
 /** we:scripts/conveyor/main-red-recovery.mjs#REBASE_ONTO_MAIN_COMMENT_MARKER — the stable FIRST LINE of the
  *  durable rebase-onto-main comment, mirroring `we:scripts/conveyor/ci-red-recovery-watch.mjs
@@ -991,6 +1045,11 @@ export const DEFAULT_MAX_MISSING_RUN_RETRIES_PER_SHA = 2;
 /** The stable FIRST LINE of the durable missing-run-recovery comment, mirroring
  *  {@link REBASE_ONTO_MAIN_COMMENT_MARKER}/{@link HUNG_CI_COMMENT_MARKER}'s own shape — a distinct marker text
  *  so this cap never cross-counts with either sibling cap. */
+/** The pre-xgq539z credential-refusal text. Those markers were posted because the push token was resolved for the
+ *  wrong owner (a plateauapp PR got a web-everything token), not because GitHub dropped anything, so they are
+ *  uncounted legacy. A refusal posted TODAY carries {@link MISSING_RUN_CREDENTIAL_REFUSAL} and still counts. */
+export const MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL = 'push requires a PAT, user OAuth token, or verified conveyor App installation token';
+export const MISSING_RUN_CREDENTIAL_REFUSAL = 'no eligible push credential for the repository owner (a PAT, user OAuth token, or that owner\'s verified conveyor App installation token)';
 export const MISSING_RUN_COMMENT_MARKER = '🚦 conveyor missing-run-recovery';
 
 /**
@@ -1175,6 +1234,8 @@ export function countMissingRunComments(comments, headSha = null) {
     // Old dispatch attempts cannot produce evaluated PR checks; do not let their
     // exhausted budget prevent the corrected recovery method from running.
     if (/via workflow-dispatch|trigger CI \(workflow-dispatch/.test(body)) continue;
+    // xgq539z — legacy wrong-owner credential refusals (see MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL) are not counted.
+    if (body.includes(MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL)) continue;
     if (headSha && !missingRunBodyHasExactLine(body, `sha: ${headSha}`)) continue;
     n += 1;
   }

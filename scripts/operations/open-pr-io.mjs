@@ -19,9 +19,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { classifySubmit } from './open-pr.mjs';
+import { checkDuplicateBornAs } from '../lib/duplicate-bornas-added.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { buildGhShimSettingsEnv, defaultShimDir, ghShimPathOverride, shimGhPath } from '../lib/gh-app-shim.mjs';
+import { buildGhShimSettingsEnv, defaultShimDir, ghShimPathOverride, shimGhPath, resolveOrgAwareShimDir, pathWithOrgAwareShim } from '../lib/gh-app-shim.mjs';
 
 /**
  * #81 — a lane's ref, when the caller did not name one. `lane/<slug>` from the lane lease's `purpose`
@@ -42,10 +43,16 @@ export function deriveLaneRef({
  * `gh` ran unauthenticated and pr-land reported a false "no credential". Prefer this checkout's shim (App
  * opted in), else the shared shim dir if it exists and is not already first on PATH; else leave env alone.
  */
-export function resolveGhCredentialEnv({ env = process.env, exists = existsSync, build = buildGhShimSettingsEnv } = {}) {
+export function resolveGhCredentialEnv({ env = process.env, exists = existsSync, build = buildGhShimSettingsEnv, orgShimDir = () => resolveOrgAwareShimDir({ exists }) } = {}) {
   try {
     const built = build({ env, pathEnv: env.PATH || '' });
     if (built?.PATH) return { ...env, ...built };
+  } catch { /* fall through */ }
+  // xpd70wx — the target repo may live in ANY constellation org (plateauapp, frontier-ui, web-everything). The
+  // legacy shared shim has no owner map and cannot see plateauapp, so prefer the daemons' org-aware shim.
+  try {
+    const orgPath = pathWithOrgAwareShim({ pathEnv: env.PATH || '', orgDir: orgShimDir() });
+    if (orgPath) return { ...env, PATH: orgPath };
   } catch { /* fall through */ }
   const dir = defaultShimDir();
   if (exists(shimGhPath(dir)) && !(env.PATH || '').split(':').includes(dir)) {
@@ -105,6 +112,8 @@ function failedGate(e, loadSettings) {
  */
 export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(), env = resolveGhCredentialEnv(),
   git = (args) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }),
+  // Real git/gh only when the real spawn is in use: a caller that injected `spawn` is a rehearsal/test and must stay hermetic.
+  dupBornAs = spawn !== spawnSync ? () => [] : (opts) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),
 } = {}) {
   return ({ argv, skipPrePrReview = '', actor = '', operatorInstruction = '' }) => {
     let r;
@@ -128,6 +137,12 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
         catch (e) { return { outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: `bypass refused — ${e.message}` }; }
       }
       if (gate.action === 'advise') process.stderr.write(`open-pr: advisory — ${gate.message}\n`);
+    }
+    // xsjn0uf-incident — advisory: a card this PR adds whose bornAs is already on main / in another open PR.
+    if (!argv.includes('--dry-run')) {
+      let dups = [];
+      try { dups = dupBornAs({ base: arg('base') || 'main', sha: arg('sha') || 'HEAD', branch: arg('branch') || '' }) || []; } catch { dups = []; }
+      for (const w of dups) process.stderr.write(`open-pr: WARNING — duplicate card: ${w}\n`);
     }
     let item;
     try { item = prepareItemFromRef(arg('ref')); } catch (e) { cleanupBody(); throw e; }
