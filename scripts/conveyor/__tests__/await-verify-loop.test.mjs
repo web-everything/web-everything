@@ -163,6 +163,10 @@ describe('glue against the real lock store and settings file', () => {
     reserve(cycleLockRoot(env), CYCLE_LOCK_RESOURCE, 'Mac:2147483', Date.now(), new Date().toISOString(), 2147483, 'unknown', 20);
     expect(await withCycleLock(async () => 'reclaimed', { env })).toBe('reclaimed');
     expect(readLockEntry(cycleLockRoot(env), CYCLE_LOCK_RESOURCE)).toBeNull();
+    // a LIVE holder (e.g. a reused pid) whose lease ran out is reclaimed too — never stuck until cleared by hand
+    const old = Date.now() - 25 * 60_000;
+    reserve(cycleLockRoot(env), CYCLE_LOCK_RESOURCE, 'Mac:live', old, new Date(old).toISOString(), process.pid, 'unknown', 20);
+    expect(await withCycleLock(async () => 'lease-expired', { env, pid: 999_999_2 })).toBe('lease-expired');
   });
   it('R5 against real claims: releases a done session\'s claim and keeps a re-taken one', () => {
     const lockRoot = tmp();
@@ -205,7 +209,9 @@ describe('glue against the real lock store and settings file', () => {
     expect(cycleFailed({ rows: [{ action: 'error', result: 'error: boom' }] })).toBe(true);
     expect(cycleFailed({ rows: [], busy: true })).toBe(true);
     expect(cycleFailed({ rows: [], released: [] })).toBe(false);
-    expect(cycleFailed({ rows: [{ key: 'k', action: 'error', result: 'error: one record' }] })).toBe(false);
+    expect(cycleFailed({ rows: [{ key: 'k', action: 'error', result: 'error: one record' }] })).toBe(true); // every acted record errored
+    expect(cycleFailed({ rows: [{ key: 'k', action: 'error', result: 'error: one' }, { key: 'j', action: 'push', result: 'pushed' }] })).toBe(false);
+    expect(cycleFailed({ rows: [{ key: 'k', action: 'wait' }] })).toBe(false);
   });
   it('the shipped settings file turns the operator-ruled features on (P1/P2)', () => {
     expect(resolveFixerSlotSettings({ env: {} })).toEqual({ awaitVerifyLoopSeconds: 15, parkedReleasesSlot: true, parkedCapFactor: 2, releaseOnCompletion: true });
@@ -292,6 +298,21 @@ describe('runAwaitVerifyCycleDefault against real stores (R5 fail-closed on the 
       const out = await runAwaitVerifyCycleDefault({ allowResume: true, env, settings: ON, passModule });
       expect(out.released.map((r) => r.pr)).toEqual([21]);
       expect(readFixDispatchClaim({ repo: 'we', pr: 21, kind: 'fix' })).toBeNull();
+    } finally { restore(); }
+  });
+  it('the loop path (no allowResume given): an auth gate that throws defers wake-ups', async () => {
+    const { env, restore } = await setup();
+    try {
+      const { writeStoredAwaitVerify } = await import('../await-verify.mjs');
+      writeStoredAwaitVerify(rec(21));
+      const runAwaitVerifyPass = vi.fn(async () => ({ rows: [] }));
+      const passModule = { defaultAwaitVerifyIo: async () => ({ listRecords: () => [], readMarker: () => null }), runAwaitVerifyPass };
+      await runAwaitVerifyCycleDefault({ env, settings: ON, passModule, authGate: () => { throw new Error('probe failed'); } });
+      expect(runAwaitVerifyPass).toHaveBeenCalledWith(expect.objectContaining({ allowResume: false }));
+      runAwaitVerifyPass.mockClear();
+      await runAwaitVerifyCycleDefault({ env, settings: ON, passModule, authGate: () => ({ paused: false }) });
+      expect(runAwaitVerifyPass).toHaveBeenCalledWith(expect.objectContaining({ allowResume: false })); // phase A
+      expect(runAwaitVerifyPass.mock.calls.every(([a]) => a.allowResume === false)).toBe(true); // nothing owed → no phase B
     } finally { restore(); }
   });
   it('setting off: the cycle never releases', async () => {

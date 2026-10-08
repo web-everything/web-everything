@@ -632,7 +632,7 @@ export async function runTickAllRepos({
   // #5137 — FIRST, before any fresh dispatch: a fixer that ended its turn awaiting a verdict is pushed (green,
   // exact sha) or resumed (red) here, so the model never holds a turn open on `check --wait`. Pushing needs no
   // Claude login; resuming does, so a paused login only defers the resume (the record keeps it pending).
-  // xn025gx (R4 push-wake-cadence): with all four fixDispatch push-on-green settings off this is exactly the pass above; with the fast loop
+  // xn025gx (R4 push-wake-cadence): with the three on/off fixDispatch push-on-green settings off this is exactly the pass above; with the fast loop
   // alive the loop owns the pass and this tick skips it; otherwise the tick runs the same R3/R5 cycle under the cycle lock.
   const awaitVerify = awaitVerifyTick ? await awaitVerifyTick({ allowResume: !authGate.paused })
     : (realTick ? await runTickAwaitVerify({ allowResume: !authGate.paused, legacyPass: runAwaitVerifyPassDefault }) : { rows: [] });

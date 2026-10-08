@@ -33,7 +33,7 @@ Fixer audit 2026-10-08: ~70% of fixer time idles until a fix-daemon tick (7-30 m
 ## Edge cases this change must handle
 
 1. **Untrusted text** — the pass's own guards are unchanged (exact sha, `lane/*` ref, claim binding, open PR); the loop adds no push path.
-2. **Truncated reads** — an unreadable await store or claim list makes R2 fall back to the raw claim list (today's count); a missing heartbeat makes the tick run the cycle (R4 fallback).
+2. **Truncated reads** — an unreadable await store makes R2 fall back to the raw claim list (today's count); a missing or stale heartbeat (a cycle that throws, cannot get the lock, or errors on every record) makes the tick run the cycle (R4 fallback); an auth gate that cannot answer defers wake-ups.
 3. **Shared state files** — one cross-process cycle lock (dead holder reclaimed by pid) keeps the loop and the tick from acting on the same record at once.
 4. **Fail closed** — a wait older than its TTL counts as active (R1); R5 keeps the claim when the status, the claim time or the record time is missing, and the R5 sweep is skipped when the wake journal cannot be read or updated.
 5. **Identity scoping** — wait records bind to claims by repo key + PR + kind + session name (or session id); R5 refuses a record from another session id.

@@ -237,7 +237,7 @@ export async function withCycleLock(fn, { env = process.env, pid = process.pid, 
 
 /** The real cycle: verdict pass (R3-gated) + completion release (R5), under the lock. Never throws. */
 export async function runAwaitVerifyCycleDefault({
-  allowResume, env = process.env, settings = resolveFixerSlotSettings({ env }), passModule = null,
+  allowResume, env = process.env, settings = resolveFixerSlotSettings({ env }), passModule = null, authGate = null,
 } = {}) {
   try {
     const out = await withCycleLock(async () => {
@@ -249,11 +249,12 @@ export async function runAwaitVerifyCycleDefault({
       const claims = listFixDispatchClaims(undefined, { liveOnly: true, leaseMinutes: WORKING_CLAIM_WINDOW_MINUTES });
       let resumeOk = allowResume;
       if (resumeOk === undefined) {
-        // The tick passes its own auth gate; the loop asks only when there is a wait to act on.
+        // The tick passes its own auth gate; the loop asks only when there is a wait to act on. A gate that cannot
+        // answer counts as paused: pushes still happen, wake-ups wait (the record keeps them pending).
         resumeOk = true;
         if (listStoredAwaitVerify().length) {
-          const { planClaudeAuthDispatchGate } = await import('./claude-auth-health.mjs');
-          try { resumeOk = !planClaudeAuthDispatchGate().paused; } catch { resumeOk = true; }
+          const gate = authGate ?? (await import('./claude-auth-health.mjs')).planClaudeAuthDispatchGate;
+          try { resumeOk = !gate().paused; } catch { resumeOk = false; }
         }
       }
       const io = await pass.defaultAwaitVerifyIo();
@@ -340,8 +341,13 @@ export function spawnAwaitVerifyLoop({ env = process.env, spawnFn = nodeSpawn, p
   return spawnFn(process.execPath, [SELF, `--parent-pid=${parentPid}`], { stdio: ['ignore', 'inherit', 'inherit'], env });
 }
 
-/** A cycle that threw before doing anything (the one top-level error row). Pure. */
-export const cycleFailed = (result) => Boolean(result?.busy) || (result?.rows ?? []).some((r) => r?.action === 'error' && r.key === undefined);
+/** A cycle that is not healthy: it threw, could not get the lock, or every record it acted on ended in an error. Pure. */
+export function cycleFailed(result) {
+  const rows = result?.rows ?? [];
+  if (result?.busy || rows.some((r) => r?.action === 'error' && r.key === undefined)) return true;
+  const acted = rows.filter((r) => r?.action !== 'wait' && r?.action !== 'skip');
+  return acted.length > 0 && acted.every((r) => r?.action === 'error' || /^error:/.test(String(r?.result ?? '')));
+}
 
 const stamp = (line) => `${new Date().toISOString()} reconcile-fix-dispatch-daemon: ${line}\n`;
 
