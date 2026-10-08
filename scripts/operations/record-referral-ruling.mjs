@@ -49,7 +49,7 @@ import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import {
   activeReferrals, buildOperatorRulingComment, mandatoryReferralState, referralRecordState,
-  validateOperatorRuling, OPERATOR_RULING_RESULTS, operatorRulingId, sameFindingForClearing,
+  validateOperatorRuling, OPERATOR_RULING_RESULTS, AUTO_POLICY_ACTOR, operatorRulingId, sameFindingForClearing,
 } from '../lib/jury-core.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { ignoredRulings } from '../lib/ruling-ledger.mjs';
@@ -171,7 +171,7 @@ export function selectFindings(open, finding) {
 const findingLocation = ({ file, line }) => `${file ?? ''}${line == null ? '' : `:${line}`}`;
 
 /** Decide the handoff after the last pending ruling, preserving blocks from other findings. PURE. */
-export function planRulingFollowUp({ open, selected, ruling, reason, enabled, head }) {
+export function planRulingFollowUp({ open, selected, ruling, reason, enabled, head, actor = '' }) {
   if (!enabled) return null;
   const isSelected = (o) => selected.some((s) => s.runId === o.runId && s.key === o.key);
   // Findings still waiting on a ruling after this one. The ruling comment itself wakes the paused review (the hold
@@ -184,8 +184,9 @@ export function planRulingFollowUp({ open, selected, ruling, reason, enabled, he
       rationale: isSelected(o) ? reason : o.rationale }));
   if (!blocked.length) return { action: 'resume' };
   const prose = (s) => String(s ?? '').replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').replace(/\s+/g, ' ').trim();
-  const body = '### Blocked referral findings (operator ruling)\n\n'
-    + `The operator ruled these mandatory-referral findings \`block\` on head \`${head}\`. Fix each one, then push.\n\n`
+  const byPolicy = actor === AUTO_POLICY_ACTOR;
+  const body = `### Blocked referral findings (${byPolicy ? 'automatic policy ruling' : 'operator ruling'})\n\n`
+    + `${byPolicy ? 'Policy (review.referralDefault=auto-block) ruled' : 'The operator ruled'} these mandatory-referral findings \`block\` on head \`${head}\`. Fix each one, then push.\n\n`
     + blocked.map((o, i) => `${i + 1}. \`${findingLocation(o)}\` (${o.seat}) — ${prose(o.summary)}`
       + (prose(o.rationale) ? `\n   Rationale: ${prose(o.rationale)}` : '')).join('\n');
   return { action: 'send-back', blocked, body };
@@ -195,7 +196,9 @@ export function planRulingFollowUp({ open, selected, ruling, reason, enabled, he
 export function planOperatorRuling(read, input) {
   const { repo, pr, finding, ruling, actor, channel, reason } = input;
   if (!OPERATOR_RULING_RESULTS.includes(ruling)) throw new Error(`--ruling must be one of ${OPERATOR_RULING_RESULTS.join('|')}`);
-  if (!OPERATOR_LOGINS.includes(String(actor ?? '').toLowerCase())) {
+  const byPolicy = String(actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR;
+  if (byPolicy && ruling !== 'block') throw new Error(`--actor=${AUTO_POLICY_ACTOR} may only rule \`block\`; card and not-real are the operator's`);
+  if (!byPolicy && !OPERATOR_LOGINS.includes(String(actor ?? '').toLowerCase())) {
     throw new Error(`--actor must be a registered operator login (${OPERATOR_LOGINS.join(', ')}); this ruling is the operator's`);
   }
   if (!String(reason ?? '').trim()) throw new Error('--reason is required: the operator\'s words, verbatim');
@@ -245,7 +248,7 @@ export function planOperatorRuling(read, input) {
     clearerId: read.clearerId,
   };
   if (!validateOperatorRuling(record)) throw new Error('the operator ruling record failed validation; nothing posted');
-  const followUp = planRulingFollowUp({ open: [...read.open, ...selected.filter((o) => !read.open.some((p) => p.runId === o.runId && p.key === o.key))], selected, ruling, reason, head: read.head,
+  const followUp = planRulingFollowUp({ open: [...read.open, ...selected.filter((o) => !read.open.some((p) => p.runId === o.runId && p.key === o.key))], selected, ruling, reason, head: read.head, actor: String(actor).toLowerCase(),
     enabled: input.sendBack !== false && read.followUpEnabled !== false });
   return { record, body: buildOperatorRulingComment(record), selected, open: read.open, disputed: read.disputed ?? [],
     supersedes: record.rulings.flatMap((r) => r.supersedes ?? []), followUp };
