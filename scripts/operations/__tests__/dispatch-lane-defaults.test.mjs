@@ -340,6 +340,7 @@ describe('#3332 — readTick reaches the REAL `laneRefForPr` default for a fix/c
     // Isolated from the #3457/#3460 already-done ground-truth check below — it shells its OWN `gh` call through
     // the same injected `exec`, and left at its default it would collide with this describe's `gh pr view` spy.
     checkAlreadyDone: () => ({ done: false, pr: null, checked: true }),
+    checkBuildDelivery: () => null,
   };
 
   it('a `fix` launch with no `laneRefForPr` override reaches the REAL `defaultLaneRefForPr` — one `gh pr view` call, argv pinned', () => {

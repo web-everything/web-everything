@@ -2264,6 +2264,7 @@ describe('#3165: the planner\'s prepare lists reach the spawner', () => {
         // #3457/#3460 — stubbed so this suite never shells the real `gh` (readTick calls it lazily whenever a
         // launch clears, and every test here clears one).
         checkAlreadyDone: () => ({ done: false, pr: null, checked: false }),
+        checkBuildDelivery: () => null,
         // #3906 — hermetic routing evidence: no trials, never the host's shared scorecard store.
         readScorecards: () => [],
       }),
@@ -2594,6 +2595,7 @@ describe('#3332: the planner\'s fix and CI-heal lists reach the spawner', () => 
         laneRefForPr: () => laneRef,
         // #3457/#3460 — same stub as the earlier `dispatchThrough` above, and for the same reason.
         checkAlreadyDone: () => ({ done: false, pr: null, checked: false }),
+        checkBuildDelivery: () => null,
         readScorecards: () => [],
       }),
     }));
@@ -2950,6 +2952,16 @@ describe('filterAlreadyDoneCandidates — PURE: which gh pr list rows are real "
     expect(filterAlreadyDoneCandidates([prepPr], '3457')).toEqual([]);
   });
 
+  it('KEEPS a real build whose card slug starts with scope-/prepare- (live PRs #700, #743); still drops the authoring PR on the same shape', () => {
+    // Review of PR #4361: the ref shape alone dropped these real implementations as "authoring".
+    const build700 = merged('WE #2629: prepare-scope agents run an AI review-to-convergence before any human review', 'lane/2629-scope-review-to-convergence', { number: 700 });
+    const build743 = merged('WE #2638: prepare-time jury charter — pre-register jury + expectations', 'lane/2638-prepare-time-jury-charter', { number: 743 });
+    expect(filterAlreadyDoneCandidates([build700], '2629').map((p) => p.number)).toEqual([700]);
+    expect(filterAlreadyDoneCandidates([build743], '2638').map((p) => p.number)).toEqual([743]);
+    const prep = merged('WE #4648: prepare — reconcile dead build run records even after their…', 'lane/4648-prepare-reconcile-dead-build-run-records-even-after-their-dispatch-c', { number: 4363 });
+    expect(filterAlreadyDoneCandidates([prep], '4648')).toEqual([]);
+  });
+
   it('a WORD-BOUNDARY title match — item "343" must not match a PR title mentioning "3435"', () => {
     const pr = merged('WE #3435: mechanically reap/stop finished sessions', 'lane/3435-session-reaper');
     expect(filterAlreadyDoneCandidates([pr], '343')).toEqual([]);
@@ -3297,6 +3309,34 @@ describe('#3110 — a fresh build dispatch\'s attempt tag rides its session slug
   });
 });
 
+describe('shapeDispatchRead — never relaunches a build whose PR is open or merged, or whose card is resolved (xykwe0h)', () => {
+  it('replay #4382: PR #4288 merged -> the build is refused', () => {
+    const v = shapeDispatchRead(tickRead({ resolvedNum: '4382', launch: { num: '4382', lane: 7 }, buildDelivery: { outcome: 'pr-merged', pr: 4288, reason: 'PR #4288 merged' } }), { num: '4382' });
+    expect(v.dispatching).toBe(false);
+    expect(v.sessionSlug).toBeNull();
+    expect(v.prompt).toBeNull();
+    expect(v.holdReason).toContain('pr-merged');
+    expect(v.gates.find((g) => g.name === 'build-delivered')).toMatchObject({ pass: false });
+  });
+  it('an OPEN build PR refuses the launch', () => {
+    const v = shapeDispatchRead(tickRead({ buildDelivery: { outcome: 'pr-open', pr: 4339, reason: 'PR #4339 is open' } }), { num: '3037' });
+    expect(v.dispatching).toBe(false);
+    expect(v.holdReason).toContain('PR #4339');
+  });
+  it('a resolved card refuses the launch', () => {
+    const v = shapeDispatchRead(tickRead({ buildDelivery: { outcome: 'card-resolved', pr: null, reason: 'card #3037 is resolved' } }), { num: '3037' });
+    expect(v.dispatching).toBe(false);
+  });
+  it('no delivery evidence (null) never blocks', () => {
+    const v = shapeDispatchRead(tickRead({ buildDelivery: null }), { num: '3037' });
+    expect(v.gates.find((g) => g.name === 'build-delivered')).toMatchObject({ pass: true });
+  });
+  it('a fix launch is not a build: an open PR is expected there and never blocks', () => {
+    const v = shapeDispatchRead(tickRead({ launch: null, launchKind: 'fix', buildDelivery: { outcome: 'pr-open', pr: 1, reason: 'x' } }), { num: '3037' });
+    expect(v.gates.find((g) => g.name === 'build-delivered')).toMatchObject({ pass: true });
+  });
+});
+
 describe('shapeDispatchRead — refuses a dispatch a real merged PR already shows done (#3457/#3460)', () => {
   const alreadyDonePr = (over = {}) => ({
     number: 1768, url: 'https://github.com/web-everything/web-everything/pull/1768',
@@ -3487,6 +3527,7 @@ describe('readTick — `openBlockers` reaches the read end to end, from `loadIte
     loadItems: () => [{ num: '3398', slug: 'conveyor-supervisor-runner-residency', scope: ['we:scripts/conveyor/'], openBlockers: ['3443'] }],
     listAgents: () => [],
     checkAlreadyDone: () => ({ done: false, pr: null, checked: true }),
+    checkBuildDelivery: () => null,
   };
 
   it('threads `openBlockers` from the loader onto `item`, and `shapeDispatchRead` refuses on it', () => {

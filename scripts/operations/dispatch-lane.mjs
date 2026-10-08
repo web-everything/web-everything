@@ -965,6 +965,32 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes } = {}) {
     };
   }
 
+  // xykwe0h — THE BUILD-DELIVERED REFUSAL. A BUILD whose card already has an OPEN or MERGED build PR, or whose
+  // card is `status: resolved` on origin/main, is not launched again (live: #4382 was relaunched after its PR
+  // merged; #5189 was redone from scratch). `raw.buildDelivery` is the io shell's read ({outcome, pr, reason});
+  // absent or null means "nothing shows it delivered" and never blocks. Build kind only: a fix or ci-heal
+  // legitimately targets a card whose PR is open.
+  const buildDelivery = raw.buildDelivery && typeof raw.buildDelivery === 'object' ? raw.buildDelivery : null;
+  if (blocked('build-delivered', launchKind === 'build' && !!buildDelivery?.outcome, buildDelivery)) {
+    return {
+      ...base,
+      inFlightRuns: [],
+      agedOutRuns,
+      dispatching: false,
+      lane: null,
+      sessionSlug: null,
+      prompt: null,
+      briefUnknownTokens: [],
+      itemSpecPath: null,
+      scope: [],
+      dispatchedGuard: null,
+      buildDelivery,
+      holdReason:
+        `#${resolvedNum} is already delivered (${buildDelivery.outcome}: ${buildDelivery.reason ?? 'see evidence'}) — `
+        + 'refusing to launch a second build for work a real PR or a resolved card already shows done.',
+    };
+  }
+
   // #3462 — THE BLOCKED-ITEM REFUSAL. Checked BEFORE `!launch`, same priority tier as the already-done check
   // just above and for the same reason: `we:scripts/readiness/dispatch-plan.mjs`'s `hasOpenBlockers` hold is
   // only reachable through the automatic sweep, whose queue (`backlog.mjs build-queue`) already excludes any

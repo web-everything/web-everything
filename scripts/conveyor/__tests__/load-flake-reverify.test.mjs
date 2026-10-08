@@ -378,3 +378,53 @@ describe('reverify discovery reads the complete comment thread', () => {
     expect(plan.candidate?.pr.number).toBe(4017);
   });
 });
+
+// Live #4361 (2026-10-08): the pass pushed a held fix onto a bounced PR and never re-armed it, so the PR kept
+// `review:changes` on a head that already was the fix and nobody owned it.
+describe('a pushed fix owes its re-arm (#4361)', () => {
+  const lbls = (...n) => n.map((name) => ({ name }));
+  const bounce = comment('🔁 review — changes requested\n\nblocked referral', '2026-10-04T18:00:00Z');
+  const pushed = comment(buildLoadFlakeResolvedComment({ altSha: 'bbb2222', result: 'pushed' }), '2026-10-04T20:00:00Z');
+  const stuck = (over = {}) => ({ number: 4361, state: 'OPEN', headRefName: 'lane/fix', headRefOid: 'bbb2222',
+    labels: lbls('review:changes', 'review:human'), comments: [bounce, hold, pushed], ...over });
+  const io = (pr) => ({ ...fixture().io, listPrs: vi.fn(async () => [pr]), readPr: vi.fn(async () => pr), rearm: vi.fn() });
+
+  it('catch-up re-arms a bounced PR whose head is the pushed fix', async () => {
+    const pr = stuck(); const fake = io(pr);
+    const out = await runLoadFlakeReverify({}, fake);
+    expect(fake.rearm).toHaveBeenCalledWith('web-everything/web-everything', 4361);
+    expect(out.rearmed).toEqual([{ pr: 4361, sha: 'bbb2222', result: 'rearmed' }]);
+  });
+  it('catch-up runs even when host load defers verification, and never in dry-run', async () => {
+    const fake = io(stuck()); fake.loadavg = () => [50, 50];
+    expect(await runLoadFlakeReverify({ config: reverifyConfig({}) }, fake)).toMatchObject({ deferred: 'host-load', rearmed: [expect.objectContaining({ pr: 4361 })] });
+    const dry = io(stuck());
+    await runLoadFlakeReverify({ dryRun: true }, dry);
+    expect(dry.rearm).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['no review:changes', { labels: lbls('review:human') }],
+    ['head moved past the push', { headRefOid: 'ccc3333' }],
+    ['already re-armed', { comments: [bounce, hold, pushed, comment('🔧 conveyor fix — re-armed for re-review\n\nx', '2026-10-04T20:01:00Z')] }],
+    ['bounced again after the push', { comments: [bounce, hold, pushed, comment('🔁 review — changes requested\n\nagain', '2026-10-04T21:00:00Z')] }],
+    ['push marker from an untrusted author', { comments: [bounce, hold, { ...pushed, author: { login: 'mallory' } }] }],
+  ])('does not re-arm when %s', async (_name, over) => {
+    const fake = io(stuck(over));
+    await runLoadFlakeReverify({}, fake);
+    expect(fake.rearm).not.toHaveBeenCalled();
+  });
+  it('a re-arm failure is reported, never thrown', async () => {
+    const fake = io(stuck()); fake.rearm.mockImplementation(() => { throw new Error('gh 502'); });
+    expect((await runLoadFlakeReverify({}, fake)).rearmed).toEqual([expect.objectContaining({ pr: 4361, result: 'rearm-failed' })]);
+  });
+  it('the push itself re-arms a bounced PR in the same sweep', async () => {
+    const { io: base, pr } = fixture();
+    pr.labels = lbls('review:changes', 'review:human');
+    const after = { ...pr, headRefOid: 'bbb2222', comments: [...pr.comments, pushed] };
+    let pushedYet = false;
+    const fake = { ...base, rearm: vi.fn(), push: vi.fn(() => { pushedYet = true; }),
+      listPrs: vi.fn(async () => [structuredClone(pr)]), readPr: vi.fn(async () => (pushedYet ? after : pr)) };
+    expect(await runLoadFlakeReverify({}, fake)).toMatchObject({ result: 'pushed', rearm: 'rearmed' });
+    expect(fake.rearm).toHaveBeenCalledWith('web-everything/web-everything', 3881);
+  });
+});
