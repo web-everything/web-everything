@@ -1,4 +1,5 @@
 ---
+bornAs: xsij7u6
 kind: story
 size: 3
 status: active
