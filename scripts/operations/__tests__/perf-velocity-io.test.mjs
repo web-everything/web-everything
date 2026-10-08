@@ -8,7 +8,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { collectVelocity, estimatesPath, heldItemText, loadEstimateRows, runEstimates, buildBrief } from '../perf-velocity-io.mjs';
+import { collectVelocity, estimatesPath, heldItemText, loadEstimateRows, runEstimates, buildBrief, stripHtmlComments } from '../perf-velocity-io.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 
 const cardText = (fm) => `---\n${Object.entries(fm).map(([k, v]) => `${k}: ${v}`).join('\n')}\n---\n\n# t\n`;
@@ -74,5 +74,15 @@ describe('runEstimates: calibrate, estimate once, store beside the snapshots', (
     expect(heldItemText('Build held item 129', '', held)).toBe('129. Velocity in perf-snapshot\n129 ADD (operator): backfill');
     expect(heldItemText('Fix a thing', 'card 5319', held)).toBe('');
     expect(buildBrief({ title: 'T', body: 'a<!-- hidden -->b', heldText: 'H' })).toBe('TITLE: T\n\nBODY:\nab\n\nHELD ITEM TEXT:\nH');
+  });
+
+  it('never leaves a comment opener behind, even when stripping splices one together or one is unterminated', () => {
+    expect(stripHtmlComments('<!<!-- x -->--y')).toBe('');
+    expect(stripHtmlComments('a<!-- b')).toBe('a');
+    expect(stripHtmlComments('a<!-- b --><!-- c -->d')).toBe('ad');
+    for (const body of ['<!<!-- x -->-- z', '<<!-- x -->!-- z', 'p<!--', '<!-- a <!-- b --> -->']) {
+      expect(stripHtmlComments(body)).not.toContain('<!--');
+      expect(buildBrief({ title: 'T', body })).not.toContain('<!--');
+    }
   });
 });
