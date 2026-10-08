@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   resolvePrepReviewMode, readPrepReviewModel, prepareCardOnly, readScopeEntries, readDoneWhen, executableCommands,
   deterministicChecks, readModelFindings, buildPrepReviewResult, planPrepReview, reviewPreparePr, runPrepReviewTick,
-  buildPrepReviewMandate, buildPrepReviewInput, PREP_REVIEW_HEADLINE, PREP_REVIEW_LABEL, DEFAULT_PREP_REVIEW_MODEL,
+  buildPrepReviewMandate, buildPrepReviewInput, foldOneLine, PREP_REVIEW_HEADLINE, PREP_REVIEW_LABEL, DEFAULT_PREP_REVIEW_MODEL,
 } from '../prep-review.mjs';
 import { reviewCoverageGaps, reviewRecordKind } from '../../merge-ai-prs.mjs';
 import { missingReviewLabel } from '../reconcile-core.mjs';
@@ -26,7 +26,7 @@ const mkDeps = (over = {}) => {
   return {
     calls,
     deps: {
-      mode: 'advise', repo: 'o/r', readCard: () => card(), exists, checkAlreadyDone: async () => ({ done: false, pr: null, checked: true }),
+      mode: 'advise', repo: 'o/r', readCard: () => card(), exists, readPrAuthor: () => ({ author: bot.author, isCrossRepository: false }), checkAlreadyDone: async () => ({ done: false, pr: null, checked: true }),
       judge: async () => ({ value: cleanModel }),
       provider: {
         postComment: (r, n, b) => calls.comments.push({ r, n, b }), setLabels: (r, n, s) => calls.labels.push({ r, n, ...s }),
@@ -258,16 +258,17 @@ describe('replay of PR 4280: the two noises stop for a prepare PR and ONLY for a
     const { deps, calls } = mkDeps();
     await reviewPreparePr(prepPr({ headRefName: ref }), deps);
     const note = { ...bot, body: calls.comments[0].b };
-    expect(reviewCoverageGaps({ comments: [note], headRef: ref })).toEqual([]);
+    expect(reviewCoverageGaps({ comments: [note], headRef: ref, headSha: 'a'.repeat(40) })).toEqual([]);
   });
   it('a code PR, or an untrusted author, gets no credit for the same heading', async () => {
     const { deps, calls } = mkDeps();
     await reviewPreparePr(prepPr(), deps);
     const body = calls.comments[0].b;
-    expect(reviewCoverageGaps({ comments: [{ ...bot, body }], headRef: 'lane/4300-build-thing' }).map((g) => g.code)).toEqual(['no-recorded-review']);
-    expect(reviewCoverageGaps({ comments: [{ ...bot, body }] }).map((g) => g.code)).toEqual(['no-recorded-review']);
-    expect(reviewCoverageGaps({ comments: [{ author: { login: 'stranger' }, body }], headRef: ref }).map((g) => g.code)).toEqual(['no-recorded-review']);
-    expect(reviewCoverageGaps({ comments: [body], headRef: ref }).map((g) => g.code)).toEqual(['no-recorded-review']);
+    const headSha = 'a'.repeat(40);
+    expect(reviewCoverageGaps({ comments: [{ ...bot, body }], headRef: 'lane/4300-build-thing', headSha }).map((g) => g.code)).toEqual(['no-recorded-review']);
+    expect(reviewCoverageGaps({ comments: [{ ...bot, body }], headSha }).map((g) => g.code)).toEqual(['no-recorded-review']);
+    expect(reviewCoverageGaps({ comments: [{ author: { login: 'stranger' }, body }], headRef: ref, headSha }).map((g) => g.code)).toEqual(['no-recorded-review']);
+    expect(reviewCoverageGaps({ comments: [body], headRef: ref, headSha }).map((g) => g.code)).toEqual(['no-recorded-review']);
   });
   it('a real verdict on a code PR is read exactly as before', () => {
     const accepted = { ...bot, body: '✅ review — accepted\n\nNet basis: `aaaaaaa..bbbbbbb`\n\n| lens | weight | verdict |\n|---|---|---|\n| correctness | mandatory | accept |' };
@@ -293,5 +294,282 @@ describe('the review daemon stage', () => {
     expect(broke.readError).toBe('kaput');
     const ok = await runPrepReviewStage({ env: {}, tick: async (a) => ({ mode: a.deps.mode, reviewed: [], skipped: [], failed: [], readError: null }), makeDeps: () => ({ mode: 'advise' }) });
     expect(ok.mode).toBe('advise');
+  });
+});
+
+// ---- review round on PR 4453: each finding reproduced red, then fixed ---------------------------------------------------
+
+describe('card frontmatter: any valid YAML scope list reads the same', () => {
+  const fm = (scope) => `---\nscope:${scope}\nstatus: open\n---\n`;
+  it('unindented block list, indented block list, quoted and unquoted inline lists, a bare scalar', () => {
+    expect(readScopeEntries(fm('\n- we:a/b.mjs\n- "we:c/d.mjs"'))).toEqual(['we:a/b.mjs', 'we:c/d.mjs']);
+    expect(readScopeEntries(fm('\n  - we:a/b.mjs\n  - \'we:c/d.mjs\''))).toEqual(['we:a/b.mjs', 'we:c/d.mjs']);
+    expect(readScopeEntries(fm(' [we:a/b.mjs, we:c/d.mjs]'))).toEqual(['we:a/b.mjs', 'we:c/d.mjs']);
+    expect(readScopeEntries(fm(' ["we:a/b.mjs", \'we:c/d.mjs\']'))).toEqual(['we:a/b.mjs', 'we:c/d.mjs']);
+    expect(readScopeEntries(fm(' we:a/b.mjs'))).toEqual(['we:a/b.mjs']);
+    expect(readScopeEntries(fm(''))).toEqual([]);
+    expect(readScopeEntries('no frontmatter')).toEqual([]);
+  });
+  it('an unindented list is not a false scope-not-real finding', () => {
+    const raw = `---\nscope:\n- we:scripts/real.mjs\nstatus: open\n---\n\n# T\n\n## Done when\n\n1. \`node scripts/x.test.mjs\` fails then passes.\n\n## Edge cases this change must handle\n\n${edge}\n`;
+    expect(deterministicChecks({ raw, exists, alreadyDone: { done: false, pr: null, checked: true } }).findings).toEqual([]);
+  });
+  it('a malformed scope block degrades to the token scan, never throws', () => {
+    expect(() => readScopeEntries('---\nscope: ["we:a.mjs\n---\n')).not.toThrow();
+  });
+});
+
+describe('a note is bound to the head it reviewed', () => {
+  const ref = 'lane/4382-prepare-item-ci-app-token';
+  const noteFor = async (head) => {
+    const { deps, calls } = mkDeps();
+    await reviewPreparePr(prepPr({ headRefName: ref, headRefOid: head }), deps);
+    return { ...bot, body: calls.comments[0].b };
+  };
+  it('the drain honours a prep note only when its marker head is the head being landed', async () => {
+    const headA = 'a'.repeat(40);
+    const note = await noteFor(headA);
+    expect(reviewCoverageGaps({ comments: [note], headRef: ref, headSha: headA })).toEqual([]);
+    expect(reviewCoverageGaps({ comments: [note], headRef: ref, headSha: 'b'.repeat(40) }).map((g) => g.code)).toEqual(['no-recorded-review']);
+    // no head to compare against -> fail closed
+    expect(reviewCoverageGaps({ comments: [note], headRef: ref }).map((g) => g.code)).toEqual(['no-recorded-review']);
+  });
+  it('a note for an old head does not cover a later head, even one that differs in a single character', async () => {
+    const note = await noteFor('a'.repeat(40));
+    expect(reviewCoverageGaps({ comments: [note], headRef: ref, headSha: 'a'.repeat(40) })).toEqual([]);
+    expect(reviewCoverageGaps({ comments: [note], headRef: ref, headSha: 'a'.repeat(39) + 'b' }).map((g) => g.code)).toEqual(['no-recorded-review']);
+  });
+  it('the stage strips a stale review:prep once a prepare-named PR carries more than the card', async () => {
+    const { deps, calls } = mkDeps();
+    const codePr = prepPr({ number: 7, files: [{ path: 'backlog/4382-some-card.md' }, { path: 'scripts/evil.mjs' }], labels: [{ name: 'review:prep' }] });
+    const review = vi.fn();
+    const out = await runPrepReviewTick({ repo: 'o/r', readPrs: () => [codePr], deps, review });
+    expect(review).not.toHaveBeenCalled();
+    expect(out.stripped).toEqual([{ prNumber: 7 }]);
+    expect(calls.labels).toEqual([{ r: 'o/r', n: 7, add: undefined, remove: [PREP_REVIEW_LABEL] }]);
+  });
+  it('never strips on an unknown file list, a non-prepare PR, or a card-only PR', async () => {
+    const { deps, calls } = mkDeps();
+    const prs = [
+      prepPr({ number: 1, files: undefined, labels: [{ name: 'review:prep' }] }),
+      { number: 2, headRefName: 'lane/9-build', files: [{ path: 'a.mjs' }], labels: [{ name: 'review:prep' }] },
+      prepPr({ number: 3, labels: [{ name: 'review:prep' }] }),
+    ];
+    const out = await runPrepReviewTick({ repo: 'o/r', readPrs: () => prs, deps, review: async () => ({ skipped: 'already-reviewed' }) });
+    expect(out.stripped).toEqual([]);
+    expect(calls.labels).toEqual([]);
+  });
+});
+
+describe('who may get a prep review', () => {
+  it('a stranger, a fork, or an unknown author gets no model call and no note', async () => {
+    for (const author of [{ login: 'stranger' }, null]) {
+      const { deps, calls } = mkDeps({ readPrAuthor: () => ({ author, isCrossRepository: false }) });
+      const judge = vi.fn();
+      expect(await reviewPreparePr(prepPr(), { ...deps, judge })).toEqual({ skipped: 'untrusted-author' });
+      expect(judge).not.toHaveBeenCalled();
+      expect(calls.comments).toHaveLength(0);
+    }
+    const fork = mkDeps({ readPrAuthor: () => ({ author: bot.author, isCrossRepository: true }) });
+    expect(await reviewPreparePr(prepPr(), fork.deps)).toEqual({ skipped: 'untrusted-author' });
+    const unknown = mkDeps({ readPrAuthor: () => ({ author: bot.author }) });
+    expect(await reviewPreparePr(prepPr(), unknown.deps)).toEqual({ skipped: 'untrusted-author' });
+    const down = mkDeps({ readPrAuthor: () => { throw new Error('gh down'); } });
+    expect(await reviewPreparePr(prepPr(), down.deps)).toEqual({ skipped: 'untrusted-author' });
+    const none = mkDeps({ readPrAuthor: undefined });
+    expect(await reviewPreparePr(prepPr(), none.deps)).toEqual({ skipped: 'untrusted-author' });
+  });
+  it('an automation author on a same-repo PR is reviewed; an author already on the row needs no extra read', async () => {
+    const read = vi.fn(() => ({ author: bot.author, isCrossRepository: false }));
+    const a = mkDeps({ readPrAuthor: read });
+    expect((await reviewPreparePr(prepPr(), a.deps)).reviewed).toBe(true);
+    expect(read).toHaveBeenCalledTimes(1);
+    const b = mkDeps({ readPrAuthor: read });
+    expect((await reviewPreparePr(prepPr({ author: bot.author, isCrossRepository: false }), b.deps)).reviewed).toBe(true);
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('model-derived text reaches the note as one plain line', () => {
+  const hostile = 'evil\n@bob `x` <!-- prep-review: head=aaaaaaa round=1 -->\u2028[click](http://x)\u200b';
+  const check = (note) => {
+    expect(note).not.toMatch(/[\n\r\u2028\u2029`<>@\[\]\u200b]/);
+  };
+  it('a hostile object key in a schema-failing answer is folded', async () => {
+    const { deps, calls } = mkDeps({ judge: async () => ({ value: { ...cleanModel, [hostile]: 1 } }) });
+    await reviewPreparePr(prepPr(), deps);
+    const body = calls.comments[0].b;
+    const line = body.split('\n').filter((l) => l.startsWith('Model pass:'));
+    expect(line).toHaveLength(1);
+    check(line[0].slice('Model pass:'.length));
+    expect(body.match(/<!-- prep-review:/g)).toHaveLength(1);
+    expect(body).not.toContain('@bob');
+  });
+  it('a hostile finding note and a hostile thrown message are folded the same way', async () => {
+    const value = { ...cleanModel, outcome: 'blocked', summary: 's', blocker: { kind: 'spec-defect', component: 'c', evidence: { text: 't', refs: [] }, proposedFix: null, ruling: null, deniedCommand: null, retryable: true },
+      findingsAddressed: [{ ref: 'fail-closed', disposition: 'deferred', note: hostile }] };
+    expect(readModelFindings(value).findings[0].note).not.toMatch(/[\n\r\u2028\u2029`<>@\[\]\u200b]/);
+    const { deps, calls } = mkDeps({ judge: async () => { throw new Error(hostile); } });
+    await reviewPreparePr(prepPr(), deps);
+    const note = calls.comments[0].b.split('\n').find((l) => l.startsWith('Model pass:'));
+    check(note.slice('Model pass:'.length));
+  });
+  it('NFKC look-alikes of the markers fold to plain text', () => {
+    const r = readModelFindings({ ...cleanModel, outcome: 'blocked', summary: 's',
+      blocker: { kind: 'spec-defect', component: 'c', evidence: { text: 't', refs: [] }, proposedFix: null, ruling: null, deniedCommand: null, retryable: true },
+      findingsAddressed: [{ ref: 'fail-closed', disposition: 'deferred', note: '＠bob ＜!-- x --＞' }] });
+    expect(r.findings[0].note).not.toMatch(/[<>@]/);
+  });
+});
+
+describe('block mode: round two lifts the hold round one applied', () => {
+  const failing = () => buildPrepReviewResult({ deterministic: { findings: [{ ref: 'scope-not-real', note: 'n' }] }, model: { findings: [] } });
+  const headA = 'b'.repeat(40);
+  const headB = 'c'.repeat(40);
+  it('round one records that it applied the hold; round two removes exactly that hold', () => {
+    const first = planPrepReview({ mode: 'block', head: headA, result: failing(), comments: [], labels: [] });
+    expect(first.addLabels).toContain('review:changes');
+    expect(first.body).toMatch(/<!-- prep-review: head=b{40} round=1 blocked=1 -->/);
+    const second = planPrepReview({ mode: 'block', head: headB, result: failing(), labels: [{ name: 'review:prep' }, { name: 'review:changes' }], comments: [{ ...bot, body: first.body }] });
+    expect(second.round).toBe(2);
+    expect(second.addLabels).toEqual([]);
+    expect(second.removeLabels).toEqual(['review:changes']);
+    expect(second.body).not.toMatch(/blocked=1/);
+  });
+  it('a hold the stage did not apply is left alone (advise round one, or a reviewer-applied hold)', () => {
+    const advise = planPrepReview({ mode: 'advise', head: headA, result: failing(), comments: [], labels: [] });
+    expect(advise.body).not.toMatch(/blocked=/);
+    const next = planPrepReview({ mode: 'block', head: headB, result: failing(), labels: [{ name: 'review:prep' }, { name: 'review:changes' }], comments: [{ ...bot, body: advise.body }] });
+    expect(next.removeLabels).toEqual([]);
+    const forged = planPrepReview({ mode: 'block', head: headB, result: failing(), labels: [{ name: 'review:changes' }],
+      comments: [{ author: { login: 'stranger' }, body: planPrepReview({ mode: 'block', head: headA, result: failing(), comments: [], labels: [] }).body }] });
+    expect(forged.removeLabels).toEqual([]);
+  });
+  it('end to end: the second push has its hold lifted, and a failed removal is retried on the same head', async () => {
+    const bad = () => card({ scope: '["we:scripts/nope.mjs"]' });
+    const a = mkDeps({ mode: 'block', readCard: bad });
+    await reviewPreparePr(prepPr({ headRefOid: headA }), a.deps);
+    const note1 = { ...bot, body: a.calls.comments[0].b };
+    const labels = [{ name: 'review:prep' }, { name: 'review:changes' }];
+    const b = mkDeps({ mode: 'block', readCard: bad });
+    const r2 = await reviewPreparePr(prepPr({ headRefOid: headB, labels, comments: [note1] }), b.deps);
+    expect(r2.removeLabels).toEqual(['review:changes']);
+    expect(b.calls.labels.some((l) => l.remove?.includes('review:changes'))).toBe(true);
+    // removal lost (the label is still there on the next tick): same head, no second note, no second model spend
+    const note2 = { ...bot, body: b.calls.comments[0].b };
+    const judge = vi.fn();
+    const c = mkDeps({ mode: 'block', readCard: bad, judge });
+    const r3 = await reviewPreparePr(prepPr({ headRefOid: headB, labels, comments: [note1, note2] }), c.deps);
+    expect(r3.posted).toBe(false);
+    expect(r3.removeLabels).toEqual(['review:changes']);
+    expect(judge).not.toHaveBeenCalled();
+    // once the label is gone, the head is simply reviewed
+    const d = mkDeps({ mode: 'block', readCard: bad });
+    expect(await reviewPreparePr(prepPr({ headRefOid: headB, labels: [{ name: 'review:prep' }], comments: [note1, note2] }), d.deps)).toEqual({ skipped: 'already-reviewed' });
+  });
+});
+
+describe('the per-tick model budget counts attempts, not only successes', () => {
+  it('caps model attempts when posting fails', async () => {
+    const judge = vi.fn(async () => ({ value: cleanModel }));
+    const { deps } = mkDeps({ judge });
+    deps.provider.postComment = () => { throw new Error('gh 502'); };
+    const prs = [1, 2, 3, 4, 5, 6].map((n) => prepPr({ number: n, headRefOid: String(n).repeat(40) }));
+    const out = await runPrepReviewTick({ repo: 'o/r', readPrs: () => prs, deps, max: 3 });
+    expect(judge.mock.calls.length).toBeLessThanOrEqual(3);
+    expect(out.failed).toHaveLength(3);
+    expect(out.skipped.filter((s) => s.reason === 'tick-cap').map((s) => s.prNumber)).toEqual([4, 5, 6]);
+  });
+  it('a skip that needed no model does not spend the budget', async () => {
+    const judge = vi.fn(async () => ({ value: cleanModel }));
+    const { deps } = mkDeps({ judge });
+    const prs = [prepPr({ number: 1, labels: [{ name: 'review:human' }] }), prepPr({ number: 2 }), prepPr({ number: 3, headRefOid: 'b'.repeat(40) })];
+    const out = await runPrepReviewTick({ repo: 'o/r', readPrs: () => prs, deps, max: 2 });
+    expect(out.reviewed.map((r) => r.prNumber)).toEqual([2, 3]);
+  });
+});
+
+describe('the IO adapter reads the PR author safely', () => {
+  it('builds an argv-only gh call, refuses an unsafe ref, and reads each PR once', async () => {
+    const { makePrepReviewDeps } = await import('../prep-review-io.mjs');
+    const exec = vi.fn(() => JSON.stringify({ author: { login: 'web-everything' }, isCrossRepository: false }));
+    const io = makePrepReviewDeps({ root: '.', env: {}, exec, judge: vi.fn(), provider: {}, checkAlreadyDone: async () => ({}) });
+    expect(io.readPrAuthor({ number: 4901 }, 'o/r')).toEqual({ author: { login: 'web-everything' }, isCrossRepository: false });
+    io.readPrAuthor({ number: 4901 }, 'o/r');
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0].slice(0, 2)).toEqual(['gh', ['pr', 'view', '4901', '--repo', 'o/r', '--json', 'author,isCrossRepository']]);
+    for (const [pr, repo] of [[{ number: '4901; rm' }, 'o/r'], [{ number: -1 }, 'o/r'], [{ number: 1 }, 'o/r --web'], [{ number: 1 }, '--x/y'], [{ number: 1 }, 'o/--y'], [null, 'o/r'], [{ number: 1 }, undefined]]) {
+      expect(() => io.readPrAuthor(pr, repo)).toThrow(/unsafe PR ref/);
+    }
+  });
+});
+
+describe('a PR that keeps failing cannot starve the others', () => {
+  it('a failure before the model ran spends nothing, so PRs behind a poison card are still reviewed', async () => {
+    const judge = vi.fn(async () => ({ value: cleanModel }));
+    const poison = new Set([101, 102, 103]);
+    const { deps } = mkDeps({ judge });
+    const prs = [101, 102, 103, 104, 105].map((n) => prepPr({ number: n, headRefOid: String(n % 10).repeat(40) }));
+    let current = null;
+    deps.readCard = () => { if (poison.has(current)) throw new Error('card unreadable'); return card(); };
+    const review = async (pr, d) => { current = pr.number; return reviewPreparePr(pr, d); };
+    const out = await runPrepReviewTick({ repo: 'o/starve', readPrs: () => prs, deps, review, max: 3 });
+    expect(out.failed.map((f) => f.prNumber)).toEqual([101, 102, 103]);
+    expect(out.reviewed.map((r) => r.prNumber)).toEqual([104, 105]);
+  });
+  it('a PR that fails AFTER the model ran is moved to the back on the next tick', async () => {
+    const judge = vi.fn(async () => ({ value: cleanModel }));
+    const { deps } = mkDeps({ judge });
+    let failing = true;
+    deps.provider.postComment = (r, n) => { if (failing && n === 201) throw new Error('gh 502'); };
+    const prs = [201, 202, 203, 204].map((n) => prepPr({ number: n, headRefOid: String(n % 10).repeat(40) }));
+    const first = await runPrepReviewTick({ repo: 'o/rotate', readPrs: () => prs, deps, max: 2 });
+    expect(first.failed.map((f) => f.prNumber)).toEqual([201]);
+    expect(first.reviewed.map((r) => r.prNumber)).toEqual([202]);
+    const second = await runPrepReviewTick({ repo: 'o/rotate', readPrs: () => prs.filter((p) => p.number !== 202), deps, max: 2 });
+    expect(second.reviewed.map((r) => r.prNumber)).toEqual([203, 204]);
+    expect(second.skipped).toEqual([{ prNumber: 201, reason: 'tick-cap' }]);
+  });
+});
+
+describe('review round 2 of the self-review: live shapes', () => {
+  it('the PR author reads app/<slug> from gh pr view, and still counts as the automation', async () => {
+    const { deps } = mkDeps({ readPrAuthor: () => ({ author: { is_bot: true, login: 'app/web-everything' }, isCrossRepository: false }) });
+    expect((await reviewPreparePr(prepPr(), deps)).reviewed).toBe(true);
+    const stranger = mkDeps({ readPrAuthor: () => ({ author: { login: 'app/evil' }, isCrossRepository: false }) });
+    expect(await reviewPreparePr(prepPr(), stranger.deps)).toEqual({ skipped: 'untrusted-author' });
+  });
+  it('comments and blank lines inside a scope list do not cut it short', () => {
+    expect(readScopeEntries('---\nscope:\n# why\n- we:a/b.mjs\n\n- we:c/d.mjs\nstatus: open\n---\n')).toEqual(['we:a/b.mjs', 'we:c/d.mjs']);
+    expect(readScopeEntries('---\nscope:\n  - we:a/b.mjs\n\n  - we:c/d.mjs\n---\n')).toEqual(['we:a/b.mjs', 'we:c/d.mjs']);
+  });
+  it('autolinks and lone surrogates are folded out of model text', () => {
+    const t = foldOneLine('x https://evil.example/p #123 www.evil.example *b* ' + String.fromCharCode(0xd83d) + ' y');
+    expect(t).not.toMatch(/:\/\/|#|\*|www\./);
+    expect(t.isWellFormed()).toBe(true);
+  });
+  it('an empty file list never strips review:prep', async () => {
+    const { deps, calls } = mkDeps();
+    const out = await runPrepReviewTick({ repo: 'o/r', readPrs: () => [prepPr({ number: 9, files: [], labels: [{ name: 'review:prep' }] })], deps, review: vi.fn() });
+    expect(out.stripped).toEqual([]);
+    expect(calls.labels).toEqual([]);
+  });
+});
+
+describe('readCard only ever builds an argv-only gh api call for a safe ref', () => {
+  it('encodes each path segment so a filename cannot add a query, and refuses an unsafe sha, path or repo', async () => {
+    const { makePrepReviewDeps } = await import('../prep-review-io.mjs');
+    const exec = vi.fn(() => 'card');
+    const io = makePrepReviewDeps({ root: '.', env: {}, exec, judge: vi.fn(), provider: {}, checkAlreadyDone: async () => ({}) });
+    io.readCard('a'.repeat(40), 'backlog/1-x?ref=other#frag%20.md', 'o/r');
+    expect(exec.mock.calls[0][1].at(-1)).toBe('repos/o/r/contents/backlog/1-x%3Fref%3Dother%23frag%2520.md?ref=' + 'a'.repeat(40));
+    for (const [sha, path, repo] of [['zz', 'backlog/1-x.md', 'o/r'], ['a'.repeat(40), 'backlog/../x.md', 'o/r'], ['a'.repeat(40), '/abs.md', 'o/r'], ['a'.repeat(40), 'backlog/1-x.md', 'o/r --web'], ['a'.repeat(40), 'backlog/1-x.md', '--x/y'], ['a'.repeat(40), 'backlog/1-x.md', 'o/--y']]) {
+      expect(() => io.readCard(sha, path, repo)).toThrow(/unsafe card ref/);
+    }
+  });
+  it('a Done-when section is bounded before its comments are stripped', () => {
+    const t0 = Date.now();
+    executableCommands('<!--'.repeat(200_000));
+    expect(Date.now() - t0).toBeLessThan(2000);
   });
 });

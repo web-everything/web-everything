@@ -999,16 +999,17 @@ export function buildCliDaemonEffects({
         const sr = result.sessionReap;
         log.error(`review-daemon: session-reap — ${sr.scanned} scanned, ${sr.stopped} stopped${sr.alreadyGone ? `, ${sr.alreadyGone} already gone` : ''}${sr.failures ? `, ${sr.failures} failed` : ''}${sr.anomalies ? `, ${sr.anomalies} anomalies` : ''}${sr.previouslyReaped ? `, ${sr.previouslyReaped} already reaped earlier (skipped)` : ''}, ${sr.kept} kept${sr.deferred ? `, ${sr.deferred} deferred to next tick (reap budget: ${sr.reapBudget?.maxStops} stops / ${sr.reapBudget?.maxDurationMs}ms, #3383)` : ''}`);
       }
-      // #xconv1 (web-everything/web-everything#2766/#2767 unblock) — the mechanical, no-session convert-advisory
-      // stage's own report: `posted` names the targeted check's own verdict, `skipped` is the idempotency
-      // no-op (a head already carrying the converted note), `failed`/`reconcileFailed` mirror the review
-      // stage's own non-fatal reporting one level up.
       const pr = result.prepReview;
       if (pr && !pr.off) {
         for (const r of (pr.reviewed ?? [])) log.error(`review-daemon: ${WE_SLUG}#${r.prNumber} prep-review (${pr.mode}) ${r.outcome}${r.findings?.length ? `: ${r.findings.join(',')}` : ''}${r.addLabels?.length ? `; labelled ${r.addLabels.join(',')}` : ''}`);
         for (const f of (pr.failed ?? [])) log.error(`review-daemon: ${WE_SLUG}#${f.prNumber ?? '?'} prep-review failed (non-fatal): ${f.error}`);
+        for (const x of (pr.stripped ?? [])) log.error(`review-daemon: ${WE_SLUG}#${x.prNumber} prep-review: removed a stale review:prep (the PR now carries more than the card)`);
         if (pr.readError) log.error(`review-daemon: prep-review could not list PRs (non-fatal): ${pr.readError}`);
       }
+      // #xconv1 (web-everything/web-everything#2766/#2767 unblock) — the mechanical, no-session convert-advisory
+      // stage's own report: `posted` names the targeted check's own verdict, `skipped` is the idempotency
+      // no-op (a head already carrying the converted note), `failed`/`reconcileFailed` mirror the review
+      // stage's own non-fatal reporting one level up.
       const ca = result.convertAdvisory;
       if (ca) {
         for (const p of (ca.posted ?? [])) log.error(`review-daemon: ${p.repo}#${p.prNumber} convert-advisory posted (targeted check: ${p.outcome ?? '?'})`);

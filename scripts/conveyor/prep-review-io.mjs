@@ -16,6 +16,10 @@ import {
 
 const GH_TIMEOUT_MS = 30_000;
 
+/** Who opened a PR and from where never changes, so one read serves every later tick (bounded; cleared when full). */
+const AUTHOR_CACHE_MAX = 500;
+const authorCache = new Map();
+
 /**
  * @param {{root:string, env?:object, exec?:Function, judge?:Function, provider?:object, checkAlreadyDone?:Function}} o
  *   `root` is the daemon's own clone of the repo (it holds `origin/main`).
@@ -27,9 +31,21 @@ export function makePrepReviewDeps({ root, env = process.env, exec = execFileSyn
     model,
     provider,
     readCard: (sha, path, repo) => {
-      if (!/^[0-9a-f]{7,40}$/.test(sha) || !isSafeRepoRelativePath(path) || !/^[\w.-]+\/[\w.-]+$/.test(String(repo))) throw new Error('prep-review: refusing an unsafe card ref');
-      return String(exec('gh', ['api', '-H', 'Accept: application/vnd.github.raw', `repos/${repo}/contents/${path}?ref=${sha}`],
+      if (!/^[0-9a-f]{7,40}$/.test(sha) || !isSafeRepoRelativePath(path) || !/^\w[\w.-]*\/\w[\w.-]*$/.test(String(repo))) throw new Error('prep-review: refusing an unsafe card ref');
+      return String(exec('gh', ['api', '-H', 'Accept: application/vnd.github.raw', `repos/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${sha}`],
         { encoding: 'utf8', timeout: GH_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+    },
+    readPrAuthor: (pr, repo) => {
+      const n = pr?.number;
+      if (!Number.isSafeInteger(n) || n <= 0 || !/^\w[\w.-]*\/\w[\w.-]*$/.test(String(repo))) throw new Error('prep-review: refusing an unsafe PR ref');
+      const key = `${repo}#${n}`;
+      if (authorCache.has(key)) return authorCache.get(key);
+      const row = JSON.parse(String(exec('gh', ['pr', 'view', String(n), '--repo', repo, '--json', 'author,isCrossRepository'],
+        { encoding: 'utf8', timeout: GH_TIMEOUT_MS, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })));
+      const who = { author: row?.author ?? null, isCrossRepository: row?.isCrossRepository };
+      if (authorCache.size >= AUTHOR_CACHE_MAX) authorCache.clear();
+      authorCache.set(key, who);
+      return who;
     },
     exists: (p) => {
       if (!isSafeRepoRelativePath(p)) return false;
