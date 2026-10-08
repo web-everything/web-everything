@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ciCheckName, collectInputs, extractMetrics, fetchCiRuns, fixOutcome, gateCause, parseMarkers, parseTranscript, percentile, rateMetric, readBounded, runCoroner } from '../coroner-extract.mjs';
+import { builderMetrics, ciCheckName, collectInputs, extractMetrics, fetchCiRuns, fixOutcome, gateCause, parseMarkers, parseTranscript, percentile, rateMetric, readBounded, runCoroner } from '../coroner-extract.mjs';
 
 const since = '2026-10-05T17:00:00.000Z', until = '2026-10-05T18:00:00.000Z';
 const at = (minutes) => new Date(Date.parse(since) + minutes * 60000).toISOString();
@@ -26,6 +26,74 @@ beforeEach(() => {
   env = Object.fromEntries(['JOBS', 'JOBS_ARCHIVE', 'PROJECTS', 'DAEMON_DIR', 'VERIFY_LOG', 'ADMISSION', 'LANES', 'STATE', 'COORD', 'BACKLOG'].map((key) => [`WE_CORONER_${key}`, join(root, key.toLowerCase())]));
 });
 afterEach(() => { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); });
+
+describe('card 130 S2 outcome labels', () => {
+  const state = { state: 'stopped', detail: 'stopped' };
+  it('a stopped fix whose line says the harness pushed it is pushed-by-harness, not stopped', () => {
+    expect(fixOutcome(state, 'PR #4233 is repaired and re-armed. The commit verified green; the harness pushed it to `lane/it`.')).toBe('pushed-by-harness');
+    expect(fixOutcome(state, 'I fixed it and the harness verified and pushed the merge to lane/x')).toBe('pushed-by-harness');
+    expect(fixOutcome(state, 'The harness did not push the fix; gate was red')).not.toBe('pushed-by-harness');
+  });
+  it('a stopped fix waiting on the harness is handed-to-harness; a silent stop is still stopped', () => {
+    expect(fixOutcome(state, 'awaiting verify for 7c1378a1')).toBe('handed-to-harness');
+    expect(fixOutcome(state, 'card-only diff, the harness will push on green and resume me')).toBe('handed-to-harness');
+    expect(fixOutcome(state, '')).toBe('stopped-without-outcome');
+    expect(fixOutcome(state, 'I pushed the repair to lane/x at abc123')).toBe('pushed');
+  });
+  it('prepare failures count per attempt, not per tick, and carried-over rows do not count', () => {
+    const fail = (extra) => ({ num: '4341', stage: 'stamp', reason: 'ref-lock', ...extra });
+    const tick = (m, failures) => ({ at: at(m), prepare: { launched: [], failures } });
+    const old = fail({ attempt: 'run dispatch-lane-old', recordedAt: at(-120) });
+    const a1 = fail({ attempt: 'stamp:4341:' + at(5), recordedAt: at(5) });
+    const a2 = fail({ attempt: 'stamp:4341:' + at(25), recordedAt: at(25) });
+    // The first tick of the log lists a pre-window failure with no time: it is carried over, not new.
+    const undated = { num: '4999', stage: 'result', reason: 'prepare-unstamped', held: true };
+    const ticks = [tick(-10, [old, undated]), tick(0, [old]), tick(6, [old, a1]), tick(7, [old, a1]), tick(8, [old, a1]), tick(26, [old, a1, a2]), tick(27, [old, a1, a2])];
+    const prepare = builderMetrics(ticks, { since, until }).byKind.prepare;
+    expect(prepare.count).toBe(2);
+    expect(prepare.causes.failed.count).toBe(2);
+  });
+  it('an undated held failure first seen in the first IN-WINDOW tick of the log is carried over, not counted', () => {
+    const undated = { num: '4999', stage: 'result', reason: 'prepare-unstamped', held: true };
+    const ticks = [{ at: at(1), prepare: { failures: [undated] } }, { at: at(2), prepare: { failures: [undated] } }];
+    expect(builderMetrics(ticks, { since, until }).byKind.prepare.count).toBe(0);
+    // Only the very first tick of the log is carried over; the same row appearing later as a new listing still counts once.
+    const later = [{ at: at(0), prepare: { failures: [] } }, { at: at(3), prepare: { failures: [undated] } }];
+    expect(builderMetrics(later, { since, until }).byKind.prepare.count).toBe(1);
+  });
+  it('a carried-over undated row does not absorb a genuine new attempt of the same failure minutes later', () => {
+    const base = { num: '4414', stage: 'result', reason: 'prepare-unstamped' };
+    const carried = { ...base, held: true }, fresh = { ...base, attempt: 'run dispatch-lane-2', recordedAt: at(4) };
+    const ticks = [{ at: at(1), prepare: { failures: [carried] } }, { at: at(5), prepare: { failures: [carried, fresh] } }];
+    expect(builderMetrics(ticks, { since, until }).byKind.prepare.count).toBe(1);
+  });
+  it('two new attempt rows in the same tick, minutes apart, are two attempts', () => {
+    const base = { num: '4415', stage: 'stamp', reason: 'ref-lock' };
+    const a = { ...base, attempt: `stamp:4415:${at(5)}`, recordedAt: at(5) }, b = { ...base, attempt: `stamp:4415:${at(8)}`, recordedAt: at(8) };
+    expect(builderMetrics([{ at: at(0), prepare: {} }, { at: at(9), prepare: { failures: [a, b] } }], { since, until }).byKind.prepare.count).toBe(2);
+  });
+  it('an anonymous listing more than ten minutes before the attempt is not that attempt', () => {
+    const base = { num: '4416', stage: 'stamp', reason: 'ref-lock' };
+    const a = { ...base, attempt: `stamp:4416:${at(30)}`, recordedAt: at(30) };
+    expect(builderMetrics([{ at: at(0), prepare: {} }, { at: at(5), prepare: { failures: [base] } }, { at: at(31), prepare: { failures: [base, a] } }], { since, until }).byKind.prepare.count).toBe(2);
+  });
+  it('distinct attempt ids with the same card, stage and reason less than ten minutes apart are separate attempts', () => {
+    const fail = (m) => ({ num: '4341', stage: 'stamp', reason: 'ref-lock', attempt: `stamp:4341:${at(m)}`, recordedAt: at(m) });
+    const [a, b, c] = [fail(12), fail(17), fail(22)];
+    const ticks = [{ at: at(0), prepare: {} }, { at: at(13), prepare: { failures: [a] } }, { at: at(18), prepare: { failures: [a, b] } }, { at: at(23), prepare: { failures: [a, b, c] } }, { at: at(24), prepare: { failures: [a, b, c] } }];
+    expect(builderMetrics(ticks, { since, until }).byKind.prepare.count).toBe(3);
+  });
+  it('an attempt-less listing is spent by the first attempt that claims it, so a second close attempt still counts', () => {
+    const base = { num: '4414', stage: 'result', reason: 'prepare-unstamped' };
+    const a1 = { ...base, attempt: 'run dispatch-lane-1', recordedAt: at(11) }, a2 = { ...base, attempt: 'run dispatch-lane-2', recordedAt: at(14) };
+    const ticks = [{ at: at(0), prepare: {} }, { at: at(10), prepare: { failures: [base] } }, { at: at(12), prepare: { failures: [base, a1] } }, { at: at(15), prepare: { failures: [base, a1, a2] } }];
+    expect(builderMetrics(ticks, { since, until }).byKind.prepare.count).toBe(2);
+  });
+  it('one failure listed without an attempt id and then with one is one attempt', () => {
+    const ticks = [{ at: at(1), prepare: { failures: [{ num: '4414', stage: 'result', reason: 'prepare-unstamped' }] } }, { at: at(2), prepare: { failures: [{ num: '4414', stage: 'result', reason: 'prepare-unstamped' }, { num: '4414', stage: 'result', reason: 'prepare-unstamped', attempt: 'run dispatch-lane-z', recordedAt: at(1) }] } }, { at: at(3), prepare: { failures: [] } }];
+    expect(builderMetrics([{ at: at(0), prepare: {} }, ...ticks], { since, until }).byKind.prepare.count).toBe(1);
+  });
+});
 
 describe('coroner metrics', () => {
   it('counts sessions by kind, outcomes, window boundaries and PR duration, including both archive layouts', () => {
@@ -61,6 +129,15 @@ describe('coroner metrics', () => {
     const metrics = run().metrics;
     expect(metrics.denials).toEqual({ byType: { 'classifier-denied': 2, 'hook-blocked': 1, 'user-denied': 1, refusing: 1 }, total: 5 });
     expect(metrics.sessions.records[0].outcomeLine).toBe('final'.repeat(32));
+  });
+
+  it('redacts secrets in repeated commands before they reach the report', () => {
+    job('a');
+    transcript('a', Array.from({ length: 3 }, (_, i) => use(`s${i}`, 'curl -H "Authorization: Bearer ghs_abcdefghijklmnopqrstuvwxyz0123456789" https://x/y')));
+    const { loops } = run().metrics;
+    expect(loops.top).toHaveLength(1);
+    expect(JSON.stringify(loops)).not.toContain('ghs_abcdefghijkl');
+    expect(loops.top[0].command).toContain('[redacted]');
   });
 
   it('detects normalized repeated commands, sorted with a ten-row limit', () => {

@@ -28,9 +28,17 @@ node scripts/operations/coroner-extract.mjs --since=<ISO|last> --json > "$SCRATC
     (`real-code-defect`, `soak-scenario`, `infra`), only the latest run per PR head and workflow, with `superseded` (cancelled), `flakyRecovered` and `awaitingReview` (review-gate, by design) reported apart and `byCheck`
     (test-shard, soak-shard, daemon-soak, smoke, review-gate, CodeQL). `WE_CORONER_NO_CI=1` skips gh.
   - `fixSessions`: fix and ci-heal sessions by outcome (`pushed`, `gate-red-not-pushed`, `load-flake-hold`, `blocked`,
-    `escalated`, `no-op`, `stopped-without-outcome`, `other`) plus `rounds` per PR.
+    `escalated`, `no-op`, `pushed-by-harness` (stopped, then the harness pushed the verified fix), `handed-to-harness`
+    (waiting on the harness), `stopped-without-outcome`, `other`) plus `rounds` per PR.
   - `builderLaunches`: from the build-dispatch tick rows: `launched`, `launch-not-confirmed`, `failed`,
-    `repeated-same-card`.
+    `repeated-same-card`. Prepare failures count once per attempt (card + attempt id), never once per tick.
+  - `frictions` (card 130): per-session transcript friction from a bounded tail read (`WE_CORONER_FRICTION_TAIL`, default
+    2 MiB; Claude `linkScanPath`, Codex rollouts joined to `codex-delivery-threads`, agy logs), grouped by kind x executor
+    (`byKindExecutor`) and again per PR kind (`byPrKind.code` / `card-only`). Signals: tool denials, guard blocks
+    (`Blocked:`), permission-denied, sandbox EPERM (`headline.<executor>.sandboxEpermBlocked` = builds blocked),
+    lane failures (`lane-already-leased`, `lane-acquire-failed`), re-runs, and minutes between lane acquire, first edit,
+    verify request, verify verdict, push and PR open, plus the worker's own final line (redacted). `buildOutcomes`: the
+    recorded result of each build dispatch run by kind x executor (`orphan-released` rows predate the settle fix).
   - `mergeConflicts`: conflict events per PR opened (newly CONFLICTING PRs, conflict-fix sessions and rounds, mechanical
     rebases, drain overlap-yield and scope-overlap waits), with minutes and `beforeAfter` the scoping cutoff
     (2026-10-06 19:00Z, override `WE_CORONER_SCOPING_CUTOFF`). Always state the before/after verdict.
