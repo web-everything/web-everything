@@ -1,9 +1,10 @@
 ---
+bornAs: xhrgr3d
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xu1nixv-red-main-gets-an-owner.md"]
+scope: ["we:backlog/5510-red-main-gets-an-owner.md"]
 dateOpened: "2026-10-08"
 tags: []
 ---
@@ -12,9 +13,9 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xu1nixv-red-main-gets-an-owner.md:26` — Add a card-lint rule in check:standards: every item under 'Edge cases this change must handle' must be matched by a named test in Done-when or a Test plan section.
-2. `we:backlog/xu1nixv-red-main-gets-an-owner.md:14` — Add one Done-when/edge-case line: a claim counts only if the PR is trusted-author and still open and non-stale, plus a replay test with a spoofed or stale claim that still dispatches.
-3. `we:backlog/xu1nixv-red-main-gets-an-owner.md:25` — Add a backlog write-gate requiring each behavioral edge constraint to reference a repository-qualified planned test, named case, and observable assertion; review whether those assertions actually defend the constraint.
+1. `we:backlog/5510-red-main-gets-an-owner.md:26` — Add a card-lint rule in check:standards: every item under 'Edge cases this change must handle' must be matched by a named test in Done-when or a Test plan section.
+2. `we:backlog/5510-red-main-gets-an-owner.md:14` — Add one Done-when/edge-case line: a claim counts only if the PR is trusted-author and still open and non-stale, plus a replay test with a spoofed or stale claim that still dispatches.
+3. `we:backlog/5510-red-main-gets-an-owner.md:25` — Add a backlog write-gate requiring each behavioral edge constraint to reference a repository-qualified planned test, named case, and observable assertion; review whether those assertions actually defend the constraint.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4523@93ff39203a97952459c467913c39ac2c7495aa4b
 
