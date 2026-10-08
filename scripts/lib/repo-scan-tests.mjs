@@ -82,6 +82,13 @@ export const REPO_SCAN_TESTS = Object.freeze([
     matches: (f) => SOURCE_EXT.test(f) && !skipped(f) && !f.startsWith('.'),
     inputs: ['scripts/lib/__tests__/review-policy.conformance.test.mjs'],
   },
+  {
+    test: 'scripts/operations/__tests__/worker-result.test.mjs',
+    scope: 'full',
+    why: 'asserts the legacy outcome mapping is total over every `--outcome=` word in skills-src/**/*-brief*.md (item 117 S1); reads the briefs, so a brief change must re-run it',
+    matches: (f) => /^skills-src\/.*-brief[^/]*\.md$/.test(f),
+    inputs: ['scripts/operations/worker-result.mjs', 'schemas/worker-result.v1.json', 'scripts/operations/__tests__/worker-result.test.mjs'],
+  },
 ]);
 
 /**
