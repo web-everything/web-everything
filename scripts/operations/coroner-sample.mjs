@@ -22,6 +22,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { redact } from './coroner-transcripts.mjs';
+import { modelSetting } from '../lib/model-settings.mjs';
 
 export const KNOB = 'coroner.sampleSize';
 export const DEFAULTS = Object.freeze({ sampleSize: 28, floor: 5, stableRuns: 3, topK: 5, concurrency: 4, model: 'haiku', effort: 'low', budgetUsd: 0.25 });
@@ -33,7 +34,7 @@ export const SIZES = Object.freeze([1, 2, 3, 5, 8]);
 // Knobs.
 const positiveInt = (v, fallback) => { const n = Number(v); return Number.isInteger(n) && n > 0 ? n : fallback; };
 /** CLI flag > env > default. `coroner.sampleSize` is `--sample-size` / `WE_CORONER_SAMPLE_SIZE`. */
-export function resolveKnobs({ values = {}, env = process.env } = {}) {
+export function resolveKnobs({ values = {}, env = process.env, settings } = {}) {
   const floor = positiveInt(values.floor ?? env.WE_CORONER_SAMPLE_FLOOR, DEFAULTS.floor);
   return {
     sampleSize: Math.max(floor, positiveInt(values['sample-size'] ?? env.WE_CORONER_SAMPLE_SIZE, DEFAULTS.sampleSize)),
@@ -41,7 +42,7 @@ export function resolveKnobs({ values = {}, env = process.env } = {}) {
     stableRuns: positiveInt(values['stable-runs'] ?? env.WE_CORONER_SAMPLE_STABLE_RUNS, DEFAULTS.stableRuns),
     topK: DEFAULTS.topK,
     concurrency: positiveInt(env.WE_CORONER_SAMPLE_CONCURRENCY, DEFAULTS.concurrency),
-    model: String(values.model ?? env.WE_CORONER_SAMPLE_MODEL ?? DEFAULTS.model),
+    model: String(values.model ?? env.WE_CORONER_SAMPLE_MODEL ?? modelSetting('coroner', 'sampleModel', DEFAULTS.model, settings)),
     effort: DEFAULTS.effort,
     budgetUsd: Number(env.WE_CORONER_SAMPLE_BUDGET_USD) > 0 ? Number(env.WE_CORONER_SAMPLE_BUDGET_USD) : DEFAULTS.budgetUsd,
   };
