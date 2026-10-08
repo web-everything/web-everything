@@ -291,6 +291,14 @@ describe('daemon version migrate / unmigrate', () => {
       expect(readFileSync(join(clone, '.operations', 'run.json'))).toBe('1');
     });
 
+    it('a kill right after the stale destination was parked, before the live entry moved, loses neither copy', async () => {
+      await expect(migrate({ clone, home, settings, deps: killAfterRename(/conflicts\//), force: true })).rejects.toThrow('killed');
+      expect(readFileSync(join(clone, '.operations', 'run.json'))).toBe('1');
+      expect((await migrate({ clone, home, settings, deps, force: true })).status).toBe('migrated');
+      expect(readFileSync(join(home, 'daemon', 'state', '.operations', 'run.json'))).toBe('1');
+      expect(files(join(home, 'daemon', 'conflicts'))).toContain('stale');
+    });
+
     it('a path the dead run had already moved over the stale destination is still put back', async () => {
       // Killed after the live .operations replaced the (parked) stale one, before its link went in.
       await expect(migrate({ clone, home, settings, deps: killAfterRename(/state\/\.operations$/), force: true })).rejects.toThrow('killed');
