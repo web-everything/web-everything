@@ -3,7 +3,7 @@ bornAs: xmvg96n
 kind: story
 size: 3
 status: open
-scope: ["we:backlog/xyqru59-clone-repair-run-re-clone-before-the-safety-gates-for-a-clon.md"]
+scope: ["we:backlog/5400-clone-repair-run-re-clone-before-the-safety-gates-for-a-clon.md"]
 dateOpened: "2026-10-08"
 tags: []
 ---
@@ -12,7 +12,7 @@ tags: []
 
 Filed mechanically by the unattended review loop (#2749) — every finding below reduced web-everything/web-everything#4455's review (reviewed head `79aab2c2210f1bbdbf57b61f068ada386dc9f44c`) to prevention-outstanding by naming a guard neither captured nor filed:
 
-1. `we:backlog/xyqru59-clone-repair-run-re-clone-before-the-safety-gates-for-a-clon.md:14` — Add a backlog-lint rule that rejects a card still carrying TODO placeholders in the Done-when or Edge-cases sections when it moves, loosens, or reorders a safety gate. Alternatively, require a Must line stating what remains protected (unpushed commits, stashes, dirty files).
+1. `we:backlog/5400-clone-repair-run-re-clone-before-the-safety-gates-for-a-clon.md:14` — Add a backlog-lint rule that rejects a card still carrying TODO placeholders in the Done-when or Edge-cases sections when it moves, loosens, or reorders a safety gate. Alternatively, require a Must line stating what remains protected (unpushed commits, stashes, dirty files).
 
 ## Done when
 

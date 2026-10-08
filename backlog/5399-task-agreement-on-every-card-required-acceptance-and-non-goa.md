@@ -1,15 +1,16 @@
 ---
+bornAs: xx2620y
 kind: story
-size: 2
+size: 8
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/prepare.mjs", "we:scripts/lib/lane-repair.mjs", "we:scripts/lib/__tests__/"]
+scope: ["we:scripts/operations/file-item.mjs", "we:scripts/backlog.mjs", "we:scripts/readiness/", "we:scripts/lib/review-core.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Clone repair: run re-clone before the safety gates for a clone whose HEAD is gone
+# Task agreement on every card: required Acceptance and Non-goals, and reviewers judge the diff against them
 
-Follow-up from #4402 review (operator approved with follow-up 2026-10-08). In we:scripts/lib/daemon-rebuild/prepare.mjs repairCloneRefs runs in Step 2, after findUnsafeLocalState and HEAD verification already return terminal (status-failed / head-unresolved) for a clone whose HEAD object is missing or index is corrupt, so the only re-clone-enabled path never re-clones it. Move the repair ahead of the safety gates under the lock, and add a prepareRebuild-level test with a HEAD-object-missing clone expecting reason clone-recloned.
+Operator 2026-10-08 (from the Harness Engineering article review): only ~740 of 5,051 cards state acceptance criteria and ~345 non-goals; we:scripts/backlog.mjs and we:scripts/operations/file-item.mjs do not require either. (1) file-item and the card template require Acceptance and Non-goals sections; the readiness check refuses to dispatch a story card without them. (2) Review jurors and the converge loop judge the diff against the card's acceptance list, catching a build that solves an easier task and calls it done. Touches every card and every brief: PREPARE FIRST (decide rollout for the existing 5,000 cards, enforcement mode advise then enforce as a knob, and how reviewers read the list).
 
 ## Done when
 
