@@ -23,7 +23,8 @@ import {
   mkdtempSync, mkdirSync, readdirSync, writeFileSync, rmSync, existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { runDaemonLoadOverlay, mergeOverlayRef, dryRunOverlay } from '../daemon-load-overlay.mjs';
 
@@ -264,7 +265,9 @@ describe('mergeOverlayRef / dryRunOverlay — REAL git (temp repos), proving the
 // ── xkhtg2a — the dispatch smoke (incident 2026-10-08: lane/worker-contract-s3b's detached `claude -p` launch had no
 // `--permission-mode`, every fix/ci-heal worker died at step 0 on an approval prompt, and the load's smoke passed
 // because it never launched a real worker). These tests pin the gate's decisions; the real-worker launch itself is
-// proven live (see the PR), never from a unit test.
+// proven live (see the PR), never from a unit test. The "smoke completions never touch the real store" guarantee is
+// defended by the `runRealDispatchSmoke — ... SCRATCH store` describe below, which drives the prompt's own report
+// command and the child env through the REAL completion-cli against a real store dir and asserts it stays empty.
 import {
   overlaySafetySettings, matchDispatchPaths, overlayDispatchFiles, judgeDispatchSmoke, withDispatchSmoke, runRealDispatchSmoke,
   DISPATCH_PATH_DEFAULTS,
@@ -714,6 +717,36 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     expect(seen.pr).toBe('999998'); // a synthetic id, never a real PR's record
     expect(existsSync(join(childStore, `${seen.slug}.json`))).toBe(true);
     expect(readdirSync(realStore)).toEqual([]); // the real store saw nothing
+  });
+
+  it('runs the prompt\'s own report command and the child env through the REAL completion-cli: the record lands in the scratch store, the real store stays empty', async () => {
+    const realStore = join(work, 'REAL-completions');
+    mkdirSync(realStore, { recursive: true });
+    const treeRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..'); // this checkout: owns scripts/operations/completion-cli.mjs
+    const settings = { ...overlaySafetySettings({}, { readSettings: () => null }), smokeTimeoutMs: 20_000 };
+    const reportOutputs = [];
+    const spawn = vi.fn((_node, args, opts) => {
+      const [, , , , slug, , , , prompt] = args;
+      const [, marker, nonce] = prompt.match(/process\.argv\[2\]\)" '([^']+)' '([^']+)'/);
+      writeFileSync(marker, nonce);
+      // (a) the worker's literal step 3, exactly as the prompt spells it, run with the PARENT's env pointing at the real store
+      const step3 = prompt.split('\n').find((l) => l.startsWith('3. ')).slice(3);
+      reportOutputs.push(execFileSync('bash', ['-c', step3], { cwd: treeRoot, env: { ...opts.env, OPERATION_COMPLETIONS_DIR: realStore }, encoding: 'utf8' }));
+      // (b) the launched child's inherited env alone (no prefix) must also resolve to the scratch store, not the real one
+      reportOutputs.push(execFileSync(process.execPath, [
+        join(treeRoot, 'scripts', 'operations', 'completion-cli.mjs'), 'report', `--session=${slug}-envonly`, '--kind=ci-heal', '--pr=999998', '--status=done', '--outcome=not-applicable',
+      ], { cwd: treeRoot, env: opts.env, encoding: 'utf8' }));
+      return { status: 0, stdout: `${JSON.stringify({ handle: 'pid:1', wrapperPid: null, cwd: opts.cwd })}\n`, stderr: '' };
+    });
+    const r = await runRealDispatchSmoke({
+      tree: treeRoot, env: { PATH: process.env.PATH, OPERATION_COMPLETIONS_DIR: realStore }, settings, spawn, pollMs: 1, home: join(work, 'home'), log: quietLog,
+    });
+    expect(r).toMatchObject({ ok: true, reason: 'passed' });
+    expect(reportOutputs).toHaveLength(2);
+    const scratchStore = join(r.scratch, 'completions');
+    const scratched = readdirSync(scratchStore).sort();
+    expect(scratched).toEqual(expect.arrayContaining(['ci-heal-999998.json', 'ci-heal-999998-envonly.json']));
+    expect(readdirSync(realStore)).toEqual([]); // neither the prompt's command nor the inherited env wrote to the real store
   });
 
   it('a launch that exits non-zero fails the smoke with launch-failed, without waiting for a record', async () => {
