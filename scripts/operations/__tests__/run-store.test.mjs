@@ -10,6 +10,8 @@
 
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
+import { execFile, execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 
@@ -38,7 +40,9 @@ import {
   readRun,
   resolveRunsDir,
   runPath,
+  migrateLegacyRuns,
   runsDir,
+  sharedRunsDir,
   tryReadRun,
   writeRun,
 } from '../run-store.mjs';
@@ -306,11 +310,13 @@ describe('the fs shell', () => {
     expect(listRunIds(join(dir, 'nope'))).toEqual([]);
   });
 
-  it('resolves the sidecar by SCRIPT location, and OPERATION_RUNS_DIR overrides it', () => {
+  it('resolves ONE shared folder (not the clone), and OPERATION_RUNS_DIR overrides it', () => {
     const previous = process.env.OPERATION_RUNS_DIR;
     try {
       delete process.env.OPERATION_RUNS_DIR;
-      expect(resolveRunsDir()).toBe(runsDir());
+      expect(resolveRunsDir()).toBe(sharedRunsDir());
+      expect(sharedRunsDir({ WE_SHARED_RUNS_DIR: dir })).toBe(dir);
+      expect(sharedRunsDir({ HOME: '/x' })).toMatch(/[/\\]\.operations[/\\]runs$/);
       expect(runsDir()).toMatch(/[/\\]\.operations[/\\]runs$/);
       process.env.OPERATION_RUNS_DIR = dir;
       expect(resolveRunsDir()).toBe(dir);
@@ -406,5 +412,53 @@ describe('pruneTerminalRuns — the fs shell', () => {
     const result = pruneTerminalRuns({ dir, maxAgeMs: 0 });
     expect(result.corrupt).toEqual(['run-torn']);
     expect(listRunIds(dir)).toEqual(['run-torn']); // filename-valid, so still LISTED — content is never touched
+  });
+});
+
+describe('one shared run store across daemon clones (D6 of 128, #xyloz19)', () => {
+  const storeUrl = pathToFileURL(join(process.cwd(), 'scripts/operations/run-store.mjs')).href;
+  const child = (env, code) => execFileSync(process.execPath, ['--input-type=module', '-e', code], {
+    env: { ...process.env, WE_UNDER_TEST: '1', OPERATION_RUNS_DIR: '', ...env }, encoding: 'utf8',
+  });
+
+  it('a record written by the review daemon is readable from the fix daemon', () => {
+    const shared = join(dir, 'shared');
+    const id = 'review-pr-aaaa';
+    // "review daemon" process writes through the default resolver
+    child({ WE_SHARED_RUNS_DIR: shared }, `import {writeRun,resolveRunsDir,newRunRecord} from ${JSON.stringify(storeUrl)};
+      writeRun(newRunRecord({id:${JSON.stringify(id)},op:'review-pr',input:{pr:1}}), resolveRunsDir());`);
+    // "fix daemon" process reads through the default resolver
+    const out = child({ WE_SHARED_RUNS_DIR: shared }, `import {tryReadRun,resolveRunsDir,listRunIds} from ${JSON.stringify(storeUrl)};
+      console.log(JSON.stringify({list:listRunIds(resolveRunsDir()),op:tryReadRun(${JSON.stringify(id)},resolveRunsDir())?.op}));`);
+    expect(JSON.parse(out)).toEqual({ list: [id], op: 'review-pr' });
+  });
+
+  it('moves records written before the move into the shared folder, once, without overwriting', () => {
+    const legacy = join(dir, 'clone', '.operations', 'runs');
+    const shared = join(dir, 'shared');
+    writeRun(newRunRecord({ id: 'old-one', op: 'review-pr', input: {} }), legacy);
+    writeRun(newRunRecord({ id: 'both', op: 'old', input: {} }), legacy);
+    writeRun(newRunRecord({ id: 'both', op: 'new', input: {} }), shared);
+    const r = migrateLegacyRuns(legacy, shared);
+    expect(r.moved).toEqual(['old-one']);
+    expect(listRunIds(shared)).toEqual(['both', 'old-one']);
+    expect(tryReadRun('both', shared).op).toBe('new');
+    expect(listRunIds(legacy)).toEqual([]);
+    expect(migrateLegacyRuns(legacy, shared)).toEqual({ moved: [], skipped: [] });
+    expect(migrateLegacyRuns(join(dir, 'missing'), shared).moved).toEqual([]);
+  });
+
+  it('concurrent writers from several processes never leave a torn record', () => {
+    const shared = join(dir, 'shared');
+    const code = (n) => `import {writeRun,newRunRecord} from ${JSON.stringify(storeUrl)};
+      for (let i=0;i<40;i++) writeRun(newRunRecord({id:'same',op:'p${n}',input:{i}}), ${JSON.stringify(shared)});
+      writeRun(newRunRecord({id:'own-${n}',op:'p${n}',input:{}}), ${JSON.stringify(shared)});`;
+    const procs = [1, 2, 3, 4].map((n) => new Promise((res, rej) => execFile(process.execPath, ['--input-type=module', '-e', code(n)],
+      { env: { ...process.env, WE_UNDER_TEST: '1' } }, (e) => (e ? rej(e) : res()))));
+    return Promise.all(procs).then(() => {
+      expect(listRunIds(shared)).toEqual(['own-1', 'own-2', 'own-3', 'own-4', 'same']);
+      expect(() => tryReadRun('same', shared)).not.toThrow();
+      expect(readdirSync(shared).some((f) => f.endsWith('.tmp'))).toBe(false);
+    });
   });
 });

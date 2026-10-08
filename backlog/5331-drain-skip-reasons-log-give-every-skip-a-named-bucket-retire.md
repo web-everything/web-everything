@@ -1,21 +1,16 @@
 ---
+bornAs: x2dhhsl
 kind: story
-size: 3
-parent: "4075"
+size: 1
 status: open
-scope: ["we:backlog/4408-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md"]
+scope: ["we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/lib/__tests__/drain-skip-reasons.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Prevention — Add a check:standards rule that fails on fenced sh blocks in backlog cards containing a we: prefi… (from web-everything/web-everything#4391 review)
+# Drain skip-reasons log: give every skip a named bucket, retire the 'other' bucket
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-
-1. `we:backlog/4408-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md:76` — Add a check:standards rule that fails on fenced `sh` blocks in backlog cards containing a `we:` prefix.
-2. `we:backlog/4408-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md:76` — Add a documentation check that validates local Node script targets in shell fences against the documented working directory and rejects repository-reference prefixes.
-
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4391@004616b37a97efa32394ad9f86687656732168b1
+Coroner 2026-10-07 F7: plateau-app #212 sat 86 passes as 'other' (no bucket recorded) because its couple partner WE #4288 was checks-pending. Name partner-pending, ready-not-reached, not-certified, off-base, codeql-failed, empty-body, stale-read, escalated, unrecognized-reason. Logging only, no merge-decision change.
 
 ## Done when
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xe61qoo
 kind: story
 size: 1
 status: open
-scope: ["we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/lib/__tests__/drain-skip-reasons.test.mjs"]
+scope: ["we:scripts/operations/machine-pr-title.mjs", "we:scripts/operations/__tests__/machine-pr-title.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Drain skip-reasons log: give every skip a named bucket, retire the 'other' bucket
+# Prepare PR titles never say subject unavailable: derive from the card title
 
-Coroner 2026-10-07 F7: plateau-app #212 sat 86 passes as 'other' (no bucket recorded) because its couple partner WE #4288 was checks-pending. Name partner-pending, ready-not-reached, not-certified, off-base, codeql-failed, empty-body, stale-read, escalated, unrecognized-reason. Logging only, no merge-decision change.
+Coroner 2026-10-07 F8: prepare PRs #4412/#4410/#4408 landed titled '[subject unavailable for N]' because guard-card titles with no numbered finding fell to the placeholder. Derive the subject from the card title instead.
 
 ## Done when
 

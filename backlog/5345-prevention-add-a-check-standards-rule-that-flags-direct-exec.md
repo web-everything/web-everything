@@ -1,17 +1,21 @@
 ---
+bornAs: xren5xl
 kind: story
-size: 5
-status: active
-scaffoldedBy: "lane-health"
-dateScaffolded: "2026-10-08"
-scope: ["we:scripts/lane-pool.mjs", "we:scripts/lib/lane-repair.mjs", "we:scripts/__tests__/lane-pool-repair.test.mjs"]
+size: 3
+parent: "4075"
+status: open
+scope: ["we:scripts/lib/referral-card-readable.mjs", "we:scripts/lib/__tests__/referral-card-readable.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# lane-pool: a corrupt lane clone or a dangling ref (pr-1686) must self-heal on acquire, not block ci-heal
+# Prevention — Add a check:standards rule that flags direct execFileSync('gh', ...) in scripts/lib and scripts/c… (from web-everything/web-everything#4368 review)
 
-Acquire/refresh fetch dies on refs pointing at missing objects (refs/heads/pr-1686) or a commit-graph naming an absent object; the lane is detected, repaired or quarantined and re-provisioned.
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+
+1. `we:scripts/lib/referral-card-readable.mjs:23` — Add a `check:standards` rule that flags direct `execFileSync('gh', ...)` in `scripts/lib` and `scripts/conveyor` modules unless they go through `we:gh-throttle.mjs`.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4368@27992e66f9b14e7bb72f75d1363c06aa71bc2b99
 
 ## Done when
 

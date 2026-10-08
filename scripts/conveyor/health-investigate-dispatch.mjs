@@ -68,7 +68,7 @@ export const NON_READ_OPERATIONS = Object.freeze([
   'resolve', 'scaffold', 'file-item', 'suggest-next', 'pr-status', 'land-advance', 'pr-reconcile', 'pr-ownership',
   'agent-activity', 'item-activity', 'daemon-status', 'heavy-queue', 'review-seat-caps', 'gate-health', 'telemetry-summary',
   'graduation-progress-report', 'route-pr-outcome', 'dispatch-lane', 'claim', 'open-pr', 'explore', 'stage-pr-view',
-  'docket-refresh', 'restart-runner', 'priority-sync', 'live-state', 'live-work', 'record-referral-ruling', 'extend-rounds',
+  'docket-refresh', 'restart-runner', 'priority-sync', 'live-state', 'live-work', 'sessions', 'record-referral-ruling', 'extend-rounds',
   'free-scope', 'maintenance', 'perf-snapshot', 'pre-pr-check',
 ]);
 

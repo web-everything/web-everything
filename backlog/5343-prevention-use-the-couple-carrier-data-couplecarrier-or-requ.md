@@ -1,22 +1,22 @@
 ---
+bornAs: xm40qa2
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/ci-heal-pr-dispatch.mjs", "we:scripts/lib/codeql-gate.mjs", "we:scripts/operations/__tests__/ci-heal-pr-dispatch.test.mjs", "we:scripts/lib/__tests__/codeql-gate.test.mjs"]
+scope: ["we:scripts/lib/drain-skip-reasons.mjs", "we:scripts/lib/__tests__/drain-skip-reasons.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Prevention — Add an end-to-end test through runReconcileCiHealDispatch. Longer term, a standards rule that eve… (from web-everything/web-everything#4378 review)
+# Prevention — Use the couple carrier data (coupleCarrier) or require different repos and Number.isFinite(item).… (from web-everything/web-everything#4397 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/ci-heal-pr-dispatch.mjs:431` — Add an end-to-end test through `runReconcileCiHealDispatch`. Longer term, a standards rule that every new `reason` value needs a test that goes from plan row to sink.
-2. `we:scripts/lib/codeql-gate.mjs:39` — Make `isCodeQLFailed` call `failedCodeQLCheck`, or add a parity test over a fixture matrix of rollup shapes.
-3. `we:scripts/lib/codeql-gate.mjs:125` — Test the empty-alerts, no-error case and word the brief accordingly ("no failure annotations found; check the run log").
+1. `we:scripts/lib/drain-skip-reasons.mjs:86` — Use the couple carrier data (`coupleCarrier`) or require different repos and `Number.isFinite(item)`. Add a test for same-item, same-repo PRs.
+2. `we:scripts/lib/__tests__/drain-skip-reasons.test.mjs:46` — Add a table-driven test mapping each representative reason to its exact expected kind, enforced by the normal test gate; include reason-based escalation separately from the escalated flag.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4378@6bb6bafdafb3a3f71e5545900a127311a18572b4
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4397@8a554840648464b10e7db03feedd9c41e6da986d
 
 ## Done when
 

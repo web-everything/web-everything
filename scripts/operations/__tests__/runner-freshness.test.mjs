@@ -100,6 +100,7 @@ describe('runner freshness policy', () => {
         "route-pr-outcome",
         "runner-activity",
         "scaffold",
+        "sessions",
         "stage-pr-view",
         "stale-state",
         "suggest-next",

@@ -1,15 +1,16 @@
 ---
-kind: story
-size: 3
+bornAs: xbm2jo5
+kind: task
+parent: "2405"
 status: open
-scope: ["we:scripts/conveyor/main-red-recovery.mjs"]
-dateOpened: "2026-10-07"
+scope: ["we:scripts/review-ledger-check.mjs", "we:scripts/__tests__/review-ledger-check.test.mjs"]
+dateOpened: "2026-10-08"
 tags: []
 ---
 
-# One shared main-defect classifier: fix daemon and ci-red-recovery-watch must agree on who owns a main-caused red PR
+# Ledger plan slice F (#3930): review-ledger-check v2 compares derived labels to live labels, appends a run record
 
-PR #4368 ping-pong: fix daemon says owed a rebase, ci-red-recovery-watch says own-failure and owed a ci-heal. The watch never read the PR comments (no labels fetched, merge base green), so it missed the recorded main-defect escalation.
+Slice F of the verdict-ledger plan. The checker runs derivePrState per open PR and compares its labels to the live labels for every mirrored family (review, ruling-needed, ready-to-merge, ci:failed). It appends one run record to the shared runs folder. Report only: it fixes no labels. Also folds in two #4311 leftovers: tests clear WE_VERDICT_LEDGER_BOARD, and an origin-probe timeout reports unreadable.
 
 ## Done when
 

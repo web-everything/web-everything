@@ -1,4 +1,5 @@
 ---
+bornAs: xsxu243
 kind: story
 size: 5
 status: active
@@ -15,7 +16,7 @@ Shared primary store commit-graph names objects gc pruned; every lane git op fai
 
 ## Done when
 
-1. **Executable** — `npx vitest run we:scripts/__tests__/lane-pool-shared-commit-graph.test.mjs` fails before this item (no `healSharedCommitGraph`) and passes after. Builds on #4382 (lane/lane-health, xj1vryw): that repairs per-lane corruption; this repairs the SHARED reference store's derived commit-graph. Must refuse (leave everything as is) on any failure to take the lock; must touch only `objects/info/commit-graph*`, never refs, objects, config or tracked files.
+1. **Executable** — `npx vitest run we:scripts/__tests__/lane-pool-shared-commit-graph.test.mjs` fails before this item (no `healSharedCommitGraph`) and passes after. Builds on #4382 (lane/lane-health, 5341): that repairs per-lane corruption; this repairs the SHARED reference store's derived commit-graph. Must refuse (leave everything as is) on any failure to take the lock; must touch only `objects/info/commit-graph*`, never refs, objects, config or tracked files.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

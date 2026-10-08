@@ -3,18 +3,19 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules.test.mjs"]
+scope: ["we:scripts/review-ledger-check.mjs", "we:scripts/__tests__/review-ledger-check.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Prevention — Add a deterministic regression assertion to the existing fenced-note test requiring a warning whe… (from web-everything/web-everything#4381 review)
+# Prevention — Treat any non-empty probeErrors as unreadable, or have readPrFacts expose a structured 'degraded'… (from web-everything/web-everything#4405 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/check-standards-rules.mjs:712` — Add a deterministic regression assertion to the existing fenced-note test requiring a warning when a fence-like line with trailing text precedes the fenced note, and require closing fences to contain only trailing whitespace.
+1. `we:scripts/review-ledger-check.mjs:225` — Treat any non-empty probeErrors as unreadable, or have readPrFacts expose a structured 'degraded' flag. Add a table-driven test over each probe error string in we:pr-state-io.mjs.
+2. `we:scripts/__tests__/review-ledger-check.test.mjs:157` — Add a deterministic CLI integration test that records external commands and rejects PR or label mutations; verify it fails when a mutation command is deliberately introduced.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4381@30270f6ab8032b73bf3812b0f59236d5b8ac9591
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4405@72020d9ac050c73b8c78a3995a4940f82d65a051
 
 ## Done when
 

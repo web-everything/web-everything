@@ -1,15 +1,18 @@
 ---
+bornAs: x4z1vez
 kind: story
-size: 1
-status: open
-scope: ["we:scripts/operations/machine-pr-title.mjs", "we:scripts/operations/__tests__/machine-pr-title.test.mjs"]
+size: 3
+status: active
+scaffoldedBy: "sessions-s2"
+dateScaffolded: "2026-10-08"
+scope: ["we:scripts/operations/sessions.mjs", "we:scripts/operations/sessions-io.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Prepare PR titles never say subject unavailable: derive from the card title
+# sessions operation: read-only Claude job history (last 24h) for the Plateau sessions page, review history gap logged (S2)
 
-Coroner 2026-10-07 F8: prepare PRs #4412/#4410/#4408 landed titled '[subject unavailable for N]' because guard-card titles with no numbered finding fell to the placeholder. Derive the subject from the card title instead.
+Slice S2 of cards-to-file 128. New read-only sessions operation in we:scripts/operations/run.mjs: merges live-work rows with ended Claude jobs from the harness jobs folder inside the ended-within window, folds subagents into a count, dedupes live vs ended, reports degraded[]. Review-completion history waits on D6 (shared run-record store) and is logged as a degraded gap.
 
 ## Done when
 
