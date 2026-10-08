@@ -851,6 +851,33 @@ describe('sessionPidAliveByName — #3383 real process-liveness per session, reu
     const m = sessionPidAliveByName([{ kind: 'interactive', name: 'conveyor-1', pid: 111 }], { isPidAlive: () => true });
     expect(m.has('conveyor-1')).toBe(false);
   });
+  // xbdixjc — live 2026-10-08 21:17Z/21:25Z: `fix-4461` and `fix-4433` each had older `done` rows (no pid, their
+  // session ids gone from ps) next to one live `working` row. When a done row came AFTER the live one, its `false`
+  // overwrote the live `true`, so sessionGoneForLease read a fixer mid-edit as gone and the reaper released lane-5
+  // and lane-20 with uncommitted work in them. A dead duplicate row must never mask a live (or unknown) reading.
+  describe('duplicate names (round-N reuse) — a dead row never masks a live or unknown reading', () => {
+    const live = { kind: 'background', name: 'fix-4461', pid: 81159, state: 'working' };
+    const done = { kind: 'background', name: 'fix-4461', sessionId: 'c198d004-f67f-4138-9018-63756d0bb8a3', state: 'done' };
+    const unknown = { kind: 'background', name: 'fix-4461', state: 'working' };
+    const opts = { psOutput: 'nothing matches', isPidAlive: (pid) => pid === 81159 };
+    it.each([
+      ['live then done', [live, done], true],
+      ['done then live', [done, live], true],
+      ['done, live, done', [done, live, done], true],
+      ['unknown then done', [unknown, done], null],
+      ['done then unknown', [done, unknown], null],
+      ['only done rows', [done, done], false],
+    ])('%s', (_label, rows, expected) => {
+      expect(sessionPidAliveByName(rows, opts).get('fix-4461')).toBe(expected);
+    });
+    it('end to end: a live fixer listed before its stale done row is NOT session-gone', () => {
+      const rows = [live, done];
+      const states = sessionStateByName(rows);
+      const pidAlive = sessionPidAliveByName(rows, opts).get('fix-4461');
+      const lease = { session: 'fix-4461', acquiredAt: '2026-10-08T20:00:00.000Z' };
+      expect(sessionGoneForLease(lease, states, { nowMs: Date.parse('2026-10-08T21:17:43.000Z'), pidAlive })).toBe(false);
+    });
+  });
   it('malformed/empty input → empty map', () => {
     expect(sessionPidAliveByName([null, {}, { kind: 'background' }]).size).toBe(0);
     expect(sessionPidAliveByName([]).size).toBe(0);
